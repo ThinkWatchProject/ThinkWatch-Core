@@ -218,3 +218,129 @@ async fn healthz_needs_no_key() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), "ok");
 }
+
+#[tokio::test]
+async fn a_request_emits_the_four_lifecycle_events_in_order() {
+    // UI 的实时列表靠这四个事件缝成一行。缺了 RequestHeaders 那条，
+    // 一个跑六分钟的流式请求在列表里要六分钟后才出现。
+    let (up, _) = start_upstream(true).await;
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "claude-code".into(),
+            key: "tw-testkey".into(),
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: format!("http://{up}"),
+            key: "sk-x".into(),
+            protocol: Some(tw_config::Protocol::Anthropic),
+        }],
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-testkey")
+        .body(CLAUDE_BODY)
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("message_stop"));
+
+    let started = rx.recv().await.unwrap();
+    assert!(
+        matches!(started, tw_api::Event::RequestStarted { ref client, .. } if client == "claude-code")
+    );
+    let headers = rx.recv().await.unwrap();
+    // 断言写成 match 而不是 matches!，这样失败时能看见实际收到了什么。
+    match headers {
+        tw_api::Event::RequestHeaders { status: 200, .. } => {}
+        ref other => panic!("第二条该是 RequestHeaders(200)，实际 {other:?}"),
+    }
+    let finished = rx.recv().await.unwrap();
+    match finished {
+        tw_api::Event::RequestFinished { status, bytes, .. } => {
+            assert_eq!(status, 200);
+            // 字节数是流真正流过的量，不是 content-length
+            assert!(bytes > 0, "应该数到流过的字节");
+        }
+        other => panic!("最后一条该是 finished，实际 {other:?}"),
+    }
+    // 四个事件共用同一个 id
+    assert_eq!(started.id(), headers.id());
+    assert_eq!(started.id(), finished.id());
+}
+
+/// 每一步都套一个超时。**卡住的测试比失败的测试更糟** —— CI 只会报一个
+/// 超时，不告诉你卡在哪一行。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
+    // 绑一个端口再立刻放掉，这样能拿到一个**确定没人在听**的端口。
+    // 不要写死一个「大概没人用」的端口号：低位端口在 macOS 上可能被
+    // 防火墙黑洞掉，表现为连接挂住十秒而不是立刻被拒。
+    let dead_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+        }],
+        providers: vec![Provider {
+            name: "dead".into(),
+            base_url: format!("http://127.0.0.1:{dead_port}"),
+            key: "sk-x".into(),
+            protocol: None,
+        }],
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        reqwest::Client::new()
+            .post(format!("http://{gw}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("网关在 20 秒内没回话 —— 连不上上游时它必须立刻返回 502，而不是挂着")
+    .unwrap();
+    // 502 而不是 500 —— 说清楚是上游那边，不是我们
+    assert_eq!(resp.status(), 502);
+
+    async fn next(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> tw_api::Event {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("没等到事件")
+            .unwrap()
+    }
+    let _started = next(&mut rx).await;
+    match next(&mut rx).await {
+        tw_api::Event::RequestFailed {
+            source, message, ..
+        } => {
+            assert_eq!(source, "upstream");
+            // 错误信息要能直接行动
+            assert!(
+                message.contains("base_url") || message.contains("代理"),
+                "{message}"
+            );
+        }
+        other => panic!("该是 failed，实际 {other:?}"),
+    }
+}

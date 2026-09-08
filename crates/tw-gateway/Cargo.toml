@@ -8,7 +8,9 @@ repository.workspace = true
 description = "数据面 HTTP 服务"
 
 [dependencies]
+tw-api = { workspace = true }
 tw-config = { workspace = true }
+tw-observe = { workspace = true }
 tw-secret = { workspace = true }
 tw-types = { workspace = true }
 axum = { workspace = true }
@@ -23,5 +25,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tw-api = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 serde_json = { workspace = true }

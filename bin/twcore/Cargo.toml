@@ -9,6 +9,7 @@ description = "ThinkWatch Lite 的本地 AI 网关引擎"
 
 [dependencies]
 tw-config = { workspace = true }
+tw-control = { workspace = true }
 tw-gateway = { workspace = true }
 tw-secret = { workspace = true }
 anyhow = { workspace = true }

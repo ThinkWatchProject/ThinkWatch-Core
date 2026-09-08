@@ -8,3 +8,5 @@ repository.workspace = true
 description = "控制面契约：请求/响应类型 + client"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

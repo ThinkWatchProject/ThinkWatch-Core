@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{any, get};
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::auth::{extract_key, key_eq};
 use crate::error::GatewayError;
@@ -23,6 +23,9 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 pub struct AppState {
     pub config: Arc<tw_config::Config>,
     pub http: reqwest::Client,
+    /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
+    /// 没有人在看。
+    pub bus: tw_observe::EventBus,
 }
 
 impl AppState {
@@ -45,6 +48,7 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             http,
+            bus: tw_observe::EventBus::new(),
         })
     }
 
@@ -86,6 +90,7 @@ async fn passthrough(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, GatewayError> {
+    let started = std::time::Instant::now();
     let client_name = state.identify(&headers, query.as_deref())?;
     forward::check_body_size(&body, MAX_BODY)?;
 
@@ -112,22 +117,70 @@ async fn passthrough(
         "转发"
     );
 
+    let id = state.bus.next_id();
+    state.bus.emit(tw_api::Event::RequestStarted {
+        id,
+        client: client_name.clone(),
+        provider: provider.name.clone(),
+        method: "POST".to_string(),
+        path: uri.path().to_string(),
+        at_ms: now_ms(),
+    });
+
     let mut req = state.http.request(method, &url);
     req = forward::forward_headers(req, &headers);
     req = forward::apply_credential(req, provider.effective_protocol(), &key);
-    let upstream = req
-        .body(body)
-        .send()
-        .await
-        .map_err(forward::map_reqwest_error)?;
+    let upstream = match req.body(body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let err = forward::map_reqwest_error(e);
+            // 失败也必须发事件。少了它，UI 上那一行会永远停在「进行中」——
+            // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
+            state.bus.emit(tw_api::Event::RequestFailed {
+                id,
+                source: "upstream".to_string(),
+                message: err.message.clone(),
+            });
+            return Err(err);
+        }
+    };
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // 响应头到手就发一次。**这个事件单独存在是有意的**：流式请求从这里
+    // 到结束可能还有好几分钟，UI 要能在这个点就把行画出来并标「进行中」，
+    // 而不是等它结束才出现。
+    state.bus.emit(tw_api::Event::RequestHeaders {
+        id,
+        status: status.as_u16(),
+        ttfb_ms: started.elapsed().as_millis() as u64,
+    });
     let out_headers = forward::response_headers(upstream.headers());
 
     // 流式：**不缓冲**。整块缓冲会把 SSE 变成一次性交付，客户端那边
     // 看起来就是「卡住很久然后一下全出来」。
-    let stream = upstream.bytes_stream().map_err(std::io::Error::other);
+    let bus = state.bus.clone();
+    let bytes_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = {
+        let bytes_seen = bytes_seen.clone();
+        upstream.bytes_stream().map_ok(move |chunk| {
+            bytes_seen.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            chunk
+        })
+    };
+    // 流结束时才知道总字节数和真实耗时 —— 对一个跑了六分钟的任务，
+    // 这两个数字在响应头那一刻都还不存在。
+    let stream = counted
+        .map_err(std::io::Error::other)
+        .chain(futures::stream::once(async move {
+            bus.emit(tw_api::Event::RequestFinished {
+                id,
+                status: status.as_u16(),
+                bytes: bytes_seen.load(std::sync::atomic::Ordering::Relaxed),
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+            Ok(Bytes::new())
+        }));
     let mut resp = Response::new(Body::from_stream(stream));
     *resp.status_mut() = status;
     *resp.headers_mut() = out_headers;
@@ -140,6 +193,13 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Resu
     let actual = listener.local_addr()?;
     tracing::info!(%actual, "网关已监听");
     axum::serve(listener, router(state)).await
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

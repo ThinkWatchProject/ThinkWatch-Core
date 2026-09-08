@@ -2184,6 +2184,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2314,6 +2326,10 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tw-api"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "tw-config"
@@ -2330,6 +2346,22 @@ dependencies = [
 [[package]]
 name = "tw-control"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "tw-api",
+ "tw-config",
+ "tw-observe",
+]
 
 [[package]]
 name = "tw-crypto"
@@ -2357,9 +2389,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tw-api",
  "tw-config",
+ "tw-observe",
  "tw-secret",
  "tw-types",
+]
+
+[[package]]
+name = "tw-observe"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tw-api",
 ]
 
 [[package]]
@@ -2441,6 +2484,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tw-config",
+ "tw-control",
  "tw-gateway",
  "tw-secret",
 ]

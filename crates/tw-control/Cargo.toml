@@ -5,6 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "控制面 API 服务端"
+description = "控制面 API 服务端（unix socket）"
 
 [dependencies]
+tw-api = { workspace = true }
+tw-config = { workspace = true }
+tw-observe = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio", "server", "server-auto"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

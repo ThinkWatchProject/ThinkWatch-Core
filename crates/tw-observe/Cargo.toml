@@ -1,0 +1,16 @@
+[package]
+name = "tw-observe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "事件总线"
+
+[dependencies]
+tw-api = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

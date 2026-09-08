@@ -149,12 +149,6 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         }
     };
 
-    if safe {
-        // 安全模式：只起控制面。M0 还没有控制面，所以先如实说。
-        tracing::warn!("安全模式：数据面不启动");
-        anyhow::bail!("安全模式需要控制面，那是 M0 后半段的事，现在还没有");
-    }
-
     let cfg = tw_config::load(path).with_context(|| {
         format!(
             "加载 {} 失败。没有配置的话跑一次 `twcore init`。",
@@ -170,9 +164,27 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let socket = dir.join("twcore.sock");
+    let config_path = path.to_path_buf();
     rt.block_on(async move {
-        let state = tw_gateway::AppState::new(cfg)
+        let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+        // 控制面无论如何都要起来 —— **网关挂了的时候，用户最需要的恰恰
+        // 是能改配置**（§2.2.1）。安全模式就是「只有这一半」。
+        let control = tw_control::ControlState {
+            started: std::time::Instant::now(),
+            config: std::sync::Arc::new(cfg),
+            config_path,
+            gateway_addr: if safe { None } else { Some(addr.to_string()) },
+            bus: state.bus.clone(),
+        };
+        let sock = socket.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tw_control::serve_unix(control, &sock).await {
+                tracing::error!("控制面起不来：{e}");
+            }
+        });
 
         if let Some(ppid) = parent {
             // 父进程守望：GUI 没了我们跟着退。轮询而不是用 kqueue，是因为
@@ -187,6 +199,13 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                     }
                 }
             });
+        }
+
+        if safe {
+            // 安全模式：只起控制面。数据面不动，让用户还能改配置、回滚。
+            tracing::warn!("安全模式：只起控制面，数据面不启动");
+            shutdown_signal().await;
+            return Ok(());
         }
 
         tracing::info!(%addr, "启动");
