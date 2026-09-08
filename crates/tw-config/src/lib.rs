@@ -27,6 +27,24 @@ pub struct Config {
     /// 而是「这把钥匙就是这个人」。
     pub clients: Vec<Client>,
     pub providers: Vec<Provider>,
+    /// 策略组。不写就没有 —— 层 0（只配 provider）是完全合法的配置，
+    /// 引擎内部会把它展开（§3.4）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<tw_engine::Group>,
+    /// 路由规则。同上，不写就是「按声明顺序故障转移」。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<tw_engine::Route>,
+}
+
+impl Config {
+    /// 按配置建一个路由引擎。
+    pub fn engine(&self) -> tw_engine::Engine {
+        tw_engine::Engine::new(
+            self.providers.iter().map(|p| p.name.clone()).collect(),
+            self.groups.clone(),
+            self.routes.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

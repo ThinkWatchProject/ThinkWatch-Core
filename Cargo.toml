@@ -11,6 +11,7 @@ members = [
     "crates/tw-api",
     "crates/tw-secret",
     "crates/tw-config",
+    "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
     "crates/tw-control",
@@ -42,6 +43,7 @@ tw-crypto   = { path = "crates/tw-crypto" }
 tw-api      = { path = "crates/tw-api" }
 tw-secret   = { path = "crates/tw-secret" }
 tw-config   = { path = "crates/tw-config" }
+tw-engine   = { path = "crates/tw-engine" }
 tw-observe  = { path = "crates/tw-observe" }
 tw-gateway  = { path = "crates/tw-gateway" }
 tw-control  = { path = "crates/tw-control" }

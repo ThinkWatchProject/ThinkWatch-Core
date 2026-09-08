@@ -1,19 +1,17 @@
 [package]
-name = "tw-config"
+name = "tw-engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "YAML schema、加载、校验"
+description = "路由规则引擎与策略组"
 
 [dependencies]
-tw-engine = { workspace = true }
-tw-secret = { workspace = true }
 serde = { workspace = true }
-serde_yaml_ng = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
-rand = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+serde_yaml_ng = { workspace = true }

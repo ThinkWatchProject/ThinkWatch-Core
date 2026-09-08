@@ -26,6 +26,10 @@ pub enum ValidationError {
         "provider `{name}` 的密钥是空的。要连不需要密钥的上游（比如本地 Ollama），写一个占位值即可。"
     )]
     EmptyProviderKey { name: String },
+    #[error("路由配置有问题：{0}")]
+    Routing(#[from] tw_engine::RouteError),
+    #[error("`{0}` 既是 provider 名又是组名。规则里的 `to` 会指向哪个是不确定的，改掉其中一个。")]
+    NameCollision(String),
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -87,6 +91,20 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             ));
         }
     }
+    // provider 和组不能同名。`to: x` 指向哪个会变成一个靠实现顺序决定
+    // 的问题 —— 而那种问题在换一个人读代码的时候就会变成 bug。
+    let group_names: std::collections::HashSet<&str> =
+        cfg.groups.iter().map(|g| g.name.as_str()).collect();
+    for p in &cfg.providers {
+        if group_names.contains(p.name.as_str()) {
+            return Err(ValidationError::NameCollision(p.name.clone()));
+        }
+    }
+
+    // 路由规则的目标、比较式写法，都在这里查。**一条永远不命中、或者
+    // 指向不存在的 provider 的规则，在运行时是完全静默的**（§7.11 的
+    // 「我明明配了为什么不生效」）。
+    cfg.engine().validate()?;
     Ok(())
 }
 
@@ -101,6 +119,8 @@ mod tests {
             listen: Listen::default(),
             clients,
             providers,
+            groups: Vec::new(),
+            routes: Vec::new(),
         }
     }
     fn c(name: &str, key: &str) -> Client {

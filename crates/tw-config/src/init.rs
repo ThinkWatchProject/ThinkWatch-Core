@@ -35,6 +35,10 @@ pub fn generate_initial() -> Config {
             key: generate_key(),
         }],
         providers: Vec::new(),
+        // 层 0：不写规则也能跑（§3.4）。引擎内部会展开成一个全量
+        // fallback 组加一条兜底规则。
+        groups: Vec::new(),
+        routes: Vec::new(),
     }
 }
 

@@ -2340,6 +2340,7 @@ dependencies = [
  "serde_yaml_ng",
  "tempfile",
  "thiserror",
+ "tw-engine",
  "tw-secret",
 ]
 
@@ -2378,6 +2379,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tw-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "tw-gateway"
 version = "0.1.0"
 dependencies = [
@@ -2388,11 +2400,13 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror",
  "tokio",
  "tracing",
  "tw-api",
  "tw-config",
+ "tw-engine",
  "tw-observe",
  "tw-secret",
  "tw-types",

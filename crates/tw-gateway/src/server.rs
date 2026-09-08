@@ -22,6 +22,9 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<tw_config::Config>,
+    /// 路由引擎。**和配置一起建，一起换** —— 分开持有会让「规则改了但
+    /// 引擎还是旧的」变成可能，而那种不一致完全静默。
+    pub engine: Arc<tw_engine::Engine>,
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
     /// 没有人在看。
@@ -45,7 +48,9 @@ impl AppState {
             .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|e| GatewayError::config(format!("HTTP 客户端建不起来：{e}")))?;
+        let engine = Arc::new(config.engine());
         Ok(Self {
+            engine,
             config: Arc::new(config),
             http,
             bus: tw_observe::EventBus::new(),
@@ -94,17 +99,49 @@ async fn passthrough(
     let client_name = state.identify(&headers, query.as_deref())?;
     forward::check_body_size(&body, MAX_BODY)?;
 
-    // M0 没有路由，取第一个 provider。M1 会把这里换成规则引擎 ——
-    // 接缝留在这一行。
-    let provider = state.config.providers.first().ok_or_else(|| {
-        // 这是首次运行还没配完时的正常状态，不是配置错误。措辞要
-        // 说清下一步 —— 用户看到这条时，他手里已经有一个能发请求
-        // 的客户端了，只差一个上游。
-        GatewayError::config(concat!(
+    // 首次运行还没配完是正常状态，不是配置错误。这条要在路由之前挡，
+    // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
+    // 说不清下一步。
+    if state.config.providers.is_empty() {
+        return Err(GatewayError::config(concat!(
             "还没有配置任何上游。打开 ThinkWatch Lite 添加第一个 provider，",
             "或者往 config.yaml 的 providers 段里写一个。"
-        ))
-    })?;
+        )));
+    }
+
+    // 管线第 2 步：路由（§4）。**规则引擎在这里** —— M0 那句「取第一个
+    // provider」就是留给这一段的接缝。
+    let facts = {
+        let mut f = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => tw_engine::RequestFacts::from_anthropic_body(&v),
+            // body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** ——
+            // 我们的解析器不认识的东西，上游可能完全认识（§4.1）。
+            Err(_) => tw_engine::RequestFacts::default(),
+        };
+        f.client = client_name.clone();
+        f
+    };
+    let decision = state
+        .engine
+        .route(&facts)
+        .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?;
+    // 候选是有序的：第一个是首选，其余留给故障转移。
+    let chosen = decision
+        .candidates
+        .first()
+        .ok_or_else(|| GatewayError::config("路由选出了一个空的候选列表"))?;
+    let provider = state
+        .config
+        .providers
+        .iter()
+        .find(|p| &p.name == chosen)
+        .ok_or_else(|| {
+            // 校验时挡过一次，能到这儿说明配置在运行中被换过。
+            GatewayError::config(format!(
+                "规则 `{}` 选中了 `{chosen}`，但配置里没有这个 provider",
+                decision.matched_rule
+            ))
+        })?;
 
     let key = provider.resolved_key().map_err(|e| {
         GatewayError::config(format!("provider `{}` 的密钥展开失败：{e}", provider.name))
@@ -116,6 +153,8 @@ async fn passthrough(
     tracing::debug!(
         client = %client_name,
         provider = %provider.name,
+        rule = %decision.matched_rule,
+        group = ?decision.via_group,
         url = %tw_secret::redact_url(&url),
         bytes = body.len(),
         "转发"
@@ -225,6 +264,8 @@ mod tests {
                 key: "sk-1".into(),
                 protocol: None,
             }],
+            groups: Vec::new(),
+            routes: Vec::new(),
         }
     }
 

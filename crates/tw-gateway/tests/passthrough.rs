@@ -73,6 +73,8 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
             key: "sk-upstream-secret".into(),
             protocol: Some(tw_config::Protocol::Anthropic),
         }],
+        groups: Vec::new(),
+        routes: Vec::new(),
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -237,6 +239,8 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
             key: "sk-x".into(),
             protocol: Some(tw_config::Protocol::Anthropic),
         }],
+        groups: Vec::new(),
+        routes: Vec::new(),
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
@@ -302,6 +306,8 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
             key: "sk-x".into(),
             protocol: None,
         }],
+        groups: Vec::new(),
+        routes: Vec::new(),
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
@@ -343,4 +349,130 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
         }
         other => panic!("该是 failed，实际 {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
+    // 路由的最小可信证明：**两家上游各自能说出自己是谁**，然后看请求
+    // 真的落在了规则说的那家。只断言「没报错」证明不了任何事。
+    let (a, seen_a) = start_upstream(false).await;
+    let (b, seen_b) = start_upstream(false).await;
+
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "claude-code".into(),
+            key: "tw-k".into(),
+        }],
+        providers: vec![
+            Provider {
+                name: "official".into(),
+                base_url: format!("http://{a}"),
+                key: "sk-official".into(),
+                protocol: Some(tw_config::Protocol::Anthropic),
+            },
+            Provider {
+                name: "relay".into(),
+                base_url: format!("http://{b}"),
+                key: "sk-relay".into(),
+                protocol: Some(tw_config::Protocol::Anthropic),
+            },
+        ],
+        groups: Vec::new(),
+        routes: vec![
+            tw_engine::Route {
+                name: "opus 走官方".into(),
+                when: serde_yaml_ng::from_str("{ model: claude-opus-* }").unwrap(),
+                to: "official".into(),
+            },
+            tw_engine::Route {
+                name: "兜底".into(),
+                when: Default::default(),
+                to: "relay".into(),
+            },
+        ],
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+
+    let send = |model: &str| {
+        let body =
+            format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+        async move {
+            reqwest::Client::new()
+                .post(format!("http://{gw}/v1/messages"))
+                .header("x-api-key", "tw-k")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    send("claude-opus-4-5").await;
+    assert!(
+        !seen_a.lock().unwrap().body.is_empty(),
+        "opus 该落在 official"
+    );
+    assert!(
+        seen_b.lock().unwrap().body.is_empty(),
+        "opus 不该落在 relay"
+    );
+
+    send("claude-sonnet-4-5").await;
+    assert!(
+        !seen_b.lock().unwrap().body.is_empty(),
+        "sonnet 该走兜底到 relay"
+    );
+
+    // 每家收到的是它自己的 key，不是对方的
+    assert_eq!(
+        seen_a.lock().unwrap().headers.get("x-api-key").unwrap(),
+        "sk-official"
+    );
+    assert_eq!(
+        seen_b.lock().unwrap().headers.get("x-api-key").unwrap(),
+        "sk-relay"
+    );
+}
+
+#[tokio::test]
+async fn with_no_routes_at_all_requests_still_go_somewhere() {
+    // 层 0：只配 provider，不写任何规则（§3.4）。这是最小可用配置，
+    // 而且**对不少人就够了** —— 如果它不工作，「配一个 API 就能用」
+    // 那条纪律就是假的。
+    let (up, seen) = start_upstream(false).await;
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+        }],
+        providers: vec![Provider {
+            name: "only".into(),
+            base_url: format!("http://{up}"),
+            key: "sk-x".into(),
+            protocol: None,
+        }],
+        groups: Vec::new(),
+        routes: Vec::new(),
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"anything"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(!seen.lock().unwrap().body.is_empty());
 }
