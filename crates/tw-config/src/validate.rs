@@ -119,8 +119,7 @@ mod tests {
             listen: Listen::default(),
             clients,
             providers,
-            groups: Vec::new(),
-            routes: Vec::new(),
+            ..Default::default()
         }
     }
     fn c(name: &str, key: &str) -> Client {
@@ -135,6 +134,7 @@ mod tests {
             base_url: url.into(),
             key: crate::Secret::Literal("sk-x".into()),
             protocol: None,
+            ..Default::default()
         }
     }
 

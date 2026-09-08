@@ -72,9 +72,9 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
             base_url: format!("http://{upstream}"),
             key: "sk-upstream-secret".into(),
             protocol: Some(tw_config::Protocol::Anthropic),
+            ..Default::default()
         }],
-        groups: Vec::new(),
-        routes: Vec::new(),
+        ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -238,9 +238,9 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
             base_url: format!("http://{up}"),
             key: "sk-x".into(),
             protocol: Some(tw_config::Protocol::Anthropic),
+            ..Default::default()
         }],
-        groups: Vec::new(),
-        routes: Vec::new(),
+        ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
@@ -305,9 +305,9 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
             base_url: format!("http://127.0.0.1:{dead_port}"),
             key: "sk-x".into(),
             protocol: None,
+            ..Default::default()
         }],
-        groups: Vec::new(),
-        routes: Vec::new(),
+        ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
@@ -371,15 +371,18 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
                 base_url: format!("http://{a}"),
                 key: "sk-official".into(),
                 protocol: Some(tw_config::Protocol::Anthropic),
+                ..Default::default()
             },
             Provider {
                 name: "relay".into(),
                 base_url: format!("http://{b}"),
                 key: "sk-relay".into(),
                 protocol: Some(tw_config::Protocol::Anthropic),
+                ..Default::default()
             },
         ],
         groups: Vec::new(),
+        proxies: Vec::new(),
         routes: vec![
             tw_engine::Route {
                 name: "opus 走官方".into(),
@@ -457,9 +460,9 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
             base_url: format!("http://{up}"),
             key: "sk-x".into(),
             protocol: None,
+            ..Default::default()
         }],
-        groups: Vec::new(),
-        routes: Vec::new(),
+        ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

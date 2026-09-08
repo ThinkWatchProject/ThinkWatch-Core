@@ -149,7 +149,7 @@ async fn setup(
         base_url: req.base_url.clone(),
         key: tw_config::Secret::Literal(req.key.clone()),
         // 猜得出来就不写进文件 —— 少一行是一行（§0.6）。
-        protocol: None,
+        ..Default::default()
     });
     tw_config::validate(&cfg).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     tw_config::write(&s.config_path, &cfg).map_err(|e| {

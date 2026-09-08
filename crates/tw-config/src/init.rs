@@ -3,7 +3,7 @@
 //! **整文件生成，不走 §3.8 的最小替换** —— 那是两套机制：这里是从无到
 //! 有，那里是改一个字节而保住其余全部。
 
-use crate::{Client, Config, GatewayListen, Listen, Provider, SCHEMA_VERSION};
+use crate::{Client, Config, Provider};
 
 /// 生成一把网关密钥。
 ///
@@ -26,19 +26,13 @@ pub fn generate_key() -> String {
 /// 「还没配上游」—— 那是「不能转发」，不是「配置错了」。
 pub fn generate_initial() -> Config {
     Config {
-        version: SCHEMA_VERSION,
-        listen: Listen {
-            gateway: GatewayListen::default(),
-        },
         clients: vec![Client {
             name: "default".to_string(),
             key: generate_key(),
         }],
-        providers: Vec::new(),
-        // 层 0：不写规则也能跑（§3.4）。引擎内部会展开成一个全量
-        // fallback 组加一条兜底规则。
-        groups: Vec::new(),
-        routes: Vec::new(),
+        // 其余全是默认值：没有 provider、没有代理、没有规则。
+        // 层 0（不写规则也能跑，§3.4）就是这份配置的形状。
+        ..Default::default()
     }
 }
 
@@ -49,10 +43,7 @@ pub fn generate_with_provider(name: &str, base_url: &str, key: &str) -> Config {
         name: name.to_string(),
         base_url: base_url.to_string(),
         key: crate::Secret::Literal(key.to_string()),
-        // 猜得出来就不写进文件 —— 少一行是一行（§0.6）。猜不出来也不写：
-        // 让 `twcore check` 在这里说「未知」，比在配置里落一个我们编的
-        // 默认值好，后者会让用户以为是他自己选的。
-        protocol: None,
+        ..Default::default()
     });
     cfg
 }

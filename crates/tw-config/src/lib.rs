@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 mod init;
+pub mod proxy;
 mod validate;
 
 pub use init::{generate_initial, generate_key, generate_with_provider};
+pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
 
 /// 配置 schema 的版本。和应用的 CalVer 是两回事 —— 这个只决定要不要
@@ -29,11 +31,45 @@ pub struct Config {
     pub providers: Vec<Provider>,
     /// 策略组。不写就没有 —— 层 0（只配 provider）是完全合法的配置，
     /// 引擎内部会把它展开（§3.4）。
+    /// 出站代理。声明一次到处引用（§3.7）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxies: Vec<Proxy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<tw_engine::Group>,
     /// 路由规则。同上，不写就是「按声明顺序故障转移」。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<tw_engine::Route>,
+}
+
+/// 便于构造，**不代表一份可用的配置** —— `providers` 和 `clients` 都是
+/// 空的，得自己填。加这个是因为每给 `Config` 添一个字段，所有构造点都
+/// 要改一遍，而那些改动全是噪音。
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: SCHEMA_VERSION,
+            listen: Listen::default(),
+            clients: Vec::new(),
+            providers: Vec::new(),
+            proxies: Vec::new(),
+            groups: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+}
+
+/// 同上。`name` / `base_url` / `key` 空着的 provider 过不了校验。
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_url: String::new(),
+            key: Secret::Literal(String::new()),
+            protocol: None,
+            proxy: default_proxy(),
+            on_proxy_fail: OnProxyFail::default(),
+        }
+    }
 }
 
 impl Config {
@@ -196,6 +232,23 @@ pub struct Provider {
     /// 不写就从 base_url 猜（§3.3 的最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
+    /// 代理名，或内置的 `direct` / `system`。
+    ///
+    /// **默认 `direct` 而不是 `system`**：显式优于隐式。默认跟随系统的
+    /// 话，用户在系统里开了全局代理，本地 Ollama 就会莫名连不上，而
+    /// 配置文件里看不出任何线索。
+    #[serde(default = "default_proxy")]
+    pub proxy: String,
+    #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
+    pub on_proxy_fail: OnProxyFail,
+}
+
+fn default_proxy() -> String {
+    DIRECT.to_string()
+}
+
+fn is_default_on_proxy_fail(v: &OnProxyFail) -> bool {
+    *v == OnProxyFail::default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +426,7 @@ providers:
             base_url: "https://api.anthropic.com".into(),
             key: Secret::Literal("k".into()),
             protocol: Some(Protocol::OpenaiChat),
+            ..Default::default()
         };
         assert_eq!(p.effective_protocol(), Some(Protocol::OpenaiChat));
     }
@@ -450,7 +504,7 @@ providers:
             name: "x".into(),
             base_url: "https://x".into(),
             key: Secret::Literal("${TW_TEST_KEY}".into()),
-            protocol: None,
+            ..Default::default()
         };
         assert_eq!(p.resolved_key().unwrap(), "sk-from-env");
     }
