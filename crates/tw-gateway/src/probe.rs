@@ -12,6 +12,41 @@ use serde::{Deserialize, Serialize};
 /// 十秒的白屏比一条「连不上」难受得多。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// 模型清单的结果。
+///
+/// **不能只用一个空 `Vec` 表达。**「上游没这个接口」「上游给了但我们没
+/// 认出格式」「真的一个模型都没有」是三件不同的事，塌成一个空列表之后：
+///
+/// - UI 只能说「这家不提供模型列表」，而那在第二种情况下是**编的** ——
+///   把我们自己的解析缺口说成了对方的特性；
+/// - §3.9 的模型清单从这里派生，静默为空之后用户不知道该去问谁。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelList {
+    /// 拿到了
+    Listed { models: Vec<String> },
+    /// 上游没有这个接口。**不是错误**，很多中转站就是不实现 —— 但要说
+    /// 出来，因为按模型路由、模型清单这些功能对它就用不了。
+    NotImplemented { status: u16 },
+    /// 上游返回了 2xx，但我们没认出它的形状。
+    ///
+    /// **这是我们的缺口，不是它的。** 必须和上一种分开报，否则每加一家
+    /// 用新格式的上游，都会被我们说成「它不提供模型列表」，然后没人去
+    /// 修解析器。
+    Unrecognized { sample: String },
+    /// 认出来了，但确实是空的
+    Empty,
+}
+
+impl ModelList {
+    pub fn models(&self) -> &[String] {
+        match self {
+            ModelList::Listed { models } => models,
+            _ => &[],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResult {
     pub ok: bool,
@@ -19,9 +54,8 @@ pub struct ProbeResult {
     pub protocol: Option<String>,
     /// L1：建连到拿到响应头的耗时
     pub latency_ms: u64,
-    /// L2：上游报出来的模型。空表示这个上游不给列表 —— **不是失败**，
-    /// 很多中转站就是不实现 /v1/models
-    pub models: Vec<String>,
+    /// L2 的结果，**带上为什么**
+    pub models: ModelList,
     /// 失败时说清楚下一步做什么
     pub error: Option<String>,
 }
@@ -32,7 +66,7 @@ impl ProbeResult {
             ok: false,
             protocol,
             latency_ms,
-            models: Vec::new(),
+            models: ModelList::Empty,
             error: Some(msg.into()),
         }
     }
@@ -89,14 +123,19 @@ pub async fn probe(
     }
 
     let models = if status.is_success() {
-        resp.text()
-            .await
-            .ok()
-            .map(|t| extract_models(&t))
-            .unwrap_or_default()
+        match resp.text().await {
+            Ok(body) => classify_models(&body),
+            // 拿到了 2xx 但读 body 失败 —— 归到「没认出」而不是「不提供」，
+            // 因为它确实有这个接口。
+            Err(e) => ModelList::Unrecognized {
+                sample: format!("读响应体失败：{e}"),
+            },
+        }
     } else {
-        // 非 2xx 但不是 401/403：认证这一关算过了，列表拿不到而已。
-        Vec::new()
+        // 非 2xx 但不是 401/403：认证这一关算过了，是它没这个接口。
+        ModelList::NotImplemented {
+            status: status.as_u16(),
+        }
     };
 
     ProbeResult {
@@ -108,21 +147,39 @@ pub async fn probe(
     }
 }
 
-/// 从各家的 /v1/models 响应里抠出模型名。
+/// 从各家的 /v1/models 响应里抠出模型名，**并说清楚认没认出来**。
 ///
 /// 三种形状：OpenAI 的 `{data:[{id}]}`、Anthropic 的 `{data:[{id}]}`（同形）、
-/// Gemini 的 `{models:[{name}]}`。**认不出来就返回空**，不猜 —— 一个编
-/// 出来的模型列表比没有列表有害得多。
-fn extract_models(body: &str) -> Vec<String> {
+/// Gemini 的 `{models:[{name}]}`。认不出来返回 `Unrecognized` 而不是空
+/// 列表 —— 一个编出来的模型列表比没有列表有害得多，而一句「这家不提供
+/// 列表」在实际是我们没认出格式时同样是编的。
+fn classify_models(body: &str) -> ModelList {
+    // 采样只留大约 200 字节：够看出形状，又不至于把一整份响应（可能带
+    // 敏感信息）塞进 UI 和日志。**按字符边界截断** —— 按字节切多字节
+    // 字符会 panic，那是这个项目栽过两次的坑（§9.7）。
+    let sample = || {
+        let t = body.trim();
+        let end = t
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|&i| i <= 200)
+            .last()
+            .unwrap_or(0);
+        t[..end].to_string()
+    };
+
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
+        return ModelList::Unrecognized { sample: sample() };
     };
     let arr = v
         .get("data")
         .or_else(|| v.get("models"))
         .and_then(|x| x.as_array());
-    let Some(arr) = arr else { return Vec::new() };
-    arr.iter()
+    let Some(arr) = arr else {
+        return ModelList::Unrecognized { sample: sample() };
+    };
+    let models: Vec<String> = arr
+        .iter()
         .filter_map(|m| {
             m.get("id")
                 .or_else(|| m.get("name"))
@@ -130,7 +187,14 @@ fn extract_models(body: &str) -> Vec<String> {
                 // Gemini 的 name 带 `models/` 前缀
                 .map(|s| s.strip_prefix("models/").unwrap_or(s).to_string())
         })
-        .collect()
+        .collect();
+    match (arr.is_empty(), models.is_empty()) {
+        // 上游明确说「我一个模型都没有」。那是它的答案，不是我们的失败。
+        (true, _) => ModelList::Empty,
+        // 数组在、有元素、一个名字都抠不出来 —— 那是新格式，不是空。
+        (false, true) => ModelList::Unrecognized { sample: sample() },
+        (false, false) => ModelList::Listed { models },
+    }
 }
 
 #[cfg(test)]
@@ -141,28 +205,66 @@ mod tests {
     fn reads_the_openai_and_anthropic_shape() {
         let b = r#"{"data":[{"id":"claude-sonnet-4-5"},{"id":"claude-opus-4-5"}]}"#;
         assert_eq!(
-            extract_models(b),
-            vec!["claude-sonnet-4-5", "claude-opus-4-5"]
+            classify_models(b).models(),
+            ["claude-sonnet-4-5", "claude-opus-4-5"]
         );
     }
 
     #[test]
     fn reads_the_gemini_shape_and_strips_its_prefix() {
         let b = r#"{"models":[{"name":"models/gemini-2.5-pro"}]}"#;
-        assert_eq!(extract_models(b), vec!["gemini-2.5-pro"]);
+        assert_eq!(classify_models(b).models(), ["gemini-2.5-pro"]);
     }
 
     #[test]
-    fn an_unrecognised_shape_yields_nothing_rather_than_a_guess() {
-        // 编出来的模型列表比没有列表有害得多 —— 用户会照着它去配路由。
-        assert!(extract_models(r#"{"whatever":1}"#).is_empty());
-        assert!(extract_models("not json at all").is_empty());
-        assert!(extract_models(r#"{"data":"not an array"}"#).is_empty());
+    fn an_unrecognised_shape_says_so_instead_of_looking_like_an_empty_list() {
+        // 这是这段代码存在的核心理由：**「我们没认出格式」和「上游没这个
+        // 接口」是两件事**。塌成一个空列表之后，UI 只能说「这家不提供模型
+        // 列表」，而那在这种情况下是编的 —— 把我们自己的解析缺口说成了
+        // 对方的特性，然后没人会去修解析器。
+        for body in [
+            r#"{"whatever":1}"#,
+            "not json at all",
+            r#"{"data":"not an array"}"#,
+        ] {
+            assert!(
+                matches!(classify_models(body), ModelList::Unrecognized { .. }),
+                "{body} 应该被判为没认出"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuinely_empty_list_is_not_the_same_as_unrecognised() {
+        // `data: []` 是上游明确说「我一个模型都没有」。
+        assert!(matches!(
+            classify_models(r#"{"data":[]}"#),
+            ModelList::Empty
+        ));
+    }
+
+    #[test]
+    fn an_array_we_cannot_read_a_single_name_out_of_is_unrecognised() {
+        // 数组在、有元素、一个名字都抠不出来 —— 那是新格式，不是空。
+        assert!(matches!(
+            classify_models(r#"{"data":[{"model_name":"x"}]}"#),
+            ModelList::Unrecognized { .. }
+        ));
+    }
+
+    #[test]
+    fn the_sample_is_truncated_on_a_char_boundary() {
+        // 采样会显示在 UI 和日志里，而按字节切多字节字符会 panic。
+        let body = "响".repeat(500);
+        match classify_models(&body) {
+            ModelList::Unrecognized { sample } => assert!(sample.len() <= 200),
+            other => panic!("应该是没认出，实际 {other:?}"),
+        }
     }
 
     #[test]
     fn entries_without_a_usable_name_are_skipped_not_faked() {
         let b = r#"{"data":[{"id":"good"},{"object":"model"}]}"#;
-        assert_eq!(extract_models(b), vec!["good"]);
+        assert_eq!(classify_models(b).models(), ["good"]);
     }
 }

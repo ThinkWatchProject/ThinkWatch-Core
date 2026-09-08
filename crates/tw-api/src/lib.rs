@@ -75,12 +75,33 @@ pub struct ProbeRequest {
     pub key: String,
 }
 
+/// 模型清单的结果。**空列表不足以表达**：「上游没这个接口」「上游给了
+/// 但我们没认出格式」「真的一个都没有」是三件事，塌成空列表之后 UI 只能
+/// 说「这家不提供模型列表」，而那在第二种情况下是编的 —— 把我们自己的
+/// 解析缺口说成了对方的特性。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelList {
+    Listed {
+        models: Vec<String>,
+    },
+    /// 上游没有这个接口。不是错误，但按模型路由那类功能对它用不了。
+    NotImplemented {
+        status: u16,
+    },
+    /// 2xx 但我们没认出形状 —— **这是我们的缺口，要报出来去修**。
+    Unrecognized {
+        sample: String,
+    },
+    Empty,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResponse {
     pub ok: bool,
     pub protocol: Option<String>,
     pub latency_ms: u64,
-    pub models: Vec<String>,
+    pub models: ModelList,
     pub error: Option<String>,
 }
 

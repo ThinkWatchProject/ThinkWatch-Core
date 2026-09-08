@@ -93,11 +93,24 @@ async fn probe(
     Json(req): Json<tw_api::ProbeRequest>,
 ) -> Json<tw_api::ProbeResponse> {
     let r = tw_gateway::probe(&s.http, &req.base_url, &req.key, None).await;
+    // 两边的枚举是同一份契约的两个副本（core 内部一份、控制面契约一份）。
+    // 手工转换是为了让 tw-api 不依赖 tw-gateway —— UI 和 CLI 只该依赖
+    // 契约，不该被拖上整个数据面。
+    let models = match r.models {
+        tw_gateway::ModelList::Listed { models } => tw_api::ModelList::Listed { models },
+        tw_gateway::ModelList::NotImplemented { status } => {
+            tw_api::ModelList::NotImplemented { status }
+        }
+        tw_gateway::ModelList::Unrecognized { sample } => {
+            tw_api::ModelList::Unrecognized { sample }
+        }
+        tw_gateway::ModelList::Empty => tw_api::ModelList::Empty,
+    };
     Json(tw_api::ProbeResponse {
         ok: r.ok,
         protocol: r.protocol,
         latency_ms: r.latency_ms,
-        models: r.models,
+        models,
         error: r.error,
     })
 }

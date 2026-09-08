@@ -12,5 +12,5 @@ pub mod probe;
 pub mod server;
 
 pub use error::GatewayError;
-pub use probe::{ProbeResult, probe};
+pub use probe::{ModelList, ProbeResult, probe};
 pub use server::{AppState, router, serve};
