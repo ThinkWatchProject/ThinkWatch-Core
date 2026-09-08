@@ -1,0 +1,16 @@
+[package]
+name = "tw-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SSE 分帧与方言间的内容提取"
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }

@@ -1,0 +1,99 @@
+[workspace]
+resolver = "2"
+members = [
+    # ── 第一层 · 共用协议层（企业版也依赖）────────────────
+    "crates/tw-types",
+    "crates/tw-protocol",
+    "crates/tw-provider",
+    "crates/tw-resil",
+    "crates/tw-crypto",
+    # ── 第二层 · 桌面网关（企业版永不依赖）────────────────
+    "crates/tw-api",
+    "crates/tw-secret",
+    "crates/tw-config",
+    "crates/tw-gateway",
+    "crates/tw-control",
+    # ── bin ──────────────────────────────────────────────
+    "bin/twcore",
+]
+
+# 其余 crate 在有内容时再加进来，不预先建空壳：
+#   tw-redact / tw-pricing / tw-engine / tw-guard / tw-store / tw-observe
+
+[workspace.package]
+edition = "2024"
+# 与企业版对齐。edition 2024 需要 1.85（2025-02 首个稳定版）。
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/ThinkWatchProject/ThinkWatch-Core"
+
+# 二进制走 CalVer，crate 走 SemVer —— 两者是两回事，卖给不同的人。
+# 见 DESIGN.md §9.6。这里是 crate 的版本。
+version = "0.1.0"
+
+[workspace.dependencies]
+# ── 内部 crate ───────────────────────────────────────────
+tw-types    = { path = "crates/tw-types" }
+tw-protocol = { path = "crates/tw-protocol" }
+tw-provider = { path = "crates/tw-provider" }
+tw-resil    = { path = "crates/tw-resil" }
+tw-crypto   = { path = "crates/tw-crypto" }
+tw-api      = { path = "crates/tw-api" }
+tw-secret   = { path = "crates/tw-secret" }
+tw-config   = { path = "crates/tw-config" }
+tw-gateway  = { path = "crates/tw-gateway" }
+tw-control  = { path = "crates/tw-control" }
+
+# ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+hyper = { version = "1", features = ["full"] }
+hyper-util = "0.1"
+http-body-util = "0.1"
+bytes = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls", "socks", "http2"] }
+
+futures = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+async-trait = "0.1"
+
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+metrics = "0.24"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.10"
+
+# 与企业版一样：加密相关一律精确锁定，防止 cargo update 悄悄换掉验证默认值
+aes-gcm = "=0.10.3"
+
+clap = { version = "4", features = ["derive"] }
+# ── Bedrock 的 SigV4 签名（tw-provider）──────────────────
+aws-sigv4 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-smithy-eventstream = "0.60"
+http_1x = { package = "http", version = "1" }
+urlencoding = "2"
+
+
+[profile.release]
+# 桌面 sidecar：体积比极限吞吐重要。企业版用 lto = true + codegen-units = 1，
+# 那是为服务器热路径调的；这里 "thin" 已经够，链接快得多。
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# 保持 unwind：§4.7 的 catch_unwind 要靠它兜住单个请求的 panic。
+# abort 会让那层防护失效，整个进程跟着死 —— 而 core 死了所有 AI 客户端一起瞎。
+panic = "unwind"

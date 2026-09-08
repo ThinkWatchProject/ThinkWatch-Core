@@ -1,0 +1,17 @@
+[package]
+name = "tw-resil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "重试、熔断、故障转移"
+
+[dependencies]
+tw-types = { workspace = true }
+tw-provider = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+rand = { workspace = true }

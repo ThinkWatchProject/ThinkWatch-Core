@@ -1,0 +1,48 @@
+use super::openai::OpenAiProvider;
+use crate::{AiProvider, ProviderBase};
+use futures::Stream;
+use std::pin::Pin;
+use tw_protocol::SseStreamExt;
+use tw_types::*;
+
+/// Custom provider that proxies to any OpenAI-compatible endpoint.
+pub struct CustomProvider {
+    inner: OpenAiProvider,
+    provider_name: String,
+}
+
+impl CustomProvider {
+    pub fn new(name: String, base_url: String) -> Self {
+        Self {
+            inner: OpenAiProvider::new(base_url),
+            provider_name: name,
+        }
+    }
+
+    pub fn with_custom_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.inner = self.inner.with_custom_headers(headers);
+        self
+    }
+}
+
+impl AiProvider for CustomProvider {
+    fn name(&self) -> &str {
+        &self.provider_name
+    }
+
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+        ctx: CallCtx,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        self.inner.chat_completion(request, ctx).await
+    }
+
+    fn stream_chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+        ctx: CallCtx,
+    ) -> Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, GatewayError>> + Send>> {
+        self.inner.stream_chat_completion(request, ctx)
+    }
+}

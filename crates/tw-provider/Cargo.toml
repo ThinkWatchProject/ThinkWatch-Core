@@ -1,0 +1,29 @@
+[package]
+name = "tw-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "provider 抽象与各家实现"
+
+[dependencies]
+tw-types = { workspace = true }
+tw-protocol = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = "0.4"
+hmac = "=0.13.0"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "=0.11.0"
+tracing = { workspace = true }
+uuid = { workspace = true }
+urlencoding = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-smithy-eventstream = { workspace = true }
+http_1x = { workspace = true }

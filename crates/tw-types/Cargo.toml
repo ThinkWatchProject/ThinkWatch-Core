@@ -1,0 +1,13 @@
+[package]
+name = "tw-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "共享类型：请求/响应 DTO、调用上下文、网关错误"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

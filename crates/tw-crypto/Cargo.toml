@@ -1,0 +1,16 @@
+[package]
+name = "tw-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AES-256-GCM 信封加解密"
+
+[dependencies]
+aes-gcm = { workspace = true }
+anyhow = { workspace = true }
+hex = "0.4"
+rand = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
