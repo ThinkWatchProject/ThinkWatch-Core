@@ -167,6 +167,53 @@ pub fn load(path: &Path) -> Result<Config, LoadError> {
     Ok(cfg)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    #[error("写 {path} 失败：{source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("序列化失败：{0}")]
+    Serialize(#[from] serde_yaml_ng::Error),
+}
+
+/// 整文件写下一份配置，权限 `0600`。
+///
+/// **这不是 §3.8 的最小替换**。那一套是「改一个标量、其余字节原样不动」，
+/// 用于日常改配置；这一套是从无到有生成，用于首次运行。两者混用会让
+/// 「注释和格式原样保留」那条承诺失效。
+///
+/// 权限不能靠 umask 的运气：这个文件里有明文密钥（§3.2）。
+pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|source| WriteError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    }
+    let text = serde_yaml_ng::to_string(cfg)?;
+    // 先写临时文件再 rename —— 中断的写不该留下半份配置。备份必须原子
+    // 发布，配置本身更是（§9.7）。
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, &text).map_err(|source| WriteError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path).map_err(|source| WriteError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+pub use validate::validate;
+
 /// 默认配置目录：`~/.thinkwatch`。
 pub fn default_dir() -> PathBuf {
     std::env::var_os("THINKWATCH_HOME")

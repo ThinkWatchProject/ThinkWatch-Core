@@ -19,11 +19,11 @@ pub fn generate_key() -> String {
     format!("tw-{body}")
 }
 
-/// 一份能通过校验、但还没有上游的骨架配置。
+/// 一份还没有上游的骨架配置。
 ///
-/// 注意它**不是**合法配置 —— `providers` 是空的，`validate` 会拒。这是
-/// 有意的：首次运行的第二步就是引导用户填第一个 provider（§7.6），在那
-/// 之前配置本就不该被当成可用。
+/// 它**是合法的**（见 `validate` 里那段注释）：core 要能带着它起来，
+/// 控制面要能工作，引导流程才有地方跑。数据面会在收到请求时说清楚
+/// 「还没配上游」—— 那是「不能转发」，不是「配置错了」。
 pub fn generate_initial() -> Config {
     Config {
         version: SCHEMA_VERSION,
@@ -83,8 +83,9 @@ mod tests {
         let c = generate_initial();
         assert_eq!(c.clients.len(), 1);
         assert!(c.providers.is_empty());
-        // 而且它**不**通过校验 —— 引导流程还没走完，配置本就不该可用。
-        assert!(crate::validate::validate(&c).is_err());
+        // 而且它是合法的 —— core 要能带着它起来，否则 UI 连「你还没配
+        // 上游」都说不出口。
+        assert!(crate::validate::validate(&c).is_ok());
     }
 
     #[test]

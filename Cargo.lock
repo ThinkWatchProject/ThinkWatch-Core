@@ -2351,6 +2351,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "reqwest",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -2360,6 +2361,7 @@ dependencies = [
  "tracing",
  "tw-api",
  "tw-config",
+ "tw-gateway",
  "tw-observe",
 ]
 

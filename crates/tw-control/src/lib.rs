@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use tokio::sync::broadcast;
@@ -23,12 +24,17 @@ pub struct ControlState {
     pub config_path: PathBuf,
     pub gateway_addr: Option<String>,
     pub bus: EventBus,
+    /// 探测复用数据面的 HTTP 客户端 —— 同一套超时、同一套代理设置。
+    /// 另起一个会让「探测通了但实际请求不通」变成可能。
+    pub http: reqwest::Client,
 }
 
 pub fn router(state: ControlState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/events", get(events))
+        .route("/probe", post(probe))
+        .route("/setup", post(setup))
         .with_state(state)
 }
 
@@ -79,6 +85,77 @@ fn async_stream_from(
 
 fn rx_state(rx: &mut broadcast::Receiver<tw_api::Event>) -> broadcast::Receiver<tw_api::Event> {
     rx.resubscribe()
+}
+
+/// 探一个上游。零成本，用户可以随便点。
+async fn probe(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ProbeRequest>,
+) -> Json<tw_api::ProbeResponse> {
+    let r = tw_gateway::probe(&s.http, &req.base_url, &req.key, None).await;
+    Json(tw_api::ProbeResponse {
+        ok: r.ok,
+        protocol: r.protocol,
+        latency_ms: r.latency_ms,
+        models: r.models,
+        error: r.error,
+    })
+}
+
+/// 首次运行：写下第一个上游。
+///
+/// **整文件生成**，不走 §3.8 的最小替换 —— 那是两套机制（§7.6 第 1 步）。
+/// 只在还没有 provider 时可用，之后改配置归 M2 的双向同步管。
+async fn setup(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::SetupRequest>,
+) -> Result<Json<tw_api::SetupResponse>, (StatusCode, String)> {
+    // **从磁盘重新读，不看 `s.config`。** 那是启动时的快照，而这个端点
+    // 自己就会改磁盘 —— 用快照做守卫，第二次调用会因为看到一份过期的
+    // 「零 provider」而通过，然后把刚写好的配置整个覆盖掉。
+    //
+    // 热重载（M2）之后快照会跟着磁盘走，但那时这条守卫也不该改回去：
+    // 「会不会覆盖用户的文件」这种判断，就该问文件本身。
+    let current = tw_config::load(&s.config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读配置失败：{e}"),
+        )
+    })?;
+    if !current.providers.is_empty() {
+        // 拒绝而不是覆盖。这个端点存在的前提是「还没有配置」，一旦有了
+        // 配置，整文件重写会把用户的注释和格式全抹掉。
+        return Err((
+            StatusCode::CONFLICT,
+            "已经配过上游了。改配置请直接编辑 config.yaml，或者等界面上的配置页。".to_string(),
+        ));
+    }
+    let mut cfg = current;
+    cfg.providers.push(tw_config::Provider {
+        name: req.name.clone(),
+        base_url: req.base_url.clone(),
+        key: req.key.clone(),
+        // 猜得出来就不写进文件 —— 少一行是一行（§0.6）。
+        protocol: None,
+    });
+    tw_config::validate(&cfg).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    tw_config::write(&s.config_path, &cfg).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("写配置失败：{e}"),
+        )
+    })?;
+
+    let gateway_key = cfg
+        .clients
+        .first()
+        .map(|c| c.key.clone())
+        .unwrap_or_default();
+    Ok(Json(tw_api::SetupResponse {
+        gateway_key,
+        gateway_addr: s.gateway_addr.clone().unwrap_or_default(),
+        config_path: s.config_path.display().to_string(),
+    }))
 }
 
 #[derive(Debug, thiserror::Error)]

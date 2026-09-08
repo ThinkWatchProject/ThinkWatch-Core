@@ -86,19 +86,10 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// `0600`。这个文件里有明文密钥（§3.2），权限不能靠 umask 的运气。
 fn write_config(path: &Path, cfg: &tw_config::Config) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("建目录 {} 失败", dir.display()))?;
-    }
-    let text = serde_yaml_ng::to_string(cfg)?;
-    std::fs::write(path, &text).with_context(|| format!("写 {} 失败", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    // 权限、原子写、目录创建都在 tw-config::write 里。两处各写一遍就是
+    // 两处会漂移 —— 而漂移的那一处大概率是漏了 0600 的那处。
+    Ok(tw_config::write(path, cfg)?)
 }
 
 fn cmd_check(path: &Path) -> Result<()> {
@@ -178,6 +169,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             config_path,
             gateway_addr: if safe { None } else { Some(addr.to_string()) },
             bus: state.bus.clone(),
+            // 探测复用数据面的客户端：同一套超时、同一套代理。另起一个
+            // 会让「探测通了但实际请求不通」变成可能。
+            http: state.http.clone(),
         };
         let sock = socket.clone();
         tokio::spawn(async move {

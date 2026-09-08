@@ -68,6 +68,42 @@ impl Event {
     }
 }
 
+/// 探一个上游能不能用。零成本，见 §4.6 的 L1/L2。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeRequest {
+    pub base_url: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeResponse {
+    pub ok: bool,
+    pub protocol: Option<String>,
+    pub latency_ms: u64,
+    pub models: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// 首次运行时写下第一个上游。
+///
+/// **只在还没有 provider 时可用**。之后改配置走 §3.8 的双向同步（M2），
+/// 那是另一套机制：这里是从无到有整文件生成，那边是改一个字节而保住
+/// 其余全部。混用会让「注释和格式原样保留」这条承诺失效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupRequest {
+    pub name: String,
+    pub base_url: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupResponse {
+    /// 写完之后，客户端该用哪把网关密钥
+    pub gateway_key: String,
+    pub gateway_addr: String,
+    pub config_path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

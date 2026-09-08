@@ -8,7 +8,9 @@
 pub mod auth;
 pub mod error;
 pub mod forward;
+pub mod probe;
 pub mod server;
 
 pub use error::GatewayError;
+pub use probe::{ProbeResult, probe};
 pub use server::{AppState, router, serve};

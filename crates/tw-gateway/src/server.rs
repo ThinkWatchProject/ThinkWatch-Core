@@ -96,11 +96,15 @@ async fn passthrough(
 
     // M0 没有路由，取第一个 provider。M1 会把这里换成规则引擎 ——
     // 接缝留在这一行。
-    let provider = state
-        .config
-        .providers
-        .first()
-        .ok_or_else(|| GatewayError::config("配置里一个 provider 都没有"))?;
+    let provider = state.config.providers.first().ok_or_else(|| {
+        // 这是首次运行还没配完时的正常状态，不是配置错误。措辞要
+        // 说清下一步 —— 用户看到这条时，他手里已经有一个能发请求
+        // 的客户端了，只差一个上游。
+        GatewayError::config(concat!(
+            "还没有配置任何上游。打开 ThinkWatch Lite 添加第一个 provider，",
+            "或者往 config.yaml 的 providers 段里写一个。"
+        ))
+    })?;
 
     let key = provider.resolved_key().map_err(|e| {
         GatewayError::config(format!("provider `{}` 的密钥展开失败：{e}", provider.name))
