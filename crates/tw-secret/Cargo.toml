@@ -8,3 +8,4 @@ repository.workspace = true
 description = "环境变量插值、exec 凭据、密钥打码"
 
 [dependencies]
+thiserror = { workspace = true }

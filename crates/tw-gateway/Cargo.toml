@@ -8,3 +8,20 @@ repository.workspace = true
 description = "数据面 HTTP 服务"
 
 [dependencies]
+tw-config = { workspace = true }
+tw-secret = { workspace = true }
+tw-types = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+serde_json = { workspace = true }

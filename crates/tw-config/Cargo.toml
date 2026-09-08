@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "YAML schema、加载、校验、双向同步"
+description = "YAML schema、加载、校验"
 
 [dependencies]
+tw-secret = { workspace = true }
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
