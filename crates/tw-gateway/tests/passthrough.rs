@@ -479,3 +479,194 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
     assert_eq!(r.status(), 200);
     assert!(!seen.lock().unwrap().body.is_empty());
 }
+
+/// 一个总是返回给定状态码的上游。
+async fn start_broken_upstream(status: u16) -> SocketAddr {
+    let app = Router::new().fallback(axum::routing::any(move || async move {
+        axum::http::StatusCode::from_u16(status).unwrap()
+    }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+fn cfg_with(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
+    Config {
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+        }],
+        providers,
+        routes,
+        ..Default::default()
+    }
+}
+
+async fn serve_cfg(cfg: Config) -> SocketAddr {
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    addr
+}
+
+async fn send_to(gw: SocketAddr) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5"}"#)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_dead_first_provider_fails_over_to_the_next_one() {
+    // §4.2：首字节之前可以透明切换 —— 拿到响应头之前我们还没往客户端
+    // 写过任何东西，换一家客户端完全无感。
+    let dead = start_broken_upstream(503).await;
+    let (good, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![
+            Provider {
+                name: "dead".into(),
+                base_url: format!("http://{dead}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "good".into(),
+                base_url: format!("http://{good}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![],
+    ))
+    .await;
+
+    let r = send_to(gw).await;
+    assert_eq!(r.status(), 200, "客户端应该完全看不出发生过故障转移");
+    assert!(
+        !seen.lock().unwrap().body.is_empty(),
+        "请求最终落在了第二家"
+    );
+}
+
+#[tokio::test]
+async fn a_client_error_does_not_burn_the_other_providers() {
+    // **4xx 不换家**（429 除外）。请求本身有问题的话，换一家也一样被拒，
+    // 还会白白污染那家的健康度 —— 而那家可能完全是好的。
+    let bad_request = start_broken_upstream(400).await;
+    let (backup, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![
+            Provider {
+                name: "first".into(),
+                base_url: format!("http://{bad_request}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "backup".into(),
+                base_url: format!("http://{backup}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![],
+    ))
+    .await;
+
+    let r = send_to(gw).await;
+    assert_eq!(r.status(), 400, "400 原样回给客户端");
+    assert!(seen.lock().unwrap().body.is_empty(), "第二家不该被打扰");
+}
+
+#[tokio::test]
+async fn rate_limiting_does_fail_over_because_another_account_may_have_quota() {
+    // 429 和别的 4xx 不一样：另一家可能有不同的额度。
+    let limited = start_broken_upstream(429).await;
+    let (good, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![
+            Provider {
+                name: "limited".into(),
+                base_url: format!("http://{limited}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "good".into(),
+                base_url: format!("http://{good}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![],
+    ))
+    .await;
+    assert_eq!(send_to(gw).await.status(), 200);
+    assert!(!seen.lock().unwrap().body.is_empty());
+}
+
+#[tokio::test]
+async fn the_only_provider_keeps_being_tried_no_matter_how_broken() {
+    // 唯一的上游被自己熔断就把用户锁死了。没有别的家可切的时候，
+    // 熔断纯粹是自伤（§4.2）。
+    let dead = start_broken_upstream(503).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "only".into(),
+            base_url: format!("http://{dead}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    // 打满熔断阈值之后再打一次，仍然应该是「上游的错误」而不是
+    // 「我们编的无可用上游」
+    for _ in 0..5 {
+        send_to(gw).await;
+    }
+    let r = send_to(gw).await;
+    assert_eq!(r.headers().get("x-thinkwatch-error").unwrap(), "upstream");
+}
+
+#[tokio::test]
+async fn everything_broken_still_tries_rather_than_refusing() {
+    // fail-open：宁可放行到一个可能坏的上游让用户看见真实错误，也不要
+    // 返回一个我们自己编的「无可用上游」—— 后者会让用户以为是我们坏了。
+    let a = start_broken_upstream(503).await;
+    let b = start_broken_upstream(503).await;
+    let gw = serve_cfg(cfg_with(
+        vec![
+            Provider {
+                name: "a".into(),
+                base_url: format!("http://{a}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "b".into(),
+                base_url: format!("http://{b}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![],
+    ))
+    .await;
+    for _ in 0..6 {
+        send_to(gw).await;
+    }
+    let r = send_to(gw).await;
+    assert_eq!(r.status(), 502);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap();
+    // 错误里要能看出「试过谁」—— 用户能看见故障转移在替他工作，
+    // 这是信任的来源。
+    assert!(msg.contains("试过"), "{msg}");
+}

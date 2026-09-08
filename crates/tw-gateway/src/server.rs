@@ -14,6 +14,7 @@ use futures::{StreamExt, TryStreamExt};
 use crate::auth::{extract_key, key_eq};
 use crate::error::GatewayError;
 use crate::forward;
+use crate::health::Health;
 
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
 /// 客户端打不爆内存。
@@ -108,6 +109,8 @@ pub struct AppState {
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
     /// 没有人在看。
     pub bus: tw_observe::EventBus,
+    /// 上游健康。**不持久化** —— 重启后重置为未知（§4.2）。
+    pub health: Arc<Health>,
 }
 
 impl AppState {
@@ -126,6 +129,7 @@ impl AppState {
             config: Arc::new(config),
             http,
             bus: tw_observe::EventBus::new(),
+            health: Arc::new(Health::new()),
         })
     }
 
@@ -197,70 +201,131 @@ async fn passthrough(
         .engine
         .route(&facts)
         .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?;
-    // 候选是有序的：第一个是首选，其余留给故障转移。
-    let chosen = decision
-        .candidates
-        .first()
-        .ok_or_else(|| GatewayError::config("路由选出了一个空的候选列表"))?;
-    let provider = state
-        .config
-        .providers
-        .iter()
-        .find(|p| &p.name == chosen)
-        .ok_or_else(|| {
-            // 校验时挡过一次，能到这儿说明配置在运行中被换过。
-            GatewayError::config(format!(
-                "规则 `{}` 选中了 `{chosen}`，但配置里没有这个 provider",
-                decision.matched_rule
-            ))
-        })?;
-
-    let key = provider.resolved_key().map_err(|e| {
-        GatewayError::config(format!("provider `{}` 的密钥展开失败：{e}", provider.name))
-    })?;
-
-    let url = forward::upstream_url(&provider.base_url, uri.path(), query.as_deref());
-    let method = reqwest::Method::from_bytes(b"POST").expect("POST 是合法方法");
-
-    tracing::debug!(
-        client = %client_name,
-        provider = %provider.name,
-        rule = %decision.matched_rule,
-        group = ?decision.via_group,
-        url = %tw_secret::redact_url(&url),
-        bytes = body.len(),
-        "转发"
-    );
+    // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
+    // 两条边界都在 `Health::filter` 里，理由写在那儿。
+    let (alive, fail_open) = state.health.filter(&decision.candidates);
+    if fail_open {
+        tracing::warn!(
+            candidates = ?decision.candidates,
+            "全部候选都在熔断中，仍然照常尝试（fail-open）"
+        );
+    }
 
     let id = state.bus.next_id();
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
         client: client_name.clone(),
-        provider: provider.name.clone(),
+        provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
         method: "POST".to_string(),
         path: uri.path().to_string(),
         at_ms: now_ms(),
     });
 
-    // 用这个 provider 自己的 Client —— 它带着这个 provider 该走的代理。
-    let http = state.clients.get(&provider.name).unwrap_or(&state.http);
-    let mut req = http.request(method, &url);
-    req = forward::forward_headers(req, &headers);
-    req = forward::apply_credential(req, provider.effective_protocol(), &key);
-    let upstream = match req.body(body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let err = forward::map_reqwest_error(e);
-            // 失败也必须发事件。少了它，UI 上那一行会永远停在「进行中」——
-            // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
-            state.bus.emit(tw_api::Event::RequestFailed {
-                id,
-                source: "upstream".to_string(),
-                message: err.message.clone(),
-            });
-            return Err(err);
+    // 依次尝试。**首字节之前可以透明切换**（§4.2）—— 拿到响应头之前
+    // 我们还没往客户端写过任何东西，换一家客户端完全无感。
+    //
+    // 「尝试链」要留下来：用户能看见故障转移在替他工作，**这是信任的
+    // 来源**。一个静默切换过的请求和一个一次就成的请求，在用户眼里
+    // 应该是不同的。
+    let mut attempts: Vec<String> = Vec::new();
+    let mut last_err: Option<GatewayError> = None;
+    let mut upstream = None;
+    let mut used: Option<&tw_config::Provider> = None;
+
+    for name in &alive {
+        let Some(provider) = state.config.providers.iter().find(|p| &p.name == *name) else {
+            // 校验时挡过一次，能到这儿说明配置在运行中被换过。
+            last_err = Some(GatewayError::config(format!(
+                "规则 `{}` 选中了 `{name}`，但配置里没有这个 provider",
+                decision.matched_rule
+            )));
+            continue;
+        };
+        attempts.push(provider.name.clone());
+
+        let key = match provider.resolved_key() {
+            Ok(k) => k,
+            Err(e) => {
+                // 密钥取不到是这一家的问题（可能是 exec 命令挂了），
+                // 换下一家是合理的。
+                state.health.record_failure(&provider.name);
+                last_err = Some(GatewayError::config(format!(
+                    "provider `{}` 的密钥取不到：{e}",
+                    provider.name
+                )));
+                continue;
+            }
+        };
+        let url = forward::upstream_url(&provider.base_url, uri.path(), query.as_deref());
+        let method = reqwest::Method::from_bytes(b"POST").expect("POST 是合法方法");
+
+        tracing::debug!(
+            client = %client_name,
+            provider = %provider.name,
+            rule = %decision.matched_rule,
+            group = ?decision.via_group,
+            url = %tw_secret::redact_url(&url),
+            attempt = attempts.len(),
+            "转发"
+        );
+
+        // 用这个 provider 自己的 Client —— 它带着该走的代理。
+        let http = state.clients.get(&provider.name).unwrap_or(&state.http);
+        let mut req = http.request(method, &url);
+        req = forward::forward_headers(req, &headers);
+        req = forward::apply_credential(req, provider.effective_protocol(), &key);
+        match req.body(body.clone()).send().await {
+            Ok(r) if r.status().is_server_error() || r.status() == 429 => {
+                // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
+                // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
+                // 也一样被拒，还会白白污染那家的健康度。
+                state.health.record_failure(&provider.name);
+                last_err = Some(GatewayError::upstream(format!(
+                    "`{}` 返回 {}",
+                    provider.name,
+                    r.status()
+                )));
+                continue;
+            }
+            Ok(r) => {
+                state.health.record_success(&provider.name);
+                upstream = Some(r);
+                used = Some(provider);
+                break;
+            }
+            Err(e) => {
+                state.health.record_failure(&provider.name);
+                last_err = Some(forward::map_reqwest_error(e));
+                continue;
+            }
         }
+    }
+
+    let (Some(upstream), Some(provider)) = (upstream, used) else {
+        let mut err = last_err.unwrap_or_else(|| GatewayError::config("没有可用的上游"));
+        // **尝试链要进客户端看到的那条错误**，不只进我们的事件流 ——
+        // 用户看的是他自己终端里的报错。一条说「试过 A → B → C 都不行」
+        // 的错误，和一条只说「503」的错误，是两种产品：前者说明我们替
+        // 他做了工作，后者让他以为我们什么都没干（§4.2）。
+        if attempts.len() > 1 {
+            err.message = format!("{}（试过：{}）", err.message, attempts.join(" → "));
+        }
+        // 失败也必须发事件。少了它，UI 上那一行会永远停在「进行中」——
+        // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
+        state.bus.emit(tw_api::Event::RequestFailed {
+            id,
+            source: "upstream".to_string(),
+            message: err.message.clone(),
+        });
+        return Err(err);
     };
+    if attempts.len() > 1 {
+        tracing::info!(
+            chain = %attempts.join(" → "),
+            "故障转移：最终由 {} 服务",
+            provider.name
+        );
+    }
 
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
