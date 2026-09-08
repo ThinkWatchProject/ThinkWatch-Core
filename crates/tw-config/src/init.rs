@@ -29,6 +29,7 @@ pub fn generate_initial() -> Config {
         clients: vec![Client {
             name: "default".to_string(),
             key: generate_key(),
+            ..Default::default()
         }],
         // 其余全是默认值：没有 provider、没有代理、没有规则。
         // 层 0（不写规则也能跑，§3.4）就是这份配置的形状。

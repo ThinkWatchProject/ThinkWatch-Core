@@ -19,6 +19,9 @@ pub enum Source {
     Upstream,
     /// 请求本身有问题
     Request,
+    /// 我们这一层排不下了。**这是唯一一个我们主动拒绝的场景**，
+    /// 而它的存在是为了防止队列撑爆内存（§4.7）。
+    Overloaded,
 }
 
 impl Source {
@@ -28,6 +31,7 @@ impl Source {
             Source::Config => "config",
             Source::Upstream => "upstream",
             Source::Request => "request",
+            Source::Overloaded => "overloaded",
         }
     }
     fn status(&self) -> StatusCode {
@@ -36,6 +40,8 @@ impl Source {
             Source::Config => StatusCode::INTERNAL_SERVER_ERROR,
             Source::Upstream => StatusCode::BAD_GATEWAY,
             Source::Request => StatusCode::BAD_REQUEST,
+            // 429 而不是 503：客户端至少知道这是限流，可以退避。
+            Source::Overloaded => StatusCode::TOO_MANY_REQUESTS,
         }
     }
     /// Anthropic 的 error.type 词表。
@@ -45,6 +51,7 @@ impl Source {
             Source::Config => "api_error",
             Source::Upstream => "api_error",
             Source::Request => "invalid_request_error",
+            Source::Overloaded => "rate_limit_error",
         }
     }
 }

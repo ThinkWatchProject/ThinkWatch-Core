@@ -296,6 +296,48 @@ pub fn substitute_template(
     out
 }
 
+/// 并发上限（DESIGN.md §4.7）。住在 tw-types 是因为配置和数据面都要认
+/// 它，而它本身只是几个数字 —— 不该为此让 tw-config 依赖 tw-gateway。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Limits {
+    /// 全局并发
+    #[serde(default = "d_max_concurrent")]
+    pub max_concurrent: usize,
+    /// 单个上游
+    #[serde(default = "d_per_provider")]
+    pub per_provider: usize,
+    /// 队列上限。满了才真的拒绝
+    #[serde(default = "d_queue_depth")]
+    pub queue_depth: usize,
+    /// 排太久还是要放弃
+    #[serde(default = "d_queue_timeout")]
+    pub queue_timeout_secs: u64,
+}
+
+fn d_max_concurrent() -> usize {
+    16
+}
+fn d_per_provider() -> usize {
+    8
+}
+fn d_queue_depth() -> usize {
+    64
+}
+fn d_queue_timeout() -> u64 {
+    30
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: d_max_concurrent(),
+            per_provider: d_per_provider(),
+            queue_depth: d_queue_depth(),
+            queue_timeout_secs: d_queue_timeout(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod call_ctx_tests {
     use super::*;

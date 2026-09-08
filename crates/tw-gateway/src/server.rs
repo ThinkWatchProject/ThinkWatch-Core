@@ -111,6 +111,8 @@ pub struct AppState {
     pub bus: tw_observe::EventBus,
     /// 上游健康。**不持久化** —— 重启后重置为未知（§4.2）。
     pub health: Arc<Health>,
+    /// 并发闸门。排队不拒绝（§4.7）。
+    pub gate: Arc<crate::limits::Gate>,
 }
 
 impl AppState {
@@ -122,6 +124,7 @@ impl AppState {
         for p in &config.providers {
             clients.insert(p.name.clone(), build_client(&config, p)?);
         }
+        let limits = config.limits.clone();
         let engine = Arc::new(config.engine());
         Ok(Self {
             clients: Arc::new(clients),
@@ -130,6 +133,7 @@ impl AppState {
             http,
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
+            gate: Arc::new(crate::limits::Gate::new(limits)),
         })
     }
 
@@ -201,6 +205,31 @@ async fn passthrough(
         .engine
         .route(&facts)
         .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?;
+    // 管线第 3 步：准入。**排队而不是拒绝**（§4.7）—— 客户端收到 429
+    // 通常不会优雅重试，一个本来只需要多等两秒的请求会变成一次任务中断。
+    //
+    // 闸门在路由**之后**取：要知道走哪个 provider 才能算 per_provider
+    // 那一维。
+    let client_limit = state
+        .config
+        .clients
+        .iter()
+        .find(|c| c.name == client_name)
+        .and_then(|c| c.max_concurrent);
+    let _pass = state
+        .gate
+        .acquire(
+            decision
+                .candidates
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("?"),
+            &client_name,
+            client_limit,
+        )
+        .await
+        .map_err(|e| GatewayError::new(crate::error::Source::Overloaded, e.to_string()))?;
+
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
     // 两条边界都在 `Health::filter` 里，理由写在那儿。
     let (alive, fail_open) = state.health.filter(&decision.candidates);
@@ -396,6 +425,7 @@ mod tests {
             clients: vec![Client {
                 name: "default".into(),
                 key: "tw-good".into(),
+                ..Default::default()
             }],
             providers: vec![Provider {
                 name: "r".into(),
@@ -477,6 +507,7 @@ mod tests {
             clients: vec![tw_config::Client {
                 name: "c".into(),
                 key: "tw-k".into(),
+                ..Default::default()
             }],
             providers: vec![
                 tw_config::Provider {

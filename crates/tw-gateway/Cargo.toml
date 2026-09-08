@@ -26,6 +26,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 tw-api = { workspace = true }
 tw-engine = { workspace = true }
 serde_yaml_ng = { workspace = true }

@@ -9,6 +9,7 @@ description = "YAML schema、加载、校验"
 
 [dependencies]
 tw-engine = { workspace = true }
+tw-types = { workspace = true }
 tw-secret = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }

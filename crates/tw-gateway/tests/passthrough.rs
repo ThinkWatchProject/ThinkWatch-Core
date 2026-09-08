@@ -7,6 +7,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -66,6 +68,7 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
         clients: vec![Client {
             name: "claude-code".into(),
             key: "tw-testkey".into(),
+            ..Default::default()
         }],
         providers: vec![Provider {
             name: "mock".into(),
@@ -232,6 +235,7 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
         clients: vec![Client {
             name: "claude-code".into(),
             key: "tw-testkey".into(),
+            ..Default::default()
         }],
         providers: vec![Provider {
             name: "mock".into(),
@@ -299,6 +303,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
         clients: vec![Client {
             name: "c".into(),
             key: "tw-k".into(),
+            ..Default::default()
         }],
         providers: vec![Provider {
             name: "dead".into(),
@@ -364,6 +369,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         clients: vec![Client {
             name: "claude-code".into(),
             key: "tw-k".into(),
+            ..Default::default()
         }],
         providers: vec![
             Provider {
@@ -383,6 +389,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         ],
         groups: Vec::new(),
         proxies: Vec::new(),
+        limits: Default::default(),
         routes: vec![
             tw_engine::Route {
                 name: "opus 走官方".into(),
@@ -454,6 +461,7 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
         clients: vec![Client {
             name: "c".into(),
             key: "tw-k".into(),
+            ..Default::default()
         }],
         providers: vec![Provider {
             name: "only".into(),
@@ -496,6 +504,7 @@ fn cfg_with(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
         clients: vec![Client {
             name: "c".into(),
             key: "tw-k".into(),
+            ..Default::default()
         }],
         providers,
         routes,
@@ -669,4 +678,155 @@ async fn everything_broken_still_tries_rather_than_refusing() {
     // 错误里要能看出「试过谁」—— 用户能看见故障转移在替他工作，
     // 这是信任的来源。
     assert!(msg.contains("试过"), "{msg}");
+}
+
+/// 一个慢上游：每个请求要 `delay`，用来观察并发行为。
+async fn start_slow_upstream(delay: Duration) -> (SocketAddr, Arc<AtomicUsize>) {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (i2, p2) = (inflight.clone(), peak.clone());
+    let app = Router::new().fallback(axum::routing::any(move || {
+        let (i, p) = (i2.clone(), p2.clone());
+        async move {
+            let now = i.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            i.fetch_sub(1, Ordering::SeqCst);
+            axum::Json(serde_json::json!({"ok": true}))
+        }
+    }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, peak)
+}
+
+fn cfg_with_limits(up: SocketAddr, limits: tw_config::Limits) -> Config {
+    Config {
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+            ..Default::default()
+        }],
+        providers: vec![Provider {
+            name: "slow".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        limits,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_the_concurrency_limit_requests_queue_instead_of_being_refused() {
+    // **这是 §4.7 那条的可信证明。**客户端收到 429 通常不会优雅重试，
+    // 一个本来只需要多等两秒的请求会变成一次任务中断 —— 所以超限时
+    // 必须排队。
+    let (up, peak) = start_slow_upstream(Duration::from_millis(200)).await;
+    let gw = serve_cfg(cfg_with_limits(
+        up,
+        tw_config::Limits {
+            max_concurrent: 2,
+            per_provider: 2,
+            queue_depth: 64,
+            queue_timeout_secs: 30,
+        },
+    ))
+    .await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        tasks.push(tokio::spawn(
+            async move { send_to(gw).await.status().as_u16() },
+        ));
+    }
+    let codes: Vec<u16> = futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert!(codes.iter().all(|&c| c == 200), "全部该成功：{codes:?}");
+    // 而且上游确实没有同时收到超过 2 个 —— 闸门真的在限流，不是摆设
+    assert!(
+        peak.load(Ordering::SeqCst) <= 2,
+        "上游峰值 {}",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_queue_refuses_with_429_rather_than_growing_without_bound() {
+    // 队列必须有上限：失控的脚本会把队列撑爆，内存跟着涨 —— 那比拒绝
+    // 更糟。这是**唯一**一个我们主动拒绝的场景。
+    let (up, _) = start_slow_upstream(Duration::from_millis(400)).await;
+    let gw = serve_cfg(cfg_with_limits(
+        up,
+        tw_config::Limits {
+            max_concurrent: 1,
+            per_provider: 1,
+            queue_depth: 3,
+            queue_timeout_secs: 30,
+        },
+    ))
+    .await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        tasks.push(tokio::spawn(async move {
+            let r = send_to(gw).await;
+            (
+                r.status().as_u16(),
+                r.headers()
+                    .get("x-thinkwatch-error")
+                    .map(|v| v.to_str().unwrap().to_string()),
+            )
+        }));
+    }
+    let out: Vec<(u16, Option<String>)> = futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let ok = out.iter().filter(|(c, _)| *c == 200).count();
+    let refused: Vec<_> = out.iter().filter(|(c, _)| *c == 429).collect();
+    assert!(ok > 0, "总得有几个成功：{out:?}");
+    assert!(!refused.is_empty(), "队列该满了才对：{out:?}");
+    // 拒绝的那些要说清是我们这一层的过载，不是上游的
+    assert_eq!(refused[0].1.as_deref(), Some("overloaded"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_client_limit_keeps_one_client_from_taking_everything() {
+    // 监听局域网时是刚需：某台机器上的失控脚本不该能占满全部并发（§4.7）。
+    let (up, peak) = start_slow_upstream(Duration::from_millis(200)).await;
+    let mut cfg = cfg_with_limits(
+        up,
+        tw_config::Limits {
+            max_concurrent: 8,
+            per_provider: 8,
+            queue_depth: 64,
+            queue_timeout_secs: 30,
+        },
+    );
+    cfg.clients[0].max_concurrent = Some(1);
+    let gw = serve_cfg(cfg).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        tasks.push(tokio::spawn(
+            async move { send_to(gw).await.status().as_u16() },
+        ));
+    }
+    let codes: Vec<u16> = futures::future::join_all(tasks)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(codes.iter().all(|&c| c == 200), "{codes:?}");
+    // 全局给了 8，但这个客户端只有 1 —— 三个维度取最严的那个
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
 }

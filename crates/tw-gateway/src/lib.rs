@@ -9,10 +9,12 @@ pub mod auth;
 pub mod error;
 pub mod forward;
 pub mod health;
+pub mod limits;
 pub mod probe;
 pub mod server;
 
 pub use error::GatewayError;
 pub use health::Health;
+pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use server::{AppState, router, serve};

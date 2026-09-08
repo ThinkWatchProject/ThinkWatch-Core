@@ -126,6 +126,7 @@ mod tests {
         Client {
             name: name.into(),
             key: key.into(),
+            ..Default::default()
         }
     }
     fn p(name: &str, url: &str) -> Provider {

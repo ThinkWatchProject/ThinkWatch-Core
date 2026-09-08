@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+pub use tw_types::Limits;
 
 mod init;
 pub mod proxy;
@@ -23,7 +24,10 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 8788;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
-    #[serde(default)]
+    /// **默认值不写进文件。** §3.3 承诺第一天的配置是六行，而每加一个
+    /// 带默认值的字段就会往文件里多堆几行 —— 用户打开配置看到一屏自己
+    /// 没配过的东西，就分不清哪些是他的决定、哪些只是默认。
+    #[serde(default, skip_serializing_if = "is_default")]
     pub listen: Listen,
     /// 客户端身份。密钥即身份（§3.3.1）—— 不是「先认证再看是谁」，
     /// 而是「这把钥匙就是这个人」。
@@ -34,6 +38,9 @@ pub struct Config {
     /// 出站代理。声明一次到处引用（§3.7）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<Proxy>,
+    /// 并发上限。不写就是默认值（§4.7）。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub limits: Limits,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<tw_engine::Group>,
     /// 路由规则。同上，不写就是「按声明顺序故障转移」。
@@ -52,8 +59,20 @@ impl Default for Config {
             clients: Vec::new(),
             providers: Vec::new(),
             proxies: Vec::new(),
+            limits: Limits::default(),
             groups: Vec::new(),
             routes: Vec::new(),
+        }
+    }
+}
+
+/// 同上：加 Default 是为了让新字段不再逼着所有构造点跟着改。
+impl Default for Client {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            key: String::new(),
+            max_concurrent: None,
         }
     }
 }
@@ -83,13 +102,13 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Listen {
     #[serde(default)]
     pub gateway: GatewayListen,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayListen {
     /// loopback | lan | all | 具体 IP。默认 loopback —— 学 Surge，
     /// 但默认值要保守（§5.4）。
@@ -139,6 +158,10 @@ impl Bind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
     pub name: String,
+    /// 这个客户端自己的并发上限。**监听局域网时是刚需**（§4.7）——
+    /// 某台机器上的失控脚本不该能占满全部并发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
     /// 网关密钥。`tw-` 前缀是刻意的：用户在客户端配置里看到它时，
     /// 一眼就知道这不是某个上游的真 key（§5.4）。
     pub key: String,
@@ -237,14 +260,23 @@ pub struct Provider {
     /// **默认 `direct` 而不是 `system`**：显式优于隐式。默认跟随系统的
     /// 话，用户在系统里开了全局代理，本地 Ollama 就会莫名连不上，而
     /// 配置文件里看不出任何线索。
-    #[serde(default = "default_proxy")]
+    #[serde(default = "default_proxy", skip_serializing_if = "is_direct")]
     pub proxy: String,
     #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
     pub on_proxy_fail: OnProxyFail,
 }
 
+/// 和默认值相等吗。用于 `skip_serializing_if`。
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
 fn default_proxy() -> String {
     DIRECT.to_string()
+}
+
+fn is_direct(v: &str) -> bool {
+    v == DIRECT
 }
 
 fn is_default_on_proxy_fail(v: &OnProxyFail) -> bool {
