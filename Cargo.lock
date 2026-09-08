@@ -2363,8 +2363,10 @@ dependencies = [
  "tracing",
  "tw-api",
  "tw-config",
+ "tw-engine",
  "tw-gateway",
  "tw-observe",
+ "tw-secret",
 ]
 
 [[package]]

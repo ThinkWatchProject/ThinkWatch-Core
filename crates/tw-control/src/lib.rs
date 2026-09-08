@@ -27,12 +27,15 @@ pub struct ControlState {
     /// 探测复用数据面的 HTTP 客户端 —— 同一套超时、同一套代理设置。
     /// 另起一个会让「探测通了但实际请求不通」变成可能。
     pub http: reqwest::Client,
+    /// 上游健康。界面要显示哪家在熔断中。
+    pub health: Arc<tw_gateway::Health>,
 }
 
 pub fn router(state: ControlState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/events", get(events))
+        .route("/overview", get(overview))
         .route("/probe", post(probe))
         .route("/setup", post(setup))
         .with_state(state)
@@ -85,6 +88,105 @@ fn async_stream_from(
 
 fn rx_state(rx: &mut broadcast::Receiver<tw_api::Event>) -> broadcast::Receiver<tw_api::Event> {
     rx.resubscribe()
+}
+
+/// 界面要显示的配置概览。**密钥只给来源，不给值。**
+async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
+    let cfg = &s.config;
+    let engine = cfg.engine();
+    Json(tw_api::Overview {
+        providers: cfg
+            .providers
+            .iter()
+            .map(|p| tw_api::ProviderView {
+                name: p.name.clone(),
+                base_url: tw_secret::redact_url(&p.base_url),
+                key_source: p.key.describe(),
+                protocol: p.effective_protocol().map(|x| format!("{x:?}")),
+                proxy: p.proxy.clone(),
+                health: match s.health.state(&p.name) {
+                    tw_gateway::health::State::Closed => "ok".into(),
+                    tw_gateway::health::State::Open => "open".into(),
+                },
+            })
+            .collect(),
+        routes: engine
+            .routes()
+            .iter()
+            .map(|r| tw_api::RouteView {
+                name: r.name.clone(),
+                to: r.to.clone(),
+                conditions: describe_when(&r.when),
+            })
+            .collect(),
+        groups: engine
+            .groups()
+            .iter()
+            .map(|g| tw_api::GroupView {
+                name: g.name.clone(),
+                kind: format!("{:?}", g.kind).to_lowercase(),
+                providers: g.providers.clone(),
+                hurts_cache: g.kind.hurts_cache(),
+            })
+            .collect(),
+        clients: cfg
+            .clients
+            .iter()
+            .map(|c| tw_api::ClientView {
+                name: c.name.clone(),
+                key: tw_secret::mask_secret(&c.key),
+                max_concurrent: c.max_concurrent,
+            })
+            .collect(),
+        listen: tw_api::ListenView {
+            bind: format!("{:?}", cfg.listen.gateway.bind).to_lowercase(),
+            port: cfg.listen.gateway.port,
+            allow_from: cfg.listen.gateway.effective_allow_from(),
+            exposed: cfg.listen.gateway.bind.is_exposed(),
+        },
+    })
+}
+
+/// 把 `when` 写成人话。
+///
+/// **规则列表上必须能直接读懂条件** —— 让用户去对着 YAML 猜「这条为什么
+/// 没命中」，正是 §7.11 那类「我明明配了」问题的来源。
+fn describe_when(w: &tw_engine::rule::When) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(m) = &w.model {
+        out.push(format!("模型 {m}"));
+    }
+    if let Some(c) = &w.client {
+        out.push(format!("客户端 {c}"));
+    }
+    if let Some(d) = &w.dialect {
+        out.push(format!("方言 {d}"));
+    }
+    for (label, v) in [
+        ("输入 token", &w.input_tokens),
+        ("max_tokens", &w.max_tokens),
+        ("工具数", &w.tool_count),
+    ] {
+        if let Some(x) = v {
+            out.push(format!("{label} {x}"));
+        }
+    }
+    for (label, v) in [
+        ("带缓存", w.cache),
+        ("带工具", w.tools),
+        ("带图片", w.image),
+        ("扩展思考", w.thinking),
+        ("流式", w.stream),
+    ] {
+        if let Some(b) = v {
+            out.push(if b {
+                label.to_string()
+            } else {
+                format!("不{label}")
+            });
+        }
+    }
+    out
 }
 
 /// 探一个上游。零成本，用户可以随便点。

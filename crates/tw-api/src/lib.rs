@@ -68,6 +68,68 @@ impl Event {
     }
 }
 
+/// 界面要显示的配置概览。
+///
+/// **不是配置文件本身**：密钥一律只给来源描述，不给值（§9.7 的统一脱敏）。
+/// 界面需要的是「有哪些上游、规则怎么写的、谁健康」，不是那份 YAML。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Overview {
+    pub providers: Vec<ProviderView>,
+    pub routes: Vec<RouteView>,
+    pub groups: Vec<GroupView>,
+    pub clients: Vec<ClientView>,
+    pub listen: ListenView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderView {
+    pub name: String,
+    /// 已脱敏
+    pub base_url: String,
+    /// 密钥的**来源**，不是值
+    pub key_source: String,
+    pub protocol: Option<String>,
+    pub proxy: String,
+    /// closed / open
+    pub health: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteView {
+    pub name: String,
+    pub to: String,
+    /// `when` 的人话摘要。空 = 兜底
+    pub conditions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupView {
+    pub name: String,
+    pub kind: String,
+    pub providers: Vec<String>,
+    /// 这个策略会不会让 prompt cache 不稳定。**要在界面上直说** ——
+    /// 它决定了用户的账单（§3.4）。
+    pub hurts_cache: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientView {
+    pub name: String,
+    /// 已脱敏
+    pub key: String,
+    pub max_concurrent: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenView {
+    pub bind: String,
+    pub port: u16,
+    /// 实际生效的白名单（`lan`/`all` 下会是默认填的私网段）
+    pub allow_from: Vec<String>,
+    /// 非 loopback 时为真。界面上要据此把「关闭密钥校验」置灰（§5.4）
+    pub exposed: bool,
+}
+
 /// 探一个上游能不能用。零成本，见 §4.6 的 L1/L2。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeRequest {

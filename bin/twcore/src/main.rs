@@ -191,6 +191,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             // 探测复用数据面的客户端：同一套超时、同一套代理。另起一个
             // 会让「探测通了但实际请求不通」变成可能。
             http: state.http.clone(),
+            health: state.health.clone(),
         };
         let sock = socket.clone();
         tokio::spawn(async move {
