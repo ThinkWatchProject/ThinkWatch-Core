@@ -5,11 +5,9 @@
 use futures::Stream;
 use std::pin::Pin;
 
-use tw_types::{
-    CallCtx, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, GatewayError,
-    parse_retry_after_seconds, substitute_template,
-};
-
+// 整体再导出：调用方只需要 `use tw_provider::*` 就能同时拿到 DTO 和
+// provider 抽象。注意不要在这里再写一遍具名 `use tw_types::{...}` ——
+// 私有具名导入会盖掉同名的 glob 再导出，外部就看不见那些类型了。
 pub use tw_types::*;
 
 pub mod providers;

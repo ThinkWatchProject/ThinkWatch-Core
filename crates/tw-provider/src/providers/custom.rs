@@ -1,8 +1,7 @@
 use super::openai::OpenAiProvider;
-use crate::{AiProvider, ProviderBase};
+use crate::AiProvider;
 use futures::Stream;
 use std::pin::Pin;
-use tw_protocol::SseStreamExt;
 use tw_types::*;
 
 /// Custom provider that proxies to any OpenAI-compatible endpoint.

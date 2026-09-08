@@ -261,10 +261,6 @@ pub fn parse_retry_after_seconds(value: &str) -> Option<u32> {
     value.trim().parse::<u32>().ok()
 }
 
-/// Shared base for all AI providers. Holds the HTTP client, base URL,
-/// and custom header templates. Previously each provider duplicated
-/// these three fields and the identical `new()`, `with_custom_headers()`,
-
 /// Replace every `{{key}}` occurrence in `template` with `attrs[key]`,
 /// or with the empty string when the key is absent.
 pub fn substitute_template(

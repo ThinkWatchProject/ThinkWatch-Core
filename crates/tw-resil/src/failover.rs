@@ -379,7 +379,6 @@ mod tests {
     use super::*;
     use futures::Stream;
     use tw_provider::AiProvider;
-    use tw_types::*;
 
     struct DummyProvider {
         name: &'static str,

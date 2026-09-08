@@ -3,7 +3,6 @@ use futures::Stream;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
-use tw_protocol::SseStreamExt;
 use tw_types::*;
 
 /// AWS Bedrock provider using the Converse API.
