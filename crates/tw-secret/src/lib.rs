@@ -6,8 +6,10 @@
 
 use std::collections::HashMap;
 
+pub mod exec;
 pub mod mask;
 
+pub use exec::{ExecError, run_exec};
 pub use mask::{mask_secret, redact_url};
 
 #[derive(Debug, thiserror::Error)]

@@ -90,12 +90,91 @@ pub struct Client {
     pub key: String,
 }
 
+/// 密钥怎么来。
+///
+/// 三种形态，**刻意按「用户会不会用到」排序**：绝大多数人写一个字符串
+/// 就完了（§3.2 明确说了密钥就明文写在配置里，不做 keychain）；`${ENV}`
+/// 给不想让密钥落到文件里的人；`exec` 给真的把密钥放在 1Password /
+/// pass 里的人。
+///
+/// serde 的 untagged 让前两种都是裸字符串 —— 配置文件里看不出区别，
+/// 也不该看出区别。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Secret {
+    /// 明文，或含 `${ENV}` 的字符串
+    Literal(String),
+    /// 跑一条命令，拿 stdout。**不过 shell**，见 tw_secret::run_exec。
+    Exec {
+        exec: Vec<String>,
+        /// 秒。不写用默认值 —— 卡住的凭据命令会让网关整个没反应。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
+}
+
+impl Secret {
+    /// 拿到真正的密钥。
+    ///
+    /// **每次调用都会重新跑 exec**。不缓存是有意的：`op read` 那类命令
+    /// 背后是一个会过期的会话，缓存住会让「昨天还好好的，今天全是 401」
+    /// 变得无法解释。真需要缓存时，那是一个显式的 TTL 配置，不是默认行为。
+    pub fn resolve(&self) -> Result<String, SecretResolveError> {
+        match self {
+            Secret::Literal(s) => Ok(tw_secret::expand_from_env(s)?),
+            Secret::Exec { exec, timeout_secs } => {
+                let t = timeout_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(tw_secret::exec::DEFAULT_TIMEOUT);
+                Ok(tw_secret::run_exec(exec, t)?)
+            }
+        }
+    }
+
+    /// 给人看的形态，**永远不含真实密钥**。
+    pub fn describe(&self) -> String {
+        match self {
+            Secret::Literal(s) if s.contains("${") => format!("环境变量 {s}"),
+            Secret::Literal(s) => tw_secret::mask_secret(s),
+            Secret::Exec { exec, .. } => format!("exec: {}", exec.join(" ")),
+        }
+    }
+
+    pub(crate) fn is_blank(&self) -> bool {
+        match self {
+            Secret::Literal(s) => s.trim().is_empty(),
+            Secret::Exec { exec, .. } => exec.is_empty(),
+        }
+    }
+}
+
+/// 裸字符串是绝大多数人的写法，所以让它在 Rust 侧也是最省事的那个。
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Secret::Literal(s.to_string())
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Secret::Literal(s)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SecretResolveError {
+    #[error(transparent)]
+    Env(#[from] tw_secret::SecretError),
+    #[error(transparent)]
+    Exec(#[from] tw_secret::ExecError),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     pub name: String,
     pub base_url: String,
-    /// 明文，或 `${ENV}`。见 §3.2 —— 不做 keychain。
-    pub key: String,
+    /// 明文、`${ENV}`、或 `{ exec: [...] }`。见 §3.2 —— 不做 keychain。
+    pub key: Secret,
     /// 不写就从 base_url 猜（§3.3 的最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
@@ -131,9 +210,9 @@ impl Provider {
             .or_else(|| Self::guess_protocol(&self.base_url))
     }
 
-    /// 展开 `${ENV}` 之后的 key。
-    pub fn resolved_key(&self) -> Result<String, tw_secret::SecretError> {
-        tw_secret::expand_from_env(&self.key)
+    /// 拿到真正的 key（展开 `${ENV}` 或跑 `exec`）。
+    pub fn resolved_key(&self) -> Result<String, SecretResolveError> {
+        self.key.resolve()
     }
 }
 
@@ -274,7 +353,7 @@ providers:
         let p = Provider {
             name: "x".into(),
             base_url: "https://api.anthropic.com".into(),
-            key: "k".into(),
+            key: Secret::Literal("k".into()),
             protocol: Some(Protocol::OpenaiChat),
         };
         assert_eq!(p.effective_protocol(), Some(Protocol::OpenaiChat));
@@ -288,12 +367,71 @@ providers:
     }
 
     #[test]
+    fn a_bare_string_key_still_parses_the_way_it_always_did() {
+        // untagged 的第一条：配置文件里绝大多数人写的还是一个裸字符串，
+        // 而且不该看出这里有个枚举。
+        let cfg: Config = serde_yaml_ng::from_str(MINIMAL).unwrap();
+        assert!(matches!(cfg.providers[0].key, Secret::Literal(ref s) if s == "sk-xxx"));
+    }
+
+    #[test]
+    fn an_exec_key_parses_and_never_shows_the_secret() {
+        let y = r#"
+version: 1
+clients:
+  - { name: default, key: tw-1 }
+providers:
+  - name: p
+    base_url: https://x.com
+    key:
+      exec: ["op", "read", "op://vault/anthropic/key"]
+"#;
+        let cfg: Config = serde_yaml_ng::from_str(y).unwrap();
+        match &cfg.providers[0].key {
+            Secret::Exec { exec, timeout_secs } => {
+                assert_eq!(exec[0], "op");
+                assert!(timeout_secs.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        // describe 是给人看的，必须不含真实密钥 —— 这里它连密钥都还没跑
+        assert!(cfg.providers[0].key.describe().starts_with("exec:"));
+    }
+
+    #[test]
+    fn describe_never_leaks_a_literal_key() {
+        // 这个方法会出现在 UI、日志、错误信息里。
+        let s = Secret::Literal("sk-ant-api03-verysecretvalue".into());
+        let d = s.describe();
+        assert!(!d.contains("verysecret"), "{d}");
+        assert!(d.contains('…'), "{d}");
+    }
+
+    #[test]
+    fn describe_shows_the_env_var_name_not_its_value() {
+        // 变量名不是秘密，而它恰恰是用户排查时要看的东西。
+        assert_eq!(
+            Secret::Literal("${MY_KEY}".into()).describe(),
+            "环境变量 ${MY_KEY}"
+        );
+    }
+
+    #[test]
+    fn an_exec_key_actually_runs() {
+        let s = Secret::Exec {
+            exec: vec!["echo".into(), "sk-1".into()],
+            timeout_secs: None,
+        };
+        assert_eq!(s.resolve().unwrap(), "sk-1");
+    }
+
+    #[test]
     fn env_interpolation_reaches_the_key() {
         unsafe { std::env::set_var("TW_TEST_KEY", "sk-from-env") };
         let p = Provider {
             name: "x".into(),
             base_url: "https://x".into(),
-            key: "${TW_TEST_KEY}".into(),
+            key: Secret::Literal("${TW_TEST_KEY}".into()),
             protocol: None,
         };
         assert_eq!(p.resolved_key().unwrap(), "sk-from-env");

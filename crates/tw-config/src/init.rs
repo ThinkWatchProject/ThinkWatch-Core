@@ -44,7 +44,7 @@ pub fn generate_with_provider(name: &str, base_url: &str, key: &str) -> Config {
     cfg.providers.push(Provider {
         name: name.to_string(),
         base_url: base_url.to_string(),
-        key: key.to_string(),
+        key: crate::Secret::Literal(key.to_string()),
         // 猜得出来就不写进文件 —— 少一行是一行（§0.6）。猜不出来也不写：
         // 让 `twcore check` 在这里说「未知」，比在配置里落一个我们编的
         // 默认值好，后者会让用户以为是他自己选的。

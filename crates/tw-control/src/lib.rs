@@ -147,7 +147,7 @@ async fn setup(
     cfg.providers.push(tw_config::Provider {
         name: req.name.clone(),
         base_url: req.base_url.clone(),
-        key: req.key.clone(),
+        key: tw_config::Secret::Literal(req.key.clone()),
         // 猜得出来就不写进文件 —— 少一行是一行（§0.6）。
         protocol: None,
     });

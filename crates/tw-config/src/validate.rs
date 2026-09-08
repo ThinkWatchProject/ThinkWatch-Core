@@ -62,7 +62,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 url: p.base_url.clone(),
             });
         }
-        if p.key.trim().is_empty() {
+        if p.key.is_blank() {
             return Err(ValidationError::EmptyProviderKey {
                 name: p.name.clone(),
             });
@@ -113,7 +113,7 @@ mod tests {
         Provider {
             name: name.into(),
             base_url: url.into(),
-            key: "sk-x".into(),
+            key: crate::Secret::Literal("sk-x".into()),
             protocol: None,
         }
     }

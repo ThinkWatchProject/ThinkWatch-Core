@@ -108,11 +108,20 @@ fn cmd_check(path: &Path) -> Result<()> {
                     None => "未知（按 Anthropic 转发）".to_string(),
                 };
                 println!(
-                    "   · {} → {} [{}]",
+                    "   · {} → {} [{}]  密钥 {}",
                     p.name,
                     tw_secret::redact_url(&p.base_url),
-                    proto
+                    proto,
+                    // 说来源而不是值。`exec` 那种要能一眼看出跑的是什么，
+                    // 因为它是这个文件里唯一会执行东西的字段。
+                    p.key.describe()
                 );
+                // exec 在 check 时**真跑一次**。这正是 check 存在的意义 ——
+                // 「密钥命令能不能跑通」最容易到用第一次才发现，而那时的
+                // 表现是一个莫名其妙的 401，或者网关整个卡住。
+                if let Err(e) = p.resolved_key() {
+                    println!("     ⚠ 密钥取不到：{e}");
+                }
             }
             Ok(())
         }
