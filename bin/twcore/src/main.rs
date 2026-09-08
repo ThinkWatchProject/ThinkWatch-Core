@@ -4,7 +4,7 @@
 //! 它自己不注册开机自启。这里做的是引擎侧那一半 —— 单实例、父进程守望、
 //! 干净退出。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -66,7 +66,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_init(path: &PathBuf, force: bool) -> Result<()> {
+fn cmd_init(path: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         anyhow::bail!(
             "{} 已经存在。要重新生成请加 --force —— 但那会覆盖你现在的配置，\n\
@@ -87,7 +87,7 @@ fn cmd_init(path: &PathBuf, force: bool) -> Result<()> {
 }
 
 /// `0600`。这个文件里有明文密钥（§3.2），权限不能靠 umask 的运气。
-fn write_config(path: &PathBuf, cfg: &tw_config::Config) -> Result<()> {
+fn write_config(path: &Path, cfg: &tw_config::Config) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("建目录 {} 失败", dir.display()))?;
     }
@@ -101,7 +101,7 @@ fn write_config(path: &PathBuf, cfg: &tw_config::Config) -> Result<()> {
     Ok(())
 }
 
-fn cmd_check(path: &PathBuf) -> Result<()> {
+fn cmd_check(path: &Path) -> Result<()> {
     match tw_config::load(path) {
         Ok(cfg) => {
             println!("✅ {} 没问题", path.display());
@@ -132,7 +132,7 @@ fn cmd_check(path: &PathBuf) -> Result<()> {
     }
 }
 
-fn cmd_serve(path: &PathBuf, port: Option<u16>, safe: bool, parent: Option<u32>) -> Result<()> {
+fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) -> Result<()> {
     let dir = path
         .parent()
         .map(PathBuf::from)
