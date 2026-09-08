@@ -6,7 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{any, get};
 use bytes::Bytes;
 use futures::TryStreamExt;

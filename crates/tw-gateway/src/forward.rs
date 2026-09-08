@@ -27,7 +27,7 @@ const STRIP: &[&str] = &[
 
 fn should_strip(name: &HeaderName) -> bool {
     let n = name.as_str();
-    STRIP.iter().any(|s| *s == n)
+    STRIP.contains(&n)
 }
 
 /// 按上游协议把凭据放到它认的位置。
