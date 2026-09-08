@@ -140,12 +140,22 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         }
     };
 
-    let cfg = tw_config::load(path).with_context(|| {
-        format!(
-            "加载 {} 失败。没有配置的话跑一次 `twcore init`。",
-            path.display()
-        )
-    })?;
+    // **配置不存在就地生成**（§7.6 第 1 步）。
+    //
+    // 这里曾经是「加载失败，去跑一次 twcore init」——而那是错的：真正的
+    // 首次运行里根本没有人会去跑 init。UI 直接 spawn 的是 serve，于是
+    // core 起不来、被守护反复重启，用户看到的是一个空界面加一串重启，
+    // 而不是「加第一个上游」。
+    //
+    // 生成的配置没有 provider，那是合法的（见 tw-config::validate）：
+    // 控制面起得来，引导流程有地方跑。
+    if !path.exists() {
+        let cfg = tw_config::generate_initial();
+        tw_config::write(path, &cfg)
+            .with_context(|| format!("生成初始配置 {} 失败", path.display()))?;
+        tracing::info!(path = %path.display(), "首次运行，已生成初始配置");
+    }
+    let cfg = tw_config::load(path).with_context(|| format!("加载 {} 失败", path.display()))?;
     let bind = cfg.listen.gateway.bind.addr().to_string();
     let listen_port = port.unwrap_or(cfg.listen.gateway.port);
     let addr: std::net::SocketAddr = format!("{bind}:{listen_port}")
