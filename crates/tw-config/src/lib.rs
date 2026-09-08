@@ -153,6 +153,31 @@ impl Bind {
             Bind::Lan | Bind::All => "0.0.0.0",
         }
     }
+
+    /// 非 loopback 吗。
+    ///
+    /// **这个判断决定了两件强制行为**（§5.4）：密钥校验不可关闭，
+    /// 以及 `allow_from` 为空时自动填私网段。
+    pub fn is_exposed(&self) -> bool {
+        !matches!(self, Bind::Loopback)
+    }
+}
+
+impl GatewayListen {
+    /// 实际生效的来源白名单。
+    ///
+    /// **`lan` / `all` 且用户没写白名单时，默认填私网段**（§5.4）——
+    /// 而不是放行所有。想放开得手动写 `0.0.0.0/0`，那时他至少知道自己
+    /// 做了什么。
+    pub fn effective_allow_from(&self) -> Vec<String> {
+        if !self.bind.is_exposed() || !self.allow_from.is_empty() {
+            return self.allow_from.clone();
+        }
+        tw_types::PRIVATE_RANGES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

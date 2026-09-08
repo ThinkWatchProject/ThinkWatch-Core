@@ -80,9 +80,14 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
+    // 监听器才能带上 connect info（对端地址）。
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
 
@@ -248,9 +253,14 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gw = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
+    // 监听器才能带上 connect info（对端地址）。
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let resp = reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
@@ -316,9 +326,14 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gw = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
+    // 监听器才能带上 connect info（对端地址）。
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -404,9 +419,14 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         ],
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gw = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
+    // 监听器才能带上 connect info（对端地址）。
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let send = |model: &str| {
         let body =
@@ -473,9 +493,14 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gw = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
+    // 监听器才能带上 connect info（对端地址）。
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let r = reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
@@ -514,9 +539,14 @@ fn cfg_with(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
 
 async fn serve_cfg(cfg: Config) -> SocketAddr {
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, tw_gateway::router(state)).await.unwrap() });
+    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
+    // 监听器才能带上 connect info（对端地址）。
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
 

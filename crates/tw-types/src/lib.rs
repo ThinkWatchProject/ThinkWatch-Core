@@ -338,6 +338,18 @@ impl Default for Limits {
     }
 }
 
+/// RFC1918 三个私网段 + 回环。监听非 loopback 时 `allow_from` 的默认值
+/// （DESIGN.md §5.4）。住在这里是因为配置层要用它填默认值，数据面要用它
+/// 判断 —— 而它只是一组字符串。
+pub const PRIVATE_RANGES: &[&str] = &[
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+];
+
 #[cfg(test)]
 mod call_ctx_tests {
     use super::*;

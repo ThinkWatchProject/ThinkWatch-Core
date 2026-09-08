@@ -113,6 +113,8 @@ pub struct AppState {
     pub health: Arc<Health>,
     /// 并发闸门。排队不拒绝（§4.7）。
     pub gate: Arc<crate::limits::Gate>,
+    /// 来源白名单。空 = 全放行，而那只在 loopback 下成立（§5.4）。
+    pub allow: Arc<crate::access::AllowList>,
 }
 
 impl AppState {
@@ -125,6 +127,8 @@ impl AppState {
             clients.insert(p.name.clone(), build_client(&config, p)?);
         }
         let limits = config.limits.clone();
+        let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
+            .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
         let engine = Arc::new(config.engine());
         Ok(Self {
             clients: Arc::new(clients),
@@ -134,6 +138,7 @@ impl AppState {
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
             gate: Arc::new(crate::limits::Gate::new(limits)),
+            allow: Arc::new(allow),
         })
     }
 
@@ -170,12 +175,24 @@ pub fn router(state: AppState) -> Router {
 
 async fn passthrough(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, GatewayError> {
     let started = std::time::Instant::now();
+    // 来源检查在身份检查**之前**：一个不该连过来的地址，不该有机会
+    // 试密钥（§5.4）。
+    if !state.allow.allows(peer.ip()) {
+        return Err(GatewayError::new(
+            crate::error::Source::Auth,
+            format!(
+                "{} 不在允许的来源里。改 listen.gateway.allow_from，或者把 bind 改回 loopback。",
+                peer.ip()
+            ),
+        ));
+    }
     let client_name = state.identify(&headers, query.as_deref())?;
     forward::check_body_size(&body, MAX_BODY)?;
 
@@ -402,8 +419,18 @@ async fn passthrough(
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual = listener.local_addr()?;
-    tracing::info!(%actual, "网关已监听");
-    axum::serve(listener, router(state)).await
+    if !state.allow.is_empty() {
+        tracing::info!(%actual, "网关已监听（有来源白名单）");
+    } else {
+        tracing::info!(%actual, "网关已监听");
+    }
+    // `into_make_service_with_connect_info` 是拿到对端地址的唯一办法 ——
+    // 少了它，来源白名单收到的永远是 unwrap 出来的默认值。
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 fn now_ms() -> u64 {

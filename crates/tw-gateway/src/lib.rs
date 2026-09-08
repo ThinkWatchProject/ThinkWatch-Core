@@ -5,6 +5,7 @@
 //! 就把接缝留对**：`forward` 已经按「选中的 provider」取参数，M1 加路由
 //! 时只需要换掉挑选逻辑。
 
+pub mod access;
 pub mod auth;
 pub mod error;
 pub mod forward;
@@ -13,6 +14,7 @@ pub mod limits;
 pub mod probe;
 pub mod server;
 
+pub use access::{AllowList, Cidr};
 pub use error::GatewayError;
 pub use health::Health;
 pub use limits::{Gate, LimitError, Limits};

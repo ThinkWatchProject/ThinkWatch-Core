@@ -30,6 +30,8 @@ pub enum ValidationError {
     Routing(#[from] tw_engine::RouteError),
     #[error("`{0}` 既是 provider 名又是组名。规则里的 `to` 会指向哪个是不确定的，改掉其中一个。")]
     NameCollision(String),
+    #[error("listen.gateway.allow_from 里的 `{entry}` 写错了：{reason}")]
+    BadCidr { entry: String, reason: String },
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -101,11 +103,42 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
         }
     }
 
+    // 来源白名单的 CIDR 在加载时查。**写错一条的后果是它永远不匹配**，
+    // 而表现是「局域网里那台机器连不上」—— 一条完全看不出原因的故障。
+    for entry in &cfg.listen.gateway.allow_from {
+        if let Err(e) = entry.parse::<std::net::IpAddr>()
+            && entry.parse::<CidrLike>().is_err()
+        {
+            let _ = e;
+            return Err(ValidationError::BadCidr {
+                entry: entry.clone(),
+                reason: "不是合法的 IP 或 CIDR，写法是 `192.168.0.0/16`".to_string(),
+            });
+        }
+    }
+
     // 路由规则的目标、比较式写法，都在这里查。**一条永远不命中、或者
     // 指向不存在的 provider 的规则，在运行时是完全静默的**（§7.11 的
     // 「我明明配了为什么不生效」）。
     cfg.engine().validate()?;
     Ok(())
+}
+
+/// 最小的 CIDR 形状校验。**真正的匹配逻辑在 tw-gateway::access** ——
+/// 这里只是不想让 tw-config 依赖数据面，而「这条写法对不对」是配置层
+/// 该回答的问题。
+struct CidrLike;
+
+impl std::str::FromStr for CidrLike {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let (ip, prefix) = s.split_once('/').ok_or(())?;
+        let addr: std::net::IpAddr = ip.parse().map_err(|_| ())?;
+        let p: u8 = prefix.parse().map_err(|_| ())?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        if p > max { Err(()) } else { Ok(CidrLike) }
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +214,34 @@ mod tests {
             validate(&cfg(vec![], vec![p("r", "https://x.com")])),
             Err(ValidationError::NoClients)
         ));
+    }
+
+    #[test]
+    fn a_broken_cidr_in_the_allow_list_is_caught_at_load_time() {
+        // 写错一条的后果是它永远不匹配，而表现是「局域网里那台机器连
+        // 不上」—— 一条完全看不出原因的故障。
+        let mut k = cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")]);
+        k.listen.gateway.allow_from = vec!["192.168.0.0/99".into()];
+        assert!(matches!(validate(&k), Err(ValidationError::BadCidr { .. })));
+        k.listen.gateway.allow_from = vec!["192.168.0.0/16".into(), "10.0.0.5".into()];
+        assert!(validate(&k).is_ok(), "裸 IP 也该接受");
+    }
+
+    #[test]
+    fn exposing_the_gateway_defaults_the_allow_list_to_private_ranges() {
+        // **不是放行所有**（§5.4）。想放开得手动写 0.0.0.0/0，那时他
+        // 至少知道自己做了什么。
+        let mut k = cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")]);
+        assert!(
+            k.listen.gateway.effective_allow_from().is_empty(),
+            "loopback 下不填"
+        );
+        k.listen.gateway.bind = crate::Bind::Lan;
+        let eff = k.listen.gateway.effective_allow_from();
+        assert!(eff.iter().any(|s| s == "192.168.0.0/16"), "{eff:?}");
+        // 用户写了就用他的，不要偷偷加
+        k.listen.gateway.allow_from = vec!["10.1.2.0/24".into()];
+        assert_eq!(k.listen.gateway.effective_allow_from(), vec!["10.1.2.0/24"]);
     }
 
     #[test]
