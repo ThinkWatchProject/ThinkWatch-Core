@@ -74,6 +74,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/latency", get(latency))
         .route("/storage", get(storage))
         .route("/quota", get(quota))
+        .route("/leaks", get(leaks))
         .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
         .with_state(state)
@@ -465,6 +466,38 @@ async fn latency(
             })
             .collect(),
     ))
+}
+
+/// 出站密钥检测攒下的证据（§5.0）。
+///
+/// **默认看过去 7 天** —— 那正是「跑上一周」之后那句话的时间尺度。
+async fn leaks(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<Days>,
+) -> Result<Json<Vec<tw_api::LeakGroup>>, Fail> {
+    let since = now_ms() - (q.days.unwrap_or(7) as i64) * 86_400_000;
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let xs = g
+        .db()
+        .leak_summary(since)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(
+        xs.into_iter()
+            .map(|l| tw_api::LeakGroup {
+                provider: l.provider,
+                kind: l.kind,
+                requests: l.requests,
+                last_at_ms: l.last_at_ms,
+                masked: l.masked,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Days {
+    days: Option<u32>,
 }
 
 /// 一条请求的全部细节，含 body。

@@ -418,6 +418,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         proxies: Vec::new(),
         limits: Default::default(),
         client_probes: Default::default(),
+        security: Default::default(),
         routes: vec![
             tw_engine::Route {
                 name: "opus 走官方".into(),
@@ -1895,4 +1896,104 @@ async fn an_upstream_that_gives_no_usage_reports_none_rather_than_zeroes() {
         }
     }
     panic!("没等到结束事件");
+}
+
+#[tokio::test]
+async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_untouched() {
+    // **观察态只记录，不改变任何行为**（§5.0）。这条同时验两件事：
+    // 发现了，而且请求体一个字节都没被动过 —— 后者是这一态的全部承诺。
+    let (up, seen) = start_upstream(false).await;
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "中转".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let raw = r#"{"model":"m","messages":[{"role":"user","content":"我的 key 是 sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234"}]}"#;
+    reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+
+    // **请求体原样发出去了。**观察态动了 body 就不是观察态了。
+    assert_eq!(
+        String::from_utf8(seen.lock().unwrap().body.clone()).unwrap(),
+        raw,
+        "观察态改了请求体"
+    );
+
+    let mut found = None;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(tw_api::Event::LeakSeen {
+                secret,
+                masked,
+                provider,
+                ..
+            })) => {
+                found = Some((secret, masked, provider));
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    let (secret, masked, provider) = found.expect("请求体里有 key，却没有发现");
+    assert_eq!(secret, "Anthropic API key");
+    assert_eq!(provider, "中转", "得知道发给了谁 —— 那才是这条防线的意义");
+    // 报出来的东西一律打码：「发现了 sk-ant-xxx」本身就是一次泄漏
+    assert!(!masked.contains("abcdefghijklmnop"), "{masked}");
+}
+
+#[tokio::test]
+async fn turning_the_detector_off_stops_it_looking_at_all() {
+    let (up, _seen) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    );
+    cfg.security.redact = tw_config::SecurityMode::Off;
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"m","messages":[{"role":"user","content":"sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Ok(tw_api::Event::LeakSeen { .. })) => panic!("关掉了却还在检测"),
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
 }

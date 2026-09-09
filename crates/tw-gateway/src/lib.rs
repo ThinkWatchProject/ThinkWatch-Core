@@ -13,6 +13,7 @@ pub mod error;
 pub mod forward;
 pub mod health;
 pub mod l1;
+pub mod leak;
 pub mod limits;
 pub mod probe;
 pub mod quota;

@@ -231,6 +231,26 @@ impl Recorder {
                     local: true,
                 });
             }
+            Event::LeakSeen {
+                id,
+                provider,
+                secret,
+                masked,
+                at_ms,
+            } => {
+                // **它自己一张表。**一次请求可能同时带出好几种凭据，
+                // 而「过去 7 天有 3 个请求把 key 发给了 relay-cn」这句话
+                // 要按 (provider, kind) 分组数（§5.0）。
+                if let Err(e) = self.db.insert_leak(&crate::db::Leak {
+                    at_ms: *at_ms as i64,
+                    request_id: *id as i64,
+                    provider: provider.clone(),
+                    kind: secret.clone(),
+                    masked: masked.clone(),
+                }) {
+                    tracing::debug!("发现记不下来：{e}");
+                }
+            }
             // 配置事件和额度事件都不是请求，不落这张表。**额度是按
             // provider 的当前状态，不是按请求的历史** —— 它的家在别处。
             Event::ConfigReloaded { .. }

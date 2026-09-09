@@ -12,6 +12,7 @@ mod init;
 mod probes;
 pub mod proxy;
 pub mod reload;
+mod security;
 pub mod store;
 mod validate;
 pub mod watch;
@@ -65,6 +66,10 @@ pub struct Config {
     /// 客户端自己发的辅助请求怎么处理（§4.8）。默认只拦 A 类。
     #[serde(default, skip_serializing_if = "is_default")]
     pub client_probes: ClientProbes,
+    /// 三道防线（§5）。**出厂时都停在「观察」** —— 只记录，不改变
+    /// 任何行为。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub security: Security,
     /// 并发上限。不写就是默认值（§4.7）。
     #[serde(default, skip_serializing_if = "is_default")]
     pub limits: Limits,
@@ -87,6 +92,7 @@ impl Default for Config {
             providers: Vec::new(),
             proxies: Vec::new(),
             client_probes: ClientProbes::default(),
+            security: Security::default(),
             limits: Limits::default(),
             groups: Vec::new(),
             routes: Vec::new(),
@@ -477,6 +483,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
+pub use security::{Mode as SecurityMode, Security};
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;
 

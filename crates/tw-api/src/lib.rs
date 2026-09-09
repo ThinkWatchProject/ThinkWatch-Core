@@ -63,6 +63,21 @@ pub enum Event {
         source: String,
         message: String,
     },
+    /// 一个请求体里带着看起来像凭据的东西（§5.0 的观察态）。
+    ///
+    /// **只记录，不改变任何行为。**换成占位符是「拦截」态的事，而那要
+    /// 等 §5.1 那套完整的脱敏。
+    LeakSeen {
+        id: u64,
+        provider: String,
+        /// 「Anthropic API key」这类人话。字段叫 `secret` 而不是 `kind`
+        /// —— 那个名字已经被枚举的 tag 占了（`probe` 那次同样的坑）
+        secret: String,
+        /// **已打码**。报出来的东西一律打码 —— 「发现了 sk-ant-xxx」
+        /// 这句话本身就是一次泄漏
+        masked: String,
+        at_ms: u64,
+    },
     /// 上游在响应头里报了订阅额度（§4.3.2）。
     ///
     /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
@@ -151,7 +166,8 @@ impl Event {
             | Event::LocallyAnswered { id, .. }
             | Event::ConfigReloaded { id, .. }
             | Event::ConfigRejected { id, .. }
-            | Event::QuotaSeen { id, .. } => *id,
+            | Event::QuotaSeen { id, .. }
+            | Event::LeakSeen { id, .. } => *id,
         }
     }
 }
@@ -470,6 +486,19 @@ pub struct BodyView {
 pub struct ProviderQuota {
     pub provider: String,
     pub windows: Vec<QuotaWindow>,
+}
+
+/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」（§5.0）。
+///
+/// **这比任何功能介绍都有说服力**，因为它说的是已经发生在你身上的事。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeakGroup {
+    pub provider: String,
+    pub kind: String,
+    pub requests: i64,
+    pub last_at_ms: i64,
+    /// 涉及哪几把，**都已打码**
+    pub masked: Vec<String>,
 }
 
 /// 观测这一层现在能不能写（§8）。

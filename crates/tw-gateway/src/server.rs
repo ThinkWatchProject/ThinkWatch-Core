@@ -615,6 +615,23 @@ async fn pipeline(
         at_ms: now_ms(),
     });
 
+    // 出站密钥检测（§5.0 的观察态）。**只看，不动** —— 换成占位符是
+    // 「拦截」态的事，而那要等 §5.1 那套完整的脱敏。
+    //
+    // 位置在这里是因为它要知道**发给了谁**：一把 key 发给官方和发给一个
+    // 中转站，是完全不同的两件事，而后者才是这条防线存在的理由。
+    if rt.config.security.redact.detects() {
+        for f in crate::leak::scan(&body) {
+            state.bus.emit(tw_api::Event::LeakSeen {
+                id,
+                provider: alive.first().map(|s| s.to_string()).unwrap_or_default(),
+                secret: f.kind,
+                masked: f.masked,
+                at_ms: now_ms(),
+            });
+        }
+    }
+
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（§4.1 说过入站是要
     // 整个解析的，所以本来就在）。

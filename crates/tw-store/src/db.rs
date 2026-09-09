@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -149,6 +149,25 @@ impl Db {
                  -- 所以时间是唯一必需的索引。按 provider / model 过滤是
                  -- 在那之上再筛，数据量小得不值得再建索引。
                  CREATE INDEX requests_at ON requests (at_ms DESC);",
+            )?;
+        }
+        if from < 2 {
+            // 出站密钥检测的发现（§5.0 的观察态）。
+            //
+            // **单独一张表，不是 requests 上的一列。**一次请求可能同时
+            // 带出好几种凭据，而「过去 7 天有 3 个请求把 key 发给了
+            // relay-cn」这句话要按 (provider, kind) 分组数。
+            self.conn.execute_batch(
+                "CREATE TABLE leaks (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at_ms     INTEGER NOT NULL,
+                    request_id INTEGER NOT NULL,
+                    provider  TEXT NOT NULL,
+                    kind      TEXT NOT NULL,
+                    -- **已打码。**存原文等于把泄漏搬了个家
+                    masked    TEXT NOT NULL
+                 );
+                 CREATE INDEX leaks_at ON leaks (at_ms DESC);",
             )?;
         }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
@@ -301,8 +320,53 @@ impl Db {
             .collect())
     }
 
+    /// 记一次出站密钥发现（§5.0 的观察态）。
+    pub fn insert_leak(&self, l: &Leak) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO leaks (at_ms, request_id, provider, kind, masked)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![l.at_ms, l.request_id, l.provider, l.kind, l.masked],
+        )?;
+        Ok(())
+    }
+
+    /// 一段时间里发生过什么。
+    ///
+    /// **按 (上游, 种类) 分组** —— 「有 3 个请求把你的 API key 发给了
+    /// relay-cn」这句话就是这么数出来的（§5.0）。
+    pub fn leak_summary(&self, since_ms: i64) -> Result<Vec<LeakGroup>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT provider, kind, COUNT(DISTINCT request_id), MAX(at_ms),
+                    GROUP_CONCAT(DISTINCT masked)
+             FROM leaks WHERE at_ms >= ?1
+             GROUP BY provider, kind
+             ORDER BY COUNT(DISTINCT request_id) DESC",
+        )?;
+        let rows = st.query_map([since_ms], |r| {
+            Ok(LeakGroup {
+                provider: r.get(0)?,
+                kind: r.get(1)?,
+                requests: r.get(2)?,
+                last_at_ms: r.get(3)?,
+                masked: r
+                    .get::<_, Option<String>>(4)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect(),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// 删掉太老的 metadata。返回删了几条。
     pub fn prune_before(&self, cutoff_ms: i64) -> Result<usize, DbError> {
+        // 发现记录跟着请求一起过期 —— 留着一条指向不存在的请求的发现，
+        // 用户点「看是哪几个请求」会落空
+        let _ = self
+            .conn
+            .execute("DELETE FROM leaks WHERE at_ms < ?1", [cutoff_ms]);
         Ok(self
             .conn
             .execute("DELETE FROM requests WHERE at_ms < ?1", [cutoff_ms])?)
@@ -370,6 +434,27 @@ pub struct Summary {
     /// 这是成本三态的第三态。把它们当成 0 会让总额悄悄偏低，而用户没有
     /// 任何线索知道少算了什么（§4.3）。
     pub unpriced_requests: i64,
+}
+
+/// 一次出站密钥发现。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leak {
+    pub at_ms: i64,
+    pub request_id: i64,
+    pub provider: String,
+    pub kind: String,
+    /// **已打码。**存原文等于把泄漏搬了个家
+    pub masked: String,
+}
+
+/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」（§5.0）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeakGroup {
+    pub provider: String,
+    pub kind: String,
+    pub requests: i64,
+    pub last_at_ms: i64,
+    pub masked: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
