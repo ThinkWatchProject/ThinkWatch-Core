@@ -817,9 +817,7 @@ mod verified_tests {
         let v = verified();
         assert_eq!(v.checked_on.len(), 10, "{}", v.checked_on);
         assert!(
-            v.checked_on
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '-'),
+            v.checked_on.chars().all(|c| c.is_ascii_digit() || c == '-'),
             "{}",
             v.checked_on
         );
