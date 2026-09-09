@@ -282,14 +282,26 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
         tw_api::Event::RequestHeaders { status: 200, .. } => {}
         ref other => panic!("第二条该是 RequestHeaders(200)，实际 {other:?}"),
     }
-    let finished = rx.recv().await.unwrap();
+    // 这个假上游的响应头里带着订阅额度（§4.3.2），所以中间会多一条 ——
+    // **那是白捡的，不是这条测试的目标**，跳过它继续往下看生命周期。
+    let mut quota_seen = false;
+    let finished = loop {
+        match rx.recv().await.unwrap() {
+            tw_api::Event::QuotaSeen { windows, .. } => {
+                quota_seen = true;
+                assert_eq!(windows[0].used_percent, 62.0, "0.62 该读成 62%");
+            }
+            other => break other,
+        }
+    };
+    assert!(quota_seen, "响应头里有额度，却没有发出事件");
     match finished {
         tw_api::Event::RequestFinished { status, bytes, .. } => {
             assert_eq!(status, 200);
             // 字节数是流真正流过的量，不是 content-length
             assert!(bytes > 0, "应该数到流过的字节");
         }
-        other => panic!("最后一条该是 finished，实际 {other:?}"),
+        ref other => panic!("最后一条该是 finished，实际 {other:?}"),
     }
     // 四个事件共用同一个 id
     assert_eq!(started.id(), headers.id());

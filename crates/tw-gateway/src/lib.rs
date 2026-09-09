@@ -14,6 +14,7 @@ pub mod health;
 pub mod l1;
 pub mod limits;
 pub mod probe;
+pub mod quota;
 pub mod server;
 pub mod usage;
 
@@ -24,6 +25,7 @@ pub use health::Health;
 pub use l1::{L1Result, ProxyHop, Segment, l1, l1_tcp};
 pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};
+pub use quota::{Quota, from_headers as quota_from_headers};
 pub use server::{
     AppState, Runtime, refresh_catalog, router, serve, serve_following_config,
     spawn_catalog_refresh,

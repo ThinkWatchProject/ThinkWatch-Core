@@ -73,6 +73,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/history", get(history))
         .route("/latency", get(latency))
         .route("/storage", get(storage))
+        .route("/quota", get(quota))
         .route("/setup", post(setup))
         .with_state(state)
 }
@@ -463,6 +464,33 @@ async fn latency(
             })
             .collect(),
     ))
+}
+
+/// 订阅额度。**每个上游最近一次报的**（§4.3.2）。
+///
+/// 按量付费的账号没有这些头，那时这个列表是空的 —— 界面据此决定显示
+/// 金额还是百分比，两种人格共用同一块地方。
+async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>> {
+    let mut out: Vec<tw_api::ProviderQuota> = s
+        .gateway
+        .quotas()
+        .into_iter()
+        .map(|(provider, q)| tw_api::ProviderQuota {
+            provider,
+            windows: q
+                .windows
+                .into_iter()
+                .map(|w| tw_api::QuotaWindow {
+                    label: w.label,
+                    used_percent: w.used_percent,
+                    reset_in_secs: w.reset_in_secs,
+                    status: w.status,
+                })
+                .collect(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.provider.cmp(&b.provider));
+    Json(out)
 }
 
 async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {

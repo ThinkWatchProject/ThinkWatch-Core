@@ -18,6 +18,7 @@ arc-swap = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 reqwest = { workspace = true }

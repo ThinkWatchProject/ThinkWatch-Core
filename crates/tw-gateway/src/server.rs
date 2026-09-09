@@ -217,6 +217,12 @@ pub struct AppState {
     /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
     /// 探测要打网络，不能挡住启动。
     pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
+    /// 每个上游最近一次报的订阅额度（§4.3.2）。
+    ///
+    /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
+    /// 五分钟前的百分比，价值几乎为零，而它会让「重启之后显示的是旧
+    /// 数字」变成一个要解释的问题。下一个请求回来就有新的了。
+    quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::quota::Quota>>>,
     /// 监听地址变了。**这是「温」那一级**（§3.8 的三级热重载）——
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
@@ -240,6 +246,7 @@ impl AppState {
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(catalog)),
+            quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -256,6 +263,11 @@ impl AppState {
 
     pub fn gate(&self) -> Arc<crate::limits::Gate> {
         self.gate.load_full()
+    }
+
+    /// 每个上游最近一次报的订阅额度。
+    pub fn quotas(&self) -> std::collections::HashMap<String, crate::quota::Quota> {
+        self.quotas.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// 换一份配置进去（§3.8 的第 ④⑤ 步）。
@@ -721,6 +733,30 @@ async fn pipeline(
         status: status.as_u16(),
         ttfb_ms: started.elapsed().as_millis() as u64,
     });
+    // 订阅额度（§4.3.2）。**零成本** —— 这些头本来就在响应里，读一下
+    // 就有了。按量付费的账号没有它们，那时什么都不发。
+    let quota = crate::quota::from_headers_reqwest(upstream.headers());
+    if !quota.is_empty() {
+        if let Ok(mut g) = state.quotas.lock() {
+            g.insert(provider.name.clone(), quota.clone());
+        }
+        state.bus.emit(tw_api::Event::QuotaSeen {
+            id,
+            provider: provider.name.clone(),
+            windows: quota
+                .windows
+                .iter()
+                .map(|w| tw_api::QuotaWindow {
+                    label: w.label.clone(),
+                    used_percent: w.used_percent,
+                    reset_in_secs: w.reset_in_secs,
+                    status: w.status.clone(),
+                })
+                .collect(),
+            at_ms: now_ms(),
+        });
+    }
+
     let mut out_headers = forward::response_headers(upstream.headers());
     // **哪一家服务的，写在头上。**§4.6.1 说上游的错误要原样透传、不加
     // `[ThinkWatch]` 前缀 —— 那确实是它说的话。可上游的 401 说的是

@@ -63,6 +63,16 @@ pub enum Event {
         source: String,
         message: String,
     },
+    /// 上游在响应头里报了订阅额度（§4.3.2）。
+    ///
+    /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
+    /// 这些头，那时这个事件根本不会出现 —— 而不是报一个「用了 0%」。
+    QuotaSeen {
+        id: u64,
+        provider: String,
+        windows: Vec<QuotaWindow>,
+        at_ms: u64,
+    },
     /// 配置换了一份新的进去，已经生效（§3.8）。
     ///
     /// **界面靠它知道自己手里那份过期了。**没有它，用户在编辑器里改完
@@ -105,6 +115,20 @@ pub enum Event {
     },
 }
 
+/// 一个订阅额度窗口。**每个字段都直接来自上游的响应头。**
+///
+/// 我们自己推断的东西不放进这个结构 —— 界面上必须能区分「上游说的」和
+/// 「我们猜的」，而混在一个类型里就区分不了了（§4.3.2）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    pub label: String,
+    pub used_percent: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_in_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
 /// 一次调用的用量。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageView {
@@ -126,7 +150,8 @@ impl Event {
             | Event::RequestFailed { id, .. }
             | Event::LocallyAnswered { id, .. }
             | Event::ConfigReloaded { id, .. }
-            | Event::ConfigRejected { id, .. } => *id,
+            | Event::ConfigRejected { id, .. }
+            | Event::QuotaSeen { id, .. } => *id,
         }
     }
 }
@@ -419,6 +444,13 @@ pub struct HistoryRow {
     pub error: Option<String>,
     /// 本地应答的（§4.8）
     pub local: bool,
+}
+
+/// 一个上游的订阅额度（§4.3.2）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderQuota {
+    pub provider: String,
+    pub windows: Vec<QuotaWindow>,
 }
 
 /// 观测这一层现在能不能写（§8）。

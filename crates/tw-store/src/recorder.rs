@@ -228,8 +228,11 @@ impl Recorder {
                     local: true,
                 });
             }
-            // 配置事件不是请求，不落这张表
-            Event::ConfigReloaded { .. } | Event::ConfigRejected { .. } => {}
+            // 配置事件和额度事件都不是请求，不落这张表。**额度是按
+            // provider 的当前状态，不是按请求的历史** —— 它的家在别处。
+            Event::ConfigReloaded { .. }
+            | Event::ConfigRejected { .. }
+            | Event::QuotaSeen { .. } => {}
         }
     }
 
