@@ -2601,10 +2601,12 @@ name = "tw-control"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "futures",
  "hyper",
  "hyper-util",
  "reqwest",
+ "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
@@ -2618,7 +2620,9 @@ dependencies = [
  "tw-engine",
  "tw-gateway",
  "tw-observe",
+ "tw-pricing",
  "tw-secret",
+ "tw-store",
  "tw-yaml",
 ]
 
@@ -2766,8 +2770,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "tw-api",
+ "tw-pricing",
 ]
 
 [[package]]
@@ -2801,10 +2807,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tw-api",
  "tw-config",
  "tw-control",
  "tw-gateway",
+ "tw-pricing",
  "tw-secret",
+ "tw-store",
  "tw-yaml",
 ]
 

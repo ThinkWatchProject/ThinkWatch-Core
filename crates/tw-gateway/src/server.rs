@@ -578,6 +578,7 @@ async fn pipeline(
         id,
         client: client_name.clone(),
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
+        model: facts.model.clone(),
         method: "POST".to_string(),
         path: uri.path().to_string(),
         at_ms: now_ms(),

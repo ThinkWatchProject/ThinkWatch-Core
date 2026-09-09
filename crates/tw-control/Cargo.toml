@@ -14,11 +14,15 @@ tw-engine = { workspace = true }
 tw-gateway = { workspace = true }
 tw-observe = { workspace = true }
 tw-secret = { workspace = true }
+tw-store = { workspace = true }
+tw-pricing = { workspace = true }
+chrono = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "server", "server-auto"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tw-yaml = { workspace = true }

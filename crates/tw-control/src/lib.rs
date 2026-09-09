@@ -30,6 +30,9 @@ pub struct ControlState {
     pub gateway: tw_gateway::AppState,
     pub cfg: Arc<ConfigManager>,
     pub gateway_addr: Option<String>,
+    /// 请求历史。**可能没有** —— 磁盘起不来时观测这一层整个不在，
+    /// 而那时网关照常转发（§4.7），所以它是 Option 而不是必需品。
+    pub store: Option<Arc<tokio::sync::Mutex<tw_store::Recorder>>>,
 }
 
 impl ControlState {
@@ -66,6 +69,10 @@ pub fn router(state: ControlState) -> Router {
         )
         .route("/config/history", get(config_history))
         .route("/config/rollback", post(config_rollback))
+        .route("/summary", get(summary))
+        .route("/history", get(history))
+        .route("/latency", get(latency))
+        .route("/storage", get(storage))
         .route("/setup", post(setup))
         .with_state(state)
 }
@@ -391,6 +398,159 @@ fn resolve_hop(
             }))
         }
     }
+}
+
+/// 一段时间的汇总。不给参数就是「今天」。
+async fn summary(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<Window>,
+) -> Result<Json<tw_api::Summary>, Fail> {
+    let (from, to) = q.range();
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let x = g
+        .db()
+        .summary(from, to)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(tw_api::Summary {
+        requests: x.requests,
+        failed: x.failed,
+        locally_answered: x.locally_answered,
+        input_tokens: x.input_tokens,
+        output_tokens: x.output_tokens,
+        cache_read_tokens: x.cache_read_tokens,
+        cache_write_tokens: x.cache_write_tokens,
+        cost_micros_exact: x.cost_micros_exact,
+        cost_micros_estimated: x.cost_micros_estimated,
+        unpriced_requests: x.unpriced_requests,
+        pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+    }))
+}
+
+/// 最近的请求。**实时列表走内存 ring buffer，这个是给「翻历史」的**
+/// （§8）。
+async fn history(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<Limit>,
+) -> Result<Json<Vec<tw_api::HistoryRow>>, Fail> {
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let rows = g
+        .db()
+        .recent(q.limit.unwrap_or(200).min(2000))
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(rows.into_iter().map(history_row).collect()))
+}
+
+async fn latency(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<Window>,
+) -> Result<Json<Vec<tw_api::LatencyView>>, Fail> {
+    let (from, to) = q.range();
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let xs = g
+        .db()
+        .latency_by_model(from, to)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(
+        xs.into_iter()
+            .map(|l| tw_api::LatencyView {
+                model: l.model,
+                p50: l.p50,
+                p95: l.p95,
+                samples: l.samples,
+            })
+            .collect(),
+    ))
+}
+
+async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
+    let Some(store) = &s.store else {
+        return Json(tw_api::StorageStatus {
+            level: "没有起来（历史记录不可用，转发不受影响）".into(),
+            rows: 0,
+            blob_bytes: 0,
+            forwarding_affected: false,
+        });
+    };
+    let g = store.lock().await;
+    Json(tw_api::StorageStatus {
+        level: g.level().label().to_string(),
+        rows: g.db().count().unwrap_or(0),
+        blob_bytes: g.blobs().total_bytes(),
+        // **永远是 false。**观测挂了，代理照跑（§4.7）。哪天有人想改成
+        // true，先回去读那一节。
+        forwarding_affected: false,
+    })
+}
+
+fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Recorder>>, Fail> {
+    s.store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "历史记录这一层没起来（磁盘或数据库有问题）。转发不受影响。".to_string(),
+        )
+    })
+}
+
+fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
+    tw_api::HistoryRow {
+        id: r.id,
+        at_ms: r.at_ms,
+        client: r.client,
+        provider: r.provider,
+        model: r.model,
+        path: r.path,
+        status: r.status,
+        ttfb_ms: r.ttfb_ms,
+        duration_ms: r.duration_ms,
+        bytes: r.bytes,
+        input_tokens: r.input_tokens,
+        output_tokens: r.output_tokens,
+        cache_read_tokens: r.cache_read_tokens,
+        cache_write_tokens: r.cache_write_tokens,
+        cost_micros: r.cost_micros,
+        cost_estimated: r.cost_estimated,
+        error: r.error,
+        local: r.local,
+    }
+}
+
+/// 时间窗。**默认是「今天」而不是「最近 24 小时」** —— 用户问的是
+/// 「今天花了多少」，那是个从零点算起的问题。
+#[derive(Debug, serde::Deserialize)]
+struct Window {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+impl Window {
+    fn range(&self) -> (i64, i64) {
+        let now = now_ms();
+        // 本地时区的零点。UTC 零点对一个桌面工具没有意义 —— 用户在
+        // 东八区，UTC 零点是他的早上八点。
+        let midnight = local_midnight_ms(now);
+        (self.from_ms.unwrap_or(midnight), self.to_ms.unwrap_or(now))
+    }
+}
+
+fn local_midnight_ms(now_ms: i64) -> i64 {
+    let offset = chrono::Local::now().offset().local_minus_utc() as i64 * 1000;
+    let local = now_ms + offset;
+    local - local.rem_euclid(86_400_000) - offset
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Limit {
+    limit: Option<usize>,
 }
 
 /// 当前配置的原文。**文本模式直接显示它。**

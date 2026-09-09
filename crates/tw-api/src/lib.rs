@@ -34,6 +34,10 @@ pub enum Event {
         id: u64,
         client: String,
         provider: String,
+        /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
+        /// 少了这个字段，落库那一步就只能记一笔没有模型的账（§4.3）
+        #[serde(default)]
+        model: String,
         method: String,
         path: String,
         at_ms: u64,
@@ -358,6 +362,78 @@ pub struct RollbackRequest {
     pub version: String,
 }
 
+/// 一段时间的汇总（§4.3、§8）。
+///
+/// **实测和估算分开，没有价格的单独数。**「今日 $12.40 实测 + ~$0.80
+/// 估算，另有 3 条没有价格」比一个混在一起的 $13.20 诚实得多 —— 后者
+/// 看起来是个确定的数字。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Summary {
+    pub requests: i64,
+    pub failed: i64,
+    /// 本地应答的次数。**是个正向数字**，单独显示（§4.8）
+    pub locally_answered: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 单位是微分（百万分之一美元）
+    pub cost_micros_exact: i64,
+    pub cost_micros_estimated: i64,
+    /// 有多少条请求根本没有价格。**不是 0，是「不知道」**
+    pub unpriced_requests: i64,
+    /// 价目表的快照日期。**成本旁边要标它**（§4.3.0）—— 一个两个月前
+    /// 的价目表算出来的数字，可信度和昨天的完全不同
+    pub pricing_date: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyView {
+    pub model: String,
+    pub p50: i64,
+    pub p95: i64,
+    /// **样本数要一起给。**「800ms」是 3 个样本还是 300 个，含义完全不同
+    pub samples: usize,
+}
+
+/// 一条历史请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryRow {
+    pub id: i64,
+    pub at_ms: i64,
+    pub client: String,
+    pub provider: String,
+    pub model: String,
+    pub path: String,
+    pub status: Option<u16>,
+    pub ttfb_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub bytes: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub cost_micros: Option<i64>,
+    /// 这个成本是估的吗。**界面上要标出来**（§4.3）
+    pub cost_estimated: bool,
+    pub error: Option<String>,
+    /// 本地应答的（§4.8）
+    pub local: bool,
+}
+
+/// 观测这一层现在能不能写（§8）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStatus {
+    /// 「正常」/「磁盘快满了…」/「磁盘几乎满了…」
+    pub level: String,
+    /// 记了多少条
+    pub rows: i64,
+    /// 请求体占了多少字节
+    pub blob_bytes: u64,
+    /// **转发受影响了吗。永远是 false** —— 观测挂了，代理照跑（§4.7）
+    pub forwarding_affected: bool,
+}
+
 /// 首次运行时写下第一个上游。
 ///
 /// **只在还没有 provider 时可用**。之后改配置走 §3.8 的双向同步（M2），
@@ -405,6 +481,7 @@ mod tests {
                 id: 7,
                 client: "c".into(),
                 provider: "p".into(),
+                model: "m".into(),
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 at_ms: 0,

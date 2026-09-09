@@ -426,6 +426,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
+        // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
+        // 照常转发（§4.7）。所以这里所有的失败都只记一行日志。
+        let store = build_store(&dir, state.bus.subscribe());
+
         // 配置的唯一入口。UI、CLI、文件监听都从这里进（§3.8）。
         let manager = std::sync::Arc::new(tw_control::ConfigManager::new(
             config_path,
@@ -450,6 +454,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             gateway: state.clone(),
             cfg: manager,
             gateway_addr: if safe { None } else { Some(addr.to_string()) },
+            store,
         };
         let sock = socket.clone();
         // **控制面没了就得退，不能只记一行日志。**
@@ -521,6 +526,40 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             }
         }
     })
+}
+
+/// 建观测层。**每一步失败都只是「没有历史记录」，不是「起不来」。**
+///
+/// 这条边界值得写死在代码形状里：这个函数返回 `Option`，而不是
+/// `Result` —— 调用方连处理错误的机会都不该有，因为没有任何一种
+/// 处理方式是「不转发了」（§4.7）。
+fn build_store(
+    dir: &Path,
+    events: tokio::sync::broadcast::Receiver<tw_api::Event>,
+) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
+    let db = match tw_store::Db::open(&dir.join("data.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("请求历史起不来，这次不记录（转发不受影响）：{e}");
+            return None;
+        }
+    };
+    // 价目表解不开是个打包错误，但同样不该挡住转发 —— 那时成本一栏
+    // 是空的，而请求照常。
+    let prices = match tw_pricing::Prices::builtin()
+        .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("价目表读不了，成本一栏会是空的：{e}");
+            return None;
+        }
+    };
+    let blobs = tw_store::Blobs::new(dir.join("blobs"));
+    Some(tw_store::task::spawn(
+        tw_store::Recorder::new(db, blobs, prices),
+        events,
+    ))
 }
 
 fn parent_alive(pid: u32) -> bool {
