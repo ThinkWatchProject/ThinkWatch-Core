@@ -266,3 +266,89 @@ async fn the_restore_diff_masks_the_users_own_key_too() {
     let v: tw_api::PlanView = serde_json::from_str(&body).unwrap();
     assert!(!v.after.contains("tw-一把钥匙就够"), "{}", v.after);
 }
+
+// ---------------------------------------------------------------- MCP 矩阵
+
+const CLAUDE_JSON: &str = r#"{
+  "numStartups": 42,
+  "mcpServers": {
+    "filesystem": { "command": "npx", "args": ["-y", "server-filesystem", "/path/to/workspace"] }
+  }
+}
+"#;
+
+#[tokio::test]
+async fn copying_a_server_between_clients_is_a_plan_then_an_apply() {
+    // 和接管一样：中间夹一次人的确认。
+    let b = bed();
+    std::fs::write(b.home.join(".claude.json"), CLAUDE_JSON).unwrap();
+    std::fs::create_dir_all(b.home.join(".cursor")).unwrap();
+    std::fs::write(
+        b.home.join(".cursor/mcp.json"),
+        "{\n  \"我的\": \"别动\"\n}\n",
+    )
+    .unwrap();
+
+    let body = r#"{"op":"copy","name":"filesystem","from":"claude-code","to":"cursor"}"#;
+    let (st, out) = post(&b.app, "/mcp/plan", body).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let p: tw_api::PlanView = serde_json::from_str(&out).unwrap();
+    assert!(p.after.contains("server-filesystem"), "{}", p.after);
+    // 只是算了一下
+    assert_eq!(
+        std::fs::read_to_string(b.home.join(".cursor/mcp.json")).unwrap(),
+        "{\n  \"我的\": \"别动\"\n}\n"
+    );
+
+    let (st, out) = post(&b.app, "/mcp/apply", body).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let after = std::fs::read_to_string(b.home.join(".cursor/mcp.json")).unwrap();
+    assert!(after.contains("server-filesystem"), "{after}");
+    assert!(after.contains("\"我的\": \"别动\""), "{after}");
+    // 源文件一个字节都没动
+    assert_eq!(
+        std::fs::read_to_string(b.home.join(".claude.json")).unwrap(),
+        CLAUDE_JSON
+    );
+}
+
+#[tokio::test]
+async fn removing_a_server_is_the_emergency_switch_and_it_really_deletes() {
+    // §7.12：它比「留一个 enabled: false 的中间状态」更直接。
+    let b = bed();
+    std::fs::write(b.home.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let body = r#"{"op":"remove","name":"filesystem","to":"claude-code"}"#;
+    let (st, out) = post(&b.app, "/mcp/apply", body).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let after = std::fs::read_to_string(b.home.join(".claude.json")).unwrap();
+    assert!(!after.contains("filesystem"), "{after}");
+    assert!(after.contains("numStartups"), "别的键被牵连了：{after}");
+}
+
+#[tokio::test]
+async fn a_client_whose_mcp_shape_we_have_not_verified_refuses_and_explains() {
+    // 照着猜写进去，用户拿到的是一份客户端读不懂的配置。
+    let b = bed();
+    std::fs::write(b.home.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let (st, out) = post(
+        &b.app,
+        "/mcp/plan",
+        r#"{"op":"copy","name":"filesystem","from":"claude-code","to":"zed"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{out}");
+    assert!(out.contains("没有验证过"), "{out}");
+}
+
+#[tokio::test]
+async fn the_target_list_says_which_ones_can_be_written_and_why_not() {
+    // 不能写的照样列出来 —— 看得见是 §7.12 的第一目标。
+    let b = bed();
+    let (st, out) = get(&b.app, "/mcp/targets").await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Vec<tw_api::McpTargetView> = serde_json::from_str(&out).unwrap();
+    assert!(v.iter().any(|t| t.client == "claude-desktop" && t.copyable));
+    let zed = v.iter().find(|t| t.client == "zed").unwrap();
+    assert!(!zed.copyable);
+    assert!(!zed.why_not.is_empty(), "不能写就要说清为什么");
+}

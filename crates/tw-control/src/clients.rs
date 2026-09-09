@@ -233,6 +233,89 @@ pub async fn restore(
     }))
 }
 
+// ---------------------------------------------------------------- MCP 矩阵
+
+fn mcp_target(id: &str) -> Result<tw_adopt::mcp::Target, Fail> {
+    tw_adopt::mcp::target(id).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+}
+
+fn mcp_err(e: tw_adopt::mcp::McpError) -> Fail {
+    let code = match &e {
+        tw_adopt::mcp::McpError::UnknownClient(_) | tw_adopt::mcp::McpError::NotThere { .. } => {
+            StatusCode::NOT_FOUND
+        }
+        // 「我们没验证过那个格式」不是用户做错了什么，但也确实做不了
+        tw_adopt::mcp::McpError::NotCopyable { .. } => StatusCode::NOT_IMPLEMENTED,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (code, e.to_string())
+}
+
+/// 能写和不能写的分别是哪些。
+pub async fn mcp_targets(State(_s): State<ControlState>) -> Json<Vec<tw_api::McpTargetView>> {
+    Json(
+        tw_adopt::mcp::targets()
+            .into_iter()
+            .map(|t| tw_api::McpTargetView {
+                client: t.client.to_string(),
+                name: t.name.to_string(),
+                path: t.config.to_string(),
+                copyable: t.copyable,
+                why_not: t.why_not.to_string(),
+            })
+            .collect(),
+    )
+}
+
+fn mcp_plan(s: &ControlState, req: &tw_api::McpOpRequest) -> Result<tw_adopt::mcp::Plan, Fail> {
+    let to = mcp_target(&req.to)?;
+    match req.op.as_str() {
+        "remove" => tw_adopt::mcp::plan_remove(&to, &s.home, &req.name).map_err(mcp_err),
+        "copy" => {
+            let from = mcp_target(req.from.as_deref().unwrap_or_default())?;
+            let v = tw_adopt::mcp::read_server(&from, &s.home, &req.name).map_err(mcp_err)?;
+            tw_adopt::mcp::plan_copy(&to, &s.home, &req.name, &v).map_err(mcp_err)
+        }
+        other => Err((StatusCode::BAD_REQUEST, format!("不认识的操作 `{other}`"))),
+    }
+}
+
+/// 算一份改动。**不写任何东西** —— 和接管一样，中间夹一次人的确认。
+pub async fn mcp_plan_op(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::McpOpRequest>,
+) -> Result<Json<tw_api::PlanView>, Fail> {
+    let p = mcp_plan(&s, &req)?;
+    Ok(Json(tw_api::PlanView {
+        client: p.client,
+        path: p.path.display().to_string(),
+        before: p.before,
+        after: p.after,
+        notes: Vec::new(),
+        shadows: Vec::new(),
+        noop: p.noop,
+        // MCP 的 env 里可能有密钥，而我们正把它抄进另一个文件
+        carries_secret: true,
+        fields: vec![p.summary],
+    }))
+}
+
+pub async fn mcp_apply(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::McpOpRequest>,
+) -> Result<Json<tw_api::AdoptResponse>, Fail> {
+    let to = mcp_target(&req.to)?;
+    let p = mcp_plan(&s, &req)?;
+    let a = tw_adopt::mcp::apply(&to, &p, &tw_adopt::foreign::backup_root()).map_err(mcp_err)?;
+    Ok(Json(tw_api::AdoptResponse {
+        real: a.real.display().to_string(),
+        backup: a.backup.display().to_string(),
+        created: a.created,
+        warnings: a.warnings,
+        takes_effect_note: "客户端下次启动时会读到它。".into(),
+    }))
+}
+
 /// 「我明明配了，为什么没生效」—— 走一遍优先级链。
 pub async fn why(
     State(s): State<ControlState>,

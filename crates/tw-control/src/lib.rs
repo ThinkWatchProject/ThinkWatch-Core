@@ -109,6 +109,10 @@ pub fn router(state: ControlState) -> Router {
         .route("/clients/{id}/restore/plan", get(clients::plan_restore))
         .route("/clients/{id}/restore", post(clients::restore))
         .route("/clients/{id}/why", get(clients::why))
+        // 矩阵上点一下（§7.12）。**plan 和 apply 同样是两步**
+        .route("/mcp/targets", get(clients::mcp_targets))
+        .route("/mcp/plan", post(clients::mcp_plan_op))
+        .route("/mcp/apply", post(clients::mcp_apply))
         .with_state(state)
 }
 

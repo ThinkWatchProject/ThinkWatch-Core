@@ -52,6 +52,23 @@ fn to_toml(v: &Val) -> TValue {
     }
 }
 
+/// 一个对象写成独立表段，嵌套的对象继续往下写成子表 —— `[a.b]`、
+/// `[a.b.c]`。
+fn to_table(ms: &[(String, Val)]) -> Table {
+    let mut t = Table::new();
+    for (k, v) in ms {
+        match v {
+            Val::Obj(inner) if !inner.is_empty() => {
+                t.insert(k, Item::Table(to_table(inner)));
+            }
+            _ => {
+                t.insert(k, Item::Value(to_toml(v)));
+            }
+        }
+    }
+    t
+}
+
 fn from_toml(item: &Item) -> Option<Val> {
     match item {
         Item::Value(v) => Some(match v {
@@ -139,11 +156,26 @@ pub fn set(text: &str, path: &[&str], v: &Val) -> Result<String, TErr> {
     let Some(tbl) = item.as_table_like_mut() else {
         return Err(TErr::NotTable(parents.join(".")));
     };
-    // 已经有这个键就只换值，键上挂着的注释和空行留在原处
+    // 已经有这个键就只换值，键上挂着的注释和空行留在原处 ——
+    // **也保住它原来是行内表还是独立表**：把用户写的
+    // `x = { a = 1 }` 换成一个 `[x]` 段落，是一次他没要求的重排版
     match tbl.get_mut(leaf) {
-        Some(slot) => *slot = Item::Value(to_toml(v)),
+        Some(slot) => {
+            let keep_table = slot.is_table();
+            *slot = match v {
+                Val::Obj(ms) if keep_table && !ms.is_empty() => Item::Table(to_table(ms)),
+                _ => Item::Value(to_toml(v)),
+            };
+        }
         None => {
-            tbl.insert(leaf, Item::Value(to_toml(v)));
+            // **新插入的对象写成独立表段。**Codex 自己的 config.toml 里
+            // 每个 MCP server 都是 `[mcp_servers.x]`，塞一个几百字符的
+            // 行内表进去，在那个文件里会显得格格不入
+            let item = match v {
+                Val::Obj(ms) if !ms.is_empty() => Item::Table(to_table(ms)),
+                _ => Item::Value(to_toml(v)),
+            };
+            tbl.insert(leaf, item);
         }
     }
     Ok(doc.to_string())
@@ -259,6 +291,45 @@ trust_level = "trusted"
         assert!(out.contains("X-ThinkWatch-Client"), "{out}");
         // wire_api = "chat" 已经被上游移除，我们绝不能写它
         assert!(!out.contains("\"chat\""), "{out}");
+    }
+
+    #[test]
+    fn a_new_nested_object_becomes_a_table_section_like_the_rest_of_the_file() {
+        // Codex 自己的 config.toml 里每个 MCP server 都是
+        // `[mcp_servers.x]`。塞一个几百字符的行内表进去，在那个文件里
+        // 会显得格格不入。
+        let out = set(
+            "model = \"gpt-5\"\n",
+            &["mcp_servers", "fs"],
+            &Val::Obj(vec![
+                ("command".into(), Val::s("npx")),
+                ("args".into(), Val::Arr(vec![Val::s("-y")])),
+                ("env".into(), Val::Obj(vec![("K".into(), Val::s("v"))])),
+            ]),
+        )
+        .unwrap();
+        assert!(out.contains("[mcp_servers.fs]"), "{out}");
+        assert!(out.contains("[mcp_servers.fs.env]"), "{out}");
+        assert!(out.contains("command = \"npx\""), "{out}");
+        // 写出来的还得是合法 TOML，而且读回来一模一样
+        assert_eq!(
+            get(&out, &["mcp_servers", "fs", "env", "K"]).unwrap(),
+            Some(Val::s("v"))
+        );
+    }
+
+    #[test]
+    fn an_existing_inline_table_stays_inline() {
+        // 把用户写的 `x = { a = 1 }` 换成一个 `[x]` 段落，是一次他没
+        // 要求的重排版。
+        let out = set(
+            "x = { a = 1 }\n",
+            &["x"],
+            &Val::Obj(vec![("a".into(), Val::Num("2".into()))]),
+        )
+        .unwrap();
+        assert!(out.contains("x = {"), "{out}");
+        assert!(!out.contains("[x]"), "{out}");
     }
 
     #[test]

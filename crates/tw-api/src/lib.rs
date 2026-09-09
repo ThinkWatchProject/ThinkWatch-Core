@@ -800,6 +800,31 @@ pub struct ScanResponse {
     pub projects: Vec<String>,
 }
 
+/// 在矩阵上点一下（§7.12）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOpRequest {
+    /// `copy` 或 `remove`
+    pub op: String,
+    pub name: String,
+    /// `copy` 时从哪个客户端取
+    #[serde(default)]
+    pub from: Option<String>,
+    /// 写到（或从中删掉）哪个客户端
+    pub to: String,
+}
+
+/// 哪些客户端能被写入，哪些只能看。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTargetView {
+    pub client: String,
+    pub name: String,
+    pub path: String,
+    /// 能不能往里写。**不能写的照样在清单里** —— 看得见是第一目标
+    pub copyable: bool,
+    /// 不能写的话，为什么
+    pub why_not: String,
+}
+
 // ---------------------------------------------------------------- 路由试算
 
 /// 「如果现在来这样一个请求，会走到哪儿」。

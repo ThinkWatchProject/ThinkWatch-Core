@@ -1,0 +1,464 @@
+//! 把一个 MCP server 从一个客户端搬到另一个（DESIGN.md §7.12）。
+//!
+//! **写入复用接管那一套**：字段级合并、写前全文备份、展示 diff 让用户
+//! 确认、认符号链接、写完读回来对一遍。风险和 §7.11 的接管完全一样，
+//! 所以规矩也一样。
+//!
+//! 「从所有客户端移除」那一项是**应急开关的替代品**：发现某个 server
+//! 有问题时，一次操作从所有客户端拿掉，不用去五个文件里各删一遍。它比
+//! 「留一个 `enabled: false` 的中间状态」更直接 —— 它真的删了。
+
+use std::path::{Path, PathBuf};
+
+use crate::clients::Format;
+use crate::foreign::{self, Applied, Change, ForeignError};
+use crate::json::Val;
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpError {
+    #[error("不认识的客户端 `{0}`")]
+    UnknownClient(String),
+    #[error("{client} 的 MCP 配置解析不了，没有动它：{msg}")]
+    Parse { client: String, msg: String },
+    #[error("{0}")]
+    Write(#[from] ForeignError),
+    #[error("{client} 里没有叫 `{name}` 的 MCP server")]
+    NotThere { client: String, name: String },
+    #[error("{client} 的 MCP 配置格式我们没有验证过，不往里写（{why}）")]
+    NotCopyable { client: String, why: String },
+}
+
+/// 一个能被写入的 MCP 配置位置。
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub client: &'static str,
+    pub name: &'static str,
+    /// 相对 `$HOME`
+    pub config: &'static str,
+    pub format: Format,
+    /// server 挂在哪个键下面
+    pub key: &'static str,
+    /// 能不能往里写。
+    ///
+    /// **不能写的照样列在清单里**（看得见是 §7.12 的第一目标），只是
+    /// 不给复制按钮。
+    pub copyable: bool,
+    /// 不能写的话，为什么
+    pub why_not: &'static str,
+}
+
+/// 能往里写的那几个，以及为什么另外两个不行。
+///
+/// 判据是**我们有没有实际见过那个形状**。`mcpServers` 那三家和 Codex 的
+/// `mcp_servers` 在本机都有真实样本，字段名一致（`command` / `args` /
+/// `env`）；opencode 和 Zed 的 MCP 段本机没有样本，**照着猜写进去，
+/// 用户拿到的是一份客户端读不懂的配置** —— 那比不提供这个功能糟得多。
+pub fn targets() -> Vec<Target> {
+    vec![
+        Target {
+            client: "claude-code",
+            name: "Claude Code",
+            config: ".claude.json",
+            format: Format::Json,
+            key: "mcpServers",
+            copyable: true,
+            why_not: "",
+        },
+        Target {
+            client: "claude-desktop",
+            name: "Claude Desktop",
+            config: "Library/Application Support/Claude/claude_desktop_config.json",
+            format: Format::Json,
+            key: "mcpServers",
+            copyable: true,
+            why_not: "",
+        },
+        Target {
+            client: "cursor",
+            name: "Cursor",
+            config: ".cursor/mcp.json",
+            format: Format::Json,
+            key: "mcpServers",
+            copyable: true,
+            why_not: "",
+        },
+        Target {
+            client: "codex",
+            name: "Codex CLI",
+            config: ".codex/config.toml",
+            format: Format::Toml,
+            key: "mcp_servers",
+            copyable: true,
+            why_not: "",
+        },
+        Target {
+            client: "opencode",
+            name: "opencode",
+            config: ".config/opencode/opencode.json",
+            format: Format::Json,
+            key: "mcp",
+            copyable: false,
+            why_not: "它的 MCP 段格式我们没有实际样本，照着猜写进去可能生成一份它读不懂的配置",
+        },
+        Target {
+            client: "zed",
+            name: "Zed",
+            config: ".config/zed/settings.json",
+            format: Format::Json,
+            key: "context_servers",
+            copyable: false,
+            why_not: "Zed 的 context server 用的是另一套结构，不是 command/args 那一套",
+        },
+    ]
+}
+
+pub fn target(client: &str) -> Result<Target, McpError> {
+    targets()
+        .into_iter()
+        .find(|t| t.client == client)
+        .ok_or_else(|| McpError::UnknownClient(client.to_string()))
+}
+
+impl Target {
+    pub fn path(&self, home: &Path) -> PathBuf {
+        home.join(self.config)
+    }
+    fn check(&self) -> Result<(), McpError> {
+        if self.copyable {
+            Ok(())
+        } else {
+            Err(McpError::NotCopyable {
+                client: self.client.to_string(),
+                why: self.why_not.to_string(),
+            })
+        }
+    }
+}
+
+fn parse_err(client: &str, e: impl std::fmt::Display) -> McpError {
+    McpError::Parse {
+        client: client.into(),
+        msg: e.to_string(),
+    }
+}
+
+fn semantic(t: &Target, text: &str) -> Result<Val, McpError> {
+    match t.format {
+        Format::Json => crate::json::value(text).map_err(|e| parse_err(t.client, e)),
+        Format::Toml => crate::toml::value(text).map_err(|e| parse_err(t.client, e)),
+        Format::Yaml => Err(parse_err(t.client, "MCP 不走 YAML")),
+    }
+}
+
+fn put(t: &Target, text: &str, path: &[&str], v: &Val) -> Result<String, McpError> {
+    match t.format {
+        Format::Json => crate::json::set(text, path, v).map_err(|e| parse_err(t.client, e)),
+        Format::Toml => crate::toml::set(text, path, v).map_err(|e| parse_err(t.client, e)),
+        Format::Yaml => Err(parse_err(t.client, "MCP 不走 YAML")),
+    }
+}
+
+fn drop_(t: &Target, text: &str, path: &[&str]) -> Result<String, McpError> {
+    match t.format {
+        Format::Json => crate::json::remove(text, path).map_err(|e| parse_err(t.client, e)),
+        Format::Toml => crate::toml::remove(text, path).map_err(|e| parse_err(t.client, e)),
+        Format::Yaml => Err(parse_err(t.client, "MCP 不走 YAML")),
+    }
+}
+
+fn empty(f: Format) -> &'static str {
+    match f {
+        Format::Json => "{}\n",
+        _ => "",
+    }
+}
+
+/// 一次改动，算好了还没落盘。
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub client: String,
+    pub path: PathBuf,
+    pub before: Option<String>,
+    pub after: String,
+    pub noop: bool,
+    /// 人话的一句「这次干了什么」
+    pub summary: String,
+}
+
+/// 读一个 server 的配置原样。
+pub fn read_server(t: &Target, home: &Path, name: &str) -> Result<Val, McpError> {
+    let text = foreign::read(&t.path(home))?.unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(McpError::NotThere {
+            client: t.client.into(),
+            name: name.into(),
+        });
+    }
+    let v = semantic(t, &text)?;
+    let Val::Obj(root) = &v else {
+        return Err(parse_err(t.client, "根不是一个对象"));
+    };
+    let servers = root.iter().find(|(k, _)| k == t.key).map(|(_, v)| v);
+    match servers {
+        Some(Val::Obj(ms)) => ms
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| McpError::NotThere {
+                client: t.client.into(),
+                name: name.into(),
+            }),
+        _ => Err(McpError::NotThere {
+            client: t.client.into(),
+            name: name.into(),
+        }),
+    }
+}
+
+/// 把一份 server 配置写进某个客户端。**只动那一个键。**
+pub fn plan_copy(t: &Target, home: &Path, name: &str, value: &Val) -> Result<Plan, McpError> {
+    t.check()?;
+    let path = t.path(home);
+    let before = foreign::read(&path)?;
+    let base = before
+        .clone()
+        .unwrap_or_else(|| empty(t.format).to_string());
+    let after = put(t, &base, &[t.key, name], value)?;
+    Ok(Plan {
+        noop: before.as_deref() == Some(after.as_str()),
+        summary: format!("往 {} 里写 {}.{name}", t.name, t.key),
+        client: t.client.into(),
+        path,
+        before,
+        after,
+    })
+}
+
+/// 从某个客户端拿掉一个 server。
+pub fn plan_remove(t: &Target, home: &Path, name: &str) -> Result<Plan, McpError> {
+    let path = t.path(home);
+    let before = foreign::read(&path)?;
+    let Some(base) = before.clone() else {
+        return Err(McpError::NotThere {
+            client: t.client.into(),
+            name: name.into(),
+        });
+    };
+    let after = drop_(t, &base, &[t.key, name])?;
+    Ok(Plan {
+        noop: after == base,
+        summary: format!("从 {} 里删掉 {}.{name}", t.name, t.key),
+        client: t.client.into(),
+        path,
+        before,
+        after,
+    })
+}
+
+/// 落盘。**和接管走同一套护栏。**
+pub fn apply(t: &Target, plan: &Plan, backup_root: &Path) -> Result<Applied, McpError> {
+    let base = plan
+        .before
+        .clone()
+        .unwrap_or_else(|| empty(t.format).to_string());
+    let expect = semantic(t, &base)?;
+    let want = semantic(t, &plan.after)?;
+    // 除了那一个键，其余必须逐字段一致
+    let key = t.key;
+    let strip = |v: &Val| -> Val {
+        match v {
+            Val::Obj(ms) => Val::Obj(
+                ms.iter()
+                    .filter(|(k, _)| k != key)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    };
+    let untouched = strip(&expect).normalized();
+
+    Ok(foreign::apply(
+        &Change {
+            path: &plan.path,
+            before: plan.before.as_deref(),
+            after: &plan.after,
+            // MCP 的 env 里可能有密钥，而我们正把它抄进另一个文件
+            carries_secret: true,
+        },
+        backup_root,
+        |text| {
+            let got = match t.format {
+                Format::Json => crate::json::value(text).map_err(|e| e.to_string())?,
+                Format::Toml => crate::toml::value(text).map_err(|e| e.to_string())?,
+                Format::Yaml => return Err("MCP 不走 YAML".into()),
+            };
+            if strip(&got).normalized() != untouched {
+                return Err(format!("除了 {key} 之外还有别的东西变了"));
+            }
+            if got.normalized() != want.normalized() {
+                return Err("改完的内容和预期对不上".into());
+            }
+            Ok(())
+        },
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home_with(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        for (rel, text) in files {
+            let p = home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+        (d, home)
+    }
+
+    const CLAUDE: &str = r#"{
+  "numStartups": 42,
+  "tipsHistory": { "x": 1 },
+  "mcpServers": {
+    "filesystem": { "command": "npx", "args": ["-y", "server-filesystem", "/path/to/workspace"] }
+  }
+}
+"#;
+
+    #[test]
+    fn copying_a_server_leaves_the_rest_of_the_file_alone() {
+        // ~/.claude.json 有六万多字节，里面装着一堆和我们无关的状态。
+        let (d, home) = home_with(&[(".claude.json", CLAUDE), (".cursor/mcp.json", "{}\n")]);
+        let src = target("claude-code").unwrap();
+        let dst = target("cursor").unwrap();
+        let v = read_server(&src, &home, "filesystem").unwrap();
+
+        let p = plan_copy(&dst, &home, "filesystem", &v).unwrap();
+        apply(&dst, &p, &d.path().join("backups")).unwrap();
+
+        let out = std::fs::read_to_string(home.join(".cursor/mcp.json")).unwrap();
+        assert!(out.contains("server-filesystem"), "{out}");
+        // 源文件一个字节都不该动
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude.json")).unwrap(),
+            CLAUDE
+        );
+    }
+
+    #[test]
+    fn copying_into_a_file_full_of_other_settings_keeps_them() {
+        let (d, home) = home_with(&[
+            (".claude.json", CLAUDE),
+            (
+                ".cursor/mcp.json",
+                "{\n  \"我的设置\": \"别动\",\n  \"mcpServers\": {\n    \"别的\": { \"command\": \"x\" }\n  }\n}\n",
+            ),
+        ]);
+        let v = read_server(&target("claude-code").unwrap(), &home, "filesystem").unwrap();
+        let dst = target("cursor").unwrap();
+        let p = plan_copy(&dst, &home, "filesystem", &v).unwrap();
+        apply(&dst, &p, &d.path().join("backups")).unwrap();
+        let out = std::fs::read_to_string(home.join(".cursor/mcp.json")).unwrap();
+        assert!(out.contains("\"我的设置\": \"别动\""), "{out}");
+        assert!(out.contains("\"别的\""), "{out}");
+        assert!(out.contains("server-filesystem"), "{out}");
+    }
+
+    #[test]
+    fn copying_into_codex_writes_toml_not_json() {
+        let (d, home) = home_with(&[
+            (".claude.json", CLAUDE),
+            (
+                ".codex/config.toml",
+                "model = \"gpt-5\"\n\n[projects.\"/a\"]\ntrust_level = \"trusted\"\n",
+            ),
+        ]);
+        let v = read_server(&target("claude-code").unwrap(), &home, "filesystem").unwrap();
+        let dst = target("codex").unwrap();
+        let p = plan_copy(&dst, &home, "filesystem", &v).unwrap();
+        apply(&dst, &p, &d.path().join("backups")).unwrap();
+        let out = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(out.contains("[mcp_servers.filesystem]"), "{out}");
+        // 用户的项目授权一条都不能少
+        assert!(out.contains("[projects.\"/a\"]"), "{out}");
+        assert!(out.contains("model = \"gpt-5\""), "{out}");
+    }
+
+    #[test]
+    fn removing_takes_only_that_one_server() {
+        let two = r#"{
+  "numStartups": 42,
+  "mcpServers": {
+    "filesystem": { "command": "npx" },
+    "postgres": { "command": "mcp-postgres" }
+  }
+}
+"#;
+        let (d, home) = home_with(&[(".claude.json", two)]);
+        let t = target("claude-code").unwrap();
+        let p = plan_remove(&t, &home, "filesystem").unwrap();
+        apply(&t, &p, &d.path().join("backups")).unwrap();
+        let out = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+        assert!(!out.contains("filesystem"), "{out}");
+        assert!(out.contains("postgres"), "{out}");
+        assert!(out.contains("numStartups"), "{out}");
+    }
+
+    #[test]
+    fn a_client_whose_shape_we_have_not_verified_is_refused_out_loud() {
+        // **照着猜写进去，用户拿到的是一份客户端读不懂的配置** ——
+        // 那比不提供这个功能糟得多。
+        let (_d, home) = home_with(&[(".claude.json", CLAUDE)]);
+        let v = read_server(&target("claude-code").unwrap(), &home, "filesystem").unwrap();
+        for c in ["zed", "opencode"] {
+            let t = target(c).unwrap();
+            let e = plan_copy(&t, &home, "filesystem", &v).unwrap_err();
+            assert!(matches!(e, McpError::NotCopyable { .. }), "{e}");
+            // 而且要说清为什么
+            assert!(e.to_string().len() > 20, "{e}");
+        }
+    }
+
+    #[test]
+    fn a_verification_failure_leaves_the_target_untouched() {
+        // 和接管走同一套护栏：写回校验过不了就一个字节都不写。
+        let (d, home) = home_with(&[(".cursor/mcp.json", "{ 坏的 }")]);
+        let t = target("cursor").unwrap();
+        let e = plan_copy(&t, &home, "x", &Val::Obj(vec![])).unwrap_err();
+        assert!(matches!(e, McpError::Parse { .. }), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".cursor/mcp.json")).unwrap(),
+            "{ 坏的 }"
+        );
+        let _ = d;
+    }
+
+    #[test]
+    fn removing_something_that_is_not_there_is_a_noop_not_an_error() {
+        let (_d, home) = home_with(&[(".claude.json", CLAUDE)]);
+        let t = target("claude-code").unwrap();
+        let p = plan_remove(&t, &home, "没这个").unwrap();
+        assert!(p.noop);
+    }
+
+    #[test]
+    fn reading_from_a_client_that_does_not_have_it_says_so() {
+        let (_d, home) = home_with(&[(".claude.json", CLAUDE)]);
+        let t = target("claude-code").unwrap();
+        let e = read_server(&t, &home, "postgres").unwrap_err();
+        assert!(matches!(e, McpError::NotThere { .. }), "{e}");
+    }
+
+    #[test]
+    fn the_backup_is_made_before_a_copy_just_like_an_adoption() {
+        let (d, home) = home_with(&[(".claude.json", CLAUDE), (".cursor/mcp.json", "{}\n")]);
+        let v = read_server(&target("claude-code").unwrap(), &home, "filesystem").unwrap();
+        let dst = target("cursor").unwrap();
+        let p = plan_copy(&dst, &home, "filesystem", &v).unwrap();
+        let a = apply(&dst, &p, &d.path().join("backups")).unwrap();
+        assert_eq!(std::fs::read_to_string(&a.backup).unwrap(), "{}\n");
+    }
+}
