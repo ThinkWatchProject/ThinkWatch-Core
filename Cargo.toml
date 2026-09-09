@@ -14,6 +14,7 @@ members = [
     "crates/tw-yaml",
     "crates/tw-store",
     "crates/tw-pricing",
+    "crates/tw-adopt",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
@@ -53,6 +54,7 @@ tw-control  = { path = "crates/tw-control" }
 tw-yaml     = { path = "crates/tw-yaml" }
 tw-store    = { path = "crates/tw-store" }
 tw-pricing  = { path = "crates/tw-pricing" }
+tw-adopt    = { path = "crates/tw-adopt" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
@@ -73,6 +75,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 libc = "0.2"
 # 内置价目表压缩着放（2.3 MB → 110 KB，§4.3.0）
 flate2 = "1"
+# 保格式地改 TOML。接管 Codex 要写它的 config.toml，而重新序列化
+# 会把用户的注释和排版一起抹掉（§7.11）
+toml_edit = "0.25"
 # 只有它给节点的 span —— 而 span 是「只改一段字节」的全部前提（§3.8）。
 # serde_yaml 已经归档，且本来就不保留格式。
 saphyr-parser = "0.0.12"

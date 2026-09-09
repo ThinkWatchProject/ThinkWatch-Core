@@ -1,0 +1,20 @@
+[package]
+name = "tw-adopt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "检测本机的 AI 客户端，接管与还原它们的配置"
+
+[dependencies]
+serde = { workspace = true }
+tw-config = { path = "../tw-config" }
+tw-yaml = { path = "../tw-yaml" }
+serde_json = { workspace = true }
+toml_edit = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

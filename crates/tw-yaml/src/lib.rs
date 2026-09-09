@@ -83,7 +83,8 @@ pub enum PatchError {
     AnchorOrAlias(String),
 }
 
-fn show(path: &[Step]) -> String {
+/// 路径的人话形式（`providers[1].base_url`）。错误信息和写回校验都用它。
+pub fn show(path: &[Step]) -> String {
     let mut s = String::new();
     for st in path {
         match st {
