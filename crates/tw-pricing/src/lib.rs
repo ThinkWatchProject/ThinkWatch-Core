@@ -161,6 +161,16 @@ impl Prices {
         })
     }
 
+    /// 一张空表。**每个模型都会是「价格未知」** —— 那是价目表读不了
+    /// 时唯一诚实的答案，比退回一个可能过期的内置快照好。
+    pub fn empty() -> Self {
+        Self {
+            table: HashMap::new(),
+            overrides: HashMap::new(),
+            snapshot_date: "（价目表没能加载）".to_string(),
+        }
+    }
+
     /// 叠上用户的覆盖文件。**文件不存在是正常状态**，不是错误。
     pub fn with_overrides(mut self, path: &Path) -> Result<Self, PricingError> {
         let text = match std::fs::read_to_string(path) {

@@ -13,6 +13,7 @@ tw-config = { workspace = true }
 tw-engine = { workspace = true }
 tw-observe = { workspace = true }
 tw-secret = { workspace = true }
+tw-pricing = { workspace = true }
 tw-types = { workspace = true }
 arc-swap = { workspace = true }
 async-stream = { workspace = true }

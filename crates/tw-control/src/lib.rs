@@ -75,6 +75,8 @@ pub fn router(state: ControlState) -> Router {
         .route("/storage", get(storage))
         .route("/quota", get(quota))
         .route("/leaks", get(leaks))
+        .route("/speed/quote", post(speed_quote))
+        .route("/speed/run", post(speed_run))
         .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
         .with_state(state)
@@ -466,6 +468,134 @@ async fn latency(
             })
             .collect(),
     ))
+}
+
+/// L3 测速的报价。**必须先问这个，再问 run。**
+///
+/// 这两个端点分开不是为了好看：合成一个的话，「显示预估」和「真的花钱」
+/// 之间就没有一个用户点头的位置了（§4.6）。
+async fn speed_quote(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::SpeedRunRequest>,
+) -> Result<Json<tw_api::SpeedQuote>, Fail> {
+    let cfg = s.config();
+    let prices = prices(&s);
+    let items: Vec<tw_gateway::Estimate> = targets(&cfg, req.provider.as_deref())?
+        .iter()
+        .map(|p| {
+            tw_gateway::l3::estimate(
+                &prices,
+                &p.name,
+                &req.model,
+                // 订阅型上游的判据：最近一次响应里报过额度（§4.3.2）。
+                // **不是一个用户要填的字段** —— 那个数字一直在我们手上。
+                s.gateway
+                    .quotas()
+                    .get(&p.name)
+                    .is_some_and(|q| !q.is_empty()),
+            )
+        })
+        .collect();
+    Ok(Json(tw_api::SpeedQuote {
+        total_micros: tw_gateway::l3::total_micros(&items),
+        items: items.into_iter().map(quote_item).collect(),
+        pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+    }))
+}
+
+/// 真的跑。**这一步花钱。**
+async fn speed_run(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::SpeedRunRequest>,
+) -> Result<Json<Vec<tw_api::SpeedResult>>, Fail> {
+    let cfg = s.config();
+    let mut out = Vec::new();
+    // **逐个跑，不并发。**几家一起打，测出来的 TTFT 互相干扰，而这一层
+    // 存在的全部意义就是那几个数字准不准（和 L1 同一个理由）。
+    for p in targets(&cfg, req.provider.as_deref())? {
+        let key = match p.resolved_key() {
+            Ok(k) => k,
+            Err(e) => {
+                out.push(tw_api::SpeedResult {
+                    provider: p.name.clone(),
+                    model: req.model.clone(),
+                    ok: false,
+                    connect_ms: 0,
+                    ttft_ms: None,
+                    total_ms: 0,
+                    input_tokens: None,
+                    output_tokens: None,
+                    error: Some(format!("密钥取不到：{e}")),
+                });
+                continue;
+            }
+        };
+        let r = tw_gateway::l3::run(
+            s.http(),
+            &p.base_url,
+            &key,
+            p.effective_protocol(),
+            &p.name,
+            &req.model,
+        )
+        .await;
+        out.push(tw_api::SpeedResult {
+            provider: r.provider,
+            model: r.model,
+            ok: r.ok,
+            connect_ms: r.connect_ms,
+            ttft_ms: r.ttft_ms,
+            total_ms: r.total_ms,
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            error: r.error,
+        });
+    }
+    Ok(Json(out))
+}
+
+fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
+    tw_api::SpeedEstimate {
+        provider: e.provider,
+        model: e.model,
+        input_tokens: e.input_tokens,
+        max_output_tokens: e.max_output_tokens,
+        cost_micros: e.cost_micros,
+        note: e.note,
+    }
+}
+
+/// 价目表。**每次现建** —— 用户可能刚改过 pricing.yaml，而报价这件事
+/// 一年也点不了几次。
+fn prices(s: &ControlState) -> tw_pricing::Prices {
+    let dir = s
+        .config_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    tw_pricing::Prices::builtin()
+        .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
+        .unwrap_or_else(|e| {
+            tracing::warn!("价目表读不了，测速报价会说「价格未知」：{e}");
+            // 建不出来时给一个空表 —— 那时每一项都是「价格未知」，
+            // 而那正是诚实的答案
+            tw_pricing::Prices::empty()
+        })
+}
+
+fn targets<'a>(
+    cfg: &'a tw_config::Config,
+    provider: Option<&str>,
+) -> Result<Vec<&'a tw_config::Provider>, Fail> {
+    match provider {
+        Some(n) => Ok(vec![
+            cfg.providers
+                .iter()
+                .find(|p| p.name == n)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{n}` 的上游")))?,
+        ]),
+        None => Ok(cfg.providers.iter().collect()),
+    }
 }
 
 /// 出站密钥检测攒下的证据（§5.0）。

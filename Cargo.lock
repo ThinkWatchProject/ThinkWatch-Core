@@ -2678,6 +2678,7 @@ dependencies = [
  "tw-config",
  "tw-engine",
  "tw-observe",
+ "tw-pricing",
  "tw-secret",
  "tw-types",
 ]

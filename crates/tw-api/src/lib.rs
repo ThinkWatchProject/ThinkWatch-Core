@@ -488,6 +488,64 @@ pub struct ProviderQuota {
     pub windows: Vec<QuotaWindow>,
 }
 
+/// L3 测速要花多少（§4.6）。
+///
+/// **这是「你确认要花钱吗」那个对话框的全部内容。**触发前必须显示它，
+/// 而不是点了才知道。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedEstimate {
+    pub provider: String,
+    pub model: String,
+    /// 输入 token。**精确值** —— 请求是固定的
+    pub input_tokens: u64,
+    pub max_output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<i64>,
+    /// 给人看的那一句
+    pub note: String,
+}
+
+/// 一批测速的账。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedQuote {
+    pub items: Vec<SpeedEstimate>,
+    /// 总计。**有一项算不出来就是 None** —— 给一个看起来完整的数字，
+    /// 用户会以为那就是全部代价（§4.6）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_micros: Option<i64>,
+    pub pricing_date: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SpeedRunRequest {
+    /// 不给就是所有上游
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// **必填。**同一个 provider 的 Opus 和 Haiku 是两条完全不同的曲线，
+    /// 不指定模型的测速结果没有意义（§4.6）
+    pub model: String,
+}
+
+/// 一次 L3 测速的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedResult {
+    pub provider: String,
+    pub model: String,
+    pub ok: bool,
+    pub connect_ms: u64,
+    /// **首 token。**这一层唯一值得测的东西
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    pub total_ms: u64,
+    /// 实际消耗。**和预估对照** —— 有些上游会附加 system prompt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」（§5.0）。
 ///
 /// **这比任何功能介绍都有说服力**，因为它说的是已经发生在你身上的事。
