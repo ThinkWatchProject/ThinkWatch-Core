@@ -736,7 +736,12 @@ pub struct AdoptRequest {
 pub struct PlanView {
     pub client: String,
     pub path: String,
+    /// 改之前的原文，**密钥已打码**。
     pub before: Option<String>,
+    /// 改之后的原文，**密钥已打码 —— 落盘写的是真值**。
+    ///
+    /// 界面上永远不显示真正的密钥，diff 里也不行：用户会截图这一屏来问
+    /// 「这样对吗」。
     pub after: String,
     pub notes: Vec<String>,
     pub shadows: Vec<String>,

@@ -222,3 +222,47 @@ async fn the_diagnosis_hands_over_a_command_rather_than_running_it() {
     // 查干净的项也要说出来（§0.6）
     assert!(v.iter().any(|f| f.level == "clear"), "{v:?}");
 }
+
+#[tokio::test]
+async fn the_diff_never_shows_the_real_key_either() {
+    // 字段摘要打码了还不够：**diff 是用户最可能截图的那一屏**。
+    let b = bed();
+    std::fs::write(b.home.join(".claude/settings.json"), CLAUDE).unwrap();
+    let (_, body) = post(&b.app, "/clients/plan", r#"{"client":"claude-code"}"#).await;
+    let v: tw_api::PlanView = serde_json::from_str(&body).unwrap();
+    assert!(
+        !v.after.contains("tw-一把钥匙就够"),
+        "diff 里回显了密钥：\n{}",
+        v.after
+    );
+    assert!(
+        v.after.contains("网关密钥"),
+        "打码之后得让人看得懂那儿是什么：\n{}",
+        v.after
+    );
+    // 但真正写进文件的必须是真值
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    let on_disk = std::fs::read_to_string(b.home.join(".claude/settings.json")).unwrap();
+    assert!(
+        on_disk.contains("tw-一把钥匙就够"),
+        "写盘的时候把打码后的字符串写进去了"
+    );
+}
+
+#[tokio::test]
+async fn the_restore_diff_masks_the_users_own_key_too() {
+    // 还原的 diff 里正在被写回去的是**用户自己的**原始密钥 —— 它比
+    // 我们那把更不该出现在截图里。
+    let b = bed();
+    let p = b.home.join(".claude/settings.json");
+    std::fs::write(
+        &p,
+        "{\n  \"env\": { \"ANTHROPIC_AUTH_TOKEN\": \"tw-一把钥匙就够\" }\n}\n",
+    )
+    .unwrap();
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    let (st, body) = get(&b.app, "/clients/claude-code/restore/plan").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v: tw_api::PlanView = serde_json::from_str(&body).unwrap();
+    assert!(!v.after.contains("tw-一把钥匙就够"), "{}", v.after);
+}

@@ -60,7 +60,20 @@ impl Val {
             Val::Null => "null".into(),
             Val::Bool(b) => b.to_string(),
             Val::Num(n) => n.clone(),
-            other => render(other, "", "  ").replace('\n', " "),
+            Val::Arr(es) => format!(
+                "[{}]",
+                es.iter()
+                    .map(|e| e.to_line())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Val::Obj(ms) => format!(
+                "{{{}}}",
+                ms.iter()
+                    .map(|(k, v)| format!("{k}: {}", v.to_line()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
     fn get<'a>(&'a self, path: &[&str]) -> Option<&'a Val> {
@@ -831,6 +844,14 @@ mod tests {
         let out = set(src, &["b"], &Val::Num("2".into())).unwrap();
         assert_eq!(get(&out, &["b"]).unwrap(), Some(Val::Num("2".into())));
         assert_eq!(get(&out, &["a"]).unwrap(), Some(Val::Num("1".into())));
+    }
+
+    #[test]
+    fn a_nested_value_folds_onto_one_readable_line() {
+        // 哨兵注释和字段摘要都是一行一条，多行的缩进折进去只会变成一串
+        // 空格。
+        let v = value(r#"{"h":{"X-A":"b"},"l":[1,2]}"#).unwrap();
+        assert_eq!(v.to_line(), "{h: {X-A: b}, l: [1, 2]}");
     }
 
     #[test]

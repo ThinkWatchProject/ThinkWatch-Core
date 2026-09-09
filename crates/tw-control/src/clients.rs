@@ -107,12 +107,27 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
     }))
 }
 
-fn view(p: &plan::Plan, fields: Vec<String>) -> tw_api::PlanView {
+/// 密钥在界面上的样子。
+///
+/// **界面上永远不显示真正的密钥**，diff 里也不行 —— 用户会截图这一屏
+/// 来问「这样对吗」。落盘写的仍然是真值，[`tw_api::PlanView`] 上那两个
+/// 字段的文档里写清了这一点。
+const MASK: &str = "«config.yaml 里的那把网关密钥»";
+
+fn mask(text: &str, key: Option<&str>) -> String {
+    match key {
+        // 空 key 会把每个字符之间都插一遍，那不是脱敏是毁掉整份 diff
+        Some(k) if !k.is_empty() => text.replace(k, MASK),
+        _ => text.to_string(),
+    }
+}
+
+fn view(p: &plan::Plan, fields: Vec<String>, key: Option<&str>) -> tw_api::PlanView {
     tw_api::PlanView {
         client: p.client.clone(),
         path: p.path.display().to_string(),
-        before: p.before.clone(),
-        after: p.after.clone(),
+        before: p.before.as_deref().map(|t| mask(t, key)),
+        after: mask(&p.after, key),
         notes: p.notes.clone(),
         shadows: p.shadows.iter().map(|x| x.display().to_string()).collect(),
         noop: p.is_noop(),
@@ -148,7 +163,7 @@ pub async fn plan_adopt(
             plan::Target::Remove(path) => format!("删掉 {}", path.join(".")),
         })
         .collect();
-    Ok(Json(view(&p, fields)))
+    Ok(Json(view(&p, fields, gw.key.as_deref())))
 }
 
 /// 算一份还原改动。**不写任何东西。**
@@ -158,7 +173,15 @@ pub async fn plan_restore(
 ) -> Result<Json<tw_api::PlanView>, Fail> {
     let c = find(&id)?;
     let p = plan::plan_restore(&c, &s.home).map_err(bad)?;
-    Ok(Json(view(&p, Vec::new())))
+    // 还原的 diff 里，**要打码的是用户自己的原始密钥** —— 它正要被写
+    // 回去，而它比我们那把更不该出现在截图里
+    let keys: Vec<String> = s.config().clients.iter().map(|c| c.key.clone()).collect();
+    let mut v = view(&p, Vec::new(), None);
+    for k in &keys {
+        v.before = v.before.as_deref().map(|t| mask(t, Some(k)));
+        v.after = mask(&v.after, Some(k));
+    }
+    Ok(Json(v))
 }
 
 fn bad(e: plan::PlanError) -> Fail {
