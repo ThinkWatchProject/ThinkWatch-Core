@@ -10,6 +10,7 @@ description = "控制面 API 服务端（unix socket）"
 [dependencies]
 tw-api = { workspace = true }
 tw-config = { workspace = true }
+tw-adopt = { workspace = true }
 tw-engine = { workspace = true }
 tw-gateway = { workspace = true }
 tw-observe = { workspace = true }

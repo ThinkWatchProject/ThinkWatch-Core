@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use futures::stream::Stream;
 use tokio::sync::broadcast;
 
+pub mod clients;
 pub mod config;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
@@ -33,6 +34,20 @@ pub struct ControlState {
     /// 请求历史。**可能没有** —— 磁盘起不来时观测这一层整个不在，
     /// 而那时网关照常转发（§4.7），所以它是 Option 而不是必需品。
     pub store: Option<Arc<tokio::sync::Mutex<tw_store::Recorder>>>,
+    /// 用户的 home。接管要顺着它去找各客户端的配置。
+    ///
+    /// **是个字段，不是每次现读 `$HOME`。**进程级的环境变量是全局可变
+    /// 状态：测试里改一次，同进程里并行跑的另一个测试就会去读一个它
+    /// 没想到的目录 —— 而这个模块写的是用户其他软件的配置文件。
+    pub home: std::path::PathBuf,
+}
+
+/// `$HOME`。取不到时给一个空路径，而不是 `/` —— 空路径会让后续的
+/// 「文件不存在」自然发生，`/` 则会让我们去翻系统根目录。
+pub fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
 }
 
 impl ControlState {
@@ -80,6 +95,13 @@ pub fn router(state: ControlState) -> Router {
         .route("/speed/run", post(speed_run))
         .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
+        // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认（§7.11）
+        .route("/clients", get(clients::list))
+        .route("/clients/plan", post(clients::plan_adopt))
+        .route("/clients/adopt", post(clients::adopt))
+        .route("/clients/{id}/restore/plan", get(clients::plan_restore))
+        .route("/clients/{id}/restore", post(clients::restore))
+        .route("/clients/{id}/why", get(clients::why))
         .with_state(state)
 }
 

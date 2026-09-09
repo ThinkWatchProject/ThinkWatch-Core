@@ -571,6 +571,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 控制面无论如何都要起来 —— **网关挂了的时候，用户最需要的恰恰
         // 是能改配置**（§2.2.1）。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
+            home: tw_control::home_dir(),
             started: std::time::Instant::now(),
             gateway: state.clone(),
             cfg: manager,

@@ -666,6 +666,108 @@ pub struct SetupResponse {
     pub config_path: String,
 }
 
+// ---------------------------------------------------------- 客户端接管
+//
+// **注意 `DetectedClient` 和上面的 `ClientView` 是两个东西**：那个是
+// config.yaml 里的一把网关密钥，这个是本机上装着的一个 AI 客户端 App。
+// 中文都叫「客户端」，混起来的话，「有几个客户端」这句话就有两个答案。
+
+/// 一个客户端此刻的样子（§7.11）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedClient {
+    pub id: String,
+    pub name: String,
+    /// 用户认得的那个路径
+    pub path: String,
+    /// 跟完符号链接的真身。**和 `path` 不同时要显示出来** —— 用户以为
+    /// 在改 ~/.claude/settings.json，实际写的可能是他 dotfiles 仓库里
+    /// 的那份，而那是个会被 git 提交的地方
+    pub real: String,
+    pub installed: bool,
+    pub has_config: bool,
+    pub adopted_at_ms: Option<u64>,
+    /// 配置里此刻的端点。**读出来的**，不是拿我们自己的记录充数
+    pub endpoint: Option<String>,
+    pub shadows: Vec<String>,
+    /// `immediately` | `on_restart`
+    pub takes_effect: String,
+    pub takes_effect_note: String,
+    /// 接管之后要不要在「一直没收到请求」时提示。
+    ///
+    /// **需要重开终端的客户端不提示** —— 用户可能一整天都没重开过，那时
+    /// 弹「是不是没生效」是狼来了（§7.11）
+    pub warns_when_silent: bool,
+    /// `measured` | `fields_only`
+    pub verified: String,
+    pub verified_note: String,
+    pub costs: Vec<String>,
+    /// 最后一次收到这个客户端的请求。**接管有没有真的生效，只有它能证明**
+    pub last_seen_ms: Option<u64>,
+}
+
+/// 接管不了、只能给指引的。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualClient {
+    pub name: String,
+    pub how: String,
+    pub caveat: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientsResponse {
+    pub clients: Vec<DetectedClient>,
+    pub manual: Vec<ManualClient>,
+    /// 客户端该连的地址
+    pub gateway_base: String,
+    /// config.yaml 里有哪几把网关密钥可选
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptRequest {
+    pub client: String,
+    /// 用哪把网关密钥。不写就用第一把 —— §0.6：为「一个 key 就够」的人设计
+    #[serde(default)]
+    pub key_name: Option<String>,
+}
+
+/// 算好但还没落盘的改动。**UI 拿它画 diff 让用户确认。**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanView {
+    pub client: String,
+    pub path: String,
+    pub before: Option<String>,
+    pub after: String,
+    pub notes: Vec<String>,
+    pub shadows: Vec<String>,
+    /// 已经是这样了，什么都不用改
+    pub noop: bool,
+    pub carries_secret: bool,
+    /// 这次会把哪些字段改成什么，人话形式。diff 之外再给一份摘要
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdoptResponse {
+    pub real: String,
+    pub backup: String,
+    pub created: bool,
+    /// 不至于失败、但用户该知道的事（符号链接、权限太松……）
+    pub warnings: Vec<String>,
+    pub takes_effect_note: String,
+}
+
+/// 一条诊断发现。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingView {
+    /// `blocking` | `suspect` | `clear`
+    pub level: String,
+    pub title: String,
+    pub detail: String,
+    /// 用户可以自己执行的下一步。**我们不替他执行。**
+    pub fix: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

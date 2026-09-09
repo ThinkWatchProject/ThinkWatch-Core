@@ -2666,6 +2666,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
+ "tw-adopt",
  "tw-api",
  "tw-config",
  "tw-engine",

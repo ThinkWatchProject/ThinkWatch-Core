@@ -282,6 +282,18 @@ impl Db {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**
+    /// （§7.11）：我们改了一个文件，但那个文件有没有被读到，只有请求能
+    /// 证明。
+    pub fn last_seen_by_hint(&self) -> Result<Vec<(String, i64)>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT client_hint, MAX(at_ms) FROM requests
+             WHERE client_hint IS NOT NULL GROUP BY client_hint",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<RequestRow>, DbError> {
         Ok(self
             .conn
@@ -801,6 +813,32 @@ mod tests {
         }
         assert_eq!(db.prune_before(500).unwrap(), 4);
         assert_eq!(db.count().unwrap(), 6);
+    }
+
+    #[test]
+    fn the_observation_window_can_ask_when_a_client_was_last_seen() {
+        // 我们改了一个文件，但那个文件有没有被读到，只有请求能证明。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        for (i, (hint, at)) in [
+            (Some("codex"), 100),
+            (Some("codex"), 300),
+            (Some("claude-code"), 200),
+            (None, 400),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = row(i as i64 + 1, at);
+            r.client_hint = hint.map(|s| s.to_string());
+            db.insert(&r).unwrap();
+        }
+        let mut got = db.last_seen_by_hint().unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("claude-code".to_string(), 200), ("codex".to_string(), 300)]
+        );
     }
 
     #[test]
