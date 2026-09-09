@@ -57,17 +57,37 @@ impl Blobs {
     }
 
     /// 写一个 body。**失败只返回 false，不往上抛** —— 观测挂了，代理照跑。
+    ///
+    /// **权限是 0600，目录是 0700。**这些文件里有用户的 system prompt、
+    /// 代码、有时还有他自己粘进去的密钥 —— 和 config.yaml 一样敏感，
+    /// 而它们比 config.yaml 多得多。默认 umask 通常给 0644，那意味着
+    /// 同一台机器上的别的用户能把它们全读走（§5.4 那条「权限就是认证」
+    /// 的同一个道理）。
     pub fn put(&self, at_ms: i64, id: i64, which: Which, body: &[u8]) -> bool {
         let p = self.path_for(at_ms, id, which);
         let Some(dir) = p.parent() else { return false };
         if std::fs::create_dir_all(dir).is_err() {
             return false;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 目录也要收 —— 文件名里有 id，而目录名本身就泄漏「哪天用过」
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700));
+        }
         // 截断而不是跳过：**开头那几 KB 是最有用的部分**（模型名、system
         // prompt、工具定义都在前面），而完整存下来会挤掉别人的。
         let slice = &body[..body.len().min(MAX_ONE)];
         match std::fs::write(&p, slice) {
-            Ok(()) => true,
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
+                true
+            }
             Err(e) => {
                 tracing::debug!(path = %p.display(), "body 写不下：{e}");
                 false
@@ -102,7 +122,13 @@ impl Blobs {
             let p = self
                 .path_for(at_ms, id, which)
                 .with_extension(format!("{}.len", which.suffix()));
-            let _ = std::fs::write(p, original_len.to_string());
+            if std::fs::write(&p, original_len.to_string()).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
+            }
         }
         true
     }
@@ -344,5 +370,52 @@ mod tests {
         let (_d, b) = setup();
         assert_eq!(b.gc(0, 7, MAX_BYTES), 0);
         assert_eq!(b.total_bytes(), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// **这些文件里有用户的 system prompt、代码、有时还有他自己粘进去的
+    /// 密钥。**和 config.yaml 一样敏感，而它们比 config.yaml 多得多。
+    ///
+    /// 默认 umask 通常给 0644 —— 同一台机器上的别的用户能把它们全读走。
+    /// 这条是真机烟测撞出来的：写完之后去看了一眼落盘的那份，发现权限
+    /// 是敞开的。
+    #[test]
+    fn a_stored_body_is_not_readable_by_other_users() {
+        let d = tempfile::tempdir().unwrap();
+        let b = Blobs::new(d.path().join("blobs"));
+        assert!(b.put(0, 1, Which::Request, b"sk-ant-secret"));
+        let p = b.root().join(day_of(0)).join("1.req");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "body 的权限是 {mode:o}");
+    }
+
+    #[test]
+    fn the_day_directory_is_not_listable_by_other_users() {
+        // 目录名本身就泄漏「哪天用过这个工具」，文件名里还有请求 id。
+        let d = tempfile::tempdir().unwrap();
+        let b = Blobs::new(d.path().join("blobs"));
+        b.put(0, 1, Which::Request, b"x");
+        for p in [b.root().to_path_buf(), b.root().join(day_of(0))] {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} 的权限是 {mode:o}", p.display());
+        }
+    }
+
+    #[test]
+    fn the_truncation_marker_file_is_locked_down_too() {
+        // 它只存一个长度数字，但它和 body 在同一个目录里 —— 漏一个
+        // 就等于给那个目录开了个口子。
+        let d = tempfile::tempdir().unwrap();
+        let b = Blobs::new(d.path().join("blobs"));
+        b.put_with_len(0, 1, Which::Request, b"abc", 9999);
+        let p = b.root().join(day_of(0)).join("1.req.len");
+        assert!(p.exists(), "截断标记没写出来");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "截断标记的权限是 {mode:o}");
     }
 }

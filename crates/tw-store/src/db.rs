@@ -91,6 +91,24 @@ impl Db {
             path: path.display().to_string(),
             source,
         })?;
+        // **0600。**这个库里有每一条请求的模型、上游、token 数和花费 ——
+        // 同一台机器上的别的用户不该能读走一份你的使用记录（§5.4 那条
+        // 「权限就是认证」的同一个道理）。WAL 模式还会带出两个兄弟文件，
+        // 一起收。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["", "-wal", "-shm"] {
+                let p = if suffix.is_empty() {
+                    path.to_path_buf()
+                } else {
+                    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+                };
+                if p.exists() {
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
         Self::from_conn(conn, &path.display().to_string())
     }
 
@@ -470,7 +488,7 @@ pub struct Latency {
 mod tests {
     use super::*;
 
-    fn row(id: i64, at_ms: i64) -> RequestRow {
+    pub(super) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
             id,
             at_ms,
@@ -719,5 +737,36 @@ mod tests {
         assert_eq!(percentile(&[7], 50), 7);
         assert_eq!(percentile(&[7], 95), 7);
         assert_eq!(percentile(&[1, 2], 95), 2);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 这个库里有每一条请求的模型、上游、token 数和花费 —— 同一台机器
+    /// 上的别的用户不该能读走一份你的使用记录。
+    ///
+    /// **WAL 模式会带出 `-wal` 和 `-shm` 两个兄弟文件**，而未提交的数据
+    /// 就在 `-wal` 里。只收主文件等于没收。
+    #[test]
+    fn the_database_and_its_wal_siblings_are_not_world_readable() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("data.db");
+        {
+            let db = Db::open(&p).unwrap();
+            db.insert(&super::tests::row(1, 100)).unwrap();
+        }
+        // 重新打开一次，让权限那一步也覆盖到 WAL（它是第一次写才出现的）
+        let _db = Db::open(&p).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let f = std::path::PathBuf::from(format!("{}{suffix}", p.display()));
+            if !f.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} 的权限是 {mode:o}", f.display());
+        }
     }
 }
