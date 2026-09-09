@@ -19,6 +19,14 @@ use std::time::Duration;
 pub enum ExecError {
     #[error("exec 命令是空的")]
     Empty,
+    /// **`NotFound` 单独说一句。**开机自启时 launchd 给的 `$PATH` 只有
+    /// `/usr/bin:/bin:/usr/sbin:/sbin` —— `op`、`gcloud`、`gh` 全都找不到，
+    /// 而手动启动时一切正常。这种时好时坏的 bug 最难查，所以错误信息
+    /// 必须直接把那个原因说出来（§2.4）。
+    #[error(
+        "找不到 `{cmd}`。如果它装在 Homebrew / nvm / ~/.local/bin 里，注意开机自启的进程只有最小 PATH —— 写命令的绝对路径最稳（`which {bin}` 能查到）。"
+    )]
+    NotFound { cmd: String, bin: String },
     #[error("跑 `{cmd}` 失败：{source}")]
     Spawn { cmd: String, source: std::io::Error },
     #[error("`{cmd}` 退出码 {code}，stderr：{stderr}")]
@@ -60,9 +68,18 @@ pub fn run_exec(argv: &[String], timeout: Duration) -> Result<String, ExecError>
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|source| ExecError::Spawn {
-            cmd: cmd_desc.clone(),
-            source,
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                ExecError::NotFound {
+                    cmd: cmd_desc.clone(),
+                    bin: program.to_string(),
+                }
+            } else {
+                ExecError::Spawn {
+                    cmd: cmd_desc.clone(),
+                    source,
+                }
+            }
         })?;
 
     // 轮询而不是 wait_timeout：不想为这一处引一个 crate。密钥命令的
@@ -212,5 +229,33 @@ mod tests {
             run_exec(&argv(&["  "]), DEFAULT_TIMEOUT),
             Err(ExecError::Empty)
         ));
+    }
+}
+
+#[cfg(test)]
+mod notfound_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_binary_points_at_the_path_problem_not_at_a_generic_io_error() {
+        // 开机自启时 launchd 给的 PATH 只有四个目录，`op`/`gcloud`/`gh`
+        // 全都找不到 —— 而手动启动时一切正常。这种时好时坏的 bug 最难查，
+        // 所以那句「注意 PATH」必须在错误里，不能只在文档里（§2.4）。
+        let e = run_exec(
+            &["definitely-not-a-real-binary-xyz".into(), "read".into()],
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("PATH"), "{m}");
+        assert!(m.contains("definitely-not-a-real-binary-xyz"), "{m}");
+        assert!(m.contains("绝对路径"), "{m}");
+    }
+
+    #[test]
+    fn a_binary_that_exists_but_fails_is_a_different_error() {
+        // 找不到和跑失败是两件事，指错方向的代价是查半天 PATH。
+        let e = run_exec(&["false".into()], Duration::from_secs(5)).unwrap_err();
+        assert!(!e.to_string().contains("PATH"), "{e}");
     }
 }
