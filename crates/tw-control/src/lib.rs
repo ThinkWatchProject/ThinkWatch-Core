@@ -412,6 +412,36 @@ pub enum ControlError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// **系统级的硬上限，不是我们的规矩。**`sockaddr_un.sun_path` 在
+    /// macOS 上是 104 字节、Linux 上 108 —— 超了 `bind` 会失败，而 libc
+    /// 给的原话是「path must be shorter than SUN_LEN」，看不出上限是多少、
+    /// 也看不出自己超了多少。
+    #[error(
+        "控制面 socket 的路径太长：{len} 字节，系统上限是 {max}。\n{path}\n把配置放到一个短一点的目录下（默认的 ~/.thinkwatch 不会有这个问题）。"
+    )]
+    PathTooLong {
+        path: PathBuf,
+        len: usize,
+        max: usize,
+    },
+}
+
+/// `sockaddr_un.sun_path` 的容量。macOS 104、Linux 108，取小的那个 ——
+/// 差的那 4 个字节不值得为它分平台。
+const SUN_PATH_MAX: usize = 104;
+
+/// 路径放得下吗。**在 bind 之前问**，这样错误信息能说清上限和超出量。
+pub fn socket_path_fits(path: &Path) -> Result<(), ControlError> {
+    // 末尾的 NUL 也占一个字节
+    let len = path.as_os_str().as_encoded_bytes().len() + 1;
+    if len > SUN_PATH_MAX {
+        return Err(ControlError::PathTooLong {
+            path: path.to_path_buf(),
+            len,
+            max: SUN_PATH_MAX,
+        });
+    }
+    Ok(())
 }
 
 /// 在 unix socket 上起控制面。
@@ -419,6 +449,7 @@ pub enum ControlError {
 /// 陈旧的 socket 文件直接删掉重建 —— 它和 lock 文件不一样，没有「另一个
 /// 实例可能还在用」的歧义：单实例锁已经在上一步挡住了。
 pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlError> {
+    socket_path_fits(path)?;
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
@@ -467,4 +498,46 @@ pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlE
 /// 默认 socket 路径。和配置放一起，这样「一个目录装下全部状态」这条成立。
 pub fn default_socket_path() -> PathBuf {
     tw_config::default_dir().join("twcore.sock")
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_that_does_not_fit_says_the_limit_and_by_how_much() {
+        // libc 的原话是「path must be shorter than SUN_LEN」—— 看不出
+        // 上限是多少，也看不出自己超了多少。两个数字都得说。
+        let long = PathBuf::from("/tmp")
+            .join("x".repeat(200))
+            .join("twcore.sock");
+        let e = socket_path_fits(&long).unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("104"), "{m}");
+        assert!(
+            m.contains(&format!("{}", long.as_os_str().len() + 1)),
+            "{m}"
+        );
+        // 还要说怎么办
+        assert!(m.contains(".thinkwatch"), "{m}");
+    }
+
+    #[test]
+    fn the_default_path_fits_with_room_to_spare() {
+        // 这条不是形式主义：如果哪天默认目录变深了，它会立刻响。
+        let p = tw_config::default_dir().join("twcore.sock");
+        socket_path_fits(&p).unwrap();
+    }
+
+    #[test]
+    fn the_boundary_is_the_nul_terminator_not_the_byte_count() {
+        // 正好 104 字节的路径**放不下** —— 结尾的 NUL 也要占一个。
+        // 差这一个字节的话，失败会推迟到 bind，而那时的报错完全不同。
+        let base = "/tmp/";
+        let exact = PathBuf::from(format!("{base}{}", "a".repeat(104 - base.len())));
+        assert_eq!(exact.as_os_str().len(), 104);
+        assert!(socket_path_fits(&exact).is_err());
+        let one_less = PathBuf::from(format!("{base}{}", "a".repeat(103 - base.len())));
+        assert!(socket_path_fits(&one_less).is_ok());
+    }
 }

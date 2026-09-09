@@ -285,6 +285,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         .enable_all()
         .build()?;
     let socket = dir.join("twcore.sock");
+    // **在起任何东西之前问**。等到 bind 失败时，网关已经在监听、客户端
+    // 可能已经连上来了，而这条错误当时只会进日志。
+    tw_control::socket_path_fits(&socket)?;
     let config_path = path.to_path_buf();
     rt.block_on(async move {
         let state = tw_gateway::AppState::new(cfg.clone())
@@ -304,10 +307,21 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             health: state.health.clone(),
         };
         let sock = socket.clone();
+        // **控制面没了就得退，不能只记一行日志。**
+        //
+        // 一个没有控制面的 core 是 UI 完全够不着的：连不上、改不了配置、
+        // 也关不掉。守护那边的心跳会因此失败，然后按重启阶梯反复拉起来，
+        // 而用户看到的是「core 连续失败」——真正的原因（比如 socket 路径
+        // 太长）只在日志里躺着。退出让那句话有机会走到人眼前。
+        let (control_died, control_dead) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            if let Err(e) = tw_control::serve_unix(control, &sock).await {
-                tracing::error!("控制面起不来：{e}");
-            }
+            let r = tw_control::serve_unix(control, &sock).await;
+            let msg = match r {
+                Err(e) => format!("{e}"),
+                // serve_unix 正常返回意味着 accept 循环结束了，同样是没了
+                Ok(()) => "控制面意外结束".to_string(),
+            };
+            let _ = control_died.send(msg);
         });
 
         if let Some(ppid) = parent {
@@ -327,8 +341,14 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 
         if safe {
             // 安全模式：只起控制面。数据面不动，让用户还能改配置、回滚。
+            // **这时候控制面就是全部** —— 它没了，这个进程一件事都干不了。
             tracing::warn!("安全模式：只起控制面，数据面不启动");
-            shutdown_signal().await;
+            tokio::select! {
+                msg = control_dead => {
+                    anyhow::bail!("{}", msg.unwrap_or_else(|_| "控制面没了".into()))
+                }
+                _ = shutdown_signal() => {}
+            }
             return Ok(());
         }
 
@@ -340,6 +360,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         tokio::select! {
             r = tw_gateway::serve(state, addr) => {
                 r.with_context(|| format!("监听 {addr} 失败。端口被占用的话，先看看是不是上一个实例没退干净。"))
+            }
+            msg = control_dead => {
+                anyhow::bail!("{}", msg.unwrap_or_else(|_| "控制面没了".into()))
             }
             _ = shutdown_signal() => {
                 tracing::info!("收到退出信号");
