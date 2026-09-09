@@ -64,6 +64,20 @@ pub fn dirs_for(sources: &[crate::sources::Source]) -> Vec<PathBuf> {
     out
 }
 
+/// 我们关心的文件后缀。
+///
+/// 这个过滤器不是优化，是**必需品**：`~/.claude.json` 的父目录是
+/// `$HOME` —— 那是全机器最忙的目录之一（每个应用都在往那儿写点东西）。
+/// 不过滤的话，别人写一次 `.zsh_history` 我们就重扫一遍几十个文件，
+/// 而 §4.5 要的是「空闲时接近零」。
+const INTERESTING: &[&str] = &["md", "json", "toml", "yaml", "yml"];
+
+fn interesting(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| INTERESTING.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
 /// 盯住这些目录，聚合出的每一次改动发一个信号。
 ///
 /// 发的是「有事发生了」而不是「文件现在长这样」：**读文件是调用方的
@@ -84,9 +98,12 @@ pub fn watch(dirs: &[PathBuf]) -> Result<(Watch, tokio::sync::mpsc::Receiver<()>
         ) {
             return;
         }
-        // 我们自己写的备份和旁文件不算 —— 接管一次会触发一轮扫描，
-        // 那一轮又什么都发现不了
-        if ev.paths.iter().all(|p| is_ours(p)) {
+        // 只有我们关心的那几种文件算数。**这一条撑着「空闲接近零」** ——
+        // `$HOME` 在监听集合里（`~/.claude.json` 的父目录就是它）。
+        //
+        // 我们自己写的备份和旁文件也不算：接管一次会触发一轮扫描，
+        // 那一轮又什么都发现不了。
+        if !ev.paths.iter().any(|p| interesting(p) && !is_ours(p)) {
             return;
         }
         let _ = raw_tx.send(());
@@ -267,6 +284,36 @@ mod tests {
                 .await
                 .is_ok(),
             "没收到信号"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_an_unrelated_file_in_a_watched_directory_stays_quiet() {
+        // **这一条撑着「空闲时 CPU 接近零」。**`$HOME` 在监听集合里
+        // （`~/.claude.json` 的父目录就是它），而那是全机器最忙的目录
+        // 之一 —— 别人写一次 `.zsh_history` 我们就重扫几十个文件的话，
+        // 这个功能会变成一个后台耗电器。
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().to_path_buf();
+        let (_w, mut rx) = watch(std::slice::from_ref(&dir)).unwrap();
+
+        std::fs::write(dir.join(".zsh_history"), "别人的东西\n").unwrap();
+        std::fs::write(dir.join("settings.json.thinkwatch.json"), "{}").unwrap();
+        std::fs::write(dir.join("x.sock"), "").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), rx.recv())
+                .await
+                .is_err(),
+            "被无关文件吵醒了"
+        );
+
+        // 而我们关心的那种照样能叫醒它
+        std::fs::write(dir.join("CLAUDE.md"), "# 改了\n").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .is_ok(),
+            "该醒的时候没醒"
         );
     }
 
