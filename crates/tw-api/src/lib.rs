@@ -446,6 +446,25 @@ pub struct HistoryRow {
     pub local: bool,
 }
 
+/// 一条请求的全部细节。**详情抽屉吃这个。**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestDetail {
+    pub row: HistoryRow,
+    pub request_body: Option<BodyView>,
+    pub response_body: Option<BodyView>,
+}
+
+/// 一份存下来的 body。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyView {
+    /// **已脱敏**。这段文字会被复制到 issue 里（§9.7）
+    pub text: String,
+    /// 原本多长。**截断了要能说出来** —— 不说的话用户会以为请求本身
+    /// 就长这样
+    pub original_len: usize,
+    pub truncated: bool,
+}
+
 /// 一个上游的订阅额度（§4.3.2）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderQuota {

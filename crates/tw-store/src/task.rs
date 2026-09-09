@@ -7,7 +7,24 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::blobs::Which;
 use crate::recorder::Recorder;
+
+/// 一份等着落盘的 body。
+///
+/// **这个类型属于 store，不属于网关。**让 store 依赖网关会把「观测」
+/// 挂到「转发」下面，而它们是两件平级的事（§9.0.1 的两层划分）——
+/// 网关那边有自己的同形结构，接线在 `twcore` 里完成，那是唯一同时看得
+/// 见两边的地方。
+#[derive(Debug)]
+pub struct StoredBody {
+    pub id: u64,
+    pub at_ms: i64,
+    pub which: Which,
+    pub body: bytes::Bytes,
+    /// 原始长度。截断了要能说出来
+    pub original_len: usize,
+}
 
 /// 多久回收一次。
 ///
@@ -23,8 +40,19 @@ pub const METADATA_KEEP_DAYS: u64 = 90;
 pub fn spawn(
     recorder: Recorder,
     mut rx: tokio::sync::broadcast::Receiver<tw_api::Event>,
+    mut bodies: tokio::sync::mpsc::Receiver<StoredBody>,
 ) -> Arc<Mutex<Recorder>> {
     let shared = Arc::new(Mutex::new(recorder));
+    let r = shared.clone();
+    tokio::spawn(async move {
+        while let Some(b) = bodies.recv().await {
+            // **写盘在这条任务上，不在转发那条路上。**慢磁盘只会让
+            // 通道积压然后丢，不会让请求变慢（§4.7）。
+            r.lock()
+                .await
+                .record_body(b.at_ms, b.id, b.which, &b.body, b.original_len);
+        }
+    });
     let r = shared.clone();
     tokio::spawn(async move {
         loop {

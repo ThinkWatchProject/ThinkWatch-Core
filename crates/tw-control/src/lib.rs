@@ -74,6 +74,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/latency", get(latency))
         .route("/storage", get(storage))
         .route("/quota", get(quota))
+        .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
         .with_state(state)
 }
@@ -464,6 +465,43 @@ async fn latency(
             })
             .collect(),
     ))
+}
+
+/// 一条请求的全部细节，含 body。
+///
+/// **body 是从磁盘现读的，不进内存缓存。**详情抽屉一次只看一条，而把
+/// 所有 body 缓存起来等着「万一有人点」，代价是几百 MB。
+async fn request_detail(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<tw_api::RequestDetail>, Fail> {
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let row = g
+        .db()
+        .get(id)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+    let at = row.at_ms;
+    let body = |which| {
+        let raw = g.blobs().get(at, id, which)?;
+        let stored = raw.len();
+        // **一律脱敏。**请求体里有 system prompt、工具定义、有时还有
+        // 用户粘进去的密钥，而这段文字会被复制到 issue 里（§9.7）。
+        let text = tw_secret::mask_body(&String::from_utf8_lossy(&raw));
+        let original_len = g.blobs().original_len(at, id, which).unwrap_or(stored);
+        Some(tw_api::BodyView {
+            text,
+            original_len,
+            truncated: original_len > stored,
+        })
+    };
+    let detail = tw_api::RequestDetail {
+        request_body: body(tw_store::Which::Request),
+        response_body: body(tw_store::Which::Response),
+        row: history_row(row),
+    };
+    Ok(Json(detail))
 }
 
 /// 订阅额度。**每个上游最近一次报的**（§4.3.2）。

@@ -85,6 +85,37 @@ impl Blobs {
         len > MAX_ONE
     }
 
+    /// 存了多少、原本多长。**两个数一起返回** —— 详情页要靠它说出
+    /// 「只存了开头 256 KB」。
+    pub fn put_with_len(
+        &self,
+        at_ms: i64,
+        id: i64,
+        which: Which,
+        body: &[u8],
+        original_len: usize,
+    ) -> bool {
+        if !self.put(at_ms, id, which, body) {
+            return false;
+        }
+        if original_len > body.len() {
+            let p = self
+                .path_for(at_ms, id, which)
+                .with_extension(format!("{}.len", which.suffix()));
+            let _ = std::fs::write(p, original_len.to_string());
+        }
+        true
+    }
+
+    /// 原始长度。**没有这个文件说明没截断** —— 那时 body 自己的长度
+    /// 就是真相。
+    pub fn original_len(&self, at_ms: i64, id: i64, which: Which) -> Option<usize> {
+        let p = self
+            .path_for(at_ms, id, which)
+            .with_extension(format!("{}.len", which.suffix()));
+        std::fs::read_to_string(p).ok()?.trim().parse().ok()
+    }
+
     /// 所有天目录，**从旧到新**。
     fn days(&self) -> Vec<(String, PathBuf)> {
         let Ok(rd) = std::fs::read_dir(&self.root) else {

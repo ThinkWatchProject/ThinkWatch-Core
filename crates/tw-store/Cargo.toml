@@ -10,6 +10,7 @@ description = "请求历史与运行时状态：SQLite + 文件系统"
 [dependencies]
 tw-api = { workspace = true }
 tw-pricing = { workspace = true }
+bytes = { workspace = true }
 rusqlite = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }

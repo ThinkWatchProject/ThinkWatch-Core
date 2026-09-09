@@ -72,13 +72,16 @@ impl Recorder {
         &self.blobs
     }
 
-    /// 记一次请求体。**在事件之外单独走** —— body 不进事件流：那是个
-    /// 广播通道，每个订阅者都会拿到一份拷贝，而 body 可能几百 KB。
-    pub fn record_body(&self, at_ms: i64, id: u64, which: Which, body: &[u8]) {
+    /// 记一次请求体或响应体。
+    ///
+    /// **在事件之外单独走** —— body 不进事件流：那是个广播通道，每个
+    /// 订阅者都会拿到一份拷贝，而 body 可能几百 KB。
+    pub fn record_body(&self, at_ms: i64, id: u64, which: Which, body: &[u8], original_len: usize) {
         if !self.level.writes_blobs() {
             return;
         }
-        self.blobs.put(at_ms, id as i64, which, body);
+        self.blobs
+            .put_with_len(at_ms, id as i64, which, body, original_len);
     }
 
     /// 吃一个事件。
@@ -490,7 +493,7 @@ mod tests {
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&finished(1, None));
         assert_eq!(r.db().count().unwrap(), 1);
-        r.record_body(1_000_000, 1, Which::Request, b"body");
+        r.record_body(1_000_000, 1, Which::Request, b"body", 4);
         assert!(
             r.blobs().get(1_000_000, 1, Which::Request).is_none(),
             "这一级不该写 body"

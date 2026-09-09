@@ -428,7 +428,15 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 
         // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
         // 照常转发（§4.7）。所以这里所有的失败都只记一行日志。
-        let store = build_store(&dir, state.bus.subscribe());
+        //
+        // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
+        // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面
+        // （§9.0.1）。
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
+        let store = build_store(&dir, state.bus.subscribe(), body_rx);
+        if store.is_some() {
+            state.set_body_sink(body_tx);
+        }
 
         // 配置的唯一入口。UI、CLI、文件监听都从这里进（§3.8）。
         let manager = std::sync::Arc::new(tw_control::ConfigManager::new(
@@ -536,6 +544,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 fn build_store(
     dir: &Path,
     events: tokio::sync::broadcast::Receiver<tw_api::Event>,
+    bodies: tokio::sync::mpsc::Receiver<tw_gateway::BodyRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let db = match tw_store::Db::open(&dir.join("data.db")) {
         Ok(db) => db,
@@ -556,9 +565,31 @@ fn build_store(
         }
     };
     let blobs = tw_store::Blobs::new(dir.join("blobs"));
+    // 两边的 body 结构在这里对接。**一次移动，不复制** —— `Bytes` 的
+    // 克隆是引用计数。
+    let (tx, rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
+    let mut bodies = bodies;
+    tokio::spawn(async move {
+        while let Some(b) = bodies.recv().await {
+            let mapped = tw_store::StoredBody {
+                id: b.id,
+                at_ms: b.at_ms,
+                which: match b.kind {
+                    tw_gateway::BodyKind::Request => tw_store::Which::Request,
+                    tw_gateway::BodyKind::Response => tw_store::Which::Response,
+                },
+                body: b.body,
+                original_len: b.original_len,
+            };
+            if tx.send(mapped).await.is_err() {
+                return;
+            }
+        }
+    });
     Some(tw_store::task::spawn(
         tw_store::Recorder::new(db, blobs, prices),
         events,
+        rx,
     ))
 }
 

@@ -217,6 +217,12 @@ pub struct AppState {
     /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
     /// 探测要打网络，不能挡住启动。
     pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
+    /// 请求体和响应体往哪儿交（§8）。
+    ///
+    /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
+    /// —— 一次慢磁盘写就变成一次慢请求，而观测永远不该有这个权力。
+    /// `None` 表示观测层没起来，那时什么都不做。
+    body_sink: Arc<std::sync::Mutex<Option<crate::bodies::BodySender>>>,
     /// 每个上游最近一次报的订阅额度（§4.3.2）。
     ///
     /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
@@ -246,6 +252,7 @@ impl AppState {
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(catalog)),
+            body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
         })
@@ -263,6 +270,18 @@ impl AppState {
 
     pub fn gate(&self) -> Arc<crate::limits::Gate> {
         self.gate.load_full()
+    }
+
+    /// 接上 body 的去处。**观测层起来之后才调** —— 在那之前 body 一律
+    /// 丢掉，而请求照常。
+    pub fn set_body_sink(&self, tx: crate::bodies::BodySender) {
+        if let Ok(mut g) = self.body_sink.lock() {
+            *g = Some(tx);
+        }
+    }
+
+    fn body_sink(&self) -> Option<crate::bodies::BodySender> {
+        self.body_sink.lock().ok().and_then(|g| g.clone())
     }
 
     /// 每个上游最近一次报的订阅额度。
@@ -596,6 +615,22 @@ async fn pipeline(
         at_ms: now_ms(),
     });
 
+    // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
+    // 除了一次 `Bytes` 的引用计数之外没有别的成本（§4.1 说过入站是要
+    // 整个解析的，所以本来就在）。
+    let sink = state.body_sink();
+    let at_ms = now_ms() as i64;
+    crate::bodies::offer(
+        &sink,
+        crate::bodies::BodyRecord {
+            id,
+            at_ms,
+            kind: crate::bodies::BodyKind::Request,
+            body: body.clone(),
+            original_len: body.len(),
+        },
+    );
+
     // 依次尝试。**首字节之前可以透明切换**（§4.2）—— 拿到响应头之前
     // 我们还没往客户端写过任何东西，换一家客户端完全无感。
     //
@@ -794,10 +829,14 @@ async fn pipeline(
         // **旁路嗅探，不缓冲**（§4.3）：字节照常流向客户端，同时喂它
         // 一份。上游返回的 usage 是真相，而拿不到它就只能估。
         let mut sniffer = crate::usage::Sniffer::new();
+        // 响应体也攒一份，**攒到上限就停**。和 usage 嗅探走同一个循环 ——
+        // 两个各自遍历一遍是白白多走一趟。
+        let mut tap = crate::bodies::ResponseTap::new();
         while let Some(item) = counted.next().await {
             match item {
                 Ok(chunk) => {
                     sniffer.feed(&chunk);
+                    tap.feed(&chunk);
                     yield Ok::<Bytes, std::io::Error>(chunk)
                 }
                 Err(e) => {
@@ -805,6 +844,19 @@ async fn pipeline(
                     break;
                 }
             }
+        }
+        let (recorded, original_len) = tap.finish();
+        if !recorded.is_empty() {
+            crate::bodies::offer(
+                &sink,
+                crate::bodies::BodyRecord {
+                    id,
+                    at_ms,
+                    kind: crate::bodies::BodyKind::Response,
+                    body: recorded,
+                    original_len,
+                },
+            );
         }
         match broke {
             None => bus.emit(tw_api::Event::RequestFinished {

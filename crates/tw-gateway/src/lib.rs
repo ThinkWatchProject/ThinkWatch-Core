@@ -7,6 +7,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod bodies;
 pub mod clientprobe;
 pub mod error;
 pub mod forward;
@@ -19,6 +20,7 @@ pub mod server;
 pub mod usage;
 
 pub use access::{AllowList, Cidr};
+pub use bodies::{BodyKind, BodyRecord, BodySender};
 pub use clientprobe::{ProbeKind, classify};
 pub use error::GatewayError;
 pub use health::Health;

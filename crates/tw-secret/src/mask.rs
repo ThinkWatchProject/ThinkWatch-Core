@@ -274,3 +274,97 @@ mod tests {
         assert_eq!(redact_url("sk-this-is-actually-a-key"), "<非 URL>");
     }
 }
+
+/// 一整段 body 里的密钥打掉。
+///
+/// 请求体里有 system prompt、工具定义，有时还有用户自己粘进去的密钥；
+/// 而这段文字会出现在详情抽屉里、被复制到 issue 里（§9.7 的统一脱敏）。
+///
+/// **按值的形状判，不按键名。**body 是 JSON，键名五花八门（`api_key`、
+/// `token`、`Authorization`、某个 MCP server 自己起的名字），而凭据的
+/// 形状是有限的几种。
+pub fn mask_body(text: &str) -> String {
+    // 一个可能是凭据的 token 由这些字符组成
+    fn is_tok(c: char) -> bool {
+        c.is_ascii_alphanumeric() || "-_.".contains(c)
+    }
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // 只在一个 token 的开头尝试匹配，否则 `xsk-abc` 里的 `sk-abc`
+        // 会被当成密钥
+        let at_boundary = i == 0 || !is_tok(chars[i - 1]);
+        if at_boundary {
+            let mut j = i;
+            while j < chars.len() && is_tok(chars[j]) {
+                j += 1;
+            }
+            let tok: String = chars[i..j].iter().collect();
+            if looks_like_credential(&tok) {
+                out.push_str(&mask_secret(&tok));
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    #[test]
+    fn a_key_pasted_into_a_request_body_is_masked() {
+        // 用户在对话里粘一把 key 是常事（「帮我看看这个配置」）。而这段
+        // 文字会出现在详情抽屉、被复制到 issue 里（§9.7）。
+        let b = r#"{"messages":[{"role":"user","content":"我的 key 是 sk-ant-api03-abcdefghijklmnopqrstuvwxyz"}]}"#;
+        let out = mask_body(b);
+        assert!(!out.contains("abcdefghijklmnop"), "{out}");
+        assert!(out.contains("messages"), "结构被打坏了：{out}");
+    }
+
+    #[test]
+    fn ordinary_prose_and_code_survive_intact() {
+        // **过度打码会让详情抽屉变得没法读**，而那正是它存在的理由。
+        for s in [
+            r#"{"model":"claude-sonnet-4-5","max_tokens":8000}"#,
+            r#"{"content":"请帮我重构 src/main.rs 里的 handle_request 函数"}"#,
+            r#"{"tools":[{"name":"read_file","description":"读一个文件"}]}"#,
+            "for (let i = 0; i < 10; i++) { console.log(i); }",
+        ] {
+            assert_eq!(mask_body(s), s, "被改了：{s}");
+        }
+    }
+
+    #[test]
+    fn a_credential_glued_to_other_characters_is_not_half_masked() {
+        // `xsk-abc…` 里的 `sk-abc…` 不是一把密钥。只在 token 边界上匹配。
+        let s = "看看 xsk-ant-api03-abcdefghijklmnop 这个变量名";
+        assert_eq!(mask_body(s), s);
+    }
+
+    #[test]
+    fn several_keys_in_one_body_are_all_masked() {
+        let s = "sk-ant-api03-aaaaaaaaaaaaaaaa 和 ghp_bbbbbbbbbbbbbbbbbbbb";
+        let out = mask_body(s);
+        assert!(!out.contains("aaaaaaaaaaaaaaaa"), "{out}");
+        assert!(!out.contains("bbbbbbbbbbbbbbbb"), "{out}");
+    }
+
+    #[test]
+    fn a_multibyte_body_does_not_panic() {
+        // 按字节切 &str 的坑在这一层同样存在（§9.7）。
+        for s in [
+            "中文中文中文 sk-ant-api03-abcdefghijklmnop 中文",
+            "🙂🙂🙂",
+            "",
+            "日本語のテキストです",
+        ] {
+            let _ = mask_body(s);
+        }
+    }
+}
