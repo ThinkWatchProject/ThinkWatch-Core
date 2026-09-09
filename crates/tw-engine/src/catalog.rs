@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::rule::glob_match;
 
 /// 一家上游能提供什么。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderModels {
     pub provider: String,
     /// 这家说的方言。客户端按方言过滤时用它

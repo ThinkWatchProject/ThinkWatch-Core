@@ -94,8 +94,39 @@ fn build_client(
         .map_err(|e| GatewayError::config(format!("HTTP 客户端建不起来：{e}")))
 }
 
-#[derive(Clone)]
-pub struct AppState {
+/// 目录的来源清单：每个 provider 声明了哪些模型、说什么协议。
+///
+/// **单独一个函数是为了让「上游名单变没变」有一个确切的判据**。
+/// 改一条路由规则不该重置模型目录（那会让 `/v1/models` 短暂地空一下），
+/// 而删掉一个 provider 必须立刻反映（列表即承诺，§3.9）。
+fn catalog_sources(cfg: &tw_config::Config) -> Vec<tw_engine::ProviderModels> {
+    cfg.providers
+        .iter()
+        .map(|p| tw_engine::ProviderModels {
+            provider: p.name.clone(),
+            protocol: p
+                .effective_protocol()
+                .map(|x| format!("{x:?}"))
+                // 猜不出协议时按 Anthropic 算 —— 和转发时的默认一致
+                // （forward::apply_credential）。两处不一致会让「列出来了
+                // 但发过去 401」变成可能。
+                .unwrap_or_else(|| "Anthropic".to_string()),
+            models: p.models.clone(),
+        })
+        .collect()
+}
+
+fn catalog_from(cfg: &tw_config::Config) -> tw_engine::Catalog {
+    tw_engine::Catalog::build(&catalog_sources(cfg))
+}
+
+/// 一次配置换入时**整块换掉**的那部分。
+///
+/// 分成「换的」和「不换的」两堆，判据是**这个东西丢了会不会让用户感觉
+/// 到**：熔断状态丢了，一家刚被熔断的上游会立刻又被试一遍；并发闸门丢
+/// 了，正在排队的请求会失去它们的位置；事件流丢了，界面上的实时列表会
+/// 断一次。这些都不该因为改了一条路由规则而发生。
+pub struct Runtime {
     pub config: Arc<tw_config::Config>,
     /// 路由引擎。**和配置一起建，一起换** —— 分开持有会让「规则改了但
     /// 引擎还是旧的」变成可能，而那种不一致完全静默。
@@ -103,18 +134,84 @@ pub struct AppState {
     /// **每个 provider 一个 Client**。reqwest 的代理绑在 Client 上，
     /// 不能按请求切换（§3.7）—— 而这本来也是对的：连接池按上游隔离，
     /// 一个慢上游不会占着另一个的连接。
-    pub clients: Arc<std::collections::HashMap<String, reqwest::Client>>,
+    pub clients: std::collections::HashMap<String, reqwest::Client>,
+    /// 来源白名单。空 = 全放行，而那只在 loopback 下成立（§5.4）。
+    pub allow: crate::access::AllowList,
+}
+
+impl Runtime {
+    /// 建一份运行时。
+    ///
+    /// `previous` 在时**尽量复用上一份的 Client**。每次重载都重建所有
+    /// Client，等于把每个上游的连接池连同已经握好的 TLS 一起扔掉 ——
+    /// 改一条路由规则不该让下一个请求多付一次完整的建连。只有代理相关
+    /// 的字段变了才必须重建，因为代理是绑在 Client 上的。
+    pub fn build(
+        config: tw_config::Config,
+        previous: Option<&Runtime>,
+    ) -> Result<Self, GatewayError> {
+        let mut clients = std::collections::HashMap::new();
+        for p in &config.providers {
+            let reusable = previous.and_then(|prev| {
+                let old = prev.config.providers.iter().find(|x| x.name == p.name)?;
+                if proxy_shape(&prev.config, old) == proxy_shape(&config, p) {
+                    prev.clients.get(&p.name)
+                } else {
+                    None
+                }
+            });
+            match reusable {
+                Some(c) => clients.insert(p.name.clone(), c.clone()),
+                None => clients.insert(p.name.clone(), build_client(&config, p)?),
+            };
+        }
+        let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
+            .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
+        Ok(Self {
+            engine: Arc::new(config.engine()),
+            config: Arc::new(config),
+            clients,
+            allow,
+        })
+    }
+}
+
+/// 决定一个 Client 能不能复用的那几个字段。
+///
+/// base_url 和 key 都**不在**里面：Client 不绑 URL，凭据是每个请求现加
+/// 的。把它们算进来只会让「改个 key」白白丢掉一整个连接池。
+fn proxy_shape(cfg: &tw_config::Config, p: &tw_config::Provider) -> String {
+    let px = cfg
+        .proxies
+        .iter()
+        .find(|x| x.name == p.proxy)
+        .map(|x| format!("{:?}|{}|{}", x.kind, x.addr, x.auth.is_some()))
+        .unwrap_or_default();
+    format!("{}|{:?}|{px}", p.proxy, p.on_proxy_fail)
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    /// 配置换入时整块换掉的那部分（§3.8 第 ⑤ 步）。
+    ///
+    /// **一次 `store` 就是一次生效**：正在跑的请求持有旧的 `Arc`，跑完
+    /// 自然释放；新请求看到的是新的。中间没有任何一个瞬间是半新半旧的。
+    rt: Arc<arc_swap::ArcSwap<Runtime>>,
+    /// 并发闸门。排队不拒绝（§4.7）。
+    ///
+    /// **不在 Runtime 里，因为它握着正在跑的请求的通行证。**跟着配置一起
+    /// 换的话，每改一次规则，队列里排着的请求就会失去位置，而已经在跑的
+    /// 那些的通行证会变成孤儿 —— 于是那一瞬间的实际并发可以到上限的两倍。
+    /// 只有 `limits` 真的变了才换它。
+    gate: Arc<arc_swap::ArcSwap<crate::limits::Gate>>,
     /// 探测和别的杂事用的默认 Client（不走代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
-    /// 没有人在看。
+    /// 没有人在看。**跨重载存活**：界面上的实时列表不该因为改了配置断一次。
     pub bus: tw_observe::EventBus,
-    /// 上游健康。**不持久化** —— 重启后重置为未知（§4.2）。
+    /// 上游健康。**不持久化**，但**跨重载存活** —— 一家刚被熔断的上游
+    /// 不该因为你改了条规则就立刻又被试一遍（§4.2）。
     pub health: Arc<Health>,
-    /// 并发闸门。排队不拒绝（§4.7）。
-    pub gate: Arc<crate::limits::Gate>,
-    /// 来源白名单。空 = 全放行，而那只在 loopback 下成立（§5.4）。
-    pub allow: Arc<crate::access::AllowList>,
     /// 模型目录。**列表和准入的唯一真相来源**（§3.9）。
     ///
     /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
@@ -127,44 +224,58 @@ impl AppState {
         let http = base_client_builder()
             .build()
             .map_err(|e| GatewayError::config(format!("HTTP 客户端建不起来：{e}")))?;
-        let mut clients = std::collections::HashMap::new();
-        for p in &config.providers {
-            clients.insert(p.name.clone(), build_client(&config, p)?);
-        }
         let limits = config.limits.clone();
-        let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
-            .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
-        // 先用配置里手写的 `models:` 建一份。**探测要打网络，不能挡住
-        // 启动** —— 没有兜底清单的 provider 这时是空的，等 L2 回来再补。
-        let catalog = tw_engine::Catalog::build(
-            &config
-                .providers
-                .iter()
-                .map(|p| tw_engine::ProviderModels {
-                    provider: p.name.clone(),
-                    protocol: p
-                        .effective_protocol()
-                        .map(|x| format!("{x:?}"))
-                        // 猜不出协议时按 Anthropic 算 —— 和转发时的默认
-                        // 一致（forward::apply_credential）。两处不一致会让
-                        // 「列出来了但发过去 401」变成可能。
-                        .unwrap_or_else(|| "Anthropic".to_string()),
-                    models: p.models.clone(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        let engine = Arc::new(config.engine());
+        let catalog = catalog_from(&config);
+        let rt = Runtime::build(config, None)?;
         Ok(Self {
-            clients: Arc::new(clients),
-            engine,
-            config: Arc::new(config),
+            rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
+            gate: Arc::new(arc_swap::ArcSwap::from_pointee(crate::limits::Gate::new(
+                limits,
+            ))),
             http,
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
-            gate: Arc::new(crate::limits::Gate::new(limits)),
-            allow: Arc::new(allow),
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(catalog)),
         })
+    }
+
+    /// 当前这一份运行时。**每个请求只取一次**，从头到尾用同一份 ——
+    /// 中途重新取会让一个请求跨在两份配置上。
+    pub fn runtime(&self) -> Arc<Runtime> {
+        self.rt.load_full()
+    }
+
+    pub fn config(&self) -> Arc<tw_config::Config> {
+        self.rt.load().config.clone()
+    }
+
+    pub fn gate(&self) -> Arc<crate::limits::Gate> {
+        self.gate.load_full()
+    }
+
+    /// 换一份配置进去（§3.8 的第 ④⑤ 步）。
+    ///
+    /// **建不起来就什么都不换。**校验已经在 `tw_config::reload` 里做过
+    /// 三遍了，但运行时对象仍然可能建不起来（比如代理地址 reqwest 不认），
+    /// 而那时旧配置必须原样继续服务。
+    pub fn reload(&self, config: tw_config::Config) -> Result<(), GatewayError> {
+        let old = self.rt.load();
+        let limits_changed = old.config.limits != config.limits;
+        let new_limits = config.limits.clone();
+        let catalog_stale = catalog_sources(&old.config) != catalog_sources(&config);
+        let next = Runtime::build(config, Some(&old))?;
+        if catalog_stale {
+            // 上游名单变了，目录里那些属于已删上游的模型必须立刻消失 ——
+            // 不然 `/v1/models` 会继续列出一个已经不存在的东西，而
+            // 「列表即承诺」（§3.9）。真正的探测在后台补。
+            self.catalog.store(Arc::new(catalog_from(&next.config)));
+        }
+        self.rt.store(Arc::new(next));
+        if limits_changed {
+            self.gate
+                .store(Arc::new(crate::limits::Gate::new(new_limits)));
+        }
+        Ok(())
     }
 
     /// 密钥 → 客户端名字 + 方言。
@@ -178,7 +289,9 @@ impl AppState {
                 "请求没带网关密钥。把 config.yaml 里 clients 段的那把 key 配到客户端上。",
             ));
         };
-        self.config
+        self.rt
+            .load()
+            .config
             .clients
             .iter()
             .find(|c| key_eq(&c.key, &key))
@@ -214,14 +327,15 @@ async fn list_models(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    if !state.allow.allows(peer.ip()) {
+    let rt = state.runtime();
+    if !rt.allow.allows(peer.ip()) {
         return Err(GatewayError::auth(format!(
             "{} 不在允许的来源里。",
             peer.ip()
         )));
     }
     let (client, position) = state.identify(&headers, query.as_deref())?;
-    let allow = state
+    let allow = rt
         .config
         .clients
         .iter()
@@ -259,9 +373,13 @@ async fn passthrough(
     body: Bytes,
 ) -> Result<Response, GatewayError> {
     let started = std::time::Instant::now();
+    // **整个请求只取一次运行时。**中途重新取会让一个请求跨在两份配置
+    // 上：按新规则选了 provider，却拿旧的 Client 去发 —— 而那种不一致
+    // 完全静默。
+    let rt = state.runtime();
     // 来源检查在身份检查**之前**：一个不该连过来的地址，不该有机会
     // 试密钥（§5.4）。
-    if !state.allow.allows(peer.ip()) {
+    if !rt.allow.allows(peer.ip()) {
         return Err(GatewayError::new(
             crate::error::Source::Auth,
             format!(
@@ -280,6 +398,7 @@ async fn passthrough(
     // 起来和真实原因毫无关系。
     pipeline(
         state,
+        rt,
         uri,
         query,
         headers,
@@ -295,6 +414,7 @@ async fn passthrough(
 #[allow(clippy::too_many_arguments)]
 async fn pipeline(
     state: AppState,
+    rt: Arc<Runtime>,
     uri: axum::http::Uri,
     query: Option<String>,
     headers: HeaderMap,
@@ -319,7 +439,7 @@ async fn pipeline(
     if let Some(kind) = crate::clientprobe::classify(&body, is_claude_code(&client_name, &headers))
     {
         use tw_config::ProbeAction::*;
-        match kind.action(&state.config.client_probes) {
+        match kind.action(&rt.config.client_probes) {
             Intercept => {
                 let id = state.bus.next_id();
                 state.bus.emit(tw_api::Event::LocallyAnswered {
@@ -345,7 +465,7 @@ async fn pipeline(
     // 首次运行还没配完是正常状态，不是配置错误。这条要在路由之前挡，
     // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
     // 说不清下一步。
-    if state.config.providers.is_empty() {
+    if rt.config.providers.is_empty() {
         return Err(GatewayError::config(concat!(
             "还没有配置任何上游。打开 ThinkWatch Lite 添加第一个 provider，",
             "或者往 config.yaml 的 providers 段里写一个。"
@@ -373,7 +493,7 @@ async fn pipeline(
     {
         let catalog = state.catalog.load();
         if !catalog.is_empty() && !facts.model.is_empty() {
-            let allow = state
+            let allow = rt
                 .config
                 .clients
                 .iter()
@@ -393,7 +513,7 @@ async fn pipeline(
         }
     }
 
-    let decision = match state
+    let decision = match rt
         .engine
         .route(&facts)
         .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?
@@ -411,14 +531,14 @@ async fn pipeline(
     //
     // 闸门在路由**之后**取：要知道走哪个 provider 才能算 per_provider
     // 那一维。
-    let client_limit = state
+    let client_limit = rt
         .config
         .clients
         .iter()
         .find(|c| c.name == client_name)
         .and_then(|c| c.max_concurrent);
     let _pass = state
-        .gate
+        .gate()
         .acquire(
             decision
                 .candidates
@@ -463,7 +583,7 @@ async fn pipeline(
     let mut used: Option<&tw_config::Provider> = None;
 
     for name in &alive {
-        let Some(provider) = state.config.providers.iter().find(|p| &p.name == *name) else {
+        let Some(provider) = rt.config.providers.iter().find(|p| &p.name == *name) else {
             // 校验时挡过一次，能到这儿说明配置在运行中被换过。
             last_err = Some(GatewayError::config(format!(
                 "规则 `{}` 选中了 `{name}`，但配置里没有这个 provider",
@@ -478,10 +598,7 @@ async fn pipeline(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**（§3.4）。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let effective_set = match state
-            .engine
-            .phase_two(&facts, &provider.name, &decision.set)
-        {
+        let effective_set = match rt.engine.phase_two(&facts, &provider.name, &decision.set) {
             Ok(tw_engine::Outcome2::Proceed(s)) => s,
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %provider.name, "阶段二拒绝");
@@ -521,7 +638,7 @@ async fn pipeline(
         );
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。
-        let http = state.clients.get(&provider.name).unwrap_or(&state.http);
+        let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
         let mut req = http.request(method, &url);
         req = forward::forward_headers(req, &headers);
         req = forward::apply_credential(req, provider.effective_protocol(), &key);
@@ -670,8 +787,11 @@ async fn pipeline(
 /// `/v1/models` 就去打上游，会把一个本该零成本的端点变成一次串行网络
 /// 往返**。
 pub async fn refresh_catalog(state: &AppState) {
+    // 探测要打网络，一轮下来可能几秒。**整轮用同一份运行时** —— 中途
+    // 换了配置的话，这一轮探的是旧名单，而下面换入前会再确认一次。
+    let rt = state.runtime();
     let mut sources = Vec::new();
-    for p in state.config.providers.iter() {
+    for p in rt.config.providers.iter() {
         let protocol = p
             .effective_protocol()
             .map(|x| format!("{x:?}"))
@@ -688,7 +808,7 @@ pub async fn refresh_catalog(state: &AppState) {
                 continue;
             }
         };
-        let http = state.clients.get(&p.name).unwrap_or(&state.http);
+        let http = rt.clients.get(&p.name).unwrap_or(&state.http);
         let r = crate::probe::probe(http, &p.base_url, &key, p.effective_protocol()).await;
         let discovered = match &r.models {
             crate::probe::ModelList::Listed { models } => models.clone(),
@@ -733,7 +853,7 @@ pub fn spawn_catalog_refresh(state: AppState) {
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual = listener.local_addr()?;
-    if !state.allow.is_empty() {
+    if !state.runtime().allow.is_empty() {
         tracing::info!(%actual, "网关已监听（有来源白名单）");
     } else {
         tracing::info!(%actual, "网关已监听");
@@ -915,8 +1035,9 @@ mod tests {
             ..Default::default()
         };
         let s = AppState::new(cfg).unwrap();
-        assert_eq!(s.clients.len(), 2);
-        assert!(s.clients.contains_key("a") && s.clients.contains_key("b"));
+        let rt = s.runtime();
+        assert_eq!(rt.clients.len(), 2);
+        assert!(rt.clients.contains_key("a") && rt.clients.contains_key("b"));
     }
 
     #[test]
