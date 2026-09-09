@@ -11,6 +11,7 @@ members = [
     "crates/tw-api",
     "crates/tw-secret",
     "crates/tw-config",
+    "crates/tw-yaml",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
@@ -47,6 +48,7 @@ tw-engine   = { path = "crates/tw-engine" }
 tw-observe  = { path = "crates/tw-observe" }
 tw-gateway  = { path = "crates/tw-gateway" }
 tw-control  = { path = "crates/tw-control" }
+tw-yaml     = { path = "crates/tw-yaml" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
@@ -60,6 +62,9 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+# 只有它给节点的 span —— 而 span 是「只改一段字节」的全部前提（§3.8）。
+# serde_yaml 已经归档，且本来就不保留格式。
+saphyr-parser = "0.0.12"
 
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls", "socks", "http2"] }
 # L1 分段测速要自己走握手 —— reqwest 把建连整个包起来，只给一个总时间，
