@@ -167,6 +167,56 @@ pub struct ProbeResponse {
     pub error: Option<String>,
 }
 
+/// L1 测速：只握手，不发业务请求（§4.6）。**零成本零副作用**，可以随便点。
+///
+/// 三种问法，但它们不是三个概念：
+///
+/// - `provider: Some(名字)` —— 测一个已配置的上游，代理按它自己的配置走
+/// - `proxy: Some(名字)` —— 只测代理本身。§4.6：**代理测速就到这一层为止**，
+///   代理影响的是网络层，没有理由为了测代理去调用模型
+/// - `base_url: Some(地址)` —— 还没保存时用，首次配置那一步
+///
+/// 全不给就测所有上游。L1 零成本，批量不需要确认（L3 才需要，见 §4.6）。
+///
+/// **不接受一个「候选 URL 列表」。** cc-switch 有那么一张表，测完还得手动
+/// 点一下填进去，运行时永远只认当前保存的那一个 —— 同一个概念在一个程序
+/// 里存在两次，两边不通。这里的规矩是：测的候选池就是运行时故障转移的
+/// 候选池，同一份数据（§4.6 的架构红线）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct L1Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct L1Segment {
+    pub name: String,
+    pub ms: u64,
+}
+
+/// **分段是个列表而不是固定的 DNS/TCP/TLS 三段**，因为走代理时的形状本来
+/// 就不同：多出「代理握手」，而 `socks5h` 下根本没有本地 DNS 那一段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L1Result {
+    /// 实际测的是什么 —— 回显出来，别让用户猜点的那一下测了谁
+    pub target: String,
+    /// 经过哪个代理，直连是 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    pub ok: bool,
+    pub segments: Vec<L1Segment>,
+    pub total_ms: u64,
+    /// 解释为什么某一段不在上面。**没有这句话，缺一段看起来就像 bug。**
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// 首次运行时写下第一个上游。
 ///
 /// **只在还没有 provider 时可用**。之后改配置走 §3.8 的双向同步（M2），

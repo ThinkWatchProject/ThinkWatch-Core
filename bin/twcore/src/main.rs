@@ -46,13 +46,26 @@ enum Command {
     },
     /// 校验配置并把结论说清楚
     Check,
+    /// 量一条线通不通、每一段花了多久。**零成本**，不发任何业务请求
+    Speed {
+        /// 只测这一家。不写就全测
+        provider: Option<String>,
+        /// 只测某个代理本身
+        #[arg(long)]
+        proxy: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("TWCORE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                // 平台证书验证器会自己 error! 一行原始的英文报错，和我们
+                // 翻译过的那句重复，而且长得像是我们没处理这个错误。
+                // 它没有被吞掉 —— L1 的 error 字段里说的就是它。
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info,rustls_platform_verifier=off")
+                }),
         )
         .init();
 
@@ -63,7 +76,104 @@ fn main() -> Result<()> {
         Command::Init { force } => cmd_init(&path, force),
         Command::Check => cmd_check(&path),
         Command::Serve { port, safe, parent } => cmd_serve(&path, port, safe, parent),
+        Command::Speed { provider, proxy } => cmd_speed(&path, provider, proxy),
     }
+}
+
+/// L1 测速（§4.6）。**逐个测，不并发** —— 六条线一起抢带宽测出来的
+/// 握手时间不是任何一条线的真实值，而这一层存在的全部意义就是那几个
+/// 数字准不准。
+fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Result<()> {
+    let cfg = tw_config::load(path).with_context(|| format!("读 {}", path.display()))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        if let Some(name) = proxy {
+            let px = cfg
+                .proxies
+                .iter()
+                .find(|x| x.name == name)
+                .with_context(|| format!("没有叫 `{name}` 的代理"))?;
+            let r = tw_gateway::l1_tcp(&px.addr).await;
+            print_l1(&format!("代理 {}", px.name), None, &r);
+            println!("  只测到代理这一跳。代理影响的是网络层，再往上就该测上游了。");
+            return Ok(());
+        }
+        let targets: Vec<&tw_config::Provider> = match &provider {
+            Some(n) => vec![
+                cfg.providers
+                    .iter()
+                    .find(|p| p.name == *n)
+                    .with_context(|| format!("没有叫 `{n}` 的上游"))?,
+            ],
+            None => cfg.providers.iter().collect(),
+        };
+        if targets.is_empty() {
+            println!("还没有配置任何上游 —— 先往 providers 段里加一个。");
+            return Ok(());
+        }
+        for p in targets {
+            match hop_for(&cfg, p) {
+                Ok(hop) => {
+                    let via = hop.as_ref().map(|_| p.proxy.as_str());
+                    let r = tw_gateway::l1(&p.base_url, hop.as_ref()).await;
+                    print_l1(&p.name, via, &r);
+                }
+                Err(e) => println!("{}  ⚠️  {e}", p.name),
+            }
+        }
+        Ok(())
+    })
+}
+
+fn hop_for(
+    cfg: &tw_config::Config,
+    p: &tw_config::Provider,
+) -> Result<Option<tw_gateway::ProxyHop>> {
+    match p.proxy.as_str() {
+        tw_config::DIRECT => Ok(None),
+        // 跟随系统代理的地址要到建连时才由环境决定，我们没有那份地址
+        // 可以去握手。说出来，而不是假装直连测一遍给个漂亮数字。
+        tw_config::SYSTEM => anyhow::bail!(
+            "走的是系统代理，地址要到建连时才由环境决定 —— L1 测不到它。把代理显式配成一个命名条目就能测。"
+        ),
+        name => {
+            let px = cfg
+                .proxies
+                .iter()
+                .find(|x| x.name == name)
+                .with_context(|| format!("proxies 段里没有 `{name}`"))?;
+            let auth = match &px.auth {
+                None => None,
+                Some(a) => Some((a.user.clone(), a.pass.resolve()?)),
+            };
+            Ok(Some(tw_gateway::ProxyHop {
+                kind: px.kind,
+                addr: px.addr.clone(),
+                auth,
+            }))
+        }
+    }
+}
+
+fn print_l1(target: &str, via: Option<&str>, r: &tw_gateway::L1Result) {
+    let head = match via {
+        Some(v) => format!("{target}（经 {v}）"),
+        None => target.to_string(),
+    };
+    println!("{}  {}", if r.ok { "✅" } else { "❌" }, head);
+    for seg in &r.segments {
+        println!("     {:<18} {:>6} ms", seg.name, seg.ms);
+    }
+    if r.ok {
+        println!("     {:<18} {:>6} ms", "建连总计", r.total_ms);
+    }
+    if let Some(e) = &r.error {
+        println!("     {e}");
+    }
+    for n in &r.notes {
+        println!("     · {n}");
+    }
+    println!();
 }
 
 fn cmd_init(path: &Path, force: bool) -> Result<()> {

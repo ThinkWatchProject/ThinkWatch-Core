@@ -37,6 +37,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/events", get(events))
         .route("/overview", get(overview))
         .route("/probe", post(probe))
+        .route("/l1", post(l1))
         .route("/setup", post(setup))
         .with_state(state)
 }
@@ -222,6 +223,130 @@ async fn probe(
         models,
         error: r.error,
     })
+}
+
+/// L1 测速。**零成本**，不发任何业务请求，用户可以随便点。
+///
+/// 一次可能测好几家，所以逐个测而不是并发：**并发会让每一段的耗时互相
+/// 干扰**，六条线一起抢带宽测出来的 TLS 时间不是任何一条线的真实值，
+/// 而这一层存在的全部意义就是那几个数字准不准。
+async fn l1(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::L1Request>,
+) -> Result<Json<Vec<tw_api::L1Result>>, (StatusCode, String)> {
+    let mut out = Vec::new();
+
+    // 只测代理本身。§4.6：代理影响的是网络层，测到 L1 就够了。
+    if let Some(name) = &req.proxy {
+        let p = s
+            .config
+            .proxies
+            .iter()
+            .find(|x| x.name == *name)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{name}` 的代理")))?;
+        let mut r = tw_gateway::l1_tcp(&p.addr).await;
+        r.notes
+            .push("只测到代理这一跳的 TCP 握手。代理影响的是网络层，再往上就该测上游了。".into());
+        out.push(view(format!("代理 {}", p.name), None, r));
+        return Ok(Json(out));
+    }
+
+    // 还没保存时的临时地址（首次配置那一步）。
+    if let Some(url) = &req.base_url {
+        let r = tw_gateway::l1(url, None).await;
+        out.push(view(url.clone(), None, r));
+        return Ok(Json(out));
+    }
+
+    let targets: Vec<&tw_config::Provider> = match &req.provider {
+        Some(n) => vec![
+            s.config
+                .providers
+                .iter()
+                .find(|p| p.name == *n)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{n}` 的上游")))?,
+        ],
+        None => s.config.providers.iter().collect(),
+    };
+    for p in targets {
+        let hop = match resolve_hop(&s.config, p) {
+            Ok(h) => h,
+            Err(e) => {
+                out.push(tw_api::L1Result {
+                    target: p.name.clone(),
+                    via: Some(p.proxy.clone()),
+                    ok: false,
+                    segments: Vec::new(),
+                    total_ms: 0,
+                    notes: Vec::new(),
+                    error: Some(e),
+                });
+                continue;
+            }
+        };
+        let via = hop.as_ref().map(|_| p.proxy.clone());
+        let r = tw_gateway::l1(&p.base_url, hop.as_ref()).await;
+        out.push(view(p.name.clone(), via, r));
+    }
+    Ok(Json(out))
+}
+
+fn view(target: String, via: Option<String>, r: tw_gateway::L1Result) -> tw_api::L1Result {
+    tw_api::L1Result {
+        target,
+        via,
+        ok: r.ok,
+        segments: r
+            .segments
+            .into_iter()
+            .map(|x| tw_api::L1Segment {
+                name: x.name,
+                ms: x.ms,
+            })
+            .collect(),
+        total_ms: r.total_ms,
+        notes: r.notes,
+        error: r.error,
+    }
+}
+
+/// 把 provider 的代理名解析成一跳。
+///
+/// **`system` 这里测不了**：跟随系统代理是 reqwest 在建连时才去查环境的，
+/// 我们没有那份地址可以去握手。说出来，而不是假装直连测一遍给个漂亮
+/// 数字 —— 那个数字测的根本不是用户实际会走的路。
+fn resolve_hop(
+    cfg: &tw_config::Config,
+    p: &tw_config::Provider,
+) -> Result<Option<tw_gateway::ProxyHop>, String> {
+    match p.proxy.as_str() {
+        tw_config::DIRECT => Ok(None),
+        tw_config::SYSTEM => Err(
+            "这家走的是系统代理，而系统代理的地址要到建连时才由环境决定 —— L1 测不到它。想量这条线的话，把代理显式配成一个命名条目。"
+                .into(),
+        ),
+        name => {
+            let px = cfg
+                .proxies
+                .iter()
+                .find(|x| x.name == name)
+                .ok_or_else(|| format!("provider `{}` 要走代理 `{name}`，但 proxies 段里没有这个名字。", p.name))?;
+            let auth = match &px.auth {
+                None => None,
+                Some(a) => Some((
+                    a.user.clone(),
+                    a.pass
+                        .resolve()
+                        .map_err(|e| format!("代理 `{name}` 的密码取不出来：{e}"))?,
+                )),
+            };
+            Ok(Some(tw_gateway::ProxyHop {
+                kind: px.kind,
+                addr: px.addr.clone(),
+                auth,
+            }))
+        }
+    }
 }
 
 /// 首次运行：写下第一个上游。
