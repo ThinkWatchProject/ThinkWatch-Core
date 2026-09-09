@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 pub mod clients;
 pub mod config;
 pub mod dryrun;
+pub mod scan;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
 
@@ -98,6 +99,8 @@ pub fn router(state: ControlState) -> Router {
         .route("/setup", post(setup))
         // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认（§7.11）
         .route("/dryrun", post(dryrun::dry_run))
+        // **每次现扫，什么都不存**（§7.12）
+        .route("/scan", get(scan::scan))
         .route("/clients", get(clients::list))
         .route("/clients/plan", post(clients::plan_adopt))
         .route("/clients/adopt", post(clients::adopt))

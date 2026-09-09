@@ -2685,6 +2685,7 @@ dependencies = [
  "tw-gateway",
  "tw-observe",
  "tw-pricing",
+ "tw-scan",
  "tw-secret",
  "tw-store",
  "tw-yaml",

@@ -666,6 +666,82 @@ pub struct SetupResponse {
     pub config_path: String,
 }
 
+// ---------------------------------------------------------------- 静态扫描
+
+/// 一处发现（§5.3）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanFinding {
+    /// `high` | `medium` | `low`
+    pub level: String,
+    /// 哪条规则命中的
+    pub rule: String,
+    /// `hooks` | `mcp` | `skill` | `command` | `agent` | `instructions`
+    pub kind: String,
+    pub kind_label: String,
+    pub client: String,
+    pub path: String,
+    /// 第几行，从 1 开始
+    pub line: usize,
+    pub title: String,
+    pub detail: String,
+    /// 命中的那一行，**不可见字符已经换成可见记号**
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpView {
+    pub name: String,
+    pub client: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// 远端型的地址
+    pub url: Option<String>,
+    /// **只有名字，没有值**
+    pub env_keys: Vec<String>,
+    pub enabled: bool,
+    pub source: String,
+    /// 远端而且不在本机
+    pub third_party: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillView {
+    pub name: String,
+    pub client: String,
+    pub path: String,
+    pub allowed_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookView {
+    pub client: String,
+    pub event: String,
+    pub command: String,
+    pub source: String,
+}
+
+/// 扫一次的结果。
+///
+/// **不存任何东西**（§7.12）：这是此刻磁盘上的真实情况，页面关了就没了。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResponse {
+    pub findings: Vec<ScanFinding>,
+    pub mcp: Vec<McpView>,
+    pub skills: Vec<SkillView>,
+    pub hooks: Vec<HookView>,
+    /// 同名但配置不同的 MCP server 名字（§7.12 矩阵上要标记号）
+    pub conflicting: Vec<String>,
+    /// 读不动的文件。**要显示** —— 悄悄跳过会给人「查过了」的错觉
+    pub unreadable: Vec<String>,
+    pub scanned: usize,
+    /// 规则从哪儿来的
+    pub rules_origin: String,
+    /// 用户的规则文件有问题时的那句话
+    pub rules_warning: Option<String>,
+    /// 这次连哪些项目目录一起扫了
+    pub projects: Vec<String>,
+}
+
 // ---------------------------------------------------------------- 路由试算
 
 /// 「如果现在来这样一个请求，会走到哪儿」。
