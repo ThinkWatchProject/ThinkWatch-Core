@@ -1136,7 +1136,9 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
     .await;
 
     let r = send_to(gw).await;
-    assert_eq!(r.status(), 400, "是请求被规则挡了，不是上游的错");
+    // §4.6.1 的表：deny 是 403 + permission_error，不是 400 ——
+    // 请求本身完全合法，是策略不让。
+    assert_eq!(r.status(), 403, "是策略不让，不是请求本身有问题");
     let text = r.text().await.unwrap();
     assert!(text.contains("这段内容不发给中转站"), "{text}");
     assert!(
@@ -1543,4 +1545,238 @@ async fn a_health_check_works_before_any_upstream_is_configured() {
         .unwrap();
     assert_ne!(real.status(), 200);
     assert!(real.text().await.unwrap().contains("还没有配置任何上游"));
+}
+
+/// §4.6.1：**错误必须用入站方言的原生格式返回。**一个 Anthropic 客户端
+/// 收到 OpenAI 形状的 error body，会在解析时炸掉，然后报一个和真实原因
+/// 完全无关的错。
+#[tokio::test]
+async fn an_error_comes_back_in_the_dialect_the_client_speaks() {
+    let gw = serve_cfg(cfg_with(vec![], vec![])).await;
+    let c = reqwest::Client::new();
+    let url = format!("http://{gw}/v1/messages");
+    let body = r#"{"model":"claude-sonnet-4-5","messages":[]}"#;
+
+    // Anthropic：`{type:"error", error:{type,message}}`
+    let v: serde_json::Value = c
+        .post(&url)
+        .header("x-api-key", "tw-k")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "api_error");
+
+    // OpenAI：没有外层 type，多了 param / code
+    let v: serde_json::Value = c
+        .post(&url)
+        .bearer_auth("tw-k")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v.get("type").is_none(), "OpenAI 没有外层 type：{v}");
+    assert_eq!(v["error"]["type"], "server_error");
+    assert!(v["error"].get("param").is_some());
+
+    // Gemini：`{error:{code,message,status}}`
+    let v: serde_json::Value = c
+        .post(&url)
+        .header("x-goog-api-key", "tw-k")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["error"]["status"], "UNAVAILABLE");
+    assert_eq!(v["error"]["code"], 500);
+}
+
+#[tokio::test]
+async fn every_dialect_still_gets_the_thinkwatch_prefix_and_header() {
+    // 用户遇到报错的第一反应是去找中转站客服。**分不清是哪一层，他会
+    // 浪费时间问错人，而且会觉得是我们坏了**（§4.6.1）。
+    let gw = serve_cfg(cfg_with(vec![], vec![])).await;
+    let c = reqwest::Client::new();
+    let url = format!("http://{gw}/v1/messages");
+    for auth in ["x-api-key", "x-goog-api-key"] {
+        let r = c
+            .post(&url)
+            .header(auth, "tw-k")
+            .body(r#"{"model":"m"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.headers().get("x-thinkwatch-error").unwrap(), "config");
+        let t = r.text().await.unwrap();
+        assert!(t.contains("[ThinkWatch]"), "{auth}: {t}");
+    }
+}
+
+#[tokio::test]
+async fn a_deny_rule_is_403_not_400() {
+    // §4.6.1 的表：`deny` 是 403 + permission_error。**和「你这个请求
+    // 本身有问题」分开** —— 混在一起的话，用户会去改他的请求，而该改
+    // 的是规则。
+    let (up, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![
+            tw_engine::Route {
+                name: "不许用 opus".into(),
+                when: serde_yaml_ng::from_str("{ model: claude-opus-* }").unwrap(),
+                to: None,
+                set: None,
+                deny: Some("这个项目不用 opus".into()),
+            },
+            tw_engine::Route {
+                name: "兜底".into(),
+                when: Default::default(),
+                to: Some("up".into()),
+                set: None,
+                deny: None,
+            },
+        ],
+    ))
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-opus-4","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(r.headers().get("x-thinkwatch-error").unwrap(), "denied");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "permission_error");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("这个项目不用 opus")
+    );
+    assert!(seen.lock().unwrap().body.is_empty());
+}
+
+/// 首字节之后上游断了：SSE 流里补一个 `error` 帧，并且发一条失败事件。
+///
+/// **截断和「答完了」在 SSE 里长得一模一样。**什么都不做的话，用户会
+/// 以为模型就答了这么多，而 UI 上那一行会永远停在「进行中」（§4.6.1）。
+#[tokio::test]
+async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
+    // 声明 content-length 比实际发的多，然后把连接关掉 —— 客户端库会
+    // 把它报成一个流错误，这正是「上游中途没了」的样子。
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                          content-length: 900\r\n\r\n\
+                          event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                    )
+                    .await;
+                let _ = s.flush().await;
+                // 说好 900 字节，只发了几十个，然后走人
+                drop(s);
+            });
+        }
+    });
+
+    let cfg = cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    );
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"m","stream":true}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap_or_default();
+    assert!(
+        text.contains("event: error"),
+        "流断了却没有任何交代：{text:?}"
+    );
+    assert!(text.contains("[ThinkWatch]"), "{text:?}");
+
+    // UI 那一行不能永远停在「进行中」
+    let mut saw_failed = false;
+    for _ in 0..6 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(tw_api::Event::RequestFailed { message, .. })) => {
+                assert!(message.contains("流中断"), "{message}");
+                saw_failed = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(saw_failed, "断流之后没有发失败事件，UI 会一直转圈");
+}
+
+#[tokio::test]
+async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
+    // 429 塌成 502 的话，客户端会当成「服务器坏了」而不是「该退避了」,
+    // 而它们该做的事完全不同（§4.6.1）。
+    let limited = start_broken_upstream(429).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "limited".into(),
+            base_url: format!("http://{limited}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    let r = send_to(gw).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(
+        r.headers().get("x-thinkwatch-error").unwrap(),
+        "rate_limited"
+    );
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "rate_limit_error");
 }

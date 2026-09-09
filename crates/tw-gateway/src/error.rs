@@ -22,6 +22,17 @@ pub enum Source {
     /// 我们这一层排不下了。**这是唯一一个我们主动拒绝的场景**，
     /// 而它的存在是为了防止队列撑爆内存（§4.7）。
     Overloaded,
+    /// 上游说「慢点」。**和 `Overloaded` 分开**：那是我们自己的队列满了，
+    /// 这是对面的额度到顶了。回 502 的话客户端会当成「服务器坏了」而不是
+    /// 「该退避了」，而它们该做的事完全不同（§4.6.1）。
+    RateLimited,
+    /// 一条 `deny` 规则挡下来的（§3.4）。
+    ///
+    /// **和 `Request` 分开是有理由的**：`Request` 说的是「你这个请求本身
+    /// 有问题」，而这里请求完全合法，是策略不让。混在一起的话，用户会
+    /// 去改他的请求，而该改的是规则。§4.6.1 的表里它是 403 +
+    /// `permission_error`。
+    Denied,
 }
 
 impl Source {
@@ -32,6 +43,8 @@ impl Source {
             Source::Upstream => "upstream",
             Source::Request => "request",
             Source::Overloaded => "overloaded",
+            Source::RateLimited => "rate_limited",
+            Source::Denied => "denied",
         }
     }
     fn status(&self) -> StatusCode {
@@ -42,6 +55,8 @@ impl Source {
             Source::Request => StatusCode::BAD_REQUEST,
             // 429 而不是 503：客户端至少知道这是限流，可以退避。
             Source::Overloaded => StatusCode::TOO_MANY_REQUESTS,
+            Source::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Source::Denied => StatusCode::FORBIDDEN,
         }
     }
     /// Anthropic 的 error.type 词表。
@@ -51,7 +66,56 @@ impl Source {
             Source::Config => "api_error",
             Source::Upstream => "api_error",
             Source::Request => "invalid_request_error",
-            Source::Overloaded => "rate_limit_error",
+            Source::Overloaded | Source::RateLimited => "rate_limit_error",
+            Source::Denied => "permission_error",
+        }
+    }
+
+    /// OpenAI 的 `error.type` 词表。**和 Anthropic 的不是一套词** ——
+    /// 直接把 `authentication_error` 塞进 OpenAI 形状里，客户端的错误
+    /// 分支会全部走空。
+    fn openai_type(&self) -> &'static str {
+        match self {
+            Source::Auth => "invalid_request_error",
+            Source::Config | Source::Upstream => "server_error",
+            Source::Request => "invalid_request_error",
+            Source::Overloaded | Source::RateLimited => "rate_limit_exceeded",
+            Source::Denied => "invalid_request_error",
+        }
+    }
+
+    /// Google 的 `status`。
+    fn google_status(&self) -> &'static str {
+        match self {
+            Source::Auth => "UNAUTHENTICATED",
+            Source::Config | Source::Upstream => "UNAVAILABLE",
+            Source::Request => "INVALID_ARGUMENT",
+            Source::Overloaded | Source::RateLimited => "RESOURCE_EXHAUSTED",
+            Source::Denied => "PERMISSION_DENIED",
+        }
+    }
+}
+
+/// 入站方言。**错误体要用它的原生形状** —— 一个 Anthropic 客户端收到
+/// OpenAI 形状的 error body，会在解析时炸掉，然后报一个和真实原因完全
+/// 无关的错（§4.6.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// 猜不出时的默认。桌面版的主用例是 Claude Code
+    #[default]
+    Anthropic,
+    Openai,
+    Gemini,
+}
+
+impl Dialect {
+    /// 从客户端把 key 放在哪儿推断。**这是我们唯一可靠的线索** ——
+    /// 路径和 UA 都可以被中间层改写，而 key 的位置是 SDK 自己决定的。
+    pub fn from_key_position(p: crate::auth::KeyPosition) -> Self {
+        match p {
+            crate::auth::KeyPosition::AnthropicHeader => Dialect::Anthropic,
+            crate::auth::KeyPosition::GoogleHeader => Dialect::Gemini,
+            crate::auth::KeyPosition::Bearer => Dialect::Openai,
         }
     }
 }
@@ -60,6 +124,9 @@ impl Source {
 pub struct GatewayError {
     pub source: Source,
     pub message: String,
+    /// 用哪种方言的形状回。**认证失败时还不知道方言**（key 就是没认出
+    /// 来），所以它有默认值而不是必填。
+    pub dialect: Dialect,
 }
 
 impl GatewayError {
@@ -67,7 +134,20 @@ impl GatewayError {
         Self {
             source,
             message: message.into(),
+            dialect: Dialect::default(),
         }
+    }
+    /// 认出客户端之后补上方言。**忘了调只会退回 Anthropic 形状**，
+    /// 那是个安全的默认，不是一个静默的错误。
+    pub fn in_dialect(mut self, d: Dialect) -> Self {
+        self.dialect = d;
+        self
+    }
+    pub fn rate_limited(m: impl Into<String>) -> Self {
+        Self::new(Source::RateLimited, m)
+    }
+    pub fn denied(m: impl Into<String>) -> Self {
+        Self::new(Source::Denied, m)
     }
     pub fn auth(m: impl Into<String>) -> Self {
         Self::new(Source::Auth, m)
@@ -83,17 +163,65 @@ impl GatewayError {
     }
 }
 
+impl GatewayError {
+    /// 流中途断掉时，唯一还能说话的地方是流本身（§4.6.1）。
+    ///
+    /// 首字节已经发出去了，状态码和响应头都改不了 —— 什么都不做的话，
+    /// 客户端看到的是一个**戛然而止的流**，而截断和「答完了」在 SSE
+    /// 里长得一模一样。
+    pub fn sse_frame(&self) -> String {
+        let msg = format!("[ThinkWatch] {}", self.message);
+        let data = match self.dialect {
+            Dialect::Anthropic => serde_json::json!({
+                "type": "error",
+                "error": { "type": self.source.anthropic_type(), "message": msg },
+            }),
+            Dialect::Openai => serde_json::json!({
+                "error": {
+                    "message": msg,
+                    "type": self.source.openai_type(),
+                    "code": self.source.slug(),
+                }
+            }),
+            Dialect::Gemini => serde_json::json!({
+                "error": {
+                    "code": self.source.status().as_u16(),
+                    "message": msg,
+                    "status": self.source.google_status(),
+                }
+            }),
+        };
+        format!("event: error\ndata: {data}\n\n")
+    }
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         // `[ThinkWatch]` 前缀不是装饰。没有它，用户看到一个 401 会先去
         // 查上游的密钥 —— 而问题在中间这一层。
-        let body = serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": self.source.anthropic_type(),
-                "message": format!("[ThinkWatch] {}", self.message),
-            }
-        });
+        let msg = format!("[ThinkWatch] {}", self.message);
+        let body = match self.dialect {
+            Dialect::Anthropic => serde_json::json!({
+                "type": "error",
+                "error": { "type": self.source.anthropic_type(), "message": msg },
+            }),
+            // OpenAI 没有外层的 `type`，而 `param` / `code` 是它自己那套
+            Dialect::Openai => serde_json::json!({
+                "error": {
+                    "message": msg,
+                    "type": self.source.openai_type(),
+                    "param": serde_json::Value::Null,
+                    "code": self.source.slug(),
+                }
+            }),
+            Dialect::Gemini => serde_json::json!({
+                "error": {
+                    "code": self.source.status().as_u16(),
+                    "message": msg,
+                    "status": self.source.google_status(),
+                }
+            }),
+        };
         let mut resp = (self.source.status(), axum::Json(body)).into_response();
         resp.headers_mut().insert(
             "x-thinkwatch-error",

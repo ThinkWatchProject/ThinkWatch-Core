@@ -15,6 +15,7 @@ tw-observe = { workspace = true }
 tw-secret = { workspace = true }
 tw-types = { workspace = true }
 arc-swap = { workspace = true }
+async-stream = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

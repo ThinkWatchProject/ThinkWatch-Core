@@ -271,6 +271,38 @@ async fn passthrough(
         ));
     }
     let (client_name, position) = state.identify(&headers, query.as_deref())?;
+    // 从这里往下，所有错误都要用客户端自己那套结构回（§4.6.1）。
+    // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
+    // 的，只能退回 Anthropic 形状，而那是桌面版的主用例。
+    let dialect = crate::error::Dialect::from_key_position(position);
+    // **在一个地方给方言，而不是在每个 return 点。**后者只要漏一处，
+    // 那条路径上的客户端就会收到一个它解析不了的 body，而那个失败看
+    // 起来和真实原因毫无关系。
+    pipeline(
+        state,
+        uri,
+        query,
+        headers,
+        body,
+        client_name,
+        position,
+        started,
+    )
+    .await
+    .map_err(|e| e.in_dialect(dialect))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pipeline(
+    state: AppState,
+    uri: axum::http::Uri,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+    client_name: String,
+    position: crate::auth::KeyPosition,
+    started: std::time::Instant,
+) -> Result<Response, GatewayError> {
     forward::check_body_size(&body, MAX_BODY)?;
 
     // 管线第 1.3 步：客户端的自言自语（§4.8）。
@@ -371,7 +403,7 @@ async fn passthrough(
             // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
             // 眼里没有区别（§3.4）。
             tracing::info!(%rule, "按规则拒绝");
-            return Err(GatewayError::new(crate::error::Source::Request, reason));
+            return Err(GatewayError::denied(reason));
         }
     };
     // 管线第 3 步：准入。**排队而不是拒绝**（§4.7）—— 客户端收到 429
@@ -453,7 +485,7 @@ async fn passthrough(
             Ok(tw_engine::Outcome2::Proceed(s)) => s,
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %provider.name, "阶段二拒绝");
-                return Err(GatewayError::new(crate::error::Source::Request, reason));
+                return Err(GatewayError::denied(reason));
             }
             Err(e) => return Err(GatewayError::config(format!("阶段二求值失败：{e}"))),
         };
@@ -499,11 +531,14 @@ async fn passthrough(
                 // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
                 // 也一样被拒，还会白白污染那家的健康度。
                 state.health.record_failure(&provider.name);
-                last_err = Some(GatewayError::upstream(format!(
-                    "`{}` 返回 {}",
-                    provider.name,
-                    r.status()
-                )));
+                // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
+                // 坏了」而不是「该退避了」，而它们该做的事完全不同
+                // （§4.6.1）。
+                last_err = Some(if r.status() == 429 {
+                    GatewayError::rate_limited(format!("`{}` 限流了", provider.name))
+                } else {
+                    GatewayError::upstream(format!("`{}` 返回 {}", provider.name, r.status()))
+                });
                 continue;
             }
             Ok(r) => {
@@ -571,17 +606,48 @@ async fn passthrough(
     };
     // 流结束时才知道总字节数和真实耗时 —— 对一个跑了六分钟的任务，
     // 这两个数字在响应头那一刻都还不存在。
-    let stream = counted
-        .map_err(std::io::Error::other)
-        .chain(futures::stream::once(async move {
-            bus.emit(tw_api::Event::RequestFinished {
+    //
+    // **中途断掉不能只是让流消失。**首字节已经发出去了，状态码和响应头
+    // 都改不了，而一个戛然而止的 SSE 流和一个正常结束的流在客户端看来
+    // 长得一模一样 —— 用户会以为模型就答了这么多。唯一还能说话的地方
+    // 是流本身，所以补一个 `event: error` 帧（§4.6.1）。
+    let is_sse = out_headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    let dialect = crate::error::Dialect::from_key_position(position);
+    let stream = async_stream::stream! {
+        let mut counted = std::pin::pin!(counted);
+        let mut broke: Option<GatewayError> = None;
+        while let Some(item) = counted.next().await {
+            match item {
+                Ok(chunk) => yield Ok::<Bytes, std::io::Error>(chunk),
+                Err(e) => {
+                    broke = Some(forward::map_reqwest_error(e).in_dialect(dialect));
+                    break;
+                }
+            }
+        }
+        match broke {
+            None => bus.emit(tw_api::Event::RequestFinished {
                 id,
                 status: status.as_u16(),
                 bytes: bytes_seen.load(std::sync::atomic::Ordering::Relaxed),
                 duration_ms: started.elapsed().as_millis() as u64,
-            });
-            Ok(Bytes::new())
-        }));
+            }),
+            Some(err) => {
+                // 少了这个事件，UI 上那一行会永远停在「进行中」——
+                // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
+                bus.emit(tw_api::Event::RequestFailed {
+                    id,
+                    source: "upstream".to_string(),
+                    message: format!("流中断：{}", err.message),
+                });
+                if is_sse {
+                    yield Ok(Bytes::from(err.sse_frame()));
+                }
+            }
+        }
+    };
     let mut resp = Response::new(Body::from_stream(stream));
     *resp.status_mut() = status;
     *resp.headers_mut() = out_headers;
