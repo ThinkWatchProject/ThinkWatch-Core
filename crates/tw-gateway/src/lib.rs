@@ -15,6 +15,7 @@ pub mod l1;
 pub mod limits;
 pub mod probe;
 pub mod server;
+pub mod usage;
 
 pub use access::{AllowList, Cidr};
 pub use clientprobe::{ProbeKind, classify};
@@ -27,3 +28,4 @@ pub use server::{
     AppState, Runtime, refresh_catalog, router, serve, serve_following_config,
     spawn_catalog_refresh,
 };
+pub use usage::{Sniffer, Usage};

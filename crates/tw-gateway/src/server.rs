@@ -754,9 +754,15 @@ async fn pipeline(
     let stream = async_stream::stream! {
         let mut counted = std::pin::pin!(counted);
         let mut broke: Option<GatewayError> = None;
+        // **旁路嗅探，不缓冲**（§4.3）：字节照常流向客户端，同时喂它
+        // 一份。上游返回的 usage 是真相，而拿不到它就只能估。
+        let mut sniffer = crate::usage::Sniffer::new();
         while let Some(item) = counted.next().await {
             match item {
-                Ok(chunk) => yield Ok::<Bytes, std::io::Error>(chunk),
+                Ok(chunk) => {
+                    sniffer.feed(&chunk);
+                    yield Ok::<Bytes, std::io::Error>(chunk)
+                }
                 Err(e) => {
                     broke = Some(forward::map_reqwest_error(e).in_dialect(dialect));
                     break;
@@ -769,6 +775,13 @@ async fn pipeline(
                 status: status.as_u16(),
                 bytes: bytes_seen.load(std::sync::atomic::Ordering::Relaxed),
                 duration_ms: started.elapsed().as_millis() as u64,
+                usage: sniffer.finish().map(|u| tw_api::UsageView {
+                    input: u.input,
+                    output: u.output,
+                    cache_read: u.cache_read,
+                    cache_write: u.cache_write,
+                    cache_1h: u.cache_1h,
+                }),
             }),
             Some(err) => {
                 // 少了这个事件，UI 上那一行会永远停在「进行中」——

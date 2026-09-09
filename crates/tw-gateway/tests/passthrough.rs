@@ -1780,3 +1780,107 @@ async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["error"]["type"], "rate_limit_error");
 }
+
+#[tokio::test]
+async fn the_upstream_usage_reaches_the_event_stream_without_buffering_the_response() {
+    // **上游返回的 usage 是真相**（§4.3），所以要拿到它 —— 但不能为此
+    // 把流缓冲起来。这条同时验两件事：数字对，而且流还是流。
+    let up = {
+        let app = Router::new().fallback(axum::routing::any(|| async {
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5000,\"cache_read_input_tokens\":4000}}}\n\n\
+                     event: content_block_delta\ndata: {\"delta\":{\"text\":\"答案\"}}\n\n\
+                     event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":777}}\n\n",
+                ))
+                .unwrap()
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","stream":true}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // 流的内容一个字节都没被动过
+    assert!(text.contains("event: message_start"), "{text}");
+    assert!(text.contains("答案"), "{text}");
+
+    let mut usage = None;
+    for _ in 0..6 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(tw_api::Event::RequestFinished { usage: u, .. })) => {
+                usage = u;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    let u = usage.expect("结束事件里没有 usage");
+    assert_eq!(u.input, 5000, "开头那个输入没被记住");
+    assert_eq!(u.output, 777, "结尾那个累计输出没被记住");
+    assert_eq!(u.cache_read, 4000);
+}
+
+#[tokio::test]
+async fn an_upstream_that_gives_no_usage_reports_none_rather_than_zeroes() {
+    // **零会让一次真实的调用看起来是免费的**（§4.3）。有些中转站就是
+    // 不给 usage，那时该走估算那条路。
+    let (up, _seen) = start_upstream(false).await;
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send_to(gw).await;
+
+    for _ in 0..6 {
+        if let Ok(Ok(tw_api::Event::RequestFinished { usage, .. })) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            assert!(usage.is_none(), "上游没给 usage，却报了 {usage:?}");
+            return;
+        }
+    }
+    panic!("没等到结束事件");
+}

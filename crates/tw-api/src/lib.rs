@@ -48,6 +48,10 @@ pub enum Event {
         status: u16,
         bytes: u64,
         duration_ms: u64,
+        /// 上游报的用量。**没报就是 None，不是零** —— 零会让一次真实的
+        /// 调用看起来是免费的（§4.3）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<UsageView>,
     },
     /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表。
     RequestFailed {
@@ -95,6 +99,18 @@ pub enum Event {
         probe: String,
         at_ms: u64,
     },
+}
+
+/// 一次调用的用量。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageView {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**（§4.3.0）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_1h: bool,
 }
 
 impl Event {
@@ -374,6 +390,7 @@ mod tests {
             status: 200,
             bytes: 10,
             duration_ms: 5,
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "request_finished");
@@ -402,6 +419,7 @@ mod tests {
                 status: 200,
                 bytes: 1,
                 duration_ms: 1,
+                usage: None,
             },
             Event::RequestFailed {
                 id: 7,

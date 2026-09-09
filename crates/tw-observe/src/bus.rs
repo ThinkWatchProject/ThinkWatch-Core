@@ -68,6 +68,7 @@ mod tests {
             status: 200,
             bytes: 0,
             duration_ms: 0,
+            usage: None,
         });
         assert_eq!(b.subscriber_count(), 0);
     }
@@ -81,6 +82,7 @@ mod tests {
             status: 200,
             bytes: 1,
             duration_ms: 2,
+            usage: None,
         });
         assert_eq!(rx.recv().await.unwrap().id(), 42);
     }
@@ -104,6 +106,7 @@ mod tests {
                 status: 200,
                 bytes: 0,
                 duration_ms: 0,
+                usage: None,
             });
         }
         // 生产端全程没阻塞；消费端会收到一个 Lagged
@@ -124,6 +127,7 @@ mod tests {
             status: 200,
             bytes: 0,
             duration_ms: 0,
+            usage: None,
         });
         assert_eq!(a.recv().await.unwrap().id(), 9);
         assert_eq!(c.recv().await.unwrap().id(), 9);
