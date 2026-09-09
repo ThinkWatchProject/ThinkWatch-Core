@@ -21,7 +21,17 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 pub const DEFAULT_GATEWAY_PORT: u16 = 8788;
 
+/// **写错的字段名是错误，不是空操作。**
+///
+/// 这条是烟测里换来的：`listen: { addr: 127.0.0.1:18830 }`（正确写法是
+/// `listen.gateway.port`）被静默丢掉，网关照常起在默认端口 8788，日志
+/// 里一个字都没有 —— 用户会以为是网关坏了，而不是自己写错了一个词。
+/// 密钥、上游地址、并发上限，每一个都有同样的失败模式。
+///
+/// 代价是旧版二进制读不了新版配置，但 `version` 字段本来就是干这个的，
+/// 而且桌面版的 core 和 UI 是一起发的。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     /// **默认值不写进文件。** §3.3 承诺第一天的配置是六行，而每加一个
@@ -105,12 +115,14 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Listen {
     #[serde(default)]
     pub gateway: GatewayListen,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayListen {
     /// loopback | lan | all | 具体 IP。默认 loopback —— 学 Surge，
     /// 但默认值要保守（§5.4）。
@@ -183,6 +195,7 @@ impl GatewayListen {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Client {
     pub name: String,
     /// 这个客户端自己的并发上限。**监听局域网时是刚需**（§4.7）——
@@ -283,6 +296,7 @@ pub enum SecretResolveError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provider {
     pub name: String,
     pub base_url: String,
@@ -368,7 +382,11 @@ pub enum LoadError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} 不是合法的 YAML：{source}")]
+    /// 语法错和字段名写错都走这里。**说「不是合法的 YAML」是错的** ——
+    /// 一份语法完美、只是把 `port` 写成 `prot` 的文件也会到这儿，而那句
+    /// 话会让用户去找一个根本不存在的语法错误。serde 自己的
+    /// 「unknown field `prot`, expected one of ...」比我们能补的任何话都准。
+    #[error("{path} 读不通：{source}")]
     Parse {
         path: PathBuf,
         source: serde_yaml_ng::Error,
@@ -581,5 +599,45 @@ providers:
             ..Default::default()
         };
         assert_eq!(p.resolved_key().unwrap(), "sk-from-env");
+    }
+}
+
+#[cfg(test)]
+mod strictness_tests {
+    use super::*;
+
+    /// 烟测里换来的：`listen: { addr: ... }` 被静默丢掉，网关起在默认
+    /// 端口，日志里一个字都没有。**写错的字段名必须是错误。**
+    #[test]
+    fn a_misspelled_field_is_an_error_that_names_the_field() {
+        let e = serde_yaml_ng::from_str::<Config>(
+            "version: 1\nlisten:\n  addr: 127.0.0.1:18830\nclients: []\nproviders: []\n",
+        )
+        .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("addr"), "错误信息里得有那个写错的词：{m}");
+        assert!(m.contains("gateway"), "还得说对的写法是什么：{m}");
+    }
+
+    #[test]
+    fn a_misspelled_provider_field_is_an_error_too() {
+        // `base_ur` 静默丢掉的话，剩下的是一个没有地址的上游。
+        let e = serde_yaml_ng::from_str::<Config>(
+            "version: 1\nproviders:\n  - name: a\n    base_ur: http://x\n    key: k\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("base_ur"), "{e}");
+    }
+
+    #[test]
+    fn the_parse_error_does_not_claim_the_yaml_is_malformed() {
+        // 那句话会让用户去找一个不存在的语法错误。
+        let e = LoadError::Parse {
+            path: PathBuf::from("config.yaml"),
+            source: serde_yaml_ng::from_str::<Config>("version: 1\nnope: 1\n").unwrap_err(),
+        };
+        let m = e.to_string();
+        assert!(!m.contains("不是合法的 YAML"), "{m}");
+        assert!(m.contains("nope"), "{m}");
     }
 }

@@ -51,6 +51,55 @@ pub struct Group {
     pub selected: Option<String>,
 }
 
+/// 改写请求参数。
+///
+/// **这是和流量代理最本质的分歧**（§3.4）：Clash 的规则只能决定走哪个
+/// proxy，因为它能做的就是转发字节。我们在协议层，能改的东西多得多 ——
+/// 而 `set` 让「降级」成为可能，而不是只能「拒绝」。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetAction {
+    /// 换一个模型。
+    ///
+    /// **注意这会作废整个 prompt cache** —— 和 §3.9 说的「改个对外名字」
+    /// 不是一回事，那个不影响缓存因为发给上游的名字没变；这里是真的换了
+    /// 一个模型。而「预算超了」恰恰最容易发生在缓存已经暖好的长会话里，
+    /// 在那个时刻降级**很可能比不降级还贵**（§3.4）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    /// 只在新会话开始时应用，跑到一半不动它。
+    ///
+    /// **长会话场景下这应该是默认值**（§3.4），但会话识别是 M3 的事 ——
+    /// 现在这个字段只被记录和展示，不生效。写在这里是为了让配置格式
+    /// 不必二次改动。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_at_session_start: bool,
+}
+
+impl SetAction {
+    /// 后面的覆盖前面的同名字段（§3.4 的累积规则）。
+    pub fn merge(&mut self, other: &SetAction) {
+        if other.model.is_some() {
+            self.model = other.model.clone();
+        }
+        if other.max_tokens.is_some() {
+            self.max_tokens = other.max_tokens;
+        }
+        if other.thinking.is_some() {
+            self.thinking = other.thinking;
+        }
+        self.only_at_session_start |= other.only_at_session_start;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.max_tokens.is_none() && self.thinking.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     /// **每条规则有名字**。日志里、UI 里、试算结果里都能引用它 ——
@@ -60,7 +109,16 @@ pub struct Route {
     pub when: When,
     /// **可以直接指 provider，不需要先建组**（§3.4 层 1）。大多数分流
     /// 需求到这一层就解决了，不必引入策略组这个概念。
-    pub to: String,
+    ///
+    /// 阶段二的规则（含 `provider_would_be`）**不允许写它** —— 那会成环。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// 改写请求参数。**从所有命中的规则累积**，不只是第一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<SetAction>,
+    /// 直接拒绝，带一句给客户端看的原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<String>,
 }
 
 /// 一次路由的结果，**带上为什么**。
@@ -74,12 +132,43 @@ pub struct Decision {
     pub matched_rule: String,
     /// 经过了哪个组（直接指 provider 时是 None）
     pub via_group: Option<String>,
+    /// 累积起来的参数改写
+    pub set: SetAction,
+}
+
+/// 阶段一结束时可能是「不让干」。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    Route(Decision),
+    /// `deny` 命中。**带一句给客户端看的原因** —— 一个没有理由的拒绝
+    /// 和一个 bug 在用户眼里没有区别。
+    Deny {
+        rule: String,
+        reason: String,
+    },
+}
+
+/// 阶段二的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome2 {
+    /// 继续，带上累积后的参数改写
+    Proceed(SetAction),
+    Deny {
+        rule: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RouteError {
     #[error("没有任何规则命中，而且没有兜底规则。加一条不带 `when` 的规则收尾。")]
     NoMatch,
+    #[error(
+        "规则 `{0}` 用了 `provider_would_be`，同时又写了 `to`。这会成环 —— 那个条件的值要等路由决定完才知道，而 `to` 正是路由决定的东西。这类规则只能写 `set` / `deny`。"
+    )]
+    PhaseTwoWithTo(String),
+    #[error("规则 `{0}` 既没有 `to` 也没有 `deny`，也不改任何参数 —— 它命中了也什么都不做。")]
+    NoAction(String),
     #[error("规则 `{rule}` 指向 `{target}`，但既没有这个 provider 也没有这个组")]
     UnknownTarget { rule: String, target: String },
     #[error("组 `{0}` 里一个 provider 都没有")]
@@ -119,7 +208,9 @@ impl Engine {
             routes.push(Route {
                 name: "默认：按声明顺序故障转移".to_string(),
                 when: When::default(),
-                to: ALL.to_string(),
+                to: Some(ALL.to_string()),
+                set: None,
+                deny: None,
             });
         }
         Self {
@@ -135,7 +226,17 @@ impl Engine {
     pub fn validate(&self) -> Result<(), RouteError> {
         for r in &self.routes {
             r.when.validate()?;
-            self.resolve_target(r)?;
+            // **这条禁令是必需的**：允许阶段二的规则写 `to`，求值就直接
+            // 成环了（§3.4）。在校验阶段挡下来，而不是在运行时。
+            if r.when.is_phase_two() && r.to.is_some() {
+                return Err(RouteError::PhaseTwoWithTo(r.name.clone()));
+            }
+            if r.to.is_none() && r.deny.is_none() && r.set.as_ref().is_none_or(|s| s.is_empty()) {
+                return Err(RouteError::NoAction(r.name.clone()));
+            }
+            if r.to.is_some() {
+                self.resolve_target(r)?;
+            }
         }
         for g in &self.groups {
             if g.providers.is_empty() {
@@ -146,32 +247,89 @@ impl Engine {
     }
 
     /// 阶段一：按请求性质选出候选 provider。
-    pub fn route(&self, facts: &RequestFacts) -> Result<Decision, RouteError> {
+    ///
+    /// **自上而下，首个命中决定 `to` 和 `deny`；`set` 从所有命中的规则
+    /// 累积**（§3.4）。两者规则不同是有理由的：去向只能有一个，而参数
+    /// 改写是可以叠加的横切策略。
+    pub fn route(&self, facts: &RequestFacts) -> Result<Outcome, RouteError> {
+        let mut set = SetAction::default();
+        let mut chosen: Option<&Route> = None;
+
         for r in &self.routes {
-            if r.when.matches(facts)? {
-                let (candidates, via_group) = self.resolve_target(r)?;
-                return Ok(Decision {
-                    candidates,
-                    matched_rule: r.name.clone(),
-                    via_group,
-                });
+            // 阶段二的规则在这一轮完全跳过 —— 它们的条件还没法求值。
+            if r.when.is_phase_two() || !r.when.matches(facts)? {
+                continue;
+            }
+            if let Some(s) = &r.set {
+                set.merge(s);
+            }
+            if chosen.is_none() && (r.to.is_some() || r.deny.is_some()) {
+                chosen = Some(r);
             }
         }
-        Err(RouteError::NoMatch)
+
+        let Some(r) = chosen else {
+            return Err(RouteError::NoMatch);
+        };
+        if let Some(reason) = &r.deny {
+            return Ok(Outcome::Deny {
+                rule: r.name.clone(),
+                reason: reason.clone(),
+            });
+        }
+        let (candidates, via_group) = self.resolve_target(r)?;
+        Ok(Outcome::Route(Decision {
+            candidates,
+            matched_rule: r.name.clone(),
+            via_group,
+            set,
+        }))
+    }
+
+    /// 阶段二：知道了具体走哪家之后，再跑一遍含 `provider_would_be` 的规则。
+    ///
+    /// **故障转移换了 provider 之后必须重跑这一步**（§3.4）。否则「走中转
+    /// 的一律脱敏」这条规则，在从官方转移到中转时会漏掉 —— 而那正是最
+    /// 需要它的时刻。
+    pub fn phase_two(
+        &self,
+        facts: &RequestFacts,
+        provider: &str,
+        base: &SetAction,
+    ) -> Result<Outcome2, RouteError> {
+        let mut set = base.clone();
+        for r in &self.routes {
+            if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
+                continue;
+            }
+            if let Some(reason) = &r.deny {
+                return Ok(Outcome2::Deny {
+                    rule: r.name.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            if let Some(s) = &r.set {
+                set.merge(s);
+            }
+        }
+        Ok(Outcome2::Proceed(set))
     }
 
     fn resolve_target(&self, r: &Route) -> Result<(Vec<String>, Option<String>), RouteError> {
+        let Some(to) = &r.to else {
+            return Ok((Vec::new(), None));
+        };
         // provider 优先于组。同名时按 provider 解释 —— 而校验会挡住
         // 同名的情况，所以这个优先级实际上不会被用到。
-        if self.providers.iter().any(|p| p == &r.to) {
-            return Ok((vec![r.to.clone()], None));
+        if self.providers.iter().any(|p| p == to) {
+            return Ok((vec![to.clone()], None));
         }
-        if let Some(g) = self.groups.iter().find(|g| g.name == r.to) {
+        if let Some(g) = self.groups.iter().find(|g| g.name == *to) {
             return Ok((self.expand_group(g), Some(g.name.clone())));
         }
         Err(RouteError::UnknownTarget {
             rule: r.name.clone(),
-            target: r.to.clone(),
+            target: to.clone(),
         })
     }
 
@@ -226,7 +384,24 @@ mod tests {
         Route {
             name: name.into(),
             when: serde_yaml_ng::from_str(when_yaml).unwrap(),
-            to: to.into(),
+            to: Some(to.into()),
+            set: None,
+            deny: None,
+        }
+    }
+
+    /// 只关心去向的测试用它，省掉每处都 match 一遍。
+    fn candidates(e: &Engine, f: &RequestFacts) -> Vec<String> {
+        match e.route(f).unwrap() {
+            Outcome::Route(d) => d.candidates,
+            other => panic!("该路由，实际 {other:?}"),
+        }
+    }
+
+    fn decision(e: &Engine, f: &RequestFacts) -> Decision {
+        match e.route(f).unwrap() {
+            Outcome::Route(d) => d,
+            other => panic!("该路由，实际 {other:?}"),
         }
     }
 
@@ -235,7 +410,7 @@ mod tests {
         // 「只配 provider」是最小可用配置，而且对不少人就够了：
         // 「官方为主，挂了走中转」零规则就能满足（§3.4 层 0）。
         let e = Engine::new(vec!["official".into(), "relay".into()], vec![], vec![]);
-        let d = e.route(&facts("claude-sonnet-4-5")).unwrap();
+        let d = decision(&e, &facts("claude-sonnet-4-5"));
         assert_eq!(d.candidates, ["official", "relay"], "按声明顺序故障转移");
         assert!(e.validate().is_ok());
     }
@@ -272,7 +447,7 @@ mod tests {
                 route("兜底", "{}", "relay"),
             ],
         );
-        let d = e.route(&facts("claude-opus-4-5")).unwrap();
+        let d = decision(&e, &facts("claude-opus-4-5"));
         assert_eq!(d.candidates, ["official"]);
         assert_eq!(d.via_group, None);
         assert_eq!(d.matched_rule, "opus 走官方");
@@ -288,10 +463,7 @@ mod tests {
                 route("后", "{ model: claude-* }", "b"),
             ],
         );
-        assert_eq!(
-            e.route(&facts("claude-opus-4-5")).unwrap().candidates,
-            ["a"]
-        );
+        assert_eq!(candidates(&e, &facts("claude-opus-4-5")), ["a"]);
     }
 
     #[test]
@@ -321,7 +493,7 @@ mod tests {
             vec![g],
             vec![route("走池子", "{}", "pool")],
         );
-        let d = e.route(&facts("x")).unwrap();
+        let d = decision(&e, &facts("x"));
         assert_eq!(d.candidates, ["official", "relay"]);
         assert_eq!(d.via_group.as_deref(), Some("pool"));
     }
@@ -342,7 +514,7 @@ mod tests {
             vec![g],
             vec![route("x", "{}", "pool")],
         );
-        assert_eq!(e.route(&facts("x")).unwrap().candidates, ["b", "a", "c"]);
+        assert_eq!(candidates(&e, &facts("x")), ["b", "a", "c"]);
     }
 
     #[test]
@@ -378,6 +550,243 @@ mod tests {
         assert!(matches!(e.validate(), Err(RouteError::EmptyGroup(_))));
     }
 
+    fn route_full(
+        name: &str,
+        when_yaml: &str,
+        to: Option<&str>,
+        set: Option<SetAction>,
+        deny: Option<&str>,
+    ) -> Route {
+        Route {
+            name: name.into(),
+            when: serde_yaml_ng::from_str(when_yaml).unwrap(),
+            to: to.map(String::from),
+            set,
+            deny: deny.map(String::from),
+        }
+    }
+
+    #[test]
+    fn set_accumulates_from_every_matching_rule_while_to_takes_the_first() {
+        // 两者规则不同是有理由的：**去向只能有一个，而参数改写是可以
+        // 叠加的横切策略**（§3.4）。
+        let e = Engine::new(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![
+                route_full(
+                    "关掉思考",
+                    "{}",
+                    None,
+                    Some(SetAction {
+                        thinking: Some(false),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("走 a", "{}", Some("a"), None, None),
+                route_full(
+                    "再改模型",
+                    "{}",
+                    None,
+                    Some(SetAction {
+                        model: Some("cheap".into()),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("走 b", "{}", Some("b"), None, None),
+            ],
+        );
+        let d = decision(&e, &facts("x"));
+        assert_eq!(d.candidates, ["a"], "去向是第一条有 to 的");
+        assert_eq!(d.set.thinking, Some(false));
+        assert_eq!(
+            d.set.model.as_deref(),
+            Some("cheap"),
+            "后面的规则也累积进来了"
+        );
+    }
+
+    #[test]
+    fn a_later_set_overrides_an_earlier_one_on_the_same_field() {
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![
+                route_full(
+                    "先",
+                    "{}",
+                    Some("a"),
+                    Some(SetAction {
+                        model: Some("first".into()),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full(
+                    "后",
+                    "{}",
+                    None,
+                    Some(SetAction {
+                        model: Some("second".into()),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(
+            decision(&e, &facts("x")).set.model.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn deny_carries_a_reason_the_client_can_read() {
+        // 一个没有理由的拒绝，和一个 bug，在用户眼里没有区别。
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![
+                route_full(
+                    "脚本不许用 opus",
+                    "{ model: claude-opus-* }",
+                    None,
+                    None,
+                    Some("脚本不允许调用 Opus"),
+                ),
+                route_full("兜底", "{}", Some("a"), None, None),
+            ],
+        );
+        match e.route(&facts("claude-opus-4-5")).unwrap() {
+            Outcome::Deny { rule, reason } => {
+                assert_eq!(rule, "脚本不许用 opus");
+                assert_eq!(reason, "脚本不允许调用 Opus");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(candidates(&e, &facts("claude-sonnet-4-5")), ["a"]);
+    }
+
+    #[test]
+    fn phase_two_rules_are_invisible_to_phase_one() {
+        // 它们的条件还没法求值 —— provider_would_be 要等路由跑完。
+        let e = Engine::new(
+            vec!["official".into(), "relay".into()],
+            vec![],
+            vec![
+                route_full(
+                    "走中转的降级",
+                    "{ provider_would_be: relay }",
+                    None,
+                    Some(SetAction {
+                        thinking: Some(false),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("兜底", "{}", Some("relay"), None, None),
+            ],
+        );
+        let d = decision(&e, &facts("x"));
+        assert_eq!(d.matched_rule, "兜底");
+        assert_eq!(d.set.thinking, None, "阶段一不该看见阶段二的 set");
+    }
+
+    #[test]
+    fn phase_two_applies_once_the_provider_is_known() {
+        let e = Engine::new(
+            vec!["official".into(), "relay".into()],
+            vec![],
+            vec![
+                route_full(
+                    "走中转的降级",
+                    "{ provider_would_be: relay }",
+                    None,
+                    Some(SetAction {
+                        thinking: Some(false),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("兜底", "{}", Some("relay"), None, None),
+            ],
+        );
+        let base = SetAction::default();
+        match e.phase_two(&facts("x"), "relay", &base).unwrap() {
+            Outcome2::Proceed(s) => assert_eq!(s.thinking, Some(false)),
+            other => panic!("{other:?}"),
+        }
+        // 换一家就不该命中了 —— 这正是故障转移后必须重跑的理由
+        match e.phase_two(&facts("x"), "official", &base).unwrap() {
+            Outcome2::Proceed(s) => assert_eq!(s.thinking, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_two_can_match_a_list_of_providers() {
+        // `provider_would_be: [a, b]` 就是 §3.4 里 `any_of` 的实际形态，
+        // 不必发明一个关键字。
+        let e = Engine::new(
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![],
+            vec![
+                route_full(
+                    "这两家都不可靠",
+                    "{ provider_would_be: [a, b] }",
+                    None,
+                    Some(SetAction {
+                        thinking: Some(false),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("兜底", "{}", Some("a"), None, None),
+            ],
+        );
+        let base = SetAction::default();
+        for (p, want) in [("a", Some(false)), ("b", Some(false)), ("c", None)] {
+            match e.phase_two(&facts("x"), p, &base).unwrap() {
+                Outcome2::Proceed(s) => assert_eq!(s.thinking, want, "provider={p}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_phase_two_rule_with_a_target_is_refused_at_load_time() {
+        // **允许的话就直接成环了**：provider_would_be 的值要等路由决定完
+        // 才知道，而 `to` 正是路由决定的东西。
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![route_full(
+                "成环",
+                "{ provider_would_be: a }",
+                Some("a"),
+                None,
+                None,
+            )],
+        );
+        let err = e.validate().unwrap_err();
+        assert!(matches!(err, RouteError::PhaseTwoWithTo(_)));
+        assert!(err.to_string().contains("成环"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_that_does_nothing_at_all_is_refused() {
+        // 命中了也什么都不做的规则，多半是写漏了 —— 而它在运行时完全
+        // 静默，用户只会觉得「我明明配了」。
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![route_full("空的", "{ model: x }", None, None, None)],
+        );
+        assert!(matches!(e.validate(), Err(RouteError::NoAction(_))));
+    }
+
     #[test]
     fn only_load_balance_is_flagged_as_bad_for_cache() {
         // 这张表要在 UI 上直接显示，因为它决定了用户的账单（§3.4）。
@@ -398,6 +807,6 @@ mod tests {
         );
         let mut f = facts("x");
         f.cache = true;
-        assert_eq!(e.route(&f).unwrap().matched_rule, "带缓存的必须走官方");
+        assert_eq!(decision(&e, &f).matched_rule, "带缓存的必须走官方");
     }
 }

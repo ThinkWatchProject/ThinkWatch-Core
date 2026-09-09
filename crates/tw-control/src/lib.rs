@@ -115,7 +115,14 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|r| tw_api::RouteView {
                 name: r.name.clone(),
-                to: r.to.clone(),
+                // 阶段二的规则没有去向 —— 它们只改参数或拒绝（§3.4）
+                to: r.to.clone().unwrap_or_else(|| {
+                    if r.deny.is_some() {
+                        "拒绝".into()
+                    } else {
+                        "（只改参数）".into()
+                    }
+                }),
                 conditions: describe_when(&r.when),
             })
             .collect(),

@@ -409,12 +409,16 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
             tw_engine::Route {
                 name: "opus 走官方".into(),
                 when: serde_yaml_ng::from_str("{ model: claude-opus-* }").unwrap(),
-                to: "official".into(),
+                to: Some("official".into()),
+                set: None,
+                deny: None,
             },
             tw_engine::Route {
                 name: "兜底".into(),
                 when: Default::default(),
-                to: "relay".into(),
+                to: Some("relay".into()),
+                set: None,
+                deny: None,
             },
         ],
     };
@@ -989,4 +993,238 @@ async fn with_nothing_discovered_the_gateway_does_not_lock_itself_shut() {
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(!seen.lock().unwrap().body.is_empty());
+}
+
+/// 会记录收到了什么、然后按指定状态码回话的上游。
+///
+/// `start_broken_upstream` 不记录 body，而两阶段求值的证据恰恰在
+/// **第一家收到了什么** —— 只看第二家证明不了「切换前后算的是两次」。
+async fn start_recording_upstream(status: u16) -> (SocketAddr, Arc<Mutex<Seen>>) {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let s = seen.clone();
+    let app = Router::new().fallback(axum::routing::any(
+        move |State(s): State<Arc<Mutex<Seen>>>, headers: HeaderMap, body: bytes::Bytes| async move {
+            {
+                let mut g = s.lock().unwrap();
+                g.headers = headers;
+                g.body = body.to_vec();
+            }
+            axum::http::StatusCode::from_u16(status).unwrap()
+        },
+    )).with_state(s);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, seen)
+}
+
+fn body_of(seen: &Arc<Mutex<Seen>>) -> serde_json::Value {
+    let g = seen.lock().unwrap();
+    assert!(!g.body.is_empty(), "这家上游根本没收到请求");
+    serde_json::from_slice(&g.body).expect("上游收到的不是 JSON")
+}
+
+#[tokio::test]
+async fn a_phase_two_rule_is_recomputed_after_failover() {
+    // **这是两阶段求值存在的全部理由**（§3.4）。`provider_would_be` 的
+    // 值要等路由决定完才知道，而故障转移会在之后再改一次去向 —— 所以
+    // 它必须在转移循环**里面**重算。
+    //
+    // 否则「走中转的一律关掉 thinking」这条规则，会在从官方转移到中转
+    // 的那一刻失效 —— 而那正是最需要它的时刻。
+    let (official, seen_official) = start_recording_upstream(503).await;
+    let (relay, seen_relay) = start_upstream(false).await;
+
+    let mut cfg = cfg_with(
+        vec![
+            Provider {
+                name: "official".into(),
+                base_url: format!("http://{official}"),
+                key: "k".into(),
+                protocol: Some(tw_config::Protocol::Anthropic),
+                ..Default::default()
+            },
+            Provider {
+                name: "relay".into(),
+                base_url: format!("http://{relay}"),
+                key: "k".into(),
+                protocol: Some(tw_config::Protocol::Anthropic),
+                ..Default::default()
+            },
+        ],
+        vec![tw_engine::Route {
+            name: "中转不开思考".into(),
+            when: serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap(),
+            to: None,
+            set: Some(tw_engine::SetAction {
+                thinking: Some(false),
+                ..Default::default()
+            }),
+            deny: None,
+        }],
+    );
+    // 没有别的规则时层 0 会补一条兜底 —— 但只有在 routes 为空时。
+    // 这里已经有一条阶段二规则了，所以显式写出兜底。
+    cfg.routes.push(tw_engine::Route {
+        name: "兜底".into(),
+        when: Default::default(),
+        to: Some("official".into()),
+        set: None,
+        deny: None,
+    });
+    // 兜底只指一家的话就没得转移了 —— 用组把两家串起来。
+    cfg.groups = vec![tw_engine::Group {
+        name: "全部".into(),
+        kind: tw_engine::GroupType::Fallback,
+        providers: vec!["official".into(), "relay".into()],
+        session_affinity: false,
+        selected: None,
+    }];
+    cfg.routes.last_mut().unwrap().to = Some("全部".into());
+
+    let gw = serve_cfg(cfg).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","thinking":{"type":"enabled","budget_tokens":1024}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // 第一家（官方）：规则不该命中，body 原样带着 thinking
+    assert!(
+        body_of(&seen_official).get("thinking").is_some(),
+        "阶段二规则在官方那一跳就生效了 —— 说明它没在循环里重算，而是只算了一次"
+    );
+    // 第二家（中转）：转移之后重算，thinking 被摘掉
+    assert!(
+        body_of(&seen_relay).get("thinking").is_none(),
+        "转移到中转之后，阶段二规则没有重新生效"
+    );
+}
+
+#[tokio::test]
+async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
+    // 一个没有理由的拒绝，和一个 bug，在用户眼里没有区别（§3.4）。
+    let (relay, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "relay".into(),
+            base_url: format!("http://{relay}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![
+            tw_engine::Route {
+                name: "中转不许发这个".into(),
+                when: serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap(),
+                to: None,
+                set: None,
+                deny: Some("这段内容不发给中转站".into()),
+            },
+            tw_engine::Route {
+                name: "兜底".into(),
+                when: Default::default(),
+                to: Some("relay".into()),
+                set: None,
+                deny: None,
+            },
+        ],
+    ))
+    .await;
+
+    let r = send_to(gw).await;
+    assert_eq!(r.status(), 400, "是请求被规则挡了，不是上游的错");
+    let text = r.text().await.unwrap();
+    assert!(text.contains("这段内容不发给中转站"), "{text}");
+    assert!(
+        seen.lock().unwrap().body.is_empty(),
+        "被拒绝的请求一个字节都不该到上游"
+    );
+}
+
+#[tokio::test]
+async fn a_set_that_changes_nothing_leaves_the_body_byte_for_byte() {
+    // §4.1 的出站直通：**改写是显式要求的例外，不是默认行为**。
+    // cc-switch 那次把缓存命中率从 99% 打到 20%，就是因为一个「看起来
+    // 无害」的重写跑在了每个请求上。
+    let (up, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    // 键顺序刻意不是字典序 —— 任何一次 JSON 往返都会把它重排。
+    let raw = r#"{"model":"claude-sonnet-4-5","z_last":1,"a_first":2,"messages":[]}"#;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        String::from_utf8(seen.lock().unwrap().body.clone()).unwrap(),
+        raw,
+        "没有 set 的请求体必须一个字节都没动过"
+    );
+}
+
+#[tokio::test]
+async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
+    // `set` 从所有命中的规则累积，而阶段一的结果是阶段二的基线 ——
+    // 转移到第二家之后，第一家算出来的改写不能丢。
+    let (dead, seen_dead) = start_recording_upstream(503).await;
+    let (good, seen_good) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![
+            Provider {
+                name: "dead".into(),
+                base_url: format!("http://{dead}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "good".into(),
+                base_url: format!("http://{good}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![tw_engine::Route {
+            name: "统一压一下上限".into(),
+            when: Default::default(),
+            to: Some("全部".into()),
+            set: Some(tw_engine::SetAction {
+                max_tokens: Some(4096),
+                ..Default::default()
+            }),
+            deny: None,
+        }],
+    );
+    cfg.groups = vec![tw_engine::Group {
+        name: "全部".into(),
+        kind: tw_engine::GroupType::Fallback,
+        providers: vec!["dead".into(), "good".into()],
+        session_affinity: false,
+        selected: None,
+    }];
+    let gw = serve_cfg(cfg).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","max_tokens":64000}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(body_of(&seen_dead)["max_tokens"], 4096);
+    assert_eq!(body_of(&seen_good)["max_tokens"], 4096, "转移之后丢了");
 }

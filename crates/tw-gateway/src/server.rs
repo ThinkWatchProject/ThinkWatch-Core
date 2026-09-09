@@ -323,10 +323,19 @@ async fn passthrough(
         }
     }
 
-    let decision = state
+    let decision = match state
         .engine
         .route(&facts)
-        .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?;
+        .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?
+    {
+        tw_engine::Outcome::Route(d) => d,
+        tw_engine::Outcome::Deny { rule, reason } => {
+            // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
+            // 眼里没有区别（§3.4）。
+            tracing::info!(%rule, "按规则拒绝");
+            return Err(GatewayError::new(crate::error::Source::Request, reason));
+        }
+    };
     // 管线第 3 步：准入。**排队而不是拒绝**（§4.7）—— 客户端收到 429
     // 通常不会优雅重试，一个本来只需要多等两秒的请求会变成一次任务中断。
     //
@@ -394,6 +403,27 @@ async fn passthrough(
         };
         attempts.push(provider.name.clone());
 
+        // 阶段二：知道走哪家了，再跑一遍含 `provider_would_be` 的规则。
+        //
+        // **在循环里面，因为故障转移换了 provider 之后必须重算**（§3.4）。
+        // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
+        // —— 而那正是最需要它的时刻。
+        let effective_set = match state
+            .engine
+            .phase_two(&facts, &provider.name, &decision.set)
+        {
+            Ok(tw_engine::Outcome2::Proceed(s)) => s,
+            Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
+                tracing::info!(%rule, provider = %provider.name, "阶段二拒绝");
+                return Err(GatewayError::new(crate::error::Source::Request, reason));
+            }
+            Err(e) => return Err(GatewayError::config(format!("阶段二求值失败：{e}"))),
+        };
+        // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
+        // §4.1 的出站直通说过任何 body 改写都可能是缓存杀手，所以这是
+        // 一个用户显式要求的例外，不是默认行为。
+        let outbound = forward::apply_set(&body, &effective_set);
+
         let key = match provider.resolved_key() {
             Ok(k) => k,
             Err(e) => {
@@ -425,7 +455,7 @@ async fn passthrough(
         let mut req = http.request(method, &url);
         req = forward::forward_headers(req, &headers);
         req = forward::apply_credential(req, provider.effective_protocol(), &key);
-        match req.body(body.clone()).send().await {
+        match req.body(outbound.clone()).send().await {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
                 // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
                 // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家

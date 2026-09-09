@@ -39,6 +39,32 @@ pub struct When {
     pub thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// **阶段二专用**：路由决定完之后，选中的是哪个 provider。
+    ///
+    /// 它是个循环依赖 —— `guard` 必须在请求发出去之前生效，而这个值要
+    /// 等路由跑完、组内选完、跳过熔断的成员之后才知道。所以求值分两
+    /// 阶段，而含这个条件的规则**不允许带 `to`**（允许就直接成环了）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_would_be: Option<OneOrMany>,
+}
+
+/// 一个值或一组值。`provider_would_be: relay-cn` 和
+/// `provider_would_be: [relay-cn, relay-hk]` 都该能写 —— 后者是 §3.4 里
+/// `any_of` 的实际形态，而不必发明一个关键字。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn contains(&self, s: &str) -> bool {
+        match self {
+            OneOrMany::One(x) => x == s,
+            OneOrMany::Many(v) => v.iter().any(|x| x == s),
+        }
+    }
 }
 
 impl When {
@@ -55,6 +81,26 @@ impl When {
             && self.image.is_none()
             && self.thinking.is_none()
             && self.stream.is_none()
+            && self.provider_would_be.is_none()
+    }
+
+    /// 这条规则要等路由跑完才能求值吗。
+    pub fn is_phase_two(&self) -> bool {
+        self.provider_would_be.is_some()
+    }
+
+    /// 阶段二的匹配：在阶段一的条件之上，再看选中的是谁。
+    pub fn matches_with_provider(
+        &self,
+        f: &RequestFacts,
+        provider: &str,
+    ) -> Result<bool, MatchError> {
+        if let Some(p) = &self.provider_would_be
+            && !p.contains(provider)
+        {
+            return Ok(false);
+        }
+        self.matches(f)
     }
 
     /// 写死的条件语法对吗。**在加载配置时查，不要等到请求进来**

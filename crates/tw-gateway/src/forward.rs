@@ -93,6 +93,48 @@ pub fn response_headers(upstream: &reqwest::header::HeaderMap) -> HeaderMap {
     out
 }
 
+/// 按规则改写请求体。
+///
+/// **`set` 为空时原样返回，一个字节都不碰**（§4.1）。改写是用户显式要求
+/// 的例外，不是默认行为 —— cc-switch 那次把缓存命中率从 99% 打到 20%，
+/// 就是因为一个「看起来无害」的重写跑在了每个请求上。
+pub fn apply_set(body: &Bytes, set: &tw_engine::SetAction) -> Bytes {
+    if set.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // 解不开就别动。我们的解析器不认识的东西，上游可能完全认识。
+        tracing::warn!("请求体不是 JSON，跳过参数改写");
+        return body.clone();
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return body.clone();
+    };
+    if let Some(m) = &set.model {
+        obj.insert("model".into(), serde_json::Value::String(m.clone()));
+    }
+    if let Some(t) = set.max_tokens {
+        obj.insert("max_tokens".into(), serde_json::Value::from(t));
+    }
+    if let Some(th) = set.thinking {
+        if th {
+            // 开启思考需要一个 budget，而我们没有一个合理的值可以编。
+            // **只做「关掉」这一个方向** —— 那是降级场景真正需要的。
+            tracing::warn!("set.thinking: true 暂不支持（需要 budget_tokens），已忽略");
+        } else {
+            obj.remove("thinking");
+        }
+    }
+    match serde_json::to_vec(&v) {
+        Ok(b) => Bytes::from(b),
+        // 序列化不该失败，但真失败了宁可发原文也不要发半个 body
+        Err(e) => {
+            tracing::error!("改写后的请求体序列化失败，发原文：{e}");
+            body.clone()
+        }
+    }
+}
+
 pub fn map_reqwest_error(e: reqwest::Error) -> GatewayError {
     // 分类要能让人看出该去哪儿修。
     if e.is_timeout() {
@@ -190,6 +232,59 @@ mod tests {
         assert_eq!(out.get("content-type").unwrap(), "text/event-stream");
         // 订阅额度的头必须留着 —— 那是 §4.3.2 白捡的数据来源。
         assert!(out.contains_key("anthropic-ratelimit-unified-5h-utilization"));
+    }
+
+    #[test]
+    fn an_empty_set_does_not_touch_a_single_byte() {
+        // §4.1 的出站直通。cc-switch 那次把缓存命中率从 99% 打到 20%，
+        // 就是因为一个「看起来无害」的重写跑在了每个请求上。
+        let b = Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(apply_set(&b, &tw_engine::SetAction::default()), b);
+    }
+
+    #[test]
+    fn setting_a_model_replaces_only_that_field() {
+        let b = Bytes::from_static(br#"{"model":"opus","max_tokens":100,"extra":"keep"}"#);
+        let out = apply_set(
+            &b,
+            &tw_engine::SetAction {
+                model: Some("haiku".into()),
+                ..Default::default()
+            },
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "haiku");
+        assert_eq!(v["max_tokens"], 100);
+        assert_eq!(v["extra"], "keep", "没被点名的字段不能动");
+    }
+
+    #[test]
+    fn turning_thinking_off_removes_the_field() {
+        let b =
+            Bytes::from_static(br#"{"model":"m","thinking":{"type":"enabled","budget_tokens":9}}"#);
+        let out = apply_set(
+            &b,
+            &tw_engine::SetAction {
+                thinking: Some(false),
+                ..Default::default()
+            },
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn a_body_we_cannot_parse_is_forwarded_untouched() {
+        // 我们的解析器不认识的东西，上游可能完全认识（§4.1）。
+        let b = Bytes::from_static(b"not json");
+        let out = apply_set(
+            &b,
+            &tw_engine::SetAction {
+                model: Some("x".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out, b);
     }
 
     #[test]
