@@ -247,7 +247,7 @@ trust_level = "trusted"
                 Val::s("responses"),
             ),
         ] {
-            out = set(&out, &p.iter().copied().collect::<Vec<_>>(), &v).unwrap();
+            out = set(&out, &p.to_vec(), &v).unwrap();
         }
         out = set(
             &out,

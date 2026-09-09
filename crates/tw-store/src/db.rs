@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 5;
+const SCHEMA: i64 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -49,6 +49,9 @@ pub struct RequestRow {
     pub id: i64,
     pub at_ms: i64,
     pub client: String,
+    /// 请求头透出来的旁证。**可以伪造** —— 只用来显示和判断接管有没有
+    /// 生效，从不参与鉴权、路由或配额
+    pub client_hint: Option<String>,
     pub provider: String,
     pub model: String,
     pub path: String,
@@ -221,6 +224,14 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN cache_saved_micros INTEGER;")?;
         }
+        if from < 6 {
+            // 「这条是哪个客户端发的」的旁证（§7.11 的观察窗口）。
+            //
+            // **和 `client` 分开两列，不是覆盖它。**一个不可伪造、一个
+            // 可以伪造，混成一列之后就再也分不清某一行的可信度了。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN client_hint TEXT;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -231,8 +242,9 @@ impl Db {
             "INSERT OR REPLACE INTO requests
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-              cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+              cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
+              client_hint)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 r.id,
                 r.at_ms,
@@ -255,6 +267,7 @@ impl Db {
                 r.routing,
                 r.billing,
                 r.cache_saved_micros,
+                r.client_hint,
             ],
         )?;
         Ok(())
@@ -499,6 +512,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         id: r.get("id")?,
         at_ms: r.get("at_ms")?,
         client: r.get("client")?,
+        client_hint: r.get("client_hint")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
         path: r.get("path")?,
@@ -586,6 +600,7 @@ mod tests {
 
     pub(super) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
+            client_hint: None,
             id,
             at_ms,
             client: "claude-code".into(),
@@ -786,6 +801,36 @@ mod tests {
         }
         assert_eq!(db.prune_before(500).unwrap(), 4);
         assert_eq!(db.count().unwrap(), 6);
+    }
+
+    #[test]
+    fn an_older_database_gains_the_new_column_without_losing_a_row() {
+        // 升级时最要紧的一条：**老记录一条都不能少**。用户装新版之前
+        // 那三个月的账，比这个新字段重要得多。
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("data.db");
+        {
+            let db = Db::open(&p).unwrap();
+            db.insert(&row(1, 100)).unwrap();
+            db.insert(&row(2, 200)).unwrap();
+            // 装作是上一版建的库
+            db.conn
+                .execute_batch("ALTER TABLE requests DROP COLUMN client_hint;")
+                .unwrap();
+            db.conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+        let db = Db::open(&p).unwrap();
+        assert_eq!(db.count().unwrap(), 2, "迁移把老记录弄丢了");
+        let got = db.recent(10).unwrap();
+        // 老记录没有旁证，那就是 None —— 不是空字符串
+        assert!(got.iter().all(|r| r.client_hint.is_none()));
+        let mut fresh = row(3, 300);
+        fresh.client_hint = Some("codex".into());
+        db.insert(&fresh).unwrap();
+        assert_eq!(
+            db.recent(1).unwrap()[0].client_hint.as_deref(),
+            Some("codex")
+        );
     }
 
     #[test]

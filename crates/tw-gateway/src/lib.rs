@@ -12,6 +12,7 @@ pub mod clientprobe;
 pub mod error;
 pub mod forward;
 pub mod health;
+pub mod hint;
 pub mod l1;
 pub mod l3;
 pub mod leak;

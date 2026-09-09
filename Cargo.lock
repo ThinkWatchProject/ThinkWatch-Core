@@ -2861,6 +2861,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tw-adopt",
  "tw-api",
  "tw-config",
  "tw-control",

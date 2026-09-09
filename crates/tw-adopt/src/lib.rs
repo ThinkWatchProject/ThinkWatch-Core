@@ -1,4 +1,5 @@
 pub mod clients;
+pub mod detect;
 pub mod foreign;
 pub mod json;
 pub mod plan;

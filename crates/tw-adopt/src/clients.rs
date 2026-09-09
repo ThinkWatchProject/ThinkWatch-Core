@@ -90,6 +90,22 @@ pub struct Client {
     /// —— 这些不是我们的 bug，但用户会算到我们头上（§7.11）。
     pub costs: &'static [&'static str],
     pub verified: Verified,
+    /// 判断「这台机器上装了它吗」的痕迹，相对 `$HOME`。
+    ///
+    /// 不能只看配置文件在不在：`.aider.conf.yml` 这种，没接管过的用户
+    /// 本来就没有；而 `~/.claude/` 这种，装了就一定有。
+    pub marker: &'static [&'static str],
+    /// 进程名里认得出它的片段。诊断「客户端没重启」要用（§7.11）。
+    pub process: &'static [&'static str],
+    /// 它会读的环境变量。扫 shell 配置时找这些名字。
+    pub env_vars: &'static [&'static str],
+    /// 它的配置文件优先级**高于**真实 shell 环境变量。
+    ///
+    /// Claude Code 是这样（`env` 块会盖住 shell 里的 export），所以对它
+    /// 来说 `.zshrc` 里的残留不是问题；对 Codex 这类读环境变量的客户端
+    /// 就是问题。**同一条发现，对不同客户端的结论相反** —— 不区分的话
+    /// 就会给出一条错误的诊断。
+    pub config_beats_env: bool,
 }
 
 /// 网关这一侧的地址和钥匙。
@@ -162,6 +178,16 @@ pub fn adoptable() -> Vec<Client> {
                 "它可能会弹一次自己的欢迎页，点掉就行。",
             ],
             verified: Verified::FieldsOnly,
+            marker: &[".claude"],
+            process: &["claude"],
+            env_vars: &[
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_MODEL",
+            ],
+            // `env` 块会盖住 shell 里的 export（§7.11）
+            config_beats_env: true,
         },
         Client {
             id: "codex",
@@ -178,6 +204,10 @@ pub fn adoptable() -> Vec<Client> {
                 "改完要关掉终端重开。",
             ],
             verified: Verified::Measured,
+            marker: &[".codex"],
+            process: &["codex"],
+            env_vars: &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"],
+            config_beats_env: false,
         },
         Client {
             id: "opencode",
@@ -188,6 +218,10 @@ pub fn adoptable() -> Vec<Client> {
             shadowed_by: &[],
             costs: &["改完要重开。"],
             verified: Verified::FieldsOnly,
+            marker: &[".config/opencode", ".local/share/opencode"],
+            process: &["opencode"],
+            env_vars: &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+            config_beats_env: false,
         },
         Client {
             id: "zed",
@@ -200,6 +234,10 @@ pub fn adoptable() -> Vec<Client> {
             // settings.json 里，我们写不进去。
             costs: &["密钥要你自己在 Zed 的界面里填一次 —— 它不放在配置文件里，我们够不着。"],
             verified: Verified::FieldsOnly,
+            marker: &[".config/zed"],
+            process: &["Zed"],
+            env_vars: &[],
+            config_beats_env: false,
         },
         Client {
             id: "aider",
@@ -215,6 +253,11 @@ pub fn adoptable() -> Vec<Client> {
                 "改完要重开。",
             ],
             verified: Verified::FieldsOnly,
+            // 没接管过的用户本来就没有这个文件，所以它自己就是那个痕迹
+            marker: &[".aider.conf.yml", ".aider.model.settings.yml"],
+            process: &["aider"],
+            env_vars: &["OPENAI_API_BASE", "OPENAI_API_KEY"],
+            config_beats_env: false,
         },
     ]
 }

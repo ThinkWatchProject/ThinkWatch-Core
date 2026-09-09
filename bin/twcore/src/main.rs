@@ -59,6 +59,27 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
     },
+    /// 看看这台机器上有哪些 AI 客户端，以及它们指向哪儿
+    Clients {
+        #[command(subcommand)]
+        what: ClientsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientsCmd {
+    /// 扫一遍。**只读**
+    List,
+    /// 「我明明配了，为什么没生效」—— 走一遍优先级链
+    Why {
+        /// 客户端 id，比如 claude-code
+        client: String,
+        /// 当前项目目录，用来查项目级配置是不是盖住了用户级
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// 算一份接管改动**并打印出来**，不落盘
+    Plan { client: String },
 }
 
 #[derive(Subcommand)]
@@ -106,6 +127,98 @@ fn main() -> Result<()> {
         Command::Serve { port, safe, parent } => cmd_serve(&path, port, safe, parent),
         Command::Speed { provider, proxy } => cmd_speed(&path, provider, proxy),
         Command::Config { what } => cmd_config(&path, what),
+        Command::Clients { what } => cmd_clients(&path, what),
+    }
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
+    use tw_adopt::clients::{Gateway, adoptable, manual_only};
+    use tw_adopt::detect;
+
+    match what {
+        ClientsCmd::List => {
+            for d in detect::detect(&home()) {
+                let state = match (d.installed, d.adopted_at_ms, &d.endpoint) {
+                    (false, _, _) => "没装".to_string(),
+                    (true, Some(at), Some(ep)) => format!("已接管 {} → {ep}", fmt_time(at)),
+                    // **「我们写过」和「现在还是那样」是两回事。**
+                    (true, Some(at), None) => {
+                        format!("接管过（{}），但配置里已经没有我们写的字段了", fmt_time(at))
+                    }
+                    (true, None, Some(ep)) => format!("没接管，自己指向 {ep}"),
+                    (true, None, None) => "装了，没接管".to_string(),
+                };
+                println!("{:<14} {:<12} {state}", d.id, d.name);
+                println!("               {}", d.real.display());
+                if d.real != d.path {
+                    println!("               （{} 是个符号链接）", d.path.display());
+                }
+                for s in &d.shadows {
+                    println!("               ⚠ {} 优先级更高", s.display());
+                }
+                if d.verified == tw_adopt::clients::Verified::FieldsOnly {
+                    println!("               ⓘ {}", d.verified.note());
+                }
+            }
+            println!();
+            println!("接管不了、只能给指引的：");
+            for m in manual_only() {
+                println!("  {:<12} {}", m.name, m.how);
+                println!("               {}", m.caveat);
+            }
+            Ok(())
+        }
+        ClientsCmd::Why { client, project } => {
+            let c = adoptable()
+                .into_iter()
+                .find(|c| c.id == client)
+                .ok_or_else(|| anyhow::anyhow!("没有叫 `{client}` 的客户端"))?;
+            for f in detect::diagnose(&c, &home(), project.as_deref()) {
+                let mark = match f.level {
+                    detect::Level::Blocking => "✗",
+                    detect::Level::Suspect => "?",
+                    detect::Level::Clear => "✓",
+                };
+                println!("{mark} {}", f.title);
+                println!("  {}", f.detail);
+                if let Some(fix) = &f.fix {
+                    println!("  → {fix}");
+                }
+            }
+            Ok(())
+        }
+        ClientsCmd::Plan { client } => {
+            let c = adoptable()
+                .into_iter()
+                .find(|c| c.id == client)
+                .ok_or_else(|| anyhow::anyhow!("没有叫 `{client}` 的客户端"))?;
+            let cfg = tw_config::load(path)?;
+            // 0.0.0.0 是监听地址，不是能填进客户端配置的地址 —— 客户端
+            // 得知道往哪儿连，那永远是 127.0.0.1
+            let gw = Gateway {
+                base: format!("http://127.0.0.1:{}", cfg.listen.gateway.port),
+                key: None,
+            };
+            let plan = tw_adopt::plan::plan_adopt(&c, &home(), &gw)?;
+            println!("要改：{}", plan.path.display());
+            if plan.is_noop() {
+                println!("（已经是这样了，什么都不用改）");
+                return Ok(());
+            }
+            for n in &plan.notes {
+                println!("  · {n}");
+            }
+            println!("\n--- 改完之后 ---");
+            println!("{}", plan.after);
+            println!("--- 以上只是算出来的，没有写盘 ---");
+            Ok(())
+        }
     }
 }
 

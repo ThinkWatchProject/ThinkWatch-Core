@@ -608,6 +608,9 @@ async fn pipeline(
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
         client: client_name.clone(),
+        // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
+        // 不参与鉴权、路由、配额（见 crate::hint）。
+        client_hint: crate::hint::client_hint(&headers),
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
         model: facts.model.clone(),
         method: "POST".to_string(),

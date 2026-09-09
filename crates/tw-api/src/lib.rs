@@ -32,7 +32,16 @@ pub enum Event {
     /// 请求进来了
     RequestStarted {
         id: u64,
+        /// 鉴权认出来的身份（网关密钥对应的那个 client 条目）。**不可伪造。**
         client: String,
+        /// 请求头透出来的旁证。**可以伪造，所以只用来显示和判断
+        /// 「接管生效了吗」，绝不用来鉴权或路由**（见 tw_gateway::hint）。
+        ///
+        /// 它存在的理由：§0.6 的目标用户「一个 key 就够」，那时五个客户端
+        /// 的 `client` 是同一个值，而观察窗口要回答的偏偏是「Codex 那边
+        /// 生效了吗」。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_hint: Option<String>,
         provider: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账（§4.3）
@@ -683,6 +692,7 @@ mod tests {
             Event::RequestStarted {
                 id: 7,
                 client: "c".into(),
+                client_hint: None,
                 provider: "p".into(),
                 model: "m".into(),
                 method: "POST".into(),

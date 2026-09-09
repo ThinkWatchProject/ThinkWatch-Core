@@ -20,6 +20,7 @@ use crate::disk::{self, DiskLevel};
 struct Partial {
     at_ms: i64,
     client: String,
+    client_hint: Option<String>,
     provider: String,
     model: String,
     path: String,
@@ -99,6 +100,7 @@ impl Recorder {
             Event::RequestStarted {
                 id,
                 client,
+                client_hint,
                 provider,
                 model,
                 path,
@@ -113,6 +115,7 @@ impl Recorder {
                     Partial {
                         at_ms: *at_ms as i64,
                         client: client.clone(),
+                        client_hint: client_hint.clone(),
                         provider: provider.clone(),
                         model: model.clone(),
                         path: path.clone(),
@@ -200,6 +203,7 @@ impl Recorder {
                     id: *id as i64,
                     at_ms: p.at_ms,
                     client: p.client,
+                    client_hint: p.client_hint,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -230,6 +234,7 @@ impl Recorder {
                     id: *id as i64,
                     at_ms: p.at_ms,
                     client: p.client,
+                    client_hint: p.client_hint,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -262,6 +267,8 @@ impl Recorder {
                     id: *id as i64,
                     at_ms: *at_ms as i64,
                     client: client.clone(),
+                    // 本地应答的探测请求没经过上游，也就没有旁证可言
+                    client_hint: None,
                     provider: String::new(),
                     model: String::new(),
                     path: probe.clone(),
@@ -383,6 +390,7 @@ mod tests {
     pub(super) fn started(id: u64, model: &str) -> Event {
         Event::RequestStarted {
             id,
+            client_hint: None,
             client: "claude-code".into(),
             provider: "官方".into(),
             model: model.into(),

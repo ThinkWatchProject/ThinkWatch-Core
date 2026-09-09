@@ -19,6 +19,7 @@ chrono = { workspace = true }
 tw-secret = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+tw-adopt = { workspace = true }
 libc = "0.2"
 serde_yaml_ng = { workspace = true }
 tokio = { workspace = true }
