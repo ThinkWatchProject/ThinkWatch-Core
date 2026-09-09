@@ -1,0 +1,20 @@
+[package]
+name = "tw-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "请求历史与运行时状态：SQLite + 文件系统"
+
+[dependencies]
+tw-api = { workspace = true }
+rusqlite = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
