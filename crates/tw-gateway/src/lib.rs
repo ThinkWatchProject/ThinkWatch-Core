@@ -19,4 +19,4 @@ pub use error::GatewayError;
 pub use health::Health;
 pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};
-pub use server::{AppState, router, serve};
+pub use server::{AppState, refresh_catalog, router, serve, spawn_catalog_refresh};

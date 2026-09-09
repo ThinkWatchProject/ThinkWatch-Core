@@ -860,3 +860,133 @@ async fn a_per_client_limit_keeps_one_client_from_taking_everything() {
     // 全局给了 8，但这个客户端只有 1 —— 三个维度取最严的那个
     assert_eq!(peak.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn listing_and_admission_come_from_the_same_place() {
+    // §3.9 的核心：**列出来的一定能用，能用的一定列了出来**。两处各写
+    // 一遍的话，「列表里有但用不了」这种状态迟早出现 —— 而 one-api 和
+    // new-api 都栽在这上面。
+    let (up, _) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![Provider {
+            name: "relay".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            protocol: Some(tw_config::Protocol::Anthropic),
+            // 这家不实现 /v1/models，所以手写兜底（§3.9）
+            models: vec!["claude-sonnet-4-5".into(), "claude-haiku-4-5".into()],
+            ..Default::default()
+        }],
+        vec![],
+    );
+    cfg.clients[0].allow = Some(vec!["claude-haiku-*".into()]);
+    let gw = serve_cfg(cfg).await;
+
+    // 列表里只有 haiku
+    let listed: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{gw}/v1/models"))
+        .header("x-api-key", "tw-k")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["claude-haiku-4-5"]);
+
+    // 列出来的能用
+    let ok = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-haiku-4-5"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // 没列出来的用不了，而且错误要说人话
+    let refused = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let body: serde_json::Value = refused.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("claude-sonnet-4-5"), "{msg}");
+    assert!(msg.contains("/v1/models"), "要告诉他去哪看能用什么：{msg}");
+}
+
+#[tokio::test]
+async fn an_empty_allow_list_disables_the_client_entirely() {
+    // 「临时禁用这个客户端」的正当用法。one-api 和 new-api 在这里语义
+    // 正好相反，所以必须有个测试钉住我们这边是哪一种。
+    let (up, _) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![Provider {
+            name: "relay".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            protocol: Some(tw_config::Protocol::Anthropic),
+            models: vec!["claude-sonnet-4-5".into()],
+            ..Default::default()
+        }],
+        vec![],
+    );
+    cfg.clients[0].allow = Some(vec![]);
+    let gw = serve_cfg(cfg).await;
+
+    let listed: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{gw}/v1/models"))
+        .header("x-api-key", "tw-k")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed["data"].as_array().unwrap().is_empty());
+
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}
+
+#[tokio::test]
+async fn with_nothing_discovered_the_gateway_does_not_lock_itself_shut() {
+    // 目录空着说明探测还没回来、或者上游都不给列表也没写兜底。这时候
+    // 拦等于把整个网关关掉 —— 而用户完全看不出为什么。
+    let (up, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "relay".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"whatever"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(!seen.lock().unwrap().body.is_empty());
+}

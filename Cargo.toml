@@ -76,6 +76,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
 chrono = { version = "0.4", features = ["serde"] }
+arc-swap = "1"
 blake3 = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"

@@ -73,6 +73,7 @@ impl Default for Client {
             name: String::new(),
             key: String::new(),
             max_concurrent: None,
+            allow: None,
         }
     }
 }
@@ -85,6 +86,7 @@ impl Default for Provider {
             base_url: String::new(),
             key: Secret::Literal(String::new()),
             protocol: None,
+            models: Vec::new(),
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
         }
@@ -187,6 +189,15 @@ pub struct Client {
     /// 某台机器上的失控脚本不该能占满全部并发。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
+    /// 这个客户端能看到哪些模型（§3.9）。
+    ///
+    /// **三种状态语义分明**，因为 one-api 和 new-api 在这里正好相反：
+    ///
+    /// - 不写（`None`）→ 只按方言过滤。默认
+    /// - 写非空 → 在方言过滤基础上再按 glob 保留
+    /// - 写 `[]` → **一个都不给**。「临时禁用这个客户端」的正当用法
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
     /// 网关密钥。`tw-` 前缀是刻意的：用户在客户端配置里看到它时，
     /// 一眼就知道这不是某个上游的真 key（§5.4）。
     pub key: String,
@@ -285,6 +296,12 @@ pub struct Provider {
     /// **默认 `direct` 而不是 `system`**：显式优于隐式。默认跟随系统的
     /// 话，用户在系统里开了全局代理，本地 Ollama 就会莫名连不上，而
     /// 配置文件里看不出任何线索。
+    /// 探测不到时的兜底清单（§3.9）。
+    ///
+    /// 有些中转站没实现 `/v1/models`。**这是 provider 级的「这家有什么」，
+    /// 不是全局的「我们对外暴露什么」** —— 那个由汇总推导出来。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     #[serde(default = "default_proxy", skip_serializing_if = "is_direct")]
     pub proxy: String,
     #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]

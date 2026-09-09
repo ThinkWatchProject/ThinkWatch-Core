@@ -6,12 +6,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 
-use crate::auth::{extract_key, key_eq};
+use crate::auth::key_eq;
 use crate::error::GatewayError;
 use crate::forward;
 use crate::health::Health;
@@ -115,6 +115,11 @@ pub struct AppState {
     pub gate: Arc<crate::limits::Gate>,
     /// 来源白名单。空 = 全放行，而那只在 loopback 下成立（§5.4）。
     pub allow: Arc<crate::access::AllowList>,
+    /// 模型目录。**列表和准入的唯一真相来源**（§3.9）。
+    ///
+    /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
+    /// 探测要打网络，不能挡住启动。
+    pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
 }
 
 impl AppState {
@@ -129,6 +134,25 @@ impl AppState {
         let limits = config.limits.clone();
         let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
             .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
+        // 先用配置里手写的 `models:` 建一份。**探测要打网络，不能挡住
+        // 启动** —— 没有兜底清单的 provider 这时是空的，等 L2 回来再补。
+        let catalog = tw_engine::Catalog::build(
+            &config
+                .providers
+                .iter()
+                .map(|p| tw_engine::ProviderModels {
+                    provider: p.name.clone(),
+                    protocol: p
+                        .effective_protocol()
+                        .map(|x| format!("{x:?}"))
+                        // 猜不出协议时按 Anthropic 算 —— 和转发时的默认
+                        // 一致（forward::apply_credential）。两处不一致会让
+                        // 「列出来了但发过去 401」变成可能。
+                        .unwrap_or_else(|| "Anthropic".to_string()),
+                    models: p.models.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
         let engine = Arc::new(config.engine());
         Ok(Self {
             clients: Arc::new(clients),
@@ -139,12 +163,17 @@ impl AppState {
             health: Arc::new(Health::new()),
             gate: Arc::new(crate::limits::Gate::new(limits)),
             allow: Arc::new(allow),
+            catalog: Arc::new(arc_swap::ArcSwap::from_pointee(catalog)),
         })
     }
 
-    /// 密钥 → 客户端名字。
-    fn identify(&self, headers: &HeaderMap, query: Option<&str>) -> Result<String, GatewayError> {
-        let Some(key) = extract_key(headers, query) else {
+    /// 密钥 → 客户端名字 + 方言。
+    fn identify(
+        &self,
+        headers: &HeaderMap,
+        query: Option<&str>,
+    ) -> Result<(String, crate::auth::KeyPosition), GatewayError> {
+        let Some((key, position)) = crate::auth::extract_key_with_position(headers, query) else {
             return Err(GatewayError::auth(
                 "请求没带网关密钥。把 config.yaml 里 clients 段的那把 key 配到客户端上。",
             ));
@@ -153,7 +182,7 @@ impl AppState {
             .clients
             .iter()
             .find(|c| key_eq(&c.key, &key))
-            .map(|c| c.name.clone())
+            .map(|c| (c.name.clone(), position))
             .ok_or_else(|| {
                 // 不回显收到的 key，哪怕是打码的 —— 回显会让「猜密钥」
                 // 这件事有了反馈信号。
@@ -167,10 +196,58 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // **和准入共用同一个函数**（§3.9）—— 列表和准入不可能不一致。
+        .route("/v1/models", get(list_models))
         // M0 只有透传：任何方法、任何路径都往上游送。M1 加路由时，
         // 这里会先过规则引擎再决定送给谁。
         .fallback(any(passthrough))
         .with_state(state)
+}
+
+/// `GET /v1/models`。
+///
+/// 三种方言的响应结构不同，但**列表内容来自同一个函数** —— 差别只在
+/// 外壳（§3.9）。
+async fn list_models(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, GatewayError> {
+    if !state.allow.allows(peer.ip()) {
+        return Err(GatewayError::auth(format!(
+            "{} 不在允许的来源里。",
+            peer.ip()
+        )));
+    }
+    let (client, position) = state.identify(&headers, query.as_deref())?;
+    let allow = state
+        .config
+        .clients
+        .iter()
+        .find(|c| c.name == client)
+        .and_then(|c| c.allow.clone());
+    let models = state
+        .catalog
+        .load()
+        .resolve_allowed(Some(position.dialect()), allow.as_deref());
+
+    let now = now_ms() / 1000;
+    let body = match position {
+        crate::auth::KeyPosition::GoogleHeader => serde_json::json!({
+            "models": models.iter().map(|m| serde_json::json!({
+                "name": format!("models/{m}"),
+            })).collect::<Vec<_>>()
+        }),
+        // Anthropic 和 OpenAI 的 /v1/models 形状一样
+        _ => serde_json::json!({
+            "object": "list",
+            "data": models.iter().map(|m| serde_json::json!({
+                "id": m, "object": "model", "created": now,
+            })).collect::<Vec<_>>()
+        }),
+    };
+    Ok(axum::Json(body).into_response())
 }
 
 async fn passthrough(
@@ -193,7 +270,7 @@ async fn passthrough(
             ),
         ));
     }
-    let client_name = state.identify(&headers, query.as_deref())?;
+    let (client_name, position) = state.identify(&headers, query.as_deref())?;
     forward::check_body_size(&body, MAX_BODY)?;
 
     // 首次运行还没配完是正常状态，不是配置错误。这条要在路由之前挡，
@@ -218,6 +295,34 @@ async fn passthrough(
         f.client = client_name.clone();
         f
     };
+    // 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
+    // （§3.9）—— 列出来的一定能用，能用的一定列了出来。
+    //
+    // 目录空着时不拦：那说明探测还没回来或者上游都不给列表，这时候拦
+    // 等于把整个网关关掉。
+    {
+        let catalog = state.catalog.load();
+        if !catalog.is_empty() && !facts.model.is_empty() {
+            let allow = state
+                .config
+                .clients
+                .iter()
+                .find(|c| c.name == client_name)
+                .and_then(|c| c.allow.clone());
+            if !catalog.admits(&facts.model, Some(position.dialect()), allow.as_deref()) {
+                // 错误信息要说人话 —— 而不是一个干巴巴的 permission
+                // denied（§3.9、§4.6.1）。
+                return Err(GatewayError::new(
+                    crate::error::Source::Request,
+                    format!(
+                        "客户端 `{client_name}` 不允许使用 {}。它能用的模型见 GET /v1/models。",
+                        facts.model
+                    ),
+                ));
+            }
+        }
+    }
+
     let decision = state
         .engine
         .route(&facts)
@@ -415,6 +520,74 @@ async fn passthrough(
     Ok(resp)
 }
 
+/// 去问每个上游有哪些模型，把目录换掉。
+///
+/// **探测是零成本的**（§4.6 的 L2），但它要打网络，所以在后台跑而不是
+/// 挡住启动。配置里手写的 `models:` 是它回来之前的兜底。
+///
+/// 结果缓存 24 小时（§3.9）——模型列表变化不频繁，而**每次有人调
+/// `/v1/models` 就去打上游，会把一个本该零成本的端点变成一次串行网络
+/// 往返**。
+pub async fn refresh_catalog(state: &AppState) {
+    let mut sources = Vec::new();
+    for p in state.config.providers.iter() {
+        let protocol = p
+            .effective_protocol()
+            .map(|x| format!("{x:?}"))
+            .unwrap_or_else(|| "Anthropic".to_string());
+        let key = match p.resolved_key() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(provider = %p.name, "密钥取不到，跳过探测：{e}");
+                sources.push(tw_engine::ProviderModels {
+                    provider: p.name.clone(),
+                    protocol,
+                    models: p.models.clone(),
+                });
+                continue;
+            }
+        };
+        let http = state.clients.get(&p.name).unwrap_or(&state.http);
+        let r = crate::probe::probe(http, &p.base_url, &key, p.effective_protocol()).await;
+        let discovered = match &r.models {
+            crate::probe::ModelList::Listed { models } => models.clone(),
+            // 探不到就用手写的兜底。**两者不合并** —— 合并的话，用户
+            // 删掉一个上游不再提供的模型时会发现它删不掉。
+            other => {
+                if !p.models.is_empty() {
+                    tracing::debug!(provider = %p.name, ?other, "用配置里手写的模型清单");
+                } else {
+                    tracing::info!(
+                        provider = %p.name, ?other,
+                        "这家没给模型列表，也没写 models: 兜底 —— 它的模型不会出现在 /v1/models 里"
+                    );
+                }
+                p.models.clone()
+            }
+        };
+        sources.push(tw_engine::ProviderModels {
+            provider: p.name.clone(),
+            protocol,
+            models: discovered,
+        });
+    }
+    let total: usize = sources.iter().map(|s| s.models.len()).sum();
+    state
+        .catalog
+        .store(Arc::new(tw_engine::Catalog::build(&sources)));
+    tracing::info!(providers = sources.len(), models = total, "模型目录已刷新");
+}
+
+/// 后台刷新循环。
+pub fn spawn_catalog_refresh(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            refresh_catalog(&state).await;
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+        }
+    });
+}
+
 /// 起服务。返回实际绑定的地址 —— 端口写 0 时调用方需要知道拿到了哪个。
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -560,10 +733,10 @@ mod tests {
     #[test]
     fn a_known_key_resolves_to_its_client_name() {
         let s = AppState::new(cfg()).unwrap();
-        assert_eq!(
-            s.identify(&hdr("x-api-key", "tw-good"), None).unwrap(),
-            "default"
-        );
+        let (name, pos) = s.identify(&hdr("x-api-key", "tw-good"), None).unwrap();
+        assert_eq!(name, "default");
+        // 位置带出来的方言是 §3.9 按方言过滤的依据
+        assert_eq!(pos.dialect(), "Anthropic");
     }
 
     #[test]
