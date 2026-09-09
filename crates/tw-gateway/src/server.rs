@@ -591,7 +591,14 @@ async fn pipeline(
         status: status.as_u16(),
         ttfb_ms: started.elapsed().as_millis() as u64,
     });
-    let out_headers = forward::response_headers(upstream.headers());
+    let mut out_headers = forward::response_headers(upstream.headers());
+    // **哪一家服务的，写在头上。**§4.6.1 说上游的错误要原样透传、不加
+    // `[ThinkWatch]` 前缀 —— 那确实是它说的话。可上游的 401 说的是
+    // 「invalid x-api-key」，而用户手里有两把 key（网关的和上游的），
+    // 他会去查错的那一把。改 body 是越界，加一个头不是。
+    if let Ok(v) = axum::http::HeaderValue::from_str(&provider.name) {
+        out_headers.insert("x-thinkwatch-upstream", v);
+    }
 
     // 流式：**不缓冲**。整块缓冲会把 SSE 变成一次性交付，客户端那边
     // 看起来就是「卡住很久然后一下全出来」。
