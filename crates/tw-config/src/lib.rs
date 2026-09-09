@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub use tw_types::Limits;
 
+pub mod history;
 mod init;
 mod probes;
 pub mod proxy;
+pub mod store;
 mod validate;
 
 pub use init::{generate_initial, generate_key, generate_with_provider};
@@ -433,33 +435,22 @@ pub enum WriteError {
 ///
 /// 权限不能靠 umask 的运气：这个文件里有明文密钥（§3.2）。
 pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|source| WriteError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-    }
     let text = serde_yaml_ng::to_string(cfg)?;
-    // 先写临时文件再 rename —— 中断的写不该留下半份配置。备份必须原子
-    // 发布，配置本身更是（§9.7）。
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, &text).map_err(|source| WriteError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, path).map_err(|source| WriteError::Io {
-        path: path.to_path_buf(),
-        source,
+    // **权限、原子写、目录创建都在 store 里。**两处各写一遍就是两处会
+    // 漂移，而漂移的那一处大概率是漏了 0600 的那处 —— 这个坑今天已经
+    // 踩过一次了。
+    store::write_atomic(path, &text).map_err(|e| match e {
+        store::StoreError::Io { path, source } => WriteError::Io { path, source },
+        other => WriteError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(other.to_string()),
+        },
     })?;
     Ok(())
 }
 
 pub use probes::{ClientProbes, ProbeAction};
+pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;
 
 /// 默认配置目录：`~/.thinkwatch`。
