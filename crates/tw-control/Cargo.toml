@@ -29,3 +29,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 serde_yaml_ng = { workspace = true }
 tempfile = "3"
+tw-observe = { workspace = true }
+tw-api = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

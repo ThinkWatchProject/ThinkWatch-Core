@@ -55,6 +55,33 @@ pub enum Event {
         source: String,
         message: String,
     },
+    /// 配置换了一份新的进去，已经生效（§3.8）。
+    ///
+    /// **界面靠它知道自己手里那份过期了。**没有它，用户在编辑器里改完
+    /// 文件，界面上还显示着旧的 —— 而他分不清是我们没生效还是界面没刷新。
+    ConfigReloaded {
+        id: u64,
+        /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
+        version: String,
+        /// 「界面」「命令行」「外部编辑」「回滚」
+        origin: String,
+        at_ms: u64,
+    },
+    /// 新配置没过关，**旧的还在服务**（§3.8）。
+    ///
+    /// 桌面工具不能因为一个笔误就断线，所以这不是崩溃，是一条要展示给
+    /// 人看的信息 —— 托盘变黄、界面标红、定位到那一行。
+    ConfigRejected {
+        id: u64,
+        /// 「语法」「字段」「语义」
+        stage: String,
+        message: String,
+        /// 1 起。语义错误没有，那时硬指一行只会误导
+        line: Option<usize>,
+        /// 出错那一行的原文，**已脱敏**
+        excerpt: Option<String>,
+        at_ms: u64,
+    },
     /// 客户端的辅助请求被本地应答了，一个字节都没发给上游（§4.8）。
     ///
     /// **单独一个事件，不复用 RequestFinished。**它的成本是 0、延迟是
@@ -77,7 +104,9 @@ impl Event {
             | Event::RequestHeaders { id, .. }
             | Event::RequestFinished { id, .. }
             | Event::RequestFailed { id, .. }
-            | Event::LocallyAnswered { id, .. } => *id,
+            | Event::LocallyAnswered { id, .. }
+            | Event::ConfigReloaded { id, .. }
+            | Event::ConfigRejected { id, .. } => *id,
         }
     }
 }

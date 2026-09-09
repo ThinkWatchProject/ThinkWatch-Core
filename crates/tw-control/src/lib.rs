@@ -15,6 +15,8 @@ use axum::{Json, Router};
 use futures::stream::Stream;
 use tokio::sync::broadcast;
 
+pub mod config;
+pub use config::{ApplyError, ConfigManager, spawn_watcher};
 pub use tw_observe::EventBus;
 
 #[derive(Clone)]

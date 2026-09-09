@@ -14,6 +14,7 @@ pub mod proxy;
 pub mod reload;
 pub mod store;
 mod validate;
+pub mod watch;
 
 pub use init::{generate_initial, generate_key, generate_with_provider};
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
