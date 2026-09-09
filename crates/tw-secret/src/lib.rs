@@ -10,7 +10,7 @@ pub mod exec;
 pub mod mask;
 
 pub use exec::{ExecError, run_exec};
-pub use mask::{mask_secret, redact_url};
+pub use mask::{mask_line, mask_secret, redact_url};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {

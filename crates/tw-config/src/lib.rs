@@ -11,6 +11,7 @@ pub mod history;
 mod init;
 mod probes;
 pub mod proxy;
+pub mod reload;
 pub mod store;
 mod validate;
 
@@ -44,7 +45,16 @@ pub struct Config {
     pub listen: Listen,
     /// 客户端身份。密钥即身份（§3.3.1）—— 不是「先认证再看是谁」，
     /// 而是「这把钥匙就是这个人」。
+    ///
+    /// **不写这一段不是语法错误。**serde 的「missing field `clients`」
+    /// 说不出下一步做什么，而 `validate` 那句「首次启动本应自动生成
+    /// 一把」能。缺字段的判断交给它。
+    #[serde(default)]
     pub clients: Vec<Client>,
+    /// **同样可以整段不写。**§3.3 承诺第一天的配置是六行，而零 provider
+    /// 是一个合法状态（首次运行就是它）—— 逼用户写一行 `providers: []`
+    /// 只是为了让解析器高兴。
+    #[serde(default)]
     pub providers: Vec<Provider>,
     /// 策略组。不写就没有 —— 层 0（只配 provider）是完全合法的配置，
     /// 引擎内部会把它展开（§3.4）。
@@ -450,6 +460,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 }
 
 pub use probes::{ClientProbes, ProbeAction};
+pub use reload::{Rejected, Stage, try_parse};
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;
 

@@ -94,7 +94,8 @@ pub fn snapshot(
 ) -> Result<Option<Version>, StoreError> {
     let dir = history_dir(config_path);
     let version = store::version_of(text);
-    if let Some(last) = list(config_path)?.last()
+    let all = list(config_path)?;
+    if let Some(last) = all.last()
         && last.version == version
     {
         return Ok(None);
@@ -103,7 +104,17 @@ pub fn snapshot(
         path: dir.clone(),
         source,
     })?;
-    let at_ms = now_ms();
+    // **时间戳必须严格递增。**同一毫秒里连着存两版（表单自动保存、
+    // 脚本连改）会得到同一个 at_ms，而那时「哪一版更新」就只能听
+    // `read_dir` 的顺序 —— 于是 prune 可能删掉最新的那一版，回滚也会
+    // 回到一个说不清的地方。
+    //
+    // 代价是一次连写里的时间戳可能比真实时刻晚几毫秒。**顺序永远不
+    // 会错，而顺序才是回滚依赖的东西**，时间只是给人看的。
+    let at_ms = match all.last() {
+        Some(last) if now_ms() <= last.at_ms => last.at_ms + 1,
+        _ => now_ms(),
+    };
     // 名字里带上时间、来源和版本号 —— 光看文件名就能读懂这一版是什么。
     let file = dir.join(format!(
         "{at_ms}-{}-{}.yaml",
@@ -362,5 +373,36 @@ mod tests {
         std::fs::write(dir.join("不是时间戳-ui-abc.yaml"), "a: 1\n").unwrap();
         snapshot(&p, "a: 1\n", Origin::Ui).unwrap();
         assert_eq!(list(&p).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    #[test]
+    fn versions_written_in_the_same_millisecond_keep_their_order() {
+        // 表单自动保存、脚本连改都会撞在同一毫秒里。撞上之后「哪一版
+        // 更新」如果只能听 read_dir 的顺序，prune 会删掉最新的那一版，
+        // 而回滚会回到一个说不清的地方。
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.yaml");
+        let mut stamps = Vec::new();
+        for i in 0..200 {
+            let v = snapshot(&p, &format!("a: {i}\n"), Origin::Ui)
+                .unwrap()
+                .unwrap();
+            stamps.push(v.at_ms);
+        }
+        assert!(
+            stamps.windows(2).all(|w| w[0] < w[1]),
+            "时间戳没有严格递增：{stamps:?}"
+        );
+        let listed = list(&p).unwrap();
+        assert_eq!(
+            read(listed.last().unwrap()).unwrap(),
+            "a: 199\n",
+            "最新的那一版不是最后一个"
+        );
     }
 }
