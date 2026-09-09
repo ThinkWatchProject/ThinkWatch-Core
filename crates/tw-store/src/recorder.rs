@@ -27,6 +27,8 @@ struct Partial {
     ttfb_ms: Option<i64>,
     /// 路由决策，JSON。**在结束事件之前到达** —— 尝试链走完才发它
     routing: Option<String>,
+    /// 服务它的那家怎么收钱（§4.3.1）
+    billing: String,
 }
 
 /// 在飞的请求最多攒多少条。
@@ -117,6 +119,7 @@ impl Recorder {
                         status: None,
                         ttfb_ms: None,
                         routing: None,
+                        billing: String::new(),
                     },
                 );
             }
@@ -125,6 +128,7 @@ impl Recorder {
                 rule,
                 group,
                 attempts,
+                billing,
             } => {
                 if let Some(p) = self.inflight.get_mut(id) {
                     p.routing = serde_json::to_string(&tw_api::RoutingView {
@@ -133,6 +137,7 @@ impl Recorder {
                         attempts: attempts.clone(),
                     })
                     .ok();
+                    p.billing = billing.clone();
                 }
             }
             Event::RequestHeaders {
@@ -165,11 +170,22 @@ impl Recorder {
                 // **上游没给 usage 就没有成本。**估算是 M3 后面的事
                 // （tiktoken / count_tokens），而在那之前记一笔 0 是在
                 // 撒谎（§4.3）。
-                let cost = u.map(|u| self.prices.cost(&p.model, &u, false));
-                let (cost_micros, estimated) = match &cost {
-                    Some(Cost::Known(m)) => (Some(*m), false),
-                    Some(Cost::Estimated(m)) => (Some(*m), true),
-                    // 没有价格 / 没有 usage，两种都是「不知道」
+                // **不引 tw-config** —— 存储层不该知道配置的形状。这个
+                // 字符串是事件契约的一部分，比较它就够了。
+                let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
+                // **订阅型不按价目表算钱。**订阅制的边际成本是零，按 API
+                // 价目表乘出来的数字是纯虚构的（§4.3.1）—— 而它会混进
+                // 「今日花费」里，把一个诚实的面板变成一个编出来的。
+                let cost = if counts_toward_money {
+                    u.map(|u| self.prices.cost(&p.model, &u, false))
+                } else {
+                    None
+                };
+                let (cost_micros, estimated) = match cost {
+                    Some(Cost::Known(m)) => (Some(m), false),
+                    Some(Cost::Estimated(m)) => (Some(m), true),
+                    // 没有价格 / 没有 usage / 不按 token 计费，
+                    // 三种都是「这笔账不在这个维度上」
                     Some(Cost::Unpriced { .. }) | None => (None, false),
                 };
                 self.write(RequestRow {
@@ -192,6 +208,7 @@ impl Recorder {
                     error: None,
                     local: false,
                     routing: p.routing,
+                    billing: p.billing,
                 });
             }
             Event::RequestFailed { id, message, .. } => {
@@ -220,6 +237,7 @@ impl Recorder {
                     error: Some(message.clone()),
                     local: false,
                     routing: p.routing,
+                    billing: p.billing,
                 });
             }
             Event::LocallyAnswered {
@@ -251,6 +269,7 @@ impl Recorder {
                     local: true,
                     // 本地应答没走路由 —— 它根本没到上游
                     routing: None,
+                    billing: String::new(),
                 });
             }
             Event::LeakSeen {
@@ -340,7 +359,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    fn rec() -> (tempfile::TempDir, Recorder) {
+    pub(super) fn rec() -> (tempfile::TempDir, Recorder) {
         let d = tempfile::tempdir().unwrap();
         let r = Recorder::new(
             Db::in_memory().unwrap(),
@@ -350,7 +369,7 @@ mod tests {
         (d, r)
     }
 
-    fn started(id: u64, model: &str) -> Event {
+    pub(super) fn started(id: u64, model: &str) -> Event {
         Event::RequestStarted {
             id,
             client: "claude-code".into(),
@@ -362,7 +381,7 @@ mod tests {
         }
     }
 
-    fn finished(id: u64, usage: Option<tw_api::UsageView>) -> Event {
+    pub(super) fn finished(id: u64, usage: Option<tw_api::UsageView>) -> Event {
         Event::RequestFinished {
             id,
             status: 200,
@@ -552,5 +571,91 @@ mod tests {
             at_ms: 0,
         });
         assert_eq!(r.db().count().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use super::tests::{finished, rec, started};
+    use super::*;
+
+    fn routed(id: u64, billing: &str) -> Event {
+        Event::RequestRouted {
+            id,
+            rule: "兜底".into(),
+            group: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "订阅账号".into(),
+                outcome: "成功".into(),
+                ms: 5,
+            }],
+            billing: billing.into(),
+        }
+    }
+
+    fn usage() -> Option<tw_api::UsageView> {
+        Some(tw_api::UsageView {
+            input: 100_000,
+            output: 1000,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_subscription_call_does_not_get_a_made_up_price() {
+        // **订阅制的边际成本是零，按 API 价目表乘出来的数字是纯虚构的**
+        // （§4.3.1）。混进「今日花费」里，就把一个诚实的面板变成了一个
+        // 编出来的。
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&routed(1, "subscription"));
+        r.on_event(&finished(1, usage()));
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.cost_micros, None, "订阅调用被按价目表算了钱");
+        // **token 数还是要记的** —— 那才是订阅用户该看的量
+        assert_eq!(row.input_tokens, Some(100_000));
+        assert_eq!(row.billing, "subscription");
+    }
+
+    #[test]
+    fn a_per_token_call_next_to_it_still_gets_priced() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&routed(1, "per-token"));
+        r.on_event(&finished(1, usage()));
+        assert!(r.db().get(1).unwrap().unwrap().cost_micros.is_some());
+    }
+
+    #[test]
+    fn the_summary_keeps_subscription_calls_out_of_the_money_but_counts_them() {
+        // 「混了订阅上游之后，Dashboard 的今日花费要拆成三栏：实测计费、
+        // 估算计费、订阅调用量」（§4.3.1）。
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&routed(1, "per-token"));
+        r.on_event(&finished(1, usage()));
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&routed(2, "subscription"));
+        r.on_event(&finished(2, usage()));
+
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(s.requests, 2);
+        assert!(s.cost_micros_exact > 0, "按量那条该有钱");
+        assert_eq!(s.subscription_requests, 1);
+        assert_eq!(s.subscription_tokens, 101_000, "订阅那条的 token 量");
+        // **订阅的不算「没有价格」** —— 那不是「不知道」，是「这笔账不在
+        // 这个维度上」，两者在界面上是两句不同的话
+        assert_eq!(s.unpriced_requests, 0);
+    }
+
+    #[test]
+    fn a_model_with_no_price_is_still_counted_as_unpriced_not_as_subscription() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "中转站自己起的名字"));
+        r.on_event(&routed(1, "per-token"));
+        r.on_event(&finished(1, usage()));
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(s.unpriced_requests, 1);
+        assert_eq!(s.subscription_requests, 0);
     }
 }

@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 3;
+const SCHEMA: i64 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -74,6 +74,8 @@ pub struct RequestRow {
     pub local: bool,
     /// 路由决策与尝试链，JSON。老记录是 None
     pub routing: Option<String>,
+    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
+    pub billing: String,
 }
 
 #[derive(Debug)]
@@ -198,6 +200,16 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN routing TEXT;")?;
         }
+        if from < 4 {
+            // 服务它的那家怎么收钱（§4.3.1）。
+            //
+            // **存在行上，不是事后查配置。**配置随时会被热重载，而一条
+            // 三天前的记录该按它当时那家的计费方式算 —— 否则今天把一家
+            // 改成订阅型，昨天的账就跟着变了。
+            self.conn.execute_batch(
+                "ALTER TABLE requests ADD COLUMN billing TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -208,8 +220,8 @@ impl Db {
             "INSERT OR REPLACE INTO requests
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-              cost_micros, cost_estimated, error, local, routing)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+              cost_micros, cost_estimated, error, local, routing, billing)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 r.id,
                 r.at_ms,
@@ -230,6 +242,7 @@ impl Db {
                 r.error,
                 r.local as i64,
                 r.routing,
+                r.billing,
             ],
         )?;
         Ok(())
@@ -262,17 +275,20 @@ impl Db {
     pub fn summary(&self, since_ms: i64, until_ms: i64) -> Result<Summary, DbError> {
         // **本地应答不算。**成本 0、延迟 0 的东西混进来，会让「平均延迟」
         // 和「请求数」这两个数字都失去意义（§4.8）。
-        let (requests, failed, in_tok, out_tok, cache_r, cache_w, exact, estimated, unpriced): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = self.conn.query_row(
+        #[allow(clippy::type_complexity)]
+        let (
+            requests,
+            failed,
+            in_tok,
+            out_tok,
+            cache_r,
+            cache_w,
+            exact,
+            estimated,
+            unpriced,
+            sub_reqs,
+            sub_tokens,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(error IS NOT NULL), 0),
@@ -282,7 +298,11 @@ impl Db {
                 COALESCE(SUM(cache_write_tokens), 0),
                 COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
-                COALESCE(SUM(cost_micros IS NULL), 0)
+                COALESCE(SUM(cost_micros IS NULL AND billing = 'per-token'), 0),
+                COALESCE(SUM(billing = 'subscription'), 0),
+                COALESCE(SUM(CASE WHEN billing = 'subscription'
+                                  THEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
+                                  ELSE 0 END), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0",
             params![since_ms, until_ms],
@@ -297,6 +317,8 @@ impl Db {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
                 ))
             },
         )?;
@@ -316,6 +338,8 @@ impl Db {
             cost_micros_exact: exact,
             cost_micros_estimated: estimated,
             unpriced_requests: unpriced,
+            subscription_requests: sub_reqs,
+            subscription_tokens: sub_tokens,
         })
     }
 
@@ -440,6 +464,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         error: r.get("error")?,
         local: r.get::<_, i64>("local")? != 0,
         routing: r.get("routing")?,
+        billing: r.get("billing")?,
     })
 }
 
@@ -462,8 +487,13 @@ pub struct Summary {
     /// 有多少条请求**根本没有价格**（模型不在价目表里）。
     ///
     /// 这是成本三态的第三态。把它们当成 0 会让总额悄悄偏低，而用户没有
-    /// 任何线索知道少算了什么（§4.3）。
+    /// 任何线索知道少算了什么（§4.3）。**订阅型的不算在这里** —— 那不是
+    /// 「不知道价格」，是「这笔账不在这个维度上」。
     pub unpriced_requests: i64,
+    /// 走订阅型上游的请求数。**不参与金额合计**（§4.3.1）
+    pub subscription_requests: i64,
+    /// 那些请求用掉的 token。**它才是订阅用户该看的量**
+    pub subscription_tokens: i64,
 }
 
 /// 一次出站密钥发现。
@@ -521,6 +551,7 @@ mod tests {
             error: None,
             local: false,
             routing: None,
+            billing: "per-token".into(),
         }
     }
 

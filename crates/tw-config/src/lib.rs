@@ -121,6 +121,7 @@ impl Default for Provider {
             key: Secret::Literal(String::new()),
             protocol: None,
             models: Vec::new(),
+            billing: None,
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
         }
@@ -355,10 +356,66 @@ pub struct Provider {
     /// 不是全局的「我们对外暴露什么」** —— 那个由汇总推导出来。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// 这家怎么收钱（§4.3.1）。
+    ///
+    /// **不写就自动判**：响应头里报过订阅额度的就是订阅型（§4.3.2）。
+    /// 那个信号一直在我们手上，不该变成一个用户要填的字段（§0.6）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<Billing>,
     #[serde(default = "default_proxy", skip_serializing_if = "is_direct")]
     pub proxy: String,
     #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
     pub on_proxy_fail: OnProxyFail,
+}
+
+/// 上游怎么收钱（§4.3.1）。
+///
+/// **接入订阅型网关之后，「按价目表乘 token 数」这个假设就不成立了** ——
+/// 订阅制的边际成本是零，按 API 价目表算出来的数字是纯虚构的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Billing {
+    /// 按价目表计价。默认
+    #[default]
+    PerToken,
+    /// 订阅制，边际成本为零。
+    ///
+    /// **成本栏显示「订阅」而不是 `$0.00`** —— 后者看起来像一个算出来的
+    /// 结果，会让人误以为这次调用真的免费；「订阅」表达的是「这笔账不在
+    /// 这个维度上」。
+    Subscription,
+    /// 上游价格未知。成本栏标「未知」，**不参与合计**
+    Unknown,
+}
+
+impl Billing {
+    /// 这次调用该不该进金额合计。
+    ///
+    /// **宁可显示「不知道」，也不显示一个编出来的精确数字**（§4.3）。
+    pub fn counts_toward_money(&self) -> bool {
+        matches!(self, Billing::PerToken)
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Billing::PerToken => "按量",
+            Billing::Subscription => "订阅",
+            Billing::Unknown => "未知",
+        }
+    }
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Billing::PerToken => "per-token",
+            Billing::Subscription => "subscription",
+            Billing::Unknown => "unknown",
+        }
+    }
+    pub fn parse(s: &str) -> Billing {
+        match s {
+            "subscription" => Billing::Subscription,
+            "unknown" => Billing::Unknown,
+            _ => Billing::PerToken,
+        }
+    }
 }
 
 /// 和默认值相等吗。用于 `skip_serializing_if`。
@@ -484,6 +541,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
 pub use security::{Mode as SecurityMode, Security};
+// Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;
 

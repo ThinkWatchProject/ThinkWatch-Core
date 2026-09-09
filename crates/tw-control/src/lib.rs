@@ -428,6 +428,8 @@ async fn summary(
         cost_micros_exact: x.cost_micros_exact,
         cost_micros_estimated: x.cost_micros_estimated,
         unpriced_requests: x.unpriced_requests,
+        subscription_requests: x.subscription_requests,
+        subscription_tokens: x.subscription_tokens,
         pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
     }))
 }
@@ -749,6 +751,7 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
             .routing
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
+        billing: r.billing,
     }
 }
 

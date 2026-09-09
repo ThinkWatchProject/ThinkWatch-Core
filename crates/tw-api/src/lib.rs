@@ -78,6 +78,12 @@ pub enum Event {
         /// 试过哪几家、各自什么结果。**一次就成的也有一条** ——
         /// 「只试了一家」和「试了三家」在用户眼里应该是不同的
         attempts: Vec<AttemptView>,
+        /// 最终服务的那家怎么收钱（§4.3.1）。
+        ///
+        /// **必须跟着这次请求走，不能事后查配置** —— 配置随时会被热重载，
+        /// 而一条三天前的记录该按它当时那家的计费方式算。
+        #[serde(default)]
+        billing: String,
     },
     /// 一个请求体里带着看起来像凭据的东西（§5.0 的观察态）。
     ///
@@ -460,6 +466,13 @@ pub struct Summary {
     pub cost_micros_estimated: i64,
     /// 有多少条请求根本没有价格。**不是 0，是「不知道」**
     pub unpriced_requests: i64,
+    /// 走订阅型上游的请求数。**不参与金额合计**（§4.3.1）——
+    /// 订阅制的边际成本是零，按价目表算出来的数字是纯虚构的
+    #[serde(default)]
+    pub subscription_requests: i64,
+    /// 那些请求用掉的 token。**它才是订阅用户该看的量**
+    #[serde(default)]
+    pub subscription_tokens: i64,
     /// 价目表的快照日期。**成本旁边要标它**（§4.3.0）—— 一个两个月前
     /// 的价目表算出来的数字，可信度和昨天的完全不同
     pub pricing_date: String,
@@ -497,6 +510,9 @@ pub struct HistoryRow {
     pub error: Option<String>,
     /// 本地应答的（§4.8）
     pub local: bool,
+    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
+    #[serde(default)]
+    pub billing: String,
     /// 路由决策与尝试链。老记录没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingView>,

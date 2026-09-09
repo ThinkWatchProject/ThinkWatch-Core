@@ -296,6 +296,18 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     assert_eq!(started.id(), finished.id());
 }
 
+/// 下一条路由事件里那家的计费方式。
+async fn next_billing(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> String {
+    for _ in 0..8 {
+        if let Ok(Ok(tw_api::Event::RequestRouted { billing, .. })) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            return billing;
+        }
+    }
+    panic!("没等到路由事件");
+}
+
 /// 下一条**生命周期**事件（开始 / 响应头 / 结束 / 失败）。
 ///
 /// 观测类的事件（路由链、订阅额度、密钥发现、配置变更）会插在它们中间，
@@ -2156,4 +2168,91 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
         }
     }
     panic!("全失败的请求没有发出路由事件");
+}
+
+#[tokio::test]
+async fn an_upstream_that_reports_quota_is_treated_as_subscription_from_then_on() {
+    // §4.3.1 + §4.3.2：**订阅型不该按价目表算钱**，而「它是不是订阅型」
+    // 这个信号一直在响应头里 —— 不该变成一个用户要填的字段（§0.6）。
+    //
+    // 这条同时钉住那个已知边界：**第一个请求会被按量计价**，因为那时
+    // 我们还没见过它的额度头。之后就对了。
+    let up = {
+        let app = Router::new().fallback(axum::routing::any(|| async {
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .header("anthropic-ratelimit-unified-5h-utilization", "40")
+                .body(axum::body::Body::from(r#"{"id":"m"}"#))
+                .unwrap()
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "订阅账号".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    send_to(gw).await;
+    assert_eq!(
+        next_billing(&mut rx).await,
+        "per-token",
+        "第一个请求本来就判不出来 —— 那时还没见过额度头"
+    );
+    send_to(gw).await;
+    assert_eq!(
+        next_billing(&mut rx).await,
+        "subscription",
+        "见过额度头之后还按量算钱 —— 那个金额是编出来的"
+    );
+}
+
+#[tokio::test]
+async fn writing_billing_in_the_config_removes_the_first_request_ambiguity() {
+    // 在乎那一条记录的人，在配置里写一行就没有歧义了。
+    let (up, _) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![Provider {
+            name: "订阅账号".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    );
+    cfg.providers[0].billing = Some(tw_config::Billing::Subscription);
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send_to(gw).await;
+
+    for _ in 0..8 {
+        if let Ok(Ok(tw_api::Event::RequestRouted { billing, .. })) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            assert_eq!(billing, "subscription", "配置里写了却没生效");
+            return;
+        }
+    }
+    panic!("没等到路由事件");
 }
