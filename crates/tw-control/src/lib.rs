@@ -60,7 +60,10 @@ pub fn router(state: ControlState) -> Router {
         .route("/overview", get(overview))
         .route("/probe", post(probe))
         .route("/l1", post(l1))
-        .route("/config", get(get_config).patch(patch_config))
+        .route(
+            "/config",
+            get(get_config).patch(patch_config).put(put_config),
+        )
         .route("/config/history", get(config_history))
         .route("/config/rollback", post(config_rollback))
         .route("/setup", post(setup))
@@ -413,6 +416,23 @@ async fn patch_config(
         .patch(
             &req.ops,
             req.base_version.as_deref(),
+            tw_config::history::Origin::Ui,
+        )
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 整份写回去。**文本模式走这条。**
+async fn put_config(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ConfigWrite>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let version = s
+        .cfg
+        .write(
+            &req.text,
+            Some(&req.base_version),
             tw_config::history::Origin::Ui,
         )
         .await

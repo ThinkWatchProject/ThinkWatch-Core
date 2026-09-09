@@ -305,6 +305,17 @@ pub enum PatchValue {
     Null,
 }
 
+/// 整份文本写回去（文本模式）。
+///
+/// **和 `PATCH` 是两条路，但同一扇门。**表单模式改字段，文本模式改整份
+/// —— 后者是前者的退路（§3.8：结构性的增删一律引导到文本模式），而两者
+/// 都必须带 `base_version`，都会走那三道校验。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigWrite {
+    pub base_version: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigWritten {
     pub version: String,
