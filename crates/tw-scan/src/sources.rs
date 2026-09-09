@@ -91,6 +91,9 @@ pub struct Source {
     pub project: Option<PathBuf>,
 }
 
+/// 我们自己留下的文件名里都有这一段。监听要跳过它们（见 [`crate::watch`]）。
+pub const SIDECAR_MARK: &str = ".thinkwatch.json";
+
 fn f(client: &'static str, kind: Kind, path: PathBuf) -> Source {
     Source {
         client,

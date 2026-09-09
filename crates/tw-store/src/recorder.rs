@@ -352,11 +352,13 @@ impl Recorder {
                     tracing::debug!("发现记不下来：{e}");
                 }
             }
-            // 配置事件和额度事件都不是请求，不落这张表。**额度是按
-            // provider 的当前状态，不是按请求的历史** —— 它的家在别处。
+            // 配置事件、额度事件、扫描告警都不是请求，不落这张表。
+            // **额度是按 provider 的当前状态，不是按请求的历史** ——
+            // 它的家在别处；扫描告警同理，它说的是磁盘上的文件。
             Event::ConfigReloaded { .. }
             | Event::ConfigRejected { .. }
-            | Event::QuotaSeen { .. } => {}
+            | Event::QuotaSeen { .. }
+            | Event::ScanAlert { .. } => {}
         }
     }
 

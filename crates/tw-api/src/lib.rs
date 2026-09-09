@@ -115,6 +115,19 @@ pub enum Event {
         masked: String,
         at_ms: u64,
     },
+    /// 客户端配置面上**新出现**了可疑的东西（§5.3）。
+    ///
+    /// **只报新出现的那些。**「一个用了半年的 skill 突然多了一段零宽
+    /// 字符」这个信号，比「这个文件里有可疑内容」强得多 —— 而后者在
+    /// 用户第一次打开页面时就已经全部看过了。
+    ///
+    /// 字段叫 `alerts` 而不是 `findings`，是为了和「打开页面扫一次」
+    /// 那份完整清单区分开：这里的每一条都值得打断用户一次。
+    ScanAlert {
+        id: u64,
+        alerts: Vec<ScanFinding>,
+        at_ms: u64,
+    },
     /// 上游在响应头里报了订阅额度（§4.3.2）。
     ///
     /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
@@ -225,6 +238,7 @@ impl Event {
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
             | Event::LeakSeen { id, .. }
+            | Event::ScanAlert { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }

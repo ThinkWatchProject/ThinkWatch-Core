@@ -660,6 +660,17 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             gateway_addr: if safe { None } else { Some(addr.to_string()) },
             store,
         };
+        // 盯着客户端配置面（§5.3）。**只报告** —— 这条路径上没有任何
+        // 一处会改用户的文件。盯不住就只是少了「变更时告警」，页面上
+        // 那份「打开时扫一次」照常可用，所以说一句就继续。
+        let _scan_watch = match tw_control::scan::spawn_watcher(control.clone()) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!("盯不住客户端配置面，变更时不会告警：{e}");
+                None
+            }
+        };
+
         let sock = socket.clone();
         // **控制面没了就得退，不能只记一行日志。**
         //
