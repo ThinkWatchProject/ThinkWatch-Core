@@ -1,0 +1,40 @@
+# 每次改动都要过的那几关。
+#
+# **价目表的比对在这里**（DESIGN.md §4.3.0）：内置快照和
+# `crates/tw-pricing/data/verified.yaml` 对不上就构建失败 —— 那是挡住
+# 「打包了错数据」的唯一手段。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 这个项目把警告当错误。**在 CI 上放松这一条，等于把它取消**
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 默认不跑打真实网络的那些（它们标了 #[ignore]）—— CI 上的网络
+      # 抖动会变成一条和代码无关的红，而那种红看几次就没人看了。
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: 构建
+        run: cargo build --release -p twcore
