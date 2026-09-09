@@ -15,6 +15,7 @@ members = [
     "crates/tw-store",
     "crates/tw-pricing",
     "crates/tw-adopt",
+    "crates/tw-scan",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
@@ -55,6 +56,7 @@ tw-yaml     = { path = "crates/tw-yaml" }
 tw-store    = { path = "crates/tw-store" }
 tw-pricing  = { path = "crates/tw-pricing" }
 tw-adopt    = { path = "crates/tw-adopt" }
+tw-scan     = { path = "crates/tw-scan" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
@@ -75,6 +77,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 libc = "0.2"
 # 内置价目表压缩着放（2.3 MB → 110 KB，§4.3.0）
 flate2 = "1"
+# regex-automata / regex-syntax 已经在依赖树里（tracing 的 EnvFilter），
+# 所以加它的增量很小
+regex = "1"
 # 保格式地改 TOML。接管 Codex 要写它的 config.toml，而重新序列化
 # 会把用户的注释和排版一起抹掉（§7.11）
 toml_edit = "0.25"

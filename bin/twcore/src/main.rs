@@ -59,6 +59,15 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
     },
+    /// 扫一遍本机的客户端配置面：hooks、MCP、skill、指令文件。**只读**
+    Scan {
+        /// 额外扫一个项目目录。我们不去全盘找项目，只看你指的
+        #[arg(long)]
+        project: Vec<PathBuf>,
+        /// 连清单一起打印，不只是问题
+        #[arg(long)]
+        inventory: bool,
+    },
     /// 看看这台机器上有哪些 AI 客户端，以及它们指向哪儿
     Clients {
         #[command(subcommand)]
@@ -128,7 +137,80 @@ fn main() -> Result<()> {
         Command::Speed { provider, proxy } => cmd_speed(&path, provider, proxy),
         Command::Config { what } => cmd_config(&path, what),
         Command::Clients { what } => cmd_clients(&path, what),
+        Command::Scan { project, inventory } => cmd_scan(&path, project, inventory),
     }
+}
+
+/// 静态扫描（§5.3）。**只报告，不删任何东西。**
+fn cmd_scan(config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
+    let dir = config.parent().unwrap_or(Path::new("."));
+    let (rules, warn) = tw_scan::rules::load(dir);
+    if let Some(w) = &warn {
+        println!("⚠ {w}");
+    }
+    let mut srcs = tw_scan::sources::user_level(&home());
+    for p in &projects {
+        srcs.extend(tw_scan::sources::in_project(p));
+    }
+    println!("扫了 {} 份文件（规则来自{}）", srcs.len(), rules.origin);
+    let r = tw_scan::report::scan(&srcs, &rules);
+
+    if inventory {
+        let conflicting = tw_scan::report::conflicting(&r.mcp);
+        println!("\nMCP server（{}）：", r.mcp.len());
+        for m in &r.mcp {
+            let mark = if conflicting.contains(&m.name) {
+                " ⚠同名不同配置"
+            } else {
+                ""
+            };
+            let off = if m.enabled { "" } else { "（已关闭）" };
+            let what = match &m.url {
+                Some(u) => format!("远端 {u}"),
+                None => format!("{} {}", m.command, m.args.join(" ")),
+            };
+            println!("  {:<20} {:<14} {what}{off}{mark}", m.name, m.client);
+            if !m.env_keys.is_empty() {
+                println!(
+                    "  {:<20} {:<14} 读环境变量 {}",
+                    "",
+                    "",
+                    m.env_keys.join("、")
+                );
+            }
+        }
+        println!("\nhook（{}）：", r.hooks.len());
+        for h in &r.hooks {
+            println!("  {:<14} {:<14} {}", h.event, h.client, h.command);
+        }
+        println!("\nskill（{}）：", r.skills.len());
+        for s in &r.skills {
+            println!("  {:<20} {}", s.name, s.path.display());
+        }
+    }
+
+    for u in &r.unreadable {
+        println!("⚠ 读不动：{u}");
+    }
+    if r.findings.is_empty() {
+        // §0.6：没风险的时候要说「安全」，而不是什么都不显示
+        println!("\n✓ 没发现问题。");
+        return Ok(());
+    }
+    println!("\n发现 {} 处：", r.findings.len());
+    for f in &r.findings {
+        let mark = match f.level {
+            tw_scan::report::Level::High => "✗ 高危",
+            tw_scan::report::Level::Medium => "? 可疑",
+            tw_scan::report::Level::Low => "· 提示",
+        };
+        println!("{mark}  {}", f.title);
+        println!("       {}:{}", f.path.display(), f.line);
+        println!("       {}", f.excerpt.trim());
+        println!("       {}", f.detail);
+    }
+    println!("\n只报告，不会替你删任何东西 —— 删不删你自己定。");
+    Ok(())
 }
 
 fn home() -> PathBuf {

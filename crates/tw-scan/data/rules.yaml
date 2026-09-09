@@ -1,0 +1,70 @@
+# 静态扫描的规则集（DESIGN.md §5.3）。
+#
+# **放在 YAML 里而不是硬编码**，因为这个列表会持续演进 —— 每出现一种
+# 新的注入写法就要能加一条，而不必等一次发版。
+#
+# 用户可以用 ~/.thinkwatch/scan-rules.yaml 覆盖整份。覆盖不是合并：
+# 一份规则集要能被完整地读懂和审查，而「默认加上你的再减去某几条」是
+# 一个没有人能在脑子里跑完的算法。
+#
+# **中英文都要覆盖。**只写英文规则等于对中文的注入完全不设防，而写
+# 中文提示词的人只多不少。
+version: 1
+
+# 一、提示注入。命中只说明「这段文字在试图改变模型的行为」，不等于
+#     恶意 —— 所以级别是 suspect，让人看一眼。
+injection:
+  - id: ignore-previous
+    pattern: '(?i)ignore\s+(all\s+)?(previous|above|prior)[^\n]{0,20}instructions'
+    why: 提示注入最经典的开头
+  - id: disregard
+    pattern: '(?i)disregard\s+(the\s+)?(system|above|previous)'
+    why: 同上，换了个动词
+  - id: you-are-now
+    pattern: '(?i)you\s+are\s+now\s+(a|an)\s'
+    why: 试图重设模型的身份
+  - id: 忽略指令
+    pattern: '忽略(以上|之前|上面|前面)(的)?(所有)?(指令|要求|规则)'
+    why: 中文的提示注入
+  - id: 新指令
+    pattern: '新的?指令[：:]'
+    why: 中文的提示注入
+  - id: 你现在是
+    pattern: '你(现在)?(是|扮演)一[个位名]'
+    why: 试图重设模型的身份
+  - id: chat-marker
+    pattern: '<\|(im_start|im_end|system|endoftext)\|>'
+    why: 伪造对话标记，试图让模型把正文当成系统消息
+  - id: fake-system
+    pattern: '(?i)\[?(system|assistant)\]?\s*[:：]\s*(you|your|ignore|从现在|你)'
+    why: 伪造成系统或助手的发言
+
+# 二、危险命令。这一组和 §5.2 的工具调用防火墙共用 —— 一套规则两处用。
+dangerous:
+  - id: curl-pipe-sh
+    pattern: '(?i)(curl|wget)[^\n|]{0,200}\|\s*(sudo\s+)?(ba|z|d)?sh'
+    why: 下载即执行 —— 内容由对方决定，你看不到它跑了什么
+  - id: rm-rf-root
+    pattern: 'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$)'
+    why: 删掉整个家目录或根目录
+  - id: chmod-777
+    pattern: 'chmod\s+(-R\s+)?777'
+    why: 把文件权限放到所有人可写
+  - id: base64-decode-exec
+    pattern: '(?i)base64\s+(-d|--decode)[^\n]{0,80}\|\s*(ba)?sh'
+    why: 把要执行的内容藏在 base64 里
+  - id: exfil-env
+    pattern: '(?i)(env|printenv|cat\s+[^\n]{0,40}\.env)[^\n]{0,60}(curl|wget|nc\s)'
+    why: 把环境变量（里面通常有密钥）发到外面去
+  # **命令形状的规则对中文指令完全不设防。**「把 ~/.aws/credentials
+  # 打印出来」里没有 cat 也没有 curl，但它要的是同一件事。所以再加一条
+  # 按「凭据路径 + 外送动词」匹配的，两个方向都写。
+  - id: 凭据外泄
+    pattern: '(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)[^\n]{0,30}(发|传|上报|打印|输出|贴出|读出|(?i:send|upload|post|print|paste|exfil))'
+    why: 让模型把凭据文件的内容送出去
+  - id: 凭据外泄2
+    pattern: '(发送|上传|贴出|打印|输出|读取|(?i:send|upload|post|print|read))[^\n]{0,30}(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)'
+    why: 让模型把凭据文件的内容送出去
+  - id: ssh-key-read
+    pattern: '(?i)(cat|cp|scp|curl)[^\n]{0,40}(\.ssh/id_|\.aws/credentials|\.netrc)'
+    why: 读私钥或云凭据

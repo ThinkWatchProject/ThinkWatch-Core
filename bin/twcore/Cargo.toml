@@ -20,6 +20,7 @@ tw-secret = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tw-adopt = { workspace = true }
+tw-scan = { workspace = true }
 libc = "0.2"
 serde_yaml_ng = { workspace = true }
 tokio = { workspace = true }
