@@ -272,6 +272,32 @@ impl Prices {
     }
 }
 
+impl Prices {
+    /// 缓存读省下了多少钱。
+    ///
+    /// **算的是「如果这些 token 没命中缓存，要多花多少」** —— 而不是
+    /// 「缓存读花了多少」。用户想知道的是那个差额：cache read 是 0.1 倍
+    /// 单价，所以省下的是 0.9 倍（§4.4）。
+    ///
+    /// 没有价格、或者这家不按 token 计费时是 `None`。**不是 0** ——
+    /// 「省了 0 元」和「算不出来省了多少」是两句不同的话。
+    pub fn cache_saving(&self, model: &str, u: &Usage) -> Option<Micros> {
+        if u.cache_read == 0 {
+            return Some(0);
+        }
+        let p = self.get(model)?;
+        // 缓存读没单独定价的话，它本来就按输入价算 —— 那时没有节省
+        let read_rate = p.cache_read?;
+        let long = u.input + u.cache_read > 200_000;
+        let full_rate = if long {
+            p.input_above_200k.unwrap_or(p.input)
+        } else {
+            p.input
+        };
+        Some(to_micros(u.cache_read as f64 * (full_rate - read_rate)))
+    }
+}
+
 fn decompress(gz: &[u8]) -> Result<Vec<u8>, PricingError> {
     use std::io::Read;
     let mut d = flate2::read::GzDecoder::new(gz);
@@ -820,6 +846,74 @@ mod verified_tests {
             v.checked_on.chars().all(|c| c.is_ascii_digit() || c == '-'),
             "{}",
             v.checked_on
+        );
+    }
+}
+
+#[cfg(test)]
+mod saving_tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_hit_saves_the_difference_not_the_whole_price() {
+        // **用户想知道的是那个差额**：cache read 是 0.1 倍单价，所以省下
+        // 的是 0.9 倍，不是全部（§4.4）。
+        let p = Prices::builtin().unwrap();
+        let u = Usage {
+            cache_read: 100_000,
+            ..Default::default()
+        };
+        let saved = p.cache_saving("claude-sonnet-4-5", &u).unwrap();
+        // Sonnet 4.5：输入 $3、缓存读 $0.30 → 十万 token 省 $0.27
+        assert_eq!(saved, 270_000);
+    }
+
+    #[test]
+    fn no_cache_reads_means_nothing_saved_which_is_a_real_zero() {
+        let p = Prices::builtin().unwrap();
+        assert_eq!(
+            p.cache_saving("claude-sonnet-4-5", &Usage::default()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn an_unpriced_model_cannot_say_how_much_was_saved() {
+        // **「省了 0 元」和「算不出来省了多少」是两句不同的话**（§4.3）。
+        let p = Prices::builtin().unwrap();
+        let u = Usage {
+            cache_read: 1000,
+            ..Default::default()
+        };
+        assert_eq!(p.cache_saving("某个中转站的模型", &u), None);
+    }
+
+    #[test]
+    fn a_long_context_cache_hit_saves_more_because_the_full_rate_is_higher() {
+        // 超过 200k 之后输入单价翻倍，那时缓存命中省下的也更多。
+        let p = Prices::builtin().unwrap();
+        let short = p
+            .cache_saving(
+                "claude-sonnet-4-5",
+                &Usage {
+                    cache_read: 100_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let long = p
+            .cache_saving(
+                "claude-sonnet-4-5",
+                &Usage {
+                    input: 150_000,
+                    cache_read: 100_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            long > short,
+            "长上下文的缓存命中省得更多：{short} vs {long}"
         );
     }
 }

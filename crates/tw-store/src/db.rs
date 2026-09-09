@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 4;
+const SCHEMA: i64 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -76,6 +76,8 @@ pub struct RequestRow {
     pub routing: Option<String>,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
     pub billing: String,
+    /// 缓存命中省下了多少微分。`None` = 算不出来（§4.4）
+    pub cache_saved_micros: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -210,6 +212,15 @@ impl Db {
                 "ALTER TABLE requests ADD COLUMN billing TEXT NOT NULL DEFAULT '';",
             )?;
         }
+        if from < 5 {
+            // 缓存命中省下了多少（§4.4）。
+            //
+            // **在记录的时候算，不在查询的时候算。**查询时算意味着要把
+            // 价目表带进 SQL，而价目表会变 —— 那样「上周省了多少」会
+            // 随着一次价格更新悄悄改变。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN cache_saved_micros INTEGER;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -220,8 +231,8 @@ impl Db {
             "INSERT OR REPLACE INTO requests
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-              cost_micros, cost_estimated, error, local, routing, billing)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+              cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 r.id,
                 r.at_ms,
@@ -243,6 +254,7 @@ impl Db {
                 r.local as i64,
                 r.routing,
                 r.billing,
+                r.cache_saved_micros,
             ],
         )?;
         Ok(())
@@ -288,7 +300,8 @@ impl Db {
             unpriced,
             sub_reqs,
             sub_tokens,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
+            cache_saved,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(error IS NOT NULL), 0),
@@ -302,7 +315,8 @@ impl Db {
                 COALESCE(SUM(billing = 'subscription'), 0),
                 COALESCE(SUM(CASE WHEN billing = 'subscription'
                                   THEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
-                                  ELSE 0 END), 0)
+                                  ELSE 0 END), 0),
+                COALESCE(SUM(cache_saved_micros), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0",
             params![since_ms, until_ms],
@@ -319,6 +333,7 @@ impl Db {
                     r.get(8)?,
                     r.get(9)?,
                     r.get(10)?,
+                    r.get(11)?,
                 ))
             },
         )?;
@@ -340,6 +355,7 @@ impl Db {
             unpriced_requests: unpriced,
             subscription_requests: sub_reqs,
             subscription_tokens: sub_tokens,
+            cache_saved_micros: cache_saved,
         })
     }
 
@@ -413,6 +429,41 @@ impl Db {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// 按上游分的延迟分位数。
+    ///
+    /// **和按模型分是两个问题。**「哪个模型慢」和「哪家上游慢」的下一步
+    /// 完全不同：前者换模型，后者换上游。合成一张表的话两个问题都答不好
+    /// （M3 验收里问的是后者）。
+    pub fn latency_by_provider(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<Latency>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT provider, ttfb_ms FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttfb_ms IS NOT NULL
+               AND provider <> ''
+             ORDER BY provider, ttfb_ms",
+        )?;
+        let rows = st.query_map(params![since_ms, until_ms], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut by: std::collections::BTreeMap<String, Vec<i64>> = Default::default();
+        for row in rows {
+            let (m, t) = row?;
+            by.entry(m).or_default().push(t);
+        }
+        Ok(by
+            .into_iter()
+            .map(|(model, xs)| Latency {
+                p50: percentile(&xs, 50),
+                p95: percentile(&xs, 95),
+                samples: xs.len(),
+                model,
+            })
+            .collect())
+    }
+
     /// 删掉太老的 metadata。返回删了几条。
     pub fn prune_before(&self, cutoff_ms: i64) -> Result<usize, DbError> {
         // 发现记录跟着请求一起过期 —— 留着一条指向不存在的请求的发现，
@@ -465,6 +516,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         local: r.get::<_, i64>("local")? != 0,
         routing: r.get("routing")?,
         billing: r.get("billing")?,
+        cache_saved_micros: r.get("cache_saved_micros")?,
     })
 }
 
@@ -494,6 +546,8 @@ pub struct Summary {
     pub subscription_requests: i64,
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
     pub subscription_tokens: i64,
+    /// 缓存命中一共省下了多少微分（§4.4）
+    pub cache_saved_micros: i64,
 }
 
 /// 一次出站密钥发现。
@@ -552,6 +606,7 @@ mod tests {
             local: false,
             routing: None,
             billing: "per-token".into(),
+            cache_saved_micros: None,
         }
     }
 

@@ -473,6 +473,12 @@ pub struct Summary {
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
     #[serde(default)]
     pub subscription_tokens: i64,
+    /// 缓存命中一共省下了多少微分（§4.4）。
+    ///
+    /// **算的是差额，不是「缓存读花了多少」** —— 用户想知道的是「如果
+    /// 没命中要多花多少」
+    #[serde(default)]
+    pub cache_saved_micros: i64,
     /// 价目表的快照日期。**成本旁边要标它**（§4.3.0）—— 一个两个月前
     /// 的价目表算出来的数字，可信度和昨天的完全不同
     pub pricing_date: String,
@@ -513,6 +519,9 @@ pub struct HistoryRow {
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
     #[serde(default)]
     pub billing: String,
+    /// 缓存命中省下了多少微分。`None` = 算不出来（§4.4）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_saved_micros: Option<i64>,
     /// 路由决策与尝试链。老记录没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingView>,

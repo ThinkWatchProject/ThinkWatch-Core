@@ -72,6 +72,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/summary", get(summary))
         .route("/history", get(history))
         .route("/latency", get(latency))
+        .route("/latency/provider", get(latency_by_provider))
         .route("/storage", get(storage))
         .route("/quota", get(quota))
         .route("/leaks", get(leaks))
@@ -430,6 +431,7 @@ async fn summary(
         unpriced_requests: x.unpriced_requests,
         subscription_requests: x.subscription_requests,
         subscription_tokens: x.subscription_tokens,
+        cache_saved_micros: x.cache_saved_micros,
         pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
     }))
 }
@@ -696,6 +698,32 @@ async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>
     Json(out)
 }
 
+/// 按上游分的延迟。**「哪家 TTFT 最差」问的是这个。**
+///
+/// 和按模型分是两个问题：前者的下一步是换上游，后者是换模型。
+async fn latency_by_provider(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<Window>,
+) -> Result<Json<Vec<tw_api::LatencyView>>, Fail> {
+    let (from, to) = q.range();
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let xs = g
+        .db()
+        .latency_by_provider(from, to)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(
+        xs.into_iter()
+            .map(|l| tw_api::LatencyView {
+                model: l.model,
+                p50: l.p50,
+                p95: l.p95,
+                samples: l.samples,
+            })
+            .collect(),
+    ))
+}
+
 async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     let Some(store) = &s.store else {
         return Json(tw_api::StorageStatus {
@@ -752,6 +780,7 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
         billing: r.billing,
+        cache_saved_micros: r.cache_saved_micros,
     }
 }
 

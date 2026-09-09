@@ -188,6 +188,14 @@ impl Recorder {
                     // 三种都是「这笔账不在这个维度上」
                     Some(Cost::Unpriced { .. }) | None => (None, false),
                 };
+                // 缓存命中省下了多少（§4.4）。**在这里算，不在查询时算**
+                // —— 查询时算意味着要把价目表带进 SQL，而价目表会变，
+                // 那样「上周省了多少」会随着一次价格更新悄悄改变。
+                let cache_saved_micros = if counts_toward_money {
+                    u.and_then(|u| self.prices.cache_saving(&p.model, &u))
+                } else {
+                    None
+                };
                 self.write(RequestRow {
                     id: *id as i64,
                     at_ms: p.at_ms,
@@ -209,6 +217,7 @@ impl Recorder {
                     local: false,
                     routing: p.routing,
                     billing: p.billing,
+                    cache_saved_micros,
                 });
             }
             Event::RequestFailed { id, message, .. } => {
@@ -238,6 +247,7 @@ impl Recorder {
                     local: false,
                     routing: p.routing,
                     billing: p.billing,
+                    cache_saved_micros: None,
                 });
             }
             Event::LocallyAnswered {
@@ -270,6 +280,7 @@ impl Recorder {
                     // 本地应答没走路由 —— 它根本没到上游
                     routing: None,
                     billing: String::new(),
+                    cache_saved_micros: None,
                 });
             }
             Event::LeakSeen {
@@ -657,5 +668,86 @@ mod billing_tests {
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.unpriced_requests, 1);
         assert_eq!(s.subscription_requests, 0);
+    }
+}
+
+#[cfg(test)]
+mod cache_saving_tests {
+    use super::tests::{finished, rec, started};
+    use tw_api::UsageView;
+
+    #[test]
+    fn a_cache_hit_records_how_much_it_saved() {
+        // §4.4：Dashboard 上要有独立的「缓存节省了多少钱」。而算的是
+        // **差额** —— 「如果这些 token 没命中缓存，要多花多少」。
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                input: 1000,
+                output: 100,
+                cache_read: 100_000,
+                ..Default::default()
+            }),
+        ));
+        let row = r.db().get(1).unwrap().unwrap();
+        // Sonnet 4.5：输入 $3、缓存读 $0.30 → 十万 token 省 $0.27
+        assert_eq!(row.cache_saved_micros, Some(270_000));
+        assert_eq!(
+            r.db().summary(0, i64::MAX).unwrap().cache_saved_micros,
+            270_000
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_cache_hit_saved_a_real_zero() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                input: 1000,
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(r.db().get(1).unwrap().unwrap().cache_saved_micros, Some(0));
+    }
+
+    #[test]
+    fn an_unpriced_model_cannot_say_how_much_the_cache_saved() {
+        // **「省了 0 元」和「算不出来省了多少」是两句不同的话**（§4.3）。
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "中转站自己起的名字"));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                cache_read: 100_000,
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(r.db().get(1).unwrap().unwrap().cache_saved_micros, None);
+    }
+
+    #[test]
+    fn latency_by_provider_answers_a_different_question_than_by_model() {
+        // 「哪个模型慢」和「哪家上游慢」的下一步完全不同：前者换模型，
+        // 后者换上游（M3 验收问的是后者）。
+        let (_d, mut r) = rec();
+        for (id, model) in [(1u64, "claude-opus-4-1"), (2, "claude-haiku-4-5")] {
+            r.on_event(&started(id, model));
+            r.on_event(&tw_api::Event::RequestHeaders {
+                id,
+                status: 200,
+                ttfb_ms: if id == 1 { 3000 } else { 300 },
+            });
+            r.on_event(&finished(id, None));
+        }
+        let by_model = r.db().latency_by_model(0, i64::MAX).unwrap();
+        assert_eq!(by_model.len(), 2, "两个模型该分开");
+        let by_provider = r.db().latency_by_provider(0, i64::MAX).unwrap();
+        assert_eq!(by_provider.len(), 1, "同一家上游该合成一行");
+        assert_eq!(by_provider[0].model, "官方");
+        assert_eq!(by_provider[0].samples, 2);
     }
 }
