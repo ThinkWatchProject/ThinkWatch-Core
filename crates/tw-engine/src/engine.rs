@@ -37,7 +37,14 @@ impl GroupType {
     }
 }
 
+/// 一组上游，以及从里面挑一个的策略。
+///
+/// **`deny_unknown_fields`** —— 这个字段在 Rust 里叫 `kind`，在 YAML 里
+/// 叫 `type`，所以「顺手写成 `kind:`」几乎是必然会发生的。没有这一行的
+/// 时候它会被静默丢掉，用户得到一个 fallback 组，然后困惑于「我明明配了
+/// 负载均衡」。这个项目已经栽过一次同样的（`listen: { addr: ... }`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Group {
     pub name: String,
     #[serde(default, rename = "type")]
@@ -101,6 +108,7 @@ impl SetAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     /// **每条规则有名字**。日志里、UI 里、试算结果里都能引用它 ——
     /// 「命中第 4 条」远不如「命中『带缓存的必须走官方』」有用。
@@ -808,5 +816,25 @@ mod tests {
         let mut f = facts("x");
         f.cache = true;
         assert_eq!(decision(&e, &f).matched_rule, "带缓存的必须走官方");
+    }
+
+    #[test]
+    fn writing_kind_instead_of_type_is_an_error_not_a_silent_downgrade() {
+        // 字段在 Rust 里叫 `kind`，在 YAML 里叫 `type` —— 顺手写成
+        // `kind:` 几乎必然发生。静默丢掉的话，用户得到的是一个 fallback
+        // 组，然后困惑于「我明明配了负载均衡」。
+        let e = serde_yaml_ng::from_str::<Group>("name: g\nkind: load-balance\nproviders: [a]\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("kind"), "{e}");
+        // 写对的那个照常认得
+        let g: Group =
+            serde_yaml_ng::from_str("name: g\ntype: load-balance\nproviders: [a]\n").unwrap();
+        assert_eq!(g.kind, GroupType::LoadBalance);
+    }
+
+    #[test]
+    fn a_typo_in_a_route_field_is_an_error_too() {
+        let e = serde_yaml_ng::from_str::<Route>("name: r\nton: 官方\n").unwrap_err();
+        assert!(e.to_string().contains("ton"), "{e}");
     }
 }

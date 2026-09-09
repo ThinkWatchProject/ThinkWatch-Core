@@ -666,6 +666,82 @@ pub struct SetupResponse {
     pub config_path: String,
 }
 
+// ---------------------------------------------------------------- 路由试算
+
+/// 「如果现在来这样一个请求，会走到哪儿」。
+///
+/// **每个字段都对应规则里能写的一个条件**（§3.4）。默认值就是一个最
+/// 普通的请求 —— 用户只需要改他关心的那一两个。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunRequest {
+    pub model: String,
+    /// 哪个客户端发的。空 = 用 config.yaml 里的第一个
+    #[serde(default)]
+    pub client: String,
+    #[serde(default = "default_dialect")]
+    pub dialect: String,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    /// 带了 `cache_control`。**把它路由到不支持缓存的中转站，等于把最大
+    /// 的省钱手段直接扔掉，而且不会察觉**（§3.4）
+    #[serde(default)]
+    pub cache: bool,
+    #[serde(default)]
+    pub tools: bool,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default)]
+    pub image: bool,
+    #[serde(default)]
+    pub thinking: bool,
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    /// 客户端自己发的辅助请求（§4.8）。空 = 真实的用户请求
+    #[serde(default)]
+    pub intent: String,
+}
+
+fn default_dialect() -> String {
+    "anthropic".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+/// 一条规则在这次试算里的下场。**没命中的也要列出来，并说清为什么** ——
+/// 「为什么没走我以为的那条」和「走了哪条」是同一个问题的两面（§3.4）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleTrace {
+    pub name: String,
+    /// `matched` | `skipped` | `phase_two`
+    pub verdict: String,
+    /// 没命中时，是哪个条件没对上
+    pub why: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunResult {
+    /// `route` | `deny` | `no_match`
+    pub outcome: String,
+    /// 命中的规则名
+    pub rule: Option<String>,
+    /// 拒绝的理由（`deny` 时）
+    pub reason: Option<String>,
+    /// 候选链，第一个是首选，后面是故障转移的备选
+    pub candidates: Vec<String>,
+    /// 经过了哪个组
+    pub via_group: Option<String>,
+    /// 累积起来的参数改写，人话形式
+    pub set: Vec<String>,
+    pub trace: Vec<RuleTrace>,
+    /// 这条路会不会伤到 prompt cache。**要直说 —— 它决定账单**（§3.4）
+    pub hurts_cache: bool,
+    /// 候选链里此刻熔断着的那些。**试算是静态的，但熔断是当下的事实**
+    pub circuit_open: Vec<String>,
+}
+
 // ---------------------------------------------------------- 客户端接管
 //
 // **注意 `DetectedClient` 和上面的 `ClientView` 是两个东西**：那个是
