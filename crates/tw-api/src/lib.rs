@@ -63,6 +63,22 @@ pub enum Event {
         source: String,
         message: String,
     },
+    /// 路由决定完了，尝试链也走完了（§4.2）。
+    ///
+    /// **单独一个事件，因为成功和失败两条路都要发它。**挂在
+    /// `RequestFinished` 上的话，失败的那条路就没有尝试链 —— 而那恰恰
+    /// 是最需要看它的时候。
+    RequestRouted {
+        id: u64,
+        /// 命中了哪条规则。**日志和界面都要显示它** —— 「命中第 4 条」
+        /// 远不如「命中『带缓存的必须走官方』」有用（§3.4）
+        rule: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        /// 试过哪几家、各自什么结果。**一次就成的也有一条** ——
+        /// 「只试了一家」和「试了三家」在用户眼里应该是不同的
+        attempts: Vec<AttemptView>,
+    },
     /// 一个请求体里带着看起来像凭据的东西（§5.0 的观察态）。
     ///
     /// **只记录，不改变任何行为。**换成占位符是「拦截」态的事，而那要
@@ -130,6 +146,26 @@ pub enum Event {
     },
 }
 
+/// 尝试链里的一跳。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptView {
+    pub provider: String,
+    /// 「成功」「429 限流」「连不上上游」这类人话。**失败的原因要留着**
+    /// —— 一条说「试过 A → B → C」的链，和一条还说清每一跳为什么失败的
+    /// 链，排查价值差得远（§4.2）
+    pub outcome: String,
+    pub ms: u64,
+}
+
+/// 一次请求的路由决策。**详情抽屉的 Routing 那一页吃它。**
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutingView {
+    pub rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub attempts: Vec<AttemptView>,
+}
+
 /// 一个订阅额度窗口。**每个字段都直接来自上游的响应头。**
 ///
 /// 我们自己推断的东西不放进这个结构 —— 界面上必须能区分「上游说的」和
@@ -167,7 +203,8 @@ impl Event {
             | Event::ConfigReloaded { id, .. }
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
-            | Event::LeakSeen { id, .. } => *id,
+            | Event::LeakSeen { id, .. }
+            | Event::RequestRouted { id, .. } => *id,
         }
     }
 }
@@ -460,6 +497,9 @@ pub struct HistoryRow {
     pub error: Option<String>,
     /// 本地应答的（§4.8）
     pub local: bool,
+    /// 路由决策与尝试链。老记录没有它
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingView>,
 }
 
 /// 一条请求的全部细节。**详情抽屉吃这个。**

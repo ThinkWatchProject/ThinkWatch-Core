@@ -743,6 +743,12 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
         cost_estimated: r.cost_estimated,
         error: r.error,
         local: r.local,
+        // 解不开就当没有。**一条坏掉的路由记录不该让整条请求记录读不出来**
+        // —— 那是详情页上的一栏，不是这一行存在的理由。
+        routing: r
+            .routing
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok()),
     }
 }
 

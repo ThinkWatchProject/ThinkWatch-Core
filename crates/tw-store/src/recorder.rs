@@ -25,6 +25,8 @@ struct Partial {
     path: String,
     status: Option<u16>,
     ttfb_ms: Option<i64>,
+    /// 路由决策，JSON。**在结束事件之前到达** —— 尝试链走完才发它
+    routing: Option<String>,
 }
 
 /// 在飞的请求最多攒多少条。
@@ -114,8 +116,24 @@ impl Recorder {
                         path: path.clone(),
                         status: None,
                         ttfb_ms: None,
+                        routing: None,
                     },
                 );
+            }
+            Event::RequestRouted {
+                id,
+                rule,
+                group,
+                attempts,
+            } => {
+                if let Some(p) = self.inflight.get_mut(id) {
+                    p.routing = serde_json::to_string(&tw_api::RoutingView {
+                        rule: rule.clone(),
+                        group: group.clone(),
+                        attempts: attempts.clone(),
+                    })
+                    .ok();
+                }
             }
             Event::RequestHeaders {
                 id,
@@ -173,6 +191,7 @@ impl Recorder {
                     cost_estimated: estimated,
                     error: None,
                     local: false,
+                    routing: p.routing,
                 });
             }
             Event::RequestFailed { id, message, .. } => {
@@ -200,6 +219,7 @@ impl Recorder {
                     cost_estimated: false,
                     error: Some(message.clone()),
                     local: false,
+                    routing: p.routing,
                 });
             }
             Event::LocallyAnswered {
@@ -229,6 +249,8 @@ impl Recorder {
                     cost_estimated: false,
                     error: None,
                     local: true,
+                    // 本地应答没走路由 —— 它根本没到上游
+                    routing: None,
                 });
             }
             Event::LeakSeen {

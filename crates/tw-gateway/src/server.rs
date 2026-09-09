@@ -655,6 +655,11 @@ async fn pipeline(
     // 来源**。一个静默切换过的请求和一个一次就成的请求，在用户眼里
     // 应该是不同的。
     let mut attempts: Vec<String> = Vec::new();
+    // 每一跳的结果和耗时。**失败的原因要留着** —— 一条说「试过 A → B →
+    // C」的链，和一条还说清每一跳为什么失败的链，排查价值差得远。
+    let mut chain: Vec<tw_api::AttemptView> = Vec::new();
+    #[allow(unused_assignments)]
+    let mut hop_started = std::time::Instant::now();
     let mut last_err: Option<GatewayError> = None;
     let mut upstream = None;
     let mut used: Option<&tw_config::Provider> = None;
@@ -669,6 +674,7 @@ async fn pipeline(
             continue;
         };
         attempts.push(provider.name.clone());
+        hop_started = std::time::Instant::now();
 
         // 阶段二：知道走哪家了，再跑一遍含 `provider_would_be` 的规则。
         //
@@ -694,6 +700,7 @@ async fn pipeline(
                 // 密钥取不到是这一家的问题（可能是 exec 命令挂了），
                 // 换下一家是合理的。
                 state.health.record_failure(&provider.name);
+                chain.push(hop(&provider.name, format!("密钥取不到：{e}"), hop_started));
                 last_err = Some(GatewayError::config(format!(
                     "provider `{}` 的密钥取不到：{e}",
                     provider.name
@@ -725,6 +732,7 @@ async fn pipeline(
                 // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
                 // 也一样被拒，还会白白污染那家的健康度。
                 state.health.record_failure(&provider.name);
+                chain.push(hop(&provider.name, format!("{}", r.status()), hop_started));
                 // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
                 // 坏了」而不是「该退避了」，而它们该做的事完全不同
                 // （§4.6.1）。
@@ -737,17 +745,29 @@ async fn pipeline(
             }
             Ok(r) => {
                 state.health.record_success(&provider.name);
+                chain.push(hop(&provider.name, "成功".to_string(), hop_started));
                 upstream = Some(r);
                 used = Some(provider);
                 break;
             }
             Err(e) => {
                 state.health.record_failure(&provider.name);
-                last_err = Some(forward::map_reqwest_error(e));
+                let err = forward::map_reqwest_error(e);
+                chain.push(hop(&provider.name, err.message.clone(), hop_started));
+                last_err = Some(err);
                 continue;
             }
         }
     }
+
+    // 尝试链走完了，两条路都要发 —— 挂在 RequestFinished 上的话，
+    // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
+    state.bus.emit(tw_api::Event::RequestRouted {
+        id,
+        rule: decision.matched_rule.clone(),
+        group: decision.via_group.clone(),
+        attempts: chain,
+    });
 
     let (Some(upstream), Some(provider)) = (upstream, used) else {
         let mut err = last_err.unwrap_or_else(|| GatewayError::config("没有可用的上游"));
@@ -1038,6 +1058,14 @@ async fn serve_once(
     )
     .with_graceful_shutdown(until)
     .await
+}
+
+fn hop(provider: &str, outcome: String, started: std::time::Instant) -> tw_api::AttemptView {
+    tw_api::AttemptView {
+        provider: provider.to_string(),
+        outcome,
+        ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 fn now_ms() -> u64 {

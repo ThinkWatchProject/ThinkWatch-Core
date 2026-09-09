@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 2;
+const SCHEMA: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -72,6 +72,8 @@ pub struct RequestRow {
     pub error: Option<String>,
     /// 客户端的辅助请求被本地应答了（§4.8）。**不进成本和延迟统计**
     pub local: bool,
+    /// 路由决策与尝试链，JSON。老记录是 None
+    pub routing: Option<String>,
 }
 
 #[derive(Debug)]
@@ -188,6 +190,14 @@ impl Db {
                  CREATE INDEX leaks_at ON leaks (at_ms DESC);",
             )?;
         }
+        if from < 3 {
+            // 路由决策与尝试链（§4.2）。
+            //
+            // **一列 JSON，不是一张表。**它是一条请求的固有事实，永远
+            // 跟着那一行一起取，从来不跨行查 —— 拆出去只会多一次 join。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN routing TEXT;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -198,8 +208,8 @@ impl Db {
             "INSERT OR REPLACE INTO requests
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-              cost_micros, cost_estimated, error, local)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+              cost_micros, cost_estimated, error, local, routing)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 r.id,
                 r.at_ms,
@@ -219,6 +229,7 @@ impl Db {
                 r.cost_estimated as i64,
                 r.error,
                 r.local as i64,
+                r.routing,
             ],
         )?;
         Ok(())
@@ -428,6 +439,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         cost_estimated: r.get::<_, i64>("cost_estimated")? != 0,
         error: r.get("error")?,
         local: r.get::<_, i64>("local")? != 0,
+        routing: r.get("routing")?,
     })
 }
 
@@ -508,6 +520,7 @@ mod tests {
             cost_estimated: false,
             error: None,
             local: false,
+            routing: None,
         }
     }
 

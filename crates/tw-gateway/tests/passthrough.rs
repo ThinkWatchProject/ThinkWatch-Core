@@ -272,29 +272,17 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("message_stop"));
 
-    let started = rx.recv().await.unwrap();
+    let started = next_lifecycle(&mut rx).await;
     assert!(
         matches!(started, tw_api::Event::RequestStarted { ref client, .. } if client == "claude-code")
     );
-    let headers = rx.recv().await.unwrap();
+    let headers = next_lifecycle(&mut rx).await;
     // 断言写成 match 而不是 matches!，这样失败时能看见实际收到了什么。
     match headers {
         tw_api::Event::RequestHeaders { status: 200, .. } => {}
         ref other => panic!("第二条该是 RequestHeaders(200)，实际 {other:?}"),
     }
-    // 这个假上游的响应头里带着订阅额度（§4.3.2），所以中间会多一条 ——
-    // **那是白捡的，不是这条测试的目标**，跳过它继续往下看生命周期。
-    let mut quota_seen = false;
-    let finished = loop {
-        match rx.recv().await.unwrap() {
-            tw_api::Event::QuotaSeen { windows, .. } => {
-                quota_seen = true;
-                assert_eq!(windows[0].used_percent, 62.0, "0.62 该读成 62%");
-            }
-            other => break other,
-        }
-    };
-    assert!(quota_seen, "响应头里有额度，却没有发出事件");
+    let finished = next_lifecycle(&mut rx).await;
     match finished {
         tw_api::Event::RequestFinished { status, bytes, .. } => {
             assert_eq!(status, 200);
@@ -306,6 +294,29 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     // 四个事件共用同一个 id
     assert_eq!(started.id(), headers.id());
     assert_eq!(started.id(), finished.id());
+}
+
+/// 下一条**生命周期**事件（开始 / 响应头 / 结束 / 失败）。
+///
+/// 观测类的事件（路由链、订阅额度、密钥发现、配置变更）会插在它们中间，
+/// 而且**以后还会更多** —— 每加一个就去改一遍这些测试是错的做法：那些
+/// 测试断言的是「四个生命周期事件按序到达」，不是「总线上只有它们」。
+async fn next_lifecycle(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> tw_api::Event {
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("5 秒内没等到事件")
+            .expect("事件流断了");
+        if matches!(
+            ev,
+            tw_api::Event::RequestStarted { .. }
+                | tw_api::Event::RequestHeaders { .. }
+                | tw_api::Event::RequestFinished { .. }
+                | tw_api::Event::RequestFailed { .. }
+        ) {
+            return ev;
+        }
+    }
 }
 
 /// 每一步都套一个超时。**卡住的测试比失败的测试更糟** —— CI 只会报一个
@@ -361,14 +372,8 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     // 502 而不是 500 —— 说清楚是上游那边，不是我们
     assert_eq!(resp.status(), 502);
 
-    async fn next(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> tw_api::Event {
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("没等到事件")
-            .unwrap()
-    }
-    let _started = next(&mut rx).await;
-    match next(&mut rx).await {
+    let _started = next_lifecycle(&mut rx).await;
+    match next_lifecycle(&mut rx).await {
         tw_api::Event::RequestFailed {
             source, message, ..
         } => {
@@ -1996,4 +2001,159 @@ async fn turning_the_detector_off_stops_it_looking_at_all() {
             _ => break,
         }
     }
+}
+
+#[tokio::test]
+async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
+    // **一条说「试过 A → B → C」的链，和一条还说清每一跳为什么失败的
+    // 链，排查价值差得远**（§4.2）。
+    let dead = start_broken_upstream(503).await;
+    let limited = start_broken_upstream(429).await;
+    let (good, _) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![
+            Provider {
+                name: "挂了的".into(),
+                base_url: format!("http://{dead}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "限流的".into(),
+                base_url: format!("http://{limited}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "好的".into(),
+                base_url: format!("http://{good}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![],
+    );
+    cfg.groups = vec![tw_engine::Group {
+        name: "全部".into(),
+        kind: tw_engine::GroupType::Fallback,
+        providers: vec!["挂了的".into(), "限流的".into(), "好的".into()],
+        session_affinity: false,
+        selected: None,
+    }];
+    cfg.routes = vec![tw_engine::Route {
+        name: "都走这一组".into(),
+        when: Default::default(),
+        to: Some("全部".into()),
+        set: None,
+        deny: None,
+    }];
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(send_to(gw).await.status(), 200);
+
+    let mut routed = None;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(tw_api::Event::RequestRouted {
+                rule,
+                group,
+                attempts,
+                ..
+            })) => {
+                routed = Some((rule, group, attempts));
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    let (rule, group, attempts) = routed.expect("没有发出路由事件");
+    // **「命中第 4 条」远不如「命中『都走这一组』」有用**（§3.4）
+    assert_eq!(rule, "都走这一组");
+    assert_eq!(group.as_deref(), Some("全部"));
+    assert_eq!(attempts.len(), 3, "{attempts:?}");
+    assert_eq!(attempts[0].provider, "挂了的");
+    assert!(attempts[0].outcome.contains("503"), "{:?}", attempts[0]);
+    assert_eq!(attempts[1].provider, "限流的");
+    assert!(attempts[1].outcome.contains("429"), "{:?}", attempts[1]);
+    assert_eq!(attempts[2].provider, "好的");
+    assert_eq!(attempts[2].outcome, "成功");
+}
+
+#[tokio::test]
+async fn a_request_that_succeeds_first_try_still_has_a_chain_of_one() {
+    // 「只试了一家」和「试了三家」在用户眼里应该是不同的 —— 而只在
+    // 发生过转移时才记链，那两件事在界面上就长得一样了。
+    let (good, _) = start_upstream(false).await;
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "官方".into(),
+            base_url: format!("http://{good}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send_to(gw).await;
+
+    for _ in 0..8 {
+        if let Ok(Ok(tw_api::Event::RequestRouted { attempts, .. })) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].outcome, "成功");
+            return;
+        }
+    }
+    panic!("没有发出路由事件");
+}
+
+#[tokio::test]
+async fn a_request_that_fails_everywhere_still_reports_the_chain() {
+    // **失败那条路才是最需要看尝试链的时候。**挂在 RequestFinished 上
+    // 的话，它恰好在那时缺席。
+    let dead = start_broken_upstream(503).await;
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "挂了的".into(),
+            base_url: format!("http://{dead}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_ne!(send_to(gw).await.status(), 200);
+
+    for _ in 0..8 {
+        if let Ok(Ok(tw_api::Event::RequestRouted { attempts, .. })) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+        {
+            assert_eq!(attempts.len(), 1);
+            assert!(attempts[0].outcome.contains("503"), "{:?}", attempts[0]);
+            return;
+        }
+    }
+    panic!("全失败的请求没有发出路由事件");
 }
