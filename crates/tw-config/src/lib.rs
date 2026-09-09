@@ -157,6 +157,21 @@ fn default_port() -> u16 {
     DEFAULT_GATEWAY_PORT
 }
 
+impl GatewayListen {
+    /// 实际要监听的地址。
+    ///
+    /// **一个函数，不是两处各拼一遍。**bind 和 port 分开写的地方多了，
+    /// 迟早有一处忘了跟着改 —— 而它的表现是「监听在了一个谁也没想到的
+    /// 地址上」。
+    pub fn socket_addr(&self) -> std::net::SocketAddr {
+        format!("{}:{}", self.bind.addr(), self.port)
+            .parse()
+            // bind.addr() 只会返回两个字面量，port 是 u16 —— 拼不出
+            // 非法地址。真拼出来了那是 bug，不是用户输入。
+            .expect("bind + port 拼不出合法地址")
+    }
+}
+
 impl Default for GatewayListen {
     fn default() -> Self {
         Self {

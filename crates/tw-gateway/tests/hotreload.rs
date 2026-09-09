@@ -453,3 +453,102 @@ async fn the_allow_list_is_reloaded_too() {
     let after = ask(gw).await;
     assert!(after.contains("不在允许的来源里"), "白名单没生效：{after}");
 }
+
+#[tokio::test]
+async fn changing_the_port_actually_moves_the_listener() {
+    // **「温」那一级**（§3.8）。换端口不能只换配置：监听器是启动时建的，
+    // 不重建的话新端口上什么都没有，而旧端口还在服务 —— 那种「改了没
+    // 反应」比报错难查得多。
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    // 先占两个端口拿号，再放掉
+    let (p1, p2) = {
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        (
+            a.local_addr().unwrap().port(),
+            b.local_addr().unwrap().port(),
+        )
+    };
+    c.listen.gateway.port = p1;
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    let s = state.clone();
+    let start = c.listen.gateway.socket_addr();
+    tokio::spawn(async move { tw_gateway::serve_following_config(s, start).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let at = |port: u16| async move {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .timeout(Duration::from_secs(2))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+    };
+    assert!(at(p1).await.is_ok(), "起始端口不通");
+
+    let mut next = c.clone();
+    next.listen.gateway.port = p2;
+    state.reload(next).unwrap();
+    // 重建监听器要一小会儿
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(at(p2).await.is_ok(), "新端口上什么都没有");
+    assert!(at(p1).await.is_err(), "旧端口还在服务");
+}
+
+#[tokio::test]
+async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
+    // **新的先起来，老的停止接受新连接并等现有请求自然结束**（§3.8）。
+    // 一个跑了六分钟的流不该因为你改了个端口而断掉。
+    let slow = {
+        let app = Router::new().fallback(any(|| async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"by":"slow"}"#))
+                .unwrap()
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let mut c = cfg(vec![provider("slow", slow)], vec![]);
+    let (p1, p2) = {
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        (
+            a.local_addr().unwrap().port(),
+            b.local_addr().unwrap().port(),
+        )
+    };
+    c.listen.gateway.port = p1;
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    let s = state.clone();
+    let start = c.listen.gateway.socket_addr();
+    tokio::spawn(async move { tw_gateway::serve_following_config(s, start).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let inflight = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{p1}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .timeout(Duration::from_secs(10))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let mut next = c.clone();
+    next.listen.gateway.port = p2;
+    state.reload(next).unwrap();
+
+    let r = inflight
+        .await
+        .unwrap()
+        .expect("换监听器把跑到一半的请求掐了");
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("slow"));
+}

@@ -405,11 +405,14 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         tracing::info!(path = %path.display(), "首次运行，已生成初始配置");
     }
     let cfg = tw_config::load(path).with_context(|| format!("加载 {} 失败", path.display()))?;
-    let bind = cfg.listen.gateway.bind.addr().to_string();
-    let listen_port = port.unwrap_or(cfg.listen.gateway.port);
-    let addr: std::net::SocketAddr = format!("{bind}:{listen_port}")
-        .parse()
-        .with_context(|| format!("监听地址不合法：{bind}:{listen_port}"))?;
+    // `--port` 是一个**显式的覆盖**，配置文件不该推翻它。所以给了它
+    // 之后就不再跟着配置里的监听地址走（§3.8 的「温」那一级）。
+    let overridden = port.is_some();
+    let mut listen = cfg.listen.gateway.clone();
+    if let Some(p) = port {
+        listen.port = p;
+    }
+    let addr = listen.socket_addr();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -500,7 +503,13 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 
         tracing::info!(%addr, "启动");
         tokio::select! {
-            r = tw_gateway::serve(state, addr) => {
+            r = async {
+                if overridden {
+                    tw_gateway::serve(state, addr).await
+                } else {
+                    tw_gateway::serve_following_config(state, addr).await
+                }
+            } => {
                 r.with_context(|| format!("监听 {addr} 失败。端口被占用的话，先看看是不是上一个实例没退干净。"))
             }
             msg = control_dead => {

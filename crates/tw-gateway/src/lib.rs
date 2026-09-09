@@ -23,4 +23,7 @@ pub use health::Health;
 pub use l1::{L1Result, ProxyHop, Segment, l1, l1_tcp};
 pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};
-pub use server::{AppState, Runtime, refresh_catalog, router, serve, spawn_catalog_refresh};
+pub use server::{
+    AppState, Runtime, refresh_catalog, router, serve, serve_following_config,
+    spawn_catalog_refresh,
+};

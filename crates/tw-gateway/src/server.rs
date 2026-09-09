@@ -217,6 +217,10 @@ pub struct AppState {
     /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
     /// 探测要打网络，不能挡住启动。
     pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
+    /// 监听地址变了。**这是「温」那一级**（§3.8 的三级热重载）——
+    /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
+    /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
+    relisten: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -236,6 +240,7 @@ impl AppState {
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(catalog)),
+            relisten: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -270,7 +275,14 @@ impl AppState {
             // 「列表即承诺」（§3.9）。真正的探测在后台补。
             self.catalog.store(Arc::new(catalog_from(&next.config)));
         }
+        let relisten =
+            old.config.listen.gateway.socket_addr() != next.config.listen.gateway.socket_addr();
         self.rt.store(Arc::new(next));
+        if relisten {
+            // 只通知，不在这里重建 —— 换监听器要 await，而这个函数被
+            // 文件监听那条同步路径调用。谁在监听谁去换。
+            self.relisten.notify_waiters();
+        }
         if limits_changed {
             self.gate
                 .store(Arc::new(crate::limits::Gate::new(new_limits)));
@@ -851,6 +863,47 @@ pub fn spawn_catalog_refresh(state: AppState) {
 
 /// 起服务。返回实际绑定的地址 —— 端口写 0 时调用方需要知道拿到了哪个。
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
+    serve_once(state, addr, std::future::pending()).await
+}
+
+/// 起服务，**并且跟着配置里的监听地址走**（§3.8 的「温」）。
+///
+/// 换端口时：新监听器先起来，旧的停止接受新连接并**等现有请求自然
+/// 结束** —— 一个跑了六分钟的流不该因为你改了个端口而断掉。
+///
+/// 命令行给了 `--port` 时不要用这个：那是一个显式的覆盖，不该被配置
+/// 文件推翻。
+pub async fn serve_following_config(
+    state: AppState,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    let mut next = addr;
+    loop {
+        let relisten = state.relisten.clone();
+        // **先订阅再进循环。**`notified()` 要在可能发生通知之前建好，
+        // 否则重建监听器那几毫秒里来的通知会丢，于是端口改了两次只生效
+        // 一次 —— 而那种「有时候生效有时候不」最难查。
+        let wait = async move {
+            relisten.notified().await;
+        };
+        serve_once(state.clone(), next, wait).await?;
+        let want = state.runtime().config.listen.gateway.socket_addr();
+        if want == next {
+            // 通知来了但地址没变（比如又改回去了）—— 原样重来
+            continue;
+        }
+        tracing::info!(from = %next, to = %want, "监听地址变了，重建监听器");
+        next = want;
+    }
+}
+
+/// 一次监听。`until` 完成时优雅停止：不再接受新连接，已经在跑的请求
+/// 自己跑完。
+async fn serve_once(
+    state: AppState,
+    addr: std::net::SocketAddr,
+    until: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual = listener.local_addr()?;
     if !state.runtime().allow.is_empty() {
@@ -864,6 +917,7 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Resu
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(until)
     .await
 }
 
