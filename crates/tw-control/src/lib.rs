@@ -16,21 +16,41 @@ use futures::stream::Stream;
 use tokio::sync::broadcast;
 
 pub mod config;
-pub use config::{ApplyError, ConfigManager, spawn_watcher};
+pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
 
 #[derive(Clone)]
 pub struct ControlState {
     pub started: std::time::Instant,
-    pub config: Arc<tw_config::Config>,
-    pub config_path: PathBuf,
+    /// **数据面本身**，不是它启动时的那份配置快照。
+    ///
+    /// 拿快照的后果是：用户在编辑器里改完文件、网关已经按新配置在转发
+    /// 了，而界面上还显示着旧的 —— 而他分不清是我们没生效还是界面没
+    /// 刷新（§3.8）。
+    pub gateway: tw_gateway::AppState,
+    pub cfg: Arc<ConfigManager>,
     pub gateway_addr: Option<String>,
-    pub bus: EventBus,
+}
+
+impl ControlState {
+    /// 当前生效的配置。**每次现取** —— 见上面那条注释。
+    pub fn config(&self) -> Arc<tw_config::Config> {
+        self.gateway.config()
+    }
+    pub fn config_path(&self) -> &std::path::Path {
+        self.cfg.path()
+    }
+    pub fn bus(&self) -> &EventBus {
+        &self.gateway.bus
+    }
     /// 探测复用数据面的 HTTP 客户端 —— 同一套超时、同一套代理设置。
     /// 另起一个会让「探测通了但实际请求不通」变成可能。
-    pub http: reqwest::Client,
-    /// 上游健康。界面要显示哪家在熔断中。
-    pub health: Arc<tw_gateway::Health>,
+    pub fn http(&self) -> &reqwest::Client {
+        &self.gateway.http
+    }
+    pub fn health(&self) -> &Arc<tw_gateway::Health> {
+        &self.gateway.health
+    }
 }
 
 pub fn router(state: ControlState) -> Router {
@@ -40,19 +60,23 @@ pub fn router(state: ControlState) -> Router {
         .route("/overview", get(overview))
         .route("/probe", post(probe))
         .route("/l1", post(l1))
+        .route("/config", get(get_config).patch(patch_config))
+        .route("/config/history", get(config_history))
+        .route("/config/rollback", post(config_rollback))
         .route("/setup", post(setup))
         .with_state(state)
 }
 
 async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
+    let cfg = s.config();
     Json(tw_api::Status {
         api_version: tw_api::CONTROL_API_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         gateway_addr: s.gateway_addr.clone(),
-        config_path: s.config_path.display().to_string(),
-        clients: s.config.clients.len(),
-        providers: s.config.providers.len(),
+        config_path: s.config_path().display().to_string(),
+        clients: cfg.clients.len(),
+        providers: cfg.providers.len(),
         uptime_secs: s.started.elapsed().as_secs(),
     })
 }
@@ -60,7 +84,7 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
 async fn events(
     State(s): State<ControlState>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
-    let rx = s.bus.subscribe();
+    let rx = s.bus().subscribe();
     let stream = async_stream_from(rx);
     // 心跳。UI 那边要能区分「没有请求」和「连接断了」—— 没有心跳的话
     // 一个安静的下午看起来就像挂了。
@@ -95,7 +119,8 @@ fn rx_state(rx: &mut broadcast::Receiver<tw_api::Event>) -> broadcast::Receiver<
 
 /// 界面要显示的配置概览。**密钥只给来源，不给值。**
 async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
-    let cfg = &s.config;
+    let cfg = s.config();
+    let cfg = &*cfg;
     let engine = cfg.engine();
     Json(tw_api::Overview {
         providers: cfg
@@ -107,7 +132,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 key_source: p.key.describe(),
                 protocol: p.effective_protocol().map(|x| format!("{x:?}")),
                 proxy: p.proxy.clone(),
-                health: match s.health.state(&p.name) {
+                health: match s.health().state(&p.name) {
                     tw_gateway::health::State::Closed => "ok".into(),
                     tw_gateway::health::State::Open => "open".into(),
                 },
@@ -219,7 +244,7 @@ async fn probe(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ProbeRequest>,
 ) -> Json<tw_api::ProbeResponse> {
-    let r = tw_gateway::probe(&s.http, &req.base_url, &req.key, None).await;
+    let r = tw_gateway::probe(s.http(), &req.base_url, &req.key, None).await;
     // 两边的枚举是同一份契约的两个副本（core 内部一份、控制面契约一份）。
     // 手工转换是为了让 tw-api 不依赖 tw-gateway —— UI 和 CLI 只该依赖
     // 契约，不该被拖上整个数据面。
@@ -251,12 +276,12 @@ async fn l1(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::L1Request>,
 ) -> Result<Json<Vec<tw_api::L1Result>>, (StatusCode, String)> {
+    let cfg = s.config();
     let mut out = Vec::new();
 
     // 只测代理本身。§4.6：代理影响的是网络层，测到 L1 就够了。
     if let Some(name) = &req.proxy {
-        let p = s
-            .config
+        let p = cfg
             .proxies
             .iter()
             .find(|x| x.name == *name)
@@ -277,16 +302,15 @@ async fn l1(
 
     let targets: Vec<&tw_config::Provider> = match &req.provider {
         Some(n) => vec![
-            s.config
-                .providers
+            cfg.providers
                 .iter()
                 .find(|p| p.name == *n)
                 .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{n}` 的上游")))?,
         ],
-        None => s.config.providers.iter().collect(),
+        None => cfg.providers.iter().collect(),
     };
     for p in targets {
-        let hop = match resolve_hop(&s.config, p) {
+        let hop = match resolve_hop(&cfg, p) {
             Ok(h) => h,
             Err(e) => {
                 out.push(tw_api::L1Result {
@@ -366,6 +390,87 @@ fn resolve_hop(
     }
 }
 
+/// 当前配置的原文。**文本模式直接显示它。**
+async fn get_config(State(s): State<ControlState>) -> Result<Json<tw_api::ConfigText>, Fail> {
+    let c = s
+        .cfg
+        .current()
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(tw_api::ConfigText {
+        path: c.path.display().to_string(),
+        version: c.version(),
+        text: c.text,
+    }))
+}
+
+/// 按字段改配置。**409 表示「你手里那份过期了」，不是失败。**
+async fn patch_config(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ConfigPatch>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let version = s
+        .cfg
+        .patch(
+            &req.ops,
+            req.base_version.as_deref(),
+            tw_config::history::Origin::Ui,
+        )
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+async fn config_history(
+    State(s): State<ControlState>,
+) -> Result<Json<Vec<tw_api::ConfigVersion>>, Fail> {
+    let all = tw_config::history::list(s.config_path())
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let now = s.cfg.current().map(|c| c.version()).unwrap_or_default();
+    // **新的在前。**用户找的几乎总是最近那几版。
+    Ok(Json(
+        all.into_iter()
+            .rev()
+            .map(|v| tw_api::ConfigVersion {
+                current: v.version == now,
+                version: v.version,
+                at_ms: v.at_ms,
+                origin: v.origin.label().to_string(),
+                bytes: v.bytes,
+            })
+            .collect(),
+    ))
+}
+
+async fn config_rollback(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::RollbackRequest>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let version = s.cfg.rollback(&req.version).await.map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+type Fail = (StatusCode, String);
+
+fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
+    (code, e.to_string())
+}
+
+/// 把配置改动的失败翻成 HTTP。
+///
+/// **`Stale` 必须是 409 而不是 400。**界面要能区分「我写错了」和「有人
+/// 抢先改了」—— 后者的正确反应是刷新再合并，而不是给用户看一条错误。
+fn apply_fail(e: ApplyError) -> Fail {
+    let code = match &e {
+        ApplyError::Stale { .. } => StatusCode::CONFLICT,
+        ApplyError::Store(tw_config::StoreError::Conflict { .. }) => StatusCode::CONFLICT,
+        ApplyError::Rejected(_) | ApplyError::Build(_) | ApplyError::BadPath(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        ApplyError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, e.to_string())
+}
+
 /// 首次运行：写下第一个上游。
 ///
 /// **整文件生成**，不走 §3.8 的最小替换 —— 那是两套机制（§7.6 第 1 步）。
@@ -380,7 +485,7 @@ async fn setup(
     //
     // 热重载（M2）之后快照会跟着磁盘走，但那时这条守卫也不该改回去：
     // 「会不会覆盖用户的文件」这种判断，就该问文件本身。
-    let current = tw_config::load(&s.config_path).map_err(|e| {
+    let current = tw_config::load(s.config_path()).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("读配置失败：{e}"),
@@ -403,12 +508,19 @@ async fn setup(
         ..Default::default()
     });
     tw_config::validate(&cfg).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    tw_config::write(&s.config_path, &cfg).map_err(|e| {
+    let text = serde_yaml_ng::to_string(&cfg).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("写配置失败：{e}"),
+            format!("序列化失败：{e}"),
         )
     })?;
+    // **走同一扇门。**直接写文件的话，这次写会被自己的监听当成外部改动
+    // （多一次无谓的重载），而且不进历史 —— 于是「刚配好就配错了」没有
+    // 退路可回。
+    s.cfg
+        .write(&text, None, tw_config::history::Origin::Ui)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     let gateway_key = cfg
         .clients
@@ -418,7 +530,7 @@ async fn setup(
     Ok(Json(tw_api::SetupResponse {
         gateway_key,
         gateway_addr: s.gateway_addr.clone().unwrap_or_default(),
-        config_path: s.config_path.display().to_string(),
+        config_path: s.config_path().display().to_string(),
     }))
 }
 

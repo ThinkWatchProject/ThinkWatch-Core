@@ -33,6 +33,10 @@ pub enum ApplyError {
     /// 校验过了但运行时对象建不起来 —— 同样保持旧的。
     #[error("配置能读，但用不起来：{0}")]
     Build(String),
+    /// patch 指的那个位置有问题。**和 Build 分开**：那句「配置能读但
+    /// 用不起来」会让人去查配置，而该查的是这次请求写的路径。
+    #[error("{0}")]
+    BadPath(String),
     #[error("版本对不上：你基于 {base}，而现在是 {current}。刷新一下再改。")]
     Stale { base: String, current: String },
 }
@@ -99,8 +103,9 @@ impl ConfigManager {
         self.gateway
             .reload(cfg)
             .map_err(|e| ApplyError::Build(e.message))?;
-        // 历史存的是**刚刚生效的这一版**。存改之前那一版是另一件事，
-        // 由写入路径在写之前做。
+        // 存刚刚生效的这一版。加上写入路径在写之前存的那一次，去重
+        // 之后的效果是「每个存在过的版本各一条」，最新那条就是现在跑
+        // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。
         let _ = tw_config::history::snapshot(&self.path, text, origin);
         let version = store::version_of(text);
         tracing::info!(%version, origin = origin.label(), "配置已生效");
@@ -135,8 +140,8 @@ impl ConfigManager {
         // **先校验再写。**写完才发现读不回来，那份坏配置已经在盘上了 ——
         // 而用户下一次启动会撞上它。
         tw_config::try_parse(new_text).map_err(ApplyError::Rejected)?;
-        // 改**之前**那一版进历史。「回滚」这个动作要的是「回到我动它
-        // 之前」（§3.8 的回滚语义）。
+        // 改之前那一版进历史。**这一步在写盘之前** —— 写完再存的话，
+        // 中间崩一次就永远丢了那一版，而那恰恰是最需要它的时刻。
         let _ = tw_config::history::snapshot(&self.path, &cur.text, origin);
         // 写盘之前再确认一次磁盘还是我们读到的那份 —— 绝不静默覆盖手改
         let fp = store::write_if_unchanged(&self.path, &cur.fingerprint, new_text)?;
@@ -153,7 +158,7 @@ impl ConfigManager {
             .iter()
             .rev()
             .find(|v| v.version == version || v.version.ends_with(version))
-            .ok_or_else(|| ApplyError::Build(format!("历史里没有 {version} 这一版")))?;
+            .ok_or_else(|| ApplyError::BadPath(format!("历史里没有 {version} 这一版")))?;
         let text = tw_config::history::read(target)?;
         let cur = self.current().ok();
         // 回滚也走同一条写入路径，所以它同样会：校验、存历史、防回环。
@@ -197,4 +202,98 @@ pub fn spawn_watcher(
         }
     });
     Ok(w)
+}
+
+/// 把 `/providers/relay-cn/base_url` 这样的路径解析成 `tw-yaml` 的步骤。
+///
+/// **用名字而不是下标。**下标会在用户重排上游之后指向另一个东西，而那
+/// 种错误完全静默 —— 你以为改的是官方，实际改的是中转。
+///
+/// 段落是数字时仍然当下标用：`/routes/0/to` 是合理的写法，因为规则的
+/// 顺序本身就是它的语义（自上而下首个命中）。
+pub fn resolve_path(text: &str, pointer: &str) -> Result<Vec<tw_yaml::Step>, String> {
+    let nodes = tw_yaml::nodes(text).map_err(|e| e.to_string())?;
+    let mut out: Vec<tw_yaml::Step> = Vec::new();
+    for seg in pointer.trim_matches('/').split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        // 当前位置是个序列吗
+        let here = nodes.iter().find(|n| n.path == out);
+        let is_seq = matches!(here.map(|n| &n.kind), Some(tw_yaml::NodeKind::Seq));
+        if is_seq {
+            if let Ok(i) = seg.parse::<usize>() {
+                out.push(tw_yaml::Step::Index(i));
+                continue;
+            }
+            // 按 name 找
+            let idx = nodes.iter().find_map(|n| {
+                let tw_yaml::NodeKind::Scalar { value, .. } = &n.kind else {
+                    return None;
+                };
+                if value != seg || n.path.len() != out.len() + 2 {
+                    return None;
+                }
+                if n.path.last() != Some(&tw_yaml::Step::Key("name".into())) {
+                    return None;
+                }
+                if !n.path.starts_with(&out) {
+                    return None;
+                }
+                match n.path[out.len()] {
+                    tw_yaml::Step::Index(i) => Some(i),
+                    _ => None,
+                }
+            });
+            match idx {
+                Some(i) => out.push(tw_yaml::Step::Index(i)),
+                None => {
+                    return Err(format!(
+                        "`{pointer}` 里没有叫 `{seg}` 的那一项。列表里的东西按 `name` 找，写下标也行。"
+                    ));
+                }
+            }
+        } else {
+            out.push(tw_yaml::Step::Key(seg.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+impl ConfigManager {
+    /// 按字段改配置（§3.8 的 `PATCH /config`）。
+    ///
+    /// **所有改动一起算，一起写。**一次 patch 里改三个字段却分三次写盘，
+    /// 中间任何一次失败都会留下一份半改的配置 —— 而那份配置是合法的，
+    /// 所以没有任何人会发现。
+    pub async fn patch(
+        &self,
+        ops: &[tw_api::PatchOp],
+        base_version: Option<&str>,
+        origin: Origin,
+    ) -> Result<String, ApplyError> {
+        let cur = self.current()?;
+        if let Some(base) = base_version
+            && cur.version() != base
+        {
+            return Err(ApplyError::Stale {
+                base: base.to_string(),
+                current: cur.version(),
+            });
+        }
+        let mut text = cur.text.clone();
+        for op in ops {
+            let tw_api::PatchOp::Replace { path, value } = op;
+            let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
+            let scalar = match value {
+                tw_api::PatchValue::Str(v) => tw_yaml::Scalar::Str(v.clone()),
+                tw_api::PatchValue::Int(v) => tw_yaml::Scalar::Int(*v),
+                tw_api::PatchValue::Bool(v) => tw_yaml::Scalar::Bool(*v),
+                tw_api::PatchValue::Null => tw_yaml::Scalar::Null,
+            };
+            text = tw_yaml::set(&text, &steps, &scalar)
+                .map_err(|e| ApplyError::BadPath(format!("改 `{path}` 失败：{e}")))?;
+        }
+        self.write(&text, Some(&cur.version()), origin).await
+    }
 }

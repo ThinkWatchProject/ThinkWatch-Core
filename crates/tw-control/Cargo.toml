@@ -20,6 +20,8 @@ futures = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "server", "server-auto"] }
 serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+tw-yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
@@ -27,6 +29,7 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tw-yaml = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tempfile = "3"
 tw-observe = { workspace = true }

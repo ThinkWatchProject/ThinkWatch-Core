@@ -260,6 +260,77 @@ pub struct L1Result {
     pub error: Option<String>,
 }
 
+/// 当前的配置文本，连同它的版本号。
+///
+/// **给的是原文，不是结构。**界面的文本模式直接显示它；表单模式改完
+/// 之后带着 `version` 回来，那就是乐观并发的凭据（§3.8）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigText {
+    pub path: String,
+    pub text: String,
+    /// `blake3:xxxxxxxxxxxx`，和 `PATCH` 的 `base_version` 是同一个
+    pub version: String,
+}
+
+/// 改配置。
+///
+/// **不是「把整份新配置发过来」**，是「基于哪一版、改哪几个字段」。
+/// 整份发过来的话，两个人同时改就必然有一个人的改动被悄悄吃掉 ——
+/// 而那正是 §1 里 cc-switch 那批 issue 的形状。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPatch {
+    /// 你基于哪一版。**对不上就是 409。**不给表示「我知道我在覆盖」
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+    pub ops: Vec<PatchOp>,
+}
+
+/// 一次字段改写。
+///
+/// `path` 用**名字**而不是下标：`/providers/relay-cn/base_url`。
+/// 下标会在用户重排上游之后指向另一个东西，而那种错误完全静默。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PatchOp {
+    Replace { path: String, value: PatchValue },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PatchValue {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    /// 显式的空。`null` 和空字符串是两回事
+    Null,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigWritten {
+    pub version: String,
+}
+
+/// 历史里的一版。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigVersion {
+    pub version: String,
+    pub at_ms: u64,
+    /// 「界面」「命令行」「外部编辑」「回滚」
+    pub origin: String,
+    pub bytes: u64,
+    /// 这一版是现在跑着的那一版吗。
+    ///
+    /// **历史里包括当前版本**，所以列表最上面那条通常就是它 —— 不标
+    /// 出来的话，用户会以为第一条是「上一版」然后回滚到自己身上。
+    #[serde(default)]
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackRequest {
+    pub version: String,
+}
+
 /// 首次运行时写下第一个上游。
 ///
 /// **只在还没有 provider 时可用**。之后改配置走 §3.8 的双向同步（M2），

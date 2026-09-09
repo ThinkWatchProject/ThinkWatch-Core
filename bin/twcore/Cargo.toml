@@ -11,6 +11,8 @@ description = "ThinkWatch Lite 的本地 AI 网关引擎"
 tw-config = { workspace = true }
 tw-control = { workspace = true }
 tw-gateway = { workspace = true }
+tw-yaml = { workspace = true }
+chrono = { workspace = true }
 tw-secret = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

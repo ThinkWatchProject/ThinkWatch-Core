@@ -2499,6 +2499,7 @@ dependencies = [
  "tw-gateway",
  "tw-observe",
  "tw-secret",
+ "tw-yaml",
 ]
 
 [[package]]
@@ -2645,6 +2646,7 @@ name = "twcore"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "libc",
  "serde_yaml_ng",
@@ -2656,6 +2658,7 @@ dependencies = [
  "tw-control",
  "tw-gateway",
  "tw-secret",
+ "tw-yaml",
 ]
 
 [[package]]

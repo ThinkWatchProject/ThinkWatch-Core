@@ -46,6 +46,11 @@ enum Command {
     },
     /// 校验配置并把结论说清楚
     Check,
+    /// 改配置。**和界面走同一套代码** —— 两套实现就是两套行为
+    Config {
+        #[command(subcommand)]
+        what: ConfigCmd,
+    },
     /// 量一条线通不通、每一段花了多久。**零成本**，不发任何业务请求
     Speed {
         /// 只测这一家。不写就全测
@@ -54,6 +59,29 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// 打印当前配置的原文和版本号
+    Show,
+    /// 改一个字段。路径写成 `/providers/官方/base_url`
+    Set {
+        /// **按名字定位，不是下标** —— 下标会在重排之后指向另一个东西
+        path: String,
+        value: String,
+        /// 明确写成数字而不是字符串。`--int 8788` 和 `8788` 是两回事
+        #[arg(long, conflicts_with_all = ["bool_value", "null"])]
+        int: bool,
+        #[arg(long = "bool", conflicts_with_all = ["int", "null"])]
+        bool_value: bool,
+        #[arg(long, conflicts_with_all = ["int", "bool_value"])]
+        null: bool,
+    },
+    /// 历史版本
+    History,
+    /// 回到某一版
+    Rollback { version: String },
 }
 
 fn main() -> Result<()> {
@@ -77,6 +105,108 @@ fn main() -> Result<()> {
         Command::Check => cmd_check(&path),
         Command::Serve { port, safe, parent } => cmd_serve(&path, port, safe, parent),
         Command::Speed { provider, proxy } => cmd_speed(&path, provider, proxy),
+        Command::Config { what } => cmd_config(&path, what),
+    }
+}
+
+/// 改配置。
+///
+/// **不连控制面，直接操作文件。**理由是这个命令必须在 core 没跑的时候
+/// 也能用 —— 「配置写坏了导致 core 起不来」正是最需要 `config rollback`
+/// 的时刻，而那时控制面根本不存在。
+///
+/// 代价是 core 正在跑时，改动要等它的文件监听发现（几百毫秒）。那条路
+/// 本来就要打通，这里搭个便车而不是再造一套。
+fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
+    match what {
+        ConfigCmd::Show => {
+            let c = tw_config::store::read(path)?;
+            println!("{}", c.text);
+            eprintln!("── {} · {}", c.path.display(), c.version());
+            Ok(())
+        }
+        ConfigCmd::History => {
+            let all = tw_config::history::list(path)?;
+            if all.is_empty() {
+                println!("还没有历史版本。第一次改配置之后就有了。");
+                return Ok(());
+            }
+            let now = tw_config::store::read(path).map(|c| c.version()).ok();
+            // 新的在前 —— 要找的几乎总是最近那几版
+            for v in all.iter().rev() {
+                let mark = if Some(&v.version) == now.as_ref() {
+                    "← 现在"
+                } else {
+                    "      "
+                };
+                println!(
+                    "{mark}  {}  {:<10}  {} 字节  {}",
+                    v.version,
+                    v.origin.label(),
+                    v.bytes,
+                    fmt_time(v.at_ms)
+                );
+            }
+            println!();
+            println!("回到某一版：twcore config rollback <版本号>（前几位就够）");
+            Ok(())
+        }
+        ConfigCmd::Rollback { version } => {
+            let text = tw_config::history::rollback(path, &version)?;
+            println!("已回到 {}", tw_config::store::version_of(&text));
+            eprintln!("（core 在跑的话，它会在一秒内自己发现）");
+            Ok(())
+        }
+        ConfigCmd::Set {
+            path: pointer,
+            value,
+            int,
+            bool_value,
+            null,
+        } => {
+            let cur = tw_config::store::read(path)?;
+            let scalar = if null {
+                tw_yaml::Scalar::Null
+            } else if int {
+                tw_yaml::Scalar::Int(
+                    value
+                        .parse()
+                        .with_context(|| format!("`{value}` 不是一个整数"))?,
+                )
+            } else if bool_value {
+                tw_yaml::Scalar::Bool(
+                    value
+                        .parse()
+                        .with_context(|| format!("`{value}` 不是 true 或 false"))?,
+                )
+            } else {
+                tw_yaml::Scalar::Str(value)
+            };
+            let steps = tw_control::resolve_path(&cur.text, &pointer)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let next = tw_yaml::set(&cur.text, &steps, &scalar)?;
+            // **先校验再写。**写完才发现读不回来，那份坏配置已经在盘上了。
+            tw_config::try_parse(&next).map_err(|r| anyhow::anyhow!("{r}"))?;
+            // 改之前那一版进历史，这样这条命令也能被 rollback 撤销
+            let _ = tw_config::history::snapshot(path, &cur.text, tw_config::history::Origin::Cli);
+            tw_config::store::write_if_unchanged(path, &cur.fingerprint, &next)?;
+            let _ = tw_config::history::snapshot(path, &next, tw_config::history::Origin::Cli);
+            println!("已改。新版本 {}", tw_config::store::version_of(&next));
+            eprintln!("（core 在跑的话，它会在一秒内自己发现）");
+            Ok(())
+        }
+    }
+}
+
+/// 给人看的时间。**本地时区** —— UTC 时间戳在一个桌面工具里没有意义。
+fn fmt_time(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(t) => t
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M:%S")
+            .to_string(),
+        None => "?".to_string(),
     }
 }
 
@@ -293,18 +423,30 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
+        // 配置的唯一入口。UI、CLI、文件监听都从这里进（§3.8）。
+        let manager = std::sync::Arc::new(tw_control::ConfigManager::new(
+            config_path,
+            state.clone(),
+            state.bus.clone(),
+        ));
+        // **监听要留着** —— 扔掉它就停止监听，而那个失效是静默的。
+        // 起不来不是致命的：手改文件不会自动生效，但界面和 CLI 照常能用，
+        // 所以说一句就继续。
+        let _watch = match tw_control::spawn_watcher(manager.clone()) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!("盯不住配置文件，手改文件不会自动生效：{e}");
+                None
+            }
+        };
+
         // 控制面无论如何都要起来 —— **网关挂了的时候，用户最需要的恰恰
         // 是能改配置**（§2.2.1）。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
             started: std::time::Instant::now(),
-            config: std::sync::Arc::new(cfg),
-            config_path,
+            gateway: state.clone(),
+            cfg: manager,
             gateway_addr: if safe { None } else { Some(addr.to_string()) },
-            bus: state.bus.clone(),
-            // 探测复用数据面的客户端：同一套超时、同一套代理。另起一个
-            // 会让「探测通了但实际请求不通」变成可能。
-            http: state.http.clone(),
-            health: state.health.clone(),
         };
         let sock = socket.clone();
         // **控制面没了就得退，不能只记一行日志。**
