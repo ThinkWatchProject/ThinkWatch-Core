@@ -98,6 +98,8 @@ pub fn router(state: ControlState) -> Router {
         .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
         // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认（§7.11）
+        .route("/sessions", get(sessions))
+        .route("/sessions/{id}", get(session_detail))
         .route("/dryrun", post(dryrun::dry_run))
         // **每次现扫，什么都不存**（§7.12）
         .route("/scan", get(scan::scan))
@@ -949,6 +951,91 @@ fn apply_fail(e: ApplyError) -> Fail {
 ///
 /// **整文件生成**，不走 §3.8 的最小替换 —— 那是两套机制（§7.6 第 1 步）。
 /// 只在还没有 provider 时可用，之后改配置归 M2 的双向同步管。
+fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {
+    tw_api::SessionView {
+        id: s.id.clone(),
+        client: s.client.clone(),
+        started_ms: s.started_ms as u64,
+        ended_ms: s.ended_ms as u64,
+        turns: s.turns as u64,
+        cost_micros: s.cost_micros,
+        unpriced_turns: s.unpriced_turns as u64,
+        input_tokens: s.input_tokens,
+        output_tokens: s.output_tokens,
+        cache_read_tokens: s.cache_read_tokens,
+        cache_write_tokens: s.cache_write_tokens,
+        cache_saved_micros: s.cache_saved_micros,
+        peak_input_tokens: s.peak_input_tokens,
+        models: s
+            .models
+            .split(',')
+            .filter(|x| !x.is_empty())
+            .map(|x| x.to_string())
+            .collect(),
+        errors: s.errors as u64,
+    }
+}
+
+fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
+    tw_api::TurnView {
+        id: t.id,
+        at_ms: t.at_ms as u64,
+        model: t.model.clone(),
+        provider: t.provider.clone(),
+        input_tokens: t.input_tokens,
+        output_tokens: t.output_tokens,
+        cache_read_tokens: t.cache_read_tokens,
+        cost_micros: t.cost_micros,
+        duration_ms: t.duration_ms,
+        error: t.error.clone(),
+    }
+}
+
+/// 会话列表（§7.9）。
+///
+/// **观测层没起来时返回空列表，不是错误**（§4.7）：那时网关照常转发，
+/// 界面上少一块统计，而不是弹一个错。
+async fn sessions(State(s): State<ControlState>) -> Json<Vec<tw_api::SessionView>> {
+    let Some(store) = &s.store else {
+        return Json(Vec::new());
+    };
+    let g = store.lock().await;
+    Json(
+        g.db()
+            .sessions(200)
+            .unwrap_or_default()
+            .iter()
+            .map(session_view)
+            .collect(),
+    )
+}
+
+async fn session_detail(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<tw_api::SessionDetail>, (StatusCode, String)> {
+    let Some(store) = &s.store else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "观测层没有启动".into()));
+    };
+    let g = store.lock().await;
+    let session = g
+        .db()
+        .sessions(500)
+        .unwrap_or_default()
+        .iter()
+        .find(|x| x.id == id)
+        .map(session_view)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{id}` 的会话")))?;
+    let turns = g
+        .db()
+        .turns(&id)
+        .unwrap_or_default()
+        .iter()
+        .map(turn_view)
+        .collect();
+    Ok(Json(tw_api::SessionDetail { session, turns }))
+}
+
 async fn setup(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::SetupRequest>,

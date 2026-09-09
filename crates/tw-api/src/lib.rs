@@ -42,6 +42,12 @@ pub enum Event {
         /// 生效了吗」。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_hint: Option<String>,
+        /// 这次请求属于哪一段对话的指纹（§7.9）。
+        ///
+        /// **只是指纹，不是会话 id** —— 会话是「同一个指纹 + 没隔太久」，
+        /// 而「隔了多久」要看上一条是什么时候，那是 recorder 的活。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_fp: Option<String>,
         provider: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账（§4.3）
@@ -666,6 +672,58 @@ pub struct SetupResponse {
     pub config_path: String,
 }
 
+// ---------------------------------------------------------------- 会话
+
+/// 一次任务（§7.9）。
+///
+/// **孤立地看单个请求，看不出任何有用的东西** —— Claude Code 的一次任务
+/// 是几十到上百个请求，携带不断增长的上下文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    pub id: String,
+    pub client: String,
+    pub started_ms: u64,
+    pub ended_ms: u64,
+    pub turns: u64,
+    /// 有价格的那些轮次加起来，单位是**微分**
+    pub cost_micros: i64,
+    /// **没有价格的轮数。**「$1.23」和「$1.23，另有 4 轮没有价格」是两个
+    /// 不同的结论（§4.3）
+    pub unpriced_turns: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 缓存命中省下了多少，微分
+    pub cache_saved_micros: i64,
+    /// 上下文峰值。**一眼看出哪次任务的上下文失控了**
+    pub peak_input_tokens: i64,
+    pub models: Vec<String>,
+    pub errors: u64,
+}
+
+/// 会话里的一轮。上下文增长曲线和成本瀑布画的就是它。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnView {
+    pub id: i64,
+    pub at_ms: u64,
+    pub model: String,
+    pub provider: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    /// **没有价格就是 None，不是 0**（§4.3）
+    pub cost_micros: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDetail {
+    pub session: SessionView,
+    pub turns: Vec<TurnView>,
+}
+
 // ---------------------------------------------------------------- 静态扫描
 
 /// 一处发现（§5.3）。
@@ -952,6 +1010,7 @@ mod tests {
                 id: 7,
                 client: "c".into(),
                 client_hint: None,
+                session_fp: None,
                 provider: "p".into(),
                 model: "m".into(),
                 method: "POST".into(),

@@ -21,6 +21,7 @@ struct Partial {
     at_ms: i64,
     client: String,
     client_hint: Option<String>,
+    session: Option<String>,
     provider: String,
     model: String,
     path: String,
@@ -48,10 +49,23 @@ pub struct Recorder {
     /// 上次查磁盘的时间。**不是每次写都查** —— statvfs 在每个请求上跑
     /// 是纯粹的浪费，而磁盘不会在两秒内从 10 GB 掉到 100 MB。
     last_check_ms: i64,
+    /// 每个对话指纹当前归到哪一次会话，以及它最后一次出现是什么时候。
+    ///
+    /// **只在内存里。**core 重启之后，同一段对话会被算成新的一次任务 ——
+    /// 那不理想，但比把它持久化成第四份状态好：会话是个观测概念，不是
+    /// 事实来源。
+    sessions: HashMap<String, (String, i64)>,
 }
 
 /// 多久查一次磁盘。
 const DISK_CHECK_EVERY_MS: i64 = 30_000;
+
+/// 隔多久算另一次任务。
+///
+/// **半小时是按「人」定的，不是按机器**：中间去开了个会再回来接着改，
+/// 那多半还是同一件事；隔了一夜再打开同一个仓库，那通常不是。切错的
+/// 代价是对称的（并多了或分多了），所以取一个人能理解的整数。
+const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 
 impl Recorder {
     pub fn new(db: Db, blobs: Blobs, prices: Prices) -> Self {
@@ -60,6 +74,7 @@ impl Recorder {
             blobs,
             prices,
             inflight: HashMap::new(),
+            sessions: HashMap::new(),
             level: DiskLevel::Ok,
             last_check_ms: 0,
         }
@@ -90,6 +105,23 @@ impl Recorder {
     }
 
     /// 吃一个事件。
+    /// 指纹 → 会话 id。同一个指纹隔太久再出现，算新的一次任务。
+    fn session_for(&mut self, fp: &str, at_ms: i64) -> String {
+        // **会话 id 里带着起始时刻**，所以同一段对话隔天再聊会得到两条
+        // 记录 —— 而那正是我们想要的：它们是两次任务
+        let fresh = format!("{fp}-{at_ms}");
+        let e = self
+            .sessions
+            .entry(fp.to_string())
+            .or_insert((fresh.clone(), at_ms));
+        if at_ms - e.1 > SESSION_GAP_MS {
+            *e = (fresh, at_ms);
+        } else {
+            e.1 = at_ms.max(e.1);
+        }
+        e.0.clone()
+    }
+
     pub fn on_event(&mut self, ev: &Event) {
         let now = now_ms();
         self.maybe_check_disk(now);
@@ -101,6 +133,7 @@ impl Recorder {
                 id,
                 client,
                 client_hint,
+                session_fp,
                 provider,
                 model,
                 path,
@@ -110,12 +143,18 @@ impl Recorder {
                 if self.inflight.len() >= MAX_INFLIGHT {
                     self.drop_oldest();
                 }
+                // **指纹在这里变成会话 id**：同一个指纹、离上一条不太久，
+                // 就还是那一次任务；隔久了就是新的一次
+                let session = session_fp
+                    .as_ref()
+                    .map(|fp| self.session_for(fp, *at_ms as i64));
                 self.inflight.insert(
                     *id,
                     Partial {
                         at_ms: *at_ms as i64,
                         client: client.clone(),
                         client_hint: client_hint.clone(),
+                        session,
                         provider: provider.clone(),
                         model: model.clone(),
                         path: path.clone(),
@@ -204,6 +243,7 @@ impl Recorder {
                     at_ms: p.at_ms,
                     client: p.client,
                     client_hint: p.client_hint,
+                    session: p.session,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -235,6 +275,7 @@ impl Recorder {
                     at_ms: p.at_ms,
                     client: p.client,
                     client_hint: p.client_hint,
+                    session: p.session,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -269,6 +310,7 @@ impl Recorder {
                     client: client.clone(),
                     // 本地应答的探测请求没经过上游，也就没有旁证可言
                     client_hint: None,
+                    session: None,
                     provider: String::new(),
                     model: String::new(),
                     path: probe.clone(),
@@ -391,6 +433,7 @@ mod tests {
         Event::RequestStarted {
             id,
             client_hint: None,
+            session_fp: None,
             client: "claude-code".into(),
             provider: "官方".into(),
             model: model.into(),

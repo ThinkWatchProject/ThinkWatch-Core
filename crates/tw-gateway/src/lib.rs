@@ -20,6 +20,7 @@ pub mod limits;
 pub mod probe;
 pub mod quota;
 pub mod server;
+pub mod session;
 pub mod usage;
 
 pub use access::{AllowList, Cidr};

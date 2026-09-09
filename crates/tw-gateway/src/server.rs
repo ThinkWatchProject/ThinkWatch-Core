@@ -517,12 +517,15 @@ async fn pipeline(
 
     // 管线第 2 步：路由（§4）。**规则引擎在这里** —— M0 那句「取第一个
     // provider」就是留给这一段的接缝。
+    // **只解析一次。**路由要它，会话指纹也要它（§7.9），而 body 可能有
+    // 几百 KB —— 解两遍是白付一份钱。
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let facts = {
-        let mut f = match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(v) => tw_engine::RequestFacts::from_anthropic_body(&v),
+        let mut f = match &parsed {
+            Some(v) => tw_engine::RequestFacts::from_anthropic_body(v),
             // body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** ——
             // 我们的解析器不认识的东西，上游可能完全认识（§4.1）。
-            Err(_) => tw_engine::RequestFacts::default(),
+            None => tw_engine::RequestFacts::default(),
         };
         f.client = client_name.clone();
         f.intent = intent;
@@ -611,6 +614,9 @@ async fn pipeline(
         // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
         // 不参与鉴权、路由、配额（见 crate::hint）。
         client_hint: crate::hint::client_hint(&headers),
+        // 认出「这几十个请求是同一次任务」（§7.9）。**认不出来就是
+        // None** —— 硬凑一个会把互不相干的请求并成一个「会话」
+        session_fp: parsed.as_ref().and_then(crate::session::fingerprint),
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
         model: facts.model.clone(),
         method: "POST".to_string(),

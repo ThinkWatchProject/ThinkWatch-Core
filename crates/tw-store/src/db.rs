@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 6;
+const SCHEMA: i64 = 7;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -52,6 +52,8 @@ pub struct RequestRow {
     /// 请求头透出来的旁证。**可以伪造** —— 只用来显示和判断接管有没有
     /// 生效，从不参与鉴权、路由或配额
     pub client_hint: Option<String>,
+    /// 这条属于哪一次任务（§7.9）。**指纹 + 起始时刻**，老记录是 None
+    pub session: Option<String>,
     pub provider: String,
     pub model: String,
     pub path: String,
@@ -232,6 +234,15 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN client_hint TEXT;")?;
         }
+        if from < 7 {
+            // 会话聚合（§7.9）。**孤立地看单个请求看不出任何有用的东西**
+            // —— Claude Code 的一次任务是几十到上百个请求。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN session TEXT;")?;
+            // 会话视图永远是「按会话分组、按时间倒序」，这个索引正好
+            self.conn
+                .execute_batch("CREATE INDEX requests_session ON requests (session, at_ms);")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -243,8 +254,8 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+              client_hint, session)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             params![
                 r.id,
                 r.at_ms,
@@ -268,6 +279,7 @@ impl Db {
                 r.billing,
                 r.cache_saved_micros,
                 r.client_hint,
+                r.session,
             ],
         )?;
         Ok(())
@@ -281,7 +293,121 @@ impl Db {
         let rows = st.query_map([limit as i64], row_from)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
 
+/// 一次任务的汇总（§7.9）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRow {
+    pub id: String,
+    pub client: String,
+    pub started_ms: i64,
+    pub ended_ms: i64,
+    pub turns: i64,
+    /// 有价格的那些轮次加起来。**单位是微分**
+    pub cost_micros: i64,
+    /// **没有价格的轮数。**三态成本的第三态在会话这一层的样子：
+    /// 「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论（§4.3）
+    pub unpriced_turns: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cache_saved_micros: i64,
+    /// 上下文的峰值。**一眼看出哪次任务的上下文失控了**（§7.9）
+    pub peak_input_tokens: i64,
+    pub models: String,
+    pub errors: i64,
+}
+
+/// 会话里的一轮。上下文增长曲线和成本瀑布画的就是它。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnRow {
+    pub id: i64,
+    pub at_ms: i64,
+    pub model: String,
+    pub provider: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cost_micros: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+impl Db {
+    /// 按会话聚合，最近的在前（§7.9）。
+    ///
+    /// **本地应答的那些不算轮次**（§4.8）：它们没经过上游，把它们算进
+    /// 「这次任务跑了多少轮」会让每个数字都偏大一点，而偏得毫无规律。
+    pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRow>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT session,
+                    client,
+                    MIN(at_ms), MAX(at_ms), COUNT(*),
+                    COALESCE(SUM(cost_micros), 0),
+                    SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cache_saved_micros), 0),
+                    COALESCE(MAX(input_tokens), 0),
+                    GROUP_CONCAT(DISTINCT model),
+                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END)
+             FROM requests
+             WHERE session IS NOT NULL AND local = 0
+             GROUP BY session
+             ORDER BY MAX(at_ms) DESC
+             LIMIT ?1",
+        )?;
+        let rows = st.query_map([limit as i64], |r| {
+            Ok(SessionRow {
+                id: r.get(0)?,
+                client: r.get(1)?,
+                started_ms: r.get(2)?,
+                ended_ms: r.get(3)?,
+                turns: r.get(4)?,
+                cost_micros: r.get(5)?,
+                unpriced_turns: r.get(6)?,
+                input_tokens: r.get(7)?,
+                output_tokens: r.get(8)?,
+                cache_read_tokens: r.get(9)?,
+                cache_write_tokens: r.get(10)?,
+                cache_saved_micros: r.get(11)?,
+                peak_input_tokens: r.get(12)?,
+                models: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                errors: r.get(14)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 一次会话里的每一轮，**按时间正序** —— 曲线是从左往右画的。
+    pub fn turns(&self, session: &str) -> Result<Vec<TurnRow>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
+                    cache_read_tokens, cost_micros, duration_ms, error
+             FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
+        )?;
+        let rows = st.query_map([session], |r| {
+            Ok(TurnRow {
+                id: r.get(0)?,
+                at_ms: r.get(1)?,
+                model: r.get(2)?,
+                provider: r.get(3)?,
+                input_tokens: r.get(4)?,
+                output_tokens: r.get(5)?,
+                cache_read_tokens: r.get(6)?,
+                cost_micros: r.get(7)?,
+                duration_ms: r.get(8)?,
+                error: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+impl Db {
     /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**
     /// （§7.11）：我们改了一个文件，但那个文件有没有被读到，只有请求能
     /// 证明。
@@ -525,6 +651,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         at_ms: r.get("at_ms")?,
         client: r.get("client")?,
         client_hint: r.get("client_hint")?,
+        session: r.get("session")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
         path: r.get("path")?,
@@ -613,6 +740,7 @@ mod tests {
     pub(super) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
             client_hint: None,
+            session: None,
             id,
             at_ms,
             client: "claude-code".into(),
@@ -816,6 +944,76 @@ mod tests {
     }
 
     #[test]
+    fn a_session_aggregates_its_turns_and_keeps_the_unpriced_ones_visible() {
+        // **「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论。**
+        // 把没价格的当成 0 加进去，得到的是一个会撒谎的账（§4.3）。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        for (i, (at, cost, input)) in [
+            (100, Some(1000), Some(1_000)),
+            (200, Some(2000), Some(50_000)),
+            (300, None, Some(120_000)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = row(i as i64 + 1, at);
+            r.session = Some("s1".into());
+            r.cost_micros = cost;
+            r.input_tokens = input;
+            db.insert(&r).unwrap();
+        }
+        let s = &db.sessions(10).unwrap()[0];
+        assert_eq!(s.turns, 3);
+        assert_eq!(s.cost_micros, 3000);
+        assert_eq!(s.unpriced_turns, 1, "没价格的那轮得单独说");
+        // 一眼看出哪次任务的上下文失控了
+        assert_eq!(s.peak_input_tokens, 120_000);
+        assert_eq!(s.started_ms, 100);
+        assert_eq!(s.ended_ms, 300);
+    }
+
+    #[test]
+    fn locally_answered_probes_do_not_count_as_turns() {
+        // 它们没经过上游。算进「这次任务跑了多少轮」会让每个数字都
+        // 偏大一点，而偏得毫无规律（§4.8）。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        let mut a = row(1, 100);
+        a.session = Some("s1".into());
+        db.insert(&a).unwrap();
+        let mut b = row(2, 200);
+        b.session = Some("s1".into());
+        b.local = true;
+        db.insert(&b).unwrap();
+        assert_eq!(db.sessions(10).unwrap()[0].turns, 1);
+        assert_eq!(db.turns("s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn turns_come_back_in_time_order_because_the_curve_is_drawn_left_to_right() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        for (i, at) in [300, 100, 200].into_iter().enumerate() {
+            let mut r = row(i as i64 + 1, at);
+            r.session = Some("s1".into());
+            db.insert(&r).unwrap();
+        }
+        let ts: Vec<_> = db.turns("s1").unwrap().iter().map(|t| t.at_ms).collect();
+        assert_eq!(ts, [100, 200, 300]);
+    }
+
+    #[test]
+    fn requests_without_a_session_are_left_out_rather_than_lumped_together() {
+        // 认不出会话的请求并成一个「会话」，比没有会话视图更糟。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        db.insert(&row(1, 100)).unwrap();
+        db.insert(&row(2, 200)).unwrap();
+        assert!(db.sessions(10).unwrap().is_empty());
+    }
+
+    #[test]
     fn the_observation_window_can_ask_when_a_client_was_last_seen() {
         // 我们改了一个文件，但那个文件有没有被读到，只有请求能证明。
         let d = tempfile::tempdir().unwrap();
@@ -851,9 +1049,17 @@ mod tests {
             let db = Db::open(&p).unwrap();
             db.insert(&row(1, 100)).unwrap();
             db.insert(&row(2, 200)).unwrap();
-            // 装作是上一版建的库
+            // 装作是老版本建的库：把这一版之后加的列全撤掉。
+            //
+            // **每加一列都要在这里补一行。**忘了补的话，这个测试会以
+            // 「duplicate column」失败 —— 那正是我们要的：它逼着人来
+            // 看一眼迁移，而不是悄悄绕过去。
             db.conn
-                .execute_batch("ALTER TABLE requests DROP COLUMN client_hint;")
+                .execute_batch(
+                    "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN session;
+                     ALTER TABLE requests DROP COLUMN client_hint;",
+                )
                 .unwrap();
             db.conn.pragma_update(None, "user_version", 5).unwrap();
         }
@@ -864,11 +1070,11 @@ mod tests {
         assert!(got.iter().all(|r| r.client_hint.is_none()));
         let mut fresh = row(3, 300);
         fresh.client_hint = Some("codex".into());
+        fresh.session = Some("abc-100".into());
         db.insert(&fresh).unwrap();
-        assert_eq!(
-            db.recent(1).unwrap()[0].client_hint.as_deref(),
-            Some("codex")
-        );
+        let back = &db.recent(1).unwrap()[0];
+        assert_eq!(back.client_hint.as_deref(), Some("codex"));
+        assert_eq!(back.session.as_deref(), Some("abc-100"));
     }
 
     #[test]
