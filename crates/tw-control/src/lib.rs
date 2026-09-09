@@ -179,6 +179,14 @@ fn describe_when(w: &tw_engine::rule::When) -> Vec<String> {
             out.push(format!("{label} {x}"));
         }
     }
+    if let Some(i) = &w.intent {
+        out.push(format!("客户端辅助请求 {}", join_one_or_many(i)));
+    }
+    // **不写出来的话，一条只有 provider_would_be 的规则在界面上会显示成
+    // 「兜底」**（条件为空就是兜底的标记）—— 那是个会让人查半天的假象。
+    if let Some(p) = &w.provider_would_be {
+        out.push(format!("将要走 {}", join_one_or_many(p)));
+    }
     for (label, v) in [
         ("带缓存", w.cache),
         ("带工具", w.tools),
@@ -195,6 +203,13 @@ fn describe_when(w: &tw_engine::rule::When) -> Vec<String> {
         }
     }
     out
+}
+
+fn join_one_or_many(v: &tw_engine::rule::OneOrMany) -> String {
+    match v {
+        tw_engine::rule::OneOrMany::One(s) => s.clone(),
+        tw_engine::rule::OneOrMany::Many(xs) => xs.join(" 或 "),
+    }
 }
 
 /// 探一个上游。零成本，用户可以随便点。
@@ -539,5 +554,45 @@ mod socket_path_tests {
         assert!(socket_path_fits(&exact).is_err());
         let one_less = PathBuf::from(format!("{base}{}", "a".repeat(103 - base.len())));
         assert!(socket_path_fits(&one_less).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    /// **每加一个 `when` 字段就必须在这里加一句人话。**
+    ///
+    /// 漏掉的后果不是「少显示一个条件」，而是条件列表变空 —— 而空列表
+    /// 在界面上正是「兜底」的标记。于是一条精确规则会显示成兜底，用户
+    /// 照着界面查半天。这条测试就是为了让漏掉这件事立刻响。
+    #[test]
+    fn every_when_field_gets_a_line() {
+        let full: tw_engine::rule::When = serde_yaml_ng::from_str(
+            "{ model: a*, client: c, dialect: anthropic, input_tokens: '>1k',
+               max_tokens: '<4k', tool_count: '>2', cache: true, tools: false,
+               image: true, thinking: false, stream: true,
+               intent: titling, provider_would_be: [a, b] }",
+        )
+        .unwrap();
+        let fields = match serde_json::to_value(&full).unwrap() {
+            serde_json::Value::Object(m) => m.len(),
+            other => panic!("{other:?}"),
+        };
+        let lines = describe_when(&full);
+        assert_eq!(
+            lines.len(),
+            fields,
+            "有 when 字段没被翻成人话。已翻的：{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_phase_two_only_rule_is_not_shown_as_a_catch_all() {
+        let w: tw_engine::rule::When =
+            serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap();
+        let lines = describe_when(&w);
+        assert!(!lines.is_empty(), "空的条件列表在界面上就是「兜底」");
+        assert!(lines[0].contains("relay"), "{lines:?}");
     }
 }

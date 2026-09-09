@@ -39,6 +39,14 @@ pub struct When {
     pub thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// 客户端的辅助请求（§4.8）。`assistant_internal` 匹配全部五类，
+    /// 也可以写具体的那一类，比如 `titling`。
+    ///
+    /// **只有把那类请求配成 `route` 才会有值** —— `intercept` 的根本
+    /// 到不了路由，`passthrough` 也不打标记。所以这个条件写了却不生效
+    /// 时，要去看的是 `client_probes` 而不是规则本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<OneOrMany>,
     /// **阶段二专用**：路由决定完之后，选中的是哪个 provider。
     ///
     /// 它是个循环依赖 —— `guard` 必须在请求发出去之前生效，而这个值要
@@ -137,6 +145,17 @@ impl When {
         {
             return Ok(false);
         }
+        // `assistant_internal` 是「五类里的任意一类」的总称。写具体的
+        // 那一类也行 —— 「所有辅助请求走便宜的那家」和「只有标题走」
+        // 是两个都合理的需求。
+        if let Some(want) = &self.intent {
+            if f.intent.is_empty() {
+                return Ok(false);
+            }
+            if !(want.contains(&f.intent) || want.contains("assistant_internal")) {
+                return Ok(false);
+            }
+        }
         for (field, spec, value) in [
             ("input_tokens", &self.input_tokens, f.input_tokens as f64),
             (
@@ -222,6 +241,7 @@ mod tests {
         RequestFacts {
             model: "claude-sonnet-4-5".into(),
             client: "claude-code".into(),
+            intent: String::new(),
             dialect: "anthropic".into(),
             input_tokens: 10_000,
             max_tokens: Some(4096),
@@ -325,5 +345,64 @@ mod tests {
         // 它们的取值是我们自己定义的小集合，通配符只会掩盖打错的名字。
         assert!(when("{ client: claude-code }").matches(&f()).unwrap());
         assert!(!when("{ client: claude-* }").matches(&f()).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    fn probe(intent: &str) -> RequestFacts {
+        RequestFacts {
+            intent: intent.into(),
+            ..Default::default()
+        }
+    }
+
+    fn w(y: &str) -> When {
+        serde_yaml_ng::from_str(y).unwrap()
+    }
+
+    #[test]
+    fn assistant_internal_matches_any_of_the_five() {
+        let r = w("{ intent: assistant_internal }");
+        for k in [
+            "health_check",
+            "warmup",
+            "titling",
+            "topic_detect",
+            "suggestion",
+        ] {
+            assert!(r.matches(&probe(k)).unwrap(), "{k}");
+        }
+    }
+
+    #[test]
+    fn a_specific_intent_matches_only_itself() {
+        // 「所有辅助请求走便宜的那家」和「只有标题走」是两个都合理的需求。
+        let r = w("{ intent: titling }");
+        assert!(r.matches(&probe("titling")).unwrap());
+        assert!(!r.matches(&probe("warmup")).unwrap());
+    }
+
+    #[test]
+    fn a_list_of_intents_works_like_anywhere_else() {
+        let r = w("{ intent: [titling, topic_detect] }");
+        assert!(r.matches(&probe("titling")).unwrap());
+        assert!(r.matches(&probe("topic_detect")).unwrap());
+        assert!(!r.matches(&probe("warmup")).unwrap());
+    }
+
+    #[test]
+    fn a_real_user_request_never_matches_an_intent_rule() {
+        // **这条是安全边界。**真实请求被一条 intent 规则捞走的话，用户的
+        // 活会被送去一个他为「省钱」准备的地方。
+        let r = w("{ intent: assistant_internal }");
+        assert!(!r.matches(&probe("")).unwrap());
+    }
+
+    #[test]
+    fn a_misspelled_intent_key_is_refused_at_load_time() {
+        assert!(serde_yaml_ng::from_str::<When>("{ intents: titling }").is_err());
     }
 }

@@ -26,6 +26,12 @@ pub struct RequestFacts {
     /// 扩展思考。token 单独计费且很贵
     pub thinking: bool,
     pub stream: bool,
+    /// 这是客户端自己发的辅助请求吗（§4.8）。
+    ///
+    /// **由识别器打的标记，不是从 body 里读出来的** —— 所以
+    /// `from_anthropic_body` 不会填它，网关在识别之后单独设。空字符串
+    /// 表示这是一个真实的用户请求。
+    pub intent: String,
 }
 
 impl RequestFacts {
@@ -42,6 +48,7 @@ impl RequestFacts {
                 .unwrap_or("")
                 .to_string(),
             client: String::new(),
+            intent: String::new(),
             dialect: "anthropic".to_string(),
             // 粗估：4 字节约 1 token。**路由只需要量级** —— 「超过 200k」
             // 和「小于 4k」这种判断，估算完全够用，而精确计数要跑一遍

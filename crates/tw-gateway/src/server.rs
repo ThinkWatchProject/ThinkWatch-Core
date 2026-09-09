@@ -273,6 +273,43 @@ async fn passthrough(
     let (client_name, position) = state.identify(&headers, query.as_deref())?;
     forward::check_body_size(&body, MAX_BODY)?;
 
+    // 管线第 1.3 步：客户端的自言自语（§4.8）。
+    //
+    // **位置在身份识别之后、模型准入和路由之前。**在准入之前不是偷懒：
+    // 一个被本地应答的请求永远不会到达任何上游，而模型准入回答的是
+    // 「哪些上游可以为你服务」，对它无从谈起。
+    //
+    // 更要紧的是**离线时也要能应答** —— sub2api 把判定放在选号之后，
+    // 于是断网时健康检查照样失败，白白丢掉这个功能最有价值的场景。
+    // 同样的理由让它排在「一个 provider 都没有」那一条之前：那一条也是
+    // 一种「没有可用上游」，而本地应答本来就不需要上游。
+    let mut intent = String::new();
+    if let Some(kind) = crate::clientprobe::classify(&body, is_claude_code(&client_name, &headers))
+    {
+        use tw_config::ProbeAction::*;
+        match kind.action(&state.config.client_probes) {
+            Intercept => {
+                let id = state.bus.next_id();
+                state.bus.emit(tw_api::Event::LocallyAnswered {
+                    id,
+                    client: client_name.clone(),
+                    probe: kind.label().to_string(),
+                    at_ms: now_ms(),
+                });
+                tracing::debug!(client = %client_name, kind = kind.label(), "本地应答");
+                return Ok(local_answer(kind, &body));
+            }
+            // `route` 交给规则处理：打一个标记让 `when: { intent: ... }`
+            // 能匹配到，然后照常往下走。
+            Route => intent = kind.slug().to_string(),
+            // **`passthrough` 不打标记。**打了的话，一条
+            // `when: { intent: assistant_internal }` 的规则会在用户还
+            // 没把那类请求配成 route 的时候就开始生效 —— 而配置文件里
+            // 看不出任何线索。
+            Passthrough => {}
+        }
+    }
+
     // 首次运行还没配完是正常状态，不是配置错误。这条要在路由之前挡，
     // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
     // 说不清下一步。
@@ -293,6 +330,7 @@ async fn passthrough(
             Err(_) => tw_engine::RequestFacts::default(),
         };
         f.client = client_name.clone();
+        f.intent = intent;
         f
     };
     // 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
@@ -641,6 +679,54 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 这个请求是 Claude Code 发的吗。
+///
+/// **`max_tokens: 1` 那条判定必须同时要求它**（§4.8），否则会误伤别人
+/// 真实的 `max_tokens: 1` 请求 —— 而误判的代价是用户看到一个凭空出现的
+/// 假答案，且完全无从察觉。
+///
+/// 两个信号取或：配置里那个客户端叫什么（`twcore init` 生成的名字就是
+/// `claude-code`），以及 UA。**都不是铁证**，所以这里只做「更窄」用：
+/// 认不出来就不拦，那是正确的失败方向。
+fn is_claude_code(client_name: &str, headers: &HeaderMap) -> bool {
+    if client_name == "claude-code" {
+        return true;
+    }
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ua| ua.to_ascii_lowercase().starts_with("claude-cli/"))
+}
+
+/// 伪造一个应答。形状跟着请求走 —— 客户端按自己请求的形状去解析，
+/// 回错了形状比不拦截更糟。
+fn local_answer(kind: crate::clientprobe::ProbeKind, body: &Bytes) -> Response {
+    if crate::clientprobe::wants_stream(body) {
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+                // 让本地应答在响应里也是可见的。**对客户端逼真，对用户
+                // 透明** —— 这两件事不矛盾，因为看这个头的是人。
+                (
+                    axum::http::HeaderName::from_static("x-thinkwatch-local"),
+                    "1",
+                ),
+            ],
+            crate::clientprobe::sse_response(kind, body),
+        )
+            .into_response();
+    }
+    (
+        [(
+            axum::http::HeaderName::from_static("x-thinkwatch-local"),
+            "1",
+        )],
+        axum::Json(crate::clientprobe::json_response(kind, body)),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

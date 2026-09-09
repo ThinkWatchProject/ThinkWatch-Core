@@ -55,6 +55,19 @@ pub enum Event {
         source: String,
         message: String,
     },
+    /// 客户端的辅助请求被本地应答了，一个字节都没发给上游（§4.8）。
+    ///
+    /// **单独一个事件，不复用 RequestFinished。**它的成本是 0、延迟是
+    /// 0，混进请求总数和延迟统计里会让那两个数字都变得没意义 —— 而
+    /// 「本地应答了 N 次」本身是个正向数字，值得单独让用户看见。
+    LocallyAnswered {
+        id: u64,
+        client: String,
+        /// 「连通性检查」这类人话标签。字段叫 `probe` 而不是 `kind` ——
+        /// 那个名字已经被枚举的 tag 占了
+        probe: String,
+        at_ms: u64,
+    },
 }
 
 impl Event {
@@ -63,7 +76,8 @@ impl Event {
             Event::RequestStarted { id, .. }
             | Event::RequestHeaders { id, .. }
             | Event::RequestFinished { id, .. }
-            | Event::RequestFailed { id, .. } => *id,
+            | Event::RequestFailed { id, .. }
+            | Event::LocallyAnswered { id, .. } => *id,
         }
     }
 }

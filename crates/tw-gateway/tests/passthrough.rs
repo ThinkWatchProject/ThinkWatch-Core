@@ -405,6 +405,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         groups: Vec::new(),
         proxies: Vec::new(),
         limits: Default::default(),
+        client_probes: Default::default(),
         routes: vec![
             tw_engine::Route {
                 name: "opus 走官方".into(),
@@ -1227,4 +1228,319 @@ async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
     assert_eq!(r.status(), 200);
     assert_eq!(body_of(&seen_dead)["max_tokens"], 4096);
     assert_eq!(body_of(&seen_good)["max_tokens"], 4096, "转移之后丢了");
+}
+
+#[tokio::test]
+async fn a_health_check_is_answered_locally_and_never_reaches_the_upstream() {
+    // §4.8 的 A 类：客户端只想知道「通不通」，回什么内容它不看。
+    let (up, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0 (external, cli)")
+        .body(r#"{"model":"claude-3-5-haiku-20241022","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // 对用户透明：响应上有标记
+    assert_eq!(r.headers().get("x-thinkwatch-local").unwrap(), "1");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["stop_reason"], "max_tokens");
+    assert!(v["id"].as_str().unwrap().starts_with("msg_01"));
+    assert!(
+        seen.lock().unwrap().body.is_empty(),
+        "本地应答的请求一个字节都不该到上游"
+    );
+}
+
+#[tokio::test]
+async fn a_health_check_still_works_with_every_upstream_dead() {
+    // **这是这个功能最有价值的场景**（§4.8）。sub2api 把判定放在选号
+    // 之后，于是断网时健康检查照样失败 —— 而客户端会因此报错。
+    let dead = start_broken_upstream(503).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "dead".into(),
+            // 连端口都没人听
+            base_url: format!("http://{dead}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0")
+        .body(r#"{"model":"claude-3-5-haiku-20241022","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "上游全挂时健康检查也必须能答");
+}
+
+#[tokio::test]
+async fn a_titling_request_goes_to_the_upstream_untouched() {
+    // **B 类默认放行。**拦掉的话，用户在 /resume 里看到的每个会话都叫
+    // 同一个名字 —— 那不是省钱，那是把一个功能关掉了。
+    let (up, seen) = start_upstream(false).await;
+    let gw = serve_cfg(cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .await;
+    let raw = r#"{"model":"claude-3-5-haiku-20241022","messages":[{"role":"user","content":"Please write a 5-10 word title for the following conversation: 修 bug"}]}"#;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().get("x-thinkwatch-local").is_none());
+    assert_eq!(
+        String::from_utf8(seen.lock().unwrap().body.clone()).unwrap(),
+        raw,
+        "放行的请求必须一个字节都没动过"
+    );
+}
+
+#[tokio::test]
+async fn intercepting_a_probe_emits_its_own_event_not_a_request_pair() {
+    // 成本 0、延迟 0 的东西混进请求总数和延迟统计里，会让那两个数字
+    // 都变得没意义（§4.8）。
+    let (up, _seen) = start_upstream(false).await;
+    let cfg = cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    );
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0")
+        .body(r#"{"model":"claude-3-5-haiku-20241022","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("2 秒内没等到事件")
+        .unwrap();
+    match ev {
+        tw_api::Event::LocallyAnswered { probe, .. } => assert_eq!(probe, "连通性检查"),
+        other => panic!("该是本地应答，实际 {other:?}"),
+    }
+    // 后面不该再跟着一对 started/finished
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "本地应答不该再发请求事件"
+    );
+}
+
+#[tokio::test]
+async fn turning_off_the_interception_sends_the_health_check_upstream() {
+    // 拦截是个默认值，不是一条铁律。想看真实探测流量的人要能关掉它。
+    let (up, seen) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: "k".into(),
+            ..Default::default()
+        }],
+        vec![],
+    );
+    cfg.client_probes.health_check = tw_config::ProbeAction::Passthrough;
+    let gw = serve_cfg(cfg).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0")
+        .body(r#"{"model":"claude-3-5-haiku-20241022","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(!seen.lock().unwrap().body.is_empty(), "关了就该发出去");
+}
+
+#[tokio::test]
+async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
+    // §4.8 的第三个选项。**它成立的前提是你手里真有一个更便宜的地方** ——
+    // 所以这是高级用法，默认没人会走到这里。
+    let (cheap, seen_cheap) = start_upstream(false).await;
+    let (normal, seen_normal) = start_upstream(false).await;
+    let mut cfg = cfg_with(
+        vec![
+            Provider {
+                name: "便宜的".into(),
+                base_url: format!("http://{cheap}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "正常的".into(),
+                base_url: format!("http://{normal}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![
+            tw_engine::Route {
+                name: "客户端辅助请求".into(),
+                when: serde_yaml_ng::from_str("{ intent: assistant_internal }").unwrap(),
+                to: Some("便宜的".into()),
+                set: None,
+                deny: None,
+            },
+            tw_engine::Route {
+                name: "兜底".into(),
+                when: Default::default(),
+                to: Some("正常的".into()),
+                set: None,
+                deny: None,
+            },
+        ],
+    );
+    cfg.client_probes.titling = tw_config::ProbeAction::Route;
+    let gw = serve_cfg(cfg).await;
+
+    let send = |body: String| async move {
+        reqwest::Client::new()
+            .post(format!("http://{gw}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .header("user-agent", "claude-cli/1.0.0")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    };
+    send(r#"{"model":"m","messages":[{"role":"user","content":"Please write a 5-10 word title for the following conversation: x"}]}"#.into()).await;
+    assert!(
+        !seen_cheap.lock().unwrap().body.is_empty(),
+        "配成 route 的标题请求该走便宜的那家"
+    );
+    assert!(seen_normal.lock().unwrap().body.is_empty());
+
+    // 真实请求照旧走兜底
+    send(r#"{"model":"m","messages":[{"role":"user","content":"帮我改个 bug"}]}"#.into()).await;
+    assert!(!seen_normal.lock().unwrap().body.is_empty());
+}
+
+#[tokio::test]
+async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
+    // **passthrough 不打标记。**打了的话，一条 intent 规则会在用户还没
+    // 把那类请求配成 route 的时候就开始生效 —— 而配置文件里看不出线索。
+    let (cheap, seen_cheap) = start_upstream(false).await;
+    let (normal, seen_normal) = start_upstream(false).await;
+    let cfg = cfg_with(
+        vec![
+            Provider {
+                name: "便宜的".into(),
+                base_url: format!("http://{cheap}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+            Provider {
+                name: "正常的".into(),
+                base_url: format!("http://{normal}"),
+                key: "k".into(),
+                ..Default::default()
+            },
+        ],
+        vec![
+            tw_engine::Route {
+                name: "客户端辅助请求".into(),
+                when: serde_yaml_ng::from_str("{ intent: assistant_internal }").unwrap(),
+                to: Some("便宜的".into()),
+                set: None,
+                deny: None,
+            },
+            tw_engine::Route {
+                name: "兜底".into(),
+                when: Default::default(),
+                to: Some("正常的".into()),
+                set: None,
+                deny: None,
+            },
+        ],
+    );
+    // titling 保持默认的 passthrough
+    let gw = serve_cfg(cfg).await;
+    reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0")
+        .body(r#"{"model":"m","messages":[{"role":"user","content":"Please write a 5-10 word title for the following conversation: x"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        seen_cheap.lock().unwrap().body.is_empty(),
+        "还没配成 route，intent 规则就不该命中"
+    );
+    assert!(!seen_normal.lock().unwrap().body.is_empty());
+}
+
+#[tokio::test]
+async fn a_health_check_works_before_any_upstream_is_configured() {
+    // 「一个 provider 都没有」也是一种「没有可用上游」，而本地应答本来
+    // 就不需要上游（§4.8）。真实请求照样会拿到那句「还没有配置任何上游」。
+    let gw = serve_cfg(cfg_with(vec![], vec![])).await;
+    let c = reqwest::Client::new();
+    let probe = c
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .header("user-agent", "claude-cli/1.0.0")
+        .body(r#"{"model":"claude-3-5-haiku-20241022","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+
+    let real = c
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(real.status(), 200);
+    assert!(real.text().await.unwrap().contains("还没有配置任何上游"));
 }

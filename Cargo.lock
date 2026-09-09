@@ -2365,6 +2365,7 @@ dependencies = [
  "hyper-util",
  "reqwest",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "thiserror",
  "tokio",

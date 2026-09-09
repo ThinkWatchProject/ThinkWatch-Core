@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub use tw_types::Limits;
 
 mod init;
+mod probes;
 pub mod proxy;
 mod validate;
 
@@ -48,6 +49,9 @@ pub struct Config {
     /// 出站代理。声明一次到处引用（§3.7）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<Proxy>,
+    /// 客户端自己发的辅助请求怎么处理（§4.8）。默认只拦 A 类。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub client_probes: ClientProbes,
     /// 并发上限。不写就是默认值（§4.7）。
     #[serde(default, skip_serializing_if = "is_default")]
     pub limits: Limits,
@@ -69,6 +73,7 @@ impl Default for Config {
             clients: Vec::new(),
             providers: Vec::new(),
             proxies: Vec::new(),
+            client_probes: ClientProbes::default(),
             limits: Limits::default(),
             groups: Vec::new(),
             routes: Vec::new(),
@@ -454,6 +459,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
     Ok(())
 }
 
+pub use probes::{ClientProbes, ProbeAction};
 pub use validate::validate;
 
 /// 默认配置目录：`~/.thinkwatch`。

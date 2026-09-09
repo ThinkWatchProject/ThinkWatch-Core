@@ -7,6 +7,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod clientprobe;
 pub mod error;
 pub mod forward;
 pub mod health;
@@ -16,6 +17,7 @@ pub mod probe;
 pub mod server;
 
 pub use access::{AllowList, Cidr};
+pub use clientprobe::{ProbeKind, classify};
 pub use error::GatewayError;
 pub use health::Health;
 pub use l1::{L1Result, ProxyHop, Segment, l1, l1_tcp};

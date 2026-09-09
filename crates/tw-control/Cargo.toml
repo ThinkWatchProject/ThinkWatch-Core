@@ -27,4 +27,5 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+serde_yaml_ng = { workspace = true }
 tempfile = "3"
