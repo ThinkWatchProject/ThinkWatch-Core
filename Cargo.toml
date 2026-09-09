@@ -13,6 +13,7 @@ members = [
     "crates/tw-config",
     "crates/tw-yaml",
     "crates/tw-store",
+    "crates/tw-pricing",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
@@ -51,6 +52,7 @@ tw-gateway  = { path = "crates/tw-gateway" }
 tw-control  = { path = "crates/tw-control" }
 tw-yaml     = { path = "crates/tw-yaml" }
 tw-store    = { path = "crates/tw-store" }
+tw-pricing  = { path = "crates/tw-pricing" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
@@ -69,6 +71,8 @@ notify = "8"
 # 请求历史。bundled 是刻意的：零外部依赖（§8），用户不必装 sqlite
 rusqlite = { version = "0.40", features = ["bundled"] }
 libc = "0.2"
+# 内置价目表压缩着放（2.3 MB → 110 KB，§4.3.0）
+flate2 = "1"
 # 只有它给节点的 span —— 而 span 是「只改一段字节」的全部前提（§3.8）。
 # serde_yaml 已经归档，且本来就不保留格式。
 saphyr-parser = "0.0.12"
