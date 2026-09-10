@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 pub mod clients;
 pub mod config;
 pub mod dryrun;
+pub mod replay;
 pub mod scan;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
@@ -99,6 +100,9 @@ pub fn router(state: ControlState) -> Router {
         .route("/setup", post(setup))
         // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认（§7.11）
         .route("/baseline", get(baseline))
+        // **报价和真跑是两个端点**：这一步花钱（和 L3 测速同一条纪律）
+        .route("/replay/quote", post(replay::quote))
+        .route("/replay/run", post(replay::run))
         .route("/sessions", get(sessions))
         .route("/sessions/{id}", get(session_detail))
         .route("/dryrun", post(dryrun::dry_run))
@@ -605,7 +609,7 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
 
 /// 价目表。**每次现建** —— 用户可能刚改过 pricing.yaml，而报价这件事
 /// 一年也点不了几次。
-fn prices(s: &ControlState) -> tw_pricing::Prices {
+pub(crate) fn prices(s: &ControlState) -> tw_pricing::Prices {
     let dir = s
         .config_path()
         .parent()

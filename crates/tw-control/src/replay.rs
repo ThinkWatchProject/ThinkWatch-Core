@@ -1,0 +1,234 @@
+//! 请求重放（DESIGN.md §11 的 M6+）。
+//!
+//! 用途只有一个，但它是这个工具最常被需要的那一个：
+//!
+//! > 这条请求走中转慢/失败了。**同样一条**发给官方会怎么样？
+//!
+//! 「同样一条」是要害。手工复现一个 Claude Code 发出的请求几乎不可能 ——
+//! 那是几十 KB 的 system prompt 加一堆工具定义，而任何一处不同都会让
+//! 对比失去意义（§4.1 说过，body 改一个字节就可能是缓存杀手）。我们手里
+//! 正好有原样的那一份。
+//!
+//! # 三条纪律
+//!
+//! **一、它花钱。**和 L3 测速（§4.6）走同一套：先报价，用户点确认才发。
+//!
+//! **二、截断过的体不能重放。**存的时候超过 4 MB 会截断，而截断之后的
+//! body 是**另一个请求** —— 拿它跑出来的结果去比对，比不跑更糟，因为
+//! 用户会以为那是同一条。
+//!
+//! **三、脱敏照做。**重放走的是控制面，不经过数据面的管线，所以
+//! §5.1 那一层要在这里显式调一次。少了它，一条本来会被脱敏的请求，
+//! 会因为「重放」这个动作把密钥原样发给中转站。
+
+use std::time::Instant;
+
+use axum::{Json, extract::State, http::StatusCode};
+
+use crate::ControlState;
+
+type Fail = (StatusCode, String);
+
+fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
+    (code, e.to_string())
+}
+
+/// 找到那条请求，把**原样的**请求体取出来。
+///
+/// 注意不是 `request_detail` 里那份 —— 那一份是脱敏之后给人看的
+/// （§9.7：它会被复制进 issue）。重放要的是原样。
+fn stored_body(
+    g: &tw_store::Recorder,
+    id: i64,
+) -> Result<(tw_store::db::RequestRow, Vec<u8>), Fail> {
+    let row = g
+        .db()
+        .get(id)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+    let raw = g
+        .blobs()
+        .get(row.at_ms, id, tw_store::Which::Request)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("第 {id} 号请求的请求体已经不在了（可能被清理了，见存储设置）"),
+            )
+        })?;
+    let original = g
+        .blobs()
+        .original_len(row.at_ms, id, tw_store::Which::Request)
+        .unwrap_or(raw.len());
+    if original > raw.len() {
+        // **截断之后的 body 是另一个请求。**拿它跑出来的结果去比对，
+        // 比不跑更糟 —— 用户会以为那是同一条
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "第 {id} 号请求的体有 {original} 字节，我们只存了 {}，重放它等于发一个不一样的请求。",
+                raw.len()
+            ),
+        ));
+    }
+    Ok((row, raw))
+}
+
+/// 报价。**不发任何请求。**
+pub async fn quote(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ReplayRequest>,
+) -> Result<Json<tw_api::ReplayQuote>, Fail> {
+    let store = s.store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "观测层没有启动".to_string(),
+        )
+    })?;
+    let (row, raw) = {
+        let g = store.lock().await;
+        stored_body(&g, req.id)?
+    };
+    let cfg = s.config();
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == req.provider)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("没有叫 `{}` 的上游", req.provider),
+            )
+        })?;
+
+    // 输入 token 用记录里的真值 —— 那是上游报回来的，比任何估算都准。
+    // 没有的话按字节粗估（和路由用的是同一个系数，§3.4）
+    let input = row.input_tokens.unwrap_or((raw.len() / 4) as i64).max(0) as u64;
+    let output = row.output_tokens.unwrap_or(0).max(0) as u64;
+    let prices = crate::prices(&s);
+    let subscription = s
+        .gateway
+        .quotas()
+        .get(&provider.name)
+        .is_some_and(|q| !q.is_empty());
+    let usage = tw_pricing::Usage {
+        input,
+        // 输出按上次那条的实际输出估。**它只是个估计**，模型这次可能
+        // 说得更多或更少
+        output: output.max(256),
+        ..Default::default()
+    };
+    let (cost_micros, note) = if subscription {
+        (
+            None,
+            format!("不计费，但会消耗约 {} tokens 的额度", input + usage.output),
+        )
+    } else {
+        match prices.cost(&row.model, &usage, false) {
+            tw_pricing::Cost::Known(m) | tw_pricing::Cost::Estimated(m) => (
+                Some(m),
+                // **金额再小也要显示。**用户按下按钮时有权知道自己在花什么
+                format!("约 ${:.5}", m as f64 / 1e6),
+            ),
+            tw_pricing::Cost::Unpriced { .. } => (
+                None,
+                format!(
+                    "价格未知（`{}` 不在价目表里），将消耗约 {} tokens",
+                    row.model,
+                    input + usage.output
+                ),
+            ),
+        }
+    };
+    Ok(Json(tw_api::ReplayQuote {
+        model: row.model.clone(),
+        provider: provider.name.clone(),
+        body_bytes: raw.len() as i64,
+        input_tokens: input as i64,
+        cost_micros,
+        note,
+        // 脱敏在重放里照做（§5.1），但用户有权在按下去之前知道
+        will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
+            .is_empty(),
+        pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+    }))
+}
+
+/// 真的发。**这一步花钱。**
+pub async fn run(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ReplayRequest>,
+) -> Result<Json<tw_api::ReplayResult>, Fail> {
+    let store = s.store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "观测层没有启动".to_string(),
+        )
+    })?;
+    let (row, raw) = {
+        let g = store.lock().await;
+        stored_body(&g, req.id)?
+    };
+    let cfg = s.config();
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == req.provider)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("没有叫 `{}` 的上游", req.provider),
+            )
+        })?;
+    let key = provider.resolved_key().map_err(|e| {
+        fail(
+            StatusCode::BAD_REQUEST,
+            format!("`{}` 的密钥取不到：{e}", provider.name),
+        )
+    })?;
+
+    // **脱敏照做。**重放不经过数据面的管线，少了这一行，一条本来会被
+    // 脱敏的请求会因为「重放」这个动作把密钥原样发给中转站（§5.1）
+    let (body, ledger) = tw_gateway::guard::redact_outbound(
+        cfg.security.redact,
+        provider,
+        &tw_engine::Guard::default(),
+        bytes::Bytes::from(raw),
+    );
+
+    let url = tw_gateway::forward::upstream_url(&provider.base_url, &row.path, None);
+    let http = s.http().clone();
+    let started = Instant::now();
+    let mut r = http.post(&url).header("content-type", "application/json");
+    r = tw_gateway::forward::apply_credential(r, provider.effective_protocol(), &key);
+    let resp = r.body(body).send().await.map_err(|e| {
+        fail(
+            StatusCode::BAD_GATEWAY,
+            tw_gateway::forward::map_reqwest_error(e).message,
+        )
+    })?;
+
+    let status = resp.status().as_u16();
+    let ttfb_ms = started.elapsed().as_millis() as i64;
+    let text = resp.text().await.unwrap_or_default();
+    let duration_ms = started.elapsed().as_millis() as i64;
+
+    // 回显还原之后再脱敏给人看。**两步都要**：还原是为了让内容和原来
+    // 那次可比，脱敏是因为这段文字会被复制进 issue（§9.7）
+    let restored = tw_redact::redact::restore(&text, &ledger);
+    Ok(Json(tw_api::ReplayResult {
+        provider: provider.name.clone(),
+        status,
+        ttfb_ms,
+        duration_ms,
+        bytes: text.len() as i64,
+        body: tw_secret::mask_body(&restored.chars().take(20_000).collect::<String>()),
+        // 和原来那次并排比 —— 这是重放存在的理由
+        original: tw_api::ReplayOriginal {
+            provider: row.provider.clone(),
+            status: row.status,
+            ttfb_ms: row.ttfb_ms,
+            duration_ms: row.duration_ms,
+            bytes: row.bytes,
+        },
+    }))
+}

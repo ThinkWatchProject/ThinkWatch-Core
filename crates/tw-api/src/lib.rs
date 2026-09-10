@@ -794,6 +794,52 @@ pub struct SessionDetail {
     pub turns: Vec<TurnView>,
 }
 
+// ---------------------------------------------------------------- 请求重放
+
+/// 把存下来的那条请求，原样发给另一个上游。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayRequest {
+    pub id: i64,
+    pub provider: String,
+}
+
+/// 报价。**按下确认之前必须看到它**（和 L3 测速同一条纪律，§4.6）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayQuote {
+    pub model: String,
+    pub provider: String,
+    pub body_bytes: i64,
+    pub input_tokens: i64,
+    /// `None` = 订阅型，或者这个模型不在价目表里。**不是 0**
+    pub cost_micros: Option<i64>,
+    pub note: String,
+    /// 发出去之前会不会脱敏。用户有权在按下去之前知道
+    pub will_redact: bool,
+    pub pricing_date: String,
+}
+
+/// 原来那一次长什么样，用来并排比。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayOriginal {
+    pub provider: String,
+    pub status: Option<u16>,
+    pub ttfb_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayResult {
+    pub provider: String,
+    pub status: u16,
+    pub ttfb_ms: i64,
+    pub duration_ms: i64,
+    pub bytes: i64,
+    /// 响应正文，**已还原占位符、已脱敏、已截断**
+    pub body: String,
+    pub original: ReplayOriginal,
+}
+
 // ---------------------------------------------------------- 上游行为基线
 
 /// 一个上游最近是不是变了（§5.2 防线三）。

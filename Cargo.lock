@@ -2665,6 +2665,7 @@ name = "tw-control"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "chrono",
  "futures",
  "hyper",
@@ -2686,6 +2687,7 @@ dependencies = [
  "tw-gateway",
  "tw-observe",
  "tw-pricing",
+ "tw-redact",
  "tw-scan",
  "tw-secret",
  "tw-store",
