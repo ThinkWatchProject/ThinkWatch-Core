@@ -10,6 +10,7 @@ pub mod auth;
 pub mod bodies;
 pub mod clientprobe;
 pub mod error;
+pub mod fixture;
 pub mod forward;
 pub mod guard;
 pub mod health;

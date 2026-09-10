@@ -104,6 +104,9 @@ pub fn router(state: ControlState) -> Router {
         // 诊断包（§9.7 的脱敏纪律）。**只读，不写任何文件**
         .route("/diagnostics", get(diagnostics::bundle))
         // **报价和真跑是两个端点**：这一步花钱（和 L3 测速同一条纪律）
+        // 把一条真实请求变成回放用例（§9.8）。**录制不是新功能** ——
+        // 每个请求本来就在存储里
+        .route("/request/{id}/fixture", get(replay::fixture))
         .route("/replay/quote", post(replay::quote))
         .route("/replay/run", post(replay::run))
         .route("/sessions", get(sessions))

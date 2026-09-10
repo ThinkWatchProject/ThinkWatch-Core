@@ -1,0 +1,51 @@
+version: 1
+name: anthropic-流式-带工具调用
+note: 按 §4.3 的方言表构造：Anthropic 流式把输入放 message_start、输出放 message_delta。不是实录。
+recorded_at_ms: 0
+request:
+  path: /v1/messages
+  content_type: application/json
+  body: '{"model": "claude-sonnet-4-5", "max_tokens": 1024, "system": [{"type": "text", "text": "你是一个助手", "cache_control": {"type": "ephemeral"}}], "messages": [{"role": "user", "content": "帮我看看这个文件"}], "tools": [{"name": "Read", "input_schema": {"type": "object"}}, {"name": "Bash", "input_schema": {"type": "object"}}], "stream": true}'
+response:
+  path: /v1/messages
+  content_type: text/event-stream
+  status: 200
+  body: |+
+    event: message_start
+    data: {"type":"message_start","message":{"id":"msg_01","usage":{"input_tokens":2450,"cache_read_input_tokens":1800,"cache_creation_input_tokens":600}}}
+
+    event: content_block_start
+    data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+    event: content_block_delta
+    data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我看一下。"}}
+
+    event: content_block_start
+    data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"Read"}}
+
+    event: content_block_delta
+    data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/a/b.rs\"}"}}
+
+    event: message_delta
+    data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":95}}
+
+    event: message_stop
+    data: {"type":"message_stop"}
+
+expect:
+  model: claude-sonnet-4-5
+  input_tokens_estimate: 19
+  cache: true
+  tools: true
+  tool_count: 2
+  image: false
+  thinking: false
+  stream: true
+  usage:
+  - 2450
+  - 95
+  - 1800
+  - 600
+  stop_reason: tool_use
+  tool_calls:
+  - Read

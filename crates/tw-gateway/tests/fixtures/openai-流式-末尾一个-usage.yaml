@@ -1,0 +1,36 @@
+version: 1
+name: openai-流式-末尾一个 usage
+note: 按 §4.3 的方言表构造：OpenAI 流式把 usage 放在最后一个 chunk。不是实录。
+recorded_at_ms: 0
+request:
+  path: /v1/chat/completions
+  content_type: application/json
+  body: '{"model": "gpt-5.6", "messages": [{"role": "user", "content": "hi"}], "stream": true}'
+response:
+  path: /v1/chat/completions
+  content_type: text/event-stream
+  status: 200
+  body: |+
+    data: {"choices":[{"delta":{"content":"你"},"finish_reason":null}]}
+
+    data: {"choices":[{"delta":{"content":"好"},"finish_reason":null}]}
+
+    data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2}}
+
+    data: [DONE]
+
+expect:
+  model: gpt-5.6
+  input_tokens_estimate: 1
+  cache: false
+  tools: false
+  tool_count: 0
+  image: false
+  thinking: false
+  stream: true
+  usage:
+  - 9
+  - 2
+  - 0
+  - 0
+  stop_reason: stop

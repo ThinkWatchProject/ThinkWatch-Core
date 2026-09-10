@@ -232,3 +232,80 @@ pub async fn run(
         },
     }))
 }
+
+/// 把一条真实请求导出成回放用例（§9.8）。
+///
+/// **「录制」不是一个新功能**：每一个请求和响应本来就在存储里，这一步
+/// 只是把观测数据变成测试夹具。
+///
+/// 脱敏在 [`tw_gateway::fixture::record`] 里做，**不是事后**：夹具会进
+/// git，一个装满真实密钥的目录被 push 上去就再也收不回来了。
+pub async fn fixture(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<String, Fail> {
+    let store = s.store.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "观测层没有启动".to_string(),
+        )
+    })?;
+    let g = store.lock().await;
+    let row = g
+        .db()
+        .get(id)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+    let body = |which| -> String {
+        g.blobs()
+            .get(row.at_ms, id, which)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default()
+    };
+    let req = body(tw_store::Which::Request);
+    let resp = body(tw_store::Which::Response);
+    if req.is_empty() && resp.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("第 {id} 号请求的正文已经不在了（可能被清理了，见存储设置）"),
+        ));
+    }
+    // 截断过的照样能当用例用 —— 它验的是「我们怎么理解这段字节」，
+    // 而不是「原样重发一遍」（那是 /replay 的事，那边会拒绝截断的）
+    let truncated = g
+        .blobs()
+        .original_len(row.at_ms, id, tw_store::Which::Response)
+        .is_some_and(|o| o > resp.len());
+    let note = format!(
+        "实录：{} 于 {}{}",
+        row.provider,
+        row.at_ms,
+        if truncated {
+            "。响应体在存储时被截断过，只取了开头一段。"
+        } else {
+            ""
+        }
+    );
+    let f = tw_gateway::fixture::record(
+        &format!("{}-{}", row.provider, row.model),
+        &note,
+        row.at_ms as u64,
+        tw_gateway::fixture::Recorded {
+            path: row.path.clone(),
+            content_type: "application/json".into(),
+            status: None,
+            body: req,
+        },
+        tw_gateway::fixture::Recorded {
+            path: row.path.clone(),
+            content_type: if resp.starts_with("event:") || resp.contains("\ndata: ") {
+                "text/event-stream".into()
+            } else {
+                "application/json".into()
+            },
+            status: row.status,
+            body: resp,
+        },
+    );
+    serde_yaml_ng::to_string(&f).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+}

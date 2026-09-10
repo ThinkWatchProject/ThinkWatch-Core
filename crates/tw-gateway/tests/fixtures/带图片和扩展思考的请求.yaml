@@ -1,0 +1,28 @@
+version: 1
+name: 带图片和扩展思考的请求
+note: 构造：盯着路由事实的提取（image / thinking / cache 三个开关）。不是实录。
+recorded_at_ms: 0
+request:
+  path: /v1/messages
+  content_type: application/json
+  body: '{"model": "claude-opus-4-5", "max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 1024}, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}, {"type": "text", "text": "这张图里是什么", "cache_control": {"type": "ephemeral"}}]}]}'
+response:
+  path: /v1/messages
+  content_type: application/json
+  status: 200
+  body: '{"type": "message", "content": [{"type": "text", "text": "一张图。"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1200, "output_tokens": 6}}'
+expect:
+  model: claude-opus-4-5
+  input_tokens_estimate: 17
+  cache: true
+  tools: false
+  tool_count: 0
+  image: true
+  thinking: true
+  stream: false
+  usage:
+  - 1200
+  - 6
+  - 0
+  - 0
+  stop_reason: end_turn

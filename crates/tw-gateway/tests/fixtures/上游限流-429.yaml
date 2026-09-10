@@ -1,0 +1,23 @@
+version: 1
+name: 上游限流-429
+note: 按 §4.6.1 构造：429 必须保住 429，塌成 502 会让客户端不退避。不是实录。
+recorded_at_ms: 0
+request:
+  path: /v1/messages
+  content_type: application/json
+  body: '{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "x"}]}'
+response:
+  path: /v1/messages
+  content_type: application/json
+  status: 429
+  body: '{"type": "error", "error": {"type": "rate_limit_error", "message": "Number of request tokens has exceeded your rate limit"}}'
+expect:
+  model: claude-sonnet-4-5
+  input_tokens_estimate: 1
+  cache: false
+  tools: false
+  tool_count: 0
+  image: false
+  thinking: false
+  stream: false
+  error_kind: rate_limit_error

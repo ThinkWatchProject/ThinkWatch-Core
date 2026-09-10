@@ -1,0 +1,28 @@
+version: 1
+name: anthropic-非流式
+note: 按 §4.3 的方言表构造：非流式在 body 末尾给一个 usage。不是实录。
+recorded_at_ms: 0
+request:
+  path: /v1/messages
+  content_type: application/json
+  body: '{"model": "claude-opus-4-5", "max_tokens": 64, "messages": [{"role": "user", "content": "一句话解释 TCP"}]}'
+response:
+  path: /v1/messages
+  content_type: application/json
+  status: 200
+  body: '{"type": "message", "id": "msg_02", "role": "assistant", "content": [{"type": "text", "text": "可靠的字节流。"}], "stop_reason": "end_turn", "usage": {"input_tokens": 18, "output_tokens": 9}}'
+expect:
+  model: claude-opus-4-5
+  input_tokens_estimate: 5
+  cache: false
+  tools: false
+  tool_count: 0
+  image: false
+  thinking: false
+  stream: false
+  usage:
+  - 18
+  - 9
+  - 0
+  - 0
+  stop_reason: end_turn
