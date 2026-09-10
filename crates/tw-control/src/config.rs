@@ -291,7 +291,10 @@ impl ConfigManager {
                 tw_api::PatchValue::Bool(v) => tw_yaml::Scalar::Bool(*v),
                 tw_api::PatchValue::Null => tw_yaml::Scalar::Null,
             };
-            text = tw_yaml::set(&text, &steps, &scalar)
+            // **`insert` 而不是 `set`。**配置里绝大多数字段是可选的、
+            // 默认不写的，只能改「用户碰巧写过」的字段，等于表单模式在
+            // 他最需要的时候是死的。已经写过的走 `set`，那是它的第一步。
+            text = tw_yaml::insert(&text, &steps, &scalar)
                 .map_err(|e| ApplyError::BadPath(format!("改 `{path}` 失败：{e}")))?;
         }
         self.write(&text, Some(&cur.version()), origin).await

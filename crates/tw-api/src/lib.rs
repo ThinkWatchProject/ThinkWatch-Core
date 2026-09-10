@@ -333,6 +333,10 @@ impl Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Overview {
     pub providers: Vec<ProviderView>,
+    /// 配置里定义过的代理名。**界面上换代理要从这里选** —— 让用户
+    /// 手打一个名字，打错了就是一次静默的「配了没生效」
+    #[serde(default)]
+    pub proxies: Vec<String>,
     pub routes: Vec<RouteView>,
     pub groups: Vec<GroupView>,
     pub clients: Vec<ClientView>,
@@ -350,6 +354,19 @@ pub struct ProviderView {
     pub proxy: String,
     /// closed / open
     pub health: String,
+    /// 这家怎么收钱（§4.3.1）。`cheapest` 策略和成本栏都看它
+    #[serde(default)]
+    pub billing: Option<String>,
+    /// 可不可信（§5.2）。**不写就按 base_url 判**，这里给的是判完的结果
+    #[serde(default)]
+    pub trust: String,
+    /// 用户有没有在配置里显式写过 `trust`。
+    ///
+    /// **界面要能区分「自动判成不受信任」和「用户写了不受信任」** ——
+    /// 前者改 base_url 就会变，后者不会，而两者显示成一样会让用户
+    /// 以为自己改不动它。
+    #[serde(default)]
+    pub trust_explicit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +381,9 @@ pub struct RouteView {
 pub struct GroupView {
     pub name: String,
     pub kind: String,
+    /// 同一次会话固定走同一家。**这一项直接决定账单**（§3.5）
+    #[serde(default)]
+    pub session_affinity: bool,
     /// `select` 组当前选中谁。
     ///
     /// **界面要能切它** —— §3.5 说这个策略就是「UI 上点选或托盘里切」，

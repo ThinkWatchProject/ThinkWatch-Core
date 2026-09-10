@@ -184,6 +184,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     let cfg = &*cfg;
     let engine = cfg.engine();
     Json(tw_api::Overview {
+        proxies: cfg.proxies.iter().map(|x| x.name.clone()).collect(),
         providers: cfg
             .providers
             .iter()
@@ -197,6 +198,14 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                     tw_gateway::health::State::Closed => "ok".into(),
                     tw_gateway::health::State::Open => "open".into(),
                 },
+                billing: p.billing.map(|b| b.slug().to_string()),
+                // **给判完的结果，不是配置里那个 Option。**界面要显示的是
+                // 「这家现在算不算受信任」，而那件事在没写的时候由
+                // base_url 决定（§5.2）
+                trust: tw_gateway::guard::effective_trust(p, &tw_engine::Guard::default())
+                    .label()
+                    .to_string(),
+                trust_explicit: p.trust.is_some(),
             })
             .collect(),
         routes: engine
@@ -221,6 +230,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .map(|g| tw_api::GroupView {
                 name: g.name.clone(),
                 kind: g.kind.label().to_string(),
+                session_affinity: g.session_affinity,
                 selected: g.selected.clone(),
                 providers: g.providers.clone(),
                 hurts_cache: g.kind.hurts_cache(),

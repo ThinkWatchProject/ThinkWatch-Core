@@ -406,3 +406,105 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
     }
     Ok(out)
 }
+
+/// 往一个已经存在的映射里**插一个新的标量键**。
+///
+/// # 为什么必须有它
+///
+/// `set` 只能改已经写在文件里的键。而配置里绝大多数字段是可选的、
+/// 默认不写的（`protocol`、`billing`、`trust`、`session_affinity`…）——
+/// 于是表单模式只能改那些「用户碰巧写过」的字段，**用户想设一个他从来
+/// 没设过的值时，界面是死的**。而那正是他最需要界面的时刻。
+///
+/// # 边界
+///
+/// 只插**标量**，而且父节点必须已经是个映射。新增一个列表项（多一个
+/// provider）仍然走文本模式 —— 那是结构性改动，§3.8 的退路说得很清楚。
+///
+/// 插在父映射**最后一个子键的下一行**，缩进抄那一行的。不去猜「该插在
+/// 哪两行之间」—— 那只会打乱用户自己排的顺序。
+pub fn insert(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchError> {
+    if find(text, path).is_ok() {
+        // 已经有了就是一次普通的替换 —— 调用方不用先问一遍
+        return set(text, path, value);
+    }
+    let Some((last, parent)) = path.split_last() else {
+        return Err(PatchError::NotFound(show(path)));
+    };
+    let Step::Key(key) = last else {
+        return Err(PatchError::NotFound(show(path)));
+    };
+    let all = nodes(text)?;
+    // 父节点得存在，而且得是个映射
+    let p = all
+        .iter()
+        .find(|n| n.path == parent)
+        .ok_or_else(|| PatchError::NotFound(show(parent)))?;
+    if !matches!(p.kind, NodeKind::Map) {
+        return Err(PatchError::NotFound(show(parent)));
+    }
+    if p.anchored {
+        return Err(PatchError::AnchorOrAlias(show(parent)));
+    }
+    // 父映射的直接子节点里，位置最靠后的那个
+    let last_child = all
+        .iter()
+        .filter(|n| n.path.len() == parent.len() + 1 && n.path.starts_with(parent))
+        .max_by_key(|n| n.bytes.end)
+        .ok_or_else(|| PatchError::NotFound(show(parent)))?;
+    // **缩进抄那一行的**，而不是按层数算 —— 用户可能用的是 4 空格，
+    // 也可能是列表项里那种 `- name: x` 的对齐
+    let line_start = text[..last_child.bytes.start]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let indent: String = text[line_start..]
+        .chars()
+        .take_while(|c| *c == ' ')
+        .collect();
+    // 那一行的结尾。**容器子节点的 `bytes.end` 会跑过头**（注释里说了
+    // 它一路跑到下一个 token），所以从行首往后找换行，而不是信它
+    let after = text[line_start..]
+        .find('\n')
+        .map(|i| line_start + i)
+        .unwrap_or(text.len());
+    // 子节点跨了多行（它自己是个映射/列表）时，往后走到这一块的末尾
+    let mut end = after.max(last_child.bytes.end.min(text.len()));
+    if end > after {
+        end = text[end..]
+            .find('\n')
+            .map(|i| end + i)
+            .unwrap_or(text.len());
+    }
+    let rendered = render_scalar(value, ScalarStyle::Plain);
+    let mut out = String::with_capacity(text.len() + key.len() + rendered.len() + 4);
+    out.push_str(&text[..end]);
+    out.push('\n');
+    out.push_str(&indent);
+    out.push_str(key);
+    out.push_str(": ");
+    out.push_str(&rendered);
+    out.push_str(&text[end..]);
+
+    // ── 和 `set` 一样的三道护栏 ──────────────────────────────────
+    let back = find(&out, path)
+        .map_err(|e| PatchError::SelfCheck(format!("插完之后 `{}` 找不回来：{e}", show(path))))?;
+    if back.value != value.as_yaml_text() {
+        return Err(PatchError::SelfCheck(format!(
+            "插完之后 `{}` 读回来是 `{}`，不是要写的那个",
+            show(path),
+            back.value
+        )));
+    }
+    // 别的字段一个都不能动
+    let before_all = nodes(text)?;
+    let after_all = nodes(&out)?;
+    if after_all.len() != before_all.len() + 1 {
+        return Err(PatchError::SelfCheck(format!(
+            "插一个字段却让节点数从 {} 变成了 {}",
+            before_all.len(),
+            after_all.len()
+        )));
+    }
+    Ok(out)
+}
