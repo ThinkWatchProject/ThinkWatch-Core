@@ -125,6 +125,19 @@ pub enum Event {
         items: Vec<RedactedItem>,
         at_ms: u64,
     },
+    /// 这次请求做了方言互转（§11 的 M6+）。
+    ///
+    /// **`dropped` 非空时必须让用户看见**：`thinking` 在 OpenAI chat
+    /// 方言里没有对应物，我们只能丢 —— 但悄悄丢掉的话，用户会发现
+    /// 「扩展思考开了却没生效」而完全不知道从哪儿查起。
+    Translated {
+        id: u64,
+        provider: String,
+        from: String,
+        to: String,
+        dropped: Vec<String>,
+        at_ms: u64,
+    },
     /// 这条响应长什么样（§5.2 防线三）。
     ///
     /// **只有形状，没有内容**：几个工具调用、命中几条规则。攒起来就是
@@ -285,6 +298,7 @@ impl Event {
             | Event::Redacted { id, .. }
             | Event::ToolCallFlagged { id, .. }
             | Event::ResponseInspected { id, .. }
+            | Event::Translated { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }

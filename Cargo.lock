@@ -2754,6 +2754,7 @@ dependencies = [
  "tracing",
  "tw-api",
  "tw-config",
+ "tw-dialect",
  "tw-engine",
  "tw-observe",
  "tw-pricing",

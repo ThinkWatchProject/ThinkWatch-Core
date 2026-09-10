@@ -350,7 +350,7 @@ mod tests {
         let start = ev
             .iter()
             .find(|(k, v)| k == "content_block_start" && v["content_block"]["type"] == "tool_use")
-            .expect(&format!("没开 tool_use 块：{out}"));
+            .unwrap_or_else(|| panic!("没开 tool_use 块：{out}"));
         assert_eq!(start.1["content_block"]["name"], "Read");
         assert_eq!(start.1["content_block"]["id"], "call_1");
         // 参数拼起来是合法 JSON —— 客户端就是这么用它的

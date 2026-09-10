@@ -680,10 +680,17 @@ async fn pipeline(
     // 「尝试链」要留下来：用户能看见故障转移在替他工作，**这是信任的
     // 来源**。一个静默切换过的请求和一个一次就成的请求，在用户眼里
     // 应该是不同的。
+    // 客户端说什么方言。**唯一可靠的线索是它把 key 放在哪儿** ——
+    // 路径和 UA 都可以被中间层改写。方言互转和错误格式都要用它，
+    // 所以在循环之前就算好
+    let dialect = crate::error::Dialect::from_key_position(position);
     let mut attempts: Vec<String> = Vec::new();
     // 成功那一次的脱敏账本。**必须是成功那一次的** —— 故障转移从官方切到
     // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来（§5.1）
     let mut used_ledger = tw_redact::redact::Ledger::default();
+    // 成功那一跳用的是哪个翻译方向。**必须是成功那一次的** —— 故障转移
+    // 从 Anthropic 上游切到 OpenAI 上游时，两跳的方向不一样
+    let mut used_xlate = crate::translate::Plan::Passthrough;
     // 每一跳的结果和耗时。**失败的原因要留着** —— 一条说「试过 A → B →
     // C」的链，和一条还说清每一跳为什么失败的链，排查价值差得远。
     let mut chain: Vec<tw_api::AttemptView> = Vec::new();
@@ -763,7 +770,31 @@ async fn pipeline(
                 continue;
             }
         };
-        let url = forward::upstream_url(&provider.base_url, uri.path(), query.as_deref());
+        // 方言互转（§11 的 M6+）。**同方言时这一整段是零成本** ——
+        // `plan()` 返回 Passthrough，body 和路径都原样
+        let xlate = crate::translate::plan(dialect, provider.effective_protocol());
+        let outbound = match (xlate.active(), parsed.as_ref()) {
+            (true, Some(v)) => {
+                let c = tw_dialect::req::to_openai(v);
+                // **翻译了就要说一声，`dropped` 非空更要说。**用户会
+                // 发现「扩展思考开了却没生效」而完全不知道从哪儿查起
+                state.bus.emit(tw_api::Event::Translated {
+                    id,
+                    provider: provider.name.clone(),
+                    from: "anthropic".into(),
+                    to: "openai-chat".into(),
+                    dropped: c.dropped.clone(),
+                    at_ms: now_ms(),
+                });
+                Bytes::from(c.body.to_string())
+            }
+            // body 解不开时原样发。**我们的解析器不认识的东西，上游可能
+            // 完全认识**（§4.1）—— 而那时它的 400 比我们编一个更有用
+            _ => outbound,
+        };
+
+        let url =
+            forward::upstream_url(&provider.base_url, xlate.path(uri.path()), query.as_deref());
         let method = reqwest::Method::from_bytes(b"POST").expect("POST 是合法方法");
 
         tracing::debug!(
@@ -779,7 +810,7 @@ async fn pipeline(
         // 用这个 provider 自己的 Client —— 它带着该走的代理。
         let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
         let mut req = http.request(method, &url);
-        req = forward::forward_headers(req, &headers);
+        req = forward::forward_headers_filtered(req, &headers, |n| xlate.keeps_header(n));
         req = forward::apply_credential(req, provider.effective_protocol(), &key);
         match req.body(outbound.clone()).send().await {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
@@ -804,6 +835,7 @@ async fn pipeline(
                 upstream = Some(r);
                 used = Some(provider);
                 used_ledger = ledger;
+                used_xlate = xlate;
                 break;
             }
             Err(e) => {
@@ -921,7 +953,6 @@ async fn pipeline(
     let is_sse = out_headers
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
-    let dialect = crate::error::Dialect::from_key_position(position);
     // 回显还原（§5.1）。
     //
     // **SSE 和非流式走两套**：前者的占位符散落在几十帧里（模型按 token
@@ -931,6 +962,19 @@ async fn pipeline(
     // **没脱敏过就是个空壳**，`process` 直接把字节原样递出去 —— 绝大多数
     // 请求走的是这条路，它不该为这个功能付任何延迟。
     let mut restorer = tw_redact::sse::Body::new(&used_ledger, is_sse);
+    // 方言互转的回程（§11 的 M6+）。**同方言时是 None，整段零成本。**
+    //
+    // 位置在还原**之后**：占位符是我们在出站时塞进去的，先换回真值再
+    // 翻译，翻译器看到的就和上游原话一样了。
+    let mut back = match (used_xlate, is_sse) {
+        (crate::translate::Plan::AnthropicToOpenai, true) => {
+            Some(tw_dialect::sse::Converter::new(&facts.model))
+        }
+        _ => None,
+    };
+    // 非流式那一条整个到手再翻
+    let translate_whole = used_xlate == crate::translate::Plan::AnthropicToOpenai && !is_sse;
+    let whole_model = facts.model.clone();
     // 工具调用防火墙（§5.2）。**只在 SSE 上跑** —— 非流式响应整个到手
     // 之后再拦已经没有意义，客户端下一步就拿到全文了。
     let inspect = rt.config.security.inspect_tools;
@@ -949,6 +993,7 @@ async fn pipeline(
         // 响应体也攒一份，**攒到上限就停**。和 usage 嗅探走同一个循环 ——
         // 两个各自遍历一遍是白白多走一趟。
         let mut tap = crate::bodies::ResponseTap::new();
+        let mut whole: Vec<u8> = Vec::new();
         while let Some(item) = counted.next().await {
             match item {
                 Ok(chunk) => {
@@ -958,6 +1003,20 @@ async fn pipeline(
                     sniffer.feed(&chunk);
                     tap.feed(&chunk);
                     let out = restorer.process(&chunk);
+                    // 翻译在还原之后、审查之前：**审查看的必须是客户端
+                    // 将要拿到的那一版**，而那一版是翻译过的
+                    let out = match back.as_mut() {
+                        Some(c) => c.process(&out).into_bytes(),
+                        None => out,
+                    };
+                    // 非流式那一条整个攒起来，最后翻一次。**这不是缓冲
+                    // 流** —— 非流式响应本来就是一整个 body，客户端无论
+                    // 如何都要等它完整（§4.1 说的是别把 SSE 变成一次性
+                    // 交付，这里没有 SSE）
+                    if translate_whole {
+                        whole.extend_from_slice(&out);
+                        continue;
+                    }
                     // **审查的是客户端将要看到的那一版**（还原之后的），
                     // 因为那才是它真正会去执行的东西
                     let mut cut: Option<(GatewayError, usize)> = None;
@@ -1018,6 +1077,27 @@ async fn pipeline(
         // 扣住的尾巴要吐出来，**在结束事件之前** —— 否则最后几个字节
         // 会掉在流的外面
         let tail = restorer.flush();
+        if translate_whole {
+            // 翻不动就原样交给客户端 —— 上游返回的可能是一条错误，
+            // 而那条错误比我们编的任何东西都有用
+            let out = match serde_json::from_slice::<serde_json::Value>(&whole) {
+                Ok(v) => tw_dialect::resp::to_anthropic(&v, &whole_model)
+                    .to_string()
+                    .into_bytes(),
+                Err(_) => whole.clone(),
+            };
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+        }
+        let tail = match back.as_mut() {
+            Some(c) => {
+                let mut t = c.process(&tail).into_bytes();
+                // **收尾帧必须补上**：Anthropic 的客户端等着
+                // `message_delta` 和 `message_stop`，少了它们会一直等
+                t.extend_from_slice(c.finish().as_bytes());
+                t
+            }
+            None => tail,
+        };
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }

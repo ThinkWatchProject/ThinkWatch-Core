@@ -51,9 +51,21 @@ pub fn forward_headers(
     builder: reqwest::RequestBuilder,
     incoming: &HeaderMap,
 ) -> reqwest::RequestBuilder {
+    forward_headers_filtered(builder, incoming, |_| true)
+}
+
+/// 同上，但再过一道调用方给的筛子。
+///
+/// 方言互转要用它（§11 的 M6+）：翻译到另一边之后，方言专属的头全是
+/// 噪音，而有些 OpenAI 兼容实现会因为不认识的头直接 400。
+pub fn forward_headers_filtered(
+    builder: reqwest::RequestBuilder,
+    incoming: &HeaderMap,
+    keep: impl Fn(&str) -> bool,
+) -> reqwest::RequestBuilder {
     let mut b = builder;
     for (name, value) in incoming.iter() {
-        if should_strip(name) {
+        if should_strip(name) || !keep(name.as_str()) {
             continue;
         }
         b = b.header(name.clone(), value.clone());

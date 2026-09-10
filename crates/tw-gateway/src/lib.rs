@@ -24,6 +24,7 @@ pub mod quota;
 pub mod server;
 pub mod session;
 pub mod toolwall;
+pub mod translate;
 pub mod usage;
 
 pub use access::{AllowList, Cidr};
