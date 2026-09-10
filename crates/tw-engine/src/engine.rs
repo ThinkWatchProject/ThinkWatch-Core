@@ -58,6 +58,40 @@ pub struct Group {
     pub selected: Option<String>,
 }
 
+/// 横切的安全策略（DESIGN.md §5.1、§5.2）。
+///
+/// **只能收紧，不能放松。**这是三层配置里最外面那一层，而它的合并规则
+/// 是并集 —— 一条 `guard` 规则不小心写少了，不会把 provider 上配好的
+/// 保护削掉。让横切策略安全的正是这一条：**加一条规则永远不会让系统
+/// 变得更不安全**，所以人敢往里加规则。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guard {
+    /// 额外要脱的类别。和 provider 上配的取并集
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redact: Vec<tw_redact::rules::Kind>,
+    /// 这条路径上一律当成不受信任的上游看待（§5.2）。
+    ///
+    /// **只能从「信任」收到「不信任」**，反过来写不生效
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub untrusted: bool,
+}
+
+impl Guard {
+    /// 并集。**只加不减** —— 这就是「只能收紧」那句话的全部实现。
+    pub fn merge(&mut self, other: &Guard) {
+        for k in &other.redact {
+            if !self.redact.contains(k) {
+                self.redact.push(*k);
+            }
+        }
+        self.untrusted |= other.untrusted;
+    }
+    pub fn is_empty(&self) -> bool {
+        self.redact.is_empty() && !self.untrusted
+    }
+}
+
 /// 改写请求参数。
 ///
 /// **这是和流量代理最本质的分歧**（§3.4）：Clash 的规则只能决定走哪个
@@ -127,6 +161,9 @@ pub struct Route {
     /// 直接拒绝，带一句给客户端看的原因。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
+    /// 横切的安全策略（§5.1）。**从所有命中的规则累积，而且只能收紧。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<Guard>,
 }
 
 /// 一次路由的结果，**带上为什么**。
@@ -142,6 +179,8 @@ pub struct Decision {
     pub via_group: Option<String>,
     /// 累积起来的参数改写
     pub set: SetAction,
+    /// 累积起来的安全策略。**并集，只加不减**
+    pub guard: Guard,
 }
 
 /// 阶段一结束时可能是「不让干」。
@@ -159,8 +198,8 @@ pub enum Outcome {
 /// 阶段二的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome2 {
-    /// 继续，带上累积后的参数改写
-    Proceed(SetAction),
+    /// 继续，带上累积后的参数改写和安全策略
+    Proceed(SetAction, Guard),
     Deny {
         rule: String,
         reason: String,
@@ -219,6 +258,7 @@ impl Engine {
                 to: Some(ALL.to_string()),
                 set: None,
                 deny: None,
+                guard: None,
             });
         }
         Self {
@@ -261,6 +301,7 @@ impl Engine {
     /// 改写是可以叠加的横切策略。
     pub fn route(&self, facts: &RequestFacts) -> Result<Outcome, RouteError> {
         let mut set = SetAction::default();
+        let mut guard = Guard::default();
         let mut chosen: Option<&Route> = None;
 
         for r in &self.routes {
@@ -270,6 +311,9 @@ impl Engine {
             }
             if let Some(s) = &r.set {
                 set.merge(s);
+            }
+            if let Some(g) = &r.guard {
+                guard.merge(g);
             }
             if chosen.is_none() && (r.to.is_some() || r.deny.is_some()) {
                 chosen = Some(r);
@@ -291,6 +335,7 @@ impl Engine {
             matched_rule: r.name.clone(),
             via_group,
             set,
+            guard,
         }))
     }
 
@@ -304,8 +349,10 @@ impl Engine {
         facts: &RequestFacts,
         provider: &str,
         base: &SetAction,
+        base_guard: &Guard,
     ) -> Result<Outcome2, RouteError> {
         let mut set = base.clone();
+        let mut guard = base_guard.clone();
         for r in &self.routes {
             if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
                 continue;
@@ -319,8 +366,14 @@ impl Engine {
             if let Some(s) = &r.set {
                 set.merge(s);
             }
+            // **「走中转的一律脱敏」这条规则活在这里。**它的条件要等
+            // 选完上游才知道，而故障转移从官方切到中转的那一刻，正是
+            // 最需要它的时刻
+            if let Some(g) = &r.guard {
+                guard.merge(g);
+            }
         }
-        Ok(Outcome2::Proceed(set))
+        Ok(Outcome2::Proceed(set, guard))
     }
 
     fn resolve_target(&self, r: &Route) -> Result<(Vec<String>, Option<String>), RouteError> {
@@ -395,6 +448,7 @@ mod tests {
             to: Some(to.into()),
             set: None,
             deny: None,
+            guard: None,
         }
     }
 
@@ -571,6 +625,7 @@ mod tests {
             to: to.map(String::from),
             set,
             deny: deny.map(String::from),
+            guard: None,
         }
     }
 
@@ -722,13 +777,19 @@ mod tests {
             ],
         );
         let base = SetAction::default();
-        match e.phase_two(&facts("x"), "relay", &base).unwrap() {
-            Outcome2::Proceed(s) => assert_eq!(s.thinking, Some(false)),
+        match e
+            .phase_two(&facts("x"), "relay", &base, &Guard::default())
+            .unwrap()
+        {
+            Outcome2::Proceed(s, _) => assert_eq!(s.thinking, Some(false)),
             other => panic!("{other:?}"),
         }
         // 换一家就不该命中了 —— 这正是故障转移后必须重跑的理由
-        match e.phase_two(&facts("x"), "official", &base).unwrap() {
-            Outcome2::Proceed(s) => assert_eq!(s.thinking, None),
+        match e
+            .phase_two(&facts("x"), "official", &base, &Guard::default())
+            .unwrap()
+        {
+            Outcome2::Proceed(s, _) => assert_eq!(s.thinking, None),
             other => panic!("{other:?}"),
         }
     }
@@ -756,8 +817,11 @@ mod tests {
         );
         let base = SetAction::default();
         for (p, want) in [("a", Some(false)), ("b", Some(false)), ("c", None)] {
-            match e.phase_two(&facts("x"), p, &base).unwrap() {
-                Outcome2::Proceed(s) => assert_eq!(s.thinking, want, "provider={p}"),
+            match e
+                .phase_two(&facts("x"), p, &base, &Guard::default())
+                .unwrap()
+            {
+                Outcome2::Proceed(s, _) => assert_eq!(s.thinking, want, "provider={p}"),
                 other => panic!("{other:?}"),
             }
         }

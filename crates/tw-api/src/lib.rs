@@ -115,6 +115,16 @@ pub enum Event {
         masked: String,
         at_ms: u64,
     },
+    /// 出站脱敏动手了（§5.1）。
+    ///
+    /// **界面上必须能看到脱敏发生了什么** —— 看不见的安全功能会被用户
+    /// 关掉，因为他们会怀疑是脱敏搞坏了功能。
+    Redacted {
+        id: u64,
+        provider: String,
+        items: Vec<RedactedItem>,
+        at_ms: u64,
+    },
     /// 客户端配置面上**新出现**了可疑的东西（§5.3）。
     ///
     /// **只报新出现的那些。**「一个用了半年的 skill 突然多了一段零宽
@@ -239,6 +249,7 @@ impl Event {
             | Event::QuotaSeen { id, .. }
             | Event::LeakSeen { id, .. }
             | Event::ScanAlert { id, .. }
+            | Event::Redacted { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }
@@ -684,6 +695,16 @@ pub struct SetupResponse {
     pub gateway_key: String,
     pub gateway_addr: String,
     pub config_path: String,
+}
+
+/// 换掉了哪一类、几处。**只有类别和计数，没有原值。**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactedItem {
+    /// `api-keys` 这类机器读的标记
+    pub kind: String,
+    /// 「Anthropic API key」这类人话
+    pub what: String,
+    pub count: u64,
 }
 
 // ---------------------------------------------------------------- 会话

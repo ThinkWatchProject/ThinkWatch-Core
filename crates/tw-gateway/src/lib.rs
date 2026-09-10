@@ -11,6 +11,7 @@ pub mod bodies;
 pub mod clientprobe;
 pub mod error;
 pub mod forward;
+pub mod guard;
 pub mod health;
 pub mod hint;
 pub mod l1;

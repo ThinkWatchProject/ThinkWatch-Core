@@ -443,6 +443,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
                 to: Some("official".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
             tw_engine::Route {
                 name: "兜底".into(),
@@ -450,6 +451,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
                 to: Some("relay".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     };
@@ -1092,6 +1094,7 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
                 ..Default::default()
             }),
             deny: None,
+            guard: None,
         }],
     );
     // 没有别的规则时层 0 会补一条兜底 —— 但只有在 routes 为空时。
@@ -1102,6 +1105,7 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
         to: Some("official".into()),
         set: None,
         deny: None,
+        guard: None,
     });
     // 兜底只指一家的话就没得转移了 —— 用组把两家串起来。
     cfg.groups = vec![tw_engine::Group {
@@ -1153,6 +1157,7 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
                 to: None,
                 set: None,
                 deny: Some("这段内容不发给中转站".into()),
+                guard: None,
             },
             tw_engine::Route {
                 name: "兜底".into(),
@@ -1160,6 +1165,7 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
                 to: Some("relay".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     ))
@@ -1240,6 +1246,7 @@ async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
                 ..Default::default()
             }),
             deny: None,
+            guard: None,
         }],
     );
     cfg.groups = vec![tw_engine::Group {
@@ -1460,6 +1467,7 @@ async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
                 to: Some("便宜的".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
             tw_engine::Route {
                 name: "兜底".into(),
@@ -1467,6 +1475,7 @@ async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
                 to: Some("正常的".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     );
@@ -1523,6 +1532,7 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
                 to: Some("便宜的".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
             tw_engine::Route {
                 name: "兜底".into(),
@@ -1530,6 +1540,7 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
                 to: Some("正常的".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     );
@@ -1672,6 +1683,7 @@ async fn a_deny_rule_is_403_not_400() {
                 to: None,
                 set: None,
                 deny: Some("这个项目不用 opus".into()),
+                guard: None,
             },
             tw_engine::Route {
                 name: "兜底".into(),
@@ -1679,6 +1691,7 @@ async fn a_deny_rule_is_403_not_400() {
                 to: Some("up".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     ))
@@ -2058,6 +2071,7 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
         to: Some("全部".into()),
         set: None,
         deny: None,
+        guard: None,
     }];
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();

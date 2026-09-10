@@ -664,6 +664,9 @@ async fn pipeline(
     // 来源**。一个静默切换过的请求和一个一次就成的请求，在用户眼里
     // 应该是不同的。
     let mut attempts: Vec<String> = Vec::new();
+    // 成功那一次的脱敏账本。**必须是成功那一次的** —— 故障转移从官方切到
+    // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来（§5.1）
+    let mut used_ledger = tw_redact::redact::Ledger::default();
     // 每一跳的结果和耗时。**失败的原因要留着** —— 一条说「试过 A → B →
     // C」的链，和一条还说清每一跳为什么失败的链，排查价值差得远。
     let mut chain: Vec<tw_api::AttemptView> = Vec::new();
@@ -690,18 +693,44 @@ async fn pipeline(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**（§3.4）。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let effective_set = match rt.engine.phase_two(&facts, &provider.name, &decision.set) {
-            Ok(tw_engine::Outcome2::Proceed(s)) => s,
-            Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
-                tracing::info!(%rule, provider = %provider.name, "阶段二拒绝");
-                return Err(GatewayError::denied(reason));
-            }
-            Err(e) => return Err(GatewayError::config(format!("阶段二求值失败：{e}"))),
-        };
+        let (effective_set, guard) =
+            match rt
+                .engine
+                .phase_two(&facts, &provider.name, &decision.set, &decision.guard)
+            {
+                Ok(tw_engine::Outcome2::Proceed(s, g)) => (s, g),
+                Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
+                    tracing::info!(%rule, provider = %provider.name, "阶段二拒绝");
+                    return Err(GatewayError::denied(reason));
+                }
+                Err(e) => return Err(GatewayError::config(format!("阶段二求值失败：{e}"))),
+            };
         // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
         // §4.1 的出站直通说过任何 body 改写都可能是缓存杀手，所以这是
         // 一个用户显式要求的例外，不是默认行为。
         let outbound = forward::apply_set(&body, &effective_set);
+
+        // 出站脱敏（§5.1）。**和阶段二在同一个位置，理由完全一样** ——
+        // 故障转移从官方切到中转的那一刻，正是最需要它的时刻，而那时
+        // 「该脱哪些」已经换了一套。
+        let (outbound, ledger) =
+            crate::guard::redact_outbound(rt.config.security.redact, provider, &guard, outbound);
+        if !ledger.is_empty() {
+            state.bus.emit(tw_api::Event::Redacted {
+                id,
+                provider: provider.name.clone(),
+                items: ledger
+                    .counts
+                    .iter()
+                    .map(|(k, what, n)| tw_api::RedactedItem {
+                        kind: k.slug().to_string(),
+                        what: what.to_string(),
+                        count: *n as u64,
+                    })
+                    .collect(),
+                at_ms: now_ms(),
+            });
+        }
 
         let key = match provider.resolved_key() {
             Ok(k) => k,
@@ -757,6 +786,7 @@ async fn pipeline(
                 chain.push(hop(&provider.name, "成功".to_string(), hop_started));
                 upstream = Some(r);
                 used = Some(provider);
+                used_ledger = ledger;
                 break;
             }
             Err(e) => {
@@ -875,6 +905,15 @@ async fn pipeline(
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
     let dialect = crate::error::Dialect::from_key_position(position);
+    // 回显还原（§5.1）。
+    //
+    // **SSE 和非流式走两套**：前者的占位符散落在几十帧里（模型按 token
+    // 吐字，一个 `<<TW_SECRET_1>>` 会被切成五到八段），后者整个躺在一份
+    // JSON 里。
+    //
+    // **没脱敏过就是个空壳**，`process` 直接把字节原样递出去 —— 绝大多数
+    // 请求走的是这条路，它不该为这个功能付任何延迟。
+    let mut restorer = tw_redact::sse::Body::new(&used_ledger, is_sse);
     let stream = async_stream::stream! {
         let mut counted = std::pin::pin!(counted);
         let mut broke: Option<GatewayError> = None;
@@ -887,15 +926,27 @@ async fn pipeline(
         while let Some(item) = counted.next().await {
             match item {
                 Ok(chunk) => {
+                    // **嗅探和留档看的是上游原话**（带占位符的那一版）：
+                    // usage 数字不受影响，而请求详情里存的正是「我们发出去
+                    // 的和收回来的」，把还原后的存进去会让那一页说谎。
                     sniffer.feed(&chunk);
                     tap.feed(&chunk);
-                    yield Ok::<Bytes, std::io::Error>(chunk)
+                    let out = restorer.process(&chunk);
+                    if !out.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+                    }
                 }
                 Err(e) => {
                     broke = Some(forward::map_reqwest_error(e).in_dialect(dialect));
                     break;
                 }
             }
+        }
+        // 扣住的尾巴要吐出来，**在结束事件之前** —— 否则最后几个字节
+        // 会掉在流的外面
+        let tail = restorer.flush();
+        if !tail.is_empty() {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }
         let (recorded, original_len) = tap.finish();
         if !recorded.is_empty() {

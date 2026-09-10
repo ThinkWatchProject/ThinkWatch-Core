@@ -10,4 +10,8 @@ description = "出站脱敏与回显还原：把凭据换成占位符，再在�
 [dependencies]
 serde = { workspace = true }
 base64 = { workspace = true }
+serde_json = { workspace = true }
 tw-secret = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

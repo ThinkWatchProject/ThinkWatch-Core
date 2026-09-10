@@ -137,6 +137,58 @@ impl Restorer {
     }
 }
 
+/// 字节流上的还原器。
+///
+/// [`Restorer`] 吃的是 `&str`，而响应是一串 `Bytes` —— **一个多字节字符
+/// 可能被切在两个 chunk 中间**。这一层负责扣住那半个字符，等下一块到了
+/// 再拼。
+///
+/// 这个项目已经被字节切片坑过三次（§9.7），所以它是一个独立的类型，
+/// 而不是调用方各自写一遍 `from_utf8_lossy`：那个函数会把半个字符变成
+/// `�`，而那是**不可逆**的 —— 客户端拿到的文字里会多出一个替换符。
+pub struct ByteRestorer {
+    inner: Restorer,
+    /// 上一块结尾那半个字符
+    partial: Vec<u8>,
+}
+
+impl ByteRestorer {
+    pub fn new(ledger: &Ledger) -> Self {
+        Self {
+            inner: Restorer::new(ledger),
+            partial: Vec::new(),
+        }
+    }
+    pub fn is_noop(&self) -> bool {
+        self.inner.is_noop()
+    }
+
+    pub fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.is_noop() {
+            return chunk.to_vec();
+        }
+        let mut buf = std::mem::take(&mut self.partial);
+        buf.extend_from_slice(chunk);
+        let valid = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        // 尾巴上那半个字符留到下一块
+        self.partial = buf[valid..].to_vec();
+        let text = std::str::from_utf8(&buf[..valid]).expect("valid_up_to 保证这一段是合法的");
+        self.inner.process(text).into_bytes()
+    }
+
+    /// 流结束了。**残留的半个字符原样发出去** —— 上游就是那么说的，
+    /// 我们没有立场替它补全或者抹掉。
+    pub fn flush(&mut self) -> Vec<u8> {
+        let mut out = self.inner.flush().into_bytes();
+        out.extend_from_slice(&self.partial);
+        self.partial.clear();
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +351,70 @@ mod tests {
             }
             assert!(feed(&chunks).contains(KEY), "按 {size} 切的时候没还原");
         }
+    }
+}
+
+#[cfg(test)]
+mod byte_tests {
+    use super::*;
+    use crate::redact::redact;
+    use crate::rules::Kind;
+
+    const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn ledger() -> Ledger {
+        redact(&format!("k={KEY}"), &[Kind::ApiKeys]).ledger
+    }
+
+    fn feed_bytes(chunks: &[&[u8]]) -> String {
+        let l = ledger();
+        let mut r = ByteRestorer::new(&l);
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&r.process(c));
+        }
+        out.extend_from_slice(&r.flush());
+        String::from_utf8(out).expect("输出必须还是合法 UTF-8")
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_chunks_is_not_mangled() {
+        // `from_utf8_lossy` 会把半个字符变成 `�`，而那是**不可逆**的
+        // —— 客户端拿到的文字里会永远多出一个替换符。
+        let text = "中文中文 <<TW_SECRET_1>> 中文中文";
+        let bytes = text.as_bytes();
+        for cut in 1..bytes.len() {
+            let got = feed_bytes(&[&bytes[..cut], &bytes[cut..]]);
+            assert!(
+                !got.contains('\u{fffd}'),
+                "在第 {cut} 字节切开时出现了替换符：{got}"
+            );
+            assert!(got.contains(KEY), "在第 {cut} 字节切开时没还原");
+        }
+    }
+
+    #[test]
+    fn a_byte_at_a_time_still_produces_the_right_text() {
+        let text = "前 <<TW_SECRET_1>> 后";
+        let chunks: Vec<&[u8]> = text.as_bytes().chunks(1).collect();
+        assert_eq!(feed_bytes(&chunks), format!("前 {KEY} 后"));
+    }
+
+    #[test]
+    fn a_truncated_character_at_the_end_of_a_stream_is_passed_through() {
+        // 上游就是那么说的，我们没有立场替它补全或者抹掉。
+        let l = ledger();
+        let mut r = ByteRestorer::new(&l);
+        let half = &"中".as_bytes()[..2];
+        assert_eq!(r.process(half), Vec::<u8>::new());
+        assert_eq!(r.flush(), half.to_vec());
+    }
+
+    #[test]
+    fn a_stream_with_nothing_to_restore_is_copied_straight_through() {
+        let mut r = ByteRestorer::new(&Ledger::default());
+        assert!(r.is_noop());
+        let raw = &[0xff, 0xfe, 0x00][..];
+        assert_eq!(r.process(raw), raw.to_vec(), "二进制体也该原样过去");
     }
 }

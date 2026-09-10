@@ -95,6 +95,7 @@ async fn one_opus_goes_to_official_and_haiku_goes_to_the_relay() {
                 to: Some("official".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
             tw_engine::Route {
                 name: "兜底走中转".into(),
@@ -102,6 +103,7 @@ async fn one_opus_goes_to_official_and_haiku_goes_to_the_relay() {
                 to: Some("relay".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     ))
@@ -173,6 +175,7 @@ async fn two_the_proxied_upstream_goes_through_it_and_the_local_one_does_not() {
                 to: Some("local".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
             tw_engine::Route {
                 name: "其余走官方".into(),
@@ -180,6 +183,7 @@ async fn two_the_proxied_upstream_goes_through_it_and_the_local_one_does_not() {
                 to: Some("official".into()),
                 set: None,
                 deny: None,
+                guard: None,
             },
         ],
     );

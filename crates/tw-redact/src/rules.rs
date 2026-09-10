@@ -163,25 +163,31 @@ fn private_keys(text: &str, out: &mut Vec<Hit>) {
     let mut from = 0;
     while let Some(b) = text[from..].find(PEM_BEGIN) {
         let begin = from + b;
-        // BEGIN 那一行必须以 `PRIVATE KEY-----` 收尾，否则是证书之类
-        let line_end = text[begin..]
-            .find('\n')
-            .map(|i| begin + i)
-            .unwrap_or(text.len());
-        if !text[begin..line_end].trim_end().ends_with(PEM_KEY) {
-            from = begin + PEM_BEGIN.len();
+        // **不能按换行找那一行的结尾。**请求体是 JSON，里面的换行是
+        // `\n` 两个字符，不是一个换行符 —— 按换行找的话整个 PEM 会落在
+        // 「同一行」里，判据当场失效。而那是这条规则实际会遇到的唯一形态。
+        // 所以按 `-----` 这个界定符找。
+        let head = begin + PEM_BEGIN.len();
+        let Some(h) = text[head..].find("-----") else {
+            from = head;
+            continue;
+        };
+        let head_end = head + h + 5;
+        // `RSA PRIVATE KEY-----` 是，`CERTIFICATE-----` 不是
+        if !text[head..head_end]
+            .trim_end_matches('-')
+            .trim_end()
+            .ends_with("PRIVATE KEY")
+        {
+            from = head;
             continue;
         }
-        let end = match text[line_end..].find("PRIVATE KEY-----") {
-            Some(e) => {
-                let e = line_end + e + "PRIVATE KEY-----".len();
-                // END 之后可能还有换行，不含它
-                e
-            }
+        let end = match text[head_end..].find(PEM_KEY) {
+            Some(e) => head_end + e + PEM_KEY.len(),
             // **没有 END 就不动。**一个半截的 PEM 换掉之后没法还原，
             // 而且它多半是文档里的示意，不是真钥匙
             None => {
-                from = line_end;
+                from = head_end;
                 continue;
             }
         };
@@ -426,6 +432,32 @@ mod tests {
         assert_eq!(got[0].0, Kind::PrivateKeys);
         assert!(got[0].1.starts_with("-----BEGIN RSA"), "{}", got[0].1);
         assert!(got[0].1.ends_with("PRIVATE KEY-----"), "{}", got[0].1);
+    }
+
+    #[test]
+    fn a_pem_inside_a_json_body_is_found_even_though_the_newlines_are_escaped() {
+        // **请求体是 JSON**，里面的换行是 `\n` 两个字符。按真换行找
+        // 「BEGIN 那一行」的话，整个 PEM 会落在同一行里，判据当场失效
+        // —— 而这是这条规则实际会遇到的唯一形态。
+        let body = r#"{"messages":[{"content":"看看这个：-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nAAAA\n-----END RSA PRIVATE KEY-----\n好吗"}]}"#;
+        let got = found(body);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, Kind::PrivateKeys);
+        assert!(got[0].1.starts_with("-----BEGIN RSA"), "{}", got[0].1);
+        assert!(got[0].1.ends_with("PRIVATE KEY-----"), "{}", got[0].1);
+        // 换掉之后 JSON 还得是合法的
+        let r = crate::redact::redact(body, &kinds());
+        serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
+        // 而且能一字不差地换回来
+        assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
+    }
+
+    #[test]
+    fn a_certificate_is_not_a_private_key() {
+        assert!(
+            found(r#"{"c":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"}"#)
+                .is_empty()
+        );
     }
 
     #[test]
