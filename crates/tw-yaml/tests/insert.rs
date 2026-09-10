@@ -108,3 +108,52 @@ fn inserting_into_a_multiline_child_still_lands_in_the_right_place() {
         serde_yaml_ng::Value::String("中转".into())
     );
 }
+
+#[test]
+fn a_flow_mapping_gets_the_new_key_inside_the_braces() {
+    // `- { name: 甲, key: sk-a }` 是完全合法的写法，而 §3.8 的格式保留
+    // 语料里本来就列了「流式与块式混排」。**在下一行插会产出一份解析
+    // 不了的 YAML** —— 护栏会拦住，但那时用户看到的是「这是个 bug，
+    // 请贴到 issue 里」，而他只是用了一种正常写法。
+    let cfg = "providers:\n  - { name: 甲, base_url: \"http://x\", key: sk-a }\n";
+    let out = insert(
+        cfg,
+        &path!["providers", 0, "billing"],
+        &Scalar::s("subscription"),
+    )
+    .unwrap();
+    assert!(out.contains("billing: subscription"), "{out}");
+    assert_eq!(out.lines().count(), cfg.lines().count(), "行数不该变");
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+    assert_eq!(
+        v["providers"][0]["billing"],
+        serde_yaml_ng::Value::String("subscription".into())
+    );
+    assert_eq!(
+        v["providers"][0]["key"],
+        serde_yaml_ng::Value::String("sk-a".into())
+    );
+}
+
+#[test]
+fn the_comma_style_follows_what_is_already_there() {
+    // `{a: 1, b: 2}` 和 `{a: 1,b: 2}` 都有人写。跟着来，比统一成我们的
+    // 偏好更不打扰 —— 这是他的文件
+    let spaced = insert("m: { a: 1, b: 2 }\n", &path!["m", "c"], &Scalar::Int(3)).unwrap();
+    assert!(spaced.contains("b: 2, c: 3"), "{spaced:?}");
+    let tight = insert("m: {a: 1,b: 2}\n", &path!["m", "c"], &Scalar::Int(3)).unwrap();
+    assert!(tight.contains("b: 2,c: 3"), "{tight:?}");
+}
+
+#[test]
+fn a_brace_inside_a_quoted_value_is_not_the_closing_one() {
+    let cfg = "m: { cmd: \"echo }\", a: 1 }\n";
+    let out = insert(cfg, &path!["m", "b"], &Scalar::Int(2)).unwrap();
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+    assert_eq!(v["m"]["cmd"], serde_yaml_ng::Value::String("echo }".into()));
+    assert_eq!(v["m"]["b"], serde_yaml_ng::Value::Number(2.into()));
+}
+
+// 空的 `{}`：解析器根本不为它发出一个 Map 节点，所以这条路走不到。
+// **不为一个退化写法去改解析层** —— 它报的是一句清楚的「没有这个位置」，
+// 而配置里写一个空映射本来也没有意义。

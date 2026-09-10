@@ -446,6 +446,37 @@ pub fn insert(text: &str, path: &[Step], value: &Scalar) -> Result<String, Patch
     if p.anchored {
         return Err(PatchError::AnchorOrAlias(show(parent)));
     }
+    // **行内写法（`{ a: 1, b: 2 }`）要插在花括号里面。**
+    //
+    // 按块式的做法在下一行插，产出的是一份解析不了的 YAML —— 护栏会
+    // 拦住，但那时用户看到的是「这是个 bug，请贴到 issue 里」，而他
+    // 只是用了一种完全合法的写法。§3.8 的格式保留语料里本来就列了
+    // 「流式与块式混排」。
+    if text[p.bytes.start..].starts_with('{') {
+        let close = flow_end(text, p.bytes.start)
+            .ok_or_else(|| PatchError::NotFound(format!("{}（行内映射没收尾）", show(parent))))?;
+        let inner = text[p.bytes.start + 1..close].trim();
+        let rendered = render_scalar(value, ScalarStyle::Plain);
+        let piece = if inner.is_empty() {
+            format!("{key}: {rendered}")
+        } else {
+            // 抄已有的逗号风格：`{a: 1, b: 2}` 和 `{a: 1,b: 2}` 都有人
+            // 写，跟着来比统一成我们的偏好更不打扰 —— 这是他的文件
+            let spaced = text[p.bytes.start..close].contains(", ");
+            format!("{}{key}: {rendered}", if spaced { ", " } else { "," })
+        };
+        // 收尾的 `}` 前面有空格（`{ a: 1 }`）就插在那个空格之前
+        let mut at = close;
+        while at > p.bytes.start + 1 && text.as_bytes()[at - 1] == b' ' {
+            at -= 1;
+        }
+        let mut out = String::with_capacity(text.len() + piece.len());
+        out.push_str(&text[..at]);
+        out.push_str(&piece);
+        out.push_str(&text[at..]);
+        return checked(text, out, path, value);
+    }
+
     // 父映射的直接子节点里，位置最靠后的那个
     let last_child = all
         .iter()
@@ -486,7 +517,45 @@ pub fn insert(text: &str, path: &[Step], value: &Scalar) -> Result<String, Patch
     out.push_str(&rendered);
     out.push_str(&text[end..]);
 
-    // ── 和 `set` 一样的三道护栏 ──────────────────────────────────
+    checked(text, out, path, value)
+}
+
+/// 行内映射从 `{` 开始的那个位置，找到配对的 `}`。
+///
+/// 要认引号里的花括号 —— `{cmd: "a}b"}` 里那个不是收尾。
+fn flow_end(text: &str, open: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    for (i, c) in b.iter().enumerate().skip(open) {
+        match quote {
+            Some(q) => {
+                if *c == b'\\' {
+                    continue;
+                }
+                if *c == q {
+                    quote = None;
+                }
+            }
+            None => match *c {
+                b'"' | b'\'' => quote = Some(*c),
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// `insert` 的三道护栏。**两条路（块式、行内）共用一份** —— 各写一份的
+/// 话，迟早有一条上的检查会比另一条松。
+fn checked(before: &str, out: String, path: &[Step], value: &Scalar) -> Result<String, PatchError> {
     let back = find(&out, path)
         .map_err(|e| PatchError::SelfCheck(format!("插完之后 `{}` 找不回来：{e}", show(path))))?;
     if back.value != value.as_yaml_text() {
@@ -497,7 +566,7 @@ pub fn insert(text: &str, path: &[Step], value: &Scalar) -> Result<String, Patch
         )));
     }
     // 别的字段一个都不能动
-    let before_all = nodes(text)?;
+    let before_all = nodes(before)?;
     let after_all = nodes(&out)?;
     if after_all.len() != before_all.len() + 1 {
         return Err(PatchError::SelfCheck(format!(
