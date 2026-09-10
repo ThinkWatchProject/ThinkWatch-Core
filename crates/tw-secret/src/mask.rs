@@ -45,6 +45,21 @@ pub fn redact_url(url: &str) -> String {
 /// `url: https://user:pass@host`；只看值的形状会漏掉一把长得普通的
 /// 自定义密钥，而它旁边明明写着 `key:`。
 pub fn mask_line(line: &str) -> String {
+    let out = mask_line_by_field(line);
+    // **兜底：不在「值」位置上的凭据 URL 也要打掉。**
+    //
+    // 按字段名那一层是按第一个 `:` 切的，而注释行
+    // `# 上游换成了 https://bob:hunter2@relay/v1` 的第一个 `:` 在
+    // `https` 后面 —— 于是键名是「# 上游换成了 https」，不是密钥名，
+    // 整行原样放过。**而诊断包是带着注释一起交出去的。**
+    if has_userinfo(&out) {
+        redact_urls_within(&out)
+    } else {
+        out
+    }
+}
+
+fn mask_line_by_field(line: &str) -> String {
     let Some(colon) = line.find(':') else {
         return line.to_string();
     };
@@ -79,15 +94,12 @@ pub fn mask_line(line: &str) -> String {
         // 值本身就是个 URL：凭据可能在 userinfo 或 path 里
         redact_url(bare)
     } else if has_userinfo(bare) {
-        // **只是「值里面带了个 URL」，不是「值是个 URL」** —— 而且那个
-        // URL 里带着 `user:pass@`。只把带凭据的那一段打掉。
+        // **只是「值里面带了个 URL」，不是「值是个 URL」。**整段按 URL
+        // 处理会把值的其余部分一起截掉，而那部分往往正是排查时要看的
+        // 东西（`https://a.example.com/v1 那个` 会只剩前半句）。
         //
-        // 反过来（整段按 URL 处理）会把
-        // `exec: ["sh", "-c", "op read op://vault/key"]` 截成
-        // `op read op://vault`：1Password 的 `op://` 恰好是 `exec` 最常见
-        // 的用法，而被截掉的那一半正是用户排查「密钥命令为什么跑不通」
-        // 时唯一要看的东西。**路径不打，userinfo 打** —— 路径里真藏了
-        // 密钥的话，下面按形状那一层还认得出来。
+        // **路径不打，userinfo 打** —— 凭据在 `user:pass@` 里，而路径里
+        // 真藏了密钥的话，下面按形状那一层还认得出来。
         redact_urls_within(bare)
     } else if is_secret_name(&name) || looks_like_credential(bare) {
         mask_secret(bare)
@@ -509,22 +521,20 @@ mod body_tests {
 
     #[test]
     fn a_credential_bearing_url_inside_a_longer_value_is_still_masked() {
-        // 路径不打、userinfo 打（见 mask_line 里那段注释）。
-        let out = mask_config_yaml(
-            "    exec: [\"sh\", \"-c\", \"curl https://bob:hunter2@relay.example.com/v1\"]\n",
-        );
+        // 一段话里夹着一个带凭据的 URL。**userinfo 打，主机名留着** ——
+        // 打掉主机名的话这条注释就没有意义了
+        let out = mask_config_yaml("    # 上游换成了 https://bob:hunter2@relay.example.com/v1\n");
         assert!(!out.contains("hunter2"), "URL 里的凭据漏了：{out}");
         assert!(out.contains("relay.example.com"), "主机名不该打掉：{out}");
     }
 
     #[test]
-    fn the_exec_escape_hatch_stays_readable() {
-        // **`exec` 要能一眼看出跑的是什么** —— 那是这个逃生舱的全部价值，
-        // 而且「密钥命令写错了」正是诊断包要帮人看的东西
-        let out = mask_config_yaml(
-            "    key:\n      exec: [\"sh\", \"-c\", \"op read op://vault/key\"]\n",
-        );
-        assert!(out.contains("op://vault/key"), "{out}");
+    fn a_value_that_merely_contains_a_url_is_not_truncated_at_the_url() {
+        // 看见 `://` 就把整段按 URL 处理的话，这条注释会在第一个 URL
+        // 处被截断 —— 而**后半句往往正是排查时要看的东西**
+        let out = mask_config_yaml("    # 从 https://a.example.com/v1 换到了 /v2，别忘了\n");
+        assert!(out.contains("别忘了"), "后半句被截掉了：{out}");
+        assert!(out.contains("/v1"), "路径不该被打掉：{out}");
     }
 
     #[test]

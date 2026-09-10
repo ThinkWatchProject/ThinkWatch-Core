@@ -32,13 +32,38 @@ pub enum ValidationError {
     NameCollision(String),
     #[error("listen.gateway.allow_from 里的 `{entry}` 写错了：{reason}")]
     BadCidr { entry: String, reason: String },
-    /// **配置文件不该能执行程序。**§3.1 把「配置被同步、被分享、被 AI
-    /// 改」当成目标场景，那时抄一份配置就等于跑一段代码 —— 而用户对一个
-    /// 网关配置文件的心理预期是「里面是设置」。
-    #[error(
-        "provider `{name}` 用的是 `exec` 凭据，而它已经不支持了：配置文件不该能执行程序。\n把密钥直接写在 key: 里，或者写成 ${{VAR}} 从环境变量取。"
-    )]
-    ExecRemoved { name: String },
+    #[error("provider `{name}` 的 key 写法读不懂：{why}")]
+    BadKeyShape { name: String, why: String },
+}
+
+/// `key:` 到底哪儿写错了。
+///
+/// **有 `oauth:` 的时候要让 serde 自己说。**「unknown field `refresh_befor`,
+/// expected one of ...」比我们能补的任何一句话都准（§3.8 那条，只是它
+/// 在 untagged 枚举上失效了，得手动把那条路走一遍）。
+fn explain_key(v: &serde_yaml_ng::Value) -> String {
+    if let Some(inner) = v.get("oauth") {
+        return match serde_yaml_ng::from_value::<crate::OAuth>(inner.clone()) {
+            Ok(_) => "oauth 里面看起来是对的，但整体没匹配上".to_string(),
+            Err(e) => format!("oauth 里 {e}"),
+        };
+    }
+    let keys: Vec<String> = v
+        .as_mapping()
+        .map(|m| {
+            m.keys()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.is_empty() {
+        "要么直接写一个字符串（可以带 ${VAR}），要么写 { oauth: {...} }".to_string()
+    } else {
+        format!(
+            "认不出 `{}`。key 要么是一个字符串（可以带 ${{VAR}}），要么是 {{ oauth: {{...}} }}",
+            keys.join("`、`")
+        )
+    }
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -75,13 +100,14 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 url: p.base_url.clone(),
             });
         }
-        // **`exec` 在这一关拦下来，而不是等到请求时。**它已经删掉了
-        // （配置文件不该能执行程序，见 Secret 的文档），而一份带
-        // `exec` 的老配置必须在这里就说清楚 —— 让它加载成功、再让
-        // 每个请求各自失败，是最难查的那种坏法。
-        if matches!(p.key, crate::Secret::Exec { .. }) {
-            return Err(ValidationError::ExecRemoved {
+        // **`key:` 写错时要说清楚哪儿错了。**serde 的 untagged 在全部
+        // 变体都不匹配时只会说「data did not match any variant」，而这是
+        // 配置里最重要的那个字段 —— 那句话对着它等于什么都没说，还把
+        // 每一种写错都塌成同一句。
+        if let crate::Secret::Unknown(v) = &p.key {
+            return Err(ValidationError::BadKeyShape {
                 name: p.name.clone(),
+                why: explain_key(v),
             });
         }
         if p.key.is_blank() {
@@ -213,6 +239,33 @@ mod tests {
             vec![p("r", "https://x.com")],
         ));
         assert!(matches!(e, Err(ValidationError::DuplicateKey(..))));
+    }
+
+    #[test]
+    fn a_key_written_in_a_shape_we_do_not_accept_says_which_shape_it_saw() {
+        // untagged 枚举全部不匹配时，serde 只会说「data did not match any
+        // variant」—— 而这是配置里最重要的那个字段
+        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      whatever: 1\n";
+        let e = crate::try_parse(y).unwrap_err().message;
+        assert!(e.contains("whatever"), "没说看见了什么：{e}");
+        assert!(e.contains("oauth"), "没说该写成什么：{e}");
+    }
+
+    #[test]
+    fn an_oauth_key_with_a_typo_lets_serde_say_which_field() {
+        // **serde 自己的话比我们能补的任何一句都准**（§3.8）——
+        // 只是在 untagged 枚举上它不出声，得手动把那条路再走一遍
+        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      oauth:\n        refresh: r\n        endpoint: https://a/token\n        refresh_befor: 5m\n";
+        let e = crate::try_parse(y).unwrap_err().message;
+        assert!(e.contains("refresh_befor"), "{e}");
+        assert!(e.contains("refresh_before"), "没提示正确的拼法：{e}");
+    }
+
+    #[test]
+    fn an_oauth_key_missing_a_required_field_says_which_one() {
+        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      oauth:\n        endpoint: https://a/token\n";
+        let e = crate::try_parse(y).unwrap_err().message;
+        assert!(e.contains("refresh"), "{e}");
     }
 
     #[test]

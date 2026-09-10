@@ -29,7 +29,7 @@ pub enum ProxyKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyAuth {
     pub user: String,
-    /// 支持 `${ENV}` 和 `exec`，和 provider 的 key 同一套
+    /// 支持 `${ENV}`，和 provider 的 key 同一套
     pub pass: crate::Secret,
 }
 
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn auth_reads_the_password_through_the_secret_machinery() {
-        // 代理密码和 provider 的 key 走同一套：明文、${ENV}、exec 都行。
+        // 代理密码和 provider 的 key 走同一套：明文和 ${ENV}。
         unsafe { std::env::set_var("TW_TEST_PROXY_PASS", "hunter2") };
         let auth = ProxyAuth {
             user: "alice".into(),

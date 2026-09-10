@@ -551,8 +551,7 @@ fn cmd_check(path: &Path) -> Result<()> {
                     p.name,
                     tw_secret::redact_url(&p.base_url),
                     proto,
-                    // 说来源而不是值。**这个文件里已经没有任何会执行
-                    // 东西的字段了**（`exec` 删掉了，见 Secret 的文档）。
+                    // 说来源而不是值。
                     p.key.describe()
                 );
                 // OAuth 不在这里换 token：那是一次网络往返，而 check

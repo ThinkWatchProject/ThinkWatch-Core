@@ -45,8 +45,8 @@ pub struct L1Result {
     pub error: Option<String>,
 }
 
-/// 代理怎么走。调用方从 `tw_config::Proxy` 解析好再传进来 —— 密码可能
-/// 来自 `exec`，那是个会阻塞的操作，不该混进计时里。
+/// 代理怎么走。调用方从 `tw_config::Proxy` 解析好再传进来 —— 解析密码
+/// 是这一层之外的事，不该混进计时里。
 #[derive(Debug, Clone)]
 pub struct ProxyHop {
     pub kind: tw_config::ProxyKind,

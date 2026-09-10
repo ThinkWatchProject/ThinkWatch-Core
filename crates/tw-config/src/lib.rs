@@ -267,53 +267,41 @@ pub struct Client {
 /// serde 的 untagged 让第一种是裸字符串 —— 配置文件里看不出 `${ENV}`
 /// 和明文的区别，也不该看出。
 ///
-/// # `exec` 去哪儿了
-///
-/// **删掉了**，理由是配置文件不该能执行程序。
-///
-/// §3.1 明确把「配置被同步、被分享、**被 AI 改**」当成目标场景，而
-/// `key: { exec: [...] }` 让「抄一份配置」等于「跑一段代码」——
-/// 用户对一个网关配置文件的心理预期是「里面是设置」，不是「里面能
-/// 执行程序」。本机攻击者反正能改 `.zshrc` 这个反驳，对「配置从别处
-/// 来」不成立。
-///
-/// 这个变体留着**只为了报一句人话**：没有它，一份老配置会撞上
-/// serde 的「data did not match any variant of untagged enum Secret」，
-/// 而那句话帮不了任何人。**它没有任何执行路径** —— 校验那一关就把
-/// 整份配置拦下来了。
+/// **没有「跑一条命令拿密钥」这一类，而且不会有**（§3.2）：配置文件
+/// 不该能执行程序 —— §3.1 把「配置被同步、被分享、被 AI 改」当成目标
+/// 场景，那时抄一份配置就等于跑一段代码。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Secret {
     /// 明文，或含 `${ENV}` 的字符串
     Literal(String),
-    /// **已经删掉的形态**，认出来只为了报一句人话。见枚举的文档。
-    Exec {
-        exec: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout_secs: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl: Option<String>,
-    },
     /// OAuth，带自动刷新（§3.6）。
     OAuth { oauth: OAuth },
+    /// 什么形状都没匹配上。**存在的唯一理由是报一句人话。**
+    ///
+    /// serde 的 untagged 在全部变体都不匹配时只会说
+    /// 「data did not match any variant of untagged enum Secret」——
+    /// 而这是配置里最重要的那个字段，那句话对着它等于什么都没说。
+    /// 更糟的是它把**每一种**写错都塌成同一句：`oauth` 少写一个必填
+    /// 字段和随手打错一个键名，报出来一模一样。
+    ///
+    /// 有了这个兜底，`validate` 那一关才有机会拿着真实的值去说清楚
+    /// 到底哪儿不对。**注意它必须排在最后** —— untagged 是按顺序试的。
+    #[serde(skip_serializing)]
+    Unknown(serde_yaml_ng::Value),
 }
 
-/// OAuth 凭据（§3.6 第 4 类）。
+/// OAuth 凭据（§3.6 第 3 类）。
 ///
-/// # 一条要写在最前面的边界
+/// # 轮换
 ///
-/// **轮换 refresh token 的服务器不在支持范围里。**很多 OAuth2 服务器
-/// 每次刷新都发一个新的 refresh token 并作废旧的；那意味着我们得把新的
-/// **写回用户的 config.yaml**，而那是个自动的、用户没要求的写入 ——
-/// 一个会自己改你配置文件的网关，比一个说「这种情况请用 `exec`」的
-/// 网关可怕得多。
+/// 很多 OAuth2 服务器每次刷新都换发一个新的 refresh token 并作废旧的。
+/// 我们**把新的写回 config.yaml**（§3.6）—— 那是一次用户没要求的写入，
+/// 但不写回更糟：**换发新的那一刻旧的已经在服务端作废了**，不写回等于
+/// 让配置文件从那一秒起就是坏的，只是症状延迟到下一次重启。
 ///
-/// 检测到轮换时我们会用新的（本进程内），同时**发一个事件说清「重启
-/// 之后要你自己更新 config.yaml」** —— 而不是等下次重启时莫名其妙地
-/// 全是 401。
-///
-/// 真正需要轮换的场景走 `exec`：§3.6 自己说了那是个「便宜又通用的
-/// 逃生舱」，任何能用一条命令换到 token 的上游都不需要专门的适配器。
+/// 写回只动那一个标量（span 补丁），而且不进配置历史 —— 回滚到一次
+/// 轮换之前拿到的是一个作废的 token，那不是可以退回去的状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuth {
@@ -363,17 +351,17 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
 impl Secret {
     /// 拿到真正的密钥。
     ///
-    /// **每次调用都会重新跑 exec**。不缓存是有意的：`op read` 那类命令
-    /// 背后是一个会过期的会话，缓存住会让「昨天还好好的，今天全是 401」
-    /// 变得无法解释。真需要缓存时，那是一个显式的 TTL 配置，不是默认行为。
+    /// **同步**：展开 `${ENV}` 就到头了。OAuth 那一类要联网换 token，
+    /// 走不了这条路 —— 它返回 `NeedsRefresh`，由网关那边的异步路径处理。
     pub fn resolve(&self) -> Result<String, SecretResolveError> {
         match self {
             Secret::Literal(s) => Ok(tw_secret::expand_from_env(s)?),
-            Secret::Exec { .. } => Err(SecretResolveError::ExecRemoved),
             // **OAuth 走不了同步这条路**：换 token 是一次网络往返。
             // 调用方要么走异步那条（网关），要么把这一句原样说给用户听
             // （`twcore check`）—— 都比在这里编一个值好
             Secret::OAuth { .. } => Err(SecretResolveError::NeedsRefresh),
+            // 到不了这儿：校验那一关先把整份配置拒了
+            Secret::Unknown(_) => Err(SecretResolveError::Unreadable),
         }
     }
 
@@ -394,21 +382,21 @@ impl Secret {
         match self {
             Secret::Literal(s) if s.contains("${") => format!("环境变量 {s}"),
             Secret::Literal(s) => tw_secret::mask_secret(s),
-            Secret::Exec { .. } => "exec（已不支持）".to_string(),
             // **不回显任何一段 token** —— refresh token 比 access token
             // 更值钱，它换得出无数个 access
             Secret::OAuth { oauth } => format!("OAuth（{}）", oauth.endpoint),
+            Secret::Unknown(_) => "（这个 key 读不懂）".to_string(),
         }
     }
 
     pub(crate) fn is_blank(&self) -> bool {
         match self {
             Secret::Literal(s) => s.trim().is_empty(),
-            // 空不空都不算数，校验那一关会先把它拦下来
-            Secret::Exec { .. } => false,
             Secret::OAuth { oauth } => {
                 oauth.refresh.trim().is_empty() || oauth.endpoint.trim().is_empty()
             }
+            // 「读不懂」是另一回事，由 `BadKeyShape` 单独报
+            Secret::Unknown(_) => false,
         }
     }
 }
@@ -433,10 +421,8 @@ pub enum SecretResolveError {
     /// OAuth 凭据要去换 token，那是一次网络往返，同步这条路走不了。
     #[error("这是一个 OAuth 凭据，要联网换 token —— 网关起来之后才会去换")]
     NeedsRefresh,
-    #[error(
-        "`exec` 凭据已经不支持了：配置文件不该能执行程序（§3.1 把「配置被同步、被分享、被 AI 改」当成目标场景，而那时抄一份配置就等于跑一段代码）。把密钥直接写在 key: 里，或者用 ${{ENV}} 从环境变量取。"
-    )]
-    ExecRemoved,
+    #[error("这个 key 的写法读不懂")]
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,7 +430,7 @@ pub enum SecretResolveError {
 pub struct Provider {
     pub name: String,
     pub base_url: String,
-    /// 明文、`${ENV}`、或 `{ exec: [...] }`。见 §3.2 —— 不做 keychain。
+    /// 明文、`${ENV}`、或 `{ oauth: {...} }`。见 §3.2 —— 不做 keychain。
     pub key: Secret,
     /// 不写就从 base_url 猜（§3.3 的最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -673,7 +659,7 @@ impl Provider {
         })
     }
 
-    /// 拿到真正的 key（展开 `${ENV}` 或跑 `exec`）。
+    /// 拿到真正的 key（展开 `${ENV}`）。
     pub fn resolved_key(&self) -> Result<String, SecretResolveError> {
         self.key.resolve()
     }
@@ -921,33 +907,6 @@ providers:
     }
 
     #[test]
-    fn an_old_exec_key_still_parses_so_that_validation_can_explain_itself() {
-        let y = r#"
-version: 1
-clients:
-  - { name: default, key: tw-1 }
-providers:
-  - name: p
-    base_url: https://x.com
-    key:
-      exec: ["op", "read", "op://vault/anthropic/key"]
-"#;
-        let cfg: Config = serde_yaml_ng::from_str(y).unwrap();
-        match &cfg.providers[0].key {
-            Secret::Exec {
-                exec, timeout_secs, ..
-            } => {
-                assert_eq!(exec[0], "op");
-                assert!(timeout_secs.is_none());
-            }
-            other => panic!("{other:?}"),
-        }
-        // describe 是给人看的。**不能让它看起来还能用** —— 这个形状
-        // 现在只是「认得出来，好报一句人话」
-        assert!(cfg.providers[0].key.describe().contains("已不支持"));
-    }
-
-    #[test]
     fn describe_never_leaks_a_literal_key() {
         // 这个方法会出现在 UI、日志、错误信息里。
         let s = Secret::Literal("sk-ant-api03-verysecretvalue".into());
@@ -963,35 +922,6 @@ providers:
             Secret::Literal("${MY_KEY}".into()).describe(),
             "环境变量 ${MY_KEY}"
         );
-    }
-
-    #[test]
-    fn an_exec_key_is_recognised_only_to_say_a_sentence_a_person_can_act_on() {
-        // **配置文件不该能执行程序。**这个变体留着只为了报人话 ——
-        // 没有它，一份老配置撞上的是 serde 的「data did not match any
-        // variant of untagged enum Secret」，那句话帮不了任何人。
-        let s = Secret::Exec {
-            exec: vec!["echo".into(), "sk-1".into()],
-            timeout_secs: None,
-            ttl: None,
-        };
-        let e = s.resolve().unwrap_err().to_string();
-        assert!(e.contains("不支持"), "{e}");
-        assert!(
-            e.contains("${VAR}") || e.contains("环境变量"),
-            "没说该改成什么：{e}"
-        );
-        // 摘要里也不能让它看起来还能用
-        assert!(s.describe().contains("已不支持"), "{}", s.describe());
-    }
-
-    #[test]
-    fn a_config_with_an_exec_key_is_rejected_at_load_time_not_at_request_time() {
-        // 让它加载成功、再让每个请求各自失败，是最难查的那种坏法
-        let text = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      exec: [\"op\", \"read\", \"op://v/k\"]\n";
-        let r = try_parse(text).unwrap_err();
-        assert!(r.message.contains("exec"), "{}", r.message);
-        assert!(r.message.contains("不支持"), "{}", r.message);
     }
 
     #[test]

@@ -300,7 +300,7 @@ impl AppState {
     }
 
     /// 取这一家的密钥。**OAuth 那一类要联网换 token，所以这条路是
-    /// async 的**（§3.6）；`literal` 和 `exec` 走同步那条，零额外成本。
+    /// async 的**（§3.6）；明文和 `${ENV}` 走同步那条，零额外成本。
     ///
     /// `http` 必须是**这一家自己的** client：换 token 要走它该走的代理
     /// （§3.7）。用一个干净的 client 去换，代理后面的用户会得到一个
@@ -895,7 +895,7 @@ async fn pipeline(
         let key = match state.key_for(provider, http).await {
             Ok(k) => k,
             Err(e) => {
-                // 密钥取不到是这一家的问题（exec 命令挂了、token 端点
+                // 密钥取不到是这一家的问题（环境变量没设、token 端点
                 // 连不上），换下一家是合理的 —— 而且**必须**换：不换的话
                 // 一家 OAuth 上游的 token 端点抽风会让整个网关不可用。
                 state.health.record_failure(&provider.name);
