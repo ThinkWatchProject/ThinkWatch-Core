@@ -1,0 +1,12 @@
+[package]
+name = "tw-dialect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "方言互转：Anthropic 与 OpenAI chat 之间的请求与响应翻译"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

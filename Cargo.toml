@@ -17,6 +17,7 @@ members = [
     "crates/tw-adopt",
     "crates/tw-scan",
     "crates/tw-redact",
+    "crates/tw-dialect",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
@@ -59,6 +60,7 @@ tw-pricing  = { path = "crates/tw-pricing" }
 tw-adopt    = { path = "crates/tw-adopt" }
 tw-scan     = { path = "crates/tw-scan" }
 tw-redact   = { path = "crates/tw-redact" }
+tw-dialect  = { path = "crates/tw-dialect" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
