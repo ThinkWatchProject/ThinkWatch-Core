@@ -45,11 +45,11 @@ impl GroupType {
     ///
     /// UI 上选中时要给一句提示 —— **不要让用户为了省 20% 的单价，
     /// 付出丢掉 90% 缓存折扣的代价**（§3.4）。
+    /// 这个**策略类型**天生会不会让 prompt cache 不稳定。
+    ///
+    /// 具体到一个组还要看它的配置 —— 用 [`Group::hurts_cache`]。
     pub fn hurts_cache(&self) -> bool {
-        matches!(
-            self,
-            GroupType::LoadBalance | GroupType::UrlTest | GroupType::Cheapest
-        )
+        matches!(self, GroupType::LoadBalance | GroupType::UrlTest)
     }
 
     /// 排顺序时要不要用到运行时的数字。
@@ -93,6 +93,10 @@ pub struct Facts {
 /// 叫 `type`，所以「顺手写成 `kind:`」几乎是必然会发生的。没有这一行的
 /// 时候它会被静默丢掉，用户得到一个 fallback 组，然后困惑于「我明明配了
 /// 负载均衡」。这个项目已经栽过一次同样的（`listen: { addr: ... }`）。
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
@@ -100,12 +104,42 @@ pub struct Group {
     #[serde(default, rename = "type")]
     pub kind: GroupType,
     pub providers: Vec<String>,
-    /// `load-balance` 必须开。同一个会话固定走同一家，缓存才能保住。
-    #[serde(default)]
+    /// 同一个会话固定走同一家，缓存才能保住。
+    ///
+    /// **默认开，而且这个默认值是这一节最重要的一行。**不开的话，一次
+    /// 长会话每轮跳一家，prompt cache 全部失效 —— 而缓存命中与否成本
+    /// 差 5 到 10 倍（§3.4）。「分散负载」换来的是账单翻几倍，而单用户
+    /// 桌面场景根本没有需要分散的负载。
+    ///
+    /// 真想要纯轮询的人写一句 `session_affinity: false`，那是个明确的
+    /// 选择；而默认关掉，是让每一个不知道这件事的人默默付那笔钱。
+    #[serde(default = "default_true")]
     pub session_affinity: bool,
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+}
+
+impl Group {
+    /// 这个组**按现在这份配置**会不会让 prompt cache 不稳定。
+    ///
+    /// 三种情况分开看：
+    ///
+    /// - `load-balance` **开了粘滞就不伤缓存**：同一次对话始终落在同
+    ///   一家，缓存该命中还是命中。把它一律标成危险是个假警报，而假
+    ///   警报的代价是用户学会忽略这一栏的所有提示（§0.6：没有风险的
+    ///   时候要说「安全」）。
+    /// - `url-test` **会伤**：排序随实测延迟变，一次对话中途完全可能
+    ///   换家。
+    /// - `cheapest` **不伤**：单价在一次对话里不会变，所以顺序是稳的
+    ///   —— 它换家的时机和 `fallback` 一样，只在上游不健康时。
+    pub fn hurts_cache(&self) -> bool {
+        match self.kind {
+            GroupType::LoadBalance => !self.session_affinity,
+            GroupType::UrlTest => true,
+            GroupType::Fallback | GroupType::Select | GroupType::Cheapest => false,
+        }
+    }
 }
 
 /// 按策略排序。**纯函数** —— 同样的输入永远给同样的顺序，试算页因此
@@ -154,8 +188,13 @@ fn rotate(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
             // —— 计数器会让「重启之后同一个会话换了一家」，而那正是
             // 粘滞要防的
             Some(s) => (hash64(s) % members.len() as u64) as usize,
-            // 认不出会话：这一条没有粘滞可言，按 seq 轮转
-            None => (f.seq % members.len() as u64) as usize,
+            // **认不出会话就钉住第一家，不要轮转。**
+            //
+            // 用户开粘滞是在说「别在一次对话里换家」。认不出这条属于
+            // 哪次对话的时候去轮转，做的正好是他要求的反面 —— 而那
+            // 时候的代价照样是缓存全废。钉住会让这部分流量集中在一家，
+            // 但**不均衡是可以看见的，缓存失效不是**。
+            None => 0,
         }
     } else {
         (f.seq % members.len() as u64) as usize
@@ -166,13 +205,21 @@ fn rotate(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
     out
 }
 
-/// 会话指纹 → 一个数。**不用于安全**，只要稳定：同一个字符串在同一个
-/// 版本里永远给同一个数。
+/// 会话指纹 → 一个数。FNV-1a。
+///
+/// **不用 `DefaultHasher`。**它是 std 的 SipHash，文档明说不保证跨版本
+/// 稳定 —— 而这个数字决定一次对话钉在哪一家。它一变，所有正在进行的
+/// 会话会在同一时刻集体换家，**一次性把全部 prompt cache 作废**，而
+/// 现场表现只是「今天账单突然高了」，没有任何东西指向一次 Rust 升级。
+///
+/// 自己写五行，换来的是这个映射永远不变。不用于安全，只要稳定。
 fn hash64(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// 横切的安全策略（DESIGN.md §5.1、§5.2）。
@@ -1196,5 +1243,66 @@ mod tests {
             );
             assert!(!kind.needs_runtime());
         }
+    }
+    #[test]
+    fn the_session_to_slot_mapping_is_frozen_forever() {
+        // **这条测试就是那个「不许改」的锁。**这个数字决定一次对话钉在
+        // 哪一家；改掉它等于让所有正在进行的会话同时换家，一次性作废
+        // 全部 prompt cache —— 而现场表现只是「今天账单突然高了」。
+        //
+        // 真要换算法的话，先想清楚怎么让已经在跑的会话平滑过去。
+        assert_eq!(hash64(""), 0xcbf2_9ce4_8422_2325);
+        // 这三个值是用一份独立的 FNV-1a 实现（python）算出来的，
+        // 不是把这段代码的输出抄回来 —— 后者只能证明它没变，证明不了
+        // 它是对的
+        assert_eq!(hash64("会话-abc"), 16_378_437_173_232_644_658);
+        assert_eq!(hash64("a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn load_balance_is_sticky_unless_you_explicitly_turn_it_off() {
+        // **默认值站在缓存这边。**不写 session_affinity 的人，是不知道
+        // 这件事的人 —— 而默认关掉就是让他默默付那笔钱
+        let y = "name: 池子\ntype: load-balance\nproviders: [甲, 乙]\n";
+        let g: Group = serde_yaml_ng::from_str(y).unwrap();
+        assert!(g.session_affinity, "默认没开粘滞");
+        assert!(!g.hurts_cache(), "开着粘滞还报「会伤缓存」是个假警报");
+
+        let off: Group = serde_yaml_ng::from_str(&format!("{y}session_affinity: false\n")).unwrap();
+        assert!(!off.session_affinity);
+        assert!(off.hurts_cache(), "关了粘滞就该直说会伤缓存");
+    }
+
+    #[test]
+    fn an_unrecognisable_session_pins_instead_of_rotating() {
+        // 用户开粘滞是在说「别在一次对话里换家」。认不出这条属于哪次
+        // 对话时去轮转，做的正好是他要求的反面
+        let g = grp(GroupType::LoadBalance, true);
+        for seq in 0..6 {
+            let f = Facts {
+                session: None,
+                seq,
+                ..Default::default()
+            };
+            assert_eq!(
+                order_by(&g, &g.providers, &f)[0],
+                "甲",
+                "认不出会话时还在转"
+            );
+        }
+    }
+
+    #[test]
+    fn cheapest_does_not_get_flagged_as_cache_hostile() {
+        // 单价在一次对话里不会变，所以它的顺序是稳的 —— 换家的时机和
+        // fallback 一样，只在上游不健康时。**没有风险的时候要说「安全」**
+        let mut g = grp(GroupType::Cheapest, false);
+        g.kind = GroupType::Cheapest;
+        assert!(!g.hurts_cache());
+        let u = Group {
+            kind: GroupType::UrlTest,
+            ..g.clone()
+        };
+        assert!(u.hurts_cache(), "url-test 的排序随实测延迟变，会伤");
     }
 }
