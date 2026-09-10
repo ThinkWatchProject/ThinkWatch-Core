@@ -13,6 +13,7 @@ regex = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tw-adopt = { workspace = true }
+tw-config = { workspace = true }
 notify = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

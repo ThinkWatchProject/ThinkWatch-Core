@@ -646,7 +646,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
-pub use security::{Mode as SecurityMode, Security};
+pub use security::{Mode as SecurityMode, ScanRule, ScanRules, Security};
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;

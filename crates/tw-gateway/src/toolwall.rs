@@ -266,7 +266,7 @@ mod tests {
     use super::*;
 
     fn rules() -> Arc<Rules> {
-        Arc::new(tw_scan::rules::parse(tw_scan::rules::BUILTIN, "内置").unwrap())
+        Arc::new(tw_scan::rules::build(&tw_config::ScanRules::default()).unwrap())
     }
 
     fn start(index: u64, name: &str) -> String {

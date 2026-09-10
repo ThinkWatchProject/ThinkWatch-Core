@@ -41,6 +41,43 @@ impl Mode {
     }
 }
 
+/// 用户自己加的一条扫描规则（§5.3）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanRule {
+    pub id: String,
+    pub pattern: String,
+    /// **为什么它值得看一眼。**没有这一句，一条命中就只是个规则 id
+    pub why: String,
+    /// `dangerous`（命令）或 `injection`（提示注入）。不写按前者算
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `high` 或 `medium`。**不写按 medium 算** —— 用户新加的规则默认
+    /// 只告警不切断，要它动手得自己写明白（§9.7 的「零值 = 安全」）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+}
+
+/// 扫描规则的用户改动（§5.3）。
+///
+/// **加法加停用，不是整份替换。**替换看起来更「干净」，但它有和
+/// cc-switch 那个白名单一模一样的毛病（§7.11）：用户复制一份内置规则再
+/// 改两条之后，**他那份就永远停在复制的那一刻了** —— 我们后来加的每一条
+/// 新攻击模式都到不了他机器上，而他不会察觉。
+///
+/// 所以：加的写进 `add`，不要的写进 `disable`（按 id）。「现在到底哪些
+/// 规则生效」这个问题由界面回答，而不是靠逼用户抄一份。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanRules {
+    /// 在内置规则之外再加这些
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add: Vec<ScanRule>,
+    /// 停用内置规则里的这几条，按 id
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+}
+
 /// 三道防线（§5）。
 ///
 /// **比 `{ enabled: false } + shadow_mode: true` 清爽得多** —— 那是两个
@@ -57,6 +94,17 @@ pub struct Security {
     /// 配置扫描。「拦截」态的动作是**告警** —— 它本来就不删东西（§5.3）
     #[serde(default)]
     pub scan_configs: Mode,
+    /// 扫描规则的增删（§5.3）。
+    ///
+    /// **它住在这里，而不是另一个文件里**：§3.1 说 `config.yaml` 是唯一
+    /// 的配置文件，而规则集是用户会去调的策略，不是数据。住在这里还白捡
+    /// 了变更历史和一键回滚（§3.8）—— 单独一个文件那两样都没有。
+    #[serde(default, skip_serializing_if = "is_default_scan_rules")]
+    pub scan_rules: ScanRules,
+}
+
+fn is_default_scan_rules(r: &ScanRules) -> bool {
+    r.add.is_empty() && r.disable.is_empty()
 }
 
 impl Security {

@@ -143,16 +143,20 @@ fn main() -> Result<()> {
 
 /// 静态扫描（§5.3）。**只报告，不删任何东西。**
 fn cmd_scan(config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
-    let dir = config.parent().unwrap_or(Path::new("."));
-    let (rules, warn) = tw_scan::rules::load(dir);
-    if let Some(w) = &warn {
+    // 规则住在 config.yaml 的 `security.scan_rules` 里（§3.1：只有一份
+    // 配置文件）。读不出配置时用内置那套 —— 扫描不该因为配置坏了就停摆
+    let user = tw_config::load(config)
+        .map(|c| c.security.scan_rules.clone())
+        .unwrap_or_default();
+    let rules = tw_scan::rules::build(&user)?;
+    for w in &rules.warnings {
         println!("⚠ {w}");
     }
     let mut srcs = tw_scan::sources::user_level(&home());
     for p in &projects {
         srcs.extend(tw_scan::sources::in_project(p));
     }
-    println!("扫了 {} 份文件（规则来自{}）", srcs.len(), rules.origin);
+    println!("扫了 {} 份文件（规则 {}）", srcs.len(), rules.summary());
     let r = tw_scan::report::scan(&srcs, &rules);
 
     if inventory {

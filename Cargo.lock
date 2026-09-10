@@ -2851,6 +2851,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tw-adopt",
+ "tw-config",
 ]
 
 [[package]]

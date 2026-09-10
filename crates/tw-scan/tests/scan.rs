@@ -55,8 +55,8 @@ fn bed() -> Bed {
 }
 
 fn run(home: &Path) -> tw_scan::report::Report {
-    let (rules, warn) = rules::load(Path::new("/不存在的目录"));
-    assert!(warn.is_none());
+    let rules = rules::build(&tw_config::ScanRules::default()).unwrap();
+    assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
     scan(&sources::user_level(home), &rules)
 }
 
@@ -218,7 +218,7 @@ fn a_file_we_cannot_read_is_said_out_loud() {
     write(&p, "x");
     let srcs = sources::user_level(&b.home);
     std::fs::remove_file(&p).unwrap();
-    let (rules, _) = rules::load(Path::new("/不存在"));
+    let rules = rules::build(&tw_config::ScanRules::default()).unwrap();
     let r = scan(&srcs, &rules);
     assert_eq!(r.unreadable.len(), 1, "{:?}", r.unreadable);
 }

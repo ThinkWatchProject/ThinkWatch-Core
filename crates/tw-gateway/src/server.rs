@@ -172,10 +172,15 @@ impl Runtime {
         }
         let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
             .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
-        // 规则集编译一次，跟着运行时一起换。**用户那份写坏了退回内置**
-        // —— 一个因为配置写错就整个不工作的安全功能等于没有（§5.3）
-        let (rules, warn) = tw_scan::rules::load(&tw_config::default_dir());
-        if let Some(w) = warn {
+        // 规则集编译一次，跟着运行时一起换 —— 它现在住在 config.yaml 的
+        // `security.scan_rules` 里，所以「改了规则」和「改了别的配置」
+        // 走同一条热重载路径（§3.1、§5.3）。
+        //
+        // **用户写坏的那几条被跳过，其余照常工作**：一个因为配置写错就
+        // 整个不工作的安全功能等于没有。但跳过要大声说出来。
+        let rules = tw_scan::rules::build(&config.security.scan_rules)
+            .map_err(|e| GatewayError::config(e.to_string()))?;
+        for w in &rules.warnings {
             tracing::warn!("{w}");
         }
         Ok(Self {
