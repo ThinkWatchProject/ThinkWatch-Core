@@ -29,98 +29,30 @@ pub struct Finding {
     pub masked: String,
 }
 
-/// 认得出来的几种凭据。
-///
-/// **只收前缀明确、长度固定的那些。**「一长串看起来随机的字符」这种
-/// 判据在真实请求体里会疯狂误报 —— 代码里的 hash、base64 的图片、
-/// UUID，全都长那样。宁可漏，不可吵：一个天天误报的安全功能，用户第
-/// 二天就关了（§5.0）。
-const PATTERNS: &[(&str, &str, usize)] = &[
-    // (前缀, 人话, 前缀之后至少还要有多少个字符)
-    ("sk-ant-", "Anthropic API key", 20),
-    ("sk-proj-", "OpenAI project key", 20),
-    ("ghp_", "GitHub personal token", 30),
-    ("gho_", "GitHub OAuth token", 30),
-    ("github_pat_", "GitHub fine-grained token", 30),
-    ("xoxb-", "Slack bot token", 20),
-    ("xoxp-", "Slack user token", 20),
-    ("AKIA", "AWS access key id", 12),
-    ("AIza", "Google API key", 30),
-    ("ya29.", "Google OAuth token", 20),
-    ("glpat-", "GitLab token", 15),
-    ("sk_live_", "Stripe live key", 20),
-];
-
-/// 单独处理 `sk-` 开头的 OpenAI 老式 key：它的前缀太短，要靠长度和
-/// 字符集把它和 `sk-test` 这种占位符分开。
-const OPENAI_MIN: usize = 40;
-
-fn is_tok(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
-}
-
 /// 扫一遍请求体。
 ///
-/// **在 token 边界上匹配。**`xsk-ant-…` 里的 `sk-ant-…` 不是一把密钥，
-/// 而按子串找会把它算上 —— 那种误报没法解释。
+/// **规则本身住在 [`tw_redact::rules`] 里，这里只是把它接到观察态上。**
+/// 「什么东西看起来像凭据」这个知识不能有两份 —— 观察态报了而拦截态没
+/// 脱、或者反过来，都是用户没法理解的行为，而且没人会注意到它在漂移。
 pub fn scan(body: &[u8]) -> Vec<Finding> {
     // 只看 UTF-8 的那部分。二进制体（图片之类）里不会有粘贴进来的 key
     let text = String::from_utf8_lossy(body);
-    let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Finding> = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if i > 0 && is_tok(chars[i - 1]) {
-            i += 1;
-            continue;
-        }
-        let mut j = i;
-        while j < chars.len() && is_tok(chars[j]) {
-            j += 1;
-        }
-        if j > i {
-            let tok: String = chars[i..j].iter().collect();
-            if let Some(kind) = classify(&tok) {
-                let f = Finding {
-                    kind: kind.to_string(),
-                    // **打码之后才记。**「发现了 sk-ant-xxx」这句话本身
-                    // 就是一次泄漏。
-                    masked: tw_secret::mask_secret(&tok),
-                };
-                if !out.contains(&f) {
-                    out.push(f);
-                }
-            }
-            i = j;
-        } else {
-            i += 1;
+    // 观察态**看全部类别** —— 它的作用是攒证据，而不是按某一家的配置
+    // 决定看什么
+    for h in tw_redact::rules::scan(&text, tw_redact::rules::Kind::all()) {
+        let f = Finding {
+            kind: h.what.to_string(),
+            // **打码之后才记。**「发现了 sk-ant-xxx」这句话本身就是一次
+            // 泄漏 —— 它会进日志、进界面、被复制到 issue 里（§9.7）
+            masked: tw_secret::mask_secret(&text[h.bytes]),
+        };
+        if !out.contains(&f) {
+            out.push(f);
         }
     }
     out
 }
-
-fn classify(tok: &str) -> Option<&'static str> {
-    for (prefix, kind, min_tail) in PATTERNS {
-        if let Some(tail) = tok.strip_prefix(prefix)
-            && tail.len() >= *min_tail
-        {
-            return Some(kind);
-        }
-    }
-    // OpenAI 老式：`sk-` 加一长串。**要求更长**，否则 `sk-test`、
-    // `sk-xxxxx` 这些占位符会天天报。
-    if let Some(tail) = tok.strip_prefix("sk-")
-        && tok.len() >= OPENAI_MIN
-        && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        // 全是字母或全是数字的一长串多半是别的东西（hash、id）
-        && tail.chars().any(|c| c.is_ascii_digit())
-        && tail.chars().any(|c| c.is_ascii_alphabetic())
-    {
-        return Some("OpenAI API key");
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

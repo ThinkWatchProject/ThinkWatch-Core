@@ -1,0 +1,13 @@
+[package]
+name = "tw-redact"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "出站脱敏与回显还原：把凭据换成占位符，再在响应里换回来"
+
+[dependencies]
+serde = { workspace = true }
+base64 = { workspace = true }
+tw-secret = { workspace = true }

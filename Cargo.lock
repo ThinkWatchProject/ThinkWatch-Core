@@ -2655,6 +2655,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tw-engine",
+ "tw-redact",
  "tw-secret",
  "tw-types",
 ]
@@ -2745,6 +2746,7 @@ dependencies = [
  "tw-engine",
  "tw-observe",
  "tw-pricing",
+ "tw-redact",
  "tw-secret",
  "tw-types",
 ]
@@ -2806,6 +2808,15 @@ dependencies = [
  "tw-types",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "tw-redact"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "tw-secret",
 ]
 
 [[package]]
