@@ -930,8 +930,10 @@ async fn pipeline(
     // 之后再拦已经没有意义，客户端下一步就拿到全文了。
     let inspect = rt.config.security.inspect_tools;
     let trust = crate::guard::effective_trust(provider, &decision.guard);
-    let mut wall =
-        (is_sse && inspect.detects()).then(|| crate::toolwall::Wall::new(rt.rules.clone()));
+    // 正文里的提示注入**只对不受信任的上游查**（§5.2 末尾）：官方端点上
+    // 模型讲解提示注入是完全正常的
+    let mut wall = (is_sse && inspect.detects())
+        .then(|| crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()));
     let wall_provider = provider.name.clone();
     let stream = async_stream::stream! {
         let mut counted = std::pin::pin!(counted);
