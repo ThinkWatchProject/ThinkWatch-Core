@@ -2748,6 +2748,7 @@ dependencies = [
  "tw-observe",
  "tw-pricing",
  "tw-redact",
+ "tw-scan",
  "tw-secret",
  "tw-types",
 ]

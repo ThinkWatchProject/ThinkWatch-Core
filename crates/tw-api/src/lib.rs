@@ -125,6 +125,26 @@ pub enum Event {
         items: Vec<RedactedItem>,
         at_ms: u64,
     },
+    /// 上游返回的响应里有一个可疑的工具调用（§5.2）。
+    ///
+    /// **这是网关位置独有的能力**：只有我们同时知道「这个调用长什么样」
+    /// 和「它来自哪个上游」。客户端弹批准提示的同一瞬间弹一条通知，用户
+    /// 的判断质量完全不一样 —— 人类批准工具调用时的审查很弱，尤其在一个
+    /// 长任务的第几十次批准时。
+    ToolCallFlagged {
+        id: u64,
+        provider: String,
+        /// 哪个工具。「一个 bash 调用」和「一个 Read 调用」是两件事
+        tool: String,
+        rule: String,
+        why: String,
+        /// 命中的那一小段，**已截断**
+        excerpt: String,
+        high: bool,
+        /// 真的切断了流吗。**高危 + 不受信任 + 拦截态**三者同时成立才会
+        blocked: bool,
+        at_ms: u64,
+    },
     /// 客户端配置面上**新出现**了可疑的东西（§5.3）。
     ///
     /// **只报新出现的那些。**「一个用了半年的 skill 突然多了一段零宽
@@ -250,6 +270,7 @@ impl Event {
             | Event::LeakSeen { id, .. }
             | Event::ScanAlert { id, .. }
             | Event::Redacted { id, .. }
+            | Event::ToolCallFlagged { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }

@@ -137,6 +137,11 @@ pub struct Runtime {
     pub clients: std::collections::HashMap<String, reqwest::Client>,
     /// 来源白名单。空 = 全放行，而那只在 loopback 下成立（§5.4）。
     pub allow: crate::access::AllowList,
+    /// 工具调用防火墙的规则（§5.2）。
+    ///
+    /// **和配置一起建、一起换**，而不是每个请求现读一次文件 —— 那是几十
+    /// 个正则的编译，摆在数据面上就是每个请求几毫秒的白付。
+    pub rules: Arc<tw_scan::rules::Rules>,
 }
 
 impl Runtime {
@@ -167,11 +172,18 @@ impl Runtime {
         }
         let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
             .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
+        // 规则集编译一次，跟着运行时一起换。**用户那份写坏了退回内置**
+        // —— 一个因为配置写错就整个不工作的安全功能等于没有（§5.3）
+        let (rules, warn) = tw_scan::rules::load(&tw_config::default_dir());
+        if let Some(w) = warn {
+            tracing::warn!("{w}");
+        }
         Ok(Self {
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
             clients,
             allow,
+            rules: Arc::new(rules),
         })
     }
 }
@@ -914,6 +926,13 @@ async fn pipeline(
     // **没脱敏过就是个空壳**，`process` 直接把字节原样递出去 —— 绝大多数
     // 请求走的是这条路，它不该为这个功能付任何延迟。
     let mut restorer = tw_redact::sse::Body::new(&used_ledger, is_sse);
+    // 工具调用防火墙（§5.2）。**只在 SSE 上跑** —— 非流式响应整个到手
+    // 之后再拦已经没有意义，客户端下一步就拿到全文了。
+    let inspect = rt.config.security.inspect_tools;
+    let trust = crate::guard::effective_trust(provider, &decision.guard);
+    let mut wall =
+        (is_sse && inspect.detects()).then(|| crate::toolwall::Wall::new(rt.rules.clone()));
+    let wall_provider = provider.name.clone();
     let stream = async_stream::stream! {
         let mut counted = std::pin::pin!(counted);
         let mut broke: Option<GatewayError> = None;
@@ -932,6 +951,53 @@ async fn pipeline(
                     sniffer.feed(&chunk);
                     tap.feed(&chunk);
                     let out = restorer.process(&chunk);
+                    // **审查的是客户端将要看到的那一版**（还原之后的），
+                    // 因为那才是它真正会去执行的东西
+                    let mut cut: Option<(GatewayError, usize)> = None;
+                    if let Some(w) = wall.as_mut() {
+                        for v in w.feed(&out) {
+                            // 高危 + 不受信任 + 拦截态 = 切断（§5.2）
+                            let blocked = v.high && inspect.acts() && trust.blocks();
+                            bus.emit(tw_api::Event::ToolCallFlagged {
+                                id,
+                                provider: wall_provider.clone(),
+                                tool: v.tool.clone(),
+                                rule: v.rule.clone(),
+                                why: v.why.clone(),
+                                excerpt: v.excerpt.clone(),
+                                high: v.high,
+                                blocked,
+                                at_ms: now_ms(),
+                            });
+                            if blocked {
+                                tracing::warn!(
+                                    provider = %wall_provider, tool = %v.tool, rule = %v.rule,
+                                    "切断响应流：上游返回了一个高危工具调用"
+                                );
+                                cut = Some((
+                                    GatewayError::denied(format!(
+                                        "`{}` 返回的 `{}` 调用命中「{}」（{}），已切断。这个上游标记为不受信任。",
+                                        wall_provider, v.tool, v.rule, v.why
+                                    )),
+                                    v.safe_prefix,
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((err, safe)) = cut {
+                        // **命中那一帧之前的内容照常发。**模型在动手之前
+                        // 通常先说了几句正常的话，一起吞掉的话用户看到的
+                        // 是「什么都没发生然后报错了」。而从那一帧起一个
+                        // 字节都不发 —— 「尽力阻断」的要点是客户端拼不出
+                        // 完整的工具调用（§5.2）
+                        let safe = safe.min(out.len());
+                        if safe > 0 {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(out[..safe].to_vec()));
+                        }
+                        broke = Some(err.in_dialect(dialect));
+                        break;
+                    }
                     if !out.is_empty() {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
                     }

@@ -361,7 +361,8 @@ impl Recorder {
             | Event::ScanAlert { .. }
             // 脱敏事件也不落这张表：它说的是「这次请求里换掉了什么」，
             // 而那属于请求详情，不是另一行记录
-            | Event::Redacted { .. } => {}
+            | Event::Redacted { .. }
+            | Event::ToolCallFlagged { .. } => {}
         }
     }
 

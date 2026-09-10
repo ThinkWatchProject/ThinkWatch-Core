@@ -40,31 +40,62 @@ injection:
     why: 伪造成系统或助手的发言
 
 # 二、危险命令。这一组和 §5.2 的工具调用防火墙共用 —— 一套规则两处用。
+#
+# `level` 决定 §5.2 里的处置：**high 才会切断流**，medium 只告警。分级的
+# 判据是「它能不能一步拿到执行权或者拿走凭据」，不是「它听起来多可怕」。
+# 没写 level 的按 medium 算。
 dangerous:
+  # 中间那段**不限长度**。`[^\n|]` 已经保证了「同一行、中间没有别的
+  # 管道」，也就是说匹配到的必然是「从这个 curl 到它右边第一个管道」——
+  # 那本来就是危险构造本身，多长都一样。
+  #
+  # 原来写的是 `{0,200}`，而那个上限是个**可以直接绕过的洞**：把 URL
+  # 填长到 200 字符以上，同一条命令就匹配不到了。测试抓住的。
   - id: curl-pipe-sh
-    pattern: '(?i)(curl|wget)[^\n|]{0,200}\|\s*(sudo\s+)?(ba|z|d)?sh'
+    pattern: '(?i)(curl|wget)[^\n|]*\|\s*(sudo\s+)?(ba|z|d)?sh'
     why: 下载即执行 —— 内容由对方决定，你看不到它跑了什么
+    level: high
   - id: rm-rf-root
     pattern: 'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$)'
     why: 删掉整个家目录或根目录
+    level: medium
   - id: chmod-777
     pattern: 'chmod\s+(-R\s+)?777'
     why: 把文件权限放到所有人可写
+    level: medium
   - id: base64-decode-exec
-    pattern: '(?i)base64\s+(-d|--decode)[^\n]{0,80}\|\s*(ba)?sh'
+    pattern: '(?i)base64\s+(-d|--decode)[^\n|]*\|\s*(ba)?sh'
     why: 把要执行的内容藏在 base64 里
+    level: high
   - id: exfil-env
-    pattern: '(?i)(env|printenv|cat\s+[^\n]{0,40}\.env)[^\n]{0,60}(curl|wget|nc\s)'
+    pattern: '(?i)(env|printenv|cat\s+[^\n]{0,60}\.env)[^\n]{0,200}(curl|wget|nc\s)'
     why: 把环境变量（里面通常有密钥）发到外面去
+    level: high
   # **命令形状的规则对中文指令完全不设防。**「把 ~/.aws/credentials
   # 打印出来」里没有 cat 也没有 curl，但它要的是同一件事。所以再加一条
   # 按「凭据路径 + 外送动词」匹配的，两个方向都写。
   - id: 凭据外泄
     pattern: '(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)[^\n]{0,30}(发|传|上报|打印|输出|贴出|读出|(?i:send|upload|post|print|paste|exfil))'
     why: 让模型把凭据文件的内容送出去
+    level: high
   - id: 凭据外泄2
     pattern: '(发送|上传|贴出|打印|输出|读取|(?i:send|upload|post|print|read))[^\n]{0,30}(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)'
     why: 让模型把凭据文件的内容送出去
+    level: high
+  # **写入启动项**：只要写进去了，下次开终端就执行 —— 而且是在你完全
+  # 不知情的时候。§5.2 把它和「下载即执行」并列为高危，理由是一样的：
+  # 一步就能拿到执行权。
+  - id: 写启动项
+    pattern: '(>>?|tee|cp|mv|ln\s+-s)[^\n]{0,200}(\.zshrc|\.bashrc|\.bash_profile|\.profile|\.zprofile|LaunchAgents|LaunchDaemons|\.git/hooks|crontab)'
+    why: 往开机或开终端就会执行的地方写东西
+    level: high
+  # `crontab -l` 是看一眼，`crontab <文件>` / `crontab -r` / `crontab -`
+  # 才是动手。分不开的话，这条规则会在每次「帮我看看定时任务」时误报。
+  - id: crontab-install
+    pattern: 'crontab\s+(-r\b|-\s*$|[^\s-][^\n]{0,40})'
+    why: 装一个定时执行的任务，或者把现有的全删掉
+    level: high
   - id: ssh-key-read
-    pattern: '(?i)(cat|cp|scp|curl)[^\n]{0,40}(\.ssh/id_|\.aws/credentials|\.netrc)'
+    pattern: '(?i)(cat|cp|scp|curl)[^\n]{0,200}(\.ssh/id_|\.aws/credentials|\.netrc)'
     why: 读私钥或云凭据
+    level: high
