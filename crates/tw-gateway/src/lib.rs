@@ -19,6 +19,7 @@ pub mod l1;
 pub mod l3;
 pub mod leak;
 pub mod limits;
+pub mod oauth;
 pub mod probe;
 pub mod quota;
 pub mod server;

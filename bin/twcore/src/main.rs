@@ -558,7 +558,39 @@ fn cmd_check(path: &Path) -> Result<()> {
                 // exec 在 check 时**真跑一次**。这正是 check 存在的意义 ——
                 // 「密钥命令能不能跑通」最容易到用第一次才发现，而那时的
                 // 表现是一个莫名其妙的 401，或者网关整个卡住。
-                if let Err(e) = p.resolved_key() {
+                // OAuth 不在这里换 token：那是一次网络往返，而 check
+                // 是个用户期望立刻返回的命令。但**能离线查的都要查** ——
+                // 这几样写错了，症状全是网关起来之后一片 401（§3.6）。
+                if let Some(o) = p.key.oauth() {
+                    if o.refresh.trim().is_empty() {
+                        println!("     ⚠ refresh token 是空的 —— 这家换不出 token");
+                    }
+                    // **本机的 http 不算明文过网。**报它是个假警报，而
+                    // 假警报的代价是用户学会忽略这一栏的所有话（§0.6：
+                    // 没有风险的时候要说「安全」，不是把话说满）。
+                    // tw-redact 的内网规则出于同一个理由排除回环。
+                    let loopback = o.endpoint.starts_with("http://127.0.0.1")
+                        || o.endpoint.starts_with("http://localhost")
+                        || o.endpoint.starts_with("http://[::1]");
+                    if !o.endpoint.starts_with("https://") && !loopback {
+                        // refresh token 换得出无数个 access token。
+                        // 它走明文 = 整个凭据走明文
+                        println!(
+                            "     ⚠ token 端点不是 https：{} —— refresh token 会明文过网",
+                            tw_secret::redact_url(&o.endpoint)
+                        );
+                    }
+                    if let Some(raw) = &o.refresh_before
+                        && tw_config::parse_duration_secs(raw).is_none()
+                    {
+                        // 静默走默认值是对的（一个写错的提前量不该让上游
+                        // 整个不可用），但**不说出来就没人会发现自己写错了**
+                        println!(
+                            "     ⚠ refresh_before: `{raw}` 看不懂（要 `30s`/`5m`/`1h`），按 300 秒算"
+                        );
+                    }
+                    println!("     · OAuth 凭据：换 token 要联网，网关起来之后才做");
+                } else if let Err(e) = p.resolved_key() {
                     println!("     ⚠ 密钥取不到：{e}");
                 }
             }

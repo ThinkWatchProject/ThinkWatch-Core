@@ -374,7 +374,9 @@ impl Recorder {
             // 而那属于请求详情，不是另一行记录
             | Event::Redacted { .. }
             | Event::ToolCallFlagged { .. }
-            | Event::Translated { .. } => {}
+            | Event::Translated { .. }
+            // 凭据轮换说的是配置文件该改了，跟哪一次请求无关
+            | Event::CredentialRotated { .. } => {}
             Event::ResponseInspected {
                 id,
                 tool_calls,

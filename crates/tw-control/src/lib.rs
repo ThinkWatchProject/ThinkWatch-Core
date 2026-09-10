@@ -561,7 +561,10 @@ async fn speed_run(
     // **逐个跑，不并发。**几家一起打，测出来的 TTFT 互相干扰，而这一层
     // 存在的全部意义就是那几个数字准不准（和 L1 同一个理由）。
     for p in targets(&cfg, req.provider.as_deref())? {
-        let key = match p.resolved_key() {
+        // OAuth 那类要联网换 token，所以走网关那条 async 的路
+        // （§3.6）。**用这一家自己的 client** —— 换 token 要走它的代理。
+        let pk_http = s.gateway.client_for(&p.name);
+        let key = match s.gateway.key_for(p, &pk_http).await {
             Ok(k) => k,
             Err(e) => {
                 out.push(tw_api::SpeedResult {

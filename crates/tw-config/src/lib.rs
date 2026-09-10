@@ -279,6 +279,70 @@ pub enum Secret {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
     },
+    /// OAuth，带自动刷新（§3.6）。
+    OAuth { oauth: OAuth },
+}
+
+/// OAuth 凭据（§3.6 第 4 类）。
+///
+/// # 一条要写在最前面的边界
+///
+/// **轮换 refresh token 的服务器不在支持范围里。**很多 OAuth2 服务器
+/// 每次刷新都发一个新的 refresh token 并作废旧的；那意味着我们得把新的
+/// **写回用户的 config.yaml**，而那是个自动的、用户没要求的写入 ——
+/// 一个会自己改你配置文件的网关，比一个说「这种情况请用 `exec`」的
+/// 网关可怕得多。
+///
+/// 检测到轮换时我们会用新的（本进程内），同时**发一个事件说清「重启
+/// 之后要你自己更新 config.yaml」** —— 而不是等下次重启时莫名其妙地
+/// 全是 401。
+///
+/// 真正需要轮换的场景走 `exec`：§3.6 自己说了那是个「便宜又通用的
+/// 逃生舱」，任何能用一条命令换到 token 的上游都不需要专门的适配器。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuth {
+    /// 现成的 access token。**可选** —— 不写就启动后立刻用 refresh 换一个
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    pub refresh: String,
+    /// token 端点
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// 提前多久去刷。**默认 5 分钟** —— 避免边界上打到一个刚过期的
+    /// token，而那个失败看起来是「上游偶尔 401」
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_before: Option<String>,
+}
+
+impl OAuth {
+    /// 提前量。写坏了按默认走 —— **一个写错的提前量不该让上游整个不可用**。
+    pub fn refresh_before(&self) -> std::time::Duration {
+        const DEFAULT: u64 = 300;
+        let secs = self
+            .refresh_before
+            .as_deref()
+            .and_then(parse_duration_secs)
+            .unwrap_or(DEFAULT);
+        std::time::Duration::from_secs(secs)
+    }
+}
+
+/// `30s` / `5m` / `1h`。不带单位按秒。
+///
+/// 不发明一套时长语言，只认这三个后缀 —— §3.6 的示例写的就是 `5m`。
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last()? {
+        's' => (&s[..s.len() - 1], 1),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        _ => (s, 1),
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
 impl Secret {
@@ -296,6 +360,22 @@ impl Secret {
                     .unwrap_or(tw_secret::exec::DEFAULT_TIMEOUT);
                 Ok(tw_secret::run_exec(exec, t)?)
             }
+            // **OAuth 走不了同步这条路**：换 token 是一次网络往返。
+            // 调用方要么走异步那条（网关），要么把这一句原样说给用户听
+            // （`twcore check`）—— 都比在这里编一个值好
+            Secret::OAuth { .. } => Err(SecretResolveError::NeedsRefresh),
+        }
+    }
+
+    /// 是不是 OAuth。调用方据此决定走异步那条路。
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, Secret::OAuth { .. })
+    }
+
+    pub fn oauth(&self) -> Option<&OAuth> {
+        match self {
+            Secret::OAuth { oauth } => Some(oauth),
+            _ => None,
         }
     }
 
@@ -305,6 +385,9 @@ impl Secret {
             Secret::Literal(s) if s.contains("${") => format!("环境变量 {s}"),
             Secret::Literal(s) => tw_secret::mask_secret(s),
             Secret::Exec { exec, .. } => format!("exec: {}", exec.join(" ")),
+            // **不回显任何一段 token** —— refresh token 比 access token
+            // 更值钱，它换得出无数个 access
+            Secret::OAuth { oauth } => format!("OAuth（{}）", oauth.endpoint),
         }
     }
 
@@ -312,6 +395,9 @@ impl Secret {
         match self {
             Secret::Literal(s) => s.trim().is_empty(),
             Secret::Exec { exec, .. } => exec.is_empty(),
+            Secret::OAuth { oauth } => {
+                oauth.refresh.trim().is_empty() || oauth.endpoint.trim().is_empty()
+            }
         }
     }
 }
@@ -335,6 +421,9 @@ pub enum SecretResolveError {
     Env(#[from] tw_secret::SecretError),
     #[error(transparent)]
     Exec(#[from] tw_secret::ExecError),
+    /// OAuth 凭据要去换 token，那是一次网络往返，同步这条路走不了。
+    #[error("这是一个 OAuth 凭据，要联网换 token —— 网关起来之后才会去换")]
+    NeedsRefresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

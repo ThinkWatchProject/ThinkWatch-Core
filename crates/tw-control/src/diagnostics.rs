@@ -174,10 +174,14 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 配置原文（脱敏后）
     let _ = writeln!(out, "\n## config.yaml（已脱敏）\n\n```yaml");
     match std::fs::read_to_string(s.config_path()) {
-        // 走和请求详情**同一个函数**。两处标准不同的话，仔细的那一处
-        // 等于白做（§9.7）
+        // **`mask_body` 一个人不够。**它认的是值的形状，而配置里有一
+        // 类密钥没有形状：自建中转那把普通样子的 key、OAuth 的 refresh
+        // token。实测它们原样穿过去了 —— 而这一段的上面就写着「已脱敏」。
+        //
+        // `mask_config_yaml` 按**字段名**打（schema 就是答案），里面照旧
+        // 叠一层 `mask_body`：仔细的那一处不能被另一处抵消（§9.7）。
         Ok(text) => {
-            let _ = writeln!(out, "{}", tw_secret::mask_body(&text));
+            let _ = writeln!(out, "{}", tw_secret::mask_config_yaml(&text));
         }
         Err(e) => {
             let _ = writeln!(out, "# 读不了：{e}");

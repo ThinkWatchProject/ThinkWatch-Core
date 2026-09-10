@@ -250,6 +250,14 @@ pub struct AppState {
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
     relisten: Arc<tokio::sync::Notify>,
+    /// OAuth 的 access token（§3.6）。
+    ///
+    /// **在内存里，跨重载存活。**access token 是派生状态 —— 不是用户输入
+    /// 的，会过期，丢了重换一个就行（§3.1）。落盘只多一处密钥副本，换不到
+    /// 任何东西；而跟着配置一起丢掉的话，改一条限流规则会让所有 OAuth
+    /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
+    /// 得出来（指纹对不上就重换）。
+    pub oauth: Arc<crate::oauth::Cache>,
 }
 
 impl AppState {
@@ -272,7 +280,55 @@ impl AppState {
             body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
+            oauth: Arc::new(crate::oauth::Cache::new()),
         })
+    }
+
+    /// 取这一家的密钥。**OAuth 那一类要联网换 token，所以这条路是
+    /// async 的**（§3.6）；`literal` 和 `exec` 走同步那条，零额外成本。
+    ///
+    /// `http` 必须是**这一家自己的** client：换 token 要走它该走的代理
+    /// （§3.7）。用一个干净的 client 去换，代理后面的用户会得到一个
+    /// 「数据面通、刷新不通」的组合 —— 而那个症状看起来完全不像凭据问题。
+    pub async fn key_for(
+        &self,
+        p: &tw_config::Provider,
+        http: &reqwest::Client,
+    ) -> Result<String, String> {
+        let Some(o) = p.key.oauth() else {
+            return p.resolved_key().map_err(|e| e.to_string());
+        };
+        let (token, rotated) = self
+            .oauth
+            .token(&p.name, o, http)
+            .await
+            .map_err(|e| e.to_string())?;
+        if rotated.is_some() {
+            // **只说发生了，不说值。**refresh token 比 access token 更值钱
+            self.bus.emit(tw_api::Event::CredentialRotated {
+                id: self.bus.next_id(),
+                provider: p.name.clone(),
+                endpoint: tw_secret::redact_url(&o.endpoint),
+                at_ms: now_ms(),
+            });
+            tracing::warn!(
+                provider = %p.name,
+                "token 端点换发了新的 refresh token。本进程内已经用上，但 config.yaml 里那个已经作废 ——                  重启之前要更新它，否则重启之后这家会全是 401。会轮换的服务器建议改用 key: {{ exec: [...] }}"
+            );
+        }
+        Ok(token)
+    }
+
+    /// 这一家该用的 HTTP client（带着它该走的代理，§3.7）。
+    ///
+    /// **给控制面用。**数据面自己整轮持着同一份 `Runtime`，直接从那里
+    /// 取 —— 走这里会重新 `load` 一次，于是一个请求可能跨在两份配置上。
+    pub fn client_for(&self, name: &str) -> reqwest::Client {
+        self.runtime()
+            .clients
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| self.http.clone())
     }
 
     /// 当前这一份运行时。**每个请求只取一次**，从头到尾用同一份 ——
@@ -756,11 +812,15 @@ async fn pipeline(
             });
         }
 
-        let key = match provider.resolved_key() {
+        // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
+        // 之前拿到**：OAuth 换 token 也要走这条代理（§3.6）。
+        let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
+        let key = match state.key_for(provider, http).await {
             Ok(k) => k,
             Err(e) => {
-                // 密钥取不到是这一家的问题（可能是 exec 命令挂了），
-                // 换下一家是合理的。
+                // 密钥取不到是这一家的问题（exec 命令挂了、token 端点
+                // 连不上），换下一家是合理的 —— 而且**必须**换：不换的话
+                // 一家 OAuth 上游的 token 端点抽风会让整个网关不可用。
                 state.health.record_failure(&provider.name);
                 chain.push(hop(&provider.name, format!("密钥取不到：{e}"), hop_started));
                 last_err = Some(GatewayError::config(format!(
@@ -807,8 +867,6 @@ async fn pipeline(
             "转发"
         );
 
-        // 用这个 provider 自己的 Client —— 它带着该走的代理。
-        let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
         let mut req = http.request(method, &url);
         req = forward::forward_headers_filtered(req, &headers, |n| xlate.keeps_header(n));
         req = forward::apply_credential(req, provider.effective_protocol(), &key);
@@ -1173,7 +1231,8 @@ pub async fn refresh_catalog(state: &AppState) {
             .effective_protocol()
             .map(|x| format!("{x:?}"))
             .unwrap_or_else(|| "Anthropic".to_string());
-        let key = match p.resolved_key() {
+        let http = rt.clients.get(&p.name).unwrap_or(&state.http);
+        let key = match state.key_for(p, http).await {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(provider = %p.name, "密钥取不到，跳过探测：{e}");
@@ -1185,7 +1244,6 @@ pub async fn refresh_catalog(state: &AppState) {
                 continue;
             }
         };
-        let http = rt.clients.get(&p.name).unwrap_or(&state.http);
         let r = crate::probe::probe(http, &p.base_url, &key, p.effective_protocol()).await;
         let discovered = match &r.models {
             crate::probe::ModelList::Listed { models } => models.clone(),

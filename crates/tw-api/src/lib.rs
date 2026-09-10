@@ -125,6 +125,21 @@ pub enum Event {
         items: Vec<RedactedItem>,
         at_ms: u64,
     },
+    /// token 端点换了 refresh token，而 config.yaml 里那个已经作废（§3.6）。
+    ///
+    /// **不说的话，症状是几天后某次重启开始全是 401** —— 而那时没人会
+    /// 想到是几天前的一次轮换。本进程内已经用上新的了，所以现在一切正常，
+    /// 这正是它危险的地方：**唯一的报警窗口就是现在。**
+    ///
+    /// 我们不自动写回 config.yaml：一个会自己改你配置文件的网关，比一个
+    /// 说「这种情况请用 `exec`」的网关可怕得多。
+    CredentialRotated {
+        id: u64,
+        provider: String,
+        /// token 端点，**已打码**
+        endpoint: String,
+        at_ms: u64,
+    },
     /// 这次请求做了方言互转（§11 的 M6+）。
     ///
     /// **`dropped` 非空时必须让用户看见**：`thinking` 在 OpenAI chat
@@ -299,6 +314,7 @@ impl Event {
             | Event::ToolCallFlagged { id, .. }
             | Event::ResponseInspected { id, .. }
             | Event::Translated { id, .. }
+            | Event::CredentialRotated { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }

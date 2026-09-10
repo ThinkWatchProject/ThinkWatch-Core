@@ -179,7 +179,10 @@ pub async fn run(
                 format!("没有叫 `{}` 的上游", req.provider),
             )
         })?;
-    let key = provider.resolved_key().map_err(|e| {
+    // §3.6：OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
+    // 必须走同一条路** —— 否则一个 OAuth 上游在重放里永远是「密钥取不到」
+    let pk_http = s.gateway.client_for(&provider.name);
+    let key = s.gateway.key_for(provider, &pk_http).await.map_err(|e| {
         fail(
             StatusCode::BAD_REQUEST,
             format!("`{}` 的密钥取不到：{e}", provider.name),
