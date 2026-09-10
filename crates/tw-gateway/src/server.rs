@@ -258,6 +258,24 @@ pub struct AppState {
     /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
     /// 得出来（指纹对不上就重换）。
     pub oauth: Arc<crate::oauth::Cache>,
+    /// `exec` 凭据的缓存（§3.6 第 3 类）。
+    ///
+    /// **跨重载存活**，理由和 OAuth 那份一样：改一条限流规则不该让每家
+    /// 上游重新 fork 一次进程。用户改了命令本身的话，缓存自己认得出来。
+    pub execkey: Arc<crate::execkey::Cache>,
+    /// 轮换出来的新 refresh token 往哪儿交（§3.6）。
+    ///
+    /// **和 body 那条路同一个形状**：数据面只管交出去，写文件是控制面的
+    /// 事 —— 那里才有历史快照、乐观并发和防回环。`None` 表示控制面没
+    /// 起来（比如测试里直接建的 AppState），那时轮换只报不写。
+    rotation_sink: Arc<std::sync::Mutex<Option<crate::oauth::RotationSender>>>,
+    /// 已经报过「写回成功」的上游。
+    ///
+    /// **只压成功的那句，失败的每次都说。**会轮换的服务器每小时换一次，
+    /// 而「已经帮你写回去了」这句话说一次就够 —— 通知的代价是用户学会
+    /// 忽略通知，包括那些真该看的（§2.4）。失败不一样：它要一直挂着，
+    /// 而且从成功变成失败是**状态变了**，必须重新说。
+    rotation_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl AppState {
@@ -281,6 +299,9 @@ impl AppState {
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
             oauth: Arc::new(crate::oauth::Cache::new()),
+            execkey: Arc::new(crate::execkey::Cache::new()),
+            rotation_sink: Arc::new(std::sync::Mutex::new(None)),
+            rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
         })
     }
 
@@ -295,6 +316,16 @@ impl AppState {
         p: &tw_config::Provider,
         http: &reqwest::Client,
     ) -> Result<String, String> {
+        // `exec`：跑一条命令。**在阻塞线程池里跑，而且可以缓存** ——
+        // 它挂在每一个请求前面（§3.6）
+        if let Some(argv) = p.key.exec_argv() {
+            let timeout = p.key.exec_timeout();
+            return self
+                .execkey
+                .key(&p.name, argv, timeout, p.key.exec_ttl())
+                .await
+                .map_err(|e| e.to_string());
+        }
         let Some(o) = p.key.oauth() else {
             return p.resolved_key().map_err(|e| e.to_string());
         };
@@ -303,20 +334,75 @@ impl AppState {
             .token(&p.name, o, http)
             .await
             .map_err(|e| e.to_string())?;
-        if rotated.is_some() {
-            // **只说发生了，不说值。**refresh token 比 access token 更值钱
-            self.bus.emit(tw_api::Event::CredentialRotated {
-                id: self.bus.next_id(),
-                provider: p.name.clone(),
-                endpoint: tw_secret::redact_url(&o.endpoint),
-                at_ms: now_ms(),
-            });
-            tracing::warn!(
-                provider = %p.name,
-                "token 端点换发了新的 refresh token。本进程内已经用上，但 config.yaml 里那个已经作废 ——                  重启之前要更新它，否则重启之后这家会全是 401。会轮换的服务器建议改用 key: {{ exec: [...] }}"
-            );
+        if let Some(new_refresh) = rotated {
+            let endpoint = tw_secret::redact_url(&o.endpoint);
+            let sink = self.rotation_sink.lock().ok().and_then(|g| g.clone());
+            match sink {
+                // **交出去就不管了。**写文件、存历史、防回环都在控制面，
+                // 而这里是转发路径 —— 它不能等一次磁盘写（§4.7）
+                Some(tx) => {
+                    let r = crate::oauth::Rotated {
+                        provider: p.name.clone(),
+                        refresh: new_refresh,
+                        endpoint,
+                    };
+                    if tx.try_send(r).is_err() {
+                        // 通道满 = 前一次还没写完。**这条要说** —— 和 body
+                        // 那条路不一样，丢掉的不是一条观测记录，是一份
+                        // 还没落盘的凭据
+                        self.report_rotation(&p.name, false, "写回的队列满了，这一次没排上");
+                    }
+                }
+                // 控制面没起来：**只报不写**，而且要说清没写
+                None => self.report_rotation(
+                    &p.name,
+                    false,
+                    "没有配置管理器（网关是单独跑的），写不回去",
+                ),
+            }
         }
         Ok(token)
+    }
+
+    /// 凭据轮换的结果报给界面。
+    ///
+    /// **写成功也要报一次。**用户的 config.yaml 被我们改了 —— 哪怕改得
+    /// 完全正确，不说一声也是不对的：他的编辑器会弹「文件已在磁盘上更改」，
+    /// 而那时他应该已经知道原因。
+    pub fn report_rotation(&self, provider: &str, persisted: bool, detail: &str) {
+        {
+            let mut told = self.rotation_told.lock().expect("锁没毒");
+            if persisted {
+                if !told.insert(provider.to_string()) {
+                    // 这家的「已经帮你写回去了」说过了
+                    tracing::debug!(provider, "又一次轮换，已写回，不再重复说");
+                    return;
+                }
+            } else {
+                // 从「写得进去」变成「写不进去」是状态变了 —— 下次写成功
+                // 的时候要重新说一句，否则用户不知道问题已经解决
+                told.remove(provider);
+            }
+        }
+        if persisted {
+            tracing::info!(
+                provider,
+                "token 端点换发了新的 refresh token，已写回 config.yaml"
+            );
+        } else {
+            tracing::warn!(
+                provider,
+                detail,
+                "token 端点换发了新的 refresh token，但没能写回 config.yaml —— 重启之前必须处理，否则这家上游会全是 401"
+            );
+        }
+        self.bus.emit(tw_api::Event::CredentialRotated {
+            id: self.bus.next_id(),
+            provider: provider.to_string(),
+            persisted,
+            detail: detail.to_string(),
+            at_ms: now_ms(),
+        });
     }
 
     /// 这一家该用的 HTTP client（带着它该走的代理，§3.7）。
@@ -349,6 +435,13 @@ impl AppState {
     /// 丢掉，而请求照常。
     pub fn set_body_sink(&self, tx: crate::bodies::BodySender) {
         if let Ok(mut g) = self.body_sink.lock() {
+            *g = Some(tx);
+        }
+    }
+
+    /// 接上轮换的去处。**控制面起来之后才调** —— 在那之前轮换只报不写。
+    pub fn set_rotation_sink(&self, tx: crate::oauth::RotationSender) {
+        if let Ok(mut g) = self.rotation_sink.lock() {
             *g = Some(tx);
         }
     }

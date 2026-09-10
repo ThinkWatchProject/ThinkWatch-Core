@@ -20,6 +20,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod dryrun;
 pub mod replay;
+pub mod rotation;
 pub mod scan;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;

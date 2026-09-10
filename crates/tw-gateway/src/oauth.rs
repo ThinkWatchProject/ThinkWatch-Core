@@ -60,7 +60,7 @@ fn fingerprint(cfg: &OAuth) -> u64 {
 }
 
 struct Live {
-    /// 生成它的那份配置的指纹。对不上就是用户改了配置，这条作废
+    /// **生成它的那份配置**的指纹。对不上未必作废 —— 见 `usable_for`
     fp: u64,
     access: String,
     /// 什么时候该去刷。`None` = 服务器没说 `expires_in`，那就一直用到 401
@@ -71,17 +71,49 @@ struct Live {
     failed: Option<(String, Instant)>,
 }
 
+impl Live {
+    /// 这条缓存还能拿来回答这份配置吗。
+    ///
+    /// **两个出口，缺一不可** —— 而缺的那个会变成一个自我维持的轮换
+    /// 循环：
+    ///
+    /// 1. `fp` 相同：配置没变过，最常见的情况。
+    /// 2. **配置里的 refresh 就是我们手里这个**：轮换之后我们把新值写回
+    ///    了 config.yaml（§3.6），文件一变监听就重载，重载出来的 `cfg`
+    ///    带着新值 —— 指纹当然对不上第一条。只认第一条的话，每次重载
+    ///    都会重新换一次 token，而每次换又换回一个新的 refresh、又写一次
+    ///    文件、又触发一次重载。**一小时一次的轮换会变成一个停不下来的
+    ///    循环。**
+    ///
+    /// 用户真的手改成了别的值时，两条都不成立 —— 于是重新换，这正是
+    /// 想要的。
+    fn usable_for(&self, cfg: &OAuth) -> bool {
+        self.fp == fingerprint(cfg) || self.refresh == cfg.refresh
+    }
+}
+
+/// token 端点换发了新的 refresh token，要有人把它写回 config.yaml。
+///
+/// **数据面不写文件。**它只把这件事交出去（和 §4.7 的 body 那条路同一
+/// 条纪律：观测和维护绝不跑在转发路径上）。真正动文件的是控制面 ——
+/// 那里才有 `ConfigManager`，才有历史快照、乐观并发、防回环那一整套。
+#[derive(Debug, Clone)]
+pub struct Rotated {
+    pub provider: String,
+    /// **新的 refresh token 原文。**它必须原样送到写文件那一层 ——
+    /// 这是全程唯一一个不能打码的地方，所以它只在进程内的通道里走，
+    /// 不进日志、不进事件、不进诊断包。
+    pub refresh: String,
+    /// token 端点，**已打码**，只用来说人话
+    pub endpoint: String,
+}
+
+pub type RotationSender = tokio::sync::mpsc::Sender<Rotated>;
+
 /// 每个 provider 一份活着的 token。
 #[derive(Default)]
 pub struct Cache {
     inner: Mutex<HashMap<String, Live>>,
-    /// 已经报过轮换的 provider。
-    ///
-    /// **会轮换的服务器每次刷新都轮换一次。**`expires_in: 1h` 就是每小时
-    /// 一条一模一样的告警 —— 而那条话说一次就够了（要做的事是「去改
-    /// config.yaml」，改完之前重复说没有新信息，改完之后它还会继续说）。
-    /// 通知的代价是用户学会忽略通知，包括那些真该看的（§2.4）。
-    reported: Mutex<std::collections::HashSet<String>>,
 }
 
 /// 换回来的东西。
@@ -108,7 +140,7 @@ impl Cache {
         // 先看手里有没有能用的
         {
             let g = self.inner.lock().expect("锁没毒");
-            if let Some(live) = g.get(provider).filter(|l| l.fp == fingerprint(cfg)) {
+            if let Some(live) = g.get(provider).filter(|l| l.usable_for(cfg)) {
                 if let Some((why, until)) = &live.failed
                     && Instant::now() < *until
                 {
@@ -144,7 +176,7 @@ impl Cache {
     ) -> Result<(String, Option<String>), OauthError> {
         {
             let mut g = self.inner.lock().expect("锁没毒");
-            if let Some(live) = g.get_mut(provider).filter(|l| l.fp == fingerprint(cfg)) {
+            if let Some(live) = g.get_mut(provider).filter(|l| l.usable_for(cfg)) {
                 live.renew_at = Some(Instant::now());
                 // 强制刷新时把退避清掉 —— 这是调用方明确要求的一次
                 live.failed = None;
@@ -163,9 +195,9 @@ impl Cache {
         let refresh = {
             let g = self.inner.lock().expect("锁没毒");
             g.get(provider)
-                // 指纹对不上 = 用户改了配置，缓存里那个（哪怕是服务器
+                // 认不出来 = 用户改了配置，缓存里那个（哪怕是服务器
                 // 换发的）一律不算，用配置里的重新开始
-                .filter(|l| l.fp == fingerprint(cfg))
+                .filter(|l| l.usable_for(cfg))
                 .map(|l| l.refresh.clone())
                 .unwrap_or_else(|| cfg.refresh.clone())
         };
@@ -194,15 +226,10 @@ impl Cache {
             .refresh
             .as_deref()
             .filter(|r| !r.is_empty() && *r != refresh.as_str())
-            .map(|r| r.to_string())
-            // **每个 provider 只往外报一次**（见 `reported` 的注释）。
-            // 缓存里照样换成新的 —— 报不报和用不用是两件事
-            .filter(|_| {
-                self.reported
-                    .lock()
-                    .expect("锁没毒")
-                    .insert(provider.to_string())
-            });
+            .map(|r| r.to_string());
+        // **每一次轮换都要往外送，不能在这儿去重。**新值要写回
+        // config.yaml（§3.6），而漏掉一次写回就等于让配置文件从那一刻
+        // 起是坏的。「同一句话别说第二遍」是报事件那一层的事，不是这一层的。
 
         let renew_at = got.expires_in.map(|secs| {
             let lead = cfg.refresh_before().as_secs();

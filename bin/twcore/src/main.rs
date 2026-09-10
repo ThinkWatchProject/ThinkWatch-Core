@@ -590,8 +590,20 @@ fn cmd_check(path: &Path) -> Result<()> {
                         );
                     }
                     println!("     · OAuth 凭据：换 token 要联网，网关起来之后才做");
-                } else if let Err(e) = p.resolved_key() {
-                    println!("     ⚠ 密钥取不到：{e}");
+                } else {
+                    // ttl 写坏了会静默退回「不缓存」——**说出来**，否则
+                    // 用户以为自己配了缓存，而每个请求还在 fork 一次
+                    if let Some(raw) = p.key.exec_ttl_raw()
+                        && tw_config::parse_duration_secs(raw).is_none()
+                    {
+                        println!(
+                            "     ⚠ ttl: `{raw}` 看不懂（要 `30s`/`5m`/`1h`），这家的密钥命令会每个请求跑一次"
+                        );
+                    }
+                    // exec 在 check 时**真跑一次**，见上面那段注释
+                    if let Err(e) = p.resolved_key() {
+                        println!("     ⚠ 密钥取不到：{e}");
+                    }
                 }
             }
             Ok(())
@@ -699,6 +711,11 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 盯着客户端配置面（§5.3）。**只报告** —— 这条路径上没有任何
         // 一处会改用户的文件。盯不住就只是少了「变更时告警」，页面上
         // 那份「打开时扫一次」照常可用，所以说一句就继续。
+        // 凭据轮换要写回 config.yaml（§3.6）。**这是这个程序里唯一一次
+        // 不是人发起的配置写入** —— 理由是服务器换发新 refresh token 的
+        // 那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
+        tw_control::rotation::spawn(control.clone());
+
         let _scan_watch = match tw_control::scan::spawn_watcher(control.clone()) {
             Ok(w) => Some(w),
             Err(e) => {

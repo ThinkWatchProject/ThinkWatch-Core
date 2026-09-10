@@ -38,6 +38,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }

@@ -16,7 +16,12 @@ use axum::routing::post;
 use tw_config::{Client, Config, Listen, OAuth, Provider, Secret};
 
 const REFRESH: &str = "rt-ORIGINAL-refresh-token";
-const ROTATED: &str = "rt-SERVER-ROTATED-token";
+/// 服务器换发的那个。**每次都不一样** —— 真的会轮换的服务器就是这样，
+/// 而返回一个常量的假服务器会让「第二次轮换」根本不存在（写这条测试
+/// 时先掉进去过一次：测试数据错了，不是代码错了）。
+fn rotated(n: usize) -> String {
+    format!("rt-SERVER-ROTATED-{n}")
+}
 
 #[derive(Default)]
 struct Token {
@@ -76,7 +81,7 @@ async fn start_token_endpoint(t: Arc<Token>) -> SocketAddr {
                     v["expires_in"] = e.into();
                 }
                 if t.rotate {
-                    v["refresh_token"] = ROTATED.into();
+                    v["refresh_token"] = rotated(n).into();
                 }
                 axum::Json(v)
             }),
@@ -312,14 +317,71 @@ async fn a_dead_token_endpoint_fails_over_instead_of_taking_the_gateway_down() {
     assert!(got[0].contains("sk-plain-backup"), "{got:?}");
 }
 
-/// 验收第四条：**服务器换发了 refresh token 时，要吵一声。**
+/// 验收第四条：**服务器换发 refresh token 时，新的要送出去写回配置。**
 ///
-/// 本进程内用新的（所以现在一切正常，这正是它危险的地方）。不说的话，
-/// 症状是几天后某次重启开始全是 401 —— 而那时没人会想到是轮换。
+/// 换发的那一刻旧的就在服务端作废了 —— 不写回等于让 config.yaml 从那
+/// 一秒起就是坏的，只是症状延迟到下次重启。这条测试盯的是数据面这一半：
+/// 每一次轮换都要送到 sink 上，**一次都不能漏**（漏掉一次，文件里就是
+/// 一个作废了的 token）。
 #[tokio::test]
-async fn a_rotated_refresh_token_is_used_in_process_and_loudly_reported() {
+async fn every_rotation_reaches_the_sink_so_none_is_lost() {
     let t = Arc::new(Token {
-        expires_in: Some(1), // 1 秒就该续 —— 逼出第二次换
+        expires_in: Some(1), // 1 秒就该续 —— 逼出连续几次轮换
+        rotate: true,
+        ..Default::default()
+    });
+    let token_addr = start_token_endpoint(t.clone()).await;
+    let (up, _seen) = start_upstream().await;
+    let (gw, state) = start_gateway(vec![oauth_provider(
+        "p",
+        up,
+        &format!("http://{token_addr}/token"),
+    )])
+    .await;
+
+    // 装一个假的写回端 —— 真的那个在 tw-control 里
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    state.set_rotation_sink(tx);
+
+    assert_eq!(ask(gw).await, 200);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(ask(gw).await, 200);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(ask(gw).await, 200);
+
+    assert_eq!(t.calls.load(Ordering::SeqCst), 3, "没有按 expires_in 去续");
+    // 第二次开始用的是服务器换发的那个，不是配置里的
+    assert_eq!(
+        t.seen.lock().unwrap().clone(),
+        vec![REFRESH.to_string(), rotated(1), rotated(2)],
+        "第二次之后没有用服务器换发的那个"
+    );
+
+    // **两次轮换，两条都要到。**在这儿去重的话，config.yaml 里会留下
+    // 一个已经作废的 token
+    let mut got = Vec::new();
+    while let Ok(r) = rx.try_recv() {
+        got.push(r);
+    }
+    // **三次换 token 就是三次轮换** —— 第一次也算：服务器在第一次
+    // 交换时就换发了新的 refresh token，配置里那个从那时起已经作废
+    assert_eq!(got.len(), 3, "轮换漏送了：{got:?}");
+    assert_eq!(
+        got.iter().map(|r| r.refresh.clone()).collect::<Vec<_>>(),
+        vec![rotated(1), rotated(2), rotated(3)],
+        "送出去的不是每一次的新值"
+    );
+    for r in &got {
+        assert_eq!(r.provider, "p");
+        assert!(!r.endpoint.contains("rt-"), "{}", r.endpoint);
+    }
+}
+
+/// 没有控制面时（网关单独跑），轮换**只报不写，而且要说清没写**。
+#[tokio::test]
+async fn without_a_config_manager_the_rotation_is_reported_as_not_persisted() {
+    let t = Arc::new(Token {
+        expires_in: Some(1),
         rotate: true,
         ..Default::default()
     });
@@ -333,46 +395,32 @@ async fn a_rotated_refresh_token_is_used_in_process_and_loudly_reported() {
     .await;
     let mut rx = state.bus.subscribe();
 
-    // 换三次 token，轮换发生两次 —— 但话只该说一次
-    assert_eq!(ask(gw).await, 200);
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(ask(gw).await, 200);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(ask(gw).await, 200);
 
-    assert_eq!(t.calls.load(Ordering::SeqCst), 3, "没有按 expires_in 去续");
-    // **第二次用的是服务器换发的那个**，不是配置里的
-    let seen_tokens = t.seen.lock().unwrap().clone();
-    assert_eq!(
-        seen_tokens,
-        vec![
-            REFRESH.to_string(),
-            ROTATED.to_string(),
-            ROTATED.to_string()
-        ]
-    );
-
-    // 事件里要有轮换，而且不能带上 token 本身
-    let mut rotated = Vec::new();
+    let mut seen = Vec::new();
     while let Ok(e) = rx.try_recv() {
         if let tw_api::Event::CredentialRotated {
-            provider, endpoint, ..
+            provider,
+            persisted,
+            detail,
+            ..
         } = &e
         {
-            rotated.push((provider.clone(), endpoint.clone()));
+            seen.push((provider.clone(), *persisted, detail.clone()));
         }
     }
-    assert_eq!(
-        rotated.len(),
-        1,
-        "轮换要么没报出来（几天后一片 401 的开始），要么每次都报（每小时一条一样的话）：{rotated:?}"
-    );
-    assert_eq!(rotated[0].0, "p");
-    let endpoint = &rotated[0].1;
-    assert!(
-        !endpoint.contains(ROTATED) && !endpoint.contains(REFRESH),
-        "{endpoint}"
-    );
+    // **失败每次都说。**它是个没解决的问题，而且重启之前不解决这家
+    // 上游就废了 —— 「同一句话别说第二遍」只压成功的那句
+    assert_eq!(seen.len(), 2, "失败被压掉了：{seen:?}");
+    for one in &seen {
+        assert_eq!(one.0, "p");
+        assert!(!one.1, "没写却说写了：{seen:?}");
+        assert!(one.2.contains("写不回去"), "{seen:?}");
+    }
+    // 事件里一个 token 都不能有
+    assert!(!seen.iter().any(|s| s.2.contains("rt-")), "{seen:?}");
 }
 
 /// 用户在 config.yaml 里换了 refresh token 之后，**缓存不能盖住这个修改**。

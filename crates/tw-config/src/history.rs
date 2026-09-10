@@ -31,6 +31,11 @@ pub enum Origin {
     /// 外部编辑（编辑器、脚本），我们是从文件监听发现的
     External,
     Rollback,
+    /// token 端点换发了新的 refresh token，我们把它写回去了（§3.6）。
+    ///
+    /// **这是唯一一次不是人发起的写入**，所以它在历史里要能一眼认出来
+    /// —— 用户看到「配置变了」时，第一个问题是「谁改的」。
+    Rotation,
 }
 
 impl Origin {
@@ -40,6 +45,7 @@ impl Origin {
             Origin::Cli => "cli",
             Origin::External => "ext",
             Origin::Rollback => "rollback",
+            Origin::Rotation => "rotation",
         }
     }
     fn parse(s: &str) -> Origin {
@@ -47,6 +53,7 @@ impl Origin {
             "ui" => Origin::Ui,
             "cli" => Origin::Cli,
             "rollback" => Origin::Rollback,
+            "rotation" => Origin::Rotation,
             _ => Origin::External,
         }
     }
@@ -56,6 +63,7 @@ impl Origin {
             Origin::Cli => "命令行",
             Origin::External => "外部编辑",
             Origin::Rollback => "回滚",
+            Origin::Rotation => "凭据轮换",
         }
     }
 }
@@ -96,6 +104,19 @@ pub fn snapshot(
     text: &str,
     origin: Origin,
 ) -> Result<Option<Version>, StoreError> {
+    // **凭据轮换不进历史**（§3.6）。三条理由，第一条就够了：
+    //
+    // 1. **回滚到一次轮换之前，拿到的是一个已经作废的 token。**服务器
+    //    换发新的那一刻就把旧的废了 —— 这一版不是「一个可以退回去的
+    //    状态」，是个陷阱。
+    // 2. 会轮换的服务器一小时一次，两天就把 50 版全占满了，用户自己
+    //    改过的那些全被挤出去 —— 而那才是他要回滚的东西。
+    // 3. 每一版都是一份明文密钥的副本，而这几份副本永远派不上用场。
+    //
+    // 「谁改的、改了什么」由 `ConfigReloaded` 事件和日志记着，不靠这里。
+    if matches!(origin, Origin::Rotation) {
+        return Ok(None);
+    }
     let dir = history_dir(config_path);
     let version = store::version_of(text);
     let all = list(config_path)?;
@@ -327,6 +348,25 @@ mod tests {
         let (_d, p) = setup();
         let e = rollback(&p, "blake3:deadbeef").unwrap_err();
         assert!(matches!(e, RollbackError::NoSuchVersion(_)), "{e:?}");
+    }
+
+    #[test]
+    fn a_rotation_never_enters_the_history() {
+        // **回滚到一次轮换之前，拿到的是一个已经作废的 token** ——
+        // 那一版不是可以退回去的状态，是个陷阱。而且一小时一次的轮换
+        // 两天就能把用户自己改过的那些全挤出去。
+        let (_d, p) = setup();
+        snapshot(&p, "version: 1\nport: 1\n", Origin::Ui).unwrap();
+        for i in 0..5 {
+            let text = format!("version: 1\nport: 1\n# rot {i}\n");
+            assert!(
+                snapshot(&p, &text, Origin::Rotation).unwrap().is_none(),
+                "轮换进历史了"
+            );
+        }
+        let all = list(&p).unwrap();
+        assert_eq!(all.len(), 1, "历史里不该有轮换那几版：{all:?}");
+        assert_eq!(all[0].origin.label(), "界面");
     }
 
     #[test]

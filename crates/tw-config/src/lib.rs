@@ -278,6 +278,16 @@ pub enum Secret {
         /// 秒。不写用默认值 —— 卡住的凭据命令会让网关整个没反应。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
+        /// 拿到的东西能用多久（`55m` / `1h` / `30s`）。
+        ///
+        /// **不写就不缓存**，每个请求跑一次 —— 那是这个字段出现之前的
+        /// 行为，保持它是有意的：默认缓存会造出一个新问题「我明明换了
+        /// 凭据，怎么没生效」，而那个问题比多 fork 几次难查得多。
+        ///
+        /// 写了就值得写：`gcloud auth print-access-token` 那类要几百
+        /// 毫秒，而它挂在**每一个请求**前面。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl: Option<String>,
     },
     /// OAuth，带自动刷新（§3.6）。
     OAuth { oauth: OAuth },
@@ -354,7 +364,9 @@ impl Secret {
     pub fn resolve(&self) -> Result<String, SecretResolveError> {
         match self {
             Secret::Literal(s) => Ok(tw_secret::expand_from_env(s)?),
-            Secret::Exec { exec, timeout_secs } => {
+            Secret::Exec {
+                exec, timeout_secs, ..
+            } => {
                 let t = timeout_secs
                     .map(std::time::Duration::from_secs)
                     .unwrap_or(tw_secret::exec::DEFAULT_TIMEOUT);
@@ -388,6 +400,45 @@ impl Secret {
             // **不回显任何一段 token** —— refresh token 比 access token
             // 更值钱，它换得出无数个 access
             Secret::OAuth { oauth } => format!("OAuth（{}）", oauth.endpoint),
+        }
+    }
+
+    /// `exec` 的缓存时长。`None` = 不缓存（见 `ttl` 字段的注释）。
+    ///
+    /// 写坏了（`ttl: 五分钟`）返回 `None` —— 也就是退回不缓存。**一个
+    /// 写错的 ttl 不该让上游整个不可用**，而 `twcore check` 会把这行
+    /// 说出来（和 `refresh_before` 同一条纪律）。
+    pub fn exec_ttl(&self) -> Option<std::time::Duration> {
+        match self {
+            Secret::Exec { ttl: Some(t), .. } => {
+                parse_duration_secs(t).map(std::time::Duration::from_secs)
+            }
+            _ => None,
+        }
+    }
+
+    /// `exec` 的超时。不写用默认值。
+    pub fn exec_timeout(&self) -> std::time::Duration {
+        match self {
+            Secret::Exec { timeout_secs, .. } => timeout_secs
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(tw_secret::exec::DEFAULT_TIMEOUT),
+            _ => tw_secret::exec::DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// `exec` 的原始 ttl 文本 —— 只给 `twcore check` 报「看不懂」用。
+    pub fn exec_ttl_raw(&self) -> Option<&str> {
+        match self {
+            Secret::Exec { ttl, .. } => ttl.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn exec_argv(&self) -> Option<&[String]> {
+        match self {
+            Secret::Exec { exec, .. } => Some(exec),
+            _ => None,
         }
     }
 
@@ -666,6 +717,91 @@ impl Provider {
     }
 }
 
+/// 把 token 端点换发的新 refresh token 写回 config.yaml 的**那一个标量**。
+///
+/// # 为什么要写回
+///
+/// **服务器换发新 refresh token 的那一刻，旧的已经在服务端作废了。**
+/// 所以「不写回」不是保守选项 —— 它保证了配置文件从那一秒起就是坏的，
+/// 只是症状延迟到下一次重启（表现是这家上游突然全是 401，而那时没人
+/// 会想到是几天前的一次轮换）。写回才是安全的那一边。
+///
+/// # 为什么是 span 补丁而不是 serde 往返
+///
+/// 往返会把用户的注释、空行、字段顺序全洗掉 —— 而这是**用户没要求的
+/// 一次写入**，它必须只动它该动的那 40 个字符。cc-switch 那 147 个
+/// commit 的白名单教训（§9.7）在这里同样成立：我们要写什么是清楚的，
+/// 「要保留什么」永远数不完。
+///
+/// 找不到那个字段就报错，**不追加**：追加意味着我们猜错了结构，而在
+/// 一个装着明文密钥的文件里猜结构是不能接受的。
+pub fn patch_oauth_refresh(
+    text: &str,
+    provider: &str,
+    new_refresh: &str,
+) -> Result<String, RotateError> {
+    // 名字对应第几个 provider —— 从**文本本身**数，不从解析后的结构数。
+    // 两者理论上一致，但真正要动的是文本里的那个位置。
+    let idx = provider_index(text, provider).ok_or_else(|| RotateError::NoProvider {
+        provider: provider.to_string(),
+    })?;
+    let path = tw_yaml::path!["providers", idx, "key", "oauth", "refresh"];
+    // 先确认它在那儿。`set` 对不存在的路径行为是另一回事，而这里
+    // 「不在那儿」本身就是「别写」的理由
+    tw_yaml::find(text, &path).map_err(|source| RotateError::Shape {
+        provider: provider.to_string(),
+        source,
+    })?;
+    let out = tw_yaml::set(text, &path, &tw_yaml::Scalar::s(new_refresh)).map_err(|source| {
+        RotateError::Shape {
+            provider: provider.to_string(),
+            source,
+        }
+    })?;
+    // **写之前先自己读一遍。**patch 出来的东西必须还是一份能加载的配置，
+    // 而且那个字段真的变成了新值 —— 否则我们会把一份坏配置留在盘上，
+    // 而用户下一次启动才撞上它（§3.8 的「先校验再写」同一条）。
+    let re = try_parse(&out).map_err(|r| RotateError::Broke {
+        provider: provider.to_string(),
+        why: r.message,
+    })?;
+    let ok = re
+        .providers
+        .iter()
+        .find(|p| p.name == provider)
+        .and_then(|p| p.key.oauth())
+        .is_some_and(|o| o.refresh == new_refresh);
+    if !ok {
+        return Err(RotateError::Broke {
+            provider: provider.to_string(),
+            why: "补丁写完之后读回来，那个字段不是新值".into(),
+        });
+    }
+    Ok(out)
+}
+
+/// `providers` 里第几个叫这个名字。
+fn provider_index(text: &str, provider: &str) -> Option<usize> {
+    let cfg: Config = serde_yaml_ng::from_str(text).ok()?;
+    cfg.providers.iter().position(|p| p.name == provider)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RotateError {
+    #[error("配置里没有叫 `{provider}` 的上游了")]
+    NoProvider { provider: String },
+    /// **说清「形状不对」而不是「写失败」。**用户可能把凭据写成了
+    /// 别的形状（锚点、块标量），那时正确的动作是他自己去改，
+    /// 而不是让我们猜。
+    #[error("`{provider}` 的 key.oauth.refresh 不在预期的位置上：{source}")]
+    Shape {
+        provider: String,
+        source: tw_yaml::PatchError,
+    },
+    #[error("给 `{provider}` 打完补丁之后配置读不回来了，没有写盘：{why}")]
+    Broke { provider: String, why: String },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("读 {path} 失败：{source}")]
@@ -836,7 +972,9 @@ providers:
 "#;
         let cfg: Config = serde_yaml_ng::from_str(y).unwrap();
         match &cfg.providers[0].key {
-            Secret::Exec { exec, timeout_secs } => {
+            Secret::Exec {
+                exec, timeout_secs, ..
+            } => {
                 assert_eq!(exec[0], "op");
                 assert!(timeout_secs.is_none());
             }
@@ -865,10 +1003,34 @@ providers:
     }
 
     #[test]
+    fn an_exec_ttl_is_parsed_and_a_broken_one_falls_back_to_no_caching() {
+        let mk = |t: Option<&str>| Secret::Exec {
+            exec: vec!["echo".into(), "x".into()],
+            timeout_secs: None,
+            ttl: t.map(|s| s.to_string()),
+        };
+        assert_eq!(
+            mk(Some("55m")).exec_ttl(),
+            Some(std::time::Duration::from_secs(3300))
+        );
+        assert_eq!(
+            mk(Some("30")).exec_ttl(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        // **不写就不缓存** —— 保持这个字段出现之前的行为
+        assert_eq!(mk(None).exec_ttl(), None);
+        // 写坏了也退回不缓存，而不是让上游整个不可用（check 会说这句）
+        assert_eq!(mk(Some("五分钟")).exec_ttl(), None);
+        // 别的凭据类型没有 ttl 这回事
+        assert_eq!(Secret::Literal("sk-x".into()).exec_ttl(), None);
+    }
+
+    #[test]
     fn an_exec_key_actually_runs() {
         let s = Secret::Exec {
             exec: vec!["echo".into(), "sk-1".into()],
             timeout_secs: None,
+            ttl: None,
         };
         assert_eq!(s.resolve().unwrap(), "sk-1");
     }

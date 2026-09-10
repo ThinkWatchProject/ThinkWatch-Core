@@ -82,9 +82,15 @@ pub fn run_exec(argv: &[String], timeout: Duration) -> Result<String, ExecError>
             }
         })?;
 
-    // 轮询而不是 wait_timeout：不想为这一处引一个 crate。密钥命令的
-    // 频率是「每次读配置一次」，50ms 的粒度绰绰有余。
+    // 轮询而不是 wait_timeout：不想为这一处引一个 crate。
+    //
+    // **但间隔要从 1ms 起翻倍，不能是固定 50ms。**这一行原来的注释写着
+    // 「密钥命令的频率是每次读配置一次，50ms 的粒度绰绰有余」—— 那句话
+    // 是错的：`resolved_key()` 在故障转移循环里，**每个请求跑一次**。
+    // 实测固定 50ms 之下，`/bin/echo` 这种瞬间返回的命令要 53ms，而那
+    // 53ms 全加在转发路径上。翻倍之后同一条命令是个位数毫秒。
     let deadline = std::time::Instant::now() + timeout;
+    let mut nap = Duration::from_millis(1);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -97,7 +103,11 @@ pub fn run_exec(argv: &[String], timeout: Duration) -> Result<String, ExecError>
                         timeout,
                     });
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                // 睡到 deadline 就够了，不要睡过头 —— 超时那条路
+                // 上多睡的时间是纯粹的延迟
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(nap.min(left));
+                nap = (nap * 2).min(Duration::from_millis(50));
             }
             Err(source) => {
                 return Err(ExecError::Spawn {
