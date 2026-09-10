@@ -488,3 +488,62 @@ async fn replaying_a_request_that_is_gone_says_so() {
     let (st, body) = post(&b.app, "/replay/quote", r#"{"id":42,"provider":"官方"}"#).await;
     assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
 }
+
+// ---------------------------------------------------------------- 诊断包
+
+#[tokio::test]
+async fn the_diagnostic_bundle_never_carries_a_key_in_the_clear() {
+    // **我们是一个看得见所有 API key 的网关**，而这份东西会被贴进 issue
+    // （§9.7）。这条测试是那句话的全部保障。
+    let b = bed();
+    let (st, text) = get(&b.app, "/diagnostics").await;
+    assert_eq!(st, StatusCode::OK);
+    // 配置里那两把
+    assert!(
+        !text.contains("tw-一把钥匙就够"),
+        "网关密钥漏出来了：\n{text}"
+    );
+    assert!(!text.contains("sk-x"), "上游密钥漏出来了：\n{text}");
+    // 但要说得出有几把、叫什么 —— 排查时那是有用的
+    assert!(text.contains("我"), "{text}");
+    assert!(text.contains("官方"), "{text}");
+}
+
+#[tokio::test]
+async fn the_bundle_is_something_a_person_will_actually_read() {
+    // **用户在交出去之前会看一眼；看不懂的东西他不会看**，也就没法发现
+    // 里面有什么不该有的。所以是 Markdown 不是 JSON dump。
+    let b = bed();
+    let (_, text) = get(&b.app, "/diagnostics").await;
+    assert!(text.starts_with("# ThinkWatch 诊断包"), "{text}");
+    for section in [
+        "## 版本",
+        "## 监听",
+        "## 上游",
+        "## 安全",
+        "## 观测",
+        "## config.yaml",
+    ] {
+        assert!(text.contains(section), "少了 {section}：\n{text}");
+    }
+    // 第一屏就要提醒他自己扫一眼
+    assert!(text.contains("交出去之前请自己扫一眼"), "{text}");
+}
+
+#[tokio::test]
+async fn the_bundle_says_it_has_no_bodies_because_that_is_the_dangerous_part() {
+    // 请求体最有用也最危险。需要的话在请求详情页里单独看 —— 那一页是
+    // 他自己打开的，不会被顺手贴进 issue。
+    let b = bed();
+    let (_, text) = get(&b.app, "/diagnostics").await;
+    assert!(text.contains("不含请求体和响应体"), "{text}");
+}
+
+#[tokio::test]
+async fn a_bundle_without_observability_says_so_rather_than_showing_zeros() {
+    // 「没有记录」和「记录了零条」是两个结论。
+    let b = bed();
+    let (_, text) = get(&b.app, "/diagnostics").await;
+    assert!(text.contains("没有启动"), "{text}");
+    assert!(!text.contains("请求条数 | 0"), "{text}");
+}
