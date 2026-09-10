@@ -17,7 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 7;
+const SCHEMA: i64 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -54,6 +54,11 @@ pub struct RequestRow {
     pub client_hint: Option<String>,
     /// 这条属于哪一次任务（§7.9）。**指纹 + 起始时刻**，老记录是 None
     pub session: Option<String>,
+    /// 响应里有几个工具调用。`None` = 那次没开入站审查，**不是 0**
+    /// —— 「没数过」和「数了是零」在画像里是完全不同的两件事（§5.2）
+    pub tool_calls: Option<i64>,
+    /// 命中了几条危险规则
+    pub flagged: Option<i64>,
     pub provider: String,
     pub model: String,
     pub path: String,
@@ -243,6 +248,15 @@ impl Db {
             self.conn
                 .execute_batch("CREATE INDEX requests_session ON requests (session, at_ms);")?;
         }
+        if from < 8 {
+            // 上游行为画像（§5.2 防线三）。**「没数过」和「数了是零」
+            // 要分得开**，所以是可空列而不是默认 0 —— 后者会让关掉审查
+            // 的那段时间在画像里变成「一个工具调用都没有」，而那是假的。
+            self.conn.execute_batch(
+                "ALTER TABLE requests ADD COLUMN tool_calls INTEGER;
+                 ALTER TABLE requests ADD COLUMN flagged INTEGER;",
+            )?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -254,8 +268,8 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint, session)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+              client_hint, session, tool_calls, flagged)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
             params![
                 r.id,
                 r.at_ms,
@@ -280,6 +294,8 @@ impl Db {
                 r.cache_saved_micros,
                 r.client_hint,
                 r.session,
+                r.tool_calls,
+                r.flagged,
             ],
         )?;
         Ok(())
@@ -407,7 +423,97 @@ impl Db {
     }
 }
 
+/// 一个上游在某段时间里的行为画像（§5.2 防线三）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shape {
+    /// 这段时间里数过形状的请求有多少条。
+    ///
+    /// **不是「有多少条请求」** —— 关掉入站审查的那段时间没有数过，
+    /// 那些条不该进画像
+    pub inspected: i64,
+    /// 其中有工具调用的
+    pub with_tools: i64,
+    /// 其中命中过危险规则的
+    pub with_flags: i64,
+    /// 响应字节数的中位数。**中位数不是平均数** —— 一次超长响应会把
+    /// 平均数拉走，而画像要说的是「平常什么样」
+    pub median_bytes: i64,
+    pub errors: i64,
+    /// 这段时间里的总请求数（含没数过形状的）
+    pub total: i64,
+}
+
+impl Shape {
+    pub fn tool_rate(&self) -> Option<f64> {
+        (self.inspected > 0).then(|| self.with_tools as f64 / self.inspected as f64)
+    }
+    pub fn flag_rate(&self) -> Option<f64> {
+        (self.inspected > 0).then(|| self.with_flags as f64 / self.inspected as f64)
+    }
+    pub fn error_rate(&self) -> Option<f64> {
+        (self.total > 0).then(|| self.errors as f64 / self.total as f64)
+    }
+}
+
 impl Db {
+    /// 一个上游在 `[from_ms, to_ms)` 里的行为画像。
+    ///
+    /// **本地应答的不算**（§4.8）：它们没经过上游，混进来会稀释每一个
+    /// 比率，而且稀释的幅度随用户开了几个客户端而变 —— 那种噪声没法解释。
+    pub fn shape_of(&self, provider: &str, from_ms: i64, to_ms: i64) -> Result<Shape, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN tool_calls IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN tool_calls > 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN flagged > 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END)
+             FROM requests
+             WHERE provider = ?1 AND local = 0 AND at_ms >= ?2 AND at_ms < ?3",
+        )?;
+        let (total, inspected, with_tools, with_flags, errors) =
+            st.query_row(rusqlite::params![provider, from_ms, to_ms], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                ))
+            })?;
+        // 中位数走 nearest-rank，和 §4.6 的分位数同一套算法 ——
+        // 两处用不同的定义会让同一份数据在两个页面上对不上
+        let median_bytes = self
+            .conn
+            .prepare(
+                "SELECT bytes FROM requests
+                 WHERE provider = ?1 AND local = 0 AND bytes IS NOT NULL
+                   AND at_ms >= ?2 AND at_ms < ?3
+                 ORDER BY bytes LIMIT 1 OFFSET (
+                     SELECT MAX(0, (COUNT(*) - 1) / 2) FROM requests
+                     WHERE provider = ?1 AND local = 0 AND bytes IS NOT NULL
+                       AND at_ms >= ?2 AND at_ms < ?3)",
+            )?
+            .query_row(rusqlite::params![provider, from_ms, to_ms], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Shape {
+            inspected,
+            with_tools,
+            with_flags,
+            median_bytes,
+            errors,
+            total,
+        })
+    }
+
+    /// 历史上出现过的所有上游名字。
+    pub fn providers_seen(&self) -> Result<Vec<String>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT provider FROM requests WHERE provider != '' ORDER BY provider",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**
     /// （§7.11）：我们改了一个文件，但那个文件有没有被读到，只有请求能
     /// 证明。
@@ -652,6 +758,8 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         client: r.get("client")?,
         client_hint: r.get("client_hint")?,
         session: r.get("session")?,
+        tool_calls: r.get("tool_calls")?,
+        flagged: r.get("flagged")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
         path: r.get("path")?,
@@ -741,6 +849,8 @@ mod tests {
         RequestRow {
             client_hint: None,
             session: None,
+            tool_calls: None,
+            flagged: None,
             id,
             at_ms,
             client: "claude-code".into(),
@@ -1014,6 +1124,89 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_counts_only_what_it_actually_measured() {
+        // **「没数过」和「数了是零」是两件事。**关掉入站审查的那段时间
+        // 没有数过形状，那些条混进画像会变成「一个工具调用都没有」——
+        // 而那是假的。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        let mk = |i: i64, at: i64, tools: Option<i64>| {
+            let mut r = row(i, at);
+            r.provider = "relay".into();
+            r.tool_calls = tools;
+            r.flagged = tools.map(|_| 0);
+            db.insert(&r).unwrap();
+        };
+        mk(1, 100, Some(2));
+        mk(2, 200, Some(0));
+        mk(3, 300, None); // 那时候审查是关的
+        let s = db.shape_of("relay", 0, 1000).unwrap();
+        assert_eq!(s.total, 3);
+        assert_eq!(s.inspected, 2, "把没数过的也算进去了");
+        assert_eq!(s.with_tools, 1);
+        assert_eq!(s.tool_rate(), Some(0.5), "分母该是数过的那些");
+    }
+
+    #[test]
+    fn locally_answered_requests_stay_out_of_the_profile() {
+        // 它们没经过上游，混进来会稀释每一个比率，而稀释的幅度随用户
+        // 开了几个客户端而变 —— 那种噪声没法解释。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        let mut r = row(1, 100);
+        r.provider = "relay".into();
+        r.tool_calls = Some(1);
+        db.insert(&r).unwrap();
+        let mut l = row(2, 200);
+        l.provider = "relay".into();
+        l.local = true;
+        l.tool_calls = Some(0);
+        db.insert(&l).unwrap();
+        let s = db.shape_of("relay", 0, 1000).unwrap();
+        assert_eq!(s.inspected, 1);
+        assert_eq!(s.tool_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn a_window_with_nothing_in_it_reports_none_not_zero() {
+        // 「这段时间里没有数据」和「这段时间里比率是 0」是两个结论。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        let s = db.shape_of("relay", 0, 1000).unwrap();
+        assert_eq!(s.tool_rate(), None);
+        assert_eq!(s.error_rate(), None);
+    }
+
+    #[test]
+    fn the_median_is_a_median_not_a_mean() {
+        // 一次超长响应会把平均数拉走，而画像要说的是「平常什么样」。
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        for (i, b) in [100i64, 110, 120, 130, 1_000_000].into_iter().enumerate() {
+            let mut r = row(i as i64 + 1, (i as i64 + 1) * 10);
+            r.provider = "relay".into();
+            r.bytes = Some(b);
+            db.insert(&r).unwrap();
+        }
+        assert_eq!(db.shape_of("relay", 0, 1000).unwrap().median_bytes, 120);
+    }
+
+    #[test]
+    fn providers_are_listed_from_what_actually_happened() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("data.db")).unwrap();
+        for (i, p) in ["relay", "官方", "relay"].into_iter().enumerate() {
+            let mut r = row(i as i64 + 1, 100);
+            r.provider = p.into();
+            db.insert(&r).unwrap();
+        }
+        assert_eq!(
+            db.providers_seen().unwrap(),
+            vec!["relay".to_string(), "官方".to_string()]
+        );
+    }
+
+    #[test]
     fn the_observation_window_can_ask_when_a_client_was_last_seen() {
         // 我们改了一个文件，但那个文件有没有被读到，只有请求能证明。
         let d = tempfile::tempdir().unwrap();
@@ -1057,6 +1250,8 @@ mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN flagged;
+                     ALTER TABLE requests DROP COLUMN tool_calls;
                      ALTER TABLE requests DROP COLUMN session;
                      ALTER TABLE requests DROP COLUMN client_hint;",
                 )

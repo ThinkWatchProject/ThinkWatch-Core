@@ -98,6 +98,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
         // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认（§7.11）
+        .route("/baseline", get(baseline))
         .route("/sessions", get(sessions))
         .route("/sessions/{id}", get(session_detail))
         .route("/dryrun", post(dryrun::dry_run))
@@ -955,6 +956,63 @@ fn apply_fail(e: ApplyError) -> Fail {
 ///
 /// **整文件生成**，不走 §3.8 的最小替换 —— 那是两套机制（§7.6 第 1 步）。
 /// 只在还没有 provider 时可用，之后改配置归 M2 的双向同步管。
+/// 最近这一段有多长。
+const RECENT_HOURS: u32 = 24;
+/// 拿来当基线的那一段有多长。
+const BASELINE_DAYS: u32 = 30;
+
+/// 每个上游最近是不是变了（§5.2 防线三）。
+///
+/// **两段时间不重叠**：基线是「最近这一段之前的那 30 天」，不含最近的
+/// 那 24 小时。重叠的话，一次异常会同时抬高两边，把自己的信号冲淡。
+async fn baseline(State(s): State<ControlState>) -> Json<tw_api::BaselineResponse> {
+    let mut out = tw_api::BaselineResponse {
+        recent_hours: RECENT_HOURS,
+        baseline_days: BASELINE_DAYS,
+        providers: Vec::new(),
+        unavailable: s.store.is_none(),
+    };
+    let Some(store) = &s.store else {
+        return Json(out);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let recent_from = now - (RECENT_HOURS as i64) * 3_600_000;
+    let base_from = recent_from - (BASELINE_DAYS as i64) * 86_400_000;
+
+    let g = store.lock().await;
+    for provider in g.db().providers_seen().unwrap_or_default() {
+        let Ok(recent) = g.db().shape_of(&provider, recent_from, now) else {
+            continue;
+        };
+        let Ok(base) = g.db().shape_of(&provider, base_from, recent_from) else {
+            continue;
+        };
+        out.providers.push(tw_api::ProviderBaseline {
+            recent_total: recent.total,
+            baseline_total: base.total,
+            recent_inspected: recent.inspected,
+            baseline_inspected: base.inspected,
+            drifts: tw_store::drift::compare(&recent, &base)
+                .into_iter()
+                .map(|d| tw_api::DriftView {
+                    metric: d.metric.to_string(),
+                    label: d.label.to_string(),
+                    recent: d.recent,
+                    baseline: d.baseline,
+                    recent_n: d.recent_n,
+                    baseline_n: d.baseline_n,
+                    notable: d.notable,
+                })
+                .collect(),
+            provider,
+        });
+    }
+    Json(out)
+}
+
 fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {
     tw_api::SessionView {
         id: s.id.clone(),

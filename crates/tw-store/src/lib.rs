@@ -11,6 +11,7 @@
 pub mod blobs;
 pub mod db;
 pub mod disk;
+pub mod drift;
 pub mod recorder;
 pub mod task;
 

@@ -1016,6 +1016,13 @@ async fn pipeline(
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }
+        // 这条响应长什么样（§5.2 防线三）。**只有形状，没有内容。**
+        if let Some(w) = wall.as_ref() {
+            let (tool_calls, flagged) = w.shape();
+            if tool_calls > 0 || flagged > 0 {
+                bus.emit(tw_api::Event::ResponseInspected { id, tool_calls, flagged });
+            }
+        }
         let (recorded, original_len) = tap.finish();
         if !recorded.is_empty() {
             crate::bodies::offer(

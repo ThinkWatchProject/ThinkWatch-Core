@@ -19,6 +19,9 @@ use crate::disk::{self, DiskLevel};
 #[derive(Debug, Clone)]
 struct Partial {
     at_ms: i64,
+    /// 响应里有几个工具调用、命中几条规则（§5.2 防线三）
+    tool_calls: Option<i64>,
+    flagged: Option<i64>,
     client: String,
     client_hint: Option<String>,
     session: Option<String>,
@@ -155,6 +158,8 @@ impl Recorder {
                         client: client.clone(),
                         client_hint: client_hint.clone(),
                         session,
+                        tool_calls: None,
+                        flagged: None,
                         provider: provider.clone(),
                         model: model.clone(),
                         path: path.clone(),
@@ -244,6 +249,8 @@ impl Recorder {
                     client: p.client,
                     client_hint: p.client_hint,
                     session: p.session,
+                    tool_calls: p.tool_calls,
+                    flagged: p.flagged,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -276,6 +283,8 @@ impl Recorder {
                     client: p.client,
                     client_hint: p.client_hint,
                     session: p.session,
+                    tool_calls: p.tool_calls,
+                    flagged: p.flagged,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -311,6 +320,8 @@ impl Recorder {
                     // 本地应答的探测请求没经过上游，也就没有旁证可言
                     client_hint: None,
                     session: None,
+                    tool_calls: None,
+                    flagged: None,
                     provider: String::new(),
                     model: String::new(),
                     path: probe.clone(),
@@ -363,6 +374,16 @@ impl Recorder {
             // 而那属于请求详情，不是另一行记录
             | Event::Redacted { .. }
             | Event::ToolCallFlagged { .. } => {}
+            Event::ResponseInspected {
+                id,
+                tool_calls,
+                flagged,
+            } => {
+                if let Some(p) = self.inflight.get_mut(id) {
+                    p.tool_calls = Some(*tool_calls as i64);
+                    p.flagged = Some(*flagged as i64);
+                }
+            }
         }
     }
 

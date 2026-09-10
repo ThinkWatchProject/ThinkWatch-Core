@@ -125,6 +125,19 @@ pub enum Event {
         items: Vec<RedactedItem>,
         at_ms: u64,
     },
+    /// 这条响应长什么样（§5.2 防线三）。
+    ///
+    /// **只有形状，没有内容**：几个工具调用、命中几条规则。攒起来就是
+    /// 每个上游的行为画像 —— 一个用了三个月一直正常的中转站，某天开始
+    /// 返回大量 bash 调用，那是统计异常。
+    ///
+    /// 单独一个事件而不是挂在 `RequestFinished` 上：它只在开了入站审查
+    /// 时才有，而 `RequestFinished` 是每条请求都有的。
+    ResponseInspected {
+        id: u64,
+        tool_calls: u32,
+        flagged: u32,
+    },
     /// 上游返回的响应里有一个可疑的工具调用（§5.2）。
     ///
     /// **这是网关位置独有的能力**：只有我们同时知道「这个调用长什么样」
@@ -271,6 +284,7 @@ impl Event {
             | Event::ScanAlert { id, .. }
             | Event::Redacted { id, .. }
             | Event::ToolCallFlagged { id, .. }
+            | Event::ResponseInspected { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }
@@ -778,6 +792,49 @@ pub struct TurnView {
 pub struct SessionDetail {
     pub session: SessionView,
     pub turns: Vec<TurnView>,
+}
+
+// ---------------------------------------------------------- 上游行为基线
+
+/// 一个上游最近是不是变了（§5.2 防线三）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftView {
+    /// `tool_calls` / `flagged` / `errors`
+    pub metric: String,
+    pub label: String,
+    /// 比率，0..1
+    pub recent: f64,
+    pub baseline: f64,
+    /// 两边各自的样本量。**必须一起显示** —— 没有它，比率是个没法判断
+    /// 可信度的数字
+    pub recent_n: i64,
+    pub baseline_n: i64,
+    pub notable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderBaseline {
+    pub provider: String,
+    /// 最近这一段有多少条请求
+    pub recent_total: i64,
+    /// 基线那一段有多少条
+    pub baseline_total: i64,
+    /// 数过形状的有多少条。**和总数不同时要说** —— 关掉入站审查的那段
+    /// 时间没有数过，画像里不该假装它们是「没有工具调用」
+    pub recent_inspected: i64,
+    pub baseline_inspected: i64,
+    pub drifts: Vec<DriftView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineResponse {
+    /// 最近这一段有多长（小时）
+    pub recent_hours: u32,
+    /// 基线那一段有多长（天）
+    pub baseline_days: u32,
+    pub providers: Vec<ProviderBaseline>,
+    /// 观测层没起来时是 true，界面上要说清「不是没发现，是没看」
+    pub unavailable: bool,
 }
 
 // ---------------------------------------------------------------- 静态扫描
