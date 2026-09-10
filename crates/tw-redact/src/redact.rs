@@ -68,13 +68,26 @@ pub struct Redacted {
 /// 失效 —— 而那种错不会立刻炸，它会安静地切错一个字节，然后你拿到一份
 /// 坏掉的 JSON。
 pub fn apply(text: &str, hits: &[Hit]) -> Redacted {
-    let mut ledger = Ledger::default();
+    apply_into(text, hits, Ledger::default())
+}
+
+/// 同上，但**接着一本已有的账本编号**。
+///
+/// WebSocket 那条路要用它（§3.6）：一次连接里有很多帧，而每帧各起一本
+/// 账的话，第二帧的 `<<TW_SECRET_1>>` 会和第一帧的撞车 —— 两个不同的
+/// 密钥映射到同一个占位符，还原时必然给错一个。**那不是会不会发生的
+/// 问题，是第二帧只要命中一次就一定发生。**
+pub fn apply_into(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
     if hits.is_empty() {
         return Redacted {
             text: text.to_string(),
             ledger,
         };
     }
+    // 这一次新换了什么，单独记 —— 事件里要报的是「这一帧换了什么」，
+    // 不是「这条连接至今换了什么」
+    let before = ledger.counts.len();
+    let _ = before;
     let mut out = text.to_string();
     for h in hits.iter().rev() {
         let original = &text[h.bytes.clone()];
@@ -98,6 +111,12 @@ pub fn apply(text: &str, hits: &[Hit]) -> Redacted {
 pub fn redact(text: &str, kinds: &[Kind]) -> Redacted {
     let hits = crate::rules::scan(text, kinds);
     apply(text, &hits)
+}
+
+/// 扫 + 换，接着一本已有的账本编号。见 [`apply_into`]。
+pub fn redact_into(text: &str, kinds: &[Kind], ledger: Ledger) -> Redacted {
+    let hits = crate::rules::scan(text, kinds);
+    apply_into(text, &hits, ledger)
 }
 
 /// 一次性还原（非流式响应、错误信息）。
@@ -224,5 +243,39 @@ mod tests {
             restore("这是 <<TW_SECRET_9>> 好吗", &r.ledger),
             "这是 <<TW_SECRET_9>> 好吗"
         );
+    }
+    #[test]
+    fn a_second_frame_does_not_reuse_the_first_frames_placeholder_number() {
+        // **第二帧只要命中一次就一定撞车** —— 两个不同的密钥映射到同一个
+        // 占位符，还原时必然给错一个（WebSocket 那条路，§3.6）
+        let kinds = [Kind::ApiKeys];
+        let a = redact("我的 key 是 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", &kinds);
+        let b = redact_into(
+            "另一把是 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB",
+            &kinds,
+            a.ledger.clone(),
+        );
+        assert!(a.text.contains("<<TW_SECRET_1>>"), "{}", a.text);
+        assert!(
+            b.text.contains("<<TW_SECRET_2>>"),
+            "第二帧重用了 1 号：{}",
+            b.text
+        );
+        // 一本账里两个都还原得回来
+        let back = restore(&format!("{} / {}", a.text, b.text), &b.ledger);
+        assert!(back.contains("AAAAAAAAAAAA"), "{back}");
+        assert!(back.contains("BBBBBBBBBBBB"), "{back}");
+    }
+
+    #[test]
+    fn the_same_secret_in_two_frames_keeps_one_number() {
+        // 同一个值在一次连接里只该占一个编号 —— 否则模型会以为那是
+        // 两个不同的东西
+        let kinds = [Kind::ApiKeys];
+        let k = "sk-ant-api03-SAMESAMESAMESAMESAME1";
+        let a = redact(&format!("第一次 {k}"), &kinds);
+        let b = redact_into(&format!("第二次 {k}"), &kinds, a.ledger.clone());
+        assert!(b.text.contains("<<TW_SECRET_1>>"), "{}", b.text);
+        assert_eq!(b.ledger.len(), 1, "同一个值占了两个编号");
     }
 }

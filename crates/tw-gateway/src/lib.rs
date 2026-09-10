@@ -17,6 +17,7 @@ pub mod health;
 pub mod hint;
 pub mod l1;
 pub mod l3;
+pub mod latency;
 pub mod leak;
 pub mod limits;
 pub mod oauth;
@@ -27,6 +28,7 @@ pub mod session;
 pub mod toolwall;
 pub mod translate;
 pub mod usage;
+pub mod ws;
 
 pub use access::{AllowList, Cidr};
 pub use bodies::{BodyKind, BodyRecord, BodySender};

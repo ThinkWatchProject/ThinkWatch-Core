@@ -220,7 +220,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|g| tw_api::GroupView {
                 name: g.name.clone(),
-                kind: format!("{:?}", g.kind).to_lowercase(),
+                kind: g.kind.label().to_string(),
+                selected: g.selected.clone(),
                 providers: g.providers.clone(),
                 hurts_cache: g.kind.hurts_cache(),
             })
@@ -371,7 +372,7 @@ async fn l1(
         None => cfg.providers.iter().collect(),
     };
     for p in targets {
-        let hop = match resolve_hop(&cfg, p) {
+        let hop = match tw_gateway::l1::hop_for(&cfg, p) {
             Ok(h) => h,
             Err(e) => {
                 out.push(tw_api::L1Result {
@@ -409,45 +410,6 @@ fn view(target: String, via: Option<String>, r: tw_gateway::L1Result) -> tw_api:
         total_ms: r.total_ms,
         notes: r.notes,
         error: r.error,
-    }
-}
-
-/// 把 provider 的代理名解析成一跳。
-///
-/// **`system` 这里测不了**：跟随系统代理是 reqwest 在建连时才去查环境的，
-/// 我们没有那份地址可以去握手。说出来，而不是假装直连测一遍给个漂亮
-/// 数字 —— 那个数字测的根本不是用户实际会走的路。
-fn resolve_hop(
-    cfg: &tw_config::Config,
-    p: &tw_config::Provider,
-) -> Result<Option<tw_gateway::ProxyHop>, String> {
-    match p.proxy.as_str() {
-        tw_config::DIRECT => Ok(None),
-        tw_config::SYSTEM => Err(
-            "这家走的是系统代理，而系统代理的地址要到建连时才由环境决定 —— L1 测不到它。想量这条线的话，把代理显式配成一个命名条目。"
-                .into(),
-        ),
-        name => {
-            let px = cfg
-                .proxies
-                .iter()
-                .find(|x| x.name == name)
-                .ok_or_else(|| format!("provider `{}` 要走代理 `{name}`，但 proxies 段里没有这个名字。", p.name))?;
-            let auth = match &px.auth {
-                None => None,
-                Some(a) => Some((
-                    a.user.clone(),
-                    a.pass
-                        .resolve()
-                        .map_err(|e| format!("代理 `{name}` 的密码取不出来：{e}"))?,
-                )),
-            };
-            Ok(Some(tw_gateway::ProxyHop {
-                kind: px.kind,
-                addr: px.addr.clone(),
-                auth,
-            }))
-        }
     }
 }
 

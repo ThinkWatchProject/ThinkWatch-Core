@@ -83,6 +83,36 @@ pub struct Wall {
 /// 「先 cd 再 curl」这种要绕过它，得先让模型输出几十万字符的无害内容。
 const MAX_ARG: usize = 64 * 1024;
 
+/// 一个值里所有**完整的**工具调用，`(名字, 参数的 JSON 文本)`。
+///
+/// 认两种形状：对象自己就是 `{"type":"tool_use","name":…,"input":…}`，
+/// 或者它的 `content` 数组里有这样的元素。
+///
+/// **不递归到任意深度**：那会把用户请求里引用的一段 JSON 也当成工具
+/// 调用，而误报的代价是用户关掉整个功能（§5.2）。
+fn complete_tool_calls(v: &Value) -> Vec<(String, String)> {
+    fn one(v: &Value, out: &mut Vec<(String, String)>) {
+        if v.get("type").and_then(|x| x.as_str()) != Some("tool_use") {
+            return;
+        }
+        let Some(input) = v.get("input") else { return };
+        let name = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("(没名字)")
+            .to_string();
+        out.push((name, input.to_string()));
+    }
+    let mut out = Vec::new();
+    one(v, &mut out);
+    if let Some(items) = v.get("content").and_then(|c| c.as_array()) {
+        for it in items {
+            one(it, &mut out);
+        }
+    }
+    out
+}
+
 impl Wall {
     pub fn new(rules: Arc<Rules>, check_text: bool) -> Self {
         Self {
@@ -149,6 +179,18 @@ impl Wall {
                 continue;
             };
             let index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+
+            // **一个完整的、没有分片的工具调用。**
+            //
+            // 流式那条路是「`content_block_start` 记名字 → `partial_json`
+            // 攒参数」，而 WebSocket 上一帧就是一个完整对象（§3.6），
+            // 没有分片可攒 —— 只认流式形状的话，这一层对 WS 完全失明。
+            //
+            // 顺带也认了包在 `content` 数组里的那种（非流式响应体的形状）。
+            for (name, args) in complete_tool_calls(&v) {
+                self.tool_calls += 1;
+                self.check(&name, &args, safe_prefix, out);
+            }
 
             // 工具调用开始：记下名字
             if v.get("type").and_then(|x| x.as_str()) == Some("content_block_start")

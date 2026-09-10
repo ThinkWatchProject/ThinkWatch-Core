@@ -364,6 +364,12 @@ pub struct RouteView {
 pub struct GroupView {
     pub name: String,
     pub kind: String,
+    /// `select` 组当前选中谁。
+    ///
+    /// **界面要能切它** —— §3.5 说这个策略就是「UI 上点选或托盘里切」，
+    /// 而切不了的话它等于一个只能改 YAML 才能用的功能。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
     pub providers: Vec<String>,
     /// 这个策略会不会让 prompt cache 不稳定。**要在界面上直说** ——
     /// 它决定了用户的账单（§3.4）。
@@ -1077,6 +1083,12 @@ pub struct RuleTrace {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunResult {
+    /// 这个组按什么挑（`按顺序` / `选最快` / `选最便宜` …）。
+    ///
+    /// **不说的话，用户看不懂候选为什么是这个顺序** —— 「我明明把官方
+    /// 写在第一个」。直指 provider 时是 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
     /// `route` | `deny` | `no_match`
     pub outcome: String,
     /// 命中的规则名

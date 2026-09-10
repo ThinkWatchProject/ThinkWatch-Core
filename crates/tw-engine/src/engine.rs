@@ -25,6 +25,19 @@ pub enum GroupType {
     Select,
     /// 轮流。**必须开会话粘滞，否则缓存全废**
     LoadBalance,
+    /// 选最快的。判据是**真实流量测出来的 TTFB**，样本不够时用启动时
+    /// 那次零成本的 L1 握手计时补（§4.6）。
+    ///
+    /// **测不到的那些排最后，而不是排最前。**「没测到」不等于「慢」，
+    /// 但把它排前面就等于放弃了「选最快的」这个承诺；排最后它仍然是
+    /// 故障转移的备选。
+    UrlTest,
+    /// 选最便宜的。**按输入单价排，输出单价只做同价时的次序**。
+    ///
+    /// 编码 agent 的输入输出比通常在 10:1 以上（长上下文、短 diff），
+    /// 所以输入单价主导。**算不出价钱的排最后** —— 「最便宜」是一句
+    /// 关于钱的承诺，而挑一个不知道多少钱的，完全可能是最贵的那个。
+    Cheapest,
 }
 
 impl GroupType {
@@ -33,8 +46,45 @@ impl GroupType {
     /// UI 上选中时要给一句提示 —— **不要让用户为了省 20% 的单价，
     /// 付出丢掉 90% 缓存折扣的代价**（§3.4）。
     pub fn hurts_cache(&self) -> bool {
-        matches!(self, GroupType::LoadBalance)
+        matches!(
+            self,
+            GroupType::LoadBalance | GroupType::UrlTest | GroupType::Cheapest
+        )
     }
+
+    /// 排顺序时要不要用到运行时的数字。
+    ///
+    /// **`fallback` 和 `select` 不需要**，而它们是绝大多数人的配置
+    /// （§0.6）—— 于是那条路上一个 HashMap 都不用建。
+    pub fn needs_runtime(&self) -> bool {
+        !matches!(self, GroupType::Fallback | GroupType::Select)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            GroupType::Fallback => "按顺序",
+            GroupType::Select => "手动选",
+            GroupType::LoadBalance => "轮流",
+            GroupType::UrlTest => "选最快",
+            GroupType::Cheapest => "选最便宜",
+        }
+    }
+}
+
+/// 排顺序时才知道的那些数字。**引擎是纯函数，这些从外面传进来** ——
+/// 于是数据面和试算页（§7.11）走的是同一段逻辑，试算不会「算出一个
+/// 和真实转发不一样的结果」。
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    /// 会话指纹（§7.9）。`None` = 认不出来这是哪次会话
+    pub session: Option<String>,
+    /// 轮转的种子。认不出会话时用它 —— 通常是请求序号
+    pub seq: u64,
+    /// 每家的典型 TTFB（毫秒）。**缺席 = 样本不够**，不是「很快」
+    pub ttfb_ms: std::collections::HashMap<String, u32>,
+    /// 每家跑这个模型的单价，(输入, 输出)，微分/百万 token。
+    /// **缺席 = 算不出价钱**，不是「免费」
+    pub price: std::collections::HashMap<String, (i64, i64)>,
 }
 
 /// 一组上游，以及从里面挑一个的策略。
@@ -56,6 +106,73 @@ pub struct Group {
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+}
+
+/// 按策略排序。**纯函数** —— 同样的输入永远给同样的顺序，试算页因此
+/// 能如实预告数据面会怎么走。
+pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
+    match g.kind {
+        // 这两种的顺序在 `expand_group` 里就定好了
+        GroupType::Fallback | GroupType::Select => members.to_vec(),
+        GroupType::LoadBalance => rotate(g, members, f),
+        GroupType::UrlTest => {
+            // 有样本的按 TTFB 升序；没样本的保持原有相对次序排在后面。
+            // **`sort_by_key` 是稳定排序**，所以同速的两家不会每次换位
+            // —— 那会让 prompt cache 白白多断一次
+            let mut out = members.to_vec();
+            out.sort_by_key(|p| f.ttfb_ms.get(p).copied().unwrap_or(u32::MAX));
+            out
+        }
+        GroupType::Cheapest => {
+            let mut out = members.to_vec();
+            out.sort_by_key(|p| match f.price.get(p) {
+                // 输入单价主导，输出单价只做同价时的次序
+                Some((i, o)) => (*i, *o),
+                // 算不出价钱的排最后
+                None => (i64::MAX, i64::MAX),
+            });
+            out
+        }
+    }
+}
+
+/// `load-balance` 的轮转。
+///
+/// **认得出会话就固定一家**（§3.5：不开粘滞的话，长会话每轮跳一家，
+/// prompt cache 全废，而缓存命中与否成本差 5 到 10 倍 —— 「分散负载」
+/// 换来的可能是账单翻几倍）。
+///
+/// 认不出会话时按 `seq` 轮转。**选中的那一家排头，其余顺次跟上**，
+/// 一个都不少 —— 故障转移还要用它们。
+fn rotate(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let start = if g.session_affinity {
+        match &f.session {
+            // **同一个会话永远落在同一家。**用会话指纹取模，不用计数器
+            // —— 计数器会让「重启之后同一个会话换了一家」，而那正是
+            // 粘滞要防的
+            Some(s) => (hash64(s) % members.len() as u64) as usize,
+            // 认不出会话：这一条没有粘滞可言，按 seq 轮转
+            None => (f.seq % members.len() as u64) as usize,
+        }
+    } else {
+        (f.seq % members.len() as u64) as usize
+    };
+    let mut out = Vec::with_capacity(members.len());
+    out.extend_from_slice(&members[start..]);
+    out.extend_from_slice(&members[..start]);
+    out
+}
+
+/// 会话指纹 → 一个数。**不用于安全**，只要稳定：同一个字符串在同一个
+/// 版本里永远给同一个数。
+fn hash64(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// 横切的安全策略（DESIGN.md §5.1、§5.2）。
@@ -415,9 +532,26 @@ impl Engine {
                 );
                 out
             }
-            // 轮转的实际选择在数据面（要按会话粘滞），引擎只给出集合。
-            GroupType::LoadBalance => g.providers.clone(),
+            // 这三种要运行时的数字才排得出来。**这里只给集合，
+            // 顺序由 `order` 定** —— 它是纯函数，数据面和试算页都调它。
+            GroupType::LoadBalance | GroupType::UrlTest | GroupType::Cheapest => {
+                g.providers.clone()
+            }
         }
+    }
+
+    /// 把候选按这个组的策略排好。
+    ///
+    /// **`expand_group` 给的是集合，这里给的是顺序。**分成两步是因为
+    /// 顺序要用运行时的数字，而路由决策本身必须是纯的、可试算的。
+    ///
+    /// 排完之后**所有候选都还在**，只是次序变了 —— 故障转移要用到它们
+    /// （§4.2）。「选最快的」不等于「只用最快的那一家」。
+    pub fn order(&self, group: Option<&str>, members: &[String], f: &Facts) -> Vec<String> {
+        let Some(g) = group.and_then(|n| self.groups.iter().find(|g| g.name == n)) else {
+            return members.to_vec();
+        };
+        order_by(g, members, f)
     }
 
     pub fn groups(&self) -> &[Group] {
@@ -900,5 +1034,167 @@ mod tests {
     fn a_typo_in_a_route_field_is_an_error_too() {
         let e = serde_yaml_ng::from_str::<Route>("name: r\nton: 官方\n").unwrap_err();
         assert!(e.to_string().contains("ton"), "{e}");
+    }
+
+    fn grp(kind: GroupType, sticky: bool) -> Group {
+        Group {
+            name: "池子".into(),
+            kind,
+            providers: vec!["甲".into(), "乙".into(), "丙".into()],
+            session_affinity: sticky,
+            selected: None,
+        }
+    }
+
+    #[test]
+    fn load_balance_actually_rotates_instead_of_always_picking_the_first() {
+        // **这条是回归测试。**曾经 `load-balance` 和 `fallback` 行为完全
+        // 一样：引擎给出集合，而没有任何一层去转它，于是 6 个请求 6 次
+        // 落在第一家 —— 一个宣称做完了、实际什么都没做的功能。
+        let g = grp(GroupType::LoadBalance, false);
+        let firsts: Vec<String> = (0..6)
+            .map(|seq| {
+                let f = Facts {
+                    seq,
+                    ..Default::default()
+                };
+                order_by(&g, &g.providers, &f)[0].clone()
+            })
+            .collect();
+        assert_eq!(firsts, vec!["甲", "乙", "丙", "甲", "乙", "丙"]);
+    }
+
+    #[test]
+    fn rotating_keeps_every_candidate_because_failover_still_needs_them() {
+        // 「轮到乙」不等于「甲和丙不要了」——那一家挂了还要能切
+        let g = grp(GroupType::LoadBalance, false);
+        let f = Facts {
+            seq: 1,
+            ..Default::default()
+        };
+        assert_eq!(order_by(&g, &g.providers, &f), vec!["乙", "丙", "甲"]);
+    }
+
+    #[test]
+    fn session_affinity_pins_one_conversation_to_one_upstream() {
+        // **不粘的话，长会话每轮跳一家，prompt cache 全废**，而缓存
+        // 命中与否成本差 5 到 10 倍（§3.5）
+        let g = grp(GroupType::LoadBalance, true);
+        let mut seen = std::collections::HashSet::new();
+        for seq in 0..20 {
+            let f = Facts {
+                session: Some("会话-abc".into()),
+                seq,
+                ..Default::default()
+            };
+            seen.insert(order_by(&g, &g.providers, &f)[0].clone());
+        }
+        assert_eq!(seen.len(), 1, "同一个会话跳家了：{seen:?}");
+    }
+
+    #[test]
+    fn different_sessions_do_land_on_different_upstreams() {
+        // 粘滞不能粘成「所有会话都挤在一家」——那就不是均衡了
+        let g = grp(GroupType::LoadBalance, true);
+        let seen: std::collections::HashSet<String> = (0..60)
+            .map(|i| {
+                let f = Facts {
+                    session: Some(format!("会话-{i}")),
+                    ..Default::default()
+                };
+                order_by(&g, &g.providers, &f)[0].clone()
+            })
+            .collect();
+        assert!(seen.len() > 1, "所有会话都挤在同一家：{seen:?}");
+    }
+
+    #[test]
+    fn url_test_puts_the_fastest_first_and_the_unmeasured_last() {
+        // **「没测到」不等于「慢」，但排前面就等于放弃了「选最快的」**
+        let g = grp(GroupType::UrlTest, false);
+        let mut ttfb = std::collections::HashMap::new();
+        ttfb.insert("丙".to_string(), 120u32);
+        ttfb.insert("甲".to_string(), 400u32);
+        // 乙没有样本
+        let f = Facts {
+            ttfb_ms: ttfb,
+            ..Default::default()
+        };
+        assert_eq!(order_by(&g, &g.providers, &f), vec!["丙", "甲", "乙"]);
+    }
+
+    #[test]
+    fn two_equally_fast_upstreams_do_not_swap_places_every_request() {
+        // 同速时换来换去会让 prompt cache 白白多断一次 —— 稳定排序
+        let g = grp(GroupType::UrlTest, false);
+        let ttfb: std::collections::HashMap<String, u32> = [
+            ("甲".to_string(), 100u32),
+            ("乙".to_string(), 100),
+            ("丙".to_string(), 100),
+        ]
+        .into_iter()
+        .collect();
+        let f = Facts {
+            ttfb_ms: ttfb,
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert_eq!(order_by(&g, &g.providers, &f), vec!["甲", "乙", "丙"]);
+        }
+    }
+
+    #[test]
+    fn cheapest_sorts_by_input_price_and_puts_the_unpriced_last() {
+        // **「最便宜」是一句关于钱的承诺** —— 挑一个不知道多少钱的，
+        // 完全可能是最贵的那个
+        let g = grp(GroupType::Cheapest, false);
+        let price: std::collections::HashMap<String, (i64, i64)> = [
+            ("甲".to_string(), (3_000_000i64, 15_000_000i64)),
+            ("丙".to_string(), (1_800_000, 9_000_000)),
+        ]
+        .into_iter()
+        .collect();
+        let f = Facts {
+            price,
+            ..Default::default()
+        };
+        assert_eq!(order_by(&g, &g.providers, &f), vec!["丙", "甲", "乙"]);
+    }
+
+    #[test]
+    fn cheapest_uses_the_output_price_only_to_break_a_tie() {
+        let g = Group {
+            providers: vec!["甲".into(), "乙".into()],
+            ..grp(GroupType::Cheapest, false)
+        };
+        let price: std::collections::HashMap<String, (i64, i64)> = [
+            ("甲".to_string(), (1_000i64, 9_000i64)),
+            ("乙".to_string(), (1_000, 5_000)),
+        ]
+        .into_iter()
+        .collect();
+        let f = Facts {
+            price,
+            ..Default::default()
+        };
+        assert_eq!(order_by(&g, &g.providers, &f), vec!["乙", "甲"]);
+    }
+
+    #[test]
+    fn fallback_and_select_never_get_reordered() {
+        for kind in [GroupType::Fallback, GroupType::Select] {
+            let g = grp(kind, false);
+            let f = Facts {
+                seq: 7,
+                ttfb_ms: [("丙".to_string(), 1u32)].into_iter().collect(),
+                ..Default::default()
+            };
+            assert_eq!(
+                order_by(&g, &g.providers, &f),
+                g.providers,
+                "{kind:?} 被重排了"
+            );
+            assert!(!kind.needs_runtime());
+        }
     }
 }

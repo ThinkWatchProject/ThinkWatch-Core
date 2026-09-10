@@ -6,6 +6,7 @@ pub mod rule;
 
 pub use catalog::{Catalog, ProviderModels};
 pub use engine::{
-    Decision, Engine, Group, GroupType, Guard, Outcome, Outcome2, Route, RouteError, SetAction,
+    Decision, Engine, Facts, Group, GroupType, Guard, Outcome, Outcome2, Route, RouteError,
+    SetAction, order_by,
 };
 pub use facts::RequestFacts;

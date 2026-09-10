@@ -36,13 +36,25 @@ pub fn apply_credential(
     protocol: Option<tw_config::Protocol>,
     key: &str,
 ) -> reqwest::RequestBuilder {
+    let (name, value) = credential_header(protocol, key);
+    builder.header(name, value)
+}
+
+/// 这个方言把凭据放在哪个头上。
+///
+/// **WS 升级那条路也走它**（§3.6）：各写一份的话，两条路迟早会在
+/// 「Gemini 用哪个头」这种事上不一致，而那时只有一条路是对的。
+pub fn credential_header(
+    protocol: Option<tw_config::Protocol>,
+    key: &str,
+) -> (&'static str, String) {
     use tw_config::Protocol::*;
     match protocol {
         // 猜不出协议时按 Anthropic 走：桌面版的主用例是 Claude Code，
         // 而中转站绝大多数说的是 Anthropic 方言。
-        Some(Anthropic) | None => builder.header("x-api-key", key),
-        Some(Gemini) => builder.header("x-goog-api-key", key),
-        Some(OpenaiChat) | Some(OpenaiResponses) => builder.bearer_auth(key),
+        Some(Anthropic) | None => ("x-api-key", key.to_string()),
+        Some(Gemini) => ("x-goog-api-key", key.to_string()),
+        Some(OpenaiChat) | Some(OpenaiResponses) => ("authorization", format!("Bearer {key}")),
     }
 }
 

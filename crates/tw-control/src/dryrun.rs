@@ -7,6 +7,55 @@
 //! **它只算，不发任何请求**，也不改任何状态。
 
 use axum::{Json, extract::State, http::StatusCode};
+
+/// 和数据面同一段排序（§3.5）。
+///
+/// 试算页存在的全部意义是「告诉你这条请求会走哪儿」，所以它**必须**用
+/// 同一个函数、同一份数字 —— 各算各的话，两边迟早会不一样，而那时
+/// 试算比没有更糟。
+fn order_like_the_data_plane(
+    s: &crate::ControlState,
+    engine: &tw_engine::Engine,
+    d: &tw_engine::Decision,
+    f: &tw_engine::RequestFacts,
+) -> Vec<String> {
+    let Some(gname) = d.via_group.clone() else {
+        return d.candidates.clone();
+    };
+    let Some(kind) = engine
+        .groups()
+        .iter()
+        .find(|g| g.name == gname)
+        .map(|g| g.kind)
+    else {
+        return d.candidates.clone();
+    };
+    if !kind.needs_runtime() {
+        return d.candidates.clone();
+    }
+    let cfg = s.config();
+    let prices = s.gateway.prices.load();
+    let facts = tw_engine::Facts {
+        session: None,
+        seq: s.gateway.bus.peek_id(),
+        ttfb_ms: s.gateway.latency.snapshot(&d.candidates),
+        price: d
+            .candidates
+            .iter()
+            .filter_map(|name| {
+                let p = cfg.providers.iter().find(|p| &p.name == name)?;
+                match p.billing {
+                    Some(tw_config::Billing::Subscription) => Some((name.clone(), (0, 0))),
+                    Some(tw_config::Billing::Unknown) => None,
+                    _ => prices
+                        .unit_micros(name, &f.model)
+                        .map(|u| (name.clone(), u)),
+                }
+            })
+            .collect(),
+    };
+    engine.order(Some(&gname), &d.candidates, &facts)
+}
 use tw_engine::{Outcome, RequestFacts, RouteError};
 
 use crate::ControlState;
@@ -80,6 +129,7 @@ pub async fn dry_run(
 
     let mut out = tw_api::DryRunResult {
         outcome: "no_match".into(),
+        strategy: None,
         rule: None,
         reason: None,
         candidates: Vec::new(),
@@ -111,7 +161,20 @@ pub async fn dry_run(
                 .cloned()
                 .collect();
             out.set = describe(&d.set);
-            out.candidates = d.candidates;
+            // **顺序要和数据面一样，否则试算就是在撒谎。**`load-balance`
+            // / `url-test` / `cheapest` 的次序由运行时的数字定（§3.5），
+            // 这里走的是同一个 `order`，喂的是同一份延迟表和价目表。
+            //
+            // 会话那一维**故意留空**：试算是「假设现在来一个请求」，
+            // 而它属于哪次会话取决于请求正文，试算没有那个东西。
+            // 于是它显示的是轮转序列里的当前位置 —— 而那正是一个没有
+            // 会话指纹的请求真的会走的路。
+            out.candidates = order_like_the_data_plane(&s, engine, &d, &f);
+            out.strategy = d
+                .via_group
+                .as_deref()
+                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
+                .map(|g| g.kind.label().to_string());
         }
         Ok(Outcome::Deny { rule, reason }) => {
             out.outcome = "deny".into();

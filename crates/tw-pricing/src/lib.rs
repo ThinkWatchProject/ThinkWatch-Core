@@ -105,6 +105,8 @@ pub struct Prices {
     table: HashMap<String, ModelPrice>,
     /// 用户覆盖层。**查它优先** —— 中转站的价格只有用户自己知道
     overrides: HashMap<String, Option<ModelPrice>>,
+    /// 每家自己的价。**比 `overrides` 还优先** —— 它更具体
+    per_provider: HashMap<String, HashMap<String, ModelPrice>>,
     pub snapshot_date: String,
 }
 
@@ -133,12 +135,23 @@ pub enum PricingError {
 ///     output: 0.000002
 ///   # 删掉一条：写 null，那个模型就变回「没有价格」
 ///   gpt-4o: null
+///
+/// # 按上游分别写。**同一个模型在不同家不是同一个价** —— 中转站常常
+/// # 打折，而这是 `cheapest` 策略（§3.5）唯一的判据来源
+/// providers:
+///   relay-cn:
+///     claude-sonnet-4-5:
+///       input: 0.0000018
+///       output: 0.000009
 /// ```
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Overrides {
     #[serde(default)]
     pub models: HashMap<String, Option<ModelPrice>>,
+    /// 每家自己的价。**没写就按通用那份算**
+    #[serde(default)]
+    pub providers: HashMap<String, HashMap<String, ModelPrice>>,
 }
 
 impl Prices {
@@ -157,6 +170,7 @@ impl Prices {
         Ok(Self {
             table,
             overrides: HashMap::new(),
+            per_provider: HashMap::new(),
             snapshot_date: SNAPSHOT_DATE.to_string(),
         })
     }
@@ -167,6 +181,7 @@ impl Prices {
         Self {
             table: HashMap::new(),
             overrides: HashMap::new(),
+            per_provider: HashMap::new(),
             snapshot_date: "（价目表没能加载）".to_string(),
         }
     }
@@ -189,6 +204,7 @@ impl Prices {
                 source,
             })?;
         self.overrides = o.models;
+        self.per_provider = o.providers;
         Ok(self)
     }
 
@@ -204,6 +220,35 @@ impl Prices {
     /// **覆盖层优先，而且能删。**用户写 `gpt-4o: null` 就是说「我不要这
     /// 条」—— 那不是一个奇怪的需求：一个只走中转的用户，官方价目表里的
     /// 数字对他是错的。
+    /// 这家跑这个模型的单价。**比通用那份优先** —— 它更具体。
+    ///
+    /// 用在 `cheapest` 策略上（§3.5）。没有这一层的话，同一个模型在
+    /// 官方和中转站算出来是同一个价，「最便宜」就没有任何判据。
+    pub fn get_for(&self, provider: &str, model: &str) -> Option<&ModelPrice> {
+        if let Some(t) = self.per_provider.get(provider) {
+            // **归一化走计价那一套**（§4.3.0）：两套规则会造出「能用但
+            // 算不出价钱」这种自相矛盾
+            for c in name::candidates(model) {
+                if let Some(mp) = t.get(&c) {
+                    return Some(mp);
+                }
+            }
+        }
+        self.get(model)
+    }
+
+    /// 这家跑这个模型的 (输入, 输出) 单价，微分/百万 token。
+    ///
+    /// 给排序用 —— **整数**，因为浮点比较在「两家价钱一样」这种边界上
+    /// 会给出不稳定的顺序，而那意味着 prompt cache 白断一次。
+    pub fn unit_micros(&self, provider: &str, model: &str) -> Option<(Micros, Micros)> {
+        let p = self.get_for(provider, model)?;
+        Some((
+            to_micros(p.input * 1_000_000.0),
+            to_micros(p.output * 1_000_000.0),
+        ))
+    }
+
     pub fn get(&self, model: &str) -> Option<&ModelPrice> {
         self.lookup(model).map(|(p, _)| p)
     }
@@ -915,5 +960,35 @@ mod saving_tests {
             long > short,
             "长上下文的缓存命中省得更多：{short} vs {long}"
         );
+    }
+    #[test]
+    fn a_relay_can_have_its_own_price_for_the_same_model() {
+        // **没有这一层，同一个模型在官方和中转站算出来是同一个价，
+        // 而 `cheapest` 就没有任何判据**（§3.5）
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("pricing.yaml");
+        std::fs::write(
+            &f,
+            "providers:\n  relay-cn:\n    claude-sonnet-4-5:\n      input: 0.0000018\n      output: 0.000009\n",
+        )
+        .unwrap();
+        let p = Prices::builtin().unwrap().with_overrides(&f).unwrap();
+        let (relay_in, _) = p.unit_micros("relay-cn", "claude-sonnet-4-5").unwrap();
+        let (official_in, _) = p.unit_micros("anthropic", "claude-sonnet-4-5").unwrap();
+        assert!(
+            relay_in < official_in,
+            "中转站的价没生效：{relay_in} vs {official_in}"
+        );
+        // 没写进 providers 的那家走通用表
+        assert_eq!(
+            p.unit_micros("别的家", "claude-sonnet-4-5"),
+            p.unit_micros("anthropic", "claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_has_no_unit_price_rather_than_a_made_up_one() {
+        let p = Prices::builtin().unwrap();
+        assert_eq!(p.unit_micros("x", "完全没见过的模型"), None);
     }
 }

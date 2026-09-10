@@ -37,6 +37,15 @@ impl EventBus {
     }
 
     /// 拿一个请求 id。同一个请求的四个事件共用它。
+    /// 现在发到第几号了，**不占号**。
+    ///
+    /// 给 `load-balance` 当轮转的种子用（§3.5）：它要一个单调、便宜、
+    /// 每个请求都不同的数，而事件序号正好是。**不能用 `next_id`** ——
+    /// 那会凭空占掉一个号，让事件流里出现一个不存在的 id。
+    pub fn peek_id(&self) -> u64 {
+        self.next_id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }

@@ -18,6 +18,7 @@ tw-types = { workspace = true }
 arc-swap = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
+tokio-tungstenite = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
@@ -38,6 +39,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# 集成测试里要当 WS 客户端 —— 那一侧需要 connect
+tokio-tungstenite = { workspace = true, features = ["connect", "stream"] }
 tempfile = "3"
 hyper = { workspace = true }
 hyper-util = { workspace = true }

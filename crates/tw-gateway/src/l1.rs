@@ -55,6 +55,48 @@ pub struct ProxyHop {
     pub auth: Option<(String, String)>,
 }
 
+/// 把 provider 的代理名解析成一跳。
+///
+/// **数据面和控制面共用这一份。**各写一份的话，L1 测速走的路和
+/// `url-test` 垫底走的路会不一样，而那时两个数字都对不上真实转发。
+///
+/// **`system` 这里测不了**：跟随系统代理是 reqwest 在建连时才去查环境的，
+/// 我们没有那份地址可以去握手。说出来，而不是假装直连测一遍给个漂亮
+/// 数字 —— 那个数字测的根本不是用户实际会走的路。
+pub fn hop_for(
+    cfg: &tw_config::Config,
+    p: &tw_config::Provider,
+) -> Result<Option<ProxyHop>, String> {
+    match p.proxy.as_str() {
+        tw_config::DIRECT => Ok(None),
+        tw_config::SYSTEM => Err(
+            "这家走的是系统代理，而系统代理的地址要到建连时才由环境决定 —— L1 测不到它。想量这条线的话，把代理显式配成一个命名条目。"
+                .into(),
+        ),
+        name => {
+            let px = cfg
+                .proxies
+                .iter()
+                .find(|x| x.name == name)
+                .ok_or_else(|| format!("provider `{}` 要走代理 `{name}`，但 proxies 段里没有这个名字。", p.name))?;
+            let auth = match &px.auth {
+                None => None,
+                Some(a) => Some((
+                    a.user.clone(),
+                    a.pass
+                        .resolve()
+                        .map_err(|e| format!("代理 `{name}` 的密码取不出来：{e}"))?,
+                )),
+            };
+            Ok(Some(ProxyHop {
+                kind: px.kind,
+                addr: px.addr.clone(),
+                auth,
+            }))
+        }
+    }
+}
+
 trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
@@ -509,7 +551,7 @@ async fn read_exact(io: &mut Box<dyn Io>, buf: &mut [u8]) -> Result<(), String> 
 
 /// TLS 配置。**用平台的信任根**，和数据面走的是同一套验证 —— 否则 L1
 /// 说通、真实请求却因为证书被拒，那是最难查的一类不一致。
-fn tls_config() -> Arc<rustls::ClientConfig> {
+pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
     static CFG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
         // 进程里可能一个都没装（rustls 同时开着两个 provider 时

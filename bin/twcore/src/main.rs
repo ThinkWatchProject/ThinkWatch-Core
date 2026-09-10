@@ -652,6 +652,15 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     rt.block_on(async move {
         let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        // **和观测那一层用同一份价目表。**两处各拿一份的话，「成本栏
+        // 显示的」和「按最便宜选的」会对不上（§4.3.0 的用户覆盖层就是
+        // `cheapest` 唯一的判据来源）。读不了就用内置那份，转发照常。
+        match tw_pricing::Prices::builtin()
+            .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
+        {
+            Ok(p) => state.set_prices(p),
+            Err(e) => tracing::warn!("价目表的用户覆盖读不了，按内置那份算：{e}"),
+        }
 
         // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
         // 照常转发（§4.7）。所以这里所有的失败都只记一行日志。

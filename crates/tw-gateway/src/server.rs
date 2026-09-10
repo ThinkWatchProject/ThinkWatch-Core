@@ -258,6 +258,15 @@ pub struct AppState {
     /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
     /// 得出来（指纹对不上就重换）。
     pub oauth: Arc<crate::oauth::Cache>,
+    /// 每家的典型首字节时间。`url-test` 策略靠它排序（§3.5、§4.6）。
+    ///
+    /// **跨重载存活**：改一条规则不该让所有上游回到「没测过」。
+    pub latency: Arc<crate::latency::Latency>,
+    /// 价目表。`cheapest` 策略靠它排序（§3.5）。
+    ///
+    /// **可能是空的** —— 价目表加载失败时成本一律标「未知」（§4.3），
+    /// 而那时 `cheapest` 组里所有人都「算不出价钱」，退回配置顺序。
+    pub prices: Arc<arc_swap::ArcSwap<tw_pricing::Prices>>,
     /// 轮换出来的新 refresh token 往哪儿交（§3.6）。
     ///
     /// **和 body 那条路同一个形状**：数据面只管交出去，写文件是控制面的
@@ -294,6 +303,15 @@ impl AppState {
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
             oauth: Arc::new(crate::oauth::Cache::new()),
+            latency: Arc::new(crate::latency::Latency::new()),
+            prices: Arc::new(arc_swap::ArcSwap::from_pointee(
+                tw_pricing::Prices::builtin().unwrap_or_else(|e| {
+                    // **加载不了不能挡住启动**：那时成本显示「未知」，
+                    // 而转发照常（§4.7）
+                    tracing::warn!("价目表加载失败，成本一律标未知：{e}");
+                    tw_pricing::Prices::empty()
+                }),
+            )),
             rotation_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
         })
@@ -423,6 +441,16 @@ impl AppState {
         }
     }
 
+    /// 换一份带用户覆盖的价目表进来。
+    ///
+    /// **一定要调。**`AppState::new` 里那份只有内置快照，没有用户的
+    /// `pricing.yaml` —— 而中转站的价格只有用户自己知道（§4.3.0），
+    /// 那正是 `cheapest` 唯一的判据来源。两处各拿一份不同的价目表，
+    /// 会让「成本栏显示的」和「按最便宜选的」对不上。
+    pub fn set_prices(&self, p: tw_pricing::Prices) {
+        self.prices.store(std::sync::Arc::new(p));
+    }
+
     /// 接上轮换的去处。**控制面起来之后才调** —— 在那之前轮换只报不写。
     pub fn set_rotation_sink(&self, tx: crate::oauth::RotationSender) {
         if let Ok(mut g) = self.rotation_sink.lock() {
@@ -510,6 +538,79 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 接管一次 WebSocket 升级。
+///
+/// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、`guard`、
+/// 熔断对它一样有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
+/// 每一帧上重新点一遍管线的保护。
+async fn ws_upgrade(
+    state: AppState,
+    rt: Arc<Runtime>,
+    ws: axum::extract::WebSocketUpgrade,
+    client_name: String,
+    uri: axum::http::Uri,
+    query: Option<String>,
+    headers: HeaderMap,
+) -> Result<Response, GatewayError> {
+    // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
+    // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道
+    let facts = tw_engine::RequestFacts {
+        client: client_name.clone(),
+        ..Default::default()
+    };
+    let decision = match rt
+        .engine
+        .route(&facts)
+        .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?
+    {
+        tw_engine::Outcome::Route(d) => d,
+        tw_engine::Outcome::Deny { rule, reason } => {
+            tracing::info!(%rule, "按规则拒绝一次 WS 升级");
+            return Err(GatewayError::denied(reason));
+        }
+    };
+    let (alive, _) = state.health.filter(&decision.candidates);
+    let Some(name) = alive.first().map(|s| s.to_string()) else {
+        return Err(GatewayError::config("没有可用的上游".to_string()));
+    };
+    let Some(provider) = rt.config.providers.iter().find(|p| p.name == name) else {
+        return Err(GatewayError::config(format!("配置里没有 `{name}`")));
+    };
+    // **走代理的上游不代理 WS**，而且要明说。悄悄绕过用户配的代理，
+    // 等于把他以为在代理后面的流量直接发出去（§3.7）
+    if provider.proxy != tw_config::DIRECT {
+        return Err(GatewayError::config(format!(
+            "`{name}` 配了出站代理（{}），而 WebSocket 升级这条路还不会走代理 —— 与其悄悄绕过它，不如在这里停下。这条链路暂时只支持 direct 的上游。",
+            provider.proxy
+        )));
+    }
+    let http = rt.clients.get(&name).unwrap_or(&state.http);
+    let key = state
+        .key_for(provider, http)
+        .await
+        .map_err(|e| GatewayError::config(format!("`{name}` 的密钥取不到：{e}")))?;
+    let url = crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref());
+    let id = state.bus.next_id();
+    state.bus.emit(tw_api::Event::RequestStarted {
+        id,
+        client: client_name,
+        client_hint: crate::hint::client_hint(&headers),
+        session_fp: None,
+        provider: name.clone(),
+        model: String::new(),
+        method: "WS".to_string(),
+        path: uri.path().to_string(),
+        at_ms: now_ms(),
+    });
+    let provider = provider.clone();
+    let guard = decision.guard.clone();
+    let rules = rt.rules.clone();
+    let protocol = provider.effective_protocol();
+    Ok(ws.on_upgrade(move |sock| async move {
+        crate::ws::proxy(state, sock, url, key, protocol, provider, guard, rules, id).await;
+    }))
+}
+
 /// `GET /v1/models`。
 ///
 /// 三种方言的响应结构不同，但**列表内容来自同一个函数** —— 差别只在
@@ -562,6 +663,9 @@ async fn passthrough(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
+    // **必须排在 `body` 前面。**提取器按顺序跑，而 `Bytes` 会把体吃掉
+    // —— 一次升级要的是那条连接本身，体被读走之后就没得升了
+    crate::ws::MaybeUpgrade(upgrade): crate::ws::MaybeUpgrade,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, GatewayError> {
@@ -582,6 +686,12 @@ async fn passthrough(
         ));
     }
     let (client_name, position) = state.identify(&headers, query.as_deref())?;
+    // WebSocket 升级（§3.6）。**在鉴权之后、解体之前分叉** —— 鉴权
+    // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
+    // 升级要的是那条连接，而 `Bytes` 会把它读干净。
+    if let Some(ws) = upgrade.filter(|_| crate::ws::is_upgrade(&headers)) {
+        return ws_upgrade(state, rt, ws, client_name, uri, query, headers).await;
+    }
     // 从这里往下，所有错误都要用客户端自己那套结构回（§4.6.1）。
     // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
     // 的，只能退回 Anthropic 形状，而那是桌面版的主用例。
@@ -722,6 +832,61 @@ async fn pipeline(
             return Err(GatewayError::denied(reason));
         }
     };
+    // 策略组排序（§3.5）。**引擎给的是集合，顺序在这儿定** ——
+    // 因为 `load-balance` / `url-test` / `cheapest` 都要运行时的数字，
+    // 而路由决策本身必须是纯的、可试算的。
+    //
+    // `fallback` 和 `select` 走不到这里面 —— 那是绝大多数人的配置
+    // （§0.6），它们连一个 HashMap 都不用建。
+    let mut decision = decision;
+    if let Some(gname) = decision.via_group.clone()
+        && let Some(kind) = rt
+            .engine
+            .groups()
+            .iter()
+            .find(|g| g.name == gname)
+            .map(|g| g.kind)
+        && kind.needs_runtime()
+    {
+        let session = parsed.as_ref().and_then(crate::session::fingerprint);
+        let facts_rt = tw_engine::Facts {
+            seq: state.bus.peek_id(),
+            ttfb_ms: match kind {
+                tw_engine::GroupType::UrlTest => state.latency.snapshot(&decision.candidates),
+                _ => Default::default(),
+            },
+            price: match kind {
+                tw_engine::GroupType::Cheapest => {
+                    let prices = state.prices.load();
+                    decision
+                        .candidates
+                        .iter()
+                        .filter_map(|name| {
+                            let p = rt.config.providers.iter().find(|p| &p.name == name)?;
+                            // **订阅制的边际成本是零，它就是最便宜的那家**
+                            // （§4.3.1）。而「价格未知」不是「免费」——
+                            // 它要排到最后去
+                            match p.billing {
+                                Some(tw_config::Billing::Subscription) => {
+                                    Some((name.clone(), (0, 0)))
+                                }
+                                Some(tw_config::Billing::Unknown) => None,
+                                _ => prices
+                                    .unit_micros(name, &facts.model)
+                                    .map(|u| (name.clone(), u)),
+                            }
+                        })
+                        .collect()
+                }
+                _ => Default::default(),
+            },
+            session,
+        };
+        decision.candidates = rt
+            .engine
+            .order(Some(&gname), &decision.candidates, &facts_rt);
+    }
+
     // 管线第 3 步：准入。**排队而不是拒绝**（§4.7）—— 客户端收到 429
     // 通常不会优雅重试，一个本来只需要多等两秒的请求会变成一次任务中断。
     //
@@ -1029,10 +1194,18 @@ async fn pipeline(
     // 响应头到手就发一次。**这个事件单独存在是有意的**：流式请求从这里
     // 到结束可能还有好几分钟，UI 要能在这个点就把行画出来并标「进行中」，
     // 而不是等它结束才出现。
+    let ttfb_ms = started.elapsed().as_millis() as u64;
+    // `url-test` 的判据（§3.5）。**只记成功的那些** —— 一个 500 在
+    // 十毫秒内返回，会让最坏的上游看起来最快
+    if status.is_success() {
+        state
+            .latency
+            .record(&provider.name, ttfb_ms.min(u32::MAX as u64) as u32);
+    }
     state.bus.emit(tw_api::Event::RequestHeaders {
         id,
         status: status.as_u16(),
-        ttfb_ms: started.elapsed().as_millis() as u64,
+        ttfb_ms,
     });
     // 订阅额度（§4.3.2）。**零成本** —— 这些头本来就在响应里，读一下
     // 就有了。按量付费的账号没有它们，那时什么都不发。
@@ -1298,6 +1471,54 @@ async fn pipeline(
 /// 结果缓存 24 小时（§3.9）——模型列表变化不频繁，而**每次有人调
 /// `/v1/models` 就去打上游，会把一个本该零成本的端点变成一次串行网络
 /// 往返**。
+/// 给 `url-test` 组的成员垫一个底（§3.5：样本不够时用零成本的 L1 补）。
+///
+/// **只测 `url-test` 组里的那些，而且只在启动和换配置时测一次。**
+/// 没有这一步的话，`url-test` 在攒够真实样本之前完全等同于 `fallback`
+/// —— 用户配了「选最快的」，而头几十个请求全落在配置里排第一那家。
+///
+/// L1 是握手计时，不发一个 API 请求、不花一分钱（§4.6）；也**不是定期
+/// 跑的** —— 真实流量一到就该由它说了算。
+pub async fn seed_latency(state: &AppState) {
+    let rt = state.runtime();
+    let mut want: Vec<String> = Vec::new();
+    for g in rt.engine.groups() {
+        if g.kind == tw_engine::GroupType::UrlTest {
+            want.extend(g.providers.iter().cloned());
+        }
+    }
+    want.sort();
+    want.dedup();
+    if want.is_empty() {
+        return;
+    }
+    for name in want {
+        let Some(p) = rt.config.providers.iter().find(|p| p.name == name) else {
+            continue;
+        };
+        // 走代理的那家要测它真正会走的那条路（§3.7）。`system` 测不了，
+        // 那时不垫底 —— 假装直连测一遍给的数字，测的根本不是那条路
+        let hop = match crate::l1::hop_for(&rt.config, p) {
+            Ok(h) => h,
+            Err(why) => {
+                tracing::debug!(provider = %name, %why, "L1 垫不了底");
+                continue;
+            }
+        };
+        let r = crate::l1::l1(&p.base_url, hop.as_ref()).await;
+        if r.ok {
+            tracing::debug!(provider = %name, ms = r.total_ms, "L1 垫底");
+            state
+                .latency
+                .seed(&name, r.total_ms.min(u32::MAX as u64) as u32);
+        } else {
+            // **连都连不上的那家不垫。**它会因为「没样本」排在最后，
+            // 而那正是对的
+            tracing::debug!(provider = %name, "L1 连不上，不垫底");
+        }
+    }
+}
+
 pub async fn refresh_catalog(state: &AppState) {
     // 探测要打网络，一轮下来可能几秒。**整轮用同一份运行时** —— 中途
     // 换了配置的话，这一轮探的是旧名单，而下面换入前会再确认一次。
@@ -1352,9 +1573,13 @@ pub async fn refresh_catalog(state: &AppState) {
 }
 
 /// 后台刷新循环。
+///
+/// **`url-test` 的垫底跟着它一起跑**：两者都是「启动时打一次网络、
+/// 之后靠真实流量」，而且都不该挡住启动（§3.9、§3.5）。
 pub fn spawn_catalog_refresh(state: AppState) {
     tokio::spawn(async move {
         loop {
+            seed_latency(&state).await;
             refresh_catalog(&state).await;
             tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
         }
@@ -1453,7 +1678,7 @@ fn hop(provider: &str, outcome: String, started: std::time::Instant) -> tw_api::
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
