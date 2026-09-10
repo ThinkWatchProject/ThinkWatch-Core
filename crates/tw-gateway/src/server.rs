@@ -258,11 +258,6 @@ pub struct AppState {
     /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
     /// 得出来（指纹对不上就重换）。
     pub oauth: Arc<crate::oauth::Cache>,
-    /// `exec` 凭据的缓存（§3.6 第 3 类）。
-    ///
-    /// **跨重载存活**，理由和 OAuth 那份一样：改一条限流规则不该让每家
-    /// 上游重新 fork 一次进程。用户改了命令本身的话，缓存自己认得出来。
-    pub execkey: Arc<crate::execkey::Cache>,
     /// 轮换出来的新 refresh token 往哪儿交（§3.6）。
     ///
     /// **和 body 那条路同一个形状**：数据面只管交出去，写文件是控制面的
@@ -299,7 +294,6 @@ impl AppState {
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
             oauth: Arc::new(crate::oauth::Cache::new()),
-            execkey: Arc::new(crate::execkey::Cache::new()),
             rotation_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
         })
@@ -316,16 +310,6 @@ impl AppState {
         p: &tw_config::Provider,
         http: &reqwest::Client,
     ) -> Result<String, String> {
-        // `exec`：跑一条命令。**在阻塞线程池里跑，而且可以缓存** ——
-        // 它挂在每一个请求前面（§3.6）
-        if let Some(argv) = p.key.exec_argv() {
-            let timeout = p.key.exec_timeout();
-            return self
-                .execkey
-                .key(&p.name, argv, timeout, p.key.exec_ttl())
-                .await
-                .map_err(|e| e.to_string());
-        }
         let Some(o) = p.key.oauth() else {
             return p.resolved_key().map_err(|e| e.to_string());
         };

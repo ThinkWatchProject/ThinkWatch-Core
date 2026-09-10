@@ -32,6 +32,13 @@ pub enum ValidationError {
     NameCollision(String),
     #[error("listen.gateway.allow_from 里的 `{entry}` 写错了：{reason}")]
     BadCidr { entry: String, reason: String },
+    /// **配置文件不该能执行程序。**§3.1 把「配置被同步、被分享、被 AI
+    /// 改」当成目标场景，那时抄一份配置就等于跑一段代码 —— 而用户对一个
+    /// 网关配置文件的心理预期是「里面是设置」。
+    #[error(
+        "provider `{name}` 用的是 `exec` 凭据，而它已经不支持了：配置文件不该能执行程序。\n把密钥直接写在 key: 里，或者写成 ${{VAR}} 从环境变量取。"
+    )]
+    ExecRemoved { name: String },
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -66,6 +73,15 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             return Err(ValidationError::BadBaseUrl {
                 name: p.name.clone(),
                 url: p.base_url.clone(),
+            });
+        }
+        // **`exec` 在这一关拦下来，而不是等到请求时。**它已经删掉了
+        // （配置文件不该能执行程序，见 Secret 的文档），而一份带
+        // `exec` 的老配置必须在这里就说清楚 —— 让它加载成功、再让
+        // 每个请求各自失败，是最难查的那种坏法。
+        if matches!(p.key, crate::Secret::Exec { .. }) {
+            return Err(ValidationError::ExecRemoved {
+                name: p.name.clone(),
             });
         }
         if p.key.is_blank() {

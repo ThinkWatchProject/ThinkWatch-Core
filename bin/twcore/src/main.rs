@@ -551,13 +551,10 @@ fn cmd_check(path: &Path) -> Result<()> {
                     p.name,
                     tw_secret::redact_url(&p.base_url),
                     proto,
-                    // 说来源而不是值。`exec` 那种要能一眼看出跑的是什么，
-                    // 因为它是这个文件里唯一会执行东西的字段。
+                    // 说来源而不是值。**这个文件里已经没有任何会执行
+                    // 东西的字段了**（`exec` 删掉了，见 Secret 的文档）。
                     p.key.describe()
                 );
-                // exec 在 check 时**真跑一次**。这正是 check 存在的意义 ——
-                // 「密钥命令能不能跑通」最容易到用第一次才发现，而那时的
-                // 表现是一个莫名其妙的 401，或者网关整个卡住。
                 // OAuth 不在这里换 token：那是一次网络往返，而 check
                 // 是个用户期望立刻返回的命令。但**能离线查的都要查** ——
                 // 这几样写错了，症状全是网关起来之后一片 401（§3.6）。
@@ -590,20 +587,8 @@ fn cmd_check(path: &Path) -> Result<()> {
                         );
                     }
                     println!("     · OAuth 凭据：换 token 要联网，网关起来之后才做");
-                } else {
-                    // ttl 写坏了会静默退回「不缓存」——**说出来**，否则
-                    // 用户以为自己配了缓存，而每个请求还在 fork 一次
-                    if let Some(raw) = p.key.exec_ttl_raw()
-                        && tw_config::parse_duration_secs(raw).is_none()
-                    {
-                        println!(
-                            "     ⚠ ttl: `{raw}` 看不懂（要 `30s`/`5m`/`1h`），这家的密钥命令会每个请求跑一次"
-                        );
-                    }
-                    // exec 在 check 时**真跑一次**，见上面那段注释
-                    if let Err(e) = p.resolved_key() {
-                        println!("     ⚠ 密钥取不到：{e}");
-                    }
+                } else if let Err(e) = p.resolved_key() {
+                    println!("     ⚠ 密钥取不到：{e}");
                 }
             }
             Ok(())

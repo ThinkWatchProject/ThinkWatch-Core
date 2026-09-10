@@ -260,32 +260,37 @@ pub struct Client {
 
 /// 密钥怎么来。
 ///
-/// 三种形态，**刻意按「用户会不会用到」排序**：绝大多数人写一个字符串
-/// 就完了（§3.2 明确说了密钥就明文写在配置里，不做 keychain）；`${ENV}`
-/// 给不想让密钥落到文件里的人；`exec` 给真的把密钥放在 1Password /
-/// pass 里的人。
+/// 两种形态：绝大多数人写一个字符串就完了（§3.2 明确说了密钥就明文写在
+/// 配置里，不做 keychain），字符串里可以带 `${ENV}`；另一种是 OAuth，
+/// 带自动刷新。
 ///
-/// serde 的 untagged 让前两种都是裸字符串 —— 配置文件里看不出区别，
-/// 也不该看出区别。
+/// serde 的 untagged 让第一种是裸字符串 —— 配置文件里看不出 `${ENV}`
+/// 和明文的区别，也不该看出。
+///
+/// # `exec` 去哪儿了
+///
+/// **删掉了**，理由是配置文件不该能执行程序。
+///
+/// §3.1 明确把「配置被同步、被分享、**被 AI 改**」当成目标场景，而
+/// `key: { exec: [...] }` 让「抄一份配置」等于「跑一段代码」——
+/// 用户对一个网关配置文件的心理预期是「里面是设置」，不是「里面能
+/// 执行程序」。本机攻击者反正能改 `.zshrc` 这个反驳，对「配置从别处
+/// 来」不成立。
+///
+/// 这个变体留着**只为了报一句人话**：没有它，一份老配置会撞上
+/// serde 的「data did not match any variant of untagged enum Secret」，
+/// 而那句话帮不了任何人。**它没有任何执行路径** —— 校验那一关就把
+/// 整份配置拦下来了。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Secret {
     /// 明文，或含 `${ENV}` 的字符串
     Literal(String),
-    /// 跑一条命令，拿 stdout。**不过 shell**，见 tw_secret::run_exec。
+    /// **已经删掉的形态**，认出来只为了报一句人话。见枚举的文档。
     Exec {
         exec: Vec<String>,
-        /// 秒。不写用默认值 —— 卡住的凭据命令会让网关整个没反应。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_secs: Option<u64>,
-        /// 拿到的东西能用多久（`55m` / `1h` / `30s`）。
-        ///
-        /// **不写就不缓存**，每个请求跑一次 —— 那是这个字段出现之前的
-        /// 行为，保持它是有意的：默认缓存会造出一个新问题「我明明换了
-        /// 凭据，怎么没生效」，而那个问题比多 fork 几次难查得多。
-        ///
-        /// 写了就值得写：`gcloud auth print-access-token` 那类要几百
-        /// 毫秒，而它挂在**每一个请求**前面。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl: Option<String>,
     },
@@ -364,14 +369,7 @@ impl Secret {
     pub fn resolve(&self) -> Result<String, SecretResolveError> {
         match self {
             Secret::Literal(s) => Ok(tw_secret::expand_from_env(s)?),
-            Secret::Exec {
-                exec, timeout_secs, ..
-            } => {
-                let t = timeout_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or(tw_secret::exec::DEFAULT_TIMEOUT);
-                Ok(tw_secret::run_exec(exec, t)?)
-            }
+            Secret::Exec { .. } => Err(SecretResolveError::ExecRemoved),
             // **OAuth 走不了同步这条路**：换 token 是一次网络往返。
             // 调用方要么走异步那条（网关），要么把这一句原样说给用户听
             // （`twcore check`）—— 都比在这里编一个值好
@@ -396,56 +394,18 @@ impl Secret {
         match self {
             Secret::Literal(s) if s.contains("${") => format!("环境变量 {s}"),
             Secret::Literal(s) => tw_secret::mask_secret(s),
-            Secret::Exec { exec, .. } => format!("exec: {}", exec.join(" ")),
+            Secret::Exec { .. } => "exec（已不支持）".to_string(),
             // **不回显任何一段 token** —— refresh token 比 access token
             // 更值钱，它换得出无数个 access
             Secret::OAuth { oauth } => format!("OAuth（{}）", oauth.endpoint),
         }
     }
 
-    /// `exec` 的缓存时长。`None` = 不缓存（见 `ttl` 字段的注释）。
-    ///
-    /// 写坏了（`ttl: 五分钟`）返回 `None` —— 也就是退回不缓存。**一个
-    /// 写错的 ttl 不该让上游整个不可用**，而 `twcore check` 会把这行
-    /// 说出来（和 `refresh_before` 同一条纪律）。
-    pub fn exec_ttl(&self) -> Option<std::time::Duration> {
-        match self {
-            Secret::Exec { ttl: Some(t), .. } => {
-                parse_duration_secs(t).map(std::time::Duration::from_secs)
-            }
-            _ => None,
-        }
-    }
-
-    /// `exec` 的超时。不写用默认值。
-    pub fn exec_timeout(&self) -> std::time::Duration {
-        match self {
-            Secret::Exec { timeout_secs, .. } => timeout_secs
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(tw_secret::exec::DEFAULT_TIMEOUT),
-            _ => tw_secret::exec::DEFAULT_TIMEOUT,
-        }
-    }
-
-    /// `exec` 的原始 ttl 文本 —— 只给 `twcore check` 报「看不懂」用。
-    pub fn exec_ttl_raw(&self) -> Option<&str> {
-        match self {
-            Secret::Exec { ttl, .. } => ttl.as_deref(),
-            _ => None,
-        }
-    }
-
-    pub fn exec_argv(&self) -> Option<&[String]> {
-        match self {
-            Secret::Exec { exec, .. } => Some(exec),
-            _ => None,
-        }
-    }
-
     pub(crate) fn is_blank(&self) -> bool {
         match self {
             Secret::Literal(s) => s.trim().is_empty(),
-            Secret::Exec { exec, .. } => exec.is_empty(),
+            // 空不空都不算数，校验那一关会先把它拦下来
+            Secret::Exec { .. } => false,
             Secret::OAuth { oauth } => {
                 oauth.refresh.trim().is_empty() || oauth.endpoint.trim().is_empty()
             }
@@ -470,11 +430,13 @@ impl From<String> for Secret {
 pub enum SecretResolveError {
     #[error(transparent)]
     Env(#[from] tw_secret::SecretError),
-    #[error(transparent)]
-    Exec(#[from] tw_secret::ExecError),
     /// OAuth 凭据要去换 token，那是一次网络往返，同步这条路走不了。
     #[error("这是一个 OAuth 凭据，要联网换 token —— 网关起来之后才会去换")]
     NeedsRefresh,
+    #[error(
+        "`exec` 凭据已经不支持了：配置文件不该能执行程序（§3.1 把「配置被同步、被分享、被 AI 改」当成目标场景，而那时抄一份配置就等于跑一段代码）。把密钥直接写在 key: 里，或者用 ${{ENV}} 从环境变量取。"
+    )]
+    ExecRemoved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -959,7 +921,7 @@ providers:
     }
 
     #[test]
-    fn an_exec_key_parses_and_never_shows_the_secret() {
+    fn an_old_exec_key_still_parses_so_that_validation_can_explain_itself() {
         let y = r#"
 version: 1
 clients:
@@ -980,8 +942,9 @@ providers:
             }
             other => panic!("{other:?}"),
         }
-        // describe 是给人看的，必须不含真实密钥 —— 这里它连密钥都还没跑
-        assert!(cfg.providers[0].key.describe().starts_with("exec:"));
+        // describe 是给人看的。**不能让它看起来还能用** —— 这个形状
+        // 现在只是「认得出来，好报一句人话」
+        assert!(cfg.providers[0].key.describe().contains("已不支持"));
     }
 
     #[test]
@@ -1003,36 +966,32 @@ providers:
     }
 
     #[test]
-    fn an_exec_ttl_is_parsed_and_a_broken_one_falls_back_to_no_caching() {
-        let mk = |t: Option<&str>| Secret::Exec {
-            exec: vec!["echo".into(), "x".into()],
-            timeout_secs: None,
-            ttl: t.map(|s| s.to_string()),
-        };
-        assert_eq!(
-            mk(Some("55m")).exec_ttl(),
-            Some(std::time::Duration::from_secs(3300))
-        );
-        assert_eq!(
-            mk(Some("30")).exec_ttl(),
-            Some(std::time::Duration::from_secs(30))
-        );
-        // **不写就不缓存** —— 保持这个字段出现之前的行为
-        assert_eq!(mk(None).exec_ttl(), None);
-        // 写坏了也退回不缓存，而不是让上游整个不可用（check 会说这句）
-        assert_eq!(mk(Some("五分钟")).exec_ttl(), None);
-        // 别的凭据类型没有 ttl 这回事
-        assert_eq!(Secret::Literal("sk-x".into()).exec_ttl(), None);
-    }
-
-    #[test]
-    fn an_exec_key_actually_runs() {
+    fn an_exec_key_is_recognised_only_to_say_a_sentence_a_person_can_act_on() {
+        // **配置文件不该能执行程序。**这个变体留着只为了报人话 ——
+        // 没有它，一份老配置撞上的是 serde 的「data did not match any
+        // variant of untagged enum Secret」，那句话帮不了任何人。
         let s = Secret::Exec {
             exec: vec!["echo".into(), "sk-1".into()],
             timeout_secs: None,
             ttl: None,
         };
-        assert_eq!(s.resolve().unwrap(), "sk-1");
+        let e = s.resolve().unwrap_err().to_string();
+        assert!(e.contains("不支持"), "{e}");
+        assert!(
+            e.contains("${VAR}") || e.contains("环境变量"),
+            "没说该改成什么：{e}"
+        );
+        // 摘要里也不能让它看起来还能用
+        assert!(s.describe().contains("已不支持"), "{}", s.describe());
+    }
+
+    #[test]
+    fn a_config_with_an_exec_key_is_rejected_at_load_time_not_at_request_time() {
+        // 让它加载成功、再让每个请求各自失败，是最难查的那种坏法
+        let text = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      exec: [\"op\", \"read\", \"op://v/k\"]\n";
+        let r = try_parse(text).unwrap_err();
+        assert!(r.message.contains("exec"), "{}", r.message);
+        assert!(r.message.contains("不支持"), "{}", r.message);
     }
 
     #[test]
