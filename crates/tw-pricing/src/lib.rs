@@ -208,6 +208,36 @@ impl Prices {
         Ok(self)
     }
 
+    /// 内置快照里有没有这个模型。界面要用它区分「覆盖」和「补一个」。
+    pub fn builtin_has(&self, model: &str) -> bool {
+        name::candidates(model)
+            .iter()
+            .any(|c| self.table.contains_key(c))
+    }
+
+    /// 把覆盖文件读成一份可编辑的清单。**顺序稳定** —— 界面上一行行
+    /// 摆着的东西，每次打开都换位置会让人以为自己改错了。
+    pub fn overrides_list(&self) -> Vec<(Option<String>, String, ModelPrice)> {
+        let mut out: Vec<(Option<String>, String, ModelPrice)> = Vec::new();
+        let mut global: Vec<_> = self
+            .overrides
+            .iter()
+            .filter_map(|(m, p)| p.clone().map(|p| (m.clone(), p)))
+            .collect();
+        global.sort_by(|a, b| a.0.cmp(&b.0));
+        out.extend(global.into_iter().map(|(m, p)| (None, m, p)));
+        let mut per: Vec<_> = self.per_provider.iter().collect();
+        per.sort_by_key(|(k, _)| k.to_string());
+        for (prov, models) in per {
+            let mut ms: Vec<_> = models.iter().collect();
+            ms.sort_by_key(|(k, _)| k.to_string());
+            for (m, p) in ms {
+                out.push((Some(prov.clone()), m.clone(), p.clone()));
+            }
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.table.len()
     }

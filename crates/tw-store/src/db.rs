@@ -541,6 +541,39 @@ impl Db {
     }
 
     /// 一段时间内的汇总。Dashboard 和「昨天花了多少钱」都问它。
+    /// 最近这些天里**算不出价钱**的请求数，和它们用的模型。
+    ///
+    /// **这是价格页存在的理由。**用户不会主动想起要配价格 —— 只有
+    /// 「有 37 条请求算不出钱，用的是这两个模型」这种具体证据才会
+    /// （§0.6：高级功能的触发条件要绑在「这个问题存不存在」上）。
+    pub fn unpriced_recent(&self, days: i64) -> Result<(i64, Vec<String>), DbError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let since = now - days * 24 * 3600 * 1000;
+        // 本地应答不算（它本来就没有成本），订阅制也不算（它的成本
+        // 不在这个维度上，标「未知」是对的，§4.3.1）
+        let mut st = self.conn.prepare(
+            "SELECT model, COUNT(*) FROM requests \
+             WHERE at_ms >= ?1 AND local = 0 AND cost_micros IS NULL \
+               AND (billing = '' OR billing = 'per-token') \
+               AND model IS NOT NULL AND model <> '' \
+             GROUP BY model ORDER BY COUNT(*) DESC LIMIT 20",
+        )?;
+        let rows = st.query_map([since], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut total = 0i64;
+        let mut models = Vec::new();
+        for row in rows {
+            let (m, n) = row?;
+            total += n;
+            models.push(m);
+        }
+        Ok((total, models))
+    }
+
     pub fn summary(&self, since_ms: i64, until_ms: i64) -> Result<Summary, DbError> {
         // **本地应答不算。**成本 0、延迟 0 的东西混进来，会让「平均延迟」
         // 和「请求数」这两个数字都失去意义（§4.8）。

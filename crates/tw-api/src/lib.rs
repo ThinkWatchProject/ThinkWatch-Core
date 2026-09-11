@@ -546,6 +546,39 @@ pub enum PatchValue {
     Null,
 }
 
+/// 一条用户自己写的价格（§4.3.0 的第三层）。
+///
+/// **单位是每百万 token 的美元**，和厂商定价页上印的一样 —— 让用户
+/// 在界面上填 `0.000003` 是在要求他做一次换算，而换算是会错的。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceRow {
+    /// 哪个上游。`None` = 对所有上游生效
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub model: String,
+    /// 每百万 token 的美元
+    pub input: f64,
+    pub output: f64,
+    /// 内置快照里有没有这个模型。**界面要能说「这条是在覆盖」**，
+    /// 因为覆盖一个本来就有价的模型，和补一个没价的，是两件事
+    #[serde(default)]
+    pub overrides_builtin: bool,
+}
+
+/// 用户的价格覆盖，连同「内置那份是什么时候的」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingView {
+    pub rows: Vec<PriceRow>,
+    pub snapshot_date: String,
+    /// 最近这段时间里**算不出价钱**的请求数。
+    ///
+    /// **这是这一页存在的理由** —— 用户不会主动想起要配价格，只有
+    /// 「有 37 条请求算不出钱」这种具体证据才会（§0.6 的触发条件）。
+    pub unpriced_recent: i64,
+    /// 那些算不出价钱的请求用的是哪些模型。**直接告诉他要填什么**
+    pub unpriced_models: Vec<String>,
+}
+
 /// 光标落在配置的哪一段上（§7.10）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigAt {

@@ -89,6 +89,7 @@ pub fn router(state: ControlState) -> Router {
         )
         .route("/config/history", get(config_history))
         .route("/config/at", get(config::path_at))
+        .route("/pricing", get(pricing_get).put(pricing_put))
         .route("/config/rollback", post(config_rollback))
         .route("/summary", get(summary))
         .route("/history", get(history))
@@ -588,6 +589,104 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
         cost_micros: e.cost_micros,
         note: e.note,
     }
+}
+
+/// 用户自己写的那份价格（§4.3.0 第三层）。
+///
+/// **这一页存在的理由是「有 N 条请求算不出钱」** —— 用户不会主动想起
+/// 要配价格（§0.6：高级功能的触发条件要绑在「这个问题存不存在」上）。
+async fn pricing_get(State(s): State<ControlState>) -> Result<Json<tw_api::PricingView>, Fail> {
+    let p = prices(&s);
+    let rows = p
+        .overrides_list()
+        .into_iter()
+        .map(|(provider, model, mp)| tw_api::PriceRow {
+            overrides_builtin: p.builtin_has(&model),
+            provider,
+            // **每百万 token 的美元** —— 和厂商定价页上印的一样
+            input: mp.input * 1_000_000.0,
+            output: mp.output * 1_000_000.0,
+            model,
+        })
+        .collect();
+    // 算不出价钱的那些。**拿不到存储就是 0** —— 观测层起不来时网关
+    // 照常转发（§4.7），这一页也该照常打开
+    let (unpriced_recent, unpriced_models) = match &s.store {
+        Some(st) => {
+            let g = st.lock().await;
+            g.db().unpriced_recent(7).unwrap_or_else(|e| {
+                tracing::debug!("算不出价钱的统计取不到：{e}");
+                (0, Vec::new())
+            })
+        }
+        None => (0, Vec::new()),
+    };
+    Ok(Json(tw_api::PricingView {
+        rows,
+        snapshot_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+        unpriced_recent,
+        unpriced_models,
+    }))
+}
+
+/// 整份写回去。**和配置文件同一条纪律**：先在内存里验一遍，再原子写。
+async fn pricing_put(
+    State(s): State<ControlState>,
+    Json(rows): Json<Vec<tw_api::PriceRow>>,
+) -> Result<Json<tw_api::PricingView>, Fail> {
+    use std::collections::HashMap;
+    let mut models: HashMap<String, Option<tw_pricing::ModelPrice>> = HashMap::new();
+    let mut providers: HashMap<String, HashMap<String, tw_pricing::ModelPrice>> = HashMap::new();
+    for r in &rows {
+        if r.model.trim().is_empty() {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "有一行没填模型名".to_string(),
+            ));
+        }
+        // **负价不是「便宜」，是写错了。**让它进去的话，`cheapest` 会
+        // 永远选中那一家，而成本栏会往下走
+        if r.input < 0.0 || r.output < 0.0 {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                format!("`{}` 的单价是负数", r.model),
+            ));
+        }
+        let mp = tw_pricing::ModelPrice {
+            input: r.input / 1_000_000.0,
+            output: r.output / 1_000_000.0,
+            cache_read: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            input_above_200k: None,
+            output_above_200k: None,
+            max_input_tokens: None,
+        };
+        match r.provider.as_ref().filter(|p| !p.trim().is_empty()) {
+            Some(p) => {
+                providers
+                    .entry(p.clone())
+                    .or_default()
+                    .insert(r.model.clone(), mp);
+            }
+            None => {
+                models.insert(r.model.clone(), Some(mp));
+            }
+        }
+    }
+    let text = serde_yaml_ng::to_string(&tw_pricing::Overrides { models, providers })
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let head = "# ThinkWatch 的用户价格覆盖（§4.3.0 第三层）。\n\
+                # 单位是**每 token** 的美元 —— 界面上填的是每百万，这里换算过了。\n\
+                # 这个文件是界面写的，但手改也没问题：它只是一份普通 YAML。\n";
+    let dir = s
+        .config_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    tw_config::store::write_atomic(&dir.join("pricing.yaml"), &format!("{head}{text}"))
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    pricing_get(State(s)).await
 }
 
 /// 价目表。**每次现建** —— 用户可能刚改过 pricing.yaml，而报价这件事
