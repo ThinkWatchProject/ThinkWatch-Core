@@ -22,8 +22,15 @@ PORT=18999
 UPPORT=18998
 PASS=0; FAIL=0
 
+WARN=0
 ok()   { PASS=$((PASS+1)); printf '  ✓ %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  ✗ %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; }
+# **超出目标但不算回归**的那一档。
+#
+# 只有 ✓ 和 ✗ 两档时，一个「35MB，而目标是 30MB」只能二选一：打勾等于
+# 给一个没达标的数字盖章，打叉等于让 CI 为一个没变坏的事实一直红着。
+# 两个都会让人停止看这一行。
+warn() { WARN=$((WARN+1)); printf '  ⚠ %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; }
 step() { printf '\n== %s\n' "$1"; }
 
 cleanup() {
@@ -213,7 +220,66 @@ C=$(post /clients/claude-code/restore '{}')
 [ "$(cat "$FAKE_HOME/.claude/settings.json")" = "$BEFORE" ] && ok "还原之后文件一个字节都没变" \
   || bad "还原之后文件不一样了" "$(diff <(echo "$BEFORE") "$FAKE_HOME/.claude/settings.json" | head -5)"
 
+# ---------------------------------------------------------------- 资源目标
+# §4.5 写了四个数字，而在此之前**没有任何东西在守它们** —— 一个写在
+# 文档里、没人验的目标，和没有目标的区别只在于它让人以为验过。
+step "资源目标（§4.5）"
+
+RSS_KB=$(ps -o rss= -p "$CORE_PID" | tr -d ' ')
+RSS_MB=$((RSS_KB / 1024))
+# 目标 < 30 MB。**留一点余量但不留太多**：卡死在 30 会让一次无关的
+# 依赖升级把 CI 弄红，而放到 100 就等于没有这个检查
+if [ "$RSS_MB" -lt 30 ]; then
+  ok "内存 ${RSS_MB} MB（§4.5 目标 < 30）"
+elif [ "$RSS_MB" -lt 45 ]; then
+  # **不给超标的数字打勾。**那等于盖章说它达标了
+  warn "内存 ${RSS_MB} MB，超出 §4.5 的 30 MB 目标" "跑过一轮请求之后量的，不是纯冷启动；40 以内不算回归"
+else
+  bad "内存 ${RSS_MB} MB，比 §4.5 的目标高出一截"
+fi
+
+# 空闲时不写盘（§4.5 的最后一条）。**没有请求就不该有任何写入** ——
+# 一个常驻进程每秒摸一次磁盘，在笔记本上就是电量
+DB_BEFORE=$(stat -f '%m %z' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo "0 0")
+sleep 3
+DB_AFTER=$(stat -f '%m %z' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo "1 1")
+[ "$DB_BEFORE" = "$DB_AFTER" ] && ok "空闲 3 秒没有写盘" \
+  || bad "空闲时还在写盘" "before=$DB_BEFORE after=$DB_AFTER"
+
+# 转发的额外延迟（§4.5：入站解析加路由 < 2ms、中继 < 1ms）。
+# **和直连同一个假上游比** —— 差出来的就是我们这一层的成本。
+# 两边各打 20 次取总时间，单次的噪声比我们要量的东西还大。
+direct_ms() {
+  local t0 t1
+  t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+  for _ in $(seq 1 20); do
+    curl -s -o /dev/null -XPOST "http://127.0.0.1:$UPPORT/v1/messages" \
+      -H 'content-type: application/json' -d "$BODY"
+  done
+  t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+  echo $(( (t1 - t0) / 20 ))
+}
+through_ms() {
+  local t0 t1
+  t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+  for _ in $(seq 1 20); do
+    curl -s -o /dev/null -XPOST "http://127.0.0.1:$PORT/v1/messages" \
+      -H 'x-api-key: tw-smoketestkey0123456789' \
+      -H 'content-type: application/json' -d "$BODY"
+  done
+  t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+  echo $(( (t1 - t0) / 20 ))
+}
+D=$(direct_ms); T=$(through_ms); OVER=$((T - D))
+# 门槛放在 15ms：curl 每次起一个进程，那个噪声本来就有几毫秒，而这个
+# 检查要抓的是「某次改动让每个请求多花了几十毫秒」那种量级的回归
+if [ "$OVER" -lt 15 ]; then
+  ok "经过网关比直连多 ${OVER}ms（直连 ${D}ms、经过 ${T}ms）"
+else
+  bad "经过网关多花了 ${OVER}ms，§4.5 的目标是解析加路由 < 2ms、中继 < 1ms"
+fi
+
 # ---------------------------------------------------------------- 收尾
 step "结果"
-printf '通过 %d，失败 %d\n' "$PASS" "$FAIL"
+printf '通过 %d，失败 %d，超标但没回归 %d\n' "$PASS" "$FAIL" "$WARN"
 [ "$FAIL" -eq 0 ] || exit 1

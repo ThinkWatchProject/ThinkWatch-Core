@@ -90,6 +90,12 @@ pub fn router(state: ControlState) -> Router {
         .route("/config/history", get(config_history))
         .route("/config/at", get(config::path_at))
         .route("/pricing", get(pricing_get).put(pricing_put))
+        // 「检查价格更新」三步走（§4.3.0、§12）。**三个端点，不是一个**
+        // —— 一个端点意味着「检查」和「写入」是同一次调用，而那正是
+        // 「静默下载」的定义
+        .route("/pricing/update/offer", post(update_offer))
+        .route("/pricing/update/fetch", post(update_fetch))
+        .route("/pricing/update/apply", post(update_apply))
         .route("/config/rollback", post(config_rollback))
         .route("/summary", get(summary))
         .route("/history", get(history))
@@ -591,6 +597,113 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
     }
 }
 
+/// 第一步：**只问「要访问什么、多大」，一个字节都不下载。**
+///
+/// §12 承诺零上传，那也意味着**零静默下载** —— 而这条承诺里最容易被
+/// 省掉的一半，正是「先告诉你要连哪儿」。
+async fn update_offer(State(s): State<ControlState>) -> Result<Json<tw_api::UpdateOffer>, Fail> {
+    let r = s
+        .http()
+        .head(tw_pricing::UPDATE_URL)
+        .send()
+        .await
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("连不上：{e}")))?;
+    Ok(Json(tw_api::UpdateOffer {
+        url: tw_pricing::UPDATE_URL.to_string(),
+        bytes: r.content_length(),
+        current_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+    }))
+}
+
+/// 第二步：下载、解析、**给 diff，但不写盘**。
+async fn update_fetch(State(s): State<ControlState>) -> Result<Json<tw_api::UpdatePreview>, Fail> {
+    let raw = s
+        .http()
+        .get(tw_pricing::UPDATE_URL)
+        .send()
+        .await
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("下载失败：{e}")))?
+        .bytes()
+        .await
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("下载失败：{e}")))?;
+    let table = tw_pricing::parse_upstream(&raw)
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let cur = prices(&s);
+    let changes = tw_pricing::diff(cur.table(), &table);
+    let token = blake3::hash(&raw).to_hex()[..16].to_string();
+    // **存在磁盘上，不存在内存里。**第三步可能几分钟之后才来（用户在
+    // 看 diff），而这中间进程完全可能重启
+    let path = pending_path(&s);
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(&path, &raw)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("存不下来：{e}")))?;
+    Ok(Json(tw_api::UpdatePreview {
+        models: table.len(),
+        changes: changes
+            .into_iter()
+            // 三千多个模型全列出来没人看得完。**改价的排在前面**
+            // （见 `tw_pricing::diff`），所以截断截掉的是新增那一批
+            .take(200)
+            .map(|c| tw_api::PriceChangeView {
+                model: c.model,
+                old_input: c.old_input,
+                new_input: c.new_input,
+                old_output: c.old_output,
+                new_output: c.new_output,
+            })
+            .collect(),
+        token,
+    }))
+}
+
+/// 第三步：**确认之后才写**。
+async fn update_apply(
+    State(s): State<ControlState>,
+    Json(req): Json<ApplyReq>,
+) -> Result<Json<tw_api::PricingView>, Fail> {
+    let path = pending_path(&s);
+    let raw = std::fs::read(&path).map_err(|_| {
+        fail(
+            StatusCode::BAD_REQUEST,
+            "没有待确认的更新 —— 先点「检查更新」".to_string(),
+        )
+    })?;
+    // **指纹要对上。**不对上的话，「确认写入」写的可能是另一次下载的
+    // 结果 —— 用户看的 diff 和落盘的东西不是一回事
+    let token = blake3::hash(&raw).to_hex()[..16].to_string();
+    if token != req.token {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "这份更新和你看到的 diff 对不上，重新检查一次".to_string(),
+        ));
+    }
+    let dir = s
+        .config_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    // 落到数据目录，加载时优先于内置快照
+    std::fs::rename(&path, dir.join("model_prices.json"))
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("写不进去：{e}")))?;
+    pricing_get(State(s)).await
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyReq {
+    token: String,
+}
+
+/// 下载完还没确认的那份放哪儿。
+fn pending_path(s: &ControlState) -> std::path::PathBuf {
+    s.config_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+        .join("model_prices.pending.json")
+}
+
 /// 用户自己写的那份价格（§4.3.0 第三层）。
 ///
 /// **这一页存在的理由是「有 N 条请求算不出钱」** —— 用户不会主动想起
@@ -623,7 +736,10 @@ async fn pricing_get(State(s): State<ControlState>) -> Result<Json<tw_api::Prici
     };
     Ok(Json(tw_api::PricingView {
         rows,
-        snapshot_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+        // **这份表自己的日期，不是那个常量。**用户点过更新之后还显示
+        // 内置快照的日期，等于把「你的价目表是哪天的」这个问题答错了
+        // —— 而成本旁边标它的全部意义就是回答那个问题（§4.3.0）
+        snapshot_date: p.snapshot_date.clone(),
         unpriced_recent,
         unpriced_models,
     }))
@@ -698,6 +814,31 @@ pub(crate) fn prices(s: &ControlState) -> tw_pricing::Prices {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
     tw_pricing::Prices::builtin()
+        // 用户点过「更新」的话，用拉回来的那份（§4.3.0 第二层）。
+        // **读不了就退回内置那份** —— 一个损坏的更新文件不该让成本栏
+        // 整个变成「未知」
+        .map(|mut p| {
+            let f = dir.join("model_prices.json");
+            match std::fs::read(&f).ok().and_then(|raw| {
+                // **要给一个人看得懂的日期。**成本旁边标的是「这份
+                // 价目表是哪天的」，而「第 20800 天」回答不了那个问题
+                let date = std::fs::metadata(&f)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Local> = t.into();
+                        dt.format("%Y-%m-%d").to_string()
+                    })
+                    .unwrap_or_else(|| "用户更新的".to_string());
+                tw_pricing::parse_upstream(&raw).ok().map(|t| (t, date))
+            }) {
+                Some((t, date)) => {
+                    p.replace_table(t, date);
+                    p
+                }
+                None => p,
+            }
+        })
         .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
         .unwrap_or_else(|e| {
             tracing::warn!("价目表读不了，测速报价会说「价格未知」：{e}");

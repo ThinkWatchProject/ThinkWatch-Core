@@ -31,6 +31,82 @@ const SNAPSHOT: &[u8] = include_bytes!("../data/model_prices.json.gz");
 pub const SNAPSHOT_DATE: &str = "2026-09-09";
 pub const SNAPSHOT_SOURCE: &str = "LiteLLM model_prices_and_context_window.json";
 
+/// 更新去哪儿拉（§4.3.0 第二层）。
+///
+/// **写死在代码里，不从配置读。**一个「价目表源」配置项等于给了任何能
+/// 改 config.yaml 的人一个往这个进程里喂 JSON 的入口，而那份 JSON 会
+/// 决定用户看到的每一个金额。
+pub const UPDATE_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+
+/// 一份拉回来的价目表**解析成表，但不落盘**。
+///
+/// 分成「解析」和「写入」两步是 §12 要的：**先给 diff，确认才写**。
+pub fn parse_upstream(raw: &[u8]) -> Result<HashMap<String, ModelPrice>, PricingError> {
+    let parsed: HashMap<String, serde_json::Value> =
+        serde_json::from_slice(raw).map_err(|e| PricingError::Snapshot(e.to_string()))?;
+    let mut table = HashMap::with_capacity(parsed.len());
+    for (k, v) in parsed {
+        if let Some(p) = price_from(&v) {
+            table.insert(k, p);
+        }
+    }
+    if table.is_empty() {
+        return Err(PricingError::Snapshot(
+            "拉回来的东西里一个带价格的模型都没有 —— 多半不是那份数据集".into(),
+        ));
+    }
+    Ok(table)
+}
+
+/// 一个模型的价格变化。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceChange {
+    pub model: String,
+    /// `None` = 新增的
+    pub old_input: Option<f64>,
+    pub new_input: f64,
+    pub old_output: Option<f64>,
+    pub new_output: f64,
+}
+
+/// 新旧两份表的差异。
+///
+/// **只列真的变了的**。三千多个模型里绝大多数没动，把它们一起列出来
+/// 等于把那几十条真的变化埋掉。
+pub fn diff(
+    old: &HashMap<String, ModelPrice>,
+    new: &HashMap<String, ModelPrice>,
+) -> Vec<PriceChange> {
+    let mut out: Vec<PriceChange> = Vec::new();
+    for (m, n) in new {
+        match old.get(m) {
+            Some(o)
+                if (o.input - n.input).abs() < f64::EPSILON
+                    && (o.output - n.output).abs() < f64::EPSILON => {}
+            Some(o) => out.push(PriceChange {
+                model: m.clone(),
+                old_input: Some(o.input),
+                new_input: n.input,
+                old_output: Some(o.output),
+                new_output: n.output,
+            }),
+            None => out.push(PriceChange {
+                model: m.clone(),
+                old_input: None,
+                new_input: n.input,
+                old_output: None,
+                new_output: n.output,
+            }),
+        }
+    }
+    // **改价的排在新增的前面**：一个模型悄悄涨价，比多了一个模型重要
+    out.sort_by(|a, b| {
+        (a.old_input.is_none(), a.model.as_str()).cmp(&(b.old_input.is_none(), b.model.as_str()))
+    });
+    out
+}
+
 /// 一个模型的价格。单位一律是**每 token 的美元**，和上游数据集一致。
 ///
 /// 缓存写入分两档不是过度设计：Sonnet 4.5 的 5 分钟档是 \$3.75、1 小时档
@@ -236,6 +312,18 @@ impl Prices {
             }
         }
         out
+    }
+
+    /// 内置表的一份拷贝。给「拉回来的和现在的差在哪」用。
+    pub fn table(&self) -> &HashMap<String, ModelPrice> {
+        &self.table
+    }
+
+    /// 换一份表进来（用户确认过更新之后）。**覆盖层原样保留** ——
+    /// 那是用户自己写的东西，不该被一次上游更新冲掉。
+    pub fn replace_table(&mut self, table: HashMap<String, ModelPrice>, date: String) {
+        self.table = table;
+        self.snapshot_date = date;
     }
 
     pub fn len(&self) -> usize {

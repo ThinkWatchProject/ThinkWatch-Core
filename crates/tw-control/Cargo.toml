@@ -11,6 +11,8 @@ description = "控制面 API 服务端（unix socket）"
 tw-api = { workspace = true }
 tw-config = { workspace = true }
 tw-adopt = { workspace = true }
+# 更新那份价目表时给下载内容按指纹 —— 用户看的 diff 和落盘的必须是同一份
+blake3 = { workspace = true }
 tw-scan = { workspace = true }
 tw-redact = { workspace = true }
 bytes = { workspace = true }

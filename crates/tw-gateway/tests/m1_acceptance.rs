@@ -313,3 +313,41 @@ async fn the_upstream_header_is_there_on_success_too_so_the_ui_can_always_show_i
         "official"
     );
 }
+
+/// **单点查询要走和列表同一道准入**（§3.9）。
+///
+/// 不接这条路的话它掉进 fallback 直接透传上游 —— 一个被 `allow` 限制成
+/// 只能用便宜模型的 client，`GET /v1/models/claude-opus-4` 照样拿 200。
+/// §3.9 点名过这个洞（说别的项目「都没做过滤」），而我们自己也漏了。
+#[tokio::test]
+async fn a_single_model_lookup_obeys_the_same_allow_list_as_the_list() {
+    let up = named_upstream("官方").await;
+    let mut p = provider("官方", up);
+    p.models = vec!["claude-haiku-4-5".into(), "claude-opus-4".into()];
+    let mut cfg = base(vec![p], vec![]);
+    cfg.clients[0].allow = Some(vec!["claude-haiku-*".into()]);
+    let gw = serve(cfg).await;
+    let c = reqwest::Client::new();
+    let get = |path: String| {
+        let c = c.clone();
+        let url = format!("http://{gw}{path}");
+        async move { c.get(url).header("x-api-key", "tw-k").send().await.unwrap() }
+    };
+    // 列表里只有被许可的那个
+    let list = get("/v1/models".into()).await.text().await.unwrap();
+    assert!(list.contains("claude-haiku-4-5"), "{list}");
+    assert!(!list.contains("claude-opus-4"), "列表漏了：{list}");
+
+    // 被许可的单点查得到
+    assert_eq!(
+        get("/v1/models/claude-haiku-4-5".into()).await.status(),
+        200
+    );
+
+    // **不许可的要当它不存在**，而不是 403 —— 回 403 等于告诉对方
+    // 「这个模型在，只是你不能用」，而列表里根本没列它
+    let r = get("/v1/models/claude-opus-4".into()).await;
+    assert_ne!(r.status(), 200, "**限制了的模型单点还是查得到**");
+    let body = r.text().await.unwrap();
+    assert!(body.contains("没有叫"), "{body}");
+}

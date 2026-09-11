@@ -532,6 +532,14 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         // **和准入共用同一个函数**（§3.9）—— 列表和准入不可能不一致。
         .route("/v1/models", get(list_models))
+        // **单点查询要走同一道准入**（§3.9）。不接这条的话它掉进
+        // fallback 直接透传上游 —— 一个被 `allow` 限制成只能用便宜
+        // 模型的 client，`GET /v1/models/claude-opus-4` 照样拿 200。
+        // §3.9 点名过这个洞（说别的项目「都没做过滤」），而我们自己
+        // 也漏了。**同一个 `admits` 函数，列表和单点不可能不一致。**
+        .route("/v1/models/{model}", get(get_model))
+        // Gemini 方言的路径。它的客户端问的是 `/v1beta/models/x`
+        .route("/v1beta/models/{model}", get(get_model))
         // M0 只有透传：任何方法、任何路径都往上游送。M1 加路由时，
         // 这里会先过规则引擎再决定送给谁。
         .fallback(any(passthrough))
@@ -654,6 +662,51 @@ async fn list_models(
                 "id": m, "object": "model", "created": now,
             })).collect::<Vec<_>>()
         }),
+    };
+    Ok(axum::Json(body).into_response())
+}
+
+/// `GET /v1/models/:model`。
+///
+/// **不许可就当它不存在（404），不是 403。**回 403 等于告诉对方
+/// 「这个模型在，只是你不能用」—— 而列表里根本没列它，两处说法不一致
+/// 本身就是一条信息。
+async fn get_model(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, GatewayError> {
+    let rt = state.runtime();
+    if !rt.allow.allows(peer.ip()) {
+        return Err(GatewayError::auth(format!(
+            "{} 不在允许的来源里。",
+            peer.ip()
+        )));
+    }
+    let (client, position) = state.identify(&headers, query.as_deref())?;
+    let allow = rt
+        .config
+        .clients
+        .iter()
+        .find(|c| c.name == client)
+        .and_then(|c| c.allow.clone());
+    let catalog = state.catalog.load();
+    // 目录空着时不拦 —— 那说明探测还没回来或者上游都不给列表，这时候
+    // 拦等于把整个网关关掉（和请求那条路同一个判断）
+    if !catalog.is_empty() && !catalog.admits(&model, Some(position.dialect()), allow.as_deref()) {
+        return Err(GatewayError::new(
+            crate::error::Source::Request,
+            format!("没有叫 `{model}` 的模型。能用的见 GET /v1/models。"),
+        ));
+    }
+    let now = now_ms() / 1000;
+    let body = match position {
+        crate::auth::KeyPosition::GoogleHeader => {
+            serde_json::json!({ "name": format!("models/{model}") })
+        }
+        _ => serde_json::json!({ "id": model, "object": "model", "created": now }),
     };
     Ok(axum::Json(body).into_response())
 }

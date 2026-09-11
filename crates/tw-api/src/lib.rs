@@ -546,6 +546,42 @@ pub enum PatchValue {
     Null,
 }
 
+/// 「检查价格更新」第一步：**先说要访问什么、多大**（§4.3.0、§12）。
+///
+/// **绝不在启动时后台偷偷拉。**零上传那句承诺，也意味着零静默下载 ——
+/// 而「先告诉你要连哪儿」是这条承诺里最容易被省掉的一半。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateOffer {
+    pub url: String,
+    /// 字节。`None` = 对面没给 `Content-Length`
+    pub bytes: Option<u64>,
+    /// 现在这份快照是哪天的
+    pub current_date: String,
+}
+
+/// 第二步：下载完、解析完，**给 diff，还没写**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePreview {
+    /// 拉回来的表里有多少个带价的模型
+    pub models: usize,
+    /// 真的变了的那些。**不列没动的** —— 三千多个里绝大多数没动，
+    /// 一起列出来等于把那几十条真的变化埋掉
+    pub changes: Vec<PriceChangeView>,
+    /// 这份东西的指纹。第三步要带着它回来 —— 否则「确认写入」写的
+    /// 可能是另一次下载的结果
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceChangeView {
+    pub model: String,
+    /// `null` = 新增的
+    pub old_input: Option<f64>,
+    pub new_input: f64,
+    pub old_output: Option<f64>,
+    pub new_output: f64,
+}
+
 /// 一条用户自己写的价格（§4.3.0 的第三层）。
 ///
 /// **单位是每百万 token 的美元**，和厂商定价页上印的一样 —— 让用户
