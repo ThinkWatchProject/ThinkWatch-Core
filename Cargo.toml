@@ -105,7 +105,6 @@ base64 = "0.22"
 futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
-async-trait = "0.1"
 
 thiserror = "2"
 anyhow = "1"
@@ -113,7 +112,6 @@ tracing = "0.1"
 metrics = "0.24"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
 chrono = { version = "0.4", features = ["serde"] }
 arc-swap = "1"
 blake3 = "1"

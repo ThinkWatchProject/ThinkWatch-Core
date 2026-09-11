@@ -1874,7 +1874,7 @@ mod tests {
     #[test]
     fn each_provider_gets_its_own_client() {
         // reqwest 的代理绑在 Client 上，不能按请求切换（§3.7）。共用一个
-        // Client 的话，「官方走代理、Ollama 直连」这个最基本的需求就做
+        // Client 的话，「这家走代理、Ollama 直连」这个最基本的需求就做
         // 不到 —— 而它恰恰是要代理这个功能的原因。
         let cfg = tw_config::Config {
             clients: vec![tw_config::Client {
