@@ -157,3 +157,18 @@ fn a_brace_inside_a_quoted_value_is_not_the_closing_one() {
 // 空的 `{}`：解析器根本不为它发出一个 Map 节点，所以这条路走不到。
 // **不为一个退化写法去改解析层** —— 它报的是一句清楚的「没有这个位置」，
 // 而配置里写一个空映射本来也没有意义。
+
+#[test]
+fn the_cursor_maps_to_the_thing_it_is_actually_inside() {
+    // **猜错的表现是「我明明点在中转上，右边显示的是官方」** —— 那比
+    // 没有这个功能更让人不信任这一页（§7.10）
+    let cfg = "providers:\n  - name: 官方\n    base_url: https://a\n  - name: 中转\n    base_url: https://b\n";
+    let at = |needle: &str| {
+        let i = cfg.find(needle).unwrap();
+        tw_yaml::path_at(cfg, i + 1).unwrap()
+    };
+    assert_eq!(at("官方")[..2], tw_yaml::path!["providers", 0][..]);
+    assert_eq!(at("中转")[..2], tw_yaml::path!["providers", 1][..]);
+    // 停在第二家的 base_url 上，仍然算在第二家里
+    assert_eq!(at("https://b")[..2], tw_yaml::path!["providers", 1][..]);
+}

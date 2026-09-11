@@ -88,6 +88,7 @@ pub fn router(state: ControlState) -> Router {
             get(get_config).patch(patch_config).put(put_config),
         )
         .route("/config/history", get(config_history))
+        .route("/config/at", get(config::path_at))
         .route("/config/rollback", post(config_rollback))
         .route("/summary", get(summary))
         .route("/history", get(history))

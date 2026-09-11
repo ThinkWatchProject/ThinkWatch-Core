@@ -204,6 +204,44 @@ pub fn spawn_watcher(
     Ok(w)
 }
 
+/// 光标落在哪个东西上（§7.10 的反向联动）。
+///
+/// 返回它所属的**顶层段落和名字**（`providers` / `官方`），因为界面要的
+/// 是「显示哪个表单」，而不是精确到字段。
+pub async fn path_at(
+    axum::extract::State(s): axum::extract::State<crate::ControlState>,
+    axum::extract::Query(q): axum::extract::Query<AtQuery>,
+) -> Result<axum::Json<tw_api::ConfigAt>, crate::Fail> {
+    let cur = s
+        .cfg
+        .current()
+        .map_err(|e| crate::fail(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let path = tw_yaml::path_at(&cur.text, q.offset.min(cur.text.len()));
+    let mut out = tw_api::ConfigAt {
+        section: None,
+        name: None,
+    };
+    if let Some(p) = path {
+        if let Some(tw_yaml::Step::Key(k)) = p.first() {
+            out.section = Some(k.clone());
+        }
+        // 名字从那一项自己的 `name:` 上取 —— 下标对界面没有意义
+        if p.len() >= 2
+            && let Some(tw_yaml::Step::Index(_)) = p.get(1)
+        {
+            let mut np = p[..2].to_vec();
+            np.push(tw_yaml::Step::Key("name".into()));
+            out.name = tw_yaml::find(&cur.text, &np).ok().map(|f| f.value);
+        }
+    }
+    Ok(axum::Json(out))
+}
+
+#[derive(serde::Deserialize)]
+pub struct AtQuery {
+    pub offset: usize,
+}
+
 /// 把 `/providers/relay-cn/base_url` 这样的路径解析成 `tw-yaml` 的步骤。
 ///
 /// **用名字而不是下标。**下标会在用户重排上游之后指向另一个东西，而那

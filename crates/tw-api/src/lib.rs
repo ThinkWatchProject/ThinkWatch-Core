@@ -546,6 +546,16 @@ pub enum PatchValue {
     Null,
 }
 
+/// 光标落在配置的哪一段上（§7.10）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigAt {
+    /// `providers` / `groups` / `routes` / `clients`…
+    pub section: Option<String>,
+    /// 那一项的名字。**不给下标** —— 下标对界面没有意义，而且用户重排
+    /// 之后它指向另一个东西
+    pub name: Option<String>,
+}
+
 /// 整份文本写回去（文本模式）。
 ///
 /// **和 `PATCH` 是两条路，但同一扇门。**表单模式改字段，文本模式改整份

@@ -224,6 +224,25 @@ pub struct Node {
     pub anchored: bool,
 }
 
+/// 光标停在这个字节位置上时，它落在哪个节点里。
+///
+/// 给 §7.10 的反向联动用：文本模式里光标停在某个 provider 上 → 侧边
+/// 显示它的表单。
+///
+/// **用解析器算，不用正则猜。**猜错的表现是「我明明点在中转上，右边
+/// 显示的是官方」—— 那比没有这个功能更让人不信任这一页。
+///
+/// 返回**最深的那个包含它的节点**的路径。容器节点的 `bytes` 是解析器
+/// 给的原样（会一路跑到下一个 token），所以这里按「起点最靠后、且起点
+/// 不超过光标」来挑 —— 那正好是最内层的那个。
+pub fn path_at(text: &str, offset: usize) -> Option<Vec<Step>> {
+    let all = nodes(text).ok()?;
+    all.into_iter()
+        .filter(|n| n.bytes.start <= offset && !n.path.is_empty())
+        .max_by_key(|n| (n.bytes.start, n.path.len()))
+        .map(|n| n.path)
+}
+
 /// 把整份文档摊平成节点列表。
 ///
 /// 走一遍就把所有位置算出来，比「每改一个字段解析一遍」省事，也让
