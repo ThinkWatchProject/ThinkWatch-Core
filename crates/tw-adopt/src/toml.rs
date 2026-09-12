@@ -229,10 +229,7 @@ trust_level = "trusted"
             &Val::s("http://127.0.0.1:8080/v1"),
         )
         .unwrap();
-        assert!(
-            out.contains(r#"[projects."/path/to/my-app"]"#),
-            "{out}"
-        );
+        assert!(out.contains(r#"[projects."/path/to/my-app"]"#), "{out}");
         assert!(
             out.contains(r#"[projects."/path/to/another-app"]"#),
             "{out}"

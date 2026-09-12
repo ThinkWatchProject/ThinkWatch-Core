@@ -242,10 +242,7 @@ fn adopting_codex_keeps_every_project_trust_and_mcp_server() {
     apply(&c, &p, &b.backups).unwrap();
 
     let after = read(&b.home.join(".codex/config.toml"));
-    assert!(
-        after.contains(r#"[projects."/path/to/my-app"]"#),
-        "{after}"
-    );
+    assert!(after.contains(r#"[projects."/path/to/my-app"]"#), "{after}");
     assert!(
         after.contains(r#"[projects."/path/to/another-app"]"#),
         "{after}"
