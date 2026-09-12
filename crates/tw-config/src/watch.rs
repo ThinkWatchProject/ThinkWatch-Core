@@ -130,6 +130,30 @@ mod tests {
         }
     }
 
+    /// 等到没有动静为止，然后才开始断言「不该有动静」。
+    ///
+    /// **macOS 的 FSEvents 会把建流之前刚发生的事件投递进来。**每个测试
+    /// 都是先 `write(config.yaml)` 再 `watch()`，而那次写的事件完全可能
+    /// 在流建立之后才到 —— 于是一条「旁边的文件不该吵醒我们」的断言，
+    /// 收到的是自己刚才那次写。
+    ///
+    /// 其他测试碰不到这个：它们先断言「收到一个」，那一个正好把它吃掉了。
+    /// 只有纯反向断言的测试会被它打中，而它在 CI 上的时序比本机紧，所以
+    /// 只在 CI 上红。
+    ///
+    /// 不能无脑 drain 一次就走 —— 那会把真的回归也一起吃掉。这里的判据
+    /// 是「连续一个去抖窗口内什么都没来」，也就是真的静下来了。
+    async fn settle(rx: &mut tokio::sync::mpsc::Receiver<()>) {
+        for _ in 0..20 {
+            match recv(rx, DEBOUNCE + Duration::from_millis(100)).await {
+                Signal::Got => continue,
+                Signal::Quiet => return,
+                Signal::Closed => panic!("监听在测试开始之前就死了"),
+            }
+        }
+        panic!("监听一直在发信号，静不下来");
+    }
+
     #[tokio::test]
     async fn an_edit_produces_exactly_one_signal() {
         let d = tempfile::tempdir().unwrap();
@@ -198,6 +222,8 @@ mod tests {
         let p = d.path().join("config.yaml");
         std::fs::write(&p, "a: 1\n").unwrap();
         let (_w, mut rx) = watch(&p).unwrap();
+        // 先把建流之前那次写可能产生的事件等掉，否则下面断言的是它。
+        settle(&mut rx).await;
 
         std::fs::write(d.path().join("别的.yaml"), "x\n").unwrap();
         std::fs::create_dir_all(d.path().join("history")).unwrap();
