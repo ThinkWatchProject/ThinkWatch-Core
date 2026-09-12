@@ -1,51 +1,68 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" />
+  <img src="https://img.shields.io/badge/License-MIT-750014?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white" />
+</p>
+
 # ThinkWatch Core
 
-一个本地 AI API 网关的核心层：路由、转发、观测、计价、以及一组数据面的
-安全守卫。它同时被桌面版（ThinkWatch Lite）和服务端版本使用。
+**[English](README.md) | [中文](README.zh-CN.md)**
 
-**这个仓库不是一个可以直接用的应用**，它是一组 crate。要跑起来的话，
-`bin/twcore` 是一个完整的、可独立运行的网关二进制。
+**The shared core of a local AI API gateway.** Routing, forwarding, observability,
+cost accounting, and a set of data-plane guards — used by both the desktop app
+(ThinkWatch Lite) and the server edition.
 
-```
-cargo run -p twcore -- init          # 生成一份带注释的 config.yaml
-cargo run -p twcore -- check         # 只校验，不启动
-cargo run -p twcore -- serve         # 起网关和控制面
-```
-
-## 它做什么
-
-把客户端（Claude Code、Codex 之类）指向本地的一个端口，然后：
-
-- **按规则路由**到不同上游 —— 条件可以是模型名、客户端、上下文长度、
-  有没有工具调用等等，动作是换上游、改参数、或者直接拒绝
-- **故障转移**：首字节之前可以透明换一家，之后只能如实报错
-- **看得见成本**：token 用量、缓存命中、按价目表计价，算不出价钱的
-  明确标「未知」而不是编一个数字
-- **出站脱敏**：发给中转站之前把请求里的密钥换成占位符，模型回显时
-  再换回来
-- **入站审查**：上游返回的工具调用过一遍规则，高危的可以在那一帧上切断
-
-## crate 分层
+**This repository is not an application you install.** It is a set of crates.
+If you want something that runs, `bin/twcore` is a complete, self-contained
+gateway binary.
 
 ```
-tw-types · tw-protocol · tw-provider · tw-resil · tw-crypto   ← 外部现实决定形状
-tw-engine · tw-pricing · tw-redact · tw-yaml · tw-secret      ← 领域逻辑
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe        ← 装配
-tw-gateway · tw-control                                       ← 数据面 / 控制面
+cargo run -p twcore -- init     # write a commented config.yaml
+cargo run -p twcore -- check    # validate only, don't start
+cargo run -p twcore -- serve    # start the gateway and control plane
 ```
 
-上面两层对外部稳定，服务端版本直接依赖它们；下面两层是单机的场景的实现
-（SQLite、unix socket），不共用。
+## What it does
 
-## 开发
+Point a client (Claude Code, Codex, and friends) at a local port, and:
+
+- **Route by rule** to different upstreams — conditions can be the model name,
+  the client, context length, whether tools are present; actions are switching
+  upstream, rewriting parameters, or refusing outright.
+- **Fail over mid-flight** — before the first byte an upstream can be swapped
+  transparently; after it, the only honest thing left is to report what happened.
+- **Make cost visible** — token usage, cache hits, priced against a snapshot
+  table. What cannot be priced is labelled *unknown* rather than given an
+  invented number.
+- **Redact outbound** — secrets in a request are replaced with placeholders
+  before they reach a relay, and restored when the model echoes them back.
+- **Inspect inbound** — tool calls returned by an upstream are checked against
+  a rule set; a dangerous one can be cut off mid-frame.
+
+## Crate layers
 
 ```
-cargo test --workspace     # 单元与集成测试
-scripts/smoke.sh           # 从零起，在真二进制上把每条路走一遍
+tw-types · tw-protocol · tw-provider · tw-resil · tw-crypto   ← shape fixed by the outside world
+tw-engine · tw-pricing · tw-redact · tw-yaml · tw-secret      ← domain logic
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe        ← assembly
+tw-gateway · tw-control                                       ← data plane / control plane
 ```
 
-`scripts/smoke.sh` 不碰你自己的任何东西 —— `HOME` 和 `THINKWATCH_HOME`
-都指向一个临时目录，跑完就删。
+The top two layers are stable against external reality — the server edition
+depends on them directly. The bottom two are the single-machine implementation
+(SQLite, unix socket) and are deliberately **not** shared: single-machine SQLite
+and multi-tenant Postgres are different enough that forcing one abstraction over
+both would serve neither.
+
+## Development
+
+```
+cargo test --workspace     # unit and integration tests
+scripts/smoke.sh           # from a clean slate, exercise every path on the real binary
+```
+
+`scripts/smoke.sh` touches nothing of yours — `HOME` and `THINKWATCH_HOME` both
+point at a temporary directory that is deleted when it finishes.
 
 ## License
 
