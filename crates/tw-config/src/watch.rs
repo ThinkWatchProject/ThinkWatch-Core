@@ -130,30 +130,6 @@ mod tests {
         }
     }
 
-    /// 等到没有动静为止，然后才开始断言「不该有动静」。
-    ///
-    /// **macOS 的 FSEvents 会把建流之前刚发生的事件投递进来。**每个测试
-    /// 都是先 `write(config.yaml)` 再 `watch()`，而那次写的事件完全可能
-    /// 在流建立之后才到 —— 于是一条「旁边的文件不该吵醒我们」的断言，
-    /// 收到的是自己刚才那次写。
-    ///
-    /// 其他测试碰不到这个：它们先断言「收到一个」，那一个正好把它吃掉了。
-    /// 只有纯反向断言的测试会被它打中，而它在 CI 上的时序比本机紧，所以
-    /// 只在 CI 上红。
-    ///
-    /// 不能无脑 drain 一次就走 —— 那会把真的回归也一起吃掉。这里的判据
-    /// 是「连续一个去抖窗口内什么都没来」，也就是真的静下来了。
-    async fn settle(rx: &mut tokio::sync::mpsc::Receiver<()>) {
-        for _ in 0..20 {
-            match recv(rx, DEBOUNCE + Duration::from_millis(100)).await {
-                Signal::Got => continue,
-                Signal::Quiet => return,
-                Signal::Closed => panic!("监听在测试开始之前就死了"),
-            }
-        }
-        panic!("监听一直在发信号，静不下来");
-    }
-
     #[tokio::test]
     async fn an_edit_produces_exactly_one_signal() {
         let d = tempfile::tempdir().unwrap();
@@ -220,10 +196,17 @@ mod tests {
         // 历史目录就在配置旁边，每存一版都会动那个目录。
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.yaml");
-        std::fs::write(&p, "a: 1\n").unwrap();
+        // **故意不建 config.yaml。**过滤器是按文件名判的，所以这个测试
+        // 里唯一可能穿过它的事件就是 config.yaml 自己的 —— 而它不存在，
+        // 也就没人能写它。这样这条断言问的就只有「旁边的文件会不会吵醒
+        // 我们」，没有第二个可能的信号来源。
+        //
+        // 之前这里先写了一次 config.yaml 再建监听，于是那次写的事件可以
+        // 在监听建立之后才投递进来，断言收到的是它。先等一个静默窗口不
+        // 解决问题：FSEvents 的投递延迟没有上界，而「以后不会再来」是
+        // 证不出来的。`watching_a_file_that_does_not_exist_yet_still_works`
+        // 已经证明了不存在的文件照样盯得住。
         let (_w, mut rx) = watch(&p).unwrap();
-        // 先把建流之前那次写可能产生的事件等掉，否则下面断言的是它。
-        settle(&mut rx).await;
 
         std::fs::write(d.path().join("别的.yaml"), "x\n").unwrap();
         std::fs::create_dir_all(d.path().join("history")).unwrap();
