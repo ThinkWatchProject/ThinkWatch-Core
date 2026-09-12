@@ -104,8 +104,30 @@ pub fn watch(path: &Path) -> Result<(Watch, tokio::sync::mpsc::Receiver<()>), Wa
 mod tests {
     use super::*;
 
-    async fn recv(rx: &mut tokio::sync::mpsc::Receiver<()>, within: Duration) -> bool {
-        tokio::time::timeout(within, rx.recv()).await.is_ok()
+    /// 等一个信号，**区分三种结果**。
+    ///
+    /// 原来这里是 `timeout(within, rx.recv()).await.is_ok()`，而
+    /// `timeout` 返回的是 `Result<Option<()>, Elapsed>` —— `rx.recv()`
+    /// 返回 `None`（通道关闭）时内层 future 也算完成，`.is_ok()` 同样
+    /// 是 true。于是「监听线程死了」和「收到信号」不可区分：正向断言
+    /// 会在监听已经死掉的情况下通过，反向断言会因为通道关闭而失败，
+    /// 而两种失败的报错一模一样。
+    #[derive(Debug, PartialEq)]
+    enum Signal {
+        /// 真的收到一个信号。
+        Got,
+        /// 窗口内没有动静 —— 这才是反向断言要的那个。
+        Quiet,
+        /// 通道关闭：发端已经没了，之后永远不会再有信号。
+        Closed,
+    }
+
+    async fn recv(rx: &mut tokio::sync::mpsc::Receiver<()>, within: Duration) -> Signal {
+        match tokio::time::timeout(within, rx.recv()).await {
+            Ok(Some(())) => Signal::Got,
+            Ok(None) => Signal::Closed,
+            Err(_) => Signal::Quiet,
+        }
     }
 
     #[tokio::test]
@@ -116,10 +138,15 @@ mod tests {
         let (_w, mut rx) = watch(&p).unwrap();
 
         std::fs::write(&p, "a: 2\n").unwrap();
-        assert!(recv(&mut rx, Duration::from_secs(3)).await, "没收到信号");
+        assert_eq!(
+            recv(&mut rx, Duration::from_secs(3)).await,
+            Signal::Got,
+            "没收到信号"
+        );
         // 去抖窗口之后不该再来一个
-        assert!(
-            !recv(&mut rx, Duration::from_millis(600)).await,
+        assert_eq!(
+            recv(&mut rx, Duration::from_millis(600)).await,
+            Signal::Quiet,
             "一次改动产生了不止一个信号"
         );
     }
@@ -137,8 +164,9 @@ mod tests {
             let tmp = d.path().join(format!("config.yaml.tmp{i}"));
             std::fs::write(&tmp, format!("a: {i}\n")).unwrap();
             std::fs::rename(&tmp, &p).unwrap();
-            assert!(
+            assert_eq!(
                 recv(&mut rx, Duration::from_secs(3)).await,
+                Signal::Got,
                 "第 {i} 次 rename 保存没被发现"
             );
         }
@@ -155,9 +183,10 @@ mod tests {
             std::fs::write(&p, format!("a: {i}\n")).unwrap();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(recv(&mut rx, Duration::from_secs(3)).await);
-        assert!(
-            !recv(&mut rx, Duration::from_millis(600)).await,
+        assert_eq!(recv(&mut rx, Duration::from_secs(3)).await, Signal::Got);
+        assert_eq!(
+            recv(&mut rx, Duration::from_millis(600)).await,
+            Signal::Quiet,
             "连写十次产生了不止一个信号"
         );
     }
@@ -173,8 +202,9 @@ mod tests {
         std::fs::write(d.path().join("别的.yaml"), "x\n").unwrap();
         std::fs::create_dir_all(d.path().join("history")).unwrap();
         std::fs::write(d.path().join("history/1-ui-abc.yaml"), "x\n").unwrap();
-        assert!(
-            !recv(&mut rx, Duration::from_millis(800)).await,
+        assert_eq!(
+            recv(&mut rx, Duration::from_millis(800)).await,
+            Signal::Quiet,
             "旁边的文件把我们吵醒了"
         );
     }
@@ -188,7 +218,11 @@ mod tests {
         std::fs::write(&p, "a: 1\n").unwrap();
         let (_w, mut rx) = watch(&p).unwrap();
         std::fs::remove_file(&p).unwrap();
-        assert!(recv(&mut rx, Duration::from_secs(3)).await, "删除没被发现");
+        assert_eq!(
+            recv(&mut rx, Duration::from_secs(3)).await,
+            Signal::Got,
+            "删除没被发现"
+        );
     }
 
     #[tokio::test]
@@ -198,6 +232,10 @@ mod tests {
         let p = d.path().join("config.yaml");
         let (_w, mut rx) = watch(&p).unwrap();
         std::fs::write(&p, "a: 1\n").unwrap();
-        assert!(recv(&mut rx, Duration::from_secs(3)).await, "新建没被发现");
+        assert_eq!(
+            recv(&mut rx, Duration::from_secs(3)).await,
+            Signal::Got,
+            "新建没被发现"
+        );
     }
 }
