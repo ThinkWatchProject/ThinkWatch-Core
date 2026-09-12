@@ -124,6 +124,22 @@ providers:
     key: sk-upstream-smoke
     protocol: anthropic
     redact: []
+# **把流量钉在 relay 上，不给故障转移留口子。**
+#
+# 两家都指着同一个假上游，而 official 的 redact 是空的（官方端点不脱，
+# §5.1）。不钉的话，relay 一次超时就会让请求转到 official，于是「中转
+# 看见了真 key」—— 一条安全断言被悄悄换成了它的反面，而两种失败在输出
+# 上长得一模一样。CI 上就这么红过两轮。
+#
+# official 留着不是摆设：模型目录刷新、/overview 的上游计数都要它，而
+# 那两处正是「多上游」才盖得到的路径。
+groups:
+  - name: 只走中转
+    type: fallback
+    providers: [relay]
+routes:
+  - name: 冒烟：这条必须走 relay，不许转移
+    to: 只走中转
 security:
   redact: enforce
   inspect_tools: enforce
@@ -159,6 +175,13 @@ print(rows[0].get("provider", "") if rows else "")' 2>/dev/null) \
   # 安全断言悄悄变成它的反面 —— 报「中转看见了真 key」会让人去查脱敏，
   # 而该查的是为什么转移了。
   bad "这次请求由 $SERVED 服务，没走到配了脱敏的 relay —— 这一条没测到脱敏" "$R"
+  printf '      路由已经钉死在 relay 上了，转移不该发生 —— 看这一行的尝试链：\n'
+  curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+    | python3 -c 'import sys, json
+rows = json.load(sys.stdin)
+print("        " + json.dumps(rows[0].get("routing"), ensure_ascii=False) if rows else "        （没有记录）")' 2>/dev/null
+  printf '      core.log 末尾：\n'
+  sed 's/^/        /' <<<"$(tail -8 "$TMP/core.log")"
 else
   # **一条安全检查失败时必须说出它为什么失败。**「中转看见了真 key」
   # 只说了结果，而下一步取决于原因：走错上游（`official` 的 redact 是
