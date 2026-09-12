@@ -17,9 +17,9 @@ pub enum ProxyKind {
     Socks5,
     /// **把域名原样发给代理，由代理端解析。**
     ///
-    /// 这个差别在本地 DNS 不可信时是决定性的：解析出来的
-    /// IP 根本连不通，即使代理本身是好的。所以它是默认值，UI 的下拉框
-    /// 里也排在 `socks5` 前面。
+    /// 这个差别在本地 DNS 不可信时是决定性的：解析出来的 IP 根本连不
+    /// 通，即使代理本身是好的。所以它是默认值，UI 的下拉框里也排在
+    /// `socks5` 前面。
     #[default]
     Socks5h,
     Http,
@@ -92,7 +92,7 @@ fn urlencode(s: &str) -> String {
 #[serde(rename_all = "lowercase")]
 pub enum OnProxyFail {
     /// **默认。** 静默降级会让请求以你意想不到的路径出去 —— 配了代理
-    /// 来说直连官方大概率也失败，只是错误信息变得更难懂；更糟的是它真
+    /// 的上游，直连大概率也失败，只是错误信息变得更难懂；更糟的是它真
     /// 的连上了，而你以为自己在走代理。
     #[default]
     Fail,
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn socks5h_is_the_default_because_of_dns_poisoning() {
-        // 本地 DNS 被污染时，socks5 解析出来的 IP 根本连不通，即使代理
+        // 本地 DNS 不可信时，socks5 解析出来的 IP 根本连不通，即使代理
         // 本身是好的。这个默认值在那种环境下是决定性的。
         assert_eq!(ProxyKind::default(), ProxyKind::Socks5h);
         assert!(
