@@ -1,0 +1,88 @@
+# Contributing to ThinkWatch Core
+
+## Open PRs against `dev`
+
+```bash
+gh pr create --base dev --head your-branch
+```
+
+`main` is the release line; `dev` is where routine work lands. GitHub
+pre-fills a new PR's base with the repo's default branch, which is
+`main`, so **the default is not the one you want**. If you already
+opened against `main`, click *Edit* next to the PR title and change the
+base — the commits and the discussion carry over. A bot will remind you.
+
+## What this repository is
+
+A set of crates, not an application. `bin/twcore` is a complete gateway
+binary and the thing to run when you want to see behavior:
+
+```bash
+cargo run -p twcore -- init     # write a commented config.yaml
+cargo run -p twcore -- check    # validate only, don't start
+cargo run -p twcore -- serve    # start the gateway and control plane
+```
+
+Both editions depend on these crates — the desktop app
+([ThinkWatch Lite](https://github.com/ThinkWatchProject/ThinkWatch-Lite))
+and the server edition. A change here reaches both, so "it works for my
+case" is not the bar.
+
+## Commit messages
+
+Conventional Commits (`fix(scope): subject`), in **English** — this is a
+public repository and the history is documentation.
+
+Say *why* in the body, not just *what*; the diff already shows what
+changed. A commit explaining the reasoning behind a non-obvious choice
+saves the next person from re-deriving it or "fixing" it back.
+
+## Before you open the PR
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./scripts/smoke.sh
+```
+
+Warnings are errors, and relaxing that on CI is the same as removing it.
+The toolchain is `stable`, so a newer stable than your local one can
+surface lints you cannot reproduce — `rustup update stable` before
+blaming CI.
+
+`scripts/smoke.sh` runs the real binary against a real socket and a real
+data plane. **It catches what unit tests structurally cannot** — file
+permissions, socket path limits, an endpoint that simply isn't
+registered, a config field silently swallowed. This project's first four
+real bugs were all in those seams. Tests that hit the live network are
+marked `#[ignore]` and don't run in CI.
+
+## Things that are load-bearing
+
+A PR that breaks one of these will be asked to change, regardless of how
+clean the diff is:
+
+- **Never echo a real secret** — not in the UI, a diff, a log, an event,
+  a diagnostic bundle, or a test fixture. Masking happens before it
+  leaves the process.
+- **Never present an estimate as exact.** Cost is three states —
+  measured, estimated, and no price at all. Treating the third as 0
+  makes a total quietly wrong with nothing to signal it.
+- **Observation must never block forwarding** (§4.7). Storage, pricing,
+  and scanning run off bounded channels; a full channel drops the
+  observation rather than delaying the request.
+- **Report, never auto-delete** (§5.3). The scanner has no write path,
+  and there's a test that reads the product code to prove it.
+- **Anything that bypasses the main pipeline re-applies its
+  protections.** Replay came close to being a legitimate way around
+  redaction.
+
+## The price list
+
+`crates/tw-pricing` embeds a pinned snapshot. It is **not** auto-updated:
+following upstream automatically means two builds can compute different
+prices, and "yesterday's number doesn't match today's" cannot be
+explained to a user. Update steps are in
+`crates/tw-pricing/data/PROVENANCE.md`, and a CI test compares the
+snapshot against the hand-checked `data/verified.yaml` row by row.
