@@ -141,8 +141,32 @@ step "数据面"
 BODY='{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"我的 key 是 sk-ant-api03-SMOKEKEYAAAAAAAAAAAAAAAA"}]}'
 R=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
       -H 'content-type: application/json' -d "$BODY")
-echo "$R" | grep -q '"saw_key": *"no"' && ok "走中转时密钥被换成了占位符" \
-  || bad "中转看见了真 key" "$R"
+if echo "$R" | grep -q '"saw_key": *"no"'; then
+  ok "走中转时密钥被换成了占位符"
+else
+  # **一条安全检查失败时必须说出它为什么失败。**「中转看见了真 key」
+  # 只说了结果，而下一步取决于原因：走错上游（`official` 的 redact 是
+  # 空的）、脱敏没配上、还是体根本没被当成 UTF-8。所以把这一次的路由
+  # 决策和 core 日志一起交出来 —— 少了这些，CI 上的一次失败在本机复现
+  # 不出来就只能靠猜。
+  sleep 0.5
+  CHAIN=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+            | python3 -c 'import sys, json
+# /history 是个顶层数组。字段名在演化，所以打印整行而不是挑几个 ——
+# 挑错了名字就什么都看不到，而这段代码只在出事那一次跑。
+try:
+    rows = json.load(sys.stdin)
+    if not rows:
+        print("这次请求没落到 /history 里（观测通道可能还没写完）")
+    else:
+        print(json.dumps(rows[0], ensure_ascii=False, sort_keys=True))
+except Exception as e:
+    print("取不到路由信息：%s" % e)' 2>/dev/null)
+  bad "中转看见了真 key" "$R"
+  printf '      %s\n' "${CHAIN:-（控制面没给出路由信息）}"
+  printf '      core.log 末尾：\n'
+  sed 's/^/        /' <<<"$(tail -8 "$TMP/core.log")"
+fi
 
 R=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
       -H 'content-type: application/json' -H 'x-thinkwatch-client: smoke' \
