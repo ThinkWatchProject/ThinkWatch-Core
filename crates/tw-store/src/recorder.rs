@@ -178,6 +178,21 @@ impl Recorder {
                 billing,
             } => {
                 if let Some(p) = self.inflight.get_mut(id) {
+                    // **归到实际服务的那家，不是第一个候选。**
+                    // `RequestStarted` 发出时只知道候选链的头一个，而故障
+                    // 转移之后那一家恰恰是失败的那一家。不改的话成本记在
+                    // 没服务的上游头上，而「哪家上游慢」（§4.6）会把成功
+                    // 那一跳的延迟算给超时的那一家 —— 两个数字都指向错的
+                    // 上游，而且没有任何东西会提示它们错了。
+                    //
+                    // 判据是「链的最后一跳」，不是按 outcome 的字符串匹配
+                    // 「成功」：转移在第一次成功时就 break，所以最后一跳
+                    // 要么是服务的那家，要么是放弃前试的最后一家。两种都
+                    // 是这一行该归的对象，而这条性质是结构性的 —— 改了
+                    // outcome 的措辞不会让它失效。
+                    if let Some(last) = attempts.last() {
+                        p.provider = last.provider.clone();
+                    }
                     p.routing = serde_json::to_string(&tw_api::RoutingView {
                         rule: rule.clone(),
                         group: group.clone(),
@@ -481,6 +496,73 @@ mod tests {
             duration_ms: 4000,
             usage,
         }
+    }
+
+    /// 故障转移之后，这一行该归给**实际服务的那家**。
+    ///
+    /// `RequestStarted` 发的是候选链的头一个，而转移之后那家恰恰是失败
+    /// 的。归错的后果不是一条难看的记录：成本记在没服务的上游头上，
+    /// 而「哪家上游慢」会把成功那一跳的 5 秒算给超时 10 秒的那一家。
+    /// 两个数字都指向错的上游，而且没有任何东西会提示它们错了。
+    ///
+    /// 这条是真机上撞出来的：冒烟脚本里 relay 超时、official 接手，
+    /// 而 `/history` 那一行写着 relay。
+    #[test]
+    fn a_failover_attributes_the_row_to_whoever_served_it() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5")); // provider = 官方
+        r.on_event(&Event::RequestRouted {
+            id: 1,
+            rule: "默认".into(),
+            group: Some("__all__".into()),
+            attempts: vec![
+                tw_api::AttemptView {
+                    provider: "官方".into(),
+                    outcome: "上游超时".into(),
+                    ms: 10_003,
+                },
+                tw_api::AttemptView {
+                    provider: "中转".into(),
+                    outcome: "成功".into(),
+                    ms: 5_042,
+                },
+            ],
+            billing: "per-token".into(),
+        });
+        r.on_event(&finished(1, None));
+
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(
+            row.provider, "中转",
+            "转移之后这一行还归给第一个候选，成本和延迟都会记到没服务的那家头上"
+        );
+        // 尝试链本身一个字都不能少 —— 归属改了，但「试过谁、为什么失败」
+        // 是排查的全部价值（§4.2）。
+        let routing: tw_api::RoutingView =
+            serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
+        assert_eq!(routing.attempts.len(), 2);
+        assert_eq!(routing.attempts[0].provider, "官方");
+        assert_eq!(routing.attempts[0].outcome, "上游超时");
+    }
+
+    /// 一次就成的请求不该被这条规则改坏：链长度为 1，最后一跳就是它自己。
+    #[test]
+    fn a_request_that_succeeds_first_try_keeps_its_provider() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestRouted {
+            id: 2,
+            rule: "默认".into(),
+            group: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "官方".into(),
+                outcome: "成功".into(),
+                ms: 300,
+            }],
+            billing: "per-token".into(),
+        });
+        r.on_event(&finished(2, None));
+        assert_eq!(r.db().get(2).unwrap().unwrap().provider, "官方");
     }
 
     #[test]

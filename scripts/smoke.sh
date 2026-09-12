@@ -72,7 +72,12 @@ class H(http.server.BaseHTTPRequestHandler):
                           "usage":{"input_tokens":100,"output_tokens":20}}).encode()
         self.send_response(200); self.send_header('content-type','application/json')
         self.send_header('content-length', str(len(out))); self.end_headers(); self.wfile.write(out)
-http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+# **必须是多线程的。**单线程的 HTTPServer 一次只处理一条请求，而 core
+# 启动时会给每个 provider 各发一次模型目录刷新 —— 两个 provider 都指着
+# 这一个端口，于是刷新把它占住，数据面那条请求排在后面等到超时，然后
+# 故障转移到另一家。CI 上就是这么红的：relay 超时 10 秒、official 接手，
+# 而 official 的 redact 是空的，所以「中转看见了真 key」。
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
 python3 "$TMP/upstream.py" "$UPPORT" >/dev/null 2>&1 &
 UP_PID=$!
@@ -143,6 +148,17 @@ R=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoket
       -H 'content-type: application/json' -d "$BODY")
 if echo "$R" | grep -q '"saw_key": *"no"'; then
   ok "走中转时密钥被换成了占位符"
+elif SERVED=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+                | python3 -c 'import sys, json
+rows = json.load(sys.stdin)
+print(rows[0].get("provider", "") if rows else "")' 2>/dev/null) \
+     && [ -n "$SERVED" ] && [ "$SERVED" != "relay" ]; then
+  # **区分两种失败。**「没脱敏」和「根本没走到配了脱敏的那家」是两句
+  # 完全不同的话，而它们的表现一模一样：上游看见了真 key。official 的
+  # redact 故意是空的（官方端点不脱，§5.1），所以一次故障转移会把这条
+  # 安全断言悄悄变成它的反面 —— 报「中转看见了真 key」会让人去查脱敏，
+  # 而该查的是为什么转移了。
+  bad "这次请求由 $SERVED 服务，没走到配了脱敏的 relay —— 这一条没测到脱敏" "$R"
 else
   # **一条安全检查失败时必须说出它为什么失败。**「中转看见了真 key」
   # 只说了结果，而下一步取决于原因：走错上游（`official` 的 redact 是
