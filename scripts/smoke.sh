@@ -45,6 +45,11 @@ trap cleanup EXIT
 cat > "$TMP/upstream.py" <<'PY'
 import http.server, json, sys
 class H(http.server.BaseHTTPRequestHandler):
+    # **默认是 HTTP/1.0，每条响应之后关连接。**core 那边是带连接池的
+    # 客户端，会拿一条它以为还活着的连接去发下一个请求。配上 1.1 才是
+    # 这个假上游该模拟的形状。
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *a): pass
     def do_GET(self):
         out = json.dumps({"data": [{"id": "claude-sonnet-4-5"}]}).encode()
@@ -79,7 +84,10 @@ class H(http.server.BaseHTTPRequestHandler):
 # 而 official 的 redact 是空的，所以「中转看见了真 key」。
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
-python3 "$TMP/upstream.py" "$UPPORT" >/dev/null 2>&1 &
+# **输出留着。**原来是 >/dev/null 2>&1，于是假上游崩了、端口被占了、
+# python 报了什么，全都看不见 —— 而失败会表现成「脱敏没生效」之类和它
+# 毫无关系的话。
+python3 -u "$TMP/upstream.py" "$UPPORT" > "$TMP/upstream.log" 2>&1 &
 UP_PID=$!
 # disown 掉，否则收尾时 kill 它，bash 会往终端上打一行 Terminated ——
 # 那一行会让一次全绿的运行看起来像是出了事
@@ -149,6 +157,20 @@ PY
 
 # ---------------------------------------------------------------- 起服务
 step "起服务"
+# **先确认假上游在应答，再起 core。**不确认的话，上游没起来会表现成
+# 数据面那几条断言失败 —— 而那些话说的是脱敏、是路由，没有一句指向真
+# 正的原因。一个不检查自己前提的测试，会把失败报在错的地方。
+UP_OK=""
+for _ in $(seq 1 40); do
+  if curl -sf -m 2 "http://127.0.0.1:$UPPORT/v1/models" >/dev/null 2>&1; then UP_OK=1; break; fi
+  sleep 0.25
+done
+if [ -n "$UP_OK" ]; then
+  ok "假上游在应答"
+else
+  bad "假上游没应答（端口 $UPPORT）" "$(tail -5 "$TMP/upstream.log" 2>/dev/null)"
+  exit 1
+fi
 "$BIN" --config "$CFG" serve > "$TMP/core.log" 2>&1 &
 CORE_PID=$!
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
@@ -205,6 +227,8 @@ except Exception as e:
   printf '      %s\n' "${CHAIN:-（控制面没给出路由信息）}"
   printf '      core.log 末尾：\n'
   sed 's/^/        /' <<<"$(tail -8 "$TMP/core.log")"
+  printf '      假上游日志末尾：\n'
+  sed 's/^/        /' <<<"$(tail -5 "$TMP/upstream.log" 2>/dev/null)"
 fi
 
 R=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
