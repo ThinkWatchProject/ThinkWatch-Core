@@ -341,6 +341,30 @@ pub struct Overview {
     pub groups: Vec<GroupView>,
     pub clients: Vec<ClientView>,
     pub listen: ListenView,
+    /// 三条防线各自的状态（§5.0）。
+    ///
+    /// **界面要能配它们，而不只是显示。**在此之前这三个字段根本没出现
+    /// 在这个视图里，于是「脱敏开没开」只能去翻 config.yaml —— 而 §5.0
+    /// 的整个设计前提是「出厂停在观察态，用户看到证据之后自己决定要不
+    /// 要切到拦截」，一个切不了的开关让那个设计不成立。
+    #[serde(default)]
+    pub security: SecurityView,
+}
+
+/// 三条防线。每条三态，而**「拦截」在每条上做的事不一样**，所以动词也
+/// 一起给出来 —— 界面上统一叫「拦截」的话，用户点下去并不知道会发生
+/// 什么（§5.0）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityView {
+    /// 出站脱敏。拦截态 = 替换成占位符
+    pub redact: String,
+    /// 入站审查。拦截态 = 切断响应流
+    pub inspect_tools: String,
+    /// 配置面扫描。拦截态 = 告警（它本来就不删东西，§5.3）
+    pub scan_configs: String,
+    /// 用户加了几条自定义扫描规则、停用了几条内置的（§5.3）
+    pub scan_rules_added: usize,
+    pub scan_rules_disabled: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +391,15 @@ pub struct ProviderView {
     /// 以为自己改不动它。
     #[serde(default)]
     pub trust_explicit: bool,
+    /// 这家上游实际会脱哪几类（§5.1）。
+    ///
+    /// 给的是**判完的结果**，不是配置里写的那几个字 —— 不写的话官方端点
+    /// 是空的、其余是那四类默认。界面上要能看出「没写」和「写了空」的
+    /// 区别，所以另给一个 explicit 标志。
+    #[serde(default)]
+    pub redact: Vec<String>,
+    #[serde(default)]
+    pub redact_explicit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

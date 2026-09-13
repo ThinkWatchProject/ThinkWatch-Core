@@ -214,6 +214,15 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                     .label()
                     .to_string(),
                 trust_explicit: p.trust.is_some(),
+                // 和 trust 同一个理由：给判完的结果。不写的时候官方端点是
+                // 空的、其余是那四类默认，而用户要看的是「这家实际脱哪几
+                // 类」（§5.1）
+                redact: p
+                    .effective_redact()
+                    .iter()
+                    .map(|k| k.slug().to_string())
+                    .collect(),
+                redact_explicit: p.redact.is_some(),
             })
             .collect(),
         routes: engine
@@ -253,6 +262,13 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 max_concurrent: c.max_concurrent,
             })
             .collect(),
+        security: tw_api::SecurityView {
+            redact: cfg.security.redact.slug().to_string(),
+            inspect_tools: cfg.security.inspect_tools.slug().to_string(),
+            scan_configs: cfg.security.scan_configs.slug().to_string(),
+            scan_rules_added: cfg.security.scan_rules.add.len(),
+            scan_rules_disabled: cfg.security.scan_rules.disable.len(),
+        },
         listen: tw_api::ListenView {
             bind: format!("{:?}", cfg.listen.gateway.bind).to_lowercase(),
             port: cfg.listen.gateway.port,
