@@ -39,6 +39,20 @@ impl Mode {
             Mode::Enforce => "拦截",
         }
     }
+
+    /// 配置文件里写的那个词。
+    ///
+    /// `label()` 是给人看的中文，**这个是写回 YAML 用的**。两者必须分开：
+    /// 界面上把「观察」原样写进 config.yaml 的话，下一次加载会因为
+    /// 「不是合法取值」整份被拒 —— 而这一层刻意不做静默回落（§5.0），
+    /// 所以那是一次真的、用户看不懂的启动失败。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::Observe => "observe",
+            Mode::Enforce => "enforce",
+        }
+    }
 }
 
 /// 用户自己加的一条扫描规则（§5.3）。
@@ -125,6 +139,24 @@ impl Security {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `slug()` 必须真的能被反序列化回来。
+    ///
+    /// 界面要能改这三个开关，而它写回 config.yaml 的就是这个字符串。
+    /// 写错一个词的后果不是「按默认值来」—— 这一层刻意不做静默回落
+    /// （§5.0：「以为自己开了拦截，其实只在观察」是最糟的状态），所以
+    /// 整份配置会被拒，表现成一次用户看不懂的启动失败。
+    ///
+    /// 所以这条不是在测一个 getter，是在把界面和加载器之间那个约定钉住。
+    #[test]
+    fn every_slug_round_trips_through_yaml() {
+        for m in [Mode::Off, Mode::Observe, Mode::Enforce] {
+            let yaml = format!("redact: {}\n", m.slug());
+            let back: Security = serde_yaml_ng::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("slug {:?} 读不回来：{e}", m.slug()));
+            assert_eq!(back.redact, m, "slug {:?} 解析成了别的档", m.slug());
+        }
+    }
 
     #[test]
     fn everything_ships_in_observe_mode() {
