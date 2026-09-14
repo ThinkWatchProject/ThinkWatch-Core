@@ -436,6 +436,13 @@ pub struct Engine {
     sets: Vec<RouteSet>,
     /// 没绑定时走哪条。
     default_route: String,
+    /// 这个名字是配置里写的，还是我们兜的。
+    ///
+    /// **写错了要报错，没写不算错。**两者都表现为「找不到这条路由」，
+    /// 但一个是打字错误（必须拦），一个是这个字段本来就可以不写（必须
+    /// 能用）。不区分的话，二选一都会错：要么打错的名字被静默兜掉，
+    /// 要么没写这个字段的配置加载不了。
+    default_is_explicit: bool,
     /// 密钥名 → 它绑的那条路由名。没有条目 = 走默认。
     bound: std::collections::HashMap<String, String>,
     groups: Vec<Group>,
@@ -461,8 +468,19 @@ impl Engine {
         // 上游」都说不出口（tw-config::validate 里那段注释）。
         //
         // 这条今天已经立过一次，又被这里破坏了一次。测试抓住了。
+        let default_is_explicit = default_route.is_some();
         let default_route = default_route.unwrap_or_else(|| DEFAULT_ROUTE.to_string());
-        if sets.iter().all(|s| s.rules.is_empty()) && !providers.is_empty() {
+        // **默认路由必须永远存在。**判据是「有没有叫这个名字的路由」，
+        // 不是「一条规则都没有」——
+        //
+        // 后者有个陷阱：配置里一添第一条自定义路由，隐式的那条默认就
+        // 不再合成，于是 `default_route` 指向一个不存在的名字、整份配置
+        // 失效。也就是说**「建第一条路由」这个动作本身会把配置写坏**，
+        // 而那正是界面上最常走的一步。端到端测出来的。
+        if !default_is_explicit
+            && !sets.iter().any(|s| s.name == default_route)
+            && !providers.is_empty()
+        {
             const ALL: &str = "__all__";
             groups.push(Group {
                 name: ALL.to_string(),
@@ -479,17 +497,15 @@ impl Engine {
                 deny: None,
                 guard: None,
             };
-            match sets.iter_mut().find(|s| s.name == default_route) {
-                Some(d) => d.rules.push(fallback),
-                None => sets.push(RouteSet {
-                    name: default_route.clone(),
-                    rules: vec![fallback],
-                }),
-            }
+            sets.push(RouteSet {
+                name: default_route.clone(),
+                rules: vec![fallback],
+            });
         }
         Self {
             sets,
             default_route,
+            default_is_explicit,
             bound,
             groups,
             providers,
@@ -560,7 +576,7 @@ impl Engine {
         }
         // 默认路由指了一个不存在的名字。**没绑路由的密钥会一条规则都
         // 不过** —— 请求全部落到「没有任何规则命中」，而配置看起来完整。
-        if !self.sets.is_empty() && !self.sets.iter().any(|s| s.name == self.default_route) {
+        if self.default_is_explicit && !self.sets.iter().any(|s| s.name == self.default_route) {
             return Err(RouteError::UnknownDefaultRoute(self.default_route.clone()));
         }
         // 绑了一个不存在的路由名 —— 那把密钥会静默地退回默认路由，
@@ -906,6 +922,24 @@ mod tests {
             Default::default(),
         );
         assert_eq!(e.validate(), Err(RouteError::DuplicateRoute("重名".into())));
+    }
+
+    #[test]
+    fn adding_the_first_custom_route_does_not_break_the_implicit_default() {
+        // **这个动作是界面上最常走的一步**，而它一度会把配置写坏：
+        // 合成条件原本是「一条规则都没有」，所以添了第一条自定义路由
+        // 之后隐式的默认就不再合成，`default_route` 指向一个不存在的
+        // 名字，整份配置失效。端到端测出来的。
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![set_of("长上下文", "a")],
+            None,
+            Default::default(),
+        );
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+        // 没绑路由的密钥仍然有规则可走
+        assert!(!e.rules_for_client("谁都行").is_empty());
     }
 
     #[test]
