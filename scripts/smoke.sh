@@ -255,6 +255,19 @@ get() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "http://lo
 post() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" -XPOST \
            -H 'content-type: application/json' -d "$2" "http://localhost$1"; }
 
+# **带上时间窗再打一次。**不带参数时一切正常、带上 `from_ms` 就 400，
+# 是这两个端点真实发生过的形态：`#[serde(flatten)]` 让 serde 走
+# deserialize_any，而 query string 里一切都是字符串，于是 i64 永远解析
+# 失败。单元测试看不见 —— 它只在真的经过一次 query string 解析时发生，
+# 而界面恰恰总是带着时间窗调。
+NOW=$(python3 -c 'import time;print(int(time.time()*1000))')
+DAY=$((NOW - 86400000))
+for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=3600000" \
+          "/summary/by?dim=model&from_ms=$DAY" "/history?limit=5&from_ms=$DAY"; do
+  C=$(get "$ep")
+  [ "$C" = "200" ] && ok "GET ${ep%%\?*}（带时间窗）" || bad "GET $ep 返回 $C" "$(cat "$TMP/out" 2>/dev/null | head -c 200)"
+done
+
 for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /leaks \
           /clients /scan /sessions /baseline /mcp/targets /diagnostics /config /config/history; do
   C=$(get "$ep")
