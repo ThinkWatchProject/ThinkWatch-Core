@@ -415,10 +415,11 @@ pub struct RuleView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteView {
     pub name: String,
-    /// 对所有密钥生效
+    /// 没绑路由的密钥走的就是这条
     pub default: bool,
-    /// 分到这条路由的密钥名。**默认路由这里是空的** —— 它不需要分配，
-    /// 而列出「所有密钥」会让人以为那是一次显式的分配。
+    /// **显式绑了这条路由的密钥。**默认路由这里通常是空的 —— 走它的人
+    /// 是「没绑」，不是「绑了它」，而把所有密钥列进来会让人以为那是
+    /// 一次次显式的选择。
     pub clients: Vec<String>,
     pub rules: Vec<RuleView>,
 }

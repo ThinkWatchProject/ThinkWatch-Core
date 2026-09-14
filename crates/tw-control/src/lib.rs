@@ -252,11 +252,11 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|set| tw_api::RouteView {
                 name: set.name.clone(),
-                default: set.default,
+                default: set.name == engine.default_route(),
                 clients: cfg
                     .clients
                     .iter()
-                    .filter(|c| c.routes.contains(&set.name))
+                    .filter(|c| c.route.as_deref() == Some(set.name.as_str()))
                     .map(|c| c.name.clone())
                     .collect(),
                 rules: set

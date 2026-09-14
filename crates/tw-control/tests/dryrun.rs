@@ -27,7 +27,6 @@ groups:
     providers: [官方, 中转]
 routes:
   - name: 默认
-    default: true
     rules:
       - name: 带缓存的必须走官方
         when: { cache: true }
