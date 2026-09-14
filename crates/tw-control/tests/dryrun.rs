@@ -26,17 +26,20 @@ groups:
     type: load-balance
     providers: [官方, 中转]
 routes:
-  - name: 带缓存的必须走官方
-    when: { cache: true }
-    to: 官方
-  - name: 超长上下文降级
-    when: { input_tokens: ">200k" }
-    set: { model: claude-haiku-4-5 }
-  - name: 图片一律拒绝
-    when: { image: true }
-    deny: 这个上游不收图片
-  - name: 其余都试试
-    to: 都试试
+  - name: 默认
+    default: true
+    rules:
+      - name: 带缓存的必须走官方
+        when: { cache: true }
+        to: 官方
+      - name: 超长上下文降级
+        when: { input_tokens: ">200k" }
+        set: { model: claude-haiku-4-5 }
+      - name: 图片一律拒绝
+        when: { image: true }
+        deny: 这个上游不收图片
+      - name: 其余都试试
+        to: 都试试
 "#;
 
 fn app() -> (tempfile::TempDir, axum::Router) {

@@ -402,12 +402,25 @@ pub struct ProviderView {
     pub redact_explicit: bool,
 }
 
+/// 一条规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteView {
+pub struct RuleView {
     pub name: String,
     pub to: String,
     /// `when` 的人话摘要。空 = 兜底
     pub conditions: Vec<String>,
+}
+
+/// 一条路由 —— 一组规则，加上它分给了谁。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteView {
+    pub name: String,
+    /// 对所有密钥生效
+    pub default: bool,
+    /// 分到这条路由的密钥名。**默认路由这里是空的** —— 它不需要分配，
+    /// 而列出「所有密钥」会让人以为那是一次显式的分配。
+    pub clients: Vec<String>,
+    pub rules: Vec<RuleView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

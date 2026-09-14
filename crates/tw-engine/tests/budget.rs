@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use tw_engine::{Engine, RequestFacts, Route};
+use tw_engine::{Engine, RequestFacts, Rule};
 
 /// 一份**比真实配置更重**的：20 个上游、31 条规则。
 ///
@@ -17,7 +17,7 @@ use tw_engine::{Engine, RequestFacts, Route};
 /// 最可能发生的回归。
 fn heavy() -> Engine {
     let providers: Vec<String> = (0..20).map(|i| format!("上游{i}")).collect();
-    let route = |name: String, to: String, model: Option<String>| Route {
+    let route = |name: String, to: String, model: Option<String>| Rule {
         name,
         when: tw_engine::rule::When {
             model,
@@ -28,7 +28,7 @@ fn heavy() -> Engine {
         deny: None,
         guard: None,
     };
-    let mut routes: Vec<Route> = (0..30)
+    let mut routes: Vec<Rule> = (0..30)
         .map(|i| {
             route(
                 format!("规则{i}"),
@@ -38,7 +38,7 @@ fn heavy() -> Engine {
         })
         .collect();
     routes.push(route("其余".into(), "上游0".into(), None));
-    Engine::new(providers, Vec::new(), routes)
+    Engine::with_default_rules(providers, Vec::new(), routes)
 }
 
 #[test]

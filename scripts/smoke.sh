@@ -146,8 +146,11 @@ groups:
     type: fallback
     providers: [relay]
 routes:
-  - name: 冒烟：这条必须走 relay，不许转移
-    to: 只走中转
+  - name: 默认
+    default: true
+    rules:
+      - name: 冒烟：这条必须走 relay，不许转移
+        to: 只走中转
 security:
   redact: enforce
   inspect_tools: enforce
