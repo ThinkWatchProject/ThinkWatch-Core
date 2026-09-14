@@ -81,6 +81,7 @@ pub fn router(state: ControlState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/interfaces", get(interfaces))
+        .route("/keys/new", get(new_key))
         .route("/events", get(events))
         .route("/overview", get(overview))
         .route("/probe", post(probe))
@@ -138,6 +139,17 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/plan", post(clients::mcp_plan_op))
         .route("/mcp/apply", post(clients::mcp_apply))
         .with_state(state)
+}
+
+/// 生成一把新的网关密钥。**不写进配置** —— 只是给界面一个值去填。
+///
+/// **在这里生成，不在界面里。**字母表（去掉了 0/O、1/I/l 这些抄错的
+/// 字符）和长度是安全相关的决定，而用户要把这串东西读出来、抄进另一个
+/// 配置文件。两处各写一份的话，迟早只有一处被改。
+async fn new_key() -> Json<tw_api::NewKey> {
+    Json(tw_api::NewKey {
+        key: tw_config::generate_key(),
+    })
 }
 
 /// 这台机器上有哪些网卡。

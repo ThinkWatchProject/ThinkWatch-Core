@@ -620,6 +620,12 @@ pub struct ConfigText {
     pub version: String,
 }
 
+/// 一把刚生成、还没写进配置的网关密钥（`GET /keys/new`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewKey {
+    pub key: String,
+}
+
 /// 这台机器上的一张网卡（`GET /interfaces`）。
 ///
 /// **界面上「绑在哪张网卡」那个选单要的就是它。**没有它，用户只能自己
