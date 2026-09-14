@@ -16,7 +16,7 @@
 //!
 //! Anthropic 的输入 token 在 `message_start` 里，而 OpenAI 的 usage 在
 //! **最后**。我们没法在开头就说出输入是多少 —— 硬等的话就变成整块缓冲，
-//! 那是 §4.1 明令不许的。
+//! 那是出站直通明令不许的。
 //!
 //! 所以 `message_start` 里的 usage 先写 0，真数字在结尾的
 //! `message_delta` 里给。**客户端本来就要看那一个**（Anthropic 自己
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn the_gateways_own_sniffer_can_read_the_converted_stream() {
         // **这一条是接缝**：翻译出来的流要能被我们自己的 usage 嗅探器
-        // 认出来，否则成本面板对所有互转请求集体失明（§4.3）。
+        // 认出来，否则成本面板对所有互转请求集体失明。
         // 嗅探器住在 tw-gateway 里，这里只验帧的形状和位置对不对。
         let out = run(&[
             &d("x"),

@@ -1,4 +1,4 @@
-//! 端到端扫一个假 home（DESIGN.md §5.3、§7.12）。
+//! 端到端扫一个假 home。
 //!
 //! 这些测试盯的是两件事：**该报的报出来并能定位到行**，以及
 //! **不该报的一条都不报** —— 后者同样重要，被误报几次之后用户会关掉
@@ -88,7 +88,7 @@ fn the_inventory_lists_env_names_but_never_their_values() {
 
 #[test]
 fn the_same_server_configured_differently_in_two_clients_is_flagged() {
-    // §7.12：你在 Claude Code 里给 filesystem 的路径是 ~/Dev，在 Cursor
+    // 你在 Claude Code 里给 filesystem 的路径是 ~/Dev，在 Cursor
     // 里是 ~/Projects。矩阵上这种情况要标个记号。
     let b = bed();
     let r = run(&b.home);
@@ -118,7 +118,7 @@ fn a_zero_width_character_in_a_skill_is_found_and_pointed_at() {
 
 #[test]
 fn a_hook_that_downloads_and_executes_is_the_highest_level() {
-    // hook 是攻击面里唯一**无需任何模型参与**就能拿到执行权的（§5.3）。
+    // hook 是攻击面里唯一**无需任何模型参与**就能拿到执行权的。
     let b = bed();
     write(
         &b.home.join(".claude/settings.json"),
@@ -225,7 +225,7 @@ fn a_file_we_cannot_read_is_said_out_loud() {
 
 #[test]
 fn scanning_never_touches_a_single_file() {
-    // §5.3 写死的那一条：只报告，不自动删除。误报删掉用户的正常配置
+    // 写死的那一条纪律：只报告，不自动删除。误报删掉用户的正常配置
     // 比漏报还糟。
     let b = bed();
     let before: Vec<_> = sources::user_level(&b.home)

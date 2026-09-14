@@ -1,8 +1,8 @@
-//! 双向同步端到端：两个写入方，一份文件（DESIGN.md §3.8）。
+//! 双向同步端到端：两个写入方，一份文件。
 //!
 //! 这些测试盯的是**回环、冲突、以及坏配置进来时旧的还在不在**。前两个
 //! 的失败模式都很隐蔽：回环表现为 CPU 莫名其妙地转，冲突表现为「我改的
-//! 东西不见了」——后者是这个项目最不能犯的错（§1 那批 cc-switch issue）。
+//! 东西不见了」 ——后者是这个项目最不能犯的错（那批 cc-switch issue）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,7 +86,7 @@ async fn our_own_write_does_not_come_back_as_an_external_edit() {
 
 #[tokio::test]
 async fn a_broken_file_keeps_the_old_config_serving_and_says_where() {
-    // 桌面工具不能因为一个笔误就断线（§3.8）。
+    // 桌面工具不能因为一个笔误就断线。
     let (_d, mgr, bus) = setup();
     let mut rx = bus.subscribe();
     let _w = tw_control::spawn_watcher(mgr.clone()).unwrap();
@@ -113,7 +113,7 @@ async fn a_broken_file_keeps_the_old_config_serving_and_says_where() {
 
 #[tokio::test]
 async fn writing_on_a_stale_version_is_refused_with_both_versions() {
-    // 乐观并发（§3.8）：**对不上就是 409，不是覆盖。**
+    // 乐观并发：**对不上就是 409，不是覆盖。**
     let (_d, mgr, _bus) = setup();
     let stale = mgr.current().unwrap().version();
     // 别人（或者你自己在编辑器里）先改了

@@ -1,9 +1,9 @@
-//! 数据面守卫：出站脱敏和入站审查的接线（DESIGN.md §5.1、§5.2）。
+//! 数据面守卫：出站脱敏和入站审查的接线。
 //!
 //! 规则本身住在 [`tw_redact`] 和 [`tw_scan`] 里，这个文件只回答一个
 //! 问题：**这一次请求，到底该按什么规格来。**
 //!
-//! # 三层配置，谁赢定死了（§5.1）
+//! # 三层配置，谁赢定死了
 //!
 //! | 层 | 字段 | 作用 |
 //! |---|---|---|
@@ -38,7 +38,7 @@ pub fn effective_kinds(provider: &Provider, guard: &Guard) -> Vec<Kind> {
 /// 脱敏一次出站请求体。
 ///
 /// 返回换过之后的体，和一本用来还原的账。**总闸不在 `enforce` 时，
-/// 账本是空的、体和进来时逐字节相同** —— 观察态那条路已经由 §5.0 的
+/// 账本是空的、体和进来时逐字节相同** —— 观察态那条路已经由
 /// `leak::scan` 走过了，这里不重复做。
 pub fn redact_outbound(
     mode: Mode,
@@ -66,7 +66,7 @@ pub fn redact_outbound(
     (bytes::Bytes::from(text), ledger)
 }
 
-/// 这一次要不要按「不受信任」来对待这个上游（§5.2）。
+/// 这一次要不要按「不受信任」来对待这个上游。
 ///
 /// route 上的 `guard.untrusted` **只能从「信任」收到「不信任」**，
 /// 反过来写不生效。
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn the_official_endpoint_gets_the_body_byte_for_byte() {
-        // §5.1 的核心：**你让 Claude Code 调试一个 .env 问题，它得真看见
+        // 核心：**你让 Claude Code 调试一个 .env 问题，它得真看见
         // 里面的值才帮得上忙。**
         let (out, l) = redact_outbound(Mode::Enforce, &official(), &Guard::default(), body());
         assert_eq!(out, body());
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn the_master_switch_being_off_or_observing_changes_nothing() {
-        // 观察态**只记录，不改变任何行为**（§5.0）。那条路由 leak::scan
+        // 观察态**只记录，不改变任何行为**。那条路由 leak::scan
         // 走，这里不重复做。
         for m in [Mode::Off, Mode::Observe] {
             let (out, l) = redact_outbound(m, &relay(), &Guard::default(), body());

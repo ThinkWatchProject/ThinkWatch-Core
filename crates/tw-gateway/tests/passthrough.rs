@@ -160,7 +160,7 @@ async fn streaming_is_not_buffered_and_upstream_headers_survive() {
         resp.headers().get("content-type").unwrap(),
         "text/event-stream"
     );
-    // 订阅额度的头必须原样回来 —— 那是 §4.3.2 零成本白捡的数据来源，
+    // 订阅额度的头必须原样回来 —— 那是零成本白捡的数据来源，
     // 剔掉它等于把那个功能的输入掐了。
     assert_eq!(
         resp.headers()
@@ -216,7 +216,7 @@ async fn a_wrong_key_is_refused_and_the_upstream_key_is_not_burned() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
-    // 一个探测本机端口的脚本不该消耗掉用户的额度（§5.4）
+    // 一个探测本机端口的脚本不该消耗掉用户的额度
     assert!(seen.lock().unwrap().body.is_empty());
 }
 
@@ -508,7 +508,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
 
 #[tokio::test]
 async fn with_no_routes_at_all_requests_still_go_somewhere() {
-    // 层 0：只配 provider，不写任何规则（§3.4）。这是最小可用配置，
+    // 层 0：只配 provider，不写任何规则。这是最小可用配置，
     // 而且**对不少人就够了** —— 如果它不工作，「配一个 API 就能用」
     // 那条纪律就是假的。
     let (up, seen) = start_upstream(false).await;
@@ -599,7 +599,7 @@ async fn send_to(gw: SocketAddr) -> reqwest::Response {
 
 #[tokio::test]
 async fn a_dead_first_provider_fails_over_to_the_next_one() {
-    // §4.2：首字节之前可以透明切换 —— 拿到响应头之前我们还没往客户端
+    // 首字节之前可以透明切换 —— 拿到响应头之前我们还没往客户端
     // 写过任何东西，换一家客户端完全无感。
     let dead = start_broken_upstream(503).await;
     let (good, seen) = start_upstream(false).await;
@@ -690,7 +690,7 @@ async fn rate_limiting_does_fail_over_because_another_account_may_have_quota() {
 #[tokio::test]
 async fn the_only_provider_keeps_being_tried_no_matter_how_broken() {
     // 唯一的上游被自己熔断就把用户锁死了。没有别的家可切的时候，
-    // 熔断纯粹是自伤（§4.2）。
+    // 熔断纯粹是自伤。
     let dead = start_broken_upstream(503).await;
     let gw = serve_cfg(cfg_with(
         vec![Provider {
@@ -788,7 +788,7 @@ fn cfg_with_limits(up: SocketAddr, limits: tw_config::Limits) -> Config {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn over_the_concurrency_limit_requests_queue_instead_of_being_refused() {
-    // **这是 §4.7 那条的可信证明。**客户端收到 429 通常不会优雅重试，
+    // **这是那条的可信证明。**客户端收到 429 通常不会优雅重试，
     // 一个本来只需要多等两秒的请求会变成一次任务中断 —— 所以超限时
     // 必须排队。
     let (up, peak) = start_slow_upstream(Duration::from_millis(200)).await;
@@ -868,7 +868,7 @@ async fn a_full_queue_refuses_with_429_rather_than_growing_without_bound() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_per_client_limit_keeps_one_client_from_taking_everything() {
-    // 监听局域网时是刚需：某台机器上的失控脚本不该能占满全部并发（§4.7）。
+    // 监听局域网时是刚需：某台机器上的失控脚本不该能占满全部并发。
     let (up, peak) = start_slow_upstream(Duration::from_millis(200)).await;
     let mut cfg = cfg_with_limits(
         up,
@@ -900,7 +900,7 @@ async fn a_per_client_limit_keeps_one_client_from_taking_everything() {
 
 #[tokio::test]
 async fn listing_and_admission_come_from_the_same_place() {
-    // §3.9 的核心：**列出来的一定能用，能用的一定列了出来**。两处各写
+    // 核心：**列出来的一定能用，能用的一定列了出来**。两处各写
     // 一遍的话，「列表里有但用不了」这种状态迟早出现 —— 而 one-api 和
     // new-api 都栽在这上面。
     let (up, _) = start_upstream(false).await;
@@ -910,7 +910,7 @@ async fn listing_and_admission_come_from_the_same_place() {
             base_url: format!("http://{up}"),
             key: "k".into(),
             protocol: Some(tw_config::Protocol::Anthropic),
-            // 这家不实现 /v1/models，所以手写兜底（§3.9）
+            // 这家不实现 /v1/models，所以手写兜底
             models: vec!["claude-sonnet-4-5".into(), "claude-haiku-4-5".into()],
             ..Default::default()
         }],
@@ -1059,7 +1059,7 @@ fn body_of(seen: &Arc<Mutex<Seen>>) -> serde_json::Value {
 
 #[tokio::test]
 async fn a_phase_two_rule_is_recomputed_after_failover() {
-    // **这是两阶段求值存在的全部理由**（§3.4）。`provider_would_be` 的
+    // **这是两阶段求值存在的全部理由**。`provider_would_be` 的
     // 值要等路由决定完才知道，而故障转移会在之后再改一次去向 —— 所以
     // 它必须在转移循环**里面**重算。
     //
@@ -1141,7 +1141,7 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
 
 #[tokio::test]
 async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
-    // 一个没有理由的拒绝，和一个 bug，在用户眼里没有区别（§3.4）。
+    // 一个没有理由的拒绝，和一个 bug，在用户眼里没有区别。
     let (relay, seen) = start_upstream(false).await;
     let gw = serve_cfg(cfg_with(
         vec![Provider {
@@ -1172,7 +1172,7 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
     .await;
 
     let r = send_to(gw).await;
-    // §4.6.1 的表：deny 是 403 + permission_error，不是 400 ——
+    // 表：deny 是 403 + permission_error，不是 400 ——
     // 请求本身完全合法，是策略不让。
     assert_eq!(r.status(), 403, "是策略不让，不是请求本身有问题");
     let text = r.text().await.unwrap();
@@ -1185,7 +1185,7 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
 
 #[tokio::test]
 async fn a_set_that_changes_nothing_leaves_the_body_byte_for_byte() {
-    // §4.1 的出站直通：**改写是显式要求的例外，不是默认行为**。
+    // 出站直通：**改写是显式要求的例外，不是默认行为**。
     // cc-switch 那次把缓存命中率从 99% 打到 20%，就是因为一个「看起来
     // 无害」的重写跑在了每个请求上。
     let (up, seen) = start_upstream(false).await;
@@ -1271,7 +1271,7 @@ async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
 
 #[tokio::test]
 async fn a_health_check_is_answered_locally_and_never_reaches_the_upstream() {
-    // §4.8 的 A 类：客户端只想知道「通不通」，回什么内容它不看。
+    // A 类：客户端只想知道「通不通」，回什么内容它不看。
     let (up, seen) = start_upstream(false).await;
     let gw = serve_cfg(cfg_with(
         vec![Provider {
@@ -1305,7 +1305,7 @@ async fn a_health_check_is_answered_locally_and_never_reaches_the_upstream() {
 
 #[tokio::test]
 async fn a_health_check_still_works_with_every_upstream_dead() {
-    // **这是这个功能最有价值的场景**（§4.8）。sub2api 把判定放在选号
+    // **这是这个功能最有价值的场景**。sub2api 把判定放在选号
     // 之后，于是断网时健康检查照样失败 —— 而客户端会因此报错。
     let dead = start_broken_upstream(503).await;
     let gw = serve_cfg(cfg_with(
@@ -1366,7 +1366,7 @@ async fn a_titling_request_goes_to_the_upstream_untouched() {
 #[tokio::test]
 async fn intercepting_a_probe_emits_its_own_event_not_a_request_pair() {
     // 成本 0、延迟 0 的东西混进请求总数和延迟统计里，会让那两个数字
-    // 都变得没意义（§4.8）。
+    // 都变得没意义。
     let (up, _seen) = start_upstream(false).await;
     let cfg = cfg_with(
         vec![Provider {
@@ -1441,7 +1441,7 @@ async fn turning_off_the_interception_sends_the_health_check_upstream() {
 
 #[tokio::test]
 async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
-    // §4.8 的第三个选项。**它成立的前提是你手里真有一个更便宜的地方** ——
+    // 第三个选项。**它成立的前提是你手里真有一个更便宜的地方** ——
     // 所以这是高级用法，默认没人会走到这里。
     let (cheap, seen_cheap) = start_upstream(false).await;
     let (normal, seen_normal) = start_upstream(false).await;
@@ -1564,7 +1564,7 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
 #[tokio::test]
 async fn a_health_check_works_before_any_upstream_is_configured() {
     // 「一个 provider 都没有」也是一种「没有可用上游」，而本地应答本来
-    // 就不需要上游（§4.8）。真实请求照样会拿到那句「还没有配置任何上游」。
+    // 就不需要上游。真实请求照样会拿到那句「还没有配置任何上游」。
     let gw = serve_cfg(cfg_with(vec![], vec![])).await;
     let c = reqwest::Client::new();
     let probe = c
@@ -1588,7 +1588,7 @@ async fn a_health_check_works_before_any_upstream_is_configured() {
     assert!(real.text().await.unwrap().contains("还没有配置任何上游"));
 }
 
-/// §4.6.1：**错误必须用入站方言的原生格式返回。**一个 Anthropic 客户端
+/// **错误必须用入站方言的原生格式返回。**一个 Anthropic 客户端
 /// 收到 OpenAI 形状的 error body，会在解析时炸掉，然后报一个和真实原因
 /// 完全无关的错。
 #[tokio::test]
@@ -1645,7 +1645,7 @@ async fn an_error_comes_back_in_the_dialect_the_client_speaks() {
 #[tokio::test]
 async fn every_dialect_still_gets_the_thinkwatch_prefix_and_header() {
     // 用户遇到报错的第一反应是去找中转站客服。**分不清是哪一层，他会
-    // 浪费时间问错人，而且会觉得是我们坏了**（§4.6.1）。
+    // 浪费时间问错人，而且会觉得是我们坏了**。
     let gw = serve_cfg(cfg_with(vec![], vec![])).await;
     let c = reqwest::Client::new();
     let url = format!("http://{gw}/v1/messages");
@@ -1665,7 +1665,7 @@ async fn every_dialect_still_gets_the_thinkwatch_prefix_and_header() {
 
 #[tokio::test]
 async fn a_deny_rule_is_403_not_400() {
-    // §4.6.1 的表：`deny` 是 403 + permission_error。**和「你这个请求
+    // 表：`deny` 是 403 + permission_error。**和「你这个请求
     // 本身有问题」分开** —— 混在一起的话，用户会去改他的请求，而该改
     // 的是规则。
     let (up, seen) = start_upstream(false).await;
@@ -1719,7 +1719,7 @@ async fn a_deny_rule_is_403_not_400() {
 /// 首字节之后上游断了：SSE 流里补一个 `error` 帧，并且发一条失败事件。
 ///
 /// **截断和「答完了」在 SSE 里长得一模一样。**什么都不做的话，用户会
-/// 以为模型就答了这么多，而 UI 上那一行会永远停在「进行中」（§4.6.1）。
+/// 以为模型就答了这么多，而 UI 上那一行会永远停在「进行中」。
 #[tokio::test]
 async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
     // 声明 content-length 比实际发的多，然后把连接关掉 —— 客户端库会
@@ -1802,7 +1802,7 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
 #[tokio::test]
 async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
     // 429 塌成 502 的话，客户端会当成「服务器坏了」而不是「该退避了」,
-    // 而它们该做的事完全不同（§4.6.1）。
+    // 而它们该做的事完全不同。
     let limited = start_broken_upstream(429).await;
     let gw = serve_cfg(cfg_with(
         vec![Provider {
@@ -1826,7 +1826,7 @@ async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
 
 #[tokio::test]
 async fn the_upstream_usage_reaches_the_event_stream_without_buffering_the_response() {
-    // **上游返回的 usage 是真相**（§4.3），所以要拿到它 —— 但不能为此
+    // **上游返回的 usage 是真相**，所以要拿到它 —— 但不能为此
     // 把流缓冲起来。这条同时验两件事：数字对，而且流还是流。
     let up = {
         let app = Router::new().fallback(axum::routing::any(|| async {
@@ -1895,7 +1895,7 @@ async fn the_upstream_usage_reaches_the_event_stream_without_buffering_the_respo
 
 #[tokio::test]
 async fn an_upstream_that_gives_no_usage_reports_none_rather_than_zeroes() {
-    // **零会让一次真实的调用看起来是免费的**（§4.3）。有些中转站就是
+    // **零会让一次真实的调用看起来是免费的**。有些中转站就是
     // 不给 usage，那时该走估算那条路。
     let (up, _seen) = start_upstream(false).await;
     let state = tw_gateway::AppState::new(cfg_with(
@@ -1930,7 +1930,7 @@ async fn an_upstream_that_gives_no_usage_reports_none_rather_than_zeroes() {
 
 #[tokio::test]
 async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_untouched() {
-    // **观察态只记录，不改变任何行为**（§5.0）。这条同时验两件事：
+    // **观察态只记录，不改变任何行为**。这条同时验两件事：
     // 发现了，而且请求体一个字节都没被动过 —— 后者是这一态的全部承诺。
     let (up, seen) = start_upstream(false).await;
     let state = tw_gateway::AppState::new(cfg_with(
@@ -2031,7 +2031,7 @@ async fn turning_the_detector_off_stops_it_looking_at_all() {
 #[tokio::test]
 async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
     // **一条说「试过 A → B → C」的链，和一条还说清每一跳为什么失败的
-    // 链，排查价值差得远**（§4.2）。
+    // 链，排查价值差得远**。
     let dead = start_broken_upstream(503).await;
     let limited = start_broken_upstream(429).await;
     let (good, _) = start_upstream(false).await;
@@ -2100,7 +2100,7 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
         }
     }
     let (rule, group, attempts) = routed.expect("没有发出路由事件");
-    // **「命中第 4 条」远不如「命中『都走这一组』」有用**（§3.4）
+    // **「命中第 4 条」远不如「命中『都走这一组』」有用**
     assert_eq!(rule, "都走这一组");
     assert_eq!(group.as_deref(), Some("全部"));
     assert_eq!(attempts.len(), 3, "{attempts:?}");
@@ -2186,8 +2186,8 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
 
 #[tokio::test]
 async fn an_upstream_that_reports_quota_is_treated_as_subscription_from_then_on() {
-    // §4.3.1 + §4.3.2：**订阅型不该按价目表算钱**，而「它是不是订阅型」
-    // 这个信号一直在响应头里 —— 不该变成一个用户要填的字段（§0.6）。
+    // **订阅型不该按价目表算钱**，而「它是不是订阅型」
+    // 这个信号一直在响应头里 —— 不该变成一个用户要填的字段。
     //
     // 这条同时钉住那个已知边界：**第一个请求会被按量计价**，因为那时
     // 我们还没见过它的额度头。之后就对了。

@@ -111,7 +111,7 @@ fn inserting_into_a_multiline_child_still_lands_in_the_right_place() {
 
 #[test]
 fn a_flow_mapping_gets_the_new_key_inside_the_braces() {
-    // `- { name: 甲, key: sk-a }` 是完全合法的写法，而 §3.8 的格式保留
+    // `- { name: 甲, key: sk-a }` 是完全合法的写法，而格式保留
     // 语料里本来就列了「流式与块式混排」。**在下一行插会产出一份解析
     // 不了的 YAML** —— 护栏会拦住，但那时用户看到的是「这是个 bug，
     // 请贴到 issue 里」，而他只是用了一种正常写法。
@@ -161,7 +161,7 @@ fn a_brace_inside_a_quoted_value_is_not_the_closing_one() {
 #[test]
 fn the_cursor_maps_to_the_thing_it_is_actually_inside() {
     // **猜错的表现是「我明明点在中转上，右边显示的是官方」** —— 那比
-    // 没有这个功能更让人不信任这一页（§7.10）
+    // 没有这个功能更让人不信任这一页
     let cfg = "providers:\n  - name: 官方\n    base_url: https://a\n  - name: 中转\n    base_url: https://b\n";
     let at = |needle: &str| {
         let i = cfg.find(needle).unwrap();

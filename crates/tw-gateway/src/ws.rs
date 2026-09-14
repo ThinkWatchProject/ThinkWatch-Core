@@ -1,4 +1,4 @@
-//! WebSocket 升级代理（DESIGN.md §3.6 的第三个集成细节）。
+//! WebSocket 升级代理（第三个集成细节）。
 //!
 //! sub2api 给 Codex CLI 提供 `/backend-api/codex/responses` 的 WS 桥接
 //! （客户端 WS ↔ 上游 HTTP/SSE）。要覆盖这条链路，数据面得能代理一次
@@ -7,7 +7,7 @@
 //! # 这一层最容易犯的错：把它做成一根管子
 //!
 //! 直接把两边的帧对着倒，是最省事的写法，也是**一条绕过整条管线的
-//! 合法后门** —— 出站脱敏（§5.1）、工具墙（§5.2）全都不会发生，而
+//! 合法后门** —— 出站脱敏、工具墙全都不会发生，而
 //! 用户完全看不出这条路和别的路有什么不同。重放那次已经踩过一模一样
 //! 的坑：**任何绕过主管线的路径都要把管线上的保护重新点一遍。**
 //!
@@ -18,7 +18,7 @@
 //!
 //! # 两条明说的边界
 //!
-//! **一、走代理的上游不代理 WS。**§3.7 的代理是给 reqwest 配的，而这里
+//! **一、走代理的上游不代理 WS。**代理是给 reqwest 配的，而这里
 //! 是自己建连。悄悄绕过用户配的代理，等于把他以为在代理后面的流量直接
 //! 发出去 —— 那比不支持严重得多，所以宁可明确拒绝。
 //!
@@ -152,13 +152,13 @@ pub async fn proxy(
     let mut p = Pipes {
         ledger: tw_redact::redact::Ledger::default(),
         wall: crate::toolwall::Wall::new(rules, cfg.security.inspect_tools.acts()),
-        // **和普通请求同一份规格**（§5.1）：`guard` 是并集，只加不减
+        // **和普通请求同一份规格**：`guard` 是并集，只加不减
         kinds: if cfg.security.redact.acts() {
             crate::guard::effective_kinds(&provider, &guard)
         } else {
             Vec::new()
         },
-        // **和主管线一模一样的判据**（§5.2）：高危 + 审查在动手档 +
+        // **和主管线一模一样的判据**：高危 + 审查在动手档 +
         // 这家不受信任，三者同时成立才切
         cut: cfg.security.inspect_tools.acts() && trust.blocks(),
         provider: provider.name.clone(),
@@ -325,7 +325,7 @@ fn as_sse(frame: &str) -> String {
 async fn close_with(client: WebSocket, why: &str) {
     let mut c = client;
     // **说清楚为什么。**一个默默断掉的 WebSocket，客户端只会显示
-    // 「连接已关闭」，而用户完全无从下手（§2.4）
+    // 「连接已关闭」，而用户完全无从下手
     let _ = c
         .send(Message::Text(format!("[ThinkWatch] {why}").into()))
         .await;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 从零起，把每条路都走一遍（DESIGN.md §9.7）。
+# 从零起，把每条路都走一遍。
 #
 # 单元测试证明不了这些，因为它们的失败模式全在**接缝上**：文件权限、
 # socket 路径长度、配置里写错一个字段名被静默吞掉、某个端点在真二进制
@@ -107,7 +107,7 @@ step "从零起"
 CFG="$THINKWATCH_HOME/config.yaml"
 "$BIN" --config "$CFG" init >/dev/null 2>&1
 [ -f "$CFG" ] && ok "init 生成了配置" || bad "init 没生成配置"
-# **明文密钥的文件必须是 0600**（§3.2）
+# **明文密钥的文件必须是 0600**
 MODE=$(stat -f '%Lp' "$CFG" 2>/dev/null || stat -c '%a' "$CFG")
 [ "$MODE" = "600" ] && ok "config.yaml 是 0600" || bad "config.yaml 权限是 $MODE，该是 600"
 
@@ -134,8 +134,8 @@ providers:
     redact: []
 # **把流量钉在 relay 上，不给故障转移留口子。**
 #
-# 两家都指着同一个假上游，而 official 的 redact 是空的（官方端点不脱，
-# §5.1）。不钉的话，relay 一次超时就会让请求转到 official，于是「中转
+# 两家都指着同一个假上游，而 official 的 redact 是空的（官方端点不脱）。
+# 不钉的话，relay 一次超时就会让请求转到 official，于是「中转
 # 看见了真 key」—— 一条安全断言被悄悄换成了它的反面，而两种失败在输出
 # 上长得一模一样。CI 上就这么红过两轮。
 #
@@ -193,7 +193,7 @@ print(rows[0].get("provider", "") if rows else "")' 2>/dev/null) \
      && [ -n "$SERVED" ] && [ "$SERVED" != "relay" ]; then
   # **区分两种失败。**「没脱敏」和「根本没走到配了脱敏的那家」是两句
   # 完全不同的话，而它们的表现一模一样：上游看见了真 key。official 的
-  # redact 故意是空的（官方端点不脱，§5.1），所以一次故障转移会把这条
+  # redact 故意是空的（官方端点不脱），所以一次故障转移会把这条
   # 安全断言悄悄变成它的反面 —— 报「中转看见了真 key」会让人去查脱敏，
   # 而该查的是为什么转移了。
   bad "这次请求由 $SERVED 服务，没走到配了脱敏的 relay —— 这一条没测到脱敏" "$R"
@@ -298,12 +298,12 @@ else
 fi
 
 # ---------------------------------------------------------------- 只有一份配置
-step "配置目录里只有一份配置文件（§3.1）"
+step "配置目录里只有一份配置文件"
 # **策略类的东西一律进 config.yaml。**这一条会被慢慢侵蚀 —— 每加一个
 # 功能都有一个「顺手开个文件放它的设置」的诱惑，而每一个单独看都很合理。
 STRAY=$(find "$THINKWATCH_HOME" -maxdepth 1 -name '*.yaml' ! -name 'config.yaml' ! -name 'pricing.yaml' 2>/dev/null)
 if [ -z "$STRAY" ]; then
-  ok "除了 config.yaml（和 §8 列明的 pricing.yaml）没有别的配置文件"
+  ok "除了 config.yaml（和 pricing.yaml）没有别的配置文件"
 else
   bad "冒出了别的配置文件" "$STRAY"
 fi
@@ -321,24 +321,24 @@ C=$(post /clients/claude-code/restore '{}')
   || bad "还原之后文件不一样了" "$(diff <(echo "$BEFORE") "$FAKE_HOME/.claude/settings.json" | head -5)"
 
 # ---------------------------------------------------------------- 资源目标
-# §4.5 写了四个数字，而在此之前**没有任何东西在守它们** —— 一个写在
+# 资源目标有四个数字，而在此之前**没有任何东西在守它们** —— 一个写在
 # 文档里、没人验的目标，和没有目标的区别只在于它让人以为验过。
-step "资源目标（§4.5）"
+step "资源目标"
 
 RSS_KB=$(ps -o rss= -p "$CORE_PID" | tr -d ' ')
 RSS_MB=$((RSS_KB / 1024))
 # 目标 < 30 MB。**留一点余量但不留太多**：卡死在 30 会让一次无关的
 # 依赖升级把 CI 弄红，而放到 100 就等于没有这个检查
 if [ "$RSS_MB" -lt 30 ]; then
-  ok "内存 ${RSS_MB} MB（§4.5 目标 < 30）"
+  ok "内存 ${RSS_MB} MB（目标 < 30）"
 elif [ "$RSS_MB" -lt 45 ]; then
   # **不给超标的数字打勾。**那等于盖章说它达标了
-  warn "内存 ${RSS_MB} MB，超出 §4.5 的 30 MB 目标" "跑过一轮请求之后量的，不是纯冷启动；40 以内不算回归"
+  warn "内存 ${RSS_MB} MB，超出 30 MB 目标" "跑过一轮请求之后量的，不是纯冷启动；40 以内不算回归"
 else
-  bad "内存 ${RSS_MB} MB，比 §4.5 的目标高出一截"
+  bad "内存 ${RSS_MB} MB，比目标高出一截"
 fi
 
-# 空闲时不写盘（§4.5 的最后一条）。**没有请求就不该有任何写入** ——
+# 空闲时不写盘（最后一条）。**没有请求就不该有任何写入** ——
 # 一个常驻进程每秒摸一次磁盘，在笔记本上就是电量
 DB_BEFORE=$(stat -f '%m %z' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo "0 0")
 sleep 3
@@ -346,7 +346,7 @@ DB_AFTER=$(stat -f '%m %z' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo "1 1")
 [ "$DB_BEFORE" = "$DB_AFTER" ] && ok "空闲 3 秒没有写盘" \
   || bad "空闲时还在写盘" "before=$DB_BEFORE after=$DB_AFTER"
 
-# 转发的额外延迟（§4.5：入站解析加路由 < 2ms、中继 < 1ms）。
+# 转发的额外延迟（入站解析加路由 < 2ms、中继 < 1ms）。
 # **和直连同一个假上游比** —— 差出来的就是我们这一层的成本。
 # 两边各打 20 次取总时间，单次的噪声比我们要量的东西还大。
 direct_ms() {
@@ -376,7 +376,7 @@ D=$(direct_ms); T=$(through_ms); OVER=$((T - D))
 if [ "$OVER" -lt 15 ]; then
   ok "经过网关比直连多 ${OVER}ms（直连 ${D}ms、经过 ${T}ms）"
 else
-  bad "经过网关多花了 ${OVER}ms，§4.5 的目标是解析加路由 < 2ms、中继 < 1ms"
+  bad "经过网关多花了 ${OVER}ms，目标是解析加路由 < 2ms、中继 < 1ms"
 fi
 
 # ---------------------------------------------------------------- 收尾

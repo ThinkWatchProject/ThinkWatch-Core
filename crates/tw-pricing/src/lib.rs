@@ -1,4 +1,4 @@
-//! 价目表（DESIGN.md §4.3.0）。
+//! 价目表。
 //!
 //! 菜单栏上那个 `$3.42` 的唯一输入。三层：
 //!
@@ -12,7 +12,7 @@
 //! 会收录它们。
 //!
 //! 贯穿这一层的一条规矩：**算不出来就说算不出来。**没有价格的模型不能
-//! 记成 0 —— 那是在撒谎，而一个会撒谎的成本面板不如没有（§4.3）。
+//! 记成 0 —— 那是在撒谎，而一个会撒谎的成本面板不如没有。
 
 pub mod name;
 
@@ -26,12 +26,12 @@ const SNAPSHOT: &[u8] = include_bytes!("../data/model_prices.json.gz");
 
 /// 快照对应的上游 commit 日期。
 ///
-/// **成本旁边要标它**（§4.3.0）：一个两个月前的价目表算出来的数字，和
+/// **成本旁边要标它**：一个两个月前的价目表算出来的数字，和
 /// 一个昨天的，可信度完全不同 —— 而用户没有别的办法知道这件事。
 pub const SNAPSHOT_DATE: &str = "2026-09-09";
 pub const SNAPSHOT_SOURCE: &str = "LiteLLM model_prices_and_context_window.json";
 
-/// 更新去哪儿拉（§4.3.0 第二层）。
+/// 更新去哪儿拉（第二层）。
 ///
 /// **写死在代码里，不从配置读。**一个「价目表源」配置项等于给了任何能
 /// 改 config.yaml 的人一个往这个进程里喂 JSON 的入口，而那份 JSON 会
@@ -41,7 +41,7 @@ pub const UPDATE_URL: &str =
 
 /// 一份拉回来的价目表**解析成表，但不落盘**。
 ///
-/// 分成「解析」和「写入」两步是 §12 要的：**先给 diff，确认才写**。
+/// 分成「解析」和「写入」两步是刻意的：**先给 diff，确认才写**。
 pub fn parse_upstream(raw: &[u8]) -> Result<HashMap<String, ModelPrice>, PricingError> {
     let parsed: HashMap<String, serde_json::Value> =
         serde_json::from_slice(raw).map_err(|e| PricingError::Snapshot(e.to_string()))?;
@@ -111,7 +111,7 @@ pub fn diff(
 ///
 /// 缓存写入分两档不是过度设计：Sonnet 4.5 的 5 分钟档是 \$3.75、1 小时档
 /// 是 \$6.00。**只用 5 分钟档会让开了 1 小时 TTL 的用户被系统性低估
-/// 60%**，而那是一个看起来很确定的数字（§4.3.0）。
+/// 60%**，而那是一个看起来很确定的数字。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 // 覆盖文件里写错一个字段名（`inptu`）被静默忽略的话，用户会以为自己
 // 已经改过价格了，而面板上的数字一直是错的。
@@ -145,7 +145,7 @@ pub struct Usage {
     pub cache_1h: bool,
 }
 
-/// 成本三态（§4.3）。
+/// 成本三态。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cost {
     /// 上游给了 usage，价目表里有这个模型 —— 这是个可以相加的数
@@ -213,7 +213,7 @@ pub enum PricingError {
 ///   gpt-4o: null
 ///
 /// # 按上游分别写。**同一个模型在不同家不是同一个价** —— 中转站常常
-/// # 打折，而这是 `cheapest` 策略（§3.5）唯一的判据来源
+/// # 打折，而这是 `cheapest` 策略唯一的判据来源
 /// providers:
 ///   relay-cn:
 ///     claude-sonnet-4-5:
@@ -340,11 +340,11 @@ impl Prices {
     /// 数字对他是错的。
     /// 这家跑这个模型的单价。**比通用那份优先** —— 它更具体。
     ///
-    /// 用在 `cheapest` 策略上（§3.5）。没有这一层的话，同一个模型在
+    /// 用在 `cheapest` 策略上。没有这一层的话，同一个模型在
     /// 官方和中转站算出来是同一个价，「最便宜」就没有任何判据。
     pub fn get_for(&self, provider: &str, model: &str) -> Option<&ModelPrice> {
         if let Some(t) = self.per_provider.get(provider) {
-            // **归一化走计价那一套**（§4.3.0）：两套规则会造出「能用但
+            // **归一化走计价那一套**：两套规则会造出「能用但
             // 算不出价钱」这种自相矛盾
             for c in name::candidates(model) {
                 if let Some(mp) = t.get(&c) {
@@ -416,7 +416,7 @@ impl Prices {
         let cache_read_rate = p.cache_read.unwrap_or(input_rate);
         let cache_write_rate = if u.cache_1h {
             // 1 小时档没有就退回 5 分钟档，再退回输入价。**退回时只会
-            // 低估** —— 所以这条要在文档里说清楚，见 §4.3.0。
+            // 低估** —— 所以这条要在文档里说清楚。
             p.cache_write_1h.or(p.cache_write_5m).unwrap_or(input_rate)
         } else {
             p.cache_write_5m.unwrap_or(input_rate)
@@ -440,7 +440,7 @@ impl Prices {
     ///
     /// **算的是「如果这些 token 没命中缓存，要多花多少」** —— 而不是
     /// 「缓存读花了多少」。用户想知道的是那个差额：cache read 是 0.1 倍
-    /// 单价，所以省下的是 0.9 倍（§4.4）。
+    /// 单价，所以省下的是 0.9 倍。
     ///
     /// 没有价格、或者这家不按 token 计费时是 `None`。**不是 0** ——
     /// 「省了 0 元」和「算不出来省了多少」是两句不同的话。
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn the_one_hour_cache_tier_is_there_and_costs_more_than_five_minutes() {
-        // **这是选 LiteLLM 的决定性理由**（§4.3.0）。少了它，开 1 小时
+        // **这是选 LiteLLM 的决定性理由**。少了它，开 1 小时
         // TTL 的用户会被系统性低估 60%，而那是个看起来很确定的数字。
         let p = prices();
         let s = p.get("claude-sonnet-4-5").unwrap();
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn a_model_with_no_price_is_unpriced_not_zero() {
         // **成本三态的第三态。**当成 0 会让总额悄悄偏低，而用户没有任何
-        // 线索知道少算了什么（§4.3）。
+        // 线索知道少算了什么。
         let p = prices();
         let c = p.cost("某个中转站自己起的名字", &Usage::default(), false);
         match c {
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn an_estimated_usage_yields_an_estimated_cost() {
-        // 估算值不能混进「今日花费」的精确数字里假装准确（§4.3）。
+        // 估算值不能混进「今日花费」的精确数字里假装准确。
         let p = prices();
         let u = Usage {
             input: 1000,
@@ -690,14 +690,14 @@ mod tests {
     #[test]
     fn the_snapshot_date_is_available_because_it_has_to_be_shown() {
         // 一个两个月前的价目表算出来的数字，和一个昨天的，可信度完全
-        // 不同 —— 而用户没有别的办法知道这件事（§4.3.0）。
+        // 不同 —— 而用户没有别的办法知道这件事。
         assert_eq!(prices().snapshot_date, SNAPSHOT_DATE);
         assert_eq!(SNAPSHOT_DATE.len(), 10, "日期得是 YYYY-MM-DD");
     }
 
     #[test]
     fn cache_reads_are_much_cheaper_than_fresh_input() {
-        // 这是整个 prompt cache 论证的数字基础（§3.4：命中与否成本差
+        // 这是整个 prompt cache 论证的数字基础（命中与否成本差
         // 5 到 10 倍）。数据集要是把它记反了，我们所有关于缓存的建议
         // 都是错的。
         let p = prices();
@@ -773,7 +773,7 @@ mod snapshot_invariants {
 
     /// 快照里那几个主力模型的绝对价格。
     ///
-    /// **和厂商官方定价页对过**（§4.3.0 的发版前交叉校验）。数字变了要
+    /// **和厂商官方定价页对过**（发版前交叉校验）。数字变了要
     /// 人来确认，而不是跟着上游悄悄改 —— 一个自动跟随的数字，出错时没有
     /// 任何人会发现。
     #[test]
@@ -915,7 +915,7 @@ mod verified_tests {
             .expect("verified.yaml 自己解析不了")
     }
 
-    /// **这是挡住「打包了错数据」的唯一手段**（§4.3.0）。
+    /// **这是挡住「打包了错数据」的唯一手段**。
     ///
     /// 换快照之后这条红了，说明上游改了价。要做的**不是**改
     /// `verified.yaml` 让它闭嘴，而是打开定价页看一眼 —— 文件头上写了
@@ -980,7 +980,7 @@ mod verified_tests {
     /// **这条测试在说一句实话，不是在检查什么。**
     ///
     /// 现在的 `verified.yaml` 是从快照里抄下来的，所以上面那条比对只能
-    /// 抓住「快照漂了」，抓不住「快照一开始就错了」。§4.3.0 说得很清楚：
+    /// 抓住「快照漂了」，抓不住「快照一开始就错了」。而这一点很清楚：
     /// 和另一个第三方数据集对，只是把赌注换个地方押 —— 而和自己对，
     /// 连换地方都没换。
     ///
@@ -1002,7 +1002,7 @@ mod verified_tests {
     #[test]
     fn the_check_date_is_a_real_date_so_staleness_is_visible() {
         // **一个没有日期的「已核对」等于没核对。**半年前对过一次，和
-        // 昨天对过一次，可信度完全不同（§4.3.0 的同一条道理）。
+        // 昨天对过一次，可信度完全不同（同一条道理）。
         let v = verified();
         assert_eq!(v.checked_on.len(), 10, "{}", v.checked_on);
         assert!(
@@ -1020,7 +1020,7 @@ mod saving_tests {
     #[test]
     fn a_cache_hit_saves_the_difference_not_the_whole_price() {
         // **用户想知道的是那个差额**：cache read 是 0.1 倍单价，所以省下
-        // 的是 0.9 倍，不是全部（§4.4）。
+        // 的是 0.9 倍，不是全部。
         let p = Prices::builtin().unwrap();
         let u = Usage {
             cache_read: 100_000,
@@ -1042,7 +1042,7 @@ mod saving_tests {
 
     #[test]
     fn an_unpriced_model_cannot_say_how_much_was_saved() {
-        // **「省了 0 元」和「算不出来省了多少」是两句不同的话**（§4.3）。
+        // **「省了 0 元」和「算不出来省了多少」是两句不同的话**。
         let p = Prices::builtin().unwrap();
         let u = Usage {
             cache_read: 1000,
@@ -1082,7 +1082,7 @@ mod saving_tests {
     #[test]
     fn a_relay_can_have_its_own_price_for_the_same_model() {
         // **没有这一层，同一个模型在官方和中转站算出来是同一个价，
-        // 而 `cheapest` 就没有任何判据**（§3.5）
+        // 而 `cheapest` 就没有任何判据**
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("pricing.yaml");
         std::fs::write(

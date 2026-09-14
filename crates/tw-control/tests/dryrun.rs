@@ -1,4 +1,4 @@
-//! 路由试算（§3.4）。
+//! 路由试算。
 //!
 //! 这些测试盯的是**「为什么没走我以为的那条」**能不能答出来 —— 只答
 //! 「走了哪条」是不够的那半个答案。
@@ -83,7 +83,7 @@ async fn a_plain_request_falls_through_to_the_catch_all() {
     assert_eq!(r.rule.as_deref(), Some("其余都试试"));
     assert_eq!(r.via_group.as_deref(), Some("都试试"));
     assert_eq!(r.candidates.len(), 2);
-    // **要直说 —— 它决定账单。**负载均衡会让 prompt cache 不稳定（§3.4）
+    // **要直说 —— 它决定账单。**负载均衡会让 prompt cache 不稳定
     assert!(r.hurts_cache, "load_balance 会打散缓存，试算里就该说");
 }
 
@@ -155,7 +155,7 @@ async fn a_set_only_rule_still_shows_up_as_matched_and_says_what_it_changes() {
         "{:?}",
         r.set
     );
-    // 换模型会作废整个缓存，而那在长会话里可能比不换还贵（§3.4）
+    // 换模型会作废整个缓存，而那在长会话里可能比不换还贵
     assert!(
         r.set.iter().any(|s| s.contains("prompt cache")),
         "{:?}",

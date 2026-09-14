@@ -1,4 +1,4 @@
-//! 认得出哪些东西是凭据（DESIGN.md §5.1）。
+//! 认得出哪些东西是凭据。
 //!
 //! **桌面场景要脱的东西和企业完全不同。**企业关心合规 —— 客户的身份证
 //! 号、手机号不能流到第三方模型。个人开发者关心的是：**我的 API key、
@@ -6,7 +6,7 @@
 //! 一条 PII 规则都没有。
 //!
 //! 贯穿全文件的一条：**宁可漏，不可吵。**一个天天误报的安全功能，用户
-//! 第二天就关了（§5.0）——而关掉之后，它连该抓的那次也抓不到了。所以
+//! 第二天就关了 ——而关掉之后，它连该抓的那次也抓不到了。所以
 //! 每一条规则都要求「前缀明确」或者「结构上无法误认」，「一长串看起来
 //! 随机的字符」这种判据一条都不收。
 
@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-/// 脱哪一类。**配置里按类别开关**，不是一条条正则（§5.1）。
+/// 脱哪一类。**配置里按类别开关**，不是一条条正则。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -234,7 +234,7 @@ fn looks_like_jwt(tok: &str) -> bool {
 /// `scheme://user:pass@host` 里的 `pass`。
 ///
 /// **只换口令那一段。**整条换掉的话，模型看到的是一个它读不懂的东西，
-/// 而你问的可能正是「这个连接串的 host 写对了吗」—— §5.1 的原则是可逆
+/// 而你问的可能正是「这个连接串的 host 写对了吗」 —— 原则是可逆
 /// 替换而不是删除，理由完全一样：删掉语义，模型就开始瞎猜。
 fn conn_strings(text: &str, out: &mut Vec<Hit>) {
     let bytes = text.as_bytes();
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn only_the_kinds_that_were_asked_for_are_scanned() {
-        // §5.1 的核心：**走官方端点不该脱敏，走中转站才脱。**
+        // 核心：**走官方端点不该脱敏，走中转站才脱。**
         let t = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA 和 10.0.0.1";
         assert_eq!(scan(t, &[]).len(), 0);
         assert_eq!(scan(t, &[Kind::ApiKeys]).len(), 1);
@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn the_spans_can_actually_be_used_to_slice_multibyte_text() {
-        // 这个项目已经被字节切片坑过三次（§9.7）。命中点前后全是中文。
+        // 这个项目已经被字节切片坑过三次。命中点前后全是中文。
         let t = "这是一段很长的中文说明，里面混着一把 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBB，后面继续写中文";
         let got = scan(t, &kinds());
         assert_eq!(got.len(), 1);

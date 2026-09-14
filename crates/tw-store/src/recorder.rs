@@ -1,6 +1,6 @@
-//! 把事件缝成一行，算好钱，落库（DESIGN.md §8、§4.3）。
+//! 把事件缝成一行，算好钱，落库。
 //!
-//! **它跑在数据面之外。**观测挂了，代理照跑（§4.7）—— 所以这里的每一个
+//! **它跑在数据面之外。**观测挂了，代理照跑 —— 所以这里的每一个
 //! 错误都只记一行日志，一个都不往回抛。
 //!
 //! 一次请求由四类事件描述（开始、响应头、结束、失败），它们分别到达，
@@ -19,7 +19,7 @@ use crate::disk::{self, DiskLevel};
 #[derive(Debug, Clone)]
 struct Partial {
     at_ms: i64,
-    /// 响应里有几个工具调用、命中几条规则（§5.2 防线三）
+    /// 响应里有几个工具调用、命中几条规则（防线三）
     tool_calls: Option<i64>,
     flagged: Option<i64>,
     client: String,
@@ -32,7 +32,7 @@ struct Partial {
     ttfb_ms: Option<i64>,
     /// 路由决策，JSON。**在结束事件之前到达** —— 尝试链走完才发它
     routing: Option<String>,
-    /// 服务它的那家怎么收钱（§4.3.1）
+    /// 服务它的那家怎么收钱
     billing: String,
 }
 
@@ -181,7 +181,7 @@ impl Recorder {
                     // **归到实际服务的那家，不是第一个候选。**
                     // `RequestStarted` 发出时只知道候选链的头一个，而故障
                     // 转移之后那一家恰恰是失败的那一家。不改的话成本记在
-                    // 没服务的上游头上，而「哪家上游慢」（§4.6）会把成功
+                    // 没服务的上游头上，而「哪家上游慢」会把成功
                     // 那一跳的延迟算给超时的那一家 —— 两个数字都指向错的
                     // 上游，而且没有任何东西会提示它们错了。
                     //
@@ -231,12 +231,12 @@ impl Recorder {
                 });
                 // **上游没给 usage 就没有成本。**估算是 M3 后面的事
                 // （tiktoken / count_tokens），而在那之前记一笔 0 是在
-                // 撒谎（§4.3）。
+                // 撒谎。
                 // **不引 tw-config** —— 存储层不该知道配置的形状。这个
                 // 字符串是事件契约的一部分，比较它就够了。
                 let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
                 // **订阅型不按价目表算钱。**订阅制的边际成本是零，按 API
-                // 价目表乘出来的数字是纯虚构的（§4.3.1）—— 而它会混进
+                // 价目表乘出来的数字是纯虚构的 —— 而它会混进
                 // 「今日花费」里，把一个诚实的面板变成一个编出来的。
                 let cost = if counts_toward_money {
                     u.map(|u| self.prices.cost(&p.model, &u, false))
@@ -250,7 +250,7 @@ impl Recorder {
                     // 三种都是「这笔账不在这个维度上」
                     Some(Cost::Unpriced { .. }) | None => (None, false),
                 };
-                // 缓存命中省下了多少（§4.4）。**在这里算，不在查询时算**
+                // 缓存命中省下了多少。**在这里算，不在查询时算**
                 // —— 查询时算意味着要把价目表带进 SQL，而价目表会变，
                 // 那样「上周省了多少」会随着一次价格更新悄悄改变。
                 let cache_saved_micros = if counts_toward_money {
@@ -327,7 +327,7 @@ impl Recorder {
                 at_ms,
             } => {
                 // 成本 0、延迟 0，**而且明确标 local** —— 汇总会把它们
-                // 排除在平均值之外，同时单独计数（§4.8）。
+                // 排除在平均值之外，同时单独计数。
                 self.write(RequestRow {
                     id: *id as i64,
                     at_ms: *at_ms as i64,
@@ -367,7 +367,7 @@ impl Recorder {
             } => {
                 // **它自己一张表。**一次请求可能同时带出好几种凭据，
                 // 而「过去 7 天有 3 个请求把 key 发给了 relay-cn」这句话
-                // 要按 (provider, kind) 分组数（§5.0）。
+                // 要按 (provider, kind) 分组数。
                 if let Err(e) = self.db.insert_leak(&crate::db::Leak {
                     at_ms: *at_ms as i64,
                     request_id: *id as i64,
@@ -537,7 +537,7 @@ mod tests {
             "转移之后这一行还归给第一个候选，成本和延迟都会记到没服务的那家头上"
         );
         // 尝试链本身一个字都不能少 —— 归属改了，但「试过谁、为什么失败」
-        // 是排查的全部价值（§4.2）。
+        // 是排查的全部价值。
         let routing: tw_api::RoutingView =
             serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
         assert_eq!(routing.attempts.len(), 2);
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn a_model_with_no_price_gets_no_cost_rather_than_zero() {
-        // **成本三态的第三态。**记成 0 会让总额悄悄偏低（§4.3）。
+        // **成本三态的第三态。**记成 0 会让总额悄悄偏低。
         let (_d, mut r) = rec();
         r.on_event(&started(1, "中转站自己起的名字"));
         r.on_event(&finished(
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn an_upstream_that_gives_no_usage_gets_no_cost_either() {
-        // 记一笔 0 是在撒谎（§4.3）。
+        // 记一笔 0 是在撒谎。
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&finished(1, None));
@@ -777,8 +777,8 @@ mod billing_tests {
 
     #[test]
     fn a_subscription_call_does_not_get_a_made_up_price() {
-        // **订阅制的边际成本是零，按 API 价目表乘出来的数字是纯虚构的**
-        // （§4.3.1）。混进「今日花费」里，就把一个诚实的面板变成了一个
+        // **订阅制的边际成本是零，按 API 价目表乘出来的数字是纯虚构的**。
+        // 混进「今日花费」里，就把一个诚实的面板变成了一个
         // 编出来的。
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
@@ -803,7 +803,7 @@ mod billing_tests {
     #[test]
     fn the_summary_keeps_subscription_calls_out_of_the_money_but_counts_them() {
         // 「混了订阅上游之后，Dashboard 的今日花费要拆成三栏：实测计费、
-        // 估算计费、订阅调用量」（§4.3.1）。
+        // 估算计费、订阅调用量」。
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&routed(1, "per-token"));
@@ -841,7 +841,7 @@ mod cache_saving_tests {
 
     #[test]
     fn a_cache_hit_records_how_much_it_saved() {
-        // §4.4：Dashboard 上要有独立的「缓存节省了多少钱」。而算的是
+        // Dashboard 上要有独立的「缓存节省了多少钱」。而算的是
         // **差额** —— 「如果这些 token 没命中缓存，要多花多少」。
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
@@ -879,7 +879,7 @@ mod cache_saving_tests {
 
     #[test]
     fn an_unpriced_model_cannot_say_how_much_the_cache_saved() {
-        // **「省了 0 元」和「算不出来省了多少」是两句不同的话**（§4.3）。
+        // **「省了 0 元」和「算不出来省了多少」是两句不同的话**。
         let (_d, mut r) = rec();
         r.on_event(&started(1, "中转站自己起的名字"));
         r.on_event(&finished(

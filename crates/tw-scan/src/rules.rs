@@ -1,4 +1,4 @@
-//! 规则集（DESIGN.md §5.3）。
+//! 规则集。
 //!
 //! 内置那一份编译进二进制，用户的增删写在 `config.yaml` 的
 //! `security.scan_rules` 里。
@@ -7,7 +7,7 @@
 //!
 //! 第一版是「用户那份文件存在就整份替换内置的」，理由是「一份规则集要能
 //! 被完整地读懂和审查」。那个理由没错，结论错了 —— 它有和 cc-switch 那个
-//! 白名单一模一样的毛病（§7.11）：
+//! 白名单一模一样的毛病：
 //!
 //! > 用户复制一份内置规则、改两条之后，**他那份就永远停在复制的那一刻
 //! > 了**。我们后来加的每一条新攻击模式都到不了他机器上，而他不会察觉。
@@ -16,12 +16,12 @@
 //!
 //! # 为什么不是另一个文件
 //!
-//! §3.1：`config.yaml` 是唯一的配置文件。规则集是用户会去调的**策略**，
-//! 不是数据 —— 而住在 `config.yaml` 里还白捡了变更历史和一键回滚
-//! （§3.8），单独一个文件那两样都没有。
+//! `config.yaml` 是唯一的配置文件。规则集是用户会去调的**策略**，
+//! 不是数据 —— 而住在 `config.yaml` 里还白捡了变更历史和一键回滚，
+//! 单独一个文件那两样都没有。
 //!
 //! （`pricing.yaml` 是另一回事：那是个十万条的厂商数据集，用户改的是
-//! 其中几行数据。§8 的目录表里把它单列了出来。）
+//! 其中几行数据。目录表里把它单列了出来。）
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,7 @@ pub struct RuleSpec {
     pub why: String,
     /// `high` 或 `medium`。不写按 medium 算。
     ///
-    /// **只有 high 会在 §5.2 里切断流。**分级的判据是「它能不能一步拿到
+    /// **只有 high 会在切断流。**分级的判据是「它能不能一步拿到
     /// 执行权或者拿走凭据」，不是「它听起来多可怕」——
     /// `rm -rf` 很吓人，但它毁的是你自己的文件，不会把你的机器交给别人。
     #[serde(default)]
@@ -68,7 +68,7 @@ pub struct Rule {
     pub re: Regex,
     /// `injection` 还是 `dangerous`
     pub group: &'static str,
-    /// 命中之后该不该动手。**只有 high 会切断流**（§5.2）
+    /// 命中之后该不该动手。**只有 high 会切断流**
     pub high: bool,
     /// 用户自己加的，不是内置的。**界面上要分得开**
     pub custom: bool,
@@ -120,7 +120,7 @@ fn compile(spec: &RuleSpec, group: &'static str, custom: bool, out: &mut Rules) 
             high: spec.level.as_deref() == Some("high"),
             custom,
         }),
-        // **写坏一条不该让整套停摆**（§5.3）：一个因为配置写错就整个不
+        // **写坏一条不该让整套停摆**：一个因为配置写错就整个不
         // 工作的安全功能等于没有。但它必须**大声**说出来 —— 静默失效
         // 比没有更糟，因为用户以为它在
         Err(e) => out.warnings.push(format!(
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn a_user_rule_is_added_on_top_of_the_builtin_ones() {
         // **加法，不是替换。**替换会让用户那份永远停在复制的那一刻，
-        // 我们后来加的每一条新攻击模式都到不了他机器上（§7.11 的白名单）。
+        // 我们后来加的每一条新攻击模式都到不了他机器上（白名单）。
         let n = r().rules.len();
         let rs = build(&tw_config::ScanRules {
             add: vec![tw_config::ScanRule {
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn a_broken_user_rule_is_skipped_loudly_and_the_rest_keep_working() {
-        // **一个因为配置写错就整个不工作的安全功能等于没有**（§5.3）。
+        // **一个因为配置写错就整个不工作的安全功能等于没有**。
         // 但静默失效比没有更糟 —— 用户以为它在。
         let n = r().rules.len();
         let rs = build(&tw_config::ScanRules {
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn there_is_no_second_config_file_any_more() {
-        // §3.1：`config.yaml` 是唯一的配置文件。规则住在它的
+        // `config.yaml` 是唯一的配置文件。规则住在它的
         // `security.scan_rules` 里，不再有 `~/.thinkwatch/scan-rules.yaml`。
         let src = std::fs::read_to_string("src/rules.rs").unwrap();
         let code = src.split("#[cfg(test)]").next().unwrap();

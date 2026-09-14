@@ -1,7 +1,7 @@
 //! 谁能连这个网关。
 //!
-//! 前面的 auth 管「这把钥匙是谁」，这一层管「这个地址能不能连过来」
-//! （DESIGN.md §5.4）。两件事分开是因为它们的失败含义不同：钥匙不对是
+//! 前面的 auth 管「这把钥匙是谁」，这一层管「这个地址能不能连过来」。
+//! 两件事分开是因为它们的失败含义不同：钥匙不对是
 //! 配置问题，地址不对是安全边界问题。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -105,7 +105,7 @@ impl AllowList {
     /// 空列表 = 全放行。
     ///
     /// 这看起来危险，但它只在 `bind: loopback` 下成立 —— 那时候能连过来
-    /// 的本来就只有本机。非 loopback 的默认值由配置层填成私网段（§5.4）。
+    /// 的本来就只有本机。非 loopback 的默认值由配置层填成私网段。
     pub fn parse(entries: &[String]) -> Result<Self, CidrError> {
         Ok(Self {
             ranges: entries

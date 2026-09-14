@@ -1,7 +1,7 @@
 //! 并发上限：**排队，不要拒绝**。
 //!
 //! 一个失控的脚本能在几秒内打出几百个请求，打爆额度，也会撞上游的限流。
-//! 所以要有上限（DESIGN.md §4.7）。
+//! 所以要有上限。
 //!
 //! 但**超限时应该排队而不是拒绝**：客户端收到 429 通常不会优雅重试，
 //! 你会看到一堆莫名其妙的失败；排队则只是变慢。这个区别对 Claude Code
@@ -27,7 +27,7 @@ pub enum LimitError {
     QueueFull(usize),
 }
 
-/// 三个维度叠加，取最严的那个（§4.7）。
+/// 三个维度叠加，取最严的那个。
 pub struct Gate {
     limits: Limits,
     global: Arc<Semaphore>,
@@ -70,7 +70,7 @@ impl Gate {
 
     /// 取一张通行证，排队等着。
     ///
-    /// `client_limit` 是这个客户端自己的上限（§3.3.1 的 `max_concurrent`）。
+    /// `client_limit` 是这个客户端自己的上限（`max_concurrent`）。
     /// 监听局域网时这是刚需 —— **某台机器上的失控脚本不该能占满全部并发**。
     pub async fn acquire(
         &self,

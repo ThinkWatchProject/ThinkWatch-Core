@@ -1,4 +1,4 @@
-//! M5 验收：出站脱敏与回显还原（DESIGN.md §5.1）。
+//! M5 验收：出站脱敏与回显还原。
 //!
 //! 验收标准的原话是：**走中转时密钥被替换成占位符且回显能还原，走官方时
 //! 原样透传。**这个文件就在证明那一句。
@@ -163,7 +163,7 @@ async fn a_relay_never_sees_the_key_but_the_client_gets_it_back() {
 #[tokio::test]
 async fn the_official_endpoint_gets_the_body_byte_for_byte() {
     // **验收标准的后半句。**你让 Claude Code 调试一个 .env 问题，
-    // 它得真看见里面的值才帮得上忙（§5.1）。
+    // 它得真看见里面的值才帮得上忙。
     let (up, seen) = start_upstream(false).await;
     let gw = start_gateway(vec![provider("official", up, true)], SecurityMode::Enforce).await;
 
@@ -200,7 +200,7 @@ async fn a_placeholder_cut_into_single_characters_still_comes_back_whole() {
 
 #[tokio::test]
 async fn observe_mode_changes_nothing_on_the_wire() {
-    // §5.0：观察态**只记录，不改变任何行为**。出厂默认停在这里。
+    // 观察态**只记录，不改变任何行为**。出厂默认停在这里。
     let (up, seen) = start_upstream(false).await;
     let gw = start_gateway(vec![provider("relay", up, false)], SecurityMode::Observe).await;
 
@@ -255,7 +255,7 @@ async fn failing_over_from_official_to_a_relay_redacts_on_the_second_hop() {
 #[tokio::test]
 async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
     // **界面上必须能看到脱敏发生了什么**，否则用户会怀疑是脱敏搞坏了
-    // 功能然后把它关掉（§5.1）。但事件里不能带原值。
+    // 功能然后把它关掉。但事件里不能带原值。
     let (up, _) = start_upstream(false).await;
     let cfg = Config {
         version: 1,

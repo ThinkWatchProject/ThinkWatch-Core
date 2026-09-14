@@ -1,6 +1,6 @@
 //! 配置：schema、加载、校验、初始生成。
 //!
-//! 只有一份文件（DESIGN.md §3.1），密钥明文写在里面（§3.2）。
+//! 只有一份文件，密钥明文写在里面。
 //! M0 只做只读加载；双向同步是 M2 的事。
 
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
 
 /// 配置 schema 的版本。和应用的 CalVer 是两回事 —— 这个只决定要不要
-/// 跑迁移（§9.6）。
+/// 跑迁移。
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub const DEFAULT_GATEWAY_PORT: u16 = 8788;
@@ -40,12 +40,12 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 8788;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
-    /// **默认值不写进文件。** §3.3 承诺第一天的配置是六行，而每加一个
+    /// **默认值不写进文件。**第一天的配置只有六行，而每加一个
     /// 带默认值的字段就会往文件里多堆几行 —— 用户打开配置看到一屏自己
     /// 没配过的东西，就分不清哪些是他的决定、哪些只是默认。
     #[serde(default, skip_serializing_if = "is_default")]
     pub listen: Listen,
-    /// 客户端身份。密钥即身份（§3.3.1）—— 不是「先认证再看是谁」，
+    /// 客户端身份。密钥即身份 —— 不是「先认证再看是谁」，
     /// 而是「这把钥匙就是这个人」。
     ///
     /// **不写这一段不是语法错误。**serde 的「missing field `clients`」
@@ -53,24 +53,24 @@ pub struct Config {
     /// 一把」能。缺字段的判断交给它。
     #[serde(default)]
     pub clients: Vec<Client>,
-    /// **同样可以整段不写。**§3.3 承诺第一天的配置是六行，而零 provider
+    /// **同样可以整段不写。**第一天的配置只有六行，而零 provider
     /// 是一个合法状态（首次运行就是它）—— 逼用户写一行 `providers: []`
     /// 只是为了让解析器高兴。
     #[serde(default)]
     pub providers: Vec<Provider>,
     /// 策略组。不写就没有 —— 层 0（只配 provider）是完全合法的配置，
-    /// 引擎内部会把它展开（§3.4）。
-    /// 出站代理。声明一次到处引用（§3.7）。
+    /// 引擎内部会把它展开。
+    /// 出站代理。声明一次到处引用。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<Proxy>,
-    /// 客户端自己发的辅助请求怎么处理（§4.8）。默认只拦 A 类。
+    /// 客户端自己发的辅助请求怎么处理。默认只拦 A 类。
     #[serde(default, skip_serializing_if = "is_default")]
     pub client_probes: ClientProbes,
-    /// 三道防线（§5）。**出厂时都停在「观察」** —— 只记录，不改变
+    /// 三道防线。**出厂时都停在「观察」** —— 只记录，不改变
     /// 任何行为。
     #[serde(default, skip_serializing_if = "is_default")]
     pub security: Security,
-    /// 并发上限。不写就是默认值（§4.7）。
+    /// 并发上限。不写就是默认值。
     #[serde(default, skip_serializing_if = "is_default")]
     pub limits: Limits,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -152,7 +152,7 @@ pub struct Listen {
 #[serde(deny_unknown_fields)]
 pub struct GatewayListen {
     /// loopback | lan | all | 具体 IP。默认 loopback —— 学 Surge，
-    /// 但默认值要保守（§5.4）。
+    /// 但默认值要保守。
     #[serde(default)]
     pub bind: Bind,
     #[serde(default = "default_port")]
@@ -205,14 +205,14 @@ impl Bind {
         match self {
             Bind::Loopback => "127.0.0.1",
             // lan 和 all 在监听层是同一件事；区别在 allow_from 的默认
-            // 值和 UI 上的措辞（§5.4）。
+            // 值和 UI 上的措辞。
             Bind::Lan | Bind::All => "0.0.0.0",
         }
     }
 
     /// 非 loopback 吗。
     ///
-    /// **这个判断决定了两件强制行为**（§5.4）：密钥校验不可关闭，
+    /// **这个判断决定了两件强制行为**：密钥校验不可关闭，
     /// 以及 `allow_from` 为空时自动填私网段。
     pub fn is_exposed(&self) -> bool {
         !matches!(self, Bind::Loopback)
@@ -222,7 +222,7 @@ impl Bind {
 impl GatewayListen {
     /// 实际生效的来源白名单。
     ///
-    /// **`lan` / `all` 且用户没写白名单时，默认填私网段**（§5.4）——
+    /// **`lan` / `all` 且用户没写白名单时，默认填私网段** ——
     /// 而不是放行所有。想放开得手动写 `0.0.0.0/0`，那时他至少知道自己
     /// 做了什么。
     pub fn effective_allow_from(&self) -> Vec<String> {
@@ -240,11 +240,11 @@ impl GatewayListen {
 #[serde(deny_unknown_fields)]
 pub struct Client {
     pub name: String,
-    /// 这个客户端自己的并发上限。**监听局域网时是刚需**（§4.7）——
+    /// 这个客户端自己的并发上限。**监听局域网时是刚需** ——
     /// 某台机器上的失控脚本不该能占满全部并发。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
-    /// 这个客户端能看到哪些模型（§3.9）。
+    /// 这个客户端能看到哪些模型。
     ///
     /// **三种状态语义分明**，因为 one-api 和 new-api 在这里正好相反：
     ///
@@ -254,28 +254,28 @@ pub struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow: Option<Vec<String>>,
     /// 网关密钥。`tw-` 前缀是刻意的：用户在客户端配置里看到它时，
-    /// 一眼就知道这不是某个上游的真 key（§5.4）。
+    /// 一眼就知道这不是某个上游的真 key。
     pub key: String,
 }
 
 /// 密钥怎么来。
 ///
-/// 两种形态：绝大多数人写一个字符串就完了（§3.2 明确说了密钥就明文写在
+/// 两种形态：绝大多数人写一个字符串就完了（明确说了密钥就明文写在
 /// 配置里，不做 keychain），字符串里可以带 `${ENV}`；另一种是 OAuth，
 /// 带自动刷新。
 ///
 /// serde 的 untagged 让第一种是裸字符串 —— 配置文件里看不出 `${ENV}`
 /// 和明文的区别，也不该看出。
 ///
-/// **没有「跑一条命令拿密钥」这一类，而且不会有**（§3.2）：配置文件
-/// 不该能执行程序 —— §3.1 把「配置被同步、被分享、被 AI 改」当成目标
+/// **没有「跑一条命令拿密钥」这一类，而且不会有**：配置文件
+/// 不该能执行程序 —— 「配置被同步、被分享、被 AI 改」都是目标
 /// 场景，那时抄一份配置就等于跑一段代码。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Secret {
     /// 明文，或含 `${ENV}` 的字符串
     Literal(String),
-    /// OAuth，带自动刷新（§3.6）。
+    /// OAuth，带自动刷新。
     OAuth { oauth: OAuth },
     /// 什么形状都没匹配上。**存在的唯一理由是报一句人话。**
     ///
@@ -291,12 +291,12 @@ pub enum Secret {
     Unknown(serde_yaml_ng::Value),
 }
 
-/// OAuth 凭据（§3.6 第 3 类）。
+/// OAuth 凭据（第 3 类）。
 ///
 /// # 轮换
 ///
 /// 很多 OAuth2 服务器每次刷新都换发一个新的 refresh token 并作废旧的。
-/// 我们**把新的写回 config.yaml**（§3.6）—— 那是一次用户没要求的写入，
+/// 我们**把新的写回 config.yaml** —— 那是一次用户没要求的写入，
 /// 但不写回更糟：**换发新的那一刻旧的已经在服务端作废了**，不写回等于
 /// 让配置文件从那一秒起就是坏的，只是症状延迟到下一次重启。
 ///
@@ -336,7 +336,7 @@ impl OAuth {
 
 /// `30s` / `5m` / `1h`。不带单位按秒。
 ///
-/// 不发明一套时长语言，只认这三个后缀 —— §3.6 的示例写的就是 `5m`。
+/// 不发明一套时长语言，只认这三个后缀 —— 示例写的就是 `5m`。
 pub fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last()? {
@@ -430,9 +430,9 @@ pub enum SecretResolveError {
 pub struct Provider {
     pub name: String,
     pub base_url: String,
-    /// 明文、`${ENV}`、或 `{ oauth: {...} }`。见 §3.2 —— 不做 keychain。
+    /// 明文、`${ENV}`、或 `{ oauth: {...} }`。**不做 keychain。**
     pub key: Secret,
-    /// 不写就从 base_url 猜（§3.3 的最小配置）。
+    /// 不写就从 base_url 猜（最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
     /// 代理名，或内置的 `direct` / `system`。
@@ -440,19 +440,19 @@ pub struct Provider {
     /// **默认 `direct` 而不是 `system`**：显式优于隐式。默认跟随系统的
     /// 话，用户在系统里开了全局代理，本地 Ollama 就会莫名连不上，而
     /// 配置文件里看不出任何线索。
-    /// 探测不到时的兜底清单（§3.9）。
+    /// 探测不到时的兜底清单。
     ///
     /// 有些中转站没实现 `/v1/models`。**这是 provider 级的「这家有什么」，
     /// 不是全局的「我们对外暴露什么」** —— 那个由汇总推导出来。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
-    /// 这家怎么收钱（§4.3.1）。
+    /// 这家怎么收钱。
     ///
-    /// **不写就自动判**：响应头里报过订阅额度的就是订阅型（§4.3.2）。
-    /// 那个信号一直在我们手上，不该变成一个用户要填的字段（§0.6）。
+    /// **不写就自动判**：响应头里报过订阅额度的就是订阅型。
+    /// 那个信号一直在我们手上，不该变成一个用户要填的字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<Billing>,
-    /// 发给这家之前，把哪几类东西换成占位符（§5.1）。
+    /// 发给这家之前，把哪几类东西换成占位符。
     ///
     /// **不写就按 base_url 判**：官方端点不脱，其余脱默认那几类。理由很
     /// 实在 —— 你让 Claude Code 调试一个 `.env` 问题，它得真看见里面的值
@@ -460,7 +460,7 @@ pub struct Provider {
     /// 自废武功。而中转站是完整的中间人。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redact: Option<Vec<tw_redact::rules::Kind>>,
-    /// 这家可不可信（§5.2）。**不写就按 base_url 判。**
+    /// 这家可不可信。**不写就按 base_url 判。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<Trust>,
     #[serde(default = "default_proxy", skip_serializing_if = "is_direct")]
@@ -469,9 +469,9 @@ pub struct Provider {
     pub on_proxy_fail: OnProxyFail,
 }
 
-/// 这家上游可不可信（§5.2）。
+/// 这家上游可不可信。
 ///
-/// **默认值落在保守那一侧**（§9.7 的「零值 = 安全」）：没判出来就是
+/// **默认值落在保守那一侧**（「零值 = 安全」）：没判出来就是
 /// 不受信任。中转站是完整的中间人 —— 它不只能看你的请求，还能改你收到的
 /// 响应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -497,7 +497,7 @@ impl Trust {
     }
 }
 
-/// 上游怎么收钱（§4.3.1）。
+/// 上游怎么收钱。
 ///
 /// **接入订阅型网关之后，「按价目表乘 token 数」这个假设就不成立了** ——
 /// 订阅制的边际成本是零，按 API 价目表算出来的数字是纯虚构的。
@@ -520,7 +520,7 @@ pub enum Billing {
 impl Billing {
     /// 这次调用该不该进金额合计。
     ///
-    /// **宁可显示「不知道」，也不显示一个编出来的精确数字**（§4.3）。
+    /// **宁可显示「不知道」，也不显示一个编出来的精确数字**。
     pub fn counts_toward_money(&self) -> bool {
         matches!(self, Billing::PerToken)
     }
@@ -629,7 +629,7 @@ impl Provider {
         OFFICIAL.contains(&host) || host.ends_with(".amazonaws.com")
     }
 
-    /// 发给这家要脱哪几类（§5.1）。
+    /// 发给这家要脱哪几类。
     pub fn effective_redact(&self) -> Vec<tw_redact::rules::Kind> {
         use tw_redact::rules::Kind;
         if let Some(k) = &self.redact {
@@ -637,7 +637,7 @@ impl Provider {
         }
         if self.is_official_endpoint() {
             // 官方端点不脱。**为了防一个你本来就信任的对象而自废武功，
-            // 是这一节最要避免的事**（§5.1）
+            // 是这一节最要避免的事**
             return Vec::new();
         }
         // 默认那几类**不含 `internal`**：RFC1918 地址在代码和文档里到处
@@ -650,7 +650,7 @@ impl Provider {
         ]
     }
 
-    /// 这家可不可信（§5.2）。
+    /// 这家可不可信。
     pub fn effective_trust(&self) -> Trust {
         self.trust.unwrap_or(if self.is_official_endpoint() {
             Trust::Official
@@ -678,7 +678,7 @@ impl Provider {
 ///
 /// 往返会把用户的注释、空行、字段顺序全洗掉 —— 而这是**用户没要求的
 /// 一次写入**，它必须只动它该动的那 40 个字符。cc-switch 那 147 个
-/// commit 的白名单教训（§9.7）在这里同样成立：我们要写什么是清楚的，
+/// commit 的白名单教训在这里同样成立：我们要写什么是清楚的，
 /// 「要保留什么」永远数不完。
 ///
 /// 找不到那个字段就报错，**不追加**：追加意味着我们猜错了结构，而在
@@ -708,7 +708,7 @@ pub fn patch_oauth_refresh(
     })?;
     // **写之前先自己读一遍。**patch 出来的东西必须还是一份能加载的配置，
     // 而且那个字段真的变成了新值 —— 否则我们会把一份坏配置留在盘上，
-    // 而用户下一次启动才撞上它（§3.8 的「先校验再写」同一条）。
+    // 而用户下一次启动才撞上它（「先校验再写」同一条）。
     let re = try_parse(&out).map_err(|r| RotateError::Broke {
         provider: provider.to_string(),
         why: r.message,
@@ -797,11 +797,11 @@ pub enum WriteError {
 
 /// 整文件写下一份配置，权限 `0600`。
 ///
-/// **这不是 §3.8 的最小替换**。那一套是「改一个标量、其余字节原样不动」，
+/// **这不是最小替换**。那一套是「改一个标量、其余字节原样不动」，
 /// 用于日常改配置；这一套是从无到有生成，用于首次运行。两者混用会让
 /// 「注释和格式原样保留」那条承诺失效。
 ///
-/// 权限不能靠 umask 的运气：这个文件里有明文密钥（§3.2）。
+/// 权限不能靠 umask 的运气：这个文件里有明文密钥。
 pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
     let text = serde_yaml_ng::to_string(cfg)?;
     // **权限、原子写、目录创建都在 store 里。**两处各写一遍就是两处会
@@ -849,8 +849,8 @@ providers:
 "#;
 
     #[test]
-    fn the_six_line_config_from_the_design_doc_actually_parses() {
-        // §3.3 承诺「第一天的配置是六行」。如果这个测试挂了，那句话
+    fn the_six_line_config_actually_parses() {
+        // 「第一天的配置是六行」是对用户的承诺。如果这个测试挂了，那句话
         // 就是假的。
         let cfg: Config = serde_yaml_ng::from_str(MINIMAL).unwrap();
         assert_eq!(cfg.version, 1);
@@ -1002,7 +1002,7 @@ mod strictness_tests {
 
     #[test]
     fn the_official_endpoint_is_not_redacted_and_a_relay_is() {
-        // §5.1 的核心分歧点：**走官方端点不该脱敏，走中转站才脱。**
+        // 核心分歧点：**走官方端点不该脱敏，走中转站才脱。**
         // 你让 Claude Code 调试一个 .env 问题，它得真看见里面的值。
         let official = Provider {
             base_url: "https://api.anthropic.com".into(),
@@ -1051,7 +1051,7 @@ mod strictness_tests {
 
     #[test]
     fn an_unknown_upstream_defaults_to_the_safe_side() {
-        // §9.7：布尔开关要命名成「零值 = 安全」。判不出来就是不受信任。
+        // 布尔开关要命名成「零值 = 安全」。判不出来就是不受信任。
         assert_eq!(Trust::default(), Trust::Untrusted);
         assert!(Trust::default().blocks());
         assert!(!Trust::Official.blocks());

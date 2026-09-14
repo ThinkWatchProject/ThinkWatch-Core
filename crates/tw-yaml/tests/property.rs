@@ -1,4 +1,4 @@
-//! §3.8 要求的 round-trip property test。
+//! round-trip property test。
 //!
 //! > 随机生成配置 × 随机 patch，断言三件事：只有目标 span 的字节变了、
 //! > 其余字节**逐字节相同**、重新解析后语义等价。**必须是 property test

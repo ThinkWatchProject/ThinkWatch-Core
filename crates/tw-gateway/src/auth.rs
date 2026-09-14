@@ -1,6 +1,6 @@
 //! 网关密钥 → 客户端身份。
 //!
-//! 这是整个设计的支点（DESIGN.md §3.3.1）：**密钥不只是认证，它就是身份**。
+//! 这是整个设计的支点：**密钥不只是认证，它就是身份**。
 //! 所有客户端指向同一个 URL，靠这把钥匙区分是谁 —— 因此才能分开算钱、
 //! 分开路由、分开限额。cc-switch 用 URL 路径前缀做这件事，而路径谁都能
 //! 构造，也分不开同一种客户端的两个实例。
@@ -9,7 +9,7 @@ use axum::http::HeaderMap;
 
 /// 密钥出现在哪个位置。
 ///
-/// **这就是方言信号**（§3.9 的按方言过滤）：一个客户端把密钥放在
+/// **这就是方言信号**（按方言过滤）：一个客户端把密钥放在
 /// `x-api-key` 里，说明它说 Anthropic 方言。这个信息我们本来就要读，
 /// 不必再发明一个探测手段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +86,7 @@ pub fn extract_key_with_position(
 }
 
 /// 常数时间比较。密钥比对不该给出计时侧信道 —— 这在本机这个场景下威胁很低，
-/// 但监听局域网是支持的配置（§5.4），而这行代码的成本是零。
+/// 但监听局域网是支持的配置，而这行代码的成本是零。
 pub fn key_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn the_position_of_the_key_tells_us_the_dialect() {
-        // §3.9 的按方言过滤靠这个。这个信息我们本来就要读 —— 不必再
+        // 按方言过滤靠这个。这个信息我们本来就要读 —— 不必再
         // 发明一个探测手段。
         let pos = |m: &HeaderMap, q: Option<&str>| extract_key_with_position(m, q).map(|(_, p)| p);
         assert_eq!(

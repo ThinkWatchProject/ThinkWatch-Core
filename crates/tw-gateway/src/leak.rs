@@ -1,9 +1,9 @@
-//! 出站密钥检测（DESIGN.md §5.0、M3 那句「观察态里最便宜的那一条」）。
+//! 出站密钥检测（M3 那句「观察态里最便宜的那一条」）。
 //!
 //! **一组正则就够，不需要整套脱敏。**这一层只回答一个问题：这个请求
 //! 体里有没有看起来像凭据的东西，正在发给一个我们知道名字的上游。
 //!
-//! 它跑在观察态：**只记录，不改变任何行为**（§5.0）。攒够一周之后，
+//! 它跑在观察态：**只记录，不改变任何行为**。攒够一周之后，
 //! 界面上出现的不是一句「我们有安全功能」，而是
 //!
 //! > 过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn。
@@ -13,10 +13,10 @@
 //! 两条纪律：
 //!
 //! **一、这一层只看，不动。**换成占位符是「拦截」态的事，而那要等
-//! §5.1 那套完整的脱敏（要能在响应里换回来）。
+//! 那套完整的脱敏（要能在响应里换回来）。
 //!
 //! **二、报出来的东西一律打码。**「发现了 sk-ant-xxx」这句话本身就是
-//! 一次泄漏 —— 它会进日志、进界面、被复制到 issue 里（§9.7）。
+//! 一次泄漏 —— 它会进日志、进界面、被复制到 issue 里。
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +44,7 @@ pub fn scan(body: &[u8]) -> Vec<Finding> {
         let f = Finding {
             kind: h.what.to_string(),
             // **打码之后才记。**「发现了 sk-ant-xxx」这句话本身就是一次
-            // 泄漏 —— 它会进日志、进界面、被复制到 issue 里（§9.7）
+            // 泄漏 —— 它会进日志、进界面、被复制到 issue 里
             masked: tw_secret::mask_secret(&text[h.bytes]),
         };
         if !out.contains(&f) {
@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn the_finding_never_carries_the_key_in_the_clear() {
         // **「发现了 sk-ant-xxx」这句话本身就是一次泄漏** —— 它会进
-        // 日志、进界面、被复制到 issue 里（§9.7）。
+        // 日志、进界面、被复制到 issue 里。
         let key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234";
         let f = &scan(key.as_bytes())[0];
         assert!(!f.masked.contains("abcdefghijklmnop"), "{}", f.masked);
@@ -96,7 +96,7 @@ mod tests {
     // ── 不该报的。**这一组比上一组重要。** ──────────────────────────
     #[test]
     fn an_ordinary_request_body_reports_nothing() {
-        // **一个天天误报的安全功能，用户第二天就关了**（§5.0）。
+        // **一个天天误报的安全功能，用户第二天就关了**。
         for b in [
             r#"{"model":"claude-sonnet-4-5","max_tokens":8000,"messages":[]}"#,
             r#"{"content":"请帮我重构 src/main.rs 里的 handle_request 函数"}"#,
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn a_multibyte_body_does_not_panic() {
-        // 按字节切 &str 的坑在这一层同样存在（§9.7）。
+        // 按字节切 &str 的坑在这一层同样存在。
         for s in ["中文中文中文", "🙂🙂🙂", "", "日本語のテキスト"] {
             let _ = scan(s.as_bytes());
         }

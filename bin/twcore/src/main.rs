@@ -1,6 +1,6 @@
 //! twcore —— 本地 AI 网关引擎。
 //!
-//! 它和 UI 在用户眼里是同一个程序（DESIGN.md §2.2.1）：UI 起它、UI 关它、
+//! 它和 UI 在用户眼里是同一个程序：UI 起它、UI 关它、
 //! 它自己不注册开机自启。这里做的是引擎侧那一半 —— 单实例、父进程守望、
 //! 干净退出。
 
@@ -141,9 +141,9 @@ fn main() -> Result<()> {
     }
 }
 
-/// 静态扫描（§5.3）。**只报告，不删任何东西。**
+/// 静态扫描。**只报告，不删任何东西。**
 fn cmd_scan(config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
-    // 规则住在 config.yaml 的 `security.scan_rules` 里（§3.1：只有一份
+    // 规则住在 config.yaml 的 `security.scan_rules` 里（只有一份
     // 配置文件）。读不出配置时用内置那套 —— 扫描不该因为配置坏了就停摆
     let user = tw_config::load(config)
         .map(|c| c.security.scan_rules.clone())
@@ -197,7 +197,7 @@ fn cmd_scan(config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()
         println!("⚠ 读不动：{u}");
     }
     if r.findings.is_empty() {
-        // §0.6：没风险的时候要说「安全」，而不是什么都不显示
+        // 没风险的时候要说「安全」，而不是什么都不显示
         println!("\n✓ 没发现问题。");
         return Ok(());
     }
@@ -409,7 +409,7 @@ fn fmt_time(ms: u64) -> String {
     }
 }
 
-/// L1 测速（§4.6）。**逐个测，不并发** —— 六条线一起抢带宽测出来的
+/// L1 测速。**逐个测，不并发** —— 六条线一起抢带宽测出来的
 /// 握手时间不是任何一条线的真实值，而这一层存在的全部意义就是那几个
 /// 数字准不准。
 fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Result<()> {
@@ -556,13 +556,13 @@ fn cmd_check(path: &Path) -> Result<()> {
                 );
                 // OAuth 不在这里换 token：那是一次网络往返，而 check
                 // 是个用户期望立刻返回的命令。但**能离线查的都要查** ——
-                // 这几样写错了，症状全是网关起来之后一片 401（§3.6）。
+                // 这几样写错了，症状全是网关起来之后一片 401。
                 if let Some(o) = p.key.oauth() {
                     if o.refresh.trim().is_empty() {
                         println!("     ⚠ refresh token 是空的 —— 这家换不出 token");
                     }
                     // **本机的 http 不算明文过网。**报它是个假警报，而
-                    // 假警报的代价是用户学会忽略这一栏的所有话（§0.6：
+                    // 假警报的代价是用户学会忽略这一栏的所有话（
                     // 没有风险的时候要说「安全」，不是把话说满）。
                     // tw-redact 的内网规则出于同一个理由排除回环。
                     let loopback = o.endpoint.starts_with("http://127.0.0.1")
@@ -616,7 +616,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         }
     };
 
-    // **配置不存在就地生成**（§7.6 第 1 步）。
+    // **配置不存在就地生成**（第 1 步）。
     //
     // 这里曾经是「加载失败，去跑一次 twcore init」——而那是错的：真正的
     // 首次运行里根本没有人会去跑 init。UI 直接 spawn 的是 serve，于是
@@ -633,7 +633,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     }
     let cfg = tw_config::load(path).with_context(|| format!("加载 {} 失败", path.display()))?;
     // `--port` 是一个**显式的覆盖**，配置文件不该推翻它。所以给了它
-    // 之后就不再跟着配置里的监听地址走（§3.8 的「温」那一级）。
+    // 之后就不再跟着配置里的监听地址走（「温」那一级）。
     let overridden = port.is_some();
     let mut listen = cfg.listen.gateway.clone();
     if let Some(p) = port {
@@ -653,7 +653,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         // **和观测那一层用同一份价目表。**两处各拿一份的话，「成本栏
-        // 显示的」和「按最便宜选的」会对不上（§4.3.0 的用户覆盖层就是
+        // 显示的」和「按最便宜选的」会对不上（用户覆盖层就是
         // `cheapest` 唯一的判据来源）。读不了就用内置那份，转发照常。
         match tw_pricing::Prices::builtin()
             .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
@@ -663,18 +663,17 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         }
 
         // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
-        // 照常转发（§4.7）。所以这里所有的失败都只记一行日志。
+        // 照常转发。所以这里所有的失败都只记一行日志。
         //
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
-        // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面
-        // （§9.0.1）。
+        // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
         let store = build_store(&dir, state.bus.subscribe(), body_rx);
         if store.is_some() {
             state.set_body_sink(body_tx);
         }
 
-        // 配置的唯一入口。UI、CLI、文件监听都从这里进（§3.8）。
+        // 配置的唯一入口。UI、CLI、文件监听都从这里进。
         let manager = std::sync::Arc::new(tw_control::ConfigManager::new(
             config_path,
             state.clone(),
@@ -692,7 +691,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         };
 
         // 控制面无论如何都要起来 —— **网关挂了的时候，用户最需要的恰恰
-        // 是能改配置**（§2.2.1）。安全模式就是「只有这一半」。
+        // 是能改配置**。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
             home: tw_control::home_dir(),
             started: std::time::Instant::now(),
@@ -701,10 +700,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             gateway_addr: if safe { None } else { Some(addr.to_string()) },
             store,
         };
-        // 盯着客户端配置面（§5.3）。**只报告** —— 这条路径上没有任何
+        // 盯着客户端配置面。**只报告** —— 这条路径上没有任何
         // 一处会改用户的文件。盯不住就只是少了「变更时告警」，页面上
         // 那份「打开时扫一次」照常可用，所以说一句就继续。
-        // 凭据轮换要写回 config.yaml（§3.6）。**这是这个程序里唯一一次
+        // 凭据轮换要写回 config.yaml。**这是这个程序里唯一一次
         // 不是人发起的配置写入** —— 理由是服务器换发新 refresh token 的
         // 那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
@@ -763,7 +762,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             return Ok(());
         }
 
-        // 模型目录：后台去问每个上游有哪些模型（§3.9）。**不挡启动** ——
+        // 模型目录：后台去问每个上游有哪些模型。**不挡启动** ——
         // 探测要打网络，而网关不该因为一次探测慢而起不来。
         tw_gateway::spawn_catalog_refresh(state.clone());
 
@@ -793,7 +792,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 ///
 /// 这条边界值得写死在代码形状里：这个函数返回 `Option`，而不是
 /// `Result` —— 调用方连处理错误的机会都不该有，因为没有任何一种
-/// 处理方式是「不转发了」（§4.7）。
+/// 处理方式是「不转发了」。
 fn build_store(
     dir: &Path,
     events: tokio::sync::broadcast::Receiver<tw_api::Event>,

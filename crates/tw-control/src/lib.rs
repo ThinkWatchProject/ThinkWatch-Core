@@ -1,6 +1,6 @@
 //! 控制面：unix socket 上的 HTTP。
 //!
-//! **不占 TCP 端口**（DESIGN.md §2.1）。理由不是省端口，是权限：一个
+//! **不占 TCP 端口**。理由不是省端口，是权限：一个
 //! `0700` 的 socket 文件天然只有当前用户能连，不需要再发明一套 token。
 //! 只有用户显式开启远程访问时才监听 TCP，那时才需要 token。
 
@@ -32,12 +32,12 @@ pub struct ControlState {
     ///
     /// 拿快照的后果是：用户在编辑器里改完文件、网关已经按新配置在转发
     /// 了，而界面上还显示着旧的 —— 而他分不清是我们没生效还是界面没
-    /// 刷新（§3.8）。
+    /// 刷新。
     pub gateway: tw_gateway::AppState,
     pub cfg: Arc<ConfigManager>,
     pub gateway_addr: Option<String>,
     /// 请求历史。**可能没有** —— 磁盘起不来时观测这一层整个不在，
-    /// 而那时网关照常转发（§4.7），所以它是 Option 而不是必需品。
+    /// 而那时网关照常转发，所以它是 Option 而不是必需品。
     pub store: Option<Arc<tokio::sync::Mutex<tw_store::Recorder>>>,
     /// 用户的 home。接管要顺着它去找各客户端的配置。
     ///
@@ -90,7 +90,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/config/history", get(config_history))
         .route("/config/at", get(config::path_at))
         .route("/pricing", get(pricing_get).put(pricing_put))
-        // 「检查价格更新」三步走（§4.3.0、§12）。**三个端点，不是一个**
+        // 「检查价格更新」三步走。**三个端点，不是一个**
         // —— 一个端点意味着「检查」和「写入」是同一次调用，而那正是
         // 「静默下载」的定义
         .route("/pricing/update/offer", post(update_offer))
@@ -110,12 +110,12 @@ pub fn router(state: ControlState) -> Router {
         .route("/speed/run", post(speed_run))
         .route("/request/{id}", get(request_detail))
         .route("/setup", post(setup))
-        // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认（§7.11）
+        // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认
         .route("/baseline", get(baseline))
-        // 诊断包（§9.7 的脱敏纪律）。**只读，不写任何文件**
+        // 诊断包（脱敏纪律）。**只读，不写任何文件**
         .route("/diagnostics", get(diagnostics::bundle))
         // **报价和真跑是两个端点**：这一步花钱（和 L3 测速同一条纪律）
-        // 把一条真实请求变成回放用例（§9.8）。**录制不是新功能** ——
+        // 把一条真实请求变成回放用例。**录制不是新功能** ——
         // 每个请求本来就在存储里
         .route("/request/{id}/fixture", get(replay::fixture))
         .route("/replay/quote", post(replay::quote))
@@ -123,7 +123,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/sessions", get(sessions))
         .route("/sessions/{id}", get(session_detail))
         .route("/dryrun", post(dryrun::dry_run))
-        // **每次现扫，什么都不存**（§7.12）
+        // **每次现扫，什么都不存**
         .route("/scan", get(scan::scan))
         .route("/clients", get(clients::list))
         .route("/clients/plan", post(clients::plan_adopt))
@@ -131,7 +131,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/clients/{id}/restore/plan", get(clients::plan_restore))
         .route("/clients/{id}/restore", post(clients::restore))
         .route("/clients/{id}/why", get(clients::why))
-        // 矩阵上点一下（§7.12）。**plan 和 apply 同样是两步**
+        // 矩阵上点一下。**plan 和 apply 同样是两步**
         .route("/mcp/targets", get(clients::mcp_targets))
         .route("/mcp/plan", post(clients::mcp_plan_op))
         .route("/mcp/apply", post(clients::mcp_apply))
@@ -211,14 +211,14 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 billing: p.billing.map(|b| b.slug().to_string()),
                 // **给判完的结果，不是配置里那个 Option。**界面要显示的是
                 // 「这家现在算不算受信任」，而那件事在没写的时候由
-                // base_url 决定（§5.2）
+                // base_url 决定
                 trust: tw_gateway::guard::effective_trust(p, &tw_engine::Guard::default())
                     .label()
                     .to_string(),
                 trust_explicit: p.trust.is_some(),
                 // 和 trust 同一个理由：给判完的结果。不写的时候官方端点是
                 // 空的、其余是那四类默认，而用户要看的是「这家实际脱哪几
-                // 类」（§5.1）
+                // 类」
                 redact: p
                     .effective_redact()
                     .iter()
@@ -232,7 +232,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|r| tw_api::RouteView {
                 name: r.name.clone(),
-                // 阶段二的规则没有去向 —— 它们只改参数或拒绝（§3.4）
+                // 阶段二的规则没有去向 —— 它们只改参数或拒绝
                 to: r.to.clone().unwrap_or_else(|| {
                     if r.deny.is_some() {
                         "拒绝".into()
@@ -283,7 +283,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
 /// 把 `when` 写成人话。
 ///
 /// **规则列表上必须能直接读懂条件** —— 让用户去对着 YAML 猜「这条为什么
-/// 没命中」，正是 §7.11 那类「我明明配了」问题的来源。
+/// 没命中」，正是那类「我明明配了」问题的来源。
 fn describe_when(w: &tw_engine::rule::When) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(m) = &w.model {
@@ -377,7 +377,7 @@ async fn l1(
     let cfg = s.config();
     let mut out = Vec::new();
 
-    // 只测代理本身。§4.6：代理影响的是网络层，测到 L1 就够了。
+    // 只测代理本身。代理影响的是网络层，测到 L1 就够了。
     if let Some(name) = &req.proxy {
         let p = cfg
             .proxies
@@ -518,8 +518,7 @@ async fn summary(
     }))
 }
 
-/// 最近的请求。**实时列表走内存 ring buffer，这个是给「翻历史」的**
-/// （§8）。
+/// 最近的请求。**实时列表走内存 ring buffer，这个是给「翻历史」的**。
 async fn history(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<Limit>,
@@ -559,7 +558,7 @@ async fn latency(
 /// L3 测速的报价。**必须先问这个，再问 run。**
 ///
 /// 这两个端点分开不是为了好看：合成一个的话，「显示预估」和「真的花钱」
-/// 之间就没有一个用户点头的位置了（§4.6）。
+/// 之间就没有一个用户点头的位置了。
 async fn speed_quote(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::SpeedRunRequest>,
@@ -573,7 +572,7 @@ async fn speed_quote(
                 &prices,
                 &p.name,
                 &req.model,
-                // 订阅型上游的判据：最近一次响应里报过额度（§4.3.2）。
+                // 订阅型上游的判据：最近一次响应里报过额度。
                 // **不是一个用户要填的字段** —— 那个数字一直在我们手上。
                 s.gateway
                     .quotas()
@@ -599,8 +598,8 @@ async fn speed_run(
     // **逐个跑，不并发。**几家一起打，测出来的 TTFT 互相干扰，而这一层
     // 存在的全部意义就是那几个数字准不准（和 L1 同一个理由）。
     for p in targets(&cfg, req.provider.as_deref())? {
-        // OAuth 那类要联网换 token，所以走网关那条 async 的路
-        // （§3.6）。**用这一家自己的 client** —— 换 token 要走它的代理。
+        // OAuth 那类要联网换 token，所以走网关那条 async 的路。
+        // **用这一家自己的 client** —— 换 token 要走它的代理。
         let pk_http = s.gateway.client_for(&p.name);
         let key = match s.gateway.key_for(p, &pk_http).await {
             Ok(k) => k,
@@ -656,7 +655,7 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
 
 /// 第一步：**只问「要访问什么、多大」，一个字节都不下载。**
 ///
-/// §12 承诺零上传，那也意味着**零静默下载** —— 而这条承诺里最容易被
+/// 零上传的承诺同时意味着**零静默下载** —— 而这条承诺里最容易被
 /// 省掉的一半，正是「先告诉你要连哪儿」。
 async fn update_offer(State(s): State<ControlState>) -> Result<Json<tw_api::UpdateOffer>, Fail> {
     let r = s
@@ -761,10 +760,10 @@ fn pending_path(s: &ControlState) -> std::path::PathBuf {
         .join("model_prices.pending.json")
 }
 
-/// 用户自己写的那份价格（§4.3.0 第三层）。
+/// 用户自己写的那份价格（第三层）。
 ///
 /// **这一页存在的理由是「有 N 条请求算不出钱」** —— 用户不会主动想起
-/// 要配价格（§0.6：高级功能的触发条件要绑在「这个问题存不存在」上）。
+/// 要配价格（高级功能的触发条件要绑在「这个问题存不存在」上）。
 async fn pricing_get(State(s): State<ControlState>) -> Result<Json<tw_api::PricingView>, Fail> {
     let p = prices(&s);
     let rows = p
@@ -780,7 +779,7 @@ async fn pricing_get(State(s): State<ControlState>) -> Result<Json<tw_api::Prici
         })
         .collect();
     // 算不出价钱的那些。**拿不到存储就是 0** —— 观测层起不来时网关
-    // 照常转发（§4.7），这一页也该照常打开
+    // 照常转发，这一页也该照常打开
     let (unpriced_recent, unpriced_models) = match &s.store {
         Some(st) => {
             let g = st.lock().await;
@@ -795,7 +794,7 @@ async fn pricing_get(State(s): State<ControlState>) -> Result<Json<tw_api::Prici
         rows,
         // **这份表自己的日期，不是那个常量。**用户点过更新之后还显示
         // 内置快照的日期，等于把「你的价目表是哪天的」这个问题答错了
-        // —— 而成本旁边标它的全部意义就是回答那个问题（§4.3.0）
+        // —— 而成本旁边标它的全部意义就是回答那个问题
         snapshot_date: p.snapshot_date.clone(),
         unpriced_recent,
         unpriced_models,
@@ -849,7 +848,7 @@ async fn pricing_put(
     }
     let text = serde_yaml_ng::to_string(&tw_pricing::Overrides { models, providers })
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let head = "# ThinkWatch 的用户价格覆盖（§4.3.0 第三层）。\n\
+    let head = "# ThinkWatch 的用户价格覆盖（第三层）。\n\
                 # 单位是**每 token** 的美元 —— 界面上填的是每百万，这里换算过了。\n\
                 # 这个文件是界面写的，但手改也没问题：它只是一份普通 YAML。\n";
     let dir = s
@@ -871,7 +870,7 @@ pub(crate) fn prices(s: &ControlState) -> tw_pricing::Prices {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
     tw_pricing::Prices::builtin()
-        // 用户点过「更新」的话，用拉回来的那份（§4.3.0 第二层）。
+        // 用户点过「更新」的话，用拉回来的那份（第二层）。
         // **读不了就退回内置那份** —— 一个损坏的更新文件不该让成本栏
         // 整个变成「未知」
         .map(|mut p| {
@@ -920,7 +919,7 @@ fn targets<'a>(
     }
 }
 
-/// 出站密钥检测攒下的证据（§5.0）。
+/// 出站密钥检测攒下的证据。
 ///
 /// **默认看过去 7 天** —— 那正是「跑上一周」之后那句话的时间尺度。
 async fn leaks(
@@ -972,7 +971,7 @@ async fn request_detail(
         let raw = g.blobs().get(at, id, which)?;
         let stored = raw.len();
         // **一律脱敏。**请求体里有 system prompt、工具定义、有时还有
-        // 用户粘进去的密钥，而这段文字会被复制到 issue 里（§9.7）。
+        // 用户粘进去的密钥，而这段文字会被复制到 issue 里。
         let text = tw_secret::mask_body(&String::from_utf8_lossy(&raw));
         let original_len = g.blobs().original_len(at, id, which).unwrap_or(stored);
         Some(tw_api::BodyView {
@@ -989,7 +988,7 @@ async fn request_detail(
     Ok(Json(detail))
 }
 
-/// 订阅额度。**每个上游最近一次报的**（§4.3.2）。
+/// 订阅额度。**每个上游最近一次报的**。
 ///
 /// 按量付费的账号没有这些头，那时这个列表是空的 —— 界面据此决定显示
 /// 金额还是百分比，两种人格共用同一块地方。
@@ -1056,7 +1055,7 @@ async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
         level: g.level().label().to_string(),
         rows: g.db().count().unwrap_or(0),
         blob_bytes: g.blobs().total_bytes(),
-        // **永远是 false。**观测挂了，代理照跑（§4.7）。哪天有人想改成
+        // **永远是 false。**观测挂了，代理照跑。哪天有人想改成
         // true，先回去读那一节。
         forwarding_affected: false,
     })
@@ -1283,14 +1282,14 @@ fn apply_fail(e: ApplyError) -> Fail {
 
 /// 首次运行：写下第一个上游。
 ///
-/// **整文件生成**，不走 §3.8 的最小替换 —— 那是两套机制（§7.6 第 1 步）。
+/// **整文件生成**，不走最小替换 —— 那是两套机制（第 1 步）。
 /// 只在还没有 provider 时可用，之后改配置归 M2 的双向同步管。
 /// 最近这一段有多长。
 const RECENT_HOURS: u32 = 24;
 /// 拿来当基线的那一段有多长。
 const BASELINE_DAYS: u32 = 30;
 
-/// 每个上游最近是不是变了（§5.2 防线三）。
+/// 每个上游最近是不是变了（防线三）。
 ///
 /// **两段时间不重叠**：基线是「最近这一段之前的那 30 天」，不含最近的
 /// 那 24 小时。重叠的话，一次异常会同时抬高两边，把自己的信号冲淡。
@@ -1382,9 +1381,9 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
     }
 }
 
-/// 会话列表（§7.9）。
+/// 会话列表。
 ///
-/// **观测层没起来时返回空列表，不是错误**（§4.7）：那时网关照常转发，
+/// **观测层没起来时返回空列表，不是错误**：那时网关照常转发，
 /// 界面上少一块统计，而不是弹一个错。
 async fn sessions(State(s): State<ControlState>) -> Json<Vec<tw_api::SessionView>> {
     let Some(store) = &s.store else {
@@ -1456,7 +1455,7 @@ async fn setup(
         name: req.name.clone(),
         base_url: req.base_url.clone(),
         key: tw_config::Secret::Literal(req.key.clone()),
-        // 猜得出来就不写进文件 —— 少一行是一行（§0.6）。
+        // 猜得出来就不写进文件 —— 少一行是一行。
         ..Default::default()
     });
     tw_config::validate(&cfg).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;

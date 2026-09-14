@@ -1,7 +1,7 @@
-//! 从响应里嗅出 usage（DESIGN.md §4.3）。
+//! 从响应里嗅出 usage。
 //!
 //! **上游返回的 usage 是真相**，所以要拿到它。难点在于不能为此破坏
-//! §4.1 的出站直通：响应是流着出去的，**不能整块缓冲下来再解析** ——
+//! 出站直通：响应是流着出去的，**不能整块缓冲下来再解析** ——
 //! 那会把 SSE 变成一次性交付，客户端看起来就是「卡很久然后一下全出来」。
 //!
 //! 所以这里是个**旁路嗅探器**：字节照常流向客户端，同时喂它一份。它只
@@ -36,7 +36,7 @@ pub struct Usage {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
-    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**（§4.3.0），
+    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**，
     /// 而上游只在 Anthropic 那边给这个细分
     pub cache_1h: bool,
 }
@@ -59,7 +59,7 @@ pub struct Sniffer {
     found: bool,
 }
 
-/// 超过这么多字节还没嗅到就放弃。放弃之后成本会走估算那条路（§4.3），
+/// 超过这么多字节还没嗅到就放弃。放弃之后成本会走估算那条路，
 /// 而估算值在界面上是标记过的。
 const GIVE_UP_AFTER: usize = 32 * 1024 * 1024;
 
@@ -184,7 +184,7 @@ impl Sniffer {
     }
 
     /// 嗅到了什么。**没嗅到就是 None，不是零** —— 零会让一次真实的
-    /// 调用看起来是免费的（§4.3）。
+    /// 调用看起来是免费的。
     pub fn finish(self) -> Option<Usage> {
         self.found.then_some(self.seen)
     }
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn the_one_hour_cache_tier_is_picked_up_because_it_costs_almost_double() {
-        // Sonnet 4.5 是 5 分钟 $3.75、1 小时 $6.00（§4.3.0）。认不出来
+        // Sonnet 4.5 是 5 分钟 $3.75、1 小时 $6.00。认不出来
         // 就会系统性低估 60%。
         let u = sniff(&[
             r#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":2000,
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_response_without_usage_yields_none_not_zero() {
-        // **零会让一次真实的调用看起来是免费的**（§4.3）。有些中转站
+        // **零会让一次真实的调用看起来是免费的**。有些中转站
         // 就是不给 usage，那时该走估算那条路，而不是记一笔 0。
         assert!(sniff(&[r#"{"id":"msg_01","content":[{"type":"text","text":"hi"}]}"#]).is_none());
         assert!(sniff(&[""]).is_none());

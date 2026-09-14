@@ -1,16 +1,15 @@
-//! 请求 metadata 的库（DESIGN.md §8）。
+//! 请求 metadata 的库。
 //!
 //! 三条贯穿这个文件的规矩：
 //!
 //! **一、写入永远不能挡住转发。**这一层的每一个错误都只记一行日志，
-//! 不往上抛到数据面。观测挂了，代理照跑（§4.7）。
+//! 不往上抛到数据面。观测挂了，代理照跑。
 //!
 //! **二、schema 版本用 `PRAGMA user_version`。**「库比程序新」要能识别
-//! 出来并给一句人话，而不是在某个 `SELECT` 上以「no such column」告终
-//! （§9.7）。
+//! 出来并给一句人话，而不是在某个 `SELECT` 上以「no such column」告终。
 //!
 //! **三、成本三态。**没有价格的模型不能记成 0 —— 那是在撒谎，而一个会
-//! 撒谎的成本面板不如没有（§4.3）。
+//! 撒谎的成本面板不如没有。
 
 use std::path::Path;
 
@@ -52,10 +51,10 @@ pub struct RequestRow {
     /// 请求头透出来的旁证。**可以伪造** —— 只用来显示和判断接管有没有
     /// 生效，从不参与鉴权、路由或配额
     pub client_hint: Option<String>,
-    /// 这条属于哪一次任务（§7.9）。**指纹 + 起始时刻**，老记录是 None
+    /// 这条属于哪一次任务。**指纹 + 起始时刻**，老记录是 None
     pub session: Option<String>,
     /// 响应里有几个工具调用。`None` = 那次没开入站审查，**不是 0**
-    /// —— 「没数过」和「数了是零」在画像里是完全不同的两件事（§5.2）
+    /// —— 「没数过」和「数了是零」在画像里是完全不同的两件事
     pub tool_calls: Option<i64>,
     /// 命中了几条危险规则
     pub flagged: Option<i64>,
@@ -77,16 +76,16 @@ pub struct RequestRow {
     /// 之后的尾差会让「今日花费」和「逐条相加」对不上 —— 那种对不上没
     /// 有任何办法解释给用户听。
     pub cost_micros: Option<i64>,
-    /// 成本是估的还是上游给的。**估算值不能混进精确数字里**（§4.3）
+    /// 成本是估的还是上游给的。**估算值不能混进精确数字里**
     pub cost_estimated: bool,
     pub error: Option<String>,
-    /// 客户端的辅助请求被本地应答了（§4.8）。**不进成本和延迟统计**
+    /// 客户端的辅助请求被本地应答了。**不进成本和延迟统计**
     pub local: bool,
     /// 路由决策与尝试链，JSON。老记录是 None
     pub routing: Option<String>,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
     pub billing: String,
-    /// 缓存命中省下了多少微分。`None` = 算不出来（§4.4）
+    /// 缓存命中省下了多少微分。`None` = 算不出来
     pub cache_saved_micros: Option<i64>,
 }
 
@@ -108,7 +107,7 @@ impl Db {
             source,
         })?;
         // **0600。**这个库里有每一条请求的模型、上游、token 数和花费 ——
-        // 同一台机器上的别的用户不该能读走一份你的使用记录（§5.4 那条
+        // 同一台机器上的别的用户不该能读走一份你的使用记录（那条
         // 「权限就是认证」的同一个道理）。WAL 模式还会带出两个兄弟文件，
         // 一起收。
         #[cfg(unix)]
@@ -186,7 +185,7 @@ impl Db {
             )?;
         }
         if from < 2 {
-            // 出站密钥检测的发现（§5.0 的观察态）。
+            // 出站密钥检测的发现（观察态）。
             //
             // **单独一张表，不是 requests 上的一列。**一次请求可能同时
             // 带出好几种凭据，而「过去 7 天有 3 个请求把 key 发给了
@@ -205,7 +204,7 @@ impl Db {
             )?;
         }
         if from < 3 {
-            // 路由决策与尝试链（§4.2）。
+            // 路由决策与尝试链。
             //
             // **一列 JSON，不是一张表。**它是一条请求的固有事实，永远
             // 跟着那一行一起取，从来不跨行查 —— 拆出去只会多一次 join。
@@ -213,7 +212,7 @@ impl Db {
                 .execute_batch("ALTER TABLE requests ADD COLUMN routing TEXT;")?;
         }
         if from < 4 {
-            // 服务它的那家怎么收钱（§4.3.1）。
+            // 服务它的那家怎么收钱。
             //
             // **存在行上，不是事后查配置。**配置随时会被热重载，而一条
             // 三天前的记录该按它当时那家的计费方式算 —— 否则今天把一家
@@ -223,7 +222,7 @@ impl Db {
             )?;
         }
         if from < 5 {
-            // 缓存命中省下了多少（§4.4）。
+            // 缓存命中省下了多少。
             //
             // **在记录的时候算，不在查询的时候算。**查询时算意味着要把
             // 价目表带进 SQL，而价目表会变 —— 那样「上周省了多少」会
@@ -232,7 +231,7 @@ impl Db {
                 .execute_batch("ALTER TABLE requests ADD COLUMN cache_saved_micros INTEGER;")?;
         }
         if from < 6 {
-            // 「这条是哪个客户端发的」的旁证（§7.11 的观察窗口）。
+            // 「这条是哪个客户端发的」的旁证（观察窗口）。
             //
             // **和 `client` 分开两列，不是覆盖它。**一个不可伪造、一个
             // 可以伪造，混成一列之后就再也分不清某一行的可信度了。
@@ -240,7 +239,7 @@ impl Db {
                 .execute_batch("ALTER TABLE requests ADD COLUMN client_hint TEXT;")?;
         }
         if from < 7 {
-            // 会话聚合（§7.9）。**孤立地看单个请求看不出任何有用的东西**
+            // 会话聚合。**孤立地看单个请求看不出任何有用的东西**
             // —— Claude Code 的一次任务是几十到上百个请求。
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN session TEXT;")?;
@@ -249,7 +248,7 @@ impl Db {
                 .execute_batch("CREATE INDEX requests_session ON requests (session, at_ms);")?;
         }
         if from < 8 {
-            // 上游行为画像（§5.2 防线三）。**「没数过」和「数了是零」
+            // 上游行为画像（防线三）。**「没数过」和「数了是零」
             // 要分得开**，所以是可空列而不是默认 0 —— 后者会让关掉审查
             // 的那段时间在画像里变成「一个工具调用都没有」，而那是假的。
             self.conn.execute_batch(
@@ -311,7 +310,7 @@ impl Db {
     }
 }
 
-/// 一次任务的汇总（§7.9）。
+/// 一次任务的汇总。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub id: String,
@@ -322,14 +321,14 @@ pub struct SessionRow {
     /// 有价格的那些轮次加起来。**单位是微分**
     pub cost_micros: i64,
     /// **没有价格的轮数。**三态成本的第三态在会话这一层的样子：
-    /// 「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论（§4.3）
+    /// 「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论
     pub unpriced_turns: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub cache_saved_micros: i64,
-    /// 上下文的峰值。**一眼看出哪次任务的上下文失控了**（§7.9）
+    /// 上下文的峰值。**一眼看出哪次任务的上下文失控了**
     pub peak_input_tokens: i64,
     pub models: String,
     pub errors: i64,
@@ -351,9 +350,9 @@ pub struct TurnRow {
 }
 
 impl Db {
-    /// 按会话聚合，最近的在前（§7.9）。
+    /// 按会话聚合，最近的在前。
     ///
-    /// **本地应答的那些不算轮次**（§4.8）：它们没经过上游，把它们算进
+    /// **本地应答的那些不算轮次**：它们没经过上游，把它们算进
     /// 「这次任务跑了多少轮」会让每个数字都偏大一点，而偏得毫无规律。
     pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRow>, DbError> {
         let mut st = self.conn.prepare(
@@ -423,7 +422,7 @@ impl Db {
     }
 }
 
-/// 一个上游在某段时间里的行为画像（§5.2 防线三）。
+/// 一个上游在某段时间里的行为画像（防线三）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shape {
     /// 这段时间里数过形状的请求有多少条。
@@ -458,7 +457,7 @@ impl Shape {
 impl Db {
     /// 一个上游在 `[from_ms, to_ms)` 里的行为画像。
     ///
-    /// **本地应答的不算**（§4.8）：它们没经过上游，混进来会稀释每一个
+    /// **本地应答的不算**：它们没经过上游，混进来会稀释每一个
     /// 比率，而且稀释的幅度随用户开了几个客户端而变 —— 那种噪声没法解释。
     pub fn shape_of(&self, provider: &str, from_ms: i64, to_ms: i64) -> Result<Shape, DbError> {
         let mut st = self.conn.prepare(
@@ -480,7 +479,7 @@ impl Db {
                     r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 ))
             })?;
-        // 中位数走 nearest-rank，和 §4.6 的分位数同一套算法 ——
+        // 中位数走 nearest-rank，和分位数同一套算法 ——
         // 两处用不同的定义会让同一份数据在两个页面上对不上
         let median_bytes = self
             .conn
@@ -514,8 +513,8 @@ impl Db {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**
-    /// （§7.11）：我们改了一个文件，但那个文件有没有被读到，只有请求能
+    /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**：
+    /// 我们改了一个文件，但那个文件有没有被读到，只有请求能
     /// 证明。
     pub fn last_seen_by_hint(&self) -> Result<Vec<(String, i64)>, DbError> {
         let mut st = self.conn.prepare(
@@ -545,7 +544,7 @@ impl Db {
     ///
     /// **这是价格页存在的理由。**用户不会主动想起要配价格 —— 只有
     /// 「有 37 条请求算不出钱，用的是这两个模型」这种具体证据才会
-    /// （§0.6：高级功能的触发条件要绑在「这个问题存不存在」上）。
+    /// （高级功能的触发条件要绑在「这个问题存不存在」上）。
     pub fn unpriced_recent(&self, days: i64) -> Result<(i64, Vec<String>), DbError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -553,7 +552,7 @@ impl Db {
             .unwrap_or(0);
         let since = now - days * 24 * 3600 * 1000;
         // 本地应答不算（它本来就没有成本），订阅制也不算（它的成本
-        // 不在这个维度上，标「未知」是对的，§4.3.1）
+        // 不在这个维度上，标「未知」是对的）
         let mut st = self.conn.prepare(
             "SELECT model, COUNT(*) FROM requests \
              WHERE at_ms >= ?1 AND local = 0 AND cost_micros IS NULL \
@@ -576,7 +575,7 @@ impl Db {
 
     pub fn summary(&self, since_ms: i64, until_ms: i64) -> Result<Summary, DbError> {
         // **本地应答不算。**成本 0、延迟 0 的东西混进来，会让「平均延迟」
-        // 和「请求数」这两个数字都失去意义（§4.8）。
+        // 和「请求数」这两个数字都失去意义。
         #[allow(clippy::type_complexity)]
         let (
             requests,
@@ -651,7 +650,7 @@ impl Db {
 
     /// 某段时间内每个模型的延迟分位数。
     ///
-    /// **用分位数不用平均值**（§4.6）：AI 延迟是长尾分布，平均值会被极端
+    /// **用分位数不用平均值**：AI 延迟是长尾分布，平均值会被极端
     /// 值拉偏。**样本数一起返回** —— 「800ms」是 3 个样本还是 300 个，
     /// 含义完全不同。
     pub fn latency_by_model(&self, since_ms: i64, until_ms: i64) -> Result<Vec<Latency>, DbError> {
@@ -679,7 +678,7 @@ impl Db {
             .collect())
     }
 
-    /// 记一次出站密钥发现（§5.0 的观察态）。
+    /// 记一次出站密钥发现（观察态）。
     pub fn insert_leak(&self, l: &Leak) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT INTO leaks (at_ms, request_id, provider, kind, masked)
@@ -692,7 +691,7 @@ impl Db {
     /// 一段时间里发生过什么。
     ///
     /// **按 (上游, 种类) 分组** —— 「有 3 个请求把你的 API key 发给了
-    /// relay-cn」这句话就是这么数出来的（§5.0）。
+    /// relay-cn」这句话就是这么数出来的。
     pub fn leak_summary(&self, since_ms: i64) -> Result<Vec<LeakGroup>, DbError> {
         let mut st = self.conn.prepare(
             "SELECT provider, kind, COUNT(DISTINCT request_id), MAX(at_ms),
@@ -760,7 +759,7 @@ impl Db {
     /// 「最近 30 天每天」要的是两种桶，而在 SQL 里写死一种，另一种就得
     /// 再写一个查询。
     ///
-    /// 成本三态在这里保持分开（§4.3）：实测的、估算的、以及**根本没有
+    /// 成本三态在这里保持分开：实测的、估算的、以及**根本没有
     /// 价格的那几条的条数**。把第三种当成 0 加进柱子里，图上那根柱子
     /// 就是偏低的，而看图的人没有任何线索知道少算了什么。
     pub fn cost_buckets(
@@ -897,12 +896,12 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
 /// 一段时间的汇总。
 ///
 /// **实测和估算分开。**「今日 $12.40 实测 + ~$0.80 估算」比一个混在一起
-/// 的 $13.20 诚实得多 —— 后者看起来是个确定的数字（§4.3）。
+/// 的 $13.20 诚实得多 —— 后者看起来是个确定的数字。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Summary {
     pub requests: i64,
     pub failed: i64,
-    /// 本地应答的次数。**是个正向数字**，单独显示（§4.8）
+    /// 本地应答的次数。**是个正向数字**，单独显示
     pub locally_answered: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -913,14 +912,14 @@ pub struct Summary {
     /// 有多少条请求**根本没有价格**（模型不在价目表里）。
     ///
     /// 这是成本三态的第三态。把它们当成 0 会让总额悄悄偏低，而用户没有
-    /// 任何线索知道少算了什么（§4.3）。**订阅型的不算在这里** —— 那不是
+    /// 任何线索知道少算了什么。**订阅型的不算在这里** —— 那不是
     /// 「不知道价格」，是「这笔账不在这个维度上」。
     pub unpriced_requests: i64,
-    /// 走订阅型上游的请求数。**不参与金额合计**（§4.3.1）
+    /// 走订阅型上游的请求数。**不参与金额合计**
     pub subscription_requests: i64,
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
     pub subscription_tokens: i64,
-    /// 缓存命中一共省下了多少微分（§4.4）
+    /// 缓存命中一共省下了多少微分
     pub cache_saved_micros: i64,
 }
 
@@ -935,7 +934,7 @@ pub struct Leak {
     pub masked: String,
 }
 
-/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」（§5.0）。
+/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeakGroup {
     pub provider: String,
@@ -1022,7 +1021,7 @@ mod tests {
     /// 成本三态在桶里也要分开。
     ///
     /// 把「没有价格」当成 0 加进柱子,那根柱子就是偏低的,而看图的人
-    /// 没有任何线索知道少算了什么（§4.3）。
+    /// 没有任何线索知道少算了什么。
     #[test]
     fn a_bucket_keeps_the_three_cost_states_apart() {
         let db = Db::in_memory().unwrap();
@@ -1066,7 +1065,7 @@ mod tests {
         assert_eq!(g[0].cost_micros, 9_000);
     }
 
-    /// 本地应答不进任何聚合（§4.8）。成本 0、延迟 0 的东西混进来,
+    /// 本地应答不进任何聚合。成本 0、延迟 0 的东西混进来,
     /// 会让图上每一格都被稀释。
     #[test]
     fn local_answers_stay_out_of_the_aggregates() {
@@ -1125,7 +1124,7 @@ mod tests {
     #[test]
     fn the_summary_keeps_measured_and_estimated_costs_apart() {
         // 「今日 $12.40 实测 + ~$0.80 估算」比一个混在一起的 $13.20
-        // 诚实得多 —— 后者看起来是个确定的数字（§4.3）。
+        // 诚实得多 —— 后者看起来是个确定的数字。
         let db = Db::in_memory().unwrap();
         let mut a = row(1, 100);
         a.cost_micros = Some(1000);
@@ -1161,7 +1160,7 @@ mod tests {
     #[test]
     fn locally_answered_requests_are_counted_but_not_averaged_in() {
         // 成本 0、延迟 0 的东西混进来，会让「平均延迟」和「请求数」
-        // 这两个数字都失去意义（§4.8）。
+        // 这两个数字都失去意义。
         let db = Db::in_memory().unwrap();
         db.insert(&row(1, 100)).unwrap();
         let mut probe = row(2, 200);
@@ -1183,7 +1182,7 @@ mod tests {
 
     #[test]
     fn latency_reports_percentiles_and_the_sample_count() {
-        // 「800ms」是 3 个样本还是 300 个，含义完全不同（§4.6）。
+        // 「800ms」是 3 个样本还是 300 个，含义完全不同。
         let db = Db::in_memory().unwrap();
         for (i, t) in (1..=100).enumerate() {
             let mut r = row(i as i64 + 1, 1000);
@@ -1265,7 +1264,7 @@ mod tests {
     #[test]
     fn a_session_aggregates_its_turns_and_keeps_the_unpriced_ones_visible() {
         // **「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论。**
-        // 把没价格的当成 0 加进去，得到的是一个会撒谎的账（§4.3）。
+        // 把没价格的当成 0 加进去，得到的是一个会撒谎的账。
         let d = tempfile::tempdir().unwrap();
         let db = Db::open(&d.path().join("data.db")).unwrap();
         for (i, (at, cost, input)) in [
@@ -1295,7 +1294,7 @@ mod tests {
     #[test]
     fn locally_answered_probes_do_not_count_as_turns() {
         // 它们没经过上游。算进「这次任务跑了多少轮」会让每个数字都
-        // 偏大一点，而偏得毫无规律（§4.8）。
+        // 偏大一点，而偏得毫无规律。
         let d = tempfile::tempdir().unwrap();
         let db = Db::open(&d.path().join("data.db")).unwrap();
         let mut a = row(1, 100);
@@ -1484,7 +1483,7 @@ mod tests {
     #[test]
     fn a_database_from_a_newer_version_says_so_instead_of_failing_weirdly() {
         // **「schema 太新」要能识别出来并给一句人话**，而不是在某个
-        // SELECT 上以「no such column」告终（§9.7）。
+        // SELECT 上以「no such column」告终。
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("data.db");
         {

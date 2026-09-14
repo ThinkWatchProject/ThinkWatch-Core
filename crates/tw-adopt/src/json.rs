@@ -1,4 +1,4 @@
-//! 保序、保格式的 JSON 外科手术（DESIGN.md §7.11「写入必须是字段级合并」）。
+//! 保序、保格式的 JSON 外科手术：**写入必须是字段级合并**。
 //!
 //! 规矩不是「把我们认识的字段合并进去」，而是**「除了这几个字段，其余
 //! 字节原样不动」**。前者是拷贝 —— 拷贝就要枚举「要保留什么」，而那是
@@ -30,7 +30,7 @@ pub enum JErr {
 }
 
 /// JSON 的语义值。数字保留字面量 —— 把 `1.0` 读成 f64 再写回会变成 `1`，
-/// 而写回校验（§7.11）比的就是「除了那几处，其余完全一致」，浮点往返
+/// 而写回校验比的就是「除了那几处，其余完全一致」，浮点往返
 /// 会让每一次校验都失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Val {
@@ -46,7 +46,7 @@ impl Val {
     pub fn s(v: impl Into<String>) -> Val {
         Val::Str(v.into())
     }
-    /// 当成字符串读。给哨兵记录原值用（§7.15）。
+    /// 当成字符串读。给哨兵记录原值用。
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Val::Str(s) => Some(s),
@@ -207,7 +207,7 @@ fn err(at: usize, msg: &str) -> JErr {
 ///
 /// **按字节扫是安全的**：UTF-8 的续字节都 ≥ 0x80，`"` 和 `\` 这两个
 /// ASCII 字节不可能出现在多字节字符中间。这个项目已经被字节切片坑过
-/// 三次（§9.7），所以这句话必须写下来，不能靠「应该没问题」。
+/// 三次，所以这句话必须写下来，不能靠「应该没问题」。
 fn scan_str(b: &[u8], i: usize) -> Result<(String, usize), JErr> {
     if b.get(i) != Some(&b'"') {
         return Err(err(i, "这里应该是一个字符串"));
@@ -416,7 +416,7 @@ fn to_val(n: &Node) -> Val {
     }
 }
 
-/// 整份文件的语义值。写回校验（§7.11）拿它和「原值 + 预期改动」比。
+/// 整份文件的语义值。写回校验拿它和「原值 + 预期改动」比。
 pub fn value(text: &str) -> Result<Val, JErr> {
     Ok(to_val(&parse(text)?))
 }
@@ -606,7 +606,7 @@ fn insert_member(
 }
 
 /// 删掉一个字段。还原走的是这条路 —— 「原本没有」的字段要真的消失，
-/// 而不是被写成空串（§7.15）。
+/// 而不是被写成空串。
 pub fn remove(text: &str, path: &[&str]) -> Result<String, JErr> {
     let Some((leaf, parents)) = path.split_last() else {
         return Err(JErr::NotObject(String::new()));
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn multibyte_content_does_not_get_sliced_in_half() {
-        // 这个项目已经被字节切片坑过三次（§9.7）。键、值、注释全用中文。
+        // 这个项目已经被字节切片坑过三次。键、值、注释全用中文。
         let src = "{\n  // 中文注释\n  \"模型\": \"通义千问\",\n  \"env\": {\n    \"名字\": \"张三\"\n  }\n}\n";
         let out = set(src, &["env", "名字"], &Val::s("李四")).unwrap();
         assert!(out.contains("\"名字\": \"李四\""), "{out}");
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn removing_restores_the_shape_the_file_had_before() {
         // 「原本没有」的字段还原时要真的消失。写成空串会让客户端
-        // 拿着一个空 base URL 去连（§7.15）。
+        // 拿着一个空 base URL 去连。
         let src = "{\n  \"model\": \"opus\"\n}\n";
         let with = set(src, &["env", "X"], &Val::s("v")).unwrap();
         let back = remove(&with, &["env", "X"]).unwrap();
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn the_semantic_value_matches_original_plus_the_intended_change() {
-        // §7.11 的写回校验：写完重新解析，和「原文件 + 预期的那几处改动」
+        // 写回校验：写完重新解析，和「原文件 + 预期的那几处改动」
         // 比。对不上就拒绝落盘 —— 这比事后备份更前置。
         let src = "{\n  \"a\": 1,\n  \"env\": { \"X\": \"old\" }\n}\n";
         let out = set(src, &["env", "X"], &Val::s("new")).unwrap();

@@ -37,7 +37,7 @@ license = "MIT"
 repository = "https://github.com/ThinkWatchProject/ThinkWatch-Core"
 
 # 二进制走 CalVer，crate 走 SemVer —— 两者是两回事，卖给不同的人。
-# 见 DESIGN.md §9.6。这里是 crate 的版本。
+# 这里是 crate 的版本。
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -74,30 +74,30 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
-# 文件监听。盯配置文件那一份（§3.8）
+# 文件监听。盯配置文件那一份
 notify = "8"
-# 请求历史。bundled 是刻意的：零外部依赖（§8），用户不必装 sqlite
+# 请求历史。bundled 是刻意的：零外部依赖，用户不必装 sqlite
 rusqlite = { version = "0.40", features = ["bundled"] }
 libc = "0.2"
-# 内置价目表压缩着放（2.3 MB → 110 KB，§4.3.0）
+# 内置价目表压缩着放（2.3 MB → 110 KB）
 flate2 = "1"
 # regex-automata / regex-syntax 已经在依赖树里（tracing 的 EnvFilter），
 # 所以加它的增量很小
 regex = "1"
 # 保格式地改 TOML。接管 Codex 要写它的 config.toml，而重新序列化
-# 会把用户的注释和排版一起抹掉（§7.11）
+# 会把用户的注释和排版一起抹掉
 toml_edit = "0.25"
-# 只有它给节点的 span —— 而 span 是「只改一段字节」的全部前提（§3.8）。
+# 只有它给节点的 span —— 而 span 是「只改一段字节」的全部前提。
 # serde_yaml 已经归档，且本来就不保留格式。
 saphyr-parser = "0.0.12"
 
-reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls", "socks", "http2", "form"] }  # form: OAuth 换 token 是表单 POST（§3.6），密钥的百分号编码不自己写
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls", "socks", "http2", "form"] }  # form: OAuth 换 token 是表单 POST，密钥的百分号编码不自己写
 # L1 分段测速要自己走握手 —— reqwest 把建连整个包起来，只给一个总时间，
 # 而分段正是这一层的全部价值。版本跟着 reqwest 的传递依赖走，不引新的树。
 rustls = "0.23"
 rustls-platform-verifier = "0.7"
 tokio-rustls = "0.26"
-# WS 升级代理（§3.6）。**不带自己的 TLS**：连接用我们已经配好的 rustls
+# WS 升级代理。**不带自己的 TLS**：连接用我们已经配好的 rustls
 # 栈，否则会出现「数据面信任的根证书」和「WS 信任的」是两套
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 base64 = "0.22"
@@ -136,6 +136,6 @@ urlencoding = "2"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-# 保持 unwind：§4.7 的 catch_unwind 要靠它兜住单个请求的 panic。
+# 保持 unwind：catch_unwind 要靠它兜住单个请求的 panic。
 # abort 会让那层防护失效，整个进程跟着死 —— 而 core 死了所有 AI 客户端一起瞎。
 panic = "unwind"

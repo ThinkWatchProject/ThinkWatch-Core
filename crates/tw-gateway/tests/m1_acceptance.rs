@@ -1,4 +1,4 @@
-//! M1 的验收标准，逐条可执行（DESIGN.md §11）。
+//! M1 的验收标准，逐条可执行。
 //!
 //! 原文四条：
 //!
@@ -152,7 +152,7 @@ async fn counting_http_proxy() -> (SocketAddr, Arc<AtomicUsize>) {
 #[tokio::test]
 async fn two_the_proxied_upstream_goes_through_it_and_the_local_one_does_not() {
     // **「本地 Ollama 不受影响」是这条验收的重点。**代理是 per-provider
-    // 的（§3.7）—— 一个全局开关会让本地上游必然连不上，而配置文件里
+    // 的 —— 一个全局开关会让本地上游必然连不上，而配置文件里
     // 看不出任何线索。
     let (proxy, hits) = counting_http_proxy().await;
     let official = named_upstream("official").await;
@@ -245,7 +245,7 @@ async fn three_a_slow_task_is_not_cut_off_by_us() {
 #[tokio::test]
 async fn four_an_upstream_401_is_readable_and_you_can_tell_which_layer_it_came_from() {
     // 用户手里有**两把 key**：网关的和上游的。一个笼统的 401 会让他去
-    // 查错的那一把 —— 而这正是「浪费时间问错人」的原型（§4.6.1）。
+    // 查错的那一把 —— 而这正是「浪费时间问错人」的原型。
     let unauthorised = {
         let app = Router::new().fallback(any(|| async {
             axum::response::Response::builder()
@@ -276,7 +276,7 @@ async fn four_an_upstream_401_is_readable_and_you_can_tell_which_layer_it_came_f
     assert_eq!(r.headers().get("x-thinkwatch-upstream").unwrap(), "中转-A");
     let t = r.text().await.unwrap();
     // **上游的话原样透传，不加我们的前缀** —— 加了就意味着「这是我们的
-    // 判断」，而这确实是它说的（§4.6.1）。
+    // 判断」，而这确实是它说的。
     assert!(t.contains("invalid x-api-key"), "{t}");
     assert!(!t.contains("[ThinkWatch]"), "上游的话被我们改写了：{t}");
 
@@ -314,11 +314,11 @@ async fn the_upstream_header_is_there_on_success_too_so_the_ui_can_always_show_i
     );
 }
 
-/// **单点查询要走和列表同一道准入**（§3.9）。
+/// **单点查询要走和列表同一道准入**。
 ///
 /// 不接这条路的话它掉进 fallback 直接透传上游 —— 一个被 `allow` 限制成
 /// 只能用便宜模型的 client，`GET /v1/models/claude-opus-4` 照样拿 200。
-/// §3.9 点名过这个洞（说别的项目「都没做过滤」），而我们自己也漏了。
+/// 这个洞在别的项目里点过名（「都没做过滤」），而我们自己也漏了。
 #[tokio::test]
 async fn a_single_model_lookup_obeys_the_same_allow_list_as_the_list() {
     let up = named_upstream("官方").await;

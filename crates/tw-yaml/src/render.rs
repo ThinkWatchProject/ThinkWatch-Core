@@ -61,7 +61,7 @@ fn needs_quotes(s: &str) -> bool {
     }
     // **`:` 和 `#` 要按 YAML 的真实规则判，不能一见就加引号。**
     // `base_url` 是被改得最多的字段，而每个 URL 都套上一对用户没写的
-    // 引号，正是 §3.8 想避免的那种 diff 噪音。
+    // 引号，正是想避免的那种 diff 噪音。
     //
     // 规则：`#` 只有在开头或前面是空白时才开启注释；`:` 只有在后面是
     // 空白或行尾时才是键值分隔符。所以 `http://a:8788` 和 `sk-a#b` 都
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn a_url_does_not_get_quoted_but_a_key_like_value_does() {
         // **`base_url` 是被改得最多的字段。**每个 URL 都套上一对用户
-        // 没写的引号，正是 §3.8 想避免的那种 diff 噪音 —— 而
+        // 没写的引号，正是想避免的那种 diff 噪音 —— 而
         // `http://a:8788` 本来就是一个合法的纯量。
         assert_eq!(plain("http://127.0.0.1:8788"), "http://127.0.0.1:8788");
         assert_eq!(plain("sk-a#b"), "sk-a#b");

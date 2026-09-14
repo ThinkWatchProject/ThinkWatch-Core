@@ -1,4 +1,4 @@
-//! 热重载：换的是什么，不换的是什么（DESIGN.md §3.8 的第 ④⑤ 步）。
+//! 热重载：换的是什么，不换的是什么（第 ④⑤ 步）。
 //!
 //! 分堆的判据是**这个东西丢了会不会让用户感觉到**。所以这些测试断言的
 //! 大多是「某个状态**没有**被重置」—— 那类回归在手工测试里几乎发现不了，
@@ -152,8 +152,8 @@ async fn a_reload_that_cannot_build_leaves_the_old_config_serving() {
 
 #[tokio::test]
 async fn the_circuit_breaker_state_survives_a_reload() {
-    // **一家刚被熔断的上游，不该因为你改了条规则就立刻又被试一遍**
-    // （§4.2）。这类回归的表现是「偶尔多打了一次已知坏掉的上游」，
+    // **一家刚被熔断的上游，不该因为你改了条规则就立刻又被试一遍**。
+    // 这类回归的表现是「偶尔多打了一次已知坏掉的上游」，
     // 在手工测试里几乎发现不了。
     let dead = {
         let app = Router::new().fallback(any(|| async {
@@ -296,7 +296,7 @@ async fn changing_the_proxy_does_rebuild_that_client() {
 
 #[tokio::test]
 async fn deleting_a_provider_takes_its_models_off_the_list_immediately() {
-    // 「列表即承诺」（§3.9）。删掉一个上游之后 `/v1/models` 还列着它的
+    // 「列表即承诺」。删掉一个上游之后 `/v1/models` 还列着它的
     // 模型，等于承诺一个已经不存在的东西。
     let (a, _) = counting_upstream("a").await;
     let (b, _) = counting_upstream("b").await;
@@ -429,7 +429,7 @@ async fn the_gate_is_only_rebuilt_when_the_limits_actually_change() {
 #[tokio::test]
 async fn reloading_from_zero_providers_to_one_starts_working_without_a_restart() {
     // 首次运行的那条路：core 先起来（零 provider），用户在界面上加了
-    // 第一个上游，然后**不重启**就该能用（§7.6）。
+    // 第一个上游，然后**不重启**就该能用。
     let (a, _) = counting_upstream("a").await;
     let state = tw_gateway::AppState::new(cfg(vec![], vec![])).unwrap();
     let gw = serve(state.clone()).await;
@@ -459,7 +459,7 @@ async fn the_allow_list_is_reloaded_too() {
 
 #[tokio::test]
 async fn changing_the_port_actually_moves_the_listener() {
-    // **「温」那一级**（§3.8）。换端口不能只换配置：监听器是启动时建的，
+    // **「温」那一级**。换端口不能只换配置：监听器是启动时建的，
     // 不重建的话新端口上什么都没有，而旧端口还在服务 —— 那种「改了没
     // 反应」比报错难查得多。
     let (up, _) = counting_upstream("a").await;
@@ -503,7 +503,7 @@ async fn changing_the_port_actually_moves_the_listener() {
 
 #[tokio::test]
 async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
-    // **新的先起来，老的停止接受新连接并等现有请求自然结束**（§3.8）。
+    // **新的先起来，老的停止接受新连接并等现有请求自然结束**。
     // 一个跑了六分钟的流不该因为你改了个端口而断掉。
     let slow = {
         let app = Router::new().fallback(any(|| async {

@@ -1,6 +1,6 @@
 //! 接管与还原：先算出一份**可以拿给用户看的**改动，再落盘。
 //!
-//! 顺序是刻意的（DESIGN.md §7.11）：
+//! 顺序是刻意的：
 //!
 //! ```text
 //! 算改动 → 展示 diff → 用户确认 → 写回校验 → 全文备份 → 原子写 → 读回来对一遍
@@ -10,7 +10,7 @@
 //! 一个 `adopt()` 直接把两件事做完的 API，用起来会很顺手 —— 顺手到
 //! 没有人会想起要展示 diff。
 //!
-//! **还原（restore）和回滚（rollback）不是一回事**（§7.15）：还原是
+//! **还原（restore）和回滚（rollback）不是一回事**：还原是
 //! 「把我们写的那几个字段改回去」，回滚是「拿全文备份覆盖」。卸载必须
 //! 走还原 —— 拿三个月前的备份去覆盖，会把用户这期间加的 MCP server、
 //! 调的权限、写的 hook 全部抹掉。
@@ -67,7 +67,7 @@ pub struct Plan {
     pub carries_secret: bool,
     /// 接管完成那一屏要说的话：什么时候生效、有什么代价、哪些文件会遮蔽我们
     pub notes: Vec<String>,
-    /// 优先级比我们高、会盖住这次写入的文件（§7.11 的 #6828）
+    /// 优先级比我们高、会盖住这次写入的文件（#6828）
     pub shadows: Vec<PathBuf>,
     /// 这次动了哪些路径。**只有这些路径允许变** —— 写回校验拿它当白名单
     pub targets: Vec<Target>,
@@ -208,7 +208,7 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
         targets.push(Target::Set(p.clone(), value.clone()));
     }
 
-    // 哨兵注释放在最前面 —— §7.15 要的是**用户打开文件就看见**。
+    // 哨兵注释放在最前面 —— 要的是**用户打开文件就看见**。
     // 严格 JSON 装不下注释，那时只有旁文件。
     if let Some(prefix) = c.comment_prefix() {
         let block = sentinel::comment_block(prefix, &originals);
@@ -333,7 +333,7 @@ pub fn apply(c: &Client, plan: &Plan, backup_root: &Path) -> Result<Applied, Pla
         backup_root,
         |text| {
             // **写回校验**：重新解析，和「原文件 + 预期的那几处改动」比。
-            // 对不上就拒绝落盘、原文件一个字节不动（§7.11）。
+            // 对不上就拒绝落盘、原文件一个字节不动。
             let got = semantic(fmt, text, &client).map_err(|e| e.to_string())?;
             if got.normalized() == expect.normalized() {
                 Ok(())
@@ -538,7 +538,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
 
     // 当初这个文件就是我们建的，还原之后又空了 —— 那就整个删掉。
     // **只在空的时候删**：用户可能在这三个月里往里加了自己的东西，
-    // 那些必须留下（§7.15：卸载走还原，不是拿备份覆盖）。
+    // 那些必须留下（卸载走还原，不是拿备份覆盖）。
     let delete_file = rec.created_file
         && matches!(semantic(c.format, &text, c.id)?, Val::Obj(ms) if ms.is_empty());
     if delete_file {

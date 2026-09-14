@@ -28,7 +28,7 @@ pub fn usage(u: Option<&Value>) -> Value {
     };
     // OpenAI 把缓存命中放在 prompt_tokens_details.cached_tokens 里，
     // 而 Anthropic 用一个独立的 cache_read_input_tokens。**它要单独搬**
-    // —— 少了它，缓存省下的钱会在成本面板上消失（§4.4）
+    // —— 少了它，缓存省下的钱会在成本面板上消失
     let cached = u
         .and_then(|x| x.get("prompt_tokens_details"))
         .and_then(|x| x.get("cached_tokens"))
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn cached_tokens_move_into_the_field_anthropic_uses() {
-        // 少了这一搬，缓存省下的钱会在成本面板上消失（§4.4）。
+        // 少了这一搬，缓存省下的钱会在成本面板上消失。
         let v = conv(
             r#"{"choices":[{"message":{"content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":800}}}"#,
         );

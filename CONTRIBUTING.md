@@ -69,10 +69,10 @@ clean the diff is:
 - **Never present an estimate as exact.** Cost is three states —
   measured, estimated, and no price at all. Treating the third as 0
   makes a total quietly wrong with nothing to signal it.
-- **Observation must never block forwarding** (§4.7). Storage, pricing,
+- **Observation must never block forwarding**. Storage, pricing,
   and scanning run off bounded channels; a full channel drops the
   observation rather than delaying the request.
-- **Report, never auto-delete** (§5.3). The scanner has no write path,
+- **Report, never auto-delete**. The scanner has no write path,
   and there's a test that reads the product code to prove it.
 - **Anything that bypasses the main pipeline re-applies its
   protections.** Replay came close to being a legitimate way around

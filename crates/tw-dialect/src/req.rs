@@ -1,8 +1,8 @@
-//! Anthropic 请求 → OpenAI chat 请求（DESIGN.md §11 的 M6+）。
+//! Anthropic 请求 → OpenAI chat 请求（M6+）。
 //!
 //! # 为什么只做这一个方向
 //!
-//! 同方言直通覆盖九成五的场景（§11），互转是剩下那 5%。而这 5% 里几乎
+//! 同方言直通覆盖九成五的场景，互转是剩下那 5%。而这 5% 里几乎
 //! 全是同一件事：**用户手上有一把 DeepSeek / Kimi / GLM / 通义的 key，
 //! 想让 Claude Code 用上。**那几家和 Ollama、LM Studio 一样说 OpenAI
 //! chat 方言。
@@ -239,7 +239,7 @@ pub fn to_openai(v: &Value) -> Converted {
         }
     }
     // **流式时要 usage。**不加这一条，OpenAI 流里根本不给 usage，
-    // 而那会让成本面板对这些请求集体失明（§4.3）
+    // 而那会让成本面板对这些请求集体失明
     if v.get("stream").and_then(|x| x.as_bool()) == Some(true) {
         out.insert("stream_options".into(), json!({ "include_usage": true }));
     }
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn streaming_asks_for_usage_because_otherwise_the_cost_panel_goes_blind() {
         // 不加 `stream_options.include_usage`，OpenAI 流里根本不给
-        // usage，而那会让成本面板对这些请求集体失明（§4.3）。
+        // usage，而那会让成本面板对这些请求集体失明。
         let c = conv(r#"{"model":"m","messages":[],"stream":true}"#);
         assert_eq!(c.body["stream_options"]["include_usage"], true);
         // 非流式不该加它

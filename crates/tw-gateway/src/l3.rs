@@ -1,4 +1,4 @@
-//! L3 · 模型测速：**这一层会花钱**（DESIGN.md §4.6）。
+//! L3 · 模型测速：**这一层会花钱**。
 //!
 //! L1 量线路、L2 量端点，两者都零成本。L3 真的调用模型，所以：
 //!
@@ -22,7 +22,7 @@ const MAX_TOKENS: u64 = 8;
 
 /// 这次测速会花多少。
 ///
-/// **三种情况都要说清楚**（§4.6）：算得出金额的给金额；订阅型的说
+/// **三种情况都要说清楚**：算得出金额的给金额；订阅型的说
 /// 「不计费」；价格未知的说「价格未知」—— 而三者都要给出 token 数，
 /// 因为那是唯一一个我们确定知道的量。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub struct Estimate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
     /// 给人看的那一句。**金额再小也要显示** —— 用户按下按钮时有权知道
-    /// 自己在花什么（§4.6）
+    /// 自己在花什么
     pub note: String,
 }
 
@@ -61,7 +61,7 @@ pub fn max_output_tokens() -> u64 {
 /// 测速的分段。
 ///
 /// **首 token 单独一段。**建连快而首 token 慢，说明是模型在排队；反过来
-/// 说明是网络。这两件事的下一步完全不同（§4.6）。
+/// 说明是网络。这两件事的下一步完全不同。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct L3Result {
     pub provider: String,
@@ -75,7 +75,7 @@ pub struct L3Result {
     /// 全部完成
     pub total_ms: u64,
     /// 实际生成了多少 token。**和预估对照** —— 有些上游会附加 system
-    /// prompt，那时实际消耗比预估多（§4.6）
+    /// prompt，那时实际消耗比预估多
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,7 +198,7 @@ pub fn estimate(
     };
     let (cost_micros, note) = if subscription {
         // **订阅型上游不按 token 计费**，但它照样消耗额度 —— 说清楚
-        // 消耗多少，而不是说「免费」（§4.6）
+        // 消耗多少，而不是说「免费」
         (
             None,
             format!("不计费，但会消耗约 {} tokens 的额度", input + MAX_TOKENS),
@@ -208,7 +208,7 @@ pub fn estimate(
             tw_pricing::Cost::Known(m) | tw_pricing::Cost::Estimated(m) => (
                 Some(m),
                 // **金额再小也要显示。**用户按下按钮时有权知道自己在花
-                // 什么（§4.6）
+                // 什么
                 format!("约 ${:.5}", m as f64 / 1e6),
             ),
             tw_pricing::Cost::Unpriced { .. } => (
@@ -232,7 +232,7 @@ pub fn estimate(
 
 /// 一批测速的总计。
 ///
-/// **批量是最容易让人手滑的地方**（§4.6）—— 点一下「全部测速」可能是
+/// **批量是最容易让人手滑的地方** —— 点一下「全部测速」可能是
 /// 十几次真实调用，所以要列出每一项**并给出总计**。
 pub fn total_micros(es: &[Estimate]) -> Option<i64> {
     // 有任何一项算不出来，总计就不该给一个看起来完整的数字
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn the_probe_request_is_streaming_because_otherwise_there_is_no_ttft() {
-        // **TTFT 才是这一层唯一值得测的东西**（§4.6）。
+        // **TTFT 才是这一层唯一值得测的东西**。
         let b = probe_body("claude-sonnet-4-5");
         assert_eq!(b["stream"], true);
         assert_eq!(b["max_tokens"], MAX_TOKENS);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn a_subscription_upstream_says_it_costs_quota_not_that_it_is_free() {
-        // 「免费」是错的 —— 它照样消耗额度（§4.6）。
+        // 「免费」是错的 —— 它照样消耗额度。
         let e = estimate(&prices(), "订阅", "claude-sonnet-4-5", true);
         assert!(e.cost_micros.is_none());
         assert!(e.note.contains("不计费"), "{}", e.note);
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_batch_gives_a_total() {
-        // **批量是最容易让人手滑的地方**（§4.6）。
+        // **批量是最容易让人手滑的地方**。
         let es: Vec<_> = ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]
             .iter()
             .map(|m| estimate(&prices(), "p", m, false))

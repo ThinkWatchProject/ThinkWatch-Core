@@ -261,7 +261,7 @@ fn adopting_codex_keeps_every_project_trust_and_mcp_server() {
 
 #[test]
 fn codex_gets_a_sentinel_comment_because_toml_can_hold_one() {
-    // §7.15：用户打开文件就该看见「这是谁改的、原来是什么」。
+    // 用户打开文件就该看见「这是谁改的、原来是什么」。
     let b = bed("codex", CODEX);
     let c = client("codex");
     let p = plan_adopt(&c, &b.home, &gw()).unwrap();
@@ -356,7 +356,7 @@ fn every_adoptable_client_survives_a_round_trip() {
 
 #[test]
 fn a_gateway_without_a_key_writes_no_key_field() {
-    // §0.6：为「一个 key 就够」的人设计。网关不要求鉴权时，不该往
+    // 为「一个 key 就够」的人设计。网关不要求鉴权时，不该往
     // 用户的配置里塞一个空密钥。
     let g = Gateway {
         base: "http://127.0.0.1:8080".into(),

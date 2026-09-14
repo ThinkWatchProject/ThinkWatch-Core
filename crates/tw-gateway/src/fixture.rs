@@ -1,4 +1,4 @@
-//! 回放测试集（DESIGN.md §9.8）。
+//! 回放测试集。
 //!
 //! 风险表里写着「上游方言的持续漂移」，而这一路积累的证据全都指向同一个
 //! 方向：Codex 在一个 patch 版本里改了 `auth.json` 的语义；
@@ -27,8 +27,8 @@
 //! # 脱敏是录制的一部分，不是事后补的
 //!
 //! 录下来的是真实请求，里面有 API key、有用户的代码、有 system prompt。
-//! **落盘之前就走一遍 §5.1 的脱敏管线**，而不是先存原始再想办法清洗。
-//! 理由比 §9.7 那条日志脱敏更硬：**测试夹具会进 git**，一个装满真实密钥
+//! **落盘之前就走一遍脱敏管线**，而不是先存原始再想办法清洗。
+//! 理由比那条日志脱敏更硬：**测试夹具会进 git**，一个装满真实密钥
 //! 的 fixture 目录被 push 上去，就再也收不回来了。
 
 use serde::{Deserialize, Serialize};
@@ -84,7 +84,7 @@ pub struct Extracted {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<String>,
     /// 上游报的错落到哪个分类。**错误映射变了是真事故** —— 一个 429
-    /// 被塌成 502，客户端就不会退避了（§4.6.1）
+    /// 被塌成 502，客户端就不会退避了
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
 }
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn an_error_response_records_which_bucket_it_lands_in() {
-        // 一个 429 被塌成 502，客户端就不会退避了（§4.6.1）。错误映射
+        // 一个 429 被塌成 502，客户端就不会退避了。错误映射
         // 变了是真事故。
         let f = record(
             "限流",
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn recording_strips_credentials_before_anything_is_written() {
         // **测试夹具会进 git。**一个装满真实密钥的 fixture 目录被 push
-        // 上去，就再也收不回来了（§9.8）。
+        // 上去，就再也收不回来了。
         let key = "sk-ant-api03-REALKEYAAAAAAAAAAAAAAAAAA";
         let f = record(
             "x",

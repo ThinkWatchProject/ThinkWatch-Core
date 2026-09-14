@@ -1,6 +1,6 @@
 version: 1
 name: 上游限流-429
-note: 按 §4.6.1 构造：429 必须保住 429，塌成 502 会让客户端不退避。不是实录。
+note: 按错误契约构造：429 必须保住 429，塌成 502 会让客户端不退避。不是实录。
 recorded_at_ms: 0
 request:
   path: /v1/messages
