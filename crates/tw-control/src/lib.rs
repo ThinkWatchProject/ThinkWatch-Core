@@ -460,7 +460,7 @@ fn view(target: String, via: Option<String>, r: tw_gateway::L1Result) -> tw_api:
 async fn cost_buckets(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<BucketQuery>,
-) -> Result<Json<Vec<tw_store::CostBucket>>, Fail> {
+) -> Result<Json<Vec<tw_api::CostBucket>>, Fail> {
     let (from, to) = q.win.range();
     // 桶宽有下限，否则一个 `bucket_ms=1` 能让这条查询扫出几百万个分组。
     let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
@@ -477,7 +477,7 @@ async fn cost_buckets(
 async fn cost_by(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<GroupQuery>,
-) -> Result<Json<Vec<tw_store::CostGroup>>, Fail> {
+) -> Result<Json<Vec<tw_api::CostGroup>>, Fail> {
     let (from, to) = q.win.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
@@ -1123,7 +1123,7 @@ struct GroupQuery {
     win: Window,
     /// **是枚举不是字符串。**它会决定 SQL 里的列名，用字符串就是一个
     /// 注入口；写错的值在这里被 serde 直接拒掉，而不是拼进查询。
-    dim: tw_store::CostDim,
+    dim: tw_api::CostDim,
 }
 
 impl Window {
