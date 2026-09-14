@@ -32,7 +32,7 @@ async fn counting_upstream(name: &'static str) -> (SocketAddr, Arc<AtomicUsize>)
     (a, hits)
 }
 
-fn cfg(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
+fn cfg(providers: Vec<Provider>, routes: Vec<tw_engine::Rule>) -> Config {
     Config {
         clients: vec![Client {
             name: "c".into(),
@@ -40,7 +40,11 @@ fn cfg(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
             ..Default::default()
         }],
         providers,
-        routes,
+        routes: if routes.is_empty() {
+            Vec::new()
+        } else {
+            vec![tw_engine::RouteSet::default_with(routes)]
+        },
         ..Default::default()
     }
 }
@@ -230,14 +234,14 @@ async fn a_connection_pool_survives_an_unrelated_edit() {
 
     // 改一条完全无关的规则
     let mut next = c.clone();
-    next.routes = vec![tw_engine::Route {
+    next.routes = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
         name: "新规则".into(),
         when: Default::default(),
         to: Some("a".into()),
         set: None,
         deny: None,
         guard: None,
-    }];
+    }])];
     state.reload(next).unwrap();
     ask(gw).await;
     assert_eq!(
@@ -345,14 +349,14 @@ async fn an_unrelated_edit_does_not_blank_the_model_list() {
     let gw = serve(state.clone()).await;
 
     let mut next = c.clone();
-    next.routes = vec![tw_engine::Route {
+    next.routes = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
         name: "r".into(),
         when: Default::default(),
         to: Some("a".into()),
         set: None,
         deny: None,
         guard: None,
-    }];
+    }])];
     state.reload(next).unwrap();
     let after = reqwest::Client::new()
         .get(format!("http://{gw}/v1/models"))
@@ -409,14 +413,14 @@ async fn the_gate_is_only_rebuilt_when_the_limits_actually_change() {
     let g0 = state.gate();
 
     let mut same_limits = c.clone();
-    same_limits.routes = vec![tw_engine::Route {
+    same_limits.routes = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
         name: "r".into(),
         when: Default::default(),
         to: Some("a".into()),
         set: None,
         deny: None,
         guard: None,
-    }];
+    }])];
     state.reload(same_limits).unwrap();
     assert!(Arc::ptr_eq(&g0, &state.gate()), "无关改动换掉了并发闸门");
 

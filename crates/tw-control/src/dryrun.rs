@@ -97,8 +97,11 @@ pub async fn dry_run(
 
     // 每条规则的下场。**先走一遍这个，再问结果** —— 顺序反过来的话，
     // 「命中了哪条」会变成唯一的输出，而那正是不够用的那半个答案。
+    // **只列这把密钥真的会过的规则。**试算问的是「我这个请求会怎么走」，
+    // 而分给别的密钥的规则对这个请求没有任何影响 —— 列出来只会让人以为
+    // 它们被跳过了，而实际上它们根本不在这条求值链上。
     let mut trace = Vec::new();
-    for r in engine.routes() {
+    for r in engine.rules_for_client(&f.client) {
         if r.when.is_phase_two() {
             trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
