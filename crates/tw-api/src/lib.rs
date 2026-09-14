@@ -680,6 +680,14 @@ pub enum PatchOp {
     Remove {
         path: String,
     },
+    /// 把一个列表清成空的（`[]`）。
+    ///
+    /// **和「把这个键删掉」不是一回事**，所以它不是 `Remove` 的循环：
+    /// `allow` 不写 = 跟客户端方言走，`allow: []` = 一个都不给。界面上
+    /// 那是两个不同的选项。
+    Clear {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

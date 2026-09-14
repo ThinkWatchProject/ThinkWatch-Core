@@ -357,6 +357,14 @@ impl ConfigManager {
                     tw_yaml::remove(&text, parent, *i)
                         .map_err(|e| ApplyError::BadPath(format!("删 `{path}` 失败：{e}")))?
                 }
+                tw_api::PatchOp::Clear { path } => {
+                    // 要清的列表可能根本还没写进文件 —— 「一个都不给」
+                    // 正是用户第一次碰 `allow` 的那一下。`resolve_path`
+                    // 对没写过的键会原样留成 Key，走得通。
+                    let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
+                    tw_yaml::clear_seq(&text, &steps)
+                        .map_err(|e| ApplyError::BadPath(format!("清空 `{path}` 失败：{e}")))?
+                }
             };
         }
         self.write(&text, Some(&cur.version()), origin).await
