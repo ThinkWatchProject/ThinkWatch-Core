@@ -754,6 +754,86 @@ impl Db {
             .collect())
     }
 
+    /// 按时间分桶的花费与请求数（概览的趋势图）。
+    ///
+    /// **桶宽由调用方给，不在这里猜。**同一段数据，看「今天每小时」和
+    /// 「最近 30 天每天」要的是两种桶，而在 SQL 里写死一种，另一种就得
+    /// 再写一个查询。
+    ///
+    /// 成本三态在这里保持分开（§4.3）：实测的、估算的、以及**根本没有
+    /// 价格的那几条的条数**。把第三种当成 0 加进柱子里，图上那根柱子
+    /// 就是偏低的，而看图的人没有任何线索知道少算了什么。
+    pub fn cost_buckets(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<CostBucket>, DbError> {
+        if bucket_ms <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut st = self.conn.prepare(
+            "SELECT ((at_ms - ?1) / ?3) AS b,
+                    COUNT(*),
+                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+                    SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END)
+             FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
+             GROUP BY b ORDER BY b",
+        )?;
+        let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
+            Ok(CostBucket {
+                at_ms: since_ms + r.get::<_, i64>(0)? * bucket_ms,
+                requests: r.get(1)?,
+                failed: r.get(2)?,
+                cost_micros_exact: r.get(3)?,
+                cost_micros_estimated: r.get(4)?,
+                unpriced_requests: r.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 按某个维度分组的花费（钱花在哪儿）。
+    ///
+    /// `dim` 只接受固定的两个值 —— **不是把列名拼进 SQL**。这个参数最终
+    /// 来自控制面的 query string，拼进去就是一个注入口，而它省下的那点
+    /// 代码完全不值。
+    pub fn cost_by(
+        &self,
+        dim: CostDim,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<CostGroup>, DbError> {
+        let col = match dim {
+            CostDim::Model => "model",
+            CostDim::Provider => "provider",
+        };
+        let sql = format!(
+            "SELECT {col}, COUNT(*),
+                    COALESCE(SUM(cost_micros), 0),
+                    SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+             FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND {col} <> ''
+             GROUP BY {col} ORDER BY 3 DESC"
+        );
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(params![since_ms, until_ms], |r| {
+            Ok(CostGroup {
+                name: r.get(0)?,
+                requests: r.get(1)?,
+                cost_micros: r.get(2)?,
+                unpriced_requests: r.get(3)?,
+                input_tokens: r.get(4)?,
+                output_tokens: r.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 删掉太老的 metadata。返回删了几条。
     pub fn prune_before(&self, cutoff_ms: i64) -> Result<usize, DbError> {
         // 发现记录跟着请求一起过期 —— 留着一条指向不存在的请求的发现，
@@ -865,6 +945,42 @@ pub struct LeakGroup {
     pub masked: Vec<String>,
 }
 
+/// 一个时间桶的花费与请求数（概览的趋势图）。
+///
+/// **成本三态在这里不合并**（§4.3）：实测、估算、以及没有价格的条数。
+/// 把第三种当成 0 加进柱子，那根柱子就是偏低的，而看图的人没有线索
+/// 知道少算了什么。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CostBucket {
+    /// 桶的起点
+    pub at_ms: i64,
+    pub requests: i64,
+    pub failed: i64,
+    pub cost_micros_exact: i64,
+    pub cost_micros_estimated: i64,
+    pub unpriced_requests: i64,
+}
+
+/// 按模型或上游分组的花费（钱花在哪儿）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CostGroup {
+    pub name: String,
+    pub requests: i64,
+    pub cost_micros: i64,
+    pub unpriced_requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// 分组维度。**是个枚举不是字符串** —— 它最终来自 query string，
+/// 而把它拼进 SQL 的列名里就是一个注入口。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostDim {
+    Model,
+    Provider,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Latency {
     pub model: String,
@@ -906,6 +1022,102 @@ mod tests {
             billing: "per-token".into(),
             cache_saved_micros: None,
         }
+    }
+
+    /// 分桶的边界。
+    ///
+    /// **空桶要有,不能跳过。**没有请求的那一小时在图上是一根零高度的
+    /// 柱子,不是「那一格不存在」—— 跳过的话,一天里的空档会被两边的
+    /// 柱子挤没,图上看起来就是连续在用。
+    ///
+    /// 这条现在是**已知的不满足**:SQL 的 GROUP BY 只会产出有数据的桶。
+    /// 补空桶放在调用方做,因为只有它知道要画多少格。写在这里是为了
+    /// 让下一个人不要以为这个函数会给一个稠密的序列。
+    #[test]
+    fn cost_buckets_group_by_the_given_width() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let hour = 3_600_000i64;
+        // 第 0 桶两条,第 2 桶一条,第 1 桶空着
+        for (i, at) in [t0 + 10, t0 + 20, t0 + 2 * hour + 5].iter().enumerate() {
+            let mut r = row(i as i64 + 1, *at);
+            r.cost_micros = Some(1_000);
+            db.insert(&r).unwrap();
+        }
+        let b = db.cost_buckets(t0, t0 + 3 * hour, hour).unwrap();
+        assert_eq!(b.len(), 2, "只产出有数据的桶,空桶由调用方补");
+        assert_eq!(
+            b[0].at_ms, t0,
+            "桶的起点要对齐到 since,不是第一条记录的时间"
+        );
+        assert_eq!(b[0].requests, 2);
+        assert_eq!(b[0].cost_micros_exact, 2_000);
+        assert_eq!(b[1].at_ms, t0 + 2 * hour);
+    }
+
+    /// 成本三态在桶里也要分开。
+    ///
+    /// 把「没有价格」当成 0 加进柱子,那根柱子就是偏低的,而看图的人
+    /// 没有任何线索知道少算了什么（§4.3）。
+    #[test]
+    fn a_bucket_keeps_the_three_cost_states_apart() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let mut exact = row(1, t0 + 1);
+        exact.cost_micros = Some(5_000);
+        exact.cost_estimated = false;
+        let mut est = row(2, t0 + 2);
+        est.cost_micros = Some(3_000);
+        est.cost_estimated = true;
+        let mut none = row(3, t0 + 3);
+        none.cost_micros = None;
+        for r in [&exact, &est, &none] {
+            db.insert(r).unwrap();
+        }
+        let b = db.cost_buckets(t0, t0 + 1000, 1000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].cost_micros_exact, 5_000);
+        assert_eq!(b[0].cost_micros_estimated, 3_000);
+        assert_eq!(b[0].unpriced_requests, 1, "没有价格的要单独数,不能当成 0");
+    }
+
+    /// 分组维度只能是那两个,而且是按花费倒序 —— 「钱花在哪儿」这张图
+    /// 第一眼要看到的就是最大的那一项。
+    #[test]
+    fn cost_by_groups_and_sorts_by_spend() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let mut cheap = row(1, t0 + 1);
+        cheap.model = "haiku".into();
+        cheap.cost_micros = Some(100);
+        let mut dear = row(2, t0 + 2);
+        dear.model = "opus".into();
+        dear.cost_micros = Some(9_000);
+        for r in [&cheap, &dear] {
+            db.insert(r).unwrap();
+        }
+        let g = db.cost_by(CostDim::Model, t0, t0 + 1000).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].name, "opus", "贵的排前面");
+        assert_eq!(g[0].cost_micros, 9_000);
+    }
+
+    /// 本地应答不进任何聚合（§4.8）。成本 0、延迟 0 的东西混进来,
+    /// 会让图上每一格都被稀释。
+    #[test]
+    fn local_answers_stay_out_of_the_aggregates() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let mut r = row(1, t0 + 1);
+        r.local = true;
+        r.cost_micros = None;
+        db.insert(&r).unwrap();
+        assert!(db.cost_buckets(t0, t0 + 1000, 1000).unwrap().is_empty());
+        assert!(
+            db.cost_by(CostDim::Model, t0, t0 + 1000)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
