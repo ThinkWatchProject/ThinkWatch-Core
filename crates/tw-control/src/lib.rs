@@ -98,6 +98,8 @@ pub fn router(state: ControlState) -> Router {
         .route("/pricing/update/apply", post(update_apply))
         .route("/config/rollback", post(config_rollback))
         .route("/summary", get(summary))
+        .route("/summary/buckets", get(cost_buckets))
+        .route("/summary/by", get(cost_by))
         .route("/history", get(history))
         .route("/latency", get(latency))
         .route("/latency/provider", get(latency_by_provider))
@@ -445,6 +447,45 @@ fn view(target: String, via: Option<String>, r: tw_gateway::L1Result) -> tw_api:
         notes: r.notes,
         error: r.error,
     }
+}
+
+/// 按时间分桶的花费与请求数（概览的趋势图）。
+///
+/// 桶宽由调用方给：同一段数据，「今天每小时」和「最近 30 天每天」要的
+/// 是两种桶，而在服务端写死一种，另一种就得再加一个端点。
+///
+/// **空桶不补。**SQL 的 GROUP BY 只产出有数据的桶，而要画多少格只有
+/// 界面知道（它知道图有多宽）。在这里补的话，一个跨度很大、桶很窄的
+/// 请求会让我们凭空造出几万个零。
+async fn cost_buckets(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<BucketQuery>,
+) -> Result<Json<Vec<tw_store::CostBucket>>, Fail> {
+    let (from, to) = q.win.range();
+    // 桶宽有下限，否则一个 `bucket_ms=1` 能让这条查询扫出几百万个分组。
+    let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let x = g
+        .db()
+        .cost_buckets(from, to, bucket)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(x))
+}
+
+/// 按模型或上游分组的花费（钱花在哪儿）。
+async fn cost_by(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<GroupQuery>,
+) -> Result<Json<Vec<tw_store::CostGroup>>, Fail> {
+    let (from, to) = q.win.range();
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let x = g
+        .db()
+        .cost_by(q.dim, from, to)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(x))
 }
 
 /// 一段时间的汇总。不给参数就是「今天」。
@@ -1067,6 +1108,22 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
 struct Window {
     from_ms: Option<i64>,
     to_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct BucketQuery {
+    #[serde(flatten)]
+    win: Window,
+    bucket_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct GroupQuery {
+    #[serde(flatten)]
+    win: Window,
+    /// **是枚举不是字符串。**它会决定 SQL 里的列名，用字符串就是一个
+    /// 注入口；写错的值在这里被 serde 直接拒掉，而不是拼进查询。
+    dim: tw_store::CostDim,
 }
 
 impl Window {
