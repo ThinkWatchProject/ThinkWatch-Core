@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "环境变量插值、exec 凭据、密钥打码"
+description = "Environment variable interpolation, exec-sourced credentials, and secret masking"
 
 [dependencies]
 thiserror = { workspace = true }

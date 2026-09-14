@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "控制面 API 服务端（unix socket）"
+description = "Control-plane API server over a unix socket"
 
 [dependencies]
 tw-api = { workspace = true }

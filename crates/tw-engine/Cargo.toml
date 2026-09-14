@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "路由规则引擎与策略组"
+description = "Routing rule engine and policy groups"
 
 [dependencies]
 serde = { workspace = true }

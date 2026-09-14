@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "重试、熔断、故障转移"
+description = "Retries, circuit breaking, and failover"
 
 [dependencies]
 tw-types = { workspace = true }

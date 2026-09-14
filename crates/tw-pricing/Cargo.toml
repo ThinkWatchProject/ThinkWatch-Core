@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "价目表：内置快照 + 用户覆盖，以及成本三态"
+description = "Price table: a built-in snapshot, user overrides, and three-state cost (measured, estimated, unpriced)"
 
 [dependencies]
 serde = { workspace = true }

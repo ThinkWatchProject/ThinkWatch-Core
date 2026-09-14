@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "共享类型：请求/响应 DTO、调用上下文、网关错误"
+description = "Shared types: request and response DTOs, call context, gateway errors"
 
 [dependencies]
 serde = { workspace = true }
