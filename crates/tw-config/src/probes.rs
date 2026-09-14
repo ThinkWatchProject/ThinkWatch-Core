@@ -27,6 +27,58 @@ pub enum ProbeAction {
     /// 便宜的可换了。
     Route,
 }
+impl ProbeAction {
+    /// 写进 YAML 的那个词。**界面写回的是它，不是中文标签** ——
+    /// 写中文的话下一次加载会因为不是合法取值整份被拒。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ProbeAction::Intercept => "intercept",
+            ProbeAction::Passthrough => "passthrough",
+            ProbeAction::Route => "route",
+        }
+    }
+}
+
+impl ClientProbes {
+    /// 五类，按「界面上从上到下」的顺序，每类带一句人话。
+    ///
+    /// **这份清单住在这里而不是界面里**：增删一类是这个结构体的事，
+    /// 而一个只在前端硬编码的清单会在加了第六类的那天悄悄少一行。
+    pub fn all(&self) -> [(&'static str, &'static str, &'static str, ProbeAction); 5] {
+        [
+            (
+                "health_check",
+                "连通性检查",
+                "客户端启动时打的一发空请求，只为看网关通不通。默认本地应答。",
+                self.health_check,
+            ),
+            (
+                "warmup",
+                "预热",
+                "正文恰好是 Warmup 的那一发，用来把连接和缓存捂热。默认本地应答。",
+                self.warmup,
+            ),
+            (
+                "titling",
+                "起标题",
+                "给会话起个名字。**默认放行** —— 拦了的话每个会话都叫同一个名字。",
+                self.titling,
+            ),
+            (
+                "topic_detect",
+                "话题识别",
+                "客户端判断这轮聊的是什么，用来决定要不要换上下文。默认放行。",
+                self.topic_detect,
+            ),
+            (
+                "suggestion",
+                "补全建议",
+                "输入框里那些灰色的建议。默认放行。",
+                self.suggestion,
+            ),
+        ]
+    }
+}
 
 /// 五种辅助请求各自怎么处理。
 ///
