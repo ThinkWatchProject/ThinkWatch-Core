@@ -1,6 +1,6 @@
 //! 一次调用的性质。
 //!
-//! 路由匹配的**不是目的地，是这次调用是个什么样的活儿**（DESIGN.md §3.4）。
+//! 路由匹配的**不是目的地，是这次调用是个什么样的活儿**。
 //! 网络代理的规则回答「这个连接去哪个 IP」；这里要回答「该交给谁干」。
 //!
 //! 下面这些维度，没有一个在网络代理里有对应物。
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct RequestFacts {
     /// 客户端要的模型名（**不是我们要发给上游的那个**）
     pub model: String,
-    /// 谁发的。靠网关密钥认出来（§3.3.1）
+    /// 谁发的。靠网关密钥认出来
     pub client: String,
     /// 入站方言
     pub dialect: String,
@@ -26,7 +26,7 @@ pub struct RequestFacts {
     /// 扩展思考。token 单独计费且很贵
     pub thinking: bool,
     pub stream: bool,
-    /// 这是客户端自己发的辅助请求吗（§4.8）。
+    /// 这是客户端自己发的辅助请求吗。
     ///
     /// **由识别器打的标记，不是从 body 里读出来的** —— 所以
     /// `from_anthropic_body` 不会填它，网关在识别之后单独设。空字符串
@@ -37,7 +37,7 @@ pub struct RequestFacts {
 impl RequestFacts {
     /// 从入站 body 里抽出这些性质。
     ///
-    /// **只读不改**（§4.1：入站恒解析，出站直通）。这里读错了顶多是路由
+    /// **只读不改**（入站恒解析，出站直通）。这里读错了顶多是路由
     /// 走偏，读的时候动了 body 才是灾难。
     pub fn from_anthropic_body(v: &serde_json::Value) -> Self {
         let msgs = v.get("messages").and_then(|m| m.as_array());
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn tools_are_counted_not_just_detected() {
-        // 带 50 个工具定义和带 2 个，成本差一个量级（§3.4）。
+        // 带 50 个工具定义和带 2 个，成本差一个量级。
         let f = facts(r#"{"tools":[{"name":"a"},{"name":"b"},{"name":"c"}]}"#);
         assert!(f.tools);
         assert_eq!(f.tool_count, 3);

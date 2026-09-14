@@ -1,6 +1,6 @@
 //! 路由引擎：规则 + 策略组。
 //!
-//! **层 0 不是特例**（DESIGN.md §3.4）。「不配规则也能跑」在内部被展开成
+//! **层 0 不是特例**。「不配规则也能跑」在内部被展开成
 //! 「一个包含全部 provider 的 fallback 组 + 一条指向它的兜底规则」，
 //! 所以引擎只有一条代码路径，用户看到的却是零配置可用。
 
@@ -26,7 +26,7 @@ pub enum GroupType {
     /// 轮流。**必须开会话粘滞，否则缓存全废**
     LoadBalance,
     /// 选最快的。判据是**真实流量测出来的 TTFB**，样本不够时用启动时
-    /// 那次零成本的 L1 握手计时补（§4.6）。
+    /// 那次零成本的 L1 握手计时补。
     ///
     /// **测不到的那些排最后，而不是排最前。**「没测到」不等于「慢」，
     /// 但把它排前面就等于放弃了「选最快的」这个承诺；排最后它仍然是
@@ -44,7 +44,7 @@ impl GroupType {
     /// 这个策略会不会让 prompt cache 不稳定。
     ///
     /// UI 上选中时要给一句提示 —— **不要让用户为了省 20% 的单价，
-    /// 付出丢掉 90% 缓存折扣的代价**（§3.4）。
+    /// 付出丢掉 90% 缓存折扣的代价**。
     /// 这个**策略类型**天生会不会让 prompt cache 不稳定。
     ///
     /// 具体到一个组还要看它的配置 —— 用 [`Group::hurts_cache`]。
@@ -55,7 +55,7 @@ impl GroupType {
     /// 排顺序时要不要用到运行时的数字。
     ///
     /// **`fallback` 和 `select` 不需要**，而它们是绝大多数人的配置
-    /// （§0.6）—— 于是那条路上一个 HashMap 都不用建。
+    /// —— 于是那条路上一个 HashMap 都不用建。
     pub fn needs_runtime(&self) -> bool {
         !matches!(self, GroupType::Fallback | GroupType::Select)
     }
@@ -72,11 +72,11 @@ impl GroupType {
 }
 
 /// 排顺序时才知道的那些数字。**引擎是纯函数，这些从外面传进来** ——
-/// 于是数据面和试算页（§7.11）走的是同一段逻辑，试算不会「算出一个
+/// 于是数据面和试算页走的是同一段逻辑，试算不会「算出一个
 /// 和真实转发不一样的结果」。
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
-    /// 会话指纹（§7.9）。`None` = 认不出来这是哪次会话
+    /// 会话指纹。`None` = 认不出来这是哪次会话
     pub session: Option<String>,
     /// 轮转的种子。认不出会话时用它 —— 通常是请求序号
     pub seq: u64,
@@ -108,7 +108,7 @@ pub struct Group {
     ///
     /// **默认开，而且这个默认值是这一节最重要的一行。**不开的话，一次
     /// 长会话每轮跳一家，prompt cache 全部失效 —— 而缓存命中与否成本
-    /// 差 5 到 10 倍（§3.4）。「分散负载」换来的是账单翻几倍，而单用户
+    /// 差 5 到 10 倍。「分散负载」换来的是账单翻几倍，而单用户
     /// 桌面场景根本没有需要分散的负载。
     ///
     /// 真想要纯轮询的人写一句 `session_affinity: false`，那是个明确的
@@ -127,7 +127,7 @@ impl Group {
     ///
     /// - `load-balance` **开了粘滞就不伤缓存**：同一次对话始终落在同
     ///   一家，缓存该命中还是命中。把它一律标成危险是个假警报，而假
-    ///   警报的代价是用户学会忽略这一栏的所有提示（§0.6：没有风险的
+    ///   警报的代价是用户学会忽略这一栏的所有提示（没有风险的
     ///   时候要说「安全」）。
     /// - `url-test` **会伤**：排序随实测延迟变，一次对话中途完全可能
     ///   换家。
@@ -172,7 +172,7 @@ pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
 
 /// `load-balance` 的轮转。
 ///
-/// **认得出会话就固定一家**（§3.5：不开粘滞的话，长会话每轮跳一家，
+/// **认得出会话就固定一家**（不开粘滞的话，长会话每轮跳一家，
 /// prompt cache 全废，而缓存命中与否成本差 5 到 10 倍 —— 「分散负载」
 /// 换来的可能是账单翻几倍）。
 ///
@@ -222,7 +222,7 @@ fn hash64(s: &str) -> u64 {
     h
 }
 
-/// 横切的安全策略（DESIGN.md §5.1、§5.2）。
+/// 横切的安全策略。
 ///
 /// **只能收紧，不能放松。**这是三层配置里最外面那一层，而它的合并规则
 /// 是并集 —— 一条 `guard` 规则不小心写少了，不会把 provider 上配好的
@@ -234,7 +234,7 @@ pub struct Guard {
     /// 额外要脱的类别。和 provider 上配的取并集
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redact: Vec<tw_redact::rules::Kind>,
-    /// 这条路径上一律当成不受信任的上游看待（§5.2）。
+    /// 这条路径上一律当成不受信任的上游看待。
     ///
     /// **只能从「信任」收到「不信任」**，反过来写不生效
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -258,7 +258,7 @@ impl Guard {
 
 /// 改写请求参数。
 ///
-/// **这是和流量代理最本质的分歧**（§3.4）：Clash 的规则只能决定走哪个
+/// **这是和流量代理最本质的分歧**：Clash 的规则只能决定走哪个
 /// proxy，因为它能做的就是转发字节。我们在协议层，能改的东西多得多 ——
 /// 而 `set` 让「降级」成为可能，而不是只能「拒绝」。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -266,10 +266,10 @@ impl Guard {
 pub struct SetAction {
     /// 换一个模型。
     ///
-    /// **注意这会作废整个 prompt cache** —— 和 §3.9 说的「改个对外名字」
+    /// **注意这会作废整个 prompt cache** —— 和「改个对外名字」
     /// 不是一回事，那个不影响缓存因为发给上游的名字没变；这里是真的换了
     /// 一个模型。而「预算超了」恰恰最容易发生在缓存已经暖好的长会话里，
-    /// 在那个时刻降级**很可能比不降级还贵**（§3.4）。
+    /// 在那个时刻降级**很可能比不降级还贵**。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,7 +278,7 @@ pub struct SetAction {
     pub thinking: Option<bool>,
     /// 只在新会话开始时应用，跑到一半不动它。
     ///
-    /// **长会话场景下这应该是默认值**（§3.4），但会话识别是 M3 的事 ——
+    /// **长会话场景下这应该是默认值**，但会话识别是 M3 的事 ——
     /// 现在这个字段只被记录和展示，不生效。写在这里是为了让配置格式
     /// 不必二次改动。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -286,7 +286,7 @@ pub struct SetAction {
 }
 
 impl SetAction {
-    /// 后面的覆盖前面的同名字段（§3.4 的累积规则）。
+    /// 后面的覆盖前面的同名字段（累积规则）。
     pub fn merge(&mut self, other: &SetAction) {
         if other.model.is_some() {
             self.model = other.model.clone();
@@ -313,7 +313,7 @@ pub struct Route {
     pub name: String,
     #[serde(default)]
     pub when: When,
-    /// **可以直接指 provider，不需要先建组**（§3.4 层 1）。大多数分流
+    /// **可以直接指 provider，不需要先建组**（层 1）。大多数分流
     /// 需求到这一层就解决了，不必引入策略组这个概念。
     ///
     /// 阶段二的规则（含 `provider_would_be`）**不允许写它** —— 那会成环。
@@ -325,7 +325,7 @@ pub struct Route {
     /// 直接拒绝，带一句给客户端看的原因。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
-    /// 横切的安全策略（§5.1）。**从所有命中的规则累积，而且只能收紧。**
+    /// 横切的安全策略。**从所有命中的规则累积，而且只能收紧。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<Guard>,
 }
@@ -439,7 +439,7 @@ impl Engine {
         for r in &self.routes {
             r.when.validate()?;
             // **这条禁令是必需的**：允许阶段二的规则写 `to`，求值就直接
-            // 成环了（§3.4）。在校验阶段挡下来，而不是在运行时。
+            // 成环了。在校验阶段挡下来，而不是在运行时。
             if r.when.is_phase_two() && r.to.is_some() {
                 return Err(RouteError::PhaseTwoWithTo(r.name.clone()));
             }
@@ -461,7 +461,7 @@ impl Engine {
     /// 阶段一：按请求性质选出候选 provider。
     ///
     /// **自上而下，首个命中决定 `to` 和 `deny`；`set` 从所有命中的规则
-    /// 累积**（§3.4）。两者规则不同是有理由的：去向只能有一个，而参数
+    /// 累积**。两者规则不同是有理由的：去向只能有一个，而参数
     /// 改写是可以叠加的横切策略。
     pub fn route(&self, facts: &RequestFacts) -> Result<Outcome, RouteError> {
         let mut set = SetAction::default();
@@ -505,7 +505,7 @@ impl Engine {
 
     /// 阶段二：知道了具体走哪家之后，再跑一遍含 `provider_would_be` 的规则。
     ///
-    /// **故障转移换了 provider 之后必须重跑这一步**（§3.4）。否则「走中转
+    /// **故障转移换了 provider 之后必须重跑这一步**。否则「走中转
     /// 的一律脱敏」这条规则，在从官方转移到中转时会漏掉 —— 而那正是最
     /// 需要它的时刻。
     pub fn phase_two(
@@ -592,8 +592,8 @@ impl Engine {
     /// **`expand_group` 给的是集合，这里给的是顺序。**分成两步是因为
     /// 顺序要用运行时的数字，而路由决策本身必须是纯的、可试算的。
     ///
-    /// 排完之后**所有候选都还在**，只是次序变了 —— 故障转移要用到它们
-    /// （§4.2）。「选最快的」不等于「只用最快的那一家」。
+    /// 排完之后**所有候选都还在**，只是次序变了 —— 故障转移要用到它们。
+    /// 「选最快的」不等于「只用最快的那一家」。
     pub fn order(&self, group: Option<&str>, members: &[String], f: &Facts) -> Vec<String> {
         let Some(g) = group.and_then(|n| self.groups.iter().find(|g| g.name == n)) else {
             return members.to_vec();
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn layer_zero_needs_no_rules_at_all() {
         // 「只配 provider」是最小可用配置，而且对不少人就够了：
-        // 「官方为主，挂了走中转」零规则就能满足（§3.4 层 0）。
+        // 「官方为主，挂了走中转」零规则就能满足（层 0）。
         let e = Engine::new(vec!["official".into(), "relay".into()], vec![], vec![]);
         let d = decision(&e, &facts("claude-sonnet-4-5"));
         assert_eq!(d.candidates, ["official", "relay"], "按声明顺序故障转移");
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn set_accumulates_from_every_matching_rule_while_to_takes_the_first() {
         // 两者规则不同是有理由的：**去向只能有一个，而参数改写是可以
-        // 叠加的横切策略**（§3.4）。
+        // 叠加的横切策略**。
         let e = Engine::new(
             vec!["a".into(), "b".into()],
             vec![],
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn phase_two_can_match_a_list_of_providers() {
-        // `provider_would_be: [a, b]` 就是 §3.4 里 `any_of` 的实际形态，
+        // `provider_would_be: [a, b]` 就是 `any_of` 的实际形态，
         // 不必发明一个关键字。
         let e = Engine::new(
             vec!["a".into(), "b".into(), "c".into()],
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn only_load_balance_is_flagged_as_bad_for_cache() {
-        // 这张表要在 UI 上直接显示，因为它决定了用户的账单（§3.4）。
+        // 这张表要在 UI 上直接显示，因为它决定了用户的账单。
         assert!(!GroupType::Fallback.hurts_cache());
         assert!(!GroupType::Select.hurts_cache());
         assert!(GroupType::LoadBalance.hurts_cache());
@@ -1125,7 +1125,7 @@ mod tests {
     #[test]
     fn session_affinity_pins_one_conversation_to_one_upstream() {
         // **不粘的话，长会话每轮跳一家，prompt cache 全废**，而缓存
-        // 命中与否成本差 5 到 10 倍（§3.5）
+        // 命中与否成本差 5 到 10 倍
         let g = grp(GroupType::LoadBalance, true);
         let mut seen = std::collections::HashSet::new();
         for seq in 0..20 {

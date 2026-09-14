@@ -1,4 +1,4 @@
-//! OAuth 凭据的验收（DESIGN.md §3.6 第 4 类）。
+//! OAuth 凭据的验收（第 4 类）。
 //!
 //! 单元测试证明不了这里的东西：**换 token 发生在故障转移循环里面**，
 //! 而它的失败模式全在接缝上 —— 上游到底收到了哪个 token、第二个请求
@@ -295,7 +295,7 @@ async fn a_token_without_an_expiry_is_used_until_something_says_otherwise() {
 /// 验收第三条：**token 端点挂了，只是这一家挂了。**
 ///
 /// 不切换的话，一家 OAuth 上游的 token 端点抽风会让整个网关不可用 ——
-/// 而那正是故障转移存在的理由（§4.2）。
+/// 而那正是故障转移存在的理由。
 #[tokio::test]
 async fn a_dead_token_endpoint_fails_over_instead_of_taking_the_gateway_down() {
     let (up, seen) = start_upstream().await;

@@ -1,4 +1,4 @@
-//! 方言互转端到端（DESIGN.md §11 的 M6+）。
+//! 方言互转端到端（M6+）。
 //!
 //! 验的是那一个真实场景：**手上一把 DeepSeek / Kimi / GLM 的 key，
 //! 想让 Claude Code 用上。**所以这里的入站请求是 Claude Code 真会发的
@@ -299,7 +299,7 @@ async fn what_could_not_be_translated_is_reported_to_the_user() {
 #[tokio::test]
 async fn the_usage_sniffer_still_sees_the_numbers_after_translation() {
     // **这是最容易断的一处接缝。**翻译出来的流要能被我们自己的嗅探器
-    // 认出来，否则成本面板对所有互转请求集体失明（§4.3）。
+    // 认出来，否则成本面板对所有互转请求集体失明。
     let (up, _) = start_openai_upstream(true).await;
     let (gw, mut rx) = start_gateway(up).await;
     ask(gw, claude_body(true)).await;

@@ -1,4 +1,4 @@
-//! 模型名归一化（DESIGN.md §4.3.0）。
+//! 模型名归一化。
 //!
 //! 客户端发过来的名字和价目表里的键**经常不是同一个字符串**：带日期
 //! 后缀的（`claude-sonnet-4-5-20250929`）、带厂商前缀的
@@ -6,7 +6,7 @@
 //!
 //! **只做能证明是同一个模型的变换，一步都不多。**模糊匹配会把
 //! `claude-opus-4-1-super` 猜成 `claude-opus-4`，然后给出一个自信的
-//! 错误数字 —— 而 §4.3 说得很清楚：那比不知道更糟。
+//! 错误数字 —— 而那比不知道更糟。
 
 /// 候选名，按「越确定越靠前」排。调用方依次查表，第一个命中的算数。
 pub fn candidates(model: &str) -> Vec<String> {
@@ -51,7 +51,7 @@ pub fn candidates(model: &str) -> Vec<String> {
 /// **缓存价差 17%**（读 3e-8 vs 2.5e-8，写 3e-7 vs 3.125e-7）。
 ///
 /// 所以它单独成一个函数、单独返回：用它算出来的成本一律标成**估算**
-/// （§4.3：估算值必须在界面上明确标记）。给一个带波浪号的数字，比给一个
+/// （估算值必须在界面上明确标记）。给一个带波浪号的数字，比给一个
 /// 空白有用；而假装它精确，就是那种「看起来很确定的错数字」。
 pub fn cross_platform_fallback(model: &str) -> Option<String> {
     let bare = model.trim().rsplit('/').next()?;
@@ -80,7 +80,7 @@ fn strip_date_suffix(s: &str) -> Option<&str> {
     }
     // `-2025-09-29`。**按字节切 &str 会 panic** —— 模型名里完全可能有
     // 中文（中转站自己起的名字），而这个函数会被每一个请求的模型名调到。
-    // 这个坑这个项目已经栽过两次了（§9.7），所以这里连一次 `&s[..]` 都
+    // 这个坑这个项目已经栽过两次了，所以这里连一次 `&s[..]` 都
     // 不写：只在确认结尾 11 个**字节**全是 ASCII 之后才切。
     let b = s.as_bytes();
     if b.len() > 11 {
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn a_number_that_is_not_a_date_is_left_alone() {
         // **`gpt-4o-2024` 剥成 `gpt-4o` 是猜。**猜出来的价格看起来是个
-        // 确定的数字，而那正是 §4.3 最反对的。
+        // 确定的数字，而那正是最该避免的。
         let c = candidates("gpt-4o-2024");
         assert!(!c.contains(&"gpt-4o".to_string()), "{c:?}");
         let c = candidates("claude-opus-4-1");
@@ -169,8 +169,8 @@ mod multibyte_tests {
     use super::*;
 
     /// **这个函数被每一个请求的模型名调到**，而中转站完全可能起一个中文
-    /// 名字。按字节切 `&str` 在那时会 panic —— 这个项目已经栽过两次了
-    /// （§9.7），第三次是这条测试当场抓住的。
+    /// 名字。按字节切 `&str` 在那时会 panic —— 这个项目已经栽过两次了，
+    /// 第三次是这条测试当场抓住的。
     #[test]
     fn a_model_name_with_multibyte_characters_does_not_panic() {
         for m in [

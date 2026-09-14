@@ -1,4 +1,4 @@
-//! 控制面的**契约**。CLI、Tauri UI、第三方都依赖它（DESIGN.md §9.5）。
+//! 控制面的**契约**。CLI、Tauri UI、第三方都依赖它。
 //!
 //! 它刻意不含任何 IO —— 只有类型。这样它能被 Tauri 的前端（通过
 //! ts-rs 之类的导出）、CLI、和将来的第三方同时依赖，而不会拖上一个
@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 控制面协议版本。UI 和 CLI 连上来时检查，不匹配就明确提示「请升级
-/// 客户端」，而不是以奇怪的方式失败（§9.6）。
+/// 客户端」，而不是以奇怪的方式失败。
 pub const CONTROL_API_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,12 +37,12 @@ pub enum Event {
         /// 请求头透出来的旁证。**可以伪造，所以只用来显示和判断
         /// 「接管生效了吗」，绝不用来鉴权或路由**（见 tw_gateway::hint）。
         ///
-        /// 它存在的理由：§0.6 的目标用户「一个 key 就够」，那时五个客户端
+        /// 它存在的理由：目标用户「一个 key 就够」，那时五个客户端
         /// 的 `client` 是同一个值，而观察窗口要回答的偏偏是「Codex 那边
         /// 生效了吗」。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_hint: Option<String>,
-        /// 这次请求属于哪一段对话的指纹（§7.9）。
+        /// 这次请求属于哪一段对话的指纹。
         ///
         /// **只是指纹，不是会话 id** —— 会话是「同一个指纹 + 没隔太久」，
         /// 而「隔了多久」要看上一条是什么时候，那是 recorder 的活。
@@ -50,7 +50,7 @@ pub enum Event {
         session_fp: Option<String>,
         provider: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
-        /// 少了这个字段，落库那一步就只能记一笔没有模型的账（§4.3）
+        /// 少了这个字段，落库那一步就只能记一笔没有模型的账
         #[serde(default)]
         model: String,
         method: String,
@@ -68,7 +68,7 @@ pub enum Event {
         bytes: u64,
         duration_ms: u64,
         /// 上游报的用量。**没报就是 None，不是零** —— 零会让一次真实的
-        /// 调用看起来是免费的（§4.3）
+        /// 调用看起来是免费的
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageView>,
     },
@@ -78,7 +78,7 @@ pub enum Event {
         source: String,
         message: String,
     },
-    /// 路由决定完了，尝试链也走完了（§4.2）。
+    /// 路由决定完了，尝试链也走完了。
     ///
     /// **单独一个事件，因为成功和失败两条路都要发它。**挂在
     /// `RequestFinished` 上的话，失败的那条路就没有尝试链 —— 而那恰恰
@@ -86,24 +86,24 @@ pub enum Event {
     RequestRouted {
         id: u64,
         /// 命中了哪条规则。**日志和界面都要显示它** —— 「命中第 4 条」
-        /// 远不如「命中『带缓存的必须走官方』」有用（§3.4）
+        /// 远不如「命中『带缓存的必须走官方』」有用
         rule: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
         /// 试过哪几家、各自什么结果。**一次就成的也有一条** ——
         /// 「只试了一家」和「试了三家」在用户眼里应该是不同的
         attempts: Vec<AttemptView>,
-        /// 最终服务的那家怎么收钱（§4.3.1）。
+        /// 最终服务的那家怎么收钱。
         ///
         /// **必须跟着这次请求走，不能事后查配置** —— 配置随时会被热重载，
         /// 而一条三天前的记录该按它当时那家的计费方式算。
         #[serde(default)]
         billing: String,
     },
-    /// 一个请求体里带着看起来像凭据的东西（§5.0 的观察态）。
+    /// 一个请求体里带着看起来像凭据的东西（观察态）。
     ///
     /// **只记录，不改变任何行为。**换成占位符是「拦截」态的事，而那要
-    /// 等 §5.1 那套完整的脱敏。
+    /// 等那套完整的脱敏。
     LeakSeen {
         id: u64,
         provider: String,
@@ -115,7 +115,7 @@ pub enum Event {
         masked: String,
         at_ms: u64,
     },
-    /// 出站脱敏动手了（§5.1）。
+    /// 出站脱敏动手了。
     ///
     /// **界面上必须能看到脱敏发生了什么** —— 看不见的安全功能会被用户
     /// 关掉，因为他们会怀疑是脱敏搞坏了功能。
@@ -125,7 +125,7 @@ pub enum Event {
         items: Vec<RedactedItem>,
         at_ms: u64,
     },
-    /// token 端点换发了新的 refresh token（§3.6）。
+    /// token 端点换发了新的 refresh token。
     ///
     /// **服务器换发新的那一刻，旧的已经在服务端作废了** —— 所以「不写回
     /// config.yaml」不是保守选项，它保证了配置文件从那一秒起就是坏的，
@@ -146,7 +146,7 @@ pub enum Event {
         detail: String,
         at_ms: u64,
     },
-    /// 这次请求做了方言互转（§11 的 M6+）。
+    /// 这次请求做了方言互转（M6+）。
     ///
     /// **`dropped` 非空时必须让用户看见**：`thinking` 在 OpenAI chat
     /// 方言里没有对应物，我们只能丢 —— 但悄悄丢掉的话，用户会发现
@@ -159,7 +159,7 @@ pub enum Event {
         dropped: Vec<String>,
         at_ms: u64,
     },
-    /// 这条响应长什么样（§5.2 防线三）。
+    /// 这条响应长什么样（防线三）。
     ///
     /// **只有形状，没有内容**：几个工具调用、命中几条规则。攒起来就是
     /// 每个上游的行为画像 —— 一个用了三个月一直正常的中转站，某天开始
@@ -172,7 +172,7 @@ pub enum Event {
         tool_calls: u32,
         flagged: u32,
     },
-    /// 上游返回的响应里有一个可疑的工具调用（§5.2）。
+    /// 上游返回的响应里有一个可疑的工具调用。
     ///
     /// **这是网关位置独有的能力**：只有我们同时知道「这个调用长什么样」
     /// 和「它来自哪个上游」。客户端弹批准提示的同一瞬间弹一条通知，用户
@@ -192,7 +192,7 @@ pub enum Event {
         blocked: bool,
         at_ms: u64,
     },
-    /// 客户端配置面上**新出现**了可疑的东西（§5.3）。
+    /// 客户端配置面上**新出现**了可疑的东西。
     ///
     /// **只报新出现的那些。**「一个用了半年的 skill 突然多了一段零宽
     /// 字符」这个信号，比「这个文件里有可疑内容」强得多 —— 而后者在
@@ -205,7 +205,7 @@ pub enum Event {
         alerts: Vec<ScanFinding>,
         at_ms: u64,
     },
-    /// 上游在响应头里报了订阅额度（§4.3.2）。
+    /// 上游在响应头里报了订阅额度。
     ///
     /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
     /// 这些头，那时这个事件根本不会出现 —— 而不是报一个「用了 0%」。
@@ -215,7 +215,7 @@ pub enum Event {
         windows: Vec<QuotaWindow>,
         at_ms: u64,
     },
-    /// 配置换了一份新的进去，已经生效（§3.8）。
+    /// 配置换了一份新的进去，已经生效。
     ///
     /// **界面靠它知道自己手里那份过期了。**没有它，用户在编辑器里改完
     /// 文件，界面上还显示着旧的 —— 而他分不清是我们没生效还是界面没刷新。
@@ -227,7 +227,7 @@ pub enum Event {
         origin: String,
         at_ms: u64,
     },
-    /// 新配置没过关，**旧的还在服务**（§3.8）。
+    /// 新配置没过关，**旧的还在服务**。
     ///
     /// 桌面工具不能因为一个笔误就断线，所以这不是崩溃，是一条要展示给
     /// 人看的信息 —— 托盘变黄、界面标红、定位到那一行。
@@ -242,7 +242,7 @@ pub enum Event {
         excerpt: Option<String>,
         at_ms: u64,
     },
-    /// 客户端的辅助请求被本地应答了，一个字节都没发给上游（§4.8）。
+    /// 客户端的辅助请求被本地应答了，一个字节都没发给上游。
     ///
     /// **单独一个事件，不复用 RequestFinished。**它的成本是 0、延迟是
     /// 0，混进请求总数和延迟统计里会让那两个数字都变得没意义 —— 而
@@ -263,7 +263,7 @@ pub struct AttemptView {
     pub provider: String,
     /// 「成功」「429 限流」「连不上上游」这类人话。**失败的原因要留着**
     /// —— 一条说「试过 A → B → C」的链，和一条还说清每一跳为什么失败的
-    /// 链，排查价值差得远（§4.2）
+    /// 链，排查价值差得远
     pub outcome: String,
     pub ms: u64,
 }
@@ -280,7 +280,7 @@ pub struct RoutingView {
 /// 一个订阅额度窗口。**每个字段都直接来自上游的响应头。**
 ///
 /// 我们自己推断的东西不放进这个结构 —— 界面上必须能区分「上游说的」和
-/// 「我们猜的」，而混在一个类型里就区分不了了（§4.3.2）。
+/// 「我们猜的」，而混在一个类型里就区分不了了。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaWindow {
     pub label: String,
@@ -298,7 +298,7 @@ pub struct UsageView {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
-    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**（§4.3.0）
+    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cache_1h: bool,
 }
@@ -328,7 +328,7 @@ impl Event {
 
 /// 界面要显示的配置概览。
 ///
-/// **不是配置文件本身**：密钥一律只给来源描述，不给值（§9.7 的统一脱敏）。
+/// **不是配置文件本身**：密钥一律只给来源描述，不给值（统一脱敏）。
 /// 界面需要的是「有哪些上游、规则怎么写的、谁健康」，不是那份 YAML。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Overview {
@@ -341,10 +341,10 @@ pub struct Overview {
     pub groups: Vec<GroupView>,
     pub clients: Vec<ClientView>,
     pub listen: ListenView,
-    /// 三条防线各自的状态（§5.0）。
+    /// 三条防线各自的状态。
     ///
     /// **界面要能配它们，而不只是显示。**在此之前这三个字段根本没出现
-    /// 在这个视图里，于是「脱敏开没开」只能去翻 config.yaml —— 而 §5.0
+    /// 在这个视图里，于是「脱敏开没开」只能去翻 config.yaml —— 而三态
     /// 的整个设计前提是「出厂停在观察态，用户看到证据之后自己决定要不
     /// 要切到拦截」，一个切不了的开关让那个设计不成立。
     #[serde(default)]
@@ -353,16 +353,16 @@ pub struct Overview {
 
 /// 三条防线。每条三态，而**「拦截」在每条上做的事不一样**，所以动词也
 /// 一起给出来 —— 界面上统一叫「拦截」的话，用户点下去并不知道会发生
-/// 什么（§5.0）。
+/// 什么。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityView {
     /// 出站脱敏。拦截态 = 替换成占位符
     pub redact: String,
     /// 入站审查。拦截态 = 切断响应流
     pub inspect_tools: String,
-    /// 配置面扫描。拦截态 = 告警（它本来就不删东西，§5.3）
+    /// 配置面扫描。拦截态 = 告警（它本来就不删东西）
     pub scan_configs: String,
-    /// 用户加了几条自定义扫描规则、停用了几条内置的（§5.3）
+    /// 用户加了几条自定义扫描规则、停用了几条内置的
     pub scan_rules_added: usize,
     pub scan_rules_disabled: usize,
 }
@@ -378,10 +378,10 @@ pub struct ProviderView {
     pub proxy: String,
     /// closed / open
     pub health: String,
-    /// 这家怎么收钱（§4.3.1）。`cheapest` 策略和成本栏都看它
+    /// 这家怎么收钱。`cheapest` 策略和成本栏都看它
     #[serde(default)]
     pub billing: Option<String>,
-    /// 可不可信（§5.2）。**不写就按 base_url 判**，这里给的是判完的结果
+    /// 可不可信。**不写就按 base_url 判**，这里给的是判完的结果
     #[serde(default)]
     pub trust: String,
     /// 用户有没有在配置里显式写过 `trust`。
@@ -391,7 +391,7 @@ pub struct ProviderView {
     /// 以为自己改不动它。
     #[serde(default)]
     pub trust_explicit: bool,
-    /// 这家上游实际会脱哪几类（§5.1）。
+    /// 这家上游实际会脱哪几类。
     ///
     /// 给的是**判完的结果**，不是配置里写的那几个字 —— 不写的话官方端点
     /// 是空的、其余是那四类默认。界面上要能看出「没写」和「写了空」的
@@ -414,18 +414,18 @@ pub struct RouteView {
 pub struct GroupView {
     pub name: String,
     pub kind: String,
-    /// 同一次会话固定走同一家。**这一项直接决定账单**（§3.5）
+    /// 同一次会话固定走同一家。**这一项直接决定账单**
     #[serde(default)]
     pub session_affinity: bool,
     /// `select` 组当前选中谁。
     ///
-    /// **界面要能切它** —— §3.5 说这个策略就是「UI 上点选或托盘里切」，
+    /// **界面要能切它** —— 这个策略本身就是「UI 上点选或托盘里切」，
     /// 而切不了的话它等于一个只能改 YAML 才能用的功能。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub providers: Vec<String>,
     /// 这个策略会不会让 prompt cache 不稳定。**要在界面上直说** ——
-    /// 它决定了用户的账单（§3.4）。
+    /// 它决定了用户的账单。
     pub hurts_cache: bool,
 }
 
@@ -443,11 +443,11 @@ pub struct ListenView {
     pub port: u16,
     /// 实际生效的白名单（`lan`/`all` 下会是默认填的私网段）
     pub allow_from: Vec<String>,
-    /// 非 loopback 时为真。界面上要据此把「关闭密钥校验」置灰（§5.4）
+    /// 非 loopback 时为真。界面上要据此把「关闭密钥校验」置灰
     pub exposed: bool,
 }
 
-/// 探一个上游能不能用。零成本，见 §4.6 的 L1/L2。
+/// 探一个上游能不能用。零成本，见L1/L2。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeRequest {
     pub base_url: String,
@@ -484,21 +484,21 @@ pub struct ProbeResponse {
     pub error: Option<String>,
 }
 
-/// L1 测速：只握手，不发业务请求（§4.6）。**零成本零副作用**，可以随便点。
+/// L1 测速：只握手，不发业务请求。**零成本零副作用**，可以随便点。
 ///
 /// 三种问法，但它们不是三个概念：
 ///
 /// - `provider: Some(名字)` —— 测一个已配置的上游，代理按它自己的配置走
-/// - `proxy: Some(名字)` —— 只测代理本身。§4.6：**代理测速就到这一层为止**，
+/// - `proxy: Some(名字)` —— 只测代理本身。**代理测速就到这一层为止**，
 ///   代理影响的是网络层，没有理由为了测代理去调用模型
 /// - `base_url: Some(地址)` —— 还没保存时用，首次配置那一步
 ///
-/// 全不给就测所有上游。L1 零成本，批量不需要确认（L3 才需要，见 §4.6）。
+/// 全不给就测所有上游。L1 零成本，批量不需要确认（L3 才需要）。
 ///
 /// **不接受一个「候选 URL 列表」。** cc-switch 有那么一张表，测完还得手动
 /// 点一下填进去，运行时永远只认当前保存的那一个 —— 同一个概念在一个程序
 /// 里存在两次，两边不通。这里的规矩是：测的候选池就是运行时故障转移的
-/// 候选池，同一份数据（§4.6 的架构红线）。
+/// 候选池，同一份数据（架构红线）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L1Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,7 +537,7 @@ pub struct L1Result {
 /// 当前的配置文本，连同它的版本号。
 ///
 /// **给的是原文，不是结构。**界面的文本模式直接显示它；表单模式改完
-/// 之后带着 `version` 回来，那就是乐观并发的凭据（§3.8）。
+/// 之后带着 `version` 回来，那就是乐观并发的凭据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigText {
     pub path: String,
@@ -550,7 +550,7 @@ pub struct ConfigText {
 ///
 /// **不是「把整份新配置发过来」**，是「基于哪一版、改哪几个字段」。
 /// 整份发过来的话，两个人同时改就必然有一个人的改动被悄悄吃掉 ——
-/// 而那正是 §1 里 cc-switch 那批 issue 的形状。
+/// 而那正是 cc-switch 那批 issue 的形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPatch {
     /// 你基于哪一版。**对不上就是 409。**不给表示「我知道我在覆盖」
@@ -579,7 +579,7 @@ pub enum PatchValue {
     Null,
 }
 
-/// 「检查价格更新」第一步：**先说要访问什么、多大**（§4.3.0、§12）。
+/// 「检查价格更新」第一步：**先说要访问什么、多大**。
 ///
 /// **绝不在启动时后台偷偷拉。**零上传那句承诺，也意味着零静默下载 ——
 /// 而「先告诉你要连哪儿」是这条承诺里最容易被省掉的一半。
@@ -615,7 +615,7 @@ pub struct PriceChangeView {
     pub new_output: f64,
 }
 
-/// 一条用户自己写的价格（§4.3.0 的第三层）。
+/// 一条用户自己写的价格（第三层）。
 ///
 /// **单位是每百万 token 的美元**，和厂商定价页上印的一样 —— 让用户
 /// 在界面上填 `0.000003` 是在要求他做一次换算，而换算是会错的。
@@ -642,13 +642,13 @@ pub struct PricingView {
     /// 最近这段时间里**算不出价钱**的请求数。
     ///
     /// **这是这一页存在的理由** —— 用户不会主动想起要配价格，只有
-    /// 「有 37 条请求算不出钱」这种具体证据才会（§0.6 的触发条件）。
+    /// 「有 37 条请求算不出钱」这种具体证据才会（触发条件）。
     pub unpriced_recent: i64,
     /// 那些算不出价钱的请求用的是哪些模型。**直接告诉他要填什么**
     pub unpriced_models: Vec<String>,
 }
 
-/// 光标落在配置的哪一段上（§7.10）。
+/// 光标落在配置的哪一段上。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigAt {
     /// `providers` / `groups` / `routes` / `clients`…
@@ -661,7 +661,7 @@ pub struct ConfigAt {
 /// 整份文本写回去（文本模式）。
 ///
 /// **和 `PATCH` 是两条路，但同一扇门。**表单模式改字段，文本模式改整份
-/// —— 后者是前者的退路（§3.8：结构性的增删一律引导到文本模式），而两者
+/// —— 后者是前者的退路（结构性的增删一律引导到文本模式），而两者
 /// 都必须带 `base_version`，都会走那三道校验。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigWrite {
@@ -695,14 +695,14 @@ pub struct RollbackRequest {
     pub version: String,
 }
 
-/// 一段时间的汇总（§4.3、§8）。
+/// 一段时间的汇总。
 ///
 /// **实测和估算分开，没有价格的单独数。**「今日 $12.40 实测 + ~$0.80
 /// 估算，另有 3 条没有价格」比一个混在一起的 $13.20 诚实得多 —— 后者
 /// 看起来是个确定的数字。
 /// 一个时间桶的花费与请求数（概览的趋势图）。
 ///
-/// **成本三态在这里不合并**（§4.3）：实测、估算、以及没有价格的条数。
+/// **成本三态在这里不合并**：实测、估算、以及没有价格的条数。
 /// 把第三种当成 0 加进柱子，那根柱子就是偏低的，而看图的人没有线索
 /// 知道少算了什么。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -740,7 +740,7 @@ pub enum CostDim {
 pub struct Summary {
     pub requests: i64,
     pub failed: i64,
-    /// 本地应答的次数。**是个正向数字**，单独显示（§4.8）
+    /// 本地应答的次数。**是个正向数字**，单独显示
     pub locally_answered: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -751,20 +751,20 @@ pub struct Summary {
     pub cost_micros_estimated: i64,
     /// 有多少条请求根本没有价格。**不是 0，是「不知道」**
     pub unpriced_requests: i64,
-    /// 走订阅型上游的请求数。**不参与金额合计**（§4.3.1）——
+    /// 走订阅型上游的请求数。**不参与金额合计** ——
     /// 订阅制的边际成本是零，按价目表算出来的数字是纯虚构的
     #[serde(default)]
     pub subscription_requests: i64,
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
     #[serde(default)]
     pub subscription_tokens: i64,
-    /// 缓存命中一共省下了多少微分（§4.4）。
+    /// 缓存命中一共省下了多少微分。
     ///
     /// **算的是差额，不是「缓存读花了多少」** —— 用户想知道的是「如果
     /// 没命中要多花多少」
     #[serde(default)]
     pub cache_saved_micros: i64,
-    /// 价目表的快照日期。**成本旁边要标它**（§4.3.0）—— 一个两个月前
+    /// 价目表的快照日期。**成本旁边要标它** —— 一个两个月前
     /// 的价目表算出来的数字，可信度和昨天的完全不同
     pub pricing_date: String,
 }
@@ -796,15 +796,15 @@ pub struct HistoryRow {
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
     pub cost_micros: Option<i64>,
-    /// 这个成本是估的吗。**界面上要标出来**（§4.3）
+    /// 这个成本是估的吗。**界面上要标出来**
     pub cost_estimated: bool,
     pub error: Option<String>,
-    /// 本地应答的（§4.8）
+    /// 本地应答的
     pub local: bool,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
     #[serde(default)]
     pub billing: String,
-    /// 缓存命中省下了多少微分。`None` = 算不出来（§4.4）
+    /// 缓存命中省下了多少微分。`None` = 算不出来
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_saved_micros: Option<i64>,
     /// 路由决策与尝试链。老记录没有它
@@ -823,7 +823,7 @@ pub struct RequestDetail {
 /// 一份存下来的 body。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BodyView {
-    /// **已脱敏**。这段文字会被复制到 issue 里（§9.7）
+    /// **已脱敏**。这段文字会被复制到 issue 里
     pub text: String,
     /// 原本多长。**截断了要能说出来** —— 不说的话用户会以为请求本身
     /// 就长这样
@@ -831,14 +831,14 @@ pub struct BodyView {
     pub truncated: bool,
 }
 
-/// 一个上游的订阅额度（§4.3.2）。
+/// 一个上游的订阅额度。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderQuota {
     pub provider: String,
     pub windows: Vec<QuotaWindow>,
 }
 
-/// L3 测速要花多少（§4.6）。
+/// L3 测速要花多少。
 ///
 /// **这是「你确认要花钱吗」那个对话框的全部内容。**触发前必须显示它，
 /// 而不是点了才知道。
@@ -860,7 +860,7 @@ pub struct SpeedEstimate {
 pub struct SpeedQuote {
     pub items: Vec<SpeedEstimate>,
     /// 总计。**有一项算不出来就是 None** —— 给一个看起来完整的数字，
-    /// 用户会以为那就是全部代价（§4.6）
+    /// 用户会以为那就是全部代价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_micros: Option<i64>,
     pub pricing_date: String,
@@ -872,7 +872,7 @@ pub struct SpeedRunRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// **必填。**同一个 provider 的 Opus 和 Haiku 是两条完全不同的曲线，
-    /// 不指定模型的测速结果没有意义（§4.6）
+    /// 不指定模型的测速结果没有意义
     pub model: String,
 }
 
@@ -896,7 +896,7 @@ pub struct SpeedResult {
     pub error: Option<String>,
 }
 
-/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」（§5.0）。
+/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」。
 ///
 /// **这比任何功能介绍都有说服力**，因为它说的是已经发生在你身上的事。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -909,7 +909,7 @@ pub struct LeakGroup {
     pub masked: Vec<String>,
 }
 
-/// 观测这一层现在能不能写（§8）。
+/// 观测这一层现在能不能写。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
     /// 「正常」/「磁盘快满了…」/「磁盘几乎满了…」
@@ -918,13 +918,13 @@ pub struct StorageStatus {
     pub rows: i64,
     /// 请求体占了多少字节
     pub blob_bytes: u64,
-    /// **转发受影响了吗。永远是 false** —— 观测挂了，代理照跑（§4.7）
+    /// **转发受影响了吗。永远是 false** —— 观测挂了，代理照跑
     pub forwarding_affected: bool,
 }
 
 /// 首次运行时写下第一个上游。
 ///
-/// **只在还没有 provider 时可用**。之后改配置走 §3.8 的双向同步（M2），
+/// **只在还没有 provider 时可用**。之后改配置走双向同步（M2），
 /// 那是另一套机制：这里是从无到有整文件生成，那边是改一个字节而保住
 /// 其余全部。混用会让「注释和格式原样保留」这条承诺失效。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -954,7 +954,7 @@ pub struct RedactedItem {
 
 // ---------------------------------------------------------------- 会话
 
-/// 一次任务（§7.9）。
+/// 一次任务。
 ///
 /// **孤立地看单个请求，看不出任何有用的东西** —— Claude Code 的一次任务
 /// 是几十到上百个请求，携带不断增长的上下文。
@@ -968,7 +968,7 @@ pub struct SessionView {
     /// 有价格的那些轮次加起来，单位是**微分**
     pub cost_micros: i64,
     /// **没有价格的轮数。**「$1.23」和「$1.23，另有 4 轮没有价格」是两个
-    /// 不同的结论（§4.3）
+    /// 不同的结论
     pub unpriced_turns: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -992,7 +992,7 @@ pub struct TurnView {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
-    /// **没有价格就是 None，不是 0**（§4.3）
+    /// **没有价格就是 None，不是 0**
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
@@ -1013,7 +1013,7 @@ pub struct ReplayRequest {
     pub provider: String,
 }
 
-/// 报价。**按下确认之前必须看到它**（和 L3 测速同一条纪律，§4.6）。
+/// 报价。**按下确认之前必须看到它**（和 L3 测速同一条纪律）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayQuote {
     pub model: String,
@@ -1052,7 +1052,7 @@ pub struct ReplayResult {
 
 // ---------------------------------------------------------- 上游行为基线
 
-/// 一个上游最近是不是变了（§5.2 防线三）。
+/// 一个上游最近是不是变了（防线三）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriftView {
     /// `tool_calls` / `flagged` / `errors`
@@ -1095,7 +1095,7 @@ pub struct BaselineResponse {
 
 // ---------------------------------------------------------------- 静态扫描
 
-/// 一处发现（§5.3）。
+/// 一处发现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanFinding {
     /// `high` | `medium` | `low`
@@ -1149,14 +1149,14 @@ pub struct HookView {
 
 /// 扫一次的结果。
 ///
-/// **不存任何东西**（§7.12）：这是此刻磁盘上的真实情况，页面关了就没了。
+/// **不存任何东西**：这是此刻磁盘上的真实情况，页面关了就没了。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResponse {
     pub findings: Vec<ScanFinding>,
     pub mcp: Vec<McpView>,
     pub skills: Vec<SkillView>,
     pub hooks: Vec<HookView>,
-    /// 同名但配置不同的 MCP server 名字（§7.12 矩阵上要标记号）
+    /// 同名但配置不同的 MCP server 名字（矩阵上要标记号）
     pub conflicting: Vec<String>,
     /// 读不动的文件。**要显示** —— 悄悄跳过会给人「查过了」的错觉
     pub unreadable: Vec<String>,
@@ -1169,7 +1169,7 @@ pub struct ScanResponse {
     pub projects: Vec<String>,
 }
 
-/// 在矩阵上点一下（§7.12）。
+/// 在矩阵上点一下。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpOpRequest {
     /// `copy` 或 `remove`
@@ -1198,7 +1198,7 @@ pub struct McpTargetView {
 
 /// 「如果现在来这样一个请求，会走到哪儿」。
 ///
-/// **每个字段都对应规则里能写的一个条件**（§3.4）。默认值就是一个最
+/// **每个字段都对应规则里能写的一个条件**。默认值就是一个最
 /// 普通的请求 —— 用户只需要改他关心的那一两个。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunRequest {
@@ -1213,7 +1213,7 @@ pub struct DryRunRequest {
     #[serde(default)]
     pub max_tokens: Option<u64>,
     /// 带了 `cache_control`。**把它路由到不支持缓存的中转站，等于把最大
-    /// 的省钱手段直接扔掉，而且不会察觉**（§3.4）
+    /// 的省钱手段直接扔掉，而且不会察觉**
     #[serde(default)]
     pub cache: bool,
     #[serde(default)]
@@ -1226,7 +1226,7 @@ pub struct DryRunRequest {
     pub thinking: bool,
     #[serde(default = "default_true")]
     pub stream: bool,
-    /// 客户端自己发的辅助请求（§4.8）。空 = 真实的用户请求
+    /// 客户端自己发的辅助请求。空 = 真实的用户请求
     #[serde(default)]
     pub intent: String,
 }
@@ -1239,7 +1239,7 @@ fn default_true() -> bool {
 }
 
 /// 一条规则在这次试算里的下场。**没命中的也要列出来，并说清为什么** ——
-/// 「为什么没走我以为的那条」和「走了哪条」是同一个问题的两面（§3.4）。
+/// 「为什么没走我以为的那条」和「走了哪条」是同一个问题的两面。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleTrace {
     pub name: String,
@@ -1270,7 +1270,7 @@ pub struct DryRunResult {
     /// 累积起来的参数改写，人话形式
     pub set: Vec<String>,
     pub trace: Vec<RuleTrace>,
-    /// 这条路会不会伤到 prompt cache。**要直说 —— 它决定账单**（§3.4）
+    /// 这条路会不会伤到 prompt cache。**要直说 —— 它决定账单**
     pub hurts_cache: bool,
     /// 候选链里此刻熔断着的那些。**试算是静态的，但熔断是当下的事实**
     pub circuit_open: Vec<String>,
@@ -1282,7 +1282,7 @@ pub struct DryRunResult {
 // config.yaml 里的一把网关密钥，这个是本机上装着的一个 AI 客户端 App。
 // 中文都叫「客户端」，混起来的话，「有几个客户端」这句话就有两个答案。
 
-/// 一个客户端此刻的样子（§7.11）。
+/// 一个客户端此刻的样子。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedClient {
     pub id: String,
@@ -1305,7 +1305,7 @@ pub struct DetectedClient {
     /// 接管之后要不要在「一直没收到请求」时提示。
     ///
     /// **需要重开终端的客户端不提示** —— 用户可能一整天都没重开过，那时
-    /// 弹「是不是没生效」是狼来了（§7.11）
+    /// 弹「是不是没生效」是狼来了
     pub warns_when_silent: bool,
     /// `measured` | `fields_only`
     pub verified: String,
@@ -1336,7 +1336,7 @@ pub struct ClientsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdoptRequest {
     pub client: String,
-    /// 用哪把网关密钥。不写就用第一把 —— §0.6：为「一个 key 就够」的人设计
+    /// 用哪把网关密钥。不写就用第一把 —— 为「一个 key 就够」的人设计
     #[serde(default)]
     pub key_name: Option<String>,
 }

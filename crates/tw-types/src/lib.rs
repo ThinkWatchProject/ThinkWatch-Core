@@ -296,7 +296,7 @@ pub fn substitute_template(
     out
 }
 
-/// 并发上限（DESIGN.md §4.7）。住在 tw-types 是因为配置和数据面都要认
+/// 并发上限。住在 tw-types 是因为配置和数据面都要认
 /// 它，而它本身只是几个数字 —— 不该为此让 tw-config 依赖 tw-gateway。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
@@ -338,8 +338,8 @@ impl Default for Limits {
     }
 }
 
-/// RFC1918 三个私网段 + 回环。监听非 loopback 时 `allow_from` 的默认值
-/// （DESIGN.md §5.4）。住在这里是因为配置层要用它填默认值，数据面要用它
+/// RFC1918 三个私网段 + 回环。监听非 loopback 时 `allow_from` 的默认值。
+/// 住在这里是因为配置层要用它填默认值，数据面要用它
 /// 判断 —— 而它只是一组字符串。
 pub const PRIVATE_RANGES: &[&str] = &[
     "127.0.0.0/8",

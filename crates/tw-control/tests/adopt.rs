@@ -1,4 +1,4 @@
-//! 接管端点的形状（DESIGN.md §7.11）。
+//! 接管端点的形状。
 //!
 //! 这些测试盯的不是「能不能跑通」，而是几条**必须成立的纪律**：
 //! plan 不写盘、密钥不回显、还原不拿备份覆盖、以及「已接管」不等于
@@ -169,7 +169,7 @@ async fn adopt_then_restore_puts_the_users_file_back() {
 #[tokio::test]
 async fn adopting_reports_being_adopted_but_never_claims_it_took_effect() {
     // 「已接管」和「已生效」是两回事。**我们改了一个文件，但那个文件
-    // 有没有被读到，只有请求能证明**（§7.11）。
+    // 有没有被读到，只有请求能证明**。
     let b = bed();
     std::fs::write(b.home.join(".claude/settings.json"), CLAUDE).unwrap();
     post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
@@ -225,7 +225,7 @@ async fn the_diagnosis_hands_over_a_command_rather_than_running_it() {
             .contains("export"),
         "我们把用户的 .zshrc 改了"
     );
-    // 查干净的项也要说出来（§0.6）
+    // 查干净的项也要说出来
     assert!(v.iter().any(|f| f.level == "clear"), "{v:?}");
 }
 
@@ -320,7 +320,7 @@ async fn copying_a_server_between_clients_is_a_plan_then_an_apply() {
 
 #[tokio::test]
 async fn removing_a_server_is_the_emergency_switch_and_it_really_deletes() {
-    // §7.12：它比「留一个 enabled: false 的中间状态」更直接。
+    // 它比「留一个 enabled: false 的中间状态」更直接。
     let b = bed();
     std::fs::write(b.home.join(".claude.json"), CLAUDE_JSON).unwrap();
     let body = r#"{"op":"remove","name":"filesystem","to":"claude-code"}"#;
@@ -348,7 +348,7 @@ async fn a_client_whose_mcp_shape_we_have_not_verified_refuses_and_explains() {
 
 #[tokio::test]
 async fn the_target_list_says_which_ones_can_be_written_and_why_not() {
-    // 不能写的照样列出来 —— 看得见是 §7.12 的第一目标。
+    // 不能写的照样列出来 —— 看得见是第一目标。
     let b = bed();
     let (st, out) = get(&b.app, "/mcp/targets").await;
     assert_eq!(st, StatusCode::OK);
@@ -361,7 +361,7 @@ async fn the_target_list_says_which_ones_can_be_written_and_why_not() {
 
 #[tokio::test]
 async fn the_watcher_reports_only_what_just_appeared() {
-    // §5.3 的 diff 扫描：**「一个用了半年的 skill 突然多了一段零宽字符」
+    // diff 扫描：**「一个用了半年的 skill 突然多了一段零宽字符」
     // 这个信号，比「这个文件里有可疑内容」强得多。**
     let b = bed();
     let skill = b.home.join(".claude/skills/格式化/SKILL.md");
@@ -404,7 +404,7 @@ fn alerts_rules(alerts: &[tw_api::ScanFinding]) -> Vec<String> {
 
 #[tokio::test]
 async fn the_watcher_never_touches_a_file() {
-    // §5.3 写死的那条：只报告，不自动删除。
+    // 写死的那条纪律：只报告，不自动删除。
     let b = bed();
     let p = b.home.join(".claude/CLAUDE.md");
     std::fs::write(&p, "# 我的项目约定\n").unwrap();
@@ -469,7 +469,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
 
 #[tokio::test]
 async fn a_quote_is_required_before_spending_money() {
-    // 和 L3 测速同一条纪律（§4.6）：报价和真跑是两个端点。
+    // 和 L3 测速同一条纪律：报价和真跑是两个端点。
     let b = bed();
     // 没有观测层时两个端点都该明说，而不是假装成功
     let (st, _) = post(&b.app, "/replay/quote", r#"{"id":1,"provider":"官方"}"#).await;
@@ -493,8 +493,8 @@ async fn replaying_a_request_that_is_gone_says_so() {
 
 #[tokio::test]
 async fn the_diagnostic_bundle_never_carries_a_key_in_the_clear() {
-    // **我们是一个看得见所有 API key 的网关**，而这份东西会被贴进 issue
-    // （§9.7）。这条测试是那句话的全部保障。
+    // **我们是一个看得见所有 API key 的网关**，而这份东西会被贴进 issue。
+    // 这条测试是那句话的全部保障。
     let b = bed();
     let (st, text) = get(&b.app, "/diagnostics").await;
     assert_eq!(st, StatusCode::OK);

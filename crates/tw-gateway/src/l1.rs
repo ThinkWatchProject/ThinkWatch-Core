@@ -1,4 +1,4 @@
-//! L1 · 连通性：DNS → TCP → TLS 的分段耗时（§4.6）。
+//! L1 · 连通性：DNS → TCP → TLS 的分段耗时。
 //!
 //! **不发任何业务请求，零成本零副作用**，可以随便点、可以定期自动跑。
 //!
@@ -212,7 +212,7 @@ pub async fn l1(base_url: &str, proxy: Option<&ProxyHop>) -> L1Result {
 /// 给代理用。**测代理和测上游是两种测量，不是同一种的参数不同** ——
 /// 拿一个编出来的 `http://` URL 去复用 `l1`，结果里会多一句「这是一个
 /// http:// 地址，没有 TLS 这一段」，而那个 http 是我们自己编的，用户
-/// 从没写过。§4.6：代理测速就到这一层为止。
+/// 从没写过。代理测速就到这一层为止。
 pub async fn l1_tcp(hostport: &str) -> L1Result {
     let mut t = Timer::new();
     let (host, port) = match split_hostport(hostport) {
@@ -815,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn socks5h_sends_the_domain_and_socks5_sends_the_ip() {
-        // 这个差别是 §3.7 里唯一真正重要的一条：本地 DNS 被污染时，
+        // 这个差别是唯一真正重要的一条：本地 DNS 被污染时，
         // socks5 解析出来的 IP 根本连不通，即使代理本身是好的。
         let (a, rx) = fake_socks5(Socks5Opts {
             need_auth: false,

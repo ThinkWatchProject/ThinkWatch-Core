@@ -1,4 +1,4 @@
-//! 订阅额度：**答案就在响应头里**（DESIGN.md §4.3.2）。
+//! 订阅额度：**答案就在响应头里**。
 //!
 //! 按量付费的用户看金额，订阅用户看百分比 —— 而后者那个数字一直在我们
 //! 手上：Anthropic 在**每一个响应**的头里带着订阅窗口的用量，Codex 是
@@ -13,7 +13,7 @@
 //! 代价。
 //!
 //! 一条贯穿这里的纪律：**分清真实信号和本地猜测。**上游给的数字可以
-//! 直接显示，我们推断的要标成推断。理由和 §4.3 的三态成本完全一样：
+//! 直接显示，我们推断的要标成推断。理由和三态成本完全一样：
 //! **一个编出来的精确数字，比一个诚实的「不知道」更有害。**
 
 use axum::http::HeaderMap;
@@ -36,7 +36,7 @@ pub struct Window {
 }
 
 impl Window {
-    /// 上游说「快到了」。**限流不再是突然发生的**（§4.3.2）。
+    /// 上游说「快到了」。**限流不再是突然发生的**。
     pub fn warning(&self) -> bool {
         matches!(self.status.as_deref(), Some("allowed_warning"))
             // 上游没给 status 时，用百分比自己判 —— 而这一条是**推断**，
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn an_upstream_warning_is_taken_at_face_value() {
-        // **限流不再是突然发生的**（§4.3.2）。
+        // **限流不再是突然发生的**。
         let q = from_headers(&headers(&[
             ("anthropic-ratelimit-unified-5h-utilization", "30"),
             ("anthropic-ratelimit-unified-5h-status", "allowed_warning"),

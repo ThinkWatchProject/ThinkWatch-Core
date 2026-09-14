@@ -1,6 +1,6 @@
 version: 1
 name: openai-流式-末尾一个 usage
-note: 按 §4.3 的方言表构造：OpenAI 流式把 usage 放在最后一个 chunk。不是实录。
+note: 按方言表构造：OpenAI 流式把 usage 放在最后一个 chunk。不是实录。
 recorded_at_ms: 0
 request:
   path: /v1/chat/completions

@@ -1,12 +1,12 @@
 //! 模型列表：每个客户端看到什么。
 //!
-//! 三句话（DESIGN.md §3.9）：
+//! 三句话：
 //!
 //! 1. **模型列表不用你写。** 去问每个上游「你有哪些模型」，汇总起来。
 //! 2. **每个客户端看到的是这份汇总的一个子集**，默认按它说什么方言过滤。
 //! 3. **想再限制，加一行 `allow`。**
 //!
-//! 模型选了之后走哪个上游是另一回事 —— 那是路由规则（§3.4）的职责。
+//! 模型选了之后走哪个上游是另一回事 —— 那是路由规则的职责。
 //! **这两件事分开，是整个设计的关键**：让目录也决定去向，就会和路由
 //! 打架，而「一个 250k 的 sonnet 请求听谁的」没有自然的答案。
 
@@ -73,7 +73,7 @@ impl Catalog {
         self.by_model.is_empty()
     }
 
-    /// **唯一的真相来源**（§3.9）。
+    /// **唯一的真相来源**。
     ///
     /// `GET /v1/models` 把它列出来，`POST /v1/messages` 检查请求的模型在
     /// 不在里面 —— 同一个函数。这样列表和准入不可能不一致，而 one-api 和
@@ -132,7 +132,7 @@ mod tests {
     }
 
     fn catalog() -> Catalog {
-        // §3.9 里跟着走的那个例子
+        // 跟着走的那个例子
         Catalog::build(&[
             pm(
                 "anthropic-official",
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn provider_order_is_preserved_because_it_is_the_failover_order() {
-        // 声明顺序就是故障转移的优先级（§3.4 层 0）。目录不能把它打乱。
+        // 声明顺序就是故障转移的优先级（层 0）。目录不能把它打乱。
         let c = Catalog::build(&[
             pm("second", "anthropic", &["m"]),
             pm("first", "anthropic", &["m"]),
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn admission_and_listing_agree_by_construction() {
-        // 这是这个模块存在的核心理由（§3.9「一个函数，两处调用」）。
+        // 这是这个模块存在的核心理由：**一个函数，两处调用**。
         // 两处各写一遍的话，「列表里有但用不了」这种状态迟早出现。
         let c = catalog();
         for dialect in [Some("anthropic"), Some("openai-chat"), None] {

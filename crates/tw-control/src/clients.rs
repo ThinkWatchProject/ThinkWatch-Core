@@ -1,4 +1,4 @@
-//! 客户端接管的控制面（DESIGN.md §7.11）。
+//! 客户端接管的控制面。
 //!
 //! 这是全项目唯一会写用户其他软件配置的地方，所以端点的形状也是刻意的：
 //! **`plan` 和 `adopt` 是两个端点**，中间必须夹一次人的确认。一个
@@ -33,7 +33,7 @@ fn gateway_base(s: &ControlState) -> String {
 
 fn gateway_for(s: &ControlState, key_name: Option<&str>) -> Result<Gateway, Fail> {
     let cfg = s.config();
-    // §0.6：为「一个 key 就够」的人设计 —— 没指定就用第一把。
+    // 为「一个 key 就够」的人设计 —— 没指定就用第一把。
     let key = match key_name {
         Some(n) => cfg.clients.iter().find(|c| c.name == n).ok_or_else(|| {
             (
@@ -57,7 +57,7 @@ fn gateway_for(s: &ControlState, key_name: Option<&str>) -> Result<Gateway, Fail
 
 pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsResponse>, Fail> {
     // 观察窗口的依据：**我们改了一个文件，但那个文件有没有被读到，
-    // 只有请求能证明**（§7.11）。
+    // 只有请求能证明**。
     let seen: Vec<(String, i64)> = match &s.store {
         Some(st) => st.lock().await.db().last_seen_by_hint().unwrap_or_default(),
         None => Vec::new(),
@@ -207,7 +207,7 @@ pub async fn adopt(
         backup: a.backup.display().to_string(),
         created: a.created,
         warnings: a.warnings,
-        // **在接管完成那一屏说，不是等五分钟后再说**（§7.11）
+        // **在接管完成那一屏说，不是等五分钟后再说**
         takes_effect_note: c.takes_effect.note().to_string(),
     }))
 }
@@ -216,7 +216,7 @@ pub async fn adopt(
 ///
 /// **走的是「把我们写的那几个字段改回去」，不是「拿全文备份覆盖」**
 /// —— 后者会把用户这三个月里加的 MCP server、调的权限、写的 hook 全部
-/// 抹掉（§7.15）。
+/// 抹掉。
 pub async fn restore(
     State(s): State<ControlState>,
     Path(id): Path<String>,

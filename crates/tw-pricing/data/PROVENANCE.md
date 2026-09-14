@@ -11,7 +11,7 @@
 
 ## Why this source
 
-The field that decided it (DESIGN.md §4.3.0):
+The field that decided it:
 
 ```
 cache_creation_input_token_cost_above_1hr
@@ -39,7 +39,7 @@ curl -sL "https://raw.githubusercontent.com/BerriAI/litellm/<SHA>/model_prices_a
 
 Then **update the SHA and the date in this file** — the freshness workflow
 reads both straight out of the table above — and run the two-source
-cross-check before release (§4.3.0): for the dozen or so models people
+cross-check before release: for the dozen or so models people
 actually use, compare line by line against **the vendor's own pricing page**.
 Not against a second third-party dataset; that only moves the bet somewhere
 else.

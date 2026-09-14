@@ -1,8 +1,8 @@
-//! 扫一遍，把看到的和担心的分开说（DESIGN.md §5.3、§7.12）。
+//! 扫一遍，把看到的和担心的分开说。
 //!
 //! 两个消费者共用这一份结果：
 //!
-//! | | §5.3 安全 | §7.12 清单 |
+//! | | 安全 | 清单 |
 //! |---|---|---|
 //! | 要的是 | 告警 | 此刻的真实状态 |
 //! | 存哪 | 进 `data.db`，要有历史 | **只在内存** |
@@ -11,7 +11,7 @@
 //!
 //! # 只报告，不自动删除
 //!
-//! 这一条写死（§5.3）。误报删掉用户的正常配置比漏报还糟 —— 它会摧毁
+//! 这一条写死。误报删掉用户的正常配置比漏报还糟 —— 它会摧毁
 //! 信任，然后用户关掉整个功能，连真正有用的那些告警一起关掉。这个模块
 //! 里没有任何一处会删东西，有测试盯着。
 
@@ -50,7 +50,7 @@ pub struct Finding {
     pub kind: sources::Kind,
     pub client: String,
     pub path: PathBuf,
-    /// 第几行，从 1 开始。**要能定位到行**（§5.3）
+    /// 第几行，从 1 开始。**要能定位到行**
     pub line: usize,
     pub title: String,
     /// 为什么它值得看一眼
@@ -84,7 +84,7 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// 判断「同名不同配置」用的指纹（§7.12 矩阵上要标记号）。
+    /// 判断「同名不同配置」用的指纹（矩阵上要标记号）。
     pub fn shape(&self) -> String {
         match &self.url {
             Some(u) => format!("远端 {u}"),
@@ -362,7 +362,7 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                 .unwrap_or_default();
             let tools = allowed_tools(&text);
             // **`*` 意味着这个 skill 能用任何工具。**它可能完全正当，
-            // 但用户有权知道自己装了这么一个东西（§5.3）
+            // 但用户有权知道自己装了这么一个东西
             if tools.iter().any(|t| t == "*") {
                 let (line, excerpt) = line_of(&text, "*");
                 r.findings.push(Finding {
@@ -435,7 +435,7 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
     r
 }
 
-/// 同名但配置不同的 MCP server（§7.12 矩阵上要标记号）。
+/// 同名但配置不同的 MCP server（矩阵上要标记号）。
 pub fn conflicting(mcp: &[McpServer]) -> Vec<String> {
     let mut by_name: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for m in mcp {

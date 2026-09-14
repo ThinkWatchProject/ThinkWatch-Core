@@ -1,4 +1,4 @@
-//! 在**原文本**上做最小替换的 YAML 补丁层（DESIGN.md §3.8）。
+//! 在**原文本**上做最小替换的 YAML 补丁层。
 //!
 //! **绝对不能「反序列化 → 改结构体 → 重新序列化」。**那会丢注释、重排
 //! 键序、统一引号风格 —— 等于每次改一个字段就把用户的文件重写一遍。
@@ -105,7 +105,7 @@ pub fn show(path: &[Step]) -> String {
 pub struct Found {
     /// **字节区间**。saphyr 的 marker 是按 char 计的，这里已经换算过了 ——
     /// 中文配置下两者差得很远，而按 char 的下标去切 `&str` 会 panic
-    /// （§9.7 里 cc-switch 栽过两次的那个坑）。
+    /// （cc-switch 栽过两次的那个坑）。
     pub bytes: Range<usize>,
     pub value: String,
     pub style: ScalarStyle,
@@ -146,7 +146,7 @@ impl CharToByte {
 /// **解析器给的 `end` 会一路跑到下一个 token 的开头** —— 对
 /// `base_url: 'https://x'   # 尾注释` 来说，那意味着 span 里包着那句
 /// 注释。照着它替换，用户的注释就没了：一个「只改了一个字段」的操作，
-/// 悄悄吃掉了他写的东西。这是 §3.8 最怕的那类失败。
+/// 悄悄吃掉了他写的东西。这是最怕的那类失败。
 fn tighten(raw: &str, style: ScalarStyle) -> usize {
     match style {
         ScalarStyle::SingleQuoted => closing_quote(raw, '\'', false),
@@ -226,7 +226,7 @@ pub struct Node {
 
 /// 光标停在这个字节位置上时，它落在哪个节点里。
 ///
-/// 给 §7.10 的反向联动用：文本模式里光标停在某个 provider 上 → 侧边
+/// 给反向联动用：文本模式里光标停在某个 provider 上 → 侧边
 /// 显示它的表单。
 ///
 /// **用解析器算，不用正则猜。**猜错的表现是「我明明点在中转上，右边
@@ -393,7 +393,7 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
         return Err(PatchError::AnchorOrAlias(show(path)));
     }
     // 块标量原地改要重排缩进，而缩进在块标量里**是内容的一部分** ——
-    // 改错一格就改了值。这一层不碰它们（§3.8 的退路：结构性的东西
+    // 改错一格就改了值。这一层不碰它们（退路：结构性的东西
     // 引导到文本模式）。
     if matches!(found.style, ScalarStyle::Literal | ScalarStyle::Folded) {
         return Err(PatchError::BlockScalar(show(path)));
@@ -438,7 +438,7 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
 /// # 边界
 ///
 /// 只插**标量**，而且父节点必须已经是个映射。新增一个列表项（多一个
-/// provider）仍然走文本模式 —— 那是结构性改动，§3.8 的退路说得很清楚。
+/// provider）仍然走文本模式 —— 那是结构性改动，退路说得很清楚。
 ///
 /// 插在父映射**最后一个子键的下一行**，缩进抄那一行的。不去猜「该插在
 /// 哪两行之间」—— 那只会打乱用户自己排的顺序。
@@ -469,7 +469,7 @@ pub fn insert(text: &str, path: &[Step], value: &Scalar) -> Result<String, Patch
     //
     // 按块式的做法在下一行插，产出的是一份解析不了的 YAML —— 护栏会
     // 拦住，但那时用户看到的是「这是个 bug，请贴到 issue 里」，而他
-    // 只是用了一种完全合法的写法。§3.8 的格式保留语料里本来就列了
+    // 只是用了一种完全合法的写法。格式保留语料里本来就列了
     // 「流式与块式混排」。
     if text[p.bytes.start..].starts_with('{') {
         let close = flow_end(text, p.bytes.start)

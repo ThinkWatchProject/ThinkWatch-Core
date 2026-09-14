@@ -1,4 +1,4 @@
-//! 路由试算（DESIGN.md §3.4、§11 的 M4）。
+//! 路由试算（M4）。
 //!
 //! 回答的不是「会走到哪儿」，而是**「为什么没走我以为的那条」**。这两个
 //! 是同一个问题的两面，而后者才是用户真正在问的 —— 所以每条没命中的
@@ -8,7 +8,7 @@
 
 use axum::{Json, extract::State, http::StatusCode};
 
-/// 和数据面同一段排序（§3.5）。
+/// 和数据面同一段排序。
 ///
 /// 试算页存在的全部意义是「告诉你这条请求会走哪儿」，所以它**必须**用
 /// 同一个函数、同一份数字 —— 各算各的话，两边迟早会不一样，而那时
@@ -162,7 +162,7 @@ pub async fn dry_run(
                 .collect();
             out.set = describe(&d.set);
             // **顺序要和数据面一样，否则试算就是在撒谎。**`load-balance`
-            // / `url-test` / `cheapest` 的次序由运行时的数字定（§3.5），
+            // / `url-test` / `cheapest` 的次序由运行时的数字定，
             // 这里走的是同一个 `order`，喂的是同一份延迟表和价目表。
             //
             // 会话那一维**故意留空**：试算是「假设现在来一个请求」，
@@ -194,7 +194,7 @@ fn describe(set: &tw_engine::SetAction) -> Vec<String> {
     let mut v = Vec::new();
     if let Some(m) = &set.model {
         // 换模型会作废整个 prompt cache，而这件事在长会话里可能比不换
-        // 还贵（§3.4）—— 试算里就要说出来
+        // 还贵 —— 试算里就要说出来
         v.push(format!("换模型 → {m}（会作废整个 prompt cache）"));
     }
     if let Some(t) = set.max_tokens {

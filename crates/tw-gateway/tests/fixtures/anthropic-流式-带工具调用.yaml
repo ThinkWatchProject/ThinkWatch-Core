@@ -1,6 +1,6 @@
 version: 1
 name: anthropic-流式-带工具调用
-note: 按 §4.3 的方言表构造：Anthropic 流式把输入放 message_start、输出放 message_delta。不是实录。
+note: 按方言表构造：Anthropic 流式把输入放 message_start、输出放 message_delta。不是实录。
 recorded_at_ms: 0
 request:
   path: /v1/messages

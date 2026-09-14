@@ -1,7 +1,7 @@
-//! 起一个后台任务，把事件流写进库里（DESIGN.md §8）。
+//! 起一个后台任务，把事件流写进库里。
 //!
 //! **它订阅事件总线，而不是被数据面直接调用。**这条边界是刻意的：写库
-//! 慢了、库锁住了、磁盘满了，转发这条路上一行代码都不会等它（§4.7）。
+//! 慢了、库锁住了、磁盘满了，转发这条路上一行代码都不会等它。
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use crate::recorder::Recorder;
 /// 一份等着落盘的 body。
 ///
 /// **这个类型属于 store，不属于网关。**让 store 依赖网关会把「观测」
-/// 挂到「转发」下面，而它们是两件平级的事（§9.0.1 的两层划分）——
+/// 挂到「转发」下面，而它们是两件平级的事（两层划分） ——
 /// 网关那边有自己的同形结构，接线在 `twcore` 里完成，那是唯一同时看得
 /// 见两边的地方。
 #[derive(Debug)]
@@ -32,7 +32,7 @@ pub struct StoredBody {
 /// 好几天，而 body 的保留策略是按天算的。
 const GC_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// metadata 留多少天（§8）。
+/// metadata 留多少天。
 pub const METADATA_KEEP_DAYS: u64 = 90;
 
 /// 起来。返回的 handle 给别的地方查历史用 —— **同一个 Recorder**，
@@ -47,7 +47,7 @@ pub fn spawn(
     tokio::spawn(async move {
         while let Some(b) = bodies.recv().await {
             // **写盘在这条任务上，不在转发那条路上。**慢磁盘只会让
-            // 通道积压然后丢，不会让请求变慢（§4.7）。
+            // 通道积压然后丢，不会让请求变慢。
             r.lock()
                 .await
                 .record_body(b.at_ms, b.id, b.which, &b.body, b.original_len);

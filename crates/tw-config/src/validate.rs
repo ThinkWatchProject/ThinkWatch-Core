@@ -39,7 +39,7 @@ pub enum ValidationError {
 /// `key:` 到底哪儿写错了。
 ///
 /// **有 `oauth:` 的时候要让 serde 自己说。**「unknown field `refresh_befor`,
-/// expected one of ...」比我们能补的任何一句话都准（§3.8 那条，只是它
+/// expected one of ...」比我们能补的任何一句话都准（那条，只是它
 /// 在 untagged 枚举上失效了，得手动把那条路走一遍）。
 fn explain_key(v: &serde_yaml_ng::Value) -> String {
     if let Some(inner) = v.get("oauth") {
@@ -68,7 +68,7 @@ fn explain_key(v: &serde_yaml_ng::Value) -> String {
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     // 版本检查放在最前面：一个来自更新版本的配置，我们对它的任何
-    // 其他判断都不作数（§9.7 的「schema 太新」）。
+    // 其他判断都不作数（「schema 太新」）。
     if cfg.version > SCHEMA_VERSION {
         return Err(ValidationError::SchemaTooNew {
             found: cfg.version,
@@ -77,13 +77,13 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     }
     // **零个 provider 是合法的**，这是实现时改的一个设计：
     //
-    // 首次运行的第一步是生成一份还没有上游的配置（§7.6），如果那样的
+    // 首次运行的第一步是生成一份还没有上游的配置，如果那样的
     // 配置过不了校验，core 就起不来 —— 而 core 起不来意味着控制面也
     // 起不来，UI 连「你还没配上游」都说不出口，只能显示一个启动失败。
     //
     // 正确的分工是：**配置合法 ≠ 能转发**。零 provider 的配置能加载、
     // 控制面能起来、引导流程能跑；数据面在收到请求时给一条说清楚下一
-    // 步的错误。这和 §0.6「配一个 API 就能用」是同一条线 —— 那句话的
+    // 步的错误。这和「配一个 API 就能用」是同一条线 —— 那句话的
     // 前提是应用能打开。
     if cfg.clients.is_empty() {
         return Err(ValidationError::NoClients);
@@ -160,7 +160,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     }
 
     // 路由规则的目标、比较式写法，都在这里查。**一条永远不命中、或者
-    // 指向不存在的 provider 的规则，在运行时是完全静默的**（§7.11 的
+    // 指向不存在的 provider 的规则，在运行时是完全静默的**（
     // 「我明明配了为什么不生效」）。
     cfg.engine().validate()?;
     Ok(())
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn an_oauth_key_with_a_typo_lets_serde_say_which_field() {
-        // **serde 自己的话比我们能补的任何一句都准**（§3.8）——
+        // **serde 自己的话比我们能补的任何一句都准** ——
         // 只是在 untagged 枚举上它不出声，得手动把那条路再走一遍
         let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      oauth:\n        refresh: r\n        endpoint: https://a/token\n        refresh_befor: 5m\n";
         let e = crate::try_parse(y).unwrap_err().message;
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn exposing_the_gateway_defaults_the_allow_list_to_private_ranges() {
-        // **不是放行所有**（§5.4）。想放开得手动写 0.0.0.0/0，那时他
+        // **不是放行所有**。想放开得手动写 0.0.0.0/0，那时他
         // 至少知道自己做了什么。
         let mut k = cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")]);
         assert!(
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn error_messages_say_what_to_do_next() {
-        // 错误信息是降低使用难度最有效的杠杆（§0.6）。判据不是「说清
+        // 错误信息是降低使用难度最有效的杠杆。判据不是「说清
         // 哪里错了」，是「说清接下来做什么」。
         let e = validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "api.example.com")])).unwrap_err();
         assert!(e.to_string().contains("http"), "{e}");

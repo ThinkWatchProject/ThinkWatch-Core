@@ -1,5 +1,5 @@
 //! 打码。所有会被人看见的地方 —— 日志、UI、错误信息、导出、剪贴板 ——
-//! 都必须过这里，而不是各写一遍（DESIGN.md §9.7）。
+//! 都必须过这里，而不是各写一遍。
 
 /// 把一个密钥打成 `sk-a…7f9c` 这样：留头 5 尾 4，中间省略。
 ///
@@ -186,7 +186,7 @@ fn is_secret_name(name: &str) -> bool {
         "passwd",
         "credential",
         "auth",
-        // OAuth 的四个（§3.6）。**`refresh` 是这里面最值钱的** ——
+        // OAuth 的四个。**`refresh` 是这里面最值钱的** ——
         // 它换得出无数个 access token，所以泄漏它比泄漏 access 严重。
         // 少了这几个名字，一份 OAuth 凭据在配置报错摘录里会原样进
         // 界面和日志（实测过）
@@ -328,12 +328,12 @@ mod line_tests {
 ///
 /// 而诊断包的第一句话是「这份内容里的密钥都已经打码」—— **一个做不到
 /// 的承诺比不承诺更危险**，因为它正是用户决定「可以贴到 issue 里」的
-/// 依据（§9.6）。
+/// 依据。
 ///
 /// # 为什么复用 `mask_line` 而不自己写一套
 ///
 /// 引号、行尾注释、URL 里的 userinfo，这三样它都已经处理对了。**两处
-/// 标准不同的话，仔细的那一处等于白做**（§9.7）—— 这个函数第一版真的
+/// 标准不同的话，仔细的那一处等于白做** —— 这个函数第一版真的
 /// 自己写了一套引号和注释规则，那是错的。
 ///
 /// 这一层只加 `mask_line` 看不见的那件事：`key: |` 之后的几行。
@@ -425,7 +425,7 @@ mod tests {
 /// 一整段 body 里的密钥打掉。
 ///
 /// 请求体里有 system prompt、工具定义，有时还有用户自己粘进去的密钥；
-/// 而这段文字会出现在详情抽屉里、被复制到 issue 里（§9.7 的统一脱敏）。
+/// 而这段文字会出现在详情抽屉里、被复制到 issue 里（统一脱敏）。
 ///
 /// **按值的形状判，不按键名。**body 是 JSON，键名五花八门（`api_key`、
 /// `token`、`Authorization`、某个 MCP server 自己起的名字），而凭据的
@@ -467,7 +467,7 @@ mod body_tests {
     #[test]
     fn a_key_pasted_into_a_request_body_is_masked() {
         // 用户在对话里粘一把 key 是常事（「帮我看看这个配置」）。而这段
-        // 文字会出现在详情抽屉、被复制到 issue 里（§9.7）。
+        // 文字会出现在详情抽屉、被复制到 issue 里。
         let b = r#"{"messages":[{"role":"user","content":"我的 key 是 sk-ant-api03-abcdefghijklmnopqrstuvwxyz"}]}"#;
         let out = mask_body(b);
         assert!(!out.contains("abcdefghijklmnop"), "{out}");
@@ -589,7 +589,7 @@ mod body_tests {
 
     #[test]
     fn a_multibyte_body_does_not_panic() {
-        // 按字节切 &str 的坑在这一层同样存在（§9.7）。
+        // 按字节切 &str 的坑在这一层同样存在。
         for s in [
             "中文中文中文 sk-ant-api03-abcdefghijklmnop 中文",
             "🙂🙂🙂",

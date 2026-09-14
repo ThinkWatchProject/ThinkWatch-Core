@@ -1,6 +1,6 @@
 //! 转发：拿到选中的 provider，把请求原样送出去。
 //!
-//! **出站直通**（DESIGN.md §4.1）：请求体一个字节都不改。这不只是省事 ——
+//! **出站直通**：请求体一个字节都不改。这不只是省事 ——
 //! cc-switch 有一次为了兼容性把 `role=system` 消息提到顶层，结果上游的
 //! 前缀缓存命中率从 99% 掉到 20%，而且是静默的，只有账单会涨。任何 body
 //! 改写都可能是缓存杀手。
@@ -42,7 +42,7 @@ pub fn apply_credential(
 
 /// 这个方言把凭据放在哪个头上。
 ///
-/// **WS 升级那条路也走它**（§3.6）：各写一份的话，两条路迟早会在
+/// **WS 升级那条路也走它**：各写一份的话，两条路迟早会在
 /// 「Gemini 用哪个头」这种事上不一致，而那时只有一条路是对的。
 pub fn credential_header(
     protocol: Option<tw_config::Protocol>,
@@ -68,7 +68,7 @@ pub fn forward_headers(
 
 /// 同上，但再过一道调用方给的筛子。
 ///
-/// 方言互转要用它（§11 的 M6+）：翻译到另一边之后，方言专属的头全是
+/// 方言互转要用它（M6+）：翻译到另一边之后，方言专属的头全是
 /// 噪音，而有些 OpenAI 兼容实现会因为不认识的头直接 400。
 pub fn forward_headers_filtered(
     builder: reqwest::RequestBuilder,
@@ -119,7 +119,7 @@ pub fn response_headers(upstream: &reqwest::header::HeaderMap) -> HeaderMap {
 
 /// 按规则改写请求体。
 ///
-/// **`set` 为空时原样返回，一个字节都不碰**（§4.1）。改写是用户显式要求
+/// **`set` 为空时原样返回，一个字节都不碰**。改写是用户显式要求
 /// 的例外，不是默认行为 —— cc-switch 那次把缓存命中率从 99% 打到 20%，
 /// 就是因为一个「看起来无害」的重写跑在了每个请求上。
 pub fn apply_set(body: &Bytes, set: &tw_engine::SetAction) -> Bytes {
@@ -254,13 +254,13 @@ mod tests {
         let out = response_headers(&up);
         assert!(!out.contains_key("content-length"));
         assert_eq!(out.get("content-type").unwrap(), "text/event-stream");
-        // 订阅额度的头必须留着 —— 那是 §4.3.2 白捡的数据来源。
+        // 订阅额度的头必须留着 —— 那是白捡的数据来源。
         assert!(out.contains_key("anthropic-ratelimit-unified-5h-utilization"));
     }
 
     #[test]
     fn an_empty_set_does_not_touch_a_single_byte() {
-        // §4.1 的出站直通。cc-switch 那次把缓存命中率从 99% 打到 20%，
+        // 出站直通。cc-switch 那次把缓存命中率从 99% 打到 20%，
         // 就是因为一个「看起来无害」的重写跑在了每个请求上。
         let b = Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
         assert_eq!(apply_set(&b, &tw_engine::SetAction::default()), b);
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_body_we_cannot_parse_is_forwarded_untouched() {
-        // 我们的解析器不认识的东西，上游可能完全认识（§4.1）。
+        // 我们的解析器不认识的东西，上游可能完全认识。
         let b = Bytes::from_static(b"not json");
         let out = apply_set(
             &b,

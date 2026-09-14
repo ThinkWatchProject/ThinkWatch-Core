@@ -12,7 +12,7 @@ tw-engine = { workspace = true }
 tw-types = { workspace = true }
 tw-secret = { workspace = true }
 tw-redact = { workspace = true }
-# 凭据轮换要把一个标量写回 config.yaml（§3.6）。**span 补丁，不是
+# 凭据轮换要把一个标量写回 config.yaml。**span 补丁，不是
 # serde 往返** —— 往返会把用户的注释和排版全洗掉
 tw-yaml = { workspace = true }
 serde = { workspace = true }

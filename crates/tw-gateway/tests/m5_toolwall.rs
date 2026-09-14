@@ -1,4 +1,4 @@
-//! M5 验收：入站审查（DESIGN.md §5.2）。
+//! M5 验收：入站审查。
 //!
 //! 验收标准的原话：**构造一个含下载执行模式的响应，`enforce` 下流被切断
 //! 且客户端拿到的工具调用不完整因而执行不了，`observe` 下放行但告警。**
@@ -145,7 +145,7 @@ async fn enforce_cuts_the_stream_and_the_tool_call_is_left_unusable() {
         "工具调用被完整地交给客户端了：{body}"
     );
     assert!(!body.contains("| sh"), "危险片段本身被转发出去了：{body}");
-    // 流上补了一个 error 帧，客户端能看出这不是正常结束（§4.6.1）
+    // 流上补了一个 error 帧，客户端能看出这不是正常结束
     assert!(
         body.contains("event: error"),
         "没有告诉客户端流是被切断的：{body}"
@@ -179,7 +179,7 @@ async fn the_client_cannot_reassemble_the_arguments_from_what_it_got() {
 
 #[tokio::test]
 async fn observe_lets_it_through_but_still_says_something() {
-    // **验收标准的后半句。**观察态只记录，不改变任何行为（§5.0）。
+    // **验收标准的后半句。**观察态只记录，不改变任何行为。
     let up = start_upstream(poisoned_stream()).await;
     let (body, mut rx) = run(config(up, SecurityMode::Observe, Trust::Untrusted)).await;
 
@@ -195,7 +195,7 @@ async fn observe_lets_it_through_but_still_says_something() {
 
 #[tokio::test]
 async fn an_official_upstream_is_only_logged_never_cut() {
-    // §5.2：处置策略按 provider 的信任级别走。官方端点只记录，不拦。
+    // 处置策略按 provider 的信任级别走。官方端点只记录，不拦。
     let up = start_upstream(poisoned_stream()).await;
     let (body, mut rx) = run(config(up, SecurityMode::Enforce, Trust::Official)).await;
 

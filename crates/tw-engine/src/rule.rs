@@ -1,6 +1,6 @@
 //! 规则的条件部分。
 //!
-//! **结构化对象，不是逗号分隔的字符串**（DESIGN.md §3.4）。初稿照搬了
+//! **结构化对象，不是逗号分隔的字符串**。初稿照搬了
 //! Clash 的 `TYPE,VALUE,TARGET`，连括号嵌套都抄了 —— 那东西写不出来也
 //! 读不懂，而且它的形状是为「匹配目标地址」设计的。
 //!
@@ -39,7 +39,7 @@ pub struct When {
     pub thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
-    /// 客户端的辅助请求（§4.8）。`assistant_internal` 匹配全部五类，
+    /// 客户端的辅助请求。`assistant_internal` 匹配全部五类，
     /// 也可以写具体的那一类，比如 `titling`。
     ///
     /// **只有把那类请求配成 `route` 才会有值** —— `intercept` 的根本
@@ -57,7 +57,7 @@ pub struct When {
 }
 
 /// 一个值或一组值。`provider_would_be: relay-cn` 和
-/// `provider_would_be: [relay-cn, relay-hk]` 都该能写 —— 后者是 §3.4 里
+/// `provider_would_be: [relay-cn, relay-hk]` 都该能写 —— 后者是
 /// `any_of` 的实际形态，而不必发明一个关键字。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn conditions_in_one_when_are_and() {
         // 「同一个 when 里多个条件默认 AND」覆盖九成需求，于是 AND
-        // 关键字和括号嵌套直接消失（§3.4）。
+        // 关键字和括号嵌套直接消失。
         let w = when("{ model: claude-sonnet-*, stream: true }");
         assert!(w.matches(&f()).unwrap());
         let w = when("{ model: claude-sonnet-*, stream: false }");
