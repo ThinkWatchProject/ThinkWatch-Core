@@ -321,20 +321,95 @@ impl ConfigManager {
         }
         let mut text = cur.text.clone();
         for op in ops {
-            let tw_api::PatchOp::Replace { path, value } = op;
-            let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
-            let scalar = match value {
-                tw_api::PatchValue::Str(v) => tw_yaml::Scalar::Str(v.clone()),
-                tw_api::PatchValue::Int(v) => tw_yaml::Scalar::Int(*v),
-                tw_api::PatchValue::Bool(v) => tw_yaml::Scalar::Bool(*v),
-                tw_api::PatchValue::Null => tw_yaml::Scalar::Null,
+            text = match op {
+                tw_api::PatchOp::Replace { path, value } => {
+                    let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
+                    let scalar = match value {
+                        tw_api::PatchValue::Str(v) => tw_yaml::Scalar::Str(v.clone()),
+                        tw_api::PatchValue::Int(v) => tw_yaml::Scalar::Int(*v),
+                        tw_api::PatchValue::Bool(v) => tw_yaml::Scalar::Bool(*v),
+                        tw_api::PatchValue::Null => tw_yaml::Scalar::Null,
+                    };
+                    // **`insert` 而不是 `set`。**配置里绝大多数字段是可选的、
+                    // 默认不写的，只能改「用户碰巧写过」的字段，等于表单模式在
+                    // 他最需要的时候是死的。已经写过的走 `set`，那是它的第一步。
+                    tw_yaml::insert(&text, &steps, &scalar)
+                        .map_err(|e| ApplyError::BadPath(format!("改 `{path}` 失败：{e}")))?
+                }
+                tw_api::PatchOp::Append { path, item } => {
+                    let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
+                    tw_yaml::append(&text, &steps, item)
+                        .map_err(|e| ApplyError::BadPath(format!("往 `{path}` 加一项失败：{e}")))?
+                }
+                tw_api::PatchOp::Remove { path } => {
+                    let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
+                    // 路径指向那一项，最后一步就是它在列表里的位置。
+                    // **按名字解析、按下标删** —— 名字是用户写的，下标是
+                    // 我们刚刚算出来的，中间没有任何一次用户可见的重排。
+                    let (last, parent) = steps.split_last().ok_or_else(|| {
+                        ApplyError::BadPath(format!("`{path}` 不指向列表里的某一项"))
+                    })?;
+                    let tw_yaml::Step::Index(i) = last else {
+                        return Err(ApplyError::BadPath(format!(
+                            "`{path}` 指的不是列表里的一项 —— 删除要指到具体那一条，比如 /clients/codex"
+                        )));
+                    };
+                    tw_yaml::remove(&text, parent, *i)
+                        .map_err(|e| ApplyError::BadPath(format!("删 `{path}` 失败：{e}")))?
+                }
             };
-            // **`insert` 而不是 `set`。**配置里绝大多数字段是可选的、
-            // 默认不写的，只能改「用户碰巧写过」的字段，等于表单模式在
-            // 他最需要的时候是死的。已经写过的走 `set`，那是它的第一步。
-            text = tw_yaml::insert(&text, &steps, &scalar)
-                .map_err(|e| ApplyError::BadPath(format!("改 `{path}` 失败：{e}")))?;
         }
         self.write(&text, Some(&cur.version()), origin).await
+    }
+}
+
+#[cfg(test)]
+mod patch_seq_tests {
+    use super::*;
+
+    const CFG: &str = "version: 1\nclients:\n  # 首次运行生成的\n  - name: default\n    key: tw-aaa\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n    key: sk-a\n";
+
+    /// 这三条是「界面能不能建东西」的全部依据。
+    #[test]
+    fn append_then_remove_by_name_round_trips_and_keeps_comments() {
+        let steps = resolve_path(CFG, "/clients").unwrap();
+        let two = tw_yaml::append(CFG, &steps, "name: codex\nkey: tw-bbb").unwrap();
+        assert!(two.contains("# 首次运行生成的"), "{two}");
+        let cfg: tw_config::Config = serde_yaml_ng::from_str(&two).unwrap();
+        assert_eq!(cfg.clients.len(), 2);
+        assert_eq!(cfg.clients[1].name, "codex");
+
+        // 按名字定位那一项，再删
+        let item = resolve_path(&two, "/clients/codex").unwrap();
+        let (last, parent) = item.split_last().unwrap();
+        let tw_yaml::Step::Index(i) = last else {
+            panic!("按名字解析出来的最后一步应该是下标：{item:?}");
+        };
+        let back = tw_yaml::remove(&two, parent, *i).unwrap();
+        let cfg: tw_config::Config = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.clients[0].name, "default");
+        assert!(back.contains("# 首次运行生成的"), "{back}");
+    }
+
+    #[test]
+    fn a_new_key_can_carry_its_route_assignment_in_one_write() {
+        // 建密钥和分配路由是**一次写入**，不是两次 —— 中间那一刻
+        // 「有一把没分配路由的密钥」是个用户能看见的错误状态。
+        let steps = resolve_path(CFG, "/clients").unwrap();
+        let out = tw_yaml::append(
+            CFG,
+            &steps,
+            "name: codex\nkey: tw-bbb\nroutes:\n  - 长上下文",
+        )
+        .unwrap();
+        let cfg: tw_config::Config = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg.clients[1].routes, vec!["长上下文".to_string()]);
+    }
+
+    #[test]
+    fn removing_a_name_that_is_not_there_says_so_instead_of_deleting_something_else() {
+        // **最该防的一条**：解析不到就报错，不要退化成「删第 0 项」。
+        assert!(resolve_path(CFG, "/clients/不存在").is_err());
     }
 }
