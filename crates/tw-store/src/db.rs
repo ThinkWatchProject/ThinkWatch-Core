@@ -768,7 +768,7 @@ impl Db {
         since_ms: i64,
         until_ms: i64,
         bucket_ms: i64,
-    ) -> Result<Vec<CostBucket>, DbError> {
+    ) -> Result<Vec<tw_api::CostBucket>, DbError> {
         if bucket_ms <= 0 {
             return Ok(Vec::new());
         }
@@ -784,7 +784,7 @@ impl Db {
              GROUP BY b ORDER BY b",
         )?;
         let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
-            Ok(CostBucket {
+            Ok(tw_api::CostBucket {
                 at_ms: since_ms + r.get::<_, i64>(0)? * bucket_ms,
                 requests: r.get(1)?,
                 failed: r.get(2)?,
@@ -803,13 +803,13 @@ impl Db {
     /// 代码完全不值。
     pub fn cost_by(
         &self,
-        dim: CostDim,
+        dim: tw_api::CostDim,
         since_ms: i64,
         until_ms: i64,
-    ) -> Result<Vec<CostGroup>, DbError> {
+    ) -> Result<Vec<tw_api::CostGroup>, DbError> {
         let col = match dim {
-            CostDim::Model => "model",
-            CostDim::Provider => "provider",
+            tw_api::CostDim::Model => "model",
+            tw_api::CostDim::Provider => "provider",
         };
         let sql = format!(
             "SELECT {col}, COUNT(*),
@@ -822,7 +822,7 @@ impl Db {
         );
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params![since_ms, until_ms], |r| {
-            Ok(CostGroup {
+            Ok(tw_api::CostGroup {
                 name: r.get(0)?,
                 requests: r.get(1)?,
                 cost_micros: r.get(2)?,
@@ -945,42 +945,6 @@ pub struct LeakGroup {
     pub masked: Vec<String>,
 }
 
-/// 一个时间桶的花费与请求数（概览的趋势图）。
-///
-/// **成本三态在这里不合并**（§4.3）：实测、估算、以及没有价格的条数。
-/// 把第三种当成 0 加进柱子，那根柱子就是偏低的，而看图的人没有线索
-/// 知道少算了什么。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CostBucket {
-    /// 桶的起点
-    pub at_ms: i64,
-    pub requests: i64,
-    pub failed: i64,
-    pub cost_micros_exact: i64,
-    pub cost_micros_estimated: i64,
-    pub unpriced_requests: i64,
-}
-
-/// 按模型或上游分组的花费（钱花在哪儿）。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CostGroup {
-    pub name: String,
-    pub requests: i64,
-    pub cost_micros: i64,
-    pub unpriced_requests: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-}
-
-/// 分组维度。**是个枚举不是字符串** —— 它最终来自 query string，
-/// 而把它拼进 SQL 的列名里就是一个注入口。
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CostDim {
-    Model,
-    Provider,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Latency {
     pub model: String,
@@ -1096,7 +1060,7 @@ mod tests {
         for r in [&cheap, &dear] {
             db.insert(r).unwrap();
         }
-        let g = db.cost_by(CostDim::Model, t0, t0 + 1000).unwrap();
+        let g = db.cost_by(tw_api::CostDim::Model, t0, t0 + 1000).unwrap();
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].name, "opus", "贵的排前面");
         assert_eq!(g[0].cost_micros, 9_000);
@@ -1114,7 +1078,7 @@ mod tests {
         db.insert(&r).unwrap();
         assert!(db.cost_buckets(t0, t0 + 1000, 1000).unwrap().is_empty());
         assert!(
-            db.cost_by(CostDim::Model, t0, t0 + 1000)
+            db.cost_by(tw_api::CostDim::Model, t0, t0 + 1000)
                 .unwrap()
                 .is_empty()
         );

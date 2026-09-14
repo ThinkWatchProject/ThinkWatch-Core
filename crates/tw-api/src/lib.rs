@@ -700,6 +700,42 @@ pub struct RollbackRequest {
 /// **实测和估算分开，没有价格的单独数。**「今日 $12.40 实测 + ~$0.80
 /// 估算，另有 3 条没有价格」比一个混在一起的 $13.20 诚实得多 —— 后者
 /// 看起来是个确定的数字。
+/// 一个时间桶的花费与请求数（概览的趋势图）。
+///
+/// **成本三态在这里不合并**（§4.3）：实测、估算、以及没有价格的条数。
+/// 把第三种当成 0 加进柱子，那根柱子就是偏低的，而看图的人没有线索
+/// 知道少算了什么。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostBucket {
+    /// 桶的起点
+    pub at_ms: i64,
+    pub requests: i64,
+    pub failed: i64,
+    pub cost_micros_exact: i64,
+    pub cost_micros_estimated: i64,
+    pub unpriced_requests: i64,
+}
+
+/// 按模型或上游分组的花费（钱花在哪儿）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostGroup {
+    pub name: String,
+    pub requests: i64,
+    pub cost_micros: i64,
+    pub unpriced_requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// 分组维度。**是个枚举不是字符串** —— 它最终来自 query string，
+/// 而把它拼进 SQL 的列名里就是一个注入口。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostDim {
+    Model,
+    Provider,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Summary {
     pub requests: i64,
