@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "YAML schema、加载、校验"
+description = "YAML config schema, loading, and validation"
 
 [dependencies]
 tw-engine = { workspace = true }

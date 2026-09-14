@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "检测本机的 AI 客户端，接管与还原它们的配置"
+description = "Detect local AI clients, take over their configuration, and restore it"
 
 [dependencies]
 serde = { workspace = true }
