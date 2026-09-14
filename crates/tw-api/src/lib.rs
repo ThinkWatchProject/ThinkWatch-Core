@@ -546,6 +546,19 @@ pub struct ConfigText {
     pub version: String,
 }
 
+/// 这台机器上的一张网卡（`GET /interfaces`）。
+///
+/// **界面上「绑在哪张网卡」那个选单要的就是它。**没有它，用户只能自己
+/// 去 `ifconfig` 抄一个地址填进配置文件，而填错的后果是网关起不来。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NicView {
+    /// `en0`、`lo0`、`utun3`
+    pub name: String,
+    pub addr: String,
+    /// 回环地址。界面上这一档叫「仅本机」，不该混在「选一张网卡」里
+    pub loopback: bool,
+}
+
 /// 改配置。
 ///
 /// **不是「把整份新配置发过来」**，是「基于哪一版、改哪几个字段」。

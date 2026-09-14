@@ -305,7 +305,7 @@ mod tests {
             k.listen.gateway.effective_allow_from().is_empty(),
             "loopback 下不填"
         );
-        k.listen.gateway.bind = crate::Bind::Lan;
+        k.listen.gateway.bind = crate::Bind::All;
         let eff = k.listen.gateway.effective_allow_from();
         assert!(eff.iter().any(|s| s == "192.168.0.0/16"), "{eff:?}");
         // 用户写了就用他的，不要偷偷加

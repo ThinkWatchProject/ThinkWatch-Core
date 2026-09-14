@@ -19,6 +19,7 @@ pub mod clients;
 pub mod config;
 pub mod diagnostics;
 pub mod dryrun;
+pub mod nics;
 pub mod replay;
 pub mod rotation;
 pub mod scan;
@@ -79,6 +80,7 @@ impl ControlState {
 pub fn router(state: ControlState) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/interfaces", get(interfaces))
         .route("/events", get(events))
         .route("/overview", get(overview))
         .route("/probe", post(probe))
@@ -136,6 +138,24 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/plan", post(clients::mcp_plan_op))
         .route("/mcp/apply", post(clients::mcp_apply))
         .with_state(state)
+}
+
+/// 这台机器上有哪些网卡。
+///
+/// 不带任何状态 —— 每次现问系统。**网卡是会变的**：插拔网线、连上另一
+/// 个 Wi-Fi、起一条 VPN，清单就不一样了，缓存下来只会让选单里出现一个
+/// 已经不存在的地址。
+async fn interfaces() -> Json<Vec<tw_api::NicView>> {
+    Json(
+        crate::nics::list()
+            .into_iter()
+            .map(|n| tw_api::NicView {
+                name: n.name,
+                loopback: n.addr.is_loopback(),
+                addr: n.addr.to_string(),
+            })
+            .collect(),
+    )
 }
 
 async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
