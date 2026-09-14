@@ -63,6 +63,7 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Seen>>) {
 
 async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
     let cfg = Config {
+        default_route: None,
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {
@@ -235,6 +236,7 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     // 一个跑六分钟的流式请求在列表里要六分钟后才出现。
     let (up, _) = start_upstream(true).await;
     let cfg = Config {
+        default_route: None,
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {
@@ -343,6 +345,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
         l.local_addr().unwrap().port()
     };
     let cfg = Config {
+        default_route: None,
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {
@@ -408,6 +411,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
     let (b, seen_b) = start_upstream(false).await;
 
     let cfg = Config {
+        default_route: None,
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {
@@ -513,6 +517,7 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
     // 那条纪律就是假的。
     let (up, seen) = start_upstream(false).await;
     let cfg = Config {
+        default_route: None,
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {

@@ -81,6 +81,12 @@ pub struct Config {
     /// 不写进文件（`generate_initial` 的六行里没有它）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<tw_engine::RouteSet>,
+    /// 没绑路由的密钥走哪条。不写就是叫「默认」的那条。
+    ///
+    /// **它是顶层的一个名字，不是某条路由身上的标志** —— 结构上就唯一，
+    /// 不需要一条「最多一条默认」的校验去维持。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_route: Option<String>,
 }
 
 /// 便于构造，**不代表一份可用的配置** —— `providers` 和 `clients` 都是
@@ -99,6 +105,7 @@ impl Default for Config {
             limits: Limits::default(),
             groups: Vec::new(),
             routes: Vec::new(),
+            default_route: None,
         }
     }
 }
@@ -111,7 +118,7 @@ impl Default for Client {
             key: String::new(),
             max_concurrent: None,
             allow: None,
-            routes: Vec::new(),
+            route: None,
         }
     }
 }
@@ -141,13 +148,13 @@ impl Config {
             self.providers.iter().map(|p| p.name.clone()).collect(),
             self.groups.clone(),
             self.routes.clone(),
-            // 密钥 → 它分到的路由。**引擎不认识密钥这个概念** ——
-            // 它只需要「这个名字要过哪几条路由」，所以映射在这里拍平，
+            self.default_route.clone(),
+            // 密钥 → 它绑的那条路由。**引擎不认识密钥这个概念** ——
+            // 它只需要「这个名字走哪条路由」，所以映射在这里拍平，
             // 而不是把整个 `clients` 交进去。
             self.clients
                 .iter()
-                .filter(|c| !c.routes.is_empty())
-                .map(|c| (c.name.clone(), c.routes.clone()))
+                .filter_map(|c| c.route.clone().map(|r| (c.name.clone(), r)))
                 .collect(),
         )
     }
@@ -323,14 +330,12 @@ pub struct Client {
     /// - 写 `[]` → **一个都不给**。「临时禁用这个客户端」的正当用法
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow: Option<Vec<String>>,
-    /// 这把密钥额外走哪几条路由，按写的顺序求值。
+    /// 这把密钥走哪条路由。**一把密钥一条路由。**
     ///
-    /// **默认路由不用写在这里** —— 它对每一把密钥都生效。这里写的是
-    /// 「在默认之上，这把密钥还要过哪些规则」。
-    ///
-    /// 一条路由可以分给多把密钥，不用复制。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routes: Vec<String>,
+    /// 不写就走默认路由（顶层的 `default_route`）。一条路由可以绑给
+    /// 多把密钥，规则只有一份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
     /// 网关密钥。`tw-` 前缀是刻意的：用户在客户端配置里看到它时，
     /// 一眼就知道这不是某个上游的真 key。
     pub key: String,
