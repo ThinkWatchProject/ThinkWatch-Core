@@ -9,6 +9,8 @@ description = "Control-plane API server over a unix socket"
 
 [dependencies]
 tw-api = { workspace = true }
+# 列网卡用 getifaddrs —— 比引一个 crate 便宜
+libc = { workspace = true }
 tw-config = { workspace = true }
 tw-adopt = { workspace = true }
 # 更新那份价目表时给下载内容按指纹 —— 用户看的 diff 和落盘的必须是同一份

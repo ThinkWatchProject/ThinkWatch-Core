@@ -151,13 +151,13 @@ pub struct Listen {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayListen {
-    /// loopback | lan | all | 具体 IP。默认 loopback —— 学 Surge，
+    /// `loopback` | `all` | 一张网卡的 IP。默认 loopback —— 学 Surge，
     /// 但默认值要保守。
     #[serde(default)]
     pub bind: Bind,
     #[serde(default = "default_port")]
     pub port: u16,
-    /// 仅 lan / all 时生效的来源白名单（CIDR）。
+    /// 只在绑到本机之外时生效的来源白名单（CIDR）。
     #[serde(default)]
     pub allow_from: Vec<String>,
 }
@@ -173,11 +173,7 @@ impl GatewayListen {
     /// 迟早有一处忘了跟着改 —— 而它的表现是「监听在了一个谁也没想到的
     /// 地址上」。
     pub fn socket_addr(&self) -> std::net::SocketAddr {
-        format!("{}:{}", self.bind.addr(), self.port)
-            .parse()
-            // bind.addr() 只会返回两个字面量，port 是 u16 —— 拼不出
-            // 非法地址。真拼出来了那是 bug，不是用户输入。
-            .expect("bind + port 拼不出合法地址")
+        std::net::SocketAddr::new(self.bind.addr(), self.port)
     }
 }
 
@@ -191,31 +187,93 @@ impl Default for GatewayListen {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+/// 绑在哪张网卡上。
+///
+/// 三种写法，对应三个真实的选择：
+///
+/// ```yaml
+/// bind: loopback      # 127.0.0.1，只有本机
+/// bind: 192.168.1.5   # 某一张具体的网卡
+/// bind: all           # 0.0.0.0，所有网卡
+/// ```
+///
+/// **以前这里有个 `lan`，它是假的。**`lan` 和 `all` 绑的是同一个地址
+/// `0.0.0.0`，区别只在 `allow_from` 的默认值 —— 也就是说它是个白名单
+/// 概念，伪装成了网卡选择。用户在界面上选「局域网」，以为网关只在局域
+/// 网那张网卡上监听，实际上它在**所有**网卡上监听，包括公网那张。
+/// 现在要真的只在局域网网卡上听，就写那张网卡的地址。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Bind {
     #[default]
     Loopback,
-    Lan,
     All,
+    /// 一张具体的网卡。**地址会变** —— DHCP 续租、换网络都可能让它失效，
+    /// 那时网关起不来。这是选它要接受的代价，界面上必须说。
+    Addr(std::net::IpAddr),
 }
 
 impl Bind {
-    pub fn addr(&self) -> &'static str {
+    pub fn addr(&self) -> std::net::IpAddr {
         match self {
-            Bind::Loopback => "127.0.0.1",
-            // lan 和 all 在监听层是同一件事；区别在 allow_from 的默认
-            // 值和 UI 上的措辞。
-            Bind::Lan | Bind::All => "0.0.0.0",
+            Bind::Loopback => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Bind::All => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            Bind::Addr(a) => *a,
         }
     }
 
-    /// 非 loopback 吗。
+    /// 本机之外连得上吗。
     ///
     /// **这个判断决定了两件强制行为**：密钥校验不可关闭，
     /// 以及 `allow_from` 为空时自动填私网段。
+    ///
+    /// 判的是地址本身而不是枚举变体 —— `bind: 127.0.0.1` 写成具体地址
+    /// 的时候，它和 `loopback` 是同一件事，不该因为换了个写法就被当成
+    /// 暴露在外。
     pub fn is_exposed(&self) -> bool {
-        !matches!(self, Bind::Loopback)
+        !self.addr().is_loopback()
+    }
+}
+
+impl Bind {
+    /// 给界面显示的地址字符串。`loopback`/`all` 展开成真实地址，
+    /// 具体网卡就是它自己。
+    pub fn socket_string(&self) -> String {
+        self.addr().to_string()
+    }
+}
+
+impl std::fmt::Display for Bind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bind::Loopback => f.write_str("loopback"),
+            Bind::All => f.write_str("all"),
+            Bind::Addr(a) => write!(f, "{a}"),
+        }
+    }
+}
+
+impl Serialize for Bind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        match raw.as_str() {
+            "loopback" => Ok(Bind::Loopback),
+            "all" => Ok(Bind::All),
+            other => other.parse().map(Bind::Addr).map_err(|_| {
+                // **说清楚三种合法写法。**「invalid value」对着一个
+                // 手写配置文件的人什么都没说，而这个字段写错的后果是
+                // 整份配置加载失败、网关起不来。
+                serde::de::Error::custom(format!(
+                    "`bind` 只能是 `loopback`、`all`，或者一张网卡的 IP（比如 192.168.1.5）。\
+                     收到的是 `{other}`"
+                ))
+            }),
+        }
     }
 }
 
@@ -894,8 +952,49 @@ providers:
     #[test]
     fn bind_defaults_to_loopback_not_all_interfaces() {
         // 默认监听 0.0.0.0 会把网关暴露给整个局域网，而用户不会知道。
-        assert_eq!(Bind::default().addr(), "127.0.0.1");
-        assert_eq!(Bind::All.addr(), "0.0.0.0");
+        assert_eq!(Bind::default().addr().to_string(), "127.0.0.1");
+        assert_eq!(Bind::All.addr().to_string(), "0.0.0.0");
+        assert!(!Bind::default().is_exposed());
+        assert!(Bind::All.is_exposed());
+    }
+
+    #[test]
+    fn bind_accepts_a_concrete_interface_address() {
+        // 这是 `lan` 被换掉的理由：想「只在局域网那张网卡上听」，
+        // 以前只能写 `lan`，而它绑的是 0.0.0.0 —— 所有网卡，包括公网那张。
+        let b: Bind = serde_yaml_ng::from_str("192.168.1.5").unwrap();
+        assert_eq!(b, Bind::Addr("192.168.1.5".parse().unwrap()));
+        assert_eq!(b.socket_string(), "192.168.1.5");
+        assert!(b.is_exposed());
+    }
+
+    #[test]
+    fn writing_the_loopback_address_out_longhand_is_not_exposure() {
+        // `is_exposed` 判的是地址，不是枚举变体 —— 换个写法不该让
+        // 密钥校验被强制、白名单被自动填上。
+        let b: Bind = serde_yaml_ng::from_str("127.0.0.1").unwrap();
+        assert!(!b.is_exposed());
+    }
+
+    #[test]
+    fn every_bind_form_round_trips_through_yaml() {
+        for raw in ["loopback", "all", "192.168.1.5", "::1"] {
+            let b: Bind = serde_yaml_ng::from_str(raw).unwrap();
+            let back = serde_yaml_ng::to_string(&b).unwrap();
+            assert_eq!(back.trim(), raw, "{raw} 写回来变了样");
+        }
+    }
+
+    #[test]
+    fn a_bind_typo_says_what_the_three_forms_are() {
+        // 这个字段写错的后果是整份配置加载失败、网关起不来 ——
+        // 那条错误必须自带答案。
+        let e = serde_yaml_ng::from_str::<Bind>("lan")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("loopback"), "{e}");
+        assert!(e.contains("all"), "{e}");
+        assert!(e.contains("192.168.1.5"), "{e}");
     }
 
     #[test]

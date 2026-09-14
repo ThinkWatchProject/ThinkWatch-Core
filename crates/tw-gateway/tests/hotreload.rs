@@ -144,7 +144,7 @@ async fn a_reload_that_cannot_build_leaves_the_old_config_serving() {
     let mut broken = cfg(vec![provider("a", a)], vec![]);
     // 白名单写错一个字。**校验层会先挡下来**，但这一层也必须挡 ——
     // 它是最后一道，而「校验过了但运行时对象建不起来」不是不可能。
-    broken.listen.gateway.bind = tw_config::Bind::Lan;
+    broken.listen.gateway.bind = tw_config::Bind::All;
     broken.listen.gateway.allow_from = vec!["10.0.0.0/999".into()];
     assert!(state.reload(broken).is_err(), "坏配置该被拒绝");
     assert!(ask(gw).await.contains("\"a\""), "旧配置没能继续服务");
@@ -450,7 +450,7 @@ async fn the_allow_list_is_reloaded_too() {
     assert!(ask(gw).await.contains("\"a\""));
 
     // 监听改成 lan 并且只放行一个不含 127.0.0.1 的段
-    c.listen.gateway.bind = tw_config::Bind::Lan;
+    c.listen.gateway.bind = tw_config::Bind::All;
     c.listen.gateway.allow_from = vec!["10.0.0.0/8".into()];
     state.reload(c).unwrap();
     let after = ask(gw).await;
