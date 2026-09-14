@@ -299,6 +299,11 @@ pub fn substitute_template(
 /// 并发上限。住在 tw-types 是因为配置和数据面都要认
 /// 它，而它本身只是几个数字 —— 不该为此让 tw-config 依赖 tw-gateway。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// 配置里的每一个结构都拒未知字段，唯独这一个在 tw-types 里，漏了。
+// 表现是 `max_body_bytes: 8388608` 写进去不报错、也不生效 —— 用户改
+// 了个上限，界面说写成功了，什么都没发生。（这一层别的类型是聊天接口
+// 的线上类型，上游随时会加字段，那些恰恰不能拒。）
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     /// 全局并发
     #[serde(default = "d_max_concurrent")]
