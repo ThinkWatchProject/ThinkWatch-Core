@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "事件总线"
+description = "Event bus"
 
 [dependencies]
 tw-api = { workspace = true }

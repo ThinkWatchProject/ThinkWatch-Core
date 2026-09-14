@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "数据面 HTTP 服务"
+description = "Data-plane HTTP server"
 
 [dependencies]
 tw-api = { workspace = true }

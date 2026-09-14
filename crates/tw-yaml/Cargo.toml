@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "在原文本上做最小替换的 YAML 补丁层"
+description = "YAML patch layer that makes minimal edits to the original text"
 
 [dependencies]
 saphyr-parser = { workspace = true }

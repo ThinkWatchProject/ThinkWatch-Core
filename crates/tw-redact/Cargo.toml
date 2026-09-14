@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "出站脱敏与回显还原：把凭据换成占位符，再在响应里换回来"
+description = "Outbound redaction: replace credentials with placeholders, and restore them when a response echoes them back"
 
 [dependencies]
 serde = { workspace = true }

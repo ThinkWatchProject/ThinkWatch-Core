@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "控制面契约：请求/响应类型 + client"
+description = "Control-plane contract: request and response types, plus a client"
 
 [dependencies]
 serde = { workspace = true }

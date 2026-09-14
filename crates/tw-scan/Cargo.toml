@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "客户端配置面的静态扫描：隐藏字符、提示注入、危险命令、过宽权限"
+description = "Static scan of client configuration for hidden characters, prompt injection, dangerous commands, and overly broad permissions"
 
 [dependencies]
 serde = { workspace = true }
