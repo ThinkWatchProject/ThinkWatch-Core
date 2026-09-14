@@ -337,32 +337,32 @@ pub struct Rule {
 
 /// 一条路由 —— 一组按顺序求值的规则。
 ///
-/// **密钥决定走哪条路由。**`clients[].routes` 里写路由名，那把密钥的请求
-/// 就额外过这条路由的规则。一条路由可以分给多把密钥，不用复制。
+/// **一把密钥绑一条路由。**`clients[].route` 写路由名，那把密钥的每个请求
+/// 就走这条路由的规则表，**只走这一条**。一条路由可以绑给多把密钥，
+/// 规则只有一份。
 ///
-/// 默认路由（`default: true`）**对每一把密钥都生效**，而且永远排在最前。
-/// 它是「首先应该有个默认路由」那句话的落点：公共的脱敏、公共的兜底去向
-/// 写在这儿一次，不必在每条路由里重复。最多只能有一条。
+/// 默认路由（顶层的 `default_route`）是**没绑定时走的那条**，不是
+/// 「所有人都要过的那条」。这个区别是这个模型的支点：前者意味着求值
+/// 永远只看一张规则表，后者意味着每次请求都要先把两张表拼起来。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteSet {
     pub name: String,
-    /// 对所有密钥生效，且排在所有其他路由之前。最多一条。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub default: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
 }
 
+/// 默认路由的名字。顶层没写 `default_route` 时用它。
+pub const DEFAULT_ROUTE: &str = "默认";
+
 impl RouteSet {
-    /// 一条装着这些规则的默认路由。
+    /// 一条叫「默认」的路由，装着这些规则。
     ///
-    /// 「只有默认路由」是最常见的配置形状 —— 没有把任何规则分给具体
-    /// 密钥的人，配出来就是这一条。
+    /// 「只有一条默认路由」是最常见的配置形状 —— 没给任何密钥绑路由
+    /// 的人，配出来就是这一条。
     pub fn default_with(rules: Vec<Rule>) -> Self {
         Self {
-            name: "默认".to_string(),
-            default: true,
+            name: DEFAULT_ROUTE.to_string(),
             rules,
         }
     }
@@ -424,23 +424,20 @@ pub enum RouteError {
     EmptyGroup(String),
     #[error("有两条路由都叫 `{0}`。密钥靠名字引用路由，重名的话「分给哪一条」没有答案。")]
     DuplicateRoute(String),
-    #[error(
-        "有不止一条默认路由。默认路由对所有密钥生效，只能有一条 —— 想要多组公共规则就写在同一条里。"
-    )]
-    ManyDefaults,
-    #[error(
-        "密钥 `{client}` 分到了路由 `{route}`，但没有这条路由。（默认路由不用分配，它对所有密钥生效。）"
-    )]
+    #[error("`default_route` 指向 `{0}`，但没有这条路由。没绑路由的密钥会一条规则都过不到。")]
+    UnknownDefaultRoute(String),
+    #[error("密钥 `{client}` 绑了路由 `{route}`，但没有这条路由。")]
     UnknownRoute { client: String, route: String },
     #[error(transparent)]
     Match(#[from] MatchError),
 }
 
 pub struct Engine {
-    /// 所有路由。默认那条（如果有）已经被排到最前。
     sets: Vec<RouteSet>,
-    /// 密钥名 → 它分到的路由名。**默认路由不在这里** —— 它对谁都生效。
-    assigned: std::collections::HashMap<String, Vec<String>>,
+    /// 没绑定时走哪条。
+    default_route: String,
+    /// 密钥名 → 它绑的那条路由名。没有条目 = 走默认。
+    bound: std::collections::HashMap<String, String>,
     groups: Vec<Group>,
     providers: Vec<String>,
 }
@@ -455,7 +452,8 @@ impl Engine {
         providers: Vec<String>,
         mut groups: Vec<Group>,
         mut sets: Vec<RouteSet>,
-        assigned: std::collections::HashMap<String, Vec<String>>,
+        default_route: Option<String>,
+        bound: std::collections::HashMap<String, String>,
     ) -> Self {
         // **没有 provider 时什么都不合成。**合成一个空组会让它过不了
         // `validate`（空组是配置错误），而零 provider 的配置必须合法 ——
@@ -463,6 +461,7 @@ impl Engine {
         // 上游」都说不出口（tw-config::validate 里那段注释）。
         //
         // 这条今天已经立过一次，又被这里破坏了一次。测试抓住了。
+        let default_route = default_route.unwrap_or_else(|| DEFAULT_ROUTE.to_string());
         if sets.iter().all(|s| s.rules.is_empty()) && !providers.is_empty() {
             const ALL: &str = "__all__";
             groups.push(Group {
@@ -480,25 +479,18 @@ impl Engine {
                 deny: None,
                 guard: None,
             };
-            // **填进已有的那条默认路由，不要再追加一条。**两条默认路由是
-            // `validate` 明确拒绝的状态，而这里凭空造一条就会制造它。
-            match sets.iter_mut().find(|s| s.default) {
+            match sets.iter_mut().find(|s| s.name == default_route) {
                 Some(d) => d.rules.push(fallback),
                 None => sets.push(RouteSet {
-                    name: "默认".to_string(),
-                    default: true,
+                    name: default_route.clone(),
                     rules: vec![fallback],
                 }),
             }
         }
-        // 默认路由排最前。**顺序就是语义**：`to` 取第一条命中的，所以
-        // 默认路由里的兜底去向必须排在后面，而它的 `deny` 和 `set` 想
-        // 先生效就得排在前面 —— 两者都要，所以位置交给用户，这里只保证
-        // 「默认在其他路由之前」这一件事。
-        sets.sort_by_key(|s| !s.default);
         Self {
             sets,
-            assigned,
+            default_route,
+            bound,
             groups,
             providers,
         }
@@ -518,36 +510,35 @@ impl Engine {
         let sets = if rules.is_empty() {
             Vec::new()
         } else {
-            vec![RouteSet {
-                name: "默认".to_string(),
-                default: true,
-                rules,
-            }]
+            vec![RouteSet::default_with(rules)]
         };
-        Self::new(providers, groups, sets, std::collections::HashMap::new())
+        Self::new(
+            providers,
+            groups,
+            sets,
+            None,
+            std::collections::HashMap::new(),
+        )
     }
 
-    /// 这次请求要过哪些规则。
+    /// 这次请求走哪条路由的规则表。
     ///
-    /// 默认路由的规则在前，然后是这把密钥分到的那几条路由，**按 `clients`
-    /// 里写的顺序**。拼出来的这张表交给 `route()`，求值逻辑一个字没变：
-    /// `set` 和 `guard` 从每一条命中的累积，`to` 和 `deny` 取第一条。
+    /// **一张表，没有拼接。**密钥绑了哪条就是哪条；没绑就是默认那条。
+    /// 这是「绑定」和「叠加」的全部区别，也是这个函数只有五行的原因。
     ///
-    /// **认不出的密钥只走默认路由。**那是首次运行、或者一把刚建还没分配
-    /// 路由的密钥 —— 它应该能用，只是没有额外规则。
-    fn rules_for(&self, client: &str) -> Vec<&Rule> {
-        let mut out: Vec<&Rule> = Vec::new();
-        for s in self.sets.iter().filter(|s| s.default) {
-            out.extend(s.rules.iter());
-        }
-        if let Some(names) = self.assigned.get(client) {
-            for n in names {
-                if let Some(s) = self.sets.iter().find(|s| !s.default && &s.name == n) {
-                    out.extend(s.rules.iter());
-                }
-            }
-        }
-        out
+    /// 认不出的密钥、或者刚建还没绑路由的密钥，都走默认路由 —— 它应该
+    /// 能用，只是没有为它定制的规则。
+    fn rules_for(&self, client: &str) -> &[Rule] {
+        let want = self
+            .bound
+            .get(client)
+            .map(String::as_str)
+            .unwrap_or(&self.default_route);
+        self.sets
+            .iter()
+            .find(|s| s.name == want)
+            .map(|s| s.rules.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 所有规则，不分归属。校验和「这条规则存在吗」用它。
@@ -567,19 +558,19 @@ impl Engine {
                 return Err(RouteError::DuplicateRoute(set.name.clone()));
             }
         }
-        if self.sets.iter().filter(|s| s.default).count() > 1 {
-            return Err(RouteError::ManyDefaults);
+        // 默认路由指了一个不存在的名字。**没绑路由的密钥会一条规则都
+        // 不过** —— 请求全部落到「没有任何规则命中」，而配置看起来完整。
+        if !self.sets.is_empty() && !self.sets.iter().any(|s| s.name == self.default_route) {
+            return Err(RouteError::UnknownDefaultRoute(self.default_route.clone()));
         }
-        // 分配里写了一个不存在的路由名 —— 那把密钥会静默地只走默认路由，
+        // 绑了一个不存在的路由名 —— 那把密钥会静默地退回默认路由，
         // 而用户以为他配的规则在生效。
-        for (client, names) in &self.assigned {
-            for n in names {
-                if !self.sets.iter().any(|s| !s.default && &s.name == n) {
-                    return Err(RouteError::UnknownRoute {
-                        client: client.clone(),
-                        route: n.clone(),
-                    });
-                }
+        for (client, name) in &self.bound {
+            if !self.sets.iter().any(|s| &s.name == name) {
+                return Err(RouteError::UnknownRoute {
+                    client: client.clone(),
+                    route: name.clone(),
+                });
             }
         }
         for r in self.all_rules() {
@@ -757,8 +748,13 @@ impl Engine {
     }
 
     /// 这把密钥实际会过的规则，按求值顺序。**试算和「按密钥看」都用它。**
-    pub fn rules_for_client(&self, client: &str) -> Vec<&Rule> {
+    pub fn rules_for_client(&self, client: &str) -> &[Rule] {
         self.rules_for(client)
+    }
+
+    /// 没绑定时走哪条路由。
+    pub fn default_route(&self) -> &str {
+        &self.default_route
     }
 }
 
@@ -822,10 +818,9 @@ mod tests {
         assert!(e.validate().is_ok(), "零 provider 的配置必须合法");
     }
 
-    fn set_of(name: &str, default: bool, to: &str) -> RouteSet {
+    fn set_of(name: &str, to: &str) -> RouteSet {
         RouteSet {
             name: name.into(),
-            default,
             rules: vec![Rule {
                 name: format!("{name} 的规则"),
                 when: When::default(),
@@ -837,26 +832,23 @@ mod tests {
         }
     }
 
-    fn assign(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+    fn bind(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
             .iter()
-            .map(|(c, rs)| {
-                (
-                    c.to_string(),
-                    rs.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-                )
-            })
+            .map(|(c, r)| (c.to_string(), r.to_string()))
             .collect()
     }
 
     #[test]
-    fn the_default_route_applies_to_every_key_and_the_assigned_one_stacks_on_top() {
-        // 这是整个模型的那句话：**默认路由对谁都生效，分配的叠在它上面**。
+    fn a_key_walks_exactly_one_route_and_an_unbound_key_walks_the_default() {
+        // **这是整个模型的那句话。**默认路由是「没绑定时走的那条」，
+        // 不是「所有人都要过的那条」—— 所以求值永远只看一张规则表。
         let e = Engine::new(
             vec!["a".into(), "b".into()],
             vec![],
-            vec![set_of("默认", true, "a"), set_of("codex 专用", false, "b")],
-            assign(&[("codex", &["codex 专用"])]),
+            vec![set_of("默认", "a"), set_of("codex 专用", "b")],
+            None,
+            bind(&[("codex", "codex 专用")]),
         );
         let names = |c: &str| {
             e.rules_for_client(c)
@@ -864,28 +856,42 @@ mod tests {
                 .map(|r| r.name.clone())
                 .collect::<Vec<_>>()
         };
-        // 没分配路由的密钥只走默认 —— 而且它能用，不是一个错误状态
         assert_eq!(names("claude-code"), vec!["默认 的规则"]);
-        // 分了的，默认在前，分配的在后
-        assert_eq!(names("codex"), vec!["默认 的规则", "codex 专用 的规则"]);
+        // **绑了的只走它自己那条，默认那条的规则不会跟着来**
+        assert_eq!(names("codex"), vec!["codex 专用 的规则"]);
     }
 
     #[test]
     fn one_route_can_serve_several_keys_without_being_copied() {
-        // 这条是「给路由起名」换来的东西：两把密钥引用同一个名字，
+        // 这条是「给路由起名」换来的东西：两把密钥绑同一个名字，
         // 规则只有一份。**复制出来的两份，迟早只有一份被改。**
         let e = Engine::new(
             vec!["a".into(), "b".into()],
             vec![],
-            vec![set_of("长上下文", false, "b")],
-            assign(&[("codex", &["长上下文"]), ("cline", &["长上下文"])]),
+            vec![set_of("默认", "a"), set_of("长上下文", "b")],
+            None,
+            bind(&[("codex", "长上下文"), ("cline", "长上下文")]),
         );
         assert_eq!(e.rules_for_client("codex").len(), 1);
-        assert_eq!(e.rules_for_client("cline").len(), 1);
         assert_eq!(
             e.rules_for_client("codex")[0].name,
             e.rules_for_client("cline")[0].name
         );
+    }
+
+    #[test]
+    fn the_default_route_can_be_any_route_by_name() {
+        // 默认路由是顶层的一个名字，不是某条路由身上的标志。
+        // **结构上就唯一** —— 没有「最多一条」这种校验要维持。
+        let e = Engine::new(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![set_of("平时", "a"), set_of("别的", "b")],
+            Some("别的".into()),
+            Default::default(),
+        );
+        assert!(e.validate().is_ok());
+        assert_eq!(e.rules_for_client("谁都行")[0].name, "别的 的规则");
     }
 
     #[test]
@@ -895,21 +901,28 @@ mod tests {
         let e = Engine::new(
             vec!["a".into()],
             vec![],
-            vec![set_of("重名", false, "a"), set_of("重名", false, "a")],
+            vec![set_of("重名", "a"), set_of("重名", "a")],
+            Some("重名".into()),
             Default::default(),
         );
         assert_eq!(e.validate(), Err(RouteError::DuplicateRoute("重名".into())));
     }
 
     #[test]
-    fn two_default_routes_are_rejected() {
+    fn a_default_route_that_names_nothing_is_caught_at_load() {
+        // **没绑路由的密钥会一条规则都过不到** —— 请求全部落到
+        // 「没有任何规则命中」，而配置看起来是完整的。
         let e = Engine::new(
             vec!["a".into()],
             vec![],
-            vec![set_of("默认一", true, "a"), set_of("默认二", true, "a")],
+            vec![set_of("有名有姓", "a")],
+            Some("打错的名字".into()),
             Default::default(),
         );
-        assert_eq!(e.validate(), Err(RouteError::ManyDefaults));
+        assert_eq!(
+            e.validate(),
+            Err(RouteError::UnknownDefaultRoute("打错的名字".into()))
+        );
     }
 
     #[test]
@@ -919,8 +932,9 @@ mod tests {
         let e = Engine::new(
             vec!["a".into()],
             vec![],
-            vec![set_of("默认", true, "a")],
-            assign(&[("codex", &["打错的名字"])]),
+            vec![set_of("默认", "a")],
+            None,
+            bind(&[("codex", "打错的名字")]),
         );
         assert_eq!(
             e.validate(),
@@ -929,19 +943,6 @@ mod tests {
                 route: "打错的名字".into(),
             })
         );
-    }
-
-    #[test]
-    fn the_default_route_is_evaluated_first_whatever_order_it_was_written_in() {
-        // 顺序就是语义：`to` 取第一条命中的。默认路由写在文件末尾也要
-        // 排到最前，否则「公共的兜底」会变成「谁都到不了的最后一条」。
-        let e = Engine::new(
-            vec!["a".into(), "b".into()],
-            vec![],
-            vec![set_of("别的", false, "b"), set_of("默认", true, "a")],
-            assign(&[("c", &["别的"])]),
-        );
-        assert_eq!(e.rules_for_client("c")[0].name, "默认 的规则");
     }
 
     #[test]

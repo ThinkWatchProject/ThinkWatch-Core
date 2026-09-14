@@ -393,18 +393,14 @@ mod patch_seq_tests {
     }
 
     #[test]
-    fn a_new_key_can_carry_its_route_assignment_in_one_write() {
-        // 建密钥和分配路由是**一次写入**，不是两次 —— 中间那一刻
-        // 「有一把没分配路由的密钥」是个用户能看见的错误状态。
+    fn a_new_key_can_carry_its_route_binding_in_one_write() {
+        // 建密钥和绑路由是**一次写入**，不是两次 —— 中间那一刻
+        // 「有一把还没绑路由的密钥」是个用户能看见的中间状态。
         let steps = resolve_path(CFG, "/clients").unwrap();
-        let out = tw_yaml::append(
-            CFG,
-            &steps,
-            "name: codex\nkey: tw-bbb\nroutes:\n  - 长上下文",
-        )
-        .unwrap();
+        let out =
+            tw_yaml::append(CFG, &steps, "name: codex\nkey: tw-bbb\nroute: 长上下文").unwrap();
         let cfg: tw_config::Config = serde_yaml_ng::from_str(&out).unwrap();
-        assert_eq!(cfg.clients[1].routes, vec!["长上下文".to_string()]);
+        assert_eq!(cfg.clients[1].route.as_deref(), Some("长上下文"));
     }
 
     #[test]

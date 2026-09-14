@@ -147,7 +147,6 @@ groups:
     providers: [relay]
 routes:
   - name: 默认
-    default: true
     rules:
       - name: 冒烟：这条必须走 relay，不许转移
         to: 只走中转
