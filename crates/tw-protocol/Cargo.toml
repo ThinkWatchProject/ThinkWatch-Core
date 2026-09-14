@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "SSE 分帧与方言间的内容提取"
+description = "SSE framing and content extraction across API dialects"
 
 [dependencies]
 bytes = { workspace = true }

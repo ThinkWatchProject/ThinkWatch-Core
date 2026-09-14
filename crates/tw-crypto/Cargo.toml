@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AES-256-GCM 信封加解密"
+description = "AES-256-GCM envelope encryption and decryption"
 
 [dependencies]
 aes-gcm = { workspace = true }

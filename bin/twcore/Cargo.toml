@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ThinkWatch Lite 的本地 AI 网关引擎"
+description = "Self-contained local AI gateway binary, and the engine behind ThinkWatch Lite"
 
 [dependencies]
 tw-config = { workspace = true }
