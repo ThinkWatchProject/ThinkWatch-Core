@@ -6,7 +6,7 @@
 # 这个 workflow 只回答另一个问题：**内置快照放了多久了。**任何第三方
 # 数据源都会滞后，而一份三个月前的快照算出来的「今日花费」，和一份上周
 # 的，可信度完全不同。
-name: 价目表新鲜度
+name: Pricing freshness
 
 on:
   schedule:
@@ -20,29 +20,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 看看内置快照放了多久
+      - name: How old is the bundled snapshot
         run: |
           set -euo pipefail
-          SNAP=$(grep -oE '快照日期 \| [0-9-]+' crates/tw-pricing/data/PROVENANCE.md | grep -oE '[0-9-]+$')
+          SNAP=$(grep -oE 'Snapshot date \| [0-9-]+' crates/tw-pricing/data/PROVENANCE.md | grep -oE '[0-9-]+$')
           AGE=$(( ( $(date +%s) - $(date -d "$SNAP" +%s) ) / 86400 ))
-          echo "内置快照日期：$SNAP（$AGE 天前）"
+          echo "Bundled snapshot: $SNAP ($AGE days old)"
           # 上游那份文件几乎天天在动，但价格变动是月级的。30 天是个
           # 「该看一眼了」的信号，不是「一定过期了」。
           if [ "$AGE" -gt 30 ]; then
-            echo "::warning::内置价目表已经 $AGE 天没更新了。更新步骤见 crates/tw-pricing/data/PROVENANCE.md"
+            echo "::warning::The bundled price table is $AGE days old. Steps to refresh it are in crates/tw-pricing/data/PROVENANCE.md"
           fi
 
-      - name: 上游有没有新版本
+      - name: Does upstream have a newer revision
         run: |
           set -euo pipefail
           PINNED=$(grep -oE '`[0-9a-f]{40}`' crates/tw-pricing/data/PROVENANCE.md | tr -d '`' | head -1)
           LATEST=$(curl -sS "https://api.github.com/repos/BerriAI/litellm/commits?path=model_prices_and_context_window.json&per_page=1" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["sha"])')
-          echo "我们 pin 的：$PINNED"
-          echo "上游最新的：$LATEST"
+          echo "pinned:   $PINNED"
+          echo "upstream: $LATEST"
           if [ "$PINNED" != "$LATEST" ]; then
             # **不自动更新。**§4.3.0：pin 到具体的 commit，不要用 main ——
             # 自动跟随意味着两次构建可能拿到不同的价格，而「昨天算出来的
             # 钱和今天不一样」是没法解释的。
-            echo "::warning::上游有新版本了。要更新的话，按 PROVENANCE.md 的步骤来，并**重新核对 verified.yaml**"
+            echo "::warning::Upstream has a newer revision. To take it, follow PROVENANCE.md and re-verify verified.yaml against the vendors' own pricing pages"
           fi

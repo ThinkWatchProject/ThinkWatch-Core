@@ -25,7 +25,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: 格式
+      - name: Format
         run: cargo fmt --all -- --check
 
       - name: clippy
@@ -33,14 +33,14 @@ jobs:
 
       # 默认不跑打真实网络的那些（它们标了 #[ignore]）—— CI 上的网络
       # 抖动会变成一条和代码无关的红，而那种红看几次就没人看了。
-      - name: 测试
+      - name: Test
         run: cargo test --workspace
 
-      - name: 构建
+      - name: Build
         run: cargo build --release -p twcore
 
       # **接缝上的失败模式单元测试看不见**：文件权限、socket、某个端点
       # 在真二进制上根本没注册。这个项目的前四个真 bug 都是这么被逮到的
       # （DESIGN.md §9.7）。脚本自己会 build，这一步只是跑它。
-      - name: 冒烟（真二进制、真 socket、真数据面）
+      - name: Smoke (real binary, real socket, real data plane)
         run: ./scripts/smoke.sh
