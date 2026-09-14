@@ -1,16 +1,16 @@
-//! 「我明明配了，为什么没生效」（DESIGN.md §7.11）。
+//! 「我明明配了，为什么没生效」。
 //!
 //! 这是接管类工具最常见的支持问题。原因有六种，而**它们的排查难度差得
 //! 很远** —— 所以这里不做「一个笼统的健康检查」，而是把六条各自查一遍、
 //! 各自给出能直接执行的下一步。
 //!
-//! 一条纪律贯穿全文件：**报告是我们的职责，修改是他的权利**（§7.11）。
+//! 一条纪律贯穿全文件：**报告是我们的职责，修改是他的权利**。
 //! 我们会说出「你的 ~/.zshrc 第 42 行导出了 ANTHROPIC_BASE_URL」，并给出
 //! 那条 `sed` 命令，但绝不替他执行 —— 那是他的 shell 配置，不是我们的。
 //!
 //! 还有一条更要紧的：**静态扫描证明不了「接管真的生效了」**。优先级链
 //! 有五层，任何一层出意外都会让静态结论出错。真正可靠的验证只有一个：
-//! 等一个真实请求过来（§7.11 的观察窗口，见 [`crate::watch`]）。
+//! 等一个真实请求过来（观察窗口，见 [`crate::watch`]）。
 
 use std::path::{Path, PathBuf};
 
@@ -117,7 +117,7 @@ pub enum Level {
     Blocking,
     /// 可疑，但不一定是它
     Suspect,
-    /// 查过了，没问题。**要说出来** —— §0.6：没风险的时候要说「安全」，
+    /// 查过了，没问题。**要说出来** —— 没风险的时候要说「安全」，
     /// 而不是让这一项消失
     Clear,
 }
@@ -229,7 +229,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     let d = detect_one(c, home);
     let mut out = Vec::new();
 
-    // 一、客户端没重启。**最常见，而且判据便宜得离谱**（§7.11）
+    // 一、客户端没重启。**最常见，而且判据便宜得离谱**
     match d.adopted_at_ms {
         Some(at) => {
             let started = running_since(c.process);
@@ -358,7 +358,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     } else {
         for (f, line, name) in exports {
             // **同一条发现，对不同客户端的结论相反。**不区分的话就会
-            // 给出一条错误的诊断（§7.11）。
+            // 给出一条错误的诊断。
             let (level, detail) = if c.config_beats_env {
                 (
                     Level::Suspect,
@@ -404,7 +404,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     }
 
     // **静态扫描证明不了「生效了」。**这句话必须留在结论里，否则一屏
-    // 绿色的「查过了没问题」会让人以为已经确认过（§7.11）。
+    // 绿色的「查过了没问题」会让人以为已经确认过。
     out.push(Finding {
         level: Level::Suspect,
         title: "以上都是静态检查".into(),
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn the_same_shell_export_is_blocking_for_codex_but_only_a_note_for_claude_code() {
-        // §7.11：Claude Code 的 env 块会盖住 shell 的 export，Codex 不会。
+        // Claude Code 的 env 块会盖住 shell 的 export，Codex 不会。
         // **同一条发现，两个相反的结论。**
         let d = tempfile::tempdir().unwrap();
         let home = d.path();
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_clean_machine_still_says_something_rather_than_showing_nothing() {
-        // §0.6：没风险的时候要说「安全」，而不是让这一项消失。
+        // 没风险的时候要说「安全」，而不是让这一项消失。
         let d = tempfile::tempdir().unwrap();
         let out = diagnose(&c("claude-code"), d.path(), None);
         assert!(out.iter().any(|f| f.level == Level::Clear), "{out:?}");

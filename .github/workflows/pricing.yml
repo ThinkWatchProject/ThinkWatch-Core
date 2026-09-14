@@ -1,6 +1,6 @@
 # 价目表会不会已经过期了。
 #
-# **这是个提醒，不是一道关卡**（DESIGN.md §4.3.0）。真正的关卡是
+# **这是个提醒，不是一道关卡**。真正的关卡是
 # `tw-pricing` 里那条比对测试 —— 它每次 CI 都跑，对不上就红。
 #
 # 这个 workflow 只回答另一个问题：**内置快照放了多久了。**任何第三方
@@ -41,7 +41,7 @@ jobs:
           echo "pinned:   $PINNED"
           echo "upstream: $LATEST"
           if [ "$PINNED" != "$LATEST" ]; then
-            # **不自动更新。**§4.3.0：pin 到具体的 commit，不要用 main ——
+            # **不自动更新。**pin 到具体的 commit，不要用 main ——
             # 自动跟随意味着两次构建可能拿到不同的价格，而「昨天算出来的
             # 钱和今天不一样」是没法解释的。
             echo "::warning::Upstream has a newer revision. To take it, follow PROVENANCE.md and re-verify verified.yaml against the vendors' own pricing pages"

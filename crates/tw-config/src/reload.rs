@@ -1,4 +1,4 @@
-//! 一次重载尝试的五个关卡（DESIGN.md §3.8）。
+//! 一次重载尝试的五个关卡。
 //!
 //! **桌面工具和服务器在这里有个重要差异：服务器可以拒绝启动，桌面工具
 //! 不行。**你手抖打错一个字母，不能让所有 AI 客户端瞬间断线。
@@ -124,7 +124,7 @@ fn stage_of(e: &ValidationError) -> Stage {
 /// 取出错那一行，**顺便脱敏**。
 ///
 /// 出错的那一行完全可能就是写着密钥的那一行 —— 而这段文字要进日志、
-/// 进界面、可能被用户复制到 issue 里（§9.7 的统一脱敏）。
+/// 进界面、可能被用户复制到 issue 里（统一脱敏）。
 fn excerpt_of(text: &str, line: usize) -> Option<String> {
     let raw = text.lines().nth(line.checked_sub(1)?)?;
     let masked = tw_secret::mask_line(raw);
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn a_config_with_neither_providers_nor_a_listen_block_still_loads() {
-        // §3.3 的「六行」。零 provider 是首次运行的正常状态，而逼用户
+        // 「六行」。零 provider 是首次运行的正常状态，而逼用户
         // 写一行 `providers: []` 只是为了让解析器高兴。
         let cfg = try_parse(GOOD).expect("最小配置该能加载");
         assert!(cfg.providers.is_empty());
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn a_very_long_line_is_cut_on_a_character_boundary() {
-        // 按字节切多字节字符会 panic —— 这个项目栽过两次（§9.7）。
+        // 按字节切多字节字符会 panic —— 这个项目栽过两次。
         let long = "很".repeat(500);
         let bad = format!("version: 1\nx: {long}\nclients:\n  - name: c\n    kye: 1\n");
         let r = try_parse(&bad).unwrap_err();

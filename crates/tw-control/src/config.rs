@@ -1,4 +1,4 @@
-//! 配置的生命周期：谁改的、怎么进来的、进不来时怎么办（DESIGN.md §3.8）。
+//! 配置的生命周期：谁改的、怎么进来的、进不来时怎么办。
 //!
 //! 这是「两个写入方，一份文件」那道题的答案所在。四个问题里，最小替换
 //! 归 `tw-yaml`，指纹和冲突归 `tw_config::store`，三道校验归
@@ -19,7 +19,7 @@ pub struct ConfigManager {
     gateway: tw_gateway::AppState,
     bus: tw_observe::EventBus,
     /// 上一次**我们自己**写下去的样子。文件事件来了先和它比 ——
-    /// 一样就是自己写的，直接忽略，否则会形成回环（§3.8）。
+    /// 一样就是自己写的，直接忽略，否则会形成回环。
     seen: Mutex<Option<Fingerprint>>,
 }
 
@@ -120,7 +120,7 @@ impl ConfigManager {
 
     /// 写一份新配置进去。UI 和 CLI 都走这条。
     ///
-    /// `base_version` 是乐观并发的凭据（§3.8）：**对不上就是 409**，
+    /// `base_version` 是乐观并发的凭据：**对不上就是 409**，
     /// 而不是覆盖。`None` 表示调用方明确要覆盖（比如首次生成）。
     pub async fn write(
         &self,
@@ -204,7 +204,7 @@ pub fn spawn_watcher(
     Ok(w)
 }
 
-/// 光标落在哪个东西上（§7.10 的反向联动）。
+/// 光标落在哪个东西上（反向联动）。
 ///
 /// 返回它所属的**顶层段落和名字**（`providers` / `官方`），因为界面要的
 /// 是「显示哪个表单」，而不是精确到字段。
@@ -299,7 +299,7 @@ pub fn resolve_path(text: &str, pointer: &str) -> Result<Vec<tw_yaml::Step>, Str
 }
 
 impl ConfigManager {
-    /// 按字段改配置（§3.8 的 `PATCH /config`）。
+    /// 按字段改配置（`PATCH /config`）。
     ///
     /// **所有改动一起算，一起写。**一次 patch 里改三个字段却分三次写盘，
     /// 中间任何一次失败都会留下一份半改的配置 —— 而那份配置是合法的，

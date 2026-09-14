@@ -1,12 +1,12 @@
-//! 去哪儿找（DESIGN.md §5.3、§7.12）。
+//! 去哪儿找。
 //!
-//! §7.12 的集中清单和 §5.3 的安全扫描**是同一件事的两面**：扫描需要
+//! 集中清单和安全扫描**是同一件事的两面**：扫描需要
 //! 知道去哪儿找，而清单正是那份地址簿。所以两者共用这个文件，不分开
 //! 实现。
 //!
 //! # 范围：只看这些，不扫全盘
 //!
-//! §11 的 M4 明确要求「开工前先定一件事：要监听哪些目录」。定下来的
+//! M4 明确要求「开工前先定一件事：要监听哪些目录」。定下来的
 //! 是：
 //!
 //! | | 扫不扫 |
@@ -16,13 +16,13 @@
 //! | 全盘搜 `.claude/` | **不扫** |
 //!
 //! 最后一条是硬约束，不是偷懒。项目级的 `.claude/` 散落全盘，无界的
-//! FSEvents 监听既是性能问题，也和 §4.5「空闲时接近零」的目标直接
+//! FSEvents 监听既是性能问题，也和「空闲时接近零」的目标直接
 //! 冲突。而且一个用户 clone 过的仓库可能有几百个，其中绝大多数他这辈子
 //! 都不会再打开 —— 为它们持续烧 CPU 换不到任何东西。
 
 use std::path::{Path, PathBuf};
 
-/// 这份文件属于哪类攻击面。**顺序就是危险度**（§5.3 的那张表）。
+/// 这份文件属于哪类攻击面。**顺序就是危险度**（那张表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     /// `settings.json` 里的 hooks，在工具调用前后**直接执行 shell 命令**。
@@ -87,7 +87,7 @@ pub struct Source {
     pub client: &'static str,
     pub kind: Kind,
     pub path: PathBuf,
-    /// 用户级还是项目级。诊断「项目级盖住用户级」要用（§7.11）
+    /// 用户级还是项目级。诊断「项目级盖住用户级」要用
     pub project: Option<PathBuf>,
 }
 
@@ -149,7 +149,7 @@ pub fn user_level(home: &Path) -> Vec<Source> {
         // 危险度第二：MCP
         f("claude-code", Kind::Mcp, home.join(".claude.json")),
         // **Claude Desktop 只在这张表里**：它是订阅制，接管不了，但它的
-        // MCP 配置是危险度第二高的攻击面。漏掉它等于扫描留了个洞（§7.11）
+        // MCP 配置是危险度第二高的攻击面。漏掉它等于扫描留了个洞
         f(
             "claude-desktop",
             Kind::Mcp,
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn claude_desktop_is_in_the_scan_even_though_it_cannot_be_adopted() {
         // 它是订阅制、接管不了，但它的 MCP 配置是危险度第二高的攻击面。
-        // 漏掉它等于扫描留了个洞（§7.11）。
+        // 漏掉它等于扫描留了个洞。
         let d = tempfile::tempdir().unwrap();
         touch(
             &d.path()
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_project_scan_records_which_project_it_came_from() {
-        // 诊断「项目级盖住用户级」要靠这个（§7.11）。
+        // 诊断「项目级盖住用户级」要靠这个。
         let d = tempfile::tempdir().unwrap();
         touch(&d.path().join(".mcp.json"));
         touch(&d.path().join("CLAUDE.md"));

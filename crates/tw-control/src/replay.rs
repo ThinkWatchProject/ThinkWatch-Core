@@ -1,4 +1,4 @@
-//! 请求重放（DESIGN.md §11 的 M6+）。
+//! 请求重放（M6+）。
 //!
 //! 用途只有一个，但它是这个工具最常被需要的那一个：
 //!
@@ -6,19 +6,19 @@
 //!
 //! 「同样一条」是要害。手工复现一个 Claude Code 发出的请求几乎不可能 ——
 //! 那是几十 KB 的 system prompt 加一堆工具定义，而任何一处不同都会让
-//! 对比失去意义（§4.1 说过，body 改一个字节就可能是缓存杀手）。我们手里
+//! 对比失去意义（说过，body 改一个字节就可能是缓存杀手）。我们手里
 //! 正好有原样的那一份。
 //!
 //! # 三条纪律
 //!
-//! **一、它花钱。**和 L3 测速（§4.6）走同一套：先报价，用户点确认才发。
+//! **一、它花钱。**和 L3 测速走同一套：先报价，用户点确认才发。
 //!
 //! **二、截断过的体不能重放。**存的时候超过 4 MB 会截断，而截断之后的
 //! body 是**另一个请求** —— 拿它跑出来的结果去比对，比不跑更糟，因为
 //! 用户会以为那是同一条。
 //!
 //! **三、脱敏照做。**重放走的是控制面，不经过数据面的管线，所以
-//! §5.1 那一层要在这里显式调一次。少了它，一条本来会被脱敏的请求，
+//! 脱敏那一层要在这里显式调一次。少了它，一条本来会被脱敏的请求，
 //! 会因为「重放」这个动作把密钥原样发给中转站。
 
 use std::time::Instant;
@@ -36,7 +36,7 @@ fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
 /// 找到那条请求，把**原样的**请求体取出来。
 ///
 /// 注意不是 `request_detail` 里那份 —— 那一份是脱敏之后给人看的
-/// （§9.7：它会被复制进 issue）。重放要的是原样。
+/// （它会被复制进 issue）。重放要的是原样。
 fn stored_body(
     g: &tw_store::Recorder,
     id: i64,
@@ -101,7 +101,7 @@ pub async fn quote(
         })?;
 
     // 输入 token 用记录里的真值 —— 那是上游报回来的，比任何估算都准。
-    // 没有的话按字节粗估（和路由用的是同一个系数，§3.4）
+    // 没有的话按字节粗估（和路由用的是同一个系数）
     let input = row.input_tokens.unwrap_or((raw.len() / 4) as i64).max(0) as u64;
     let output = row.output_tokens.unwrap_or(0).max(0) as u64;
     let prices = crate::prices(&s);
@@ -146,7 +146,7 @@ pub async fn quote(
         input_tokens: input as i64,
         cost_micros,
         note,
-        // 脱敏在重放里照做（§5.1），但用户有权在按下去之前知道
+        // 脱敏在重放里照做，但用户有权在按下去之前知道
         will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
             .is_empty(),
         pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
@@ -179,7 +179,7 @@ pub async fn run(
                 format!("没有叫 `{}` 的上游", req.provider),
             )
         })?;
-    // §3.6：OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
+    // OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
     // 必须走同一条路** —— 否则一个 OAuth 上游在重放里永远是「密钥取不到」
     let pk_http = s.gateway.client_for(&provider.name);
     let key = s.gateway.key_for(provider, &pk_http).await.map_err(|e| {
@@ -190,7 +190,7 @@ pub async fn run(
     })?;
 
     // **脱敏照做。**重放不经过数据面的管线，少了这一行，一条本来会被
-    // 脱敏的请求会因为「重放」这个动作把密钥原样发给中转站（§5.1）
+    // 脱敏的请求会因为「重放」这个动作把密钥原样发给中转站
     let (body, ledger) = tw_gateway::guard::redact_outbound(
         cfg.security.redact,
         provider,
@@ -216,7 +216,7 @@ pub async fn run(
     let duration_ms = started.elapsed().as_millis() as i64;
 
     // 回显还原之后再脱敏给人看。**两步都要**：还原是为了让内容和原来
-    // 那次可比，脱敏是因为这段文字会被复制进 issue（§9.7）
+    // 那次可比，脱敏是因为这段文字会被复制进 issue
     let restored = tw_redact::redact::restore(&text, &ledger);
     Ok(Json(tw_api::ReplayResult {
         provider: provider.name.clone(),
@@ -236,7 +236,7 @@ pub async fn run(
     }))
 }
 
-/// 把一条真实请求导出成回放用例（§9.8）。
+/// 把一条真实请求导出成回放用例。
 ///
 /// **「录制」不是一个新功能**：每一个请求和响应本来就在存储里，这一步
 /// 只是把观测数据变成测试夹具。

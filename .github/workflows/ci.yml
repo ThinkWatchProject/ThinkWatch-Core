@@ -1,6 +1,6 @@
 # 每次改动都要过的那几关。
 #
-# **价目表的比对在这里**（DESIGN.md §4.3.0）：内置快照和
+# **价目表的比对在这里**：内置快照和
 # `crates/tw-pricing/data/verified.yaml` 对不上就构建失败 —— 那是挡住
 # 「打包了错数据」的唯一手段。
 name: CI
@@ -40,7 +40,7 @@ jobs:
         run: cargo build --release -p twcore
 
       # **接缝上的失败模式单元测试看不见**：文件权限、socket、某个端点
-      # 在真二进制上根本没注册。这个项目的前四个真 bug 都是这么被逮到的
-      # （DESIGN.md §9.7）。脚本自己会 build，这一步只是跑它。
+      # 在真二进制上根本没注册。这个项目的前四个真 bug 都是这么被逮到的。
+      # 脚本自己会 build，这一步只是跑它。
       - name: Smoke (real binary, real socket, real data plane)
         run: ./scripts/smoke.sh

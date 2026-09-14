@@ -24,7 +24,7 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 /// 的那批和不走代理的那批会慢慢长出不同的超时行为。
 fn base_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        // 分段超时（§4.7）。**没有整体超时** —— 一个跑了六分钟的
+        // 分段超时。**没有整体超时** —— 一个跑了六分钟的
         // Opus 任务不该被中间层掐断，让客户端自己决定何时放弃。
         .connect_timeout(std::time::Duration::from_secs(10))
         // 响应头超时覆盖不到 DNS 和 TCP 握手，所以上面那条必须显式
@@ -71,7 +71,7 @@ fn build_client(
             match reqwest::Proxy::all(&url) {
                 Ok(px) => b = b.proxy(px),
                 Err(e) => {
-                    // **默认让请求失败，不静默改走直连**（§3.7）。静默降级
+                    // **默认让请求失败，不静默改走直连**。静默降级
                     // 最糟的情况不是失败，是它真的连上了，而你以为自己在
                     // 走代理。
                     if p.on_proxy_fail == tw_config::OnProxyFail::Direct {
@@ -98,7 +98,7 @@ fn build_client(
 ///
 /// **单独一个函数是为了让「上游名单变没变」有一个确切的判据**。
 /// 改一条路由规则不该重置模型目录（那会让 `/v1/models` 短暂地空一下），
-/// 而删掉一个 provider 必须立刻反映（列表即承诺，§3.9）。
+/// 而删掉一个 provider 必须立刻反映（列表即承诺）。
 fn catalog_sources(cfg: &tw_config::Config) -> Vec<tw_engine::ProviderModels> {
     cfg.providers
         .iter()
@@ -132,12 +132,12 @@ pub struct Runtime {
     /// 引擎还是旧的」变成可能，而那种不一致完全静默。
     pub engine: Arc<tw_engine::Engine>,
     /// **每个 provider 一个 Client**。reqwest 的代理绑在 Client 上，
-    /// 不能按请求切换（§3.7）—— 而这本来也是对的：连接池按上游隔离，
+    /// 不能按请求切换 —— 而这本来也是对的：连接池按上游隔离，
     /// 一个慢上游不会占着另一个的连接。
     pub clients: std::collections::HashMap<String, reqwest::Client>,
-    /// 来源白名单。空 = 全放行，而那只在 loopback 下成立（§5.4）。
+    /// 来源白名单。空 = 全放行，而那只在 loopback 下成立。
     pub allow: crate::access::AllowList,
-    /// 工具调用防火墙的规则（§5.2）。
+    /// 工具调用防火墙的规则。
     ///
     /// **和配置一起建、一起换**，而不是每个请求现读一次文件 —— 那是几十
     /// 个正则的编译，摆在数据面上就是每个请求几毫秒的白付。
@@ -174,7 +174,7 @@ impl Runtime {
             .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
         // 规则集编译一次，跟着运行时一起换 —— 它现在住在 config.yaml 的
         // `security.scan_rules` 里，所以「改了规则」和「改了别的配置」
-        // 走同一条热重载路径（§3.1、§5.3）。
+        // 走同一条热重载路径。
         //
         // **用户写坏的那几条被跳过，其余照常工作**：一个因为配置写错就
         // 整个不工作的安全功能等于没有。但跳过要大声说出来。
@@ -209,12 +209,12 @@ fn proxy_shape(cfg: &tw_config::Config, p: &tw_config::Provider) -> String {
 
 #[derive(Clone)]
 pub struct AppState {
-    /// 配置换入时整块换掉的那部分（§3.8 第 ⑤ 步）。
+    /// 配置换入时整块换掉的那部分（第 ⑤ 步）。
     ///
     /// **一次 `store` 就是一次生效**：正在跑的请求持有旧的 `Arc`，跑完
     /// 自然释放；新请求看到的是新的。中间没有任何一个瞬间是半新半旧的。
     rt: Arc<arc_swap::ArcSwap<Runtime>>,
-    /// 并发闸门。排队不拒绝（§4.7）。
+    /// 并发闸门。排队不拒绝。
     ///
     /// **不在 Runtime 里，因为它握着正在跑的请求的通行证。**跟着配置一起
     /// 换的话，每改一次规则，队列里排着的请求就会失去位置，而已经在跑的
@@ -227,47 +227,47 @@ pub struct AppState {
     /// 没有人在看。**跨重载存活**：界面上的实时列表不该因为改了配置断一次。
     pub bus: tw_observe::EventBus,
     /// 上游健康。**不持久化**，但**跨重载存活** —— 一家刚被熔断的上游
-    /// 不该因为你改了条规则就立刻又被试一遍（§4.2）。
+    /// 不该因为你改了条规则就立刻又被试一遍。
     pub health: Arc<Health>,
-    /// 模型目录。**列表和准入的唯一真相来源**（§3.9）。
+    /// 模型目录。**列表和准入的唯一真相来源**。
     ///
     /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
     /// 探测要打网络，不能挡住启动。
     pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
-    /// 请求体和响应体往哪儿交（§8）。
+    /// 请求体和响应体往哪儿交。
     ///
     /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
     /// —— 一次慢磁盘写就变成一次慢请求，而观测永远不该有这个权力。
     /// `None` 表示观测层没起来，那时什么都不做。
     body_sink: Arc<std::sync::Mutex<Option<crate::bodies::BodySender>>>,
-    /// 每个上游最近一次报的订阅额度（§4.3.2）。
+    /// 每个上游最近一次报的订阅额度。
     ///
     /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
     /// 五分钟前的百分比，价值几乎为零，而它会让「重启之后显示的是旧
     /// 数字」变成一个要解释的问题。下一个请求回来就有新的了。
     quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::quota::Quota>>>,
-    /// 监听地址变了。**这是「温」那一级**（§3.8 的三级热重载）——
+    /// 监听地址变了。**这是「温」那一级**（三级热重载） ——
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
     relisten: Arc<tokio::sync::Notify>,
-    /// OAuth 的 access token（§3.6）。
+    /// OAuth 的 access token。
     ///
     /// **在内存里，跨重载存活。**access token 是派生状态 —— 不是用户输入
-    /// 的，会过期，丢了重换一个就行（§3.1）。落盘只多一处密钥副本，换不到
+    /// 的，会过期，丢了重换一个就行。落盘只多一处密钥副本，换不到
     /// 任何东西；而跟着配置一起丢掉的话，改一条限流规则会让所有 OAuth
     /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
     /// 得出来（指纹对不上就重换）。
     pub oauth: Arc<crate::oauth::Cache>,
-    /// 每家的典型首字节时间。`url-test` 策略靠它排序（§3.5、§4.6）。
+    /// 每家的典型首字节时间。`url-test` 策略靠它排序。
     ///
     /// **跨重载存活**：改一条规则不该让所有上游回到「没测过」。
     pub latency: Arc<crate::latency::Latency>,
-    /// 价目表。`cheapest` 策略靠它排序（§3.5）。
+    /// 价目表。`cheapest` 策略靠它排序。
     ///
-    /// **可能是空的** —— 价目表加载失败时成本一律标「未知」（§4.3），
+    /// **可能是空的** —— 价目表加载失败时成本一律标「未知」，
     /// 而那时 `cheapest` 组里所有人都「算不出价钱」，退回配置顺序。
     pub prices: Arc<arc_swap::ArcSwap<tw_pricing::Prices>>,
-    /// 轮换出来的新 refresh token 往哪儿交（§3.6）。
+    /// 轮换出来的新 refresh token 往哪儿交。
     ///
     /// **和 body 那条路同一个形状**：数据面只管交出去，写文件是控制面的
     /// 事 —— 那里才有历史快照、乐观并发和防回环。`None` 表示控制面没
@@ -277,7 +277,7 @@ pub struct AppState {
     ///
     /// **只压成功的那句，失败的每次都说。**会轮换的服务器每小时换一次，
     /// 而「已经帮你写回去了」这句话说一次就够 —— 通知的代价是用户学会
-    /// 忽略通知，包括那些真该看的（§2.4）。失败不一样：它要一直挂着，
+    /// 忽略通知，包括那些真该看的。失败不一样：它要一直挂着，
     /// 而且从成功变成失败是**状态变了**，必须重新说。
     rotation_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
@@ -307,7 +307,7 @@ impl AppState {
             prices: Arc::new(arc_swap::ArcSwap::from_pointee(
                 tw_pricing::Prices::builtin().unwrap_or_else(|e| {
                     // **加载不了不能挡住启动**：那时成本显示「未知」，
-                    // 而转发照常（§4.7）
+                    // 而转发照常
                     tracing::warn!("价目表加载失败，成本一律标未知：{e}");
                     tw_pricing::Prices::empty()
                 }),
@@ -318,10 +318,10 @@ impl AppState {
     }
 
     /// 取这一家的密钥。**OAuth 那一类要联网换 token，所以这条路是
-    /// async 的**（§3.6）；明文和 `${ENV}` 走同步那条，零额外成本。
+    /// async 的**；明文和 `${ENV}` 走同步那条，零额外成本。
     ///
-    /// `http` 必须是**这一家自己的** client：换 token 要走它该走的代理
-    /// （§3.7）。用一个干净的 client 去换，代理后面的用户会得到一个
+    /// `http` 必须是**这一家自己的** client：换 token 要走它该走的代理。
+    /// 用一个干净的 client 去换，代理后面的用户会得到一个
     /// 「数据面通、刷新不通」的组合 —— 而那个症状看起来完全不像凭据问题。
     pub async fn key_for(
         &self,
@@ -341,7 +341,7 @@ impl AppState {
             let sink = self.rotation_sink.lock().ok().and_then(|g| g.clone());
             match sink {
                 // **交出去就不管了。**写文件、存历史、防回环都在控制面，
-                // 而这里是转发路径 —— 它不能等一次磁盘写（§4.7）
+                // 而这里是转发路径 —— 它不能等一次磁盘写
                 Some(tx) => {
                     let r = crate::oauth::Rotated {
                         provider: p.name.clone(),
@@ -407,7 +407,7 @@ impl AppState {
         });
     }
 
-    /// 这一家该用的 HTTP client（带着它该走的代理，§3.7）。
+    /// 这一家该用的 HTTP client（带着它该走的代理）。
     ///
     /// **给控制面用。**数据面自己整轮持着同一份 `Runtime`，直接从那里
     /// 取 —— 走这里会重新 `load` 一次，于是一个请求可能跨在两份配置上。
@@ -444,7 +444,7 @@ impl AppState {
     /// 换一份带用户覆盖的价目表进来。
     ///
     /// **一定要调。**`AppState::new` 里那份只有内置快照，没有用户的
-    /// `pricing.yaml` —— 而中转站的价格只有用户自己知道（§4.3.0），
+    /// `pricing.yaml` —— 而中转站的价格只有用户自己知道，
     /// 那正是 `cheapest` 唯一的判据来源。两处各拿一份不同的价目表，
     /// 会让「成本栏显示的」和「按最便宜选的」对不上。
     pub fn set_prices(&self, p: tw_pricing::Prices) {
@@ -467,7 +467,7 @@ impl AppState {
         self.quotas.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 换一份配置进去（§3.8 的第 ④⑤ 步）。
+    /// 换一份配置进去（第 ④⑤ 步）。
     ///
     /// **建不起来就什么都不换。**校验已经在 `tw_config::reload` 里做过
     /// 三遍了，但运行时对象仍然可能建不起来（比如代理地址 reqwest 不认），
@@ -481,7 +481,7 @@ impl AppState {
         if catalog_stale {
             // 上游名单变了，目录里那些属于已删上游的模型必须立刻消失 ——
             // 不然 `/v1/models` 会继续列出一个已经不存在的东西，而
-            // 「列表即承诺」（§3.9）。真正的探测在后台补。
+            // 「列表即承诺」。真正的探测在后台补。
             self.catalog.store(Arc::new(catalog_from(&next.config)));
         }
         let relisten =
@@ -530,12 +530,12 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        // **和准入共用同一个函数**（§3.9）—— 列表和准入不可能不一致。
+        // **和准入共用同一个函数** —— 列表和准入不可能不一致。
         .route("/v1/models", get(list_models))
-        // **单点查询要走同一道准入**（§3.9）。不接这条的话它掉进
+        // **单点查询要走同一道准入**。不接这条的话它掉进
         // fallback 直接透传上游 —— 一个被 `allow` 限制成只能用便宜
         // 模型的 client，`GET /v1/models/claude-opus-4` 照样拿 200。
-        // §3.9 点名过这个洞（说别的项目「都没做过滤」），而我们自己
+        // 这个洞在别的项目里点过名（「都没做过滤」），而我们自己
         // 也漏了。**同一个 `admits` 函数，列表和单点不可能不一致。**
         .route("/v1/models/{model}", get(get_model))
         // Gemini 方言的路径。它的客户端问的是 `/v1beta/models/x`
@@ -585,7 +585,7 @@ async fn ws_upgrade(
         return Err(GatewayError::config(format!("配置里没有 `{name}`")));
     };
     // **走代理的上游不代理 WS**，而且要明说。悄悄绕过用户配的代理，
-    // 等于把他以为在代理后面的流量直接发出去（§3.7）
+    // 等于把他以为在代理后面的流量直接发出去
     if provider.proxy != tw_config::DIRECT {
         return Err(GatewayError::config(format!(
             "`{name}` 配了出站代理（{}），而 WebSocket 升级这条路还不会走代理 —— 与其悄悄绕过它，不如在这里停下。这条链路暂时只支持 direct 的上游。",
@@ -622,7 +622,7 @@ async fn ws_upgrade(
 /// `GET /v1/models`。
 ///
 /// 三种方言的响应结构不同，但**列表内容来自同一个函数** —— 差别只在
-/// 外壳（§3.9）。
+/// 外壳。
 async fn list_models(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -728,7 +728,7 @@ async fn passthrough(
     // 完全静默。
     let rt = state.runtime();
     // 来源检查在身份检查**之前**：一个不该连过来的地址，不该有机会
-    // 试密钥（§5.4）。
+    // 试密钥。
     if !rt.allow.allows(peer.ip()) {
         return Err(GatewayError::new(
             crate::error::Source::Auth,
@@ -739,13 +739,13 @@ async fn passthrough(
         ));
     }
     let (client_name, position) = state.identify(&headers, query.as_deref())?;
-    // WebSocket 升级（§3.6）。**在鉴权之后、解体之前分叉** —— 鉴权
+    // WebSocket 升级。**在鉴权之后、解体之前分叉** —— 鉴权
     // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
     // 升级要的是那条连接，而 `Bytes` 会把它读干净。
     if let Some(ws) = upgrade.filter(|_| crate::ws::is_upgrade(&headers)) {
         return ws_upgrade(state, rt, ws, client_name, uri, query, headers).await;
     }
-    // 从这里往下，所有错误都要用客户端自己那套结构回（§4.6.1）。
+    // 从这里往下，所有错误都要用客户端自己那套结构回。
     // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
     // 的，只能退回 Anthropic 形状，而那是桌面版的主用例。
     let dialect = crate::error::Dialect::from_key_position(position);
@@ -781,7 +781,7 @@ async fn pipeline(
 ) -> Result<Response, GatewayError> {
     forward::check_body_size(&body, MAX_BODY)?;
 
-    // 管线第 1.3 步：客户端的自言自语（§4.8）。
+    // 管线第 1.3 步：客户端的自言自语。
     //
     // **位置在身份识别之后、模型准入和路由之前。**在准入之前不是偷懒：
     // 一个被本地应答的请求永远不会到达任何上游，而模型准入回答的是
@@ -828,16 +828,16 @@ async fn pipeline(
         )));
     }
 
-    // 管线第 2 步：路由（§4）。**规则引擎在这里** —— M0 那句「取第一个
+    // 管线第 2 步：路由。**规则引擎在这里** —— M0 那句「取第一个
     // provider」就是留给这一段的接缝。
-    // **只解析一次。**路由要它，会话指纹也要它（§7.9），而 body 可能有
+    // **只解析一次。**路由要它，会话指纹也要它，而 body 可能有
     // 几百 KB —— 解两遍是白付一份钱。
     let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let facts = {
         let mut f = match &parsed {
             Some(v) => tw_engine::RequestFacts::from_anthropic_body(v),
             // body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** ——
-            // 我们的解析器不认识的东西，上游可能完全认识（§4.1）。
+            // 我们的解析器不认识的东西，上游可能完全认识。
             None => tw_engine::RequestFacts::default(),
         };
         f.client = client_name.clone();
@@ -845,7 +845,7 @@ async fn pipeline(
         f
     };
     // 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
-    // （§3.9）—— 列出来的一定能用，能用的一定列了出来。
+    // —— 列出来的一定能用，能用的一定列了出来。
     //
     // 目录空着时不拦：那说明探测还没回来或者上游都不给列表，这时候拦
     // 等于把整个网关关掉。
@@ -860,7 +860,7 @@ async fn pipeline(
                 .and_then(|c| c.allow.clone());
             if !catalog.admits(&facts.model, Some(position.dialect()), allow.as_deref()) {
                 // 错误信息要说人话 —— 而不是一个干巴巴的 permission
-                // denied（§3.9、§4.6.1）。
+                // denied。
                 return Err(GatewayError::new(
                     crate::error::Source::Request,
                     format!(
@@ -880,17 +880,17 @@ async fn pipeline(
         tw_engine::Outcome::Route(d) => d,
         tw_engine::Outcome::Deny { rule, reason } => {
             // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
-            // 眼里没有区别（§3.4）。
+            // 眼里没有区别。
             tracing::info!(%rule, "按规则拒绝");
             return Err(GatewayError::denied(reason));
         }
     };
-    // 策略组排序（§3.5）。**引擎给的是集合，顺序在这儿定** ——
+    // 策略组排序。**引擎给的是集合，顺序在这儿定** ——
     // 因为 `load-balance` / `url-test` / `cheapest` 都要运行时的数字，
     // 而路由决策本身必须是纯的、可试算的。
     //
-    // `fallback` 和 `select` 走不到这里面 —— 那是绝大多数人的配置
-    // （§0.6），它们连一个 HashMap 都不用建。
+    // `fallback` 和 `select` 走不到这里面 —— 那是绝大多数人的配置，
+    // 它们连一个 HashMap 都不用建。
     let mut decision = decision;
     if let Some(gname) = decision.via_group.clone()
         && let Some(kind) = rt
@@ -916,8 +916,8 @@ async fn pipeline(
                         .iter()
                         .filter_map(|name| {
                             let p = rt.config.providers.iter().find(|p| &p.name == name)?;
-                            // **订阅制的边际成本是零，它就是最便宜的那家**
-                            // （§4.3.1）。而「价格未知」不是「免费」——
+                            // **订阅制的边际成本是零，它就是最便宜的那家**。
+                            // 而「价格未知」不是「免费」 ——
                             // 它要排到最后去
                             match p.billing {
                                 Some(tw_config::Billing::Subscription) => {
@@ -940,7 +940,7 @@ async fn pipeline(
             .order(Some(&gname), &decision.candidates, &facts_rt);
     }
 
-    // 管线第 3 步：准入。**排队而不是拒绝**（§4.7）—— 客户端收到 429
+    // 管线第 3 步：准入。**排队而不是拒绝** —— 客户端收到 429
     // 通常不会优雅重试，一个本来只需要多等两秒的请求会变成一次任务中断。
     //
     // 闸门在路由**之后**取：要知道走哪个 provider 才能算 per_provider
@@ -982,7 +982,7 @@ async fn pipeline(
         // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
         // 不参与鉴权、路由、配额（见 crate::hint）。
         client_hint: crate::hint::client_hint(&headers),
-        // 认出「这几十个请求是同一次任务」（§7.9）。**认不出来就是
+        // 认出「这几十个请求是同一次任务」。**认不出来就是
         // None** —— 硬凑一个会把互不相干的请求并成一个「会话」
         session_fp: parsed.as_ref().and_then(crate::session::fingerprint),
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
@@ -992,8 +992,8 @@ async fn pipeline(
         at_ms: now_ms(),
     });
 
-    // 出站密钥检测（§5.0 的观察态）。**只看，不动** —— 换成占位符是
-    // 「拦截」态的事，而那要等 §5.1 那套完整的脱敏。
+    // 出站密钥检测（观察态）。**只看，不动** —— 换成占位符是
+    // 「拦截」态的事，而那要等那套完整的脱敏。
     //
     // 位置在这里是因为它要知道**发给了谁**：一把 key 发给官方和发给一个
     // 中转站，是完全不同的两件事，而后者才是这条防线存在的理由。
@@ -1010,7 +1010,7 @@ async fn pipeline(
     }
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
-    // 除了一次 `Bytes` 的引用计数之外没有别的成本（§4.1 说过入站是要
+    // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
     // 整个解析的，所以本来就在）。
     let sink = state.body_sink();
     let at_ms = now_ms() as i64;
@@ -1025,7 +1025,7 @@ async fn pipeline(
         },
     );
 
-    // 依次尝试。**首字节之前可以透明切换**（§4.2）—— 拿到响应头之前
+    // 依次尝试。**首字节之前可以透明切换** —— 拿到响应头之前
     // 我们还没往客户端写过任何东西，换一家客户端完全无感。
     //
     // 「尝试链」要留下来：用户能看见故障转移在替他工作，**这是信任的
@@ -1037,7 +1037,7 @@ async fn pipeline(
     let dialect = crate::error::Dialect::from_key_position(position);
     let mut attempts: Vec<String> = Vec::new();
     // 成功那一次的脱敏账本。**必须是成功那一次的** —— 故障转移从官方切到
-    // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来（§5.1）
+    // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来
     let mut used_ledger = tw_redact::redact::Ledger::default();
     // 成功那一跳用的是哪个翻译方向。**必须是成功那一次的** —— 故障转移
     // 从 Anthropic 上游切到 OpenAI 上游时，两跳的方向不一样
@@ -1065,7 +1065,7 @@ async fn pipeline(
 
         // 阶段二：知道走哪家了，再跑一遍含 `provider_would_be` 的规则。
         //
-        // **在循环里面，因为故障转移换了 provider 之后必须重算**（§3.4）。
+        // **在循环里面，因为故障转移换了 provider 之后必须重算**。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
         let (effective_set, guard) =
@@ -1081,11 +1081,11 @@ async fn pipeline(
                 Err(e) => return Err(GatewayError::config(format!("阶段二求值失败：{e}"))),
             };
         // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
-        // §4.1 的出站直通说过任何 body 改写都可能是缓存杀手，所以这是
+        // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
         // 一个用户显式要求的例外，不是默认行为。
         let outbound = forward::apply_set(&body, &effective_set);
 
-        // 出站脱敏（§5.1）。**和阶段二在同一个位置，理由完全一样** ——
+        // 出站脱敏。**和阶段二在同一个位置，理由完全一样** ——
         // 故障转移从官方切到中转的那一刻，正是最需要它的时刻，而那时
         // 「该脱哪些」已经换了一套。
         let (outbound, ledger) =
@@ -1108,7 +1108,7 @@ async fn pipeline(
         }
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
-        // 之前拿到**：OAuth 换 token 也要走这条代理（§3.6）。
+        // 之前拿到**：OAuth 换 token 也要走这条代理。
         let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
         let key = match state.key_for(provider, http).await {
             Ok(k) => k,
@@ -1125,7 +1125,7 @@ async fn pipeline(
                 continue;
             }
         };
-        // 方言互转（§11 的 M6+）。**同方言时这一整段是零成本** ——
+        // 方言互转（M6+）。**同方言时这一整段是零成本** ——
         // `plan()` 返回 Passthrough，body 和路径都原样
         let xlate = crate::translate::plan(dialect, provider.effective_protocol());
         let outbound = match (xlate.active(), parsed.as_ref()) {
@@ -1144,7 +1144,7 @@ async fn pipeline(
                 Bytes::from(c.body.to_string())
             }
             // body 解不开时原样发。**我们的解析器不认识的东西，上游可能
-            // 完全认识**（§4.1）—— 而那时它的 400 比我们编一个更有用
+            // 完全认识** —— 而那时它的 400 比我们编一个更有用
             _ => outbound,
         };
 
@@ -1173,8 +1173,7 @@ async fn pipeline(
                 state.health.record_failure(&provider.name);
                 chain.push(hop(&provider.name, format!("{}", r.status()), hop_started));
                 // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
-                // 坏了」而不是「该退避了」，而它们该做的事完全不同
-                // （§4.6.1）。
+                // 坏了」而不是「该退避了」，而它们该做的事完全不同。
                 last_err = Some(if r.status() == 429 {
                     GatewayError::rate_limited(format!("`{}` 限流了", provider.name))
                 } else {
@@ -1204,7 +1203,7 @@ async fn pipeline(
     // 尝试链走完了，两条路都要发 —— 挂在 RequestFinished 上的话，
     // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
     // 最终服务的那家怎么收钱。**跟着请求走，不能事后查配置** ——
-    // 配置随时会被热重载，而一条三天前的记录该按它当时那家的算（§4.3.1）。
+    // 配置随时会被热重载，而一条三天前的记录该按它当时那家的算。
     let billing = used
         .map(|p| effective_billing(&state, p))
         .unwrap_or(tw_config::Billing::PerToken);
@@ -1221,7 +1220,7 @@ async fn pipeline(
         // **尝试链要进客户端看到的那条错误**，不只进我们的事件流 ——
         // 用户看的是他自己终端里的报错。一条说「试过 A → B → C 都不行」
         // 的错误，和一条只说「503」的错误，是两种产品：前者说明我们替
-        // 他做了工作，后者让他以为我们什么都没干（§4.2）。
+        // 他做了工作，后者让他以为我们什么都没干。
         if attempts.len() > 1 {
             err.message = format!("{}（试过：{}）", err.message, attempts.join(" → "));
         }
@@ -1248,7 +1247,7 @@ async fn pipeline(
     // 到结束可能还有好几分钟，UI 要能在这个点就把行画出来并标「进行中」，
     // 而不是等它结束才出现。
     let ttfb_ms = started.elapsed().as_millis() as u64;
-    // `url-test` 的判据（§3.5）。**只记成功的那些** —— 一个 500 在
+    // `url-test` 的判据。**只记成功的那些** —— 一个 500 在
     // 十毫秒内返回，会让最坏的上游看起来最快
     if status.is_success() {
         state
@@ -1260,7 +1259,7 @@ async fn pipeline(
         status: status.as_u16(),
         ttfb_ms,
     });
-    // 订阅额度（§4.3.2）。**零成本** —— 这些头本来就在响应里，读一下
+    // 订阅额度。**零成本** —— 这些头本来就在响应里，读一下
     // 就有了。按量付费的账号没有它们，那时什么都不发。
     let quota = crate::quota::from_headers_reqwest(upstream.headers());
     if !quota.is_empty() {
@@ -1285,7 +1284,7 @@ async fn pipeline(
     }
 
     let mut out_headers = forward::response_headers(upstream.headers());
-    // **哪一家服务的，写在头上。**§4.6.1 说上游的错误要原样透传、不加
+    // **哪一家服务的，写在头上。**错误契约要求上游的错误原样透传、不加
     // `[ThinkWatch]` 前缀 —— 那确实是它说的话。可上游的 401 说的是
     // 「invalid x-api-key」，而用户手里有两把 key（网关的和上游的），
     // 他会去查错的那一把。改 body 是越界，加一个头不是。
@@ -1310,11 +1309,11 @@ async fn pipeline(
     // **中途断掉不能只是让流消失。**首字节已经发出去了，状态码和响应头
     // 都改不了，而一个戛然而止的 SSE 流和一个正常结束的流在客户端看来
     // 长得一模一样 —— 用户会以为模型就答了这么多。唯一还能说话的地方
-    // 是流本身，所以补一个 `event: error` 帧（§4.6.1）。
+    // 是流本身，所以补一个 `event: error` 帧。
     let is_sse = out_headers
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
-    // 回显还原（§5.1）。
+    // 回显还原。
     //
     // **SSE 和非流式走两套**：前者的占位符散落在几十帧里（模型按 token
     // 吐字，一个 `<<TW_SECRET_1>>` 会被切成五到八段），后者整个躺在一份
@@ -1323,7 +1322,7 @@ async fn pipeline(
     // **没脱敏过就是个空壳**，`process` 直接把字节原样递出去 —— 绝大多数
     // 请求走的是这条路，它不该为这个功能付任何延迟。
     let mut restorer = tw_redact::sse::Body::new(&used_ledger, is_sse);
-    // 方言互转的回程（§11 的 M6+）。**同方言时是 None，整段零成本。**
+    // 方言互转的回程（M6+）。**同方言时是 None，整段零成本。**
     //
     // 位置在还原**之后**：占位符是我们在出站时塞进去的，先换回真值再
     // 翻译，翻译器看到的就和上游原话一样了。
@@ -1336,11 +1335,11 @@ async fn pipeline(
     // 非流式那一条整个到手再翻
     let translate_whole = used_xlate == crate::translate::Plan::AnthropicToOpenai && !is_sse;
     let whole_model = facts.model.clone();
-    // 工具调用防火墙（§5.2）。**只在 SSE 上跑** —— 非流式响应整个到手
+    // 工具调用防火墙。**只在 SSE 上跑** —— 非流式响应整个到手
     // 之后再拦已经没有意义，客户端下一步就拿到全文了。
     let inspect = rt.config.security.inspect_tools;
     let trust = crate::guard::effective_trust(provider, &decision.guard);
-    // 正文里的提示注入**只对不受信任的上游查**（§5.2 末尾）：官方端点上
+    // 正文里的提示注入**只对不受信任的上游查**（末尾）：官方端点上
     // 模型讲解提示注入是完全正常的
     let mut wall = (is_sse && inspect.detects())
         .then(|| crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()));
@@ -1348,7 +1347,7 @@ async fn pipeline(
     let stream = async_stream::stream! {
         let mut counted = std::pin::pin!(counted);
         let mut broke: Option<GatewayError> = None;
-        // **旁路嗅探，不缓冲**（§4.3）：字节照常流向客户端，同时喂它
+        // **旁路嗅探，不缓冲**：字节照常流向客户端，同时喂它
         // 一份。上游返回的 usage 是真相，而拿不到它就只能估。
         let mut sniffer = crate::usage::Sniffer::new();
         // 响应体也攒一份，**攒到上限就停**。和 usage 嗅探走同一个循环 ——
@@ -1372,7 +1371,7 @@ async fn pipeline(
                     };
                     // 非流式那一条整个攒起来，最后翻一次。**这不是缓冲
                     // 流** —— 非流式响应本来就是一整个 body，客户端无论
-                    // 如何都要等它完整（§4.1 说的是别把 SSE 变成一次性
+                    // 如何都要等它完整（说的是别把 SSE 变成一次性
                     // 交付，这里没有 SSE）
                     if translate_whole {
                         whole.extend_from_slice(&out);
@@ -1383,7 +1382,7 @@ async fn pipeline(
                     let mut cut: Option<(GatewayError, usize)> = None;
                     if let Some(w) = wall.as_mut() {
                         for v in w.feed(&out) {
-                            // 高危 + 不受信任 + 拦截态 = 切断（§5.2）
+                            // 高危 + 不受信任 + 拦截态 = 切断
                             let blocked = v.high && inspect.acts() && trust.blocks();
                             bus.emit(tw_api::Event::ToolCallFlagged {
                                 id,
@@ -1417,7 +1416,7 @@ async fn pipeline(
                         // 通常先说了几句正常的话，一起吞掉的话用户看到的
                         // 是「什么都没发生然后报错了」。而从那一帧起一个
                         // 字节都不发 —— 「尽力阻断」的要点是客户端拼不出
-                        // 完整的工具调用（§5.2）
+                        // 完整的工具调用
                         let safe = safe.min(out.len());
                         if safe > 0 {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(out[..safe].to_vec()));
@@ -1462,7 +1461,7 @@ async fn pipeline(
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }
-        // 这条响应长什么样（§5.2 防线三）。**只有形状，没有内容。**
+        // 这条响应长什么样（防线三）。**只有形状，没有内容。**
         if let Some(w) = wall.as_ref() {
             let (tool_calls, flagged) = w.shape();
             if tool_calls > 0 || flagged > 0 {
@@ -1518,19 +1517,19 @@ async fn pipeline(
 
 /// 去问每个上游有哪些模型，把目录换掉。
 ///
-/// **探测是零成本的**（§4.6 的 L2），但它要打网络，所以在后台跑而不是
+/// **探测是零成本的**（L2），但它要打网络，所以在后台跑而不是
 /// 挡住启动。配置里手写的 `models:` 是它回来之前的兜底。
 ///
-/// 结果缓存 24 小时（§3.9）——模型列表变化不频繁，而**每次有人调
+/// 结果缓存 24 小时 ——模型列表变化不频繁，而**每次有人调
 /// `/v1/models` 就去打上游，会把一个本该零成本的端点变成一次串行网络
 /// 往返**。
-/// 给 `url-test` 组的成员垫一个底（§3.5：样本不够时用零成本的 L1 补）。
+/// 给 `url-test` 组的成员垫一个底（样本不够时用零成本的 L1 补）。
 ///
 /// **只测 `url-test` 组里的那些，而且只在启动和换配置时测一次。**
 /// 没有这一步的话，`url-test` 在攒够真实样本之前完全等同于 `fallback`
 /// —— 用户配了「选最快的」，而头几十个请求全落在配置里排第一那家。
 ///
-/// L1 是握手计时，不发一个 API 请求、不花一分钱（§4.6）；也**不是定期
+/// L1 是握手计时，不发一个 API 请求、不花一分钱；也**不是定期
 /// 跑的** —— 真实流量一到就该由它说了算。
 pub async fn seed_latency(state: &AppState) {
     let rt = state.runtime();
@@ -1549,7 +1548,7 @@ pub async fn seed_latency(state: &AppState) {
         let Some(p) = rt.config.providers.iter().find(|p| p.name == name) else {
             continue;
         };
-        // 走代理的那家要测它真正会走的那条路（§3.7）。`system` 测不了，
+        // 走代理的那家要测它真正会走的那条路。`system` 测不了，
         // 那时不垫底 —— 假装直连测一遍给的数字，测的根本不是那条路
         let hop = match crate::l1::hop_for(&rt.config, p) {
             Ok(h) => h,
@@ -1628,7 +1627,7 @@ pub async fn refresh_catalog(state: &AppState) {
 /// 后台刷新循环。
 ///
 /// **`url-test` 的垫底跟着它一起跑**：两者都是「启动时打一次网络、
-/// 之后靠真实流量」，而且都不该挡住启动（§3.9、§3.5）。
+/// 之后靠真实流量」，而且都不该挡住启动。
 pub fn spawn_catalog_refresh(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -1644,7 +1643,7 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Resu
     serve_once(state, addr, std::future::pending()).await
 }
 
-/// 起服务，**并且跟着配置里的监听地址走**（§3.8 的「温」）。
+/// 起服务，**并且跟着配置里的监听地址走**（「温」）。
 ///
 /// 换端口时：新监听器先起来，旧的停止接受新连接并**等现有请求自然
 /// 结束** —— 一个跑了六分钟的流不该因为你改了个端口而断掉。
@@ -1702,14 +1701,14 @@ async fn serve_once(
 /// 这家实际怎么收钱。
 ///
 /// **配置里写了就听配置的，没写就自动判**：响应头里报过订阅额度的就是
-/// 订阅型（§4.3.2）。那个信号一直在我们手上，不该变成一个用户要填的
-/// 字段（§0.6）—— 而一个填错了的字段比没有更糟。
+/// 订阅型。那个信号一直在我们手上，不该变成一个用户要填的
+/// 字段 —— 而一个填错了的字段比没有更糟。
 ///
 /// **自动判有一个已知的边界：每次进程启动之后，打给一家订阅上游的第一个
 /// 请求会被按量计价。**那时我们还没见过它的额度头。之后就对了。
 ///
 /// 没有更好的办法：额度头只在响应里，而计价发生在响应之后 —— 想在第一
-/// 个请求之前知道，只能主动探测，而 §4.3.2 明确否掉了那条路（会占用户
+/// 个请求之前知道，只能主动探测，而那条路是明确否掉的（会占用户
 /// 自己的配额）。在乎那一条记录的人，在配置里写一行 `billing:
 /// subscription` 就没有歧义了。
 fn effective_billing(state: &AppState, p: &tw_config::Provider) -> tw_config::Billing {
@@ -1740,7 +1739,7 @@ pub(crate) fn now_ms() -> u64 {
 
 /// 这个请求是 Claude Code 发的吗。
 ///
-/// **`max_tokens: 1` 那条判定必须同时要求它**（§4.8），否则会误伤别人
+/// **`max_tokens: 1` 那条判定必须同时要求它**，否则会误伤别人
 /// 真实的 `max_tokens: 1` 请求 —— 而误判的代价是用户看到一个凭空出现的
 /// 假答案，且完全无从察觉。
 ///
@@ -1829,7 +1828,7 @@ mod tests {
 
     #[test]
     fn the_default_proxy_is_direct_not_system() {
-        // 显式优于隐式（§3.7）。默认跟随系统的话，用户在系统里开了全局
+        // 显式优于隐式。默认跟随系统的话，用户在系统里开了全局
         // 代理，本地 Ollama 就会莫名连不上 —— 而配置文件里看不出任何线索。
         assert_eq!(tw_config::Provider::default().proxy, tw_config::DIRECT);
     }
@@ -1873,7 +1872,7 @@ mod tests {
 
     #[test]
     fn each_provider_gets_its_own_client() {
-        // reqwest 的代理绑在 Client 上，不能按请求切换（§3.7）。共用一个
+        // reqwest 的代理绑在 Client 上，不能按请求切换。共用一个
         // Client 的话，「这家走代理、Ollama 直连」这个最基本的需求就做
         // 不到 —— 而它恰恰是要代理这个功能的原因。
         let cfg = tw_config::Config {
@@ -1909,7 +1908,7 @@ mod tests {
         let s = AppState::new(cfg()).unwrap();
         let (name, pos) = s.identify(&hdr("x-api-key", "tw-good"), None).unwrap();
         assert_eq!(name, "default");
-        // 位置带出来的方言是 §3.9 按方言过滤的依据
+        // 位置带出来的方言是按方言过滤的依据
         assert_eq!(pos.dialect(), "Anthropic");
     }
 

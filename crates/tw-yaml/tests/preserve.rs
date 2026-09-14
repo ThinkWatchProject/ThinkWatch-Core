@@ -1,4 +1,4 @@
-//! §3.8 点名的语料，每一项都是格式保留的经典翻车点：
+//! 格式保留的经典翻车点，一项一项来：
 //! 行内与行尾注释、锚点与别名、多行标量、流式与块式混排、中文、CRLF、
 //! tab 缩进、极长的行。
 //!
@@ -85,7 +85,7 @@ fn every_other_comment_and_blank_line_survives() {
 #[test]
 fn chinese_keys_and_values_do_not_shift_the_span() {
     // **saphyr 的 marker 是按 char 数的。**直接拿它当字节下标，在中文
-    // 配置上会切到一个字符中间 —— 那是 §9.7 里 cc-switch 栽过两次的
+    // 配置上会切到一个字符中间 —— 那是 cc-switch 栽过两次的
     // 那个 panic。
     let out = set(
         REAL,

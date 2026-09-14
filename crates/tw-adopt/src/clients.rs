@@ -1,4 +1,4 @@
-//! 本机上有哪些 AI 客户端（DESIGN.md §7.11）。
+//! 本机上有哪些 AI 客户端。
 //!
 //! **两张表的成员不一样。**「能接管 API 端点」和「有 MCP 要管」是两件
 //! 事：Claude Code 两张表都在，Claude Desktop 只在第二张（它是订阅制，
@@ -16,7 +16,7 @@ use crate::json::Val;
 /// 配置文件是什么格式。**决定了怎么做字段级合并，以及哨兵往哪儿放。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Format {
-    /// 严格 JSON，**装不下注释** —— 哨兵退化成同目录的旁文件（§7.15）
+    /// 严格 JSON，**装不下注释** —— 哨兵退化成同目录的旁文件
     Json,
     Toml,
     Yaml,
@@ -24,7 +24,7 @@ pub enum Format {
 
 /// 配置改完什么时候生效。
 ///
-/// **这个差别真的会让用户困惑**（§7.11），而它直接决定观察窗口的行为：
+/// **这个差别真的会让用户困惑**，而它直接决定观察窗口的行为：
 /// 对需要重开终端的客户端，「五分钟没收到请求」是完全正常的 —— 用户
 /// 可能一整天都没重开过终端。那时弹「是不是没生效」是狼来了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ impl TakesEffect {
 
 /// 我们对这一条了解到什么程度。**要显示在界面上。**
 ///
-/// DESIGN.md §7.11 的表格自己就标了「前五个在这台机器上实测存在，后四个
+/// 表格自己就标了「前五个在这台机器上实测存在，后四个
 /// 是查证过字段但本机没装」。把这个区别丢掉，等于把「我跑过」和「我读过
 /// 文档」说成同一件事 —— 而它们出错的概率差一个数量级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,14 +80,14 @@ pub struct Client {
     pub config: &'static str,
     pub format: Format,
     pub takes_effect: TakesEffect,
-    /// 优先级比主配置更高、会盖住我们的那些文件（§7.11 的诊断链）。
+    /// 优先级比主配置更高、会盖住我们的那些文件（诊断链）。
     ///
     /// **检测阶段就要扫**：cc-switch 的 #6828 就是栽在
     /// `settings.local.json` 上 —— 我们写了 `settings.json`，而那边的
     /// 残留把它遮住了，用户看到的是「接管了但没生效」。
     pub shadowed_by: &'static [&'static str],
     /// 接管的代价。**接管确认对话框要把它们列出来，不能等用户自己发现**
-    /// —— 这些不是我们的 bug，但用户会算到我们头上（§7.11）。
+    /// —— 这些不是我们的 bug，但用户会算到我们头上。
     pub costs: &'static [&'static str],
     pub verified: Verified,
     /// 判断「这台机器上装了它吗」的痕迹，相对 `$HOME`。
@@ -95,7 +95,7 @@ pub struct Client {
     /// 不能只看配置文件在不在：`.aider.conf.yml` 这种，没接管过的用户
     /// 本来就没有；而 `~/.claude/` 这种，装了就一定有。
     pub marker: &'static [&'static str],
-    /// 进程名里认得出它的片段。诊断「客户端没重启」要用（§7.11）。
+    /// 进程名里认得出它的片段。诊断「客户端没重启」要用。
     pub process: &'static [&'static str],
     /// 它会读的环境变量。扫 shell 配置时找这些名字。
     pub env_vars: &'static [&'static str],
@@ -116,7 +116,7 @@ pub struct Gateway {
     /// 给这个客户端的专属密钥。`None` = 网关不要求鉴权。
     ///
     /// 专属密钥的意义在于**客户端识别**，这样规则里才能写
-    /// `when: { client: claude-code }`（§7.11）。
+    /// `when: { client: claude-code }`。
     pub key: Option<String>,
 }
 
@@ -130,7 +130,7 @@ impl Gateway {
 ///
 /// **这张表就是那个白名单，而它枚举的是「我们要写什么」** —— 有限、封闭、
 /// 不会增长。cc-switch 的白名单枚举的是「要保留什么」，那是个它不控制、
-/// 还在增长的集合，所以 147 个 commit 之后整个撤回了（§7.11）。
+/// 还在增长的集合，所以 147 个 commit 之后整个撤回了。
 #[derive(Debug, Clone)]
 pub struct Edit {
     pub path: Vec<String>,
@@ -156,12 +156,12 @@ fn secret(path: &[&str], value: Val) -> Edit {
 
 /// 我们给自己在各客户端里用的 provider id。
 ///
-/// Codex 的 `openai` / `ollama` / `lmstudio` 是保留 id，不能撞（§7.11）。
+/// Codex 的 `openai` / `ollama` / `lmstudio` 是保留 id，不能撞。
 pub const PROVIDER_ID: &str = "thinkwatch";
 
 /// 表一：能接管 API 端点的。
 ///
-/// 字段名都对应上游当前文档，不是猜的（§7.11）。
+/// 字段名都对应上游当前文档，不是猜的。
 pub fn adoptable() -> Vec<Client> {
     vec![
         Client {
@@ -186,7 +186,7 @@ pub fn adoptable() -> Vec<Client> {
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_MODEL",
             ],
-            // `env` 块会盖住 shell 里的 export（§7.11）
+            // `env` 块会盖住 shell 里的 export
             config_beats_env: true,
         },
         Client {
@@ -194,7 +194,7 @@ pub fn adoptable() -> Vec<Client> {
             name: "Codex CLI",
             config: ".codex/config.toml",
             format: Format::Toml,
-            // **读环境变量的，必须关掉终端重开**（§7.11）
+            // **读环境变量的，必须关掉终端重开**
             takes_effect: TakesEffect::OnRestart,
             // 项目级的 .codex/config.toml 会忽略 model_provider，
             // 所以它不构成遮蔽 —— 但它确实存在，值得在诊断里提一句
@@ -262,7 +262,7 @@ pub fn adoptable() -> Vec<Client> {
     ]
 }
 
-/// 接管不了、只能给指引的（§7.11）。
+/// 接管不了、只能给指引的。
 ///
 /// **不假装能接管。**Cursor 没有可写的配置文件，而且即使手动改了，
 /// Tab 补全和 inline edit 仍然走它自己的后端 —— 显示成「已接管」会让
@@ -293,7 +293,7 @@ pub fn manual_only() -> Vec<ManualOnly> {
             name: "Gemini CLI",
             how: "在你的 shell 配置里 export GOOGLE_GEMINI_BASE_URL=<我们的地址>。",
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
-            // 「只改 endpoint 和 key 字段」的边界（§7.11）——
+            // 「只改 endpoint 和 key 字段」的边界 ——
             // **报告是我们的职责，修改是他的权利。**
             caveat: "它只读环境变量，没有可写的配置字段。改 shell 配置文件超出了我们该动的范围，所以这一条只给命令，不代劳。",
         },
@@ -305,11 +305,11 @@ pub fn edits(client: &Client, gw: &Gateway) -> Vec<Edit> {
     match client.id {
         // 统一写 `ANTHROPIC_AUTH_TOKEN` 而不是 `ANTHROPIC_API_KEY`：
         // 后者在交互模式下要用户去 /config 点一次确认，**被拒绝是静默
-        // 忽略的** —— 接管会看起来「没生效」却查不出原因（§7.11）。
+        // 忽略的** —— 接管会看起来「没生效」却查不出原因。
         "claude-code" => {
             let mut v = vec![
                 e(&["env", "ANTHROPIC_BASE_URL"], Val::s(&gw.base)),
-                // 不设它，Claude Code 根本不会来问我们的 /v1/models（§3.9）
+                // 不设它，Claude Code 根本不会来问我们的 /v1/models
                 e(
                     &["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
                     Val::s("1"),
@@ -324,7 +324,7 @@ pub fn edits(client: &Client, gw: &Gateway) -> Vec<Edit> {
         // 的，并且用一个本地嗅探器实跑验证过：请求真的落在
         // `POST /v1/responses`，`http_headers` 原样送达，
         // `experimental_bearer_token` 变成 `Authorization: Bearer`。
-        // 一个 GET 都没有 —— 它确实不问我们要模型列表（§3.9）。
+        // 一个 GET 都没有 —— 它确实不问我们要模型列表。
         "codex" => {
             let p = |k: &str| {
                 vec![
@@ -467,7 +467,7 @@ mod tests {
     fn the_clients_that_need_a_restart_do_not_get_a_silence_warning() {
         // **对需要重开终端的客户端，五分钟收不到请求是完全正常的** ——
         // 用户可能一整天都没重开过终端。那时弹「是不是没生效」是狼来了，
-        // 被误报几次之后真正该看的那次也不会看了（§7.11）。
+        // 被误报几次之后真正该看的那次也不会看了。
         for c in adoptable() {
             if c.takes_effect == TakesEffect::OnRestart {
                 assert!(
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn adoption_costs_are_stated_where_they_exist() {
         // **接管确认对话框要把它们列出来，不能等用户自己发现** ——
-        // 这些不是我们的 bug，但用户会算到我们头上（§7.11）。
+        // 这些不是我们的 bug，但用户会算到我们头上。
         let cc = adoptable()
             .into_iter()
             .find(|c| c.id == "claude-code")
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn json_clients_have_no_comment_prefix_so_they_use_the_sidecar() {
-        // 严格 JSON 装不下注释 —— 哨兵退化成同目录的旁文件（§7.15）。
+        // 严格 JSON 装不下注释 —— 哨兵退化成同目录的旁文件。
         for c in adoptable() {
             match c.format {
                 Format::Json => assert!(c.comment_prefix().is_none(), "{}", c.id),
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn cursor_is_manual_only_and_says_why() {
         // **不假装能接管。**显示成「已接管」会让用户以为所有流量都在
-        // 我们这儿，而 Tab 补全根本不经过（§7.11）。
+        // 我们这儿，而 Tab 补全根本不经过。
         let m = manual_only();
         let cursor = m.iter().find(|c| c.name == "Cursor").unwrap();
         assert!(cursor.caveat.contains("Tab 补全"), "{}", cursor.caveat);

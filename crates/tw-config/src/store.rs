@@ -1,4 +1,4 @@
-//! 配置文件的读写门户（DESIGN.md §3.8）。
+//! 配置文件的读写门户。
 //!
 //! **两个写入方，一份文件，两个方向**：UI/CLI 经 API 结构化地改，你自己
 //! 拿编辑器直接改。由此产生四个问题，这个模块负责其中两个：
@@ -91,7 +91,7 @@ pub enum StoreError {
 
 /// 一份读到内存里的配置文本，带着它的来源和版本。
 ///
-/// **它记住的是原始文本，不是解析后的结构。**§3.8 的最小替换要在原文
+/// **它记住的是原始文本，不是解析后的结构。**最小替换要在原文
 /// 上做，而一旦经过结构体，注释和格式就已经没了。
 #[derive(Debug, Clone)]
 pub struct Loaded {
@@ -161,7 +161,7 @@ pub fn write_if_unchanged(
 /// 原子写 + `0600`。
 ///
 /// 先写临时文件再 rename —— **中断的写不该留下半份配置**。权限不能靠
-/// umask 的运气：这个文件里有明文密钥（§3.2）。
+/// umask 的运气：这个文件里有明文密钥。
 pub fn write_atomic(path: &Path, text: &str) -> Result<Fingerprint, StoreError> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn the_file_keeps_its_0600_after_every_write() {
-        // 这个文件里有明文密钥（§3.2）。权限不能靠 umask 的运气，
+        // 这个文件里有明文密钥。权限不能靠 umask 的运气，
         // 而**每一次写都要重新确认** —— 原子写换的是一个新 inode。
         #[cfg(unix)]
         {

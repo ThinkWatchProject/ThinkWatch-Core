@@ -1,4 +1,4 @@
-# 静态扫描的规则集（DESIGN.md §5.3）。
+# 静态扫描的规则集。
 #
 # **放在 YAML 里而不是硬编码**，因为这个列表会持续演进 —— 每出现一种
 # 新的注入写法就要能加一条，而不必等一次发版。
@@ -39,9 +39,9 @@ injection:
     pattern: '(?i)\[?(system|assistant)\]?\s*[:：]\s*(you|your|ignore|从现在|你)'
     why: 伪造成系统或助手的发言
 
-# 二、危险命令。这一组和 §5.2 的工具调用防火墙共用 —— 一套规则两处用。
+# 二、危险命令。这一组和工具调用防火墙共用 —— 一套规则两处用。
 #
-# `level` 决定 §5.2 里的处置：**high 才会切断流**，medium 只告警。分级的
+# `level` 决定的处置：**high 才会切断流**，medium 只告警。分级的
 # 判据是「它能不能一步拿到执行权或者拿走凭据」，不是「它听起来多可怕」。
 # 没写 level 的按 medium 算。
 dangerous:
@@ -83,7 +83,7 @@ dangerous:
     why: 让模型把凭据文件的内容送出去
     level: high
   # **写入启动项**：只要写进去了，下次开终端就执行 —— 而且是在你完全
-  # 不知情的时候。§5.2 把它和「下载即执行」并列为高危，理由是一样的：
+  # 不知情的时候。它和「下载即执行」并列为高危，理由是一样的：
   # 一步就能拿到执行权。
   - id: 写启动项
     pattern: '(>>?|tee|cp|mv|ln\s+-s)[^\n]{0,200}(\.zshrc|\.bashrc|\.bash_profile|\.profile|\.zprofile|LaunchAgents|LaunchDaemons|\.git/hooks|crontab)'

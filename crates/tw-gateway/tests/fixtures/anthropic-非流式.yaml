@@ -1,6 +1,6 @@
 version: 1
 name: anthropic-非流式
-note: 按 §4.3 的方言表构造：非流式在 body 末尾给一个 usage。不是实录。
+note: 按方言表构造：非流式在 body 末尾给一个 usage。不是实录。
 recorded_at_ms: 0
 request:
   path: /v1/messages

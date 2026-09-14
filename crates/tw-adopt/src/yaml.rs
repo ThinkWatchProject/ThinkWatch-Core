@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn multibyte_content_is_not_sliced_in_half() {
         // tw-yaml 的 marker 是按 char 数的，按它切 &str 会 panic。
-        // 这个项目已经被这一类坑过三次（§9.7）。
+        // 这个项目已经被这一类坑过三次。
         let src = "# 中文注释\n模型: 通义千问\nopenai-api-base: 'http://旧地址'\n";
         let out = set(src, &["openai-api-base"], "http://新地址").unwrap();
         assert!(out.contains("模型: 通义千问"), "{out}");

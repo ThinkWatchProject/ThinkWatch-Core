@@ -1,4 +1,4 @@
-//! 把凭据换成占位符，并记住怎么换回来（DESIGN.md §5.1）。
+//! 把凭据换成占位符，并记住怎么换回来。
 //!
 //! **可逆替换，不是删除。**删掉的话模型看到半截连接串反而会瞎猜 ——
 //! 而「瞎猜」在一个正帮你调试 `.env` 的助手身上，比看不见更糟。
@@ -26,7 +26,7 @@ pub struct Ledger {
     back: HashMap<String, String>,
     /// 原值 → 占位符，用来复用编号
     seen: HashMap<String, String>,
-    /// 换了哪些、各几处。**界面上要说得出来**（§5.1：看不见的安全功能
+    /// 换了哪些、各几处。**界面上要说得出来**（看不见的安全功能
     /// 会被用户关掉，因为他们会怀疑是脱敏搞坏了功能）
     pub counts: Vec<(Kind, &'static str, usize)>,
 }
@@ -73,7 +73,7 @@ pub fn apply(text: &str, hits: &[Hit]) -> Redacted {
 
 /// 同上，但**接着一本已有的账本编号**。
 ///
-/// WebSocket 那条路要用它（§3.6）：一次连接里有很多帧，而每帧各起一本
+/// WebSocket 那条路要用它：一次连接里有很多帧，而每帧各起一本
 /// 账的话，第二帧的 `<<TW_SECRET_1>>` 会和第一帧的撞车 —— 两个不同的
 /// 密钥映射到同一个占位符，还原时必然给错一个。**那不是会不会发生的
 /// 问题，是第二帧只要命中一次就一定发生。**
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn nothing_to_redact_means_the_text_comes_back_byte_identical() {
-        // **走官方端点不该脱敏**（§5.1），那条路径上这个函数每次都要跑，
+        // **走官方端点不该脱敏**，那条路径上这个函数每次都要跑，
         // 所以它在「没命中」时必须是一次纯粹的拷贝。
         let t = "帮我看看这个 .env 文件\n";
         let r = redact(t, &all());
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn multibyte_text_around_a_hit_survives_intact() {
-        // 这个项目已经被字节切片坑过三次（§9.7）。
+        // 这个项目已经被字节切片坑过三次。
         let t = format!("很长的一段中文说明，中间夹着 {KEY}，后面还有更多中文内容");
         let r = redact(&t, &all());
         assert!(r.text.starts_with("很长的一段中文说明"), "{}", r.text);
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn the_ledger_can_say_what_it_replaced_without_showing_it() {
-        // **界面上必须能看到脱敏发生了什么**（§5.1）—— 看不见的安全功能
+        // **界面上必须能看到脱敏发生了什么** —— 看不见的安全功能
         // 会被用户关掉，因为他们会怀疑是脱敏搞坏了功能。
         let t = format!("{KEY} 和 10.0.0.1 和 10.0.0.2");
         let r = redact(&t, &all());
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn a_second_frame_does_not_reuse_the_first_frames_placeholder_number() {
         // **第二帧只要命中一次就一定撞车** —— 两个不同的密钥映射到同一个
-        // 占位符，还原时必然给错一个（WebSocket 那条路，§3.6）
+        // 占位符，还原时必然给错一个（WebSocket 那条路）
         let kinds = [Kind::ApiKeys];
         let a = redact("我的 key 是 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", &kinds);
         let b = redact_into(

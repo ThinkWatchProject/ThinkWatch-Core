@@ -1,6 +1,6 @@
-//! 静态扫描的控制面（DESIGN.md §5.3、§7.12）。
+//! 静态扫描的控制面。
 //!
-//! **每次请求现扫一遍，什么都不存。**§7.12 说得很明确：没有「同步状态」
+//! **每次请求现扫一遍，什么都不存。**没有「同步状态」
 //! 这个概念，也就没有「同步失效了」「主清单过期了」这类问题 —— 你看到的
 //! 永远是磁盘上此刻的真实情况。
 //!
@@ -35,7 +35,7 @@ pub fn finding_view(f: &tw_scan::report::Finding) -> tw_api::ScanFinding {
 
 #[derive(Debug, Deserialize)]
 pub struct Params {
-    /// 额外扫哪些项目目录。**我们不去找项目，只看用户指的**（§5.3 的
+    /// 额外扫哪些项目目录。**我们不去找项目，只看用户指的**（
     /// 范围约定）
     #[serde(default)]
     pub project: Vec<String>,
@@ -45,7 +45,7 @@ pub async fn scan(
     State(s): State<ControlState>,
     Query(p): Query<Params>,
 ) -> Json<tw_api::ScanResponse> {
-    // 规则住在 config.yaml 里（§3.1），所以「现在生效的是哪一套」和
+    // 规则住在 config.yaml 里，所以「现在生效的是哪一套」和
     // 「现在生效的是哪一份配置」永远是同一个答案
     let cfg = s.config();
     let rules = match tw_scan::rules::build(&cfg.security.scan_rules) {
@@ -121,7 +121,7 @@ pub async fn scan(
     })
 }
 
-/// 盯着配置面，**只在有新东西出现时**发事件（§5.3）。
+/// 盯着配置面，**只在有新东西出现时**发事件。
 ///
 /// 三条纪律都在这个函数里：
 ///

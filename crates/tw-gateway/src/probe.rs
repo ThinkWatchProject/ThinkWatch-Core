@@ -1,6 +1,6 @@
 //! 上游探测。
 //!
-//! 分层见 DESIGN.md §4.6。这里做 L1 和 L2 —— **两层都零成本**，不产生
+//! 分层。这里做 L1 和 L2 —— **两层都零成本**，不产生
 //! 任何 token 消耗，所以可以随便跑。L3（真发一次推理）要花钱，必须先
 //! 弹确认框，那是 M3 的事。
 
@@ -19,7 +19,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 ///
 /// - UI 只能说「这家不提供模型列表」，而那在第二种情况下是**编的** ——
 ///   把我们自己的解析缺口说成了对方的特性；
-/// - §3.9 的模型清单从这里派生，静默为空之后用户不知道该去问谁。
+/// - 模型清单从这里派生，静默为空之后用户不知道该去问谁。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelList {
@@ -156,7 +156,7 @@ pub async fn probe(
 fn classify_models(body: &str) -> ModelList {
     // 采样只留大约 200 字节：够看出形状，又不至于把一整份响应（可能带
     // 敏感信息）塞进 UI 和日志。**按字符边界截断** —— 按字节切多字节
-    // 字符会 panic，那是这个项目栽过两次的坑（§9.7）。
+    // 字符会 panic，那是这个项目栽过两次的坑。
     let sample = || {
         let t = body.trim();
         let end = t

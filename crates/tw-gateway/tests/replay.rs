@@ -1,4 +1,4 @@
-//! 把 `tests/fixtures/` 里的语料全部回放一遍（DESIGN.md §9.8）。
+//! 把 `tests/fixtures/` 里的语料全部回放一遍。
 //!
 //! **这个测试和别的都不一样**：它不验证某段代码的行为，它验证的是
 //! 「我们对真实流量的理解没有变」。上游漂移和我们自己的回归，都会在
@@ -48,7 +48,7 @@ fn every_recorded_case_still_extracts_the_same_semantics() {
 #[test]
 fn no_fixture_carries_a_credential() {
     // **夹具会进 git**，一个装满真实密钥的目录被 push 上去就再也收不
-    // 回来了（§9.8）。导出时脱过一遍，这里再守一道 —— 手写或者手改过
+    // 回来了。导出时脱过一遍，这里再守一道 —— 手写或者手改过
     // 的用例不走导出那条路。
     for (name, f) in load_all() {
         let dump = serde_yaml_ng::to_string(&f).unwrap();

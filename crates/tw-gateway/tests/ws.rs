@@ -1,4 +1,4 @@
-//! WebSocket 升级代理的验收（DESIGN.md §3.6）。
+//! WebSocket 升级代理的验收。
 //!
 //! **这个文件真正要证明的不是「能不能连通」，是「管线的保护有没有重新
 //! 点一遍」。**把两边的帧对着倒是最省事的写法，也是一条绕过出站脱敏和
@@ -112,7 +112,7 @@ async fn connect(
 
 /// 验收第一条：**客户端粘进去的密钥不会原样发给中转站。**
 ///
-/// 这一条要是不成立，WS 就是一条绕过 §5.1 的后门。
+/// 这一条要是不成立，WS 就是一条绕过后门。
 #[tokio::test]
 async fn a_secret_in_a_frame_is_redacted_before_it_reaches_the_upstream() {
     let (up, seen) = start_upstream("echo").await;
@@ -176,7 +176,7 @@ async fn a_second_frame_gets_its_own_placeholder_number() {
 
 /// 验收第三条：**上游返回的高危工具调用会切断这条连接。**
 ///
-/// 和 SSE 那条路同一条纪律：先判断再转发，命中那一帧不发（§5.2）。
+/// 和 SSE 那条路同一条纪律：先判断再转发，命中那一帧不发。
 #[tokio::test]
 async fn a_dangerous_tool_call_from_an_untrusted_upstream_cuts_the_connection() {
     let (up, _seen) = start_upstream("danger").await;
@@ -203,7 +203,7 @@ async fn a_dangerous_tool_call_from_an_untrusted_upstream_cuts_the_connection() 
     );
 }
 
-/// 审查关掉时不该切 —— **安全档位说了算**（§5.0 的三态）。
+/// 审查关掉时不该切 —— **安全档位说了算**（三态）。
 #[tokio::test]
 async fn with_inspection_off_the_frame_goes_through_untouched() {
     let (up, _seen) = start_upstream("danger").await;

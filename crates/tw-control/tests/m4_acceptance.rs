@@ -1,4 +1,4 @@
-//! M4 的验收标准（DESIGN.md §11）。
+//! M4 的验收标准。
 //!
 //! 原文：**新机器装完三分钟内五个客户端全部接管且能一键还原；往一个
 //! skill 里塞零宽字符能被检出并定位到行；只报告不删除；空闲时 CPU 仍然
@@ -9,9 +9,9 @@
 //! **全部接管 → 全部还原 → 文件回到原样**、**零宽字符检出并定位到行**、
 //! **只报告不删除**。
 //!
-//! **为什么要有这个文件**：DESIGN.md 自己写着「验收标准写成测试值得
-//! 单独记一笔 —— 手动清单只会在里程碑那天跑一次，之后每一次改动都可能
-//! 悄悄破坏它们」。M1、M2、M5 都有，M4 一直没有。
+//! **为什么要有这个文件**：验收标准值得写成测试 —— 手动清单只会在里程碑
+//! 那天跑一次，之后每一次改动都可能悄悄破坏它们。M1、M2、M5 都有，M4
+//! 一直没有。
 
 use std::sync::Arc;
 
@@ -178,7 +178,7 @@ async fn two_a_zero_width_character_in_a_skill_is_found_and_located_to_a_line() 
 
 /// 验收三：**只报告，不删除。**
 ///
-/// §5.3 的原话：删掉一个误报比漏掉一个真的更糟。这条测试盯的是扫描
+/// 原话：删掉一个误报比漏掉一个真的更糟。这条测试盯的是扫描
 /// **一个字节都不会改**。
 #[tokio::test]
 async fn three_scanning_never_touches_a_single_byte() {
@@ -195,7 +195,7 @@ async fn three_scanning_never_touches_a_single_byte() {
     assert_eq!(
         std::fs::read_to_string(&skill).unwrap(),
         text,
-        "**扫描改了文件** —— §5.3 说的是只报告"
+        "**扫描改了文件** —— 规矩是只报告"
     );
     assert_eq!(std::fs::metadata(&skill).unwrap().len(), before);
     assert!(skill.exists(), "文件被删了");
