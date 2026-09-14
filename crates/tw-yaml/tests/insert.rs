@@ -83,10 +83,21 @@ fn a_boolean_reads_back_as_a_boolean() {
 }
 
 #[test]
-fn a_missing_parent_is_refused_rather_than_invented() {
-    // 猜结构是不能接受的 —— 这个文件会去改用户唯一的配置
+fn a_missing_list_entry_is_refused_rather_than_invented() {
+    // **列表项凭空造不出来。**`providers[9]` 不存在的时候，「给第九家
+    // 上游设 protocol」这句话本身没有意义 —— 猜一个出来是在改用户唯一
+    // 的配置。新增一项走 append，那条路上有名字。
     assert!(insert(CFG, &path!["providers", 9, "protocol"], &Scalar::s("x")).is_err());
-    assert!(insert(CFG, &path!["没有这一段", "x"], &Scalar::s("x")).is_err());
+}
+
+#[test]
+fn a_missing_section_is_created_because_that_is_its_first_write() {
+    // 缺的**映射**是另一回事：`limits`、`client_probes` 这些整段默认
+    // 不写，「改里面某一项」就是它们的第一次写入。拒绝掉等于这些设置
+    // 项在界面上从头到尾是死的 —— 而那正是用户最需要界面的时刻。
+    let out = insert(CFG, &path!["还没这一段", "x"], &Scalar::s("v")).unwrap();
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+    assert_eq!(v["还没这一段"]["x"].as_str(), Some("v"));
 }
 
 #[test]
