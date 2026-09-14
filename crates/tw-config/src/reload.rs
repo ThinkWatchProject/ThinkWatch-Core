@@ -202,7 +202,7 @@ mod tests {
     fn a_route_pointing_at_a_deleted_group_is_caught_before_anything_swaps_in() {
         // **语法正确但语义错误的配置最危险**：YAML 完全合法，运行时却会
         // 把请求路由到空处。
-        let bad = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\nroutes:\n  - name: r\n    to: 已经删掉的组\n";
+        let bad = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\nroutes:\n  - name: 默认\n    default: true\n    rules:\n      - name: r\n        to: 已经删掉的组\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Semantics);
         assert!(r.message.contains("已经删掉的组"), "{r:?}");

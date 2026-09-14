@@ -56,7 +56,7 @@ async fn serve(cfg: Config) -> SocketAddr {
     addr
 }
 
-fn base(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
+fn base(providers: Vec<Provider>, routes: Vec<tw_engine::Rule>) -> Config {
     Config {
         clients: vec![Client {
             name: "claude-code".into(),
@@ -64,7 +64,11 @@ fn base(providers: Vec<Provider>, routes: Vec<tw_engine::Route>) -> Config {
             ..Default::default()
         }],
         providers,
-        routes,
+        routes: if routes.is_empty() {
+            Vec::new()
+        } else {
+            vec![tw_engine::RouteSet::default_with(routes)]
+        },
         ..Default::default()
     }
 }
@@ -89,7 +93,7 @@ async fn one_opus_goes_to_official_and_haiku_goes_to_the_relay() {
     let gw = serve(base(
         vec![provider("official", official), provider("relay", relay)],
         vec![
-            tw_engine::Route {
+            tw_engine::Rule {
                 name: "opus 走官方".into(),
                 when: serde_yaml_ng::from_str("{ model: claude-opus-* }").unwrap(),
                 to: Some("official".into()),
@@ -97,7 +101,7 @@ async fn one_opus_goes_to_official_and_haiku_goes_to_the_relay() {
                 deny: None,
                 guard: None,
             },
-            tw_engine::Route {
+            tw_engine::Rule {
                 name: "兜底走中转".into(),
                 when: Default::default(),
                 to: Some("relay".into()),
@@ -169,7 +173,7 @@ async fn two_the_proxied_upstream_goes_through_it_and_the_local_one_does_not() {
             provider("local", local),
         ],
         vec![
-            tw_engine::Route {
+            tw_engine::Rule {
                 name: "本地模型走本地".into(),
                 when: serde_yaml_ng::from_str("{ model: 'llama*' }").unwrap(),
                 to: Some("local".into()),
@@ -177,7 +181,7 @@ async fn two_the_proxied_upstream_goes_through_it_and_the_local_one_does_not() {
                 deny: None,
                 guard: None,
             },
-            tw_engine::Route {
+            tw_engine::Rule {
                 name: "其余走官方".into(),
                 when: Default::default(),
                 to: Some("official".into()),

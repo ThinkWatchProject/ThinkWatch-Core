@@ -250,17 +250,31 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         routes: engine
             .routes()
             .iter()
-            .map(|r| tw_api::RouteView {
-                name: r.name.clone(),
-                // 阶段二的规则没有去向 —— 它们只改参数或拒绝
-                to: r.to.clone().unwrap_or_else(|| {
-                    if r.deny.is_some() {
-                        "拒绝".into()
-                    } else {
-                        "（只改参数）".into()
-                    }
-                }),
-                conditions: describe_when(&r.when),
+            .map(|set| tw_api::RouteView {
+                name: set.name.clone(),
+                default: set.default,
+                clients: cfg
+                    .clients
+                    .iter()
+                    .filter(|c| c.routes.contains(&set.name))
+                    .map(|c| c.name.clone())
+                    .collect(),
+                rules: set
+                    .rules
+                    .iter()
+                    .map(|r| tw_api::RuleView {
+                        name: r.name.clone(),
+                        // 阶段二的规则没有去向 —— 它们只改参数或拒绝
+                        to: r.to.clone().unwrap_or_else(|| {
+                            if r.deny.is_some() {
+                                "拒绝".into()
+                            } else {
+                                "（只改参数）".into()
+                            }
+                        }),
+                        conditions: describe_when(&r.when),
+                    })
+                    .collect(),
             })
             .collect(),
         groups: engine

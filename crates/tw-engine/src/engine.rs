@@ -305,9 +305,14 @@ impl SetAction {
     }
 }
 
+/// 一条规则。
+///
+/// **它不是「一条路由」** —— 路由是 [`RouteSet`]，一条路由里有一串规则。
+/// 这个区分是有代价才立起来的：用户说「把这个路由分给那把密钥」时，指的
+/// 是一组规则，而不是其中某一条。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Route {
+pub struct Rule {
     /// **每条规则有名字**。日志里、UI 里、试算结果里都能引用它 ——
     /// 「命中第 4 条」远不如「命中『带缓存的必须走官方』」有用。
     pub name: String,
@@ -328,6 +333,39 @@ pub struct Route {
     /// 横切的安全策略。**从所有命中的规则累积，而且只能收紧。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<Guard>,
+}
+
+/// 一条路由 —— 一组按顺序求值的规则。
+///
+/// **密钥决定走哪条路由。**`clients[].routes` 里写路由名，那把密钥的请求
+/// 就额外过这条路由的规则。一条路由可以分给多把密钥，不用复制。
+///
+/// 默认路由（`default: true`）**对每一把密钥都生效**，而且永远排在最前。
+/// 它是「首先应该有个默认路由」那句话的落点：公共的脱敏、公共的兜底去向
+/// 写在这儿一次，不必在每条路由里重复。最多只能有一条。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSet {
+    pub name: String,
+    /// 对所有密钥生效，且排在所有其他路由之前。最多一条。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
+}
+
+impl RouteSet {
+    /// 一条装着这些规则的默认路由。
+    ///
+    /// 「只有默认路由」是最常见的配置形状 —— 没有把任何规则分给具体
+    /// 密钥的人，配出来就是这一条。
+    pub fn default_with(rules: Vec<Rule>) -> Self {
+        Self {
+            name: "默认".to_string(),
+            default: true,
+            rules,
+        }
+    }
 }
 
 /// 一次路由的结果，**带上为什么**。
@@ -384,12 +422,25 @@ pub enum RouteError {
     UnknownTarget { rule: String, target: String },
     #[error("组 `{0}` 里一个 provider 都没有")]
     EmptyGroup(String),
+    #[error("有两条路由都叫 `{0}`。密钥靠名字引用路由，重名的话「分给哪一条」没有答案。")]
+    DuplicateRoute(String),
+    #[error(
+        "有不止一条默认路由。默认路由对所有密钥生效，只能有一条 —— 想要多组公共规则就写在同一条里。"
+    )]
+    ManyDefaults,
+    #[error(
+        "密钥 `{client}` 分到了路由 `{route}`，但没有这条路由。（默认路由不用分配，它对所有密钥生效。）"
+    )]
+    UnknownRoute { client: String, route: String },
     #[error(transparent)]
     Match(#[from] MatchError),
 }
 
 pub struct Engine {
-    routes: Vec<Route>,
+    /// 所有路由。默认那条（如果有）已经被排到最前。
+    sets: Vec<RouteSet>,
+    /// 密钥名 → 它分到的路由名。**默认路由不在这里** —— 它对谁都生效。
+    assigned: std::collections::HashMap<String, Vec<String>>,
     groups: Vec<Group>,
     providers: Vec<String>,
 }
@@ -400,14 +451,19 @@ impl Engine {
     /// **层 0 在这里被展开**：没有 routes 时补一条兜底规则指向一个自动
     /// 生成的、包含全部 provider 的 fallback 组。这样下面的求值逻辑
     /// 只有一条路径。
-    pub fn new(providers: Vec<String>, mut groups: Vec<Group>, mut routes: Vec<Route>) -> Self {
+    pub fn new(
+        providers: Vec<String>,
+        mut groups: Vec<Group>,
+        mut sets: Vec<RouteSet>,
+        assigned: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
         // **没有 provider 时什么都不合成。**合成一个空组会让它过不了
         // `validate`（空组是配置错误），而零 provider 的配置必须合法 ——
         // 否则首次运行时 core 起不来，控制面也起不来，UI 连「你还没配
         // 上游」都说不出口（tw-config::validate 里那段注释）。
         //
         // 这条今天已经立过一次，又被这里破坏了一次。测试抓住了。
-        if routes.is_empty() && !providers.is_empty() {
+        if sets.iter().all(|s| s.rules.is_empty()) && !providers.is_empty() {
             const ALL: &str = "__all__";
             groups.push(Group {
                 name: ALL.to_string(),
@@ -416,27 +472,117 @@ impl Engine {
                 session_affinity: false,
                 selected: None,
             });
-            routes.push(Route {
+            let fallback = Rule {
                 name: "默认：按声明顺序故障转移".to_string(),
                 when: When::default(),
                 to: Some(ALL.to_string()),
                 set: None,
                 deny: None,
                 guard: None,
-            });
+            };
+            // **填进已有的那条默认路由，不要再追加一条。**两条默认路由是
+            // `validate` 明确拒绝的状态，而这里凭空造一条就会制造它。
+            match sets.iter_mut().find(|s| s.default) {
+                Some(d) => d.rules.push(fallback),
+                None => sets.push(RouteSet {
+                    name: "默认".to_string(),
+                    default: true,
+                    rules: vec![fallback],
+                }),
+            }
         }
+        // 默认路由排最前。**顺序就是语义**：`to` 取第一条命中的，所以
+        // 默认路由里的兜底去向必须排在后面，而它的 `deny` 和 `set` 想
+        // 先生效就得排在前面 —— 两者都要，所以位置交给用户，这里只保证
+        // 「默认在其他路由之前」这一件事。
+        sets.sort_by_key(|s| !s.default);
         Self {
-            routes,
+            sets,
+            assigned,
             groups,
             providers,
         }
+    }
+
+    /// 只有一条默认路由的引擎。
+    ///
+    /// **这不是测试便利,是「层 0」本身** —— 没有把规则分给任何密钥的
+    /// 配置就是这个形状,而那是多数人的配置。
+    pub fn with_default_rules(
+        providers: Vec<String>,
+        groups: Vec<Group>,
+        rules: Vec<Rule>,
+    ) -> Self {
+        // 没有规则就不造一条空路由 —— 零 provider 零规则是首次运行的
+        // 合法状态，而那时**什么都不该被合成出来**。
+        let sets = if rules.is_empty() {
+            Vec::new()
+        } else {
+            vec![RouteSet {
+                name: "默认".to_string(),
+                default: true,
+                rules,
+            }]
+        };
+        Self::new(providers, groups, sets, std::collections::HashMap::new())
+    }
+
+    /// 这次请求要过哪些规则。
+    ///
+    /// 默认路由的规则在前，然后是这把密钥分到的那几条路由，**按 `clients`
+    /// 里写的顺序**。拼出来的这张表交给 `route()`，求值逻辑一个字没变：
+    /// `set` 和 `guard` 从每一条命中的累积，`to` 和 `deny` 取第一条。
+    ///
+    /// **认不出的密钥只走默认路由。**那是首次运行、或者一把刚建还没分配
+    /// 路由的密钥 —— 它应该能用，只是没有额外规则。
+    fn rules_for(&self, client: &str) -> Vec<&Rule> {
+        let mut out: Vec<&Rule> = Vec::new();
+        for s in self.sets.iter().filter(|s| s.default) {
+            out.extend(s.rules.iter());
+        }
+        if let Some(names) = self.assigned.get(client) {
+            for n in names {
+                if let Some(s) = self.sets.iter().find(|s| !s.default && &s.name == n) {
+                    out.extend(s.rules.iter());
+                }
+            }
+        }
+        out
+    }
+
+    /// 所有规则，不分归属。校验和「这条规则存在吗」用它。
+    fn all_rules(&self) -> impl Iterator<Item = &Rule> {
+        self.sets.iter().flat_map(|s| s.rules.iter())
     }
 
     /// 加载时校验。**规则写错了要在这里说，不要等请求进来** ——
     /// 一条指向不存在的 provider 的规则，在运行时的表现是每个命中它的
     /// 请求都失败，而用户看不出是哪条规则的问题。
     pub fn validate(&self) -> Result<(), RouteError> {
-        for r in &self.routes {
+        // 名字要唯一 —— `clients[].routes` 靠名字引用，重名的话
+        // 「分给哪一条」没有答案，而那个歧义完全静默。
+        let mut seen = std::collections::HashSet::new();
+        for set in &self.sets {
+            if !seen.insert(set.name.as_str()) {
+                return Err(RouteError::DuplicateRoute(set.name.clone()));
+            }
+        }
+        if self.sets.iter().filter(|s| s.default).count() > 1 {
+            return Err(RouteError::ManyDefaults);
+        }
+        // 分配里写了一个不存在的路由名 —— 那把密钥会静默地只走默认路由，
+        // 而用户以为他配的规则在生效。
+        for (client, names) in &self.assigned {
+            for n in names {
+                if !self.sets.iter().any(|s| !s.default && &s.name == n) {
+                    return Err(RouteError::UnknownRoute {
+                        client: client.clone(),
+                        route: n.clone(),
+                    });
+                }
+            }
+        }
+        for r in self.all_rules() {
             r.when.validate()?;
             // **这条禁令是必需的**：允许阶段二的规则写 `to`，求值就直接
             // 成环了。在校验阶段挡下来，而不是在运行时。
@@ -466,9 +612,10 @@ impl Engine {
     pub fn route(&self, facts: &RequestFacts) -> Result<Outcome, RouteError> {
         let mut set = SetAction::default();
         let mut guard = Guard::default();
-        let mut chosen: Option<&Route> = None;
+        let mut chosen: Option<&Rule> = None;
 
-        for r in &self.routes {
+        let applicable = self.rules_for(&facts.client);
+        for r in applicable {
             // 阶段二的规则在这一轮完全跳过 —— 它们的条件还没法求值。
             if r.when.is_phase_two() || !r.when.matches(facts)? {
                 continue;
@@ -517,7 +664,7 @@ impl Engine {
     ) -> Result<Outcome2, RouteError> {
         let mut set = base.clone();
         let mut guard = base_guard.clone();
-        for r in &self.routes {
+        for r in self.rules_for(&facts.client) {
             if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
                 continue;
             }
@@ -540,7 +687,7 @@ impl Engine {
         Ok(Outcome2::Proceed(set, guard))
     }
 
-    fn resolve_target(&self, r: &Route) -> Result<(Vec<String>, Option<String>), RouteError> {
+    fn resolve_target(&self, r: &Rule) -> Result<(Vec<String>, Option<String>), RouteError> {
         let Some(to) = &r.to else {
             return Ok((Vec::new(), None));
         };
@@ -604,8 +751,14 @@ impl Engine {
     pub fn groups(&self) -> &[Group] {
         &self.groups
     }
-    pub fn routes(&self) -> &[Route] {
-        &self.routes
+    /// 所有路由（含默认那条）。UI 和试算要列它们。
+    pub fn routes(&self) -> &[RouteSet] {
+        &self.sets
+    }
+
+    /// 这把密钥实际会过的规则，按求值顺序。**试算和「按密钥看」都用它。**
+    pub fn rules_for_client(&self, client: &str) -> Vec<&Rule> {
+        self.rules_for(client)
     }
 }
 
@@ -622,8 +775,8 @@ mod tests {
         }
     }
 
-    fn route(name: &str, when_yaml: &str, to: &str) -> Route {
-        Route {
+    fn route(name: &str, when_yaml: &str, to: &str) -> Rule {
+        Rule {
             name: name.into(),
             when: serde_yaml_ng::from_str(when_yaml).unwrap(),
             to: Some(to.into()),
@@ -652,7 +805,7 @@ mod tests {
     fn layer_zero_needs_no_rules_at_all() {
         // 「只配 provider」是最小可用配置，而且对不少人就够了：
         // 「官方为主，挂了走中转」零规则就能满足（层 0）。
-        let e = Engine::new(vec!["official".into(), "relay".into()], vec![], vec![]);
+        let e = Engine::with_default_rules(vec!["official".into(), "relay".into()], vec![], vec![]);
         let d = decision(&e, &facts("claude-sonnet-4-5"));
         assert_eq!(d.candidates, ["official", "relay"], "按声明顺序故障转移");
         assert!(e.validate().is_ok());
@@ -663,26 +816,148 @@ mod tests {
         // 零 provider 是首次运行的合法状态。合成一个空组会让配置校验
         // 失败，而那会让 core 起不来 —— 于是 UI 连「你还没配上游」都
         // 说不出口。
-        let e = Engine::new(vec![], vec![], vec![]);
+        let e = Engine::with_default_rules(vec![], vec![], vec![]);
         assert!(e.groups().is_empty());
         assert!(e.routes().is_empty());
         assert!(e.validate().is_ok(), "零 provider 的配置必须合法");
+    }
+
+    fn set_of(name: &str, default: bool, to: &str) -> RouteSet {
+        RouteSet {
+            name: name.into(),
+            default,
+            rules: vec![Rule {
+                name: format!("{name} 的规则"),
+                when: When::default(),
+                to: Some(to.into()),
+                set: None,
+                deny: None,
+                guard: None,
+            }],
+        }
+    }
+
+    fn assign(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(c, rs)| {
+                (
+                    c.to_string(),
+                    rs.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_default_route_applies_to_every_key_and_the_assigned_one_stacks_on_top() {
+        // 这是整个模型的那句话：**默认路由对谁都生效，分配的叠在它上面**。
+        let e = Engine::new(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![set_of("默认", true, "a"), set_of("codex 专用", false, "b")],
+            assign(&[("codex", &["codex 专用"])]),
+        );
+        let names = |c: &str| {
+            e.rules_for_client(c)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // 没分配路由的密钥只走默认 —— 而且它能用，不是一个错误状态
+        assert_eq!(names("claude-code"), vec!["默认 的规则"]);
+        // 分了的，默认在前，分配的在后
+        assert_eq!(names("codex"), vec!["默认 的规则", "codex 专用 的规则"]);
+    }
+
+    #[test]
+    fn one_route_can_serve_several_keys_without_being_copied() {
+        // 这条是「给路由起名」换来的东西：两把密钥引用同一个名字，
+        // 规则只有一份。**复制出来的两份，迟早只有一份被改。**
+        let e = Engine::new(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![set_of("长上下文", false, "b")],
+            assign(&[("codex", &["长上下文"]), ("cline", &["长上下文"])]),
+        );
+        assert_eq!(e.rules_for_client("codex").len(), 1);
+        assert_eq!(e.rules_for_client("cline").len(), 1);
+        assert_eq!(
+            e.rules_for_client("codex")[0].name,
+            e.rules_for_client("cline")[0].name
+        );
+    }
+
+    #[test]
+    fn two_routes_with_the_same_name_are_rejected() {
+        // 密钥靠名字引用路由。重名的话「分给哪一条」没有答案，
+        // 而那个歧义完全静默。
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![set_of("重名", false, "a"), set_of("重名", false, "a")],
+            Default::default(),
+        );
+        assert_eq!(e.validate(), Err(RouteError::DuplicateRoute("重名".into())));
+    }
+
+    #[test]
+    fn two_default_routes_are_rejected() {
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![set_of("默认一", true, "a"), set_of("默认二", true, "a")],
+            Default::default(),
+        );
+        assert_eq!(e.validate(), Err(RouteError::ManyDefaults));
+    }
+
+    #[test]
+    fn assigning_a_route_that_does_not_exist_is_caught_at_load() {
+        // **不能静默。**那把密钥会只走默认路由，而用户以为他配的规则
+        // 在生效 —— 一个看起来在工作、实际什么都没做的配置。
+        let e = Engine::new(
+            vec!["a".into()],
+            vec![],
+            vec![set_of("默认", true, "a")],
+            assign(&[("codex", &["打错的名字"])]),
+        );
+        assert_eq!(
+            e.validate(),
+            Err(RouteError::UnknownRoute {
+                client: "codex".into(),
+                route: "打错的名字".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_default_route_is_evaluated_first_whatever_order_it_was_written_in() {
+        // 顺序就是语义：`to` 取第一条命中的。默认路由写在文件末尾也要
+        // 排到最前，否则「公共的兜底」会变成「谁都到不了的最后一条」。
+        let e = Engine::new(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![set_of("别的", false, "b"), set_of("默认", true, "a")],
+            assign(&[("c", &["别的"])]),
+        );
+        assert_eq!(e.rules_for_client("c")[0].name, "默认 的规则");
     }
 
     #[test]
     fn layer_zero_is_not_a_special_case_in_the_code() {
         // 它被展开成「一个全量 fallback 组 + 一条兜底规则」，所以求值
         // 只有一条路径。这个测试盯着那个展开，而不是它的表面行为。
-        let e = Engine::new(vec!["a".into()], vec![], vec![]);
+        let e = Engine::with_default_rules(vec!["a".into()], vec![], vec![]);
         assert_eq!(e.groups().len(), 1);
         assert_eq!(e.routes().len(), 1);
-        assert!(e.routes()[0].when.is_catch_all());
+        assert!(e.routes()[0].rules[0].when.is_catch_all());
     }
 
     #[test]
     fn a_rule_can_point_straight_at_a_provider_without_a_group() {
         // 大多数分流需求到这一层就解决了，不必引入策略组这个概念。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["official".into(), "relay".into()],
             vec![],
             vec![
@@ -698,7 +973,7 @@ mod tests {
 
     #[test]
     fn rules_are_tried_in_order_and_the_first_match_wins() {
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into(), "b".into()],
             vec![],
             vec![
@@ -712,7 +987,7 @@ mod tests {
     #[test]
     fn no_catch_all_and_no_match_says_what_to_add() {
         // 「没有规则命中」是配置问题，而错误信息要说清下一步。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into()],
             vec![],
             vec![route("只管 opus", "{ model: claude-opus-* }", "a")],
@@ -731,7 +1006,7 @@ mod tests {
             session_affinity: false,
             selected: None,
         };
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["official".into(), "relay".into()],
             vec![g],
             vec![route("走池子", "{}", "pool")],
@@ -752,7 +1027,7 @@ mod tests {
             session_affinity: false,
             selected: Some("b".into()),
         };
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into(), "b".into(), "c".into()],
             vec![g],
             vec![route("x", "{}", "pool")],
@@ -764,7 +1039,8 @@ mod tests {
     fn a_rule_pointing_nowhere_is_caught_at_load_time() {
         // 运行时的表现是「每个命中它的请求都失败」，而用户看不出是哪条
         // 规则的问题。
-        let e = Engine::new(vec!["a".into()], vec![], vec![route("x", "{}", "typo")]);
+        let e =
+            Engine::with_default_rules(vec!["a".into()], vec![], vec![route("x", "{}", "typo")]);
         let err = e.validate().unwrap_err();
         assert!(matches!(err, RouteError::UnknownTarget { .. }));
         assert!(err.to_string().contains("typo"));
@@ -772,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_broken_comparison_in_a_rule_fails_validation() {
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into()],
             vec![],
             vec![route("x", r#"{ input_tokens: "200k" }"#, "a")],
@@ -789,7 +1065,8 @@ mod tests {
             session_affinity: false,
             selected: None,
         };
-        let e = Engine::new(vec!["a".into()], vec![g], vec![route("x", "{}", "empty")]);
+        let e =
+            Engine::with_default_rules(vec!["a".into()], vec![g], vec![route("x", "{}", "empty")]);
         assert!(matches!(e.validate(), Err(RouteError::EmptyGroup(_))));
     }
 
@@ -799,8 +1076,8 @@ mod tests {
         to: Option<&str>,
         set: Option<SetAction>,
         deny: Option<&str>,
-    ) -> Route {
-        Route {
+    ) -> Rule {
+        Rule {
             name: name.into(),
             when: serde_yaml_ng::from_str(when_yaml).unwrap(),
             to: to.map(String::from),
@@ -814,7 +1091,7 @@ mod tests {
     fn set_accumulates_from_every_matching_rule_while_to_takes_the_first() {
         // 两者规则不同是有理由的：**去向只能有一个，而参数改写是可以
         // 叠加的横切策略**。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into(), "b".into()],
             vec![],
             vec![
@@ -854,7 +1131,7 @@ mod tests {
 
     #[test]
     fn a_later_set_overrides_an_earlier_one_on_the_same_field() {
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into()],
             vec![],
             vec![
@@ -889,7 +1166,7 @@ mod tests {
     #[test]
     fn deny_carries_a_reason_the_client_can_read() {
         // 一个没有理由的拒绝，和一个 bug，在用户眼里没有区别。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into()],
             vec![],
             vec![
@@ -916,7 +1193,7 @@ mod tests {
     #[test]
     fn phase_two_rules_are_invisible_to_phase_one() {
         // 它们的条件还没法求值 —— provider_would_be 要等路由跑完。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["official".into(), "relay".into()],
             vec![],
             vec![
@@ -940,7 +1217,7 @@ mod tests {
 
     #[test]
     fn phase_two_applies_once_the_provider_is_known() {
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["official".into(), "relay".into()],
             vec![],
             vec![
@@ -979,7 +1256,7 @@ mod tests {
     fn phase_two_can_match_a_list_of_providers() {
         // `provider_would_be: [a, b]` 就是 `any_of` 的实际形态，
         // 不必发明一个关键字。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into(), "b".into(), "c".into()],
             vec![],
             vec![
@@ -1012,7 +1289,7 @@ mod tests {
     fn a_phase_two_rule_with_a_target_is_refused_at_load_time() {
         // **允许的话就直接成环了**：provider_would_be 的值要等路由决定完
         // 才知道，而 `to` 正是路由决定的东西。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into()],
             vec![],
             vec![route_full(
@@ -1032,7 +1309,7 @@ mod tests {
     fn a_rule_that_does_nothing_at_all_is_refused() {
         // 命中了也什么都不做的规则，多半是写漏了 —— 而它在运行时完全
         // 静默，用户只会觉得「我明明配了」。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["a".into()],
             vec![],
             vec![route_full("空的", "{ model: x }", None, None, None)],
@@ -1053,7 +1330,7 @@ mod tests {
     #[test]
     fn the_decision_says_which_rule_matched() {
         // 「命中第 4 条」远不如「命中『带缓存的必须走官方』」有用。
-        let e = Engine::new(
+        let e = Engine::with_default_rules(
             vec!["official".into()],
             vec![],
             vec![route("带缓存的必须走官方", "{ cache: true }", "official")],
@@ -1079,7 +1356,7 @@ mod tests {
 
     #[test]
     fn a_typo_in_a_route_field_is_an_error_too() {
-        let e = serde_yaml_ng::from_str::<Route>("name: r\nton: 官方\n").unwrap_err();
+        let e = serde_yaml_ng::from_str::<Rule>("name: r\nton: 官方\n").unwrap_err();
         assert!(e.to_string().contains("ton"), "{e}");
     }
 
