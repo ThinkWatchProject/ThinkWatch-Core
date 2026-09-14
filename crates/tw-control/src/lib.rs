@@ -461,7 +461,7 @@ async fn cost_buckets(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<BucketQuery>,
 ) -> Result<Json<Vec<tw_api::CostBucket>>, Fail> {
-    let (from, to) = q.win.range();
+    let (from, to) = q.range();
     // 桶宽有下限，否则一个 `bucket_ms=1` 能让这条查询扫出几百万个分组。
     let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
     let store = need_store(&s)?;
@@ -478,7 +478,7 @@ async fn cost_by(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<GroupQuery>,
 ) -> Result<Json<Vec<tw_api::CostGroup>>, Fail> {
-    let (from, to) = q.win.range();
+    let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
     let x = g
@@ -1110,20 +1110,49 @@ struct Window {
     to_ms: Option<i64>,
 }
 
+/// **不能用 `#[serde(flatten)]` 摊平 `Window`。**
+///
+/// flatten 会让 serde 走 `deserialize_any`，而 query string 里一切都是
+/// 字符串 —— 于是 `from_ms=123` 被当成字符串喂给 `i64`，整个请求 400：
+/// `invalid type: string "123", expected i64`。
+///
+/// 表现很坏：不带参数时一切正常，只有在**同时带上时间窗**的时候才失败，
+/// 而界面恰恰总是带着它调。单元测试看不见这件事 —— 它只在真的经过一次
+/// query string 解析时才发生。
 #[derive(serde::Deserialize)]
 struct BucketQuery {
-    #[serde(flatten)]
-    win: Window,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
     bucket_ms: Option<i64>,
+}
+
+impl BucketQuery {
+    fn range(&self) -> (i64, i64) {
+        Window {
+            from_ms: self.from_ms,
+            to_ms: self.to_ms,
+        }
+        .range()
+    }
 }
 
 #[derive(serde::Deserialize)]
 struct GroupQuery {
-    #[serde(flatten)]
-    win: Window,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
     /// **是枚举不是字符串。**它会决定 SQL 里的列名，用字符串就是一个
     /// 注入口；写错的值在这里被 serde 直接拒掉，而不是拼进查询。
     dim: tw_api::CostDim,
+}
+
+impl GroupQuery {
+    fn range(&self) -> (i64, i64) {
+        Window {
+            from_ms: self.from_ms,
+            to_ms: self.to_ms,
+        }
+        .range()
+    }
 }
 
 impl Window {
