@@ -158,27 +158,59 @@ fn write_atomic(real: &Path, text: &str, keep_mode: Option<u32>) -> Result<(), F
     })
 }
 
-/// 备份目录：`~/.thinkwatch/backups/<毫秒时间戳>/`。
+/// 备份目录：`~/.thinkwatch/backups/<毫秒时间戳>-<序号>/`。
 ///
 /// 时间戳在目录名里，所以按名字排序就是时间序 —— 不必读 mtime（备份
-/// 工具会把 mtime 全改成同一天）。
+/// 工具会把 mtime 全改成同一天）。序号补零到固定宽度，同一毫秒里的
+/// 几份也按先后排。
 pub fn backup_root() -> PathBuf {
     tw_config::default_dir().join("backups")
 }
 
+/// 同一毫秒里最多几份备份。补零宽度跟着它走，超了排序就不对了。
+const BACKUP_SEQ_MAX: u32 = 9999;
+
 fn backup_to(root: &Path, real: &Path, text: &str) -> Result<PathBuf, ForeignError> {
+    backup_at(root, real, text, now_ms())
+}
+
+/// 时间戳从外面传进来，测试才能稳定地造出「同一毫秒」。
+fn backup_at(root: &Path, real: &Path, text: &str, ms: u64) -> Result<PathBuf, ForeignError> {
     // 目录名里带上来源路径的形状，一眼能看出这是谁的备份
     let flat = real
         .to_string_lossy()
         .trim_start_matches('/')
         .replace('/', "%");
-    let dir = root.join(now_ms().to_string());
-    std::fs::create_dir_all(&dir).map_err(|source| ForeignError::Write {
-        path: dir.clone(),
+    std::fs::create_dir_all(root).map_err(|source| ForeignError::Write {
+        path: root.to_path_buf(),
         source,
     })?;
+    // **同一毫秒里连着接管两次，第二份备份不能盖掉第一份。**第二次备份
+    // 的内容里已经是我们写的密钥了；盖掉之后还原只能找回我们的密钥，
+    // 用户自己的那个就再也没有了。所以用 `create_dir`（不是 `_all`）
+    // 让文件系统原子地告诉我们目录是不是已经有了，有了就换下一个序号。
+    let mut seq = 0;
+    let dir = loop {
+        let dir = root.join(format!("{ms}-{seq:04}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && seq < BACKUP_SEQ_MAX => {
+                seq += 1;
+            }
+            Err(source) => return Err(ForeignError::Write { path: dir, source }),
+        }
+    };
     let file = dir.join(flat);
-    std::fs::write(&file, text).map_err(|source| ForeignError::Write {
+    // 目录是刚建的，按说不会有同名文件；万一有，也宁可失败不覆盖。
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file)
+        .map_err(|source| ForeignError::Write {
+            path: file.clone(),
+            source,
+        })?;
+    std::io::Write::write_all(&mut f, text.as_bytes()).map_err(|source| ForeignError::Write {
         path: file.clone(),
         source,
     })?;
@@ -393,6 +425,43 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&a.backup).unwrap(), "三个月的设置");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "接管之后");
         assert!(!a.created);
+    }
+
+    #[test]
+    fn two_backups_in_the_same_millisecond_do_not_overwrite_each_other() {
+        // 连着接管两次时第二份备份里已经是我们的密钥；它要是盖掉第一份，
+        // 用户原来的密钥就没了，还原只能还原到我们这儿。
+        let (d, root) = dirs();
+        let p = d.path().join("c.json");
+        let first = backup_at(&root, &p, "sk-用户自己的", 1_700_000_000_000).unwrap();
+        let second = backup_at(&root, &p, "tw-我们写的", 1_700_000_000_000).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "sk-用户自己的");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "tw-我们写的");
+
+        // 按名字排序仍然是时间序，跨毫秒也是
+        let third = backup_at(&root, &p, "后来的", 1_700_000_000_001).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        names.sort();
+        let parent = |f: &PathBuf| f.parent().unwrap().to_path_buf();
+        assert_eq!(names, vec![parent(&first), parent(&second), parent(&third)]);
+    }
+
+    #[test]
+    fn back_to_back_real_backups_all_survive() {
+        // 不注入时间戳，走真实时钟：一口气备份很多份，几乎必然撞在同一毫秒。
+        let (d, root) = dirs();
+        let p = d.path().join("c.json");
+        let files: Vec<_> = (0..50)
+            .map(|i| backup_to(&root, &p, &i.to_string()).unwrap())
+            .collect();
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(std::fs::read_to_string(f).unwrap(), i.to_string());
+        }
     }
 
     #[test]
