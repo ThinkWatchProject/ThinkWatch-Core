@@ -333,10 +333,10 @@ impl Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Overview {
     pub providers: Vec<ProviderView>,
-    /// 配置里定义过的代理名。**界面上换代理要从这里选** —— 让用户
+    /// 配置里定义过的代理。**界面上换代理要从这里选** —— 让用户
     /// 手打一个名字，打错了就是一次静默的「配了没生效」
     #[serde(default)]
-    pub proxies: Vec<String>,
+    pub proxies: Vec<ProxyView>,
     pub routes: Vec<RouteView>,
     pub groups: Vec<GroupView>,
     pub clients: Vec<ClientView>,
@@ -349,6 +349,60 @@ pub struct Overview {
     /// 要切到拦截」，一个切不了的开关让那个设计不成立。
     #[serde(default)]
     pub security: SecurityView,
+    /// 没绑路由的密钥走哪条
+    #[serde(default)]
+    pub default_route: String,
+    /// 客户端自己发的辅助请求怎么处理
+    #[serde(default)]
+    pub client_probes: Vec<ProbeView>,
+    /// 并发上限
+    #[serde(default)]
+    pub limits: LimitsView,
+}
+
+/// 一个出站代理。
+///
+/// **密码不在这里。**`ProxyAuth.pass` 和上游的 key 是同一类东西 ——
+/// 这个视图会进日志、进诊断包、进用户贴出来的截图。有没有认证是要
+/// 显示的，认证内容不是。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyView {
+    pub name: String,
+    /// `http` / `socks5`
+    pub kind: String,
+    pub addr: String,
+    pub has_auth: bool,
+    /// 有几家上游在用它。删之前要知道
+    pub used_by: usize,
+}
+
+/// 一类客户端辅助请求的处置。
+///
+/// **这一段以前在界面上完全不存在，而它的缺席是连锁的**：路由条件
+/// `when.intent` 只有在对应那一类被配成 `route` 时才可能命中，所以
+/// 界面上那些写了 `intent` 的规则永远不会生效，而用户无从知道为什么。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeView {
+    /// `health_check` / `warmup` / `titling` / `topic_detect` / `suggestion`
+    pub id: String,
+    /// 中文名
+    pub label: String,
+    /// 这一类是什么请求，一句话
+    pub what: String,
+    /// `intercept` / `route` / `passthrough`
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LimitsView {
+    /// 全局并发
+    pub max_concurrent: usize,
+    /// 单个上游
+    pub per_provider: usize,
+    /// 队列上限。满了才真的拒绝
+    pub queue_depth: usize,
+    /// 排太久还是要放弃
+    pub queue_timeout_secs: u64,
 }
 
 /// 三条防线。每条三态，而**「拦截」在每条上做的事不一样**，所以动词也
@@ -449,6 +503,12 @@ pub struct ClientView {
     /// 已脱敏
     pub key: String,
     pub max_concurrent: Option<usize>,
+    /// 绑的那条路由。`None` = 走默认路由
+    #[serde(default)]
+    pub route: Option<String>,
+    /// 这把密钥能看到哪些模型。三态：不写 / 写非空 / 写 `[]`（一个都不给）
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

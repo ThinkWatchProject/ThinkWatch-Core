@@ -214,7 +214,19 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     let cfg = &*cfg;
     let engine = cfg.engine();
     Json(tw_api::Overview {
-        proxies: cfg.proxies.iter().map(|x| x.name.clone()).collect(),
+        proxies: cfg
+            .proxies
+            .iter()
+            .map(|x| tw_api::ProxyView {
+                name: x.name.clone(),
+                kind: x.kind.slug().to_string(),
+                addr: x.addr.clone(),
+                // **密码不出这个函数。**它和上游的 key 是同一类东西，
+                // 而这个视图会进日志、进诊断包、进用户贴出来的截图。
+                has_auth: x.auth.is_some(),
+                used_by: cfg.providers.iter().filter(|p| p.proxy == x.name).count(),
+            })
+            .collect(),
         providers: cfg
             .providers
             .iter()
@@ -296,6 +308,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 name: c.name.clone(),
                 key: tw_secret::mask_secret(&c.key),
                 max_concurrent: c.max_concurrent,
+                route: c.route.clone(),
+                allow: c.allow.clone(),
             })
             .collect(),
         security: tw_api::SecurityView {
@@ -305,8 +319,29 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             scan_rules_added: cfg.security.scan_rules.add.len(),
             scan_rules_disabled: cfg.security.scan_rules.disable.len(),
         },
+        default_route: engine.default_route().to_string(),
+        client_probes: cfg
+            .client_probes
+            .all()
+            .into_iter()
+            .map(|(id, label, what, mode)| tw_api::ProbeView {
+                id: id.to_string(),
+                label: label.to_string(),
+                what: what.to_string(),
+                mode: mode.slug().to_string(),
+            })
+            .collect(),
+        limits: tw_api::LimitsView {
+            max_concurrent: cfg.limits.max_concurrent,
+            per_provider: cfg.limits.per_provider,
+            queue_depth: cfg.limits.queue_depth,
+            queue_timeout_secs: cfg.limits.queue_timeout_secs,
+        },
         listen: tw_api::ListenView {
-            bind: format!("{:?}", cfg.listen.gateway.bind).to_lowercase(),
+            // **`Display` 不是 `Debug`。**`{:?}` 对 `Loopback` / `All`
+            // 碰巧给出正确的小写词，对 `Addr(192.168.1.5)` 给的是
+            // `addr(192.168.1.5)` —— 界面拿它去比对档位，永远不相等。
+            bind: cfg.listen.gateway.bind.to_string(),
             port: cfg.listen.gateway.port,
             allow_from: cfg.listen.gateway.effective_allow_from(),
             exposed: cfg.listen.gateway.bind.is_exposed(),
@@ -1693,5 +1728,36 @@ mod describe_tests {
         let lines = describe_when(&w);
         assert!(!lines.is_empty(), "空的条件列表在界面上就是「兜底」");
         assert!(lines[0].contains("relay"), "{lines:?}");
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    /// **代理的密码不能出现在概览里。**它和上游的 key 是同一类东西，
+    /// 而这个视图会进日志、进诊断包、进用户贴出来的截图。
+    #[test]
+    fn a_proxy_password_never_reaches_the_overview() {
+        let cfg: tw_config::Config = serde_yaml_ng::from_str(
+            "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://x.com\n    key: sk-a\n    proxy: 翻墙\nproxies:\n  - name: 翻墙\n    type: socks5h\n    addr: 127.0.0.1:1080\n    auth:\n      user: u\n      pass: 这是密码不能漏\n",
+        )
+        .unwrap();
+        let view: Vec<tw_api::ProxyView> = cfg
+            .proxies
+            .iter()
+            .map(|x| tw_api::ProxyView {
+                name: x.name.clone(),
+                kind: x.kind.slug().to_string(),
+                addr: x.addr.clone(),
+                has_auth: x.auth.is_some(),
+                used_by: cfg.providers.iter().filter(|p| p.proxy == x.name).count(),
+            })
+            .collect();
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("这是密码不能漏"), "{json}");
+        assert!(!json.contains("\"u\""), "用户名也是凭据的一半：{json}");
+        // 有没有认证是要显示的，认证内容不是
+        assert!(view[0].has_auth);
+        // 有几家在用 —— 删之前要知道
+        assert_eq!(view[0].used_by, 1);
     }
 }

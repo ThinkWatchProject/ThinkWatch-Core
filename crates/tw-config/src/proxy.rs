@@ -25,6 +25,17 @@ pub enum ProxyKind {
     Http,
     Https,
 }
+impl ProxyKind {
+    /// 写进 YAML 的那个词。界面写回的是它，不是显示用的标签。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ProxyKind::Socks5 => "socks5",
+            ProxyKind::Socks5h => "socks5h",
+            ProxyKind::Http => "http",
+            ProxyKind::Https => "https",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyAuth {
