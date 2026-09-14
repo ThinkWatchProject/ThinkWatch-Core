@@ -592,7 +592,27 @@ pub struct ConfigPatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PatchOp {
-    Replace { path: String, value: PatchValue },
+    Replace {
+        path: String,
+        value: PatchValue,
+    },
+    /// 往块式列表末尾加一项。
+    ///
+    /// `item` 是这一项的 YAML 片段，不带前导的 `- `。**结构性的编辑
+    /// 只有这一条路** —— 没有它，界面只能改已经存在的标量，而新建
+    /// 任何东西（一把密钥、一条规则、一个代理）都不是替换。
+    Append {
+        path: String,
+        item: String,
+    },
+    /// 删掉列表里的一项。
+    ///
+    /// `path` 指向**那一项**，按名字：`/clients/codex`。和 `Replace`
+    /// 同一条纪律 —— 下标会在用户重排之后指向另一个东西，而那种错误
+    /// 完全静默。
+    Remove {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

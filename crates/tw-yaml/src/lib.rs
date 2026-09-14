@@ -596,3 +596,275 @@ fn checked(before: &str, out: String, path: &[Step], value: &Scalar) -> Result<S
     }
     Ok(out)
 }
+
+// ─────────────────────────────────────────────────────────── 列表增删
+//
+// **`set` / `insert` 只动标量，而配置里一半的编辑是结构性的**：加一把
+// 密钥、删一条路由规则、给某把密钥分配一条路由。这些都是往块式列表里
+// 增删一项。
+//
+// 没有这一层的后果不是「少个功能」，是界面只能读不能写 —— 补丁协议里
+// 唯一的操作是「替换一个标量」，而新建任何东西都不是替换。
+
+/// 一项在列表里占的字节区间，**含行首缩进、不含结尾换行**。
+///
+/// 按行推而不是信容器节点的 `bytes`：那个区间会一路跑到下一个 token
+/// （文件开头的注释里写了），拿来切字节会把下一项的开头一起切掉。
+fn item_span(text: &str, seq_path: &[Step], index: usize) -> Result<Range<usize>, PatchError> {
+    let all = nodes(text)?;
+    let mut want = seq_path.to_vec();
+    want.push(Step::Index(index));
+    // 这一项底下最靠前的那个节点，就是这一项的起点所在的行
+    let start_node = all
+        .iter()
+        .filter(|n| n.path.starts_with(&want))
+        .map(|n| n.bytes.start)
+        .min()
+        .ok_or_else(|| PatchError::NotFound(show(&want)))?;
+    let line_start = text[..start_node].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    // 行首到 `-` 的缩进
+    let dash = text[line_start..]
+        .find('-')
+        .map(|i| line_start + i)
+        .ok_or_else(|| PatchError::NotFound(format!("{}（不是块式列表）", show(&want))))?;
+    let indent = dash - line_start;
+    // 往后走到下一项的 `-`（同缩进）或者这一块结束
+    let mut at = text[line_start..]
+        .find('\n')
+        .map(|i| line_start + i + 1)
+        .unwrap_or(text.len());
+    while at < text.len() {
+        let line_end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
+        let line = &text[at..line_end];
+        let trimmed = line.trim_start();
+        // 空行归属于**下一项**：它是分隔，不是内容。跟着上一项删的话，
+        // 删掉中间一项会让前后两项贴在一起。
+        if !trimmed.is_empty() {
+            let this_indent = line.len() - trimmed.len();
+            if this_indent <= indent {
+                break;
+            }
+        }
+        at = if line_end >= text.len() {
+            text.len()
+        } else {
+            line_end + 1
+        };
+    }
+    // 回退掉结尾那个换行。**只回退一个** —— 再往前是上一项的内容，
+    // 而这个区间是要交给调用方切字节的。
+    let end = if at > line_start && text.as_bytes()[at - 1] == b'\n' {
+        at - 1
+    } else {
+        at
+    };
+    Ok(line_start..end)
+}
+
+/// 往块式列表末尾加一项。
+///
+/// `item` 是这一项的 YAML 片段，**不带前导的 `- `**，多行之间用 `\n`
+/// 分隔：`"name: codex\nkey: tw-abc"` 变成
+///
+/// ```text
+///   - name: codex
+///     key: tw-abc
+/// ```
+///
+/// 缩进抄已有那一项的 —— 用户用的是两格还是四格是他的事。
+pub fn append(text: &str, seq_path: &[Step], item: &str) -> Result<String, PatchError> {
+    let all = nodes(text)?;
+    let count = all
+        .iter()
+        .filter(|n| n.path.len() == seq_path.len() + 1 && n.path.starts_with(seq_path))
+        .filter_map(|n| match n.path.last() {
+            Some(Step::Index(i)) => Some(*i + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    if count == 0 {
+        return Err(PatchError::NotFound(format!(
+            "{}（空列表还不支持追加，先在文本模式里写第一项）",
+            show(seq_path)
+        )));
+    }
+    let last = item_span(text, seq_path, count - 1)?;
+    let line_start = text[..last.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let dash = text[line_start..last.end]
+        .find('-')
+        .map(|i| line_start + i)
+        .ok_or_else(|| PatchError::NotFound(show(seq_path)))?;
+    let indent = " ".repeat(dash - line_start);
+    // `- ` 之后的内容相对行首多缩两格（`- ` 本身的宽度）
+    let cont = format!("{indent}  ");
+    let mut piece = String::from("\n");
+    for (i, line) in item.lines().enumerate() {
+        if i > 0 {
+            piece.push('\n');
+            piece.push_str(&cont);
+        } else {
+            piece.push_str(&indent);
+            piece.push_str("- ");
+        }
+        piece.push_str(line);
+    }
+    let mut out = String::with_capacity(text.len() + piece.len());
+    out.push_str(&text[..last.end]);
+    out.push_str(&piece);
+    out.push_str(&text[last.end..]);
+    checked_structural(text, out, seq_path, count + 1)
+}
+
+/// 从块式列表里删掉第 `index` 项。
+pub fn remove(text: &str, seq_path: &[Step], index: usize) -> Result<String, PatchError> {
+    let span = item_span(text, seq_path, index)?;
+    let all = nodes(text)?;
+    let count = all
+        .iter()
+        .filter(|n| n.path.len() == seq_path.len() + 1 && n.path.starts_with(seq_path))
+        .filter_map(|n| match n.path.last() {
+            Some(Step::Index(i)) => Some(*i + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // 连同它后面那个换行一起删，否则会留下一个空行
+    let mut end = span.end;
+    if end < text.len() && text.as_bytes()[end] == b'\n' {
+        end += 1;
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..span.start]);
+    out.push_str(&text[end..]);
+    checked_structural(text, out, seq_path, count.saturating_sub(1))
+}
+
+/// 结构性改动的护栏：**改完在内存里重新解析，数一遍这个列表有几项**。
+///
+/// 和标量那条护栏是同一个理由，只是断言不同 —— 那边断言「写进去的值
+/// 读得回来」，这边断言「列表长度正好差一」。改出一份解析不了的 YAML
+/// 是这一层最该防的事，而它只会在下一次加载时暴露。
+fn checked_structural(
+    before: &str,
+    out: String,
+    seq_path: &[Step],
+    want: usize,
+) -> Result<String, PatchError> {
+    let after = nodes(&out).map_err(|e| {
+        PatchError::SelfCheck(format!("改完 `{}` 之后解析不了：{e}", show(seq_path)))
+    })?;
+    let got = after
+        .iter()
+        .filter(|n| n.path.len() == seq_path.len() + 1 && n.path.starts_with(seq_path))
+        .filter_map(|n| match n.path.last() {
+            Some(Step::Index(i)) => Some(*i + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    if got != want {
+        return Err(PatchError::SelfCheck(format!(
+            "改完之后 `{}` 有 {got} 项，应该是 {want} 项",
+            show(seq_path)
+        )));
+    }
+    let _ = before;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod seq_tests {
+    use super::*;
+
+    const CFG: &str = "version: 1\nclients:\n  # 第一把是首次运行生成的\n  - name: default\n    key: tw-aaa\n  - name: codex\n    key: tw-bbb\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n";
+
+    fn clients() -> Vec<Step> {
+        vec![Step::Key("clients".into())]
+    }
+
+    #[test]
+    fn appending_a_key_keeps_every_comment_and_the_other_entries() {
+        let out = append(CFG, &clients(), "name: cline\nkey: tw-ccc").unwrap();
+        // 注释还在 —— 这是整个 tw-yaml 存在的理由
+        assert!(out.contains("# 第一把是首次运行生成的"), "{out}");
+        assert!(out.contains("- name: default"), "{out}");
+        assert!(out.contains("- name: codex"), "{out}");
+        assert!(out.contains("  - name: cline\n    key: tw-ccc"), "{out}");
+        // 新的一项在 providers 之前，不是文件末尾
+        assert!(
+            out.find("cline").unwrap() < out.find("providers").unwrap(),
+            "{out}"
+        );
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["clients"].as_sequence().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn removing_the_middle_entry_does_not_glue_its_neighbours_together() {
+        let three = append(CFG, &clients(), "name: cline\nkey: tw-ccc").unwrap();
+        let out = remove(&three, &clients(), 1).unwrap();
+        assert!(!out.contains("codex"), "{out}");
+        assert!(out.contains("- name: default"), "{out}");
+        assert!(out.contains("- name: cline"), "{out}");
+        assert!(out.contains("# 第一把是首次运行生成的"), "{out}");
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["clients"].as_sequence().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn removing_the_first_entry_keeps_the_rest_parseable() {
+        let out = remove(CFG, &clients(), 0).unwrap();
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        let cs = cfg["clients"].as_sequence().unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0]["name"].as_str(), Some("codex"));
+    }
+
+    #[test]
+    fn a_four_space_file_gets_four_space_entries() {
+        // **缩进抄用户的，不是我们的偏好。**这是他的文件。
+        let four = "clients:\n    - name: a\n      key: tw-a\n";
+        let out = append(four, &clients(), "name: b\nkey: tw-b").unwrap();
+        assert!(out.contains("    - name: b\n      key: tw-b"), "{out}");
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["clients"].as_sequence().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_trailing_comment_on_the_last_entry_stays_with_it() {
+        let c = "clients:\n  - name: a\n    key: tw-a  # 这把给 Claude Code\n";
+        let out = append(c, &clients(), "name: b\nkey: tw-b").unwrap();
+        assert!(out.contains("tw-a  # 这把给 Claude Code"), "{out}");
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["clients"].as_sequence().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn appending_a_nested_list_round_trips() {
+        // `routes` 是列表里套列表 —— 这是路由页要写的形状
+        let c = "routes:\n  - name: 默认\n    default: true\n    rules:\n      - name: r1\n        to: a\n";
+        let out = append(
+            c,
+            &[
+                Step::Key("routes".into()),
+                Step::Index(0),
+                Step::Key("rules".into()),
+            ],
+            "name: r2\nto: b",
+        )
+        .unwrap();
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        let rules = cfg["routes"][0]["rules"].as_sequence().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[1]["name"].as_str(), Some("r2"));
+    }
+
+    #[test]
+    fn an_empty_list_says_so_instead_of_writing_something_broken() {
+        // 空列表还不支持 —— **说出来，而不是写出一份解析不了的文件**
+        let c = "clients: []\n";
+        let e = append(c, &clients(), "name: a\nkey: tw-a").unwrap_err();
+        assert!(format!("{e}").contains("空列表"), "{e}");
+    }
+}
