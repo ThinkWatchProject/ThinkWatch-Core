@@ -684,10 +684,11 @@ pub fn append(text: &str, seq_path: &[Step], item: &str) -> Result<String, Patch
         .max()
         .unwrap_or(0);
     if count == 0 {
-        return Err(PatchError::NotFound(format!(
-            "{}（空列表还不支持追加，先在文本模式里写第一项）",
-            show(seq_path)
-        )));
+        // **第一项要单独处理，而且这条路径是常走的**：`routes`、`proxies`、
+        // `allow_from` 这些键在配置里默认根本不写（「第一天的配置是六行」），
+        // 所以「加第一条路由」「加第一个代理」都从这儿过。不支持它的话，
+        // 界面上每一个新建功能都在用户第一次用的时候失败。
+        return append_first(text, seq_path, item);
     }
     let last = item_span(text, seq_path, count - 1)?;
     let line_start = text[..last.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -714,6 +715,131 @@ pub fn append(text: &str, seq_path: &[Step], item: &str) -> Result<String, Patch
     out.push_str(&piece);
     out.push_str(&text[last.end..]);
     checked_structural(text, out, seq_path, count + 1)
+}
+
+/// 往一个还不存在、或者空着的列表里加第一项。
+///
+/// 三种起点，产出的都是块式列表：
+///
+/// · 键根本没写 —— 在父映射末尾补 `key:` 和第一项
+/// · `key: []` —— 换成块式写法
+/// · `key:` 后面空着 —— 直接补第一项
+fn append_first(text: &str, seq_path: &[Step], item: &str) -> Result<String, PatchError> {
+    let Some((last, parent)) = seq_path.split_last() else {
+        return Err(PatchError::NotFound(show(seq_path)));
+    };
+    let Step::Key(key) = last else {
+        return Err(PatchError::NotFound(show(seq_path)));
+    };
+    let all = nodes(text)?;
+    let p = all
+        .iter()
+        .find(|n| n.path == parent)
+        .ok_or_else(|| PatchError::NotFound(show(parent)))?;
+    if !matches!(p.kind, NodeKind::Map) || p.anchored {
+        return Err(PatchError::NotFound(show(parent)));
+    }
+
+    // 这一块从哪到哪。
+    //
+    // **不能拿「最后一个直接子节点」的位置。**块式列表的值节点，起点是
+    // 第一个 `-` 那一行而不是 `key:` 那一行 —— 照它抄缩进会抄成列表项的
+    // 缩进，插入点也会落在列表中间。（这正是第一版写出来的东西：
+    // `routes:` 被插进了 `clients` 的两项之间。）
+    //
+    // 所以按整块算：范围取这个父节点底下**所有**节点的最远处，缩进取
+    // 这块里非空行的最小缩进 —— 那正是这一层键的缩进。
+    let block_end = all
+        .iter()
+        .filter(|n| n.path.starts_with(parent) && n.path.len() > parent.len())
+        .map(|n| n.bytes.end.min(text.len()))
+        .max()
+        .ok_or_else(|| PatchError::NotFound(show(parent)))?;
+    let block_start = all
+        .iter()
+        .filter(|n| n.path.starts_with(parent) && n.path.len() > parent.len())
+        .map(|n| n.bytes.start)
+        .min()
+        .unwrap_or(0);
+    let first_line = text[..block_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = text[block_end..]
+        .find('\n')
+        .map(|i| block_end + i)
+        .unwrap_or(text.len());
+    // **跳过以 `-` 开头的行。**映射本身是列表的一项时（`clients[0]`），
+    // 它的第一个键写在 `- name: a` 这一行上 —— 那一行的缩进是短划线的
+    // 缩进，比键实际所在的列少两格。照它算出来的新键会缩到列表项外面去。
+    let key_indents: Vec<usize> = text[first_line..end]
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('-'))
+        .map(|l| l.len() - l.trim_start().len())
+        .collect();
+    let indent: String = match key_indents.iter().min() {
+        Some(n) => " ".repeat(*n),
+        // 整块只有一行 `- name: a` —— 键在短划线后面两格
+        None => {
+            let dash = text[first_line..end]
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.len() - l.trim_start().len() + 2)
+                .unwrap_or(0);
+            " ".repeat(dash)
+        }
+    };
+
+    let existing = all.iter().find(|n| n.path == seq_path);
+    let piece = {
+        let cont = format!("{indent}    ");
+        let mut out = String::new();
+        for (i, line) in item.lines().enumerate() {
+            if i > 0 {
+                out.push('\n');
+                out.push_str(&cont);
+            } else {
+                out.push_str(&indent);
+                out.push_str("  - ");
+            }
+            out.push_str(line);
+        }
+        out
+    };
+
+    let mut out = String::with_capacity(text.len() + piece.len() + key.len() + 4);
+    match existing {
+        // `key: []` 或者 `key:` 空着 —— 换掉那一行的值部分
+        Some(n) => {
+            let vline_start = text[..n.bytes.start]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let vline_end = text[vline_start..]
+                .find('\n')
+                .map(|i| vline_start + i)
+                .unwrap_or(text.len());
+            let vindent: String = text[vline_start..]
+                .chars()
+                .take_while(|c| *c == ' ')
+                .collect();
+            let piece = piece.replacen(&indent, &vindent, 1);
+            out.push_str(&text[..vline_start]);
+            out.push_str(&vindent);
+            out.push_str(key);
+            out.push_str(":\n");
+            out.push_str(&piece);
+            out.push_str(&text[vline_end..]);
+        }
+        // 键根本没写 —— 在这一块末尾补一整段
+        None => {
+            out.push_str(&text[..end]);
+            out.push('\n');
+            out.push_str(&indent);
+            out.push_str(key);
+            out.push_str(":\n");
+            out.push_str(&piece);
+            out.push_str(&text[end..]);
+        }
+    }
+    checked_structural(text, out, seq_path, 1)
 }
 
 /// 从块式列表里删掉第 `index` 项。
@@ -860,11 +986,74 @@ mod seq_tests {
         assert_eq!(rules[1]["name"].as_str(), Some("r2"));
     }
 
+    /// **这四条是「第一次用」的全部路径。**`routes`、`proxies`、
+    /// `allow_from` 这些键在配置里默认根本不写（第一天的配置只有六行），
+    /// 所以「建第一条路由」「加第一个代理」都从这里过 —— 不支持的话，
+    /// 界面上每个新建功能都在用户第一次点它的时候失败。
     #[test]
-    fn an_empty_list_says_so_instead_of_writing_something_broken() {
-        // 空列表还不支持 —— **说出来，而不是写出一份解析不了的文件**
-        let c = "clients: []\n";
-        let e = append(c, &clients(), "name: a\nkey: tw-a").unwrap_err();
-        assert!(format!("{e}").contains("空列表"), "{e}");
+    fn a_key_that_is_not_in_the_file_yet_gets_created_with_its_first_entry() {
+        let c = "version: 1\nclients:\n  - name: a\n    key: tw-a\n";
+        let out = append(
+            c,
+            &[Step::Key("routes".into())],
+            "name: 默认\nrules:\n  - name: 兜底\n    to: official",
+        )
+        .unwrap();
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        let rs = cfg["routes"].as_sequence().unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0]["name"].as_str(), Some("默认"));
+        assert_eq!(rs[0]["rules"].as_sequence().unwrap().len(), 1);
+        // 原来的内容一个字没动
+        assert!(out.contains("- name: a\n    key: tw-a"), "{out}");
+    }
+
+    #[test]
+    fn a_flow_empty_list_becomes_a_block_list() {
+        let c = "version: 1\nproxies: []\n";
+        let out = append(
+            c,
+            &[Step::Key("proxies".into())],
+            "name: 翻墙\ntype: socks5h\naddr: 127.0.0.1:1080",
+        )
+        .unwrap();
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["proxies"].as_sequence().unwrap().len(), 1);
+        assert!(!out.contains("[]"), "流式的空列表该被换掉：{out}");
+    }
+
+    #[test]
+    fn creating_a_key_keeps_the_comments_around_it() {
+        let c =
+            "version: 1\n# 这台机器上的上游\nproviders:\n  - name: 官方\n    base_url: https://x\n";
+        let out = append(
+            c,
+            &[Step::Key("proxies".into())],
+            "name: p\naddr: 1.2.3.4:1080",
+        )
+        .unwrap();
+        assert!(out.contains("# 这台机器上的上游"), "{out}");
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["providers"].as_sequence().unwrap().len(), 1);
+        assert_eq!(cfg["proxies"].as_sequence().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_nested_key_that_does_not_exist_yet_works_too() {
+        // `clients[].allow` 也是默认不写的 —— 「限制这把密钥能看的模型」
+        // 第一次点也走这条路
+        let c = "clients:\n  - name: a\n    key: tw-a\n";
+        let out = append(
+            c,
+            &[
+                Step::Key("clients".into()),
+                Step::Index(0),
+                Step::Key("allow".into()),
+            ],
+            "claude-haiku-*",
+        )
+        .unwrap();
+        let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg["clients"][0]["allow"].as_sequence().unwrap().len(), 1);
     }
 }
