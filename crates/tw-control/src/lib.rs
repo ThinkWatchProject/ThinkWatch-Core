@@ -102,6 +102,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/config/rollback", post(config_rollback))
         .route("/summary", get(summary))
         .route("/summary/buckets", get(cost_buckets))
+        .route("/summary/buckets/by", get(cost_buckets_by))
         .route("/summary/by", get(cost_by))
         .route("/history", get(history))
         .route("/latency", get(latency))
@@ -555,6 +556,27 @@ async fn cost_buckets(
 }
 
 /// 按模型或上游分组的花费（钱花在哪儿）。
+async fn cost_buckets_by(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<BucketGroupQuery>,
+) -> Result<Json<Vec<tw_api::CostBucketGroup>>, Fail> {
+    let (from, to) = Window {
+        from_ms: q.from_ms,
+        to_ms: q.to_ms,
+    }
+    .range();
+    // 桶宽有下限，和 `/summary/buckets` 同一条理由：`bucket_ms=1` 能让
+    // 这条查询扫出几百万个分组，而这一条还要再乘上模型个数。
+    let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let x = g
+        .db()
+        .cost_buckets_by(q.dim, from, to, bucket)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(x))
+}
+
 async fn cost_by(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<GroupQuery>,
@@ -1214,6 +1236,15 @@ impl BucketQuery {
         }
         .range()
     }
+}
+
+#[derive(serde::Deserialize)]
+struct BucketGroupQuery {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    bucket_ms: Option<i64>,
+    /// 和 `GroupQuery` 同一条理由：是枚举不是字符串，它会变成列名。
+    dim: tw_api::CostDim,
 }
 
 #[derive(serde::Deserialize)]

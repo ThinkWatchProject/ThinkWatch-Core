@@ -436,28 +436,51 @@ impl Prices {
 }
 
 impl Prices {
-    /// 缓存读省下了多少钱。
+    /// 用了缓存之后，净多花还是净少花了多少。
     ///
-    /// **算的是「如果这些 token 没命中缓存，要多花多少」** —— 而不是
-    /// 「缓存读花了多少」。用户想知道的是那个差额：cache read 是 0.1 倍
-    /// 单价，所以省下的是 0.9 倍。
+    /// **算的是「如果完全不用缓存，这次要多花多少」** —— 两笔都要算：
+    ///
+    /// · 命中省下的：cache read 是 0.1 倍单价，所以每个读到的 token
+    ///   省 0.9 倍。
+    /// · 写入多花的：**cache write 是 1.25 倍单价，不是免费的。**
+    ///
+    /// **第二笔以前没减。**不减的话，一个反复重建缓存、很少命中的用法
+    /// 会被报成「省了钱」，而它的真实账单比不开缓存更贵 —— 那正是用户
+    /// 最需要知道的一种情况，却被这个数字盖住了。
+    ///
+    /// 所以它可以是负数，而负数是一条结论：这个用法上缓存在亏钱。
+    /// 回本线很低 —— 写的溢价是 0.25 倍、每次读省 0.9 倍，读量到写量的
+    /// 约 28% 就回本了。
     ///
     /// 没有价格、或者这家不按 token 计费时是 `None`。**不是 0** ——
     /// 「省了 0 元」和「算不出来省了多少」是两句不同的话。
     pub fn cache_saving(&self, model: &str, u: &Usage) -> Option<Micros> {
-        if u.cache_read == 0 {
+        if u.cache_read == 0 && u.cache_write == 0 {
             return Some(0);
         }
         let p = self.get(model)?;
-        // 缓存读没单独定价的话，它本来就按输入价算 —— 那时没有节省
-        let read_rate = p.cache_read?;
         let long = u.input + u.cache_read > 200_000;
         let full_rate = if long {
             p.input_above_200k.unwrap_or(p.input)
         } else {
             p.input
         };
-        Some(to_micros(u.cache_read as f64 * (full_rate - read_rate)))
+        // 缓存读没单独定价的话，它本来就按输入价算 —— 那时没有节省
+        let saved = match p.cache_read {
+            Some(read_rate) => u.cache_read as f64 * (full_rate - read_rate),
+            None => 0.0,
+        };
+        // 写入同理：没单独定价就是按输入价收，没有溢价
+        let write_rate = if u.cache_1h {
+            p.cache_write_1h.or(p.cache_write_5m)
+        } else {
+            p.cache_write_5m
+        };
+        let spent = match write_rate {
+            Some(w) => u.cache_write as f64 * (w - full_rate),
+            None => 0.0,
+        };
+        Some(to_micros(saved - spent))
     }
 }
 
@@ -1038,6 +1061,68 @@ mod saving_tests {
             p.cache_saving("claude-sonnet-4-5", &Usage::default()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn the_write_premium_is_subtracted_not_ignored() {
+        // **这条是这个函数改过一次的理由。**缓存写是 1.25 倍单价：
+        // 只算读省下的、不减写多花的，等于声称缓存永远只会让人省钱。
+        let p = Prices::builtin().unwrap();
+        let read_only = p
+            .cache_saving(
+                "claude-sonnet-4-5",
+                &Usage {
+                    cache_read: 100_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let with_writes = p
+            .cache_saving(
+                "claude-sonnet-4-5",
+                &Usage {
+                    cache_read: 100_000,
+                    cache_write: 100_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Sonnet 4.5：输入 $3、写 $3.75 → 十万 token 多花 $0.075
+        assert_eq!(read_only - with_writes, 75_000);
+    }
+
+    #[test]
+    fn a_cache_that_never_gets_read_is_a_loss_and_says_so() {
+        // **负数是一条结论**，不是一个要被夹到零的边界：这个用法上
+        // 缓存在亏钱，而那正是最该让人看见的一种情况。
+        let p = Prices::builtin().unwrap();
+        let v = p
+            .cache_saving(
+                "claude-sonnet-4-5",
+                &Usage {
+                    cache_write: 200_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(v, -150_000, "写二十万、一次没读到，多花 $0.15");
+    }
+
+    /// 回本线：读量到写量的约 28% 就打平。
+    #[test]
+    fn reading_back_a_third_of_what_was_written_already_pays_for_it() {
+        let p = Prices::builtin().unwrap();
+        let v = p
+            .cache_saving(
+                "claude-sonnet-4-5",
+                &Usage {
+                    cache_write: 100_000,
+                    cache_read: 33_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(v > 0, "读回三分之一就该是赚的，实际 {v}");
     }
 
     #[test]
