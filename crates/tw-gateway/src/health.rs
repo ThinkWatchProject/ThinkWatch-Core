@@ -101,16 +101,18 @@ impl Health {
         (before != after).then_some(after)
     }
 
-    /// 这家的冷却刚好走完了吗。
+    /// 这家还要等多久才轮到探测。
     ///
-    /// **专门给「报一条恢复」用的**，所以判据比 `state()` 严：要求那次
-    /// 熔断**还在**（`opened_at` 没被成功清掉，也没有被一次新的失败
-    /// 顶成更晚的时刻）。中途成功过的话 `record_success` 已经报过了，
-    /// 再报一条就是同一件事说两遍；重新熔断的话，那次自己带着定时器。
-    pub fn just_cooled_down(&self, name: &str) -> bool {
+    /// `None` = 根本不在熔断态（成功过，或者从来没熔断过）。
+    /// `Some(0)` = 冷却走完了，下一个请求就是那次探测。
+    ///
+    /// **专门给「报一条恢复」的定时器用。**它必须能分清「到点了」和
+    /// 「中途又失败、冷却被顶到更晚了」—— 后者返回的是新的剩余时间，
+    /// 定时器据此接着等，而不是现在就宣布恢复。
+    pub fn cooldown_left(&self, name: &str) -> Option<Duration> {
         let g = self.inner.lock().unwrap();
-        g.get(name)
-            .is_some_and(|e| e.opened_at.is_some_and(|t| t.elapsed() >= COOLDOWN))
+        let t = g.get(name)?.opened_at?;
+        Some(COOLDOWN.saturating_sub(t.elapsed()))
     }
 
     /// 从候选里挑出还能用的，**并说明是不是 fail-open**。
@@ -171,18 +173,27 @@ mod tests {
         assert_eq!(h.record_success("a"), None);
     }
 
-    /// 刚熔断的那一刻冷却还没走完 —— 这条守的是「别把恢复报两遍」：
-    /// 开的时候排下的那个定时器到点会拿它再确认一次。
+    /// 这条守着「报恢复」那个定时器的两个判断。
     #[test]
-    fn a_fresh_open_has_not_cooled_down_yet() {
+    fn the_cooldown_clock_says_which_case_it_is() {
         let h = Health::new();
+        assert_eq!(h.cooldown_left("a"), None, "没熔断过，没有什么可等的");
         for _ in 0..3 {
             h.record_failure("a");
         }
-        assert!(!h.just_cooled_down("a"));
-        // 成功之后那次熔断就不存在了，定时器到点也不该再报一条
+        let left = h.cooldown_left("a").expect("熔断了就该在等");
+        assert!(!left.is_zero(), "刚熔断，冷却还没走完");
+
+        // **中途又失败会把冷却顶到更晚。**定时器到点时看到的是一段新的
+        // 剩余时间，它该接着等 —— 现在宣布恢复的话，界面会说一家正在
+        // 连续失败的上游已经好了。
+        h.record_failure("a");
+        assert!(!h.cooldown_left("a").expect("还在熔断").is_zero());
+
+        // 成功之后那次熔断就不存在了：`record_success` 已经报过恢复，
+        // 定时器到点看到 None，闭嘴走人。
         h.record_success("a");
-        assert!(!h.just_cooled_down("a"));
+        assert_eq!(h.cooldown_left("a"), None);
     }
 
     #[test]
