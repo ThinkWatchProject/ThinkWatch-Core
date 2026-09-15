@@ -800,6 +800,52 @@ impl Db {
     /// `dim` 只接受固定的两个值 —— **不是把列名拼进 SQL**。这个参数最终
     /// 来自控制面的 query string，拼进去就是一个注入口，而它省下的那点
     /// 代码完全不值。
+    /// 每个时间桶里，按模型（或上游）分开的那部分。
+    ///
+    /// **和 `cost_buckets` 是两个查询。**前者回答「这段时间的形状」，
+    /// 这个多回答一句「每一段里是谁花的」—— 趋势图按模型分层之后，
+    /// 两个问题只用看一次。
+    ///
+    /// 桶边界的算法和 `cost_buckets` 完全一样（相对 `since_ms` 数），
+    /// 两边必须一致：界面是按同一个起点补空桶的。
+    pub fn cost_buckets_by(
+        &self,
+        dim: tw_api::CostDim,
+        since_ms: i64,
+        until_ms: i64,
+        bucket_ms: i64,
+    ) -> Result<Vec<tw_api::CostBucketGroup>, DbError> {
+        if bucket_ms <= 0 {
+            return Ok(Vec::new());
+        }
+        let col = match dim {
+            tw_api::CostDim::Model => "model",
+            tw_api::CostDim::Provider => "provider",
+        };
+        let sql = format!(
+            "SELECT ((at_ms - ?1) / ?3) AS b, {col},
+                    COUNT(*),
+                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0)
+             FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
+             GROUP BY b, {col} ORDER BY b"
+        );
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
+            Ok(tw_api::CostBucketGroup {
+                at_ms: since_ms + r.get::<_, i64>(0)? * bucket_ms,
+                name: r.get(1)?,
+                requests: r.get(2)?,
+                failed: r.get(3)?,
+                cost_micros_exact: r.get(4)?,
+                cost_micros_estimated: r.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn cost_by(
         &self,
         dim: tw_api::CostDim,
@@ -1022,6 +1068,45 @@ mod tests {
     ///
     /// 把「没有价格」当成 0 加进柱子,那根柱子就是偏低的,而看图的人
     /// 没有任何线索知道少算了什么。
+
+    #[test]
+    fn buckets_by_model_line_up_with_the_plain_buckets() {
+        // **两条查询的桶边界必须完全一样。**界面是按同一个起点补空桶的，
+        // 差一格就是「有数据的那一格被画在了没数据的位置上」。
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let hour = 3_600_000i64;
+        for (i, (at, model)) in [
+            (t0 + 10, "opus"),
+            (t0 + 20, "sonnet"),
+            (t0 + 2 * hour + 5, "opus"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut r = row(i as i64 + 1, *at);
+            r.model = (*model).into();
+            r.cost_micros = Some(1_000);
+            db.insert(&r).unwrap();
+        }
+        let plain = db.cost_buckets(t0, t0 + 3 * hour, hour).unwrap();
+        let by = db
+            .cost_buckets_by(tw_api::CostDim::Model, t0, t0 + 3 * hour, hour)
+            .unwrap();
+        // 第 0 桶两个模型各一条，第 2 桶一条
+        assert_eq!(by.len(), 3, "两个模型在第 0 桶要分成两行：{by:?}");
+        let sum: i64 = by.iter().map(|b| b.cost_micros_exact).sum();
+        let plain_sum: i64 = plain.iter().map(|b| b.cost_micros_exact).sum();
+        assert_eq!(sum, plain_sum, "分组之后总额要和不分组的一致");
+        for b in &by {
+            assert!(
+                plain.iter().any(|p| p.at_ms == b.at_ms),
+                "{} 这一格在不分组的结果里没有对应",
+                b.at_ms
+            );
+        }
+    }
+
     #[test]
     fn a_bucket_keeps_the_three_cost_states_apart() {
         let db = Db::in_memory().unwrap();
