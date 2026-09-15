@@ -35,6 +35,15 @@ struct Entry {
     opened_at: Option<Instant>,
 }
 
+/// 这一条现在算什么状态。**时间也是输入** —— 冷却到点就自动算合上，
+/// 下一个请求自然成为探测。
+fn effective(e: &Entry) -> State {
+    match e.opened_at {
+        Some(t) if t.elapsed() < COOLDOWN => State::Open,
+        _ => State::Closed,
+    }
+}
+
 /// 每个 provider 的健康状态。
 ///
 /// **不持久化**。桌面应用重启频繁，把「这家挂了」的判断带过重启
@@ -60,30 +69,48 @@ impl Health {
 
     pub fn state(&self, name: &str) -> State {
         let g = self.inner.lock().unwrap();
-        let Some(e) = g.get(name) else {
-            return State::Closed;
-        };
-        match e.opened_at {
-            Some(t) if t.elapsed() < COOLDOWN => State::Open,
-            // 冷却到点了就当成 Closed —— 下一个请求自然成为探测。
-            _ => State::Closed,
-        }
+        g.get(name).map_or(State::Closed, effective)
     }
 
-    pub fn record_success(&self, name: &str) {
+    /// 记一次成功。**返回的是状态变化，没变就是 `None`。**
+    ///
+    /// 调用方要拿它去发事件：熔断开合是界面上看得见的状态，而看得见的
+    /// 状态必须能被推出去 —— 否则界面只能轮询。
+    pub fn record_success(&self, name: &str) -> Option<State> {
         let mut g = self.inner.lock().unwrap();
         let e = g.entry(name.to_string()).or_default();
+        let before = effective(e);
         e.consecutive_failures = 0;
         e.opened_at = None;
+        (before != State::Closed).then_some(State::Closed)
     }
 
-    pub fn record_failure(&self, name: &str) {
+    /// 记一次失败，同样返回状态变化。
+    ///
+    /// 冷却到点之后那次探测又失败时，这里会再报一次 `Open` —— **那不是
+    /// 重复**：中间确实经过了一段「可以再试」的时间，而它又被关上了。
+    pub fn record_failure(&self, name: &str) -> Option<State> {
         let mut g = self.inner.lock().unwrap();
         let e = g.entry(name.to_string()).or_default();
+        let before = effective(e);
         e.consecutive_failures += 1;
         if e.consecutive_failures >= FAILURE_THRESHOLD {
             e.opened_at = Some(Instant::now());
         }
+        let after = effective(e);
+        (before != after).then_some(after)
+    }
+
+    /// 这家的冷却刚好走完了吗。
+    ///
+    /// **专门给「报一条恢复」用的**，所以判据比 `state()` 严：要求那次
+    /// 熔断**还在**（`opened_at` 没被成功清掉，也没有被一次新的失败
+    /// 顶成更晚的时刻）。中途成功过的话 `record_success` 已经报过了，
+    /// 再报一条就是同一件事说两遍；重新熔断的话，那次自己带着定时器。
+    pub fn just_cooled_down(&self, name: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.get(name)
+            .is_some_and(|e| e.opened_at.is_some_and(|t| t.elapsed() >= COOLDOWN))
     }
 
     /// 从候选里挑出还能用的，**并说明是不是 fail-open**。
@@ -120,6 +147,42 @@ mod tests {
         let h = Health::new();
         assert!(h.is_available("a"));
         assert_eq!(h.state("a"), State::Closed);
+    }
+
+    #[test]
+    fn only_the_failure_that_flips_it_reports_a_change() {
+        // 每次失败都报一条的话，这个事件就退化成了另一个请求流 ——
+        // 而订阅它的那一页要的是「什么时候变了」，不是「又失败了一次」。
+        let h = Health::new();
+        assert_eq!(h.record_failure("a"), None);
+        assert_eq!(h.record_failure("a"), None);
+        assert_eq!(h.record_failure("a"), Some(State::Open), "第三次才是变化");
+        assert_eq!(h.record_failure("a"), None, "已经开着了，不是新的变化");
+    }
+
+    #[test]
+    fn a_success_reports_the_close_only_when_it_was_open() {
+        let h = Health::new();
+        assert_eq!(h.record_success("a"), None, "本来就是好的");
+        for _ in 0..3 {
+            h.record_failure("a");
+        }
+        assert_eq!(h.record_success("a"), Some(State::Closed));
+        assert_eq!(h.record_success("a"), None);
+    }
+
+    /// 刚熔断的那一刻冷却还没走完 —— 这条守的是「别把恢复报两遍」：
+    /// 开的时候排下的那个定时器到点会拿它再确认一次。
+    #[test]
+    fn a_fresh_open_has_not_cooled_down_yet() {
+        let h = Health::new();
+        for _ in 0..3 {
+            h.record_failure("a");
+        }
+        assert!(!h.just_cooled_down("a"));
+        // 成功之后那次熔断就不存在了，定时器到点也不该再报一条
+        h.record_success("a");
+        assert!(!h.just_cooled_down("a"));
     }
 
     #[test]
