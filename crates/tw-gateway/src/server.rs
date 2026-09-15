@@ -776,6 +776,11 @@ async fn passthrough(
 /// 开的时候顺手排一个定时器：**冷却到点本身就是一次状态变化**，而它
 /// 不由任何调用触发。不报的话，界面会一直显示「熔断中」，直到碰巧又有
 /// 一个请求打到这家为止。
+///
+/// 定时器会**自己续期**，因为熔断期间的每一次失败都会把冷却顶到更晚
+/// （全都熔断时我们是放行的，所以那些失败照样打得到这家）。只睡一次
+/// 就下结论的话，它醒来时看到的是一段还没走完的冷却 —— 然后闭嘴，而
+/// 真正到点的那一刻再也没有人报。
 fn note_health(
     bus: &tw_observe::EventBus,
     health: &Arc<Health>,
@@ -799,9 +804,16 @@ fn note_health(
     }
     let (bus, health, name) = (bus.clone(), health.clone(), provider.to_string());
     tokio::spawn(async move {
-        tokio::time::sleep(crate::health::COOLDOWN).await;
-        if health.just_cooled_down(&name) {
-            say(&bus, name, false);
+        let mut left = crate::health::COOLDOWN;
+        loop {
+            tokio::time::sleep(left).await;
+            match health.cooldown_left(&name) {
+                // 中途成功过了 —— `record_success` 已经报过恢复
+                None => return,
+                Some(d) if d.is_zero() => return say(&bus, name, false),
+                // 又失败了一次，冷却被顶后。接着等，别现在就说它好了
+                Some(d) => left = d,
+            }
         }
     });
 }
