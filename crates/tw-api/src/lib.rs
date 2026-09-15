@@ -861,6 +861,23 @@ pub struct CostBucket {
     pub unpriced_requests: i64,
 }
 
+/// 一个时间桶里，某一个模型（或上游）的那部分。
+///
+/// **和 `CostBucket` 是两个查询，不是一个的扩展。**趋势图要回答的是
+/// 「什么时候花的」和「花在哪个模型上」—— 合成一张按模型分层的图之后，
+/// 这两个问题只用看一次；而把它们拆成一张趋势图加一张构成图，读的人
+/// 要在两张图之间自己对时间。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostBucketGroup {
+    pub at_ms: i64,
+    /// 模型名或上游名，看查的是哪一维
+    pub name: String,
+    pub requests: i64,
+    pub failed: i64,
+    pub cost_micros_exact: i64,
+    pub cost_micros_estimated: i64,
+}
+
 /// 按模型或上游分组的花费（钱花在哪儿）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostGroup {
