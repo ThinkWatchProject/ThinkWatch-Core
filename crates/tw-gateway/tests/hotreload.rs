@@ -155,6 +155,56 @@ async fn a_reload_that_cannot_build_leaves_the_old_config_serving() {
 }
 
 #[tokio::test]
+async fn opening_the_breaker_is_announced_on_the_bus() {
+    // **熔断是界面上看得见的状态，所以它必须能被推出去。**没有这条
+    // 事件，界面想知道「哪家被熔断了」就只能定时去问 `/overview` ——
+    // 而那是在一条完全空闲的连接上反复问同一个问题。
+    let dead = {
+        let app = Router::new().fallback(any(|| async {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let (good, _) = counting_upstream("good").await;
+    let c = cfg(vec![provider("dead", dead), provider("good", good)], vec![]);
+    let state = tw_gateway::AppState::new(c).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = serve(state.clone()).await;
+
+    for _ in 0..6 {
+        ask(gw).await;
+    }
+    assert!(!state.health.is_available("dead"), "dead 没被熔断");
+
+    let mut opened = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let tw_api::Event::HealthChanged {
+            provider, state, ..
+        } = ev
+        {
+            opened.push((provider, state));
+        }
+    }
+    assert_eq!(
+        opened
+            .iter()
+            .filter(|(p, s)| p == "dead" && s == "open")
+            .count(),
+        1,
+        "dead 熔断了却没报，或者报了不止一次：{opened:?}"
+    );
+    // **成功的那家不报。**没变化的状态不该产生事件 —— 每次成功都报一条
+    // 的话，这个事件就退化成了另一个请求流。
+    assert!(
+        !opened.iter().any(|(p, _)| p == "good"),
+        "good 一直是好的，不该有状态变化：{opened:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_circuit_breaker_state_survives_a_reload() {
     // **一家刚被熔断的上游，不该因为你改了条规则就立刻又被试一遍**。
     // 这类回归的表现是「偶尔多打了一次已知坏掉的上游」，

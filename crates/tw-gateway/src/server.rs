@@ -767,6 +767,45 @@ async fn passthrough(
     .map_err(|e| e.in_dialect(dialect))
 }
 
+/// 熔断状态变了就报一条，没变什么都不做。
+///
+/// **用自己的 id，不用这次请求的。**挂上请求的 id 会让存储层把它当成
+/// 那次请求的一部分 —— 而熔断说的是「这家上游现在什么情况」，和触发它
+/// 的那一次请求已经没关系了。
+///
+/// 开的时候顺手排一个定时器：**冷却到点本身就是一次状态变化**，而它
+/// 不由任何调用触发。不报的话，界面会一直显示「熔断中」，直到碰巧又有
+/// 一个请求打到这家为止。
+fn note_health(
+    bus: &tw_observe::EventBus,
+    health: &Arc<Health>,
+    provider: &str,
+    change: Option<crate::health::State>,
+) {
+    let Some(next) = change else { return };
+    let say = |bus: &tw_observe::EventBus, name: String, open: bool| {
+        let id = bus.next_id();
+        bus.emit(tw_api::Event::HealthChanged {
+            id,
+            provider: name,
+            state: if open { "open" } else { "closed" }.into(),
+            at_ms: now_ms(),
+        });
+    };
+    let open = next == crate::health::State::Open;
+    say(bus, provider.to_string(), open);
+    if !open {
+        return;
+    }
+    let (bus, health, name) = (bus.clone(), health.clone(), provider.to_string());
+    tokio::spawn(async move {
+        tokio::time::sleep(crate::health::COOLDOWN).await;
+        if health.just_cooled_down(&name) {
+            say(&bus, name, false);
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pipeline(
     state: AppState,
@@ -1116,7 +1155,12 @@ async fn pipeline(
                 // 密钥取不到是这一家的问题（环境变量没设、token 端点
                 // 连不上），换下一家是合理的 —— 而且**必须**换：不换的话
                 // 一家 OAuth 上游的 token 端点抽风会让整个网关不可用。
-                state.health.record_failure(&provider.name);
+                note_health(
+                    &state.bus,
+                    &state.health,
+                    &provider.name,
+                    state.health.record_failure(&provider.name),
+                );
                 chain.push(hop(&provider.name, format!("密钥取不到：{e}"), hop_started));
                 last_err = Some(GatewayError::config(format!(
                     "provider `{}` 的密钥取不到：{e}",
@@ -1170,7 +1214,12 @@ async fn pipeline(
                 // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
                 // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
                 // 也一样被拒，还会白白污染那家的健康度。
-                state.health.record_failure(&provider.name);
+                note_health(
+                    &state.bus,
+                    &state.health,
+                    &provider.name,
+                    state.health.record_failure(&provider.name),
+                );
                 chain.push(hop(&provider.name, format!("{}", r.status()), hop_started));
                 // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
                 // 坏了」而不是「该退避了」，而它们该做的事完全不同。
@@ -1182,7 +1231,12 @@ async fn pipeline(
                 continue;
             }
             Ok(r) => {
-                state.health.record_success(&provider.name);
+                note_health(
+                    &state.bus,
+                    &state.health,
+                    &provider.name,
+                    state.health.record_success(&provider.name),
+                );
                 chain.push(hop(&provider.name, "成功".to_string(), hop_started));
                 upstream = Some(r);
                 used = Some(provider);
@@ -1191,7 +1245,12 @@ async fn pipeline(
                 break;
             }
             Err(e) => {
-                state.health.record_failure(&provider.name);
+                note_health(
+                    &state.bus,
+                    &state.health,
+                    &provider.name,
+                    state.health.record_failure(&provider.name),
+                );
                 let err = forward::map_reqwest_error(e);
                 chain.push(hop(&provider.name, err.message.clone(), hop_started));
                 last_err = Some(err);
