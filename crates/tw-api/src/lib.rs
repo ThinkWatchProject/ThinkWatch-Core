@@ -205,6 +205,28 @@ pub enum Event {
         alerts: Vec<ScanFinding>,
         at_ms: u64,
     },
+    /// 客户端配置面上的文件动了 —— **不管改了什么**。
+    ///
+    /// 和 `ScanAlert` 是两件事。那条说的是「出现了可疑内容」，值得打断
+    /// 用户；这条只说「磁盘上那几个文件变了」，界面据此重读一遍接管
+    /// 状态。用户在编辑器里把 `ANTHROPIC_BASE_URL` 改回原样，一点都不
+    /// 可疑，但界面必须跟上 —— 没有这条，那一页只能每五秒重扫一次磁盘。
+    ClientsChanged { id: u64, at_ms: u64 },
+    /// 某家上游的熔断器开了或者合上了。
+    ///
+    /// **这是少数几个不挂在任何一次请求上的状态变化。**熔断是攒够三次
+    /// 连续失败之后的判断，而恢复更彻底 —— 「冷却到点了」纯粹是时间
+    /// 走到，没有任何调用触发它。
+    ///
+    /// 没有这条事件，界面想知道「哪家被熔断了」就只能轮询 `/overview`，
+    /// 而那是在一条本来完全空闲的连接上每两秒问一次同样的问题。
+    HealthChanged {
+        id: u64,
+        provider: String,
+        /// `open` = 熔断中，不进候选链；`closed` = 可以用
+        state: String,
+        at_ms: u64,
+    },
     /// 上游在响应头里报了订阅额度。
     ///
     /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
@@ -316,6 +338,8 @@ impl Event {
             | Event::QuotaSeen { id, .. }
             | Event::LeakSeen { id, .. }
             | Event::ScanAlert { id, .. }
+            | Event::ClientsChanged { id, .. }
+            | Event::HealthChanged { id, .. }
             | Event::Redacted { id, .. }
             | Event::ToolCallFlagged { id, .. }
             | Event::ResponseInspected { id, .. }

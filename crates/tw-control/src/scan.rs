@@ -17,6 +17,13 @@ use serde::Deserialize;
 
 use crate::ControlState;
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 把一条发现变成给界面看的样子。
 pub fn finding_view(f: &tw_scan::report::Finding) -> tw_api::ScanFinding {
     tw_api::ScanFinding {
@@ -152,6 +159,16 @@ pub fn spawn_watcher(
         seen.diff(&scan_now(&home).findings);
 
         while rx.recv().await.is_some() {
+            // **文件动了本身就是一条消息，和「可疑不可疑」无关。**接管
+            // 状态读的就是这几个文件（`ANTHROPIC_BASE_URL` 指向哪儿），
+            // 用户在编辑器里把它改回去一点都不可疑，但界面必须跟上。
+            // 没有这条，客户端那一页只能每五秒重扫一次磁盘。
+            let id = bus.next_id();
+            bus.emit(tw_api::Event::ClientsChanged {
+                id,
+                at_ms: now_ms(),
+            });
+
             // **每次重新枚举来源**：用户可能刚加了一个 skill，
             // 而那个文件在启动时还不存在
             let fresh = seen.diff(&scan_now(&home).findings);
@@ -163,10 +180,7 @@ pub fn spawn_watcher(
             bus.emit(tw_api::Event::ScanAlert {
                 id,
                 alerts: fresh.iter().map(finding_view).collect(),
-                at_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
+                at_ms: now_ms(),
             });
         }
     });
