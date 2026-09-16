@@ -450,6 +450,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
         cost_estimated: false,
         error: None,
         local: false,
+        cancelled: false,
         routing: None,
         billing: String::new(),
         cache_saved_micros: None,

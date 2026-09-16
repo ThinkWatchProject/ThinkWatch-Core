@@ -9,6 +9,7 @@ pub mod access;
 pub mod auth;
 pub mod bodies;
 pub mod clientprobe;
+pub mod ending;
 pub mod error;
 pub mod fixture;
 pub mod forward;
