@@ -13,6 +13,7 @@ tw-control = { workspace = true }
 tw-gateway = { workspace = true }
 tw-yaml = { workspace = true }
 tw-api = { workspace = true }
+tw-observe = { workspace = true }
 tw-store = { workspace = true }
 tw-pricing = { workspace = true }
 chrono = { workspace = true }
