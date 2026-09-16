@@ -615,6 +615,7 @@ async fn summary(
         cost_micros_exact: x.cost_micros_exact,
         cost_micros_estimated: x.cost_micros_estimated,
         unpriced_requests: x.unpriced_requests,
+        no_usage_requests: x.no_usage_requests,
         subscription_requests: x.subscription_requests,
         subscription_tokens: x.subscription_tokens,
         cache_saved_micros: x.cache_saved_micros,
@@ -1465,7 +1466,10 @@ fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {
         ended_ms: s.ended_ms as u64,
         turns: s.turns as u64,
         cost_micros: s.cost_micros,
+        cost_micros_estimated: s.cost_micros_estimated,
+        priced_turns: s.priced_turns as u64,
         unpriced_turns: s.unpriced_turns as u64,
+        no_usage_turns: s.no_usage_turns as u64,
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
         cache_read_tokens: s.cache_read_tokens,
@@ -1495,6 +1499,7 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
         duration_ms: t.duration_ms,
         error: t.error.clone(),
         cancelled: t.cancelled,
+        cost_estimated: t.cost_estimated,
     }
 }
 
