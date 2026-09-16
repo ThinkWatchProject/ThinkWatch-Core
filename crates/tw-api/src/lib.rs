@@ -205,6 +205,27 @@ pub enum Event {
         alerts: Vec<ScanFinding>,
         at_ms: u64,
     },
+    /// 这次请求花了多少钱 —— **在它跑完之后一小会儿才知道**。
+    ///
+    /// 价钱不在数据面的职责里：网关知道用了多少 token，而单价在存储层
+    /// 落库时才查价目表算出来。所以它是一条独立事件，而不是
+    /// `RequestFinished` 上的一个字段 —— 后者会要求网关依赖价目表，把
+    /// 「转发」挂到「计价」下面。
+    ///
+    /// 没有这条的话，界面想知道价钱就只能在请求结束之后回库里再查一遍。
+    ///
+    /// 三个值都可能是「算不出来」：上游没报用量、模型不在价目表里、
+    /// 或者那家是订阅计费 —— **那都不是零**。
+    RequestPriced {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micros: Option<i64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cost_estimated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_saved_micros: Option<i64>,
+        at_ms: u64,
+    },
     /// 客户端配置面上的文件动了 —— **不管改了什么**。
     ///
     /// 和 `ScanAlert` 是两件事。那条说的是「出现了可疑内容」，值得打断
@@ -338,6 +359,7 @@ impl Event {
             | Event::QuotaSeen { id, .. }
             | Event::LeakSeen { id, .. }
             | Event::ScanAlert { id, .. }
+            | Event::RequestPriced { id, .. }
             | Event::ClientsChanged { id, .. }
             | Event::HealthChanged { id, .. }
             | Event::Redacted { id, .. }

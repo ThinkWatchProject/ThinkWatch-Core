@@ -60,6 +60,14 @@ pub struct Recorder {
     /// 那不理想，但比把它持久化成第四份状态好：会话是个观测概念，不是
     /// 事实来源。
     sessions: HashMap<String, (String, i64)>,
+    /// 算完价钱之后往回报一条。
+    ///
+    /// **这一层是唯一知道价钱的地方** —— 网关只知道用了多少 token，
+    /// 单价在这里查价目表。不报的话，界面想知道花了多少就只能在请求
+    /// 结束之后回库里再查一遍。
+    ///
+    /// `None` 表示没人要听（测试、以及不带总线的调用方）。
+    bus: Option<tw_observe::EventBus>,
 }
 
 /// 多久查一次磁盘。
@@ -82,7 +90,14 @@ impl Recorder {
             sessions: HashMap::new(),
             level: DiskLevel::Ok,
             last_check_ms: 0,
+            bus: None,
         }
+    }
+
+    /// 把算出来的价钱报回总线上。
+    pub fn reporting_to(mut self, bus: tw_observe::EventBus) -> Self {
+        self.bus = Some(bus);
+        self
     }
 
     pub fn level(&self) -> DiskLevel {
@@ -278,6 +293,17 @@ impl Recorder {
                 } else {
                     None
                 };
+                // **算完就报，不等人来问。**这是整条链上唯一知道价钱的
+                // 地方，而界面上那一列金额在它到达之前只能是「—」。
+                if let Some(bus) = &self.bus {
+                    bus.emit(Event::RequestPriced {
+                        id: *id,
+                        cost_micros,
+                        cost_estimated: estimated,
+                        cache_saved_micros,
+                        at_ms: p.at_ms as u64,
+                    });
+                }
                 self.write(RequestRow {
                     id: *id as i64,
                     at_ms: p.at_ms,
@@ -415,7 +441,9 @@ impl Recorder {
             // 客户端配置面变了、某家上游熔断了 —— 都是「现在什么情况」，
             // 不是「刚才发生过什么」。这张表只装后者。
             | Event::ClientsChanged { .. }
-            | Event::HealthChanged { .. } => {}
+            | Event::HealthChanged { .. }
+            // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
+            | Event::RequestPriced { .. } => {}
             Event::ResponseInspected {
                 id,
                 tool_calls,
@@ -855,6 +883,70 @@ mod billing_tests {
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.unpriced_requests, 1);
         assert_eq!(s.subscription_requests, 0);
+    }
+}
+
+#[cfg(test)]
+mod pricing_report_tests {
+    use super::tests::{finished, rec, started};
+    use tw_api::UsageView;
+
+    /// **算完的价钱要报回去，不能等界面回头来问。**这一层是整条链上
+    /// 唯一知道单价的地方：网关只知道用了多少 token。不报的话，界面上
+    /// 那一列金额在请求结束之后只能靠再查一次库才填得上。
+    #[test]
+    fn the_price_goes_back_onto_the_bus() {
+        let (_d, mut r) = rec();
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        r = r.reporting_to(bus);
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                // 压在 200k 以下：超过之后走的是长上下文那档单价
+                input: 100_000,
+                output: 0,
+                ..Default::default()
+            }),
+        ));
+        let mut priced = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let tw_api::Event::RequestPriced {
+                id, cost_micros, ..
+            } = ev
+            {
+                priced = Some((id, cost_micros));
+            }
+        }
+        // Sonnet 4.5 输入 $3/M —— 十万 token 是 $0.30
+        assert_eq!(priced, Some((1, Some(300_000))));
+    }
+
+    /// **「算不出来」要原样报出去，不能报成零。**订阅制上游、价目表里
+    /// 没有的模型，都是这一档 —— 报 0 的话界面会画一个「免费」。
+    #[test]
+    fn an_unpriceable_request_reports_nothing_not_zero() {
+        let (_d, mut r) = rec();
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        r = r.reporting_to(bus);
+        r.on_event(&started(1, "某个中转站的模型"));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                input: 1000,
+                output: 10,
+                ..Default::default()
+            }),
+        ));
+        let mut priced = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let tw_api::Event::RequestPriced { cost_micros, .. } = ev {
+                priced = Some(cost_micros);
+            }
+        }
+        assert_eq!(priced, Some(None));
     }
 }
 
