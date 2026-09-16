@@ -77,9 +77,10 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageView>,
     },
-    /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表，
-    /// 另外多一个 `internal`：流在网关自己的代码里崩掉了。它只出现在这里
-    /// —— 那时响应头早就发出去了，没有哪个 HTTP 头还能带上它。
+    /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表
+    /// （`auth` / `config` / `upstream` / `request` / `overloaded` /
+    /// `rate_limited` / `denied`），另外多一个 `internal`：网关自己的代码
+    /// 崩掉了。它只出现在这里 —— 那时往往已经没有一个 HTTP 响应能带上它。
     RequestFailed {
         id: u64,
         source: String,
@@ -95,9 +96,14 @@ pub enum Event {
     /// **用量停在断开那一刻。**输入通常是齐的（`message_start` 在流的最
     /// 前面），输出多半不是 —— Anthropic 只在流的末尾报累计输出，之前手里
     /// 那个数是个占位。按它算出来的钱只能是估算，而且只会偏低。
+    ///
+    /// 客户端也可能在响应头到达之前就走了（非流式请求、慢的中转站），那时
+    /// 没有状态码、没有字节、也没有用量。
     RequestCancelled {
         id: u64,
-        status: u16,
+        /// 上游的响应头还没到就走了的，**没有状态码** —— 不是 0
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
         /// 断开之前从上游收到了多少字节
         bytes: u64,
         duration_ms: u64,
@@ -1678,7 +1684,7 @@ mod tests {
             },
             Event::RequestCancelled {
                 id: 7,
-                status: 200,
+                status: Some(200),
                 bytes: 1,
                 duration_ms: 1,
                 usage: None,
@@ -1694,7 +1700,7 @@ mod tests {
     fn a_cancellation_carries_the_usage_seen_so_far() {
         let e = Event::RequestCancelled {
             id: 3,
-            status: 200,
+            status: Some(200),
             bytes: 512,
             duration_ms: 2400,
             usage: Some(UsageView {
@@ -1712,15 +1718,17 @@ mod tests {
             Event::RequestCancelled { usage: Some(u), .. } if u.input == 5000
         ));
 
+        // 响应头之前就走了的：状态码和用量都不出现，不是 0
         let none = Event::RequestCancelled {
             id: 4,
-            status: 200,
+            status: None,
             bytes: 0,
             duration_ms: 10,
             usage: None,
         };
         let v = serde_json::to_value(&none).unwrap();
         assert!(v.get("usage").is_none(), "{v}");
+        assert!(v.get("status").is_none(), "{v}");
     }
 
     #[test]

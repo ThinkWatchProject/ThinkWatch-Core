@@ -1,19 +1,24 @@
-//! 一个响应体怎么收场。
+//! 一个请求怎么收场。
 //!
-//! 流式响应的结局只能由流自己来报 —— handler 在第一个字节发出去之前就
-//! 已经返回了。跑完了报 `RequestFinished`，上游断了或者被防火墙切断报
-//! `RequestFailed`，这两种都走得到流的末尾。
+//! 发出 `RequestStarted` 的那一刻起，这个请求就欠总线一个结局：跑完了是
+//! `RequestFinished`，出错了是 `RequestFailed`，客户端先走了是
+//! `RequestCancelled`。**恰好一个** —— 少一个，存储层永远等不到它：那一行
+//! 不落库，上游已经计的费从账上消失，界面上那一行也永远停在「进行中」；
+//! 多一个，同一行会被写两遍。
 //!
-//! **第三种走不到。**客户端先走了（Claude Code 里按一下 Esc），hyper 丢掉
-//! 响应体，流停在它当时等着的那个 await 上被整个丢掉，末尾的代码一行都
-//! 不会执行。可那一刻上游已经在计费了：输入全额，输出算到断开为止。什么
-//! 都不报的话，存储层永远等不到这个请求的结局 —— 它不落库，那笔钱就从账
-//! 上消失了，界面上那一行也永远停在「进行中」。
+//! 难的是第三种，它**走不到任何一行报结局的代码**。客户端断开时，hyper 把
+//! 手上的东西整个丢掉 —— 响应头还没到时丢的是 handler 的 future，流式
+//! 响应已经开始时丢的是响应体 —— 它们停在当时等着的那个 await 上，后面的
+//! 代码一行都不会执行。
 //!
-//! 所以结局挂在一个跟着流走的对象上（和 [`crate::live::Pass`] 同一个
+//! 所以结局挂在一个跟着请求走的对象上（和 [`crate::live::Pass`] 同一个
 //! 做法）：正常收尾时显式地报，没报就被丢掉的，由 Drop 替它报「客户端
-//! 取消」。一个请求因此**恰好有一个结局** —— 少一个是一条永远不落库的
-//! 记录，多一个是同一行被写两遍。
+//! 取消」。它先待在 handler 里（等响应头的那一段），拿到响应头之后交给
+//! 响应体；WebSocket 那条路上交给升级之后的连接。
+//!
+//! **Drop 只能代表「被丢掉」。**所以 handler 里返回错误的路径一条都不能
+//! 让它自己掉在地上 —— 那由 `server::passthrough` 统一按返回的错误报成
+//! 失败，理由写在那儿。
 
 use std::time::Instant;
 
@@ -22,18 +27,20 @@ use crate::usage::{Sniffer, Usage};
 
 /// 一个还欠着结局的请求。
 ///
-/// **到目前为止对响应知道的一切都在它身上**：收到多少字节、嗅到多少用量、
-/// 攒下的响应体。放在一处是因为结局要用的正是这些 —— 不管这个结局是走到
-/// 流的末尾报的，还是在 Drop 里报的。
+/// **到目前为止对响应知道的一切都在它身上**：状态码、收到多少字节、嗅到
+/// 多少用量、攒下的响应体。放在一处是因为结局要用的正是这些 —— 不管这个
+/// 结局是显式报的，还是在 Drop 里报的。
 #[must_use = "丢掉它就等于报告客户端已经走了"]
 pub struct Ending {
     bus: tw_observe::EventBus,
     id: u64,
-    status: u16,
     started: Instant,
     /// 请求开始的时刻。响应体按它归档，和请求体那一份对得上
     at_ms: i64,
     sink: Option<BodySender>,
+    /// 上游的响应头。**没到的时候客户端就走了的，没有状态码可报** —— 那时
+    /// 报一个 0 或者 499，都是在编
+    status: Option<u16>,
     /// 从上游收到多少字节。**数的是上游原话**，不是还原、翻译之后的那版
     bytes: u64,
     /// 旁路嗅探。客户端走掉那一刻手里有多少用量，靠的就是它
@@ -47,7 +54,6 @@ impl Ending {
     pub fn new(
         bus: tw_observe::EventBus,
         id: u64,
-        status: u16,
         started: Instant,
         at_ms: i64,
         sink: Option<BodySender>,
@@ -55,15 +61,20 @@ impl Ending {
         Self {
             bus,
             id,
-            status,
             started,
             at_ms,
             sink,
+            status: None,
             bytes: 0,
             sniffer: Sniffer::new(),
             tap: ResponseTap::new(),
             told: false,
         }
+    }
+
+    /// 上游的响应头到了。从这里起，客户端再走掉，报出去的取消带着状态码。
+    pub fn responded(&mut self, status: u16) {
+        self.status = Some(status);
     }
 
     /// 上游来了一块。**这里看的是上游原话**（带占位符的那一版）：usage
@@ -74,20 +85,31 @@ impl Ending {
         self.tap.feed(chunk);
     }
 
-    /// 流走到了末尾。
-    pub fn finished(mut self) {
+    /// 只数字节，不嗅用量、不留档。
+    ///
+    /// WebSocket 那条路用它。一条连接上跑着好几轮回答，每轮各报一次用量，
+    /// 而嗅探器是「每个字段取最大值」—— 喂给它，得到的是其中某一轮的数，
+    /// 看起来却像整条连接的；模型名也不知道（升级请求里没有），算不了钱。
+    /// **与其报一个错的数，不如说没有。**
+    pub fn count(&mut self, bytes: usize) {
+        self.bytes += bytes as u64;
+    }
+
+    /// 走完了。
+    pub fn finished(mut self, status: u16) {
+        self.status = Some(status);
         let usage = self.settle();
         self.bus.emit(tw_api::Event::RequestFinished {
             id: self.id,
-            status: self.status,
+            status,
             bytes: self.bytes,
             duration_ms: self.duration_ms(),
             usage,
         });
     }
 
-    /// 流断了，或者被切断了。**响应头早就发出去了**，这条事件是界面上
-    /// 那一行唯一能知道它失败了的途径。
+    /// 失败了：上游不行、策略不让、流断了或者被切断了。`source` 用
+    /// `x-thinkwatch-error` 那个词表。
     pub fn failed(mut self, source: &str, message: String) {
         self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
@@ -130,13 +152,13 @@ impl Drop for Ending {
         // 再 panic 一次，整个进程就没了。下面每一步都是不会失败的那种：
         // 往通道里 try_send、往广播里 send、读一下时钟。
         let usage = self.settle();
-        // 流是在网关自己的代码里崩掉的。**记成取消会冤枉客户端** ——
-        // 排查的人会去问一个根本没做过这件事的客户端。
+        // 是网关自己的代码崩掉了。**记成取消会冤枉客户端** —— 排查的人
+        // 会去问一个根本没做过这件事的客户端。
         if std::thread::panicking() {
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
                 source: "internal".to_string(),
-                message: "流中断：网关内部出错".to_string(),
+                message: "请求中断：网关内部出错".to_string(),
             });
             return;
         }
@@ -170,8 +192,11 @@ mod tests {
     const MESSAGE_START: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5000,\"cache_read_input_tokens\":4000,\"output_tokens\":1}}}\n\n";
     const MESSAGE_DELTA: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":777}}\n\n";
 
-    fn ending(bus: &tw_observe::EventBus) -> Ending {
-        Ending::new(bus.clone(), 7, 200, Instant::now(), 1_000, None)
+    /// 一个响应头已经到了的请求。
+    fn responding(bus: &tw_observe::EventBus) -> Ending {
+        let mut e = Ending::new(bus.clone(), 7, Instant::now(), 1_000, None);
+        e.responded(200);
+        e
     }
 
     /// 总线上此刻有的全部事件。
@@ -185,10 +210,10 @@ mod tests {
     fn a_stream_that_reaches_its_end_is_finished_and_nothing_else() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        let mut e = ending(&bus);
+        let mut e = responding(&bus);
         e.feed(MESSAGE_START);
         e.feed(MESSAGE_DELTA);
-        e.finished();
+        e.finished(200);
 
         let got = drain(&mut rx);
         assert_eq!(got.len(), 1, "{got:?}");
@@ -211,7 +236,7 @@ mod tests {
     fn a_stream_that_broke_is_failed_and_nothing_else() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        let mut e = ending(&bus);
+        let mut e = responding(&bus);
         e.feed(MESSAGE_START);
         e.failed("upstream", "流中断：上游断开了".into());
 
@@ -226,11 +251,12 @@ mod tests {
     /// **这条是这个类型存在的理由。**没有人报结局就被丢掉的流，是客户端
     /// 先走了 —— 而上游已经为它看到的那些 token 计了费。
     #[test]
-    fn dropped_before_its_end_it_reports_a_cancellation_with_what_it_saw() {
+    fn dropped_mid_stream_it_reports_a_cancellation_with_what_it_saw() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let (tx, mut bodies) = tokio::sync::mpsc::channel(4);
-        let mut e = Ending::new(bus.clone(), 7, 200, Instant::now(), 1_000, Some(tx));
+        let mut e = Ending::new(bus.clone(), 7, Instant::now(), 1_000, Some(tx));
+        e.responded(200);
         e.feed(MESSAGE_START);
         drop(e);
 
@@ -239,7 +265,7 @@ mod tests {
         match &got[0] {
             Event::RequestCancelled {
                 id: 7,
-                status: 200,
+                status: Some(200),
                 bytes,
                 usage: Some(u),
                 ..
@@ -257,23 +283,46 @@ mod tests {
         assert_eq!(body.at_ms, 1_000);
     }
 
-    /// 客户端在第一帧之前就走了。**没有用量就是 None，不是零** —— 零会让
-    /// 一次真实的调用看起来是免费的。
+    /// 响应头还没到，客户端就走了。**没有状态码，也没有用量** —— 两个都是
+    /// None，不是 0：0 会让一次真实的调用看起来是免费的，状态码 0 则是编的。
     #[test]
-    fn dropped_before_the_first_chunk_it_reports_no_usage_rather_than_zero() {
+    fn dropped_before_the_response_headers_it_reports_neither_a_status_nor_usage() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        drop(ending(&bus));
+        drop(Ending::new(bus.clone(), 7, Instant::now(), 1_000, None));
 
         let got = drain(&mut rx);
         assert!(
             matches!(
                 got.as_slice(),
                 [Event::RequestCancelled {
+                    status: None,
                     bytes: 0,
                     usage: None,
                     ..
                 }]
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// WebSocket 那条路只数字节。**帧里的 usage 不能被嗅成整条连接的用量**
+    /// —— 那是某一轮的数。
+    #[test]
+    fn counting_bytes_does_not_turn_frames_into_usage() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = Ending::new(bus.clone(), 7, Instant::now(), 1_000, None);
+        e.responded(101);
+        e.count(MESSAGE_START.len());
+        e.finished(101);
+
+        let got = drain(&mut rx);
+        assert!(
+            matches!(
+                got.as_slice(),
+                [Event::RequestFinished { status: 101, bytes, usage: None, .. }]
+                    if *bytes == MESSAGE_START.len() as u64
             ),
             "{got:?}"
         );
@@ -288,7 +337,7 @@ mod tests {
     fn a_stream_that_panics_is_not_blamed_on_the_client() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        let e = ending(&bus);
+        let e = responding(&bus);
         let s = async_stream::stream! {
             let mut e = e;
             e.feed(MESSAGE_START);
