@@ -106,6 +106,9 @@ struct Pipes {
 ///
 /// 路由、鉴权、`guard` 合并都在调用方做完了 —— 这里只负责把两条流
 /// 接起来，并且**在每一帧上重新点一遍管线的保护**。
+///
+/// **这条连接怎么断的，就是这个请求的结局**（`ending`）。每一条收场的
+/// 路径都先报结局、再去关连接：关连接要等对面，而对面可能已经不在了。
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy(
     state: AppState,
@@ -117,6 +120,7 @@ pub async fn proxy(
     guard: tw_engine::Guard,
     rules: Arc<tw_scan::rules::Rules>,
     id: u64,
+    ending: crate::ending::Ending,
 ) {
     let mut req =
         match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
@@ -124,7 +128,9 @@ pub async fn proxy(
         ) {
             Ok(r) => r,
             Err(e) => {
-                close_with(client, &format!("上游地址不是合法的 WS 地址：{e}")).await;
+                let why = format!("上游地址不是合法的 WS 地址：{e}");
+                ending.failed("config", why.clone());
+                close_with(client, &why).await;
                 return;
             }
         };
@@ -135,7 +141,9 @@ pub async fn proxy(
                 req.headers_mut().insert(name, v);
             }
             Err(_) => {
-                close_with(client, "这家的密钥里有不能放进请求头的字符").await;
+                let why = "这家的密钥里有不能放进请求头的字符";
+                ending.failed("config", why.to_string());
+                close_with(client, why).await;
                 return;
             }
         }
@@ -143,7 +151,9 @@ pub async fn proxy(
     let up = match dial(&upstream_url, req).await {
         Ok(x) => x,
         Err(e) => {
-            close_with(client, &format!("连不上上游的 WebSocket：{e}")).await;
+            let why = format!("连不上上游的 WebSocket：{e}");
+            ending.failed("upstream", why.clone());
+            close_with(client, &why).await;
             return;
         }
     };
@@ -164,7 +174,7 @@ pub async fn proxy(
         provider: provider.name.clone(),
         id,
     };
-    pump(state, client, up, &mut p).await;
+    pump(state, client, up, &mut p, ending).await;
 }
 
 /// 建连。
@@ -214,14 +224,31 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 type Stream = tokio_tungstenite::WebSocketStream<Box<dyn Io>>;
 
-async fn pump(state: AppState, client: WebSocket, up: Stream, p: &mut Pipes) {
+/// 一条连接是怎么断的。
+enum End {
+    /// 有一边收场了：发了关闭帧，或者把连接收掉了。**客户端那一边怎么走
+    /// 都算这一种** —— 一次会话就是由客户端结束的，那是正常收场
+    Closed,
+    /// 上游那边出错断了，或者写不过去了
+    Broke(String),
+    /// 上游返回了高危工具调用，被切断了
+    Cut(String),
+}
+
+async fn pump(
+    state: AppState,
+    client: WebSocket,
+    up: Stream,
+    p: &mut Pipes,
+    mut ending: crate::ending::Ending,
+) {
     let (mut c_tx, mut c_rx) = client.split();
     let (mut u_tx, mut u_rx) = up.split();
-    loop {
+    let end = loop {
         tokio::select! {
             // 客户端 → 上游：**和普通请求同一个脱敏函数**
             msg = c_rx.next() => {
-                let Some(Ok(m)) = msg else { break };
+                let Some(Ok(m)) = msg else { break End::Closed };
                 let out = match m {
                     Message::Text(t) => {
                         let r = tw_redact::redact::redact_into(
@@ -254,19 +281,33 @@ async fn pump(state: AppState, client: WebSocket, up: Stream, p: &mut Pipes) {
                     Message::Binary(b) => UpMsg::Binary(b),
                     Message::Ping(b) => UpMsg::Ping(b),
                     Message::Pong(b) => UpMsg::Pong(b),
-                    Message::Close(_) => break,
+                    Message::Close(_) => break End::Closed,
                 };
-                if u_tx.send(out).await.is_err() { break }
+                if let Err(e) = u_tx.send(out).await {
+                    break End::Broke(format!("写给上游失败：{e}"));
+                }
             }
             // 上游 → 客户端：先还原占位符，再过工具墙
             msg = u_rx.next() => {
-                let Some(Ok(m)) = msg else { break };
+                let m = match msg {
+                    Some(Ok(m)) => m,
+                    // 上游把连接收掉了，没有关闭帧也算收场
+                    None => break End::Closed,
+                    Some(Err(e)) => break End::Broke(format!("上游连接中断：{e}")),
+                };
                 let out = match m {
                     UpMsg::Text(t) => {
                         let restored = tw_redact::redact::restore(t.as_str(), &p.ledger);
                         let hits = p.wall.feed(as_sse(&restored).as_bytes());
                         let mut deadly = false;
+                        let mut why = String::new();
                         for h in &hits {
+                            if h.high && p.cut && !deadly {
+                                why = format!(
+                                    "`{}` 返回的 `{}` 调用命中「{}」（{}），已切断连接。这个上游标记为不受信任。",
+                                    p.provider, h.tool, h.rule, h.why
+                                );
+                            }
                             deadly |= h.high && p.cut;
                             state.bus.emit(tw_api::Event::ToolCallFlagged {
                                 id: p.id,
@@ -286,19 +327,30 @@ async fn pump(state: AppState, client: WebSocket, up: Stream, p: &mut Pipes) {
                             let _ = c_tx.send(Message::Text(
                                 "[ThinkWatch] 上游返回了一个高危工具调用，这条连接已切断。".into(),
                             )).await;
-                            break;
+                            break End::Cut(why);
                         }
+                        ending.count(restored.len());
                         Message::Text(restored.into())
                     }
-                    UpMsg::Binary(b) => Message::Binary(b),
+                    UpMsg::Binary(b) => {
+                        ending.count(b.len());
+                        Message::Binary(b)
+                    }
                     UpMsg::Ping(b) => Message::Ping(b),
                     UpMsg::Pong(b) => Message::Pong(b),
-                    UpMsg::Close(_) => break,
+                    UpMsg::Close(_) => break End::Closed,
                     UpMsg::Frame(_) => continue,
                 };
-                if c_tx.send(out).await.is_err() { break }
+                // 发不给客户端，就是客户端已经走了
+                if c_tx.send(out).await.is_err() { break End::Closed }
             }
         }
+    };
+    // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了
+    match end {
+        End::Closed => ending.finished(101),
+        End::Broke(why) => ending.failed("upstream", why),
+        End::Cut(why) => ending.failed("denied", why),
     }
     let _ = c_tx.close().await;
     let _ = u_tx.close().await;
