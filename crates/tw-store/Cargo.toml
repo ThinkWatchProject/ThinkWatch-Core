@@ -9,6 +9,7 @@ description = "Request history and runtime state on SQLite and the filesystem"
 
 [dependencies]
 tw-api = { workspace = true }
+tw-observe = { workspace = true }
 tw-pricing = { workspace = true }
 bytes = { workspace = true }
 rusqlite = { workspace = true }

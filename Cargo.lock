@@ -3042,6 +3042,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tw-api",
+ "tw-observe",
  "tw-pricing",
 ]
 
@@ -3081,6 +3082,7 @@ dependencies = [
  "tw-config",
  "tw-control",
  "tw-gateway",
+ "tw-observe",
  "tw-pricing",
  "tw-scan",
  "tw-secret",

@@ -668,7 +668,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
-        let store = build_store(&dir, state.bus.subscribe(), body_rx);
+        let store = build_store(&dir, state.bus.clone(), body_rx);
         if store.is_some() {
             state.set_body_sink(body_tx);
         }
@@ -795,9 +795,12 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 /// 处理方式是「不转发了」。
 fn build_store(
     dir: &Path,
-    events: tokio::sync::broadcast::Receiver<tw_api::Event>,
+    // **收整条总线，不只是一个订阅端。**存储层算完价钱要往回报一条
+    // （见 `Event::RequestPriced`）—— 它是这条链上唯一知道单价的地方。
+    bus: tw_observe::EventBus,
     bodies: tokio::sync::mpsc::Receiver<tw_gateway::BodyRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
+    let events = bus.subscribe();
     let db = match tw_store::Db::open(&dir.join("data.db")) {
         Ok(db) => db,
         Err(e) => {
@@ -839,7 +842,9 @@ fn build_store(
         }
     });
     Some(tw_store::task::spawn(
-        tw_store::Recorder::new(db, blobs, prices),
+        // 算完价钱往回报一条 —— 见 `Event::RequestPriced`。这里是唯一
+        // 同时看得见总线和存储层的地方，所以接线在这儿完成。
+        tw_store::Recorder::new(db, blobs, prices).reporting_to(bus),
         events,
         rx,
     ))
