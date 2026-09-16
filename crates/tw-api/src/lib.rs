@@ -85,6 +85,20 @@ pub enum Event {
         id: u64,
         source: String,
         message: String,
+        /// 失败之前从上游收到了多少字节。**响应头都没到的没有**
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
+        /// 从请求进来到失败用了多久。「试过三家、二十秒后放弃」和「立刻被拒」
+        /// 是两件事
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// 失败之前嗅到的用量。
+        ///
+        /// **流断在中间、或者被防火墙切断时，上游已经为它计了费** —— 输入
+        /// 全额，输出算到断开为止。不带上它，那笔钱就不在账上。和取消一样，
+        /// 按它算出来的钱只能是估算。响应头之前就失败的没有用量。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<UsageView>,
     },
     /// 客户端没等到响应结束就走了（Claude Code 里按一下 Esc）。
     ///
@@ -1681,6 +1695,9 @@ mod tests {
                 id: 7,
                 source: "upstream".into(),
                 message: "x".into(),
+                bytes: None,
+                duration_ms: None,
+                usage: None,
             },
             Event::RequestCancelled {
                 id: 7,

@@ -71,7 +71,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return
         if b'"stream":true' in body:
             frames = (
-              'event: message_start\ndata: {"type":"message_start","message":{"id":"m"}}\n\n'
+              'event: message_start\ndata: {"type":"message_start","message":{"id":"m",'
+              '"usage":{"input_tokens":2345,"output_tokens":1}}}\n\n'
               'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
               '"content_block":{"type":"tool_use","id":"t","name":"Bash"}}\n\n'
               'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
@@ -259,6 +260,22 @@ S=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoket
       -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}')
 echo "$S" | grep -q 'event: error' && ok "高危工具调用被切断了" || bad "没切断" "$S"
 echo "$S" | grep -q 'content_block_stop' && bad "切断之后还发了 content_block_stop" || ok "客户端拿到的工具调用是残的"
+# **切断之前上游已经为输入计了费。**这一行要带着那笔钱落库 —— 以前失败的
+# 行一律没有用量，这笔钱就不在账上。
+GOT=""
+for _ in $(seq 1 20); do
+  GOT=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+          | python3 -c 'import sys, json
+rows = json.load(sys.stdin)
+r = rows[0] if rows else {}
+good = ("已切断" in (r.get("error") or "") and r.get("input_tokens") == 2345
+        and r.get("cost_micros") is not None and r.get("cost_estimated") is True)
+print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/dev/null)
+  [ "$GOT" = "ok" ] && break
+  sleep 0.25
+done
+[ "$GOT" = "ok" ] && ok "被切断的请求落了库：带着切断之前的输入用量和估算金额" \
+  || bad "被切断的请求没有带着用量落库" "$GOT"
 
 # 客户端中途走掉（Claude Code 里按 Esc）。
 #
