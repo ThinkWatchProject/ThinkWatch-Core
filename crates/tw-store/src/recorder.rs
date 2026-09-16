@@ -40,10 +40,11 @@ struct Partial {
 
 /// 在飞的请求最多攒多少条。
 ///
-/// **一个只发了 `RequestStarted` 就再也没有下文的请求会永远占着位置**
-/// —— 进程被杀、上游把连接挂着不放、客户端在响应头到达之前就走了，都会
-/// 造成它。（响应头之后才走的那些会报 `RequestCancelled`，不在此列。）超了
-/// 从最老的开始丢：丢掉的是一条观测记录，而留着它们会慢慢吃掉内存。
+/// **一个只发了 `RequestStarted` 就再也没有下文的请求会一直占着位置。**
+/// 网关给每个开始了的请求都报一个结局（见 `tw_gateway::ending`），所以
+/// 剩下的来源是结局还没来得及发出去进程就没了，以及上游把连接挂着不放、
+/// 客户端又一直在等的那些 —— 它们迟早有结局，只是可能很久。超了从最老的
+/// 开始丢：丢掉的是一条观测记录，而留着它们会慢慢吃掉内存。
 const MAX_INFLIGHT: usize = 4096;
 
 pub struct Recorder {
@@ -254,7 +255,7 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
-            } => self.settle(*id, *status, *bytes, *duration_ms, *usage, false),
+            } => self.settle(*id, Some(*status), *bytes, *duration_ms, *usage, false),
             /*
                 客户端没等到响应结束就走了。
 
@@ -401,7 +402,8 @@ impl Recorder {
     fn settle(
         &mut self,
         id: u64,
-        status: u16,
+        // 响应头之前客户端就走了的，没有状态码
+        status: Option<u16>,
         bytes: u64,
         duration_ms: u64,
         usage: Option<tw_api::UsageView>,
@@ -473,7 +475,7 @@ impl Recorder {
             provider: p.provider,
             model: p.model,
             path: p.path,
-            status: Some(status),
+            status: status.or(p.status),
             ttfb_ms: p.ttfb_ms,
             duration_ms: Some(duration_ms as i64),
             bytes: Some(bytes as i64),
@@ -783,7 +785,7 @@ mod tests {
 
     #[test]
     fn requests_that_never_finish_do_not_grow_the_map_without_bound() {
-        // 进程被杀、上游把连接挂着不放、客户端在响应头之前就走了，都会造成它。
+        // 结局没来得及发出去进程就没了，或者上游把连接挂着不放。
         let (_d, mut r) = rec();
         for i in 0..(MAX_INFLIGHT + 100) as u64 {
             r.on_event(&started(i, "m"));
@@ -1118,7 +1120,7 @@ mod cancellation_tests {
     fn cancelled(id: u64, usage: Option<UsageView>) -> Event {
         Event::RequestCancelled {
             id,
-            status: 200,
+            status: Some(200),
             bytes: 312,
             duration_ms: 2_500,
             usage,
@@ -1220,6 +1222,27 @@ mod cancellation_tests {
         assert!(row.cancelled);
         assert_eq!(row.input_tokens, None);
         assert_eq!(row.cost_micros, None);
+    }
+
+    /// 响应头还没到客户端就走了（非流式请求、慢的中转站）。**没有状态码**
+    /// —— 不是 0，也不是随手编一个 499；耗时倒是真的，那是它等了多久。
+    #[test]
+    fn a_cancellation_before_the_response_headers_has_no_status() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestCancelled {
+            id: 1,
+            status: None,
+            bytes: 0,
+            duration_ms: 12_000,
+            usage: None,
+        });
+
+        let row = r.db().get(1).unwrap().expect("响应头之前的取消也该落库");
+        assert!(row.cancelled);
+        assert_eq!(row.status, None);
+        assert_eq!(row.duration_ms, Some(12_000));
+        assert_eq!(row.error, None);
     }
 
     /// 会话里的那一轮也要看得出是取消的。否则在每轮花费里，它就是一轮

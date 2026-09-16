@@ -563,6 +563,7 @@ async fn ws_upgrade(
     uri: axum::http::Uri,
     query: Option<String>,
     headers: HeaderMap,
+    started: std::time::Instant,
     live: crate::live::Pass,
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
@@ -615,6 +616,10 @@ async fn ws_upgrade(
         path: uri.path().to_string(),
         at_ms: now_ms(),
     });
+    // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成
+    // 就被丢掉的 —— 客户端没等到 101 就走了 —— 由 Drop 报成取消。WS 帧
+    // 不留档，所以没有 body 的去处
+    let ending = crate::ending::Ending::new(state.bus.clone(), id, started, now_ms() as i64, None);
     let provider = provider.clone();
     let guard = decision.guard.clone();
     let rules = rt.rules.clone();
@@ -622,7 +627,12 @@ async fn ws_upgrade(
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久
         let _live = live;
-        crate::ws::proxy(state, sock, url, key, protocol, provider, guard, rules, id).await;
+        let mut ending = ending;
+        ending.responded(101);
+        crate::ws::proxy(
+            state, sock, url, key, protocol, provider, guard, rules, id, ending,
+        )
+        .await;
     }))
 }
 
@@ -753,16 +763,36 @@ async fn passthrough(
     // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
     // 升级要的是那条连接，而 `Bytes` 会把它读干净。
     if let Some(ws) = upgrade.filter(|_| crate::ws::is_upgrade(&headers)) {
-        return ws_upgrade(state, rt, ws, client_name, uri, query, headers, live).await;
+        return ws_upgrade(
+            state,
+            rt,
+            ws,
+            client_name,
+            uri,
+            query,
+            headers,
+            started,
+            live,
+        )
+        .await;
     }
     // 从这里往下，所有错误都要用客户端自己那套结构回。
     // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
     // 的，只能退回 Anthropic 形状，而那是桌面版的主用例。
     let dialect = crate::error::Dialect::from_key_position(position);
-    // **在一个地方给方言，而不是在每个 return 点。**后者只要漏一处，
-    // 那条路径上的客户端就会收到一个它解析不了的 body，而那个失败看
-    // 起来和真实原因毫无关系。
-    pipeline(
+    //
+    // 这个请求的结局（见 `crate::ending`）。**管线发出开始事件时把它放
+    // 进来。**
+    //
+    // 它待在这一层而不是管线里面，是因为只有这里分得清两件事：管线**返回
+    // 了**一个错误，和管线**被丢掉了**。前者是失败，按返回的错误报；后者
+    // 是客户端在响应头到达之前就走了 —— hyper 丢掉整个 handler，这个变量
+    // 跟着被丢掉，由 Drop 报成取消。
+    //
+    // 交给管线里每一条 `return Err` 各自去报的话，漏掉一条的后果不是没报，
+    // 而是被 Drop 报成「客户端取消」—— 一次策略拒绝会记到客户端头上。
+    let mut ending: Option<crate::ending::Ending> = None;
+    let result = pipeline(
         state,
         rt,
         uri,
@@ -773,9 +803,21 @@ async fn passthrough(
         position,
         started,
         live,
+        &mut ending,
     )
-    .await
-    .map_err(|e| e.in_dialect(dialect))
+    .await;
+    if let Some(end) = ending.take() {
+        match &result {
+            Err(e) => end.failed(e.source.slug(), e.message.clone()),
+            // 成功的路径都把结局交给了响应体，**走到这里是漏交了**。那也只能
+            // 按拿到的状态码报结束 —— 不能让它掉在地上，被记成一次取消
+            Ok(resp) => end.finished(resp.status().as_u16()),
+        }
+    }
+    // **在一个地方给方言，而不是在每个 return 点。**后者只要漏一处，
+    // 那条路径上的客户端就会收到一个它解析不了的 body，而那个失败看
+    // 起来和真实原因毫无关系。
+    result.map_err(|e| e.in_dialect(dialect))
 }
 
 /// 熔断状态变了就报一条，没变什么都不做。
@@ -841,6 +883,7 @@ async fn pipeline(
     position: crate::auth::KeyPosition,
     started: std::time::Instant,
     live: crate::live::Pass,
+    ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
     forward::check_body_size(&body, MAX_BODY)?;
 
@@ -1054,6 +1097,17 @@ async fn pipeline(
         path: uri.path().to_string(),
         at_ms: now_ms(),
     });
+    // **发了开始，就欠一个结局。**从这一行起，这里返回的错误由调用方报成
+    // 失败，这个 future 被丢掉由 Drop 报成取消（见 `passthrough`）。
+    let sink = state.body_sink();
+    let at_ms = now_ms() as i64;
+    *ending = Some(crate::ending::Ending::new(
+        state.bus.clone(),
+        id,
+        started,
+        at_ms,
+        sink.clone(),
+    ));
 
     // 出站密钥检测（观察态）。**只看，不动** —— 换成占位符是
     // 「拦截」态的事，而那要等那套完整的脱敏。
@@ -1075,8 +1129,6 @@ async fn pipeline(
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
     // 整个解析的，所以本来就在）。
-    let sink = state.body_sink();
-    let at_ms = now_ms() as i64;
     crate::bodies::offer(
         &sink,
         crate::bodies::BodyRecord {
@@ -1307,13 +1359,10 @@ async fn pipeline(
         if attempts.len() > 1 {
             err.message = format!("{}（试过：{}）", err.message, attempts.join(" → "));
         }
-        // 失败也必须发事件。少了它，UI 上那一行会永远停在「进行中」——
-        // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
-        state.bus.emit(tw_api::Event::RequestFailed {
-            id,
-            source: "upstream".to_string(),
-            message: err.message.clone(),
-        });
+        // 失败也必须有结局。少了它，UI 上那一行会永远停在「进行中」——
+        // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。它由
+        // `passthrough` 按这里返回的错误报出去，带着上面那串尝试链，
+        // `source` 也是这个错误自己的（被限流的就是 `rate_limited`）。
         return Err(err);
     };
     if attempts.len() > 1 {
@@ -1383,7 +1432,8 @@ async fn pipeline(
     //
     // **结局跟着流走，而不是只写在流的末尾。**客户端中途走掉时，末尾的
     // 代码一行都不会执行，而上游已经为这次请求计了费（见 `crate::ending`）。
-    let ending = crate::ending::Ending::new(bus.clone(), id, status.as_u16(), started, at_ms, sink);
+    let mut ending = ending.take().expect("发出开始事件时就放进去了");
+    ending.responded(status.as_u16());
     let chunks = upstream.bytes_stream();
     // **中途断掉不能只是让流消失。**首字节已经发出去了，状态码和响应头
     // 都改不了，而一个戛然而止的 SSE 流和一个正常结束的流在客户端看来
@@ -1552,7 +1602,7 @@ async fn pipeline(
         // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
         // 东西，分开写就会有一种漏掉
         match broke {
-            None => ending.finished(),
+            None => ending.finished(status.as_u16()),
             Some(err) => {
                 // 少了这个事件，UI 上那一行会永远停在「进行中」——
                 // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。

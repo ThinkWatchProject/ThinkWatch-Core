@@ -36,7 +36,8 @@ pub enum Source {
 }
 
 impl Source {
-    fn slug(&self) -> &'static str {
+    /// `x-thinkwatch-error` 头和 `RequestFailed.source` 共用的词表。
+    pub fn slug(&self) -> &'static str {
         match self {
             Source::Auth => "auth",
             Source::Config => "config",
