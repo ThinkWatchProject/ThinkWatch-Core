@@ -280,6 +280,8 @@ pub struct AppState {
     /// 忽略通知，包括那些真该看的。失败不一样：它要一直挂着，
     /// 而且从成功变成失败是**状态变了**，必须重新说。
     rotation_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 正在服务中的请求数。见 [`crate::live`]。
+    pub live: crate::live::Live,
 }
 
 impl AppState {
@@ -314,6 +316,7 @@ impl AppState {
             )),
             rotation_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
+            live: crate::live::Live::default(),
         })
     }
 
@@ -551,6 +554,7 @@ pub fn router(state: AppState) -> Router {
 /// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、`guard`、
 /// 熔断对它一样有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
 /// 每一帧上重新点一遍管线的保护。
+#[allow(clippy::too_many_arguments)]
 async fn ws_upgrade(
     state: AppState,
     rt: Arc<Runtime>,
@@ -559,6 +563,7 @@ async fn ws_upgrade(
     uri: axum::http::Uri,
     query: Option<String>,
     headers: HeaderMap,
+    live: crate::live::Pass,
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
     // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道
@@ -615,6 +620,8 @@ async fn ws_upgrade(
     let rules = rt.rules.clone();
     let protocol = provider.effective_protocol();
     Ok(ws.on_upgrade(move |sock| async move {
+        // 一条 WS 连接活多久，这个请求就算在服务中多久
+        let _live = live;
         crate::ws::proxy(state, sock, url, key, protocol, provider, guard, rules, id).await;
     }))
 }
@@ -723,6 +730,9 @@ async fn passthrough(
     body: Bytes,
 ) -> Result<Response, GatewayError> {
     let started = std::time::Instant::now();
+    // 从这一刻起它就算「在服务中」。**排队等并发名额的也算** —— 那时客户
+    // 端的连接已经开着在等了，这时候重启网关一样会让它失败。
+    let live = state.live.enter();
     // **整个请求只取一次运行时。**中途重新取会让一个请求跨在两份配置
     // 上：按新规则选了 provider，却拿旧的 Client 去发 —— 而那种不一致
     // 完全静默。
@@ -743,7 +753,7 @@ async fn passthrough(
     // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
     // 升级要的是那条连接，而 `Bytes` 会把它读干净。
     if let Some(ws) = upgrade.filter(|_| crate::ws::is_upgrade(&headers)) {
-        return ws_upgrade(state, rt, ws, client_name, uri, query, headers).await;
+        return ws_upgrade(state, rt, ws, client_name, uri, query, headers, live).await;
     }
     // 从这里往下，所有错误都要用客户端自己那套结构回。
     // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
@@ -762,6 +772,7 @@ async fn passthrough(
         client_name,
         position,
         started,
+        live,
     )
     .await
     .map_err(|e| e.in_dialect(dialect))
@@ -829,6 +840,7 @@ async fn pipeline(
     client_name: String,
     position: crate::auth::KeyPosition,
     started: std::time::Instant,
+    live: crate::live::Pass,
 ) -> Result<Response, GatewayError> {
     forward::check_body_size(&body, MAX_BODY)?;
 
@@ -1416,6 +1428,10 @@ async fn pipeline(
         .then(|| crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()));
     let wall_provider = provider.name.clone();
     let stream = async_stream::stream! {
+        // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
+        // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
+        // 都算这个请求结束了。
+        let _live = live;
         let mut counted = std::pin::pin!(counted);
         let mut broke: Option<GatewayError> = None;
         // **旁路嗅探，不缓冲**：字节照常流向客户端，同时喂它

@@ -23,6 +23,11 @@ pub struct Status {
     pub clients: usize,
     pub providers: usize,
     pub uptime_secs: u64,
+    /// 正在服务中的请求数：从进入网关到响应体最后一个字节发完为止，排队
+    /// 的和还在流式输出的都算。
+    ///
+    /// 重启网关之前要看它 —— 重启会掐断所有还没结束的流。
+    pub in_flight: usize,
 }
 
 /// 一次请求的观测事件。UI 的实时列表吃这个。
@@ -1657,9 +1662,11 @@ mod tests {
             clients: 1,
             providers: 1,
             uptime_secs: 0,
+            in_flight: 3,
         };
         let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.gateway_addr.as_deref(), Some("127.0.0.1:8788"));
+        assert_eq!(back.in_flight, 3);
     }
 
     #[test]
@@ -1667,7 +1674,8 @@ mod tests {
         // 安全模式 = 控制面在、数据面不在。它必须是一个能被表达的状态，
         // 而不是「gateway_addr 是空字符串」这种约定。
         let json = r#"{"api_version":1,"version":"x","pid":1,"gateway_addr":null,
-                       "config_path":"/x","clients":0,"providers":0,"uptime_secs":0}"#;
+                       "config_path":"/x","clients":0,"providers":0,"uptime_secs":0,
+                       "in_flight":0}"#;
         let s: Status = serde_json::from_str(json).unwrap();
         assert!(s.gateway_addr.is_none());
     }
