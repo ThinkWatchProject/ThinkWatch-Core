@@ -434,6 +434,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
         session: None,
         tool_calls: None,
         flagged: None,
+        redacted: None,
         provider: "relay".into(),
         model: "claude-sonnet-4-5".into(),
         path: "/v1/messages".into(),
