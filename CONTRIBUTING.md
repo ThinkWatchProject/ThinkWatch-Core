@@ -86,3 +86,23 @@ prices, and "yesterday's number doesn't match today's" cannot be
 explained to a user. Update steps are in
 `crates/tw-pricing/data/PROVENANCE.md`, and a CI test compares the
 snapshot against the hand-checked `data/verified.yaml` row by row.
+
+## Cutting a release
+
+`twcore` ships inside the desktop app's `.app`, so "which build is in
+there" has to be a fact somebody can check rather than whatever sat in
+a `target/` directory that afternoon.
+
+1. Bump `version` in the workspace `Cargo.toml`, land it on `main`.
+2. Tag that commit `vX.Y.Z` and push the tag.
+3. `release.yml` builds `twcore` for `aarch64-apple-darwin`, checks the
+   binary actually runs and reports the version on the tag, and attaches
+   it to a GitHub Release with a `sha256`.
+
+The desktop app pins `tw-api` to the same tag and bundles the binary
+from that release. Those two have to come from one commit: the binary
+speaks a protocol, and the app compiles a mirror of it.
+
+Apple Silicon only, deliberately. An Intel user downloading a file that
+will not open is worse served than one who finds no download at all;
+supporting them means a universal binary, which is its own decision.
