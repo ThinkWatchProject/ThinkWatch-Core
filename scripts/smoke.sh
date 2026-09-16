@@ -43,7 +43,7 @@ trap cleanup EXIT
 
 # ---------------------------------------------------------------- 假上游
 cat > "$TMP/upstream.py" <<'PY'
-import http.server, json, sys
+import http.server, json, sys, time
 class H(http.server.BaseHTTPRequestHandler):
     # **默认是 HTTP/1.0，每条响应之后关连接。**core 那边是带连接池的
     # 客户端，会拿一条它以为还活着的连接去发下一个请求。配上 1.1 才是
@@ -59,6 +59,16 @@ class H(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get('content-length', 0) or 0)
         body = self.rfile.read(n)
         saw = "yes" if b"sk-ant-api03-SMOKEKEY" in body else "no"
+        if b"SLOWSTREAM" in body:
+            # 先吐第一帧（输入用量就在里面），然后长时间「思考」—— 客户端
+            # 会在这期间走掉。不给 content-length，读到连接关闭为止。
+            self.send_response(200); self.send_header('content-type','text/event-stream')
+            self.send_header('connection','close'); self.end_headers()
+            self.wfile.write(b'event: message_start\ndata: {"type":"message_start",'
+                             b'"message":{"usage":{"input_tokens":4321,"output_tokens":1}}}\n\n')
+            self.wfile.flush()
+            time.sleep(30)
+            return
         if b'"stream":true' in body:
             frames = (
               'event: message_start\ndata: {"type":"message_start","message":{"id":"m"}}\n\n'
@@ -249,6 +259,36 @@ S=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoket
       -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}')
 echo "$S" | grep -q 'event: error' && ok "高危工具调用被切断了" || bad "没切断" "$S"
 echo "$S" | grep -q 'content_block_stop' && bad "切断之后还发了 content_block_stop" || ok "客户端拿到的工具调用是残的"
+
+# 客户端中途走掉（Claude Code 里按 Esc）。
+#
+# **这一行以前不落库。**流末尾报结局的代码在这条路径上一行都不执行，而
+# 上游已经为输入计了费。网关的测试里那个服务是测试自己起的；这里验的是
+# 真二进制上「客户端断开 → 事件 → 落库 → /history」整条链通不通。
+curl -s -N -m 2 -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"SLOWSTREAM"}]}' \
+  > "$TMP/cancelled.out" 2>/dev/null
+if ! grep -q 'message_start' "$TMP/cancelled.out"; then
+  bad "断开之前连第一帧都没收到 —— 这一条测的不是「中途」走掉" "$(head -c 300 "$TMP/cancelled.out")"
+else
+  GOT=""
+  # 落库是异步的：事件先过广播，再由存储层的任务写进去
+  for _ in $(seq 1 20); do
+    GOT=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+            | python3 -c 'import sys, json
+rows = json.load(sys.stdin)
+r = rows[0] if rows else {}
+good = (r.get("cancelled") is True and r.get("error") is None
+        and r.get("input_tokens") == 4321
+        and r.get("cost_micros") is not None and r.get("cost_estimated") is True)
+print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/dev/null)
+    [ "$GOT" = "ok" ] && break
+    sleep 0.25
+  done
+  [ "$GOT" = "ok" ] && ok "客户端中途走掉的请求落了库：标着取消，带着输入用量和估算金额" \
+    || bad "客户端中途走掉的请求没有按取消落库" "$GOT"
+fi
 
 # ---------------------------------------------------------------- 控制面
 step "控制面（每个端点）"

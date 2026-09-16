@@ -310,7 +310,7 @@ async fn next_billing(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) 
     panic!("没等到路由事件");
 }
 
-/// 下一条**生命周期**事件（开始 / 响应头 / 结束 / 失败）。
+/// 下一条**生命周期**事件（开始 / 响应头 / 结束 / 失败 / 取消）。
 ///
 /// 观测类的事件（路由链、订阅额度、密钥发现、配置变更）会插在它们中间，
 /// 而且**以后还会更多** —— 每加一个就去改一遍这些测试是错的做法：那些
@@ -327,6 +327,7 @@ async fn next_lifecycle(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>
                 | tw_api::Event::RequestHeaders { .. }
                 | tw_api::Event::RequestFinished { .. }
                 | tw_api::Event::RequestFailed { .. }
+                | tw_api::Event::RequestCancelled { .. }
         ) {
             return ev;
         }

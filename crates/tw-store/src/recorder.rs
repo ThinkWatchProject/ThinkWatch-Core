@@ -3,8 +3,8 @@
 //! **它跑在数据面之外。**观测挂了，代理照跑 —— 所以这里的每一个
 //! 错误都只记一行日志，一个都不往回抛。
 //!
-//! 一次请求由四类事件描述（开始、响应头、结束、失败），它们分别到达，
-//! 中间可能隔着几分钟。这里攒着它们，齐了就写一条。
+//! 一次请求由几类事件描述（开始、响应头，以及结束、失败、客户端取消三者
+//! 之一），它们分别到达，中间可能隔着几分钟。这里攒着它们，齐了就写一条。
 
 use std::collections::HashMap;
 
@@ -41,8 +41,9 @@ struct Partial {
 /// 在飞的请求最多攒多少条。
 ///
 /// **一个只发了 `RequestStarted` 就再也没有下文的请求会永远占着位置**
-/// —— 客户端 Ctrl+C、进程被杀、上游把连接挂着不放，都会造成它。超了从
-/// 最老的开始丢：丢掉的是一条观测记录，而留着它们会慢慢吃掉内存。
+/// —— 进程被杀、上游把连接挂着不放、客户端在响应头到达之前就走了，都会
+/// 造成它。（响应头之后才走的那些会报 `RequestCancelled`，不在此列。）超了
+/// 从最老的开始丢：丢掉的是一条观测记录，而留着它们会慢慢吃掉内存。
 const MAX_INFLIGHT: usize = 4096;
 
 pub struct Recorder {
@@ -253,86 +254,23 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
-            } => {
-                let Some(p) = self.inflight.remove(id) else {
-                    return;
-                };
-                let u = usage.map(|u| Usage {
-                    input: u.input,
-                    output: u.output,
-                    cache_read: u.cache_read,
-                    cache_write: u.cache_write,
-                    cache_1h: u.cache_1h,
-                });
-                // **上游没给 usage 就没有成本。**估算是 M3 后面的事
-                // （tiktoken / count_tokens），而在那之前记一笔 0 是在
-                // 撒谎。
-                // **不引 tw-config** —— 存储层不该知道配置的形状。这个
-                // 字符串是事件契约的一部分，比较它就够了。
-                let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
-                // **订阅型不按价目表算钱。**订阅制的边际成本是零，按 API
-                // 价目表乘出来的数字是纯虚构的 —— 而它会混进
-                // 「今日花费」里，把一个诚实的面板变成一个编出来的。
-                let cost = if counts_toward_money {
-                    u.map(|u| self.prices.cost(&p.model, &u, false))
-                } else {
-                    None
-                };
-                let (cost_micros, estimated) = match cost {
-                    Some(Cost::Known(m)) => (Some(m), false),
-                    Some(Cost::Estimated(m)) => (Some(m), true),
-                    // 没有价格 / 没有 usage / 不按 token 计费，
-                    // 三种都是「这笔账不在这个维度上」
-                    Some(Cost::Unpriced { .. }) | None => (None, false),
-                };
-                // 缓存命中省下了多少。**在这里算，不在查询时算**
-                // —— 查询时算意味着要把价目表带进 SQL，而价目表会变，
-                // 那样「上周省了多少」会随着一次价格更新悄悄改变。
-                let cache_saved_micros = if counts_toward_money {
-                    u.and_then(|u| self.prices.cache_saving(&p.model, &u))
-                } else {
-                    None
-                };
-                // **算完就报，不等人来问。**这是整条链上唯一知道价钱的
-                // 地方，而界面上那一列金额在它到达之前只能是「—」。
-                if let Some(bus) = &self.bus {
-                    bus.emit(Event::RequestPriced {
-                        id: *id,
-                        cost_micros,
-                        cost_estimated: estimated,
-                        cache_saved_micros,
-                        at_ms: p.at_ms as u64,
-                    });
-                }
-                self.write(RequestRow {
-                    id: *id as i64,
-                    at_ms: p.at_ms,
-                    client: p.client,
-                    client_hint: p.client_hint,
-                    session: p.session,
-                    tool_calls: p.tool_calls,
-                    flagged: p.flagged,
-                    redacted: p.redacted,
-                    provider: p.provider,
-                    model: p.model,
-                    path: p.path,
-                    status: Some(*status),
-                    ttfb_ms: p.ttfb_ms,
-                    duration_ms: Some(*duration_ms as i64),
-                    bytes: Some(*bytes as i64),
-                    input_tokens: u.map(|u| u.input as i64),
-                    output_tokens: u.map(|u| u.output as i64),
-                    cache_read_tokens: u.map(|u| u.cache_read as i64),
-                    cache_write_tokens: u.map(|u| u.cache_write as i64),
-                    cost_micros,
-                    cost_estimated: estimated,
-                    error: None,
-                    local: false,
-                    routing: p.routing,
-                    billing: p.billing,
-                    cache_saved_micros,
-                });
-            }
+            } => self.settle(*id, *status, *bytes, *duration_ms, *usage, false),
+            /*
+                客户端没等到响应结束就走了。
+
+                **照样落库，照样算钱。**上游那边已经计了费：输入全额，输出
+                算到断开为止。以前这类请求只在内存里挂着，从来不写 —— 那笔
+                钱就从账上消失了。
+
+                它和正常结束只差一个标记，所以走同一条路。
+            */
+            Event::RequestCancelled {
+                id,
+                status,
+                bytes,
+                duration_ms,
+                usage,
+            } => self.settle(*id, *status, *bytes, *duration_ms, *usage, true),
             Event::RequestFailed { id, message, .. } => {
                 let Some(p) = self.inflight.remove(id) else {
                     return;
@@ -363,6 +301,7 @@ impl Recorder {
                     cost_estimated: false,
                     error: Some(message.clone()),
                     local: false,
+                    cancelled: false,
                     routing: p.routing,
                     billing: p.billing,
                     cache_saved_micros: None,
@@ -401,6 +340,7 @@ impl Recorder {
                     cost_estimated: false,
                     error: None,
                     local: true,
+                    cancelled: false,
                     // 本地应答没走路由 —— 它根本没到上游
                     routing: None,
                     billing: String::new(),
@@ -455,6 +395,101 @@ impl Recorder {
                 }
             }
         }
+    }
+
+    /// 一个拿到了用量的结局：跑完了，或者客户端中途走了。算钱，落库。
+    fn settle(
+        &mut self,
+        id: u64,
+        status: u16,
+        bytes: u64,
+        duration_ms: u64,
+        usage: Option<tw_api::UsageView>,
+        cancelled: bool,
+    ) {
+        let Some(p) = self.inflight.remove(&id) else {
+            return;
+        };
+        let u = usage.map(|u| Usage {
+            input: u.input,
+            output: u.output,
+            cache_read: u.cache_read,
+            cache_write: u.cache_write,
+            cache_1h: u.cache_1h,
+        });
+        // **上游没给 usage 就没有成本。**估算是 M3 后面的事
+        // （tiktoken / count_tokens），而在那之前记一笔 0 是在
+        // 撒谎。
+        // **不引 tw-config** —— 存储层不该知道配置的形状。这个
+        // 字符串是事件契约的一部分，比较它就够了。
+        let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
+        // **订阅型不按价目表算钱。**订阅制的边际成本是零，按 API
+        // 价目表乘出来的数字是纯虚构的 —— 而它会混进
+        // 「今日花费」里，把一个诚实的面板变成一个编出来的。
+        //
+        // **取消的一律按估算记。**输出只算到断开那一刻，而 Anthropic 在流的
+        // 末尾才报累计输出 —— 断在中间时手里那个数是个占位。按它算出来的钱
+        // 只会偏低，当成实测会让「今日花费」悄悄少一截。
+        let cost = if counts_toward_money {
+            u.map(|u| self.prices.cost(&p.model, &u, cancelled))
+        } else {
+            None
+        };
+        let (cost_micros, estimated) = match cost {
+            Some(Cost::Known(m)) => (Some(m), false),
+            Some(Cost::Estimated(m)) => (Some(m), true),
+            // 没有价格 / 没有 usage / 不按 token 计费，
+            // 三种都是「这笔账不在这个维度上」
+            Some(Cost::Unpriced { .. }) | None => (None, false),
+        };
+        // 缓存命中省下了多少。**在这里算，不在查询时算**
+        // —— 查询时算意味着要把价目表带进 SQL，而价目表会变，
+        // 那样「上周省了多少」会随着一次价格更新悄悄改变。
+        let cache_saved_micros = if counts_toward_money {
+            u.and_then(|u| self.prices.cache_saving(&p.model, &u))
+        } else {
+            None
+        };
+        // **算完就报，不等人来问。**这是整条链上唯一知道价钱的
+        // 地方，而界面上那一列金额在它到达之前只能是「—」。
+        if let Some(bus) = &self.bus {
+            bus.emit(Event::RequestPriced {
+                id,
+                cost_micros,
+                cost_estimated: estimated,
+                cache_saved_micros,
+                at_ms: p.at_ms as u64,
+            });
+        }
+        self.write(RequestRow {
+            id: id as i64,
+            at_ms: p.at_ms,
+            client: p.client,
+            client_hint: p.client_hint,
+            session: p.session,
+            tool_calls: p.tool_calls,
+            flagged: p.flagged,
+            redacted: p.redacted,
+            provider: p.provider,
+            model: p.model,
+            path: p.path,
+            status: Some(status),
+            ttfb_ms: p.ttfb_ms,
+            duration_ms: Some(duration_ms as i64),
+            bytes: Some(bytes as i64),
+            input_tokens: u.map(|u| u.input as i64),
+            output_tokens: u.map(|u| u.output as i64),
+            cache_read_tokens: u.map(|u| u.cache_read as i64),
+            cache_write_tokens: u.map(|u| u.cache_write as i64),
+            cost_micros,
+            cost_estimated: estimated,
+            error: None,
+            local: false,
+            cancelled,
+            routing: p.routing,
+            billing: p.billing,
+            cache_saved_micros,
+        });
     }
 
     fn write(&self, r: RequestRow) {
@@ -748,7 +783,7 @@ mod tests {
 
     #[test]
     fn requests_that_never_finish_do_not_grow_the_map_without_bound() {
-        // 客户端 Ctrl+C、进程被杀、上游把连接挂着不放，都会造成它。
+        // 进程被杀、上游把连接挂着不放、客户端在响应头之前就走了，都会造成它。
         let (_d, mut r) = rec();
         for i in 0..(MAX_INFLIGHT + 100) as u64 {
             r.on_event(&started(i, "m"));
@@ -1071,5 +1106,157 @@ mod cache_saving_tests {
         assert_eq!(by_provider.len(), 1, "同一家上游该合成一行");
         assert_eq!(by_provider[0].model, "官方");
         assert_eq!(by_provider[0].samples, 2);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::tests::{finished, rec, started};
+    use super::*;
+    use tw_api::UsageView;
+
+    fn cancelled(id: u64, usage: Option<UsageView>) -> Event {
+        Event::RequestCancelled {
+            id,
+            status: 200,
+            bytes: 312,
+            duration_ms: 2_500,
+            usage,
+        }
+    }
+
+    /// 按 Esc 那一刻手里的用量：输入是齐的，输出是 `message_start` 里那个
+    /// 占位的 1。
+    fn partial() -> Option<UsageView> {
+        Some(UsageView {
+            input: 100_000,
+            output: 1,
+            ..Default::default()
+        })
+    }
+
+    /// **这一行以前根本不存在。**客户端中途走掉的请求只在内存里挂着，从来
+    /// 不写 —— 而上游已经为那十万个输入 token 计了费。
+    #[test]
+    fn a_request_the_client_walked_away_from_is_written_and_priced() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestHeaders {
+            id: 1,
+            status: 200,
+            ttfb_ms: 900,
+        });
+        r.on_event(&cancelled(1, partial()));
+
+        let row = r.db().get(1).unwrap().expect("取消的请求没有落库");
+        assert!(row.cancelled);
+        assert_eq!(row.error, None, "取消不是失败");
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.ttfb_ms, Some(900));
+        assert_eq!(row.duration_ms, Some(2_500));
+        assert_eq!(row.bytes, Some(312));
+        assert_eq!(row.input_tokens, Some(100_000));
+        assert_eq!(row.output_tokens, Some(1));
+        // Sonnet 4.5：输入 $3/M、输出 $15/M —— 十万个输入加一个输出
+        assert_eq!(row.cost_micros, Some(300_015));
+        assert!(row.cost_estimated, "输出只算到断开那一刻，这个数只能是估算");
+    }
+
+    /// 取消不进失败数。**进了的话，一个常按 Esc 的人会看到一个失败率很高
+    /// 的面板**，而上游什么都没做错。钱照算，只是算在估算那一栏。
+    #[test]
+    fn a_cancellation_is_not_a_failure_but_its_money_still_counts() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&cancelled(1, partial()));
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&finished(
+            2,
+            Some(UsageView {
+                input: 100_000,
+                ..Default::default()
+            }),
+        ));
+
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(s.requests, 2);
+        assert_eq!(s.failed, 0, "取消被算成了失败");
+        assert_eq!(s.cost_micros_exact, 300_000);
+        assert_eq!(s.cost_micros_estimated, 300_015);
+    }
+
+    /// 算出来的价钱照样报回总线，**而且标着估算** —— 界面上那一列金额
+    /// 要带着 `~` 出现。
+    #[test]
+    fn the_price_of_a_cancellation_goes_back_onto_the_bus_as_an_estimate() {
+        let (_d, mut r) = rec();
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        r = r.reporting_to(bus);
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&cancelled(1, partial()));
+
+        let priced = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|ev| match ev {
+            Event::RequestPriced {
+                id,
+                cost_micros,
+                cost_estimated,
+                ..
+            } => Some((id, cost_micros, cost_estimated)),
+            _ => None,
+        });
+        assert_eq!(priced, Some((1, Some(300_015), true)));
+    }
+
+    /// 客户端在第一帧之前就走了。**没有用量就没有金额，不是零** —— 而这
+    /// 一行还是要写：这个请求发生过，本身就是事实。
+    #[test]
+    fn a_cancellation_before_any_usage_is_written_without_a_price_rather_than_as_free() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&cancelled(1, None));
+
+        let row = r.db().get(1).unwrap().expect("没有用量的取消也该落库");
+        assert!(row.cancelled);
+        assert_eq!(row.input_tokens, None);
+        assert_eq!(row.cost_micros, None);
+    }
+
+    /// 会话里的那一轮也要看得出是取消的。否则在每轮花费里，它就是一轮
+    /// 花了钱、输出却只有一个 token 的「正常」请求。
+    #[test]
+    fn a_cancelled_turn_says_so_in_its_session() {
+        let (_d, mut r) = rec();
+        r.on_event(&Event::RequestStarted {
+            id: 1,
+            client: "claude-code".into(),
+            client_hint: None,
+            session_fp: Some("fp".into()),
+            provider: "官方".into(),
+            model: "claude-sonnet-4-5".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            at_ms: 1_000_000,
+        });
+        r.on_event(&cancelled(1, partial()));
+
+        let sessions = r.db().sessions(10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].errors, 0, "取消被算成了会话里的失败");
+        let turns = r.db().turns(&sessions[0].id).unwrap();
+        assert!(turns[0].cancelled);
+    }
+
+    /// 结局只认第一个。同一个 id 后面再来一个结束，**不该把已经写下的那一行
+    /// 盖掉** —— 写库用的是 INSERT OR REPLACE，第二次写就是覆盖。
+    #[test]
+    fn a_second_ending_for_the_same_request_does_not_overwrite_the_first() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&cancelled(1, partial()));
+        r.on_event(&finished(1, None));
+
+        assert_eq!(r.db().count().unwrap(), 1);
+        assert!(r.db().get(1).unwrap().unwrap().cancelled);
     }
 }

@@ -77,11 +77,33 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageView>,
     },
-    /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表。
+    /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表，
+    /// 另外多一个 `internal`：流在网关自己的代码里崩掉了。它只出现在这里
+    /// —— 那时响应头早就发出去了，没有哪个 HTTP 头还能带上它。
     RequestFailed {
         id: u64,
         source: String,
         message: String,
+    },
+    /// 客户端没等到响应结束就走了（Claude Code 里按一下 Esc）。
+    ///
+    /// **不是失败，也不是正常结束，所以单独一个事件。**上游那时已经在计费
+    /// 了 —— 输入全额，输出算到断开为止 —— 所以它带着到那一刻为止看到的
+    /// 用量，存储层照样算钱。而它不能算进失败：上游什么都没做错，记成失败
+    /// 会让一个常按 Esc 的用户看到一家「经常出错」的上游。
+    ///
+    /// **用量停在断开那一刻。**输入通常是齐的（`message_start` 在流的最
+    /// 前面），输出多半不是 —— Anthropic 只在流的末尾报累计输出，之前手里
+    /// 那个数是个占位。按它算出来的钱只能是估算，而且只会偏低。
+    RequestCancelled {
+        id: u64,
+        status: u16,
+        /// 断开之前从上游收到了多少字节
+        bytes: u64,
+        duration_ms: u64,
+        /// **没嗅到就是 None，不是零** —— 客户端可能在第一帧之前就走了
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<UsageView>,
     },
     /// 路由决定完了，尝试链也走完了。
     ///
@@ -358,6 +380,7 @@ impl Event {
             | Event::RequestHeaders { id, .. }
             | Event::RequestFinished { id, .. }
             | Event::RequestFailed { id, .. }
+            | Event::RequestCancelled { id, .. }
             | Event::LocallyAnswered { id, .. }
             | Event::ConfigReloaded { id, .. }
             | Event::ConfigRejected { id, .. }
@@ -1013,6 +1036,10 @@ pub struct HistoryRow {
     pub error: Option<String>,
     /// 本地应答的
     pub local: bool,
+    /// 客户端没等到响应结束就走了。**不是失败**（`error` 是空的）；用量
+    /// 只算到断开那一刻，所以有金额的话一定是估算
+    #[serde(default)]
+    pub cancelled: bool,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
     #[serde(default)]
     pub billing: String,
@@ -1208,6 +1235,9 @@ pub struct TurnView {
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
+    /// 客户端没等到这一轮结束就走了（见 `HistoryRow::cancelled`）
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1646,9 +1676,51 @@ mod tests {
                 source: "upstream".into(),
                 message: "x".into(),
             },
+            Event::RequestCancelled {
+                id: 7,
+                status: 200,
+                bytes: 1,
+                duration_ms: 1,
+                usage: None,
+            },
         ] {
             assert_eq!(e.id(), 7);
         }
+    }
+
+    /// 取消带着用量走 —— **存储层要拿它算钱**。而客户端在第一帧之前就走了
+    /// 的那种，字段整个不出现，不是一组零。
+    #[test]
+    fn a_cancellation_carries_the_usage_seen_so_far() {
+        let e = Event::RequestCancelled {
+            id: 3,
+            status: 200,
+            bytes: 512,
+            duration_ms: 2400,
+            usage: Some(UsageView {
+                input: 5000,
+                output: 1,
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "request_cancelled");
+        assert_eq!(v["usage"]["input"], 5000);
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            Event::RequestCancelled { usage: Some(u), .. } if u.input == 5000
+        ));
+
+        let none = Event::RequestCancelled {
+            id: 4,
+            status: 200,
+            bytes: 0,
+            duration_ms: 10,
+            usage: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(v.get("usage").is_none(), "{v}");
     }
 
     #[test]

@@ -47,6 +47,7 @@ fn req(id: i64, at_ms: i64) -> RequestRow {
         cost_estimated: false,
         error: None,
         local: false,
+        cancelled: false,
         routing: None,
         billing: "per-token".into(),
         cache_saved_micros: Some(1_500),

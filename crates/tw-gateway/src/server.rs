@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 
 use crate::auth::key_eq;
 use crate::error::GatewayError;
@@ -1378,17 +1378,13 @@ async fn pipeline(
     // 流式：**不缓冲**。整块缓冲会把 SSE 变成一次性交付，客户端那边
     // 看起来就是「卡住很久然后一下全出来」。
     let bus = state.bus.clone();
-    let bytes_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counted = {
-        let bytes_seen = bytes_seen.clone();
-        upstream.bytes_stream().map_ok(move |chunk| {
-            bytes_seen.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            chunk
-        })
-    };
     // 流结束时才知道总字节数和真实耗时 —— 对一个跑了六分钟的任务，
     // 这两个数字在响应头那一刻都还不存在。
     //
+    // **结局跟着流走，而不是只写在流的末尾。**客户端中途走掉时，末尾的
+    // 代码一行都不会执行，而上游已经为这次请求计了费（见 `crate::ending`）。
+    let ending = crate::ending::Ending::new(bus.clone(), id, status.as_u16(), started, at_ms, sink);
+    let chunks = upstream.bytes_stream();
     // **中途断掉不能只是让流消失。**首字节已经发出去了，状态码和响应头
     // 都改不了，而一个戛然而止的 SSE 流和一个正常结束的流在客户端看来
     // 长得一模一样 —— 用户会以为模型就答了这么多。唯一还能说话的地方
@@ -1432,23 +1428,21 @@ async fn pipeline(
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
         // 都算这个请求结束了。
         let _live = live;
-        let mut counted = std::pin::pin!(counted);
+        // 结局也一样：流被丢掉的时候，它替流报「客户端取消」。
+        let mut ending = ending;
+        let mut chunks = std::pin::pin!(chunks);
         let mut broke: Option<GatewayError> = None;
-        // **旁路嗅探，不缓冲**：字节照常流向客户端，同时喂它
-        // 一份。上游返回的 usage 是真相，而拿不到它就只能估。
-        let mut sniffer = crate::usage::Sniffer::new();
-        // 响应体也攒一份，**攒到上限就停**。和 usage 嗅探走同一个循环 ——
-        // 两个各自遍历一遍是白白多走一趟。
-        let mut tap = crate::bodies::ResponseTap::new();
         let mut whole: Vec<u8> = Vec::new();
-        while let Some(item) = counted.next().await {
+        while let Some(item) = chunks.next().await {
             match item {
                 Ok(chunk) => {
-                    // **嗅探和留档看的是上游原话**（带占位符的那一版）：
-                    // usage 数字不受影响，而请求详情里存的正是「我们发出去
-                    // 的和收回来的」，把还原后的存进去会让那一页说谎。
-                    sniffer.feed(&chunk);
-                    tap.feed(&chunk);
+                    // **旁路嗅探和留档，不缓冲**：字节照常流向客户端，同时
+                    // 喂它一份。上游返回的 usage 是真相，而拿不到它就只能估。
+                    //
+                    // 看的是上游原话（带占位符的那一版）：usage 数字不受
+                    // 影响，而请求详情里存的正是「我们发出去的和收回来的」，
+                    // 把还原后的存进去会让那一页说谎。
+                    ending.feed(&chunk);
                     let out = restorer.process(&chunk);
                     // 翻译在还原之后、审查之前：**审查看的必须是客户端
                     // 将要拿到的那一版**，而那一版是翻译过的
@@ -1555,41 +1549,17 @@ async fn pipeline(
                 bus.emit(tw_api::Event::ResponseInspected { id, tool_calls, flagged });
             }
         }
-        let (recorded, original_len) = tap.finish();
-        if !recorded.is_empty() {
-            crate::bodies::offer(
-                &sink,
-                crate::bodies::BodyRecord {
-                    id,
-                    at_ms,
-                    kind: crate::bodies::BodyKind::Response,
-                    body: recorded,
-                    original_len,
-                },
-            );
-        }
+        // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
+        // 东西，分开写就会有一种漏掉
         match broke {
-            None => bus.emit(tw_api::Event::RequestFinished {
-                id,
-                status: status.as_u16(),
-                bytes: bytes_seen.load(std::sync::atomic::Ordering::Relaxed),
-                duration_ms: started.elapsed().as_millis() as u64,
-                usage: sniffer.finish().map(|u| tw_api::UsageView {
-                    input: u.input,
-                    output: u.output,
-                    cache_read: u.cache_read,
-                    cache_write: u.cache_write,
-                    cache_1h: u.cache_1h,
-                }),
-            }),
+            None => ending.finished(),
             Some(err) => {
                 // 少了这个事件，UI 上那一行会永远停在「进行中」——
                 // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。
-                bus.emit(tw_api::Event::RequestFailed {
-                    id,
-                    source: "upstream".to_string(),
-                    message: format!("流中断：{}", err.message),
-                });
+                //
+                // **先报再发错误帧**：客户端恰好在最后这一帧上走掉的话，
+                // 结局已经报过了，不会再被记成一次取消。
+                ending.failed("upstream", format!("流中断：{}", err.message));
                 if is_sse {
                     yield Ok(Bytes::from(err.sse_frame()));
                 }

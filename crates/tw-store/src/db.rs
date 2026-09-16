@@ -16,7 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 9;
+const SCHEMA: i64 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -83,6 +83,9 @@ pub struct RequestRow {
     pub error: Option<String>,
     /// 客户端的辅助请求被本地应答了。**不进成本和延迟统计**
     pub local: bool,
+    /// 客户端没等到响应结束就走了。**和 `error` 是两件事**：它不算失败，
+    /// 用量只算到断开那一刻，所以金额是估算
+    pub cancelled: bool,
     /// 路由决策与尝试链，JSON。老记录是 None
     pub routing: Option<String>,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
@@ -270,6 +273,19 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN redacted INTEGER;")?;
         }
+        if from < 10 {
+            // 客户端没等到响应结束就走了的那些（Claude Code 里按 Esc）。
+            //
+            // **不能写进 `error`。**那一列决定失败数、失败率，还有上游行为
+            // 画像里的错误率 —— 用户按了 Esc，不该让上游看起来在出错。可它
+            // 也不是正常结束：用量只算到断开那一刻，界面要能把这一点说出来。
+            //
+            // 老记录是 0。那时候这类请求根本不落库，所以没有一条老记录
+            // 该是 1。
+            self.conn.execute_batch(
+                "ALTER TABLE requests ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -281,8 +297,8 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint, session, tool_calls, flagged, redacted)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
+              client_hint, session, tool_calls, flagged, redacted, cancelled)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             params![
                 r.id,
                 r.at_ms,
@@ -310,6 +326,7 @@ impl Db {
                 r.tool_calls,
                 r.flagged,
                 r.redacted,
+                r.cancelled as i64,
             ],
         )?;
         Ok(())
@@ -362,6 +379,7 @@ pub struct TurnRow {
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
+    pub cancelled: bool,
 }
 
 impl Db {
@@ -416,7 +434,7 @@ impl Db {
     pub fn turns(&self, session: &str) -> Result<Vec<TurnRow>, DbError> {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
-                    cache_read_tokens, cost_micros, duration_ms, error
+                    cache_read_tokens, cost_micros, duration_ms, error, cancelled
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -431,6 +449,7 @@ impl Db {
                 cost_micros: r.get(7)?,
                 duration_ms: r.get(8)?,
                 error: r.get(9)?,
+                cancelled: r.get::<_, i64>(10)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -980,6 +999,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         cost_estimated: r.get::<_, i64>("cost_estimated")? != 0,
         error: r.get("error")?,
         local: r.get::<_, i64>("local")? != 0,
+        cancelled: r.get::<_, i64>("cancelled")? != 0,
         routing: r.get("routing")?,
         billing: r.get("billing")?,
         cache_saved_micros: r.get("cache_saved_micros")?,
@@ -1079,6 +1099,7 @@ mod tests {
             cost_estimated: false,
             error: None,
             local: false,
+            cancelled: false,
             routing: None,
             billing: "per-token".into(),
             cache_saved_micros: None,
@@ -1595,6 +1616,7 @@ mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN cancelled;
                      ALTER TABLE requests DROP COLUMN redacted;
                      ALTER TABLE requests DROP COLUMN flagged;
                      ALTER TABLE requests DROP COLUMN tool_calls;
@@ -1609,6 +1631,8 @@ mod tests {
         let got = db.recent(10).unwrap();
         // 老记录没有旁证，那就是 None —— 不是空字符串
         assert!(got.iter().all(|r| r.client_hint.is_none()));
+        // 升级之前取消的请求根本不落库，所以老记录一条都不该是「已取消」
+        assert!(got.iter().all(|r| !r.cancelled));
         let mut fresh = row(3, 300);
         fresh.client_hint = Some("codex".into());
         fresh.session = Some("abc-100".into());
