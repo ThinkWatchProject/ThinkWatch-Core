@@ -1,0 +1,70 @@
+# 发一版 twcore 的二进制。
+#
+# **它存在的理由是桌面版。**桌面版的 `.app` 里要装一份 twcore，而
+# 「装的是哪一版」必须是钉死、可复核的 —— 从隔壁仓库的 target 目录复制
+# 一份过去，等于把「发出去的是什么」交给那台机器当时的状态。
+#
+# 这条流水线不重跑那四道门：tag 是从 main 上打的，而 main 上的每一个
+# commit 都过过 `ci.yml`。这里只做 CI 做不了的那件事 —— 产出一个别人
+# 能下载、能校验的文件。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  twcore:
+    name: twcore (aarch64-apple-darwin)
+    # 只发 Apple Silicon。**不是「暂时」** —— 覆盖不到的那部分机器，
+    # 拿到的是一个能下载但打不开的文件，而那比没有更糟；真要支持 Intel
+    # 就得做通用二进制，那是另一个决定。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p twcore --target aarch64-apple-darwin
+
+      # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出
+      # 任何问题 —— 而它会一路发到用户手里。
+      - name: It runs, and it is the version on the tag
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-apple-darwin/release/twcore
+          file "$BIN" | grep -q arm64
+          GOT=$("$BIN" --version | awk '{print $2}')
+          WANT="${GITHUB_REF_NAME#v}"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "tag 是 $WANT，而二进制报的是 $GOT —— Cargo.toml 的版本没跟上" >&2
+            exit 1
+          fi
+          "$BIN" --help > /dev/null
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/twcore dist/twcore-aarch64-apple-darwin
+          cd dist
+          shasum -a 256 twcore-aarch64-apple-darwin > twcore-aarch64-apple-darwin.sha256
+          cat twcore-aarch64-apple-darwin.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/twcore-aarch64-apple-darwin
+            dist/twcore-aarch64-apple-darwin.sha256
+          # 发布说明留空，从 tag 的信息里来 —— 让一份自动生成的清单
+          # 冒充发布说明，读的人得不到任何东西
+          generate_release_notes: true
