@@ -47,6 +47,14 @@ struct Partial {
 /// 开始丢：丢掉的是一条观测记录，而留着它们会慢慢吃掉内存。
 const MAX_INFLIGHT: usize = 4096;
 
+/// 一个请求是怎么结束的。**三种结局落同一张表、走同一条算钱的路**，只在
+/// 这几处不同：失败有 `error`，取消有 `cancelled`，没跑完的金额是估算。
+enum Ending<'a> {
+    Finished,
+    Cancelled,
+    Failed(&'a str),
+}
+
 pub struct Recorder {
     db: Db,
     blobs: Blobs,
@@ -255,7 +263,14 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
-            } => self.settle(*id, Some(*status), *bytes, *duration_ms, *usage, false),
+            } => self.settle(
+                *id,
+                Some(*status),
+                Some(*bytes),
+                Some(*duration_ms),
+                *usage,
+                Ending::Finished,
+            ),
             /*
                 客户端没等到响应结束就走了。
 
@@ -271,43 +286,36 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
-            } => self.settle(*id, *status, *bytes, *duration_ms, *usage, true),
-            Event::RequestFailed { id, message, .. } => {
-                let Some(p) = self.inflight.remove(id) else {
-                    return;
-                };
-                // **失败也要落库。**「昨天有多少请求失败了」是这个面板
-                // 最有用的问题之一，而只记成功的话它永远答不出来。
-                self.write(RequestRow {
-                    id: *id as i64,
-                    at_ms: p.at_ms,
-                    client: p.client,
-                    client_hint: p.client_hint,
-                    session: p.session,
-                    tool_calls: p.tool_calls,
-                    flagged: p.flagged,
-                    redacted: p.redacted,
-                    provider: p.provider,
-                    model: p.model,
-                    path: p.path,
-                    status: p.status,
-                    ttfb_ms: p.ttfb_ms,
-                    duration_ms: None,
-                    bytes: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    cache_read_tokens: None,
-                    cache_write_tokens: None,
-                    cost_micros: None,
-                    cost_estimated: false,
-                    error: Some(message.clone()),
-                    local: false,
-                    cancelled: false,
-                    routing: p.routing,
-                    billing: p.billing,
-                    cache_saved_micros: None,
-                });
-            }
+            } => self.settle(
+                *id,
+                *status,
+                Some(*bytes),
+                Some(*duration_ms),
+                *usage,
+                Ending::Cancelled,
+            ),
+            /*
+                失败也要落库。「昨天有多少请求失败了」是这个面板最有用的问题
+                之一，而只记成功的话它永远答不出来。
+
+                **断在流中间的失败带着用量**（上游断了、被防火墙切断）：上游
+                已经为它计了费，这一行要把那笔钱记上。
+            */
+            Event::RequestFailed {
+                id,
+                message,
+                bytes,
+                duration_ms,
+                usage,
+                ..
+            } => self.settle(
+                *id,
+                None,
+                *bytes,
+                *duration_ms,
+                *usage,
+                Ending::Failed(message),
+            ),
             Event::LocallyAnswered {
                 id,
                 client,
@@ -398,16 +406,17 @@ impl Recorder {
         }
     }
 
-    /// 一个拿到了用量的结局：跑完了，或者客户端中途走了。算钱，落库。
+    /// 一个请求的结局：算钱，落库，把价钱报回去。
     fn settle(
         &mut self,
         id: u64,
-        // 响应头之前客户端就走了的，没有状态码
+        // 结局事件自己带的状态码。没带的（失败、响应头之前的取消）用
+        // 响应头那个事件记下的
         status: Option<u16>,
-        bytes: u64,
-        duration_ms: u64,
+        bytes: Option<u64>,
+        duration_ms: Option<u64>,
         usage: Option<tw_api::UsageView>,
-        cancelled: bool,
+        how: Ending<'_>,
     ) {
         let Some(p) = self.inflight.remove(&id) else {
             return;
@@ -429,11 +438,12 @@ impl Recorder {
         // 价目表乘出来的数字是纯虚构的 —— 而它会混进
         // 「今日花费」里，把一个诚实的面板变成一个编出来的。
         //
-        // **取消的一律按估算记。**输出只算到断开那一刻，而 Anthropic 在流的
-        // 末尾才报累计输出 —— 断在中间时手里那个数是个占位。按它算出来的钱
-        // 只会偏低，当成实测会让「今日花费」悄悄少一截。
+        // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
+        // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
+        // 占位。按它算出来的钱只会偏低，当成实测会让「今日花费」悄悄少一截。
+        let partial = !matches!(how, Ending::Finished);
         let cost = if counts_toward_money {
-            u.map(|u| self.prices.cost(&p.model, &u, cancelled))
+            u.map(|u| self.prices.cost(&p.model, &u, partial))
         } else {
             None
         };
@@ -477,17 +487,20 @@ impl Recorder {
             path: p.path,
             status: status.or(p.status),
             ttfb_ms: p.ttfb_ms,
-            duration_ms: Some(duration_ms as i64),
-            bytes: Some(bytes as i64),
+            duration_ms: duration_ms.map(|d| d as i64),
+            bytes: bytes.map(|b| b as i64),
             input_tokens: u.map(|u| u.input as i64),
             output_tokens: u.map(|u| u.output as i64),
             cache_read_tokens: u.map(|u| u.cache_read as i64),
             cache_write_tokens: u.map(|u| u.cache_write as i64),
             cost_micros,
             cost_estimated: estimated,
-            error: None,
+            error: match how {
+                Ending::Failed(message) => Some(message.to_string()),
+                _ => None,
+            },
             local: false,
-            cancelled,
+            cancelled: matches!(how, Ending::Cancelled),
             routing: p.routing,
             billing: p.billing,
             cache_saved_micros,
@@ -753,6 +766,9 @@ mod tests {
             id: 1,
             source: "upstream".into(),
             message: "连不上".into(),
+            bytes: None,
+            duration_ms: None,
+            usage: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(row.error.as_deref(), Some("连不上"));
@@ -1281,5 +1297,121 @@ mod cancellation_tests {
 
         assert_eq!(r.db().count().unwrap(), 1);
         assert!(r.db().get(1).unwrap().unwrap().cancelled);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::tests::{finished, rec, started};
+    use super::*;
+    use tw_api::UsageView;
+
+    fn failed(id: u64, usage: Option<UsageView>) -> Event {
+        Event::RequestFailed {
+            id,
+            source: "upstream".into(),
+            message: "流中断：上游断开了".into(),
+            bytes: Some(312),
+            duration_ms: Some(2_500),
+            usage,
+        }
+    }
+
+    fn partial() -> Option<UsageView> {
+        Some(UsageView {
+            input: 100_000,
+            output: 1,
+            ..Default::default()
+        })
+    }
+
+    /// 流断在中间。**上游已经为那十万个输入 token 计了费** —— 以前失败的
+    /// 行一律没有用量、没有金额，那笔钱就不在账上。
+    #[test]
+    fn a_stream_that_broke_is_written_as_a_failure_with_what_it_used() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestHeaders {
+            id: 1,
+            status: 200,
+            ttfb_ms: 900,
+        });
+        r.on_event(&failed(1, partial()));
+
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.error.as_deref(), Some("流中断：上游断开了"));
+        assert!(!row.cancelled);
+        assert_eq!(row.status, Some(200), "状态码来自响应头那个事件");
+        assert_eq!(row.bytes, Some(312));
+        assert_eq!(row.duration_ms, Some(2_500));
+        assert_eq!(row.input_tokens, Some(100_000));
+        // Sonnet 4.5：输入 $3/M、输出 $15/M
+        assert_eq!(row.cost_micros, Some(300_015));
+        assert!(row.cost_estimated, "断在中间的输出不全，这个数只能是估算");
+    }
+
+    /// 失败照样是失败，**钱照样是钱**：进估算那一栏，不进实测。
+    #[test]
+    fn it_still_counts_as_failed_and_its_money_counts_as_estimated() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&failed(1, partial()));
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&finished(
+            2,
+            Some(UsageView {
+                input: 100_000,
+                ..Default::default()
+            }),
+        ));
+
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.cost_micros_exact, 300_000);
+        assert_eq!(s.cost_micros_estimated, 300_015);
+    }
+
+    /// 响应头之前就失败的（每家都拒绝、策略不让）。**没有用量就没有金额，
+    /// 不是 0**；耗时照记 —— 「试了二十秒才放弃」是排查的线索。
+    #[test]
+    fn a_failure_before_any_usage_has_no_price_but_keeps_its_duration() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestFailed {
+            id: 1,
+            source: "rate_limited".into(),
+            message: "`up` 限流了".into(),
+            bytes: None,
+            duration_ms: Some(20_000),
+            usage: None,
+        });
+
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.cost_micros, None);
+        assert_eq!(row.input_tokens, None);
+        assert_eq!(row.bytes, None, "响应头都没到，没有「收到了多少字节」");
+        assert_eq!(row.duration_ms, Some(20_000));
+    }
+
+    /// 算出来的价钱照样报回总线，**标着估算**。
+    #[test]
+    fn the_price_of_a_failure_goes_back_onto_the_bus_as_an_estimate() {
+        let (_d, mut r) = rec();
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        r = r.reporting_to(bus);
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&failed(1, partial()));
+
+        let priced = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|ev| match ev {
+            Event::RequestPriced {
+                id,
+                cost_micros,
+                cost_estimated,
+                ..
+            } => Some((id, cost_micros, cost_estimated)),
+            _ => None,
+        });
+        assert_eq!(priced, Some((1, Some(300_015), true)));
     }
 }

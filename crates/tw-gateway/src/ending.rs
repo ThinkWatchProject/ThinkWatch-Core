@@ -110,12 +110,17 @@ impl Ending {
 
     /// 失败了：上游不行、策略不让、流断了或者被切断了。`source` 用
     /// `x-thinkwatch-error` 那个词表。
+    ///
+    /// **断在流中间的失败也带着用量** —— 上游已经为它计了费。
     pub fn failed(mut self, source: &str, message: String) {
-        self.settle();
+        let usage = self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
             source: source.to_string(),
             message,
+            bytes: self.received(),
+            duration_ms: Some(self.duration_ms()),
+            usage,
         });
     }
 
@@ -141,6 +146,12 @@ impl Ending {
     fn duration_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
+
+    /// 收到了多少字节。**响应头都没到的，没有「收到了多少」这回事** ——
+    /// 报 0 会让它看起来像一个空响应。
+    fn received(&self) -> Option<u64> {
+        self.status.map(|_| self.bytes)
+    }
 }
 
 impl Drop for Ending {
@@ -159,6 +170,9 @@ impl Drop for Ending {
                 id: self.id,
                 source: "internal".to_string(),
                 message: "请求中断：网关内部出错".to_string(),
+                bytes: self.received(),
+                duration_ms: Some(self.duration_ms()),
+                usage,
             });
             return;
         }
@@ -242,8 +256,43 @@ mod tests {
 
         let got = drain(&mut rx);
         assert_eq!(got.len(), 1, "{got:?}");
+        match &got[0] {
+            Event::RequestFailed {
+                source,
+                bytes,
+                duration_ms: Some(_),
+                usage: Some(u),
+                ..
+            } => {
+                assert_eq!(source, "upstream");
+                assert_eq!(*bytes, Some(MESSAGE_START.len() as u64));
+                // **断在中间也要带着用量**：输入在第一帧里就齐了，上游已经为它计费
+                assert_eq!((u.input, u.cache_read), (5000, 4000));
+            }
+            other => panic!("该是一条带着用量的失败，实际 {other:?}"),
+        }
+    }
+
+    /// 响应头之前就失败了（每家上游都拒绝、策略不让）。**没有字节、没有
+    /// 用量，但有耗时** —— 「试了二十秒才放弃」本身就是排查的线索。
+    #[test]
+    fn a_failure_before_the_response_headers_has_a_duration_but_no_bytes_or_usage() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        Ending::new(bus.clone(), 7, Instant::now(), 1_000, None)
+            .failed("rate_limited", "`up` 限流了".into());
+
+        let got = drain(&mut rx);
         assert!(
-            matches!(&got[0], Event::RequestFailed { source, .. } if source == "upstream"),
+            matches!(
+                got.as_slice(),
+                [Event::RequestFailed {
+                    bytes: None,
+                    duration_ms: Some(_),
+                    usage: None,
+                    ..
+                }]
+            ),
             "{got:?}"
         );
     }
