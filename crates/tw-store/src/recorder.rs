@@ -22,6 +22,8 @@ struct Partial {
     /// 响应里有几个工具调用、命中几条规则（防线三）
     tool_calls: Option<i64>,
     flagged: Option<i64>,
+    /// 出站脱敏换掉了几处（防线一）。`None` = 那次没开脱敏
+    redacted: Option<i64>,
     client: String,
     client_hint: Option<String>,
     session: Option<String>,
@@ -160,6 +162,7 @@ impl Recorder {
                         session,
                         tool_calls: None,
                         flagged: None,
+                        redacted: None,
                         provider: provider.clone(),
                         model: model.clone(),
                         path: path.clone(),
@@ -200,6 +203,23 @@ impl Recorder {
                     })
                     .ok();
                     p.billing = billing.clone();
+                }
+            }
+            /*
+                这次请求里换掉了几处。
+
+                **只记条数，不记内容。**换掉的正是不能落盘的东西 ——
+                记下来等于把外泄搬了个家。
+
+                以前这条事件整个不落表，理由是「它属于请求详情」。但
+                请求详情本身也没存它，于是切到「拦截」档之后，面板上
+                那条证据链断了：观察档看得见「检测到 12 处外泄」，拦截
+                档反而什么都没有，而后者是防护更强的一档。
+            */
+            Event::Redacted { id, items, .. } => {
+                if let Some(p) = self.inflight.get_mut(id) {
+                    let n: i64 = items.iter().map(|x| x.count as i64).sum();
+                    p.redacted = Some(p.redacted.unwrap_or(0) + n);
                 }
             }
             Event::RequestHeaders {
@@ -266,6 +286,7 @@ impl Recorder {
                     session: p.session,
                     tool_calls: p.tool_calls,
                     flagged: p.flagged,
+                    redacted: p.redacted,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -300,6 +321,7 @@ impl Recorder {
                     session: p.session,
                     tool_calls: p.tool_calls,
                     flagged: p.flagged,
+                    redacted: p.redacted,
                     provider: p.provider,
                     model: p.model,
                     path: p.path,
@@ -337,6 +359,7 @@ impl Recorder {
                     session: None,
                     tool_calls: None,
                     flagged: None,
+                    redacted: None,
                     provider: String::new(),
                     model: String::new(),
                     path: probe.clone(),
@@ -385,9 +408,6 @@ impl Recorder {
             | Event::ConfigRejected { .. }
             | Event::QuotaSeen { .. }
             | Event::ScanAlert { .. }
-            // 脱敏事件也不落这张表：它说的是「这次请求里换掉了什么」，
-            // 而那属于请求详情，不是另一行记录
-            | Event::Redacted { .. }
             | Event::ToolCallFlagged { .. }
             | Event::Translated { .. }
             // 凭据轮换说的是配置文件该改了，跟哪一次请求无关
@@ -835,6 +855,49 @@ mod billing_tests {
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.unpriced_requests, 1);
         assert_eq!(s.subscription_requests, 0);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::tests::{finished, rec, started};
+
+    /// **拦截档也要留下痕迹。**观察档产出的是「检测到的外泄」证据，
+    /// 而拦截档把它们就地换掉了 —— 那一刻如果什么都不记，面板在防护
+    /// 最强的一档上反而是空的，读起来像什么都没发生。
+    #[test]
+    fn a_redaction_is_counted_on_the_row_it_happened_to() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&tw_api::Event::Redacted {
+            id: 1,
+            provider: "relay".into(),
+            items: vec![
+                tw_api::RedactedItem {
+                    kind: "api_key".into(),
+                    what: "sk-…".into(),
+                    count: 2,
+                },
+                tw_api::RedactedItem {
+                    kind: "token".into(),
+                    what: "ghp_…".into(),
+                    count: 1,
+                },
+            ],
+            at_ms: 0,
+        });
+        r.on_event(&finished(1, None));
+        assert_eq!(r.db().get(1).unwrap().unwrap().redacted, Some(3));
+    }
+
+    /// **「没开脱敏」和「开了但这次没换」是两件事。**记成 0 的话，
+    /// 关掉脱敏的那段时间在统计里会变成「一处都没换过」—— 那是假的。
+    #[test]
+    fn no_redaction_event_means_unknown_not_zero() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&finished(1, None));
+        assert_eq!(r.db().get(1).unwrap().unwrap().redacted, None);
     }
 }
 

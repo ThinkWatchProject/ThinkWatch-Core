@@ -31,6 +31,7 @@ fn req(id: i64, at_ms: i64) -> RequestRow {
         session: None,
         tool_calls: None,
         flagged: None,
+        redacted: None,
         provider: "官方".into(),
         model: "claude-sonnet-4-5".into(),
         path: "/v1/messages".into(),

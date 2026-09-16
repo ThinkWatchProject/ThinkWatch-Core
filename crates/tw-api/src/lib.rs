@@ -876,6 +876,18 @@ pub struct CostBucketGroup {
     pub failed: i64,
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
+    /// 这一格里这一项用掉的 token。
+    ///
+    /// **四类分开给。**它们的单价差十倍以上，加成一个数之后既算不回
+    /// 钱，也说不清「这段时间是在写新上下文还是在吃缓存」。
+    #[serde(default)]
+    pub input_tokens: i64,
+    #[serde(default)]
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub cache_read_tokens: i64,
+    #[serde(default)]
+    pub cache_write_tokens: i64,
 }
 
 /// 按模型或上游分组的花费（钱花在哪儿）。
@@ -920,12 +932,23 @@ pub struct Summary {
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
     #[serde(default)]
     pub subscription_tokens: i64,
-    /// 缓存命中一共省下了多少微分。
+    /// 用了缓存之后净省下多少微分。
     ///
-    /// **算的是差额，不是「缓存读花了多少」** —— 用户想知道的是「如果
-    /// 没命中要多花多少」
+    /// **净额：命中节省的部分，减去写入产生的溢价。**用户想知道的是
+    /// 「如果完全不用缓存，这段时间要多花还是少花」—— 而缓存写入按
+    /// 1.25 倍单价计费，所以这个数可以是负的。
     #[serde(default)]
     pub cache_saved_micros: i64,
+    /// 本区间有多少个请求带回了可疑工具调用（防线三）
+    #[serde(default)]
+    pub flagged_requests: i64,
+    /// 本区间有多少个请求在出站时被脱敏换过内容（防线一的拦截档）
+    ///
+    /// **观察档不产生这个数**，它产生的是 `/leaks` 里那些证据。两档
+    /// 各有各的痕迹，界面上要分别说明 —— 否则切到拦截之后看起来像
+    /// 什么都没发生，而那是防护更强的一档。
+    #[serde(default)]
+    pub redacted_requests: i64,
     /// 价目表的快照日期。**成本旁边要标它** —— 一个两个月前
     /// 的价目表算出来的数字，可信度和昨天的完全不同
     pub pricing_date: String,

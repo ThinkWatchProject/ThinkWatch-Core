@@ -16,7 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 8;
+const SCHEMA: i64 = 9;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -58,6 +58,8 @@ pub struct RequestRow {
     pub tool_calls: Option<i64>,
     /// 命中了几条危险规则
     pub flagged: Option<i64>,
+    /// 出站脱敏换掉了几处。`None` = 那次没开脱敏，**不是 0**
+    pub redacted: Option<i64>,
     pub provider: String,
     pub model: String,
     pub path: String,
@@ -256,6 +258,18 @@ impl Db {
                  ALTER TABLE requests ADD COLUMN flagged INTEGER;",
             )?;
         }
+        if from < 9 {
+            // 出站脱敏换掉了几处（防线一的拦截档）。
+            //
+            // **不记的话，切到「拦截」之后面板反而没数字了** —— 观察档
+            // 产出的是「检测到的外泄」，而拦截档把它们就地换掉了，于是
+            // 那条证据链在防护最强的时候断掉，读起来像「什么都没发生」。
+            //
+            // 和 `tool_calls` 同一条理由用可空列：「没开脱敏」和
+            // 「开了但这次没换」是两件事。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN redacted INTEGER;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -267,8 +281,8 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint, session, tool_calls, flagged)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+              client_hint, session, tool_calls, flagged, redacted)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             params![
                 r.id,
                 r.at_ms,
@@ -295,6 +309,7 @@ impl Db {
                 r.session,
                 r.tool_calls,
                 r.flagged,
+                r.redacted,
             ],
         )?;
         Ok(())
@@ -590,7 +605,24 @@ impl Db {
             sub_reqs,
             sub_tokens,
             cache_saved,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
+            flagged_requests,
+            redacted_requests,
+        ): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self.conn.query_row(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(error IS NOT NULL), 0),
@@ -605,7 +637,9 @@ impl Db {
                 COALESCE(SUM(CASE WHEN billing = 'subscription'
                                   THEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
                                   ELSE 0 END), 0),
-                COALESCE(SUM(cache_saved_micros), 0)
+                COALESCE(SUM(cache_saved_micros), 0),
+                COALESCE(SUM(flagged > 0), 0),
+                COALESCE(SUM(redacted > 0), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0",
             params![since_ms, until_ms],
@@ -623,6 +657,8 @@ impl Db {
                     r.get(9)?,
                     r.get(10)?,
                     r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
                 ))
             },
         )?;
@@ -644,6 +680,8 @@ impl Db {
             unpriced_requests: unpriced,
             subscription_requests: sub_reqs,
             subscription_tokens: sub_tokens,
+            flagged_requests,
+            redacted_requests,
             cache_saved_micros: cache_saved,
         })
     }
@@ -827,7 +865,11 @@ impl Db {
                     COUNT(*),
                     SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
              GROUP BY b, {col} ORDER BY b"
@@ -841,6 +883,10 @@ impl Db {
                 failed: r.get(3)?,
                 cost_micros_exact: r.get(4)?,
                 cost_micros_estimated: r.get(5)?,
+                input_tokens: r.get(6)?,
+                output_tokens: r.get(7)?,
+                cache_read_tokens: r.get(8)?,
+                cache_write_tokens: r.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -918,6 +964,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         session: r.get("session")?,
         tool_calls: r.get("tool_calls")?,
         flagged: r.get("flagged")?,
+        redacted: r.get("redacted")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
         path: r.get("path")?,
@@ -965,6 +1012,10 @@ pub struct Summary {
     pub subscription_requests: i64,
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
     pub subscription_tokens: i64,
+    /// 本区间有多少个请求带回了可疑工具调用（防线三）
+    pub flagged_requests: i64,
+    /// 本区间有多少个请求在出站时被脱敏换过内容（防线一的拦截档）
+    pub redacted_requests: i64,
     /// 缓存命中一共省下了多少微分
     pub cache_saved_micros: i64,
 }
@@ -1009,6 +1060,7 @@ mod tests {
             session: None,
             tool_calls: None,
             flagged: None,
+            redacted: None,
             id,
             at_ms,
             client: "claude-code".into(),
@@ -1543,6 +1595,7 @@ mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN redacted;
                      ALTER TABLE requests DROP COLUMN flagged;
                      ALTER TABLE requests DROP COLUMN tool_calls;
                      ALTER TABLE requests DROP COLUMN session;
