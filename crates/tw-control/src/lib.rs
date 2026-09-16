@@ -617,6 +617,8 @@ async fn summary(
         subscription_requests: x.subscription_requests,
         subscription_tokens: x.subscription_tokens,
         cache_saved_micros: x.cache_saved_micros,
+        flagged_requests: x.flagged_requests,
+        redacted_requests: x.redacted_requests,
         pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
     }))
 }
