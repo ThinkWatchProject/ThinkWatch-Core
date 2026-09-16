@@ -18,6 +18,27 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
 const SCHEMA: i64 = 10;
 
+/// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
+///
+/// 价格页上那句「给这个模型配一个价格」能解决的只有这一种。按 token 计费
+/// 的才算 —— 订阅制的那一行不是没有价格，是这笔账不在金额这个维度上。
+///
+/// **每一处数「没有价格」的都用它。**以前各写各的：汇总只看 `cost_micros
+/// IS NULL AND billing = 'per-token'`，于是每一条失败都被数成「模型不在价目
+/// 表里」；时间桶、分组和会话只看 `cost_micros IS NULL`，连订阅制也数了进去。
+const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
+                         AND billing IN ('', 'per-token'))";
+
+/// 这一行算不出钱，**因为没有拿到用量**：上游没报，或者连接在它报之前就
+/// 结束了（客户端取消、WebSocket 会话）。配价格解决不了它，而它多半花了钱，
+/// 合计里缺着它 —— 所以要单独数出来，不能混进「没有价格」，也不能不数。
+///
+/// 只数上游确实接下了的：成功的响应（含 WebSocket 的 101）和客户端取消的。
+/// 失败的不数 —— 响应开始之前的失败不计费，断在中间的会带着用量，归到上面
+/// 那种；上游回了 4xx 的也不数，那种响应不计费。
+const NO_USAGE: &str = "(cost_micros IS NULL AND input_tokens IS NULL AND error IS NULL \
+                         AND billing IN ('', 'per-token') AND (cancelled = 1 OR status < 300))";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("打不开 {path}：{source}")]
@@ -352,9 +373,16 @@ pub struct SessionRow {
     pub turns: i64,
     /// 有价格的那些轮次加起来。**单位是微分**
     pub cost_micros: i64,
-    /// **没有价格的轮数。**三态成本的第三态在会话这一层的样子：
-    /// 「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论
+    /// 其中估算的那部分（客户端取消、断在中间、跨平台借来的价格）。
+    /// **估算不能冒充实测** —— 合计里有它，界面上就得标出来
+    pub cost_micros_estimated: i64,
+    /// 算出了价格的轮数
+    pub priced_turns: i64,
+    /// **没有价格的轮数**（见 `NO_PRICE`）。三态成本的第三态在会话这一层
+    /// 的样子：「$1.23」和「$1.23，另有 4 轮没有价格」是两个不同的结论
     pub unpriced_turns: i64,
+    /// 没有拿到用量、所以算不出钱的轮数（见 `NO_USAGE`）
+    pub no_usage_turns: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -380,6 +408,8 @@ pub struct TurnRow {
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
     pub cancelled: bool,
+    /// 这一轮的金额是估算。**瀑布图上要带记号**
+    pub cost_estimated: bool,
 }
 
 impl Db {
@@ -388,12 +418,12 @@ impl Db {
     /// **本地应答的那些不算轮次**：它们没经过上游，把它们算进
     /// 「这次任务跑了多少轮」会让每个数字都偏大一点，而偏得毫无规律。
     pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRow>, DbError> {
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare(&format!(
             "SELECT session,
                     client,
                     MIN(at_ms), MAX(at_ms), COUNT(*),
                     COALESCE(SUM(cost_micros), 0),
-                    SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
+                    COALESCE(SUM({NO_PRICE}), 0),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0),
@@ -401,13 +431,16 @@ impl Db {
                     COALESCE(SUM(cache_saved_micros), 0),
                     COALESCE(MAX(input_tokens), 0),
                     GROUP_CONCAT(DISTINCT model),
-                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+                    COUNT(cost_micros),
+                    COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
              WHERE session IS NOT NULL AND local = 0
              GROUP BY session
              ORDER BY MAX(at_ms) DESC
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        ))?;
         let rows = st.query_map([limit as i64], |r| {
             Ok(SessionRow {
                 id: r.get(0)?,
@@ -425,6 +458,9 @@ impl Db {
                 peak_input_tokens: r.get(12)?,
                 models: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
                 errors: r.get(14)?,
+                cost_micros_estimated: r.get(15)?,
+                priced_turns: r.get(16)?,
+                no_usage_turns: r.get(17)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -434,7 +470,8 @@ impl Db {
     pub fn turns(&self, session: &str) -> Result<Vec<TurnRow>, DbError> {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
-                    cache_read_tokens, cost_micros, duration_ms, error, cancelled
+                    cache_read_tokens, cost_micros, duration_ms, error, cancelled,
+                    cost_estimated
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -450,6 +487,7 @@ impl Db {
                 duration_ms: r.get(8)?,
                 error: r.get(9)?,
                 cancelled: r.get::<_, i64>(10)? != 0,
+                cost_estimated: r.get::<_, i64>(11)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -585,15 +623,16 @@ impl Db {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let since = now - days * 24 * 3600 * 1000;
-        // 本地应答不算（它本来就没有成本），订阅制也不算（它的成本
-        // 不在这个维度上，标「未知」是对的）
-        let mut st = self.conn.prepare(
+        // **只数配一个价格就能解决的那些**（`NO_PRICE`）。本地应答不算（它
+        // 本来就没有成本），订阅制不算（它的成本不在这个维度上）；失败的、
+        // 没有用量的也不算 —— 给那个模型配价格，那几行照样算不出钱，而这一页
+        // 让人去配的正是价格。
+        let mut st = self.conn.prepare(&format!(
             "SELECT model, COUNT(*) FROM requests \
-             WHERE at_ms >= ?1 AND local = 0 AND cost_micros IS NULL \
-               AND (billing = '' OR billing = 'per-token') \
+             WHERE at_ms >= ?1 AND local = 0 AND {NO_PRICE} \
                AND model IS NOT NULL AND model <> '' \
-             GROUP BY model ORDER BY COUNT(*) DESC LIMIT 20",
-        )?;
+             GROUP BY model ORDER BY COUNT(*) DESC LIMIT 20"
+        ))?;
         let rows = st.query_map([since], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })?;
@@ -626,6 +665,7 @@ impl Db {
             cache_saved,
             flagged_requests,
             redacted_requests,
+            no_usage,
         ): (
             i64,
             i64,
@@ -641,8 +681,10 @@ impl Db {
             i64,
             i64,
             i64,
+            i64,
         ) = self.conn.query_row(
-            "SELECT
+            &format!(
+                "SELECT
                 COUNT(*),
                 COALESCE(SUM(error IS NOT NULL), 0),
                 COALESCE(SUM(input_tokens), 0),
@@ -651,16 +693,18 @@ impl Db {
                 COALESCE(SUM(cache_write_tokens), 0),
                 COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
-                COALESCE(SUM(cost_micros IS NULL AND billing = 'per-token'), 0),
+                COALESCE(SUM({NO_PRICE}), 0),
                 COALESCE(SUM(billing = 'subscription'), 0),
                 COALESCE(SUM(CASE WHEN billing = 'subscription'
                                   THEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
                                   ELSE 0 END), 0),
                 COALESCE(SUM(cache_saved_micros), 0),
                 COALESCE(SUM(flagged > 0), 0),
-                COALESCE(SUM(redacted > 0), 0)
+                COALESCE(SUM(redacted > 0), 0),
+                COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
-             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0",
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0"
+            ),
             params![since_ms, until_ms],
             |r| {
                 Ok((
@@ -678,6 +722,7 @@ impl Db {
                     r.get(11)?,
                     r.get(12)?,
                     r.get(13)?,
+                    r.get(14)?,
                 ))
             },
         )?;
@@ -697,6 +742,7 @@ impl Db {
             cost_micros_exact: exact,
             cost_micros_estimated: estimated,
             unpriced_requests: unpriced,
+            no_usage_requests: no_usage,
             subscription_requests: sub_reqs,
             subscription_tokens: sub_tokens,
             flagged_requests,
@@ -828,17 +874,18 @@ impl Db {
         if bucket_ms <= 0 {
             return Ok(Vec::new());
         }
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare(&format!(
             "SELECT ((at_ms - ?1) / ?3) AS b,
                     COUNT(*),
                     SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
-                    SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END)
+                    COALESCE(SUM({NO_PRICE}), 0),
+                    COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
-             GROUP BY b ORDER BY b",
-        )?;
+             GROUP BY b ORDER BY b"
+        ))?;
         let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
             Ok(tw_api::CostBucket {
                 at_ms: since_ms + r.get::<_, i64>(0)? * bucket_ms,
@@ -847,6 +894,7 @@ impl Db {
                 cost_micros_exact: r.get(3)?,
                 cost_micros_estimated: r.get(4)?,
                 unpriced_requests: r.get(5)?,
+                no_usage_requests: r.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -924,8 +972,9 @@ impl Db {
         let sql = format!(
             "SELECT {col}, COUNT(*),
                     COALESCE(SUM(cost_micros), 0),
-                    SUM(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END),
-                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                    COALESCE(SUM({NO_PRICE}), 0),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND {col} <> ''
              GROUP BY {col} ORDER BY 3 DESC"
@@ -939,6 +988,7 @@ impl Db {
                 unpriced_requests: r.get(3)?,
                 input_tokens: r.get(4)?,
                 output_tokens: r.get(5)?,
+                no_usage_requests: r.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1022,12 +1072,16 @@ pub struct Summary {
     pub cache_write_tokens: i64,
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
-    /// 有多少条请求**根本没有价格**（模型不在价目表里）。
+    /// 有多少条请求**根本没有价格**（模型不在价目表里，见 `NO_PRICE`）。
     ///
     /// 这是成本三态的第三态。把它们当成 0 会让总额悄悄偏低，而用户没有
     /// 任何线索知道少算了什么。**订阅型的不算在这里** —— 那不是
     /// 「不知道价格」，是「这笔账不在这个维度上」。
     pub unpriced_requests: i64,
+    /// 有多少条请求**没有拿到用量**，所以同样算不出钱（见 `NO_USAGE`）。
+    /// 和上面那个分开数：两者都让总额偏低，但只有上面那个是配一个价格
+    /// 就能解决的
+    pub no_usage_requests: i64,
     /// 走订阅型上游的请求数。**不参与金额合计**
     pub subscription_requests: i64,
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
@@ -1721,5 +1775,169 @@ mod permission_tests {
             let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} 的权限是 {mode:o}", f.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod cost_state_tests {
+    use super::tests::row;
+    use super::*;
+
+    /// 响应头之前就失败了：没有状态码、没有用量、没有金额。
+    fn failed_before_usage(id: i64, at: i64) -> RequestRow {
+        let mut r = row(id, at);
+        r.error = Some("`up` 返回 502 Bad Gateway".into());
+        r.status = None;
+        r.input_tokens = None;
+        r.output_tokens = None;
+        r.cache_read_tokens = None;
+        r.cost_micros = None;
+        r
+    }
+
+    /// 上游回了一个正常的响应，但没有报用量。
+    fn without_usage(id: i64, at: i64) -> RequestRow {
+        let mut r = row(id, at);
+        r.input_tokens = None;
+        r.output_tokens = None;
+        r.cache_read_tokens = None;
+        r.cost_micros = None;
+        r
+    }
+
+    /// 用量是有的，价目表里没有这个模型。
+    fn unknown_model(id: i64, at: i64) -> RequestRow {
+        let mut r = row(id, at);
+        r.model = "中转站自己起的名字".into();
+        r.cost_micros = None;
+        r
+    }
+
+    /// **这条是「没有价格」被重新定义的理由。**一条失败的请求没有用量，
+    /// 给它的模型配价格也算不出钱 —— 可以前每一条失败都被数成了「模型不在
+    /// 价目表里」，概览上那句提示在失败多的那天格外响。
+    #[test]
+    fn a_failure_is_not_counted_as_a_model_without_a_price() {
+        let db = Db::in_memory().unwrap();
+        db.insert(&failed_before_usage(1, 100)).unwrap();
+        let s = db.summary(0, 1000).unwrap();
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.unpriced_requests, 0, "一条失败被数成了「没有价格」");
+        assert_eq!(
+            s.no_usage_requests, 0,
+            "响应开始之前的失败不计费，钱没有缺着"
+        );
+    }
+
+    /// 断在中间、带着用量的失败，模型又没有价格：**那一行的钱确实缺着**，
+    /// 而且配一个价格就能补上。
+    #[test]
+    fn a_failure_with_usage_and_an_unknown_model_is_still_unpriced() {
+        let db = Db::in_memory().unwrap();
+        let mut r = unknown_model(1, 100);
+        r.error = Some("流中断：上游断开了".into());
+        db.insert(&r).unwrap();
+        assert_eq!(db.summary(0, 1000).unwrap().unpriced_requests, 1);
+    }
+
+    /// 没有用量的那几种：**钱缺着，但缺的不是价格**。
+    #[test]
+    fn a_response_without_usage_is_counted_as_no_usage_not_as_no_price() {
+        let db = Db::in_memory().unwrap();
+        // 上游没报用量的成功响应
+        db.insert(&without_usage(1, 100)).unwrap();
+        // 响应头之前就被客户端取消的
+        let mut early = without_usage(2, 200);
+        early.status = None;
+        early.cancelled = true;
+        db.insert(&early).unwrap();
+        // 一次 WebSocket 会话
+        let mut ws = without_usage(3, 300);
+        ws.status = Some(101);
+        db.insert(&ws).unwrap();
+        // 上游回了 400 —— 那种响应不计费，**两种都不是**
+        let mut rejected = without_usage(4, 400);
+        rejected.status = Some(400);
+        db.insert(&rejected).unwrap();
+
+        let s = db.summary(0, 1000).unwrap();
+        assert_eq!(s.no_usage_requests, 3);
+        assert_eq!(s.unpriced_requests, 0, "没有用量的被说成了「模型没有价格」");
+        let b = db.cost_buckets(0, 1000, 1000).unwrap();
+        assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (0, 3));
+        let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
+        assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 3));
+    }
+
+    /// 订阅制的那一行**哪一种都不是**：这笔账不在金额这个维度上。汇总早就
+    /// 这么算了，而时间桶、分组和会话以前把它数成了「没有价格」。
+    #[test]
+    fn a_subscription_row_is_neither_anywhere() {
+        let db = Db::in_memory().unwrap();
+        let mut r = row(1, 100);
+        r.billing = "subscription".into();
+        r.cost_micros = None;
+        r.session = Some("s1".into());
+        db.insert(&r).unwrap();
+
+        let b = db.cost_buckets(0, 1000, 1000).unwrap();
+        assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (0, 0));
+        let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
+        assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 0));
+        let s = &db.sessions(10).unwrap()[0];
+        assert_eq!((s.unpriced_turns, s.no_usage_turns), (0, 0));
+        assert_eq!(s.priced_turns, 0, "订阅制那一轮没有价格可言");
+    }
+
+    /// 价格页只列**配一个价格就能解决**的模型。列出一个失败了的、或者
+    /// 上游没报用量的模型，用户照做了，那几行也还是算不出钱。
+    #[test]
+    fn the_pricing_page_lists_only_models_a_price_would_fix() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let db = Db::in_memory().unwrap();
+        let mut failed = failed_before_usage(1, now);
+        failed.model = "失败的那个".into();
+        db.insert(&failed).unwrap();
+        let mut silent = without_usage(2, now);
+        silent.model = "不报用量的那个".into();
+        db.insert(&silent).unwrap();
+        db.insert(&unknown_model(3, now)).unwrap();
+
+        let (n, models) = db.unpriced_recent(7).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(models, vec!["中转站自己起的名字".to_string()]);
+    }
+
+    /// 会话的合计里有估算，**就得说出来**；每一轮也带着自己的记号。
+    #[test]
+    fn a_session_says_how_much_of_its_cost_is_estimated() {
+        let db = Db::in_memory().unwrap();
+        let mut exact = row(1, 100);
+        exact.cost_micros = Some(1_000);
+        let mut estimated = row(2, 200);
+        estimated.cost_micros = Some(300);
+        estimated.cost_estimated = true;
+        estimated.cancelled = true;
+        let silent = without_usage(3, 300);
+        let unknown = unknown_model(4, 400);
+        for mut r in [exact, estimated, silent, unknown] {
+            r.session = Some("s1".into());
+            db.insert(&r).unwrap();
+        }
+
+        let s = &db.sessions(10).unwrap()[0];
+        assert_eq!(s.cost_micros, 1_300);
+        assert_eq!(s.cost_micros_estimated, 300, "合计里的估算部分没有单独说");
+        assert_eq!(s.priced_turns, 2);
+        assert_eq!(s.unpriced_turns, 1);
+        assert_eq!(s.no_usage_turns, 1);
+        let turns = db.turns("s1").unwrap();
+        assert_eq!(
+            turns.iter().map(|t| t.cost_estimated).collect::<Vec<_>>(),
+            vec![false, true, false, false]
+        );
     }
 }

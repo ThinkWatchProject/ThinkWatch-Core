@@ -928,7 +928,11 @@ pub struct CostBucket {
     pub failed: i64,
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
+    /// 价目表里没有这个模型的条数（用量是有的），见 `Summary::unpriced_requests`
     pub unpriced_requests: i64,
+    /// 没有拿到用量的条数，见 `Summary::no_usage_requests`
+    #[serde(default)]
+    pub no_usage_requests: i64,
 }
 
 /// 一个时间桶里，某一个模型（或上游）的那部分。
@@ -966,9 +970,13 @@ pub struct CostGroup {
     pub name: String,
     pub requests: i64,
     pub cost_micros: i64,
+    /// 价目表里没有这个模型的条数（用量是有的）
     pub unpriced_requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// 没有拿到用量的条数
+    #[serde(default)]
+    pub no_usage_requests: i64,
 }
 
 /// 分组维度。**是个枚举不是字符串** —— 它最终来自 query string，
@@ -993,8 +1001,19 @@ pub struct Summary {
     /// 单位是微分（百万分之一美元）
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
-    /// 有多少条请求根本没有价格。**不是 0，是「不知道」**
+    /// 有多少条请求**价目表里没有它的模型**：用量是有的，缺的是单价。
+    /// **不是 0，是「不知道」。**给那个模型配一个价格就能解决。
+    ///
+    /// 失败的、没有用量的、订阅制的都不在这里 —— 配价格对它们没用。
     pub unpriced_requests: i64,
+    /// 有多少条请求**没有拿到用量**，所以同样算不出钱：上游没报，或者连接
+    /// 在它报之前就结束了（客户端取消、WebSocket 会话）。
+    ///
+    /// 和 `unpriced_requests` 一样让金额合计偏低，但配价格解决不了它 ——
+    /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
+    /// 取消的，失败的和上游回了 4xx 的不算。
+    #[serde(default)]
+    pub no_usage_requests: i64,
     /// 走订阅型上游的请求数。**不参与金额合计** ——
     /// 订阅制的边际成本是零，按价目表算出来的数字是纯虚构的
     #[serde(default)]
@@ -1226,9 +1245,18 @@ pub struct SessionView {
     pub turns: u64,
     /// 有价格的那些轮次加起来，单位是**微分**
     pub cost_micros: i64,
-    /// **没有价格的轮数。**「$1.23」和「$1.23，另有 4 轮没有价格」是两个
-    /// 不同的结论
+    /// 其中估算的那部分。**不为 0 时，合计要标成估算** —— 估算不能冒充实测
+    #[serde(default)]
+    pub cost_micros_estimated: i64,
+    /// 算出了价格的轮数。**一轮都没有时，合计不是 $0，是「没有价格」**
+    #[serde(default)]
+    pub priced_turns: u64,
+    /// **价目表里没有那个模型的轮数。**「$1.23」和「$1.23，另有 4 轮没有
+    /// 价格」是两个不同的结论
     pub unpriced_turns: u64,
+    /// 没有拿到用量、所以算不出钱的轮数
+    #[serde(default)]
+    pub no_usage_turns: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -1258,6 +1286,10 @@ pub struct TurnView {
     /// 客户端没等到这一轮结束就走了（见 `HistoryRow::cancelled`）
     #[serde(default)]
     pub cancelled: bool,
+    /// 这一轮的金额是估算。**瀑布图上要带记号** —— 以前这里没有这个字段，
+    /// 估算的金额在瀑布图上和实测的长得一模一样
+    #[serde(default)]
+    pub cost_estimated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
