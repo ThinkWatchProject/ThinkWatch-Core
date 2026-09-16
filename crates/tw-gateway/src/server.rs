@@ -1609,7 +1609,10 @@ async fn pipeline(
                 //
                 // **先报再发错误帧**：客户端恰好在最后这一帧上走掉的话，
                 // 结局已经报过了，不会再被记成一次取消。
-                ending.failed("upstream", format!("流中断：{}", err.message));
+                //
+                // `source` 用这个错误自己的：上游断了是 `upstream`，被
+                // 防火墙切断是 `denied` —— 后者不是上游坏了，是策略拦的。
+                ending.failed(err.source.slug(), format!("流中断：{}", err.message));
                 if is_sse {
                     yield Ok(Bytes::from(err.sse_frame()));
                 }
