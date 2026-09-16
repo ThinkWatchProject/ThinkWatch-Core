@@ -182,6 +182,7 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
         clients: cfg.clients.len(),
         providers: cfg.providers.len(),
         uptime_secs: s.started.elapsed().as_secs(),
+        in_flight: s.gateway.live.count(),
     })
 }
 
