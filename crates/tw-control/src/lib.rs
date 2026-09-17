@@ -206,7 +206,7 @@ fn async_stream_from(
                 // 订阅者跟不上时 broadcast 会丢最老的。**继续收而不是断开** ——
                 // UI 少几行实时日志无所谓，断掉重连才是真的难受。
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "控制面订阅者跟不上，丢了一些事件");
+                    tracing::warn!(dropped = n, "控制面订阅者处理不及，部分事件已丢弃");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -491,7 +491,7 @@ async fn l1(
             cfg.providers
                 .iter()
                 .find(|p| p.name == *n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{n}` 的上游")))?,
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))?,
         ],
         None => cfg.providers.iter().collect(),
     };
@@ -758,7 +758,7 @@ async fn speed_run(
                     total_ms: 0,
                     input_tokens: None,
                     output_tokens: None,
-                    error: Some(format!("取不到凭据：{e}")),
+                    error: Some(format!("无法获取凭据：{e}")),
                 });
                 continue;
             }
@@ -818,7 +818,7 @@ fn targets<'a>(
             cfg.providers
                 .iter()
                 .find(|p| &p.name == n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫「{n}」的上游")))
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))
         })
         .collect()
 }
@@ -869,7 +869,7 @@ async fn request_detail(
         .db()
         .get(id)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
     let at = row.at_ms;
     let body = |which| {
         let raw = g.blobs().get(at, id, which)?;
@@ -969,7 +969,7 @@ fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Reco
     s.store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "请求记录不可用，数据库无法打开或磁盘出错。转发不受影响。".to_string(),
+            "请求记录不可用，数据库无法打开或磁盘出错，转发不受影响".to_string(),
         )
     })
 }
@@ -1334,7 +1334,7 @@ async fn session_detail(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<tw_api::SessionDetail>, (StatusCode, String)> {
     let Some(store) = &s.store else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "观测层没有启动".into()));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "请求记录未启动".into()));
     };
     let g = store.lock().await;
     let session = g
@@ -1344,7 +1344,7 @@ async fn session_detail(
         .iter()
         .find(|x| x.id == id)
         .map(session_view)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{id}` 的会话")))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到会话 {id}")))?;
     let turns = g
         .db()
         .turns(&id)
@@ -1357,7 +1357,7 @@ async fn session_detail(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
-    #[error("控制面 socket {path} 起不来：{source}")]
+    #[error("无法启动控制面 socket {path}：{source}")]
     Bind {
         path: PathBuf,
         source: std::io::Error,
@@ -1367,7 +1367,7 @@ pub enum ControlError {
     /// 给的原话是「path must be shorter than SUN_LEN」，看不出上限是多少、
     /// 也看不出自己超了多少。
     #[error(
-        "控制面 socket 的路径太长：{len} 字节，系统上限是 {max}。\n{path}\n把配置放到一个短一点的目录下（默认的 ~/.thinkwatch 不会有这个问题）。"
+        "控制面 socket 的路径过长：{len} 字节，系统上限为 {max}。\n{path}\n请将配置放在路径较短的目录中（默认的 ~/.thinkwatch 不受此限制）"
     )]
     PathTooLong {
         path: PathBuf,
@@ -1416,7 +1416,7 @@ pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlE
         // 0700：只有当前用户能连。这就是不需要 token 的原因。
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
-    tracing::info!(path = %path.display(), "控制面已监听");
+    tracing::info!(path = %path.display(), "控制面已开始监听");
 
     let app = router(state);
     loop {

@@ -412,23 +412,23 @@ pub enum Outcome2 {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RouteError {
-    #[error("没有任何规则命中，而且没有兜底规则。加一条不带 `when` 的规则收尾。")]
+    #[error("没有规则命中，且缺少兜底规则。请在末尾添加一条不带 when 的规则")]
     NoMatch,
     #[error(
-        "规则 `{0}` 用了 `provider_would_be`，同时又写了 `to`。这会成环 —— 那个条件的值要等路由决定完才知道，而 `to` 正是路由决定的东西。这类规则只能写 `set` / `deny`。"
+        "规则「{0}」同时设置了 provider_would_be 和 to。provider_would_be 要在选定上游之后才能求值，这类规则只能使用 set 或 deny"
     )]
     PhaseTwoWithTo(String),
-    #[error("规则 `{0}` 既没有 `to` 也没有 `deny`，也不改任何参数 —— 它命中了也什么都不做。")]
+    #[error("规则「{0}」没有设置 to、deny 或 set，命中后不产生任何效果")]
     NoAction(String),
-    #[error("规则 `{rule}` 指向 `{target}`，但既没有这个 provider 也没有这个组")]
+    #[error("规则「{rule}」指向的「{target}」既不是上游，也不是策略组")]
     UnknownTarget { rule: String, target: String },
-    #[error("组 `{0}` 里一个 provider 都没有")]
+    #[error("策略组「{0}」中没有任何上游")]
     EmptyGroup(String),
-    #[error("有两条路由都叫 `{0}`。密钥靠名字引用路由，重名的话「分给哪一条」没有答案。")]
+    #[error("存在多条名为「{0}」的路由。网关密钥按名称绑定路由，路由名称必须唯一")]
     DuplicateRoute(String),
-    #[error("`default_route` 指向 `{0}`，但没有这条路由。没绑路由的密钥会一条规则都过不到。")]
+    #[error("default_route 指向的路由「{0}」不存在，未绑定路由的网关密钥将无法匹配任何规则")]
     UnknownDefaultRoute(String),
-    #[error("密钥 `{client}` 绑了路由 `{route}`，但没有这条路由。")]
+    #[error("网关密钥「{client}」绑定的路由「{route}」不存在")]
     UnknownRoute { client: String, route: String },
     #[error(transparent)]
     Match(#[from] MatchError),
@@ -492,7 +492,7 @@ impl Engine {
                 selected: None,
             });
             let fallback = Rule {
-                name: "默认：按声明顺序故障转移".to_string(),
+                name: "默认：按配置顺序故障转移".to_string(),
                 when: When::default(),
                 to: Some(ALL.to_string()),
                 set: None,
@@ -1355,7 +1355,7 @@ mod tests {
         );
         let err = e.validate().unwrap_err();
         assert!(matches!(err, RouteError::PhaseTwoWithTo(_)));
-        assert!(err.to_string().contains("成环"), "{err}");
+        assert!(err.to_string().contains("只能使用 set 或 deny"), "{err}");
     }
 
     #[test]

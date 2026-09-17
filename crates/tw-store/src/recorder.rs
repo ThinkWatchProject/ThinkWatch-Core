@@ -393,7 +393,7 @@ impl Recorder {
                     kind: secret.clone(),
                     masked: masked.clone(),
                 }) {
-                    tracing::debug!("发现记不下来：{e}");
+                    tracing::debug!("泄漏记录写入失败：{e}");
                 }
             }
             // 配置事件、额度事件、扫描告警都不是请求，不落这张表。
@@ -547,7 +547,7 @@ impl Recorder {
     fn write(&self, r: RequestRow) {
         if let Err(e) = self.db.insert(&r) {
             // **不往回抛。**观测挂了，代理照跑。
-            tracing::debug!(id = r.id, "请求记不下来：{e}");
+            tracing::debug!(id = r.id, "请求记录写入失败：{e}");
         }
     }
 
@@ -572,7 +572,7 @@ impl Recorder {
             // 得知道那不是 bug。
             tracing::warn!(
                 free_mb = free / 1024 / 1024,
-                "磁盘级别变了：{}",
+                "磁盘状态已变化：{}",
                 next.label()
             );
             self.level = next;
@@ -584,7 +584,7 @@ impl Recorder {
         let freed = self.blobs.gc(now_ms, keep_days, max_bytes);
         let cutoff = now_ms - (metadata_keep_days as i64) * 86_400_000;
         match self.db.prune_before(cutoff) {
-            Ok(n) if n > 0 => tracing::info!(rows = n, "清掉了过期的请求记录"),
+            Ok(n) if n > 0 => tracing::info!(rows = n, "已清理过期的请求记录"),
             Err(e) => tracing::debug!("清理请求记录失败：{e}"),
             _ => {}
         }

@@ -47,9 +47,9 @@ impl Was {
     }
     fn note(&self) -> &'static str {
         match self {
-            Was::Missing => "原本没有这个字段，还原时删掉它",
-            Was::Value(_) => "原本就有值，还原时写回「原值」",
-            Was::Secret(_) => "原值是密钥，没有抄到这个文件里；去「全文备份」那份文件里取",
+            Was::Missing => "原配置中没有该字段，还原时删除",
+            Was::Value(_) => "原配置中已有该字段，还原时写回「原值」",
+            Was::Secret(_) => "原值是密钥，未写入本文件，请从「全文备份」所指的文件中获取",
         }
     }
 }
@@ -95,14 +95,14 @@ pub fn comment_block(prefix: &str, originals: &[Original]) -> String {
     out.push_str(&format!("{prefix} {BEGIN}\n"));
     for o in originals {
         match &o.was {
-            Was::Missing => out.push_str(&format!("{prefix} 原本没有 {}\n", o.field)),
+            Was::Missing => out.push_str(&format!("{prefix} 原配置中没有 {}\n", o.field)),
             Was::Value(v) | Was::Secret(v) => {
                 out.push_str(&format!("{prefix} 原值 {}: {v}\n", o.field))
             }
         }
     }
     out.push_str(&format!(
-        "{prefix} 要手动还原：把上面这些值改回去（原本没有的就删掉），再删掉本段注释\n"
+        "{prefix} 手动还原方法：将以上字段恢复为原值（原配置中没有的字段直接删除），然后删除本段注释\n"
     ));
     out.push_str(&format!("{prefix} {END}\n"));
     out
@@ -203,9 +203,9 @@ impl SidecarRecord {
     ) -> Self {
         Self {
             what: format!(
-                "ThinkWatch Lite 接管 {client} 时留下的记录。它记着我们改了哪些字段、原来是什么值。"
+                "ThinkWatch Lite 接管 {client} 时生成的记录，记载了修改过的字段及其原值。"
             ),
-            how: "把下面 originals 里的每个字段改回它的「原值」（was 是 missing 表示原本没有这个字段，删掉即可；was 是 secret 表示原值是密钥、请去「全文备份」那份文件里取），然后删掉这个文件。".to_string(),
+            how: "将 originals 中的每个字段恢复为「原值」（was 为 missing 表示原配置中没有该字段，直接删除即可；was 为 secret 表示原值是密钥，请从「全文备份」所指的文件中获取），然后删除本文件。".to_string(),
             client: client.to_string(),
             adopted_at_ms: at_ms,
             backup: backup.to_string(),
@@ -247,7 +247,7 @@ mod tests {
         // 可能已经在废纸篓里了 —— 那段注释是他唯一的线索。
         let b = comment_block("#", &originals());
         assert!(b.contains("https://api.anthropic.com"), "原值没写进去：{b}");
-        assert!(b.contains("要手动还原"), "没告诉他能做什么：{b}");
+        assert!(b.contains("手动还原方法"), "没告诉他能做什么：{b}");
         assert!(b.contains(BEGIN) && b.contains(END), "{b}");
     }
 
@@ -258,7 +258,7 @@ mod tests {
         // 的字段。
         let b = comment_block("#", &originals());
         assert!(
-            b.contains("原本没有 env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
+            b.contains("原配置中没有 env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
             "{b}"
         );
         assert!(

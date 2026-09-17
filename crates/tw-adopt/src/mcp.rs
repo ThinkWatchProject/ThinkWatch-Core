@@ -16,15 +16,15 @@ use crate::json::Val;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    #[error("不认识的客户端 `{0}`")]
+    #[error("未知的客户端 {0}")]
     UnknownClient(String),
-    #[error("{client} 的 MCP 配置解析不了，没有动它：{msg}")]
+    #[error("无法解析 {client} 的 MCP 配置，未做任何修改：{msg}")]
     Parse { client: String, msg: String },
     #[error("{0}")]
     Write(#[from] ForeignError),
-    #[error("{client} 里没有叫 `{name}` 的 MCP server")]
+    #[error("{client} 中没有名为「{name}」的 MCP server")]
     NotThere { client: String, name: String },
-    #[error("{client} 的 MCP 配置格式我们没有验证过，不往里写（{why}）")]
+    #[error("{client} 的 MCP 配置格式未经验证，不支持写入（{why}）")]
     NotCopyable { client: String, why: String },
 }
 
@@ -98,7 +98,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "mcp",
             copyable: false,
-            why_not: "它的 MCP 段格式我们没有实际样本，照着猜写进去可能生成一份它读不懂的配置",
+            why_not: "该客户端的 MCP 配置格式尚未验证，写入可能导致客户端无法读取配置",
         },
         Target {
             client: "zed",
@@ -107,7 +107,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "context_servers",
             copyable: false,
-            why_not: "Zed 的 context server 用的是另一套结构，不是 command/args 那一套",
+            why_not: "Zed 的 context server 使用不同的配置结构，不支持 command/args 形式",
         },
     ]
 }
@@ -146,7 +146,7 @@ fn semantic(t: &Target, text: &str) -> Result<Val, McpError> {
     match t.format {
         Format::Json => crate::json::value(text).map_err(|e| parse_err(t.client, e)),
         Format::Toml => crate::toml::value(text).map_err(|e| parse_err(t.client, e)),
-        Format::Yaml => Err(parse_err(t.client, "MCP 不走 YAML")),
+        Format::Yaml => Err(parse_err(t.client, "MCP 配置不使用 YAML 格式")),
     }
 }
 
@@ -154,7 +154,7 @@ fn put(t: &Target, text: &str, path: &[&str], v: &Val) -> Result<String, McpErro
     match t.format {
         Format::Json => crate::json::set(text, path, v).map_err(|e| parse_err(t.client, e)),
         Format::Toml => crate::toml::set(text, path, v).map_err(|e| parse_err(t.client, e)),
-        Format::Yaml => Err(parse_err(t.client, "MCP 不走 YAML")),
+        Format::Yaml => Err(parse_err(t.client, "MCP 配置不使用 YAML 格式")),
     }
 }
 
@@ -162,7 +162,7 @@ fn drop_(t: &Target, text: &str, path: &[&str]) -> Result<String, McpError> {
     match t.format {
         Format::Json => crate::json::remove(text, path).map_err(|e| parse_err(t.client, e)),
         Format::Toml => crate::toml::remove(text, path).map_err(|e| parse_err(t.client, e)),
-        Format::Yaml => Err(parse_err(t.client, "MCP 不走 YAML")),
+        Format::Yaml => Err(parse_err(t.client, "MCP 配置不使用 YAML 格式")),
     }
 }
 
@@ -198,7 +198,7 @@ pub fn read_server(t: &Target, home: &Path, name: &str) -> Result<Val, McpError>
     }
     let v = semantic(t, &text)?;
     let Val::Obj(root) = &v else {
-        return Err(parse_err(t.client, "根不是一个对象"));
+        return Err(parse_err(t.client, "根节点不是对象"));
     };
     let servers = root.iter().find(|(k, _)| k == t.key).map(|(_, v)| v);
     match servers {
@@ -295,13 +295,13 @@ pub fn apply(t: &Target, plan: &Plan, backup_root: &Path) -> Result<Applied, Mcp
             let got = match t.format {
                 Format::Json => crate::json::value(text).map_err(|e| e.to_string())?,
                 Format::Toml => crate::toml::value(text).map_err(|e| e.to_string())?,
-                Format::Yaml => return Err("MCP 不走 YAML".into()),
+                Format::Yaml => return Err("MCP 配置不使用 YAML 格式".into()),
             };
             if strip(&got).normalized() != untouched {
-                return Err(format!("除了 {key} 之外还有别的东西变了"));
+                return Err(format!("除 {key} 之外还有其他内容发生了变化"));
             }
             if got.normalized() != want.normalized() {
-                return Err("改完的内容和预期对不上".into());
+                return Err("修改后的内容与预期不一致".into());
             }
             Ok(())
         },

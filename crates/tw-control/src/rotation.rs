@@ -72,7 +72,7 @@ async fn persist(state: &crate::ControlState, r: &Rotated) -> (bool, String) {
     (
         false,
         format!(
-            "{last}。重启之前请处理：修好这个文件（多半是权限或者它正被别的程序占着），修好之后下一次轮换会自动写进去；实在不行就重新走一次授权换一份新凭据"
+            "{last}。请在重启前处理：检查该文件的权限，以及是否被其他程序占用。问题解决后，下一次轮换会自动写回；如仍无法写回，请重新授权以获取新凭据"
         ),
     )
 }
@@ -81,7 +81,7 @@ async fn once(state: &crate::ControlState, r: &Rotated) -> Result<String, String
     let cur = state
         .cfg
         .current()
-        .map_err(|e| format!("读不到 config.yaml：{e}"))?;
+        .map_err(|e| format!("无法读取 config.yaml：{e}"))?;
     // 打完补丁的文本自己会先被解析一遍（`patch_oauth_refresh` 里），
     // 所以到这儿的一定是一份能加载的配置
     let patched = tw_config::patch_oauth_refresh(&cur.text, &r.provider, &r.refresh)
@@ -146,13 +146,13 @@ providers:
         // 轮换在飞的时候用户把这家删了。**不猜位置** —— 在一个装着
         // 明文密钥的文件里猜结构是不能接受的
         let e = tw_config::patch_oauth_refresh(CFG, "已经删掉了", "rt-NEW").unwrap_err();
-        assert!(e.to_string().contains("没有叫"), "{e}");
+        assert!(e.to_string().contains("已不存在上游"), "{e}");
     }
 
     #[test]
     fn a_provider_without_oauth_is_refused_rather_than_rewritten() {
         let e = tw_config::patch_oauth_refresh(CFG, "官方", "rt-NEW").unwrap_err();
-        assert!(e.to_string().contains("不在预期的位置上"), "{e}");
+        assert!(e.to_string().contains("无法定位"), "{e}");
     }
 
     #[test]

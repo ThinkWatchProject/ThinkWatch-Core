@@ -48,7 +48,7 @@ impl TakesEffect {
     pub fn note(&self) -> &'static str {
         match self {
             TakesEffect::Immediately => "下一个请求即使用新配置。",
-            TakesEffect::OnRestart => "重新打开终端后生效，在此之前网关收不到该客户端的请求。",
+            TakesEffect::OnRestart => "重新打开终端后生效，在此之前网关不会收到该客户端的请求。",
         }
     }
     /// 该不该设「还没收到请求」的超时提示。
@@ -189,9 +189,9 @@ pub fn adoptable() -> Vec<Client> {
             // **`settings.local.json` 优先级更高。**cc-switch #6828 栽在这里
             shadowed_by: &[".claude/settings.local.json"],
             costs: &[
-                "Remote Control 和语音输入会被禁用 —— 只要 base URL 不是官方域名就会。",
-                "MCP tool search 默认关闭。",
-                "它可能会弹一次自己的欢迎页，点掉就行。",
+                "接口地址不是官方域名时，Remote Control 和语音输入不可用。",
+                "MCP tool search 将默认关闭。",
+                "Claude Code 可能会显示一次欢迎页，关闭即可。",
             ],
             verified: Verified::FieldsOnly,
             marker: &[".claude"],
@@ -216,8 +216,8 @@ pub fn adoptable() -> Vec<Client> {
             // 所以它不构成遮蔽 —— 但它确实存在，值得在诊断里提一句
             shadowed_by: &[],
             costs: &[
-                "它不问我们要模型列表，所以自定义模型名对它无效 —— 那个清单来自本地的模型目录文件。",
-                "改完要关掉终端重开。",
+                "Codex CLI 不从网关获取模型列表，自定义模型名无效，模型列表以本地的模型目录文件为准。",
+                "修改后需要重新打开终端。",
             ],
             verified: Verified::Measured,
             marker: &[".codex"],
@@ -232,7 +232,7 @@ pub fn adoptable() -> Vec<Client> {
             format: Format::Json,
             takes_effect: TakesEffect::OnRestart,
             shadowed_by: &[],
-            costs: &["改完要重开。"],
+            costs: &["修改后需要重新启动 opencode。"],
             verified: Verified::FieldsOnly,
             marker: &[".config/opencode", ".local/share/opencode"],
             process: &["opencode"],
@@ -248,7 +248,7 @@ pub fn adoptable() -> Vec<Client> {
             shadowed_by: &[],
             // **只算部分接管**：Zed 的密钥走它自己的凭据存储，不在
             // settings.json 里，我们写不进去。
-            costs: &["密钥要你自己在 Zed 的界面里填一次 —— 它不放在配置文件里，我们够不着。"],
+            costs: &["Zed 的密钥不保存在配置文件中，需要在 Zed 的设置界面中手动填写一次。"],
             verified: Verified::FieldsOnly,
             marker: &[".config/zed"],
             process: &["Zed"],
@@ -265,8 +265,8 @@ pub fn adoptable() -> Vec<Client> {
             // 我们只写 home 那一份，所以项目里的会盖住它
             shadowed_by: &[],
             costs: &[
-                "它按 home → 仓库根 → 当前目录的顺序找配置，后面的会盖住前面的 —— 我们只写 home 那一份。",
-                "改完要重开。",
+                "Aider 依次读取主目录、Git 项目根目录和当前目录中的配置，后读取的会覆盖先读取的，接管只修改主目录中的配置。",
+                "修改后需要重新启动 Aider。",
             ],
             verified: Verified::FieldsOnly,
             // 没接管过的用户本来就没有这个文件，所以它自己就是那个痕迹

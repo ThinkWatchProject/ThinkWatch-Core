@@ -20,7 +20,7 @@ fn find(id: &str) -> Result<tw_adopt::clients::Client, Fail> {
     adoptable()
         .into_iter()
         .find(|c| c.id == id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{id}` 的客户端")))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未知的客户端 {id}")))
 }
 
 /// 客户端该连的地址。
@@ -38,14 +38,13 @@ fn gateway_for(s: &ControlState, key_name: Option<&str>) -> Result<Gateway, Fail
         Some(n) => cfg.clients.iter().find(|c| c.name == n).ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                format!("config.yaml 里没有叫 `{n}` 的网关密钥"),
+                format!("config.yaml 中没有名为「{n}」的网关密钥"),
             )
         })?,
         None => cfg.clients.first().ok_or_else(|| {
             (
                 StatusCode::CONFLICT,
-                "config.yaml 里还没有任何网关密钥 —— 先在配置页加一个，再来接管客户端。"
-                    .to_string(),
+                "config.yaml 中尚无网关密钥，请先创建网关密钥，再接管客户端".to_string(),
             )
         })?,
     };
@@ -107,7 +106,7 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
 /// **界面上永远不显示真正的密钥**，diff 里也不行 —— 用户会截图这一屏
 /// 来问「这样对吗」。落盘写的仍然是真值，[`tw_api::PlanView`] 上那两个
 /// 字段的文档里写清了这一点。
-const MASK: &str = "«config.yaml 里的那把网关密钥»";
+const MASK: &str = "«config.yaml 中的网关密钥»";
 
 fn mask(text: &str, key: Option<&str>) -> String {
     match key {
@@ -273,7 +272,7 @@ fn mcp_plan(s: &ControlState, req: &tw_api::McpOpRequest) -> Result<tw_adopt::mc
             let v = tw_adopt::mcp::read_server(&from, &s.home, &req.name).map_err(mcp_err)?;
             tw_adopt::mcp::plan_copy(&to, &s.home, &req.name, &v).map_err(mcp_err)
         }
-        other => Err((StatusCode::BAD_REQUEST, format!("不认识的操作 `{other}`"))),
+        other => Err((StatusCode::BAD_REQUEST, format!("不支持的操作 {other}"))),
     }
 }
 

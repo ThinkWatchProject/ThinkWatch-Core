@@ -348,7 +348,7 @@ async fn a_client_whose_mcp_shape_we_have_not_verified_refuses_and_explains() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{out}");
-    assert!(out.contains("没有验证过"), "{out}");
+    assert!(out.contains("未经验证"), "{out}");
 }
 
 #[tokio::test]
@@ -476,7 +476,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
     let b = bed_with_store(Some(store));
     let (st, body) = post(&b.app, "/replay/quote", r#"{"id":1,"provider":"官方"}"#).await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("不一样的请求"), "{body}");
+    assert!(body.contains("无法原样重放"), "{body}");
 }
 
 #[tokio::test]
@@ -537,13 +537,13 @@ async fn the_bundle_is_something_a_person_will_actually_read() {
         "## 监听",
         "## 上游",
         "## 安全",
-        "## 观测",
+        "## 请求记录",
         "## config.yaml",
     ] {
         assert!(text.contains(section), "少了 {section}：\n{text}");
     }
-    // 第一屏就要提醒他自己扫一眼
-    assert!(text.contains("交出去之前请自己扫一眼"), "{text}");
+    // 第一屏就要提醒他自己检查一遍
+    assert!(text.contains("发送本文件之前，请再次检查"), "{text}");
 }
 
 #[tokio::test]
@@ -552,7 +552,7 @@ async fn the_bundle_says_it_has_no_bodies_because_that_is_the_dangerous_part() {
     // 他自己打开的，不会被顺手贴进 issue。
     let b = bed();
     let (_, text) = get(&b.app, "/diagnostics").await;
-    assert!(text.contains("不含请求体和响应体"), "{text}");
+    assert!(text.contains("不包含请求体和响应体"), "{text}");
 }
 
 #[tokio::test]
@@ -560,6 +560,6 @@ async fn a_bundle_without_observability_says_so_rather_than_showing_zeros() {
     // 「没有记录」和「记录了零条」是两个结论。
     let b = bed();
     let (_, text) = get(&b.app, "/diagnostics").await;
-    assert!(text.contains("没有启动"), "{text}");
+    assert!(text.contains("未启动，此期间的请求未被记录"), "{text}");
     assert!(!text.contains("请求条数 | 0"), "{text}");
 }

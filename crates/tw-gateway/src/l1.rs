@@ -181,7 +181,7 @@ pub fn hop_for(
     match p.proxy.as_str() {
         tw_config::DIRECT => Ok(None),
         tw_config::SYSTEM => Err(
-            "该上游使用系统代理，代理地址在建立连接时才能确定，链路测速无法测量。如需测速，请将代理配置为命名代理。"
+            "该上游使用系统代理，代理地址在建立连接时才能确定，链路测速无法测量。如需测速，请将代理配置为命名代理"
                 .into(),
         ),
         name => {
@@ -189,7 +189,7 @@ pub fn hop_for(
                 .proxies
                 .iter()
                 .find(|x| x.name == name)
-                .ok_or_else(|| format!("上游「{}」使用的代理「{name}」未在 proxies 中定义。", p.name))?;
+                .ok_or_else(|| format!("上游「{}」使用的代理「{name}」未在 proxies 中定义", p.name))?;
             hop_of(px).map(Some)
         }
     }
@@ -397,11 +397,11 @@ async fn resolve(t: &mut Timer, host: &str, port: u16, stage: Stage) -> Result<S
         .map_err(|e| {
             if e == timed_out() {
                 format!(
-                    "解析 {host} 超过 {} 秒未完成，DNS 服务器可能无法访问。",
+                    "解析 {host} 超过 {} 秒未完成，DNS 服务器可能无法访问",
                     PHASE_TIMEOUT.as_secs()
                 )
             } else {
-                format!("无法解析 {host}。请检查域名拼写；如果该地址需要经代理访问，请先配置代理。")
+                format!("无法解析 {host}。请检查域名拼写；如果该地址需要经代理访问，请先配置代理")
             }
         })?;
     let addr = it
@@ -492,11 +492,11 @@ async fn connect_via_proxy(
 fn tcp_message(e: &str, addr: SocketAddr) -> String {
     let l = e.to_ascii_lowercase();
     if l.contains("refused") {
-        format!("{addr} 拒绝连接，该端口上没有服务在监听。请检查地址和端口。")
+        format!("{addr} 拒绝连接，该端口上没有服务在监听。请检查地址和端口")
     } else if e == timed_out() || l.contains("timed out") {
-        format!("连接 {addr} 没有响应。请检查网络，或确认该地址是否需要经代理访问。")
+        format!("连接 {addr} 没有响应。请检查网络，或确认该地址是否需要经代理访问")
     } else if l.contains("unreachable") {
-        format!("无法访问 {addr} 所在的网络，请检查本机网络。")
+        format!("无法访问 {addr} 所在的网络，请检查本机网络")
     } else {
         format!("无法连接 {addr}：{e}")
     }
@@ -544,7 +544,7 @@ async fn socks5_connect(
     read_exact(io, &mut m).await?;
     if m[0] != 0x05 {
         return Err(format!(
-            "代理的响应不是 SOCKS5 协议（版本字节 0x{:02x}），该端口上可能是 HTTP 代理。",
+            "代理的响应不是 SOCKS5 协议（版本字节 0x{:02x}），该端口上可能是 HTTP 代理",
             m[0]
         ));
     }
@@ -669,7 +669,7 @@ async fn http_connect(
     let code = line.split_whitespace().nth(1).unwrap_or("");
     match code {
         "200" => Ok(()),
-        "407" => Err("代理要求认证（HTTP 407），请检查用户名和密码。".into()),
+        "407" => Err("代理要求认证（HTTP 407），请检查用户名和密码".into()),
         "" => Err(format!("代理返回了无法识别的响应：{line}")),
         c => Err(format!("代理拒绝了 CONNECT 请求（HTTP {c}）：{line}")),
     }
@@ -737,21 +737,19 @@ fn tls_message(e: &std::io::Error) -> String {
     // 塞进 `Other`，那些结构化变体在这个平台上永远不会出现 —— 按枚举
     // 匹配的结果是每一种失败都拿到那句最泛的提示，包括证书只是过期时。
     let d = detail.to_ascii_lowercase();
-    let hint = if d.contains("expired")
-        || d.contains("not valid yet")
-        || d.contains("not yet valid")
-    {
-        "证书已过期或尚未生效，也可能是本机时间不准确，请先核对系统时间。"
-    } else if d.contains("issuer")
-        || d.contains("self-signed")
-        || d.contains("self signed")
-        || d.contains("untrusted")
-        || d.contains("not trusted")
-    {
-        "证书的签发者不在系统信任列表中。如果本机安装了抓包工具或企业根证书，证书链可能已被替换。"
-    } else {
-        "如果网络中有抓包工具或企业代理拦截 TLS 连接，也会出现此错误。"
-    };
+    let hint =
+        if d.contains("expired") || d.contains("not valid yet") || d.contains("not yet valid") {
+            "证书已过期或尚未生效，也可能是本机时间不准确，请先核对系统时间"
+        } else if d.contains("issuer")
+            || d.contains("self-signed")
+            || d.contains("self signed")
+            || d.contains("untrusted")
+            || d.contains("not trusted")
+        {
+            "证书的签发者不在系统信任列表中。如果本机安装了抓包工具或企业根证书，证书链可能已被替换"
+        } else {
+            "如果网络中有抓包工具或企业代理拦截 TLS 连接，也会出现此错误"
+        };
     format!("证书验证未通过：{detail}。{hint}")
 }
 

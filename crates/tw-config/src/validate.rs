@@ -5,28 +5,30 @@ use crate::{Config, SCHEMA_VERSION};
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error(
-        "配置 schema 版本是 {found}，这个版本的 twcore 只认到 {supported}。\n请升级应用，或把配置改回旧格式。"
+        "配置的 schema 版本为 {found}，当前版本的 twcore 最高支持 {supported}。请升级应用，或将配置改回旧格式"
     )]
     SchemaTooNew { found: u32, supported: u32 },
     #[error(
-        "配置里一个 client 都没有。没有网关密钥的话，任何请求都会被拒绝 —— 首次启动本应自动生成一把。"
+        "配置中没有任何网关密钥（clients），所有请求都会被拒绝。首次启动时应已自动生成一个网关密钥"
     )]
     NoClients,
-    #[error("provider 名字重复：{0}。名字是路由规则里引用它的方式，必须唯一。")]
+    #[error("上游名称重复：{0}。路由规则按名称引用上游，名称必须唯一")]
     DuplicateProvider(String),
-    #[error("client 名字重复：{0}")]
+    #[error("网关密钥名称重复：{0}")]
     DuplicateClient(String),
-    #[error("两个 client 用了同一把密钥（{0} 和 {1}）。密钥就是身份，重复等于这两个客户端分不开。")]
+    #[error("网关密钥「{0}」与「{1}」的值相同。网关按密钥区分客户端，密钥值必须唯一")]
     DuplicateKey(String, String),
-    #[error("provider `{name}` 的 base_url 不是 http/https：{url}")]
+    #[error("上游「{name}」的接口地址不是 http 或 https 地址：{url}")]
     BadBaseUrl { name: String, url: String },
-    #[error("client `{name}` 的密钥是空的")]
+    #[error("网关密钥「{name}」的值为空")]
     EmptyKey { name: String },
-    #[error("路由配置有问题：{0}")]
+    #[error("路由配置有误：{0}")]
     Routing(#[from] tw_engine::RouteError),
-    #[error("`{0}` 既是 provider 名又是组名。规则里的 `to` 会指向哪个是不确定的，改掉其中一个。")]
+    #[error(
+        "「{0}」既是上游名称又是策略组名称，规则中的 to 无法确定指向哪一个，请修改其中一个名称"
+    )]
     NameCollision(String),
-    #[error("listen.gateway.allow_from 里的 `{entry}` 写错了：{reason}")]
+    #[error("listen.gateway.allow_from 中的「{entry}」有误：{reason}")]
     BadCidr { entry: String, reason: String },
     #[error("上游「{name}」的凭据：{source}")]
     Credential {
@@ -35,13 +37,13 @@ pub enum ValidationError {
     },
     #[error("{0}")]
     Pricing(#[from] tw_pricing::SheetError),
-    #[error("上游「{provider}」选的价目表「{sheet}」不存在")]
+    #[error("上游「{provider}」使用的价目表「{sheet}」不存在")]
     UnknownPriceSheet { provider: String, sheet: String },
     #[error(
-        "上游「{name}」的启用范围（models_only）是空的，这样它一个模型都不服务。暂时不用这家上游的话，请停用它（disabled: true）"
+        "上游「{name}」的启用范围（models_only）为空，该上游将不提供任何模型。如需暂停使用该上游，请将其停用（disabled: true）"
     )]
     EmptyModelsOnly { name: String },
-    #[error("上游「{name}」的启用范围（models_only）里有一项是空的")]
+    #[error("上游「{name}」的启用范围（models_only）中存在空项")]
     BlankModelsOnly { name: String },
 }
 
@@ -137,7 +139,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             let _ = e;
             return Err(ValidationError::BadCidr {
                 entry: entry.clone(),
-                reason: "不是合法的 IP 或 CIDR，写法是 `192.168.0.0/16`".to_string(),
+                reason: "不是合法的 IP 地址或 CIDR，应写成 192.168.0.0/16 的形式".to_string(),
             });
         }
     }

@@ -443,7 +443,7 @@ fn removing_a_key_removes_that_entry_and_nothing_else() {
         let out = match remove_key(&doc, &target.path) {
             Ok(o) => o,
             // 列表项里唯一的键：明确拒绝，不是失败
-            Err(PatchError::NotFound(m)) if m.contains("唯一的键") => continue,
+            Err(PatchError::NotFound(m)) if m.contains("只有这一个键") => continue,
             Err(PatchError::AnchorOrAlias(_)) | Err(PatchError::Duplicate(_)) => continue,
             Err(e) => panic!("seed {seed}：{} 删不掉：{e}\n{doc}", show(&target.path)),
         };

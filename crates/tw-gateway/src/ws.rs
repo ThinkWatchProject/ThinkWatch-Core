@@ -127,7 +127,7 @@ pub async fn proxy(
         ) {
             Ok(r) => r,
             Err(e) => {
-                let why = format!("上游地址不是合法的 WS 地址：{e}");
+                let why = format!("上游地址不是合法的 WebSocket 地址：{e}");
                 ending.failed("config", why.clone());
                 close_with(client, &why).await;
                 return;
@@ -143,7 +143,7 @@ pub async fn proxy(
                 req.headers_mut().insert(n, v);
             }
             _ => {
-                let why = format!("这家的请求头「{name}」里有不能放进请求头的字符");
+                let why = format!("上游的请求头「{name}」包含请求头中不允许的字符");
                 ending.failed("config", why.clone());
                 close_with(client, &why).await;
                 return;
@@ -153,7 +153,7 @@ pub async fn proxy(
     let up = match dial(&upstream_url, req).await {
         Ok(x) => x,
         Err(e) => {
-            let why = format!("连不上上游的 WebSocket：{e}");
+            let why = format!("无法连接上游的 WebSocket：{e}");
             ending.failed("upstream", why.clone());
             close_with(client, &why).await;
             return;
@@ -206,10 +206,10 @@ async fn dial(
     };
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
-        .map_err(|e| format!("连不上 {host}:{port}：{e}"))?;
+        .map_err(|e| format!("无法连接 {host}:{port}：{e}"))?;
     let io: Box<dyn Io> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| format!("`{host}` 不是一个能放进 SNI 的主机名"))?;
+            .map_err(|_| format!("{host} 不是有效的 TLS 主机名"))?;
         let conn = tokio_rustls::TlsConnector::from(crate::l1::tls_config());
         Box::new(conn.connect(name, tcp).await.map_err(|e| e.to_string())?)
     } else {
@@ -286,7 +286,7 @@ async fn pump(
                     Message::Close(_) => break End::Closed,
                 };
                 if let Err(e) = u_tx.send(out).await {
-                    break End::Broke(format!("写给上游失败：{e}"));
+                    break End::Broke(format!("向上游发送数据失败：{e}"));
                 }
             }
             // 上游 → 客户端：先还原占位符，再过工具墙
@@ -306,7 +306,7 @@ async fn pump(
                         for h in &hits {
                             if h.high && p.cut && !deadly {
                                 why = format!(
-                                    "`{}` 返回的 `{}` 调用命中「{}」（{}），已切断连接。这个上游标记为不受信任。",
+                                    "上游「{}」（非官方端点）返回的 {} 调用命中规则「{}」（{}），已切断连接",
                                     p.provider, h.tool, h.rule, h.why
                                 );
                             }
@@ -327,7 +327,7 @@ async fn pump(
                             // **命中那一帧不发。**和 SSE 那条路同一条纪律：
                             // 先判断再转发，而不是发完再说
                             let _ = c_tx.send(Message::Text(
-                                "[ThinkWatch] 上游返回了一个高危工具调用，这条连接已切断。".into(),
+                                "[ThinkWatch] 上游返回了高危工具调用，连接已切断".into(),
                             )).await;
                             break End::Cut(why);
                         }

@@ -231,7 +231,7 @@ pub fn read(v: &Version) -> Result<String, StoreError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackError {
-    #[error("历史里没有 {0} 这一版")]
+    #[error("版本历史中没有 {0}")]
     NoSuchVersion(String),
     #[error(transparent)]
     Store(#[from] StoreError),

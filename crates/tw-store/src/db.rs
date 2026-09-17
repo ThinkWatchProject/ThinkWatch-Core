@@ -41,7 +41,7 @@ const NO_USAGE: &str = "(cost_micros IS NULL AND input_tokens IS NULL AND error 
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
-    #[error("打不开 {path}：{source}")]
+    #[error("无法打开 {path}：{source}")]
     Open {
         path: String,
         source: rusqlite::Error,
@@ -49,7 +49,7 @@ pub enum DbError {
     /// 库是更新版本的程序建的。**只能读不能写** —— 硬写会让那个版本的
     /// 数据变成半新半旧，而用户回到新版本时已经修不回来了。
     #[error(
-        "数据库的 schema 版本是 {found}，这个版本的 twcore 只认到 {supported}。请升级应用；实在要用旧版的话，把 {path} 挪走会重新建一个空库（历史记录会看不见，但不会丢）。"
+        "数据库的 schema 版本为 {found}，当前版本的 twcore 最高支持 {supported}。请升级应用；如需继续使用当前版本，可将 {path} 移至其他位置，程序会新建空数据库，原有请求记录不会被删除"
     )]
     TooNew {
         found: i64,
@@ -1737,7 +1737,7 @@ mod tests {
         assert!(matches!(e, DbError::TooNew { .. }), "{e:?}");
         let m = e.to_string();
         assert!(m.contains("升级"), "{m}");
-        assert!(m.contains("不会丢"), "得说清历史记录的下场：{m}");
+        assert!(m.contains("不会被删除"), "得说清历史记录的下场：{m}");
     }
 
     #[test]

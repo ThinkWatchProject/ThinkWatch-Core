@@ -57,7 +57,7 @@ pub struct RuleFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
-    #[error("内置规则文件坏了：{0}")]
+    #[error("内置规则文件无法解析：{0}")]
     Builtin(String),
 }
 
@@ -131,7 +131,7 @@ fn compile(spec: &RuleSpec, group: &'static str, custom: bool, out: &mut Rules) 
         // 工作的安全功能等于没有。但它必须**大声**说出来 —— 静默失效
         // 比没有更糟，因为用户以为它在
         Err(e) => out.warnings.push(format!(
-            "规则 `{}` 的正则写不通，这一条没有生效：{e}",
+            "规则「{}」的正则表达式有误，该规则未生效：{e}",
             spec.id
         )),
     }
@@ -166,7 +166,7 @@ pub fn build(user: &tw_config::ScanRules) -> Result<Rules, RuleError> {
     for id in &user.disable {
         if !out.disabled.contains(id) {
             out.warnings
-                .push(format!("`{id}` 不是内置规则的 id，这一条停用没有生效"));
+                .push(format!("「{id}」不是内置规则的 id，停用未生效"));
         }
     }
     for spec in &user.add {
