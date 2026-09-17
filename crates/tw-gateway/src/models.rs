@@ -100,15 +100,7 @@ pub struct Directory {
 /// **OAuth 只看账号，不看 token**：refresh token 轮换一次就重问一遍，问到的
 /// 是同一份清单。
 fn identity(cfg: &tw_config::Config, p: &tw_config::Provider) -> String {
-    let key = match &p.key {
-        tw_config::Secret::Literal(v) => v.clone(),
-        tw_config::Secret::OAuth { oauth } => format!(
-            "oauth|{}|{}",
-            oauth.endpoint,
-            oauth.client_id.as_deref().unwrap_or_default()
-        ),
-        tw_config::Secret::Unknown(_) => String::new(),
-    };
+    let key = p.credential_identity();
     let raw = format!(
         "{}|{key}|{:?}|{}",
         p.base_url,
@@ -180,11 +172,12 @@ impl Directory {
                     provider: p.name.clone(),
                     protocol: p
                         .effective_protocol()
-                        .map(|x| format!("{x:?}"))
-                        // 猜不出协议时按 Anthropic 算 —— 和转发时的默认一致
-                        // （forward::apply_credential）。两处不一致会让「列出来
+                        // 猜不出协议时按 Anthropic 算 —— 和放凭据时的默认一致
+                        // （`tw_config::auth_header`）。两处不一致会让「列出来
                         // 了但发过去 401」变成可能。
-                        .unwrap_or_else(|| "Anthropic".to_string()),
+                        .unwrap_or(tw_config::Protocol::Anthropic)
+                        .slug()
+                        .to_string(),
                     known: l.source != Source::None,
                     models: l.models.into_iter().filter(|m| p.uses_model(m)).collect(),
                 }
@@ -261,11 +254,11 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
 async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer {
     // 用这一家自己的 client：它带着该走的代理，换 OAuth token 也要走那条路
     let http = rt.clients.get(&p.name).unwrap_or(&state.http);
-    let key = match state.key_for(p, http).await {
-        Ok(k) => k,
+    let headers = match state.headers_for(p, http, None).await {
+        Ok(h) => h,
         Err(e) => return Answer::Failed(format!("取不到凭据：{e}")),
     };
-    let r = crate::probe::probe(http, &p.base_url, &key, p.effective_protocol()).await;
+    let r = crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await;
     if !r.ok {
         return Answer::Failed(r.error.unwrap_or_else(|| "检测失败".to_string()));
     }
@@ -458,7 +451,7 @@ mod tests {
         tw_config::Provider {
             name: name.into(),
             base_url: format!("https://{name}.example"),
-            key: "sk".into(),
+            key: Some("sk".into()),
             ..Default::default()
         }
     }

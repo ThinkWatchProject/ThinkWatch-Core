@@ -113,12 +113,22 @@ async fn delete_provider(
 /// 这个选项说清楚它此刻会选成什么 —— 这套判断只在 core 里写一遍。
 async fn preview_provider(
     Json(req): Json<tw_api::ProviderPreviewRequest>,
-) -> Json<tw_api::ProviderPreview> {
+) -> Result<Json<tw_api::ProviderPreview>, Fail> {
     let p = tw_config::Provider {
         base_url: req.base_url.trim().to_string(),
         ..Default::default()
     };
-    Json(tw_api::ProviderPreview {
+    // 选定了协议，密钥就按选定的协议放；「自动识别」那一项要说的仍是按地址推断的结果
+    let chosen = tw_config::Provider {
+        protocol: req
+            .protocol
+            .as_deref()
+            .map(|v| slug("接口协议", v))
+            .transpose()
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?,
+        ..p.clone()
+    };
+    Ok(Json(tw_api::ProviderPreview {
         protocol: p.effective_protocol().map(|x| x.slug().to_string()),
         official: p.is_official_endpoint(),
         redact: p
@@ -126,7 +136,8 @@ async fn preview_provider(
             .iter()
             .map(|k| k.slug().to_string())
             .collect(),
-    })
+        auth_header: chosen.auth_header().0.to_string(),
+    }))
 }
 
 /// 检测一个上游，**不保存**。
@@ -162,27 +173,35 @@ async fn test_provider(
         Ok(h) => h,
         Err(e) => return Ok(Json(failed(e.message))),
     };
-    let key = match (&req.provider.key, existing) {
-        // 凭据没改：走网关那条路。OAuth 的缓存和轮换写回都在那儿
-        (None, Some(e)) => s.gateway.key_for(e, &http).await,
-        (Some(tw_api::CredentialInput::Oauth { access, .. }), _) => {
+    // OAuth 的 token：新填的那份只能用现成的 access token；沿用原来那份时走网关，
+    // **按原来的名字换** —— 缓存和轮换写回都认名字，而表单里可能刚改了名
+    let token = match (&req.provider.oauth, existing) {
+        (tw_api::OAuthChange::Set { access, .. }, _) => {
             // **不拿 refresh token 去换。**服务端可能当场作废旧的那把，而
             // 新换到的那把还没有地方写 —— 检测一次就把凭据弄坏了
-            match access.as_deref().filter(|a| !a.is_empty()) {
-                Some(a) => Ok(a.to_string()),
-                None => Err(
-                    "OAuth 凭据需要保存后才能检测。要现在检测，请同时填写 access token。"
-                        .to_string(),
-                ),
+            match access.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                Some(a) => Some(a.to_string()),
+                None => {
+                    return Ok(Json(failed(
+                        "OAuth 凭据需要保存后才能检测。要现在检测，请同时填写 access token。"
+                            .to_string(),
+                    )));
+                }
             }
         }
-        _ => p.resolved_key().map_err(|e| e.to_string()),
+        (tw_api::OAuthChange::Keep, Some(e)) if e.oauth.is_some() && p.oauth.is_some() => {
+            match s.gateway.oauth_token_for(e, &http).await {
+                Ok(t) => Some(t),
+                Err(e) => return Ok(Json(failed(e))),
+            }
+        }
+        _ => None,
     };
-    let key = match key {
-        Ok(k) => k,
-        Err(e) => return Ok(Json(failed(e))),
+    let headers = match p.outbound_headers(token.as_deref(), None) {
+        Ok(h) => h,
+        Err(e) => return Ok(Json(failed(e.to_string()))),
     };
-    let r = tw_gateway::probe(&http, &p.base_url, &key, protocol).await;
+    let r = tw_gateway::probe(&http, &p.base_url, &headers, protocol).await;
     Ok(Json(tw_api::ProviderTestResult {
         ok: r.ok,
         protocol: protocol.map(|x| x.slug().to_string()),
@@ -268,14 +287,70 @@ fn to_provider(
         (None, None) => return Err("接口地址不能为空".to_string()),
     };
     let key = match (&input.key, existing) {
-        (Some(c), _) => credential(c)?,
-        (None, Some(e)) => e.key.clone(),
-        (None, None) => return Err("缺少凭据".to_string()),
+        (tw_api::SecretChange::Keep, Some(e)) => e.key.clone(),
+        (tw_api::SecretChange::Keep, None) | (tw_api::SecretChange::None, _) => None,
+        (tw_api::SecretChange::Set { value }, _) => {
+            let v = value.trim();
+            if v.is_empty() {
+                return Err("密钥不能为空".to_string());
+            }
+            Some(tw_config::Secret::new(v))
+        }
     };
-    Ok(tw_config::Provider {
+    let headers = input
+        .headers
+        .iter()
+        .map(|h| {
+            let name = h.name.trim().to_string();
+            let value = match &h.value {
+                Some(v) => tw_config::Secret::new(v.trim()),
+                // 沿用原值：界面拿不到打码之前的值，这一行不动就不传
+                None => existing
+                    .and_then(|e| e.headers.get(&name))
+                    .map(|x| x.value.clone())
+                    .ok_or_else(|| format!("请求头「{name}」缺少值"))?,
+            };
+            Ok(tw_config::Header { name, value })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let oauth = match (&input.oauth, existing) {
+        (tw_api::OAuthChange::Keep, Some(e)) => e.oauth.clone(),
+        (tw_api::OAuthChange::Keep, None) | (tw_api::OAuthChange::None, _) => None,
+        (
+            tw_api::OAuthChange::Set {
+                refresh,
+                endpoint,
+                client_id,
+                client_secret,
+                access,
+            },
+            _,
+        ) => {
+            let nonempty = |v: &Option<String>| {
+                v.as_deref()
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+            };
+            Some(tw_config::OAuth {
+                access: nonempty(access),
+                refresh: refresh.trim().to_string(),
+                endpoint: endpoint.trim().to_string(),
+                client_id: nonempty(client_id),
+                client_secret: nonempty(client_secret),
+                // 沿用原来写的提前量：界面不编辑它
+                refresh_before: existing
+                    .and_then(|e| e.oauth.as_ref())
+                    .and_then(|o| o.refresh_before.clone()),
+            })
+        }
+    };
+    let provider = tw_config::Provider {
         name,
         base_url,
         key,
+        headers: tw_config::Headers::new(headers),
+        oauth,
         protocol: input
             .protocol
             .as_deref()
@@ -314,61 +389,11 @@ fn to_provider(
             .map(|ms| ms.iter().map(|m| m.trim().to_string()).collect::<Vec<_>>()),
         pricing: input.pricing.clone(),
         disabled: input.disabled,
-    })
-}
-
-fn credential(c: &tw_api::CredentialInput) -> Result<tw_config::Secret, String> {
-    use tw_api::CredentialInput::*;
-    Ok(match c {
-        Key { value } => {
-            let v = value.trim();
-            if v.is_empty() {
-                return Err("密钥不能为空".to_string());
-            }
-            // `${` 在配置里表示「从环境变量读」。一把真的含 `${` 的明文密钥
-            // 写进去会被当成变量展开 —— 说清楚，而不是写一个读回来就变了的值
-            if v.contains("${") {
-                return Err("密钥里不能出现 `${`。要从环境变量读，请选择「环境变量」".to_string());
-            }
-            tw_config::Secret::Literal(v.to_string())
-        }
-        Env { var } => {
-            let v = var.trim();
-            let ok = !v.is_empty()
-                && !v.starts_with(|c: char| c.is_ascii_digit())
-                && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if !ok {
-                return Err(format!(
-                    "环境变量名「{v}」不合法：只能由字母、数字和下划线组成，且不以数字开头"
-                ));
-            }
-            tw_config::Secret::Literal(format!("${{{v}}}"))
-        }
-        Oauth {
-            refresh,
-            endpoint,
-            client_id,
-            client_secret,
-            access,
-        } => {
-            let nonempty = |v: &Option<String>| {
-                v.as_deref()
-                    .map(str::trim)
-                    .filter(|x| !x.is_empty())
-                    .map(str::to_string)
-            };
-            tw_config::Secret::OAuth {
-                oauth: tw_config::OAuth {
-                    access: nonempty(access),
-                    refresh: refresh.trim().to_string(),
-                    endpoint: endpoint.trim().to_string(),
-                    client_id: nonempty(client_id),
-                    client_secret: nonempty(client_secret),
-                    refresh_before: None,
-                },
-            }
-        }
-    })
+    };
+    // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时
+    // 报一条指着 YAML 的错误
+    provider.check_credential().map_err(|e| e.to_string())?;
+    Ok(provider)
 }
 
 // ─────────────────────────────────────────────────────────── 代理
@@ -488,7 +513,7 @@ fn to_proxy(
             }
             Some(tw_config::proxy::ProxyAuth {
                 user: user.to_string(),
-                pass: tw_config::Secret::Literal(pass.clone()),
+                pass: tw_config::Secret::new(pass.clone()),
             })
         }
     };

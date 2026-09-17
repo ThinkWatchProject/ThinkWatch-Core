@@ -539,19 +539,17 @@ pub struct ProviderView {
     pub base_url: String,
     /// 地址里有被打码的部分（userinfo 之类）
     pub base_url_masked: bool,
-    /// 密钥的**来源**，不是值
-    pub key_source: String,
-    /// `key` / `env` / `oauth`
-    pub key_kind: String,
-    /// `env` 时是哪个变量。变量名不是秘密，而它正是编辑时要回填的东西
+    /// API 密钥：打过码的值，或者环境变量名。没有密钥是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_env: Option<String>,
-    /// `oauth` 时的 token 端点和 client id。**refresh token 和 client
-    /// secret 永远不出这个进程**
+    pub key: Option<SecretView>,
+    /// 密钥放在哪个请求头里发：`x-api-key` / `authorization` / `x-goog-api-key`
+    pub auth_header: String,
+    /// 其余请求头，按配置里的顺序
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HeaderView>,
+    /// OAuth 的 token 端点和 client id。**refresh token 和 client secret 永远不出这个进程**
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth_endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth_client_id: Option<String>,
+    pub oauth: Option<OAuthView>,
     /// 实际生效的协议：`anthropic` / `openai-chat` / `openai-responses` /
     /// `gemini`。猜不出来时为空
     pub protocol: Option<String>,
@@ -598,6 +596,34 @@ pub struct ProviderView {
     /// 选的价目表。空 = 默认价目表
     #[serde(default)]
     pub pricing: Option<String>,
+}
+
+/// 一个可能是密钥的值给界面看的样子。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecretView {
+    /// 打过码的值，或者 `环境变量 ${NAME}`
+    pub display: String,
+    /// 整个值恰好是一个 `${NAME}` 时的变量名。变量名不是秘密，编辑时要回填
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+}
+
+/// 一行请求头给界面看的样子。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeaderView {
+    pub name: String,
+    /// **可能是密钥的值是打过码的**；公开的头（`anthropic-version` 之类）、
+    /// 只由环境变量和占位符组成的值原样给
+    pub value: String,
+    /// 值打过码。编辑时这一行不回填，留空表示保持原值
+    pub masked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OAuthView {
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 /// 配置里引用了某个上游的一处。
@@ -1049,9 +1075,16 @@ pub struct ProviderInput {
     /// 会把码写进配置
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// 修改时**不给就是保持原样** —— 界面拿不到原值，也不该拿到
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<CredentialInput>,
+    /// API 密钥。修改时默认保持原样 —— 界面拿不到原值，也不该拿到
+    #[serde(default)]
+    pub key: SecretChange,
+    /// 请求头，按顺序。**整张表就是保存之后的样子**：没列出来的行被删掉，
+    /// 某一行不给 `value` 表示沿用同名那一行的原值
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HeaderInput>,
+    /// OAuth。修改时默认保持原样
+    #[serde(default)]
+    pub oauth: OAuthChange,
     /// `anthropic` / `openai-chat` / `openai-responses` / `gemini`。
     /// 不给就按地址推断
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1090,6 +1123,9 @@ pub struct ProviderInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderPreviewRequest {
     pub base_url: String,
+    /// 表单里选定的协议。不给就是「自动识别」。只影响 `auth_header`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1101,6 +1137,9 @@ pub struct ProviderPreview {
     pub official: bool,
     /// 自动识别时发送前脱敏的类别
     pub redact: Vec<String>,
+    /// API 密钥放在哪个请求头里：`x-api-key` / `authorization` / `x-goog-api-key`。
+    /// 选定了协议按选定的算，否则按推断出的
+    pub auth_header: String,
 }
 
 /// 一个上游的模型清单。
@@ -1144,16 +1183,34 @@ fn fail_closed() -> String {
     "fail".to_string()
 }
 
-/// 凭据的三种写法。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CredentialInput {
-    /// 明文写进配置
-    Key { value: String },
-    /// 从环境变量读，只写变量名
-    Env { var: String },
-    /// OAuth，带自动刷新
-    Oauth {
+/// 一个密钥类的值怎么改。**三态**，因为视图里拿不到原值：不动就得有「保持原样」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SecretChange {
+    #[default]
+    Keep,
+    None,
+    /// 可以写 `${ENV}` 从环境变量读
+    Set {
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeaderInput {
+    pub name: String,
+    /// 不给表示沿用同名那一行的原值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum OAuthChange {
+    #[default]
+    Keep,
+    None,
+    Set {
         refresh: String,
         endpoint: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

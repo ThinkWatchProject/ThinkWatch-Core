@@ -165,12 +165,16 @@ pub async fn run(
     // OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
     // 必须走同一条路** —— 否则一个 OAuth 上游在重放里永远是「密钥取不到」
     let pk_http = s.gateway.client_for(&provider.name);
-    let key = s.gateway.key_for(provider, &pk_http).await.map_err(|e| {
-        fail(
-            StatusCode::BAD_REQUEST,
-            format!("`{}` 的密钥取不到：{e}", provider.name),
-        )
-    })?;
+    let headers = s
+        .gateway
+        .headers_for(provider, &pk_http, None)
+        .await
+        .map_err(|e| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                format!("`{}` 的凭据取不到：{e}", provider.name),
+            )
+        })?;
 
     // **脱敏照做。**重放不经过数据面的管线，少了这一行，一条本来会被
     // 脱敏的请求会因为「重放」这个动作把密钥原样发给中转站
@@ -185,7 +189,7 @@ pub async fn run(
     let http = s.http().clone();
     let started = Instant::now();
     let mut r = http.post(&url).header("content-type", "application/json");
-    r = tw_gateway::forward::apply_credential(r, provider.effective_protocol(), &key);
+    r = tw_gateway::forward::apply_headers(r, &headers);
     let resp = r.body(body).send().await.map_err(|e| {
         fail(
             StatusCode::BAD_GATEWAY,

@@ -12,7 +12,7 @@
 
 use tw_config::Protocol;
 
-use crate::error::Dialect;
+use crate::client_api::ClientApi;
 
 /// 这一次要不要翻译，往哪个方向。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,9 +28,9 @@ pub enum Plan {
 /// **认不出来就直通。**猜一个转换方向的代价是「请求被改成了另一个样子
 /// 然后上游 400」，比不转难查得多 —— 而不转的表现是上游直接告诉你
 /// 「我不认识这个格式」，那条错误信息本身就是线索。
-pub fn plan(client: Dialect, upstream: Option<Protocol>) -> Plan {
+pub fn plan(client: Option<ClientApi>, upstream: Option<Protocol>) -> Plan {
     match (client, upstream) {
-        (Dialect::Anthropic, Some(Protocol::OpenaiChat)) => Plan::AnthropicToOpenai,
+        (Some(ClientApi::AnthropicMessages), Some(Protocol::OpenaiChat)) => Plan::AnthropicToOpenai,
         _ => Plan::Passthrough,
     }
 }
@@ -71,14 +71,23 @@ mod tests {
     fn same_dialect_is_always_passthrough() {
         // **九成五走这条**，它一个字节都不该被碰。
         assert_eq!(
-            plan(Dialect::Anthropic, Some(Protocol::Anthropic)),
+            plan(
+                Some(ClientApi::AnthropicMessages),
+                Some(Protocol::Anthropic)
+            ),
             Plan::Passthrough
         );
         assert_eq!(
-            plan(Dialect::Openai, Some(Protocol::OpenaiChat)),
+            plan(Some(ClientApi::OpenaiChat), Some(Protocol::OpenaiChat)),
             Plan::Passthrough
         );
-        assert!(!plan(Dialect::Anthropic, Some(Protocol::Anthropic)).active());
+        assert!(
+            !plan(
+                Some(ClientApi::AnthropicMessages),
+                Some(Protocol::Anthropic)
+            )
+            .active()
+        );
     }
 
     #[test]
@@ -86,7 +95,10 @@ mod tests {
         // 那是这个功能存在的全部理由：手上一把 DeepSeek 的 key，
         // 想让 Claude Code 用上。
         assert_eq!(
-            plan(Dialect::Anthropic, Some(Protocol::OpenaiChat)),
+            plan(
+                Some(ClientApi::AnthropicMessages),
+                Some(Protocol::OpenaiChat)
+            ),
             Plan::AnthropicToOpenai
         );
     }
@@ -101,14 +113,18 @@ mod tests {
             Some(Protocol::OpenaiResponses),
             None,
         ] {
-            assert_eq!(plan(Dialect::Anthropic, up), Plan::Passthrough, "{up:?}");
+            assert_eq!(
+                plan(Some(ClientApi::AnthropicMessages), up),
+                Plan::Passthrough,
+                "{up:?}"
+            );
         }
         assert_eq!(
-            plan(Dialect::Openai, Some(Protocol::Anthropic)),
+            plan(Some(ClientApi::OpenaiChat), Some(Protocol::Anthropic)),
             Plan::Passthrough
         );
         assert_eq!(
-            plan(Dialect::Gemini, Some(Protocol::OpenaiChat)),
+            plan(Some(ClientApi::Gemini), Some(Protocol::OpenaiChat)),
             Plan::Passthrough
         );
     }

@@ -114,8 +114,7 @@ pub async fn proxy(
     state: AppState,
     client: WebSocket,
     upstream_url: String,
-    key: String,
-    protocol: Option<tw_config::Protocol>,
+    upstream_headers: Vec<(String, String)>,
     provider: tw_config::Provider,
     guard: tw_engine::Guard,
     rules: Arc<tw_scan::rules::Rules>,
@@ -134,16 +133,19 @@ pub async fn proxy(
                 return;
             }
         };
-    {
-        let (name, value) = crate::forward::credential_header(protocol, &key);
-        match value.parse() {
-            Ok(v) => {
-                req.headers_mut().insert(name, v);
+    for (name, value) in &upstream_headers {
+        let parsed = (
+            name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>(),
+            value.parse::<tokio_tungstenite::tungstenite::http::HeaderValue>(),
+        );
+        match parsed {
+            (Ok(n), Ok(v)) => {
+                req.headers_mut().insert(n, v);
             }
-            Err(_) => {
-                let why = "这家的密钥里有不能放进请求头的字符";
-                ending.failed("config", why.to_string());
-                close_with(client, why).await;
+            _ => {
+                let why = format!("这家的请求头「{name}」里有不能放进请求头的字符");
+                ending.failed("config", why.clone());
+                close_with(client, &why).await;
                 return;
             }
         }

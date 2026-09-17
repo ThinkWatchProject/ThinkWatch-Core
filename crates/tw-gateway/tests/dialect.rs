@@ -104,7 +104,7 @@ async fn start_gateway(
         providers: vec![Provider {
             name: "deepseek".into(),
             base_url: format!("http://{up}"),
-            key: "sk-deepseek".into(),
+            key: Some("sk-deepseek".into()),
             // **这一行是整个功能的开关**
             protocol: Some(tw_config::Protocol::OpenaiChat),
             redact: Some(vec![]),

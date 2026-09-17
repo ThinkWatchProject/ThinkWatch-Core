@@ -113,15 +113,21 @@ impl Catalog {
     /// - `None`（不写）→ 只按方言过滤。默认，绝大多数情况
     /// - `Some(非空)` → 在方言过滤的基础上再按 glob 保留
     /// - `Some(空)` → **一个都不给**。「临时禁用这个客户端」的正当用法
-    pub fn resolve_allowed(&self, dialect: Option<&str>, allow: Option<&[String]>) -> Vec<String> {
+    pub fn resolve_allowed(
+        &self,
+        protocols: Option<&[&str]>,
+        allow: Option<&[String]>,
+    ) -> Vec<String> {
         let by_dialect: BTreeSet<&str> = self
             .by_model
             .iter()
-            .filter(|(_, provs)| match dialect {
-                // 至少有一家说这个方言的上游能提供它
-                Some(d) => provs
-                    .iter()
-                    .any(|p| self.protocols.get(p).map(|x| x.as_str()) == Some(d)),
+            .filter(|(_, provs)| match protocols {
+                // 至少有一家能服务这种请求的上游提供它（同协议，或者有现成转换）
+                Some(ok) => provs.iter().any(|p| {
+                    self.protocols
+                        .get(p)
+                        .is_some_and(|x| ok.contains(&x.as_str()))
+                }),
                 // 不知道方言就不过滤 —— 猜错了会把用户能用的模型藏起来，
                 // 而那比多列几个更难查。
                 None => true,
@@ -140,8 +146,13 @@ impl Catalog {
     }
 
     /// 这个客户端能用这个模型吗。和上面同一套逻辑。
-    pub fn admits(&self, model: &str, dialect: Option<&str>, allow: Option<&[String]>) -> bool {
-        self.resolve_allowed(dialect, allow)
+    pub fn admits(
+        &self,
+        model: &str,
+        protocols: Option<&[&str]>,
+        allow: Option<&[String]>,
+    ) -> bool {
+        self.resolve_allowed(protocols, allow)
             .iter()
             .any(|m| m == model)
     }
@@ -220,11 +231,11 @@ mod tests {
         // Claude Code 说 anthropic 方言 → 看不到 ollama 的模型。
         let c = catalog();
         assert_eq!(
-            c.resolve_allowed(Some("anthropic"), None),
+            c.resolve_allowed(Some(&["anthropic"]), None),
             owned(&["claude-haiku-4-5", "claude-opus-4-1", "claude-sonnet-4-5"])
         );
         assert_eq!(
-            c.resolve_allowed(Some("openai-chat"), None),
+            c.resolve_allowed(Some(&["openai-chat"]), None),
             owned(&["llama-4", "qwen3-coder"])
         );
     }
@@ -241,7 +252,7 @@ mod tests {
     fn allow_narrows_on_top_of_the_dialect_filter() {
         let c = catalog();
         assert_eq!(
-            c.resolve_allowed(Some("anthropic"), Some(&owned(&["claude-haiku-*"]))),
+            c.resolve_allowed(Some(&["anthropic"]), Some(&owned(&["claude-haiku-*"]))),
             owned(&["claude-haiku-4-5"])
         );
     }
@@ -252,8 +263,11 @@ mod tests {
         // 分歧本身就说明容易搞错。YAML 里「字段缺失」和「空数组」天然
         // 可区分，所以我们能表达得清楚。
         let c = catalog();
-        assert!(c.resolve_allowed(Some("anthropic"), Some(&[])).is_empty());
-        assert!(!c.resolve_allowed(Some("anthropic"), None).is_empty());
+        assert!(
+            c.resolve_allowed(Some(&["anthropic"]), Some(&[]))
+                .is_empty()
+        );
+        assert!(!c.resolve_allowed(Some(&["anthropic"]), None).is_empty());
     }
 
     #[test]
@@ -262,7 +276,7 @@ mod tests {
         let c = catalog();
         assert_eq!(
             c.resolve_allowed(
-                Some("anthropic"),
+                Some(&["anthropic"]),
                 Some(&owned(&["claude-opus-4-1", "claude-sonnet-4-5"]))
             ),
             owned(&["claude-opus-4-1", "claude-sonnet-4-5"])
@@ -275,7 +289,7 @@ mod tests {
         // 否则它不会凭空出现。
         let c = catalog();
         assert!(
-            c.resolve_allowed(Some("anthropic"), Some(&owned(&["gpt-9"])))
+            c.resolve_allowed(Some(&["anthropic"]), Some(&owned(&["gpt-9"])))
                 .is_empty()
         );
     }
@@ -285,7 +299,7 @@ mod tests {
         // 这是这个模块存在的核心理由：**一个函数，两处调用**。
         // 两处各写一遍的话，「列表里有但用不了」这种状态迟早出现。
         let c = catalog();
-        for dialect in [Some("anthropic"), Some("openai-chat"), None] {
+        for dialect in [Some(&["anthropic"][..]), Some(&["openai-chat"][..]), None] {
             for allow in [None, Some(owned(&["claude-*"])), Some(vec![])] {
                 let listed = c.resolve_allowed(dialect, allow.as_deref());
                 for m in &listed {
@@ -305,7 +319,7 @@ mod tests {
         // 上游一个都没探到时（都不实现 /v1/models 且没写 models 兜底）。
         let c = Catalog::default();
         assert!(c.is_empty());
-        assert!(c.resolve_allowed(Some("anthropic"), None).is_empty());
+        assert!(c.resolve_allowed(Some(&["anthropic"]), None).is_empty());
         assert!(!c.admits("anything", None, None));
     }
 }
