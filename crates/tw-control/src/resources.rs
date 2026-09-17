@@ -29,6 +29,7 @@ pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
         .route("/providers", post(create_provider))
         .route("/providers/test", post(test_provider))
+        .route("/providers/preview", post(preview_provider))
         .route(
             "/providers/{name}",
             put(update_provider).delete(delete_provider),
@@ -104,6 +105,28 @@ async fn delete_provider(
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 按接口地址自动识别会得到什么：协议、是不是官方端点、默认脱敏哪几类。
+///
+/// **不联网，只看地址。**编辑对话框在用户输入地址时调它，好让「自动识别」
+/// 这个选项说清楚它此刻会选成什么 —— 这套判断只在 core 里写一遍。
+async fn preview_provider(
+    Json(req): Json<tw_api::ProviderPreviewRequest>,
+) -> Json<tw_api::ProviderPreview> {
+    let p = tw_config::Provider {
+        base_url: req.base_url.trim().to_string(),
+        ..Default::default()
+    };
+    Json(tw_api::ProviderPreview {
+        protocol: p.effective_protocol().map(|x| x.slug().to_string()),
+        official: p.is_official_endpoint(),
+        redact: p
+            .effective_redact()
+            .iter()
+            .map(|k| k.slug().to_string())
+            .collect(),
+    })
 }
 
 /// 检测一个上游，**不保存**。

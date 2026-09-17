@@ -38,7 +38,7 @@ pub fn router() -> axum::Router<ControlState> {
         .route("/pricing/sheets", post(create_sheet))
         .route(
             "/pricing/sheets/{name}",
-            put(update_sheet).delete(delete_sheet),
+            get(sheet).put(update_sheet).delete(delete_sheet),
         )
 }
 
@@ -479,20 +479,40 @@ fn search(
 
 // ─────────────────────────────────────────────────────────── 自定义价目表
 
+/// 一张价目表的完整定义。编辑对话框从这里取。
+async fn sheet(
+    State(s): State<ControlState>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Json<tw_api::PriceSheetInput>, Fail> {
+    let cfg = s.config();
+    let def = cfg
+        .pricing
+        .sheet(&name)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的价目表")))?;
+    Ok(Json(tw_api::PriceSheetInput {
+        name: def.name.clone(),
+        multiplier: def.multiplier,
+        models: def
+            .models
+            .iter()
+            .map(|(m, p)| (m.clone(), price_fields(p)))
+            .collect(),
+    }))
+}
+
 async fn create_sheet(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::PriceSheetSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let version = s
         .cfg
-        .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
+        .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
             let def = sheet_def(&req.sheet).map_err(invalid)?;
-            Ok(edit::upsert(
-                text,
-                edit::PRICE_SHEETS,
-                None,
-                &mapping(&def)?,
-            )?)
+            let mut out = edit::upsert(text, edit::PRICE_SHEETS, None, &mapping(&def)?)?;
+            if let Some(used_by) = &req.used_by {
+                out = assign(&out, cfg, None, &def.name, used_by)?;
+            }
+            Ok(out)
         })
         .await
         .map_err(apply_fail)?;
@@ -513,6 +533,9 @@ async fn update_sheet(
                 // **和那一张在同一个版本里改** —— 分两次写的话，中间那一版的
                 // 上游选着一张不存在的价目表，会被校验拒掉
                 out = refs::rename_sheet(&out, cfg, &name, &def.name)?;
+            }
+            if let Some(used_by) = &req.used_by {
+                out = assign(&out, cfg, Some(&name), &def.name, used_by)?;
             }
             Ok(out)
         })
@@ -541,6 +564,45 @@ async fn delete_sheet(
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 让恰好 `used_by` 这几家上游使用价目表 `name`。
+///
+/// `cfg` 是写之前的那一份（下标对得上）；`old` 是改名前的名字 —— 改名的
+/// 引用已经跟着改过，所以原来用 `old` 的上游这时候用的是 `name`。
+fn assign(
+    text: &str,
+    cfg: &tw_config::Config,
+    old: Option<&str>,
+    name: &str,
+    used_by: &[String],
+) -> Result<String, ApplyError> {
+    if let Some(missing) = used_by
+        .iter()
+        .find(|u| !cfg.providers.iter().any(|p| &p.name == *u))
+    {
+        return Err(ApplyError::Edit(edit::EditError::NotFound {
+            what: "上游",
+            name: missing.clone(),
+        }));
+    }
+    let mut out = text.to_string();
+    for (i, p) in cfg.providers.iter().enumerate() {
+        let current = match p.pricing.as_deref() {
+            Some(s) if Some(s) == old => Some(name),
+            other => other,
+        };
+        let path = [Step::key("providers"), Step::Index(i), Step::key("pricing")];
+        match (used_by.contains(&p.name), current == Some(name)) {
+            (true, false) => {
+                out = edit::set(&out, &path, Some(&Value::String(name.to_string())))?;
+            }
+            // 原来用它、不在列表里的：改回默认价目表
+            (false, true) => out = edit::set(&out, &path, None)?,
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// 概览里的自定义价目表。
