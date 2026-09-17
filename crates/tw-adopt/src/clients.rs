@@ -36,11 +36,19 @@ pub enum TakesEffect {
 }
 
 impl TakesEffect {
-    /// 接管完成那一屏要说的话。**在那一刻说，不是等五分钟后再说。**
+    /// 控制面发给界面的值。接管完成那一屏由界面按它说明什么时候生效 ——
+    /// **在那一刻说，不是等五分钟后再说。**
+    pub fn slug(&self) -> &'static str {
+        match self {
+            TakesEffect::Immediately => "immediately",
+            TakesEffect::OnRestart => "on_restart",
+        }
+    }
+    /// 接管提示和诊断结论里的那一句。
     pub fn note(&self) -> &'static str {
         match self {
-            TakesEffect::Immediately => "下一个请求就会走新配置。",
-            TakesEffect::OnRestart => "需要关掉终端重开才生效 —— 在那之前收不到请求是正常的。",
+            TakesEffect::Immediately => "下一个请求即使用新配置。",
+            TakesEffect::OnRestart => "重新打开终端后生效，在此之前网关收不到该客户端的请求。",
         }
     }
     /// 该不该设「还没收到请求」的超时提示。
@@ -63,10 +71,18 @@ pub enum Verified {
 }
 
 impl Verified {
+    /// 控制面发给界面的值。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Verified::Measured => "measured",
+            Verified::FieldsOnly => "fields_only",
+        }
+    }
+    /// 命令行里的说法。
     pub fn note(&self) -> &'static str {
         match self {
-            Verified::Measured => "本机实测过",
-            Verified::FieldsOnly => "字段查证过，但没有在本机实跑验证",
+            Verified::Measured => "已在本机实际运行验证",
+            Verified::FieldsOnly => "字段名已查证，尚未在本机实际运行验证",
         }
     }
 }
@@ -269,33 +285,44 @@ pub fn adoptable() -> Vec<Client> {
 /// 用户以为所有流量都在我们这儿。
 pub struct ManualOnly {
     pub name: &'static str,
-    pub how: &'static str,
+    /// 手动配置的步骤。`{v1}` 是带 `/v1` 的网关地址，`{base}` 是不带的
+    steps: &'static str,
     pub caveat: &'static str,
+}
+
+impl ManualOnly {
+    /// 手动配置的步骤，**网关地址已经填好**。以前这里写的是「填我们的
+    /// 地址」，用户还得自己去找那个地址是什么。
+    pub fn how(&self, gw: &Gateway) -> String {
+        self.steps
+            .replace("{v1}", &gw.v1())
+            .replace("{base}", gw.base.trim_end_matches('/'))
+    }
 }
 
 pub fn manual_only() -> Vec<ManualOnly> {
     vec![
         ManualOnly {
             name: "Cursor",
-            how: "设置 → Models → Override OpenAI Base URL，填我们的地址。",
-            caveat: "即使改了，Tab 补全和 inline edit 仍然走 Cursor 自己的后端，不会经过我们。所以它只能算「部分接管」。",
+            steps: "在 Cursor 的「Settings → Models」中开启 Override OpenAI Base URL，填写 {v1}。",
+            caveat: "Tab 补全与 inline edit 仍由 Cursor 自身的服务处理，不经过网关，因此只能部分接管。",
         },
         ManualOnly {
             name: "Continue",
-            how: "在 ~/.continue/config.yaml 的 models: 列表里加一条，把 apiBase 指向我们的地址。",
+            steps: "在 ~/.continue/config.yaml 的 models 列表中添加一项，将 apiBase 设为 {v1}。",
             // **接管它要往一个 YAML 列表里插一个新条目**，那是结构性
             // 改写，不是替换一个标量。我们的 YAML 补丁只做后者
             // （见 crate::yaml 开头那段）。宁可少接管一个客户端，也不
             // 要写一段我们自己没把握的结构。
-            caveat: "它的接管要往一个 YAML 列表里插新条目，属于结构性改写 —— 我们的增量写入只做「替换一个已有的值」，所以这一条给指引不代劳。",
+            caveat: "接入需要在 models 列表中新增条目，不提供自动接管，请按上述步骤手动配置。",
         },
         ManualOnly {
             name: "Gemini CLI",
-            how: "在你的 shell 配置里 export GOOGLE_GEMINI_BASE_URL=<我们的地址>。",
+            steps: "在 shell 配置文件中添加 export GOOGLE_GEMINI_BASE_URL={base}，然后重新打开终端。",
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
             // 「只改 endpoint 和 key 字段」的边界 ——
             // **报告是我们的职责，修改是他的权利。**
-            caveat: "它只读环境变量，没有可写的配置字段。改 shell 配置文件超出了我们该动的范围，所以这一条只给命令，不代劳。",
+            caveat: "Gemini CLI 只从环境变量读取接口地址。ThinkWatch 不修改 shell 配置文件，请手动添加。",
         },
     ]
 }
@@ -476,7 +503,7 @@ mod tests {
                     c.id
                 );
                 assert!(
-                    c.takes_effect.note().contains("重开"),
+                    c.takes_effect.note().contains("重新打开终端"),
                     "{} 没在接管那一刻说清要重开",
                     c.id
                 );
@@ -533,6 +560,19 @@ mod tests {
         let m = manual_only();
         let cursor = m.iter().find(|c| c.name == "Cursor").unwrap();
         assert!(cursor.caveat.contains("Tab 补全"), "{}", cursor.caveat);
+        // 步骤里要有真实的地址，而不是一个让用户自己去找的说法
+        let gw = Gateway {
+            base: "http://127.0.0.1:8788".into(),
+            key: None,
+        };
+        assert!(
+            cursor.how(&gw).contains("http://127.0.0.1:8788/v1"),
+            "{}",
+            cursor.how(&gw)
+        );
+        for c in &m {
+            assert!(!c.how(&gw).contains('{'), "{}：{}", c.name, c.how(&gw));
+        }
         assert!(
             !adoptable().iter().any(|c| c.name == "Cursor"),
             "Cursor 不该在接管表里"

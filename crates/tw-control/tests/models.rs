@@ -273,10 +273,8 @@ routes:
     assert_eq!(v["outcome"], "unavailable", "{v}");
     assert_eq!(v["candidates"], serde_json::json!([]));
     assert_eq!(v["skipped"][1]["reason"], "out_of_scope", "{v}");
-    assert!(
-        v["reason"].as_str().unwrap().contains("claude-opus-4-1"),
-        "{v}"
-    );
+    // 原因都在 `skipped` 里，不再另写一句
+    assert!(v["reason"].is_null(), "{v}");
 }
 
 #[tokio::test]

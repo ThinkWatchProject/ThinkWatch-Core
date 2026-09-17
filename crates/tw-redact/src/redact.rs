@@ -42,14 +42,14 @@ impl Ledger {
     pub fn table(&self) -> &HashMap<String, String> {
         &self.back
     }
-    fn note(&mut self, kind: Kind, what: &'static str) {
+    fn note(&mut self, kind: Kind, secret: &'static str) {
         match self
             .counts
             .iter_mut()
-            .find(|(k, w, _)| *k == kind && *w == what)
+            .find(|(k, w, _)| *k == kind && *w == secret)
         {
             Some((_, _, n)) => *n += 1,
-            None => self.counts.push((kind, what, 1)),
+            None => self.counts.push((kind, secret, 1)),
         }
     }
 }
@@ -100,7 +100,7 @@ pub fn apply_into(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
                 p
             }
         };
-        ledger.note(h.kind, h.what);
+        ledger.note(h.kind, h.secret);
         out.replace_range(h.bytes.clone(), &ph);
     }
     ledger.counts.sort_by_key(|(k, w, _)| (*k, *w));
@@ -213,8 +213,8 @@ mod tests {
         let t = format!("{KEY} 和 10.0.0.1 和 10.0.0.2");
         let r = redact(&t, &all());
         let summary = format!("{:?}", r.ledger.counts);
-        assert!(summary.contains("Anthropic API key"), "{summary}");
-        assert!(summary.contains("内网地址"), "{summary}");
+        assert!(summary.contains("anthropic-api-key"), "{summary}");
+        assert!(summary.contains("internal-ip"), "{summary}");
         assert!(
             !summary.contains("sk-ant-api03-AAAA"),
             "计数里带出了原值：{summary}"

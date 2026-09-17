@@ -232,11 +232,11 @@ impl Recorder {
                     // 那一跳的延迟算给超时的那一家 —— 两个数字都指向错的
                     // 上游，而且没有任何东西会提示它们错了。
                     //
-                    // 判据是「链的最后一跳」，不是按 outcome 的字符串匹配
-                    // 「成功」：转移在第一次成功时就 break，所以最后一跳
+                    // 判据是「链的最后一跳」，不是看哪一跳的 outcome 是
+                    // `served`：转移在第一次成功时就 break，所以最后一跳
                     // 要么是服务的那家，要么是放弃前试的最后一家。两种都
-                    // 是这一行该归的对象，而这条性质是结构性的 —— 改了
-                    // outcome 的措辞不会让它失效。
+                    // 是这一行该归的对象，而这条性质是结构性的，不依赖
+                    // outcome 的取值。
                     if let Some(last) = attempts.last() {
                         p.provider = last.provider.clone();
                     }
@@ -657,12 +657,16 @@ mod tests {
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "官方".into(),
-                    outcome: "上游超时".into(),
+                    outcome: "error".into(),
+                    status: None,
+                    error: Some("上游响应超时".into()),
                     ms: 10_003,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
-                    outcome: "成功".into(),
+                    outcome: "served".into(),
+                    status: Some(200),
+                    error: None,
                     ms: 5_042,
                 },
             ],
@@ -681,7 +685,8 @@ mod tests {
             serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
         assert_eq!(routing.attempts.len(), 2);
         assert_eq!(routing.attempts[0].provider, "官方");
-        assert_eq!(routing.attempts[0].outcome, "上游超时");
+        assert_eq!(routing.attempts[0].outcome, "error");
+        assert_eq!(routing.attempts[0].error.as_deref(), Some("上游响应超时"));
     }
 
     /// 一次就成的请求不该被这条规则改坏：链长度为 1，最后一跳就是它自己。
@@ -695,7 +700,9 @@ mod tests {
             group: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
-                outcome: "成功".into(),
+                outcome: "served".into(),
+                status: Some(200),
+                error: None,
                 ms: 300,
             }],
             billing: "per-token".into(),
@@ -964,7 +971,9 @@ mod billing_tests {
             group: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
-                outcome: "成功".into(),
+                outcome: "served".into(),
+                status: Some(200),
+                error: None,
                 ms: 5,
             }],
             billing: billing.into(),
@@ -1134,13 +1143,13 @@ mod redaction_tests {
             provider: "relay".into(),
             items: vec![
                 tw_api::RedactedItem {
-                    kind: "api_key".into(),
-                    what: "sk-…".into(),
+                    kind: "api-keys".into(),
+                    secret: "anthropic-api-key".into(),
                     count: 2,
                 },
                 tw_api::RedactedItem {
-                    kind: "token".into(),
-                    what: "ghp_…".into(),
+                    kind: "api-keys".into(),
+                    secret: "github-personal-token".into(),
                     count: 1,
                 },
             ],

@@ -70,7 +70,17 @@ impl Secret {
         Ok(tw_secret::expand_from_env(&self.0)?)
     }
 
-    /// 给人看的形态，**永远不含真实密钥**。
+    /// 给界面的形态，**永远不含真实密钥**：带 `${NAME}` 的原样给（写的是
+    /// 从哪个环境变量读），其余打码。怎么称呼它由界面决定。
+    pub fn shown(&self) -> String {
+        if self.0.contains("${") {
+            self.0.clone()
+        } else {
+            tw_secret::mask_secret(&self.0)
+        }
+    }
+
+    /// 命令行和诊断包里的说法，**永远不含真实密钥**。
     pub fn describe(&self) -> String {
         if self.0.contains("${") {
             format!("环境变量 {}", self.0)

@@ -78,17 +78,9 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
             adopted_at_ms: d.adopted_at_ms,
             endpoint: d.endpoint,
             shadows: d.shadows.iter().map(|p| p.display().to_string()).collect(),
-            takes_effect: match d.takes_effect {
-                tw_adopt::clients::TakesEffect::Immediately => "immediately".into(),
-                tw_adopt::clients::TakesEffect::OnRestart => "on_restart".into(),
-            },
-            takes_effect_note: d.takes_effect.note().to_string(),
+            takes_effect: d.takes_effect.slug().to_string(),
             warns_when_silent: d.takes_effect.warns_when_silent(),
-            verified: match d.verified {
-                tw_adopt::clients::Verified::Measured => "measured".into(),
-                tw_adopt::clients::Verified::FieldsOnly => "fields_only".into(),
-            },
-            verified_note: d.verified.note().to_string(),
+            verified: d.verified.slug().to_string(),
             costs: d.costs,
         })
         .collect();
@@ -98,7 +90,10 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
             .into_iter()
             .map(|m| tw_api::ManualClient {
                 name: m.name.to_string(),
-                how: m.how.to_string(),
+                how: m.how(&Gateway {
+                    base: gateway_base(&s),
+                    key: None,
+                }),
                 caveat: m.caveat.to_string(),
             })
             .collect(),
@@ -122,7 +117,7 @@ fn mask(text: &str, key: Option<&str>) -> String {
     }
 }
 
-fn view(p: &plan::Plan, fields: Vec<String>, key: Option<&str>) -> tw_api::PlanView {
+fn view(p: &plan::Plan, fields: Vec<tw_api::FieldChange>, key: Option<&str>) -> tw_api::PlanView {
     tw_api::PlanView {
         client: p.client.clone(),
         path: p.path.display().to_string(),
@@ -148,19 +143,21 @@ pub async fn plan_adopt(
         .targets
         .iter()
         .map(|t| match t {
-            plan::Target::Set(path, v) => {
+            plan::Target::Set(path, v) => tw_api::FieldChange {
+                op: "set".into(),
+                path: path.join("."),
                 // **密钥不回显**，哪怕是打码的
-                let shown = if path.iter().any(|k| {
+                value: (!path.iter().any(|k| {
                     let k = k.to_ascii_lowercase();
                     k.contains("token") || k.contains("key")
-                }) {
-                    "（那把网关密钥）".to_string()
-                } else {
-                    v.to_line()
-                };
-                format!("{} = {shown}", path.join("."))
-            }
-            plan::Target::Remove(path) => format!("删掉 {}", path.join(".")),
+                }))
+                .then(|| v.to_line()),
+            },
+            plan::Target::Remove(path) => tw_api::FieldChange {
+                op: "remove".into(),
+                path: path.join("."),
+                value: None,
+            },
         })
         .collect();
     Ok(Json(view(&p, fields, gw.key.as_deref())))
@@ -208,7 +205,7 @@ pub async fn adopt(
         created: a.created,
         warnings: a.warnings,
         // **在接管完成那一屏说，不是等五分钟后再说**
-        takes_effect_note: c.takes_effect.note().to_string(),
+        takes_effect: c.takes_effect.slug().to_string(),
     }))
 }
 
@@ -229,7 +226,7 @@ pub async fn restore(
         backup: a.backup.display().to_string(),
         created: false,
         warnings: p.notes,
-        takes_effect_note: c.takes_effect.note().to_string(),
+        takes_effect: c.takes_effect.slug().to_string(),
     }))
 }
 
@@ -296,7 +293,12 @@ pub async fn mcp_plan_op(
         noop: p.noop,
         // MCP 的 env 里可能有密钥，而我们正把它抄进另一个文件
         carries_secret: true,
-        fields: vec![p.summary],
+        fields: vec![tw_api::FieldChange {
+            op: if p.remove { "remove" } else { "set" }.to_string(),
+            path: p.field.join("."),
+            // 值是一整段 server 配置，里面可能有密钥，diff 里已经能看到打过码的样子
+            value: None,
+        }],
     }))
 }
 
@@ -312,7 +314,8 @@ pub async fn mcp_apply(
         backup: a.backup.display().to_string(),
         created: a.created,
         warnings: a.warnings,
-        takes_effect_note: "客户端下次启动时会读到它。".into(),
+        // 客户端只在启动时读 MCP 配置
+        takes_effect: tw_adopt::clients::TakesEffect::OnRestart.slug().to_string(),
     }))
 }
 

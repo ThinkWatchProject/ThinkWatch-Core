@@ -128,7 +128,6 @@ pub async fn quote(
         input_tokens: input as i64,
         cost_micros: quote.cost_micros,
         billing: quote.billing.slug().to_string(),
-        note: quote.note,
         // 脱敏在重放里照做，但用户有权在按下去之前知道
         will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
             .is_empty(),

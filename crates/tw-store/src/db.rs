@@ -1122,6 +1122,7 @@ pub struct Leak {
     pub at_ms: i64,
     pub request_id: i64,
     pub provider: String,
+    /// 哪种凭据的 slug（`anthropic-api-key` …）。列名沿用 `kind`
     pub kind: String,
     /// **已打码。**存原文等于把泄漏搬了个家
     pub masked: String,

@@ -23,24 +23,135 @@ use tokio::net::TcpStream;
 /// 一句「8 秒超时」和「TLS 握手 8 秒没完成」的可修复性差得远。
 const PHASE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// 建连的哪一步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Step {
+    /// 地址或代理配置用不了，还没有开始建连
+    Config,
+    Dns,
+    Tcp,
+    Tls,
+    /// 代理协议的握手，含认证
+    Handshake,
+}
+
+impl Step {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Step::Config => "config",
+            Step::Dns => "dns",
+            Step::Tcp => "tcp",
+            Step::Tls => "tls",
+            Step::Handshake => "handshake",
+        }
+    }
+}
+
+/// 这一步对着谁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Peer {
+    Upstream,
+    Proxy,
+}
+
+impl Peer {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Peer::Upstream => "upstream",
+            Peer::Proxy => "proxy",
+        }
+    }
+}
+
+/// 建连的一步，连同它对着谁。**失败时报的就是它**：「卡在到代理的 TCP
+/// 握手」和「卡在上游的 TLS 握手」该去修的地方完全不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stage {
+    pub step: Step,
+    pub peer: Peer,
+}
+
+impl Stage {
+    const fn new(step: Step, peer: Peer) -> Self {
+        Self { step, peer }
+    }
+
+    /// 命令行里的说法。**界面不用它**，界面按 `step` / `peer` 自己说。
+    pub fn label(&self) -> String {
+        let step = match self.step {
+            Step::Config => "配置",
+            Step::Dns => "DNS 解析",
+            Step::Tcp => "TCP 握手",
+            Step::Tls => "TLS 握手",
+            Step::Handshake => "代理握手",
+        };
+        match (self.step, self.peer) {
+            (Step::Handshake, _) | (_, Peer::Upstream) => step.to_string(),
+            (_, Peer::Proxy) => format!("{step} · 代理"),
+        }
+    }
+}
+
+/// 某一步为什么没有出现在分段里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// `http://` 地址没有 TLS
+    PlainHttp,
+    /// 地址已经是 IP，不需要解析
+    IpAddress,
+    /// `socks5h` 和 HTTP CONNECT 把域名交给代理解析
+    ProxyResolves,
+}
+
+impl SkipReason {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            SkipReason::PlainHttp => "plain_http",
+            SkipReason::IpAddress => "ip_address",
+            SkipReason::ProxyResolves => "proxy_resolves",
+        }
+    }
+
+    /// 命令行里的说法。
+    pub fn label(&self) -> &'static str {
+        match self {
+            SkipReason::PlainHttp => "http:// 地址不进行 TLS 握手",
+            SkipReason::IpAddress => "地址已是 IP，无需 DNS 解析",
+            SkipReason::ProxyResolves => "域名由代理解析，本机不进行 DNS 解析",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Segment {
-    pub name: String,
+    pub stage: Stage,
     pub ms: u64,
 }
 
+/// 没出现在分段里的一步。**不说的话，缺一段看起来就像 bug。**
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Skip {
+    pub stage: Stage,
+    pub reason: SkipReason,
+}
+
 /// **分段是个列表而不是固定的三个字段**，因为走代理时的形状本来就不同：
-/// 多出「代理握手」，而 `socks5h` 下根本没有本地 DNS 这一段。用
+/// 多出代理握手，而 `socks5h` 下根本没有本地 DNS 这一段。用
 /// `Option<dns_ms>` 表达会把「测不到」和「0 毫秒」混成一件事。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L1Result {
     pub ok: bool,
     pub segments: Vec<Segment>,
     pub total_ms: u64,
-    /// 解释为什么某一段不在上面。**没有这句话，缺一段看起来就像 bug。**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
-    /// 失败时说清楚卡在哪一段、下一步做什么
+    pub skipped: Vec<Skip>,
+    /// 失败在哪一步
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<Stage>,
+    /// 失败的原因和下一步
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -70,7 +181,7 @@ pub fn hop_for(
     match p.proxy.as_str() {
         tw_config::DIRECT => Ok(None),
         tw_config::SYSTEM => Err(
-            "这家走的是系统代理，而系统代理的地址要到建连时才由环境决定 —— L1 测不到它。想量这条线的话，把代理显式配成一个命名条目。"
+            "该上游使用系统代理，代理地址在建立连接时才能确定，链路测速无法测量。如需测速，请将代理配置为命名代理。"
                 .into(),
         ),
         name => {
@@ -78,7 +189,7 @@ pub fn hop_for(
                 .proxies
                 .iter()
                 .find(|x| x.name == name)
-                .ok_or_else(|| format!("provider `{}` 要走代理 `{name}`，但 proxies 段里没有这个名字。", p.name))?;
+                .ok_or_else(|| format!("上游「{}」使用的代理「{name}」未在 proxies 中定义。", p.name))?;
             hop_of(px).map(Some)
         }
     }
@@ -93,7 +204,7 @@ pub fn hop_of(px: &tw_config::Proxy) -> Result<ProxyHop, String> {
             a.user.clone(),
             a.pass
                 .resolve()
-                .map_err(|e| format!("代理 `{}` 的密码取不出来：{e}", px.name))?,
+                .map_err(|e| format!("无法读取代理「{}」的密码：{e}", px.name))?,
         )),
     };
     Ok(ProxyHop {
@@ -122,7 +233,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 struct Timer {
     segments: Vec<Segment>,
-    notes: Vec<String>,
+    skipped: Vec<Skip>,
     started: Instant,
     last: Instant,
 }
@@ -132,29 +243,33 @@ impl Timer {
         let now = Instant::now();
         Self {
             segments: Vec::new(),
-            notes: Vec::new(),
+            skipped: Vec::new(),
             started: now,
             last: now,
         }
     }
-    fn mark(&mut self, name: impl Into<String>) {
+    fn mark(&mut self, stage: Stage) {
         let now = Instant::now();
         self.segments.push(Segment {
-            name: name.into(),
+            stage,
             ms: now.duration_since(self.last).as_millis() as u64,
         });
         self.last = now;
     }
+    fn skip(&mut self, stage: Stage, reason: SkipReason) {
+        self.skipped.push(Skip { stage, reason });
+    }
     fn total(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
-    fn fail(self, phase: &str, msg: impl std::fmt::Display) -> L1Result {
+    fn fail(self, stage: Stage, msg: impl std::fmt::Display) -> L1Result {
         L1Result {
             ok: false,
             total_ms: self.total(),
             segments: self.segments,
-            notes: self.notes,
-            error: Some(format!("{phase}：{msg}")),
+            skipped: self.skipped,
+            failed: Some(stage),
+            error: Some(msg.to_string()),
         }
     }
     fn ok(self) -> L1Result {
@@ -162,35 +277,41 @@ impl Timer {
             ok: true,
             total_ms: self.total(),
             segments: self.segments,
-            notes: self.notes,
+            skipped: self.skipped,
+            failed: None,
             error: None,
         }
     }
 }
 
-async fn phase<T>(
-    what: &str,
-    f: impl std::future::Future<Output = std::io::Result<T>>,
-) -> Result<T, String> {
+/// 某一步超时的说法。**它同时是判据**：解析超时和解析失败要说成两句话。
+fn timed_out() -> String {
+    format!("{} 秒内未完成", PHASE_TIMEOUT.as_secs())
+}
+
+async fn phase<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> Result<T, String> {
     match tokio::time::timeout(PHASE_TIMEOUT, f).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err(format!("{PHASE_TIMEOUT:?} 内没完成（{what}）")),
+        Err(_) => Err(timed_out()),
     }
 }
 
 /// 拆出 host / port / 要不要 TLS。
 fn target_of(base_url: &str) -> Result<(String, u16, bool), String> {
-    let u =
-        reqwest::Url::parse(base_url).map_err(|e| format!("base_url 不是一个合法的 URL：{e}"))?;
+    let u = reqwest::Url::parse(base_url).map_err(|e| format!("接口地址不是合法的 URL：{e}"))?;
     let tls = match u.scheme() {
         "https" => true,
         "http" => false,
-        other => return Err(format!("不支持的 scheme `{other}`，只能是 http 或 https")),
+        other => {
+            return Err(format!(
+                "接口地址的协议 {other} 不受支持，仅支持 http 和 https"
+            ));
+        }
     };
     let host = u
         .host_str()
-        .ok_or("base_url 里没有主机名")?
+        .ok_or("接口地址中缺少主机名")?
         .trim_matches(['[', ']'])
         .to_string();
     Ok((host, u.port_or_known_default().unwrap_or(443), tls))
@@ -201,7 +322,7 @@ pub async fn l1(base_url: &str, proxy: Option<&ProxyHop>) -> L1Result {
     let mut t = Timer::new();
     let (host, port, tls) = match target_of(base_url) {
         Ok(v) => v,
-        Err(e) => return t.fail("配置", e),
+        Err(e) => return t.fail(Stage::new(Step::Config, Peer::Upstream), e),
     };
 
     let stream: Box<dyn Io> = match proxy {
@@ -215,15 +336,15 @@ pub async fn l1(base_url: &str, proxy: Option<&ProxyHop>) -> L1Result {
         },
     };
 
+    let tls_stage = Stage::new(Step::Tls, Peer::Upstream);
     if !tls {
-        t.notes
-            .push("这是一个 http:// 地址，没有 TLS 这一段。".into());
+        t.skip(tls_stage, SkipReason::PlainHttp);
         return t.ok();
     }
     if let Err(e) = tls_handshake(stream, &host).await {
-        return t.fail("TLS 握手", e);
+        return t.fail(tls_stage, e);
     }
-    t.mark("TLS 握手");
+    t.mark(tls_stage);
     t.ok()
 }
 
@@ -244,45 +365,49 @@ pub async fn l1_proxy(p: &ProxyHop, host: &str, port: u16) -> L1Result {
 }
 
 async fn connect_direct(t: &mut Timer, host: &str, port: u16) -> Result<TcpStream, L1Result> {
-    let addr = match resolve(t, host, port, "DNS 解析").await {
+    let dns = Stage::new(Step::Dns, Peer::Upstream);
+    let addr = match resolve(t, host, port, dns).await {
         Ok(a) => a,
-        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail("DNS 解析", e)),
+        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(dns, e)),
     };
-    match phase("TCP 握手", TcpStream::connect(addr)).await {
+    let tcp = Stage::new(Step::Tcp, Peer::Upstream);
+    match phase(TcpStream::connect(addr)).await {
         Ok(s) => {
             let _ = s.set_nodelay(true);
-            t.mark("TCP 握手");
+            t.mark(tcp);
             Ok(s)
         }
-        Err(e) => Err(std::mem::replace(t, Timer::new()).fail("TCP 握手", tcp_message(&e, addr))),
+        Err(e) => Err(std::mem::replace(t, Timer::new()).fail(tcp, tcp_message(&e, addr))),
     }
 }
 
 /// 解析一个 `host:port`。**已经是 IP 时不记这一段** —— 记一个 0ms 的
-/// 「DNS 解析」会让人以为解析快得离谱，而实际是根本没发生。
-async fn resolve(t: &mut Timer, host: &str, port: u16, label: &str) -> Result<SocketAddr, String> {
+/// DNS 解析会让人以为解析快得离谱，而实际是根本没发生。
+async fn resolve(t: &mut Timer, host: &str, port: u16, stage: Stage) -> Result<SocketAddr, String> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        t.notes
-            .push(format!("{host} 已经是 IP，没有 {label} 这一段。"));
+        t.skip(stage, SkipReason::IpAddress);
         t.last = Instant::now();
         return Ok(SocketAddr::new(ip, port));
     }
     // **解析失败的系统原话是英文的、而且没提到域名。**「nodename nor
     // servname provided」对着一个中文界面出现，用户既不知道它在说谁，
     // 也不知道该改哪里。
-    let mut it = phase(label, tokio::net::lookup_host((host, port)))
+    let mut it = phase(tokio::net::lookup_host((host, port)))
         .await
         .map_err(|e| {
-            if e.contains("内没完成") {
-                format!("{host} 的解析{e}。DNS 服务器可能不通。")
+            if e == timed_out() {
+                format!(
+                    "解析 {host} 超过 {} 秒未完成，DNS 服务器可能无法访问。",
+                    PHASE_TIMEOUT.as_secs()
+                )
             } else {
-                format!("解析不出 `{host}`。检查域名拼写；如果这家上游本来就要走代理，先配好代理。")
+                format!("无法解析 {host}。请检查域名拼写；如果该地址需要经代理访问，请先配置代理。")
             }
         })?;
     let addr = it
         .next()
-        .ok_or_else(|| format!("`{host}` 解析成功但一个地址都没有"))?;
-    t.mark(label);
+        .ok_or_else(|| format!("{host} 的解析结果中没有地址"))?;
+    t.mark(stage);
     Ok(addr)
 }
 
@@ -296,51 +421,52 @@ async fn connect_via_proxy(
 
     let (phost, pport) = match split_hostport(&p.addr) {
         Ok(v) => v,
-        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail("代理地址", e)),
+        Err(e) => {
+            let stage = Stage::new(Step::Config, Peer::Proxy);
+            return Err(std::mem::replace(t, Timer::new()).fail(stage, e));
+        }
     };
 
     // socks5（不带 h）在本地解析目标域名 —— **这一段正是会被污染的那一段**，
     // 所以它值得单独计时。socks5h 和 CONNECT 都把域名原样交给代理。
+    let upstream_dns = Stage::new(Step::Dns, Peer::Upstream);
     let target_ip = if p.kind == Socks5 {
-        match resolve(t, host, port, "DNS 解析 · 上游").await {
+        match resolve(t, host, port, upstream_dns).await {
             Ok(a) => Some(a),
-            Err(e) => return Err(std::mem::replace(t, Timer::new()).fail("DNS 解析 · 上游", e)),
+            Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(upstream_dns, e)),
         }
     } else {
-        if p.kind == Socks5h {
-            t.notes
-                .push("socks5h 把域名原样交给代理解析，本地没有 DNS 这一段（这正是它比 socks5 抗污染的地方）。".into());
-        } else {
-            t.notes
-                .push("HTTP CONNECT 把域名原样交给代理解析，本地没有 DNS 这一段。".into());
-        }
+        t.skip(upstream_dns, SkipReason::ProxyResolves);
         None
     };
 
-    let paddr = match resolve(t, &phost, pport, "DNS 解析 · 代理").await {
+    let proxy_dns = Stage::new(Step::Dns, Peer::Proxy);
+    let paddr = match resolve(t, &phost, pport, proxy_dns).await {
         Ok(a) => a,
-        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail("DNS 解析 · 代理", e)),
+        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(proxy_dns, e)),
     };
-    let tcp = match phase("TCP 握手 · 代理", TcpStream::connect(paddr)).await {
+    let proxy_tcp = Stage::new(Step::Tcp, Peer::Proxy);
+    let tcp = match phase(TcpStream::connect(paddr)).await {
         Ok(s) => {
             let _ = s.set_nodelay(true);
-            t.mark("TCP 握手 · 代理");
+            t.mark(proxy_tcp);
             s
         }
         Err(e) => {
             let msg = tcp_message(&e, paddr);
-            return Err(std::mem::replace(t, Timer::new()).fail("TCP 握手 · 代理", msg));
+            return Err(std::mem::replace(t, Timer::new()).fail(proxy_tcp, msg));
         }
     };
 
     // https 代理：到代理这一跳本身也是 TLS，CONNECT 走在里面。
+    let proxy_tls = Stage::new(Step::Tls, Peer::Proxy);
     let mut io: Box<dyn Io> = if p.kind == Https {
         match tls_handshake_boxed(Box::new(tcp), &phost).await {
             Ok(s) => {
-                t.mark("TLS 握手 · 代理");
+                t.mark(proxy_tls);
                 s
             }
-            Err(e) => return Err(std::mem::replace(t, Timer::new()).fail("TLS 握手 · 代理", e)),
+            Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(proxy_tls, e)),
         }
     } else {
         Box::new(tcp)
@@ -350,12 +476,13 @@ async fn connect_via_proxy(
         Socks5 | Socks5h => socks5_connect(&mut io, p, host, port, target_ip).await,
         Http | Https => http_connect(&mut io, p, host, port).await,
     };
+    let handshake = Stage::new(Step::Handshake, Peer::Proxy);
     match r {
         Ok(()) => {
-            t.mark("代理握手");
+            t.mark(handshake);
             Ok(io)
         }
-        Err(e) => Err(std::mem::replace(t, Timer::new()).fail("代理握手", e)),
+        Err(e) => Err(std::mem::replace(t, Timer::new()).fail(handshake, e)),
     }
 }
 
@@ -365,13 +492,13 @@ async fn connect_via_proxy(
 fn tcp_message(e: &str, addr: SocketAddr) -> String {
     let l = e.to_ascii_lowercase();
     if l.contains("refused") {
-        format!("{addr} 拒绝了连接 —— 那个端口上没有东西在听。检查地址和端口。")
-    } else if l.contains("内没完成") || l.contains("timed out") {
-        format!("连 {addr} 一直没有回应。多半是被丢包了：检查网络，或者这家上游需要走代理。")
+        format!("{addr} 拒绝连接，该端口上没有服务在监听。请检查地址和端口。")
+    } else if e == timed_out() || l.contains("timed out") {
+        format!("连接 {addr} 没有响应。请检查网络，或确认该地址是否需要经代理访问。")
     } else if l.contains("unreachable") {
-        format!("到 {addr} 的网络不可达。检查本机网络。")
+        format!("无法访问 {addr} 所在的网络，请检查本机网络。")
     } else {
-        format!("连不上 {addr}：{e}")
+        format!("无法连接 {addr}：{e}")
     }
 }
 
@@ -380,19 +507,21 @@ fn split_hostport(s: &str) -> Result<(String, u16), String> {
     if let Some(rest) = s.strip_prefix('[') {
         let (h, p) = rest
             .split_once("]:")
-            .ok_or("IPv6 代理地址要写成 [::1]:1080")?;
-        return Ok((h.to_string(), p.parse().map_err(|_| "端口不是数字")?));
+            .ok_or("IPv6 代理地址应写成 [::1]:1080 的形式")?;
+        return Ok((h.to_string(), p.parse().map_err(|_| "端口必须是数字")?));
     }
-    let (h, p) = s.rsplit_once(':').ok_or("代理地址要写成 host:port")?;
+    let (h, p) = s
+        .rsplit_once(':')
+        .ok_or("代理地址应写成 主机:端口 的形式")?;
     // **裸的 IPv6 要报错，不能猜。**`fe80::1` 会被切成主机 `fe80:` 加
     // 端口 `1` —— 一个语法上完全合法、语义上彻底错掉的结果，而它的表现
     // 是「代理连不上」，没有任何线索指向这里。
     if h.contains(':') {
-        return Err(format!("`{s}` 里的 IPv6 地址要加方括号，写成 [{h}]:{p}"));
+        return Err(format!("{s} 中的 IPv6 地址需要加方括号，应写成 [{h}]:{p}"));
     }
     Ok((
         h.to_string(),
-        p.parse().map_err(|_| format!("端口 `{p}` 不是数字"))?,
+        p.parse().map_err(|_| format!("端口 {p} 不是数字"))?,
     ))
 }
 
@@ -415,7 +544,7 @@ async fn socks5_connect(
     read_exact(io, &mut m).await?;
     if m[0] != 0x05 {
         return Err(format!(
-            "对面回的不是 SOCKS5（版本字节 0x{:02x}）。这个端口上跑的可能是 HTTP 代理。",
+            "代理的响应不是 SOCKS5 协议（版本字节 0x{:02x}），该端口上可能是 HTTP 代理。",
             m[0]
         ));
     }
@@ -423,10 +552,10 @@ async fn socks5_connect(
         0x00 => {}
         0x02 => {
             let Some((u, pw)) = &p.auth else {
-                return Err("代理要求用户名密码，但这个代理没有配 auth".into());
+                return Err("代理要求用户名和密码认证，但该代理未配置认证信息".into());
             };
             if u.len() > 255 || pw.len() > 255 {
-                return Err("SOCKS5 的用户名和密码都不能超过 255 字节".into());
+                return Err("SOCKS5 的用户名和密码均不能超过 255 字节".into());
             }
             let mut buf = vec![0x01, u.len() as u8];
             buf.extend_from_slice(u.as_bytes());
@@ -436,11 +565,11 @@ async fn socks5_connect(
             let mut r = [0u8; 2];
             read_exact(io, &mut r).await?;
             if r[1] != 0x00 {
-                return Err("代理拒绝了用户名密码".into());
+                return Err("代理拒绝了用户名和密码".into());
             }
         }
-        0xFF => return Err("代理不接受我们提供的认证方式".into()),
-        other => return Err(format!("代理选了一个我们不支持的认证方式 0x{other:02x}")),
+        0xFF => return Err("代理不接受所提供的认证方式".into()),
+        other => return Err(format!("代理要求的认证方式 0x{other:02x} 不受支持")),
     }
 
     // CONNECT
@@ -456,7 +585,7 @@ async fn socks5_connect(
         }
         None => {
             if host.len() > 255 {
-                return Err("域名超过 255 字节，SOCKS5 发不出去".into());
+                return Err("域名超过 255 字节，无法通过 SOCKS5 发送".into());
             }
             req.push(0x03);
             req.push(host.len() as u8);
@@ -480,7 +609,7 @@ async fn socks5_connect(
             read_exact(io, &mut l).await?;
             l[0] as usize
         }
-        other => return Err(format!("代理回了一个看不懂的地址类型 0x{other:02x}")),
+        other => return Err(format!("代理返回了无法识别的地址类型 0x{other:02x}")),
     };
     let mut rest = vec![0u8; n + 2];
     read_exact(io, &mut rest).await?;
@@ -490,13 +619,13 @@ async fn socks5_connect(
 fn socks5_reply(code: u8) -> &'static str {
     match code {
         0x01 => "代理内部错误",
-        0x02 => "代理的规则不允许连这个地址",
+        0x02 => "代理规则不允许连接该地址",
         0x03 => "网络不可达",
         0x04 => "主机不可达",
         0x05 => "目标拒绝连接",
-        0x06 => "TTL 过期",
+        0x06 => "TTL 已过期",
         0x07 => "代理不支持 CONNECT",
-        0x08 => "代理不支持这个地址类型",
+        0x08 => "代理不支持该地址类型",
         _ => "代理拒绝了连接",
     }
 }
@@ -532,7 +661,7 @@ async fn http_connect(
             break;
         }
         if buf.len() > 8192 {
-            return Err("代理的响应头超过 8KB，不像是一个 HTTP 代理".into());
+            return Err("代理的响应头超过 8 KB，该端口上可能不是 HTTP 代理".into());
         }
     }
     let head = String::from_utf8_lossy(&buf);
@@ -540,21 +669,18 @@ async fn http_connect(
     let code = line.split_whitespace().nth(1).unwrap_or("");
     match code {
         "200" => Ok(()),
-        "407" => Err("代理要求认证（407）。检查用户名密码。".into()),
-        "" => Err(format!("代理回了一句看不懂的话：{line}")),
-        c => Err(format!("代理拒绝了 CONNECT（HTTP {c}）：{line}")),
+        "407" => Err("代理要求认证（HTTP 407），请检查用户名和密码。".into()),
+        "" => Err(format!("代理返回了无法识别的响应：{line}")),
+        c => Err(format!("代理拒绝了 CONNECT 请求（HTTP {c}）：{line}")),
     }
 }
 
 async fn write_all(io: &mut Box<dyn Io>, buf: &[u8]) -> Result<(), String> {
-    phase("写给代理", io.write_all(buf)).await
+    phase(io.write_all(buf)).await
 }
 
 async fn read_exact(io: &mut Box<dyn Io>, buf: &mut [u8]) -> Result<(), String> {
-    phase("等代理回话", async {
-        io.read_exact(buf).await.map(|_| ())
-    })
-    .await
+    phase(async { io.read_exact(buf).await.map(|_| ()) }).await
 }
 
 /// TLS 配置。**用平台的信任根**，和数据面走的是同一套验证 —— 否则 L1
@@ -569,7 +695,7 @@ pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
         use rustls_platform_verifier::BuilderVerifierExt;
         let c = rustls::ClientConfig::builder()
             .with_platform_verifier()
-            .expect("装不出平台证书验证器")
+            .expect("无法创建平台证书验证器")
             .with_no_client_auth();
         Arc::new(c)
     })
@@ -582,12 +708,12 @@ async fn tls_handshake(stream: Box<dyn Io>, host: &str) -> Result<(), String> {
 
 async fn tls_handshake_boxed(stream: Box<dyn Io>, host: &str) -> Result<Box<dyn Io>, String> {
     let name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|_| format!("`{host}` 不是一个能放进 SNI 的主机名"))?;
+        .map_err(|_| format!("{host} 不是有效的 TLS 主机名"))?;
     let conn = tokio_rustls::TlsConnector::from(tls_config());
     match tokio::time::timeout(PHASE_TIMEOUT, conn.connect(name, stream)).await {
         Ok(Ok(s)) => Ok(Box::new(s)),
         Ok(Err(e)) => Err(tls_message(&e)),
-        Err(_) => Err(format!("{PHASE_TIMEOUT:?} 内没完成")),
+        Err(_) => Err(timed_out()),
     }
 }
 
@@ -611,20 +737,22 @@ fn tls_message(e: &std::io::Error) -> String {
     // 塞进 `Other`，那些结构化变体在这个平台上永远不会出现 —— 按枚举
     // 匹配的结果是每一种失败都拿到那句最泛的提示，包括证书只是过期时。
     let d = detail.to_ascii_lowercase();
-    let hint =
-        if d.contains("expired") || d.contains("not valid yet") || d.contains("not yet valid") {
-            "过期有两种可能：证书真的过期了，或者本机时钟不对 —— 先看一眼系统时间。"
-        } else if d.contains("issuer")
-            || d.contains("self-signed")
-            || d.contains("self signed")
-            || d.contains("untrusted")
-            || d.contains("not trusted")
-        {
-            "签发者不在系统信任列表里。本机装了抓包工具或公司根证书的话，这条链就是被换过的。"
-        } else {
-            "如果这条线上有东西在劫持 TLS（抓包工具、企业代理），看到的就是这个。"
-        };
-    format!("证书验证没过：{detail}。{hint}")
+    let hint = if d.contains("expired")
+        || d.contains("not valid yet")
+        || d.contains("not yet valid")
+    {
+        "证书已过期或尚未生效，也可能是本机时间不准确，请先核对系统时间。"
+    } else if d.contains("issuer")
+        || d.contains("self-signed")
+        || d.contains("self signed")
+        || d.contains("untrusted")
+        || d.contains("not trusted")
+    {
+        "证书的签发者不在系统信任列表中。如果本机安装了抓包工具或企业根证书，证书链可能已被替换。"
+    } else {
+        "如果网络中有抓包工具或企业代理拦截 TLS 连接，也会出现此错误。"
+    };
+    format!("证书验证未通过：{detail}。{hint}")
 }
 
 #[cfg(test)]
@@ -632,8 +760,15 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    fn names(r: &L1Result) -> Vec<&str> {
-        r.segments.iter().map(|s| s.name.as_str()).collect()
+    fn stages(r: &L1Result) -> Vec<Stage> {
+        r.segments.iter().map(|s| s.stage).collect()
+    }
+
+    fn skipped(r: &L1Result, step: Step, peer: Peer, reason: SkipReason) -> bool {
+        r.skipped.contains(&Skip {
+            stage: Stage::new(step, peer),
+            reason,
+        })
     }
 
     /// 起一个只接受连接、什么都不说的 TCP 端口。
@@ -656,10 +791,18 @@ mod tests {
         let a = dead_ear().await;
         let r = l1(&format!("http://{a}"), None).await;
         assert!(r.ok, "{r:?}");
-        assert_eq!(names(&r), ["TCP 握手"]);
-        // 缺一段必须有话说，否则看起来像 bug
-        assert!(r.notes.iter().any(|n| n.contains("TLS")), "{:?}", r.notes);
-        assert!(r.notes.iter().any(|n| n.contains("IP")), "{:?}", r.notes);
+        assert_eq!(stages(&r), [Stage::new(Step::Tcp, Peer::Upstream)]);
+        // 缺一段必须有交代，否则看起来像 bug
+        assert!(
+            skipped(&r, Step::Tls, Peer::Upstream, SkipReason::PlainHttp),
+            "{:?}",
+            r.skipped
+        );
+        assert!(
+            skipped(&r, Step::Dns, Peer::Upstream, SkipReason::IpAddress),
+            "{:?}",
+            r.skipped
+        );
     }
 
     #[tokio::test]
@@ -670,14 +813,23 @@ mod tests {
         drop(l);
         let r = l1(&format!("http://{a}"), None).await;
         assert!(!r.ok);
-        assert!(r.error.as_ref().unwrap().starts_with("TCP 握手："), "{r:?}");
+        assert_eq!(
+            r.failed,
+            Some(Stage::new(Step::Tcp, Peer::Upstream)),
+            "{r:?}"
+        );
+        assert!(r.error.is_some());
     }
 
     #[tokio::test]
     async fn a_hostname_that_does_not_resolve_fails_at_dns() {
         let r = l1("https://no-such-host.invalid", None).await;
         assert!(!r.ok);
-        assert!(r.error.as_ref().unwrap().starts_with("DNS 解析："), "{r:?}");
+        assert_eq!(
+            r.failed,
+            Some(Stage::new(Step::Dns, Peer::Upstream)),
+            "{r:?}"
+        );
         assert!(r.segments.is_empty(), "还没走到 TCP 就不该有 TCP 这一段");
     }
 
@@ -686,7 +838,11 @@ mod tests {
         for bad in ["ftp://x", "not a url", "https://"] {
             let r = l1(bad, None).await;
             assert!(!r.ok, "{bad} 该被拒");
-            assert!(r.error.as_ref().unwrap().starts_with("配置："), "{r:?}");
+            assert_eq!(
+                r.failed,
+                Some(Stage::new(Step::Config, Peer::Upstream)),
+                "{r:?}"
+            );
         }
     }
 
@@ -950,7 +1106,7 @@ mod tests {
         let mut io = dial(a).await;
         let p = hop(tw_config::ProxyKind::Http, a, None);
         let e = http_connect(&mut io, &p, "x.com", 443).await.unwrap_err();
-        assert!(e.contains("用户名密码"), "{e}");
+        assert!(e.contains("用户名和密码"), "{e}");
     }
 
     #[tokio::test]
@@ -966,16 +1122,22 @@ mod tests {
         let r = l1("http://example.com:80", Some(&p)).await;
         assert!(r.ok, "{r:?}");
         // 代理地址就是个 IP，所以没有解析这一段 —— 而这件事有话交代。
-        assert_eq!(names(&r), ["TCP 握手 · 代理", "代理握手"]);
-        assert!(
-            r.notes.iter().any(|n| n.contains("已经是 IP")),
-            "{:?}",
-            r.notes
+        assert_eq!(
+            stages(&r),
+            [
+                Stage::new(Step::Tcp, Peer::Proxy),
+                Stage::new(Step::Handshake, Peer::Proxy)
+            ]
         );
         assert!(
-            r.notes.iter().any(|n| n.contains("socks5h")),
+            skipped(&r, Step::Dns, Peer::Proxy, SkipReason::IpAddress),
+            "{:?}",
+            r.skipped
+        );
+        assert!(
+            skipped(&r, Step::Dns, Peer::Upstream, SkipReason::ProxyResolves),
             "socks5h 没有本地 DNS 这件事要说出来：{:?}",
-            r.notes
+            r.skipped
         );
     }
 
@@ -990,7 +1152,7 @@ mod tests {
         let r = l1_proxy(&p, "api.anthropic.com", 443).await;
         assert!(!r.ok);
         let e = r.error.unwrap();
-        assert!(e.contains("没有东西在听"), "{e}");
+        assert!(e.contains("没有服务在监听"), "{e}");
         assert!(!e.contains("os error"), "{e}");
     }
 
@@ -1005,7 +1167,13 @@ mod tests {
         let p = hop(tw_config::ProxyKind::Socks5h, a, Some(("svc", "p@ss")));
         let r = l1_proxy(&p, "api.anthropic.com", 443).await;
         assert!(r.ok, "{r:?}");
-        assert_eq!(names(&r), ["TCP 握手 · 代理", "代理握手"]);
+        assert_eq!(
+            stages(&r),
+            [
+                Stage::new(Step::Tcp, Peer::Proxy),
+                Stage::new(Step::Handshake, Peer::Proxy)
+            ]
+        );
         assert_eq!(creds.await.unwrap(), "svc:p@ss");
     }
 
@@ -1034,9 +1202,6 @@ mod tests {
         let p = hop(tw_config::ProxyKind::Socks5h, a, None);
         let r = l1("https://api.anthropic.com", Some(&p)).await;
         assert!(!r.ok);
-        assert!(
-            r.error.as_ref().unwrap().starts_with("TCP 握手 · 代理："),
-            "{r:?}"
-        );
+        assert_eq!(r.failed, Some(Stage::new(Step::Tcp, Peer::Proxy)), "{r:?}");
     }
 }

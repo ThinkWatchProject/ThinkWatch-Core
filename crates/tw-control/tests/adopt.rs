@@ -110,7 +110,6 @@ async fn a_client_that_needs_a_restart_says_so_and_gets_no_silence_warning() {
     let codex = v.clients.iter().find(|c| c.id == "codex").unwrap();
     assert_eq!(codex.takes_effect, "on_restart");
     assert!(!codex.warns_when_silent);
-    assert!(codex.takes_effect_note.contains("重开"));
 }
 
 #[tokio::test]
@@ -141,13 +140,18 @@ async fn the_plan_summary_never_echoes_the_key() {
     let v: tw_api::PlanView = serde_json::from_str(&body).unwrap();
     assert!(v.carries_secret);
     for f in &v.fields {
-        assert!(!f.contains("tw-一把钥匙就够"), "字段摘要里回显了密钥：{f}");
+        assert!(
+            !f.value.as_deref().unwrap_or("").contains("tw-一把钥匙就够"),
+            "字段摘要里回显了密钥：{f:?}"
+        );
     }
-    assert!(
-        v.fields.iter().any(|f| f.contains("网关密钥")),
-        "{:?}",
-        v.fields
-    );
+    let key = v
+        .fields
+        .iter()
+        .find(|f| f.path == "env.ANTHROPIC_AUTH_TOKEN")
+        .expect("写密钥的那一项要列出来");
+    assert_eq!(key.op, "set");
+    assert_eq!(key.value, None, "{key:?}");
 }
 
 #[tokio::test]

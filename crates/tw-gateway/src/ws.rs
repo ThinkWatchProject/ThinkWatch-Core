@@ -266,9 +266,9 @@ async fn pump(
                                     .ledger
                                     .counts
                                     .iter()
-                                    .map(|(k, what, n)| tw_api::RedactedItem {
+                                    .map(|(k, secret, n)| tw_api::RedactedItem {
                                         kind: k.slug().to_string(),
-                                        what: what.to_string(),
+                                        secret: secret.to_string(),
                                         count: *n as u64,
                                     })
                                     .collect(),

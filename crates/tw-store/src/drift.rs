@@ -28,9 +28,9 @@ const MIN_SAMPLE: i64 = 20;
 /// 一处变化。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Drift {
-    /// `tool_calls` / `flagged` / `errors`
+    /// `flagged`（命中高危规则的响应）/ `tool_calls`（带工具调用的响应）/
+    /// `errors`（失败的请求）
     pub metric: &'static str,
-    pub label: &'static str,
     pub recent: f64,
     pub baseline: f64,
     /// 两边各自的样本量。**必须一起显示** —— 没有它，比率是个没法判断
@@ -62,7 +62,6 @@ pub fn compare(recent: &Shape, base: &Shape) -> Vec<Drift> {
         if recent.with_flags > 0 && (b == 0.0 || jumped(r, b)) {
             out.push(Drift {
                 metric: "flagged",
-                label: "命中危险规则的响应",
                 recent: r,
                 baseline: b,
                 recent_n: recent.inspected,
@@ -79,7 +78,6 @@ pub fn compare(recent: &Shape, base: &Shape) -> Vec<Drift> {
         if jumped(r, b) {
             out.push(Drift {
                 metric: "tool_calls",
-                label: "带工具调用的响应",
                 recent: r,
                 baseline: b,
                 recent_n: recent.inspected,
@@ -98,7 +96,6 @@ pub fn compare(recent: &Shape, base: &Shape) -> Vec<Drift> {
         if jumped(r, b) {
             out.push(Drift {
                 metric: "errors",
-                label: "失败的请求",
                 recent: r,
                 baseline: b,
                 recent_n: recent.total,

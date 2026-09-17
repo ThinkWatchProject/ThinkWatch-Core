@@ -40,42 +40,18 @@ impl ProbeAction {
 }
 
 impl ClientProbes {
-    /// 五类，按「界面上从上到下」的顺序，每类带一句人话。
+    /// 五类，按「界面上从上到下」的顺序。
     ///
     /// **这份清单住在这里而不是界面里**：增删一类是这个结构体的事，
-    /// 而一个只在前端硬编码的清单会在加了第六类的那天悄悄少一行。
-    pub fn all(&self) -> [(&'static str, &'static str, &'static str, ProbeAction); 5] {
+    /// 而一个只在前端硬编码的清单会在加了第六类的那天悄悄少一行。每一类
+    /// 叫什么、是什么请求，由界面按 id 自己写。
+    pub fn all(&self) -> [(&'static str, ProbeAction); 5] {
         [
-            (
-                "health_check",
-                "连通性检查",
-                "客户端启动时打的一发空请求，只为看网关通不通。默认本地应答。",
-                self.health_check,
-            ),
-            (
-                "warmup",
-                "预热",
-                "正文恰好是 Warmup 的那一发，用来把连接和缓存捂热。默认本地应答。",
-                self.warmup,
-            ),
-            (
-                "titling",
-                "起标题",
-                "给会话起个名字。**默认放行** —— 拦了的话每个会话都叫同一个名字。",
-                self.titling,
-            ),
-            (
-                "topic_detect",
-                "话题识别",
-                "客户端判断这轮聊的是什么，用来决定要不要换上下文。默认放行。",
-                self.topic_detect,
-            ),
-            (
-                "suggestion",
-                "补全建议",
-                "输入框里那些灰色的建议。默认放行。",
-                self.suggestion,
-            ),
+            ("health_check", self.health_check),
+            ("warmup", self.warmup),
+            ("titling", self.titling),
+            ("topic_detect", self.topic_detect),
+            ("suggestion", self.suggestion),
         ]
     }
 }

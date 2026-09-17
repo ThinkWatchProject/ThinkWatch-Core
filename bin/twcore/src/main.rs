@@ -252,10 +252,18 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
                     println!("               ⓘ {}", d.verified.note());
                 }
             }
+            // 配置读不了时照样列出步骤，地址按默认端口给
+            let port = tw_config::load(path)
+                .map(|c| c.listen.gateway.port)
+                .unwrap_or(tw_config::DEFAULT_GATEWAY_PORT);
+            let gw = Gateway {
+                base: format!("http://127.0.0.1:{port}"),
+                key: None,
+            };
             println!();
             println!("接管不了、只能给指引的：");
             for m in manual_only() {
-                println!("  {:<12} {}", m.name, m.how);
+                println!("  {:<12} {}", m.name, m.how(&gw));
                 println!("               {}", m.caveat);
             }
             Ok(())
@@ -496,16 +504,19 @@ fn print_l1(target: &str, via: Option<&str>, r: &tw_gateway::L1Result) {
     };
     println!("{}  {}", if r.ok { "✅" } else { "❌" }, head);
     for seg in &r.segments {
-        println!("     {:<18} {:>6} ms", seg.name, seg.ms);
+        println!("     {:<18} {:>6} ms", seg.stage.label(), seg.ms);
     }
     if r.ok {
         println!("     {:<18} {:>6} ms", "建连总计", r.total_ms);
     }
     if let Some(e) = &r.error {
-        println!("     {e}");
+        match r.failed {
+            Some(stage) => println!("     {}：{e}", stage.label()),
+            None => println!("     {e}"),
+        }
     }
-    for n in &r.notes {
-        println!("     · {n}");
+    for s in &r.skipped {
+        println!("     · {}", s.reason.label());
     }
     println!();
 }

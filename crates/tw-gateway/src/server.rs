@@ -1060,10 +1060,10 @@ async fn pipeline(
                 state.bus.emit(tw_api::Event::LocallyAnswered {
                     id,
                     client: client_name.clone(),
-                    probe: kind.label().to_string(),
+                    probe: kind.slug().to_string(),
                     at_ms: now_ms(),
                 });
-                tracing::debug!(client = %client_name, kind = kind.label(), "本地应答");
+                tracing::debug!(client = %client_name, kind = kind.slug(), "本地应答");
                 return Ok(local_answer(kind, &body));
             }
             // `route` 交给规则处理：打一个标记让 `when: { intent: ... }`
@@ -1367,9 +1367,9 @@ async fn pipeline(
                 items: ledger
                     .counts
                     .iter()
-                    .map(|(k, what, n)| tw_api::RedactedItem {
+                    .map(|(k, secret, n)| tw_api::RedactedItem {
                         kind: k.slug().to_string(),
-                        what: what.to_string(),
+                        secret: secret.to_string(),
                         count: *n as u64,
                     })
                     .collect(),
@@ -1392,7 +1392,11 @@ async fn pipeline(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
-                chain.push(hop(&provider.name, format!("凭据取不到：{e}"), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    format!("无法取得凭据：{e}"),
+                    hop_started,
+                ));
                 last_err = Some(GatewayError::config(format!(
                     "provider `{}` 的凭据取不到：{e}",
                     provider.name
@@ -1453,7 +1457,12 @@ async fn pipeline(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
-                chain.push(hop(&provider.name, format!("{}", r.status()), hop_started));
+                chain.push(hop(
+                    &provider.name,
+                    "status",
+                    r.status().as_u16(),
+                    hop_started,
+                ));
                 // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
                 // 坏了」而不是「该退避了」，而它们该做的事完全不同。
                 last_err = Some(if r.status() == 429 {
@@ -1470,7 +1479,12 @@ async fn pipeline(
                     &provider.name,
                     state.health.record_success(&provider.name),
                 );
-                chain.push(hop(&provider.name, "成功".to_string(), hop_started));
+                chain.push(hop(
+                    &provider.name,
+                    "served",
+                    r.status().as_u16(),
+                    hop_started,
+                ));
                 upstream = Some(r);
                 used = Some(provider);
                 used_ledger = ledger;
@@ -1485,7 +1499,7 @@ async fn pipeline(
                     state.health.record_failure(&provider.name),
                 );
                 let err = forward::map_reqwest_error(e);
-                chain.push(hop(&provider.name, err.message.clone(), hop_started));
+                chain.push(hop_failed(&provider.name, err.message.clone(), hop_started));
                 last_err = Some(err);
                 continue;
             }
@@ -1562,7 +1576,7 @@ async fn pipeline(
                 .windows
                 .iter()
                 .map(|w| tw_api::QuotaWindow {
-                    label: w.label.clone(),
+                    window: w.window.clone(),
                     used_percent: w.used_percent,
                     reset_in_secs: w.reset_in_secs,
                     status: w.status.clone(),
@@ -1897,10 +1911,29 @@ async fn serve_once(
     .await
 }
 
-fn hop(provider: &str, outcome: String, started: std::time::Instant) -> tw_api::AttemptView {
+/// 上游回了话的一跳：`served` 或者 `status`。
+fn hop(
+    provider: &str,
+    outcome: &str,
+    status: u16,
+    started: std::time::Instant,
+) -> tw_api::AttemptView {
     tw_api::AttemptView {
         provider: provider.to_string(),
-        outcome,
+        outcome: outcome.to_string(),
+        status: Some(status),
+        error: None,
+        ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// 没有收到响应的一跳。
+fn hop_failed(provider: &str, error: String, started: std::time::Instant) -> tw_api::AttemptView {
+    tw_api::AttemptView {
+        provider: provider.to_string(),
+        outcome: "error".to_string(),
+        status: None,
+        error: Some(error),
         ms: started.elapsed().as_millis() as u64,
     }
 }

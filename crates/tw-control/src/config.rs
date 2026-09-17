@@ -97,7 +97,7 @@ impl ConfigManager {
             // 写错一个字，界面上什么都不会发生。
             self.bus.emit(tw_api::Event::ConfigRejected {
                 id: self.bus.next_id(),
-                stage: r.stage.label().to_string(),
+                stage: r.stage.slug().to_string(),
                 message: r.message.clone(),
                 line: r.line,
                 excerpt: r.excerpt.clone(),
@@ -114,11 +114,11 @@ impl ConfigManager {
         // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。
         let _ = tw_config::history::snapshot(&self.path, text, origin);
         let version = store::version_of(text);
-        tracing::info!(%version, origin = origin.label(), "配置已生效");
+        tracing::info!(%version, origin = origin.slug(), "配置已生效");
         self.bus.emit(tw_api::Event::ConfigReloaded {
             id: self.bus.next_id(),
             version: version.clone(),
-            origin: origin.label().to_string(),
+            origin: origin.slug().to_string(),
             at_ms: now_ms(),
         });
         Ok(version)

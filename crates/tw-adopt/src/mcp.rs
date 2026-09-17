@@ -181,8 +181,10 @@ pub struct Plan {
     pub before: Option<String>,
     pub after: String,
     pub noop: bool,
-    /// 人话的一句「这次干了什么」
-    pub summary: String,
+    /// 这次改的是哪个键，按层级（`mcpServers`、server 名）
+    pub field: Vec<String>,
+    /// 删掉这个键。否则是写入
+    pub remove: bool,
 }
 
 /// 读一个 server 的配置原样。
@@ -226,7 +228,8 @@ pub fn plan_copy(t: &Target, home: &Path, name: &str, value: &Val) -> Result<Pla
     let after = put(t, &base, &[t.key, name], value)?;
     Ok(Plan {
         noop: before.as_deref() == Some(after.as_str()),
-        summary: format!("往 {} 里写 {}.{name}", t.name, t.key),
+        field: vec![t.key.to_string(), name.to_string()],
+        remove: false,
         client: t.client.into(),
         path,
         before,
@@ -247,7 +250,8 @@ pub fn plan_remove(t: &Target, home: &Path, name: &str) -> Result<Plan, McpError
     let after = drop_(t, &base, &[t.key, name])?;
     Ok(Plan {
         noop: after == base,
-        summary: format!("从 {} 里删掉 {}.{name}", t.name, t.key),
+        field: vec![t.key.to_string(), name.to_string()],
+        remove: true,
         client: t.client.into(),
         path,
         before,

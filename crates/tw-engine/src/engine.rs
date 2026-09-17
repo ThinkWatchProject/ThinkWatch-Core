@@ -60,13 +60,15 @@ impl GroupType {
         !matches!(self, GroupType::Fallback | GroupType::Select)
     }
 
-    pub fn label(&self) -> &'static str {
+    /// 配置里 `type` 写的那个词，也是控制面发给界面的值。**界面按它判断、
+    /// 按它取自己的名称**，不拿显示文字去比较。
+    pub fn slug(&self) -> &'static str {
         match self {
-            GroupType::Fallback => "按顺序",
-            GroupType::Select => "手动选",
-            GroupType::LoadBalance => "轮流",
-            GroupType::UrlTest => "选最快",
-            GroupType::Cheapest => "选最便宜",
+            GroupType::Fallback => "fallback",
+            GroupType::Select => "select",
+            GroupType::LoadBalance => "load-balance",
+            GroupType::UrlTest => "url-test",
+            GroupType::Cheapest => "cheapest",
         }
     }
 }
@@ -777,6 +779,22 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 界面拿 `slug()` 去判断、去写回配置，所以它必须就是配置里的那个词。
+    #[test]
+    fn the_slug_is_the_word_written_in_the_config() {
+        for t in [
+            GroupType::Fallback,
+            GroupType::Select,
+            GroupType::LoadBalance,
+            GroupType::UrlTest,
+            GroupType::Cheapest,
+        ] {
+            let back: GroupType =
+                serde_json::from_value(serde_json::Value::String(t.slug().into())).unwrap();
+            assert_eq!(back, t);
+        }
+    }
 
     fn facts(model: &str) -> RequestFacts {
         RequestFacts {
