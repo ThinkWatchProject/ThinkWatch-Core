@@ -579,6 +579,9 @@ pub struct ProviderView {
     /// 空 = 自动识别
     #[serde(default)]
     pub billing: Option<String>,
+    /// 实际按什么计费。没写明时自动识别：报过订阅额度的是 `subscription`，
+    /// 否则 `per-token`
+    pub billing_effective: String,
     /// 判完的信任级别：`official` / `untrusted`
     pub trust: String,
     /// 用户有没有在配置里显式写过 `trust`。
@@ -950,6 +953,11 @@ pub struct PriceSheetSave {
     pub sheet: PriceSheetInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
+    /// 保存之后使用这张价目表的上游。给了就**恰好是这几家**：列表里的改用
+    /// 它，原来用它、不在列表里的改回默认价目表，和价目表本身在同一个版本
+    /// 里写入。不给就不动上游的选择
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_by: Option<Vec<String>>,
 }
 
 /// 按哪张价目表查价。
@@ -1075,6 +1083,24 @@ pub struct ProviderInput {
     /// 停用
     #[serde(default)]
     pub disabled: bool,
+}
+
+/// 按接口地址自动识别的结果。给编辑中、还没保存的上游显示「自动识别」
+/// 会选成什么。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderPreviewRequest {
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderPreview {
+    /// 按地址推断的接口协议。推断不出是空（转发时按 Anthropic 处理）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// 是厂商官方端点：自动识别的信任级别是 `official`，否则 `untrusted`
+    pub official: bool,
+    /// 自动识别时发送前脱敏的类别
+    pub redact: Vec<String>,
 }
 
 /// 一个上游的模型清单。
@@ -1456,6 +1482,10 @@ pub struct SpeedEstimate {
     pub billing: String,
     /// 给人看的那一句
     pub note: String,
+    /// 这家服务不了这个模型：`out_of_scope`（不在启用范围里）/
+    /// `not_offered`（模型清单里没有）。有值时不进合计，也不会被测
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }
 
 /// 一批测速的账。
@@ -1472,9 +1502,9 @@ pub struct SpeedQuote {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SpeedRunRequest {
-    /// 不给就是所有上游
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    /// 测哪几家。空 = 所有上游
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
     /// **必填。**同一个 provider 的 Opus 和 Haiku 是两条完全不同的曲线，
     /// 不指定模型的测速结果没有意义
     pub model: String,

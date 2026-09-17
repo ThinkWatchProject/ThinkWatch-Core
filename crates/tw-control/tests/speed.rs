@@ -130,7 +130,7 @@ providers:
     let (st, v) = post(
         &b.app,
         "/speed/run",
-        r#"{"provider":"relay","model":"claude-sonnet-4-5"}"#,
+        r#"{"providers":["relay"],"model":"claude-sonnet-4-5"}"#,
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -172,4 +172,60 @@ providers:
         v["total_micros"], official["cost_micros"],
         "合计应当只算按量计费的那一家：{v}"
     );
+}
+
+#[tokio::test]
+async fn a_quote_covers_the_chosen_upstreams_and_marks_the_ones_that_cannot_serve_the_model() {
+    let b = bed("version: 1
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: official
+    base_url: https://api.anthropic.com
+    key: sk-x
+  - name: haiku-only
+    base_url: https://relay.example
+    key: sk-y
+    models_only: [claude-haiku-*]
+  - name: third
+    base_url: https://relay.example
+    key: sk-z
+");
+    let (st, v) = post(
+        &b.app,
+        "/speed/quote",
+        r#"{"providers":["official","haiku-only"],"model":"claude-sonnet-4-5"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "只报点名的那几家：{v}");
+    let official = items.iter().find(|i| i["provider"] == "official").unwrap();
+    let scoped = items
+        .iter()
+        .find(|i| i["provider"] == "haiku-only")
+        .unwrap();
+    assert_eq!(scoped["skipped"], "out_of_scope", "{v}");
+    assert!(official.get("skipped").is_none(), "{v}");
+    // 不会被测的那一家不进合计
+    assert_eq!(v["total_micros"], official["cost_micros"], "{v}");
+
+    // 服务不了的不发请求：这里一个请求都不会发出去
+    let (st, v) = post(
+        &b.app,
+        "/speed/run",
+        r#"{"providers":["haiku-only"],"model":"claude-sonnet-4-5"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v, serde_json::json!([]));
+
+    let (st, _) = post(
+        &b.app,
+        "/speed/quote",
+        r#"{"providers":["没有这家"],"model":"claude-sonnet-4-5"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

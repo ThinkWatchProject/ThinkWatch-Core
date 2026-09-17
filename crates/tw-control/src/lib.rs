@@ -380,6 +380,7 @@ fn provider_view(
             tw_gateway::health::State::Open => "open".into(),
         },
         billing: p.billing.map(|b| b.slug().to_string()),
+        billing_effective: s.gateway.billing_of(p).slug().to_string(),
         // **给判完的结果，不是配置里那个 Option。**界面要显示的是
         // 「这家现在算不算受信任」，而那件事在没写的时候由 base_url 决定
         trust: tw_gateway::guard::effective_trust(p, &tw_engine::Guard::default())
@@ -681,16 +682,29 @@ async fn speed_quote(
 ) -> Result<Json<tw_api::SpeedQuote>, Fail> {
     let cfg = s.config();
     let book = s.gateway.pricing.load();
-    let items: Vec<tw_gateway::Estimate> = targets(&cfg, req.provider.as_deref())?
-        .iter()
-        .map(|p| {
-            // 计费方式和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
-            tw_gateway::l3::estimate(&book, &p.name, &req.model, s.gateway.billing_of(p))
-        })
-        .collect();
+    let catalog = s.gateway.catalog.load();
+    let items: Vec<(tw_gateway::Estimate, Option<tw_gateway::models::Skip>)> =
+        targets(&cfg, &req.providers)?
+            .into_iter()
+            .map(|p| {
+                // 计费方式和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
+                let e =
+                    tw_gateway::l3::estimate(&book, &p.name, &req.model, s.gateway.billing_of(p));
+                (e, tw_gateway::models::fit(&catalog, p, &req.model))
+            })
+            .collect();
     Ok(Json(tw_api::SpeedQuote {
-        total_micros: tw_gateway::quote::total(items.iter().map(|e| &e.quote)),
-        items: items.into_iter().map(quote_item).collect(),
+        // 服务不了这个模型的那几家不会被测，也就不进合计
+        total_micros: tw_gateway::quote::total(
+            items
+                .iter()
+                .filter(|(_, skip)| skip.is_none())
+                .map(|(e, _)| &e.quote),
+        ),
+        items: items
+            .into_iter()
+            .map(|(e, skip)| quote_item(e, skip))
+            .collect(),
         pricing_date: book.table().date.clone(),
     }))
 }
@@ -701,10 +715,16 @@ async fn speed_run(
     Json(req): Json<tw_api::SpeedRunRequest>,
 ) -> Result<Json<Vec<tw_api::SpeedResult>>, Fail> {
     let cfg = s.config();
+    let catalog = s.gateway.catalog.load();
     let mut out = Vec::new();
     // **逐个跑，不并发。**几家一起打，测出来的 TTFT 互相干扰，而这一层
     // 存在的全部意义就是那几个数字准不准（和 L1 同一个理由）。
-    for p in targets(&cfg, req.provider.as_deref())? {
+    for p in targets(&cfg, &req.providers)? {
+        // 服务不了这个模型的不发：报价里已经说了它不会被测，发出去只会得到
+        // 一个 4xx，还可能被计费
+        if tw_gateway::models::fit(&catalog, p, &req.model).is_some() {
+            continue;
+        }
         // OAuth 那类要联网换 token，所以走网关那条 async 的路。
         // **用这一家自己的 client** —— 换 token 要走它的代理。
         let pk_http = s.gateway.client_for(&p.name);
@@ -720,7 +740,7 @@ async fn speed_run(
                     total_ms: 0,
                     input_tokens: None,
                     output_tokens: None,
-                    error: Some(format!("密钥取不到：{e}")),
+                    error: Some(format!("取不到凭据：{e}")),
                 });
                 continue;
             }
@@ -751,7 +771,10 @@ async fn speed_run(
     Ok(Json(out))
 }
 
-fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
+fn quote_item(
+    e: tw_gateway::Estimate,
+    skip: Option<tw_gateway::models::Skip>,
+) -> tw_api::SpeedEstimate {
     tw_api::SpeedEstimate {
         provider: e.provider,
         model: e.model,
@@ -760,22 +783,27 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
         cost_micros: e.quote.cost_micros,
         billing: e.quote.billing.slug().to_string(),
         note: e.quote.note,
+        skipped: skip.map(|s| s.slug().to_string()),
     }
 }
 
+/// 要测的那几家。**空 = 全部**；点名了一家不存在的就是 404，不悄悄跳过。
 fn targets<'a>(
     cfg: &'a tw_config::Config,
-    provider: Option<&str>,
+    names: &[String],
 ) -> Result<Vec<&'a tw_config::Provider>, Fail> {
-    match provider {
-        Some(n) => Ok(vec![
+    if names.is_empty() {
+        return Ok(cfg.providers.iter().collect());
+    }
+    names
+        .iter()
+        .map(|n| {
             cfg.providers
                 .iter()
-                .find(|p| p.name == n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{n}` 的上游")))?,
-        ]),
-        None => Ok(cfg.providers.iter().collect()),
-    }
+                .find(|p| &p.name == n)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫「{n}」的上游")))
+        })
+        .collect()
 }
 
 /// 出站密钥检测攒下的证据。

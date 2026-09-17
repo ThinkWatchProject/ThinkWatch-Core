@@ -278,3 +278,40 @@ routes:
         "{v}"
     );
 }
+
+#[tokio::test]
+async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
+    let b = bed(&config(upstream().await, "sk-good", ""));
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/providers/preview",
+        serde_json::json!({ "base_url": "https://api.anthropic.com" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["protocol"], "anthropic");
+    assert_eq!(v["official"], true);
+    assert_eq!(v["redact"], serde_json::json!([]), "官方端点不脱敏");
+
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/providers/preview",
+        serde_json::json!({ "base_url": "https://relay.example/v1" }),
+    )
+    .await;
+    assert!(v.get("protocol").is_none(), "{v}");
+    assert_eq!(v["official"], false);
+    assert!(
+        v["redact"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("api-keys"))
+    );
+
+    // 没写计费方式时，概览说出它实际按什么计费
+    let (_, ov) = call(&b.app, "GET", "/overview", serde_json::json!(null)).await;
+    assert!(ov["providers"][0].get("billing").unwrap().is_null());
+    assert_eq!(ov["providers"][0]["billing_effective"], "per-token");
+}
