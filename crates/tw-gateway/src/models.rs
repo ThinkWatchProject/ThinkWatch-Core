@@ -406,6 +406,18 @@ impl Serving {
     }
 }
 
+/// 这家能不能服务这个模型：不在启用范围里、清单里没有，都不能。**不看
+/// 停用** —— 停用是路由的事，测速一家停用的上游是合理的。
+pub fn fit(catalog: &tw_engine::Catalog, p: &tw_config::Provider, model: &str) -> Option<Skip> {
+    if !p.uses_model(model) {
+        Some(Skip::OutOfScope)
+    } else if catalog.offers(&p.name, model) == Some(false) {
+        Some(Skip::NotOffered)
+    } else {
+        None
+    }
+}
+
 /// 在路由选出的候选里去掉服务不了这个请求的上游。
 ///
 /// **没有模型清单的上游不跳过**：不知道它有什么，不等于它没有。`model`
@@ -427,12 +439,8 @@ pub fn serving(
             Some(Skip::Disabled)
         } else if model.is_empty() {
             None
-        } else if !p.uses_model(model) {
-            Some(Skip::OutOfScope)
-        } else if catalog.offers(name, model) == Some(false) {
-            Some(Skip::NotOffered)
         } else {
-            None
+            fit(catalog, p, model)
         };
         match skip {
             Some(s) => out.skipped.push((name.clone(), s)),

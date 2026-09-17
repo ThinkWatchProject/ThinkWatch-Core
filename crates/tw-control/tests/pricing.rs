@@ -190,6 +190,81 @@ async fn a_sheet_is_created_chosen_renamed_and_deleted_only_once_nobody_uses_it(
 }
 
 #[tokio::test]
+async fn a_sheet_saved_with_its_upstreams_assigns_them_in_the_same_version() {
+    let b = bed(BASE);
+    let versions = || {
+        tw_config::history::list(&b.dir.path().join("config.yaml"))
+            .unwrap()
+            .len()
+    };
+    let mut body = relay_sheet("中转协议价");
+    body["used_by"] = serde_json::json!(["relay-hk"]);
+    let (st, v) = call(&b.app, "POST", "/pricing/sheets", body).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        b.parsed().providers[1].pricing.as_deref(),
+        Some("中转协议价")
+    );
+
+    // 改名，同时换一家用它：原来那家改回默认价目表。**一次保存一个版本**
+    let mut body = relay_sheet("中转价");
+    body["used_by"] = serde_json::json!(["官方"]);
+    let before = versions();
+    let (st, v) = call(&b.app, "PUT", "/pricing/sheets/中转协议价", body).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(versions(), before + 1, "价目表和上游的选择是一次保存");
+    let cfg = b.parsed();
+    assert_eq!(cfg.providers[0].pricing.as_deref(), Some("中转价"));
+    assert_eq!(cfg.providers[1].pricing, None);
+
+    // 不给就不动上游的选择
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/pricing/sheets/中转价",
+        relay_sheet("中转价"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.parsed().providers[0].pricing.as_deref(), Some("中转价"));
+
+    // 点名一家不存在的上游：什么都不写
+    let file = b.file();
+    let mut body = relay_sheet("中转价");
+    body["used_by"] = serde_json::json!(["没有这家"]);
+    let (st, _) = call(&b.app, "PUT", "/pricing/sheets/中转价", body).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(b.file(), file);
+}
+
+#[tokio::test]
+async fn a_sheets_full_definition_can_be_read_back_for_editing() {
+    let b = bed(BASE);
+    call(&b.app, "POST", "/pricing/sheets", relay_sheet("中转协议价")).await;
+    let (st, v) = call(
+        &b.app,
+        "GET",
+        "/pricing/sheets/中转协议价",
+        serde_json::json!(null),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["multiplier"], 0.8);
+    assert_eq!(
+        v["models"]["claude-sonnet-4-5-thinking"]["cache_write_1h"],
+        6.0
+    );
+    let (st, _) = call(
+        &b.app,
+        "GET",
+        "/pricing/sheets/没有这张",
+        serde_json::json!(null),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn an_upstream_cannot_choose_a_sheet_that_does_not_exist() {
     // 静默退回默认价的话，算出来的钱看起来正常，而折扣从没生效过
     let b = bed(BASE);
