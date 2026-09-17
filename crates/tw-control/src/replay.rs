@@ -104,12 +104,9 @@ pub async fn quote(
     // 没有的话按字节粗估（和路由用的是同一个系数）
     let input = row.input_tokens.unwrap_or((raw.len() / 4) as i64).max(0) as u64;
     let output = row.output_tokens.unwrap_or(0).max(0) as u64;
-    let prices = crate::prices(&s);
-    let subscription = s
-        .gateway
-        .quotas()
-        .get(&provider.name)
-        .is_some_and(|q| !q.is_empty());
+    let book = s.gateway.pricing.load();
+    // 和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
+    let subscription = s.gateway.billing_of(provider) == tw_config::Billing::Subscription;
     let usage = tw_pricing::Usage {
         input,
         // 输出按上次那条的实际输出估。**它只是个估计**，模型这次可能
@@ -123,7 +120,8 @@ pub async fn quote(
             format!("不计费，但会消耗约 {} tokens 的额度", input + usage.output),
         )
     } else {
-        match prices.cost(&row.model, &usage, false) {
+        // **按要重放到的那个上游查价**，不是原来那条走的上游
+        match book.cost_for(&provider.name, &row.model, &usage, false) {
             tw_pricing::Cost::Known(m) | tw_pricing::Cost::Estimated(m) => (
                 Some(m),
                 // **金额再小也要显示。**用户按下按钮时有权知道自己在花什么
@@ -149,7 +147,7 @@ pub async fn quote(
         // 脱敏在重放里照做，但用户有权在按下去之前知道
         will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
             .is_empty(),
-        pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+        pricing_date: book.table().date.clone(),
     }))
 }
 

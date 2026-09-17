@@ -48,3 +48,16 @@ One measured example. OpenAI cut the price of a model on 2026-08-22, and a
 widely used dataset **did not correct it for three days**, returning a figure
 25% too high the whole time. The cause was that their sync script automates
 the model list but not the prices, which arrive by hand-written PR.
+
+## At runtime
+
+The snapshot is what a fresh install and an offline machine price with.
+Once running, the control plane fetches the same file from the dataset's
+`main` branch once a day, unless `pricing.auto_update: false`, and saves it
+as `model_prices.json` beside `config.yaml`. Whichever of the two is newer
+prices requests.
+
+Following `main` at runtime is the trade the snapshot refuses at build
+time, and it is taken on purpose: vendor price cuts and relay rates move
+faster than releases. It stays explainable because every request records
+the date of the table that priced it.

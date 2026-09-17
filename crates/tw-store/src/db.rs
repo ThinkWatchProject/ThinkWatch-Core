@@ -16,7 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 10;
+const SCHEMA: i64 = 11;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -113,6 +113,9 @@ pub struct RequestRow {
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     pub cache_saved_micros: Option<i64>,
+    /// 金额按什么价格算的，JSON（`tw_api::PriceSourceView`）。没算出金额的、
+    /// 老记录是 None
+    pub price_source: Option<String>,
 }
 
 #[derive(Debug)]
@@ -307,6 +310,17 @@ impl Db {
                 "ALTER TABLE requests ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        if from < 11 {
+            // 金额按什么价格算的：默认价目表（哪天的）、乘了哪张价目表的倍率、
+            // 还是哪张价目表的覆盖价。
+            //
+            // **记在行上。**价目表会刷新、会被改，事后按现在的配置去推当时用的
+            // 是哪个价，推出来的是错的。
+            //
+            // 老记录是 NULL：那时只有一份价目表，而它的日期没有记下来。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN price_source TEXT;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -318,8 +332,8 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint, session, tool_calls, flagged, redacted, cancelled)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
+              client_hint, session, tool_calls, flagged, redacted, cancelled, price_source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
             params![
                 r.id,
                 r.at_ms,
@@ -348,6 +362,7 @@ impl Db {
                 r.flagged,
                 r.redacted,
                 r.cancelled as i64,
+                r.price_source,
             ],
         )?;
         Ok(())
@@ -617,7 +632,7 @@ impl Db {
     /// **这是价格页存在的理由。**用户不会主动想起要配价格 —— 只有
     /// 「有 37 条请求算不出钱，用的是这两个模型」这种具体证据才会
     /// （高级功能的触发条件要绑在「这个问题存不存在」上）。
-    pub fn unpriced_recent(&self, days: i64) -> Result<(i64, Vec<String>), DbError> {
+    pub fn unpriced_recent(&self, days: i64) -> Result<(i64, Vec<tw_api::UnpricedModel>), DbError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -627,23 +642,29 @@ impl Db {
         // 本来就没有成本），订阅制不算（它的成本不在这个维度上）；失败的、
         // 没有用量的也不算 —— 给那个模型配价格，那几行照样算不出钱，而这一页
         // 让人去配的正是价格。
+        let filter = format!(
+            "at_ms >= ?1 AND local = 0 AND {NO_PRICE} AND model IS NOT NULL AND model <> ''"
+        );
+        // 总数单独数：下面那个列表有上限，拿它加出来的总数会偏低
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM requests WHERE {filter}"),
+            [since],
+            |r| r.get(0),
+        )?;
+        // **按 (上游, 模型) 分。**同一个模型在不同上游按不同的价目表计价，
+        // 该在哪张表里补价格取决于它走的是哪家
         let mut st = self.conn.prepare(&format!(
-            "SELECT model, COUNT(*) FROM requests \
-             WHERE at_ms >= ?1 AND local = 0 AND {NO_PRICE} \
-               AND model IS NOT NULL AND model <> '' \
-             GROUP BY model ORDER BY COUNT(*) DESC LIMIT 20"
+            "SELECT provider, model, COUNT(*) AS n FROM requests WHERE {filter} \
+             GROUP BY provider, model ORDER BY n DESC, provider, model LIMIT 20"
         ))?;
         let rows = st.query_map([since], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok(tw_api::UnpricedModel {
+                provider: r.get(0)?,
+                model: r.get(1)?,
+                requests: r.get(2)?,
+            })
         })?;
-        let mut total = 0i64;
-        let mut models = Vec::new();
-        for row in rows {
-            let (m, n) = row?;
-            total += n;
-            models.push(m);
-        }
-        Ok((total, models))
+        Ok((total, rows.collect::<Result<_, _>>()?))
     }
 
     pub fn summary(&self, since_ms: i64, until_ms: i64) -> Result<Summary, DbError> {
@@ -1053,6 +1074,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         routing: r.get("routing")?,
         billing: r.get("billing")?,
         cache_saved_micros: r.get("cache_saved_micros")?,
+        price_source: r.get("price_source")?,
     })
 }
 
@@ -1157,6 +1179,7 @@ mod tests {
             routing: None,
             billing: "per-token".into(),
             cache_saved_micros: None,
+            price_source: None,
         }
     }
 
@@ -1670,6 +1693,7 @@ mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN price_source;
                      ALTER TABLE requests DROP COLUMN cancelled;
                      ALTER TABLE requests DROP COLUMN redacted;
                      ALTER TABLE requests DROP COLUMN flagged;
@@ -1687,6 +1711,8 @@ mod tests {
         assert!(got.iter().all(|r| r.client_hint.is_none()));
         // 升级之前取消的请求根本不落库，所以老记录一条都不该是「已取消」
         assert!(got.iter().all(|r| !r.cancelled));
+        // 老记录不知道当时用的是哪份价目表，那就是不知道
+        assert!(got.iter().all(|r| r.price_source.is_none()));
         let mut fresh = row(3, 300);
         fresh.client_hint = Some("codex".into());
         fresh.session = Some("abc-100".into());
@@ -1908,7 +1934,32 @@ mod cost_state_tests {
 
         let (n, models) = db.unpriced_recent(7).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(models, vec!["中转站自己起的名字".to_string()]);
+        assert_eq!(
+            models,
+            vec![tw_api::UnpricedModel {
+                provider: "官方".into(),
+                model: "中转站自己起的名字".into(),
+                requests: 1,
+            }]
+        );
+    }
+
+    /// 列表有上限，总数没有。
+    #[test]
+    fn the_unpriced_total_counts_every_request_not_just_the_listed_models() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let db = Db::in_memory().unwrap();
+        for i in 0..25 {
+            let mut r = unknown_model(i + 1, now);
+            r.model = format!("m{i}");
+            db.insert(&r).unwrap();
+        }
+        let (n, models) = db.unpriced_recent(7).unwrap();
+        assert_eq!(models.len(), 20);
+        assert_eq!(n, 25);
     }
 
     /// 会话的合计里有估算，**就得说出来**；每一轮也带着自己的记号。

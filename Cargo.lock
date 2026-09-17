@@ -2808,6 +2808,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tw-engine",
+ "tw-pricing",
  "tw-redact",
  "tw-secret",
  "tw-types",
@@ -2819,7 +2820,6 @@ name = "tw-control"
 version = "0.1.2"
 dependencies = [
  "axum",
- "blake3",
  "bytes",
  "chrono",
  "futures",
@@ -2935,13 +2935,12 @@ dependencies = [
 name = "tw-pricing"
 version = "0.1.2"
 dependencies = [
+ "arc-swap",
  "flate2",
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "tempfile",
  "thiserror",
- "tracing",
 ]
 
 [[package]]

@@ -31,9 +31,10 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
   upstream, rewriting parameters, or refusing outright.
 - **Fail over mid-flight** — before the first byte an upstream can be swapped
   transparently; after it, the only honest thing left is to report what happened.
-- **Make cost visible** — token usage, cache hits, priced against a snapshot
-  table. What cannot be priced is labelled *unknown* rather than given an
-  invented number.
+- **Make cost visible** — token usage, cache hits, priced against a public
+  price table that refreshes daily, with price sheets for upstreams that
+  charge differently. What cannot be priced is labelled *unknown* rather
+  than given an invented number.
 - **Redact outbound** — secrets in a request are replaced with placeholders
   before they reach a relay, and restored when the model echoes them back.
 - **Inspect inbound** — tool calls returned by an upstream are checked against

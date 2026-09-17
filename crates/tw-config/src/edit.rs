@@ -157,6 +157,10 @@ pub fn upsert(
 }
 
 /// 删掉叫 `name` 的那一项。引用它的地方由调用方先检查。
+///
+/// **删掉的是最后一项时，整段列表连同因此变空的父段一起删。**这几段列表
+/// 不写和写成空列表是一回事，而默认值不写进文件 —— 留下一个
+/// `pricing: { sheets: [] }` 只是噪音。
 pub fn remove(text: &str, section: Section, name: &str) -> Result<String, EditError> {
     let doc = parse(text)?;
     let index = section
@@ -165,7 +169,11 @@ pub fn remove(text: &str, section: Section, name: &str) -> Result<String, EditEr
             what: section.what,
             name: name.to_string(),
         })?;
-    let out = tw_yaml::remove(text, &section.steps(), index)?;
+    let out = if section.items(&doc).len() == 1 {
+        tw_yaml::remove_key(text, &section.steps())?
+    } else {
+        tw_yaml::remove(text, &section.steps(), index)?
+    };
     let got = parse(&out).map_err(|e| EditError::SelfCheck(e.to_string()))?;
     if section.index_of(&got, name).is_some()
         || section.items(&got).len() + 1 != section.items(&doc).len()
@@ -464,5 +472,30 @@ providers:
         let v = parse(&out).unwrap();
         assert_eq!(v["providers"].as_sequence().unwrap().len(), 1);
         assert_eq!(v["providers"][0]["name"], "relay");
+    }
+
+    #[test]
+    fn removing_the_last_price_sheet_leaves_no_empty_section_behind() {
+        let one = upsert(
+            CFG,
+            PRICE_SHEETS,
+            None,
+            &map("name: 中转协议价
+"),
+        )
+        .unwrap();
+        let out = remove(&one, PRICE_SHEETS, "中转协议价").unwrap();
+        assert_eq!(out, CFG);
+        // 还有别的设置时，只删 `sheets`
+        let off = set(
+            &one,
+            &[Step::key("pricing"), Step::key("auto_update")],
+            Some(&Value::Bool(false)),
+        )
+        .unwrap();
+        let out = remove(&off, PRICE_SHEETS, "中转协议价").unwrap();
+        let v = parse(&out).unwrap();
+        assert_eq!(v["pricing"]["auto_update"], false);
+        assert!(v["pricing"].get("sheets").is_none(), "{out}");
     }
 }

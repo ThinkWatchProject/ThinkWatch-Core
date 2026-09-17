@@ -452,6 +452,20 @@ pub struct Overview {
     /// 并发上限
     #[serde(default)]
     pub limits: LimitsView,
+    /// 自定义价目表。默认价目表不在这里 —— 它的状态看 `/pricing`
+    #[serde(default)]
+    pub price_sheets: Vec<PriceSheetView>,
+}
+
+/// 一张自定义价目表。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceSheetView {
+    pub name: String,
+    pub multiplier: f64,
+    /// 单独覆盖了几个模型
+    pub overrides: usize,
+    /// 哪些上游选了它。**删之前要知道**，改名时它们会跟着改
+    pub used_by: Vec<String>,
 }
 
 /// 一个出站代理。
@@ -567,6 +581,9 @@ pub struct ProviderView {
     pub redact_explicit: bool,
     /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
     pub references: Vec<ReferenceView>,
+    /// 选的价目表。空 = 默认价目表
+    #[serde(default)]
+    pub pricing: Option<String>,
 }
 
 /// 配置里引用了某个上游的一处。
@@ -814,73 +831,164 @@ pub enum PatchValue {
     Null,
 }
 
-/// 「检查价格更新」第一步：**先说要访问什么、多大**。
-///
-/// **绝不在启动时后台偷偷拉。**零上传那句承诺，也意味着零静默下载 ——
-/// 而「先告诉你要连哪儿」是这条承诺里最容易被省掉的一半。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateOffer {
-    pub url: String,
-    /// 字节。`None` = 对面没给 `Content-Length`
-    pub bytes: Option<u64>,
-    /// 现在这份快照是哪天的
-    pub current_date: String,
-}
+// ─────────────────────────────────────────────────────────── 价目表
 
-/// 第二步：下载完、解析完，**给 diff，还没写**。
+/// 默认价目表现在的状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdatePreview {
-    /// 拉回来的表里有多少个带价的模型
+pub struct PricingStatus {
+    /// 这份表的数据日期。**费用旁边要标它**
+    pub date: String,
+    /// `builtin`（随版本内置）/ `fetched`（联网刷新过）/ `empty`
+    pub source: String,
+    /// 表里有多少个模型
     pub models: usize,
-    /// 真的变了的那些。**不列没动的** —— 三千多个里绝大多数没动，
-    /// 一起列出来等于把那几十条真的变化埋掉
-    pub changes: Vec<PriceChangeView>,
-    /// 这份东西的指纹。第三步要带着它回来 —— 否则「确认写入」写的
-    /// 可能是另一次下载的结果
-    pub token: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PriceChangeView {
-    pub model: String,
-    /// `null` = 新增的
-    pub old_input: Option<f64>,
-    pub new_input: f64,
-    pub old_output: Option<f64>,
-    pub new_output: f64,
-}
-
-/// 一条用户自己写的价格（第三层）。
-///
-/// **单位是每百万 token 的美元**，和厂商定价页上印的一样 —— 让用户
-/// 在界面上填 `0.000003` 是在要求他做一次换算，而换算是会错的。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PriceRow {
-    /// 哪个上游。`None` = 对所有上游生效
+    /// 定期刷新开没开
+    pub auto_update: bool,
+    /// 最近一次刷新的时间，成功失败都算。这次启动以来没刷过就是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub checked_at_ms: Option<u64>,
+    /// 最近一次刷新失败的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 最近 7 天里**无法计价**的请求数。
+    ///
+    /// 用户不会主动想起要配价格，只有「有 37 次请求无法计价」这种具体
+    /// 证据才会。
+    pub unpriced_recent: i64,
+    /// 那些请求走的是哪个上游、哪个模型。**直接告诉他要在哪张价目表里设
+    /// 什么**，按请求数从多到少
+    pub unpriced_models: Vec<UnpricedModel>,
+}
+
+/// 一个无法计价的 (上游, 模型)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnpricedModel {
+    pub provider: String,
     pub model: String,
-    /// 每百万 token 的美元
+    pub requests: i64,
+}
+
+/// 刷新了一次之后。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingRefreshed {
+    pub status: PricingStatus,
+    /// 和刷新之前比，价格变了、新增或者移除了的模型数
+    pub changed: usize,
+}
+
+/// 开关定期刷新。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoUpdateSave {
+    pub on: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 一个模型的单价，**每百万 tokens 的美元**，和厂商定价页上印的一样。
+///
+/// 查价返回的是**实际计费用的**单价：数据集里没单独定价的缓存档已经按
+/// 计费规则补上。所以它可以原样作为一条覆盖价的起点。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PriceFields {
     pub input: f64,
     pub output: f64,
-    /// 内置快照里有没有这个模型。**界面要能说「这条是在覆盖」**，
-    /// 因为覆盖一个本来就有价的模型，和补一个没价的，是两件事
-    #[serde(default)]
-    pub overrides_builtin: bool,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+    /// 单次请求输入超过 200K tokens 之后的单价。**成对出现**；没有 = 不分档
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_above_200k: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_above_200k: Option<f64>,
 }
 
-/// 用户的价格覆盖，连同「内置那份是什么时候的」。
+/// 一个价格是从哪儿来的。**每一笔费用都要能追溯到它。**
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceSourceView {
+    /// 默认价目表。`date` 是那份表的数据日期
+    Default { date: String },
+    /// 默认价目表 × 某张价目表的倍率
+    Scaled {
+        sheet: String,
+        multiplier: f64,
+        date: String,
+    },
+    /// 某张价目表单独覆盖的
+    Override { sheet: String },
+}
+
+/// 新建或修改一张价目表时交过来的定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PricingView {
-    pub rows: Vec<PriceRow>,
-    pub snapshot_date: String,
-    /// 最近这段时间里**算不出价钱**的请求数。
-    ///
-    /// **这是这一页存在的理由** —— 用户不会主动想起要配价格，只有
-    /// 「有 37 条请求算不出钱」这种具体证据才会（触发条件）。
-    pub unpriced_recent: i64,
-    /// 那些算不出价钱的请求用的是哪些模型。**直接告诉他要填什么**
-    pub unpriced_models: Vec<String>,
+pub struct PriceSheetInput {
+    pub name: String,
+    /// 作用于默认价目表的全部单价
+    #[serde(default = "one")]
+    pub multiplier: f64,
+    /// 单独覆盖的模型。**覆盖价不受倍率影响**
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, PriceFields>,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceSheetSave {
+    pub sheet: PriceSheetInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 按哪张价目表查价。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SheetRef {
+    /// 默认价目表
+    Default,
+    /// 一张已经保存的价目表
+    Named { name: String },
+    /// 编辑中、还没保存的那一张
+    Draft { sheet: PriceSheetInput },
+}
+
+/// 查价。**界面不自己实现计价顺序**，要显示什么价就来问。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceQuery {
+    pub sheet: SheetRef,
+    /// 要查的模型。给了就只查这些
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// 没给模型时按名字搜：默认价目表里的模型，加上这张价目表单独覆盖的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    /// 搜索最多返回几个。默认 50
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// 一个模型查到的价格。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedPrice {
+    pub model: String,
+    /// 价格和来源。`None` = 无法计价
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<PriceFields>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PriceSourceView>,
+    /// 价格是从别的平台借来的。**按它算出来的钱是估算**
+    pub estimated: bool,
+    /// 上下文窗口
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceQueryResult {
+    pub items: Vec<ResolvedPrice>,
+    /// 按名字搜时，一共有多少个模型对得上（`items` 可能被 `limit` 截断）
+    pub matched: usize,
 }
 
 /// 光标落在配置的哪一段上。
@@ -947,6 +1055,9 @@ pub struct ProviderInput {
     /// 发送前脱敏的类别。不给就按地址识别；**空列表是「不脱敏」**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redact: Option<Vec<String>>,
+    /// 按哪张价目表计价。不给就是默认价目表
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<String>,
 }
 
 fn direct() -> String {
@@ -1244,6 +1355,9 @@ pub struct HistoryRow {
     /// 路由决策与尝试链。老记录没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingView>,
+    /// 按什么价格算的。没算出金额的、老记录没有它
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<PriceSourceView>,
 }
 
 /// 一条请求的全部细节。**详情抽屉吃这个。**
