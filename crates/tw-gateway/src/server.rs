@@ -266,11 +266,12 @@ pub struct AppState {
     ///
     /// **跨重载存活**：改一条规则不该让所有上游回到「没测过」。
     pub latency: Arc<crate::latency::Latency>,
-    /// 价目表。`cheapest` 策略靠它排序。
+    /// 价格簿：默认价目表 + 自定义价目表 + 哪个上游用哪张。
     ///
-    /// **可能是空的** —— 价目表加载失败时成本一律标「未知」，
-    /// 而那时 `cheapest` 组里所有人都「算不出价钱」，退回配置顺序。
-    pub prices: Arc<arc_swap::ArcSwap<tw_pricing::Prices>>,
+    /// **全进程只有这一份。**`cheapest` 排序、记账、测速报价、回放都从这
+    /// 里取 —— 以前记账那一层攥着启动时的一份副本，改了价格要重启才生效。
+    /// 配置重载时换掉自定义价目表，刷新默认价目表时换掉底表。
+    pub pricing: tw_pricing::Shared,
     /// 轮换出来的新 refresh token 往哪儿交。
     ///
     /// **和 body 那条路同一个形状**：数据面只管交出去，写文件是控制面的
@@ -295,6 +296,8 @@ impl AppState {
             .map_err(|e| GatewayError::config(format!("HTTP 客户端建不起来：{e}")))?;
         let limits = config.limits.clone();
         let catalog = catalog_from(&config);
+        let pricing_config = config.pricing.clone();
+        let price_assign = config.price_assign();
         let rt = Runtime::build(config, None)?;
         Ok(Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
@@ -310,13 +313,15 @@ impl AppState {
             relisten: Arc::new(tokio::sync::Notify::new()),
             oauth: Arc::new(crate::oauth::Cache::new()),
             latency: Arc::new(crate::latency::Latency::new()),
-            prices: Arc::new(arc_swap::ArcSwap::from_pointee(
-                tw_pricing::Prices::builtin().unwrap_or_else(|e| {
+            pricing: tw_pricing::shared(tw_pricing::PriceBook::new(
+                Arc::new(tw_pricing::Table::builtin().unwrap_or_else(|e| {
                     // **加载不了不能挡住启动**：那时成本显示「未知」，
                     // 而转发照常
-                    tracing::warn!("价目表加载失败，成本一律标未知：{e}");
-                    tw_pricing::Prices::empty()
-                }),
+                    tracing::warn!("内置价目表加载失败，成本一律标未知：{e}");
+                    tw_pricing::Table::empty()
+                })),
+                pricing_config,
+                price_assign,
             )),
             rotation_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -448,14 +453,66 @@ impl AppState {
         }
     }
 
-    /// 换一份带用户覆盖的价目表进来。
+    /// 换一份默认价目表进来（启动时读到的上次刷新结果，或者刚刷新的）。
+    pub fn set_price_table(&self, table: tw_pricing::Table) {
+        let table = Arc::new(table);
+        // **rcu，不是 load 再 store。**刷新和配置重载可能同时发生，后者
+        // 换的是自定义价目表 —— 先读后写会把对方刚换进去的那一半覆盖掉
+        self.pricing.rcu(|book| book.with_table(table.clone()));
+    }
+
+    /// 这家实际怎么收钱。
     ///
-    /// **一定要调。**`AppState::new` 里那份只有内置快照，没有用户的
-    /// `pricing.yaml` —— 而中转站的价格只有用户自己知道，
-    /// 那正是 `cheapest` 唯一的判据来源。两处各拿一份不同的价目表，
-    /// 会让「成本栏显示的」和「按最便宜选的」对不上。
-    pub fn set_prices(&self, p: tw_pricing::Prices) {
-        self.prices.store(std::sync::Arc::new(p));
+    /// **配置里写了就听配置的，没写就自动判**：响应头里报过订阅额度的就是
+    /// 订阅型。那个信号一直在我们手上，不该变成一个用户要填的
+    /// 字段 —— 而一个填错了的字段比没有更糟。
+    ///
+    /// **自动判有一个已知的边界：每次进程启动之后，打给一家订阅上游的第一个
+    /// 请求会被按量计价。**那时我们还没见过它的额度头。之后就对了。
+    ///
+    /// 没有更好的办法：额度头只在响应里，而计价发生在响应之后 —— 想在第一
+    /// 个请求之前知道，只能主动探测，而那条路是明确否掉的（会占用户
+    /// 自己的配额）。在乎那一条记录的人，在配置里写一行 `billing:
+    /// subscription` 就没有歧义了。
+    pub fn billing_of(&self, p: &tw_config::Provider) -> tw_config::Billing {
+        if let Some(b) = p.billing {
+            return b;
+        }
+        let reported = self
+            .quotas
+            .lock()
+            .map(|g| g.get(&p.name).is_some_and(|q| !q.is_empty()))
+            .unwrap_or(false);
+        if reported {
+            tw_config::Billing::Subscription
+        } else {
+            tw_config::Billing::PerToken
+        }
+    }
+
+    /// `cheapest` 排序用的单价：每家跑这个模型的 (输入, 输出)，微分/百万 token。
+    ///
+    /// **路由和预演共用这一个** —— 各写一份的话，预演说会选 A，实际选的是 B。
+    pub fn unit_prices(
+        &self,
+        providers: &[tw_config::Provider],
+        candidates: &[String],
+        model: &str,
+    ) -> std::collections::HashMap<String, (i64, i64)> {
+        let book = self.pricing.load();
+        candidates
+            .iter()
+            .filter_map(|name| {
+                let p = providers.iter().find(|p| &p.name == name)?;
+                // **订阅制的边际成本是零，它就是最便宜的那家**。
+                // 而「价格未知」不是「免费」 —— 它不在这张表里，排到最后去
+                match p.billing {
+                    Some(tw_config::Billing::Subscription) => Some((name.clone(), (0, 0))),
+                    Some(tw_config::Billing::Unknown) => None,
+                    _ => book.unit_micros(name, model).map(|u| (name.clone(), u)),
+                }
+            })
+            .collect()
     }
 
     /// 接上轮换的去处。**控制面起来之后才调** —— 在那之前轮换只报不写。
@@ -493,6 +550,10 @@ impl AppState {
         }
         let relisten =
             old.config.listen.gateway.socket_addr() != next.config.listen.gateway.socket_addr();
+        // 自定义价目表和上游的选择跟着配置走，默认价目表不变
+        let (sheets, assign) = (next.config.pricing.clone(), next.config.price_assign());
+        self.pricing
+            .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
         self.rt.store(Arc::new(next));
         if relisten {
             // 只通知，不在这里重建 —— 换监听器要 await，而这个函数被
@@ -1020,26 +1081,7 @@ async fn pipeline(
             },
             price: match kind {
                 tw_engine::GroupType::Cheapest => {
-                    let prices = state.prices.load();
-                    decision
-                        .candidates
-                        .iter()
-                        .filter_map(|name| {
-                            let p = rt.config.providers.iter().find(|p| &p.name == name)?;
-                            // **订阅制的边际成本是零，它就是最便宜的那家**。
-                            // 而「价格未知」不是「免费」 ——
-                            // 它要排到最后去
-                            match p.billing {
-                                Some(tw_config::Billing::Subscription) => {
-                                    Some((name.clone(), (0, 0)))
-                                }
-                                Some(tw_config::Billing::Unknown) => None,
-                                _ => prices
-                                    .unit_micros(name, &facts.model)
-                                    .map(|u| (name.clone(), u)),
-                            }
-                        })
-                        .collect()
+                    state.unit_prices(&rt.config.providers, &decision.candidates, &facts.model)
                 }
                 _ => Default::default(),
             },
@@ -1344,7 +1386,7 @@ async fn pipeline(
     // 最终服务的那家怎么收钱。**跟着请求走，不能事后查配置** ——
     // 配置随时会被热重载，而一条三天前的记录该按它当时那家的算。
     let billing = used
-        .map(|p| effective_billing(&state, p))
+        .map(|p| state.billing_of(p))
         .unwrap_or(tw_config::Billing::PerToken);
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
@@ -1810,30 +1852,6 @@ async fn serve_once(
     )
     .with_graceful_shutdown(until)
     .await
-}
-
-/// 这家实际怎么收钱。
-///
-/// **配置里写了就听配置的，没写就自动判**：响应头里报过订阅额度的就是
-/// 订阅型。那个信号一直在我们手上，不该变成一个用户要填的
-/// 字段 —— 而一个填错了的字段比没有更糟。
-///
-/// **自动判有一个已知的边界：每次进程启动之后，打给一家订阅上游的第一个
-/// 请求会被按量计价。**那时我们还没见过它的额度头。之后就对了。
-///
-/// 没有更好的办法：额度头只在响应里，而计价发生在响应之后 —— 想在第一
-/// 个请求之前知道，只能主动探测，而那条路是明确否掉的（会占用户
-/// 自己的配额）。在乎那一条记录的人，在配置里写一行 `billing:
-/// subscription` 就没有歧义了。
-fn effective_billing(state: &AppState, p: &tw_config::Provider) -> tw_config::Billing {
-    if let Some(b) = p.billing {
-        return b;
-    }
-    if state.quotas().get(&p.name).is_some_and(|q| !q.is_empty()) {
-        tw_config::Billing::Subscription
-    } else {
-        tw_config::Billing::PerToken
-    }
 }
 
 fn hop(provider: &str, outcome: String, started: std::time::Instant) -> tw_api::AttemptView {

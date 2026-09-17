@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use tw_api::Event;
-use tw_pricing::{Cost, Prices, Usage};
+use tw_pricing::{Cost, Usage};
 
 use crate::blobs::{Blobs, Which};
 use crate::db::{Db, RequestRow};
@@ -58,7 +58,9 @@ enum Ending<'a> {
 pub struct Recorder {
     db: Db,
     blobs: Blobs,
-    prices: Prices,
+    /// 和网关共用的那一份价格簿。**不是一份副本** —— 改了价目表，下一个
+    /// 结束的请求就按新价算，不用重启
+    pricing: tw_pricing::Shared,
     inflight: HashMap<u64, Partial>,
     level: DiskLevel,
     /// 上次查磁盘的时间。**不是每次写都查** —— statvfs 在每个请求上跑
@@ -90,12 +92,29 @@ const DISK_CHECK_EVERY_MS: i64 = 30_000;
 /// 代价是对称的（并多了或分多了），所以取一个人能理解的整数。
 const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 
+/// 一个价格的来源，给界面看的样子。`date`：当时默认价目表的数据日期。
+pub fn price_source(source: &tw_pricing::Source, date: &str) -> tw_api::PriceSourceView {
+    match source {
+        tw_pricing::Source::Default => tw_api::PriceSourceView::Default {
+            date: date.to_string(),
+        },
+        tw_pricing::Source::Scaled { sheet, multiplier } => tw_api::PriceSourceView::Scaled {
+            sheet: sheet.clone(),
+            multiplier: *multiplier,
+            date: date.to_string(),
+        },
+        tw_pricing::Source::Override { sheet } => tw_api::PriceSourceView::Override {
+            sheet: sheet.clone(),
+        },
+    }
+}
+
 impl Recorder {
-    pub fn new(db: Db, blobs: Blobs, prices: Prices) -> Self {
+    pub fn new(db: Db, blobs: Blobs, pricing: tw_pricing::Shared) -> Self {
         Self {
             db,
             blobs,
-            prices,
+            pricing,
             inflight: HashMap::new(),
             sessions: HashMap::new(),
             level: DiskLevel::Ok,
@@ -354,6 +373,7 @@ impl Recorder {
                     routing: None,
                     billing: String::new(),
                     cache_saved_micros: None,
+                    price_source: None,
                 });
             }
             Event::LeakSeen {
@@ -442,10 +462,16 @@ impl Recorder {
         // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
         // 占位。按它算出来的钱只会偏低，当成实测会让「今日花费」悄悄少一截。
         let partial = !matches!(how, Ending::Finished);
-        let cost = if counts_toward_money {
-            u.map(|u| self.prices.cost(&p.model, &u, partial))
+        let book = self.pricing.load();
+        // **按这个请求实际走的上游查价** —— 同一个模型在不同上游不是同一个价
+        let resolved = if counts_toward_money {
+            book.resolve_for(&p.provider, &p.model)
         } else {
             None
+        };
+        let cost = match (&u, &resolved) {
+            (Some(u), Some(r)) => Some(r.cost(u, partial)),
+            _ => None,
         };
         let (cost_micros, estimated) = match cost {
             Some(Cost::Known(m)) => (Some(m), false),
@@ -457,10 +483,16 @@ impl Recorder {
         // 缓存命中省下了多少。**在这里算，不在查询时算**
         // —— 查询时算意味着要把价目表带进 SQL，而价目表会变，
         // 那样「上周省了多少」会随着一次价格更新悄悄改变。
-        let cache_saved_micros = if counts_toward_money {
-            u.and_then(|u| self.prices.cache_saving(&p.model, &u))
-        } else {
-            None
+        let cache_saved_micros = match (&u, &resolved) {
+            (Some(u), Some(r)) => Some(r.cache_saving(u)),
+            _ => None,
+        };
+        // 同一个道理：**按什么价算的也在这里记下**，事后推不回来
+        let price_source = match (&resolved, cost_micros) {
+            (Some(r), Some(_)) => {
+                serde_json::to_string(&price_source(&r.source, &book.table().date)).ok()
+            }
+            _ => None,
         };
         // **算完就报，不等人来问。**这是整条链上唯一知道价钱的
         // 地方，而界面上那一列金额在它到达之前只能是「—」。
@@ -504,6 +536,7 @@ impl Recorder {
             routing: p.routing,
             billing: p.billing,
             cache_saved_micros,
+            price_source,
         });
     }
 
@@ -571,7 +604,7 @@ mod tests {
         let r = Recorder::new(
             Db::in_memory().unwrap(),
             Blobs::new(d.path().join("blobs")),
-            Prices::builtin().unwrap(),
+            tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
         );
         (d, r)
     }
@@ -725,6 +758,68 @@ mod tests {
             long.cost_micros,
             Some(1_800_000),
             "30 万 token 该按 $6/百万 算"
+        );
+    }
+
+    /// **按上游选的价目表记账，而且改了价不用重启。**
+    ///
+    /// 以前按上游设的价格只给 `cheapest` 排序用，记账永远按通用价 —— 界面
+    /// 上说「这家按这个价算」，而落库的金额不是；记账这一层还攥着启动时的
+    /// 一份价目表副本，改了价格要重启才生效。
+    #[test]
+    fn a_request_is_priced_by_its_upstreams_sheet_and_a_change_applies_without_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let pricing = tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap());
+        let mut r = Recorder::new(
+            Db::in_memory().unwrap(),
+            Blobs::new(d.path().join("blobs")),
+            pricing.clone(),
+        );
+        let usage = || {
+            Some(tw_api::UsageView {
+                input: 100_000,
+                ..Default::default()
+            })
+        };
+        r.on_event(&started(1, "claude-sonnet-4-5")); // provider = 官方
+        r.on_event(&finished(1, usage()));
+        assert_eq!(r.db().get(1).unwrap().unwrap().cost_micros, Some(300_000));
+
+        // 给「官方」选一张半价的价目表 —— 同一个 Recorder，没有重启
+        let half = tw_pricing::PricingConfig {
+            auto_update: true,
+            sheets: vec![tw_pricing::SheetDef {
+                name: "半价".into(),
+                multiplier: 0.5,
+                models: Default::default(),
+            }],
+        };
+        let next = pricing
+            .load()
+            .with_config(half, [("官方".to_string(), "半价".to_string())]);
+        pricing.store(std::sync::Arc::new(next));
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&finished(2, usage()));
+        let row = r.db().get(2).unwrap().unwrap();
+        assert_eq!(row.cost_micros, Some(150_000));
+
+        // 两条各自记着当时按什么价算的
+        let source = |row: &RequestRow| -> tw_api::PriceSourceView {
+            serde_json::from_str(row.price_source.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(
+            source(&r.db().get(1).unwrap().unwrap()),
+            tw_api::PriceSourceView::Default {
+                date: tw_pricing::SNAPSHOT_DATE.into()
+            }
+        );
+        assert_eq!(
+            source(&row),
+            tw_api::PriceSourceView::Scaled {
+                sheet: "半价".into(),
+                multiplier: 0.5,
+                date: tw_pricing::SNAPSHOT_DATE.into()
+            }
         );
     }
 

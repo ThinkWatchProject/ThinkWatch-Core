@@ -34,25 +34,13 @@ fn order_like_the_data_plane(
         return d.candidates.clone();
     }
     let cfg = s.config();
-    let prices = s.gateway.prices.load();
     let facts = tw_engine::Facts {
         session: None,
         seq: s.gateway.bus.peek_id(),
         ttfb_ms: s.gateway.latency.snapshot(&d.candidates),
-        price: d
-            .candidates
-            .iter()
-            .filter_map(|name| {
-                let p = cfg.providers.iter().find(|p| &p.name == name)?;
-                match p.billing {
-                    Some(tw_config::Billing::Subscription) => Some((name.clone(), (0, 0))),
-                    Some(tw_config::Billing::Unknown) => None,
-                    _ => prices
-                        .unit_micros(name, &f.model)
-                        .map(|u| (name.clone(), u)),
-                }
-            })
-            .collect(),
+        price: s
+            .gateway
+            .unit_prices(&cfg.providers, &d.candidates, &f.model),
     };
     engine.order(Some(&gname), &d.candidates, &facts)
 }

@@ -66,6 +66,30 @@ pub fn proxy_users(cfg: &Config, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// 选了 `name` 这张价目表的上游。
+pub fn sheet_users(cfg: &Config, name: &str) -> Vec<String> {
+    cfg.providers
+        .iter()
+        .filter(|p| p.pricing.as_deref() == Some(name))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// 把 `text` 里选了价目表 `old` 的上游都改成选 `new`。
+pub fn rename_sheet(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
+    let mut out = text.to_string();
+    for (i, p) in cfg.providers.iter().enumerate() {
+        if p.pricing.as_deref() == Some(old) {
+            out = edit::set(
+                &out,
+                &[Step::key("providers"), Step::Index(i), Step::key("pricing")],
+                Some(&Value::String(new.to_string())),
+            )?;
+        }
+    }
+    Ok(out)
+}
+
 /// 把 `text` 里引用上游 `old` 的地方都改成 `new`。`cfg` 是 `text` 解析
 /// 出来的那一份 —— 下标要对得上。
 pub fn rename_provider(
@@ -228,6 +252,32 @@ routes:
         assert!(provider_refs(&after, "relay").is_empty());
         assert_eq!(provider_refs(&after, "relay-hk").len(), 3);
         assert_eq!(after.groups[0].providers, ["relay-hk", "官方"]);
+    }
+
+    #[test]
+    fn renaming_a_price_sheet_moves_the_upstreams_that_use_it() {
+        let text = CFG.replace("    proxy: hk\n", "    proxy: hk\n    pricing: 中转\n")
+            + "pricing:\n  sheets:\n    - name: 中转\n      multiplier: 0.8\n";
+        let c = cfg(&text);
+        assert_eq!(sheet_users(&c, "中转"), ["relay"]);
+        let renamed = edit::upsert(
+            &text,
+            edit::PRICE_SHEETS,
+            Some("中转"),
+            &serde_yaml_ng::from_str("name: 中转协议价\nmultiplier: 0.8\n").unwrap(),
+        )
+        .unwrap();
+        let out = rename_sheet(&renamed, &c, "中转", "中转协议价").unwrap();
+        let after = cfg(&out);
+        assert_eq!(sheet_users(&after, "中转协议价"), ["relay"]);
+    }
+
+    #[test]
+    fn a_provider_pointing_at_a_missing_sheet_is_a_config_error() {
+        // 静默退回默认价的话，算出来的钱看起来正常，而折扣从没生效过
+        let text = CFG.replace("    proxy: hk\n", "    proxy: hk\n    pricing: 没有这张\n");
+        let e = crate::try_parse(&text).unwrap_err();
+        assert!(e.message.contains("没有这张"), "{}", e.message);
     }
 
     #[test]

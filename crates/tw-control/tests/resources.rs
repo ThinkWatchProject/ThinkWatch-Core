@@ -58,6 +58,7 @@ fn bed(yaml: &str) -> Bed {
         gateway_addr: None,
         store: None,
         started: std::time::Instant::now(),
+        price_updater: Default::default(),
         // **测试里绝不能碰开发者自己的配置**
         home: d.path().join("home"),
     };

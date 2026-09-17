@@ -51,6 +51,7 @@ fn req(id: i64, at_ms: i64) -> RequestRow {
         routing: None,
         billing: "per-token".into(),
         cache_saved_micros: Some(1_500),
+        price_source: None,
     }
 }
 

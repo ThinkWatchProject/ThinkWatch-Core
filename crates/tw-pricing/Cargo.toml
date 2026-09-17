@@ -5,16 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Price table: a built-in snapshot, user overrides, and three-state cost (measured, estimated, unpriced)"
+description = "Pricing: the public price table, user price sheets, and three-state cost (measured, estimated, unpriced)"
 
 [dependencies]
+arc-swap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml_ng = { workspace = true }
 flate2 = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
+# 价目表写在 config.yaml 里，而读 YAML 是 tw-config 的事。这里只在测试里用它
 serde_yaml_ng = { workspace = true }
-tempfile = "3"

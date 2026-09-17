@@ -65,6 +65,9 @@ pub struct Config {
     /// 出站代理。声明一次到处引用。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<Proxy>,
+    /// 价目表：默认价目表要不要定期刷新，以及用户自己的价目表。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub pricing: tw_pricing::PricingConfig,
     /// 客户端自己发的辅助请求怎么处理。默认只拦 A 类。
     #[serde(default, skip_serializing_if = "is_default")]
     pub client_probes: ClientProbes,
@@ -102,6 +105,7 @@ impl Default for Config {
             clients: Vec::new(),
             providers: Vec::new(),
             proxies: Vec::new(),
+            pricing: tw_pricing::PricingConfig::default(),
             client_probes: ClientProbes::default(),
             security: Security::default(),
             limits: Limits::default(),
@@ -139,11 +143,20 @@ impl Default for Provider {
             trust: None,
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
+            pricing: None,
         }
     }
 }
 
 impl Config {
+    /// 哪个上游选了哪张价目表。**没选的不在里面** —— 它们按默认价目表。
+    pub fn price_assign(&self) -> Vec<(String, String)> {
+        self.providers
+            .iter()
+            .filter_map(|p| p.pricing.clone().map(|s| (p.name.clone(), s)))
+            .collect()
+    }
+
     /// 按配置建一个路由引擎。
     pub fn engine(&self) -> tw_engine::Engine {
         tw_engine::Engine::new(
@@ -552,6 +565,9 @@ pub struct Provider {
     pub proxy: String,
     #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
     pub on_proxy_fail: OnProxyFail,
+    /// 按哪张价目表计价。不写就是默认价目表。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<String>,
 }
 
 /// 这家上游可不可信。

@@ -657,15 +657,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     rt.block_on(async move {
         let state = tw_gateway::AppState::new(cfg.clone())
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-        // **和观测那一层用同一份价目表。**两处各拿一份的话，「成本栏
-        // 显示的」和「按最便宜选的」会对不上（用户覆盖层就是
-        // `cheapest` 唯一的判据来源）。读不了就用内置那份，转发照常。
-        match tw_pricing::Prices::builtin()
-            .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
-        {
-            Ok(p) => state.set_prices(p),
-            Err(e) => tracing::warn!("价目表的用户覆盖读不了，按内置那份算：{e}"),
-        }
+        // 默认价目表：上次联网刷新存下的那份，或者内置的。自定义价目表已经
+        // 随配置进了价格簿
+        state.set_price_table(tw_control::pricing::load_table(&config_path));
 
         // 观测这一层。**起不来不是致命的** —— 历史记录看不见，而网关
         // 照常转发。所以这里所有的失败都只记一行日志。
@@ -673,7 +667,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
         let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
-        let store = build_store(&dir, state.bus.clone(), body_rx);
+        let store = build_store(&dir, state.bus.clone(), state.pricing.clone(), body_rx);
         if store.is_some() {
             state.set_body_sink(body_tx);
         }
@@ -704,6 +698,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             cfg: manager,
             gateway_addr: if safe { None } else { Some(addr.to_string()) },
             store,
+            price_updater: Default::default(),
         };
         // 盯着客户端配置面。**只报告** —— 这条路径上没有任何
         // 一处会改用户的文件。盯不住就只是少了「变更时告警」，页面上
@@ -712,6 +707,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 不是人发起的配置写入** —— 理由是服务器换发新 refresh token 的
         // 那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
+        // 定期刷新默认价目表（`pricing.auto_update`，默认开）
+        tw_control::pricing::spawn(control.clone());
 
         let _scan_watch = match tw_control::scan::spawn_watcher(control.clone()) {
             Ok(w) => Some(w),
@@ -803,6 +800,8 @@ fn build_store(
     // **收整条总线，不只是一个订阅端。**存储层算完价钱要往回报一条
     // （见 `Event::RequestPriced`）—— 它是这条链上唯一知道单价的地方。
     bus: tw_observe::EventBus,
+    // **和网关同一份价格簿**，不是一份副本：改了价目表，下一个结束的请求就按新价算
+    pricing: tw_pricing::Shared,
     bodies: tokio::sync::mpsc::Receiver<tw_gateway::BodyRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let events = bus.subscribe();
@@ -810,17 +809,6 @@ fn build_store(
         Ok(db) => db,
         Err(e) => {
             tracing::warn!("请求历史起不来，这次不记录（转发不受影响）：{e}");
-            return None;
-        }
-    };
-    // 价目表解不开是个打包错误，但同样不该挡住转发 —— 那时成本一栏
-    // 是空的，而请求照常。
-    let prices = match tw_pricing::Prices::builtin()
-        .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("价目表读不了，成本一栏会是空的：{e}");
             return None;
         }
     };
@@ -849,7 +837,7 @@ fn build_store(
     Some(tw_store::task::spawn(
         // 算完价钱往回报一条 —— 见 `Event::RequestPriced`。这里是唯一
         // 同时看得见总线和存储层的地方，所以接线在这儿完成。
-        tw_store::Recorder::new(db, blobs, prices).reporting_to(bus),
+        tw_store::Recorder::new(db, blobs, pricing).reporting_to(bus),
         events,
         rx,
     ))

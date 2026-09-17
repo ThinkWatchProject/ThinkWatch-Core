@@ -39,6 +39,7 @@ fn bed_with_store(store: Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Reco
         gateway_addr: None,
         store,
         started: std::time::Instant::now(),
+        price_updater: Default::default(),
         // 接管走这个 home。**测试里绝不能碰开发者自己的配置**，而且它
         // 是个字段而不是进程级的 $HOME —— 后者会让并行跑的测试互相踩。
         home: home.clone(),
@@ -454,13 +455,18 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
         routing: None,
         billing: String::new(),
         cache_saved_micros: None,
+        price_source: None,
     };
     row.id = 1;
     db.insert(&row).unwrap();
     // 存的时候说清「原本更长」
     blobs.put_with_len(1000, 1, tw_store::Which::Request, b"half", 9_999_999);
 
-    let rec = tw_store::Recorder::new(db, blobs, tw_pricing::Prices::builtin().unwrap());
+    let rec = tw_store::Recorder::new(
+        db,
+        blobs,
+        tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
+    );
     let store = std::sync::Arc::new(tokio::sync::Mutex::new(rec));
 
     let b = bed_with_store(Some(store));
@@ -485,7 +491,11 @@ async fn replaying_a_request_that_is_gone_says_so() {
     let d = tempfile::tempdir().unwrap();
     let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
     let blobs = tw_store::Blobs::new(d.path().join("blobs"));
-    let rec = tw_store::Recorder::new(db, blobs, tw_pricing::Prices::builtin().unwrap());
+    let rec = tw_store::Recorder::new(
+        db,
+        blobs,
+        tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
+    );
     let b = bed_with_store(Some(std::sync::Arc::new(tokio::sync::Mutex::new(rec))));
     let (st, body) = post(&b.app, "/replay/quote", r#"{"id":42,"provider":"官方"}"#).await;
     assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
