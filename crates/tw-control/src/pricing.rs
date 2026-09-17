@@ -583,7 +583,7 @@ fn per_million(p: &tw_api::PriceFields) -> tw_pricing::PerMillion {
     }
 }
 
-fn price_fields(p: &tw_pricing::PerMillion) -> tw_api::PriceFields {
+pub(crate) fn price_fields(p: &tw_pricing::PerMillion) -> tw_api::PriceFields {
     tw_api::PriceFields {
         input: p.input,
         output: p.output,

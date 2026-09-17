@@ -563,9 +563,20 @@ pub struct ProviderView {
     pub on_proxy_fail: String,
     /// 服务不提供模型列表时用的手动清单
     pub models: Vec<String>,
+    /// 启用范围：只用这些模型（ID 或 glob）。空 = 它提供的全部
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_only: Option<Vec<String>>,
+    /// 模型清单从哪儿来：`discovered`（上游列出的）/ `manual`（手动清单）/
+    /// `none`（不知道它有什么）
+    pub model_source: String,
+    /// 现在能服务的模型数，已按启用范围过滤。停用时是 0
+    pub model_count: usize,
+    /// 停用：不参与路由，模型不出现在 `/v1/models` 里
+    pub disabled: bool,
     /// closed / open
     pub health: String,
-    /// 配置里写明的计费方式。空 = 自动识别
+    /// 配置里写明的计费方式：`per-token` / `subscription` / `free` / `unknown`。
+    /// 空 = 自动识别
     #[serde(default)]
     pub billing: Option<String>,
     /// 判完的信任级别：`official` / `untrusted`
@@ -1046,7 +1057,10 @@ pub struct ProviderInput {
     /// 服务不提供模型列表时的手动清单
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
-    /// `per-token` / `subscription` / `unknown`。不给就自动识别
+    /// 启用范围：只用这些模型（ID 或 glob）。不给就是它提供的全部
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_only: Option<Vec<String>>,
+    /// `per-token` / `subscription` / `free` / `unknown`。不给就自动识别
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
     /// `official` / `untrusted`。不给就按地址识别
@@ -1058,6 +1072,42 @@ pub struct ProviderInput {
     /// 按哪张价目表计价。不给就是默认价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
+    /// 停用
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+/// 一个上游的模型清单。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelsView {
+    pub provider: String,
+    /// `discovered`（上游列出的）/ `manual`（手动清单）/ `none`
+    pub source: String,
+    /// 最近一次向上游获取清单的时间。还没获取过是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at_ms: Option<u64>,
+    /// 没从上游拿到清单的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub models: Vec<ModelRow>,
+}
+
+/// 清单里的一个模型。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRow {
+    pub id: String,
+    /// 在启用范围里
+    pub enabled: bool,
+    /// 上下文窗口，来自默认价目表
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// 按这个上游选的价目表查到的价格。空 = 无法计价
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<PriceFields>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<PriceSourceView>,
+    /// 价格是从别的平台借来的。**按它算出来的钱是估算**
+    pub estimated: bool,
 }
 
 fn direct() -> String {
@@ -1397,12 +1447,13 @@ pub struct SpeedEstimate {
     /// 输入 token。**精确值** —— 请求是固定的
     pub input_tokens: u64,
     pub max_output_tokens: u64,
+    /// 微分。按量计费算得出来时是那个数，不计费时是 0。订阅制、计费方式
+    /// 未知、无法计价时是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
-    /// 订阅制上游：不按 token 收钱，消耗的是额度。它没有金额，但**不让
-    /// 合计变成空** —— 空只留给「按量计费却算不出来」
-    #[serde(default)]
-    pub subscription: bool,
+    /// 这家的计费方式：`per-token` / `subscription` / `free` / `unknown`。
+    /// **订阅制那几项没有金额，但不让合计变成空**
+    pub billing: String,
     /// 给人看的那一句
     pub note: String,
 }
@@ -1569,8 +1620,10 @@ pub struct ReplayQuote {
     pub provider: String,
     pub body_bytes: i64,
     pub input_tokens: i64,
-    /// `None` = 订阅型，或者这个模型不在价目表里。**不是 0**
+    /// `None` = 订阅制、计费方式未知，或者这个模型无法计价。**不是 0**
     pub cost_micros: Option<i64>,
+    /// 要重放到的那家的计费方式：`per-token` / `subscription` / `free` / `unknown`
+    pub billing: String,
     pub note: String,
     /// 发出去之前会不会脱敏。用户有权在按下去之前知道
     pub will_redact: bool,
@@ -1806,7 +1859,7 @@ pub struct DryRunResult {
     /// 写在第一个」。直指 provider 时是 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
-    /// `route` | `deny` | `no_match`
+    /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了）
     pub outcome: String,
     /// 命中的规则名
     pub rule: Option<String>,
@@ -1823,6 +1876,17 @@ pub struct DryRunResult {
     pub hurts_cache: bool,
     /// 候选链里此刻熔断着的那些。**试算是静态的，但熔断是当下的事实**
     pub circuit_open: Vec<String>,
+    /// 规则选中、但服务不了这个请求而被跳过的上游
+    #[serde(default)]
+    pub skipped: Vec<SkippedView>,
+}
+
+/// 一个被跳过的候选上游。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkippedView {
+    pub provider: String,
+    /// `disabled` / `out_of_scope` / `not_offered`
+    pub reason: String,
 }
 
 // ---------------------------------------------------------- 客户端接管

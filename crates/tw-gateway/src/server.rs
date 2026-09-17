@@ -98,32 +98,6 @@ pub fn client_for_provider(
         .map_err(|e| GatewayError::config(format!("HTTP 客户端建不起来：{e}")))
 }
 
-/// 目录的来源清单：每个 provider 声明了哪些模型、说什么协议。
-///
-/// **单独一个函数是为了让「上游名单变没变」有一个确切的判据**。
-/// 改一条路由规则不该重置模型目录（那会让 `/v1/models` 短暂地空一下），
-/// 而删掉一个 provider 必须立刻反映（列表即承诺）。
-fn catalog_sources(cfg: &tw_config::Config) -> Vec<tw_engine::ProviderModels> {
-    cfg.providers
-        .iter()
-        .map(|p| tw_engine::ProviderModels {
-            provider: p.name.clone(),
-            protocol: p
-                .effective_protocol()
-                .map(|x| format!("{x:?}"))
-                // 猜不出协议时按 Anthropic 算 —— 和转发时的默认一致
-                // （forward::apply_credential）。两处不一致会让「列出来了
-                // 但发过去 401」变成可能。
-                .unwrap_or_else(|| "Anthropic".to_string()),
-            models: p.models.clone(),
-        })
-        .collect()
-}
-
-fn catalog_from(cfg: &tw_config::Config) -> tw_engine::Catalog {
-    tw_engine::Catalog::build(&catalog_sources(cfg))
-}
-
 /// 一次配置换入时**整块换掉**的那部分。
 ///
 /// 分成「换的」和「不换的」两堆，判据是**这个东西丢了会不会让用户感觉
@@ -201,7 +175,7 @@ impl Runtime {
 ///
 /// base_url 和 key 都**不在**里面：Client 不绑 URL，凭据是每个请求现加
 /// 的。把它们算进来只会让「改个 key」白白丢掉一整个连接池。
-fn proxy_shape(cfg: &tw_config::Config, p: &tw_config::Provider) -> String {
+pub(crate) fn proxy_shape(cfg: &tw_config::Config, p: &tw_config::Provider) -> String {
     let px = cfg
         .proxies
         .iter()
@@ -233,11 +207,13 @@ pub struct AppState {
     /// 上游健康。**不持久化**，但**跨重载存活** —— 一家刚被熔断的上游
     /// 不该因为你改了条规则就立刻又被试一遍。
     pub health: Arc<Health>,
-    /// 模型目录。**列表和准入的唯一真相来源**。
+    /// 模型汇总。**列表、准入和挑候选的唯一真相来源**。
     ///
-    /// 启动时用配置里的 `models:` 填一份，L2 探测回来后原子换入 ——
-    /// 探测要打网络，不能挡住启动。
+    /// 从 `models` 和当前配置推出来（见 [`crate::models`]）：启动时只有手写
+    /// 的清单，向上游问到之后、配置换了之后都会重算。
     pub catalog: Arc<arc_swap::ArcSwap<tw_engine::Catalog>>,
+    /// 每个上游的模型清单，以及是什么时候、怎么来的。**跨重载存活**
+    pub models: Arc<crate::models::Directory>,
     /// 请求体和响应体往哪儿交。
     ///
     /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
@@ -295,11 +271,12 @@ impl AppState {
             .build()
             .map_err(|e| GatewayError::config(format!("HTTP 客户端建不起来：{e}")))?;
         let limits = config.limits.clone();
-        let catalog = catalog_from(&config);
         let pricing_config = config.pricing.clone();
         let price_assign = config.price_assign();
+        let models = Arc::new(crate::models::Directory::default());
+        models.reconcile(&config);
         let rt = Runtime::build(config, None)?;
-        Ok(Self {
+        let state = Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Arc::new(arc_swap::ArcSwap::from_pointee(crate::limits::Gate::new(
                 limits,
@@ -307,7 +284,8 @@ impl AppState {
             http,
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
-            catalog: Arc::new(arc_swap::ArcSwap::from_pointee(catalog)),
+            catalog: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+            models,
             body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
@@ -326,7 +304,15 @@ impl AppState {
             rotation_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
             live: crate::live::Live::default(),
-        })
+        };
+        // 手写的清单马上可用；向上游问是后台的事，不挡启动
+        state.publish_catalog();
+        Ok(state)
+    }
+
+    /// 按目录和当前配置重算模型汇总。
+    pub(crate) fn publish_catalog(&self) {
+        self.models.publish(|| self.config(), &self.catalog);
     }
 
     /// 取这一家的密钥。**OAuth 那一类要联网换 token，所以这条路是
@@ -504,10 +490,12 @@ impl AppState {
             .iter()
             .filter_map(|name| {
                 let p = providers.iter().find(|p| &p.name == name)?;
-                // **订阅制的边际成本是零，它就是最便宜的那家**。
+                // **订阅制和不计费的边际成本是零，它们就是最便宜的**。
                 // 而「价格未知」不是「免费」 —— 它不在这张表里，排到最后去
                 match p.billing {
-                    Some(tw_config::Billing::Subscription) => Some((name.clone(), (0, 0))),
+                    Some(tw_config::Billing::Subscription | tw_config::Billing::Free) => {
+                        Some((name.clone(), (0, 0)))
+                    }
                     Some(tw_config::Billing::Unknown) => None,
                     _ => book.unit_micros(name, model).map(|u| (name.clone(), u)),
                 }
@@ -540,14 +528,7 @@ impl AppState {
         let old = self.rt.load();
         let limits_changed = old.config.limits != config.limits;
         let new_limits = config.limits.clone();
-        let catalog_stale = catalog_sources(&old.config) != catalog_sources(&config);
         let next = Runtime::build(config, Some(&old))?;
-        if catalog_stale {
-            // 上游名单变了，目录里那些属于已删上游的模型必须立刻消失 ——
-            // 不然 `/v1/models` 会继续列出一个已经不存在的东西，而
-            // 「列表即承诺」。真正的探测在后台补。
-            self.catalog.store(Arc::new(catalog_from(&next.config)));
-        }
         let relisten =
             old.config.listen.gateway.socket_addr() != next.config.listen.gateway.socket_addr();
         // 自定义价目表和上游的选择跟着配置走，默认价目表不变
@@ -555,6 +536,12 @@ impl AppState {
         self.pricing
             .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
         self.rt.store(Arc::new(next));
+        // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表
+        // 即承诺），改了范围的立刻生效。新加的、地址凭据变了的在后台补问
+        if self.models.reconcile(&self.config()) {
+            self.models.wake();
+        }
+        self.publish_catalog();
         if relisten {
             // 只通知，不在这里重建 —— 换监听器要 await，而这个函数被
             // 文件监听那条同步路径调用。谁在监听谁去换。
@@ -1030,20 +1017,25 @@ async fn pipeline(
                 .find(|c| c.name == client_name)
                 .and_then(|c| c.allow.clone());
             if !catalog.admits(&facts.model, Some(position.dialect()), allow.as_deref()) {
-                // 错误信息要说人话 —— 而不是一个干巴巴的 permission
-                // denied。
-                return Err(GatewayError::new(
-                    crate::error::Source::Request,
+                // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
+                // 该去改的地方不一样
+                let msg = if catalog.providers_for(&facts.model).is_empty() {
+                    format!(
+                        "没有上游提供模型 {}。能用的模型见 GET /v1/models。",
+                        facts.model
+                    )
+                } else {
                     format!(
                         "客户端 `{client_name}` 不允许使用 {}。它能用的模型见 GET /v1/models。",
                         facts.model
-                    ),
-                ));
+                    )
+                };
+                return Err(GatewayError::new(crate::error::Source::Request, msg));
             }
         }
     }
 
-    let decision = match rt
+    let mut decision = match rt
         .engine
         .route(&facts)
         .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?
@@ -1056,13 +1048,30 @@ async fn pipeline(
             return Err(GatewayError::denied(reason));
         }
     };
+    // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的。
+    // **在排序之前** —— `cheapest` 和 `url-test` 要在能服务的上游里挑。
+    //
+    // 不跳过的话，一家没有这个模型的上游排在前面，它回的 404 不触发故障
+    // 转移，请求就在一家能服务它的上游旁边失败了。
+    let serving = crate::models::serving(
+        &rt.config,
+        &state.catalog.load(),
+        &decision.candidates,
+        &facts.model,
+    );
+    if serving.usable.is_empty() {
+        return Err(serving.explain(&facts.model));
+    }
+    if !serving.skipped.is_empty() {
+        tracing::debug!(skipped = ?serving.skipped, model = %facts.model, "跳过服务不了的候选");
+    }
+    decision.candidates = serving.usable;
     // 策略组排序。**引擎给的是集合，顺序在这儿定** ——
     // 因为 `load-balance` / `url-test` / `cheapest` 都要运行时的数字，
     // 而路由决策本身必须是纯的、可试算的。
     //
     // `fallback` 和 `select` 走不到这里面 —— 那是绝大多数人的配置，
     // 它们连一个 HashMap 都不用建。
-    let mut decision = decision;
     if let Some(gname) = decision.via_group.clone()
         && let Some(kind) = rt
             .engine
@@ -1671,17 +1680,10 @@ async fn pipeline(
     Ok(resp)
 }
 
-/// 去问每个上游有哪些模型，把目录换掉。
-///
-/// **探测是零成本的**（L2），但它要打网络，所以在后台跑而不是
-/// 挡住启动。配置里手写的 `models:` 是它回来之前的兜底。
-///
-/// 结果缓存 24 小时 ——模型列表变化不频繁，而**每次有人调
-/// `/v1/models` 就去打上游，会把一个本该零成本的端点变成一次串行网络
-/// 往返**。
 /// 给 `url-test` 组的成员垫一个底（样本不够时用零成本的 L1 补）。
 ///
-/// **只测 `url-test` 组里的那些，而且只在启动和换配置时测一次。**
+/// **只测 `url-test` 组里的那些，启动时和之后每天各测一次**（跟着模型清单
+/// 的刷新一起跑，见 [`crate::models::spawn`]）。
 /// 没有这一步的话，`url-test` 在攒够真实样本之前完全等同于 `fallback`
 /// —— 用户配了「选最快的」，而头几十个请求全落在配置里排第一那家。
 ///
@@ -1701,7 +1703,13 @@ pub async fn seed_latency(state: &AppState) {
         return;
     }
     for name in want {
-        let Some(p) = rt.config.providers.iter().find(|p| p.name == name) else {
+        // 停用的不参与路由，用不着垫
+        let Some(p) = rt
+            .config
+            .providers
+            .iter()
+            .find(|p| p.name == name && !p.disabled)
+        else {
             continue;
         };
         // 走代理的那家要测它真正会走的那条路。`system` 测不了，
@@ -1725,73 +1733,6 @@ pub async fn seed_latency(state: &AppState) {
             tracing::debug!(provider = %name, "L1 连不上，不垫底");
         }
     }
-}
-
-pub async fn refresh_catalog(state: &AppState) {
-    // 探测要打网络，一轮下来可能几秒。**整轮用同一份运行时** —— 中途
-    // 换了配置的话，这一轮探的是旧名单，而下面换入前会再确认一次。
-    let rt = state.runtime();
-    let mut sources = Vec::new();
-    for p in rt.config.providers.iter() {
-        let protocol = p
-            .effective_protocol()
-            .map(|x| format!("{x:?}"))
-            .unwrap_or_else(|| "Anthropic".to_string());
-        let http = rt.clients.get(&p.name).unwrap_or(&state.http);
-        let key = match state.key_for(p, http).await {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(provider = %p.name, "密钥取不到，跳过探测：{e}");
-                sources.push(tw_engine::ProviderModels {
-                    provider: p.name.clone(),
-                    protocol,
-                    models: p.models.clone(),
-                });
-                continue;
-            }
-        };
-        let r = crate::probe::probe(http, &p.base_url, &key, p.effective_protocol()).await;
-        let discovered = match &r.models {
-            crate::probe::ModelList::Listed { models } => models.clone(),
-            // 探不到就用手写的兜底。**两者不合并** —— 合并的话，用户
-            // 删掉一个上游不再提供的模型时会发现它删不掉。
-            other => {
-                if !p.models.is_empty() {
-                    tracing::debug!(provider = %p.name, ?other, "用配置里手写的模型清单");
-                } else {
-                    tracing::info!(
-                        provider = %p.name, ?other,
-                        "这家没给模型列表，也没写 models: 兜底 —— 它的模型不会出现在 /v1/models 里"
-                    );
-                }
-                p.models.clone()
-            }
-        };
-        sources.push(tw_engine::ProviderModels {
-            provider: p.name.clone(),
-            protocol,
-            models: discovered,
-        });
-    }
-    let total: usize = sources.iter().map(|s| s.models.len()).sum();
-    state
-        .catalog
-        .store(Arc::new(tw_engine::Catalog::build(&sources)));
-    tracing::info!(providers = sources.len(), models = total, "模型目录已刷新");
-}
-
-/// 后台刷新循环。
-///
-/// **`url-test` 的垫底跟着它一起跑**：两者都是「启动时打一次网络、
-/// 之后靠真实流量」，而且都不该挡住启动。
-pub fn spawn_catalog_refresh(state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            seed_latency(&state).await;
-            refresh_catalog(&state).await;
-            tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
-        }
-    });
 }
 
 /// 起服务。返回实际绑定的地址 —— 端口写 0 时调用方需要知道拿到了哪个。

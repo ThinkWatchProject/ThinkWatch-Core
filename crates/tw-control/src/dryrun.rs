@@ -129,10 +129,11 @@ pub async fn dry_run(
         trace,
         hurts_cache: false,
         circuit_open: Vec::new(),
+        skipped: Vec::new(),
     };
 
     match engine.route(&f) {
-        Ok(Outcome::Route(d)) => {
+        Ok(Outcome::Route(mut d)) => {
             out.outcome = "route".into();
             out.rule = Some(d.matched_rule.clone());
             out.via_group = d.via_group.clone();
@@ -142,6 +143,35 @@ pub async fn dry_run(
                 .and_then(|g| engine.groups().iter().find(|x| x.name == g))
                 .map(|g| g.kind.hurts_cache())
                 .unwrap_or(false);
+            out.set = describe(&d.set);
+            out.strategy = d
+                .via_group
+                .as_deref()
+                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
+                .map(|g| g.kind.label().to_string());
+            // 和数据面同一步：去掉服务不了这个请求的候选（停用的、范围外的、
+            // 清单里没有这个模型的）。**被跳过的要列出来** —— 「规则明明写的
+            // 是 A」正是用户会来试算的原因
+            let serving = tw_gateway::models::serving(
+                &rt.config,
+                &s.gateway.catalog.load(),
+                &d.candidates,
+                &f.model,
+            );
+            out.skipped = serving
+                .skipped
+                .iter()
+                .map(|(provider, why)| tw_api::SkippedView {
+                    provider: provider.clone(),
+                    reason: why.slug().to_string(),
+                })
+                .collect();
+            if serving.usable.is_empty() {
+                out.outcome = "unavailable".into();
+                out.reason = Some(serving.explain(&f.model).message);
+                return Ok(Json(out));
+            }
+            d.candidates = serving.usable;
             // **熔断是当下的事实，不是静态结论。**试算说「会走 A」，而 A
             // 此刻正熔断着 —— 不说出来的话，用户会拿着一个对的答案去查
             // 一个错的现象。
@@ -151,7 +181,6 @@ pub async fn dry_run(
                 .filter(|c| !s.health().is_available(c))
                 .cloned()
                 .collect();
-            out.set = describe(&d.set);
             // **顺序要和数据面一样，否则试算就是在撒谎。**`load-balance`
             // / `url-test` / `cheapest` 的次序由运行时的数字定，
             // 这里走的是同一个 `order`，喂的是同一份延迟表和价目表。
@@ -161,11 +190,6 @@ pub async fn dry_run(
             // 于是它显示的是轮转序列里的当前位置 —— 而那正是一个没有
             // 会话指纹的请求真的会走的路。
             out.candidates = order_like_the_data_plane(&s, engine, &d, &f);
-            out.strategy = d
-                .via_group
-                .as_deref()
-                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .map(|g| g.kind.label().to_string());
         }
         Ok(Outcome::Deny { rule, reason }) => {
             out.outcome = "deny".into();

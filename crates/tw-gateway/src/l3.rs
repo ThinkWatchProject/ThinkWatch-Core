@@ -21,11 +21,7 @@ const PROMPT: &str = "Hi";
 const MAX_TOKENS: u64 = 8;
 
 /// 这次测速会花多少。
-///
-/// **三种情况都要说清楚**：算得出金额的给金额；订阅型的说
-/// 「不计费」；价格未知的说「价格未知」—— 而三者都要给出 token 数，
-/// 因为那是唯一一个我们确定知道的量。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Estimate {
     pub provider: String,
     pub model: String,
@@ -33,16 +29,8 @@ pub struct Estimate {
     pub input_tokens: u64,
     /// 输出上限
     pub max_output_tokens: u64,
-    /// 微分。`None` 表示价目表里没有这个模型，或者这家是订阅制
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_micros: Option<i64>,
-    /// 订阅制上游。**没有金额不等于算不出来** —— 它消耗的是额度，不该
-    /// 让一批测速的合计因为它变成「算不出来」
-    #[serde(default)]
-    pub subscription: bool,
-    /// 给人看的那一句。**金额再小也要显示** —— 用户按下按钮时有权知道
-    /// 自己在花什么
-    pub note: String,
+    /// 按这家的计费方式和价目表报的价，见 [`crate::quote`]
+    pub quote: crate::quote::Quote,
 }
 
 /// 探测请求的输入 token 数。
@@ -251,10 +239,10 @@ fn has_content(chunk: &[u8]) -> bool {
 
 /// 算一次测速要花多少。
 pub fn estimate(
-    prices: &tw_pricing::PriceBook,
+    book: &tw_pricing::PriceBook,
     provider: &str,
     model: &str,
-    subscription: bool,
+    billing: tw_config::Billing,
 ) -> Estimate {
     let input = probe_input_tokens();
     let usage = tw_pricing::Usage {
@@ -262,58 +250,13 @@ pub fn estimate(
         output: MAX_TOKENS,
         ..Default::default()
     };
-    let (cost_micros, note) = if subscription {
-        // **订阅型上游不按 token 计费**，但它照样消耗额度 —— 说清楚
-        // 消耗多少，而不是说「免费」
-        (
-            None,
-            format!("不计费，但会消耗约 {} tokens 的额度", input + MAX_TOKENS),
-        )
-    } else {
-        match prices.cost_for(provider, model, &usage, false) {
-            tw_pricing::Cost::Known(m) | tw_pricing::Cost::Estimated(m) => (
-                Some(m),
-                // **金额再小也要显示。**用户按下按钮时有权知道自己在花
-                // 什么
-                format!("约 ${:.5}", m as f64 / 1e6),
-            ),
-            tw_pricing::Cost::Unpriced { .. } => (
-                None,
-                format!(
-                    "价格未知（这个模型不在价目表里），将消耗约 {} tokens",
-                    input + MAX_TOKENS
-                ),
-            ),
-        }
-    };
     Estimate {
         provider: provider.to_string(),
         model: model.to_string(),
         input_tokens: input,
         max_output_tokens: MAX_TOKENS,
-        cost_micros,
-        subscription,
-        note,
+        quote: crate::quote::quote(book, provider, model, &usage, billing),
     }
-}
-
-/// 一批测速的总计。
-///
-/// **批量是最容易让人手滑的地方** —— 点一下「全部测速」可能是
-/// 十几次真实调用，所以要列出每一项**并给出总计**。
-///
-/// **订阅制那几项不进合计**：它们不按 token 收钱，消耗的是额度，界面上
-/// 单独说。以前它们和「价格未知」一样让合计变成空 —— 于是只要勾上一家
-/// 订阅制上游，用户就再也看不到这批测速要花多少钱。
-pub fn total_micros(es: &[Estimate]) -> Option<i64> {
-    // 有任何一项按量计费却算不出来，总计就不该给一个看起来完整的数字
-    if es
-        .iter()
-        .any(|e| !e.subscription && e.cost_micros.is_none())
-    {
-        return None;
-    }
-    Some(es.iter().filter_map(|e| e.cost_micros).sum())
 }
 
 #[cfg(test)]
@@ -340,80 +283,26 @@ mod tests {
     }
 
     #[test]
-    fn an_estimate_names_a_concrete_amount_however_small() {
-        // **金额再小也要显示。**用户按下按钮时有权知道自己在花什么。
-        let e = estimate(&prices(), "官方", "claude-sonnet-4-5", false);
-        assert!(e.cost_micros.is_some());
-        assert!(e.note.starts_with("约 $"), "{}", e.note);
-        // 五位小数：这次测速是几百微分的量级，**两位小数会显示成
-        // $0.00**，而那等于告诉用户「这不花钱」。
-        assert!(e.note.contains("0.000"), "{}", e.note);
-        assert_ne!(e.note, "约 $0.00", "精度不够，看起来像免费的");
-    }
-
-    #[test]
-    fn a_subscription_upstream_says_it_costs_quota_not_that_it_is_free() {
-        // 「免费」是错的 —— 它照样消耗额度。
-        let e = estimate(&prices(), "订阅", "claude-sonnet-4-5", true);
-        assert!(e.cost_micros.is_none());
-        assert!(e.note.contains("不计费"), "{}", e.note);
-        assert!(e.note.contains("额度"), "得说清消耗的是什么：{}", e.note);
-        assert!(e.note.contains("18"), "得给出 token 数：{}", e.note);
-    }
-
-    #[test]
-    fn an_unpriced_model_says_so_and_still_gives_the_token_count() {
-        // token 数是唯一一个我们确定知道的量。
-        let e = estimate(&prices(), "中转", "某个自己起的名字", false);
-        assert!(e.cost_micros.is_none());
-        assert!(e.note.contains("价格未知"), "{}", e.note);
-        assert!(e.note.contains("18"), "{}", e.note);
-    }
-
-    #[test]
-    fn the_input_token_count_is_exact_not_approximate() {
+    fn an_estimate_prices_the_fixed_probe_with_an_exact_token_count() {
         // 「约 10 tokens」和「10 tokens」在一个「你确认要花钱吗」的
         // 对话框里是两种可信度。
-        let e = estimate(&prices(), "p", "claude-sonnet-4-5", false);
+        let e = estimate(
+            &prices(),
+            "官方",
+            "claude-sonnet-4-5",
+            tw_config::Billing::PerToken,
+        );
         assert_eq!(e.input_tokens, probe_input_tokens());
         assert_eq!(e.max_output_tokens, MAX_TOKENS);
-    }
-
-    #[test]
-    fn a_batch_gives_a_total() {
-        // **批量是最容易让人手滑的地方**。
-        let es: Vec<_> = ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]
-            .iter()
-            .map(|m| estimate(&prices(), "p", m, false))
-            .collect();
-        let total = total_micros(&es).expect("三个都有价格，总计该算得出来");
-        assert_eq!(
-            total,
-            es.iter().map(|e| e.cost_micros.unwrap()).sum::<i64>()
+        assert!(e.quote.cost_micros.is_some());
+        let tokens = (probe_input_tokens() + MAX_TOKENS).to_string();
+        let e = estimate(
+            &prices(),
+            "订阅",
+            "claude-sonnet-4-5",
+            tw_config::Billing::Subscription,
         );
-    }
-
-    #[test]
-    fn a_batch_with_one_unpriced_model_refuses_to_show_a_complete_looking_total() {
-        // **有一项算不出来，总计就不该给一个看起来完整的数字** ——
-        // 那会让用户以为「全部测速」的代价就是那个数。
-        let mut es = vec![estimate(&prices(), "p", "claude-sonnet-4-5", false)];
-        es.push(estimate(&prices(), "p", "某个中转站的模型", false));
-        assert!(total_micros(&es).is_none());
-    }
-
-    #[test]
-    fn a_subscription_item_stays_out_of_the_total_instead_of_voiding_it() {
-        // 勾上一家订阅制上游，不该让用户看不到其余几家要花多少钱。
-        let es = vec![
-            estimate(&prices(), "官方", "claude-sonnet-4-5", false),
-            estimate(&prices(), "订阅", "claude-sonnet-4-5", true),
-        ];
-        assert_eq!(total_micros(&es), es[0].cost_micros);
-        // 价格未知的那一项照样让合计不成立
-        let mut es = es;
-        es.push(estimate(&prices(), "中转", "某个中转站的模型", false));
-        assert!(total_micros(&es).is_none());
+        assert!(e.quote.note.contains(&tokens), "{}", e.quote.note);
     }
 
     #[test]

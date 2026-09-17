@@ -105,8 +105,6 @@ pub async fn quote(
     let input = row.input_tokens.unwrap_or((raw.len() / 4) as i64).max(0) as u64;
     let output = row.output_tokens.unwrap_or(0).max(0) as u64;
     let book = s.gateway.pricing.load();
-    // 和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
-    let subscription = s.gateway.billing_of(provider) == tw_config::Billing::Subscription;
     let usage = tw_pricing::Usage {
         input,
         // 输出按上次那条的实际输出估。**它只是个估计**，模型这次可能
@@ -114,36 +112,23 @@ pub async fn quote(
         output: output.max(256),
         ..Default::default()
     };
-    let (cost_micros, note) = if subscription {
-        (
-            None,
-            format!("不计费，但会消耗约 {} tokens 的额度", input + usage.output),
-        )
-    } else {
-        // **按要重放到的那个上游查价**，不是原来那条走的上游
-        match book.cost_for(&provider.name, &row.model, &usage, false) {
-            tw_pricing::Cost::Known(m) | tw_pricing::Cost::Estimated(m) => (
-                Some(m),
-                // **金额再小也要显示。**用户按下按钮时有权知道自己在花什么
-                format!("约 ${:.5}", m as f64 / 1e6),
-            ),
-            tw_pricing::Cost::Unpriced { .. } => (
-                None,
-                format!(
-                    "价格未知（`{}` 不在价目表里），将消耗约 {} tokens",
-                    row.model,
-                    input + usage.output
-                ),
-            ),
-        }
-    };
+    // **按要重放到的那个上游报价**，不是原来那条走的上游。计费方式和记账
+    // 同一个口径：配置里写明了，或者最近一次响应里报过额度
+    let quote = tw_gateway::quote::quote(
+        &book,
+        &provider.name,
+        &row.model,
+        &usage,
+        s.gateway.billing_of(provider),
+    );
     Ok(Json(tw_api::ReplayQuote {
         model: row.model.clone(),
         provider: provider.name.clone(),
         body_bytes: raw.len() as i64,
         input_tokens: input as i64,
-        cost_micros,
-        note,
+        cost_micros: quote.cost_micros,
+        billing: quote.billing.slug().to_string(),
+        note: quote.note,
         // 脱敏在重放里照做，但用户有权在按下去之前知道
         will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
             .is_empty(),

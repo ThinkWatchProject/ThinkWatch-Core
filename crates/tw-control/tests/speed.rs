@@ -166,7 +166,7 @@ providers:
     let items = v["items"].as_array().unwrap();
     let official = items.iter().find(|i| i["provider"] == "official").unwrap();
     let max = items.iter().find(|i| i["provider"] == "max").unwrap();
-    assert_eq!(max["subscription"], true, "{v}");
+    assert_eq!(max["billing"], "subscription", "{v}");
     assert!(max.get("cost_micros").is_none(), "订阅制不该给金额：{v}");
     assert_eq!(
         v["total_micros"], official["cost_micros"],

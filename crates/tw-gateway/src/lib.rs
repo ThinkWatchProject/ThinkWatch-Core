@@ -22,9 +22,11 @@ pub mod latency;
 pub mod leak;
 pub mod limits;
 pub mod live;
+pub mod models;
 pub mod oauth;
 pub mod probe;
 pub mod quota;
+pub mod quote;
 pub mod server;
 pub mod session;
 pub mod toolwall;
@@ -42,8 +44,6 @@ pub use l3::{Estimate, L3Result};
 pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quota::{Quota, from_headers as quota_from_headers};
-pub use server::{
-    AppState, Runtime, client_for_provider, refresh_catalog, router, serve, serve_following_config,
-    spawn_catalog_refresh,
-};
+pub use quote::Quote;
+pub use server::{AppState, Runtime, client_for_provider, router, serve, serve_following_config};
 pub use usage::{Sniffer, Usage};
