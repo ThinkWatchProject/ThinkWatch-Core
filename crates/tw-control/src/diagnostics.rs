@@ -90,13 +90,13 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 上游
     let _ = writeln!(
         out,
-        "\n## 上游（{} 个）\n\n| 名字 | 地址 | 协议 | 代理 | 熔断 | 脱敏 | 信任 | 价目表 |\n|---|---|---|---|---|---|---|---|",
+        "\n## 上游（{} 个）\n\n| 名字 | 地址 | 协议 | 代理 | 状态 | 模型 | 脱敏 | 信任 | 价目表 |\n|---|---|---|---|---|---|---|---|---|",
         cfg.providers.len()
     );
     for p in &cfg.providers {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             p.name,
             // **地址也要脱敏** —— 中转站的 base_url 里常常带着 key
             tw_secret::redact_url(&p.base_url),
@@ -104,10 +104,34 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                 .map(|x| format!("{x:?}"))
                 .unwrap_or_else(|| "猜不出".into()),
             p.proxy,
-            if s.health().is_available(&p.name) {
+            if p.disabled {
+                "已停用"
+            } else if s.health().is_available(&p.name) {
                 "正常"
             } else {
                 "**熔断中**"
+            },
+            {
+                // 「这家为什么收不到某个模型的请求」多半答在这一栏
+                let l = s.gateway.models.listing(p);
+                let served = s.gateway.catalog.load().count_for(&p.name);
+                let scope = if p.models_only.is_some() {
+                    "，限定范围"
+                } else {
+                    ""
+                };
+                match l.source {
+                    tw_gateway::models::Source::Discovered => {
+                        format!("{served}（上游列出 {}{scope}）", l.models.len())
+                    }
+                    tw_gateway::models::Source::Manual => {
+                        format!("{served}（手动清单 {}{scope}）", l.models.len())
+                    }
+                    tw_gateway::models::Source::None => match &l.error {
+                        Some(why) => format!("未知：{why}"),
+                        None => "未知".to_string(),
+                    },
+                }
             },
             {
                 let k = p.effective_redact();

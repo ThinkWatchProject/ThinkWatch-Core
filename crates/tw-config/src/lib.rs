@@ -137,13 +137,15 @@ impl Default for Provider {
             base_url: String::new(),
             key: Secret::Literal(String::new()),
             protocol: None,
-            models: Vec::new(),
-            billing: None,
-            redact: None,
-            trust: None,
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
+            models: Vec::new(),
+            models_only: None,
+            billing: None,
             pricing: None,
+            trust: None,
+            redact: None,
+            disabled: false,
         }
     }
 }
@@ -538,18 +540,35 @@ pub struct Provider {
     /// **默认 `direct` 而不是 `system`**：显式优于隐式。默认跟随系统的
     /// 话，用户在系统里开了全局代理，本地 Ollama 就会莫名连不上，而
     /// 配置文件里看不出任何线索。
+    #[serde(default = "default_proxy", skip_serializing_if = "is_direct")]
+    pub proxy: String,
+    #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
+    pub on_proxy_fail: OnProxyFail,
     /// 探测不到时的兜底清单。
     ///
     /// 有些中转站没实现 `/v1/models`。**这是 provider 级的「这家有什么」，
     /// 不是全局的「我们对外暴露什么」** —— 那个由汇总推导出来。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// 只用这家的这些模型：模型 ID 或 glob。不写就是它提供的全部。
+    ///
+    /// **和 `models` 说的不是一件事**：`models` 说这家有什么，这里说我们
+    /// 用它的哪些。范围外的模型不出现在 `/v1/models` 里，路由也不会把
+    /// 它们的请求交给这家。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_only: Option<Vec<String>>,
     /// 这家怎么收钱。
     ///
     /// **不写就自动判**：响应头里报过订阅额度的就是订阅型。
     /// 那个信号一直在我们手上，不该变成一个用户要填的字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<Billing>,
+    /// 按哪张价目表计价。不写就是默认价目表。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<String>,
+    /// 这家可不可信。**不写就按 base_url 判。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<Trust>,
     /// 发给这家之前，把哪几类东西换成占位符。
     ///
     /// **不写就按 base_url 判**：官方端点不脱，其余脱默认那几类。理由很
@@ -558,16 +577,23 @@ pub struct Provider {
     /// 自废武功。而中转站是完整的中间人。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redact: Option<Vec<tw_redact::rules::Kind>>,
-    /// 这家可不可信。**不写就按 base_url 判。**
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust: Option<Trust>,
-    #[serde(default = "default_proxy", skip_serializing_if = "is_direct")]
-    pub proxy: String,
-    #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
-    pub on_proxy_fail: OnProxyFail,
-    /// 按哪张价目表计价。不写就是默认价目表。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<String>,
+    /// 停用。**配置原样留着**：不参与路由，它的模型也不出现在
+    /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub disabled: bool,
+}
+
+impl Provider {
+    /// 这家的这个模型在不在启用范围里（`models_only`）。**不管这家到底
+    /// 有没有这个模型** —— 那要看模型目录。
+    pub fn uses_model(&self, model: &str) -> bool {
+        match &self.models_only {
+            None => true,
+            Some(patterns) => patterns
+                .iter()
+                .any(|p| tw_engine::rule::glob_match(p, model)),
+        }
+    }
 }
 
 /// 这家上游可不可信。
@@ -621,21 +647,19 @@ pub enum Billing {
     /// 结果，会让人误以为这次调用真的免费；「订阅」表达的是「这笔账不在
     /// 这个维度上」。
     Subscription,
+    /// 不计费：本地模型、免费额度。**费用记 $0，是一个确定的数** ——
+    /// 和订阅制不同，这里的钱确实是零
+    Free,
     /// 上游价格未知。成本栏标「未知」，**不参与合计**
     Unknown,
 }
 
 impl Billing {
-    /// 这次调用该不该进金额合计。
-    ///
-    /// **宁可显示「不知道」，也不显示一个编出来的精确数字**。
-    pub fn counts_toward_money(&self) -> bool {
-        matches!(self, Billing::PerToken)
-    }
     pub fn label(&self) -> &'static str {
         match self {
             Billing::PerToken => "按量",
             Billing::Subscription => "订阅",
+            Billing::Free => "不计费",
             Billing::Unknown => "未知",
         }
     }
@@ -643,14 +667,8 @@ impl Billing {
         match self {
             Billing::PerToken => "per-token",
             Billing::Subscription => "subscription",
+            Billing::Free => "free",
             Billing::Unknown => "unknown",
-        }
-    }
-    pub fn parse(s: &str) -> Billing {
-        match s {
-            "subscription" => Billing::Subscription,
-            "unknown" => Billing::Unknown,
-            _ => Billing::PerToken,
         }
     }
 }

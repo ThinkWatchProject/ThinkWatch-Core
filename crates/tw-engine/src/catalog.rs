@@ -22,6 +22,9 @@ pub struct ProviderModels {
     pub provider: String,
     /// 这家说的方言。客户端按方言过滤时用它
     pub protocol: String,
+    /// 知不知道这家有什么。**不知道时 `models` 是空的，而那不代表它什么都
+    /// 不提供**；知道、但按启用范围过滤完是空的，才是真的什么都不提供
+    pub known: bool,
     pub models: Vec<String>,
 }
 
@@ -35,14 +38,20 @@ pub struct Catalog {
     by_model: BTreeMap<String, Vec<String>>,
     /// provider → 它说的方言
     protocols: BTreeMap<String, String>,
+    /// 有模型清单的 provider。**不在里面的不是「什么都不提供」，是「不知道」**
+    listed: BTreeSet<String>,
 }
 
 impl Catalog {
     pub fn build(sources: &[ProviderModels]) -> Self {
         let mut by_model: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut protocols = BTreeMap::new();
+        let mut listed = BTreeSet::new();
         for s in sources {
             protocols.insert(s.provider.clone(), s.protocol.clone());
+            if s.known {
+                listed.insert(s.provider.clone());
+            }
             for m in &s.models {
                 let v = by_model.entry(m.clone()).or_default();
                 if !v.contains(&s.provider) {
@@ -53,7 +62,26 @@ impl Catalog {
         Self {
             by_model,
             protocols,
+            listed,
         }
+    }
+
+    /// 这家能不能提供这个模型。`None` = 不知道：它没有模型清单。
+    ///
+    /// **不知道不等于不能。**把没有清单的上游当成「什么都没有」，一家不
+    /// 实现 `/v1/models` 的中转站就再也收不到请求 —— 而它可能什么都能服务。
+    pub fn offers(&self, provider: &str, model: &str) -> Option<bool> {
+        self.listed
+            .contains(provider)
+            .then(|| self.providers_for(model).iter().any(|p| p == provider))
+    }
+
+    /// 这家能服务几个模型。
+    pub fn count_for(&self, provider: &str) -> usize {
+        self.by_model
+            .values()
+            .filter(|ps| ps.iter().any(|p| p == provider))
+            .count()
     }
 
     /// 全集。
@@ -127,6 +155,7 @@ mod tests {
         ProviderModels {
             provider: p.into(),
             protocol: proto.into(),
+            known: !models.is_empty(),
             models: models.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -150,6 +179,19 @@ mod tests {
 
     fn owned(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_upstream_without_a_list_is_unknown_not_empty() {
+        let c = Catalog::build(&[
+            pm("relay-cn", "anthropic", &["claude-sonnet-4-5"]),
+            pm("no-list", "anthropic", &[]),
+        ]);
+        assert_eq!(c.offers("relay-cn", "claude-sonnet-4-5"), Some(true));
+        assert_eq!(c.offers("relay-cn", "claude-opus-4-1"), Some(false));
+        assert_eq!(c.offers("no-list", "claude-opus-4-1"), None);
+        assert_eq!(c.count_for("relay-cn"), 1);
+        assert_eq!(c.count_for("no-list"), 0);
     }
 
     #[test]
