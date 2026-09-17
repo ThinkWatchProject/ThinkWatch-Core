@@ -462,12 +462,14 @@ pub struct Overview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyView {
     pub name: String,
-    /// `http` / `socks5`
+    /// `socks5h` / `socks5` / `http` / `https`
     pub kind: String,
     pub addr: String,
+    /// 有没有认证。**用户名和密码都不在这里** —— 用户名是凭据的一半，
+    /// 而这个视图会进日志、进诊断包、进用户贴出来的截图
     pub has_auth: bool,
-    /// 有几家上游在用它。删之前要知道
-    pub used_by: usize,
+    /// 哪些上游在用它。删之前要知道，改名时它们会跟着改
+    pub used_by: Vec<String>,
 }
 
 /// 一类客户端辅助请求的处置。
@@ -518,36 +520,65 @@ pub struct SecurityView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderView {
     pub name: String,
-    /// 已脱敏
+    /// 已脱敏。**编辑时不要原样写回** —— 地址里带了凭据的话，写回去的
+    /// 是打过码的那一份。`base_url_masked` 告诉界面这一点
     pub base_url: String,
+    /// 地址里有被打码的部分（userinfo 之类）
+    pub base_url_masked: bool,
     /// 密钥的**来源**，不是值
     pub key_source: String,
+    /// `key` / `env` / `oauth`
+    pub key_kind: String,
+    /// `env` 时是哪个变量。变量名不是秘密，而它正是编辑时要回填的东西
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_env: Option<String>,
+    /// `oauth` 时的 token 端点和 client id。**refresh token 和 client
+    /// secret 永远不出这个进程**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    /// 实际生效的协议：`anthropic` / `openai-chat` / `openai-responses` /
+    /// `gemini`。猜不出来时为空
     pub protocol: Option<String>,
+    /// 协议是配置里写明的，还是按地址推断的
+    pub protocol_explicit: bool,
+    /// `direct` / `system` / 代理名
     pub proxy: String,
+    /// `fail` / `direct`
+    pub on_proxy_fail: String,
+    /// 服务不提供模型列表时用的手动清单
+    pub models: Vec<String>,
     /// closed / open
     pub health: String,
-    /// 这家怎么收钱。`cheapest` 策略和成本栏都看它
+    /// 配置里写明的计费方式。空 = 自动识别
     #[serde(default)]
     pub billing: Option<String>,
-    /// 可不可信。**不写就按 base_url 判**，这里给的是判完的结果
-    #[serde(default)]
+    /// 判完的信任级别：`official` / `untrusted`
     pub trust: String,
     /// 用户有没有在配置里显式写过 `trust`。
     ///
     /// **界面要能区分「自动判成不受信任」和「用户写了不受信任」** ——
     /// 前者改 base_url 就会变，后者不会，而两者显示成一样会让用户
     /// 以为自己改不动它。
-    #[serde(default)]
     pub trust_explicit: bool,
-    /// 这家上游实际会脱哪几类。
-    ///
-    /// 给的是**判完的结果**，不是配置里写的那几个字 —— 不写的话官方端点
-    /// 是空的、其余是那四类默认。界面上要能看出「没写」和「写了空」的
-    /// 区别，所以另给一个 explicit 标志。
-    #[serde(default)]
+    /// 这家上游实际会脱哪几类。给的是**判完的结果**
     pub redact: Vec<String>,
-    #[serde(default)]
     pub redact_explicit: bool,
+    /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
+    pub references: Vec<ReferenceView>,
+}
+
+/// 配置里引用了某个上游的一处。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReferenceView {
+    /// 路由规则的去向（`to`）
+    RuleTarget { route: String, rule: String },
+    /// 路由规则的条件（`provider_would_be`）
+    RuleCondition { route: String, rule: String },
+    /// 策略组的成员
+    Group { group: String },
 }
 
 /// 一条规则。
@@ -615,13 +646,6 @@ pub struct ListenView {
     pub exposed: bool,
 }
 
-/// 探一个上游能不能用。零成本，见L1/L2。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProbeRequest {
-    pub base_url: String,
-    pub key: String,
-}
-
 /// 模型清单的结果。**空列表不足以表达**：「上游没这个接口」「上游给了
 /// 但我们没认出格式」「真的一个都没有」是三件事，塌成空列表之后 UI 只能
 /// 说「这家不提供模型列表」，而那在第二种情况下是编的 —— 把我们自己的
@@ -643,25 +667,25 @@ pub enum ModelList {
     Empty,
 }
 
+/// 检测一个上游的结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProbeResponse {
+pub struct ProviderTestResult {
+    /// 地址通、凭据被接受
     pub ok: bool,
+    /// 按哪种协议测的
     pub protocol: Option<String>,
     pub latency_ms: u64,
     pub models: ModelList,
+    /// 经由哪个代理。直连时为空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub error: Option<String>,
 }
 
-/// L1 测速：只握手，不发业务请求。**零成本零副作用**，可以随便点。
+/// L1 测速：只握手，不发业务请求。**零成本零副作用**。
 ///
-/// 三种问法，但它们不是三个概念：
-///
-/// - `provider: Some(名字)` —— 测一个已配置的上游，代理按它自己的配置走
-/// - `proxy: Some(名字)` —— 只测代理本身。**代理测速就到这一层为止**，
-///   代理影响的是网络层，没有理由为了测代理去调用模型
-/// - `base_url: Some(地址)` —— 还没保存时用，首次配置那一步
-///
-/// 全不给就测所有上游。L1 零成本，批量不需要确认（L3 才需要）。
+/// 给了名字就测那一家，不给就测所有上游。代理自己的检测走
+/// `/proxies/test`，还没保存的上游走 `/providers/test`。
 ///
 /// **不接受一个「候选 URL 列表」。** cc-switch 有那么一张表，测完还得手动
 /// 点一下填进去，运行时永远只认当前保存的那一个 —— 同一个概念在一个程序
@@ -671,10 +695,6 @@ pub struct ProbeResponse {
 pub struct L1Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -887,6 +907,142 @@ pub struct ConfigWrite {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigWritten {
     pub version: String,
+}
+
+// ─────────────────────────────────────────────── 上游与代理的增删改
+
+/// 新建或修改一个上游时交过来的定义。
+///
+/// **结构，不是 YAML。**以前界面拼一段 YAML 交给补丁接口 —— 拼字符串的
+/// 那一方不知道引号规则，一个带 `#` 的值就能写坏整份配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderInput {
+    pub name: String,
+    /// 修改时**不给就是保持原样**：视图里的地址是打过码的，原样写回去
+    /// 会把码写进配置
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// 修改时**不给就是保持原样** —— 界面拿不到原值，也不该拿到
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<CredentialInput>,
+    /// `anthropic` / `openai-chat` / `openai-responses` / `gemini`。
+    /// 不给就按地址推断
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// `direct` / `system` / 代理名
+    #[serde(default = "direct")]
+    pub proxy: String,
+    /// `fail` / `direct`
+    #[serde(default = "fail_closed")]
+    pub on_proxy_fail: String,
+    /// 服务不提供模型列表时的手动清单
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// `per-token` / `subscription` / `unknown`。不给就自动识别
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
+    /// `official` / `untrusted`。不给就按地址识别
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+    /// 发送前脱敏的类别。不给就按地址识别；**空列表是「不脱敏」**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redact: Option<Vec<String>>,
+}
+
+fn direct() -> String {
+    "direct".to_string()
+}
+
+fn fail_closed() -> String {
+    "fail".to_string()
+}
+
+/// 凭据的三种写法。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialInput {
+    /// 明文写进配置
+    Key { value: String },
+    /// 从环境变量读，只写变量名
+    Env { var: String },
+    /// OAuth，带自动刷新
+    Oauth {
+        refresh: String,
+        endpoint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret: Option<String>,
+        /// 现成的 access token。**检测一份还没保存的 OAuth 凭据只能用它**
+        /// —— 拿 refresh token 去换，服务端可能当场作废旧的那把，而新的
+        /// 那把还没有地方写
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSave {
+    pub provider: ProviderInput,
+    /// 你基于哪一版。**对不上就是 409**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 检测一个上游，**不保存**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderTest {
+    pub provider: ProviderInput,
+    /// 正在编辑的是哪一家。给了的话，表单里没改的凭据和地址从它那儿取
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyInput {
+    pub name: String,
+    /// `socks5h` / `socks5` / `http` / `https`
+    pub kind: String,
+    /// `host:port`
+    pub addr: String,
+    pub auth: ProxyAuthInput,
+}
+
+/// 代理的认证怎么处理。
+///
+/// **三态**，因为视图里拿不到原来的用户名和密码：编辑时不动认证，就得有
+/// 一个「保持原样」的说法，而不是把空值当成「清掉」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ProxyAuthInput {
+    /// 保持原来的认证（新建时等同于不需要认证）
+    Keep,
+    /// 不需要认证
+    None,
+    /// 设成这一对
+    Set { user: String, pass: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxySave {
+    pub proxy: ProxyInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 检测一个代理，**不保存**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyTest {
+    pub proxy: ProxyInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+}
+
+/// 删除时带上的版本。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BaseVersion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
 }
 
 /// 历史里的一版。
@@ -1203,26 +1359,6 @@ pub struct StorageStatus {
     pub blob_bytes: u64,
     /// **转发受影响了吗。永远是 false** —— 观测挂了，代理照跑
     pub forwarding_affected: bool,
-}
-
-/// 首次运行时写下第一个上游。
-///
-/// **只在还没有 provider 时可用**。之后改配置走双向同步（M2），
-/// 那是另一套机制：这里是从无到有整文件生成，那边是改一个字节而保住
-/// 其余全部。混用会让「注释和格式原样保留」这条承诺失效。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetupRequest {
-    pub name: String,
-    pub base_url: String,
-    pub key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetupResponse {
-    /// 写完之后，客户端该用哪把网关密钥
-    pub gateway_key: String,
-    pub gateway_addr: String,
-    pub config_path: String,
 }
 
 /// 换掉了哪一类、几处。**只有类别和计数，没有原值。**
