@@ -1723,14 +1723,38 @@ async fn pipeline(
     let client_sse = session
         .as_ref()
         .map_or(is_sse, |s| convert_stream && s.client_sse());
-    // 工具调用防火墙。**只在 SSE 上跑** —— 非流式响应整个到手
+    // 客户端收到的是不是那个 JSON 数组流。**它也是边收边发的**：以前工具调用审查
+    // 只认 SSE，不带 `alt=sse` 的 Gemini 客户端收到的工具调用一个都没查过
+    let client_json_stream = status.is_success()
+        && match &session {
+            Some(s) => convert_stream && !s.client_sse(),
+            None => {
+                !is_sse
+                    && api == Some(crate::client_api::ClientApi::Gemini)
+                    && uri
+                        .path()
+                        .trim_end_matches('/')
+                        .ends_with(":streamGenerateContent")
+            }
+        };
+    // 工具调用防火墙。**只在流上跑** —— 非流式响应整个到手
     // 之后再拦已经没有意义，客户端下一步就拿到全文了。
     let inspect = rt.config.security.inspect_tools;
     let trust = crate::guard::effective_trust(provider, &decision.guard);
     // 正文里的提示注入**只对不受信任的上游查**（末尾）：官方端点上
     // 模型讲解提示注入是完全正常的
-    let mut wall = (client_sse && inspect.detects())
-        .then(|| crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()));
+    let mut wall = if !inspect.detects() {
+        None
+    } else if client_sse {
+        Some(crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()))
+    } else if client_json_stream {
+        Some(crate::toolwall::Wall::json_array(
+            rt.rules.clone(),
+            trust.blocks(),
+        ))
+    } else {
+        None
+    };
     let wall_provider = provider.name.clone();
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
