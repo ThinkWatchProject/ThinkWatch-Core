@@ -39,6 +39,9 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# 测试里的假 OpenAI：拼 id_token、核对 PKCE
+base64 = { workspace = true }
+sha2 = { workspace = true }
 tw-yaml = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tempfile = "3"

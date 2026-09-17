@@ -132,6 +132,7 @@ fn oauth_provider(name: &str, upstream: SocketAddr, token_url: &str) -> Provider
         base_url: format!("http://{upstream}"),
         oauth: Some(OAuth {
             access: None,
+            expires_at: None,
             refresh: REFRESH.into(),
             endpoint: token_url.into(),
             client_id: Some("tw-test".into()),
@@ -339,7 +340,7 @@ async fn every_rotation_reaches_the_sink_so_none_is_lost() {
 
     // 装一个假的写回端 —— 真的那个在 tw-control 里
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    state.set_rotation_sink(tx);
+    state.set_renewal_sink(tx);
 
     assert_eq!(ask(gw).await, 200);
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -366,12 +367,22 @@ async fn every_rotation_reaches_the_sink_so_none_is_lost() {
     assert_eq!(got.len(), 3, "轮换漏送了：{got:?}");
     assert_eq!(
         got.iter().map(|r| r.refresh.clone()).collect::<Vec<_>>(),
-        vec![rotated(1), rotated(2), rotated(3)],
+        vec![Some(rotated(1)), Some(rotated(2)), Some(rotated(3))],
         "送出去的不是每一次的新值"
+    );
+    // access token 和过期时间跟着一起送：它们也要写回配置
+    assert_eq!(
+        got.iter().map(|r| r.access.clone()).collect::<Vec<_>>(),
+        vec!["at-issued-1", "at-issued-2", "at-issued-3"]
     );
     for r in &got {
         assert_eq!(r.provider, "p");
+        assert!(r.expires_at.is_some(), "{r:?}");
         assert!(!r.endpoint.contains("rt-"), "{}", r.endpoint);
+        assert!(
+            !format!("{r:?}").contains("at-issued"),
+            "调试输出里不能有 token：{r:?}"
+        );
     }
 }
 
@@ -484,6 +495,7 @@ async fn an_error_body_from_the_token_endpoint_is_masked_before_being_reported()
     // 靠 `mask_body` 的模式匹配挡不住它 —— 而这正是这条测试要证明的
     let cfg = OAuth {
         access: None,
+        expires_at: None,
         refresh: "1//0gLdOPAQUE-nothing-matches-this-shape".into(),
         endpoint: format!("http://{addr}/token"),
         client_id: None,

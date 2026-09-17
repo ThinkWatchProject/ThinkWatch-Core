@@ -90,6 +90,9 @@ async fn delete_provider(
     Path(name): Path<String>,
     Query(q): Query<tw_api::BaseVersion>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    // 删掉之后这一家的 client 就不在了，先拿着：吊销也要走它的出站设置
+    let http = s.gateway.client_for(&name);
+    let mut login = None;
     let version = s
         .cfg
         .transform(q.base_version.as_deref(), Origin::Ui, |text, cfg| {
@@ -100,11 +103,38 @@ async fn delete_provider(
                     describe(&used)
                 )));
             }
+            login = chatgpt_login(cfg, &name, &s.chatgpt.endpoints.token);
             Ok(edit::remove(text, edit::PROVIDERS, &name)?)
         })
         .await
         .map_err(apply_fail)?;
+    if let Some(refresh) = login {
+        let endpoint = s.chatgpt.endpoints.revoke.clone();
+        tokio::spawn(async move {
+            match tw_gateway::chatgpt::revoke(&http, &endpoint, &refresh).await {
+                Ok(()) => tracing::info!(provider = %name, "已吊销 ChatGPT 登录凭据"),
+                Err(why) => tracing::warn!(provider = %name, "未能吊销 ChatGPT 登录凭据：{why}"),
+            }
+        });
+    }
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 删掉这个上游时要吊销的 ChatGPT refresh token。
+///
+/// **只吊销登录得来的**（发放它的正是这个 token 端点），而且别的上游没有在用同一个 ——
+/// 复制出来的上游共用一份登录，吊销会让留下的那个也失效。
+fn chatgpt_login(cfg: &tw_config::Config, name: &str, token_endpoint: &str) -> Option<String> {
+    let p = cfg.providers.iter().find(|p| p.name == name)?;
+    let o = p.oauth.as_ref()?;
+    let ours = p.effective_protocol() == Some(tw_config::Protocol::Chatgpt)
+        && o.endpoint == token_endpoint
+        && o.client_id.as_deref() == Some(tw_config::chatgpt::CLIENT_ID);
+    let shared = cfg
+        .providers
+        .iter()
+        .any(|q| q.name != name && q.oauth.as_ref().is_some_and(|x| x.refresh == o.refresh));
+    (ours && !shared).then(|| o.refresh.clone())
 }
 
 /// 按接口地址自动识别会得到什么：协议、是不是官方端点、默认脱敏哪几类。
@@ -334,6 +364,7 @@ fn to_provider(
             };
             Some(tw_config::OAuth {
                 access: nonempty(access),
+                expires_at: None,
                 refresh: refresh.trim().to_string(),
                 endpoint: endpoint.trim().to_string(),
                 client_id: nonempty(client_id),

@@ -199,6 +199,33 @@ pub enum Event {
         detail: String,
         at_ms: u64,
     },
+    /// OAuth 凭据失效了：refresh token 过期、被用过或者被吊销。
+    ///
+    /// **重试没有用，只有重新登录能恢复**，而在那之前这家上游的请求全部失败，所以要
+    /// 让人知道。只在失效的那一刻报一次；重新登录之后再失效，会重新报。
+    CredentialExpired {
+        id: u64,
+        provider: String,
+        /// 失效的原因，**已打码**
+        detail: String,
+        at_ms: u64,
+    },
+    /// 一次账号登录结束了：成功、失败、过期或者取消。
+    ///
+    /// 登录是在浏览器里完成的，**界面等的就是这一条**：收到它就能切回前台、说明结果，
+    /// 不用一直问。
+    LoginFinished {
+        id: u64,
+        /// 发起登录时拿到的 ID
+        login: String,
+        /// `done` / `failed` / `expired` / `cancelled`
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        at_ms: u64,
+    },
     /// 这次请求做了方言互转（M6+）。
     ///
     /// **`dropped` 非空时必须让用户看见**：`thinking` 在 OpenAI chat
@@ -313,6 +340,20 @@ pub enum Event {
         windows: Vec<QuotaWindow>,
         at_ms: u64,
     },
+    /// 一个订阅额度窗口用完了，这家上游在窗口重置之前不再接受请求。
+    ///
+    /// **只在用完的那一刻报一次。**之后同一个窗口里的请求照样被拒，但同一句话说第二遍，
+    /// 只会让人学会忽略通知。窗口重置、额度恢复之后再用完，会重新报。
+    QuotaExhausted {
+        id: u64,
+        provider: String,
+        /// 和 `QuotaWindow.window` 同一个词表
+        window: String,
+        /// 多久之后重置。上游没说就没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_in_secs: Option<u64>,
+        at_ms: u64,
+    },
     /// 配置换了一份新的进去，已经生效。
     ///
     /// **界面靠它知道自己手里那份过期了。**没有它，用户在编辑器里改完
@@ -425,6 +466,7 @@ impl Event {
             | Event::ConfigReloaded { id, .. }
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
+            | Event::QuotaExhausted { id, .. }
             | Event::LeakSeen { id, .. }
             | Event::ScanAlert { id, .. }
             | Event::RequestPriced { id, .. }
@@ -435,6 +477,8 @@ impl Event {
             | Event::ResponseInspected { id, .. }
             | Event::Translated { id, .. }
             | Event::CredentialRotated { id, .. }
+            | Event::CredentialExpired { id, .. }
+            | Event::LoginFinished { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }
@@ -640,6 +684,15 @@ pub struct OAuthView {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// access token 什么时候过期，RFC 3339。不知道就没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// 最近一次刷新失败的原因。**已打码**；没失败过、或者已经恢复就没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    /// 凭据已经失效，只有重新登录能恢复
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_login: bool,
 }
 
 /// 配置里引用了某个上游的一处。
@@ -1589,6 +1642,111 @@ pub struct BodyView {
 pub struct ProviderQuota {
     pub provider: String,
     pub windows: Vec<QuotaWindow>,
+}
+
+// ---------------------------------------------------------------- ChatGPT 账号
+
+/// 发起 ChatGPT 登录（`POST /chatgpt/login`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatgptLoginStart {
+    /// 登录后写进配置的上游名。不给就是 `chatgpt`；已经有同名的 ChatGPT 账号上游时，
+    /// 换掉它的凭据（重新登录），其余设置不动
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 换 token 走哪条路：`direct` / `system` / 代理名。不给是 `direct`。新建上游时也写成它的出站方式
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// 登录完成后，浏览器页面跳到哪里。**只接受应用自己的协议**（`thinkwatch://…`），
+    /// 不接受网页地址
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_to: Option<String>,
+}
+
+/// 一次进行中的登录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatgptLogin {
+    pub id: String,
+    /// 在浏览器里打开的授权地址
+    pub authorize_url: String,
+    /// 多少秒内要完成
+    pub expires_in_secs: u64,
+}
+
+/// 登录进行到哪一步（`GET /chatgpt/login/{id}`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatgptLoginStatus {
+    pub id: String,
+    /// `pending` / `done` / `failed` / `expired` / `cancelled`
+    pub status: String,
+    /// 写进配置的上游名。`done` 时有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// 套餐：`plus` / `pro` / `team` …。`done` 时有，令牌里没写就没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// `failed` 时的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// ChatGPT 账号的用量（`GET /providers/{name}/chatgpt/usage`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatgptUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// 额度窗口，词表同 [`QuotaWindow`]
+    pub windows: Vec<QuotaWindow>,
+    /// 可用的额度重置卡张数。账号没有这一项时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<i64>,
+}
+
+/// 一张额度重置卡。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResetCreditView {
+    pub id: String,
+    /// 重置哪种额度，后端的原词
+    pub reset_type: String,
+    /// 后端的原词
+    pub status: String,
+    pub granted_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// 账号上的额度重置卡（`GET /providers/{name}/chatgpt/resets`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetCredits {
+    pub available_count: i64,
+    pub credits: Vec<ResetCreditView>,
+}
+
+/// 用一张额度重置卡（`POST /providers/{name}/chatgpt/resets`）。
+///
+/// **卡用掉就回不来**，所以只在用户明确点下去时发，网关自己从不用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetCreditUse {
+    /// 幂等键。同一次操作重试时用同一个值，后端不会重复扣卡
+    pub idempotency_key: String,
+    /// 用哪一张。不给由后端挑
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResetCreditUsed {
+    /// - `reset`：额度已重置
+    /// - `nothing_to_reset`：额度没用完，不需要重置，没有扣卡
+    /// - `no_credit`：没有可用的卡（指定了卡时：那张已经不能用）
+    /// - `already_redeemed`：这个幂等键已经用过，额度在那一次已经重置
+    pub code: String,
+    /// 重置了几个窗口
+    #[serde(default)]
+    pub windows_reset: i64,
 }
 
 /// L3 测速要花多少。

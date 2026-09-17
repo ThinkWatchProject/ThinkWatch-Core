@@ -242,7 +242,7 @@ impl<'de> Deserialize<'de> for Headers {
 pub fn auth_header(protocol: Option<Protocol>) -> (&'static str, &'static str) {
     match protocol {
         Some(Protocol::Gemini) => ("x-goog-api-key", ""),
-        Some(Protocol::OpenaiChat) | Some(Protocol::OpenaiResponses) => {
+        Some(Protocol::OpenaiChat) | Some(Protocol::OpenaiResponses) | Some(Protocol::Chatgpt) => {
             ("authorization", "Bearer ")
         }
         Some(Protocol::Anthropic) | None => ("x-api-key", ""),
@@ -262,6 +262,10 @@ pub enum CredentialError {
     ClaudeSubscription,
     #[error("不支持接入 Gemini CLI 的 Google 登录凭据，请改用 Gemini API 密钥")]
     GoogleSubscription,
+    #[error("ChatGPT 账号上游只能使用登录获得的凭据")]
+    ChatgptWithoutLogin,
+    #[error("请求头「{0}」说明请求的来源，由网关如实发送，不能在配置中设置")]
+    IdentityHeader(String),
     #[error("请求头不能超过 {MAX_HEADERS} 个")]
     TooManyHeaders,
     #[error(
@@ -299,7 +303,7 @@ impl From<SecretResolveError> for CredentialError {
     }
 }
 
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     let h = url.trim().to_ascii_lowercase();
     h.split("://")
         .nth(1)
@@ -373,6 +377,11 @@ impl Provider {
                 return Err(CredentialError::GoogleSubscription);
             }
         }
+        // **Codex 后端只认登录拿到的凭据**，API 密钥发过去只会是一个 401
+        let chatgpt = self.effective_protocol() == Some(Protocol::Chatgpt);
+        if chatgpt && crate::chatgpt::is_backend(&self.base_url) && self.oauth.is_none() {
+            return Err(CredentialError::ChatgptWithoutLogin);
+        }
         if self.headers.len() > MAX_HEADERS {
             return Err(CredentialError::TooManyHeaders);
         }
@@ -391,6 +400,9 @@ impl Provider {
             let lower = name.to_ascii_lowercase();
             if RESERVED.contains(&lower.as_str()) {
                 return Err(CredentialError::ReservedHeader(h.name.clone()));
+            }
+            if chatgpt && crate::chatgpt::IDENTITY_HEADERS.contains(&lower.as_str()) {
+                return Err(CredentialError::IdentityHeader(h.name.clone()));
             }
             if seen.contains(&lower) {
                 return Err(CredentialError::DuplicateHeader(h.name.clone()));
@@ -491,6 +503,7 @@ mod tests {
     fn oauth() -> OAuth {
         OAuth {
             access: None,
+            expires_at: None,
             refresh: "r".into(),
             endpoint: "https://auth.example.com/token".into(),
             client_id: None,
@@ -649,6 +662,58 @@ mod tests {
         let mut lookalike = p("name: l\nbase_url: https://notanthropic.com/api.anthropic.com\n");
         lookalike.oauth = Some(oauth());
         lookalike.check_credential().unwrap();
+    }
+
+    #[test]
+    fn a_chatgpt_account_takes_only_a_login_and_its_identity_is_not_configurable() {
+        let bare = p("name: c\nbase_url: https://chatgpt.com/backend-api/codex\n");
+        assert_eq!(bare.effective_protocol(), Some(Protocol::Chatgpt));
+        assert_eq!(
+            bare.check_credential(),
+            Err(CredentialError::ChatgptWithoutLogin)
+        );
+        let key = p("name: c\nbase_url: https://chatgpt.com/backend-api/codex\nkey: sk-x\n");
+        assert_eq!(
+            key.check_credential(),
+            Err(CredentialError::ChatgptWithoutLogin)
+        );
+
+        let mut login = p(
+            "name: c\nbase_url: https://chatgpt.com/backend-api/codex\nheaders:\n  ChatGPT-Account-Id: acc-1\n",
+        );
+        login.oauth = Some(OAuth {
+            endpoint: crate::chatgpt::TOKEN_ENDPOINT.into(),
+            client_id: Some(crate::chatgpt::CLIENT_ID.into()),
+            ..oauth()
+        });
+        login.check_credential().unwrap();
+        assert_eq!(
+            login.outbound_headers(Some("at"), None).unwrap(),
+            vec![
+                ("authorization".to_string(), "Bearer at".to_string()),
+                ("ChatGPT-Account-Id".to_string(), "acc-1".to_string()),
+            ]
+        );
+
+        // 一行配置就能冒充 Codex 的话，「如实说明身份」就只是个默认值
+        for name in [
+            "originator",
+            "User-Agent",
+            "session-id",
+            "session_id",
+            "version",
+        ] {
+            let mut forged = login.clone();
+            forged.headers = p(&format!(
+                "name: c\nbase_url: https://x\nheaders:\n  {name}: codex_cli_rs\n"
+            ))
+            .headers;
+            assert_eq!(
+                forged.check_credential(),
+                Err(CredentialError::IdentityHeader(name.to_string())),
+                "{name}"
+            );
+        }
     }
 
     #[test]

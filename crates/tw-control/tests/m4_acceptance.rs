@@ -43,6 +43,7 @@ fn bed() -> Bed {
         store: None,
         started: std::time::Instant::now(),
         price_updater: Default::default(),
+        chatgpt: Default::default(),
         // **测试里绝不能碰开发者自己的配置**
         home: home.clone(),
     };

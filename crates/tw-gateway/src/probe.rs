@@ -87,7 +87,13 @@ pub async fn probe(
     let proto_name = proto.map(|p| format!("{p:?}"));
     let started = Instant::now();
 
-    let url = crate::forward::upstream_url(base_url, "/v1/models", None);
+    let chatgpt = proto == Some(tw_config::Protocol::Chatgpt);
+    // Codex 后端的模型清单不在 `/v1/models`，而且必须带 `client_version`
+    let url = if chatgpt {
+        crate::chatgpt::models_url(base_url)
+    } else {
+        crate::forward::upstream_url(base_url, "/v1/models", None)
+    };
     let mut req = http.get(&url).timeout(PROBE_TIMEOUT);
     req = crate::forward::apply_headers(req, headers);
 
@@ -127,6 +133,7 @@ pub async fn probe(
 
     let models = if status.is_success() {
         match resp.text().await {
+            Ok(body) if chatgpt => classify_chatgpt_models(&body),
             Ok(body) => classify_models(&body),
             // 拿到了 2xx 但读 body 失败 —— 归到「没认出」而不是「不提供」，
             // 因为它确实有这个接口。
@@ -147,6 +154,20 @@ pub async fn probe(
         latency_ms: ms,
         models,
         error: None,
+    }
+}
+
+/// Codex 后端的模型清单：`{models:[{slug, visibility}]}`。后端隐藏的不列
+fn classify_chatgpt_models(body: &str) -> ModelList {
+    let parsed = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| crate::chatgpt::parse_models(&v));
+    match parsed {
+        Some(models) if models.is_empty() => ModelList::Empty,
+        Some(models) => ModelList::Listed { models },
+        None => ModelList::Unrecognized {
+            sample: body.trim().chars().take(200).collect(),
+        },
     }
 }
 

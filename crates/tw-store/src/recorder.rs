@@ -437,10 +437,13 @@ impl Recorder {
             Event::ConfigReloaded { .. }
             | Event::ConfigRejected { .. }
             | Event::QuotaSeen { .. }
+            | Event::QuotaExhausted { .. }
             | Event::ScanAlert { .. }
             | Event::ToolCallFlagged { .. }
             // 凭据轮换说的是配置文件该改了，跟哪一次请求无关
             | Event::CredentialRotated { .. }
+            | Event::CredentialExpired { .. }
+            | Event::LoginFinished { .. }
             // 客户端配置面变了、某家上游熔断了 —— 都是「现在什么情况」，
             // 不是「刚才发生过什么」。这张表只装后者。
             | Event::ClientsChanged { .. }
