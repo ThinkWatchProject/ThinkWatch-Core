@@ -453,10 +453,13 @@ impl Recorder {
         // 撒谎。
         // **不引 tw-config** —— 存储层不该知道配置的形状。这个
         // 字符串是事件契约的一部分，比较它就够了。
-        let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
+        //
         // **订阅型不按价目表算钱。**订阅制的边际成本是零，按 API
         // 价目表乘出来的数字是纯虚构的 —— 而它会混进
-        // 「今日花费」里，把一个诚实的面板变成一个编出来的。
+        // 「今日花费」里，把一个诚实的面板变成一个编出来的。计费方式未知的
+        // 同样不算。**不计费的记 $0**：那是一个确定的数，和订阅不是一回事。
+        let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
+        let free = p.billing == "free";
         //
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
         // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
@@ -470,6 +473,7 @@ impl Recorder {
             None
         };
         let cost = match (&u, &resolved) {
+            _ if free => Some(Cost::Known(0)),
             (Some(u), Some(r)) => Some(r.cost(u, partial)),
             _ => None,
         };
@@ -989,6 +993,22 @@ mod billing_tests {
         // **token 数还是要记的** —— 那才是订阅用户该看的量
         assert_eq!(row.input_tokens, Some(100_000));
         assert_eq!(row.billing, "subscription");
+    }
+
+    #[test]
+    fn a_free_call_costs_exactly_zero_rather_than_nothing() {
+        // 「不计费」和「订阅」在费用栏上是两句不同的话：$0 是一个确定的数，
+        // 能进合计；订阅那一栏说的是这笔账不在金额这个维度上
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&routed(1, "free"));
+        r.on_event(&finished(1, usage()));
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.cost_micros, Some(0));
+        assert!(!row.cost_estimated);
+        assert_eq!(row.price_source, None, "没有按任何价目表算");
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!((s.unpriced_requests, s.subscription_requests), (0, 0));
     }
 
     #[test]

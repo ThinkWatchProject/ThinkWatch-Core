@@ -38,6 +38,12 @@ pub enum ValidationError {
     Pricing(#[from] tw_pricing::SheetError),
     #[error("上游「{provider}」选的价目表「{sheet}」不存在")]
     UnknownPriceSheet { provider: String, sheet: String },
+    #[error(
+        "上游「{name}」的启用范围（models_only）是空的，这样它一个模型都不服务。暂时不用这家上游的话，请停用它（disabled: true）"
+    )]
+    EmptyModelsOnly { name: String },
+    #[error("上游「{name}」的启用范围（models_only）里有一项是空的")]
+    BlankModelsOnly { name: String },
 }
 
 /// `key:` 到底哪儿写错了。
@@ -118,6 +124,20 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             return Err(ValidationError::EmptyProviderKey {
                 name: p.name.clone(),
             });
+        }
+        // **空范围不是「全部」，也不是一个合理的「停用」。**两种读法各有
+        // 人会当真，而停用有自己的开关
+        if let Some(only) = &p.models_only {
+            if only.is_empty() {
+                return Err(ValidationError::EmptyModelsOnly {
+                    name: p.name.clone(),
+                });
+            }
+            if only.iter().any(|m| m.trim().is_empty()) {
+                return Err(ValidationError::BlankModelsOnly {
+                    name: p.name.clone(),
+                });
+            }
         }
     }
 
@@ -330,6 +350,15 @@ mod tests {
         // 用户写了就用他的，不要偷偷加
         k.listen.gateway.allow_from = vec!["10.1.2.0/24".into()];
         assert_eq!(k.listen.gateway.effective_allow_from(), vec!["10.1.2.0/24"]);
+    }
+
+    #[test]
+    fn an_empty_model_scope_is_refused_and_points_at_disabling_instead() {
+        let mut prov = p("relay", "https://relay.example");
+        prov.models_only = Some(vec![]);
+        let e = validate(&cfg(vec![c("a", "tw-a")], vec![prov])).unwrap_err();
+        assert!(matches!(e, ValidationError::EmptyModelsOnly { .. }), "{e}");
+        assert!(e.to_string().contains("disabled"), "{e}");
     }
 
     #[test]

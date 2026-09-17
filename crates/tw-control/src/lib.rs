@@ -371,6 +371,10 @@ fn provider_view(
         proxy: p.proxy.clone(),
         on_proxy_fail: p.on_proxy_fail.slug().to_string(),
         models: p.models.clone(),
+        models_only: p.models_only.clone(),
+        model_source: s.gateway.models.listing(p).source.slug().to_string(),
+        model_count: s.gateway.catalog.load().count_for(&p.name),
+        disabled: p.disabled,
         health: match s.health().state(&p.name) {
             tw_gateway::health::State::Closed => "ok".into(),
             tw_gateway::health::State::Open => "open".into(),
@@ -680,17 +684,12 @@ async fn speed_quote(
     let items: Vec<tw_gateway::Estimate> = targets(&cfg, req.provider.as_deref())?
         .iter()
         .map(|p| {
-            tw_gateway::l3::estimate(
-                &book,
-                &p.name,
-                &req.model,
-                // 和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
-                s.gateway.billing_of(p) == tw_config::Billing::Subscription,
-            )
+            // 计费方式和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
+            tw_gateway::l3::estimate(&book, &p.name, &req.model, s.gateway.billing_of(p))
         })
         .collect();
     Ok(Json(tw_api::SpeedQuote {
-        total_micros: tw_gateway::l3::total_micros(&items),
+        total_micros: tw_gateway::quote::total(items.iter().map(|e| &e.quote)),
         items: items.into_iter().map(quote_item).collect(),
         pricing_date: book.table().date.clone(),
     }))
@@ -758,9 +757,9 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
         model: e.model,
         input_tokens: e.input_tokens,
         max_output_tokens: e.max_output_tokens,
-        cost_micros: e.cost_micros,
-        subscription: e.subscription,
-        note: e.note,
+        cost_micros: e.quote.cost_micros,
+        billing: e.quote.billing.slug().to_string(),
+        note: e.quote.note,
     }
 }
 

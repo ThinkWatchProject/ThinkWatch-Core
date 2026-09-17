@@ -17,7 +17,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{post, put};
+use axum::routing::{get, post, put};
 use serde_yaml_ng::Value;
 use tw_config::edit::{self, EditError};
 use tw_config::history::Origin;
@@ -33,6 +33,8 @@ pub fn router() -> axum::Router<ControlState> {
             "/providers/{name}",
             put(update_provider).delete(delete_provider),
         )
+        .route("/providers/{name}/models", get(provider_models))
+        .route("/providers/{name}/models/refresh", post(refresh_models))
         .route("/proxies", post(create_proxy))
         .route("/proxies/test", post(test_proxy))
         .route("/proxies/{name}", put(update_proxy).delete(delete_proxy))
@@ -168,6 +170,70 @@ async fn test_provider(
     }))
 }
 
+/// 一个上游的模型清单：每个模型在不在启用范围里、上下文窗口多大、按它选的
+/// 价目表怎么计价。
+async fn provider_models(
+    State(s): State<ControlState>,
+    Path(name): Path<String>,
+) -> Result<Json<tw_api::ProviderModelsView>, Fail> {
+    let cfg = s.config();
+    let p = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的上游")))?;
+    Ok(Json(models_view(&s, p, s.gateway.models.listing(p))))
+}
+
+/// 马上向上游重新获取模型清单。
+async fn refresh_models(
+    State(s): State<ControlState>,
+    Path(name): Path<String>,
+) -> Result<Json<tw_api::ProviderModelsView>, Fail> {
+    let listing = tw_gateway::models::refresh_one(&s.gateway, &name)
+        .await
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的上游")))?;
+    let cfg = s.config();
+    let p = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的上游")))?;
+    Ok(Json(models_view(&s, p, listing)))
+}
+
+fn models_view(
+    s: &ControlState,
+    p: &tw_config::Provider,
+    listing: tw_gateway::models::Listing,
+) -> tw_api::ProviderModelsView {
+    let book = s.gateway.pricing.load();
+    let date = &book.table().date;
+    tw_api::ProviderModelsView {
+        provider: p.name.clone(),
+        source: listing.source.slug().to_string(),
+        checked_at_ms: listing.checked_at_ms,
+        error: listing.error,
+        models: listing
+            .models
+            .into_iter()
+            .map(|id| {
+                let r = book.resolve_for(&p.name, &id);
+                tw_api::ModelRow {
+                    enabled: p.uses_model(&id),
+                    context_window: r.as_ref().and_then(|r| r.price.max_input_tokens),
+                    price: r.as_ref().map(|r| {
+                        crate::pricing::price_fields(&tw_pricing::PerMillion::of(&r.price))
+                    }),
+                    price_source: r.as_ref().map(|r| tw_store::price_source(&r.source, date)),
+                    estimated: r.as_ref().is_some_and(|r| r.cross_platform),
+                    id,
+                }
+            })
+            .collect(),
+    }
+}
+
 fn to_provider(
     input: &tw_api::ProviderInput,
     existing: Option<&tw_config::Provider>,
@@ -219,7 +285,12 @@ fn to_provider(
             .transpose()?,
         proxy: input.proxy.trim().to_string(),
         on_proxy_fail: slug("代理不可用时的处理", &input.on_proxy_fail)?,
+        models_only: input
+            .models_only
+            .as_ref()
+            .map(|ms| ms.iter().map(|m| m.trim().to_string()).collect::<Vec<_>>()),
         pricing: input.pricing.clone(),
+        disabled: input.disabled,
     })
 }
 
