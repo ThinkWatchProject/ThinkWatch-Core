@@ -56,7 +56,7 @@ fn no_fixture_carries_a_credential() {
         let real: Vec<_> = hits
             .iter()
             .filter(|h| h.kind != tw_redact::rules::Kind::Internal)
-            .map(|h| format!("{}（{}）", h.what, &dump[h.bytes.clone()]))
+            .map(|h| format!("{}（{}）", h.secret, &dump[h.bytes.clone()]))
             .collect();
         assert!(real.is_empty(), "{name} 里有凭据：{real:?}");
     }

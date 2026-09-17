@@ -206,7 +206,7 @@ fn async_stream_from(
                 // 订阅者跟不上时 broadcast 会丢最老的。**继续收而不是断开** ——
                 // UI 少几行实时日志无所谓，断掉重连才是真的难受。
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "控制面订阅者跟不上，丢了一些事件");
+                    tracing::warn!(dropped = n, "控制面订阅者处理不及，部分事件已丢弃");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -261,13 +261,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                     .map(|r| tw_api::RuleView {
                         name: r.name.clone(),
                         // 阶段二的规则没有去向 —— 它们只改参数或拒绝
-                        to: r.to.clone().unwrap_or_else(|| {
-                            if r.deny.is_some() {
-                                "拒绝".into()
-                            } else {
-                                "（只改参数）".into()
-                            }
-                        }),
+                        to: r.to.clone(),
+                        deny: r.deny.is_some(),
                         conditions: describe_when(&r.when),
                     })
                     .collect(),
@@ -278,7 +273,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|g| tw_api::GroupView {
                 name: g.name.clone(),
-                kind: g.kind.label().to_string(),
+                kind: g.kind.slug().to_string(),
                 session_affinity: g.session_affinity,
                 selected: g.selected.clone(),
                 providers: g.providers.clone(),
@@ -308,10 +303,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .client_probes
             .all()
             .into_iter()
-            .map(|(id, label, what, mode)| tw_api::ProbeView {
+            .map(|(id, mode)| tw_api::ProbeView {
                 id: id.to_string(),
-                label: label.to_string(),
-                what: what.to_string(),
                 mode: mode.slug().to_string(),
             })
             .collect(),
@@ -366,7 +359,7 @@ fn provider_view(
         base_url_masked: base_url != p.base_url,
         base_url,
         key: p.key.as_ref().map(|k| tw_api::SecretView {
-            display: k.describe(),
+            display: k.shown(),
             env: k.env_var().map(str::to_string),
         }),
         auth_header: p.auth_header().0.to_string(),
@@ -410,60 +403,57 @@ fn provider_view(
     }
 }
 
-/// 把 `when` 写成人话。
+/// `when` 里写了的条件，按固定顺序。
 ///
 /// **规则列表上必须能直接读懂条件** —— 让用户去对着 YAML 猜「这条为什么
-/// 没命中」，正是那类「我明明配了」问题的来源。
-fn describe_when(w: &tw_engine::rule::When) -> Vec<String> {
+/// 没命中」，正是那类「我明明配了」问题的来源。这里给键和值，每个条件
+/// 怎么称呼由界面决定。
+fn describe_when(w: &tw_engine::rule::When) -> Vec<tw_api::ConditionView> {
     let mut out = Vec::new();
-    if let Some(m) = &w.model {
-        out.push(format!("模型 {m}"));
-    }
-    if let Some(c) = &w.client {
-        out.push(format!("客户端 {c}"));
-    }
-    if let Some(d) = &w.dialect {
-        out.push(format!("方言 {d}"));
-    }
-    for (label, v) in [
-        ("输入 token", &w.input_tokens),
+    let mut push = |field: &str, values: Vec<String>| {
+        out.push(tw_api::ConditionView {
+            field: field.to_string(),
+            values,
+        })
+    };
+    for (field, v) in [
+        ("model", &w.model),
+        ("client", &w.client),
+        ("dialect", &w.dialect),
+        ("input_tokens", &w.input_tokens),
         ("max_tokens", &w.max_tokens),
-        ("工具数", &w.tool_count),
+        ("tool_count", &w.tool_count),
     ] {
         if let Some(x) = v {
-            out.push(format!("{label} {x}"));
+            push(field, vec![x.clone()]);
         }
     }
     if let Some(i) = &w.intent {
-        out.push(format!("客户端辅助请求 {}", join_one_or_many(i)));
+        push("intent", one_or_many(i));
     }
     // **不写出来的话，一条只有 provider_would_be 的规则在界面上会显示成
     // 「兜底」**（条件为空就是兜底的标记）—— 那是个会让人查半天的假象。
     if let Some(p) = &w.provider_would_be {
-        out.push(format!("将要走 {}", join_one_or_many(p)));
+        push("provider_would_be", one_or_many(p));
     }
-    for (label, v) in [
-        ("带缓存", w.cache),
-        ("带工具", w.tools),
-        ("带图片", w.image),
-        ("扩展思考", w.thinking),
-        ("流式", w.stream),
+    for (field, v) in [
+        ("cache", w.cache),
+        ("tools", w.tools),
+        ("image", w.image),
+        ("thinking", w.thinking),
+        ("stream", w.stream),
     ] {
         if let Some(b) = v {
-            out.push(if b {
-                label.to_string()
-            } else {
-                format!("不{label}")
-            });
+            push(field, vec![b.to_string()]);
         }
     }
     out
 }
 
-fn join_one_or_many(v: &tw_engine::rule::OneOrMany) -> String {
+fn one_or_many(v: &tw_engine::rule::OneOrMany) -> Vec<String> {
     match v {
-        tw_engine::rule::OneOrMany::One(s) => s.clone(),
-        tw_engine::rule::OneOrMany::Many(xs) => xs.join(" 或 "),
+        tw_engine::rule::OneOrMany::One(s) => vec![s.clone()],
+        tw_engine::rule::OneOrMany::Many(xs) => xs.clone(),
     }
 }
 
@@ -501,7 +491,7 @@ async fn l1(
             cfg.providers
                 .iter()
                 .find(|p| p.name == *n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{n}` 的上游")))?,
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))?,
         ],
         None => cfg.providers.iter().collect(),
     };
@@ -515,7 +505,11 @@ async fn l1(
                     ok: false,
                     segments: Vec::new(),
                     total_ms: 0,
-                    notes: Vec::new(),
+                    skipped: Vec::new(),
+                    failed: Some(l1_stage(tw_gateway::Stage {
+                        step: tw_gateway::Step::Config,
+                        peer: tw_gateway::Peer::Proxy,
+                    })),
                     error: Some(e),
                 });
                 continue;
@@ -541,13 +535,28 @@ pub(crate) fn l1_view(
             .segments
             .into_iter()
             .map(|x| tw_api::L1Segment {
-                name: x.name,
+                stage: l1_stage(x.stage),
                 ms: x.ms,
             })
             .collect(),
         total_ms: r.total_ms,
-        notes: r.notes,
+        skipped: r
+            .skipped
+            .into_iter()
+            .map(|x| tw_api::L1Skip {
+                stage: l1_stage(x.stage),
+                reason: x.reason.slug().to_string(),
+            })
+            .collect(),
+        failed: r.failed.map(l1_stage),
         error: r.error,
+    }
+}
+
+fn l1_stage(s: tw_gateway::Stage) -> tw_api::L1Stage {
+    tw_api::L1Stage {
+        step: s.step.slug().to_string(),
+        peer: s.peer.slug().to_string(),
     }
 }
 
@@ -749,7 +758,7 @@ async fn speed_run(
                     total_ms: 0,
                     input_tokens: None,
                     output_tokens: None,
-                    error: Some(format!("取不到凭据：{e}")),
+                    error: Some(format!("无法获取凭据：{e}")),
                 });
                 continue;
             }
@@ -791,7 +800,6 @@ fn quote_item(
         max_output_tokens: e.max_output_tokens,
         cost_micros: e.quote.cost_micros,
         billing: e.quote.billing.slug().to_string(),
-        note: e.quote.note,
         skipped: skip.map(|s| s.slug().to_string()),
     }
 }
@@ -810,7 +818,7 @@ fn targets<'a>(
             cfg.providers
                 .iter()
                 .find(|p| &p.name == n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫「{n}」的上游")))
+                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))
         })
         .collect()
 }
@@ -833,7 +841,7 @@ async fn leaks(
         xs.into_iter()
             .map(|l| tw_api::LeakGroup {
                 provider: l.provider,
-                kind: l.kind,
+                secret: l.kind,
                 requests: l.requests,
                 last_at_ms: l.last_at_ms,
                 masked: l.masked,
@@ -861,7 +869,7 @@ async fn request_detail(
         .db()
         .get(id)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
     let at = row.at_ms;
     let body = |which| {
         let raw = g.blobs().get(at, id, which)?;
@@ -899,7 +907,7 @@ async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>
                 .windows
                 .into_iter()
                 .map(|w| tw_api::QuotaWindow {
-                    label: w.label,
+                    window: w.window,
                     used_percent: w.used_percent,
                     reset_in_secs: w.reset_in_secs,
                     status: w.status,
@@ -940,7 +948,7 @@ async fn latency_by_provider(
 async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     let Some(store) = &s.store else {
         return Json(tw_api::StorageStatus {
-            level: "没有起来（历史记录不可用，转发不受影响）".into(),
+            level: "unavailable".into(),
             rows: 0,
             blob_bytes: 0,
             forwarding_affected: false,
@@ -948,7 +956,7 @@ async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     };
     let g = store.lock().await;
     Json(tw_api::StorageStatus {
-        level: g.level().label().to_string(),
+        level: g.level().slug().to_string(),
         rows: g.db().count().unwrap_or(0),
         blob_bytes: g.blobs().total_bytes(),
         // **永远是 false。**观测挂了，代理照跑。哪天有人想改成
@@ -961,7 +969,7 @@ fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Reco
     s.store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "历史记录这一层没起来（磁盘或数据库有问题）。转发不受影响。".to_string(),
+            "请求记录不可用，数据库无法打开或磁盘出错，转发不受影响".to_string(),
         )
     })
 }
@@ -1154,7 +1162,7 @@ async fn config_history(
                 current: v.version == now,
                 version: v.version,
                 at_ms: v.at_ms,
-                origin: v.origin.label().to_string(),
+                origin: v.origin.slug().to_string(),
                 bytes: v.bytes,
             })
             .collect(),
@@ -1244,7 +1252,6 @@ async fn baseline(State(s): State<ControlState>) -> Json<tw_api::BaselineRespons
                 .into_iter()
                 .map(|d| tw_api::DriftView {
                     metric: d.metric.to_string(),
-                    label: d.label.to_string(),
                     recent: d.recent,
                     baseline: d.baseline,
                     recent_n: d.recent_n,
@@ -1327,7 +1334,7 @@ async fn session_detail(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<tw_api::SessionDetail>, (StatusCode, String)> {
     let Some(store) = &s.store else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "观测层没有启动".into()));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "请求记录未启动".into()));
     };
     let g = store.lock().await;
     let session = g
@@ -1337,7 +1344,7 @@ async fn session_detail(
         .iter()
         .find(|x| x.id == id)
         .map(session_view)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{id}` 的会话")))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到会话 {id}")))?;
     let turns = g
         .db()
         .turns(&id)
@@ -1350,7 +1357,7 @@ async fn session_detail(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
-    #[error("控制面 socket {path} 起不来：{source}")]
+    #[error("无法启动控制面 socket {path}：{source}")]
     Bind {
         path: PathBuf,
         source: std::io::Error,
@@ -1360,7 +1367,7 @@ pub enum ControlError {
     /// 给的原话是「path must be shorter than SUN_LEN」，看不出上限是多少、
     /// 也看不出自己超了多少。
     #[error(
-        "控制面 socket 的路径太长：{len} 字节，系统上限是 {max}。\n{path}\n把配置放到一个短一点的目录下（默认的 ~/.thinkwatch 不会有这个问题）。"
+        "控制面 socket 的路径过长：{len} 字节，系统上限为 {max}。\n{path}\n请将配置放在路径较短的目录中（默认的 ~/.thinkwatch 不受此限制）"
     )]
     PathTooLong {
         path: PathBuf,
@@ -1409,7 +1416,7 @@ pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlE
         // 0700：只有当前用户能连。这就是不需要 token 的原因。
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
-    tracing::info!(path = %path.display(), "控制面已监听");
+    tracing::info!(path = %path.display(), "控制面已开始监听");
 
     let app = router(state);
     loop {
@@ -1489,7 +1496,7 @@ mod socket_path_tests {
 mod describe_tests {
     use super::*;
 
-    /// **每加一个 `when` 字段就必须在这里加一句人话。**
+    /// **每加一个 `when` 字段就必须在这里列出来。**
     ///
     /// 漏掉的后果不是「少显示一个条件」，而是条件列表变空 —— 而空列表
     /// 在界面上正是「兜底」的标记。于是一条精确规则会显示成兜底，用户
@@ -1504,15 +1511,15 @@ mod describe_tests {
         )
         .unwrap();
         let fields = match serde_json::to_value(&full).unwrap() {
-            serde_json::Value::Object(m) => m.len(),
+            serde_json::Value::Object(m) => m,
             other => panic!("{other:?}"),
         };
         let lines = describe_when(&full);
-        assert_eq!(
-            lines.len(),
-            fields,
-            "有 when 字段没被翻成人话。已翻的：{lines:?}"
-        );
+        assert_eq!(lines.len(), fields.len(), "有 when 字段没列出来：{lines:?}");
+        // 界面按 `field` 取名称，所以它必须就是配置里的那个键
+        for l in &lines {
+            assert!(fields.contains_key(&l.field), "{l:?}");
+        }
     }
 
     #[test]
@@ -1521,6 +1528,7 @@ mod describe_tests {
             serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap();
         let lines = describe_when(&w);
         assert!(!lines.is_empty(), "空的条件列表在界面上就是「兜底」");
-        assert!(lines[0].contains("relay"), "{lines:?}");
+        assert_eq!(lines[0].field, "provider_would_be", "{lines:?}");
+        assert_eq!(lines[0].values, ["relay"], "{lines:?}");
     }
 }

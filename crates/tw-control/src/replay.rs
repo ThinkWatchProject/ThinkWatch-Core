@@ -45,14 +45,14 @@ fn stored_body(
         .db()
         .get(id)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
     let raw = g
         .blobs()
         .get(row.at_ms, id, tw_store::Which::Request)
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                format!("第 {id} 号请求的请求体已经不在了（可能被清理了，见存储设置）"),
+                format!("第 {id} 号请求的请求体已不存在，可能已被清理"),
             )
         })?;
     let original = g
@@ -65,7 +65,7 @@ fn stored_body(
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "第 {id} 号请求的体有 {original} 字节，我们只存了 {}，重放它等于发一个不一样的请求。",
+                "第 {id} 号请求的请求体有 {original} 字节，仅保存了 {} 字节，无法原样重放",
                 raw.len()
             ),
         ));
@@ -81,7 +81,7 @@ pub async fn quote(
     let store = s.store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "观测层没有启动".to_string(),
+            "请求记录未启动".to_string(),
         )
     })?;
     let (row, raw) = {
@@ -96,7 +96,7 @@ pub async fn quote(
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                format!("没有叫 `{}` 的上游", req.provider),
+                format!("未找到名为「{}」的上游", req.provider),
             )
         })?;
 
@@ -128,7 +128,6 @@ pub async fn quote(
         input_tokens: input as i64,
         cost_micros: quote.cost_micros,
         billing: quote.billing.slug().to_string(),
-        note: quote.note,
         // 脱敏在重放里照做，但用户有权在按下去之前知道
         will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
             .is_empty(),
@@ -144,7 +143,7 @@ pub async fn run(
     let store = s.store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "观测层没有启动".to_string(),
+            "请求记录未启动".to_string(),
         )
     })?;
     let (row, raw) = {
@@ -159,7 +158,7 @@ pub async fn run(
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                format!("没有叫 `{}` 的上游", req.provider),
+                format!("未找到名为「{}」的上游", req.provider),
             )
         })?;
     // OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
@@ -172,7 +171,7 @@ pub async fn run(
         .map_err(|e| {
             fail(
                 StatusCode::BAD_REQUEST,
-                format!("`{}` 的凭据取不到：{e}", provider.name),
+                format!("无法获取上游「{}」的凭据：{e}", provider.name),
             )
         })?;
 
@@ -237,7 +236,7 @@ pub async fn fixture(
     let store = s.store.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "观测层没有启动".to_string(),
+            "请求记录未启动".to_string(),
         )
     })?;
     let g = store.lock().await;
@@ -245,7 +244,7 @@ pub async fn fixture(
         .db()
         .get(id)
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有第 {id} 号请求")))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
     let body = |which| -> String {
         g.blobs()
             .get(row.at_ms, id, which)
@@ -257,7 +256,7 @@ pub async fn fixture(
     if req.is_empty() && resp.is_empty() {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("第 {id} 号请求的正文已经不在了（可能被清理了，见存储设置）"),
+            format!("第 {id} 号请求的响应体已不存在，可能已被清理"),
         ));
     }
     // 截断过的照样能当用例用 —— 它验的是「我们怎么理解这段字节」，
@@ -267,11 +266,11 @@ pub async fn fixture(
         .original_len(row.at_ms, id, tw_store::Which::Response)
         .is_some_and(|o| o > resp.len());
     let note = format!(
-        "实录：{} 于 {}{}",
+        "录制自上游「{}」，时间戳 {}{}",
         row.provider,
         row.at_ms,
         if truncated {
-            "。响应体在存储时被截断过，只取了开头一段。"
+            "。响应体在存储时已被截断，仅包含开头部分"
         } else {
             ""
         }

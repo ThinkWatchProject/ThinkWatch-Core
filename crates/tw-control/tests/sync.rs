@@ -49,7 +49,7 @@ async fn an_external_edit_is_picked_up_and_takes_effect() {
     std::fs::write(mgr.path(), &next).unwrap();
 
     match next_config_event(&mut rx).await {
-        tw_api::Event::ConfigReloaded { origin, .. } => assert_eq!(origin, "外部编辑"),
+        tw_api::Event::ConfigReloaded { origin, .. } => assert_eq!(origin, "external"),
         other => panic!("{other:?}"),
     }
 }
@@ -67,14 +67,14 @@ async fn our_own_write_does_not_come_back_as_an_external_edit() {
 
     // 第一个事件是我们自己那次写
     match next_config_event(&mut rx).await {
-        tw_api::Event::ConfigReloaded { origin, .. } => assert_eq!(origin, "界面"),
+        tw_api::Event::ConfigReloaded { origin, .. } => assert_eq!(origin, "ui"),
         other => panic!("{other:?}"),
     }
     // 之后不该再冒出一个「外部编辑」
     let stray = tokio::time::timeout(Duration::from_millis(1200), async {
         loop {
             if let Ok(tw_api::Event::ConfigReloaded { origin, .. }) = rx.recv().await
-                && origin == "外部编辑"
+                && origin == "external"
             {
                 return;
             }
@@ -103,7 +103,7 @@ async fn a_broken_file_keeps_the_old_config_serving_and_says_where() {
             message,
             ..
         } => {
-            assert_eq!(stage, "字段");
+            assert_eq!(stage, "schema");
             assert_eq!(line, Some(4), "得指到那一行");
             assert!(message.contains("kye"), "{message}");
         }

@@ -19,7 +19,7 @@ pub const DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
-    #[error("盯不住 {path}：{source}")]
+    #[error("无法监听 {path} 的变化：{source}")]
     Start {
         path: PathBuf,
         source: notify::Error,

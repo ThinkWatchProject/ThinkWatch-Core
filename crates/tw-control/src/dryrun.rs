@@ -93,9 +93,10 @@ pub async fn dry_run(
         if r.when.is_phase_two() {
             trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
-                verdict: "phase_two".into(),
                 // 阶段二的条件要等路由决定完才知道，静态试算给不了结论
-                why: Some("它的条件要等选完上游才知道，这一轮先跳过".into()),
+                verdict: "phase_two".into(),
+                mismatch: None,
+                error: None,
             });
             continue;
         }
@@ -103,17 +104,20 @@ pub async fn dry_run(
             Ok(true) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 verdict: "matched".into(),
-                why: None,
+                mismatch: None,
+                error: None,
             }),
             Ok(false) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 verdict: "skipped".into(),
-                why: Some(unmatched(&r.when, &f)),
+                mismatch: unmatched(&r.when, &f),
+                error: None,
             }),
             Err(e) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 verdict: "skipped".into(),
-                why: Some(e.to_string()),
+                mismatch: None,
+                error: Some(e.to_string()),
             }),
         }
     }
@@ -148,7 +152,7 @@ pub async fn dry_run(
                 .via_group
                 .as_deref()
                 .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .map(|g| g.kind.label().to_string());
+                .map(|g| g.kind.slug().to_string());
             // 和数据面同一步：去掉服务不了这个请求的候选（停用的、范围外的、
             // 清单里没有这个模型的）。**被跳过的要列出来** —— 「规则明明写的
             // 是 A」正是用户会来试算的原因
@@ -166,9 +170,9 @@ pub async fn dry_run(
                     reason: why.slug().to_string(),
                 })
                 .collect();
+            // 服务不了的原因都在 `skipped` 里，不再另说一遍
             if serving.usable.is_empty() {
                 out.outcome = "unavailable".into();
-                out.reason = Some(serving.explain(&f.model).message);
                 return Ok(Json(out));
             }
             d.candidates = serving.usable;
@@ -198,28 +202,33 @@ pub async fn dry_run(
         }
         Err(RouteError::NoMatch) => {
             out.outcome = "no_match".into();
-            out.reason = Some(RouteError::NoMatch.to_string());
         }
         Err(e) => return Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
     Ok(Json(out))
 }
 
-fn describe(set: &tw_engine::SetAction) -> Vec<String> {
+fn describe(set: &tw_engine::SetAction) -> Vec<tw_api::SetView> {
     let mut v = Vec::new();
+    let mut push = |field: &str, value: String| {
+        v.push(tw_api::SetView {
+            field: field.to_string(),
+            value,
+        })
+    };
+    // 换模型会作废整个 prompt cache，而这件事在长会话里可能比不换还贵 ——
+    // 界面上要说出来，所以它单独是一项，不和别的参数混在一起
     if let Some(m) = &set.model {
-        // 换模型会作废整个 prompt cache，而这件事在长会话里可能比不换
-        // 还贵 —— 试算里就要说出来
-        v.push(format!("换模型 → {m}（会作废整个 prompt cache）"));
+        push("model", m.clone());
     }
     if let Some(t) = set.max_tokens {
-        v.push(format!("max_tokens → {t}"));
+        push("max_tokens", t.to_string());
     }
     if let Some(t) = set.thinking {
-        v.push(format!("thinking → {t}"));
+        push("thinking", t.to_string());
     }
     if set.only_at_session_start {
-        v.push("只在新会话开始时应用".into());
+        push("only_at_session_start", "true".to_string());
     }
     v
 }
@@ -228,54 +237,49 @@ fn describe(set: &tw_engine::SetAction) -> Vec<String> {
 ///
 /// **逐条试，报第一个不满足的。**报「不匹配」等于什么都没说 —— 用户看
 /// 试算就是为了知道差在哪儿。
-fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> String {
-    let eq = |want: &Option<String>, got: &str| -> Option<String> {
-        match want {
-            Some(w) if w != got => Some(format!("要求 `{w}`，实际是 `{got}`")),
-            _ => None,
-        }
-    };
-    let b = |want: Option<bool>, got: bool, name: &str| -> Option<String> {
-        match want {
-            Some(w) if w != got => Some(format!("要求 {name}={w}，实际是 {got}")),
-            _ => None,
-        }
+fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::MismatchView> {
+    let miss = |field: &str, want: Vec<String>, got: String| {
+        Some(tw_api::MismatchView {
+            field: field.to_string(),
+            want,
+            got,
+        })
     };
     if let Some(w) = &when.model
         && !tw_engine::rule::glob_match(w, &f.model)
     {
-        return format!("model 要匹配 `{w}`，实际是 `{}`", f.model);
+        return miss("model", vec![w.clone()], f.model.clone());
     }
-    if let Some(m) = eq(&when.client, &f.client) {
-        return format!("client {m}");
-    }
-    if let Some(m) = eq(&when.dialect, &f.dialect) {
-        return format!("dialect {m}");
+    for (field, want, got) in [
+        ("client", &when.client, &f.client),
+        ("dialect", &when.dialect, &f.dialect),
+    ] {
+        if let Some(w) = want
+            && w != got
+        {
+            return miss(field, vec![w.clone()], got.clone());
+        }
     }
     if let Some(w) = &when.intent
         && !w.contains(&f.intent)
     {
-        return format!(
-            "intent 要在 {w:?} 里，实际是 `{}`",
-            if f.intent.is_empty() {
-                "（真实用户请求）"
-            } else {
-                &f.intent
-            }
-        );
+        // 实际值为空表示真实的用户请求，由界面说明
+        return miss("intent", crate::one_or_many(w), f.intent.clone());
     }
-    for (want, got, name) in [
+    for (want, got, field) in [
         (when.cache, f.cache, "cache"),
         (when.tools, f.tools, "tools"),
         (when.image, f.image, "image"),
         (when.thinking, f.thinking, "thinking"),
         (when.stream, f.stream, "stream"),
     ] {
-        if let Some(m) = b(want, got, name) {
-            return m;
+        if let Some(w) = want
+            && w != got
+        {
+            return miss(field, vec![w.to_string()], got.to_string());
         }
     }
-    for (want, got, name) in [
+    for (want, got, field) in [
         (&when.input_tokens, f.input_tokens as f64, "input_tokens"),
         (&when.tool_count, f.tool_count as f64, "tool_count"),
         (
@@ -285,10 +289,10 @@ fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> String {
         ),
     ] {
         if let Some(w) = want {
-            return format!("{name} 要满足 `{w}`，实际是 {got}");
+            return miss(field, vec![w.clone()], got.to_string());
         }
     }
     // **阶段二的条件不在这里**：它们在上面就被单独归类了。走到这儿说明
-    // 有个条件我们没覆盖到 —— 与其编一句，不如承认。
-    "有条件没对上（这条 ThinkWatch 还没能给出更具体的解释）".to_string()
+    // 有个条件没覆盖到 —— 与其编一句，不如承认说不出来。
+    None
 }

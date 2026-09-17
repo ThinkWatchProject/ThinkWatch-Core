@@ -21,9 +21,9 @@ pub use tw_types::Limits;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LimitError {
-    #[error("排队超过 {0:?} 还没轮到。上游可能全都卡住了，或者并发上限设得太低。")]
+    #[error("排队超过 {0:?} 仍未获得处理。上游可能均无响应，或并发上限设置过低")]
     Timeout(Duration),
-    #[error("等待队列已满（{0} 个）。有东西在疯狂发请求 —— 检查一下是不是有脚本失控了。")]
+    #[error("等待队列已满（{0} 个），请求量异常，请检查是否有脚本在大量发送请求")]
     QueueFull(usize),
 }
 

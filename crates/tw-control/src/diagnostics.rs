@@ -35,8 +35,8 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     let _ = writeln!(out, "# ThinkWatch 诊断包\n");
     let _ = writeln!(
         out,
-        "> 这份内容里的密钥、地址、请求正文都已经打码。交出去之前请自己扫一眼 —— \
-         **我们是一个看得见所有 API key 的网关**，这一步值得多花十秒。\n"
+        "> 本文件中的密钥、地址和请求正文均已脱敏。ThinkWatch 作为网关可以接触到所有 API \
+         密钥，发送本文件之前，请再次检查其中是否含有敏感信息。\n"
     );
 
     // ---- 版本和平台
@@ -51,7 +51,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
         let t = book.table();
         let source = match t.source {
             tw_pricing::TableSource::Builtin => "内置",
-            tw_pricing::TableSource::Fetched => "联网刷新",
+            tw_pricing::TableSource::Fetched => "联网更新",
             tw_pricing::TableSource::Empty => "未加载",
         };
         line(
@@ -65,7 +65,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     line(&mut out, "架构", std::env::consts::ARCH);
     line(
         &mut out,
-        "已运行",
+        "运行时长",
         format!("{} 秒", s.started.elapsed().as_secs()),
     );
 
@@ -74,7 +74,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     line(
         &mut out,
         "网关",
-        s.gateway_addr.as_deref().unwrap_or("没起（安全模式）"),
+        s.gateway_addr.as_deref().unwrap_or("未启动（安全模式）"),
     );
     line(&mut out, "绑定", format!("{:?}", cfg.listen.gateway.bind));
     line(&mut out, "端口", cfg.listen.gateway.port);
@@ -90,7 +90,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 上游
     let _ = writeln!(
         out,
-        "\n## 上游（{} 个）\n\n| 名字 | 地址 | 协议 | 代理 | 状态 | 模型 | 脱敏 | 信任 | 价目表 |\n|---|---|---|---|---|---|---|---|---|",
+        "\n## 上游（{} 个）\n\n| 名称 | 接口地址 | 协议 | 代理 | 状态 | 模型 | 脱敏 | 信任级别 | 价目表 |\n|---|---|---|---|---|---|---|---|---|",
         cfg.providers.len()
     );
     for p in &cfg.providers {
@@ -102,27 +102,27 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
             tw_secret::redact_url(&p.base_url),
             p.effective_protocol()
                 .map(|x| format!("{x:?}"))
-                .unwrap_or_else(|| "猜不出".into()),
+                .unwrap_or_else(|| "未识别".into()),
             p.proxy,
             if p.disabled {
                 "已停用"
             } else if s.health().is_available(&p.name) {
                 "正常"
             } else {
-                "**熔断中**"
+                "熔断中"
             },
             {
                 // 「这家为什么收不到某个模型的请求」多半答在这一栏
                 let l = s.gateway.models.listing(p);
                 let served = s.gateway.catalog.load().count_for(&p.name);
                 let scope = if p.models_only.is_some() {
-                    "，限定范围"
+                    "，已限定启用范围"
                 } else {
                     ""
                 };
                 match l.source {
                     tw_gateway::models::Source::Discovered => {
-                        format!("{served}（上游列出 {}{scope}）", l.models.len())
+                        format!("{served}（上游提供 {}{scope}）", l.models.len())
                     }
                     tw_gateway::models::Source::Manual => {
                         format!("{served}（手动清单 {}{scope}）", l.models.len())
@@ -136,20 +136,20 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
             {
                 let k = p.effective_redact();
                 if k.is_empty() {
-                    "不脱".to_string()
+                    "不脱敏".to_string()
                 } else {
                     k.iter().map(|x| x.slug()).collect::<Vec<_>>().join(" ")
                 }
             },
             p.effective_trust().label(),
-            p.pricing.as_deref().unwrap_or("默认"),
+            p.pricing.as_deref().unwrap_or("默认价目表"),
         );
     }
 
     // ---- 客户端条目（**只有名字和脱敏后的 key**）
     let _ = writeln!(
         out,
-        "\n## 网关密钥（{} 把）\n\n| 名字 | key |\n|---|---|",
+        "\n## 网关密钥（{} 个）\n\n| 名称 | 密钥 |\n|---|---|",
         cfg.clients.len()
     );
     for c in &cfg.clients {
@@ -159,22 +159,22 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 安全三态
     let _ = writeln!(out, "\n## 安全\n\n| | |\n|---|---|");
     line(&mut out, "出站脱敏", cfg.security.redact.label());
-    line(&mut out, "入站审查", cfg.security.inspect_tools.label());
-    line(&mut out, "配置扫描", cfg.security.scan_configs.label());
+    line(&mut out, "工具调用审查", cfg.security.inspect_tools.label());
+    line(&mut out, "配置面扫描", cfg.security.scan_configs.label());
 
     // ---- 存储和最近的失败
     match &s.store {
         None => {
-            let _ = writeln!(out, "\n## 观测\n\n**没有启动。**这段时间的请求没有被记录。");
+            let _ = writeln!(out, "\n## 请求记录\n\n未启动，此期间的请求未被记录。");
         }
         Some(store) => {
             let g = store.lock().await;
-            let _ = writeln!(out, "\n## 观测\n\n| | |\n|---|---|");
-            line(&mut out, "磁盘状态", format!("{:?}", g.level()));
+            let _ = writeln!(out, "\n## 请求记录\n\n| | |\n|---|---|");
+            line(&mut out, "磁盘状态", g.level().label());
             line(&mut out, "请求条数", g.db().count().unwrap_or(0));
             line(
                 &mut out,
-                "留档大小",
+                "请求体存储大小",
                 format!("{} 字节", g.blobs().total_bytes()),
             );
 
@@ -186,12 +186,12 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                 .collect();
             let _ = writeln!(
                 out,
-                "\n### 最近的失败（{} 条，取自最近 {} 条请求）\n",
+                "\n### 最近失败的请求（{} 条，取自最近 {} 条请求）\n",
                 failed.len(),
                 recent.len()
             );
             if failed.is_empty() {
-                let _ = writeln!(out, "没有。");
+                let _ = writeln!(out, "无。");
             } else {
                 let _ = writeln!(out, "| 时间 | 上游 | 状态 | 错误 |\n|---|---|---|---|");
                 for r in failed {
@@ -225,14 +225,14 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
             let _ = writeln!(out, "{}", tw_secret::mask_config_yaml(&text));
         }
         Err(e) => {
-            let _ = writeln!(out, "# 读不了：{e}");
+            let _ = writeln!(out, "# 无法读取：{e}");
         }
     }
     let _ = writeln!(out, "```");
 
     let _ = writeln!(
         out,
-        "\n---\n\n**不含请求体和响应体。**它们最有用也最危险 —— 需要的话在请求详情页里单独看。"
+        "\n---\n\n本文件不包含请求体和响应体，如有需要，请在请求详情中查看。"
     );
     out
 }

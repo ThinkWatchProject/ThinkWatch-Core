@@ -34,13 +34,13 @@ const BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum OauthError {
-    #[error("换 token 时连不上 {endpoint}：{why}")]
+    #[error("刷新 token 时无法连接 {endpoint}：{why}")]
     Http { endpoint: String, why: String },
     #[error("token 端点返回 {status}：{body}")]
     Status { status: u16, body: String },
-    #[error("token 端点的响应里没有 access_token")]
+    #[error("token 端点的响应中没有 access_token")]
     NoToken,
-    #[error("上一次换 token 失败了（{why}），{secs} 秒之后再试")]
+    #[error("上次刷新 token 失败（{why}），将在 {secs} 秒后重试")]
     Backoff { why: String, secs: u64 },
 }
 
@@ -140,7 +140,7 @@ impl Cache {
     ) -> Result<(String, Option<String>), OauthError> {
         // 先看手里有没有能用的
         {
-            let g = self.inner.lock().expect("锁没毒");
+            let g = self.inner.lock().expect("锁未中毒");
             if let Some(live) = g.get(provider).filter(|l| l.usable_for(cfg)) {
                 if let Some((why, until)) = &live.failed
                     && Instant::now() < *until
@@ -176,7 +176,7 @@ impl Cache {
         http: &reqwest::Client,
     ) -> Result<(String, Option<String>), OauthError> {
         {
-            let mut g = self.inner.lock().expect("锁没毒");
+            let mut g = self.inner.lock().expect("锁未中毒");
             if let Some(live) = g.get_mut(provider).filter(|l| l.usable_for(cfg)) {
                 live.renew_at = Some(Instant::now());
                 // 强制刷新时把退避清掉 —— 这是调用方明确要求的一次
@@ -194,7 +194,7 @@ impl Cache {
     ) -> Result<(String, Option<String>), OauthError> {
         // 用手里那个 refresh（可能是服务器换过的），没有就用配置里的
         let refresh = {
-            let g = self.inner.lock().expect("锁没毒");
+            let g = self.inner.lock().expect("锁未中毒");
             g.get(provider)
                 // 认不出来 = 用户改了配置，缓存里那个（哪怕是服务器
                 // 换发的）一律不算，用配置里的重新开始
@@ -207,7 +207,7 @@ impl Cache {
             Err(e) => {
                 // **记下失败并退避。**没有它，一个坏掉的 token 端点会被
                 // 每个请求敲一次
-                let mut g = self.inner.lock().expect("锁没毒");
+                let mut g = self.inner.lock().expect("锁未中毒");
                 let why = e.to_string();
                 let fp = fingerprint(cfg);
                 let entry = g.entry(provider.to_string()).or_insert_with(|| Live {
@@ -241,7 +241,7 @@ impl Cache {
             let life = secs.saturating_sub(lead).max(1);
             Instant::now() + Duration::from_secs(life)
         });
-        let mut g = self.inner.lock().expect("锁没毒");
+        let mut g = self.inner.lock().expect("锁未中毒");
         g.insert(
             provider.to_string(),
             Live {
@@ -390,7 +390,7 @@ mod tests {
         let second = rt.block_on(c.token("p", &o, &http)).unwrap_err();
         // 第二次直接被退避挡住，没有再去连
         assert!(matches!(second, OauthError::Backoff { .. }), "{second}");
-        assert!(second.to_string().contains("秒之后再试"), "{second}");
+        assert!(second.to_string().contains("秒后重试"), "{second}");
     }
 
     #[test]

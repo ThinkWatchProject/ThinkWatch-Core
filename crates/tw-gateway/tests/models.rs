@@ -279,7 +279,7 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
     assert_eq!(status, 400, "{body}");
     let msg = body["error"]["message"].as_str().unwrap();
     assert!(
-        msg.contains("official-only") && msg.contains("relay 不提供该模型"),
+        msg.contains("official-only") && msg.contains("relay 未提供此模型"),
         "{msg}"
     );
 

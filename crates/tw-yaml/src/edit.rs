@@ -49,10 +49,10 @@ pub fn put(text: &str, path: &[Step], value: Put<'_>) -> Result<String, PatchErr
         return Err(PatchError::NotFound(show(path)));
     };
     let frag = nodes(value.text())
-        .map_err(|e| PatchError::Parse(format!("要写进 `{}` 的值本身解析不了：{e}", show(path))))?;
+        .map_err(|e| PatchError::Parse(format!("写入 {} 的值无法解析：{e}", show(path))))?;
     if matches!(value, Put::Inline(s) if s.contains('\n')) {
         return Err(PatchError::Parse(format!(
-            "写进 `{}` 的单行值里有换行",
+            "写入 {} 的单行值包含换行",
             show(path)
         )));
     }
@@ -67,7 +67,7 @@ pub fn put(text: &str, path: &[Step], value: Put<'_>) -> Result<String, PatchErr
         None => add_key(text, &before, path, value)?,
     };
     let after = nodes(&out)
-        .map_err(|e| PatchError::SelfCheck(format!("写完 `{}` 之后解析不了：{e}", show(path))))?;
+        .map_err(|e| PatchError::SelfCheck(format!("写入 {} 后配置无法解析：{e}", show(path))))?;
     untouched_outside(&before, &after, path)?;
     lands_as(&after, path, &frag)?;
     Ok(out)
@@ -105,7 +105,7 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
     }
     if !matches!(parent_node.kind, NodeKind::Map) || is_flow(text, parent_node) {
         return Err(PatchError::NotFound(format!(
-            "{}（行内映射里的键只能整段改写）",
+            "{}（行内映射中的键只能整体修改）",
             show(path)
         )));
     }
@@ -121,7 +121,7 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
             // 而不是一个空映射 —— 整项删是 `remove` 的事
             Some(Step::Index(_)) => {
                 return Err(PatchError::NotFound(format!(
-                    "{}（这是那一项里唯一的键，要删就删整项）",
+                    "{}（该项只有这一个键，请删除整项）",
                     show(path)
                 )));
             }
@@ -156,10 +156,10 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
     };
 
     let after = nodes(&out)
-        .map_err(|e| PatchError::SelfCheck(format!("删掉 `{}` 之后解析不了：{e}", show(path))))?;
+        .map_err(|e| PatchError::SelfCheck(format!("删除 {} 后配置无法解析：{e}", show(path))))?;
     if after.iter().any(|n| n.path == path) {
         return Err(PatchError::SelfCheck(format!(
-            "删完之后 `{}` 还在",
+            "删除后 {} 仍然存在",
             show(path)
         )));
     }
@@ -207,10 +207,10 @@ pub fn replace_item(
     let mut path = seq_path.to_vec();
     path.push(Step::Index(index));
     let after = nodes(&out)
-        .map_err(|e| PatchError::SelfCheck(format!("换掉 `{}` 之后解析不了：{e}", show(&path))))?;
+        .map_err(|e| PatchError::SelfCheck(format!("替换 {} 后配置无法解析：{e}", show(&path))))?;
     if count_items(&after, seq_path) != count {
         return Err(PatchError::SelfCheck(format!(
-            "换完之后 `{}` 的项数变了",
+            "替换后 {} 的项数发生了变化",
             show(seq_path)
         )));
     }
@@ -335,13 +335,13 @@ fn add_key(text: &str, all: &[Node], path: &[Step], value: Put<'_>) -> Result<St
     if is_flow(text, a) {
         let (1, Put::Inline(rendered)) = (keys.len(), value) else {
             return Err(PatchError::NotFound(format!(
-                "{}（行内映射里写不下多层或多行的值）",
+                "{}（行内映射中不能写入多层或多行的值）",
                 show(path)
             )));
         };
         let key = keys[0];
         let close = flow_end(text, a.bytes.start)
-            .ok_or_else(|| PatchError::NotFound(format!("{}（行内映射没收尾）", show(anchor))))?;
+            .ok_or_else(|| PatchError::NotFound(format!("{}（行内映射未闭合）", show(anchor))))?;
         let inner = text[a.bytes.start + 1..close].trim();
         let piece = if inner.is_empty() {
             format!("{key}: {rendered}")
@@ -417,7 +417,7 @@ fn value_end(text: &str, all: &[Node], n: &Node) -> Result<usize, PatchError> {
         NodeKind::Scalar { .. } | NodeKind::Alias => Ok(n.bytes.end.min(text.len())),
         NodeKind::Map | NodeKind::Seq if is_flow(text, n) => flow_end(text, n.bytes.start)
             .map(|i| i + 1)
-            .ok_or_else(|| PatchError::NotFound(format!("{}（行内写法没收尾）", show(&n.path)))),
+            .ok_or_else(|| PatchError::NotFound(format!("{}（行内写法未闭合）", show(&n.path)))),
         NodeKind::Map | NodeKind::Seq => {
             block_end(text, all, &n.path).ok_or_else(|| PatchError::NotFound(show(&n.path)))
         }
@@ -471,7 +471,7 @@ fn untouched_outside(before: &[Node], after: &[Node], path: &[Step]) -> Result<(
             .map(|(x, _)| show(x.0))
             .unwrap_or_else(|| format!("节点数 {} → {}", b.len(), a.len()));
         return Err(PatchError::SelfCheck(format!(
-            "写 `{}` 的时候动到了别处（{diff}）",
+            "写入 {} 时修改了其他位置（{diff}）",
             show(path)
         )));
     }
@@ -491,7 +491,7 @@ fn lands_as(after: &[Node], path: &[Step], frag: &[Node]) -> Result<(), PatchErr
         .collect();
     if got != want {
         return Err(PatchError::SelfCheck(format!(
-            "`{}` 写完读回来和要写的不一样",
+            "{} 写入后读回的值与预期不一致",
             show(path)
         )));
     }

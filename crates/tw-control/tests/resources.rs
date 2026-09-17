@@ -217,7 +217,7 @@ async fn a_duplicate_name_and_a_stale_version_are_both_conflicts() {
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("已经有叫「官方」的上游"), "{body}");
+    assert!(body.contains("已存在名为「官方」的上游"), "{body}");
 
     let (st, body) = call(
         &b.app,

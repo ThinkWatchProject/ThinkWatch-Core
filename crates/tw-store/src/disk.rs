@@ -34,11 +34,21 @@ impl DiskLevel {
     pub fn writes_anything(&self) -> bool {
         !matches!(self, DiskLevel::Nothing)
     }
+    /// 控制面发给界面的值。**界面按它判断、按它取自己的文案**，不拿
+    /// 显示文字去比较。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            DiskLevel::Ok => "ok",
+            DiskLevel::MetadataOnly => "metadata_only",
+            DiskLevel::Nothing => "stopped",
+        }
+    }
+    /// 诊断包和日志里的说法。
     pub fn label(&self) -> &'static str {
         match self {
             DiskLevel::Ok => "正常",
-            DiskLevel::MetadataOnly => "磁盘快满了，只记摘要不存请求体",
-            DiskLevel::Nothing => "磁盘几乎满了，已停止记录（转发不受影响）",
+            DiskLevel::MetadataOnly => "磁盘空间不足，仅记录请求摘要，不保存请求体与响应体",
+            DiskLevel::Nothing => "磁盘空间严重不足，已停止记录，转发不受影响",
         }
     }
 }
@@ -99,6 +109,7 @@ mod tests {
         // 哪天有人往 DiskLevel 上加一个「停止转发」，它会立刻响。
         for l in [DiskLevel::Ok, DiskLevel::MetadataOnly, DiskLevel::Nothing] {
             assert!(l.label().len() > 1, "每一级都要有一句给人看的话");
+            assert!(!l.slug().is_empty());
         }
         assert!(
             DiskLevel::Nothing.label().contains("转发不受影响"),

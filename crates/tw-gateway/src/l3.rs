@@ -154,7 +154,7 @@ pub async fn run(
             output_tokens: None,
             input_tokens: None,
             error: Some(format!(
-                "推理测速暂不支持 {} 协议的上游，没有发出请求",
+                "推理测速暂不支持 {} 协议的上游，未发送请求",
                 protocol.map(|p| format!("{p:?}")).unwrap_or_default()
             )),
         };
@@ -297,14 +297,14 @@ mod tests {
         assert_eq!(e.input_tokens, probe_input_tokens());
         assert_eq!(e.max_output_tokens, MAX_TOKENS);
         assert!(e.quote.cost_micros.is_some());
-        let tokens = (probe_input_tokens() + MAX_TOKENS).to_string();
         let e = estimate(
             &prices(),
             "订阅",
             "claude-sonnet-4-5",
             tw_config::Billing::Subscription,
         );
-        assert!(e.quote.note.contains(&tokens), "{}", e.quote.note);
+        assert_eq!(e.quote.cost_micros, None);
+        assert_eq!(e.input_tokens, probe_input_tokens());
     }
 
     #[test]
@@ -345,7 +345,7 @@ mod tests {
         assert!(!r.ok);
         let e = r.error.unwrap();
         assert!(e.contains("暂不支持"), "{e}");
-        assert!(e.contains("没有发出请求"), "{e}");
+        assert!(e.contains("未发送请求"), "{e}");
     }
 
     #[test]

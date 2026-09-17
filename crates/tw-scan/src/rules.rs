@@ -57,7 +57,7 @@ pub struct RuleFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
-    #[error("内置规则文件坏了：{0}")]
+    #[error("内置规则文件无法解析：{0}")]
     Builtin(String),
 }
 
@@ -86,18 +86,24 @@ pub struct Rules {
 }
 
 impl Rules {
-    /// 一句给界面看的话：现在到底有多少条在生效。
+    /// 其中用户自己加的有几条。
     ///
-    /// 这句话是「加法加停用」能成立的前提 —— 用户不必抄一份规则集，
-    /// 也能知道自己这台机器上跑的是什么。
+    /// 「现在到底有多少条在生效、几条是加的、停用了几条」是「加法加停用」
+    /// 能成立的前提 —— 用户不必抄一份规则集，也能知道自己这台机器上跑的
+    /// 是什么。界面拿这三个数自己说。
+    pub fn custom(&self) -> usize {
+        self.rules.iter().filter(|r| r.custom).count()
+    }
+
+    /// 命令行里的那一句。
     pub fn summary(&self) -> String {
-        let custom = self.rules.iter().filter(|r| r.custom).count();
-        let mut s = format!("{} 条生效", self.rules.len());
+        let custom = self.custom();
+        let mut s = format!("生效 {} 条", self.rules.len());
         if custom > 0 {
-            s.push_str(&format!("（其中 {custom} 条是你加的）"));
+            s.push_str(&format!("，其中自定义 {custom} 条"));
         }
         if !self.disabled.is_empty() {
-            s.push_str(&format!("，停用了 {} 条内置", self.disabled.len()));
+            s.push_str(&format!("，已停用内置规则 {} 条", self.disabled.len()));
         }
         s
     }
@@ -125,7 +131,7 @@ fn compile(spec: &RuleSpec, group: &'static str, custom: bool, out: &mut Rules) 
         // 工作的安全功能等于没有。但它必须**大声**说出来 —— 静默失效
         // 比没有更糟，因为用户以为它在
         Err(e) => out.warnings.push(format!(
-            "规则 `{}` 的正则写不通，这一条没有生效：{e}",
+            "规则「{}」的正则表达式有误，该规则未生效：{e}",
             spec.id
         )),
     }
@@ -160,7 +166,7 @@ pub fn build(user: &tw_config::ScanRules) -> Result<Rules, RuleError> {
     for id in &user.disable {
         if !out.disabled.contains(id) {
             out.warnings
-                .push(format!("`{id}` 不是内置规则的 id，这一条停用没有生效"));
+                .push(format!("「{id}」不是内置规则的 id，停用未生效"));
         }
     }
     for spec in &user.add {
@@ -434,9 +440,11 @@ mod tests {
             disable: vec!["chmod-777".into()],
         })
         .unwrap();
+        assert_eq!(rs.custom(), 1);
+        assert_eq!(rs.disabled.len(), 1);
         let s = rs.summary();
-        assert!(s.contains("1 条是你加的"), "{s}");
-        assert!(s.contains("停用了 1 条"), "{s}");
+        assert!(s.contains("其中自定义 1 条"), "{s}");
+        assert!(s.contains("已停用内置规则 1 条"), "{s}");
         // injection 组的规则永远不切断
         assert!(!rs.rules.iter().find(|x| x.id == "我的").unwrap().high);
     }

@@ -61,7 +61,7 @@ pub fn spawn(
                 // **落后了就跳过，不要退出。**广播通道满的时候丢的是
                 // 观测记录，而退出会让之后的记录全部丢失。
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("观测落后了 {n} 条，这些请求不会出现在历史里");
+                    tracing::warn!("请求记录处理不及，{n} 条请求未能记录");
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
@@ -81,7 +81,7 @@ pub fn spawn(
                 crate::blobs::MAX_BYTES,
             );
             if freed > 0 {
-                tracing::info!(mb = freed / 1024 / 1024, "回收了过期的请求体");
+                tracing::info!(mb = freed / 1024 / 1024, "已回收过期的请求体");
             }
         }
     });

@@ -755,7 +755,7 @@ async fn everything_broken_still_tries_rather_than_refusing() {
     let msg = body["error"]["message"].as_str().unwrap();
     // 错误里要能看出「试过谁」—— 用户能看见故障转移在替他工作，
     // 这是信任的来源。
-    assert!(msg.contains("试过"), "{msg}");
+    assert!(msg.contains("已尝试"), "{msg}");
 }
 
 /// 一个慢上游：每个请求要 `delay`，用来观察并发行为。
@@ -1411,7 +1411,7 @@ async fn intercepting_a_probe_emits_its_own_event_not_a_request_pair() {
         .expect("2 秒内没等到事件")
         .unwrap();
     match ev {
-        tw_api::Event::LocallyAnswered { probe, .. } => assert_eq!(probe, "连通性检查"),
+        tw_api::Event::LocallyAnswered { probe, .. } => assert_eq!(probe, "health_check"),
         other => panic!("该是本地应答，实际 {other:?}"),
     }
     // 后面不该再跟着一对 started/finished
@@ -1596,7 +1596,7 @@ async fn a_health_check_works_before_any_upstream_is_configured() {
         .await
         .unwrap();
     assert_ne!(real.status(), 200);
-    assert!(real.text().await.unwrap().contains("还没有配置任何上游"));
+    assert!(real.text().await.unwrap().contains("尚未配置任何上游"));
 }
 
 /// **错误必须用入站方言的原生格式返回。**一个 Anthropic 客户端
@@ -2003,7 +2003,7 @@ async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_unto
         }
     }
     let (secret, masked, provider) = found.expect("请求体里有 key，却没有发现");
-    assert_eq!(secret, "Anthropic API key");
+    assert_eq!(secret, "anthropic-api-key");
     assert_eq!(provider, "中转", "得知道发给了谁 —— 那才是这条防线的意义");
     // 报出来的东西一律打码：「发现了 sk-ant-xxx」本身就是一次泄漏
     assert!(!masked.contains("abcdefghijklmnop"), "{masked}");
@@ -2124,11 +2124,13 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
     assert_eq!(group.as_deref(), Some("全部"));
     assert_eq!(attempts.len(), 3, "{attempts:?}");
     assert_eq!(attempts[0].provider, "挂了的");
-    assert!(attempts[0].outcome.contains("503"), "{:?}", attempts[0]);
+    assert_eq!(attempts[0].outcome, "status", "{:?}", attempts[0]);
+    assert_eq!(attempts[0].status, Some(503), "{:?}", attempts[0]);
     assert_eq!(attempts[1].provider, "限流的");
-    assert!(attempts[1].outcome.contains("429"), "{:?}", attempts[1]);
+    assert_eq!(attempts[1].status, Some(429), "{:?}", attempts[1]);
     assert_eq!(attempts[2].provider, "好的");
-    assert_eq!(attempts[2].outcome, "成功");
+    assert_eq!(attempts[2].outcome, "served");
+    assert_eq!(attempts[2].status, Some(200));
 }
 
 #[tokio::test]
@@ -2160,7 +2162,7 @@ async fn a_request_that_succeeds_first_try_still_has_a_chain_of_one() {
             tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
         {
             assert_eq!(attempts.len(), 1);
-            assert_eq!(attempts[0].outcome, "成功");
+            assert_eq!(attempts[0].outcome, "served");
             return;
         }
     }
@@ -2196,7 +2198,8 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
             tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
         {
             assert_eq!(attempts.len(), 1);
-            assert!(attempts[0].outcome.contains("503"), "{:?}", attempts[0]);
+            assert_eq!(attempts[0].outcome, "status", "{:?}", attempts[0]);
+            assert_eq!(attempts[0].status, Some(503), "{:?}", attempts[0]);
             return;
         }
     }
