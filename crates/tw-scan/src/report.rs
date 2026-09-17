@@ -310,11 +310,11 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                 path: src.path.clone(),
                 line: h.line,
                 title: format!(
-                    "{} 里有{}",
+                    "{} 中含有{}",
                     src.kind.label(),
                     h.kind.why().split('：').next().unwrap_or("隐藏字符")
                 ),
-                detail: format!("{} {}", h.kind.why(), src.kind.why()),
+                detail: format!("{}{}", h.kind.why(), src.kind.why()),
                 excerpt: h.line_text,
             });
         }
@@ -336,9 +336,9 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                             client: src.client.to_string(),
                             path: src.path.clone(),
                             line,
-                            title: format!("MCP server `{}` 在远端", m.name),
+                            title: format!("MCP server「{}」位于远端", m.name),
                             detail: format!(
-                                "它指向 {}。用到它的时候，相关上下文会发到那台服务器上。",
+                                "该 server 的地址为 {}，使用时相关上下文会发送到该服务器。",
                                 m.url.as_deref().unwrap_or("")
                             ),
                             excerpt,
@@ -372,8 +372,10 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     client: src.client.to_string(),
                     path: src.path.clone(),
                     line,
-                    title: format!("skill `{name}` 声明了 allowed-tools: [\"*\"]"),
-                    detail: "它能用任何工具。这可能完全正当，但值得你看一眼是不是真的需要。".into(),
+                    title: format!("skill「{name}」声明了 allowed-tools: [\"*\"]"),
+                    detail:
+                        "该 skill 可以使用任何工具。这可能是正常需要，建议确认是否确实需要此权限。"
+                            .into(),
                     excerpt,
                 });
             }
@@ -422,8 +424,8 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     client: src.client.to_string(),
                     path: src.path.clone(),
                     line,
-                    title: format!("{} 里命中「{}」", src.kind.label(), rule.id),
-                    detail: format!("{} {}", rule.why, src.kind.why()),
+                    title: format!("{} 中命中规则「{}」", src.kind.label(), rule.id),
+                    detail: format!("{}。{}", rule.why, src.kind.why()),
                     excerpt,
                 });
             }

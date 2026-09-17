@@ -29,6 +29,15 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// 控制面发给界面的值。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Stage::Syntax => "syntax",
+            Stage::Schema => "schema",
+            Stage::Semantics => "semantics",
+        }
+    }
+    /// 命令行和日志里的说法，后面接「错误」。
     pub fn label(&self) -> &'static str {
         match self {
             Stage::Syntax => "语法",

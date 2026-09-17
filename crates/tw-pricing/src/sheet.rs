@@ -102,24 +102,24 @@ pub struct PerMillion {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SheetError {
-    #[error("有一张价目表没有名字")]
+    #[error("存在未填写名称的价目表")]
     EmptyName,
-    #[error("价目表名称「{0}」首尾不能有空白")]
+    #[error("价目表名称「{0}」首尾不能包含空白")]
     PaddedName(String),
-    #[error("价目表名字重复：{0}")]
+    #[error("价目表名称重复：{0}")]
     DuplicateName(String),
-    #[error("价目表「{sheet}」的倍率 {value} 不对：要是一个大于 0 的数")]
+    #[error("价目表「{sheet}」的倍率 {value} 无效，倍率必须大于 0")]
     BadMultiplier { sheet: String, value: f64 },
-    #[error("价目表「{sheet}」里有一个模型没写名字")]
+    #[error("价目表「{sheet}」中存在未填写名称的模型")]
     EmptyModel { sheet: String },
-    #[error("价目表「{sheet}」里 `{model}` 的{field}是 {value}：单价不能是负数")]
+    #[error("价目表「{sheet}」中模型 {model} 的{field}为 {value}，单价不能为负数")]
     BadPrice {
         sheet: String,
         model: String,
         field: &'static str,
         value: f64,
     },
-    #[error("价目表「{sheet}」里 `{model}` 的长上下文单价要输入、输出一起写")]
+    #[error("价目表「{sheet}」中模型 {model} 的长上下文输入单价与输出单价需要同时填写")]
     HalfLongContext { sheet: String, model: String },
 }
 

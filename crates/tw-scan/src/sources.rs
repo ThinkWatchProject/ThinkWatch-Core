@@ -66,16 +66,12 @@ impl Kind {
     /// 为什么它危险。**说清「它能干什么」**，别只说「它是什么」。
     pub fn why(&self) -> &'static str {
         match self {
-            Kind::Hooks => {
-                "hook 在工具调用前后直接执行 shell 命令 —— 不需要模型参与就能拿到执行权。"
-            }
-            Kind::Mcp => {
-                "MCP server 配置指定的是一个可执行程序和它的参数，等同于「运行这个二进制」。"
-            }
+            Kind::Hooks => "hook 在工具调用前后直接执行 shell 命令，无需模型参与即可获得执行权限。",
+            Kind::Mcp => "MCP server 配置指定了可执行程序及其参数，相当于直接运行该程序。",
             Kind::Skill => "SKILL.md 的内容会被注入模型上下文，成为指令。",
             Kind::Command => "斜杠命令的内容会被注入模型上下文，成为指令。",
-            Kind::Agent => "subagent 定义会被注入上下文，而且可能声明宽松的工具权限。",
-            Kind::Instructions => "这个文件会被自动读入上下文。",
+            Kind::Agent => "subagent 定义会被注入模型上下文，并可能声明宽松的工具权限。",
+            Kind::Instructions => "该文件会被自动读入模型上下文。",
         }
     }
 }
@@ -264,7 +260,7 @@ mod tests {
         // 危险度排序不是装饰：界面按它排，高危项发通知。
         assert!(Kind::Hooks < Kind::Mcp);
         assert!(Kind::Mcp < Kind::Skill);
-        assert!(Kind::Hooks.why().contains("不需要模型参与"));
+        assert!(Kind::Hooks.why().contains("无需模型参与"));
     }
 
     #[test]

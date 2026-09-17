@@ -59,29 +59,23 @@ impl From<usize> for Step {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PatchError {
-    #[error("这份 YAML 解析不了：{0}")]
+    #[error("YAML 无法解析：{0}")]
     Parse(String),
-    #[error("配置里没有 `{0}` 这个位置")]
+    #[error("无法在配置中定位 {0}")]
     NotFound(String),
-    #[error("`{0}` 不是一个标量 —— 只有标量能这样改；结构性的增删走另一条路")]
+    #[error("{0} 不是标量值，只有标量值可以直接修改")]
     NotScalar(String),
     /// **写之前的最后一道闸。**改完在内存里重新解析一遍，对不上就拒绝
     /// 写入。开销几百微秒，换来「永远不会写出一个自己都解析不了的文件」。
-    #[error("补丁自检没过：{0}。**没有写盘。**这是个 bug，请把配置文件贴到 issue 里")]
+    #[error("配置修改自检未通过，未写入文件：{0}")]
     SelfCheck(String),
     /// 同一个 map 里出现了两个同名的键。
-    #[error(
-        "`{0}` 在配置里出现了不止一次。同名的键谁生效各家解析器并不一致，改错一个的表现是「改了却没生效」—— 请先手动删掉重复的那个"
-    )]
+    #[error("{0} 在配置中重复出现，修改后可能不生效，请先手动删除重复的项")]
     Duplicate(String),
-    #[error(
-        "`{0}` 是一个多行块标量（`|` / `>`）。缩进在这里是内容的一部分，改错一格就改了值 —— 请直接编辑配置文件"
-    )]
+    #[error("{0} 是多行文本块（| 或 >），无法自动修改，请直接编辑配置文件")]
     BlockScalar(String),
     /// 锚点和别名让「改一处」不再是改一处。
-    #[error(
-        "`{0}` 落在 YAML 的锚点/别名（`&x` / `*x`）里。改它会同时改掉引用它的每一处，所以这里不动它 —— 请直接编辑配置文件"
-    )]
+    #[error("{0} 位于 YAML 锚点或别名（&x / *x）中，修改会影响所有引用处，请直接编辑配置文件")]
     AnchorOrAlias(String),
 }
 
@@ -471,11 +465,11 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
 
     // ── 护栏三 ──────────────────────────────────────────────────────
     let after = find(&out, path)
-        .map_err(|e| PatchError::SelfCheck(format!("改完之后 `{}` 找不回来了：{e}", show(path))))?;
+        .map_err(|e| PatchError::SelfCheck(format!("修改后无法找到 {}：{e}", show(path))))?;
     let want = value.as_yaml_text();
     if after.value != want {
         return Err(PatchError::SelfCheck(format!(
-            "`{}` 改完读回来是 {:?}，期望 {:?}",
+            "{} 修改后读回的值为 {:?}，预期为 {:?}",
             show(path),
             after.value,
             want
@@ -486,7 +480,7 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
     let untouched_before = text[..slot.start] == out[..slot.start];
     let untouched_after = text[slot.end..] == out[slot.start + pad.len() + rendered.len()..];
     if !untouched_before || !untouched_after {
-        return Err(PatchError::SelfCheck("目标之外的字节被动了".into()));
+        return Err(PatchError::SelfCheck("目标位置之外的内容被修改".into()));
     }
     Ok(out)
 }
@@ -900,12 +894,12 @@ fn checked_structural(
     want: usize,
 ) -> Result<String, PatchError> {
     let after = nodes(&out).map_err(|e| {
-        PatchError::SelfCheck(format!("改完 `{}` 之后解析不了：{e}", show(seq_path)))
+        PatchError::SelfCheck(format!("修改 {} 后配置无法解析：{e}", show(seq_path)))
     })?;
     let got = count_items(&after, seq_path);
     if got != want {
         return Err(PatchError::SelfCheck(format!(
-            "改完之后 `{}` 有 {got} 项，应该是 {want} 项",
+            "修改后 {} 有 {got} 项，预期为 {want} 项",
             show(seq_path)
         )));
     }

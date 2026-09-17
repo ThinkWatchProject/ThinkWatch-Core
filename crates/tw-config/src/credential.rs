@@ -70,7 +70,17 @@ impl Secret {
         Ok(tw_secret::expand_from_env(&self.0)?)
     }
 
-    /// 给人看的形态，**永远不含真实密钥**。
+    /// 给界面的形态，**永远不含真实密钥**：带 `${NAME}` 的原样给（写的是
+    /// 从哪个环境变量读），其余打码。怎么称呼它由界面决定。
+    pub fn shown(&self) -> String {
+        if self.0.contains("${") {
+            self.0.clone()
+        } else {
+            tw_secret::mask_secret(&self.0)
+        }
+    }
+
+    /// 命令行和诊断包里的说法，**永远不含真实密钥**。
     pub fn describe(&self) -> String {
         if self.0.contains("${") {
             format!("环境变量 {}", self.0)
@@ -119,7 +129,7 @@ impl<'de> Deserialize<'de> for Secret {
             // **说清楚该怎么写。**serde 默认只会说「expected a string」，而写错成
             // `key: { oauth: ... }` 的人要知道的是 OAuth 放在哪儿
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("一个字符串（可以带 ${VAR}）。OAuth 凭据写在上游的 `oauth` 字段里")
+                f.write_str("字符串（可以包含 ${VAR}）。OAuth 凭据应写在上游的 oauth 字段中")
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Secret, E> {
                 Ok(Secret(v.to_string()))
@@ -207,7 +217,7 @@ impl<'de> Deserialize<'de> for Headers {
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = Headers;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("一组「请求头名: 值」")
+                f.write_str("由「请求头名: 值」组成的映射")
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -242,41 +252,41 @@ pub fn auth_header(protocol: Option<Protocol>) -> (&'static str, &'static str) {
 /// 凭据写法上的问题。**每一条都指到具体的那一行**，而不是「凭据无效」。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
-    #[error("密钥是空的")]
+    #[error("API 密钥为空")]
     EmptyKey,
-    #[error("`key` 和 `oauth` 只能写一个")]
+    #[error("key 和 oauth 只能填写其中一项")]
     KeyAndOauth,
     #[error("oauth 的 refresh 和 endpoint 都不能为空")]
     EmptyOauth,
-    #[error("Claude 订阅账号的登录凭据不能接入，请改用 Anthropic API 密钥")]
+    #[error("不支持接入 Claude 订阅账号的登录凭据，请改用 Anthropic API 密钥")]
     ClaudeSubscription,
-    #[error("Gemini CLI 的 Google 登录凭据不能接入，请改用 Gemini API 密钥")]
+    #[error("不支持接入 Gemini CLI 的 Google 登录凭据，请改用 Gemini API 密钥")]
     GoogleSubscription,
-    #[error("请求头最多 {MAX_HEADERS} 个")]
+    #[error("请求头不能超过 {MAX_HEADERS} 个")]
     TooManyHeaders,
     #[error(
-        "请求头名「{0}」不合法：只能由字母、数字和 - _ . ~ 组成，最长 {MAX_HEADER_NAME} 个字符"
+        "请求头名「{0}」不合法：只能由字母、数字和 - _ . ~ 组成，长度不超过 {MAX_HEADER_NAME} 个字符"
     )]
     BadHeaderName(String),
-    #[error("请求头「{0}」由网关管理，不能在配置里设置")]
+    #[error("请求头「{0}」由网关管理，不能在配置中设置")]
     ReservedHeader(String),
-    #[error("请求头「{0}」写了两次（请求头名不分大小写）")]
+    #[error("请求头「{0}」重复（请求头名不区分大小写）")]
     DuplicateHeader(String),
-    #[error("请求头「{0}」的值不能包含换行，最长 {MAX_HEADER_VALUE} 个字符")]
+    #[error("请求头「{0}」的值不能包含换行，长度不超过 {MAX_HEADER_VALUE} 个字符")]
     BadHeaderValue(String),
     #[error(
-        "请求头「{name}」里的 {placeholder} 认不出来。能用的只有 {{{{access_token}}}} 和 {{{{client}}}}"
+        "请求头「{name}」中的 {placeholder} 无法识别，仅支持 {{{{access_token}}}} 和 {{{{client}}}}"
     )]
     UnknownPlaceholder { name: String, placeholder: String },
-    #[error("请求头「{0}」用了 {{{{access_token}}}}，但这个上游没有配置 oauth")]
+    #[error("请求头「{0}」使用了 {{{{access_token}}}}，但该上游未配置 oauth")]
     TokenWithoutOauth(String),
-    #[error("已经写了 `key`，请求头里不能再写「{0}」—— 密钥就是放在这个头里发的")]
+    #[error("已填写 key，API 密钥将通过请求头「{0}」发送，请求头中不能再设置「{0}」")]
     KeyAndAuthHeader(String),
     #[error(
-        "配置了 oauth 时 token 默认放在「{0}」里。要自己写这个头，请在值里用 {{{{access_token}}}} 指定 token 的位置"
+        "配置 oauth 后，token 默认通过请求头「{0}」发送。如需自行设置该请求头，请在值中用 {{{{access_token}}}} 标明 token 的位置"
     )]
     OauthAndAuthHeader(String),
-    #[error("取不到 OAuth access token")]
+    #[error("无法获取 OAuth access token")]
     NoToken,
     /// 环境变量没设之类。存成文字：这个错误要能比较，而底下那个类型不能
     #[error("{0}")]

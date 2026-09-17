@@ -415,7 +415,7 @@ async fn without_a_config_manager_the_rotation_is_reported_as_not_persisted() {
     for one in &seen {
         assert_eq!(one.0, "p");
         assert!(!one.1, "没写却说写了：{seen:?}");
-        assert!(one.2.contains("写不回去"), "{seen:?}");
+        assert!(one.2.contains("无法写回"), "{seen:?}");
     }
     // 事件里一个 token 都不能有
     assert!(!seen.iter().any(|s| s.2.contains("rt-")), "{seen:?}");

@@ -17,9 +17,9 @@ pub use mask::{
 pub enum SecretError {
     #[error("环境变量 {0} 未设置")]
     MissingEnv(String),
-    #[error("第 {pos} 个字符处的 ${{...}} 没有闭合")]
+    #[error("第 {pos} 个字符处的 ${{...}} 未闭合")]
     Unterminated { pos: usize },
-    #[error("空的变量名：${{}}")]
+    #[error("变量名为空：${{}}")]
     EmptyName,
 }
 

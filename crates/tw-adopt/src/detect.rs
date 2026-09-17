@@ -237,34 +237,34 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
             if started.is_empty() {
                 out.push(Finding {
                     level: Level::Clear,
-                    title: format!("{} 现在没在跑", c.name),
-                    detail: "下次启动时它会读到新配置。".into(),
+                    title: format!("{} 当前未运行", c.name),
+                    detail: "下次启动时将读取新配置。".into(),
                     fix: None,
                 });
             } else if !stale.is_empty() {
                 out.push(Finding {
                     level: Level::Blocking,
-                    title: format!("{} 的进程比我们改配置的时间还早", c.name),
+                    title: format!("{} 的进程启动于接管之前", c.name),
                     detail: format!(
-                        "有 {} 个进程是在接管之前启动的，它们读的还是旧配置。{}",
+                        "有 {} 个进程在接管之前启动，仍在使用旧配置。{}",
                         stale.len(),
                         c.takes_effect.note()
                     ),
-                    fix: Some(format!("关掉 {} 再打开", c.name)),
+                    fix: Some(format!("退出 {} 后重新打开", c.name)),
                 });
             } else {
                 out.push(Finding {
                     level: Level::Clear,
-                    title: format!("{} 是接管之后启动的", c.name),
-                    detail: "它读到的是新配置。".into(),
+                    title: format!("{} 在接管之后启动", c.name),
+                    detail: "已读取新配置。".into(),
                     fix: None,
                 });
             }
         }
         None => out.push(Finding {
             level: Level::Suspect,
-            title: "还没有接管过它".into(),
-            detail: format!("{} 上没有我们留下的接管记录。", d.real.display()),
+            title: "尚未接管该客户端".into(),
+            detail: format!("{} 中没有接管记录。", d.real.display()),
             fix: None,
         }),
     }
@@ -273,9 +273,9 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if d.shadows.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: "没有优先级更高的文件盖住它".into(),
+            title: "没有优先级更高的配置文件".into(),
             detail: if c.shadowed_by.is_empty() {
-                "这个客户端没有这类文件。".into()
+                "该客户端没有优先级更高的配置文件。".into()
             } else {
                 format!("{} 不存在。", c.shadowed_by.join("、"))
             },
@@ -291,19 +291,19 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     Level::Blocking
                 },
-                title: format!("{} 的优先级比我们写的那份高", s.display()),
+                title: format!("{} 的优先级高于接管写入的配置", s.display()),
                 detail: if hits.is_empty() {
-                    "它存在，但里面没有我们关心的字段。".into()
+                    "该文件存在，但不包含相关字段。".into()
                 } else {
                     format!(
-                        "它里面有 {} —— 会盖掉我们写的。",
+                        "该文件中包含 {}，会覆盖接管写入的设置。",
                         hits.iter()
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>()
                             .join("、")
                     )
                 },
-                fix: Some(format!("打开 {} 看看那几行", s.display())),
+                fix: Some(format!("检查 {} 中的相关字段", s.display())),
             });
         }
     }
@@ -314,9 +314,9 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
         if local.exists() {
             out.push(Finding {
                 level: Level::Suspect,
-                title: "这个项目里有一份同名配置".into(),
-                detail: format!("{} 会覆盖用户级的那份。", local.display()),
-                fix: Some(format!("打开 {local:?} 看看")),
+                title: "当前项目中有同名配置文件".into(),
+                detail: format!("{} 会覆盖用户级配置。", local.display()),
+                fix: Some(format!("检查 {}", local.display())),
             });
         }
     }
@@ -332,15 +332,15 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     Level::Blocking
                 },
-                title: "这台机器上有管理策略文件".into(),
-                detail: format!("{MANAGED} 的优先级压过一切，包括你自己的配置。"),
+                title: "本机存在管理策略文件".into(),
+                detail: format!("{MANAGED} 的优先级高于其他所有配置，包括用户配置。"),
                 fix: None,
             });
         } else {
             out.push(Finding {
                 level: Level::Clear,
-                title: "没有管理策略文件".into(),
-                detail: "这台机器上没有会压过一切的那份。".into(),
+                title: "本机没有管理策略文件".into(),
+                detail: "不存在优先级高于其他所有配置的管理策略文件。".into(),
                 fix: None,
             });
         }
@@ -351,8 +351,8 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if exports.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: "shell 配置里没有同名的环境变量".into(),
-            detail: "扫过了 .zshrc / .zprofile / .bashrc 这些。".into(),
+            title: "shell 配置中没有同名环境变量".into(),
+            detail: "已检查 .zshrc、.zprofile、.bashrc 等文件。".into(),
             fix: None,
         });
     } else {
@@ -363,14 +363,14 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 (
                     Level::Suspect,
                     format!(
-                        "这不影响 {}（它的配置文件优先级更高），但会影响读环境变量的其他客户端。",
+                        "不影响 {}（其配置文件优先级更高），但会影响读取环境变量的其他客户端。",
                         c.name
                     ),
                 )
             } else {
                 (
                     Level::Blocking,
-                    format!("{} 读环境变量，这一行会盖掉我们写的配置。", c.name),
+                    format!("{} 读取环境变量，该行会覆盖接管写入的配置。", c.name),
                 )
             };
             out.push(Finding {
@@ -378,7 +378,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 title: format!("{} 第 {line} 行导出了 {name}", f.display()),
                 detail,
                 // 命令给出来，执行与否是他的事
-                fix: Some(format!("要移除的话：sed -i '' '{line}d' {}", f.display())),
+                fix: Some(format!("sed -i '' '{line}d' {}", f.display())),
             });
         }
     }
@@ -387,17 +387,17 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     match (&d.adopted_at_ms, &d.endpoint) {
         (Some(_), None) => out.push(Finding {
             level: Level::Blocking,
-            title: "我们写的字段已经不在配置里了".into(),
+            title: "接管写入的字段已不在配置中".into(),
             detail: format!(
-                "{} 里找不到我们写的端点 —— 被别的工具改回去了。",
+                "{} 中未找到接管写入的接口地址，可能已被其他工具修改。",
                 d.real.display()
             ),
-            fix: Some("重新接管一次".into()),
+            fix: Some("重新接管该客户端".into()),
         }),
         (Some(_), Some(ep)) => out.push(Finding {
             level: Level::Clear,
-            title: "配置里的端点还是我们写的".into(),
-            detail: format!("现在指向 {ep}。"),
+            title: "配置中的接口地址与接管时一致".into(),
+            detail: format!("当前指向 {ep}。"),
             fix: None,
         }),
         _ => {}
@@ -407,10 +407,9 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     // 绿色的「查过了没问题」会让人以为已经确认过。
     out.push(Finding {
         level: Level::Suspect,
-        title: "以上都是静态检查".into(),
-        detail:
-            "优先级链有五层，静态检查证明不了「真的生效了」。唯一可靠的验证是等一个真实请求过来。"
-                .into(),
+        title: "以上均为静态检查".into(),
+        detail: "静态检查无法确认配置已实际生效。收到该客户端的真实请求后，才能确认接管已生效。"
+            .into(),
         fix: None,
     });
     out
@@ -506,7 +505,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let out = diagnose(&c("claude-code"), d.path(), None);
         assert!(
-            out.iter().any(|f| f.detail.contains("等一个真实请求")),
+            out.iter().any(|f| f.detail.contains("真实请求")),
             "结论里没留下这句话：{out:?}"
         );
     }

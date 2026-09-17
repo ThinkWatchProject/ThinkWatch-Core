@@ -256,7 +256,7 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     let http = rt.clients.get(&p.name).unwrap_or(&state.http);
     let headers = match state.headers_for(p, http, None).await {
         Ok(h) => h,
-        Err(e) => return Answer::Failed(format!("取不到凭据：{e}")),
+        Err(e) => return Answer::Failed(format!("无法获取凭据：{e}")),
     };
     let r = crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await;
     if !r.ok {
@@ -265,7 +265,7 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     match r.models {
         ModelList::Listed { models } => Answer::Listed(models),
         ModelList::NotImplemented { status } => {
-            Answer::NoList(format!("上游没有提供模型列表接口（HTTP {status}）"))
+            Answer::NoList(format!("上游未提供模型列表接口（HTTP {status}）"))
         }
         ModelList::Unrecognized { .. } => {
             Answer::NoList("上游返回的模型列表格式无法识别".to_string())
@@ -287,10 +287,10 @@ async fn refresh(state: &AppState, names: &[String]) {
     for (p, id, answer) in futures::future::join_all(asks).await {
         match &answer {
             Answer::Listed(models) => {
-                tracing::debug!(provider = %p.name, models = models.len(), "模型清单已获取")
+                tracing::debug!(provider = %p.name, models = models.len(), "已获取模型列表")
             }
             Answer::NoList(why) | Answer::Failed(why) => {
-                tracing::info!(provider = %p.name, "没有获取到模型清单：{why}")
+                tracing::info!(provider = %p.name, "未能获取模型列表：{why}")
             }
             Answer::Pending => {}
         }
@@ -365,8 +365,8 @@ impl Skip {
     pub fn label(&self) -> &'static str {
         match self {
             Skip::Disabled => "已停用",
-            Skip::OutOfScope => "该模型不在启用范围内",
-            Skip::NotOffered => "不提供该模型",
+            Skip::OutOfScope => "不在启用范围内",
+            Skip::NotOffered => "未提供此模型",
         }
     }
 }
@@ -389,11 +389,11 @@ impl Serving {
             .join("；");
         // 全是停用：请求没问题，是配置里能用的上游都关掉了
         if self.skipped.iter().all(|(_, s)| *s == Skip::Disabled) {
-            crate::GatewayError::config(format!("路由选中的上游都已停用：{why}"))
+            crate::GatewayError::config(format!("路由选中的上游均已停用：{why}"))
         } else {
             crate::GatewayError::new(
                 crate::error::Source::Request,
-                format!("没有可用的上游提供模型 `{model}`：{why}"),
+                format!("没有可用的上游提供模型 {model}：{why}"),
             )
         }
     }

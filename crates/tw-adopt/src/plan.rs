@@ -24,24 +24,24 @@ use crate::sentinel::{self, Original, SidecarRecord, Was};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
-    #[error("{client} 的配置读不动：{source}")]
+    #[error("无法读取 {client} 的配置：{source}")]
     Read {
         client: String,
         source: ForeignError,
     },
-    #[error("{client} 的配置解析不了，没有动它：{msg}")]
+    #[error("无法解析 {client} 的配置，未做任何修改：{msg}")]
     Parse { client: String, msg: String },
     #[error("{0}")]
     Write(#[from] ForeignError),
-    #[error("{path} 旁边那份接管记录写的是 `{other}`，不是 `{client}` —— 没有动任何东西")]
+    #[error("{path} 旁的接管记录属于 {other}，不属于 {client}，未做任何修改")]
     ForeignSidecar {
         path: PathBuf,
         other: String,
         client: String,
     },
-    #[error("没有找到 {client} 的接管记录，不知道该还原成什么。手动还原的话看 {path}")]
+    #[error("未找到 {client} 的接管记录，无法确定还原内容。如需手动还原，请查看 {path}")]
     NoRecord { client: String, path: PathBuf },
-    #[error("{client} 的原值是一个密钥，只在全文备份里；备份 {backup} 已经不在了")]
+    #[error("{client} 的原值是密钥，仅保存在全文备份中，而备份 {backup} 已不存在")]
     SecretGone { client: String, backup: PathBuf },
 }
 
@@ -220,7 +220,7 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
     notes.extend(c.costs.iter().map(|s| s.to_string()));
     if c.verified == crate::clients::Verified::FieldsOnly {
         notes.push(format!(
-            "{}。第一个请求到达之前，别把它当成已经生效。",
+            "{}。收到第一个请求之前，请勿视为已生效。",
             c.verified.note()
         ));
     }
@@ -232,7 +232,7 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
         .collect();
     if !shadows.is_empty() {
         notes.push(format!(
-            "检测到 {} —— 它的优先级比我们写的这份高，里面如果有同名设置会把我们盖掉。",
+            "检测到 {}，其优先级高于接管写入的配置，其中的同名设置会覆盖接管的设置。",
             shadows
                 .iter()
                 .map(|p| p.display().to_string())
@@ -338,7 +338,7 @@ pub fn apply(c: &Client, plan: &Plan, backup_root: &Path) -> Result<Applied, Pla
             if got.normalized() == expect.normalized() {
                 Ok(())
             } else {
-                Err("改完的内容和「原文件 + 预期改动」对不上".into())
+                Err("修改后的内容与「原文件加预期改动」不一致".into())
             }
         },
     )?;
@@ -415,7 +415,7 @@ pub fn apply_restore(c: &Client, plan: &Plan, backup_root: &Path) -> Result<Appl
             if got.normalized() == expect.normalized() {
                 Ok(())
             } else {
-                Err("还原之后的内容和「当前文件 - 我们写的那几个字段」对不上".into())
+                Err("还原后的内容与「当前文件去掉接管写入的字段」不一致".into())
             }
         },
     )?;
@@ -463,7 +463,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
             after: String::new(),
             originals: Vec::new(),
             carries_secret: false,
-            notes: vec!["这个配置文件已经不在了，只清掉我们留下的接管记录。".into()],
+            notes: vec!["配置文件已不存在，仅删除接管记录。".into()],
             shadows: Vec::new(),
             targets: Vec::new(),
             drop_sidecar: Some(side),
@@ -499,7 +499,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
                 // 更糟 —— 那等于卸载之后还在替他发着请求。
                 targets.push(Target::Remove(p.clone()));
                 notes.push(format!(
-                    "{} 原来是一个密钥，它只在全文备份里，而 {} 已经不在了 —— 我们把这个字段删掉了，你需要自己重新填一次。",
+                    "{} 的原值是密钥，仅保存在全文备份中，而 {} 已不存在。该字段已删除，需要手动重新填写。",
                     f.field,
                     backup.display()
                 ));
@@ -542,7 +542,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
     let delete_file = rec.created_file
         && matches!(semantic(c.format, &text, c.id)?, Val::Obj(ms) if ms.is_empty());
     if delete_file {
-        notes.push("这个文件当初是接管时新建的，还原后它是空的，所以一并删掉了。".into());
+        notes.push("该文件在接管时新建，还原后内容为空，已一并删除。".into());
     }
 
     notes.insert(0, c.takes_effect.note().to_string());

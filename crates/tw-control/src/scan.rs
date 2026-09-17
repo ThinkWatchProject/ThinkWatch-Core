@@ -30,7 +30,6 @@ pub fn finding_view(f: &tw_scan::report::Finding) -> tw_api::ScanFinding {
         level: f.level.slug().to_string(),
         rule: f.rule.clone(),
         kind: f.kind.slug().to_string(),
-        kind_label: f.kind.label().to_string(),
         client: f.client.clone(),
         path: f.path.display().to_string(),
         line: f.line,
@@ -66,7 +65,9 @@ pub async fn scan(
                 conflicting: Vec::new(),
                 unreadable: Vec::new(),
                 scanned: 0,
-                rules_origin: e.to_string(),
+                rules_active: 0,
+                rules_custom: 0,
+                rules_disabled: 0,
                 rules_warning: Some(e.to_string()),
                 projects: p.project,
             });
@@ -120,7 +121,9 @@ pub async fn scan(
             .collect(),
         unreadable: r.unreadable,
         scanned,
-        rules_origin: rules.summary(),
+        rules_active: rules.rules.len(),
+        rules_custom: rules.custom(),
+        rules_disabled: rules.disabled.len(),
         // **写坏的那几条要说出来** —— 一条静默失效的安全规则，比没有那条
         // 规则更糟，因为用户以为它在
         rules_warning: (!rules.warnings.is_empty()).then(|| rules.warnings.join("；")),
@@ -142,7 +145,7 @@ pub fn spawn_watcher(
     let home = state.home.clone();
     let cfg = state.config();
     let dirs = tw_scan::watch::dirs_for(&tw_scan::sources::user_level(&home));
-    tracing::debug!(dirs = dirs.len(), "开始盯客户端配置面");
+    tracing::debug!(dirs = dirs.len(), "开始监控客户端配置面");
     let (w, mut rx) = tw_scan::watch::watch(&dirs)?;
 
     let bus = state.bus().clone();
@@ -152,7 +155,7 @@ pub fn spawn_watcher(
         let scan_now = |home: &std::path::Path| {
             let rules = tw_scan::rules::build(&cfg.security.scan_rules).unwrap_or_else(|_| {
                 tw_scan::rules::build(&tw_config::ScanRules::default())
-                    .expect("内置规则必须能编译 —— 有测试盯着")
+                    .expect("内置规则的正则表达式有效，由测试保证")
             });
             tw_scan::report::scan(&tw_scan::sources::user_level(home), &rules)
         };
@@ -175,7 +178,7 @@ pub fn spawn_watcher(
             if fresh.is_empty() {
                 continue;
             }
-            tracing::info!(count = fresh.len(), "配置面上出现了新的可疑内容");
+            tracing::info!(count = fresh.len(), "客户端配置面出现了新的可疑内容");
             let id = bus.next_id();
             bus.emit(tw_api::Event::ScanAlert {
                 id,

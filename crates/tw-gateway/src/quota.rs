@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 /// 一个额度窗口的状态。**每个字段都直接来自响应头，没有一个是推算的。**
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
-    /// 「5h」「7d」「周」这类人话标签
-    pub label: String,
+    /// 哪个窗口：`5h` / `7d`（Anthropic）/ `weekly`（Codex）
+    pub window: String,
     /// 用了百分之多少。0–100
     pub used_percent: f64,
     /// 还有多少秒重置。**上游没给就是 None** —— 那时界面上只能说
@@ -84,14 +84,14 @@ pub fn from_headers(h: &HeaderMap) -> Quota {
     let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
 
     // ── Anthropic ────────────────────────────────────────────────
-    for (key, label) in [("5h", "5 小时"), ("7d", "7 天")] {
+    for key in ["5h", "7d"] {
         let Some(u) = get(&format!("anthropic-ratelimit-unified-{key}-utilization"))
             .and_then(|v| v.parse::<f64>().ok())
         else {
             continue;
         };
         windows.push(Window {
-            label: label.to_string(),
+            window: key.to_string(),
             // 上游给的是 0–100 还是 0–1，各家不一样。**大于 1 就当成
             // 百分比**：一个真实的 0.62 和一个真实的 62 都要能读对，而
             // 「用了 0.62%」这种值在订阅场景下没有意义。
@@ -104,20 +104,20 @@ pub fn from_headers(h: &HeaderMap) -> Quota {
     }
     // 7 天窗口的越线标记是个独立的头
     if get("anthropic-ratelimit-unified-7d-surpassed-threshold") == Some("true")
-        && let Some(w) = windows.iter_mut().find(|w| w.label == "7 天")
+        && let Some(w) = windows.iter_mut().find(|w| w.window == "7d")
         && w.status.is_none()
     {
         w.status = Some("allowed_warning".to_string());
     }
 
     // ── Codex ────────────────────────────────────────────────────
-    for (prefix, label) in [("primary", "周"), ("secondary", "5 小时")] {
+    for (prefix, window) in [("primary", "weekly"), ("secondary", "5h")] {
         let Some(u) = get(&format!("x-codex-{prefix}-used-percent")).and_then(|v| v.parse().ok())
         else {
             continue;
         };
         windows.push(Window {
-            label: label.to_string(),
+            window: window.to_string(),
             used_percent: normalize_percent(u),
             reset_in_secs: get(&format!("x-codex-{prefix}-reset-after-seconds"))
                 .and_then(|v| v.parse().ok()),
@@ -188,7 +188,7 @@ mod tests {
         ]));
         assert_eq!(q.windows.len(), 2);
         let five = &q.windows[0];
-        assert_eq!(five.label, "5 小时");
+        assert_eq!(five.window, "5h");
         assert_eq!(five.used_percent, 62.0);
         assert_eq!(five.reset_in_secs, Some(7200));
         assert_eq!(five.status.as_deref(), Some("allowed"));
@@ -232,7 +232,7 @@ mod tests {
             ("anthropic-ratelimit-unified-5h-utilization", "20"),
             ("anthropic-ratelimit-unified-7d-utilization", "91"),
         ]));
-        assert_eq!(q.tightest().unwrap().label, "7 天");
+        assert_eq!(q.tightest().unwrap().window, "7d");
     }
 
     #[test]

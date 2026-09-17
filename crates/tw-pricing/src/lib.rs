@@ -88,9 +88,9 @@ pub fn to_micros(usd: f64) -> Micros {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PricingError {
-    #[error("内置价目表解不开，这是个打包错误：{0}")]
+    #[error("内置价目表无法解析：{0}")]
     Snapshot(String),
-    #[error("价格数据读不通：{0}")]
+    #[error("价格数据无法解析：{0}")]
     Dataset(String),
 }
 

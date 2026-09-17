@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// 一次发现。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
-    /// 「Anthropic API key」这类人话
+    /// 哪种凭据，见 [`tw_redact::rules::Hit::secret`]
     pub kind: String,
     /// **已打码**的样子，比如 `sk-an…7f9c`
     pub masked: String,
@@ -42,7 +42,7 @@ pub fn scan(body: &[u8]) -> Vec<Finding> {
     // 决定看什么
     for h in tw_redact::rules::scan(&text, tw_redact::rules::Kind::all()) {
         let f = Finding {
-            kind: h.what.to_string(),
+            kind: h.secret.to_string(),
             // **打码之后才记。**「发现了 sk-ant-xxx」这句话本身就是一次
             // 泄漏 —— 它会进日志、进界面、被复制到 issue 里
             masked: tw_secret::mask_secret(&text[h.bytes]),
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn a_pasted_anthropic_key_is_found() {
         let body = r#"{"messages":[{"role":"user","content":"我的 key 是 sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234"}]}"#;
-        assert_eq!(kinds(body), vec!["Anthropic API key"]);
+        assert_eq!(kinds(body), vec!["anthropic-api-key"]);
     }
 
     #[test]
@@ -82,8 +82,8 @@ mod tests {
         let body =
             "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaa 还有 ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let ks = kinds(body);
-        assert!(ks.contains(&"Anthropic API key".to_string()), "{ks:?}");
-        assert!(ks.contains(&"GitHub personal token".to_string()), "{ks:?}");
+        assert!(ks.contains(&"anthropic-api-key".to_string()), "{ks:?}");
+        assert!(ks.contains(&"github-personal-token".to_string()), "{ks:?}");
     }
 
     #[test]

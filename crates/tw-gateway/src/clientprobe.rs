@@ -24,17 +24,8 @@ pub enum ProbeKind {
 }
 
 impl ProbeKind {
-    pub fn label(&self) -> &'static str {
-        match self {
-            ProbeKind::HealthCheck => "连通性检查",
-            ProbeKind::Warmup => "预热",
-            ProbeKind::Titling => "会话标题",
-            ProbeKind::TopicDetect => "话题检测",
-            ProbeKind::Suggestion => "建议模式",
-        }
-    }
-
-    /// 规则里 `when: { intent: ... }` 写的那个词。
+    /// 规则里 `when: { intent: ... }` 写的那个词，也是 `LocallyAnswered.probe`
+    /// 和 `ProbeView.id` 发的值。
     pub fn slug(&self) -> &'static str {
         match self {
             ProbeKind::HealthCheck => "health_check",

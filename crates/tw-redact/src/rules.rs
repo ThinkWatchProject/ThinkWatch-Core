@@ -66,8 +66,12 @@ pub struct Hit {
     pub kind: Kind,
     /// 在原文里的字节区间
     pub bytes: Range<usize>,
-    /// 「Anthropic API key」这类人话
-    pub what: &'static str,
+    /// 具体是哪种凭据：`anthropic-api-key` / `private-key` / `jwt` …
+    ///
+    /// **给的是 slug，不是名称。**界面拿它查自己的名称表；以前这里是
+    /// 「Anthropic API key」「连接串里的口令」这样的显示文字，一路原样进了
+    /// 事件、数据库和界面。
+    pub secret: &'static str,
 }
 
 // ---------------------------------------------------------------- API 密钥
@@ -77,27 +81,27 @@ pub struct Hit {
 /// **只收前缀明确的。**代码里的 hash、base64 的图片、UUID 全都长得像
 /// 「一长串随机字符」，按那个判据匹配会疯狂误报。
 const PREFIXED: &[(&str, &str, usize)] = &[
-    // (前缀, 人话, 前缀之后至少还要有多少个字符)
-    ("sk-ant-", "Anthropic API key", 20),
-    ("sk-proj-", "OpenAI project key", 20),
-    ("ghp_", "GitHub personal token", 30),
-    ("gho_", "GitHub OAuth token", 30),
-    ("ghs_", "GitHub server token", 30),
-    ("ghu_", "GitHub user token", 30),
-    ("github_pat_", "GitHub fine-grained token", 30),
-    ("xoxb-", "Slack bot token", 20),
-    ("xoxp-", "Slack user token", 20),
-    ("xoxa-", "Slack app token", 20),
-    ("AKIA", "AWS access key id", 12),
-    ("ASIA", "AWS temporary key id", 12),
-    ("AIza", "Google API key", 30),
-    ("ya29.", "Google OAuth token", 20),
-    ("glpat-", "GitLab token", 15),
-    ("sk_live_", "Stripe live key", 20),
-    ("rk_live_", "Stripe restricted key", 20),
-    ("npm_", "npm token", 30),
-    ("dop_v1_", "DigitalOcean token", 30),
-    ("SG.", "SendGrid key", 30),
+    // (前缀, 哪种凭据, 前缀之后至少还要有多少个字符)
+    ("sk-ant-", "anthropic-api-key", 20),
+    ("sk-proj-", "openai-project-key", 20),
+    ("ghp_", "github-personal-token", 30),
+    ("gho_", "github-oauth-token", 30),
+    ("ghs_", "github-server-token", 30),
+    ("ghu_", "github-user-token", 30),
+    ("github_pat_", "github-fine-grained-token", 30),
+    ("xoxb-", "slack-bot-token", 20),
+    ("xoxp-", "slack-user-token", 20),
+    ("xoxa-", "slack-app-token", 20),
+    ("AKIA", "aws-access-key-id", 12),
+    ("ASIA", "aws-temporary-key-id", 12),
+    ("AIza", "google-api-key", 30),
+    ("ya29.", "google-oauth-token", 20),
+    ("glpat-", "gitlab-token", 15),
+    ("sk_live_", "stripe-live-key", 20),
+    ("rk_live_", "stripe-restricted-key", 20),
+    ("npm_", "npm-token", 30),
+    ("dop_v1_", "digitalocean-token", 30),
+    ("SG.", "sendgrid-key", 30),
 ];
 
 /// `sk-` 开头的 OpenAI 老式 key。
@@ -110,11 +114,11 @@ fn is_tok(c: char) -> bool {
 }
 
 fn classify_token(tok: &str) -> Option<&'static str> {
-    for (prefix, what, min_tail) in PREFIXED {
+    for (prefix, secret, min_tail) in PREFIXED {
         if let Some(tail) = tok.strip_prefix(prefix)
             && tail.len() >= *min_tail
         {
-            return Some(what);
+            return Some(secret);
         }
     }
     if let Some(tail) = tok.strip_prefix("sk-")
@@ -127,7 +131,7 @@ fn classify_token(tok: &str) -> Option<&'static str> {
         && tail.chars().any(|c| c.is_ascii_digit())
         && tail.chars().any(|c| c.is_ascii_alphabetic())
     {
-        return Some("OpenAI API key");
+        return Some("openai-api-key");
     }
     None
 }
@@ -194,7 +198,7 @@ fn private_keys(text: &str, out: &mut Vec<Hit>) {
         out.push(Hit {
             kind: Kind::PrivateKeys,
             bytes: begin..end,
-            what: "私钥",
+            secret: "private-key",
         });
         from = end;
     }
@@ -265,7 +269,7 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
             out.push(Hit {
                 kind: Kind::ConnStrings,
                 bytes: c + 1..j,
-                what: "连接串里的口令",
+                secret: "conn-string-password",
             });
         }
         from = after;
@@ -301,14 +305,14 @@ fn is_rfc1918(tok: &str) -> bool {
 /// 本身藏起来了。何况我们的网关自己就住在那儿。
 fn internal_token(tok: &str) -> Option<&'static str> {
     if is_rfc1918(tok) {
-        return Some("内网地址");
+        return Some("internal-ip");
     }
     let lower = tok.to_ascii_lowercase();
     if (lower.ends_with(".local") || lower.ends_with(".internal") || lower.ends_with(".lan"))
         && lower.len() > 7
         && lower.contains('.')
     {
-        return Some("内部域名");
+        return Some("internal-domain");
     }
     None
 }
@@ -332,11 +336,11 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     let want_int = kinds.contains(&Kind::Internal);
     if want_api || want_jwt || want_int {
         for_each_token(text, |tok, span| {
-            if want_api && let Some(what) = classify_token(tok) {
+            if want_api && let Some(secret) = classify_token(tok) {
                 out.push(Hit {
                     kind: Kind::ApiKeys,
                     bytes: span,
-                    what,
+                    secret,
                 });
                 return;
             }
@@ -344,15 +348,15 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
                 out.push(Hit {
                     kind: Kind::Jwt,
                     bytes: span,
-                    what: "JWT",
+                    secret: "jwt",
                 });
                 return;
             }
-            if want_int && let Some(what) = internal_token(tok) {
+            if want_int && let Some(secret) = internal_token(tok) {
                 out.push(Hit {
                     kind: Kind::Internal,
                     bytes: span,
-                    what,
+                    secret,
                 });
             }
         });

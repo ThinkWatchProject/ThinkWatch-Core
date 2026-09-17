@@ -294,7 +294,7 @@ fn a_duplicate_key_is_refused_rather_than_guessed() {
     let y = "a:\n  k: 1\n  k: 2\n";
     let e = set(y, &path!["a", "k"], &Scalar::Int(9)).unwrap_err();
     assert!(matches!(e, PatchError::Duplicate(_)), "{e:?}");
-    assert!(e.to_string().contains("不止一次"), "{e}");
+    assert!(e.to_string().contains("重复出现"), "{e}");
 }
 
 #[test]

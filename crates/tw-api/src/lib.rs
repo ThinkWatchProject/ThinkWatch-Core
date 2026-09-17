@@ -3,6 +3,11 @@
 //! 它刻意不含任何 IO —— 只有类型。这样它能被 Tauri 的前端（通过
 //! ts-rs 之类的导出）、CLI、和将来的第三方同时依赖，而不会拖上一个
 //! HTTP 栈。
+//!
+//! **取值来自一个固定集合的字段发 slug，界面自己决定怎么称呼它。**
+//! 以前策略组类型、磁盘状态这些发的是中文标签，界面只能拿显示文字去做
+//! 判断，而这边改一个措辞，那边的判断就悄悄失效了。带着运行时细节的句子
+//! （错误、提示、诊断结论）仍然在这里写好，用书面语。
 
 use serde::{Deserialize, Serialize};
 
@@ -154,8 +159,9 @@ pub enum Event {
     LeakSeen {
         id: u64,
         provider: String,
-        /// 「Anthropic API key」这类人话。字段叫 `secret` 而不是 `kind`
-        /// —— 那个名字已经被枚举的 tag 占了（`probe` 那次同样的坑）
+        /// 哪种凭据：`anthropic-api-key` / `private-key` / `jwt` …（见
+        /// `tw_redact::rules::Secret`）。字段叫 `secret` 而不是 `kind` ——
+        /// 那个名字已经被枚举的 tag 占了（`probe` 那次同样的坑）
         secret: String,
         /// **已打码**。报出来的东西一律打码 —— 「发现了 sk-ant-xxx」
         /// 这句话本身就是一次泄漏
@@ -203,6 +209,8 @@ pub enum Event {
         provider: String,
         from: String,
         to: String,
+        /// 丢掉的字段，按它在请求体里的位置写：`thinking`、`top_k`、
+        /// `messages.content.thinking`、`messages.content.image.source.file` …
         dropped: Vec<String>,
         at_ms: u64,
     },
@@ -313,7 +321,7 @@ pub enum Event {
         id: u64,
         /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
         version: String,
-        /// 「界面」「命令行」「外部编辑」「回滚」
+        /// `ui` / `cli` / `external` / `rollback` / `rotation`
         origin: String,
         at_ms: u64,
     },
@@ -323,7 +331,8 @@ pub enum Event {
     /// 人看的信息 —— 托盘变黄、界面标红、定位到那一行。
     ConfigRejected {
         id: u64,
-        /// 「语法」「字段」「语义」
+        /// `syntax`（YAML 写坏了）/ `schema`（字段名或取值不对）/
+        /// `semantics`（单看每个字段都对，合起来不成立）
         stage: String,
         message: String,
         /// 1 起。语义错误没有，那时硬指一行只会误导
@@ -340,21 +349,31 @@ pub enum Event {
     LocallyAnswered {
         id: u64,
         client: String,
-        /// 「连通性检查」这类人话标签。字段叫 `probe` 而不是 `kind` ——
-        /// 那个名字已经被枚举的 tag 占了
+        /// 哪一类辅助请求，和 `ProbeView.id` 同一个词表。字段叫 `probe` 而
+        /// 不是 `kind` —— 那个名字已经被枚举的 tag 占了
         probe: String,
         at_ms: u64,
     },
 }
 
 /// 尝试链里的一跳。
+///
+/// **失败的原因要留着** —— 一条说「试过 A → B → C」的链，和一条还说清
+/// 每一跳为什么失败的链，排查价值差得远。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttemptView {
     pub provider: String,
-    /// 「成功」「429 限流」「连不上上游」这类人话。**失败的原因要留着**
-    /// —— 一条说「试过 A → B → C」的链，和一条还说清每一跳为什么失败的
-    /// 链，排查价值差得远
+    /// - `served`：这一跳接下了请求，尝试链到此为止。上游回的是 4xx 也算
+    ///   —— 请求本身有问题，换一个上游也一样被拒。
+    /// - `status`：上游返回 5xx 或 429，换下一个上游。
+    /// - `error`：没有收到响应（超时、无法连接）。
     pub outcome: String,
+    /// 上游返回的状态码。`error` 时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// `error` 时的说明
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub ms: u64,
 }
 
@@ -373,7 +392,8 @@ pub struct RoutingView {
 /// 「我们猜的」，而混在一个类型里就区分不了了。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaWindow {
-    pub label: String,
+    /// `5h` / `7d`（Anthropic）/ `weekly`（Codex）
+    pub window: String,
     pub used_percent: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_in_secs: Option<u64>,
@@ -495,10 +515,6 @@ pub struct ProxyView {
 pub struct ProbeView {
     /// `health_check` / `warmup` / `titling` / `topic_detect` / `suggestion`
     pub id: String,
-    /// 中文名
-    pub label: String,
-    /// 这一类是什么请求，一句话
-    pub what: String,
     /// `intercept` / `route` / `passthrough`
     pub mode: String,
 }
@@ -601,7 +617,7 @@ pub struct ProviderView {
 /// 一个可能是密钥的值给界面看的样子。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SecretView {
-    /// 打过码的值，或者 `环境变量 ${NAME}`
+    /// 打过码的值。带 `${NAME}` 的值原样给 —— 它写的是从哪个环境变量读
     pub display: String,
     /// 整个值恰好是一个 `${NAME}` 时的变量名。变量名不是秘密，编辑时要回填
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,9 +658,26 @@ pub enum ReferenceView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleView {
     pub name: String,
-    pub to: String,
-    /// `when` 的人话摘要。空 = 兜底
-    pub conditions: Vec<String>,
+    /// 去向：上游名或组名。拒绝的规则和只改参数的规则没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// 命中就拒绝
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deny: bool,
+    /// `when` 里写了的条件，按固定顺序。空 = 兜底
+    pub conditions: Vec<ConditionView>,
+}
+
+/// 规则里的一个条件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConditionView {
+    /// `when` 里的键：`model` / `client` / `dialect` / `input_tokens` /
+    /// `max_tokens` / `tool_count` / `intent` / `provider_would_be` /
+    /// `cache` / `tools` / `image` / `thinking` / `stream`
+    pub field: String,
+    /// 写的值。`intent` 和 `provider_would_be` 可以写多个，满足其一即可；
+    /// 布尔条件是 `true` / `false`；数量条件是比较式（`>200k`）
+    pub values: Vec<String>,
 }
 
 /// 一条路由 —— 一组规则，加上它分给了谁。
@@ -663,6 +696,8 @@ pub struct RouteView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupView {
     pub name: String,
+    /// 配置里写的 `type`：`fallback` / `select` / `load-balance` /
+    /// `url-test` / `cheapest`
     pub kind: String,
     /// 同一次会话固定走同一家。**这一项直接决定账单**
     #[serde(default)]
@@ -754,17 +789,36 @@ pub struct L1Request {
     pub provider: Option<String>,
 }
 
+/// 建连的哪一步、对着谁。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct L1Stage {
+    /// `config`（地址或代理配置用不了，没有开始建连）/ `dns` / `tcp` /
+    /// `tls` / `handshake`（代理协议的握手，含认证）
+    pub step: String,
+    /// `upstream` / `proxy`
+    pub peer: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct L1Segment {
-    pub name: String,
+    pub stage: L1Stage,
     pub ms: u64,
 }
 
+/// 没有出现在分段里的那一步，和原因。**不说的话，缺一段看起来就像 bug。**
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct L1Skip {
+    pub stage: L1Stage,
+    /// `plain_http`（`http://` 地址没有 TLS）/ `ip_address`（地址已经是 IP，
+    /// 不需要解析）/ `proxy_resolves`（`socks5h` 和 HTTP CONNECT 由代理解析域名）
+    pub reason: String,
+}
+
 /// **分段是个列表而不是固定的 DNS/TCP/TLS 三段**，因为走代理时的形状本来
-/// 就不同：多出「代理握手」，而 `socks5h` 下根本没有本地 DNS 那一段。
+/// 就不同：多出代理握手，而 `socks5h` 下根本没有本地 DNS 那一段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L1Result {
-    /// 实际测的是什么 —— 回显出来，别让用户猜点的那一下测了谁
+    /// 测的是哪个上游或代理的名字 —— 回显出来，别让用户猜点的那一下测了谁
     pub target: String,
     /// 经过哪个代理，直连是 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -772,9 +826,12 @@ pub struct L1Result {
     pub ok: bool,
     pub segments: Vec<L1Segment>,
     pub total_ms: u64,
-    /// 解释为什么某一段不在上面。**没有这句话，缺一段看起来就像 bug。**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
+    pub skipped: Vec<L1Skip>,
+    /// 失败在哪一步
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<L1Stage>,
+    /// 失败的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1294,7 +1351,7 @@ pub struct BaseVersion {
 pub struct ConfigVersion {
     pub version: String,
     pub at_ms: u64,
-    /// 「界面」「命令行」「外部编辑」「回滚」
+    /// `ui` / `cli` / `external` / `rollback` / `rotation`
     pub origin: String,
     pub bytes: u64,
     /// 这一版是现在跑着的那一版吗。
@@ -1537,8 +1594,6 @@ pub struct SpeedEstimate {
     /// 这家的计费方式：`per-token` / `subscription` / `free` / `unknown`。
     /// **订阅制那几项没有金额，但不让合计变成空**
     pub billing: String,
-    /// 给人看的那一句
-    pub note: String,
     /// 这家服务不了这个模型：`out_of_scope`（不在启用范围里）/
     /// `not_offered`（模型清单里没有）。有值时不进合计，也不会被测
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1593,7 +1648,8 @@ pub struct SpeedResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeakGroup {
     pub provider: String,
-    pub kind: String,
+    /// 哪种凭据，和 `Event::LeakSeen.secret` 同一个词表
+    pub secret: String,
     pub requests: i64,
     pub last_at_ms: i64,
     /// 涉及哪几把，**都已打码**
@@ -1603,7 +1659,10 @@ pub struct LeakGroup {
 /// 观测这一层现在能不能写。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
-    /// 「正常」/「磁盘快满了…」/「磁盘几乎满了…」
+    /// - `ok`：正常记录
+    /// - `metadata_only`：磁盘空间不足，只记请求摘要，不保存请求体和响应体
+    /// - `stopped`：磁盘空间严重不足，停止记录
+    /// - `unavailable`：请求记录没有启动（数据库打不开之类）
     pub level: String,
     /// 记了多少条
     pub rows: i64,
@@ -1616,10 +1675,10 @@ pub struct StorageStatus {
 /// 换掉了哪一类、几处。**只有类别和计数，没有原值。**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedactedItem {
-    /// `api-keys` 这类机器读的标记
+    /// 类别：`api-keys` / `private-keys` / `jwt` / `conn-strings` / `internal`
     pub kind: String,
-    /// 「Anthropic API key」这类人话
-    pub what: String,
+    /// 具体是哪种，和 `Event::LeakSeen.secret` 同一个词表
+    pub secret: String,
     pub count: u64,
 }
 
@@ -1711,7 +1770,6 @@ pub struct ReplayQuote {
     pub cost_micros: Option<i64>,
     /// 要重放到的那家的计费方式：`per-token` / `subscription` / `free` / `unknown`
     pub billing: String,
-    pub note: String,
     /// 发出去之前会不会脱敏。用户有权在按下去之前知道
     pub will_redact: bool,
     pub pricing_date: String,
@@ -1744,9 +1802,9 @@ pub struct ReplayResult {
 /// 一个上游最近是不是变了（防线三）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriftView {
-    /// `tool_calls` / `flagged` / `errors`
+    /// `flagged`（命中高危规则的响应）/ `tool_calls`（带工具调用的响应）/
+    /// `errors`（失败的请求）
     pub metric: String,
-    pub label: String,
     /// 比率，0..1
     pub recent: f64,
     pub baseline: f64,
@@ -1793,7 +1851,6 @@ pub struct ScanFinding {
     pub rule: String,
     /// `hooks` | `mcp` | `skill` | `command` | `agent` | `instructions`
     pub kind: String,
-    pub kind_label: String,
     pub client: String,
     pub path: String,
     /// 第几行，从 1 开始
@@ -1850,9 +1907,13 @@ pub struct ScanResponse {
     /// 读不动的文件。**要显示** —— 悄悄跳过会给人「查过了」的错觉
     pub unreadable: Vec<String>,
     pub scanned: usize,
-    /// 规则从哪儿来的
-    pub rules_origin: String,
-    /// 用户的规则文件有问题时的那句话
+    /// 这次生效的规则数，内置的加上用户加的
+    pub rules_active: usize,
+    /// 其中用户加的
+    pub rules_custom: usize,
+    /// 停用了几条内置规则
+    pub rules_disabled: usize,
+    /// 有规则没能生效时的说明（正则写错、停用了不存在的 id）
     pub rules_warning: Option<String>,
     /// 这次连哪些项目目录一起扫了
     pub projects: Vec<String>,
@@ -1932,32 +1993,59 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleTrace {
     pub name: String,
-    /// `matched` | `skipped` | `phase_two`
+    /// `matched` | `skipped` | `phase_two`（条件要等选定上游之后才能求值，
+    /// 静态试算给不了结论）
     pub verdict: String,
-    /// 没命中时，是哪个条件没对上
-    pub why: Option<String>,
+    /// 没命中时，第一个没对上的条件
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatch: Option<MismatchView>,
+    /// 条件本身写错了、没法求值时的说明
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 一个没对上的条件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MismatchView {
+    /// 和 `ConditionView.field` 同一个词表
+    pub field: String,
+    /// 规则里写的值。`intent` 写了多个时逐个列出
+    pub want: Vec<String>,
+    /// 这个请求实际的值。`intent` 为空表示真实的用户请求
+    pub got: String,
+}
+
+/// 一项参数改写。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetView {
+    /// `model`（换模型，整个 prompt cache 作废）/ `max_tokens` / `thinking` /
+    /// `only_at_session_start`（以上改写只在新会话开始时应用，值是 `true`）
+    pub field: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunResult {
-    /// 这个组按什么挑（`按顺序` / `选最快` / `选最便宜` …）。
+    /// 经过的组按什么排候选：`fallback` / `select` / `load-balance` /
+    /// `url-test` / `cheapest`。
     ///
     /// **不说的话，用户看不懂候选为什么是这个顺序** —— 「我明明把官方
     /// 写在第一个」。直指 provider 时是 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
-    /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了）
+    /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，
+    /// 见 `skipped`）
     pub outcome: String,
     /// 命中的规则名
     pub rule: Option<String>,
-    /// 拒绝的理由（`deny` 时）
+    /// `deny` 时规则里写的拒绝理由
     pub reason: Option<String>,
     /// 候选链，第一个是首选，后面是故障转移的备选
     pub candidates: Vec<String>,
     /// 经过了哪个组
     pub via_group: Option<String>,
-    /// 累积起来的参数改写，人话形式
-    pub set: Vec<String>,
+    /// 累积起来的参数改写
+    pub set: Vec<SetView>,
     pub trace: Vec<RuleTrace>,
     /// 这条路会不会伤到 prompt cache。**要直说 —— 它决定账单**
     pub hurts_cache: bool,
@@ -1999,17 +2087,18 @@ pub struct DetectedClient {
     /// 配置里此刻的端点。**读出来的**，不是拿我们自己的记录充数
     pub endpoint: Option<String>,
     pub shadows: Vec<String>,
-    /// `immediately` | `on_restart`
+    /// `immediately`（下一个请求就使用新配置）| `on_restart`（客户端重新
+    /// 启动后才生效，读环境变量的要重开终端）
     pub takes_effect: String,
-    pub takes_effect_note: String,
     /// 接管之后要不要在「一直没收到请求」时提示。
     ///
     /// **需要重开终端的客户端不提示** —— 用户可能一整天都没重开过，那时
     /// 弹「是不是没生效」是狼来了
     pub warns_when_silent: bool,
-    /// `measured` | `fields_only`
+    /// `measured`（在本机实际运行验证过）| `fields_only`（字段名查证过，
+    /// 没有在本机实际运行验证）
     pub verified: String,
-    pub verified_note: String,
+    /// 接管之后会失去或改变的功能
     pub costs: Vec<String>,
     /// 最后一次收到这个客户端的请求。**接管有没有真的生效，只有它能证明**
     pub last_seen_ms: Option<u64>,
@@ -2019,6 +2108,7 @@ pub struct DetectedClient {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualClient {
     pub name: String,
+    /// 手动配置的步骤，网关地址已经填在里面
     pub how: String,
     pub caveat: String,
 }
@@ -2058,8 +2148,20 @@ pub struct PlanView {
     /// 已经是这样了，什么都不用改
     pub noop: bool,
     pub carries_secret: bool,
-    /// 这次会把哪些字段改成什么，人话形式。diff 之外再给一份摘要
-    pub fields: Vec<String>,
+    /// 这次会改哪些字段。diff 之外再给一份摘要
+    pub fields: Vec<FieldChange>,
+}
+
+/// 配置文件里的一处改动。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldChange {
+    /// `set` | `remove`
+    pub op: String,
+    /// 字段路径，按层级用 `.` 连起来：`env.ANTHROPIC_BASE_URL`
+    pub path: String,
+    /// 要写入的值。写的是网关密钥或者一整段结构时不给
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2069,7 +2171,8 @@ pub struct AdoptResponse {
     pub created: bool,
     /// 不至于失败、但用户该知道的事（符号链接、权限太松……）
     pub warnings: Vec<String>,
-    pub takes_effect_note: String,
+    /// 改动什么时候生效，和 `DetectedClient.takes_effect` 同一个词表
+    pub takes_effect: String,
 }
 
 /// 一条诊断发现。

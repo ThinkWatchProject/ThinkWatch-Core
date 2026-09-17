@@ -131,7 +131,7 @@ fn a_hook_that_downloads_and_executes_is_the_highest_level() {
         .find(|f| f.rule == "curl-pipe-sh")
         .unwrap_or_else(|| panic!("{:#?}", r.findings));
     assert_eq!(f.level, Level::High);
-    assert!(f.detail.contains("不需要模型参与"), "{}", f.detail);
+    assert!(f.detail.contains("无需模型参与"), "{}", f.detail);
     // 最高级的排在最前面 —— 界面直接按这个顺序画
     assert_eq!(r.findings[0].rule, "curl-pipe-sh");
 }
@@ -189,7 +189,7 @@ fn a_skill_claiming_every_tool_is_reported_without_being_called_malicious() {
         .find(|f| f.rule == "over-broad-tools")
         .unwrap();
     assert_eq!(f.level, Level::Medium);
-    assert!(f.detail.contains("可能完全正当"), "{}", f.detail);
+    assert!(f.detail.contains("这可能是正常需要"), "{}", f.detail);
     let sk = r.skills.iter().find(|s| s.name == "万能").unwrap();
     assert_eq!(sk.allowed_tools, vec!["*".to_string()]);
 }
@@ -291,7 +291,7 @@ fn a_remote_mcp_server_is_told_apart_from_one_that_runs_a_binary() {
     assert_eq!(f.len(), 1, "只有第三方那个该报：{:#?}", r.findings);
     // **级别是提示，不是高危。**它多半是用户自己有意加的
     assert_eq!(f[0].level, Level::Low);
-    assert!(f[0].detail.contains("会发到那台服务器"), "{}", f[0].detail);
+    assert!(f[0].detail.contains("会发送到该服务器"), "{}", f[0].detail);
 }
 
 #[test]

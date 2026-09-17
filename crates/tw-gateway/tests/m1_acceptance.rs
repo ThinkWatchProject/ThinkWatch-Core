@@ -353,5 +353,5 @@ async fn a_single_model_lookup_obeys_the_same_allow_list_as_the_list() {
     let r = get("/v1/models/claude-opus-4".into()).await;
     assert_ne!(r.status(), 200, "**限制了的模型单点还是查得到**");
     let body = r.text().await.unwrap();
-    assert!(body.contains("没有叫"), "{body}");
+    assert!(body.contains("不存在模型"), "{body}");
 }

@@ -22,18 +22,18 @@ use tw_yaml::{Put, Step};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
-    #[error("已经有叫「{name}」的{what}了")]
+    #[error("已存在名为「{name}」的{what}")]
     NameTaken { what: &'static str, name: String },
-    #[error("没有叫「{name}」的{what}")]
+    #[error("未找到名为「{name}」的{what}")]
     NotFound { what: &'static str, name: String },
     #[error("{0}")]
     Yaml(#[from] tw_yaml::PatchError),
-    #[error("配置文件读不通：{0}")]
+    #[error("配置文件无法解析：{0}")]
     Parse(String),
     /// 渲染不出一个能安全写进去的值。
     #[error("{0}")]
     Unwritable(String),
-    #[error("写完之后读回来和预期不一样：{0}。没有写盘。")]
+    #[error("修改后的内容与预期不一致（{0}），未写入文件")]
     SelfCheck(String),
 }
 
@@ -99,7 +99,7 @@ pub fn upsert(
     let name = item
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| EditError::Unwritable(format!("{}没有名字", section.what)))?
+        .ok_or_else(|| EditError::Unwritable(format!("{}缺少名称", section.what)))?
         .to_string();
     let taken = section.index_of(&doc, &name);
     let steps = section.steps();
@@ -238,7 +238,7 @@ fn render_block(v: &Value) -> Result<String, EditError> {
 fn reject_multiline(v: &Value) -> Result<(), EditError> {
     match v {
         Value::String(s) if s.contains('\n') || s.contains('\r') => {
-            Err(EditError::Unwritable("值里不能有换行".to_string()))
+            Err(EditError::Unwritable("值中不能包含换行".to_string()))
         }
         Value::Mapping(m) => m.iter().try_for_each(|(k, v)| {
             reject_multiline(k)?;

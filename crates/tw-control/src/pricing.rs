@@ -88,7 +88,7 @@ fn read_saved(path: &Path) -> Option<tw_pricing::Table> {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            tracing::warn!("{} 读不了，按内置价目表计价：{e}", path.display());
+            tracing::warn!("无法读取 {}，改用内置价目表计价：{e}", path.display());
             return None;
         }
     };
@@ -97,7 +97,7 @@ fn read_saved(path: &Path) -> Option<tw_pricing::Table> {
     match tw_pricing::Table::fetched(&raw, local_date(saved_at)) {
         Ok(t) => Some(t),
         Err(e) => {
-            tracing::warn!("{} 读不通，按内置价目表计价：{e}", path.display());
+            tracing::warn!("无法解析 {}，改用内置价目表计价：{e}", path.display());
             None
         }
     }
@@ -167,7 +167,7 @@ struct Attempt {
 pub enum RefreshError {
     #[error("{0}")]
     Fetch(String),
-    #[error("下载到的内容不是价格数据集：{0}")]
+    #[error("下载的内容不是价格数据集：{0}")]
     Dataset(String),
     #[error("价目表无法保存：{0}")]
     Save(String),
@@ -237,7 +237,7 @@ pub fn spawn(s: ControlState) {
                 && u.due(s.config_path(), SystemTime::now())
                 && let Err(e) = refresh(&s).await
             {
-                tracing::info!("默认价目表刷新失败，稍后重试：{e}");
+                tracing::info!("默认价目表更新失败，稍后重试：{e}");
             }
             u.pause(u.schedule.tick).await;
         }
@@ -271,7 +271,7 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshErro
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
-        .map_err(|e| RefreshError::Fetch(format!("连接价格数据源失败：{}", chain(&e))))?;
+        .map_err(|e| RefreshError::Fetch(format!("无法连接价格数据源：{}", chain(&e))))?;
     if !resp.status().is_success() {
         return Err(RefreshError::Fetch(format!(
             "价格数据源返回 HTTP {}",
@@ -286,7 +286,7 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshErro
     {
         if raw.len() + chunk.len() > MAX_DATASET {
             return Err(RefreshError::Dataset(format!(
-                "大小超过 {} MB",
+                "文件大小超过 {} MB",
                 MAX_DATASET / 1024 / 1024
             )));
         }
@@ -333,7 +333,7 @@ async fn pricing_status(s: &ControlState) -> tw_api::PricingStatus {
     // **拿不到存储就是 0** —— 观测层起不来时网关照常转发，这一页也该照常打开
     let (unpriced_recent, unpriced_models) = match &s.store {
         Some(st) => st.lock().await.db().unpriced_recent(7).unwrap_or_else(|e| {
-            tracing::debug!("无法计价的请求统计取不到：{e}");
+            tracing::debug!("未能获取无法计价请求的统计：{e}");
             (0, Vec::new())
         }),
         None => (0, Vec::new()),
@@ -407,7 +407,7 @@ async fn query(
             if loaded.config().sheet(&name).is_none() {
                 return Err(fail(
                     StatusCode::NOT_FOUND,
-                    format!("没有叫「{name}」的价目表"),
+                    format!("未找到名为「{name}」的价目表"),
                 ));
             }
             (loaded, Some(name))
@@ -485,10 +485,12 @@ async fn sheet(
     UrlPath(name): UrlPath<String>,
 ) -> Result<Json<tw_api::PriceSheetInput>, Fail> {
     let cfg = s.config();
-    let def = cfg
-        .pricing
-        .sheet(&name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的价目表")))?;
+    let def = cfg.pricing.sheet(&name).ok_or_else(|| {
+        fail(
+            StatusCode::NOT_FOUND,
+            format!("未找到名为「{name}」的价目表"),
+        )
+    })?;
     Ok(Json(tw_api::PriceSheetInput {
         name: def.name.clone(),
         multiplier: def.multiplier,
@@ -555,7 +557,7 @@ async fn delete_sheet(
             let users = refs::sheet_users(cfg, &name);
             if !users.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "价目表「{name}」仍被上游{}使用，解除后才能删除",
+                    "价目表「{name}」仍被上游{}使用，请先解除关联再删除",
                     quoted(&users)
                 )));
             }

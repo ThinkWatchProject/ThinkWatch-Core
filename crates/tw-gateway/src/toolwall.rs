@@ -99,7 +99,7 @@ fn complete_tool_calls(v: &Value) -> Vec<(String, String)> {
         let name = v
             .get("name")
             .and_then(|x| x.as_str())
-            .unwrap_or("(没名字)")
+            .unwrap_or("（未命名）")
             .to_string();
         out.push((name, input.to_string()));
     }
@@ -200,7 +200,7 @@ impl Wall {
                 let name = cb
                     .get("name")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("(没名字)")
+                    .unwrap_or("（未命名）")
                     .to_string();
                 self.blocks.insert(index, (name, String::new()));
                 self.tool_calls += 1;
@@ -275,7 +275,7 @@ impl Wall {
             self.fired.push(r.id.clone());
             out.push(Verdict {
                 rule: r.id.clone(),
-                why: format!("{}。这段文字会进入下一轮的上下文。", r.why),
+                why: format!("{}。这段文字会进入下一轮对话的上下文", r.why),
                 high: false,
                 tool: "（响应正文）".into(),
                 excerpt: excerpt(m.as_str()),

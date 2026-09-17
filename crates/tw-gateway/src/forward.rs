@@ -164,7 +164,7 @@ pub fn apply_set(body: &Bytes, set: &tw_engine::SetAction) -> Bytes {
         Ok(b) => Bytes::from(b),
         // 序列化不该失败，但真失败了宁可发原文也不要发半个 body
         Err(e) => {
-            tracing::error!("改写后的请求体序列化失败，发原文：{e}");
+            tracing::error!("改写后的请求体序列化失败，改为发送原始请求体：{e}");
             body.clone()
         }
     }
@@ -173,10 +173,10 @@ pub fn apply_set(body: &Bytes, set: &tw_engine::SetAction) -> Bytes {
 pub fn map_reqwest_error(e: reqwest::Error) -> GatewayError {
     // 分类要能让人看出该去哪儿修。
     if e.is_timeout() {
-        GatewayError::upstream("上游超时")
+        GatewayError::upstream("上游响应超时")
     } else if e.is_connect() {
         GatewayError::upstream(format!(
-            "连不上上游。检查 base_url 和网络，如果配了代理也检查代理：{}",
+            "无法连接上游，请检查接口地址、网络和代理设置：{}",
             tw_secret::redact_url(e.url().map(|u| u.as_str()).unwrap_or(""))
         ))
     } else {
@@ -188,7 +188,7 @@ pub fn map_reqwest_error(e: reqwest::Error) -> GatewayError {
 pub fn check_body_size(body: &Bytes, max: usize) -> Result<(), GatewayError> {
     if body.len() > max {
         return Err(GatewayError::request(format!(
-            "请求体 {} 字节，超过上限 {} 字节",
+            "请求体大小为 {} 字节，超过上限 {} 字节",
             body.len(),
             max
         )));

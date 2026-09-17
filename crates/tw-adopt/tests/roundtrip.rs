@@ -163,7 +163,7 @@ fn losing_the_backup_removes_our_key_and_says_so_out_loud() {
 
     let r = plan_restore(&c, &b.home).unwrap();
     assert!(
-        r.notes.iter().any(|n| n.contains("你需要自己重新填一次")),
+        r.notes.iter().any(|n| n.contains("需要手动重新填写")),
         "没说清密钥拿不回来了：{:?}",
         r.notes
     );
@@ -268,8 +268,8 @@ fn codex_gets_a_sentinel_comment_because_toml_can_hold_one() {
     apply(&c, &p, &b.backups).unwrap();
     let after = read(&b.home.join(".codex/config.toml"));
     assert!(after.contains(tw_adopt::sentinel::BEGIN), "{after}");
-    assert!(after.contains("要手动还原"), "{after}");
-    assert!(after.contains("原本没有 model_provider"), "{after}");
+    assert!(after.contains("手动还原方法"), "{after}");
+    assert!(after.contains("原配置中没有 model_provider"), "{after}");
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn a_restore_without_a_record_refuses_instead_of_guessing() {
     let b = bed("codex", CODEX);
     let c = client("codex");
     let e = plan_restore(&c, &b.home).unwrap_err();
-    assert!(e.to_string().contains("没有找到"), "{e}");
+    assert!(e.to_string().contains("未找到"), "{e}");
     assert_eq!(read(&b.home.join(".codex/config.toml")), CODEX);
 }
 
@@ -485,7 +485,7 @@ fn re_adopting_codex_also_keeps_the_first_record() {
     }
     let after = read(&b.home.join(".codex/config.toml"));
     assert!(
-        after.contains("原本没有 model_provider"),
+        after.contains("原配置中没有 model_provider"),
         "哨兵注释记成了我们自己的值：{after}"
     );
     let r = plan_restore(&c, &b.home).unwrap();

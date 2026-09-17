@@ -25,23 +25,23 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ForeignError {
-    #[error("读不了 {path}：{source}")]
+    #[error("无法读取 {path}：{source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("写不了 {path}：{source}")]
+    #[error("无法写入 {path}：{source}")]
     Write {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} 在你确认之后又被改过了 —— 没有写入，请重新看一遍改动")]
+    #[error("{path} 在确认之后又被修改，未写入。请重新查看改动")]
     ChangedUnderUs { path: PathBuf },
-    #[error("改完之后的内容自己校验不过，已经放弃写入（{0}）")]
+    #[error("修改后的内容未通过校验，未写入（{0}）")]
     VerifyFailed(String),
-    #[error("写完读回来和预期不一致，已经从备份还原：{path}")]
+    #[error("写入后读回的内容与预期不一致，已从备份还原：{path}")]
     Readback { path: PathBuf },
-    #[error("符号链接绕了太多层：{path}")]
+    #[error("符号链接层级过多：{path}")]
     LinkLoop { path: PathBuf },
 }
 
@@ -240,7 +240,7 @@ pub fn apply(
         // 的是 ~/dotfiles/claude/settings.json —— 那是个会被 git 提交
         // 的地方，而我们正要往里放一个密钥。
         warnings.push(format!(
-            "{} 是一个符号链接，实际写入的是 {}。",
+            "{} 是符号链接，实际写入的文件为 {}。",
             ch.path.display(),
             real.display()
         ));
@@ -277,7 +277,7 @@ pub fn apply(
         && m & 0o077 != 0
     {
         warnings.push(format!(
-            "{} 的权限是 {:o}，同机器上的其他用户能读到刚写进去的密钥。要收紧的话：chmod 600 {}",
+            "{} 的权限为 {:o}，本机其他用户可以读取写入的密钥。可执行 chmod 600 {} 收紧权限。",
             real.display(),
             m,
             real.display()

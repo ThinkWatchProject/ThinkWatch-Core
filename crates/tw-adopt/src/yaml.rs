@@ -16,7 +16,7 @@ use tw_yaml::{PatchError, Scalar, Step};
 pub enum YErr {
     #[error("{0}")]
     Patch(#[from] PatchError),
-    #[error("只支持顶层的扁平字段，`{0}` 是嵌套的")]
+    #[error("仅支持顶层字段，{0} 是嵌套字段")]
     TooDeep(String),
 }
 

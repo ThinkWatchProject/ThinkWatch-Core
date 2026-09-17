@@ -89,7 +89,7 @@ impl Blobs {
                 true
             }
             Err(e) => {
-                tracing::debug!(path = %p.display(), "body 写不下：{e}");
+                tracing::debug!(path = %p.display(), "请求体写入失败：{e}");
                 false
             }
         }

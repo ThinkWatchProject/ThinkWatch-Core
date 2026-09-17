@@ -40,7 +40,10 @@ pub use bodies::{BodyKind, BodyRecord, BodySender};
 pub use clientprobe::{ProbeKind, classify};
 pub use error::GatewayError;
 pub use health::Health;
-pub use l1::{L1Result, ProxyHop, Segment, hop_of, l1, l1_proxy, proxy_target};
+pub use l1::{
+    L1Result, Peer, ProxyHop, Segment, Skip, SkipReason, Stage, Step, hop_of, l1, l1_proxy,
+    proxy_target,
+};
 pub use l3::{Estimate, L3Result};
 pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};

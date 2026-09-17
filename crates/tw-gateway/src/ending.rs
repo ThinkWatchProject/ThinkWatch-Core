@@ -30,7 +30,7 @@ use crate::usage::{Sniffer, Usage};
 /// **到目前为止对响应知道的一切都在它身上**：状态码、收到多少字节、嗅到
 /// 多少用量、攒下的响应体。放在一处是因为结局要用的正是这些 —— 不管这个
 /// 结局是显式报的，还是在 Drop 里报的。
-#[must_use = "丢掉它就等于报告客户端已经走了"]
+#[must_use = "丢弃它等同于报告客户端已断开"]
 pub struct Ending {
     bus: tw_observe::EventBus,
     id: u64,
@@ -169,7 +169,7 @@ impl Drop for Ending {
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
                 source: "internal".to_string(),
-                message: "请求中断：网关内部出错".to_string(),
+                message: "请求中断：网关内部错误".to_string(),
                 bytes: self.received(),
                 duration_ms: Some(self.duration_ms()),
                 usage,

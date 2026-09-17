@@ -39,11 +39,23 @@ pub enum Origin {
 }
 
 impl Origin {
-    fn slug(&self) -> &'static str {
+    /// 历史文件名里的那一段。**文件名是存盘格式**，和控制面发的 `slug()`
+    /// 分开：外部编辑在文件名里一直叫 `ext`，改掉它就读不懂已有的历史。
+    fn file_tag(&self) -> &'static str {
         match self {
             Origin::Ui => "ui",
             Origin::Cli => "cli",
             Origin::External => "ext",
+            Origin::Rollback => "rollback",
+            Origin::Rotation => "rotation",
+        }
+    }
+    /// 控制面发给界面的值。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Origin::Ui => "ui",
+            Origin::Cli => "cli",
+            Origin::External => "external",
             Origin::Rollback => "rollback",
             Origin::Rotation => "rotation",
         }
@@ -143,7 +155,7 @@ pub fn snapshot(
     // 名字里带上时间、来源和版本号 —— 光看文件名就能读懂这一版是什么。
     let file = dir.join(format!(
         "{at_ms}-{}-{}.yaml",
-        origin.slug(),
+        origin.file_tag(),
         &version["blake3:".len()..]
     ));
     store::write_atomic(&file, text)?;
@@ -219,7 +231,7 @@ pub fn read(v: &Version) -> Result<String, StoreError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackError {
-    #[error("历史里没有 {0} 这一版")]
+    #[error("版本历史中没有 {0}")]
     NoSuchVersion(String),
     #[error(transparent)]
     Store(#[from] StoreError),

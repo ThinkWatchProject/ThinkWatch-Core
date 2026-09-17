@@ -16,7 +16,7 @@ use crate::json::Val;
 pub enum TErr {
     #[error("不是合法的 TOML：{0}")]
     Syntax(String),
-    #[error("`{0}` 不是一张表，没法往里写字段")]
+    #[error("{0} 不是表，无法写入字段")]
     NotTable(String),
 }
 
@@ -147,7 +147,7 @@ pub fn set(text: &str, path: &[&str], v: &Val) -> Result<String, TErr> {
         let next = item
             .as_table_like_mut()
             .and_then(|t| t.get_mut(k))
-            .expect("刚插进去的");
+            .expect("刚插入的表");
         if next.as_table_like().is_none() {
             return Err(TErr::NotTable(parents[..=i].join(".")));
         }

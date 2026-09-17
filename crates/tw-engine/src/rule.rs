@@ -195,7 +195,7 @@ impl When {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum MatchError {
-    #[error("条件 `{field}` 写错了：{source}")]
+    #[error("条件 {field} 的写法有误：{source}")]
     BadCompare {
         field: &'static str,
         source: crate::num::ParseError,

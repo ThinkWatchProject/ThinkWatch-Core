@@ -44,7 +44,7 @@ impl Latency {
 
     /// 记一次。**转发路径上调，所以必须便宜**：一次哈希加一次 push。
     pub fn record(&self, provider: &str, ttfb_ms: u32) {
-        let mut g = self.inner.lock().expect("锁没毒");
+        let mut g = self.inner.lock().expect("锁未中毒");
         let w = g.entry(provider.to_string()).or_default();
         if w.len() == WINDOW {
             w.pop_front();
@@ -57,7 +57,7 @@ impl Latency {
     /// **只在完全没有真实样本时垫**。真实流量一到就该由它说了算 ——
     /// L1 量的是建连，不含上游排队和推理，天生偏乐观。
     pub fn seed(&self, provider: &str, ttfb_ms: u32) {
-        let mut g = self.inner.lock().expect("锁没毒");
+        let mut g = self.inner.lock().expect("锁未中毒");
         let w = g.entry(provider.to_string()).or_default();
         if w.is_empty() {
             // 垫满 `MIN_SAMPLES` 才算数 —— 否则它自己也是「样本不够」
@@ -69,7 +69,7 @@ impl Latency {
 
     /// 这家的典型 TTFB。`None` = 样本不够，**不是「很快」**。
     pub fn typical(&self, provider: &str) -> Option<u32> {
-        let g = self.inner.lock().expect("锁没毒");
+        let g = self.inner.lock().expect("锁未中毒");
         let w = g.get(provider)?;
         if w.len() < MIN_SAMPLES {
             return None;
@@ -81,7 +81,7 @@ impl Latency {
 
     /// 一次取一批 —— 排序时要用到，逐个取会连着锁好几次。
     pub fn snapshot(&self, names: &[String]) -> HashMap<String, u32> {
-        let g = self.inner.lock().expect("锁没毒");
+        let g = self.inner.lock().expect("锁未中毒");
         let mut out = HashMap::new();
         for n in names {
             if let Some(w) = g.get(n)

@@ -24,6 +24,10 @@ use serde_json::{Map, Value, json};
 pub struct Converted {
     pub body: Value,
     /// 转不过去、只能丢掉的东西。**必须交出去给用户看**
+    ///
+    /// 写的是它在请求体里的位置（`thinking`、`top_k`、
+    /// `messages.content.thinking`），不是一句解释 —— 「目标协议没有这个
+    /// 字段」对每一项都成立，由界面说一次就够了。
     pub dropped: Vec<String>,
 }
 
@@ -70,18 +74,21 @@ fn content_part(block: &Value, dropped: &mut Vec<String>) -> Option<Value> {
                     "image_url": { "url": src.get("url").and_then(|u| u.as_str()).unwrap_or_default() },
                 })),
                 other => {
-                    dropped.push(format!("一个 image 块的 source 类型是 {other:?}，转不过去"));
+                    dropped.push(format!(
+                        "messages.content.image.source.{}",
+                        other.unwrap_or("unknown")
+                    ));
                     None
                 }
             }
         }
         // 扩展思考在 OpenAI chat 里没有对应物
-        Some("thinking") | Some("redacted_thinking") => {
-            dropped.push("消息里的 thinking 块（OpenAI chat 方言没有它）".into());
+        Some(t @ ("thinking" | "redacted_thinking")) => {
+            dropped.push(format!("messages.content.{t}"));
             None
         }
         Some(other) => {
-            dropped.push(format!("不认识的 content 块类型 `{other}`"));
+            dropped.push(format!("messages.content.{other}"));
             None
         }
         None => None,
@@ -244,11 +251,11 @@ pub fn to_openai(v: &Value) -> Converted {
         out.insert("stream_options".into(), json!({ "include_usage": true }));
     }
     if v.get("thinking").is_some_and(|t| !t.is_null()) {
-        dropped.push("thinking（扩展思考）：OpenAI chat 方言没有对应字段".into());
+        dropped.push("thinking".into());
     }
     for k in ["top_k", "metadata"] {
         if v.get(k).is_some() {
-            dropped.push(format!("{k}：OpenAI chat 方言没有对应字段"));
+            dropped.push(k.to_string());
         }
     }
     Converted {
@@ -357,17 +364,7 @@ mod tests {
         let c = conv(
             r#"{"model":"m","messages":[],"thinking":{"type":"enabled","budget_tokens":1024},"top_k":40}"#,
         );
-        assert_eq!(c.dropped.len(), 2, "{:?}", c.dropped);
-        assert!(
-            c.dropped.iter().any(|d| d.contains("thinking")),
-            "{:?}",
-            c.dropped
-        );
-        assert!(
-            c.dropped.iter().any(|d| d.contains("top_k")),
-            "{:?}",
-            c.dropped
-        );
+        assert_eq!(c.dropped, ["thinking", "top_k"]);
         // 而且请求本身不该带上它们
         assert!(c.body.get("thinking").is_none());
         assert!(c.body.get("top_k").is_none());

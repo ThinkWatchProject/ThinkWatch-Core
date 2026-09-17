@@ -236,7 +236,7 @@ pub fn replay(f: &Fixture) -> Vec<String> {
         ($field:ident, $label:expr) => {
             if got.$field != f.expect.$field {
                 diffs.push(format!(
-                    "{}：录的是 {:?}，现在是 {:?}",
+                    "{}：录制时为 {:?}，当前为 {:?}",
                     $label, f.expect.$field, got.$field
                 ));
             }
@@ -250,7 +250,7 @@ pub fn replay(f: &Fixture) -> Vec<String> {
     cmp!(image, "带图片");
     cmp!(thinking, "扩展思考");
     cmp!(stream, "流式");
-    cmp!(usage, "usage 四维");
+    cmp!(usage, "用量四项");
     cmp!(stop_reason, "stop_reason");
     cmp!(tool_calls, "工具调用");
     cmp!(error_kind, "错误分类");
@@ -328,11 +328,11 @@ mod tests {
             .replace("\"usage\":{\"output_tokens\":30}", "\"usage\":{}");
         let d = replay(&f);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert!(d[0].contains("usage 四维"), "{d:?}");
+        assert!(d[0].contains("用量四项"), "{d:?}");
         // **差异要说清「录的是什么、现在是什么」** —— 只说「不一致」
         // 的话，看的人还得自己去翻
         assert!(
-            d[0].contains("录的是") && d[0].contains("现在是"),
+            d[0].contains("录制时为") && d[0].contains("当前为"),
             "{}",
             d[0]
         );

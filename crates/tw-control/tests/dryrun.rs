@@ -111,16 +111,20 @@ async fn every_rule_that_did_not_match_says_what_it_wanted() {
         .find(|t| t.name == "带缓存的必须走官方")
         .unwrap();
     assert_eq!(cache_rule.verdict, "skipped");
-    let why = cache_rule.why.as_deref().unwrap();
-    assert!(why.contains("cache"), "{why}");
-    assert!(
-        why.contains("true") && why.contains("false"),
-        "要说清要什么、实际是什么：{why}"
+    // 要说清要什么、实际是什么
+    assert_eq!(
+        cache_rule.mismatch,
+        Some(tw_api::MismatchView {
+            field: "cache".into(),
+            want: vec!["true".into()],
+            got: "false".into(),
+        })
     );
 
     let long = r.trace.iter().find(|t| t.name == "超长上下文降级").unwrap();
-    assert!(
-        long.why.as_deref().unwrap().contains("input_tokens"),
+    assert_eq!(
+        long.mismatch.as_ref().map(|m| m.field.as_str()),
+        Some("input_tokens"),
         "{long:?}"
     );
 }
@@ -153,14 +157,12 @@ async fn a_set_only_rule_still_shows_up_as_matched_and_says_what_it_changes() {
         "{:?}",
         r.trace
     );
+    // 换模型会作废整个缓存，而那在长会话里可能比不换还贵 —— 所以它单独
+    // 是一项，界面才能在这一项旁边说出来
     assert!(
-        r.set.iter().any(|s| s.contains("claude-haiku-4-5")),
-        "{:?}",
         r.set
-    );
-    // 换模型会作废整个缓存，而那在长会话里可能比不换还贵
-    assert!(
-        r.set.iter().any(|s| s.contains("prompt cache")),
+            .iter()
+            .any(|s| s.field == "model" && s.value == "claude-haiku-4-5"),
         "{:?}",
         r.set
     );

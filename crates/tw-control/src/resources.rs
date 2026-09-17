@@ -96,7 +96,7 @@ async fn delete_provider(
             let used = refs::provider_refs(cfg, &name);
             if !used.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "上游「{name}」仍被{}引用，解除引用后才能删除",
+                    "上游「{name}」仍被{}引用，请先解除引用再删除",
                     describe(&used)
                 )));
             }
@@ -154,7 +154,7 @@ async fn test_provider(
             cfg.providers
                 .iter()
                 .find(|p| p.name == n)
-                .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{n}」的上游")))?,
+                .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))?,
         ),
         None => None,
     };
@@ -183,7 +183,7 @@ async fn test_provider(
                 Some(a) => Some(a.to_string()),
                 None => {
                     return Ok(Json(failed(
-                        "OAuth 凭据需要保存后才能检测。要现在检测，请同时填写 access token。"
+                        "OAuth 凭据需要保存后才能检测。如需立即检测，请同时填写 access token"
                             .to_string(),
                     )));
                 }
@@ -223,7 +223,7 @@ async fn provider_models(
         .providers
         .iter()
         .find(|p| p.name == name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的上游")))?;
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{name}」的上游")))?;
     Ok(Json(models_view(&s, p, s.gateway.models.listing(p))))
 }
 
@@ -234,13 +234,13 @@ async fn refresh_models(
 ) -> Result<Json<tw_api::ProviderModelsView>, Fail> {
     let listing = tw_gateway::models::refresh_one(&s.gateway, &name)
         .await
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的上游")))?;
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{name}」的上游")))?;
     let cfg = s.config();
     let p = cfg
         .providers
         .iter()
         .find(|p| p.name == name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{name}」的上游")))?;
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{name}」的上游")))?;
     Ok(Json(models_view(&s, p, listing)))
 }
 
@@ -292,7 +292,7 @@ fn to_provider(
         (tw_api::SecretChange::Set { value }, _) => {
             let v = value.trim();
             if v.is_empty() {
-                return Err("密钥不能为空".to_string());
+                return Err("API 密钥不能为空".to_string());
             }
             Some(tw_config::Secret::new(v))
         }
@@ -449,7 +449,7 @@ async fn delete_proxy(
             let users = refs::proxy_users(cfg, &name);
             if !users.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "代理「{name}」仍被上游{}使用，解除后才能删除",
+                    "代理「{name}」仍被上游{}使用，请先解除关联再删除",
                     quoted(&users)
                 )));
             }
@@ -471,7 +471,7 @@ async fn test_proxy(
             cfg.proxies
                 .iter()
                 .find(|p| p.name == n)
-                .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("没有叫「{n}」的代理")))?,
+                .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{n}」的代理")))?,
         ),
         None => None,
     };
@@ -480,7 +480,7 @@ async fn test_proxy(
     // 握手的目标：正在编辑的那个代理原来服务的上游
     let (host, port) = tw_gateway::proxy_target(&cfg, req.current.as_deref().unwrap_or(&px.name));
     let r = tw_gateway::l1_proxy(&hop, &host, port).await;
-    Ok(Json(crate::l1_view(format!("代理 {}", px.name), None, r)))
+    Ok(Json(crate::l1_view(px.name.clone(), None, r)))
 }
 
 fn to_proxy(
@@ -489,14 +489,14 @@ fn to_proxy(
 ) -> Result<tw_config::Proxy, String> {
     let name = checked_name(&input.name, "代理")?;
     if matches!(name.as_str(), tw_config::DIRECT | tw_config::SYSTEM) {
-        return Err(format!("「{name}」是内置选项的名字，请换一个"));
+        return Err(format!("「{name}」是内置选项的名称，请使用其他名称"));
     }
     let addr = input.addr.trim().to_string();
     let port_ok = addr
         .rsplit_once(':')
         .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0));
     if !port_ok {
-        return Err(format!("代理地址「{addr}」要写成 主机:端口"));
+        return Err(format!("代理地址「{addr}」应写成 主机:端口 的形式"));
     }
     let auth = match &input.auth {
         // 没动认证：沿用原来那一份，**原值不经过界面**
@@ -509,7 +509,7 @@ fn to_proxy(
             }
             // `${` 在配置里表示「从环境变量读」
             if pass.contains("${") {
-                return Err("密码里不能出现 `${`".to_string());
+                return Err("密码中不能包含 ${".to_string());
             }
             Some(tw_config::proxy::ProxyAuth {
                 user: user.to_string(),
@@ -532,7 +532,7 @@ pub(crate) fn checked_name(raw: &str, what: &str) -> Result<String, String> {
         return Err(format!("{what}名称不能为空"));
     }
     if raw.trim() != raw {
-        return Err(format!("{what}名称首尾不能有空白"));
+        return Err(format!("{what}名称首尾不能包含空白"));
     }
     Ok(raw.to_string())
 }
@@ -540,13 +540,13 @@ pub(crate) fn checked_name(raw: &str, what: &str) -> Result<String, String> {
 /// 界面上的一个选项值 → 配置里的枚举。**和 YAML 里写的词是同一套**。
 fn slug<T: serde::de::DeserializeOwned>(what: &str, v: &str) -> Result<T, String> {
     serde_yaml_ng::from_value(Value::String(v.to_string()))
-        .map_err(|_| format!("{what}「{v}」不认识"))
+        .map_err(|_| format!("{what}「{v}」不受支持"))
 }
 
 pub(crate) fn mapping<T: serde::Serialize>(v: &T) -> Result<serde_yaml_ng::Mapping, ApplyError> {
     match serde_yaml_ng::to_value(v) {
         Ok(Value::Mapping(m)) => Ok(m),
-        Ok(_) => Err(invalid("写不成一个映射".to_string())),
+        Ok(_) => Err(invalid("无法序列化为映射".to_string())),
         Err(e) => Err(invalid(e.to_string())),
     }
 }

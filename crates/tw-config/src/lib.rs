@@ -309,8 +309,8 @@ impl<'de> Deserialize<'de> for Bind {
                 // 手写配置文件的人什么都没说，而这个字段写错的后果是
                 // 整份配置加载失败、网关起不来。
                 serde::de::Error::custom(format!(
-                    "`bind` 只能是 `loopback`、`all`，或者一张网卡的 IP（比如 192.168.1.5）。\
-                     收到的是 `{other}`"
+                    "bind 只能是 loopback、all 或某个网卡的 IP 地址（例如 192.168.1.5），\
+                     当前值为 {other}"
                 ))
             }),
         }
@@ -524,8 +524,8 @@ impl Trust {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Trust::Official => "官方",
-            Trust::Untrusted => "不受信任",
+            Trust::Official => "官方端点",
+            Trust::Untrusted => "非官方端点",
         }
     }
     /// 命中高危时要不要真的切断。
@@ -560,10 +560,10 @@ pub enum Billing {
 impl Billing {
     pub fn label(&self) -> &'static str {
         match self {
-            Billing::PerToken => "按量",
-            Billing::Subscription => "订阅",
+            Billing::PerToken => "按量计费",
+            Billing::Subscription => "订阅制",
             Billing::Free => "不计费",
-            Billing::Unknown => "未知",
+            Billing::Unknown => "计费方式未知",
         }
     }
     pub fn slug(&self) -> &'static str {
@@ -758,7 +758,7 @@ pub fn patch_oauth_refresh(
     if !ok {
         return Err(RotateError::Broke {
             provider: provider.to_string(),
-            why: "补丁写完之后读回来，那个字段不是新值".into(),
+            why: "写入后读回的 refresh token 不是新值".into(),
         });
     }
     Ok(out)
@@ -772,23 +772,23 @@ fn provider_index(text: &str, provider: &str) -> Option<usize> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RotateError {
-    #[error("配置里没有叫 `{provider}` 的上游了")]
+    #[error("配置中已不存在上游「{provider}」")]
     NoProvider { provider: String },
     /// **说清「形状不对」而不是「写失败」。**用户可能把凭据写成了
     /// 别的形状（锚点、块标量），那时正确的动作是他自己去改，
     /// 而不是让我们猜。
-    #[error("`{provider}` 的 oauth.refresh 不在预期的位置上：{source}")]
+    #[error("无法定位上游「{provider}」的 oauth.refresh：{source}")]
     Shape {
         provider: String,
         source: tw_yaml::PatchError,
     },
-    #[error("给 `{provider}` 打完补丁之后配置读不回来了，没有写盘：{why}")]
+    #[error("写入上游「{provider}」的新凭据后配置无法读取，未写入文件：{why}")]
     Broke { provider: String, why: String },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("读 {path} 失败：{source}")]
+    #[error("无法读取 {path}：{source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -797,7 +797,7 @@ pub enum LoadError {
     /// 一份语法完美、只是把 `port` 写成 `prot` 的文件也会到这儿，而那句
     /// 话会让用户去找一个根本不存在的语法错误。serde 自己的
     /// 「unknown field `prot`, expected one of ...」比我们能补的任何话都准。
-    #[error("{path} 读不通：{source}")]
+    #[error("无法解析 {path}：{source}")]
     Parse {
         path: PathBuf,
         source: serde_yaml_ng::Error,
@@ -822,7 +822,7 @@ pub fn load(path: &Path) -> Result<Config, LoadError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
-    #[error("写 {path} 失败：{source}")]
+    #[error("无法写入 {path}：{source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
