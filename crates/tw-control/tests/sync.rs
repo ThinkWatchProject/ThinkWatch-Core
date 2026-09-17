@@ -101,11 +101,14 @@ async fn a_broken_file_keeps_the_old_config_serving_and_says_where() {
             stage,
             line,
             message,
+            origin,
             ..
         } => {
             assert_eq!(stage, "schema");
             assert_eq!(line, Some(4), "得指到那一行");
             assert!(message.contains("kye"), "{message}");
+            // **谁写的也要说**：编辑器里写错了要提醒，界面自己写坏了那条路自己会报
+            assert_eq!(origin, "external");
         }
         other => panic!("{other:?}"),
     }

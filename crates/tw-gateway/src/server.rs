@@ -265,9 +265,33 @@ pub struct AppState {
     expired_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// 已经报过「用完」的额度窗口：(上游, 窗口)。**窗口恢复之后清掉**，再用完会重新报
     exhausted: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    /// 凭据正被上游拒绝的那几家。**进入和恢复各报一次**
+    rejected: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 每个代理最近一次检查的结果。见 [`AppState::check_proxy`]
+    proxies: Arc<std::sync::Mutex<std::collections::HashMap<String, ProxyState>>>,
     /// 正在服务中的请求数。见 [`crate::live`]。
     pub live: crate::live::Live,
 }
+
+/// 这个出站设置是配置里定义的代理吗。`direct` 和 `system` 不是：
+/// 前者没有代理，后者的地址在 reqwest 建连时才去环境里查，我们没有它可以握手
+fn named_proxy(proxy: &str) -> bool {
+    !proxy.is_empty() && proxy != tw_config::DIRECT && proxy != tw_config::SYSTEM
+}
+
+/// 一个代理最近一次检查的结果。
+///
+/// **只在转发失败之后才检查**，而且同一个代理隔一会儿才检一次 —— 一条打不通的
+/// 链路上每个请求都去检一遍，等于把一次故障放大成一串握手。
+struct ProxyState {
+    reachable: bool,
+    checked_at: std::time::Instant,
+    /// 正在检查。并发的失败只触发一次
+    checking: bool,
+}
+
+/// 同一个代理两次检查之间至少隔多久
+const PROXY_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl AppState {
     pub fn new(config: tw_config::Config) -> Result<Self, GatewayError> {
@@ -309,6 +333,8 @@ impl AppState {
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
             expired_told: Arc::new(std::sync::Mutex::new(Default::default())),
             exhausted: Arc::new(std::sync::Mutex::new(Default::default())),
+            rejected: Arc::new(std::sync::Mutex::new(Default::default())),
+            proxies: Arc::new(std::sync::Mutex::new(Default::default())),
             live: crate::live::Live::default(),
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
@@ -431,6 +457,163 @@ impl AppState {
             }
         }
         Ok(token)
+    }
+
+    /// 上游对凭据的态度变了没有。**进入被拒和恢复各报一次**。
+    ///
+    /// 熔断器看不见这件事：4xx 不算失败（换一家也一样被拒），所以一个凭据坏掉的
+    /// 上游永远不会被熔断，也就永远不会有 `HealthChanged`。而这件事要用户去改配置。
+    pub(crate) fn note_auth(&self, provider: &str, status: u16) {
+        let rejected = status == 401 || status == 403;
+        // 别的失败（500、429、超时）什么都不说明：凭据可能好好的
+        if !rejected && !(200..300).contains(&status) {
+            return;
+        }
+        let changed = self
+            .rejected
+            .lock()
+            .map(|mut g| {
+                if rejected {
+                    g.insert(provider.to_string())
+                } else {
+                    g.remove(provider)
+                }
+            })
+            .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        if rejected {
+            tracing::warn!(provider, status, "上游拒绝了凭据");
+        }
+        self.bus.emit(tw_api::Event::AuthChanged {
+            id: self.bus.next_id(),
+            provider: provider.to_string(),
+            state: if rejected { "rejected" } else { "accepted" }.into(),
+            status: rejected.then_some(status),
+            at_ms: now_ms(),
+        });
+    }
+
+    /// 经这个代理的请求成功了：它之前要是被判成不通，现在说一声通了。
+    pub(crate) fn note_proxy_ok(&self, proxy: &str) {
+        if !named_proxy(proxy) {
+            return;
+        }
+        let recovered = self
+            .proxies
+            .lock()
+            .map(|mut g| match g.get_mut(proxy) {
+                Some(st) if !st.reachable => {
+                    st.reachable = true;
+                    st.checked_at = std::time::Instant::now();
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if recovered {
+            self.bus.emit(tw_api::Event::ProxyChanged {
+                id: self.bus.next_id(),
+                proxy: proxy.to_string(),
+                state: "reachable".into(),
+                detail: None,
+                at_ms: now_ms(),
+            });
+        }
+    }
+
+    /// 经这个代理的请求连不上了：检一次代理本身。
+    ///
+    /// **不做定时探测**，只在转发失败之后顺手检一次 —— 没有它，代理挂掉在界面上
+    /// 看起来是「好几家上游同时不通」，而那两件事要做的处理完全不同。
+    pub(crate) fn check_proxy(&self, proxy: &str) {
+        if !named_proxy(proxy) {
+            return;
+        }
+        let due = self
+            .proxies
+            .lock()
+            .map(|mut g| {
+                let st = g.entry(proxy.to_string()).or_insert(ProxyState {
+                    reachable: true,
+                    // 第一次就该检：把时间放到足够早
+                    checked_at: std::time::Instant::now() - PROXY_RECHECK,
+                    checking: false,
+                });
+                let due = !st.checking && st.checked_at.elapsed() >= PROXY_RECHECK;
+                if due {
+                    st.checking = true;
+                }
+                due
+            })
+            .unwrap_or(false);
+        if !due {
+            return;
+        }
+        let state = self.clone();
+        let name = proxy.to_string();
+        tokio::spawn(async move {
+            let cfg = state.config();
+            let result = match cfg.proxies.iter().find(|p| p.name == name) {
+                Some(px) => match crate::l1::hop_of(px) {
+                    Ok(hop) => {
+                        let (host, port) = crate::l1::proxy_target(&cfg, &name);
+                        let r = crate::l1::l1_proxy(&hop, &host, port).await;
+                        if r.ok {
+                            None
+                        } else {
+                            // 卡在哪一步 + 为什么。**两个都要**：一句「TCP 握手失败」
+                            // 说不出是地址错了还是代理没起来
+                            let step = r.failed.map(|f| f.label()).unwrap_or_default();
+                            let why = r.error.unwrap_or_else(|| "无法连接".into());
+                            Some(if step.is_empty() {
+                                why
+                            } else {
+                                format!("{step}：{why}")
+                            })
+                        }
+                    }
+                    Err(e) => Some(e),
+                },
+                // 配置刚好在这中间改了，代理没了：不报
+                None => None,
+            };
+            let changed = state
+                .proxies
+                .lock()
+                .map(|mut g| match g.get_mut(&name) {
+                    Some(st) => {
+                        st.checking = false;
+                        st.checked_at = std::time::Instant::now();
+                        let reachable = result.is_none();
+                        let changed = st.reachable != reachable;
+                        st.reachable = reachable;
+                        changed
+                    }
+                    None => false,
+                })
+                .unwrap_or(false);
+            if !changed {
+                return;
+            }
+            match &result {
+                Some(why) => tracing::warn!(proxy = %name, "代理不通：{why}"),
+                None => tracing::info!(proxy = %name, "代理又通了"),
+            }
+            state.bus.emit(tw_api::Event::ProxyChanged {
+                id: state.bus.next_id(),
+                proxy: name,
+                state: if result.is_some() {
+                    "unreachable"
+                } else {
+                    "reachable"
+                }
+                .into(),
+                detail: result,
+                at_ms: now_ms(),
+            });
+        });
     }
 
     /// 凭据失效报给界面。**同一家只报一次**，直到它恢复。
@@ -1723,6 +1906,8 @@ async fn pipeline(
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
                 // 额度用完时上游回的正是 429，这一跳的额度头也要读
                 state.note_quota(id, &provider.name, r.headers());
+                // 上游回了话，说明代理是通的
+                state.note_proxy_ok(&provider.proxy);
                 // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
                 // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
                 // 也一样被拒，还会白白污染那家的健康度。
@@ -1773,6 +1958,8 @@ async fn pipeline(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
+                // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
+                state.check_proxy(&provider.proxy);
                 let err = forward::map_reqwest_error(e);
                 chain.push(hop_failed(&provider.name, err.message.clone(), hop_started));
                 last_err = Some(err);
@@ -1840,6 +2027,9 @@ async fn pipeline(
     // 订阅额度。**零成本** —— 这些头本来就在响应里，读一下
     // 就有了。按量付费的账号没有它们，那时什么都不发。
     state.note_quota(id, &provider.name, upstream.headers());
+    // 上游收不收我们的凭据、经过的代理通不通：**都是状态变化，各只报一次**
+    state.note_auth(&provider.name, status.as_u16());
+    state.note_proxy_ok(&provider.proxy);
 
     let mut out_headers = forward::response_headers(upstream.headers());
     // **哪一家服务的，写在头上。**错误契约要求上游的错误原样透传、不加
