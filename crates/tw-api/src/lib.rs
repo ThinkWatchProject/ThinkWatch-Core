@@ -1129,6 +1129,10 @@ pub struct SpeedEstimate {
     pub max_output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
+    /// 订阅制上游：不按 token 收钱，消耗的是额度。它没有金额，但**不让
+    /// 合计变成空** —— 空只留给「按量计费却算不出来」
+    #[serde(default)]
+    pub subscription: bool,
     /// 给人看的那一句
     pub note: String,
 }
@@ -1137,8 +1141,9 @@ pub struct SpeedEstimate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedQuote {
     pub items: Vec<SpeedEstimate>,
-    /// 总计。**有一项算不出来就是 None** —— 给一个看起来完整的数字，
-    /// 用户会以为那就是全部代价
+    /// 总计，**不含订阅制那几项**（它们消耗额度，单独说）。按量计费的
+    /// 有一项算不出来就是 None —— 给一个看起来完整的数字，用户会以为
+    /// 那就是全部代价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_micros: Option<i64>,
     pub pricing_date: String,
