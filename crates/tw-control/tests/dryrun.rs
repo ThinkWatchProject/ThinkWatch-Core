@@ -191,3 +191,26 @@ async fn the_defaults_describe_an_ordinary_request() {
     let trace: Vec<_> = r.trace.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(trace.len(), 4, "每条规则都要有个交代：{trace:?}");
 }
+
+#[tokio::test]
+async fn a_candidate_in_another_format_is_listed_as_converted() {
+    // 试算要说出来：规则把一个 Chat 客户端分到了 Anthropic 上游，请求会被转换，
+    // 转不过去的字段会被丢掉
+    let (_d, app) = app();
+    let r = run(
+        &app,
+        r#"{"model":"claude-sonnet-4-5","dialect":"openai-chat"}"#,
+    )
+    .await;
+    assert_eq!(
+        r.converted,
+        vec![tw_api::ConvertedView {
+            provider: "官方".into(),
+            from: "openai-chat".into(),
+            to: "anthropic".into(),
+        }],
+        "协议认不出来的中转站直通，不算转换"
+    );
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert!(r.converted.is_empty(), "{:?}", r.converted);
+}

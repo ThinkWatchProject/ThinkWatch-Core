@@ -36,6 +36,9 @@ struct Partial {
     routing: Option<String>,
     /// 服务它的那家怎么收钱
     billing: String,
+    /// 做过的格式转换，JSON，带着做转换的那一家。**只留服务它的那一跳的**：
+    /// 故障转移前一跳转换过、后一跳直通时，这一行不该说它转换过
+    translated: Option<String>,
 }
 
 /// 在飞的请求最多攒多少条。
@@ -214,6 +217,7 @@ impl Recorder {
                         ttfb_ms: None,
                         routing: None,
                         billing: String::new(),
+                        translated: None,
                     },
                 );
             }
@@ -247,6 +251,36 @@ impl Recorder {
                     })
                     .ok();
                     p.billing = billing.clone();
+                    // 做转换的不是服务它的那一跳（转换那家失败了，后面一家直通）
+                    let converted_by = p
+                        .translated
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                        .and_then(|v| v["provider"].as_str().map(str::to_string));
+                    if converted_by.is_some_and(|by| by != p.provider) {
+                        p.translated = None;
+                    }
+                }
+            }
+            Event::Translated {
+                id,
+                provider,
+                from,
+                to,
+                dropped,
+                ..
+            } => {
+                // 故障转移时每一跳各报一次，后一跳盖掉前一跳
+                if let Some(p) = self.inflight.get_mut(id) {
+                    p.translated = Some(
+                        serde_json::json!({
+                            "provider": provider,
+                            "from": from,
+                            "to": to,
+                            "dropped": dropped,
+                        })
+                        .to_string(),
+                    );
                 }
             }
             /*
@@ -374,6 +408,7 @@ impl Recorder {
                     billing: String::new(),
                     cache_saved_micros: None,
                     price_source: None,
+                    translated: None,
                 });
             }
             Event::LeakSeen {
@@ -404,7 +439,6 @@ impl Recorder {
             | Event::QuotaSeen { .. }
             | Event::ScanAlert { .. }
             | Event::ToolCallFlagged { .. }
-            | Event::Translated { .. }
             // 凭据轮换说的是配置文件该改了，跟哪一次请求无关
             | Event::CredentialRotated { .. }
             // 客户端配置面变了、某家上游熔断了 —— 都是「现在什么情况」，
@@ -541,6 +575,7 @@ impl Recorder {
             billing: p.billing,
             cache_saved_micros,
             price_source,
+            translated: p.translated,
         });
     }
 
@@ -1167,6 +1202,68 @@ mod redaction_tests {
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&finished(1, None));
         assert_eq!(r.db().get(1).unwrap().unwrap().redacted, None);
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::tests::{finished, rec, started};
+
+    fn translated(provider: &str) -> tw_api::Event {
+        tw_api::Event::Translated {
+            id: 1,
+            provider: provider.into(),
+            from: "anthropic".into(),
+            to: "openai-responses".into(),
+            dropped: vec!["top_k".into()],
+            at_ms: 0,
+        }
+    }
+
+    fn routed(chain: &[&str]) -> tw_api::Event {
+        tw_api::Event::RequestRouted {
+            id: 1,
+            rule: "默认".into(),
+            group: None,
+            attempts: chain
+                .iter()
+                .map(|p| tw_api::AttemptView {
+                    provider: p.to_string(),
+                    outcome: "served".into(),
+                    status: Some(200),
+                    error: None,
+                    ms: 1,
+                })
+                .collect(),
+            billing: "per-token".into(),
+        }
+    }
+
+    #[test]
+    fn a_conversion_is_kept_on_the_row_with_what_it_dropped() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "gpt-5"));
+        r.on_event(&translated("codex-backend"));
+        r.on_event(&routed(&["codex-backend"]));
+        r.on_event(&finished(1, None));
+        let j = r.db().get(1).unwrap().unwrap().translated.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            (v["from"].as_str(), v["to"].as_str()),
+            (Some("anthropic"), Some("openai-responses"))
+        );
+        assert_eq!(v["dropped"], serde_json::json!(["top_k"]));
+    }
+
+    /// 转换那一跳失败了、后面一家直通接下了请求：这一行不能说它转换过
+    #[test]
+    fn a_conversion_on_a_hop_that_did_not_serve_is_not_kept() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "gpt-5"));
+        r.on_event(&translated("relay"));
+        r.on_event(&routed(&["relay", "official"]));
+        r.on_event(&finished(1, None));
+        assert_eq!(r.db().get(1).unwrap().unwrap().translated, None);
     }
 }
 

@@ -13,7 +13,7 @@ response:
   body: '{"type": "error", "error": {"type": "rate_limit_error", "message": "Number of request tokens has exceeded your rate limit"}}'
 expect:
   model: claude-sonnet-4-5
-  input_tokens_estimate: 1
+  input_tokens_estimate: 0
   cache: false
   tools: false
   tool_count: 0

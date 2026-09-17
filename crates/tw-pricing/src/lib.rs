@@ -50,6 +50,10 @@ pub struct ModelPrice {
     pub output_above_200k: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<u64>,
+    /// 一次最多输出多少。转换到必须写 `max_tokens` 的格式（Anthropic）、而客户端
+    /// 没写时用它 —— 写大了上游会拒绝，写小了回答会被截断
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 /// 一次调用用掉了什么。

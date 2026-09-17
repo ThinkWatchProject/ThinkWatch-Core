@@ -45,12 +45,7 @@ impl Sheet {
             overrides: def
                 .models
                 .iter()
-                .map(|(m, p)| {
-                    (
-                        m.clone(),
-                        p.to_price(table.get(m).and_then(|b| b.max_input_tokens)),
-                    )
-                })
+                .map(|(m, p)| (m.clone(), p.to_price(table.get(m))))
                 .collect(),
         }
     }
@@ -236,6 +231,7 @@ impl ModelPrice {
             input_above_200k: self.input_above_200k.map(|v| v * m),
             output_above_200k: self.output_above_200k.map(|v| v * m),
             max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
         }
     }
 

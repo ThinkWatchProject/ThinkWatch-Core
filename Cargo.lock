@@ -2879,6 +2879,7 @@ dependencies = [
  "serde_yaml_ng",
  "thiserror",
  "tracing",
+ "tw-dialect",
  "tw-redact",
 ]
 

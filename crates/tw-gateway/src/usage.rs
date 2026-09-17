@@ -7,15 +7,19 @@
 //! 所以这里是个**旁路嗅探器**：字节照常流向客户端，同时喂它一份。它只
 //! 记那几个数字，内存是有界的。
 //!
-//! 两种方言、两种模式，四种组合都要认：
+//! 四种格式、两种模式都要认：
 //!
-//! | | Anthropic | OpenAI |
-//! |---|---|---|
-//! | 非流式 | body 末尾一个 `usage` | 同 |
-//! | 流式 | `message_start` 给输入、`message_delta` 给输出 | 末尾一个带 `usage` 的 chunk |
+//! | | Anthropic | OpenAI Chat | OpenAI Responses | Gemini |
+//! |---|---|---|---|---|
+//! | 非流式 | 末尾一个 `usage` | 同 | 同 | `usageMetadata` |
+//! | 流式 | `message_start` 给输入、`message_delta` 给输出 | 末尾一个带 `usage` 的 chunk | `response.completed` 里的 `usage` | 每一帧都带累计的 `usageMetadata` |
 //!
-//! 流式那一列决定了实现形状：usage **可能出现在流的任何位置，而且不止
+//! 流式那一行决定了实现形状：usage **可能出现在流的任何位置，而且不止
 //! 一次**，所以不能只看结尾。
+//!
+//! **三家对「输入」的定义不一样**：Anthropic 的 `input_tokens` 不含缓存命中；
+//! OpenAI（两种格式）和 Gemini 的输入数**包含**缓存命中。不减掉的话，命中缓存的
+//! 那部分会按输入价再算一遍。
 
 use serde_json::Value;
 
@@ -79,7 +83,8 @@ impl Sniffer {
         // 快速排除。**边界要单独看**：`"usage"` 七个字节完全可能被
         // chunk 切成两半，那时它在两边各自都找不到。这条是那个逐字节
         // 切开的测试当场抓住的 —— 漏掉它就是漏掉整次调用的成本。
-        const NEEDLE: &[u8] = b"\"usage\"";
+        // 不带收尾引号：`"usage"` 和 Gemini 的 `"usageMetadata"` 都要命中
+        const NEEDLE: &[u8] = b"\"usage";
         let edge = NEEDLE.len() - 1;
         let straddling = !self.carry.is_empty() && {
             let mut e = Vec::with_capacity(2 * edge);
@@ -108,9 +113,14 @@ impl Sniffer {
 
     /// 找出这一段里所有完整的 usage 对象并合并。
     fn scan(&mut self, buf: &[u8]) {
+        self.scan_key(buf, b"\"usage\"", false);
+        self.scan_key(buf, b"\"usageMetadata\"", true);
+    }
+
+    fn scan_key(&mut self, buf: &[u8], key: &[u8], gemini: bool) {
         let mut from = 0;
-        while let Some(i) = find_at(buf, b"\"usage\"", from) {
-            from = i + 7;
+        while let Some(i) = find_at(buf, key, from) {
+            from = i + key.len();
             let Some(open) = buf[from..]
                 .iter()
                 .position(|c| !c.is_ascii_whitespace() && *c != b':')
@@ -126,7 +136,11 @@ impl Sniffer {
                 continue;
             };
             if let Ok(v) = serde_json::from_slice::<Value>(&buf[open..=end]) {
-                self.merge(&v);
+                if gemini {
+                    self.merge_gemini(&v);
+                } else {
+                    self.merge(&v);
+                }
             }
         }
     }
@@ -156,17 +170,24 @@ impl Sniffer {
         );
         take(&["cache_read_input_tokens"], &mut self.seen.cache_read);
         take(&["cache_creation_input_tokens"], &mut self.seen.cache_write);
-        // OpenAI 把缓存读放在 `prompt_tokens_details.cached_tokens` 里，
-        // **而且它是 prompt_tokens 的子集** —— 直接相加会重复计费。
-        if let Some(c) = v
+        // OpenAI 把缓存读写放在明细里（Chat 叫 `prompt_tokens_details`，Responses
+        // 叫 `input_tokens_details`），**而且它们是输入数的子集** —— 直接相加会
+        // 重复计费。
+        let details = v
             .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            && c > 0
-        {
+            .or_else(|| v.get("input_tokens_details"));
+        let detail = |k: &str| {
+            details
+                .and_then(|d| d.get(k))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        let (read, write) = (detail("cached_tokens"), detail("cache_write_tokens"));
+        if read + write > 0 {
             got = true;
-            self.seen.cache_read = self.seen.cache_read.max(c);
-            self.seen.input = self.seen.input.saturating_sub(c);
+            self.seen.cache_read = self.seen.cache_read.max(read);
+            self.seen.cache_write = self.seen.cache_write.max(write);
+            self.seen.input = self.seen.input.saturating_sub(read + write);
         }
         // 1 小时缓存写。Anthropic 在 `cache_creation` 里给细分
         if let Some(d) = v.get("cache_creation") {
@@ -181,6 +202,23 @@ impl Sniffer {
             }
         }
         self.found |= got;
+    }
+
+    /// 合并一个 Gemini 的 `usageMetadata`。**流里每一帧都带，数字是累计的**，
+    /// 取较大值就是最终数。`promptTokenCount` 包含缓存命中，`candidatesTokenCount`
+    /// 不含思考
+    fn merge_gemini(&mut self, v: &Value) {
+        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let cached = n("cachedContentTokenCount");
+        let input = (n("promptTokenCount") + n("toolUsePromptTokenCount")).saturating_sub(cached);
+        let output = n("candidatesTokenCount") + n("thoughtsTokenCount");
+        if input + cached + output == 0 {
+            return;
+        }
+        self.found = true;
+        self.seen.input = self.seen.input.max(input);
+        self.seen.cache_read = self.seen.cache_read.max(cached);
+        self.seen.output = self.seen.output.max(output);
     }
 
     /// 嗅到了什么。**没嗅到就是 None，不是零** —— 零会让一次真实的
@@ -250,6 +288,42 @@ mod tests {
             s.feed(c.as_bytes());
         }
         s.finish()
+    }
+
+    #[test]
+    fn a_responses_stream_subtracts_its_cached_tokens() {
+        let u = sniff(&[
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"usage\":null}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5000,\"input_tokens_details\":{\"cached_tokens\":4000,\"cache_write_tokens\":0},\"output_tokens\":300,\"output_tokens_details\":{\"reasoning_tokens\":200},\"total_tokens\":5300}}}\n\n",
+        ])
+        .unwrap();
+        assert_eq!((u.input, u.cache_read, u.output), (1000, 4000, 300));
+    }
+
+    #[test]
+    fn a_gemini_stream_is_read_from_usage_metadata() {
+        // 以前只认 `"usage"`，Gemini 的请求一个数字都记不到
+        let chunk = |candidates: u64| {
+            format!(
+                "data: {{\"candidates\":[],\"usageMetadata\":{{\"promptTokenCount\":1000,\"cachedContentTokenCount\":600,\"candidatesTokenCount\":{candidates},\"thoughtsTokenCount\":50}}}}\r\n\r\n"
+            )
+        };
+        let (a, b) = (chunk(10), chunk(80));
+        let u = sniff(&[&a, &b]).unwrap();
+        assert_eq!((u.input, u.cache_read, u.output), (400, 600, 130));
+    }
+
+    #[test]
+    fn a_needle_cut_between_chunks_still_finds_usage_metadata() {
+        let whole = r#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}"#;
+        for cut in 1..whole.len() {
+            let u = sniff(&[&whole[..cut], &whole[cut..]]);
+            assert_eq!(
+                u.map(|u| (u.input, u.output)),
+                Some((10, 5)),
+                "在第 {cut} 字节切开"
+            );
+        }
     }
 
     #[test]

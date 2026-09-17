@@ -174,6 +174,7 @@ fn price_from(v: &serde_json::Value) -> Option<ModelPrice> {
         input_above_200k: f("input_cost_per_token_above_200k_tokens"),
         output_above_200k: f("output_cost_per_token_above_200k_tokens"),
         max_input_tokens: v.get("max_input_tokens").and_then(|x| x.as_u64()),
+        max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
     })
 }
 
@@ -196,6 +197,12 @@ mod tests {
         ] {
             assert!(t.get(m).is_some(), "查不到 {m}");
         }
+        // 输出上限要读进来：转换到 Anthropic 时靠它填 max_tokens
+        assert!(
+            t.get("claude-sonnet-4-5")
+                .and_then(|p| p.max_output_tokens)
+                .is_some_and(|n| n >= 32_000)
+        );
     }
 
     #[test]

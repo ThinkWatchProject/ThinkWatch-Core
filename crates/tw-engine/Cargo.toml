@@ -9,6 +9,7 @@ description = "Routing rule engine and policy groups"
 
 [dependencies]
 serde = { workspace = true }
+tw-dialect = { workspace = true }
 tw-redact = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

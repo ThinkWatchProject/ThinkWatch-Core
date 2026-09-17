@@ -13,7 +13,7 @@ response:
   body: '{"type": "message", "id": "msg_02", "role": "assistant", "content": [{"type": "text", "text": "可靠的字节流。"}], "stop_reason": "end_turn", "usage": {"input_tokens": 18, "output_tokens": 9}}'
 expect:
   model: claude-opus-4-5
-  input_tokens_estimate: 5
+  input_tokens_estimate: 4
   cache: false
   tools: false
   tool_count: 0
