@@ -33,9 +33,13 @@ pub struct Estimate {
     pub input_tokens: u64,
     /// 输出上限
     pub max_output_tokens: u64,
-    /// 微分。`None` 表示价目表里没有这个模型
+    /// 微分。`None` 表示价目表里没有这个模型，或者这家是订阅制
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
+    /// 订阅制上游。**没有金额不等于算不出来** —— 它消耗的是额度，不该
+    /// 让一批测速的合计因为它变成「算不出来」
+    #[serde(default)]
+    pub subscription: bool,
     /// 给人看的那一句。**金额再小也要显示** —— 用户按下按钮时有权知道
     /// 自己在花什么
     pub note: String,
@@ -95,10 +99,53 @@ pub fn probe_body(model: &str) -> serde_json::Value {
     })
 }
 
+/// 这家上游说什么方言，测速请求就发成什么样。
+///
+/// **以前一律发 Anthropic 的 `/v1/messages`**，于是 OpenAI 协议的上游
+/// 必然 404；而且没带 `anthropic-version`，官方 Anthropic 端点直接 400 ——
+/// 两种情况都被报成「这家不通」，用户会去换一个其实没问题的上游。
+///
+/// 返回 `None` 的协议是**还没写**，不是「这家不支持测速」。说清是哪一种，
+/// 比发一个注定失败的请求、再把失败算到上游头上要好。
+pub struct ProbeRequest {
+    pub path: &'static str,
+    pub body: serde_json::Value,
+    pub headers: &'static [(&'static str, &'static str)],
+}
+
+pub fn probe_request(protocol: Option<tw_config::Protocol>, model: &str) -> Option<ProbeRequest> {
+    use tw_config::Protocol::*;
+    match protocol {
+        // 猜不出协议时按 Anthropic 走 —— 和转发时 `credential_header` 的
+        // 默认一致，两处不一致会让「转发正常、测速失败」成为可能
+        Some(Anthropic) | None => Some(ProbeRequest {
+            path: "/v1/messages",
+            body: probe_body(model),
+            headers: &[("anthropic-version", "2023-06-01")],
+        }),
+        Some(OpenaiChat) => Some(ProbeRequest {
+            path: "/v1/chat/completions",
+            body: serde_json::json!({
+                "model": model,
+                "max_tokens": MAX_TOKENS,
+                "stream": true,
+                // 不要这一项，流式响应里没有 usage，「实际消耗」一栏就是空的
+                "stream_options": { "include_usage": true },
+                "messages": [{ "role": "user", "content": PROMPT }],
+            }),
+            headers: &[],
+        }),
+        Some(OpenaiResponses) | Some(Gemini) => None,
+    }
+}
+
 /// 真的跑一次。
 ///
 /// 调用方**必须**先把 `Estimate` 摆给用户看过。这个函数不检查那件事 ——
 /// 它检查不了 —— 但它是这一层唯一花钱的入口，所以这条注释写在这里。
+///
+/// `http` 必须是**这家上游自己的** client：它带着该走的代理。用默认
+/// client 的话，要走代理的上游在这里连不上，而转发时它是通的。
 pub async fn run(
     http: &reqwest::Client,
     base_url: &str,
@@ -108,13 +155,32 @@ pub async fn run(
     model: &str,
 ) -> L3Result {
     let started = Instant::now();
-    let url = crate::forward::upstream_url(base_url, "/v1/messages", None);
+    let Some(probe) = probe_request(protocol, model) else {
+        return L3Result {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            ok: false,
+            connect_ms: 0,
+            ttft_ms: None,
+            total_ms: 0,
+            output_tokens: None,
+            input_tokens: None,
+            error: Some(format!(
+                "推理测速暂不支持 {} 协议的上游，没有发出请求",
+                protocol.map(|p| format!("{p:?}")).unwrap_or_default()
+            )),
+        };
+    };
+    let url = crate::forward::upstream_url(base_url, probe.path, None);
     let mut req = http
         .post(&url)
         // 测速不该无限等。**但也不能太短** —— 一个排队中的上游正是我们
         // 想量的东西，掐早了会把「慢」误报成「不通」。
         .timeout(Duration::from_secs(60));
     req = crate::forward::apply_credential(req, protocol, key);
+    for (name, value) in probe.headers {
+        req = req.header(*name, *value);
+    }
     let fail = |e: String, connect_ms: u64| L3Result {
         provider: provider.to_string(),
         model: model.to_string(),
@@ -127,7 +193,7 @@ pub async fn run(
         error: Some(e),
     };
 
-    let resp = match req.json(&probe_body(model)).send().await {
+    let resp = match req.json(&probe.body).send().await {
         Ok(r) => r,
         Err(e) => {
             return fail(
@@ -226,6 +292,7 @@ pub fn estimate(
         input_tokens: input,
         max_output_tokens: MAX_TOKENS,
         cost_micros,
+        subscription,
         note,
     }
 }
@@ -234,9 +301,16 @@ pub fn estimate(
 ///
 /// **批量是最容易让人手滑的地方** —— 点一下「全部测速」可能是
 /// 十几次真实调用，所以要列出每一项**并给出总计**。
+///
+/// **订阅制那几项不进合计**：它们不按 token 收钱，消耗的是额度，界面上
+/// 单独说。以前它们和「价格未知」一样让合计变成空 —— 于是只要勾上一家
+/// 订阅制上游，用户就再也看不到这批测速要花多少钱。
 pub fn total_micros(es: &[Estimate]) -> Option<i64> {
-    // 有任何一项算不出来，总计就不该给一个看起来完整的数字
-    if es.iter().any(|e| e.cost_micros.is_none()) {
+    // 有任何一项按量计费却算不出来，总计就不该给一个看起来完整的数字
+    if es
+        .iter()
+        .any(|e| !e.subscription && e.cost_micros.is_none())
+    {
         return None;
     }
     Some(es.iter().filter_map(|e| e.cost_micros).sum())
@@ -326,6 +400,61 @@ mod tests {
         let mut es = vec![estimate(&prices(), "p", "claude-sonnet-4-5", false)];
         es.push(estimate(&prices(), "p", "某个中转站的模型", false));
         assert!(total_micros(&es).is_none());
+    }
+
+    #[test]
+    fn a_subscription_item_stays_out_of_the_total_instead_of_voiding_it() {
+        // 勾上一家订阅制上游，不该让用户看不到其余几家要花多少钱。
+        let es = vec![
+            estimate(&prices(), "官方", "claude-sonnet-4-5", false),
+            estimate(&prices(), "订阅", "claude-sonnet-4-5", true),
+        ];
+        assert_eq!(total_micros(&es), es[0].cost_micros);
+        // 价格未知的那一项照样让合计不成立
+        let mut es = es;
+        es.push(estimate(&prices(), "中转", "某个中转站的模型", false));
+        assert!(total_micros(&es).is_none());
+    }
+
+    #[test]
+    fn an_anthropic_probe_carries_the_version_header_the_official_api_requires() {
+        // 没有它，官方端点回 400，而那会被报成「这家不通」。
+        let p = probe_request(Some(tw_config::Protocol::Anthropic), "m").unwrap();
+        assert_eq!(p.path, "/v1/messages");
+        assert!(p.headers.iter().any(|(k, _)| *k == "anthropic-version"));
+        // 猜不出协议时和转发的默认一致
+        let guessed = probe_request(None, "m").unwrap();
+        assert_eq!(guessed.path, "/v1/messages");
+    }
+
+    #[test]
+    fn an_openai_chat_probe_goes_to_chat_completions_and_asks_for_usage() {
+        // 以前一律发 /v1/messages，OpenAI 协议的上游必然 404。
+        let p = probe_request(Some(tw_config::Protocol::OpenaiChat), "gpt-4o").unwrap();
+        assert_eq!(p.path, "/v1/chat/completions");
+        assert_eq!(p.body["stream"], true);
+        assert_eq!(p.body["max_tokens"], MAX_TOKENS);
+        assert_eq!(p.body["stream_options"]["include_usage"], true);
+        assert!(p.headers.is_empty(), "OpenAI 系不该带 Anthropic 的头");
+    }
+
+    #[tokio::test]
+    async fn a_protocol_without_a_probe_says_so_and_sends_nothing() {
+        // 发一个注定失败的请求、再把失败算到上游头上，比直说更糟。
+        // 地址指向一个不存在的端口：真发了的话错误会是「连不上」
+        let r = run(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:9",
+            "k",
+            Some(tw_config::Protocol::Gemini),
+            "g",
+            "gemini-2.5-pro",
+        )
+        .await;
+        assert!(!r.ok);
+        let e = r.error.unwrap();
+        assert!(e.contains("暂不支持"), "{e}");
+        assert!(e.contains("没有发出请求"), "{e}");
     }
 
     #[test]

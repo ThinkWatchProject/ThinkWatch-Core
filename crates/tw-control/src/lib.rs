@@ -679,12 +679,13 @@ async fn speed_quote(
                 &prices,
                 &p.name,
                 &req.model,
-                // 订阅型上游的判据：最近一次响应里报过额度。
-                // **不是一个用户要填的字段** —— 那个数字一直在我们手上。
-                s.gateway
-                    .quotas()
-                    .get(&p.name)
-                    .is_some_and(|q| !q.is_empty()),
+                // 订阅型上游的判据：配置里写明了，或者最近一次响应里报过
+                // 额度（不写时自动判，和成本栏同一个口径）。
+                p.billing == Some(tw_config::Billing::Subscription)
+                    || s.gateway
+                        .quotas()
+                        .get(&p.name)
+                        .is_some_and(|q| !q.is_empty()),
             )
         })
         .collect();
@@ -725,8 +726,10 @@ async fn speed_run(
                 continue;
             }
         };
+        // **发请求也用这一家的 client。**以前只有换 token 走它、真正的测速
+        // 请求走默认 client —— 要走代理的上游在这里连不上，而转发时它是通的
         let r = tw_gateway::l3::run(
-            s.http(),
+            &pk_http,
             &p.base_url,
             &key,
             p.effective_protocol(),
@@ -756,6 +759,7 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
         input_tokens: e.input_tokens,
         max_output_tokens: e.max_output_tokens,
         cost_micros: e.cost_micros,
+        subscription: e.subscription,
         note: e.note,
     }
 }
