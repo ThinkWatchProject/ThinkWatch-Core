@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Dialect translation of requests and responses between Anthropic and OpenAI chat"
+description = "Request, response and stream conversion between Anthropic Messages, OpenAI Chat Completions, OpenAI Responses and Gemini"
 
 [dependencies]
 serde = { workspace = true }
