@@ -184,7 +184,13 @@ async fn a_chat_client_reaches_claude_with_the_headers_anthropic_needs() {
     assert_eq!(s.headers.get("x-api-key").unwrap(), "sk-upstream");
     let sent: Value = serde_json::from_slice(&s.body).unwrap();
     assert_eq!(sent["system"][0]["text"], "简短");
-    assert_eq!(sent["max_tokens"], 32000, "Claude 的默认最大输出");
+    // 客户端没写最大输出：用价目表里这个模型的输出上限
+    let limit = tw_pricing::Table::builtin()
+        .unwrap()
+        .get("claude-opus-4-7")
+        .and_then(|p| p.max_output_tokens)
+        .unwrap_or(32000);
+    assert_eq!(sent["max_tokens"], limit);
 
     let frames = data_frames(&body);
     assert!(body.ends_with("data: [DONE]\n\n"), "{body}");

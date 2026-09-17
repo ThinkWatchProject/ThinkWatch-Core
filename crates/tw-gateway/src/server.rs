@@ -1412,7 +1412,10 @@ async fn pipeline(
                 let p = d.encode(&tw_dialect::ir::Target {
                     dialect,
                     official: provider.is_official_endpoint(),
-                    default_max_tokens: crate::translate::default_max_tokens(&d.request.model),
+                    default_max_tokens: crate::translate::default_max_tokens(
+                        &state.pricing.load(),
+                        &d.request.model,
+                    ),
                 });
                 // **转换了就要说一声，丢了字段更要说。**用户会发现「扩展思考开了
                 // 却没生效」而完全不知道从哪儿查起

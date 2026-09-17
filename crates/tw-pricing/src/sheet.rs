@@ -207,7 +207,8 @@ impl PerMillion {
     /// 换成每 token 的价格。**按写的算，一个字段都不推** —— 见模块注释。
     ///
     /// 上下文窗口不是价格，从默认价目表里这个模型那儿取。
-    pub(crate) fn to_price(&self, max_input_tokens: Option<u64>) -> ModelPrice {
+    /// `base`：默认价目表里这个模型的那一条。上下文和输出上限从它来，覆盖价只改单价
+    pub(crate) fn to_price(&self, base: Option<&ModelPrice>) -> ModelPrice {
         const M: f64 = 1e-6;
         ModelPrice {
             input: self.input * M,
@@ -217,7 +218,8 @@ impl PerMillion {
             cache_write_1h: Some(self.cache_write_1h * M),
             input_above_200k: self.input_above_200k.map(|v| v * M),
             output_above_200k: self.output_above_200k.map(|v| v * M),
-            max_input_tokens,
+            max_input_tokens: base.and_then(|b| b.max_input_tokens),
+            max_output_tokens: base.and_then(|b| b.max_output_tokens),
         }
     }
 
@@ -326,7 +328,10 @@ mod tests {
             input_above_200k: None,
             output_above_200k: None,
         }
-        .to_price(Some(200_000));
+        .to_price(Some(&ModelPrice {
+            max_input_tokens: Some(200_000),
+            ..Default::default()
+        }));
         let per_m = |v: Option<f64>| v.map(|x| (x * 1e6 * 1e6).round() / 1e6);
         assert_eq!(per_m(p.cache_read), Some(0.25));
         assert_eq!(per_m(p.cache_write_5m), Some(2.0));

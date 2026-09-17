@@ -88,9 +88,13 @@ pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction) {
 
 /// 客户端没写最大输出、目标格式又必须写（Anthropic）时用多少。
 ///
-/// Claude 4 系列的输出上限都不低于 32000；Anthropic 兼容接口背后的别家模型
-/// （DeepSeek 这类）上限多在 8192，写大了会被拒绝。
-pub fn default_max_tokens(model: &str) -> u64 {
+/// **价目表里有这个模型的输出上限就用它**：写大了上游拒绝，写小了回答被截断。
+/// 查不到时按模型名兜底：Claude 4 系列的上限都不低于 32000，Anthropic 兼容接口
+/// 背后的别家模型（DeepSeek 这类）多在 8192。
+pub fn default_max_tokens(book: &tw_pricing::PriceBook, model: &str) -> u64 {
+    if let Some(n) = book.table().get(model).and_then(|p| p.max_output_tokens) {
+        return n;
+    }
     if model.to_ascii_lowercase().contains("claude") {
         32000
     } else {
@@ -133,6 +137,27 @@ mod tests {
                 assert_eq!(plan(api, true, Some(p)), want, "{path} → {p:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_default_output_limit_comes_from_the_price_table_first() {
+        let book = tw_pricing::PriceBook::new(
+            std::sync::Arc::new(
+                tw_pricing::Table::fetched(
+                    br#"{"claude-sonnet-4-5":{"input_cost_per_token":3e-6,"output_cost_per_token":1.5e-5,"max_output_tokens":64000},
+                         "deepseek-chat":{"input_cost_per_token":1e-7,"output_cost_per_token":2e-7,"max_output_tokens":8000}}"#,
+                    "d".into(),
+                )
+                .unwrap(),
+            ),
+            Default::default(),
+            [],
+        );
+        assert_eq!(default_max_tokens(&book, "claude-sonnet-4-5"), 64000);
+        assert_eq!(default_max_tokens(&book, "deepseek-chat"), 8000);
+        // 表里没有的按名字兜底
+        assert_eq!(default_max_tokens(&book, "claude-mythos-5-1"), 32000);
+        assert_eq!(default_max_tokens(&book, "some-relay-model"), 8192);
     }
 
     #[test]
