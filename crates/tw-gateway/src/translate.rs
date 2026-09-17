@@ -1,65 +1,100 @@
-//! 方言互转在管线上的接线（M6+）。
+//! 方言互转在管线上的接线。
 //!
-//! **这一层只在客户端方言和上游协议不同时才醒过来。**同方言那条路
-//! （九成五的场景）一个字节都不会被碰 —— 出站直通仍然成立。
+//! **只在客户端格式和上游协议不同、而且调的是生成回答时才醒过来。**同格式那条路
+//! 一个字节都不碰（唯一的例外是去掉转换写出去的推理签名，见
+//! [`tw_dialect::convert::strip_carried`]）。转换本身在 `tw-dialect` 里，这里只管
+//! 三个接缝：
 //!
-//! 接线本身很短，但它有三个必须做对的接缝：
-//!
-//! 1. **路径要跟着换。**`/v1/messages` 打到一个 OpenAI 上游上是 404。
-//! 2. **头要跟着换。**`anthropic-version` 送给 OpenAI 上游没意义，
-//!    而有些兼容实现会因为不认识的头直接 400。
-//! 3. **响应也要换回来**，而且流式那条路要一路换到最后一帧。
+//! 1. **要不要转**：上游协议认不出来时不转。猜一个方向的代价是「请求被改成另一个
+//!    样子然后上游 400」，比不转难查得多
+//! 2. **请求头**：客户端格式专属的头（`anthropic-version`、`openai-beta`……）发给
+//!    别家是噪音，有的兼容实现还会因为不认识而拒绝；目标格式必需的头要补上
+//! 3. **路径和查询串**：由转换给出，客户端的不再用
 
 use tw_config::Protocol;
+use tw_dialect::ir::{Dialect, Request};
 
 use crate::client_api::ClientApi;
 
-/// 这一次要不要翻译，往哪个方向。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Plan {
-    /// 同方言，什么都不做。**九成五走这条**
-    Passthrough,
-    /// Anthropic 客户端 → OpenAI chat 上游
-    AnthropicToOpenai,
+pub fn dialect_of(p: Protocol) -> Dialect {
+    match p {
+        Protocol::Anthropic => Dialect::Anthropic,
+        Protocol::OpenaiChat => Dialect::Chat,
+        Protocol::OpenaiResponses => Dialect::Responses,
+        Protocol::Gemini => Dialect::Gemini,
+    }
 }
 
-/// 客户端说什么方言、上游说什么协议，决定这一次怎么走。
+/// 这一跳转成哪种格式。`None` 是直通。
+pub fn plan(
+    api: Option<ClientApi>,
+    generates: bool,
+    upstream: Option<Protocol>,
+) -> Option<Dialect> {
+    let (api, upstream) = (api?, upstream?);
+    if !generates {
+        return None;
+    }
+    let target = dialect_of(upstream);
+    (target != api.dialect()).then_some(target)
+}
+
+/// 转换时，客户端发来的这个请求头还发不发给上游。
+pub fn keeps_header(client: Dialect, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let own: &[&str] = match client {
+        Dialect::Anthropic => &[
+            "anthropic-version",
+            "anthropic-beta",
+            "anthropic-dangerous-direct-browser-access",
+        ],
+        // Codex 带的 originator / session_id / version 说的是它和 OpenAI 之间的事
+        Dialect::Chat | Dialect::Responses => &[
+            "openai-beta",
+            "openai-organization",
+            "openai-project",
+            "chatgpt-account-id",
+            "originator",
+            "session_id",
+            "conversation_id",
+            "version",
+        ],
+        Dialect::Gemini => &["x-goog-api-client", "x-goog-user-project"],
+    };
+    !own.contains(&name.as_str())
+}
+
+/// 转成这种格式时必须带的请求头（上游配置里写了同名头时以配置为准）。
+pub fn required_headers(target: Dialect) -> &'static [(&'static str, &'static str)] {
+    match target {
+        Dialect::Anthropic => &[("anthropic-version", "2023-06-01")],
+        _ => &[],
+    }
+}
+
+/// 规则里的参数改写，改在中间表示上：转换出去的请求四种格式一样生效。
+pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction) {
+    if let Some(m) = &set.model {
+        r.model = m.clone();
+    }
+    if let Some(t) = set.max_tokens {
+        r.max_tokens = Some(t);
+    }
+    // 和直通时一样只做「关掉」：去掉推理配置，按模型默认走
+    if set.thinking == Some(false) {
+        r.reasoning = None;
+    }
+}
+
+/// 客户端没写最大输出、目标格式又必须写（Anthropic）时用多少。
 ///
-/// **认不出来就直通。**猜一个转换方向的代价是「请求被改成了另一个样子
-/// 然后上游 400」，比不转难查得多 —— 而不转的表现是上游直接告诉你
-/// 「我不认识这个格式」，那条错误信息本身就是线索。
-pub fn plan(client: Option<ClientApi>, upstream: Option<Protocol>) -> Plan {
-    match (client, upstream) {
-        (Some(ClientApi::AnthropicMessages), Some(Protocol::OpenaiChat)) => Plan::AnthropicToOpenai,
-        _ => Plan::Passthrough,
-    }
-}
-
-impl Plan {
-    pub fn active(&self) -> bool {
-        !matches!(self, Plan::Passthrough)
-    }
-    /// 上游那边的路径。**`/v1/messages` 打到 OpenAI 上游是 404。**
-    pub fn path<'a>(&self, original: &'a str) -> &'a str {
-        match self {
-            Plan::Passthrough => original,
-            Plan::AnthropicToOpenai => "/v1/chat/completions",
-        }
-    }
-    /// 这个请求头要不要送给上游。
-    ///
-    /// 翻译过去之后，方言专属的头全是噪音，而有些 OpenAI 兼容实现会
-    /// 因为不认识的头直接 400。
-    pub fn keeps_header(&self, name: &str) -> bool {
-        match self {
-            Plan::Passthrough => true,
-            Plan::AnthropicToOpenai => !matches!(
-                name.to_ascii_lowercase().as_str(),
-                "anthropic-version"
-                    | "anthropic-beta"
-                    | "anthropic-dangerous-direct-browser-access"
-            ),
-        }
+/// Claude 4 系列的输出上限都不低于 32000；Anthropic 兼容接口背后的别家模型
+/// （DeepSeek 这类）上限多在 8192，写大了会被拒绝。
+pub fn default_max_tokens(model: &str) -> u64 {
+    if model.to_ascii_lowercase().contains("claude") {
+        32000
+    } else {
+        8192
     }
 }
 
@@ -68,85 +103,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_dialect_is_always_passthrough() {
-        // **九成五走这条**，它一个字节都不该被碰。
-        assert_eq!(
-            plan(
-                Some(ClientApi::AnthropicMessages),
-                Some(Protocol::Anthropic)
-            ),
-            Plan::Passthrough
-        );
-        assert_eq!(
-            plan(Some(ClientApi::OpenaiChat), Some(Protocol::OpenaiChat)),
-            Plan::Passthrough
-        );
-        assert!(
-            !plan(
-                Some(ClientApi::AnthropicMessages),
-                Some(Protocol::Anthropic)
-            )
-            .active()
-        );
+    fn same_format_and_non_generating_calls_are_passthrough() {
+        let messages = ClientApi::of_path("/v1/messages");
+        assert_eq!(plan(messages, true, Some(Protocol::Anthropic)), None);
+        // 计 token 不转，即使上游是另一种格式
+        assert_eq!(plan(messages, false, Some(Protocol::OpenaiChat)), None);
+        // 认不出上游协议：不猜
+        assert_eq!(plan(messages, true, None), None);
+        // 认不出客户端 API：不猜
+        assert_eq!(plan(None, true, Some(Protocol::OpenaiChat)), None);
     }
 
     #[test]
-    fn a_claude_client_on_an_openai_upstream_is_the_one_we_translate() {
-        // 那是这个功能存在的全部理由：手上一把 DeepSeek 的 key，
-        // 想让 Claude Code 用上。
-        assert_eq!(
-            plan(
-                Some(ClientApi::AnthropicMessages),
-                Some(Protocol::OpenaiChat)
-            ),
-            Plan::AnthropicToOpenai
-        );
-    }
-
-    #[test]
-    fn everything_we_have_not_built_falls_back_to_passthrough() {
-        // **猜一个转换方向的代价是「请求被改成另一个样子然后上游 400」**，
-        // 比不转难查得多。不转的话，上游会直接说「我不认识这个格式」——
-        // 那条错误信息本身就是线索。
-        for up in [
-            Some(Protocol::Gemini),
-            Some(Protocol::OpenaiResponses),
-            None,
+    fn every_other_combination_converts_to_the_upstream_format() {
+        for path in [
+            "/v1/messages",
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1beta/models/g:generateContent",
         ] {
-            assert_eq!(
-                plan(Some(ClientApi::AnthropicMessages), up),
-                Plan::Passthrough,
-                "{up:?}"
-            );
+            let api = ClientApi::of_path(path);
+            for p in [
+                Protocol::Anthropic,
+                Protocol::OpenaiChat,
+                Protocol::OpenaiResponses,
+                Protocol::Gemini,
+            ] {
+                let want = (dialect_of(p) != api.unwrap().dialect()).then_some(dialect_of(p));
+                assert_eq!(plan(api, true, Some(p)), want, "{path} → {p:?}");
+            }
         }
-        assert_eq!(
-            plan(Some(ClientApi::OpenaiChat), Some(Protocol::Anthropic)),
-            Plan::Passthrough
-        );
-        assert_eq!(
-            plan(Some(ClientApi::Gemini), Some(Protocol::OpenaiChat)),
-            Plan::Passthrough
-        );
     }
 
     #[test]
-    fn the_path_follows_the_dialect() {
-        // `/v1/messages` 打到 OpenAI 上游上是 404。
-        assert_eq!(Plan::Passthrough.path("/v1/messages"), "/v1/messages");
+    fn a_clients_own_headers_stay_behind_and_anthropic_gets_its_version() {
+        assert!(!keeps_header(Dialect::Anthropic, "Anthropic-Beta"));
+        assert!(keeps_header(Dialect::Anthropic, "user-agent"));
+        assert!(!keeps_header(Dialect::Responses, "originator"));
+        assert!(!keeps_header(Dialect::Gemini, "x-goog-api-client"));
         assert_eq!(
-            Plan::AnthropicToOpenai.path("/v1/messages"),
-            "/v1/chat/completions"
+            required_headers(Dialect::Anthropic),
+            [("anthropic-version", "2023-06-01")]
         );
-    }
-
-    #[test]
-    fn dialect_specific_headers_do_not_travel_to_the_other_side() {
-        // 有些 OpenAI 兼容实现会因为不认识的头直接 400。
-        let p = Plan::AnthropicToOpenai;
-        assert!(!p.keeps_header("anthropic-version"));
-        assert!(!p.keeps_header("Anthropic-Beta"));
-        assert!(p.keeps_header("content-type"));
-        // 直通时一个都不剔 —— 那条路的规矩是 forward_headers 定的
-        assert!(Plan::Passthrough.keeps_header("anthropic-version"));
+        assert!(required_headers(Dialect::Gemini).is_empty());
     }
 }

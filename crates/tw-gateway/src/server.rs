@@ -759,18 +759,16 @@ impl ListingShape {
         }
     }
 
-    /// 这种客户端能用哪些协议的上游的模型。和请求那条路用同一张表
+    /// 这种客户端能用哪些协议的上游的模型。和请求那条路用同一张表：列出来的是
+    /// 用来生成回答的模型，四种格式互相转换，所以谁都能用
     fn protocols(&self) -> Vec<&'static str> {
         use crate::client_api::{ClientApi, slugs};
-        match self {
-            ListingShape::Anthropic => slugs(ClientApi::AnthropicMessages.servable_by()),
-            ListingShape::Openai => {
-                let mut v = slugs(ClientApi::OpenaiChat.servable_by());
-                v.extend(slugs(ClientApi::OpenaiResponses.servable_by()));
-                v
-            }
-            ListingShape::Gemini => slugs(ClientApi::Gemini.servable_by()),
-        }
+        let api = match self {
+            ListingShape::Anthropic => ClientApi::AnthropicMessages,
+            ListingShape::Openai => ClientApi::OpenaiChat,
+            ListingShape::Gemini => ClientApi::Gemini,
+        };
+        slugs(api.servable_by(true))
     }
 }
 
@@ -1088,17 +1086,16 @@ async fn pipeline(
     // **只解析一次。**路由要它，会话指纹也要它，而 body 可能有
     // 几百 KB —— 解两遍是白付一份钱。
     let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    // 生成回答的请求解码成中间表示，**四种格式的客户端读出同一份路由事实**。
+    // body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** —— 我们的解析器
+    // 不认识的东西，上游可能完全认识（只有需要转换时才用得上解码结果）
+    let reading = crate::client_api::read(uri.path(), query.as_deref(), parsed.as_ref());
+    let generates = reading.generates;
+    let decoded = reading.decoded;
     let facts = {
-        let mut f = match &parsed {
-            Some(v) => tw_engine::RequestFacts::from_anthropic_body(v),
-            // body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** ——
-            // 我们的解析器不认识的东西，上游可能完全认识。
-            None => tw_engine::RequestFacts::default(),
-        };
+        let mut f = reading.facts;
         f.client = client_name.clone();
         f.intent = intent;
-        // **按路径认出来的 API**，规则里的 `when.dialect` 比的就是它
-        f.dialect = api.map(|a| a.slug()).unwrap_or_default().to_string();
         f
     };
     // 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
@@ -1115,7 +1112,7 @@ async fn pipeline(
                 .iter()
                 .find(|c| c.name == client_name)
                 .and_then(|c| c.allow.clone());
-            let servable = api.map(|a| crate::client_api::slugs(a.servable_by()));
+            let servable = api.map(|a| crate::client_api::slugs(a.servable_by(generates)));
             if !catalog.admits(&facts.model, servable.as_deref(), allow.as_deref()) {
                 // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
                 // 该去改的地方不一样
@@ -1305,9 +1302,9 @@ async fn pipeline(
     // 成功那一次的脱敏账本。**必须是成功那一次的** —— 故障转移从官方切到
     // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来
     let mut used_ledger = tw_redact::redact::Ledger::default();
-    // 成功那一跳用的是哪个翻译方向。**必须是成功那一次的** —— 故障转移
-    // 从 Anthropic 上游切到 OpenAI 上游时，两跳的方向不一样
-    let mut used_xlate = crate::translate::Plan::Passthrough;
+    // 成功那一跳的转换。**必须是成功那一次的** —— 故障转移从 Anthropic 上游
+    // 切到 OpenAI 上游时，两跳转成的格式不一样；直通时是 None
+    let mut used_session: Option<tw_dialect::convert::Session> = None;
     // 每一跳的结果和耗时。**失败的原因要留着** —— 一条说「试过 A → B →
     // C」的链，和一条还说清每一跳为什么失败的链，排查价值差得远。
     let mut chain: Vec<tw_api::AttemptView> = Vec::new();
@@ -1329,6 +1326,22 @@ async fn pipeline(
         attempts.push(provider.name.clone());
         hop_started = std::time::Instant::now();
 
+        // 生成回答以外的接口（计 token、嵌入……）没有别的格式可以转换，只能交给同格式
+        // 的上游。**不发出去**：打到别家的同名路径上，好的情况是 404，坏的情况是被
+        // 当成另一个接口执行
+        if !generates
+            && let (Some(a), Some(p)) = (api, provider.effective_protocol())
+            && a.protocol() != p
+        {
+            let why = format!("{} 只能由 {} 格式的上游处理", uri.path(), a.slug());
+            chain.push(hop_failed(&provider.name, why.clone(), hop_started));
+            last_err = Some(GatewayError::new(
+                crate::error::Source::Request,
+                format!("{why}，上游「{}」是 {} 格式", provider.name, p.slug()),
+            ));
+            continue;
+        }
+
         // 阶段二：知道走哪家了，再跑一遍含 `provider_would_be` 的规则。
         //
         // **在循环里面，因为故障转移换了 provider 之后必须重算**。
@@ -1346,10 +1359,78 @@ async fn pipeline(
                 }
                 Err(e) => return Err(GatewayError::config(format!("规则求值失败：{e}"))),
             };
-        // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
-        // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
-        // 一个用户显式要求的例外，不是默认行为。
-        let outbound = forward::apply_set(&body, &effective_set);
+        // 方言互转。**同格式时是 None，这一整段零成本**
+        let client_dialect = api.map(|a| a.dialect());
+        let target = crate::translate::plan(api, generates, provider.effective_protocol());
+        let mut path = uri.path().to_string();
+        let mut upstream_query = query.clone();
+        let mut prepared: Option<tw_dialect::convert::Prepared> = None;
+        let outbound = match target {
+            None => {
+                // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
+                // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
+                // 一个用户显式要求的例外，不是默认行为。
+                let out = forward::apply_set(&body, &effective_set, client_dialect);
+                if let (Some(tw_dialect::ir::Dialect::Gemini), Some(m)) =
+                    (client_dialect, &effective_set.model)
+                {
+                    path = forward::gemini_path_with_model(&path, m);
+                }
+                // 对话之前被转换过、这一跳直通时，去掉客户端带回来的转换签名：
+                // 这个上游不认，整个请求会被拒
+                match client_dialect
+                    .filter(|_| generates)
+                    .and_then(|d| tw_dialect::convert::strip_carried(d, &out))
+                {
+                    Some(b) => Bytes::from(b),
+                    None => out,
+                }
+            }
+            Some(dialect) => {
+                let d = match &decoded {
+                    Some(Ok(d)) => d,
+                    other => {
+                        // 转换不了就换下一家：同格式的上游可能还在后面
+                        let why = match other {
+                            Some(Err(rej)) => rej.0.clone(),
+                            _ => "请求体不是合法的 JSON".to_string(),
+                        };
+                        chain.push(hop_failed(
+                            &provider.name,
+                            format!("无法转换为 {} 格式：{why}", dialect.slug()),
+                            hop_started,
+                        ));
+                        last_err = Some(GatewayError::new(
+                            crate::error::Source::Request,
+                            format!("无法转换为上游「{}」的格式：{why}", provider.name),
+                        ));
+                        continue;
+                    }
+                };
+                let mut d = d.clone();
+                crate::translate::apply_set(&mut d.request, &effective_set);
+                let p = d.encode(&tw_dialect::ir::Target {
+                    dialect,
+                    official: provider.is_official_endpoint(),
+                    default_max_tokens: crate::translate::default_max_tokens(&d.request.model),
+                });
+                // **转换了就要说一声，丢了字段更要说。**用户会发现「扩展思考开了
+                // 却没生效」而完全不知道从哪儿查起
+                state.bus.emit(tw_api::Event::Translated {
+                    id,
+                    provider: provider.name.clone(),
+                    from: d.client.slug().into(),
+                    to: dialect.slug().into(),
+                    dropped: p.dropped.clone(),
+                    at_ms: now_ms(),
+                });
+                path = p.path.clone();
+                upstream_query = p.query.clone();
+                let body = Bytes::from(p.body.clone());
+                prepared = Some(p);
+                body
+            }
+        };
 
         // 出站脱敏。**和阶段二在同一个位置，理由完全一样** ——
         // 故障转移从官方切到中转的那一刻，正是最需要它的时刻，而那时
@@ -1400,31 +1481,7 @@ async fn pipeline(
                 continue;
             }
         };
-        // 方言互转（M6+）。**同方言时这一整段是零成本** ——
-        // `plan()` 返回 Passthrough，body 和路径都原样
-        let xlate = crate::translate::plan(api, provider.effective_protocol());
-        let outbound = match (xlate.active(), parsed.as_ref()) {
-            (true, Some(v)) => {
-                let c = tw_dialect::req::to_openai(v);
-                // **翻译了就要说一声，`dropped` 非空更要说。**用户会
-                // 发现「扩展思考开了却没生效」而完全不知道从哪儿查起
-                state.bus.emit(tw_api::Event::Translated {
-                    id,
-                    provider: provider.name.clone(),
-                    from: "anthropic".into(),
-                    to: "openai-chat".into(),
-                    dropped: c.dropped.clone(),
-                    at_ms: now_ms(),
-                });
-                Bytes::from(c.body.to_string())
-            }
-            // body 解不开时原样发。**我们的解析器不认识的东西，上游可能
-            // 完全认识** —— 而那时它的 400 比我们编一个更有用
-            _ => outbound,
-        };
-
-        let url =
-            forward::upstream_url(&provider.base_url, xlate.path(uri.path()), query.as_deref());
+        let url = forward::upstream_url(&provider.base_url, &path, upstream_query.as_deref());
         let method = reqwest::Method::from_bytes(b"POST").expect("POST 是合法方法");
 
         tracing::debug!(
@@ -1438,9 +1495,23 @@ async fn pipeline(
         );
 
         let mut req = http.request(method, &url);
+        let required = target
+            .map(crate::translate::required_headers)
+            .unwrap_or_default();
         req = forward::forward_headers_filtered(req, &headers, |n| {
-            xlate.keeps_header(n) && !forward::overridden(&upstream_headers, n)
+            let own = match (target, client_dialect) {
+                (Some(_), Some(c)) => !crate::translate::keeps_header(c, n),
+                _ => false,
+            };
+            !own && !required.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
+                && !forward::overridden(&upstream_headers, n)
         });
+        // 目标格式必需的头（Anthropic 的 anthropic-version）。上游配置里写了同名头时以配置为准
+        for (k, v) in required {
+            if !forward::overridden(&upstream_headers, k) {
+                req = req.header(*k, *v);
+            }
+        }
         req = forward::apply_headers(req, &upstream_headers);
         match req.body(outbound.clone()).send().await {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
@@ -1484,7 +1555,7 @@ async fn pipeline(
                 upstream = Some(r);
                 used = Some(provider);
                 used_ledger = ledger;
-                used_xlate = xlate;
+                used_session = prepared.map(|p| p.session);
                 break;
             }
             Err(e) => {
@@ -1609,6 +1680,24 @@ async fn pipeline(
     let is_sse = out_headers
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    // 转换的回程。**流式成功的边收边转**；整包、以及上游返回的错误，整个到手再转 ——
+    // 上游的错误体要换成客户端认得的错误格式，否则客户端连原因都解析不出来
+    let session = used_session;
+    let convert_stream = session.is_some() && is_sse && status.is_success();
+    let convert_whole = session.is_some() && !convert_stream;
+    if let Some(s) = &session {
+        // 客户端要流而上游给了整包时，整包会被写成客户端格式的流
+        let writes_stream = convert_stream || (status.is_success() && s.stream);
+        let ct = if writes_stream {
+            s.content_type()
+        } else {
+            "application/json"
+        };
+        out_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(ct),
+        );
+    }
     // 回显还原。
     //
     // **SSE 和非流式走两套**：前者的占位符散落在几十帧里（模型按 token
@@ -1618,26 +1707,26 @@ async fn pipeline(
     // **没脱敏过就是个空壳**，`process` 直接把字节原样递出去 —— 绝大多数
     // 请求走的是这条路，它不该为这个功能付任何延迟。
     let mut restorer = tw_redact::sse::Body::new(&used_ledger, is_sse);
-    // 方言互转的回程（M6+）。**同方言时是 None，整段零成本。**
+    // 流式转换器。**同格式时是 None，整段零成本。**
     //
     // 位置在还原**之后**：占位符是我们在出站时塞进去的，先换回真值再
-    // 翻译，翻译器看到的就和上游原话一样了。
-    let mut back = match (used_xlate, is_sse) {
-        (crate::translate::Plan::AnthropicToOpenai, true) => {
-            Some(tw_dialect::sse::Converter::new(&facts.model))
-        }
-        _ => None,
+    // 转换，转换器看到的就和上游原话一样了。
+    let mut back = if convert_stream {
+        session.as_ref().map(|s| s.stream())
+    } else {
+        None
     };
-    // 非流式那一条整个到手再翻
-    let translate_whole = used_xlate == crate::translate::Plan::AnthropicToOpenai && !is_sse;
-    let whole_model = facts.model.clone();
+    // 客户端收到的是不是 SSE。Gemini 客户端不带 `alt=sse` 时是一个 JSON 数组
+    let client_sse = session
+        .as_ref()
+        .map_or(is_sse, |s| convert_stream && s.client_sse());
     // 工具调用防火墙。**只在 SSE 上跑** —— 非流式响应整个到手
     // 之后再拦已经没有意义，客户端下一步就拿到全文了。
     let inspect = rt.config.security.inspect_tools;
     let trust = crate::guard::effective_trust(provider, &decision.guard);
     // 正文里的提示注入**只对不受信任的上游查**（末尾）：官方端点上
     // 模型讲解提示注入是完全正常的
-    let mut wall = (is_sse && inspect.detects())
+    let mut wall = (client_sse && inspect.detects())
         .then(|| crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()));
     let wall_provider = provider.name.clone();
     let stream = async_stream::stream! {
@@ -1664,14 +1753,13 @@ async fn pipeline(
                     // 翻译在还原之后、审查之前：**审查看的必须是客户端
                     // 将要拿到的那一版**，而那一版是翻译过的
                     let out = match back.as_mut() {
-                        Some(c) => c.process(&out).into_bytes(),
+                        Some(c) => c.process(&out),
                         None => out,
                     };
-                    // 非流式那一条整个攒起来，最后翻一次。**这不是缓冲
-                    // 流** —— 非流式响应本来就是一整个 body，客户端无论
-                    // 如何都要等它完整（说的是别把 SSE 变成一次性
-                    // 交付，这里没有 SSE）
-                    if translate_whole {
+                    // 整包那一条整个攒起来，最后转一次。**这不是缓冲流** ——
+                    // 整包响应本来就是一整个 body，客户端无论如何都要等它完整
+                    // （说的是别把 SSE 变成一次性交付，这里没有 SSE）
+                    if convert_whole {
                         whole.extend_from_slice(&out);
                         continue;
                     }
@@ -1735,26 +1823,34 @@ async fn pipeline(
         // 扣住的尾巴要吐出来，**在结束事件之前** —— 否则最后几个字节
         // 会掉在流的外面
         let tail = restorer.flush();
-        if translate_whole {
-            // 翻不动就原样交给客户端 —— 上游返回的可能是一条错误，
-            // 而那条错误比我们编的任何东西都有用
-            let out = match serde_json::from_slice::<serde_json::Value>(&whole) {
-                Ok(v) => tw_dialect::resp::to_anthropic(&v, &whole_model)
-                    .to_string()
-                    .into_bytes(),
-                Err(_) => whole.clone(),
-            };
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
-        }
-        let tail = match back.as_mut() {
-            Some(c) => {
-                let mut t = c.process(&tail).into_bytes();
-                // **收尾帧必须补上**：Anthropic 的客户端等着
-                // `message_delta` 和 `message_stop`，少了它们会一直等
-                t.extend_from_slice(c.finish().as_bytes());
+        let tail = match (&session, back.as_mut()) {
+            (Some(s), None) if convert_whole => {
+                if broke.is_some() {
+                    // 半截的整包转不出任何有意义的东西，由下面的错误收尾
+                    Vec::new()
+                } else {
+                    whole.extend_from_slice(&tail);
+                    if !status.is_success() {
+                        s.error(status.as_u16(), &whole)
+                    } else if s.stream {
+                        s.stream_from_whole(&whole).unwrap_or_else(|| whole.clone())
+                    } else {
+                        // 转不动就原样交给客户端 —— 那是上游的原话，比我们编的任何
+                        // 东西都有用
+                        s.response(&whole).unwrap_or_else(|| whole.clone())
+                    }
+                }
+            }
+            (_, Some(c)) => {
+                let mut t = c.process(&tail);
+                // **收尾必须补上**：客户端等着结束帧（Anthropic 的 message_stop、
+                // Chat 的 [DONE]），少了会一直等。中途断了的由下面按错误收尾
+                if broke.is_none() {
+                    t.extend(c.finish());
+                }
                 t
             }
-            None => tail,
+            _ => tail,
         };
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
@@ -1780,7 +1876,10 @@ async fn pipeline(
                 // `source` 用这个错误自己的：上游断了是 `upstream`，被
                 // 防火墙切断是 `denied` —— 后者不是上游坏了，是策略拦的。
                 ending.failed(err.source.slug(), format!("响应流中断：{}", err.message));
-                if is_sse {
+                if let Some(c) = back.as_mut() {
+                    // 转换过的流按客户端的格式收尾
+                    yield Ok(Bytes::from(c.fail(&format!("[ThinkWatch] {}", err.message))));
+                } else if is_sse && session.is_none() {
                     yield Ok(Bytes::from(err.sse_frame()));
                 }
             }

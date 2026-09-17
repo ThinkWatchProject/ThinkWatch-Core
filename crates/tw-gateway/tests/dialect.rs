@@ -188,8 +188,9 @@ async fn a_claude_code_request_reaches_an_openai_only_upstream_in_the_right_shap
     // stop_sequences 改名了
     assert_eq!(sent["stop"][0], "\n\nHuman:");
     assert!(sent.get("stop_sequences").is_none());
-    // thinking 转不过去，不该带上
+    // 思考预算折成推理强度（1024 是最低一档）
     assert!(sent.get("thinking").is_none());
+    assert_eq!(sent["reasoning_effort"], "minimal");
 }
 
 #[tokio::test]
@@ -276,7 +277,13 @@ async fn what_could_not_be_translated_is_reported_to_the_user() {
     // **用户会发现「扩展思考开了却没生效」而完全不知道从哪儿查起。**
     let (up, _) = start_openai_upstream(false).await;
     let (gw, mut rx) = start_gateway(up).await;
-    ask(gw, claude_body(false)).await;
+    // 服务端工具只有 Anthropic 能执行
+    let mut body: serde_json::Value = serde_json::from_str(&claude_body(false)).unwrap();
+    body["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"type": "web_search_20250305", "name": "web_search"}));
+    ask(gw, body.to_string()).await;
 
     let mut found = None;
     while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
@@ -290,9 +297,10 @@ async fn what_could_not_be_translated_is_reported_to_the_user() {
     }
     let (from, to, dropped) = found.expect("没发翻译事件");
     assert_eq!((from.as_str(), to.as_str()), ("anthropic", "openai-chat"));
-    assert!(
-        dropped.iter().any(|d| d.contains("thinking")),
-        "没说 thinking 被丢了：{dropped:?}"
+    assert_eq!(
+        dropped,
+        ["tools.web_search_20250305"],
+        "没说服务端工具被丢了"
     );
 }
 

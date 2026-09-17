@@ -13,7 +13,7 @@ response:
   body: '{"type": "message", "content": [{"type": "text", "text": "一张图。"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1200, "output_tokens": 6}}'
 expect:
   model: claude-opus-4-5
-  input_tokens_estimate: 17
+  input_tokens_estimate: 5
   cache: true
   tools: false
   tool_count: 0

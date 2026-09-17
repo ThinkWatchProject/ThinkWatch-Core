@@ -31,9 +31,100 @@ pub struct Prepared {
     pub session: Session,
 }
 
-/// 客户端请求 → 上游请求。
+/// 解码好的客户端请求。
+///
+/// **解码一次，按上游编码多次**：故障转移换到另一种格式的上游时只需要重新编码。
+/// 编码前可以改 [`Decoded::request`]（规则里的参数改写就改在这里）。
+#[derive(Debug, Clone)]
+pub struct Decoded {
+    pub client: Dialect,
+    pub request: Request,
+    dropped: Dropped,
+    shape: ClientShape,
+}
+
+/// 客户端请求 → 中间表示。
 ///
 /// `path` 和 `query` 是客户端请求的：Gemini 把模型和是否流式写在路径里。
+pub fn decode(
+    client: Dialect,
+    body: &Value,
+    path: &str,
+    query: Option<&str>,
+) -> Result<Decoded, Rejection> {
+    let mut dropped = Dropped::new(client);
+    let mut shape = ClientShape::default();
+    let request = match client {
+        Dialect::Anthropic => anthropic::decode_request(body, &mut dropped)?,
+        Dialect::Chat => chat::decode_request(body, &mut dropped, &mut shape)?,
+        Dialect::Responses => responses::decode_request(body, &mut dropped, &mut shape)?,
+        Dialect::Gemini => {
+            let (model, stream) = gemini_path(path).ok_or_else(|| {
+                Rejection(format!(
+                    "无法从路径 {path} 中读出 Gemini 的模型和调用方式。"
+                ))
+            })?;
+            shape.gemini_sse = query.is_some_and(|q| q.split('&').any(|kv| kv == "alt=sse"));
+            gemini::decode_request(body, &model, stream, &mut dropped)?
+        }
+    };
+    Ok(Decoded {
+        client,
+        request,
+        dropped,
+        shape,
+    })
+}
+
+impl Decoded {
+    /// 中间表示 → 发给某种格式上游的请求。
+    pub fn encode(&self, target: &Target) -> Prepared {
+        let mut dropped = self.dropped.clone();
+        let request = &self.request;
+        let (body, path, query) = match target.dialect {
+            Dialect::Anthropic => (
+                anthropic::encode_request(request, target, &mut dropped),
+                "/v1/messages".to_string(),
+                None,
+            ),
+            Dialect::Chat => (
+                chat::encode_request(request, target, &mut dropped),
+                "/v1/chat/completions".to_string(),
+                None,
+            ),
+            Dialect::Responses => (
+                responses::encode_request(request, target, &mut dropped),
+                "/v1/responses".to_string(),
+                None,
+            ),
+            Dialect::Gemini => {
+                let model = request
+                    .model
+                    .strip_prefix("models/")
+                    .unwrap_or(&request.model);
+                let (action, query) = if request.stream {
+                    ("streamGenerateContent", Some("alt=sse".to_string()))
+                } else {
+                    ("generateContent", None)
+                };
+                (
+                    gemini::encode_request(request, target, &mut dropped),
+                    format!("/v1beta/models/{model}:{action}"),
+                    query,
+                )
+            }
+        };
+        Prepared {
+            body: body.to_string().into_bytes(),
+            path,
+            query,
+            dropped: dropped.into_vec(),
+            session: Session::new(self.client, target.dialect, request, self.shape.clone()),
+        }
+    }
+}
+
+/// 客户端请求 → 上游请求，一步到位。
 pub fn prepare(
     client: Dialect,
     body: &[u8],
@@ -43,63 +134,7 @@ pub fn prepare(
 ) -> Result<Prepared, Rejection> {
     let v: Value =
         serde_json::from_slice(body).map_err(|_| Rejection("请求体不是合法的 JSON。".into()))?;
-    let mut dropped = Dropped::new(client);
-    let mut shape = ClientShape::default();
-    let request = match client {
-        Dialect::Anthropic => anthropic::decode_request(&v, &mut dropped)?,
-        Dialect::Chat => chat::decode_request(&v, &mut dropped, &mut shape)?,
-        Dialect::Responses => responses::decode_request(&v, &mut dropped, &mut shape)?,
-        Dialect::Gemini => {
-            let (model, stream) = gemini_path(path).ok_or_else(|| {
-                Rejection(format!(
-                    "无法从路径 {path} 中读出 Gemini 的模型和调用方式。"
-                ))
-            })?;
-            shape.gemini_sse = query.is_some_and(|q| q.split('&').any(|kv| kv == "alt=sse"));
-            gemini::decode_request(&v, &model, stream, &mut dropped)?
-        }
-    };
-
-    let (body, path, query) = match target.dialect {
-        Dialect::Anthropic => (
-            anthropic::encode_request(&request, target, &mut dropped),
-            "/v1/messages".to_string(),
-            None,
-        ),
-        Dialect::Chat => (
-            chat::encode_request(&request, target, &mut dropped),
-            "/v1/chat/completions".to_string(),
-            None,
-        ),
-        Dialect::Responses => (
-            responses::encode_request(&request, target, &mut dropped),
-            "/v1/responses".to_string(),
-            None,
-        ),
-        Dialect::Gemini => {
-            let model = request
-                .model
-                .strip_prefix("models/")
-                .unwrap_or(&request.model);
-            let (action, query) = if request.stream {
-                ("streamGenerateContent", Some("alt=sse".to_string()))
-            } else {
-                ("generateContent", None)
-            };
-            (
-                gemini::encode_request(&request, target, &mut dropped),
-                format!("/v1beta/models/{model}:{action}"),
-                query,
-            )
-        }
-    };
-    Ok(Prepared {
-        body: body.to_string().into_bytes(),
-        path,
-        query,
-        dropped: dropped.into_vec(),
-        session: Session::new(client, target.dialect, &request, shape),
-    })
+    Ok(decode(client, &v, path, query)?.encode(target))
 }
 
 /// `/v1beta/models/gemini-2.5-pro:streamGenerateContent` → (模型, 是否流式)
@@ -184,6 +219,39 @@ impl Session {
         v.to_string().into_bytes()
     }
 
+    /// 客户端收到的流是不是 SSE。Gemini 客户端不带 `alt=sse` 时是一个 JSON 数组
+    pub fn client_sse(&self) -> bool {
+        !(self.client == Dialect::Gemini && !self.shape.gemini_sse)
+    }
+
+    /// 转换后的响应的 Content-Type
+    pub fn content_type(&self) -> &'static str {
+        if self.stream && self.client_sse() {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }
+    }
+
+    /// 上游给了整包、客户端要的是流：把整包写成一条流。上游返回的不是 JSON 时是 `None`
+    pub fn stream_from_whole(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let v: Value = serde_json::from_slice(body).ok()?;
+        let mut r = match self.upstream {
+            Dialect::Anthropic => anthropic::decode_response(&v),
+            Dialect::Chat => chat::decode_response(&v),
+            Dialect::Responses => responses::decode_response(&v),
+            Dialect::Gemini => gemini::decode_response(&v),
+        };
+        self.normalize(&mut r);
+        let mut w = Writer::new(self);
+        let mut out = String::new();
+        for e in events_of(&r) {
+            out.push_str(&w.event(&e));
+        }
+        out.push_str(&w.finish());
+        Some(out.into_bytes())
+    }
+
     /// 上游的错误响应 → 客户端格式的错误体。状态码不变，说明取上游的原话
     pub fn error(&self, status: u16, body: &[u8]) -> Vec<u8> {
         let message = serde_json::from_slice::<Value>(body)
@@ -266,6 +334,44 @@ pub fn error_body(client: Dialect, status: u16, message: &str) -> Vec<u8> {
         Dialect::Gemini => gemini::response::error_body(status, message),
     };
     v.to_string().into_bytes()
+}
+
+/// 一个整包响应拆成流事件
+fn events_of(r: &Response) -> Vec<Event> {
+    let mut out = vec![Event::Start {
+        id: r.id.clone(),
+        model: r.model.clone(),
+    }];
+    for (index, b) in r.blocks.iter().enumerate() {
+        let (kind, deltas) = match b {
+            Block::Text(t) => (BlockKind::Text, vec![Delta::Text(t.clone())]),
+            Block::Thinking(th) => {
+                let mut d = vec![Delta::Thinking(th.text.clone())];
+                d.extend(th.signature.clone().map(Delta::Signature));
+                (BlockKind::Thinking, d)
+            }
+            Block::ToolCall(c) => (
+                BlockKind::ToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                },
+                vec![Delta::ToolInput(match &c.input {
+                    ToolInput::Text(t) => t.clone(),
+                    json => json.to_json_text(),
+                })],
+            ),
+        };
+        out.push(Event::BlockStart { index, kind });
+        out.extend(
+            deltas
+                .into_iter()
+                .map(|delta| Event::Delta { index, delta }),
+        );
+        out.push(Event::BlockStop { index });
+    }
+    out.extend(r.usage.map(Event::Usage));
+    out.extend(r.stop.clone().map(Event::Stop));
+    out
 }
 
 fn unwrap_freeform(json_text: &str) -> String {
@@ -456,6 +562,20 @@ impl StreamConverter {
     pub fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
         let frames = self.decoder.feed(chunk);
         self.run(frames, false)
+    }
+
+    /// 流在中途出了错（上游断开、被策略切断）：按客户端的格式写一个错误收尾。之后
+    /// [`StreamConverter::finish`] 什么都不再写
+    pub fn fail(&mut self, message: &str) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut out = self.writer.event(&Event::Error {
+            message: message.to_string(),
+        });
+        out.push_str(&self.writer.finish());
+        out.into_bytes()
     }
 
     /// 上游的流结束了（正常结束或断开）。**幂等**
@@ -688,6 +808,33 @@ mod tests {
             "/v1beta/models/gemini-3-pro-preview:streamGenerateContent"
         );
         assert_eq!(p.query.as_deref(), Some("alt=sse"));
+    }
+
+    #[test]
+    fn a_whole_upstream_response_can_be_written_as_the_stream_the_client_asked_for() {
+        let s = Session::for_test(Dialect::Anthropic, Dialect::Chat);
+        let out = s
+            .stream_from_whole(
+                br#"{"choices":[{"message":{"content":"hi","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        for ev in ["message_start", "text_delta", "tool_use", "message_stop"] {
+            assert!(text.contains(ev), "{ev}: {text}");
+        }
+        assert_eq!(s.content_type(), "text/event-stream");
+        let mut g = Session::for_test(Dialect::Gemini, Dialect::Chat);
+        g.shape.gemini_sse = false;
+        assert_eq!(g.content_type(), "application/json");
+    }
+
+    #[test]
+    fn a_failed_stream_ends_in_the_client_shape_and_stays_ended() {
+        let s = Session::for_test(Dialect::Chat, Dialect::Anthropic);
+        let mut c = s.stream();
+        let out = String::from_utf8(c.fail("上游断开")).unwrap();
+        assert!(out.contains("\"message\":\"上游断开\""), "{out}");
+        assert!(c.finish().is_empty());
     }
 
     #[test]

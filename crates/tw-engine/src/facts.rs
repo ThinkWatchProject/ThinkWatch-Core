@@ -6,6 +6,7 @@
 //! 下面这些维度，没有一个在网络代理里有对应物。
 
 use serde::{Deserialize, Serialize};
+use tw_dialect::ir::{Part, Request, ToolInput, ToolKind};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestFacts {
@@ -23,51 +24,44 @@ pub struct RequestFacts {
     pub tools: bool,
     pub tool_count: usize,
     pub image: bool,
-    /// 扩展思考。token 单独计费且很贵
+    /// 推理（扩展思考）开着。token 单独计费且很贵
     pub thinking: bool,
     pub stream: bool,
     /// 这是客户端自己发的辅助请求吗。
     ///
     /// **由识别器打的标记，不是从 body 里读出来的** —— 所以
-    /// `from_anthropic_body` 不会填它，网关在识别之后单独设。空字符串
+    /// `from_request` 不会填它，网关在识别之后单独设。空字符串
     /// 表示这是一个真实的用户请求。
     pub intent: String,
 }
 
 impl RequestFacts {
-    /// 从入站 body 里抽出这些性质。
+    /// 从解码好的请求里抽出这些性质。**四种格式的客户端读的是同一份中间表示**，
+    /// 一条「带图片的走 A」的规则对 Claude Code 和 Gemini CLI 一样生效。
     ///
-    /// **只读不改**（入站恒解析，出站直通）。这里读错了顶多是路由
-    /// 走偏，读的时候动了 body 才是灾难。
-    pub fn from_anthropic_body(v: &serde_json::Value) -> Self {
-        let msgs = v.get("messages").and_then(|m| m.as_array());
+    /// `raw` 是原始请求体，只用来找 `cache_control` —— 中间表示不带缓存标记。
+    /// **只读不改**：这里读错了顶多是路由走偏，读的时候动了 body 才是灾难。
+    pub fn from_request(r: &Request, raw: &serde_json::Value) -> Self {
         Self {
-            model: v
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .to_string(),
+            model: r.model.clone(),
             client: String::new(),
             intent: String::new(),
-            dialect: "anthropic".to_string(),
+            dialect: String::new(),
             // 粗估：4 字节约 1 token。**路由只需要量级** —— 「超过 200k」
             // 和「小于 4k」这种判断，估算完全够用，而精确计数要跑一遍
             // tokenizer，那是每个请求都要付的成本。
-            input_tokens: estimate_tokens(v),
-            max_tokens: v.get("max_tokens").and_then(|m| m.as_u64()),
-            cache: has_cache_control(v),
-            tools: v
-                .get("tools")
-                .and_then(|t| t.as_array())
-                .is_some_and(|a| !a.is_empty()),
-            tool_count: v
-                .get("tools")
-                .and_then(|t| t.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0),
-            image: has_image(msgs),
-            thinking: v.get("thinking").is_some_and(|t| !t.is_null()),
-            stream: v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+            input_tokens: estimate_tokens(r),
+            max_tokens: r.max_tokens,
+            cache: has_cache_control(raw),
+            tools: !r.tools.is_empty(),
+            tool_count: r.tools.len(),
+            image: r.messages.iter().flat_map(|m| &m.parts).any(|p| match p {
+                Part::Image(_) => true,
+                Part::ToolResult(t) => t.has_image(),
+                _ => false,
+            }),
+            thinking: r.reasoning.as_ref().is_some_and(|x| x.enabled),
+            stream: r.stream,
         }
     }
 }
@@ -77,16 +71,31 @@ impl RequestFacts {
 /// 对中文会高估（一个汉字 3 字节但常常就是 1 个 token），但**路由只关心
 /// 量级**：`>200k` 和 `<4k` 这种阈值，估算误差改变不了结论。精确计数要
 /// 跑 tokenizer，那是每个请求都要付的成本，换来的精度没有用处。
-fn estimate_tokens(v: &serde_json::Value) -> u64 {
-    let mut bytes = 0usize;
-    if let Some(s) = v.get("system") {
-        bytes += json_text_len(s);
+///
+/// 图片和文件不计：它们按 token 计价的方式各家不同，而把 base64 的字节数算进来
+/// 会把一张截图估成几十万 token。
+fn estimate_tokens(r: &Request) -> u64 {
+    let mut bytes: usize = r.system.iter().map(String::len).sum();
+    for p in r.messages.iter().flat_map(|m| &m.parts) {
+        bytes += match p {
+            Part::Text(t) => t.len(),
+            Part::Thinking(t) => t.text.len(),
+            Part::ToolCall(c) => {
+                c.name.len()
+                    + match &c.input {
+                        ToolInput::Json(v) => json_text_len(v),
+                        ToolInput::Text(t) => t.len(),
+                    }
+            }
+            Part::ToolResult(t) => t.text().len(),
+            Part::Image(_) | Part::File { .. } => 0,
+        };
     }
-    if let Some(m) = v.get("messages") {
-        bytes += json_text_len(m);
-    }
-    if let Some(t) = v.get("tools") {
-        bytes += json_text_len(t);
+    for t in &r.tools {
+        bytes += t.name.len() + t.description.as_ref().map_or(0, String::len);
+        if let ToolKind::Function { schema, .. } = &t.kind {
+            bytes += json_text_len(schema);
+        }
     }
     (bytes / 4) as u64
 }
@@ -112,25 +121,17 @@ fn has_cache_control(v: &serde_json::Value) -> bool {
     walk(v)
 }
 
-fn has_image(msgs: Option<&Vec<serde_json::Value>>) -> bool {
-    let Some(msgs) = msgs else { return false };
-    msgs.iter().any(|m| {
-        m.get("content")
-            .and_then(|c| c.as_array())
-            .is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
-            })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use tw_dialect::ir::{Dialect, Dropped};
+
     fn facts(json: &str) -> RequestFacts {
-        RequestFacts::from_anthropic_body(&serde_json::from_str(json).unwrap())
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let r = tw_dialect::anthropic::decode_request(&v, &mut Dropped::new(Dialect::Anthropic))
+            .unwrap();
+        RequestFacts::from_request(&r, &v)
     }
 
     #[test]
@@ -196,10 +197,53 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_on_when_the_field_is_present_and_not_null() {
+    fn thinking_is_on_only_when_it_is_enabled() {
         assert!(facts(r#"{"thinking":{"type":"enabled","budget_tokens":10000}}"#).thinking);
+        assert!(facts(r#"{"thinking":{"type":"adaptive"}}"#).thinking);
+        // 明确关掉的不算：以前只看字段在不在，`disabled` 也被当成开着
+        assert!(!facts(r#"{"thinking":{"type":"disabled"}}"#).thinking);
         assert!(!facts(r#"{"thinking":null}"#).thinking);
         assert!(!facts(r#"{}"#).thinking);
+    }
+
+    #[test]
+    fn a_chat_and_a_gemini_request_give_the_same_facts_as_an_anthropic_one() {
+        // 同一个请求用三种格式写，规则看到的应该是同一件事
+        let chat: serde_json::Value = serde_json::from_str(
+            r#"{"model":"m","max_tokens":100,"stream":true,"reasoning_effort":"high",
+                "messages":[{"role":"user","content":[{"type":"text","text":"看图"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}],
+                "tools":[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}}]}"#,
+        )
+        .unwrap();
+        let c = tw_dialect::chat::decode_request(
+            &chat,
+            &mut Dropped::new(Dialect::Chat),
+            &mut Default::default(),
+        )
+        .unwrap();
+        let gemini: serde_json::Value = serde_json::from_str(
+            r#"{"contents":[{"role":"user","parts":[{"text":"看图"},{"inlineData":{"mimeType":"image/png","data":"AAAA"}}]}],
+                "tools":[{"functionDeclarations":[{"name":"a","parametersJsonSchema":{"type":"object"}}]}],
+                "generationConfig":{"maxOutputTokens":100,"thinkingConfig":{"thinkingBudget":20000}}}"#,
+        )
+        .unwrap();
+        let g = tw_dialect::gemini::decode_request(
+            &gemini,
+            "m",
+            true,
+            &mut Dropped::new(Dialect::Gemini),
+        )
+        .unwrap();
+        for f in [
+            RequestFacts::from_request(&c, &chat),
+            RequestFacts::from_request(&g, &gemini),
+        ] {
+            assert_eq!(f.model, "m");
+            assert_eq!(f.max_tokens, Some(100));
+            assert!(f.stream && f.image && f.tools && f.thinking, "{f:?}");
+            assert_eq!(f.tool_count, 1);
+        }
     }
 
     #[test]

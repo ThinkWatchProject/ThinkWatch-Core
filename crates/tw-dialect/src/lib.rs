@@ -13,7 +13,3 @@ pub mod gemini;
 pub mod ir;
 pub mod responses;
 pub mod think;
-
-pub mod req;
-pub mod resp;
-pub mod sse;
