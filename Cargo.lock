@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "tw-adopt"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2789,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "tw-api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "tw-config"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "notify",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "tw-control"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "bytes",
@@ -2852,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "tw-crypto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2864,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "tw-dialect"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "tw-engine"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "tw-gateway"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -2924,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "tw-observe"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "tokio",
  "tracing",
@@ -2933,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pricing"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arc-swap",
  "flate2",
@@ -2945,7 +2945,7 @@ dependencies = [
 
 [[package]]
 name = "tw-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "futures",
@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "tw-provider"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "aws-credential-types",
@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "tw-redact"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "serde",
@@ -2992,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "tw-resil"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "futures",
  "metrics",
@@ -3005,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "tw-scan"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "notify",
  "regex",
@@ -3022,14 +3022,14 @@ dependencies = [
 
 [[package]]
 name = "tw-secret"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tw-store"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "libc",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "tw-types"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "tw-yaml"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "saphyr-parser",
  "serde_yaml_ng",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "twcore"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
