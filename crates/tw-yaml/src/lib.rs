@@ -272,6 +272,16 @@ pub fn nodes(text: &str) -> Result<Vec<Node>, PatchError> {
                 }
                 let mut bytes = c2b.range(sp);
                 bytes.end = bytes.start + tighten(&text[bytes.clone()], style);
+                // **映射里空着的值（`key:`），解析器的标记停在冒号上**，不在
+                // 它后面。照它写，值会粘在冒号前面（`allow[]:`、一个叫
+                // `note:hi` 的键）；从它往回找冒号，找到的是上一个键的。
+                // 在这里挪到冒号后面，下游拿到的就是值真正的位置
+                if bytes.is_empty()
+                    && matches!(pending, Some(Step::Key(_)))
+                    && text[bytes.start..].starts_with(':')
+                {
+                    bytes = bytes.start + 1..bytes.start + 1;
+                }
                 out.push(Node {
                     path: node_path(&pending, &cur),
                     bytes,
@@ -411,27 +421,22 @@ fn after_key_colon(text: &str, at: usize) -> Option<usize> {
     None
 }
 
-/// 值该写在哪一段字节上。
-///
-/// **值是空的时候（`key:` 后面什么都没有），解析器给的标记停在冒号
-/// 上面而不是后面** —— 照它直接写，`allow` 会变成 `allow[]:`，`note`
-/// 会变成 `note:hi` 里那个叫 `note:hi` 的标量。配置里「写了键、还没填
-/// 值」很常见，而这两种产物都解析不回原来那个键。
-fn value_slot(text: &str, at: &Range<usize>) -> Range<usize> {
-    if !at.is_empty() {
-        return at.clone();
+/// 引出这个节点的冒号在哪，返回它**后面**一个字节。
+fn key_colon(text: &str, n: &Node) -> Option<usize> {
+    after_key_colon(text, n.bytes.start)
+}
+
+/// 键在第几列。`- key:` 那种写法里，键在短划线后面。
+fn key_column(text: &str, colon: usize) -> usize {
+    let line_start = text[..colon].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &text[line_start..colon];
+    let trimmed = line.trim_start();
+    let mut col = line.len() - trimmed.len();
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        let after = rest.trim_start();
+        col += 1 + (rest.len() - after.len());
     }
-    let line_end = text[at.start..]
-        .find('\n')
-        .map(|i| at.start + i)
-        .unwrap_or(text.len());
-    match text[at.start..line_end].find(':') {
-        Some(i) => {
-            let after = at.start + i + 1;
-            after..after
-        }
-        None => at.clone(),
-    }
+    col
 }
 
 /// 改一个标量值，**只动它那一段字节**。
@@ -454,13 +459,10 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
         return Err(PatchError::BlockScalar(show(path)));
     }
     let rendered = render_scalar(value, found.style);
-    let slot = value_slot(text, &found.bytes);
-    // 冒号后面还没有空格就补一个
-    let pad = if slot.is_empty() && !text[slot.start..].starts_with(' ') {
-        " "
-    } else {
-        ""
-    };
+    let slot = found.bytes.clone();
+    // 空着的值紧贴在冒号后面（见 `nodes`）：补一个空格再写。冒号后面原有的
+    // 空白和注释留在值后面
+    let pad = if slot.is_empty() { " " } else { "" };
     let mut out = String::with_capacity(text.len() + rendered.len() + pad.len());
     out.push_str(&text[..slot.start]);
     out.push_str(pad);
@@ -489,54 +491,45 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
     Ok(out)
 }
 
-/// 一个映射节点底下那一块到哪结束，以及它的子键缩进在第几列。
+/// 一个节点底下那一块在哪结束：所有后代里最远的那个字节所在行的行尾。
 ///
 /// **不能拿「最后一个直接子节点」的位置来算。**容器子节点的 `bytes` 是
 /// 解析器给的一个空区间，落在它内容的起点上 —— 对 `routes:` 来说那是
-/// 第一个 `-` 那一行。照它抄缩进会抄成列表项的缩进，插入点也会落进列表
-/// 中间：`insert` 和 `append_first` 各自栽过一次（一次把 `routes:` 插到
-/// 了两个 client 之间，一次把 `default_route:` 插到了列表项里面），所以
-/// 这段逻辑只留一份。
-///
-/// 按整块算：末尾取这个节点底下**所有后代**的最远处，缩进取这块里非空
-/// 行的最小缩进 —— 那正是这一层键所在的列。
-fn block_of(text: &str, all: &[Node], parent: &[Step]) -> Option<(usize, String)> {
-    let (mut start, mut last) = (usize::MAX, 0usize);
-    for n in all
+/// 第一个 `-` 那一行，块的真正末尾在它后代的最远处。
+fn block_end(text: &str, all: &[Node], path: &[Step]) -> Option<usize> {
+    let last = all
         .iter()
-        .filter(|n| n.path.len() > parent.len() && n.path.starts_with(parent))
-    {
-        start = start.min(n.bytes.start);
-        last = last.max(n.bytes.end.min(text.len()));
-    }
-    if start == usize::MAX {
-        return None;
-    }
-    let first_line = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let end = text[last..]
-        .find('\n')
-        .map(|i| last + i)
-        .unwrap_or(text.len());
-    // **跳过 `-` 开头的行和注释行。**映射本身是列表的一项时
-    // （`clients[0]`），它的第一个键写在 `- name: a` 这一行上，那一行的
-    // 缩进是短划线的，比键实际所在的列少两格；注释则是用户想顶格写就
-    // 顶格写的，跟这一层的缩进无关。
-    let indent = text[first_line..end]
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !t.is_empty() && !t.starts_with('-') && !t.starts_with('#')
+        .filter(|n| n.path.len() > path.len() && n.path.starts_with(path))
+        .map(|n| n.bytes.end.min(text.len()))
+        .max()?;
+    Some(
+        text[last..]
+            .find('\n')
+            .map(|i| last + i)
+            .unwrap_or(text.len()),
+    )
+}
+
+/// 一个映射节点底下那一块到哪结束，以及它的子键写在第几列。
+///
+/// **缩进按直接子键本身所在的列定，不按块里的行首。**子节点的字节区间是
+/// 值的区间：值是块式列表或映射时，区间从下一行、更深一层开始。照那一行
+/// 抄缩进，新写的键会落进别人的列表项或映射里 —— `insert`、`append_first`、
+/// `put` 各栽过一次（`routes:` 插到了两个 client 之间，`default_route:`
+/// 插进了列表项，`auto_update` 插进了 `sheets` 的第一项），所以这段逻辑
+/// 只留一份。
+fn block_of(text: &str, all: &[Node], parent: &[Step]) -> Option<(usize, String)> {
+    let end = block_end(text, all, parent)?;
+    let indent = all
+        .iter()
+        .filter(|n| {
+            n.path.len() == parent.len() + 1
+                && n.path.starts_with(parent)
+                && matches!(n.path.last(), Some(Step::Key(_)))
         })
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .or_else(|| {
-            // 整块只有一行 `- name: a` —— 键在短划线后面两格
-            text[first_line..end]
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| l.len() - l.trim_start().len() + 2)
-        })
-        .unwrap_or(0);
+        .filter_map(|n| key_colon(text, n))
+        .map(|colon| key_column(text, colon))
+        .min()?;
     Some((end, " ".repeat(indent)))
 }
 
@@ -552,16 +545,15 @@ fn count_items(all: &[Node], seq_path: &[Step]) -> usize {
         .unwrap_or(0)
 }
 
-/// 把 `at` 这段值换成 `[]`，必要时在冒号后面补空格。
+/// 把 `at` 这段值换成 `[]`。空着的值紧贴在冒号后面（见 `nodes`），补一个空格。
 fn put_empty_seq(text: &str, at: &Range<usize>) -> String {
-    let slot = value_slot(text, at);
     let mut out = String::with_capacity(text.len() + 3);
-    out.push_str(&text[..slot.start]);
-    if !text[slot.start..].starts_with(' ') {
+    out.push_str(&text[..at.start]);
+    if at.is_empty() {
         out.push(' ');
     }
     out.push_str("[]");
-    out.push_str(&text[slot.end..]);
+    out.push_str(&text[at.end..]);
     out
 }
 
@@ -1088,6 +1080,69 @@ mod seq_tests {
 mod first_write_tests {
     use super::*;
 
+    /// 往一个映射里加键，而它的**第一个键的值是块式的**。
+    ///
+    /// 子节点的字节区间是值的区间：值是块式列表或映射时，区间从下一行、
+    /// 更深一层的缩进开始。按那一行定缩进，新键会落进那个列表项里 ——
+    /// 读回来是另一份配置，写入被自检拦下，界面上表现为「保存不了」。
+    #[test]
+    fn a_key_added_beside_a_block_valued_first_key_lands_at_that_keys_column() {
+        for (cfg, path, want) in [
+            (
+                "version: 1\npricing:\n  sheets:\n    - name: a\n",
+                vec![Step::key("pricing"), Step::key("auto_update")],
+                "version: 1\npricing:\n  sheets:\n    - name: a\n  auto_update: false\n",
+            ),
+            (
+                "version: 1\nlisten:\n  gateway:\n    port: 1\n",
+                vec![Step::key("listen"), Step::key("auto_update")],
+                "version: 1\nlisten:\n  gateway:\n    port: 1\n  auto_update: false\n",
+            ),
+            // 列表项里的映射：键在短划线后面
+            (
+                "clients:\n  - allow:\n      - a\n",
+                vec![
+                    Step::key("clients"),
+                    Step::Index(0),
+                    Step::key("auto_update"),
+                ],
+                "clients:\n  - allow:\n      - a\n    auto_update: false\n",
+            ),
+        ] {
+            let out = insert(cfg, &path, &Scalar::Bool(false)).unwrap();
+            assert_eq!(out, want);
+        }
+    }
+
+    /// 第一个键的值是空的（`note:`），缩进也得从它自己的冒号算。
+    #[test]
+    fn a_blank_first_key_still_tells_the_column() {
+        let cfg = "pricing:\n  note:\n  sheets:\n    - name: a\n";
+        let out = insert(
+            cfg,
+            &[Step::key("pricing"), Step::key("auto_update")],
+            &Scalar::Bool(false),
+        )
+        .unwrap();
+        assert_eq!(out, format!("{cfg}  auto_update: false\n"));
+    }
+
+    /// 同一个问题在「第一次往列表里加一项」那条路上。
+    #[test]
+    fn a_first_list_beside_a_block_valued_first_key_lands_at_that_keys_column() {
+        let cfg = "version: 1\nlisten:\n  gateway:\n    port: 1\n";
+        let out = append(
+            cfg,
+            &[Step::key("listen"), Step::key("allow_from")],
+            "127.0.0.1",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "version: 1\nlisten:\n  gateway:\n    port: 1\n  allow_from:\n    - 127.0.0.1\n"
+        );
+    }
+
     /// 尾部是块式列表的文件，往**顶层**插一个键。
     ///
     /// 容器节点的 `bytes` 是内容起点上的一个空区间，照它算位置会把
@@ -1155,11 +1210,25 @@ mod first_write_tests {
     /// `key:x` —— 一个名叫 `key:x` 的标量。
     #[test]
     fn setting_a_key_whose_value_is_blank_does_not_glue_it_to_the_colon() {
-        let cfg = "version: 1\nnote:\n";
-        let out = set(cfg, &[Step::key("note")], &Scalar::s("hi")).unwrap();
-        assert!(out.contains("note: hi"), "{out}");
-        let back: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
-        assert_eq!(back["note"].as_str(), Some("hi"));
+        // 冒号后面什么都没有、只有空格、只有注释 —— 值都写在冒号后面，
+        // 原有的空白和注释留在它后面
+        for (cfg, want) in [
+            ("version: 1\nnote:\n", "version: 1\nnote: hi\n"),
+            ("version: 1\nnote: \n", "version: 1\nnote: hi \n"),
+            (
+                "version: 1\nnote:   # 见 https://x\n",
+                "version: 1\nnote: hi   # 见 https://x\n",
+            ),
+        ] {
+            let out = set(cfg, &[Step::key("note")], &Scalar::s("hi")).unwrap();
+            assert_eq!(out, want);
+        }
+    }
+
+    #[test]
+    fn a_blank_list_key_with_a_trailing_space_becomes_an_empty_list() {
+        let out = clear_seq("allow: \n", &[Step::key("allow")]).unwrap();
+        assert_eq!(out, "allow: [] \n");
     }
 
     const ALLOW: &str = "clients:\n  - name: demo\n    key: tw-a\n    allow:\n      # 只给这些\n      - claude-*\n      - gpt-*\n";

@@ -75,6 +75,11 @@ fn gen_entry(rng: &mut Rng, out: &mut String, depth: usize) {
     // 键必须唯一才好断言，加个序号
     let key = format!("{key}_{}", rng.below(1000));
     match rng.below(if depth >= 2 { 4 } else { 6 }) {
+        // 写了键、还没填值（`key:`）。真实配置里很常见，而解析器给这种值的
+        // 位置标记和别的值不一样
+        0 if rng.chance(3) => {
+            out.push_str(&format!("{pad}{key}:\n"));
+        }
         0..=3 => {
             let v = gen_scalar(rng);
             out.push_str(&format!("{pad}{key}: {v}"));
@@ -360,6 +365,61 @@ fn putting_a_value_changes_that_value_and_nothing_else() {
     }
     assert!(checked > 1500, "只真正验了 {checked} 次，样本太少");
     eprintln!("真正验了 {checked} 次整值写入");
+}
+
+#[test]
+fn adding_a_key_to_any_mapping_puts_it_there_and_nothing_else() {
+    let mut checked = 0usize;
+    for seed in 1..=3000u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1);
+        let doc = gen_doc(&mut rng);
+        let Ok(all) = nodes(&doc) else { continue };
+        let Ok(before) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&doc) else {
+            continue;
+        };
+        // 任意一个映射：顶层、嵌套的、列表项。**它的第一个键的值是什么形状
+        // 都有可能** —— 块式的值从下一行、更深一层开始，缩进不能照它抄
+        let maps: Vec<_> = all
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Map))
+            .collect();
+        if maps.is_empty() {
+            continue;
+        }
+        let parent = maps[rng.below(maps.len())];
+        let mut path = parent.path.clone();
+        path.push(Step::key(format!("新键_{seed}")));
+        let (value, text, block) = gen_put_value(&mut rng);
+        let put_value = if block {
+            Put::Block(&text)
+        } else {
+            Put::Inline(&text)
+        };
+        let out = match put(&doc, &path, put_value) {
+            Ok(o) => o,
+            Err(PatchError::AnchorOrAlias(_)) | Err(PatchError::Duplicate(_)) => continue,
+            Err(e) => panic!(
+                "seed {seed}：{} 加不进去：{e}\n--- 值 ---\n{text}\n--- 原 ---\n{doc}",
+                show(&path)
+            ),
+        };
+        checked += 1;
+        let after: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out)
+            .unwrap_or_else(|e| panic!("seed {seed} 写完解析不了：{e}\n{out}"));
+        let mut expected = before.clone();
+        slot(&mut expected, &parent.path)
+            .as_mapping_mut()
+            .unwrap()
+            .insert(serde_yaml_ng::Value::String(format!("新键_{seed}")), value);
+        assert_eq!(
+            after,
+            expected,
+            "seed {seed}：往 {} 里加键之后语义不对\n--- 原 ---\n{doc}\n--- 新 ---\n{out}",
+            show(&parent.path)
+        );
+    }
+    assert!(checked > 1500, "只真正验了 {checked} 次，样本太少");
+    eprintln!("真正验了 {checked} 次加键");
 }
 
 #[test]

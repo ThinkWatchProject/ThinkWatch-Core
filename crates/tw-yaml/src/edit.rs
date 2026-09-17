@@ -267,8 +267,7 @@ fn replace_value(
         NodeKind::Scalar { style, .. }
             if !matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) =>
         {
-            let slot = value_slot(text, &node.bytes);
-            (slot.start.max(colon), slot.end.max(colon))
+            (node.bytes.start, node.bytes.end)
         }
         _ => (colon, value_end(text, all, node)?),
     };
@@ -412,24 +411,6 @@ fn is_flow(text: &str, n: &Node) -> bool {
         )
 }
 
-/// 引出这个值的冒号的位置（冒号本身的下一个字节）。
-fn key_colon(text: &str, n: &Node) -> Option<usize> {
-    after_key_colon(text, n.bytes.start)
-}
-
-/// 键在第几列。`- key:` 那种写法里，键在短划线后面。
-fn key_column(text: &str, colon: usize) -> usize {
-    let line_start = text[..colon].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line = &text[line_start..colon];
-    let trimmed = line.trim_start();
-    let mut col = line.len() - trimmed.len();
-    if let Some(rest) = trimmed.strip_prefix('-') {
-        let after = rest.trim_start();
-        col += 1 + (rest.len() - after.len());
-    }
-    col
-}
-
 /// 一个值在原文里结束的位置（最后一个字节之后）。
 fn value_end(text: &str, all: &[Node], n: &Node) -> Result<usize, PatchError> {
     match &n.kind {
@@ -437,9 +418,9 @@ fn value_end(text: &str, all: &[Node], n: &Node) -> Result<usize, PatchError> {
         NodeKind::Map | NodeKind::Seq if is_flow(text, n) => flow_end(text, n.bytes.start)
             .map(|i| i + 1)
             .ok_or_else(|| PatchError::NotFound(format!("{}（行内写法没收尾）", show(&n.path)))),
-        NodeKind::Map | NodeKind::Seq => block_of(text, all, &n.path)
-            .map(|(end, _)| end)
-            .ok_or_else(|| PatchError::NotFound(show(&n.path))),
+        NodeKind::Map | NodeKind::Seq => {
+            block_end(text, all, &n.path).ok_or_else(|| PatchError::NotFound(show(&n.path)))
+        }
     }
 }
 
@@ -640,6 +621,18 @@ mod tests {
         assert_eq!(v["providers"].as_sequence().unwrap().len(), 2);
         assert!(v["providers"][0].get("name").is_none());
         assert_eq!(v["providers"][0]["key"], "sk-a");
+    }
+
+    /// 写了键、还没填值（`note:`）。**解析器给这种值的标记停在冒号上**，
+    /// 从那儿往回找冒号会找到上一个键的 —— 写进去的值粘在冒号上变成另一个
+    /// 键，删掉的是上一行。
+    #[test]
+    fn a_key_with_a_blank_value_is_written_and_removed_at_its_own_colon() {
+        let cfg = "pricing:\n  note:\n  auto_update: false\n";
+        let out = put(cfg, &p(&["pricing", "note"]), Put::Inline("x")).unwrap();
+        assert_eq!(out, "pricing:\n  note: x\n  auto_update: false\n");
+        let out = remove_key(cfg, &p(&["pricing", "note"])).unwrap();
+        assert_eq!(out, "pricing:\n  auto_update: false\n");
     }
 
     #[test]
