@@ -330,6 +330,45 @@ pub enum Event {
         state: String,
         at_ms: u64,
     },
+    /// 某个代理通不通变了（只在变化那一刻发一次）。
+    ///
+    /// **没有它，代理挂了看起来就是「好几家上游同时不通」** —— 而那两件事
+    /// 要做的处理完全不同。转发失败时顺手检一次那个代理，不做定时探测。
+    ProxyChanged {
+        id: u64,
+        proxy: String,
+        /// `unreachable` = 刚刚检查不通；`reachable` = 又通了
+        state: String,
+        /// 不通时卡在哪一步，已脱敏。通了没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        at_ms: u64,
+    },
+    /// 上游拒绝了我们的凭据（401/403），或者重新接受了。
+    ///
+    /// **熔断器看不见这件事**：4xx 不算失败，所以一个凭据坏掉的上游永远不会
+    /// 被熔断，也就永远不会有 `HealthChanged`。而它要用户去改配置。
+    AuthChanged {
+        id: u64,
+        provider: String,
+        /// `rejected` = 上游拒绝了凭据；`accepted` = 又能用了
+        state: String,
+        /// 被拒时上游给的状态码
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        at_ms: u64,
+    },
+    /// 磁盘空间的档位变了，记录随之减少或停止。
+    ///
+    /// **用户点开一个请求发现没有正文时，得知道那不是 bug。**
+    StorageChanged {
+        id: u64,
+        /// `ok` = 全记；`metadata_only` = 不再存正文；`stopped` = 连记录也停了
+        level: String,
+        /// 还剩多少可用空间
+        free_bytes: u64,
+        at_ms: u64,
+    },
     /// 上游在响应头里报了订阅额度。
     ///
     /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
@@ -380,6 +419,11 @@ pub enum Event {
         line: Option<usize>,
         /// 出错那一行的原文，**已脱敏**
         excerpt: Option<String>,
+        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation`。
+        ///
+        /// **界面靠它区分「用户在编辑器里写错了」和「界面自己刚写坏了」** ——
+        /// 前者要提醒，后者是保存失败，那条路自己会报。
+        origin: String,
         at_ms: u64,
     },
     /// 客户端的辅助请求被本地应答了，一个字节都没发给上游。
@@ -472,6 +516,9 @@ impl Event {
             | Event::RequestPriced { id, .. }
             | Event::ClientsChanged { id, .. }
             | Event::HealthChanged { id, .. }
+            | Event::ProxyChanged { id, .. }
+            | Event::AuthChanged { id, .. }
+            | Event::StorageChanged { id, .. }
             | Event::Redacted { id, .. }
             | Event::ToolCallFlagged { id, .. }
             | Event::ResponseInspected { id, .. }
