@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod dryrun;
 pub mod nics;
 pub mod replay;
+pub mod resources;
 pub mod rotation;
 pub mod scan;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
@@ -84,7 +85,6 @@ pub fn router(state: ControlState) -> Router {
         .route("/keys/new", get(new_key))
         .route("/events", get(events))
         .route("/overview", get(overview))
-        .route("/probe", post(probe))
         .route("/l1", post(l1))
         .route(
             "/config",
@@ -113,7 +113,6 @@ pub fn router(state: ControlState) -> Router {
         .route("/speed/quote", post(speed_quote))
         .route("/speed/run", post(speed_run))
         .route("/request/{id}", get(request_detail))
-        .route("/setup", post(setup))
         // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认
         .route("/baseline", get(baseline))
         // 诊断包（脱敏纪律）。**只读，不写任何文件**
@@ -139,6 +138,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/targets", get(clients::mcp_targets))
         .route("/mcp/plan", post(clients::mcp_plan_op))
         .route("/mcp/apply", post(clients::mcp_apply))
+        .merge(resources::router())
         .with_state(state)
 }
 
@@ -238,40 +238,13 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 // **密码不出这个函数。**它和上游的 key 是同一类东西，
                 // 而这个视图会进日志、进诊断包、进用户贴出来的截图。
                 has_auth: x.auth.is_some(),
-                used_by: cfg.providers.iter().filter(|p| p.proxy == x.name).count(),
+                used_by: tw_config::refs::proxy_users(cfg, &x.name),
             })
             .collect(),
         providers: cfg
             .providers
             .iter()
-            .map(|p| tw_api::ProviderView {
-                name: p.name.clone(),
-                base_url: tw_secret::redact_url(&p.base_url),
-                key_source: p.key.describe(),
-                protocol: p.effective_protocol().map(|x| format!("{x:?}")),
-                proxy: p.proxy.clone(),
-                health: match s.health().state(&p.name) {
-                    tw_gateway::health::State::Closed => "ok".into(),
-                    tw_gateway::health::State::Open => "open".into(),
-                },
-                billing: p.billing.map(|b| b.slug().to_string()),
-                // **给判完的结果，不是配置里那个 Option。**界面要显示的是
-                // 「这家现在算不算受信任」，而那件事在没写的时候由
-                // base_url 决定
-                trust: tw_gateway::guard::effective_trust(p, &tw_engine::Guard::default())
-                    .label()
-                    .to_string(),
-                trust_explicit: p.trust.is_some(),
-                // 和 trust 同一个理由：给判完的结果。不写的时候官方端点是
-                // 空的、其余是那四类默认，而用户要看的是「这家实际脱哪几
-                // 类」
-                redact: p
-                    .effective_redact()
-                    .iter()
-                    .map(|k| k.slug().to_string())
-                    .collect(),
-                redact_explicit: p.redact.is_some(),
-            })
+            .map(|p| provider_view(&s, cfg, p))
             .collect(),
         routes: engine
             .routes()
@@ -363,6 +336,67 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     })
 }
 
+/// 一个上游给界面看的样子。**任何一个字段都不带密钥原文。**
+fn provider_view(
+    s: &ControlState,
+    cfg: &tw_config::Config,
+    p: &tw_config::Provider,
+) -> tw_api::ProviderView {
+    let base_url = tw_secret::redact_url(&p.base_url);
+    // `${NAME}` 整个是一个变量时才算「环境变量」。混着明文的写法
+    // （`sk-${SUFFIX}`）界面编辑不了，按明文密钥显示，改的时候整个替换
+    let env = match &p.key {
+        tw_config::Secret::Literal(v) => v
+            .strip_prefix("${")
+            .and_then(|r| r.strip_suffix('}'))
+            .filter(|n| !n.is_empty() && !n.contains(['$', '{', '}']))
+            .map(str::to_string),
+        _ => None,
+    };
+    let oauth = p.key.oauth();
+    tw_api::ProviderView {
+        name: p.name.clone(),
+        base_url_masked: base_url != p.base_url,
+        base_url,
+        key_source: p.key.describe(),
+        key_kind: match (&p.key, &env) {
+            (tw_config::Secret::OAuth { .. }, _) => "oauth",
+            (_, Some(_)) => "env",
+            _ => "key",
+        }
+        .to_string(),
+        key_env: env,
+        oauth_endpoint: oauth.map(|o| o.endpoint.clone()),
+        oauth_client_id: oauth.and_then(|o| o.client_id.clone()),
+        protocol: p.effective_protocol().map(|x| x.slug().to_string()),
+        protocol_explicit: p.protocol.is_some(),
+        proxy: p.proxy.clone(),
+        on_proxy_fail: p.on_proxy_fail.slug().to_string(),
+        models: p.models.clone(),
+        health: match s.health().state(&p.name) {
+            tw_gateway::health::State::Closed => "ok".into(),
+            tw_gateway::health::State::Open => "open".into(),
+        },
+        billing: p.billing.map(|b| b.slug().to_string()),
+        // **给判完的结果，不是配置里那个 Option。**界面要显示的是
+        // 「这家现在算不算受信任」，而那件事在没写的时候由 base_url 决定
+        trust: tw_gateway::guard::effective_trust(p, &tw_engine::Guard::default())
+            .slug()
+            .to_string(),
+        trust_explicit: p.trust.is_some(),
+        redact: p
+            .effective_redact()
+            .iter()
+            .map(|k| k.slug().to_string())
+            .collect(),
+        redact_explicit: p.redact.is_some(),
+        references: tw_config::refs::provider_refs(cfg, &p.name)
+            .iter()
+            .map(resources::reference_view)
+            .collect(),
+    }
+}
+
 /// 把 `when` 写成人话。
 ///
 /// **规则列表上必须能直接读懂条件** —— 让用户去对着 YAML 猜「这条为什么
@@ -420,16 +454,12 @@ fn join_one_or_many(v: &tw_engine::rule::OneOrMany) -> String {
     }
 }
 
-/// 探一个上游。零成本，用户可以随便点。
-async fn probe(
-    State(s): State<ControlState>,
-    Json(req): Json<tw_api::ProbeRequest>,
-) -> Json<tw_api::ProbeResponse> {
-    let r = tw_gateway::probe(s.http(), &req.base_url, &req.key, None).await;
-    // 两边的枚举是同一份契约的两个副本（core 内部一份、控制面契约一份）。
-    // 手工转换是为了让 tw-api 不依赖 tw-gateway —— UI 和 CLI 只该依赖
-    // 契约，不该被拖上整个数据面。
-    let models = match r.models {
+/// 模型清单的两份副本之间转换（core 内部一份、控制面契约一份）。
+///
+/// 手工转换是为了让 tw-api 不依赖 tw-gateway —— UI 和 CLI 只该依赖契约，
+/// 不该被拖上整个数据面。
+pub(crate) fn model_list(m: tw_gateway::ModelList) -> tw_api::ModelList {
+    match m {
         tw_gateway::ModelList::Listed { models } => tw_api::ModelList::Listed { models },
         tw_gateway::ModelList::NotImplemented { status } => {
             tw_api::ModelList::NotImplemented { status }
@@ -438,14 +468,7 @@ async fn probe(
             tw_api::ModelList::Unrecognized { sample }
         }
         tw_gateway::ModelList::Empty => tw_api::ModelList::Empty,
-    };
-    Json(tw_api::ProbeResponse {
-        ok: r.ok,
-        protocol: r.protocol,
-        latency_ms: r.latency_ms,
-        models,
-        error: r.error,
-    })
+    }
 }
 
 /// L1 测速。**零成本**，不发任何业务请求，用户可以随便点。
@@ -459,27 +482,6 @@ async fn l1(
 ) -> Result<Json<Vec<tw_api::L1Result>>, (StatusCode, String)> {
     let cfg = s.config();
     let mut out = Vec::new();
-
-    // 只测代理本身。代理影响的是网络层，测到 L1 就够了。
-    if let Some(name) = &req.proxy {
-        let p = cfg
-            .proxies
-            .iter()
-            .find(|x| x.name == *name)
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("没有叫 `{name}` 的代理")))?;
-        let mut r = tw_gateway::l1_tcp(&p.addr).await;
-        r.notes
-            .push("只测到代理这一跳的 TCP 握手。代理影响的是网络层，再往上就该测上游了。".into());
-        out.push(view(format!("代理 {}", p.name), None, r));
-        return Ok(Json(out));
-    }
-
-    // 还没保存时的临时地址（首次配置那一步）。
-    if let Some(url) = &req.base_url {
-        let r = tw_gateway::l1(url, None).await;
-        out.push(view(url.clone(), None, r));
-        return Ok(Json(out));
-    }
 
     let targets: Vec<&tw_config::Provider> = match &req.provider {
         Some(n) => vec![
@@ -508,12 +510,16 @@ async fn l1(
         };
         let via = hop.as_ref().map(|_| p.proxy.clone());
         let r = tw_gateway::l1(&p.base_url, hop.as_ref()).await;
-        out.push(view(p.name.clone(), via, r));
+        out.push(l1_view(p.name.clone(), via, r));
     }
     Ok(Json(out))
 }
 
-fn view(target: String, via: Option<String>, r: tw_gateway::L1Result) -> tw_api::L1Result {
+pub(crate) fn l1_view(
+    target: String,
+    via: Option<String>,
+    r: tw_gateway::L1Result,
+) -> tw_api::L1Result {
     tw_api::L1Result {
         target,
         via,
@@ -1379,9 +1385,9 @@ async fn config_rollback(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-type Fail = (StatusCode, String);
+pub(crate) type Fail = (StatusCode, String);
 
-fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
+pub(crate) fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
     (code, e.to_string())
 }
 
@@ -1389,22 +1395,28 @@ fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
 ///
 /// **`Stale` 必须是 409 而不是 400。**界面要能区分「我写错了」和「有人
 /// 抢先改了」—— 后者的正确反应是刷新再合并，而不是给用户看一条错误。
-fn apply_fail(e: ApplyError) -> Fail {
+pub(crate) fn apply_fail(e: ApplyError) -> Fail {
+    use tw_config::edit::EditError;
     let code = match &e {
         ApplyError::Stale { .. } => StatusCode::CONFLICT,
         ApplyError::Store(tw_config::StoreError::Conflict { .. }) => StatusCode::CONFLICT,
-        ApplyError::Rejected(_) | ApplyError::Build(_) | ApplyError::BadPath(_) => {
-            StatusCode::BAD_REQUEST
+        // 名字撞了、还有人在引用 —— 都是「现在的配置不允许」，不是请求写错了
+        ApplyError::Edit(EditError::NameTaken { .. }) | ApplyError::InUse(_) => {
+            StatusCode::CONFLICT
         }
-        ApplyError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ApplyError::Edit(EditError::NotFound { .. }) => StatusCode::NOT_FOUND,
+        ApplyError::Rejected(_)
+        | ApplyError::Build(_)
+        | ApplyError::BadPath(_)
+        | ApplyError::Edit(EditError::Unwritable(_))
+        | ApplyError::Edit(EditError::Yaml(_)) => StatusCode::BAD_REQUEST,
+        ApplyError::Edit(EditError::Parse(_) | EditError::SelfCheck(_)) | ApplyError::Store(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
     (code, e.to_string())
 }
 
-/// 首次运行：写下第一个上游。
-///
-/// **整文件生成**，不走最小替换 —— 那是两套机制（第 1 步）。
-/// 只在还没有 provider 时可用，之后改配置归 M2 的双向同步管。
 /// 最近这一段有多长。
 const RECENT_HOURS: u32 = 24;
 /// 拿来当基线的那一段有多长。
@@ -1550,65 +1562,6 @@ async fn session_detail(
         .map(turn_view)
         .collect();
     Ok(Json(tw_api::SessionDetail { session, turns }))
-}
-
-async fn setup(
-    State(s): State<ControlState>,
-    Json(req): Json<tw_api::SetupRequest>,
-) -> Result<Json<tw_api::SetupResponse>, (StatusCode, String)> {
-    // **从磁盘重新读，不看 `s.config`。** 那是启动时的快照，而这个端点
-    // 自己就会改磁盘 —— 用快照做守卫，第二次调用会因为看到一份过期的
-    // 「零 provider」而通过，然后把刚写好的配置整个覆盖掉。
-    //
-    // 热重载（M2）之后快照会跟着磁盘走，但那时这条守卫也不该改回去：
-    // 「会不会覆盖用户的文件」这种判断，就该问文件本身。
-    let current = tw_config::load(s.config_path()).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("读配置失败：{e}"),
-        )
-    })?;
-    if !current.providers.is_empty() {
-        // 拒绝而不是覆盖。这个端点存在的前提是「还没有配置」，一旦有了
-        // 配置，整文件重写会把用户的注释和格式全抹掉。
-        return Err((
-            StatusCode::CONFLICT,
-            "已经配过上游了。改配置请直接编辑 config.yaml，或者等界面上的配置页。".to_string(),
-        ));
-    }
-    let mut cfg = current;
-    cfg.providers.push(tw_config::Provider {
-        name: req.name.clone(),
-        base_url: req.base_url.clone(),
-        key: tw_config::Secret::Literal(req.key.clone()),
-        // 猜得出来就不写进文件 —— 少一行是一行。
-        ..Default::default()
-    });
-    tw_config::validate(&cfg).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let text = serde_yaml_ng::to_string(&cfg).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("序列化失败：{e}"),
-        )
-    })?;
-    // **走同一扇门。**直接写文件的话，这次写会被自己的监听当成外部改动
-    // （多一次无谓的重载），而且不进历史 —— 于是「刚配好就配错了」没有
-    // 退路可回。
-    s.cfg
-        .write(&text, None, tw_config::history::Origin::Ui)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
-    let gateway_key = cfg
-        .clients
-        .first()
-        .map(|c| c.key.clone())
-        .unwrap_or_default();
-    Ok(Json(tw_api::SetupResponse {
-        gateway_key,
-        gateway_addr: s.gateway_addr.clone().unwrap_or_default(),
-        config_path: s.config_path().display().to_string(),
-    }))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1785,36 +1738,5 @@ mod describe_tests {
         let lines = describe_when(&w);
         assert!(!lines.is_empty(), "空的条件列表在界面上就是「兜底」");
         assert!(lines[0].contains("relay"), "{lines:?}");
-    }
-}
-
-#[cfg(test)]
-mod overview_tests {
-    /// **代理的密码不能出现在概览里。**它和上游的 key 是同一类东西，
-    /// 而这个视图会进日志、进诊断包、进用户贴出来的截图。
-    #[test]
-    fn a_proxy_password_never_reaches_the_overview() {
-        let cfg: tw_config::Config = serde_yaml_ng::from_str(
-            "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://x.com\n    key: sk-a\n    proxy: 翻墙\nproxies:\n  - name: 翻墙\n    type: socks5h\n    addr: 127.0.0.1:1080\n    auth:\n      user: u\n      pass: 这是密码不能漏\n",
-        )
-        .unwrap();
-        let view: Vec<tw_api::ProxyView> = cfg
-            .proxies
-            .iter()
-            .map(|x| tw_api::ProxyView {
-                name: x.name.clone(),
-                kind: x.kind.slug().to_string(),
-                addr: x.addr.clone(),
-                has_auth: x.auth.is_some(),
-                used_by: cfg.providers.iter().filter(|p| p.proxy == x.name).count(),
-            })
-            .collect();
-        let json = serde_json::to_string(&view).unwrap();
-        assert!(!json.contains("这是密码不能漏"), "{json}");
-        assert!(!json.contains("\"u\""), "用户名也是凭据的一半：{json}");
-        // 有没有认证是要显示的，认证内容不是
-        assert!(view[0].has_auth);
-        // 有几家在用 —— 删之前要知道
-        assert_eq!(view[0].used_by, 1);
     }
 }

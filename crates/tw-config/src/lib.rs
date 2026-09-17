@@ -7,17 +7,19 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub use tw_types::Limits;
 
+pub mod edit;
 pub mod history;
 mod init;
 mod probes;
 pub mod proxy;
+pub mod refs;
 pub mod reload;
 mod security;
 pub mod store;
 mod validate;
 pub mod watch;
 
-pub use init::{generate_initial, generate_key, generate_with_provider};
+pub use init::{generate_initial, generate_key};
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
 
@@ -568,6 +570,13 @@ pub enum Trust {
 }
 
 impl Trust {
+    /// 写进 YAML 的那个词。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Trust::Official => "official",
+            Trust::Untrusted => "untrusted",
+        }
+    }
     pub fn label(&self) -> &'static str {
         match self {
             Trust::Official => "官方",
@@ -654,6 +663,18 @@ pub enum Protocol {
     OpenaiChat,
     OpenaiResponses,
     Gemini,
+}
+
+impl Protocol {
+    /// 写进 YAML 的那个词。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Protocol::Anthropic => "anthropic",
+            Protocol::OpenaiChat => "openai-chat",
+            Protocol::OpenaiResponses => "openai-responses",
+            Protocol::Gemini => "gemini",
+        }
+    }
 }
 
 impl Provider {

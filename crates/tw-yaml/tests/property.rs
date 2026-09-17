@@ -8,7 +8,7 @@
 //! 像真实配置文件**的东西 —— 注释、空行、中文、各种引号风格、嵌套。
 //! 一个通用的 shrinker 对这个形状帮不上什么忙，而种子可复现已经够用了。
 
-use tw_yaml::{NodeKind, PatchError, Scalar, Step, nodes, set};
+use tw_yaml::{NodeKind, PatchError, Put, Scalar, Step, nodes, put, remove_key, set};
 
 /// xorshift64。**要的是可复现，不是随机质量** —— 挂了要能拿种子重放。
 struct Rng(u64);
@@ -262,4 +262,155 @@ fn diff_paths(
         }
         _ => vec![at.join(".")],
     }
+}
+
+/// 按路径取出一棵语义树里的那个位置。
+fn slot<'a>(v: &'a mut serde_yaml_ng::Value, path: &[Step]) -> &'a mut serde_yaml_ng::Value {
+    let mut cur = v;
+    for st in path {
+        cur = match st {
+            Step::Key(k) => cur
+                .as_mapping_mut()
+                .unwrap()
+                .get_mut(serde_yaml_ng::Value::String(k.clone()))
+                .unwrap(),
+            Step::Index(i) => &mut cur.as_sequence_mut().unwrap()[*i],
+        };
+    }
+    cur
+}
+
+/// 一个随机的新值，连同它渲染好的文本。**渲染交给 serde_yaml_ng** ——
+/// 和资源层真正的调用方式一致。
+fn gen_put_value(rng: &mut Rng) -> (serde_yaml_ng::Value, String, bool) {
+    use serde_yaml_ng::Value as V;
+    let scalar = |rng: &mut Rng| -> V {
+        match rng.below(5) {
+            0 => V::from(rng.below(1000) as u64),
+            1 => V::from(rng.below(1000) as f64 / 8.0),
+            2 => V::Bool(rng.chance(2)),
+            3 => V::String(rng.pick(VALUES).to_string()),
+            _ => V::String(
+                rng.pick(&["no", "y", "", "a: b", " x ", "# 假注释", "sk-a#b", "- 开头"])
+                    .to_string(),
+            ),
+        }
+    };
+    let v = match rng.below(4) {
+        0 | 1 => scalar(rng),
+        2 => {
+            let mut m = serde_yaml_ng::Mapping::new();
+            for i in 0..1 + rng.below(3) {
+                m.insert(V::String(format!("{}_{i}", rng.pick(KEYS))), scalar(rng));
+            }
+            V::Mapping(m)
+        }
+        _ => V::Sequence((0..1 + rng.below(3)).map(|_| scalar(rng)).collect()),
+    };
+    let text = serde_yaml_ng::to_string(&v).unwrap();
+    let text = text.trim_end_matches('\n').to_string();
+    let block = matches!(v, V::Mapping(_) | V::Sequence(_));
+    (v, text, block)
+}
+
+#[test]
+fn putting_a_value_changes_that_value_and_nothing_else() {
+    let mut checked = 0usize;
+    for seed in 1..=3000u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+        let doc = gen_doc(&mut rng);
+        let Ok(all) = nodes(&doc) else { continue };
+        let Ok(before) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&doc) else {
+            continue;
+        };
+        // 任意一个映射里的键（值可以是标量、块式映射、块式列表）
+        let keys: Vec<_> = all
+            .iter()
+            .filter(|n| matches!(n.path.last(), Some(Step::Key(_))))
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let target = keys[rng.below(keys.len())];
+        let (value, text, block) = gen_put_value(&mut rng);
+        let put_value = if block {
+            Put::Block(&text)
+        } else {
+            Put::Inline(&text)
+        };
+        let out = match put(&doc, &target.path, put_value) {
+            Ok(o) => o,
+            Err(PatchError::AnchorOrAlias(_)) | Err(PatchError::Duplicate(_)) => continue,
+            Err(e) => panic!(
+                "seed {seed}：{} 写不进去：{e}\n--- 值 ---\n{text}\n--- 原 ---\n{doc}",
+                show(&target.path)
+            ),
+        };
+        checked += 1;
+        let after: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out)
+            .unwrap_or_else(|e| panic!("seed {seed} 写完解析不了：{e}\n{out}"));
+        let mut expected = before.clone();
+        *slot(&mut expected, &target.path) = value;
+        assert_eq!(
+            after,
+            expected,
+            "seed {seed}：{} 写完语义不对\n--- 原 ---\n{doc}\n--- 新 ---\n{out}",
+            show(&target.path)
+        );
+    }
+    assert!(checked > 1500, "只真正验了 {checked} 次，样本太少");
+    eprintln!("真正验了 {checked} 次整值写入");
+}
+
+#[test]
+fn removing_a_key_removes_that_entry_and_nothing_else() {
+    let mut checked = 0usize;
+    for seed in 1..=3000u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x94D0_49BB_1331_11EB) | 1);
+        let doc = gen_doc(&mut rng);
+        let Ok(all) = nodes(&doc) else { continue };
+        let Ok(before) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&doc) else {
+            continue;
+        };
+        let keys: Vec<_> = all
+            .iter()
+            .filter(|n| matches!(n.path.last(), Some(Step::Key(_))))
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let target = keys[rng.below(keys.len())];
+        let out = match remove_key(&doc, &target.path) {
+            Ok(o) => o,
+            // 列表项里唯一的键：明确拒绝，不是失败
+            Err(PatchError::NotFound(m)) if m.contains("唯一的键") => continue,
+            Err(PatchError::AnchorOrAlias(_)) | Err(PatchError::Duplicate(_)) => continue,
+            Err(e) => panic!("seed {seed}：{} 删不掉：{e}\n{doc}", show(&target.path)),
+        };
+        checked += 1;
+        let after: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out)
+            .unwrap_or_else(|e| panic!("seed {seed} 删完解析不了：{e}\n{out}"));
+        // 期望：删掉那个键；父映射删空了而父是某个键的值，父也一起没了
+        let mut expected = before.clone();
+        let mut path = target.path.clone();
+        loop {
+            let (last, parent) = path.split_last().unwrap();
+            let Step::Key(k) = last else { unreachable!() };
+            let m = slot(&mut expected, parent).as_mapping_mut().unwrap();
+            m.remove(serde_yaml_ng::Value::String(k.clone()));
+            if m.is_empty() && matches!(parent.last(), Some(Step::Key(_))) {
+                path = parent.to_vec();
+                continue;
+            }
+            break;
+        }
+        assert_eq!(
+            after,
+            expected,
+            "seed {seed}：删 {} 之后语义不对\n--- 原 ---\n{doc}\n--- 新 ---\n{out}",
+            show(&target.path)
+        );
+    }
+    assert!(checked > 1500, "只真正验了 {checked} 次，样本太少");
+    eprintln!("真正验了 {checked} 次删键");
 }

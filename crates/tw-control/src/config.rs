@@ -39,6 +39,12 @@ pub enum ApplyError {
     BadPath(String),
     #[error("版本对不上：你基于 {base}，而现在是 {current}。刷新一下再改。")]
     Stale { base: String, current: String },
+    /// 按资源改（上游、代理、价目表）时的失败：名字撞了、找不到、值写不进去。
+    #[error(transparent)]
+    Edit(#[from] tw_config::edit::EditError),
+    /// 还有别的配置在引用它，删不掉。**消息里要说清是谁。**
+    #[error("{0}")]
+    InUse(String),
 }
 
 impl ConfigManager {
@@ -149,6 +155,34 @@ impl ConfigManager {
         // 到了，于是我们把自己刚写的当成外部改动又重载一遍。
         *self.seen.lock().await = Some(fp);
         self.apply_text(new_text, origin).await
+    }
+
+    /// 在当前这一版上做一次改动：`f` 拿到磁盘上的原文和它解析出来的配置，
+    /// 返回改完的原文。
+    ///
+    /// **所有按资源的写入都走这一条**：版本核对、先校验再写、写之前存历史、
+    /// 写完换入 —— 和 `patch` 同一条路，只是「怎么改」交给调用方。
+    pub async fn transform<F>(
+        &self,
+        base_version: Option<&str>,
+        origin: Origin,
+        f: F,
+    ) -> Result<String, ApplyError>
+    where
+        F: FnOnce(&str, &tw_config::Config) -> Result<String, ApplyError>,
+    {
+        let cur = self.current()?;
+        if let Some(base) = base_version
+            && cur.version() != base
+        {
+            return Err(ApplyError::Stale {
+                base: base.to_string(),
+                current: cur.version(),
+            });
+        }
+        let cfg = tw_config::try_parse(&cur.text).map_err(ApplyError::Rejected)?;
+        let text = f(&cur.text, &cfg)?;
+        self.write(&text, Some(&cur.version()), origin).await
     }
 
     /// 回到某一版。

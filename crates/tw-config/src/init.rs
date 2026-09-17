@@ -3,7 +3,7 @@
 //! **整文件生成，不走最小替换** —— 那是两套机制：这里是从无到
 //! 有，那里是改一个字节而保住其余全部。
 
-use crate::{Client, Config, Provider};
+use crate::{Client, Config};
 
 /// 生成一把网关密钥。
 ///
@@ -35,18 +35,6 @@ pub fn generate_initial() -> Config {
         // 层 0（不写规则也能跑）就是这份配置的形状。
         ..Default::default()
     }
-}
-
-/// 带一个 provider 的完整初始配置，用于引导流程结束时落盘。
-pub fn generate_with_provider(name: &str, base_url: &str, key: &str) -> Config {
-    let mut cfg = generate_initial();
-    cfg.providers.push(Provider {
-        name: name.to_string(),
-        base_url: base_url.to_string(),
-        key: crate::Secret::Literal(key.to_string()),
-        ..Default::default()
-    });
-    cfg
 }
 
 #[cfg(test)]
@@ -85,18 +73,12 @@ mod tests {
     }
 
     #[test]
-    fn a_config_with_one_provider_is_immediately_usable() {
-        let c = generate_with_provider("relay", "https://api.example.com", "sk-1");
-        assert!(crate::validate::validate(&c).is_ok());
-    }
-
-    #[test]
     fn the_generated_config_round_trips_through_yaml() {
         // 生成出来的东西必须自己能读回去，否则首次运行就废了。
-        let c = generate_with_provider("relay", "https://api.example.com", "sk-1");
+        let c = generate_initial();
         let text = serde_yaml_ng::to_string(&c).unwrap();
         let back: Config = serde_yaml_ng::from_str(&text).unwrap();
         assert_eq!(back.clients[0].key, c.clients[0].key);
-        assert_eq!(back.providers[0].base_url, "https://api.example.com");
+        assert!(crate::validate::validate(&back).is_ok());
     }
 }

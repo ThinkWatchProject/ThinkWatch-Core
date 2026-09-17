@@ -39,7 +39,11 @@ fn base_client_builder() -> reqwest::ClientBuilder {
 }
 
 /// 给一个 provider 建 Client，带上它该走的代理。
-fn build_client(
+/// 按这家上游的出站设置建一个 HTTP 客户端。
+///
+/// **公开是给控制面检测一个还没保存的上游用的** —— 检测必须和转发走同一条
+/// 出站路径，否则「检测通了、转发不通」会成为可能。
+pub fn client_for_provider(
     cfg: &tw_config::Config,
     p: &tw_config::Provider,
 ) -> Result<reqwest::Client, GatewayError> {
@@ -167,7 +171,7 @@ impl Runtime {
             });
             match reusable {
                 Some(c) => clients.insert(p.name.clone(), c.clone()),
-                None => clients.insert(p.name.clone(), build_client(&config, p)?),
+                None => clients.insert(p.name.clone(), client_for_provider(&config, p)?),
             };
         }
         let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
@@ -1946,8 +1950,8 @@ mod tests {
     #[test]
     fn the_two_builtin_proxy_names_need_no_declaration() {
         let cfg = tw_config::Config::default();
-        assert!(build_client(&cfg, &provider_with_proxy(tw_config::DIRECT)).is_ok());
-        assert!(build_client(&cfg, &provider_with_proxy(tw_config::SYSTEM)).is_ok());
+        assert!(client_for_provider(&cfg, &provider_with_proxy(tw_config::DIRECT)).is_ok());
+        assert!(client_for_provider(&cfg, &provider_with_proxy(tw_config::SYSTEM)).is_ok());
     }
 
     #[test]
@@ -1955,7 +1959,7 @@ mod tests {
         // 启动时报，不要等请求进来。而且要说清有哪两个内置名字 ——
         // 用户十有八九是想写 `direct`。
         let cfg = tw_config::Config::default();
-        let e = build_client(&cfg, &provider_with_proxy("airport")).unwrap_err();
+        let e = client_for_provider(&cfg, &provider_with_proxy("airport")).unwrap_err();
         assert!(e.message.contains("airport"), "{}", e.message);
         assert!(e.message.contains("direct"), "{}", e.message);
         // 行续接留下的缩进不该进错误信息
@@ -1977,7 +1981,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(build_client(&cfg, &provider_with_proxy("airport")).is_ok());
+        assert!(client_for_provider(&cfg, &provider_with_proxy("airport")).is_ok());
     }
 
     #[test]
