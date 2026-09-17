@@ -422,9 +422,14 @@ fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Re
                 .iter()
                 .find(|x| x.name == name)
                 .with_context(|| format!("没有叫 `{name}` 的代理"))?;
-            let r = tw_gateway::l1_tcp(&px.addr).await;
-            print_l1(&format!("代理 {}", px.name), None, &r);
-            println!("  只测到代理这一跳。代理影响的是网络层，再往上就该测上游了。");
+            let hop = tw_gateway::hop_of(px).map_err(anyhow::Error::msg)?;
+            let (host, port) = tw_gateway::proxy_target(&cfg, &px.name);
+            let r = tw_gateway::l1_proxy(&hop, &host, port).await;
+            print_l1(
+                &format!("代理 {}（经它连 {host}:{port}）", px.name),
+                None,
+                &r,
+            );
             return Ok(());
         }
         let targets: Vec<&tw_config::Provider> = match &provider {

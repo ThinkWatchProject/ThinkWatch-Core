@@ -79,22 +79,42 @@ pub fn hop_for(
                 .iter()
                 .find(|x| x.name == name)
                 .ok_or_else(|| format!("provider `{}` 要走代理 `{name}`，但 proxies 段里没有这个名字。", p.name))?;
-            let auth = match &px.auth {
-                None => None,
-                Some(a) => Some((
-                    a.user.clone(),
-                    a.pass
-                        .resolve()
-                        .map_err(|e| format!("代理 `{name}` 的密码取不出来：{e}"))?,
-                )),
-            };
-            Ok(Some(ProxyHop {
-                kind: px.kind,
-                addr: px.addr.clone(),
-                auth,
-            }))
+            hop_of(px).map(Some)
         }
     }
+}
+
+/// 一个代理条目解析成一跳。**密码在这里取出来**，取不出来（环境变量没设）
+/// 直接说是哪个代理的哪一项。
+pub fn hop_of(px: &tw_config::Proxy) -> Result<ProxyHop, String> {
+    let auth = match &px.auth {
+        None => None,
+        Some(a) => Some((
+            a.user.clone(),
+            a.pass
+                .resolve()
+                .map_err(|e| format!("代理 `{}` 的密码取不出来：{e}", px.name))?,
+        )),
+    };
+    Ok(ProxyHop {
+        kind: px.kind,
+        addr: px.addr.clone(),
+        auth,
+    })
+}
+
+/// 测一个代理时让它去连哪儿。
+///
+/// SOCKS5 和 HTTP CONNECT 的握手都是「帮我连到某处」，所以握手必须带一个
+/// 目标。**用第一家走这个代理的上游** —— 测的就是它实际要替谁连；还没有
+/// 上游用它时，退到 `api.anthropic.com:443`。
+pub fn proxy_target(cfg: &tw_config::Config, proxy: &str) -> (String, u16) {
+    cfg.providers
+        .iter()
+        .filter(|p| p.proxy == proxy)
+        .find_map(|p| target_of(&p.base_url).ok())
+        .map(|(host, port, _)| (host, port))
+        .unwrap_or_else(|| ("api.anthropic.com".to_string(), 443))
 }
 
 trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -207,31 +227,19 @@ pub async fn l1(base_url: &str, proxy: Option<&ProxyHop>) -> L1Result {
     t.ok()
 }
 
-/// 只量到某个 `host:port` 的 TCP 一跳。
+/// 只量代理这一跳：连上代理，并**完成它的握手（含认证）**为止。
 ///
-/// 给代理用。**测代理和测上游是两种测量，不是同一种的参数不同** ——
-/// 拿一个编出来的 `http://` URL 去复用 `l1`，结果里会多一句「这是一个
-/// http:// 地址，没有 TLS 这一段」，而那个 http 是我们自己编的，用户
-/// 从没写过。代理测速就到这一层为止。
-pub async fn l1_tcp(hostport: &str) -> L1Result {
+/// **握手必须做完。**以前这里只量到 TCP：密码错了、或者那个端口上跑的
+/// 根本不是这种代理，结果照样是「通」—— 然后走它的上游全部连不上，而
+/// 用户刚看过一个绿色的对勾。
+///
+/// 握手的目标见 [`proxy_target`]。上游那一段（TLS 以及之后）不在这里测，
+/// 那是链路测速对每个上游做的事。
+pub async fn l1_proxy(p: &ProxyHop, host: &str, port: u16) -> L1Result {
     let mut t = Timer::new();
-    let (host, port) = match split_hostport(hostport) {
-        Ok(v) => v,
-        Err(e) => return t.fail("配置", e),
-    };
-    let addr = match resolve(&mut t, &host, port, "DNS 解析").await {
-        Ok(a) => a,
-        Err(e) => return t.fail("DNS 解析", e),
-    };
-    match phase("TCP 握手", TcpStream::connect(addr)).await {
-        Ok(_) => {
-            t.mark("TCP 握手");
-            t.ok()
-        }
-        Err(e) => {
-            let msg = tcp_message(&e, addr);
-            t.fail("TCP 握手", msg)
-        }
+    match connect_via_proxy(&mut t, p, host, port).await {
+        Ok(_) => t.ok(),
+        Err(r) => r,
     }
 }
 
@@ -972,31 +980,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testing_a_proxy_does_not_invent_an_http_url_to_apologise_for() {
-        // 拿一个编出来的 `http://` 去复用 l1，结果里会多一句「这是一个
-        // http:// 地址，没有 TLS 这一段」—— 而那个 http 是我们自己编的，
-        // 用户从没写过，看到只会困惑。
-        let a = dead_ear().await;
-        let r = l1_tcp(&a.to_string()).await;
-        assert!(r.ok, "{r:?}");
-        assert_eq!(names(&r), ["TCP 握手"]);
-        assert!(
-            !r.notes.iter().any(|n| n.contains("http://")),
-            "{:?}",
-            r.notes
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refused_port_says_nothing_is_listening_not_just_an_errno() {
+    async fn a_refused_proxy_port_says_nothing_is_listening_not_just_an_errno() {
         // 「Connection refused (os error 61)」和「那个端口上没有东西在听」
         // 之间隔着一次搜索。
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = l.local_addr().unwrap();
         drop(l);
-        let e = l1_tcp(&a.to_string()).await.error.unwrap();
+        let p = hop(tw_config::ProxyKind::Socks5h, a, None);
+        let r = l1_proxy(&p, "api.anthropic.com", 443).await;
+        assert!(!r.ok);
+        let e = r.error.unwrap();
         assert!(e.contains("没有东西在听"), "{e}");
         assert!(!e.contains("os error"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn testing_a_proxy_completes_its_handshake_with_the_credentials() {
+        // 只量 TCP 的话，密码错了也是「通」。握手做完，认证才算验过。
+        let (a, creds) = fake_socks5(Socks5Opts {
+            need_auth: true,
+            domain_bound: false,
+        })
+        .await;
+        let p = hop(tw_config::ProxyKind::Socks5h, a, Some(("svc", "p@ss")));
+        let r = l1_proxy(&p, "api.anthropic.com", 443).await;
+        assert!(r.ok, "{r:?}");
+        assert_eq!(names(&r), ["TCP 握手 · 代理", "代理握手"]);
+        assert_eq!(creds.await.unwrap(), "svc:p@ss");
+    }
+
+    #[test]
+    fn a_proxy_is_tested_against_the_first_upstream_that_uses_it() {
+        let cfg: tw_config::Config = serde_yaml_ng::from_str(
+            "version: 1\nproxies:\n  - { name: hk, type: socks5h, addr: 127.0.0.1:7890 }\nproviders:\n  - { name: a, base_url: https://api.anthropic.com, key: k }\n  - { name: b, base_url: http://relay.example:8080, key: k, proxy: hk }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            proxy_target(&cfg, "hk"),
+            ("relay.example".to_string(), 8080)
+        );
+        assert_eq!(
+            proxy_target(&cfg, "unused"),
+            ("api.anthropic.com".to_string(), 443)
+        );
     }
 
     #[tokio::test]

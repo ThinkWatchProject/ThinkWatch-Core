@@ -37,13 +37,13 @@ pub use bodies::{BodyKind, BodyRecord, BodySender};
 pub use clientprobe::{ProbeKind, classify};
 pub use error::GatewayError;
 pub use health::Health;
-pub use l1::{L1Result, ProxyHop, Segment, l1, l1_tcp};
+pub use l1::{L1Result, ProxyHop, Segment, hop_of, l1, l1_proxy, proxy_target};
 pub use l3::{Estimate, L3Result};
 pub use limits::{Gate, LimitError, Limits};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quota::{Quota, from_headers as quota_from_headers};
 pub use server::{
-    AppState, Runtime, refresh_catalog, router, serve, serve_following_config,
+    AppState, Runtime, client_for_provider, refresh_catalog, router, serve, serve_following_config,
     spawn_catalog_refresh,
 };
 pub use usage::{Sniffer, Usage};

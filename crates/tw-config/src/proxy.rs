@@ -98,6 +98,16 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+impl OnProxyFail {
+    /// 写进 YAML 的那个词。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            OnProxyFail::Fail => "fail",
+            OnProxyFail::Direct => "direct",
+        }
+    }
+}
+
 /// 代理挂了怎么办。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

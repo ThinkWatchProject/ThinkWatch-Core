@@ -16,7 +16,9 @@ use std::ops::Range;
 
 use saphyr_parser::{Event, Parser, ScalarStyle, Span};
 
+mod edit;
 mod render;
+pub use edit::{Put, is_flow_at, put, remove_key, replace_item};
 pub use render::{Scalar, render_scalar};
 
 /// 到某个节点的路径。`providers[1].base_url` 写成
@@ -270,6 +272,16 @@ pub fn nodes(text: &str) -> Result<Vec<Node>, PatchError> {
                 }
                 let mut bytes = c2b.range(sp);
                 bytes.end = bytes.start + tighten(&text[bytes.clone()], style);
+                // **映射里空着的值（`key:`），解析器的标记停在冒号上**，不在
+                // 它后面。照它写，值会粘在冒号前面（`allow[]:`、一个叫
+                // `note:hi` 的键）；从它往回找冒号，找到的是上一个键的。
+                // 在这里挪到冒号后面，下游拿到的就是值真正的位置
+                if bytes.is_empty()
+                    && matches!(pending, Some(Step::Key(_)))
+                    && text[bytes.start..].starts_with(':')
+                {
+                    bytes = bytes.start + 1..bytes.start + 1;
+                }
                 out.push(Node {
                     path: node_path(&pending, &cur),
                     bytes,
@@ -409,61 +421,22 @@ fn after_key_colon(text: &str, at: usize) -> Option<usize> {
     None
 }
 
-/// 拿一个标量盖掉一整块列表或映射。
-///
-/// **三态里的「回来那一步」走的是这条路。**`allow` 从一张清单退回
-/// 「什么都不限」时写进去的是 `~`，原来那一整块要跟着消失。没有它的
-/// 话，`insert` 会在旁边再写一个同名键 —— 护栏拦得住，但用户看到的是
-/// 「这是个 bug，请贴到 issue 里」，而他只是想把设过的东西撤回去。
-fn overwrite_block(
-    text: &str,
-    all: &[Node],
-    node: &Node,
-    rendered: &str,
-) -> Result<String, PatchError> {
-    let at = after_key_colon(text, node.bytes.start)
-        .ok_or_else(|| PatchError::NotFound(show(&node.path)))?;
-    // 有后代就按整块算；`key: []` 这种没有后代，就到本行行尾
-    let end = block_of(text, all, &node.path)
-        .map(|(e, _)| e)
-        .unwrap_or_else(|| {
-            text[node.bytes.start..]
-                .find('\n')
-                .map(|i| node.bytes.start + i)
-                .unwrap_or(text.len())
-        });
-    if end < at {
-        return Err(PatchError::NotFound(show(&node.path)));
-    }
-    let mut out = String::with_capacity(text.len() + rendered.len());
-    out.push_str(&text[..at]);
-    out.push(' ');
-    out.push_str(rendered);
-    out.push_str(&text[end..]);
-    Ok(out)
+/// 引出这个节点的冒号在哪，返回它**后面**一个字节。
+fn key_colon(text: &str, n: &Node) -> Option<usize> {
+    after_key_colon(text, n.bytes.start)
 }
 
-/// 值该写在哪一段字节上。
-///
-/// **值是空的时候（`key:` 后面什么都没有），解析器给的标记停在冒号
-/// 上面而不是后面** —— 照它直接写，`allow` 会变成 `allow[]:`，`note`
-/// 会变成 `note:hi` 里那个叫 `note:hi` 的标量。配置里「写了键、还没填
-/// 值」很常见，而这两种产物都解析不回原来那个键。
-fn value_slot(text: &str, at: &Range<usize>) -> Range<usize> {
-    if !at.is_empty() {
-        return at.clone();
+/// 键在第几列。`- key:` 那种写法里，键在短划线后面。
+fn key_column(text: &str, colon: usize) -> usize {
+    let line_start = text[..colon].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &text[line_start..colon];
+    let trimmed = line.trim_start();
+    let mut col = line.len() - trimmed.len();
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        let after = rest.trim_start();
+        col += 1 + (rest.len() - after.len());
     }
-    let line_end = text[at.start..]
-        .find('\n')
-        .map(|i| at.start + i)
-        .unwrap_or(text.len());
-    match text[at.start..line_end].find(':') {
-        Some(i) => {
-            let after = at.start + i + 1;
-            after..after
-        }
-        None => at.clone(),
-    }
+    col
 }
 
 /// 改一个标量值，**只动它那一段字节**。
@@ -486,13 +459,10 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
         return Err(PatchError::BlockScalar(show(path)));
     }
     let rendered = render_scalar(value, found.style);
-    let slot = value_slot(text, &found.bytes);
-    // 冒号后面还没有空格就补一个
-    let pad = if slot.is_empty() && !text[slot.start..].starts_with(' ') {
-        " "
-    } else {
-        ""
-    };
+    let slot = found.bytes.clone();
+    // 空着的值紧贴在冒号后面（见 `nodes`）：补一个空格再写。冒号后面原有的
+    // 空白和注释留在值后面
+    let pad = if slot.is_empty() { " " } else { "" };
     let mut out = String::with_capacity(text.len() + rendered.len() + pad.len());
     out.push_str(&text[..slot.start]);
     out.push_str(pad);
@@ -521,54 +491,45 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
     Ok(out)
 }
 
-/// 一个映射节点底下那一块到哪结束，以及它的子键缩进在第几列。
+/// 一个节点底下那一块在哪结束：所有后代里最远的那个字节所在行的行尾。
 ///
 /// **不能拿「最后一个直接子节点」的位置来算。**容器子节点的 `bytes` 是
 /// 解析器给的一个空区间，落在它内容的起点上 —— 对 `routes:` 来说那是
-/// 第一个 `-` 那一行。照它抄缩进会抄成列表项的缩进，插入点也会落进列表
-/// 中间：`insert` 和 `append_first` 各自栽过一次（一次把 `routes:` 插到
-/// 了两个 client 之间，一次把 `default_route:` 插到了列表项里面），所以
-/// 这段逻辑只留一份。
-///
-/// 按整块算：末尾取这个节点底下**所有后代**的最远处，缩进取这块里非空
-/// 行的最小缩进 —— 那正是这一层键所在的列。
-fn block_of(text: &str, all: &[Node], parent: &[Step]) -> Option<(usize, String)> {
-    let (mut start, mut last) = (usize::MAX, 0usize);
-    for n in all
+/// 第一个 `-` 那一行，块的真正末尾在它后代的最远处。
+fn block_end(text: &str, all: &[Node], path: &[Step]) -> Option<usize> {
+    let last = all
         .iter()
-        .filter(|n| n.path.len() > parent.len() && n.path.starts_with(parent))
-    {
-        start = start.min(n.bytes.start);
-        last = last.max(n.bytes.end.min(text.len()));
-    }
-    if start == usize::MAX {
-        return None;
-    }
-    let first_line = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let end = text[last..]
-        .find('\n')
-        .map(|i| last + i)
-        .unwrap_or(text.len());
-    // **跳过 `-` 开头的行和注释行。**映射本身是列表的一项时
-    // （`clients[0]`），它的第一个键写在 `- name: a` 这一行上，那一行的
-    // 缩进是短划线的，比键实际所在的列少两格；注释则是用户想顶格写就
-    // 顶格写的，跟这一层的缩进无关。
-    let indent = text[first_line..end]
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !t.is_empty() && !t.starts_with('-') && !t.starts_with('#')
+        .filter(|n| n.path.len() > path.len() && n.path.starts_with(path))
+        .map(|n| n.bytes.end.min(text.len()))
+        .max()?;
+    Some(
+        text[last..]
+            .find('\n')
+            .map(|i| last + i)
+            .unwrap_or(text.len()),
+    )
+}
+
+/// 一个映射节点底下那一块到哪结束，以及它的子键写在第几列。
+///
+/// **缩进按直接子键本身所在的列定，不按块里的行首。**子节点的字节区间是
+/// 值的区间：值是块式列表或映射时，区间从下一行、更深一层开始。照那一行
+/// 抄缩进，新写的键会落进别人的列表项或映射里 —— `insert`、`append_first`、
+/// `put` 各栽过一次（`routes:` 插到了两个 client 之间，`default_route:`
+/// 插进了列表项，`auto_update` 插进了 `sheets` 的第一项），所以这段逻辑
+/// 只留一份。
+fn block_of(text: &str, all: &[Node], parent: &[Step]) -> Option<(usize, String)> {
+    let end = block_end(text, all, parent)?;
+    let indent = all
+        .iter()
+        .filter(|n| {
+            n.path.len() == parent.len() + 1
+                && n.path.starts_with(parent)
+                && matches!(n.path.last(), Some(Step::Key(_)))
         })
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .or_else(|| {
-            // 整块只有一行 `- name: a` —— 键在短划线后面两格
-            text[first_line..end]
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| l.len() - l.trim_start().len() + 2)
-        })
-        .unwrap_or(0);
+        .filter_map(|n| key_colon(text, n))
+        .map(|colon| key_column(text, colon))
+        .min()?;
     Some((end, " ".repeat(indent)))
 }
 
@@ -584,121 +545,16 @@ fn count_items(all: &[Node], seq_path: &[Step]) -> usize {
         .unwrap_or(0)
 }
 
-/// 把 `at` 这段值换成 `[]`，必要时在冒号后面补空格。
+/// 把 `at` 这段值换成 `[]`。空着的值紧贴在冒号后面（见 `nodes`），补一个空格。
 fn put_empty_seq(text: &str, at: &Range<usize>) -> String {
-    let slot = value_slot(text, at);
     let mut out = String::with_capacity(text.len() + 3);
-    out.push_str(&text[..slot.start]);
-    if !text[slot.start..].starts_with(' ') {
+    out.push_str(&text[..at.start]);
+    if at.is_empty() {
         out.push(' ');
     }
     out.push_str("[]");
-    out.push_str(&text[slot.end..]);
+    out.push_str(&text[at.end..]);
     out
-}
-
-/// 把 `path` 这个键写进文档，值是**已经渲染好的一段文本**。
-///
-/// 返回新文本，以及多出来的节点数 —— 护栏要拿它对账。
-///
-/// **缺的中间层会一起补出来。**`limits`、`client_probes` 这些整段默认
-/// 不写（「第一天的配置是六行」），于是「改里面某一项」就是它们的第一次
-/// 写入；要求父节点先存在，等于这些设置项在界面上从头到尾是死的。
-fn splice_key(
-    text: &str,
-    all: &[Node],
-    path: &[Step],
-    rendered: &str,
-) -> Result<(String, usize), PatchError> {
-    if path.is_empty() {
-        return Err(PatchError::NotFound(show(path)));
-    }
-    // 最深的那个已经存在、而且能往里写的祖先。根一定在。
-    let mut depth = path.len() - 1;
-    while depth > 0 {
-        match all.iter().find(|n| n.path == path[..depth]) {
-            Some(n) if n.anchored => return Err(PatchError::AnchorOrAlias(show(&path[..depth]))),
-            Some(n) if matches!(n.kind, NodeKind::Map) => break,
-            // 存在但不是映射 —— 往里插字段是在改它的类型，不干
-            Some(_) => return Err(PatchError::NotFound(show(&path[..depth]))),
-            None => depth -= 1,
-        }
-    }
-    let anchor = &path[..depth];
-    let a = all
-        .iter()
-        .find(|n| n.path == anchor)
-        .ok_or_else(|| PatchError::NotFound(show(anchor)))?;
-    if a.anchored {
-        return Err(PatchError::AnchorOrAlias(show(anchor)));
-    }
-    if !matches!(a.kind, NodeKind::Map) {
-        return Err(PatchError::NotFound(show(anchor)));
-    }
-    // 要补出来的那几层键，从锚点往下数
-    let mut keys = Vec::with_capacity(path.len() - depth);
-    for step in &path[depth..] {
-        match step {
-            Step::Key(k) => keys.push(k.as_str()),
-            // 列表项凭空造不出来 —— 那是 append 的事
-            Step::Index(_) => return Err(PatchError::NotFound(show(path))),
-        }
-    }
-
-    // **行内写法（`{ a: 1, b: 2 }`）要插在花括号里面。**按块式在下一行
-    // 插，产出的是一份解析不了的 YAML —— 护栏会拦住，但那时用户看到的
-    // 是「这是个 bug，请贴到 issue 里」，而他只是用了一种完全合法的写法。
-    // 格式保留语料里本来就列了「流式与块式混排」。
-    if text[a.bytes.start..].starts_with('{') {
-        // 行内映射里再补一层块式的中间键，写不出来
-        if keys.len() > 1 {
-            return Err(PatchError::NotFound(show(&path[..path.len() - 1])));
-        }
-        let key = keys[0];
-        let close = flow_end(text, a.bytes.start)
-            .ok_or_else(|| PatchError::NotFound(format!("{}（行内映射没收尾）", show(anchor))))?;
-        let inner = text[a.bytes.start + 1..close].trim();
-        let piece = if inner.is_empty() {
-            format!("{key}: {rendered}")
-        } else {
-            // 抄已有的逗号风格：`{a: 1, b: 2}` 和 `{a: 1,b: 2}` 都有人
-            // 写，跟着来比统一成我们的偏好更不打扰 —— 这是他的文件
-            let spaced = text[a.bytes.start..close].contains(", ");
-            format!("{}{key}: {rendered}", if spaced { ", " } else { "," })
-        };
-        // 收尾的 `}` 前面有空格（`{ a: 1 }`）就插在那个空格之前
-        let mut at = close;
-        while at > a.bytes.start + 1 && text.as_bytes()[at - 1] == b' ' {
-            at -= 1;
-        }
-        let mut out = String::with_capacity(text.len() + piece.len());
-        out.push_str(&text[..at]);
-        out.push_str(&piece);
-        out.push_str(&text[at..]);
-        return Ok((out, 1));
-    }
-
-    let (end, indent) =
-        block_of(text, all, anchor).ok_or_else(|| PatchError::NotFound(show(anchor)))?;
-    let mut piece = String::new();
-    for (i, k) in keys.iter().enumerate() {
-        piece.push('\n');
-        piece.push_str(&indent);
-        for _ in 0..i {
-            piece.push_str("  ");
-        }
-        piece.push_str(k);
-        piece.push(':');
-        if i + 1 == keys.len() {
-            piece.push(' ');
-            piece.push_str(rendered);
-        }
-    }
-    let mut out = String::with_capacity(text.len() + piece.len());
-    out.push_str(&text[..end]);
-    out.push_str(&piece);
-    out.push_str(&text[end..]);
-    Ok((out, keys.len()))
 }
 
 /// 往映射里**插一个新的标量键**。
@@ -712,33 +568,24 @@ fn splice_key(
 ///
 /// # 边界
 ///
-/// 只插**标量**，而且父节点必须已经是个映射。新增一个列表项（多一个
-/// provider）仍然走文本模式 —— 那是结构性改动，退路说得很清楚。
+/// 只写**标量**。整段的值（嵌套映射、列表）走 [`put`]，增删列表项走
+/// [`append`] / [`remove`]。
 ///
 /// 插在父映射**最后一个子键的下一行**，缩进抄那一行的。不去猜「该插在
 /// 哪两行之间」—— 那只会打乱用户自己排的顺序。
 pub fn insert(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchError> {
     if find(text, path).is_ok() {
-        // 已经有了就是一次普通的替换 —— 调用方不用先问一遍
+        // 已经有了就是一次普通的替换 —— 调用方不用先问一遍，而且原来的
+        // 引号风格要保住，这是 `set` 做的事
         return set(text, path, value);
     }
-    let all = nodes(text)?;
-    let rendered = render_scalar(value, ScalarStyle::Plain);
-    // 这个位置已经是个列表或映射 —— 整块换掉，而不是在旁边再写一个
-    // 同名键。`find` 只认标量，所以走到这儿的容器看着像「还没有」。
-    if let Some(n) = all.iter().find(|n| n.path == path) {
-        if n.anchored {
-            return Err(PatchError::AnchorOrAlias(show(path)));
-        }
-        let gone = all
-            .iter()
-            .filter(|x| x.path.len() > path.len() && x.path.starts_with(path))
-            .count();
-        let out = overwrite_block(text, &all, n, &rendered)?;
-        return checked(out, path, value, all.len() - gone);
-    }
-    let (out, added) = splice_key(text, &all, path, &rendered)?;
-    checked(out, path, value, all.len() + added)
+    // 没写过、或者原来是个容器（`allow` 从一张清单退回 `~`）：整个值换掉，
+    // 缺的中间层一起补
+    put(
+        text,
+        path,
+        Put::Inline(&render_scalar(value, ScalarStyle::Plain)),
+    )
 }
 
 /// 行内映射从 `{` 开始的那个位置，找到配对的 `}`。
@@ -772,34 +619,6 @@ fn flow_end(text: &str, open: usize) -> Option<usize> {
         }
     }
     None
-}
-
-/// `insert` 的三道护栏。**两条路（块式、行内）共用一份** —— 各写一份的
-/// 话，迟早有一条上的检查会比另一条松。
-fn checked(
-    out: String,
-    path: &[Step],
-    value: &Scalar,
-    expected: usize,
-) -> Result<String, PatchError> {
-    let back = find(&out, path)
-        .map_err(|e| PatchError::SelfCheck(format!("插完之后 `{}` 找不回来：{e}", show(path))))?;
-    if back.value != value.as_yaml_text() {
-        return Err(PatchError::SelfCheck(format!(
-            "插完之后 `{}` 读回来是 `{}`，不是要写的那个",
-            show(path),
-            back.value
-        )));
-    }
-    // 别的字段一个都不能动
-    let after_all = nodes(&out)?;
-    if after_all.len() != expected {
-        return Err(PatchError::SelfCheck(format!(
-            "改完之后有 {} 个节点，应该是 {expected} 个",
-            after_all.len()
-        )));
-    }
-    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────── 列表增删
@@ -942,10 +761,12 @@ fn append_first(text: &str, seq_path: &[Step], item: &str) -> Result<String, Pat
         return Err(PatchError::NotFound(show(seq_path)));
     };
     let all = nodes(text)?;
-    let parent_node = all
-        .iter()
-        .find(|n| n.path == parent)
-        .ok_or_else(|| PatchError::NotFound(show(parent)))?;
+    let Some(parent_node) = all.iter().find(|n| n.path == parent) else {
+        // **父映射都还没写过**（`pricing.sheets` 的第一项）。整段补出来，
+        // 缺的中间层交给 `put`
+        let out = put(text, seq_path, Put::Block(&edit::one_item_seq(item)))?;
+        return checked_structural(text, out, seq_path, 1);
+    };
     if !matches!(parent_node.kind, NodeKind::Map) || parent_node.anchored {
         return Err(PatchError::NotFound(show(parent)));
     }
@@ -1061,8 +882,8 @@ pub fn clear_seq(text: &str, seq_path: &[Step]) -> Result<String, PatchError> {
         Some(n) if matches!(n.kind, NodeKind::Scalar { .. }) => put_empty_seq(&cur, &n.bytes),
         // 本来就是空列表
         Some(_) => cur.clone(),
-        // 这个键根本没写 —— 和 insert 一样在父映射末尾补一行
-        None => splice_key(&cur, &all, seq_path, "[]")?.0,
+        // 这个键根本没写 —— 在父映射末尾补一行，缺的中间层一起补
+        None => put(&cur, seq_path, Put::Inline("[]"))?,
     };
     checked_structural(&cur, out, seq_path, 0)
 }
@@ -1259,6 +1080,69 @@ mod seq_tests {
 mod first_write_tests {
     use super::*;
 
+    /// 往一个映射里加键，而它的**第一个键的值是块式的**。
+    ///
+    /// 子节点的字节区间是值的区间：值是块式列表或映射时，区间从下一行、
+    /// 更深一层的缩进开始。按那一行定缩进，新键会落进那个列表项里 ——
+    /// 读回来是另一份配置，写入被自检拦下，界面上表现为「保存不了」。
+    #[test]
+    fn a_key_added_beside_a_block_valued_first_key_lands_at_that_keys_column() {
+        for (cfg, path, want) in [
+            (
+                "version: 1\npricing:\n  sheets:\n    - name: a\n",
+                vec![Step::key("pricing"), Step::key("auto_update")],
+                "version: 1\npricing:\n  sheets:\n    - name: a\n  auto_update: false\n",
+            ),
+            (
+                "version: 1\nlisten:\n  gateway:\n    port: 1\n",
+                vec![Step::key("listen"), Step::key("auto_update")],
+                "version: 1\nlisten:\n  gateway:\n    port: 1\n  auto_update: false\n",
+            ),
+            // 列表项里的映射：键在短划线后面
+            (
+                "clients:\n  - allow:\n      - a\n",
+                vec![
+                    Step::key("clients"),
+                    Step::Index(0),
+                    Step::key("auto_update"),
+                ],
+                "clients:\n  - allow:\n      - a\n    auto_update: false\n",
+            ),
+        ] {
+            let out = insert(cfg, &path, &Scalar::Bool(false)).unwrap();
+            assert_eq!(out, want);
+        }
+    }
+
+    /// 第一个键的值是空的（`note:`），缩进也得从它自己的冒号算。
+    #[test]
+    fn a_blank_first_key_still_tells_the_column() {
+        let cfg = "pricing:\n  note:\n  sheets:\n    - name: a\n";
+        let out = insert(
+            cfg,
+            &[Step::key("pricing"), Step::key("auto_update")],
+            &Scalar::Bool(false),
+        )
+        .unwrap();
+        assert_eq!(out, format!("{cfg}  auto_update: false\n"));
+    }
+
+    /// 同一个问题在「第一次往列表里加一项」那条路上。
+    #[test]
+    fn a_first_list_beside_a_block_valued_first_key_lands_at_that_keys_column() {
+        let cfg = "version: 1\nlisten:\n  gateway:\n    port: 1\n";
+        let out = append(
+            cfg,
+            &[Step::key("listen"), Step::key("allow_from")],
+            "127.0.0.1",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "version: 1\nlisten:\n  gateway:\n    port: 1\n  allow_from:\n    - 127.0.0.1\n"
+        );
+    }
+
     /// 尾部是块式列表的文件，往**顶层**插一个键。
     ///
     /// 容器节点的 `bytes` 是内容起点上的一个空区间，照它算位置会把
@@ -1326,11 +1210,25 @@ mod first_write_tests {
     /// `key:x` —— 一个名叫 `key:x` 的标量。
     #[test]
     fn setting_a_key_whose_value_is_blank_does_not_glue_it_to_the_colon() {
-        let cfg = "version: 1\nnote:\n";
-        let out = set(cfg, &[Step::key("note")], &Scalar::s("hi")).unwrap();
-        assert!(out.contains("note: hi"), "{out}");
-        let back: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
-        assert_eq!(back["note"].as_str(), Some("hi"));
+        // 冒号后面什么都没有、只有空格、只有注释 —— 值都写在冒号后面，
+        // 原有的空白和注释留在它后面
+        for (cfg, want) in [
+            ("version: 1\nnote:\n", "version: 1\nnote: hi\n"),
+            ("version: 1\nnote: \n", "version: 1\nnote: hi \n"),
+            (
+                "version: 1\nnote:   # 见 https://x\n",
+                "version: 1\nnote: hi   # 见 https://x\n",
+            ),
+        ] {
+            let out = set(cfg, &[Step::key("note")], &Scalar::s("hi")).unwrap();
+            assert_eq!(out, want);
+        }
+    }
+
+    #[test]
+    fn a_blank_list_key_with_a_trailing_space_becomes_an_empty_list() {
+        let out = clear_seq("allow: \n", &[Step::key("allow")]).unwrap();
+        assert_eq!(out, "allow: [] \n");
     }
 
     const ALLOW: &str = "clients:\n  - name: demo\n    key: tw-a\n    allow:\n      # 只给这些\n      - claude-*\n      - gpt-*\n";
