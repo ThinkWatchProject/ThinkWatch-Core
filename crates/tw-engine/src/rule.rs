@@ -210,27 +210,30 @@ pub enum MatchError {
 pub fn glob_match(pattern: &str, s: &str) -> bool {
     // 大小写不敏感：上游对模型名的大小写并不一致，而用户不该关心这个。
     let (pattern, s) = (pattern.to_ascii_lowercase(), s.to_ascii_lowercase());
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return true;
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let [first, middle @ .., last] = parts.as_slice() else {
+        // 没有 `*`：精确匹配
+        return pattern == s;
     };
-    if !s.starts_with(first) {
+    // **头尾各自锚定，再在中间找其余几段。**只从左往右找的话，最后一段会
+    // 停在它第一次出现的地方：`*-mini` 对 `gpt-4o-mini-2024-mini` 就判成不
+    // 匹配，而它明明以 `-mini` 结尾。
+    //
+    // 头尾不能重叠：`ab*ba` 不匹配 `aba`。
+    if s.len() < first.len() + last.len() || !s.starts_with(first) || !s.ends_with(last) {
         return false;
     }
-    let mut pos = first.len();
-    let mut last_was_star = pattern.len() > first.len();
-    for part in parts {
-        if part.is_empty() {
-            last_was_star = true;
-            continue;
-        }
-        match s[pos..].find(part) {
-            Some(i) => pos += i + part.len(),
+    // 小写化不改变字节长度，而头尾都是完整的 str，切出来的边界一定合法
+    let mut rest = &s[first.len()..s.len() - last.len()];
+    // 中间几段取最左边的出现位置：只有 `*` 一种通配符时，这样找不会错过
+    // 任何一种匹配
+    for part in middle {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
             None => return false,
         }
-        last_was_star = false;
     }
-    last_was_star || pos == s.len()
+    true
 }
 
 #[cfg(test)]
@@ -265,6 +268,68 @@ mod tests {
         assert!(glob_match("claude-sonnet-4-5", "claude-sonnet-4-5"));
         assert!(!glob_match("claude-opus-*", "claude-sonnet-4-5"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn the_part_after_the_last_star_anchors_at_the_end() {
+        // 结尾那一段在前面也出现过：只从左往右找会停在第一次出现的地方
+        assert!(glob_match("*-mini", "gpt-4o-mini-2024-mini"));
+        assert!(glob_match("gpt-*-mini", "gpt-4o-mini-realtime-mini"));
+        assert!(glob_match("a*b", "abxb"));
+        assert!(!glob_match("*-mini", "gpt-4o-mini-2024"));
+        // 头尾不能共用同一段字符
+        assert!(!glob_match("ab*ba", "aba"));
+        assert!(glob_match("ab*ba", "abba"));
+    }
+
+    /// 参考实现：逐字符回溯。慢，但一眼能看出是对的。
+    fn reference(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(b'*'), _) => reference(&p[1..], s) || (!s.is_empty() && reference(p, &s[1..])),
+            (Some(c), Some(d)) => c == d && reference(&p[1..], &s[1..]),
+            (Some(_), None) => false,
+        }
+    }
+
+    #[test]
+    fn agrees_with_a_backtracking_matcher_on_every_short_input() {
+        // 字母表只要 `a` `b` 两个字母加 `*`：能出现「一段在前面重复出现」的
+        // 全部形状，而穷举的规模还很小（模式 ≤ 5 个字符，字符串 ≤ 6 个）
+        fn all(alphabet: &[u8], max: usize) -> Vec<Vec<u8>> {
+            let mut out = vec![Vec::new()];
+            let mut layer = vec![Vec::new()];
+            for _ in 0..max {
+                layer = layer
+                    .iter()
+                    .flat_map(|w| {
+                        alphabet.iter().map(move |c| {
+                            let mut w = w.clone();
+                            w.push(*c);
+                            w
+                        })
+                    })
+                    .collect();
+                out.extend(layer.iter().cloned());
+            }
+            out
+        }
+        let patterns = all(b"ab*", 5);
+        let strings = all(b"ab", 6);
+        for p in &patterns {
+            for s in &strings {
+                let (ps, ss) = (
+                    std::str::from_utf8(p).unwrap(),
+                    std::str::from_utf8(s).unwrap(),
+                );
+                assert_eq!(
+                    glob_match(ps, ss),
+                    reference(p, s),
+                    "pattern `{ps}` against `{ss}`"
+                );
+            }
+        }
     }
 
     #[test]
