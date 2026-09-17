@@ -22,18 +22,17 @@ pub enum ValidationError {
     BadBaseUrl { name: String, url: String },
     #[error("client `{name}` 的密钥是空的")]
     EmptyKey { name: String },
-    #[error(
-        "provider `{name}` 的密钥是空的。要连不需要密钥的上游（比如本地 Ollama），写一个占位值即可。"
-    )]
-    EmptyProviderKey { name: String },
     #[error("路由配置有问题：{0}")]
     Routing(#[from] tw_engine::RouteError),
     #[error("`{0}` 既是 provider 名又是组名。规则里的 `to` 会指向哪个是不确定的，改掉其中一个。")]
     NameCollision(String),
     #[error("listen.gateway.allow_from 里的 `{entry}` 写错了：{reason}")]
     BadCidr { entry: String, reason: String },
-    #[error("provider `{name}` 的 key 写法读不懂：{why}")]
-    BadKeyShape { name: String, why: String },
+    #[error("上游「{name}」的凭据：{source}")]
+    Credential {
+        name: String,
+        source: crate::CredentialError,
+    },
     #[error("{0}")]
     Pricing(#[from] tw_pricing::SheetError),
     #[error("上游「{provider}」选的价目表「{sheet}」不存在")]
@@ -44,36 +43,6 @@ pub enum ValidationError {
     EmptyModelsOnly { name: String },
     #[error("上游「{name}」的启用范围（models_only）里有一项是空的")]
     BlankModelsOnly { name: String },
-}
-
-/// `key:` 到底哪儿写错了。
-///
-/// **有 `oauth:` 的时候要让 serde 自己说。**「unknown field `refresh_befor`,
-/// expected one of ...」比我们能补的任何一句话都准（那条，只是它
-/// 在 untagged 枚举上失效了，得手动把那条路走一遍）。
-fn explain_key(v: &serde_yaml_ng::Value) -> String {
-    if let Some(inner) = v.get("oauth") {
-        return match serde_yaml_ng::from_value::<crate::OAuth>(inner.clone()) {
-            Ok(_) => "oauth 里面看起来是对的，但整体没匹配上".to_string(),
-            Err(e) => format!("oauth 里 {e}"),
-        };
-    }
-    let keys: Vec<String> = v
-        .as_mapping()
-        .map(|m| {
-            m.keys()
-                .filter_map(|k| k.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if keys.is_empty() {
-        "要么直接写一个字符串（可以带 ${VAR}），要么写 { oauth: {...} }".to_string()
-    } else {
-        format!(
-            "认不出 `{}`。key 要么是一个字符串（可以带 ${{VAR}}），要么是 {{ oauth: {{...}} }}",
-            keys.join("`、`")
-        )
-    }
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -110,21 +79,11 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 url: p.base_url.clone(),
             });
         }
-        // **`key:` 写错时要说清楚哪儿错了。**serde 的 untagged 在全部
-        // 变体都不匹配时只会说「data did not match any variant」，而这是
-        // 配置里最重要的那个字段 —— 那句话对着它等于什么都没说，还把
-        // 每一种写错都塌成同一句。
-        if let crate::Secret::Unknown(v) = &p.key {
-            return Err(ValidationError::BadKeyShape {
+        p.check_credential()
+            .map_err(|source| ValidationError::Credential {
                 name: p.name.clone(),
-                why: explain_key(v),
-            });
-        }
-        if p.key.is_blank() {
-            return Err(ValidationError::EmptyProviderKey {
-                name: p.name.clone(),
-            });
-        }
+                source,
+            })?;
         // **空范围不是「全部」，也不是一个合理的「停用」。**两种读法各有
         // 人会当真，而停用有自己的开关
         if let Some(only) = &p.models_only {
@@ -247,7 +206,7 @@ mod tests {
         Provider {
             name: name.into(),
             base_url: url.into(),
-            key: crate::Secret::Literal("sk-x".into()),
+            key: Some(crate::Secret::new("sk-x")),
             protocol: None,
             ..Default::default()
         }
@@ -281,30 +240,44 @@ mod tests {
     }
 
     #[test]
-    fn a_key_written_in_a_shape_we_do_not_accept_says_which_shape_it_saw() {
-        // untagged 枚举全部不匹配时，serde 只会说「data did not match any
-        // variant」—— 而这是配置里最重要的那个字段
+    fn a_key_written_as_a_mapping_says_what_to_write_instead() {
         let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      whatever: 1\n";
         let e = crate::try_parse(y).unwrap_err().message;
-        assert!(e.contains("whatever"), "没说看见了什么：{e}");
-        assert!(e.contains("oauth"), "没说该写成什么：{e}");
+        assert!(e.contains("字符串"), "没说该写成什么：{e}");
     }
 
     #[test]
-    fn an_oauth_key_with_a_typo_lets_serde_say_which_field() {
-        // **serde 自己的话比我们能补的任何一句都准** ——
-        // 只是在 untagged 枚举上它不出声，得手动把那条路再走一遍
-        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      oauth:\n        refresh: r\n        endpoint: https://a/token\n        refresh_befor: 5m\n";
+    fn an_oauth_typo_lets_serde_say_which_field() {
+        // **serde 自己的话比我们能补的任何一句都准**
+        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    oauth:\n      refresh: r\n      endpoint: https://a/token\n      refresh_befor: 5m\n";
         let e = crate::try_parse(y).unwrap_err().message;
         assert!(e.contains("refresh_befor"), "{e}");
         assert!(e.contains("refresh_before"), "没提示正确的拼法：{e}");
     }
 
     #[test]
-    fn an_oauth_key_missing_a_required_field_says_which_one() {
-        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      oauth:\n        endpoint: https://a/token\n";
+    fn an_oauth_missing_a_required_field_says_which_one() {
+        let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    oauth:\n      endpoint: https://a/token\n";
         let e = crate::try_parse(y).unwrap_err().message;
         assert!(e.contains("refresh"), "{e}");
+    }
+
+    #[test]
+    fn a_credential_problem_names_the_upstream() {
+        let mut x = p("r", "https://relay.example");
+        x.key = Some(crate::Secret::new("  "));
+        let e = validate(&cfg(vec![c("d", "tw-1")], vec![x]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("「r」"), "{e}");
+    }
+
+    #[test]
+    fn an_upstream_without_any_credential_is_valid() {
+        // 本地 Ollama 这类不要密钥。以前要写一个占位值，那是在让配置说谎
+        let mut x = p("ollama", "http://127.0.0.1:11434");
+        x.key = None;
+        assert!(validate(&cfg(vec![c("d", "tw-1")], vec![x])).is_ok());
     }
 
     #[test]

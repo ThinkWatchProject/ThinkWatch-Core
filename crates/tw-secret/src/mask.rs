@@ -117,6 +117,84 @@ fn mask_line_by_field(line: &str) -> String {
     format!("{head}{lead}{q}{masked}{q}{comment}")
 }
 
+/// `headers:` 段里的一行：公开的头和只由引用组成的值原样留着，其余打码。
+fn mask_header_line(line: &str) -> String {
+    let Some(colon) = line.find(':') else {
+        return line.to_string();
+    };
+    let (head, rest) = line.split_at(colon + 1);
+    let name = head.trim_end_matches(':').trim().trim_matches(['"', '\'']);
+    let (value_raw, comment) = match rest.find(" #") {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let value = value_raw.trim();
+    let quoted = value.starts_with(['"', '\'']) && value.len() >= 2;
+    let bare = if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if bare.is_empty() || is_public_header(name) || is_reference_only(bare) {
+        return line.to_string();
+    }
+    let q = if quoted { &value[..1] } else { "" };
+    format!("{head} {q}{}{q}{comment}", mask_secret(bare))
+}
+
+/// 值不是秘密的请求头。**只列确定的** —— 名单外的一律当密钥处理，
+/// 打错一个的代价是界面上多一处打码，漏掉一个的代价是密钥进了诊断包。
+pub fn is_public_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "anthropic-version"
+            | "anthropic-beta"
+            | "openai-organization"
+            | "openai-project"
+            | "openai-beta"
+            | "user-agent"
+            | "http-referer"
+            | "referer"
+            | "x-title"
+            | "accept"
+            | "accept-language"
+            | "content-type"
+    )
+}
+
+/// 值里只有环境变量引用、占位符，加上一个短前缀（`Bearer ${TOKEN}`、
+/// `{{access_token}}`）—— 这样的值里没有秘密可泄。
+pub fn is_reference_only(value: &str) -> bool {
+    if !value.contains("${") && !value.contains("{{") {
+        return false;
+    }
+    let mut rest = String::new();
+    let mut s = value;
+    loop {
+        let next = [("${", "}"), ("{{", "}}")]
+            .iter()
+            .filter_map(|(open, close)| s.find(open).map(|i| (i, *open, *close)))
+            .min_by_key(|(i, _, _)| *i);
+        let Some((i, open, close)) = next else {
+            rest.push_str(s);
+            break;
+        };
+        rest.push_str(&s[..i]);
+        match s[i + open.len()..].find(close) {
+            Some(j) => s = &s[i + open.len() + j + close.len()..],
+            // 没闭合：不是引用，剩下的全算文字
+            None => {
+                rest.push_str(&s[i..]);
+                break;
+            }
+        }
+    }
+    let rest = rest.trim();
+    // 前缀只认字母和空格（`Bearer `、`Token `）：`sk-live-${SUFFIX}` 里那段
+    // `sk-live-` 就是密钥的一部分
+    rest.len() <= 16 && rest.chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
+}
+
 /// 这个值本身是不是一个 URL（而不是「一段包含 URL 的文本」）。
 fn is_url(v: &str) -> bool {
     let Some(i) = v.find("://") else {
@@ -320,10 +398,9 @@ mod line_tests {
 ///
 /// ```yaml
 /// key: mycompany-internal-token-9911      # 自建中转的 key
-/// key:
-///   oauth:
-///     refresh: 1//0gLdOPAQUE               # OAuth 的 refresh token
-///     client_secret: cs-whatever
+/// oauth:
+///   refresh: 1//0gLdOPAQUE                 # OAuth 的 refresh token
+///   client_secret: cs-whatever
 /// ```
 ///
 /// 而诊断包的第一句话是「这份内容里的密钥都已经打码」—— **一个做不到
@@ -343,6 +420,9 @@ pub fn mask_config_yaml(text: &str) -> String {
     // 块标量（`key: |`）的内容在后面几行上。`mask_line` 只看一行，看不见
     // 这种情况 —— 记住宿主那一层的缩进，把整块吃掉
     let mut block: Option<usize> = None;
+    // 上游的 `headers:` 那一段。**请求头名说明不了值是不是秘密**
+    // （`X-Relay-Token`），所以这一段里按请求头的规矩打码，不按字段名
+    let mut headers: Option<usize> = None;
     for line in text.lines() {
         let indent = line.len() - line.trim_start().len();
         if let Some(owner) = block {
@@ -351,6 +431,32 @@ pub fn mask_config_yaml(text: &str) -> String {
                 continue;
             }
             block = None;
+        }
+        if let Some(owner) = headers {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if indent > owner {
+                out.push_str(&mask_header_line(line));
+                out.push('\n');
+                continue;
+            }
+            headers = None;
+        }
+        if let Some((name, rest)) = line.trim_start().trim_start_matches("- ").split_once(':')
+            && name.trim() == "headers"
+        {
+            let value = rest.split(" #").next().unwrap_or("").trim();
+            if value.is_empty() {
+                headers = Some(indent);
+            } else {
+                // 流式写法（`headers: { X-Token: t }`）整段打掉
+                let head = &line[..line.find(':').unwrap_or(0) + 1];
+                out.push_str(&format!("{head} {{…}}\n"));
+                continue;
+            }
         }
         // **块标量要在打码之前认出来。**`mask_line` 会把 `|` 自己也当成
         // 一个值打掉（变成 `key: …`），那之后就再也看不出这里开了个块 ——
@@ -506,7 +612,7 @@ mod body_tests {
     fn the_config_secrets_that_have_no_recognisable_shape_are_still_masked() {
         // **这三种实测都能原样穿过 `mask_body`。**它们是这个函数存在的理由
         let out = mask_config_yaml(
-            "providers:\n  - name: b\n    key: mycompany-internal-token-9911\n  - name: c\n    key:\n      oauth:\n        refresh: 1//0gLdOPAQUE-REFRESH\n        client_secret: cs-OPAQUE-SECRET\n        endpoint: https://auth.example.com/token\n",
+            "providers:\n  - name: b\n    key: mycompany-internal-token-9911\n  - name: c\n    oauth:\n      refresh: 1//0gLdOPAQUE-REFRESH\n      client_secret: cs-OPAQUE-SECRET\n      endpoint: https://auth.example.com/token\n",
         );
         assert!(
             !out.contains("internal-token-9911"),
@@ -598,5 +704,38 @@ mod body_tests {
         ] {
             let _ = mask_body(s);
         }
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn header_values_in_a_config_are_masked_unless_public_or_references() {
+        let cfg = "providers:\n  - name: relay\n    base_url: https://relay.example\n    headers:\n      X-Relay-Token: rt-verysecretvalue123\n      anthropic-version: 2023-06-01\n      Authorization: Bearer ${RELAY_TOKEN}\n      X-Tenant: \"team-alpha-verysecret\" # 注释留着\n    proxy: direct\n";
+        let out = mask_config_yaml(cfg);
+        assert!(!out.contains("verysecretvalue123"), "{out}");
+        assert!(!out.contains("team-alpha-verysecret"), "{out}");
+        assert!(out.contains("anthropic-version: 2023-06-01"), "{out}");
+        assert!(out.contains("Bearer ${RELAY_TOKEN}"), "{out}");
+        assert!(out.contains("# 注释留着"), "{out}");
+        // 段落结束之后恢复按字段名打码的规矩
+        assert!(out.contains("proxy: direct"), "{out}");
+    }
+
+    #[test]
+    fn a_flow_style_headers_map_is_masked_whole() {
+        let out = mask_config_yaml("    headers: { X-Token: t-verysecretvalue }\n");
+        assert!(!out.contains("verysecret"), "{out}");
+    }
+
+    #[test]
+    fn reference_only_values_are_recognised() {
+        assert!(is_reference_only("${KEY}"));
+        assert!(is_reference_only("Bearer ${KEY}"));
+        assert!(is_reference_only("Token {{access_token}}"));
+        assert!(!is_reference_only("sk-live-${SUFFIX}"));
+        assert!(!is_reference_only("plain-secret"));
     }
 }

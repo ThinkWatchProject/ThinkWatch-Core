@@ -59,7 +59,7 @@ async fn serve(upstream: SocketAddr) -> (SocketAddr, tw_gateway::live::Live) {
         providers: vec![Provider {
             name: "up".into(),
             base_url: format!("http://{upstream}"),
-            key: "sk-x".into(),
+            key: Some("sk-x".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             ..Default::default()
         }],

@@ -80,7 +80,7 @@ impl ProbeResult {
 pub async fn probe(
     http: &reqwest::Client,
     base_url: &str,
-    key: &str,
+    headers: &[(String, String)],
     protocol: Option<tw_config::Protocol>,
 ) -> ProbeResult {
     let proto = protocol.or_else(|| tw_config::Provider::guess_protocol(base_url));
@@ -89,7 +89,7 @@ pub async fn probe(
 
     let url = crate::forward::upstream_url(base_url, "/v1/models", None);
     let mut req = http.get(&url).timeout(PROBE_TIMEOUT);
-    req = crate::forward::apply_credential(req, proto, key);
+    req = crate::forward::apply_headers(req, headers);
 
     let resp = match req.send().await {
         Ok(r) => r,

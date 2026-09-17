@@ -13,7 +13,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
-use tw_config::{Client, Config, Listen, OAuth, Provider, Secret};
+use tw_config::{Client, Config, Listen, OAuth, Provider};
 
 const REFRESH: &str = "rt-ORIGINAL-refresh-token";
 /// 服务器换发的那个。**每次都不一样** —— 真的会轮换的服务器就是这样，
@@ -130,16 +130,14 @@ fn oauth_provider(name: &str, upstream: SocketAddr, token_url: &str) -> Provider
     Provider {
         name: name.into(),
         base_url: format!("http://{upstream}"),
-        key: Secret::OAuth {
-            oauth: OAuth {
-                access: None,
-                refresh: REFRESH.into(),
-                endpoint: token_url.into(),
-                client_id: Some("tw-test".into()),
-                client_secret: None,
-                refresh_before: Some("5m".into()),
-            },
-        },
+        oauth: Some(OAuth {
+            access: None,
+            refresh: REFRESH.into(),
+            endpoint: token_url.into(),
+            client_id: Some("tw-test".into()),
+            client_secret: None,
+            refresh_before: Some("5m".into()),
+        }),
         protocol: Some(tw_config::Protocol::Anthropic),
         redact: Some(vec![]),
         ..Default::default()
@@ -304,7 +302,7 @@ async fn a_dead_token_endpoint_fails_over_instead_of_taking_the_gateway_down() {
     let backup = Provider {
         name: "backup".into(),
         base_url: format!("http://{up}"),
-        key: "sk-plain-backup".into(),
+        key: Some("sk-plain-backup".into()),
         protocol: Some(tw_config::Protocol::Anthropic),
         redact: Some(vec![]),
         ..Default::default()
@@ -439,10 +437,7 @@ async fn editing_the_refresh_token_in_the_config_invalidates_the_cache() {
     let cache = tw_gateway::oauth::Cache::new();
     let http = reqwest::Client::new();
 
-    let mut cfg = match oauth_provider("p", up, &url).key {
-        Secret::OAuth { oauth } => oauth,
-        _ => unreachable!(),
-    };
+    let mut cfg = oauth_provider("p", up, &url).oauth.unwrap();
     let (a, _) = cache.token("p", &cfg, &http).await.unwrap();
     assert_eq!(a, "at-issued-1");
     // 没改配置：不再换

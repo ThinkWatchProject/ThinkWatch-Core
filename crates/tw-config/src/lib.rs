@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub use tw_types::Limits;
 
+pub mod credential;
 pub mod edit;
 pub mod history;
 mod init;
@@ -19,6 +20,7 @@ pub mod store;
 mod validate;
 pub mod watch;
 
+pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_initial, generate_key};
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
@@ -129,13 +131,15 @@ impl Default for Client {
     }
 }
 
-/// 同上。`name` / `base_url` / `key` 空着的 provider 过不了校验。
+/// 同上。`name` / `base_url` 空着的 provider 过不了校验。
 impl Default for Provider {
     fn default() -> Self {
         Self {
             name: String::new(),
             base_url: String::new(),
-            key: Secret::Literal(String::new()),
+            key: None,
+            headers: Headers::default(),
+            oauth: None,
             protocol: None,
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
@@ -358,39 +362,6 @@ pub struct Client {
     pub key: String,
 }
 
-/// 密钥怎么来。
-///
-/// 两种形态：绝大多数人写一个字符串就完了（明确说了密钥就明文写在
-/// 配置里，不做 keychain），字符串里可以带 `${ENV}`；另一种是 OAuth，
-/// 带自动刷新。
-///
-/// serde 的 untagged 让第一种是裸字符串 —— 配置文件里看不出 `${ENV}`
-/// 和明文的区别，也不该看出。
-///
-/// **没有「跑一条命令拿密钥」这一类，而且不会有**：配置文件
-/// 不该能执行程序 —— 「配置被同步、被分享、被 AI 改」都是目标
-/// 场景，那时抄一份配置就等于跑一段代码。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Secret {
-    /// 明文，或含 `${ENV}` 的字符串
-    Literal(String),
-    /// OAuth，带自动刷新。
-    OAuth { oauth: OAuth },
-    /// 什么形状都没匹配上。**存在的唯一理由是报一句人话。**
-    ///
-    /// serde 的 untagged 在全部变体都不匹配时只会说
-    /// 「data did not match any variant of untagged enum Secret」——
-    /// 而这是配置里最重要的那个字段，那句话对着它等于什么都没说。
-    /// 更糟的是它把**每一种**写错都塌成同一句：`oauth` 少写一个必填
-    /// 字段和随手打错一个键名，报出来一模一样。
-    ///
-    /// 有了这个兜底，`validate` 那一关才有机会拿着真实的值去说清楚
-    /// 到底哪儿不对。**注意它必须排在最后** —— untagged 是按顺序试的。
-    #[serde(skip_serializing)]
-    Unknown(serde_yaml_ng::Value),
-}
-
 /// OAuth 凭据（第 3 类）。
 ///
 /// # 轮换
@@ -448,90 +419,22 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
-impl Secret {
-    /// 拿到真正的密钥。
-    ///
-    /// **同步**：展开 `${ENV}` 就到头了。OAuth 那一类要联网换 token，
-    /// 走不了这条路 —— 它返回 `NeedsRefresh`，由网关那边的异步路径处理。
-    pub fn resolve(&self) -> Result<String, SecretResolveError> {
-        match self {
-            Secret::Literal(s) => Ok(tw_secret::expand_from_env(s)?),
-            // **OAuth 走不了同步这条路**：换 token 是一次网络往返。
-            // 调用方要么走异步那条（网关），要么把这一句原样说给用户听
-            // （`twcore check`）—— 都比在这里编一个值好
-            Secret::OAuth { .. } => Err(SecretResolveError::NeedsRefresh),
-            // 到不了这儿：校验那一关先把整份配置拒了
-            Secret::Unknown(_) => Err(SecretResolveError::Unreadable),
-        }
-    }
-
-    /// 是不是 OAuth。调用方据此决定走异步那条路。
-    pub fn is_oauth(&self) -> bool {
-        matches!(self, Secret::OAuth { .. })
-    }
-
-    pub fn oauth(&self) -> Option<&OAuth> {
-        match self {
-            Secret::OAuth { oauth } => Some(oauth),
-            _ => None,
-        }
-    }
-
-    /// 给人看的形态，**永远不含真实密钥**。
-    pub fn describe(&self) -> String {
-        match self {
-            Secret::Literal(s) if s.contains("${") => format!("环境变量 {s}"),
-            Secret::Literal(s) => tw_secret::mask_secret(s),
-            // **不回显任何一段 token** —— refresh token 比 access token
-            // 更值钱，它换得出无数个 access
-            Secret::OAuth { oauth } => format!("OAuth（{}）", oauth.endpoint),
-            Secret::Unknown(_) => "（这个 key 读不懂）".to_string(),
-        }
-    }
-
-    pub(crate) fn is_blank(&self) -> bool {
-        match self {
-            Secret::Literal(s) => s.trim().is_empty(),
-            Secret::OAuth { oauth } => {
-                oauth.refresh.trim().is_empty() || oauth.endpoint.trim().is_empty()
-            }
-            // 「读不懂」是另一回事，由 `BadKeyShape` 单独报
-            Secret::Unknown(_) => false,
-        }
-    }
-}
-
-/// 裸字符串是绝大多数人的写法，所以让它在 Rust 侧也是最省事的那个。
-impl From<&str> for Secret {
-    fn from(s: &str) -> Self {
-        Secret::Literal(s.to_string())
-    }
-}
-
-impl From<String> for Secret {
-    fn from(s: String) -> Self {
-        Secret::Literal(s)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SecretResolveError {
-    #[error(transparent)]
-    Env(#[from] tw_secret::SecretError),
-    /// OAuth 凭据要去换 token，那是一次网络往返，同步这条路走不了。
-    #[error("这是一个 OAuth 凭据，要联网换 token —— 网关起来之后才会去换")]
-    NeedsRefresh,
-    #[error("这个 key 的写法读不懂")]
-    Unreadable,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
     pub name: String,
     pub base_url: String,
-    /// 明文、`${ENV}`、或 `{ oauth: {...} }`。**不做 keychain。**
-    pub key: Secret,
+    /// API 密钥，按接口协议放进它认的请求头。可以写 `${ENV}`。**不做 keychain。**
+    ///
+    /// 不需要密钥的上游（本地 Ollama）不写；密钥要放在别的头里时写在 `headers`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<Secret>,
+    /// 其余要发的请求头，或者自己决定凭据怎么发。见 [`credential`]。
+    #[serde(default, skip_serializing_if = "Headers::is_empty")]
+    pub headers: Headers,
+    /// OAuth：access token 由 refresh token 换发，默认放进协议的鉴权头。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuth>,
     /// 不写就从 base_url 猜（最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
@@ -796,11 +699,6 @@ impl Provider {
             Trust::Untrusted
         })
     }
-
-    /// 拿到真正的 key（展开 `${ENV}`）。
-    pub fn resolved_key(&self) -> Result<String, SecretResolveError> {
-        self.key.resolve()
-    }
 }
 
 /// 把 token 端点换发的新 refresh token 写回 config.yaml 的**那一个标量**。
@@ -831,7 +729,7 @@ pub fn patch_oauth_refresh(
     let idx = provider_index(text, provider).ok_or_else(|| RotateError::NoProvider {
         provider: provider.to_string(),
     })?;
-    let path = tw_yaml::path!["providers", idx, "key", "oauth", "refresh"];
+    let path = tw_yaml::path!["providers", idx, "oauth", "refresh"];
     // 先确认它在那儿。`set` 对不存在的路径行为是另一回事，而这里
     // 「不在那儿」本身就是「别写」的理由
     tw_yaml::find(text, &path).map_err(|source| RotateError::Shape {
@@ -855,7 +753,7 @@ pub fn patch_oauth_refresh(
         .providers
         .iter()
         .find(|p| p.name == provider)
-        .and_then(|p| p.key.oauth())
+        .and_then(|p| p.oauth.as_ref())
         .is_some_and(|o| o.refresh == new_refresh);
     if !ok {
         return Err(RotateError::Broke {
@@ -879,7 +777,7 @@ pub enum RotateError {
     /// **说清「形状不对」而不是「写失败」。**用户可能把凭据写成了
     /// 别的形状（锚点、块标量），那时正确的动作是他自己去改，
     /// 而不是让我们猜。
-    #[error("`{provider}` 的 key.oauth.refresh 不在预期的位置上：{source}")]
+    #[error("`{provider}` 的 oauth.refresh 不在预期的位置上：{source}")]
     Shape {
         provider: String,
         source: tw_yaml::PatchError,
@@ -1022,7 +920,7 @@ providers:
         let p = Provider {
             name: "x".into(),
             base_url: "https://api.anthropic.com".into(),
-            key: Secret::Literal("k".into()),
+            key: Some(Secret::new("k")),
             protocol: Some(Protocol::OpenaiChat),
             ..Default::default()
         };
@@ -1078,17 +976,19 @@ providers:
     }
 
     #[test]
-    fn a_bare_string_key_still_parses_the_way_it_always_did() {
-        // untagged 的第一条：配置文件里绝大多数人写的还是一个裸字符串，
-        // 而且不该看出这里有个枚举。
+    fn a_key_is_a_bare_string() {
+        // 配置文件里绝大多数人写的就是一个裸字符串
         let cfg: Config = serde_yaml_ng::from_str(MINIMAL).unwrap();
-        assert!(matches!(cfg.providers[0].key, Secret::Literal(ref s) if s == "sk-xxx"));
+        assert_eq!(
+            cfg.providers[0].key.as_ref().map(Secret::raw),
+            Some("sk-xxx")
+        );
     }
 
     #[test]
     fn describe_never_leaks_a_literal_key() {
         // 这个方法会出现在 UI、日志、错误信息里。
-        let s = Secret::Literal("sk-ant-api03-verysecretvalue".into());
+        let s = Secret::new("sk-ant-api03-verysecretvalue");
         let d = s.describe();
         assert!(!d.contains("verysecret"), "{d}");
         assert!(d.contains('…'), "{d}");
@@ -1097,10 +997,7 @@ providers:
     #[test]
     fn describe_shows_the_env_var_name_not_its_value() {
         // 变量名不是秘密，而它恰恰是用户排查时要看的东西。
-        assert_eq!(
-            Secret::Literal("${MY_KEY}".into()).describe(),
-            "环境变量 ${MY_KEY}"
-        );
+        assert_eq!(Secret::new("${MY_KEY}").describe(), "环境变量 ${MY_KEY}");
     }
 
     #[test]
@@ -1109,10 +1006,13 @@ providers:
         let p = Provider {
             name: "x".into(),
             base_url: "https://x".into(),
-            key: Secret::Literal("${TW_TEST_KEY}".into()),
+            key: Some(Secret::new("${TW_TEST_KEY}")),
             ..Default::default()
         };
-        assert_eq!(p.resolved_key().unwrap(), "sk-from-env");
+        assert_eq!(
+            p.outbound_headers(None, None).unwrap(),
+            vec![("x-api-key".to_string(), "sk-from-env".to_string())]
+        );
     }
 }
 

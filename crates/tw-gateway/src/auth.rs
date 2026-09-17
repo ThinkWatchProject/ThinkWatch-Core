@@ -22,21 +22,6 @@ pub enum KeyPosition {
     Bearer,
 }
 
-impl KeyPosition {
-    /// 对应的上游协议名。和 `tw_config::Protocol` 的 Debug 形态对齐。
-    ///
-    /// **Bearer 映射到 `OpenaiChat` 是一个近似**：Responses 方言也用
-    /// Bearer。方言过滤只用来决定「列不列出来」，猜宽一点的代价是多列
-    /// 几个模型，猜窄了的代价是用户能用的模型凭空消失 —— 后者难查得多。
-    pub fn dialect(&self) -> &'static str {
-        match self {
-            KeyPosition::AnthropicHeader => "Anthropic",
-            KeyPosition::GoogleHeader => "Gemini",
-            KeyPosition::Bearer => "OpenaiChat",
-        }
-    }
-}
-
 /// 四个位置，因为四种客户端各写各的。
 ///
 /// 顺序有讲究：**先看专用头，最后才看 query**。query 里的 key 会进访问
@@ -159,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn the_position_of_the_key_tells_us_the_dialect() {
+    fn the_position_of_the_key_is_reported() {
         // 按方言过滤靠这个。这个信息我们本来就要读 —— 不必再
         // 发明一个探测手段。
         let pos = |m: &HeaderMap, q: Option<&str>| extract_key_with_position(m, q).map(|(_, p)| p);
@@ -180,15 +165,6 @@ mod tests {
             pos(&HeaderMap::new(), Some("key=k")),
             Some(KeyPosition::GoogleHeader)
         );
-    }
-
-    #[test]
-    fn dialects_line_up_with_the_protocol_names() {
-        // 对不上的话，方言过滤会把所有模型都滤掉 —— 而那看起来像
-        // 「一个模型都没探到」。
-        assert_eq!(KeyPosition::AnthropicHeader.dialect(), "Anthropic");
-        assert_eq!(KeyPosition::GoogleHeader.dialect(), "Gemini");
-        assert_eq!(KeyPosition::Bearer.dialect(), "OpenaiChat");
     }
 
     #[test]

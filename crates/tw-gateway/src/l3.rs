@@ -137,7 +137,7 @@ pub fn probe_request(protocol: Option<tw_config::Protocol>, model: &str) -> Opti
 pub async fn run(
     http: &reqwest::Client,
     base_url: &str,
-    key: &str,
+    headers: &[(String, String)],
     protocol: Option<tw_config::Protocol>,
     provider: &str,
     model: &str,
@@ -165,9 +165,11 @@ pub async fn run(
         // 测速不该无限等。**但也不能太短** —— 一个排队中的上游正是我们
         // 想量的东西，掐早了会把「慢」误报成「不通」。
         .timeout(Duration::from_secs(60));
-    req = crate::forward::apply_credential(req, protocol, key);
+    req = crate::forward::apply_headers(req, headers);
     for (name, value) in probe.headers {
-        req = req.header(*name, *value);
+        if !crate::forward::overridden(headers, name) {
+            req = req.header(*name, *value);
+        }
     }
     let fail = |e: String, connect_ms: u64| L3Result {
         provider: provider.to_string(),
@@ -334,7 +336,7 @@ mod tests {
         let r = run(
             &reqwest::Client::new(),
             "http://127.0.0.1:9",
-            "k",
+            &[("x-goog-api-key".to_string(), "k".to_string())],
             Some(tw_config::Protocol::Gemini),
             "g",
             "gemini-2.5-pro",

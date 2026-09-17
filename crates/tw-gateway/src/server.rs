@@ -315,20 +315,50 @@ impl AppState {
         self.models.publish(|| self.config(), &self.catalog);
     }
 
-    /// 取这一家的密钥。**OAuth 那一类要联网换 token，所以这条路是
-    /// async 的**；明文和 `${ENV}` 走同步那条，零额外成本。
+    /// 要发给这一家的请求头，凭据在里面。**OAuth 那一类要联网换 token，所以这条路是
+    /// async 的**；密钥和 `${ENV}` 走同步那条，零额外成本。
     ///
     /// `http` 必须是**这一家自己的** client：换 token 要走它该走的代理。
     /// 用一个干净的 client 去换，代理后面的用户会得到一个
     /// 「数据面通、刷新不通」的组合 —— 而那个症状看起来完全不像凭据问题。
-    pub async fn key_for(
+    ///
+    /// `client`：发起请求的网关密钥名，填 `{{client}}` 用。后台的探测没有这个人。
+    pub async fn headers_for(
+        &self,
+        p: &tw_config::Provider,
+        http: &reqwest::Client,
+        client: Option<&str>,
+    ) -> Result<Vec<(String, String)>, String> {
+        let token = match &p.oauth {
+            Some(o) => Some(self.oauth_token(p, o, http).await?),
+            None => None,
+        };
+        p.outbound_headers(token.as_deref(), client)
+            .map_err(|e| e.to_string())
+    }
+
+    /// 这一家的 OAuth access token。没配 oauth 是错误。
+    ///
+    /// 检测一个沿用原凭据的上游时用：**按原来那一家的名字换**，缓存和轮换写回都认名字。
+    pub async fn oauth_token_for(
         &self,
         p: &tw_config::Provider,
         http: &reqwest::Client,
     ) -> Result<String, String> {
-        let Some(o) = p.key.oauth() else {
-            return p.resolved_key().map_err(|e| e.to_string());
-        };
+        let o = p
+            .oauth
+            .as_ref()
+            .ok_or_else(|| format!("上游「{}」没有配置 OAuth", p.name))?;
+        self.oauth_token(p, o, http).await
+    }
+
+    /// 换一个 access token，服务器换发了新的 refresh token 就交给控制面写回。
+    async fn oauth_token(
+        &self,
+        p: &tw_config::Provider,
+        o: &tw_config::OAuth,
+        http: &reqwest::Client,
+    ) -> Result<String, String> {
         let (token, rotated) = self
             .oauth
             .token(&p.name, o, http)
@@ -592,9 +622,17 @@ pub fn router(state: AppState) -> Router {
         // 模型的 client，`GET /v1/models/claude-opus-4` 照样拿 200。
         // 这个洞在别的项目里点过名（「都没做过滤」），而我们自己
         // 也漏了。**同一个 `admits` 函数，列表和单点不可能不一致。**
-        .route("/v1/models/{model}", get(get_model))
-        // Gemini 方言的路径。它的客户端问的是 `/v1beta/models/x`
-        .route("/v1beta/models/{model}", get(get_model))
+        //
+        // **只截 GET。**Gemini 把调用写成 `POST /v1beta/models/{model}:generateContent`，
+        // 和单点查询是同一个路径模式 —— 没有这个 `fallback`，那些请求会被这条只认
+        // GET 的路由拒成 405，永远到不了透传
+        .route("/v1/models/{model}", get(get_model).fallback(passthrough))
+        // Gemini 方言的路径。它的客户端问的是 `/v1beta/models` 和 `/v1beta/models/x`
+        .route("/v1beta/models", get(list_models))
+        .route(
+            "/v1beta/models/{model}",
+            get(get_model).fallback(passthrough),
+        )
         // M0 只有透传：任何方法、任何路径都往上游送。M1 加路由时，
         // 这里会先过规则引擎再决定送给谁。
         .fallback(any(passthrough))
@@ -651,10 +689,10 @@ async fn ws_upgrade(
         )));
     }
     let http = rt.clients.get(&name).unwrap_or(&state.http);
-    let key = state
-        .key_for(provider, http)
+    let upstream_headers = state
+        .headers_for(provider, http, Some(&client_name))
         .await
-        .map_err(|e| GatewayError::config(format!("`{name}` 的密钥取不到：{e}")))?;
+        .map_err(|e| GatewayError::config(format!("`{name}` 的凭据取不到：{e}")))?;
     let url = crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref());
     let id = state.bus.next_id();
     state.bus.emit(tw_api::Event::RequestStarted {
@@ -675,17 +713,69 @@ async fn ws_upgrade(
     let provider = provider.clone();
     let guard = decision.guard.clone();
     let rules = rt.rules.clone();
-    let protocol = provider.effective_protocol();
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久
         let _live = live;
         let mut ending = ending;
         ending.responded(101);
         crate::ws::proxy(
-            state, sock, url, key, protocol, provider, guard, rules, id, ending,
+            state,
+            sock,
+            url,
+            upstream_headers,
+            provider,
+            guard,
+            rules,
+            id,
+            ending,
         )
         .await;
     }))
+}
+
+/// 列模型、查单个模型时，客户端是哪一种。
+///
+/// 这两个请求没有体，路径也分不出 Anthropic 和 OpenAI（都是 `/v1/models`），
+/// 只能看请求头：
+///
+/// - `/v1beta` 路径、或者把密钥放在 Google 位置上的是 Gemini
+/// - 带 `anthropic-version`、或者把密钥放在 `x-api-key` 的是 Anthropic ——
+///   两个信号**任一个**就算：Claude Code 用 `ANTHROPIC_AUTH_TOKEN` 时密钥走
+///   Bearer，但版本头照带；手写的脚本常常只放 `x-api-key`
+/// - 其余按 OpenAI 算
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingShape {
+    Anthropic,
+    Openai,
+    Gemini,
+}
+
+impl ListingShape {
+    fn of(path: &str, headers: &HeaderMap, position: crate::auth::KeyPosition) -> Self {
+        if path.starts_with("/v1beta") || position == crate::auth::KeyPosition::GoogleHeader {
+            ListingShape::Gemini
+        } else if headers.contains_key("anthropic-version")
+            || position == crate::auth::KeyPosition::AnthropicHeader
+        {
+            ListingShape::Anthropic
+        } else {
+            ListingShape::Openai
+        }
+    }
+
+    /// 这种客户端能用哪些协议的上游的模型。和请求那条路用同一张表
+    fn protocols(&self) -> Vec<&'static str> {
+        use crate::client_api::{ClientApi, slugs};
+        match self {
+            ListingShape::Anthropic => slugs(ClientApi::AnthropicMessages.servable_by()),
+            ListingShape::Openai => {
+                let mut v = slugs(ClientApi::OpenaiChat.servable_by());
+                v.extend(slugs(ClientApi::OpenaiResponses.servable_by()));
+                v
+            }
+            ListingShape::Gemini => slugs(ClientApi::Gemini.servable_by()),
+        }
+    }
 }
 
 /// `GET /v1/models`。
@@ -695,6 +785,7 @@ async fn ws_upgrade(
 async fn list_models(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
@@ -712,14 +803,15 @@ async fn list_models(
         .iter()
         .find(|c| c.name == client)
         .and_then(|c| c.allow.clone());
+    let shape = ListingShape::of(uri.path(), &headers, position);
     let models = state
         .catalog
         .load()
-        .resolve_allowed(Some(position.dialect()), allow.as_deref());
+        .resolve_allowed(Some(&shape.protocols()), allow.as_deref());
 
     let now = now_ms() / 1000;
-    let body = match position {
-        crate::auth::KeyPosition::GoogleHeader => serde_json::json!({
+    let body = match shape {
+        ListingShape::Gemini => serde_json::json!({
             "models": models.iter().map(|m| serde_json::json!({
                 "name": format!("models/{m}"),
             })).collect::<Vec<_>>()
@@ -744,6 +836,7 @@ async fn get_model(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(model): axum::extract::Path<String>,
+    OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
@@ -764,15 +857,16 @@ async fn get_model(
     let catalog = state.catalog.load();
     // 目录空着时不拦 —— 那说明探测还没回来或者上游都不给列表，这时候
     // 拦等于把整个网关关掉（和请求那条路同一个判断）
-    if !catalog.is_empty() && !catalog.admits(&model, Some(position.dialect()), allow.as_deref()) {
+    let shape = ListingShape::of(uri.path(), &headers, position);
+    if !catalog.is_empty() && !catalog.admits(&model, Some(&shape.protocols()), allow.as_deref()) {
         return Err(GatewayError::new(
             crate::error::Source::Request,
             format!("没有叫 `{model}` 的模型。能用的见 GET /v1/models。"),
         ));
     }
     let now = now_ms() / 1000;
-    let body = match position {
-        crate::auth::KeyPosition::GoogleHeader => {
+    let body = match shape {
+        ListingShape::Gemini => {
             serde_json::json!({ "name": format!("models/{model}") })
         }
         _ => serde_json::json!({ "id": model, "object": "model", "created": now }),
@@ -828,10 +922,15 @@ async fn passthrough(
         )
         .await;
     }
+    // 客户端调的是哪种 API：**看路径**（见 `client_api`）。认不出的路径照旧
+    // 直通，出错时的格式退回按密钥位置猜。
+    let api = crate::client_api::ClientApi::of_path(uri.path());
     // 从这里往下，所有错误都要用客户端自己那套结构回。
     // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
     // 的，只能退回 Anthropic 形状，而那是桌面版的主用例。
-    let dialect = crate::error::Dialect::from_key_position(position);
+    let dialect = api
+        .map(|a| a.error_dialect())
+        .unwrap_or_else(|| crate::error::Dialect::from_key_position(position));
     //
     // 这个请求的结局（见 `crate::ending`）。**管线发出开始事件时把它放
     // 进来。**
@@ -852,7 +951,8 @@ async fn passthrough(
         headers,
         body,
         client_name,
-        position,
+        api,
+        dialect,
         started,
         live,
         &mut ending,
@@ -932,7 +1032,8 @@ async fn pipeline(
     headers: HeaderMap,
     body: Bytes,
     client_name: String,
-    position: crate::auth::KeyPosition,
+    api: Option<crate::client_api::ClientApi>,
+    dialect: crate::error::Dialect,
     started: std::time::Instant,
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
@@ -1000,6 +1101,8 @@ async fn pipeline(
         };
         f.client = client_name.clone();
         f.intent = intent;
+        // **按路径认出来的 API**，规则里的 `when.dialect` 比的就是它
+        f.dialect = api.map(|a| a.slug()).unwrap_or_default().to_string();
         f
     };
     // 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
@@ -1016,7 +1119,8 @@ async fn pipeline(
                 .iter()
                 .find(|c| c.name == client_name)
                 .and_then(|c| c.allow.clone());
-            if !catalog.admits(&facts.model, Some(position.dialect()), allow.as_deref()) {
+            let servable = api.map(|a| crate::client_api::slugs(a.servable_by()));
+            if !catalog.admits(&facts.model, servable.as_deref(), allow.as_deref()) {
                 // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
                 // 该去改的地方不一样
                 let msg = if catalog.providers_for(&facts.model).is_empty() {
@@ -1201,10 +1305,6 @@ async fn pipeline(
     // 「尝试链」要留下来：用户能看见故障转移在替他工作，**这是信任的
     // 来源**。一个静默切换过的请求和一个一次就成的请求，在用户眼里
     // 应该是不同的。
-    // 客户端说什么方言。**唯一可靠的线索是它把 key 放在哪儿** ——
-    // 路径和 UA 都可以被中间层改写。方言互转和错误格式都要用它，
-    // 所以在循环之前就算好
-    let dialect = crate::error::Dialect::from_key_position(position);
     let mut attempts: Vec<String> = Vec::new();
     // 成功那一次的脱敏账本。**必须是成功那一次的** —— 故障转移从官方切到
     // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来
@@ -1280,8 +1380,8 @@ async fn pipeline(
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
         let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
-        let key = match state.key_for(provider, http).await {
-            Ok(k) => k,
+        let upstream_headers = match state.headers_for(provider, http, Some(&client_name)).await {
+            Ok(h) => h,
             Err(e) => {
                 // 密钥取不到是这一家的问题（环境变量没设、token 端点
                 // 连不上），换下一家是合理的 —— 而且**必须**换：不换的话
@@ -1292,9 +1392,9 @@ async fn pipeline(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
-                chain.push(hop(&provider.name, format!("密钥取不到：{e}"), hop_started));
+                chain.push(hop(&provider.name, format!("凭据取不到：{e}"), hop_started));
                 last_err = Some(GatewayError::config(format!(
-                    "provider `{}` 的密钥取不到：{e}",
+                    "provider `{}` 的凭据取不到：{e}",
                     provider.name
                 )));
                 continue;
@@ -1302,7 +1402,7 @@ async fn pipeline(
         };
         // 方言互转（M6+）。**同方言时这一整段是零成本** ——
         // `plan()` 返回 Passthrough，body 和路径都原样
-        let xlate = crate::translate::plan(dialect, provider.effective_protocol());
+        let xlate = crate::translate::plan(api, provider.effective_protocol());
         let outbound = match (xlate.active(), parsed.as_ref()) {
             (true, Some(v)) => {
                 let c = tw_dialect::req::to_openai(v);
@@ -1338,8 +1438,10 @@ async fn pipeline(
         );
 
         let mut req = http.request(method, &url);
-        req = forward::forward_headers_filtered(req, &headers, |n| xlate.keeps_header(n));
-        req = forward::apply_credential(req, provider.effective_protocol(), &key);
+        req = forward::forward_headers_filtered(req, &headers, |n| {
+            xlate.keeps_header(n) && !forward::overridden(&upstream_headers, n)
+        });
+        req = forward::apply_headers(req, &upstream_headers);
         match req.body(outbound.clone()).send().await {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
                 // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
@@ -1875,7 +1977,7 @@ mod tests {
             providers: vec![Provider {
                 name: "r".into(),
                 base_url: "https://example.invalid".into(),
-                key: "sk-1".into(),
+                key: Some("sk-1".into()),
                 protocol: None,
                 ..Default::default()
             }],
@@ -1893,7 +1995,7 @@ mod tests {
         tw_config::Provider {
             name: "p".into(),
             base_url: "https://x.com".into(),
-            key: "k".into(),
+            key: Some("k".into()),
             proxy: proxy.into(),
             ..Default::default()
         }
@@ -1958,13 +2060,13 @@ mod tests {
                 tw_config::Provider {
                     name: "a".into(),
                     base_url: "https://a.com".into(),
-                    key: "k".into(),
+                    key: Some("k".into()),
                     ..Default::default()
                 },
                 tw_config::Provider {
                     name: "b".into(),
                     base_url: "https://b.com".into(),
-                    key: "k".into(),
+                    key: Some("k".into()),
                     ..Default::default()
                 },
             ],
@@ -1981,8 +2083,7 @@ mod tests {
         let s = AppState::new(cfg()).unwrap();
         let (name, pos) = s.identify(&hdr("x-api-key", "tw-good"), None).unwrap();
         assert_eq!(name, "default");
-        // 位置带出来的方言是按方言过滤的依据
-        assert_eq!(pos.dialect(), "Anthropic");
+        assert_eq!(pos, crate::auth::KeyPosition::AnthropicHeader);
     }
 
     #[test]

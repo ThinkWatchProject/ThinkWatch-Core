@@ -74,7 +74,7 @@ fn config(up: SocketAddr, mode: SecurityMode, trust: Trust) -> Config {
         providers: vec![Provider {
             name: "relay".into(),
             base_url: format!("http://{up}"),
-            key: "sk-upstream".into(),
+            key: Some("sk-upstream".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             trust: Some(trust),
             redact: Some(vec![]),

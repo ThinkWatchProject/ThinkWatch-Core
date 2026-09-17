@@ -106,7 +106,7 @@ fn provider(name: &str, base: SocketAddr, official: bool) -> Provider {
     Provider {
         name: name.into(),
         base_url: format!("http://{base}"),
-        key: "sk-upstream".into(),
+        key: Some("sk-upstream".into()),
         protocol: Some(tw_config::Protocol::Anthropic),
         // 测试里连的是 127.0.0.1，域名判据用不上，所以直接写清楚
         redact: Some(if official {

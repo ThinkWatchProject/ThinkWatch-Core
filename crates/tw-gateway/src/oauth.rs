@@ -411,20 +411,17 @@ mod tests {
     }
 
     #[test]
-    fn describing_an_oauth_credential_never_shows_a_token() {
-        // **refresh token 比 access token 更值钱**，它换得出无数个 access。
-        let s = tw_config::Secret::OAuth {
-            oauth: cfg("https://auth.example.com/token"),
+    fn headers_without_a_token_say_so_instead_of_inventing_a_value() {
+        // OAuth 的 token 要联网换，同步那条路给不出来 —— 说出来，而不是发一个空的鉴权头
+        let p = tw_config::Provider {
+            name: "o".into(),
+            base_url: "https://relay.example".into(),
+            oauth: Some(cfg("https://auth.example.com/token")),
+            ..Default::default()
         };
-        let d = s.describe();
-        assert!(!d.contains("r-original"), "{d}");
-        assert!(d.contains("auth.example.com"), "{d}");
-    }
-
-    #[test]
-    fn a_sync_resolve_says_what_is_going_on_instead_of_inventing_a_value() {
-        let s = tw_config::Secret::OAuth { oauth: cfg("x") };
-        let e = s.resolve().unwrap_err();
-        assert!(e.to_string().contains("换 token"), "{e}");
+        assert_eq!(
+            p.outbound_headers(None, None),
+            Err(tw_config::CredentialError::NoToken)
+        );
     }
 }

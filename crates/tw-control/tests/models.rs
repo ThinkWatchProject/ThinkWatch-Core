@@ -293,6 +293,28 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     assert_eq!(v["protocol"], "anthropic");
     assert_eq!(v["official"], true);
     assert_eq!(v["redact"], serde_json::json!([]), "官方端点不脱敏");
+    assert_eq!(v["auth_header"], "x-api-key");
+
+    // 选了协议：密钥按选的协议放，「自动识别」那一项仍然说按地址推断的结果
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/providers/preview",
+        serde_json::json!({ "base_url": "https://api.anthropic.com", "protocol": "openai-chat" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["protocol"], "anthropic");
+    assert_eq!(v["auth_header"], "authorization");
+
+    let (st, _) = call(
+        &b.app,
+        "POST",
+        "/providers/preview",
+        serde_json::json!({ "base_url": "https://api.anthropic.com", "protocol": "grpc" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 
     let (_, v) = call(
         &b.app,

@@ -8,6 +8,7 @@
 pub mod access;
 pub mod auth;
 pub mod bodies;
+pub mod client_api;
 pub mod clientprobe;
 pub mod ending;
 pub mod error;
