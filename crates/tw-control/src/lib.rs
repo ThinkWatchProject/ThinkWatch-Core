@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use futures::stream::Stream;
 use tokio::sync::broadcast;
 
+pub mod chatgpt;
 pub mod clients;
 pub mod config;
 pub mod diagnostics;
@@ -44,6 +45,8 @@ pub struct ControlState {
     pub store: Option<Arc<tokio::sync::Mutex<tw_store::Recorder>>>,
     /// 定期刷新默认价目表的那个任务。**价格本身不在这里**，在网关的价格簿里
     pub price_updater: Arc<pricing::Updater>,
+    /// ChatGPT 账号的登录。**同一时刻只有一次**：回调端口只有一个
+    pub chatgpt: Arc<chatgpt::Accounts>,
     /// 用户的 home。接管要顺着它去找各客户端的配置。
     ///
     /// **是个字段，不是每次现读 `$HOME`。**进程级的环境变量是全局可变
@@ -136,6 +139,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/apply", post(clients::mcp_apply))
         .merge(resources::router())
         .merge(pricing::router())
+        .merge(chatgpt::router())
         .with_state(state)
 }
 
@@ -364,9 +368,15 @@ fn provider_view(
         }),
         auth_header: p.auth_header().0.to_string(),
         headers: p.headers.iter().map(header_view).collect(),
-        oauth: p.oauth.as_ref().map(|o| tw_api::OAuthView {
-            endpoint: o.endpoint.clone(),
-            client_id: o.client_id.clone(),
+        oauth: p.oauth.as_ref().map(|o| {
+            let failure = s.gateway.oauth.failure(&p.name, o);
+            tw_api::OAuthView {
+                endpoint: o.endpoint.clone(),
+                client_id: o.client_id.clone(),
+                expires_at: o.expires_at.clone(),
+                needs_login: failure.as_ref().is_some_and(|(_, relogin)| *relogin),
+                failure: failure.map(|(why, _)| why),
+            }
         }),
         protocol: p.effective_protocol().map(|x| x.slug().to_string()),
         protocol_explicit: p.protocol.is_some(),

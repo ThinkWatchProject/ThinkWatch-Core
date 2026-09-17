@@ -111,20 +111,48 @@ pub fn from_headers(h: &HeaderMap) -> Quota {
     }
 
     // ── Codex ────────────────────────────────────────────────────
-    for (prefix, window) in [("primary", "weekly"), ("secondary", "5h")] {
-        let Some(u) = get(&format!("x-codex-{prefix}-used-percent")).and_then(|v| v.parse().ok())
+    //
+    // **窗口多长看 `-window-minutes`，不按 primary / secondary 猜。**Plus 账号实测：
+    // primary 是 10080 分钟（一周），secondary 报 0 分钟 —— 那个窗口没有启用，按名字猜
+    // 会显示出一个并不存在的「5 小时额度已用 0%」。
+    //
+    // 百分比本来就是 0–100，**不做小数换算**：「用了 1%」读成 100%，会凭空报出一次额度用完。
+    for prefix in ["primary", "secondary"] {
+        let Some(u) =
+            get(&format!("x-codex-{prefix}-used-percent")).and_then(|v| v.parse::<f64>().ok())
         else {
             continue;
         };
+        let window = match get(&format!("x-codex-{prefix}-window-minutes"))
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => continue,
+            Some(minutes) => codex_window(minutes),
+            // 不带窗口长度的响应：沿用之前的叫法
+            None if prefix == "primary" => "weekly".to_string(),
+            None => "5h".to_string(),
+        };
+        let used_percent = u.clamp(0.0, 100.0);
         windows.push(Window {
-            window: window.to_string(),
-            used_percent: normalize_percent(u),
+            window,
+            used_percent,
             reset_in_secs: get(&format!("x-codex-{prefix}-reset-after-seconds"))
                 .and_then(|v| v.parse().ok()),
-            status: None,
+            // Codex 不报状态。用满就是被拒 —— 这是上游数字的直接结论，不是推断
+            status: (used_percent >= 100.0).then(|| "rejected".to_string()),
         });
     }
     Quota { windows }
+}
+
+/// Codex 的窗口名：一周叫 `weekly`，其余按长度写成 `5h`、`1d`、`90m`
+pub fn codex_window(minutes: u64) -> String {
+    match minutes {
+        10080 => "weekly".to_string(),
+        m if m % 1440 == 0 => format!("{}d", m / 1440),
+        m if m % 60 == 0 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    }
 }
 
 fn normalize_percent(v: f64) -> f64 {
@@ -224,6 +252,39 @@ mod tests {
         assert_eq!(q.windows.len(), 2);
         assert_eq!(q.tightest().unwrap().used_percent, 88.0);
         assert_eq!(q.windows[0].reset_in_secs, Some(86400));
+    }
+
+    #[test]
+    fn a_codex_window_is_named_by_its_length_and_an_unused_one_is_left_out() {
+        // Plus 账号实测的那组头：secondary 报 0 分钟，那个窗口没有启用
+        let q = from_headers(&headers(&[
+            ("x-codex-primary-used-percent", "21"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-primary-reset-after-seconds", "410912"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+            ("x-codex-secondary-reset-after-seconds", "0"),
+        ]));
+        assert_eq!(q.windows.len(), 1, "{q:?}");
+        assert_eq!(q.windows[0].window, "weekly");
+        assert_eq!(q.windows[0].used_percent, 21.0);
+        assert!(!q.windows[0].rejected());
+
+        let five = from_headers(&headers(&[
+            ("x-codex-primary-used-percent", "1"),
+            ("x-codex-primary-window-minutes", "300"),
+        ]));
+        assert_eq!(five.windows[0].window, "5h");
+        assert_eq!(five.windows[0].used_percent, 1.0, "1% 不是 100%");
+    }
+
+    #[test]
+    fn a_full_codex_window_is_rejected() {
+        let q = from_headers(&headers(&[
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-window-minutes", "10080"),
+        ]));
+        assert!(q.windows[0].rejected());
     }
 
     #[test]

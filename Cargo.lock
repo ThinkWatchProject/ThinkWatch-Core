@@ -2820,6 +2820,7 @@ name = "tw-control"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "futures",
@@ -2830,6 +2831,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2898,12 +2900,14 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rand 0.10.2",
  "reqwest",
  "rustls",
  "rustls-platform-verifier",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2921,6 +2925,7 @@ dependencies = [
  "tw-scan",
  "tw-secret",
  "tw-types",
+ "uuid",
 ]
 
 [[package]]

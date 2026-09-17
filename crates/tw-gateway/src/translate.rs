@@ -20,7 +20,7 @@ pub fn dialect_of(p: Protocol) -> Dialect {
     match p {
         Protocol::Anthropic => Dialect::Anthropic,
         Protocol::OpenaiChat => Dialect::Chat,
-        Protocol::OpenaiResponses => Dialect::Responses,
+        Protocol::OpenaiResponses | Protocol::Chatgpt => Dialect::Responses,
         Protocol::Gemini => Dialect::Gemini,
     }
 }
