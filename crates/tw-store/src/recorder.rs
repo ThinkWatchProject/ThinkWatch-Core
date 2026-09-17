@@ -448,6 +448,9 @@ impl Recorder {
             // 不是「刚才发生过什么」。这张表只装后者。
             | Event::ClientsChanged { .. }
             | Event::HealthChanged { .. }
+            | Event::ProxyChanged { .. }
+            | Event::AuthChanged { .. }
+            | Event::StorageChanged { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
             | Event::RequestPriced { .. } => {}
             Event::ResponseInspected {
@@ -604,16 +607,28 @@ impl Recorder {
         let Some(free) = disk::free_bytes(self.blobs.root()) else {
             return;
         };
-        let next = disk::level_for(free);
-        if next != self.level {
-            // 级别变了要说出来 —— 用户点开一个请求发现没有 body，
-            // 得知道那不是 bug。
-            tracing::warn!(
-                free_mb = free / 1024 / 1024,
-                "磁盘状态已变化：{}",
-                next.label()
-            );
-            self.level = next;
+        self.set_level(disk::level_for(free), free, now);
+    }
+
+    /// 换一档。**只在真的变了的时候说一次** —— 用户点开一个请求发现没有正文时，
+    /// 得知道那不是 bug，而这是唯一会发生这件事的地方。
+    fn set_level(&mut self, next: DiskLevel, free: u64, now: i64) {
+        if next == self.level {
+            return;
+        }
+        tracing::warn!(
+            free_mb = free / 1024 / 1024,
+            "磁盘状态已变化：{}",
+            next.label()
+        );
+        self.level = next;
+        if let Some(bus) = &self.bus {
+            bus.emit(Event::StorageChanged {
+                id: bus.next_id(),
+                level: next.slug().to_string(),
+                free_bytes: free,
+                at_ms: now as u64,
+            });
         }
     }
 
@@ -955,6 +970,41 @@ mod tests {
             "攒了 {}",
             r.inflight.len()
         );
+    }
+
+    #[test]
+    fn a_change_of_disk_level_is_announced_once() {
+        let (_d, mut r) = rec();
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        r = r.reporting_to(bus);
+        r.set_level(
+            DiskLevel::MetadataOnly,
+            500 * 1024 * 1024,
+            1_700_000_000_000,
+        );
+        match rx.try_recv().unwrap() {
+            Event::StorageChanged {
+                level, free_bytes, ..
+            } => {
+                assert_eq!(level, "metadata_only");
+                assert_eq!(free_bytes, 500 * 1024 * 1024);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 还是这一档：不再说第二遍
+        r.set_level(
+            DiskLevel::MetadataOnly,
+            400 * 1024 * 1024,
+            1_700_000_001_000,
+        );
+        assert!(rx.try_recv().is_err());
+        // 回到正常也要说 —— 界面上那条提示该撤掉了
+        r.set_level(DiskLevel::Ok, 40 * 1024 * 1024 * 1024, 1_700_000_002_000);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::StorageChanged { level, .. } if level == "ok"
+        ));
     }
 
     #[test]

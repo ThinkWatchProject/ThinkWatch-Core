@@ -101,6 +101,7 @@ impl ConfigManager {
                 message: r.message.clone(),
                 line: r.line,
                 excerpt: r.excerpt.clone(),
+                origin: origin.slug().to_string(),
                 at_ms: now_ms(),
             });
             tracing::warn!("配置未通过校验，继续使用上一版本：{r}");
