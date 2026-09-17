@@ -27,35 +27,32 @@ const STRIP: &[&str] = &[
 
 fn should_strip(name: &HeaderName) -> bool {
     let n = name.as_str();
-    STRIP.contains(&n)
+    // `x-thinkwatch-*` 是客户端写给网关的（接管 Codex 时写进去的
+    // `X-ThinkWatch-Client`），上游不该看见
+    STRIP.contains(&n) || n.starts_with("x-thinkwatch-")
 }
 
-/// 按上游协议把凭据放到它认的位置。
-pub fn apply_credential(
-    builder: reqwest::RequestBuilder,
-    protocol: Option<tw_config::Protocol>,
-    key: &str,
-) -> reqwest::RequestBuilder {
-    let (name, value) = credential_header(protocol, key);
-    builder.header(name, value)
-}
-
-/// 这个方言把凭据放在哪个头上。
+/// 把这家上游的请求头放上去。**凭据就在里面**（见 `tw_config::credential`）。
 ///
-/// **WS 升级那条路也走它**：各写一份的话，两条路迟早会在
-/// 「Gemini 用哪个头」这种事上不一致，而那时只有一条路是对的。
-pub fn credential_header(
-    protocol: Option<tw_config::Protocol>,
-    key: &str,
-) -> (&'static str, String) {
-    use tw_config::Protocol::*;
-    match protocol {
-        // 猜不出协议时按 Anthropic 走：桌面版的主用例是 Claude Code，
-        // 而中转站绝大多数说的是 Anthropic 方言。
-        Some(Anthropic) | None => ("x-api-key", key.to_string()),
-        Some(Gemini) => ("x-goog-api-key", key.to_string()),
-        Some(OpenaiChat) | Some(OpenaiResponses) => ("authorization", format!("Bearer {key}")),
+/// **WS 升级那条路也走同一份** `Provider::outbound_headers`：各写一份的话，
+/// 两条路迟早会在「Gemini 用哪个头」这种事上不一致，而那时只有一条路是对的。
+pub fn apply_headers(
+    builder: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    let mut b = builder;
+    for (name, value) in headers {
+        b = b.header(name.as_str(), value.as_str());
     }
+    b
+}
+
+/// 客户端带来的这个头，是不是被这家上游配置的同名头盖掉了。
+///
+/// **盖掉，而不是并存。**配置里写的 `anthropic-version` 和客户端自己带的
+/// 那一个同时发出去，上游收到的是两个值 —— 有的取第一个、有的直接 400。
+pub fn overridden(headers: &[(String, String)], name: &str) -> bool {
+    headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
 }
 
 /// 把客户端的请求头搬到上游请求上，剔掉不该走的那些。
@@ -91,10 +88,24 @@ pub fn forward_headers_filtered(
 pub fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
     let path = path.trim_start_matches('/');
+    let query = query.map(without_gateway_key);
     match query {
         Some(q) if !q.is_empty() => format!("{base}/{path}?{q}"),
         _ => format!("{base}/{path}"),
     }
+}
+
+/// 去掉查询串里的 `key=`。
+///
+/// **那是网关密钥。**Gemini 的 REST 写法把密钥放在查询串里，网关认完身份之后
+/// 原样把整个查询串拼到上游地址上，等于把它发给了上游。上游的凭据走请求头，
+/// 用不着这一项。
+fn without_gateway_key(query: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| *pair != "key" && !pair.starts_with("key="))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// 上游响应里也有不该原样回给客户端的头。
@@ -213,6 +224,45 @@ mod tests {
             upstream_url("https://x.com", "/v1/m", Some("")),
             "https://x.com/v1/m"
         );
+    }
+
+    #[test]
+    fn the_gateway_key_in_the_query_never_reaches_the_upstream() {
+        assert_eq!(
+            upstream_url(
+                "https://g.example",
+                "/v1beta/models/m:generateContent",
+                Some("key=tw-secret&alt=sse")
+            ),
+            "https://g.example/v1beta/models/m:generateContent?alt=sse"
+        );
+        assert_eq!(
+            upstream_url(
+                "https://g.example",
+                "/v1beta/models/m",
+                Some("key=tw-secret")
+            ),
+            "https://g.example/v1beta/models/m"
+        );
+        // 名字只是以 key 开头的参数不受影响
+        assert_eq!(
+            upstream_url("https://g.example", "/x", Some("keyword=a")),
+            "https://g.example/x?keyword=a"
+        );
+    }
+
+    #[test]
+    fn headers_meant_for_the_gateway_never_reach_the_upstream() {
+        assert!(should_strip(&HeaderName::from_static(
+            "x-thinkwatch-client"
+        )));
+    }
+
+    #[test]
+    fn a_configured_header_replaces_the_one_the_client_sent() {
+        let configured = vec![("Anthropic-Version".to_string(), "2023-06-01".to_string())];
+        assert!(overridden(&configured, "anthropic-version"));
+        assert!(!overridden(&configured, "anthropic-beta"));
     }
 
     #[test]

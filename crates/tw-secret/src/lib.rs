@@ -8,7 +8,10 @@ use std::collections::HashMap;
 
 pub mod mask;
 
-pub use mask::{mask_body, mask_config_yaml, mask_line, mask_secret, redact_url};
+pub use mask::{
+    is_public_header, is_reference_only, mask_body, mask_config_yaml, mask_line, mask_secret,
+    redact_url,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {

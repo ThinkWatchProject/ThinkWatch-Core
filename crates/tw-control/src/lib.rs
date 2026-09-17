@@ -334,6 +334,26 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     })
 }
 
+/// 一行请求头给界面看的样子。
+///
+/// **不知道是不是密钥的，一律按密钥打码。**请求头名说明不了什么 ——
+/// `X-Relay-Token` 和 `X-Tenant` 看不出哪个是秘密。原样给的只有两类：已知
+/// 公开的头（`anthropic-version` 之类），和只由环境变量、占位符加上一个短前缀
+/// 组成的值（`Bearer ${RELAY_TOKEN}`）—— 那里面没有秘密可泄。
+fn header_view(h: &tw_config::Header) -> tw_api::HeaderView {
+    let raw = h.value.raw();
+    let masked = !(tw_secret::is_public_header(&h.name) || tw_secret::is_reference_only(raw));
+    tw_api::HeaderView {
+        name: h.name.clone(),
+        value: if masked {
+            tw_secret::mask_secret(raw)
+        } else {
+            raw.to_string()
+        },
+        masked,
+    }
+}
+
 /// 一个上游给界面看的样子。**任何一个字段都不带密钥原文。**
 fn provider_view(
     s: &ControlState,
@@ -341,31 +361,20 @@ fn provider_view(
     p: &tw_config::Provider,
 ) -> tw_api::ProviderView {
     let base_url = tw_secret::redact_url(&p.base_url);
-    // `${NAME}` 整个是一个变量时才算「环境变量」。混着明文的写法
-    // （`sk-${SUFFIX}`）界面编辑不了，按明文密钥显示，改的时候整个替换
-    let env = match &p.key {
-        tw_config::Secret::Literal(v) => v
-            .strip_prefix("${")
-            .and_then(|r| r.strip_suffix('}'))
-            .filter(|n| !n.is_empty() && !n.contains(['$', '{', '}']))
-            .map(str::to_string),
-        _ => None,
-    };
-    let oauth = p.key.oauth();
     tw_api::ProviderView {
         name: p.name.clone(),
         base_url_masked: base_url != p.base_url,
         base_url,
-        key_source: p.key.describe(),
-        key_kind: match (&p.key, &env) {
-            (tw_config::Secret::OAuth { .. }, _) => "oauth",
-            (_, Some(_)) => "env",
-            _ => "key",
-        }
-        .to_string(),
-        key_env: env,
-        oauth_endpoint: oauth.map(|o| o.endpoint.clone()),
-        oauth_client_id: oauth.and_then(|o| o.client_id.clone()),
+        key: p.key.as_ref().map(|k| tw_api::SecretView {
+            display: k.describe(),
+            env: k.env_var().map(str::to_string),
+        }),
+        auth_header: p.auth_header().0.to_string(),
+        headers: p.headers.iter().map(header_view).collect(),
+        oauth: p.oauth.as_ref().map(|o| tw_api::OAuthView {
+            endpoint: o.endpoint.clone(),
+            client_id: o.client_id.clone(),
+        }),
         protocol: p.effective_protocol().map(|x| x.slug().to_string()),
         protocol_explicit: p.protocol.is_some(),
         proxy: p.proxy.clone(),
@@ -728,8 +737,8 @@ async fn speed_run(
         // OAuth 那类要联网换 token，所以走网关那条 async 的路。
         // **用这一家自己的 client** —— 换 token 要走它的代理。
         let pk_http = s.gateway.client_for(&p.name);
-        let key = match s.gateway.key_for(p, &pk_http).await {
-            Ok(k) => k,
+        let headers = match s.gateway.headers_for(p, &pk_http, None).await {
+            Ok(h) => h,
             Err(e) => {
                 out.push(tw_api::SpeedResult {
                     provider: p.name.clone(),
@@ -750,7 +759,7 @@ async fn speed_run(
         let r = tw_gateway::l3::run(
             &pk_http,
             &p.base_url,
-            &key,
+            &headers,
             p.effective_protocol(),
             &p.name,
             &req.model,

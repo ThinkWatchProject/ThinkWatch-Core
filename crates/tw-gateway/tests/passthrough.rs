@@ -74,7 +74,7 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: format!("http://{upstream}"),
-            key: "sk-upstream-secret".into(),
+            key: Some("sk-upstream-secret".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             ..Default::default()
         }],
@@ -247,7 +247,7 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: format!("http://{up}"),
-            key: "sk-x".into(),
+            key: Some("sk-x".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             ..Default::default()
         }],
@@ -357,7 +357,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
         providers: vec![Provider {
             name: "dead".into(),
             base_url: format!("http://127.0.0.1:{dead_port}"),
-            key: "sk-x".into(),
+            key: Some("sk-x".into()),
             protocol: None,
             ..Default::default()
         }],
@@ -424,14 +424,14 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
             Provider {
                 name: "official".into(),
                 base_url: format!("http://{a}"),
-                key: "sk-official".into(),
+                key: Some("sk-official".into()),
                 protocol: Some(tw_config::Protocol::Anthropic),
                 ..Default::default()
             },
             Provider {
                 name: "relay".into(),
                 base_url: format!("http://{b}"),
-                key: "sk-relay".into(),
+                key: Some("sk-relay".into()),
                 protocol: Some(tw_config::Protocol::Anthropic),
                 ..Default::default()
             },
@@ -530,7 +530,7 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
         providers: vec![Provider {
             name: "only".into(),
             base_url: format!("http://{up}"),
-            key: "sk-x".into(),
+            key: Some("sk-x".into()),
             protocol: None,
             ..Default::default()
         }],
@@ -619,13 +619,13 @@ async fn a_dead_first_provider_fails_over_to_the_next_one() {
             Provider {
                 name: "dead".into(),
                 base_url: format!("http://{dead}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "good".into(),
                 base_url: format!("http://{good}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -652,13 +652,13 @@ async fn a_client_error_does_not_burn_the_other_providers() {
             Provider {
                 name: "first".into(),
                 base_url: format!("http://{bad_request}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "backup".into(),
                 base_url: format!("http://{backup}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -681,13 +681,13 @@ async fn rate_limiting_does_fail_over_because_another_account_may_have_quota() {
             Provider {
                 name: "limited".into(),
                 base_url: format!("http://{limited}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "good".into(),
                 base_url: format!("http://{good}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -707,7 +707,7 @@ async fn the_only_provider_keeps_being_tried_no_matter_how_broken() {
         vec![Provider {
             name: "only".into(),
             base_url: format!("http://{dead}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -733,13 +733,13 @@ async fn everything_broken_still_tries_rather_than_refusing() {
             Provider {
                 name: "a".into(),
                 base_url: format!("http://{a}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "b".into(),
                 base_url: format!("http://{b}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -789,7 +789,7 @@ fn cfg_with_limits(up: SocketAddr, limits: tw_config::Limits) -> Config {
         providers: vec![Provider {
             name: "slow".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         limits,
@@ -919,7 +919,7 @@ async fn listing_and_admission_come_from_the_same_place() {
         vec![Provider {
             name: "relay".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             // 这家不实现 /v1/models，所以手写兜底
             models: vec!["claude-sonnet-4-5".into(), "claude-haiku-4-5".into()],
@@ -982,7 +982,7 @@ async fn an_empty_allow_list_disables_the_client_entirely() {
         vec![Provider {
             name: "relay".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             models: vec!["claude-sonnet-4-5".into()],
             ..Default::default()
@@ -1022,7 +1022,7 @@ async fn with_nothing_discovered_the_gateway_does_not_lock_itself_shut() {
         vec![Provider {
             name: "relay".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1084,14 +1084,14 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
             Provider {
                 name: "official".into(),
                 base_url: format!("http://{official}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 protocol: Some(tw_config::Protocol::Anthropic),
                 ..Default::default()
             },
             Provider {
                 name: "relay".into(),
                 base_url: format!("http://{relay}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 protocol: Some(tw_config::Protocol::Anthropic),
                 ..Default::default()
             },
@@ -1158,7 +1158,7 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
         vec![Provider {
             name: "relay".into(),
             base_url: format!("http://{relay}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![
@@ -1204,7 +1204,7 @@ async fn a_set_that_changes_nothing_leaves_the_body_byte_for_byte() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1238,13 +1238,13 @@ async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
             Provider {
                 name: "dead".into(),
                 base_url: format!("http://{dead}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "good".into(),
                 base_url: format!("http://{good}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -1288,7 +1288,7 @@ async fn a_health_check_is_answered_locally_and_never_reaches_the_upstream() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1324,7 +1324,7 @@ async fn a_health_check_still_works_with_every_upstream_dead() {
             name: "dead".into(),
             // 连端口都没人听
             base_url: format!("http://{dead}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1350,7 +1350,7 @@ async fn a_titling_request_goes_to_the_upstream_untouched() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1383,7 +1383,7 @@ async fn intercepting_a_probe_emits_its_own_event_not_a_request_pair() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1431,7 +1431,7 @@ async fn turning_off_the_interception_sends_the_health_check_upstream() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1461,13 +1461,13 @@ async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
             Provider {
                 name: "便宜的".into(),
                 base_url: format!("http://{cheap}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "正常的".into(),
                 base_url: format!("http://{normal}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -1526,13 +1526,13 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
             Provider {
                 name: "便宜的".into(),
                 base_url: format!("http://{cheap}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "正常的".into(),
                 base_url: format!("http://{normal}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -1602,55 +1602,63 @@ async fn a_health_check_works_before_any_upstream_is_configured() {
 /// **错误必须用入站方言的原生格式返回。**一个 Anthropic 客户端
 /// 收到 OpenAI 形状的 error body，会在解析时炸掉，然后报一个和真实原因
 /// 完全无关的错。
+///
+/// 方言按路径认，不按密钥放在哪儿认。
 #[tokio::test]
 async fn an_error_comes_back_in_the_dialect_the_client_speaks() {
     let gw = serve_cfg(cfg_with(vec![], vec![])).await;
     let c = reqwest::Client::new();
-    let url = format!("http://{gw}/v1/messages");
-    let body = r#"{"model":"claude-sonnet-4-5","messages":[]}"#;
+    let post = |path: &str, auth: &str| {
+        let r = c
+            .post(format!("http://{gw}{path}"))
+            .body(r#"{"model":"m","messages":[]}"#);
+        match auth {
+            "bearer" => r.bearer_auth("tw-k"),
+            h => r.header(h, "tw-k"),
+        }
+    };
 
     // Anthropic：`{type:"error", error:{type,message}}`
-    let v: serde_json::Value = c
-        .post(&url)
-        .header("x-api-key", "tw-k")
-        .body(body)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(v["type"], "error");
-    assert_eq!(v["error"]["type"], "api_error");
+    for auth in ["x-api-key", "bearer"] {
+        // Bearer 是 Claude Code 用 `ANTHROPIC_AUTH_TOKEN` 时的发法 —— 照样是 Anthropic
+        let v: serde_json::Value = post("/v1/messages", auth)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["type"], "error", "{auth}: {v}");
+        assert_eq!(v["error"]["type"], "api_error", "{auth}: {v}");
+    }
 
     // OpenAI：没有外层 type，多了 param / code
-    let v: serde_json::Value = c
-        .post(&url)
-        .bearer_auth("tw-k")
-        .body(body)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(v.get("type").is_none(), "OpenAI 没有外层 type：{v}");
-    assert_eq!(v["error"]["type"], "server_error");
-    assert!(v["error"].get("param").is_some());
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        let v: serde_json::Value = post(path, "bearer")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(v.get("type").is_none(), "{path}: OpenAI 没有外层 type：{v}");
+        assert_eq!(v["error"]["type"], "server_error", "{path}: {v}");
+        assert!(v["error"].get("param").is_some(), "{path}: {v}");
+    }
 
     // Gemini：`{error:{code,message,status}}`
-    let v: serde_json::Value = c
-        .post(&url)
-        .header("x-goog-api-key", "tw-k")
-        .body(body)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(v["error"]["status"], "UNAVAILABLE");
-    assert_eq!(v["error"]["code"], 500);
+    let v: serde_json::Value = post(
+        "/v1beta/models/gemini-2.5-pro:generateContent",
+        "x-goog-api-key",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(v["error"]["status"], "UNAVAILABLE", "{v}");
+    assert_eq!(v["error"]["code"], 500, "{v}");
 }
 
 #[tokio::test]
@@ -1684,7 +1692,7 @@ async fn a_deny_rule_is_403_not_400() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![
@@ -1764,7 +1772,7 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1819,7 +1827,7 @@ async fn an_upstream_rate_limit_stays_a_429_instead_of_becoming_a_502() {
         vec![Provider {
             name: "limited".into(),
             base_url: format!("http://{limited}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1859,7 +1867,7 @@ async fn the_upstream_usage_reaches_the_event_stream_without_buffering_the_respo
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1913,7 +1921,7 @@ async fn an_upstream_that_gives_no_usage_reports_none_rather_than_zeroes() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -1948,7 +1956,7 @@ async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_unto
         vec![Provider {
             name: "中转".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -2008,7 +2016,7 @@ async fn turning_the_detector_off_stops_it_looking_at_all() {
         vec![Provider {
             name: "up".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -2051,19 +2059,19 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
             Provider {
                 name: "挂了的".into(),
                 base_url: format!("http://{dead}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "限流的".into(),
                 base_url: format!("http://{limited}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
             Provider {
                 name: "好的".into(),
                 base_url: format!("http://{good}"),
-                key: "k".into(),
+                key: Some("k".into()),
                 ..Default::default()
             },
         ],
@@ -2132,7 +2140,7 @@ async fn a_request_that_succeeds_first_try_still_has_a_chain_of_one() {
         vec![Provider {
             name: "官方".into(),
             base_url: format!("http://{good}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -2168,7 +2176,7 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
         vec![Provider {
             name: "挂了的".into(),
             base_url: format!("http://{dead}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -2219,7 +2227,7 @@ async fn an_upstream_that_reports_quota_is_treated_as_subscription_from_then_on(
         vec![Provider {
             name: "订阅账号".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
@@ -2255,7 +2263,7 @@ async fn writing_billing_in_the_config_removes_the_first_request_ambiguity() {
         vec![Provider {
             name: "订阅账号".into(),
             base_url: format!("http://{up}"),
-            key: "k".into(),
+            key: Some("k".into()),
             ..Default::default()
         }],
         vec![],

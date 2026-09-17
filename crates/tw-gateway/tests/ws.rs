@@ -74,7 +74,7 @@ async fn start_gateway(up: SocketAddr, mode: SecurityMode, inspect: SecurityMode
         providers: vec![Provider {
             name: "中转".into(),
             base_url: format!("http://{up}"),
-            key: "sk-upstream".into(),
+            key: Some("sk-upstream".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
             // 测试连的是 127.0.0.1，域名判据用不上，所以写清楚
             redact: Some(vec![tw_redact::rules::Kind::ApiKeys]),

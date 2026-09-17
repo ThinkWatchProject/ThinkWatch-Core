@@ -53,7 +53,7 @@ fn provider(name: &str, at: SocketAddr) -> Provider {
     Provider {
         name: name.into(),
         base_url: format!("http://{at}"),
-        key: "k".into(),
+        key: Some("k".into()),
         protocol: Some(tw_config::Protocol::Anthropic),
         ..Default::default()
     }
@@ -302,7 +302,7 @@ async fn a_connection_pool_survives_an_unrelated_edit() {
 
     // 换一把 key 更不该重建：Client 不绑凭据，凭据是每个请求现加的
     let mut next2 = c.clone();
-    next2.providers[0].key = "另一把".into();
+    next2.providers[0].key = Some("另一把".into());
     state.reload(next2).unwrap();
     ask(gw).await;
     assert_eq!(conns.load(Ordering::SeqCst), 1, "改一把 key 就把连接池扔了");

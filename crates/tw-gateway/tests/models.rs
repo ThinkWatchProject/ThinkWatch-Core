@@ -53,7 +53,7 @@ fn provider(name: &str, at: SocketAddr) -> Provider {
     Provider {
         name: name.into(),
         base_url: format!("http://{at}"),
-        key: "k".into(),
+        key: Some("k".into()),
         protocol: Some(tw_config::Protocol::Anthropic),
         ..Default::default()
     }

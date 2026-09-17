@@ -551,18 +551,34 @@ fn cmd_check(path: &Path) -> Result<()> {
                     // 猜不出来不是错误，但值得说一句 —— M0 按 Anthropic 走。
                     None => "未知（按 Anthropic 转发）".to_string(),
                 };
+                // 说来源而不是值。
+                let credential = match (&p.key, &p.oauth) {
+                    (Some(k), _) => format!("密钥 {}（{}）", k.describe(), p.auth_header().0),
+                    (None, Some(_)) => "OAuth".to_string(),
+                    (None, None) if !p.headers.is_empty() => "请求头".to_string(),
+                    (None, None) => "无凭据".to_string(),
+                };
                 println!(
-                    "   · {} → {} [{}]  密钥 {}",
+                    "   · {} → {} [{}]  {credential}",
                     p.name,
                     tw_secret::redact_url(&p.base_url),
                     proto,
-                    // 说来源而不是值。
-                    p.key.describe()
                 );
+                for h in p.headers.iter() {
+                    let raw = h.value.raw();
+                    let shown = if tw_secret::is_public_header(&h.name)
+                        || tw_secret::is_reference_only(raw)
+                    {
+                        raw.to_string()
+                    } else {
+                        tw_secret::mask_secret(raw)
+                    };
+                    println!("     · 请求头 {}: {shown}", h.name);
+                }
                 // OAuth 不在这里换 token：那是一次网络往返，而 check
                 // 是个用户期望立刻返回的命令。但**能离线查的都要查** ——
                 // 这几样写错了，症状全是网关起来之后一片 401。
-                if let Some(o) = p.key.oauth() {
+                if let Some(o) = &p.oauth {
                     if o.refresh.trim().is_empty() {
                         println!("     ⚠ refresh token 是空的 —— 这家换不出 token");
                     }
@@ -591,8 +607,8 @@ fn cmd_check(path: &Path) -> Result<()> {
                         );
                     }
                     println!("     · OAuth 凭据：换 token 要联网，网关起来之后才做");
-                } else if let Err(e) = p.resolved_key() {
-                    println!("     ⚠ 密钥取不到：{e}");
+                } else if let Err(e) = p.outbound_headers(None, None) {
+                    println!("     ⚠ 凭据取不到：{e}");
                 }
             }
             Ok(())

@@ -116,11 +116,10 @@ providers:
     key: sk-ant-literal
   - name: oauth-家
     base_url: https://api.example.com
-    key:
-      oauth:
-        refresh: rt-OLD-ONE     # 这个会被换掉
-        endpoint: https://auth.example.com/token
-        refresh_before: 5m
+    oauth:
+      refresh: rt-OLD-ONE     # 这个会被换掉
+      endpoint: https://auth.example.com/token
+      refresh_before: 5m
 "#;
 
     #[test]
@@ -151,7 +150,7 @@ providers:
     }
 
     #[test]
-    fn a_key_that_is_not_oauth_shaped_is_refused_rather_than_rewritten() {
+    fn a_provider_without_oauth_is_refused_rather_than_rewritten() {
         let e = tw_config::patch_oauth_refresh(CFG, "官方", "rt-NEW").unwrap_err();
         assert!(e.to_string().contains("不在预期的位置上"), "{e}");
     }
@@ -176,7 +175,7 @@ providers:
                 .providers
                 .iter()
                 .find(|p| p.name == "oauth-家")
-                .and_then(|p| p.key.oauth())
+                .and_then(|p| p.oauth.as_ref())
                 .unwrap();
             assert_eq!(got.refresh, t, "读回来不是原值：{out}");
         }

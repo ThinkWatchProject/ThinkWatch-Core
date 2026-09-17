@@ -40,7 +40,7 @@ impl ProxyKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyAuth {
     pub user: String,
-    /// 支持 `${ENV}`，和 provider 的 key 同一套
+    /// 支持 `${ENV}`，和上游的密钥同一套
     pub pass: crate::Secret,
 }
 
@@ -174,7 +174,7 @@ mod tests {
         // 而表现是一个费解的「代理地址不对」。
         let auth = ProxyAuth {
             user: "alice".into(),
-            pass: crate::Secret::Literal("p@ss:w/rd".into()),
+            pass: crate::Secret::new("p@ss:w/rd"),
         };
         let url = p(ProxyKind::Http, Some(auth)).url().unwrap();
         assert!(!url.contains("p@ss"), "{url}");
@@ -188,7 +188,7 @@ mod tests {
         unsafe { std::env::set_var("TW_TEST_PROXY_PASS", "hunter2") };
         let auth = ProxyAuth {
             user: "alice".into(),
-            pass: crate::Secret::Literal("${TW_TEST_PROXY_PASS}".into()),
+            pass: crate::Secret::new("${TW_TEST_PROXY_PASS}"),
         };
         assert!(
             p(ProxyKind::Socks5h, Some(auth))
