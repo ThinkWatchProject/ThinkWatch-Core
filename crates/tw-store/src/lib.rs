@@ -18,5 +18,5 @@ pub mod task;
 pub use blobs::{Blobs, Which};
 pub use db::{Db, DbError, Latency, RequestRow, Summary};
 pub use disk::{DiskLevel, free_bytes, level_for};
-pub use recorder::Recorder;
+pub use recorder::{Recorder, price_source};
 pub use task::StoredBody;

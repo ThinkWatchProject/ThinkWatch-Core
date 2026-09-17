@@ -438,6 +438,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         ],
         groups: Vec::new(),
         proxies: Vec::new(),
+        pricing: Default::default(),
         limits: Default::default(),
         client_probes: Default::default(),
         security: Default::default(),

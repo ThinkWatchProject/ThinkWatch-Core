@@ -251,7 +251,7 @@ fn has_content(chunk: &[u8]) -> bool {
 
 /// 算一次测速要花多少。
 pub fn estimate(
-    prices: &tw_pricing::Prices,
+    prices: &tw_pricing::PriceBook,
     provider: &str,
     model: &str,
     subscription: bool,
@@ -270,7 +270,7 @@ pub fn estimate(
             format!("不计费，但会消耗约 {} tokens 的额度", input + MAX_TOKENS),
         )
     } else {
-        match prices.cost(model, &usage, false) {
+        match prices.cost_for(provider, model, &usage, false) {
             tw_pricing::Cost::Known(m) | tw_pricing::Cost::Estimated(m) => (
                 Some(m),
                 // **金额再小也要显示。**用户按下按钮时有权知道自己在花
@@ -320,8 +320,8 @@ pub fn total_micros(es: &[Estimate]) -> Option<i64> {
 mod tests {
     use super::*;
 
-    fn prices() -> tw_pricing::Prices {
-        tw_pricing::Prices::builtin().unwrap()
+    fn prices() -> tw_pricing::PriceBook {
+        tw_pricing::PriceBook::builtin().unwrap()
     }
 
     #[test]

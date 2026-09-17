@@ -80,12 +80,27 @@ clean the diff is:
 
 ## The price list
 
-`crates/tw-pricing` embeds a pinned snapshot. It is **not** auto-updated:
-following upstream automatically means two builds can compute different
-prices, and "yesterday's number doesn't match today's" cannot be
-explained to a user. Update steps are in
-`crates/tw-pricing/data/PROVENANCE.md`, and a CI test compares the
-snapshot against the hand-checked `data/verified.yaml` row by row.
+Prices come in two layers.
+
+- **The default price table** is LiteLLM's public dataset. A pinned
+  snapshot is embedded in `crates/tw-pricing`, so a fresh install and an
+  offline machine have one. Update steps are in
+  `crates/tw-pricing/data/PROVENANCE.md`, and a CI test compares the
+  snapshot against the hand-checked `data/verified.yaml` row by row. At
+  runtime the control plane refreshes the table once a day (unless
+  `pricing.auto_update: false`) and saves it as `model_prices.json` beside
+  `config.yaml`. Whichever of the two is newer prices requests.
+- **Price sheets** live in `config.yaml` under `pricing.sheets`: a
+  multiplier over the default table, plus per-model overrides with every
+  field written out (dollars per million tokens; nothing is inferred at
+  pricing time). An upstream picks a sheet with `pricing:`. Without one,
+  the default table applies.
+
+A refresh or an edited sheet changes the price of requests from then on,
+never of the ones already recorded. Each request stores its cost and where
+the price came from: the default table and its date, a sheet's multiplier,
+or a sheet's override. "Yesterday's number doesn't match today's" is then
+answered on the request itself.
 
 ## Cutting a release
 

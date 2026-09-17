@@ -219,6 +219,7 @@ fn to_provider(
             .transpose()?,
         proxy: input.proxy.trim().to_string(),
         on_proxy_fail: slug("代理不可用时的处理", &input.on_proxy_fail)?,
+        pricing: input.pricing.clone(),
     })
 }
 
@@ -330,11 +331,7 @@ async fn delete_proxy(
             if !users.is_empty() {
                 return Err(ApplyError::InUse(format!(
                     "代理「{name}」仍被上游{}使用，解除后才能删除",
-                    users
-                        .iter()
-                        .map(|u| format!("「{u}」"))
-                        .collect::<Vec<_>>()
-                        .join("、")
+                    quoted(&users)
                 )));
             }
             Ok(edit::remove(text, edit::PROXIES, &name)?)
@@ -411,7 +408,7 @@ fn to_proxy(
 
 // ─────────────────────────────────────────────────────────── 共用
 
-fn checked_name(raw: &str, what: &str) -> Result<String, String> {
+pub(crate) fn checked_name(raw: &str, what: &str) -> Result<String, String> {
     if raw.trim().is_empty() {
         return Err(format!("{what}名称不能为空"));
     }
@@ -427,7 +424,7 @@ fn slug<T: serde::de::DeserializeOwned>(what: &str, v: &str) -> Result<T, String
         .map_err(|_| format!("{what}「{v}」不认识"))
 }
 
-fn mapping<T: serde::Serialize>(v: &T) -> Result<serde_yaml_ng::Mapping, ApplyError> {
+pub(crate) fn mapping<T: serde::Serialize>(v: &T) -> Result<serde_yaml_ng::Mapping, ApplyError> {
     match serde_yaml_ng::to_value(v) {
         Ok(Value::Mapping(m)) => Ok(m),
         Ok(_) => Err(invalid("写不成一个映射".to_string())),
@@ -435,7 +432,7 @@ fn mapping<T: serde::Serialize>(v: &T) -> Result<serde_yaml_ng::Mapping, ApplyEr
     }
 }
 
-fn invalid(msg: String) -> ApplyError {
+pub(crate) fn invalid(msg: String) -> ApplyError {
     ApplyError::Edit(EditError::Unwritable(msg))
 }
 
@@ -444,6 +441,15 @@ fn not_found(what: &'static str, name: &str) -> ApplyError {
         what,
         name: name.to_string(),
     })
+}
+
+/// 「「relay-hk」、「relay-sg」」
+pub(crate) fn quoted(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("「{n}」"))
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 /// 「路由「默认」的规则「长上下文」、策略组「pool」」

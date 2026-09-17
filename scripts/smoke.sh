@@ -360,9 +360,9 @@ fi
 step "配置目录里只有一份配置文件"
 # **策略类的东西一律进 config.yaml。**这一条会被慢慢侵蚀 —— 每加一个
 # 功能都有一个「顺手开个文件放它的设置」的诱惑，而每一个单独看都很合理。
-STRAY=$(find "$THINKWATCH_HOME" -maxdepth 1 -name '*.yaml' ! -name 'config.yaml' ! -name 'pricing.yaml' 2>/dev/null)
+STRAY=$(find "$THINKWATCH_HOME" -maxdepth 1 -name '*.yaml' ! -name 'config.yaml' 2>/dev/null)
 if [ -z "$STRAY" ]; then
-  ok "除了 config.yaml（和 pricing.yaml）没有别的配置文件"
+  ok "除了 config.yaml 没有别的配置文件"
 else
   bad "冒出了别的配置文件" "$STRAY"
 fi

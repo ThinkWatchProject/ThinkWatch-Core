@@ -44,7 +44,23 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     line(&mut out, "core", env!("CARGO_PKG_VERSION"));
     line(&mut out, "控制面 API", tw_api::CONTROL_API_VERSION);
     line(&mut out, "配置 schema", cfg.version);
-    line(&mut out, "价目表快照", tw_pricing::SNAPSHOT_DATE);
+    {
+        // **生效的那一份，不是内置快照的日期** —— 刷新过之后两者不同，而对账
+        // 对不上时要问的正是「按哪天的价格算的」
+        let book = s.gateway.pricing.load();
+        let t = book.table();
+        let source = match t.source {
+            tw_pricing::TableSource::Builtin => "内置",
+            tw_pricing::TableSource::Fetched => "联网刷新",
+            tw_pricing::TableSource::Empty => "未加载",
+        };
+        line(
+            &mut out,
+            "默认价目表",
+            format!("{}（{source}，{} 个模型）", t.date, t.len()),
+        );
+        line(&mut out, "自定义价目表", cfg.pricing.sheets.len());
+    }
     line(&mut out, "平台", std::env::consts::OS);
     line(&mut out, "架构", std::env::consts::ARCH);
     line(
@@ -74,13 +90,13 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 上游
     let _ = writeln!(
         out,
-        "\n## 上游（{} 个）\n\n| 名字 | 地址 | 协议 | 代理 | 熔断 | 脱敏 | 信任 |\n|---|---|---|---|---|---|---|",
+        "\n## 上游（{} 个）\n\n| 名字 | 地址 | 协议 | 代理 | 熔断 | 脱敏 | 信任 | 价目表 |\n|---|---|---|---|---|---|---|---|",
         cfg.providers.len()
     );
     for p in &cfg.providers {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             p.name,
             // **地址也要脱敏** —— 中转站的 base_url 里常常带着 key
             tw_secret::redact_url(&p.base_url),
@@ -102,6 +118,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                 }
             },
             p.effective_trust().label(),
+            p.pricing.as_deref().unwrap_or("默认"),
         );
     }
 

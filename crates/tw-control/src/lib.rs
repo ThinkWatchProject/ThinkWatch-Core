@@ -20,6 +20,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod dryrun;
 pub mod nics;
+pub mod pricing;
 pub mod replay;
 pub mod resources;
 pub mod rotation;
@@ -41,6 +42,8 @@ pub struct ControlState {
     /// 请求历史。**可能没有** —— 磁盘起不来时观测这一层整个不在，
     /// 而那时网关照常转发，所以它是 Option 而不是必需品。
     pub store: Option<Arc<tokio::sync::Mutex<tw_store::Recorder>>>,
+    /// 定期刷新默认价目表的那个任务。**价格本身不在这里**，在网关的价格簿里
+    pub price_updater: Arc<pricing::Updater>,
     /// 用户的 home。接管要顺着它去找各客户端的配置。
     ///
     /// **是个字段，不是每次现读 `$HOME`。**进程级的环境变量是全局可变
@@ -92,13 +95,6 @@ pub fn router(state: ControlState) -> Router {
         )
         .route("/config/history", get(config_history))
         .route("/config/at", get(config::path_at))
-        .route("/pricing", get(pricing_get).put(pricing_put))
-        // 「检查价格更新」三步走。**三个端点，不是一个**
-        // —— 一个端点意味着「检查」和「写入」是同一次调用，而那正是
-        // 「静默下载」的定义
-        .route("/pricing/update/offer", post(update_offer))
-        .route("/pricing/update/fetch", post(update_fetch))
-        .route("/pricing/update/apply", post(update_apply))
         .route("/config/rollback", post(config_rollback))
         .route("/summary", get(summary))
         .route("/summary/buckets", get(cost_buckets))
@@ -139,6 +135,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/plan", post(clients::mcp_plan_op))
         .route("/mcp/apply", post(clients::mcp_apply))
         .merge(resources::router())
+        .merge(pricing::router())
         .with_state(state)
 }
 
@@ -318,6 +315,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 mode: mode.slug().to_string(),
             })
             .collect(),
+        price_sheets: pricing::sheet_views(cfg),
         limits: tw_api::LimitsView {
             max_concurrent: cfg.limits.max_concurrent,
             per_provider: cfg.limits.per_provider,
@@ -394,6 +392,7 @@ fn provider_view(
             .iter()
             .map(resources::reference_view)
             .collect(),
+        pricing: p.pricing.clone(),
     }
 }
 
@@ -627,7 +626,7 @@ async fn summary(
         cache_saved_micros: x.cache_saved_micros,
         flagged_requests: x.flagged_requests,
         redacted_requests: x.redacted_requests,
-        pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+        pricing_date: s.gateway.pricing.load().table().date.clone(),
     }))
 }
 
@@ -677,28 +676,23 @@ async fn speed_quote(
     Json(req): Json<tw_api::SpeedRunRequest>,
 ) -> Result<Json<tw_api::SpeedQuote>, Fail> {
     let cfg = s.config();
-    let prices = prices(&s);
+    let book = s.gateway.pricing.load();
     let items: Vec<tw_gateway::Estimate> = targets(&cfg, req.provider.as_deref())?
         .iter()
         .map(|p| {
             tw_gateway::l3::estimate(
-                &prices,
+                &book,
                 &p.name,
                 &req.model,
-                // 订阅型上游的判据：配置里写明了，或者最近一次响应里报过
-                // 额度（不写时自动判，和成本栏同一个口径）。
-                p.billing == Some(tw_config::Billing::Subscription)
-                    || s.gateway
-                        .quotas()
-                        .get(&p.name)
-                        .is_some_and(|q| !q.is_empty()),
+                // 和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
+                s.gateway.billing_of(p) == tw_config::Billing::Subscription,
             )
         })
         .collect();
     Ok(Json(tw_api::SpeedQuote {
         total_micros: tw_gateway::l3::total_micros(&items),
         items: items.into_iter().map(quote_item).collect(),
-        pricing_date: tw_pricing::SNAPSHOT_DATE.to_string(),
+        pricing_date: book.table().date.clone(),
     }))
 }
 
@@ -768,257 +762,6 @@ fn quote_item(e: tw_gateway::Estimate) -> tw_api::SpeedEstimate {
         subscription: e.subscription,
         note: e.note,
     }
-}
-
-/// 第一步：**只问「要访问什么、多大」，一个字节都不下载。**
-///
-/// 零上传的承诺同时意味着**零静默下载** —— 而这条承诺里最容易被
-/// 省掉的一半，正是「先告诉你要连哪儿」。
-async fn update_offer(State(s): State<ControlState>) -> Result<Json<tw_api::UpdateOffer>, Fail> {
-    let r = s
-        .http()
-        .head(tw_pricing::UPDATE_URL)
-        .send()
-        .await
-        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("连不上：{e}")))?;
-    Ok(Json(tw_api::UpdateOffer {
-        url: tw_pricing::UPDATE_URL.to_string(),
-        bytes: r.content_length(),
-        current_date: tw_pricing::SNAPSHOT_DATE.to_string(),
-    }))
-}
-
-/// 第二步：下载、解析、**给 diff，但不写盘**。
-async fn update_fetch(State(s): State<ControlState>) -> Result<Json<tw_api::UpdatePreview>, Fail> {
-    let raw = s
-        .http()
-        .get(tw_pricing::UPDATE_URL)
-        .send()
-        .await
-        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("下载失败：{e}")))?
-        .bytes()
-        .await
-        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("下载失败：{e}")))?;
-    let table = tw_pricing::parse_upstream(&raw)
-        .map_err(|e| fail(StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let cur = prices(&s);
-    let changes = tw_pricing::diff(cur.table(), &table);
-    let token = blake3::hash(&raw).to_hex()[..16].to_string();
-    // **存在磁盘上，不存在内存里。**第三步可能几分钟之后才来（用户在
-    // 看 diff），而这中间进程完全可能重启
-    let path = pending_path(&s);
-    if let Some(d) = path.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    std::fs::write(&path, &raw)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("存不下来：{e}")))?;
-    Ok(Json(tw_api::UpdatePreview {
-        models: table.len(),
-        changes: changes
-            .into_iter()
-            // 三千多个模型全列出来没人看得完。**改价的排在前面**
-            // （见 `tw_pricing::diff`），所以截断截掉的是新增那一批
-            .take(200)
-            .map(|c| tw_api::PriceChangeView {
-                model: c.model,
-                old_input: c.old_input,
-                new_input: c.new_input,
-                old_output: c.old_output,
-                new_output: c.new_output,
-            })
-            .collect(),
-        token,
-    }))
-}
-
-/// 第三步：**确认之后才写**。
-async fn update_apply(
-    State(s): State<ControlState>,
-    Json(req): Json<ApplyReq>,
-) -> Result<Json<tw_api::PricingView>, Fail> {
-    let path = pending_path(&s);
-    let raw = std::fs::read(&path).map_err(|_| {
-        fail(
-            StatusCode::BAD_REQUEST,
-            "没有待确认的更新 —— 先点「检查更新」".to_string(),
-        )
-    })?;
-    // **指纹要对上。**不对上的话，「确认写入」写的可能是另一次下载的
-    // 结果 —— 用户看的 diff 和落盘的东西不是一回事
-    let token = blake3::hash(&raw).to_hex()[..16].to_string();
-    if token != req.token {
-        return Err(fail(
-            StatusCode::CONFLICT,
-            "这份更新和你看到的 diff 对不上，重新检查一次".to_string(),
-        ));
-    }
-    let dir = s
-        .config_path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    // 落到数据目录，加载时优先于内置快照
-    std::fs::rename(&path, dir.join("model_prices.json"))
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("写不进去：{e}")))?;
-    pricing_get(State(s)).await
-}
-
-#[derive(serde::Deserialize)]
-struct ApplyReq {
-    token: String,
-}
-
-/// 下载完还没确认的那份放哪儿。
-fn pending_path(s: &ControlState) -> std::path::PathBuf {
-    s.config_path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default()
-        .join("model_prices.pending.json")
-}
-
-/// 用户自己写的那份价格（第三层）。
-///
-/// **这一页存在的理由是「有 N 条请求算不出钱」** —— 用户不会主动想起
-/// 要配价格（高级功能的触发条件要绑在「这个问题存不存在」上）。
-async fn pricing_get(State(s): State<ControlState>) -> Result<Json<tw_api::PricingView>, Fail> {
-    let p = prices(&s);
-    let rows = p
-        .overrides_list()
-        .into_iter()
-        .map(|(provider, model, mp)| tw_api::PriceRow {
-            overrides_builtin: p.builtin_has(&model),
-            provider,
-            // **每百万 token 的美元** —— 和厂商定价页上印的一样
-            input: mp.input * 1_000_000.0,
-            output: mp.output * 1_000_000.0,
-            model,
-        })
-        .collect();
-    // 算不出价钱的那些。**拿不到存储就是 0** —— 观测层起不来时网关
-    // 照常转发，这一页也该照常打开
-    let (unpriced_recent, unpriced_models) = match &s.store {
-        Some(st) => {
-            let g = st.lock().await;
-            g.db().unpriced_recent(7).unwrap_or_else(|e| {
-                tracing::debug!("算不出价钱的统计取不到：{e}");
-                (0, Vec::new())
-            })
-        }
-        None => (0, Vec::new()),
-    };
-    Ok(Json(tw_api::PricingView {
-        rows,
-        // **这份表自己的日期，不是那个常量。**用户点过更新之后还显示
-        // 内置快照的日期，等于把「你的价目表是哪天的」这个问题答错了
-        // —— 而成本旁边标它的全部意义就是回答那个问题
-        snapshot_date: p.snapshot_date.clone(),
-        unpriced_recent,
-        unpriced_models,
-    }))
-}
-
-/// 整份写回去。**和配置文件同一条纪律**：先在内存里验一遍，再原子写。
-async fn pricing_put(
-    State(s): State<ControlState>,
-    Json(rows): Json<Vec<tw_api::PriceRow>>,
-) -> Result<Json<tw_api::PricingView>, Fail> {
-    use std::collections::HashMap;
-    let mut models: HashMap<String, Option<tw_pricing::ModelPrice>> = HashMap::new();
-    let mut providers: HashMap<String, HashMap<String, tw_pricing::ModelPrice>> = HashMap::new();
-    for r in &rows {
-        if r.model.trim().is_empty() {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "有一行没填模型名".to_string(),
-            ));
-        }
-        // **负价不是「便宜」，是写错了。**让它进去的话，`cheapest` 会
-        // 永远选中那一家，而成本栏会往下走
-        if r.input < 0.0 || r.output < 0.0 {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                format!("`{}` 的单价是负数", r.model),
-            ));
-        }
-        let mp = tw_pricing::ModelPrice {
-            input: r.input / 1_000_000.0,
-            output: r.output / 1_000_000.0,
-            cache_read: None,
-            cache_write_5m: None,
-            cache_write_1h: None,
-            input_above_200k: None,
-            output_above_200k: None,
-            max_input_tokens: None,
-        };
-        match r.provider.as_ref().filter(|p| !p.trim().is_empty()) {
-            Some(p) => {
-                providers
-                    .entry(p.clone())
-                    .or_default()
-                    .insert(r.model.clone(), mp);
-            }
-            None => {
-                models.insert(r.model.clone(), Some(mp));
-            }
-        }
-    }
-    let text = serde_yaml_ng::to_string(&tw_pricing::Overrides { models, providers })
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let head = "# ThinkWatch 的用户价格覆盖（第三层）。\n\
-                # 单位是**每 token** 的美元 —— 界面上填的是每百万，这里换算过了。\n\
-                # 这个文件是界面写的，但手改也没问题：它只是一份普通 YAML。\n";
-    let dir = s
-        .config_path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    tw_config::store::write_atomic(&dir.join("pricing.yaml"), &format!("{head}{text}"))
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    pricing_get(State(s)).await
-}
-
-/// 价目表。**每次现建** —— 用户可能刚改过 pricing.yaml，而报价这件事
-/// 一年也点不了几次。
-pub(crate) fn prices(s: &ControlState) -> tw_pricing::Prices {
-    let dir = s
-        .config_path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    tw_pricing::Prices::builtin()
-        // 用户点过「更新」的话，用拉回来的那份（第二层）。
-        // **读不了就退回内置那份** —— 一个损坏的更新文件不该让成本栏
-        // 整个变成「未知」
-        .map(|mut p| {
-            let f = dir.join("model_prices.json");
-            match std::fs::read(&f).ok().and_then(|raw| {
-                // **要给一个人看得懂的日期。**成本旁边标的是「这份
-                // 价目表是哪天的」，而「第 20800 天」回答不了那个问题
-                let date = std::fs::metadata(&f)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Local> = t.into();
-                        dt.format("%Y-%m-%d").to_string()
-                    })
-                    .unwrap_or_else(|| "用户更新的".to_string());
-                tw_pricing::parse_upstream(&raw).ok().map(|t| (t, date))
-            }) {
-                Some((t, date)) => {
-                    p.replace_table(t, date);
-                    p
-                }
-                None => p,
-            }
-        })
-        .and_then(|p| p.with_overrides(&dir.join("pricing.yaml")))
-        .unwrap_or_else(|e| {
-            tracing::warn!("价目表读不了，测速报价会说「价格未知」：{e}");
-            // 建不出来时给一个空表 —— 那时每一项都是「价格未知」，
-            // 而那正是诚实的答案
-            tw_pricing::Prices::empty()
-        })
 }
 
 fn targets<'a>(
@@ -1216,6 +959,11 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
             .and_then(|j| serde_json::from_str(j).ok()),
         billing: r.billing,
         cache_saved_micros: r.cache_saved_micros,
+        // 同上：解不开就当没有
+        price_source: r
+            .price_source
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok()),
     }
 }
 

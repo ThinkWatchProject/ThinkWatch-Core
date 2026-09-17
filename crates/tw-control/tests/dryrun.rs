@@ -54,6 +54,7 @@ fn app() -> (tempfile::TempDir, axum::Router) {
         gateway_addr: None,
         store: None,
         started: std::time::Instant::now(),
+        price_updater: Default::default(),
         home: d.path().join("home"),
     };
     (d, tw_control::router(state))

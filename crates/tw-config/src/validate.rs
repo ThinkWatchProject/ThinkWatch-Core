@@ -34,6 +34,10 @@ pub enum ValidationError {
     BadCidr { entry: String, reason: String },
     #[error("provider `{name}` 的 key 写法读不懂：{why}")]
     BadKeyShape { name: String, why: String },
+    #[error("{0}")]
+    Pricing(#[from] tw_pricing::SheetError),
+    #[error("上游「{provider}」选的价目表「{sheet}」不存在")]
+    UnknownPriceSheet { provider: String, sheet: String },
 }
 
 /// `key:` 到底哪儿写错了。
@@ -155,6 +159,21 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             return Err(ValidationError::BadCidr {
                 entry: entry.clone(),
                 reason: "不是合法的 IP 或 CIDR，写法是 `192.168.0.0/16`".to_string(),
+            });
+        }
+    }
+
+    // 价目表本身（名字、倍率、单价），以及上游选的价目表在不在。
+    // **选了一张不存在的价目表不能静默退回默认价** —— 那样算出来的钱
+    // 看起来正常，而用户设的折扣从来没生效过。
+    cfg.pricing.validate()?;
+    for p in &cfg.providers {
+        if let Some(sheet) = &p.pricing
+            && cfg.pricing.sheet(sheet).is_none()
+        {
+            return Err(ValidationError::UnknownPriceSheet {
+                provider: p.name.clone(),
+                sheet: sheet.clone(),
             });
         }
     }
