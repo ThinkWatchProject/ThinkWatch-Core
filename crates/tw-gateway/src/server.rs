@@ -248,12 +248,12 @@ pub struct AppState {
     /// 里取 —— 以前记账那一层攥着启动时的一份副本，改了价格要重启才生效。
     /// 配置重载时换掉自定义价目表，刷新默认价目表时换掉底表。
     pub pricing: tw_pricing::Shared,
-    /// 轮换出来的新 refresh token 往哪儿交。
+    /// 刷新换回来的 token 往哪儿交（写回 config.yaml）。
     ///
     /// **和 body 那条路同一个形状**：数据面只管交出去，写文件是控制面的
     /// 事 —— 那里才有历史快照、乐观并发和防回环。`None` 表示控制面没
     /// 起来（比如测试里直接建的 AppState），那时轮换只报不写。
-    rotation_sink: Arc<std::sync::Mutex<Option<crate::oauth::RotationSender>>>,
+    renewal_sink: Arc<std::sync::Mutex<Option<crate::oauth::RenewalSender>>>,
     /// 已经报过「写回成功」的上游。
     ///
     /// **只压成功的那句，失败的每次都说。**会轮换的服务器每小时换一次，
@@ -261,6 +261,10 @@ pub struct AppState {
     /// 忽略通知，包括那些真该看的。失败不一样：它要一直挂着，
     /// 而且从成功变成失败是**状态变了**，必须重新说。
     rotation_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 已经报过「凭据失效」的上游。**只在失效的那一刻报一次**，恢复之后清掉
+    expired_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 已经报过「用完」的额度窗口：(上游, 窗口)。**窗口恢复之后清掉**，再用完会重新报
+    exhausted: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     /// 正在服务中的请求数。见 [`crate::live`]。
     pub live: crate::live::Live,
 }
@@ -301,8 +305,10 @@ impl AppState {
                 pricing_config,
                 price_assign,
             )),
-            rotation_sink: Arc::new(std::sync::Mutex::new(None)),
+            renewal_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
+            expired_told: Arc::new(std::sync::Mutex::new(Default::default())),
+            exhausted: Arc::new(std::sync::Mutex::new(Default::default())),
             live: crate::live::Live::default(),
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
@@ -352,6 +358,30 @@ impl AppState {
         self.oauth_token(p, o, http).await
     }
 
+    /// 上游回了 401 之后换一个 access token，重新生成请求头。
+    ///
+    /// **只该调一次**（由调用方保证）：换回来的 token 还是 401，说明问题不在 token。
+    /// `sent_at` 是被拒的那个请求发出去的时刻 —— 那之后已经有人换过的话，直接用新的。
+    pub async fn headers_after_401(
+        &self,
+        p: &tw_config::Provider,
+        http: &reqwest::Client,
+        client: Option<&str>,
+        sent_at: std::time::Instant,
+    ) -> Result<Vec<(String, String)>, String> {
+        let o = p
+            .oauth
+            .as_ref()
+            .ok_or_else(|| format!("上游「{}」未配置 OAuth", p.name))?;
+        let got = self
+            .oauth
+            .invalidate_and_refresh(&p.name, o, http, sent_at)
+            .await;
+        let token = self.settle_token(p, got)?;
+        p.outbound_headers(Some(&token), client)
+            .map_err(|e| e.to_string())
+    }
+
     /// 换一个 access token，服务器换发了新的 refresh token 就交给控制面写回。
     async fn oauth_token(
         &self,
@@ -359,37 +389,121 @@ impl AppState {
         o: &tw_config::OAuth,
         http: &reqwest::Client,
     ) -> Result<String, String> {
-        let (token, rotated) = self
-            .oauth
-            .token(&p.name, o, http)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(new_refresh) = rotated {
-            let endpoint = tw_secret::redact_url(&o.endpoint);
-            let sink = self.rotation_sink.lock().ok().and_then(|g| g.clone());
-            match sink {
+        let got = self.oauth.token(&p.name, o, http).await;
+        self.settle_token(p, got)
+    }
+
+    /// 换 token 的结果：失效了要说，轮换了要写回。
+    fn settle_token(
+        &self,
+        p: &tw_config::Provider,
+        got: Result<(String, Option<crate::oauth::Renewed>), crate::oauth::OauthError>,
+    ) -> Result<String, String> {
+        let (token, renewed) = match got {
+            Ok(t) => {
+                if let Ok(mut told) = self.expired_told.lock() {
+                    told.remove(&p.name);
+                }
+                t
+            }
+            Err(e) => {
+                if e.needs_login() {
+                    self.report_expired(&p.name, &e);
+                }
+                return Err(e.to_string());
+            }
+        };
+        if let Some(r) = renewed {
+            let rotated = r.refresh.is_some();
+            let sink = self.renewal_sink.lock().ok().and_then(|g| g.clone());
+            let lost = match sink {
                 // **交出去就不管了。**写文件、存历史、防回环都在控制面，
-                // 而这里是转发路径 —— 它不能等一次磁盘写
-                Some(tx) => {
-                    let r = crate::oauth::Rotated {
-                        provider: p.name.clone(),
-                        refresh: new_refresh,
-                        endpoint,
-                    };
-                    if tx.try_send(r).is_err() {
-                        // 通道满 = 前一次还没写完。**这条要说** —— 和 body
-                        // 那条路不一样，丢掉的不是一条观测记录，是一份
-                        // 还没落盘的凭据
-                        self.report_rotation(&p.name, false, "写回队列已满，本次未能写回");
-                    }
-                }
+                // 而这里是转发路径 —— 它不能等一次磁盘写。
+                // 通道满 = 前一次还没写完
+                Some(tx) => tx.try_send(r).err().map(|_| "写回队列已满，本次未能写回"),
                 // 控制面没起来：**只报不写**，而且要说清没写
-                None => {
-                    self.report_rotation(&p.name, false, "网关独立运行，没有配置管理器，无法写回")
-                }
+                None => Some("网关独立运行，没有配置管理器，无法写回"),
+            };
+            // **换发的 refresh token 没写回才要说** —— 丢掉的是一份还没落盘、旧的已经作废的
+            // 凭据。access token 没写回不要紧：下次启动拿 refresh token 再换一个就是
+            if let (Some(why), true) = (lost, rotated) {
+                self.report_rotation(&p.name, false, why);
             }
         }
         Ok(token)
+    }
+
+    /// 凭据失效报给界面。**同一家只报一次**，直到它恢复。
+    fn report_expired(&self, provider: &str, e: &crate::oauth::OauthError) {
+        let first = self
+            .expired_told
+            .lock()
+            .map(|mut g| g.insert(provider.to_string()))
+            .unwrap_or(false);
+        if !first {
+            return;
+        }
+        tracing::warn!(provider, "OAuth 凭据已失效，需要重新登录：{e}");
+        self.bus.emit(tw_api::Event::CredentialExpired {
+            id: self.bus.next_id(),
+            provider: provider.to_string(),
+            detail: e.to_string(),
+            at_ms: now_ms(),
+        });
+    }
+
+    /// 读响应头里的订阅额度：存下来，报给界面，用完的窗口单独报一次。
+    ///
+    /// **429 的那一跳也要读**：额度用完时上游回的正是 429，只读成功那一跳的话，
+    /// 「用完了」这件事永远看不到。
+    pub(crate) fn note_quota(&self, id: u64, provider: &str, headers: &reqwest::header::HeaderMap) {
+        let quota = crate::quota::from_headers_reqwest(headers);
+        if quota.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.quotas.lock() {
+            g.insert(provider.to_string(), quota.clone());
+        }
+        self.bus.emit(tw_api::Event::QuotaSeen {
+            id,
+            provider: provider.to_string(),
+            windows: quota
+                .windows
+                .iter()
+                .map(|w| tw_api::QuotaWindow {
+                    window: w.window.clone(),
+                    used_percent: w.used_percent,
+                    reset_in_secs: w.reset_in_secs,
+                    status: w.status.clone(),
+                })
+                .collect(),
+            at_ms: now_ms(),
+        });
+        for w in &quota.windows {
+            let key = (provider.to_string(), w.window.clone());
+            let changed = self
+                .exhausted
+                .lock()
+                .map(|mut g| {
+                    if w.rejected() {
+                        g.insert(key)
+                    } else {
+                        g.remove(&key);
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if changed {
+                tracing::warn!(provider, window = %w.window, "订阅额度已用完");
+                self.bus.emit(tw_api::Event::QuotaExhausted {
+                    id: self.bus.next_id(),
+                    provider: provider.to_string(),
+                    window: w.window.clone(),
+                    reset_in_secs: w.reset_in_secs,
+                    at_ms: now_ms(),
+                });
+            }
+        }
     }
 
     /// 凭据轮换的结果报给界面。
@@ -531,9 +645,9 @@ impl AppState {
             .collect()
     }
 
-    /// 接上轮换的去处。**控制面起来之后才调** —— 在那之前轮换只报不写。
-    pub fn set_rotation_sink(&self, tx: crate::oauth::RotationSender) {
-        if let Ok(mut g) = self.rotation_sink.lock() {
+    /// 接上写回的去处。**控制面起来之后才调** —— 在那之前刷新只报不写。
+    pub fn set_renewal_sink(&self, tx: crate::oauth::RenewalSender) {
+        if let Ok(mut g) = self.renewal_sink.lock() {
             *g = Some(tx);
         }
     }
@@ -1362,9 +1476,14 @@ async fn pipeline(
         // 方言互转。**同格式时是 None，这一整段零成本**
         let client_dialect = api.map(|a| a.dialect());
         let target = crate::translate::plan(api, generates, provider.effective_protocol());
+        // ChatGPT 账号（Codex 后端）：只收流式、不认输出上限、身份头由网关填
+        let chatgpt =
+            generates && provider.effective_protocol() == Some(tw_config::Protocol::Chatgpt);
         let mut path = uri.path().to_string();
         let mut upstream_query = query.clone();
         let mut prepared: Option<tw_dialect::convert::Prepared> = None;
+        // 直通到 Codex 后端、客户端却要整包时，收齐流要用的会话
+        let mut collect_session: Option<tw_dialect::convert::Session> = None;
         let outbound = match target {
             None => {
                 // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
@@ -1378,12 +1497,44 @@ async fn pipeline(
                 }
                 // 对话之前被转换过、这一跳直通时，去掉客户端带回来的转换签名：
                 // 这个上游不认，整个请求会被拒
-                match client_dialect
+                let out = match client_dialect
                     .filter(|_| generates)
                     .and_then(|d| tw_dialect::convert::strip_carried(d, &out))
                 {
                     Some(b) => Bytes::from(b),
                     None => out,
+                };
+                if chatgpt {
+                    // **只动 Codex 后端不认的那几个字段**，其余原样发（见 `chatgpt` 模块）
+                    let (shaped, dropped) = crate::chatgpt::shape_passthrough(&out);
+                    if !dropped.is_empty() {
+                        let responses = tw_dialect::ir::Dialect::Responses.slug();
+                        state.bus.emit(tw_api::Event::Translated {
+                            id,
+                            provider: provider.name.clone(),
+                            from: responses.into(),
+                            to: responses.into(),
+                            dropped,
+                            at_ms: now_ms(),
+                        });
+                    }
+                    // 客户端要整包，后端只给流：由网关收齐。收齐要知道客户端的格式，所以要一个会话
+                    if let Some(Ok(d)) = &decoded
+                        && !d.request.stream
+                    {
+                        collect_session = Some(
+                            d.clone()
+                                .encode(&tw_dialect::ir::Target {
+                                    dialect: tw_dialect::ir::Dialect::Responses,
+                                    official: provider.is_official_endpoint(),
+                                    default_max_tokens: 0,
+                                })
+                                .session,
+                        );
+                    }
+                    shaped
+                } else {
+                    out
                 }
             }
             Some(dialect) => {
@@ -1409,6 +1560,12 @@ async fn pipeline(
                 };
                 let mut d = d.clone();
                 crate::translate::apply_set(&mut d.request, &effective_set);
+                // Codex 后端不认输出上限：带着它发过去是一个 400
+                let limit = if chatgpt {
+                    crate::chatgpt::drop_output_limit(&mut d.request, d.client)
+                } else {
+                    None
+                };
                 let p = d.encode(&tw_dialect::ir::Target {
                     dialect,
                     official: provider.is_official_endpoint(),
@@ -1419,21 +1576,34 @@ async fn pipeline(
                 });
                 // **转换了就要说一声，丢了字段更要说。**用户会发现「扩展思考开了
                 // 却没生效」而完全不知道从哪儿查起
+                let mut dropped = p.dropped.clone();
+                dropped.extend(limit);
                 state.bus.emit(tw_api::Event::Translated {
                     id,
                     provider: provider.name.clone(),
                     from: d.client.slug().into(),
                     to: dialect.slug().into(),
-                    dropped: p.dropped.clone(),
+                    dropped,
                     at_ms: now_ms(),
                 });
                 path = p.path.clone();
                 upstream_query = p.query.clone();
-                let body = Bytes::from(p.body.clone());
+                // **客户端要不要流由会话记着**，发给 Codex 后端的这一份一律是流式
+                let body = if chatgpt {
+                    Bytes::from(crate::chatgpt::force_stream(p.body.clone()))
+                } else {
+                    Bytes::from(p.body.clone())
+                };
                 prepared = Some(p);
                 body
             }
         };
+
+        if chatgpt {
+            // Codex 后端的生成接口是 `{base}/responses`，不在 `/v1` 下
+            path = "/responses".to_string();
+            upstream_query = None;
+        }
 
         // 出站脱敏。**和阶段二在同一个位置，理由完全一样** ——
         // 故障转移从官方切到中转的那一刻，正是最需要它的时刻，而那时
@@ -1497,27 +1667,62 @@ async fn pipeline(
             "转发"
         );
 
-        let mut req = http.request(method, &url);
         let required = target
             .map(crate::translate::required_headers)
             .unwrap_or_default();
-        req = forward::forward_headers_filtered(req, &headers, |n| {
-            let own = match (target, client_dialect) {
-                (Some(_), Some(c)) => !crate::translate::keeps_header(c, n),
-                _ => false,
-            };
-            !own && !required.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
-                && !forward::overridden(&upstream_headers, n)
-        });
-        // 目标格式必需的头（Anthropic 的 anthropic-version）。上游配置里写了同名头时以配置为准
-        for (k, v) in required {
-            if !forward::overridden(&upstream_headers, k) {
-                req = req.header(*k, *v);
+        let build = |upstream_headers: &[(String, String)]| {
+            let mut req = http.request(method.clone(), &url);
+            req = forward::forward_headers_filtered(req, &headers, |n| {
+                let own = match (target, client_dialect) {
+                    (Some(_), Some(c)) => !crate::translate::keeps_header(c, n),
+                    _ => false,
+                };
+                // 请求来自谁由网关如实填写：客户端报的来源（比如 Codex CLI 的 originator）
+                // 不转发，请求经过的是 ThinkWatch
+                let identity = chatgpt && !crate::chatgpt::keeps_client_header(n);
+                !own && !identity
+                    && !required.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
+                    && !forward::overridden(upstream_headers, n)
+            });
+            // 目标格式必需的头（Anthropic 的 anthropic-version）。上游配置里写了同名头时以配置为准
+            for (k, v) in required {
+                if !forward::overridden(upstream_headers, k) {
+                    req = req.header(*k, *v);
+                }
+            }
+            req = forward::apply_headers(req, upstream_headers);
+            if chatgpt {
+                req = forward::apply_headers(
+                    req,
+                    &crate::chatgpt::identity_headers(&headers, upstream_headers),
+                );
+            }
+            req
+        };
+        let sent_at = std::time::Instant::now();
+        let mut sent = build(&upstream_headers).body(outbound.clone()).send().await;
+        // **OAuth 上游回 401：换一个 access token 再发一次，只一次。**token 可能在别处被
+        // 吊销了、提前失效了；不重试的话，这个请求连同之后每一个请求都会原样失败，直到
+        // 缓存里那个 token 按时间过期。换回来的还是 401，说明问题不在 token
+        if provider.oauth.is_some() && matches!(&sent, Ok(r) if r.status() == 401) {
+            match state
+                .headers_after_401(provider, http, Some(&client_name), sent_at)
+                .await
+            {
+                // 换回来的还是同一个（刚换过不久）：再发一次也是 401
+                Ok(fresh) if fresh != upstream_headers => {
+                    sent = build(&fresh).body(outbound.clone()).send().await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(provider = %provider.name, "上游返回 401，换 token 失败：{e}")
+                }
             }
         }
-        req = forward::apply_headers(req, &upstream_headers);
-        match req.body(outbound.clone()).send().await {
+        match sent {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
+                // 额度用完时上游回的正是 429，这一跳的额度头也要读
+                state.note_quota(id, &provider.name, r.headers());
                 // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
                 // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
                 // 也一样被拒，还会白白污染那家的健康度。
@@ -1558,7 +1763,7 @@ async fn pipeline(
                 upstream = Some(r);
                 used = Some(provider);
                 used_ledger = ledger;
-                used_session = prepared.map(|p| p.session);
+                used_session = prepared.map(|p| p.session).or(collect_session);
                 break;
             }
             Err(e) => {
@@ -1634,27 +1839,7 @@ async fn pipeline(
     });
     // 订阅额度。**零成本** —— 这些头本来就在响应里，读一下
     // 就有了。按量付费的账号没有它们，那时什么都不发。
-    let quota = crate::quota::from_headers_reqwest(upstream.headers());
-    if !quota.is_empty() {
-        if let Ok(mut g) = state.quotas.lock() {
-            g.insert(provider.name.clone(), quota.clone());
-        }
-        state.bus.emit(tw_api::Event::QuotaSeen {
-            id,
-            provider: provider.name.clone(),
-            windows: quota
-                .windows
-                .iter()
-                .map(|w| tw_api::QuotaWindow {
-                    window: w.window.clone(),
-                    used_percent: w.used_percent,
-                    reset_in_secs: w.reset_in_secs,
-                    status: w.status.clone(),
-                })
-                .collect(),
-            at_ms: now_ms(),
-        });
-    }
+    state.note_quota(id, &provider.name, upstream.headers());
 
     let mut out_headers = forward::response_headers(upstream.headers());
     // **哪一家服务的，写在头上。**错误契约要求上游的错误原样透传、不加
@@ -1680,14 +1865,30 @@ async fn pipeline(
     // 都改不了，而一个戛然而止的 SSE 流和一个正常结束的流在客户端看来
     // 长得一模一样 —— 用户会以为模型就答了这么多。唯一还能说话的地方
     // 是流本身，所以补一个 `event: error` 帧。
+    //
+    // **Codex 后端的流式响应没有 Content-Type**（实测）。发给它的请求一定是流式的，所以
+    // 成功的响应就是 SSE；不补上的话，转换、回显还原和工具调用审查都会当成整包处理。
+    if generates
+        && provider.effective_protocol() == Some(tw_config::Protocol::Chatgpt)
+        && status.is_success()
+        && !out_headers.contains_key(axum::http::header::CONTENT_TYPE)
+    {
+        out_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+    }
     let is_sse = out_headers
         .get(axum::http::header::CONTENT_TYPE)
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
     // 转换的回程。**流式成功的边收边转**；整包、以及上游返回的错误，整个到手再转 ——
     // 上游的错误体要换成客户端认得的错误格式，否则客户端连原因都解析不出来
     let session = used_session;
-    let convert_stream = session.is_some() && is_sse && status.is_success();
-    let convert_whole = session.is_some() && !convert_stream;
+    // 客户端要整包、上游给的是流：**收齐之后写一个客户端格式的整包。**以前这种情况把转换
+    // 出来的流标成 `application/json` 发过去，客户端解析不了
+    let collect = session.as_ref().is_some_and(|s| !s.stream) && is_sse && status.is_success();
+    let convert_stream = session.is_some() && is_sse && status.is_success() && !collect;
+    let convert_whole = session.is_some() && !convert_stream && !collect;
     if let Some(s) = &session {
         // 客户端要流而上游给了整包时，整包会被写成客户端格式的流
         let writes_stream = convert_stream || (status.is_success() && s.stream);
@@ -1716,6 +1917,12 @@ async fn pipeline(
     // 转换，转换器看到的就和上游原话一样了。
     let mut back = if convert_stream {
         session.as_ref().map(|s| s.stream())
+    } else {
+        None
+    };
+    // 客户端要整包、上游给流时的收集器
+    let mut collector = if collect {
+        session.as_ref().map(|s| s.collector())
     } else {
         None
     };
@@ -1788,6 +1995,10 @@ async fn pipeline(
                     // （说的是别把 SSE 变成一次性交付，这里没有 SSE）
                     if convert_whole {
                         whole.extend_from_slice(&out);
+                        continue;
+                    }
+                    if let Some(c) = collector.as_mut() {
+                        c.process(&out);
                         continue;
                     }
                     // **审查的是客户端将要看到的那一版**（还原之后的），
@@ -1868,6 +2079,18 @@ async fn pipeline(
                     }
                 }
             }
+            (Some(s), None) if collect => match collector.take() {
+                Some(mut c) if broke.is_none() => {
+                    c.process(&tail);
+                    match c.finish() {
+                        Ok(body) => body,
+                        // 上游在流里报了错：按客户端的格式说出来
+                        Err(why) => tw_dialect::convert::error_body(s.client, 502, &why),
+                    }
+                }
+                // 半截的流收不出完整的回答，由下面的错误收尾
+                _ => Vec::new(),
+            },
             (_, Some(c)) => {
                 let mut t = c.process(&tail);
                 // **收尾必须补上**：客户端等着结束帧（Anthropic 的 message_stop、
@@ -1906,6 +2129,13 @@ async fn pipeline(
                 if let Some(c) = back.as_mut() {
                     // 转换过的流按客户端的格式收尾
                     yield Ok(Bytes::from(c.fail(&format!("[ThinkWatch] {}", err.message))));
+                } else if let (true, Some(s)) = (collect, session.as_ref()) {
+                    // 要收齐的整包一个字节都还没发：按客户端的格式回一个错误体
+                    yield Ok(Bytes::from(tw_dialect::convert::error_body(
+                        s.client,
+                        502,
+                        &format!("[ThinkWatch] {}", err.message),
+                    )));
                 } else if is_sse && session.is_none() {
                     yield Ok(Bytes::from(err.sse_frame()));
                 }

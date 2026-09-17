@@ -123,7 +123,7 @@ pub fn probe_request(protocol: Option<tw_config::Protocol>, model: &str) -> Opti
             }),
             headers: &[],
         }),
-        Some(OpenaiResponses) | Some(Gemini) => None,
+        Some(OpenaiResponses) | Some(Gemini) | Some(Chatgpt) => None,
     }
 }
 

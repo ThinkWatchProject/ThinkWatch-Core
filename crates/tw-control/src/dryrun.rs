@@ -203,7 +203,8 @@ pub async fn dry_run(
                 .iter()
                 .filter_map(|name| {
                     let p = rt.config.providers.iter().find(|p| &p.name == name)?;
-                    let to = p.effective_protocol()?.slug();
+                    // 比的是格式，不是协议：ChatGPT 账号说的就是 Responses 格式
+                    let to = tw_gateway::translate::dialect_of(p.effective_protocol()?).slug();
                     (to != req.dialect).then(|| tw_api::ConvertedView {
                         provider: name.clone(),
                         from: req.dialect.clone(),

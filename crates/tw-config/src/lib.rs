@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub use tw_types::Limits;
 
+pub mod chatgpt;
 pub mod credential;
 pub mod edit;
 pub mod history;
@@ -371,14 +372,23 @@ pub struct Client {
 /// 但不写回更糟：**换发新的那一刻旧的已经在服务端作废了**，不写回等于
 /// 让配置文件从那一秒起就是坏的，只是症状延迟到下一次重启。
 ///
-/// 写回只动那一个标量（span 补丁），而且不进配置历史 —— 回滚到一次
+/// 写回只动这几个标量（span 补丁），而且不进配置历史 —— 回滚到一次
 /// 轮换之前拿到的是一个作废的 token，那不是可以退回去的状态。
+///
+/// # access token 也写在这里
+///
+/// 每次刷新之后，网关把新的 access token 和过期时间一起写回来（2026-09-18 定）。
+/// 重启之后手里那个没过期就直接用：不用先换一次 token，也就不会每次重启都轮换
+/// 一次 refresh token、写一次文件；启动时 token 端点一时连不上，请求也照样能发。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuth {
-    /// 现成的 access token。**可选** —— 不写就启动后立刻用 refresh 换一个
+    /// access token。**可选** —— 不写就在第一次用到时拿 refresh 换一个，换来的写回这里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<String>,
+    /// `access` 什么时候过期，RFC 3339（UTC）。不知道的话就一直用到上游回 401
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     pub refresh: String,
     /// token 端点
     pub endpoint: String,
@@ -600,6 +610,9 @@ pub enum Protocol {
     OpenaiChat,
     OpenaiResponses,
     Gemini,
+    /// ChatGPT 账号：Codex 后端。说的是 OpenAI Responses 格式，但只接受流式、
+    /// 不认 `max_output_tokens`、身份头由网关填（见 [`chatgpt`]）
+    Chatgpt,
 }
 
 impl Protocol {
@@ -610,6 +623,7 @@ impl Protocol {
             Protocol::OpenaiChat => "openai-chat",
             Protocol::OpenaiResponses => "openai-responses",
             Protocol::Gemini => "gemini",
+            Protocol::Chatgpt => "chatgpt",
         }
     }
 }
@@ -618,6 +632,9 @@ impl Provider {
     /// 从 base_url 猜协议。猜不出来返回 None —— **不猜一个默认值**，
     /// 因为猜错的表现是「请求发出去了但上游 400」，比直接说不知道难查。
     pub fn guess_protocol(base_url: &str) -> Option<Protocol> {
+        if chatgpt::is_backend(base_url) {
+            return Some(Protocol::Chatgpt);
+        }
         let h = base_url.to_ascii_lowercase();
         if h.contains("api.anthropic.com") {
             Some(Protocol::Anthropic)
@@ -650,6 +667,7 @@ impl Provider {
             "api.moonshot.cn",
             "open.bigmodel.cn",
             "dashscope.aliyuncs.com",
+            "chatgpt.com",
         ];
         let h = self.base_url.to_ascii_lowercase();
         // **要在 host 上比，不能只看包含。**`https://evil.com/api.anthropic.com/`
@@ -701,49 +719,71 @@ impl Provider {
     }
 }
 
-/// 把 token 端点换发的新 refresh token 写回 config.yaml 的**那一个标量**。
+/// 刷新之后要写回配置的值。
+#[derive(Debug, Clone, Copy)]
+pub struct RenewedTokens<'a> {
+    pub access: &'a str,
+    /// RFC 3339（UTC）。服务器没说有效期就是 `None`，那时删掉配置里旧的过期时间
+    pub expires_at: Option<&'a str>,
+    /// 服务器换发了新的 refresh token 才有
+    pub refresh: Option<&'a str>,
+}
+
+/// 把刷新换回来的 token 写回 config.yaml：access token、过期时间，以及换发的
+/// refresh token（有的话）。
 ///
 /// # 为什么要写回
 ///
 /// **服务器换发新 refresh token 的那一刻，旧的已经在服务端作废了。**
 /// 所以「不写回」不是保守选项 —— 它保证了配置文件从那一秒起就是坏的，
 /// 只是症状延迟到下一次重启（表现是这家上游突然全是 401，而那时没人
-/// 会想到是几天前的一次轮换）。写回才是安全的那一边。
+/// 会想到是几天前的一次轮换）。写回才是安全的那一边。access token 写回的理由
+/// 见 [`OAuth`]。
 ///
 /// # 为什么是 span 补丁而不是 serde 往返
 ///
 /// 往返会把用户的注释、空行、字段顺序全洗掉 —— 而这是**用户没要求的
-/// 一次写入**，它必须只动它该动的那 40 个字符。cc-switch 那 147 个
+/// 一次写入**，它必须只动它该动的那几个字段。cc-switch 那 147 个
 /// commit 的白名单教训在这里同样成立：我们要写什么是清楚的，
 /// 「要保留什么」永远数不完。
 ///
-/// 找不到那个字段就报错，**不追加**：追加意味着我们猜错了结构，而在
-/// 一个装着明文密钥的文件里猜结构是不能接受的。
-pub fn patch_oauth_refresh(
+/// `oauth.refresh` 找不到就报错，**不追加**：那说明我们猜错了结构，而在一个装着
+/// 明文密钥的文件里猜结构是不能接受的。`access` 和 `expires_at` 是可选字段，
+/// 没写过就加在 `oauth` 下面。
+pub fn patch_oauth_tokens(
     text: &str,
     provider: &str,
-    new_refresh: &str,
+    tokens: RenewedTokens<'_>,
 ) -> Result<String, RotateError> {
     // 名字对应第几个 provider —— 从**文本本身**数，不从解析后的结构数。
     // 两者理论上一致，但真正要动的是文本里的那个位置。
     let idx = provider_index(text, provider).ok_or_else(|| RotateError::NoProvider {
         provider: provider.to_string(),
     })?;
-    let path = tw_yaml::path!["providers", idx, "oauth", "refresh"];
-    // 先确认它在那儿。`set` 对不存在的路径行为是另一回事，而这里
-    // 「不在那儿」本身就是「别写」的理由
-    tw_yaml::find(text, &path).map_err(|source| RotateError::Shape {
+    let shape = |source| RotateError::Shape {
         provider: provider.to_string(),
         source,
-    })?;
-    let out = tw_yaml::set(text, &path, &tw_yaml::Scalar::s(new_refresh)).map_err(|source| {
-        RotateError::Shape {
-            provider: provider.to_string(),
-            source,
+    };
+    let refresh_path = tw_yaml::path!["providers", idx, "oauth", "refresh"];
+    // 先确认它在那儿：不在那儿本身就是「别写」的理由
+    tw_yaml::find(text, &refresh_path).map_err(shape)?;
+    let mut out = text.to_string();
+    if let Some(r) = tokens.refresh {
+        out = tw_yaml::set(&out, &refresh_path, &tw_yaml::Scalar::s(r)).map_err(shape)?;
+    }
+    let access_path = tw_yaml::path!["providers", idx, "oauth", "access"];
+    out = tw_yaml::insert(&out, &access_path, &tw_yaml::Scalar::s(tokens.access)).map_err(shape)?;
+    let expires_path = tw_yaml::path!["providers", idx, "oauth", "expires_at"];
+    out = match tokens.expires_at {
+        Some(at) => tw_yaml::insert(&out, &expires_path, &tw_yaml::Scalar::s(at)).map_err(shape)?,
+        // 新 token 的有效期不知道：旧的过期时间留着只会让它被当成旧 token 的寿命
+        None if tw_yaml::find(&out, &expires_path).is_ok() => {
+            tw_yaml::remove_key(&out, &expires_path).map_err(shape)?
         }
-    })?;
+        None => out,
+    };
     // **写之前先自己读一遍。**patch 出来的东西必须还是一份能加载的配置，
-    // 而且那个字段真的变成了新值 —— 否则我们会把一份坏配置留在盘上，
+    // 而且那几个字段真的变成了新值 —— 否则我们会把一份坏配置留在盘上，
     // 而用户下一次启动才撞上它（「先校验再写」同一条）。
     let re = try_parse(&out).map_err(|r| RotateError::Broke {
         provider: provider.to_string(),
@@ -754,11 +794,15 @@ pub fn patch_oauth_refresh(
         .iter()
         .find(|p| p.name == provider)
         .and_then(|p| p.oauth.as_ref())
-        .is_some_and(|o| o.refresh == new_refresh);
+        .is_some_and(|o| {
+            o.access.as_deref() == Some(tokens.access)
+                && o.expires_at.as_deref() == tokens.expires_at
+                && tokens.refresh.is_none_or(|r| o.refresh == r)
+        });
     if !ok {
         return Err(RotateError::Broke {
             provider: provider.to_string(),
-            why: "写入后读回的 refresh token 不是新值".into(),
+            why: "写入后读回的 token 不是新值".into(),
         });
     }
     Ok(out)
@@ -907,6 +951,10 @@ providers:
         assert_eq!(
             Provider::guess_protocol("https://generativelanguage.googleapis.com/v1beta"),
             Some(Protocol::Gemini)
+        );
+        assert_eq!(
+            Provider::guess_protocol("https://chatgpt.com/backend-api/codex"),
+            Some(Protocol::Chatgpt)
         );
         // 中转站猜不出来 —— 返回 None 而不是编一个默认值。
         assert_eq!(

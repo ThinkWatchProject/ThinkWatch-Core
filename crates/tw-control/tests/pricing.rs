@@ -58,6 +58,7 @@ fn bed_with(yaml: &str, updater: Updater) -> Bed {
         store: None,
         started: std::time::Instant::now(),
         price_updater: Arc::new(updater),
+        chatgpt: Default::default(),
         // **测试里绝不能碰开发者自己的配置**
         home: d.path().join("home"),
     };
