@@ -1548,6 +1548,21 @@ pub struct HistoryRow {
     /// 按什么价格算的。没算出金额的、老记录没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSourceView>,
+    /// 服务它的那一跳做过的格式转换。直通的、老记录没有它
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translated: Option<TranslatedView>,
+}
+
+/// 一次请求做过的格式转换。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranslatedView {
+    /// 客户端的格式：`anthropic` / `openai-chat` / `openai-responses` / `gemini`
+    pub from: String,
+    /// 服务它的上游的格式
+    pub to: String,
+    /// 客户端请求里转不过去、被丢掉的字段路径
+    #[serde(default)]
+    pub dropped: Vec<String>,
 }
 
 /// 一条请求的全部细节。**详情抽屉吃这个。**
@@ -2054,6 +2069,19 @@ pub struct DryRunResult {
     /// 规则选中、但服务不了这个请求而被跳过的上游
     #[serde(default)]
     pub skipped: Vec<SkippedView>,
+    /// 候选链里要转换格式的上游：客户端的格式和上游的协议不同
+    #[serde(default)]
+    pub converted: Vec<ConvertedView>,
+}
+
+/// 一个要转换格式的候选上游。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConvertedView {
+    pub provider: String,
+    /// 客户端的格式：`anthropic` / `openai-chat` / `openai-responses` / `gemini`
+    pub from: String,
+    /// 这个上游的格式
+    pub to: String,
 }
 
 /// 一个被跳过的候选上游。

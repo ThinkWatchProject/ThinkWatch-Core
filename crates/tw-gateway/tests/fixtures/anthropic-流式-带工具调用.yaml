@@ -34,7 +34,7 @@ response:
 
 expect:
   model: claude-sonnet-4-5
-  input_tokens_estimate: 19
+  input_tokens_estimate: 15
   cache: true
   tools: true
   tool_count: 2

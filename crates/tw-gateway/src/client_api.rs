@@ -14,6 +14,8 @@
 //! 认不出的路径（`None`）照旧直通，出错时的格式退回按密钥位置猜。
 
 use tw_config::Protocol;
+use tw_dialect::convert::Decoded;
+use tw_dialect::ir::{Dialect, Rejection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientApi {
@@ -62,6 +64,31 @@ impl ClientApi {
         None
     }
 
+    /// 这个路径是不是**生成回答**的那个调用。
+    ///
+    /// **只有生成回答能转换**：计 token（`/v1/messages/count_tokens`、`:countTokens`）、
+    /// 嵌入、旧版补全、Responses 的压缩这些接口，别的格式没有对应物。以前
+    /// `count_tokens` 打到 OpenAI 上游会被改写成一次真正的补全 —— 既花钱，回来的
+    /// 也不是客户端要的形状。
+    pub fn generates(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        let tail = p.strip_prefix("/v1").unwrap_or(p);
+        matches!(tail, "/messages" | "/chat/completions" | "/responses")
+            || p == "/backend-api/codex/responses"
+            || (p.contains("/models/")
+                && (p.ends_with(":generateContent") || p.ends_with(":streamGenerateContent")))
+    }
+
+    /// 转换库里对应的格式
+    pub fn dialect(&self) -> Dialect {
+        match self {
+            ClientApi::AnthropicMessages => Dialect::Anthropic,
+            ClientApi::OpenaiChat => Dialect::Chat,
+            ClientApi::OpenaiResponses => Dialect::Responses,
+            ClientApi::Gemini => Dialect::Gemini,
+        }
+    }
+
     /// 和它同格式的上游协议。
     pub fn protocol(&self) -> Protocol {
         match self {
@@ -77,14 +104,22 @@ impl ClientApi {
         self.protocol().slug()
     }
 
-    /// 能服务这种请求的上游协议：同格式的直通，加上有现成转换的。
+    /// 能服务这次调用的上游协议。
     ///
     /// **模型准入、`/v1/models` 和转发时选不选这家，用的都是这一张表** ——
-    /// 列出来的模型发过去一定有人能接。
-    pub fn servable_by(&self) -> &'static [Protocol] {
+    /// 列出来的模型发过去一定有人能接。生成回答四种格式互相转换，谁都能服务；
+    /// 别的接口只有同格式的上游能处理（见 [`ClientApi::generates`]）。
+    pub fn servable_by(&self, generates: bool) -> &'static [Protocol] {
+        if generates {
+            return &[
+                Protocol::Anthropic,
+                Protocol::OpenaiChat,
+                Protocol::OpenaiResponses,
+                Protocol::Gemini,
+            ];
+        }
         match self {
-            // 手上一把 DeepSeek / Kimi 的 key 想让 Claude Code 用上：见 `translate`
-            ClientApi::AnthropicMessages => &[Protocol::Anthropic, Protocol::OpenaiChat],
+            ClientApi::AnthropicMessages => &[Protocol::Anthropic],
             ClientApi::OpenaiChat => &[Protocol::OpenaiChat],
             ClientApi::OpenaiResponses => &[Protocol::OpenaiResponses],
             ClientApi::Gemini => &[Protocol::Gemini],
@@ -104,6 +139,62 @@ impl ClientApi {
 /// 这些协议写进模型目录时的名字，给目录的过滤用。
 pub fn slugs(protocols: &[Protocol]) -> Vec<&'static str> {
     protocols.iter().map(|p| p.slug()).collect()
+}
+
+/// 读一个请求：调的是哪种 API、是不是生成回答、解码成中间表示、抽出路由用的事实。
+///
+/// **管线和回放测试用的是同一个函数** —— 另写一份的话，回放验的是那一份，线上跑的
+/// 是这一份。
+#[derive(Debug)]
+pub struct Reading {
+    pub api: Option<ClientApi>,
+    pub generates: bool,
+    /// 生成回答的请求解码出来的中间表示。解码失败时是那条理由 —— **只在需要转换时
+    /// 才用得上**：同格式直通时，我们解不开的东西上游可能完全认识
+    pub decoded: Option<Result<Decoded, Rejection>>,
+    pub facts: tw_engine::RequestFacts,
+}
+
+pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -> Reading {
+    let api = ClientApi::of_path(path);
+    let generates = api.is_some() && ClientApi::generates(path);
+    let decoded = match (api, body) {
+        (Some(a), Some(v)) if generates => {
+            Some(tw_dialect::convert::decode(a.dialect(), v, path, query))
+        }
+        _ => None,
+    };
+    let mut facts = match (&decoded, body) {
+        (Some(Ok(d)), Some(v)) => tw_engine::RequestFacts::from_request(&d.request, v),
+        // 解不开或者不是生成回答：只取模型名，别的维度按默认走兜底规则
+        (_, Some(v)) => tw_engine::RequestFacts {
+            model: v
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .or_else(|| gemini_model(path))
+                .unwrap_or_default(),
+            ..Default::default()
+        },
+        (_, None) => tw_engine::RequestFacts {
+            model: gemini_model(path).unwrap_or_default(),
+            ..Default::default()
+        },
+    };
+    facts.dialect = api.map(|a| a.slug()).unwrap_or_default().to_string();
+    Reading {
+        api,
+        generates,
+        decoded,
+        facts,
+    }
+}
+
+/// Gemini 把模型写在路径里：`/v1beta/models/{model}:动作`
+fn gemini_model(path: &str) -> Option<String> {
+    let (_, rest) = path.split_once("/models/")?;
+    let (model, _) = rest.rsplit_once(':')?;
+    Some(model.to_string())
 }
 
 #[cfg(test)]
@@ -148,20 +239,52 @@ mod tests {
         // 这正是改成看路径的原因：`ANTHROPIC_AUTH_TOKEN` 发的是 Bearer
         let api = ClientApi::of_path("/v1/messages").unwrap();
         assert_eq!(api.error_dialect(), crate::error::Dialect::Anthropic);
-        assert!(api.servable_by().contains(&Protocol::Anthropic));
+        assert!(api.servable_by(true).contains(&Protocol::Anthropic));
     }
 
     #[test]
-    fn an_anthropic_client_can_be_served_by_an_openai_chat_upstream_but_not_the_reverse() {
-        assert!(
-            ClientApi::AnthropicMessages
-                .servable_by()
-                .contains(&Protocol::OpenaiChat)
+    fn generating_converts_to_every_protocol_but_other_calls_stay_home() {
+        for (path, generates) in [
+            ("/v1/messages", true),
+            ("/v1/chat/completions", true),
+            ("/v1/responses", true),
+            ("/backend-api/codex/responses", true),
+            ("/v1beta/models/gemini-2.5-pro:streamGenerateContent", true),
+            ("/v1beta/models/gemini-2.5-pro:generateContent", true),
+            // 计 token 转到别家会变成一次真的补全
+            ("/v1/messages/count_tokens", false),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", false),
+            ("/v1/embeddings", false),
+            ("/v1/completions", false),
+            ("/v1/responses/compact", false),
+        ] {
+            assert_eq!(ClientApi::generates(path), generates, "{path}");
+        }
+        assert_eq!(ClientApi::OpenaiChat.servable_by(true).len(), 4);
+        assert_eq!(
+            ClientApi::AnthropicMessages.servable_by(false),
+            [Protocol::Anthropic]
         );
-        assert!(
-            !ClientApi::OpenaiChat
-                .servable_by()
-                .contains(&Protocol::Anthropic)
+    }
+
+    #[test]
+    fn a_gemini_request_is_read_with_the_model_from_its_path() {
+        let body = serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let r = read(
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            Some("alt=sse"),
+            Some(&body),
         );
+        assert!(r.generates);
+        assert_eq!(r.facts.model, "gemini-2.5-pro");
+        assert!(r.facts.stream);
+        assert_eq!(r.facts.dialect, "gemini");
+        let r = read(
+            "/v1beta/models/gemini-2.5-pro:countTokens",
+            None,
+            Some(&body),
+        );
+        assert!(!r.generates && r.decoded.is_none());
+        assert_eq!(r.facts.model, "gemini-2.5-pro");
     }
 }

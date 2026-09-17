@@ -460,6 +460,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
         billing: String::new(),
         cache_saved_micros: None,
         price_source: None,
+        translated: None,
     };
     row.id = 1;
     db.insert(&row).unwrap();

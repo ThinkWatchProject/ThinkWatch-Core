@@ -1008,6 +1008,10 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
             .price_source
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
+        translated: r
+            .translated
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok()),
     }
 }
 

@@ -16,7 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 11;
+const SCHEMA: i64 = 12;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -116,6 +116,8 @@ pub struct RequestRow {
     /// 金额按什么价格算的，JSON（`tw_api::PriceSourceView`）。没算出金额的、
     /// 老记录是 None
     pub price_source: Option<String>,
+    /// 服务它的那一跳做过的格式转换，JSON。直通的是 None
+    pub translated: Option<String>,
 }
 
 #[derive(Debug)]
@@ -321,6 +323,17 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN price_source TEXT;")?;
         }
+        if from < 12 {
+            // 客户端和上游说不同的格式时做过的转换，以及转不过去被丢掉的字段。
+            //
+            // **记在行上。**实时事件只在网关运行期间存在，而「扩展思考开了却
+            // 没生效」往往是事后翻历史才发现的。
+            //
+            // 老记录是 NULL：那时只有 Anthropic → OpenAI Chat 一个方向，转换
+            // 没有落库。
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN translated TEXT;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -332,8 +345,8 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint, session, tool_calls, flagged, redacted, cancelled, price_source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+              client_hint, session, tool_calls, flagged, redacted, cancelled, price_source, translated)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             params![
                 r.id,
                 r.at_ms,
@@ -363,6 +376,7 @@ impl Db {
                 r.redacted,
                 r.cancelled as i64,
                 r.price_source,
+                r.translated,
             ],
         )?;
         Ok(())
@@ -1075,6 +1089,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         billing: r.get("billing")?,
         cache_saved_micros: r.get("cache_saved_micros")?,
         price_source: r.get("price_source")?,
+        translated: r.get("translated")?,
     })
 }
 
@@ -1181,6 +1196,7 @@ mod tests {
             billing: "per-token".into(),
             cache_saved_micros: None,
             price_source: None,
+            translated: None,
         }
     }
 
@@ -1694,6 +1710,7 @@ mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN translated;
                      ALTER TABLE requests DROP COLUMN price_source;
                      ALTER TABLE requests DROP COLUMN cancelled;
                      ALTER TABLE requests DROP COLUMN redacted;
@@ -1714,6 +1731,8 @@ mod tests {
         assert!(got.iter().all(|r| !r.cancelled));
         // 老记录不知道当时用的是哪份价目表，那就是不知道
         assert!(got.iter().all(|r| r.price_source.is_none()));
+        // 老记录没有落库的转换，那就是没有
+        assert!(got.iter().all(|r| r.translated.is_none()));
         let mut fresh = row(3, 300);
         fresh.client_hint = Some("codex".into());
         fresh.session = Some("abc-100".into());

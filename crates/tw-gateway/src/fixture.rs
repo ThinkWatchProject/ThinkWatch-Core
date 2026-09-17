@@ -96,7 +96,11 @@ pub fn extract(request: &Recorded, response: &Recorded) -> Extracted {
     // ---- 请求侧：直接复用路由用的那个解析器。**必须是同一个** ——
     // 另写一份提取逻辑的话，回放验的是那一份，而线上跑的是这一份
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&request.body) {
-        let f = tw_engine::RequestFacts::from_anthropic_body(&v);
+        let (path, query) = match request.path.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (request.path.as_str(), None),
+        };
+        let f = crate::client_api::read(path, query, Some(&v)).facts;
         out.model = f.model;
         out.input_tokens_estimate = f.input_tokens;
         out.cache = f.cache;
@@ -417,11 +421,15 @@ mod tests {
     fn the_extractor_is_the_same_one_the_gateway_uses() {
         // **另写一份提取逻辑的话，回放验的是那一份，而线上跑的是另一
         // 份。**这条测试盯着「用的是同一个」这件事。
-        let body = r#"{"model":"claude-opus-4-5","messages":[{"role":"user","content":[{"type":"image"}]}],"tools":[{"name":"a"},{"name":"b"}],"thinking":{"type":"enabled"}}"#;
+        let body = r#"{"model":"claude-opus-4-5","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]}],"tools":[{"name":"a"},{"name":"b"}],"thinking":{"type":"enabled","budget_tokens":2048}}"#;
         let f = record("x", "", 1, req(body), resp("application/json", 200, "{}"));
-        let direct = tw_engine::RequestFacts::from_anthropic_body(
-            &serde_json::from_str(&f.request.body).unwrap(),
-        );
+        let direct = crate::client_api::read(
+            &f.request.path,
+            None,
+            Some(&serde_json::from_str(&f.request.body).unwrap()),
+        )
+        .facts;
+        assert!(direct.image && direct.thinking, "{direct:?}");
         assert_eq!(f.expect.model, direct.model);
         assert_eq!(f.expect.tool_count, direct.tool_count);
         assert_eq!(f.expect.image, direct.image);

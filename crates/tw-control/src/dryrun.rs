@@ -134,6 +134,7 @@ pub async fn dry_run(
         hurts_cache: false,
         circuit_open: Vec::new(),
         skipped: Vec::new(),
+        converted: Vec::new(),
     };
 
     match engine.route(&f) {
@@ -194,6 +195,22 @@ pub async fn dry_run(
             // 于是它显示的是轮转序列里的当前位置 —— 而那正是一个没有
             // 会话指纹的请求真的会走的路。
             out.candidates = order_like_the_data_plane(&s, engine, &d, &f);
+            // 哪些候选要转换格式。**试算里要说出来**：转换可能丢掉请求里的字段，
+            // 而「规则把我分到了一个别的格式的上游」本身就是用户来试算想知道的事。
+            // 协议认不出来的上游直通，不算
+            out.converted = out
+                .candidates
+                .iter()
+                .filter_map(|name| {
+                    let p = rt.config.providers.iter().find(|p| &p.name == name)?;
+                    let to = p.effective_protocol()?.slug();
+                    (to != req.dialect).then(|| tw_api::ConvertedView {
+                        provider: name.clone(),
+                        from: req.dialect.clone(),
+                        to: to.to_string(),
+                    })
+                })
+                .collect();
         }
         Ok(Outcome::Deny { rule, reason }) => {
             out.outcome = "deny".into();
