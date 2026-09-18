@@ -1,11 +1,17 @@
-//! ChatGPT 账号：浏览器登录、用量、额度重置卡。
+//! ChatGPT 账号：登录、用量、额度重置卡。
 //!
 //! # 登录
 //!
-//! 在浏览器里完成 OAuth 授权（PKCE）。**回调只能回本机的 1455 或 1457 端口**：那是登记在
-//! Codex 客户端上的回调地址，OpenAI 不开放第三方登记自己的地址。core 在其中一个端口上等
-//! 回调，用授权码换 token，把上游写进 config.yaml —— refresh token、access token、过期时间和
-//! 账户 ID 都在配置里，和别的上游一起管理。桌面版只负责打开浏览器。
+//! 两条路，都是 OAuth（PKCE），最后都落到同一处：用授权码换 token，把上游写进
+//! config.yaml —— refresh token、access token、过期时间和账户 ID 都在配置里，和别的上游
+//! 一起管理。
+//!
+//! - **在这台机器上开浏览器**（`browser`）。**回调只能回本机的 1455 或 1457 端口**：那是
+//!   登记在 Codex 客户端上的回调地址，OpenAI 不开放第三方登记自己的地址。core 在其中一个
+//!   端口上等回调，桌面版只负责打开浏览器。
+//! - **去另一台设备上输码**（`device`）。这台机器上没有浏览器、或者浏览器登录不了的时候
+//!   用。core 换一个一次性码，之后自己去问「批准了没有」。**不是所有账号都开放这条路**，
+//!   服务端没开时换码直接 404，只能改用浏览器登录。
 //!
 //! **同一时刻只有一次登录**：回调端口只有一个。新的登录开始时，还没完成的那次作废。
 //!
@@ -32,6 +38,9 @@ use crate::{ControlState, Fail, fail};
 
 /// 登录要在多久之内完成。和 Codex 一样是 15 分钟
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
+/// 设备码最快多久问一次「批准了没有」。服务端给的间隔比它还短就按它来 —— 问得再勤，
+/// 除了被限流没有别的效果
+const DEVICE_POLL_MIN: Duration = Duration::from_secs(3);
 /// 不指定名字时，上游叫这个
 const DEFAULT_NAME: &str = "chatgpt";
 /// 调 ChatGPT 后端接口（用量、重置卡）的超时
@@ -138,63 +147,113 @@ struct Flow {
 
 // ---------------------------------------------------------------- 登录
 
+/// 在哪台设备上授权
+enum Mode {
+    /// 在这台机器上开浏览器
+    Browser,
+    /// 去另一台设备上输码
+    Device,
+}
+
+/// 这次要登成什么样。两条登录路共用的那几项参数
+struct Want {
+    mode: Mode,
+    /// 登录后写进配置的上游名
+    name: String,
+    /// 换 token 走哪条路
+    proxy: String,
+    /// 浏览器登录完成后跳回应用。设备码登录没有这一步
+    return_to: Option<String>,
+}
+
+impl Want {
+    /// 读一遍参数，有问题就直接回错
+    fn read(s: &ControlState, req: &tw_api::ChatgptLoginStart) -> Result<Self, Fail> {
+        let given = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+        };
+        let mode = match given(&req.mode).as_deref() {
+            None | Some("browser") => Mode::Browser,
+            Some("device") => Mode::Device,
+            Some(other) => {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    format!("不支持的登录方式「{other}」"),
+                ));
+            }
+        };
+        let name = given(&req.name).unwrap_or_else(|| DEFAULT_NAME.to_string());
+        let proxy = given(&req.proxy).unwrap_or_else(|| tw_config::DIRECT.to_string());
+        let cfg = s.config();
+        if proxy != tw_config::DIRECT
+            && proxy != tw_config::SYSTEM
+            && !cfg.proxies.iter().any(|p| p.name == proxy)
+        {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                format!("代理「{proxy}」不存在"),
+            ));
+        }
+        if let Some(p) = cfg.providers.iter().find(|p| p.name == name)
+            && p.effective_protocol() != Some(Protocol::Chatgpt)
+        {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                format!("已有名为「{name}」的上游，且不是 ChatGPT 账号上游，请使用其他名称"),
+            ));
+        }
+        let return_to = match given(&req.return_to) {
+            Some(v) if app_link(&v) => Some(v),
+            Some(_) => {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "登录完成后的跳转地址只能使用应用自己的协议，不能是网页地址",
+                ));
+            }
+            None => None,
+        };
+        Ok(Self {
+            mode,
+            name,
+            proxy,
+            return_to,
+        })
+    }
+}
+
 async fn start(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ChatgptLoginStart>,
 ) -> Result<Json<tw_api::ChatgptLogin>, Fail> {
-    let name = req
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .unwrap_or(DEFAULT_NAME)
-        .to_string();
-    let proxy = req
-        .proxy
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .unwrap_or(tw_config::DIRECT)
-        .to_string();
-    let cfg = s.config();
-    if proxy != tw_config::DIRECT
-        && proxy != tw_config::SYSTEM
-        && !cfg.proxies.iter().any(|p| p.name == proxy)
-    {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            format!("代理「{proxy}」不存在"),
-        ));
-    }
-    if let Some(p) = cfg.providers.iter().find(|p| p.name == name)
-        && p.effective_protocol() != Some(Protocol::Chatgpt)
-    {
-        return Err(fail(
-            StatusCode::CONFLICT,
-            format!("已有名为「{name}」的上游，且不是 ChatGPT 账号上游，请使用其他名称"),
-        ));
-    }
-    let return_to = match req
-        .return_to
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        Some(v) if app_link(v) => Some(v.to_string()),
-        Some(_) => {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "登录完成后的跳转地址只能使用应用自己的协议，不能是网页地址",
-            ));
-        }
-        None => None,
-    };
-
+    let want = Want::read(&s, &req)?;
     // 还没完成的上一次登录作废：回调端口要让出来
     let prev = s.chatgpt.current.lock().ok().and_then(|mut g| g.take());
     if let Some(prev) = prev {
         prev.stop(&s).await;
     }
+    let (current, login) = match want.mode {
+        Mode::Browser => start_browser(&s, want).await?,
+        Mode::Device => start_device(&s, want).await?,
+    };
+    // 两个登录同时开始时，后到的算数
+    let raced = match s.chatgpt.current.lock() {
+        Ok(mut g) => g.replace(current),
+        Err(_) => Some(current),
+    };
+    if let Some(prev) = raced {
+        prev.stop(&s).await;
+    }
+    Ok(Json(login))
+}
+
+/// 在这台机器上开浏览器：占住一个回调端口，等浏览器带着授权码回来
+async fn start_browser(
+    s: &ControlState,
+    want: Want,
+) -> Result<(Current, tw_api::ChatgptLogin), Fail> {
     let (listener, port) = bind_callback(&s.chatgpt.endpoints.ports)
         .await
         .ok_or_else(|| {
@@ -221,9 +280,9 @@ async fn start(
     let flow = Arc::new(Flow {
         s: s.clone(),
         id: id.clone(),
-        name,
-        proxy,
-        return_to,
+        name: want.name,
+        proxy: want.proxy,
+        return_to: want.return_to,
         redirect_uri,
         verifier: pkce.verifier,
         state,
@@ -231,29 +290,192 @@ async fn start(
         settled: AtomicBool::new(false),
         done: tokio::sync::Notify::new(),
     });
-    let current = Current {
-        status: tw_api::ChatgptLoginStatus {
-            id: id.clone(),
-            status: "pending".into(),
-            provider: None,
-            plan: None,
+    Ok((
+        Current {
+            status: pending(&id),
+            task: tokio::spawn(serve_callback(flow, listener)),
+        },
+        tw_api::ChatgptLogin {
+            id,
+            authorize_url: Some(authorize_url),
+            user_code: None,
+            verification_url: None,
+            expires_in_secs: LOGIN_TTL.as_secs(),
+        },
+    ))
+}
+
+/// 去另一台设备上输码：先换一个一次性码，再自己去问「批准了没有」。
+///
+/// **PKCE 的两段都在服务端**：challenge 是它生成的，批准之后连 verifier 一起给我们，
+/// 我们只负责原样带进换 token 那一步。
+async fn start_device(
+    s: &ControlState,
+    want: Want,
+) -> Result<(Current, tw_api::ChatgptLogin), Fail> {
+    let issuer = s.chatgpt.endpoints.issuer.clone();
+    let http =
+        client_for(s, &want.name, &want.proxy).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    let asked = serde_json::json!({ "client_id": chatgpt::CLIENT_ID });
+    let resp = send(
+        &http,
+        reqwest::Method::POST,
+        &chatgpt::device_code_url(&issuer),
+        &[],
+        Some(&asked),
+    )
+    .await?;
+    let status = resp.status();
+    if status == StatusCode::NOT_FOUND {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "这个账号还不能用设备码登录，请改用在这台电脑上登录",
+        ));
+    }
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(fail(
+            StatusCode::BAD_GATEWAY,
+            format!("换设备码时返回 {}：{}", status.as_u16(), brief(&text)),
+        ));
+    }
+    let code: DeviceCode =
+        serde_json::from_str(&text).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    let id = chatgpt::new_state();
+    let user_code = code.user_code.clone();
+    Ok((
+        Current {
+            status: pending(&id),
+            task: tokio::spawn(await_device(s.clone(), id.clone(), want, http, code)),
+        },
+        tw_api::ChatgptLogin {
+            id,
+            authorize_url: None,
+            user_code: Some(user_code),
+            verification_url: Some(chatgpt::device_page_url(&issuer)),
+            expires_in_secs: LOGIN_TTL.as_secs(),
+        },
+    ))
+}
+
+fn pending(id: &str) -> tw_api::ChatgptLoginStatus {
+    tw_api::ChatgptLoginStatus {
+        id: id.to_string(),
+        status: "pending".into(),
+        provider: None,
+        plan: None,
+        error: None,
+    }
+}
+
+/// 换来的设备码
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DeviceCode {
+    /// 问「批准了没有」时要带上它
+    device_auth_id: String,
+    /// 给用户看、让他输进去的码
+    user_code: String,
+    /// 服务端让我们隔多少秒问一次
+    #[serde(default)]
+    interval: u64,
+}
+
+/// 用户批准之后拿到的东西。verifier 是服务端生成的，原样带进换 token
+#[derive(Debug, serde::Deserialize)]
+struct Approved {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+/// 等用户在另一台设备上批准。**403 和 404 都是「还没批」**，一直问到 15 分钟为止
+async fn await_device(
+    s: ControlState,
+    id: String,
+    want: Want,
+    http: reqwest::Client,
+    code: DeviceCode,
+) {
+    let issuer = s.chatgpt.endpoints.issuer.clone();
+    let url = chatgpt::device_token_url(&issuer);
+    let asked = serde_json::json!({
+        "device_auth_id": code.device_auth_id,
+        "user_code": code.user_code,
+    });
+    let every = Duration::from_secs(code.interval).max(DEVICE_POLL_MIN);
+    let deadline = tokio::time::Instant::now() + LOGIN_TTL;
+    while tokio::time::Instant::now() < deadline {
+        let resp = match send(&http, reqwest::Method::POST, &url, &[], Some(&asked)).await {
+            Ok(r) => r,
+            Err((_, why)) => return settle(&s, &id, Err(why)),
+        };
+        let status = resp.status();
+        // 还没批：接着等
+        if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND {
+            tokio::time::sleep(every).await;
+            continue;
+        }
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return settle(
+                &s,
+                &id,
+                Err(format!("登录时返回 {}：{}", status.as_u16(), brief(&text))),
+            );
+        }
+        let done = match serde_json::from_str::<Approved>(&text) {
+            Ok(a) => {
+                exchange_and_save(
+                    &s,
+                    &want.name,
+                    &want.proxy,
+                    &a.authorization_code,
+                    &a.code_verifier,
+                    &chatgpt::device_redirect_uri(&issuer),
+                )
+                .await
+            }
+            Err(e) => Err(format!("批准登录的响应看不懂：{e}")),
+        };
+        return settle(&s, &id, done);
+    }
+    s.chatgpt.set_status(tw_api::ChatgptLoginStatus {
+        id: id.clone(),
+        status: "expired".into(),
+        provider: None,
+        plan: None,
+        error: Some("15 分钟内没有完成授权".into()),
+    });
+    announce(&s, &id, "expired", None, None);
+}
+
+/// 记下登录的结果，并告诉界面一声
+fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), String>) {
+    let status = match done {
+        Ok((provider, plan)) => tw_api::ChatgptLoginStatus {
+            id: id.to_string(),
+            status: "done".into(),
+            provider: Some(provider),
+            plan,
             error: None,
         },
-        task: tokio::spawn(serve_callback(flow, listener)),
+        Err(why) => {
+            tracing::warn!("ChatGPT 登录未完成：{why}");
+            tw_api::ChatgptLoginStatus {
+                id: id.to_string(),
+                status: "failed".into(),
+                provider: None,
+                plan: None,
+                error: Some(why),
+            }
+        }
     };
-    // 两个登录同时开始时，后到的算数
-    let raced = match s.chatgpt.current.lock() {
-        Ok(mut g) => g.replace(current),
-        Err(_) => Some(current),
-    };
-    if let Some(prev) = raced {
-        prev.stop(&s).await;
-    }
-    Ok(Json(tw_api::ChatgptLogin {
-        id,
-        authorize_url,
-        expires_in_secs: LOGIN_TTL.as_secs(),
-    }))
+    s.chatgpt.set_status(status.clone());
+    announce(s, id, &status.status, status.provider, status.error);
+}
+
+/// 出错时给用户看的那一小段响应
+fn brief(text: &str) -> String {
+    tw_secret::mask_body(text).chars().take(200).collect()
 }
 
 async fn status(
@@ -375,43 +597,32 @@ async fn callback(
                 detail.chars().take(200).collect::<String>()
             ))
         }
-        (None, Some(code)) => complete(&flow, code).await,
+        (None, Some(code)) => {
+            exchange_and_save(
+                &flow.s,
+                &flow.name,
+                &flow.proxy,
+                code,
+                &flow.verifier,
+                &flow.redirect_uri,
+            )
+            .await
+        }
         (None, None) => Err("回调中缺少授权码".to_string()),
     };
-    let html = match result {
-        Ok((provider, plan)) => {
-            flow.s.chatgpt.set_status(tw_api::ChatgptLoginStatus {
-                id: flow.id.clone(),
-                status: "done".into(),
-                provider: Some(provider.clone()),
-                plan,
-                error: None,
-            });
-            announce(&flow.s, &flow.id, "done", Some(provider), None);
-            page(
-                "ChatGPT 登录已完成",
-                "此页可以关闭。",
-                flow.return_to.as_deref(),
-            )
-        }
-        Err(why) => {
-            tracing::warn!("ChatGPT 登录未完成：{why}");
-            let html = page(
-                "ChatGPT 登录未完成",
-                &format!("{why}。请回到 ThinkWatch 重新发起登录。"),
-                flow.return_to.as_deref(),
-            );
-            flow.s.chatgpt.set_status(tw_api::ChatgptLoginStatus {
-                id: flow.id.clone(),
-                status: "failed".into(),
-                provider: None,
-                plan: None,
-                error: Some(why.clone()),
-            });
-            announce(&flow.s, &flow.id, "failed", None, Some(why));
-            html
-        }
+    let html = match &result {
+        Ok(_) => page(
+            "ChatGPT 登录已完成",
+            "此页可以关闭。",
+            flow.return_to.as_deref(),
+        ),
+        Err(why) => page(
+            "ChatGPT 登录未完成",
+            &format!("{why}。请回到 ThinkWatch 重新发起登录。"),
+            flow.return_to.as_deref(),
+        ),
     };
+    settle(&flow.s, &flow.id, result);
     *outcome = Some(html.clone());
     flow.settled.store(true, Ordering::SeqCst);
     // 这一页先发出去，服务再停
@@ -420,25 +631,18 @@ async fn callback(
 }
 
 /// 用授权码换 token，写进配置。返回上游名和套餐。
-async fn complete(flow: &Flow, code: &str) -> Result<(String, Option<String>), String> {
-    let s = &flow.s;
+async fn exchange_and_save(
+    s: &ControlState,
+    name: &str,
+    proxy: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<(String, Option<String>), String> {
     let endpoints = &s.chatgpt.endpoints;
-    // 换 token 走选定的出站方式：需要代理才能访问 OpenAI 的用户，直连会卡在这一步
-    let route = tw_config::Provider {
-        name: flow.name.clone(),
-        base_url: endpoints.backend.clone(),
-        proxy: flow.proxy.clone(),
-        ..Default::default()
-    };
-    let http = tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| e.message)?;
-    let tokens = chatgpt::exchange_code(
-        &http,
-        &endpoints.token,
-        code,
-        &flow.verifier,
-        &flow.redirect_uri,
-    )
-    .await?;
+    let http = client_for(s, name, proxy)?;
+    let tokens =
+        chatgpt::exchange_code(&http, &endpoints.token, code, verifier, redirect_uri).await?;
     let account = chatgpt::account(&tokens.id_token);
     let oauth = tw_config::OAuth {
         access: Some(tokens.access.clone()),
@@ -452,8 +656,8 @@ async fn complete(flow: &Flow, code: &str) -> Result<(String, Option<String>), S
         client_secret: None,
         refresh_before: None,
     };
-    let name = flow.name.clone();
-    let proxy = flow.proxy.clone();
+    let name = name.to_string();
+    let proxy = proxy.to_string();
     let backend = endpoints.backend.clone();
     let account_id = account.account_id.clone();
     s.cfg
@@ -504,11 +708,22 @@ async fn complete(flow: &Flow, code: &str) -> Result<(String, Option<String>), S
         .map_err(|e| format!("无法写入配置：{e}"))?;
     // 模型清单现在就问一次：不然要等到下一轮定时刷新，新上游的模型才出现
     let gateway = s.gateway.clone();
-    let provider = flow.name.clone();
+    let provider = name.clone();
     tokio::spawn(async move {
         tw_gateway::models::refresh_one(&gateway, &provider).await;
     });
-    Ok((flow.name.clone(), account.plan))
+    Ok((name, account.plan))
+}
+
+/// 按出站方式建一个客户端。**要代理才能访问 OpenAI 的用户，直连会卡在换 token 这一步**
+fn client_for(s: &ControlState, name: &str, proxy: &str) -> Result<reqwest::Client, String> {
+    let route = tw_config::Provider {
+        name: name.to_string(),
+        base_url: s.chatgpt.endpoints.backend.clone(),
+        proxy: proxy.to_string(),
+        ..Default::default()
+    };
+    tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| e.message)
 }
 
 fn announce(
@@ -691,7 +906,26 @@ async fn usage(
     Path(name): Path<String>,
 ) -> Result<Json<tw_api::ChatgptUsage>, Fail> {
     let v = account_call(&s, &name, reqwest::Method::GET, "usage", None).await?;
-    Ok(Json(parse_usage(&v)))
+    let usage = parse_usage(&v);
+    // 问来的额度和响应头里读到的一样记下来：**额度只在内存里**，冷启动之后要等这个账号
+    // 第一次有请求才会有，而界面一打开就该看得见
+    s.gateway.record_quota(
+        s.bus().next_id(),
+        &name,
+        tw_gateway::quota::Quota {
+            windows: usage
+                .windows
+                .iter()
+                .map(|w| tw_gateway::quota::Window {
+                    window: w.window.clone(),
+                    used_percent: w.used_percent,
+                    reset_in_secs: w.reset_in_secs,
+                    status: w.status.clone(),
+                })
+                .collect(),
+        },
+    );
+    Ok(Json(usage))
 }
 
 /// `wham/usage` 的回答。**只取额度相关的几项**：同一份回答里还有邮箱和用户 ID，不往外带

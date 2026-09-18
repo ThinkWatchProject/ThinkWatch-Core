@@ -274,6 +274,32 @@ pub fn authorize_url(issuer: &str, redirect_uri: &str, pkce: &Pkce, state: &str)
     url.to_string()
 }
 
+/// 设备码：在这台机器上换一个一次性码。**不是所有账号都开放**，没开放时这个接口回 404
+pub fn device_code_url(issuer: &str) -> String {
+    format!(
+        "{}/api/accounts/deviceauth/usercode",
+        issuer.trim_end_matches('/')
+    )
+}
+
+/// 设备码：问一次「批准了没有」
+pub fn device_token_url(issuer: &str) -> String {
+    format!(
+        "{}/api/accounts/deviceauth/token",
+        issuer.trim_end_matches('/')
+    )
+}
+
+/// 设备码：让用户在另一台设备上打开、输码的那一页
+pub fn device_page_url(issuer: &str) -> String {
+    format!("{}/codex/device", issuer.trim_end_matches('/'))
+}
+
+/// 设备码换令牌时要报的回调地址。**这一步没有浏览器跳转**，但它必须和授权时的一致
+pub fn device_redirect_uri(issuer: &str) -> String {
+    format!("{}/deviceauth/callback", issuer.trim_end_matches('/'))
+}
+
 /// 登录换回来的令牌。refresh token、access token 和过期时间写进配置，id_token 只用来读账户信息
 pub struct Tokens {
     pub id_token: String,
