@@ -640,7 +640,12 @@ impl AppState {
     /// **429 的那一跳也要读**：额度用完时上游回的正是 429，只读成功那一跳的话，
     /// 「用完了」这件事永远看不到。
     pub(crate) fn note_quota(&self, id: u64, provider: &str, headers: &reqwest::header::HeaderMap) {
-        let quota = crate::quota::from_headers_reqwest(headers);
+        self.record_quota(id, provider, crate::quota::from_headers_reqwest(headers));
+    }
+
+    /// 记下一份额度。**账号接口问来的也走这里**：额度只在内存里，冷启动之后要等第一次
+    /// 请求才有，而界面一打开就该看得见
+    pub fn record_quota(&self, id: u64, provider: &str, quota: crate::quota::Quota) {
         if quota.is_empty() {
             return;
         }
