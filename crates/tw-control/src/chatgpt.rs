@@ -181,7 +181,7 @@ impl Want {
             Some(other) => {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
-                    format!("登录方式「{other}」不认识"),
+                    format!("不支持的登录方式「{other}」"),
                 ));
             }
         };
