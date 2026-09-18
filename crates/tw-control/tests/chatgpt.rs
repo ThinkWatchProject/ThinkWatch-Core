@@ -37,6 +37,12 @@ struct OpenAi {
     backend: Mutex<Vec<(String, HeaderMap)>>,
     /// 用卡接口收到的请求体
     consumed: Mutex<Vec<Value>>,
+    /// 这个账号不能用设备码登录：换码回 404
+    device_closed: Mutex<bool>,
+    /// 问到第几次才算批准。0 就是第一次问就批
+    device_approve_after: Mutex<u32>,
+    /// 设备码的两个接口收到的请求体
+    device_asks: Mutex<Vec<Value>>,
 }
 
 fn jwt(claims: Value) -> String {
@@ -108,12 +114,56 @@ async fn token(
     .into_response()
 }
 
+/// 换一个一次性码。**没开放这条路的账号回 404**
+async fn device_code(
+    State(o): State<Arc<OpenAi>>,
+    axum::Json(v): axum::Json<Value>,
+) -> axum::response::Response {
+    o.device_asks.lock().unwrap().push(v);
+    if *o.device_closed.lock().unwrap() {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"detail": "Not Found"})),
+        )
+            .into_response();
+    }
+    axum::Json(json!({"device_auth_id": "dev-1", "user_code": "ABCD-1234", "interval": 1}))
+        .into_response()
+}
+
+/// 批准了没有。**没批准是 403**，批准了才给授权码和服务端生成的 verifier
+async fn device_token(
+    State(o): State<Arc<OpenAi>>,
+    axum::Json(v): axum::Json<Value>,
+) -> axum::response::Response {
+    let asked = {
+        let mut asks = o.device_asks.lock().unwrap();
+        asks.push(v);
+        asks.iter().filter(|a| a.get("user_code").is_some()).count() as u32
+    };
+    if asked <= *o.device_approve_after.lock().unwrap() {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"detail": "Forbidden"})),
+        )
+            .into_response();
+    }
+    axum::Json(json!({
+        "authorization_code": "code-from-device",
+        "code_challenge": "challenge-from-server",
+        "code_verifier": "verifier-from-server",
+    }))
+    .into_response()
+}
+
 async fn start_openai(o: Arc<OpenAi>) -> Endpoints {
     fn seen(o: &OpenAi, uri: &OriginalUri, headers: HeaderMap) {
         o.backend.lock().unwrap().push((uri.0.to_string(), headers));
     }
     let app = axum::Router::new()
         .route("/oauth/token", post(token))
+        .route("/api/accounts/deviceauth/usercode", post(device_code))
+        .route("/api/accounts/deviceauth/token", post(device_token))
         .route(
             "/oauth/revoke",
             post(|State(o): State<Arc<OpenAi>>, axum::Json(v): axum::Json<Value>| async move {
@@ -651,11 +701,111 @@ async fn a_new_login_replaces_the_one_still_waiting_and_a_login_can_be_cancelled
     assert_eq!(v["status"], "cancelled");
 }
 
+// ---------------------------------------------------------------- 设备码登录
+
+#[tokio::test]
+async fn a_device_login_waits_for_the_other_device_and_saves_the_account() {
+    let mut b = bed(|_| String::new()).await;
+    // 第一次问的时候还没批，要接着等
+    *b.openai.device_approve_after.lock().unwrap() = 1;
+    let (st, v) = b
+        .call("POST", "/chatgpt/login", json!({"mode": "device"}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // 给用户的是码和一个地址，这台机器上不开浏览器
+    let id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["user_code"], "ABCD-1234");
+    assert_eq!(
+        v["verification_url"],
+        json!(format!("{}/codex/device", b.endpoints.issuer))
+    );
+    assert!(v["authorize_url"].is_null(), "{v}");
+    let (_, v) = b
+        .call("GET", &format!("/chatgpt/login/{id}"), Value::Null)
+        .await;
+    assert_eq!(v["status"], "pending");
+
+    assert_eq!(
+        b.login_finished().await,
+        (id.clone(), "done".into(), Some("chatgpt".into()))
+    );
+
+    // 换码时如实说明自己是谁
+    let asked = b.openai.device_asks.lock().unwrap().clone();
+    assert_eq!(asked[0]["client_id"], CLIENT_ID);
+    // 之后每次都带着这一次的设备码去问
+    assert!(asked.len() >= 3, "问了几次：{}", asked.len());
+    for ask in &asked[1..] {
+        assert_eq!(ask["device_auth_id"], "dev-1");
+        assert_eq!(ask["user_code"], "ABCD-1234");
+    }
+
+    // 换 token 用服务端给的 verifier 和设备码那条路的回调地址
+    let form = b.openai.token_forms.lock().unwrap()[0].clone();
+    assert_eq!(form["grant_type"], "authorization_code");
+    assert_eq!(form["code"], "code-from-device");
+    assert_eq!(form["code_verifier"], "verifier-from-server");
+    assert_eq!(
+        form["redirect_uri"],
+        format!("{}/deviceauth/callback", b.endpoints.issuer)
+    );
+
+    // 之后和浏览器登录完全一样：凭据进配置，模型清单马上问
+    let p = b.provider("chatgpt").expect("登录之后配置里应当有这个上游");
+    assert_eq!(p.effective_protocol(), Some(tw_config::Protocol::Chatgpt));
+    assert_eq!(p.oauth.as_ref().unwrap().refresh, "rt-login");
+    assert_eq!(
+        p.headers.get("ChatGPT-Account-Id").unwrap().value.raw(),
+        "acct-1"
+    );
+    let (_, v) = b
+        .call("GET", &format!("/chatgpt/login/{id}"), Value::Null)
+        .await;
+    assert_eq!(v["plan"], "plus");
+    eventually("登录后获取模型清单", || {
+        b.openai
+            .backend
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.starts_with("/backend-api/codex/models?client_version="))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_account_without_device_login_is_told_to_use_the_browser() {
+    let b = bed(|_| String::new()).await;
+    *b.openai.device_closed.lock().unwrap() = true;
+    let (st, v) = b
+        .call("POST", "/chatgpt/login", json!({"mode": "device"}))
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(
+        v.to_string().contains("这台电脑"),
+        "要告诉用户改用浏览器登录：{v}"
+    );
+    assert!(b.provider("chatgpt").is_none());
+}
+
+#[tokio::test]
+async fn a_login_mode_that_is_not_understood_is_refused() {
+    let b = bed(|_| String::new()).await;
+    let (st, _) = b
+        .call("POST", "/chatgpt/login", json!({"mode": "carrier-pigeon"}))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
 // ---------------------------------------------------------------- 用量与重置卡
 
 #[tokio::test]
 async fn usage_shows_the_limits_without_personal_details() {
     let b = bed(|e| logged_in("chatgpt", e, "rt-cfg")).await;
+    // 还没有请求经过，额度就还不知道
+    let (_, v) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(v, json!([]));
     let (st, v) = b
         .call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null)
         .await;
@@ -672,6 +822,11 @@ async fn usage_shows_the_limits_without_personal_details() {
         !text.contains("someone@example.com") && !text.contains("user-1"),
         "{text}"
     );
+
+    // 问来的额度就是这个上游的额度：冷启动之后界面不用等第一次请求
+    let (_, q) = b.call("GET", "/quota", Value::Null).await;
+    assert_eq!(q[0]["provider"], "chatgpt");
+    assert_eq!(q[0]["windows"], v["windows"]);
 
     // 如实说明是谁，带着配置里的 access token 和账户 ID；不是对话，不带会话 ID
     let seen = b.openai.backend.lock().unwrap();

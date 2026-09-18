@@ -1704,17 +1704,28 @@ pub struct ChatgptLoginStart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
     /// 登录完成后，浏览器页面跳到哪里。**只接受应用自己的协议**（`thinkwatch://…`），
-    /// 不接受网页地址
+    /// 不接受网页地址。设备码登录没有浏览器页面，给了也不用
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_to: Option<String>,
+    /// 在哪台设备上授权：`browser`（默认，在这台机器上开浏览器）或 `device`（拿一个
+    /// 一次性码，去别的设备上输）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// 一次进行中的登录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatgptLogin {
     pub id: String,
-    /// 在浏览器里打开的授权地址
-    pub authorize_url: String,
+    /// 在浏览器里打开的授权地址。`browser` 登录才有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_url: Option<String>,
+    /// 要用户输进去的一次性码。`device` 登录才有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    /// 用户在另一台设备上打开、输码的地址。`device` 登录才有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_url: Option<String>,
     /// 多少秒内要完成
     pub expires_in_secs: u64,
 }
