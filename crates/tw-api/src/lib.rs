@@ -1532,6 +1532,12 @@ pub struct RouteSave {
     /// 不给就不动密钥的选择
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    /// 和路由一起写入：把这几类客户端辅助请求设为「交给路由」。
+    ///
+    /// **规则里的辅助请求条件只对交给路由的类别生效** —— 其余类别的请求在
+    /// 进路由之前就被本地应答或原样放行，不带类别标记，那个条件永远不满足
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_probes: Vec<String>,
 }
 
 /// 删除一条路由。

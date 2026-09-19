@@ -56,7 +56,7 @@ async fn create_route(
             if let Some(keys) = &req.keys {
                 out = assign_keys(&out, cfg, None, &set.name, keys)?;
             }
-            Ok(out)
+            route_probes(&out, &req.route_probes)
         })
         .await
         .map_err(apply_fail)?;
@@ -93,7 +93,7 @@ async fn update_route(
             if let Some(keys) = &req.keys {
                 out = assign_keys(&out, cfg, Some(&name), &set.name, keys)?;
             }
-            Ok(out)
+            route_probes(&out, &req.route_probes)
         })
         .await
         .map_err(apply_fail)?;
@@ -211,6 +211,23 @@ fn assign_keys(
             (false, true) => out = edit::set(&out, &route_of(i), None)?,
             _ => {}
         }
+    }
+    Ok(out)
+}
+
+/// 把这几类辅助请求设为「交给路由」。
+fn route_probes(text: &str, probes: &[String]) -> Result<String, ApplyError> {
+    let mut out = text.to_string();
+    for p in probes {
+        // 总称不是一个可以单独设置的类别
+        if p == "assistant_internal" || !INTENTS.contains(&p.as_str()) {
+            return Err(invalid(format!("辅助请求类别「{p}」不存在")));
+        }
+        out = edit::set(
+            &out,
+            &[Step::key("client_probes"), Step::key(p.as_str())],
+            Some(&Value::String("route".to_string())),
+        )?;
     }
     Ok(out)
 }

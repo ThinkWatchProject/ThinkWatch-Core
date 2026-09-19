@@ -383,6 +383,42 @@ async fn a_rule_that_only_adds_a_guard_can_be_saved() {
 }
 
 #[tokio::test]
+async fn an_assistant_request_condition_can_route_those_requests_in_the_same_write() {
+    // 生成标题默认原样放行，不带类别标记：条件写进去也永远不满足
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/routes/codex",
+        json!({ "route": { "name": "codex", "rules": [
+            { "name": "标题用小模型",
+              "conditions": [{ "field": "intent", "values": ["titling"] }],
+              "set": { "model": "claude-haiku-4-5" } },
+            catch_all("主力"),
+        ]}, "route_probes": ["titling"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let probes = b.parsed().client_probes;
+    assert_eq!(probes.titling, tw_config::ProbeAction::Route);
+    assert_eq!(
+        probes.topic_detect,
+        tw_config::ProbeAction::Passthrough,
+        "没选的不动"
+    );
+
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/routes/codex",
+        json!({ "route": { "name": "codex", "rules": [catch_all("主力")] },
+                "route_probes": ["assistant_internal"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn deleting_a_route_sends_its_keys_where_the_user_chose() {
     let b = bed(BASE);
     call(
