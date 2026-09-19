@@ -252,13 +252,24 @@ async fn the_diff_never_shows_the_real_key_either() {
         "打码之后得让人看得懂那儿是什么：\n{}",
         v.after
     );
-    // 但真正写进文件的必须是真值
+    // 但真正写进文件的必须是真值。**不是 diff 里那把**：落盘这一步会为这个
+    // 客户端单独生成一把，diff 里打码的只是「这儿有一把 config.yaml 里的钥匙」
     post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
     let on_disk = std::fs::read_to_string(b.home.join(".claude/settings.json")).unwrap();
+    let mine = b
+        .state
+        .config()
+        .clients
+        .iter()
+        .find(|c| c.client.as_deref() == Some("claude-code"))
+        .expect("接管应当为它生成一把密钥")
+        .key
+        .clone();
     assert!(
-        on_disk.contains("tw-一把钥匙就够"),
+        on_disk.contains(&mine),
         "写盘的时候把打码后的字符串写进去了"
     );
+    assert!(!on_disk.contains("网关密钥»"), "{on_disk}");
 }
 
 #[tokio::test]
@@ -564,4 +575,117 @@ async fn a_bundle_without_observability_says_so_rather_than_showing_zeros() {
     let (_, text) = get(&b.app, "/diagnostics").await;
     assert!(text.contains("未启动，此期间的请求未被记录"), "{text}");
     assert!(!text.contains("请求条数 | 0"), "{text}");
+}
+
+// ────────────────────────────────────────────────── 接管与密钥的关系
+
+/// 配置文件此刻的样子
+fn config_of(b: &Bed) -> Arc<tw_config::Config> {
+    b.state.config()
+}
+
+#[tokio::test]
+async fn adopting_gives_the_client_a_key_of_its_own_and_writes_down_whose_it_is() {
+    // 共用一把的后果是连锁的：请求记录里分不出是谁发的、按密钥绑路由匹不到、
+    // 每客户端并发上限形同虚设 —— 三样东西一起失效，而原因只是少了一把钥匙
+    let b = bed();
+    std::fs::write(b.home.join(".claude/settings.json"), CLAUDE).unwrap();
+    let (st, body) = post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let cfg = config_of(&b);
+    let made = cfg
+        .clients
+        .iter()
+        .find(|c| c.client.as_deref() == Some("claude-code"))
+        .expect("接管应当为它生成一把密钥");
+    assert_eq!(made.name, "claude-code");
+    assert_ne!(made.key, "tw-一把钥匙就够", "不该共用默认那把");
+    // 写进客户端配置的就是这一把
+    let written = std::fs::read_to_string(b.home.join(".claude/settings.json")).unwrap();
+    assert!(written.contains(&made.key), "{written}");
+}
+
+#[tokio::test]
+async fn cancelling_keeps_the_key_and_adopting_again_reuses_it() {
+    let b = bed();
+    let p = b.home.join(".claude/settings.json");
+    std::fs::write(&p, CLAUDE).unwrap();
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    let first = config_of(&b)
+        .clients
+        .iter()
+        .find(|c| c.client.as_deref() == Some("claude-code"))
+        .unwrap()
+        .key
+        .clone();
+
+    let (st, body) = post(&b.app, "/clients/claude-code/restore", "").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    // **取消接管不删密钥。**删了的话，下次接管要用户重新配一遍
+    let kept = config_of(&b);
+    assert!(
+        kept.clients.iter().any(|c| c.key == first),
+        "取消接管之后密钥应当留着"
+    );
+
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    let after = config_of(&b);
+    assert_eq!(
+        after.clients.len(),
+        kept.clients.len(),
+        "再次接管不该再建一把"
+    );
+    assert!(std::fs::read_to_string(&p).unwrap().contains(&first));
+}
+
+#[tokio::test]
+async fn rotating_an_adopted_clients_key_writes_the_new_value_into_its_config() {
+    let b = bed();
+    let p = b.home.join(".claude/settings.json");
+    std::fs::write(&p, CLAUDE).unwrap();
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    let before = config_of(&b)
+        .clients
+        .iter()
+        .find(|c| c.client.as_deref() == Some("claude-code"))
+        .unwrap()
+        .key
+        .clone();
+
+    let (st, body) = post(&b.app, "/keys/claude-code/rotate", "{}").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v: tw_api::KeyRotated = serde_json::from_str(&body).unwrap();
+    assert_ne!(v.key, before);
+    // 换完之后那个客户端还得能连上 —— 这正是拆成两步会漏掉的一半
+    let written = std::fs::read_to_string(&p).unwrap();
+    assert!(written.contains(&v.key), "{written}");
+    assert!(!written.contains(&before), "旧值应当被换掉：{written}");
+    assert_eq!(v.synced.len(), 1, "{v:?}");
+    assert_eq!(v.synced[0].client, "claude-code");
+    assert!(v.failed.is_empty(), "{v:?}");
+}
+
+#[tokio::test]
+async fn a_key_of_an_adopted_client_cannot_be_deleted_until_it_is_released() {
+    let b = bed();
+    std::fs::write(b.home.join(".claude/settings.json"), CLAUDE).unwrap();
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+
+    let r = b
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/keys/claude-code")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("取消接管"), "要说清怎样才能删：{text}");
 }
