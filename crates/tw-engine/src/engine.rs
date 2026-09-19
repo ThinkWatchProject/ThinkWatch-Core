@@ -99,6 +99,11 @@ fn default_true() -> bool {
     true
 }
 
+/// 默认值不写进文件。
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
@@ -115,7 +120,7 @@ pub struct Group {
     ///
     /// 真想要纯轮询的人写一句 `session_affinity: false`，那是个明确的
     /// 选择；而默认关掉，是让每一个不知道这件事的人默默付那笔钱。
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub session_affinity: bool,
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -318,7 +323,8 @@ pub struct Rule {
     /// **每条规则有名字**。日志里、UI 里、试算结果里都能引用它 ——
     /// 「命中第 4 条」远不如「命中『带缓存的必须走官方』」有用。
     pub name: String,
-    #[serde(default)]
+    /// 不写就是兜底，匹配全部请求。**写回配置时也不写**：`when: {}` 只是噪音
+    #[serde(default, skip_serializing_if = "When::is_catch_all")]
     pub when: When,
     /// **可以直接指 provider，不需要先建组**（层 1）。大多数分流
     /// 需求到这一层就解决了，不必引入策略组这个概念。
@@ -335,6 +341,79 @@ pub struct Rule {
     /// 横切的安全策略。**从所有命中的规则累积，而且只能收紧。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<Guard>,
+}
+
+impl Rule {
+    /// 命中就决定去向：转发或拒绝。
+    pub fn decides(&self) -> bool {
+        self.to.is_some() || self.deny.is_some()
+    }
+
+    /// 命中就附加参数改写或安全要求。这两样从所有命中的规则累积。
+    pub fn adds(&self) -> bool {
+        self.set.as_ref().is_some_and(|s| !s.is_empty())
+            || self.guard.as_ref().is_some_and(|g| !g.is_empty())
+    }
+
+    /// 命中之后有没有任何效果：决定去向，或者附加参数改写、安全要求。
+    ///
+    /// **只附加安全要求的规则是有效的**（「选定中转上游时额外脱敏」）。它曾经
+    /// 被当成「命中后不产生任何效果」拒掉。
+    pub fn has_effect(&self) -> bool {
+        self.decides() || self.adds()
+    }
+}
+
+/// 一条规则在它那条路由里的处境。**界面据此提示，不影响求值。**
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuleNotes {
+    /// 没有条件，匹配全部请求
+    pub catch_all: bool,
+    /// 在选定上游之后才判断
+    pub phase_two: bool,
+    /// 它的转发或拒绝不会被采用：前面已经有一条匹配全部请求的转发或拒绝。
+    ///
+    /// 它附加的参数改写和安全要求照常生效 —— 那两样从所有命中的规则累积。
+    pub shadowed: bool,
+}
+
+/// 每条规则的处境，和 `rules` 一一对应。
+///
+/// **「添加规则」追加到末尾、排在兜底之后**是这个提示存在的原因：那样一条
+/// 规则的转发永远不会执行，而配置完全合法、看不出任何问题。
+pub fn notes(rules: &[Rule]) -> Vec<RuleNotes> {
+    let mut decided = false;
+    rules
+        .iter()
+        .map(|r| {
+            let phase_two = r.when.is_phase_two();
+            let catch_all = r.when.is_catch_all();
+            let shadowed = !phase_two && r.decides() && decided;
+            if !phase_two && catch_all && r.decides() {
+                decided = true;
+            }
+            RuleNotes {
+                catch_all,
+                phase_two,
+                shadowed,
+            }
+        })
+        .collect()
+}
+
+/// 这组规则能不能给每个请求一个去向：有没有一条匹配全部请求的转发或拒绝。
+///
+/// 没有的话，哪条都没命中的请求会失败（[`RouteError::NoMatch`]）。**这是
+/// 提示，不是错误** —— 「只处理这几类请求，其余一律失败」也可能是有意的。
+pub fn has_catch_all(rules: &[Rule]) -> bool {
+    rules
+        .iter()
+        .any(|r| !r.when.is_phase_two() && r.when.is_catch_all() && r.decides())
+}
+
+/// 这个策略组是内置的「全部上游」。
+pub fn is_builtin_group(name: &str) -> bool {
+    name == ALL_UPSTREAMS
 }
 
 /// 一条路由 —— 一组按顺序求值的规则。
@@ -356,6 +435,21 @@ pub struct RouteSet {
 
 /// 默认路由的名字。顶层没写 `default_route` 时用它。
 pub const DEFAULT_ROUTE: &str = "默认";
+
+/// 内置策略组「全部上游」在配置里的名字：全部上游，按声明顺序故障转移。
+///
+/// **只要有上游它就在**，不管默认路由是合成的还是写在配置里的。它曾经只跟着
+/// 合成的默认路由一起出现 —— 于是用户一把默认路由写进配置、仍让兜底指向它，
+/// 那份配置就被校验拒掉，而那正是编辑默认路由之后保存的那一刻。
+///
+/// 以 `__` 开头的名字留给内置项，配置里的上游、策略组、路由都不能用。
+pub const ALL_UPSTREAMS: &str = "__all__";
+
+/// 合成的默认路由里那条兜底规则的名字。流量详情里「命中规则」显示的就是它。
+pub const CATCH_ALL_RULE: &str = "兜底";
+
+/// 以这个前缀开头的名字留给内置项。
+pub const RESERVED_PREFIX: &str = "__";
 
 impl RouteSet {
     /// 一条叫「默认」的路由，装着这些规则。
@@ -418,12 +512,14 @@ pub enum RouteError {
         "规则「{0}」同时设置了 provider_would_be 和 to。provider_would_be 要在选定上游之后才能求值，这类规则只能使用 set 或 deny"
     )]
     PhaseTwoWithTo(String),
-    #[error("规则「{0}」没有设置 to、deny 或 set，命中后不产生任何效果")]
+    #[error("规则「{0}」没有设置 to、deny、set 或 guard，命中后不产生任何效果")]
     NoAction(String),
     #[error("规则「{rule}」指向的「{target}」既不是上游，也不是策略组")]
     UnknownTarget { rule: String, target: String },
     #[error("策略组「{0}」中没有任何上游")]
     EmptyGroup(String),
+    #[error("存在多个名为「{0}」的策略组。规则按名称引用策略组，名称必须唯一")]
+    DuplicateGroup(String),
     #[error("存在多条名为「{0}」的路由。网关密钥按名称绑定路由，路由名称必须唯一")]
     DuplicateRoute(String),
     #[error("default_route 指向的路由「{0}」不存在，未绑定路由的网关密钥将无法匹配任何规则")]
@@ -445,6 +541,11 @@ pub struct Engine {
     /// 能用）。不区分的话，二选一都会错：要么打错的名字被静默兜掉，
     /// 要么没写这个字段的配置加载不了。
     default_is_explicit: bool,
+    /// 默认路由是按配置补出来的，配置文件里没有它。
+    ///
+    /// 界面要知道这件事：它能编辑（保存即写进配置），但「在配置文件中定位」
+    /// 找不到它。
+    synthesized_default: bool,
     /// 密钥名 → 它绑的那条路由名。没有条目 = 走默认。
     bound: std::collections::HashMap<String, String>,
     groups: Vec<Group>,
@@ -454,9 +555,9 @@ pub struct Engine {
 impl Engine {
     /// 建引擎。
     ///
-    /// **层 0 在这里被展开**：没有 routes 时补一条兜底规则指向一个自动
-    /// 生成的、包含全部 provider 的 fallback 组。这样下面的求值逻辑
-    /// 只有一条路径。
+    /// **层 0 在这里被展开**：有上游就有内置的「全部上游」组；配置里没有
+    /// 默认路由时，补一条只含兜底规则、指向它的默认路由。这样下面的求值
+    /// 逻辑只有一条路径。
     pub fn new(
         providers: Vec<String>,
         mut groups: Vec<Group>,
@@ -472,6 +573,15 @@ impl Engine {
         // 这条今天已经立过一次，又被这里破坏了一次。测试抓住了。
         let default_is_explicit = default_route.is_some();
         let default_route = default_route.unwrap_or_else(|| DEFAULT_ROUTE.to_string());
+        if !providers.is_empty() {
+            groups.push(Group {
+                name: ALL_UPSTREAMS.to_string(),
+                kind: GroupType::Fallback,
+                providers: providers.clone(),
+                session_affinity: false,
+                selected: None,
+            });
+        }
         // **默认路由必须永远存在。**判据是「有没有叫这个名字的路由」，
         // 不是「一条规则都没有」——
         //
@@ -479,22 +589,14 @@ impl Engine {
         // 不再合成，于是 `default_route` 指向一个不存在的名字、整份配置
         // 失效。也就是说**「建第一条路由」这个动作本身会把配置写坏**，
         // 而那正是界面上最常走的一步。端到端测出来的。
-        if !default_is_explicit
+        let synthesized_default = !default_is_explicit
             && !sets.iter().any(|s| s.name == default_route)
-            && !providers.is_empty()
-        {
-            const ALL: &str = "__all__";
-            groups.push(Group {
-                name: ALL.to_string(),
-                kind: GroupType::Fallback,
-                providers: providers.clone(),
-                session_affinity: false,
-                selected: None,
-            });
+            && !providers.is_empty();
+        if synthesized_default {
             let fallback = Rule {
-                name: "默认：按配置顺序故障转移".to_string(),
+                name: CATCH_ALL_RULE.to_string(),
                 when: When::default(),
-                to: Some(ALL.to_string()),
+                to: Some(ALL_UPSTREAMS.to_string()),
                 set: None,
                 deny: None,
                 guard: None,
@@ -508,6 +610,7 @@ impl Engine {
             sets,
             default_route,
             default_is_explicit,
+            synthesized_default,
             bound,
             groups,
             providers,
@@ -559,11 +662,6 @@ impl Engine {
             .unwrap_or(&[])
     }
 
-    /// 所有规则，不分归属。校验和「这条规则存在吗」用它。
-    fn all_rules(&self) -> impl Iterator<Item = &Rule> {
-        self.sets.iter().flat_map(|s| s.rules.iter())
-    }
-
     /// 加载时校验。**规则写错了要在这里说，不要等请求进来** ——
     /// 一条指向不存在的 provider 的规则，在运行时的表现是每个命中它的
     /// 请求都失败，而用户看不出是哪条规则的问题。
@@ -591,23 +689,39 @@ impl Engine {
                 });
             }
         }
-        for r in self.all_rules() {
+        // 策略组的名字也要唯一：规则按名字引用它，重名时去向取决于实现顺序
+        let mut groups = std::collections::HashSet::new();
+        for g in &self.groups {
+            if !groups.insert(g.name.as_str()) {
+                return Err(RouteError::DuplicateGroup(g.name.clone()));
+            }
+            if g.providers.is_empty() {
+                return Err(RouteError::EmptyGroup(g.name.clone()));
+            }
+        }
+        for set in &self.sets {
+            self.check_rules(&set.rules)?;
+        }
+        Ok(())
+    }
+
+    /// 一组规则各自写得对不对：比较式能解析、阶段二的规则不带去向、命中后
+    /// 有效果、去向存在。
+    ///
+    /// **还没保存的规则也用它查** —— 试算一份草稿之前，先说清楚哪条写错了。
+    pub fn check_rules(&self, rules: &[Rule]) -> Result<(), RouteError> {
+        for r in rules {
             r.when.validate()?;
             // **这条禁令是必需的**：允许阶段二的规则写 `to`，求值就直接
             // 成环了。在校验阶段挡下来，而不是在运行时。
             if r.when.is_phase_two() && r.to.is_some() {
                 return Err(RouteError::PhaseTwoWithTo(r.name.clone()));
             }
-            if r.to.is_none() && r.deny.is_none() && r.set.as_ref().is_none_or(|s| s.is_empty()) {
+            if !r.has_effect() {
                 return Err(RouteError::NoAction(r.name.clone()));
             }
             if r.to.is_some() {
                 self.resolve_target(r)?;
-            }
-        }
-        for g in &self.groups {
-            if g.providers.is_empty() {
-                return Err(RouteError::EmptyGroup(g.name.clone()));
             }
         }
         Ok(())
@@ -619,12 +733,19 @@ impl Engine {
     /// 累积**。两者规则不同是有理由的：去向只能有一个，而参数
     /// 改写是可以叠加的横切策略。
     pub fn route(&self, facts: &RequestFacts) -> Result<Outcome, RouteError> {
+        self.route_with(self.rules_for(&facts.client), facts)
+    }
+
+    /// 按给定的规则表走阶段一。
+    ///
+    /// **试算按路由名、按未保存的草稿求值都走这里** —— 和数据面是同一段
+    /// 代码，试算才不会算出一个和真实转发不一样的结果。
+    pub fn route_with(&self, rules: &[Rule], facts: &RequestFacts) -> Result<Outcome, RouteError> {
         let mut set = SetAction::default();
         let mut guard = Guard::default();
         let mut chosen: Option<&Rule> = None;
 
-        let applicable = self.rules_for(&facts.client);
-        for r in applicable {
+        for r in rules {
             // 阶段二的规则在这一轮完全跳过 —— 它们的条件还没法求值。
             if r.when.is_phase_two() || !r.when.matches(facts)? {
                 continue;
@@ -770,9 +891,30 @@ impl Engine {
         self.rules_for(client)
     }
 
+    /// 这把密钥使用哪条路由：指定了的那条，否则默认路由。
+    pub fn route_of(&self, client: &str) -> &str {
+        self.bound
+            .get(client)
+            .map(String::as_str)
+            .unwrap_or(&self.default_route)
+    }
+
     /// 没绑定时走哪条路由。
     pub fn default_route(&self) -> &str {
         &self.default_route
+    }
+
+    /// 这条路由的规则表。没有这条路由时为空。
+    pub fn rules_of(&self, route: &str) -> Option<&[Rule]> {
+        self.sets
+            .iter()
+            .find(|s| s.name == route)
+            .map(|s| s.rules.as_slice())
+    }
+
+    /// 这条路由是按配置补出来的默认路由，配置文件里没有它。
+    pub fn is_builtin_route(&self, name: &str) -> bool {
+        self.synthesized_default && name == self.default_route
     }
 }
 
@@ -1634,5 +1776,159 @@ mod tests {
             ..g.clone()
         };
         assert!(u.hurts_cache(), "url-test 的排序随实测延迟变，会伤");
+    }
+}
+
+/// 内置项（「全部上游」、合成的默认路由）与规则处境的提示。
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    fn rule(name: &str, when_yaml: &str, to: &str) -> Rule {
+        Rule {
+            name: name.into(),
+            when: serde_yaml_ng::from_str(when_yaml).unwrap(),
+            to: Some(to.into()),
+            set: None,
+            deny: None,
+            guard: None,
+        }
+    }
+
+    fn facts(model: &str) -> RequestFacts {
+        RequestFacts {
+            model: model.into(),
+            client: "claude-code".into(),
+            dialect: "anthropic".into(),
+            ..Default::default()
+        }
+    }
+
+    fn candidates(o: Outcome) -> Vec<String> {
+        match o {
+            Outcome::Route(d) => d.candidates,
+            other => panic!("该路由，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_upstreams_is_still_there_once_the_default_route_is_written_down() {
+        // 编辑默认路由并保存，就是把合成的那条写进配置 —— 兜底仍指向「全部
+        // 上游」。它要是只跟着合成的默认路由出现，这一次保存会被校验拒掉
+        let written = RouteSet {
+            name: DEFAULT_ROUTE.into(),
+            rules: vec![rule(CATCH_ALL_RULE, "{}", ALL_UPSTREAMS)],
+        };
+        let e = Engine::new(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![written],
+            None,
+            Default::default(),
+        );
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+        assert!(!e.is_builtin_route(DEFAULT_ROUTE));
+        assert_eq!(candidates(e.route(&facts("m")).unwrap()), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_synthesised_default_route_is_marked_and_its_rule_is_the_catch_all() {
+        let e = Engine::with_default_rules(vec!["a".into()], vec![], vec![]);
+        assert!(e.is_builtin_route(DEFAULT_ROUTE));
+        assert_eq!(e.routes()[0].rules[0].name, CATCH_ALL_RULE);
+        assert!(is_builtin_group(&e.groups()[0].name));
+        assert!(e.rules_of(DEFAULT_ROUTE).is_some());
+        assert!(e.rules_of("没有这条").is_none());
+        // 零上游时什么都不合成：没有「全部上游」，也没有默认路由
+        let empty = Engine::with_default_rules(vec![], vec![], vec![]);
+        assert!(!empty.is_builtin_route(DEFAULT_ROUTE));
+        assert!(empty.groups().is_empty());
+    }
+
+    #[test]
+    fn a_rule_that_only_adds_a_guard_is_valid() {
+        // 「选定中转上游时按非官方端点处理」：只有安全要求，没有去向和改写
+        let only_guard = Rule {
+            name: "中转加强保护".into(),
+            when: serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap(),
+            to: None,
+            set: None,
+            deny: None,
+            guard: Some(Guard {
+                redact: vec![],
+                untrusted: true,
+            }),
+        };
+        let e = Engine::with_default_rules(
+            vec!["relay".into()],
+            vec![],
+            vec![only_guard, rule("兜底", "{}", "relay")],
+        );
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+    }
+
+    #[test]
+    fn a_rule_after_the_catch_all_is_flagged_as_shadowed() {
+        let rewrite = Rule {
+            name: "限制输出".into(),
+            when: When::default(),
+            to: None,
+            deny: None,
+            guard: None,
+            set: Some(SetAction {
+                max_tokens: Some(4096),
+                ..Default::default()
+            }),
+        };
+        let rules = vec![
+            rule("长上下文", "{ input_tokens: '>200k' }", "a"),
+            rule("兜底", "{}", "b"),
+            rule("Gemini", "{ model: 'gemini-*' }", "a"),
+            rewrite,
+        ];
+        let n = notes(&rules);
+        assert_eq!(
+            n.iter().map(|x| x.shadowed).collect::<Vec<_>>(),
+            [false, false, true, false],
+            "兜底之后的转发不会被采用；只附加改写的规则照常生效"
+        );
+        assert!(n[1].catch_all);
+        assert!(has_catch_all(&rules));
+        // 只附加改写、不决定去向的规则不算兜底
+        assert!(!has_catch_all(&rules[3..]));
+        assert!(!has_catch_all(&rules[..1]));
+    }
+
+    #[test]
+    fn a_rule_list_that_is_not_in_the_config_can_be_evaluated() {
+        // 路由对话框里还没保存的规则：先查写法，再按同一段代码求值
+        let e = Engine::with_default_rules(vec!["a".into(), "b".into()], vec![], vec![]);
+        let draft = vec![rule("只走 b", "{}", "b")];
+        assert!(e.check_rules(&draft).is_ok());
+        assert_eq!(
+            candidates(e.route_with(&draft, &facts("m")).unwrap()),
+            ["b"]
+        );
+        assert!(matches!(
+            e.check_rules(&[rule("x", "{}", "没有这家")]),
+            Err(RouteError::UnknownTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn two_groups_with_the_same_name_are_rejected() {
+        let g = |n: &str| Group {
+            name: n.into(),
+            kind: GroupType::Fallback,
+            providers: vec!["a".into()],
+            session_affinity: true,
+            selected: None,
+        };
+        let e = Engine::with_default_rules(
+            vec!["a".into()],
+            vec![g("pool"), g("pool")],
+            vec![rule("兜底", "{}", "pool")],
+        );
+        assert_eq!(e.validate(), Err(RouteError::DuplicateGroup("pool".into())));
     }
 }

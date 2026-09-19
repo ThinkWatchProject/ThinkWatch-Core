@@ -89,6 +89,7 @@ impl When {
             && self.image.is_none()
             && self.thinking.is_none()
             && self.stream.is_none()
+            && self.intent.is_none()
             && self.provider_would_be.is_none()
     }
 
@@ -360,6 +361,8 @@ mod tests {
         assert!(When::default().is_catch_all());
         assert!(When::default().matches(&f()).unwrap());
         assert!(!when("{ model: x }").is_catch_all());
+        // 只写了辅助请求类别的规则不是兜底：它只匹配那一类请求
+        assert!(!when("{ intent: titling }").is_catch_all());
     }
 
     #[test]

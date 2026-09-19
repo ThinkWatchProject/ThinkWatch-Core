@@ -755,17 +755,60 @@ pub enum ReferenceView {
 }
 
 /// 一条规则。
+///
+/// **是全文，不是摘要** —— 编辑对话框靠它回填：条件、去向、拒绝原因、
+/// 参数改写、安全要求，交回来的 [`RuleInput`] 是同一套写法。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleView {
     pub name: String,
-    /// 去向：上游名或组名。拒绝的规则和只改参数的规则没有
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    /// 命中就拒绝
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub deny: bool,
     /// `when` 里写了的条件，按固定顺序。空 = 兜底
     pub conditions: Vec<ConditionView>,
+    /// 去向：上游名或组名。拒绝的规则和只附加改写、安全要求的规则没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// 命中就拒绝。值是返回给客户端的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<String>,
+    /// 参数改写
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<RuleRewrite>,
+    /// 安全要求
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<RuleGuard>,
+    /// 没有条件，匹配全部请求
+    #[serde(default)]
+    pub catch_all: bool,
+    /// 在选定上游之后才判断（条件里有 `provider_would_be`）
+    #[serde(default)]
+    pub phase_two: bool,
+    /// 它的转发或拒绝不会被采用：前面已经有一条匹配全部请求的转发或拒绝。
+    /// 它附加的改写和安全要求照常生效
+    #[serde(default)]
+    pub shadowed: bool,
+}
+
+/// 规则里的参数改写。每一项不写就是不改。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuleRewrite {
+    /// 换一个模型。**整个 prompt cache 随之作废**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// 打开或关闭扩展思考
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+}
+
+/// 规则里的安全要求。**只能收紧**：和上游自己的设置取并集。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuleGuard {
+    /// 额外脱敏的类别，和上游 `redact` 同一套标识符
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redact: Vec<String>,
+    /// 按非官方端点处理
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub untrusted: bool,
 }
 
 /// 规则里的一个条件。
@@ -786,6 +829,12 @@ pub struct RouteView {
     pub name: String,
     /// 没绑路由的密钥走的就是这条
     pub default: bool,
+    /// 网关按配置补出来的默认路由：配置文件里没有它。**编辑并保存即写入配置**
+    #[serde(default)]
+    pub builtin: bool,
+    /// 有一条匹配全部请求的转发或拒绝。没有的话，哪条规则都没命中的请求会失败
+    #[serde(default)]
+    pub has_catch_all: bool,
     /// **显式绑了这条路由的密钥。**默认路由这里通常是空的 —— 走它的人
     /// 是「没绑」，不是「绑了它」，而把所有密钥列进来会让人以为那是
     /// 一次次显式的选择。
@@ -796,6 +845,9 @@ pub struct RouteView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupView {
     pub name: String,
+    /// 内置的「全部上游」：成员是全部上游，按上游列表的顺序。不能编辑、不能删除
+    #[serde(default)]
+    pub builtin: bool,
     /// 配置里写的 `type`：`fallback` / `select` / `load-balance` /
     /// `url-test` / `cheapest`
     pub kind: String,
@@ -809,8 +861,8 @@ pub struct GroupView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub providers: Vec<String>,
-    /// 这个策略会不会让 prompt cache 不稳定。**要在界面上直说** ——
-    /// 它决定了用户的账单。
+    /// 这个组**按现在的配置**会不会让 prompt cache 不稳定（开着会话粘滞的
+    /// 轮询组不会）。**要在界面上直说** —— 它决定了用户的账单。
     pub hurts_cache: bool,
 }
 
@@ -1437,6 +1489,97 @@ pub struct ProxyTest {
     pub proxy: ProxyInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
+}
+
+// ─────────────────────────────────────────────── 路由与策略组的增删改
+
+/// 新建或修改一条路由时交过来的定义。**规则的顺序就是数组的顺序。**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteInput {
+    pub name: String,
+    #[serde(default)]
+    pub rules: Vec<RuleInput>,
+}
+
+/// 一条规则的定义。
+///
+/// **条件和视图是同一套写法**（[`ConditionView`]）：界面拿到什么，就交回
+/// 什么，不必再学一种格式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleInput {
+    pub name: String,
+    /// 空 = 兜底，匹配全部请求
+    #[serde(default)]
+    pub conditions: Vec<ConditionView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// 拒绝，以及返回给客户端的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<RuleRewrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<RuleGuard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteSave {
+    pub route: RouteInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+    /// 保存之后使用这条路由的密钥。给了就**恰好是这几把**：列表里的改用它，
+    /// 原来用它、不在列表里的改用默认路由，和路由本身在同一个版本里写入。
+    /// 不给就不动密钥的选择
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+}
+
+/// 删除一条路由。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RouteDelete {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+    /// 使用这条路由的密钥改用哪一条。不给 = 改用默认路由（不指定路由）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassign_to: Option<String>,
+}
+
+/// 更换默认路由。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultRouteSave {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 新建或修改一个策略组时交过来的定义。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupInput {
+    pub name: String,
+    /// `fallback` / `select` / `load-balance` / `url-test` / `cheapest`
+    pub kind: String,
+    /// 成员，按顺序
+    pub providers: Vec<String>,
+    /// `select` 组优先使用的成员
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+    /// 同一次会话固定走同一家。只对 `load-balance` 有意义
+    #[serde(default = "default_true")]
+    pub session_affinity: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupSave {
+    pub group: GroupInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 网关知道的一个模型，以及能提供它的上游（已按启用范围与停用过滤）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownModel {
+    pub id: String,
+    pub providers: Vec<String>,
 }
 
 /// 删除时带上的版本。
@@ -2184,9 +2327,16 @@ pub struct McpTargetView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunRequest {
     pub model: String,
-    /// 哪个客户端发的。空 = 用 config.yaml 里的第一个
+    /// 哪把密钥发的。只给它时按这把密钥使用的路由求值；规则里的 `client`
+    /// 条件也按它判断
     #[serde(default)]
     pub client: String,
+    /// 按这条路由求值，不管密钥使用哪一条
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// 按一份还没保存的路由求值。给了就不看 `route`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<RouteInput>,
     #[serde(default = "default_dialect")]
     pub dialect: String,
     #[serde(default)]
@@ -2233,6 +2383,10 @@ pub struct RuleTrace {
     /// 条件本身写错了、没法求值时的说明
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 命中时它起了什么作用：`decide`（决定了去向）/ `apply`（附加了改写或
+    /// 安全要求）/ `none`（去向已由前面的规则决定，也没有附加项）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 /// 一个没对上的条件。
@@ -2257,6 +2411,9 @@ pub struct SetView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunResult {
+    /// 按哪条路由求的值。草稿是草稿的名字
+    #[serde(default)]
+    pub route: String,
     /// 经过的组按什么排候选：`fallback` / `select` / `load-balance` /
     /// `url-test` / `cheapest`。
     ///

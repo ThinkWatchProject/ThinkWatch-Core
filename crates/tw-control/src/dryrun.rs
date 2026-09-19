@@ -50,14 +50,10 @@ use crate::ControlState;
 
 type Fail = (StatusCode, String);
 
-fn facts(req: &tw_api::DryRunRequest, fallback_client: &str) -> RequestFacts {
+fn facts(req: &tw_api::DryRunRequest) -> RequestFacts {
     RequestFacts {
         model: req.model.clone(),
-        client: if req.client.is_empty() {
-            fallback_client.to_string()
-        } else {
-            req.client.clone()
-        },
+        client: req.client.clone(),
         dialect: req.dialect.clone(),
         input_tokens: req.input_tokens,
         max_tokens: req.max_tokens,
@@ -78,18 +74,49 @@ pub async fn dry_run(
     let cfg = s.config();
     let rt = s.gateway.runtime();
     let engine = &rt.engine;
-    let f = facts(
-        &req,
-        cfg.clients.first().map(|c| c.name.as_str()).unwrap_or(""),
-    );
+    let f = facts(&req);
+    if !f.client.is_empty() && !cfg.clients.iter().any(|c| c.name == f.client) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("未找到名为「{}」的网关密钥", f.client),
+        ));
+    }
+
+    // 按哪张规则表求值：**未保存的草稿 > 指定的路由 > 密钥使用的路由**。
+    // 以前密钥为空时悄悄取配置里的第一把，而那一把可能指定了另一条路由 ——
+    // 试算给出一个对的答案，回答的却是另一个问题。
+    let draft;
+    let (route, rules): (String, &[tw_engine::Rule]) = if let Some(d) = &req.draft {
+        draft = d
+            .rules
+            .iter()
+            .map(|r| crate::routes::to_rule(r, &cfg))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        engine
+            .check_rules(&draft)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        (d.name.clone(), draft.as_slice())
+    } else if let Some(name) = req.route.as_deref().filter(|n| !n.is_empty()) {
+        let rules = engine
+            .rules_of(name)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{name}」的路由")))?;
+        (name.to_string(), rules)
+    } else if !f.client.is_empty() {
+        let name = engine.route_of(&f.client).to_string();
+        (name, engine.rules_for_client(&f.client))
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "请指定网关密钥或路由".to_string()));
+    };
 
     // 每条规则的下场。**先走一遍这个，再问结果** —— 顺序反过来的话，
     // 「命中了哪条」会变成唯一的输出，而那正是不够用的那半个答案。
-    // **只列这把密钥真的会过的规则。**试算问的是「我这个请求会怎么走」，
-    // 而分给别的密钥的规则对这个请求没有任何影响 —— 列出来只会让人以为
+    // **只列这条路由里的规则。**试算问的是「我这个请求会怎么走」，
+    // 而别的路由里的规则对这个请求没有任何影响 —— 列出来只会让人以为
     // 它们被跳过了，而实际上它们根本不在这条求值链上。
     let mut trace = Vec::new();
-    for r in engine.rules_for_client(&f.client) {
+    let mut decided = false;
+    for r in rules {
         if r.when.is_phase_two() {
             trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
@@ -97,32 +124,49 @@ pub async fn dry_run(
                 verdict: "phase_two".into(),
                 mismatch: None,
                 error: None,
+                effect: None,
             });
             continue;
         }
         match r.when.matches(&f) {
-            Ok(true) => trace.push(tw_api::RuleTrace {
-                name: r.name.clone(),
-                verdict: "matched".into(),
-                mismatch: None,
-                error: None,
-            }),
+            Ok(true) => {
+                // 命中之后起了什么作用。**「命中了但没用上」要说出来** —— 兜底
+                // 规则在试算里命中，而去向早已由前面的规则决定
+                let effect = if !decided && r.decides() {
+                    decided = true;
+                    "decide"
+                } else if r.adds() {
+                    "apply"
+                } else {
+                    "none"
+                };
+                trace.push(tw_api::RuleTrace {
+                    name: r.name.clone(),
+                    verdict: "matched".into(),
+                    mismatch: None,
+                    error: None,
+                    effect: Some(effect.into()),
+                })
+            }
             Ok(false) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 verdict: "skipped".into(),
                 mismatch: unmatched(&r.when, &f),
                 error: None,
+                effect: None,
             }),
             Err(e) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 verdict: "skipped".into(),
                 mismatch: None,
                 error: Some(e.to_string()),
+                effect: None,
             }),
         }
     }
 
     let mut out = tw_api::DryRunResult {
+        route,
         outcome: "no_match".into(),
         strategy: None,
         rule: None,
@@ -137,17 +181,17 @@ pub async fn dry_run(
         converted: Vec::new(),
     };
 
-    match engine.route(&f) {
+    match engine.route_with(rules, &f) {
         Ok(Outcome::Route(mut d)) => {
             out.outcome = "route".into();
             out.rule = Some(d.matched_rule.clone());
             out.via_group = d.via_group.clone();
+            // 按这个组的配置判断：开着会话粘滞的轮询组不伤缓存
             out.hurts_cache = d
                 .via_group
                 .as_deref()
                 .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .map(|g| g.kind.hurts_cache())
-                .unwrap_or(false);
+                .is_some_and(|g| g.hurts_cache());
             out.set = describe(&d.set);
             out.strategy = d
                 .via_group
@@ -278,8 +322,10 @@ fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::M
             return miss(field, vec![w.clone()], got.clone());
         }
     }
+    // 和 `When::matches` 一样：`assistant_internal` 是五类里的任意一类，而
+    // 真实的用户请求（空）不属于任何一类
     if let Some(w) = &when.intent
-        && !w.contains(&f.intent)
+        && (f.intent.is_empty() || !(w.contains(&f.intent) || w.contains("assistant_internal")))
     {
         // 实际值为空表示真实的用户请求，由界面说明
         return miss("intent", crate::one_or_many(w), f.intent.clone());
@@ -297,17 +343,24 @@ fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::M
             return miss(field, vec![w.to_string()], got.to_string());
         }
     }
+    // **逐个比较，报真没对上的那个。**以前这里报的是第一个写了的数量条件，
+    // 哪怕它其实满足 —— 「要求输入 >100k，实际 200000」这种自相矛盾的话
     for (want, got, field) in [
-        (&when.input_tokens, f.input_tokens as f64, "input_tokens"),
-        (&when.tool_count, f.tool_count as f64, "tool_count"),
-        (
-            &when.max_tokens,
-            f.max_tokens.unwrap_or(0) as f64,
-            "max_tokens",
-        ),
+        (&when.input_tokens, Some(f.input_tokens), "input_tokens"),
+        (&when.tool_count, Some(f.tool_count as u64), "tool_count"),
+        (&when.max_tokens, f.max_tokens, "max_tokens"),
     ] {
-        if let Some(w) = want {
-            return miss(field, vec![w.clone()], got.to_string());
+        let Some(w) = want else { continue };
+        let Ok(cmp) = w.parse::<tw_engine::num::Compare>() else {
+            continue;
+        };
+        match got {
+            // 请求没写 max_tokens：任何比较都不满足。实际值留空，由界面说明
+            None => return miss(field, vec![w.clone()], String::new()),
+            Some(v) if !cmp.matches(v as f64) => {
+                return miss(field, vec![w.clone()], v.to_string());
+            }
+            Some(_) => {}
         }
     }
     // **阶段二的条件不在这里**：它们在上面就被单独归类了。走到这儿说明
