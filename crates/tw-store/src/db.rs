@@ -39,6 +39,13 @@ const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
 const NO_USAGE: &str = "(cost_micros IS NULL AND input_tokens IS NULL AND error IS NULL \
                          AND billing IN ('', 'per-token') AND (cancelled = 1 OR status < 300))";
 
+/// 这一行由订阅制上游服务：**没有金额，但不是缺了什么** —— 这笔账按订阅额度
+/// 算，不按用量算。和上面两种都不相交（那两种只数按 token 计费的）。
+///
+/// **概览和会话都用它。**概览上的「订阅额度 N 次」和会话里的订阅轮数数的是
+/// 同一批行，两处各写一遍迟早会数得不一样 —— 上面那两个常量就是这么来的。
+const SUBSCRIPTION: &str = "(billing = 'subscription')";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("无法打开 {path}：{source}")]
@@ -412,6 +419,10 @@ pub struct SessionRow {
     pub unpriced_turns: i64,
     /// 没有拿到用量、所以算不出钱的轮数（见 `NO_USAGE`）
     pub no_usage_turns: i64,
+    /// 由订阅制上游服务的轮数（见 `SUBSCRIPTION`）。**少了它，一个全走订阅的
+    /// 会话和一个一轮都算不出钱的会话长得一模一样**：有价格、没有价格、没有
+    /// 用量都是 0 轮
+    pub subscription_turns: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -439,6 +450,9 @@ pub struct TurnRow {
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号**
     pub cost_estimated: bool,
+    /// 服务它的那家怎么收钱（见 `RequestRow::billing`）。**订阅制那一轮没有
+    /// 金额，但不是「无法计价」** —— 只看 `cost_micros` 分不出这两种
+    pub billing: String,
 }
 
 impl Db {
@@ -463,7 +477,8 @@ impl Db {
                     SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
                     COUNT(cost_micros),
-                    COALESCE(SUM({NO_USAGE}), 0)
+                    COALESCE(SUM({NO_USAGE}), 0),
+                    COALESCE(SUM({SUBSCRIPTION}), 0)
              FROM requests
              WHERE session IS NOT NULL AND local = 0
              GROUP BY session
@@ -490,6 +505,7 @@ impl Db {
                 cost_micros_estimated: r.get(15)?,
                 priced_turns: r.get(16)?,
                 no_usage_turns: r.get(17)?,
+                subscription_turns: r.get(18)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -500,7 +516,7 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
                     cache_read_tokens, cost_micros, duration_ms, error, cancelled,
-                    cost_estimated
+                    cost_estimated, billing
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -517,6 +533,7 @@ impl Db {
                 error: r.get(9)?,
                 cancelled: r.get::<_, i64>(10)? != 0,
                 cost_estimated: r.get::<_, i64>(11)? != 0,
+                billing: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -743,8 +760,8 @@ impl Db {
                 COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM({NO_PRICE}), 0),
-                COALESCE(SUM(billing = 'subscription'), 0),
-                COALESCE(SUM(CASE WHEN billing = 'subscription'
+                COALESCE(SUM({SUBSCRIPTION}), 0),
+                COALESCE(SUM(CASE WHEN {SUBSCRIPTION}
                                   THEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
                                   ELSE 0 END), 0),
                 COALESCE(SUM(cache_saved_micros), 0),
@@ -1949,6 +1966,45 @@ mod cost_state_tests {
         let s = &db.sessions(10).unwrap()[0];
         assert_eq!((s.unpriced_turns, s.no_usage_turns), (0, 0));
         assert_eq!(s.priced_turns, 0, "订阅制那一轮没有价格可言");
+    }
+
+    /// **全走订阅的会话和一轮都算不出钱的会话是两个结论。**以前两者在会话
+    /// 这一层长得一模一样 —— 有价格、没有价格、没有用量都是 0 轮 —— 界面只能
+    /// 都说成「无法计价」，而概览上同一批请求写着「订阅额度 N 次」。
+    #[test]
+    fn a_session_counts_its_subscription_turns_as_what_they_are() {
+        let db = Db::in_memory().unwrap();
+        let mut served = row(1, 100);
+        served.billing = "subscription".into();
+        served.cost_micros = None;
+        // 断在中间的那一轮也是订阅上游服务的，不因为失败就变成「没有价格」
+        let mut broken = served.clone();
+        broken.id = 2;
+        broken.at_ms = 200;
+        broken.error = Some("流中断：上游断开了".into());
+        for mut r in [served, broken, row(3, 300), unknown_model(4, 400)] {
+            r.session = Some("s1".into());
+            db.insert(&r).unwrap();
+        }
+
+        let s = &db.sessions(10).unwrap()[0];
+        assert_eq!(s.subscription_turns, 2);
+        assert_eq!(
+            (s.priced_turns, s.unpriced_turns, s.no_usage_turns),
+            (1, 1, 0),
+            "订阅那几轮混进了别的状态"
+        );
+        assert_eq!(
+            db.summary(0, 1000).unwrap().subscription_requests,
+            s.subscription_turns,
+            "概览和会话数的不是同一批行"
+        );
+        // 每一轮带着自己的计费方式：瀑布图上订阅那一轮不能写成「无法计价」
+        let turns = db.turns("s1").unwrap();
+        assert_eq!(
+            turns.iter().map(|t| t.billing.as_str()).collect::<Vec<_>>(),
+            ["subscription", "subscription", "per-token", "per-token"]
+        );
     }
 
     /// 价格页只列**配一个价格就能解决**的模型。列出一个失败了的、或者
