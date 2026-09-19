@@ -1279,6 +1279,7 @@ fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {
         priced_turns: s.priced_turns as u64,
         unpriced_turns: s.unpriced_turns as u64,
         no_usage_turns: s.no_usage_turns as u64,
+        subscription_turns: s.subscription_turns as u64,
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
         cache_read_tokens: s.cache_read_tokens,
@@ -1309,6 +1310,7 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
         error: t.error.clone(),
         cancelled: t.cancelled,
         cost_estimated: t.cost_estimated,
+        billing: t.billing.clone(),
     }
 }
 

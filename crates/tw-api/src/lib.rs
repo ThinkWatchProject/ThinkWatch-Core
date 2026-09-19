@@ -2220,6 +2220,10 @@ pub struct SessionView {
     /// 没有拿到用量、所以算不出钱的轮数
     #[serde(default)]
     pub no_usage_turns: u64,
+    /// 由订阅制上游服务的轮数：计入订阅额度，**没有金额，也不是「无法计价」**。
+    /// 和上面三个数互不相交，和概览的 `subscription_requests` 数的是同一类请求。
+    /// 少了它，全走订阅的会话和一轮都算不出钱的会话在这里长得一模一样
+    pub subscription_turns: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -2253,6 +2257,10 @@ pub struct TurnView {
     /// 估算的金额在瀑布图上和实测的长得一模一样
     #[serde(default)]
     pub cost_estimated: bool,
+    /// 服务它的那家怎么收钱，和 `HistoryRow::billing` 同一套词：`per-token` /
+    /// `subscription` / `free` / `unknown`。**订阅制那一轮的 `cost_micros` 也是
+    /// None**，只看金额分不出它和「无法计价」
+    pub billing: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
