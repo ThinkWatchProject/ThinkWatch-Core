@@ -928,7 +928,9 @@ async fn usage(
     Ok(Json(usage))
 }
 
-/// `wham/usage` 的回答。**只取额度相关的几项**：同一份回答里还有邮箱和用户 ID，不往外带
+/// `wham/usage` 的回答。**只取界面要用的几项**：额度、套餐，以及邮箱
+/// —— 账号不止一个时，邮箱是用户分得清哪个是哪个的唯一一项。同一份回答里
+/// 的用户 ID 和账户 ID 不往外带：界面用不上，而它们一旦出去就会进日志
 fn parse_usage(v: &Value) -> tw_api::ChatgptUsage {
     let window = |w: &Value| {
         let secs = w.get("limit_window_seconds")?.as_u64().filter(|s| *s > 0)?;
@@ -942,6 +944,7 @@ fn parse_usage(v: &Value) -> tw_api::ChatgptUsage {
     };
     let limits = &v["rate_limit"];
     tw_api::ChatgptUsage {
+        email: v["email"].as_str().map(str::to_string),
         plan: v["plan_type"].as_str().map(str::to_string),
         windows: [&limits["primary_window"], &limits["secondary_window"]]
             .into_iter()
@@ -1039,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_keeps_only_the_limits() {
+    fn usage_keeps_the_limits_and_who_is_signed_in() {
         let v = serde_json::json!({
             "email": "someone@example.com",
             "user_id": "user-1",
@@ -1053,16 +1056,15 @@ mod tests {
             "rate_limit_reset_credits": {"available_count": 2}
         });
         let u = parse_usage(&v);
+        assert_eq!(u.email.as_deref(), Some("someone@example.com"));
         assert_eq!(u.plan.as_deref(), Some("plus"));
         assert_eq!(u.windows.len(), 1);
         assert_eq!(u.windows[0].window, "weekly");
         assert_eq!(u.windows[0].used_percent, 21.0);
         assert_eq!(u.windows[0].reset_in_secs, Some(410907));
         assert_eq!(u.reset_credits, Some(2));
+        // 用户 ID 不往外带：界面读不出是谁，而它一旦出去就会进日志
         let json = serde_json::to_string(&u).unwrap();
-        assert!(
-            !json.contains("someone@example.com") && !json.contains("user-1"),
-            "{json}"
-        );
+        assert!(!json.contains("user-1"), "{json}");
     }
 }

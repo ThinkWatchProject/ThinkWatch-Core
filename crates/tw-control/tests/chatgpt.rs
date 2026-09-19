@@ -817,9 +817,12 @@ async fn usage_shows_the_limits_without_personal_details() {
         json!([{"window": "weekly", "used_percent": 21.0, "reset_in_secs": 410907}]),
         "长度为 0 的窗口不算"
     );
+    // 邮箱要给：账号不止一个时，它是用户分辨哪个是哪个的唯一一项
+    assert_eq!(v["email"], "someone@example.com");
+    // 用户 ID 和账户 ID 不给：界面读不出是谁，而它们一旦出去就会进日志
     let text = v.to_string();
     assert!(
-        !text.contains("someone@example.com") && !text.contains("user-1"),
+        !text.contains("user-1") && !text.contains("acct-1"),
         "{text}"
     );
 
