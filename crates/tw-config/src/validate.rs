@@ -45,6 +45,8 @@ pub enum ValidationError {
     EmptyModelsOnly { name: String },
     #[error("上游「{name}」的启用范围（models_only）中存在空项")]
     BlankModelsOnly { name: String },
+    #[error("{what}名称「{name}」以 __ 开头。以 __ 开头的名称留给内置项，请使用其他名称")]
+    ReservedName { what: &'static str, name: String },
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -120,6 +122,25 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             ));
         }
     }
+    // `__` 开头的名字留给内置项（「全部上游」在配置里叫 `__all__`）。**撞上了
+    // 不是报一个重名那么简单**：规则写 `to: __all__` 时指的是谁，就取决于
+    // 实现顺序了
+    let reserved = |n: &str| n.starts_with(tw_engine::RESERVED_PREFIX);
+    let named = cfg
+        .providers
+        .iter()
+        .map(|p| ("上游", &p.name))
+        .chain(cfg.groups.iter().map(|g| ("策略组", &g.name)))
+        .chain(cfg.routes.iter().map(|r| ("路由", &r.name)));
+    for (what, name) in named {
+        if reserved(name) {
+            return Err(ValidationError::ReservedName {
+                what,
+                name: name.clone(),
+            });
+        }
+    }
+
     // provider 和组不能同名。`to: x` 指向哪个会变成一个靠实现顺序决定
     // 的问题 —— 而那种问题在换一个人读代码的时候就会变成 bug。
     let group_names: std::collections::HashSet<&str> =
@@ -344,6 +365,19 @@ mod tests {
             validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "api.example.com")])),
             Err(ValidationError::BadBaseUrl { .. })
         ));
+    }
+
+    #[test]
+    fn names_that_start_with_two_underscores_are_reserved() {
+        // 「全部上游」在配置里叫 `__all__`。一个同名的上游或策略组会让
+        // `to: __all__` 指向谁取决于实现顺序
+        let e = validate(&cfg(
+            vec![c("d", "tw-1")],
+            vec![p("__all__", "https://relay.example")],
+        ))
+        .unwrap_err();
+        assert!(matches!(e, ValidationError::ReservedName { .. }), "{e}");
+        assert!(e.to_string().contains("__all__"), "{e}");
     }
 
     #[test]
