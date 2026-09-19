@@ -252,7 +252,7 @@ routes:
         &b.app,
         "POST",
         "/dryrun",
-        serde_json::json!({ "model": "claude-sonnet-4-5" }),
+        serde_json::json!({ "model": "claude-sonnet-4-5", "client": "c" }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -268,7 +268,7 @@ routes:
         &b.app,
         "POST",
         "/dryrun",
-        serde_json::json!({ "model": "claude-opus-4-1" }),
+        serde_json::json!({ "model": "claude-opus-4-1", "client": "c" }),
     )
     .await;
     assert_eq!(v["outcome"], "unavailable", "{v}");

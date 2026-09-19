@@ -1,4 +1,4 @@
-//! 按名字编辑配置里的一项：上游、代理、价目表。
+//! 按名字编辑配置里的一项：上游、代理、价目表、路由、策略组。
 //!
 //! # 为什么要有这一层
 //!
@@ -55,6 +55,14 @@ pub const PROXIES: Section = Section {
 pub const PRICE_SHEETS: Section = Section {
     path: &["pricing", "sheets"],
     what: "价目表",
+};
+pub const ROUTES: Section = Section {
+    path: &["routes"],
+    what: "路由",
+};
+pub const GROUPS: Section = Section {
+    path: &["groups"],
+    what: "策略组",
 };
 
 impl Section {

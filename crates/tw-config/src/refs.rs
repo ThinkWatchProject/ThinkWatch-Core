@@ -153,6 +153,94 @@ pub fn rename_provider(
     Ok(out)
 }
 
+/// 一条规则：它在哪条路由里、叫什么。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleRef {
+    pub route: String,
+    pub rule: String,
+}
+
+/// 把请求转发给策略组 `name` 的规则，按配置里出现的顺序。
+pub fn group_refs(cfg: &Config, name: &str) -> Vec<RuleRef> {
+    cfg.routes
+        .iter()
+        .flat_map(|route| {
+            route
+                .rules
+                .iter()
+                .filter(|rule| rule.to.as_deref() == Some(name))
+                .map(|rule| RuleRef {
+                    route: route.name.clone(),
+                    rule: rule.name.clone(),
+                })
+        })
+        .collect()
+}
+
+/// 指定了路由 `name` 的密钥。
+///
+/// **没指定路由的密钥不在这里**，哪怕 `name` 正是默认路由：它们用的是
+/// 「默认路由」这个位置，不是这个名字 —— 默认路由换了，它们跟着换。
+pub fn route_users(cfg: &Config, name: &str) -> Vec<String> {
+    cfg.clients
+        .iter()
+        .filter(|c| c.route.as_deref() == Some(name))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// 把 `text` 里引用路由 `old` 的地方都改成 `new`：指定了它的密钥，以及
+/// 默认路由。
+///
+/// **默认路由没写在配置里、被改名的又正是它时，要把新名字写进去** —— 不写
+/// 的话，改完名默认路由仍是「叫默认的那条」，而那条已经不存在了。反过来，
+/// 新名字就是「默认」时不写：默认值不写进文件。
+pub fn rename_route(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
+    let mut out = text.to_string();
+    let s = |v: &str| Value::String(v.to_string());
+    for (i, c) in cfg.clients.iter().enumerate() {
+        if c.route.as_deref() == Some(old) {
+            out = edit::set(
+                &out,
+                &[Step::key("clients"), Step::Index(i), Step::key("route")],
+                Some(&s(new)),
+            )?;
+        }
+    }
+    let default = cfg
+        .default_route
+        .as_deref()
+        .unwrap_or(tw_engine::DEFAULT_ROUTE);
+    if default == old {
+        let value = (new != tw_engine::DEFAULT_ROUTE).then(|| s(new));
+        out = edit::set(&out, &[Step::key("default_route")], value.as_ref())?;
+    }
+    Ok(out)
+}
+
+/// 把 `text` 里转发给策略组 `old` 的规则都改成转发给 `new`。
+pub fn rename_group(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
+    let mut out = text.to_string();
+    for (r, route) in cfg.routes.iter().enumerate() {
+        for (i, rule) in route.rules.iter().enumerate() {
+            if rule.to.as_deref() == Some(old) {
+                out = edit::set(
+                    &out,
+                    &[
+                        Step::key("routes"),
+                        Step::Index(r),
+                        Step::key("rules"),
+                        Step::Index(i),
+                        Step::key("to"),
+                    ],
+                    Some(&Value::String(new.to_string())),
+                )?;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// 把 `text` 里用着代理 `old` 的上游都改成用 `new`。
 pub fn rename_proxy(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
     let mut out = text.to_string();
@@ -278,6 +366,77 @@ routes:
         let text = CFG.replace("    proxy: hk\n", "    proxy: hk\n    pricing: 没有这张\n");
         let e = crate::try_parse(&text).unwrap_err();
         assert!(e.message.contains("没有这张"), "{}", e.message);
+    }
+
+    #[test]
+    fn the_rules_that_forward_to_a_group_are_found() {
+        assert_eq!(
+            group_refs(&cfg(CFG), "pool"),
+            vec![RuleRef {
+                route: "默认".into(),
+                rule: "兜底".into()
+            }]
+        );
+        assert!(group_refs(&cfg(CFG), "没有这个组").is_empty());
+    }
+
+    #[test]
+    fn renaming_a_group_moves_the_rules_that_forward_to_it() {
+        let c = cfg(CFG);
+        let text = edit::upsert(
+            CFG,
+            edit::GROUPS,
+            Some("pool"),
+            &serde_yaml_ng::from_str("name: 主力\ntype: fallback\nproviders: [relay, 官方]\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let out = rename_group(&text, &c, "pool", "主力").unwrap();
+        let after = cfg(&out);
+        assert_eq!(group_refs(&after, "主力").len(), 1);
+        assert!(group_refs(&after, "pool").is_empty());
+    }
+
+    #[test]
+    fn renaming_a_route_moves_its_keys_and_the_default() {
+        // 默认路由没写在配置里：改名之后要写进去，否则默认路由指向一条不存在的「默认」
+        let text = CFG.replace(
+            "    key: tw-k\n",
+            "    key: tw-k\n  - name: codex\n    key: tw-x\n    route: 默认\n",
+        );
+        let c = cfg(&text);
+        assert_eq!(route_users(&c, "默认"), ["codex"]);
+        let renamed = edit::upsert(
+            &text,
+            edit::ROUTES,
+            Some("默认"),
+            &edit::parse(&text).unwrap()["routes"][0]
+                .as_mapping()
+                .map(|m| {
+                    let mut m = m.clone();
+                    m.insert("name".into(), "通用".into());
+                    m
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let out = rename_route(&renamed, &c, "默认", "通用").unwrap();
+        let after = cfg(&out);
+        assert_eq!(after.default_route.as_deref(), Some("通用"));
+        assert_eq!(route_users(&after, "通用"), ["codex"]);
+        // 改回「默认」：默认值不写进文件
+        let back = edit::upsert(
+            &out,
+            edit::ROUTES,
+            Some("通用"),
+            &edit::parse(&text).unwrap()["routes"][0]
+                .as_mapping()
+                .cloned()
+                .unwrap(),
+        )
+        .unwrap();
+        let back = rename_route(&back, &after, "通用", "默认").unwrap();
+        assert!(!back.contains("default_route"), "{back}");
     }
 
     #[test]

@@ -25,6 +25,10 @@ groups:
   - name: 都试试
     type: load-balance
     providers: [官方, 中转]
+  - name: 真轮询
+    type: load-balance
+    session_affinity: false
+    providers: [官方, 中转]
 routes:
   - name: 默认
     rules:
@@ -61,7 +65,18 @@ fn app() -> (tempfile::TempDir, axum::Router) {
     (d, tw_control::router(state))
 }
 
+/// 试算要说清按哪条路由算。没指定密钥、路由、草稿时，用唯一那把密钥
 async fn run(app: &axum::Router, body: &str) -> tw_api::DryRunResult {
+    let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
+    if v.get("client").is_none() && v.get("route").is_none() && v.get("draft").is_none() {
+        v["client"] = "我".into();
+    }
+    let (st, b) = send(app, &v.to_string()).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    serde_json::from_str(&b).unwrap()
+}
+
+async fn send(app: &axum::Router, body: &str) -> (StatusCode, String) {
     let r = app
         .clone()
         .oneshot(
@@ -74,9 +89,9 @@ async fn run(app: &axum::Router, body: &str) -> tw_api::DryRunResult {
         )
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let st = r.status();
     let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
-    serde_json::from_slice(&b).unwrap()
+    (st, String::from_utf8_lossy(&b).to_string())
 }
 
 #[tokio::test]
@@ -87,8 +102,116 @@ async fn a_plain_request_falls_through_to_the_catch_all() {
     assert_eq!(r.rule.as_deref(), Some("其余都试试"));
     assert_eq!(r.via_group.as_deref(), Some("都试试"));
     assert_eq!(r.candidates.len(), 2);
-    // **要直说 —— 它决定账单。**负载均衡会让 prompt cache 不稳定
-    assert!(r.hurts_cache, "load_balance 会打散缓存，试算里就该说");
+    assert_eq!(r.route, "默认");
+    // 开着会话粘滞（默认）的轮询不伤缓存：同一次对话始终落在同一家。
+    // 一律标成危险是假警报，而假警报会让人学会忽略这一栏
+    assert!(!r.hurts_cache, "粘滞的轮询不该报");
+}
+
+#[tokio::test]
+async fn round_robin_without_affinity_is_said_to_hurt_the_cache() {
+    // **要直说 —— 它决定账单。**
+    let (_d, app) = app();
+    let r = run(
+        &app,
+        r#"{"model":"claude-sonnet-4-5","draft":{"name":"草稿","rules":[{"name":"兜底","to":"真轮询"}]}}"#,
+    )
+    .await;
+    assert!(r.hurts_cache);
+    assert_eq!(r.route, "草稿");
+}
+
+#[tokio::test]
+async fn without_a_key_or_a_route_it_refuses_instead_of_guessing() {
+    // 以前悄悄拿配置里第一把密钥来算，而那把可能指定了另一条路由
+    let (_d, app) = app();
+    let (st, body) = send(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    let (st, _) = send(&app, r#"{"model":"m","client":"没有这把"}"#).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = send(&app, r#"{"model":"m","route":"没有这条"}"#).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_route_can_be_tried_by_name_and_a_draft_as_written() {
+    let (_d, app) = app();
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5","route":"默认"}"#).await;
+    assert_eq!(r.route, "默认");
+    assert_eq!(r.rule.as_deref(), Some("其余都试试"));
+
+    let r = run(
+        &app,
+        r#"{"model":"m","draft":{"name":"新路由","rules":[{"name":"只走中转","to":"中转"}]}}"#,
+    )
+    .await;
+    assert_eq!(r.candidates, ["中转"]);
+    // 草稿里写错的规则在求值之前就说出来
+    let (st, body) = send(
+        &app,
+        r#"{"model":"m","draft":{"name":"x","rules":[{"name":"坏的","to":"没有这家"}]}}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(body.contains("没有这家"), "{body}");
+}
+
+#[tokio::test]
+async fn the_trace_says_which_rule_decided_and_which_only_added_something() {
+    let (_d, app) = app();
+    let r = run(
+        &app,
+        r#"{"model":"claude-sonnet-4-5","cache":true,"input_tokens":300000}"#,
+    )
+    .await;
+    let effect = |name: &str| {
+        r.trace
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.effect.clone())
+    };
+    assert_eq!(effect("带缓存的必须走官方").as_deref(), Some("decide"));
+    assert_eq!(effect("超长上下文降级").as_deref(), Some("apply"));
+    assert_eq!(
+        effect("其余都试试").as_deref(),
+        Some("none"),
+        "命中了，但去向早已决定"
+    );
+    assert_eq!(effect("图片一律拒绝"), None, "没命中就没有作用");
+}
+
+#[tokio::test]
+async fn the_mismatch_is_the_condition_that_really_failed() {
+    // 两个数量条件：前一个满足，后一个不满足。以前报的是前一个
+    let (_d, app) = app();
+    let draft = |extra: &str| {
+        format!(
+            r#"{{"model":"m","input_tokens":200000{extra},"draft":{{"name":"x","rules":[
+                {{"name":"两个比较","conditions":[
+                    {{"field":"input_tokens","values":[">100k"]}},
+                    {{"field":"max_tokens","values":["<4k"]}}],"to":"中转"}},
+                {{"name":"兜底","to":"官方"}}]}}}}"#
+        )
+    };
+    let r = run(&app, &draft(r#","max_tokens":8000"#)).await;
+    let m = r.trace[0].mismatch.as_ref().unwrap();
+    assert_eq!((m.field.as_str(), m.got.as_str()), ("max_tokens", "8000"));
+    // 请求没写 max_tokens：实际值留空，而不是报一个 0
+    let r = run(&app, &draft("")).await;
+    let m = r.trace[0].mismatch.as_ref().unwrap();
+    assert_eq!((m.field.as_str(), m.got.as_str()), ("max_tokens", ""));
+
+    // `assistant_internal` 是五类里的任意一类：卡住的是模型，不是它
+    let r = run(
+        &app,
+        r#"{"model":"m","intent":"titling","draft":{"name":"x","rules":[
+            {"name":"辅助请求走中转","conditions":[
+                {"field":"intent","values":["assistant_internal"]},
+                {"field":"model","values":["claude-*"]}],"to":"中转"},
+            {"name":"兜底","to":"官方"}]}}"#,
+    )
+    .await;
+    assert_eq!(r.trace[0].mismatch.as_ref().unwrap().field, "model");
 }
 
 #[tokio::test]

@@ -25,6 +25,7 @@ pub mod pricing;
 pub mod replay;
 pub mod resources;
 pub mod rotation;
+pub mod routes;
 pub mod scan;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
@@ -138,6 +139,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/plan", post(clients::mcp_plan_op))
         .route("/mcp/apply", post(clients::mcp_apply))
         .merge(resources::router())
+        .merge(routes::router())
         .merge(pricing::router())
         .merge(chatgpt::router())
         .with_state(state)
@@ -253,6 +255,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .map(|set| tw_api::RouteView {
                 name: set.name.clone(),
                 default: set.name == engine.default_route(),
+                builtin: engine.is_builtin_route(&set.name),
+                has_catch_all: tw_engine::has_catch_all(&set.rules),
                 clients: cfg
                     .clients
                     .iter()
@@ -262,13 +266,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 rules: set
                     .rules
                     .iter()
-                    .map(|r| tw_api::RuleView {
-                        name: r.name.clone(),
-                        // 阶段二的规则没有去向 —— 它们只改参数或拒绝
-                        to: r.to.clone(),
-                        deny: r.deny.is_some(),
-                        conditions: describe_when(&r.when),
-                    })
+                    .zip(tw_engine::notes(&set.rules))
+                    .map(|(r, n)| routes::rule_view(r, n))
                     .collect(),
             })
             .collect(),
@@ -277,11 +276,13 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|g| tw_api::GroupView {
                 name: g.name.clone(),
+                builtin: tw_engine::is_builtin_group(&g.name),
                 kind: g.kind.slug().to_string(),
                 session_affinity: g.session_affinity,
                 selected: g.selected.clone(),
                 providers: g.providers.clone(),
-                hurts_cache: g.kind.hurts_cache(),
+                // 按这个组的配置判断：开着会话粘滞的轮询组不伤缓存
+                hurts_cache: g.hurts_cache(),
             })
             .collect(),
         clients: cfg
@@ -418,7 +419,7 @@ fn provider_view(
 /// **规则列表上必须能直接读懂条件** —— 让用户去对着 YAML 猜「这条为什么
 /// 没命中」，正是那类「我明明配了」问题的来源。这里给键和值，每个条件
 /// 怎么称呼由界面决定。
-fn describe_when(w: &tw_engine::rule::When) -> Vec<tw_api::ConditionView> {
+pub(crate) fn describe_when(w: &tw_engine::rule::When) -> Vec<tw_api::ConditionView> {
     let mut out = Vec::new();
     let mut push = |field: &str, values: Vec<String>| {
         out.push(tw_api::ConditionView {
