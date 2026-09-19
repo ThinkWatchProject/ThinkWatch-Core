@@ -237,3 +237,60 @@ async fn a_relay_can_take_its_credential_in_its_own_header() {
         "没写 key 就不该发鉴权头"
     );
 }
+
+#[tokio::test]
+async fn a_disabled_key_is_refused_and_says_it_was_disabled_on_purpose() {
+    let (up, _seen) = start_upstream().await;
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![
+            Client {
+                name: "laptop".into(),
+                key: "tw-testkey".into(),
+                ..Default::default()
+            },
+            Client {
+                name: "试用".into(),
+                key: "tw-paused".into(),
+                disabled: true,
+                ..Default::default()
+            },
+        ],
+        providers: vec![anthropic(up)],
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "tw-paused")
+        .header("content-type", "application/json")
+        .body(BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let text = resp.text().await.unwrap();
+    // **和「密钥无效」是两回事**：说成无效的话，用户会去查客户端配置，
+    // 而那里什么问题都没有
+    assert!(text.contains("已停用"), "{text}");
+    assert!(text.contains("试用"), "要说清是哪一把：{text}");
+
+    // 同一个网关上，没停用的那把照常能用
+    let ok = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "tw-testkey")
+        .header("content-type", "application/json")
+        .body(BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+}

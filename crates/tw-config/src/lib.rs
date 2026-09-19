@@ -95,6 +95,13 @@ pub struct Config {
     /// 不需要一条「最多一条默认」的校验去维持。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_route: Option<String>,
+    /// 没有为自己生成密钥的那些客户端用哪一把。
+    ///
+    /// **它是一个身份，不是「列表里的第一个」。**接管时不指定用哪把密钥，
+    /// 落到的就是它；界面上它删不掉 —— 删了之后手动配置的客户端会在某个
+    /// 说不清的时刻断掉。不写就是名字叫 `default` 的那把。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_key: Option<String>,
 }
 
 /// 便于构造，**不代表一份可用的配置** —— `providers` 和 `clients` 都是
@@ -115,6 +122,7 @@ impl Default for Config {
             groups: Vec::new(),
             routes: Vec::new(),
             default_route: None,
+            default_key: None,
         }
     }
 }
@@ -128,6 +136,8 @@ impl Default for Client {
             max_concurrent: None,
             allow: None,
             route: None,
+            client: None,
+            disabled: false,
         }
     }
 }
@@ -155,7 +165,39 @@ impl Default for Provider {
     }
 }
 
+/// 名字叫这个的密钥就是默认那把 —— 前提是 `default_key` 没有明写别的
+pub const DEFAULT_KEY: &str = "default";
+
 impl Config {
+    /// 没有为自己生成密钥的客户端用哪一把。
+    ///
+    /// 按顺序：`default_key` 指名的那把 → 名字叫 `default` 的 → 第一把。
+    /// **最后这一条只是不让它返回空**：配置是首次启动生成的，那时就有一把
+    /// 叫 `default` 的；能落到「第一把」的只有手写配置删掉了它的情形。
+    pub fn default_client(&self) -> Option<&Client> {
+        let named = self
+            .default_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+        if let Some(n) = named
+            && let Some(c) = self.clients.iter().find(|c| c.name == n)
+        {
+            return Some(c);
+        }
+        self.clients
+            .iter()
+            .find(|c| c.name == DEFAULT_KEY)
+            .or_else(|| self.clients.first())
+    }
+
+    /// 为这个客户端留着的那把钥匙。**取消接管之后它还在**
+    pub fn client_key(&self, client: &str) -> Option<&Client> {
+        self.clients
+            .iter()
+            .find(|c| c.client.as_deref() == Some(client))
+    }
+
     /// 哪个上游选了哪张价目表。**没选的不在里面** —— 它们按默认价目表。
     pub fn price_assign(&self) -> Vec<(String, String)> {
         self.providers
@@ -361,6 +403,23 @@ pub struct Client {
     /// 网关密钥。`tw-` 前缀是刻意的：用户在客户端配置里看到它时，
     /// 一眼就知道这不是某个上游的真 key。
     pub key: String,
+    /// 这把钥匙是为哪个客户端生成的（`claude-code` / `codex` …）。
+    ///
+    /// **写下来，而不是靠名字相同去猜。**接管时把密钥的值写进那个客户端
+    /// 的配置文件，之后两边就没有别的联系了 —— 靠名字的话，用户改一次名
+    /// 就对不上，自己建一把重名的又会被当成它的。
+    ///
+    /// 取消接管**不清空它**：那把钥匙仍然是为这个客户端留着的，下次接管
+    /// 直接接着用，不必让用户再配一遍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// 停用之后，用这把钥匙的请求一律拒绝。
+    ///
+    /// **和「一个模型都不给」不是一回事。**后者是模型范围为空，用户读到的
+    /// 是「配错了」；而「临时停掉这个客户端」是一个正当的、要能一眼看出来
+    /// 也能一键恢复的状态。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 /// OAuth 凭据（第 3 类）。

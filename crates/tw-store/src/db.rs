@@ -617,6 +617,20 @@ impl Db {
     /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**：
     /// 我们改了一个文件，但那个文件有没有被读到，只有请求能
     /// 证明。
+    /// 每把网关密钥最后一次被用在什么时候。
+    ///
+    /// **和 `last_seen_by_hint` 不是一回事。**那个按客户端自报的标识分组，
+    /// 标识是请求头里来的、可以伪造；这个按密钥分组，而密钥是网关自己认出来的。
+    /// 「这把钥匙还有没有人在用」只能问这一个。
+    pub fn last_seen_by_client(&self) -> Result<Vec<(String, i64)>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT client, MAX(at_ms) FROM requests
+             WHERE client <> '' GROUP BY client",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn last_seen_by_hint(&self) -> Result<Vec<(String, i64)>, DbError> {
         let mut st = self.conn.prepare(
             "SELECT client_hint, MAX(at_ms) FROM requests
@@ -961,6 +975,7 @@ impl Db {
         let col = match dim {
             tw_api::CostDim::Model => "model",
             tw_api::CostDim::Provider => "provider",
+            tw_api::CostDim::Client => "client",
         };
         let sql = format!(
             "SELECT ((at_ms - ?1) / ?3) AS b, {col},
@@ -1003,6 +1018,7 @@ impl Db {
         let col = match dim {
             tw_api::CostDim::Model => "model",
             tw_api::CostDim::Provider => "provider",
+            tw_api::CostDim::Client => "client",
         };
         let sql = format!(
             "SELECT {col}, COUNT(*),

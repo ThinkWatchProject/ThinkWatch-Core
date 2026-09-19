@@ -20,6 +20,7 @@ pub mod clients;
 pub mod config;
 pub mod diagnostics;
 pub mod dryrun;
+pub mod keys;
 pub mod nics;
 pub mod pricing;
 pub mod replay;
@@ -89,7 +90,7 @@ pub fn router(state: ControlState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/interfaces", get(interfaces))
-        .route("/keys/new", get(new_key))
+        .merge(keys::router())
         .route("/events", get(events))
         .route("/overview", get(overview))
         .route("/l1", post(l1))
@@ -143,17 +144,6 @@ pub fn router(state: ControlState) -> Router {
         .merge(pricing::router())
         .merge(chatgpt::router())
         .with_state(state)
-}
-
-/// 生成一把新的网关密钥。**不写进配置** —— 只是给界面一个值去填。
-///
-/// **在这里生成，不在界面里。**字母表（去掉了 0/O、1/I/l 这些抄错的
-/// 字符）和长度是安全相关的决定，而用户要把这串东西读出来、抄进另一个
-/// 配置文件。两处各写一份的话，迟早只有一处被改。
-async fn new_key() -> Json<tw_api::NewKey> {
-    Json(tw_api::NewKey {
-        key: tw_config::generate_key(),
-    })
 }
 
 /// 这台机器上有哪些网卡。
@@ -285,17 +275,9 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 hurts_cache: g.hurts_cache(),
             })
             .collect(),
-        clients: cfg
-            .clients
-            .iter()
-            .map(|c| tw_api::ClientView {
-                name: c.name.clone(),
-                key: tw_secret::mask_secret(&c.key),
-                max_concurrent: c.max_concurrent,
-                route: c.route.clone(),
-                allow: c.allow.clone(),
-            })
-            .collect(),
+        // 和 `GET /keys` 同一份视图：概览里少一个字段的话，两处会各自
+        // 按不同的事实画同一张表
+        clients: keys::views(&s).await,
         security: tw_api::SecurityView {
             redact: cfg.security.redact.slug().to_string(),
             inspect_tools: cfg.security.inspect_tools.slug().to_string(),

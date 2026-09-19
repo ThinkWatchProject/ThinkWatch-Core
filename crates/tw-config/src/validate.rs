@@ -18,6 +18,12 @@ pub enum ValidationError {
     DuplicateClient(String),
     #[error("网关密钥「{0}」与「{1}」的值相同。网关按密钥区分客户端，密钥值必须唯一")]
     DuplicateKey(String, String),
+    #[error("default_key 指向的网关密钥「{0}」不存在")]
+    MissingDefaultKey(String),
+    #[error("默认网关密钥「{0}」处于停用状态。未接管的客户端均使用它，停用将使这些客户端一并失效")]
+    DisabledDefaultKey(String),
+    #[error("网关密钥「{0}」与「{1}」都写着为客户端「{2}」生成。一个客户端只能有一把")]
+    DuplicateClientKey(String, String, String),
     #[error("上游「{name}」的接口地址不是 http 或 https 地址：{url}")]
     BadBaseUrl { name: String, url: String },
     #[error("网关密钥「{name}」的值为空")]
@@ -106,6 +112,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
 
     let mut names = std::collections::HashSet::new();
     let mut keys: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut for_client: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for c in &cfg.clients {
         if !names.insert(&c.name) {
             return Err(ValidationError::DuplicateClient(c.name.clone()));
@@ -120,6 +127,33 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 prev.to_string(),
                 c.name.clone(),
             ));
+        }
+        // 一个客户端两把钥匙，接管时就得猜用哪把 —— 而猜错的后果要等到
+        // 那个客户端下一次发请求才看得见
+        if let Some(owner) = c.client.as_deref().map(str::trim).filter(|x| !x.is_empty())
+            && let Some(prev) = for_client.insert(owner, &c.name)
+        {
+            return Err(ValidationError::DuplicateClientKey(
+                prev.to_string(),
+                c.name.clone(),
+                owner.to_string(),
+            ));
+        }
+    }
+    // 默认密钥是一个身份，不是「列表里的第一把」：指到一把不存在的钥匙上，
+    // 接管和手动配置会各自落到不同的地方
+    if let Some(name) = cfg
+        .default_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
+        match cfg.clients.iter().find(|c| c.name == name) {
+            None => return Err(ValidationError::MissingDefaultKey(name.to_string())),
+            Some(c) if c.disabled => {
+                return Err(ValidationError::DisabledDefaultKey(name.to_string()));
+            }
+            Some(_) => {}
         }
     }
     // `__` 开头的名字留给内置项（「全部上游」在配置里叫 `__all__`）。**撞上了

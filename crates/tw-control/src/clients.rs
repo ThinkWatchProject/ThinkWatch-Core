@@ -31,27 +31,137 @@ fn gateway_base(s: &ControlState) -> String {
     format!("http://127.0.0.1:{}", s.config().listen.gateway.port)
 }
 
-fn gateway_for(s: &ControlState, key_name: Option<&str>) -> Result<Gateway, Fail> {
-    let cfg = s.config();
-    // 为「一个 key 就够」的人设计 —— 没指定就用第一把。
-    let key = match key_name {
-        Some(n) => cfg.clients.iter().find(|c| c.name == n).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("config.yaml 中没有名为「{n}」的网关密钥"),
-            )
-        })?,
-        None => cfg.clients.first().ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                "config.yaml 中尚无网关密钥，请先创建网关密钥，再接管客户端".to_string(),
-            )
-        })?,
-    };
+/// 这次接管该用哪把钥匙。
+///
+/// 顺序：**指名的 → 为这个客户端留着的 → 默认的**。
+///
+/// 中间那一条是「取消接管之后密钥不删」的另一半：再次接管时直接接着用同一把，
+/// 用户不必重新配置，也不会在配置里攒下一堆同名的钥匙。
+fn key_for(
+    cfg: &tw_config::Config,
+    client: &str,
+    key_name: Option<&str>,
+) -> Result<tw_config::Client, Fail> {
+    if let Some(n) = key_name {
+        return cfg
+            .clients
+            .iter()
+            .find(|c| c.name == n)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("config.yaml 中没有名为「{n}」的网关密钥"),
+                )
+            });
+    }
+    if let Some(c) = cfg.client_key(client) {
+        return Ok(c.clone());
+    }
+    cfg.default_client().cloned().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "config.yaml 中尚无网关密钥，请先创建网关密钥，再接管客户端".to_string(),
+        )
+    })
+}
+
+fn gateway_for(s: &ControlState, client: &str, key_name: Option<&str>) -> Result<Gateway, Fail> {
+    let key = key_for(&s.config(), client, key_name)?;
     Ok(Gateway {
         base: gateway_base(s),
         key: Some(key.key.clone()),
     })
+}
+
+/// 接管之前先把钥匙准备好：**每个被接管的客户端有自己的一把**。
+///
+/// 共用一把的后果是连锁的：请求记录里分不出是谁发的，按密钥绑路由匹不到，
+/// 每客户端并发上限形同虚设 —— 三样东西一起失效，而原因只是少了一把钥匙。
+///
+/// 已经有一把为它留着的（包括取消接管后留下的）就用那把，只补上绑定；
+/// 一把也没有才新建。
+async fn ensure_key(
+    s: &ControlState,
+    client: &tw_adopt::clients::Client,
+    key_name: Option<&str>,
+) -> Result<Gateway, Fail> {
+    let chosen = {
+        let cfg = s.config();
+        let picked = key_for(&cfg, client.id, key_name)?;
+        // 指名的、或者已经为它留着的：认这一把。否则为它新建
+        let mine = key_name.is_some() || cfg.client_key(client.id).is_some();
+        if mine { Some(picked) } else { None }
+    };
+    if let Some(c) = chosen {
+        // 指名一把还没绑过的，就此绑给它 —— 否则「这把是谁的」这件事只存在于
+        // 用户此刻的记忆里
+        if c.client.as_deref() != Some(client.id) {
+            bind(s, &c.name, client.id).await?;
+        }
+        return Ok(Gateway {
+            base: gateway_base(s),
+            key: Some(c.key),
+        });
+    }
+    let name = free_name(&s.config(), client.id);
+    let key = tw_config::generate_key();
+    let item = tw_config::Client {
+        name: name.clone(),
+        key: key.clone(),
+        client: Some(client.id.to_string()),
+        ..Default::default()
+    };
+    s.cfg
+        .transform(None, tw_config::history::Origin::Ui, |text, _| {
+            Ok(tw_config::edit::upsert(
+                text,
+                crate::keys::CLIENTS,
+                None,
+                &crate::resources::mapping(&item)?,
+            )?)
+        })
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, format!("无法创建网关密钥：{e}")))?;
+    Ok(Gateway {
+        base: gateway_base(s),
+        key: Some(key),
+    })
+}
+
+/// 把一把已有的钥匙记成某个客户端的。
+async fn bind(s: &ControlState, key: &str, client: &str) -> Result<(), Fail> {
+    let key = key.to_string();
+    let client = client.to_string();
+    s.cfg
+        .transform(None, tw_config::history::Origin::Ui, |text, cfg| {
+            let Some(i) = cfg.clients.iter().position(|c| c.name == key) else {
+                return Ok(text.to_string());
+            };
+            Ok(tw_config::edit::set(
+                text,
+                &[
+                    tw_yaml::Step::key("clients"),
+                    tw_yaml::Step::Index(i),
+                    tw_yaml::Step::key("client"),
+                ],
+                Some(&serde_yaml_ng::Value::String(client.clone())),
+            )?)
+        })
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, format!("无法记录密钥归属：{e}")))?;
+    Ok(())
+}
+
+/// 没被占用的密钥名。客户端 id 本身被占了就往后编号
+fn free_name(cfg: &tw_config::Config, id: &str) -> String {
+    if !cfg.clients.iter().any(|c| c.name == id) {
+        return id.to_string();
+    }
+    (2..)
+        .map(|n| format!("{id}-{n}"))
+        .find(|n| !cfg.clients.iter().any(|c| &c.name == n))
+        .unwrap_or_else(|| id.to_string())
 }
 
 pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsResponse>, Fail> {
@@ -136,7 +246,9 @@ pub async fn plan_adopt(
     Json(req): Json<tw_api::AdoptRequest>,
 ) -> Result<Json<tw_api::PlanView>, Fail> {
     let c = find(&req.client)?;
-    let gw = gateway_for(&s, req.key_name.as_deref())?;
+    // **算一份改动不该写任何东西**，所以这里不建密钥：没有的话按默认那把算，
+    // 而 diff 里的密钥本来就是打码的
+    let gw = gateway_for(&s, c.id, req.key_name.as_deref())?;
     let p = plan::plan_adopt(&c, &s.home, &gw).map_err(bad)?;
     let fields = p
         .targets
@@ -195,7 +307,9 @@ pub async fn adopt(
     Json(req): Json<tw_api::AdoptRequest>,
 ) -> Result<Json<tw_api::AdoptResponse>, Fail> {
     let c = find(&req.client)?;
-    let gw = gateway_for(&s, req.key_name.as_deref())?;
+    // 落盘这一步才建钥匙：**先有钥匙再写对方的配置** —— 反过来的话，中间那一刻
+    // 对方配置里写着一把 config.yaml 里没有的钥匙
+    let gw = ensure_key(&s, &c, req.key_name.as_deref()).await?;
     let p = plan::plan_adopt(&c, &s.home, &gw).map_err(bad)?;
     let a = plan::apply(&c, &p, &tw_adopt::foreign::backup_root()).map_err(bad)?;
     Ok(Json(tw_api::AdoptResponse {

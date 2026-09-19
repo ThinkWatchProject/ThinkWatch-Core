@@ -218,6 +218,57 @@ pub fn rename_route(text: &str, cfg: &Config, old: &str, new: &str) -> Result<St
     Ok(out)
 }
 
+/// 谁引用了网关密钥 `name`：按它分流的规则，以及「它是默认密钥」这件事。
+///
+/// **改名和删除都要先问它。**规则里的 `client` 是精确匹配一个密钥名字，
+/// 名字变了而规则没跟着变，那条规则从此一次也不会命中 —— 而配置照样通过
+/// 校验，用户只会发现「这条规则不知道什么时候起不灵了」。
+pub fn client_refs(cfg: &Config, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for route in &cfg.routes {
+        for rule in &route.rules {
+            if rule.when.client.as_deref() == Some(name) {
+                out.push(format!("路由「{}」的规则「{}」", route.name, rule.name));
+            }
+        }
+    }
+    if cfg.default_key.as_deref() == Some(name) {
+        out.push("默认密钥".to_string());
+    }
+    out
+}
+
+/// 把 `text` 里引用密钥 `old` 的地方都改成 `new`：按它分流的规则，以及默认密钥。
+pub fn rename_client(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
+    let mut out = text.to_string();
+    for (r, route) in cfg.routes.iter().enumerate() {
+        for (i, rule) in route.rules.iter().enumerate() {
+            if rule.when.client.as_deref() == Some(old) {
+                out = edit::set(
+                    &out,
+                    &[
+                        Step::key("routes"),
+                        Step::Index(r),
+                        Step::key("rules"),
+                        Step::Index(i),
+                        Step::key("when"),
+                        Step::key("client"),
+                    ],
+                    Some(&Value::String(new.to_string())),
+                )?;
+            }
+        }
+    }
+    if cfg.default_key.as_deref() == Some(old) {
+        out = edit::set(
+            &out,
+            &[Step::key("default_key")],
+            Some(&Value::String(new.to_string())),
+        )?;
+    }
+    Ok(out)
+}
+
 /// 把 `text` 里转发给策略组 `old` 的规则都改成转发给 `new`。
 pub fn rename_group(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
     let mut out = text.to_string();
