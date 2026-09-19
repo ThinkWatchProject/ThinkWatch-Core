@@ -597,7 +597,7 @@ pub(crate) fn invalid(msg: String) -> ApplyError {
     ApplyError::Edit(EditError::Unwritable(msg))
 }
 
-fn not_found(what: &'static str, name: &str) -> ApplyError {
+pub(crate) fn not_found(what: &'static str, name: &str) -> ApplyError {
     ApplyError::Edit(EditError::NotFound {
         what,
         name: name.to_string(),

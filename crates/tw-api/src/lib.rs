@@ -901,6 +901,103 @@ pub struct ClientView {
     /// 这把密钥能看到哪些模型。三态：不写 / 写非空 / 写 `[]`（一个都不给）
     #[serde(default)]
     pub allow: Option<Vec<String>>,
+    /// 为哪个客户端生成的（`claude-code` / `codex` …）。取消接管之后仍然记着
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// 停用之后，用这把密钥的请求一律拒绝
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// 没有为自己生成密钥的客户端用的就是它。**删不得**
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    /// 最后一次被用在什么时候。**按密钥算，不是按客户端自报的标识** ——
+    /// 那个可以伪造。从来没被用过时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+}
+
+/// 新建或保存一把网关密钥（`POST /keys`、`PUT /keys/{name}`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeySave {
+    pub key: KeyInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 一把密钥上用户能改的东西。**密钥的值不在里面** —— 它由 core 生成，
+/// 要换就走更换，那条路会把新值同步给已接管的客户端。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyInput {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
+    /// `None` = 走默认路由
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// 三态：不写 / 写非空 / 写 `[]`（一个都不给）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+/// 换哪把密钥（`POST /keys/{name}/rotate`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyRotate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 换完之后的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRotated {
+    pub version: String,
+    /// 新的密钥值。**只在这里给一次**，之后列表里只有脱敏的
+    pub key: String,
+    /// 跟着改好的客户端。空的就是没有客户端在用它
+    #[serde(default)]
+    pub synced: Vec<KeySynced>,
+    /// 同步不上的客户端。**密钥已经换了**，这些要用户自己去改
+    #[serde(default)]
+    pub failed: Vec<KeySyncFailed>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeySynced {
+    /// 客户端 id（`claude-code` …）
+    pub client: String,
+    /// 界面上显示的名字
+    pub name: String,
+    /// `immediately` 下一个请求就用新的；`on_restart` 要重启那个客户端。
+    /// 和 `DetectedClient.takes_effect` 同一个词表
+    pub takes_effect: String,
+    /// 改之前的全文备份在哪
+    pub backup: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeySyncFailed {
+    pub client: String,
+    pub name: String,
+    pub error: String,
+}
+
+/// 设默认密钥（`PUT /default_key`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DefaultKeySave {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 一把密钥的明文（`GET /keys/{name}/value`）。
+///
+/// **单独一个接口，而不是放进列表**：列表是一直在刷的，而明文只在用户
+/// 点「复制」的那一刻需要。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyValue {
+    pub name: String,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1021,12 +1118,6 @@ pub struct ConfigText {
     pub text: String,
     /// `blake3:xxxxxxxxxxxx`，和 `PATCH` 的 `base_version` 是同一个
     pub version: String,
-}
-
-/// 一把刚生成、还没写进配置的网关密钥（`GET /keys/new`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewKey {
-    pub key: String,
 }
 
 /// 这台机器上的一张网卡（`GET /interfaces`）。
@@ -1725,6 +1816,9 @@ pub struct CostGroup {
 pub enum CostDim {
     Model,
     Provider,
+    /// 按网关密钥。**密钥是不可伪造的那个身份** —— `client_hint` 来自请求头，
+    /// 谁都能写；而这一列是网关自己按密钥反查出来的
+    Client,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

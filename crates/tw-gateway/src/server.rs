@@ -895,18 +895,23 @@ impl AppState {
                 "请求未携带网关密钥。请将 config.yaml 的 clients 中的网关密钥配置到客户端",
             ));
         };
-        self.rt
-            .load()
-            .config
-            .clients
-            .iter()
-            .find(|c| key_eq(&c.key, &key))
-            .map(|c| (c.name.clone(), position))
-            .ok_or_else(|| {
-                // 不回显收到的 key，哪怕是打码的 —— 回显会让「猜密钥」
-                // 这件事有了反馈信号。
-                GatewayError::auth("网关密钥无效。请检查客户端配置中的密钥与 config.yaml 是否一致")
-            })
+        let rt = self.rt.load();
+        let found = rt.config.clients.iter().find(|c| key_eq(&c.key, &key));
+        match found {
+            // **停用的密钥要说清楚是停用了。**这一条和「密钥无效」不同：
+            // 用户是自己停的，而把它说成无效会让他去查客户端配置 —— 那里
+            // 什么问题都没有
+            Some(c) if c.disabled => Err(GatewayError::auth(format!(
+                "网关密钥「{}」已停用。在应用的密钥页启用它即可恢复",
+                c.name
+            ))),
+            Some(c) => Ok((c.name.clone(), position)),
+            // 不回显收到的 key，哪怕是打码的 —— 回显会让「猜密钥」
+            // 这件事有了反馈信号。
+            None => Err(GatewayError::auth(
+                "网关密钥无效。请检查客户端配置中的密钥与 config.yaml 是否一致",
+            )),
+        }
     }
 }
 
