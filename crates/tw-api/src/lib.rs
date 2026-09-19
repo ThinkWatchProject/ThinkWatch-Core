@@ -1899,6 +1899,10 @@ pub struct ChatgptLoginStatus {
 /// ChatGPT 账号的用量（`GET /providers/{name}/chatgpt/usage`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatgptUsage {
+    /// 登的是哪个账号。**只有邮箱** —— 同一份回答里的用户 ID
+    /// 和账户 ID 不往外带：界面认账号靠邮箱，那两个读不出是谁
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     /// 额度窗口，词表同 [`QuotaWindow`]
