@@ -11,6 +11,8 @@ use tw_control::{ConfigManager, ControlState};
 struct Bed {
     dir: tempfile::TempDir,
     app: axum::Router,
+    /// 从一开始就订阅的事件
+    events: tokio::sync::broadcast::Receiver<tw_api::Event>,
 }
 
 impl Bed {
@@ -26,6 +28,7 @@ fn bed(yaml: &str) -> Bed {
     let cfg = tw_config::try_parse(yaml).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
     let bus = gw.bus.clone();
+    let events = bus.subscribe();
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
@@ -40,6 +43,7 @@ fn bed(yaml: &str) -> Bed {
     Bed {
         app: tw_control::router(state),
         dir: d,
+        events,
     }
 }
 
@@ -152,6 +156,73 @@ async fn an_upstreams_models_come_with_their_scope_context_window_and_price() {
     assert_eq!(p["model_count"], 1, "范围外的不算：{p}");
     assert_eq!(p["models_only"], serde_json::json!(["claude-sonnet-*"]));
     assert_eq!(p["disabled"], false);
+}
+
+/// 等到这一家的 `models_changed` 来够 `n` 条。
+async fn models_changed(events: &mut tokio::sync::broadcast::Receiver<tw_api::Event>, n: usize) {
+    let mut seen = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while seen < n {
+            if let tw_api::Event::ModelsChanged { provider, .. } = events.recv().await.unwrap() {
+                assert_eq!(provider, "relay");
+                seen += 1;
+            }
+        }
+    })
+    .await
+    .expect("等 models_changed 超时");
+}
+
+#[tokio::test]
+async fn opening_the_page_asks_what_it_has_not_got_and_says_when_the_answer_is_back() {
+    let up = upstream().await;
+    let mut b = bed(&config(up, "sk-good", ""));
+    let (_, ov) = call(&b.app, "GET", "/overview", serde_json::json!(null)).await;
+    assert_eq!(ov["providers"][0]["model_status"], "pending", "{ov}");
+
+    let (st, v) = call(&b.app, "POST", "/models/refresh", serde_json::json!(null)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["providers"], serde_json::json!(["relay"]));
+    // 开始问一条、问完一条
+    models_changed(&mut b.events, 2).await;
+    let (_, ov) = call(&b.app, "GET", "/overview", serde_json::json!(null)).await;
+    let p = &ov["providers"][0];
+    assert_eq!(p["model_status"], "listed", "{p}");
+    assert_eq!(p["model_source"], "discovered");
+    assert_eq!(p["model_fetching"], false);
+    assert_eq!(p["model_count"], 3);
+    assert!(p["model_checked_at_ms"].as_u64().is_some(), "{p}");
+    assert!(p.get("model_error").is_none(), "{p}");
+
+    // 刚问过：再打开一次页面不再去问
+    let (_, v) = call(&b.app, "POST", "/models/refresh", serde_json::json!(null)).await;
+    assert_eq!(v["providers"], serde_json::json!([]));
+    let (_, v) = call(
+        &b.app,
+        "GET",
+        "/providers/relay/models",
+        serde_json::json!(null),
+    )
+    .await;
+    assert_eq!(
+        (v["status"].as_str(), v["fetching"].as_bool()),
+        (Some("listed"), Some(false))
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_that_refuses_the_key_is_failed_with_the_reason_not_merely_unknown() {
+    let up = upstream().await;
+    let mut b = bed(&config(up, "sk-bad", ""));
+    call(&b.app, "POST", "/models/refresh", serde_json::json!(null)).await;
+    models_changed(&mut b.events, 2).await;
+    let (_, ov) = call(&b.app, "GET", "/overview", serde_json::json!(null)).await;
+    let p = &ov["providers"][0];
+    assert_eq!(
+        (p["model_status"].as_str(), p["model_source"].as_str()),
+        (Some("failed"), Some("none"))
+    );
+    assert!(p["model_error"].as_str().unwrap().contains("401"), "{p}");
 }
 
 #[tokio::test]
