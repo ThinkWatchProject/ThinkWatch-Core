@@ -16,6 +16,10 @@
 //! **向上游问是后台的事。**探测零成本，但要打网络：它不挡启动，`/v1/models`
 //! 也不现问 —— 每次有人列模型就去打一遍上游，会把一个本该零成本的端点变成
 //! 一串网络往返。
+//!
+//! **问的开始和结束都报 `models_changed`。**后台的问不挂在任何一次调用上，
+//! 界面没有别的办法知道它问完了：以前启动那一刻读到的「还没问」会一直挂在
+//! 上游页上，直到别的什么事让它重读一次概览。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -28,6 +32,8 @@ use crate::server::{AppState, Runtime, now_ms};
 const REFRESH_EVERY: Duration = Duration::from_secs(24 * 3600);
 /// 没问到（连不上、密钥被拒）之后多久再试。
 const RETRY_AFTER: Duration = Duration::from_secs(3600);
+/// 页面打开时补问：同一家至少隔这么久。**来回切页面不该每次都打一遍网络**
+const RECHECK_GAP: Duration = Duration::from_secs(60);
 /// 多久看一次有没有到时间的。看一次只是比较时间，不联网。
 ///
 /// **不是睡满一天再醒。**笔记本合盖时单调时钟不走，睡「24 小时」可能睡上
@@ -55,10 +61,41 @@ impl Source {
     }
 }
 
+/// 最近一次向上游问的结果。**和 [`Source`] 不是一回事**：没问到时清单可能
+/// 来自手写的兜底（`Manual`），而界面要说的是「问了，没问到，为什么」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// 还没问过：刚启动、刚加的、刚改了地址或凭据。停用的上游一直是这样 ——
+    /// 不去问它
+    Pending,
+    /// 上游列出了清单
+    Listed,
+    /// 问到了，但上游没给出清单：没有这个接口、格式认不出、空的。**再问多半
+    /// 还是这样**，该做的是填手动清单
+    NoList,
+    /// 没问到：连不上、密钥被拒、取不到密钥。**修好连接再问就行**
+    Failed,
+}
+
+impl Status {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::Listed => "listed",
+            Status::NoList => "no_list",
+            Status::Failed => "failed",
+        }
+    }
+}
+
 /// 一个上游的模型清单。
 #[derive(Debug, Clone)]
 pub struct Listing {
     pub source: Source,
+    pub status: Status,
+    /// 正在向上游问。**和 `status` 同时成立**：上一次的答案照常可用，
+    /// 新答案回来之前不作废
+    pub fetching: bool,
     /// 清单本身。**还没按启用范围过滤**
     pub models: Vec<String>,
     /// 最近一次向上游问的时间。还没问过是空
@@ -86,6 +123,9 @@ struct Entry {
     identity: String,
     answer: Answer,
     checked_at_ms: Option<u64>,
+    /// 正在问的次数。**是计数不是开关**：后台那一轮和用户点的刷新可能同时
+    /// 在问同一家，先回来的那个不该把另一个还在问的状态抹掉
+    in_flight: u32,
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +173,7 @@ impl Directory {
                     identity: id,
                     answer: Answer::Pending,
                     checked_at_ms: None,
+                    in_flight: 0,
                 },
             );
             pending = true;
@@ -195,6 +236,8 @@ impl Directory {
             .filter(|p| !p.disabled)
             .filter(|p| match entries.get(&p.name) {
                 None => true,
+                // 正在问的不再排一次
+                Some(e) if e.in_flight > 0 => false,
                 Some(e) => match (&e.answer, e.checked_at_ms) {
                     (Answer::Pending, _) | (_, None) => true,
                     (Answer::Failed(_), Some(at)) => {
@@ -207,6 +250,55 @@ impl Directory {
             .collect()
     }
 
+    /// 页面打开时该补问的上游：没问过的、没问到的、过期的。
+    ///
+    /// **刚问过的不问**（[`RECHECK_GAP`]），**正在问的不问**，**上游本来就
+    /// 不给清单的不问** —— 除非过期了，再问多半还是一样。停用的不问。
+    fn stale(&self, cfg: &tw_config::Config, now: u64) -> Vec<String> {
+        let entries = self.lock();
+        cfg.providers
+            .iter()
+            .filter(|p| !p.disabled)
+            .filter(|p| {
+                let Some(e) = entries.get(&p.name) else {
+                    return true;
+                };
+                if e.in_flight > 0 {
+                    return false;
+                }
+                let Some(at) = e.checked_at_ms else {
+                    return true;
+                };
+                let age = now.saturating_sub(at);
+                if age < RECHECK_GAP.as_millis() as u64 {
+                    return false;
+                }
+                match e.answer {
+                    Answer::Pending | Answer::Failed(_) => true,
+                    Answer::Listed(_) | Answer::NoList(_) => {
+                        age >= REFRESH_EVERY.as_millis() as u64
+                    }
+                }
+            })
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// 开始问一家。**配置还没对过这一家时补一条**（比如刚加上、重载还没轮到）
+    /// —— 否则问回来的答案没有地方记。
+    fn begin(&self, name: &str, identity: &str) {
+        let mut entries = self.lock();
+        let e = entries.entry(name.to_string()).or_insert_with(|| Entry {
+            identity: identity.to_string(),
+            answer: Answer::Pending,
+            checked_at_ms: None,
+            in_flight: 0,
+        });
+        if e.identity == identity {
+            e.in_flight += 1;
+        }
+    }
+
     /// 记下一次答案。**问的时候那家的身份已经变了的话，这个答案作废** ——
     /// 配置重载已经把它排进了下一轮。
     fn record(&self, name: &str, identity: &str, answer: Answer, at: u64) {
@@ -216,19 +308,39 @@ impl Directory {
         {
             e.answer = answer;
             e.checked_at_ms = Some(at);
+            e.in_flight = e.in_flight.saturating_sub(1);
+        }
+    }
+
+    /// 开始问之后又没问（问之前配置变了）：只撤掉在途，不动答案。
+    fn abandon(&self, name: &str, identity: &str) {
+        let mut entries = self.lock();
+        if let Some(e) = entries.get_mut(name)
+            && e.identity == identity
+        {
+            e.in_flight = e.in_flight.saturating_sub(1);
         }
     }
 }
 
 fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
     let checked_at_ms = entry.and_then(|e| e.checked_at_ms);
+    let fetching = entry.is_some_and(|e| e.in_flight > 0);
     let error = entry.and_then(|e| match &e.answer {
         Answer::NoList(why) | Answer::Failed(why) => Some(why.clone()),
         Answer::Pending | Answer::Listed(_) => None,
     });
+    let status = match entry.map(|e| &e.answer) {
+        None | Some(Answer::Pending) => Status::Pending,
+        Some(Answer::Listed(_)) => Status::Listed,
+        Some(Answer::NoList(_)) => Status::NoList,
+        Some(Answer::Failed(_)) => Status::Failed,
+    };
     match entry.map(|e| &e.answer) {
         Some(Answer::Listed(models)) => Listing {
             source: Source::Discovered,
+            status,
+            fetching,
             models: models.clone(),
             checked_at_ms,
             error: None,
@@ -237,12 +349,16 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
         // 上游不再提供的模型时会发现它删不掉
         _ if !p.models.is_empty() => Listing {
             source: Source::Manual,
+            status,
+            fetching,
             models: p.models.clone(),
             checked_at_ms,
             error,
         },
         _ => Listing {
             source: Source::None,
+            status,
+            fetching,
             models: Vec::new(),
             checked_at_ms,
             error,
@@ -274,29 +390,97 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     }
 }
 
-/// 去问这几家，记下答案，重算汇总。**几家一起问** —— 探测互不干扰，而一家
-/// 连不上要等满超时，挨个问会让排在后面的都跟着等。
-async fn refresh(state: &AppState, names: &[String]) {
-    let rt = state.runtime();
-    let asks = names.iter().filter_map(|name| {
-        let p = rt.config.providers.iter().find(|p| &p.name == name)?;
-        let id = identity(&rt.config, p);
-        let rt = &rt;
-        Some(async move { (p, id, ask(state, rt, p).await) })
+/// 正在问的一家：名字，和开始问时它的身份。
+struct Asking {
+    name: String,
+    identity: String,
+}
+
+/// 告诉界面这一家的清单变了（开始问了，或者问完了）。
+fn changed(state: &AppState, provider: &str) {
+    let id = state.bus.next_id();
+    state.bus.emit(tw_api::Event::ModelsChanged {
+        id,
+        provider: provider.to_string(),
+        at_ms: now_ms(),
     });
-    for (p, id, answer) in futures::future::join_all(asks).await {
+}
+
+/// 把这几家标成正在问。**同步做完再返回** —— 调用方紧接着读概览时，
+/// 读到的就已经是「正在获取」。
+fn start(state: &AppState, names: &[String]) -> Vec<Asking> {
+    let cfg = state.config();
+    names
+        .iter()
+        .filter_map(|name| {
+            let p = cfg.providers.iter().find(|p| &p.name == name)?;
+            let identity = identity(&cfg, p);
+            state.models.begin(name, &identity);
+            changed(state, name);
+            Some(Asking {
+                name: name.clone(),
+                identity,
+            })
+        })
+        .collect()
+}
+
+/// 去问，记下答案，重算汇总。**几家一起问** —— 探测互不干扰，而一家
+/// 连不上要等满超时，挨个问会让排在后面的都跟着等。
+async fn finish(state: &AppState, asking: Vec<Asking>) {
+    let rt = state.runtime();
+    let asks = asking.iter().map(|a| {
+        let rt = &rt;
+        async move {
+            let answer = match rt.config.providers.iter().find(|p| p.name == a.name) {
+                Some(p) if identity(&rt.config, p) == a.identity => Some(ask(state, rt, p).await),
+                // 开始问之后配置又变了：这一问作废，重载已经把它排进下一轮
+                _ => None,
+            };
+            (a, answer)
+        }
+    });
+    for (a, answer) in futures::future::join_all(asks).await {
+        let Some(answer) = answer else {
+            state.models.abandon(&a.name, &a.identity);
+            continue;
+        };
         match &answer {
             Answer::Listed(models) => {
-                tracing::debug!(provider = %p.name, models = models.len(), "已获取模型列表")
+                tracing::debug!(provider = %a.name, models = models.len(), "已获取模型列表")
             }
             Answer::NoList(why) | Answer::Failed(why) => {
-                tracing::info!(provider = %p.name, "未能获取模型列表：{why}")
+                tracing::info!(provider = %a.name, "未能获取模型列表：{why}")
             }
             Answer::Pending => {}
         }
-        state.models.record(&p.name, &id, answer, now_ms());
+        state.models.record(&a.name, &a.identity, answer, now_ms());
     }
+    // 先重算汇总再报：界面收到事件去读概览时，数目已经是新的
     state.publish_catalog();
+    for a in &asking {
+        changed(state, &a.name);
+    }
+}
+
+async fn refresh(state: &AppState, names: &[String]) {
+    let asking = start(state, names);
+    finish(state, asking).await;
+}
+
+/// 页面打开时补问：没问过的、没问到的、过期的（见 [`Directory::stale`]）。
+///
+/// **不等结果**：返回的是开始问的那几家，答案随 `models_changed` 一家一家地到。
+/// 等齐了再回的话，一家连不上就让整页等满超时。
+pub fn refresh_stale(state: &AppState) -> Vec<String> {
+    let names = state.models.stale(&state.config(), now_ms());
+    if names.is_empty() {
+        return names;
+    }
+    let asking = start(state, &names);
+    let state = state.clone();
+    tokio::spawn(async move { finish(&state, asking).await });
+    names
 }
 
 /// 马上向所有上游问一遍。
@@ -570,5 +754,129 @@ mod tests {
             d.listing(&c.providers[1]).error.as_deref(),
             Some("没有接口")
         );
+    }
+
+    #[test]
+    fn a_page_visit_asks_what_is_missing_failed_or_old_and_nothing_it_just_asked() {
+        let d = Directory::default();
+        let names = [
+            "new",
+            "failed",
+            "failed-now",
+            "listed",
+            "listed-old",
+            "no-list",
+            "asking",
+        ];
+        let mut c = cfg(names.iter().map(|n| provider(n)).collect());
+        c.providers.push(tw_config::Provider {
+            disabled: true,
+            ..provider("off")
+        });
+        d.reconcile(&c);
+        let day = REFRESH_EVERY.as_millis() as u64;
+        let now = day * 2;
+        let minute = RECHECK_GAP.as_millis() as u64;
+        let id = |n: &str| identity(&c, c.providers.iter().find(|p| p.name == n).unwrap());
+        d.record(
+            "failed",
+            &id("failed"),
+            Answer::Failed("连不上".into()),
+            now - minute,
+        );
+        d.record(
+            "failed-now",
+            &id("failed-now"),
+            Answer::Failed("连不上".into()),
+            now - 1,
+        );
+        d.record(
+            "listed",
+            &id("listed"),
+            Answer::Listed(vec!["m".into()]),
+            now - minute,
+        );
+        d.record(
+            "listed-old",
+            &id("listed-old"),
+            Answer::Listed(vec!["m".into()]),
+            now - day,
+        );
+        d.record(
+            "no-list",
+            &id("no-list"),
+            Answer::NoList("没有接口".into()),
+            now - minute,
+        );
+        d.begin("asking", &id("asking"));
+        // 没问过的、失败了一阵的、过期的；刚问过的、不给清单的、正在问的、
+        // 停用的都不问
+        assert_eq!(d.stale(&c, now), ["new", "failed", "listed-old"]);
+    }
+
+    #[test]
+    fn two_asks_at_once_keep_it_fetching_until_both_are_back() {
+        let d = Directory::default();
+        let c = cfg(vec![provider("a")]);
+        d.reconcile(&c);
+        let id = identity(&c, &c.providers[0]);
+        let p = &c.providers[0];
+        assert_eq!(d.listing(p).status, Status::Pending);
+        assert!(!d.listing(p).fetching);
+        d.begin("a", &id);
+        d.begin("a", &id);
+        d.record("a", &id, Answer::Failed("连不上".into()), 1);
+        // 一个回来了，另一个还在问；上一次的答案照常可用
+        let l = d.listing(p);
+        assert!(l.fetching);
+        assert_eq!(l.status, Status::Failed);
+        assert_eq!(l.error.as_deref(), Some("连不上"));
+        // 正在问的不再排进后台那一轮
+        assert!(d.due(&c, REFRESH_EVERY.as_millis() as u64).is_empty());
+        d.record("a", &id, Answer::Listed(vec!["m".into()]), 2);
+        let l = d.listing(p);
+        assert!(!l.fetching);
+        assert_eq!((l.status, l.source), (Status::Listed, Source::Discovered));
+        assert_eq!(l.error, None);
+    }
+
+    #[test]
+    fn an_ask_dropped_because_the_config_changed_leaves_nothing_fetching() {
+        let d = Directory::default();
+        let mut c = cfg(vec![provider("a")]);
+        d.reconcile(&c);
+        let before = identity(&c, &c.providers[0]);
+        d.begin("a", &before);
+        c.providers[0].base_url = "https://elsewhere.example".into();
+        d.reconcile(&c);
+        d.abandon("a", &before);
+        let l = d.listing(&c.providers[0]);
+        assert!(!l.fetching);
+        assert_eq!(l.status, Status::Pending);
+        // 还没对过配置的一家（刚加上）：开始问时补一条，答案有地方记
+        let fresh = provider("fresh");
+        let id = identity(&c, &fresh);
+        d.begin("fresh", &id);
+        d.record("fresh", &id, Answer::Listed(vec!["m".into()]), 1);
+        assert_eq!(d.listing(&fresh).status, Status::Listed);
+    }
+
+    #[test]
+    fn a_failure_with_a_manual_list_says_both() {
+        let d = Directory::default();
+        let mut c = cfg(vec![provider("a")]);
+        c.providers[0].models = vec!["手写".into()];
+        d.reconcile(&c);
+        d.record(
+            "a",
+            &identity(&c, &c.providers[0]),
+            Answer::Failed("密钥被拒".into()),
+            1,
+        );
+        let l = d.listing(&c.providers[0]);
+        // 清单来自手写的兜底，但「问了、没问到、为什么」一样要说
+        assert_eq!((l.source, l.status), (Source::Manual, Status::Failed));
+        assert_eq!(l.models, ["手写"]);
+        assert_eq!(l.error.as_deref(), Some("密钥被拒"));
     }
 }

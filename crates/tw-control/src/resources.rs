@@ -36,6 +36,7 @@ pub fn router() -> axum::Router<ControlState> {
         )
         .route("/providers/{name}/models", get(provider_models))
         .route("/providers/{name}/models/refresh", post(refresh_models))
+        .route("/models/refresh", post(refresh_stale_models))
         .route("/proxies", post(create_proxy))
         .route("/proxies/test", post(test_proxy))
         .route("/proxies/{name}", put(update_proxy).delete(delete_proxy))
@@ -274,6 +275,14 @@ async fn refresh_models(
     Ok(Json(models_view(&s, p, listing)))
 }
 
+/// 页面打开时补问：没问过的、没问到的、过期的。**不等答案** —— 立刻回
+/// 开始问的是哪几家，答案随 `models_changed` 一家一家地到。
+async fn refresh_stale_models(State(s): State<ControlState>) -> Json<tw_api::ModelsRefreshing> {
+    Json(tw_api::ModelsRefreshing {
+        providers: tw_gateway::models::refresh_stale(&s.gateway),
+    })
+}
+
 fn models_view(
     s: &ControlState,
     p: &tw_config::Provider,
@@ -284,6 +293,8 @@ fn models_view(
     tw_api::ProviderModelsView {
         provider: p.name.clone(),
         source: listing.source.slug().to_string(),
+        status: listing.status.slug().to_string(),
+        fetching: listing.fetching,
         checked_at_ms: listing.checked_at_ms,
         error: listing.error,
         models: listing

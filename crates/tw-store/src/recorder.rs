@@ -448,6 +448,7 @@ impl Recorder {
             // 不是「刚才发生过什么」。这张表只装后者。
             | Event::ClientsChanged { .. }
             | Event::HealthChanged { .. }
+            | Event::ModelsChanged { .. }
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
             | Event::StorageChanged { .. }

@@ -359,6 +359,7 @@ fn provider_view(
     p: &tw_config::Provider,
 ) -> tw_api::ProviderView {
     let base_url = tw_secret::redact_url(&p.base_url);
+    let listing = s.gateway.models.listing(p);
     tw_api::ProviderView {
         name: p.name.clone(),
         base_url_masked: base_url != p.base_url,
@@ -385,7 +386,11 @@ fn provider_view(
         on_proxy_fail: p.on_proxy_fail.slug().to_string(),
         models: p.models.clone(),
         models_only: p.models_only.clone(),
-        model_source: s.gateway.models.listing(p).source.slug().to_string(),
+        model_source: listing.source.slug().to_string(),
+        model_status: listing.status.slug().to_string(),
+        model_fetching: listing.fetching,
+        model_checked_at_ms: listing.checked_at_ms,
+        model_error: listing.error,
         model_count: s.gateway.catalog.load().count_for(&p.name),
         disabled: p.disabled,
         health: match s.health().state(&p.name) {

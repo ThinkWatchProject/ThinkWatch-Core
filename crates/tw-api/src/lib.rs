@@ -330,6 +330,17 @@ pub enum Event {
         state: String,
         at_ms: u64,
     },
+    /// 某家上游的模型清单开始获取了，或者获取完了（列出来了、没列出来、
+    /// 没问到）。
+    ///
+    /// **后台获取不挂在任何一次调用上**：启动时、每天一次、改了地址或凭据
+    /// 之后，core 自己去问。没有这条事件，界面在启动那一刻读到的「还没
+    /// 获取」会一直挂着，直到别的什么事让它重读一次概览。
+    ModelsChanged {
+        id: u64,
+        provider: String,
+        at_ms: u64,
+    },
     /// 某个代理通不通变了（只在变化那一刻发一次）。
     ///
     /// **没有它，代理挂了看起来就是「好几家上游同时不通」** —— 而那两件事
@@ -516,6 +527,7 @@ impl Event {
             | Event::RequestPriced { id, .. }
             | Event::ClientsChanged { id, .. }
             | Event::HealthChanged { id, .. }
+            | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
             | Event::AuthChanged { id, .. }
             | Event::StorageChanged { id, .. }
@@ -674,6 +686,17 @@ pub struct ProviderView {
     /// 模型清单从哪儿来：`discovered`（上游列出的）/ `manual`（手动清单）/
     /// `none`（不知道它有什么）
     pub model_source: String,
+    /// 最近一次向上游获取清单的结果：`pending`（还没获取，停用的上游一直是
+    /// 这样）/ `listed` / `no_list`（上游不提供清单）/ `failed`（没问到）
+    pub model_status: String,
+    /// 正在获取。上一次的结果照常有效
+    pub model_fetching: bool,
+    /// 最近一次获取的时间。还没获取过是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_checked_at_ms: Option<u64>,
+    /// `no_list` / `failed` 的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_error: Option<String>,
     /// 现在能服务的模型数，已按启用范围过滤。停用时是 0
     pub model_count: usize,
     /// 停用：不参与路由，模型不出现在 `/v1/models` 里
@@ -1357,6 +1380,10 @@ pub struct ProviderModelsView {
     pub provider: String,
     /// `discovered`（上游列出的）/ `manual`（手动清单）/ `none`
     pub source: String,
+    /// 最近一次获取的结果，同 [`ProviderView::model_status`]
+    pub status: String,
+    /// 正在获取
+    pub fetching: bool,
     /// 最近一次向上游获取清单的时间。还没获取过是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at_ms: Option<u64>,
@@ -1364,6 +1391,12 @@ pub struct ProviderModelsView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub models: Vec<ModelRow>,
+}
+
+/// 页面打开时补问模型清单：开始问的是哪几家。答案随 `models_changed` 到。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsRefreshing {
+    pub providers: Vec<String>,
 }
 
 /// 清单里的一个模型。
