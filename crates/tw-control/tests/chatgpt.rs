@@ -445,7 +445,7 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
 
     let (code, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
     assert_eq!(code, 200);
-    assert!(page.contains("ChatGPT 登录已完成"), "{page}");
+    assert!(page.contains("Signed in to ChatGPT"), "{page}");
     assert!(
         page.contains("thinkwatch://chatgpt/login"),
         "登录完成后要能回到应用：{page}"
@@ -515,7 +515,7 @@ async fn a_callback_that_arrives_twice_exchanges_the_code_once() {
     // 浏览器有时会把同一个跳转发两次。token 端点慢一点，让两次挤在一起
     let url = format!("{}?code=slow&state={}", s.redirect_uri, s.state);
     let ((_, one), (_, two)) = tokio::join!(browser(&url), browser(&url));
-    assert!(one.contains("ChatGPT 登录已完成"), "{one}");
+    assert!(one.contains("Signed in to ChatGPT"), "{one}");
     assert_eq!(one, two);
     assert_eq!(b.openai.token_forms.lock().unwrap().len(), 1);
 }
@@ -525,7 +525,7 @@ async fn the_callback_server_stops_once_the_login_is_settled() {
     let b = bed(|_| String::new()).await;
     let s = start_login(&b, json!({})).await;
     let (_, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
-    assert!(page.contains("ChatGPT 登录已完成"), "{page}");
+    assert!(page.contains("Signed in to ChatGPT"), "{page}");
     let addr = s
         .redirect_uri
         .trim_start_matches("http://localhost:")
@@ -554,7 +554,7 @@ async fn a_callback_with_the_wrong_state_does_not_end_the_login() {
 
     // 别的网页来试探这个端口：不理它，登录还在等
     let (_, page) = browser(&format!("{}?code=stolen&state=guess", s.redirect_uri)).await;
-    assert!(page.contains("登录链接已失效"), "{page}");
+    assert!(page.contains("This sign-in link has expired"), "{page}");
     let (_, v) = b
         .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
         .await;
@@ -567,7 +567,10 @@ async fn a_callback_with_the_wrong_state_does_not_end_the_login() {
         s.redirect_uri, s.state
     ))
     .await;
-    assert!(page.contains("ChatGPT 登录未完成"), "{page}");
+    assert!(
+        page.contains("The ChatGPT sign-in did not finish"),
+        "{page}"
+    );
     let (_, v) = b
         .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
         .await;
@@ -589,7 +592,10 @@ async fn a_rejected_code_fails_the_login_and_leaves_the_config_alone() {
     let before = b.file();
     let s = start_login(&b, json!({})).await;
     let (_, page) = browser(&format!("{}?code=bad&state={}", s.redirect_uri, s.state)).await;
-    assert!(page.contains("ChatGPT 登录未完成"), "{page}");
+    assert!(
+        page.contains("The ChatGPT sign-in did not finish"),
+        "{page}"
+    );
     assert!(page.contains("400"), "{page}");
     let (_, v) = b
         .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
@@ -614,7 +620,7 @@ async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
     .await;
     let s = start_login(&b, json!({"name": "chatgpt"})).await;
     let (_, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
-    assert!(page.contains("ChatGPT 登录已完成"), "{page}");
+    assert!(page.contains("Signed in to ChatGPT"), "{page}");
     let p = b.provider("chatgpt").unwrap();
     let o = p.oauth.as_ref().unwrap();
     assert_eq!(
@@ -783,7 +789,7 @@ async fn an_account_without_device_login_is_told_to_use_the_browser() {
         .await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert!(
-        v.to_string().contains("这台电脑"),
+        v.to_string().contains("Sign in on this computer"),
         "要告诉用户改用浏览器登录：{v}"
     );
     assert!(b.provider("chatgpt").is_none());

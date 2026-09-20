@@ -24,6 +24,7 @@ use tw_config::history::Origin;
 use tw_config::refs::{self, ProviderRef};
 
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_types::{Msg, msg};
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
@@ -51,7 +52,7 @@ async fn create_provider(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let p = to_provider(&req.provider, None).map_err(invalid)?;
+            let p = to_provider(&req.provider, None).map_err(|e| invalid(e.text))?;
             Ok(edit::upsert(text, edit::PROVIDERS, None, &mapping(&p)?)?)
         })
         .await
@@ -71,8 +72,8 @@ async fn update_provider(
                 .providers
                 .iter()
                 .find(|p| p.name == name)
-                .ok_or_else(|| not_found("上游", &name))?;
-            let p = to_provider(&req.provider, Some(existing)).map_err(invalid)?;
+                .ok_or_else(|| not_found("upstream", &name))?;
+            let p = to_provider(&req.provider, Some(existing)).map_err(|e| invalid(e.text))?;
             let mut out = edit::upsert(text, edit::PROVIDERS, Some(&name), &mapping(&p)?)?;
             if p.name != name {
                 // **和那一项在同一个版本里改** —— 分两次写的话，中间那一版
@@ -100,7 +101,7 @@ async fn delete_provider(
             let used = refs::provider_refs(cfg, &name);
             if !used.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "上游「{name}」仍被{}引用，请先解除引用再删除",
+                    "Upstream `{name}` is still referenced by {}; drop those references before deleting it.",
                     describe(&used)
                 )));
             }
@@ -113,8 +114,10 @@ async fn delete_provider(
         let endpoint = s.chatgpt.endpoints.revoke.clone();
         tokio::spawn(async move {
             match tw_gateway::chatgpt::revoke(&http, &endpoint, &refresh).await {
-                Ok(()) => tracing::info!(provider = %name, "已吊销 ChatGPT 登录凭据"),
-                Err(why) => tracing::warn!(provider = %name, "未能吊销 ChatGPT 登录凭据：{why}"),
+                Ok(()) => tracing::info!(provider = %name, "the ChatGPT sign-in was revoked"),
+                Err(why) => {
+                    tracing::warn!(provider = %name, "the ChatGPT sign-in could not be revoked: {why}")
+                }
             }
         });
     }
@@ -154,7 +157,7 @@ async fn preview_provider(
         protocol: req
             .protocol
             .as_deref()
-            .map(|v| slug("接口协议", v))
+            .map(|v| slug("protocol", v))
             .transpose()
             .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?,
         ..p.clone()
@@ -185,7 +188,7 @@ async fn test_provider(
             cfg.providers
                 .iter()
                 .find(|p| p.name == n)
-                .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))?,
+                .ok_or_else(|| crate::no_such_upstream(n))?,
         ),
         None => None,
     };
@@ -214,7 +217,8 @@ async fn test_provider(
                 Some(a) => Some(a.to_string()),
                 None => {
                     return Ok(Json(failed(
-                        "OAuth 凭据需要保存后才能检测。如需立即检测，请同时填写 access token"
+                        "An OAuth credential has to be saved before it can be checked. To check it now, \
+                 fill in an access token as well."
                             .to_string(),
                     )));
                 }
@@ -254,7 +258,7 @@ async fn provider_models(
         .providers
         .iter()
         .find(|p| p.name == name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{name}」的上游")))?;
+        .ok_or_else(|| crate::no_such_upstream(&name))?;
     Ok(Json(models_view(&s, p, s.gateway.models.listing(p))))
 }
 
@@ -265,13 +269,13 @@ async fn refresh_models(
 ) -> Result<Json<tw_api::ProviderModelsView>, Fail> {
     let listing = tw_gateway::models::refresh_one(&s.gateway, &name)
         .await
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{name}」的上游")))?;
+        .ok_or_else(|| crate::no_such_upstream(&name))?;
     let cfg = s.config();
     let p = cfg
         .providers
         .iter()
         .find(|p| p.name == name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{name}」的上游")))?;
+        .ok_or_else(|| crate::no_such_upstream(&name))?;
     Ok(Json(models_view(&s, p, listing)))
 }
 
@@ -320,12 +324,16 @@ fn models_view(
 fn to_provider(
     input: &tw_api::ProviderInput,
     existing: Option<&tw_config::Provider>,
-) -> Result<tw_config::Provider, String> {
-    let name = checked_name(&input.name, "上游")?;
+) -> Result<tw_config::Provider, Msg> {
+    let name = checked_name(&input.name, "upstream")?;
     let base_url = match (&input.base_url, existing) {
         (Some(u), _) => u.trim().to_string(),
         (None, Some(e)) => e.base_url.clone(),
-        (None, None) => return Err("接口地址不能为空".to_string()),
+        (None, None) => {
+            return Err(msg!(
+                "control.base_url_empty" => "The endpoint address cannot be empty."
+            ));
+        }
     };
     let key = match (&input.key, existing) {
         (tw_api::SecretChange::Keep, Some(e)) => e.key.clone(),
@@ -333,7 +341,7 @@ fn to_provider(
         (tw_api::SecretChange::Set { value }, _) => {
             let v = value.trim();
             if v.is_empty() {
-                return Err("API 密钥不能为空".to_string());
+                return Err(msg!("control.api_key_empty" => "The API key cannot be empty."));
             }
             Some(tw_config::Secret::new(v))
         }
@@ -349,11 +357,13 @@ fn to_provider(
                 None => existing
                     .and_then(|e| e.headers.get(&name))
                     .map(|x| x.value.clone())
-                    .ok_or_else(|| format!("请求头「{name}」缺少值"))?,
+                    .ok_or_else(|| {
+                    msg!("control.header_no_value", header = name.clone() => "Header `{header}` has no value.")
+                })?,
             };
             Ok(tw_config::Header { name, value })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, Msg>>()?;
     let oauth = match (&input.oauth, existing) {
         (tw_api::OAuthChange::Keep, Some(e)) => e.oauth.clone(),
         (tw_api::OAuthChange::Keep, None) | (tw_api::OAuthChange::None, _) => None,
@@ -396,7 +406,7 @@ fn to_provider(
         protocol: input
             .protocol
             .as_deref()
-            .map(|v| slug("接口协议", v))
+            .map(|v| slug("protocol", v))
             .transpose()?,
         models: input
             .models
@@ -407,24 +417,24 @@ fn to_provider(
         billing: input
             .billing
             .as_deref()
-            .map(|v| slug("计费方式", v))
+            .map(|v| slug("billing mode", v))
             .transpose()?,
         redact: input
             .redact
             .as_ref()
             .map(|ks| {
                 ks.iter()
-                    .map(|k| slug("脱敏类别", k))
+                    .map(|k| slug("redaction class", k))
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?,
         trust: input
             .trust
             .as_deref()
-            .map(|v| slug("信任级别", v))
+            .map(|v| slug("trust level", v))
             .transpose()?,
         proxy: input.proxy.trim().to_string(),
-        on_proxy_fail: slug("代理不可用时的处理", &input.on_proxy_fail)?,
+        on_proxy_fail: slug("setting for an unusable proxy", &input.on_proxy_fail)?,
         models_only: input
             .models_only
             .as_ref()
@@ -434,7 +444,9 @@ fn to_provider(
     };
     // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时
     // 报一条指着 YAML 的错误
-    provider.check_credential().map_err(|e| e.to_string())?;
+    provider
+        .check_credential()
+        .map_err(|e| msg!("control.bad_credential", detail = e => "{detail}"))?;
     Ok(provider)
 }
 
@@ -447,7 +459,7 @@ async fn create_proxy(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let px = to_proxy(&req.proxy, None).map_err(invalid)?;
+            let px = to_proxy(&req.proxy, None).map_err(|e| invalid(e.text))?;
             Ok(edit::upsert(text, edit::PROXIES, None, &mapping(&px)?)?)
         })
         .await
@@ -467,8 +479,8 @@ async fn update_proxy(
                 .proxies
                 .iter()
                 .find(|p| p.name == name)
-                .ok_or_else(|| not_found("代理", &name))?;
-            let px = to_proxy(&req.proxy, Some(existing)).map_err(invalid)?;
+                .ok_or_else(|| not_found("proxy", &name))?;
+            let px = to_proxy(&req.proxy, Some(existing)).map_err(|e| invalid(e.text))?;
             let mut out = edit::upsert(text, edit::PROXIES, Some(&name), &mapping(&px)?)?;
             if px.name != name {
                 out = refs::rename_proxy(&out, cfg, &name, &px.name)?;
@@ -491,7 +503,7 @@ async fn delete_proxy(
             let users = refs::proxy_users(cfg, &name);
             if !users.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "代理「{name}」仍被上游{}使用，请先解除关联再删除",
+                    "Proxy `{name}` is still used by upstream {}; unlink those before deleting it.",
                     quoted(&users)
                 )));
             }
@@ -509,12 +521,12 @@ async fn test_proxy(
 ) -> Result<Json<tw_api::L1Result>, Fail> {
     let cfg = s.config();
     let existing = match req.current.as_deref() {
-        Some(n) => Some(
-            cfg.proxies
-                .iter()
-                .find(|p| p.name == n)
-                .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("未找到名为「{n}」的代理")))?,
-        ),
+        Some(n) => Some(cfg.proxies.iter().find(|p| p.name == n).ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!("control.proxy_not_found", proxy = n => "There is no proxy named `{proxy}`."),
+            )
+        })?),
         None => None,
     };
     let px = to_proxy(&req.proxy, existing).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
@@ -528,17 +540,23 @@ async fn test_proxy(
 fn to_proxy(
     input: &tw_api::ProxyInput,
     existing: Option<&tw_config::Proxy>,
-) -> Result<tw_config::Proxy, String> {
-    let name = checked_name(&input.name, "代理")?;
+) -> Result<tw_config::Proxy, Msg> {
+    let name = checked_name(&input.name, "proxy")?;
     if matches!(name.as_str(), tw_config::DIRECT | tw_config::SYSTEM) {
-        return Err(format!("「{name}」是内置选项的名称，请使用其他名称"));
+        return Err(msg!(
+            "control.name_is_builtin", name = name =>
+            "`{name}` is the name of a built-in choice; use a different one."
+        ));
     }
     let addr = input.addr.trim().to_string();
     let port_ok = addr
         .rsplit_once(':')
         .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0));
     if !port_ok {
-        return Err(format!("代理地址「{addr}」应写成 主机:端口 的形式"));
+        return Err(msg!(
+            "control.proxy_addr_form", addr = addr =>
+            "The proxy address `{addr}` is written as host:port."
+        ));
     }
     let auth = match &input.auth {
         // 没动认证：沿用原来那一份，**原值不经过界面**
@@ -547,11 +565,13 @@ fn to_proxy(
         tw_api::ProxyAuthInput::Set { user, pass } => {
             let user = user.trim();
             if user.is_empty() {
-                return Err("用户名不能为空".to_string());
+                return Err(msg!("control.user_empty" => "The user name cannot be empty."));
             }
             // `${` 在配置里表示「从环境变量读」
             if pass.contains("${") {
-                return Err("密码中不能包含 ${".to_string());
+                return Err(
+                    msg!("control.pass_has_expansion" => "A password cannot contain `${{`."),
+                );
             }
             Some(tw_config::proxy::ProxyAuth {
                 user: user.to_string(),
@@ -561,7 +581,7 @@ fn to_proxy(
     };
     Ok(tw_config::Proxy {
         name,
-        kind: slug("代理类型", &input.kind)?,
+        kind: slug("proxy kind", &input.kind)?,
         addr,
         auth,
     })
@@ -569,26 +589,37 @@ fn to_proxy(
 
 // ─────────────────────────────────────────────────────────── 共用
 
-pub(crate) fn checked_name(raw: &str, what: &str) -> Result<String, String> {
+/// 名字得有、而且不能带首尾空白。`what` 是这种资源的英文名（`upstream`、
+/// `proxy`…），进句子也进 `args` —— 界面照码说话时用它挑自己的词。
+pub(crate) fn checked_name(raw: &str, what: &'static str) -> Result<String, Msg> {
     if raw.trim().is_empty() {
-        return Err(format!("{what}名称不能为空"));
+        return Err(msg!(
+            "control.name_empty", kind = what => "An {kind} needs a name."
+        ));
     }
     if raw.trim() != raw {
-        return Err(format!("{what}名称首尾不能包含空白"));
+        return Err(msg!(
+            "control.name_whitespace", kind = what =>
+            "An {kind} name cannot start or end with whitespace."
+        ));
     }
     Ok(raw.to_string())
 }
 
 /// 界面上的一个选项值 → 配置里的枚举。**和 YAML 里写的词是同一套**。
-fn slug<T: serde::de::DeserializeOwned>(what: &str, v: &str) -> Result<T, String> {
-    serde_yaml_ng::from_value(Value::String(v.to_string()))
-        .map_err(|_| format!("{what}「{v}」不受支持"))
+fn slug<T: serde::de::DeserializeOwned>(what: &'static str, v: &str) -> Result<T, Msg> {
+    serde_yaml_ng::from_value(Value::String(v.to_string())).map_err(|_| {
+        msg!(
+            "control.unsupported_value", kind = what, value = v =>
+            "`{value}` is not a {kind} we support."
+        )
+    })
 }
 
 pub(crate) fn mapping<T: serde::Serialize>(v: &T) -> Result<serde_yaml_ng::Mapping, ApplyError> {
     match serde_yaml_ng::to_value(v) {
         Ok(Value::Mapping(m)) => Ok(m),
-        Ok(_) => Err(invalid("无法序列化为映射".to_string())),
+        Ok(_) => Err(invalid("it does not serialize to a mapping".to_string())),
         Err(e) => Err(invalid(e.to_string())),
     }
 }
@@ -604,13 +635,13 @@ pub(crate) fn not_found(what: &'static str, name: &str) -> ApplyError {
     })
 }
 
-/// 「「relay-hk」、「relay-sg」」
+/// `` `relay-hk`, `relay-sg` ``
 pub(crate) fn quoted(names: &[String]) -> String {
     names
         .iter()
-        .map(|n| format!("「{n}」"))
+        .map(|n| format!("`{n}`"))
         .collect::<Vec<_>>()
-        .join("、")
+        .join(", ")
 }
 
 /// 「路由「默认」的规则「长上下文」、策略组「pool」」
@@ -619,12 +650,12 @@ fn describe(refs: &[ProviderRef]) -> String {
         .map(|r| match r {
             ProviderRef::RuleTarget { route, rule }
             | ProviderRef::RuleCondition { route, rule } => {
-                format!("路由「{route}」的规则「{rule}」")
+                format!("rule `{rule}` of route `{route}`")
             }
-            ProviderRef::Group { group } => format!("策略组「{group}」"),
+            ProviderRef::Group { group } => format!("group `{group}`"),
         })
         .collect::<Vec<_>>()
-        .join("、")
+        .join(", ")
 }
 
 pub(crate) fn reference_view(r: &ProviderRef) -> tw_api::ReferenceView {

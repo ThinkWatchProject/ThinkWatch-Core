@@ -197,7 +197,7 @@ async fn the_default_key_can_be_neither_deleted_nor_disabled() {
     let b = bed(BASE);
     let (st, v) = call(&b.app, "DELETE", "/keys/default", serde_json::Value::Null).await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
-    assert!(v.to_string().contains("默认密钥"), "{v}");
+    assert!(v.to_string().contains("default key"), "{v}");
 
     let (st, v) = call(
         &b.app,

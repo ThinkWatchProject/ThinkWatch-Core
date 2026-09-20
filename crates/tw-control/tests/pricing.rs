@@ -168,7 +168,10 @@ async fn a_sheet_is_created_chosen_renamed_and_deleted_only_once_nobody_uses_it(
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.as_str().unwrap().contains("relay-hk"), "{body}");
+    assert!(
+        body["text"].as_str().unwrap().contains("relay-hk"),
+        "{body}"
+    );
 
     // 上游改回默认价目表之后才能删；删完不留空段
     let (st, body) = call(
@@ -277,7 +280,10 @@ async fn an_upstream_cannot_choose_a_sheet_that_does_not_exist() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.as_str().unwrap().contains("没有这张"), "{body}");
+    assert!(
+        body["text"].as_str().unwrap().contains("没有这张"),
+        "{body}"
+    );
     assert_eq!(b.file(), BASE);
 }
 
@@ -298,7 +304,10 @@ async fn a_sheet_with_a_half_written_override_is_refused_with_the_reason() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.as_str().unwrap().contains("长上下文"), "{body}");
+    assert!(
+        body["text"].as_str().unwrap().contains("长上下文"),
+        "{body}"
+    );
     assert_eq!(b.file(), BASE);
 }
 
@@ -483,7 +492,7 @@ async fn a_failed_refresh_keeps_the_table_and_reports_why() {
         let b = bed_with(BASE, Updater::new(url, Schedule::default()));
         let (st, r) = call(&b.app, "POST", "/pricing/refresh", serde_json::json!(null)).await;
         assert_eq!(st, StatusCode::BAD_GATEWAY, "{r}");
-        assert!(r.as_str().unwrap().contains(says), "{r}");
+        assert!(r["text"].as_str().unwrap().contains(says), "{r}");
         let (_, status) = call(&b.app, "GET", "/pricing", serde_json::json!(null)).await;
         assert_eq!(status["source"], "builtin");
         assert!(status["error"].as_str().unwrap().contains(says), "{status}");

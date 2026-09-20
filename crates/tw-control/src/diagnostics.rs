@@ -32,55 +32,58 @@ fn line(out: &mut String, k: &str, v: impl std::fmt::Display) {
 pub async fn bundle(State(s): State<ControlState>) -> String {
     let mut out = String::new();
     let cfg = s.config();
-    let _ = writeln!(out, "# ThinkWatch 诊断包\n");
+    let _ = writeln!(out, "# ThinkWatch diagnostics bundle\n");
     let _ = writeln!(
         out,
-        "> 本文件中的密钥、地址和请求正文均已脱敏。ThinkWatch 作为网关可以接触到所有 API \
-         密钥，发送本文件之前，请再次检查其中是否含有敏感信息。\n"
+        "> The keys, addresses and request bodies in this file are redacted. ThinkWatch is a \
+         gateway and can see every API key you own, so read this through once more before you \
+         send it anywhere.\n"
     );
 
     // ---- 版本和平台
-    let _ = writeln!(out, "## 版本\n\n| | |\n|---|---|");
+    let _ = writeln!(out, "## Versions\n\n| | |\n|---|---|");
     line(&mut out, "core", env!("CARGO_PKG_VERSION"));
-    line(&mut out, "控制面 API", tw_api::CONTROL_API_VERSION);
-    line(&mut out, "配置 schema", cfg.version);
+    line(&mut out, "Control-plane API", tw_api::CONTROL_API_VERSION);
+    line(&mut out, "Config schema", cfg.version);
     {
         // **生效的那一份，不是内置快照的日期** —— 刷新过之后两者不同，而对账
         // 对不上时要问的正是「按哪天的价格算的」
         let book = s.gateway.pricing.load();
         let t = book.table();
         let source = match t.source {
-            tw_pricing::TableSource::Builtin => "内置",
-            tw_pricing::TableSource::Fetched => "联网更新",
-            tw_pricing::TableSource::Empty => "未加载",
+            tw_pricing::TableSource::Builtin => "built in",
+            tw_pricing::TableSource::Fetched => "fetched",
+            tw_pricing::TableSource::Empty => "not loaded",
         };
         line(
             &mut out,
-            "默认价目表",
-            format!("{}（{source}，{} 个模型）", t.date, t.len()),
+            "Default price sheet",
+            format!("{} ({source}, {} models)", t.date, t.len()),
         );
-        line(&mut out, "自定义价目表", cfg.pricing.sheets.len());
+        line(&mut out, "Custom price sheets", cfg.pricing.sheets.len());
     }
-    line(&mut out, "平台", std::env::consts::OS);
-    line(&mut out, "架构", std::env::consts::ARCH);
+    line(&mut out, "Platform", std::env::consts::OS);
+    line(&mut out, "Architecture", std::env::consts::ARCH);
     line(
         &mut out,
-        "运行时长",
-        format!("{} 秒", s.started.elapsed().as_secs()),
+        "Uptime",
+        format!("{} s", s.started.elapsed().as_secs()),
     );
 
     // ---- 监听
-    let _ = writeln!(out, "\n## 监听\n\n| | |\n|---|---|");
+    let _ = writeln!(out, "\n## Listening\n\n| | |\n|---|---|");
     line(
         &mut out,
-        "网关",
-        s.gateway_addr.as_deref().unwrap_or("未启动（安全模式）"),
+        "Gateway",
+        s.gateway_addr
+            .as_deref()
+            .unwrap_or("not started (safe mode)"),
     );
-    line(&mut out, "绑定", format!("{:?}", cfg.listen.gateway.bind));
-    line(&mut out, "端口", cfg.listen.gateway.port);
+    line(&mut out, "Bind", format!("{:?}", cfg.listen.gateway.bind));
+    line(&mut out, "Port", cfg.listen.gateway.port);
     line(
         &mut out,
-        "控制面",
+        "Control plane",
         s.config_path()
             .parent()
             .map(|p| p.display().to_string())
@@ -90,7 +93,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 上游
     let _ = writeln!(
         out,
-        "\n## 上游（{} 个）\n\n| 名称 | 接口地址 | 协议 | 代理 | 状态 | 模型 | 脱敏 | 信任级别 | 价目表 |\n|---|---|---|---|---|---|---|---|---|",
+        "\n## Upstreams ({})\n\n| Name | Endpoint | Protocol | Proxy | State | Models | Redaction | Trust | Price sheet |\n|---|---|---|---|---|---|---|---|---|",
         cfg.providers.len()
     );
     for p in &cfg.providers {
@@ -102,54 +105,54 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
             tw_secret::redact_url(&p.base_url),
             p.effective_protocol()
                 .map(|x| format!("{x:?}"))
-                .unwrap_or_else(|| "未识别".into()),
+                .unwrap_or_else(|| "unrecognized".into()),
             p.proxy,
             if p.disabled {
-                "已停用"
+                "disabled"
             } else if s.health().is_available(&p.name) {
-                "正常"
+                "ok"
             } else {
-                "熔断中"
+                "circuit open"
             },
             {
                 // 「这家为什么收不到某个模型的请求」多半答在这一栏
                 let l = s.gateway.models.listing(p);
                 let served = s.gateway.catalog.load().count_for(&p.name);
                 let scope = if p.models_only.is_some() {
-                    "，已限定启用范围"
+                    ", scoped"
                 } else {
                     ""
                 };
                 match l.source {
                     tw_gateway::models::Source::Discovered => {
-                        format!("{served}（上游提供 {}{scope}）", l.models.len())
+                        format!("{served} (upstream offers {}{scope})", l.models.len())
                     }
                     tw_gateway::models::Source::Manual => {
-                        format!("{served}（手动清单 {}{scope}）", l.models.len())
+                        format!("{served} (manual list of {}{scope})", l.models.len())
                     }
                     tw_gateway::models::Source::None => match &l.error {
-                        Some(why) => format!("未知：{why}"),
-                        None => "未知".to_string(),
+                        Some(why) => format!("unknown: {why}"),
+                        None => "unknown".to_string(),
                     },
                 }
             },
             {
                 let k = p.effective_redact();
                 if k.is_empty() {
-                    "不脱敏".to_string()
+                    "none".to_string()
                 } else {
                     k.iter().map(|x| x.slug()).collect::<Vec<_>>().join(" ")
                 }
             },
             p.effective_trust().label(),
-            p.pricing.as_deref().unwrap_or("默认价目表"),
+            p.pricing.as_deref().unwrap_or("the default sheet"),
         );
     }
 
     // ---- 客户端条目（**只有名字和脱敏后的 key**）
     let _ = writeln!(
         out,
-        "\n## 网关密钥（{} 个）\n\n| 名称 | 密钥 |\n|---|---|",
+        "\n## Gateway keys ({})\n\n| Name | Key |\n|---|---|",
         cfg.clients.len()
     );
     for c in &cfg.clients {
@@ -157,25 +160,32 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     }
 
     // ---- 安全三态
-    let _ = writeln!(out, "\n## 安全\n\n| | |\n|---|---|");
-    line(&mut out, "出站脱敏", cfg.security.redact.label());
-    line(&mut out, "工具调用审查", cfg.security.inspect_tools.label());
-    line(&mut out, "配置面扫描", cfg.security.scan_configs.label());
+    let _ = writeln!(out, "\n## Security\n\n| | |\n|---|---|");
+    line(&mut out, "Outbound redaction", cfg.security.redact.label());
+    line(
+        &mut out,
+        "Tool-call inspection",
+        cfg.security.inspect_tools.label(),
+    );
+    line(&mut out, "Config scan", cfg.security.scan_configs.label());
 
     // ---- 存储和最近的失败
     match &s.store {
         None => {
-            let _ = writeln!(out, "\n## 请求记录\n\n未启动，此期间的请求未被记录。");
+            let _ = writeln!(
+                out,
+                "\n## Request recording\n\nNot running, so nothing from this period was recorded."
+            );
         }
         Some(store) => {
             let g = store.lock().await;
-            let _ = writeln!(out, "\n## 请求记录\n\n| | |\n|---|---|");
-            line(&mut out, "磁盘状态", g.level().label());
-            line(&mut out, "请求条数", g.db().count().unwrap_or(0));
+            let _ = writeln!(out, "\n## Request recording\n\n| | |\n|---|---|");
+            line(&mut out, "Disk state", g.level().label());
+            line(&mut out, "Requests recorded", g.db().count().unwrap_or(0));
             line(
                 &mut out,
-                "请求体存储大小",
-                format!("{} 字节", g.blobs().total_bytes()),
+                "Request bodies on disk",
+                format!("{} bytes", g.blobs().total_bytes()),
             );
 
             let recent = g.db().recent(200).unwrap_or_default();
@@ -186,14 +196,17 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                 .collect();
             let _ = writeln!(
                 out,
-                "\n### 最近失败的请求（{} 条，取自最近 {} 条请求）\n",
+                "\n### Recent failures ({} of the last {} requests)\n",
                 failed.len(),
                 recent.len()
             );
             if failed.is_empty() {
-                let _ = writeln!(out, "无。");
+                let _ = writeln!(out, "None.");
             } else {
-                let _ = writeln!(out, "| 时间 | 上游 | 状态 | 错误 |\n|---|---|---|---|");
+                let _ = writeln!(
+                    out,
+                    "| Time | Upstream | Status | Error |\n|---|---|---|---|"
+                );
                 for r in failed {
                     let _ = writeln!(
                         out,
@@ -213,7 +226,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     }
 
     // ---- 配置原文（脱敏后）
-    let _ = writeln!(out, "\n## config.yaml（已脱敏）\n\n```yaml");
+    let _ = writeln!(out, "\n## config.yaml (redacted)\n\n```yaml");
     match std::fs::read_to_string(s.config_path()) {
         // **`mask_body` 一个人不够。**它认的是值的形状，而配置里有一
         // 类密钥没有形状：自建中转那把普通样子的 key、OAuth 的 refresh
@@ -225,14 +238,14 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
             let _ = writeln!(out, "{}", tw_secret::mask_config_yaml(&text));
         }
         Err(e) => {
-            let _ = writeln!(out, "# 无法读取：{e}");
+            let _ = writeln!(out, "# could not be read: {e}");
         }
     }
     let _ = writeln!(out, "```");
 
     let _ = writeln!(
         out,
-        "\n---\n\n本文件不包含请求体和响应体，如有需要，请在请求详情中查看。"
+        "\n---\n\nThis file carries no request or response bodies. They are in the request detail view."
     );
     out
 }

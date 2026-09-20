@@ -13,14 +13,17 @@ use tw_adopt::clients::{Gateway, adoptable, manual_only};
 use tw_adopt::{detect, plan};
 
 use crate::ControlState;
+use tw_types::msg;
 
-type Fail = (StatusCode, String);
+use crate::{Fail, fail};
 
 fn find(id: &str) -> Result<tw_adopt::clients::Client, Fail> {
-    adoptable()
-        .into_iter()
-        .find(|c| c.id == id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未知的客户端 {id}")))
+    adoptable().into_iter().find(|c| c.id == id).ok_or_else(|| {
+        fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.client_unknown", client = id => "`{client}` is not a client we know."),
+        )
+    })
 }
 
 /// 客户端该连的地址。
@@ -49,9 +52,12 @@ fn key_for(
             .find(|c| c.name == n)
             .cloned()
             .ok_or_else(|| {
-                (
+                fail(
                     StatusCode::NOT_FOUND,
-                    format!("config.yaml 中没有名为「{n}」的网关密钥"),
+                    msg!(
+                        "control.key_not_found", key = n =>
+                        "config.yaml has no gateway key named `{key}`."
+                    ),
                 )
             });
     }
@@ -59,9 +65,13 @@ fn key_for(
         return Ok(c.clone());
     }
     cfg.default_client().cloned().ok_or_else(|| {
-        (
+        fail(
             StatusCode::CONFLICT,
-            "config.yaml 中尚无网关密钥，请先创建网关密钥，再接管客户端".to_string(),
+            msg!(
+                "control.no_keys" =>
+                "config.yaml has no gateway key yet. Create one before pointing a client at the \
+                 gateway."
+            ),
         )
     })
 }
@@ -122,7 +132,12 @@ async fn ensure_key(
             )?)
         })
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("无法创建网关密钥：{e}")))?;
+        .map_err(|e| {
+            fail(
+                StatusCode::CONFLICT,
+                msg!("control.key_create_failed", detail = e => "The gateway key could not be created: {detail}"),
+            )
+        })?;
     Ok(Gateway {
         base: gateway_base(s),
         key: Some(key),
@@ -149,7 +164,12 @@ async fn bind(s: &ControlState, key: &str, client: &str) -> Result<(), Fail> {
             )?)
         })
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("无法记录密钥归属：{e}")))?;
+        .map_err(|e| {
+            fail(
+                StatusCode::CONFLICT,
+                msg!("control.key_bind_failed", detail = e => "The key's owner could not be recorded: {detail}"),
+            )
+        })?;
     Ok(())
 }
 
@@ -216,7 +236,7 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
 /// **界面上永远不显示真正的密钥**，diff 里也不行 —— 用户会截图这一屏
 /// 来问「这样对吗」。落盘写的仍然是真值，[`tw_api::PlanView`] 上那两个
 /// 字段的文档里写清了这一点。
-const MASK: &str = "«config.yaml 中的网关密钥»";
+const MASK: &str = "«the gateway key from config.yaml»";
 
 fn mask(text: &str, key: Option<&str>) -> String {
     match key {
@@ -298,7 +318,7 @@ fn bad(e: plan::PlanError) -> Fail {
         plan::PlanError::ForeignSidecar { .. } => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
-    (code, e.to_string())
+    fail(code, msg!("control.adopt_failed", detail = e => "{detail}"))
 }
 
 /// 落盘。**用户在 diff 上点过确认之后才该到这里。**
@@ -346,7 +366,12 @@ pub async fn restore(
 // ---------------------------------------------------------------- MCP 矩阵
 
 fn mcp_target(id: &str) -> Result<tw_adopt::mcp::Target, Fail> {
-    tw_adopt::mcp::target(id).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+    tw_adopt::mcp::target(id).map_err(|e| {
+        fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.mcp_target_unknown", detail = e => "{detail}"),
+        )
+    })
 }
 
 fn mcp_err(e: tw_adopt::mcp::McpError) -> Fail {
@@ -358,7 +383,7 @@ fn mcp_err(e: tw_adopt::mcp::McpError) -> Fail {
         tw_adopt::mcp::McpError::NotCopyable { .. } => StatusCode::NOT_IMPLEMENTED,
         _ => StatusCode::BAD_REQUEST,
     };
-    (code, e.to_string())
+    fail(code, msg!("control.mcp_failed", detail = e => "{detail}"))
 }
 
 /// 能写和不能写的分别是哪些。
@@ -386,7 +411,10 @@ fn mcp_plan(s: &ControlState, req: &tw_api::McpOpRequest) -> Result<tw_adopt::mc
             let v = tw_adopt::mcp::read_server(&from, &s.home, &req.name).map_err(mcp_err)?;
             tw_adopt::mcp::plan_copy(&to, &s.home, &req.name, &v).map_err(mcp_err)
         }
-        other => Err((StatusCode::BAD_REQUEST, format!("不支持的操作 {other}"))),
+        other => Err(fail(
+            StatusCode::BAD_REQUEST,
+            msg!("control.unsupported_action", action = other => "`{action}` is not an action we support."),
+        )),
     }
 }
 

@@ -53,7 +53,7 @@ pub fn spawn(state: crate::ControlState) {
                 // 换发了 refresh token：成没成都要报（「成功」只报一次，由网关那边管）
                 state.gateway.report_rotation(&r.provider, ok, &detail);
             } else if !ok {
-                tracing::warn!(provider = %r.provider, "access token 未能写回 config.yaml：{detail}");
+                tracing::warn!(provider = %r.provider, "the access token could not be written back to config.yaml: {detail}");
             }
         }
     });
@@ -67,7 +67,10 @@ async fn persist(state: &crate::ControlState, r: &Renewed) -> (bool, String) {
             Ok(version) => {
                 return (
                     true,
-                    format!("已写回 {}（版本 {version}）", state.cfg.path().display()),
+                    format!(
+                        "written back to {} (version {version})",
+                        state.cfg.path().display()
+                    ),
                 );
             }
             Err(why) => {
@@ -81,7 +84,9 @@ async fn persist(state: &crate::ControlState, r: &Renewed) -> (bool, String) {
     (
         false,
         format!(
-            "{last}。请在重启前处理：检查该文件的权限，以及是否被其他程序占用。问题解决后，下一次轮换会自动写回；如仍无法写回，请重新授权以获取新凭据"
+            "{last}. Deal with this before a restart: check the file's permissions, and whether \
+             another program is holding it. Once that is fixed the next rotation writes itself \
+             back; if it still cannot, authorize again for a fresh credential."
         ),
     )
 }
@@ -90,7 +95,7 @@ async fn once(state: &crate::ControlState, r: &Renewed) -> Result<String, String
     let cur = state
         .cfg
         .current()
-        .map_err(|e| format!("无法读取 config.yaml：{e}"))?;
+        .map_err(|e| format!("config.yaml could not be read: {e}"))?;
     // 打完补丁的文本自己会先被解析一遍（`patch_oauth_tokens` 里），
     // 所以到这儿的一定是一份能加载的配置
     let patched = tw_config::patch_oauth_tokens(

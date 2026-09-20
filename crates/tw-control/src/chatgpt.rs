@@ -35,6 +35,7 @@ use tw_config::history::Origin;
 use tw_gateway::chatgpt;
 
 use crate::{ControlState, Fail, fail};
+use tw_types::msg;
 
 /// 登录要在多久之内完成。和 Codex 一样是 15 分钟
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
@@ -181,7 +182,7 @@ impl Want {
             Some(other) => {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
-                    format!("不支持的登录方式「{other}」"),
+                    msg!("control.unknown_signin_mode", mode = other => "`{mode}` is not a sign-in mode we support."),
                 ));
             }
         };
@@ -194,7 +195,7 @@ impl Want {
         {
             return Err(fail(
                 StatusCode::BAD_REQUEST,
-                format!("代理「{proxy}」不存在"),
+                msg!("control.proxy_not_found", proxy = proxy => "There is no proxy named `{proxy}`."),
             ));
         }
         if let Some(p) = cfg.providers.iter().find(|p| p.name == name)
@@ -202,7 +203,11 @@ impl Want {
         {
             return Err(fail(
                 StatusCode::CONFLICT,
-                format!("已有名为「{name}」的上游，且不是 ChatGPT 账号上游，请使用其他名称"),
+                msg!(
+                    "control.name_taken_not_chatgpt", name = name =>
+                    "There is already an upstream named `{name}`, and it is not a ChatGPT account. \
+                     Use a different name."
+                ),
             ));
         }
         let return_to = match given(&req.return_to) {
@@ -210,7 +215,11 @@ impl Want {
             Some(_) => {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
-                    "登录完成后的跳转地址只能使用应用自己的协议，不能是网页地址",
+                    msg!(
+                        "control.redirect_must_be_app_scheme" =>
+                        "The address to return to after signing in has to use the app's own scheme, not a \
+                         web address."
+                    ),
                 ));
             }
             None => None,
@@ -264,10 +273,14 @@ async fn start_browser(
                 .iter()
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
-                .join("、");
+                .join(", ");
             fail(
                 StatusCode::CONFLICT,
-                format!("登录回调端口 {ports} 均被占用。如果 Codex 正在登录，请先完成或关闭它"),
+                msg!(
+                "control.callback_ports_busy", ports = ports =>
+                "Every sign-in callback port ({ports}) is taken. If Codex is signing in, finish or \
+                 close it first."
+            ),
             )
         })?;
 
@@ -314,8 +327,12 @@ async fn start_device(
     want: Want,
 ) -> Result<(Current, tw_api::ChatgptLogin), Fail> {
     let issuer = s.chatgpt.endpoints.issuer.clone();
-    let http =
-        client_for(s, &want.name, &want.proxy).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    let http = client_for(s, &want.name, &want.proxy).map_err(|e| {
+        fail(
+            StatusCode::BAD_GATEWAY,
+            msg!("control.upstream_call_failed", detail = e => "{detail}"),
+        )
+    })?;
     let asked = serde_json::json!({ "client_id": chatgpt::CLIENT_ID });
     let resp = send(
         &http,
@@ -329,18 +346,29 @@ async fn start_device(
     if status == StatusCode::NOT_FOUND {
         return Err(fail(
             StatusCode::CONFLICT,
-            "这个账号还不能用设备码登录，请改用在这台电脑上登录",
+            msg!(
+                "control.device_code_unavailable" =>
+                "This account cannot sign in with a device code yet. Sign in on this computer \
+                 instead."
+            ),
         ));
     }
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(fail(
             StatusCode::BAD_GATEWAY,
-            format!("换设备码时返回 {}：{}", status.as_u16(), brief(&text)),
+            msg!(
+                "control.device_code_failed", status = status.as_u16(), detail = brief(&text) =>
+                "Asking for a device code answered {status}: {detail}"
+            ),
         ));
     }
-    let code: DeviceCode =
-        serde_json::from_str(&text).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
+    let code: DeviceCode = serde_json::from_str(&text).map_err(|e| {
+        fail(
+            StatusCode::BAD_GATEWAY,
+            msg!("control.upstream_call_failed", detail = e => "{detail}"),
+        )
+    })?;
     let id = chatgpt::new_state();
     let user_code = code.user_code.clone();
     Ok((
@@ -406,7 +434,7 @@ async fn await_device(
     while tokio::time::Instant::now() < deadline {
         let resp = match send(&http, reqwest::Method::POST, &url, &[], Some(&asked)).await {
             Ok(r) => r,
-            Err((_, why)) => return settle(&s, &id, Err(why)),
+            Err((_, why)) => return settle(&s, &id, Err(why.0.text)),
         };
         let status = resp.status();
         // 还没批：接着等
@@ -419,7 +447,11 @@ async fn await_device(
             return settle(
                 &s,
                 &id,
-                Err(format!("登录时返回 {}：{}", status.as_u16(), brief(&text))),
+                Err(format!(
+                    "signing in answered {}: {}",
+                    status.as_u16(),
+                    brief(&text)
+                )),
             );
         }
         let done = match serde_json::from_str::<Approved>(&text) {
@@ -434,7 +466,7 @@ async fn await_device(
                 )
                 .await
             }
-            Err(e) => Err(format!("批准登录的响应看不懂：{e}")),
+            Err(e) => Err(format!("the approval response could not be read: {e}")),
         };
         return settle(&s, &id, done);
     }
@@ -443,7 +475,7 @@ async fn await_device(
         status: "expired".into(),
         provider: None,
         plan: None,
-        error: Some("15 分钟内没有完成授权".into()),
+        error: Some("the authorization was not completed within 15 minutes".into()),
     });
     announce(&s, &id, "expired", None, None);
 }
@@ -459,7 +491,7 @@ fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Str
             error: None,
         },
         Err(why) => {
-            tracing::warn!("ChatGPT 登录未完成：{why}");
+            tracing::warn!("the ChatGPT sign-in did not finish: {why}");
             tw_api::ChatgptLoginStatus {
                 id: id.to_string(),
                 status: "failed".into(),
@@ -495,7 +527,10 @@ async fn status(
         .ok_or_else(|| {
             fail(
                 StatusCode::NOT_FOUND,
-                "没有这次登录，或者它已被新的登录替代",
+                msg!(
+                    "control.signin_gone" =>
+                    "There is no such sign-in, or a newer one replaced it."
+                ),
             )
         })
 }
@@ -505,15 +540,19 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> Result<Json<tw_api::ChatgptLoginStatus>, Fail> {
     let mut status = {
-        let g = s
-            .chatgpt
-            .current
-            .lock()
-            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let g = s.chatgpt.current.lock().map_err(|e| {
+            fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg!("control.internal", detail = e => "{detail}"),
+            )
+        })?;
         let c = g.as_ref().filter(|c| c.status.id == id).ok_or_else(|| {
             fail(
                 StatusCode::NOT_FOUND,
-                "没有这次登录，或者它已被新的登录替代",
+                msg!(
+                    "control.signin_gone" =>
+                    "There is no such sign-in, or a newer one replaced it."
+                ),
             )
         })?;
         if c.status.status != "pending" {
@@ -567,7 +606,7 @@ async fn serve_callback(flow: Arc<Flow>, listener: tokio::net::TcpListener) {
             status: "expired".into(),
             provider: None,
             plan: None,
-            error: Some("15 分钟内没有完成授权".into()),
+            error: Some("the authorization was not completed within 15 minutes".into()),
         });
         announce(&flow.s, &flow.id, "expired", None, None);
     }
@@ -580,8 +619,8 @@ async fn callback(
     // **state 对不上就当没来过**：可能是别的网页在试探这个端口，不能让它终止这次登录
     if q.get("state") != Some(&flow.state) {
         return Html(page(
-            "登录链接已失效",
-            "请回到 ThinkWatch 重新发起登录。",
+            "This sign-in link has expired",
+            "Go back to ThinkWatch and start again.",
             None,
         ));
     }
@@ -593,7 +632,7 @@ async fn callback(
         (Some(e), _) => {
             let detail = q.get("error_description").unwrap_or(e);
             Err(format!(
-                "授权页返回错误：{}",
+                "the authorization page returned an error: {}",
                 detail.chars().take(200).collect::<String>()
             ))
         }
@@ -608,17 +647,17 @@ async fn callback(
             )
             .await
         }
-        (None, None) => Err("回调中缺少授权码".to_string()),
+        (None, None) => Err("the callback carried no authorization code".to_string()),
     };
     let html = match &result {
         Ok(_) => page(
-            "ChatGPT 登录已完成",
-            "此页可以关闭。",
+            "Signed in to ChatGPT",
+            "This page can be closed.",
             flow.return_to.as_deref(),
         ),
         Err(why) => page(
-            "ChatGPT 登录未完成",
-            &format!("{why}。请回到 ThinkWatch 重新发起登录。"),
+            "The ChatGPT sign-in did not finish",
+            &format!("{why}. Go back to ThinkWatch and start again."),
             flow.return_to.as_deref(),
         ),
     };
@@ -667,7 +706,7 @@ async fn exchange_and_save(
                 && e.effective_protocol() != Some(Protocol::Chatgpt)
             {
                 return Err(crate::resources::invalid(format!(
-                    "已有名为「{name}」的上游，且不是 ChatGPT 账号上游"
+                    "there is already an upstream named `{name}`, and it is not a ChatGPT account"
                 )));
             }
             let mut p = existing.cloned().unwrap_or_else(|| tw_config::Provider {
@@ -705,7 +744,7 @@ async fn exchange_and_save(
             )?)
         })
         .await
-        .map_err(|e| format!("无法写入配置：{e}"))?;
+        .map_err(|e| format!("the configuration could not be written: {e}"))?;
     // 模型清单现在就问一次：不然要等到下一轮定时刷新，新上游的模型才出现
     let gateway = s.gateway.clone();
     let provider = name.clone();
@@ -788,13 +827,13 @@ fn page(title: &str, detail: &str, return_to: Option<&str>) -> String {
             let u = escape(url);
             (
                 format!(r#"<meta http-equiv="refresh" content="0;url={u}">"#),
-                format!(r#"<p><a href="{u}">返回 ThinkWatch</a></p>"#),
+                format!(r#"<p><a href="{u}">Back to ThinkWatch</a></p>"#),
             )
         }
         None => (String::new(), String::new()),
     };
     format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ThinkWatch</title>{redirect}<style>body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:420px;padding:32px;text-align:center}}h1{{margin:0 0 8px;font-size:20px;font-weight:600}}p{{margin:8px 0 0;color:#6e6e73}}a{{color:#0066cc}}@media (prefers-color-scheme:dark){{body{{background:#1d1d1f;color:#f5f5f7}}p{{color:#a1a1a6}}a{{color:#2997ff}}}}</style></head><body><main><h1>{}</h1><p>{}</p>{link}</main></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ThinkWatch</title>{redirect}<style>body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:#f5f5f7;color:#1d1d1f}}main{{max-width:420px;padding:32px;text-align:center}}h1{{margin:0 0 8px;font-size:20px;font-weight:600}}p{{margin:8px 0 0;color:#6e6e73}}a{{color:#0066cc}}@media (prefers-color-scheme:dark){{body{{background:#1d1d1f;color:#f5f5f7}}p{{color:#a1a1a6}}a{{color:#2997ff}}}}</style></head><body><main><h1>{}</h1><p>{}</p>{link}</main></body></html>"#,
         escape(title),
         escape(detail)
     )
@@ -827,11 +866,14 @@ async fn account_call(
         .providers
         .iter()
         .find(|p| p.name == name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("上游「{name}」不存在")))?;
+        .ok_or_else(|| crate::no_such_upstream(name))?;
     if p.effective_protocol() != Some(Protocol::Chatgpt) {
         return Err(fail(
             StatusCode::BAD_REQUEST,
-            format!("上游「{name}」不是 ChatGPT 账号上游"),
+            msg!(
+                "control.not_a_chatgpt_account", upstream = name =>
+                "Upstream `{upstream}` is not a ChatGPT account."
+            ),
         ));
     }
     let http = s.gateway.client_for(name);
@@ -839,7 +881,10 @@ async fn account_call(
     let no_credential = |e: String| {
         fail(
             StatusCode::BAD_GATEWAY,
-            format!("无法获取上游「{name}」的凭据：{e}"),
+            msg!(
+                "control.credentials_failed", upstream = name, detail = e =>
+                "The credential for upstream `{upstream}` could not be obtained: {detail}"
+            ),
         )
     };
     let headers = s
@@ -864,11 +909,19 @@ async fn account_call(
             .collect::<String>();
         return Err(fail(
             StatusCode::BAD_GATEWAY,
-            format!("ChatGPT 后端返回 {}：{body}", status.as_u16()),
+            msg!(
+                "control.chatgpt_backend_status", status = status.as_u16(), detail = body =>
+                "The ChatGPT backend answered {status}: {detail}"
+            ),
         ));
     }
     serde_json::from_str(&text)
-        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "ChatGPT 后端的响应不是 JSON"))
+        .map_err(|_| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                msg!("control.chatgpt_backend_not_json" => "The ChatGPT backend's response is not JSON."),
+            )
+        })
 }
 
 /// 发一次。**这几个接口也如实报身份**；它们不是流式对话，不带会话 ID 和流式的 accept
@@ -891,11 +944,12 @@ async fn send(
         req = req.json(b);
     }
     req.send().await.map_err(|e| {
+        let why = tw_gateway::forward::map_reqwest_error(e);
         fail(
             StatusCode::BAD_GATEWAY,
-            format!(
-                "无法连接 ChatGPT 后端：{}",
-                tw_gateway::forward::map_reqwest_error(e).message()
+            msg!(
+                "control.chatgpt_backend_unreachable", detail = why.message() =>
+                "The ChatGPT backend could not be reached: {detail}"
             ),
         )
     })
@@ -968,7 +1022,12 @@ async fn list_resets(
     .await?;
     serde_json::from_value(v)
         .map(Json)
-        .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("无法识别重置卡清单：{e}")))
+        .map_err(|e| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                msg!("control.reset_cards_unreadable", detail = e => "The list of reset cards could not be read: {detail}"),
+            )
+        })
 }
 
 async fn use_reset(
@@ -980,7 +1039,10 @@ async fn use_reset(
     if key.is_empty() || key.len() > 128 || key.chars().any(|c| c.is_control()) {
         return Err(fail(
             StatusCode::BAD_REQUEST,
-            "幂等键不能为空，且不超过 128 个字符",
+            msg!(
+                "control.bad_idempotency_key" =>
+                "An idempotency key cannot be empty, and cannot be longer than 128 characters."
+            ),
         ));
     }
     let mut body = serde_json::json!({ "redeem_request_id": key });
@@ -1002,9 +1064,14 @@ async fn use_reset(
     .await?;
     let code = v["code"]
         .as_str()
-        .ok_or_else(|| fail(StatusCode::BAD_GATEWAY, "无法识别使用重置卡的结果"))?
+        .ok_or_else(|| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                msg!("control.reset_card_result_unreadable" => "The result of using the reset card could not be read."),
+            )
+        })?
         .to_ascii_lowercase();
-    tracing::info!(provider = %name, %code, "已请求使用额度重置卡");
+    tracing::info!(provider = %name, %code, "asked to use a quota reset card");
     Ok(Json(tw_api::ResetCreditUsed {
         code,
         windows_reset: v["windows_reset"].as_i64().unwrap_or(0),

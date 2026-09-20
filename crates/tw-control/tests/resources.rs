@@ -191,7 +191,7 @@ async fn an_upstream_still_in_use_is_not_deleted_and_the_answer_names_who_uses_i
     let b = bed(BASE);
     let (st, body) = call(&b.app, "DELETE", "/providers/官方", serde_json::json!({})).await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("策略组「pool」"), "{body}");
+    assert!(body.contains("group `pool`"), "{body}");
     assert_eq!(b.parsed().providers.len(), 1);
 
     // 没人用的那家删得掉
@@ -389,7 +389,7 @@ async fn renaming_a_proxy_moves_the_upstreams_that_use_it_and_a_used_proxy_is_no
 
     let (st, body) = call(&b.app, "DELETE", "/proxies/corp", serde_json::json!({})).await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("「relay」"), "{body}");
+    assert!(body.contains("`relay`"), "{body}");
 
     let (st, body) = call(
         &b.app,
@@ -499,7 +499,7 @@ async fn an_unsaved_oauth_credential_is_not_refreshed_just_to_test_it() {
     let v = json(&body);
     assert_eq!(v["ok"], false);
     assert!(
-        v["error"].as_str().unwrap().contains("保存后才能检测"),
+        v["error"].as_str().unwrap().contains("has to be saved"),
         "{body}"
     );
 }

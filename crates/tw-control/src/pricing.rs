@@ -28,6 +28,7 @@ use tw_yaml::Step;
 
 use crate::resources::{checked_name, invalid, mapping, quoted};
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_types::{Msg, msg};
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
@@ -77,7 +78,7 @@ pub fn load_table(config: &Path) -> tw_pricing::Table {
             _ => builtin,
         },
         Err(e) => {
-            tracing::warn!("内置价目表加载失败：{e}");
+            tracing::warn!("the built-in price sheet failed to load: {e}");
             saved.unwrap_or_else(tw_pricing::Table::empty)
         }
     }
@@ -88,7 +89,10 @@ fn read_saved(path: &Path) -> Option<tw_pricing::Table> {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            tracing::warn!("无法读取 {}，改用内置价目表计价：{e}", path.display());
+            tracing::warn!(
+                "{} could not be read; pricing with the built-in sheet: {e}",
+                path.display()
+            );
             return None;
         }
     };
@@ -97,7 +101,10 @@ fn read_saved(path: &Path) -> Option<tw_pricing::Table> {
     match tw_pricing::Table::fetched(&raw, local_date(saved_at)) {
         Ok(t) => Some(t),
         Err(e) => {
-            tracing::warn!("无法解析 {}，改用内置价目表计价：{e}", path.display());
+            tracing::warn!(
+                "{} could not be parsed; pricing with the built-in sheet: {e}",
+                path.display()
+            );
             None
         }
     }
@@ -167,9 +174,9 @@ struct Attempt {
 pub enum RefreshError {
     #[error("{0}")]
     Fetch(String),
-    #[error("下载的内容不是价格数据集：{0}")]
+    #[error("what was downloaded is not a price data set: {0}")]
     Dataset(String),
-    #[error("价目表无法保存：{0}")]
+    #[error("the price sheet could not be saved: {0}")]
     Save(String),
 }
 
@@ -237,7 +244,7 @@ pub fn spawn(s: ControlState) {
                 && u.due(s.config_path(), SystemTime::now())
                 && let Err(e) = refresh(&s).await
             {
-                tracing::info!("默认价目表更新失败，稍后重试：{e}");
+                tracing::info!("the default price sheet could not be updated; retrying later: {e}");
             }
             u.pause(u.schedule.tick).await;
         }
@@ -271,10 +278,15 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshErro
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
-        .map_err(|e| RefreshError::Fetch(format!("无法连接价格数据源：{}", chain(&e))))?;
+        .map_err(|e| {
+            RefreshError::Fetch(format!(
+                "the price data source could not be reached: {}",
+                chain(&e)
+            ))
+        })?;
     if !resp.status().is_success() {
         return Err(RefreshError::Fetch(format!(
-            "价格数据源返回 HTTP {}",
+            "the price data source answered HTTP {}",
             resp.status().as_u16()
         )));
     }
@@ -282,11 +294,11 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshErro
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| RefreshError::Fetch(format!("下载中断：{}", chain(&e))))?
+        .map_err(|e| RefreshError::Fetch(format!("the download broke off: {}", chain(&e))))?
     {
         if raw.len() + chunk.len() > MAX_DATASET {
             return Err(RefreshError::Dataset(format!(
-                "文件大小超过 {} MB",
+                "the file is over {} MB",
                 MAX_DATASET / 1024 / 1024
             )));
         }
@@ -333,7 +345,7 @@ async fn pricing_status(s: &ControlState) -> tw_api::PricingStatus {
     // **拿不到存储就是 0** —— 观测层起不来时网关照常转发，这一页也该照常打开
     let (unpriced_recent, unpriced_models) = match &s.store {
         Some(st) => st.lock().await.db().unpriced_recent(7).unwrap_or_else(|e| {
-            tracing::debug!("未能获取无法计价请求的统计：{e}");
+            tracing::debug!("the count of unpriced requests could not be read: {e}");
             (0, Vec::new())
         }),
         None => (0, Vec::new()),
@@ -359,7 +371,10 @@ async fn refresh_now(
             RefreshError::Save(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_GATEWAY,
         };
-        fail(code, e)
+        fail(
+            code,
+            msg!("control.pricing_refresh_failed", detail = e => "{detail}"),
+        )
     })?;
     Ok(Json(tw_api::PricingRefreshed {
         status: pricing_status(&s).await,
@@ -407,13 +422,21 @@ async fn query(
             if loaded.config().sheet(&name).is_none() {
                 return Err(fail(
                     StatusCode::NOT_FOUND,
-                    format!("未找到名为「{name}」的价目表"),
+                    msg!(
+                        "control.sheet_not_found", sheet = name =>
+                        "There is no price sheet named `{sheet}`."
+                    ),
                 ));
             }
             (loaded, Some(name))
         }
         tw_api::SheetRef::Draft { sheet } => {
-            let def = sheet_def(&sheet).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let def = sheet_def(&sheet).map_err(|e| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    msg!("control.bad_price_sheet", detail = e => "{detail}"),
+                )
+            })?;
             let name = def.name.clone();
             (Arc::new(loaded.with_draft(def)), Some(name))
         }
@@ -488,7 +511,10 @@ async fn sheet(
     let def = cfg.pricing.sheet(&name).ok_or_else(|| {
         fail(
             StatusCode::NOT_FOUND,
-            format!("未找到名为「{name}」的价目表"),
+            msg!(
+                "control.sheet_not_found", sheet = name =>
+                "There is no price sheet named `{sheet}`."
+            ),
         )
     })?;
     Ok(Json(tw_api::PriceSheetInput {
@@ -509,7 +535,7 @@ async fn create_sheet(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
-            let def = sheet_def(&req.sheet).map_err(invalid)?;
+            let def = sheet_def(&req.sheet).map_err(|e| invalid(e.text))?;
             let mut out = edit::upsert(text, edit::PRICE_SHEETS, None, &mapping(&def)?)?;
             if let Some(used_by) = &req.used_by {
                 out = assign(&out, cfg, None, &def.name, used_by)?;
@@ -529,7 +555,7 @@ async fn update_sheet(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
-            let def = sheet_def(&req.sheet).map_err(invalid)?;
+            let def = sheet_def(&req.sheet).map_err(|e| invalid(e.text))?;
             let mut out = edit::upsert(text, edit::PRICE_SHEETS, Some(&name), &mapping(&def)?)?;
             if def.name != name {
                 // **和那一张在同一个版本里改** —— 分两次写的话，中间那一版的
@@ -557,7 +583,7 @@ async fn delete_sheet(
             let users = refs::sheet_users(cfg, &name);
             if !users.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "价目表「{name}」仍被上游{}使用，请先解除关联再删除",
+                    "Price sheet `{name}` is still used by upstream {}; unlink those before deleting it.",
                     quoted(&users)
                 )));
             }
@@ -584,7 +610,7 @@ fn assign(
         .find(|u| !cfg.providers.iter().any(|p| &p.name == *u))
     {
         return Err(ApplyError::Edit(edit::EditError::NotFound {
-            what: "上游",
+            what: "upstream",
             name: missing.clone(),
         }));
     }
@@ -621,9 +647,9 @@ pub(crate) fn sheet_views(cfg: &tw_config::Config) -> Vec<tw_api::PriceSheetView
         .collect()
 }
 
-fn sheet_def(input: &tw_api::PriceSheetInput) -> Result<tw_pricing::SheetDef, String> {
+fn sheet_def(input: &tw_api::PriceSheetInput) -> Result<tw_pricing::SheetDef, Msg> {
     let def = tw_pricing::SheetDef {
-        name: checked_name(&input.name, "价目表")?,
+        name: checked_name(&input.name, "price sheet")?,
         multiplier: input.multiplier,
         models: input
             .models
@@ -631,7 +657,8 @@ fn sheet_def(input: &tw_api::PriceSheetInput) -> Result<tw_pricing::SheetDef, St
             .map(|(m, p)| (m.clone(), per_million(p)))
             .collect(),
     };
-    def.validate().map_err(|e| e.to_string())?;
+    def.validate()
+        .map_err(|e| msg!("control.bad_price_sheet", detail = e => "{detail}"))?;
     Ok(def)
 }
 

@@ -9,6 +9,7 @@ description = "Control-plane API server over a unix socket"
 
 [dependencies]
 tw-api = { workspace = true }
+tw-types = { workspace = true }
 # 列网卡用 getifaddrs —— 比引一个 crate 便宜
 libc = { workspace = true }
 tw-config = { workspace = true }
@@ -47,4 +48,5 @@ serde_yaml_ng = { workspace = true }
 tempfile = "3"
 tw-observe = { workspace = true }
 tw-api = { workspace = true }
+tw-types = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

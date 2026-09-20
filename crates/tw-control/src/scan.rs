@@ -126,7 +126,7 @@ pub async fn scan(
         rules_disabled: rules.disabled.len(),
         // **写坏的那几条要说出来** —— 一条静默失效的安全规则，比没有那条
         // 规则更糟，因为用户以为它在
-        rules_warning: (!rules.warnings.is_empty()).then(|| rules.warnings.join("；")),
+        rules_warning: (!rules.warnings.is_empty()).then(|| rules.warnings.join("; ")),
         projects: p.project,
     })
 }
@@ -145,7 +145,10 @@ pub fn spawn_watcher(
     let home = state.home.clone();
     let cfg = state.config();
     let dirs = tw_scan::watch::dirs_for(&tw_scan::sources::user_level(&home));
-    tracing::debug!(dirs = dirs.len(), "开始监控客户端配置面");
+    tracing::debug!(
+        dirs = dirs.len(),
+        "watching the clients' configuration surface"
+    );
     let (w, mut rx) = tw_scan::watch::watch(&dirs)?;
 
     let bus = state.bus().clone();
@@ -155,7 +158,7 @@ pub fn spawn_watcher(
         let scan_now = |home: &std::path::Path| {
             let rules = tw_scan::rules::build(&cfg.security.scan_rules).unwrap_or_else(|_| {
                 tw_scan::rules::build(&tw_config::ScanRules::default())
-                    .expect("内置规则的正则表达式有效，由测试保证")
+                    .expect("the built-in rules' patterns are valid, and a test keeps them so")
             });
             tw_scan::report::scan(&tw_scan::sources::user_level(home), &rules)
         };
@@ -178,7 +181,10 @@ pub fn spawn_watcher(
             if fresh.is_empty() {
                 continue;
             }
-            tracing::info!(count = fresh.len(), "客户端配置面出现了新的可疑内容");
+            tracing::info!(
+                count = fresh.len(),
+                "something new and suspicious appeared in the clients' configuration"
+            );
             let id = bus.next_id();
             bus.emit(tw_api::Event::ScanAlert {
                 id,
