@@ -31,13 +31,15 @@ pub enum ApplyError {
     #[error("{0}")]
     Rejected(tw_config::Rejected),
     /// 校验过了但运行时对象建不起来 —— 同样保持旧的。
-    #[error("配置可以解析，但无法应用：{0}")]
+    #[error("the configuration parses but cannot be applied: {0}")]
     Build(String),
     /// patch 指的那个位置有问题。**和 Build 分开**：那句「配置能读但
     /// 用不起来」会让人去查配置，而该查的是这次请求写的路径。
     #[error("{0}")]
     BadPath(String),
-    #[error("配置版本不一致：本次修改基于 {base}，当前版本为 {current}。请刷新后重新修改")]
+    #[error(
+        "version mismatch: this edit is based on {base}, and the current version is {current}. Refresh and edit again"
+    )]
     Stale { base: String, current: String },
     /// 按资源改（上游、代理、价目表）时的失败：名字撞了、找不到、值写不进去。
     #[error(transparent)]
@@ -104,7 +106,9 @@ impl ConfigManager {
                 origin: origin.slug().to_string(),
                 at_ms: now_ms(),
             });
-            tracing::warn!("配置未通过校验，继续使用上一版本：{r}");
+            tracing::warn!(
+                "the configuration did not validate; staying on the previous version: {r}"
+            );
             ApplyError::Rejected(r)
         })?;
         self.gateway
@@ -115,7 +119,7 @@ impl ConfigManager {
         // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。
         let _ = tw_config::history::snapshot(&self.path, text, origin);
         let version = store::version_of(text);
-        tracing::info!(%version, origin = origin.slug(), "配置已生效");
+        tracing::info!(%version, origin = origin.slug(), "the configuration is in effect");
         self.bus.emit(tw_api::Event::ConfigReloaded {
             id: self.bus.next_id(),
             version: version.clone(),
@@ -193,7 +197,7 @@ impl ConfigManager {
             .iter()
             .rev()
             .find(|v| v.version == version || v.version.ends_with(version))
-            .ok_or_else(|| ApplyError::BadPath(format!("版本历史中没有 {version}")))?;
+            .ok_or_else(|| ApplyError::BadPath(format!("the version history has no {version}")))?;
         let text = tw_config::history::read(target)?;
         let cur = self.current().ok();
         // 回滚也走同一条写入路径，所以它同样会：校验、存历史、防回环。
@@ -229,10 +233,12 @@ pub fn spawn_watcher(
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             match mgr.reload_from_disk().await {
-                Ok(Some(v)) => tracing::debug!(version = %v, "配置文件已被修改，已重新加载"),
-                Ok(None) => tracing::trace!("文件变更由本进程写入，忽略"),
+                Ok(Some(v)) => {
+                    tracing::debug!(version = %v, "the configuration file changed and was reloaded")
+                }
+                Ok(None) => tracing::trace!("this process wrote that change; ignoring it"),
                 // 错误已经在 apply_text 里发过事件了，这里只记一行
-                Err(e) => tracing::debug!("重新加载失败：{e}"),
+                Err(e) => tracing::debug!("the reload failed: {e}"),
             }
         }
     });
@@ -247,10 +253,12 @@ pub async fn path_at(
     axum::extract::State(s): axum::extract::State<crate::ControlState>,
     axum::extract::Query(q): axum::extract::Query<AtQuery>,
 ) -> Result<axum::Json<tw_api::ConfigAt>, crate::Fail> {
-    let cur = s
-        .cfg
-        .current()
-        .map_err(|e| crate::fail(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let cur = s.cfg.current().map_err(|e| {
+        crate::fail(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            tw_types::msg!("control.internal", detail = e => "{detail}"),
+        )
+    })?;
     let path = tw_yaml::path_at(&cur.text, q.offset.min(cur.text.len()));
     let mut out = tw_api::ConfigAt {
         section: None,
@@ -322,7 +330,7 @@ pub fn resolve_path(text: &str, pointer: &str) -> Result<Vec<tw_yaml::Step>, Str
                 Some(i) => out.push(tw_yaml::Step::Index(i)),
                 None => {
                     return Err(format!(
-                        "{pointer} 中没有名为「{seg}」的项。列表项按 name 查找，也可以使用下标"
+                        "{pointer} has no entry named `{seg}`. List entries are found by name, or by index."
                     ));
                 }
             }
@@ -368,13 +376,15 @@ impl ConfigManager {
                     // **`insert` 而不是 `set`。**配置里绝大多数字段是可选的、
                     // 默认不写的，只能改「用户碰巧写过」的字段，等于表单模式在
                     // 他最需要的时候是死的。已经写过的走 `set`，那是它的第一步。
-                    tw_yaml::insert(&text, &steps, &scalar)
-                        .map_err(|e| ApplyError::BadPath(format!("修改 {path} 失败：{e}")))?
+                    tw_yaml::insert(&text, &steps, &scalar).map_err(|e| {
+                        ApplyError::BadPath(format!("{path} could not be changed: {e}"))
+                    })?
                 }
                 tw_api::PatchOp::Append { path, item } => {
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
-                    tw_yaml::append(&text, &steps, item)
-                        .map_err(|e| ApplyError::BadPath(format!("向 {path} 添加项失败：{e}")))?
+                    tw_yaml::append(&text, &steps, item).map_err(|e| {
+                        ApplyError::BadPath(format!("nothing could be added to {path}: {e}"))
+                    })?
                 }
                 tw_api::PatchOp::Remove { path } => {
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
@@ -382,23 +392,25 @@ impl ConfigManager {
                     // **按名字解析、按下标删** —— 名字是用户写的，下标是
                     // 我们刚刚算出来的，中间没有任何一次用户可见的重排。
                     let (last, parent) = steps.split_last().ok_or_else(|| {
-                        ApplyError::BadPath(format!("{path} 没有指向列表中的某一项"))
+                        ApplyError::BadPath(format!("{path} does not point at an entry of a list"))
                     })?;
                     let tw_yaml::Step::Index(i) = last else {
                         return Err(ApplyError::BadPath(format!(
-                            "{path} 没有指向列表中的某一项。删除时需要指定具体的项，例如 /clients/codex"
+                            "{path} does not point at an entry of a list. A delete names the entry, as in /clients/codex."
                         )));
                     };
-                    tw_yaml::remove(&text, parent, *i)
-                        .map_err(|e| ApplyError::BadPath(format!("删除 {path} 失败：{e}")))?
+                    tw_yaml::remove(&text, parent, *i).map_err(|e| {
+                        ApplyError::BadPath(format!("{path} could not be deleted: {e}"))
+                    })?
                 }
                 tw_api::PatchOp::Clear { path } => {
                     // 要清的列表可能根本还没写进文件 —— 「一个都不给」
                     // 正是用户第一次碰 `allow` 的那一下。`resolve_path`
                     // 对没写过的键会原样留成 Key，走得通。
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
-                    tw_yaml::clear_seq(&text, &steps)
-                        .map_err(|e| ApplyError::BadPath(format!("清空 {path} 失败：{e}")))?
+                    tw_yaml::clear_seq(&text, &steps).map_err(|e| {
+                        ApplyError::BadPath(format!("{path} could not be cleared: {e}"))
+                    })?
                 }
             };
         }

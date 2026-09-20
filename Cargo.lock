@@ -2850,6 +2850,7 @@ dependencies = [
  "tw-scan",
  "tw-secret",
  "tw-store",
+ "tw-types",
  "tw-yaml",
 ]
 

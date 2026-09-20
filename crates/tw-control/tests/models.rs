@@ -289,7 +289,8 @@ async fn disabling_and_scoping_an_upstream_is_written_and_an_empty_scope_is_refu
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert!(v.as_str().unwrap().contains("disabled"), "{v}");
+    // 错误体现在是一个 JSON 的 Msg：码给界面，text 给读日志的人
+    assert!(v["text"].as_str().unwrap().contains("disabled"), "{v}");
     assert_eq!(b.file(), before);
 }
 

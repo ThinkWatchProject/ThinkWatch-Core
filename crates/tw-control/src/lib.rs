@@ -14,6 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use tokio::sync::broadcast;
+use tw_types::{Msg, msg};
 
 pub mod chatgpt;
 pub mod clients;
@@ -202,7 +203,10 @@ fn async_stream_from(
                 // 订阅者跟不上时 broadcast 会丢最老的。**继续收而不是断开** ——
                 // UI 少几行实时日志无所谓，断掉重连才是真的难受。
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "控制面订阅者处理不及，部分事件已丢弃");
+                    tracing::warn!(
+                        dropped = n,
+                        "a control-plane subscriber fell behind; some events were dropped"
+                    );
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -480,7 +484,7 @@ pub(crate) fn model_list(m: tw_gateway::ModelList) -> tw_api::ModelList {
 async fn l1(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::L1Request>,
-) -> Result<Json<Vec<tw_api::L1Result>>, (StatusCode, String)> {
+) -> Result<Json<Vec<tw_api::L1Result>>, Fail> {
     let cfg = s.config();
     let mut out = Vec::new();
 
@@ -489,7 +493,7 @@ async fn l1(
             cfg.providers
                 .iter()
                 .find(|p| p.name == *n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))?,
+                .ok_or_else(|| no_such_upstream(n))?,
         ],
         None => cfg.providers.iter().collect(),
     };
@@ -575,10 +579,7 @@ async fn cost_buckets(
     let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let x = g
-        .db()
-        .cost_buckets(from, to, bucket)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let x = g.db().cost_buckets(from, to, bucket).map_err(internal)?;
     Ok(Json(x))
 }
 
@@ -600,7 +601,7 @@ async fn cost_buckets_by(
     let x = g
         .db()
         .cost_buckets_by(q.dim, from, to, bucket)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal)?;
     Ok(Json(x))
 }
 
@@ -611,10 +612,7 @@ async fn cost_by(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let x = g
-        .db()
-        .cost_by(q.dim, from, to)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let x = g.db().cost_by(q.dim, from, to).map_err(internal)?;
     Ok(Json(x))
 }
 
@@ -626,10 +624,7 @@ async fn summary(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let x = g
-        .db()
-        .summary(from, to)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let x = g.db().summary(from, to).map_err(internal)?;
     Ok(Json(tw_api::Summary {
         requests: x.requests,
         failed: x.failed,
@@ -661,7 +656,7 @@ async fn history(
     let rows = g
         .db()
         .recent(q.limit.unwrap_or(200).min(2000))
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal)?;
     Ok(Json(rows.into_iter().map(history_row).collect()))
 }
 
@@ -672,10 +667,7 @@ async fn latency(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let xs = g
-        .db()
-        .latency_by_model(from, to)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let xs = g.db().latency_by_model(from, to).map_err(internal)?;
     Ok(Json(
         xs.into_iter()
             .map(|l| tw_api::LatencyView {
@@ -756,7 +748,7 @@ async fn speed_run(
                     total_ms: 0,
                     input_tokens: None,
                     output_tokens: None,
-                    error: Some(format!("无法获取凭据：{e}")),
+                    error: Some(format!("the credential could not be obtained: {e}")),
                 });
                 continue;
             }
@@ -816,7 +808,7 @@ fn targets<'a>(
             cfg.providers
                 .iter()
                 .find(|p| &p.name == n)
-                .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{n}」的上游")))
+                .ok_or_else(|| no_such_upstream(n))
         })
         .collect()
 }
@@ -831,10 +823,7 @@ async fn leaks(
     let since = now_ms() - (q.days.unwrap_or(7) as i64) * 86_400_000;
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let xs = g
-        .db()
-        .leak_summary(since)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let xs = g.db().leak_summary(since).map_err(internal)?;
     Ok(Json(
         xs.into_iter()
             .map(|l| tw_api::LeakGroup {
@@ -863,11 +852,12 @@ async fn request_detail(
 ) -> Result<Json<tw_api::RequestDetail>, Fail> {
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let row = g
-        .db()
-        .get(id)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
+    let row = g.db().get(id).map_err(internal)?.ok_or_else(|| {
+        fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.request_not_found", id = id => "There is no request {id}."),
+        )
+    })?;
     let at = row.at_ms;
     let body = |which| {
         let raw = g.blobs().get(at, id, which)?;
@@ -927,10 +917,7 @@ async fn latency_by_provider(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let xs = g
-        .db()
-        .latency_by_provider(from, to)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let xs = g.db().latency_by_provider(from, to).map_err(internal)?;
     Ok(Json(
         xs.into_iter()
             .map(|l| tw_api::LatencyView {
@@ -965,9 +952,13 @@ async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
 
 fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Recorder>>, Fail> {
     s.store.as_ref().ok_or_else(|| {
-        (
+        fail(
             StatusCode::SERVICE_UNAVAILABLE,
-            "请求记录不可用，数据库无法打开或磁盘出错，转发不受影响".to_string(),
+            msg!(
+                "control.store_unavailable" =>
+                "Request recording is unavailable: the database could not be opened, or the disk \
+                 is failing. Forwarding is unaffected."
+            ),
         )
     })
 }
@@ -1105,10 +1096,7 @@ struct Limit {
 
 /// 当前配置的原文。**文本模式直接显示它。**
 async fn get_config(State(s): State<ControlState>) -> Result<Json<tw_api::ConfigText>, Fail> {
-    let c = s
-        .cfg
-        .current()
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let c = s.cfg.current().map_err(internal)?;
     Ok(Json(tw_api::ConfigText {
         path: c.path.display().to_string(),
         version: c.version(),
@@ -1153,8 +1141,7 @@ async fn put_config(
 async fn config_history(
     State(s): State<ControlState>,
 ) -> Result<Json<Vec<tw_api::ConfigVersion>>, Fail> {
-    let all = tw_config::history::list(s.config_path())
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let all = tw_config::history::list(s.config_path()).map_err(internal)?;
     let now = s.cfg.current().map(|c| c.version()).unwrap_or_default();
     // **新的在前。**用户找的几乎总是最近那几版。
     Ok(Json(
@@ -1179,10 +1166,37 @@ async fn config_rollback(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-pub(crate) type Fail = (StatusCode, String);
+/// 控制面的错误响应。
+///
+/// **响应体是一个 JSON 的 [`Msg`]，不是一句纯文本。**上一版发的是文本，
+/// 于是界面只能把它原样贴出来 —— 一个中英双语的界面里，那句话必然有
+/// 一半人读不懂。现在带着码发出去，界面照码说它自己那句话。
+pub(crate) type Fail = (StatusCode, Json<Msg>);
 
-pub(crate) fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
-    (code, e.to_string())
+pub(crate) fn fail(code: StatusCode, detail: Msg) -> Fail {
+    (code, Json(detail))
+}
+
+/// 内部错误：数据库读不了、序列化不了之类。
+///
+/// **这一类只有一个码。**界面对它们能说的只有同一句话（「这一步没做成」），
+/// 真正有用的是 `detail` 里那句原话，而那句话是给看日志的人读的。
+pub(crate) fn internal(e: impl std::fmt::Display) -> Fail {
+    fail(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        msg!("control.internal", detail = e => "{detail}"),
+    )
+}
+
+/// 配置里没有这个名字的上游。
+pub(crate) fn no_such_upstream(name: &str) -> Fail {
+    fail(
+        StatusCode::NOT_FOUND,
+        msg!(
+            "control.upstream_not_found", upstream = name =>
+            "There is no upstream named `{upstream}`."
+        ),
+    )
 }
 
 /// 把配置改动的失败翻成 HTTP。
@@ -1208,7 +1222,10 @@ pub(crate) fn apply_fail(e: ApplyError) -> Fail {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    (code, e.to_string())
+    fail(
+        code,
+        msg!("control.config_rejected", detail = e => "{detail}"),
+    )
 }
 
 /// 最近这一段有多长。
@@ -1336,9 +1353,12 @@ async fn sessions(State(s): State<ControlState>) -> Json<Vec<tw_api::SessionView
 async fn session_detail(
     State(s): State<ControlState>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<tw_api::SessionDetail>, (StatusCode, String)> {
+) -> Result<Json<tw_api::SessionDetail>, Fail> {
     let Some(store) = &s.store else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "请求记录未启动".into()));
+        return Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            msg!("control.store_off" => "Request recording is not running."),
+        ));
     };
     let g = store.lock().await;
     let session = g
@@ -1348,7 +1368,12 @@ async fn session_detail(
         .iter()
         .find(|x| x.id == id)
         .map(session_view)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到会话 {id}")))?;
+        .ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!("control.session_not_found", id = id.clone() => "There is no session {id}."),
+            )
+        })?;
     let turns = g
         .db()
         .turns(&id)
@@ -1361,7 +1386,7 @@ async fn session_detail(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
-    #[error("无法启动控制面 socket {path}：{source}")]
+    #[error("the control-plane socket {path} could not be started: {source}")]
     Bind {
         path: PathBuf,
         source: std::io::Error,
@@ -1371,7 +1396,7 @@ pub enum ControlError {
     /// 给的原话是「path must be shorter than SUN_LEN」，看不出上限是多少、
     /// 也看不出自己超了多少。
     #[error(
-        "控制面 socket 的路径过长：{len} 字节，系统上限为 {max}。\n{path}\n请将配置放在路径较短的目录中（默认的 ~/.thinkwatch 不受此限制）"
+        "the control-plane socket path is {len} bytes, over the system limit of {max}.\n{path}\nPut the configuration in a directory with a shorter path (the default ~/.thinkwatch is well within the limit)."
     )]
     PathTooLong {
         path: PathBuf,
@@ -1420,14 +1445,14 @@ pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlE
         // 0700：只有当前用户能连。这就是不需要 token 的原因。
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
-    tracing::info!(path = %path.display(), "控制面已开始监听");
+    tracing::info!(path = %path.display(), "the control plane is listening");
 
     let app = router(state);
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
-                tracing::warn!("控制面 accept 失败：{e}");
+                tracing::warn!("the control plane could not accept a connection: {e}");
                 continue;
             }
         };
@@ -1443,7 +1468,7 @@ pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlE
                     .serve_connection(io, svc)
                     .await
             {
-                tracing::debug!("控制面连接结束：{e}");
+                tracing::debug!("a control-plane connection ended: {e}");
             }
         });
     }

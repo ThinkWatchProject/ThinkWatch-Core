@@ -248,7 +248,7 @@ async fn the_diff_never_shows_the_real_key_either() {
         v.after
     );
     assert!(
-        v.after.contains("网关密钥"),
+        v.after.contains("gateway key"),
         "打码之后得让人看得懂那儿是什么：\n{}",
         v.after
     );
@@ -489,7 +489,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
     let b = bed_with_store(Some(store));
     let (st, body) = post(&b.app, "/replay/quote", r#"{"id":1,"provider":"官方"}"#).await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("无法原样重放"), "{body}");
+    assert!(body.contains("cannot be replayed as it was"), "{body}");
 }
 
 #[tokio::test]
@@ -544,19 +544,22 @@ async fn the_bundle_is_something_a_person_will_actually_read() {
     // 里面有什么不该有的。所以是 Markdown 不是 JSON dump。
     let b = bed();
     let (_, text) = get(&b.app, "/diagnostics").await;
-    assert!(text.starts_with("# ThinkWatch 诊断包"), "{text}");
+    assert!(
+        text.starts_with("# ThinkWatch diagnostics bundle"),
+        "{text}"
+    );
     for section in [
-        "## 版本",
-        "## 监听",
-        "## 上游",
-        "## 安全",
-        "## 请求记录",
+        "## Versions",
+        "## Listening",
+        "## Upstreams",
+        "## Security",
+        "## Request recording",
         "## config.yaml",
     ] {
         assert!(text.contains(section), "少了 {section}：\n{text}");
     }
     // 第一屏就要提醒他自己检查一遍
-    assert!(text.contains("发送本文件之前，请再次检查"), "{text}");
+    assert!(text.contains("read this through once more"), "{text}");
 }
 
 #[tokio::test]
@@ -565,7 +568,10 @@ async fn the_bundle_says_it_has_no_bodies_because_that_is_the_dangerous_part() {
     // 他自己打开的，不会被顺手贴进 issue。
     let b = bed();
     let (_, text) = get(&b.app, "/diagnostics").await;
-    assert!(text.contains("不包含请求体和响应体"), "{text}");
+    assert!(
+        text.contains("carries no request or response bodies"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -573,8 +579,11 @@ async fn a_bundle_without_observability_says_so_rather_than_showing_zeros() {
     // 「没有记录」和「记录了零条」是两个结论。
     let b = bed();
     let (_, text) = get(&b.app, "/diagnostics").await;
-    assert!(text.contains("未启动，此期间的请求未被记录"), "{text}");
-    assert!(!text.contains("请求条数 | 0"), "{text}");
+    assert!(
+        text.contains("Not running, so nothing from this period was recorded"),
+        "{text}"
+    );
+    assert!(!text.contains("Requests recorded | 0"), "{text}");
 }
 
 // ────────────────────────────────────────────────── 接管与密钥的关系
@@ -687,5 +696,5 @@ async fn a_key_of_an_adopted_client_cannot_be_deleted_until_it_is_released() {
     assert_eq!(r.status(), StatusCode::CONFLICT);
     let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("取消接管"), "要说清怎样才能删：{text}");
+    assert!(text.contains("Restore it"), "要说清怎样才能删：{text}");
 }

@@ -47,8 +47,9 @@ fn order_like_the_data_plane(
 use tw_engine::{Outcome, RequestFacts, RouteError};
 
 use crate::ControlState;
+use tw_types::msg;
 
-type Fail = (StatusCode, String);
+use crate::{Fail, fail};
 
 fn facts(req: &tw_api::DryRunRequest) -> RequestFacts {
     RequestFacts {
@@ -76,9 +77,12 @@ pub async fn dry_run(
     let engine = &rt.engine;
     let f = facts(&req);
     if !f.client.is_empty() && !cfg.clients.iter().any(|c| c.name == f.client) {
-        return Err((
+        return Err(fail(
             StatusCode::NOT_FOUND,
-            format!("未找到名为「{}」的网关密钥", f.client),
+            msg!(
+                "control.key_not_found", key = f.client.clone() =>
+                "There is no gateway key named `{key}`."
+            ),
         ));
     }
 
@@ -92,21 +96,37 @@ pub async fn dry_run(
             .iter()
             .map(|r| crate::routes::to_rule(r, &cfg))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-        engine
-            .check_rules(&draft)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            .map_err(|e| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    msg!("control.bad_rule", detail = e => "{detail}"),
+                )
+            })?;
+        engine.check_rules(&draft).map_err(|e| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                msg!("control.bad_rule", detail = e => "{detail}"),
+            )
+        })?;
         (d.name.clone(), draft.as_slice())
     } else if let Some(name) = req.route.as_deref().filter(|n| !n.is_empty()) {
         let rules = engine
             .rules_of(name)
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到名为「{name}」的路由")))?;
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::NOT_FOUND,
+                    msg!("control.route_not_found", route = name => "There is no route named `{route}`."),
+                )
+            })?;
         (name.to_string(), rules)
     } else if !f.client.is_empty() {
         let name = engine.route_of(&f.client).to_string();
         (name, engine.rules_for_client(&f.client))
     } else {
-        return Err((StatusCode::BAD_REQUEST, "请指定网关密钥或路由".to_string()));
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            msg!("control.dryrun_needs_target" => "Name a gateway key or a route."),
+        ));
     };
 
     // 每条规则的下场。**先走一遍这个，再问结果** —— 顺序反过来的话，
@@ -265,7 +285,12 @@ pub async fn dry_run(
         Err(RouteError::NoMatch) => {
             out.outcome = "no_match".into();
         }
-        Err(e) => return Err((StatusCode::BAD_REQUEST, e.to_string())),
+        Err(e) => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                msg!("control.route_failed", detail = e => "{detail}"),
+            ));
+        }
     }
     Ok(Json(out))
 }

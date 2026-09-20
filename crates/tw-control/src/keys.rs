@@ -29,6 +29,7 @@ use tw_config::refs;
 use tw_yaml::Step;
 
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_types::msg;
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
@@ -43,11 +44,11 @@ pub fn router() -> axum::Router<ControlState> {
 /// 按用途分段，而密钥这一段之前没人按资源改过
 pub(crate) const CLIENTS: edit::Section = edit::Section {
     path: &["clients"],
-    what: "网关密钥",
+    what: "gateway key",
 };
 
 fn not_found(name: &str) -> ApplyError {
-    crate::resources::not_found("网关密钥", name)
+    crate::resources::not_found("gateway key", name)
 }
 
 // ---------------------------------------------------------------- 读
@@ -99,7 +100,12 @@ async fn value(
         .clients
         .iter()
         .find(|c| c.name == name)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("网关密钥「{name}」不存在")))?;
+        .ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!("control.key_not_found", key = name.clone() => "There is no gateway key named `{key}`."),
+            )
+        })?;
     Ok(Json(tw_api::KeyValue {
         name: c.name.clone(),
         key: c.key.clone(),
@@ -145,7 +151,9 @@ async fn update(
             // 默认密钥停用 = 把所有手动配置的客户端一起关掉，而它们不在这一页上
             if c.disabled && cfg.default_client().map(|d| d.name.as_str()) == Some(name.as_str()) {
                 return Err(ApplyError::InUse(
-                    "默认密钥不能停用。未接管的客户端均使用它，停用将使这些客户端一并失效".into(),
+                    "The default key cannot be disabled. Every client that has not been pointed \
+                     at the gateway explicitly uses it, and disabling it would break all of them."
+                        .to_string(),
                 ));
             }
             let mut out =
@@ -180,19 +188,23 @@ async fn delete_key(
                 .ok_or_else(|| not_found(&name))?;
             if cfg.default_client().map(|d| d.name.as_str()) == Some(name.as_str()) {
                 return Err(ApplyError::InUse(
-                    "默认密钥不能删除。未接管的客户端均使用它，删除后这些客户端将无法连接".into(),
+                    "The default key cannot be deleted. Every client that has not been pointed at \
+                     the gateway explicitly uses it, and they could not connect without it."
+                        .to_string(),
                 ));
             }
             if let Some(label) = &adopted {
                 return Err(ApplyError::InUse(format!(
-                    "{label} 正在被接管，其配置中记录着此密钥。请先取消接管，再删除"
+                    "{label} is pointed at the gateway and has this key in its configuration. Restore \
+                 it before deleting the key."
                 )));
             }
             let used = refs::client_refs(cfg, &c.name);
             if !used.is_empty() {
                 return Err(ApplyError::InUse(format!(
-                    "网关密钥「{name}」仍被{}引用，请先解除引用再删除",
-                    used.join("、")
+                    "Gateway key `{name}` is still referenced by {}; drop those references before \
+                     deleting it.",
+                    used.join(", ")
                 )));
             }
             Ok(edit::remove(text, CLIENTS, &name)?)
@@ -216,7 +228,7 @@ async fn set_default(
                 .ok_or_else(|| not_found(&req.name))?;
             if c.disabled {
                 return Err(ApplyError::InUse(format!(
-                    "网关密钥「{}」已停用，不能设为默认密钥",
+                    "Gateway key `{}` is disabled, so it cannot be the default key.",
                     req.name
                 )));
             }
@@ -254,7 +266,12 @@ async fn rotate(
             .clients
             .iter()
             .find(|c| c.name == name)
-            .ok_or_else(|| fail(StatusCode::NOT_FOUND, format!("网关密钥「{name}」不存在")))?;
+            .ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!("control.key_not_found", key = name.clone() => "There is no gateway key named `{key}`."),
+            )
+        })?;
         c.client.clone()
     };
     let version = s
@@ -333,8 +350,8 @@ fn to_client(
     existing: Option<&tw_config::Client>,
     cfg: &tw_config::Config,
 ) -> Result<tw_config::Client, ApplyError> {
-    let name = crate::resources::checked_name(&input.name, "网关密钥")
-        .map_err(crate::resources::invalid)?;
+    let name = crate::resources::checked_name(&input.name, "gateway key")
+        .map_err(|e| crate::resources::invalid(e.text))?;
     if let Some(r) = input
         .route
         .as_deref()
@@ -342,7 +359,7 @@ fn to_client(
         .filter(|r| !r.is_empty())
         && cfg.engine().rules_of(r).is_none()
     {
-        return Err(crate::resources::not_found("路由", r));
+        return Err(crate::resources::not_found("route", r));
     }
     Ok(tw_config::Client {
         name,

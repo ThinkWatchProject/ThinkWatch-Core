@@ -341,7 +341,7 @@ async fn a_broken_condition_is_refused_before_anything_is_written() {
         ),
         (
             json!([{ "field": "cache", "values": ["yes"] }]),
-            "true 或 false",
+            "takes true or false",
         ),
         (json!([{ "field": "colour", "values": ["red"] }]), "colour"),
     ] {
@@ -356,7 +356,7 @@ async fn a_broken_condition_is_refused_before_anything_is_written() {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-        assert!(v.as_str().unwrap_or_default().contains(says), "{v}");
+        assert!(v["text"].as_str().unwrap_or_default().contains(says), "{v}");
     }
     assert_eq!(b.file(), before);
 }
@@ -497,7 +497,10 @@ async fn a_group_forwarded_to_by_a_rule_cannot_be_deleted() {
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
-    assert!(v.as_str().unwrap().contains("codex"), "说清是谁在用：{v}");
+    assert!(
+        v["text"].as_str().unwrap().contains("codex"),
+        "说清是谁在用：{v}"
+    );
 }
 
 #[tokio::test]

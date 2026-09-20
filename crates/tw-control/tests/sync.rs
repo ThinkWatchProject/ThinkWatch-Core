@@ -127,7 +127,7 @@ async fn writing_on_a_stale_version_is_refused_with_both_versions() {
         .await
         .unwrap_err();
     assert!(matches!(e, ApplyError::Stale { .. }), "{e:?}");
-    assert!(e.to_string().contains("刷新"), "{e}");
+    assert!(e.to_string().contains("Refresh and edit again"), "{e}");
     // 而且真的没写
     assert!(
         std::fs::read_to_string(mgr.path())
