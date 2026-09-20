@@ -17,7 +17,11 @@ pub use tw_types::Msg;
 
 /// 控制面协议版本。UI 和 CLI 连上来时检查，不匹配就明确提示「请升级
 /// 客户端」，而不是以奇怪的方式失败。
-pub const CONTROL_API_VERSION: u32 = 1;
+///
+/// **2 起，凡是给人看的一句话都是 [`Msg`]，不是 `String`。**错误响应的
+/// 响应体也从纯文本变成了 JSON。照 1 写的客户端会把这些当字符串显示，
+/// 屏幕上是一坨 JSON —— 所以这里要跳号，让它在连上的那一刻就失败。
+pub const CONTROL_API_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
