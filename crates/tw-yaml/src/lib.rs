@@ -59,23 +59,29 @@ impl From<usize> for Step {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PatchError {
-    #[error("YAML 无法解析：{0}")]
+    #[error("the YAML could not be parsed: {0}")]
     Parse(String),
-    #[error("无法在配置中定位 {0}")]
+    #[error("{0} could not be located in the configuration")]
     NotFound(String),
-    #[error("{0} 不是标量值，只有标量值可以直接修改")]
+    #[error("{0} is not a scalar, and only a scalar can be changed in place")]
     NotScalar(String),
     /// **写之前的最后一道闸。**改完在内存里重新解析一遍，对不上就拒绝
     /// 写入。开销几百微秒，换来「永远不会写出一个自己都解析不了的文件」。
-    #[error("配置修改自检未通过，未写入文件：{0}")]
+    #[error("the edit did not pass its own check, so nothing was written: {0}")]
     SelfCheck(String),
     /// 同一个 map 里出现了两个同名的键。
-    #[error("{0} 在配置中重复出现，修改后可能不生效，请先手动删除重复的项")]
+    #[error(
+        "{0} appears more than once in the configuration, so a change to it may not take effect; remove the duplicates by hand first"
+    )]
     Duplicate(String),
-    #[error("{0} 是多行文本块（| 或 >），无法自动修改，请直接编辑配置文件")]
+    #[error(
+        "{0} is a multi-line block (| or >) and cannot be changed automatically; edit the configuration file directly"
+    )]
     BlockScalar(String),
     /// 锚点和别名让「改一处」不再是改一处。
-    #[error("{0} 位于 YAML 锚点或别名（&x / *x）中，修改会影响所有引用处，请直接编辑配置文件")]
+    #[error(
+        "{0} sits inside a YAML anchor or alias (&x / *x), so a change reaches every use of it; edit the configuration file directly"
+    )]
     AnchorOrAlias(String),
 }
 
@@ -464,12 +470,16 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
     out.push_str(&text[slot.end..]);
 
     // ── 护栏三 ──────────────────────────────────────────────────────
-    let after = find(&out, path)
-        .map_err(|e| PatchError::SelfCheck(format!("修改后无法找到 {}：{e}", show(path))))?;
+    let after = find(&out, path).map_err(|e| {
+        PatchError::SelfCheck(format!(
+            "{} could not be found after the change: {e}",
+            show(path)
+        ))
+    })?;
     let want = value.as_yaml_text();
     if after.value != want {
         return Err(PatchError::SelfCheck(format!(
-            "{} 修改后读回的值为 {:?}，预期为 {:?}",
+            "{} reads back as {:?} after the change, and {:?} was expected",
             show(path),
             after.value,
             want
@@ -480,7 +490,9 @@ pub fn set(text: &str, path: &[Step], value: &Scalar) -> Result<String, PatchErr
     let untouched_before = text[..slot.start] == out[..slot.start];
     let untouched_after = text[slot.end..] == out[slot.start + pad.len() + rendered.len()..];
     if !untouched_before || !untouched_after {
-        return Err(PatchError::SelfCheck("目标位置之外的内容被修改".into()));
+        return Err(PatchError::SelfCheck(
+            "something outside the target was changed".into(),
+        ));
     }
     Ok(out)
 }
@@ -644,7 +656,7 @@ fn item_span(text: &str, seq_path: &[Step], index: usize) -> Result<Range<usize>
     let dash = text[line_start..]
         .find('-')
         .map(|i| line_start + i)
-        .ok_or_else(|| PatchError::NotFound(format!("{}（不是块式列表）", show(&want))))?;
+        .ok_or_else(|| PatchError::NotFound(format!("{} (not a block list)", show(&want))))?;
     let indent = dash - line_start;
     // 往后走到下一项的 `-`（同缩进）或者这一块结束
     let mut at = text[line_start..]
@@ -894,12 +906,15 @@ fn checked_structural(
     want: usize,
 ) -> Result<String, PatchError> {
     let after = nodes(&out).map_err(|e| {
-        PatchError::SelfCheck(format!("修改 {} 后配置无法解析：{e}", show(seq_path)))
+        PatchError::SelfCheck(format!(
+            "the configuration could not be parsed after changing {}: {e}",
+            show(seq_path)
+        ))
     })?;
     let got = count_items(&after, seq_path);
     if got != want {
         return Err(PatchError::SelfCheck(format!(
-            "修改后 {} 有 {got} 项，预期为 {want} 项",
+            "{} has {got} entries after the change, and {want} were expected",
             show(seq_path)
         )));
     }

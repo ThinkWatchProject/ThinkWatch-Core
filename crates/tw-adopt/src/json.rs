@@ -21,11 +21,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum JErr {
-    #[error("第 {at} 个字节处不是合法的 JSON：{msg}")]
+    #[error("byte {at} is not valid JSON: {msg}")]
     Syntax { at: usize, msg: String },
-    #[error("{0} 不是对象，无法写入字段")]
+    #[error("{0} is not an object, so no field can be written into it")]
     NotObject(String),
-    #[error("文件为空")]
+    #[error("the file is empty")]
     Empty,
 }
 
@@ -210,7 +210,7 @@ fn err(at: usize, msg: &str) -> JErr {
 /// 三次，所以这句话必须写下来，不能靠「应该没问题」。
 fn scan_str(b: &[u8], i: usize) -> Result<(String, usize), JErr> {
     if b.get(i) != Some(&b'"') {
-        return Err(err(i, "此处应为字符串"));
+        return Err(err(i, "a string was expected here"));
     }
     let mut out = String::new();
     let mut j = i + 1;
@@ -219,7 +219,9 @@ fn scan_str(b: &[u8], i: usize) -> Result<(String, usize), JErr> {
             b'"' => return Ok((out, j + 1)),
             b'\\' => {
                 j += 1;
-                let c = *b.get(j).ok_or_else(|| err(j, "转义序列不完整"))?;
+                let c = *b
+                    .get(j)
+                    .ok_or_else(|| err(j, "the escape sequence is incomplete"))?;
                 j += 1;
                 match c {
                     b'"' => out.push('"'),
@@ -232,10 +234,13 @@ fn scan_str(b: &[u8], i: usize) -> Result<(String, usize), JErr> {
                     b't' => out.push('\t'),
                     b'u' => {
                         let hex = |b: &[u8], p: usize| -> Result<u32, JErr> {
-                            let s = b.get(p..p + 4).ok_or_else(|| err(p, "\\u 后不足四位"))?;
+                            let s = b.get(p..p + 4).ok_or_else(|| {
+                                err(p, "\\u is followed by fewer than four digits")
+                            })?;
                             let s = std::str::from_utf8(s)
-                                .map_err(|_| err(p, "\\u 后不是十六进制数字"))?;
-                            u32::from_str_radix(s, 16).map_err(|_| err(p, "\\u 后不是十六进制数字"))
+                                .map_err(|_| err(p, "\\u is not followed by hexadecimal digits"))?;
+                            u32::from_str_radix(s, 16)
+                                .map_err(|_| err(p, "\\u is not followed by hexadecimal digits"))
                         };
                         let hi = hex(b, j)?;
                         j += 4;
@@ -256,7 +261,7 @@ fn scan_str(b: &[u8], i: usize) -> Result<(String, usize), JErr> {
                         };
                         out.push(ch);
                     }
-                    _ => return Err(err(j - 1, "无法识别的转义序列")),
+                    _ => return Err(err(j - 1, "an escape sequence that is not recognized")),
                 }
             }
             _ => {
@@ -265,17 +270,17 @@ fn scan_str(b: &[u8], i: usize) -> Result<(String, usize), JErr> {
                     j += 1;
                 }
                 out.push_str(
-                    std::str::from_utf8(&b[start..j]).map_err(|_| err(start, "不是 UTF-8"))?,
+                    std::str::from_utf8(&b[start..j]).map_err(|_| err(start, "not UTF-8"))?,
                 );
             }
         }
     }
-    Err(err(i, "字符串缺少结束引号"))
+    Err(err(i, "the string has no closing quote"))
 }
 
 fn parse_value(b: &[u8], i: usize) -> Result<(Node, usize), JErr> {
     let i = skip_ws(b, i);
-    let c = *b.get(i).ok_or_else(|| err(i, "此处缺少值"))?;
+    let c = *b.get(i).ok_or_else(|| err(i, "a value is missing here"))?;
     match c {
         b'{' => {
             let mut j = skip_ws(b, i + 1);
@@ -294,7 +299,7 @@ fn parse_value(b: &[u8], i: usize) -> Result<(Node, usize), JErr> {
                 let kstart = j;
                 let c = skip_ws(b, after_key);
                 if b.get(c) != Some(&b':') {
-                    return Err(err(c, "键之后应为冒号"));
+                    return Err(err(c, "a colon was expected after the key"));
                 }
                 let (val, after_val) = parse_value(b, c + 1)?;
                 ms.push(Member {
@@ -316,7 +321,7 @@ fn parse_value(b: &[u8], i: usize) -> Result<(Node, usize), JErr> {
                         j + 1,
                     ));
                 }
-                return Err(err(j, "对象中缺少逗号或右花括号"));
+                return Err(err(j, "the object is missing a comma or a closing brace"));
             }
         }
         b'[' => {
@@ -348,7 +353,7 @@ fn parse_value(b: &[u8], i: usize) -> Result<(Node, usize), JErr> {
                         j + 1,
                     ));
                 }
-                return Err(err(j, "数组中缺少逗号或右方括号"));
+                return Err(err(j, "the array is missing a comma or a closing bracket"));
             }
         }
         b'"' => {
@@ -372,14 +377,19 @@ fn parse_value(b: &[u8], i: usize) -> Result<(Node, usize), JErr> {
             {
                 j += 1;
             }
-            let lit = std::str::from_utf8(&b[start..j]).map_err(|_| err(start, "不是 UTF-8"))?;
+            let lit = std::str::from_utf8(&b[start..j]).map_err(|_| err(start, "not UTF-8"))?;
             let body = match lit {
                 "true" => Body::Bool(true),
                 "false" => Body::Bool(false),
                 "null" => Body::Null,
-                "" => return Err(err(i, "此处缺少值")),
+                "" => return Err(err(i, "a value is missing here")),
                 n if n.parse::<f64>().is_ok() => Body::Num(n.to_string()),
-                other => return Err(err(start, &format!("无法识别的字面量 {other}"))),
+                other => {
+                    return Err(err(
+                        start,
+                        &format!("a literal that is not recognized: {other}"),
+                    ));
+                }
             };
             Ok((
                 Node {
@@ -400,7 +410,10 @@ fn parse(text: &str) -> Result<Node, JErr> {
     let (n, after) = parse_value(b, 0)?;
     let rest = skip_ws(b, after);
     if rest < b.len() {
-        return Err(err(rest, "文件末尾有多余内容"));
+        return Err(err(
+            rest,
+            "there is extra content after the end of the document",
+        ));
     }
     Ok(n)
 }

@@ -39,13 +39,15 @@ impl Compare {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ParseError {
-    #[error("比较式为空")]
+    #[error("the comparison is empty")]
     Empty,
-    #[error("「{0}」缺少比较符，应以 > < >= <= = 之一开头，例如 \">200k\"")]
+    #[error("`{0}` has no comparison operator; it starts with one of > < >= <= =, as in \">200k\"")]
     NoOperator(String),
-    #[error("「{0}」中的数字无法解析")]
+    #[error("the number in `{0}` could not be parsed")]
     BadNumber(String),
-    #[error("「{0}」的单位无法识别。支持 k（千）和 m（百万），金额写成 $2.5 的形式")]
+    #[error(
+        "the unit in `{0}` is not recognized. k (thousand) and m (million) are; an amount is written as $2.5"
+    )]
     BadUnit(String),
 }
 

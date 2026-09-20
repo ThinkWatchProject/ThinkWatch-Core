@@ -48,11 +48,15 @@ pub fn put(text: &str, path: &[Step], value: Put<'_>) -> Result<String, PatchErr
     let Some(Step::Key(_)) = path.last() else {
         return Err(PatchError::NotFound(show(path)));
     };
-    let frag = nodes(value.text())
-        .map_err(|e| PatchError::Parse(format!("写入 {} 的值无法解析：{e}", show(path))))?;
+    let frag = nodes(value.text()).map_err(|e| {
+        PatchError::Parse(format!(
+            "the value written to {} could not be parsed: {e}",
+            show(path)
+        ))
+    })?;
     if matches!(value, Put::Inline(s) if s.contains('\n')) {
         return Err(PatchError::Parse(format!(
-            "写入 {} 的单行值包含换行",
+            "the single-line value written to {} contains a newline",
             show(path)
         )));
     }
@@ -66,8 +70,12 @@ pub fn put(text: &str, path: &[Step], value: Put<'_>) -> Result<String, PatchErr
         Some(n) => replace_value(text, &before, n, value)?,
         None => add_key(text, &before, path, value)?,
     };
-    let after = nodes(&out)
-        .map_err(|e| PatchError::SelfCheck(format!("写入 {} 后配置无法解析：{e}", show(path))))?;
+    let after = nodes(&out).map_err(|e| {
+        PatchError::SelfCheck(format!(
+            "the configuration could not be parsed after writing {}: {e}",
+            show(path)
+        ))
+    })?;
     untouched_outside(&before, &after, path)?;
     lands_as(&after, path, &frag)?;
     Ok(out)
@@ -105,7 +113,7 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
     }
     if !matches!(parent_node.kind, NodeKind::Map) || is_flow(text, parent_node) {
         return Err(PatchError::NotFound(format!(
-            "{}（行内映射中的键只能整体修改）",
+            "{} (a key of an inline mapping is changed as a whole)",
             show(path)
         )));
     }
@@ -121,7 +129,7 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
             // 而不是一个空映射 —— 整项删是 `remove` 的事
             Some(Step::Index(_)) => {
                 return Err(PatchError::NotFound(format!(
-                    "{}（该项只有这一个键，请删除整项）",
+                    "{} (this is the entry's only key; delete the entry itself)",
                     show(path)
                 )));
             }
@@ -155,11 +163,15 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
         out
     };
 
-    let after = nodes(&out)
-        .map_err(|e| PatchError::SelfCheck(format!("删除 {} 后配置无法解析：{e}", show(path))))?;
+    let after = nodes(&out).map_err(|e| {
+        PatchError::SelfCheck(format!(
+            "the configuration could not be parsed after deleting {}: {e}",
+            show(path)
+        ))
+    })?;
     if after.iter().any(|n| n.path == path) {
         return Err(PatchError::SelfCheck(format!(
-            "删除后 {} 仍然存在",
+            "{} is still there after the delete",
             show(path)
         )));
     }
@@ -206,11 +218,15 @@ pub fn replace_item(
 
     let mut path = seq_path.to_vec();
     path.push(Step::Index(index));
-    let after = nodes(&out)
-        .map_err(|e| PatchError::SelfCheck(format!("替换 {} 后配置无法解析：{e}", show(&path))))?;
+    let after = nodes(&out).map_err(|e| {
+        PatchError::SelfCheck(format!(
+            "the configuration could not be parsed after replacing {}: {e}",
+            show(&path)
+        ))
+    })?;
     if count_items(&after, seq_path) != count {
         return Err(PatchError::SelfCheck(format!(
-            "替换后 {} 的项数发生了变化",
+            "the number of entries under {} changed after the replace",
             show(seq_path)
         )));
     }
@@ -335,13 +351,17 @@ fn add_key(text: &str, all: &[Node], path: &[Step], value: Put<'_>) -> Result<St
     if is_flow(text, a) {
         let (1, Put::Inline(rendered)) = (keys.len(), value) else {
             return Err(PatchError::NotFound(format!(
-                "{}（行内映射中不能写入多层或多行的值）",
+                "{} (an inline mapping takes neither a nested nor a multi-line value)",
                 show(path)
             )));
         };
         let key = keys[0];
-        let close = flow_end(text, a.bytes.start)
-            .ok_or_else(|| PatchError::NotFound(format!("{}（行内映射未闭合）", show(anchor))))?;
+        let close = flow_end(text, a.bytes.start).ok_or_else(|| {
+            PatchError::NotFound(format!(
+                "{} (the inline mapping is not closed)",
+                show(anchor)
+            ))
+        })?;
         let inner = text[a.bytes.start + 1..close].trim();
         let piece = if inner.is_empty() {
             format!("{key}: {rendered}")
@@ -415,9 +435,11 @@ fn is_flow(text: &str, n: &Node) -> bool {
 fn value_end(text: &str, all: &[Node], n: &Node) -> Result<usize, PatchError> {
     match &n.kind {
         NodeKind::Scalar { .. } | NodeKind::Alias => Ok(n.bytes.end.min(text.len())),
-        NodeKind::Map | NodeKind::Seq if is_flow(text, n) => flow_end(text, n.bytes.start)
-            .map(|i| i + 1)
-            .ok_or_else(|| PatchError::NotFound(format!("{}（行内写法未闭合）", show(&n.path)))),
+        NodeKind::Map | NodeKind::Seq if is_flow(text, n) => {
+            flow_end(text, n.bytes.start).map(|i| i + 1).ok_or_else(|| {
+                PatchError::NotFound(format!("{} (the inline form is not closed)", show(&n.path)))
+            })
+        }
         NodeKind::Map | NodeKind::Seq => {
             block_end(text, all, &n.path).ok_or_else(|| PatchError::NotFound(show(&n.path)))
         }
@@ -469,9 +491,9 @@ fn untouched_outside(before: &[Node], after: &[Node], path: &[Step]) -> Result<(
             .zip(a.iter())
             .find(|(x, y)| x != y)
             .map(|(x, _)| show(x.0))
-            .unwrap_or_else(|| format!("节点数 {} → {}", b.len(), a.len()));
+            .unwrap_or_else(|| format!("{} nodes → {}", b.len(), a.len()));
         return Err(PatchError::SelfCheck(format!(
-            "写入 {} 时修改了其他位置（{diff}）",
+            "writing {} changed something else as well ({diff})",
             show(path)
         )));
     }
@@ -491,7 +513,7 @@ fn lands_as(after: &[Node], path: &[Step], frag: &[Node]) -> Result<(), PatchErr
         .collect();
     if got != want {
         return Err(PatchError::SelfCheck(format!(
-            "{} 写入后读回的值与预期不一致",
+            "the value read back after writing {} is not what was expected",
             show(path)
         )));
     }

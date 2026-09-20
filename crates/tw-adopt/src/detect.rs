@@ -237,34 +237,34 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
             if started.is_empty() {
                 out.push(Finding {
                     level: Level::Clear,
-                    title: format!("{} 当前未运行", c.name),
-                    detail: "下次启动时将读取新配置。".into(),
+                    title: format!("{} is not running", c.name),
+                    detail: "It reads the new configuration the next time it starts.".into(),
                     fix: None,
                 });
             } else if !stale.is_empty() {
                 out.push(Finding {
                     level: Level::Blocking,
-                    title: format!("{} 的进程启动于接管之前", c.name),
+                    title: format!("{} was started before the change", c.name),
                     detail: format!(
-                        "有 {} 个进程在接管之前启动，仍在使用旧配置。{}",
+                        "{} processes were started before the change and are still on the old configuration. {}",
                         stale.len(),
                         c.takes_effect.note()
                     ),
-                    fix: Some(format!("退出 {} 后重新打开", c.name)),
+                    fix: Some(format!("Quit {} and open it again", c.name)),
                 });
             } else {
                 out.push(Finding {
                     level: Level::Clear,
-                    title: format!("{} 在接管之后启动", c.name),
-                    detail: "已读取新配置。".into(),
+                    title: format!("{} was started after the change", c.name),
+                    detail: "It has read the new configuration.".into(),
                     fix: None,
                 });
             }
         }
         None => out.push(Finding {
             level: Level::Suspect,
-            title: "尚未接管该客户端".into(),
-            detail: format!("{} 中没有接管记录。", d.real.display()),
+            title: "This client has not been pointed at the gateway".into(),
+            detail: format!("{} carries no record.", d.real.display()),
             fix: None,
         }),
     }
@@ -273,11 +273,11 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if d.shadows.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: "没有优先级更高的配置文件".into(),
+            title: "Nothing takes precedence over this file".into(),
             detail: if c.shadowed_by.is_empty() {
-                "该客户端没有优先级更高的配置文件。".into()
+                "This client has no configuration file that takes precedence.".into()
             } else {
-                format!("{} 不存在。", c.shadowed_by.join("、"))
+                format!("{} does not exist.", c.shadowed_by.join(", "))
             },
             fix: None,
         });
@@ -291,19 +291,22 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     Level::Blocking
                 },
-                title: format!("{} 的优先级高于接管写入的配置", s.display()),
+                title: format!(
+                    "{} takes precedence over what was written here",
+                    s.display()
+                ),
                 detail: if hits.is_empty() {
-                    "该文件存在，但不包含相关字段。".into()
+                    "The file exists, but carries none of the fields in question.".into()
                 } else {
                     format!(
-                        "该文件中包含 {}，会覆盖接管写入的设置。",
+                        "The file carries {}, which overrides what was written here.",
                         hits.iter()
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>()
-                            .join("、")
+                            .join(", ")
                     )
                 },
-                fix: Some(format!("检查 {} 中的相关字段", s.display())),
+                fix: Some(format!("Look at those fields in {}", s.display())),
             });
         }
     }
@@ -314,9 +317,12 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
         if local.exists() {
             out.push(Finding {
                 level: Level::Suspect,
-                title: "当前项目中有同名配置文件".into(),
-                detail: format!("{} 会覆盖用户级配置。", local.display()),
-                fix: Some(format!("检查 {}", local.display())),
+                title: "This project has a configuration file of the same name".into(),
+                detail: format!(
+                    "{} overrides the user-level configuration.",
+                    local.display()
+                ),
+                fix: Some(format!("Look at {}", local.display())),
             });
         }
     }
@@ -332,15 +338,16 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     Level::Blocking
                 },
-                title: "本机存在管理策略文件".into(),
-                detail: format!("{MANAGED} 的优先级高于其他所有配置，包括用户配置。"),
+                title: "This machine has a managed-policy file".into(),
+                detail: format!("{MANAGED} takes precedence over everything else, including the user's own configuration."),
                 fix: None,
             });
         } else {
             out.push(Finding {
                 level: Level::Clear,
-                title: "本机没有管理策略文件".into(),
-                detail: "不存在优先级高于其他所有配置的管理策略文件。".into(),
+                title: "This machine has no managed-policy file".into(),
+                detail: "There is no managed-policy file taking precedence over everything else."
+                    .into(),
                 fix: None,
             });
         }
@@ -351,8 +358,8 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if exports.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: "shell 配置中没有同名环境变量".into(),
-            detail: "已检查 .zshrc、.zprofile、.bashrc 等文件。".into(),
+            title: "No shell file exports a variable of the same name".into(),
+            detail: "Checked .zshrc, .zprofile, .bashrc and the rest.".into(),
             fix: None,
         });
     } else {
@@ -363,19 +370,22 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 (
                     Level::Suspect,
                     format!(
-                        "不影响 {}（其配置文件优先级更高），但会影响读取环境变量的其他客户端。",
+                        "It does not affect {}, whose configuration file takes precedence, but it does affect every client that reads the environment.",
                         c.name
                     ),
                 )
             } else {
                 (
                     Level::Blocking,
-                    format!("{} 读取环境变量，该行会覆盖接管写入的配置。", c.name),
+                    format!(
+                        "{} reads the environment, so this line overrides what was written here.",
+                        c.name
+                    ),
                 )
             };
             out.push(Finding {
                 level,
-                title: format!("{} 第 {line} 行导出了 {name}", f.display()),
+                title: format!("{} exports {name} on line {line}", f.display()),
                 detail,
                 // 命令给出来，执行与否是他的事
                 fix: Some(format!("sed -i '' '{line}d' {}", f.display())),
@@ -387,17 +397,17 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     match (&d.adopted_at_ms, &d.endpoint) {
         (Some(_), None) => out.push(Finding {
             level: Level::Blocking,
-            title: "接管写入的字段已不在配置中".into(),
+            title: "The fields written here are no longer in the configuration".into(),
             detail: format!(
-                "{} 中未找到接管写入的接口地址，可能已被其他工具修改。",
+                "{} no longer carries the endpoint that was written here; something else may have changed it.",
                 d.real.display()
             ),
-            fix: Some("重新接管该客户端".into()),
+            fix: Some("Point this client at the gateway again".into()),
         }),
         (Some(_), Some(ep)) => out.push(Finding {
             level: Level::Clear,
-            title: "配置中的接口地址与接管时一致".into(),
-            detail: format!("当前指向 {ep}。"),
+            title: "The endpoint in the configuration is the one written here".into(),
+            detail: format!("It points at {ep}."),
             fix: None,
         }),
         _ => {}
@@ -407,8 +417,8 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     // 绿色的「查过了没问题」会让人以为已经确认过。
     out.push(Finding {
         level: Level::Suspect,
-        title: "以上均为静态检查".into(),
-        detail: "静态检查无法确认配置已实际生效。收到该客户端的真实请求后，才能确认接管已生效。"
+        title: "Everything above is a static check".into(),
+        detail: "A static check cannot tell whether the configuration is actually in use. Only a real request from this client settles that."
             .into(),
         fix: None,
     });
@@ -480,7 +490,7 @@ mod tests {
             .find(|f| f.title.contains("ANTHROPIC_BASE_URL"))
             .unwrap();
         assert_eq!(f.level, Level::Suspect, "{:?}", f);
-        assert!(f.detail.contains("优先级更高"), "{}", f.detail);
+        assert!(f.detail.contains("takes precedence"), "{}", f.detail);
 
         let cx = diagnose(&c("codex"), home, None);
         let f = cx
@@ -505,7 +515,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let out = diagnose(&c("claude-code"), d.path(), None);
         assert!(
-            out.iter().any(|f| f.detail.contains("真实请求")),
+            out.iter().any(|f| f.detail.contains("real request")),
             "结论里没留下这句话：{out:?}"
         );
     }

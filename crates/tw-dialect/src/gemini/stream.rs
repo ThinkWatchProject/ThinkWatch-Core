@@ -43,7 +43,9 @@ impl Parser {
     pub fn chunk(&mut self, v: &Value, out: &mut Vec<Event>) {
         if let Some(e) = v.get("error") {
             out.push(Event::Error {
-                message: str_of(e, "message").unwrap_or("上游返回错误").to_string(),
+                message: str_of(e, "message")
+                    .unwrap_or("the upstream returned an error")
+                    .to_string(),
             });
             return;
         }

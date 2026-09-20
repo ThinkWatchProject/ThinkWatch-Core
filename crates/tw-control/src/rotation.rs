@@ -213,14 +213,14 @@ providers:
         // 明文密钥的文件里猜结构是不能接受的
         let e = tw_config::patch_oauth_tokens(CFG, "已经删掉了", renewal(Some("rt-NEW"), "at"))
             .unwrap_err();
-        assert!(e.to_string().contains("已不存在上游"), "{e}");
+        assert!(e.to_string().contains("no longer has an upstream"), "{e}");
     }
 
     #[test]
     fn a_provider_without_oauth_is_refused_rather_than_rewritten() {
         let e =
             tw_config::patch_oauth_tokens(CFG, "官方", renewal(Some("rt-NEW"), "at")).unwrap_err();
-        assert!(e.to_string().contains("无法定位"), "{e}");
+        assert!(e.to_string().contains("could not be located"), "{e}");
     }
 
     #[test]

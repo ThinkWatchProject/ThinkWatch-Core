@@ -25,23 +25,27 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ForeignError {
-    #[error("无法读取 {path}：{source}")]
+    #[error("{path} could not be read: {source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("无法写入 {path}：{source}")]
+    #[error("{path} could not be written: {source}")]
     Write {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} 在确认之后又被修改，未写入。请重新查看改动")]
+    #[error(
+        "{path} changed after it was confirmed, so nothing was written. Look at the change again"
+    )]
     ChangedUnderUs { path: PathBuf },
-    #[error("修改后的内容未通过校验，未写入（{0}）")]
+    #[error("the edited content did not pass its check, so nothing was written ({0})")]
     VerifyFailed(String),
-    #[error("写入后读回的内容与预期不一致，已从备份还原：{path}")]
+    #[error(
+        "what was read back after writing is not what was expected; restored from the backup: {path}"
+    )]
     Readback { path: PathBuf },
-    #[error("符号链接层级过多：{path}")]
+    #[error("too many levels of symbolic link: {path}")]
     LinkLoop { path: PathBuf },
 }
 
@@ -240,7 +244,7 @@ pub fn apply(
         // 的是 ~/dotfiles/claude/settings.json —— 那是个会被 git 提交
         // 的地方，而我们正要往里放一个密钥。
         warnings.push(format!(
-            "{} 是符号链接，实际写入的文件为 {}。",
+            "{} is a symbolic link; the file actually written is {}.",
             ch.path.display(),
             real.display()
         ));
@@ -277,7 +281,7 @@ pub fn apply(
         && m & 0o077 != 0
     {
         warnings.push(format!(
-            "{} 的权限为 {:o}，本机其他用户可以读取写入的密钥。可执行 chmod 600 {} 收紧权限。",
+            "{} is mode {:o}, so other users on this machine can read the key written into it. chmod 600 {} tightens it.",
             real.display(),
             m,
             real.display()
@@ -358,7 +362,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         assert!(
-            a.warnings.iter().any(|w| w.contains("符号链接")),
+            a.warnings.iter().any(|w| w.contains("symbolic link")),
             "{:?}",
             a.warnings
         );

@@ -13,8 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const BEGIN: &str = "=== ThinkWatch 接管开始 ===";
-pub const END: &str = "=== ThinkWatch 接管结束 ===";
+pub const BEGIN: &str = "=== ThinkWatch: begin ===";
+pub const END: &str = "=== ThinkWatch: end ===";
 
 /// 这个字段原本是什么样。**三态，不是「有值/没值」两态。**
 ///
@@ -47,9 +47,13 @@ impl Was {
     }
     fn note(&self) -> &'static str {
         match self {
-            Was::Missing => "原配置中没有该字段，还原时删除",
-            Was::Value(_) => "原配置中已有该字段，还原时写回「原值」",
-            Was::Secret(_) => "原值是密钥，未写入本文件，请从「全文备份」所指的文件中获取",
+            Was::Missing => "the original configuration had no such field; restoring removes it",
+            Was::Value(_) => {
+                "the original configuration had this field; restoring writes `was` back"
+            }
+            Was::Secret(_) => {
+                "the original value is a secret and is not in this file; take it from the full backup named above"
+            }
         }
     }
 }
@@ -95,14 +99,14 @@ pub fn comment_block(prefix: &str, originals: &[Original]) -> String {
     out.push_str(&format!("{prefix} {BEGIN}\n"));
     for o in originals {
         match &o.was {
-            Was::Missing => out.push_str(&format!("{prefix} 原配置中没有 {}\n", o.field)),
+            Was::Missing => out.push_str(&format!("{prefix} no {} originally\n", o.field)),
             Was::Value(v) | Was::Secret(v) => {
-                out.push_str(&format!("{prefix} 原值 {}: {v}\n", o.field))
+                out.push_str(&format!("{prefix} was {}: {v}\n", o.field))
             }
         }
     }
     out.push_str(&format!(
-        "{prefix} 手动还原方法：将以上字段恢复为原值（原配置中没有的字段直接删除），然后删除本段注释\n"
+        "{prefix} to restore by hand: put the fields above back to what they were (delete the ones that had no value), then delete this block\n"
     ));
     out.push_str(&format!("{prefix} {END}\n"));
     out
@@ -143,9 +147,9 @@ pub struct SidecarField {
     pub path: Vec<String>,
     /// 机器读的标记：`missing` / `value` / `secret`
     pub was: String,
-    #[serde(rename = "原值", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "was_value", skip_serializing_if = "Option::is_none", default)]
     pub value: Option<String>,
-    #[serde(rename = "说明")]
+    #[serde(rename = "note")]
     pub note: String,
 }
 
@@ -157,21 +161,21 @@ pub struct SidecarField {
 pub struct SidecarRecord {
     /// 人话说明，**放在第一个字段** —— 用户打开这个文件，第一眼看到的
     /// 应该是「这是什么」
-    #[serde(rename = "这个文件是什么")]
+    #[serde(rename = "what_this_file_is")]
     pub what: String,
-    #[serde(rename = "怎么手动还原")]
+    #[serde(rename = "how_to_restore_by_hand")]
     pub how: String,
     pub client: String,
     pub adopted_at_ms: u64,
     /// 接管前那一刻的全文备份。密钥类原值只在这里，不在本文件里。
-    #[serde(rename = "全文备份")]
+    #[serde(rename = "full_backup")]
     pub backup: String,
     /// 这个配置文件本来不存在，是接管时新建的。
     ///
     /// 还原时要能把它**整个删掉** —— 否则「还原」之后会留下一个用户
     /// 从来没有过的文件。但只在它还是空的时候删：用户可能在这期间往
     /// 里加了自己的东西。
-    #[serde(rename = "文件是我们建的", default)]
+    #[serde(rename = "file_created_by_us", default)]
     pub created_file: bool,
     pub originals: Vec<SidecarField>,
 }
@@ -203,9 +207,14 @@ impl SidecarRecord {
     ) -> Self {
         Self {
             what: format!(
-                "ThinkWatch Lite 接管 {client} 时生成的记录，记载了修改过的字段及其原值。"
+                "Written by ThinkWatch Lite when it pointed {client} at the gateway. It records \
+                 the fields that were changed and what they were before."
             ),
-            how: "将 originals 中的每个字段恢复为「原值」（was 为 missing 表示原配置中没有该字段，直接删除即可；was 为 secret 表示原值是密钥，请从「全文备份」所指的文件中获取），然后删除本文件。".to_string(),
+            how: "Put every field under `originals` back to its `was_value`. A `was` of \
+                  `missing` means the field was not there to begin with, so delete it; a `was` of \
+                  `secret` means the original is a secret, which is in the file named by \
+                  `full_backup`. Then delete this file."
+                .to_string(),
             client: client.to_string(),
             adopted_at_ms: at_ms,
             backup: backup.to_string(),
@@ -247,7 +256,7 @@ mod tests {
         // 可能已经在废纸篓里了 —— 那段注释是他唯一的线索。
         let b = comment_block("#", &originals());
         assert!(b.contains("https://api.anthropic.com"), "原值没写进去：{b}");
-        assert!(b.contains("手动还原方法"), "没告诉他能做什么：{b}");
+        assert!(b.contains("to restore by hand"), "没告诉他能做什么：{b}");
         assert!(b.contains(BEGIN) && b.contains(END), "{b}");
     }
 
@@ -258,11 +267,11 @@ mod tests {
         // 的字段。
         let b = comment_block("#", &originals());
         assert!(
-            b.contains("原配置中没有 env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
+            b.contains("no env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY originally"),
             "{b}"
         );
         assert!(
-            !b.contains("原值 env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
+            !b.contains("was env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
             "{b}"
         );
     }
@@ -293,7 +302,7 @@ mod tests {
             .find(|f| f.field.ends_with("AUTH_TOKEN"))
             .unwrap();
         assert_eq!(f.was, "secret");
-        assert!(f.note.contains("备份"), "{}", f.note);
+        assert!(f.note.contains("full backup"), "{}", f.note);
         assert!(rec.backup.contains("backups"), "{}", rec.backup);
     }
 
@@ -302,8 +311,8 @@ mod tests {
         let rec = SidecarRecord::new("claude-code", 1, "b", false, &originals());
         let j = serde_json::to_string_pretty(&rec).unwrap();
         let first = j.lines().nth(1).unwrap();
-        assert!(first.contains("这个文件是什么"), "{first}");
-        assert!(j.contains("怎么手动还原"), "{j}");
+        assert!(first.contains("what_this_file_is"), "{first}");
+        assert!(j.contains("how_to_restore_by_hand"), "{j}");
     }
 
     #[test]

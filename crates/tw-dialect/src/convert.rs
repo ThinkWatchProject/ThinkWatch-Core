@@ -61,7 +61,7 @@ pub fn decode(
         Dialect::Gemini => {
             let (model, stream) = gemini_path(path).ok_or_else(|| {
                 Rejection(format!(
-                    "无法从路径 {path} 中读出 Gemini 的模型和调用方式。"
+                    "The path {path} does not say which Gemini model to call, or how."
                 ))
             })?;
             shape.gemini_sse = query.is_some_and(|q| q.split('&').any(|kv| kv == "alt=sse"));
@@ -132,8 +132,8 @@ pub fn prepare(
     query: Option<&str>,
     target: &Target,
 ) -> Result<Prepared, Rejection> {
-    let v: Value =
-        serde_json::from_slice(body).map_err(|_| Rejection("请求体不是合法的 JSON。".into()))?;
+    let v: Value = serde_json::from_slice(body)
+        .map_err(|_| Rejection("The request body is not valid JSON.".into()))?;
     Ok(decode(client, &v, path, query)?.encode(target))
 }
 
@@ -265,7 +265,7 @@ impl Session {
                 let text = String::from_utf8_lossy(body);
                 let text = text.trim();
                 if text.is_empty() {
-                    format!("上游返回 HTTP {status}，没有附带说明。")
+                    format!("The upstream answered HTTP {status} with nothing else.")
                 } else {
                     text.chars().take(2000).collect()
                 }
@@ -847,7 +847,7 @@ mod tests {
             &target(Dialect::Chat),
         )
         .unwrap_err();
-        assert_eq!(e.0, "请求体不是合法的 JSON。");
+        assert_eq!(e.0, "The request body is not valid JSON.");
     }
 
     #[test]

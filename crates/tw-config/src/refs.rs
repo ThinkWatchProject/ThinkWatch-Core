@@ -228,12 +228,12 @@ pub fn client_refs(cfg: &Config, name: &str) -> Vec<String> {
     for route in &cfg.routes {
         for rule in &route.rules {
             if rule.when.client.as_deref() == Some(name) {
-                out.push(format!("路由「{}」的规则「{}」", route.name, rule.name));
+                out.push(format!("rule `{}` of route `{}`", rule.name, route.name));
             }
         }
     }
     if cfg.default_key.as_deref() == Some(name) {
-        out.push("默认密钥".to_string());
+        out.push("the default key".to_string());
     }
     out
 }
@@ -332,7 +332,7 @@ groups:
     type: fallback
     providers: [relay, 官方]
 routes:
-  - name: 默认
+  - name: default
     rules:
       - name: 长上下文
         when: { input_tokens: '>200k' }
@@ -356,11 +356,11 @@ routes:
             refs,
             vec![
                 ProviderRef::RuleTarget {
-                    route: "默认".into(),
+                    route: "default".into(),
                     rule: "长上下文".into()
                 },
                 ProviderRef::RuleCondition {
-                    route: "默认".into(),
+                    route: "default".into(),
                     rule: "中转脱敏".into()
                 },
                 ProviderRef::Group {
@@ -424,7 +424,7 @@ routes:
         assert_eq!(
             group_refs(&cfg(CFG), "pool"),
             vec![RuleRef {
-                route: "默认".into(),
+                route: "default".into(),
                 rule: "兜底".into()
             }]
         );
@@ -453,14 +453,14 @@ routes:
         // 默认路由没写在配置里：改名之后要写进去，否则默认路由指向一条不存在的「默认」
         let text = CFG.replace(
             "    key: tw-k\n",
-            "    key: tw-k\n  - name: codex\n    key: tw-x\n    route: 默认\n",
+            "    key: tw-k\n  - name: codex\n    key: tw-x\n    route: default\n",
         );
         let c = cfg(&text);
-        assert_eq!(route_users(&c, "默认"), ["codex"]);
+        assert_eq!(route_users(&c, "default"), ["codex"]);
         let renamed = edit::upsert(
             &text,
             edit::ROUTES,
-            Some("默认"),
+            Some("default"),
             &edit::parse(&text).unwrap()["routes"][0]
                 .as_mapping()
                 .map(|m| {
@@ -471,7 +471,7 @@ routes:
                 .unwrap(),
         )
         .unwrap();
-        let out = rename_route(&renamed, &c, "默认", "通用").unwrap();
+        let out = rename_route(&renamed, &c, "default", "通用").unwrap();
         let after = cfg(&out);
         assert_eq!(after.default_route.as_deref(), Some("通用"));
         assert_eq!(route_users(&after, "通用"), ["codex"]);
@@ -486,7 +486,7 @@ routes:
                 .unwrap(),
         )
         .unwrap();
-        let back = rename_route(&back, &after, "通用", "默认").unwrap();
+        let back = rename_route(&back, &after, "通用", "default").unwrap();
         assert!(!back.contains("default_route"), "{back}");
     }
 

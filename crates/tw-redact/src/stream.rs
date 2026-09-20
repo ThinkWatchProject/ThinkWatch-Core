@@ -175,8 +175,8 @@ impl ByteRestorer {
         };
         // 尾巴上那半个字符留到下一块
         self.partial = buf[valid..].to_vec();
-        let text =
-            std::str::from_utf8(&buf[..valid]).expect("valid_up_to 之前的字节是合法的 UTF-8");
+        let text = std::str::from_utf8(&buf[..valid])
+            .expect("the bytes before valid_up_to are valid UTF-8");
         self.inner.process(text).into_bytes()
     }
 
