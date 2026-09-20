@@ -82,12 +82,17 @@ impl Verified {
             Verified::FieldsOnly => "fields_only",
         }
     }
-    /// 命令行里的说法。
+    /// 这一条我们了解到什么程度，说成一句话。
+    ///
+    /// **一整句，不是半截。**它会被接到另一句前面（接管说明里那条
+    /// 「收到第一个请求之前别当成已生效」），半截话接上去读出来是
+    /// 「…on this machine Do not take it…」—— 中间没有停顿，后半句还
+    /// 小写开头。[`TakesEffect::note`] 早就是整句的，这里跟上。
     pub fn note(&self) -> &'static str {
         match self {
-            Verified::Measured => "checked by actually running it on this machine",
+            Verified::Measured => "It was checked by actually running it on this machine.",
             Verified::FieldsOnly => {
-                "the field names are verified; it has not been run on this machine"
+                "The field names are verified; it has not been run on this machine."
             }
         }
     }
@@ -661,6 +666,27 @@ mod tests {
         for m in manual_only() {
             assert!(!m.how(&gw).code.is_empty(), "{}：步骤没有码", m.name);
             assert!(!m.caveat().code.is_empty(), "{}：提醒没有码", m.name);
+        }
+    }
+
+    /// **`note()` 给的是整句，不是半截。**这两个 `note()` 都会被接到
+    /// 别的句子前后去，半截话接上去就是一句读不通的话 —— 而它不会报错，
+    /// 只会让用户读到 `…on this machine Do not take it…`。
+    #[test]
+    fn a_note_is_a_whole_sentence() {
+        let notes = [
+            Verified::Measured.note(),
+            Verified::FieldsOnly.note(),
+            TakesEffect::Immediately.note(),
+            TakesEffect::OnRestart.note(),
+        ];
+        for n in notes {
+            let first = n.chars().next().expect("note 不为空");
+            assert!(
+                first.is_uppercase(),
+                "「{n}」小写开头，接在别的句子后面读不通"
+            );
+            assert!(n.ends_with('.'), "「{n}」没有句号，后面再接一句就连成一片");
         }
     }
 
