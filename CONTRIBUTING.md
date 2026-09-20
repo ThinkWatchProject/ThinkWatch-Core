@@ -1,16 +1,20 @@
 # Contributing to ThinkWatch Core
 
-## Open PRs against `dev`
+## Open PRs against `main`
 
 ```bash
-gh pr create --base dev --head your-branch
+gh pr create --base main --head your-branch
 ```
 
-`main` is the release line; `dev` is where routine work lands. GitHub
-pre-fills a new PR's base with the repo's default branch, which is
-`main`, so **the default is not the one you want**. If you already
-opened against `main`, click *Edit* next to the PR title and change the
-base — the commits and the discussion carry over. A bot will remind you.
+`main` is the only long-lived branch. Every PR lands on it, and a
+release is a tagged commit on it rather than a separate line, so the
+base GitHub pre-fills is the one you want.
+
+There used to be a `dev` branch in between, and a bot that asked you to
+retarget onto it. Both are gone. With one branch there is nothing to
+keep in sync and no window in which a fix is merged but not yet
+releasable; the `dev` branch's last act was to sit still for five days
+while thirty-five commits landed on `main` without it.
 
 ## What this repository is
 
