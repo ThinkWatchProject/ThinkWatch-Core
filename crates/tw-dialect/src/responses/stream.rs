@@ -290,7 +290,7 @@ impl Parser {
                     .get("response")
                     .and_then(|r| r.get("error"))
                     .and_then(|e| str_of(e, "message"))
-                    .unwrap_or("上游返回 response.failed")
+                    .unwrap_or("the upstream returned response.failed")
                     .to_string(),
             }),
             "error" => out.push(Event::Error {

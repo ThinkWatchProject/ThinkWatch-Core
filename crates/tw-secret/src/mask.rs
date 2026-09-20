@@ -23,7 +23,7 @@ pub fn mask_secret(s: &str) -> String {
 /// 「去掉 query」，是「只留 scheme://host:port」。
 pub fn redact_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
-        return "<非 URL>".to_string();
+        return "<not a URL>".to_string();
     };
     let rest = &url[scheme_end + 3..];
     // userinfo（user:pass@host）整段丢掉
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn non_url_is_not_echoed_back() {
-        assert_eq!(redact_url("sk-this-is-actually-a-key"), "<非 URL>");
+        assert_eq!(redact_url("sk-this-is-actually-a-key"), "<not a URL>");
     }
 }
 

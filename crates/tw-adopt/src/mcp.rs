@@ -16,15 +16,17 @@ use crate::json::Val;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    #[error("未知的客户端 {0}")]
+    #[error("{0} is not a client we know")]
     UnknownClient(String),
-    #[error("无法解析 {client} 的 MCP 配置，未做任何修改：{msg}")]
+    #[error("the MCP configuration of {client} could not be parsed, so nothing was changed: {msg}")]
     Parse { client: String, msg: String },
     #[error("{0}")]
     Write(#[from] ForeignError),
-    #[error("{client} 中没有名为「{name}」的 MCP server")]
+    #[error("{client} has no MCP server named `{name}`")]
     NotThere { client: String, name: String },
-    #[error("{client} 的 MCP 配置格式未经验证，不支持写入（{why}）")]
+    #[error(
+        "the MCP configuration format of {client} is unverified, so it is not written to ({why})"
+    )]
     NotCopyable { client: String, why: String },
 }
 
@@ -98,7 +100,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "mcp",
             copyable: false,
-            why_not: "该客户端的 MCP 配置格式尚未验证，写入可能导致客户端无法读取配置",
+            why_not: "this client's MCP configuration format is not verified yet, and writing to it could leave the client unable to read its own configuration",
         },
         Target {
             client: "zed",
@@ -107,7 +109,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "context_servers",
             copyable: false,
-            why_not: "Zed 的 context server 使用不同的配置结构，不支持 command/args 形式",
+            why_not: "Zed's context servers use a different structure and do not take the command/args form",
         },
     ]
 }
@@ -146,7 +148,7 @@ fn semantic(t: &Target, text: &str) -> Result<Val, McpError> {
     match t.format {
         Format::Json => crate::json::value(text).map_err(|e| parse_err(t.client, e)),
         Format::Toml => crate::toml::value(text).map_err(|e| parse_err(t.client, e)),
-        Format::Yaml => Err(parse_err(t.client, "MCP 配置不使用 YAML 格式")),
+        Format::Yaml => Err(parse_err(t.client, "MCP configuration is not YAML")),
     }
 }
 
@@ -154,7 +156,7 @@ fn put(t: &Target, text: &str, path: &[&str], v: &Val) -> Result<String, McpErro
     match t.format {
         Format::Json => crate::json::set(text, path, v).map_err(|e| parse_err(t.client, e)),
         Format::Toml => crate::toml::set(text, path, v).map_err(|e| parse_err(t.client, e)),
-        Format::Yaml => Err(parse_err(t.client, "MCP 配置不使用 YAML 格式")),
+        Format::Yaml => Err(parse_err(t.client, "MCP configuration is not YAML")),
     }
 }
 
@@ -162,7 +164,7 @@ fn drop_(t: &Target, text: &str, path: &[&str]) -> Result<String, McpError> {
     match t.format {
         Format::Json => crate::json::remove(text, path).map_err(|e| parse_err(t.client, e)),
         Format::Toml => crate::toml::remove(text, path).map_err(|e| parse_err(t.client, e)),
-        Format::Yaml => Err(parse_err(t.client, "MCP 配置不使用 YAML 格式")),
+        Format::Yaml => Err(parse_err(t.client, "MCP configuration is not YAML")),
     }
 }
 
@@ -198,7 +200,7 @@ pub fn read_server(t: &Target, home: &Path, name: &str) -> Result<Val, McpError>
     }
     let v = semantic(t, &text)?;
     let Val::Obj(root) = &v else {
-        return Err(parse_err(t.client, "根节点不是对象"));
+        return Err(parse_err(t.client, "the root is not an object"));
     };
     let servers = root.iter().find(|(k, _)| k == t.key).map(|(_, v)| v);
     match servers {
@@ -295,13 +297,13 @@ pub fn apply(t: &Target, plan: &Plan, backup_root: &Path) -> Result<Applied, Mcp
             let got = match t.format {
                 Format::Json => crate::json::value(text).map_err(|e| e.to_string())?,
                 Format::Toml => crate::toml::value(text).map_err(|e| e.to_string())?,
-                Format::Yaml => return Err("MCP 配置不使用 YAML 格式".into()),
+                Format::Yaml => return Err("MCP configuration is not YAML".into()),
             };
             if strip(&got).normalized() != untouched {
-                return Err(format!("除 {key} 之外还有其他内容发生了变化"));
+                return Err(format!("something other than {key} changed"));
             }
             if got.normalized() != want.normalized() {
-                return Err("修改后的内容与预期不一致".into());
+                return Err("the edited content is not what was expected".into());
             }
             Ok(())
         },

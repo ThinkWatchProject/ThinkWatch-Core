@@ -24,24 +24,28 @@ use crate::sentinel::{self, Original, SidecarRecord, Was};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
-    #[error("无法读取 {client} 的配置：{source}")]
+    #[error("the configuration of {client} could not be read: {source}")]
     Read {
         client: String,
         source: ForeignError,
     },
-    #[error("无法解析 {client} 的配置，未做任何修改：{msg}")]
+    #[error("the configuration of {client} could not be parsed, so nothing was changed: {msg}")]
     Parse { client: String, msg: String },
     #[error("{0}")]
     Write(#[from] ForeignError),
-    #[error("{path} 旁的接管记录属于 {other}，不属于 {client}，未做任何修改")]
+    #[error("the record beside {path} belongs to {other}, not {client}, so nothing was changed")]
     ForeignSidecar {
         path: PathBuf,
         other: String,
         client: String,
     },
-    #[error("未找到 {client} 的接管记录，无法确定还原内容。如需手动还原，请查看 {path}")]
+    #[error(
+        "there is no record for {client}, so there is nothing to restore from. To restore by hand, look at {path}"
+    )]
     NoRecord { client: String, path: PathBuf },
-    #[error("{client} 的原值是密钥，仅保存在全文备份中，而备份 {backup} 已不存在")]
+    #[error(
+        "the original value for {client} is a secret kept only in the full backup, and the backup {backup} is gone"
+    )]
     SecretGone { client: String, backup: PathBuf },
 }
 
@@ -220,7 +224,7 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
     notes.extend(c.costs.iter().map(|s| s.to_string()));
     if c.verified == crate::clients::Verified::FieldsOnly {
         notes.push(format!(
-            "{}。收到第一个请求之前，请勿视为已生效。",
+            "{} Do not take it as working until the first request arrives.",
             c.verified.note()
         ));
     }
@@ -232,12 +236,12 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
         .collect();
     if !shadows.is_empty() {
         notes.push(format!(
-            "检测到 {}，其优先级高于接管写入的配置，其中的同名设置会覆盖接管的设置。",
+            "{} was found, and it takes precedence over what was written here, so a setting of the same name there wins.",
             shadows
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
-                .join("、")
+                .join(", ")
         ));
     }
 
@@ -338,7 +342,7 @@ pub fn apply(c: &Client, plan: &Plan, backup_root: &Path) -> Result<Applied, Pla
             if got.normalized() == expect.normalized() {
                 Ok(())
             } else {
-                Err("修改后的内容与「原文件加预期改动」不一致".into())
+                Err("the edited content is not the original plus the intended change".into())
             }
         },
     )?;
@@ -415,7 +419,10 @@ pub fn apply_restore(c: &Client, plan: &Plan, backup_root: &Path) -> Result<Appl
             if got.normalized() == expect.normalized() {
                 Ok(())
             } else {
-                Err("还原后的内容与「当前文件去掉接管写入的字段」不一致".into())
+                Err(
+                    "the restored content is not the current file minus the fields written here"
+                        .into(),
+                )
             }
         },
     )?;
@@ -463,7 +470,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
             after: String::new(),
             originals: Vec::new(),
             carries_secret: false,
-            notes: vec!["配置文件已不存在，仅删除接管记录。".into()],
+            notes: vec!["The configuration file is gone; only the record was removed.".into()],
             shadows: Vec::new(),
             targets: Vec::new(),
             drop_sidecar: Some(side),
@@ -499,7 +506,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
                 // 更糟 —— 那等于卸载之后还在替他发着请求。
                 targets.push(Target::Remove(p.clone()));
                 notes.push(format!(
-                    "{} 的原值是密钥，仅保存在全文备份中，而 {} 已不存在。该字段已删除，需要手动重新填写。",
+                    "The original value of {} is a secret kept only in the full backup, and {} is gone. The field was removed and has to be filled in again by hand.",
                     f.field,
                     backup.display()
                 ));
@@ -542,7 +549,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
     let delete_file = rec.created_file
         && matches!(semantic(c.format, &text, c.id)?, Val::Obj(ms) if ms.is_empty());
     if delete_file {
-        notes.push("该文件在接管时新建，还原后内容为空，已一并删除。".into());
+        notes.push("This file was created here, restoring leaves it empty, and it was removed with the rest.".into());
     }
 
     notes.insert(0, c.takes_effect.note().to_string());

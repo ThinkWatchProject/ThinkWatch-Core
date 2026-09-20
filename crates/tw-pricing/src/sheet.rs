@@ -102,24 +102,30 @@ pub struct PerMillion {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SheetError {
-    #[error("存在未填写名称的价目表")]
+    #[error("a price sheet has no name")]
     EmptyName,
-    #[error("价目表名称「{0}」首尾不能包含空白")]
+    #[error("the price sheet name `{0}` cannot start or end with whitespace")]
     PaddedName(String),
-    #[error("价目表名称重复：{0}")]
+    #[error("the price sheet name {0} appears twice")]
     DuplicateName(String),
-    #[error("价目表「{sheet}」的倍率 {value} 无效，倍率必须大于 0")]
+    #[error(
+        "the multiplier {value} of price sheet `{sheet}` is not valid; a multiplier is greater than 0"
+    )]
     BadMultiplier { sheet: String, value: f64 },
-    #[error("价目表「{sheet}」中存在未填写名称的模型")]
+    #[error("a model in price sheet `{sheet}` has no name")]
     EmptyModel { sheet: String },
-    #[error("价目表「{sheet}」中模型 {model} 的{field}为 {value}，单价不能为负数")]
+    #[error(
+        "the {field} of model {model} in price sheet `{sheet}` is {value}; a price cannot be negative"
+    )]
     BadPrice {
         sheet: String,
         model: String,
         field: &'static str,
         value: f64,
     },
-    #[error("价目表「{sheet}」中模型 {model} 的长上下文输入单价与输出单价需要同时填写")]
+    #[error(
+        "model {model} in price sheet `{sheet}` needs both the long-context input price and the output price, or neither"
+    )]
     HalfLongContext { sheet: String, model: String },
 }
 
@@ -187,15 +193,15 @@ impl SheetDef {
 impl PerMillion {
     fn fields(&self) -> Vec<(&'static str, f64)> {
         let mut out = vec![
-            ("输入单价", self.input),
-            ("输出单价", self.output),
-            ("缓存读取单价", self.cache_read),
-            ("缓存写入（5 分钟）单价", self.cache_write_5m),
-            ("缓存写入（1 小时）单价", self.cache_write_1h),
+            ("input price", self.input),
+            ("output price", self.output),
+            ("cache-read price", self.cache_read),
+            ("cache-write price (5 minutes)", self.cache_write_5m),
+            ("cache-write price (1 hour)", self.cache_write_1h),
         ];
         for (name, v) in [
-            ("长上下文输入单价", self.input_above_200k),
-            ("长上下文输出单价", self.output_above_200k),
+            ("long-context input price", self.input_above_200k),
+            ("long-context output price", self.output_above_200k),
         ] {
             if let Some(v) = v {
                 out.push((name, v));
@@ -295,7 +301,7 @@ mod tests {
             matches!(
                 e,
                 SheetError::BadPrice {
-                    field: "缓存读取单价",
+                    field: "cache-read price",
                     ..
                 }
             ),

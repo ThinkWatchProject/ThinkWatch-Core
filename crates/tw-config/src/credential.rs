@@ -83,7 +83,7 @@ impl Secret {
     /// 命令行和诊断包里的说法，**永远不含真实密钥**。
     pub fn describe(&self) -> String {
         if self.0.contains("${") {
-            format!("环境变量 {}", self.0)
+            format!("environment variable {}", self.0)
         } else {
             tw_secret::mask_secret(&self.0)
         }
@@ -129,7 +129,7 @@ impl<'de> Deserialize<'de> for Secret {
             // **说清楚该怎么写。**serde 默认只会说「expected a string」，而写错成
             // `key: { oauth: ... }` 的人要知道的是 OAuth 放在哪儿
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("字符串（可以包含 ${VAR}）。OAuth 凭据应写在上游的 oauth 字段中")
+                f.write_str("a string, which may contain ${VAR}. An OAuth credential belongs in the upstream's oauth field")
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Secret, E> {
                 Ok(Secret(v.to_string()))
@@ -217,7 +217,7 @@ impl<'de> Deserialize<'de> for Headers {
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = Headers;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("由「请求头名: 值」组成的映射")
+                f.write_str("a mapping of header name to value")
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -252,45 +252,53 @@ pub fn auth_header(protocol: Option<Protocol>) -> (&'static str, &'static str) {
 /// 凭据写法上的问题。**每一条都指到具体的那一行**，而不是「凭据无效」。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
-    #[error("API 密钥为空")]
+    #[error("the API key is empty")]
     EmptyKey,
-    #[error("key 和 oauth 只能填写其中一项")]
+    #[error("key and oauth are alternatives; fill in one of them")]
     KeyAndOauth,
-    #[error("oauth 的 refresh 和 endpoint 都不能为空")]
+    #[error("neither refresh nor endpoint of oauth can be empty")]
     EmptyOauth,
-    #[error("不支持接入 Claude 订阅账号的登录凭据，请改用 Anthropic API 密钥")]
+    #[error("a Claude subscription sign-in is not supported here; use an Anthropic API key")]
     ClaudeSubscription,
-    #[error("不支持接入 Gemini CLI 的 Google 登录凭据，请改用 Gemini API 密钥")]
+    #[error("the Google sign-in of Gemini CLI is not supported here; use a Gemini API key")]
     GoogleSubscription,
-    #[error("ChatGPT 账号上游只能使用登录获得的凭据")]
+    #[error("a ChatGPT account upstream takes only the credential obtained by signing in")]
     ChatgptWithoutLogin,
-    #[error("请求头「{0}」说明请求的来源，由网关如实发送，不能在配置中设置")]
+    #[error(
+        "the `{0}` header says where a request came from; the gateway sends it truthfully and it cannot be set in the configuration"
+    )]
     IdentityHeader(String),
-    #[error("请求头不能超过 {MAX_HEADERS} 个")]
+    #[error("there can be at most {MAX_HEADERS} headers")]
     TooManyHeaders,
     #[error(
-        "请求头名「{0}」不合法：只能由字母、数字和 - _ . ~ 组成，长度不超过 {MAX_HEADER_NAME} 个字符"
+        "the header name `{0}` is not valid: letters, digits and - _ . ~ only, and at most {MAX_HEADER_NAME} characters"
     )]
     BadHeaderName(String),
-    #[error("请求头「{0}」由网关管理，不能在配置中设置")]
+    #[error("the `{0}` header is the gateway's to manage and cannot be set in the configuration")]
     ReservedHeader(String),
-    #[error("请求头「{0}」重复（请求头名不区分大小写）")]
+    #[error("the `{0}` header appears twice (header names are case-insensitive)")]
     DuplicateHeader(String),
-    #[error("请求头「{0}」的值不能包含换行，长度不超过 {MAX_HEADER_VALUE} 个字符")]
+    #[error(
+        "the value of the `{0}` header cannot contain a newline and is at most {MAX_HEADER_VALUE} characters"
+    )]
     BadHeaderValue(String),
     #[error(
-        "请求头「{name}」中的 {placeholder} 无法识别，仅支持 {{{{access_token}}}} 和 {{{{client}}}}"
+        "{placeholder} in the `{name}` header is not recognized; only {{{{access_token}}}} and {{{{client}}}} are"
     )]
     UnknownPlaceholder { name: String, placeholder: String },
-    #[error("请求头「{0}」使用了 {{{{access_token}}}}，但该上游未配置 oauth")]
+    #[error(
+        "the `{0}` header uses {{{{access_token}}}}, and this upstream has no oauth configured"
+    )]
     TokenWithoutOauth(String),
-    #[error("已填写 key，API 密钥将通过请求头「{0}」发送，请求头中不能再设置「{0}」")]
+    #[error(
+        "a key is filled in, so the API key goes out in the `{0}` header; `{0}` cannot also be set among the headers"
+    )]
     KeyAndAuthHeader(String),
     #[error(
-        "配置 oauth 后，token 默认通过请求头「{0}」发送。如需自行设置该请求头，请在值中用 {{{{access_token}}}} 标明 token 的位置"
+        "with oauth configured, the token goes out in the `{0}` header by default. To set that header yourself, mark where the token goes with {{{{access_token}}}}"
     )]
     OauthAndAuthHeader(String),
-    #[error("无法获取 OAuth access token")]
+    #[error("an OAuth access token could not be obtained")]
     NoToken,
     /// 环境变量没设之类。存成文字：这个错误要能比较，而底下那个类型不能
     #[error("{0}")]

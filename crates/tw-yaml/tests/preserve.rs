@@ -152,7 +152,11 @@ fn a_block_scalar_is_refused_rather_than_reflowed() {
     let y = "script: |\n  echo hi\nport: 1\n";
     let e = set(y, &path!["script"], &Scalar::s("echo bye")).unwrap_err();
     assert!(matches!(e, PatchError::BlockScalar(_)), "{e:?}");
-    assert!(e.to_string().contains("直接编辑"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("edit the configuration file directly"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -171,7 +175,7 @@ fn an_anchor_is_refused_instead_of_silently_changing_every_alias() {
     let y = "defaults: &d\n  timeout: 30\na:\n  <<: *d\nb:\n  <<: *d\n";
     let e = set(y, &path!["defaults"], &Scalar::s("x")).unwrap_err();
     assert!(matches!(e, PatchError::AnchorOrAlias(_)), "{e:?}");
-    assert!(e.to_string().contains("锚点"), "{e}");
+    assert!(e.to_string().contains("anchor or alias"), "{e}");
 }
 
 #[test]
@@ -294,7 +298,7 @@ fn a_duplicate_key_is_refused_rather_than_guessed() {
     let y = "a:\n  k: 1\n  k: 2\n";
     let e = set(y, &path!["a", "k"], &Scalar::Int(9)).unwrap_err();
     assert!(matches!(e, PatchError::Duplicate(_)), "{e:?}");
-    assert!(e.to_string().contains("重复出现"), "{e}");
+    assert!(e.to_string().contains("appears more than once"), "{e}");
 }
 
 #[test]

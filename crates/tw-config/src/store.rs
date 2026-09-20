@@ -75,16 +75,16 @@ pub fn version_of(text: &str) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("无法读取 {path}：{source}")]
+    #[error("{path} could not be read: {source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} 不存在")]
+    #[error("{path} does not exist")]
     Missing { path: PathBuf },
     /// **有人在我们读到和写下之间改了这个文件。**
     #[error(
-        "配置文件在此期间已被修改（当前版本为 {current}，本次修改基于 {expected}），未覆盖该文件。请确认最新内容后重试"
+        "the configuration file changed in the meantime (it is now {current}, and this edit is based on {expected}), so it was not overwritten. Look at the current content and try again"
     )]
     Conflict { expected: String, current: String },
 }
@@ -267,7 +267,7 @@ mod tests {
         let m = e.to_string();
         assert!(m.contains(&version_of("a: 1\n")[..18]), "{m}");
         assert!(m.contains(&version_of("a: 2\n")[..18]), "{m}");
-        assert!(m.contains("未覆盖"), "{m}");
+        assert!(m.contains("was not overwritten"), "{m}");
     }
 
     #[test]

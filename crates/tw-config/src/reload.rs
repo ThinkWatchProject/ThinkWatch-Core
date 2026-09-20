@@ -40,9 +40,9 @@ impl Stage {
     /// 命令行和日志里的说法，后面接「错误」。
     pub fn label(&self) -> &'static str {
         match self {
-            Stage::Syntax => "语法",
-            Stage::Schema => "字段",
-            Stage::Semantics => "语义",
+            Stage::Syntax => "syntax",
+            Stage::Schema => "schema",
+            Stage::Semantics => "semantics",
         }
     }
 }
@@ -65,11 +65,11 @@ pub struct Rejected {
 
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}错误", self.stage.label())?;
+        write!(f, "{} error", self.stage.label())?;
         if let Some(l) = self.line {
-            write!(f, "（第 {l} 行）")?;
+            write!(f, " (line {l})")?;
         }
-        write!(f, "：{}", self.message)
+        write!(f, ": {}", self.message)
     }
 }
 
@@ -184,7 +184,7 @@ mod tests {
         // serde 的「missing field `clients`」说不出下一步做什么。
         let r = try_parse("version: 1\n").unwrap_err();
         assert_eq!(r.stage, Stage::Semantics, "{r:?}");
-        assert!(r.message.contains("首次启动"), "{r:?}");
+        assert!(r.message.contains("generated on first start"), "{r:?}");
     }
 
     #[test]
@@ -204,7 +204,7 @@ mod tests {
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Semantics, "{r:?}");
         assert!(r.line.is_none(), "语义错不该编行号：{r:?}");
-        assert!(r.message.contains("重复"), "{r:?}");
+        assert!(r.message.contains("appears twice"), "{r:?}");
     }
 
     #[test]
@@ -222,7 +222,7 @@ mod tests {
         let bad = "version: 999\nclients:\n  - name: c\n    key: tw-k\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Schema);
-        assert!(r.message.contains("升级"), "{r:?}");
+        assert!(r.message.contains("Upgrade the app"), "{r:?}");
         assert!(!schema_supported(999));
         assert!(schema_supported(1));
     }
@@ -254,6 +254,6 @@ mod tests {
     fn the_display_form_reads_like_a_sentence_a_person_can_act_on() {
         let bad = "version: 1\nclients:\n  - name: c\n    kye: tw-k\n";
         let s = try_parse(bad).unwrap_err().to_string();
-        assert!(s.starts_with("字段错误（第 4 行）："), "{s}");
+        assert!(s.starts_with("schema error (line 4): "), "{s}");
     }
 }

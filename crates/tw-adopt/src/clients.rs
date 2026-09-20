@@ -47,8 +47,10 @@ impl TakesEffect {
     /// 接管提示和诊断结论里的那一句。
     pub fn note(&self) -> &'static str {
         match self {
-            TakesEffect::Immediately => "下一个请求即使用新配置。",
-            TakesEffect::OnRestart => "重新打开终端后生效，在此之前网关不会收到该客户端的请求。",
+            TakesEffect::Immediately => "The next request uses the new configuration.",
+            TakesEffect::OnRestart => {
+                "It takes effect once the terminal is reopened; until then the gateway sees nothing from this client."
+            }
         }
     }
     /// 该不该设「还没收到请求」的超时提示。
@@ -81,8 +83,10 @@ impl Verified {
     /// 命令行里的说法。
     pub fn note(&self) -> &'static str {
         match self {
-            Verified::Measured => "已在本机实际运行验证",
-            Verified::FieldsOnly => "字段名已查证，尚未在本机实际运行验证",
+            Verified::Measured => "checked by actually running it on this machine",
+            Verified::FieldsOnly => {
+                "the field names are verified; it has not been run on this machine"
+            }
         }
     }
 }
@@ -189,9 +193,9 @@ pub fn adoptable() -> Vec<Client> {
             // **`settings.local.json` 优先级更高。**cc-switch #6828 栽在这里
             shadowed_by: &[".claude/settings.local.json"],
             costs: &[
-                "接口地址不是官方域名时，Remote Control 和语音输入不可用。",
-                "MCP tool search 将默认关闭。",
-                "Claude Code 可能会显示一次欢迎页，关闭即可。",
+                "Remote Control and voice input do not work when the endpoint is not an official domain.",
+                "MCP tool search is off by default.",
+                "Claude Code may show its welcome screen once; closing it is enough.",
             ],
             verified: Verified::FieldsOnly,
             marker: &[".claude"],
@@ -216,8 +220,8 @@ pub fn adoptable() -> Vec<Client> {
             // 所以它不构成遮蔽 —— 但它确实存在，值得在诊断里提一句
             shadowed_by: &[],
             costs: &[
-                "Codex CLI 不从网关获取模型列表，自定义模型名无效，模型列表以本地的模型目录文件为准。",
-                "修改后需要重新打开终端。",
+                "Codex CLI does not read the model list from the gateway, so a custom model name has no effect; its local model catalogue decides.",
+                "The terminal has to be reopened afterwards.",
             ],
             verified: Verified::Measured,
             marker: &[".codex"],
@@ -232,7 +236,7 @@ pub fn adoptable() -> Vec<Client> {
             format: Format::Json,
             takes_effect: TakesEffect::OnRestart,
             shadowed_by: &[],
-            costs: &["修改后需要重新启动 opencode。"],
+            costs: &["opencode has to be restarted afterwards."],
             verified: Verified::FieldsOnly,
             marker: &[".config/opencode", ".local/share/opencode"],
             process: &["opencode"],
@@ -248,7 +252,9 @@ pub fn adoptable() -> Vec<Client> {
             shadowed_by: &[],
             // **只算部分接管**：Zed 的密钥走它自己的凭据存储，不在
             // settings.json 里，我们写不进去。
-            costs: &["Zed 的密钥不保存在配置文件中，需要在 Zed 的设置界面中手动填写一次。"],
+            costs: &[
+                "Zed keeps its key outside the configuration file, so it has to be filled in once in Zed's settings.",
+            ],
             verified: Verified::FieldsOnly,
             marker: &[".config/zed"],
             process: &["Zed"],
@@ -265,8 +271,8 @@ pub fn adoptable() -> Vec<Client> {
             // 我们只写 home 那一份，所以项目里的会盖住它
             shadowed_by: &[],
             costs: &[
-                "Aider 依次读取主目录、Git 项目根目录和当前目录中的配置，后读取的会覆盖先读取的，接管只修改主目录中的配置。",
-                "修改后需要重新启动 Aider。",
+                "Aider reads the home directory, then the Git project root, then the current directory, and each one overrides the last; only the home directory is changed here.",
+                "Aider has to be restarted afterwards.",
             ],
             verified: Verified::FieldsOnly,
             // 没接管过的用户本来就没有这个文件，所以它自己就是那个痕迹
@@ -304,25 +310,25 @@ pub fn manual_only() -> Vec<ManualOnly> {
     vec![
         ManualOnly {
             name: "Cursor",
-            steps: "在 Cursor 的「Settings → Models」中开启 Override OpenAI Base URL，填写 {v1}。",
-            caveat: "Tab 补全与 inline edit 仍由 Cursor 自身的服务处理，不经过网关，因此只能部分接管。",
+            steps: "In Cursor, under Settings → Models, turn on Override OpenAI Base URL and enter {v1}.",
+            caveat: "Tab completion and inline edit still go to Cursor's own service rather than the gateway, so only part of Cursor is covered.",
         },
         ManualOnly {
             name: "Continue",
-            steps: "在 ~/.continue/config.yaml 的 models 列表中添加一项，将 apiBase 设为 {v1}。",
+            steps: "Add an entry to the models list in ~/.continue/config.yaml with apiBase set to {v1}.",
             // **接管它要往一个 YAML 列表里插一个新条目**，那是结构性
             // 改写，不是替换一个标量。我们的 YAML 补丁只做后者
             // （见 crate::yaml 开头那段）。宁可少接管一个客户端，也不
             // 要写一段我们自己没把握的结构。
-            caveat: "接入需要在 models 列表中新增条目，不提供自动接管，请按上述步骤手动配置。",
+            caveat: "This needs a new entry in the models list, which is not written automatically; follow the steps above.",
         },
         ManualOnly {
             name: "Gemini CLI",
-            steps: "在 shell 配置文件中添加 export GOOGLE_GEMINI_BASE_URL={base}，然后重新打开终端。",
+            steps: "Add export GOOGLE_GEMINI_BASE_URL={base} to the shell configuration, then reopen the terminal.",
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
             // 「只改 endpoint 和 key 字段」的边界 ——
             // **报告是我们的职责，修改是他的权利。**
-            caveat: "Gemini CLI 只从环境变量读取接口地址。ThinkWatch 不修改 shell 配置文件，请手动添加。",
+            caveat: "Gemini CLI reads the endpoint only from the environment. ThinkWatch does not edit shell configuration files, so add it by hand.",
         },
     ]
 }
@@ -503,7 +509,7 @@ mod tests {
                     c.id
                 );
                 assert!(
-                    c.takes_effect.note().contains("重新打开终端"),
+                    c.takes_effect.note().contains("terminal is reopened"),
                     "{} 没在接管那一刻说清要重开",
                     c.id
                 );
@@ -559,7 +565,11 @@ mod tests {
         // 我们这儿，而 Tab 补全根本不经过。
         let m = manual_only();
         let cursor = m.iter().find(|c| c.name == "Cursor").unwrap();
-        assert!(cursor.caveat.contains("Tab 补全"), "{}", cursor.caveat);
+        assert!(
+            cursor.caveat.contains("Tab completion"),
+            "{}",
+            cursor.caveat
+        );
         // 步骤里要有真实的地址，而不是一个让用户自己去找的说法
         let gw = Gateway {
             base: "http://127.0.0.1:8788".into(),

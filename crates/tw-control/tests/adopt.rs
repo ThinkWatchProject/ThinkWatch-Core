@@ -360,7 +360,7 @@ async fn a_client_whose_mcp_shape_we_have_not_verified_refuses_and_explains() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{out}");
-    assert!(out.contains("未经验证"), "{out}");
+    assert!(out.contains("is unverified"), "{out}");
 }
 
 #[tokio::test]

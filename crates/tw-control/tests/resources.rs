@@ -218,7 +218,10 @@ async fn a_duplicate_name_and_a_stale_version_are_both_conflicts() {
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("已存在名为「官方」的上游"), "{body}");
+    assert!(
+        body.contains("there is already a upstream named `官方`"),
+        "{body}"
+    );
 
     let (st, body) = call(
         &b.app,
@@ -322,7 +325,7 @@ async fn a_claude_subscription_login_cannot_be_saved_as_oauth() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("Claude 订阅账号"), "{body}");
+    assert!(body.contains("Claude subscription sign-in"), "{body}");
     assert_eq!(b.parsed().providers.len(), 1);
 }
 

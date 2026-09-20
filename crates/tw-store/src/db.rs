@@ -48,7 +48,7 @@ const SUBSCRIPTION: &str = "(billing = 'subscription')";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
-    #[error("无法打开 {path}：{source}")]
+    #[error("{path} could not be opened: {source}")]
     Open {
         path: String,
         source: rusqlite::Error,
@@ -56,7 +56,7 @@ pub enum DbError {
     /// 库是更新版本的程序建的。**只能读不能写** —— 硬写会让那个版本的
     /// 数据变成半新半旧，而用户回到新版本时已经修不回来了。
     #[error(
-        "数据库的 schema 版本为 {found}，当前版本的 twcore 最高支持 {supported}。请升级应用；如需继续使用当前版本，可将 {path} 移至其他位置，程序会新建空数据库，原有请求记录不会被删除"
+        "the database is schema version {found}, and this twcore supports up to {supported}. Upgrade the app; to stay on this version, move {path} elsewhere and an empty database is created, leaving the recorded requests where they are"
     )]
     TooNew {
         found: i64,
@@ -1788,8 +1788,11 @@ mod tests {
         let e = Db::open(&p).unwrap_err();
         assert!(matches!(e, DbError::TooNew { .. }), "{e:?}");
         let m = e.to_string();
-        assert!(m.contains("升级"), "{m}");
-        assert!(m.contains("不会被删除"), "得说清历史记录的下场：{m}");
+        assert!(m.contains("Upgrade the app"), "{m}");
+        assert!(
+            m.contains("leaving the recorded requests where they are"),
+            "得说清历史记录的下场：{m}"
+        );
     }
 
     #[test]

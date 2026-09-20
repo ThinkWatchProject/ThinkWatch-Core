@@ -34,9 +34,9 @@ impl Mode {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Mode::Off => "关闭",
-            Mode::Observe => "观察",
-            Mode::Enforce => "拦截",
+            Mode::Off => "off",
+            Mode::Observe => "observe",
+            Mode::Enforce => "enforce",
         }
     }
 
@@ -128,10 +128,10 @@ impl Security {
     /// 很远，而用户点「切到拦截」时应该清楚知道会发生什么。
     pub fn enforce_verb(line: &str) -> &'static str {
         match line {
-            "redact" => "替换",
-            "inspect_tools" => "切断",
-            "scan_configs" => "告警",
-            _ => "拦截",
+            "redact" => "replaces",
+            "inspect_tools" => "cuts off",
+            "scan_configs" => "reports",
+            _ => "enforces",
         }
     }
 }
@@ -180,9 +180,9 @@ mod tests {
     #[test]
     fn each_line_of_defence_has_its_own_verb() {
         // 三件事差得很远，统一叫「拦截」会让用户不知道自己在开什么。
-        assert_eq!(Security::enforce_verb("redact"), "替换");
-        assert_eq!(Security::enforce_verb("inspect_tools"), "切断");
-        assert_eq!(Security::enforce_verb("scan_configs"), "告警");
+        assert_eq!(Security::enforce_verb("redact"), "replaces");
+        assert_eq!(Security::enforce_verb("inspect_tools"), "cuts off");
+        assert_eq!(Security::enforce_verb("scan_configs"), "reports");
     }
 
     #[test]

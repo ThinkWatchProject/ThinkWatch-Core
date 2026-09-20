@@ -45,11 +45,11 @@ pub fn decode_request(
     dropped: &mut Dropped,
 ) -> Result<Request, Rejection> {
     if !v.is_object() {
-        return Err(Rejection("请求体不是 JSON 对象。".into()));
+        return Err(Rejection("The request body is not a JSON object.".into()));
     }
     if field(v, "cachedContent").is_some_and(|c| !c.is_null()) {
         return Err(Rejection(
-            "请求使用了 cachedContent，缓存内容保存在 Google 服务端，无法转换到其他格式的上游。"
+            "The request uses cachedContent, which lives on Google's servers, so it cannot be converted for an upstream of another format."
                 .into(),
         ));
     }

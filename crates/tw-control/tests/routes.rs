@@ -159,11 +159,11 @@ fn enc(s: &str) -> String {
 async fn the_overview_says_what_is_synthesised_and_gives_every_rule_in_full() {
     let b = bed(BASE);
     let ov = b.overview().await;
-    let default = find(&ov["routes"], "默认");
+    let default = find(&ov["routes"], "default");
     assert_eq!(default["default"], true);
     assert_eq!(default["builtin"], true, "配置文件里没有它：{default}");
     assert_eq!(default["has_catch_all"], true);
-    assert_eq!(default["rules"][0]["name"], "兜底");
+    assert_eq!(default["rules"][0]["name"], "catch-all");
     assert_eq!(default["rules"][0]["to"], "__all__");
     assert_eq!(default["rules"][0]["catch_all"], true);
 
@@ -191,8 +191,8 @@ async fn saving_the_synthesised_default_route_writes_it_into_the_file() {
     let (st, v) = call(
         &b.app,
         "PUT",
-        &format!("/routes/{}", enc("默认")),
-        json!({ "route": { "name": "默认", "rules": [
+        &format!("/routes/{}", enc("default")),
+        json!({ "route": { "name": "default", "rules": [
             rule("长上下文", json!([{ "field": "input_tokens", "values": [">200k"] }]), "中转"),
             catch_all("__all__"),
         ]}}),
@@ -200,7 +200,7 @@ async fn saving_the_synthesised_default_route_writes_it_into_the_file() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let cfg = b.parsed();
-    let r = cfg.routes.iter().find(|r| r.name == "默认").unwrap();
+    let r = cfg.routes.iter().find(|r| r.name == "default").unwrap();
     assert_eq!(
         r.rules.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
         ["长上下文", "兜底"]
@@ -211,7 +211,7 @@ async fn saving_the_synthesised_default_route_writes_it_into_the_file() {
     assert!(!file.contains("default_route"), "{file}");
     assert!(file.contains("# 两家上游"), "{file}");
     assert_eq!(
-        find(&b.overview().await["routes"], "默认")["builtin"],
+        find(&b.overview().await["routes"], "default")["builtin"],
         false
     );
 }
@@ -287,7 +287,7 @@ async fn the_name_of_the_synthesised_default_is_taken() {
         &b.app,
         "POST",
         "/routes",
-        json!({ "route": { "name": "默认", "rules": [catch_all("中转")] } }),
+        json!({ "route": { "name": "default", "rules": [catch_all("中转")] } }),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -329,7 +329,7 @@ async fn a_broken_condition_is_refused_before_anything_is_written() {
         // 少了比较符：写进去的后果是这条规则永远不命中
         (
             json!([{ "field": "input_tokens", "values": ["200k"] }]),
-            "比较符",
+            "comparison operator",
         ),
         (
             json!([{ "field": "dialect", "values": ["anthorpic"] }]),
@@ -457,7 +457,7 @@ async fn the_default_route_cannot_be_deleted() {
     let (st, v) = call(
         &b.app,
         "DELETE",
-        &format!("/routes/{}", enc("默认")),
+        &format!("/routes/{}", enc("default")),
         json!(null),
     )
     .await;
@@ -474,12 +474,18 @@ async fn changing_the_default_keeps_the_synthesised_one_as_an_ordinary_route() {
     let kept = cfg
         .routes
         .iter()
-        .find(|r| r.name == "默认")
+        .find(|r| r.name == "default")
         .expect("「默认」留下来");
     assert_eq!(kept.rules[0].to.as_deref(), Some("__all__"));
 
     // 换回来：默认值不写进文件
-    let (st, v) = call(&b.app, "PUT", "/default_route", json!({ "name": "默认" })).await;
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/default_route",
+        json!({ "name": "default" }),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(!b.file().contains("default_route"), "{}", b.file());
 }

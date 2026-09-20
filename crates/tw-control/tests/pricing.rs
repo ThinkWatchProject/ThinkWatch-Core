@@ -305,7 +305,7 @@ async fn a_sheet_with_a_half_written_override_is_refused_with_the_reason() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body["text"].as_str().unwrap().contains("长上下文"),
+        body["text"].as_str().unwrap().contains("long-context"),
         "{body}"
     );
     assert_eq!(b.file(), BASE);
@@ -486,7 +486,11 @@ async fn a_refresh_saves_the_new_table_and_prices_with_it_straight_away() {
 async fn a_failed_refresh_keeps_the_table_and_reports_why() {
     for (code, body, says) in [
         (500, "internal error", "HTTP 500"),
-        (200, r#"{"error": "rate limited"}"#, "不是价格数据集"),
+        (
+            200,
+            r#"{"error": "rate limited"}"#,
+            "may not be a price data set",
+        ),
     ] {
         let (url, _) = price_source(code, body).await;
         let b = bed_with(BASE, Updater::new(url, Schedule::default()));

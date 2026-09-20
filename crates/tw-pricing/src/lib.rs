@@ -92,9 +92,9 @@ pub fn to_micros(usd: f64) -> Micros {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PricingError {
-    #[error("内置价目表无法解析：{0}")]
+    #[error("the built-in price sheet could not be parsed: {0}")]
     Snapshot(String),
-    #[error("价格数据无法解析：{0}")]
+    #[error("the price data could not be parsed: {0}")]
     Dataset(String),
 }
 

@@ -14,9 +14,9 @@ use crate::json::Val;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum TErr {
-    #[error("不是合法的 TOML：{0}")]
+    #[error("not valid TOML: {0}")]
     Syntax(String),
-    #[error("{0} 不是表，无法写入字段")]
+    #[error("{0} is not a table, so no field can be written into it")]
     NotTable(String),
 }
 
@@ -147,7 +147,7 @@ pub fn set(text: &str, path: &[&str], v: &Val) -> Result<String, TErr> {
         let next = item
             .as_table_like_mut()
             .and_then(|t| t.get_mut(k))
-            .expect("刚插入的表");
+            .expect("the table that was just inserted");
         if next.as_table_like().is_none() {
             return Err(TErr::NotTable(parents[..=i].join(".")));
         }

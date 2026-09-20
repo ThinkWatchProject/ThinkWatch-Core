@@ -89,7 +89,7 @@ impl Blobs {
                 true
             }
             Err(e) => {
-                tracing::debug!(path = %p.display(), "请求体写入失败：{e}");
+                tracing::debug!(path = %p.display(), "the request body could not be written: {e}");
                 false
             }
         }

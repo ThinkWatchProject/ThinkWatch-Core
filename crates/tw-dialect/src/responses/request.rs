@@ -18,22 +18,25 @@ pub fn decode_request(
     shape: &mut ClientShape,
 ) -> Result<Request, Rejection> {
     if !v.is_object() {
-        return Err(Rejection("请求体不是 JSON 对象。".into()));
+        return Err(Rejection("The request body is not a JSON object.".into()));
     }
     for (key, what) in [
-        ("previous_response_id", "对话内容保存在 OpenAI 服务端"),
-        ("conversation", "对话内容保存在 OpenAI 服务端"),
-        ("prompt", "提示模板保存在 OpenAI 服务端"),
+        (
+            "previous_response_id",
+            "the conversation lives on OpenAI's servers",
+        ),
+        ("conversation", "the conversation lives on OpenAI's servers"),
+        ("prompt", "the prompt template lives on OpenAI's servers"),
     ] {
         if has(v, key) {
             return Err(Rejection(format!(
-                "请求使用了 {key}，{what}，无法转换到其他格式的上游。"
+                "The request uses {key}, and {what}, so it cannot be converted for an upstream of another format."
             )));
         }
     }
     if v.get("background").and_then(Value::as_bool) == Some(true) {
         return Err(Rejection(
-            "请求使用了 background，后台运行只有 OpenAI 服务端支持，无法转换到其他格式的上游。"
+            "The request uses background, which only OpenAI's servers support, so it cannot be converted for an upstream of another format."
                 .into(),
         ));
     }
@@ -288,13 +291,13 @@ fn decode_item(item: &Value, dropped: &mut Dropped, r: &mut Request) -> Result<(
         }
         "item_reference" => {
             return Err(Rejection(
-                "input 中的 item_reference 引用了 OpenAI 服务端保存的内容，无法转换到其他格式的上游。"
+                "An item_reference in input points at something kept on OpenAI's servers, so the request cannot be converted for an upstream of another format."
                     .into(),
             ));
         }
         "compaction" => {
             return Err(Rejection(
-                "input 中的 compaction 是 OpenAI 压缩后的加密对话，只有 OpenAI 能读取，无法转换到其他格式的上游。"
+                "A compaction in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
                     .into(),
             ));
         }
@@ -702,7 +705,7 @@ mod tests {
             r#"{"model":"m","background":true,"input":"hi"}"#,
         ] {
             let e = decode(body).unwrap_err();
-            assert!(e.0.contains("无法转换"), "{body}: {e}");
+            assert!(e.0.contains("cannot be converted"), "{body}: {e}");
         }
         // null 不算用了
         assert!(decode(r#"{"model":"m","previous_response_id":null,"input":"hi"}"#).is_ok());

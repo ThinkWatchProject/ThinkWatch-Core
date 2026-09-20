@@ -5,53 +5,63 @@ use crate::{Config, SCHEMA_VERSION};
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error(
-        "配置的 schema 版本为 {found}，当前版本的 twcore 最高支持 {supported}。请升级应用，或将配置改回旧格式"
+        "the configuration is schema version {found}, and this twcore supports up to {supported}. Upgrade the app, or put the configuration back in the older form"
     )]
     SchemaTooNew { found: u32, supported: u32 },
     #[error(
-        "配置中没有任何网关密钥（clients），所有请求都会被拒绝。首次启动时应已自动生成一个网关密钥"
+        "the configuration has no gateway key under `clients`, so every request is refused. One is generated on first start"
     )]
     NoClients,
-    #[error("上游名称重复：{0}。路由规则按名称引用上游，名称必须唯一")]
+    #[error(
+        "the upstream name {0} appears twice. Routing rules refer to an upstream by name, so names have to be unique"
+    )]
     DuplicateProvider(String),
-    #[error("网关密钥名称重复：{0}")]
+    #[error("the gateway key name {0} appears twice")]
     DuplicateClient(String),
-    #[error("网关密钥「{0}」与「{1}」的值相同。网关按密钥区分客户端，密钥值必须唯一")]
+    #[error(
+        "gateway keys `{0}` and `{1}` have the same value. The gateway tells clients apart by key, so the values have to be unique"
+    )]
     DuplicateKey(String, String),
-    #[error("default_key 指向的网关密钥「{0}」不存在")]
+    #[error("default_key points at gateway key `{0}`, which does not exist")]
     MissingDefaultKey(String),
-    #[error("默认网关密钥「{0}」处于停用状态。未接管的客户端均使用它，停用将使这些客户端一并失效")]
+    #[error(
+        "the default gateway key `{0}` is disabled. Every client that has not been pointed at the gateway explicitly uses it, and disabling it breaks all of them"
+    )]
     DisabledDefaultKey(String),
-    #[error("网关密钥「{0}」与「{1}」都写着为客户端「{2}」生成。一个客户端只能有一把")]
+    #[error(
+        "gateway keys `{0}` and `{1}` both say they were made for client `{2}`. A client has exactly one"
+    )]
     DuplicateClientKey(String, String, String),
-    #[error("上游「{name}」的接口地址不是 http 或 https 地址：{url}")]
+    #[error("the endpoint of upstream `{name}` is neither http nor https: {url}")]
     BadBaseUrl { name: String, url: String },
-    #[error("网关密钥「{name}」的值为空")]
+    #[error("the value of gateway key `{name}` is empty")]
     EmptyKey { name: String },
-    #[error("路由配置有误：{0}")]
+    #[error("the routing configuration is wrong: {0}")]
     Routing(#[from] tw_engine::RouteError),
     #[error(
-        "「{0}」既是上游名称又是策略组名称，规则中的 to 无法确定指向哪一个，请修改其中一个名称"
+        "`{0}` is the name of both an upstream and a group, so a rule's `to` cannot say which one it means. Rename one of them"
     )]
     NameCollision(String),
-    #[error("listen.gateway.allow_from 中的「{entry}」有误：{reason}")]
+    #[error("`{entry}` in listen.gateway.allow_from is wrong: {reason}")]
     BadCidr { entry: String, reason: String },
-    #[error("上游「{name}」的凭据：{source}")]
+    #[error("the credential of upstream `{name}`: {source}")]
     Credential {
         name: String,
         source: crate::CredentialError,
     },
     #[error("{0}")]
     Pricing(#[from] tw_pricing::SheetError),
-    #[error("上游「{provider}」使用的价目表「{sheet}」不存在")]
+    #[error("upstream `{provider}` uses price sheet `{sheet}`, which does not exist")]
     UnknownPriceSheet { provider: String, sheet: String },
     #[error(
-        "上游「{name}」的启用范围（models_only）为空，该上游将不提供任何模型。如需暂停使用该上游，请将其停用（disabled: true）"
+        "the scope of upstream `{name}` (models_only) is empty, so it offers no model at all. To pause the upstream, disable it instead (disabled: true)"
     )]
     EmptyModelsOnly { name: String },
-    #[error("上游「{name}」的启用范围（models_only）中存在空项")]
+    #[error("the scope of upstream `{name}` (models_only) has an empty entry")]
     BlankModelsOnly { name: String },
-    #[error("{what}名称「{name}」以 __ 开头。以 __ 开头的名称留给内置项，请使用其他名称")]
+    #[error(
+        "the {what} name `{name}` starts with __, which is reserved for built-ins. Use a different name"
+    )]
     ReservedName { what: &'static str, name: String },
 }
 
@@ -163,9 +173,9 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     let named = cfg
         .providers
         .iter()
-        .map(|p| ("上游", &p.name))
-        .chain(cfg.groups.iter().map(|g| ("策略组", &g.name)))
-        .chain(cfg.routes.iter().map(|r| ("路由", &r.name)));
+        .map(|p| ("upstream", &p.name))
+        .chain(cfg.groups.iter().map(|g| ("group", &g.name)))
+        .chain(cfg.routes.iter().map(|r| ("route", &r.name)));
     for (what, name) in named {
         if reserved(name) {
             return Err(ValidationError::ReservedName {
@@ -194,7 +204,8 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             let _ = e;
             return Err(ValidationError::BadCidr {
                 entry: entry.clone(),
-                reason: "不是合法的 IP 地址或 CIDR，应写成 192.168.0.0/16 的形式".to_string(),
+                reason: "not a valid IP address or CIDR; it is written as 192.168.0.0/16"
+                    .to_string(),
             });
         }
     }
@@ -300,7 +311,7 @@ mod tests {
     fn a_key_written_as_a_mapping_says_what_to_write_instead() {
         let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      whatever: 1\n";
         let e = crate::try_parse(y).unwrap_err().message;
-        assert!(e.contains("字符串"), "没说该写成什么：{e}");
+        assert!(e.contains("a string"), "没说该写成什么：{e}");
     }
 
     #[test]
@@ -326,7 +337,7 @@ mod tests {
         let e = validate(&cfg(vec![c("d", "tw-1")], vec![x]))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("「r」"), "{e}");
+        assert!(e.contains("`r`"), "{e}");
     }
 
     #[test]

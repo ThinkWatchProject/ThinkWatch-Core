@@ -144,7 +144,7 @@ fn parse_dataset(raw: &[u8]) -> Result<HashMap<String, ModelPrice>, PricingError
         .collect();
     if prices.is_empty() {
         return Err(PricingError::Dataset(
-            "其中没有任何带价格的模型，可能不是价格数据集".into(),
+            "it carries no model with a price, so it may not be a price data set".into(),
         ));
     }
     Ok(prices)

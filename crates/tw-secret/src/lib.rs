@@ -15,11 +15,11 @@ pub use mask::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
-    #[error("环境变量 {0} 未设置")]
+    #[error("the environment variable {0} is not set")]
     MissingEnv(String),
-    #[error("第 {pos} 个字符处的 ${{...}} 未闭合")]
+    #[error("the ${{...}} at character {pos} is not closed")]
     Unterminated { pos: usize },
-    #[error("变量名为空：${{}}")]
+    #[error("the variable name is empty: ${{}}")]
     EmptyName,
 }
 

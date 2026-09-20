@@ -71,11 +71,11 @@ impl Origin {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Origin::Ui => "界面",
-            Origin::Cli => "命令行",
-            Origin::External => "外部编辑",
-            Origin::Rollback => "回滚",
-            Origin::Rotation => "凭据轮换",
+            Origin::Ui => "the interface",
+            Origin::Cli => "the command line",
+            Origin::External => "an outside edit",
+            Origin::Rollback => "a rollback",
+            Origin::Rotation => "a credential rotation",
         }
     }
 }
@@ -231,7 +231,7 @@ pub fn read(v: &Version) -> Result<String, StoreError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackError {
-    #[error("版本历史中没有 {0}")]
+    #[error("the version history has no {0}")]
     NoSuchVersion(String),
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -378,7 +378,7 @@ mod tests {
         }
         let all = list(&p).unwrap();
         assert_eq!(all.len(), 1, "历史里不该有轮换那几版：{all:?}");
-        assert_eq!(all[0].origin.label(), "界面");
+        assert_eq!(all[0].origin.label(), "the interface");
     }
 
     #[test]

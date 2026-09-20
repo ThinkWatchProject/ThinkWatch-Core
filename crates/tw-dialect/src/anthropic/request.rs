@@ -13,7 +13,7 @@ const IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/we
 /// 客户端发来的 Anthropic 请求 → 中间表示。
 pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejection> {
     if !v.is_object() {
-        return Err(Rejection("请求体不是 JSON 对象。".into()));
+        return Err(Rejection("The request body is not a JSON object.".into()));
     }
     let mut r = Request {
         model: str_of(v, "model").unwrap_or_default().to_string(),
