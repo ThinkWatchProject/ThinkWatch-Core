@@ -22,18 +22,18 @@ use tw_yaml::{Put, Step};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
-    #[error("已存在名为「{name}」的{what}")]
+    #[error("there is already a {what} named `{name}`")]
     NameTaken { what: &'static str, name: String },
-    #[error("未找到名为「{name}」的{what}")]
+    #[error("there is no {what} named `{name}`")]
     NotFound { what: &'static str, name: String },
     #[error("{0}")]
     Yaml(#[from] tw_yaml::PatchError),
-    #[error("配置文件无法解析：{0}")]
+    #[error("the configuration file could not be parsed: {0}")]
     Parse(String),
     /// 渲染不出一个能安全写进去的值。
     #[error("{0}")]
     Unwritable(String),
-    #[error("修改后的内容与预期不一致（{0}），未写入文件")]
+    #[error("the edited content is not what was expected ({0}), so nothing was written")]
     SelfCheck(String),
 }
 
@@ -46,23 +46,23 @@ pub struct Section {
 
 pub const PROVIDERS: Section = Section {
     path: &["providers"],
-    what: "上游",
+    what: "upstream",
 };
 pub const PROXIES: Section = Section {
     path: &["proxies"],
-    what: "代理",
+    what: "proxy",
 };
 pub const PRICE_SHEETS: Section = Section {
     path: &["pricing", "sheets"],
-    what: "价目表",
+    what: "price sheet",
 };
 pub const ROUTES: Section = Section {
     path: &["routes"],
-    what: "路由",
+    what: "route",
 };
 pub const GROUPS: Section = Section {
     path: &["groups"],
-    what: "策略组",
+    what: "group",
 };
 
 impl Section {
@@ -107,7 +107,7 @@ pub fn upsert(
     let name = item
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| EditError::Unwritable(format!("{}缺少名称", section.what)))?
+        .ok_or_else(|| EditError::Unwritable(format!("the {} has no name", section.what)))?
         .to_string();
     let taken = section.index_of(&doc, &name);
     let steps = section.steps();
@@ -159,7 +159,7 @@ pub fn upsert(
     put_item(&mut expected, section, index, Value::Mapping(item.clone()));
     let got = parse(&out).map_err(|e| EditError::SelfCheck(e.to_string()))?;
     if got != expected {
-        return Err(EditError::SelfCheck(format!("{}「{name}」", section.what)));
+        return Err(EditError::SelfCheck(format!("{} `{name}`", section.what)));
     }
     Ok(out)
 }
@@ -186,7 +186,7 @@ pub fn remove(text: &str, section: Section, name: &str) -> Result<String, EditEr
     if section.index_of(&got, name).is_some()
         || section.items(&got).len() + 1 != section.items(&doc).len()
     {
-        return Err(EditError::SelfCheck(format!("{}「{name}」", section.what)));
+        return Err(EditError::SelfCheck(format!("{} `{name}`", section.what)));
     }
     Ok(out)
 }
@@ -245,9 +245,9 @@ fn render_block(v: &Value) -> Result<String, EditError> {
 /// 内容的一部分 —— 这一层不去冒那个险。配置里本来也没有需要多行的字段。
 fn reject_multiline(v: &Value) -> Result<(), EditError> {
     match v {
-        Value::String(s) if s.contains('\n') || s.contains('\r') => {
-            Err(EditError::Unwritable("值中不能包含换行".to_string()))
-        }
+        Value::String(s) if s.contains('\n') || s.contains('\r') => Err(EditError::Unwritable(
+            "a value cannot contain a newline".to_string(),
+        )),
         Value::Mapping(m) => m.iter().try_for_each(|(k, v)| {
             reject_multiline(k)?;
             reject_multiline(v)
@@ -269,7 +269,7 @@ fn sync_fields(
     let key_of = |k: &Value| -> Result<String, EditError> {
         k.as_str()
             .map(str::to_string)
-            .ok_or_else(|| EditError::Unwritable(format!("键 {k:?} 不是字符串")))
+            .ok_or_else(|| EditError::Unwritable(format!("the key {k:?} is not a string")))
     };
     for (k, _) in old.iter().filter(|(k, _)| !new.contains_key(*k)) {
         let mut p = path.to_vec();

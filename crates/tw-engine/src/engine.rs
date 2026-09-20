@@ -434,7 +434,7 @@ pub struct RouteSet {
 }
 
 /// 默认路由的名字。顶层没写 `default_route` 时用它。
-pub const DEFAULT_ROUTE: &str = "默认";
+pub const DEFAULT_ROUTE: &str = "default";
 
 /// 内置策略组「全部上游」在配置里的名字：全部上游，按声明顺序故障转移。
 ///
@@ -446,7 +446,7 @@ pub const DEFAULT_ROUTE: &str = "默认";
 pub const ALL_UPSTREAMS: &str = "__all__";
 
 /// 合成的默认路由里那条兜底规则的名字。流量详情里「命中规则」显示的就是它。
-pub const CATCH_ALL_RULE: &str = "兜底";
+pub const CATCH_ALL_RULE: &str = "catch-all";
 
 /// 以这个前缀开头的名字留给内置项。
 pub const RESERVED_PREFIX: &str = "__";
@@ -506,25 +506,31 @@ pub enum Outcome2 {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RouteError {
-    #[error("没有规则命中，且缺少兜底规则。请在末尾添加一条不带 when 的规则")]
+    #[error("no rule matched, and there is no catch-all. Add a rule without a `when` at the end")]
     NoMatch,
     #[error(
-        "规则「{0}」同时设置了 provider_would_be 和 to。provider_would_be 要在选定上游之后才能求值，这类规则只能使用 set 或 deny"
+        "rule `{0}` sets both provider_would_be and to. provider_would_be can only be evaluated once an upstream is chosen, so such a rule takes only set or deny"
     )]
     PhaseTwoWithTo(String),
-    #[error("规则「{0}」没有设置 to、deny、set 或 guard，命中后不产生任何效果")]
+    #[error("rule `{0}` sets none of to, deny, set or guard, so matching it does nothing")]
     NoAction(String),
-    #[error("规则「{rule}」指向的「{target}」既不是上游，也不是策略组")]
+    #[error("rule `{rule}` points at `{target}`, which is neither an upstream nor a group")]
     UnknownTarget { rule: String, target: String },
-    #[error("策略组「{0}」中没有任何上游")]
+    #[error("group `{0}` has no upstream in it")]
     EmptyGroup(String),
-    #[error("存在多个名为「{0}」的策略组。规则按名称引用策略组，名称必须唯一")]
+    #[error(
+        "there is more than one group named `{0}`. Rules refer to a group by name, so names have to be unique"
+    )]
     DuplicateGroup(String),
-    #[error("存在多条名为「{0}」的路由。网关密钥按名称绑定路由，路由名称必须唯一")]
+    #[error(
+        "there is more than one route named `{0}`. A gateway key binds to a route by name, so names have to be unique"
+    )]
     DuplicateRoute(String),
-    #[error("default_route 指向的路由「{0}」不存在，未绑定路由的网关密钥将无法匹配任何规则")]
+    #[error(
+        "default_route points at route `{0}`, which does not exist, so a gateway key with no route of its own matches nothing"
+    )]
     UnknownDefaultRoute(String),
-    #[error("网关密钥「{client}」绑定的路由「{route}」不存在")]
+    #[error("gateway key `{client}` binds to route `{route}`, which does not exist")]
     UnknownRoute { client: String, route: String },
     #[error(transparent)]
     Match(#[from] MatchError),
@@ -1022,7 +1028,7 @@ mod tests {
         let e = Engine::new(
             vec!["a".into(), "b".into()],
             vec![],
-            vec![set_of("默认", "a"), set_of("codex 专用", "b")],
+            vec![set_of("default", "a"), set_of("codex 专用", "b")],
             None,
             bind(&[("codex", "codex 专用")]),
         );
@@ -1032,7 +1038,7 @@ mod tests {
                 .map(|r| r.name.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names("claude-code"), vec!["默认 的规则"]);
+        assert_eq!(names("claude-code"), vec!["default 的规则"]);
         // **绑了的只走它自己那条，默认那条的规则不会跟着来**
         assert_eq!(names("codex"), vec!["codex 专用 的规则"]);
     }
@@ -1189,7 +1195,7 @@ mod tests {
         );
         let err = e.route(&facts("claude-sonnet-4-5")).unwrap_err();
         assert_eq!(err, RouteError::NoMatch);
-        assert!(err.to_string().contains("兜底"));
+        assert!(err.to_string().contains("catch-all"));
     }
 
     #[test]
@@ -1497,7 +1503,7 @@ mod tests {
         );
         let err = e.validate().unwrap_err();
         assert!(matches!(err, RouteError::PhaseTwoWithTo(_)));
-        assert!(err.to_string().contains("只能使用 set 或 deny"), "{err}");
+        assert!(err.to_string().contains("takes only set or deny"), "{err}");
     }
 
     #[test]

@@ -42,11 +42,11 @@ impl Kind {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Kind::ApiKeys => "API 密钥",
-            Kind::PrivateKeys => "私钥",
+            Kind::ApiKeys => "API keys",
+            Kind::PrivateKeys => "private keys",
             Kind::Jwt => "JWT",
-            Kind::ConnStrings => "连接串口令",
-            Kind::Internal => "内网标识",
+            Kind::ConnStrings => "connection-string passwords",
+            Kind::Internal => "internal addresses",
         }
     }
     pub fn all() -> &'static [Kind] {

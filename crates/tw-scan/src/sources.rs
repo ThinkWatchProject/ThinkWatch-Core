@@ -58,20 +58,30 @@ impl Kind {
             Kind::Hooks => "hook",
             Kind::Mcp => "MCP server",
             Kind::Skill => "skill",
-            Kind::Command => "斜杠命令",
+            Kind::Command => "slash command",
             Kind::Agent => "subagent",
-            Kind::Instructions => "项目指令",
+            Kind::Instructions => "project instructions",
         }
     }
     /// 为什么它危险。**说清「它能干什么」**，别只说「它是什么」。
     pub fn why(&self) -> &'static str {
         match self {
-            Kind::Hooks => "hook 在工具调用前后直接执行 shell 命令，无需模型参与即可获得执行权限。",
-            Kind::Mcp => "MCP server 配置指定了可执行程序及其参数，相当于直接运行该程序。",
-            Kind::Skill => "SKILL.md 的内容会被注入模型上下文，成为指令。",
-            Kind::Command => "斜杠命令的内容会被注入模型上下文，成为指令。",
-            Kind::Agent => "subagent 定义会被注入模型上下文，并可能声明宽松的工具权限。",
-            Kind::Instructions => "该文件会被自动读入模型上下文。",
+            Kind::Hooks => {
+                "A hook runs a shell command before or after a tool call, which is execution without the model taking part."
+            }
+            Kind::Mcp => {
+                "An MCP server entry names an executable and its arguments, which amounts to running that program."
+            }
+            Kind::Skill => {
+                "The content of SKILL.md goes into the model's context and becomes instruction."
+            }
+            Kind::Command => {
+                "The content of a slash command goes into the model's context and becomes instruction."
+            }
+            Kind::Agent => {
+                "A subagent definition goes into the model's context, and it may declare loose tool permissions."
+            }
+            Kind::Instructions => "This file is read into the model's context automatically.",
         }
     }
 }
@@ -260,7 +270,7 @@ mod tests {
         // 危险度排序不是装饰：界面按它排，高危项发通知。
         assert!(Kind::Hooks < Kind::Mcp);
         assert!(Kind::Mcp < Kind::Skill);
-        assert!(Kind::Hooks.why().contains("无需模型参与"));
+        assert!(Kind::Hooks.why().contains("without the model taking part"));
     }
 
     #[test]

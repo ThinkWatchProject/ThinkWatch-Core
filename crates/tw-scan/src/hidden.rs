@@ -42,15 +42,21 @@ impl Kind {
     /// 「U+200B ZWSP」对绝大多数人不构成信息。
     pub fn why(&self) -> &'static str {
         match self {
-            Kind::ZeroWidth => "零宽字符：在编辑器中不可见，但会被模型读取。",
+            Kind::ZeroWidth => {
+                "Zero-width characters: invisible in an editor, and read by the model."
+            }
             Kind::Tag => {
-                "Unicode 标签字符：在编辑器中完全不可见，但会原样进入模型上下文，可用于隐藏整段指令。"
+                "Unicode tag characters: entirely invisible in an editor, carried into the model's context as they are, and able to hide a whole instruction."
             }
-            Kind::Bidi => "双向控制符：可使屏幕上的显示顺序与实际字符顺序不一致。",
+            Kind::Bidi => {
+                "Bidirectional controls: they make what is on screen read in a different order than the characters actually are."
+            }
             Kind::Homoglyph => {
-                "同形字符：外观与拉丁字母相同，实际是其他字符，常用于伪装命令和域名。"
+                "Homoglyphs: they look like Latin letters and are other characters, which is how a command or a domain gets disguised."
             }
-            Kind::PrivateUse => "私用区码位：没有标准含义，出现在指令文件中即属可疑。",
+            Kind::PrivateUse => {
+                "Private-use code points: they have no standard meaning, and an instruction file is no place for them."
+            }
         }
     }
 }
@@ -296,7 +302,7 @@ mod tests {
         let hits = scan(&text);
         assert_eq!(hits.len(), 8, "藏了八个字符就该报八处");
         assert!(hits.iter().all(|h| h.kind == Kind::Tag));
-        assert!(hits[0].kind.why().contains("完全不可见"));
+        assert!(hits[0].kind.why().contains("entirely invisible"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub fn decode_request(
     shape: &mut ClientShape,
 ) -> Result<Request, Rejection> {
     if !v.is_object() {
-        return Err(Rejection("请求体不是 JSON 对象。".into()));
+        return Err(Rejection("The request body is not a JSON object.".into()));
     }
     let mut r = Request {
         model: str_of(v, "model").unwrap_or_default().to_string(),

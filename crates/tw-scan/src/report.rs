@@ -87,7 +87,7 @@ impl McpServer {
     /// 判断「同名不同配置」用的指纹（矩阵上要标记号）。
     pub fn shape(&self) -> String {
         match &self.url {
-            Some(u) => format!("远端 {u}"),
+            Some(u) => format!("remote {u}"),
             None => format!("{} {}", self.command, self.args.join(" ")),
         }
     }
@@ -310,9 +310,13 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                 path: src.path.clone(),
                 line: h.line,
                 title: format!(
-                    "{} 中含有{}",
+                    "{} contains {}",
                     src.kind.label(),
-                    h.kind.why().split('：').next().unwrap_or("隐藏字符")
+                    h.kind
+                        .why()
+                        .split(':')
+                        .next()
+                        .unwrap_or("hidden characters")
                 ),
                 detail: format!("{}{}", h.kind.why(), src.kind.why()),
                 excerpt: h.line_text,
@@ -336,9 +340,9 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                             client: src.client.to_string(),
                             path: src.path.clone(),
                             line,
-                            title: format!("MCP server「{}」位于远端", m.name),
+                            title: format!("MCP server `{}` is remote", m.name),
                             detail: format!(
-                                "该 server 的地址为 {}，使用时相关上下文会发送到该服务器。",
+                                "That server is at {}, and using it sends the surrounding context there.",
                                 m.url.as_deref().unwrap_or("")
                             ),
                             excerpt,
@@ -372,9 +376,9 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     client: src.client.to_string(),
                     path: src.path.clone(),
                     line,
-                    title: format!("skill「{name}」声明了 allowed-tools: [\"*\"]"),
+                    title: format!("skill `{name}` declares allowed-tools: [\"*\"]"),
                     detail:
-                        "该 skill 可以使用任何工具。这可能是正常需要，建议确认是否确实需要此权限。"
+                        "That skill may use any tool. It may well need to; it is worth confirming that it does."
                             .into(),
                     excerpt,
                 });
@@ -424,8 +428,8 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     client: src.client.to_string(),
                     path: src.path.clone(),
                     line,
-                    title: format!("{} 中命中规则「{}」", src.kind.label(), rule.id),
-                    detail: format!("{}。{}", rule.why, src.kind.why()),
+                    title: format!("{} matched rule `{}`", src.kind.label(), rule.id),
+                    detail: format!("{}. {}", rule.why, src.kind.why()),
                     excerpt,
                 });
             }

@@ -428,7 +428,7 @@ impl Recorder {
                     kind: secret.clone(),
                     masked: masked.clone(),
                 }) {
-                    tracing::debug!("泄漏记录写入失败：{e}");
+                    tracing::debug!("the leak record could not be written: {e}");
                 }
             }
             // 配置事件、额度事件、扫描告警都不是请求，不落这张表。
@@ -589,7 +589,7 @@ impl Recorder {
     fn write(&self, r: RequestRow) {
         if let Err(e) = self.db.insert(&r) {
             // **不往回抛。**观测挂了，代理照跑。
-            tracing::debug!(id = r.id, "请求记录写入失败：{e}");
+            tracing::debug!(id = r.id, "the request row could not be written: {e}");
         }
     }
 
@@ -619,7 +619,7 @@ impl Recorder {
         }
         tracing::warn!(
             free_mb = free / 1024 / 1024,
-            "磁盘状态已变化：{}",
+            "the disk state changed: {}",
             next.label()
         );
         self.level = next;
@@ -638,8 +638,8 @@ impl Recorder {
         let freed = self.blobs.gc(now_ms, keep_days, max_bytes);
         let cutoff = now_ms - (metadata_keep_days as i64) * 86_400_000;
         match self.db.prune_before(cutoff) {
-            Ok(n) if n > 0 => tracing::info!(rows = n, "已清理过期的请求记录"),
-            Err(e) => tracing::debug!("清理请求记录失败：{e}"),
+            Ok(n) if n > 0 => tracing::info!(rows = n, "cleaned up expired request rows"),
+            Err(e) => tracing::debug!("the request rows could not be cleaned up: {e}"),
             _ => {}
         }
         freed

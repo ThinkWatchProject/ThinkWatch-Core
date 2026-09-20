@@ -593,8 +593,8 @@ impl Trust {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Trust::Official => "官方端点",
-            Trust::Untrusted => "非官方端点",
+            Trust::Official => "official endpoint",
+            Trust::Untrusted => "unofficial endpoint",
         }
     }
     /// 命中高危时要不要真的切断。
@@ -629,10 +629,10 @@ pub enum Billing {
 impl Billing {
     pub fn label(&self) -> &'static str {
         match self {
-            Billing::PerToken => "按量计费",
-            Billing::Subscription => "订阅制",
-            Billing::Free => "不计费",
-            Billing::Unknown => "计费方式未知",
+            Billing::PerToken => "per token",
+            Billing::Subscription => "subscription",
+            Billing::Free => "free",
+            Billing::Unknown => "billing unknown",
         }
     }
     pub fn slug(&self) -> &'static str {
@@ -861,7 +861,7 @@ pub fn patch_oauth_tokens(
     if !ok {
         return Err(RotateError::Broke {
             provider: provider.to_string(),
-            why: "写入后读回的 token 不是新值".into(),
+            why: "the token read back after writing is not the new one".into(),
         });
     }
     Ok(out)
@@ -875,23 +875,25 @@ fn provider_index(text: &str, provider: &str) -> Option<usize> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RotateError {
-    #[error("配置中已不存在上游「{provider}」")]
+    #[error("the configuration no longer has an upstream `{provider}`")]
     NoProvider { provider: String },
     /// **说清「形状不对」而不是「写失败」。**用户可能把凭据写成了
     /// 别的形状（锚点、块标量），那时正确的动作是他自己去改，
     /// 而不是让我们猜。
-    #[error("无法定位上游「{provider}」的 oauth.refresh：{source}")]
+    #[error("oauth.refresh of upstream `{provider}` could not be located: {source}")]
     Shape {
         provider: String,
         source: tw_yaml::PatchError,
     },
-    #[error("写入上游「{provider}」的新凭据后配置无法读取，未写入文件：{why}")]
+    #[error(
+        "after writing the new credential for upstream `{provider}` the configuration could not be read, so nothing was written: {why}"
+    )]
     Broke { provider: String, why: String },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("无法读取 {path}：{source}")]
+    #[error("{path} could not be read: {source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -900,7 +902,7 @@ pub enum LoadError {
     /// 一份语法完美、只是把 `port` 写成 `prot` 的文件也会到这儿，而那句
     /// 话会让用户去找一个根本不存在的语法错误。serde 自己的
     /// 「unknown field `prot`, expected one of ...」比我们能补的任何话都准。
-    #[error("无法解析 {path}：{source}")]
+    #[error("{path} could not be parsed: {source}")]
     Parse {
         path: PathBuf,
         source: serde_yaml_ng::Error,
@@ -925,12 +927,12 @@ pub fn load(path: &Path) -> Result<Config, LoadError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
-    #[error("无法写入 {path}：{source}")]
+    #[error("{path} could not be written: {source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("序列化失败：{0}")]
+    #[error("serialization failed: {0}")]
     Serialize(#[from] serde_yaml_ng::Error),
 }
 
@@ -1104,7 +1106,10 @@ providers:
     #[test]
     fn describe_shows_the_env_var_name_not_its_value() {
         // 变量名不是秘密，而它恰恰是用户排查时要看的东西。
-        assert_eq!(Secret::new("${MY_KEY}").describe(), "环境变量 ${MY_KEY}");
+        assert_eq!(
+            Secret::new("${MY_KEY}").describe(),
+            "environment variable ${MY_KEY}"
+        );
     }
 
     #[test]

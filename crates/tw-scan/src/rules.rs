@@ -57,7 +57,7 @@ pub struct RuleFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
-    #[error("内置规则文件无法解析：{0}")]
+    #[error("the built-in rules file could not be parsed: {0}")]
     Builtin(String),
 }
 
@@ -98,12 +98,15 @@ impl Rules {
     /// 命令行里的那一句。
     pub fn summary(&self) -> String {
         let custom = self.custom();
-        let mut s = format!("生效 {} 条", self.rules.len());
+        let mut s = format!("{} active", self.rules.len());
         if custom > 0 {
-            s.push_str(&format!("，其中自定义 {custom} 条"));
+            s.push_str(&format!(", {custom} of them custom"));
         }
         if !self.disabled.is_empty() {
-            s.push_str(&format!("，已停用内置规则 {} 条", self.disabled.len()));
+            s.push_str(&format!(
+                ", {} built-in rules disabled",
+                self.disabled.len()
+            ));
         }
         s
     }
@@ -131,7 +134,7 @@ fn compile(spec: &RuleSpec, group: &'static str, custom: bool, out: &mut Rules) 
         // 工作的安全功能等于没有。但它必须**大声**说出来 —— 静默失效
         // 比没有更糟，因为用户以为它在
         Err(e) => out.warnings.push(format!(
-            "规则「{}」的正则表达式有误，该规则未生效：{e}",
+            "the pattern of rule `{}` is wrong, so the rule is not in effect: {e}",
             spec.id
         )),
     }
@@ -165,8 +168,9 @@ pub fn build(user: &tw_config::ScanRules) -> Result<Rules, RuleError> {
     // 「我明明停用了它，怎么还在报」
     for id in &user.disable {
         if !out.disabled.contains(id) {
-            out.warnings
-                .push(format!("「{id}」不是内置规则的 id，停用未生效"));
+            out.warnings.push(format!(
+                "`{id}` is not the id of a built-in rule, so disabling it did nothing"
+            ));
         }
     }
     for spec in &user.add {
@@ -443,8 +447,8 @@ mod tests {
         assert_eq!(rs.custom(), 1);
         assert_eq!(rs.disabled.len(), 1);
         let s = rs.summary();
-        assert!(s.contains("其中自定义 1 条"), "{s}");
-        assert!(s.contains("已停用内置规则 1 条"), "{s}");
+        assert!(s.contains("1 of them custom"), "{s}");
+        assert!(s.contains("1 built-in rules disabled"), "{s}");
         // injection 组的规则永远不切断
         assert!(!rs.rules.iter().find(|x| x.id == "我的").unwrap().high);
     }

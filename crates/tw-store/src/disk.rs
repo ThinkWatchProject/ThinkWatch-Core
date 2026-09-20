@@ -46,9 +46,13 @@ impl DiskLevel {
     /// 诊断包和日志里的说法。
     pub fn label(&self) -> &'static str {
         match self {
-            DiskLevel::Ok => "正常",
-            DiskLevel::MetadataOnly => "磁盘空间不足，仅记录请求摘要，不保存请求体与响应体",
-            DiskLevel::Nothing => "磁盘空间严重不足，已停止记录，转发不受影响",
+            DiskLevel::Ok => "ok",
+            DiskLevel::MetadataOnly => {
+                "low disk space: only request summaries are recorded, and no request or response bodies"
+            }
+            DiskLevel::Nothing => {
+                "very low disk space: recording has stopped, and forwarding is unaffected"
+            }
         }
     }
 }
@@ -112,7 +116,9 @@ mod tests {
             assert!(!l.slug().is_empty());
         }
         assert!(
-            DiskLevel::Nothing.label().contains("转发不受影响"),
+            DiskLevel::Nothing
+                .label()
+                .contains("forwarding is unaffected"),
             "最坏的那一级也必须说清楚请求还是通的"
         );
     }

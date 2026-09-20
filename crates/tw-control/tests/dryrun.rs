@@ -30,7 +30,7 @@ groups:
     session_affinity: false
     providers: [官方, 中转]
 routes:
-  - name: 默认
+  - name: default
     rules:
       - name: 带缓存的必须走官方
         when: { cache: true }
@@ -102,7 +102,7 @@ async fn a_plain_request_falls_through_to_the_catch_all() {
     assert_eq!(r.rule.as_deref(), Some("其余都试试"));
     assert_eq!(r.via_group.as_deref(), Some("都试试"));
     assert_eq!(r.candidates.len(), 2);
-    assert_eq!(r.route, "默认");
+    assert_eq!(r.route, "default");
     // 开着会话粘滞（默认）的轮询不伤缓存：同一次对话始终落在同一家。
     // 一律标成危险是假警报，而假警报会让人学会忽略这一栏
     assert!(!r.hurts_cache, "粘滞的轮询不该报");
@@ -136,8 +136,8 @@ async fn without_a_key_or_a_route_it_refuses_instead_of_guessing() {
 #[tokio::test]
 async fn a_route_can_be_tried_by_name_and_a_draft_as_written() {
     let (_d, app) = app();
-    let r = run(&app, r#"{"model":"claude-sonnet-4-5","route":"默认"}"#).await;
-    assert_eq!(r.route, "默认");
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5","route":"default"}"#).await;
+    assert_eq!(r.route, "default");
     assert_eq!(r.rule.as_deref(), Some("其余都试试"));
 
     let r = run(
