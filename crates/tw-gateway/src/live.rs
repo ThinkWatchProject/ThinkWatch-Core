@@ -23,7 +23,7 @@ pub struct Live(Arc<AtomicUsize>);
 
 /// 一个请求的通行证。**Drop 时自动减一** —— 手工减的话，迟早有一条错误
 /// 路径会漏掉，而漏掉的表现是这个数只增不减，等它归零的人永远等不到。
-#[must_use = "丢弃通行证等同于请求已结束"]
+#[must_use = "dropping the permit says the request has ended"]
 pub struct Pass(Arc<AtomicUsize>);
 
 impl Live {

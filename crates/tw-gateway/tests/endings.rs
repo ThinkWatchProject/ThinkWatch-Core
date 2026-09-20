@@ -363,7 +363,8 @@ async fn a_stream_the_tool_firewall_cuts_is_denied_and_keeps_its_usage() {
             ..
         } => {
             assert_eq!(source, "denied");
-            assert!(message.contains("Bash"), "{message}");
+            assert_eq!(message.code, "gw.toolcall.cut", "{message}");
+            assert_eq!(message.arg("tool"), "Bash", "{message}");
             let u = usage.expect("切断之前的用量没有带上");
             assert_eq!(u.input, 5000);
         }
@@ -437,7 +438,7 @@ async fn a_phase_two_deny_after_the_request_started_is_reported_as_denied() {
         matches!(
             &got[0],
             Event::RequestFailed { source, message, .. }
-                if source == "denied" && message.contains("这段内容不发给中转站")
+                if source == "denied" && message.text.contains("这段内容不发给中转站")
         ),
         "该是一次带着理由的拒绝：{got:?}"
     );
@@ -563,7 +564,7 @@ async fn a_websocket_cut_for_a_dangerous_tool_call_is_failed_as_denied() {
         matches!(
             &got[0],
             Event::RequestFailed { source, message, .. }
-                if source == "denied" && message.contains("Bash")
+                if source == "denied" && message.arg("tool") == "Bash"
         ),
         "该是一次带着工具名的拦截：{got:?}"
     );

@@ -399,7 +399,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
             assert_eq!(source, "upstream");
             // 错误信息要能直接行动
             assert!(
-                message.contains("base_url") || message.contains("代理"),
+                message.text.contains("endpoint address") || message.text.contains("proxy"),
                 "{message}"
             );
         }
@@ -760,7 +760,7 @@ async fn everything_broken_still_tries_rather_than_refusing() {
     let msg = body["error"]["message"].as_str().unwrap();
     // 错误里要能看出「试过谁」—— 用户能看见故障转移在替他工作，
     // 这是信任的来源。
-    assert!(msg.contains("已尝试"), "{msg}");
+    assert!(msg.contains("tried:"), "{msg}");
 }
 
 /// 一个慢上游：每个请求要 `delay`，用来观察并发行为。
@@ -1601,7 +1601,12 @@ async fn a_health_check_works_before_any_upstream_is_configured() {
         .await
         .unwrap();
     assert_ne!(real.status(), 200);
-    assert!(real.text().await.unwrap().contains("尚未配置任何上游"));
+    assert!(
+        real.text()
+            .await
+            .unwrap()
+            .contains("No upstream is configured")
+    );
 }
 
 /// **错误必须用入站方言的原生格式返回。**一个 Anthropic 客户端
@@ -1812,7 +1817,7 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
     for _ in 0..6 {
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Ok(tw_api::Event::RequestFailed { message, .. })) => {
-                assert!(message.contains("流中断"), "{message}");
+                assert!(message.text.contains("stream broke"), "{message}");
                 saw_failed = true;
                 break;
             }

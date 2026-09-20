@@ -93,7 +93,7 @@ pub enum Event {
     RequestFailed {
         id: u64,
         source: String,
-        message: String,
+        message: Msg,
         /// 失败之前从上游收到了多少字节。**响应头都没到的没有**
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes: Option<u64>,
@@ -2790,7 +2790,7 @@ mod tests {
             Event::RequestFailed {
                 id: 7,
                 source: "upstream".into(),
-                message: "x".into(),
+                message: tw_types::msg!("t.x" => "x"),
                 bytes: None,
                 duration_ms: None,
                 usage: None,

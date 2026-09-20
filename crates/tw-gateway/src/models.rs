@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use crate::probe::ModelList;
 use crate::server::{AppState, Runtime, now_ms};
+use tw_types::msg;
 
 /// 多久向每个上游重新问一次。
 const REFRESH_EVERY: Duration = Duration::from_secs(24 * 3600);
@@ -372,21 +373,23 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     let http = rt.clients.get(&p.name).unwrap_or(&state.http);
     let headers = match state.headers_for(p, http, None).await {
         Ok(h) => h,
-        Err(e) => return Answer::Failed(format!("无法获取凭据：{e}")),
+        Err(e) => return Answer::Failed(format!("the credential could not be obtained: {e}")),
     };
     let r = crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await;
     if !r.ok {
-        return Answer::Failed(r.error.unwrap_or_else(|| "检测失败".to_string()));
+        return Answer::Failed(r.error.unwrap_or_else(|| "the check failed".to_string()));
     }
     match r.models {
         ModelList::Listed { models } => Answer::Listed(models),
-        ModelList::NotImplemented { status } => {
-            Answer::NoList(format!("上游未提供模型列表接口（HTTP {status}）"))
+        ModelList::NotImplemented { status } => Answer::NoList(format!(
+            "the upstream has no model-list endpoint (HTTP {status})"
+        )),
+        ModelList::Unrecognized { .. } => Answer::NoList(
+            "the model list the upstream returned is in an unrecognized format".to_string(),
+        ),
+        ModelList::Empty => {
+            Answer::NoList("the model list the upstream returned is empty".to_string())
         }
-        ModelList::Unrecognized { .. } => {
-            Answer::NoList("上游返回的模型列表格式无法识别".to_string())
-        }
-        ModelList::Empty => Answer::NoList("上游返回的模型列表为空".to_string()),
     }
 }
 
@@ -447,10 +450,10 @@ async fn finish(state: &AppState, asking: Vec<Asking>) {
         };
         match &answer {
             Answer::Listed(models) => {
-                tracing::debug!(provider = %a.name, models = models.len(), "已获取模型列表")
+                tracing::debug!(provider = %a.name, models = models.len(), "fetched the model list")
             }
             Answer::NoList(why) | Answer::Failed(why) => {
-                tracing::info!(provider = %a.name, "未能获取模型列表：{why}")
+                tracing::info!(provider = %a.name, "the model list could not be fetched: {why}")
             }
             Answer::Pending => {}
         }
@@ -546,11 +549,12 @@ impl Skip {
             Skip::NotOffered => "not_offered",
         }
     }
+    /// 进给客户端的那句话里。**界面不用它** —— 界面按 `slug` 自己说。
     pub fn label(&self) -> &'static str {
         match self {
-            Skip::Disabled => "已停用",
-            Skip::OutOfScope => "不在启用范围内",
-            Skip::NotOffered => "未提供此模型",
+            Skip::Disabled => "disabled",
+            Skip::OutOfScope => "out of scope",
+            Skip::NotOffered => "does not offer this model",
         }
     }
 }
@@ -570,14 +574,20 @@ impl Serving {
             .iter()
             .map(|(p, s)| format!("{p} {}", s.label()))
             .collect::<Vec<_>>()
-            .join("；");
+            .join("; ");
         // 全是停用：请求没问题，是配置里能用的上游都关掉了
         if self.skipped.iter().all(|(_, s)| *s == Skip::Disabled) {
-            crate::GatewayError::config(format!("路由选中的上游均已停用：{why}"))
+            crate::GatewayError::config(msg!(
+                "gw.route.all_selected_disabled", detail = why =>
+                "Every upstream the route selected is disabled: {detail}"
+            ))
         } else {
             crate::GatewayError::new(
                 crate::error::Source::Request,
-                format!("没有可用的上游提供模型 {model}：{why}"),
+                msg!(
+                    "gw.model.no_upstream_available", model = model, detail = why =>
+                    "No upstream is available to serve model {model}: {detail}"
+                ),
             )
         }
     }

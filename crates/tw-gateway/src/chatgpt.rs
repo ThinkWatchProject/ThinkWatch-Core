@@ -259,7 +259,7 @@ pub fn redirect_uri(port: u16) -> String {
 pub fn authorize_url(issuer: &str, redirect_uri: &str, pkce: &Pkce, state: &str) -> String {
     let mut url = reqwest::Url::parse(&format!("{}/oauth/authorize", issuer.trim_end_matches('/')))
         .unwrap_or_else(|_| {
-            reqwest::Url::parse(&format!("{ISSUER}/oauth/authorize")).expect("常量拼出的地址")
+            reqwest::Url::parse(&format!("{ISSUER}/oauth/authorize")).expect("built from constants")
         });
     url.query_pairs_mut()
         .append_pair("response_type", "code")
@@ -336,18 +336,27 @@ pub async fn exchange_code(
         ])
         .send()
         .await
-        .map_err(|e| format!("无法连接 {}：{e}", tw_secret::redact_url(token_endpoint)))?;
+        .map_err(|e| {
+            format!(
+                "{} could not be reached: {e}",
+                tw_secret::redact_url(token_endpoint)
+            )
+        })?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     if status >= 400 {
-        let body = tw_secret::mask_body(&text.replace(code, "<省略>").replace(verifier, "<省略>"));
+        let body = tw_secret::mask_body(
+            &text
+                .replace(code, "<omitted>")
+                .replace(verifier, "<omitted>"),
+        );
         return Err(format!(
-            "token 端点返回 {status}：{}",
+            "the token endpoint answered {status}: {}",
             body.chars().take(400).collect::<String>()
         ));
     }
-    let v: Value =
-        serde_json::from_str(&text).map_err(|_| "token 端点的响应不是 JSON".to_string())?;
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|_| "the token endpoint's response is not JSON".to_string())?;
     let field = |k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())
@@ -355,9 +364,10 @@ pub async fn exchange_code(
             .map(str::to_string)
     };
     Ok(Tokens {
-        id_token: field("id_token").ok_or("token 端点的响应中没有 id_token")?,
-        access: field("access_token").ok_or("token 端点的响应中没有 access_token")?,
-        refresh: field("refresh_token").ok_or("token 端点的响应中没有 refresh_token")?,
+        id_token: field("id_token").ok_or("the token endpoint's response has no id_token")?,
+        access: field("access_token").ok_or("the token endpoint's response has no access_token")?,
+        refresh: field("refresh_token")
+            .ok_or("the token endpoint's response has no refresh_token")?,
         expires_in: v.get("expires_in").and_then(|x| x.as_u64()),
     })
 }
@@ -378,11 +388,19 @@ pub async fn revoke(
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| format!("无法连接 {}：{e}", tw_secret::redact_url(revoke_endpoint)))?;
+        .map_err(|e| {
+            format!(
+                "{} could not be reached: {e}",
+                tw_secret::redact_url(revoke_endpoint)
+            )
+        })?;
     if resp.status().is_success() {
         Ok(())
     } else {
-        Err(format!("吊销接口返回 {}", resp.status().as_u16()))
+        Err(format!(
+            "the revoke endpoint answered {}",
+            resp.status().as_u16()
+        ))
     }
 }
 

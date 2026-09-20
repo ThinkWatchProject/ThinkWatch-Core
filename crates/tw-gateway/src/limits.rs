@@ -21,9 +21,13 @@ pub use tw_types::Limits;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LimitError {
-    #[error("排队超过 {0:?} 仍未获得处理。上游可能均无响应，或并发上限设置过低")]
+    #[error(
+        "still queued after {0:?}. Every upstream may be unresponsive, or the concurrency limit may be too low"
+    )]
     Timeout(Duration),
-    #[error("等待队列已满（{0} 个），请求量异常，请检查是否有脚本在大量发送请求")]
+    #[error(
+        "the wait queue is full ({0} entries). The request volume is unusual — check whether a script is sending in bulk"
+    )]
     QueueFull(usize),
 }
 
@@ -109,7 +113,11 @@ impl Gate {
         let acquire_all = async {
             let mut permits = Vec::with_capacity(sems.len());
             for s in sems {
-                permits.push(s.acquire_owned().await.expect("信号量不会被关闭"));
+                permits.push(
+                    s.acquire_owned()
+                        .await
+                        .expect("the semaphore is never closed"),
+                );
             }
             permits
         };
@@ -181,7 +189,7 @@ mod tests {
         let _held = g.acquire("p", "c", None).await.unwrap();
         let e = g.acquire("p", "c", None).await.unwrap_err();
         assert!(matches!(e, LimitError::Timeout(_)));
-        assert!(e.to_string().contains("并发上限"), "{e}");
+        assert!(e.to_string().contains("concurrency limit"), "{e}");
     }
 
     #[tokio::test]
@@ -200,7 +208,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let e = g.acquire("p", "c", None).await.unwrap_err();
         assert!(matches!(e, LimitError::QueueFull(2)), "{e:?}");
-        assert!(e.to_string().contains("脚本"), "错误要指向真正的原因：{e}");
+        assert!(
+            e.to_string().contains("a script is sending in bulk"),
+            "错误要指向真正的原因：{e}"
+        );
         for w in waiters {
             w.abort();
         }

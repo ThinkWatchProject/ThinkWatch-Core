@@ -154,7 +154,7 @@ pub async fn run(
             output_tokens: None,
             input_tokens: None,
             error: Some(format!(
-                "推理测速暂不支持 {} 协议的上游，未发送请求",
+                "an inference test does not support a {} upstream yet, so nothing was sent",
                 protocol.map(|p| format!("{p:?}")).unwrap_or_default()
             )),
         };
@@ -187,7 +187,7 @@ pub async fn run(
         Ok(r) => r,
         Err(e) => {
             return fail(
-                crate::forward::map_reqwest_error(e).message,
+                crate::forward::map_reqwest_error(e).message().to_string(),
                 started.elapsed().as_millis() as u64,
             );
         }
@@ -197,7 +197,7 @@ pub async fn run(
         let code = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
         let short: String = body.chars().take(200).collect();
-        return fail(format!("上游返回 {code}：{short}"), connect_ms);
+        return fail(format!("the upstream answered {code}: {short}"), connect_ms);
     }
 
     // 一边流一边计时。**首个带内容的帧才算首 token** —— `message_start`
@@ -344,8 +344,8 @@ mod tests {
         .await;
         assert!(!r.ok);
         let e = r.error.unwrap();
-        assert!(e.contains("暂不支持"), "{e}");
-        assert!(e.contains("未发送请求"), "{e}");
+        assert!(e.contains("does not support"), "{e}");
+        assert!(e.contains("nothing was sent"), "{e}");
     }
 
     #[test]

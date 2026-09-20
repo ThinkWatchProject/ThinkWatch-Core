@@ -192,7 +192,9 @@ pub async fn run(
     let resp = r.body(body).send().await.map_err(|e| {
         fail(
             StatusCode::BAD_GATEWAY,
-            tw_gateway::forward::map_reqwest_error(e).message,
+            tw_gateway::forward::map_reqwest_error(e)
+                .message()
+                .to_string(),
         )
     })?;
 

@@ -280,7 +280,7 @@ async fn a_disabled_key_is_refused_and_says_it_was_disabled_on_purpose() {
     let text = resp.text().await.unwrap();
     // **和「密钥无效」是两回事**：说成无效的话，用户会去查客户端配置，
     // 而那里什么问题都没有
-    assert!(text.contains("已停用"), "{text}");
+    assert!(text.contains("disabled"), "{text}");
     assert!(text.contains("试用"), "要说清是哪一把：{text}");
 
     // 同一个网关上，没停用的那把照常能用
