@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tw_types::{Msg, msg};
 
 /// 每一段都单独限时，这样超时错误能说出**卡在哪一段**。
 /// 一句「8 秒超时」和「TLS 握手 8 秒没完成」的可修复性差得远。
@@ -81,15 +82,15 @@ impl Stage {
     /// 命令行里的说法。**界面不用它**，界面按 `step` / `peer` 自己说。
     pub fn label(&self) -> String {
         let step = match self.step {
-            Step::Config => "配置",
-            Step::Dns => "DNS 解析",
-            Step::Tcp => "TCP 握手",
-            Step::Tls => "TLS 握手",
-            Step::Handshake => "代理握手",
+            Step::Config => "config",
+            Step::Dns => "DNS lookup",
+            Step::Tcp => "TCP handshake",
+            Step::Tls => "TLS handshake",
+            Step::Handshake => "proxy handshake",
         };
         match (self.step, self.peer) {
             (Step::Handshake, _) | (_, Peer::Upstream) => step.to_string(),
-            (_, Peer::Proxy) => format!("{step} · 代理"),
+            (_, Peer::Proxy) => format!("{step} to the proxy"),
         }
     }
 }
@@ -118,9 +119,11 @@ impl SkipReason {
     /// 命令行里的说法。
     pub fn label(&self) -> &'static str {
         match self {
-            SkipReason::PlainHttp => "http:// 地址不进行 TLS 握手",
-            SkipReason::IpAddress => "地址已是 IP，无需 DNS 解析",
-            SkipReason::ProxyResolves => "域名由代理解析，本机不进行 DNS 解析",
+            SkipReason::PlainHttp => "an http:// address has no TLS handshake",
+            SkipReason::IpAddress => "already an IP address, so no DNS lookup",
+            SkipReason::ProxyResolves => {
+                "the proxy resolves the name, so there is no local DNS lookup"
+            }
         }
     }
 }
@@ -153,7 +156,7 @@ pub struct L1Result {
     pub failed: Option<Stage>,
     /// 失败的原因和下一步
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
 }
 
 /// 代理怎么走。调用方从 `tw_config::Proxy` 解析好再传进来 —— 解析密码
@@ -174,22 +177,22 @@ pub struct ProxyHop {
 /// **`system` 这里测不了**：跟随系统代理是 reqwest 在建连时才去查环境的，
 /// 我们没有那份地址可以去握手。说出来，而不是假装直连测一遍给个漂亮
 /// 数字 —— 那个数字测的根本不是用户实际会走的路。
-pub fn hop_for(
-    cfg: &tw_config::Config,
-    p: &tw_config::Provider,
-) -> Result<Option<ProxyHop>, String> {
+pub fn hop_for(cfg: &tw_config::Config, p: &tw_config::Provider) -> Result<Option<ProxyHop>, Msg> {
     match p.proxy.as_str() {
         tw_config::DIRECT => Ok(None),
-        tw_config::SYSTEM => Err(
-            "该上游使用系统代理，代理地址在建立连接时才能确定，链路测速无法测量。如需测速，请将代理配置为命名代理"
-                .into(),
-        ),
+        tw_config::SYSTEM => Err(msg!(
+            "l1.config.system_proxy" =>
+            "This upstream goes through the system proxy, whose address is only decided by the \
+             environment when the connection is made, so a link test cannot measure it. Configure \
+             the proxy as a named entry to measure this route."
+        )),
         name => {
-            let px = cfg
-                .proxies
-                .iter()
-                .find(|x| x.name == name)
-                .ok_or_else(|| format!("上游「{}」使用的代理「{name}」未在 proxies 中定义", p.name))?;
+            let px = cfg.proxies.iter().find(|x| x.name == name).ok_or_else(|| {
+                msg!(
+                    "l1.config.proxy_undefined", upstream = p.name.clone(), proxy = name =>
+                    "Upstream `{upstream}` uses proxy `{proxy}`, which is not defined under `proxies`."
+                )
+            })?;
             hop_of(px).map(Some)
         }
     }
@@ -197,14 +200,17 @@ pub fn hop_for(
 
 /// 一个代理条目解析成一跳。**密码在这里取出来**，取不出来（环境变量没设）
 /// 直接说是哪个代理的哪一项。
-pub fn hop_of(px: &tw_config::Proxy) -> Result<ProxyHop, String> {
+pub fn hop_of(px: &tw_config::Proxy) -> Result<ProxyHop, Msg> {
     let auth = match &px.auth {
         None => None,
         Some(a) => Some((
             a.user.clone(),
-            a.pass
-                .resolve()
-                .map_err(|e| format!("无法读取代理「{}」的密码：{e}", px.name))?,
+            a.pass.resolve().map_err(|e| {
+                msg!(
+                    "l1.config.proxy_password", proxy = px.name.clone(), detail = e =>
+                    "The password for proxy `{proxy}` could not be read: {detail}"
+                )
+            })?,
         )),
     };
     Ok(ProxyHop {
@@ -262,14 +268,14 @@ impl Timer {
     fn total(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
-    fn fail(self, stage: Stage, msg: impl std::fmt::Display) -> L1Result {
+    fn fail(self, stage: Stage, why: Msg) -> L1Result {
         L1Result {
             ok: false,
             total_ms: self.total(),
             segments: self.segments,
             skipped: self.skipped,
             failed: Some(stage),
-            error: Some(msg.to_string()),
+            error: Some(why),
         }
     }
     fn ok(self) -> L1Result {
@@ -284,34 +290,49 @@ impl Timer {
     }
 }
 
-/// 某一步超时的说法。**它同时是判据**：解析超时和解析失败要说成两句话。
-fn timed_out() -> String {
-    format!("{} 秒内未完成", PHASE_TIMEOUT.as_secs())
+/// 某一步超时的说法。
+const TIMED_OUT: &str = "l1.timeout";
+
+fn timed_out() -> Msg {
+    msg!(
+        "l1.timeout", seconds = PHASE_TIMEOUT.as_secs() =>
+        "did not finish within {seconds} s"
+    )
 }
 
-async fn phase<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> Result<T, String> {
+/// 这一段是超时，不是别的失败。**按码判，不按句子判** —— 上一版比的是
+/// 中文原话，于是「解析超时」和「解析失败」两句话之间隔着一次字符串相等，
+/// 改一个字就会把超时说成解析失败。
+fn is_timeout(m: &Msg) -> bool {
+    m.code == TIMED_OUT
+}
+
+async fn phase<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> Result<T, Msg> {
     match tokio::time::timeout(PHASE_TIMEOUT, f).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Err(e)) => Err(msg!("l1.io", detail = e => "{detail}")),
         Err(_) => Err(timed_out()),
     }
 }
 
 /// 拆出 host / port / 要不要 TLS。
-fn target_of(base_url: &str) -> Result<(String, u16, bool), String> {
-    let u = reqwest::Url::parse(base_url).map_err(|e| format!("接口地址不是合法的 URL：{e}"))?;
+fn target_of(base_url: &str) -> Result<(String, u16, bool), Msg> {
+    let u = reqwest::Url::parse(base_url).map_err(|e| {
+        msg!("l1.config.bad_url", detail = e => "The endpoint address is not a valid URL: {detail}")
+    })?;
     let tls = match u.scheme() {
         "https" => true,
         "http" => false,
         other => {
-            return Err(format!(
-                "接口地址的协议 {other} 不受支持，仅支持 http 和 https"
+            return Err(msg!(
+                "l1.config.unsupported_scheme", scheme = other =>
+                "The endpoint address uses `{scheme}`, which is not supported; only http and https are."
             ));
         }
     };
     let host = u
         .host_str()
-        .ok_or("接口地址中缺少主机名")?
+        .ok_or_else(|| msg!("l1.config.no_host" => "The endpoint address has no host name."))?
         .trim_matches(['[', ']'])
         .to_string();
     Ok((host, u.port_or_known_default().unwrap_or(443), tls))
@@ -328,11 +349,11 @@ pub async fn l1(base_url: &str, proxy: Option<&ProxyHop>) -> L1Result {
     let stream: Box<dyn Io> = match proxy {
         None => match connect_direct(&mut t, &host, port).await {
             Ok(s) => Box::new(s),
-            Err(r) => return r,
+            Err(r) => return *r,
         },
         Some(p) => match connect_via_proxy(&mut t, p, &host, port).await {
             Ok(s) => s,
-            Err(r) => return r,
+            Err(r) => return *r,
         },
     };
 
@@ -360,15 +381,17 @@ pub async fn l1_proxy(p: &ProxyHop, host: &str, port: u16) -> L1Result {
     let mut t = Timer::new();
     match connect_via_proxy(&mut t, p, host, port).await {
         Ok(_) => t.ok(),
-        Err(r) => r,
+        Err(r) => *r,
     }
 }
 
-async fn connect_direct(t: &mut Timer, host: &str, port: u16) -> Result<TcpStream, L1Result> {
+/// **`Err` 侧装箱**：这里的「错」是一份已经量完的 `L1Result`，比一个
+/// 句柄大得多，而成功那一路每次都要把它抬着走。
+async fn connect_direct(t: &mut Timer, host: &str, port: u16) -> Result<TcpStream, Box<L1Result>> {
     let dns = Stage::new(Step::Dns, Peer::Upstream);
     let addr = match resolve(t, host, port, dns).await {
         Ok(a) => a,
-        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(dns, e)),
+        Err(e) => return Err(Box::new(std::mem::replace(t, Timer::new()).fail(dns, e))),
     };
     let tcp = Stage::new(Step::Tcp, Peer::Upstream);
     match phase(TcpStream::connect(addr)).await {
@@ -377,13 +400,15 @@ async fn connect_direct(t: &mut Timer, host: &str, port: u16) -> Result<TcpStrea
             t.mark(tcp);
             Ok(s)
         }
-        Err(e) => Err(std::mem::replace(t, Timer::new()).fail(tcp, tcp_message(&e, addr))),
+        Err(e) => Err(Box::new(
+            std::mem::replace(t, Timer::new()).fail(tcp, tcp_message(&e, addr)),
+        )),
     }
 }
 
 /// 解析一个 `host:port`。**已经是 IP 时不记这一段** —— 记一个 0ms 的
 /// DNS 解析会让人以为解析快得离谱，而实际是根本没发生。
-async fn resolve(t: &mut Timer, host: &str, port: u16, stage: Stage) -> Result<SocketAddr, String> {
+async fn resolve(t: &mut Timer, host: &str, port: u16, stage: Stage) -> Result<SocketAddr, Msg> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         t.skip(stage, SkipReason::IpAddress);
         t.last = Instant::now();
@@ -395,18 +420,22 @@ async fn resolve(t: &mut Timer, host: &str, port: u16, stage: Stage) -> Result<S
     let mut it = phase(tokio::net::lookup_host((host, port)))
         .await
         .map_err(|e| {
-            if e == timed_out() {
-                format!(
-                    "解析 {host} 超过 {} 秒未完成，DNS 服务器可能无法访问",
-                    PHASE_TIMEOUT.as_secs()
+            if is_timeout(&e) {
+                msg!(
+                    "l1.dns.timeout", host = host, seconds = PHASE_TIMEOUT.as_secs() =>
+                    "Resolving {host} did not finish within {seconds} s. The DNS server may be unreachable."
                 )
             } else {
-                format!("无法解析 {host}。请检查域名拼写；如果该地址需要经代理访问，请先配置代理")
+                msg!(
+                    "l1.dns.failed", host = host =>
+                    "{host} could not be resolved. Check the spelling of the name; if this \
+                     address has to be reached through a proxy, configure the proxy first."
+                )
             }
         })?;
-    let addr = it
-        .next()
-        .ok_or_else(|| format!("{host} 的解析结果中没有地址"))?;
+    let addr = it.next().ok_or_else(
+        || msg!("l1.dns.no_records", host = host => "{host} resolved, but to no addresses."),
+    )?;
     t.mark(stage);
     Ok(addr)
 }
@@ -416,14 +445,14 @@ async fn connect_via_proxy(
     p: &ProxyHop,
     host: &str,
     port: u16,
-) -> Result<Box<dyn Io>, L1Result> {
+) -> Result<Box<dyn Io>, Box<L1Result>> {
     use tw_config::ProxyKind::*;
 
     let (phost, pport) = match split_hostport(&p.addr) {
         Ok(v) => v,
         Err(e) => {
             let stage = Stage::new(Step::Config, Peer::Proxy);
-            return Err(std::mem::replace(t, Timer::new()).fail(stage, e));
+            return Err(Box::new(std::mem::replace(t, Timer::new()).fail(stage, e)));
         }
     };
 
@@ -433,7 +462,11 @@ async fn connect_via_proxy(
     let target_ip = if p.kind == Socks5 {
         match resolve(t, host, port, upstream_dns).await {
             Ok(a) => Some(a),
-            Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(upstream_dns, e)),
+            Err(e) => {
+                return Err(Box::new(
+                    std::mem::replace(t, Timer::new()).fail(upstream_dns, e),
+                ));
+            }
         }
     } else {
         t.skip(upstream_dns, SkipReason::ProxyResolves);
@@ -443,7 +476,11 @@ async fn connect_via_proxy(
     let proxy_dns = Stage::new(Step::Dns, Peer::Proxy);
     let paddr = match resolve(t, &phost, pport, proxy_dns).await {
         Ok(a) => a,
-        Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(proxy_dns, e)),
+        Err(e) => {
+            return Err(Box::new(
+                std::mem::replace(t, Timer::new()).fail(proxy_dns, e),
+            ));
+        }
     };
     let proxy_tcp = Stage::new(Step::Tcp, Peer::Proxy);
     let tcp = match phase(TcpStream::connect(paddr)).await {
@@ -453,8 +490,10 @@ async fn connect_via_proxy(
             s
         }
         Err(e) => {
-            let msg = tcp_message(&e, paddr);
-            return Err(std::mem::replace(t, Timer::new()).fail(proxy_tcp, msg));
+            let why = tcp_message(&e, paddr);
+            return Err(Box::new(
+                std::mem::replace(t, Timer::new()).fail(proxy_tcp, why),
+            ));
         }
     };
 
@@ -466,7 +505,11 @@ async fn connect_via_proxy(
                 t.mark(proxy_tls);
                 s
             }
-            Err(e) => return Err(std::mem::replace(t, Timer::new()).fail(proxy_tls, e)),
+            Err(e) => {
+                return Err(Box::new(
+                    std::mem::replace(t, Timer::new()).fail(proxy_tls, e),
+                ));
+            }
         }
     } else {
         Box::new(tcp)
@@ -482,46 +525,70 @@ async fn connect_via_proxy(
             t.mark(handshake);
             Ok(io)
         }
-        Err(e) => Err(std::mem::replace(t, Timer::new()).fail(handshake, e)),
+        Err(e) => Err(Box::new(
+            std::mem::replace(t, Timer::new()).fail(handshake, e),
+        )),
     }
 }
 
 /// TCP 建连失败的系统原话是英文的，而且只有一个 errno。
 /// 「Connection refused (os error 61)」和「那个端口上没有东西在听」
 /// 之间隔着一次搜索。
-fn tcp_message(e: &str, addr: SocketAddr) -> String {
-    let l = e.to_ascii_lowercase();
+fn tcp_message(e: &Msg, addr: SocketAddr) -> Msg {
+    let l = e.text.to_ascii_lowercase();
     if l.contains("refused") {
-        format!("{addr} 拒绝连接，该端口上没有服务在监听。请检查地址和端口")
-    } else if e == timed_out() || l.contains("timed out") {
-        format!("连接 {addr} 没有响应。请检查网络，或确认该地址是否需要经代理访问")
+        msg!(
+            "l1.tcp.refused", addr = addr =>
+            "{addr} refused the connection: nothing is listening on that port. Check the address and the port."
+        )
+    } else if is_timeout(e) || l.contains("timed out") {
+        msg!(
+            "l1.tcp.timeout", addr = addr =>
+            "{addr} did not answer. Check the network, or whether this address has to be reached through a proxy."
+        )
     } else if l.contains("unreachable") {
-        format!("无法访问 {addr} 所在的网络，请检查本机网络")
+        msg!(
+            "l1.tcp.unreachable", addr = addr =>
+            "The network {addr} is on cannot be reached. Check this machine's network."
+        )
     } else {
-        format!("无法连接 {addr}：{e}")
+        msg!("l1.tcp.failed", addr = addr, detail = e.text.clone() => "{addr} could not be reached: {detail}")
     }
 }
 
-fn split_hostport(s: &str) -> Result<(String, u16), String> {
+fn split_hostport(s: &str) -> Result<(String, u16), Msg> {
     // IPv6 字面量要带方括号
     if let Some(rest) = s.strip_prefix('[') {
-        let (h, p) = rest
-            .split_once("]:")
-            .ok_or("IPv6 代理地址应写成 [::1]:1080 的形式")?;
-        return Ok((h.to_string(), p.parse().map_err(|_| "端口必须是数字")?));
+        let (h, p) = rest.split_once("]:").ok_or_else(|| {
+            msg!(
+                "l1.config.proxy_addr_ipv6_form" =>
+                "An IPv6 proxy address is written as [::1]:1080."
+            )
+        })?;
+        return Ok((
+            h.to_string(),
+            p.parse().map_err(|_| {
+                msg!("l1.config.proxy_port_not_a_number", port = p => "The port `{port}` is not a number.")
+            })?,
+        ));
     }
-    let (h, p) = s
-        .rsplit_once(':')
-        .ok_or("代理地址应写成 主机:端口 的形式")?;
+    let (h, p) = s.rsplit_once(':').ok_or_else(
+        || msg!("l1.config.proxy_addr_form" => "A proxy address is written as host:port."),
+    )?;
     // **裸的 IPv6 要报错，不能猜。**`fe80::1` 会被切成主机 `fe80:` 加
     // 端口 `1` —— 一个语法上完全合法、语义上彻底错掉的结果，而它的表现
     // 是「代理连不上」，没有任何线索指向这里。
     if h.contains(':') {
-        return Err(format!("{s} 中的 IPv6 地址需要加方括号，应写成 [{h}]:{p}"));
+        return Err(msg!(
+            "l1.config.proxy_addr_ipv6_brackets", addr = s, host = h, port = p =>
+            "The IPv6 address in {addr} needs brackets, as [{host}]:{port}."
+        ));
     }
     Ok((
         h.to_string(),
-        p.parse().map_err(|_| format!("端口 {p} 不是数字"))?,
+        p.parse().map_err(|_| {
+            msg!("l1.config.proxy_port_not_a_number", port = p => "The port `{port}` is not a number.")
+        })?,
     ))
 }
 
@@ -531,7 +598,7 @@ async fn socks5_connect(
     host: &str,
     port: u16,
     target_ip: Option<SocketAddr>,
-) -> Result<(), String> {
+) -> Result<(), Msg> {
     // 打招呼。**总是把「无认证」也报上去** —— 配了用户名密码但代理不要，
     // 只报 0x02 会被拒，而那个失败看起来像密码错了。
     let greeting: &[u8] = if p.auth.is_some() {
@@ -543,19 +610,25 @@ async fn socks5_connect(
     let mut m = [0u8; 2];
     read_exact(io, &mut m).await?;
     if m[0] != 0x05 {
-        return Err(format!(
-            "代理的响应不是 SOCKS5 协议（版本字节 0x{:02x}），该端口上可能是 HTTP 代理",
-            m[0]
+        return Err(msg!(
+            "l1.socks5.not_socks5", byte = format!("0x{:02x}", m[0]) =>
+            "The proxy did not answer SOCKS5 (version byte {byte}). An HTTP proxy may be running on that port."
         ));
     }
     match m[1] {
         0x00 => {}
         0x02 => {
             let Some((u, pw)) = &p.auth else {
-                return Err("代理要求用户名和密码认证，但该代理未配置认证信息".into());
+                return Err(msg!(
+                    "l1.socks5.auth_required" =>
+                    "The proxy asks for a user name and password, and none are configured for it."
+                ));
             };
             if u.len() > 255 || pw.len() > 255 {
-                return Err("SOCKS5 的用户名和密码均不能超过 255 字节".into());
+                return Err(msg!(
+                    "l1.socks5.credentials_too_long" =>
+                    "A SOCKS5 user name and password are each limited to 255 bytes."
+                ));
             }
             let mut buf = vec![0x01, u.len() as u8];
             buf.extend_from_slice(u.as_bytes());
@@ -565,11 +638,23 @@ async fn socks5_connect(
             let mut r = [0u8; 2];
             read_exact(io, &mut r).await?;
             if r[1] != 0x00 {
-                return Err("代理拒绝了用户名和密码".into());
+                return Err(msg!(
+                    "l1.socks5.auth_rejected" => "The proxy rejected the user name and password."
+                ));
             }
         }
-        0xFF => return Err("代理不接受所提供的认证方式".into()),
-        other => return Err(format!("代理要求的认证方式 0x{other:02x} 不受支持")),
+        0xFF => {
+            return Err(msg!(
+                "l1.socks5.no_acceptable_auth" =>
+                "The proxy accepts none of the authentication methods offered."
+            ));
+        }
+        other => {
+            return Err(msg!(
+                "l1.socks5.unsupported_auth", method = format!("0x{other:02x}") =>
+                "The proxy asks for authentication method {method}, which is not supported."
+            ));
+        }
     }
 
     // CONNECT
@@ -585,7 +670,10 @@ async fn socks5_connect(
         }
         None => {
             if host.len() > 255 {
-                return Err("域名超过 255 字节，无法通过 SOCKS5 发送".into());
+                return Err(msg!(
+                    "l1.socks5.host_too_long" =>
+                    "The host name is longer than 255 bytes and cannot be sent over SOCKS5."
+                ));
             }
             req.push(0x03);
             req.push(host.len() as u8);
@@ -598,7 +686,7 @@ async fn socks5_connect(
     let mut head = [0u8; 4];
     read_exact(io, &mut head).await?;
     if head[1] != 0x00 {
-        return Err(socks5_reply(head[1]).to_string());
+        return Err(socks5_reply(head[1]));
     }
     // **绑定地址必须读掉**，否则它会留在流里，被后面的 TLS 当成握手数据。
     let n = match head[3] {
@@ -609,24 +697,39 @@ async fn socks5_connect(
             read_exact(io, &mut l).await?;
             l[0] as usize
         }
-        other => return Err(format!("代理返回了无法识别的地址类型 0x{other:02x}")),
+        other => {
+            return Err(msg!(
+                "l1.socks5.unknown_address_type", kind = format!("0x{other:02x}") =>
+                "The proxy answered with address type {kind}, which is not recognized."
+            ));
+        }
     };
     let mut rest = vec![0u8; n + 2];
     read_exact(io, &mut rest).await?;
     Ok(())
 }
 
-fn socks5_reply(code: u8) -> &'static str {
+/// SOCKS5 的拒绝理由。**每一种一个码** —— 「代理规则不允许」和「主机
+/// 不可达」要去改的地方完全不同，合成一句「代理拒绝了连接」等于把那个
+/// 区别扔掉。
+fn socks5_reply(code: u8) -> Msg {
     match code {
-        0x01 => "代理内部错误",
-        0x02 => "代理规则不允许连接该地址",
-        0x03 => "网络不可达",
-        0x04 => "主机不可达",
-        0x05 => "目标拒绝连接",
-        0x06 => "TTL 已过期",
-        0x07 => "代理不支持 CONNECT",
-        0x08 => "代理不支持该地址类型",
-        _ => "代理拒绝了连接",
+        0x01 => msg!("l1.socks5.general_failure" => "The proxy reported an internal failure."),
+        0x02 => {
+            msg!("l1.socks5.not_allowed" => "The proxy's rules do not allow a connection to this address.")
+        }
+        0x03 => msg!("l1.socks5.network_unreachable" => "The proxy cannot reach that network."),
+        0x04 => msg!("l1.socks5.host_unreachable" => "The proxy cannot reach that host."),
+        0x05 => msg!("l1.socks5.connection_refused" => "The destination refused the connection."),
+        0x06 => msg!("l1.socks5.ttl_expired" => "The TTL expired on the way."),
+        0x07 => msg!("l1.socks5.command_unsupported" => "The proxy does not support CONNECT."),
+        0x08 => {
+            msg!("l1.socks5.address_type_unsupported" => "The proxy does not support this address type.")
+        }
+        other => msg!(
+            "l1.socks5.rejected", reply = format!("0x{other:02x}") =>
+            "The proxy refused the connection (reply {reply})."
+        ),
     }
 }
 
@@ -635,7 +738,7 @@ async fn http_connect(
     p: &ProxyHop,
     host: &str,
     port: u16,
-) -> Result<(), String> {
+) -> Result<(), Msg> {
     let hostport = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -661,7 +764,10 @@ async fn http_connect(
             break;
         }
         if buf.len() > 8192 {
-            return Err("代理的响应头超过 8 KB，该端口上可能不是 HTTP 代理".into());
+            return Err(msg!(
+                "l1.http_proxy.headers_too_large" =>
+                "The proxy's response headers passed 8 KB. Something other than an HTTP proxy may be running on that port."
+            ));
         }
     }
     let head = String::from_utf8_lossy(&buf);
@@ -669,17 +775,26 @@ async fn http_connect(
     let code = line.split_whitespace().nth(1).unwrap_or("");
     match code {
         "200" => Ok(()),
-        "407" => Err("代理要求认证（HTTP 407），请检查用户名和密码".into()),
-        "" => Err(format!("代理返回了无法识别的响应：{line}")),
-        c => Err(format!("代理拒绝了 CONNECT 请求（HTTP {c}）：{line}")),
+        "407" => Err(msg!(
+            "l1.http_proxy.auth_required" =>
+            "The proxy asks for authentication (HTTP 407). Check the user name and password."
+        )),
+        "" => Err(msg!(
+            "l1.http_proxy.unreadable_response", line = line =>
+            "The proxy answered something unrecognized: {line}"
+        )),
+        c => Err(msg!(
+            "l1.http_proxy.connect_rejected", status = c, line = line =>
+            "The proxy refused the CONNECT request (HTTP {status}): {line}"
+        )),
     }
 }
 
-async fn write_all(io: &mut Box<dyn Io>, buf: &[u8]) -> Result<(), String> {
+async fn write_all(io: &mut Box<dyn Io>, buf: &[u8]) -> Result<(), Msg> {
     phase(io.write_all(buf)).await
 }
 
-async fn read_exact(io: &mut Box<dyn Io>, buf: &mut [u8]) -> Result<(), String> {
+async fn read_exact(io: &mut Box<dyn Io>, buf: &mut [u8]) -> Result<(), Msg> {
     phase(async { io.read_exact(buf).await.map(|_| ()) }).await
 }
 
@@ -695,20 +810,21 @@ pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
         use rustls_platform_verifier::BuilderVerifierExt;
         let c = rustls::ClientConfig::builder()
             .with_platform_verifier()
-            .expect("无法创建平台证书验证器")
+            .expect("the platform certificate verifier could not be created")
             .with_no_client_auth();
         Arc::new(c)
     })
     .clone()
 }
 
-async fn tls_handshake(stream: Box<dyn Io>, host: &str) -> Result<(), String> {
+async fn tls_handshake(stream: Box<dyn Io>, host: &str) -> Result<(), Msg> {
     tls_handshake_boxed(stream, host).await.map(|_| ())
 }
 
-async fn tls_handshake_boxed(stream: Box<dyn Io>, host: &str) -> Result<Box<dyn Io>, String> {
-    let name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|_| format!("{host} 不是有效的 TLS 主机名"))?;
+async fn tls_handshake_boxed(stream: Box<dyn Io>, host: &str) -> Result<Box<dyn Io>, Msg> {
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(
+        |_| msg!("l1.tls.bad_hostname", host = host => "{host} is not a valid TLS host name."),
+    )?;
     let conn = tokio_rustls::TlsConnector::from(tls_config());
     match tokio::time::timeout(PHASE_TIMEOUT, conn.connect(name, stream)).await {
         Ok(Ok(s)) => Ok(Box::new(s)),
@@ -723,11 +839,11 @@ async fn tls_handshake_boxed(stream: Box<dyn Io>, host: &str) -> Result<Box<dyn 
 /// 里面那句才是平台验证器说的，外面两层包装对用户没有任何信息量。
 /// 而证书失败在这个产品的目标场景里**多半不是证书过期，是中间人**：
 /// 公司根证书、抓包工具、或者一个在劫持 TLS 的「代理」。
-fn tls_message(e: &std::io::Error) -> String {
+fn tls_message(e: &std::io::Error) -> Msg {
     let Some(rustls::Error::InvalidCertificate(ce)) =
         e.get_ref().and_then(|r| r.downcast_ref::<rustls::Error>())
     else {
-        return e.to_string();
+        return msg!("l1.tls.failed", detail = e => "The TLS handshake failed: {detail}");
     };
     let detail = match ce {
         rustls::CertificateError::Other(o) => o.to_string(),
@@ -737,20 +853,31 @@ fn tls_message(e: &std::io::Error) -> String {
     // 塞进 `Other`，那些结构化变体在这个平台上永远不会出现 —— 按枚举
     // 匹配的结果是每一种失败都拿到那句最泛的提示，包括证书只是过期时。
     let d = detail.to_ascii_lowercase();
-    let hint =
-        if d.contains("expired") || d.contains("not valid yet") || d.contains("not yet valid") {
-            "证书已过期或尚未生效，也可能是本机时间不准确，请先核对系统时间"
-        } else if d.contains("issuer")
-            || d.contains("self-signed")
-            || d.contains("self signed")
-            || d.contains("untrusted")
-            || d.contains("not trusted")
-        {
-            "证书的签发者不在系统信任列表中。如果本机安装了抓包工具或企业根证书，证书链可能已被替换"
-        } else {
-            "如果网络中有抓包工具或企业代理拦截 TLS 连接，也会出现此错误"
-        };
-    format!("证书验证未通过：{detail}。{hint}")
+    if d.contains("expired") || d.contains("not valid yet") || d.contains("not yet valid") {
+        msg!(
+            "l1.tls.cert_expired", detail = detail =>
+            "The certificate did not verify: {detail}. It has expired or is not valid yet; this \
+             machine's clock may also be wrong, so check the system time first."
+        )
+    } else if d.contains("issuer")
+        || d.contains("self-signed")
+        || d.contains("self signed")
+        || d.contains("untrusted")
+        || d.contains("not trusted")
+    {
+        msg!(
+            "l1.tls.cert_untrusted_issuer", detail = detail =>
+            "The certificate did not verify: {detail}. Its issuer is not in the system trust \
+             store. If an interception tool or a corporate root certificate is installed on this \
+             machine, the certificate chain may have been replaced."
+        )
+    } else {
+        msg!(
+            "l1.tls.cert_invalid", detail = detail =>
+            "The certificate did not verify: {detail}. An interception tool or a corporate proxy \
+             that terminates TLS on the network also produces this error."
+        )
+    }
 }
 
 #[cfg(test)]
@@ -858,7 +985,7 @@ mod tests {
         // 变成主机 `fe80:` 加端口 `1`，语法合法、语义全错，而表现只是
         // 「代理连不上」。**报错好过悄悄猜。**
         let e = split_hostport("fe80::1").unwrap_err();
-        assert!(e.contains("方括号"), "{e}");
+        assert_eq!(e.code, "l1.config.proxy_addr_ipv6_brackets", "{e}");
         assert!(split_hostport("::1:1080").is_err());
         assert!(split_hostport("no-port").is_err());
     }
@@ -1039,7 +1166,7 @@ mod tests {
         let e = socks5_connect(&mut io, &p, "example.com", 443, None)
             .await
             .unwrap_err();
-        assert!(e.contains("HTTP 代理"), "{e}");
+        assert_eq!(e.code, "l1.socks5.not_socks5", "{e}");
     }
 
     // ── 假的 HTTP CONNECT 代理 ──────────────────────────────────────
@@ -1104,7 +1231,7 @@ mod tests {
         let mut io = dial(a).await;
         let p = hop(tw_config::ProxyKind::Http, a, None);
         let e = http_connect(&mut io, &p, "x.com", 443).await.unwrap_err();
-        assert!(e.contains("用户名和密码"), "{e}");
+        assert_eq!(e.code, "l1.http_proxy.auth_required", "{e}");
     }
 
     #[tokio::test]
@@ -1150,8 +1277,9 @@ mod tests {
         let r = l1_proxy(&p, "api.anthropic.com", 443).await;
         assert!(!r.ok);
         let e = r.error.unwrap();
-        assert!(e.contains("没有服务在监听"), "{e}");
-        assert!(!e.contains("os error"), "{e}");
+        assert_eq!(e.code, "l1.tcp.refused", "{e}");
+        // 系统原话（「Connection refused (os error 61)」）不往外发
+        assert!(!e.text.contains("os error"), "{e}");
     }
 
     #[tokio::test]

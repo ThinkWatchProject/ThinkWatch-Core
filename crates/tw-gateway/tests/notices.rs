@@ -174,7 +174,9 @@ async fn next_change(
                     ..
                 } if want == "proxy" => {
                     assert_eq!(proxy, "代理一");
-                    return (state, detail);
+                    // **返回码，不返回句子。**这条测试要的是「说清卡在哪一步」，
+                    // 而句子随时会改措辞 —— 比字符串的话，改一个词就红
+                    return (state, detail.map(|d| d.code));
                 }
                 _ => {}
             }
@@ -232,9 +234,12 @@ async fn a_dead_proxy_is_named_as_the_cause_and_reported_again_when_it_comes_bac
 
     // 代理连上就断：请求失败，而失败的是代理不是上游
     assert_ne!(ask(gw).await, 200);
-    let (state, detail) = next_change(&mut rx, "proxy").await;
+    let (state, code) = next_change(&mut rx, "proxy").await;
     assert_eq!(state, "unreachable");
-    assert!(detail.is_some_and(|d| !d.is_empty()), "要说清卡在哪一步");
+    assert!(
+        code.is_some_and(|c| c.starts_with("l1.")),
+        "要说清卡在哪一步"
+    );
 
     broken.store(false, Ordering::SeqCst);
     assert_eq!(ask(gw).await, 200);

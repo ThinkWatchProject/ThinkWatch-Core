@@ -552,7 +552,8 @@ async fn testing_a_proxy_checks_its_credentials_including_the_stored_ones() {
     .await;
     let v = json(&body);
     assert_eq!(v["ok"], false, "{body}");
-    assert!(v["error"].as_str().unwrap().contains("407"), "{body}");
+    // 按码断言：这条测的是「握手做完了、认证验过了」，不是那句话怎么写
+    assert_eq!(v["error"]["code"], "l1.http_proxy.auth_required", "{body}");
 
     // 存下正确的，再用「保持原样」检测 —— 用的是存着的那份
     call(
