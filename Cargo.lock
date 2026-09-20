@@ -2784,6 +2784,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tw-config",
+ "tw-types",
  "tw-yaml",
 ]
 
@@ -3026,6 +3027,7 @@ dependencies = [
  "tracing",
  "tw-adopt",
  "tw-config",
+ "tw-types",
 ]
 
 [[package]]

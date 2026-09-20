@@ -189,6 +189,7 @@ mod tests {
     use super::*;
     use crate::report::{Finding, Level};
     use crate::sources::Kind;
+    use tw_types::Msg;
 
     fn f(path: &str, rule: &str, line: usize) -> Finding {
         Finding {
@@ -198,8 +199,8 @@ mod tests {
             client: "claude-code".into(),
             path: PathBuf::from(path),
             line,
-            title: "t".into(),
-            detail: "d".into(),
+            title: Msg::plain("t"),
+            detail: Msg::plain("d"),
             excerpt: "e".into(),
         }
     }
@@ -249,8 +250,8 @@ mod tests {
         // 这些文件里有用户的提示词和密钥。
         let mut seen = Seen::default();
         let mut secret = f("a", "tag", 1);
-        secret.detail = "这里有一段很私密的提示词内容".into();
-        secret.title = "标题里也有私密内容".into();
+        secret.detail = Msg::plain("这里有一段很私密的提示词内容");
+        secret.title = Msg::plain("标题里也有私密内容");
         seen.diff(&[secret]);
         let dump = format!("{:?}", seen);
         assert!(!dump.contains("私密"), "{dump}");

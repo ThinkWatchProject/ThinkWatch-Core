@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use tw_types::{Msg, msg};
 
 #[derive(Debug, Error)]
 pub enum ForeignError {
@@ -61,7 +62,7 @@ pub struct Applied {
     /// 原来没有这个文件，是我们创建的。还原时要连文件一起删。
     pub created: bool,
     /// 不至于失败、但用户该知道的事。
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Msg>,
 }
 
 fn now_ms() -> u64 {
@@ -243,10 +244,11 @@ pub fn apply(
         // **说出来。**用户以为自己在改 ~/.claude/settings.json，实际写
         // 的是 ~/dotfiles/claude/settings.json —— 那是个会被 git 提交
         // 的地方，而我们正要往里放一个密钥。
-        warnings.push(format!(
-            "{} is a symbolic link; the file actually written is {}.",
-            ch.path.display(),
-            real.display()
+        warnings.push(msg!(
+            "adopt.warn.symlink",
+            path = ch.path.display(),
+            real = real.display()
+            => "{path} is a symbolic link; the file actually written is {real}."
         ));
     }
 
@@ -280,11 +282,11 @@ pub fn apply(
         && let Some(m) = keep
         && m & 0o077 != 0
     {
-        warnings.push(format!(
-            "{} is mode {:o}, so other users on this machine can read the key written into it. chmod 600 {} tightens it.",
-            real.display(),
-            m,
-            real.display()
+        warnings.push(msg!(
+            "adopt.warn.world_readable",
+            path = real.display(),
+            mode = format!("{m:o}")
+            => "{path} is mode {mode}, so other users on this machine can read the key written into it. chmod 600 {path} tightens it."
         ));
     }
 
@@ -362,7 +364,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         assert!(
-            a.warnings.iter().any(|w| w.contains("symbolic link")),
+            a.warnings.iter().any(|w| w.text.contains("symbolic link")),
             "{:?}",
             a.warnings
         );
@@ -514,7 +516,7 @@ mod tests {
         let m = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(m, 0o644, "权限被我们改了");
         assert!(
-            a.warnings.iter().any(|w| w.contains("chmod 600")),
+            a.warnings.iter().any(|w| w.text.contains("chmod 600")),
             "{:?}",
             a.warnings
         );

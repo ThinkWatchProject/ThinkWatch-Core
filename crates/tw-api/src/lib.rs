@@ -21,7 +21,12 @@ pub use tw_types::Msg;
 /// **2 起，凡是给人看的一句话都是 [`Msg`]，不是 `String`。**错误响应的
 /// 响应体也从纯文本变成了 JSON。照 1 写的客户端会把这些当字符串显示，
 /// 屏幕上是一坨 JSON —— 所以这里要跳号，让它在连上的那一刻就失败。
-pub const CONTROL_API_VERSION: u32 = 2;
+///
+/// **3 把剩下的那些也换了。**2 只管了错误：扫描发现、客户端诊断、接管
+/// 的代价和提醒仍然是 `String`，于是中文界面上整整三页变成了英文。
+/// 换句话说，2 只做了一半 —— 而「一句给人读的话」和「它是不是错误」
+/// 本来就没有关系。
+pub const CONTROL_API_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -2389,8 +2394,8 @@ pub struct ScanFinding {
     pub path: String,
     /// 第几行，从 1 开始
     pub line: usize,
-    pub title: String,
-    pub detail: String,
+    pub title: Msg,
+    pub detail: Msg,
     /// 命中的那一行，**不可见字符已经换成可见记号**
     pub excerpt: String,
 }
@@ -2474,8 +2479,9 @@ pub struct McpTargetView {
     pub path: String,
     /// 能不能往里写。**不能写的照样在清单里** —— 看得见是第一目标
     pub copyable: bool,
-    /// 不能写的话，为什么
-    pub why_not: String,
+    /// 不能写的话，为什么。能写的时候没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_not: Option<Msg>,
 }
 
 // ---------------------------------------------------------------- 路由试算
@@ -2660,7 +2666,7 @@ pub struct DetectedClient {
     /// 没有在本机实际运行验证）
     pub verified: String,
     /// 接管之后会失去或改变的功能
-    pub costs: Vec<String>,
+    pub costs: Vec<Msg>,
     /// 最后一次收到这个客户端的请求。**接管有没有真的生效，只有它能证明**
     pub last_seen_ms: Option<u64>,
 }
@@ -2670,8 +2676,8 @@ pub struct DetectedClient {
 pub struct ManualClient {
     pub name: String,
     /// 手动配置的步骤，网关地址已经填在里面
-    pub how: String,
-    pub caveat: String,
+    pub how: Msg,
+    pub caveat: Msg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2704,7 +2710,7 @@ pub struct PlanView {
     /// 界面上永远不显示真正的密钥，diff 里也不行：用户会截图这一屏来问
     /// 「这样对吗」。
     pub after: String,
-    pub notes: Vec<String>,
+    pub notes: Vec<Msg>,
     pub shadows: Vec<String>,
     /// 已经是这样了，什么都不用改
     pub noop: bool,
@@ -2731,7 +2737,7 @@ pub struct AdoptResponse {
     pub backup: String,
     pub created: bool,
     /// 不至于失败、但用户该知道的事（符号链接、权限太松……）
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Msg>,
     /// 改动什么时候生效，和 `DetectedClient.takes_effect` 同一个词表
     pub takes_effect: String,
 }
@@ -2741,10 +2747,10 @@ pub struct AdoptResponse {
 pub struct FindingView {
     /// `blocking` | `suspect` | `clear`
     pub level: String,
-    pub title: String,
-    pub detail: String,
+    pub title: Msg,
+    pub detail: Msg,
     /// 用户可以自己执行的下一步。**我们不替他执行。**
-    pub fix: Option<String>,
+    pub fix: Option<Msg>,
 }
 
 #[cfg(test)]

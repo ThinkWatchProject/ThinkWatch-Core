@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tw_types::{Msg, msg};
+
 use crate::clients::{Client, Format, TakesEffect, Verified, adoptable};
 use crate::foreign;
 use crate::sentinel::{self, SidecarRecord};
@@ -39,7 +41,7 @@ pub struct Detected {
     pub takes_effect: TakesEffect,
     pub verified: Verified,
     pub format: Format,
-    pub costs: Vec<String>,
+    pub costs: Vec<Msg>,
 }
 
 fn endpoint_of(c: &Client, text: &str) -> Option<String> {
@@ -98,7 +100,15 @@ pub fn detect_one(c: &Client, home: &Path) -> Detected {
         takes_effect: c.takes_effect,
         verified: c.verified,
         format: c.format,
-        costs: c.costs.iter().map(|s| s.to_string()).collect(),
+        costs: c
+            .costs
+            .iter()
+            .map(|(code, text)| Msg {
+                code: (*code).into(),
+                args: Default::default(),
+                text: (*text).into(),
+            })
+            .collect(),
         path,
         real,
     }
@@ -123,13 +133,16 @@ pub enum Level {
 }
 
 /// 一条发现。
+///
+/// **三句话都带码。**这一屏是「为什么没生效」的答案，桌面版要用中文
+/// 说出来；英文原句是给命令行和不认识这个码的客户端的退路。
 #[derive(Debug, Clone)]
 pub struct Finding {
     pub level: Level,
-    pub title: String,
-    pub detail: String,
+    pub title: Msg,
+    pub detail: Msg,
     /// 用户可以自己执行的下一步。**我们不替他执行。**
-    pub fix: Option<String>,
+    pub fix: Option<Msg>,
 }
 
 fn now_ms() -> u64 {
@@ -237,34 +250,38 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
             if started.is_empty() {
                 out.push(Finding {
                     level: Level::Clear,
-                    title: format!("{} is not running", c.name),
-                    detail: "It reads the new configuration the next time it starts.".into(),
+                    title: msg!("adopt.diag.not_running", client = c.name => "{client} is not running"),
+                    detail: msg!("adopt.diag.not_running.detail" => "It reads the new configuration the next time it starts."),
                     fix: None,
                 });
             } else if !stale.is_empty() {
                 out.push(Finding {
                     level: Level::Blocking,
-                    title: format!("{} was started before the change", c.name),
-                    detail: format!(
-                        "{} processes were started before the change and are still on the old configuration. {}",
-                        stale.len(),
+                    title: msg!("adopt.diag.started_before", client = c.name => "{client} was started before the change"),
+                    // `takes_effect` 传的是词表里的那个词，不是那句话本身
+                    // —— 句子在两边各写各的，码和词是共同的那部分
+                    detail: msg!(
+                        "adopt.diag.started_before.detail",
+                        count = stale.len(),
+                        takes_effect = c.takes_effect.slug(),
+                        => "{count} processes were started before the change and are still on the old configuration. {}",
                         c.takes_effect.note()
                     ),
-                    fix: Some(format!("Quit {} and open it again", c.name)),
+                    fix: Some(msg!("adopt.diag.restart", client = c.name => "Quit {client} and open it again")),
                 });
             } else {
                 out.push(Finding {
                     level: Level::Clear,
-                    title: format!("{} was started after the change", c.name),
-                    detail: "It has read the new configuration.".into(),
+                    title: msg!("adopt.diag.started_after", client = c.name => "{client} was started after the change"),
+                    detail: msg!("adopt.diag.started_after.detail" => "It has read the new configuration."),
                     fix: None,
                 });
             }
         }
         None => out.push(Finding {
             level: Level::Suspect,
-            title: "This client has not been pointed at the gateway".into(),
-            detail: format!("{} carries no record.", d.real.display()),
+            title: msg!("adopt.diag.not_adopted" => "This client has not been pointed at the gateway"),
+            detail: msg!("adopt.diag.not_adopted.detail", path = d.real.display() => "{path} carries no record."),
             fix: None,
         }),
     }
@@ -273,11 +290,11 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if d.shadows.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: "Nothing takes precedence over this file".into(),
+            title: msg!("adopt.diag.no_shadow" => "Nothing takes precedence over this file"),
             detail: if c.shadowed_by.is_empty() {
-                "This client has no configuration file that takes precedence.".into()
+                msg!("adopt.diag.no_shadow.none" => "This client has no configuration file that takes precedence.")
             } else {
-                format!("{} does not exist.", c.shadowed_by.join(", "))
+                msg!("adopt.diag.no_shadow.absent", files = c.shadowed_by.join(", ") => "{files} does not exist.")
             },
             fix: None,
         });
@@ -291,22 +308,25 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     Level::Blocking
                 },
-                title: format!(
-                    "{} takes precedence over what was written here",
-                    s.display()
+                title: msg!(
+                    "adopt.diag.shadowed",
+                    path = s.display()
+                    => "{path} takes precedence over what was written here"
                 ),
                 detail: if hits.is_empty() {
-                    "The file exists, but carries none of the fields in question.".into()
+                    msg!("adopt.diag.shadowed.no_fields" => "The file exists, but carries none of the fields in question.")
                 } else {
-                    format!(
-                        "The file carries {}, which overrides what was written here.",
-                        hits.iter()
+                    msg!(
+                        "adopt.diag.shadowed.fields",
+                        fields = hits
+                            .iter()
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>()
                             .join(", ")
+                        => "The file carries {fields}, which overrides what was written here."
                     )
                 },
-                fix: Some(format!("Look at those fields in {}", s.display())),
+                fix: Some(msg!("adopt.diag.look_at_fields", path = s.display() => "Look at those fields in {path}")),
             });
         }
     }
@@ -317,12 +337,13 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
         if local.exists() {
             out.push(Finding {
                 level: Level::Suspect,
-                title: "This project has a configuration file of the same name".into(),
-                detail: format!(
-                    "{} overrides the user-level configuration.",
-                    local.display()
+                title: msg!("adopt.diag.project_config" => "This project has a configuration file of the same name"),
+                detail: msg!(
+                    "adopt.diag.project_config.detail",
+                    path = local.display()
+                    => "{path} overrides the user-level configuration."
                 ),
-                fix: Some(format!("Look at {}", local.display())),
+                fix: Some(msg!("adopt.diag.look_at", path = local.display() => "Look at {path}")),
             });
         }
     }
@@ -338,16 +359,15 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     Level::Blocking
                 },
-                title: "This machine has a managed-policy file".into(),
-                detail: format!("{MANAGED} takes precedence over everything else, including the user's own configuration."),
+                title: msg!("adopt.diag.managed" => "This machine has a managed-policy file"),
+                detail: msg!("adopt.diag.managed.detail", path = MANAGED => "{path} takes precedence over everything else, including the user's own configuration."),
                 fix: None,
             });
         } else {
             out.push(Finding {
                 level: Level::Clear,
-                title: "This machine has no managed-policy file".into(),
-                detail: "There is no managed-policy file taking precedence over everything else."
-                    .into(),
+                title: msg!("adopt.diag.no_managed" => "This machine has no managed-policy file"),
+                detail: msg!("adopt.diag.no_managed.detail" => "There is no managed-policy file taking precedence over everything else."),
                 fix: None,
             });
         }
@@ -358,8 +378,8 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if exports.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: "No shell file exports a variable of the same name".into(),
-            detail: "Checked .zshrc, .zprofile, .bashrc and the rest.".into(),
+            title: msg!("adopt.diag.no_exports" => "No shell file exports a variable of the same name"),
+            detail: msg!("adopt.diag.no_exports.detail" => "Checked .zshrc, .zprofile, .bashrc and the rest."),
             fix: None,
         });
     } else {
@@ -369,26 +389,39 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
             let (level, detail) = if c.config_beats_env {
                 (
                     Level::Suspect,
-                    format!(
-                        "It does not affect {}, whose configuration file takes precedence, but it does affect every client that reads the environment.",
-                        c.name
+                    msg!(
+                        "adopt.diag.shell_export.harmless",
+                        client = c.name
+                        => "It does not affect {client}, whose configuration file takes precedence, but it does affect every client that reads the environment."
                     ),
                 )
             } else {
                 (
                     Level::Blocking,
-                    format!(
-                        "{} reads the environment, so this line overrides what was written here.",
-                        c.name
+                    msg!(
+                        "adopt.diag.shell_export.overrides",
+                        client = c.name
+                        => "{client} reads the environment, so this line overrides what was written here."
                     ),
                 )
             };
             out.push(Finding {
                 level,
-                title: format!("{} exports {name} on line {line}", f.display()),
+                title: msg!(
+                    "adopt.diag.shell_export",
+                    path = f.display(),
+                    name = name,
+                    line = line
+                    => "{path} exports {name} on line {line}"
+                ),
                 detail,
                 // 命令给出来，执行与否是他的事
-                fix: Some(format!("sed -i '' '{line}d' {}", f.display())),
+                fix: Some(msg!(
+                    "adopt.diag.delete_line",
+                    path = f.display(),
+                    line = line
+                    => "sed -i '' '{line}d' {path}"
+                )),
             });
         }
     }
@@ -397,17 +430,18 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     match (&d.adopted_at_ms, &d.endpoint) {
         (Some(_), None) => out.push(Finding {
             level: Level::Blocking,
-            title: "The fields written here are no longer in the configuration".into(),
-            detail: format!(
-                "{} no longer carries the endpoint that was written here; something else may have changed it.",
-                d.real.display()
+            title: msg!("adopt.diag.fields_gone" => "The fields written here are no longer in the configuration"),
+            detail: msg!(
+                "adopt.diag.fields_gone.detail",
+                path = d.real.display()
+                => "{path} no longer carries the endpoint that was written here; something else may have changed it."
             ),
-            fix: Some("Point this client at the gateway again".into()),
+            fix: Some(msg!("adopt.diag.adopt_again" => "Point this client at the gateway again")),
         }),
         (Some(_), Some(ep)) => out.push(Finding {
             level: Level::Clear,
-            title: "The endpoint in the configuration is the one written here".into(),
-            detail: format!("It points at {ep}."),
+            title: msg!("adopt.diag.endpoint_ok" => "The endpoint in the configuration is the one written here"),
+            detail: msg!("adopt.diag.endpoint_ok.detail", endpoint = ep => "It points at {endpoint}."),
             fix: None,
         }),
         _ => {}
@@ -417,9 +451,8 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     // 绿色的「查过了没问题」会让人以为已经确认过。
     out.push(Finding {
         level: Level::Suspect,
-        title: "Everything above is a static check".into(),
-        detail: "A static check cannot tell whether the configuration is actually in use. Only a real request from this client settles that."
-            .into(),
+        title: msg!("adopt.diag.static_only" => "Everything above is a static check"),
+        detail: msg!("adopt.diag.static_only.detail" => "A static check cannot tell whether the configuration is actually in use. Only a real request from this client settles that."),
         fix: None,
     });
     out
@@ -487,15 +520,15 @@ mod tests {
         let cc = diagnose(&c("claude-code"), home, None);
         let f = cc
             .iter()
-            .find(|f| f.title.contains("ANTHROPIC_BASE_URL"))
+            .find(|f| f.title.text.contains("ANTHROPIC_BASE_URL"))
             .unwrap();
         assert_eq!(f.level, Level::Suspect, "{:?}", f);
-        assert!(f.detail.contains("takes precedence"), "{}", f.detail);
+        assert!(f.detail.text.contains("takes precedence"), "{}", f.detail);
 
         let cx = diagnose(&c("codex"), home, None);
         let f = cx
             .iter()
-            .find(|f| f.title.contains("OPENAI_BASE_URL"))
+            .find(|f| f.title.text.contains("OPENAI_BASE_URL"))
             .unwrap();
         assert_eq!(f.level, Level::Blocking, "{:?}", f);
     }
@@ -515,7 +548,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let out = diagnose(&c("claude-code"), d.path(), None);
         assert!(
-            out.iter().any(|f| f.detail.contains("real request")),
+            out.iter().any(|f| f.detail.text.contains("real request")),
             "结论里没留下这句话：{out:?}"
         );
     }
@@ -532,9 +565,13 @@ mod tests {
         let out = diagnose(&c("codex"), d.path(), None);
         let f = out
             .iter()
-            .find(|f| f.title.contains("OPENAI_BASE_URL"))
+            .find(|f| f.title.text.contains("OPENAI_BASE_URL"))
             .unwrap();
-        assert!(f.fix.as_ref().unwrap().contains("sed -i ''"), "{:?}", f.fix);
+        assert!(
+            f.fix.as_ref().unwrap().text.contains("sed -i ''"),
+            "{:?}",
+            f.fix
+        );
         // 文件还在，我们没动它
         assert!(d.path().join(".zshrc").exists());
         assert!(
@@ -571,5 +608,52 @@ mod tests {
             "空目录里不该检测出任何客户端"
         );
         assert_eq!(all.len(), adoptable().len());
+    }
+
+    /// **每一条诊断都要带码。**
+    ///
+    /// 这一屏是「为什么没生效」的答案，漏一个码不会报错，只会让中文
+    /// 界面上那一行悄悄变成英文。走一遍每个客户端，把能走到的分支
+    /// 都过一次。
+    #[test]
+    fn every_finding_carries_a_code() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        // 让「有配置文件」「有残留」「shell 里 export 了」这几条都成立
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.local.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://old"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".zshrc"),
+            "export ANTHROPIC_BASE_URL=https://old
+",
+        )
+        .unwrap();
+        let mut n = 0;
+        for c in adoptable() {
+            for f in diagnose(&c, home, Some(home)) {
+                n += 1;
+                assert!(!f.title.code.is_empty(), "{}：「{}」没有码", c.id, f.title);
+                assert!(
+                    !f.detail.code.is_empty(),
+                    "{}：「{}」没有码",
+                    c.id,
+                    f.detail
+                );
+                assert!(
+                    !f.title.text.is_empty(),
+                    "{}：{} 没有英文原句",
+                    c.id,
+                    f.title.code
+                );
+                if let Some(fix) = &f.fix {
+                    assert!(!fix.code.is_empty(), "{}：「{fix}」没有码", c.id);
+                }
+            }
+        }
+        assert!(n > 10, "只走到 {n} 条，分支没覆盖到");
     }
 }

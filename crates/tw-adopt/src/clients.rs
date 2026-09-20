@@ -7,9 +7,11 @@
 //!
 //! 这个文件只管第一张表。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use tw_types::Msg;
 
 use crate::json::Val;
 
@@ -108,7 +110,10 @@ pub struct Client {
     pub shadowed_by: &'static [&'static str],
     /// 接管的代价。**接管确认对话框要把它们列出来，不能等用户自己发现**
     /// —— 这些不是我们的 bug，但用户会算到我们头上。
-    pub costs: &'static [&'static str],
+    ///
+    /// 每条是「码，英文原句」。码给桌面版查中文，英文原句给命令行和
+    /// 不认识这个码的客户端。
+    pub costs: &'static [(&'static str, &'static str)],
     pub verified: Verified,
     /// 判断「这台机器上装了它吗」的痕迹，相对 `$HOME`。
     ///
@@ -193,9 +198,18 @@ pub fn adoptable() -> Vec<Client> {
             // **`settings.local.json` 优先级更高。**cc-switch #6828 栽在这里
             shadowed_by: &[".claude/settings.local.json"],
             costs: &[
-                "Remote Control and voice input do not work when the endpoint is not an official domain.",
-                "MCP tool search is off by default.",
-                "Claude Code may show its welcome screen once; closing it is enough.",
+                (
+                    "adopt.cost.claude_code.remote_control",
+                    "Remote Control and voice input do not work when the endpoint is not an official domain.",
+                ),
+                (
+                    "adopt.cost.claude_code.mcp_tool_search",
+                    "MCP tool search is off by default.",
+                ),
+                (
+                    "adopt.cost.claude_code.welcome_screen",
+                    "Claude Code may show its welcome screen once; closing it is enough.",
+                ),
             ],
             verified: Verified::FieldsOnly,
             marker: &[".claude"],
@@ -220,8 +234,14 @@ pub fn adoptable() -> Vec<Client> {
             // 所以它不构成遮蔽 —— 但它确实存在，值得在诊断里提一句
             shadowed_by: &[],
             costs: &[
-                "Codex CLI does not read the model list from the gateway, so a custom model name has no effect; its local model catalogue decides.",
-                "The terminal has to be reopened afterwards.",
+                (
+                    "adopt.cost.codex.model_list",
+                    "Codex CLI does not read the model list from the gateway, so a custom model name has no effect; its local model catalogue decides.",
+                ),
+                (
+                    "adopt.cost.codex.reopen_terminal",
+                    "The terminal has to be reopened afterwards.",
+                ),
             ],
             verified: Verified::Measured,
             marker: &[".codex"],
@@ -236,7 +256,10 @@ pub fn adoptable() -> Vec<Client> {
             format: Format::Json,
             takes_effect: TakesEffect::OnRestart,
             shadowed_by: &[],
-            costs: &["opencode has to be restarted afterwards."],
+            costs: &[(
+                "adopt.cost.opencode.restart",
+                "opencode has to be restarted afterwards.",
+            )],
             verified: Verified::FieldsOnly,
             marker: &[".config/opencode", ".local/share/opencode"],
             process: &["opencode"],
@@ -252,9 +275,10 @@ pub fn adoptable() -> Vec<Client> {
             shadowed_by: &[],
             // **只算部分接管**：Zed 的密钥走它自己的凭据存储，不在
             // settings.json 里，我们写不进去。
-            costs: &[
+            costs: &[(
+                "adopt.cost.zed.key_store",
                 "Zed keeps its key outside the configuration file, so it has to be filled in once in Zed's settings.",
-            ],
+            )],
             verified: Verified::FieldsOnly,
             marker: &[".config/zed"],
             process: &["Zed"],
@@ -271,8 +295,14 @@ pub fn adoptable() -> Vec<Client> {
             // 我们只写 home 那一份，所以项目里的会盖住它
             shadowed_by: &[],
             costs: &[
-                "Aider reads the home directory, then the Git project root, then the current directory, and each one overrides the last; only the home directory is changed here.",
-                "Aider has to be restarted afterwards.",
+                (
+                    "adopt.cost.aider.lookup_order",
+                    "Aider reads the home directory, then the Git project root, then the current directory, and each one overrides the last; only the home directory is changed here.",
+                ),
+                (
+                    "adopt.cost.aider.restart",
+                    "Aider has to be restarted afterwards.",
+                ),
             ],
             verified: Verified::FieldsOnly,
             // 没接管过的用户本来就没有这个文件，所以它自己就是那个痕迹
@@ -291,18 +321,37 @@ pub fn adoptable() -> Vec<Client> {
 /// 用户以为所有流量都在我们这儿。
 pub struct ManualOnly {
     pub name: &'static str,
+    /// 这个客户端的码前缀：步骤是 `<prefix>.how`，提醒是 `<prefix>.caveat`
+    code: &'static str,
     /// 手动配置的步骤。`{v1}` 是带 `/v1` 的网关地址，`{base}` 是不带的
     steps: &'static str,
-    pub caveat: &'static str,
+    caveat: &'static str,
 }
 
 impl ManualOnly {
     /// 手动配置的步骤，**网关地址已经填好**。以前这里写的是「填我们的
     /// 地址」，用户还得自己去找那个地址是什么。
-    pub fn how(&self, gw: &Gateway) -> String {
-        self.steps
-            .replace("{v1}", &gw.v1())
-            .replace("{base}", gw.base.trim_end_matches('/'))
+    pub fn how(&self, gw: &Gateway) -> Msg {
+        let v1 = gw.v1();
+        let base = gw.base.trim_end_matches('/').to_string();
+        Msg {
+            code: format!("{}.how", self.code),
+            args: BTreeMap::from([
+                ("v1".to_string(), v1.clone()),
+                ("base".to_string(), base.clone()),
+            ]),
+            text: self.steps.replace("{v1}", &v1).replace("{base}", &base),
+        }
+    }
+
+    /// 接管不了的那一句提醒。**必须和步骤一起给** —— 只说怎么配、不说
+    /// 配完还漏什么，等于说了假话
+    pub fn caveat(&self) -> Msg {
+        Msg {
+            code: format!("{}.caveat", self.code),
+            args: BTreeMap::new(),
+            text: self.caveat.to_string(),
+        }
     }
 }
 
@@ -310,11 +359,13 @@ pub fn manual_only() -> Vec<ManualOnly> {
     vec![
         ManualOnly {
             name: "Cursor",
+            code: "adopt.manual.cursor",
             steps: "In Cursor, under Settings → Models, turn on Override OpenAI Base URL and enter {v1}.",
             caveat: "Tab completion and inline edit still go to Cursor's own service rather than the gateway, so only part of Cursor is covered.",
         },
         ManualOnly {
             name: "Continue",
+            code: "adopt.manual.continue",
             steps: "Add an entry to the models list in ~/.continue/config.yaml with apiBase set to {v1}.",
             // **接管它要往一个 YAML 列表里插一个新条目**，那是结构性
             // 改写，不是替换一个标量。我们的 YAML 补丁只做后者
@@ -324,6 +375,7 @@ pub fn manual_only() -> Vec<ManualOnly> {
         },
         ManualOnly {
             name: "Gemini CLI",
+            code: "adopt.manual.gemini_cli",
             steps: "Add export GOOGLE_GEMINI_BASE_URL={base} to the shell configuration, then reopen the terminal.",
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
             // 「只改 endpoint 和 key 字段」的边界 ——
@@ -542,7 +594,7 @@ mod tests {
             .unwrap();
         assert!(!cc.costs.is_empty());
         assert!(
-            cc.costs.iter().any(|c| c.contains("Remote Control")),
+            cc.costs.iter().any(|(_, t)| t.contains("Remote Control")),
             "{:?}",
             cc.costs
         );
@@ -576,16 +628,53 @@ mod tests {
             key: None,
         };
         assert!(
-            cursor.how(&gw).contains("http://127.0.0.1:8788/v1"),
+            cursor.how(&gw).text.contains("http://127.0.0.1:8788/v1"),
             "{}",
             cursor.how(&gw)
         );
         for c in &m {
-            assert!(!c.how(&gw).contains('{'), "{}：{}", c.name, c.how(&gw));
+            assert!(!c.how(&gw).text.contains('{'), "{}：{}", c.name, c.how(&gw));
         }
         assert!(
             !adoptable().iter().any(|c| c.name == "Cursor"),
             "Cursor 不该在接管表里"
         );
+    }
+
+    /// **每一句给人看的话都要带码。**
+    ///
+    /// 漏一个不会报错、不会崩，只会让中文界面上那一行悄悄变成英文 ——
+    /// 而这正是 v0.10.0 干过的事：错误全上了码，接管的代价和提醒没有，
+    /// 于是客户端页整页是英文。
+    #[test]
+    fn every_sentence_here_carries_a_code() {
+        for c in adoptable() {
+            for (code, text) in c.costs {
+                assert!(!code.is_empty(), "{}：「{text}」没有码", c.id);
+                assert!(!text.is_empty(), "{}：{code} 没有英文原句", c.id);
+            }
+        }
+        let gw = Gateway {
+            base: "http://127.0.0.1:8787".into(),
+            key: None,
+        };
+        for m in manual_only() {
+            assert!(!m.how(&gw).code.is_empty(), "{}：步骤没有码", m.name);
+            assert!(!m.caveat().code.is_empty(), "{}：提醒没有码", m.name);
+        }
+    }
+
+    /// 码重了等于两句不同的话共用一条译文 —— 改其中一句，另一句会跟着
+    /// 变，而没有任何东西会说出来。
+    #[test]
+    fn no_two_sentences_share_a_code() {
+        let mut seen = std::collections::BTreeMap::new();
+        for c in adoptable() {
+            for (code, text) in c.costs {
+                if let Some(other) = seen.insert(*code, *text) {
+                    assert_eq!(other, *text, "{code} 被两句话共用了");
+                }
+            }
+        }
     }
 }

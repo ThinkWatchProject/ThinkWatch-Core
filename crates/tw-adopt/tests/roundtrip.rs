@@ -165,7 +165,7 @@ fn losing_the_backup_removes_our_key_and_says_so_out_loud() {
     assert!(
         r.notes
             .iter()
-            .any(|n| n.contains("filled in again by hand")),
+            .any(|n| n.text.contains("filled in again by hand")),
         "没说清密钥拿不回来了：{:?}",
         r.notes
     );
@@ -437,7 +437,9 @@ fn the_shadow_file_that_bit_cc_switch_is_reported_at_plan_time() {
     let p = plan_adopt(&c, &b.home, &gw()).unwrap();
     assert_eq!(p.shadows.len(), 1, "{:?}", p.shadows);
     assert!(
-        p.notes.iter().any(|n| n.contains("settings.local.json")),
+        p.notes
+            .iter()
+            .any(|n| n.text.contains("settings.local.json")),
         "没提醒它会盖住我们：{:?}",
         p.notes
     );
