@@ -26,11 +26,12 @@ use std::time::Instant;
 use axum::{Json, extract::State, http::StatusCode};
 
 use crate::ControlState;
+use tw_types::msg;
 
-type Fail = (StatusCode, String);
+use crate::Fail;
 
-fn fail(code: StatusCode, e: impl std::fmt::Display) -> Fail {
-    (code, e.to_string())
+fn fail(code: StatusCode, detail: tw_types::Msg) -> Fail {
+    (code, axum::Json(detail))
 }
 
 /// 找到那条请求，把**原样的**请求体取出来。
@@ -44,15 +45,28 @@ fn stored_body(
     let row = g
         .db()
         .get(id)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
+        .map_err(|e| {
+            fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg!("control.internal", detail = e => "{detail}"),
+            )
+        })?
+        .ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!("control.request_not_found", id = id => "There is no request {id}."),
+            )
+        })?;
     let raw = g
         .blobs()
         .get(row.at_ms, id, tw_store::Which::Request)
         .ok_or_else(|| {
-            (
+            fail(
                 StatusCode::NOT_FOUND,
-                format!("第 {id} 号请求的请求体已不存在，可能已被清理"),
+                msg!(
+                    "control.request_body_gone", id = id =>
+                    "The request body of request {id} is gone; it may have been cleaned up."
+                ),
             )
         })?;
     let original = g
@@ -62,11 +76,12 @@ fn stored_body(
     if original > raw.len() {
         // **截断之后的 body 是另一个请求。**拿它跑出来的结果去比对，
         // 比不跑更糟 —— 用户会以为那是同一条
-        return Err((
+        return Err(fail(
             StatusCode::CONFLICT,
-            format!(
-                "第 {id} 号请求的请求体有 {original} 字节，仅保存了 {} 字节，无法原样重放",
-                raw.len()
+            msg!(
+                "control.request_body_truncated", id = id, original = original, kept = raw.len() =>
+                "The request body of request {id} was {original} bytes and only {kept} of them \
+                 were kept, so it cannot be replayed as it was."
             ),
         ));
     }
@@ -79,9 +94,9 @@ pub async fn quote(
     Json(req): Json<tw_api::ReplayRequest>,
 ) -> Result<Json<tw_api::ReplayQuote>, Fail> {
     let store = s.store.as_ref().ok_or_else(|| {
-        (
+        fail(
             StatusCode::SERVICE_UNAVAILABLE,
-            "请求记录未启动".to_string(),
+            msg!("control.store_off" => "Request recording is not running."),
         )
     })?;
     let (row, raw) = {
@@ -94,9 +109,12 @@ pub async fn quote(
         .iter()
         .find(|p| p.name == req.provider)
         .ok_or_else(|| {
-            (
+            fail(
                 StatusCode::NOT_FOUND,
-                format!("未找到名为「{}」的上游", req.provider),
+                msg!(
+                    "control.upstream_not_found", upstream = req.provider.clone() =>
+                    "There is no upstream named `{upstream}`."
+                ),
             )
         })?;
 
@@ -141,9 +159,9 @@ pub async fn run(
     Json(req): Json<tw_api::ReplayRequest>,
 ) -> Result<Json<tw_api::ReplayResult>, Fail> {
     let store = s.store.as_ref().ok_or_else(|| {
-        (
+        fail(
             StatusCode::SERVICE_UNAVAILABLE,
-            "请求记录未启动".to_string(),
+            msg!("control.store_off" => "Request recording is not running."),
         )
     })?;
     let (row, raw) = {
@@ -156,9 +174,12 @@ pub async fn run(
         .iter()
         .find(|p| p.name == req.provider)
         .ok_or_else(|| {
-            (
+            fail(
                 StatusCode::NOT_FOUND,
-                format!("未找到名为「{}」的上游", req.provider),
+                msg!(
+                    "control.upstream_not_found", upstream = req.provider.clone() =>
+                    "There is no upstream named `{upstream}`."
+                ),
             )
         })?;
     // OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
@@ -171,7 +192,10 @@ pub async fn run(
         .map_err(|e| {
             fail(
                 StatusCode::BAD_REQUEST,
-                format!("无法获取上游「{}」的凭据：{e}", provider.name),
+                msg!(
+                    "control.credentials_failed", upstream = provider.name.clone(), detail = e =>
+                    "The credential for upstream `{upstream}` could not be obtained: {detail}"
+                ),
             )
         })?;
 
@@ -190,11 +214,10 @@ pub async fn run(
     let mut r = http.post(&url).header("content-type", "application/json");
     r = tw_gateway::forward::apply_headers(r, &headers);
     let resp = r.body(body).send().await.map_err(|e| {
+        let why = tw_gateway::forward::map_reqwest_error(e);
         fail(
             StatusCode::BAD_GATEWAY,
-            tw_gateway::forward::map_reqwest_error(e)
-                .message()
-                .to_string(),
+            msg!("control.upstream_call_failed", detail = why.message() => "{detail}"),
         )
     })?;
 
@@ -236,17 +259,27 @@ pub async fn fixture(
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<String, Fail> {
     let store = s.store.as_ref().ok_or_else(|| {
-        (
+        fail(
             StatusCode::SERVICE_UNAVAILABLE,
-            "请求记录未启动".to_string(),
+            msg!("control.store_off" => "Request recording is not running."),
         )
     })?;
     let g = store.lock().await;
     let row = g
         .db()
         .get(id)
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未找到第 {id} 号请求")))?;
+        .map_err(|e| {
+            fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg!("control.internal", detail = e => "{detail}"),
+            )
+        })?
+        .ok_or_else(|| {
+            fail(
+                StatusCode::NOT_FOUND,
+                msg!("control.request_not_found", id = id => "There is no request {id}."),
+            )
+        })?;
     let body = |which| -> String {
         g.blobs()
             .get(row.at_ms, id, which)
@@ -256,9 +289,12 @@ pub async fn fixture(
     let req = body(tw_store::Which::Request);
     let resp = body(tw_store::Which::Response);
     if req.is_empty() && resp.is_empty() {
-        return Err((
+        return Err(fail(
             StatusCode::NOT_FOUND,
-            format!("第 {id} 号请求的响应体已不存在，可能已被清理"),
+            msg!(
+                "control.response_body_gone", id = id =>
+                "The response body of request {id} is gone; it may have been cleaned up."
+            ),
         ));
     }
     // 截断过的照样能当用例用 —— 它验的是「我们怎么理解这段字节」，
@@ -268,11 +304,11 @@ pub async fn fixture(
         .original_len(row.at_ms, id, tw_store::Which::Response)
         .is_some_and(|o| o > resp.len());
     let note = format!(
-        "录制自上游「{}」，时间戳 {}{}",
+        "recorded from upstream `{}` at {}{}",
         row.provider,
         row.at_ms,
         if truncated {
-            "。响应体在存储时已被截断，仅包含开头部分"
+            ". The response body was truncated when it was stored, so only its beginning is here."
         } else {
             ""
         }
@@ -298,5 +334,10 @@ pub async fn fixture(
             body: resp,
         },
     );
-    serde_yaml_ng::to_string(&f).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))
+    serde_yaml_ng::to_string(&f).map_err(|e| {
+        fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            msg!("control.internal", detail = e => "{detail}"),
+        )
+    })
 }
