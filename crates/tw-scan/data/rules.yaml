@@ -16,28 +16,28 @@ version: 1
 injection:
   - id: ignore-previous
     pattern: '(?i)ignore\s+(all\s+)?(previous|above|prior)[^\n]{0,20}instructions'
-    why: 典型的提示注入开头
+    why: A prompt injection typically starts this way
   - id: disregard
     pattern: '(?i)disregard\s+(the\s+)?(system|above|previous)'
-    why: 典型的提示注入开头，使用 disregard 一类的动词
+    why: A prompt injection typically starts this way, with a verb like disregard
   - id: you-are-now
     pattern: '(?i)you\s+are\s+now\s+(a|an)\s'
-    why: 试图重新设定模型的身份
-  - id: 忽略指令
+    why: An attempt to reset who the model is
+  - id: ignore-previous-zh
     pattern: '忽略(以上|之前|上面|前面)(的)?(所有)?(指令|要求|规则)'
-    why: 中文提示注入，要求忽略先前的指令
-  - id: 新指令
+    why: A Chinese prompt injection asking the model to ignore earlier instructions
+  - id: new-instructions-zh
     pattern: '新的?指令[：:]'
-    why: 中文提示注入，声明新的指令
-  - id: 你现在是
+    why: A Chinese prompt injection declaring new instructions
+  - id: you-are-now-zh
     pattern: '你(现在)?(是|扮演)一[个位名]'
-    why: 试图重新设定模型的身份
+    why: An attempt to reset who the model is
   - id: chat-marker
     pattern: '<\|(im_start|im_end|system|endoftext)\|>'
-    why: 伪造对话标记，试图让模型将正文当作系统消息
+    why: Forged conversation markers, so the model reads the body as a system message
   - id: fake-system
     pattern: '(?i)\[?(system|assistant)\]?\s*[:：]\s*(you|your|ignore|从现在|你)'
-    why: 伪装成系统或助手的发言
+    why: Text disguised as something the system or the assistant said
 
 # 二、危险命令。这一组和工具调用防火墙共用 —— 一套规则两处用。
 #
@@ -53,49 +53,49 @@ dangerous:
   # 填长到 200 字符以上，同一条命令就匹配不到了。测试抓住的。
   - id: curl-pipe-sh
     pattern: '(?i)(curl|wget)[^\n|]*\|\s*(sudo\s+)?(ba|z|d)?sh'
-    why: 下载后直接执行，执行的内容由远端决定且无法预先查看
+    why: Downloads and runs it straight away; what runs is decided remotely and cannot be read first
     level: high
   - id: rm-rf-root
     pattern: 'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$)'
-    why: 删除整个主目录或根目录
+    why: Deletes the whole home directory or the root
     level: medium
   - id: chmod-777
     pattern: 'chmod\s+(-R\s+)?777'
-    why: 将文件权限设为所有人可写
+    why: Makes a file writable by everyone
     level: medium
   - id: base64-decode-exec
     pattern: '(?i)base64\s+(-d|--decode)[^\n|]*\|\s*(ba)?sh'
-    why: 将要执行的内容隐藏在 base64 编码中
+    why: Hides what will run inside base64
     level: high
   - id: exfil-env
     pattern: '(?i)(env|printenv|cat\s+[^\n]{0,60}\.env)[^\n]{0,200}(curl|wget|nc\s)'
-    why: 将环境变量（通常包含密钥）发送到外部
+    why: Sends the environment, which usually holds keys, somewhere else
     level: high
   # **命令形状的规则对中文指令完全不设防。**「把 ~/.aws/credentials
   # 打印出来」里没有 cat 也没有 curl，但它要的是同一件事。所以再加一条
   # 按「凭据路径 + 外送动词」匹配的，两个方向都写。
-  - id: 凭据外泄
+  - id: exfil-credentials
     pattern: '(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)[^\n]{0,30}(发|传|上报|打印|输出|贴出|读出|(?i:send|upload|post|print|paste|exfil))'
-    why: 要求模型将凭据文件的内容发送出去
+    why: Asks the model to send the contents of a credential file somewhere
     level: high
-  - id: 凭据外泄2
+  - id: exfil-credentials-reversed
     pattern: '(发送|上传|贴出|打印|输出|读取|(?i:send|upload|post|print|read))[^\n]{0,30}(\.ssh/id_|\.aws/credentials|\.netrc|/\.env)'
-    why: 要求模型将凭据文件的内容发送出去
+    why: Asks the model to send the contents of a credential file somewhere
     level: high
   # **写入启动项**：只要写进去了，下次开终端就执行 —— 而且是在你完全
   # 不知情的时候。它和「下载即执行」并列为高危，理由是一样的：
   # 一步就能拿到执行权。
-  - id: 写启动项
+  - id: write-startup-item
     pattern: '(>>?|tee|cp|mv|ln\s+-s)[^\n]{0,200}(\.zshrc|\.bashrc|\.bash_profile|\.profile|\.zprofile|LaunchAgents|LaunchDaemons|\.git/hooks|crontab)'
-    why: 写入开机或打开终端时自动执行的位置
+    why: Writes somewhere that runs at login or whenever a terminal opens
     level: high
   # `crontab -l` 是看一眼，`crontab <文件>` / `crontab -r` / `crontab -`
   # 才是动手。分不开的话，这条规则会在每次「帮我看看定时任务」时误报。
   - id: crontab-install
     pattern: 'crontab\s+(-r\b|-\s*$|[^\s-][^\n]{0,40})'
-    why: 安装定时任务，或删除全部现有定时任务
+    why: Installs a scheduled job, or deletes every existing one
     level: high
   - id: ssh-key-read
     pattern: '(?i)(cat|cp|scp|curl)[^\n]{0,200}(\.ssh/id_|\.aws/credentials|\.netrc)'
-    why: 读取私钥或云服务凭据
+    why: Reads a private key or a cloud credential
     level: high

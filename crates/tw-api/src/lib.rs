@@ -1914,7 +1914,9 @@ pub struct HistoryRow {
     pub cost_micros: Option<i64>,
     /// 这个成本是估的吗。**界面上要标出来**
     pub cost_estimated: bool,
-    pub error: Option<String>,
+    /// 失败的原因。**带着码** —— 翻历史时界面照样能说自己那句话；
+    /// 码是空串的是加这两列之前的老记录，那时只存了正文
+    pub error: Option<Msg>,
     /// 本地应答的
     pub local: bool,
     /// 客户端没等到响应结束就走了。**不是失败**（`error` 是空的）；用量

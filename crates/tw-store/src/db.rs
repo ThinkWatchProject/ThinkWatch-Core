@@ -14,9 +14,10 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use tw_api::Msg;
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 12;
+const SCHEMA: i64 = 13;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -108,7 +109,9 @@ pub struct RequestRow {
     pub cost_micros: Option<i64>,
     /// 成本是估的还是上游给的。**估算值不能混进精确数字里**
     pub cost_estimated: bool,
-    pub error: Option<String>,
+    /// 失败的原因，带着码。**老记录的码是空串** —— 那时只存了正文，
+    /// 界面认不出空码，照旧显示正文
+    pub error: Option<Msg>,
     /// 客户端的辅助请求被本地应答了。**不进成本和延迟统计**
     pub local: bool,
     /// 客户端没等到响应结束就走了。**和 `error` 是两件事**：它不算失败，
@@ -341,6 +344,18 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN translated TEXT;")?;
         }
+        if from < 13 {
+            // 失败原因的码和参数。
+            //
+            // **只存正文的话，翻历史时它永远是英文。**实时事件里带着码，
+            // 界面照码说自己那句话；一刷新，同一条记录就退回上游的原话。
+            // 老记录的 `error_code` 是 NULL —— 界面认不出码就照旧显示正文，
+            // 正是它要的那条退路。
+            self.conn.execute_batch(
+                "ALTER TABLE requests ADD COLUMN error_code TEXT;
+                 ALTER TABLE requests ADD COLUMN error_args TEXT;",
+            )?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -352,8 +367,9 @@ impl Db {
              (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
-              client_hint, session, tool_calls, flagged, redacted, cancelled, price_source, translated)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+              client_hint, session, tool_calls, flagged, redacted, cancelled, price_source, translated,
+              error_code, error_args)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
             params![
                 r.id,
                 r.at_ms,
@@ -371,7 +387,7 @@ impl Db {
                 r.cache_write_tokens,
                 r.cost_micros,
                 r.cost_estimated as i64,
-                r.error,
+                r.error.as_ref().map(|e| e.text.as_str()),
                 r.local as i64,
                 r.routing,
                 r.billing,
@@ -384,6 +400,11 @@ impl Db {
                 r.cancelled as i64,
                 r.price_source,
                 r.translated,
+                r.error.as_ref().map(|e| e.code.as_str()),
+                r.error
+                    .as_ref()
+                    .filter(|e| !e.args.is_empty())
+                    .map(|e| serde_json::to_string(&e.args).unwrap_or_default()),
             ],
         )?;
         Ok(())
@@ -1092,6 +1113,24 @@ fn percentile(sorted: &[i64], p: usize) -> i64 {
     sorted[rank.saturating_sub(1).min(n - 1)]
 }
 
+/// 把三列拼回一条 [`Msg`]。
+///
+/// **码和参数是后来才加的列**，老记录里是 NULL：那时给一个空码，界面
+/// 认不出它，就走「显示正文」那条退路 —— 正是我们想要的。
+fn error_from(r: &rusqlite::Row) -> rusqlite::Result<Option<Msg>> {
+    let Some(text) = r.get::<_, Option<String>>("error")? else {
+        return Ok(None);
+    };
+    let code = r
+        .get::<_, Option<String>>("error_code")?
+        .unwrap_or_default();
+    let args = r
+        .get::<_, Option<String>>("error_args")?
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Ok(Some(Msg { code, args, text }))
+}
+
 fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
     Ok(RequestRow {
         id: r.get("id")?,
@@ -1115,7 +1154,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         cache_write_tokens: r.get("cache_write_tokens")?,
         cost_micros: r.get("cost_micros")?,
         cost_estimated: r.get::<_, i64>("cost_estimated")? != 0,
-        error: r.get("error")?,
+        error: error_from(r)?,
         local: r.get::<_, i64>("local")? != 0,
         cancelled: r.get::<_, i64>("cancelled")? != 0,
         routing: r.get("routing")?,
@@ -1743,6 +1782,8 @@ mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN error_args;
+                     ALTER TABLE requests DROP COLUMN error_code;
                      ALTER TABLE requests DROP COLUMN translated;
                      ALTER TABLE requests DROP COLUMN price_source;
                      ALTER TABLE requests DROP COLUMN cancelled;
@@ -1868,7 +1909,7 @@ mod cost_state_tests {
     /// 响应头之前就失败了：没有状态码、没有用量、没有金额。
     fn failed_before_usage(id: i64, at: i64) -> RequestRow {
         let mut r = row(id, at);
-        r.error = Some("`up` 返回 502 Bad Gateway".into());
+        r.error = Some(Msg::plain("`up` 返回 502 Bad Gateway"));
         r.status = None;
         r.input_tokens = None;
         r.output_tokens = None;
@@ -1917,7 +1958,7 @@ mod cost_state_tests {
     fn a_failure_with_usage_and_an_unknown_model_is_still_unpriced() {
         let db = Db::in_memory().unwrap();
         let mut r = unknown_model(1, 100);
-        r.error = Some("流中断：上游断开了".into());
+        r.error = Some(Msg::plain("流中断：上游断开了"));
         db.insert(&r).unwrap();
         assert_eq!(db.summary(0, 1000).unwrap().unpriced_requests, 1);
     }
@@ -1984,7 +2025,7 @@ mod cost_state_tests {
         let mut broken = served.clone();
         broken.id = 2;
         broken.at_ms = 200;
-        broken.error = Some("流中断：上游断开了".into());
+        broken.error = Some(Msg::plain("流中断：上游断开了"));
         for mut r in [served, broken, row(3, 300), unknown_model(4, 400)] {
             r.session = Some("s1".into());
             db.insert(&r).unwrap();
