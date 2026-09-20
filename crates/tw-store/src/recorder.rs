@@ -55,7 +55,7 @@ const MAX_INFLIGHT: usize = 4096;
 enum Ending<'a> {
     Finished,
     Cancelled,
-    Failed(&'a str),
+    Failed(&'a tw_api::Msg),
 }
 
 pub struct Recorder {
@@ -367,7 +367,7 @@ impl Recorder {
                 *bytes,
                 *duration_ms,
                 *usage,
-                Ending::Failed(&message.text),
+                Ending::Failed(message),
             ),
             Event::LocallyAnswered {
                 id,
@@ -573,7 +573,7 @@ impl Recorder {
             cost_micros,
             cost_estimated: estimated,
             error: match how {
-                Ending::Failed(message) => Some(message.to_string()),
+                Ending::Failed(message) => Some((*message).clone()),
                 _ => None,
             },
             local: false,
@@ -935,7 +935,7 @@ mod tests {
             usage: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(row.error.as_deref(), Some("cannot connect"));
+        assert_eq!(row.error.map(|e| e.text).as_deref(), Some("cannot connect"));
         assert_eq!(r.db().summary(0, i64::MAX).unwrap().failed, 1);
     }
 
@@ -1622,10 +1622,10 @@ mod failure_tests {
         r.on_event(&failed(1, partial()));
 
         let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(
-            row.error.as_deref(),
-            Some("the stream broke: the upstream disconnected")
-        );
+        let e = row.error.expect("失败的行要带着原因");
+        assert_eq!(e.text, "the stream broke: the upstream disconnected");
+        // 码也要落库：刷新之后界面还能照码说自己那句话
+        assert_eq!(e.code, "t.broke");
         assert!(!row.cancelled);
         assert_eq!(row.status, Some(200), "状态码来自响应头那个事件");
         assert_eq!(row.bytes, Some(312));

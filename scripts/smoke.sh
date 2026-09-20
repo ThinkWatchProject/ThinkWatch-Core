@@ -268,7 +268,7 @@ for _ in $(seq 1 20); do
           | python3 -c 'import sys, json
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
-good = ("was cut off" in (r.get("error") or "") and r.get("input_tokens") == 2345
+good = ("was cut off" in ((r.get("error") or {}).get("text") or "") and r.get("input_tokens") == 2345
         and r.get("cost_micros") is not None and r.get("cost_estimated") is True)
 print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/dev/null)
   [ "$GOT" = "ok" ] && break
