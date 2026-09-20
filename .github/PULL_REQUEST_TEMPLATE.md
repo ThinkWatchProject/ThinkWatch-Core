@@ -1,9 +1,6 @@
 <!--
-Base branch: `dev`, not `main`.
-
-GitHub pre-fills the base with this repo's default branch (`main`), the
-release line. Use the "Edit" button next to the title to switch the base
-to `dev`; with the CLI, pass `--base dev`.
+Base branch: `main`, which is what GitHub pre-fills. It is the only
+long-lived branch here; a release is a tag on it.
 
 Before writing: this repository is a set of crates, not an application.
 The desktop app lives in ThinkWatch-Lite. See CONTRIBUTING.md.
