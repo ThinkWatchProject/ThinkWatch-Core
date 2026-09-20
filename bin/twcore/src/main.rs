@@ -14,9 +14,13 @@ mod lockfile;
 use lockfile::{LockFile, LockOutcome};
 
 #[derive(Parser)]
-#[command(name = "twcore", version, about = "ThinkWatch Lite 的本地 AI 网关引擎")]
+#[command(
+    name = "twcore",
+    version,
+    about = "The local AI gateway engine behind ThinkWatch Lite"
+)]
 struct Cli {
-    /// 配置文件路径，默认为 ~/.thinkwatch/config.yaml
+    /// Path to the configuration file; ~/.thinkwatch/config.yaml by default
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -25,56 +29,56 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 启动网关
+    /// Start the gateway
     Serve {
-        /// 覆盖配置中的端口。设为 0 时由系统分配（用于测试）
+        /// Override the port from the configuration; 0 lets the system pick one (for tests)
         #[arg(long)]
         port: Option<u16>,
-        /// 仅启动控制面，不启动数据面
+        /// Start only the control plane, not the data plane
         //
         // 守护连续失败后进这个模式 —— 网关挂了的时候，用户最需要的恰恰是
         // 能改配置
         #[arg(long)]
         safe: bool,
-        /// 父进程 pid。父进程退出后本进程随之退出
+        /// The parent process id; this process exits when that one does
         //
         // 「让用户认为他俩就是一个程序」
         #[arg(long)]
         parent: Option<u32>,
     },
-    /// 生成初始配置
+    /// Write an initial configuration
     Init {
-        /// 配置文件已存在时仍然覆盖
+        /// Overwrite the configuration file even if it exists
         #[arg(long)]
         force: bool,
     },
-    /// 校验配置并输出结果
+    /// Validate the configuration and print the result
     Check,
-    /// 修改配置
+    /// Change the configuration
     //
     // **和界面走同一套代码** —— 两套实现就是两套行为
     Config {
         #[command(subcommand)]
         what: ConfigCmd,
     },
-    /// 测试链路连通性及各阶段耗时。不发送业务请求，不产生费用
+    /// Test the link and time each stage. Sends no request of its own and costs nothing
     Speed {
-        /// 只测试该上游。不指定时测试全部上游
+        /// Test only this upstream; without it, every upstream is tested
         provider: Option<String>,
-        /// 只测试指定的代理
+        /// Test only this proxy
         #[arg(long)]
         proxy: Option<String>,
     },
-    /// 扫描本机客户端配置面：hooks、MCP、skill 与指令文件。只读取，不修改
+    /// Scan the clients on this machine: hooks, MCP, skills and instruction files. Read-only
     Scan {
-        /// 额外扫描的项目目录。不会自动查找项目
+        /// Extra project directories to scan; projects are not found automatically
         #[arg(long)]
         project: Vec<PathBuf>,
-        /// 同时输出完整清单，而不仅是发现的问题
+        /// Print the full inventory as well, not only the findings
         #[arg(long)]
         inventory: bool,
     },
-    /// 列出本机的 AI 客户端及其指向的地址
+    /// List the AI clients on this machine and where each one points
     Clients {
         #[command(subcommand)]
         what: ClientsCmd,
@@ -83,32 +87,32 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClientsCmd {
-    /// 扫描本机客户端。只读取，不修改
+    /// Scan the clients on this machine. Read-only
     List,
-    /// 诊断配置未生效的原因，逐层检查配置的优先级
+    /// Work out why a change has not taken effect, layer by layer
     Why {
-        /// 客户端 id，例如 claude-code
+        /// The client id, such as claude-code
         client: String,
-        /// 当前项目目录，用于检查项目级配置是否覆盖了用户级配置
+        /// The current project directory, to see whether a project file overrides the user one
         #[arg(long)]
         project: Option<PathBuf>,
     },
-    /// 计算接管改动并输出，不写入文件
+    /// Work out the change and print it, without writing anything
     Plan { client: String },
 }
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// 输出当前配置的原文和版本号
+    /// Print the configuration as it is, with its version
     Show,
-    /// 修改一个字段，路径写成 /providers/官方/base_url 的形式
+    /// Change one field; a path is written as /providers/<name>/base_url
     Set {
-        /// 按名称定位，而不是按下标
+        /// Locate by name rather than by index
         //
         // 下标会在重排之后指向另一个东西
         path: String,
         value: String,
-        /// 按整数写入，而不是字符串。--int 8788 与 8788 不同
+        /// Write an integer rather than a string; --int 8788 differs from 8788
         #[arg(long, conflicts_with_all = ["bool_value", "null"])]
         int: bool,
         #[arg(long = "bool", conflicts_with_all = ["int", "null"])]
@@ -116,9 +120,9 @@ enum ConfigCmd {
         #[arg(long, conflicts_with_all = ["int", "bool_value"])]
         null: bool,
     },
-    /// 列出历史版本
+    /// List the versions in the history
     History,
-    /// 回滚到指定版本
+    /// Roll back to a version
     Rollback { version: String },
 }
 
@@ -164,64 +168,64 @@ fn cmd_scan(config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()
     for p in &projects {
         srcs.extend(tw_scan::sources::in_project(p));
     }
-    println!("已扫描 {} 个文件（规则：{}）", srcs.len(), rules.summary());
+    println!("scanned {} files (rules: {})", srcs.len(), rules.summary());
     let r = tw_scan::report::scan(&srcs, &rules);
 
     if inventory {
         let conflicting = tw_scan::report::conflicting(&r.mcp);
-        println!("\nMCP server（{}）：", r.mcp.len());
+        println!("\nMCP servers ({}):", r.mcp.len());
         for m in &r.mcp {
             let mark = if conflicting.contains(&m.name) {
-                " ⚠ 同名但配置不同"
+                " ⚠ same name, different configuration"
             } else {
                 ""
             };
-            let off = if m.enabled { "" } else { "（已停用）" };
+            let off = if m.enabled { "" } else { " (disabled)" };
             let what = match &m.url {
-                Some(u) => format!("远端 {u}"),
+                Some(u) => format!("remote {u}"),
                 None => format!("{} {}", m.command, m.args.join(" ")),
             };
             println!("  {:<20} {:<14} {what}{off}{mark}", m.name, m.client);
             if !m.env_keys.is_empty() {
                 println!(
-                    "  {:<20} {:<14} 读取环境变量 {}",
+                    "  {:<20} {:<14} reads the environment variables {}",
                     "",
                     "",
-                    m.env_keys.join("、")
+                    m.env_keys.join(", ")
                 );
             }
         }
-        println!("\nhook（{}）：", r.hooks.len());
+        println!("\nhooks ({}):", r.hooks.len());
         for h in &r.hooks {
             println!("  {:<14} {:<14} {}", h.event, h.client, h.command);
         }
-        println!("\nskill（{}）：", r.skills.len());
+        println!("\nskills ({}):", r.skills.len());
         for s in &r.skills {
             println!("  {:<20} {}", s.name, s.path.display());
         }
     }
 
     for u in &r.unreadable {
-        println!("⚠ 无法读取：{u}");
+        println!("⚠ could not be read: {u}");
     }
     if r.findings.is_empty() {
         // 没风险的时候要说「安全」，而不是什么都不显示
-        println!("\n✓ 未发现问题。");
+        println!("\n✓ nothing found.");
         return Ok(());
     }
-    println!("\n发现 {} 处问题：", r.findings.len());
+    println!("\n{} findings:", r.findings.len());
     for f in &r.findings {
         let mark = match f.level {
-            tw_scan::report::Level::High => "✗ 高危",
-            tw_scan::report::Level::Medium => "? 可疑",
-            tw_scan::report::Level::Low => "· 提示",
+            tw_scan::report::Level::High => "✗ high",
+            tw_scan::report::Level::Medium => "? suspicious",
+            tw_scan::report::Level::Low => "· note",
         };
         println!("{mark}  {}", f.title);
         println!("       {}:{}", f.path.display(), f.line);
         println!("       {}", f.excerpt.trim());
         println!("       {}", f.detail);
     }
-    println!("\n扫描只报告问题，不会删除任何内容。");
+    println!("\nThe scan only reports; it deletes nothing.");
     Ok(())
 }
 
@@ -239,22 +243,27 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
         ClientsCmd::List => {
             for d in detect::detect(&home()) {
                 let state = match (d.installed, d.adopted_at_ms, &d.endpoint) {
-                    (false, _, _) => "未安装".to_string(),
-                    (true, Some(at), Some(ep)) => format!("已接管 {} → {ep}", fmt_time(at)),
+                    (false, _, _) => "not installed".to_string(),
+                    (true, Some(at), Some(ep)) => {
+                        format!("pointed at the gateway {} → {ep}", fmt_time(at))
+                    }
                     // **「我们写过」和「现在还是那样」是两回事。**
                     (true, Some(at), None) => {
-                        format!("曾于 {} 接管，但配置中已不包含接管写入的字段", fmt_time(at))
+                        format!(
+                            "was pointed at the gateway {}, and the fields written then are gone",
+                            fmt_time(at)
+                        )
                     }
-                    (true, None, Some(ep)) => format!("未接管，当前指向 {ep}"),
-                    (true, None, None) => "已安装，未接管".to_string(),
+                    (true, None, Some(ep)) => format!("not pointed at the gateway; points at {ep}"),
+                    (true, None, None) => "installed, not pointed at the gateway".to_string(),
                 };
                 println!("{:<14} {:<12} {state}", d.id, d.name);
                 println!("               {}", d.real.display());
                 if d.real != d.path {
-                    println!("               （{} 是符号链接）", d.path.display());
+                    println!("               ({} is a symbolic link)", d.path.display());
                 }
                 for s in &d.shadows {
-                    println!("               ⚠ {} 优先级更高", s.display());
+                    println!("               ⚠ {} takes precedence", s.display());
                 }
                 if d.verified == tw_adopt::clients::Verified::FieldsOnly {
                     println!("               ⓘ {}", d.verified.note());
@@ -269,7 +278,7 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
                 key: None,
             };
             println!();
-            println!("不支持自动接管、需要手动配置的客户端：");
+            println!("Clients that have to be configured by hand:");
             for m in manual_only() {
                 println!("  {:<12} {}", m.name, m.how(&gw));
                 println!("               {}", m.caveat);
@@ -280,7 +289,7 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
             let c = adoptable()
                 .into_iter()
                 .find(|c| c.id == client)
-                .ok_or_else(|| anyhow::anyhow!("未知的客户端 {client}"))?;
+                .ok_or_else(|| anyhow::anyhow!("{client} is not a client we know"))?;
             for f in detect::diagnose(&c, &home(), project.as_deref()) {
                 let mark = match f.level {
                     detect::Level::Blocking => "✗",
@@ -299,7 +308,7 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
             let c = adoptable()
                 .into_iter()
                 .find(|c| c.id == client)
-                .ok_or_else(|| anyhow::anyhow!("未知的客户端 {client}"))?;
+                .ok_or_else(|| anyhow::anyhow!("{client} is not a client we know"))?;
             let cfg = tw_config::load(path)?;
             // 0.0.0.0 是监听地址，不是能填进客户端配置的地址 —— 客户端
             // 得知道往哪儿连，那永远是 127.0.0.1
@@ -308,17 +317,17 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
                 key: None,
             };
             let plan = tw_adopt::plan::plan_adopt(&c, &home(), &gw)?;
-            println!("将修改：{}", plan.path.display());
+            println!("will change: {}", plan.path.display());
             if plan.is_noop() {
-                println!("（配置已是目标状态，无需修改）");
+                println!("(the configuration is already as it should be)");
                 return Ok(());
             }
             for n in &plan.notes {
                 println!("  · {n}");
             }
-            println!("\n--- 修改后 ---");
+            println!("\n--- after ---");
             println!("{}", plan.after);
-            println!("--- 以上为预览，未写入文件 ---");
+            println!("--- a preview; nothing was written ---");
             Ok(())
         }
     }
@@ -343,19 +352,19 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
         ConfigCmd::History => {
             let all = tw_config::history::list(path)?;
             if all.is_empty() {
-                println!("尚无历史版本，首次修改配置后会生成。");
+                println!("No versions yet; the first change to the configuration makes one.");
                 return Ok(());
             }
             let now = tw_config::store::read(path).map(|c| c.version()).ok();
             // 新的在前 —— 要找的几乎总是最近那几版
             for v in all.iter().rev() {
                 let mark = if Some(&v.version) == now.as_ref() {
-                    "← 当前"
+                    "← current"
                 } else {
                     "      "
                 };
                 println!(
-                    "{mark}  {}  {:<10}  {} 字节  {}",
+                    "{mark}  {}  {:<10}  {} bytes  {}",
                     v.version,
                     v.origin.label(),
                     v.bytes,
@@ -363,13 +372,15 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
                 );
             }
             println!();
-            println!("回滚到指定版本：twcore config rollback <版本号>（输入前几位即可）");
+            println!(
+                "To roll back: twcore config rollback <version> (the first few characters are enough)"
+            );
             Ok(())
         }
         ConfigCmd::Rollback { version } => {
             let text = tw_config::history::rollback(path, &version)?;
-            println!("已回滚到 {}", tw_config::store::version_of(&text));
-            eprintln!("（core 正在运行时，会在一秒内自动加载）");
+            println!("rolled back to {}", tw_config::store::version_of(&text));
+            eprintln!("(a running core picks this up within a second)");
             Ok(())
         }
         ConfigCmd::Set {
@@ -386,13 +397,13 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
                 tw_yaml::Scalar::Int(
                     value
                         .parse()
-                        .with_context(|| format!("「{value}」不是整数"))?,
+                        .with_context(|| format!("`{value}` is not an integer"))?,
                 )
             } else if bool_value {
                 tw_yaml::Scalar::Bool(
                     value
                         .parse()
-                        .with_context(|| format!("「{value}」不是 true 或 false"))?,
+                        .with_context(|| format!("`{value}` is neither true nor false"))?,
                 )
             } else {
                 tw_yaml::Scalar::Str(value)
@@ -406,8 +417,11 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
             let _ = tw_config::history::snapshot(path, &cur.text, tw_config::history::Origin::Cli);
             tw_config::store::write_if_unchanged(path, &cur.fingerprint, &next)?;
             let _ = tw_config::history::snapshot(path, &next, tw_config::history::Origin::Cli);
-            println!("已修改，新版本为 {}", tw_config::store::version_of(&next));
-            eprintln!("（core 正在运行时，会在一秒内自动加载）");
+            println!(
+                "changed; the new version is {}",
+                tw_config::store::version_of(&next)
+            );
+            eprintln!("(a running core picks this up within a second)");
             Ok(())
         }
     }
@@ -429,7 +443,7 @@ fn fmt_time(ms: u64) -> String {
 /// 握手时间不是任何一条线的真实值，而这一层存在的全部意义就是那几个
 /// 数字准不准。
 fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Result<()> {
-    let cfg = tw_config::load(path).with_context(|| format!("读取 {}", path.display()))?;
+    let cfg = tw_config::load(path).with_context(|| format!("reading {}", path.display()))?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         if let Some(name) = proxy {
@@ -546,12 +560,14 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     let cfg = tw_config::generate_initial();
     let key = cfg.clients[0].key.clone();
     write_config(path, &cfg)?;
-    println!("已生成 {}", path.display());
+    println!("wrote {}", path.display());
     println!();
-    println!("网关密钥：{key}");
-    println!("（请在客户端中配置该密钥。tw- 前缀用于区分网关密钥与上游的 API 密钥）");
+    println!("gateway key: {key}");
+    println!(
+        "(configure a client with it. The tw- prefix tells a gateway key from an upstream API key.)"
+    );
     println!();
-    println!("下一步：在 providers 中添加上游，然后运行 twcore serve。");
+    println!("Next: add an upstream under providers, then run twcore serve.");
     Ok(())
 }
 
@@ -564,9 +580,9 @@ fn write_config(path: &Path, cfg: &tw_config::Config) -> Result<()> {
 fn cmd_check(path: &Path) -> Result<()> {
     match tw_config::load(path) {
         Ok(cfg) => {
-            println!("✅ {} 校验通过", path.display());
+            println!("✅ {} is valid", path.display());
             println!(
-                "   {} 个网关密钥，{} 个上游",
+                "   {} gateway keys, {} upstreams",
                 cfg.clients.len(),
                 cfg.providers.len()
             );
@@ -574,14 +590,14 @@ fn cmd_check(path: &Path) -> Result<()> {
                 let proto = match p.effective_protocol() {
                     Some(x) => format!("{x:?}"),
                     // 猜不出来不是错误，但值得说一句 —— M0 按 Anthropic 走。
-                    None => "未识别（按 Anthropic 格式转发）".to_string(),
+                    None => "not recognized (forwarded in the Anthropic format)".to_string(),
                 };
                 // 说来源而不是值。
                 let credential = match (&p.key, &p.oauth) {
-                    (Some(k), _) => format!("API 密钥 {}（{}）", k.describe(), p.auth_header().0),
+                    (Some(k), _) => format!("API key {} ({})", k.describe(), p.auth_header().0),
                     (None, Some(_)) => "OAuth".to_string(),
-                    (None, None) if !p.headers.is_empty() => "请求头".to_string(),
-                    (None, None) => "无凭据".to_string(),
+                    (None, None) if !p.headers.is_empty() => "headers".to_string(),
+                    (None, None) => "no credential".to_string(),
                 };
                 println!(
                     "   · {} → {} [{}]  {credential}",
@@ -598,14 +614,16 @@ fn cmd_check(path: &Path) -> Result<()> {
                     } else {
                         tw_secret::mask_secret(raw)
                     };
-                    println!("     · 请求头 {}: {shown}", h.name);
+                    println!("     · header {}: {shown}", h.name);
                 }
                 // OAuth 不在这里换 token：那是一次网络往返，而 check
                 // 是个用户期望立刻返回的命令。但**能离线查的都要查** ——
                 // 这几样写错了，症状全是网关起来之后一片 401。
                 if let Some(o) = &p.oauth {
                     if o.refresh.trim().is_empty() {
-                        println!("     ⚠ refresh token 为空，无法获取 access token");
+                        println!(
+                            "     ⚠ the refresh token is empty, so no access token can be obtained"
+                        );
                     }
                     // **本机的 http 不算明文过网。**报它是个假警报，而
                     // 假警报的代价是用户学会忽略这一栏的所有话（
@@ -618,7 +636,7 @@ fn cmd_check(path: &Path) -> Result<()> {
                         // refresh token 换得出无数个 access token。
                         // 它走明文 = 整个凭据走明文
                         println!(
-                            "     ⚠ token 端点不是 https 地址：{}，refresh token 将以明文传输",
+                            "     ⚠ the token endpoint is not https ({}), so the refresh token travels in the clear",
                             tw_secret::redact_url(&o.endpoint)
                         );
                     }
@@ -628,12 +646,14 @@ fn cmd_check(path: &Path) -> Result<()> {
                         // 静默走默认值是对的（一个写错的提前量不该让上游
                         // 整个不可用），但**不说出来就没人会发现自己写错了**
                         println!(
-                            "     ⚠ refresh_before 的值「{raw}」无法识别（应为 30s、5m、1h 的形式），按 300 秒处理"
+                            "     ⚠ refresh_before is `{raw}`, which is not recognized (it is written as 30s, 5m or 1h); using 300 s"
                         );
                     }
-                    println!("     · OAuth 凭据：获取 token 需要联网，将在网关启动后进行");
+                    println!(
+                        "     · OAuth: getting a token needs the network, and happens once the gateway starts"
+                    );
                 } else if let Err(e) = p.outbound_headers(None, None) {
-                    println!("     ⚠ 无法获取凭据：{e}");
+                    println!("     ⚠ the credential could not be obtained: {e}");
                 }
             }
             Ok(())
@@ -674,10 +694,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     if !path.exists() {
         let cfg = tw_config::generate_initial();
         tw_config::write(path, &cfg)
-            .with_context(|| format!("生成初始配置 {} 失败", path.display()))?;
-        tracing::info!(path = %path.display(), "首次运行，已生成初始配置");
+            .with_context(|| format!("writing the initial configuration {}", path.display()))?;
+        tracing::info!(path = %path.display(), "first run; wrote an initial configuration");
     }
-    let cfg = tw_config::load(path).with_context(|| format!("加载 {} 失败", path.display()))?;
+    let cfg = tw_config::load(path).with_context(|| format!("loading {}", path.display()))?;
     // `--port` 是一个**显式的覆盖**，配置文件不该推翻它。所以给了它
     // 之后就不再跟着配置里的监听地址走（「温」那一级）。
     let overridden = port.is_some();
@@ -725,7 +745,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         let _watch = match tw_control::spawn_watcher(manager.clone()) {
             Ok(w) => Some(w),
             Err(e) => {
-                tracing::warn!("无法监听配置文件，手动修改的配置不会自动生效：{e}");
+                tracing::warn!("the configuration file cannot be watched, so a hand edit will not take effect on its own: {e}");
                 None
             }
         };
@@ -755,7 +775,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         let _scan_watch = match tw_control::scan::spawn_watcher(control.clone()) {
             Ok(w) => Some(w),
             Err(e) => {
-                tracing::warn!("无法监控客户端配置面，发生变更时不会告警：{e}");
+                tracing::warn!("the clients' configuration cannot be watched, so a change there raises nothing: {e}");
                 None
             }
         };
@@ -773,7 +793,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             let msg = match r {
                 Err(e) => format!("{e}"),
                 // serve_unix 正常返回意味着 accept 循环结束了，同样是没了
-                Ok(()) => "控制面意外结束".to_string(),
+                Ok(()) => "the control plane ended unexpectedly".to_string(),
             };
             let _ = control_died.send(msg);
         });
@@ -786,7 +806,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     if !parent_alive(ppid) {
-                        tracing::info!(ppid, "父进程已退出，随之退出");
+                        tracing::info!(ppid, "the parent exited; exiting with it");
                         std::process::exit(0);
                     }
                 }
@@ -796,10 +816,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         if safe {
             // 安全模式：只起控制面。数据面不动，让用户还能改配置、回滚。
             // **这时候控制面就是全部** —— 它没了，这个进程一件事都干不了。
-            tracing::warn!("安全模式：仅启动控制面，不启动数据面");
+            tracing::warn!("safe mode: starting the control plane only, not the data plane");
             tokio::select! {
                 msg = control_dead => {
-                    anyhow::bail!("{}", msg.unwrap_or_else(|_| "控制面已停止".into()))
+                    anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
                 }
                 _ = shutdown_signal() => {}
             }
@@ -810,7 +830,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 探测要打网络，而网关不该因为一次探测慢而起不来。
         tw_gateway::models::spawn(state.clone());
 
-        tracing::info!(%addr, "启动");
+        tracing::info!(%addr, "starting");
         tokio::select! {
             r = async {
                 if overridden {
@@ -819,13 +839,13 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                     tw_gateway::serve_following_config(state, addr).await
                 }
             } => {
-                r.with_context(|| format!("监听 {addr} 失败。如果端口被占用，请检查上一个实例是否已完全退出"))
+                r.with_context(|| format!("{addr} could not be listened on. If the port is taken, check whether an earlier instance has fully exited"))
             }
             msg = control_dead => {
-                anyhow::bail!("{}", msg.unwrap_or_else(|_| "控制面已停止".into()))
+                anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
             }
             _ = shutdown_signal() => {
-                tracing::info!("收到退出信号");
+                tracing::info!("got a shutdown signal");
                 Ok(())
             }
         }
@@ -850,7 +870,9 @@ fn build_store(
     let db = match tw_store::Db::open(&dir.join("data.db")) {
         Ok(db) => db,
         Err(e) => {
-            tracing::warn!("请求记录无法启动，本次运行不记录请求，转发不受影响：{e}");
+            tracing::warn!(
+                "request recording could not start, so nothing is recorded this run; forwarding is unaffected: {e}"
+            );
             return None;
         }
     };
