@@ -437,12 +437,15 @@ fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Re
                 .proxies
                 .iter()
                 .find(|x| x.name == name)
-                .with_context(|| format!("未找到名为「{name}」的代理"))?;
+                .with_context(|| format!("no proxy named `{name}`"))?;
             let hop = tw_gateway::hop_of(px).map_err(anyhow::Error::msg)?;
             let (host, port) = tw_gateway::proxy_target(&cfg, &px.name);
             let r = tw_gateway::l1_proxy(&hop, &host, port).await;
             print_l1(
-                &format!("代理「{}」（经其连接 {host}:{port}）", px.name),
+                &format!(
+                    "proxy `{}` (connecting to {host}:{port} through it)",
+                    px.name
+                ),
                 None,
                 &r,
             );
@@ -453,12 +456,12 @@ fn cmd_speed(path: &Path, provider: Option<String>, proxy: Option<String>) -> Re
                 cfg.providers
                     .iter()
                     .find(|p| p.name == *n)
-                    .with_context(|| format!("未找到名为「{n}」的上游"))?,
+                    .with_context(|| format!("no upstream named `{n}`"))?,
             ],
             None => cfg.providers.iter().collect(),
         };
         if targets.is_empty() {
-            println!("尚未配置任何上游，请先在 providers 中添加上游。");
+            println!("No upstreams are configured yet. Add one under `providers`.");
             return Ok(());
         }
         for p in targets {
@@ -484,14 +487,16 @@ fn hop_for(
         // 跟随系统代理的地址要到建连时才由环境决定，我们没有那份地址
         // 可以去握手。说出来，而不是假装直连测一遍给个漂亮数字。
         tw_config::SYSTEM => anyhow::bail!(
-            "该上游使用系统代理，代理地址在建立连接时才能确定，链路测速无法测量。将代理配置为命名代理后即可测速"
+            "This upstream goes through the system proxy, whose address is only decided by \
+             the environment when the connection is made, so a link test cannot measure it. \
+             Configure the proxy as a named entry to measure this route."
         ),
         name => {
             let px = cfg
                 .proxies
                 .iter()
                 .find(|x| x.name == name)
-                .with_context(|| format!("proxies 中未定义「{name}」"))?;
+                .with_context(|| format!("`{name}` is not defined under `proxies`"))?;
             let auth = match &px.auth {
                 None => None,
                 Some(a) => Some((a.user.clone(), a.pass.resolve()?)),
@@ -507,19 +512,20 @@ fn hop_for(
 
 fn print_l1(target: &str, via: Option<&str>, r: &tw_gateway::L1Result) {
     let head = match via {
-        Some(v) => format!("{target}（经由 {v}）"),
+        Some(v) => format!("{target} (through {v})"),
         None => target.to_string(),
     };
     println!("{}  {}", if r.ok { "✅" } else { "❌" }, head);
+    // 28 宽：最长的一个是 `TLS handshake to the proxy`
     for seg in &r.segments {
-        println!("     {:<18} {:>6} ms", seg.stage.label(), seg.ms);
+        println!("     {:<28} {:>6} ms", seg.stage.label(), seg.ms);
     }
     if r.ok {
-        println!("     {:<18} {:>6} ms", "建立连接合计", r.total_ms);
+        println!("     {:<28} {:>6} ms", "connect, total", r.total_ms);
     }
     if let Some(e) = &r.error {
         match r.failed {
-            Some(stage) => println!("     {}：{e}", stage.label()),
+            Some(stage) => println!("     {}: {e}", stage.label()),
             None => println!("     {e}"),
         }
     }
