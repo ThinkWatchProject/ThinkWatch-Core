@@ -218,7 +218,9 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                             .unwrap_or_else(|| "—".into()),
                         // **错误信息也要脱敏** —— 上游的 401 正文里可能
                         // 回显了我们发过去的 key
-                        tw_secret::mask_body(r.error.as_deref().unwrap_or("")),
+                        tw_secret::mask_body(
+                            r.error.as_ref().map(|e| e.text.as_str()).unwrap_or("")
+                        ),
                     );
                 }
             }

@@ -42,6 +42,18 @@ impl std::fmt::Display for Msg {
 }
 
 impl Msg {
+    /// 一句没有码的话。
+    ///
+    /// **给的是退路，不是常规写法。**界面对空码只能照搬 `text` —— 用在
+    /// 加码之前落下的旧数据上，以及测试里。新写的消息用 [`msg!`]。
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            code: String::new(),
+            args: BTreeMap::new(),
+            text: text.into(),
+        }
+    }
+
     /// 取一个参数。**没有就是空串** —— 调用方是在拼一句话，为一个缺席的
     /// 参数 panic 没有意义
     pub fn arg(&self, name: &str) -> &str {

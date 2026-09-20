@@ -149,10 +149,10 @@ fn an_injection_hidden_in_an_instruction_file_is_found() {
     );
     let r = run(&b.home);
     let ids: Vec<_> = r.findings.iter().map(|f| f.rule.as_str()).collect();
-    assert!(ids.contains(&"忽略指令"), "{ids:?}");
+    assert!(ids.contains(&"ignore-previous-zh"), "{ids:?}");
     // 命令形状的规则对中文指令不设防，所以有一条按「凭据路径 + 外送
     // 动词」匹配的
-    assert!(ids.contains(&"凭据外泄"), "{ids:?}");
+    assert!(ids.contains(&"exfil-credentials"), "{ids:?}");
 }
 
 #[test]
