@@ -15,7 +15,10 @@
 //! 走还原 —— 拿三个月前的备份去覆盖，会把用户这期间加的 MCP server、
 //! 调的权限、写的 hook 全部抹掉。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use tw_types::{Msg, msg};
 
 use crate::clients::{Client, Edit, Format, Gateway};
 use crate::foreign::{self, Applied, Change, ForeignError};
@@ -70,7 +73,7 @@ pub struct Plan {
     /// 这次会不会把密钥写进这个文件
     pub carries_secret: bool,
     /// 接管完成那一屏要说的话：什么时候生效、有什么代价、哪些文件会遮蔽我们
-    pub notes: Vec<String>,
+    pub notes: Vec<Msg>,
     /// 优先级比我们高、会盖住这次写入的文件（#6828）
     pub shadows: Vec<PathBuf>,
     /// 这次动了哪些路径。**只有这些路径允许变** —— 写回校验拿它当白名单
@@ -158,6 +161,18 @@ fn refs(path: &[String]) -> Vec<&str> {
 // ---------------------------------------------------------------- 接管
 
 /// 算一份接管改动。**不写任何东西。**
+/// 「什么时候生效」那一句。
+///
+/// 码里带上 `takes_effect` 那个词，因为界面上的两句话措辞完全不同，
+/// 不是同一句填不同的空。
+fn takes_effect_note(c: &Client) -> Msg {
+    msg!(
+        "adopt.takes_effect",
+        takes_effect = c.takes_effect.slug()
+        => "{}", c.takes_effect.note()
+    )
+}
+
 pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanError> {
     let path = c.config_path(home);
     let before = foreign::read(&path).map_err(|source| PlanError::Read {
@@ -220,11 +235,16 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
         text = format!("{block}{}", sentinel::strip(&text, prefix));
     }
 
-    let mut notes = vec![c.takes_effect.note().to_string()];
-    notes.extend(c.costs.iter().map(|s| s.to_string()));
+    let mut notes = vec![takes_effect_note(c)];
+    notes.extend(c.costs.iter().map(|(code, text)| Msg {
+        code: (*code).into(),
+        args: BTreeMap::new(),
+        text: (*text).into(),
+    }));
     if c.verified == crate::clients::Verified::FieldsOnly {
-        notes.push(format!(
-            "{} Do not take it as working until the first request arrives.",
+        notes.push(msg!(
+            "adopt.plan.fields_only"
+            => "{} Do not take it as working until the first request arrives.",
             c.verified.note()
         ));
     }
@@ -235,13 +255,14 @@ pub fn plan_adopt(c: &Client, home: &Path, gw: &Gateway) -> Result<Plan, PlanErr
         .filter(|p| p.exists())
         .collect();
     if !shadows.is_empty() {
-        notes.push(format!(
-            "{} was found, and it takes precedence over what was written here, so a setting of the same name there wins.",
-            shadows
+        notes.push(msg!(
+            "adopt.plan.shadowed",
+            paths = shadows
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
+            => "{paths} was found, and it takes precedence over what was written here, so a setting of the same name there wins."
         ));
     }
 
@@ -470,7 +491,9 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
             after: String::new(),
             originals: Vec::new(),
             carries_secret: false,
-            notes: vec!["The configuration file is gone; only the record was removed.".into()],
+            notes: vec![
+                msg!("adopt.restore.config_gone" => "The configuration file is gone; only the record was removed."),
+            ],
             shadows: Vec::new(),
             targets: Vec::new(),
             drop_sidecar: Some(side),
@@ -505,10 +528,11 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
                 // 密钥，备份没了我们就是拿不回来；留着我们的密钥比删掉
                 // 更糟 —— 那等于卸载之后还在替他发着请求。
                 targets.push(Target::Remove(p.clone()));
-                notes.push(format!(
-                    "The original value of {} is a secret kept only in the full backup, and {} is gone. The field was removed and has to be filled in again by hand.",
-                    f.field,
-                    backup.display()
+                notes.push(msg!(
+                    "adopt.restore.secret_lost",
+                    field = f.field.clone(),
+                    backup = backup.display()
+                    => "The original value of {field} is a secret kept only in the full backup, and {backup} is gone. The field was removed and has to be filled in again by hand."
                 ));
             }
             (_, None, None) => targets.push(Target::Remove(p.clone())),
@@ -549,10 +573,10 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
     let delete_file = rec.created_file
         && matches!(semantic(c.format, &text, c.id)?, Val::Obj(ms) if ms.is_empty());
     if delete_file {
-        notes.push("This file was created here, restoring leaves it empty, and it was removed with the rest.".into());
+        notes.push(msg!("adopt.restore.file_removed" => "This file was created here, restoring leaves it empty, and it was removed with the rest."));
     }
 
-    notes.insert(0, c.takes_effect.note().to_string());
+    notes.insert(0, takes_effect_note(c));
     Ok(Plan {
         client: c.id.into(),
         path,

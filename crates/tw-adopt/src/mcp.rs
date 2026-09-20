@@ -8,7 +8,10 @@
 //! 有问题时，一次操作从所有客户端拿掉，不用去五个文件里各删一遍。它比
 //! 「留一个 `enabled: false` 的中间状态」更直接 —— 它真的删了。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use tw_types::Msg;
 
 use crate::clients::Format;
 use crate::foreign::{self, Applied, Change, ForeignError};
@@ -45,8 +48,19 @@ pub struct Target {
     /// **不能写的照样列在清单里**（看得见是第一目标），只是
     /// 不给复制按钮。
     pub copyable: bool,
-    /// 不能写的话，为什么
-    pub why_not: &'static str,
+    /// 不能写的话，为什么。能写的这里是 `None`
+    pub why_not: Option<(&'static str, &'static str)>,
+}
+
+impl Target {
+    /// 不能写的理由，带码。
+    pub fn why_not(&self) -> Option<Msg> {
+        self.why_not.map(|(code, text)| Msg {
+            code: code.to_string(),
+            args: BTreeMap::new(),
+            text: text.to_string(),
+        })
+    }
 }
 
 /// 能往里写的那几个，以及为什么另外两个不行。
@@ -64,7 +78,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "mcpServers",
             copyable: true,
-            why_not: "",
+            why_not: None,
         },
         Target {
             client: "claude-desktop",
@@ -73,7 +87,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "mcpServers",
             copyable: true,
-            why_not: "",
+            why_not: None,
         },
         Target {
             client: "cursor",
@@ -82,7 +96,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "mcpServers",
             copyable: true,
-            why_not: "",
+            why_not: None,
         },
         Target {
             client: "codex",
@@ -91,7 +105,7 @@ pub fn targets() -> Vec<Target> {
             format: Format::Toml,
             key: "mcp_servers",
             copyable: true,
-            why_not: "",
+            why_not: None,
         },
         Target {
             client: "opencode",
@@ -100,7 +114,10 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "mcp",
             copyable: false,
-            why_not: "this client's MCP configuration format is not verified yet, and writing to it could leave the client unable to read its own configuration",
+            why_not: Some((
+                "adopt.mcp.unverified_format",
+                "this client's MCP configuration format is not verified yet, and writing to it could leave the client unable to read its own configuration",
+            )),
         },
         Target {
             client: "zed",
@@ -109,7 +126,10 @@ pub fn targets() -> Vec<Target> {
             format: Format::Json,
             key: "context_servers",
             copyable: false,
-            why_not: "Zed's context servers use a different structure and do not take the command/args form",
+            why_not: Some((
+                "adopt.mcp.zed_structure",
+                "Zed's context servers use a different structure and do not take the command/args form",
+            )),
         },
     ]
 }
@@ -131,7 +151,9 @@ impl Target {
         } else {
             Err(McpError::NotCopyable {
                 client: self.client.to_string(),
-                why: self.why_not.to_string(),
+                // 这一条是护栏：界面对不能写的目标根本不给按钮。
+                // 英文原句就够了，控制面会把它当 detail 包进去
+                why: self.why_not.map(|(_, t)| t.to_string()).unwrap_or_default(),
             })
         }
     }

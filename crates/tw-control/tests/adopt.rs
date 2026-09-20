@@ -221,9 +221,9 @@ async fn the_diagnosis_hands_over_a_command_rather_than_running_it() {
     let v: Vec<tw_api::FindingView> = serde_json::from_str(&body).unwrap();
     let f = v
         .iter()
-        .find(|f| f.title.contains("ANTHROPIC_BASE_URL"))
+        .find(|f| f.title.text.contains("ANTHROPIC_BASE_URL"))
         .unwrap();
-    assert!(f.fix.as_ref().unwrap().contains("sed"), "{:?}", f.fix);
+    assert!(f.fix.as_ref().unwrap().text.contains("sed"), "{:?}", f.fix);
     // 文件还在，我们没动它
     assert!(
         std::fs::read_to_string(b.home.join(".zshrc"))
@@ -373,7 +373,7 @@ async fn the_target_list_says_which_ones_can_be_written_and_why_not() {
     assert!(v.iter().any(|t| t.client == "claude-desktop" && t.copyable));
     let zed = v.iter().find(|t| t.client == "zed").unwrap();
     assert!(!zed.copyable);
-    assert!(!zed.why_not.is_empty(), "不能写就要说清为什么");
+    assert!(zed.why_not.is_some(), "不能写就要说清为什么");
 }
 
 #[tokio::test]

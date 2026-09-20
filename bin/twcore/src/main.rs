@@ -281,7 +281,7 @@ fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
             println!("Clients that have to be configured by hand:");
             for m in manual_only() {
                 println!("  {:<12} {}", m.name, m.how(&gw));
-                println!("               {}", m.caveat);
+                println!("               {}", m.caveat());
             }
             Ok(())
         }
