@@ -517,6 +517,7 @@ impl AppState {
                 id: self.bus.next_id(),
                 proxy: proxy.to_string(),
                 state: "reachable".into(),
+                failed: None,
                 detail: None,
                 at_ms: now_ms(),
             });
@@ -555,30 +556,38 @@ impl AppState {
         let name = proxy.to_string();
         tokio::spawn(async move {
             let cfg = state.config();
-            let result = match cfg.proxies.iter().find(|p| p.name == name) {
-                Some(px) => match crate::l1::hop_of(px) {
-                    Ok(hop) => {
-                        let (host, port) = crate::l1::proxy_target(&cfg, &name);
-                        let r = crate::l1::l1_proxy(&hop, &host, port).await;
-                        if r.ok {
-                            None
-                        } else {
-                            // 卡在哪一步 + 为什么。**两个都要**：一句「TCP 握手失败」
-                            // 说不出是地址错了还是代理没起来
-                            let step = r.failed.map(|f| f.label()).unwrap_or_default();
-                            let why = r.error.unwrap_or_else(|| "无法连接".into());
-                            Some(if step.is_empty() {
-                                why
+            // 卡在哪一步 + 为什么。**两个都要**：一句「TCP 握手失败」说不出
+            // 是地址错了还是代理没起来。两样分开发，界面自己组句
+            let result: Option<(Option<crate::l1::Stage>, tw_types::Msg)> =
+                match cfg.proxies.iter().find(|p| p.name == name) {
+                    Some(px) => match crate::l1::hop_of(px) {
+                        Ok(hop) => {
+                            let (host, port) = crate::l1::proxy_target(&cfg, &name);
+                            let r = crate::l1::l1_proxy(&hop, &host, port).await;
+                            if r.ok {
+                                None
                             } else {
-                                format!("{step}：{why}")
-                            })
+                                Some((
+                                    r.failed,
+                                    r.error.unwrap_or_else(|| {
+                                        tw_types::msg!(
+                                            "l1.unreachable" => "The proxy could not be reached."
+                                        )
+                                    }),
+                                ))
+                            }
                         }
-                    }
-                    Err(e) => Some(e),
-                },
-                // 配置刚好在这中间改了，代理没了：不报
-                None => None,
-            };
+                        Err(e) => Some((
+                            Some(crate::l1::Stage {
+                                step: crate::l1::Step::Config,
+                                peer: crate::l1::Peer::Proxy,
+                            }),
+                            e,
+                        )),
+                    },
+                    // 配置刚好在这中间改了，代理没了：不报
+                    None => None,
+                };
             let changed = state
                 .proxies
                 .lock()
@@ -598,19 +607,30 @@ impl AppState {
                 return;
             }
             match &result {
-                Some(why) => tracing::warn!(proxy = %name, "代理不通：{why}"),
-                None => tracing::info!(proxy = %name, "代理又通了"),
+                Some((_, why)) => tracing::warn!(proxy = %name, "proxy is unreachable: {why}"),
+                None => tracing::info!(proxy = %name, "proxy is reachable again"),
             }
+            let (failed, detail) = match result {
+                Some((stage, why)) => (
+                    stage.map(|s| tw_api::L1Stage {
+                        step: s.step.slug().into(),
+                        peer: s.peer.slug().into(),
+                    }),
+                    Some(why),
+                ),
+                None => (None, None),
+            };
             state.bus.emit(tw_api::Event::ProxyChanged {
                 id: state.bus.next_id(),
                 proxy: name,
-                state: if result.is_some() {
+                state: if detail.is_some() {
                     "unreachable"
                 } else {
                     "reachable"
                 }
                 .into(),
-                detail: result,
+                failed,
+                detail,
                 at_ms: now_ms(),
             });
         });

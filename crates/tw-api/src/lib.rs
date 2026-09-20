@@ -11,6 +11,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 给人看的话：码 + 参数 + 英文原句。见 [`tw_types::Msg`]。**协议里凡是
+/// 一句给人读的错误或说明，类型都是它**，不是 `String`。
+pub use tw_types::Msg;
+
 /// 控制面协议版本。UI 和 CLI 连上来时检查，不匹配就明确提示「请升级
 /// 客户端」，而不是以奇怪的方式失败。
 pub const CONTROL_API_VERSION: u32 = 1;
@@ -350,9 +354,14 @@ pub enum Event {
         proxy: String,
         /// `unreachable` = 刚刚检查不通；`reachable` = 又通了
         state: String,
-        /// 不通时卡在哪一步，已脱敏。通了没有
+        /// 不通时卡在建连的哪一步。**和原因分开** —— 「卡在到代理的 TCP
+        /// 握手」要去改的地方和「代理拒绝了用户名和密码」完全不同，而把
+        /// 两句话拼成一个字符串之后，界面就只能整句照搬
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
+        failed: Option<L1Stage>,
+        /// 不通的原因，已脱敏。通了没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<Msg>,
         at_ms: u64,
     },
     /// 上游拒绝了我们的凭据（401/403），或者重新接受了。
@@ -1105,7 +1114,7 @@ pub struct L1Result {
     pub failed: Option<L1Stage>,
     /// 失败的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
 }
 
 /// 当前的配置文本，连同它的版本号。
