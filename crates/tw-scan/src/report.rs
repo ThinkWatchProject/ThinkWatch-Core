@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 
 use tw_adopt::json::Val;
+use tw_types::{Msg, msg};
 
 use crate::hidden;
 use crate::rules::Rules;
@@ -52,9 +53,12 @@ pub struct Finding {
     pub path: PathBuf,
     /// 第几行，从 1 开始。**要能定位到行**
     pub line: usize,
-    pub title: String,
+    /// **带码。**这一屏要用界面自己的语言说出来；英文原句是给命令行
+    /// 和不认识这个码的客户端的退路。参数里给的都是词表里的词
+    /// （`kind` / `rule` / `what`），不是拼好的句子 —— 句子两边各写各的
+    pub title: Msg,
     /// 为什么它值得看一眼
-    pub detail: String,
+    pub detail: Msg,
     /// 命中的那一行。不可见字符已经换成可见记号
     pub excerpt: String,
 }
@@ -309,8 +313,11 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                 client: src.client.to_string(),
                 path: src.path.clone(),
                 line: h.line,
-                title: format!(
-                    "{} contains {}",
+                title: msg!(
+                    "scan.hidden",
+                    kind = src.kind.slug(),
+                    what = h.kind.slug()
+                    => "{} contains {}",
                     src.kind.label(),
                     h.kind
                         .why()
@@ -318,7 +325,16 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                         .next()
                         .unwrap_or("hidden characters")
                 ),
-                detail: format!("{}{}", h.kind.why(), src.kind.why()),
+                // 两句之间要有一个空格 —— 中文句号自己带停顿，英文句点不带，
+                // 直接接上会读成「…by the model.The content of…」
+                detail: msg!(
+                    "scan.hidden.detail",
+                    kind = src.kind.slug(),
+                    what = h.kind.slug()
+                    => "{} {}",
+                    h.kind.why(),
+                    src.kind.why()
+                ),
                 excerpt: h.line_text,
             });
         }
@@ -340,10 +356,11 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                             client: src.client.to_string(),
                             path: src.path.clone(),
                             line,
-                            title: format!("MCP server `{}` is remote", m.name),
-                            detail: format!(
-                                "That server is at {}, and using it sends the surrounding context there.",
-                                m.url.as_deref().unwrap_or("")
+                            title: msg!("scan.mcp.remote", name = m.name.clone() => "MCP server `{name}` is remote"),
+                            detail: msg!(
+                                "scan.mcp.remote.detail",
+                                url = m.url.clone().unwrap_or_default()
+                                => "That server is at {url}, and using it sends the surrounding context there."
                             ),
                             excerpt,
                         });
@@ -376,10 +393,8 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     client: src.client.to_string(),
                     path: src.path.clone(),
                     line,
-                    title: format!("skill `{name}` declares allowed-tools: [\"*\"]"),
-                    detail:
-                        "That skill may use any tool. It may well need to; it is worth confirming that it does."
-                            .into(),
+                    title: msg!("scan.skill.all_tools", name = name.clone() => "skill `{name}` declares allowed-tools: [\"*\"]"),
+                    detail: msg!("scan.skill.all_tools.detail" => "That skill may use any tool. It may well need to; it is worth confirming that it does."),
                     excerpt,
                 });
             }
@@ -415,6 +430,9 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     continue;
                 };
                 let (line, excerpt) = line_of(&text, m.as_str());
+                // `msg!` 会把 `rule` 遮住，所以句子要用到的两段先取出来
+                let why = rule.why.clone();
+                let kind_why = src.kind.why();
                 r.findings.push(Finding {
                     // **hook 和 MCP 里的危险命令是最高级**：它们不需要
                     // 模型参与就会被执行
@@ -428,8 +446,21 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     client: src.client.to_string(),
                     path: src.path.clone(),
                     line,
-                    title: format!("{} matched rule `{}`", src.kind.label(), rule.id),
-                    detail: format!("{}. {}", rule.why, src.kind.why()),
+                    title: msg!(
+                        "scan.rule",
+                        kind = src.kind.slug(),
+                        rule = rule.id.clone()
+                        => "{} matched rule `{rule}`",
+                        src.kind.label()
+                    ),
+                    detail: msg!(
+                        "scan.rule.detail",
+                        kind = src.kind.slug(),
+                        rule = rule.id.clone()
+                        => "{}. {}",
+                        why,
+                        kind_why
+                    ),
                     excerpt,
                 });
             }

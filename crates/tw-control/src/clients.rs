@@ -223,7 +223,7 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
                     base: gateway_base(&s),
                     key: None,
                 }),
-                caveat: m.caveat.to_string(),
+                caveat: m.caveat(),
             })
             .collect(),
         gateway_base: gateway_base(&s),
@@ -396,7 +396,7 @@ pub async fn mcp_targets(State(_s): State<ControlState>) -> Json<Vec<tw_api::Mcp
                 name: t.name.to_string(),
                 path: t.config.to_string(),
                 copyable: t.copyable,
-                why_not: t.why_not.to_string(),
+                why_not: t.why_not(),
             })
             .collect(),
     )
