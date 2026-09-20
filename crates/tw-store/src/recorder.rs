@@ -367,7 +367,7 @@ impl Recorder {
                 *bytes,
                 *duration_ms,
                 *usage,
-                Ending::Failed(message),
+                Ending::Failed(&message.text),
             ),
             Event::LocallyAnswered {
                 id,
@@ -925,13 +925,17 @@ mod tests {
         r.on_event(&Event::RequestFailed {
             id: 1,
             source: "upstream".into(),
-            message: "连不上".into(),
+            message: tw_api::Msg {
+                code: "t.unreachable".into(),
+                args: Default::default(),
+                text: "cannot connect".into(),
+            },
             bytes: None,
             duration_ms: None,
             usage: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(row.error.as_deref(), Some("连不上"));
+        assert_eq!(row.error.as_deref(), Some("cannot connect"));
         assert_eq!(r.db().summary(0, i64::MAX).unwrap().failed, 1);
     }
 
@@ -1585,7 +1589,11 @@ mod failure_tests {
         Event::RequestFailed {
             id,
             source: "upstream".into(),
-            message: "流中断：上游断开了".into(),
+            message: tw_api::Msg {
+                code: "t.broke".into(),
+                args: Default::default(),
+                text: "the stream broke: the upstream disconnected".into(),
+            },
             bytes: Some(312),
             duration_ms: Some(2_500),
             usage,
@@ -1614,7 +1622,10 @@ mod failure_tests {
         r.on_event(&failed(1, partial()));
 
         let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(row.error.as_deref(), Some("流中断：上游断开了"));
+        assert_eq!(
+            row.error.as_deref(),
+            Some("the stream broke: the upstream disconnected")
+        );
         assert!(!row.cancelled);
         assert_eq!(row.status, Some(200), "状态码来自响应头那个事件");
         assert_eq!(row.bytes, Some(312));
@@ -1655,7 +1666,11 @@ mod failure_tests {
         r.on_event(&Event::RequestFailed {
             id: 1,
             source: "rate_limited".into(),
-            message: "`up` 限流了".into(),
+            message: tw_api::Msg {
+                code: "t.limited".into(),
+                args: Default::default(),
+                text: "`up` rate-limited us".into(),
+            },
             bytes: None,
             duration_ms: Some(20_000),
             usage: None,

@@ -426,7 +426,7 @@ async fn without_a_config_manager_the_rotation_is_reported_as_not_persisted() {
     for one in &seen {
         assert_eq!(one.0, "p");
         assert!(!one.1, "没写却说写了：{seen:?}");
-        assert!(one.2.contains("无法写回"), "{seen:?}");
+        assert!(one.2.contains("not written back"), "{seen:?}");
     }
     // 事件里一个 token 都不能有
     assert!(!seen.iter().any(|s| s.2.contains("rt-")), "{seen:?}");
@@ -512,5 +512,5 @@ async fn an_error_body_from_the_token_endpoint_is_masked_before_being_reported()
         !e.contains("OPAQUE-nothing-matches"),
         "**凭据从错误消息里漏出去了**：{e}"
     );
-    assert!(e.contains("<省略>"), "抹掉了但没说抹掉了什么：{e}");
+    assert!(e.contains("<omitted>"), "抹掉了但没说抹掉了什么：{e}");
 }

@@ -488,7 +488,7 @@ async fn reloading_from_zero_providers_to_one_starts_working_without_a_restart()
     let state = tw_gateway::AppState::new(cfg(vec![], vec![])).unwrap();
     let gw = serve(state.clone()).await;
     let first = ask(gw).await;
-    assert!(first.contains("尚未配置任何上游"), "{first}");
+    assert!(first.contains("No upstream is configured"), "{first}");
 
     state.reload(cfg(vec![provider("a", a)], vec![])).unwrap();
     assert!(ask(gw).await.contains("\"a\""), "加完上游还是不通");
@@ -509,7 +509,7 @@ async fn the_allow_list_is_reloaded_too() {
     state.reload(c).unwrap();
     let after = ask(gw).await;
     assert!(
-        after.contains("不在允许的来源地址中"),
+        after.contains("not among the allowed source addresses"),
         "白名单没生效：{after}"
     );
 }

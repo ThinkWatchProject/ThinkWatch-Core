@@ -52,16 +52,16 @@ const EXPIRED_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum OauthError {
-    #[error("刷新 token 时无法连接 {endpoint}：{why}")]
+    #[error("{endpoint} could not be reached while refreshing the token: {why}")]
     Http { endpoint: String, why: String },
-    #[error("token 端点返回 {status}：{body}")]
+    #[error("the token endpoint answered {status}: {body}")]
     Status { status: u16, body: String },
-    #[error("token 端点的响应中没有 access_token")]
+    #[error("the token endpoint's response has no access_token")]
     NoToken,
-    #[error("上次刷新 token 失败（{why}），将在 {secs} 秒后重试")]
+    #[error("the last token refresh failed ({why}); retrying in {secs} s")]
     Backoff { why: String, secs: u64 },
     /// refresh token 已经作废。**重试没有用**，要重新登录或换一个 refresh token
-    #[error("OAuth 凭据已失效，需要重新登录或更换 refresh token（{why}）")]
+    #[error("the OAuth credential has expired; sign in again or replace the refresh token ({why})")]
     Expired { why: String },
 }
 
@@ -237,7 +237,7 @@ impl Cache {
         let flight = self.flight(provider);
         let _one = flight.lock().await;
         {
-            let mut g = self.inner.lock().expect("锁未中毒");
+            let mut g = self.inner.lock().expect("lock not poisoned");
             if let Some(live) = g.get_mut(provider).filter(|l| l.usable_for(cfg)) {
                 let renewed = !live.access.is_empty()
                     && live
@@ -258,7 +258,7 @@ impl Cache {
 
     /// 这家最近一次刷新失败的原因，和是不是要重新登录。没失败过、或者已经恢复，是 `None`。
     pub fn failure(&self, provider: &str, cfg: &OAuth) -> Option<(String, bool)> {
-        let g = self.inner.lock().expect("锁未中毒");
+        let g = self.inner.lock().expect("lock not poisoned");
         let f = g
             .get(provider)
             .filter(|l| l.usable_for(cfg))?
@@ -270,7 +270,7 @@ impl Cache {
     fn flight(&self, provider: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.flights
             .lock()
-            .expect("锁未中毒")
+            .expect("lock not poisoned")
             .entry(provider.to_string())
             .or_default()
             .clone()
@@ -278,7 +278,7 @@ impl Cache {
 
     /// 手里能直接用的 token。`Err` 是还在退避。
     fn cached(&self, provider: &str, cfg: &OAuth) -> Result<Option<String>, OauthError> {
-        let mut g = self.inner.lock().expect("锁未中毒");
+        let mut g = self.inner.lock().expect("lock not poisoned");
         if let Some(live) = g.get(provider).filter(|l| l.usable_for(cfg)) {
             if let Some(f) = &live.failed
                 && Instant::now() < f.until
@@ -328,7 +328,7 @@ impl Cache {
     ) -> Result<(String, Option<Renewed>), OauthError> {
         // 用手里那个 refresh（可能是服务器换过的），没有就用配置里的
         let refresh = {
-            let g = self.inner.lock().expect("锁未中毒");
+            let g = self.inner.lock().expect("lock not poisoned");
             g.get(provider)
                 // 认不出来 = 用户改了配置，缓存里那个（哪怕是服务器
                 // 换发的）一律不算，用配置里的重新开始
@@ -346,7 +346,7 @@ impl Cache {
                     other => (other.to_string(), false),
                 };
                 let until = Instant::now() + if expired { EXPIRED_BACKOFF } else { BACKOFF };
-                let mut g = self.inner.lock().expect("锁未中毒");
+                let mut g = self.inner.lock().expect("lock not poisoned");
                 let entry = g.entry(provider.to_string()).or_insert_with(|| Live {
                     fp: fingerprint(cfg),
                     access: String::new(),
@@ -373,7 +373,7 @@ impl Cache {
         // **每一次轮换都要往外送，不能在这儿去重。**新值要写回
         // config.yaml，而漏掉一次写回就等于让配置文件从那一刻
         // 起是坏的。「同一句话别说第二遍」是报事件那一层的事，不是这一层的。
-        let mut g = self.inner.lock().expect("锁未中毒");
+        let mut g = self.inner.lock().expect("lock not poisoned");
         g.insert(
             provider.to_string(),
             Live {
@@ -466,11 +466,11 @@ fn scrub_sent(text: &str, sent: &[&str]) -> String {
     // 太短的不抹：一个三个字母的 client_secret 会把正文里无关的地方也
     // 换掉，那时错误消息本身变得不可读，比漏一点更妨碍排查
     for v in sent.iter().filter(|v| v.len() >= 6) {
-        out = out.replace(*v, "<省略>");
+        out = out.replace(*v, "<omitted>");
         // 表单是百分号编码之后发出去的，对方回显的很可能是编码后的样子
         let enc = form_encode(v);
         if enc != *v {
-            out = out.replace(&enc, "<省略>");
+            out = out.replace(&enc, "<omitted>");
         }
     }
     out
@@ -533,7 +533,7 @@ async fn exchange(cfg: &OAuth, refresh: &str, http: &reqwest::Client) -> Result<
         let body = masked.chars().take(400).collect::<String>();
         if is_expired(status, &text) {
             return Err(OauthError::Expired {
-                why: format!("token 端点返回 {status}：{body}"),
+                why: format!("the token endpoint answered {status}: {body}"),
             });
         }
         return Err(OauthError::Status { status, body });
@@ -632,7 +632,7 @@ mod tests {
         let second = rt.block_on(c.token("p", &o, &http)).unwrap_err();
         // 第二次直接被退避挡住，没有再去连
         assert!(matches!(second, OauthError::Backoff { .. }), "{second}");
-        assert!(second.to_string().contains("秒后重试"), "{second}");
+        assert!(second.to_string().contains("retrying in"), "{second}");
     }
 
     #[test]

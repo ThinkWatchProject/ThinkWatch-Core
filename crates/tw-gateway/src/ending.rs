@@ -24,13 +24,14 @@ use std::time::Instant;
 
 use crate::bodies::{BodyKind, BodyRecord, BodySender, ResponseTap};
 use crate::usage::{Sniffer, Usage};
+use tw_types::{Msg, msg};
 
 /// 一个还欠着结局的请求。
 ///
 /// **到目前为止对响应知道的一切都在它身上**：状态码、收到多少字节、嗅到
 /// 多少用量、攒下的响应体。放在一处是因为结局要用的正是这些 —— 不管这个
 /// 结局是显式报的，还是在 Drop 里报的。
-#[must_use = "丢弃它等同于报告客户端已断开"]
+#[must_use = "dropping it reports that the client disconnected"]
 pub struct Ending {
     bus: tw_observe::EventBus,
     id: u64,
@@ -112,7 +113,7 @@ impl Ending {
     /// `x-thinkwatch-error` 那个词表。
     ///
     /// **断在流中间的失败也带着用量** —— 上游已经为它计了费。
-    pub fn failed(mut self, source: &str, message: String) {
+    pub fn failed(mut self, source: &str, message: Msg) {
         let usage = self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
@@ -169,7 +170,9 @@ impl Drop for Ending {
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
                 source: "internal".to_string(),
-                message: "请求中断：网关内部错误".to_string(),
+                message: msg!(
+                    "gw.internal" => "The request was interrupted by an error inside the gateway."
+                ),
                 bytes: self.received(),
                 duration_ms: Some(self.duration_ms()),
                 usage,
@@ -252,7 +255,10 @@ mod tests {
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
         e.feed(MESSAGE_START);
-        e.failed("upstream", "流中断：上游断开了".into());
+        e.failed(
+            "upstream",
+            msg!("t.broke" => "the stream broke: the upstream disconnected"),
+        );
 
         let got = drain(&mut rx);
         assert_eq!(got.len(), 1, "{got:?}");
@@ -280,7 +286,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         Ending::new(bus.clone(), 7, Instant::now(), 1_000, None)
-            .failed("rate_limited", "`up` 限流了".into());
+            .failed("rate_limited", msg!("t.limited" => "`up` rate-limited us"));
 
         let got = drain(&mut rx);
         assert!(

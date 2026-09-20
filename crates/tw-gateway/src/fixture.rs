@@ -240,24 +240,24 @@ pub fn replay(f: &Fixture) -> Vec<String> {
         ($field:ident, $label:expr) => {
             if got.$field != f.expect.$field {
                 diffs.push(format!(
-                    "{}：录制时为 {:?}，当前为 {:?}",
+                    "{}: {:?} when recorded, {:?} now",
                     $label, f.expect.$field, got.$field
                 ));
             }
         };
     }
     cmp!(model, "model");
-    cmp!(input_tokens_estimate, "输入 token 估算");
-    cmp!(cache, "带缓存");
-    cmp!(tools, "带工具");
-    cmp!(tool_count, "工具数");
-    cmp!(image, "带图片");
-    cmp!(thinking, "扩展思考");
-    cmp!(stream, "流式");
-    cmp!(usage, "用量四项");
+    cmp!(input_tokens_estimate, "input token estimate");
+    cmp!(cache, "carries cache");
+    cmp!(tools, "carries tools");
+    cmp!(tool_count, "tool count");
+    cmp!(image, "carries images");
+    cmp!(thinking, "extended thinking");
+    cmp!(stream, "streaming");
+    cmp!(usage, "the four usage figures");
     cmp!(stop_reason, "stop_reason");
-    cmp!(tool_calls, "工具调用");
-    cmp!(error_kind, "错误分类");
+    cmp!(tool_calls, "tool calls");
+    cmp!(error_kind, "error class");
     diffs
 }
 
@@ -332,11 +332,11 @@ mod tests {
             .replace("\"usage\":{\"output_tokens\":30}", "\"usage\":{}");
         let d = replay(&f);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert!(d[0].contains("用量四项"), "{d:?}");
+        assert!(d[0].contains("the four usage figures"), "{d:?}");
         // **差异要说清「录的是什么、现在是什么」** —— 只说「不一致」
         // 的话，看的人还得自己去翻
         assert!(
-            d[0].contains("录制时为") && d[0].contains("当前为"),
+            d[0].contains("when recorded") && d[0].contains("now"),
             "{}",
             d[0]
         );

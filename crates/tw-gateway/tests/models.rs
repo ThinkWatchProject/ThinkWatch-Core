@@ -227,7 +227,10 @@ async fn a_disabled_upstream_takes_no_requests_and_lists_nothing() {
     let (status, body) = ask(gw, "shared").await;
     assert_eq!(status, 500, "{body}");
     let msg = body["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("已停用") && msg.contains("official"), "{msg}");
+    assert!(
+        msg.contains("disabled") && msg.contains("official"),
+        "{msg}"
+    );
 }
 
 #[tokio::test]
@@ -279,7 +282,7 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
     assert_eq!(status, 400, "{body}");
     let msg = body["error"]["message"].as_str().unwrap();
     assert!(
-        msg.contains("official-only") && msg.contains("relay 未提供此模型"),
+        msg.contains("official-only") && msg.contains("relay does not offer this model"),
         "{msg}"
     );
 
@@ -287,5 +290,5 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
     let (status, body) = ask(gw, "nobody-has-this").await;
     assert_eq!(status, 400, "{body}");
     let msg = body["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("没有上游提供模型"), "{msg}");
+    assert!(msg.contains("No upstream serves model"), "{msg}");
 }

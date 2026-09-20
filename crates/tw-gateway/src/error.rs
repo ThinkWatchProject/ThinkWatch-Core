@@ -7,6 +7,9 @@
 
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use tw_types::Msg;
+#[cfg(test)]
+use tw_types::msg;
 
 /// 失败源。分类的意义在于**用户能看出该去哪儿修**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,19 +127,41 @@ impl Dialect {
 #[derive(Debug)]
 pub struct GatewayError {
     pub source: Source,
-    pub message: String,
+    /// 为什么失败。**发给 AI 客户端的是 `detail.text`**（它们只认字符串），
+    /// 界面拿 `detail.code` 去自己的词表里找句子。见 [`tw_types::Msg`]。
+    pub detail: Msg,
     /// 用哪种方言的形状回。**认证失败时还不知道方言**（key 就是没认出
     /// 来），所以它有默认值而不是必填。
     pub dialect: Dialect,
 }
 
 impl GatewayError {
-    pub fn new(source: Source, message: impl Into<String>) -> Self {
+    pub fn new(source: Source, detail: Msg) -> Self {
         Self {
             source,
-            message: message.into(),
+            detail,
             dialect: Dialect::default(),
         }
+    }
+
+    /// 给人看的那句话。
+    pub fn message(&self) -> &str {
+        &self.detail.text
+    }
+
+    /// 在原因后面补上尝试过哪几家上游。
+    ///
+    /// **码不变，补的是同一条消息的细节。**界面照 `code` 说它自己那句话，
+    /// 需要时从 `attempts` 参数里取这份链路；只读字符串的客户端拿到的是
+    /// 补过的 `text`。
+    pub fn with_attempts(mut self, attempts: &[String]) -> Self {
+        if attempts.is_empty() {
+            return self;
+        }
+        let chain = attempts.join(" → ");
+        self.detail.text = format!("{} (tried: {chain})", self.detail.text);
+        self.detail.args.insert("attempts".into(), chain);
+        self
     }
     /// 认出客户端之后补上方言。**忘了调只会退回 Anthropic 形状**，
     /// 那是个安全的默认，不是一个静默的错误。
@@ -144,23 +169,23 @@ impl GatewayError {
         self.dialect = d;
         self
     }
-    pub fn rate_limited(m: impl Into<String>) -> Self {
-        Self::new(Source::RateLimited, m)
+    pub fn rate_limited(detail: Msg) -> Self {
+        Self::new(Source::RateLimited, detail)
     }
-    pub fn denied(m: impl Into<String>) -> Self {
-        Self::new(Source::Denied, m)
+    pub fn denied(detail: Msg) -> Self {
+        Self::new(Source::Denied, detail)
     }
-    pub fn auth(m: impl Into<String>) -> Self {
-        Self::new(Source::Auth, m)
+    pub fn auth(detail: Msg) -> Self {
+        Self::new(Source::Auth, detail)
     }
-    pub fn config(m: impl Into<String>) -> Self {
-        Self::new(Source::Config, m)
+    pub fn config(detail: Msg) -> Self {
+        Self::new(Source::Config, detail)
     }
-    pub fn upstream(m: impl Into<String>) -> Self {
-        Self::new(Source::Upstream, m)
+    pub fn upstream(detail: Msg) -> Self {
+        Self::new(Source::Upstream, detail)
     }
-    pub fn request(m: impl Into<String>) -> Self {
-        Self::new(Source::Request, m)
+    pub fn request(detail: Msg) -> Self {
+        Self::new(Source::Request, detail)
     }
 }
 
@@ -171,7 +196,7 @@ impl GatewayError {
     /// 客户端看到的是一个**戛然而止的流**，而截断和「答完了」在 SSE
     /// 里长得一模一样。
     pub fn sse_frame(&self) -> String {
-        let msg = format!("[ThinkWatch] {}", self.message);
+        let msg = format!("[ThinkWatch] {}", self.detail.text);
         let data = match self.dialect {
             Dialect::Anthropic => serde_json::json!({
                 "type": "error",
@@ -200,7 +225,7 @@ impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         // `[ThinkWatch]` 前缀不是装饰。没有它，用户看到一个 401 会先去
         // 查上游的密钥 —— 而问题在中间这一层。
-        let msg = format!("[ThinkWatch] {}", self.message);
+        let msg = format!("[ThinkWatch] {}", self.detail.text);
         let body = match self.dialect {
             Dialect::Anthropic => serde_json::json!({
                 "type": "error",
@@ -253,7 +278,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_auth_failure_is_401_and_says_who_rejected_it() {
-        let (status, slug, json) = body_of(GatewayError::auth("密钥不对")).await;
+        let (status, slug, json) =
+            body_of(GatewayError::auth(msg!("t.auth" => "the key is wrong"))).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(slug, "auth");
         // 客户端解析的是 Anthropic 的形状
@@ -270,7 +296,10 @@ mod tests {
     #[tokio::test]
     async fn upstream_failures_are_502_not_500() {
         // 500 会让人怀疑我们；502 说清楚是上游那边。
-        let (status, slug, _) = body_of(GatewayError::upstream("连不上")).await;
+        let (status, slug, _) = body_of(GatewayError::upstream(
+            msg!("t.upstream" => "cannot connect"),
+        ))
+        .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(slug, "upstream");
     }
@@ -279,12 +308,12 @@ mod tests {
     async fn each_source_maps_to_its_own_status_and_slug() {
         for (e, want_status, want_slug) in [
             (
-                GatewayError::config("x"),
+                GatewayError::config(msg!("t.x" => "x")),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "config",
             ),
             (
-                GatewayError::request("x"),
+                GatewayError::request(msg!("t.x" => "x")),
                 StatusCode::BAD_REQUEST,
                 "request",
             ),

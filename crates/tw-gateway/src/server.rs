@@ -15,6 +15,7 @@ use crate::auth::key_eq;
 use crate::error::GatewayError;
 use crate::forward;
 use crate::health::Health;
+use tw_types::msg;
 
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
 /// 客户端打不爆内存。
@@ -58,20 +59,18 @@ pub fn client_for_provider(
         }
         name => {
             let proxy = cfg.proxies.iter().find(|x| x.name == name).ok_or_else(|| {
-                // 用 concat! 而不是反斜杠续行：续行后面那行的缩进会
-                // 原样进字符串，而错误信息里冒出一串空格没人会注意到。
-                // 今天已经犯过一次了（还没有配置任何上游那条）。
-                GatewayError::config(format!(
-                    concat!(
-                        "上游「{}」使用的代理「{}」未在 proxies 中定义，",
-                        "内置选项只有 direct 和 system"
-                    ),
-                    p.name, name
+                GatewayError::config(msg!(
+                    "gw.config.proxy_undefined", upstream = p.name.clone(), proxy = name =>
+                    "Upstream `{upstream}` uses proxy `{proxy}`, which is not defined under \
+                     `proxies`; the only built-in choices are direct and system."
                 ))
             })?;
-            let url = proxy
-                .url()
-                .map_err(|e| GatewayError::config(format!("无法读取代理「{name}」的密码：{e}")))?;
+            let url = proxy.url().map_err(|e| {
+                GatewayError::config(msg!(
+                    "gw.config.proxy_password", proxy = name, detail = e =>
+                    "The password for proxy `{proxy}` could not be read: {detail}"
+                ))
+            })?;
             match reqwest::Proxy::all(&url) {
                 Ok(px) => b = b.proxy(px),
                 Err(e) => {
@@ -81,21 +80,24 @@ pub fn client_for_provider(
                     if p.on_proxy_fail == tw_config::OnProxyFail::Direct {
                         tracing::warn!(
                             provider = %p.name, proxy = %name,
-                            "代理不可用，按 on_proxy_fail 设置改为直连：{e}"
+                            "proxy unusable, going direct as on_proxy_fail says: {e}"
                         );
                         b = b.no_proxy();
                     } else {
-                        return Err(GatewayError::config(format!(
-                            "上游「{}」的代理「{name}」不可用：{e}",
-                            p.name
+                        return Err(GatewayError::config(msg!(
+                            "gw.config.proxy_unusable", upstream = p.name.clone(), proxy = name, detail = e =>
+                            "Proxy `{proxy}`, used by upstream `{upstream}`, is unusable: {detail}"
                         )));
                     }
                 }
             }
         }
     }
-    b.build()
-        .map_err(|e| GatewayError::config(format!("无法创建 HTTP 客户端：{e}")))
+    b.build().map_err(|e| {
+        GatewayError::config(msg!(
+            "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
+        ))
+    })
 }
 
 /// 一次配置换入时**整块换掉**的那部分。
@@ -149,15 +151,20 @@ impl Runtime {
             };
         }
         let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
-            .map_err(|e| GatewayError::config(format!("listen.gateway.allow_from：{e}")))?;
+            .map_err(|e| {
+                GatewayError::config(msg!(
+                    "gw.config.allow_from", detail = e => "listen.gateway.allow_from: {detail}"
+                ))
+            })?;
         // 规则集编译一次，跟着运行时一起换 —— 它现在住在 config.yaml 的
         // `security.scan_rules` 里，所以「改了规则」和「改了别的配置」
         // 走同一条热重载路径。
         //
         // **用户写坏的那几条被跳过，其余照常工作**：一个因为配置写错就
         // 整个不工作的安全功能等于没有。但跳过要大声说出来。
-        let rules = tw_scan::rules::build(&config.security.scan_rules)
-            .map_err(|e| GatewayError::config(e.to_string()))?;
+        let rules = tw_scan::rules::build(&config.security.scan_rules).map_err(|e| {
+            GatewayError::config(msg!("gw.config.scan_rules", detail = e => "{detail}"))
+        })?;
         for w in &rules.warnings {
             tracing::warn!("{w}");
         }
@@ -295,9 +302,11 @@ const PROXY_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl AppState {
     pub fn new(config: tw_config::Config) -> Result<Self, GatewayError> {
-        let http = base_client_builder()
-            .build()
-            .map_err(|e| GatewayError::config(format!("无法创建 HTTP 客户端：{e}")))?;
+        let http = base_client_builder().build().map_err(|e| {
+            GatewayError::config(msg!(
+                "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
+            ))
+        })?;
         let limits = config.limits.clone();
         let pricing_config = config.pricing.clone();
         let price_assign = config.price_assign();
@@ -323,7 +332,7 @@ impl AppState {
                 Arc::new(tw_pricing::Table::builtin().unwrap_or_else(|e| {
                     // **加载不了不能挡住启动**：那时成本显示「未知」，
                     // 而转发照常
-                    tracing::warn!("内置价目表加载失败，所有请求的费用记为未知：{e}");
+                    tracing::warn!("the built-in price sheet failed to load; every request is recorded with an unknown cost: {e}");
                     tw_pricing::Table::empty()
                 })),
                 pricing_config,
@@ -380,7 +389,7 @@ impl AppState {
         let o = p
             .oauth
             .as_ref()
-            .ok_or_else(|| format!("上游「{}」未配置 OAuth", p.name))?;
+            .ok_or_else(|| format!("upstream `{}` has no OAuth configured", p.name))?;
         self.oauth_token(p, o, http).await
     }
 
@@ -398,7 +407,7 @@ impl AppState {
         let o = p
             .oauth
             .as_ref()
-            .ok_or_else(|| format!("上游「{}」未配置 OAuth", p.name))?;
+            .ok_or_else(|| format!("upstream `{}` has no OAuth configured", p.name))?;
         let got = self
             .oauth
             .invalidate_and_refresh(&p.name, o, http, sent_at)
@@ -446,9 +455,15 @@ impl AppState {
                 // **交出去就不管了。**写文件、存历史、防回环都在控制面，
                 // 而这里是转发路径 —— 它不能等一次磁盘写。
                 // 通道满 = 前一次还没写完
-                Some(tx) => tx.try_send(r).err().map(|_| "写回队列已满，本次未能写回"),
+                Some(tx) => tx
+                    .try_send(r)
+                    .err()
+                    .map(|_| "the write-back queue is full, so this rotation was not written back"),
                 // 控制面没起来：**只报不写**，而且要说清没写
-                None => Some("网关独立运行，没有配置管理器，无法写回"),
+                None => Some(
+                    "the gateway is running on its own, with no configuration manager, so this \
+                     rotation was not written back",
+                ),
             };
             // **换发的 refresh token 没写回才要说** —— 丢掉的是一份还没落盘、旧的已经作废的
             // 凭据。access token 没写回不要紧：下次启动拿 refresh token 再换一个就是
@@ -484,7 +499,7 @@ impl AppState {
             return;
         }
         if rejected {
-            tracing::warn!(provider, status, "上游拒绝了凭据");
+            tracing::warn!(provider, status, "the upstream rejected the credential");
         }
         self.bus.emit(tw_api::Event::AuthChanged {
             id: self.bus.next_id(),
@@ -646,7 +661,10 @@ impl AppState {
         if !first {
             return;
         }
-        tracing::warn!(provider, "OAuth 凭据已失效，需要重新登录：{e}");
+        tracing::warn!(
+            provider,
+            "the OAuth credential has expired and needs a new sign-in: {e}"
+        );
         self.bus.emit(tw_api::Event::CredentialExpired {
             id: self.bus.next_id(),
             provider: provider.to_string(),
@@ -702,7 +720,7 @@ impl AppState {
                 })
                 .unwrap_or(false);
             if changed {
-                tracing::warn!(provider, window = %w.window, "订阅额度已用完");
+                tracing::warn!(provider, window = %w.window, "the subscription quota is used up");
                 self.bus.emit(tw_api::Event::QuotaExhausted {
                     id: self.bus.next_id(),
                     provider: provider.to_string(),
@@ -721,11 +739,14 @@ impl AppState {
     /// 而那时他应该已经知道原因。
     pub fn report_rotation(&self, provider: &str, persisted: bool, detail: &str) {
         {
-            let mut told = self.rotation_told.lock().expect("锁未中毒");
+            let mut told = self.rotation_told.lock().expect("lock not poisoned");
             if persisted {
                 if !told.insert(provider.to_string()) {
                     // 这家的「已经帮你写回去了」说过了
-                    tracing::debug!(provider, "凭据再次轮换，已写回");
+                    tracing::debug!(
+                        provider,
+                        "the credential rotated again and was written back"
+                    );
                     return;
                 }
             } else {
@@ -737,13 +758,15 @@ impl AppState {
         if persisted {
             tracing::info!(
                 provider,
-                "token 端点换发了新的 refresh token，已写回 config.yaml"
+                "the token endpoint issued a new refresh token; it was written back to config.yaml"
             );
         } else {
             tracing::warn!(
                 provider,
                 detail,
-                "token 端点换发了新的 refresh token，但未能写回 config.yaml。重启前必须处理，否则该上游的请求将全部返回 401"
+                "the token endpoint issued a new refresh token and it could not be written back to \
+                 config.yaml; this has to be dealt with before a restart, or every request to this \
+                 upstream will come back 401"
             );
         }
         self.bus.emit(tw_api::Event::CredentialRotated {
@@ -911,9 +934,11 @@ impl AppState {
         query: Option<&str>,
     ) -> Result<(String, crate::auth::KeyPosition), GatewayError> {
         let Some((key, position)) = crate::auth::extract_key_with_position(headers, query) else {
-            return Err(GatewayError::auth(
-                "请求未携带网关密钥。请将 config.yaml 的 clients 中的网关密钥配置到客户端",
-            ));
+            return Err(GatewayError::auth(msg!(
+                "gw.auth.no_key" =>
+                "The request carried no gateway key. Configure the client with one of the gateway \
+                 keys under `clients` in config.yaml."
+            )));
         };
         let rt = self.rt.load();
         let found = rt.config.clients.iter().find(|c| key_eq(&c.key, &key));
@@ -921,16 +946,18 @@ impl AppState {
             // **停用的密钥要说清楚是停用了。**这一条和「密钥无效」不同：
             // 用户是自己停的，而把它说成无效会让他去查客户端配置 —— 那里
             // 什么问题都没有
-            Some(c) if c.disabled => Err(GatewayError::auth(format!(
-                "网关密钥「{}」已停用。在应用的密钥页启用它即可恢复",
-                c.name
+            Some(c) if c.disabled => Err(GatewayError::auth(msg!(
+                "gw.auth.key_disabled", key = c.name.clone() =>
+                "Gateway key `{key}` is disabled. Enable it on the app's keys page to use it again."
             ))),
             Some(c) => Ok((c.name.clone(), position)),
             // 不回显收到的 key，哪怕是打码的 —— 回显会让「猜密钥」
             // 这件事有了反馈信号。
-            None => Err(GatewayError::auth(
-                "网关密钥无效。请检查客户端配置中的密钥与 config.yaml 是否一致",
-            )),
+            None => Err(GatewayError::auth(msg!(
+                "gw.auth.key_invalid" =>
+                "The gateway key is not valid. Check that the key in the client's configuration \
+                 matches the one in config.yaml."
+            ))),
         }
     }
 }
@@ -985,37 +1012,49 @@ async fn ws_upgrade(
         client: client_name.clone(),
         ..Default::default()
     };
-    let decision = match rt
-        .engine
-        .route(&facts)
-        .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?
-    {
+    let decision = match rt.engine.route(&facts).map_err(|e| {
+        GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
+    })? {
         tw_engine::Outcome::Route(d) => d,
         tw_engine::Outcome::Deny { rule, reason } => {
-            tracing::info!(%rule, "按规则拒绝 WebSocket 升级");
-            return Err(GatewayError::denied(reason));
+            tracing::info!(%rule, "a rule denied the WebSocket upgrade");
+            return Err(GatewayError::denied(msg!(
+                "gw.route.denied", rule = rule, reason = reason =>
+                "Rule `{rule}` denied this request: {reason}"
+            )));
         }
     };
     let (alive, _) = state.health.filter(&decision.candidates);
     let Some(name) = alive.first().map(|s| s.to_string()) else {
-        return Err(GatewayError::config("没有可用的上游".to_string()));
+        return Err(GatewayError::config(msg!(
+            "gw.route.no_upstream_alive" => "No upstream is available."
+        )));
     };
     let Some(provider) = rt.config.providers.iter().find(|p| p.name == name) else {
-        return Err(GatewayError::config(format!("配置中不存在「{name}」")));
+        return Err(GatewayError::config(msg!(
+            "gw.route.upstream_missing", upstream = name.clone() =>
+            "`{upstream}` is not in the configuration."
+        )));
     };
     // **走代理的上游不代理 WS**，而且要明说。悄悄绕过用户配的代理，
     // 等于把他以为在代理后面的流量直接发出去
     if provider.proxy != tw_config::DIRECT {
-        return Err(GatewayError::config(format!(
-            "上游「{name}」配置了代理（{}），WebSocket 连接暂不支持经代理转发，仅支持直连的上游",
-            provider.proxy
+        return Err(GatewayError::config(msg!(
+            "gw.ws.proxy_unsupported", upstream = name.clone(), proxy = provider.proxy.clone() =>
+            "Upstream `{upstream}` goes through proxy `{proxy}`. WebSocket connections are not \
+             forwarded through a proxy yet; only directly connected upstreams are."
         )));
     }
     let http = rt.clients.get(&name).unwrap_or(&state.http);
     let upstream_headers = state
         .headers_for(provider, http, Some(&client_name))
         .await
-        .map_err(|e| GatewayError::config(format!("无法获取上游「{name}」的凭据：{e}")))?;
+        .map_err(|e| {
+            GatewayError::config(msg!(
+                "gw.credentials.failed", upstream = name.clone(), detail = e =>
+                "The credential for upstream `{upstream}` could not be obtained: {detail}"
+            ))
+        })?;
     let url = crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref());
     let id = state.bus.next_id();
     state.bus.emit(tw_api::Event::RequestStarted {
@@ -1112,9 +1151,9 @@ async fn list_models(
 ) -> Result<Response, GatewayError> {
     let rt = state.runtime();
     if !rt.allow.allows(peer.ip()) {
-        return Err(GatewayError::auth(format!(
-            "{} 不在允许的来源地址中",
-            peer.ip()
+        return Err(GatewayError::auth(msg!(
+            "gw.auth.source_not_allowed", peer = peer.ip() =>
+            "{peer} is not among the allowed source addresses."
         )));
     }
     let (client, position) = state.identify(&headers, query.as_deref())?;
@@ -1163,9 +1202,9 @@ async fn get_model(
 ) -> Result<Response, GatewayError> {
     let rt = state.runtime();
     if !rt.allow.allows(peer.ip()) {
-        return Err(GatewayError::auth(format!(
-            "{} 不在允许的来源地址中",
-            peer.ip()
+        return Err(GatewayError::auth(msg!(
+            "gw.auth.source_not_allowed", peer = peer.ip() =>
+            "{peer} is not among the allowed source addresses."
         )));
     }
     let (client, position) = state.identify(&headers, query.as_deref())?;
@@ -1182,7 +1221,10 @@ async fn get_model(
     if !catalog.is_empty() && !catalog.admits(&model, Some(&shape.protocols()), allow.as_deref()) {
         return Err(GatewayError::new(
             crate::error::Source::Request,
-            format!("不存在模型 {model}，可用模型请参见 GET /v1/models"),
+            msg!(
+                "gw.model.unknown", model = model.clone() =>
+                "There is no model {model}. GET /v1/models lists the models that are available."
+            ),
         ));
     }
     let now = now_ms() / 1000;
@@ -1219,9 +1261,10 @@ async fn passthrough(
     if !rt.allow.allows(peer.ip()) {
         return Err(GatewayError::new(
             crate::error::Source::Auth,
-            format!(
-                "{} 不在允许的来源地址中。请修改 listen.gateway.allow_from，或将 bind 改为 loopback",
-                peer.ip()
+            msg!(
+                "gw.auth.source_not_allowed_hint", peer = peer.ip() =>
+                "{peer} is not among the allowed source addresses. Change \
+                 listen.gateway.allow_from, or set bind to loopback."
             ),
         ));
     }
@@ -1281,7 +1324,7 @@ async fn passthrough(
     .await;
     if let Some(end) = ending.take() {
         match &result {
-            Err(e) => end.failed(e.source.slug(), e.message.clone()),
+            Err(e) => end.failed(e.source.slug(), e.detail.clone()),
             // 成功的路径都把结局交给了响应体，**走到这里是漏交了**。那也只能
             // 按拿到的状态码报结束 —— 不能让它掉在地上，被记成一次取消
             Ok(resp) => end.finished(resp.status().as_u16()),
@@ -1384,7 +1427,7 @@ async fn pipeline(
                     probe: kind.slug().to_string(),
                     at_ms: now_ms(),
                 });
-                tracing::debug!(client = %client_name, kind = kind.slug(), "本地应答");
+                tracing::debug!(client = %client_name, kind = kind.slug(), "answered locally");
                 return Ok(local_answer(kind, &body));
             }
             // `route` 交给规则处理：打一个标记让 `when: { intent: ... }`
@@ -1402,9 +1445,10 @@ async fn pipeline(
     // 因为「一个 provider 都没有」时任何路由结果都是空的，而那条错误
     // 说不清下一步。
     if rt.config.providers.is_empty() {
-        return Err(GatewayError::config(concat!(
-            "尚未配置任何上游。请在 ThinkWatch Lite 中添加上游，",
-            "或在 config.yaml 的 providers 中添加"
+        return Err(GatewayError::config(msg!(
+            "gw.config.no_upstreams" =>
+            "No upstream is configured yet. Add one in ThinkWatch Lite, or under `providers` in \
+             config.yaml."
         )));
     }
 
@@ -1443,33 +1487,36 @@ async fn pipeline(
             if !catalog.admits(&facts.model, servable.as_deref(), allow.as_deref()) {
                 // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
                 // 该去改的地方不一样
-                let msg = if catalog.providers_for(&facts.model).is_empty() {
-                    format!(
-                        "没有上游提供模型 {}，可用模型请参见 GET /v1/models",
-                        facts.model
+                let why = if catalog.providers_for(&facts.model).is_empty() {
+                    msg!(
+                        "gw.model.no_upstream", model = facts.model.clone() =>
+                        "No upstream serves model {model}. GET /v1/models lists the models that \
+                         are available."
                     )
                 } else {
-                    format!(
-                        "网关密钥「{client_name}」无权使用模型 {}，可用模型请参见 GET /v1/models",
-                        facts.model
+                    msg!(
+                        "gw.model.not_allowed", key = client_name.clone(), model = facts.model.clone() =>
+                        "Gateway key `{key}` may not use model {model}. GET /v1/models lists the \
+                         models that are available."
                     )
                 };
-                return Err(GatewayError::new(crate::error::Source::Request, msg));
+                return Err(GatewayError::new(crate::error::Source::Request, why));
             }
         }
     }
 
-    let mut decision = match rt
-        .engine
-        .route(&facts)
-        .map_err(|e| GatewayError::config(format!("路由失败：{e}")))?
-    {
+    let mut decision = match rt.engine.route(&facts).map_err(|e| {
+        GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
+    })? {
         tw_engine::Outcome::Route(d) => d,
         tw_engine::Outcome::Deny { rule, reason } => {
             // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
             // 眼里没有区别。
-            tracing::info!(%rule, "按规则拒绝");
-            return Err(GatewayError::denied(reason));
+            tracing::info!(%rule, "a rule denied the request");
+            return Err(GatewayError::denied(msg!(
+                "gw.route.denied", rule = rule, reason = reason =>
+                "Rule `{rule}` denied this request: {reason}"
+            )));
         }
     };
     // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的。
@@ -1487,7 +1534,7 @@ async fn pipeline(
         return Err(serving.explain(&facts.model));
     }
     if !serving.skipped.is_empty() {
-        tracing::debug!(skipped = ?serving.skipped, model = %facts.model, "跳过无法服务该请求的候选上游");
+        tracing::debug!(skipped = ?serving.skipped, model = %facts.model, "skipping the candidates that cannot serve this request");
     }
     decision.candidates = serving.usable;
     // 策略组排序。**引擎给的是集合，顺序在这儿定** ——
@@ -1548,7 +1595,12 @@ async fn pipeline(
             client_limit,
         )
         .await
-        .map_err(|e| GatewayError::new(crate::error::Source::Overloaded, e.to_string()))?;
+        .map_err(|e| {
+            GatewayError::new(
+                crate::error::Source::Overloaded,
+                msg!("gw.overloaded", detail = e => "{detail}"),
+            )
+        })?;
 
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
     // 两条边界都在 `Health::filter` 里，理由写在那儿。
@@ -1556,7 +1608,7 @@ async fn pipeline(
     if fail_open {
         tracing::warn!(
             candidates = ?decision.candidates,
-            "所有候选上游均处于熔断状态，仍照常尝试（fail-open）"
+            "every candidate upstream is open-circuited; trying them anyway (fail-open)"
         );
     }
 
@@ -1644,9 +1696,10 @@ async fn pipeline(
     for name in &alive {
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == *name) else {
             // 校验时挡过一次，能到这儿说明配置在运行中被换过。
-            last_err = Some(GatewayError::config(format!(
-                "规则「{}」选中的上游「{name}」在配置中不存在",
-                decision.matched_rule
+            last_err = Some(GatewayError::config(msg!(
+                "gw.route.selected_upstream_missing",
+                rule = decision.matched_rule.clone(), upstream = name =>
+                "Rule `{rule}` selected upstream `{upstream}`, which is not in the configuration."
             )));
             continue;
         };
@@ -1660,11 +1713,20 @@ async fn pipeline(
             && let (Some(a), Some(p)) = (api, provider.effective_protocol())
             && a.protocol() != p
         {
-            let why = format!("{} 只能由 {} 格式的上游处理", uri.path(), a.slug());
+            let why = format!(
+                "{} can only be served by a {} upstream",
+                uri.path(),
+                a.slug()
+            );
             chain.push(hop_failed(&provider.name, why.clone(), hop_started));
             last_err = Some(GatewayError::new(
                 crate::error::Source::Request,
-                format!("{why}，上游「{}」是 {} 格式", provider.name, p.slug()),
+                msg!(
+                    "gw.route.protocol_mismatch",
+                    path = uri.path(), wanted = a.slug(),
+                    upstream = provider.name.clone(), got = p.slug() =>
+                    "{path} can only be served by a {wanted} upstream, and `{upstream}` is {got}."
+                ),
             ));
             continue;
         }
@@ -1674,18 +1736,26 @@ async fn pipeline(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let (effective_set, guard) =
-            match rt
-                .engine
-                .phase_two(&facts, &provider.name, &decision.set, &decision.guard)
-            {
-                Ok(tw_engine::Outcome2::Proceed(s, g)) => (s, g),
-                Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
-                    tracing::info!(%rule, provider = %provider.name, "阶段二拒绝");
-                    return Err(GatewayError::denied(reason));
-                }
-                Err(e) => return Err(GatewayError::config(format!("规则求值失败：{e}"))),
-            };
+        let (effective_set, guard) = match rt.engine.phase_two(
+            &facts,
+            &provider.name,
+            &decision.set,
+            &decision.guard,
+        ) {
+            Ok(tw_engine::Outcome2::Proceed(s, g)) => (s, g),
+            Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
+                tracing::info!(%rule, provider = %provider.name, "a phase-two rule denied the request");
+                return Err(GatewayError::denied(msg!(
+                    "gw.route.denied", rule = rule, reason = reason =>
+                    "Rule `{rule}` denied this request: {reason}"
+                )));
+            }
+            Err(e) => {
+                return Err(GatewayError::config(msg!(
+                    "gw.route.rule_failed", detail = e => "A rule could not be evaluated: {detail}"
+                )));
+            }
+        };
         // 方言互转。**同格式时是 None，这一整段零成本**
         let client_dialect = api.map(|a| a.dialect());
         let target = crate::translate::plan(api, generates, provider.effective_protocol());
@@ -1757,16 +1827,20 @@ async fn pipeline(
                         // 转换不了就换下一家：同格式的上游可能还在后面
                         let why = match other {
                             Some(Err(rej)) => rej.0.clone(),
-                            _ => "请求体不是合法的 JSON".to_string(),
+                            _ => "the request body is not valid JSON".to_string(),
                         };
                         chain.push(hop_failed(
                             &provider.name,
-                            format!("无法转换为 {} 格式：{why}", dialect.slug()),
+                            format!("could not be converted to {}: {why}", dialect.slug()),
                             hop_started,
                         ));
                         last_err = Some(GatewayError::new(
                             crate::error::Source::Request,
-                            format!("无法转换为上游「{}」的格式：{why}", provider.name),
+                            msg!(
+                                "gw.convert.failed", upstream = provider.name.clone(), detail = why =>
+                                "The request could not be converted to the format upstream \
+                                 `{upstream}` speaks: {detail}"
+                            ),
                         ));
                         continue;
                     }
@@ -1857,18 +1931,18 @@ async fn pipeline(
                 );
                 chain.push(hop_failed(
                     &provider.name,
-                    format!("无法获取凭据：{e}"),
+                    format!("the credential could not be obtained: {e}"),
                     hop_started,
                 ));
-                last_err = Some(GatewayError::config(format!(
-                    "无法获取上游「{}」的凭据：{e}",
-                    provider.name
+                last_err = Some(GatewayError::config(msg!(
+                    "gw.credentials.failed", upstream = provider.name.clone(), detail = e =>
+                    "The credential for upstream `{upstream}` could not be obtained: {detail}"
                 )));
                 continue;
             }
         };
         let url = forward::upstream_url(&provider.base_url, &path, upstream_query.as_deref());
-        let method = reqwest::Method::from_bytes(b"POST").expect("POST 是合法方法");
+        let method = reqwest::Method::from_bytes(b"POST").expect("POST is a valid method");
 
         tracing::debug!(
             client = %client_name,
@@ -1877,7 +1951,7 @@ async fn pipeline(
             group = ?decision.via_group,
             url = %tw_secret::redact_url(&url),
             attempt = attempts.len(),
-            "转发"
+            "forwarding"
         );
 
         let required = target
@@ -1928,7 +2002,7 @@ async fn pipeline(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::debug!(provider = %provider.name, "上游返回 401，换 token 失败：{e}")
+                    tracing::debug!(provider = %provider.name, "the upstream answered 401 and the token could not be renewed: {e}")
                 }
             }
         }
@@ -1956,9 +2030,15 @@ async fn pipeline(
                 // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
                 // 坏了」而不是「该退避了」，而它们该做的事完全不同。
                 last_err = Some(if r.status() == 429 {
-                    GatewayError::rate_limited(format!("上游「{}」触发限流", provider.name))
+                    GatewayError::rate_limited(msg!(
+                        "gw.upstream.rate_limited", upstream = provider.name.clone() =>
+                        "Upstream `{upstream}` rate-limited the request."
+                    ))
                 } else {
-                    GatewayError::upstream(format!("上游「{}」返回 {}", provider.name, r.status()))
+                    GatewayError::upstream(msg!(
+                        "gw.upstream.status", upstream = provider.name.clone(), status = r.status().as_u16() =>
+                        "Upstream `{upstream}` answered {status}."
+                    ))
                 });
                 continue;
             }
@@ -1991,7 +2071,11 @@ async fn pipeline(
                 // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                 state.check_proxy(&provider.proxy);
                 let err = forward::map_reqwest_error(e);
-                chain.push(hop_failed(&provider.name, err.message.clone(), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    err.message().to_string(),
+                    hop_started,
+                ));
                 last_err = Some(err);
                 continue;
             }
@@ -2014,13 +2098,15 @@ async fn pipeline(
     });
 
     let (Some(upstream), Some(provider)) = (upstream, used) else {
-        let mut err = last_err.unwrap_or_else(|| GatewayError::config("没有可用的上游"));
+        let mut err = last_err.unwrap_or_else(|| {
+            GatewayError::config(msg!("gw.route.no_upstream_alive" => "No upstream is available."))
+        });
         // **尝试链要进客户端看到的那条错误**，不只进我们的事件流 ——
         // 用户看的是他自己终端里的报错。一条说「试过 A → B → C 都不行」
         // 的错误，和一条只说「503」的错误，是两种产品：前者说明我们替
         // 他做了工作，后者让他以为我们什么都没干。
         if attempts.len() > 1 {
-            err.message = format!("{}（已尝试：{}）", err.message, attempts.join(" → "));
+            err = err.with_attempts(&attempts);
         }
         // 失败也必须有结局。少了它，UI 上那一行会永远停在「进行中」——
         // 而「一直转圈」比「明确失败」更让人怀疑是我们卡住了。它由
@@ -2031,7 +2117,7 @@ async fn pipeline(
     if attempts.len() > 1 {
         tracing::info!(
             chain = %attempts.join(" → "),
-            "故障转移：最终由 {} 响应",
+            "failed over; {} answered in the end",
             provider.name
         );
     }
@@ -2078,7 +2164,9 @@ async fn pipeline(
     //
     // **结局跟着流走，而不是只写在流的末尾。**客户端中途走掉时，末尾的
     // 代码一行都不会执行，而上游已经为这次请求计了费（见 `crate::ending`）。
-    let mut ending = ending.take().expect("发出开始事件时已写入");
+    let mut ending = ending
+        .take()
+        .expect("written when the start event was emitted");
     ending.responded(status.as_u16());
     let chunks = upstream.bytes_stream();
     // **中途断掉不能只是让流消失。**首字节已经发出去了，状态码和响应头
@@ -2242,12 +2330,16 @@ async fn pipeline(
                             if blocked {
                                 tracing::warn!(
                                     provider = %wall_provider, tool = %v.tool, rule = %v.rule,
-                                    "已切断响应流：上游返回了高危工具调用"
+                                    "cut the response stream: the upstream returned a dangerous tool call"
                                 );
                                 cut = Some((
-                                    GatewayError::denied(format!(
-                                        "上游「{}」（非官方端点）返回的 {} 调用命中规则「{}」（{}），已切断响应",
-                                        wall_provider, v.tool, v.rule, v.why
+                                    GatewayError::denied(msg!(
+                                        "gw.toolcall.cut",
+                                        upstream = wall_provider.clone(), tool = v.tool.clone(),
+                                        rule = v.rule.clone(), why = v.why.clone() =>
+                                        "The {tool} call returned by upstream `{upstream}` (an \
+                                         unofficial endpoint) matched rule `{rule}` ({why}), so \
+                                         the response was cut off."
                                     )),
                                     v.safe_prefix,
                                 ));
@@ -2345,16 +2437,19 @@ async fn pipeline(
                 //
                 // `source` 用这个错误自己的：上游断了是 `upstream`，被
                 // 防火墙切断是 `denied` —— 后者不是上游坏了，是策略拦的。
-                ending.failed(err.source.slug(), format!("响应流中断：{}", err.message));
+                // 码保持不变，只在句子前面点明它断在流里 —— 界面认的是码
+                let mut why = err.detail.clone();
+                why.text = format!("the response stream broke: {}", why.text);
+                ending.failed(err.source.slug(), why);
                 if let Some(c) = back.as_mut() {
                     // 转换过的流按客户端的格式收尾
-                    yield Ok(Bytes::from(c.fail(&format!("[ThinkWatch] {}", err.message))));
+                    yield Ok(Bytes::from(c.fail(&format!("[ThinkWatch] {}", err.message()))));
                 } else if let (true, Some(s)) = (collect, session.as_ref()) {
                     // 要收齐的整包一个字节都还没发：按客户端的格式回一个错误体
                     yield Ok(Bytes::from(tw_dialect::convert::error_body(
                         s.client,
                         502,
-                        &format!("[ThinkWatch] {}", err.message),
+                        &format!("[ThinkWatch] {}", err.message()),
                     )));
                 } else if is_sse && session.is_none() {
                     yield Ok(Bytes::from(err.sse_frame()));
@@ -2405,20 +2500,20 @@ pub async fn seed_latency(state: &AppState) {
         let hop = match crate::l1::hop_for(&rt.config, p) {
             Ok(h) => h,
             Err(why) => {
-                tracing::debug!(provider = %name, %why, "该上游无法进行链路测速，不补充延迟样本");
+                tracing::debug!(provider = %name, %why, "this upstream cannot be link-tested, so no latency sample is seeded");
                 continue;
             }
         };
         let r = crate::l1::l1(&p.base_url, hop.as_ref()).await;
         if r.ok {
-            tracing::debug!(provider = %name, ms = r.total_ms, "以链路测速结果补充延迟样本");
+            tracing::debug!(provider = %name, ms = r.total_ms, "seeding a latency sample from the link test");
             state
                 .latency
                 .seed(&name, r.total_ms.min(u32::MAX as u64) as u32);
         } else {
             // **连都连不上的那家不垫。**它会因为「没样本」排在最后，
             // 而那正是对的
-            tracing::debug!(provider = %name, "链路测速无法连接，不补充延迟样本");
+            tracing::debug!(provider = %name, "the link test could not connect, so no latency sample is seeded");
         }
     }
 }
@@ -2454,7 +2549,7 @@ pub async fn serve_following_config(
             // 通知来了但地址没变（比如又改回去了）—— 原样重来
             continue;
         }
-        tracing::info!(from = %next, to = %want, "监听地址已变化，重建监听器");
+        tracing::info!(from = %next, to = %want, "the listen address changed; rebuilding the listener");
         next = want;
     }
 }
@@ -2469,9 +2564,9 @@ async fn serve_once(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual = listener.local_addr()?;
     if !state.runtime().allow.is_empty() {
-        tracing::info!(%actual, "网关已开始监听（启用来源地址白名单）");
+        tracing::info!(%actual, "the gateway is listening (source allow-list in effect)");
     } else {
-        tracing::info!(%actual, "网关已开始监听");
+        tracing::info!(%actual, "the gateway is listening");
     }
     // `into_make_service_with_connect_info` 是拿到对端地址的唯一办法 ——
     // 少了它，来源白名单收到的永远是 unwrap 出来的默认值。
@@ -2626,13 +2721,14 @@ mod tests {
         // 用户十有八九是想写 `direct`。
         let cfg = tw_config::Config::default();
         let e = client_for_provider(&cfg, &provider_with_proxy("airport")).unwrap_err();
-        assert!(e.message.contains("airport"), "{}", e.message);
-        assert!(e.message.contains("direct"), "{}", e.message);
+        assert_eq!(e.detail.code, "gw.config.proxy_undefined");
+        assert_eq!(e.detail.arg("proxy"), "airport");
+        assert!(e.message().contains("direct"), "{}", e.message());
         // 行续接留下的缩进不该进错误信息
         assert!(
-            !e.message.contains("   "),
+            !e.message().contains("   "),
             "错误信息里有多余空格：{}",
-            e.message
+            e.message()
         );
     }
 
@@ -2696,7 +2792,8 @@ mod tests {
         let s = AppState::new(cfg()).unwrap();
         let e = s.identify(&HeaderMap::new(), None).unwrap_err();
         assert_eq!(e.source, crate::error::Source::Auth);
-        assert!(e.message.contains("clients"));
+        assert_eq!(e.detail.code, "gw.auth.no_key");
+        assert!(e.message().contains("clients"));
     }
 
     #[test]
@@ -2704,8 +2801,10 @@ mod tests {
         // 回显会给「猜密钥」这件事一个反馈信号，哪怕只是打码的。
         let s = AppState::new(cfg()).unwrap();
         let e = s.identify(&hdr("x-api-key", "tw-wrong"), None).unwrap_err();
-        assert!(!e.message.contains("tw-wrong"));
-        assert!(!e.message.contains("tw-wr"));
+        assert!(!e.message().contains("tw-wrong"));
+        assert!(!e.message().contains("tw-wr"));
+        // 参数里也不许有 —— 界面拿的是参数，不是那句话
+        assert!(!e.detail.args.values().any(|v| v.contains("tw-wr")));
     }
 
     #[test]

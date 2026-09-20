@@ -109,7 +109,7 @@ impl ConfigManager {
         })?;
         self.gateway
             .reload(cfg)
-            .map_err(|e| ApplyError::Build(e.message))?;
+            .map_err(|e| ApplyError::Build(e.message().to_string()))?;
         // 存刚刚生效的这一版。加上写入路径在写之前存的那一次，去重
         // 之后的效果是「每个存在过的版本各一条」，最新那条就是现在跑
         // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。

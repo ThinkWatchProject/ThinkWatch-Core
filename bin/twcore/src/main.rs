@@ -697,7 +697,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     let config_path = path.to_path_buf();
     rt.block_on(async move {
         let state = tw_gateway::AppState::new(cfg.clone())
-            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
         // 默认价目表：上次联网刷新存下的那份，或者内置的。自定义价目表已经
         // 随配置进了价格簿
         state.set_price_table(tw_control::pricing::load_table(&config_path));
