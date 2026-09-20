@@ -103,13 +103,13 @@ pub async fn probe(
             let ms = started.elapsed().as_millis() as u64;
             let msg = if e.is_timeout() {
                 format!(
-                    "{PROBE_TIMEOUT:?} 内没有响应。请检查接口地址，或确认该上游是否需要经代理访问"
+                    "no answer within {PROBE_TIMEOUT:?}. Check the endpoint address, or whether this upstream has to be reached through a proxy"
                 )
             } else if e.is_connect() {
-                "无法连接。请检查接口地址拼写和网络；如果该上游需要经代理访问，请先配置代理"
+                "could not connect. Check the spelling of the endpoint address and the network; if this upstream has to be reached through a proxy, configure the proxy first"
                     .to_string()
             } else {
-                format!("请求失败：{e}")
+                format!("the request failed: {e}")
             };
             return ProbeResult::fail(ms, proto_name, msg);
         }
@@ -125,7 +125,7 @@ pub async fn probe(
             ms,
             proto_name,
             format!(
-                "上游拒绝了该密钥（HTTP {}）。请检查密钥是否包含多余的空格，以及是否属于该上游",
+                "the upstream rejected this key (HTTP {}). Check the key for stray whitespace, and that it belongs to this upstream",
                 status.as_u16()
             ),
         );
@@ -138,7 +138,7 @@ pub async fn probe(
             // 拿到了 2xx 但读 body 失败 —— 归到「没认出」而不是「不提供」，
             // 因为它确实有这个接口。
             Err(e) => ModelList::Unrecognized {
-                sample: format!("读取响应体失败：{e}"),
+                sample: format!("the response body could not be read: {e}"),
             },
         }
     } else {

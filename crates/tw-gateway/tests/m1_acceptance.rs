@@ -297,7 +297,7 @@ async fn four_an_upstream_401_is_readable_and_you_can_tell_which_layer_it_came_f
     assert!(r.headers().get("x-thinkwatch-upstream").is_none());
     let t = r.text().await.unwrap();
     assert!(t.contains("[ThinkWatch]"), "{t}");
-    assert!(t.contains("网关密钥"), "得说清是哪把 key：{t}");
+    assert!(t.contains("gateway key"), "得说清是哪把 key：{t}");
 }
 
 /// 上游成功时也带这个头 —— 它是「谁服务的」而不是「谁出错了」。
@@ -353,5 +353,5 @@ async fn a_single_model_lookup_obeys_the_same_allow_list_as_the_list() {
     let r = get("/v1/models/claude-opus-4".into()).await;
     assert_ne!(r.status(), 200, "**限制了的模型单点还是查得到**");
     let body = r.text().await.unwrap();
-    assert!(body.contains("不存在模型"), "{body}");
+    assert!(body.contains("There is no model"), "{body}");
 }

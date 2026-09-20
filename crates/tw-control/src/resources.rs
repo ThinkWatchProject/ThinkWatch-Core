@@ -202,7 +202,7 @@ async fn test_provider(
     };
     let http = match tw_gateway::client_for_provider(&cfg, &p) {
         Ok(h) => h,
-        Err(e) => return Ok(Json(failed(e.message))),
+        Err(e) => return Ok(Json(failed(e.message().to_string()))),
     };
     // OAuth 的 token：新填的那份只能用现成的 access token；沿用原来那份时走网关，
     // **按原来的名字换** —— 缓存和轮换写回都认名字，而表单里可能刚改了名

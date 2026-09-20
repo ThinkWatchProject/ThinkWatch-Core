@@ -18,9 +18,11 @@ pub struct Cidr {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum CidrError {
-    #[error("「{0}」不是合法的 CIDR，应写成 192.168.0.0/16 的形式")]
+    #[error("`{0}` is not a valid CIDR; it is written as 192.168.0.0/16")]
     Malformed(String),
-    #[error("「{cidr}」的前缀长度 {prefix} 超出范围（IPv4 最大为 32，IPv6 最大为 128）")]
+    #[error(
+        "the prefix length {prefix} in `{cidr}` is out of range (at most 32 for IPv4, 128 for IPv6)"
+    )]
     BadPrefix { cidr: String, prefix: u8 },
 }
 
@@ -122,7 +124,7 @@ impl AllowList {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>(),
         )
-        .expect("内置私网段是合法的 CIDR")
+        .expect("the built-in private ranges are valid CIDRs")
     }
 
     pub fn allows(&self, ip: IpAddr) -> bool {

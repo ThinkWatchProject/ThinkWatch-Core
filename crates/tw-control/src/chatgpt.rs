@@ -723,7 +723,7 @@ fn client_for(s: &ControlState, name: &str, proxy: &str) -> Result<reqwest::Clie
         proxy: proxy.to_string(),
         ..Default::default()
     };
-    tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| e.message)
+    tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| e.message().to_string())
 }
 
 fn announce(
@@ -895,7 +895,7 @@ async fn send(
             StatusCode::BAD_GATEWAY,
             format!(
                 "无法连接 ChatGPT 后端：{}",
-                tw_gateway::forward::map_reqwest_error(e).message
+                tw_gateway::forward::map_reqwest_error(e).message()
             ),
         )
     })

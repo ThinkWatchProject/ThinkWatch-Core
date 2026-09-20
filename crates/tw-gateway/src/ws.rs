@@ -32,6 +32,7 @@ use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::protocol::Message as UpMsg;
 
 use crate::server::AppState;
+use tw_types::{Msg, msg};
 
 /// `Option<WebSocketUpgrade>` 的替身。
 ///
@@ -127,9 +128,13 @@ pub async fn proxy(
         ) {
             Ok(r) => r,
             Err(e) => {
-                let why = format!("上游地址不是合法的 WebSocket 地址：{e}");
-                ending.failed("config", why.clone());
-                close_with(client, &why).await;
+                let why = msg!(
+                    "gw.ws.bad_url", detail = e =>
+                    "The upstream address is not a valid WebSocket address: {detail}"
+                );
+                let text = why.text.clone();
+                ending.failed("config", why);
+                close_with(client, &text).await;
                 return;
             }
         };
@@ -143,9 +148,13 @@ pub async fn proxy(
                 req.headers_mut().insert(n, v);
             }
             _ => {
-                let why = format!("上游的请求头「{name}」包含请求头中不允许的字符");
-                ending.failed("config", why.clone());
-                close_with(client, &why).await;
+                let why = msg!(
+                    "gw.ws.bad_header", header = name =>
+                    "The upstream header `{header}` contains characters a header may not carry."
+                );
+                let text = why.text.clone();
+                ending.failed("config", why);
+                close_with(client, &text).await;
                 return;
             }
         }
@@ -153,9 +162,13 @@ pub async fn proxy(
     let up = match dial(&upstream_url, req).await {
         Ok(x) => x,
         Err(e) => {
-            let why = format!("无法连接上游的 WebSocket：{e}");
-            ending.failed("upstream", why.clone());
-            close_with(client, &why).await;
+            let why = msg!(
+                "gw.ws.connect_failed", detail = e =>
+                "The upstream WebSocket could not be connected: {detail}"
+            );
+            let text = why.text.clone();
+            ending.failed("upstream", why);
+            close_with(client, &text).await;
             return;
         }
     };
@@ -206,10 +219,10 @@ async fn dial(
     };
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
-        .map_err(|e| format!("无法连接 {host}:{port}：{e}"))?;
+        .map_err(|e| format!("{host}:{port} could not be reached: {e}"))?;
     let io: Box<dyn Io> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| format!("{host} 不是有效的 TLS 主机名"))?;
+            .map_err(|_| format!("{host} is not a valid TLS host name"))?;
         let conn = tokio_rustls::TlsConnector::from(crate::l1::tls_config());
         Box::new(conn.connect(name, tcp).await.map_err(|e| e.to_string())?)
     } else {
@@ -232,9 +245,9 @@ enum End {
     /// 都算这一种** —— 一次会话就是由客户端结束的，那是正常收场
     Closed,
     /// 上游那边出错断了，或者写不过去了
-    Broke(String),
+    Broke(Msg),
     /// 上游返回了高危工具调用，被切断了
-    Cut(String),
+    Cut(Msg),
 }
 
 async fn pump(
@@ -286,7 +299,9 @@ async fn pump(
                     Message::Close(_) => break End::Closed,
                 };
                 if let Err(e) = u_tx.send(out).await {
-                    break End::Broke(format!("向上游发送数据失败：{e}"));
+                    break End::Broke(msg!(
+                "gw.ws.send_failed", detail = e => "Sending to the upstream failed: {detail}"
+            ));
                 }
             }
             // 上游 → 客户端：先还原占位符，再过工具墙
@@ -295,20 +310,29 @@ async fn pump(
                     Some(Ok(m)) => m,
                     // 上游把连接收掉了，没有关闭帧也算收场
                     None => break End::Closed,
-                    Some(Err(e)) => break End::Broke(format!("上游连接中断：{e}")),
+                    Some(Err(e)) => {
+                    break End::Broke(msg!(
+                        "gw.ws.upstream_broke", detail = e =>
+                        "The upstream connection broke: {detail}"
+                    ));
+                }
                 };
                 let out = match m {
                     UpMsg::Text(t) => {
                         let restored = tw_redact::redact::restore(t.as_str(), &p.ledger);
                         let hits = p.wall.feed(as_sse(&restored).as_bytes());
                         let mut deadly = false;
-                        let mut why = String::new();
+                        let mut why: Option<Msg> = None;
                         for h in &hits {
-                            if h.high && p.cut && !deadly {
-                                why = format!(
-                                    "上游「{}」（非官方端点）返回的 {} 调用命中规则「{}」（{}），已切断连接",
-                                    p.provider, h.tool, h.rule, h.why
-                                );
+                            if h.high && p.cut && why.is_none() {
+                                why = Some(msg!(
+                                    "gw.ws.toolcall_cut",
+                                    upstream = p.provider.clone(), tool = h.tool.clone(),
+                                    rule = h.rule.clone(), detail = h.why.clone() =>
+                                    "The {tool} call returned by upstream `{upstream}` (an \
+                                     unofficial endpoint) matched rule `{rule}` ({detail}), so \
+                                     the connection was cut."
+                                ));
                             }
                             deadly |= h.high && p.cut;
                             state.bus.emit(tw_api::Event::ToolCallFlagged {
@@ -327,9 +351,9 @@ async fn pump(
                             // **命中那一帧不发。**和 SSE 那条路同一条纪律：
                             // 先判断再转发，而不是发完再说
                             let _ = c_tx.send(Message::Text(
-                                "[ThinkWatch] 上游返回了高危工具调用，连接已切断".into(),
+                                "[ThinkWatch] the upstream returned a dangerous tool call; the connection was cut".into(),
                             )).await;
-                            break End::Cut(why);
+                            break End::Cut(why.expect("set on the same pass that set deadly"));
                         }
                         ending.count(restored.len());
                         Message::Text(restored.into())

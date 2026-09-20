@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
 
 use crate::error::GatewayError;
+use tw_types::msg;
 
 /// 这些头是「我们和客户端之间」的，不该转给上游。
 ///
@@ -147,7 +148,7 @@ pub fn apply_set(
     }
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
         // 解不开就别动。我们的解析器不认识的东西，上游可能完全认识。
-        tracing::warn!("请求体不是 JSON，跳过参数改写");
+        tracing::warn!("the request body is not JSON; skipping the parameter rewrites");
         return body.clone();
     };
     let Some(obj) = v.as_object_mut() else {
@@ -190,7 +191,9 @@ pub fn apply_set(
         if th {
             // 开启思考需要一个 budget，而我们没有一个合理的值可以编。
             // **只做「关掉」这一个方向** —— 那是降级场景真正需要的。
-            tracing::warn!("set.thinking: true 暂不支持（需要 budget_tokens），已忽略");
+            tracing::warn!(
+                "set.thinking: true is not supported yet (it needs budget_tokens); ignoring it"
+            );
         } else {
             match client {
                 Dialect::Anthropic => {
@@ -217,7 +220,9 @@ pub fn apply_set(
         Ok(b) => Bytes::from(b),
         // 序列化不该失败，但真失败了宁可发原文也不要发半个 body
         Err(e) => {
-            tracing::error!("改写后的请求体序列化失败，改为发送原始请求体：{e}");
+            tracing::error!(
+                "the rewritten request body could not be serialized; sending the original instead: {e}"
+            );
             body.clone()
         }
     }
@@ -237,24 +242,29 @@ pub fn gemini_path_with_model(path: &str, model: &str) -> String {
 pub fn map_reqwest_error(e: reqwest::Error) -> GatewayError {
     // 分类要能让人看出该去哪儿修。
     if e.is_timeout() {
-        GatewayError::upstream("上游响应超时")
+        GatewayError::upstream(msg!(
+            "gw.upstream.timeout" => "The upstream did not answer in time."
+        ))
     } else if e.is_connect() {
-        GatewayError::upstream(format!(
-            "无法连接上游，请检查接口地址、网络和代理设置：{}",
-            tw_secret::redact_url(e.url().map(|u| u.as_str()).unwrap_or(""))
+        GatewayError::upstream(msg!(
+            "gw.upstream.unreachable",
+            url = tw_secret::redact_url(e.url().map(|u| u.as_str()).unwrap_or("")) =>
+            "The upstream could not be reached at {url}. Check the endpoint address, the network \
+             and the proxy settings."
         ))
     } else {
-        GatewayError::upstream(format!("转发失败：{e}"))
+        GatewayError::upstream(msg!(
+            "gw.upstream.forward_failed", detail = e => "Forwarding failed: {detail}"
+        ))
     }
 }
 
 /// 请求体原样转发，只在这里做一次大小检查。
 pub fn check_body_size(body: &Bytes, max: usize) -> Result<(), GatewayError> {
     if body.len() > max {
-        return Err(GatewayError::request(format!(
-            "请求体大小为 {} 字节，超过上限 {} 字节",
-            body.len(),
-            max
+        return Err(GatewayError::request(msg!(
+            "gw.request.body_too_large", size = body.len(), max = max =>
+            "The request body is {size} bytes, over the {max}-byte limit."
         )));
     }
     Ok(())
@@ -478,7 +488,7 @@ mod tests {
     #[test]
     fn body_size_limit_reports_both_numbers() {
         let e = check_body_size(&Bytes::from(vec![0u8; 10]), 5).unwrap_err();
-        assert!(e.message.contains("10") && e.message.contains('5'));
+        assert!(e.message().contains("10") && e.message().contains('5'));
         assert!(check_body_size(&Bytes::from(vec![0u8; 5]), 5).is_ok());
     }
 }

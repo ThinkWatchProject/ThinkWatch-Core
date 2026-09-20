@@ -125,7 +125,7 @@ fn complete_tool_calls(v: &Value) -> Vec<(String, String)> {
         let name = v
             .get("name")
             .and_then(|x| x.as_str())
-            .unwrap_or("（未命名）")
+            .unwrap_or("(unnamed)")
             .to_string();
         out.push((name, input.to_string()));
     }
@@ -271,7 +271,7 @@ impl Wall {
                     let name = call
                         .get("name")
                         .and_then(|x| x.as_str())
-                        .unwrap_or("（未命名）")
+                        .unwrap_or("(unnamed)")
                         .to_string();
                     let args = call.get("args").map(|a| a.to_string()).unwrap_or_default();
                     self.check(&name, &args, safe_prefix, out);
@@ -425,7 +425,7 @@ impl Wall {
                 let name = call
                     .get("name")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("（未命名）")
+                    .unwrap_or("(unnamed)")
                     .to_string();
                 let args = call.get("args").map(|a| a.to_string()).unwrap_or_default();
                 self.check(&name, &args, safe_prefix, out);
@@ -441,7 +441,7 @@ impl Wall {
     fn open_call(&mut self, index: u64, name: Option<&Value>) {
         let name = name
             .and_then(|x| x.as_str())
-            .unwrap_or("（未命名）")
+            .unwrap_or("(unnamed)")
             .to_string();
         self.blocks.insert(index, (name, String::new()));
         self.tool_calls += 1;
@@ -510,9 +510,9 @@ impl Wall {
             self.fired.push(r.id.clone());
             out.push(Verdict {
                 rule: r.id.clone(),
-                why: format!("{}。这段文字会进入下一轮对话的上下文", r.why),
+                why: format!("{}. This text enters the context of the next turn", r.why),
                 high: false,
-                tool: "（响应正文）".into(),
+                tool: "(response text)".into(),
                 excerpt: excerpt(m.as_str()),
                 safe_prefix,
             });
@@ -836,8 +836,8 @@ mod tests {
         );
         assert_eq!(v.len(), 1, "{v:?}");
         assert!(!v[0].high, "提示注入不该切断响应");
-        assert_eq!(v[0].tool, "（响应正文）");
-        assert!(v[0].why.contains("下一轮"), "{}", v[0].why);
+        assert_eq!(v[0].tool, "(response text)");
+        assert!(v[0].why.contains("next turn"), "{}", v[0].why);
     }
 
     #[test]
