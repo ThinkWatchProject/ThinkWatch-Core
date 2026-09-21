@@ -581,6 +581,9 @@ pub struct Overview {
     /// 并发上限
     #[serde(default)]
     pub limits: LimitsView,
+    /// 日志留多久
+    #[serde(default)]
+    pub retention: RetentionView,
     /// 自定义价目表。默认价目表不在这里 —— 它的状态看 `/pricing`
     #[serde(default)]
     pub price_sheets: Vec<PriceSheetView>,
@@ -638,6 +641,21 @@ pub struct LimitsView {
     pub queue_depth: usize,
     /// 排太久还是要放弃
     pub queue_timeout_secs: u64,
+}
+
+/// 日志留多久。两个期限分开，因为正文和记录行的代价差三个数量级 ——
+/// 一条正文几十 KB，一行记录几百字节。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetentionView {
+    /// 请求和响应的正文留几天
+    pub body_days: u64,
+    /// 一行记录留几天
+    pub row_days: u64,
+    /// 正文总共最多占多少字节
+    pub body_max_bytes: u64,
+    /// 正文现在实际占了多少。**不是配置，是现状** —— 没有它，
+    /// 「2 GB 上限」是个用户无从判断松紧的数字
+    pub body_bytes_now: u64,
 }
 
 /// 三条防线。每条三态，而**「拦截」在每条上做的事不一样**，所以动词也
