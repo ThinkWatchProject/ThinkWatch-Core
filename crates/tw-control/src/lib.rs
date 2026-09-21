@@ -1086,11 +1086,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct Limit {
-    limit: Option<usize>,
-}
-
 /// 一张列表要的两样：看哪一段，最多几条。
 ///
 /// **时间窗是可选的，而且缺省不是「今天」。**聚合类的端点缺省到今天是
