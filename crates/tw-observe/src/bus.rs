@@ -108,6 +108,7 @@ mod tests {
         let b = EventBus::new();
         b.emit(tw_api::Event::RequestFinished {
             id: 1,
+            model: String::new(),
             status: 200,
             bytes: 0,
             duration_ms: 0,
@@ -122,6 +123,7 @@ mod tests {
         let mut rx = b.subscribe();
         b.emit(tw_api::Event::RequestFinished {
             id: 42,
+            model: String::new(),
             status: 200,
             bytes: 1,
             duration_ms: 2,
@@ -146,6 +148,7 @@ mod tests {
         for i in 0..(CAPACITY as u64 + 100) {
             b.emit(tw_api::Event::RequestFinished {
                 id: i,
+                model: String::new(),
                 status: 200,
                 bytes: 0,
                 duration_ms: 0,
@@ -167,6 +170,7 @@ mod tests {
         let mut c = b.subscribe();
         b.emit(tw_api::Event::RequestFinished {
             id: 9,
+            model: String::new(),
             status: 200,
             bytes: 0,
             duration_ms: 0,
