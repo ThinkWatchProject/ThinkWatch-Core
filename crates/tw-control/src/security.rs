@@ -313,15 +313,7 @@ async fn toggle_builtin(
             .any(|r| r.id == id)
             .then_some(true),
     }
-    .ok_or_else(|| {
-        fail(
-            StatusCode::NOT_FOUND,
-            msg!(
-                "security.unknown_rule", rule = id.clone() =>
-                "There is no built-in rule `{rule}`."
-            ),
-        )
-    })?;
+    .ok_or_else(|| unknown_rule(&id))?;
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
@@ -463,6 +455,16 @@ fn utf16_at(text: &str, byte: usize) -> usize {
 /// 名字给「只试这一条」用。**不会写进任何地方。**
 const TRIAL: &str = "trial";
 
+fn unknown_rule(id: &str) -> Fail {
+    fail(
+        StatusCode::NOT_FOUND,
+        msg!(
+            "security.unknown_rule", rule = id.to_string() =>
+            "There is no built-in rule `{rule}`."
+        ),
+    )
+}
+
 async fn test(
     State(s): State<ControlState>,
     Path(guard): Path<String>,
@@ -474,14 +476,19 @@ async fn test(
     let hits = match guard {
         Guard::Redact => {
             let trial;
-            let rules = match &req.pattern {
-                Some(p) => {
+            let rules = match (&req.pattern, &req.rule) {
+                (Some(p), _) => {
                     trial = tw_redact::rules::RuleSet::none()
                         .with_custom(TRIAL, p)
                         .map_err(bad_pattern)?;
                     &trial
                 }
-                None => rt.redact.as_ref(),
+                (None, Some(id)) => {
+                    let b = tw_redact::rules::builtin(id).ok_or_else(|| unknown_rule(id))?;
+                    trial = tw_redact::rules::RuleSet::only(&[b.id]);
+                    &trial
+                }
+                (None, None) => rt.redact.as_ref(),
             };
             // **按它在请求体里的样子找**，结论才和真的请求一致
             tw_redact::rules::scan_plain(&req.sample, rules)
@@ -501,8 +508,8 @@ async fn test(
         }
         Guard::Tools => {
             let trial;
-            let rules = match &req.pattern {
-                Some(p) => {
+            let rules = match (&req.pattern, &req.rule) {
+                (Some(p), _) => {
                     trial = tw_scan::rules::single(TRIAL, p, true).map_err(|e| {
                         fail(
                             StatusCode::BAD_REQUEST,
@@ -514,7 +521,11 @@ async fn test(
                     })?;
                     &trial
                 }
-                None => rt.tools.as_ref(),
+                (None, Some(id)) => {
+                    trial = tw_scan::rules::one_builtin(id).ok_or_else(|| unknown_rule(id))?;
+                    &trial
+                }
+                (None, None) => rt.tools.as_ref(),
             };
             // 和网关一样：**每条规则只报第一处**
             let mut out: Vec<tw_api::SecurityTestHit> = rules

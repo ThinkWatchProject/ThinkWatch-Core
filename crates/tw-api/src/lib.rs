@@ -2826,13 +2826,15 @@ fn yes() -> bool {
     true
 }
 
-/// 拿一段文本试一试。给了 `pattern` 就只试这一条正则，否则按现在启用的
-/// 全部规则。
+/// 拿一段文本试一试。给了 `pattern` 就只试这一条正则，给了 `rule` 就只试
+/// 这一条内置规则（停用着的也能试），都不给就按现在启用的全部规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityTestRequest {
     pub sample: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// 试出来的一处。

@@ -55,6 +55,8 @@ use tw_scan::rules::Rules;
 pub struct Verdict {
     /// 内置规则的 id，或者自定义规则的名字
     pub rule: String,
+    /// 英文名。自定义规则就是它的名字。**告诉客户端的那句话用它**，不用 id
+    pub name: String,
     pub custom: bool,
     /// 为什么值得看一眼（英文）。自定义规则是空的
     pub why: String,
@@ -553,6 +555,7 @@ impl Wall {
             self.fired.push(r.id.clone());
             out.push(Verdict {
                 rule: r.id.clone(),
+                name: r.name.clone(),
                 custom: r.custom,
                 why: r.why.clone(),
                 cut: r.high,

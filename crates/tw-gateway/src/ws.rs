@@ -334,9 +334,11 @@ async fn pump(
                                 why = Some(msg!(
                                     "gw.ws.toolcall_cut",
                                     upstream = p.provider.clone(), tool = h.tool.clone(),
-                                    rule = h.rule.clone(), detail = h.why.clone() =>
+                                    rule = h.rule.clone(), name = h.name.clone(),
+                                    detail = h.why.clone() =>
                                     "The {tool} call returned by upstream `{upstream}` matched \
-                                     rule `{rule}` ({detail}), so the connection was cut."
+                                     rule “{name}”{}, so the connection was cut.",
+                                    crate::server::because(&h.why)
                                 ));
                             }
                             deadly |= blocked;

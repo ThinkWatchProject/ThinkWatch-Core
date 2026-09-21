@@ -201,6 +201,16 @@ pub fn single(name: &str, pattern: &str, high: bool) -> Result<Rules, RuleError>
     })
 }
 
+/// 只有一条内置的危险命令规则。**不管它启用没有** —— 安全页上要能试一条
+/// 停用着的规则，再决定开不开。不是内置规则的 id 返回 `None`。
+pub fn one_builtin(id: &str) -> Option<Rules> {
+    let spec = builtin().dangerous.iter().find(|s| s.id == id)?;
+    Some(Rules {
+        rules: vec![compile(spec, "dangerous", false).expect("the built-in patterns compile")],
+        warnings: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

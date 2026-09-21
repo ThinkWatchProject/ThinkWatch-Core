@@ -2343,9 +2343,10 @@ async fn pipeline(
                                     GatewayError::denied(msg!(
                                         "gw.toolcall.cut",
                                         upstream = wall_provider.clone(), tool = v.tool.clone(),
-                                        rule = v.rule.clone(), why = v.why.clone() =>
+                                        rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
                                         "The {tool} call returned by upstream `{upstream}` \
-                                         matched rule `{rule}` ({why}), so the response was cut off."
+                                         matched rule “{name}”{}, so the response was cut off.",
+                                        because(&v.why)
                                     )),
                                     v.safe_prefix,
                                 ));
@@ -2455,9 +2456,10 @@ async fn pipeline(
                     denied = Some(GatewayError::denied(msg!(
                         "gw.toolcall.blocked",
                         upstream = wall_provider.clone(), tool = v.tool.clone(),
-                        rule = v.rule.clone(), why = v.why.clone() =>
+                        rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
                         "The {tool} call returned by upstream `{upstream}` matched rule \
-                         `{rule}` ({why}), so the response was withheld."
+                         “{name}”{}, so the response was withheld.",
+                        because(&v.why)
                     )));
                     break;
                 }
@@ -2716,6 +2718,16 @@ fn local_answer(kind: crate::clientprobe::ProbeKind, body: &Bytes) -> Response {
         axum::Json(crate::clientprobe::json_response(kind, body)),
     )
         .into_response()
+}
+
+/// 规则名后面那半句「为什么」。**自定义规则没有这一句**，那时整个括号都不要，
+/// 不留一对空括号。
+pub(crate) fn because(why: &str) -> String {
+    if why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({why})")
+    }
 }
 
 /// 一次工具调用命中写成事件。流式、整包、WebSocket 三条路共用 —— 字段写漏

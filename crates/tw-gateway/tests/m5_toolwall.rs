@@ -260,6 +260,11 @@ async fn a_custom_rule_that_says_cut_cuts() {
         !body.contains("namespace prod"),
         "自定义的切断规则没切：{body}"
     );
+    // 告诉客户端的那句话按规则名说；自定义规则没有「为什么」，不留一对空括号
+    assert!(
+        body.contains("matched rule “删除集群资源”, so the response was cut off"),
+        "{body}"
+    );
     let (cut, blocked, tool, rule) = flagged(&mut rx).await.expect("没发告警事件");
     assert!(cut && blocked);
     assert_eq!(tool, "Bash");
