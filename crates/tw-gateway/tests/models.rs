@@ -86,7 +86,6 @@ fn grouped(mut cfg: Config, order: &[&str]) -> Config {
         to: Some("pool".into()),
         set: None,
         deny: None,
-        guard: None,
     }])];
     cfg
 }
@@ -272,7 +271,6 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
         to: Some("relay".into()),
         set: None,
         deny: None,
-        guard: None,
     }])];
     let state = tw_gateway::AppState::new(cfg).unwrap();
     tw_gateway::models::refresh_all(&state).await;

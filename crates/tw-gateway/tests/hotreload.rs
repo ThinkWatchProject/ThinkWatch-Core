@@ -290,7 +290,6 @@ async fn a_connection_pool_survives_an_unrelated_edit() {
         to: Some("a".into()),
         set: None,
         deny: None,
-        guard: None,
     }])];
     state.reload(next).unwrap();
     ask(gw).await;
@@ -405,7 +404,6 @@ async fn an_unrelated_edit_does_not_blank_the_model_list() {
         to: Some("a".into()),
         set: None,
         deny: None,
-        guard: None,
     }])];
     state.reload(next).unwrap();
     let after = reqwest::Client::new()
@@ -469,7 +467,6 @@ async fn the_gate_is_only_rebuilt_when_the_limits_actually_change() {
         to: Some("a".into()),
         set: None,
         deny: None,
-        guard: None,
     }])];
     state.reload(same_limits).unwrap();
     assert!(Arc::ptr_eq(&g0, &state.gate()), "无关改动换掉了并发闸门");

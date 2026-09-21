@@ -79,7 +79,6 @@ fn anthropic(upstream: SocketAddr) -> Provider {
         protocol: Some(Protocol::Anthropic),
         // 手写清单让模型目录不为空 —— 准入只在目录不为空时才拦
         models: vec!["claude-sonnet-4-5".into()],
-        redact: Some(vec![]),
         ..Default::default()
     }
 }
@@ -145,7 +144,6 @@ async fn a_gemini_generate_content_call_is_forwarded_without_the_gateway_key() {
         base_url: format!("http://{up}"),
         key: Some("g-upstream".into()),
         protocol: Some(Protocol::Gemini),
-        redact: Some(vec![]),
         ..Default::default()
     })
     .await;

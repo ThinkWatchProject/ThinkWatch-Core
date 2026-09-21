@@ -11,7 +11,7 @@ description = "YAML config schema, loading, and validation"
 tw-engine = { workspace = true }
 tw-types = { workspace = true }
 tw-secret = { workspace = true }
-tw-redact = { workspace = true }
+regex = { workspace = true }
 tw-pricing = { workspace = true }
 # 凭据轮换要把一个标量写回 config.yaml。**span 补丁，不是
 # serde 往返** —— 往返会把用户的注释和排版全洗掉

@@ -117,11 +117,13 @@ pub struct Runtime {
     pub clients: std::collections::HashMap<String, reqwest::Client>,
     /// 来源白名单。空 = 全放行，而那只在 loopback 下成立。
     pub allow: crate::access::AllowList,
-    /// 工具调用防火墙的规则。
+    /// 出站脱敏的规则。
     ///
-    /// **和配置一起建、一起换**，而不是每个请求现读一次文件 —— 那是几十
-    /// 个正则的编译，摆在数据面上就是每个请求几毫秒的白付。
-    pub rules: Arc<tw_scan::rules::Rules>,
+    /// **和配置一起建、一起换**，而不是每个请求现编一次 —— 自定义规则是
+    /// 正则，摆在数据面上现编就是每个请求白付一次编译。
+    pub redact: Arc<tw_redact::rules::RuleSet>,
+    /// 工具调用审查的规则。同上。
+    pub tools: Arc<tw_scan::rules::Rules>,
 }
 
 impl Runtime {
@@ -156,24 +158,33 @@ impl Runtime {
                     "gw.config.allow_from", detail = e => "listen.gateway.allow_from: {detail}"
                 ))
             })?;
-        // 规则集编译一次，跟着运行时一起换 —— 它现在住在 config.yaml 的
-        // `security.scan_rules` 里，所以「改了规则」和「改了别的配置」
+        // 两项防护的规则编译一次，跟着运行时一起换 —— 它们住在
+        // config.yaml 的 `security` 里，所以「改了规则」和「改了别的配置」
         // 走同一条热重载路径。
         //
-        // **用户写坏的那几条被跳过，其余照常工作**：一个因为配置写错就
-        // 整个不工作的安全功能等于没有。但跳过要大声说出来。
-        let rules = tw_scan::rules::build(&config.security.scan_rules).map_err(|e| {
-            GatewayError::config(msg!("gw.config.scan_rules", detail = e => "{detail}"))
+        // 自定义规则的正则在配置校验时已经编过一次，这里再失败只可能是有人
+        // 绕过了校验，照样拒绝这份配置。认不出的内置规则 id 不拒绝：一条
+        // 内置规则将来可能改名，用户停用过它的那一行不该让整份配置失效
+        let sec = &config.security;
+        let (redact, unknown) = tw_redact::rules::RuleSet::build(
+            &sec.redact.enable,
+            &sec.redact.disable,
+            sec.redact.active_custom(),
+        )
+        .map_err(|e| GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}")))?;
+        let tools = tw_scan::rules::tool_rules(&sec.inspect_tools).map_err(|e| {
+            GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         })?;
-        for w in &rules.warnings {
-            tracing::warn!("{w}");
+        for id in unknown.iter().chain(&tools.warnings) {
+            tracing::warn!(rule = %id, "`{id}` is not the id of a built-in rule, so turning it on or off did nothing");
         }
         Ok(Self {
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
             clients,
             allow,
-            rules: Arc::new(rules),
+            redact: Arc::new(redact),
+            tools: Arc::new(tools),
         })
     }
 }
@@ -991,8 +1002,8 @@ pub fn router(state: AppState) -> Router {
 
 /// 接管一次 WebSocket 升级。
 ///
-/// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、`guard`、
-/// 熔断对它一样有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
+/// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、熔断对它一样
+/// 有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
 /// 每一帧上重新点一遍管线的保护。
 #[allow(clippy::too_many_arguments)]
 async fn ws_upgrade(
@@ -1080,8 +1091,12 @@ async fn ws_upgrade(
         None,
     );
     let provider = provider.clone();
-    let guard = decision.guard.clone();
-    let rules = rt.rules.clone();
+    let rules = crate::ws::Rules {
+        redact_mode: rt.config.security.redact.mode,
+        redact: rt.redact.clone(),
+        inspect_mode: rt.config.security.inspect_tools.mode,
+        tools: rt.tools.clone(),
+    };
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久
         let _live = live;
@@ -1093,7 +1108,6 @@ async fn ws_upgrade(
             url,
             upstream_headers,
             provider,
-            guard,
             rules,
             id,
             ending,
@@ -1648,21 +1662,19 @@ async fn pipeline(
         sink.clone(),
     ));
 
-    // 出站密钥检测（观察态）。**只看，不动** —— 换成占位符是
-    // 「拦截」态的事，而那要等那套完整的脱敏。
-    //
-    // 位置在这里是因为它要知道**发给了谁**：一把 key 发给官方和发给一个
-    // 中转站，是完全不同的两件事，而后者才是这条防线存在的理由。
-    if rt.config.security.redact.detects() {
-        for f in crate::leak::scan(&body) {
-            state.bus.emit(tw_api::Event::LeakSeen {
-                id,
-                provider: alive.first().map(|s| s.to_string()).unwrap_or_default(),
-                secret: f.kind,
-                masked: f.masked,
-                at_ms: now_ms(),
-            });
-        }
+    // 出站脱敏：按全局的规则看一遍客户端发来的原文。**观察档和拦截档报的
+    // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
+    // 那一跳的请求体可能是转换过格式的。
+    let redact_mode = rt.config.security.redact.mode;
+    let found = crate::guard::find(redact_mode, &rt.redact, &body);
+    if !found.is_empty() {
+        state.bus.emit(tw_api::Event::SecretsFound {
+            id,
+            provider: alive.first().map(|s| s.to_string()).unwrap_or_default(),
+            replaced: redact_mode.acts(),
+            items: crate::guard::items(&found),
+            at_ms: now_ms(),
+        });
     }
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
@@ -1686,8 +1698,8 @@ async fn pipeline(
     // 来源**。一个静默切换过的请求和一个一次就成的请求，在用户眼里
     // 应该是不同的。
     let mut attempts: Vec<String> = Vec::new();
-    // 成功那一次的脱敏账本。**必须是成功那一次的** —— 故障转移从官方切到
-    // 中转时，两次的脱敏规格不一样，拿错一本就还原不回来
+    // 成功那一次的脱敏账本。**必须是成功那一次的** —— 每一跳发出去的体可能
+    // 转换过格式，占位符按那一份的顺序编号
     let mut used_ledger = tw_redact::redact::Ledger::default();
     // 成功那一跳的转换。**必须是成功那一次的** —— 故障转移从 Anthropic 上游
     // 切到 OpenAI 上游时，两跳转成的格式不一样；直通时是 None
@@ -1744,13 +1756,8 @@ async fn pipeline(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let (effective_set, guard) = match rt.engine.phase_two(
-            &facts,
-            &provider.name,
-            &decision.set,
-            &decision.guard,
-        ) {
-            Ok(tw_engine::Outcome2::Proceed(s, g)) => (s, g),
+        let effective_set = match rt.engine.phase_two(&facts, &provider.name, &decision.set) {
+            Ok(tw_engine::Outcome2::Proceed(s)) => s,
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %provider.name, "a phase-two rule denied the request");
                 return Err(GatewayError::denied(msg!(
@@ -1900,27 +1907,9 @@ async fn pipeline(
             upstream_query = None;
         }
 
-        // 出站脱敏。**和阶段二在同一个位置，理由完全一样** ——
-        // 故障转移从官方切到中转的那一刻，正是最需要它的时刻，而那时
-        // 「该脱哪些」已经换了一套。
-        let (outbound, ledger) =
-            crate::guard::redact_outbound(rt.config.security.redact, provider, &guard, outbound);
-        if !ledger.is_empty() {
-            state.bus.emit(tw_api::Event::Redacted {
-                id,
-                provider: provider.name.clone(),
-                items: ledger
-                    .counts
-                    .iter()
-                    .map(|(k, secret, n)| tw_api::RedactedItem {
-                        kind: k.slug().to_string(),
-                        secret: secret.to_string(),
-                        count: *n as u64,
-                    })
-                    .collect(),
-                at_ms: now_ms(),
-            });
-        }
+        // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
+        // 格式）。规则是全局的，每一跳换掉的是同一批东西
+        let (outbound, ledger) = crate::guard::replace(redact_mode, &rt.redact, outbound);
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
@@ -2270,25 +2259,17 @@ async fn pipeline(
     // 以前非流式这一支根本不建审查器。代价有两条：观察档对非流式
     // 客户端一条都不记（而界面上写的是「照常检测、照常记录」），
     // 拦截档更是被整个绕过去。
-    let inspect = rt.config.security.inspect_tools;
-    let trust = crate::guard::effective_trust(provider, &decision.guard);
-    // 正文里的提示注入**只对不受信任的上游查**（末尾）：官方端点上
-    // 模型讲解提示注入是完全正常的
+    // **对所有上游一样**：切不切只看档位和规则的处置，不看上游是不是官方的
+    let inspect = rt.config.security.inspect_tools.mode;
     let whole_body = !client_sse && !client_json_stream;
     let mut wall = if !inspect.detects() {
         None
     } else if client_sse {
-        Some(crate::toolwall::Wall::new(rt.rules.clone(), trust.blocks()))
+        Some(crate::toolwall::Wall::new(rt.tools.clone()))
     } else if client_json_stream {
-        Some(crate::toolwall::Wall::json_array(
-            rt.rules.clone(),
-            trust.blocks(),
-        ))
+        Some(crate::toolwall::Wall::json_array(rt.tools.clone()))
     } else {
-        Some(crate::toolwall::Wall::json_body(
-            rt.rules.clone(),
-            trust.blocks(),
-        ))
+        Some(crate::toolwall::Wall::json_body(rt.tools.clone()))
     };
     /*
       非流式要拦得住，body 就不能边收边发 —— 发出去了就收不回来。
@@ -2348,19 +2329,9 @@ async fn pipeline(
                     let mut cut: Option<(GatewayError, usize)> = None;
                     if let Some(w) = wall.as_mut() {
                         for v in w.feed(&out) {
-                            // 高危 + 不受信任 + 拦截态 = 切断
-                            let blocked = v.high && inspect.acts() && trust.blocks();
-                            bus.emit(tw_api::Event::ToolCallFlagged {
-                                id,
-                                provider: wall_provider.clone(),
-                                tool: v.tool.clone(),
-                                rule: v.rule.clone(),
-                                why: v.why.clone(),
-                                excerpt: v.excerpt.clone(),
-                                high: v.high,
-                                blocked,
-                                at_ms: now_ms(),
-                            });
+                            // 规则是切断 + 拦截档 = 切断
+                            let blocked = v.cut && inspect.acts();
+                            bus.emit(flagged(id, &wall_provider, &v, blocked));
                             if blocked {
                                 tracing::warn!(
                                     provider = %wall_provider, tool = %v.tool, rule = %v.rule,
@@ -2371,9 +2342,8 @@ async fn pipeline(
                                         "gw.toolcall.cut",
                                         upstream = wall_provider.clone(), tool = v.tool.clone(),
                                         rule = v.rule.clone(), why = v.why.clone() =>
-                                        "The {tool} call returned by upstream `{upstream}` (an \
-                                         unofficial endpoint) matched rule `{rule}` ({why}), so \
-                                         the response was cut off."
+                                        "The {tool} call returned by upstream `{upstream}` \
+                                         matched rule `{rule}` ({why}), so the response was cut off."
                                     )),
                                     v.safe_prefix,
                                 ));
@@ -2473,18 +2443,8 @@ async fn pipeline(
             && let Some(w) = wall.as_mut()
         {
             for v in w.whole(&tail) {
-                let blocked = v.high && inspect.acts() && trust.blocks();
-                bus.emit(tw_api::Event::ToolCallFlagged {
-                    id,
-                    provider: wall_provider.clone(),
-                    tool: v.tool.clone(),
-                    rule: v.rule.clone(),
-                    why: v.why.clone(),
-                    excerpt: v.excerpt.clone(),
-                    high: v.high,
-                    blocked,
-                    at_ms: now_ms(),
-                });
+                let blocked = v.cut && inspect.acts();
+                bus.emit(flagged(id, &wall_provider, &v, blocked));
                 if blocked {
                     tracing::warn!(
                         provider = %wall_provider, tool = %v.tool, rule = %v.rule,
@@ -2494,9 +2454,8 @@ async fn pipeline(
                         "gw.toolcall.blocked",
                         upstream = wall_provider.clone(), tool = v.tool.clone(),
                         rule = v.rule.clone(), why = v.why.clone() =>
-                        "The {tool} call returned by upstream `{upstream}` (an unofficial \
-                         endpoint) matched rule `{rule}` ({why}), so the response was \
-                         withheld."
+                        "The {tool} call returned by upstream `{upstream}` matched rule \
+                         `{rule}` ({why}), so the response was withheld."
                     )));
                     break;
                 }
@@ -2504,13 +2463,6 @@ async fn pipeline(
         }
         if denied.is_none() && !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
-        }
-        // 这条响应长什么样（防线三）。**只有形状，没有内容。**
-        if let Some(w) = wall.as_ref() {
-            let (tool_calls, flagged) = w.shape();
-            if tool_calls > 0 || flagged > 0 {
-                bus.emit(tw_api::Event::ResponseInspected { id, tool_calls, flagged });
-            }
         }
         // 扣下整份 body 和流断在半路，对结局来说是同一件事
         if let Some(err) = denied {
@@ -2762,6 +2714,29 @@ fn local_answer(kind: crate::clientprobe::ProbeKind, body: &Bytes) -> Response {
         axum::Json(crate::clientprobe::json_response(kind, body)),
     )
         .into_response()
+}
+
+
+/// 一次工具调用命中写成事件。流式、整包、WebSocket 三条路共用 —— 字段写漏
+/// 一个，就有一条路上的日志说不清是哪条规则。
+pub(crate) fn flagged(
+    id: u64,
+    provider: &str,
+    v: &crate::toolwall::Verdict,
+    blocked: bool,
+) -> tw_api::Event {
+    tw_api::Event::ToolCallFlagged {
+        id,
+        provider: provider.to_string(),
+        tool: v.tool.clone(),
+        rule: v.rule.clone(),
+        custom: v.custom,
+        why: v.why.clone(),
+        excerpt: v.excerpt.clone(),
+        action: if v.cut { "cut" } else { "record" }.to_string(),
+        blocked,
+        at_ms: now_ms(),
+    }
 }
 
 #[cfg(test)]

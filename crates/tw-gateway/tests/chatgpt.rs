@@ -212,7 +212,6 @@ fn chatgpt_provider(base_url: &str, token_url: &str) -> Provider {
             name: ACCOUNT_HEADER.into(),
             value: Secret::new("acc-123"),
         }]),
-        redact: Some(vec![]),
         ..Default::default()
     }
 }

@@ -140,7 +140,6 @@ fn oauth_provider(name: &str, upstream: SocketAddr, token_url: &str) -> Provider
             refresh_before: Some("5m".into()),
         }),
         protocol: Some(tw_config::Protocol::Anthropic),
-        redact: Some(vec![]),
         ..Default::default()
     }
 }
@@ -305,7 +304,6 @@ async fn a_dead_token_endpoint_fails_over_instead_of_taking_the_gateway_down() {
         base_url: format!("http://{up}"),
         key: Some("sk-plain-backup".into()),
         protocol: Some(tw_config::Protocol::Anthropic),
-        redact: Some(vec![]),
         ..Default::default()
     };
     let (gw, _s) = start_gateway(vec![broken, backup]).await;

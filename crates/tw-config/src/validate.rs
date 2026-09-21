@@ -63,6 +63,16 @@ pub enum ValidationError {
         "the {what} name `{name}` starts with __, which is reserved for built-ins. Use a different name"
     )]
     ReservedName { what: &'static str, name: String },
+    #[error("a custom {what} rule has no name")]
+    EmptyRuleName { what: &'static str },
+    #[error("the custom {what} rule name `{name}` appears twice")]
+    DuplicateRuleName { what: &'static str, name: String },
+    #[error("the pattern of custom {what} rule `{name}` is not a valid regular expression: {detail}")]
+    BadRulePattern {
+        what: &'static str,
+        name: String,
+        detail: String,
+    },
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -229,6 +239,60 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     // 指向不存在的 provider 的规则，在运行时是完全静默的**（
     // 「我明明配了为什么不生效」）。
     cfg.engine().validate()?;
+
+    // 自定义规则。**写坏的正则在这里就拒绝**，而不是加载之后跳过那一条：
+    // 一条静默失效的安全规则比没有更糟，因为用户以为它在
+    check_rules(
+        "redaction",
+        cfg.security
+            .redact
+            .custom
+            .iter()
+            .map(|c| (c.name.as_str(), c.pattern.as_str())),
+    )?;
+    check_rules(
+        "tool-call",
+        cfg.security
+            .inspect_tools
+            .custom
+            .iter()
+            .map(|c| (c.name.as_str(), c.pattern.as_str())),
+    )?;
+    Ok(())
+}
+
+/// 一组自定义规则：名字不空、不重复，正则编得过。
+///
+/// 上限和数据面编译时一样（`tw_redact::rules::compile`）：一条要在每个请求上
+/// 跑的正则，编出来的东西不能太大。
+fn check_rules<'a>(
+    what: &'static str,
+    rules: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<(), ValidationError> {
+    let mut seen = std::collections::HashSet::new();
+    for (name, pattern) in rules {
+        if name.trim().is_empty() {
+            return Err(ValidationError::EmptyRuleName { what });
+        }
+        if !seen.insert(name) {
+            return Err(ValidationError::DuplicateRuleName {
+                what,
+                name: name.to_string(),
+            });
+        }
+        let bad = |detail: String| ValidationError::BadRulePattern {
+            what,
+            name: name.to_string(),
+            detail,
+        };
+        if pattern.is_empty() {
+            return Err(bad("the pattern is empty".to_string()));
+        }
+        regex::RegexBuilder::new(pattern)
+            .size_limit(1 << 20)
+            .build()
+            .map_err(|e| bad(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -431,5 +495,57 @@ mod tests {
         // 哪里错了」，是「说清接下来做什么」。
         let e = validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "api.example.com")])).unwrap_err();
         assert!(e.to_string().contains("http"), "{e}");
+    }
+
+    fn with_rules(redact: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
+        let mut x = cfg(vec![c("default", "tw-a")], vec![]);
+        x.security.redact.custom = redact
+            .iter()
+            .map(|(n, pat)| crate::CustomRedactRule {
+                name: n.to_string(),
+                pattern: pat.to_string(),
+                disabled: false,
+            })
+            .collect();
+        x.security.inspect_tools.custom = tools
+            .iter()
+            .map(|(n, pat)| crate::CustomToolRule {
+                name: n.to_string(),
+                pattern: pat.to_string(),
+                action: crate::ToolAction::Cut,
+                disabled: false,
+            })
+            .collect();
+        x
+    }
+
+    #[test]
+    fn custom_rules_that_compile_are_accepted() {
+        let x = with_rules(&[("公司令牌", r"corp_[A-Za-z0-9]{32}")], &[("删除集群资源", r"kubectl\s+delete")]);
+        assert!(validate(&x).is_ok(), "{:?}", validate(&x));
+    }
+
+    #[test]
+    fn a_broken_pattern_is_refused_and_named() {
+        // 一条静默失效的安全规则比没有更糟：用户以为它在
+        let e = validate(&with_rules(&[("写坏了", "(")], &[])).unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("写坏了"), "{m}");
+        assert!(matches!(e, ValidationError::BadRulePattern { .. }), "{e:?}");
+        assert!(validate(&with_rules(&[], &[("空的", "")])).is_err());
+    }
+
+    #[test]
+    fn a_rule_name_is_required_and_unique_within_its_line_of_defence() {
+        assert!(matches!(
+            validate(&with_rules(&[(" ", "x")], &[])),
+            Err(ValidationError::EmptyRuleName { .. })
+        ));
+        assert!(matches!(
+            validate(&with_rules(&[("同名", "a"), ("同名", "b")], &[])),
+            Err(ValidationError::DuplicateRuleName { .. })
+        ));
+        // 两项防护各管各的名字
+        assert!(validate(&with_rules(&[("同名", "a")], &[("同名", "b")])).is_ok());
     }
 }

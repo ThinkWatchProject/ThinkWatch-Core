@@ -76,15 +76,17 @@ async fn start_gateway(up: SocketAddr, mode: SecurityMode, inspect: SecurityMode
             base_url: format!("http://{up}"),
             key: Some("sk-upstream".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
-            // 测试连的是 127.0.0.1，域名判据用不上，所以写清楚
-            redact: Some(vec![tw_redact::rules::Kind::ApiKeys]),
-            trust: Some(tw_config::Trust::Untrusted),
             ..Default::default()
         }],
         security: Security {
-            redact: mode,
-            inspect_tools: inspect,
-            ..Default::default()
+            redact: tw_config::RedactPolicy {
+                mode,
+                ..Default::default()
+            },
+            inspect_tools: tw_config::ToolPolicy {
+                mode: inspect,
+                ..Default::default()
+            },
         },
         ..Default::default()
     };

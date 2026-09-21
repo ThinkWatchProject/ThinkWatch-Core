@@ -1,28 +1,24 @@
 //! 规则集。
 //!
-//! 内置那一份编译进二进制，用户的增删写在 `config.yaml` 的
-//! `security.scan_rules` 里。
+//! 内置那一份编译进二进制（`data/rules.yaml`），两处在用：
+//!
+//! - **客户端配置扫描**用全部内置规则（[`scan_rules`]），不受用户改动影响。
+//!   安全页上的规则只作用于经过网关的请求 —— 两件事各管各的，用户在那边
+//!   停用一条误报，不该让这边悄悄少查一样东西。
+//! - **工具调用审查**只用「危险命令」那一组（[`tool_rules`]），用户可以逐条
+//!   停用、再加自己的，写在 `config.yaml` 的 `security.inspect_tools` 里。
 //!
 //! # 为什么是加法加停用，不是整份替换
 //!
 //! 第一版是「用户那份文件存在就整份替换内置的」，理由是「一份规则集要能
-//! 被完整地读懂和审查」。那个理由没错，结论错了 —— 它有和 cc-switch 那个
-//! 白名单一模一样的毛病：
+//! 被完整地读懂和审查」。那个理由没错，结论错了：
 //!
 //! > 用户复制一份内置规则、改两条之后，**他那份就永远停在复制的那一刻
 //! > 了**。我们后来加的每一条新攻击模式都到不了他机器上，而他不会察觉。
 //!
-//! 「现在到底哪些规则生效」这个问题应该由界面回答，而不是靠逼用户抄一份。
-//!
-//! # 为什么不是另一个文件
-//!
-//! `config.yaml` 是唯一的配置文件。规则集是用户会去调的**策略**，
-//! 不是数据 —— 而住在 `config.yaml` 里还白捡了变更历史和一键回滚，
-//! 单独一个文件那两样都没有。
-//!
-//! （联网刷新下来的 `model_prices.json` 是另一回事：那是几千个模型的公开
-//! 价格数据集，是数据不是策略，不进版本历史。用户自己的价目表照样住在
-//! `config.yaml` 里。）
+//! 「现在到底哪些规则生效」这个问题由界面回答，而不是靠逼用户抄一份。
+
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -31,18 +27,27 @@ use serde::{Deserialize, Serialize};
 pub const BUILTIN: &str = include_str!("../data/rules.yaml");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleSpec {
     pub id: String,
+    /// 界面上的名字（英文）。界面按 id 查自己的名称表，查不到才用它
+    pub name: String,
     pub pattern: String,
     /// **为什么它值得看一眼。**没有这一句，一条命中就只是个规则 id
     pub why: String,
     /// `high` 或 `medium`。不写按 medium 算。
     ///
-    /// **只有 high 会在切断流。**分级的判据是「它能不能一步拿到
+    /// **只有 high 会在拦截档下切断。**分级的判据是「它能不能一步拿到
     /// 执行权或者拿走凭据」，不是「它听起来多可怕」——
     /// `rm -rf` 很吓人，但它毁的是你自己的文件，不会把你的机器交给别人。
     #[serde(default)]
     pub level: Option<String>,
+}
+
+impl RuleSpec {
+    pub fn high(&self) -> bool {
+        self.level.as_deref() == Some("high")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,131 +64,143 @@ pub struct RuleFile {
 pub enum RuleError {
     #[error("the built-in rules file could not be parsed: {0}")]
     Builtin(String),
+    #[error("the pattern of rule `{name}` is not a valid regular expression: {detail}")]
+    BadPattern { name: String, detail: String },
 }
 
 /// 一条编译好的规则。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Rule {
+    /// 内置规则的 id，或者自定义规则的名字
     pub id: String,
+    /// 英文名；自定义规则就是它的名字
+    pub name: String,
+    /// 为什么值得看一眼（英文）。自定义规则没有这一句
     pub why: String,
+    pub pattern: String,
     pub re: Regex,
     /// `injection` 还是 `dangerous`
     pub group: &'static str,
-    /// 命中之后该不该动手。**只有 high 会切断流**
+    /// 命中之后该不该动手。**拦截档下只有它会切断**
     pub high: bool,
     /// 用户自己加的，不是内置的。**界面上要分得开**
     pub custom: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Rules {
     pub rules: Vec<Rule>,
-    /// 停用了几条内置的
-    pub disabled: Vec<String>,
-    /// 没能编译的那些。**要说出来** —— 一条静默失效的安全规则，比没有
-    /// 那条规则更糟，因为用户以为它在
+    /// 认不出的规则 id（`enable` / `disable` 里写的）。**要说出来** —— 多半
+    /// 是拼错了，而它的表现是「我明明停用了它，怎么还在报」
     pub warnings: Vec<String>,
 }
 
-impl Rules {
-    /// 其中用户自己加的有几条。
-    ///
-    /// 「现在到底有多少条在生效、几条是加的、停用了几条」是「加法加停用」
-    /// 能成立的前提 —— 用户不必抄一份规则集，也能知道自己这台机器上跑的
-    /// 是什么。界面拿这三个数自己说。
-    pub fn custom(&self) -> usize {
-        self.rules.iter().filter(|r| r.custom).count()
-    }
-
-    /// 命令行里的那一句。
-    pub fn summary(&self) -> String {
-        let custom = self.custom();
-        let mut s = format!("{} active", self.rules.len());
-        if custom > 0 {
-            s.push_str(&format!(", {custom} of them custom"));
-        }
-        if !self.disabled.is_empty() {
-            s.push_str(&format!(
-                ", {} built-in rules disabled",
-                self.disabled.len()
-            ));
-        }
-        s
-    }
-}
-
-fn group_of(name: Option<&str>) -> &'static str {
-    match name {
-        Some("injection") => "injection",
-        // 不写按「命令」算 —— 用户加规则十有八九是想抓某条命令
-        _ => "dangerous",
-    }
-}
-
-fn compile(spec: &RuleSpec, group: &'static str, custom: bool, out: &mut Rules) {
-    match Regex::new(&spec.pattern) {
-        Ok(re) => out.rules.push(Rule {
-            id: spec.id.clone(),
-            why: spec.why.clone(),
-            re,
-            group,
-            high: spec.level.as_deref() == Some("high"),
-            custom,
-        }),
-        // **写坏一条不该让整套停摆**：一个因为配置写错就整个不
-        // 工作的安全功能等于没有。但它必须**大声**说出来 —— 静默失效
-        // 比没有更糟，因为用户以为它在
-        Err(e) => out.warnings.push(format!(
-            "the pattern of rule `{}` is wrong, so the rule is not in effect: {e}",
-            spec.id
-        )),
-    }
-}
-
-/// 内置规则 + 用户的增删。
+/// 内置规则文件，解析一次。
 ///
-/// **永远返回一套能用的规则**：用户写坏的那几条被跳过并记进
-/// `warnings`，其余照常工作。
-pub fn build(user: &tw_config::ScanRules) -> Result<Rules, RuleError> {
-    let builtin: RuleFile =
-        serde_yaml_ng::from_str(BUILTIN).map_err(|e| RuleError::Builtin(e.to_string()))?;
-    let mut out = Rules {
-        rules: Vec::new(),
-        disabled: Vec::new(),
+/// 解析不了是编译进二进制的那份写坏了 —— 测试钉着它
+/// （`the_builtin_rules_compile`），运行时不会发生。
+pub fn builtin() -> &'static RuleFile {
+    static FILE: OnceLock<RuleFile> = OnceLock::new();
+    FILE.get_or_init(|| {
+        serde_yaml_ng::from_str(BUILTIN)
+            .expect("the built-in rules file parses, and a test keeps it so")
+    })
+}
+
+fn compile(spec: &RuleSpec, group: &'static str, custom: bool) -> Result<Rule, RuleError> {
+    let re = regex::RegexBuilder::new(&spec.pattern)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| RuleError::BadPattern {
+            name: spec.id.clone(),
+            detail: e.to_string(),
+        })?;
+    Ok(Rule {
+        id: spec.id.clone(),
+        name: spec.name.clone(),
+        why: spec.why.clone(),
+        pattern: spec.pattern.clone(),
+        re,
+        group,
+        high: spec.high(),
+        custom,
+    })
+}
+
+/// 客户端配置扫描用的：**全部内置规则**，不受用户改动影响。
+pub fn scan_rules() -> Rules {
+    let f = builtin();
+    let rules = f
+        .injection
+        .iter()
+        .map(|s| (s, "injection"))
+        .chain(f.dangerous.iter().map(|s| (s, "dangerous")))
+        .map(|(s, g)| compile(s, g, false).expect("the built-in patterns compile"))
+        .collect();
+    Rules {
+        rules,
         warnings: Vec::new(),
-    };
-    for (specs, group) in [
-        (&builtin.injection, "injection"),
-        (&builtin.dangerous, "dangerous"),
-    ] {
-        for spec in specs {
-            if user.disable.contains(&spec.id) {
-                out.disabled.push(spec.id.clone());
-                continue;
-            }
-            compile(spec, group, false, &mut out);
+    }
+}
+
+/// 工具调用审查用的：内置的危险命令规则，按用户的启停过一遍，再加上启用着
+/// 的自定义规则。
+///
+/// 自定义规则的正则在配置校验时已经编过一次；这里再编失败只可能是有人绕过
+/// 了校验，照样当错误返回，不静默跳过。
+pub fn tool_rules(p: &tw_config::ToolPolicy) -> Result<Rules, RuleError> {
+    let f = builtin();
+    let mut warnings = Vec::new();
+    for id in p.enable.iter().chain(&p.disable) {
+        if !f.dangerous.iter().any(|s| &s.id == id) {
+            warnings.push(id.clone());
         }
     }
-    // **停用一条不存在的 id 要说出来。**多半是拼错了，而它的表现是
-    // 「我明明停用了它，怎么还在报」
-    for id in &user.disable {
-        if !out.disabled.contains(id) {
-            out.warnings.push(format!(
-                "`{id}` is not the id of a built-in rule, so disabling it did nothing"
-            ));
+    let mut rules = Vec::new();
+    for s in &f.dangerous {
+        if p.disable.contains(&s.id) {
+            continue;
         }
+        rules.push(compile(s, "dangerous", false)?);
     }
-    for spec in &user.add {
-        let group = group_of(spec.group.as_deref());
-        let s = RuleSpec {
-            id: spec.id.clone(),
-            pattern: spec.pattern.clone(),
-            why: spec.why.clone(),
-            level: spec.level.clone(),
+    for c in p.custom.iter().filter(|c| !c.disabled) {
+        let spec = RuleSpec {
+            id: c.name.clone(),
+            name: c.name.clone(),
+            pattern: c.pattern.clone(),
+            why: String::new(),
+            level: Some(
+                match c.action {
+                    tw_config::ToolAction::Cut => "high",
+                    tw_config::ToolAction::Record => "medium",
+                }
+                .to_string(),
+            ),
         };
-        compile(&s, group, true, &mut out);
+        rules.push(compile(&spec, "dangerous", true)?);
     }
-    Ok(out)
+    Ok(Rules { rules, warnings })
+}
+
+/// 只有这一条正则的规则集。界面上新建规则时「测试」用它。
+pub fn single(name: &str, pattern: &str, high: bool) -> Result<Rules, RuleError> {
+    let spec = RuleSpec {
+        id: name.to_string(),
+        name: name.to_string(),
+        pattern: pattern.to_string(),
+        why: String::new(),
+        level: Some(if high { "high" } else { "medium" }.to_string()),
+    };
+    if pattern.is_empty() {
+        return Err(RuleError::BadPattern {
+            name: name.to_string(),
+            detail: "the pattern is empty".to_string(),
+        });
+    }
+    Ok(Rules {
+        rules: vec![compile(&spec, "dangerous", true)?],
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -191,21 +208,25 @@ mod tests {
     use super::*;
 
     fn r() -> Rules {
-        build(&tw_config::ScanRules::default()).unwrap()
+        scan_rules()
     }
 
     #[test]
     fn the_builtin_rules_compile() {
-        // 内置规则编译不过 = 扫描整个不工作。这条测试是那个 expect 的
-        // 底气。
+        // 内置规则编译不过 = 扫描整个不工作。这条测试是那个 expect 的底气。
         let rs = r();
         assert!(rs.rules.len() >= 12, "只有 {} 条", rs.rules.len());
+        assert!(
+            tool_rules(&Default::default()).unwrap().rules.len() >= 10,
+            "工具调用审查的内置规则少了"
+        );
     }
 
     #[test]
-    fn every_rule_says_why_it_matters() {
+    fn every_rule_has_a_name_and_says_why_it_matters() {
         // 没有这一句，一条命中就只是个规则 id —— 用户看不出该不该管它。
         for x in r().rules {
+            assert!(!x.name.is_empty(), "{} 没写 name", x.id);
             assert!(!x.why.is_empty(), "{} 没写 why", x.id);
             assert!(x.why.chars().count() > 5, "{} 的 why 太短：{}", x.id, x.why);
         }
@@ -351,112 +372,87 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_inspection_uses_only_the_command_rules() {
+        // 一个写文档的工具调用里出现「忽略以上指令」是完全正常的
+        let rs = tool_rules(&Default::default()).unwrap();
+        assert!(rs.rules.iter().all(|x| x.group == "dangerous"));
+        assert!(!rs.rules.iter().any(|x| x.id == "ignore-previous"));
+    }
+
+    fn policy(disable: &[&str], custom: &[(&str, &str, tw_config::ToolAction)]) -> tw_config::ToolPolicy {
+        tw_config::ToolPolicy {
+            disable: disable.iter().map(|s| s.to_string()).collect(),
+            custom: custom
+                .iter()
+                .map(|(n, p, a)| tw_config::CustomToolRule {
+                    name: n.to_string(),
+                    pattern: p.to_string(),
+                    action: *a,
+                    disabled: false,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
     fn a_user_rule_is_added_on_top_of_the_builtin_ones() {
         // **加法，不是替换。**替换会让用户那份永远停在复制的那一刻，
-        // 我们后来加的每一条新攻击模式都到不了他机器上（白名单）。
-        let n = r().rules.len();
-        let rs = build(&tw_config::ScanRules {
-            add: vec![tw_config::ScanRule {
-                id: "我们公司的内网域名".into(),
-                pattern: "corp\\.internal".into(),
-                why: "内网域名不该出现在发出去的命令里".into(),
-                group: None,
-                level: None,
-            }],
-            disable: vec![],
-        })
+        // 我们后来加的每一条新攻击模式都到不了他机器上。
+        let n = tool_rules(&Default::default()).unwrap().rules.len();
+        let rs = tool_rules(&policy(
+            &[],
+            &[("删除集群资源", r"kubectl\s+delete", tw_config::ToolAction::Cut)],
+        ))
         .unwrap();
         assert_eq!(rs.rules.len(), n + 1, "内置那些被顶掉了");
-        let mine = rs
-            .rules
-            .iter()
-            .find(|x| x.id == "我们公司的内网域名")
-            .unwrap();
+        let mine = rs.rules.iter().find(|x| x.id == "删除集群资源").unwrap();
         assert!(mine.custom, "界面上要分得开哪些是用户加的");
-        // **不写 level 就是 medium** —— 用户新加的规则默认只告警不切断
-        assert!(!mine.high);
-        // 不写 group 按「命令」算 —— 加规则十有八九是想抓某条命令
-        assert_eq!(mine.group, "dangerous");
+        assert!(mine.high, "写明了切断却没有切断");
+        assert!(mine.re.is_match("kubectl delete ns prod"));
         assert!(rs.warnings.is_empty(), "{:?}", rs.warnings);
     }
 
     #[test]
+    fn a_user_rule_that_does_not_say_cut_only_records() {
+        let rs = tool_rules(&policy(&[], &[("我的", "zzz", tw_config::ToolAction::Record)])).unwrap();
+        assert!(!rs.rules.iter().find(|x| x.id == "我的").unwrap().high);
+    }
+
+    #[test]
     fn a_builtin_rule_can_be_switched_off_by_id() {
-        let rs = build(&tw_config::ScanRules {
-            add: vec![],
-            disable: vec!["chmod-777".into()],
-        })
-        .unwrap();
+        let rs = tool_rules(&policy(&["chmod-777"], &[])).unwrap();
         assert!(!rs.rules.iter().any(|x| x.id == "chmod-777"));
-        assert_eq!(rs.disabled, vec!["chmod-777".to_string()]);
         // 别的照常在
         assert!(rs.rules.iter().any(|x| x.id == "curl-pipe-sh"));
         assert!(rs.warnings.is_empty(), "{:?}", rs.warnings);
     }
 
     #[test]
-    fn disabling_an_id_that_does_not_exist_is_said_out_loud() {
+    fn switching_off_an_id_that_does_not_exist_is_said_out_loud() {
         // 多半是拼错了，而它的表现是「我明明停用了它，怎么还在报」。
-        let rs = build(&tw_config::ScanRules {
-            add: vec![],
-            disable: vec!["chmod777".into()],
-        })
-        .unwrap();
-        assert_eq!(rs.warnings.len(), 1, "{:?}", rs.warnings);
-        assert!(rs.warnings[0].contains("chmod777"), "{:?}", rs.warnings);
+        let rs = tool_rules(&policy(&["chmod777"], &[])).unwrap();
+        assert_eq!(rs.warnings, vec!["chmod777".to_string()]);
     }
 
     #[test]
-    fn a_broken_user_rule_is_skipped_loudly_and_the_rest_keep_working() {
-        // **一个因为配置写错就整个不工作的安全功能等于没有**。
-        // 但静默失效比没有更糟 —— 用户以为它在。
-        let n = r().rules.len();
-        let rs = build(&tw_config::ScanRules {
-            add: vec![tw_config::ScanRule {
-                id: "写坏了".into(),
-                pattern: "(".into(),
-                why: "x".into(),
-                group: None,
-                level: None,
-            }],
-            disable: vec![],
-        })
-        .unwrap();
-        assert_eq!(rs.rules.len(), n, "坏的那条不该进来");
-        assert_eq!(rs.warnings.len(), 1);
-        assert!(rs.warnings[0].contains("写坏了"), "{:?}", rs.warnings);
-        // 内置的照常工作
-        assert!(rs.rules.iter().any(|x| x.id == "curl-pipe-sh"));
+    fn a_disabled_user_rule_stays_out() {
+        let mut p = policy(&[], &[("我的", "zzz", tw_config::ToolAction::Cut)]);
+        p.custom[0].disabled = true;
+        let rs = tool_rules(&p).unwrap();
+        assert!(!rs.rules.iter().any(|x| x.id == "我的"));
     }
 
     #[test]
-    fn the_summary_answers_what_is_actually_running() {
-        // 这句话是「加法加停用」能成立的前提：用户不必抄一份规则集，
-        // 也能知道自己这台机器上跑的是什么。
-        let rs = build(&tw_config::ScanRules {
-            add: vec![tw_config::ScanRule {
-                id: "我的".into(),
-                pattern: "zzz".into(),
-                why: "x".into(),
-                group: Some("injection".into()),
-                level: None,
-            }],
-            disable: vec!["chmod-777".into()],
-        })
-        .unwrap();
-        assert_eq!(rs.custom(), 1);
-        assert_eq!(rs.disabled.len(), 1);
-        let s = rs.summary();
-        assert!(s.contains("1 of them custom"), "{s}");
-        assert!(s.contains("1 built-in rules disabled"), "{s}");
-        // injection 组的规则永远不切断
-        assert!(!rs.rules.iter().find(|x| x.id == "我的").unwrap().high);
+    fn the_config_scan_is_not_affected_by_what_the_user_turned_off() {
+        // 安全页上的规则只作用于经过网关的请求。在那边停用一条误报，不该让
+        // 客户端配置扫描悄悄少查一样东西。
+        assert!(scan_rules().rules.iter().any(|x| x.id == "chmod-777"));
     }
 
     #[test]
-    fn there_is_no_second_config_file_any_more() {
-        // `config.yaml` 是唯一的配置文件。规则住在它的
-        // `security.scan_rules` 里，不再有 `~/.thinkwatch/scan-rules.yaml`。
+    fn there_is_no_second_config_file() {
+        // `config.yaml` 是唯一的配置文件。规则不从磁盘上别的地方读。
         let src = std::fs::read_to_string("src/rules.rs").unwrap();
         let code = src.split("#[cfg(test)]").next().unwrap();
         assert!(!code.contains("scan-rules.yaml"), "又冒出一个配置文件");

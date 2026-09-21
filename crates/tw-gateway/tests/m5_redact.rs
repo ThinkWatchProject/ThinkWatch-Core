@@ -1,10 +1,10 @@
-//! M5 验收：出站脱敏与回显还原。
+//! 出站脱敏与回显还原。
 //!
-//! 验收标准的原话是：**走中转时密钥被替换成占位符且回显能还原，走官方时
-//! 原样透传。**这个文件就在证明那一句。
+//! **拦截档下密钥被替换成占位符、回显能还原；观察档原样发出、只留记录。**
+//! 规则是全局的：不管请求发往哪个上游，按的都是同一套。
 //!
-//! 单元测试证明不了它，因为它的失败模式全在接缝上：脱敏发生在故障转移
-//! 循环里面（换了 provider 就换一套规格），还原发生在流上（占位符会被切在
+//! 单元测试证明不了它，因为它的失败模式全在接缝上：替换发生在故障转移
+//! 循环里面（每一跳发出去的那一份），还原发生在流上（占位符会被切在
 //! 两个 chunk 中间），而两者中间隔着整条管线。
 
 use std::net::SocketAddr;
@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
-use tw_config::{Client, Config, Listen, Provider, Security, SecurityMode};
+use tw_config::{Client, Config, Listen, Provider, RedactPolicy, Security, SecurityMode};
 
 /// 用户粘进对话里的那把 key。
 const USER_KEY: &str = "sk-ant-api03-USERSOWNKEYAAAAAAAAAAAAAA";
@@ -76,7 +76,18 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
     (addr, seen)
 }
 
+fn policy(mode: SecurityMode) -> RedactPolicy {
+    RedactPolicy {
+        mode,
+        ..Default::default()
+    }
+}
+
 async fn start_gateway(providers: Vec<Provider>, mode: SecurityMode) -> SocketAddr {
+    start_with(providers, policy(mode)).await
+}
+
+async fn start_with(providers: Vec<Provider>, redact: RedactPolicy) -> SocketAddr {
     let cfg = Config {
         version: 1,
         listen: Listen::default(),
@@ -87,7 +98,7 @@ async fn start_gateway(providers: Vec<Provider>, mode: SecurityMode) -> SocketAd
         }],
         providers,
         security: Security {
-            redact: mode,
+            redact,
             ..Default::default()
         },
         ..Default::default()
@@ -102,18 +113,12 @@ async fn start_gateway(providers: Vec<Provider>, mode: SecurityMode) -> SocketAd
     addr
 }
 
-fn provider(name: &str, base: SocketAddr, official: bool) -> Provider {
+fn provider(name: &str, base: SocketAddr) -> Provider {
     Provider {
         name: name.into(),
         base_url: format!("http://{base}"),
         key: Some("sk-upstream".into()),
         protocol: Some(tw_config::Protocol::Anthropic),
-        // 测试里连的是 127.0.0.1，域名判据用不上，所以直接写清楚
-        redact: Some(if official {
-            vec![]
-        } else {
-            vec![tw_redact::rules::Kind::ApiKeys]
-        }),
         ..Default::default()
     }
 }
@@ -144,10 +149,9 @@ async fn ask(gw: SocketAddr, body: &str, stream: bool) -> String {
 }
 
 #[tokio::test]
-async fn a_relay_never_sees_the_key_but_the_client_gets_it_back() {
-    // **验收标准的前半句。**
+async fn the_upstream_never_sees_the_key_but_the_client_gets_it_back() {
     let (up, seen) = start_upstream(false).await;
-    let gw = start_gateway(vec![provider("relay", up, false)], SecurityMode::Enforce).await;
+    let gw = start_gateway(vec![provider("relay", up)], SecurityMode::Enforce).await;
 
     let got = ask(gw, &body_with_key(), false).await;
 
@@ -161,17 +165,51 @@ async fn a_relay_never_sees_the_key_but_the_client_gets_it_back() {
 }
 
 #[tokio::test]
-async fn the_official_endpoint_gets_the_body_byte_for_byte() {
-    // **验收标准的后半句。**你让 Claude Code 调试一个 .env 问题，
-    // 它得真看见里面的值才帮得上忙。
+async fn a_builtin_rule_that_is_switched_off_leaves_that_kind_of_key_alone() {
+    // 误报的那一条关掉，别的照常工作 —— 开关按条，不按类别
     let (up, seen) = start_upstream(false).await;
-    let gw = start_gateway(vec![provider("official", up, true)], SecurityMode::Enforce).await;
+    let gw = start_with(
+        vec![provider("relay", up)],
+        RedactPolicy {
+            mode: SecurityMode::Enforce,
+            disable: vec!["anthropic-api-key".into()],
+            ..Default::default()
+        },
+    )
+    .await;
 
     let body = body_with_key();
     ask(gw, &body, false).await;
 
     let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
-    assert_eq!(sent, body, "官方端点上 body 被动过了");
+    assert_eq!(sent, body, "停用的规则还在替换");
+}
+
+#[tokio::test]
+async fn a_custom_rule_is_replaced_on_the_way_out_and_restored_on_the_way_back() {
+    let (up, seen) = start_upstream(false).await;
+    let gw = start_with(
+        vec![provider("relay", up)],
+        RedactPolicy {
+            mode: SecurityMode::Enforce,
+            custom: vec![tw_config::CustomRedactRule {
+                name: "公司令牌".into(),
+                pattern: r"corp_[A-Za-z0-9]{12}".into(),
+                disabled: false,
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let body = r#"{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"令牌是 corp_ABCDEF123456，帮我看看"}]}"#;
+    let got = ask(gw, body, false).await;
+
+    let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+    assert!(!sent.contains("corp_ABCDEF123456"), "{sent}");
+    assert!(sent.contains("<<TW_SECRET_1>>"), "{sent}");
+    serde_json::from_str::<serde_json::Value>(&sent).expect("换完不是合法 JSON");
+    assert!(got.contains("corp_ABCDEF123456"), "回显没还原：{got}");
 }
 
 #[tokio::test]
@@ -179,7 +217,7 @@ async fn a_placeholder_cut_into_single_characters_still_comes_back_whole() {
     // 假上游一个字符一帧地发 —— 占位符必然被切碎，而那正是流式还原
     // 存在的全部理由。
     let (up, seen) = start_upstream(true).await;
-    let gw = start_gateway(vec![provider("relay", up, false)], SecurityMode::Enforce).await;
+    let gw = start_gateway(vec![provider("relay", up)], SecurityMode::Enforce).await;
 
     let got = ask(gw, &body_with_key(), true).await;
 
@@ -202,7 +240,7 @@ async fn a_placeholder_cut_into_single_characters_still_comes_back_whole() {
 async fn observe_mode_changes_nothing_on_the_wire() {
     // 观察态**只记录，不改变任何行为**。出厂默认停在这里。
     let (up, seen) = start_upstream(false).await;
-    let gw = start_gateway(vec![provider("relay", up, false)], SecurityMode::Observe).await;
+    let gw = start_gateway(vec![provider("relay", up)], SecurityMode::Observe).await;
 
     let body = body_with_key();
     let got = ask(gw, &body, false).await;
@@ -216,10 +254,9 @@ async fn observe_mode_changes_nothing_on_the_wire() {
 }
 
 #[tokio::test]
-async fn failing_over_from_official_to_a_relay_redacts_on_the_second_hop() {
-    // **这是脱敏为什么必须住在故障转移循环里面。**从官方切到中转的那一
-    // 刻，正是最需要它的时刻 —— 而循环外面算一次的话，第二跳会拿着为
-    // 官方算出来的规格（也就是「不脱」）把 key 发出去。
+async fn failing_over_redacts_what_the_second_hop_sends() {
+    // **替换住在故障转移循环里面**：每一跳发出去的那一份都要换过，还原用
+    // 的是真正服务它的那一跳的账本。
     let dead = {
         // 一个立刻 500 的上游
         let app = Router::new().route(
@@ -234,8 +271,8 @@ async fn failing_over_from_official_to_a_relay_redacts_on_the_second_hop() {
     let (up, seen) = start_upstream(false).await;
     let gw = start_gateway(
         vec![
-            provider("official", dead, true),
-            provider("relay", up, false),
+            provider("first", dead),
+            provider("relay", up),
         ],
         SecurityMode::Enforce,
     )
@@ -246,7 +283,7 @@ async fn failing_over_from_official_to_a_relay_redacts_on_the_second_hop() {
     let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
     assert!(
         !sent.contains(USER_KEY),
-        "转移到中转之后仍然把真 key 发过去了：{sent}"
+        "转移到第二家之后仍然把真 key 发过去了：{sent}"
     );
     assert!(sent.contains("<<TW_SECRET_1>>"), "{sent}");
     assert!(got.contains(USER_KEY), "还原没跟上故障转移：{got}");
@@ -265,9 +302,9 @@ async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
             key: "tw-testkey".into(),
             ..Default::default()
         }],
-        providers: vec![provider("relay", up, false)],
+        providers: vec![provider("relay", up)],
         security: Security {
-            redact: SecurityMode::Enforce,
+            redact: policy(SecurityMode::Enforce),
             ..Default::default()
         },
         ..Default::default()
@@ -286,17 +323,22 @@ async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
 
     let mut found = None;
     while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-        if let tw_api::Event::Redacted {
-            items, provider, ..
+        if let tw_api::Event::SecretsFound {
+            items,
+            provider,
+            replaced,
+            ..
         } = ev
         {
-            found = Some((items, provider));
+            found = Some((items, provider, replaced));
             break;
         }
     }
-    let (items, provider) = found.expect("没发脱敏事件");
+    let (items, provider, replaced) = found.expect("没发脱敏事件");
     assert_eq!(provider, "relay");
+    assert!(replaced);
     assert_eq!(items.len(), 1);
+    assert_eq!(items[0].rule, "anthropic-api-key");
     assert_eq!(items[0].kind, "api-keys");
     assert_eq!(items[0].count, 1);
     let dump = format!("{items:?}");

@@ -163,8 +163,6 @@ impl Default for Provider {
             models_only: None,
             billing: None,
             pricing: None,
-            trust: None,
-            redact: None,
             disabled: false,
         }
     }
@@ -648,17 +646,6 @@ pub struct Provider {
     /// 按哪张价目表计价。不写就是默认价目表。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
-    /// 这家可不可信。**不写就按 base_url 判。**
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust: Option<Trust>,
-    /// 发给这家之前，把哪几类东西换成占位符。
-    ///
-    /// **不写就按 base_url 判**：官方端点不脱，其余脱默认那几类。理由很
-    /// 实在 —— 你让 Claude Code 调试一个 `.env` 问题，它得真看见里面的值
-    /// 才帮得上忙；对官方端点脱敏，等于为了防一个你本来就信任的对象而
-    /// 自废武功。而中转站是完整的中间人。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redact: Option<Vec<tw_redact::rules::Kind>>,
     /// 停用。**配置原样留着**：不参与路由，它的模型也不出现在
     /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
     #[serde(default, skip_serializing_if = "is_default")]
@@ -675,41 +662,6 @@ impl Provider {
                 .iter()
                 .any(|p| tw_engine::rule::glob_match(p, model)),
         }
-    }
-}
-
-/// 这家上游可不可信。
-///
-/// **默认值落在保守那一侧**（「零值 = 安全」）：没判出来就是
-/// 不受信任。中转站是完整的中间人 —— 它不只能看你的请求，还能改你收到的
-/// 响应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Trust {
-    /// 厂商官方端点。工具调用只记录，不拦
-    Official,
-    /// 高危拦截，中危告警
-    #[default]
-    Untrusted,
-}
-
-impl Trust {
-    /// 写进 YAML 的那个词。
-    pub fn slug(&self) -> &'static str {
-        match self {
-            Trust::Official => "official",
-            Trust::Untrusted => "untrusted",
-        }
-    }
-    pub fn label(&self) -> &'static str {
-        match self {
-            Trust::Official => "official endpoint",
-            Trust::Untrusted => "unofficial endpoint",
-        }
-    }
-    /// 命中高危时要不要真的切断。
-    pub fn blocks(&self) -> bool {
-        matches!(self, Trust::Untrusted)
     }
 }
 
@@ -821,10 +773,10 @@ impl Provider {
             .or_else(|| Self::guess_protocol(&self.base_url))
     }
 
-    /// 这是不是一个厂商官方的端点。
+    /// 这是不是一个厂商官方的端点。格式转换按它决定要不要照官方接口的
+    /// 严格要求来写请求。
     ///
-    /// **判据只有域名。**「我信任这一家」是个安全判断，而域名是这里唯一
-    /// 不可伪装的东西 —— 一个中转站可以把自己叫做 `anthropic-official`，
+    /// **判据只有域名。**一个中转站可以把自己叫做 `anthropic-official`，
     /// 但它没法让自己的 base_url 变成 `api.anthropic.com`。
     pub fn is_official_endpoint(&self) -> bool {
         const OFFICIAL: &[&str] = &[
@@ -857,35 +809,6 @@ impl Provider {
         OFFICIAL.contains(&host) || host.ends_with(".amazonaws.com")
     }
 
-    /// 发给这家要脱哪几类。
-    pub fn effective_redact(&self) -> Vec<tw_redact::rules::Kind> {
-        use tw_redact::rules::Kind;
-        if let Some(k) = &self.redact {
-            return k.clone();
-        }
-        if self.is_official_endpoint() {
-            // 官方端点不脱。**为了防一个你本来就信任的对象而自废武功，
-            // 是这一节最要避免的事**
-            return Vec::new();
-        }
-        // 默认那几类**不含 `internal`**：RFC1918 地址在代码和文档里到处
-        // 都是，而它的危害远小于一把 key。想脱的人自己开
-        vec![
-            Kind::ApiKeys,
-            Kind::PrivateKeys,
-            Kind::Jwt,
-            Kind::ConnStrings,
-        ]
-    }
-
-    /// 这家可不可信。
-    pub fn effective_trust(&self) -> Trust {
-        self.trust.unwrap_or(if self.is_official_endpoint() {
-            Trust::Official
-        } else {
-            Trust::Untrusted
-        })
-    }
 }
 
 /// 刷新之后要写回配置的值。
@@ -1070,7 +993,10 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
-pub use security::{Mode as SecurityMode, ScanRule, ScanRules, Security};
+pub use security::{
+    CustomRedactRule, CustomToolRule, Mode as SecurityMode, RedactPolicy, Security, ToolAction,
+    ToolPolicy,
+};
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;
@@ -1359,8 +1285,8 @@ mod strictness_tests {
     #[test]
     fn an_official_endpoint_is_recognised_by_host_not_by_name() {
         // **一个中转站可以把自己叫做 `anthropic-official`，但它没法让
-        // 自己的 base_url 变成 `api.anthropic.com`。**「我信任这一家」是
-        // 个安全判断，域名是这里唯一不可伪装的东西。
+        // 自己的 base_url 变成 `api.anthropic.com`。**域名是这里唯一
+        // 不可伪装的东西。
         let p = |name: &str, url: &str| Provider {
             name: name.into(),
             base_url: url.into(),
@@ -1378,62 +1304,5 @@ mod strictness_tests {
         assert!(!p("x", "https://api.anthropic.com.evil.com").is_official_endpoint());
         // 塞进 userinfo 里同样不行
         assert!(!p("x", "https://api.anthropic.com@evil.com/v1").is_official_endpoint());
-    }
-
-    #[test]
-    fn the_official_endpoint_is_not_redacted_and_a_relay_is() {
-        // 核心分歧点：**走官方端点不该脱敏，走中转站才脱。**
-        // 你让 Claude Code 调试一个 .env 问题，它得真看见里面的值。
-        let official = Provider {
-            base_url: "https://api.anthropic.com".into(),
-            ..Default::default()
-        };
-        assert!(official.effective_redact().is_empty());
-        assert_eq!(official.effective_trust(), Trust::Official);
-
-        let relay = Provider {
-            base_url: "https://relay.example.com".into(),
-            ..Default::default()
-        };
-        assert!(!relay.effective_redact().is_empty());
-        assert_eq!(relay.effective_trust(), Trust::Untrusted);
-        // 默认不含 internal —— RFC1918 地址在代码和文档里到处都是
-        assert!(
-            !relay
-                .effective_redact()
-                .contains(&tw_redact::rules::Kind::Internal)
-        );
-        assert!(
-            relay
-                .effective_redact()
-                .contains(&tw_redact::rules::Kind::ApiKeys)
-        );
-    }
-
-    #[test]
-    fn writing_it_down_explicitly_wins_over_the_guess() {
-        let p = Provider {
-            base_url: "https://api.anthropic.com".into(),
-            redact: Some(vec![tw_redact::rules::Kind::Internal]),
-            trust: Some(Trust::Untrusted),
-            ..Default::default()
-        };
-        assert_eq!(p.effective_redact(), vec![tw_redact::rules::Kind::Internal]);
-        assert_eq!(p.effective_trust(), Trust::Untrusted);
-        // 显式写空列表 = 明确不脱，不是「没写」
-        let q = Provider {
-            base_url: "https://relay.example.com".into(),
-            redact: Some(vec![]),
-            ..Default::default()
-        };
-        assert!(q.effective_redact().is_empty());
-    }
-
-    #[test]
-    fn an_unknown_upstream_defaults_to_the_safe_side() {
-        // 布尔开关要命名成「零值 = 安全」。判不出来就是不受信任。
-        assert_eq!(Trust::default(), Trust::Untrusted);
-        assert!(Trust::default().blocks());
-        assert!(!Trust::Official.blocks());
     }
 }
