@@ -445,9 +445,10 @@ impl<'de> Deserialize<'de> for Bind {
                 // 去掉了，以及为什么。老配置升上来时要读到后者。
                 if other == "lan" {
                     return Err(serde::de::Error::custom(
-                        "bind: lan 这个写法已经去掉了 —— 它绑的其实是 0.0.0.0（所有网卡，\
-                         包括公网那张），只是白名单默认填了私网段。要只在局域网那张网卡上\
-                         监听，写那张网卡的名字（例如 en0）",
+                        "`bind: lan` is gone. It bound 0.0.0.0, every interface including \
+                         a public one, and only differed in defaulting the allow-list to \
+                         the private ranges. To listen on the local network alone, name \
+                         that interface, for example en0",
                     ));
                 }
                 if looks_like_nic(other) {
@@ -457,8 +458,8 @@ impl<'de> Deserialize<'de> for Bind {
                 // 手写配置文件的人什么都没说，而这个字段写错的后果是
                 // 整份配置加载失败、网关起不来。
                 Err(serde::de::Error::custom(format!(
-                    "bind 只能是 loopback、all、某张网卡的名字（例如 en0）\
-                     或某个 IP 地址（例如 192.168.1.5），当前值为 {other}"
+                    "bind takes loopback, all, the name of an interface such as en0, \
+                     or an address such as 192.168.1.5; it reads {other}"
                 )))
             }
         }
@@ -1219,6 +1220,10 @@ providers:
         assert!(e.contains("all"), "{e}");
         assert!(e.contains("en0"), "{e}");
         assert!(e.contains("192.168.1.5"), "{e}");
+        assert!(
+            e.contains("192.168.1.5@wifi"),
+            "没把写错的那个词说出来：{e}"
+        );
     }
 
     /// `lan` 是真存在过的关键字，老配置里可能还写着它。形状上它像网卡名，
