@@ -265,7 +265,8 @@ async fn the_overview_says_where_a_credential_comes_from_and_never_the_value() {
     assert_eq!(official["auth_header"], "x-api-key");
     assert_eq!(official["protocol"], "anthropic");
     assert_eq!(official["protocol_explicit"], false);
-    assert_eq!(official["trust"], "official");
+    // 安全设置是全局的，上游上不再有信任级别
+    assert!(official.get("trust").is_none(), "{body}");
     assert_eq!(official["references"][0]["kind"], "group");
     let env = providers.iter().find(|p| p["name"] == "env").unwrap();
     assert_eq!(env["key"]["env"], "RELAY_KEY");

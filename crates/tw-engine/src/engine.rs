@@ -1375,18 +1375,12 @@ mod tests {
             ],
         );
         let base = SetAction::default();
-        match e
-            .phase_two(&facts("x"), "relay", &base)
-            .unwrap()
-        {
+        match e.phase_two(&facts("x"), "relay", &base).unwrap() {
             Outcome2::Proceed(s) => assert_eq!(s.thinking, Some(false)),
             other => panic!("{other:?}"),
         }
         // 换一家就不该命中了 —— 这正是故障转移后必须重跑的理由
-        match e
-            .phase_two(&facts("x"), "official", &base)
-            .unwrap()
-        {
+        match e.phase_two(&facts("x"), "official", &base).unwrap() {
             Outcome2::Proceed(s) => assert_eq!(s.thinking, None),
             other => panic!("{other:?}"),
         }
@@ -1415,10 +1409,7 @@ mod tests {
         );
         let base = SetAction::default();
         for (p, want) in [("a", Some(false)), ("b", Some(false)), ("c", None)] {
-            match e
-                .phase_two(&facts("x"), p, &base)
-                .unwrap()
-            {
+            match e.phase_two(&facts("x"), p, &base).unwrap() {
                 Outcome2::Proceed(s) => assert_eq!(s.thinking, want, "provider={p}"),
                 other => panic!("{other:?}"),
             }

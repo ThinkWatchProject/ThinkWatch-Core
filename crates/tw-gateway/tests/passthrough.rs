@@ -2009,7 +2009,11 @@ async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_unto
     assert_eq!(items[0].rule, "anthropic-api-key");
     assert_eq!(provider, "中转", "得知道发给了谁");
     // 报出来的东西一律打码：「发现了 sk-ant-xxx」本身就是一次泄漏
-    assert!(!items[0].masked.contains("abcdefghijklmnop"), "{:?}", items[0]);
+    assert!(
+        !items[0].masked.contains("abcdefghijklmnop"),
+        "{:?}",
+        items[0]
+    );
 }
 
 #[tokio::test]

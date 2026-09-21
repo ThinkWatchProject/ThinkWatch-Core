@@ -1147,7 +1147,10 @@ mod security_tests {
             let (got, more) = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
             assert!(!more);
             assert_eq!(got.len(), 2, "{got:?}");
-            assert!(got.iter().all(|e| e.guard == "redact" && e.action == action));
+            assert!(
+                got.iter()
+                    .all(|e| e.guard == "redact" && e.action == action)
+            );
             // 倒序：后记的在前
             assert_eq!(got[1].rule, "anthropic-api-key");
             assert_eq!(got[1].count, 2);

@@ -171,7 +171,9 @@ impl Runtime {
             &sec.redact.disable,
             sec.redact.active_custom(),
         )
-        .map_err(|e| GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}")))?;
+        .map_err(|e| {
+            GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
+        })?;
         let tools = tw_scan::rules::tool_rules(&sec.inspect_tools).map_err(|e| {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         })?;
@@ -2715,7 +2717,6 @@ fn local_answer(kind: crate::clientprobe::ProbeKind, body: &Bytes) -> Response {
     )
         .into_response()
 }
-
 
 /// 一次工具调用命中写成事件。流式、整包、WebSocket 三条路共用 —— 字段写漏
 /// 一个，就有一条路上的日志说不清是哪条规则。

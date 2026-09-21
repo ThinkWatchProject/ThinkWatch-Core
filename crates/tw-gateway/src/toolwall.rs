@@ -767,8 +767,7 @@ mod tests {
 
     #[test]
     fn a_harmless_non_streaming_call_is_counted_but_not_flagged() {
-        // **数到了但没报警。**计数是防线三的输入（上游行为画像），
-        // 它不该只在命中规则时才发生。
+        // **看过了但没报警。**每个调用都要过一遍规则，不只是可疑的那些。
         let (calls, v) = whole_of(serde_json::json!({
             "choices": [{ "message": { "tool_calls": [{ "function": {
                 "name": "read_file",
@@ -966,8 +965,7 @@ mod tests {
 
     #[test]
     fn the_wall_counts_what_the_response_contained() {
-        // 行为画像要的是数字，而数数的位置只有这里 —— 别处都拿不到
-        // 「这条响应里有几个工具调用」。
+        // 每个调用都看了、只看了一次：两个调用，一条命中。
         let mut w = Wall::new(rules());
         w.feed(start(0, "Read").as_bytes());
         w.feed(start(1, "Bash").as_bytes());

@@ -75,8 +75,8 @@ pub struct Config {
     /// 客户端自己发的辅助请求怎么处理。默认只拦 A 类。
     #[serde(default, skip_serializing_if = "is_default")]
     pub client_probes: ClientProbes,
-    /// 三道防线。**出厂时都停在「观察」** —— 只记录，不改变
-    /// 任何行为。
+    /// 两项防护：出站脱敏、工具调用审查。**出厂时都停在「观察」** ——
+    /// 只记录，不改变任何行为。对所有上游一视同仁。
     #[serde(default, skip_serializing_if = "is_default")]
     pub security: Security,
     /// 日志留多久。不写就是默认值。
@@ -808,7 +808,6 @@ impl Provider {
             .unwrap_or("");
         OFFICIAL.contains(&host) || host.ends_with(".amazonaws.com")
     }
-
 }
 
 /// 刷新之后要写回配置的值。

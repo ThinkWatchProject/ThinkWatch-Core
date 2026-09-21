@@ -146,9 +146,13 @@ pub async fn quote(
         input_tokens: input as i64,
         cost_micros: quote.cost_micros,
         billing: quote.billing.slug().to_string(),
-        // 脱敏在重放里照做，但用户有权在按下去之前知道
-        will_redact: !tw_gateway::guard::effective_kinds(provider, &tw_engine::Guard::default())
-            .is_empty(),
+        // 脱敏在重放里照做，但用户有权在按下去之前知道：拦截档下、这份请求体
+        // 里确实有要换的东西
+        will_redact: {
+            let rt = s.gateway.runtime();
+            let mode = rt.config.security.redact.mode;
+            mode.acts() && !tw_gateway::guard::find(mode, &rt.redact, &raw).is_empty()
+        },
         pricing_date: book.table().date.clone(),
     }))
 }
@@ -200,11 +204,11 @@ pub async fn run(
         })?;
 
     // **脱敏照做。**重放不经过数据面的管线，少了这一行，一条本来会被
-    // 脱敏的请求会因为「重放」这个动作把密钥原样发给中转站
-    let (body, ledger) = tw_gateway::guard::redact_outbound(
-        cfg.security.redact,
-        provider,
-        &tw_engine::Guard::default(),
+    // 脱敏的请求会因为「重放」这个动作把密钥原样发出去
+    let rt = s.gateway.runtime();
+    let (body, ledger) = tw_gateway::guard::replace(
+        rt.config.security.redact.mode,
+        &rt.redact,
         bytes::Bytes::from(raw),
     );
 

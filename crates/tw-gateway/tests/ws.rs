@@ -180,7 +180,7 @@ async fn a_second_frame_gets_its_own_placeholder_number() {
 ///
 /// 和 SSE 那条路同一条纪律：先判断再转发，命中那一帧不发。
 #[tokio::test]
-async fn a_dangerous_tool_call_from_an_untrusted_upstream_cuts_the_connection() {
+async fn a_dangerous_tool_call_cuts_the_connection() {
     let (up, _seen) = start_upstream("danger").await;
     let gw = start_gateway(up, SecurityMode::Observe, SecurityMode::Enforce).await;
     let mut c = connect(gw).await;

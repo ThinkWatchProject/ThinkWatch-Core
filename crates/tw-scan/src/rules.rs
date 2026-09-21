@@ -62,8 +62,6 @@ pub struct RuleFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
-    #[error("the built-in rules file could not be parsed: {0}")]
-    Builtin(String),
     #[error("the pattern of rule `{name}` is not a valid regular expression: {detail}")]
     BadPattern { name: String, detail: String },
 }
@@ -379,7 +377,10 @@ mod tests {
         assert!(!rs.rules.iter().any(|x| x.id == "ignore-previous"));
     }
 
-    fn policy(disable: &[&str], custom: &[(&str, &str, tw_config::ToolAction)]) -> tw_config::ToolPolicy {
+    fn policy(
+        disable: &[&str],
+        custom: &[(&str, &str, tw_config::ToolAction)],
+    ) -> tw_config::ToolPolicy {
         tw_config::ToolPolicy {
             disable: disable.iter().map(|s| s.to_string()).collect(),
             custom: custom
@@ -402,7 +403,11 @@ mod tests {
         let n = tool_rules(&Default::default()).unwrap().rules.len();
         let rs = tool_rules(&policy(
             &[],
-            &[("删除集群资源", r"kubectl\s+delete", tw_config::ToolAction::Cut)],
+            &[(
+                "删除集群资源",
+                r"kubectl\s+delete",
+                tw_config::ToolAction::Cut,
+            )],
         ))
         .unwrap();
         assert_eq!(rs.rules.len(), n + 1, "内置那些被顶掉了");
@@ -415,7 +420,11 @@ mod tests {
 
     #[test]
     fn a_user_rule_that_does_not_say_cut_only_records() {
-        let rs = tool_rules(&policy(&[], &[("我的", "zzz", tw_config::ToolAction::Record)])).unwrap();
+        let rs = tool_rules(&policy(
+            &[],
+            &[("我的", "zzz", tw_config::ToolAction::Record)],
+        ))
+        .unwrap();
         assert!(!rs.rules.iter().find(|x| x.id == "我的").unwrap().high);
     }
 

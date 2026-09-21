@@ -1250,7 +1250,8 @@ pub struct SecurityEvent {
 }
 
 /// 读安全日志时的那段 SELECT。**上游、密钥、模型优先取请求那一行的。**
-const SECURITY_SELECT: &str = "SELECT e.id, e.at_ms, e.request_id, e.guard, e.rule, e.custom, e.action,
+const SECURITY_SELECT: &str =
+    "SELECT e.id, e.at_ms, e.request_id, e.guard, e.rule, e.custom, e.action,
         COALESCE(NULLIF(r.provider, ''), e.provider),
         COALESCE(NULLIF(r.client, ''), e.client),
         COALESCE(r.model, ''),

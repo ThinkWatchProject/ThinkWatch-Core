@@ -28,6 +28,7 @@ pub mod resources;
 pub mod rotation;
 pub mod routes;
 pub mod scan;
+pub mod security;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
 
@@ -111,12 +112,10 @@ pub fn router(state: ControlState) -> Router {
         .route("/latency/provider", get(latency_by_provider))
         .route("/storage", get(storage))
         .route("/quota", get(quota))
-        .route("/leaks", get(leaks))
         .route("/speed/quote", post(speed_quote))
         .route("/speed/run", post(speed_run))
         .route("/request/{id}", get(request_detail))
         // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认
-        .route("/baseline", get(baseline))
         // 诊断包（脱敏纪律）。**只读，不写任何文件**
         .route("/diagnostics", get(diagnostics::bundle))
         // **报价和真跑是两个端点**：这一步花钱（和 L3 测速同一条纪律）
@@ -142,6 +141,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/mcp/apply", post(clients::mcp_apply))
         .merge(resources::router())
         .merge(routes::router())
+        .merge(security::router())
         .merge(pricing::router())
         .merge(chatgpt::router())
         .with_state(state)
@@ -297,11 +297,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         // 按不同的事实画同一张表
         clients: keys::views(&s).await,
         security: tw_api::SecurityView {
-            redact: cfg.security.redact.slug().to_string(),
-            inspect_tools: cfg.security.inspect_tools.slug().to_string(),
-            scan_configs: cfg.security.scan_configs.slug().to_string(),
-            scan_rules_added: cfg.security.scan_rules.add.len(),
-            scan_rules_disabled: cfg.security.scan_rules.disable.len(),
+            redact: cfg.security.redact.mode.slug().to_string(),
+            inspect_tools: cfg.security.inspect_tools.mode.slug().to_string(),
         },
         default_route: engine.default_route().to_string(),
         client_probes: cfg
@@ -407,18 +404,6 @@ fn provider_view(
         },
         billing: p.billing.map(|b| b.slug().to_string()),
         billing_effective: s.gateway.billing_of(p).slug().to_string(),
-        // **给判完的结果，不是配置里那个 Option。**界面要显示的是
-        // 「这家现在算不算受信任」，而那件事在没写的时候由 base_url 决定
-        trust: tw_gateway::guard::effective_trust(p, &tw_engine::Guard::default())
-            .slug()
-            .to_string(),
-        trust_explicit: p.trust.is_some(),
-        redact: p
-            .effective_redact()
-            .iter()
-            .map(|k| k.slug().to_string())
-            .collect(),
-        redact_explicit: p.redact.is_some(),
         references: tw_config::refs::provider_refs(cfg, &p.name)
             .iter()
             .map(resources::reference_view)
@@ -662,8 +647,8 @@ async fn summary(
         subscription_requests: x.subscription_requests,
         subscription_tokens: x.subscription_tokens,
         cache_saved_micros: x.cache_saved_micros,
-        flagged_requests: x.flagged_requests,
-        redacted_requests: x.redacted_requests,
+        // **和安全日志数的是同一批**：概览上点开这个数，落到的日志就是这么多条
+        security: g.db().security_counts(from, to).map_err(internal)?,
         pricing_date: s.gateway.pricing.load().table().date.clone(),
     }))
 }
@@ -676,7 +661,23 @@ async fn history(
     let store = need_store(&s)?;
     let g = store.lock().await;
     let rows = g.db().recent(q.within(), q.limit()).map_err(internal)?;
-    Ok(Json(rows.into_iter().map(history_row).collect()))
+    // 这一段里的安全记录一次取完，按请求号挂上去。**流量页的徽标靠它**：
+    // 以前徽标只来自实时事件，关窗再开就没了
+    let mut security = match (
+        rows.iter().map(|r| r.id).min(),
+        rows.iter().map(|r| r.id).max(),
+    ) {
+        (Some(from), Some(to)) => g.db().security_of_requests(from, to).map_err(internal)?,
+        _ => Default::default(),
+    };
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| {
+                let sec = security.remove(&r.id).unwrap_or_default();
+                history_row(r, sec)
+            })
+            .collect(),
+    ))
 }
 
 async fn latency(
@@ -832,35 +833,6 @@ fn targets<'a>(
         .collect()
 }
 
-/// 出站密钥检测攒下的证据。
-///
-/// **默认看过去 7 天** —— 那正是「跑上一周」之后那句话的时间尺度。
-async fn leaks(
-    State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<Days>,
-) -> Result<Json<Vec<tw_api::LeakGroup>>, Fail> {
-    let since = now_ms() - (q.days.unwrap_or(7) as i64) * 86_400_000;
-    let store = need_store(&s)?;
-    let g = store.lock().await;
-    let xs = g.db().leak_summary(since).map_err(internal)?;
-    Ok(Json(
-        xs.into_iter()
-            .map(|l| tw_api::LeakGroup {
-                provider: l.provider,
-                secret: l.kind,
-                requests: l.requests,
-                last_at_ms: l.last_at_ms,
-                masked: l.masked,
-            })
-            .collect(),
-    ))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Days {
-    days: Option<u32>,
-}
-
 /// 一条请求的全部细节，含 body。
 ///
 /// **body 是从磁盘现读的，不进内存缓存。**详情抽屉一次只看一条，而把
@@ -891,10 +863,16 @@ async fn request_detail(
             truncated: original_len > stored,
         })
     };
+    let security = g
+        .db()
+        .security_of_requests(id, id)
+        .map_err(internal)?
+        .remove(&id)
+        .unwrap_or_default();
     let detail = tw_api::RequestDetail {
         request_body: body(tw_store::Which::Request),
         response_body: body(tw_store::Which::Response),
-        row: history_row(row),
+        row: history_row(row, security),
     };
     Ok(Json(detail))
 }
@@ -982,7 +960,10 @@ fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Reco
     })
 }
 
-fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
+fn history_row(
+    r: tw_store::RequestRow,
+    security: Vec<tw_api::SecurityEventView>,
+) -> tw_api::HistoryRow {
     tw_api::HistoryRow {
         id: r.id,
         at_ms: r.at_ms,
@@ -1021,6 +1002,7 @@ fn history_row(r: tw_store::RequestRow) -> tw_api::HistoryRow {
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
         session: r.session,
+        security,
     }
 }
 
@@ -1271,62 +1253,6 @@ pub(crate) fn apply_fail(e: ApplyError) -> Fail {
         code,
         msg!("control.config_rejected", detail = e => "{detail}"),
     )
-}
-
-/// 最近这一段有多长。
-const RECENT_HOURS: u32 = 24;
-/// 拿来当基线的那一段有多长。
-const BASELINE_DAYS: u32 = 30;
-
-/// 每个上游最近是不是变了（防线三）。
-///
-/// **两段时间不重叠**：基线是「最近这一段之前的那 30 天」，不含最近的
-/// 那 24 小时。重叠的话，一次异常会同时抬高两边，把自己的信号冲淡。
-async fn baseline(State(s): State<ControlState>) -> Json<tw_api::BaselineResponse> {
-    let mut out = tw_api::BaselineResponse {
-        recent_hours: RECENT_HOURS,
-        baseline_days: BASELINE_DAYS,
-        providers: Vec::new(),
-        unavailable: s.store.is_none(),
-    };
-    let Some(store) = &s.store else {
-        return Json(out);
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let recent_from = now - (RECENT_HOURS as i64) * 3_600_000;
-    let base_from = recent_from - (BASELINE_DAYS as i64) * 86_400_000;
-
-    let g = store.lock().await;
-    for provider in g.db().providers_seen().unwrap_or_default() {
-        let Ok(recent) = g.db().shape_of(&provider, recent_from, now) else {
-            continue;
-        };
-        let Ok(base) = g.db().shape_of(&provider, base_from, recent_from) else {
-            continue;
-        };
-        out.providers.push(tw_api::ProviderBaseline {
-            recent_total: recent.total,
-            baseline_total: base.total,
-            recent_inspected: recent.inspected,
-            baseline_inspected: base.inspected,
-            drifts: tw_store::drift::compare(&recent, &base)
-                .into_iter()
-                .map(|d| tw_api::DriftView {
-                    metric: d.metric.to_string(),
-                    recent: d.recent,
-                    baseline: d.baseline,
-                    recent_n: d.recent_n,
-                    baseline_n: d.baseline_n,
-                    notable: d.notable,
-                })
-                .collect(),
-            provider,
-        });
-    }
-    Json(out)
 }
 
 fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {

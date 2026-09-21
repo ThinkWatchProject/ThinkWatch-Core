@@ -131,21 +131,41 @@ pub const BUILTINS: &[Builtin] = &[
             min_len: OPENAI_MIN,
         },
     },
-    prefix("github-personal-token", "GitHub personal access token", "ghp_", 30),
+    prefix(
+        "github-personal-token",
+        "GitHub personal access token",
+        "ghp_",
+        30,
+    ),
     prefix("github-oauth-token", "GitHub OAuth token", "gho_", 30),
     prefix("github-server-token", "GitHub server token", "ghs_", 30),
     prefix("github-user-token", "GitHub user token", "ghu_", 30),
-    prefix("github-fine-grained-token", "GitHub fine-grained token", "github_pat_", 30),
+    prefix(
+        "github-fine-grained-token",
+        "GitHub fine-grained token",
+        "github_pat_",
+        30,
+    ),
     prefix("slack-bot-token", "Slack bot token", "xoxb-", 20),
     prefix("slack-user-token", "Slack user token", "xoxp-", 20),
     prefix("slack-app-token", "Slack app token", "xoxa-", 20),
     prefix("aws-access-key-id", "AWS access key ID", "AKIA", 12),
-    prefix("aws-temporary-key-id", "AWS temporary access key ID", "ASIA", 12),
+    prefix(
+        "aws-temporary-key-id",
+        "AWS temporary access key ID",
+        "ASIA",
+        12,
+    ),
     prefix("google-api-key", "Google API key", "AIza", 30),
     prefix("google-oauth-token", "Google OAuth token", "ya29.", 20),
     prefix("gitlab-token", "GitLab token", "glpat-", 15),
     prefix("stripe-live-key", "Stripe live key", "sk_live_", 20),
-    prefix("stripe-restricted-key", "Stripe restricted key", "rk_live_", 20),
+    prefix(
+        "stripe-restricted-key",
+        "Stripe restricted key",
+        "rk_live_",
+        20,
+    ),
     prefix("npm-token", "npm token", "npm_", 30),
     prefix("digitalocean-token", "DigitalOcean token", "dop_v1_", 30),
     prefix("sendgrid-key", "SendGrid key", "SG.", 30),
@@ -924,7 +944,10 @@ mod tests {
         // 多半是拼错了；也可能是一条后来改了名的内置规则。都不该让整套停摆。
         let (set, unknown) =
             RuleSet::build(&["internal-ipp".into()], &["jwtt".into()], []).unwrap();
-        assert_eq!(unknown, vec!["internal-ipp".to_string(), "jwtt".to_string()]);
+        assert_eq!(
+            unknown,
+            vec!["internal-ipp".to_string(), "jwtt".to_string()]
+        );
         assert!(set.is_on("jwt"));
     }
 
@@ -981,7 +1004,8 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(&text[got[0].bytes.clone()], "pw=hunter2");
         // 内置规则同样换算回原文，包括跨过换行的私钥块
-        let pem = "看：\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n完";
+        let pem =
+            "看：\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n完";
         let got = scan_plain(pem, &RuleSet::defaults());
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(pem[got[0].bytes.clone()].starts_with("-----BEGIN RSA"));

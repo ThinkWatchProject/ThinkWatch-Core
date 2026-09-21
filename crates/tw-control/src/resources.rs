@@ -164,12 +164,6 @@ async fn preview_provider(
     };
     Ok(Json(tw_api::ProviderPreview {
         protocol: p.effective_protocol().map(|x| x.slug().to_string()),
-        official: p.is_official_endpoint(),
-        redact: p
-            .effective_redact()
-            .iter()
-            .map(|k| k.slug().to_string())
-            .collect(),
         auth_header: chosen.auth_header().0.to_string(),
     }))
 }
@@ -418,20 +412,6 @@ fn to_provider(
             .billing
             .as_deref()
             .map(|v| slug("billing mode", v))
-            .transpose()?,
-        redact: input
-            .redact
-            .as_ref()
-            .map(|ks| {
-                ks.iter()
-                    .map(|k| slug("redaction class", k))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?,
-        trust: input
-            .trust
-            .as_deref()
-            .map(|v| slug("trust level", v))
             .transpose()?,
         proxy: input.proxy.trim().to_string(),
         on_proxy_fail: slug("setting for an unusable proxy", &input.on_proxy_fail)?,

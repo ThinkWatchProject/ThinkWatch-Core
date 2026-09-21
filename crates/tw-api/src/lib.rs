@@ -566,12 +566,11 @@ pub struct Overview {
     pub groups: Vec<GroupView>,
     pub clients: Vec<ClientView>,
     pub listen: ListenView,
-    /// 三条防线各自的状态。
+    /// 两项防护各在哪一档。
     ///
-    /// **界面要能配它们，而不只是显示。**在此之前这三个字段根本没出现
-    /// 在这个视图里，于是「脱敏开没开」只能去翻 config.yaml —— 而三态
-    /// 的整个设计前提是「出厂停在观察态，用户看到证据之后自己决定要不
-    /// 要切到拦截」，一个切不了的开关让那个设计不成立。
+    /// **界面要能配它们，而不只是显示。**三态的整个设计前提是「出厂停在
+    /// 观察态，用户看到证据之后自己决定要不要切到拦截」，一个切不了的开关
+    /// 让那个设计不成立。规则在 `/security` 里。
     #[serde(default)]
     pub security: SecurityView,
     /// 没绑路由的密钥走哪条

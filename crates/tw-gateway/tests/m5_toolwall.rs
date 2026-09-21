@@ -256,7 +256,10 @@ async fn a_custom_rule_that_says_cut_cuts() {
         },
     ))
     .await;
-    assert!(!body.contains("namespace prod"), "自定义的切断规则没切：{body}");
+    assert!(
+        !body.contains("namespace prod"),
+        "自定义的切断规则没切：{body}"
+    );
     let (cut, blocked, tool, rule) = flagged(&mut rx).await.expect("没发告警事件");
     assert!(cut && blocked);
     assert_eq!(tool, "Bash");
@@ -423,5 +426,8 @@ async fn a_harmless_non_streaming_tool_call_passes_without_a_record() {
         body.contains("npm install"),
         "把一个正常的工具调用扣了：{body}"
     );
-    assert!(flagged(&mut rx).await.is_none(), "对一个正常的工具调用报了警");
+    assert!(
+        flagged(&mut rx).await.is_none(),
+        "对一个正常的工具调用报了警"
+    );
 }

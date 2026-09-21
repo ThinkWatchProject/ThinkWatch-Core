@@ -51,28 +51,9 @@ pub async fn scan(
     State(s): State<ControlState>,
     Query(p): Query<Params>,
 ) -> Json<tw_api::ScanResponse> {
-    // 规则住在 config.yaml 里，所以「现在生效的是哪一套」和
-    // 「现在生效的是哪一份配置」永远是同一个答案
-    let cfg = s.config();
-    let rules = match tw_scan::rules::build(&cfg.security.scan_rules) {
-        Ok(r) => r,
-        Err(e) => {
-            return Json(tw_api::ScanResponse {
-                findings: Vec::new(),
-                mcp: Vec::new(),
-                skills: Vec::new(),
-                hooks: Vec::new(),
-                conflicting: Vec::new(),
-                unreadable: Vec::new(),
-                scanned: 0,
-                rules_active: 0,
-                rules_custom: 0,
-                rules_disabled: 0,
-                rules_warning: Some(e.to_string()),
-                projects: p.project,
-            });
-        }
-    };
+    // **只用内置规则。**安全页上的规则只作用于经过网关的请求：在那边停用
+    // 一条误报，不该让这边悄悄少查一样东西
+    let rules = tw_scan::rules::scan_rules();
 
     let mut sources = tw_scan::sources::user_level(&s.home);
     for proj in &p.project {
@@ -121,12 +102,6 @@ pub async fn scan(
             .collect(),
         unreadable: r.unreadable,
         scanned,
-        rules_active: rules.rules.len(),
-        rules_custom: rules.custom(),
-        rules_disabled: rules.disabled.len(),
-        // **写坏的那几条要说出来** —— 一条静默失效的安全规则，比没有那条
-        // 规则更糟，因为用户以为它在
-        rules_warning: (!rules.warnings.is_empty()).then(|| rules.warnings.join("; ")),
         projects: p.project,
     })
 }
@@ -143,7 +118,6 @@ pub fn spawn_watcher(
     state: ControlState,
 ) -> Result<Arc<tw_scan::watch::Watch>, tw_scan::watch::WatchError> {
     let home = state.home.clone();
-    let cfg = state.config();
     let dirs = tw_scan::watch::dirs_for(&tw_scan::sources::user_level(&home));
     tracing::debug!(
         dirs = dirs.len(),
@@ -155,11 +129,9 @@ pub fn spawn_watcher(
     tokio::spawn(async move {
         let mut seen = tw_scan::watch::Seen::default();
         // 先垫一次底：把此刻已经存在的那些记下来，它们不算「新出现」
+        // 内置规则，和打开页面时扫的是同一套
+        let rules = tw_scan::rules::scan_rules();
         let scan_now = |home: &std::path::Path| {
-            let rules = tw_scan::rules::build(&cfg.security.scan_rules).unwrap_or_else(|_| {
-                tw_scan::rules::build(&tw_config::ScanRules::default())
-                    .expect("the built-in rules' patterns are valid, and a test keeps them so")
-            });
             tw_scan::report::scan(&tw_scan::sources::user_level(home), &rules)
         };
         seen.diff(&scan_now(&home).findings);

@@ -67,7 +67,9 @@ pub enum ValidationError {
     EmptyRuleName { what: &'static str },
     #[error("the custom {what} rule name `{name}` appears twice")]
     DuplicateRuleName { what: &'static str, name: String },
-    #[error("the pattern of custom {what} rule `{name}` is not a valid regular expression: {detail}")]
+    #[error(
+        "the pattern of custom {what} rule `{name}` is not a valid regular expression: {detail}"
+    )]
     BadRulePattern {
         what: &'static str,
         name: String,
@@ -521,7 +523,10 @@ mod tests {
 
     #[test]
     fn custom_rules_that_compile_are_accepted() {
-        let x = with_rules(&[("公司令牌", r"corp_[A-Za-z0-9]{32}")], &[("删除集群资源", r"kubectl\s+delete")]);
+        let x = with_rules(
+            &[("公司令牌", r"corp_[A-Za-z0-9]{32}")],
+            &[("删除集群资源", r"kubectl\s+delete")],
+        );
         assert!(validate(&x).is_ok(), "{:?}", validate(&x));
     }
 

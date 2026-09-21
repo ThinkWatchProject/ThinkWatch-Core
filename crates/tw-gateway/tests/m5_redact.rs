@@ -270,10 +270,7 @@ async fn failing_over_redacts_what_the_second_hop_sends() {
     };
     let (up, seen) = start_upstream(false).await;
     let gw = start_gateway(
-        vec![
-            provider("first", dead),
-            provider("relay", up),
-        ],
+        vec![provider("first", dead), provider("relay", up)],
         SecurityMode::Enforce,
     )
     .await;

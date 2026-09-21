@@ -285,9 +285,10 @@ mod tests {
     #[test]
     fn a_custom_tool_rule_records_unless_it_says_to_cut() {
         // 手写的规则默认只记不切 —— 要它动手得自己写明白
-        let p: ToolPolicy =
-            serde_yaml_ng::from_str("custom:\n  - name: 删除集群资源\n    pattern: 'kubectl\\s+delete'\n")
-                .unwrap();
+        let p: ToolPolicy = serde_yaml_ng::from_str(
+            "custom:\n  - name: 删除集群资源\n    pattern: 'kubectl\\s+delete'\n",
+        )
+        .unwrap();
         assert_eq!(p.custom[0].action, ToolAction::Record);
         // 默认值不写回文件
         let out = serde_yaml_ng::to_string(&p).unwrap();

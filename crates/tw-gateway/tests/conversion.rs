@@ -409,7 +409,7 @@ async fn redaction_applies_to_the_converted_request() {
 }
 
 #[tokio::test]
-async fn a_dangerous_call_from_an_untrusted_upstream_is_cut_in_the_converted_stream() {
+async fn a_dangerous_call_is_cut_in_the_converted_stream() {
     // 以前工具调用审查只认 Anthropic 的流：转换给 Chat 客户端之后，同样的调用
     // 原样送到了客户端手里
     let stream = [
