@@ -219,14 +219,21 @@ impl GatewayError {
         };
         format!("event: error\ndata: {data}\n\n")
     }
-}
 
-impl IntoResponse for GatewayError {
-    fn into_response(self) -> Response {
+    /// 这个错误的响应体，**客户端方言的形状**。
+    ///
+    /// 非流式的响应体被扣下来时要顶替它的位置：状态码和响应头那时已经
+    /// 发出去了，body 是唯一还能说话的地方 —— 和 `sse_frame` 在流上扮
+    /// 演的是同一个角色。
+    pub fn body_bytes(&self) -> Vec<u8> {
+        self.body_value().to_string().into_bytes()
+    }
+
+    fn body_value(&self) -> serde_json::Value {
         // `[ThinkWatch]` 前缀不是装饰。没有它，用户看到一个 401 会先去
         // 查上游的密钥 —— 而问题在中间这一层。
         let msg = format!("[ThinkWatch] {}", self.detail.text);
-        let body = match self.dialect {
+        match self.dialect {
             Dialect::Anthropic => serde_json::json!({
                 "type": "error",
                 "error": { "type": self.source.anthropic_type(), "message": msg },
@@ -247,7 +254,13 @@ impl IntoResponse for GatewayError {
                     "status": self.source.google_status(),
                 }
             }),
-        };
+        }
+    }
+}
+
+impl IntoResponse for GatewayError {
+    fn into_response(self) -> Response {
+        let body = self.body_value();
         let mut resp = (self.source.status(), axum::Json(body)).into_response();
         resp.headers_mut().insert(
             "x-thinkwatch-error",
