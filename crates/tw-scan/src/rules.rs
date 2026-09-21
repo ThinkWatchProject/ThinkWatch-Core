@@ -149,8 +149,8 @@ pub fn scan_rules() -> Rules {
 pub fn tool_rules(p: &tw_config::ToolPolicy) -> Result<Rules, RuleError> {
     let f = builtin();
     let mut warnings = Vec::new();
-    for id in p.enable.iter().chain(&p.disable) {
-        if !f.dangerous.iter().any(|s| &s.id == id) {
+    for id in p.enable.iter().chain(&p.disable).chain(p.actions.keys()) {
+        if !f.dangerous.iter().any(|s| &s.id == id) && !warnings.contains(id) {
             warnings.push(id.clone());
         }
     }
@@ -159,7 +159,7 @@ pub fn tool_rules(p: &tw_config::ToolPolicy) -> Result<Rules, RuleError> {
         if p.disable.contains(&s.id) {
             continue;
         }
-        rules.push(compile(s, "dangerous", false)?);
+        rules.push(with_action(compile(s, "dangerous", false)?, p));
     }
     for c in p.custom.iter().filter(|c| !c.disabled) {
         let spec = RuleSpec {
@@ -202,13 +202,32 @@ pub fn single(name: &str, pattern: &str, high: bool) -> Result<Rules, RuleError>
 }
 
 /// 只有一条内置的危险命令规则。**不管它启用没有** —— 安全页上要能试一条
-/// 停用着的规则，再决定开不开。不是内置规则的 id 返回 `None`。
-pub fn one_builtin(id: &str) -> Option<Rules> {
+/// 停用着的规则，再决定开不开。处置按用户设的来。不是内置规则的 id 返回
+/// `None`。
+pub fn one_builtin(id: &str, p: &tw_config::ToolPolicy) -> Option<Rules> {
     let spec = builtin().dangerous.iter().find(|s| s.id == id)?;
+    let rule = compile(spec, "dangerous", false).expect("the built-in patterns compile");
     Some(Rules {
-        rules: vec![compile(spec, "dangerous", false).expect("the built-in patterns compile")],
+        rules: vec![with_action(rule, p)],
         warnings: Vec::new(),
     })
+}
+
+/// 用户改过这条内置规则在拦截档下做什么的话，按改过的来。
+fn with_action(mut rule: Rule, p: &tw_config::ToolPolicy) -> Rule {
+    if let Some(a) = p.actions.get(&rule.id) {
+        rule.high = *a == tw_config::ToolAction::Cut;
+    }
+    rule
+}
+
+/// 一条内置规则出厂时在拦截档下做什么。
+pub fn factory_action(spec: &RuleSpec) -> tw_config::ToolAction {
+    if spec.high() {
+        tw_config::ToolAction::Cut
+    } else {
+        tw_config::ToolAction::Record
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +247,28 @@ mod tests {
             tool_rules(&Default::default()).unwrap().rules.len() >= 10,
             "工具调用审查的内置规则少了"
         );
+    }
+
+    #[test]
+    fn a_built_in_rule_does_what_the_user_set_on_enforce() {
+        let p = tw_config::ToolPolicy {
+            actions: [
+                ("rm-rf-root".to_string(), tw_config::ToolAction::Cut),
+                ("curl-pipe-sh".to_string(), tw_config::ToolAction::Record),
+                ("no-such-rule".to_string(), tw_config::ToolAction::Cut),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let rs = tool_rules(&p).unwrap();
+        let high = |id: &str| rs.rules.iter().find(|r| r.id == id).unwrap().high;
+        assert!(high("rm-rf-root"));
+        assert!(!high("curl-pipe-sh"));
+        // 没改的照出厂
+        assert!(high("base64-decode-exec"));
+        assert_eq!(rs.warnings, vec!["no-such-rule".to_string()]);
+        // 只试一条的时候也按改过的来
+        assert!(one_builtin("rm-rf-root", &p).unwrap().rules[0].high);
     }
 
     #[test]

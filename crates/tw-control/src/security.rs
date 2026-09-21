@@ -33,6 +33,10 @@ pub fn router() -> axum::Router<ControlState> {
         .route("/security/events", get(events))
         .route("/security/{guard}/mode", put(set_mode))
         .route("/security/{guard}/builtin/{id}", put(toggle_builtin))
+        .route(
+            "/security/{guard}/builtin/{id}/action",
+            put(set_builtin_action),
+        )
         .route("/security/{guard}/custom", post(create_custom))
         .route(
             "/security/{guard}/custom/{name}",
@@ -151,6 +155,7 @@ fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
                 enabled: on,
                 on_by_default: b.on_by_default,
                 action: None,
+                default_action: None,
             }
         })
         .collect();
@@ -166,6 +171,7 @@ fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
         enabled: !c.disabled,
         on_by_default: true,
         action: None,
+        default_action: None,
     }));
     tw_api::GuardDetail {
         mode: p.mode.slug().to_string(),
@@ -195,7 +201,15 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
             },
             enabled: !p.disable.contains(&r.id),
             on_by_default: true,
-            action: Some(if r.high() { "cut" } else { "record" }.into()),
+            action: Some(
+                p.actions
+                    .get(&r.id)
+                    .copied()
+                    .unwrap_or_else(|| tw_scan::rules::factory_action(r))
+                    .slug()
+                    .into(),
+            ),
+            default_action: Some(tw_scan::rules::factory_action(r).slug().into()),
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
@@ -210,17 +224,23 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
         enabled: !c.disabled,
         on_by_default: true,
         action: Some(c.action.slug().into()),
+        default_action: None,
     }));
     tw_api::GuardDetail {
         mode: p.mode.slug().to_string(),
         rules,
-        unknown: p
-            .enable
-            .iter()
-            .chain(&p.disable)
-            .filter(|id| !builtin.iter().any(|r| &&r.id == id))
-            .cloned()
-            .collect(),
+        unknown: {
+            let mut ids: Vec<String> = p
+                .enable
+                .iter()
+                .chain(&p.disable)
+                .chain(p.actions.keys())
+                .filter(|id| !builtin.iter().any(|r| &&r.id == id))
+                .cloned()
+                .collect();
+            ids.dedup();
+            ids
+        },
     }
 }
 
@@ -337,6 +357,60 @@ async fn toggle_builtin(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
+fn action_of(slug: &str) -> Result<ToolAction, Fail> {
+    ToolAction::from_slug(slug).ok_or_else(|| {
+        fail(
+            StatusCode::BAD_REQUEST,
+            msg!(
+                "security.unknown_action", action = slug.to_string() =>
+                "`{action}` is not an action; it is cut or record."
+            ),
+        )
+    })
+}
+
+/// 改一条内置规则在拦截档下做什么。
+///
+/// **内置规则提供的只是一条正则。**命中之后切不切，和自定义规则一样由用户
+/// 定 —— 不必为了改处置先复制成一条自定义规则。和出厂一样的就把那一行删掉。
+async fn set_builtin_action(
+    State(s): State<ControlState>,
+    Path((guard, id)): Path<(String, String)>,
+    Json(req): Json<tw_api::ActionSave>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    if Guard::parse(&guard)? != Guard::Tools {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            msg!(
+                "security.no_action" =>
+                "Outbound redaction rules have no action of their own; the mode decides what happens to a match."
+            ),
+        ));
+    }
+    let spec = tw_scan::rules::builtin()
+        .dangerous
+        .iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| unknown_rule(&id))?;
+    let action = action_of(&req.action)?;
+    let factory = tw_scan::rules::factory_action(spec);
+    let version = s
+        .cfg
+        .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
+            let path = [
+                Step::key("security"),
+                Step::key("inspect_tools"),
+                Step::key("actions"),
+                Step::key(id.as_str()),
+            ];
+            let value = (action != factory).then(|| Value::from(action.slug()));
+            Ok(edit::set(text, &path, value.as_ref())?)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
 /// 检查一条自定义规则，写成配置里的样子。
 fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fail> {
     let name = req.name.trim();
@@ -354,15 +428,7 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
     if guard == Guard::Tools {
         let action = match req.action.as_deref() {
             None => ToolAction::default(),
-            Some(a) => ToolAction::from_slug(a).ok_or_else(|| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    msg!(
-                        "security.unknown_action", action = a =>
-                        "`{action}` is not an action; it is cut or record."
-                    ),
-                )
-            })?,
+            Some(a) => action_of(a)?,
         };
         // 默认值不写进文件
         if action != ToolAction::default() {
@@ -525,7 +591,8 @@ async fn test(
                     &trial
                 }
                 (None, Some(id)) => {
-                    trial = tw_scan::rules::one_builtin(id).ok_or_else(|| unknown_rule(id))?;
+                    trial = tw_scan::rules::one_builtin(id, &s.config().security.inspect_tools)
+                        .ok_or_else(|| unknown_rule(id))?;
                     &trial
                 }
                 (None, None) => rt.tools.as_ref(),
