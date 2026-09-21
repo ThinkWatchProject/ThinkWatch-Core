@@ -472,6 +472,14 @@ async fn a_broken_pattern_is_refused_before_anything_is_written() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["code"], "security.bad_pattern");
+    // 说的是正则哪里写错了，不提那条临时规则的名字
+    let text = v["text"].as_str().unwrap();
+    assert!(!text.contains("trial"), "{text}");
+    assert_eq!(
+        text.matches("not a valid regular expression").count(),
+        1,
+        "{text}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────── 测试

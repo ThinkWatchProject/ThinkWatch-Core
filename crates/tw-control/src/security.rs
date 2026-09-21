@@ -510,15 +510,18 @@ async fn test(
             let trial;
             let rules = match (&req.pattern, &req.rule) {
                 (Some(p), _) => {
-                    trial = tw_scan::rules::single(TRIAL, p, true).map_err(|e| {
-                        fail(
-                            StatusCode::BAD_REQUEST,
-                            msg!(
-                                "security.bad_pattern", detail = e =>
-                                "The pattern is not a valid regular expression: {detail}"
-                            ),
-                        )
-                    })?;
+                    // 只要正则引擎那半句：规则名是这里临时起的，说出来只会让人困惑
+                    trial = tw_scan::rules::single(TRIAL, p, true).map_err(
+                        |tw_scan::rules::RuleError::BadPattern { detail, .. }| {
+                            fail(
+                                StatusCode::BAD_REQUEST,
+                                msg!(
+                                    "security.bad_pattern", detail = detail =>
+                                    "The pattern is not a valid regular expression: {detail}"
+                                ),
+                            )
+                        },
+                    )?;
                     &trial
                 }
                 (None, Some(id)) => {
