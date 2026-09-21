@@ -430,8 +430,9 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                     continue;
                 };
                 let (line, excerpt) = line_of(&text, m.as_str());
-                // `msg!` 会把 `rule` 遮住，所以句子要用到的两段先取出来
+                // `msg!` 会把 `rule` 遮住，所以句子要用到的几段先取出来
                 let why = rule.why.clone();
+                let name = rule.name.clone();
                 let kind_why = src.kind.why();
                 r.findings.push(Finding {
                     // **hook 和 MCP 里的危险命令是最高级**：它们不需要
@@ -450,8 +451,9 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
                         "scan.rule",
                         kind = src.kind.slug(),
                         rule = rule.id.clone()
-                        => "{} matched rule `{rule}`",
-                        src.kind.label()
+                        => "{} matched rule “{}”",
+                        src.kind.label(),
+                        name
                     ),
                     detail: msg!(
                         "scan.rule.detail",

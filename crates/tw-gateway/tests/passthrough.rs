@@ -457,7 +457,6 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
                 to: Some("official".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
             tw_engine::Rule {
                 name: "兜底".into(),
@@ -465,7 +464,6 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
                 to: Some("relay".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
         ])],
     };
@@ -1115,7 +1113,6 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
                 ..Default::default()
             }),
             deny: None,
-            guard: None,
         }],
     );
     // 没有别的规则时层 0 会补一条兜底 —— 但只有在 routes 为空时。
@@ -1126,7 +1123,6 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
         to: Some("official".into()),
         set: None,
         deny: None,
-        guard: None,
     });
     // 兜底只指一家的话就没得转移了 —— 用组把两家串起来。
     cfg.groups = vec![tw_engine::Group {
@@ -1178,7 +1174,6 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
                 to: None,
                 set: None,
                 deny: Some("这段内容不发给中转站".into()),
-                guard: None,
             },
             tw_engine::Rule {
                 name: "兜底".into(),
@@ -1186,7 +1181,6 @@ async fn a_phase_two_deny_reaches_the_client_with_its_reason() {
                 to: Some("relay".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
         ],
     ))
@@ -1267,7 +1261,6 @@ async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
                 ..Default::default()
             }),
             deny: None,
-            guard: None,
         }],
     );
     cfg.groups = vec![tw_engine::Group {
@@ -1488,7 +1481,6 @@ async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
                 to: Some("便宜的".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
             tw_engine::Rule {
                 name: "兜底".into(),
@@ -1496,7 +1488,6 @@ async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
                 to: Some("正常的".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
         ],
     );
@@ -1553,7 +1544,6 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
                 to: Some("便宜的".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
             tw_engine::Rule {
                 name: "兜底".into(),
@@ -1561,7 +1551,6 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
                 to: Some("正常的".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
         ],
     );
@@ -1717,7 +1706,6 @@ async fn a_deny_rule_is_403_not_400() {
                 to: None,
                 set: None,
                 deny: Some("这个项目不用 opus".into()),
-                guard: None,
             },
             tw_engine::Rule {
                 name: "兜底".into(),
@@ -1725,7 +1713,6 @@ async fn a_deny_rule_is_403_not_400() {
                 to: Some("up".into()),
                 set: None,
                 deny: None,
-                guard: None,
             },
         ],
     ))
@@ -2004,24 +1991,29 @@ async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_unto
     let mut found = None;
     for _ in 0..8 {
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-            Ok(Ok(tw_api::Event::LeakSeen {
-                secret,
-                masked,
+            Ok(Ok(tw_api::Event::SecretsFound {
+                items,
                 provider,
+                replaced,
                 ..
             })) => {
-                found = Some((secret, masked, provider));
+                found = Some((items, provider, replaced));
                 break;
             }
             Ok(Ok(_)) => continue,
             _ => break,
         }
     }
-    let (secret, masked, provider) = found.expect("请求体里有 key，却没有发现");
-    assert_eq!(secret, "anthropic-api-key");
-    assert_eq!(provider, "中转", "得知道发给了谁 —— 那才是这条防线的意义");
+    let (items, provider, replaced) = found.expect("请求体里有 key，却没有发现");
+    assert!(!replaced, "观察档说自己换了");
+    assert_eq!(items[0].rule, "anthropic-api-key");
+    assert_eq!(provider, "中转", "得知道发给了谁");
     // 报出来的东西一律打码：「发现了 sk-ant-xxx」本身就是一次泄漏
-    assert!(!masked.contains("abcdefghijklmnop"), "{masked}");
+    assert!(
+        !items[0].masked.contains("abcdefghijklmnop"),
+        "{:?}",
+        items[0]
+    );
 }
 
 #[tokio::test]
@@ -2036,7 +2028,7 @@ async fn turning_the_detector_off_stops_it_looking_at_all() {
         }],
         vec![],
     );
-    cfg.security.redact = tw_config::SecurityMode::Off;
+    cfg.security.redact.mode = tw_config::SecurityMode::Off;
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
     let gw = {
@@ -2055,7 +2047,7 @@ async fn turning_the_detector_off_stops_it_looking_at_all() {
 
     for _ in 0..8 {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-            Ok(Ok(tw_api::Event::LeakSeen { .. })) => panic!("关掉了却还在检测"),
+            Ok(Ok(tw_api::Event::SecretsFound { .. })) => panic!("关掉了却还在检测"),
             Ok(Ok(_)) => continue,
             _ => break,
         }
@@ -2105,7 +2097,6 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
         to: Some("全部".into()),
         set: None,
         deny: None,
-        guard: None,
     }])];
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();

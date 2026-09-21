@@ -7,14 +7,25 @@
 //!
 //! 贯穿全文件的一条：**宁可漏，不可吵。**一个天天误报的安全功能，用户
 //! 第二天就关了 ——而关掉之后，它连该抓的那次也抓不到了。所以
-//! 每一条规则都要求「前缀明确」或者「结构上无法误认」，「一长串看起来
+//! 每一条内置规则都要求「前缀明确」或者「结构上无法误认」，「一长串看起来
 //! 随机的字符」这种判据一条都不收。
+//!
+//! # 规则是一条一条开关的
+//!
+//! 界面上每条规则都看得见、关得掉：误报的那一条关掉，别的照常工作。以前
+//! 只能按五个类别整类开关，于是一条前缀太短的误报能让人关掉整类 API 密钥。
+//! 类别（[`Kind`]）留着，只用来分组和说明。
+//!
+//! 用户还可以写自己的规则（正则）。它们和内置规则在同一遍里找、同一本账
+//! 里换，于是「同一个值只占一个编号」这类纪律对它们同样成立。
 
+use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// 脱哪一类。**配置里按类别开关**，不是一条条正则。
+/// 规则属于哪一类。**只用来分组和说明**，开关按条。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -28,6 +39,8 @@ pub enum Kind {
     ConnStrings,
     /// RFC1918 地址、`.local` / `.internal` 域名
     Internal,
+    /// 用户自己写的规则
+    Custom,
 }
 
 impl Kind {
@@ -38,90 +51,358 @@ impl Kind {
             Kind::Jwt => "jwt",
             Kind::ConnStrings => "conn-strings",
             Kind::Internal => "internal",
+            Kind::Custom => "custom",
         }
     }
-    pub fn label(&self) -> &'static str {
+}
+
+/// 一条内置规则按什么认。**给界面说明用** —— 真正的判据在下面的函数里，
+/// 两者由测试钉在一起（`every_builtin_rule_describes_what_it_matches`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Matcher {
+    /// 以 `prefix` 开头，其后至少还有 `min_tail` 个字符
+    Prefix {
+        prefix: &'static str,
+        min_tail: usize,
+    },
+    /// `sk-` 开头的 OpenAI 老式密钥：全长至少 `min_len`，字母和数字都有
+    OpenaiLegacy { min_len: usize },
+    /// PEM 私钥块，BEGIN 到对应的 END 整段
+    Pem,
+    /// 三段 base64url，首段解码后含 `"alg"`
+    Jwt,
+    /// `协议://用户:口令@主机` 里的口令
+    ConnString,
+    /// RFC1918 私有地址，不含回环
+    PrivateIp,
+    /// 以这几个后缀结尾的域名
+    DomainSuffix { suffixes: &'static [&'static str] },
+}
+
+/// 一条内置规则。
+#[derive(Debug, Clone, Copy)]
+pub struct Builtin {
+    /// 规则的 id，也是命中之后报出去的那个词（`anthropic-api-key` …）
+    pub id: &'static str,
+    pub kind: Kind,
+    /// 英文名。界面按 id 查自己的名称表，查不到才用它
+    pub name: &'static str,
+    /// 出厂时开不开。**只有内网地址那两条是关的**：RFC1918 地址在代码和
+    /// 文档里到处都是，而它的危害远小于一把 key，想脱的人自己开
+    pub on_by_default: bool,
+    pub matcher: Matcher,
+}
+
+const fn prefix(
+    id: &'static str,
+    name: &'static str,
+    prefix: &'static str,
+    min_tail: usize,
+) -> Builtin {
+    Builtin {
+        id,
+        kind: Kind::ApiKeys,
+        name,
+        on_by_default: true,
+        matcher: Matcher::Prefix { prefix, min_tail },
+    }
+}
+
+/// `sk-` 开头的 OpenAI 老式 key 至少要多长。
+///
+/// 前缀太短，**要靠长度把它和 `sk-test`、`sk-xxx` 这种占位符分开**。
+const OPENAI_MIN: usize = 40;
+
+const INTERNAL_SUFFIXES: &[&str] = &[".local", ".internal", ".lan"];
+
+/// 全部内置规则，**按界面上的顺序**。
+///
+/// API 密钥那一段**只收前缀明确、长度有下限的**。代码里的 hash、base64 的
+/// 图片、UUID 全都长得像「一长串随机字符」，按那个判据匹配会疯狂误报。
+pub const BUILTINS: &[Builtin] = &[
+    prefix("anthropic-api-key", "Anthropic API key", "sk-ant-", 20),
+    prefix("openai-project-key", "OpenAI project key", "sk-proj-", 20),
+    Builtin {
+        id: "openai-api-key",
+        kind: Kind::ApiKeys,
+        name: "OpenAI API key",
+        on_by_default: true,
+        matcher: Matcher::OpenaiLegacy {
+            min_len: OPENAI_MIN,
+        },
+    },
+    prefix(
+        "github-personal-token",
+        "GitHub personal access token",
+        "ghp_",
+        30,
+    ),
+    prefix("github-oauth-token", "GitHub OAuth token", "gho_", 30),
+    prefix("github-server-token", "GitHub server token", "ghs_", 30),
+    prefix("github-user-token", "GitHub user token", "ghu_", 30),
+    prefix(
+        "github-fine-grained-token",
+        "GitHub fine-grained token",
+        "github_pat_",
+        30,
+    ),
+    prefix("slack-bot-token", "Slack bot token", "xoxb-", 20),
+    prefix("slack-user-token", "Slack user token", "xoxp-", 20),
+    prefix("slack-app-token", "Slack app token", "xoxa-", 20),
+    prefix("aws-access-key-id", "AWS access key ID", "AKIA", 12),
+    prefix(
+        "aws-temporary-key-id",
+        "AWS temporary access key ID",
+        "ASIA",
+        12,
+    ),
+    prefix("google-api-key", "Google API key", "AIza", 30),
+    prefix("google-oauth-token", "Google OAuth token", "ya29.", 20),
+    prefix("gitlab-token", "GitLab token", "glpat-", 15),
+    prefix("stripe-live-key", "Stripe live key", "sk_live_", 20),
+    prefix(
+        "stripe-restricted-key",
+        "Stripe restricted key",
+        "rk_live_",
+        20,
+    ),
+    prefix("npm-token", "npm token", "npm_", 30),
+    prefix("digitalocean-token", "DigitalOcean token", "dop_v1_", 30),
+    prefix("sendgrid-key", "SendGrid key", "SG.", 30),
+    Builtin {
+        id: "private-key",
+        kind: Kind::PrivateKeys,
+        name: "Private key",
+        on_by_default: true,
+        matcher: Matcher::Pem,
+    },
+    Builtin {
+        id: "jwt",
+        kind: Kind::Jwt,
+        name: "JWT",
+        on_by_default: true,
+        matcher: Matcher::Jwt,
+    },
+    Builtin {
+        id: "conn-string-password",
+        kind: Kind::ConnStrings,
+        name: "Connection string password",
+        on_by_default: true,
+        matcher: Matcher::ConnString,
+    },
+    Builtin {
+        id: "internal-ip",
+        kind: Kind::Internal,
+        name: "Internal IP address",
+        on_by_default: false,
+        matcher: Matcher::PrivateIp,
+    },
+    Builtin {
+        id: "internal-domain",
+        kind: Kind::Internal,
+        name: "Internal domain",
+        on_by_default: false,
+        matcher: Matcher::DomainSuffix {
+            suffixes: INTERNAL_SUFFIXES,
+        },
+    },
+];
+
+pub fn builtin(id: &str) -> Option<&'static Builtin> {
+    BUILTINS.iter().find(|b| b.id == id)
+}
+
+/// 命中的是哪一条规则。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Rule {
+    Builtin(&'static str),
+    /// 用户的规则，按名字认
+    Custom(Arc<str>),
+}
+
+impl Rule {
+    /// 内置规则的 id，或者自定义规则的名字
+    pub fn id(&self) -> &str {
         match self {
-            Kind::ApiKeys => "API keys",
-            Kind::PrivateKeys => "private keys",
-            Kind::Jwt => "JWT",
-            Kind::ConnStrings => "connection-string passwords",
-            Kind::Internal => "internal addresses",
+            Rule::Builtin(id) => id,
+            Rule::Custom(name) => name,
         }
     }
-    pub fn all() -> &'static [Kind] {
-        &[
-            Kind::ApiKeys,
-            Kind::PrivateKeys,
-            Kind::Jwt,
-            Kind::ConnStrings,
-            Kind::Internal,
-        ]
+    pub fn custom(&self) -> bool {
+        matches!(self, Rule::Custom(_))
+    }
+    pub fn kind(&self) -> Kind {
+        match self {
+            Rule::Builtin(id) => builtin(id).map_or(Kind::ApiKeys, |b| b.kind),
+            Rule::Custom(_) => Kind::Custom,
+        }
     }
 }
 
 /// 找到的一段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
-    pub kind: Kind,
     /// 在原文里的字节区间
     pub bytes: Range<usize>,
-    /// 具体是哪种凭据：`anthropic-api-key` / `private-key` / `jwt` …
-    ///
-    /// **给的是 slug，不是名称。**界面拿它查自己的名称表；以前这里是
-    /// 「Anthropic API key」「连接串里的口令」这样的显示文字，一路原样进了
-    /// 事件、数据库和界面。
-    pub secret: &'static str,
+    pub rule: Rule,
 }
 
-// ---------------------------------------------------------------- API 密钥
+/// 一条编译好的自定义规则。
+#[derive(Debug, Clone)]
+pub struct Custom {
+    pub name: Arc<str>,
+    pub re: regex::Regex,
+}
 
-/// 前缀明确、长度有下限的那些。
-///
-/// **只收前缀明确的。**代码里的 hash、base64 的图片、UUID 全都长得像
-/// 「一长串随机字符」，按那个判据匹配会疯狂误报。
-const PREFIXED: &[(&str, &str, usize)] = &[
-    // (前缀, 哪种凭据, 前缀之后至少还要有多少个字符)
-    ("sk-ant-", "anthropic-api-key", 20),
-    ("sk-proj-", "openai-project-key", 20),
-    ("ghp_", "github-personal-token", 30),
-    ("gho_", "github-oauth-token", 30),
-    ("ghs_", "github-server-token", 30),
-    ("ghu_", "github-user-token", 30),
-    ("github_pat_", "github-fine-grained-token", 30),
-    ("xoxb-", "slack-bot-token", 20),
-    ("xoxp-", "slack-user-token", 20),
-    ("xoxa-", "slack-app-token", 20),
-    ("AKIA", "aws-access-key-id", 12),
-    ("ASIA", "aws-temporary-key-id", 12),
-    ("AIza", "google-api-key", 30),
-    ("ya29.", "google-oauth-token", 20),
-    ("glpat-", "gitlab-token", 15),
-    ("sk_live_", "stripe-live-key", 20),
-    ("rk_live_", "stripe-restricted-key", 20),
-    ("npm_", "npm-token", 30),
-    ("dop_v1_", "digitalocean-token", 30),
-    ("SG.", "sendgrid-key", 30),
-];
+/// 一个自定义规则的正则写错了。
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("the pattern of rule `{name}` is not a valid regular expression: {detail}")]
+pub struct BadPattern {
+    pub name: String,
+    pub detail: String,
+}
 
-/// `sk-` 开头的 OpenAI 老式 key。
+/// 编一条正则。**长度和编译后的大小都有上限** —— 这条正则要在每个请求体
+/// 上跑，一个写得很大的正则不该拖慢每一个请求。
+pub fn compile(name: &str, pattern: &str) -> Result<regex::Regex, BadPattern> {
+    if pattern.is_empty() {
+        return Err(BadPattern {
+            name: name.to_string(),
+            detail: "the pattern is empty".to_string(),
+        });
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| BadPattern {
+            name: name.to_string(),
+            detail: e.to_string(),
+        })
+}
+
+/// 这一次按哪些规则找。
 ///
-/// 前缀太短，**要靠长度把它和 `sk-test`、`sk-xxx` 这种占位符分开**。
-const OPENAI_MIN: usize = 40;
+/// **运行时建一次、跟着配置一起换**，不在每个请求上现编正则。
+#[derive(Debug, Clone)]
+pub struct RuleSet {
+    on: HashSet<&'static str>,
+    custom: Vec<Custom>,
+}
+
+impl Default for RuleSet {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+impl RuleSet {
+    /// 出厂时的样子：内置规则按默认开关，没有自定义。
+    pub fn defaults() -> Self {
+        Self {
+            on: BUILTINS
+                .iter()
+                .filter(|b| b.on_by_default)
+                .map(|b| b.id)
+                .collect(),
+            custom: Vec::new(),
+        }
+    }
+
+    /// 一条都不开。测试和「只试这一条正则」用。
+    pub fn none() -> Self {
+        Self {
+            on: HashSet::new(),
+            custom: Vec::new(),
+        }
+    }
+
+    /// 只开这几条内置规则。
+    pub fn only(ids: &[&str]) -> Self {
+        Self {
+            on: BUILTINS
+                .iter()
+                .filter(|b| ids.contains(&b.id))
+                .map(|b| b.id)
+                .collect(),
+            custom: Vec::new(),
+        }
+    }
+
+    /// 按配置建：在默认之上打开 `enable`、关掉 `disable`，再加上启用着的
+    /// 自定义规则。
+    ///
+    /// 返回值的第二项是**认不出的 id**。它们不是错误 —— 一条内置规则将来
+    /// 可能改名或删掉，用户配置里停用过它的那一行不该因此让整份配置失效 ——
+    /// 但要说出来：多半是拼错了，而它的表现是「我明明停用了它，怎么还在报」。
+    pub fn build<'a>(
+        enable: &[String],
+        disable: &[String],
+        custom: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<(Self, Vec<String>), BadPattern> {
+        let mut set = Self::defaults();
+        let mut unknown = Vec::new();
+        for id in enable {
+            match builtin(id) {
+                Some(b) => {
+                    set.on.insert(b.id);
+                }
+                None => unknown.push(id.clone()),
+            }
+        }
+        for id in disable {
+            match builtin(id) {
+                Some(b) => {
+                    set.on.remove(b.id);
+                }
+                None => unknown.push(id.clone()),
+            }
+        }
+        for (name, pattern) in custom {
+            set.custom.push(Custom {
+                name: Arc::from(name),
+                re: compile(name, pattern)?,
+            });
+        }
+        Ok((set, unknown))
+    }
+
+    /// 再加一条自定义规则。
+    pub fn with_custom(mut self, name: &str, pattern: &str) -> Result<Self, BadPattern> {
+        self.custom.push(Custom {
+            name: Arc::from(name),
+            re: compile(name, pattern)?,
+        });
+        Ok(self)
+    }
+
+    pub fn is_on(&self, id: &str) -> bool {
+        self.on.contains(id)
+    }
+
+    /// 一条都没开。**调用方据此整条短路** —— 没有规则的话，找都不用找。
+    pub fn is_empty(&self) -> bool {
+        self.on.is_empty() && self.custom.is_empty()
+    }
+}
 
 fn is_tok(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
 }
 
-fn classify_token(tok: &str) -> Option<&'static str> {
-    for (prefix, secret, min_tail) in PREFIXED {
-        if let Some(tail) = tok.strip_prefix(prefix)
-            && tail.len() >= *min_tail
+/// 一段 token 是哪种 API 密钥。**只看开着的那几条。**
+fn classify_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
+    for b in BUILTINS {
+        if let Matcher::Prefix { prefix, min_tail } = b.matcher
+            && let Some(tail) = tok.strip_prefix(prefix)
+            && tail.len() >= min_tail
         {
-            return Some(secret);
+            // 前缀认出来了但这条关着 —— **不再往下猜**。`sk-ant-…` 关掉之后
+            // 不该被当成一把 OpenAI 老式 key 换掉
+            return set.is_on(b.id).then_some(b.id);
         }
     }
-    if let Some(tail) = tok.strip_prefix("sk-")
+    if set.is_on("openai-api-key")
+        && let Some(tail) = tok.strip_prefix("sk-")
         && tok.len() >= OPENAI_MIN
         && !tail.starts_with("ant-")
         && !tail.starts_with("proj-")
@@ -196,9 +477,8 @@ fn private_keys(text: &str, out: &mut Vec<Hit>) {
             }
         };
         out.push(Hit {
-            kind: Kind::PrivateKeys,
             bytes: begin..end,
-            secret: "private-key",
+            rule: Rule::Builtin("private-key"),
         });
         from = end;
     }
@@ -267,9 +547,8 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
             && j > c + 1
         {
             out.push(Hit {
-                kind: Kind::ConnStrings,
                 bytes: c + 1..j,
-                secret: "conn-string-password",
+                rule: Rule::Builtin("conn-string-password"),
             });
         }
         from = after;
@@ -303,12 +582,13 @@ fn is_rfc1918(tok: &str) -> bool {
 /// **不含回环。**`127.0.0.1` 和 `localhost` 是这台机器自己 —— 而用户问
 /// 的很可能正是「我本地这个服务为什么连不上」，把它换成占位符等于把问题
 /// 本身藏起来了。何况我们的网关自己就住在那儿。
-fn internal_token(tok: &str) -> Option<&'static str> {
-    if is_rfc1918(tok) {
+fn internal_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
+    if set.is_on("internal-ip") && is_rfc1918(tok) {
         return Some("internal-ip");
     }
     let lower = tok.to_ascii_lowercase();
-    if (lower.ends_with(".local") || lower.ends_with(".internal") || lower.ends_with(".lan"))
+    if set.is_on("internal-domain")
+        && INTERNAL_SUFFIXES.iter().any(|s| lower.ends_with(s))
         && lower.len() > 7
         && lower.contains('.')
     {
@@ -317,53 +597,89 @@ fn internal_token(tok: &str) -> Option<&'static str> {
     None
 }
 
+// ---------------------------------------------------------------- 自定义
+
+/// 自定义规则的一处匹配，收成**在 JSON 字符串里换得安全**的一段。
+///
+/// 规则跑在请求体上，而请求体是 JSON：换行是 `\n` 两个字符，引号是 `\"`。
+/// 内置规则的判据天生不会跨过它们；用户的正则不一定 —— `\S+` 在 JSON 里
+/// 会一路吃过 `\n`，一个跨过引号的替换则直接把请求体写坏。所以：
+///
+/// - 从反斜杠或引号处截断：那是正文里一个换行、一个引号的位置，截在那儿
+///   和同一条正则在纯文本上的结果一致；
+/// - 起点落在转义序列中间（前面是奇数个反斜杠）的不要。
+fn json_safe(text: &str, m: Range<usize>) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut slashes = 0;
+    while slashes < m.start && bytes[m.start - 1 - slashes] == b'\\' {
+        slashes += 1;
+    }
+    if slashes % 2 == 1 {
+        return None;
+    }
+    let end = text[m.clone()]
+        .find(['\\', '"'])
+        .map_or(m.end, |i| m.start + i);
+    (end > m.start).then_some(m.start..end)
+}
+
+fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
+    for c in &set.custom {
+        for m in c.re.find_iter(text) {
+            if let Some(bytes) = json_safe(text, m.range()) {
+                out.push(Hit {
+                    bytes,
+                    rule: Rule::Custom(c.name.clone()),
+                });
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 入口
 
-/// 扫一段文本，只找 `kinds` 里点名的类别。
+/// 按 `set` 里开着的规则扫一段文本。
 ///
 /// 返回的区间**按起点排序且互不重叠** —— 替换要从后往前做，重叠会让
 /// 偏移全乱。
-pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
+pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     let mut out = Vec::new();
-    if kinds.contains(&Kind::PrivateKeys) {
+    if set.is_empty() {
+        return out;
+    }
+    if set.is_on("private-key") {
         private_keys(text, &mut out);
     }
-    if kinds.contains(&Kind::ConnStrings) {
+    if set.is_on("conn-string-password") {
         conn_strings(text, &mut out);
     }
-    let want_api = kinds.contains(&Kind::ApiKeys);
-    let want_jwt = kinds.contains(&Kind::Jwt);
-    let want_int = kinds.contains(&Kind::Internal);
-    if want_api || want_jwt || want_int {
-        for_each_token(text, |tok, span| {
-            if want_api && let Some(secret) = classify_token(tok) {
-                out.push(Hit {
-                    kind: Kind::ApiKeys,
-                    bytes: span,
-                    secret,
-                });
-                return;
-            }
-            if want_jwt && looks_like_jwt(tok) {
-                out.push(Hit {
-                    kind: Kind::Jwt,
-                    bytes: span,
-                    secret: "jwt",
-                });
-                return;
-            }
-            if want_int && let Some(secret) = internal_token(tok) {
-                out.push(Hit {
-                    kind: Kind::Internal,
-                    bytes: span,
-                    secret,
-                });
-            }
-        });
-    }
-    out.sort_by_key(|h| (h.bytes.start, h.bytes.end));
+    let want_jwt = set.is_on("jwt");
+    for_each_token(text, |tok, span| {
+        if let Some(id) = classify_token(tok, set) {
+            out.push(Hit {
+                bytes: span,
+                rule: Rule::Builtin(id),
+            });
+            return;
+        }
+        if want_jwt && looks_like_jwt(tok) {
+            out.push(Hit {
+                bytes: span,
+                rule: Rule::Builtin("jwt"),
+            });
+            return;
+        }
+        if let Some(id) = internal_token(tok, set) {
+            out.push(Hit {
+                bytes: span,
+                rule: Rule::Builtin(id),
+            });
+        }
+    });
+    custom_hits(text, set, &mut out);
+    out.sort_by_key(|h| (h.bytes.start, std::cmp::Reverse(h.bytes.end)));
     // **重叠的只留第一个。**私钥块里的 base64 会被 token 扫描当成别的
-    // 东西，两段嵌在一起替换会把偏移彻底搞乱
+    // 东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段
     let mut kept: Vec<Hit> = Vec::with_capacity(out.len());
     for h in out {
         if kept.last().is_some_and(|p| p.bytes.end > h.bytes.start) {
@@ -374,18 +690,103 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     kept
 }
 
+/// 一个字符在 JSON 字符串里写出来有几个字节。**和 serde_json 的转义一致。**
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// 扫一段**纯文本**，结果和它出现在请求体里时一样。
+///
+/// 界面上的「测试」用它：用户贴进来的是一段正文，而网关扫的是装着这段
+/// 正文的 JSON。直接扫纯文本的话，一条跨过换行的自定义规则会在测试里
+/// 命中、在真的请求里却换不掉 —— 测试的结论就是错的。所以先编成 JSON
+/// 字符串再扫，再把区间换算回原文。
+pub fn scan_plain(text: &str, set: &RuleSet) -> Vec<Hit> {
+    let encoded = serde_json::to_string(text).unwrap_or_default();
+    // 原文每个字符的起点在编码后的位置。首尾那对引号不算
+    let mut map: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
+    let mut at = 1;
+    for (i, c) in text.char_indices() {
+        map.push((at, i));
+        at += json_len(c);
+    }
+    map.push((at, text.len()));
+    let back = |enc: usize| {
+        map.binary_search_by_key(&enc, |(e, _)| *e)
+            .ok()
+            .map(|i| map[i].1)
+    };
+    scan(&encoded, set)
+        .into_iter()
+        .filter_map(|h| {
+            let start = back(h.bytes.start)?;
+            let end = back(h.bytes.end)?;
+            (end > start).then_some(Hit {
+                bytes: start..end,
+                rule: h.rule,
+            })
+        })
+        .collect()
+}
+
+/// 报出去的样子。**一律打码** —— 「发现了 sk-ant-xxx」这句话本身就是一次
+/// 泄漏，它会进日志、进界面、被复制到 issue 里。
+///
+/// 内网地址和内部域名例外：它们不是凭据，而打码之后的 `…` 让人无从判断
+/// 那条记录说的是哪台机器。
+pub fn masked(rule: &Rule, value: &str) -> String {
+    if rule.kind() == Kind::Internal {
+        return value.to_string();
+    }
+    tw_secret::mask_secret(value)
+}
+
+/// 一次扫描按「哪条规则 × 哪个值」合起来的结果，给事件和日志用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub rule: Rule,
+    /// 已打码
+    pub masked: String,
+    /// 这个值在这段文本里出现了几次
+    pub count: u64,
+}
+
+/// 把命中合并成「哪条规则 × 哪个值 × 几次」。**同一个值只报一次**：
+/// 一把 key 在一个请求里出现三次，是一把 key，不是三把。
+pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
+    let mut out: Vec<(Rule, &str, u64)> = Vec::new();
+    for h in hits {
+        let value = &text[h.bytes.clone()];
+        match out.iter_mut().find(|(r, v, _)| *r == h.rule && *v == value) {
+            Some((_, _, n)) => *n += 1,
+            None => out.push((h.rule.clone(), value, 1)),
+        }
+    }
+    out.into_iter()
+        .map(|(rule, value, count)| Finding {
+            masked: masked(&rule, value),
+            rule,
+            count,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn kinds() -> Vec<Kind> {
-        Kind::all().to_vec()
+    fn all() -> RuleSet {
+        RuleSet::only(&BUILTINS.iter().map(|b| b.id).collect::<Vec<_>>())
     }
 
-    fn found(text: &str) -> Vec<(Kind, String)> {
-        scan(text, &kinds())
+    fn found(text: &str) -> Vec<(String, String)> {
+        scan(text, &all())
             .into_iter()
-            .map(|h| (h.kind, text[h.bytes].to_string()))
+            .map(|h| (h.rule.id().to_string(), text[h.bytes].to_string()))
             .collect()
     }
 
@@ -394,7 +795,7 @@ mod tests {
         let t = "我的 key 是 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA，别外传";
         let got = found(t);
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, Kind::ApiKeys);
+        assert_eq!(got[0].0, "anthropic-api-key");
         assert!(got[0].1.starts_with("sk-ant-api03-"), "{}", got[0].1);
     }
 
@@ -433,7 +834,7 @@ mod tests {
         let t = "配置里有：\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nAAAA\n-----END RSA PRIVATE KEY-----\n然后呢";
         let got = found(t);
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, Kind::PrivateKeys);
+        assert_eq!(got[0].0, "private-key");
         assert!(got[0].1.starts_with("-----BEGIN RSA"), "{}", got[0].1);
         assert!(got[0].1.ends_with("PRIVATE KEY-----"), "{}", got[0].1);
     }
@@ -446,11 +847,9 @@ mod tests {
         let body = r#"{"messages":[{"content":"看看这个：-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nAAAA\n-----END RSA PRIVATE KEY-----\n好吗"}]}"#;
         let got = found(body);
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, Kind::PrivateKeys);
-        assert!(got[0].1.starts_with("-----BEGIN RSA"), "{}", got[0].1);
-        assert!(got[0].1.ends_with("PRIVATE KEY-----"), "{}", got[0].1);
+        assert_eq!(got[0].0, "private-key");
         // 换掉之后 JSON 还得是合法的
-        let r = crate::redact::redact(body, &kinds());
+        let r = crate::redact::redact(body, &all());
         serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
         // 而且能一字不差地换回来
         assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
@@ -476,7 +875,7 @@ mod tests {
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.abcdefghijk";
         let got = found(&format!("Authorization: Bearer {jwt}"));
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, Kind::Jwt);
+        assert_eq!(got[0].0, "jwt");
         assert_eq!(got[0].1, jwt);
         // 三段 base64 但头部不是 JWT 头 —— 不算
         assert!(found("aaaaaaaa.bbbbbbbb.cccccccc").is_empty());
@@ -488,7 +887,7 @@ mod tests {
         let t = "DATABASE_URL=postgres://admin:hunter2@db.example.com:5432/app";
         let got = found(t);
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, Kind::ConnStrings);
+        assert_eq!(got[0].0, "conn-string-password");
         assert_eq!(got[0].1, "hunter2");
     }
 
@@ -501,7 +900,7 @@ mod tests {
             "见 https://user@example.com/x",
         ] {
             assert!(
-                !found(t).iter().any(|(k, _)| *k == Kind::ConnStrings),
+                !found(t).iter().any(|(k, _)| k == "conn-string-password"),
                 "误报了：{t} → {:?}",
                 found(t)
             );
@@ -514,18 +913,102 @@ mod tests {
         // 把它换成占位符等于把问题本身藏起来。
         let got = found("内网 10.1.2.3 和 192.168.0.5，还有 172.20.1.1");
         assert_eq!(got.len(), 3, "{got:?}");
-        assert!(got.iter().all(|(k, _)| *k == Kind::Internal));
+        assert!(got.iter().all(|(k, _)| k == "internal-ip"));
         assert!(found("127.0.0.1 和 8.8.8.8 和 172.32.0.1").is_empty());
     }
 
     #[test]
-    fn only_the_kinds_that_were_asked_for_are_scanned() {
-        // 核心：**走官方端点不该脱敏，走中转站才脱。**
-        let t = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA 和 10.0.0.1";
-        assert_eq!(scan(t, &[]).len(), 0);
-        assert_eq!(scan(t, &[Kind::ApiKeys]).len(), 1);
-        assert_eq!(scan(t, &[Kind::Internal]).len(), 1);
-        assert_eq!(scan(t, &[Kind::ApiKeys, Kind::Internal]).len(), 2);
+    fn the_internal_rules_are_off_until_someone_turns_them_on() {
+        // RFC1918 地址在代码和文档里到处都是，而它的危害远小于一把 key。
+        let t = "内网 10.1.2.3，内部域名 build.corp.internal";
+        assert!(scan(t, &RuleSet::defaults()).is_empty());
+        let (set, unknown) = RuleSet::build(&["internal-ip".into()], &[], []).unwrap();
+        assert!(unknown.is_empty());
+        let got = scan(t, &set);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].rule, Rule::Builtin("internal-ip"));
+    }
+
+    #[test]
+    fn a_rule_that_is_off_is_not_used_and_does_not_hand_its_keys_to_another() {
+        // 关掉 Anthropic 那条之后，`sk-ant-…` 不该被当成一把 OpenAI 老式
+        // key 换掉 —— 用户关掉的正是「这种东西不要换」。
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1234";
+        let (set, _) = RuleSet::build(&[], &["anthropic-api-key".into()], []).unwrap();
+        assert!(scan(key, &set).is_empty(), "{:?}", scan(key, &set));
+        assert_eq!(scan(key, &RuleSet::defaults()).len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_rule_id_is_reported_rather_than_failing_the_whole_set() {
+        // 多半是拼错了；也可能是一条后来改了名的内置规则。都不该让整套停摆。
+        let (set, unknown) =
+            RuleSet::build(&["internal-ipp".into()], &["jwtt".into()], []).unwrap();
+        assert_eq!(
+            unknown,
+            vec!["internal-ipp".to_string(), "jwtt".to_string()]
+        );
+        assert!(set.is_on("jwt"));
+    }
+
+    #[test]
+    fn a_custom_rule_is_found_alongside_the_builtin_ones() {
+        let (set, _) = RuleSet::build(&[], &[], [("公司令牌", r"corp_[A-Za-z0-9]{8}")]).unwrap();
+        let t = "令牌 corp_ABCD1234 和 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let got = scan(t, &set);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].rule, Rule::Custom(Arc::from("公司令牌")));
+        assert_eq!(&t[got[0].bytes.clone()], "corp_ABCD1234");
+        assert!(got[0].rule.custom());
+        assert_eq!(got[0].rule.kind(), Kind::Custom);
+    }
+
+    #[test]
+    fn a_broken_custom_pattern_is_an_error_that_names_the_rule() {
+        let e = RuleSet::build(&[], &[], [("写坏了", "(")]).unwrap_err();
+        assert_eq!(e.name, "写坏了");
+        assert!(RuleSet::build(&[], &[], [("空的", "")]).is_err());
+    }
+
+    #[test]
+    fn a_custom_match_never_crosses_an_escape_or_a_quote_in_the_body() {
+        // `\S+` 在 JSON 里会一路吃过 `\n` 和 `\"`；换掉那样一段会把请求体写坏。
+        let set = RuleSet::none().with_custom("口令", r"pw=\S+").unwrap();
+        let body = serde_json::to_string(&serde_json::json!({
+            "content": "pw=hunter2\n下一行 \"引号\" pw=abc\"def"
+        }))
+        .unwrap();
+        let r = crate::redact::redact(&body, &set);
+        let v: serde_json::Value = serde_json::from_str(&r.text).expect("换完不是合法 JSON");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("<<TW_SECRET_1>>\n下一行"), "{content}");
+        assert!(content.contains("<<TW_SECRET_2>>\"def"), "{content}");
+        assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
+    }
+
+    #[test]
+    fn a_custom_match_that_starts_inside_an_escape_is_dropped() {
+        // `\n` 里的 `n` 不是正文的一部分，从它开始换会留下一个坏掉的转义。
+        let set = RuleSet::none().with_custom("n 开头", r"n[a-z]+").unwrap();
+        let body = r#"{"c":"a\nbc"}"#;
+        assert!(scan(body, &set).is_empty(), "{:?}", scan(body, &set));
+    }
+
+    #[test]
+    fn scanning_plain_text_gives_what_the_body_would_give() {
+        // 测试的结论必须和真的请求一致：跨过换行的那一截在请求体里换不掉，
+        // 在测试里也不该显示成命中。
+        let set = RuleSet::none().with_custom("口令", r"pw=\S+").unwrap();
+        let text = "第一行 pw=hunter2\n第二行";
+        let got = scan_plain(text, &set);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(&text[got[0].bytes.clone()], "pw=hunter2");
+        // 内置规则同样换算回原文，包括跨过换行的私钥块
+        let pem =
+            "看：\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n完";
+        let got = scan_plain(pem, &RuleSet::defaults());
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(pem[got[0].bytes.clone()].starts_with("-----BEGIN RSA"));
     }
 
     #[test]
@@ -533,32 +1016,62 @@ mod tests {
         // 私钥块里的 base64 会被 token 扫描当成别的东西，嵌在一起替换会
         // 把偏移彻底搞乱。
         let t = "-----BEGIN OPENSSH PRIVATE KEY-----\nsk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END OPENSSH PRIVATE KEY-----";
-        let got = scan(t, &kinds());
+        let got = scan(t, &all());
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].kind, Kind::PrivateKeys);
+        assert_eq!(got[0].rule, Rule::Builtin("private-key"));
     }
 
     #[test]
     fn the_spans_can_actually_be_used_to_slice_multibyte_text() {
         // 这个项目已经被字节切片坑过三次。命中点前后全是中文。
         let t = "这是一段很长的中文说明，里面混着一把 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBB，后面继续写中文";
-        let got = scan(t, &kinds());
+        let got = scan(t, &all());
         assert_eq!(got.len(), 1);
-        assert!(
-            t[got[0].bytes.clone()].starts_with("sk-ant-"),
-            "{}",
-            &t[got[0].bytes.clone()]
-        );
+        assert!(t[got[0].bytes.clone()].starts_with("sk-ant-"));
     }
 
     #[test]
     fn the_hits_come_back_sorted_and_disjoint() {
         // 替换要从后往前做，重叠或乱序会让偏移全乱。
         let t = "10.0.0.1 然后 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA 然后 192.168.1.1";
-        let got = scan(t, &kinds());
+        let got = scan(t, &all());
         assert_eq!(got.len(), 3);
         for w in got.windows(2) {
             assert!(w[0].bytes.end <= w[1].bytes.start, "{got:?}");
         }
+    }
+
+    #[test]
+    fn findings_say_which_rule_saw_which_value_and_how_often_but_never_the_value() {
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let t = format!("{key} 又一次 {key} 和 10.0.0.1");
+        let hits = scan(&t, &all());
+        let f = findings(&t, &hits);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert_eq!(f[0].rule, Rule::Builtin("anthropic-api-key"));
+        assert_eq!(f[0].count, 2);
+        assert!(!f[0].masked.contains("AAAAAAAAAAAA"), "{}", f[0].masked);
+        // 内网地址不是凭据，打码之后反而认不出是哪台机器
+        assert_eq!(f[1].masked, "10.0.0.1");
+    }
+
+    #[test]
+    fn every_builtin_rule_describes_what_it_matches() {
+        // 界面上的「匹配」一栏来自 `matcher`；它说的必须就是扫描用的判据。
+        for b in BUILTINS {
+            if let Matcher::Prefix { prefix, min_tail } = b.matcher {
+                let key = format!("{prefix}{}", "a1".repeat(min_tail));
+                let hits = scan(&key, &RuleSet::only(&[b.id]));
+                assert_eq!(hits.len(), 1, "{} 认不出它自己说的形状：{key}", b.id);
+                let short = format!("{prefix}{}", "a".repeat(min_tail - 1));
+                assert!(
+                    scan(&short, &RuleSet::only(&[b.id])).is_empty(),
+                    "{} 比它说的长度下限更短的也认了",
+                    b.id
+                );
+            }
+        }
+        let ids: HashSet<&str> = BUILTINS.iter().map(|b| b.id).collect();
+        assert_eq!(ids.len(), BUILTINS.len(), "内置规则的 id 重复了");
     }
 }

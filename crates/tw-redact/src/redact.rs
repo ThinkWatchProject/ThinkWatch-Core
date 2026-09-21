@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::rules::{Hit, Kind};
+use crate::rules::{Hit, RuleSet};
 
 /// 占位符长什么样：`<<TW_SECRET_1>>`。
 pub const OPEN: &str = "<<TW_SECRET_";
@@ -20,15 +20,15 @@ pub fn placeholder(n: usize) -> String {
 /// **同一个值在一次请求里只占一个编号。**一把 key 出现三次却换成三个
 /// 不同的占位符，会让模型以为那是三个不同的东西 —— 而它可能正在帮你
 /// 对比「这两处的 key 是不是同一把」。
+///
+/// 换了哪些、各几处不记在这里：那是 [`crate::rules::findings`] 从命中里
+/// 算出来的，观察档（不换）和拦截档（换）报的是同一份。
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
     /// 占位符 → 原值
     back: HashMap<String, String>,
     /// 原值 → 占位符，用来复用编号
     seen: HashMap<String, String>,
-    /// 换了哪些、各几处。**界面上要说得出来**（看不见的安全功能
-    /// 会被用户关掉，因为他们会怀疑是脱敏搞坏了功能）
-    pub counts: Vec<(Kind, &'static str, usize)>,
 }
 
 impl Ledger {
@@ -41,16 +41,6 @@ impl Ledger {
     /// 占位符 → 原值。流式还原要拿它。
     pub fn table(&self) -> &HashMap<String, String> {
         &self.back
-    }
-    fn note(&mut self, kind: Kind, secret: &'static str) {
-        match self
-            .counts
-            .iter_mut()
-            .find(|(k, w, _)| *k == kind && *w == secret)
-        {
-            Some((_, _, n)) => *n += 1,
-            None => self.counts.push((kind, secret, 1)),
-        }
     }
 }
 
@@ -84,38 +74,32 @@ pub fn apply_into(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
             ledger,
         };
     }
-    // 这一次新换了什么，单独记 —— 事件里要报的是「这一帧换了什么」，
-    // 不是「这条连接至今换了什么」
-    let before = ledger.counts.len();
-    let _ = before;
+    // 编号按出现的先后发：从后往前换，但先从前往后把号发完
+    for h in hits {
+        let original = &text[h.bytes.clone()];
+        if !ledger.seen.contains_key(original) {
+            let p = placeholder(ledger.back.len() + 1);
+            ledger.back.insert(p.clone(), original.to_string());
+            ledger.seen.insert(original.to_string(), p);
+        }
+    }
     let mut out = text.to_string();
     for h in hits.iter().rev() {
-        let original = &text[h.bytes.clone()];
-        let ph = match ledger.seen.get(original) {
-            Some(p) => p.clone(),
-            None => {
-                let p = placeholder(ledger.back.len() + 1);
-                ledger.back.insert(p.clone(), original.to_string());
-                ledger.seen.insert(original.to_string(), p.clone());
-                p
-            }
-        };
-        ledger.note(h.kind, h.secret);
-        out.replace_range(h.bytes.clone(), &ph);
+        let ph = &ledger.seen[&text[h.bytes.clone()]];
+        out.replace_range(h.bytes.clone(), ph);
     }
-    ledger.counts.sort_by_key(|(k, w, _)| (*k, *w));
     Redacted { text: out, ledger }
 }
 
 /// 扫 + 换，一步到位。
-pub fn redact(text: &str, kinds: &[Kind]) -> Redacted {
-    let hits = crate::rules::scan(text, kinds);
+pub fn redact(text: &str, rules: &RuleSet) -> Redacted {
+    let hits = crate::rules::scan(text, rules);
     apply(text, &hits)
 }
 
 /// 扫 + 换，接着一本已有的账本编号。见 [`apply_into`]。
-pub fn redact_into(text: &str, kinds: &[Kind], ledger: Ledger) -> Redacted {
-    let hits = crate::rules::scan(text, kinds);
+pub fn redact_into(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
+    let hits = crate::rules::scan(text, rules);
     apply_into(text, &hits, ledger)
 }
 
@@ -136,11 +120,12 @@ pub fn restore(text: &str, ledger: &Ledger) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{BUILTINS, RuleSet};
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-    fn all() -> Vec<Kind> {
-        Kind::all().to_vec()
+    fn all() -> RuleSet {
+        RuleSet::only(&BUILTINS.iter().map(|b| b.id).collect::<Vec<_>>())
     }
 
     #[test]
@@ -207,25 +192,12 @@ mod tests {
     }
 
     #[test]
-    fn the_ledger_can_say_what_it_replaced_without_showing_it() {
-        // **界面上必须能看到脱敏发生了什么** —— 看不见的安全功能
-        // 会被用户关掉，因为他们会怀疑是脱敏搞坏了功能。
-        let t = format!("{KEY} 和 10.0.0.1 和 10.0.0.2");
+    fn the_first_value_gets_the_first_number() {
+        // 编号按出现的先后发 —— 从后往前换不该把号也倒过来
+        let t = format!("{KEY} 然后 10.0.0.2");
         let r = redact(&t, &all());
-        let summary = format!("{:?}", r.ledger.counts);
-        assert!(summary.contains("anthropic-api-key"), "{summary}");
-        assert!(summary.contains("internal-ip"), "{summary}");
-        assert!(
-            !summary.contains("sk-ant-api03-AAAA"),
-            "计数里带出了原值：{summary}"
-        );
-        let internal = r
-            .ledger
-            .counts
-            .iter()
-            .find(|(k, _, _)| *k == Kind::Internal)
-            .unwrap();
-        assert_eq!(internal.2, 2);
+        assert!(r.text.starts_with("<<TW_SECRET_1>>"), "{}", r.text);
+        assert!(r.text.ends_with("<<TW_SECRET_2>>"), "{}", r.text);
     }
 
     #[test]
@@ -248,7 +220,7 @@ mod tests {
     fn a_second_frame_does_not_reuse_the_first_frames_placeholder_number() {
         // **第二帧只要命中一次就一定撞车** —— 两个不同的密钥映射到同一个
         // 占位符，还原时必然给错一个（WebSocket 那条路）
-        let kinds = [Kind::ApiKeys];
+        let kinds = RuleSet::only(&["anthropic-api-key"]);
         let a = redact("我的 key 是 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", &kinds);
         let b = redact_into(
             "另一把是 sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB",
@@ -271,7 +243,7 @@ mod tests {
     fn the_same_secret_in_two_frames_keeps_one_number() {
         // 同一个值在一次连接里只该占一个编号 —— 否则模型会以为那是
         // 两个不同的东西
-        let kinds = [Kind::ApiKeys];
+        let kinds = RuleSet::only(&["anthropic-api-key"]);
         let k = "sk-ant-api03-SAMESAMESAMESAMESAME1";
         let a = redact(&format!("第一次 {k}"), &kinds);
         let b = redact_into(&format!("第二次 {k}"), &kinds, a.ledger.clone());

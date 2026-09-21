@@ -55,7 +55,7 @@ fn bed() -> Bed {
 }
 
 fn run(home: &Path) -> tw_scan::report::Report {
-    let rules = rules::build(&tw_config::ScanRules::default()).unwrap();
+    let rules = rules::scan_rules();
     assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
     scan(&sources::user_level(home), &rules)
 }
@@ -226,7 +226,7 @@ fn a_file_we_cannot_read_is_said_out_loud() {
     write(&p, "x");
     let srcs = sources::user_level(&b.home);
     std::fs::remove_file(&p).unwrap();
-    let rules = rules::build(&tw_config::ScanRules::default()).unwrap();
+    let rules = rules::scan_rules();
     let r = scan(&srcs, &rules);
     assert_eq!(r.unreadable.len(), 1, "{:?}", r.unreadable);
 }

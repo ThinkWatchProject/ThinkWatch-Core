@@ -13,8 +13,9 @@
 //!
 //! 所以这里每一帧文本都过同一套：
 //!
-//! - 客户端 → 上游：`redact_outbound`，和普通请求同一个函数、同一份规格；
-//! - 上游 → 客户端：先把占位符换回去，再喂给工具墙。
+//! - 客户端 → 上游：出站脱敏，和普通请求同一套函数、同一份全局规则 ——
+//!   观察档记录，拦截档替换；
+//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
 //!
 //! # 两条明说的边界
 //!
@@ -90,23 +91,31 @@ pub fn upstream_url(base: &str, path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// 两项防护此刻的档位和规则。**升级那一刻取一次**：一条连接活多久，就按
+/// 它开始时的配置走多久，和普通请求按开始时的运行时走是同一个道理。
+pub struct Rules {
+    pub redact_mode: tw_config::SecurityMode,
+    pub redact: Arc<tw_redact::rules::RuleSet>,
+    pub inspect_mode: tw_config::SecurityMode,
+    pub tools: Arc<tw_scan::rules::Rules>,
+}
+
 /// 一次连接里两个方向各自的状态。
 struct Pipes {
     /// **整条连接一本账。**每帧各起一本的话，第二帧的
     /// `<<TW_SECRET_1>>` 会和第一帧的撞车（见 `redact_into` 的注释）
     ledger: tw_redact::redact::Ledger,
-    wall: crate::toolwall::Wall,
-    kinds: Vec<tw_redact::rules::Kind>,
-    /// 命中高危且这家不受信任时，切断整条连接
-    cut: bool,
+    /// 工具调用审查关着的时候没有它
+    wall: Option<crate::toolwall::Wall>,
+    rules: Rules,
     provider: String,
     id: u64,
 }
 
 /// 接管一次升级。
 ///
-/// 路由、鉴权、`guard` 合并都在调用方做完了 —— 这里只负责把两条流
-/// 接起来，并且**在每一帧上重新点一遍管线的保护**。
+/// 路由、鉴权都在调用方做完了 —— 这里只负责把两条流接起来，并且**在每一帧
+/// 上重新点一遍管线的保护**。
 ///
 /// **这条连接怎么断的，就是这个请求的结局**（`ending`）。每一条收场的
 /// 路径都先报结局、再去关连接：关连接要等对面，而对面可能已经不在了。
@@ -117,8 +126,7 @@ pub async fn proxy(
     upstream_url: String,
     upstream_headers: Vec<(String, String)>,
     provider: tw_config::Provider,
-    guard: tw_engine::Guard,
-    rules: Arc<tw_scan::rules::Rules>,
+    rules: Rules,
     id: u64,
     ending: crate::ending::Ending,
 ) {
@@ -172,20 +180,13 @@ pub async fn proxy(
             return;
         }
     };
-    let cfg = state.config();
-    let trust = crate::guard::effective_trust(&provider, &guard);
     let mut p = Pipes {
         ledger: tw_redact::redact::Ledger::default(),
-        wall: crate::toolwall::Wall::new(rules, cfg.security.inspect_tools.acts()),
-        // **和普通请求同一份规格**：`guard` 是并集，只加不减
-        kinds: if cfg.security.redact.acts() {
-            crate::guard::effective_kinds(&provider, &guard)
-        } else {
-            Vec::new()
-        },
-        // **和主管线一模一样的判据**：高危 + 审查在动手档 +
-        // 这家不受信任，三者同时成立才切
-        cut: cfg.security.inspect_tools.acts() && trust.blocks(),
+        wall: rules
+            .inspect_mode
+            .detects()
+            .then(|| crate::toolwall::Wall::new(rules.tools.clone())),
+        rules,
         provider: provider.name.clone(),
         id,
     };
@@ -266,31 +267,30 @@ async fn pump(
                 let Some(Ok(m)) = msg else { break End::Closed };
                 let out = match m {
                     Message::Text(t) => {
-                        let r = tw_redact::redact::redact_into(
-                            t.as_str(),
-                            &p.kinds,
-                            std::mem::take(&mut p.ledger),
-                        );
-                        if !r.ledger.counts.is_empty() && r.text != t.as_str() {
-                            state.bus.emit(tw_api::Event::Redacted {
+                        let mode = p.rules.redact_mode;
+                        let found = crate::guard::find(mode, &p.rules.redact, t.as_bytes());
+                        if found.is_empty() {
+                            UpMsg::Text(t.as_str().into())
+                        } else {
+                            state.bus.emit(tw_api::Event::SecretsFound {
                                 id: p.id,
                                 provider: p.provider.clone(),
-                                items: r
-                                    .ledger
-                                    .counts
-                                    .iter()
-                                    .map(|(k, secret, n)| tw_api::RedactedItem {
-                                        kind: k.slug().to_string(),
-                                        secret: secret.to_string(),
-                                        count: *n as u64,
-                                    })
-                                    .collect(),
+                                replaced: mode.acts(),
+                                items: crate::guard::items(&found),
                                 at_ms: crate::server::now_ms(),
                             });
+                            if mode.acts() {
+                                let r = tw_redact::redact::redact_into(
+                                    t.as_str(),
+                                    &p.rules.redact,
+                                    std::mem::take(&mut p.ledger),
+                                );
+                                p.ledger = r.ledger;
+                                UpMsg::Text(r.text.into())
+                            } else {
+                                UpMsg::Text(t.as_str().into())
+                            }
                         }
-                        let text = r.text;
-                        p.ledger = r.ledger;
-                        UpMsg::Text(text.into())
                     }
                     // 二进制不检查，也不假装检查过
                     Message::Binary(b) => UpMsg::Binary(b),
@@ -320,32 +320,29 @@ async fn pump(
                 let out = match m {
                     UpMsg::Text(t) => {
                         let restored = tw_redact::redact::restore(t.as_str(), &p.ledger);
-                        let hits = p.wall.feed(as_sse(&restored).as_bytes());
+                        let hits = match p.wall.as_mut() {
+                            Some(w) => w.feed(as_sse(&restored).as_bytes()),
+                            None => Vec::new(),
+                        };
+                        // **和主管线一模一样的判据**：规则是切断 + 拦截档
+                        let acts = p.rules.inspect_mode.acts();
                         let mut deadly = false;
                         let mut why: Option<Msg> = None;
                         for h in &hits {
-                            if h.high && p.cut && why.is_none() {
+                            let blocked = h.cut && acts;
+                            if blocked && why.is_none() {
                                 why = Some(msg!(
                                     "gw.ws.toolcall_cut",
                                     upstream = p.provider.clone(), tool = h.tool.clone(),
-                                    rule = h.rule.clone(), detail = h.why.clone() =>
-                                    "The {tool} call returned by upstream `{upstream}` (an \
-                                     unofficial endpoint) matched rule `{rule}` ({detail}), so \
-                                     the connection was cut."
+                                    rule = h.rule.clone(), name = h.name.clone(),
+                                    detail = h.why.clone() =>
+                                    "The {tool} call returned by upstream `{upstream}` matched \
+                                     rule “{name}”{}, so the connection was cut.",
+                                    crate::server::because(&h.why)
                                 ));
                             }
-                            deadly |= h.high && p.cut;
-                            state.bus.emit(tw_api::Event::ToolCallFlagged {
-                                id: p.id,
-                                provider: p.provider.clone(),
-                                tool: h.tool.clone(),
-                                rule: h.rule.clone(),
-                                why: h.why.clone(),
-                                excerpt: h.excerpt.clone(),
-                                high: h.high,
-                                blocked: deadly,
-                                at_ms: crate::server::now_ms(),
-                            });
+                            deadly |= blocked;
+                            state.bus.emit(crate::server::flagged(p.id, &p.provider, h, blocked));
                         }
                         if deadly {
                             // **命中那一帧不发。**和 SSE 那条路同一条纪律：

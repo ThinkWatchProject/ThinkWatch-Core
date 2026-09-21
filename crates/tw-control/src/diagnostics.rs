@@ -93,13 +93,13 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
     // ---- 上游
     let _ = writeln!(
         out,
-        "\n## Upstreams ({})\n\n| Name | Endpoint | Protocol | Proxy | State | Models | Redaction | Trust | Price sheet |\n|---|---|---|---|---|---|---|---|---|",
+        "\n## Upstreams ({})\n\n| Name | Endpoint | Protocol | Proxy | State | Models | Price sheet |\n|---|---|---|---|---|---|---|",
         cfg.providers.len()
     );
     for p in &cfg.providers {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             p.name,
             // **地址也要脱敏** —— 中转站的 base_url 里常常带着 key
             tw_secret::redact_url(&p.base_url),
@@ -136,15 +136,6 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                     },
                 }
             },
-            {
-                let k = p.effective_redact();
-                if k.is_empty() {
-                    "none".to_string()
-                } else {
-                    k.iter().map(|x| x.slug()).collect::<Vec<_>>().join(" ")
-                }
-            },
-            p.effective_trust().label(),
             p.pricing.as_deref().unwrap_or("the default sheet"),
         );
     }
@@ -159,15 +150,54 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
         let _ = writeln!(out, "| {} | {} |", c.name, tw_secret::mask_secret(&c.key));
     }
 
-    // ---- 安全三态
+    // ---- 两项防护：档位，以及和出厂不一样的那几处（只有规则名，不含正则 ——
+    // 自定义规则的正则里可能写着公司内部的东西）
     let _ = writeln!(out, "\n## Security\n\n| | |\n|---|---|");
-    line(&mut out, "Outbound redaction", cfg.security.redact.label());
+    let changes = |enable: &[String], disable: &[String], custom: Vec<&str>| {
+        let mut parts = Vec::new();
+        if !enable.is_empty() {
+            parts.push(format!("on: {}", enable.join(" ")));
+        }
+        if !disable.is_empty() {
+            parts.push(format!("off: {}", disable.join(" ")));
+        }
+        if !custom.is_empty() {
+            parts.push(format!("custom: {}", custom.len()));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join("; "))
+        }
+    };
+    let r = &cfg.security.redact;
+    line(
+        &mut out,
+        "Outbound redaction",
+        format!(
+            "{}{}",
+            r.mode.label(),
+            changes(
+                &r.enable,
+                &r.disable,
+                r.custom.iter().map(|c| c.name.as_str()).collect()
+            )
+        ),
+    );
+    let t = &cfg.security.inspect_tools;
     line(
         &mut out,
         "Tool-call inspection",
-        cfg.security.inspect_tools.label(),
+        format!(
+            "{}{}",
+            t.mode.label(),
+            changes(
+                &t.enable,
+                &t.disable,
+                t.custom.iter().map(|c| c.name.as_str()).collect()
+            )
+        ),
     );
-    line(&mut out, "Config scan", cfg.security.scan_configs.label());
 
     // ---- 存储和最近的失败
     match &s.store {

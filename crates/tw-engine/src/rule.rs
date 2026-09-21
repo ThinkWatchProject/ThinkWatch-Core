@@ -49,7 +49,7 @@ pub struct When {
     pub intent: Option<OneOrMany>,
     /// **阶段二专用**：路由决定完之后，选中的是哪个 provider。
     ///
-    /// 它是个循环依赖 —— `guard` 必须在请求发出去之前生效，而这个值要
+    /// 它是个循环依赖 —— 规则的去向要在请求发出去之前定下来，而这个值要
     /// 等路由跑完、组内选完、跳过熔断的成员之后才知道。所以求值分两
     /// 阶段，而含这个条件的规则**不允许带 `to`**（允许就直接成环了）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
