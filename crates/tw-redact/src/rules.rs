@@ -421,9 +421,31 @@ fn classify_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
 ///
 /// **在 token 边界上匹配。**`xsk-ant-…` 里的 `sk-ant-…` 不是一把密钥，
 /// 而按子串找会把它算上 —— 那种误报没法解释。
+///
+/// **JSON 转义不属于任何 token。**扫的是请求体，而请求体是 JSON：换行在
+/// 里面是 `\n` 两个字符。按字符切的话，行首的 `sk-ant-…` 会和那个 `n`
+/// 粘成 `nsk-ant-…`，前缀就对不上了 —— 贴进对话的凭据文件里，密钥偏偏
+/// 常在行首。`\t` 同理；`\uXXXX` 也一样（Python 写的客户端默认把中文
+/// 都转成这种写法，`密钥：sk-…` 里的冒号就成了 `\uff1a`）。所以转义序列
+/// 整个算作分隔。
 fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>)) {
     let mut start: Option<usize> = None;
-    for (i, c) in text.char_indices() {
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            if let Some(s) = start.take() {
+                f(&text[s..i], s..i);
+            }
+            // 反斜杠后面那个字符是转义的一部分；`\u` 再带四位十六进制
+            if let Some((_, 'u')) = chars.next() {
+                for _ in 0..4 {
+                    if chars.next_if(|(_, h)| h.is_ascii_hexdigit()).is_none() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
         if is_tok(c) {
             start.get_or_insert(i);
         } else if let Some(s) = start.take() {
@@ -797,6 +819,29 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, "anthropic-api-key");
         assert!(got[0].1.starts_with("sk-ant-api03-"), "{}", got[0].1);
+    }
+
+    #[test]
+    fn a_key_right_after_a_json_escape_is_still_found() {
+        // 扫的是请求体原文：换行、制表符在里面是 `\n`、`\t`，中文可能是
+        // `\uXXXX`。转义里的那个字母不能和后面的密钥粘成一个 token
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl";
+        for (t, rule, value) in [
+            (format!(r"keys:\n{key}\nnext"), "anthropic-api-key", key),
+            (format!(r"key\t{key}"), "anthropic-api-key", key),
+            (
+                format!(r"\u5bc6\u94a5\uff1a{key}"),
+                "anthropic-api-key",
+                key,
+            ),
+            (format!(r"token:\n{jwt}"), "jwt", jwt),
+            // 转义的反斜杠：解出来是 `C:\sk-ant-…`，反斜杠后面照样是边界
+            (format!(r"C:\\{key}"), "anthropic-api-key", key),
+        ] {
+            let got = found(&t);
+            assert_eq!(got, vec![(rule.to_string(), value.to_string())], "{t}");
+        }
     }
 
     #[test]
