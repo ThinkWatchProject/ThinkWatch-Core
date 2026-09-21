@@ -340,7 +340,10 @@ async fn enforce_withholds_the_whole_non_streaming_response() {
     let up = start_json_upstream(poisoned_whole()).await;
     let (body, mut rx) = run_whole(config(up, SecurityMode::Enforce, Trust::Untrusted)).await;
 
-    assert!(!body.contains("| sh"), "危险的工具调用被交给客户端了：{body}");
+    assert!(
+        !body.contains("| sh"),
+        "危险的工具调用被交给客户端了：{body}"
+    );
     assert!(!body.contains("tool_use"), "{body}");
     // 状态码随响应头早走了，改不动；body 是唯一还能说话的地方
     assert!(
@@ -375,7 +378,10 @@ async fn a_harmless_non_streaming_tool_call_is_counted_but_not_flagged() {
     let up = start_json_upstream(clean).await;
     let (body, mut rx) = run_whole(config(up, SecurityMode::Enforce, Trust::Untrusted)).await;
 
-    assert!(body.contains("npm install"), "把一个正常的工具调用扣了：{body}");
+    assert!(
+        body.contains("npm install"),
+        "把一个正常的工具调用扣了：{body}"
+    );
     let (tool_calls, flags) = inspected(&mut rx).await.expect("没发形状事件");
     assert_eq!(tool_calls, 1, "非流式的工具调用没数上");
     assert_eq!(flags, 0, "对一个正常的工具调用报了警");
