@@ -129,3 +129,32 @@ async fn a_mixed_session_keeps_the_money_and_the_subscription_apart() {
         .collect();
     assert_eq!(billing, ["per-token", "subscription"]);
 }
+
+/// **请求和会话是同一批记录的两个粒度，界面要能在两者之间走动。**
+///
+/// 少了这个字段，两个粒度之间就没有门：看着一条很贵的请求，问不出它
+/// 属于哪次任务。库里这一列一直都在，只是没有交出来。
+#[tokio::test]
+async fn a_request_in_the_history_says_which_session_it_belongs_to() {
+    let mut orphan = turn(3, "per-token");
+    orphan.session = None;
+    let (_d, app) = app(&[turn(1, "per-token"), turn(2, "per-token"), orphan]);
+
+    let rows = get(&app, "/history?limit=10").await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+
+    let by_id = |id: i64| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("没有 id={id} 这一行"))
+    };
+    assert_eq!(by_id(1)["session"], "s1");
+    assert_eq!(by_id(2)["session"], "s1");
+    // 认不出会话的请求（拼不出指纹的、老记录）不该冒充属于某一次
+    assert!(by_id(3).get("session").is_none(), "{}", by_id(3));
+
+    // 会话那一端报的是同一个 id —— 两边对得上才走得通
+    let list = get(&app, "/sessions").await;
+    assert_eq!(list[0]["id"], "s1");
+}
