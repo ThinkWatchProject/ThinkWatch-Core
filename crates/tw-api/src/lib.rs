@@ -26,7 +26,11 @@ pub use tw_types::Msg;
 /// 的代价和提醒仍然是 `String`，于是中文界面上整整三页变成了英文。
 /// 换句话说，2 只做了一半 —— 而「一句给人读的话」和「它是不是错误」
 /// 本来就没有关系。
-pub const CONTROL_API_VERSION: u32 = 3;
+///
+/// **4 把安全改成了全局的。**上游不再有信任级别和脱敏类别，路由规则不再有
+/// 安全要求；两项防护各有自己的规则和日志，出站检测的两条事件合成了一条。
+/// 照 3 写的界面会去读已经不存在的字段，所以跳号。
+pub const CONTROL_API_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -181,30 +185,21 @@ pub enum Event {
         #[serde(default)]
         billing: String,
     },
-    /// 一个请求体里带着看起来像凭据的东西（观察态）。
+    /// 一个请求发出前，按出站脱敏的规则找到了东西。
     ///
-    /// **只记录，不改变任何行为。**换成占位符是「拦截」态的事，而那要
-    /// 等那套完整的脱敏。
-    LeakSeen {
-        id: u64,
-        provider: String,
-        /// 哪种凭据：`anthropic-api-key` / `private-key` / `jwt` …（见
-        /// `tw_redact::rules::Secret`）。字段叫 `secret` 而不是 `kind` ——
-        /// 那个名字已经被枚举的 tag 占了（`probe` 那次同样的坑）
-        secret: String,
-        /// **已打码**。报出来的东西一律打码 —— 「发现了 sk-ant-xxx」
-        /// 这句话本身就是一次泄漏
-        masked: String,
-        at_ms: u64,
-    },
-    /// 出站脱敏动手了。
+    /// **观察档和拦截档报的是同一条**，差别只在 `replaced`：观察档只记录，
+    /// 请求原样发出；拦截档已经把它们换成了占位符。以前两档是两条事件、
+    /// 按两套规格找，于是同一个请求观察时报「检测到」，切到拦截后一处不换。
     ///
-    /// **界面上必须能看到脱敏发生了什么** —— 看不见的安全功能会被用户
-    /// 关掉，因为他们会怀疑是脱敏搞坏了功能。
-    Redacted {
+    /// **看不见的安全功能会被用户关掉** —— 他们会怀疑是脱敏搞坏了功能 ——
+    /// 所以换了什么要说得出来，但一律打码。
+    SecretsFound {
         id: u64,
+        /// 这时要发往的上游（故障转移之前的首选）
         provider: String,
-        items: Vec<RedactedItem>,
+        /// 已经换成占位符了吗。`false` = 观察档，只记录
+        replaced: bool,
+        items: Vec<SecretItem>,
         at_ms: u64,
     },
     /// token 端点换发了新的 refresh token。
@@ -270,19 +265,6 @@ pub enum Event {
         dropped: Vec<String>,
         at_ms: u64,
     },
-    /// 这条响应长什么样（防线三）。
-    ///
-    /// **只有形状，没有内容**：几个工具调用、命中几条规则。攒起来就是
-    /// 每个上游的行为画像 —— 一个用了三个月一直正常的中转站，某天开始
-    /// 返回大量 bash 调用，那是统计异常。
-    ///
-    /// 单独一个事件而不是挂在 `RequestFinished` 上：它只在开了入站审查
-    /// 时才有，而 `RequestFinished` 是每条请求都有的。
-    ResponseInspected {
-        id: u64,
-        tool_calls: u32,
-        flagged: u32,
-    },
     /// 上游返回的响应里有一个可疑的工具调用。
     ///
     /// **这是网关位置独有的能力**：只有我们同时知道「这个调用长什么样」
@@ -294,12 +276,18 @@ pub enum Event {
         provider: String,
         /// 哪个工具。「一个 bash 调用」和「一个 Read 调用」是两件事
         tool: String,
+        /// 内置规则的 id，或者自定义规则的名字
         rule: String,
+        /// 自定义规则
+        #[serde(default)]
+        custom: bool,
+        /// 为什么值得看一眼（英文）。自定义规则是空的，名字就是说明
         why: String,
         /// 命中的那一小段，**已截断**
         excerpt: String,
-        high: bool,
-        /// 真的切断了流吗。**高危 + 不受信任 + 拦截态**三者同时成立才会
+        /// 这条规则在拦截档下做什么：`cut` / `record`
+        action: String,
+        /// 真的切断了流吗。**拦截档 + 规则是切断**两者同时成立才会
         blocked: bool,
         at_ms: u64,
     },
@@ -545,7 +533,7 @@ impl Event {
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
-            | Event::LeakSeen { id, .. }
+            | Event::SecretsFound { id, .. }
             | Event::ScanAlert { id, .. }
             | Event::RequestPriced { id, .. }
             | Event::ClientsChanged { id, .. }
@@ -553,9 +541,7 @@ impl Event {
             | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
             | Event::AuthChanged { id, .. }
-            | Event::Redacted { id, .. }
             | Event::ToolCallFlagged { id, .. }
-            | Event::ResponseInspected { id, .. }
             | Event::Translated { id, .. }
             | Event::CredentialRotated { id, .. }
             | Event::CredentialExpired { id, .. }
@@ -580,12 +566,11 @@ pub struct Overview {
     pub groups: Vec<GroupView>,
     pub clients: Vec<ClientView>,
     pub listen: ListenView,
-    /// 三条防线各自的状态。
+    /// 两项防护各在哪一档。
     ///
-    /// **界面要能配它们，而不只是显示。**在此之前这三个字段根本没出现
-    /// 在这个视图里，于是「脱敏开没开」只能去翻 config.yaml —— 而三态
-    /// 的整个设计前提是「出厂停在观察态，用户看到证据之后自己决定要不
-    /// 要切到拦截」，一个切不了的开关让那个设计不成立。
+    /// **界面要能配它们，而不只是显示。**三态的整个设计前提是「出厂停在
+    /// 观察态，用户看到证据之后自己决定要不要切到拦截」，一个切不了的开关
+    /// 让那个设计不成立。规则在 `/security` 里。
     #[serde(default)]
     pub security: SecurityView,
     /// 没绑路由的密钥走哪条
@@ -674,20 +659,14 @@ pub struct RetentionView {
     pub body_bytes_now: u64,
 }
 
-/// 三条防线。每条三态，而**「拦截」在每条上做的事不一样**，所以动词也
-/// 一起给出来 —— 界面上统一叫「拦截」的话，用户点下去并不知道会发生
-/// 什么。
+/// 两项防护各在哪一档：`off` / `observe` / `enforce`。
+///
+/// **「拦截」在两项上做的事不一样**：脱敏是替换成占位符，审查是切断响应。
+/// 规则和日志在 [`SecurityDetail`] 和 `/security/events` 里，不塞进概览。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityView {
-    /// 出站脱敏。拦截态 = 替换成占位符
     pub redact: String,
-    /// 入站审查。拦截态 = 切断响应流
     pub inspect_tools: String,
-    /// 配置面扫描。拦截态 = 告警（它本来就不删东西）
-    pub scan_configs: String,
-    /// 用户加了几条自定义扫描规则、停用了几条内置的
-    pub scan_rules_added: usize,
-    pub scan_rules_disabled: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,17 +729,6 @@ pub struct ProviderView {
     /// 实际按什么计费。没写明时自动识别：报过订阅额度的是 `subscription`，
     /// 否则 `per-token`
     pub billing_effective: String,
-    /// 判完的信任级别：`official` / `untrusted`
-    pub trust: String,
-    /// 用户有没有在配置里显式写过 `trust`。
-    ///
-    /// **界面要能区分「自动判成不受信任」和「用户写了不受信任」** ——
-    /// 前者改 base_url 就会变，后者不会，而两者显示成一样会让用户
-    /// 以为自己改不动它。
-    pub trust_explicit: bool,
-    /// 这家上游实际会脱哪几类。给的是**判完的结果**
-    pub redact: Vec<String>,
-    pub redact_explicit: bool,
     /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
     pub references: Vec<ReferenceView>,
     /// 选的价目表。空 = 默认价目表
@@ -826,7 +794,7 @@ pub struct RuleView {
     pub name: String,
     /// `when` 里写了的条件，按固定顺序。空 = 兜底
     pub conditions: Vec<ConditionView>,
-    /// 去向：上游名或组名。拒绝的规则和只附加改写、安全要求的规则没有
+    /// 去向：上游名或组名。拒绝的规则和只附加改写的规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     /// 命中就拒绝。值是返回给客户端的原因
@@ -835,9 +803,6 @@ pub struct RuleView {
     /// 参数改写
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<RuleRewrite>,
-    /// 安全要求
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard: Option<RuleGuard>,
     /// 没有条件，匹配全部请求
     #[serde(default)]
     pub catch_all: bool,
@@ -845,7 +810,7 @@ pub struct RuleView {
     #[serde(default)]
     pub phase_two: bool,
     /// 它的转发或拒绝不会被采用：前面已经有一条匹配全部请求的转发或拒绝。
-    /// 它附加的改写和安全要求照常生效
+    /// 它附加的改写照常生效
     #[serde(default)]
     pub shadowed: bool,
 }
@@ -861,17 +826,6 @@ pub struct RuleRewrite {
     /// 打开或关闭扩展思考
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
-}
-
-/// 规则里的安全要求。**只能收紧**：和上游自己的设置取并集。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct RuleGuard {
-    /// 额外脱敏的类别，和上游 `redact` 同一套标识符
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub redact: Vec<String>,
-    /// 按非官方端点处理
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub untrusted: bool,
 }
 
 /// 规则里的一个条件。
@@ -1467,12 +1421,6 @@ pub struct ProviderInput {
     /// `per-token` / `subscription` / `free` / `unknown`。不给就自动识别
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
-    /// `official` / `untrusted`。不给就按地址识别
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust: Option<String>,
-    /// 发送前脱敏的类别。不给就按地址识别；**空列表是「不脱敏」**
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redact: Option<Vec<String>>,
     /// 按哪张价目表计价。不给就是默认价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
@@ -1496,10 +1444,6 @@ pub struct ProviderPreview {
     /// 按地址推断的接口协议。推断不出是空（转发时按 Anthropic 处理）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
-    /// 是厂商官方端点：自动识别的信任级别是 `official`，否则 `untrusted`
-    pub official: bool,
-    /// 自动识别时发送前脱敏的类别
-    pub redact: Vec<String>,
     /// API 密钥放在哪个请求头里：`x-api-key` / `authorization` / `x-goog-api-key`。
     /// 选定了协议按选定的算，否则按推断出的
     pub auth_header: String,
@@ -1682,8 +1626,6 @@ pub struct RuleInput {
     pub deny: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<RuleRewrite>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard: Option<RuleGuard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1901,16 +1843,10 @@ pub struct Summary {
     /// 1.25 倍单价计费，所以这个数可以是负的。
     #[serde(default)]
     pub cache_saved_micros: i64,
-    /// 本区间有多少个请求带回了可疑工具调用（防线三）
+    /// 本区间两项防护各留下了几条记录。**和安全日志数的是同一批** —— 概览上
+    /// 点开这个数，落到的日志就是这么多条
     #[serde(default)]
-    pub flagged_requests: i64,
-    /// 本区间有多少个请求在出站时被脱敏换过内容（防线一的拦截档）
-    ///
-    /// **观察档不产生这个数**，它产生的是 `/leaks` 里那些证据。两档
-    /// 各有各的痕迹，界面上要分别说明 —— 否则切到拦截之后看起来像
-    /// 什么都没发生，而那是防护更强的一档。
-    #[serde(default)]
-    pub redacted_requests: i64,
+    pub security: SecurityCounts,
     /// 价目表的快照日期。**成本旁边要标它** —— 一个两个月前
     /// 的价目表算出来的数字，可信度和昨天的完全不同
     pub pricing_date: String,
@@ -1979,6 +1915,12 @@ pub struct HistoryRow {
     /// 认不出会话的请求（拼不出指纹的、老记录）是 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// 这次请求在两项防护上留下的记录（和安全日志同一份）。没有就是空的。
+    ///
+    /// **流量页的徽标靠它。**以前徽标只来自实时事件，关窗再开就没了 ——
+    /// 而那正是用户回头翻「那一条到底被换了什么」的时候。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security: Vec<SecurityEventView>,
 }
 
 /// 一次请求做过的格式转换。
@@ -2205,20 +2147,6 @@ pub struct SpeedResult {
     pub error: Option<String>,
 }
 
-/// 「过去 7 天，有 3 个请求把你的 API key 发给了 relay-cn」。
-///
-/// **这比任何功能介绍都有说服力**，因为它说的是已经发生在你身上的事。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeakGroup {
-    pub provider: String,
-    /// 哪种凭据，和 `Event::LeakSeen.secret` 同一个词表
-    pub secret: String,
-    pub requests: i64,
-    pub last_at_ms: i64,
-    /// 涉及哪几把，**都已打码**
-    pub masked: Vec<String>,
-}
-
 /// 观测这一层在不在记。
 ///
 /// **不看磁盘还剩多少。**那是操作系统的事，网关管好自己占的那一份就够了
@@ -2233,16 +2161,6 @@ pub struct StorageStatus {
     pub blob_bytes: u64,
     /// **转发受影响了吗。永远是 false** —— 观测挂了，代理照跑
     pub forwarding_affected: bool,
-}
-
-/// 换掉了哪一类、几处。**只有类别和计数，没有原值。**
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RedactedItem {
-    /// 类别：`api-keys` / `private-keys` / `jwt` / `conn-strings` / `internal`
-    pub kind: String,
-    /// 具体是哪种，和 `Event::LeakSeen.secret` 同一个词表
-    pub secret: String,
-    pub count: u64,
 }
 
 // ---------------------------------------------------------------- 会话
@@ -2368,49 +2286,6 @@ pub struct ReplayResult {
     pub original: ReplayOriginal,
 }
 
-// ---------------------------------------------------------- 上游行为基线
-
-/// 一个上游最近是不是变了（防线三）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DriftView {
-    /// `flagged`（命中高危规则的响应）/ `tool_calls`（带工具调用的响应）/
-    /// `errors`（失败的请求）
-    pub metric: String,
-    /// 比率，0..1
-    pub recent: f64,
-    pub baseline: f64,
-    /// 两边各自的样本量。**必须一起显示** —— 没有它，比率是个没法判断
-    /// 可信度的数字
-    pub recent_n: i64,
-    pub baseline_n: i64,
-    pub notable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderBaseline {
-    pub provider: String,
-    /// 最近这一段有多少条请求
-    pub recent_total: i64,
-    /// 基线那一段有多少条
-    pub baseline_total: i64,
-    /// 数过形状的有多少条。**和总数不同时要说** —— 关掉入站审查的那段
-    /// 时间没有数过，画像里不该假装它们是「没有工具调用」
-    pub recent_inspected: i64,
-    pub baseline_inspected: i64,
-    pub drifts: Vec<DriftView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BaselineResponse {
-    /// 最近这一段有多长（小时）
-    pub recent_hours: u32,
-    /// 基线那一段有多长（天）
-    pub baseline_days: u32,
-    pub providers: Vec<ProviderBaseline>,
-    /// 观测层没起来时是 true，界面上要说清「不是没发现，是没看」
-    pub unavailable: bool,
-}
-
 // ---------------------------------------------------------------- 静态扫描
 
 /// 一处发现。
@@ -2478,14 +2353,6 @@ pub struct ScanResponse {
     /// 读不动的文件。**要显示** —— 悄悄跳过会给人「查过了」的错觉
     pub unreadable: Vec<String>,
     pub scanned: usize,
-    /// 这次生效的规则数，内置的加上用户加的
-    pub rules_active: usize,
-    /// 其中用户加的
-    pub rules_custom: usize,
-    /// 停用了几条内置规则
-    pub rules_disabled: usize,
-    /// 有规则没能生效时的说明（正则写错、停用了不存在的 id）
-    pub rules_warning: Option<String>,
     /// 这次连哪些项目目录一起扫了
     pub projects: Vec<String>,
 }
@@ -2787,6 +2654,209 @@ pub struct FindingView {
     pub detail: Msg,
     /// 用户可以自己执行的下一步。**我们不替他执行。**
     pub fix: Option<Msg>,
+}
+
+// ---------------------------------------------------------------- 安全
+
+/// 出站脱敏找到的一项：哪条规则、哪个值（已打码）、在这个请求里出现了几次。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecretItem {
+    /// 内置规则的 id（`anthropic-api-key` …），或者自定义规则的名字
+    pub rule: String,
+    #[serde(default)]
+    pub custom: bool,
+    /// 类别：`api-keys` / `private-keys` / `jwt` / `conn-strings` / `internal` / `custom`
+    pub kind: String,
+    /// **已打码。**报出来的东西一律打码 —— 「发现了 sk-ant-xxx」这句话本身
+    /// 就是一次泄漏。内网地址和内部域名例外，它们不是凭据
+    pub masked: String,
+    pub count: u64,
+}
+
+/// 两项防护在一段时间里各留下了几条记录。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SecurityCounts {
+    /// 出站脱敏找到的（每条 = 一个请求里的一个值）
+    pub secrets: i64,
+    /// 其中已替换的（拦截档）
+    pub secrets_replaced: i64,
+    /// 命中规则的工具调用
+    pub tool_calls: i64,
+    /// 其中被切断的
+    pub tool_calls_cut: i64,
+}
+
+/// 安全日志的一条。
+///
+/// **一条是一次命中**：出站脱敏是「一个请求里的一个值」（出现几次合成
+/// 一条，`count` 说几次），工具调用审查是「一个工具调用命中一条规则」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityEventView {
+    pub id: i64,
+    pub at_ms: i64,
+    pub request_id: i64,
+    /// `redact` / `inspect_tools`
+    pub guard: String,
+    /// 内置规则的 id，或者自定义规则的名字
+    pub rule: String,
+    #[serde(default)]
+    pub custom: bool,
+    /// 做了什么：`recorded`（只记录）/ `replaced`（已替换）/ `cut`（已切断）
+    pub action: String,
+    /// 请求最终由哪个上游服务；还没结束的是当时的首选
+    pub provider: String,
+    /// 哪把网关密钥
+    pub client: String,
+    /// 请求的模型。还没落库的请求是空的
+    #[serde(default)]
+    pub model: String,
+    /// 工具调用审查：哪个工具
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// 出站脱敏是打码后的值；工具调用审查是命中的那一小段（已截断）
+    pub excerpt: String,
+    /// 出站脱敏：这个值在请求里出现了几次
+    pub count: i64,
+}
+
+/// 安全日志的一页。**按时间倒序**，`more` 说后面还有没有。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityEventsPage {
+    pub events: Vec<SecurityEventView>,
+    pub more: bool,
+}
+
+/// 一条内置规则按什么认。**给界面说明用**，界面按类型写成自己的话。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Matcher {
+    /// 以 `prefix` 开头，其后至少还有 `min_tail` 个字符
+    Prefix { prefix: String, min_tail: usize },
+    /// `sk-` 开头的 OpenAI 老式密钥：全长至少 `min_len`，字母和数字都有
+    OpenaiLegacy { min_len: usize },
+    /// PEM 私钥块，BEGIN 到对应的 END 整段
+    Pem,
+    /// 三段 base64url，首段解码后含 `"alg"`
+    Jwt,
+    /// `协议://用户:口令@主机` 里的口令
+    ConnString,
+    /// RFC1918 私有地址，不含回环
+    PrivateIp,
+    /// 以这几个后缀结尾的域名
+    DomainSuffix { suffixes: Vec<String> },
+    /// 正则表达式：工具调用审查的全部规则，和两项防护的自定义规则
+    Regex { pattern: String },
+}
+
+/// 一条规则。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityRuleView {
+    /// 内置规则的 id，或者自定义规则的名字
+    pub id: String,
+    #[serde(default)]
+    pub custom: bool,
+    /// 英文名。界面按 id 查自己的名称表，查不到才用它；自定义规则就是名字
+    pub name: String,
+    /// 为什么值得看一眼（英文）。出站脱敏和自定义规则没有
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    /// 类别。出站脱敏：`api-keys` … `custom`；工具调用审查：`command` / `custom`
+    pub kind: String,
+    pub matcher: Matcher,
+    pub enabled: bool,
+    /// 出厂时开不开。自定义规则是 `true`
+    pub on_by_default: bool,
+    /// 工具调用审查：拦截档下做什么，`cut` / `record`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// 一项防护的档位和规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardDetail {
+    /// `off` / `observe` / `enforce`
+    pub mode: String,
+    /// 按界面上的顺序：内置的在前，自定义的在后
+    pub rules: Vec<SecurityRuleView>,
+    /// 配置里写了、但认不出的内置规则 id。**要说出来** —— 多半是拼错了，
+    /// 而它的表现是「我明明停用了它，怎么还在报」
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown: Vec<String>,
+}
+
+/// 两项防护。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityDetail {
+    pub redact: GuardDetail,
+    pub inspect_tools: GuardDetail,
+}
+
+/// 改档位。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeSave {
+    /// `off` / `observe` / `enforce`
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 启用或停用一条规则（内置的或自定义的）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleToggle {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 新建或修改一条自定义规则。改的时候名字可以变，那就是改名。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomRuleSave {
+    pub name: String,
+    pub pattern: String,
+    /// 工具调用审查才有：`cut` / `record`。不给按 `record`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// 拿一段文本试一试。给了 `pattern` 就只试这一条正则，给了 `rule` 就只试
+/// 这一条内置规则（停用着的也能试），都不给就按现在启用的全部规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityTestRequest {
+    pub sample: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+}
+
+/// 试出来的一处。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityTestHit {
+    pub rule: String,
+    #[serde(default)]
+    pub custom: bool,
+    /// 在样本里的位置，**按 UTF-16 码元计** —— 界面是 JavaScript，按它的
+    /// 下标切就能标出来
+    pub start: usize,
+    pub end: usize,
+    /// 出站脱敏：打码后的值；工具调用审查：命中的那一小段
+    pub excerpt: String,
+    /// 工具调用审查：拦截档下做什么
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityTestResult {
+    pub hits: Vec<SecurityTestHit>,
 }
 
 #[cfg(test)]

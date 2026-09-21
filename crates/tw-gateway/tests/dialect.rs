@@ -107,7 +107,6 @@ async fn start_gateway(
             key: Some("sk-deepseek".into()),
             // **这一行是整个功能的开关**
             protocol: Some(tw_config::Protocol::OpenaiChat),
-            redact: Some(vec![]),
             ..Default::default()
         }],
         ..Default::default()

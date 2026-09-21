@@ -194,12 +194,12 @@ impl ByteRestorer {
 mod tests {
     use super::*;
     use crate::redact::redact;
-    use crate::rules::Kind;
+    use crate::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn ledger() -> Ledger {
-        redact(&format!("k={KEY}"), &[Kind::ApiKeys]).ledger
+        redact(&format!("k={KEY}"), &RuleSet::only(&["anthropic-api-key"])).ledger
     }
 
     /// 把一段内容按给定的切法喂进去，返回客户端最终看到的东西。
@@ -359,12 +359,12 @@ mod tests {
 mod byte_tests {
     use super::*;
     use crate::redact::redact;
-    use crate::rules::Kind;
+    use crate::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn ledger() -> Ledger {
-        redact(&format!("k={KEY}"), &[Kind::ApiKeys]).ledger
+        redact(&format!("k={KEY}"), &RuleSet::only(&["anthropic-api-key"])).ledger
     }
 
     fn feed_bytes(chunks: &[&[u8]]) -> String {

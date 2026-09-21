@@ -362,8 +362,11 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["protocol"], "anthropic");
-    assert_eq!(v["official"], true);
-    assert_eq!(v["redact"], serde_json::json!([]), "官方端点不脱敏");
+    // 安全设置是全局的，预览里不再有「这家脱不脱敏、可不可信」
+    assert!(
+        v.get("official").is_none() && v.get("redact").is_none(),
+        "{v}"
+    );
     assert_eq!(v["auth_header"], "x-api-key");
 
     // 选了协议：密钥按选的协议放，「自动识别」那一项仍然说按地址推断的结果
@@ -395,13 +398,6 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     )
     .await;
     assert!(v.get("protocol").is_none(), "{v}");
-    assert_eq!(v["official"], false);
-    assert!(
-        v["redact"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("api-keys"))
-    );
 
     // 没写计费方式时，概览说出它实际按什么计费
     let (_, ov) = call(&b.app, "GET", "/overview", serde_json::json!(null)).await;

@@ -398,11 +398,13 @@ async fn a_stream_the_upstream_breaks_is_failed_and_not_also_cancelled() {
 /// 上游已经为这次回答计了费 —— 两件事都要在结局里说清楚。
 #[tokio::test]
 async fn a_stream_the_tool_firewall_cuts_is_denied_and_keeps_its_usage() {
-    let mut p = provider(poisoned_stream_upstream().await);
-    p.trust = Some(tw_config::Trust::Untrusted);
+    let p = provider(poisoned_stream_upstream().await);
     let mut c = cfg(p);
     c.security = Security {
-        inspect_tools: SecurityMode::Enforce,
+        inspect_tools: tw_config::ToolPolicy {
+            mode: SecurityMode::Enforce,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let (gw, mut events) = serve(c).await;
@@ -475,7 +477,6 @@ async fn a_phase_two_deny_after_the_request_started_is_reported_as_denied() {
             to: None,
             set: None,
             deny: Some("这段内容不发给中转站".into()),
-            guard: None,
         },
         tw_engine::Rule {
             name: "兜底".into(),
@@ -483,7 +484,6 @@ async fn a_phase_two_deny_after_the_request_started_is_reported_as_denied() {
             to: Some("up".into()),
             set: None,
             deny: None,
-            guard: None,
         },
     ])];
     let (gw, mut events) = serve(c).await;
@@ -603,11 +603,13 @@ async fn a_websocket_whose_upstream_cannot_be_reached_is_failed() {
 /// 上游坏了** —— `source` 要说清楚是哪一种。
 #[tokio::test]
 async fn a_websocket_cut_for_a_dangerous_tool_call_is_failed_as_denied() {
-    let mut p = provider(ws_upstream("danger").await);
-    p.trust = Some(tw_config::Trust::Untrusted);
+    let p = provider(ws_upstream("danger").await);
     let mut c = cfg(p);
     c.security = Security {
-        inspect_tools: SecurityMode::Enforce,
+        inspect_tools: tw_config::ToolPolicy {
+            mode: SecurityMode::Enforce,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let (gw, mut events) = serve(c).await;

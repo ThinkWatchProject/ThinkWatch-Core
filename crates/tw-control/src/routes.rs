@@ -22,7 +22,7 @@ use tw_config::edit::{self, EditError};
 use tw_config::history::Origin;
 use tw_config::refs;
 use tw_engine::rule::{OneOrMany, When};
-use tw_engine::{Group, GroupType, Guard, RouteSet, Rule, SetAction};
+use tw_engine::{Group, GroupType, RouteSet, Rule, SetAction};
 use tw_yaml::Step;
 
 use crate::resources::{checked_name, invalid, mapping};
@@ -294,32 +294,12 @@ pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Res
         };
         (!a.is_empty()).then_some(a)
     });
-    let guard = match &input.guard {
-        Some(g) => {
-            let redact = g
-                .redact
-                .iter()
-                .map(|k| {
-                    serde_yaml_ng::from_value(Value::String(k.clone())).map_err(|_| {
-                        format!("rule `{name}`: `{k}` is not a redaction class we support")
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let g = Guard {
-                redact,
-                untrusted: g.untrusted,
-            };
-            (!g.is_empty()).then_some(g)
-        }
-        None => None,
-    };
     Ok(Rule {
         name,
         when,
         to,
         set,
         deny,
-        guard,
     })
 }
 
@@ -586,14 +566,6 @@ pub(crate) fn rule_view(r: &Rule, n: tw_engine::RuleNotes) -> tw_api::RuleView {
                 model: s.model.clone(),
                 max_tokens: s.max_tokens,
                 thinking: s.thinking,
-            }),
-        guard: r
-            .guard
-            .as_ref()
-            .filter(|g| !g.is_empty())
-            .map(|g| tw_api::RuleGuard {
-                redact: g.redact.iter().map(|k| k.slug().to_string()).collect(),
-                untrusted: g.untrusted,
             }),
         catch_all: n.catch_all,
         phase_two: n.phase_two,

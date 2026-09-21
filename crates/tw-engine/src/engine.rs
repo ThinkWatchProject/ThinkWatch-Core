@@ -229,40 +229,6 @@ fn hash64(s: &str) -> u64 {
     h
 }
 
-/// 横切的安全策略。
-///
-/// **只能收紧，不能放松。**这是三层配置里最外面那一层，而它的合并规则
-/// 是并集 —— 一条 `guard` 规则不小心写少了，不会把 provider 上配好的
-/// 保护削掉。让横切策略安全的正是这一条：**加一条规则永远不会让系统
-/// 变得更不安全**，所以人敢往里加规则。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Guard {
-    /// 额外要脱的类别。和 provider 上配的取并集
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub redact: Vec<tw_redact::rules::Kind>,
-    /// 这条路径上一律当成不受信任的上游看待。
-    ///
-    /// **只能从「信任」收到「不信任」**，反过来写不生效
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub untrusted: bool,
-}
-
-impl Guard {
-    /// 并集。**只加不减** —— 这就是「只能收紧」那句话的全部实现。
-    pub fn merge(&mut self, other: &Guard) {
-        for k in &other.redact {
-            if !self.redact.contains(k) {
-                self.redact.push(*k);
-            }
-        }
-        self.untrusted |= other.untrusted;
-    }
-    pub fn is_empty(&self) -> bool {
-        self.redact.is_empty() && !self.untrusted
-    }
-}
-
 /// 改写请求参数。
 ///
 /// **这是和流量代理最本质的分歧**：Clash 的规则只能决定走哪个
@@ -338,9 +304,6 @@ pub struct Rule {
     /// 直接拒绝，带一句给客户端看的原因。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
-    /// 横切的安全策略。**从所有命中的规则累积，而且只能收紧。**
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard: Option<Guard>,
 }
 
 impl Rule {
@@ -349,16 +312,12 @@ impl Rule {
         self.to.is_some() || self.deny.is_some()
     }
 
-    /// 命中就附加参数改写或安全要求。这两样从所有命中的规则累积。
+    /// 命中就附加参数改写。它从所有命中的规则累积。
     pub fn adds(&self) -> bool {
         self.set.as_ref().is_some_and(|s| !s.is_empty())
-            || self.guard.as_ref().is_some_and(|g| !g.is_empty())
     }
 
-    /// 命中之后有没有任何效果：决定去向，或者附加参数改写、安全要求。
-    ///
-    /// **只附加安全要求的规则是有效的**（「选定中转上游时额外脱敏」）。它曾经
-    /// 被当成「命中后不产生任何效果」拒掉。
+    /// 命中之后有没有任何效果：决定去向，或者附加参数改写。
     pub fn has_effect(&self) -> bool {
         self.decides() || self.adds()
     }
@@ -477,8 +436,6 @@ pub struct Decision {
     pub via_group: Option<String>,
     /// 累积起来的参数改写
     pub set: SetAction,
-    /// 累积起来的安全策略。**并集，只加不减**
-    pub guard: Guard,
 }
 
 /// 阶段一结束时可能是「不让干」。
@@ -496,8 +453,8 @@ pub enum Outcome {
 /// 阶段二的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome2 {
-    /// 继续，带上累积后的参数改写和安全策略
-    Proceed(SetAction, Guard),
+    /// 继续，带上累积后的参数改写
+    Proceed(SetAction),
     Deny {
         rule: String,
         reason: String,
@@ -512,7 +469,7 @@ pub enum RouteError {
         "rule `{0}` sets both provider_would_be and to. provider_would_be can only be evaluated once an upstream is chosen, so such a rule takes only set or deny"
     )]
     PhaseTwoWithTo(String),
-    #[error("rule `{0}` sets none of to, deny, set or guard, so matching it does nothing")]
+    #[error("rule `{0}` sets none of to, deny or set, so matching it does nothing")]
     NoAction(String),
     #[error("rule `{rule}` points at `{target}`, which is neither an upstream nor a group")]
     UnknownTarget { rule: String, target: String },
@@ -605,7 +562,6 @@ impl Engine {
                 to: Some(ALL_UPSTREAMS.to_string()),
                 set: None,
                 deny: None,
-                guard: None,
             };
             sets.push(RouteSet {
                 name: default_route.clone(),
@@ -748,7 +704,6 @@ impl Engine {
     /// 代码，试算才不会算出一个和真实转发不一样的结果。
     pub fn route_with(&self, rules: &[Rule], facts: &RequestFacts) -> Result<Outcome, RouteError> {
         let mut set = SetAction::default();
-        let mut guard = Guard::default();
         let mut chosen: Option<&Rule> = None;
 
         for r in rules {
@@ -758,9 +713,6 @@ impl Engine {
             }
             if let Some(s) = &r.set {
                 set.merge(s);
-            }
-            if let Some(g) = &r.guard {
-                guard.merge(g);
             }
             if chosen.is_none() && (r.to.is_some() || r.deny.is_some()) {
                 chosen = Some(r);
@@ -782,24 +734,20 @@ impl Engine {
             matched_rule: r.name.clone(),
             via_group,
             set,
-            guard,
         }))
     }
 
     /// 阶段二：知道了具体走哪家之后，再跑一遍含 `provider_would_be` 的规则。
     ///
-    /// **故障转移换了 provider 之后必须重跑这一步**。否则「走中转
-    /// 的一律脱敏」这条规则，在从官方转移到中转时会漏掉 —— 而那正是最
-    /// 需要它的时刻。
+    /// **故障转移换了 provider 之后必须重跑这一步**。否则「走某家时改写
+    /// 参数、或者拒绝」这类规则，在转移到那一家时会漏掉。
     pub fn phase_two(
         &self,
         facts: &RequestFacts,
         provider: &str,
         base: &SetAction,
-        base_guard: &Guard,
     ) -> Result<Outcome2, RouteError> {
         let mut set = base.clone();
-        let mut guard = base_guard.clone();
         for r in self.rules_for(&facts.client) {
             if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
                 continue;
@@ -813,14 +761,8 @@ impl Engine {
             if let Some(s) = &r.set {
                 set.merge(s);
             }
-            // **「走中转的一律脱敏」这条规则活在这里。**它的条件要等
-            // 选完上游才知道，而故障转移从官方切到中转的那一刻，正是
-            // 最需要它的时刻
-            if let Some(g) = &r.guard {
-                guard.merge(g);
-            }
         }
-        Ok(Outcome2::Proceed(set, guard))
+        Ok(Outcome2::Proceed(set))
     }
 
     fn resolve_target(&self, r: &Rule) -> Result<(Vec<String>, Option<String>), RouteError> {
@@ -960,7 +902,6 @@ mod tests {
             to: Some(to.into()),
             set: None,
             deny: None,
-            guard: None,
         }
     }
 
@@ -1009,7 +950,6 @@ mod tests {
                 to: Some(to.into()),
                 set: None,
                 deny: None,
-                guard: None,
             }],
         }
     }
@@ -1284,7 +1224,6 @@ mod tests {
             to: to.map(String::from),
             set,
             deny: deny.map(String::from),
-            guard: None,
         }
     }
 
@@ -1436,19 +1375,13 @@ mod tests {
             ],
         );
         let base = SetAction::default();
-        match e
-            .phase_two(&facts("x"), "relay", &base, &Guard::default())
-            .unwrap()
-        {
-            Outcome2::Proceed(s, _) => assert_eq!(s.thinking, Some(false)),
+        match e.phase_two(&facts("x"), "relay", &base).unwrap() {
+            Outcome2::Proceed(s) => assert_eq!(s.thinking, Some(false)),
             other => panic!("{other:?}"),
         }
         // 换一家就不该命中了 —— 这正是故障转移后必须重跑的理由
-        match e
-            .phase_two(&facts("x"), "official", &base, &Guard::default())
-            .unwrap()
-        {
-            Outcome2::Proceed(s, _) => assert_eq!(s.thinking, None),
+        match e.phase_two(&facts("x"), "official", &base).unwrap() {
+            Outcome2::Proceed(s) => assert_eq!(s.thinking, None),
             other => panic!("{other:?}"),
         }
     }
@@ -1476,11 +1409,8 @@ mod tests {
         );
         let base = SetAction::default();
         for (p, want) in [("a", Some(false)), ("b", Some(false)), ("c", None)] {
-            match e
-                .phase_two(&facts("x"), p, &base, &Guard::default())
-                .unwrap()
-            {
-                Outcome2::Proceed(s, _) => assert_eq!(s.thinking, want, "provider={p}"),
+            match e.phase_two(&facts("x"), p, &base).unwrap() {
+                Outcome2::Proceed(s) => assert_eq!(s.thinking, want, "provider={p}"),
                 other => panic!("{other:?}"),
             }
         }
@@ -1797,7 +1727,6 @@ mod builtin_tests {
             to: Some(to.into()),
             set: None,
             deny: None,
-            guard: None,
         }
     }
 
@@ -1852,23 +1781,22 @@ mod builtin_tests {
     }
 
     #[test]
-    fn a_rule_that_only_adds_a_guard_is_valid() {
-        // 「选定中转上游时按非官方端点处理」：只有安全要求，没有去向和改写
-        let only_guard = Rule {
-            name: "中转加强保护".into(),
+    fn a_rule_that_only_rewrites_is_valid() {
+        // 「选定中转上游时限制输出」：只有改写，没有去向
+        let only_set = Rule {
+            name: "中转限制输出".into(),
             when: serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap(),
             to: None,
-            set: None,
             deny: None,
-            guard: Some(Guard {
-                redact: vec![],
-                untrusted: true,
+            set: Some(SetAction {
+                max_tokens: Some(4096),
+                ..Default::default()
             }),
         };
         let e = Engine::with_default_rules(
             vec!["relay".into()],
             vec![],
-            vec![only_guard, rule("兜底", "{}", "relay")],
+            vec![only_set, rule("兜底", "{}", "relay")],
         );
         assert!(e.validate().is_ok(), "{:?}", e.validate());
     }
@@ -1880,7 +1808,6 @@ mod builtin_tests {
             when: When::default(),
             to: None,
             deny: None,
-            guard: None,
             set: Some(SetAction {
                 max_tokens: Some(4096),
                 ..Default::default()

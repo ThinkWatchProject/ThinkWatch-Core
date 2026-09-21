@@ -198,8 +198,8 @@ fn collect(v: &serde_json::Value, out: &mut Extracted) {
 
 /// 录一个用例。**脱敏在这一步做，不是事后。**
 ///
-/// `kinds` 传全部类别 —— 录制不该按某个 provider 的配置决定脱什么，
-/// 它要脱的是「任何可能是凭据的东西」。
+/// 规则开全部内置的 —— 录制不该按用户此刻的配置决定脱什么，它要脱的是
+/// 「任何可能是凭据的东西」。
 pub fn record(
     name: &str,
     note: &str,
@@ -210,7 +210,9 @@ pub fn record(
     let clean = |r: Recorded| -> Recorded {
         // 两道：先按凭据规则换成占位符（结构还在，值没了），再走一遍
         // 通用打码兜住规则没认出来的
-        let redacted = tw_redact::redact::redact(&r.body, tw_redact::rules::Kind::all()).text;
+        let all: Vec<&str> = tw_redact::rules::BUILTINS.iter().map(|b| b.id).collect();
+        let redacted =
+            tw_redact::redact::redact(&r.body, &tw_redact::rules::RuleSet::only(&all)).text;
         Recorded {
             body: tw_secret::mask_body(&redacted),
             ..r

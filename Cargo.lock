@@ -2805,6 +2805,7 @@ dependencies = [
  "libc",
  "notify",
  "rand 0.10.2",
+ "regex",
  "serde",
  "serde_yaml_ng",
  "tempfile",
@@ -2812,7 +2813,6 @@ dependencies = [
  "tokio",
  "tw-engine",
  "tw-pricing",
- "tw-redact",
  "tw-secret",
  "tw-types",
  "tw-yaml",
@@ -2886,7 +2886,6 @@ dependencies = [
  "thiserror",
  "tracing",
  "tw-dialect",
- "tw-redact",
 ]
 
 [[package]]
@@ -2995,8 +2994,10 @@ name = "tw-redact"
 version = "0.17.2"
 dependencies = [
  "base64",
+ "regex",
  "serde",
  "serde_json",
+ "thiserror",
  "tw-secret",
 ]
 

@@ -154,21 +154,19 @@ fn main() -> Result<()> {
 }
 
 /// 静态扫描。**只报告，不删任何东西。**
-fn cmd_scan(config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
-    // 规则住在 config.yaml 的 `security.scan_rules` 里（只有一份
-    // 配置文件）。读不出配置时用内置那套 —— 扫描不该因为配置坏了就停摆
-    let user = tw_config::load(config)
-        .map(|c| c.security.scan_rules.clone())
-        .unwrap_or_default();
-    let rules = tw_scan::rules::build(&user)?;
-    for w in &rules.warnings {
-        println!("⚠ {w}");
-    }
+fn cmd_scan(_config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
+    // **只用内置规则**，和应用里 MCP 页扫的是同一套。安全页上的规则只作用于
+    // 经过网关的请求
+    let rules = tw_scan::rules::scan_rules();
     let mut srcs = tw_scan::sources::user_level(&home());
     for p in &projects {
         srcs.extend(tw_scan::sources::in_project(p));
     }
-    println!("scanned {} files (rules: {})", srcs.len(), rules.summary());
+    println!(
+        "scanned {} files ({} built-in rules)",
+        srcs.len(),
+        rules.rules.len()
+    );
     let r = tw_scan::report::scan(&srcs, &rules);
 
     if inventory {

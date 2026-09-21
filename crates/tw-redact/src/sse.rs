@@ -238,12 +238,12 @@ impl Body {
 mod tests {
     use super::*;
     use crate::redact::redact;
-    use crate::rules::Kind;
+    use crate::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn ledger() -> Ledger {
-        redact(&format!("k={KEY}"), &[Kind::ApiKeys]).ledger
+        redact(&format!("k={KEY}"), &RuleSet::only(&["anthropic-api-key"])).ledger
     }
 
     fn delta(text: &str) -> String {

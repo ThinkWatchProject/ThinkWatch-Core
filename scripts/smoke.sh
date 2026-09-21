@@ -91,8 +91,7 @@ class H(http.server.BaseHTTPRequestHandler):
 # **必须是多线程的。**单线程的 HTTPServer 一次只处理一条请求，而 core
 # 启动时会给每个 provider 各发一次模型目录刷新 —— 两个 provider 都指着
 # 这一个端口，于是刷新把它占住，数据面那条请求排在后面等到超时，然后
-# 故障转移到另一家。CI 上就是这么红的：relay 超时 10 秒、official 接手，
-# 而 official 的 redact 是空的，所以「中转看见了真 key」。
+# 故障转移到另一家。CI 上就这么红过：relay 超时 10 秒、official 接手。
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 PY
 # **输出留着。**原来是 >/dev/null 2>&1，于是假上游崩了、端口被占了、
@@ -137,18 +136,12 @@ providers:
     base_url: http://127.0.0.1:{upport}
     key: sk-upstream-smoke
     protocol: anthropic
-    redact: [api-keys]
   - name: official
     base_url: http://127.0.0.1:{upport}
     key: sk-upstream-smoke
     protocol: anthropic
-    redact: []
-# **把流量钉在 relay 上，不给故障转移留口子。**
-#
-# 两家都指着同一个假上游，而 official 的 redact 是空的（官方端点不脱）。
-# 不钉的话，relay 一次超时就会让请求转到 official，于是「中转
-# 看见了真 key」—— 一条安全断言被悄悄换成了它的反面，而两种失败在输出
-# 上长得一模一样。CI 上就这么红过两轮。
+# **把流量钉在 relay 上。**脱敏是全局的，走哪家都会换；钉住是为了让
+# 「这一条走了哪条路由」也有一个确定的答案，失败时少猜一件事。
 #
 # official 留着不是摆设：模型目录刷新、/overview 的上游计数都要它，而
 # 那两处正是「多上游」才盖得到的路径。
@@ -162,8 +155,10 @@ routes:
       - name: 冒烟：这条必须走 relay，不许转移
         to: 只走中转
 security:
-  redact: enforce
-  inspect_tools: enforce
+  redact:
+    mode: enforce
+  inspect_tools:
+    mode: enforce
 """)
 PY
 "$BIN" --config "$CFG" check >/dev/null 2>&1 && ok "check 认得这份配置" || bad "check 不认这份配置"
@@ -198,31 +193,12 @@ BODY='{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","c
 R=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
       -H 'content-type: application/json' -d "$BODY")
 if echo "$R" | grep -q '"saw_key": *"no"'; then
-  ok "走中转时密钥被换成了占位符"
-elif SERVED=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
-                | python3 -c 'import sys, json
-rows = json.load(sys.stdin)
-print(rows[0].get("provider", "") if rows else "")' 2>/dev/null) \
-     && [ -n "$SERVED" ] && [ "$SERVED" != "relay" ]; then
-  # **区分两种失败。**「没脱敏」和「根本没走到配了脱敏的那家」是两句
-  # 完全不同的话，而它们的表现一模一样：上游看见了真 key。official 的
-  # redact 故意是空的（官方端点不脱），所以一次故障转移会把这条
-  # 安全断言悄悄变成它的反面 —— 报「中转看见了真 key」会让人去查脱敏，
-  # 而该查的是为什么转移了。
-  bad "这次请求由 $SERVED 服务，没走到配了脱敏的 relay —— 这一条没测到脱敏" "$R"
-  printf '      路由已经钉死在 relay 上了，转移不该发生 —— 看这一行的尝试链：\n'
-  curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
-    | python3 -c 'import sys, json
-rows = json.load(sys.stdin)
-print("        " + json.dumps(rows[0].get("routing"), ensure_ascii=False) if rows else "        （没有记录）")' 2>/dev/null
-  printf '      core.log 末尾：\n'
-  sed 's/^/        /' <<<"$(tail -8 "$TMP/core.log")"
+  ok "拦截档下密钥被换成了占位符"
 else
-  # **一条安全检查失败时必须说出它为什么失败。**「中转看见了真 key」
-  # 只说了结果，而下一步取决于原因：走错上游（`official` 的 redact 是
-  # 空的）、脱敏没配上、还是体根本没被当成 UTF-8。所以把这一次的路由
-  # 决策和 core 日志一起交出来 —— 少了这些，CI 上的一次失败在本机复现
-  # 不出来就只能靠猜。
+  # **一条安全检查失败时必须说出它为什么失败。**「上游看见了真 key」
+  # 只说了结果，而下一步取决于原因：脱敏没配上、规则没认出来、还是体
+  # 根本没被当成 UTF-8。所以把这一次的路由决策和 core 日志一起交出来 ——
+  # 少了这些，CI 上的一次失败在本机复现不出来就只能靠猜。
   sleep 0.5
   CHAIN=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
             | python3 -c 'import sys, json
@@ -236,7 +212,7 @@ try:
         print(json.dumps(rows[0], ensure_ascii=False, sort_keys=True))
 except Exception as e:
     print("取不到路由信息：%s" % e)' 2>/dev/null)
-  bad "中转看见了真 key" "$R"
+  bad "上游看见了真 key" "$R"
   printf '      %s\n' "${CHAIN:-（控制面没给出路由信息）}"
   printf '      core.log 末尾：\n'
   sed 's/^/        /' <<<"$(tail -8 "$TMP/core.log")"
@@ -327,8 +303,8 @@ for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=36000
   [ "$C" = "200" ] && ok "GET ${ep%%\?*}（带时间窗）" || bad "GET $ep 返回 $C" "$(cat "$TMP/out" 2>/dev/null | head -c 200)"
 done
 
-for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /leaks \
-          /clients /scan /sessions /baseline /mcp/targets /diagnostics /config /config/history /models; do
+for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
+          /security/events /clients /scan /sessions /mcp/targets /diagnostics /config /config/history /models; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done

@@ -362,16 +362,16 @@ async fn a_broken_condition_is_refused_before_anything_is_written() {
 }
 
 #[tokio::test]
-async fn a_rule_that_only_adds_a_guard_can_be_saved() {
+async fn a_rule_that_only_rewrites_can_be_saved() {
     let b = bed(BASE);
     let (st, v) = call(
         &b.app,
         "PUT",
         "/routes/codex",
         json!({ "route": { "name": "codex", "rules": [
-            { "name": "中转加强保护",
+            { "name": "中转限制输出",
               "conditions": [{ "field": "provider_would_be", "values": ["中转"] }],
-              "guard": { "redact": ["internal"], "untrusted": true } },
+              "set": { "max_tokens": 4096 } },
             catch_all("主力"),
         ]}}),
     )
@@ -379,7 +379,9 @@ async fn a_rule_that_only_adds_a_guard_can_be_saved() {
     assert_eq!(st, StatusCode::OK, "{v}");
     let codex = find(&b.overview().await["routes"], "codex").clone();
     assert_eq!(codex["rules"][0]["phase_two"], true);
-    assert_eq!(codex["rules"][0]["guard"]["untrusted"], true, "{codex}");
+    assert_eq!(codex["rules"][0]["set"]["max_tokens"], 4096, "{codex}");
+    // 安全设置是全局的，规则上没有这一项了
+    assert!(codex["rules"][0].get("guard").is_none(), "{codex}");
 }
 
 #[tokio::test]

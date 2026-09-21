@@ -26,7 +26,6 @@ fn heavy() -> Engine {
         to: Some(to),
         set: None,
         deny: None,
-        guard: None,
     };
     let mut routes: Vec<Rule> = (0..30)
         .map(|i| {
