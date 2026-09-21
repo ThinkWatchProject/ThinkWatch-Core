@@ -929,7 +929,7 @@ async fn latency_by_provider(
 async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     let Some(store) = &s.store else {
         return Json(tw_api::StorageStatus {
-            level: "unavailable".into(),
+            recording: false,
             rows: 0,
             blob_bytes: 0,
             forwarding_affected: false,
@@ -937,7 +937,7 @@ async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     };
     let g = store.lock().await;
     Json(tw_api::StorageStatus {
-        level: g.level().slug().to_string(),
+        recording: true,
         rows: g.db().count().unwrap_or(0),
         blob_bytes: g.blobs().total_bytes(),
         // **永远是 false。**观测挂了，代理照跑。哪天有人想改成

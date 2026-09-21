@@ -10,13 +10,11 @@
 
 pub mod blobs;
 pub mod db;
-pub mod disk;
 pub mod drift;
 pub mod recorder;
 pub mod task;
 
 pub use blobs::{Blobs, Which};
 pub use db::{Db, DbError, Latency, RequestRow, Summary};
-pub use disk::{DiskLevel, free_bytes, level_for};
 pub use recorder::{Recorder, price_source};
 pub use task::StoredBody;

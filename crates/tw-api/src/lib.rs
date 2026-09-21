@@ -387,17 +387,6 @@ pub enum Event {
         status: Option<u16>,
         at_ms: u64,
     },
-    /// 磁盘空间的档位变了，记录随之减少或停止。
-    ///
-    /// **用户点开一个请求发现没有正文时，得知道那不是 bug。**
-    StorageChanged {
-        id: u64,
-        /// `ok` = 全记；`metadata_only` = 不再存正文；`stopped` = 连记录也停了
-        level: String,
-        /// 还剩多少可用空间
-        free_bytes: u64,
-        at_ms: u64,
-    },
     /// 上游在响应头里报了订阅额度。
     ///
     /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
@@ -548,7 +537,6 @@ impl Event {
             | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
             | Event::AuthChanged { id, .. }
-            | Event::StorageChanged { id, .. }
             | Event::Redacted { id, .. }
             | Event::ToolCallFlagged { id, .. }
             | Event::ResponseInspected { id, .. }
@@ -2197,14 +2185,14 @@ pub struct LeakGroup {
     pub masked: Vec<String>,
 }
 
-/// 观测这一层现在能不能写。
+/// 观测这一层在不在记。
+///
+/// **不看磁盘还剩多少。**那是操作系统的事，网关管好自己占的那一份就够了
+/// —— 正文按天数和总量回收（见 `tw_store::blobs`），摘要按天数回收。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
-    /// - `ok`：正常记录
-    /// - `metadata_only`：磁盘空间不足，只记请求摘要，不保存请求体和响应体
-    /// - `stopped`：磁盘空间严重不足，停止记录
-    /// - `unavailable`：请求记录没有启动（数据库打不开之类）
-    pub level: String,
+    /// 请求记录启动了没有。`false` = 数据库打不开之类，这段时间的请求都不会留下
+    pub recording: bool,
     /// 记了多少条
     pub rows: i64,
     /// 请求体占了多少字节
