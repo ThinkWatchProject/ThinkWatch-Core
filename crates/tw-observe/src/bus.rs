@@ -50,6 +50,19 @@ impl EventBus {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// 从这个号之后接着发。
+    ///
+    /// **计数器出厂从 1 开始，而库是跨重启的。**存储层落库用的是
+    /// `INSERT OR REPLACE`（同一个请求要写两次），所以重启后重新发出
+    /// 的号会一条一条顶掉历史上的同号记录。启动时把已经用掉的最大号
+    /// 交给它，那条路就断了。
+    ///
+    /// **只进不退**：同一个进程里被调用两次，或者调用时已经发过号了，
+    /// 都不会把计数器往回拨 —— 往回拨就是在制造重号。
+    pub fn resume_after(&self, id: u64) {
+        self.next_id.fetch_max(id + 1, Ordering::Relaxed);
+    }
+
     /// 发一条。**没有订阅者不是错误** —— 没开 UI 的时候数据面照常跑。
     pub fn emit(&self, ev: tw_api::Event) {
         let _ = self.tx.send(ev);
@@ -67,6 +80,27 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_resume_after_the_number_the_store_already_has() {
+        let b = EventBus::new();
+        b.resume_after(1258);
+        assert_eq!(b.next_id(), 1259);
+        assert_eq!(b.next_id(), 1260);
+    }
+
+    #[test]
+    fn resuming_never_hands_out_a_number_twice() {
+        // **只进不退。**往回拨就是在制造重号，而重号在存储层是覆盖。
+        let b = EventBus::new();
+        assert_eq!(b.next_id(), 1);
+        assert_eq!(b.next_id(), 2);
+        b.resume_after(0);
+        assert_eq!(b.next_id(), 3, "被拨回去了");
+        b.resume_after(100);
+        b.resume_after(50);
+        assert_eq!(b.next_id(), 101);
+    }
 
     #[tokio::test]
     async fn emitting_with_no_subscribers_is_not_an_error() {
