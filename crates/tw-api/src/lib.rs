@@ -2588,7 +2588,11 @@ pub struct DryRunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
     /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，
-    /// 见 `skipped`）
+    /// 见 `skipped`）| `intercepted` | `passthrough`
+    ///
+    /// **后两个说的是这个请求压根没到规则那一层。**客户端自己发的辅助
+    /// 请求先过 `client_probes`：本地应答的一个字节都不出本机，原样放行的
+    /// 直接转发 —— 两种情况下 `trace` 都是空的，因为确实一条规则都没求值。
     pub outcome: String,
     /// 命中的规则名
     pub rule: Option<String>,
