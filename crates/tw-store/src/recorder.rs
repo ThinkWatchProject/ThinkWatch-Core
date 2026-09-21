@@ -1558,7 +1558,7 @@ mod cancellation_tests {
         });
         r.on_event(&cancelled(1, partial()));
 
-        let sessions = r.db().sessions(10).unwrap();
+        let sessions = r.db().sessions(None, 10).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].errors, 0, "取消被算成了会话里的失败");
         let turns = r.db().turns(&sessions[0].id).unwrap();

@@ -158,3 +158,35 @@ async fn a_request_in_the_history_says_which_session_it_belongs_to() {
     let list = get(&app, "/sessions").await;
     assert_eq!(list[0]["id"], "s1");
 }
+
+/// 时间窗走到端点上是不是还成立。
+///
+/// **query string 这一层单独验。**`Window` 上面那段注释记着一次教训：
+/// 不带参数时一切正常，带上时间窗才 400 —— 而单元测试看不见它，它只在
+/// 真的经过一次 query string 解析时才发生。
+#[tokio::test]
+async fn the_endpoints_take_a_time_window_off_the_query_string() {
+    // turn(id) 的 at_ms 是 1000 + id
+    let (_d, app) = app(&[turn(1, "per-token"), turn(2, "per-token")]);
+
+    let all = get(&app, "/history?limit=10").await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+
+    let narrowed = get(&app, "/history?from_ms=1002&to_ms=1002&limit=10").await;
+    let narrowed = narrowed.as_array().unwrap();
+    assert_eq!(narrowed.len(), 1, "{narrowed:?}");
+    assert_eq!(narrowed[0]["id"], 2);
+
+    // 只给一端：从那时起到现在
+    let from_only = get(&app, "/history?from_ms=1002").await;
+    assert_eq!(from_only.as_array().unwrap().len(), 1);
+
+    // 会话那一端：窗口只盖住第二轮，整条会话照样两轮
+    let s = get(&app, "/sessions?from_ms=1002&to_ms=1002").await;
+    assert_eq!(s.as_array().unwrap().len(), 1);
+    assert_eq!(s[0]["turns"], 2, "跨边界的会话被截断了：{s}");
+
+    // 完全错开的窗口筛得掉
+    let none = get(&app, "/sessions?from_ms=9000&to_ms=9999").await;
+    assert!(none.as_array().unwrap().is_empty(), "{none}");
+}

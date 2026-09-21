@@ -648,14 +648,11 @@ async fn summary(
 /// 最近的请求。**实时列表走内存 ring buffer，这个是给「翻历史」的**。
 async fn history(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<Limit>,
+    axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> Result<Json<Vec<tw_api::HistoryRow>>, Fail> {
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let rows = g
-        .db()
-        .recent(q.limit.unwrap_or(200).min(2000))
-        .map_err(internal)?;
+    let rows = g.db().recent(q.within(), q.limit()).map_err(internal)?;
     Ok(Json(rows.into_iter().map(history_row).collect()))
 }
 
@@ -1089,9 +1086,34 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 一张列表要的两样：看哪一段，最多几条。
+///
+/// **时间窗是可选的，而且缺省不是「今天」。**聚合类的端点缺省到今天是
+/// 对的（见 [`Window`]）；列表类的不是 —— 「最近 N 条」本身就是一个
+/// 完整的回答，而缺省成今天的话，过了零点这张表会空掉，那时用户什么
+/// 都没做。
+///
+/// 两端各自可缺：只给 `from_ms` 就是「从那时起到现在」。
+///
+/// 字段摊平写、不用 `#[serde(flatten)]`，理由见 [`Window`] 上面那段。
 #[derive(Debug, serde::Deserialize)]
-struct Limit {
+struct ListQuery {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
     limit: Option<usize>,
+}
+
+impl ListQuery {
+    fn within(&self) -> Option<(i64, i64)> {
+        match (self.from_ms, self.to_ms) {
+            (None, None) => None,
+            (f, t) => Some((f.unwrap_or(i64::MIN), t.unwrap_or_else(now_ms))),
+        }
+    }
+
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(200).min(2000)
+    }
 }
 
 /// 当前配置的原文。**文本模式直接显示它。**
@@ -1335,14 +1357,17 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
 ///
 /// **观测层没起来时返回空列表，不是错误**：那时网关照常转发，
 /// 界面上少一块统计，而不是弹一个错。
-async fn sessions(State(s): State<ControlState>) -> Json<Vec<tw_api::SessionView>> {
+async fn sessions(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<ListQuery>,
+) -> Json<Vec<tw_api::SessionView>> {
     let Some(store) = &s.store else {
         return Json(Vec::new());
     };
     let g = store.lock().await;
     Json(
         g.db()
-            .sessions(200)
+            .sessions(q.within(), q.limit())
             .unwrap_or_default()
             .iter()
             .map(session_view)
@@ -1363,7 +1388,7 @@ async fn session_detail(
     let g = store.lock().await;
     let session = g
         .db()
-        .sessions(500)
+        .sessions(None, 500)
         .unwrap_or_default()
         .iter()
         .find(|x| x.id == id)

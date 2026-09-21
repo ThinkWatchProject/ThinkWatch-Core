@@ -188,7 +188,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                 format!("{} bytes", g.blobs().total_bytes()),
             );
 
-            let recent = g.db().recent(200).unwrap_or_default();
+            let recent = g.db().recent(None, 200).unwrap_or_default();
             let failed: Vec<_> = recent
                 .iter()
                 .filter(|r| r.error.is_some())

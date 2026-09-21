@@ -427,12 +427,24 @@ impl Db {
         Ok(id.max(0) as u64)
     }
 
-    /// 最近 N 条，新的在前。
-    pub fn recent(&self, limit: usize) -> Result<Vec<RequestRow>, DbError> {
-        let mut st = self
-            .conn
-            .prepare("SELECT * FROM requests ORDER BY at_ms DESC, id DESC LIMIT ?1")?;
-        let rows = st.query_map([limit as i64], row_from)?;
+    /// 最近 N 条，新的在前。`within` 给了就只看那段时间。
+    ///
+    /// **不给时间窗不等于「今天」。**别的端点是在做聚合，「这段时间花了
+    /// 多少」必须有个默认的段，而那个段该是今天；这个端点给的是一张
+    /// 列表，「最近 N 条」本身就是一个完整的回答。默认成今天的话，
+    /// 过了零点这张表会空掉，而那时用户什么都没做。
+    pub fn recent(
+        &self,
+        within: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<RequestRow>, DbError> {
+        let (from, to) = within.unwrap_or((i64::MIN, i64::MAX));
+        let mut st = self.conn.prepare(
+            "SELECT * FROM requests
+             WHERE at_ms >= ?1 AND at_ms <= ?2
+             ORDER BY at_ms DESC, id DESC LIMIT ?3",
+        )?;
+        let rows = st.query_map([from, to, limit as i64], row_from)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
@@ -498,7 +510,17 @@ impl Db {
     ///
     /// **本地应答的那些不算轮次**：它们没经过上游，把它们算进
     /// 「这次任务跑了多少轮」会让每个数字都偏大一点，而偏得毫无规律。
-    pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRow>, DbError> {
+    /// `within` 给了就只看在那段时间里活动过的会话。
+    ///
+    /// **筛的是会话，不是轮次。**把轮次按时间筛掉再聚合的话，一次跨过
+    /// 窗口边界的任务会少算几轮、少算一截钱 —— 而「那次重构花了多少」
+    /// 问的是整次任务，不是它落在某个窗口里的那一段。所以先整体聚合，
+    /// 再按「有没有任何一轮落在窗口里」留下整条。
+    pub fn sessions(
+        &self,
+        within: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<SessionRow>, DbError> {
         let mut st = self.conn.prepare(&format!(
             "SELECT session,
                     client,
@@ -520,10 +542,12 @@ impl Db {
              FROM requests
              WHERE session IS NOT NULL AND local = 0
              GROUP BY session
+             HAVING MAX(at_ms) >= ?1 AND MIN(at_ms) <= ?2
              ORDER BY MAX(at_ms) DESC
-             LIMIT ?1"
+             LIMIT ?3"
         ))?;
-        let rows = st.query_map([limit as i64], |r| {
+        let (from, to) = within.unwrap_or((i64::MIN, i64::MAX));
+        let rows = st.query_map([from, to, limit as i64], |r| {
             Ok(SessionRow {
                 id: r.get(0)?,
                 client: r.get(1)?,
@@ -1425,6 +1449,49 @@ mod tests {
     }
 
     #[test]
+    fn a_window_narrows_the_history_and_no_window_means_the_most_recent() {
+        let db = Db::in_memory().unwrap();
+        for (id, at) in [(1, 1_000), (2, 5_000), (3, 9_000)] {
+            db.insert(&row(id, at)).unwrap();
+        }
+        let ids = |w| {
+            let mut v: Vec<i64> = db.recent(w, 10).unwrap().iter().map(|r| r.id).collect();
+            v.sort_unstable();
+            v
+        };
+        // **不给窗口不是「今天」。**列表的默认答案是「最近 N 条」
+        assert_eq!(ids(None), vec![1, 2, 3]);
+        assert_eq!(ids(Some((4_000, 6_000))), vec![2]);
+        // 两端都是闭区间 —— 边界上那一条属于窗口里
+        assert_eq!(ids(Some((5_000, 9_000))), vec![2, 3]);
+        assert!(ids(Some((20_000, 30_000))).is_empty());
+    }
+
+    #[test]
+    fn a_session_that_straddles_the_window_is_kept_whole() {
+        /*
+          **筛的是会话，不是轮次。**把轮次先按时间筛掉再聚合的话，一次
+          跨过边界的任务会少算几轮、少算一截钱 —— 而「那次重构花了多少」
+          问的是整次任务，不是它落在某个窗口里的那一段。
+        */
+        let db = Db::in_memory().unwrap();
+        for (id, at) in [(1, 1_000), (2, 5_000), (3, 9_000)] {
+            let mut r = row(id, at);
+            r.session = Some("s".into());
+            db.insert(&r).unwrap();
+        }
+        // 窗口只盖住中间那一轮，整条会话照样在，而且三轮都算上了
+        let got = db.sessions(Some((4_000, 6_000)), 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].turns, 3, "跨边界的会话被截断了");
+        assert_eq!(got[0].started_ms, 1_000);
+        assert_eq!(got[0].ended_ms, 9_000);
+
+        // 完全错开的窗口才筛得掉它
+        assert!(db.sessions(Some((20_000, 30_000)), 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn the_last_request_id_is_where_the_next_run_has_to_start() {
         let db = Db::in_memory().unwrap();
         assert_eq!(db.last_request_id().unwrap(), 0, "空库不该报一个假的号");
@@ -1451,7 +1518,7 @@ mod tests {
         let mut newer = row(1, 9_000);
         newer.model = "qwen3:8b".into();
         db.insert(&newer).unwrap();
-        assert_eq!(db.recent(10).unwrap().len(), 1, "老的那条没了");
+        assert_eq!(db.recent(None, 10).unwrap().len(), 1, "老的那条没了");
         assert_eq!(db.get(1).unwrap().unwrap().model, "qwen3:8b");
         // 从库里问一次号就够躲开：下一条该用 2
         assert_eq!(db.last_request_id().unwrap(), 1);
@@ -1491,7 +1558,7 @@ mod tests {
         for i in 1..=5 {
             db.insert(&row(i, i * 1000)).unwrap();
         }
-        let got: Vec<i64> = db.recent(3).unwrap().iter().map(|r| r.id).collect();
+        let got: Vec<i64> = db.recent(None, 3).unwrap().iter().map(|r| r.id).collect();
         assert_eq!(got, vec![5, 4, 3]);
     }
 
@@ -1655,7 +1722,7 @@ mod tests {
             r.input_tokens = input;
             db.insert(&r).unwrap();
         }
-        let s = &db.sessions(10).unwrap()[0];
+        let s = &db.sessions(None, 10).unwrap()[0];
         assert_eq!(s.turns, 3);
         assert_eq!(s.cost_micros, 3000);
         assert_eq!(s.unpriced_turns, 1, "没价格的那轮得单独说");
@@ -1678,7 +1745,7 @@ mod tests {
         b.session = Some("s1".into());
         b.local = true;
         db.insert(&b).unwrap();
-        assert_eq!(db.sessions(10).unwrap()[0].turns, 1);
+        assert_eq!(db.sessions(None, 10).unwrap()[0].turns, 1);
         assert_eq!(db.turns("s1").unwrap().len(), 1);
     }
 
@@ -1702,7 +1769,7 @@ mod tests {
         let db = Db::open(&d.path().join("data.db")).unwrap();
         db.insert(&row(1, 100)).unwrap();
         db.insert(&row(2, 200)).unwrap();
-        assert!(db.sessions(10).unwrap().is_empty());
+        assert!(db.sessions(None, 10).unwrap().is_empty());
     }
 
     #[test]
@@ -1848,7 +1915,7 @@ mod tests {
         }
         let db = Db::open(&p).unwrap();
         assert_eq!(db.count().unwrap(), 2, "迁移把老记录弄丢了");
-        let got = db.recent(10).unwrap();
+        let got = db.recent(None, 10).unwrap();
         // 老记录没有旁证，那就是 None —— 不是空字符串
         assert!(got.iter().all(|r| r.client_hint.is_none()));
         // 升级之前取消的请求根本不落库，所以老记录一条都不该是「已取消」
@@ -1861,7 +1928,7 @@ mod tests {
         fresh.client_hint = Some("codex".into());
         fresh.session = Some("abc-100".into());
         db.insert(&fresh).unwrap();
-        let back = &db.recent(1).unwrap()[0];
+        let back = &db.recent(None, 1).unwrap()[0];
         assert_eq!(back.client_hint.as_deref(), Some("codex"));
         assert_eq!(back.session.as_deref(), Some("abc-100"));
     }
@@ -2057,7 +2124,7 @@ mod cost_state_tests {
         assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (0, 0));
         let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
         assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 0));
-        let s = &db.sessions(10).unwrap()[0];
+        let s = &db.sessions(None, 10).unwrap()[0];
         assert_eq!((s.unpriced_turns, s.no_usage_turns), (0, 0));
         assert_eq!(s.priced_turns, 0, "订阅制那一轮没有价格可言");
     }
@@ -2081,7 +2148,7 @@ mod cost_state_tests {
             db.insert(&r).unwrap();
         }
 
-        let s = &db.sessions(10).unwrap()[0];
+        let s = &db.sessions(None, 10).unwrap()[0];
         assert_eq!(s.subscription_turns, 2);
         assert_eq!(
             (s.priced_turns, s.unpriced_turns, s.no_usage_turns),
@@ -2165,7 +2232,7 @@ mod cost_state_tests {
             db.insert(&r).unwrap();
         }
 
-        let s = &db.sessions(10).unwrap()[0];
+        let s = &db.sessions(None, 10).unwrap()[0];
         assert_eq!(s.cost_micros, 1_300);
         assert_eq!(s.cost_micros_estimated, 300, "合计里的估算部分没有单独说");
         assert_eq!(s.priced_turns, 2);
