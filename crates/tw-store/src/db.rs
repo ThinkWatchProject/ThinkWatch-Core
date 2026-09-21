@@ -1276,10 +1276,10 @@ pub struct Latency {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    pub(super) fn row(id: i64, at_ms: i64) -> RequestRow {
+    pub(crate) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
             client_hint: None,
             session: None,

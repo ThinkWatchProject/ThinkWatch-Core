@@ -1415,6 +1415,58 @@ mod cancellation_tests {
         assert_eq!(row.error, None);
     }
 
+    /// 两个期限管的不是同一样东西。
+    ///
+    /// **一条正文几十 KB，一行记录几百字节** —— 合成一个期限的话，要么
+    /// 早早丢掉「上个月花了多少」，要么让磁盘替正文买单。这条钉住的就是
+    /// 它们能各走各的。
+    #[test]
+    fn bodies_and_rows_expire_on_their_own_clocks() {
+        let (_d, r) = rec();
+        const DAY: i64 = 86_400_000;
+        let now = 100 * DAY;
+
+        // 30 天前的一条：正文和记录都写下
+        let old = now - 30 * DAY;
+        r.db().insert(&crate::db::tests::row(1, old)).unwrap();
+        r.record_body(old, 1, Which::Request, b"an old body", 11);
+
+        // 正文留 7 天、记录留 90 天：正文该没了，记录还在
+        r.gc(now, 7, 90, u64::MAX);
+        assert_eq!(
+            r.db().recent(None, 10).unwrap().len(),
+            1,
+            "记录行被正文的期限带走了"
+        );
+        assert!(
+            r.blobs().get(old, 1, Which::Request).is_none(),
+            "正文过了它自己的期限却还在"
+        );
+
+        // 记录的期限也到了才删行
+        r.gc(now, 7, 7, u64::MAX);
+        assert!(r.db().recent(None, 10).unwrap().is_empty());
+    }
+
+    /// 总量上限是给突发准备的：按天算出来的占用取决于用量，而用量会有
+    /// 一周十倍于平时的时候。
+    #[test]
+    fn the_size_cap_bites_even_when_nothing_is_old_enough() {
+        let (_d, r) = rec();
+        const DAY: i64 = 86_400_000;
+        let now = 100 * DAY;
+        for i in 0..3u64 {
+            let at = now - (i as i64) * DAY;
+            r.record_body(at, i + 1, Which::Request, &vec![b'x'; 4096], 4096);
+        }
+        let before = r.blobs().total_bytes();
+        assert!(before > 0);
+        // 一天都没过期，但总量超了 —— 从最旧的整天开始删
+        let freed = r.gc(now, 30, 30, 4096);
+        assert!(freed > 0, "总量超了却什么都没删");
+        assert!(r.blobs().total_bytes() < before);
+    }
+
     /// 会话里的那一轮也要看得出是取消的。否则在每轮花费里，它就是一轮
     /// 花了钱、输出却只有一个 token 的「正常」请求。
     #[test]

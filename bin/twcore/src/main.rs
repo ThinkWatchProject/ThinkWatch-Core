@@ -738,6 +738,45 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             state.set_body_sink(body_tx);
         }
 
+        /*
+          日志回收。**启动先跑一次，之后每小时一次。**
+
+          只在启动时跑的话，一台一直开着的机器永远轮不到它；只定时跑的
+          话，关机过夜的那台永远等不到那一小时。两个都要。
+
+          每一轮都重新读配置，所以改完期限不用重启 —— 下一轮就按新的算。
+          扫的是目录和一条 DELETE，空跑一次的代价可以忽略。
+        */
+        if let Some(rec) = store.clone() {
+            let gw = state.clone();
+            tokio::spawn(async move {
+                loop {
+                    let r = gw.config().retention.clone();
+                    let freed = {
+                        let g = rec.lock().await;
+                        g.gc(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0),
+                            r.body_days,
+                            r.row_days,
+                            r.body_max_bytes,
+                        )
+                    };
+                    if freed > 0 {
+                        tracing::info!(
+                            freed_bytes = freed,
+                            body_days = r.body_days,
+                            row_days = r.row_days,
+                            "reclaimed expired request logs"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            });
+        }
+
         // 配置的唯一入口。UI、CLI、文件监听都从这里进。
         let manager = std::sync::Arc::new(tw_control::ConfigManager::new(
             config_path,

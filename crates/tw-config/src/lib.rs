@@ -79,6 +79,9 @@ pub struct Config {
     /// 任何行为。
     #[serde(default, skip_serializing_if = "is_default")]
     pub security: Security,
+    /// 日志留多久。不写就是默认值。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub retention: tw_types::Retention,
     /// 并发上限。不写就是默认值。
     #[serde(default, skip_serializing_if = "is_default")]
     pub limits: Limits,
@@ -119,6 +122,7 @@ impl Default for Config {
             pricing: tw_pricing::PricingConfig::default(),
             client_probes: ClientProbes::default(),
             security: Security::default(),
+            retention: tw_types::Retention::default(),
             limits: Limits::default(),
             groups: Vec::new(),
             routes: Vec::new(),
@@ -1085,6 +1089,38 @@ pub fn default_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// 保留期出厂不写进文件，写了要认得出来。
+    ///
+    /// **默认值不进文件**是这份配置的一条规矩：用户打开 config.yaml
+    /// 看到一屏自己没配过的东西，就分不清哪些是他的决定。
+    #[test]
+    fn retention_defaults_stay_out_of_the_file_but_a_choice_does_not() {
+        let cfg = Config::default();
+        let out = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(!out.contains("retention"), "默认值被写进文件了：{out}");
+
+        let text = "version: 1\nretention:\n  body_days: 3\n";
+        let back: Config = serde_yaml_ng::from_str(text).unwrap();
+        assert_eq!(back.retention.body_days, 3);
+        // 没写的那两个仍然是默认值，不是 0 —— 0 会让 gc 把一切都删掉
+        assert_eq!(back.retention.row_days, 90);
+        assert_eq!(back.retention.body_max_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(
+            serde_yaml_ng::to_string(&back)
+                .unwrap()
+                .contains("body_days: 3")
+        );
+    }
+
+    /// 写错字段名要报错，不能悄悄忽略。
+    #[test]
+    fn a_typo_in_retention_is_rejected_rather_than_ignored() {
+        // 「改了个上限，界面说写成功了，什么都没发生」是 `Limits` 上
+        // 记过的那个教训
+        let text = "version: 1\nretention:\n  body_dayz: 3\n";
+        assert!(serde_yaml_ng::from_str::<Config>(text).is_err());
+    }
     use super::*;
 
     const MINIMAL: &str = r#"
