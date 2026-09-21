@@ -8,8 +8,9 @@
 //! 注意这条豁免**不适用于成本记账**：那类数据丢了账单永久对不
 //! 上，必须走别的路径。这里只走「丢了只是图上少个点」的东西。
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
@@ -19,6 +20,8 @@ const CAPACITY: usize = 1024;
 pub struct EventBus {
     tx: broadcast::Sender<tw_api::Event>,
     next_id: Arc<AtomicU64>,
+    /// 开始了、还没有结局的请求：它们的开始事件，按 id。见 [`EventBus::in_flight`]
+    open: Arc<Mutex<BTreeMap<u64, tw_api::Event>>>,
 }
 
 impl Default for EventBus {
@@ -33,6 +36,7 @@ impl EventBus {
         Self {
             tx,
             next_id: Arc::new(AtomicU64::new(1)),
+            open: Arc::default(),
         }
     }
 
@@ -64,8 +68,55 @@ impl EventBus {
     }
 
     /// 发一条。**没有订阅者不是错误** —— 没开 UI 的时候数据面照常跑。
+    ///
+    /// **先记账再发**（见 [`EventBus::in_flight`]）：订阅者收到一个结局的
+    /// 时候，快照里已经没有它了。
     pub fn emit(&self, ev: tw_api::Event) {
+        self.track(&ev);
         let _ = self.tx.send(ev);
+    }
+
+    /// 开始的记下，有了结局的划掉。
+    ///
+    /// **这里什么都不能 panic。**`Ending` 在 Drop 里也会走到这儿，那时可能
+    /// 正处在一次 unwind 里 —— 再 panic 一次，整个进程就没了。锁中毒了也照样
+    /// 拿里面的表：少记一笔的快照，好过一个没了的网关。
+    fn track(&self, ev: &tw_api::Event) {
+        use tw_api::Event as E;
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        match ev {
+            E::RequestStarted { id, .. } => {
+                open.insert(*id, ev.clone());
+            }
+            E::RequestFinished { id, .. }
+            | E::RequestFailed { id, .. }
+            | E::RequestCancelled { id, .. } => {
+                open.remove(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// 此刻还在跑的请求：它们的开始事件，**原样**，按 id 从小到大。
+    ///
+    /// 给**半路才来听的一方**用。事件流只送订阅之后发生的事，一个在那之前
+    /// 就开始、此刻还没结束的请求，它的开始事件早就发过了 —— 听的人数
+    /// 「进行中」时就漏掉它，直到它结束。桌面版概览的实时档每次打开都是
+    /// 这样。把这份快照当成补发的开始事件处理，就和从头听起一样。
+    ///
+    /// **和 `Status::in_flight` 不是一个数。**那个从连接进到数据面就算，比
+    /// 开始事件早，排队等名额的、鉴权没过的都在里面 —— 它回答的是「现在
+    /// 重启会掐断几个连接」。这里只有发过开始事件的请求，和事件流里说的是
+    /// 同一批。
+    ///
+    /// 表不会只进不出：每个开始事件都欠着恰好一个结局，由 `Ending` 保证。
+    pub fn in_flight(&self) -> Vec<tw_api::Event> {
+        self.open
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<tw_api::Event> {
@@ -80,6 +131,87 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn started(id: u64) -> tw_api::Event {
+        tw_api::Event::RequestStarted {
+            id,
+            client: "c".into(),
+            client_hint: None,
+            session_fp: None,
+            provider: "p".into(),
+            model: "m".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            at_ms: 1_000 + id,
+        }
+    }
+
+    /// 快照里是**开始了、还没有结局**的那些。三种结局都算结局，响应头不算。
+    #[test]
+    fn in_flight_is_what_started_and_has_not_ended() {
+        let b = EventBus::new();
+        for id in 1..=4 {
+            b.emit(started(id));
+        }
+        b.emit(tw_api::Event::RequestFinished {
+            id: 1,
+            model: "m".into(),
+            status: 200,
+            bytes: 0,
+            duration_ms: 0,
+            usage: None,
+        });
+        b.emit(tw_api::Event::RequestFailed {
+            id: 2,
+            model: "m".into(),
+            source: "upstream".into(),
+            message: tw_api::Msg {
+                code: "t.x".into(),
+                args: Default::default(),
+                text: "x".into(),
+            },
+            bytes: None,
+            duration_ms: None,
+            usage: None,
+        });
+        b.emit(tw_api::Event::RequestCancelled {
+            id: 3,
+            model: "m".into(),
+            status: None,
+            bytes: 0,
+            duration_ms: 0,
+            usage: None,
+        });
+        b.emit(tw_api::Event::RequestHeaders {
+            id: 4,
+            status: 200,
+            ttfb_ms: 5,
+        });
+
+        let open = b.in_flight();
+        assert_eq!(open.iter().map(|e| e.id()).collect::<Vec<_>>(), [4]);
+        // **原样**：听的人拿它当补发的开始事件，字段一个都不能少
+        assert!(
+            matches!(&open[0], tw_api::Event::RequestStarted { model, at_ms: 1004, .. } if model == "m"),
+            "{open:?}"
+        );
+    }
+
+    /// 没有订阅者的时候照样记 —— 这份快照就是给还没来的订阅者准备的。
+    /// 按 id 排，也就是按开始的先后。
+    #[test]
+    fn in_flight_is_kept_with_no_subscriber_and_in_start_order() {
+        let b = EventBus::new();
+        assert!(b.in_flight().is_empty());
+        for id in [7, 3, 5] {
+            b.emit(started(id));
+        }
+        assert_eq!(b.subscriber_count(), 0);
+        assert_eq!(
+            b.in_flight().iter().map(|e| e.id()).collect::<Vec<_>>(),
+            [3, 5, 7]
+        );
+    }
 
     #[test]
     fn ids_resume_after_the_number_the_store_already_has() {
