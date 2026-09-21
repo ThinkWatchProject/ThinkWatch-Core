@@ -200,15 +200,22 @@ fn cfg(provider: Provider) -> Config {
 /// 起一个网关，**先订阅事件再起服务** —— 之后才订的话，早到的事件就
 /// 看不见了。
 async fn serve(cfg: Config) -> (SocketAddr, Receiver<Event>) {
+    let (addr, events, _) = serve_with_bus(cfg).await;
+    (addr, events)
+}
+
+/// 同上，再把总线交出来 —— 要看「此刻还在跑的」那份快照时用。
+async fn serve_with_bus(cfg: Config) -> (SocketAddr, Receiver<Event>, tw_observe::EventBus) {
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let events = state.bus.subscribe();
+    let bus = state.bus.clone();
+    let events = bus.subscribe();
     let addr = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     };
     tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (addr, events)
+    (addr, events, bus)
 }
 
 fn post(gw: SocketAddr) -> reqwest::RequestBuilder {
@@ -323,6 +330,34 @@ async fn a_client_that_walks_away_mid_stream_is_reported_once_as_cancelled() {
         other => panic!("该是一次取消，实际 {other:?}"),
     }
     assert_eq!(model_of(&got[0]), MODEL);
+}
+
+/// 流还开着的时候，这个请求在「此刻还在跑的」快照里；结局一报，它就不在了。
+///
+/// **半路才来听事件流的一方靠这份快照数「进行中」**（桌面版的实时档每次
+/// 打开都是这样），而它只有在每一种结局都划掉那一笔时才是对的 —— 漏掉一
+/// 种，那个请求就永远「进行中」。
+#[tokio::test]
+async fn a_request_is_in_flight_until_its_ending_and_not_after() {
+    let (gw, mut events, bus) = serve_with_bus(cfg(provider(slow_stream_upstream().await))).await;
+
+    let resp = post(gw).send().await.unwrap();
+    let mut body = resp.bytes_stream();
+    body.next().await.unwrap().unwrap();
+    let open = bus.in_flight();
+    assert!(
+        matches!(open.as_slice(), [Event::RequestStarted { model, .. }] if model == MODEL),
+        "第一帧到了、流还开着，它该在快照里：{open:?}"
+    );
+
+    drop(body);
+    let got = endings(&mut events).await;
+    assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
+    assert!(
+        bus.in_flight().is_empty(),
+        "结局报了，快照里还挂着：{:?}",
+        bus.in_flight()
+    );
 }
 
 /// 上游中途断了：**报失败，不报取消**。网关随后往客户端补的那个错误帧，
