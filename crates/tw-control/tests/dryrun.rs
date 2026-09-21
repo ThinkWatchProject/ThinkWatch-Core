@@ -46,10 +46,14 @@ routes:
 "#;
 
 fn app() -> (tempfile::TempDir, axum::Router) {
+    app_with(CFG)
+}
+
+fn app_with(text: &str) -> (tempfile::TempDir, axum::Router) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
-    std::fs::write(&p, CFG).unwrap();
-    let cfg: tw_config::Config = serde_yaml_ng::from_str(CFG).unwrap();
+    std::fs::write(&p, text).unwrap();
+    let cfg: tw_config::Config = serde_yaml_ng::from_str(text).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
     let bus = gw.bus.clone();
     let state = ControlState {
@@ -201,9 +205,13 @@ async fn the_mismatch_is_the_condition_that_really_failed() {
     let m = r.trace[0].mismatch.as_ref().unwrap();
     assert_eq!((m.field.as_str(), m.got.as_str()), ("max_tokens", ""));
 
-    // `assistant_internal` 是五类里的任意一类：卡住的是模型，不是它
+    // `assistant_internal` 是五类里的任意一类：卡住的是模型，不是它。
+    //
+    // **起标题要先设成「交给路由」，这个场景才到得了规则** —— 出厂是
+    // 原样放行，那时试算在规则之前就短路了，一条都不求值
+    let (_d2, routed) = app_with(&format!("{CFG}client_probes:\n  titling: route\n"));
     let r = run(
-        &app,
+        &routed,
         r#"{"model":"m","intent":"titling","draft":{"name":"x","rules":[
             {"name":"辅助请求走中转","conditions":[
                 {"field":"intent","values":["assistant_internal"]},
@@ -337,4 +345,48 @@ async fn a_candidate_in_another_format_is_listed_as_converted() {
     );
     let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
     assert!(r.converted.is_empty(), "{:?}", r.converted);
+}
+
+/// 辅助请求先过 `client_probes` 那一层，规则轮不到它。
+///
+/// **不看那一层的话，试算会对一个根本到不了规则的请求给出一条路线。**
+/// 连通性检查出厂是本地应答、一个字节都不出本机，而试算会说它走某个上游
+/// —— 用户拿着一个对的答案去查一个不存在的现象。
+#[tokio::test]
+async fn a_locally_answered_probe_never_reaches_the_rules() {
+    let (_d, app) = app();
+    let r = run(
+        &app,
+        r#"{"model":"claude-sonnet-4-5","intent":"health_check"}"#,
+    )
+    .await;
+    assert_eq!(r.outcome, "intercepted");
+    assert!(r.candidates.is_empty(), "本地应答不会发给任何上游：{r:?}");
+    assert!(r.rule.is_none());
+    // 一条规则都没求值，所以明细是空的。一份「全部未命中」的明细会
+    // 读成「规则写错了」
+    assert!(r.trace.is_empty(), "不该列出没求过的规则：{r:?}");
+}
+
+#[tokio::test]
+async fn a_passed_through_probe_says_so_instead_of_naming_a_rule() {
+    let (_d, app) = app();
+    // 起标题出厂是原样放行：它转发，但不经过规则
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5","intent":"titling"}"#).await;
+    assert_eq!(r.outcome, "passthrough");
+    assert!(r.trace.is_empty());
+}
+
+/// 设成「交给路由」的那些，和普通请求一样走完规则。
+#[tokio::test]
+async fn a_routed_probe_is_evaluated_like_any_other_request() {
+    let (_d, app) = app_with(&format!("{CFG}client_probes:\n  health_check: route\n"));
+    let r = run(
+        &app,
+        r#"{"model":"claude-sonnet-4-5","intent":"health_check"}"#,
+    )
+    .await;
+    assert_eq!(r.outcome, "route");
+    assert_eq!(r.rule.as_deref(), Some("其余都试试"));
+    assert!(!r.trace.is_empty(), "交给路由的要走完规则：{r:?}");
 }

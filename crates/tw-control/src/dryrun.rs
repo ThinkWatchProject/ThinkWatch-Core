@@ -129,6 +129,23 @@ pub async fn dry_run(
         ));
     };
 
+    // **辅助请求先过它自己那一层，剩下的才轮到规则。**
+    //
+    // 不看这一层的话，试算会对一个根本到不了规则的请求给出一条路线 ——
+    // 连通性检查默认本地应答、一个字节都不出本机，而试算说它走 anthropic。
+    // 那句话比不说更糟：用户拿着一个对的答案去查一个不存在的现象。
+    let short = cfg
+        .client_probes
+        .all()
+        .into_iter()
+        .find(|(slug, _)| *slug == f.intent)
+        .and_then(|(_, action)| match action {
+            tw_config::ProbeAction::Intercept => Some("intercepted"),
+            tw_config::ProbeAction::Passthrough => Some("passthrough"),
+            // 交给路由的那些照常往下走，和普通请求一样
+            tw_config::ProbeAction::Route => None,
+        });
+
     // 每条规则的下场。**先走一遍这个，再问结果** —— 顺序反过来的话，
     // 「命中了哪条」会变成唯一的输出，而那正是不够用的那半个答案。
     // **只列这条路由里的规则。**试算问的是「我这个请求会怎么走」，
@@ -136,7 +153,9 @@ pub async fn dry_run(
     // 它们被跳过了，而实际上它们根本不在这条求值链上。
     let mut trace = Vec::new();
     let mut decided = false;
-    for r in rules {
+    // 短路时一条都不求值 —— 空的 `trace` 说的就是这件事，
+    // 而一份「全部未命中」的明细会读成「规则写错了」
+    for r in rules.iter().filter(|_| short.is_none()) {
         if r.when.is_phase_two() {
             trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
@@ -187,7 +206,7 @@ pub async fn dry_run(
 
     let mut out = tw_api::DryRunResult {
         route,
-        outcome: "no_match".into(),
+        outcome: short.unwrap_or("no_match").into(),
         strategy: None,
         rule: None,
         reason: None,
@@ -200,6 +219,10 @@ pub async fn dry_run(
         skipped: Vec::new(),
         converted: Vec::new(),
     };
+
+    if short.is_some() {
+        return Ok(Json(out));
+    }
 
     match engine.route_with(rules, &f) {
         Ok(Outcome::Route(mut d)) => {
