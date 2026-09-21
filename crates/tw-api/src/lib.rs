@@ -1947,6 +1947,16 @@ pub struct HistoryRow {
     /// 服务它的那一跳做过的格式转换。直通的、老记录没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translated: Option<TranslatedView>,
+    /// 它属于哪一次会话，和 [`SessionView::id`] 是同一个值。
+    ///
+    /// **请求和会话是同一批记录的两个粒度**，而不带这个字段的话，界面
+    /// 上的两个粒度之间就没有门：看着一条很贵的请求，问不出它属于哪次
+    /// 任务；看着一次很贵的任务，也回不到具体是哪一条。库里这一列一直
+    /// 都在（`requests.session`，还建了索引），只是没有交出来。
+    ///
+    /// 认不出会话的请求（拼不出指纹的、老记录）是 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// 一次请求做过的格式转换。
