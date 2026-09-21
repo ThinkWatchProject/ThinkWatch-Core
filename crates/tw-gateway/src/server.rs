@@ -2286,8 +2286,14 @@ async fn pipeline(
       非流式要拦得住，body 就不能边收边发 —— 发出去了就收不回来。
 
       **这不是把流变成一次性交付**：客户端要的本来就是一整份 JSON，
-      它无论如何都得等完整。整包转换（`convert_whole`）和整包收集
-      （`collect`）本来就在攒，只有剩下那条直通的路需要这一下。
+      它无论如何都得等完整 —— 它那边的 HTTP 栈同样要收齐才交给调用者。
+      整包转换（`convert_whole`）和整包收集（`collect`）本来就在攒，
+      只有剩下那条直通的路需要这一下。
+
+      **不设大小上限。**设了就是一条绕过去的路：往响应里塞几 MB 无害
+      内容把体积顶过阈值，后面的工具调用就再也不会被看到了。而一次
+      非流式回答的体积由 `max_tokens` 封顶，十几万输出 token 也就几百
+      KB —— 真正的风险不在这儿。整包转换那条路本来也是不封顶的。
     */
     let hold = wall.is_some() && whole_body && !convert_whole && !collect;
     let wall_provider = provider.name.clone();
