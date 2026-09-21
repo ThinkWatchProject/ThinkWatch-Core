@@ -410,6 +410,23 @@ impl Db {
         Ok(())
     }
 
+    /// 已经用掉的最大请求号。库是空的时候是 0。
+    ///
+    /// **重启之后请求号要接着往下发。**号是进程里的一个计数器，每次
+    /// 起来都从 1 开始；而写库走的是 `INSERT OR REPLACE`（一个请求要
+    /// 写两次：开始一次、结束一次，见 `recorder`）。两件事凑在一起，
+    /// 重启后的第一条请求就顶掉了历史上的第 1 条，第二条顶掉第 2 条
+    /// —— 最老的记录一条一条地无声消失，而应用每更新一次就重启一次。
+    pub fn last_request_id(&self) -> Result<u64, DbError> {
+        // 空表时 MAX(id) 是 NULL，用 COALESCE 收掉
+        let id: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM requests", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(id.max(0) as u64)
+    }
+
     /// 最近 N 条，新的在前。
     pub fn recent(&self, limit: usize) -> Result<Vec<RequestRow>, DbError> {
         let mut st = self
@@ -1405,6 +1422,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_last_request_id_is_where_the_next_run_has_to_start() {
+        let db = Db::in_memory().unwrap();
+        assert_eq!(db.last_request_id().unwrap(), 0, "空库不该报一个假的号");
+        db.insert(&row(1, 1)).unwrap();
+        db.insert(&row(7, 2)).unwrap();
+        db.insert(&row(3, 3)).unwrap();
+        // **最大的那个，不是最后写进去的那个。**乱序写入照样成立
+        assert_eq!(db.last_request_id().unwrap(), 7);
+    }
+
+    #[test]
+    fn reusing_a_request_id_overwrites_the_older_record() {
+        /*
+          这一条钉住的是**问题本身**，不是修法：写库走的是
+          `INSERT OR REPLACE`（一个请求要写两次，见 `recorder`），所以
+          重号就是覆盖。计数器每次起来都从 1 开始，两件事凑在一起，
+          重启后的第一条请求会顶掉历史上的第 1 条。
+
+          `last_request_id` 存在的全部理由就是让这件事不发生。
+        */
+        let db = Db::in_memory().unwrap();
+        let old = row(1, 1_000);
+        db.insert(&old).unwrap();
+        let mut newer = row(1, 9_000);
+        newer.model = "qwen3:8b".into();
+        db.insert(&newer).unwrap();
+        assert_eq!(db.recent(10).unwrap().len(), 1, "老的那条没了");
+        assert_eq!(db.get(1).unwrap().unwrap().model, "qwen3:8b");
+        // 从库里问一次号就够躲开：下一条该用 2
+        assert_eq!(db.last_request_id().unwrap(), 1);
     }
 
     #[test]

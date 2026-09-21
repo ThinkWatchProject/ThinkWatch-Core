@@ -881,6 +881,24 @@ fn build_store(
             return None;
         }
     };
+    /*
+      **接着上次的号往下发。**这里是唯一同时看得见总线和库的地方，
+      而且它跑在 `serve` 之前（见 `cmd_serve`）—— 第一个请求拿到号
+      的时候，计数器已经归位了。
+
+      读不到就照常跑：那顶多是这一次重启又压掉几条历史，比起因为
+      一次查询失败而不记录任何东西要好得多。
+    */
+    match db.last_request_id() {
+        Ok(0) => {}
+        Ok(last) => {
+            tracing::debug!(last, "request ids resume from where they left off");
+            bus.resume_after(last);
+        }
+        Err(e) => tracing::warn!(
+            "could not read the last request id, so this run may overwrite the oldest records: {e}"
+        ),
+    }
     let blobs = tw_store::Blobs::new(dir.join("blobs"));
     // 两边的 body 结构在这里对接。**一次移动，不复制** —— `Bytes` 的
     // 克隆是引用计数。
