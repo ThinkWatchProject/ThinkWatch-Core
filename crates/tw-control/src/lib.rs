@@ -22,7 +22,6 @@ pub mod config;
 pub mod diagnostics;
 pub mod dryrun;
 pub mod keys;
-pub mod nics;
 pub mod pricing;
 pub mod replay;
 pub mod resources;
@@ -154,7 +153,7 @@ pub fn router(state: ControlState) -> Router {
 /// 已经不存在的地址。
 async fn interfaces() -> Json<Vec<tw_api::NicView>> {
     Json(
-        crate::nics::list()
+        tw_config::nics::list()
             .into_iter()
             .map(|n| tw_api::NicView {
                 name: n.name,

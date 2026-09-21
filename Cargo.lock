@@ -2802,6 +2802,7 @@ name = "tw-config"
 version = "0.11.1"
 dependencies = [
  "blake3",
+ "libc",
  "notify",
  "rand 0.10.2",
  "serde",

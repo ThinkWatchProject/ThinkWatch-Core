@@ -2544,7 +2544,16 @@ pub async fn serve_following_config(
             relisten.notified().await;
         };
         serve_once(state.clone(), next, wait).await?;
-        let want = state.runtime().config.listen.gateway.socket_addr();
+        let want = match state.runtime().config.listen.gateway.socket_addr() {
+            Ok(a) => a,
+            // **新配置的地址算不出来就守住旧的。**`bind` 指着一张刚被拔掉
+            // 的网卡时，正确的动作不是把一个正在工作的监听器拆掉 —— 那会
+            // 让所有客户端立刻断线，而它们本来好好的。
+            Err(e) => {
+                tracing::error!(%e, keeping = %next, "the new listen address cannot be resolved");
+                continue;
+            }
+        };
         if want == next {
             // 通知来了但地址没变（比如又改回去了）—— 原样重来
             continue;
