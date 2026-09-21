@@ -223,6 +223,12 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     let cfg = s.config();
     let cfg = &*cfg;
     let engine = cfg.engine();
+    // 正文现在占了多少。**扫的是目录，所以放在这儿算一次**，不塞进
+    // 下面那个视图表达式里
+    let body_bytes_now = match &s.store {
+        Some(st) => st.lock().await.blobs().total_bytes(),
+        None => 0,
+    };
     Json(tw_api::Overview {
         proxies: cfg
             .proxies
@@ -304,6 +310,14 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             per_provider: cfg.limits.per_provider,
             queue_depth: cfg.limits.queue_depth,
             queue_timeout_secs: cfg.limits.queue_timeout_secs,
+        },
+        retention: tw_api::RetentionView {
+            body_days: cfg.retention.body_days,
+            row_days: cfg.retention.row_days,
+            body_max_bytes: cfg.retention.body_max_bytes,
+            // **现状和配置一起给。**「上限 2 GB」这个数字，用户没法
+            // 判断松还是紧，除非同时看得见现在占了多少
+            body_bytes_now,
         },
         listen: tw_api::ListenView {
             // **`Display` 不是 `Debug`。**`{:?}` 对 `Loopback` / `All`
