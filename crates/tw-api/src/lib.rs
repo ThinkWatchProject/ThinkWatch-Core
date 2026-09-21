@@ -2769,6 +2769,9 @@ pub struct SecurityRuleView {
     /// 工具调用审查：拦截档下做什么，`cut` / `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// 内置的工具调用规则出厂时拦截档下做什么。和 `action` 不一样就是改过
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_action: Option<String>,
 }
 
 /// 一项防护的档位和规则。
@@ -2804,6 +2807,16 @@ pub struct ModeSave {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleToggle {
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 改一条内置规则在拦截档下做什么。只有工具调用审查的规则有这一项 ——
+/// 出站脱敏命中之后做什么由档位决定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionSave {
+    /// `cut` / `record`
+    pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
 }

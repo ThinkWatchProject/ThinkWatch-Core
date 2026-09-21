@@ -378,6 +378,80 @@ async fn one_built_in_rule_can_be_tried_even_while_it_is_off() {
     assert_eq!(v["code"], "security.unknown_rule", "{v}");
 }
 
+#[tokio::test]
+async fn a_built_in_rule_s_action_is_written_only_while_it_differs_from_the_factory() {
+    let b = bed(BASE);
+    let before = b.file();
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/inspect_tools/builtin/rm-rf-root/action",
+        json!({ "action": "cut" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        b.parsed().security.inspect_tools.actions.get("rm-rf-root"),
+        Some(&tw_config::ToolAction::Cut)
+    );
+
+    let (_, v) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    let r = rule(&v, "inspect_tools", "rm-rf-root");
+    assert_eq!(r["action"], "cut", "{r}");
+    assert_eq!(r["default_action"], "record", "{r}");
+
+    // 试一试也按改过的处置报
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/inspect_tools/test",
+        json!({ "sample": "rm -rf ~ /tmp/x", "rule": "rm-rf-root" }),
+    )
+    .await;
+    assert_eq!(v["hits"][0]["action"], "cut", "{v}");
+
+    // 改回出厂：那一行删掉，文件和原来一个字节都不差
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/inspect_tools/builtin/rm-rf-root/action",
+        json!({ "action": "record" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.file(), before);
+
+    // 出站脱敏的规则没有自己的处置：命中之后做什么由档位决定
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/redact/builtin/jwt/action",
+        json!({ "action": "cut" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.no_action");
+
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/inspect_tools/builtin/no-such-rule/action",
+        json!({ "action": "cut" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/inspect_tools/builtin/rm-rf-root/action",
+        json!({ "action": "delete" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.unknown_action");
+    assert_eq!(b.file(), before);
+}
+
 // ─────────────────────────────────────────────────────────── 自定义规则
 
 #[tokio::test]

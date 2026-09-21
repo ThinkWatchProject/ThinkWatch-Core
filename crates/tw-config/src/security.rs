@@ -31,6 +31,8 @@
 //! 规则住在 `config.yaml` 里，而不是另一个文件：它是用户会去调的策略，
 //! 不是数据，而且住在这里白捡了变更历史和一键回滚。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -165,6 +167,13 @@ pub struct ToolPolicy {
     pub enable: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disable: Vec<String>,
+    /// 内置规则在拦截档下做什么，**只写和出厂不一样的**：`rm-rf-root: cut`。
+    ///
+    /// 内置规则提供的只是一条正则和一个出厂的处置；命中之后切不切，和自定义
+    /// 规则一样由用户定。认不出的 id 和 `enable` / `disable` 里的一样，报出来、
+    /// 不拒绝整份配置。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actions: BTreeMap<String, ToolAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom: Vec<CustomToolRule>,
 }
