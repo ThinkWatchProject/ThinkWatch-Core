@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn nothing_to_redact_means_the_text_comes_back_byte_identical() {
-        // **走官方端点不该脱敏**，那条路径上这个函数每次都要跑，
+        // **绝大多数请求一处都不命中**，而这个函数每个请求都要跑，
         // 所以它在「没命中」时必须是一次纯粹的拷贝。
         let t = "帮我看看这个 .env 文件\n";
         let r = redact(t, &all());
@@ -146,6 +146,24 @@ mod tests {
         assert!(!r.text.contains(KEY), "{}", r.text);
         assert!(r.text.contains("<<TW_SECRET_1>>"), "{}", r.text);
         assert_eq!(restore(&r.text, &r.ledger), t);
+    }
+
+    #[test]
+    fn a_key_at_the_start_of_a_line_is_replaced_and_the_body_stays_json() {
+        // 请求体里的换行是 `\n` 两个字符。行首的 key 曾经和那个 `n` 粘在
+        // 一起、认不出来 —— 而贴进对话的凭据文件里，key 偏偏常在行首
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": format!("keys:\n{KEY}\nthanks") }]
+        })
+        .to_string();
+        let r = redact(&body, &all());
+        assert!(!r.text.contains(KEY), "{}", r.text);
+        let v: serde_json::Value = serde_json::from_str(&r.text).expect("the body is still JSON");
+        assert_eq!(
+            v["messages"][0]["content"], "keys:\n<<TW_SECRET_1>>\nthanks",
+            "{v}"
+        );
+        assert_eq!(restore(&r.text, &r.ledger), body);
     }
 
     #[test]
