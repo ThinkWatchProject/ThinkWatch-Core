@@ -288,12 +288,14 @@ impl Recorder {
                     p.ttfb_ms = Some(*ttfb_ms as i64);
                 }
             }
+            // 结局里的模型名不用：开始事件已经给过，这一行从那时就在 `inflight` 里
             Event::RequestFinished {
                 id,
                 status,
                 bytes,
                 duration_ms,
                 usage,
+                ..
             } => self.settle(
                 *id,
                 Some(*status),
@@ -317,6 +319,7 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
+                ..
             } => self.settle(
                 *id,
                 *status,
@@ -621,6 +624,7 @@ mod tests {
     pub(super) fn finished(id: u64, usage: Option<tw_api::UsageView>) -> Event {
         Event::RequestFinished {
             id,
+            model: String::new(),
             status: 200,
             bytes: 1234,
             duration_ms: 4000,
@@ -861,6 +865,7 @@ mod tests {
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestFailed {
             id: 1,
+            model: String::new(),
             source: "upstream".into(),
             message: tw_api::Msg {
                 code: "t.unreachable".into(),
@@ -1290,6 +1295,7 @@ mod cancellation_tests {
     fn cancelled(id: u64, usage: Option<UsageView>) -> Event {
         Event::RequestCancelled {
             id,
+            model: String::new(),
             status: Some(200),
             bytes: 312,
             duration_ms: 2_500,
@@ -1402,6 +1408,7 @@ mod cancellation_tests {
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestCancelled {
             id: 1,
+            model: String::new(),
             status: None,
             bytes: 0,
             duration_ms: 12_000,
@@ -1515,6 +1522,7 @@ mod failure_tests {
     fn failed(id: u64, usage: Option<UsageView>) -> Event {
         Event::RequestFailed {
             id,
+            model: String::new(),
             source: "upstream".into(),
             message: tw_api::Msg {
                 code: "t.broke".into(),
@@ -1592,6 +1600,7 @@ mod failure_tests {
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestFailed {
             id: 1,
+            model: String::new(),
             source: "rate_limited".into(),
             message: tw_api::Msg {
                 code: "t.limited".into(),

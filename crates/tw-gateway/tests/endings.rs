@@ -22,6 +22,9 @@ use tw_config::{Client, Config, Provider, Security, SecurityMode};
 
 /// Anthropic 流的第一帧。**输入和缓存读在这里就是齐的**，输出是个占位的
 /// 1 —— 累计输出要等流的末尾才报。
+/// 客户端要的模型名。**每一种结局都要带着它**（见 `model_of`）
+const MODEL: &str = "claude-sonnet-4-5";
+
 const MESSAGE_START: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5000,\"cache_read_input_tokens\":4000,\"output_tokens\":1}}}\n\n";
 
 async fn listen(app: Router) -> SocketAddr {
@@ -212,7 +215,9 @@ fn post(gw: SocketAddr) -> reqwest::RequestBuilder {
     reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
         .header("x-api-key", "tw-k")
-        .body(r#"{"model":"claude-sonnet-4-5","stream":true,"messages":[]}"#)
+        .body(format!(
+            r#"{{"model":"{MODEL}","stream":true,"messages":[]}}"#
+        ))
 }
 
 async fn ws_connect(
@@ -250,6 +255,20 @@ async fn endings(rx: &mut Receiver<Event>) -> Vec<Event> {
     got
 }
 
+/// 结局上写的模型名。
+///
+/// **每一种结局都要带着它**：听事件的一方可能是请求开始之后才来的（界面的
+/// 实时曲线就是这样），它手上只有结局 —— 这笔用量记在哪个模型上，只能看
+/// 结局里写的。
+fn model_of(e: &Event) -> &str {
+    match e {
+        Event::RequestFinished { model, .. }
+        | Event::RequestFailed { model, .. }
+        | Event::RequestCancelled { model, .. } => model,
+        other => panic!("该是一个结局，实际 {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------- 流式响应开始之后
 
 /// 跑完的流**只报结束**。Drop 那一侧不知道「已经报过了」的话，每一个正常
@@ -266,6 +285,7 @@ async fn a_stream_that_runs_to_its_end_is_finished_and_nothing_else() {
         matches!(&got[0], Event::RequestFinished { usage: Some(u), .. } if u.output == 777),
         "该是带着累计输出的结束：{got:?}"
     );
+    assert_eq!(model_of(&got[0]), MODEL);
 }
 
 /// 客户端中途走了（Claude Code 里按一下 Esc）。
@@ -302,6 +322,7 @@ async fn a_client_that_walks_away_mid_stream_is_reported_once_as_cancelled() {
         }
         other => panic!("该是一次取消，实际 {other:?}"),
     }
+    assert_eq!(model_of(&got[0]), MODEL);
 }
 
 /// 上游中途断了：**报失败，不报取消**。网关随后往客户端补的那个错误帧，
@@ -335,6 +356,7 @@ async fn a_stream_the_upstream_breaks_is_failed_and_not_also_cancelled() {
         }
         other => panic!("该是一次上游失败，实际 {other:?}"),
     }
+    assert_eq!(model_of(&got[0]), MODEL);
 }
 
 /// 防火墙切断了一个高危工具调用。**这是策略拦下来的，不是上游坏了**，而
@@ -400,6 +422,7 @@ async fn a_client_that_leaves_before_the_response_headers_is_reported_once_as_ca
         ),
         "该是一次没有状态码、没有用量的取消：{got:?}"
     );
+    assert_eq!(model_of(&got[0]), MODEL);
 }
 
 /// 选中上游之后才生效的规则拒绝了这次请求（阶段二）。
@@ -442,6 +465,7 @@ async fn a_phase_two_deny_after_the_request_started_is_reported_as_denied() {
         ),
         "该是一次带着理由的拒绝：{got:?}"
     );
+    assert_eq!(model_of(&got[0]), MODEL);
 }
 
 /// 每一家上游都没接住。**只报一次失败，`source` 是它真正的原因** —— 被限流
@@ -474,6 +498,7 @@ async fn a_request_every_upstream_refused_is_failed_once_for_the_reason_it_was_r
         }
         other => panic!("该是一次失败，实际 {other:?}"),
     }
+    assert_eq!(model_of(&got[0]), MODEL);
 }
 
 // ---------------------------------------------------------------- WebSocket
@@ -511,6 +536,7 @@ async fn a_websocket_session_the_client_closes_is_finished() {
         ),
         "该是一次带着回帧字节数、没有用量的结束：{got:?}"
     );
+    assert_eq!(model_of(&got[0]), "", "升级请求里没有模型名，不该编一个");
 }
 
 #[tokio::test]

@@ -87,6 +87,16 @@ pub enum Event {
     /// 结束了
     RequestFinished {
         id: u64,
+        /// 客户端要的模型名，和 `RequestStarted` 里的是同一个。
+        ///
+        /// **三种结局都自己带着它。**听事件的一方不一定从请求开始时就在听
+        /// —— 界面的窗口开着才订阅，概览打开时才挂上实时曲线 —— 而用量是
+        /// 在结局里才到的。模型名只在开始事件里的话，一个开始时没人在听、
+        /// 结束时有人在听的请求，它的用量就不知道该记在哪个模型上。
+        ///
+        /// WebSocket 那条路是空串：升级请求里没有模型名（和开始事件一样）。
+        #[serde(default)]
+        model: String,
         status: u16,
         bytes: u64,
         duration_ms: u64,
@@ -101,6 +111,9 @@ pub enum Event {
     /// 崩掉了。它只出现在这里 —— 那时往往已经没有一个 HTTP 响应能带上它。
     RequestFailed {
         id: u64,
+        /// 模型名。理由见 `RequestFinished::model`
+        #[serde(default)]
+        model: String,
         source: String,
         message: Msg,
         /// 失败之前从上游收到了多少字节。**响应头都没到的没有**
@@ -133,6 +146,9 @@ pub enum Event {
     /// 没有状态码、没有字节、也没有用量。
     RequestCancelled {
         id: u64,
+        /// 模型名。理由见 `RequestFinished::model`
+        #[serde(default)]
+        model: String,
         /// 上游的响应头还没到就走了的，**没有状态码** —— 不是 0
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
@@ -2782,6 +2798,7 @@ mod tests {
         // 前端按 `kind` 分派。少了它，TypeScript 那边只能靠字段有无来猜。
         let e = Event::RequestFinished {
             id: 1,
+            model: "claude-sonnet-5".into(),
             status: 200,
             bytes: 10,
             duration_ms: 5,
@@ -2790,6 +2807,8 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "request_finished");
         assert_eq!(v["id"], 1);
+        // 结局自己带着模型名：开始之后才来听的一方只有它
+        assert_eq!(v["model"], "claude-sonnet-5");
     }
 
     #[test]
@@ -2814,6 +2833,7 @@ mod tests {
             },
             Event::RequestFinished {
                 id: 7,
+                model: String::new(),
                 status: 200,
                 bytes: 1,
                 duration_ms: 1,
@@ -2821,6 +2841,7 @@ mod tests {
             },
             Event::RequestFailed {
                 id: 7,
+                model: String::new(),
                 source: "upstream".into(),
                 message: tw_types::msg!("t.x" => "x"),
                 bytes: None,
@@ -2829,6 +2850,7 @@ mod tests {
             },
             Event::RequestCancelled {
                 id: 7,
+                model: String::new(),
                 status: Some(200),
                 bytes: 1,
                 duration_ms: 1,
@@ -2845,6 +2867,7 @@ mod tests {
     fn a_cancellation_carries_the_usage_seen_so_far() {
         let e = Event::RequestCancelled {
             id: 3,
+            model: String::new(),
             status: Some(200),
             bytes: 512,
             duration_ms: 2400,
@@ -2866,6 +2889,7 @@ mod tests {
         // 响应头之前就走了的：状态码和用量都不出现，不是 0
         let none = Event::RequestCancelled {
             id: 4,
+            model: String::new(),
             status: None,
             bytes: 0,
             duration_ms: 10,

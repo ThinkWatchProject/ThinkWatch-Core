@@ -35,6 +35,8 @@ use tw_types::{Msg, msg};
 pub struct Ending {
     bus: tw_observe::EventBus,
     id: u64,
+    /// 客户端要的模型名。**结局带着它走**（理由见 `tw_api::Event::RequestFinished`）
+    model: String,
     started: Instant,
     /// 请求开始的时刻。响应体按它归档，和请求体那一份对得上
     at_ms: i64,
@@ -55,6 +57,7 @@ impl Ending {
     pub fn new(
         bus: tw_observe::EventBus,
         id: u64,
+        model: String,
         started: Instant,
         at_ms: i64,
         sink: Option<BodySender>,
@@ -62,6 +65,7 @@ impl Ending {
         Self {
             bus,
             id,
+            model,
             started,
             at_ms,
             sink,
@@ -102,6 +106,7 @@ impl Ending {
         let usage = self.settle();
         self.bus.emit(tw_api::Event::RequestFinished {
             id: self.id,
+            model: std::mem::take(&mut self.model),
             status,
             bytes: self.bytes,
             duration_ms: self.duration_ms(),
@@ -117,6 +122,7 @@ impl Ending {
         let usage = self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
+            model: std::mem::take(&mut self.model),
             source: source.to_string(),
             message,
             bytes: self.received(),
@@ -169,6 +175,7 @@ impl Drop for Ending {
         if std::thread::panicking() {
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
+                model: std::mem::take(&mut self.model),
                 source: "internal".to_string(),
                 message: msg!(
                     "gw.internal" => "The request was interrupted by an error inside the gateway."
@@ -181,6 +188,7 @@ impl Drop for Ending {
         }
         self.bus.emit(tw_api::Event::RequestCancelled {
             id: self.id,
+            model: std::mem::take(&mut self.model),
             status: self.status,
             bytes: self.bytes,
             duration_ms: self.duration_ms(),
@@ -208,10 +216,11 @@ mod tests {
     /// Anthropic 流的第一帧：输入和缓存读是齐的，输出是个占位的 1。
     const MESSAGE_START: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5000,\"cache_read_input_tokens\":4000,\"output_tokens\":1}}}\n\n";
     const MESSAGE_DELTA: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":777}}\n\n";
+    const MODEL: &str = "claude-sonnet-5";
 
     /// 一个响应头已经到了的请求。
     fn responding(bus: &tw_observe::EventBus) -> Ending {
-        let mut e = Ending::new(bus.clone(), 7, Instant::now(), 1_000, None);
+        let mut e = Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None);
         e.responded(200);
         e
     }
@@ -279,13 +288,37 @@ mod tests {
         }
     }
 
+    /// **三种结局都带着模型名。**听事件的一方可能是请求开始之后才来的（界面
+    /// 的实时曲线就是这样），它手上只有结局 —— 这笔用量记在哪个模型上，只能
+    /// 看结局里写的。
+    #[test]
+    fn every_ending_carries_the_model() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        responding(&bus).finished(200);
+        responding(&bus).failed("upstream", msg!("t.x" => "x"));
+        drop(responding(&bus));
+
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 3, "{got:?}");
+        for e in &got {
+            let model = match e {
+                Event::RequestFinished { model, .. }
+                | Event::RequestFailed { model, .. }
+                | Event::RequestCancelled { model, .. } => model,
+                other => panic!("该是一个结局，实际 {other:?}"),
+            };
+            assert_eq!(model, MODEL, "{e:?}");
+        }
+    }
+
     /// 响应头之前就失败了（每家上游都拒绝、策略不让）。**没有字节、没有
     /// 用量，但有耗时** —— 「试了二十秒才放弃」本身就是排查的线索。
     #[test]
     fn a_failure_before_the_response_headers_has_a_duration_but_no_bytes_or_usage() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        Ending::new(bus.clone(), 7, Instant::now(), 1_000, None)
+        Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None)
             .failed("rate_limited", msg!("t.limited" => "`up` rate-limited us"));
 
         let got = drain(&mut rx);
@@ -310,7 +343,14 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let (tx, mut bodies) = tokio::sync::mpsc::channel(4);
-        let mut e = Ending::new(bus.clone(), 7, Instant::now(), 1_000, Some(tx));
+        let mut e = Ending::new(
+            bus.clone(),
+            7,
+            MODEL.into(),
+            Instant::now(),
+            1_000,
+            Some(tx),
+        );
         e.responded(200);
         e.feed(MESSAGE_START);
         drop(e);
@@ -344,7 +384,14 @@ mod tests {
     fn dropped_before_the_response_headers_it_reports_neither_a_status_nor_usage() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        drop(Ending::new(bus.clone(), 7, Instant::now(), 1_000, None));
+        drop(Ending::new(
+            bus.clone(),
+            7,
+            MODEL.into(),
+            Instant::now(),
+            1_000,
+            None,
+        ));
 
         let got = drain(&mut rx);
         assert!(
@@ -367,7 +414,8 @@ mod tests {
     fn counting_bytes_does_not_turn_frames_into_usage() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        let mut e = Ending::new(bus.clone(), 7, Instant::now(), 1_000, None);
+        // WebSocket 那条路不知道模型名
+        let mut e = Ending::new(bus.clone(), 7, String::new(), Instant::now(), 1_000, None);
         e.responded(101);
         e.count(MESSAGE_START.len());
         e.finished(101);
@@ -408,7 +456,10 @@ mod tests {
 
         let got = drain(&mut rx);
         assert!(
-            matches!(got.as_slice(), [Event::RequestFailed { source, .. }] if source == "internal"),
+            matches!(
+                got.as_slice(),
+                [Event::RequestFailed { source, model, .. }] if source == "internal" && model == MODEL
+            ),
             "{got:?}"
         );
     }

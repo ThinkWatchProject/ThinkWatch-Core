@@ -1071,7 +1071,14 @@ async fn ws_upgrade(
     // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成
     // 就被丢掉的 —— 客户端没等到 101 就走了 —— 由 Drop 报成取消。WS 帧
     // 不留档，所以没有 body 的去处
-    let ending = crate::ending::Ending::new(state.bus.clone(), id, started, now_ms() as i64, None);
+    let ending = crate::ending::Ending::new(
+        state.bus.clone(),
+        id,
+        String::new(),
+        started,
+        now_ms() as i64,
+        None,
+    );
     let provider = provider.clone();
     let guard = decision.guard.clone();
     let rules = rt.rules.clone();
@@ -1635,6 +1642,7 @@ async fn pipeline(
     *ending = Some(crate::ending::Ending::new(
         state.bus.clone(),
         id,
+        facts.model.clone(),
         started,
         at_ms,
         sink.clone(),
