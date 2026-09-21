@@ -180,7 +180,6 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
         Some(store) => {
             let g = store.lock().await;
             let _ = writeln!(out, "\n## Request recording\n\n| | |\n|---|---|");
-            line(&mut out, "Disk state", g.level().label());
             line(&mut out, "Requests recorded", g.db().count().unwrap_or(0));
             line(
                 &mut out,

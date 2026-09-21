@@ -13,7 +13,6 @@ use tw_pricing::{Cost, Usage};
 
 use crate::blobs::{Blobs, Which};
 use crate::db::{Db, RequestRow};
-use crate::disk::{self, DiskLevel};
 
 /// 攒着的一行。
 #[derive(Debug, Clone)]
@@ -65,10 +64,6 @@ pub struct Recorder {
     /// 结束的请求就按新价算，不用重启
     pricing: tw_pricing::Shared,
     inflight: HashMap<u64, Partial>,
-    level: DiskLevel,
-    /// 上次查磁盘的时间。**不是每次写都查** —— statvfs 在每个请求上跑
-    /// 是纯粹的浪费，而磁盘不会在两秒内从 10 GB 掉到 100 MB。
-    last_check_ms: i64,
     /// 每个对话指纹当前归到哪一次会话，以及它最后一次出现是什么时候。
     ///
     /// **只在内存里。**core 重启之后，同一段对话会被算成新的一次任务 ——
@@ -84,9 +79,6 @@ pub struct Recorder {
     /// `None` 表示没人要听（测试、以及不带总线的调用方）。
     bus: Option<tw_observe::EventBus>,
 }
-
-/// 多久查一次磁盘。
-const DISK_CHECK_EVERY_MS: i64 = 30_000;
 
 /// 隔多久算另一次任务。
 ///
@@ -120,8 +112,6 @@ impl Recorder {
             pricing,
             inflight: HashMap::new(),
             sessions: HashMap::new(),
-            level: DiskLevel::Ok,
-            last_check_ms: 0,
             bus: None,
         }
     }
@@ -130,10 +120,6 @@ impl Recorder {
     pub fn reporting_to(mut self, bus: tw_observe::EventBus) -> Self {
         self.bus = Some(bus);
         self
-    }
-
-    pub fn level(&self) -> DiskLevel {
-        self.level
     }
 
     pub fn db(&self) -> &Db {
@@ -149,9 +135,6 @@ impl Recorder {
     /// **在事件之外单独走** —— body 不进事件流：那是个广播通道，每个
     /// 订阅者都会拿到一份拷贝，而 body 可能几百 KB。
     pub fn record_body(&self, at_ms: i64, id: u64, which: Which, body: &[u8], original_len: usize) {
-        if !self.level.writes_blobs() {
-            return;
-        }
         self.blobs
             .put_with_len(at_ms, id as i64, which, body, original_len);
     }
@@ -175,11 +158,6 @@ impl Recorder {
     }
 
     pub fn on_event(&mut self, ev: &Event) {
-        let now = now_ms();
-        self.maybe_check_disk(now);
-        if !self.level.writes_anything() {
-            return;
-        }
         match ev {
             Event::RequestStarted {
                 id,
@@ -451,7 +429,6 @@ impl Recorder {
             | Event::ModelsChanged { .. }
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
-            | Event::StorageChanged { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
             | Event::RequestPriced { .. } => {}
             Event::ResponseInspected {
@@ -600,39 +577,6 @@ impl Recorder {
         }
     }
 
-    fn maybe_check_disk(&mut self, now: i64) {
-        if now - self.last_check_ms < DISK_CHECK_EVERY_MS {
-            return;
-        }
-        self.last_check_ms = now;
-        let Some(free) = disk::free_bytes(self.blobs.root()) else {
-            return;
-        };
-        self.set_level(disk::level_for(free), free, now);
-    }
-
-    /// 换一档。**只在真的变了的时候说一次** —— 用户点开一个请求发现没有正文时，
-    /// 得知道那不是 bug，而这是唯一会发生这件事的地方。
-    fn set_level(&mut self, next: DiskLevel, free: u64, now: i64) {
-        if next == self.level {
-            return;
-        }
-        tracing::warn!(
-            free_mb = free / 1024 / 1024,
-            "the disk state changed: {}",
-            next.label()
-        );
-        self.level = next;
-        if let Some(bus) = &self.bus {
-            bus.emit(Event::StorageChanged {
-                id: bus.next_id(),
-                level: next.slug().to_string(),
-                free_bytes: free,
-                at_ms: now as u64,
-            });
-        }
-    }
-
     /// 定期回收。**返回删了多少字节**，调用方记一行日志就够了。
     pub fn gc(&self, now_ms: i64, keep_days: u64, metadata_keep_days: u64, max_bytes: u64) -> u64 {
         let freed = self.blobs.gc(now_ms, keep_days, max_bytes);
@@ -644,13 +588,6 @@ impl Recorder {
         }
         freed
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -974,68 +911,6 @@ mod tests {
             r.inflight.len() <= MAX_INFLIGHT,
             "攒了 {}",
             r.inflight.len()
-        );
-    }
-
-    #[test]
-    fn a_change_of_disk_level_is_announced_once() {
-        let (_d, mut r) = rec();
-        let bus = tw_observe::EventBus::new();
-        let mut rx = bus.subscribe();
-        r = r.reporting_to(bus);
-        r.set_level(
-            DiskLevel::MetadataOnly,
-            500 * 1024 * 1024,
-            1_700_000_000_000,
-        );
-        match rx.try_recv().unwrap() {
-            Event::StorageChanged {
-                level, free_bytes, ..
-            } => {
-                assert_eq!(level, "metadata_only");
-                assert_eq!(free_bytes, 500 * 1024 * 1024);
-            }
-            other => panic!("{other:?}"),
-        }
-        // 还是这一档：不再说第二遍
-        r.set_level(
-            DiskLevel::MetadataOnly,
-            400 * 1024 * 1024,
-            1_700_000_001_000,
-        );
-        assert!(rx.try_recv().is_err());
-        // 回到正常也要说 —— 界面上那条提示该撤掉了
-        r.set_level(DiskLevel::Ok, 40 * 1024 * 1024 * 1024, 1_700_000_002_000);
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            Event::StorageChanged { level, .. } if level == "ok"
-        ));
-    }
-
-    #[test]
-    fn nothing_is_written_when_the_disk_is_full() {
-        // **但请求照样通** —— 这一层根本不参与转发。
-        let (_d, mut r) = rec();
-        r.level = DiskLevel::Nothing;
-        r.last_check_ms = i64::MAX; // 别让它去查真实磁盘把级别改回来
-        r.on_event(&started(1, "claude-sonnet-4-5"));
-        r.on_event(&finished(1, None));
-        assert_eq!(r.db().count().unwrap(), 0);
-    }
-
-    #[test]
-    fn metadata_is_still_written_when_only_blobs_are_stopped() {
-        // 中间那一级的意义就在这里：**先牺牲 body，留住摘要**。
-        let (_d, mut r) = rec();
-        r.level = DiskLevel::MetadataOnly;
-        r.last_check_ms = i64::MAX;
-        r.on_event(&started(1, "claude-sonnet-4-5"));
-        r.on_event(&finished(1, None));
-        assert_eq!(r.db().count().unwrap(), 1);
-        r.record_body(1_000_000, 1, Which::Request, b"body", 4);
-        assert!(
-            r.blobs().get(1_000_000, 1, Which::Request).is_none(),
-            "这一级不该写 body"
         );
     }
 
