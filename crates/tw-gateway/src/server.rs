@@ -2252,12 +2252,21 @@ async fn pipeline(
                         .ends_with(":streamGenerateContent")
             }
         };
-    // 工具调用防火墙。**只在流上跑** —— 非流式响应整个到手
-    // 之后再拦已经没有意义，客户端下一步就拿到全文了。
+    // 工具调用防火墙。
+    //
+    // **流式和非流式走两套，但两套都跑。**流式是边流边扫、命中就切，
+    // 立足点是「不完整的工具调用执行不了」；非流式没有这个立足点，
+    // 却有一个更强的条件 —— 整份 body 到手时一个字节都还没发出去，
+    // 所以整份看完再决定发不发。
+    //
+    // 以前非流式这一支根本不建审查器。代价有两条：观察档对非流式
+    // 客户端一条都不记（而界面上写的是「照常检测、照常记录」），
+    // 拦截档更是被整个绕过去。
     let inspect = rt.config.security.inspect_tools;
     let trust = crate::guard::effective_trust(provider, &decision.guard);
     // 正文里的提示注入**只对不受信任的上游查**（末尾）：官方端点上
     // 模型讲解提示注入是完全正常的
+    let whole_body = !client_sse && !client_json_stream;
     let mut wall = if !inspect.detects() {
         None
     } else if client_sse {
@@ -2268,8 +2277,25 @@ async fn pipeline(
             trust.blocks(),
         ))
     } else {
-        None
+        Some(crate::toolwall::Wall::json_body(
+            rt.rules.clone(),
+            trust.blocks(),
+        ))
     };
+    /*
+      非流式要拦得住，body 就不能边收边发 —— 发出去了就收不回来。
+
+      **这不是把流变成一次性交付**：客户端要的本来就是一整份 JSON，
+      它无论如何都得等完整 —— 它那边的 HTTP 栈同样要收齐才交给调用者。
+      整包转换（`convert_whole`）和整包收集（`collect`）本来就在攒，
+      只有剩下那条直通的路需要这一下。
+
+      **不设大小上限。**设了就是一条绕过去的路：往响应里塞几 MB 无害
+      内容把体积顶过阈值，后面的工具调用就再也不会被看到了。而一次
+      非流式回答的体积由 `max_tokens` 封顶，十几万输出 token 也就几百
+      KB —— 真正的风险不在这儿。整包转换那条路本来也是不封顶的。
+    */
+    let hold = wall.is_some() && whole_body && !convert_whole && !collect;
     let wall_provider = provider.name.clone();
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
@@ -2301,7 +2327,7 @@ async fn pipeline(
                     // 整包那一条整个攒起来，最后转一次。**这不是缓冲流** ——
                     // 整包响应本来就是一整个 body，客户端无论如何都要等它完整
                     // （说的是别把 SSE 变成一次性交付，这里没有 SSE）
-                    if convert_whole {
+                    if convert_whole || hold {
                         whole.extend_from_slice(&out);
                         continue;
                     }
@@ -2403,6 +2429,16 @@ async fn pipeline(
                 // 半截的流收不出完整的回答，由下面的错误收尾
                 _ => Vec::new(),
             },
+            // 攒着等整份看完的那条直通路：尾巴接上，整份交给下面
+            _ if hold => {
+                if broke.is_some() {
+                    // 半截的整包交不出去，由下面的错误收尾
+                    Vec::new()
+                } else {
+                    whole.extend_from_slice(&tail);
+                    std::mem::take(&mut whole)
+                }
+            }
             (_, Some(c)) => {
                 let mut t = c.process(&tail);
                 // **收尾必须补上**：客户端等着结束帧（Anthropic 的 message_stop、
@@ -2414,7 +2450,51 @@ async fn pipeline(
             }
             _ => tail,
         };
-        if !tail.is_empty() {
+        /*
+          非流式：**整份到手了才看得见工具调用，而它一个字节都还没发出去。**
+
+          流式那条路只能「尽力阻断」—— 首字节早发了，能做的是从命中的
+          那一帧起不再发。这里不一样：要么整份发出去，要么一份都不发，
+          所以拦得干净。代价是状态码已经随响应头走了，改不动 —— body
+          里换成错误体，和 `sse_frame` 在流上扮演的是同一个角色。
+        */
+        let mut denied: Option<GatewayError> = None;
+        if whole_body
+            && broke.is_none()
+            && status.is_success()
+            && let Some(w) = wall.as_mut()
+        {
+            for v in w.whole(&tail) {
+                let blocked = v.high && inspect.acts() && trust.blocks();
+                bus.emit(tw_api::Event::ToolCallFlagged {
+                    id,
+                    provider: wall_provider.clone(),
+                    tool: v.tool.clone(),
+                    rule: v.rule.clone(),
+                    why: v.why.clone(),
+                    excerpt: v.excerpt.clone(),
+                    high: v.high,
+                    blocked,
+                    at_ms: now_ms(),
+                });
+                if blocked {
+                    tracing::warn!(
+                        provider = %wall_provider, tool = %v.tool, rule = %v.rule,
+                        "withheld the response: the upstream returned a dangerous tool call"
+                    );
+                    denied = Some(GatewayError::denied(msg!(
+                        "gw.toolcall.blocked",
+                        upstream = wall_provider.clone(), tool = v.tool.clone(),
+                        rule = v.rule.clone(), why = v.why.clone() =>
+                        "The {tool} call returned by upstream `{upstream}` (an unofficial \
+                         endpoint) matched rule `{rule}` ({why}), so the response was \
+                         withheld."
+                    )));
+                    break;
+                }
+            }
+        }
+        if denied.is_none() && !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }
         // 这条响应长什么样（防线三）。**只有形状，没有内容。**
@@ -2423,6 +2503,10 @@ async fn pipeline(
             if tool_calls > 0 || flagged > 0 {
                 bus.emit(tw_api::Event::ResponseInspected { id, tool_calls, flagged });
             }
+        }
+        // 扣下整份 body 和流断在半路，对结局来说是同一件事
+        if let Some(err) = denied {
+            broke = Some(err.in_dialect(dialect));
         }
         // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
         // 东西，分开写就会有一种漏掉
@@ -2453,6 +2537,9 @@ async fn pipeline(
                     )));
                 } else if is_sse && session.is_none() {
                     yield Ok(Bytes::from(err.sse_frame()));
+                } else if hold {
+                    // 整份攒着的那条路：body 还没发，整个换成错误体
+                    yield Ok(Bytes::from(err.body_bytes()));
                 }
             }
         }
