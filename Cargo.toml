@@ -38,7 +38,7 @@ repository = "https://github.com/ThinkWatchProject/ThinkWatch-Core"
 
 # 二进制走 CalVer，crate 走 SemVer —— 两者是两回事，卖给不同的人。
 # 这里是 crate 的版本。
-version = "0.13.0"
+version = "0.14.0"
 
 [workspace.dependencies]
 # ── 内部 crate ───────────────────────────────────────────
