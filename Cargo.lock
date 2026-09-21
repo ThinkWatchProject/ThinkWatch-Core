@@ -3043,7 +3043,6 @@ name = "tw-store"
 version = "0.15.0"
 dependencies = [
  "bytes",
- "libc",
  "rusqlite",
  "serde",
  "serde_json",
