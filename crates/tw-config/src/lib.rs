@@ -12,6 +12,7 @@ pub mod credential;
 pub mod edit;
 pub mod history;
 mod init;
+pub mod nics;
 mod probes;
 pub mod proxy;
 pub mod refs;
@@ -255,8 +256,8 @@ impl GatewayListen {
     /// **一个函数，不是两处各拼一遍。**bind 和 port 分开写的地方多了，
     /// 迟早有一处忘了跟着改 —— 而它的表现是「监听在了一个谁也没想到的
     /// 地址上」。
-    pub fn socket_addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::new(self.bind.addr(), self.port)
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, BindError> {
+        Ok(std::net::SocketAddr::new(self.bind.resolve()?, self.port))
     }
 }
 
@@ -284,23 +285,78 @@ impl Default for GatewayListen {
 /// `0.0.0.0`，区别只在 `allow_from` 的默认值 —— 也就是说它是个白名单
 /// 概念，伪装成了网卡选择。用户在界面上选「局域网」，以为网关只在局域
 /// 网那张网卡上监听，实际上它在**所有**网卡上监听，包括公网那张。
-/// 现在要真的只在局域网网卡上听，就写那张网卡的地址。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 现在要真的只在局域网网卡上听，**写那张网卡的名字**（`en0`）。
+///
+/// 写名字而不是写地址，是因为地址会变：DHCP 续租、换个 Wi-Fi，
+/// `192.168.1.5` 就不在了，网关起不来，而系统给的错误只有一句
+/// 「Can't assign requested address」。名字不会变，每次启动现问系统它
+/// 当下是哪个地址。**写死的地址仍然收** —— 有人就是要钉住那一个。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Bind {
     #[default]
     Loopback,
     All,
-    /// 一张具体的网卡。**地址会变** —— DHCP 续租、换网络都可能让它失效，
-    /// 那时网关起不来。这是选它要接受的代价，界面上必须说。
+    /// 一张具体的网卡，按名字。启动时解析。
+    Nic(String),
+    /// 一个写死的地址。**它会随网络变化失效**，而 [`Bind::Nic`] 不会。
     Addr(std::net::IpAddr),
 }
 
+/// `bind` 解析不出一个能监听的地址。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BindError {
+    /// **把机器上真有哪些网卡一并说出来。**名字是在加载配置时按形状收下
+    /// 的（那时那张网卡可能正没插线），所以拼错要到这一刻才发现 ——
+    /// 那就让这一刻的这句话直接给出答案，而不是让人再去跑一次 ifconfig。
+    #[error("this machine has no interface named `{name}`; it has {}", available.join(", "))]
+    NoSuchNic {
+        name: String,
+        available: Vec<String>,
+    },
+    /// 网卡在，但此刻没有地址：网线拔了、Wi-Fi 没连上、还没拿到 DHCP。
+    #[error("interface `{name}` currently has no address")]
+    NicHasNoAddr { name: String },
+}
+
 impl Bind {
-    pub fn addr(&self) -> std::net::IpAddr {
+    /// 要监听的那个地址。**网卡名要问系统**，所以这一步可能失败。
+    ///
+    /// 每次都现问，不缓存：换网络之后重启网关，拿到的就该是新地址。
+    pub fn resolve(&self) -> Result<std::net::IpAddr, BindError> {
         match self {
-            Bind::Loopback => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            Bind::All => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            Bind::Addr(a) => *a,
+            Bind::Loopback => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            Bind::All => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            Bind::Addr(a) => Ok(*a),
+            Bind::Nic(name) => {
+                let mut found = false;
+                // **同一张网卡可以有好几个地址。**取 IPv4 那个：客户端配置里
+                // 写的是 `http://<地址>:端口`，而一个 IPv6 地址在那个位置要
+                // 加方括号，多数客户端的输入框对此毫无准备。
+                let mut v6 = None;
+                for n in nics::list() {
+                    if n.name != *name {
+                        continue;
+                    }
+                    found = true;
+                    match n.addr {
+                        std::net::IpAddr::V4(_) => return Ok(n.addr),
+                        std::net::IpAddr::V6(_) => v6 = v6.or(Some(n.addr)),
+                    }
+                }
+                match (found, v6) {
+                    (_, Some(a)) => Ok(a),
+                    (true, None) => Err(BindError::NicHasNoAddr { name: name.clone() }),
+                    (false, None) => Err(BindError::NoSuchNic {
+                        name: name.clone(),
+                        available: {
+                            let mut names: Vec<String> =
+                                nics::list().into_iter().map(|n| n.name).collect();
+                            names.dedup();
+                            names
+                        },
+                    }),
+                }
+            }
         }
     }
 
@@ -309,19 +365,30 @@ impl Bind {
     /// **这个判断决定了两件强制行为**：密钥校验不可关闭，
     /// 以及 `allow_from` 为空时自动填私网段。
     ///
-    /// 判的是地址本身而不是枚举变体 —— `bind: 127.0.0.1` 写成具体地址
-    /// 的时候，它和 `loopback` 是同一件事，不该因为换了个写法就被当成
-    /// 暴露在外。
+    /// 写死地址的那一档判的是地址本身而不是枚举变体 —— `bind: 127.0.0.1`
+    /// 和 `loopback` 是同一件事，不该因为换了个写法就被当成暴露在外。
+    ///
+    /// **网卡名一律算暴露，不去解析。**这个判断要在任何时候都答得出，
+    /// 包括那张网卡当下没有地址的时候；而它决定的是密钥强制和白名单
+    /// 默认值 —— 答不上来时错在保守那一侧，比为一个判断去做系统调用好。
+    /// 代价是 `bind: lo0` 会被当成暴露，那没有坏处。
     pub fn is_exposed(&self) -> bool {
-        !self.addr().is_loopback()
+        match self {
+            Bind::Loopback => false,
+            Bind::All | Bind::Nic(_) => true,
+            Bind::Addr(a) => !a.is_loopback(),
+        }
     }
 }
 
 impl Bind {
-    /// 给界面显示的地址字符串。`loopback`/`all` 展开成真实地址，
-    /// 具体网卡就是它自己。
+    /// 给界面显示的地址字符串。`loopback`/`all` 展开成真实地址，写死的
+    /// 地址就是它自己，网卡名解析得出来就给地址、解析不出来就给名字。
     pub fn socket_string(&self) -> String {
-        self.addr().to_string()
+        match self.resolve() {
+            Ok(a) => a.to_string(),
+            Err(_) => self.to_string(),
+        }
     }
 }
 
@@ -330,9 +397,25 @@ impl std::fmt::Display for Bind {
         match self {
             Bind::Loopback => f.write_str("loopback"),
             Bind::All => f.write_str("all"),
+            Bind::Nic(n) => f.write_str(n),
             Bind::Addr(a) => write!(f, "{a}"),
         }
     }
+}
+
+/// 看起来像不像一个网卡名。
+///
+/// **只判形状，不问系统。**Linux 的 `IFNAMSIZ` 是 16，BSD 一系更短；
+/// 名字里出现的是字母数字加 `.` `-` `_`（`en0`、`utun3`、`br-a1b2`、
+/// `enp0s31f6`）。够宽松，能收下没见过的命名法。**它拦不住把 `loopback`
+/// 拼成 `lookback`** —— 那照样是个合法形状，会被当成网卡名收下，到启动
+/// 时才发现。所以 [`BindError::NoSuchNic`] 要把真有哪些网卡说出来。
+fn looks_like_nic(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() < 16
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 impl Serialize for Bind {
@@ -347,15 +430,37 @@ impl<'de> Deserialize<'de> for Bind {
         match raw.as_str() {
             "loopback" => Ok(Bind::Loopback),
             "all" => Ok(Bind::All),
-            other => other.parse().map(Bind::Addr).map_err(|_| {
-                // **说清楚三种合法写法。**「invalid value」对着一个
+            other => {
+                if let Ok(a) = other.parse() {
+                    return Ok(Bind::Addr(a));
+                }
+                // **网卡名不在这里核实存不存在。**写配置的时候那张网卡
+                // 可能正好没插线；真要监听的那一刻才问系统，那时给的是
+                // 「没有叫 en9 的网卡」，比一句解析失败准确得多。
+                //
+                // 但形状要核：拼错成 `lookback` 的话，当成网卡名收下就
+                // 成了一个到启动才炸的错误，而它本来可以在这里就说清楚。
+                // **`lan` 曾经是个合法关键字。**它形状上像网卡名，收下
+                // 之后给的会是「没有叫 lan 的网卡」—— 而真相是这个写法被
+                // 去掉了，以及为什么。老配置升上来时要读到后者。
+                if other == "lan" {
+                    return Err(serde::de::Error::custom(
+                        "bind: lan 这个写法已经去掉了 —— 它绑的其实是 0.0.0.0（所有网卡，\
+                         包括公网那张），只是白名单默认填了私网段。要只在局域网那张网卡上\
+                         监听，写那张网卡的名字（例如 en0）",
+                    ));
+                }
+                if looks_like_nic(other) {
+                    return Ok(Bind::Nic(other.to_string()));
+                }
+                // **说清楚四种合法写法。**「invalid value」对着一个
                 // 手写配置文件的人什么都没说，而这个字段写错的后果是
                 // 整份配置加载失败、网关起不来。
-                serde::de::Error::custom(format!(
-                    "bind 只能是 loopback、all 或某个网卡的 IP 地址（例如 192.168.1.5），\
-                     当前值为 {other}"
-                ))
-            }),
+                Err(serde::de::Error::custom(format!(
+                    "bind 只能是 loopback、all、某张网卡的名字（例如 en0）\
+                     或某个 IP 地址（例如 192.168.1.5），当前值为 {other}"
+                )))
+            }
         }
     }
 }
@@ -1039,8 +1144,8 @@ providers:
     #[test]
     fn bind_defaults_to_loopback_not_all_interfaces() {
         // 默认监听 0.0.0.0 会把网关暴露给整个局域网，而用户不会知道。
-        assert_eq!(Bind::default().addr().to_string(), "127.0.0.1");
-        assert_eq!(Bind::All.addr().to_string(), "0.0.0.0");
+        assert_eq!(Bind::default().resolve().unwrap().to_string(), "127.0.0.1");
+        assert_eq!(Bind::All.resolve().unwrap().to_string(), "0.0.0.0");
         assert!(!Bind::default().is_exposed());
         assert!(Bind::All.is_exposed());
     }
@@ -1063,9 +1168,39 @@ providers:
         assert!(!b.is_exposed());
     }
 
+    /// 写名字而不是写地址，图的就是它熬得过换网络：地址会变，`en0` 不变。
+    #[test]
+    fn bind_takes_an_interface_by_name() {
+        let b: Bind = serde_yaml_ng::from_str("en0").unwrap();
+        assert_eq!(b, Bind::Nic("en0".into()));
+        // **不去解析就要算暴露。**这个判断决定密钥强制和白名单默认值，
+        // 而那张网卡此刻可能没有地址 —— 答不上来时错在保守那一侧
+        assert!(b.is_exposed());
+    }
+
+    /// 名字要在启动时解析成当下的地址。这台机器上一定有回环，拿它当样本。
+    #[test]
+    fn a_name_resolves_to_whatever_address_that_interface_has_now() {
+        let lo = nics::list()
+            .into_iter()
+            .find(|n| n.addr.is_loopback())
+            .expect("一台机器不可能没有回环网卡");
+        let b = Bind::Nic(lo.name.clone());
+        assert_eq!(b.resolve().unwrap(), lo.addr);
+    }
+
+    #[test]
+    fn a_name_that_is_not_here_says_what_is() {
+        let e = Bind::Nic("zzz0".into()).resolve().unwrap_err().to_string();
+        assert!(e.contains("zzz0"), "{e}");
+        // 拼错要到这一刻才发现，所以这一刻得给出答案，而不是让人去跑 ifconfig
+        let lo = nics::list().into_iter().next().expect("至少有一张网卡");
+        assert!(e.contains(&lo.name), "没把机器上真有的网卡说出来：{e}");
+    }
+
     #[test]
     fn every_bind_form_round_trips_through_yaml() {
-        for raw in ["loopback", "all", "192.168.1.5", "::1"] {
+        for raw in ["loopback", "all", "en0", "192.168.1.5", "::1"] {
             let b: Bind = serde_yaml_ng::from_str(raw).unwrap();
             let back = serde_yaml_ng::to_string(&b).unwrap();
             assert_eq!(back.trim(), raw, "{raw} 写回来变了样");
@@ -1073,15 +1208,28 @@ providers:
     }
 
     #[test]
-    fn a_bind_typo_says_what_the_three_forms_are() {
+    fn a_bind_typo_says_what_the_forms_are() {
         // 这个字段写错的后果是整份配置加载失败、网关起不来 ——
-        // 那条错误必须自带答案。
-        let e = serde_yaml_ng::from_str::<Bind>("lan")
+        // 那条错误必须自带答案。**「@」不是网卡名的合法字符**，所以它
+        // 走不到「当成网卡名收下」那条路上
+        let e = serde_yaml_ng::from_str::<Bind>("192.168.1.5@wifi")
             .unwrap_err()
             .to_string();
         assert!(e.contains("loopback"), "{e}");
         assert!(e.contains("all"), "{e}");
+        assert!(e.contains("en0"), "{e}");
         assert!(e.contains("192.168.1.5"), "{e}");
+    }
+
+    /// `lan` 是真存在过的关键字，老配置里可能还写着它。形状上它像网卡名，
+    /// 收下之后给的是「没有叫 lan 的网卡」—— 而用户要读到的是它为什么没了。
+    #[test]
+    fn the_old_lan_keyword_explains_itself_instead_of_looking_like_an_interface() {
+        let e = serde_yaml_ng::from_str::<Bind>("lan")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("0.0.0.0"), "没说清它其实绑的是什么：{e}");
+        assert!(e.contains("en0"), "没说改成写什么：{e}");
     }
 
     #[test]

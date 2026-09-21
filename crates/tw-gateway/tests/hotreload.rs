@@ -533,7 +533,7 @@ async fn changing_the_port_actually_moves_the_listener() {
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     let s = state.clone();
-    let start = c.listen.gateway.socket_addr();
+    let start = c.listen.gateway.socket_addr().unwrap();
     tokio::spawn(async move { tw_gateway::serve_following_config(s, start).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -587,7 +587,7 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     let s = state.clone();
-    let start = c.listen.gateway.socket_addr();
+    let start = c.listen.gateway.socket_addr().unwrap();
     tokio::spawn(async move { tw_gateway::serve_following_config(s, start).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(80)).await;
 

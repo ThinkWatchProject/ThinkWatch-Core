@@ -705,7 +705,12 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     if let Some(p) = port {
         listen.port = p;
     }
-    let addr = listen.socket_addr();
+    // **`bind` 写的是网卡名时，这一步要问系统。**问不出来就在这里停，
+    // 而不是带着一个猜出来的地址起监听 —— 错误里说清是哪张网卡，以及
+    // 这台机器上真有哪些
+    let addr = listen
+        .socket_addr()
+        .with_context(|| format!("resolving bind: {}", listen.bind))?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
