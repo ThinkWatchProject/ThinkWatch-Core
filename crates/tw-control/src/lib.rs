@@ -92,6 +92,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/interfaces", get(interfaces))
         .merge(keys::router())
         .route("/events", get(events))
+        .route("/in-flight", get(in_flight))
         .route("/overview", get(overview))
         .route("/l1", post(l1))
         .route(
@@ -187,6 +188,14 @@ async fn events(
     // 心跳。UI 那边要能区分「没有请求」和「连接断了」—— 没有心跳的话
     // 一个安静的下午看起来就像挂了。
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+/// 此刻还在跑的请求：它们的开始事件，原样（见 `EventBus::in_flight`）。
+///
+/// **半路才开始听 `/events` 的一方先问这个。**不问的话，订阅之前就开始了
+/// 的请求它一个都不知道，直到它们结束 —— 数「进行中」就会少数。
+async fn in_flight(State(s): State<ControlState>) -> Json<Vec<tw_api::Event>> {
+    Json(s.bus().in_flight())
 }
 
 fn async_stream_from(
