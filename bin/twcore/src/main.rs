@@ -904,8 +904,8 @@ fn build_store(
     bodies: tokio::sync::mpsc::Receiver<tw_gateway::BodyRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let events = bus.subscribe();
-    let db = match tw_store::Db::open(&dir.join("data.db")) {
-        Ok(db) => db,
+    let (db, blobs) = match tw_store::open(dir) {
+        Ok(opened) => opened,
         Err(e) => {
             tracing::warn!(
                 "request recording could not start, so nothing is recorded this run; forwarding is unaffected: {e}"
@@ -931,7 +931,6 @@ fn build_store(
             "could not read the last request id, so this run may overwrite the oldest records: {e}"
         ),
     }
-    let blobs = tw_store::Blobs::new(dir.join("blobs"));
     // 两边的 body 结构在这里对接。**一次移动，不复制** —— `Bytes` 的
     // 克隆是引用计数。
     let (tx, rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);

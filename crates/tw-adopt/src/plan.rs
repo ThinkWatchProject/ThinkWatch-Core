@@ -298,7 +298,7 @@ fn originals_from(
         .originals
         .iter()
         .map(|f| {
-            let path = record_path(f);
+            let path = f.path.clone();
             let was = match f.was.as_str() {
                 "missing" => Was::Missing,
                 "secret" => match backed_val.as_ref().and_then(|v| lookup(v, &refs(&path))) {
@@ -319,14 +319,6 @@ fn originals_from(
             }
         })
         .collect())
-}
-
-fn record_path(f: &sentinel::SidecarField) -> Vec<String> {
-    if f.path.is_empty() {
-        f.field.split('.').map(|s| s.to_string()).collect()
-    } else {
-        f.path.clone()
-    }
 }
 
 /// 落盘。**用户确认之后才该调到这里。**
@@ -516,7 +508,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
     let mut notes = Vec::new();
     let mut targets = Vec::new();
     for f in &rec.originals {
-        let p = record_path(f);
+        let p = f.path.clone();
         let r = refs(&p);
         let from_backup = backed_val.as_ref().and_then(|v| lookup(v, &r));
         match (f.was.as_str(), from_backup, &f.value) {
@@ -543,7 +535,7 @@ pub fn plan_restore(c: &Client, home: &Path) -> Result<Plan, PlanError> {
     // 否则「还原」之后会留下一个用户从来没有过的空段落。
     if let Some(bv) = &backed_val {
         for f in &rec.originals {
-            let p = record_path(f);
+            let p = f.path.clone();
             for cut in (1..p.len()).rev() {
                 let anc = &p[..cut];
                 if lookup(bv, &refs(anc)).is_none()

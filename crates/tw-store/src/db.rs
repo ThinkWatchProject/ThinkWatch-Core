@@ -5,8 +5,9 @@
 //! **一、写入永远不能挡住转发。**这一层的每一个错误都只记一行日志，
 //! 不往上抛到数据面。观测挂了，代理照跑。
 //!
-//! **二、schema 版本用 `PRAGMA user_version`。**「库比程序新」要能识别
-//! 出来并给一句人话，而不是在某个 `SELECT` 上以「no such column」告终。
+//! **二、schema 版本用 `PRAGMA user_version`，不迁移。**版本对不上的库
+//! 不去猜它长什么样：连同正文目录整个重建（见 [`crate::open`]），而不是在
+//! 某个 `SELECT` 上以「no such column」告终。
 //!
 //! **三、成本三态。**没有价格的模型不能记成 0 —— 那是在撒谎，而一个会
 //! 撒谎的成本面板不如没有。
@@ -16,8 +17,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use tw_api::Msg;
 
-/// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 16;
+/// 当前 schema 版本。**表的样子一变就加一，改 [`Db::create`] 里那一份。**
+/// 不写迁移：项目还没有存量用户，版本对不上的库整个重建。
+const SCHEMA: i64 = 17;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -54,16 +56,10 @@ pub enum DbError {
         path: String,
         source: rusqlite::Error,
     },
-    /// 库是更新版本的程序建的。**只能读不能写** —— 硬写会让那个版本的
-    /// 数据变成半新半旧，而用户回到新版本时已经修不回来了。
-    #[error(
-        "the database is schema version {found}, and this twcore supports up to {supported}. Upgrade the app; to stay on this version, move {path} elsewhere and an empty database is created, leaving the recorded requests where they are"
-    )]
-    TooNew {
-        found: i64,
-        supported: i64,
-        path: String,
-    },
+    /// 库是别的版本建的。**不迁移、也不硬读** —— [`crate::open`] 连同正文
+    /// 目录整个重建。
+    #[error("the database is schema version {found}; this twcore reads only {supported}")]
+    OtherVersion { found: i64, supported: i64 },
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
 }
@@ -84,7 +80,8 @@ pub struct RequestRow {
     pub peer: Option<String>,
     /// 请求带的那把网关密钥打码后的样子，请求那一刻的
     pub key_masked: Option<String>,
-    /// 这条属于哪一次任务。**指纹 + 起始时刻**，老记录是 None
+    /// 这条属于哪一次任务。**指纹 + 起始时刻**。认不出会话的（WebSocket、
+    /// 本地应答）是 None
     pub session: Option<String>,
     pub provider: String,
     pub model: String,
@@ -106,22 +103,21 @@ pub struct RequestRow {
     pub cost_micros: Option<i64>,
     /// 成本是估的还是上游给的。**估算值不能混进精确数字里**
     pub cost_estimated: bool,
-    /// 失败的原因，带着码。**老记录的码是空串** —— 那时只存了正文，
-    /// 界面认不出空码，照旧显示正文
+    /// 失败的原因，带着码
     pub error: Option<Msg>,
     /// 客户端的辅助请求被本地应答了。**不进成本和延迟统计**
     pub local: bool,
     /// 客户端没等到响应结束就走了。**和 `error` 是两件事**：它不算失败，
     /// 用量只算到断开那一刻，所以金额是估算
     pub cancelled: bool,
-    /// 路由决策与尝试链，JSON。老记录是 None
+    /// 路由决策与尝试链，JSON。没经过路由的（WebSocket、本地应答）是 None
     pub routing: Option<String>,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     pub cache_saved_micros: Option<i64>,
-    /// 金额按什么价格算的，JSON（`tw_api::PriceSourceView`）。没算出金额的、
-    /// 老记录是 None
+    /// 金额按什么价格算的，JSON（`tw_api::PriceSourceView`）。没算出金额的
+    /// 是 None
     pub price_source: Option<String>,
     /// 服务它的那一跳做过的格式转换，JSON。直通的是 None
     pub translated: Option<String>,
@@ -162,15 +158,15 @@ impl Db {
                 }
             }
         }
-        Self::from_conn(conn, &path.display().to_string())
+        Self::from_conn(conn)
     }
 
     /// 内存库。测试用，也是「磁盘写不了」时的退路。
     pub fn in_memory() -> Result<Self, DbError> {
-        Self::from_conn(Connection::open_in_memory()?, ":memory:")
+        Self::from_conn(Connection::open_in_memory()?)
     }
 
-    fn from_conn(conn: Connection, path: &str) -> Result<Self, DbError> {
+    fn from_conn(conn: Connection) -> Result<Self, DbError> {
         // WAL：读不挡写。**界面在查历史的同时数据面在写** —— 默认的
         // rollback journal 下那是互相阻塞的。
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -180,231 +176,103 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if found > SCHEMA {
-            return Err(DbError::TooNew {
+        if found != 0 && found != SCHEMA {
+            return Err(DbError::OtherVersion {
                 found,
                 supported: SCHEMA,
-                path: path.to_string(),
             });
         }
         let db = Self { conn };
-        db.migrate(found)?;
+        if found == 0 {
+            db.create()?;
+        }
         Ok(db)
     }
 
-    /// 从 `from` 版本升到当前。**每一步都是独立的、只往前的。**
-    fn migrate(&self, from: i64) -> Result<(), DbError> {
-        if from < 1 {
-            self.conn.execute_batch(
-                "CREATE TABLE requests (
-                    id                INTEGER PRIMARY KEY,
-                    at_ms             INTEGER NOT NULL,
-                    client            TEXT    NOT NULL,
-                    provider          TEXT    NOT NULL,
-                    model             TEXT    NOT NULL DEFAULT '',
-                    path              TEXT    NOT NULL,
-                    status            INTEGER,
-                    ttfb_ms           INTEGER,
-                    duration_ms       INTEGER,
-                    bytes             INTEGER,
-                    input_tokens      INTEGER,
-                    output_tokens     INTEGER,
-                    cache_read_tokens  INTEGER,
-                    cache_write_tokens INTEGER,
-                    cost_micros       INTEGER,
-                    cost_estimated    INTEGER NOT NULL DEFAULT 0,
-                    error             TEXT,
-                    local             INTEGER NOT NULL DEFAULT 0
-                 );
-                 -- 几乎所有查询都是「最近的 N 条」或者「某段时间内的」，
-                 -- 所以时间是唯一必需的索引。按 provider / model 过滤是
-                 -- 在那之上再筛，数据量小得不值得再建索引。
-                 CREATE INDEX requests_at ON requests (at_ms DESC);",
-            )?;
-        }
-        if from < 2 {
-            // 出站密钥检测的发现（观察态）。
-            //
-            // **单独一张表，不是 requests 上的一列。**一次请求可能同时
-            // 带出好几种凭据，而「过去 7 天有 3 个请求把 key 发给了
-            // relay-cn」这句话要按 (provider, kind) 分组数。
-            self.conn.execute_batch(
-                "CREATE TABLE leaks (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    at_ms     INTEGER NOT NULL,
-                    request_id INTEGER NOT NULL,
-                    provider  TEXT NOT NULL,
-                    kind      TEXT NOT NULL,
-                    -- **已打码。**存原文等于把泄漏搬了个家
-                    masked    TEXT NOT NULL
-                 );
-                 CREATE INDEX leaks_at ON leaks (at_ms DESC);",
-            )?;
-        }
-        if from < 3 {
-            // 路由决策与尝试链。
-            //
-            // **一列 JSON，不是一张表。**它是一条请求的固有事实，永远
-            // 跟着那一行一起取，从来不跨行查 —— 拆出去只会多一次 join。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN routing TEXT;")?;
-        }
-        if from < 4 {
-            // 服务它的那家怎么收钱。
-            //
-            // **存在行上，不是事后查配置。**配置随时会被热重载，而一条
-            // 三天前的记录该按它当时那家的计费方式算 —— 否则今天把一家
-            // 改成订阅型，昨天的账就跟着变了。
-            self.conn.execute_batch(
-                "ALTER TABLE requests ADD COLUMN billing TEXT NOT NULL DEFAULT '';",
-            )?;
-        }
-        if from < 5 {
-            // 缓存命中省下了多少。
-            //
-            // **在记录的时候算，不在查询的时候算。**查询时算意味着要把
-            // 价目表带进 SQL，而价目表会变 —— 那样「上周省了多少」会
-            // 随着一次价格更新悄悄改变。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN cache_saved_micros INTEGER;")?;
-        }
-        if from < 6 {
-            // 「这条是哪个客户端发的」的旁证（观察窗口）。
-            //
-            // **和 `client` 分开两列，不是覆盖它。**一个不可伪造、一个
-            // 可以伪造，混成一列之后就再也分不清某一行的可信度了。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN client_hint TEXT;")?;
-        }
-        if from < 7 {
-            // 会话聚合。**孤立地看单个请求看不出任何有用的东西**
-            // —— Claude Code 的一次任务是几十到上百个请求。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN session TEXT;")?;
-            // 会话视图永远是「按会话分组、按时间倒序」，这个索引正好
-            self.conn
-                .execute_batch("CREATE INDEX requests_session ON requests (session, at_ms);")?;
-        }
-        if from < 8 {
-            // 上游行为画像（防线三）。**「没数过」和「数了是零」
-            // 要分得开**，所以是可空列而不是默认 0 —— 后者会让关掉审查
-            // 的那段时间在画像里变成「一个工具调用都没有」，而那是假的。
-            self.conn.execute_batch(
-                "ALTER TABLE requests ADD COLUMN tool_calls INTEGER;
-                 ALTER TABLE requests ADD COLUMN flagged INTEGER;",
-            )?;
-        }
-        if from < 9 {
-            // 出站脱敏换掉了几处（防线一的拦截档）。
-            //
-            // **不记的话，切到「拦截」之后面板反而没数字了** —— 观察档
-            // 产出的是「检测到的外泄」，而拦截档把它们就地换掉了，于是
-            // 那条证据链在防护最强的时候断掉，读起来像「什么都没发生」。
-            //
-            // 和 `tool_calls` 同一条理由用可空列：「没开脱敏」和
-            // 「开了但这次没换」是两件事。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN redacted INTEGER;")?;
-        }
-        if from < 10 {
-            // 客户端没等到响应结束就走了的那些（Claude Code 里按 Esc）。
-            //
-            // **不能写进 `error`。**那一列决定失败数、失败率，还有上游行为
-            // 画像里的错误率 —— 用户按了 Esc，不该让上游看起来在出错。可它
-            // 也不是正常结束：用量只算到断开那一刻，界面要能把这一点说出来。
-            //
-            // 老记录是 0。那时候这类请求根本不落库，所以没有一条老记录
-            // 该是 1。
-            self.conn.execute_batch(
-                "ALTER TABLE requests ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0;",
-            )?;
-        }
-        if from < 11 {
-            // 金额按什么价格算的：默认价目表（哪天的）、乘了哪张价目表的倍率、
-            // 还是哪张价目表的覆盖价。
-            //
-            // **记在行上。**价目表会刷新、会被改，事后按现在的配置去推当时用的
-            // 是哪个价，推出来的是错的。
-            //
-            // 老记录是 NULL：那时只有一份价目表，而它的日期没有记下来。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN price_source TEXT;")?;
-        }
-        if from < 12 {
-            // 客户端和上游说不同的格式时做过的转换，以及转不过去被丢掉的字段。
-            //
-            // **记在行上。**实时事件只在网关运行期间存在，而「扩展思考开了却
-            // 没生效」往往是事后翻历史才发现的。
-            //
-            // 老记录是 NULL：那时只有 Anthropic → OpenAI Chat 一个方向，转换
-            // 没有落库。
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN translated TEXT;")?;
-        }
-        if from < 13 {
-            // 失败原因的码和参数。
-            //
-            // **只存正文的话，翻历史时它永远是英文。**实时事件里带着码，
-            // 界面照码说自己那句话；一刷新，同一条记录就退回上游的原话。
-            // 老记录的 `error_code` 是 NULL —— 界面认不出码就照旧显示正文，
-            // 正是它要的那条退路。
-            self.conn.execute_batch(
-                "ALTER TABLE requests ADD COLUMN error_code TEXT;
-                 ALTER TABLE requests ADD COLUMN error_args TEXT;",
-            )?;
-        }
-        if from < 14 {
-            // 安全日志。**一条是一次命中**：出站脱敏是「一个请求里的一个值」，
-            // 工具调用审查是「一个工具调用命中一条规则」。
-            //
-            // 它替代了三样东西：观察档的 `leaks` 表、拦截档记在请求行上的
-            // 「换了几处」、以及上游行为画像要的 `tool_calls` / `flagged`。
-            // 以前工具调用命中了哪条规则、摘录是什么根本不落库 —— 关窗再开，
-            // 证据就没了；拦截档换掉了什么也只有一个条数。
-            //
-            // `leaks` 里的旧记录搬过来：它们就是观察档留下的记录，丢掉的话
-            // 升级那一刻安全日志会变空，读起来像「什么都没发生过」。
-            self.conn.execute_batch(
-                "CREATE TABLE security_events (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    at_ms      INTEGER NOT NULL,
-                    request_id INTEGER NOT NULL,
-                    guard      TEXT    NOT NULL,
-                    rule       TEXT    NOT NULL,
-                    custom     INTEGER NOT NULL DEFAULT 0,
-                    action     TEXT    NOT NULL,
-                    provider   TEXT    NOT NULL DEFAULT '',
-                    client     TEXT    NOT NULL DEFAULT '',
-                    tool       TEXT,
-                    -- **已打码或已截断。**存原文等于把泄漏搬了个家
-                    excerpt    TEXT    NOT NULL,
-                    count      INTEGER NOT NULL DEFAULT 1
-                 );
-                 CREATE INDEX security_events_at ON security_events (at_ms DESC);
-                 CREATE INDEX security_events_request ON security_events (request_id);
-                 INSERT INTO security_events
-                     (at_ms, request_id, guard, rule, action, provider, excerpt)
-                     SELECT at_ms, request_id, 'redact', kind, 'recorded', provider, masked
-                     FROM leaks ORDER BY id;
-                 DROP TABLE leaks;
-                 ALTER TABLE requests DROP COLUMN redacted;
-                 ALTER TABLE requests DROP COLUMN flagged;
-                 ALTER TABLE requests DROP COLUMN tool_calls;",
-            )?;
-        }
-        if from < 15 {
-            // 请求从哪台机器来。**网关开给局域网之后**，几台机器共用一把密钥
-            // 时只有它分得开是谁发的；本机来的留空
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN peer TEXT;")?;
-        }
-        if from < 16 {
-            // 用的是哪把密钥：打码后的样子。**名字会改、密钥会换**，只记名字的
-            // 话，更换之后老记录就对不上是哪一把了
-            self.conn
-                .execute_batch("ALTER TABLE requests ADD COLUMN key_masked TEXT;")?;
-        }
-        self.conn.pragma_update(None, "user_version", SCHEMA)?;
+    /// 建表。**只有这一份，没有迁移**：表的样子一变，改这里、[`SCHEMA`] 加一，
+    /// 版本对不上的旧库整个重建。
+    ///
+    /// 放在一个事务里：建到一半断掉的话，下次打开看到的仍然是版本 0 的空库，
+    /// 而不是一个缺了几张表、版本号却对得上的库。
+    fn create(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(&format!(
+            "BEGIN;
+             CREATE TABLE requests (
+                id                 INTEGER PRIMARY KEY,
+                at_ms              INTEGER NOT NULL,
+                client             TEXT    NOT NULL,
+                -- 请求头透出来的旁证。**和 `client` 分开两列**：一个不可伪造、
+                -- 一个可以伪造，混成一列之后就再也分不清某一行的可信度了
+                client_hint        TEXT,
+                -- 非本机来的请求的来源地址。**网关开给局域网之后**，几台机器共用
+                -- 一把密钥时只有它分得开是谁发的；本机来的留空
+                peer               TEXT,
+                -- 用的是哪把密钥：打码后的样子。名字会改、密钥会换，只记名字的
+                -- 话，更换之后就对不上是哪一把了
+                key_masked         TEXT,
+                -- 属于哪一次任务。认不出会话的请求（WebSocket、本地应答）没有
+                session            TEXT,
+                provider           TEXT    NOT NULL,
+                model              TEXT    NOT NULL,
+                path               TEXT    NOT NULL,
+                status             INTEGER,
+                ttfb_ms            INTEGER,
+                duration_ms        INTEGER,
+                bytes              INTEGER,
+                input_tokens       INTEGER,
+                output_tokens      INTEGER,
+                cache_read_tokens  INTEGER,
+                cache_write_tokens INTEGER,
+                cost_micros        INTEGER,
+                cost_estimated     INTEGER NOT NULL,
+                -- 缓存命中省下了多少。**在记录的时候算**：查询时算要把价目表
+                -- 带进 SQL，而价目表会变，「上周省了多少」会跟着悄悄改变
+                cache_saved_micros INTEGER,
+                -- 金额按什么价格算的。**记在行上**：事后按现在的配置去推当时
+                -- 用的是哪个价，推出来的是错的
+                price_source       TEXT,
+                -- 服务它的那家怎么收钱。**存在行上**：今天把一家改成订阅型，
+                -- 昨天的账不该跟着变
+                billing            TEXT    NOT NULL,
+                -- 路由决策与尝试链，一列 JSON：永远跟着那一行一起取
+                routing            TEXT,
+                -- 客户端和上游说不同的格式时做过的转换，以及被丢掉的字段
+                translated         TEXT,
+                -- 失败的原因：正文、码、参数。**码要存**：只存正文的话，翻
+                -- 历史时它永远是英文
+                error              TEXT,
+                error_code         TEXT,
+                error_args         TEXT,
+                local              INTEGER NOT NULL,
+                -- 客户端没等到响应结束就走了。**不能写进 `error`**：它不算失败
+                cancelled          INTEGER NOT NULL
+             );
+             -- 几乎所有查询都是「最近的 N 条」或者「某段时间内的」
+             CREATE INDEX requests_at ON requests (at_ms DESC);
+             -- 会话视图永远是「按会话分组、按时间倒序」
+             CREATE INDEX requests_session ON requests (session, at_ms);
+             -- 安全日志。**一条是一次命中**：出站脱敏是「一个请求里的一个值」，
+             -- 工具调用审查是「一个工具调用命中一条规则」
+             CREATE TABLE security_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                at_ms      INTEGER NOT NULL,
+                request_id INTEGER NOT NULL,
+                guard      TEXT    NOT NULL,
+                rule       TEXT    NOT NULL,
+                custom     INTEGER NOT NULL,
+                action     TEXT    NOT NULL,
+                provider   TEXT    NOT NULL,
+                client     TEXT    NOT NULL,
+                tool       TEXT,
+                -- **已打码或已截断。**存原文等于把泄漏搬了个家
+                excerpt    TEXT    NOT NULL,
+                count      INTEGER NOT NULL
+             );
+             CREATE INDEX security_events_at ON security_events (at_ms DESC);
+             CREATE INDEX security_events_request ON security_events (request_id);
+             PRAGMA user_version = {SCHEMA};
+             COMMIT;"
+        ))?;
         Ok(())
     }
 
@@ -1164,17 +1032,12 @@ fn percentile(sorted: &[i64], p: usize) -> i64 {
     sorted[rank.saturating_sub(1).min(n - 1)]
 }
 
-/// 把三列拼回一条 [`Msg`]。
-///
-/// **码和参数是后来才加的列**，老记录里是 NULL：那时给一个空码，界面
-/// 认不出它，就走「显示正文」那条退路 —— 正是我们想要的。
+/// 把三列拼回一条 [`Msg`]。有正文就有码；没有参数的是 NULL。
 fn error_from(r: &rusqlite::Row) -> rusqlite::Result<Option<Msg>> {
     let Some(text) = r.get::<_, Option<String>>("error")? else {
         return Ok(None);
     };
-    let code = r
-        .get::<_, Option<String>>("error_code")?
-        .unwrap_or_default();
+    let code = r.get::<_, String>("error_code")?;
     let args = r
         .get::<_, Option<String>>("error_args")?
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1312,6 +1175,15 @@ pub struct Latency {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// 一条失败原因。码随便取一个，这里测的不是它
+    pub(crate) fn upstream_failed(text: &str) -> Msg {
+        Msg {
+            code: "t.upstream_failed".into(),
+            args: Default::default(),
+            text: text.into(),
+        }
+    }
 
     pub(crate) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
@@ -1832,104 +1704,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_older_database_gains_the_new_column_without_losing_a_row() {
-        // 升级时最要紧的一条：**老记录一条都不能少**。用户装新版之前
-        // 那三个月的账，比这个新字段重要得多。
+    fn a_database_from_another_version_is_refused_rather_than_read() {
+        // 不迁移，也不硬读：版本对不上就说出来，由 `crate::open` 整个重建
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("data.db");
-        {
-            let db = Db::open(&p).unwrap();
-            db.insert(&row(1, 100)).unwrap();
-            db.insert(&row(2, 200)).unwrap();
-            // 装作是老版本建的库：把这一版之后加的列全撤掉，那时才有的表
-            // 换回那时的样子。
-            //
-            // **每加一列、每换一张表都要在这里补一行。**忘了补的话，这个
-            // 测试会以「duplicate column」之类失败 —— 那正是我们要的：它逼
-            // 着人来看一眼迁移，而不是悄悄绕过去。
-            db.conn
-                .execute_batch(
-                    "DROP INDEX requests_session;
-                     ALTER TABLE requests DROP COLUMN key_masked;
-                     ALTER TABLE requests DROP COLUMN peer;
-                     ALTER TABLE requests DROP COLUMN error_args;
-                     ALTER TABLE requests DROP COLUMN error_code;
-                     ALTER TABLE requests DROP COLUMN translated;
-                     ALTER TABLE requests DROP COLUMN price_source;
-                     ALTER TABLE requests DROP COLUMN cancelled;
-                     ALTER TABLE requests DROP COLUMN session;
-                     ALTER TABLE requests DROP COLUMN client_hint;
-                     DROP TABLE security_events;
-                     CREATE TABLE leaks (
-                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                         at_ms INTEGER NOT NULL,
-                         request_id INTEGER NOT NULL,
-                         provider TEXT NOT NULL,
-                         kind TEXT NOT NULL,
-                         masked TEXT NOT NULL
-                     );
-                     INSERT INTO leaks (at_ms, request_id, provider, kind, masked)
-                         VALUES (100, 1, 'relay', 'anthropic-api-key', 'sk-an…AAAA');",
-                )
-                .unwrap();
-            db.conn.pragma_update(None, "user_version", 5).unwrap();
+        for found in [SCHEMA - 1, SCHEMA + 1] {
+            {
+                let db = Db::open(&p).unwrap();
+                db.conn.pragma_update(None, "user_version", found).unwrap();
+            }
+            let e = Db::open(&p).unwrap_err();
+            assert!(
+                matches!(e, DbError::OtherVersion { found: f, .. } if f == found),
+                "{e:?}"
+            );
+            std::fs::remove_file(&p).unwrap();
         }
-        let db = Db::open(&p).unwrap();
-        assert_eq!(db.count().unwrap(), 2, "迁移把老记录弄丢了");
-        // 观察档留下的旧记录搬进了安全日志，而不是随那张表一起消失
-        let (logged, _) = db.security_events(None, 0, i64::MAX, None, 10).unwrap();
-        assert_eq!(logged.len(), 1, "{logged:?}");
-        assert_eq!(logged[0].guard, "redact");
-        assert_eq!(logged[0].action, "recorded");
-        assert_eq!(logged[0].rule, "anthropic-api-key");
-        assert_eq!(logged[0].excerpt, "sk-an…AAAA");
-        let got = db.recent(None, 10).unwrap();
-        // 老记录没有旁证，那就是 None —— 不是空字符串
-        assert!(got.iter().all(|r| r.client_hint.is_none()));
-        // 升级之前取消的请求根本不落库，所以老记录一条都不该是「已取消」
-        assert!(got.iter().all(|r| !r.cancelled));
-        // 老记录不知道当时用的是哪份价目表，那就是不知道
-        assert!(got.iter().all(|r| r.price_source.is_none()));
-        // 老记录没有落库的转换，那就是没有
-        assert!(got.iter().all(|r| r.translated.is_none()));
-        // 老记录不知道从哪台机器来，那就是没有 —— 不是「本机」
-        assert!(got.iter().all(|r| r.peer.is_none()));
-        let mut fresh = row(3, 300);
-        fresh.client_hint = Some("codex".into());
-        fresh.session = Some("abc-100".into());
-        fresh.peer = Some("192.168.1.23".into());
-        fresh.key_masked = Some("tw-re…wb4e".into());
-        db.insert(&fresh).unwrap();
-        let back = &db.recent(None, 1).unwrap()[0];
-        assert_eq!(back.client_hint.as_deref(), Some("codex"));
-        assert_eq!(back.session.as_deref(), Some("abc-100"));
-        assert_eq!(back.peer.as_deref(), Some("192.168.1.23"));
-        assert_eq!(back.key_masked.as_deref(), Some("tw-re…wb4e"));
-    }
-
-    #[test]
-    fn a_database_from_a_newer_version_says_so_instead_of_failing_weirdly() {
-        // **「schema 太新」要能识别出来并给一句人话**，而不是在某个
-        // SELECT 上以「no such column」告终。
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("data.db");
-        {
-            let db = Db::open(&p).unwrap();
-            db.conn.pragma_update(None, "user_version", 999).unwrap();
-        }
-        let e = Db::open(&p).unwrap_err();
-        assert!(matches!(e, DbError::TooNew { .. }), "{e:?}");
-        let m = e.to_string();
-        assert!(m.contains("Upgrade the app"), "{m}");
-        assert!(
-            m.contains("leaving the recorded requests where they are"),
-            "得说清历史记录的下场：{m}"
-        );
     }
 
     #[test]
     fn opening_the_same_database_twice_is_idempotent() {
-        // 迁移跑两遍不该出错 —— 每次启动都会跑一次。
+        // 每次启动都会打开一次，建过的表不该再建。
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("data.db");
         {
@@ -1994,13 +1789,13 @@ mod permission_tests {
 
 #[cfg(test)]
 mod cost_state_tests {
-    use super::tests::row;
+    use super::tests::{row, upstream_failed};
     use super::*;
 
     /// 响应头之前就失败了：没有状态码、没有用量、没有金额。
     fn failed_before_usage(id: i64, at: i64) -> RequestRow {
         let mut r = row(id, at);
-        r.error = Some(Msg::plain("`up` 返回 502 Bad Gateway"));
+        r.error = Some(upstream_failed("`up` 返回 502 Bad Gateway"));
         r.status = None;
         r.input_tokens = None;
         r.output_tokens = None;
@@ -2049,7 +1844,7 @@ mod cost_state_tests {
     fn a_failure_with_usage_and_an_unknown_model_is_still_unpriced() {
         let db = Db::in_memory().unwrap();
         let mut r = unknown_model(1, 100);
-        r.error = Some(Msg::plain("流中断：上游断开了"));
+        r.error = Some(upstream_failed("流中断：上游断开了"));
         db.insert(&r).unwrap();
         assert_eq!(db.summary(0, 1000).unwrap().unpriced_requests, 1);
     }
@@ -2116,7 +1911,7 @@ mod cost_state_tests {
         let mut broken = served.clone();
         broken.id = 2;
         broken.at_ms = 200;
-        broken.error = Some(Msg::plain("流中断：上游断开了"));
+        broken.error = Some(upstream_failed("流中断：上游断开了"));
         for mut r in [served, broken, row(3, 300), unknown_model(4, 400)] {
             r.session = Some("s1".into());
             db.insert(&r).unwrap();

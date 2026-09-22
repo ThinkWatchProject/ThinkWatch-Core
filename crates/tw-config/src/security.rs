@@ -32,6 +32,7 @@
 //! 不是数据，而且住在这里白捡了变更历史和一键回滚。
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -170,8 +171,7 @@ pub struct ToolPolicy {
     /// 内置规则在拦截档下做什么，**只写和出厂不一样的**：`rm-rf-root: cut`。
     ///
     /// 内置规则提供的只是一条正则和一个出厂的处置；命中之后切不切，和自定义
-    /// 规则一样由用户定。认不出的 id 和 `enable` / `disable` 里的一样，报出来、
-    /// 不拒绝整份配置。
+    /// 规则一样由用户定。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub actions: BTreeMap<String, ToolAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -188,6 +188,35 @@ impl RedactPolicy {
     }
 }
 
+/// 内置规则的清单，编译进二进制。
+///
+/// **放在这里而不是 tw-scan**：`config.yaml` 按 id 引用其中「危险命令」那一组
+/// （`security.inspect_tools` 的 `enable` / `disable` / `actions`），校验要认得出
+/// 这些 id，而 tw-scan 依赖本 crate、反过来引用不了。规则怎么编译、怎么匹配
+/// 仍然是 tw-scan 的事。
+pub const BUILTIN_RULES: &str = include_str!("../data/rules.yaml");
+
+/// 工具调用审查的内置规则 id：[`BUILTIN_RULES`] 里「危险命令」那一组。
+fn tool_rule_ids() -> &'static [String] {
+    #[derive(Deserialize)]
+    struct File {
+        dangerous: Vec<Spec>,
+    }
+    #[derive(Deserialize)]
+    struct Spec {
+        id: String,
+    }
+    static IDS: OnceLock<Vec<String>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        serde_yaml_ng::from_str::<File>(BUILTIN_RULES)
+            .expect("the built-in rules file parses, and a test keeps it so")
+            .dangerous
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    })
+}
+
 /// 两项防护。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,6 +228,28 @@ pub struct Security {
 }
 
 impl Security {
+    /// 第一个认不出的内置规则 id，连同它写在哪一项下面。
+    ///
+    /// **认不出就是配置错**，和写错一个字段名一样：静默跳过的话，它的表现是
+    /// 「我明明停用了它，怎么还在报」。
+    pub(crate) fn unknown_rule(&self) -> Option<(&'static str, &str)> {
+        let r = &self.redact;
+        let t = &self.inspect_tools;
+        r.enable
+            .iter()
+            .chain(&r.disable)
+            .find(|id| tw_redact::rules::builtin(id).is_none())
+            .map(|id| ("redact", id.as_str()))
+            .or_else(|| {
+                t.enable
+                    .iter()
+                    .chain(&t.disable)
+                    .chain(t.actions.keys())
+                    .find(|id| !tool_rule_ids().contains(id))
+                    .map(|id| ("inspect_tools", id.as_str()))
+            })
+    }
+
     /// 「拦截」态在这项防护上具体做什么。
     ///
     /// **界面上要显示各自的动词，不要统一叫「拦截」** —— 两件事差得很远，
@@ -281,14 +332,6 @@ mod tests {
         // 而它还在跑；或者以为自己开了拦截，而它只在观察。
         assert!(serde_yaml_ng::from_str::<Security>("redact:\n  mode: observ").is_err());
         assert!(serde_yaml_ng::from_str::<Security>("redcat:\n  mode: off").is_err());
-    }
-
-    #[test]
-    fn the_old_one_word_form_is_not_read() {
-        // 以前是 `redact: enforce`。项目还没有存量用户，不做兼容：读不懂就
-        // 说读不懂，而不是悄悄当成默认值。
-        assert!(serde_yaml_ng::from_str::<Security>("redact: enforce").is_err());
-        assert!(serde_yaml_ng::from_str::<Security>("scan_configs: observe").is_err());
     }
 
     #[test]

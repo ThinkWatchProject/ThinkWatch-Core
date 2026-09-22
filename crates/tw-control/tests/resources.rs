@@ -104,6 +104,54 @@ fn relay(name: &str) -> serde_json::Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────── 概览
+
+/// 概览自带改配置要用的版本号：和 `GET /config` 的一样，改完跟着换。
+///
+/// 文件改坏了、旧配置还在服务时，给的是**文件**的版本 —— 拿它去改得到的是
+/// 「文件读不懂」（400），而不是刷新多少次都没用的「版本对不上」（409）。
+#[tokio::test]
+async fn the_overview_carries_the_version_an_edit_is_based_on() {
+    let b = bed(BASE);
+    let version = |body: &str| json(body)["config_version"].as_str().unwrap().to_string();
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let before = version(&body);
+    let (_, body) = call(&b.app, "GET", "/config", serde_json::Value::Null).await;
+    assert_eq!(json(&body)["version"], before.as_str(), "{body}");
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "base_version": before,
+            "ops": [{ "op": "replace", "path": "/limits/per_provider", "value": 7 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let written = json(&body)["version"].as_str().unwrap().to_string();
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(version(&body), written);
+    assert_ne!(written, before);
+
+    let broken = format!("{}providers: [\n", b.file());
+    std::fs::write(b.dir.path().join("config.yaml"), &broken).unwrap();
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let now = version(&body);
+    assert_eq!(now, tw_config::store::version_of(&broken));
+    let edit = |base: String| {
+        serde_json::json!({
+            "base_version": base,
+            "ops": [{ "op": "replace", "path": "/limits/per_provider", "value": 8 }],
+        })
+    };
+    let (st, body) = call(&b.app, "PATCH", "/config", edit(written)).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    let (st, body) = call(&b.app, "PATCH", "/config", edit(now)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
 // ─────────────────────────────────────────────────────────── 上游
 
 #[tokio::test]

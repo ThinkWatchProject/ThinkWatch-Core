@@ -149,7 +149,7 @@ async fn a_request_in_the_history_says_which_session_it_belongs_to() {
     };
     assert_eq!(by_id(1)["session"], "s1");
     assert_eq!(by_id(2)["session"], "s1");
-    // 认不出会话的请求（拼不出指纹的、老记录）不该冒充属于某一次
+    // 认不出会话的请求（拼不出指纹的）不该冒充属于某一次
     assert!(by_id(3).get("session").is_none(), "{}", by_id(3));
 
     // 会话那一端报的是同一个 id —— 两边对得上才走得通

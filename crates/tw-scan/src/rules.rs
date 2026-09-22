@@ -1,6 +1,7 @@
 //! 规则集。
 //!
-//! 内置那一份编译进二进制（`data/rules.yaml`），两处在用：
+//! 内置那一份编译进二进制（tw-config 的 `data/rules.yaml`：`config.yaml` 按 id
+//! 引用其中的规则，校验要认得出），两处在用：
 //!
 //! - **客户端配置扫描**用全部内置规则（[`scan_rules`]），不受用户改动影响。
 //!   安全页上的规则只作用于经过网关的请求 —— 两件事各管各的，用户在那边
@@ -24,7 +25,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// 编译进二进制的那一份。
-pub const BUILTIN: &str = include_str!("../data/rules.yaml");
+pub const BUILTIN: &str = tw_config::BUILTIN_RULES;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +54,6 @@ impl RuleSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleFile {
-    pub version: u32,
     #[serde(default)]
     pub injection: Vec<RuleSpec>,
     #[serde(default)]
@@ -88,9 +88,6 @@ pub struct Rule {
 #[derive(Debug, Clone)]
 pub struct Rules {
     pub rules: Vec<Rule>,
-    /// 认不出的规则 id（`enable` / `disable` 里写的）。**要说出来** —— 多半
-    /// 是拼错了，而它的表现是「我明明停用了它，怎么还在报」
-    pub warnings: Vec<String>,
 }
 
 /// 内置规则文件，解析一次。
@@ -135,10 +132,7 @@ pub fn scan_rules() -> Rules {
         .chain(f.dangerous.iter().map(|s| (s, "dangerous")))
         .map(|(s, g)| compile(s, g, false).expect("the built-in patterns compile"))
         .collect();
-    Rules {
-        rules,
-        warnings: Vec::new(),
-    }
+    Rules { rules }
 }
 
 /// 工具调用审查用的：内置的危险命令规则，按用户的启停过一遍，再加上启用着
@@ -148,12 +142,6 @@ pub fn scan_rules() -> Rules {
 /// 了校验，照样当错误返回，不静默跳过。
 pub fn tool_rules(p: &tw_config::ToolPolicy) -> Result<Rules, RuleError> {
     let f = builtin();
-    let mut warnings = Vec::new();
-    for id in p.enable.iter().chain(&p.disable).chain(p.actions.keys()) {
-        if !f.dangerous.iter().any(|s| &s.id == id) && !warnings.contains(id) {
-            warnings.push(id.clone());
-        }
-    }
     let mut rules = Vec::new();
     for s in &f.dangerous {
         if p.disable.contains(&s.id) {
@@ -177,7 +165,7 @@ pub fn tool_rules(p: &tw_config::ToolPolicy) -> Result<Rules, RuleError> {
         };
         rules.push(compile(&spec, "dangerous", true)?);
     }
-    Ok(Rules { rules, warnings })
+    Ok(Rules { rules })
 }
 
 /// 只有这一条正则的规则集。界面上新建规则时「测试」用它。
@@ -197,7 +185,6 @@ pub fn single(name: &str, pattern: &str, high: bool) -> Result<Rules, RuleError>
     }
     Ok(Rules {
         rules: vec![compile(&spec, "dangerous", true)?],
-        warnings: Vec::new(),
     })
 }
 
@@ -209,7 +196,6 @@ pub fn one_builtin(id: &str, p: &tw_config::ToolPolicy) -> Option<Rules> {
     let rule = compile(spec, "dangerous", false).expect("the built-in patterns compile");
     Some(Rules {
         rules: vec![with_action(rule, p)],
-        warnings: Vec::new(),
     })
 }
 
@@ -255,7 +241,6 @@ mod tests {
             actions: [
                 ("rm-rf-root".to_string(), tw_config::ToolAction::Cut),
                 ("curl-pipe-sh".to_string(), tw_config::ToolAction::Record),
-                ("no-such-rule".to_string(), tw_config::ToolAction::Cut),
             ]
             .into(),
             ..Default::default()
@@ -266,7 +251,6 @@ mod tests {
         assert!(!high("curl-pipe-sh"));
         // 没改的照出厂
         assert!(high("base64-decode-exec"));
-        assert_eq!(rs.warnings, vec!["no-such-rule".to_string()]);
         // 只试一条的时候也按改过的来
         assert!(one_builtin("rm-rf-root", &p).unwrap().rules[0].high);
     }
@@ -466,7 +450,6 @@ mod tests {
         assert!(mine.custom, "界面上要分得开哪些是用户加的");
         assert!(mine.high, "写明了切断却没有切断");
         assert!(mine.re.is_match("kubectl delete ns prod"));
-        assert!(rs.warnings.is_empty(), "{:?}", rs.warnings);
     }
 
     #[test]
@@ -485,14 +468,6 @@ mod tests {
         assert!(!rs.rules.iter().any(|x| x.id == "chmod-777"));
         // 别的照常在
         assert!(rs.rules.iter().any(|x| x.id == "curl-pipe-sh"));
-        assert!(rs.warnings.is_empty(), "{:?}", rs.warnings);
-    }
-
-    #[test]
-    fn switching_off_an_id_that_does_not_exist_is_said_out_loud() {
-        // 多半是拼错了，而它的表现是「我明明停用了它，怎么还在报」。
-        let rs = tool_rules(&policy(&["chmod777"], &[])).unwrap();
-        assert_eq!(rs.warnings, vec!["chmod777".to_string()]);
     }
 
     #[test]

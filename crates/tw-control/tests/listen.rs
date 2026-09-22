@@ -185,7 +185,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "lan", "port": free_port() }),
+        serde_json::json!({ "bind": "192.168.1.5@wifi", "port": free_port() }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");

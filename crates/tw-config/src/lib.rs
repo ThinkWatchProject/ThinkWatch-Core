@@ -27,8 +27,9 @@ pub use init::{generate_initial, generate_key};
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
 
-/// 配置 schema 的版本。和应用的 CalVer 是两回事 —— 这个只决定要不要
-/// 跑迁移。
+/// 配置文件格式的版本，和应用的 CalVer 是两回事。**不迁移**：格式变了就
+/// 直接改，旧写法读不进来时报的是那个字段本身的错。它只挡住一种情况 ——
+/// 更新版本的程序写的文件交给了旧程序。
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub const DEFAULT_GATEWAY_PORT: u16 = 8788;
@@ -296,11 +297,8 @@ impl Default for GatewayListen {
 /// bind: all           # 0.0.0.0，所有网卡
 /// ```
 ///
-/// **以前这里有个 `lan`，它是假的。**`lan` 和 `all` 绑的是同一个地址
-/// `0.0.0.0`，区别只在 `allow_from` 的默认值 —— 也就是说它是个白名单
-/// 概念，伪装成了网卡选择。用户在界面上选「局域网」，以为网关只在局域
-/// 网那张网卡上监听，实际上它在**所有**网卡上监听，包括公网那张。
-/// 现在要真的只在局域网网卡上听，**写那张网卡的名字**（`en0`）。
+/// **只在局域网那张网卡上听，就写那张网卡的名字**（`en0`）。白名单只按
+/// 来源地址放行，它替代不了「根本不在别的网卡上监听」。
 ///
 /// 写名字而不是写地址，是因为地址会变：DHCP 续租、换个 Wi-Fi，
 /// `192.168.1.5` 就不在了，网关起不来，而系统给的错误只有一句
@@ -455,17 +453,6 @@ impl<'de> Deserialize<'de> for Bind {
                 //
                 // 但形状要核：拼错成 `lookback` 的话，当成网卡名收下就
                 // 成了一个到启动才炸的错误，而它本来可以在这里就说清楚。
-                // **`lan` 曾经是个合法关键字。**它形状上像网卡名，收下
-                // 之后给的会是「没有叫 lan 的网卡」—— 而真相是这个写法被
-                // 去掉了，以及为什么。老配置升上来时要读到后者。
-                if other == "lan" {
-                    return Err(serde::de::Error::custom(
-                        "`bind: lan` is gone. It bound 0.0.0.0, every interface including \
-                         a public one, and only differed in defaulting the allow-list to \
-                         the private ranges. To listen on the local network alone, name \
-                         that interface, for example en0",
-                    ));
-                }
                 if looks_like_nic(other) {
                     return Ok(Bind::Nic(other.to_string()));
                 }
@@ -484,7 +471,7 @@ impl<'de> Deserialize<'de> for Bind {
 impl GatewayListen {
     /// 实际生效的来源白名单。
     ///
-    /// **`lan` / `all` 且用户没写白名单时，默认填私网段** ——
+    /// **暴露在局域网、而用户没写白名单时，默认填私网段** ——
     /// 而不是放行所有。想放开得手动写 `0.0.0.0/0`，那时他至少知道自己
     /// 做了什么。
     pub fn effective_allow_from(&self) -> Vec<String> {
@@ -1006,8 +993,8 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
 pub use security::{
-    CustomRedactRule, CustomToolRule, Mode as SecurityMode, RedactPolicy, Security, ToolAction,
-    ToolPolicy,
+    BUILTIN_RULES, CustomRedactRule, CustomToolRule, Mode as SecurityMode, RedactPolicy, Security,
+    ToolAction, ToolPolicy,
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
@@ -1127,8 +1114,8 @@ providers:
 
     #[test]
     fn bind_accepts_a_concrete_interface_address() {
-        // 这是 `lan` 被换掉的理由：想「只在局域网那张网卡上听」，
-        // 以前只能写 `lan`，而它绑的是 0.0.0.0 —— 所有网卡，包括公网那张。
+        // 想「只在局域网那张网卡上听」，就写那张网卡的地址或名字 ——
+        // 绑 0.0.0.0 会连公网那张一起听。
         let b: Bind = serde_yaml_ng::from_str("192.168.1.5").unwrap();
         assert_eq!(b, Bind::Addr("192.168.1.5".parse().unwrap()));
         assert_eq!(b.socket_string(), "192.168.1.5");
@@ -1224,17 +1211,6 @@ providers:
             e.contains("192.168.1.5@wifi"),
             "没把写错的那个词说出来：{e}"
         );
-    }
-
-    /// `lan` 是真存在过的关键字，老配置里可能还写着它。形状上它像网卡名，
-    /// 收下之后给的是「没有叫 lan 的网卡」—— 而用户要读到的是它为什么没了。
-    #[test]
-    fn the_old_lan_keyword_explains_itself_instead_of_looking_like_an_interface() {
-        let e = serde_yaml_ng::from_str::<Bind>("lan")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("0.0.0.0"), "没说清它其实绑的是什么：{e}");
-        assert!(e.contains("en0"), "没说改成写什么：{e}");
     }
 
     #[test]

@@ -244,6 +244,12 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         None => 0,
     };
     Json(tw_api::Overview {
+        // **磁盘上那一份的版本，不是正在服务的那一份。**改配置时核对的是
+        // 文件（见 `ConfigManager::write`）。两者只在文件被改坏、旧配置还在
+        // 服务时不一样：这时拿文件的版本去改，得到的是「文件读不懂」，而不是
+        // 一句刷新多少次都没用的「版本对不上」。读不到文件时是空串，拿它去
+        // 改会得到读不到文件的那个错误。
+        config_version: s.cfg.current().map(|l| l.version()).unwrap_or_default(),
         proxies: cfg
             .proxies
             .iter()

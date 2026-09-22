@@ -331,31 +331,18 @@ impl RuleSet {
     /// 按配置建：在默认之上打开 `enable`、关掉 `disable`，再加上启用着的
     /// 自定义规则。
     ///
-    /// 返回值的第二项是**认不出的 id**。它们不是错误 —— 一条内置规则将来
-    /// 可能改名或删掉，用户配置里停用过它的那一行不该因此让整份配置失效 ——
-    /// 但要说出来：多半是拼错了，而它的表现是「我明明停用了它，怎么还在报」。
+    /// 认不出的 id 在配置校验时就拒绝了（`tw_config::validate`），到不了这里。
     pub fn build<'a>(
         enable: &[String],
         disable: &[String],
         custom: impl IntoIterator<Item = (&'a str, &'a str)>,
-    ) -> Result<(Self, Vec<String>), BadPattern> {
+    ) -> Result<Self, BadPattern> {
         let mut set = Self::defaults();
-        let mut unknown = Vec::new();
-        for id in enable {
-            match builtin(id) {
-                Some(b) => {
-                    set.on.insert(b.id);
-                }
-                None => unknown.push(id.clone()),
-            }
+        for b in enable.iter().filter_map(|id| builtin(id)) {
+            set.on.insert(b.id);
         }
-        for id in disable {
-            match builtin(id) {
-                Some(b) => {
-                    set.on.remove(b.id);
-                }
-                None => unknown.push(id.clone()),
-            }
+        for b in disable.iter().filter_map(|id| builtin(id)) {
+            set.on.remove(b.id);
         }
         for (name, pattern) in custom {
             set.custom.push(Custom {
@@ -363,7 +350,7 @@ impl RuleSet {
                 re: compile(name, pattern)?,
             });
         }
-        Ok((set, unknown))
+        Ok(set)
     }
 
     /// 再加一条自定义规则。
@@ -967,8 +954,7 @@ mod tests {
         // RFC1918 地址在代码和文档里到处都是，而它的危害远小于一把 key。
         let t = "内网 10.1.2.3，内部域名 build.corp.internal";
         assert!(scan(t, &RuleSet::defaults()).is_empty());
-        let (set, unknown) = RuleSet::build(&["internal-ip".into()], &[], []).unwrap();
-        assert!(unknown.is_empty());
+        let set = RuleSet::build(&["internal-ip".into()], &[], []).unwrap();
         let got = scan(t, &set);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].rule, Rule::Builtin("internal-ip"));
@@ -979,26 +965,14 @@ mod tests {
         // 关掉 Anthropic 那条之后，`sk-ant-…` 不该被当成一把 OpenAI 老式
         // key 换掉 —— 用户关掉的正是「这种东西不要换」。
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1234";
-        let (set, _) = RuleSet::build(&[], &["anthropic-api-key".into()], []).unwrap();
+        let set = RuleSet::build(&[], &["anthropic-api-key".into()], []).unwrap();
         assert!(scan(key, &set).is_empty(), "{:?}", scan(key, &set));
         assert_eq!(scan(key, &RuleSet::defaults()).len(), 1);
     }
 
     #[test]
-    fn an_unknown_rule_id_is_reported_rather_than_failing_the_whole_set() {
-        // 多半是拼错了；也可能是一条后来改了名的内置规则。都不该让整套停摆。
-        let (set, unknown) =
-            RuleSet::build(&["internal-ipp".into()], &["jwtt".into()], []).unwrap();
-        assert_eq!(
-            unknown,
-            vec!["internal-ipp".to_string(), "jwtt".to_string()]
-        );
-        assert!(set.is_on("jwt"));
-    }
-
-    #[test]
     fn a_custom_rule_is_found_alongside_the_builtin_ones() {
-        let (set, _) = RuleSet::build(&[], &[], [("公司令牌", r"corp_[A-Za-z0-9]{8}")]).unwrap();
+        let set = RuleSet::build(&[], &[], [("公司令牌", r"corp_[A-Za-z0-9]{8}")]).unwrap();
         let t = "令牌 corp_ABCD1234 和 sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
         let got = scan(t, &set);
         assert_eq!(got.len(), 2, "{got:?}");
