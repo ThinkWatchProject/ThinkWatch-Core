@@ -59,7 +59,6 @@ fn app_with(text: &str) -> (tempfile::TempDir, axum::Router) {
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
-        gateway_addr: None,
         store: None,
         started: std::time::Instant::now(),
         price_updater: Default::default(),

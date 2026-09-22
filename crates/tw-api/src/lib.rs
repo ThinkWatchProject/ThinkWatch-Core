@@ -30,7 +30,10 @@ pub use tw_types::Msg;
 /// **4 把安全改成了全局的。**上游不再有信任级别和脱敏类别，路由规则不再有
 /// 安全要求；两项防护各有自己的规则和日志，出站检测的两条事件合成了一条。
 /// 照 3 写的界面会去读已经不存在的字段，所以跳号。
-pub const CONTROL_API_VERSION: u32 = 4;
+///
+/// **5 去掉了全局并发上限**（`limits.max_concurrent`），`GET /keys` 改给明文，
+/// 状态里的监听地址跟着真实的监听器走。照 4 写的界面会画出一个空的「全局」格子。
+pub const CONTROL_API_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -38,9 +41,16 @@ pub struct Status {
     /// 二进制的 CalVer
     pub version: String,
     pub pid: u32,
-    /// 数据面在监听哪儿。安全模式下是 None —— 那正是「只起控制面」的
-    /// 可观测形态。
+    /// 数据面**此刻**在监听哪儿：配置里写的那个地址（绑网卡时顺带开着的
+    /// 回环不在这里）。安全模式下是 None —— 那正是「只起控制面」的可观测形态。
+    ///
+    /// **跟着真实的监听器走。**换了端口、网关已经在新端口上服务之后，这里
+    /// 就是新的；换不成的时候这里仍是旧的，原因在 `listen_error`。
     pub gateway_addr: Option<String>,
+    /// 配置里的监听地址没能换上的原因（端口被占、网卡没有地址）。**这时
+    /// 旧的地址还在服务**，也就是 `gateway_addr` 说的那个
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_error: Option<Msg>,
     pub config_path: String,
     pub clients: usize,
     pub providers: usize,
@@ -424,6 +434,21 @@ pub enum Event {
         reset_in_secs: Option<u64>,
         at_ms: u64,
     },
+    /// 数据面换了监听地址，或者没换成（旧的还在服务）。
+    ///
+    /// **和 `ConfigReloaded` 是两件事。**配置换进去之后监听器才开始换，
+    /// 新地址绑不绑得上要再过一会儿才知道 —— 界面只听配置那一条的话，
+    /// 读到的永远是换之前的地址。
+    ListenChanged {
+        id: u64,
+        /// 此刻在听的那个地址，同 `Status::gateway_addr`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addr: Option<String>,
+        /// 没换成的原因。换成了就没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<Msg>,
+        at_ms: u64,
+    },
     /// 配置换了一份新的进去，已经生效。
     ///
     /// **界面靠它知道自己手里那份过期了。**没有它，用户在编辑器里改完
@@ -552,6 +577,7 @@ impl Event {
             | Event::RequestCancelled { id, .. }
             | Event::LocallyAnswered { id, .. }
             | Event::ConfigReloaded { id, .. }
+            | Event::ListenChanged { id, .. }
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
@@ -656,8 +682,6 @@ pub struct ProbeView {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LimitsView {
-    /// 全局并发
-    pub max_concurrent: usize,
     /// 单个上游
     pub per_provider: usize,
     /// 队列上限。满了才真的拒绝
@@ -908,7 +932,8 @@ pub struct GroupView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientView {
     pub name: String,
-    /// 已脱敏
+    /// `GET /keys` 给明文 —— 密钥页要把它原样显示出来、给出复制按钮。
+    /// `GET /overview` 里是脱敏的：概览到处都在读，它用不着密钥的值
     pub key: String,
     pub max_concurrent: Option<usize>,
     /// 绑的那条路由。`None` = 走默认路由
@@ -998,6 +1023,22 @@ pub struct KeySyncFailed {
     pub error: String,
 }
 
+/// 保存监听设置（`PUT /listen`）。
+///
+/// **三项一起存**，而不是三个补丁：从「仅本机」换到「局域网」时网卡和
+/// 端口往往一起改，分开存的话中间那一版监听在一个用户没选过的地址上。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListenSave {
+    /// 同配置里的 `listen.gateway.bind`：`loopback` / `all` / 网卡名 / 地址
+    pub bind: String,
+    pub port: u16,
+    /// 放行网段。**只在监听超出本机时有意义**；空 = 按私网段放行
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
 /// 设默认密钥（`PUT /default_key`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DefaultKeySave {
@@ -1006,10 +1047,8 @@ pub struct DefaultKeySave {
     pub base_version: Option<String>,
 }
 
-/// 一把密钥的明文（`GET /keys/{name}/value`）。
-///
-/// **单独一个接口，而不是放进列表**：列表是一直在刷的，而明文只在用户
-/// 点「复制」的那一刻需要。
+/// 一把密钥的明文（`GET /keys/{name}/value`）。「复制」按名字取此刻配置里的
+/// 值，不依赖界面手里那份列表是不是最新的。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyValue {
     pub name: String,
@@ -3034,6 +3073,7 @@ mod tests {
             version: "2026.9.0".into(),
             pid: 1,
             gateway_addr: Some("127.0.0.1:8788".into()),
+            listen_error: None,
             config_path: "/x/config.yaml".into(),
             clients: 1,
             providers: 1,

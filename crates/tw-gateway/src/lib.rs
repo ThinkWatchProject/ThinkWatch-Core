@@ -22,6 +22,7 @@ pub mod l1;
 pub mod l3;
 pub mod latency;
 pub mod limits;
+pub mod listen;
 pub mod live;
 pub mod models;
 pub mod oauth;
@@ -46,8 +47,9 @@ pub use l1::{
 };
 pub use l3::{Estimate, L3Result};
 pub use limits::{Gate, LimitError, Limits};
+pub use listen::{Listening, bind_failure, serve_at};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quota::{Quota, from_headers as quota_from_headers};
 pub use quote::Quote;
-pub use server::{AppState, Runtime, client_for_provider, router, serve, serve_following_config};
+pub use server::{AppState, Runtime, client_for_provider, router, serve};
 pub use usage::{Sniffer, Usage};

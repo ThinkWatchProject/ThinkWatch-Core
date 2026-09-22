@@ -462,6 +462,7 @@ impl Recorder {
             | Event::ModelsChanged { .. }
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
+            | Event::ListenChanged { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
             | Event::RequestPriced { .. } => {}
         }

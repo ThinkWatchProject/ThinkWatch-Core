@@ -425,6 +425,11 @@ impl Default for Retention {
 
 /// 并发上限。住在 tw-types 是因为配置和数据面都要认
 /// 它，而它本身只是几个数字 —— 不该为此让 tw-config 依赖 tw-gateway。
+///
+/// **没有全局上限。**一个本机网关同时在跑的请求，就是这台电脑上几个客户端
+/// 各自开着的那几个会话；再压一道总闸，挡住的只会是用户自己的并行任务。
+/// 要防的是另外两件事：一个变慢的上游占住所有请求（`per_provider`），和
+/// 某一把密钥后面的失控脚本（密钥自己的 `max_concurrent`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // 配置里的每一个结构都拒未知字段，唯独这一个在 tw-types 里，漏了。
 // 表现是 `max_body_bytes: 8388608` 写进去不报错、也不生效 —— 用户改
@@ -432,9 +437,6 @@ impl Default for Retention {
 // 的线上类型，上游随时会加字段，那些恰恰不能拒。）
 #[serde(deny_unknown_fields)]
 pub struct Limits {
-    /// 全局并发
-    #[serde(default = "d_max_concurrent")]
-    pub max_concurrent: usize,
     /// 单个上游
     #[serde(default = "d_per_provider")]
     pub per_provider: usize,
@@ -446,9 +448,6 @@ pub struct Limits {
     pub queue_timeout_secs: u64,
 }
 
-fn d_max_concurrent() -> usize {
-    16
-}
 fn d_per_provider() -> usize {
     8
 }
@@ -462,7 +461,6 @@ fn d_queue_timeout() -> u64 {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_concurrent: d_max_concurrent(),
             per_provider: d_per_provider(),
             queue_depth: d_queue_depth(),
             queue_timeout_secs: d_queue_timeout(),

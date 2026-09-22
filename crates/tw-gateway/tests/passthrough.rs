@@ -814,7 +814,6 @@ async fn over_the_concurrency_limit_requests_queue_instead_of_being_refused() {
     let gw = serve_cfg(cfg_with_limits(
         up,
         tw_config::Limits {
-            max_concurrent: 2,
             per_provider: 2,
             queue_depth: 64,
             queue_timeout_secs: 30,
@@ -851,7 +850,6 @@ async fn a_full_queue_refuses_with_429_rather_than_growing_without_bound() {
     let gw = serve_cfg(cfg_with_limits(
         up,
         tw_config::Limits {
-            max_concurrent: 1,
             per_provider: 1,
             queue_depth: 3,
             queue_timeout_secs: 30,
@@ -892,7 +890,6 @@ async fn a_per_client_limit_keeps_one_client_from_taking_everything() {
     let mut cfg = cfg_with_limits(
         up,
         tw_config::Limits {
-            max_concurrent: 8,
             per_provider: 8,
             queue_depth: 64,
             queue_timeout_secs: 30,
@@ -913,7 +910,7 @@ async fn a_per_client_limit_keeps_one_client_from_taking_everything() {
         .map(|r| r.unwrap())
         .collect();
     assert!(codes.iter().all(|&c| c == 200), "{codes:?}");
-    // 全局给了 8，但这个客户端只有 1 —— 三个维度取最严的那个
+    // 单个上游给了 8，但这个客户端只有 1 —— 两个维度取最严的那个
     assert_eq!(peak.load(Ordering::SeqCst), 1);
 }
 
@@ -1392,13 +1389,15 @@ async fn intercepting_a_probe_emits_its_own_event_not_a_request_pair() {
         vec![],
     );
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let mut rx = state.bus.subscribe();
     let addr = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     };
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let st = state.clone();
+    tokio::spawn(async move { tw_gateway::serve(st, addr).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
+    // 监听起来时报的那一条不算：这里只看请求带出来的事件
+    let mut rx = state.bus.subscribe();
 
     reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))

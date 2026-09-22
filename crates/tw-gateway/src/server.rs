@@ -250,6 +250,9 @@ pub struct AppState {
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
     relisten: Arc<tokio::sync::Notify>,
+    /// 此刻在听的地址。**跟着真实的监听器走，不是启动时记的一次** —— 见
+    /// [`crate::listen`]。
+    pub(crate) listening: Arc<std::sync::Mutex<crate::listen::Listening>>,
     /// OAuth 的 access token。
     ///
     /// **在内存里，跨重载存活。**access token 是派生状态 —— 不是用户输入
@@ -339,6 +342,7 @@ impl AppState {
             body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             relisten: Arc::new(tokio::sync::Notify::new()),
+            listening: Arc::new(std::sync::Mutex::new(Default::default())),
             oauth: Arc::new(crate::oauth::Cache::new()),
             latency: Arc::new(crate::latency::Latency::new()),
             pricing: tw_pricing::shared(tw_pricing::PriceBook::new(
@@ -813,6 +817,10 @@ impl AppState {
         self.rt.load().config.clone()
     }
 
+    pub(crate) fn relisten_signal(&self) -> &tokio::sync::Notify {
+        &self.relisten
+    }
+
     pub fn gate(&self) -> Arc<crate::limits::Gate> {
         self.gate.load_full()
     }
@@ -915,8 +923,9 @@ impl AppState {
         let limits_changed = old.config.limits != config.limits;
         let new_limits = config.limits.clone();
         let next = Runtime::build(config, Some(&old))?;
-        let relisten =
-            old.config.listen.gateway.socket_addr() != next.config.listen.gateway.socket_addr();
+        // 比的是写法不是解析出来的地址：网卡名要问系统，而那是监听那一边的事
+        let (was, now) = (&old.config.listen.gateway, &next.config.listen.gateway);
+        let relisten = was.bind != now.bind || was.port != now.port;
         // 自定义价目表和上游的选择跟着配置走，默认价目表不变
         let (sheets, assign) = (next.config.pricing.clone(), next.config.price_assign());
         self.pricing
@@ -931,7 +940,7 @@ impl AppState {
         if relisten {
             // 只通知，不在这里重建 —— 换监听器要 await，而这个函数被
             // 文件监听那条同步路径调用。谁在监听谁去换。
-            self.relisten.notify_waiters();
+            self.relisten();
         }
         if limits_changed {
             self.gate
@@ -2600,73 +2609,9 @@ pub async fn seed_latency(state: &AppState) {
     }
 }
 
-/// 起服务。返回实际绑定的地址 —— 端口写 0 时调用方需要知道拿到了哪个。
+/// 在一个地址上起服务，**不跟配置走**。测试和命令行 `--port` 用它。
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
-    serve_once(state, addr, std::future::pending()).await
-}
-
-/// 起服务，**并且跟着配置里的监听地址走**（「温」）。
-///
-/// 换端口时：新监听器先起来，旧的停止接受新连接并**等现有请求自然
-/// 结束** —— 一个跑了六分钟的流不该因为你改了个端口而断掉。
-///
-/// 命令行给了 `--port` 时不要用这个：那是一个显式的覆盖，不该被配置
-/// 文件推翻。
-pub async fn serve_following_config(
-    state: AppState,
-    addr: std::net::SocketAddr,
-) -> std::io::Result<()> {
-    let mut next = addr;
-    loop {
-        let relisten = state.relisten.clone();
-        // **先订阅再进循环。**`notified()` 要在可能发生通知之前建好，
-        // 否则重建监听器那几毫秒里来的通知会丢，于是端口改了两次只生效
-        // 一次 —— 而那种「有时候生效有时候不」最难查。
-        let wait = async move {
-            relisten.notified().await;
-        };
-        serve_once(state.clone(), next, wait).await?;
-        let want = match state.runtime().config.listen.gateway.socket_addr() {
-            Ok(a) => a,
-            // **新配置的地址算不出来就守住旧的。**`bind` 指着一张刚被拔掉
-            // 的网卡时，正确的动作不是把一个正在工作的监听器拆掉 —— 那会
-            // 让所有客户端立刻断线，而它们本来好好的。
-            Err(e) => {
-                tracing::error!(%e, keeping = %next, "the new listen address cannot be resolved");
-                continue;
-            }
-        };
-        if want == next {
-            // 通知来了但地址没变（比如又改回去了）—— 原样重来
-            continue;
-        }
-        tracing::info!(from = %next, to = %want, "the listen address changed; rebuilding the listener");
-        next = want;
-    }
-}
-
-/// 一次监听。`until` 完成时优雅停止：不再接受新连接，已经在跑的请求
-/// 自己跑完。
-async fn serve_once(
-    state: AppState,
-    addr: std::net::SocketAddr,
-    until: impl std::future::Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual = listener.local_addr()?;
-    if !state.runtime().allow.is_empty() {
-        tracing::info!(%actual, "the gateway is listening (source allow-list in effect)");
-    } else {
-        tracing::info!(%actual, "the gateway is listening");
-    }
-    // `into_make_service_with_connect_info` 是拿到对端地址的唯一办法 ——
-    // 少了它，来源白名单收到的永远是 unwrap 出来的默认值。
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(until)
-    .await
+    crate::listen::serve_at(state, vec![addr], false).await
 }
 
 /// 上游回了话的一跳：`served` 或者 `status`。
