@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use tw_api::Msg;
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 14;
+const SCHEMA: i64 = 15;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -80,6 +80,8 @@ pub struct RequestRow {
     /// 请求头透出来的旁证。**可以伪造** —— 只用来显示和判断接管有没有
     /// 生效，从不参与鉴权、路由或配额
     pub client_hint: Option<String>,
+    /// 非本机来的请求的来源地址（这条连接对面的地址）。本机来的是 None
+    pub peer: Option<String>,
     /// 这条属于哪一次任务。**指纹 + 起始时刻**，老记录是 None
     pub session: Option<String>,
     pub provider: String,
@@ -388,6 +390,12 @@ impl Db {
                  ALTER TABLE requests DROP COLUMN tool_calls;",
             )?;
         }
+        if from < 15 {
+            // 请求从哪台机器来。**网关开给局域网之后**，几台机器共用一把密钥
+            // 时只有它分得开是谁发的；本机来的留空
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN peer TEXT;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -400,8 +408,8 @@ impl Db {
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
               client_hint, session, cancelled, price_source, translated,
-              error_code, error_args)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
+              error_code, error_args, peer)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             params![
                 r.id,
                 r.at_ms,
@@ -434,6 +442,7 @@ impl Db {
                     .as_ref()
                     .filter(|e| !e.args.is_empty())
                     .map(|e| serde_json::to_string(&e.args).unwrap_or_default()),
+                r.peer,
             ],
         )?;
         Ok(())
@@ -1170,6 +1179,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         at_ms: r.get("at_ms")?,
         client: r.get("client")?,
         client_hint: r.get("client_hint")?,
+        peer: r.get("peer")?,
         session: r.get("session")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
@@ -1255,7 +1265,8 @@ const SECURITY_SELECT: &str =
         COALESCE(NULLIF(r.provider, ''), e.provider),
         COALESCE(NULLIF(r.client, ''), e.client),
         COALESCE(r.model, ''),
-        e.tool, e.excerpt, e.count
+        e.tool, e.excerpt, e.count,
+        r.client_hint, r.peer
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventView> {
@@ -1273,6 +1284,8 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         tool: r.get(10)?,
         excerpt: r.get(11)?,
         count: r.get(12)?,
+        client_hint: r.get(13)?,
+        peer: r.get(14)?,
     })
 }
 
@@ -1291,6 +1304,7 @@ pub(crate) mod tests {
 
     pub(crate) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
+            peer: None,
             client_hint: None,
             session: None,
             id,
@@ -1824,6 +1838,7 @@ pub(crate) mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN peer;
                      ALTER TABLE requests DROP COLUMN error_args;
                      ALTER TABLE requests DROP COLUMN error_code;
                      ALTER TABLE requests DROP COLUMN translated;
@@ -1864,13 +1879,17 @@ pub(crate) mod tests {
         assert!(got.iter().all(|r| r.price_source.is_none()));
         // 老记录没有落库的转换，那就是没有
         assert!(got.iter().all(|r| r.translated.is_none()));
+        // 老记录不知道从哪台机器来，那就是没有 —— 不是「本机」
+        assert!(got.iter().all(|r| r.peer.is_none()));
         let mut fresh = row(3, 300);
         fresh.client_hint = Some("codex".into());
         fresh.session = Some("abc-100".into());
+        fresh.peer = Some("192.168.1.23".into());
         db.insert(&fresh).unwrap();
         let back = &db.recent(None, 1).unwrap()[0];
         assert_eq!(back.client_hint.as_deref(), Some("codex"));
         assert_eq!(back.session.as_deref(), Some("abc-100"));
+        assert_eq!(back.peer.as_deref(), Some("192.168.1.23"));
     }
 
     #[test]

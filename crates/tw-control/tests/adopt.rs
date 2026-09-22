@@ -444,6 +444,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
     let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
     let blobs = tw_store::Blobs::new(d.path().join("blobs"));
     let mut row = tw_store::db::RequestRow {
+        peer: None,
         id: 1,
         at_ms: 1000,
         client: "我".into(),

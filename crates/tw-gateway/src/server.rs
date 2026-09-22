@@ -1018,6 +1018,7 @@ async fn ws_upgrade(
     headers: HeaderMap,
     started: std::time::Instant,
     live: crate::live::Pass,
+    peer: Option<String>,
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
     // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道
@@ -1075,6 +1076,7 @@ async fn ws_upgrade(
         client: client_name,
         client_hint: crate::hint::client_hint(&headers),
         session_fp: None,
+        peer,
         provider: name.clone(),
         model: String::new(),
         method: "WS".to_string(),
@@ -1292,6 +1294,8 @@ async fn passthrough(
         ));
     }
     let (client_name, position) = state.identify(&headers, query.as_deref())?;
+    // 请求从哪台机器来。本机来的是 None
+    let from = crate::hint::peer_of(peer.ip());
     // WebSocket 升级。**在鉴权之后、解体之前分叉** —— 鉴权
     // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
     // 升级要的是那条连接，而 `Bytes` 会把它读干净。
@@ -1306,6 +1310,7 @@ async fn passthrough(
             headers,
             started,
             live,
+            from,
         )
         .await;
     }
@@ -1342,6 +1347,7 @@ async fn passthrough(
         dialect,
         started,
         live,
+        from,
         &mut ending,
     )
     .await;
@@ -1423,6 +1429,7 @@ async fn pipeline(
     dialect: crate::error::Dialect,
     started: std::time::Instant,
     live: crate::live::Pass,
+    peer: Option<String>,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
     forward::check_body_size(&body, MAX_BODY)?;
@@ -1447,6 +1454,8 @@ async fn pipeline(
                 state.bus.emit(tw_api::Event::LocallyAnswered {
                     id,
                     client: client_name.clone(),
+                    client_hint: crate::hint::client_hint(&headers),
+                    peer: peer.clone(),
                     probe: kind.slug().to_string(),
                     at_ms: now_ms(),
                 });
@@ -1645,6 +1654,7 @@ async fn pipeline(
         // 认出「这几十个请求是同一次任务」。**认不出来就是
         // None** —— 硬凑一个会把互不相干的请求并成一个「会话」
         session_fp: parsed.as_ref().and_then(crate::session::fingerprint),
+        peer,
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
         model: facts.model.clone(),
         method: "POST".to_string(),

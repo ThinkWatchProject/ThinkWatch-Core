@@ -20,6 +20,7 @@ struct Partial {
     at_ms: i64,
     client: String,
     client_hint: Option<String>,
+    peer: Option<String>,
     session: Option<String>,
     provider: String,
     model: String,
@@ -166,6 +167,7 @@ impl Recorder {
                 client,
                 client_hint,
                 session_fp,
+                peer,
                 provider,
                 model,
                 path,
@@ -186,6 +188,7 @@ impl Recorder {
                         at_ms: *at_ms as i64,
                         client: client.clone(),
                         client_hint: client_hint.clone(),
+                        peer: peer.clone(),
                         session,
                         provider: provider.clone(),
                         model: model.clone(),
@@ -396,6 +399,8 @@ impl Recorder {
             Event::LocallyAnswered {
                 id,
                 client,
+                client_hint,
+                peer,
                 probe,
                 at_ms,
             } => {
@@ -405,8 +410,9 @@ impl Recorder {
                     id: *id as i64,
                     at_ms: *at_ms as i64,
                     client: client.clone(),
-                    // 本地应答的探测请求没经过上游，也就没有旁证可言
-                    client_hint: None,
+                    // 没经过上游，但请求是客户端发来的：旁证和来源照样有
+                    client_hint: client_hint.clone(),
+                    peer: peer.clone(),
                     session: None,
                     provider: String::new(),
                     model: String::new(),
@@ -544,6 +550,7 @@ impl Recorder {
             at_ms: p.at_ms,
             client: p.client,
             client_hint: p.client_hint,
+            peer: p.peer,
             session: p.session,
             provider: p.provider,
             model: p.model,
@@ -615,6 +622,7 @@ mod tests {
 
     pub(super) fn started(id: u64, model: &str) -> Event {
         Event::RequestStarted {
+            peer: None,
             id,
             client_hint: None,
             session_fp: None,
@@ -891,6 +899,8 @@ mod tests {
     fn a_locally_answered_probe_is_marked_local() {
         let (_d, mut r) = rec();
         r.on_event(&Event::LocallyAnswered {
+            client_hint: None,
+            peer: None,
             id: 9,
             client: "claude-code".into(),
             probe: "连通性检查".into(),
@@ -1534,6 +1544,7 @@ mod cancellation_tests {
     fn a_cancelled_turn_says_so_in_its_session() {
         let (_d, mut r) = rec();
         r.on_event(&Event::RequestStarted {
+            peer: None,
             id: 1,
             client: "claude-code".into(),
             client_hint: None,
