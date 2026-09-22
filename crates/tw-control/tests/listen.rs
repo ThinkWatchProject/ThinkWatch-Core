@@ -171,8 +171,13 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
-    assert_eq!(v["code"], "control.listen.unresolved");
-    assert!(v["text"].as_str().unwrap().contains("en97"), "{v}");
+    assert_eq!(v["code"], "gw.listen.no_such_nic");
+    assert_eq!(v["args"]["name"], "en97");
+    // 真有哪些网卡一并说出来，用户不必再去跑一次 ifconfig
+    assert!(
+        v["args"]["available"].as_str().unwrap().contains("lo0"),
+        "{v}"
+    );
     assert_eq!(b.file(), before);
 
     // 写法本身不对的，按配置文件的那套规则说

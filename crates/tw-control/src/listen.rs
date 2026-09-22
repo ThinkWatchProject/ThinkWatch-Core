@@ -55,12 +55,9 @@ async fn save(
         allow_from: allow.clone(),
     };
     // 网卡名要问系统：拼错了、此刻没有地址，都在这一步说
-    let want = listen.addrs().map_err(|e| {
-        fail(
-            StatusCode::CONFLICT,
-            msg!("control.listen.unresolved", detail = e => "{detail}"),
-        )
-    })?;
+    let want = listen
+        .addrs()
+        .map_err(|e| fail(StatusCode::CONFLICT, tw_gateway::listen::unresolved(&e)))?;
     tw_gateway::listen::check(&s.gateway, &want)
         .await
         .map_err(|m| fail(StatusCode::CONFLICT, m))?;

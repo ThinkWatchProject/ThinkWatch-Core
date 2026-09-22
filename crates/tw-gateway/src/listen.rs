@@ -59,6 +59,21 @@ pub fn bind_failure(addr: SocketAddr, e: &std::io::Error) -> Msg {
     }
 }
 
+/// 网卡解析不出地址的原因，说给人听。**两种情况要做的事不同**：名字不对要
+/// 改设置，网卡没地址要去插网线、连 Wi-Fi。
+pub fn unresolved(e: &tw_config::BindError) -> Msg {
+    match e {
+        tw_config::BindError::NoSuchNic { name, available } => msg!(
+            "gw.listen.no_such_nic", name = name, available = available.join(", ") =>
+            "This machine has no interface named {name}; it has {available}."
+        ),
+        tw_config::BindError::NicHasNoAddr { name } => msg!(
+            "gw.listen.nic_no_addr", name = name =>
+            "Interface {name} currently has no address. Check the cable or the Wi-Fi connection."
+        ),
+    }
+}
+
 /// 这几个地址现在绑不绑得上。**只试还没在听的那几个** —— 已经在听的会原样
 /// 留下，拿它们去试只会撞上我们自己。试完就放掉。
 ///
@@ -161,8 +176,7 @@ pub async fn serve_at(state: AppState, want: Vec<SocketAddr>, follow: bool) -> s
             // 让所有客户端立刻断线，而它们本来好好的。
             Err(e) => {
                 tracing::error!(%e, "the new listen address cannot be resolved; keeping the current one");
-                let why = msg!("gw.listen.unresolved", detail = e => "{detail}");
-                state.set_listening(snapshot(&bound, Some(why)));
+                state.set_listening(snapshot(&bound, Some(unresolved(&e))));
                 continue;
             }
         };
