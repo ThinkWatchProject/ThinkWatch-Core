@@ -696,3 +696,190 @@ async fn a_key_of_an_adopted_client_cannot_be_deleted_until_it_is_released() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("Restore it"), "要说清怎样才能删：{text}");
 }
+
+#[tokio::test]
+async fn a_manual_client_gets_its_own_key_once_and_it_remembers_whose_it_is() {
+    // 手动配 Cursor 时填进去的应该是一把只属于它的钥匙：流量、路由、并发上限
+    // 才分得清是谁。**再要一次给的是同一把**，不会攒下一堆
+    let b = bed();
+    let (st, body) = post(&b.app, "/clients/cursor/key", "").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let k: tw_api::ClientKey = serde_json::from_str(&body).unwrap();
+    assert_eq!(k.name, "cursor");
+    assert!(k.created);
+    assert!(k.key.starts_with("tw-"), "{}", k.key);
+    let made = b
+        .state
+        .config()
+        .clients
+        .iter()
+        .find(|c| c.name == "cursor")
+        .cloned()
+        .expect("配置里要有这把");
+    assert_eq!(made.client.as_deref(), Some("cursor"), "要记着是为谁生成的");
+    assert_eq!(made.key, k.key);
+
+    let (_, body) = post(&b.app, "/clients/cursor/key", "").await;
+    let again: tw_api::ClientKey = serde_json::from_str(&body).unwrap();
+    assert_eq!((again.name.as_str(), again.created), ("cursor", false));
+    assert_eq!(again.key, k.key);
+    assert_eq!(b.state.config().clients.len(), 2, "只该多出一把");
+
+    let (_, body) = get(&b.app, "/clients").await;
+    let v: tw_api::ClientsResponse = serde_json::from_str(&body).unwrap();
+    let cursor = v.manual.iter().find(|m| m.id == "cursor").unwrap();
+    assert_eq!(cursor.key.as_deref(), Some("cursor"));
+
+    let (st, _) = post(&b.app, "/clients/notepad/key", "").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn every_client_says_how_to_connect_it_by_hand() {
+    // 没检测到的客户端也要能照着接上：打开哪个文件、写哪几项、填哪个地址。
+    // 写的那几项就是接管时写的那几项
+    let b = bed();
+    let (_, body) = get(&b.app, "/clients").await;
+    let v: tw_api::ClientsResponse = serde_json::from_str(&body).unwrap();
+    let base = v.gateway_base.clone();
+
+    let cc = v.clients.iter().find(|c| c.id == "claude-code").unwrap();
+    assert_eq!(cc.manual.endpoint, base, "Claude Code 要的地址不带 /v1");
+    assert_eq!(cc.manual.steps[0].arg("file"), "~/.claude/settings.json");
+    let url = cc
+        .manual
+        .fields
+        .iter()
+        .find(|f| f.path == "env.ANTHROPIC_BASE_URL")
+        .unwrap();
+    assert_eq!(url.value.as_deref(), Some(base.as_str()));
+    let token = cc
+        .manual
+        .fields
+        .iter()
+        .find(|f| f.path == "env.ANTHROPIC_AUTH_TOKEN")
+        .unwrap();
+    assert!(token.secret, "{token:?}");
+    assert_eq!(token.value, None, "密钥那一项不给值");
+
+    let codex = v.clients.iter().find(|c| c.id == "codex").unwrap();
+    assert_eq!(codex.manual.endpoint, format!("{base}/v1"));
+
+    // 接管不了的那几个：几步说明，地址单独给，不写进句子里
+    for m in &v.manual {
+        assert!(!m.setup.steps.is_empty(), "{}", m.name);
+        assert!(m.setup.endpoint.starts_with(&base), "{}", m.setup.endpoint);
+        for step in &m.setup.steps {
+            assert!(!step.text.contains(&base), "{}：{step}", m.name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_plan_says_which_key_goes_in_and_whether_it_is_made_now() {
+    // 新建一把和沿用一把对用户是两件事，**要在确认之前说**
+    let b = bed();
+    std::fs::write(b.home.join(".claude/settings.json"), CLAUDE).unwrap();
+    let (_, body) = post(&b.app, "/clients/plan", r#"{"client":"claude-code"}"#).await;
+    let v: tw_api::PlanView = serde_json::from_str(&body).unwrap();
+    assert_eq!(v.key.as_deref(), Some("claude-code"));
+    assert!(v.key_created);
+    let token = v
+        .fields
+        .iter()
+        .find(|f| f.path == "env.ANTHROPIC_AUTH_TOKEN")
+        .unwrap();
+    assert!(token.secret);
+    // 算一份改动不写任何东西：那把钥匙还没建
+    assert_eq!(b.state.config().clients.len(), 1);
+
+    post(&b.app, "/clients/adopt", r#"{"client":"claude-code"}"#).await;
+    let (_, body) = get(&b.app, "/clients/claude-code/restore/plan").await;
+    let r: tw_api::PlanView = serde_json::from_str(&body).unwrap();
+    // 还原不删密钥：说清留下的是哪一把
+    assert_eq!(r.key.as_deref(), Some("claude-code"));
+    assert!(!r.key_created);
+    assert!(
+        r.fields
+            .iter()
+            .any(|f| f.op == "remove" && f.path == "env.ANTHROPIC_BASE_URL"),
+        "{:?}",
+        r.fields
+    );
+
+    // 还原之后再接管：沿用留下的那一把
+    post(&b.app, "/clients/claude-code/restore", "").await;
+    let (_, body) = post(&b.app, "/clients/plan", r#"{"client":"claude-code"}"#).await;
+    let again: tw_api::PlanView = serde_json::from_str(&body).unwrap();
+    assert_eq!(again.key.as_deref(), Some("claude-code"));
+    assert!(!again.key_created);
+
+    let (_, body) = get(&b.app, "/clients").await;
+    let list: tw_api::ClientsResponse = serde_json::from_str(&body).unwrap();
+    let cc = list.clients.iter().find(|c| c.id == "claude-code").unwrap();
+    assert_eq!(
+        cc.key.as_deref(),
+        Some("claude-code"),
+        "取消接管之后仍然记着"
+    );
+}
+
+#[tokio::test]
+async fn in_use_is_proven_by_the_clients_own_key_not_by_what_the_headers_claim() {
+    // 请求头里的客户端标识谁都能写：一个没接管的程序自称 claude-code，不该让
+    // Claude Code 显示成「使用中」。**只认为它生成的那把密钥**
+    let d = tempfile::tempdir().unwrap();
+    let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
+    let blobs = tw_store::Blobs::new(d.path().join("blobs"));
+    let row = |id: i64, at_ms: i64, client: &str, hint: Option<&str>| tw_store::db::RequestRow {
+        key_masked: None,
+        peer: None,
+        id,
+        at_ms,
+        client: client.into(),
+        client_hint: hint.map(str::to_string),
+        session: None,
+        provider: "relay".into(),
+        model: "claude-sonnet-4-5".into(),
+        path: "/v1/messages".into(),
+        status: Some(200),
+        ttfb_ms: Some(100),
+        duration_ms: Some(200),
+        bytes: Some(10),
+        input_tokens: Some(50),
+        output_tokens: Some(20),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cost_micros: None,
+        cost_estimated: false,
+        error: None,
+        local: false,
+        cancelled: false,
+        routing: None,
+        billing: String::new(),
+        cache_saved_micros: None,
+        price_source: None,
+        translated: None,
+    };
+    // 冒名的：默认那把密钥，却自称 claude-code
+    db.insert(&row(1, 5_000, "我", Some("claude-code")))
+        .unwrap();
+    // 真的：为 Cursor 生成的那把
+    db.insert(&row(2, 7_000, "cursor", None)).unwrap();
+    let rec = tw_store::Recorder::new(
+        db,
+        blobs,
+        tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
+    );
+    let b = bed_with_store(Some(std::sync::Arc::new(tokio::sync::Mutex::new(rec))));
+    post(&b.app, "/clients/cursor/key", "").await;
+    post(&b.app, "/clients/claude-code/key", "").await;
+
+    let (_, body) = get(&b.app, "/clients").await;
+    let v: tw_api::ClientsResponse = serde_json::from_str(&body).unwrap();
+    let cc = v.clients.iter().find(|c| c.id == "claude-code").unwrap();
+    assert_eq!(cc.key.as_deref(), Some("claude-code"));
+    assert_eq!(cc.last_seen_ms, None, "它的密钥一个请求都没发过");
+    let cursor = v.manual.iter().find(|m| m.id == "cursor").unwrap();
+    assert_eq!(cursor.last_seen_ms, Some(7_000));
+}
