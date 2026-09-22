@@ -17,6 +17,7 @@ const BASE: &str = "version: 1\nclients:\n  - name: 我\n    key: tw-一把钥�
 fn turn(id: i64, billing: &str) -> tw_store::db::RequestRow {
     let per_token = billing == "per-token";
     tw_store::db::RequestRow {
+        peer: None,
         id,
         at_ms: 1000 + id,
         client: "codex".into(),

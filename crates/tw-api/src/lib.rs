@@ -75,6 +75,11 @@ pub enum Event {
         /// 而「隔了多久」要看上一条是什么时候，那是 recorder 的活。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_fp: Option<String>,
+        /// 请求从哪台机器来：**这条连接对面的地址**，不可伪造。本机（回环）
+        /// 来的不记 —— 那是绝大多数请求，写上只是噪音；局域网来的才值得
+        /// 说一句「来自 192.168.1.23」。几台机器共用一把密钥时，只有它分得开
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
         provider: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账
@@ -456,6 +461,15 @@ pub enum Event {
     LocallyAnswered {
         id: u64,
         client: String,
+        /// 请求头透出来的旁证，同 `RequestStarted`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_hint: Option<String>,
+        /// 请求从哪台机器来：**这条连接对面的地址**，不可伪造。本机（回环）
+        /// 来的不记 —— 那是绝大多数请求，写上只是噪音；局域网来的才值得
+        /// 说一句「来自 192.168.1.23」。几台机器共用一把密钥时，只有它分得开
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+
         /// 哪一类辅助请求，和 `ProbeView.id` 同一个词表。字段叫 `probe` 而
         /// 不是 `kind` —— 那个名字已经被枚举的 tag 占了
         probe: String,
@@ -1915,6 +1929,13 @@ pub struct HistoryRow {
     /// 认不出会话的请求（拼不出指纹的、老记录）是 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，
+    /// 只用来显示；身份是 `client` 那把密钥
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hint: Option<String>,
+    /// 非本机来的请求的来源地址。本机来的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
     /// 这次请求在两项防护上留下的记录（和安全日志同一份）。没有就是空的。
     ///
     /// **流量页的徽标靠它。**以前徽标只来自实时事件，关窗再开就没了 ——
@@ -2717,6 +2738,13 @@ pub struct SecurityEventView {
     pub excerpt: String,
     /// 出站脱敏：这个值在请求里出现了几次
     pub count: i64,
+    /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，
+    /// 只用来显示；身份是 `client` 那把密钥
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hint: Option<String>,
+    /// 非本机来的请求的来源地址。本机来的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 /// 安全日志的一页。**按时间倒序**，`more` 说后面还有没有。
@@ -2899,6 +2927,7 @@ mod tests {
         // UI 靠 id 把四个事件缝成一行。
         for e in [
             Event::RequestStarted {
+                peer: None,
                 id: 7,
                 client: "c".into(),
                 client_hint: None,

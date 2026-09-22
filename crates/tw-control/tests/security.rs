@@ -41,6 +41,7 @@ impl Bed {
 
 fn request(id: i64, at_ms: i64, provider: &str) -> tw_store::db::RequestRow {
     tw_store::db::RequestRow {
+        peer: None,
         id,
         at_ms,
         client: "default".into(),
@@ -617,7 +618,11 @@ async fn trying_a_tool_call_says_what_enforce_would_do_with_it() {
 #[tokio::test]
 async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request() {
     let b = bed_with(BASE, |db| {
-        db.insert(&request(1, 1_000, "中转")).unwrap();
+        // 局域网里另一台机器，看样子是 Claude Code 发的
+        let mut r = request(1, 1_000, "中转");
+        r.peer = Some("192.168.1.23".into());
+        r.client_hint = Some("claude-code".into());
+        db.insert(&r).unwrap();
         db.insert_security_event(&event(1, 1_001, "redact", "anthropic-api-key", "recorded"))
             .unwrap();
         db.insert_security_event(&event(1, 1_002, "inspect_tools", "curl-pipe-sh", "cut"))
@@ -645,6 +650,12 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     );
     assert_eq!(events[1]["model"], "claude-sonnet-4-5");
     assert_eq!(events[1]["tool"], "Bash");
+    // 是谁发的：密钥是身份，应用是旁证，来源是这条连接对面的地址
+    assert_eq!(events[1]["client"], "default");
+    assert_eq!(events[1]["client_hint"], "claude-code");
+    assert_eq!(events[1]["peer"], "192.168.1.23");
+    // 本机来的、还没落库的，都没有来源
+    assert!(events[0].get("peer").is_none(), "{}", events[0]);
 
     let before = events[1]["id"].as_i64().unwrap();
     let (_, v) = call(
