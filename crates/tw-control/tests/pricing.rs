@@ -54,7 +54,6 @@ fn bed_with(yaml: &str, updater: Updater) -> Bed {
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
-        gateway_addr: None,
         store: None,
         started: std::time::Instant::now(),
         price_updater: Arc::new(updater),

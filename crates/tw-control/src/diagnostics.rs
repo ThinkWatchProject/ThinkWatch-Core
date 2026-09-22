@@ -72,13 +72,24 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
 
     // ---- 监听
     let _ = writeln!(out, "\n## Listening\n\n| | |\n|---|---|");
+    let listening = s.gateway.listening();
     line(
         &mut out,
         "Gateway",
-        s.gateway_addr
-            .as_deref()
-            .unwrap_or("not started (safe mode)"),
+        if listening.addrs.is_empty() {
+            "not started (safe mode)".to_string()
+        } else {
+            listening
+                .addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
     );
+    if let Some(e) = &listening.error {
+        line(&mut out, "Listen error", e);
+    }
     line(&mut out, "Bind", format!("{:?}", cfg.listen.gateway.bind));
     line(&mut out, "Port", cfg.listen.gateway.port);
     line(

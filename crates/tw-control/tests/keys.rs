@@ -56,7 +56,6 @@ fn bed(yaml: &str) -> Bed {
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
-        gateway_addr: None,
         store: None,
         started: std::time::Instant::now(),
         price_updater: Default::default(),
@@ -100,22 +99,27 @@ async fn call(
 // ─────────────────────────────────────────────────────────── 读
 
 #[tokio::test]
-async fn the_list_masks_the_value_and_says_which_one_is_the_default() {
+async fn the_list_shows_the_value_and_says_which_one_is_the_default() {
     let b = bed(BASE);
     let (st, v) = call(&b.app, "GET", "/keys", serde_json::Value::Null).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v[0]["name"], "default");
-    // 列表是一直在刷的，明文不该在里面
-    assert_ne!(v[0]["key"], "tw-aaaa");
+    // 密钥页把值原样显示出来：这把钥匙的用处就是被复制进客户端
+    assert_eq!(v[0]["key"], "tw-aaaa");
     assert_eq!(v[0]["default"], true);
     // 没有 default_key 时，名字叫 default 的那把就是默认的
     assert_eq!(v[1]["name"], "codex");
     assert!(v[1]["default"].is_null() || v[1]["default"] == false);
     assert_eq!(v[1]["client"], "codex");
 
-    // 明文单独要：用户点「复制」的那一刻才需要
+    // 「复制」按名字取此刻配置里的值
     let (st, v) = call(&b.app, "GET", "/keys/codex/value", serde_json::Value::Null).await;
     assert_eq!((st, v["key"].as_str()), (StatusCode::OK, Some("tw-bbbb")));
+
+    // 概览到处都在读，它那份是脱敏的；上游的凭据哪里都不出现
+    let (_, ov) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_ne!(ov["clients"][0]["key"], "tw-aaaa");
+    assert!(!ov.to_string().contains("sk-official"));
 }
 
 #[tokio::test]

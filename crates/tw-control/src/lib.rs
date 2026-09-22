@@ -22,6 +22,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod dryrun;
 pub mod keys;
+pub mod listen;
 pub mod pricing;
 pub mod replay;
 pub mod resources;
@@ -42,7 +43,6 @@ pub struct ControlState {
     /// 刷新。
     pub gateway: tw_gateway::AppState,
     pub cfg: Arc<ConfigManager>,
-    pub gateway_addr: Option<String>,
     /// 请求历史。**可能没有** —— 磁盘起不来时观测这一层整个不在，
     /// 而那时网关照常转发，所以它是 Option 而不是必需品。
     pub store: Option<Arc<tokio::sync::Mutex<tw_store::Recorder>>>,
@@ -92,6 +92,7 @@ pub fn router(state: ControlState) -> Router {
         .route("/status", get(status))
         .route("/interfaces", get(interfaces))
         .merge(keys::router())
+        .merge(listen::router())
         .route("/events", get(events))
         .route("/in-flight", get(in_flight))
         .route("/overview", get(overview))
@@ -167,11 +168,15 @@ async fn interfaces() -> Json<Vec<tw_api::NicView>> {
 
 async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
     let cfg = s.config();
+    let listening = s.gateway.listening();
     Json(tw_api::Status {
         api_version: tw_api::CONTROL_API_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
-        gateway_addr: s.gateway_addr.clone(),
+        // **问监听器，不是问启动时记下的那一次。**安全模式下数据面从没起过，
+        // 这里自然是 None
+        gateway_addr: listening.primary().map(|a| a.to_string()),
+        listen_error: listening.error,
         config_path: s.config_path().display().to_string(),
         clients: cfg.clients.len(),
         providers: cfg.providers.len(),
@@ -294,8 +299,9 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             })
             .collect(),
         // 和 `GET /keys` 同一份视图：概览里少一个字段的话，两处会各自
-        // 按不同的事实画同一张表
-        clients: keys::views(&s).await,
+        // 按不同的事实画同一张表。**只是密钥的值脱敏** —— 概览到处都在读，
+        // 用不着它
+        clients: keys::views(&s, keys::Reveal::Masked).await,
         security: tw_api::SecurityView {
             redact: cfg.security.redact.mode.slug().to_string(),
             inspect_tools: cfg.security.inspect_tools.mode.slug().to_string(),
@@ -312,7 +318,6 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .collect(),
         price_sheets: pricing::sheet_views(cfg),
         limits: tw_api::LimitsView {
-            max_concurrent: cfg.limits.max_concurrent,
             per_provider: cfg.limits.per_provider,
             queue_depth: cfg.limits.queue_depth,
             queue_timeout_secs: cfg.limits.queue_timeout_secs,
@@ -331,7 +336,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             // `addr(192.168.1.5)` —— 界面拿它去比对档位，永远不相等。
             bind: cfg.listen.gateway.bind.to_string(),
             port: cfg.listen.gateway.port,
-            allow_from: cfg.listen.gateway.effective_allow_from(),
+            allow_from: cfg.listen.gateway.allow_from.clone(),
             exposed: cfg.listen.gateway.bind.is_exposed(),
         },
     })
