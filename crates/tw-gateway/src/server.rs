@@ -1018,7 +1018,7 @@ async fn ws_upgrade(
     headers: HeaderMap,
     started: std::time::Instant,
     live: crate::live::Pass,
-    peer: Option<String>,
+    from: Sender,
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
     // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道
@@ -1076,7 +1076,8 @@ async fn ws_upgrade(
         client: client_name,
         client_hint: crate::hint::client_hint(&headers),
         session_fp: None,
-        peer,
+        peer: from.peer,
+        key_masked: from.key,
         provider: name.clone(),
         model: String::new(),
         method: "WS".to_string(),
@@ -1294,8 +1295,16 @@ async fn passthrough(
         ));
     }
     let (client_name, position) = state.identify(&headers, query.as_deref())?;
-    // 请求从哪台机器来。本机来的是 None
-    let from = crate::hint::peer_of(peer.ip());
+    // 除了密钥的名字，这条请求是谁发的
+    let from = Sender {
+        peer: crate::hint::peer_of(peer.ip()),
+        key: rt
+            .config
+            .clients
+            .iter()
+            .find(|c| c.name == client_name)
+            .map(|c| tw_secret::mask_secret(&c.key)),
+    };
     // WebSocket 升级。**在鉴权之后、解体之前分叉** —— 鉴权
     // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
     // 升级要的是那条连接，而 `Bytes` 会把它读干净。
@@ -1416,6 +1425,16 @@ fn note_health(
     });
 }
 
+/// 这条请求是谁发的：密钥的名字之外的两样。**记下的是请求那一刻的** ——
+/// 密钥换过之后，老记录上的尾巴照样对得上。
+#[derive(Debug, Clone, Default)]
+struct Sender {
+    /// 这条连接对面的地址。本机来的是 None（见 `hint::peer_of`）
+    peer: Option<String>,
+    /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`）
+    key: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pipeline(
     state: AppState,
@@ -1429,7 +1448,7 @@ async fn pipeline(
     dialect: crate::error::Dialect,
     started: std::time::Instant,
     live: crate::live::Pass,
-    peer: Option<String>,
+    from: Sender,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
     forward::check_body_size(&body, MAX_BODY)?;
@@ -1455,7 +1474,8 @@ async fn pipeline(
                     id,
                     client: client_name.clone(),
                     client_hint: crate::hint::client_hint(&headers),
-                    peer: peer.clone(),
+                    peer: from.peer.clone(),
+                    key_masked: from.key.clone(),
                     probe: kind.slug().to_string(),
                     at_ms: now_ms(),
                 });
@@ -1654,7 +1674,8 @@ async fn pipeline(
         // 认出「这几十个请求是同一次任务」。**认不出来就是
         // None** —— 硬凑一个会把互不相干的请求并成一个「会话」
         session_fp: parsed.as_ref().and_then(crate::session::fingerprint),
-        peer,
+        peer: from.peer,
+        key_masked: from.key,
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
         model: facts.model.clone(),
         method: "POST".to_string(),

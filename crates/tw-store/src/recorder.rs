@@ -21,6 +21,7 @@ struct Partial {
     client: String,
     client_hint: Option<String>,
     peer: Option<String>,
+    key_masked: Option<String>,
     session: Option<String>,
     provider: String,
     model: String,
@@ -168,6 +169,7 @@ impl Recorder {
                 client_hint,
                 session_fp,
                 peer,
+                key_masked,
                 provider,
                 model,
                 path,
@@ -189,6 +191,7 @@ impl Recorder {
                         client: client.clone(),
                         client_hint: client_hint.clone(),
                         peer: peer.clone(),
+                        key_masked: key_masked.clone(),
                         session,
                         provider: provider.clone(),
                         model: model.clone(),
@@ -401,6 +404,7 @@ impl Recorder {
                 client,
                 client_hint,
                 peer,
+                key_masked,
                 probe,
                 at_ms,
             } => {
@@ -413,6 +417,7 @@ impl Recorder {
                     // 没经过上游，但请求是客户端发来的：旁证和来源照样有
                     client_hint: client_hint.clone(),
                     peer: peer.clone(),
+                    key_masked: key_masked.clone(),
                     session: None,
                     provider: String::new(),
                     model: String::new(),
@@ -551,6 +556,7 @@ impl Recorder {
             client: p.client,
             client_hint: p.client_hint,
             peer: p.peer,
+            key_masked: p.key_masked,
             session: p.session,
             provider: p.provider,
             model: p.model,
@@ -622,6 +628,7 @@ mod tests {
 
     pub(super) fn started(id: u64, model: &str) -> Event {
         Event::RequestStarted {
+            key_masked: None,
             peer: None,
             id,
             client_hint: None,
@@ -899,6 +906,7 @@ mod tests {
     fn a_locally_answered_probe_is_marked_local() {
         let (_d, mut r) = rec();
         r.on_event(&Event::LocallyAnswered {
+            key_masked: None,
             client_hint: None,
             peer: None,
             id: 9,
@@ -1544,6 +1552,7 @@ mod cancellation_tests {
     fn a_cancelled_turn_says_so_in_its_session() {
         let (_d, mut r) = rec();
         r.on_event(&Event::RequestStarted {
+            key_masked: None,
             peer: None,
             id: 1,
             client: "claude-code".into(),

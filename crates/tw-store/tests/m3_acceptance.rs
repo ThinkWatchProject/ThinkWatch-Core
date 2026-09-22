@@ -24,6 +24,7 @@ const NOW: i64 = 1_800_000_000_000;
 
 fn req(id: i64, at_ms: i64) -> RequestRow {
     RequestRow {
+        key_masked: None,
         peer: None,
         id,
         at_ms,

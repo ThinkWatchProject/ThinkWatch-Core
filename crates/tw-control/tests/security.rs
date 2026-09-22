@@ -41,6 +41,7 @@ impl Bed {
 
 fn request(id: i64, at_ms: i64, provider: &str) -> tw_store::db::RequestRow {
     tw_store::db::RequestRow {
+        key_masked: None,
         peer: None,
         id,
         at_ms,
@@ -622,6 +623,7 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
         let mut r = request(1, 1_000, "中转");
         r.peer = Some("192.168.1.23".into());
         r.client_hint = Some("claude-code".into());
+        r.key_masked = Some("tw-re…wb4e".into());
         db.insert(&r).unwrap();
         db.insert_security_event(&event(1, 1_001, "redact", "anthropic-api-key", "recorded"))
             .unwrap();
@@ -654,6 +656,7 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     assert_eq!(events[1]["client"], "default");
     assert_eq!(events[1]["client_hint"], "claude-code");
     assert_eq!(events[1]["peer"], "192.168.1.23");
+    assert_eq!(events[1]["key_masked"], "tw-re…wb4e");
     // 本机来的、还没落库的，都没有来源
     assert!(events[0].get("peer").is_none(), "{}", events[0]);
 

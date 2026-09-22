@@ -79,7 +79,8 @@ fn with_policy(up: SocketAddr, inspect_tools: ToolPolicy) -> Config {
         listen: Listen::default(),
         clients: vec![Client {
             name: "claude-code".into(),
-            key: "tw-testkey".into(),
+            // 真实长度的密钥：打码后该是 `tw-re…wb4e`，太短的会整串打掉
+            key: "tw-reh4xqqrzyvbutjacvjywb4e".into(),
             ..Default::default()
         }],
         providers: vec![Provider {
@@ -110,7 +111,7 @@ async fn run(cfg: Config) -> (String, tokio::sync::broadcast::Receiver<tw_api::E
 
     let body = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "tw-testkey")
+        .header("x-api-key", "tw-reh4xqqrzyvbutjacvjywb4e")
         .header("content-type", "application/json")
         .body(r#"{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"帮我看看构建配置"}],"stream":true}"#)
         .send()
@@ -201,6 +202,28 @@ async fn observe_lets_it_through_but_still_says_something() {
     assert!(cut, "处置不该因为档位而变");
     assert!(!blocked, "观察态不能真的切");
     assert_eq!(rule, "curl-pipe-sh");
+}
+
+#[tokio::test]
+async fn the_start_event_names_the_key_masked_and_no_source_for_this_machine() {
+    // 密钥记打码后的样子，而且是请求那一刻用的那把；本机来的不记来源
+    let up = start_upstream(poisoned_stream()).await;
+    let (_, mut rx) = run(config(up, SecurityMode::Observe)).await;
+    let started = loop {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Ok(tw_api::Event::RequestStarted {
+                client,
+                key_masked,
+                peer,
+                ..
+            })) => break (client, key_masked, peer),
+            Ok(Ok(_)) => continue,
+            other => panic!("没收到开始事件：{other:?}"),
+        }
+    };
+    assert_eq!(started.0, "claude-code");
+    assert_eq!(started.1.as_deref(), Some("tw-re…wb4e"));
+    assert_eq!(started.2, None, "本机来的不该有来源");
 }
 
 #[tokio::test]
@@ -381,7 +404,7 @@ async fn run_whole(cfg: Config) -> (String, tokio::sync::broadcast::Receiver<tw_
 
     let body = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
-        .header("x-api-key", "tw-testkey")
+        .header("x-api-key", "tw-reh4xqqrzyvbutjacvjywb4e")
         .header("content-type", "application/json")
         .body(r#"{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"帮我看看构建配置"}]}"#)
         .send()

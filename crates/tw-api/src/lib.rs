@@ -80,6 +80,10 @@ pub enum Event {
         /// 说一句「来自 192.168.1.23」。几台机器共用一把密钥时，只有它分得开
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<String>,
+        /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`）。**记的是请求那一刻
+        /// 用的那把** —— 密钥更换过之后，老记录上的尾巴照样对得上
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_masked: Option<String>,
         provider: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账
@@ -469,6 +473,10 @@ pub enum Event {
         /// 说一句「来自 192.168.1.23」。几台机器共用一把密钥时，只有它分得开
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<String>,
+        /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`）。**记的是请求那一刻
+        /// 用的那把** —— 密钥更换过之后，老记录上的尾巴照样对得上
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_masked: Option<String>,
 
         /// 哪一类辅助请求，和 `ProbeView.id` 同一个词表。字段叫 `probe` 而
         /// 不是 `kind` —— 那个名字已经被枚举的 tag 占了
@@ -1936,6 +1944,9 @@ pub struct HistoryRow {
     /// 非本机来的请求的来源地址。本机来的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`），请求那一刻的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_masked: Option<String>,
     /// 这次请求在两项防护上留下的记录（和安全日志同一份）。没有就是空的。
     ///
     /// **流量页的徽标靠它。**以前徽标只来自实时事件，关窗再开就没了 ——
@@ -2745,6 +2756,9 @@ pub struct SecurityEventView {
     /// 非本机来的请求的来源地址。本机来的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`），请求那一刻的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_masked: Option<String>,
 }
 
 /// 安全日志的一页。**按时间倒序**，`more` 说后面还有没有。
@@ -2927,6 +2941,7 @@ mod tests {
         // UI 靠 id 把四个事件缝成一行。
         for e in [
             Event::RequestStarted {
+                key_masked: None,
                 peer: None,
                 id: 7,
                 client: "c".into(),

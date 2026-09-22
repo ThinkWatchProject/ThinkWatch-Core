@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use tw_api::Msg;
 
 /// 当前 schema 版本。**加字段就加一，并在 `migrate` 里补一步。**
-const SCHEMA: i64 = 15;
+const SCHEMA: i64 = 16;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -82,6 +82,8 @@ pub struct RequestRow {
     pub client_hint: Option<String>,
     /// 非本机来的请求的来源地址（这条连接对面的地址）。本机来的是 None
     pub peer: Option<String>,
+    /// 请求带的那把网关密钥打码后的样子，请求那一刻的
+    pub key_masked: Option<String>,
     /// 这条属于哪一次任务。**指纹 + 起始时刻**，老记录是 None
     pub session: Option<String>,
     pub provider: String,
@@ -396,6 +398,12 @@ impl Db {
             self.conn
                 .execute_batch("ALTER TABLE requests ADD COLUMN peer TEXT;")?;
         }
+        if from < 16 {
+            // 用的是哪把密钥：打码后的样子。**名字会改、密钥会换**，只记名字的
+            // 话，更换之后老记录就对不上是哪一把了
+            self.conn
+                .execute_batch("ALTER TABLE requests ADD COLUMN key_masked TEXT;")?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -408,8 +416,8 @@ impl Db {
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
               client_hint, session, cancelled, price_source, translated,
-              error_code, error_args, peer)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+              error_code, error_args, peer, key_masked)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
             params![
                 r.id,
                 r.at_ms,
@@ -443,6 +451,7 @@ impl Db {
                     .filter(|e| !e.args.is_empty())
                     .map(|e| serde_json::to_string(&e.args).unwrap_or_default()),
                 r.peer,
+                r.key_masked,
             ],
         )?;
         Ok(())
@@ -1180,6 +1189,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         client: r.get("client")?,
         client_hint: r.get("client_hint")?,
         peer: r.get("peer")?,
+        key_masked: r.get("key_masked")?,
         session: r.get("session")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
@@ -1266,7 +1276,7 @@ const SECURITY_SELECT: &str =
         COALESCE(NULLIF(r.client, ''), e.client),
         COALESCE(r.model, ''),
         e.tool, e.excerpt, e.count,
-        r.client_hint, r.peer
+        r.client_hint, r.peer, r.key_masked
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventView> {
@@ -1286,6 +1296,7 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         count: r.get(12)?,
         client_hint: r.get(13)?,
         peer: r.get(14)?,
+        key_masked: r.get(15)?,
     })
 }
 
@@ -1304,6 +1315,7 @@ pub(crate) mod tests {
 
     pub(crate) fn row(id: i64, at_ms: i64) -> RequestRow {
         RequestRow {
+            key_masked: None,
             peer: None,
             client_hint: None,
             session: None,
@@ -1838,6 +1850,7 @@ pub(crate) mod tests {
             db.conn
                 .execute_batch(
                     "DROP INDEX requests_session;
+                     ALTER TABLE requests DROP COLUMN key_masked;
                      ALTER TABLE requests DROP COLUMN peer;
                      ALTER TABLE requests DROP COLUMN error_args;
                      ALTER TABLE requests DROP COLUMN error_code;
@@ -1885,11 +1898,13 @@ pub(crate) mod tests {
         fresh.client_hint = Some("codex".into());
         fresh.session = Some("abc-100".into());
         fresh.peer = Some("192.168.1.23".into());
+        fresh.key_masked = Some("tw-re…wb4e".into());
         db.insert(&fresh).unwrap();
         let back = &db.recent(None, 1).unwrap()[0];
         assert_eq!(back.client_hint.as_deref(), Some("codex"));
         assert_eq!(back.session.as_deref(), Some("abc-100"));
         assert_eq!(back.peer.as_deref(), Some("192.168.1.23"));
+        assert_eq!(back.key_masked.as_deref(), Some("tw-re…wb4e"));
     }
 
     #[test]
