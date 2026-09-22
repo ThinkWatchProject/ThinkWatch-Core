@@ -145,9 +145,8 @@ providers:
 }
 
 #[tokio::test]
-async fn a_subscription_upstream_does_not_void_the_quote_total() {
-    // 以前只要勾上一家订阅制上游，合计就是空的 —— 用户再也看不到这批
-    // 测速要花多少钱。
+async fn every_upstream_is_quoted_by_its_price_sheet_and_free_is_zero() {
+    // 订阅账号也按价目表报价；不计费的那一家报 0，合计照样算得出来
     let b = bed("version: 1
 clients:
   - name: c
@@ -159,18 +158,31 @@ providers:
   - name: max
     base_url: https://api.anthropic.com
     key: sk-y
-    billing: subscription
+  - name: local
+    base_url: http://127.0.0.1:11434
+    key: sk-z
+    protocol: anthropic
+    billing: free
 ");
     let (st, v) = post(&b.app, "/speed/quote", r#"{"model":"claude-sonnet-4-5"}"#).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let items = v["items"].as_array().unwrap();
-    let official = items.iter().find(|i| i["provider"] == "official").unwrap();
-    let max = items.iter().find(|i| i["provider"] == "max").unwrap();
-    assert_eq!(max["billing"], "subscription", "{v}");
-    assert!(max.get("cost_micros").is_none(), "订阅制不该给金额：{v}");
+    let pick = |name: &str| items.iter().find(|i| i["provider"] == name).unwrap();
+    let (official, max, local) = (pick("official"), pick("max"), pick("local"));
+    assert_eq!(max["billing"], "per-token", "{v}");
     assert_eq!(
-        v["total_micros"], official["cost_micros"],
-        "合计应当只算按量计费的那一家：{v}"
+        max["cost_micros"], official["cost_micros"],
+        "同一张价目表报的价不一样：{v}"
+    );
+    assert_eq!(
+        (local["billing"].as_str(), local["cost_micros"].as_i64()),
+        (Some("free"), Some(0)),
+        "{v}"
+    );
+    assert_eq!(
+        v["total_micros"].as_i64(),
+        Some(official["cost_micros"].as_i64().unwrap() * 2),
+        "合计是两家按量计费的加上不计费的 0：{v}"
     );
 }
 

@@ -51,7 +51,12 @@ pub use tw_types::Msg;
 /// `overloaded`）。放行网段不再有「空 = 私网段」：不写是默认名单、空就是
 /// 只有本机，`ListenView` 带上了默认名单；`GET /interfaces` 每张网卡一行。
 /// 照 8 写的界面会画出一节改了也不起作用的并发设置。
-pub const CONTROL_API_VERSION: u32 = 9;
+///
+/// **10 计费只剩两档**：`billing` 只有 `per-token` / `free`，订阅账号也按
+/// 价目表算费用。上游视图的 `billing` 必有，`billing_effective` 没了；汇总的
+/// `subscription_requests` / `subscription_tokens` 和会话的 `subscription_turns`
+/// 没了。照 9 写的界面会去读已经不存在的字段。
+pub const CONTROL_API_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -226,8 +231,7 @@ pub enum Event {
         /// **必须跟着这次请求走，不能事后查配置** —— 配置随时会被热重载，
         /// 而一条三天前的记录该按它当时那家的计费方式算。
         ///
-        /// 一家都没接下时是 `per-token`：那一行没有用量、没有金额，记成订阅
-        /// 的话会被数进订阅额度的次数里。
+        /// 一家都没接下时是 `per-token`：没有哪一家的计费方式可以跟着走。
         billing: String,
     },
     /// 一个请求发出前，按出站脱敏的规则找到了东西。
@@ -823,12 +827,8 @@ pub struct ProviderView {
     /// 上游永远不会熔断。和 `AuthChanged` 说的是同一件事：一个是现状，一个是变化
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_rejected: Option<u16>,
-    /// 配置里写明的计费方式：`per-token` / `subscription` / `free` / `unknown`。
-    /// 空 = 自动识别
-    pub billing: Option<String>,
-    /// 实际按什么计费。没写明时自动识别：报过订阅额度的是 `subscription`，
-    /// 否则 `per-token`
-    pub billing_effective: String,
+    /// 计费方式：`per-token`（按价目表算，订阅账号也是）/ `free`（记 $0）
+    pub billing: String,
     /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
     pub references: Vec<ReferenceView>,
     /// 选的价目表。空 = 默认价目表
@@ -1527,7 +1527,7 @@ pub struct ProviderInput {
     /// 启用范围：只用这些模型（ID 或 glob）。不给就是它提供的全部
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_only: Option<Vec<String>>,
-    /// `per-token` / `subscription` / `free` / `unknown`。不给就自动识别
+    /// `per-token` / `free`。不给就是按量计费
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
     /// 按哪张价目表计价。不给就是默认价目表
@@ -1922,7 +1922,7 @@ pub struct Summary {
     /// 有多少条请求**价目表里没有它的模型**：用量是有的，缺的是单价。
     /// **不是 0，是「不知道」。**给那个模型配一个价格就能解决。
     ///
-    /// 失败的、没有用量的、订阅制的都不在这里 —— 配价格对它们没用。
+    /// 失败的、没有用量的、不计费的都不在这里 —— 配价格对它们没用。
     pub unpriced_requests: i64,
     /// 有多少条请求**没有拿到用量**，所以同样算不出钱：上游没报，或者连接
     /// 在它报之前就结束了（客户端取消、WebSocket 会话）。
@@ -1931,11 +1931,6 @@ pub struct Summary {
     /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
     /// 取消的，失败的和上游回了 4xx 的不算。
     pub no_usage_requests: i64,
-    /// 走订阅型上游的请求数。**不参与金额合计** ——
-    /// 订阅制的边际成本是零，按价目表算出来的数字是纯虚构的
-    pub subscription_requests: i64,
-    /// 那些请求用掉的 token。**它才是订阅用户该看的量**
-    pub subscription_tokens: i64,
     /// 用了缓存之后净省下多少微分。
     ///
     /// **净额：命中节省的部分，减去写入产生的溢价。**用户想知道的是
@@ -1986,8 +1981,8 @@ pub struct HistoryRow {
     /// 客户端没等到响应结束就走了。**不是失败**（`error` 是空的）；用量
     /// 只算到断开那一刻，所以有金额的话一定是估算
     pub cancelled: bool,
-    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `free` / `unknown`。
-    /// 本地应答的是 `free`：网关自己答的，费用确实是零
+    /// 服务它的那家怎么收钱：`per-token` / `free`。本地应答的是 `free`：网关
+    /// 自己答的，费用确实是零
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2204,12 +2199,10 @@ pub struct SpeedEstimate {
     /// 输入 token。**精确值** —— 请求是固定的
     pub input_tokens: u64,
     pub max_output_tokens: u64,
-    /// 微分。按量计费算得出来时是那个数，不计费时是 0。订阅制、计费方式
-    /// 未知、无法计价时是空
+    /// 微分。按量计费算得出来时是那个数，不计费时是 0，无法计价时是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
-    /// 这家的计费方式：`per-token` / `subscription` / `free` / `unknown`。
-    /// **订阅制那几项没有金额，但不让合计变成空**
+    /// 这家的计费方式：`per-token` / `free`
     pub billing: String,
     /// 这家服务不了这个模型：`out_of_scope`（不在启用范围里）/
     /// `not_offered`（模型清单里没有）。有值时不进合计，也不会被测
@@ -2221,9 +2214,8 @@ pub struct SpeedEstimate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedQuote {
     pub items: Vec<SpeedEstimate>,
-    /// 总计，**不含订阅制那几项**（它们消耗额度，单独说）。按量计费的
-    /// 有一项算不出来就是 None —— 给一个看起来完整的数字，用户会以为
-    /// 那就是全部代价
+    /// 总计。有一项算不出来就是 None —— 给一个看起来完整的数字，用户会
+    /// 以为那就是全部代价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_micros: Option<i64>,
     pub pricing_date: String,
@@ -2299,10 +2291,6 @@ pub struct SessionView {
     pub unpriced_turns: u64,
     /// 没有拿到用量、所以算不出钱的轮数
     pub no_usage_turns: u64,
-    /// 由订阅制上游服务的轮数：计入订阅额度，**没有金额，也不是「无法计价」**。
-    /// 和上面三个数互不相交，和概览的 `subscription_requests` 数的是同一类请求。
-    /// 少了它，全走订阅的会话和一轮都算不出钱的会话在这里长得一模一样
-    pub subscription_turns: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -2335,8 +2323,7 @@ pub struct TurnView {
     /// 估算的金额在瀑布图上和实测的长得一模一样
     pub cost_estimated: bool,
     /// 服务它的那家怎么收钱，和 `HistoryRow::billing` 同一套词：`per-token` /
-    /// `subscription` / `free` / `unknown`。**订阅制那一轮的 `cost_micros` 也是
-    /// None**，只看金额分不出它和「无法计价」
+    /// `free`
     pub billing: String,
 }
 
@@ -2362,9 +2349,9 @@ pub struct ReplayQuote {
     pub provider: String,
     pub body_bytes: i64,
     pub input_tokens: i64,
-    /// `None` = 订阅制、计费方式未知，或者这个模型无法计价。**不是 0**
+    /// `None` = 这个模型无法计价。**不是 0**
     pub cost_micros: Option<i64>,
-    /// 要重放到的那家的计费方式：`per-token` / `subscription` / `free` / `unknown`
+    /// 要重放到的那家的计费方式：`per-token` / `free`
     pub billing: String,
     /// 发出去之前会不会脱敏。用户有权在按下去之前知道
     pub will_redact: bool,

@@ -157,7 +157,7 @@ impl Default for Provider {
             on_proxy_fail: OnProxyFail::default(),
             models: Vec::new(),
             models_only: None,
-            billing: None,
+            billing: Billing::PerToken,
             pricing: None,
             disabled: false,
         }
@@ -608,12 +608,13 @@ pub struct Provider {
     /// 它们的请求交给这家。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_only: Option<Vec<String>>,
-    /// 这家怎么收钱。
+    /// 这家怎么收钱：按量计费（默认，按价目表算）或不计费。
     ///
-    /// **不写就自动判**：响应头里报过订阅额度的就是订阅型。
-    /// 那个信号一直在我们手上，不该变成一个用户要填的字段。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub billing: Option<Billing>,
+    /// **订阅账号也按量计费。**费用一律是「用量 × 这家所选价目表里该模型的
+    /// 单价」，订阅账号算出来的就是按 API 价格折算的费用；额度另从响应头读，
+    /// 和计费无关。想让它的费用记 0，写 `free`。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub billing: Billing,
     /// 按哪张价目表计价。不写就是默认价目表。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
@@ -638,42 +639,29 @@ impl Provider {
 
 /// 上游怎么收钱。
 ///
-/// **接入订阅型网关之后，「按价目表乘 token 数」这个假设就不成立了** ——
-/// 订阅制的边际成本是零，按 API 价目表算出来的数字是纯虚构的。
+/// **只有两档。**费用只取决于用量和价目表：按量计费的按价目表算，不计费的
+/// 记 $0。上游是不是订阅账号不影响费用 —— 那件事由它报的额度说。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Billing {
     /// 按价目表计价。默认
     #[default]
     PerToken,
-    /// 订阅制，边际成本为零。
-    ///
-    /// **成本栏显示「订阅」而不是 `$0.00`** —— 后者看起来像一个算出来的
-    /// 结果，会让人误以为这次调用真的免费；「订阅」表达的是「这笔账不在
-    /// 这个维度上」。
-    Subscription,
-    /// 不计费：本地模型、免费额度。**费用记 $0，是一个确定的数** ——
-    /// 和订阅制不同，这里的钱确实是零
+    /// 不计费：本地模型、免费额度。**费用记 $0，是一个确定的数**
     Free,
-    /// 上游价格未知。成本栏标「未知」，**不参与合计**
-    Unknown,
 }
 
 impl Billing {
     pub fn label(&self) -> &'static str {
         match self {
             Billing::PerToken => "per token",
-            Billing::Subscription => "subscription",
             Billing::Free => "free",
-            Billing::Unknown => "billing unknown",
         }
     }
     pub fn slug(&self) -> &'static str {
         match self {
             Billing::PerToken => "per-token",
-            Billing::Subscription => "subscription",
             Billing::Free => "free",
-            Billing::Unknown => "unknown",
         }
     }
 }
@@ -1038,6 +1026,34 @@ providers:
         assert_eq!(cfg.listen.gateway.bind, Bind::Loopback);
         assert_eq!(cfg.listen.gateway.port, DEFAULT_GATEWAY_PORT);
         assert_eq!(cfg.listen.gateway.allow_from, default_allow_from());
+    }
+
+    #[test]
+    fn billing_is_per_token_or_free_and_nothing_else() {
+        let parse = |billing: &str| {
+            serde_yaml_ng::from_str::<Config>(&format!(
+                "version: 1\nproviders:\n  - {{ name: p, base_url: https://api.example.com{billing} }}\n"
+            ))
+        };
+        // 不写就是按量计费，写回去也不多出这一行
+        let unset = parse("").unwrap();
+        assert_eq!(unset.providers[0].billing, Billing::PerToken);
+        assert!(
+            !serde_yaml_ng::to_string(&unset)
+                .unwrap()
+                .contains("billing")
+        );
+        assert_eq!(
+            parse(", billing: free").unwrap().providers[0].billing,
+            Billing::Free
+        );
+        // 订阅账号也按价目表算费用，「订阅」和「未知」不再是计费方式
+        for gone in ["subscription", "unknown"] {
+            assert!(
+                parse(&format!(", billing: {gone}")).is_err(),
+                "{gone} 还被接受"
+            );
+        }
     }
 
     #[test]

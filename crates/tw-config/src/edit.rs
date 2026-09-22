@@ -389,7 +389,7 @@ providers:
             CFG,
             PROVIDERS,
             Some("官方"),
-            &map("name: 官方\nbase_url: https://api.anthropic.com\nkey: sk-a\nbilling: subscription\n"),
+            &map("name: 官方\nbase_url: https://api.anthropic.com\nkey: sk-a\nbilling: free\n"),
         )
         .unwrap();
         let without = upsert(

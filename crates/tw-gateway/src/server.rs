@@ -842,35 +842,6 @@ impl AppState {
         self.pricing.rcu(|book| book.with_table(table.clone()));
     }
 
-    /// 这家实际怎么收钱。
-    ///
-    /// **配置里写了就听配置的，没写就自动判**：响应头里报过订阅额度的就是
-    /// 订阅型。那个信号一直在我们手上，不该变成一个用户要填的
-    /// 字段 —— 而一个填错了的字段比没有更糟。
-    ///
-    /// **自动判有一个已知的边界：每次进程启动之后，打给一家订阅上游的第一个
-    /// 请求会被按量计价。**那时我们还没见过它的额度头。之后就对了。
-    ///
-    /// 没有更好的办法：额度头只在响应里，而计价发生在响应之后 —— 想在第一
-    /// 个请求之前知道，只能主动探测，而那条路是明确否掉的（会占用户
-    /// 自己的配额）。在乎那一条记录的人，在配置里写一行 `billing:
-    /// subscription` 就没有歧义了。
-    pub fn billing_of(&self, p: &tw_config::Provider) -> tw_config::Billing {
-        if let Some(b) = p.billing {
-            return b;
-        }
-        let reported = self
-            .quotas
-            .lock()
-            .map(|g| g.get(&p.name).is_some_and(|q| !q.is_empty()))
-            .unwrap_or(false);
-        if reported {
-            tw_config::Billing::Subscription
-        } else {
-            tw_config::Billing::PerToken
-        }
-    }
-
     /// `cheapest` 排序用的单价：每家跑这个模型的 (输入, 输出)，微分/百万 token。
     ///
     /// **路由和预演共用这一个** —— 各写一份的话，预演说会选 A，实际选的是 B。
@@ -885,14 +856,13 @@ impl AppState {
             .iter()
             .filter_map(|name| {
                 let p = providers.iter().find(|p| &p.name == name)?;
-                // **订阅制和不计费的边际成本是零，它们就是最便宜的**。
-                // 而「价格未知」不是「免费」 —— 它不在这张表里，排到最后去
+                // **不计费的就是最便宜的**；其余按它所选的价目表比，订阅账号
+                // 也一样。价目表里没有这个模型的不是「免费」 —— 排到最后去
                 match p.billing {
-                    Some(tw_config::Billing::Subscription | tw_config::Billing::Free) => {
-                        Some((name.clone(), (0, 0)))
+                    tw_config::Billing::Free => Some((name.clone(), (0, 0))),
+                    tw_config::Billing::PerToken => {
+                        book.unit_micros(name, model).map(|u| (name.clone(), u))
                     }
-                    Some(tw_config::Billing::Unknown) => None,
-                    _ => book.unit_micros(name, model).map(|u| (name.clone(), u)),
                 }
             })
             .collect()
@@ -1099,7 +1069,7 @@ async fn ws_upgrade(
         peer: from.peer,
         key_masked: from.key,
         provider: name.clone(),
-        billing: state.billing_of(provider).slug().to_string(),
+        billing: provider.billing.slug().to_string(),
         model: String::new(),
         method: "WS".to_string(),
         path: uri.path().to_string(),
@@ -1680,8 +1650,8 @@ async fn pipeline(
         key_masked: from.key,
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
         billing: first
-            .map(|p| state.billing_of(p))
-            .unwrap_or(tw_config::Billing::PerToken)
+            .map(|p| p.billing)
+            .unwrap_or_default()
             .slug()
             .to_string(),
         model: facts.model.clone(),
@@ -2123,9 +2093,7 @@ async fn pipeline(
     // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
     // 最终服务的那家怎么收钱。**跟着请求走，不能事后查配置** ——
     // 配置随时会被热重载，而一条三天前的记录该按它当时那家的算。
-    let billing = used
-        .map(|p| state.billing_of(p))
-        .unwrap_or(tw_config::Billing::PerToken);
+    let billing = used.map(|p| p.billing).unwrap_or_default();
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
         rule: decision.matched_rule.clone(),
