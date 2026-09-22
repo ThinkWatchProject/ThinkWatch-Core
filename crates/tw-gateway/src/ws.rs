@@ -91,6 +91,19 @@ pub fn upstream_url(base: &str, path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// 要连的那一家，以及路由是怎么选中它的。
+pub struct Upstream {
+    /// `ws(s)://` 开头的完整地址（见 [`upstream_url`]）
+    pub url: String,
+    /// 连上游时带的头：凭据，和配置里给这一家写的那些
+    pub headers: Vec<(String, String)>,
+    pub provider: tw_config::Provider,
+    /// 命中的规则和经过的策略组。**路由事件在这边发**，和 HTTP 那条路报的是
+    /// 同一个形状，只是要等握手有了结果
+    pub rule: String,
+    pub group: Option<String>,
+}
+
 /// 两项防护此刻的档位和规则。**升级那一刻取一次**：一条连接活多久，就按
 /// 它开始时的配置走多久，和普通请求按开始时的运行时走是同一个道理。
 pub struct Rules {
@@ -114,68 +127,50 @@ struct Pipes {
 
 /// 接管一次升级。
 ///
-/// 路由、鉴权都在调用方做完了 —— 这里只负责把两条流接起来，并且**在每一帧
+/// 路由、鉴权都在调用方做完了 —— 这里把两条流接起来，并且**在每一帧
 /// 上重新点一遍管线的保护**。
+///
+/// 路由事件也在这里发：选中的那一家接没接下，要等和它握完手才知道。
 ///
 /// **这条连接怎么断的，就是这个请求的结局**（`ending`）。每一条收场的
 /// 路径都先报结局、再去关连接：关连接要等对面，而对面可能已经不在了。
-#[allow(clippy::too_many_arguments)]
 pub async fn proxy(
     state: AppState,
     client: WebSocket,
-    upstream_url: String,
-    upstream_headers: Vec<(String, String)>,
-    provider: tw_config::Provider,
+    upstream: Upstream,
     rules: Rules,
     id: u64,
     ending: crate::ending::Ending,
 ) {
-    let mut req =
-        match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-            upstream_url.as_str(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let why = msg!(
-                    "gw.ws.bad_url", detail = e =>
-                    "The upstream address is not a valid WebSocket address: {detail}"
-                );
-                let text = why.text.clone();
-                ending.failed("config", why);
-                close_with(client, &text).await;
-                return;
-            }
-        };
-    for (name, value) in &upstream_headers {
-        let parsed = (
-            name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>(),
-            value.parse::<tokio_tungstenite::tungstenite::http::HeaderValue>(),
-        );
-        match parsed {
-            (Ok(n), Ok(v)) => {
-                req.headers_mut().insert(n, v);
-            }
-            _ => {
-                let why = msg!(
-                    "gw.ws.bad_header", header = name =>
-                    "The upstream header `{header}` contains characters a header may not carry."
-                );
-                let text = why.text.clone();
-                ending.failed("config", why);
-                close_with(client, &text).await;
-                return;
-            }
-        }
-    }
-    let up = match dial(&upstream_url, req).await {
-        Ok(x) => x,
+    let hop_started = std::time::Instant::now();
+    let connected = connect(&upstream).await;
+    // **连不上也要报。**和 HTTP 那条路一样，失败的时候恰恰最需要看这一跳；
+    // 报在结局之前，存储层落库时手上才有它
+    let name = &upstream.provider.name;
+    let attempt = match &connected {
+        Ok(_) => crate::server::hop(name, "served", 101, hop_started),
+        Err(NotConnected {
+            status: Some(s), ..
+        }) => crate::server::hop(name, "status", *s, hop_started),
+        Err(e) => crate::server::hop_failed(name, e.why.text.clone(), hop_started),
+    };
+    // 和 HTTP 那条路同一个规矩：没接下的不按那一家记账
+    let billing = match &connected {
+        Ok(_) => state.billing_of(&upstream.provider),
+        Err(_) => tw_config::Billing::PerToken,
+    };
+    state.bus.emit(tw_api::Event::RequestRouted {
+        id,
+        rule: upstream.rule,
+        group: upstream.group,
+        attempts: vec![attempt],
+        billing: billing.slug().to_string(),
+    });
+    let up = match connected {
+        Ok(up) => up,
         Err(e) => {
-            let why = msg!(
-                "gw.ws.connect_failed", detail = e =>
-                "The upstream WebSocket could not be connected: {detail}"
-            );
-            let text = why.text.clone();
-            ending.failed("upstream", why);
+            let text = e.why.text.clone();
+            ending.failed(e.source, e.why);
             close_with(client, &text).await;
             return;
         }
@@ -187,13 +182,65 @@ pub async fn proxy(
             .detects()
             .then(|| crate::toolwall::Wall::new(rules.tools.clone())),
         rules,
-        provider: provider.name.clone(),
+        provider: upstream.provider.name,
         id,
     };
     pump(state, client, up, &mut p, ending).await;
 }
 
-/// 建连。
+/// 为什么没连上。
+struct NotConnected {
+    /// `x-thinkwatch-error` 那个词表：地址、头写坏了是 `config`，其余是
+    /// `upstream`
+    source: &'static str,
+    /// 上游回了 101 以外的状态码：**它答了话，只是没接下这条连接**。根本
+    /// 没连上的（地址不通、TLS 失败、握手中途断了）没有
+    status: Option<u16>,
+    why: Msg,
+}
+
+/// 按路由选中的那一家建连：拼请求、带上头、握手。
+async fn connect(upstream: &Upstream) -> Result<Stream, NotConnected> {
+    let config = |why: Msg| NotConnected {
+        source: "config",
+        status: None,
+        why,
+    };
+    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        upstream.url.as_str(),
+    )
+    .map_err(|e| {
+        config(msg!(
+            "gw.ws.bad_url", detail = e =>
+            "The upstream address is not a valid WebSocket address: {detail}"
+        ))
+    })?;
+    for (name, value) in &upstream.headers {
+        let parsed = (
+            name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>(),
+            value.parse::<tokio_tungstenite::tungstenite::http::HeaderValue>(),
+        );
+        let (Ok(n), Ok(v)) = parsed else {
+            return Err(config(msg!(
+                "gw.ws.bad_header", header = name =>
+                "The upstream header `{header}` contains characters a header may not carry."
+            )));
+        };
+        req.headers_mut().insert(n, v);
+    }
+    dial(&upstream.url, req)
+        .await
+        .map_err(|(status, detail)| NotConnected {
+            source: "upstream",
+            status,
+            why: msg!(
+                "gw.ws.connect_failed", detail = detail =>
+                "The upstream WebSocket could not be connected: {detail}"
+            ),
+        })
+}
+
+/// 建连。没连上时给出上游回的状态码（它答了话的话）和原因。
 ///
 /// **不用 tokio-tungstenite 自带的 `connect_async`。**那会带进另一套 TLS
 /// 信任根，于是「数据面信任的证书」和「WS 信任的」变成两回事 —— 而那种
@@ -202,7 +249,7 @@ pub async fn proxy(
 async fn dial(
     url: &str,
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
-) -> Result<Stream, String> {
+) -> Result<Stream, (Option<u16>, String)> {
     let tls = url.starts_with("wss://");
     let hostport = url
         .trim_start_matches("wss://")
@@ -220,18 +267,28 @@ async fn dial(
     };
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
-        .map_err(|e| format!("{host}:{port} could not be reached: {e}"))?;
+        .map_err(|e| (None, format!("{host}:{port} could not be reached: {e}")))?;
     let io: Box<dyn Io> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| format!("{host} is not a valid TLS host name"))?;
+            .map_err(|_| (None, format!("{host} is not a valid TLS host name")))?;
         let conn = tokio_rustls::TlsConnector::from(crate::l1::tls_config());
-        Box::new(conn.connect(name, tcp).await.map_err(|e| e.to_string())?)
+        Box::new(
+            conn.connect(name, tcp)
+                .await
+                .map_err(|e| (None, e.to_string()))?,
+        )
     } else {
         Box::new(tcp)
     };
     let (s, _) = tokio_tungstenite::client_async(req, io)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let status = match &e {
+                tokio_tungstenite::tungstenite::Error::Http(r) => Some(r.status().as_u16()),
+                _ => None,
+            };
+            (status, e.to_string())
+        })?;
     Ok(s)
 }
 

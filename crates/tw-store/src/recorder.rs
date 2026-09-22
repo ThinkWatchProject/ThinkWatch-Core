@@ -30,7 +30,8 @@ struct Partial {
     ttfb_ms: Option<i64>,
     /// 路由决策，JSON。**在结束事件之前到达** —— 尝试链走完才发它
     routing: Option<String>,
-    /// 服务它的那家怎么收钱
+    /// 服务它的那家怎么收钱。**开始事件就带着**（要发往的那一家的），路由
+    /// 事件到了换成最终服务的那家的 —— 等不到路由事件的请求也有一个真实的值
     billing: String,
     /// 做过的格式转换，JSON，带着做转换的那一家。**只留服务它的那一跳的**：
     /// 故障转移前一跳转换过、后一跳直通时，这一行不该说它转换过
@@ -171,6 +172,7 @@ impl Recorder {
                 peer,
                 key_masked,
                 provider,
+                billing,
                 model,
                 path,
                 at_ms,
@@ -199,7 +201,7 @@ impl Recorder {
                         status: None,
                         ttfb_ms: None,
                         routing: None,
-                        billing: String::new(),
+                        billing: billing.clone(),
                         translated: None,
                     },
                 );
@@ -437,7 +439,9 @@ impl Recorder {
                     cancelled: false,
                     // 本地应答没走路由 —— 它根本没到上游
                     routing: None,
-                    billing: String::new(),
+                    // 网关自己答的，费用确实是零：和 `cost_micros` 那个确定的 0 是
+                    // 同一句话
+                    billing: "free".into(),
                     cache_saved_micros: None,
                     price_source: None,
                     translated: None,
@@ -500,7 +504,7 @@ impl Recorder {
         // 价目表乘出来的数字是纯虚构的 —— 而它会混进
         // 「今日花费」里，把一个诚实的面板变成一个编出来的。计费方式未知的
         // 同样不算。**不计费的记 $0**：那是一个确定的数，和订阅不是一回事。
-        let counts_toward_money = p.billing.is_empty() || p.billing == "per-token";
+        let counts_toward_money = p.billing == "per-token";
         let free = p.billing == "free";
         //
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
@@ -636,6 +640,7 @@ mod tests {
             session_fp: None,
             client: "claude-code".into(),
             provider: "官方".into(),
+            billing: "per-token".into(),
             model: model.into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
@@ -917,6 +922,8 @@ mod tests {
         });
         let row = r.db().get(9).unwrap().unwrap();
         assert!(row.local);
+        // 网关自己答的：费用是一个确定的 0，和不计费的上游是同一句话
+        assert_eq!((row.billing.as_str(), row.cost_micros), ("free", Some(0)));
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.requests, 0, "本地应答混进了请求总数");
         assert_eq!(s.locally_answered, 1);
@@ -1058,6 +1065,131 @@ mod billing_tests {
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.unpriced_requests, 1);
         assert_eq!(s.subscription_requests, 0);
+    }
+
+    /// 一次 WebSocket 升级：开始事件里没有模型名，路由事件在握手之后到。
+    fn ws_started(id: u64, billing: &str) -> Event {
+        Event::RequestStarted {
+            key_masked: None,
+            peer: None,
+            id,
+            client_hint: None,
+            session_fp: None,
+            client: "codex".into(),
+            provider: "订阅账号".into(),
+            billing: billing.into(),
+            model: String::new(),
+            method: "WS".into(),
+            path: "/backend-api/codex/responses".into(),
+            at_ms: 1_000_000,
+        }
+    }
+
+    fn ws_routed(id: u64, billing: &str) -> Event {
+        Event::RequestRouted {
+            id,
+            rule: "catch-all".into(),
+            group: Some("__all__".into()),
+            attempts: vec![tw_api::AttemptView {
+                provider: "订阅账号".into(),
+                outcome: "served".into(),
+                status: Some(101),
+                error: None,
+                ms: 40,
+            }],
+            billing: billing.into(),
+        }
+    }
+
+    /// 一条会话跑完了：帧里的用量不算（见 `tw_gateway::ending::Ending::count`）
+    fn ws_closed(id: u64) -> Event {
+        Event::RequestFinished {
+            id,
+            model: String::new(),
+            status: 101,
+            bytes: 2048,
+            duration_ms: 600_000,
+            usage: None,
+        }
+    }
+
+    /// **WebSocket 会话按服务它的那一家记账。**以前这条路不发路由事件，这一行
+    /// 的计费方式是空的、当成按量计费：订阅账号上的一次 Codex 会话，在概览上
+    /// 被数成「没有用量、钱缺着」的一条，详情里也说没有路由信息。
+    #[test]
+    fn a_websocket_session_on_a_subscription_upstream_is_counted_as_subscription() {
+        let (_d, mut r) = rec();
+        r.on_event(&ws_started(1, "subscription"));
+        r.on_event(&ws_routed(1, "subscription"));
+        r.on_event(&ws_closed(1));
+
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.billing, "subscription");
+        let routing: tw_api::RoutingView =
+            serde_json::from_str(row.routing.as_deref().expect("WS 这一行没有路由信息")).unwrap();
+        assert_eq!(routing.rule, "catch-all");
+        assert_eq!(routing.attempts.len(), 1);
+        assert_eq!(routing.attempts[0].status, Some(101));
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(
+            (s.no_usage_requests, s.subscription_requests),
+            (0, 1),
+            "订阅账号上的 WS 会话被数成了钱缺着的一条"
+        );
+    }
+
+    /// 按量计费的那一家上的 WS 会话：没有用量，**钱是真缺着** —— 照旧数进
+    /// 「没有用量」。
+    #[test]
+    fn a_websocket_session_on_a_per_token_upstream_is_still_missing_its_money() {
+        let (_d, mut r) = rec();
+        r.on_event(&ws_started(1, "per-token"));
+        r.on_event(&ws_routed(1, "per-token"));
+        r.on_event(&ws_closed(1));
+
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!((s.no_usage_requests, s.subscription_requests), (1, 0));
+    }
+
+    /// 路由事件没等到请求就结束了（上游应答之前客户端就走了）。**按开始事件
+    /// 说的那一家记账**，而不是留一个空值、让它被当成按量计费。
+    #[test]
+    fn a_request_that_ends_before_its_route_is_reported_keeps_the_billing_it_started_with() {
+        let (_d, mut r) = rec();
+        for (id, billing) in [(1, "subscription"), (2, "per-token")] {
+            r.on_event(&Event::RequestStarted {
+                key_masked: None,
+                peer: None,
+                id,
+                client_hint: None,
+                session_fp: None,
+                client: "claude-code".into(),
+                provider: "订阅账号".into(),
+                billing: billing.into(),
+                model: "claude-sonnet-4-5".into(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                at_ms: 1_000_000,
+            });
+            r.on_event(&Event::RequestCancelled {
+                id,
+                model: String::new(),
+                status: None,
+                bytes: 0,
+                duration_ms: 3_000,
+                usage: None,
+            });
+        }
+
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(row.billing, "subscription");
+        assert_eq!(row.routing, None, "路由没走完，这一行本来就没有尝试链");
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(
+            (s.no_usage_requests, s.subscription_requests),
+            (1, 1),
+            "取消的那两条该各归各的：按量计费的钱缺着，订阅的不缺"
+        );
     }
 }
 
@@ -1560,6 +1692,7 @@ mod cancellation_tests {
             client_hint: None,
             session_fp: Some("fp".into()),
             provider: "官方".into(),
+            billing: "per-token".into(),
             model: "claude-sonnet-4-5".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
