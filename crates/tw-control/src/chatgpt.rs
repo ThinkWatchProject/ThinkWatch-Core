@@ -960,7 +960,7 @@ async fn usage(
     Path(name): Path<String>,
 ) -> Result<Json<tw_api::ChatgptUsage>, Fail> {
     let v = account_call(&s, &name, reqwest::Method::GET, "usage", None).await?;
-    let usage = parse_usage(&v);
+    let usage = parse_usage(&v, now_ms());
     // 问来的额度和响应头里读到的一样记下来：**额度只在内存里**，冷启动之后要等这个账号
     // 第一次有请求才会有，而界面一打开就该看得见
     s.gateway.record_quota(
@@ -973,7 +973,7 @@ async fn usage(
                 .map(|w| tw_gateway::quota::Window {
                     window: w.window.clone(),
                     used_percent: w.used_percent,
-                    reset_in_secs: w.reset_in_secs,
+                    resets_at_ms: w.resets_at_ms,
                     status: w.status.clone(),
                 })
                 .collect(),
@@ -985,14 +985,19 @@ async fn usage(
 /// `wham/usage` 的回答。**只取界面要用的几项**：额度、套餐，以及邮箱
 /// —— 账号不止一个时，邮箱是用户分得清哪个是哪个的唯一一项。同一份回答里
 /// 的用户 ID 和账户 ID 不往外带：界面用不上，而它们一旦出去就会进日志
-fn parse_usage(v: &Value) -> tw_api::ChatgptUsage {
+///
+/// `now_ms`：收到回答的时刻。「还有多少秒重置」要靠它换成时刻
+fn parse_usage(v: &Value, now_ms: u64) -> tw_api::ChatgptUsage {
     let window = |w: &Value| {
         let secs = w.get("limit_window_seconds")?.as_u64().filter(|s| *s > 0)?;
         let used = w.get("used_percent")?.as_f64()?.clamp(0.0, 100.0);
         Some(tw_api::QuotaWindow {
             window: tw_gateway::quota::codex_window(secs / 60),
             used_percent: used,
-            reset_in_secs: w.get("reset_after_seconds").and_then(|x| x.as_u64()),
+            resets_at_ms: w
+                .get("reset_after_seconds")
+                .and_then(|x| x.as_u64())
+                .map(|secs| now_ms.saturating_add(secs.saturating_mul(1000))),
             status: (used >= 100.0).then(|| "rejected".to_string()),
         })
     };
@@ -1122,13 +1127,17 @@ mod tests {
             },
             "rate_limit_reset_credits": {"available_count": 2}
         });
-        let u = parse_usage(&v);
+        let u = parse_usage(&v, 1_758_000_000_000);
         assert_eq!(u.email.as_deref(), Some("someone@example.com"));
         assert_eq!(u.plan.as_deref(), Some("plus"));
         assert_eq!(u.windows.len(), 1);
         assert_eq!(u.windows[0].window, "weekly");
         assert_eq!(u.windows[0].used_percent, 21.0);
-        assert_eq!(u.windows[0].reset_in_secs, Some(410907));
+        // 「还有 410907 秒」换成了时刻：收到回答那一刻往后数
+        assert_eq!(
+            u.windows[0].resets_at_ms,
+            Some(1_758_000_000_000 + 410_907_000)
+        );
         assert_eq!(u.reset_credits, Some(2));
         // 用户 ID 不往外带：界面读不出是谁，而它一旦出去就会进日志
         let json = serde_json::to_string(&u).unwrap();

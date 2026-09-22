@@ -37,10 +37,15 @@ pub use tw_types::Msg;
 /// **6 概览带上了配置版本号，协议里不再有为老版本留的默认值。**照 5 写的
 /// 界面从别处读版本号；而缺了这些字段的 core 现在连概览都解析不了。
 ///
+/// **8 额度的重置时间换成了时刻**（`resets_at_ms`，不再是 `reset_in_secs`）：
+/// 秒数是收到响应那一刻的，存下来原样再给出去就是一个不会走的倒计时。另外
+/// 概览带上了上游凭据被拒、代理不通的现状，请求详情能取还在跑的请求，掉队的
+/// 事件流订阅者会收到一条 `EventsDropped`。照 7 写的界面拿不到倒计时。
+///
 /// **7 把手动配置的说明拆成了步骤、字段和地址**（`ManualClient.how` 没了，
 /// 换成 `setup`；能接管的客户端也带上了 `manual`），客户端的最近一次请求改按
 /// 为它生成的密钥算。照 6 写的界面会把手动配置那一栏画成空白。
-pub const CONTROL_API_VERSION: u32 = 7;
+pub const CONTROL_API_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -443,9 +448,9 @@ pub enum Event {
         provider: String,
         /// 和 `QuotaWindow.window` 同一个词表
         window: String,
-        /// 多久之后重置。上游没说就没有
+        /// 什么时候重置（见 `QuotaWindow::resets_at_ms`）。上游没说就没有
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reset_in_secs: Option<u64>,
+        resets_at_ms: Option<u64>,
         at_ms: u64,
     },
     /// 数据面换了监听地址，或者没换成（旧的还在服务）。
@@ -522,6 +527,16 @@ pub enum Event {
         probe: String,
         at_ms: u64,
     },
+    /// 这个订阅者跟不上，事件流丢了它 `count` 条事件。
+    ///
+    /// **只发给掉队的那一个**，不进总线：别的订阅者什么都没丢。收到它就说明
+    /// 只靠增量维护的东西（进行中的请求、列表里每一行的状态）从这一刻起不可信，
+    /// 要整体对一次账：重读 `/in-flight`、最近的历史和概览。
+    ///
+    /// 以前丢了只记一行日志。那时事件只喂几行实时日志，少几行无所谓；现在
+    /// 「进行中」的计数和每一行的状态都靠事件，丢一个结局，那一行就永远停在
+    /// 「进行中」。
+    EventsDropped { id: u64, count: u64, at_ms: u64 },
 }
 
 /// 尝试链里的一跳。
@@ -566,8 +581,11 @@ pub struct QuotaWindow {
     /// `5h` / `7d`（Anthropic）/ `weekly`（Codex）
     pub window: String,
     pub used_percent: f64,
+    /// 什么时候重置，Unix 毫秒。**是时刻，不是「还有多少秒」**：上游报的秒数
+    /// 只在收到响应那一刻成立，存下来原样给出去，界面上就是一个不会走的倒计时。
+    /// 上游没说就没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reset_in_secs: Option<u64>,
+    pub resets_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
@@ -593,6 +611,7 @@ impl Event {
             | Event::RequestFailed { id, .. }
             | Event::RequestCancelled { id, .. }
             | Event::LocallyAnswered { id, .. }
+            | Event::EventsDropped { id, .. }
             | Event::ConfigReloaded { id, .. }
             | Event::ListenChanged { id, .. }
             | Event::ConfigRejected { id, .. }
@@ -682,6 +701,24 @@ pub struct ProxyView {
     pub has_auth: bool,
     /// 哪些上游在用它。删之前要知道，改名时它们会跟着改
     pub used_by: Vec<String>,
+    /// 网关发现它不通了：经它转发的请求连不上之后检过一次，卡在哪一步、为什么。
+    /// 之后经它的请求成功了、或者再检一次通了，就又是空的。
+    ///
+    /// **不定时探测**（见 `ProxyChanged`），所以空的意思是「没发现问题」，不是
+    /// 「刚测过是通的」。和 `ProxyChanged` 说的是同一件事：一个是现状，一个是变化
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<ProxyFault>,
+}
+
+/// 网关发现一个代理不通时，检出来的样子。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProxyFault {
+    /// 卡在哪一步。说不出来的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<L1Stage>,
+    pub detail: Msg,
+    /// 什么时候检的
+    pub at_ms: u64,
 }
 
 /// 一类客户端辅助请求的处置。
@@ -783,8 +820,15 @@ pub struct ProviderView {
     pub model_count: usize,
     /// 停用：不参与路由，模型不出现在 `/v1/models` 里
     pub disabled: bool,
-    /// closed / open
+    /// `ok` / `open`（熔断中）
     pub health: String,
+    /// 上游拒绝了凭据：最近一次得到答复的请求回的是这个状态码（401 / 403）。
+    /// 没被拒是空的，被拒之后有请求成功了也是空的。
+    ///
+    /// **熔断看不见这件事**：4xx 不算失败，换一家也一样被拒，所以一家凭据坏掉的
+    /// 上游永远不会熔断。和 `AuthChanged` 说的是同一件事：一个是现状，一个是变化
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_rejected: Option<u16>,
     /// 配置里写明的计费方式：`per-token` / `subscription` / `free` / `unknown`。
     /// 空 = 自动识别
     pub billing: Option<String>,
@@ -2009,6 +2053,11 @@ pub struct RequestDetail {
     pub row: HistoryRow,
     pub request_body: Option<BodyView>,
     pub response_body: Option<BodyView>,
+    /// 这个请求还在跑。**记录在结局到了才落库**，这时的 `row` 是到目前为止
+    /// 知道的那些：开始时的身份和上游，响应头到了就有状态码，路由走完就有
+    /// 尝试链；耗时、用量、金额都还没有。请求体已经存下了，响应体要等结局。
+    /// 结局到了再取一次，就是完整的那一份
+    pub in_flight: bool,
 }
 
 /// 一份存下来的 body。

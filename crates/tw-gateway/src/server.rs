@@ -284,8 +284,8 @@ pub struct AppState {
     expired_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// 已经报过「用完」的额度窗口：(上游, 窗口)。**窗口恢复之后清掉**，再用完会重新报
     exhausted: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
-    /// 凭据正被上游拒绝的那几家。**进入和恢复各报一次**
-    rejected: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 凭据正被上游拒绝的那几家，和它回的状态码。**进入和恢复各报一次**
+    rejected: Arc<std::sync::Mutex<std::collections::HashMap<String, u16>>>,
     /// 每个代理最近一次检查的结果。见 [`AppState::check_proxy`]
     proxies: Arc<std::sync::Mutex<std::collections::HashMap<String, ProxyState>>>,
     /// 正在服务中的请求数。见 [`crate::live`]。
@@ -307,6 +307,9 @@ struct ProxyState {
     checked_at: std::time::Instant,
     /// 正在检查。并发的失败只触发一次
     checking: bool,
+    /// 不通时检出来的样子。**概览要给现状**：只在变化时报的事件，界面晚打开
+    /// 就错过了
+    fault: Option<tw_api::ProxyFault>,
 }
 
 /// 同一个代理两次检查之间至少隔多久
@@ -502,9 +505,9 @@ impl AppState {
             .lock()
             .map(|mut g| {
                 if rejected {
-                    g.insert(provider.to_string())
+                    g.insert(provider.to_string(), status).is_none()
                 } else {
-                    g.remove(provider)
+                    g.remove(provider).is_some()
                 }
             })
             .unwrap_or(false);
@@ -535,6 +538,7 @@ impl AppState {
                 Some(st) if !st.reachable => {
                     st.reachable = true;
                     st.checked_at = std::time::Instant::now();
+                    st.fault = None;
                     true
                 }
                 _ => false,
@@ -569,6 +573,7 @@ impl AppState {
                     // 第一次就该检：把时间放到足够早
                     checked_at: std::time::Instant::now() - PROXY_RECHECK,
                     checking: false,
+                    fault: None,
                 });
                 let due = !st.checking && st.checked_at.elapsed() >= PROXY_RECHECK;
                 if due {
@@ -616,6 +621,14 @@ impl AppState {
                     // 配置刚好在这中间改了，代理没了：不报
                     None => None,
                 };
+            let fault = result.as_ref().map(|(stage, why)| tw_api::ProxyFault {
+                failed: stage.as_ref().map(|s| tw_api::L1Stage {
+                    step: s.step.slug().into(),
+                    peer: s.peer.slug().into(),
+                }),
+                detail: why.clone(),
+                at_ms: now_ms(),
+            });
             let changed = state
                 .proxies
                 .lock()
@@ -623,9 +636,11 @@ impl AppState {
                     Some(st) => {
                         st.checking = false;
                         st.checked_at = std::time::Instant::now();
-                        let reachable = result.is_none();
+                        let reachable = fault.is_none();
                         let changed = st.reachable != reachable;
                         st.reachable = reachable;
+                        // 一直不通、原因换了也记下最新的这一次
+                        st.fault = fault.clone();
                         changed
                     }
                     None => false,
@@ -634,18 +649,12 @@ impl AppState {
             if !changed {
                 return;
             }
-            match &result {
-                Some((_, why)) => tracing::warn!(proxy = %name, "proxy is unreachable: {why}"),
+            match &fault {
+                Some(f) => tracing::warn!(proxy = %name, "proxy is unreachable: {}", f.detail),
                 None => tracing::info!(proxy = %name, "proxy is reachable again"),
             }
-            let (failed, detail) = match result {
-                Some((stage, why)) => (
-                    stage.map(|s| tw_api::L1Stage {
-                        step: s.step.slug().into(),
-                        peer: s.peer.slug().into(),
-                    }),
-                    Some(why),
-                ),
+            let (failed, detail) = match fault {
+                Some(f) => (f.failed, Some(f.detail)),
                 None => (None, None),
             };
             state.bus.emit(tw_api::Event::ProxyChanged {
@@ -691,7 +700,11 @@ impl AppState {
     /// **429 的那一跳也要读**：额度用完时上游回的正是 429，只读成功那一跳的话，
     /// 「用完了」这件事永远看不到。
     pub(crate) fn note_quota(&self, id: u64, provider: &str, headers: &reqwest::header::HeaderMap) {
-        self.record_quota(id, provider, crate::quota::from_headers_reqwest(headers));
+        self.record_quota(
+            id,
+            provider,
+            crate::quota::from_headers_reqwest(headers, now_ms()),
+        );
     }
 
     /// 记下一份额度。**账号接口问来的也走这里**：额度只在内存里，冷启动之后要等第一次
@@ -712,7 +725,7 @@ impl AppState {
                 .map(|w| tw_api::QuotaWindow {
                     window: w.window.clone(),
                     used_percent: w.used_percent,
-                    reset_in_secs: w.reset_in_secs,
+                    resets_at_ms: w.resets_at_ms,
                     status: w.status.clone(),
                 })
                 .collect(),
@@ -738,7 +751,7 @@ impl AppState {
                     id: self.bus.next_id(),
                     provider: provider.to_string(),
                     window: w.window.clone(),
-                    reset_in_secs: w.reset_in_secs,
+                    resets_at_ms: w.resets_at_ms,
                     at_ms: now_ms(),
                 });
             }
@@ -907,6 +920,22 @@ impl AppState {
     /// 每个上游最近一次报的订阅额度。
     pub fn quotas(&self) -> std::collections::HashMap<String, crate::quota::Quota> {
         self.quotas.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 这一家的凭据正被拒绝的话，它回的状态码（见 [`AppState::note_auth`]）。
+    pub fn auth_rejected(&self, provider: &str) -> Option<u16> {
+        self.rejected
+            .lock()
+            .ok()
+            .and_then(|g| g.get(provider).copied())
+    }
+
+    /// 这个代理被发现不通的话，检出来的样子（见 [`AppState::check_proxy`]）。
+    pub fn proxy_fault(&self, proxy: &str) -> Option<tw_api::ProxyFault> {
+        self.proxies
+            .lock()
+            .ok()
+            .and_then(|g| g.get(proxy).and_then(|st| st.fault.clone()))
     }
 
     /// 换一份配置进去（第 ④⑤ 步）。

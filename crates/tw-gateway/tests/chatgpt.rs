@@ -602,13 +602,18 @@ async fn an_exhausted_window_is_reported_once_and_the_429_reaches_the_client() {
         .filter_map(|e| match e {
             tw_api::Event::QuotaExhausted {
                 window,
-                reset_in_secs,
+                resets_at_ms,
+                at_ms,
                 ..
-            } => Some((window, reset_in_secs)),
+            } => Some((window, resets_at_ms.map(|r| r.saturating_sub(at_ms)))),
             _ => None,
         })
         .collect();
-    assert_eq!(exhausted, vec![("weekly".to_string(), Some(3600))]);
+    // 重置的是一个时刻：收到 429 的那一刻往后一小时
+    assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+    assert_eq!(exhausted[0].0, "weekly");
+    let ahead = exhausted[0].1.expect("没有重置时刻");
+    assert!((3_590_000..=3_600_000).contains(&ahead), "{ahead}");
 }
 
 #[tokio::test]

@@ -190,7 +190,7 @@ async fn events(
     State(s): State<ControlState>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     let rx = s.bus().subscribe();
-    let stream = async_stream_from(rx);
+    let stream = async_stream_from(rx, s.bus().clone());
     // 心跳。UI 那边要能区分「没有请求」和「连接断了」—— 没有心跳的话
     // 一个安静的下午看起来就像挂了。
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
@@ -204,28 +204,43 @@ async fn in_flight(State(s): State<ControlState>) -> Json<Vec<tw_api::Event>> {
     Json(s.bus().in_flight())
 }
 
+/// 事件流编码成 SSE。
 fn async_stream_from(
-    mut rx: broadcast::Receiver<tw_api::Event>,
+    rx: broadcast::Receiver<tw_api::Event>,
+    bus: EventBus,
 ) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    futures::stream::unfold(rx_state(&mut rx), |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let data = serde_json::to_string(&ev).unwrap_or_default();
-                    return Some((Ok(SseEvent::default().data(data)), rx));
+    use futures::StreamExt;
+    event_stream(rx, bus).map(|ev| {
+        let data = serde_json::to_string(&ev).unwrap_or_default();
+        Ok(SseEvent::default().data(data))
+    })
+}
+
+/// 一个订阅者收到的事件。`bus` 用来给掉队的那条标记取一个号。
+fn event_stream(
+    mut rx: broadcast::Receiver<tw_api::Event>,
+    bus: EventBus,
+) -> impl Stream<Item = tw_api::Event> {
+    futures::stream::unfold((rx_state(&mut rx), bus), |(mut rx, bus)| async move {
+        let ev = match rx.recv().await {
+            Ok(ev) => ev,
+            // 订阅者跟不上时 broadcast 会丢最老的。**继续收而不是断开**（断掉重连
+            // 丢得更多），**但要告诉它丢了**：它手上只靠增量维护的状态从这一刻起
+            // 不可信，得自己对一次账（见 `Event::EventsDropped`）
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    dropped = n,
+                    "a control-plane subscriber fell behind; some events were dropped"
+                );
+                tw_api::Event::EventsDropped {
+                    id: bus.next_id(),
+                    count: n,
+                    at_ms: config::now_ms(),
                 }
-                // 订阅者跟不上时 broadcast 会丢最老的。**继续收而不是断开** ——
-                // UI 少几行实时日志无所谓，断掉重连才是真的难受。
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        dropped = n,
-                        "a control-plane subscriber fell behind; some events were dropped"
-                    );
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        Some((ev, (rx, bus)))
     })
 }
 
@@ -262,6 +277,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 // 而这个视图会进日志、进诊断包、进用户贴出来的截图。
                 has_auth: x.auth.is_some(),
                 used_by: tw_config::refs::proxy_users(cfg, &x.name),
+                unreachable: s.gateway.proxy_fault(&x.name),
             })
             .collect(),
         providers: cfg
@@ -414,6 +430,7 @@ fn provider_view(
             tw_gateway::health::State::Closed => "ok".into(),
             tw_gateway::health::State::Open => "open".into(),
         },
+        auth_rejected: s.gateway.auth_rejected(&p.name),
         billing: p.billing.map(|b| b.slug().to_string()),
         billing_effective: s.gateway.billing_of(p).slug().to_string(),
         references: tw_config::refs::provider_refs(cfg, &p.name)
@@ -855,12 +872,23 @@ async fn request_detail(
 ) -> Result<Json<tw_api::RequestDetail>, Fail> {
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let row = g.db().get(id).map_err(internal)?.ok_or_else(|| {
-        fail(
-            StatusCode::NOT_FOUND,
-            msg!("control.request_not_found", id = id => "There is no request {id}."),
-        )
-    })?;
+    // **还在跑的也答。**记录要等结局才落库，而用户点开的往往正是那个跑了很久的
+    // 请求：给到目前为止知道的，标着还在跑
+    let (row, in_flight) = match g.db().get(id).map_err(internal)? {
+        Some(row) => (row, false),
+        None => {
+            let row = u64::try_from(id)
+                .ok()
+                .and_then(|id| g.in_flight_row(id))
+                .ok_or_else(|| {
+                    fail(
+                        StatusCode::NOT_FOUND,
+                        msg!("control.request_not_found", id = id => "There is no request {id}."),
+                    )
+                })?;
+            (row, true)
+        }
+    };
     let at = row.at_ms;
     let body = |which| {
         let raw = g.blobs().get(at, id, which)?;
@@ -885,6 +913,7 @@ async fn request_detail(
         request_body: body(tw_store::Which::Request),
         response_body: body(tw_store::Which::Response),
         row: history_row(row, security),
+        in_flight,
     };
     Ok(Json(detail))
 }
@@ -906,7 +935,7 @@ async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>
                 .map(|w| tw_api::QuotaWindow {
                     window: w.window,
                     used_percent: w.used_percent,
-                    reset_in_secs: w.reset_in_secs,
+                    resets_at_ms: w.resets_at_ms,
                     status: w.status,
                 })
                 .collect(),
@@ -1548,5 +1577,39 @@ mod describe_tests {
         assert!(!lines.is_empty(), "空的条件列表在界面上就是「兜底」");
         assert_eq!(lines[0].field, "provider_would_be", "{lines:?}");
         assert_eq!(lines[0].values, ["relay"], "{lines:?}");
+    }
+}
+
+#[cfg(test)]
+mod event_stream_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    /// 订阅者跟不上时，**丢了要说**。以前只记一行日志，而界面上「进行中」的
+    /// 计数和每一行的状态都靠增量维护 —— 丢一个结局，那一行就永远在跑。
+    #[tokio::test]
+    async fn a_subscriber_that_falls_behind_is_told_how_many_events_it_lost() {
+        let bus = EventBus::new();
+        let stream = event_stream(bus.subscribe(), bus.clone());
+        let mut stream = Box::pin(stream);
+        // 比缓冲多塞 10 条，一条都还没读
+        let n = 1024 + 10;
+        for i in 0..n {
+            bus.emit(tw_api::Event::HealthChanged {
+                id: i,
+                provider: "p".into(),
+                state: "open".into(),
+                at_ms: 0,
+            });
+        }
+        match stream.next().await {
+            Some(tw_api::Event::EventsDropped { count, .. }) => assert_eq!(count, 10),
+            other => panic!("该先说丢了几条，实际 {other:?}"),
+        }
+        // 然后接着收留下来的：最老的丢掉了，从第 10 条开始
+        match stream.next().await {
+            Some(tw_api::Event::HealthChanged { id, .. }) => assert_eq!(id, 10),
+            other => panic!("该接着收留下来的，实际 {other:?}"),
+        }
     }
 }
