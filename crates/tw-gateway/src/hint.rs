@@ -52,6 +52,16 @@ pub fn client_hint(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// 请求从哪台机器来。**本机（回环）来的不记** —— 那是绝大多数请求，写上
+/// 只是噪音；局域网来的才值得说一句「来自 192.168.1.23」。
+///
+/// 和上面的旁证不是一类东西：它是这条 TCP 连接对面的地址，**不能伪造**。
+/// 几台机器共用一把网关密钥时，只有它分得开是哪台发的。
+pub fn peer_of(ip: std::net::IpAddr) -> Option<String> {
+    let ip = ip.to_canonical();
+    (!ip.is_loopback()).then(|| ip.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +119,19 @@ mod tests {
         let long = "x".repeat(10_000);
         let got = client_hint(&h(&[(OURS, &long)])).unwrap();
         assert!(got.chars().count() <= 40, "{}", got.len());
+    }
+
+    #[test]
+    fn only_a_request_from_another_machine_has_a_peer() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(peer_of(ip("127.0.0.1")), None);
+        assert_eq!(peer_of(ip("::1")), None);
+        // 双栈监听时本机连过来是 IPv4 映射的 IPv6，也是本机
+        assert_eq!(peer_of(ip("::ffff:127.0.0.1")), None);
+        assert_eq!(peer_of(ip("192.168.1.23")).as_deref(), Some("192.168.1.23"));
+        assert_eq!(
+            peer_of(ip("::ffff:192.168.1.23")).as_deref(),
+            Some("192.168.1.23")
+        );
     }
 }

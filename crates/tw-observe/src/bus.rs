@@ -134,6 +134,7 @@ mod tests {
 
     fn started(id: u64) -> tw_api::Event {
         tw_api::Event::RequestStarted {
+            peer: None,
             id,
             client: "c".into(),
             client_hint: None,

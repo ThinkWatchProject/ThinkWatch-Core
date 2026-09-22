@@ -1002,6 +1002,8 @@ fn history_row(
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
         session: r.session,
+        client_hint: r.client_hint,
+        peer: r.peer,
         security,
     }
 }
