@@ -678,7 +678,7 @@ mod tests {
             );
         }
         // 改计费方式、启用范围：不用重问
-        c.providers[0].billing = Some(tw_config::Billing::Free);
+        c.providers[0].billing = tw_config::Billing::Free;
         c.providers[0].models_only = Some(vec!["a-*".into()]);
         assert!(!d.reconcile(&c));
         assert_eq!(d.listing(&c.providers[0]).models, ["a-m"]);

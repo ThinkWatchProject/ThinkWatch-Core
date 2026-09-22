@@ -131,14 +131,8 @@ pub async fn quote(
         ..Default::default()
     };
     // **按要重放到的那个上游报价**，不是原来那条走的上游。计费方式和记账
-    // 同一个口径：配置里写明了，或者最近一次响应里报过额度
-    let quote = tw_gateway::quote::quote(
-        &book,
-        &provider.name,
-        &row.model,
-        &usage,
-        s.gateway.billing_of(provider),
-    );
+    let quote =
+        tw_gateway::quote::quote(&book, &provider.name, &row.model, &usage, provider.billing);
     Ok(Json(tw_api::ReplayQuote {
         model: row.model.clone(),
         provider: provider.name.clone(),

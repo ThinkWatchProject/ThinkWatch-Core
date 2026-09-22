@@ -398,8 +398,8 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     .await;
     assert!(v.get("protocol").is_none(), "{v}");
 
-    // 没写计费方式时，概览说出它实际按什么计费
+    // 没写计费方式就是按量计费，概览照实说
     let (_, ov) = call(&b.app, "GET", "/overview", serde_json::json!(null)).await;
-    assert!(ov["providers"][0].get("billing").unwrap().is_null());
-    assert_eq!(ov["providers"][0]["billing_effective"], "per-token");
+    assert_eq!(ov["providers"][0]["billing"], "per-token");
+    assert!(ov["providers"][0].get("billing_effective").is_none());
 }

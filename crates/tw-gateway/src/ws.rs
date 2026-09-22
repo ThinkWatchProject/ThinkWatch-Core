@@ -156,7 +156,7 @@ pub async fn proxy(
     };
     // 和 HTTP 那条路同一个规矩：没接下的不按那一家记账
     let billing = match &connected {
-        Ok(_) => state.billing_of(&upstream.provider),
+        Ok(_) => upstream.provider.billing,
         Err(_) => tw_config::Billing::PerToken,
     };
     state.bus.emit(tw_api::Event::RequestRouted {

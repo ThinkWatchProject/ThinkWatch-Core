@@ -127,18 +127,13 @@ fn a_flow_mapping_gets_the_new_key_inside_the_braces() {
     // 不了的 YAML** —— 护栏会拦住，但那时用户看到的是「这是个 bug，
     // 请贴到 issue 里」，而他只是用了一种正常写法。
     let cfg = "providers:\n  - { name: 甲, base_url: \"http://x\", key: sk-a }\n";
-    let out = insert(
-        cfg,
-        &path!["providers", 0, "billing"],
-        &Scalar::s("subscription"),
-    )
-    .unwrap();
-    assert!(out.contains("billing: subscription"), "{out}");
+    let out = insert(cfg, &path!["providers", 0, "billing"], &Scalar::s("free")).unwrap();
+    assert!(out.contains("billing: free"), "{out}");
     assert_eq!(out.lines().count(), cfg.lines().count(), "行数不该变");
     let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
     assert_eq!(
         v["providers"][0]["billing"],
-        serde_yaml_ng::Value::String("subscription".into())
+        serde_yaml_ng::Value::String("free".into())
     );
     assert_eq!(
         v["providers"][0]["key"],

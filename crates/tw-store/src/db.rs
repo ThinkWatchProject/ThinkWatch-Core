@@ -19,16 +19,16 @@ use tw_api::Msg;
 
 /// 当前 schema 版本。**表的样子一变就加一，改 [`Db::create`] 里那一份。**
 /// 不写迁移：项目还没有存量用户，版本对不上的库整个重建。
-const SCHEMA: i64 = 17;
+const SCHEMA: i64 = 18;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
-/// 价格页上那句「给这个模型配一个价格」能解决的只有这一种。按 token 计费
-/// 的才算 —— 订阅制的那一行不是没有价格，是这笔账不在金额这个维度上。
+/// 价格页上那句「给这个模型配一个价格」能解决的只有这一种。按量计费的才算
+/// —— 不计费的那一行记的是确定的 $0，不会缺价格。
 ///
 /// **每一处数「没有价格」的都用它。**以前各写各的：汇总只看 `cost_micros
 /// IS NULL AND billing = 'per-token'`，于是每一条失败都被数成「模型不在价目
-/// 表里」；时间桶、分组和会话只看 `cost_micros IS NULL`，连订阅制也数了进去。
+/// 表里」；时间桶、分组和会话只看 `cost_micros IS NULL`，数进了不该数的行。
 const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
                          AND billing = 'per-token')";
 
@@ -41,13 +41,6 @@ const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
 /// 那种；上游回了 4xx 的也不数，那种响应不计费。
 const NO_USAGE: &str = "(cost_micros IS NULL AND input_tokens IS NULL AND error IS NULL \
                          AND billing = 'per-token' AND (cancelled = 1 OR status < 300))";
-
-/// 这一行由订阅制上游服务：**没有金额，但不是缺了什么** —— 这笔账按订阅额度
-/// 算，不按用量算。和上面两种都不相交（那两种只数按 token 计费的）。
-///
-/// **概览和会话都用它。**概览上的「订阅额度 N 次」和会话里的订阅轮数数的是
-/// 同一批行，两处各写一遍迟早会数得不一样 —— 上面那两个常量就是这么来的。
-const SUBSCRIPTION: &str = "(billing = 'subscription')";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -113,8 +106,7 @@ pub struct RequestRow {
     /// 路由决策与尝试链，JSON。本地应答的是 None；路由还没报出结论请求就
     /// 结束了的也是：上游应答之前客户端就走了、被第二阶段规则拒绝
     pub routing: Option<String>,
-    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `free` / `unknown`。
-    /// 本地应答是 `free`
+    /// 服务它的那家怎么收钱：`per-token` / `free`。本地应答是 `free`
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     pub cache_saved_micros: Option<i64>,
@@ -233,7 +225,7 @@ impl Db {
                 -- 金额按什么价格算的。**记在行上**：事后按现在的配置去推当时
                 -- 用的是哪个价，推出来的是错的
                 price_source       TEXT,
-                -- 服务它的那家怎么收钱。**存在行上**：今天把一家改成订阅型，
+                -- 服务它的那家怎么收钱。**存在行上**：今天把一家改成不计费，
                 -- 昨天的账不该跟着变
                 billing            TEXT    NOT NULL,
                 -- 路由决策与尝试链，一列 JSON：永远跟着那一行一起取
@@ -386,10 +378,6 @@ pub struct SessionRow {
     pub unpriced_turns: i64,
     /// 没有拿到用量、所以算不出钱的轮数（见 `NO_USAGE`）
     pub no_usage_turns: i64,
-    /// 由订阅制上游服务的轮数（见 `SUBSCRIPTION`）。**少了它，一个全走订阅的
-    /// 会话和一个一轮都算不出钱的会话长得一模一样**：有价格、没有价格、没有
-    /// 用量都是 0 轮
-    pub subscription_turns: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -417,8 +405,7 @@ pub struct TurnRow {
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号**
     pub cost_estimated: bool,
-    /// 服务它的那家怎么收钱（见 `RequestRow::billing`）。**订阅制那一轮没有
-    /// 金额，但不是「无法计价」** —— 只看 `cost_micros` 分不出这两种
+    /// 服务它的那家怎么收钱（见 `RequestRow::billing`）
     pub billing: String,
 }
 
@@ -454,8 +441,7 @@ impl Db {
                     SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
                     COUNT(cost_micros),
-                    COALESCE(SUM({NO_USAGE}), 0),
-                    COALESCE(SUM({SUBSCRIPTION}), 0)
+                    COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
              WHERE session IS NOT NULL AND local = 0
              GROUP BY session
@@ -484,7 +470,6 @@ impl Db {
                 cost_micros_estimated: r.get(15)?,
                 priced_turns: r.get(16)?,
                 no_usage_turns: r.get(17)?,
-                subscription_turns: r.get(18)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -561,9 +546,8 @@ impl Db {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let since = now - days * 24 * 3600 * 1000;
-        // **只数配一个价格就能解决的那些**（`NO_PRICE`）。本地应答不算（它
-        // 本来就没有成本），订阅制不算（它的成本不在这个维度上）；失败的、
-        // 没有用量的也不算 —— 给那个模型配价格，那几行照样算不出钱，而这一页
+        // **只数配一个价格就能解决的那些**（`NO_PRICE`）。本地应答和不计费的
+        // 不算（它们记的是确定的 $0）；失败的、没有用量的也不算 —— 给那个模型配价格，那几行照样算不出钱，而这一页
         // 让人去配的正是价格。
         let filter = format!(
             "at_ms >= ?1 AND local = 0 AND {NO_PRICE} AND model IS NOT NULL AND model <> ''"
@@ -604,25 +588,9 @@ impl Db {
             exact,
             estimated,
             unpriced,
-            sub_reqs,
-            sub_tokens,
             cache_saved,
             no_usage,
-        ): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = self.conn.query_row(
+        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             &format!(
                 "SELECT
                 COUNT(*),
@@ -634,10 +602,6 @@ impl Db {
                 COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM({NO_PRICE}), 0),
-                COALESCE(SUM({SUBSCRIPTION}), 0),
-                COALESCE(SUM(CASE WHEN {SUBSCRIPTION}
-                                  THEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
-                                  ELSE 0 END), 0),
                 COALESCE(SUM(cache_saved_micros), 0),
                 COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
@@ -657,8 +621,6 @@ impl Db {
                     r.get(8)?,
                     r.get(9)?,
                     r.get(10)?,
-                    r.get(11)?,
-                    r.get(12)?,
                 ))
             },
         )?;
@@ -679,8 +641,6 @@ impl Db {
             cost_micros_estimated: estimated,
             unpriced_requests: unpriced,
             no_usage_requests: no_usage,
-            subscription_requests: sub_reqs,
-            subscription_tokens: sub_tokens,
             cache_saved_micros: cache_saved,
         })
     }
@@ -1088,17 +1048,12 @@ pub struct Summary {
     /// 有多少条请求**根本没有价格**（模型不在价目表里，见 `NO_PRICE`）。
     ///
     /// 这是成本三态的第三态。把它们当成 0 会让总额悄悄偏低，而用户没有
-    /// 任何线索知道少算了什么。**订阅型的不算在这里** —— 那不是
-    /// 「不知道价格」，是「这笔账不在这个维度上」。
+    /// 任何线索知道少算了什么。
     pub unpriced_requests: i64,
     /// 有多少条请求**没有拿到用量**，所以同样算不出钱（见 `NO_USAGE`）。
     /// 和上面那个分开数：两者都让总额偏低，但只有上面那个是配一个价格
     /// 就能解决的
     pub no_usage_requests: i64,
-    /// 走订阅型上游的请求数。**不参与金额合计**
-    pub subscription_requests: i64,
-    /// 那些请求用掉的 token。**它才是订阅用户该看的量**
-    pub subscription_tokens: i64,
     /// 缓存命中一共省下了多少微分
     pub cache_saved_micros: i64,
 }
@@ -1870,15 +1825,12 @@ mod cost_state_tests {
         assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 3));
     }
 
-    /// **钱缺着的只有按量计费的那些。**订阅、不计费、计费方式未知的，没有
-    /// 用量也好、模型不在价目表里也好，哪一种都不是：这笔账本来就不按价目表算。
+    /// **钱缺着的只有按量计费的那些。**不计费的，没有用量也好、模型不在价目表
+    /// 里也好，哪一种都不是：这笔账本来就不按价目表算。
     #[test]
     fn only_a_per_token_row_can_be_missing_its_money() {
         let db = Db::in_memory().unwrap();
-        for (i, billing) in ["per-token", "subscription", "free", "unknown"]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, billing) in ["per-token", "free"].into_iter().enumerate() {
             let id = i as i64 * 2 + 1;
             let mut no_usage = without_usage(id, 100);
             no_usage.billing = billing.into();
@@ -1902,65 +1854,6 @@ mod cost_state_tests {
             (1, 1)
         );
         assert_eq!(db.unpriced_recent(365_000).unwrap().0, 1);
-    }
-
-    /// 订阅制的那一行**哪一种都不是**：这笔账不在金额这个维度上。汇总早就
-    /// 这么算了，而时间桶、分组和会话以前把它数成了「没有价格」。
-    #[test]
-    fn a_subscription_row_is_neither_anywhere() {
-        let db = Db::in_memory().unwrap();
-        let mut r = row(1, 100);
-        r.billing = "subscription".into();
-        r.cost_micros = None;
-        r.session = Some("s1".into());
-        db.insert(&r).unwrap();
-
-        let b = db.cost_buckets(0, 1000, 1000).unwrap();
-        assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (0, 0));
-        let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
-        assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 0));
-        let s = &db.sessions(None, 10).unwrap()[0];
-        assert_eq!((s.unpriced_turns, s.no_usage_turns), (0, 0));
-        assert_eq!(s.priced_turns, 0, "订阅制那一轮没有价格可言");
-    }
-
-    /// **全走订阅的会话和一轮都算不出钱的会话是两个结论。**以前两者在会话
-    /// 这一层长得一模一样 —— 有价格、没有价格、没有用量都是 0 轮 —— 界面只能
-    /// 都说成「无法计价」，而概览上同一批请求写着「订阅额度 N 次」。
-    #[test]
-    fn a_session_counts_its_subscription_turns_as_what_they_are() {
-        let db = Db::in_memory().unwrap();
-        let mut served = row(1, 100);
-        served.billing = "subscription".into();
-        served.cost_micros = None;
-        // 断在中间的那一轮也是订阅上游服务的，不因为失败就变成「没有价格」
-        let mut broken = served.clone();
-        broken.id = 2;
-        broken.at_ms = 200;
-        broken.error = Some(upstream_failed("流中断：上游断开了"));
-        for mut r in [served, broken, row(3, 300), unknown_model(4, 400)] {
-            r.session = Some("s1".into());
-            db.insert(&r).unwrap();
-        }
-
-        let s = &db.sessions(None, 10).unwrap()[0];
-        assert_eq!(s.subscription_turns, 2);
-        assert_eq!(
-            (s.priced_turns, s.unpriced_turns, s.no_usage_turns),
-            (1, 1, 0),
-            "订阅那几轮混进了别的状态"
-        );
-        assert_eq!(
-            db.summary(0, 1000).unwrap().subscription_requests,
-            s.subscription_turns,
-            "概览和会话数的不是同一批行"
-        );
-        // 每一轮带着自己的计费方式：瀑布图上订阅那一轮不能写成「无法计价」
-        let turns = db.turns("s1").unwrap();
-        assert_eq!(
-            turns.iter().map(|t| t.billing.as_str()).collect::<Vec<_>>(),
-            ["subscription", "subscription", "per-token", "per-token"]
-        );
     }
 
     /// 价格页只列**配一个价格就能解决**的模型。列出一个失败了的、或者

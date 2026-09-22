@@ -2,7 +2,8 @@
 //!
 //! 原文四条：**能回答「昨天花了多少钱」「哪家 TTFT 最差」「缓存省了
 //! 多少」；混入订阅型上游后金额不失真；菜单栏花费从两位数跳三位数时
-//! 右边图标不移动；实测 UI 关窗后的常驻内存。**
+//! 右边图标不移动；实测 UI 关窗后的常驻内存。**第四条说的订阅型上游在计费
+//! 收成两档之后已经按价目表算钱，这里改测不计费的上游。
 //!
 //! 后两条不在这一层：菜单栏那条在桌面版（它渲染的是像素），内存那条是
 //! 一次性实测。这个文件盯住前四条里属于数据层的。
@@ -108,13 +109,13 @@ fn three_you_can_ask_how_much_the_cache_saved() {
     assert_eq!(db.summary(0, NOW + 1).unwrap().cache_saved_micros, 4_500);
 }
 
-/// 验收四：**混入订阅型上游之后金额不失真。**
+/// 验收四：**混入不计费的上游之后金额不失真。**
 ///
-/// 订阅制的边际成本是零，按 API 价目表给它算一个数字是纯虚构的。
-/// 所以它**不进金额合计**，但要能数出来有多少条 ——
-/// 「$1.23」和「$1.23，另有 4 条走的订阅」是两个不同的结论。
+/// 原文说的是订阅型上游。计费收成「按量计费 / 不计费」两档之后，订阅账号也
+/// 按价目表算费用，和别的上游没有区别；还需要盯住的是不计费的那一家：它记的
+/// 是确定的 $0，**进合计但不加钱**，条数照样数，也不能被当成「算不出价钱」。
 #[test]
-fn four_a_subscription_upstream_does_not_distort_the_money() {
+fn four_a_free_upstream_does_not_distort_the_money() {
     let (_d, db) = open();
     for i in 1..=2 {
         db.insert(&req(i, NOW)).unwrap();
@@ -122,19 +123,16 @@ fn four_a_subscription_upstream_does_not_distort_the_money() {
     let before = db.summary(0, NOW + 1).unwrap();
     for i in 3..=6 {
         let mut r = req(i, NOW);
-        r.provider = "订阅家".into();
-        r.billing = "subscription".into();
-        // 订阅制那几条没有成本 —— 它的账不在这个维度上
-        r.cost_micros = None;
+        r.provider = "本地模型".into();
+        r.billing = "free".into();
+        r.cost_micros = Some(0);
         db.insert(&r).unwrap();
     }
     let after = db.summary(0, NOW + 1).unwrap();
     assert_eq!(
         after.cost_micros_exact, before.cost_micros_exact,
-        "**订阅制把金额算进去了**，那个数字是虚构的"
+        "不计费的那几条加了钱"
     );
-    assert_eq!(after.requests, 6, "订阅制那几条要能被数出来");
-    assert_eq!(after.subscription_requests, 4, "订阅制的条数没单独数");
-    // 它们也不该被算成「算不出价钱」 —— 那是另一种状态（三态）
-    assert_eq!(after.unpriced_requests, 0, "订阅制被当成「不知道价格」了");
+    assert_eq!(after.requests, 6, "不计费那几条要能被数出来");
+    assert_eq!(after.unpriced_requests, 0, "不计费被当成「不知道价格」了");
 }

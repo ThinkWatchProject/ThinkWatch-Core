@@ -191,7 +191,7 @@ async fn editing_without_a_key_keeps_the_key_and_touches_only_what_changed() {
         serde_json::json!({ "provider": {
             "name": "官方",
             "proxy": "system",
-            "billing": "subscription",
+            "billing": "free",
         }}),
     )
     .await;
@@ -205,7 +205,25 @@ async fn editing_without_a_key_keeps_the_key_and_touches_only_what_changed() {
     );
     let p = &b.parsed().providers[0];
     assert_eq!(p.proxy, "system");
-    assert_eq!(p.billing, Some(tw_config::Billing::Subscription));
+    assert_eq!(p.billing, tw_config::Billing::Free);
+}
+
+#[tokio::test]
+async fn billing_is_per_token_or_free_and_nothing_else() {
+    // 订阅账号也按价目表算费用：「订阅」「未知」不再是计费方式，存不进去
+    let b = bed(BASE);
+    let before = b.file();
+    for gone in ["subscription", "unknown"] {
+        let (st, body) = call(
+            &b.app,
+            "PUT",
+            "/providers/官方",
+            serde_json::json!({ "provider": { "name": "官方", "billing": gone }}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{gone}：{body}");
+    }
+    assert_eq!(b.file(), before, "拒绝了的保存不该动配置");
 }
 
 #[tokio::test]

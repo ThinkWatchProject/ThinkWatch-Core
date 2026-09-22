@@ -714,7 +714,6 @@ async fn exchange_and_save(
                 base_url: backend.clone(),
                 protocol: Some(Protocol::Chatgpt),
                 proxy: proxy.clone(),
-                billing: Some(tw_config::Billing::Subscription),
                 ..Default::default()
             });
             // 重新登录：换掉凭据和账户 ID，其余设置（出站方式、模型范围、停用…）不动

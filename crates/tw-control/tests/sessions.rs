@@ -1,8 +1,7 @@
 //! 会话端点的形状。
 //!
-//! 各种轮次怎么数在 tw-store 里测；这里盯的是**界面拿到的那份 JSON**。
-//! 订阅那几轮要作为一个数、每一轮的计费方式要作为一个字段送到界面 ——
-//! 否则界面手里只有「没有金额」，只能把订阅说成「无法计价」。
+//! 各种轮次怎么数在 tw-store 里测；这里盯的是**界面拿到的那份 JSON**：
+//! 每一轮的金额和计费方式都要作为字段送到界面。
 
 use std::sync::Arc;
 
@@ -13,7 +12,7 @@ use tw_control::{ConfigManager, ControlState};
 
 const BASE: &str = "version: 1\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n    key: sk-x\n";
 
-/// 一轮 Codex 的请求。按 token 计费的那一轮带着金额，订阅制的没有。
+/// 一轮 Codex 的请求。按量计费的那一轮带着金额，不计费的记 $0。
 fn turn(id: i64, billing: &str) -> tw_store::db::RequestRow {
     let per_token = billing == "per-token";
     tw_store::db::RequestRow {
@@ -24,7 +23,7 @@ fn turn(id: i64, billing: &str) -> tw_store::db::RequestRow {
         client: "codex".into(),
         client_hint: None,
         session: Some("s1".into()),
-        provider: if per_token { "官方" } else { "ChatGPT" }.into(),
+        provider: if per_token { "官方" } else { "本地" }.into(),
         model: "gpt-5-codex".into(),
         path: "/v1/responses".into(),
         status: Some(200),
@@ -35,7 +34,7 @@ fn turn(id: i64, billing: &str) -> tw_store::db::RequestRow {
         output_tokens: Some(20),
         cache_read_tokens: None,
         cache_write_tokens: None,
-        cost_micros: per_token.then_some(1_000),
+        cost_micros: Some(if per_token { 1_000 } else { 0 }),
         cost_estimated: false,
         error: None,
         local: false,
@@ -87,36 +86,35 @@ async fn get(app: &axum::Router, path: &str) -> serde_json::Value {
     serde_json::from_slice(&b).unwrap()
 }
 
-/// 报这个问题的那种会话：Codex 走 ChatGPT 账号，一轮按量计费的都没有。
-/// **界面要能说「订阅额度 2 轮」，而不是「无法计价」。**
+/// 全走不计费上游的会话：金额是确定的 $0，每一轮都算「有价格」，
+/// 不能被说成「无法计价」。
 #[tokio::test]
-async fn a_session_served_by_a_subscription_says_so_rather_than_looking_unpriced() {
-    let (_d, app) = app(&[turn(1, "subscription"), turn(2, "subscription")]);
+async fn a_session_on_a_free_upstream_costs_exactly_zero() {
+    let (_d, app) = app(&[turn(1, "free"), turn(2, "free")]);
 
     let list = get(&app, "/sessions").await;
     let s = &list[0];
-    assert_eq!(s["priced_turns"], 0);
+    assert_eq!(s["cost_micros"], 0);
+    assert_eq!(s["priced_turns"], 2, "{s}");
     assert_eq!(s["unpriced_turns"], 0);
     assert_eq!(s["no_usage_turns"], 0);
-    assert_eq!(s["subscription_turns"], 2, "{s}");
+    assert!(s.get("subscription_turns").is_none(), "{s}");
 
     let detail = get(&app, "/sessions/s1").await;
-    assert_eq!(detail["session"]["subscription_turns"], 2);
     for t in detail["turns"].as_array().unwrap() {
-        assert_eq!(t["cost_micros"], serde_json::Value::Null);
-        assert_eq!(t["billing"], "subscription", "{t}");
+        assert_eq!(t["cost_micros"], 0);
+        assert_eq!(t["billing"], "free", "{t}");
     }
 }
 
-/// 混着走的会话：金额只合计按量计费的那一轮，订阅那一轮单独数。
+/// 混着走的会话：不计费那一轮按 $0 进合计，每一轮带着自己的计费方式。
 #[tokio::test]
-async fn a_mixed_session_keeps_the_money_and_the_subscription_apart() {
-    let (_d, app) = app(&[turn(1, "per-token"), turn(2, "subscription")]);
+async fn a_mixed_session_adds_the_free_turn_as_zero() {
+    let (_d, app) = app(&[turn(1, "per-token"), turn(2, "free")]);
 
     let s = &get(&app, "/sessions").await[0];
     assert_eq!(s["cost_micros"], 1_000);
-    assert_eq!(s["priced_turns"], 1);
-    assert_eq!(s["subscription_turns"], 1);
+    assert_eq!(s["priced_turns"], 2);
 
     let detail = get(&app, "/sessions/s1").await;
     let billing: Vec<_> = detail["turns"]
@@ -125,7 +123,7 @@ async fn a_mixed_session_keeps_the_money_and_the_subscription_apart() {
         .iter()
         .map(|t| t["billing"].as_str().unwrap())
         .collect();
-    assert_eq!(billing, ["per-token", "subscription"]);
+    assert_eq!(billing, ["per-token", "free"]);
 }
 
 /// **请求和会话是同一批记录的两个粒度，界面要能在两者之间走动。**

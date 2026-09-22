@@ -542,11 +542,9 @@ impl Recorder {
         // **不引 tw-config** —— 存储层不该知道配置的形状。这个
         // 字符串是事件契约的一部分，比较它就够了。
         //
-        // **订阅型不按价目表算钱。**订阅制的边际成本是零，按 API
-        // 价目表乘出来的数字是纯虚构的 —— 而它会混进
-        // 「今日花费」里，把一个诚实的面板变成一个编出来的。计费方式未知的
-        // 同样不算。**不计费的记 $0**：那是一个确定的数，和订阅不是一回事。
-        let counts_toward_money = p.billing == "per-token";
+        // **按量计费的一律按价目表算钱**，订阅账号也一样：费用是「用量 ×
+        // 这家所选价目表里该模型的单价」，订阅账号算出来的就是按 API 价格
+        // 折算的费用。**不计费的记 $0**：那是一个确定的数。
         let free = p.billing == "free";
         //
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
@@ -555,10 +553,10 @@ impl Recorder {
         let partial = !matches!(how, Ending::Finished);
         let book = self.pricing.load();
         // **按这个请求实际走的上游查价** —— 同一个模型在不同上游不是同一个价
-        let resolved = if counts_toward_money {
-            book.resolve_for(&p.provider, &p.model)
-        } else {
+        let resolved = if free {
             None
+        } else {
+            book.resolve_for(&p.provider, &p.model)
         };
         let cost = match (&u, &resolved) {
             _ if free => Some(Cost::Known(0)),
@@ -568,8 +566,7 @@ impl Recorder {
         let (cost_micros, estimated) = match cost {
             Some(Cost::Known(m)) => (Some(m), false),
             Some(Cost::Estimated(m)) => (Some(m), true),
-            // 没有价格 / 没有 usage / 不按 token 计费，
-            // 三种都是「这笔账不在这个维度上」
+            // 没有价格 / 没有 usage：两种都算不出钱，由汇总分开数
             Some(Cost::Unpriced { .. }) | None => (None, false),
         };
         // 缓存命中省下了多少。**在这里算，不在查询时算**
@@ -1036,25 +1033,8 @@ mod billing_tests {
     }
 
     #[test]
-    fn a_subscription_call_does_not_get_a_made_up_price() {
-        // **订阅制的边际成本是零，按 API 价目表乘出来的数字是纯虚构的**。
-        // 混进「今日花费」里，就把一个诚实的面板变成了一个
-        // 编出来的。
-        let (_d, mut r) = rec();
-        r.on_event(&started(1, "claude-sonnet-4-5"));
-        r.on_event(&routed(1, "subscription"));
-        r.on_event(&finished(1, usage()));
-        let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(row.cost_micros, None, "订阅调用被按价目表算了钱");
-        // **token 数还是要记的** —— 那才是订阅用户该看的量
-        assert_eq!(row.input_tokens, Some(100_000));
-        assert_eq!(row.billing, "subscription");
-    }
-
-    #[test]
     fn a_free_call_costs_exactly_zero_rather_than_nothing() {
-        // 「不计费」和「订阅」在费用栏上是两句不同的话：$0 是一个确定的数，
-        // 能进合计；订阅那一栏说的是这笔账不在金额这个维度上
+        // $0 是一个确定的数，能进合计 —— 和「算不出来」是两句不同的话
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
         r.on_event(&routed(1, "free"));
@@ -1064,7 +1044,7 @@ mod billing_tests {
         assert!(!row.cost_estimated);
         assert_eq!(row.price_source, None, "没有按任何价目表算");
         let s = r.db().summary(0, i64::MAX).unwrap();
-        assert_eq!((s.unpriced_requests, s.subscription_requests), (0, 0));
+        assert_eq!((s.unpriced_requests, s.no_usage_requests), (0, 0));
     }
 
     #[test]
@@ -1077,36 +1057,13 @@ mod billing_tests {
     }
 
     #[test]
-    fn the_summary_keeps_subscription_calls_out_of_the_money_but_counts_them() {
-        // 「混了订阅上游之后，Dashboard 的今日花费要拆成三栏：实测计费、
-        // 估算计费、订阅调用量」。
-        let (_d, mut r) = rec();
-        r.on_event(&started(1, "claude-sonnet-4-5"));
-        r.on_event(&routed(1, "per-token"));
-        r.on_event(&finished(1, usage()));
-        r.on_event(&started(2, "claude-sonnet-4-5"));
-        r.on_event(&routed(2, "subscription"));
-        r.on_event(&finished(2, usage()));
-
-        let s = r.db().summary(0, i64::MAX).unwrap();
-        assert_eq!(s.requests, 2);
-        assert!(s.cost_micros_exact > 0, "按量那条该有钱");
-        assert_eq!(s.subscription_requests, 1);
-        assert_eq!(s.subscription_tokens, 101_000, "订阅那条的 token 量");
-        // **订阅的不算「没有价格」** —— 那不是「不知道」，是「这笔账不在
-        // 这个维度上」，两者在界面上是两句不同的话
-        assert_eq!(s.unpriced_requests, 0);
-    }
-
-    #[test]
-    fn a_model_with_no_price_is_still_counted_as_unpriced_not_as_subscription() {
+    fn a_model_with_no_price_is_counted_as_unpriced() {
         let (_d, mut r) = rec();
         r.on_event(&started(1, "中转站自己起的名字"));
         r.on_event(&routed(1, "per-token"));
         r.on_event(&finished(1, usage()));
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.unpriced_requests, 1);
-        assert_eq!(s.subscription_requests, 0);
     }
 
     /// 一次 WebSocket 升级：开始事件里没有模型名，路由事件在握手之后到。
@@ -1156,17 +1113,18 @@ mod billing_tests {
     }
 
     /// **WebSocket 会话按服务它的那一家记账。**以前这条路不发路由事件，这一行
-    /// 的计费方式是空的、当成按量计费：订阅账号上的一次 Codex 会话，在概览上
-    /// 被数成「没有用量、钱缺着」的一条，详情里也说没有路由信息。
+    /// 的计费方式是空的、当成按量计费：不计费那一家上的一次 Codex 会话，在概览
+    /// 上被数成「没有用量、钱缺着」的一条，详情里也说没有路由信息。
     #[test]
-    fn a_websocket_session_on_a_subscription_upstream_is_counted_as_subscription() {
+    fn a_websocket_session_on_a_free_upstream_costs_exactly_zero() {
         let (_d, mut r) = rec();
-        r.on_event(&ws_started(1, "subscription"));
-        r.on_event(&ws_routed(1, "subscription"));
+        r.on_event(&ws_started(1, "free"));
+        r.on_event(&ws_routed(1, "free"));
         r.on_event(&ws_closed(1));
 
         let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(row.billing, "subscription");
+        assert_eq!(row.billing, "free");
+        assert_eq!(row.cost_micros, Some(0));
         let routing: tw_api::RoutingView =
             serde_json::from_str(row.routing.as_deref().expect("WS 这一行没有路由信息")).unwrap();
         assert_eq!(routing.rule, "catch-all");
@@ -1174,9 +1132,8 @@ mod billing_tests {
         assert_eq!(routing.attempts[0].status, Some(101));
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(
-            (s.no_usage_requests, s.subscription_requests),
-            (0, 1),
-            "订阅账号上的 WS 会话被数成了钱缺着的一条"
+            s.no_usage_requests, 0,
+            "不计费的 WS 会话被数成了钱缺着的一条"
         );
     }
 
@@ -1190,7 +1147,7 @@ mod billing_tests {
         r.on_event(&ws_closed(1));
 
         let s = r.db().summary(0, i64::MAX).unwrap();
-        assert_eq!((s.no_usage_requests, s.subscription_requests), (1, 0));
+        assert_eq!(s.no_usage_requests, 1);
     }
 
     /// 路由事件没等到请求就结束了（上游应答之前客户端就走了）。**按开始事件
@@ -1198,7 +1155,7 @@ mod billing_tests {
     #[test]
     fn a_request_that_ends_before_its_route_is_reported_keeps_the_billing_it_started_with() {
         let (_d, mut r) = rec();
-        for (id, billing) in [(1, "subscription"), (2, "per-token")] {
+        for (id, billing) in [(1, "free"), (2, "per-token")] {
             r.on_event(&Event::RequestStarted {
                 key_masked: None,
                 peer: None,
@@ -1224,13 +1181,12 @@ mod billing_tests {
         }
 
         let row = r.db().get(1).unwrap().unwrap();
-        assert_eq!(row.billing, "subscription");
+        assert_eq!(row.billing, "free");
         assert_eq!(row.routing, None, "路由没走完，这一行本来就没有尝试链");
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(
-            (s.no_usage_requests, s.subscription_requests),
-            (1, 1),
-            "取消的那两条该各归各的：按量计费的钱缺着，订阅的不缺"
+            s.no_usage_requests, 1,
+            "取消的那两条该各归各的：按量计费的钱缺着，不计费的不缺"
         );
     }
 }
@@ -1272,8 +1228,8 @@ mod pricing_report_tests {
         assert_eq!(priced, Some((1, Some(300_000))));
     }
 
-    /// **「算不出来」要原样报出去，不能报成零。**订阅制上游、价目表里
-    /// 没有的模型，都是这一档 —— 报 0 的话界面会画一个「免费」。
+    /// **「算不出来」要原样报出去，不能报成零。**价目表里没有的模型就是这一档
+    /// —— 报 0 的话界面会画一个「免费」。
     #[test]
     fn an_unpriceable_request_reports_nothing_not_zero() {
         let (_d, mut r) = rec();

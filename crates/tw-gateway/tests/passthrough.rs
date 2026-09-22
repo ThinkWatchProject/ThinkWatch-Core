@@ -2139,12 +2139,10 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
 }
 
 #[tokio::test]
-async fn an_upstream_that_reports_quota_is_treated_as_subscription_from_then_on() {
-    // **订阅型不该按价目表算钱**，而「它是不是订阅型」
-    // 这个信号一直在响应头里 —— 不该变成一个用户要填的字段。
-    //
-    // 这条同时钉住那个已知边界：**第一个请求会被按量计价**，因为那时
-    // 我们还没见过它的额度头。之后就对了。
+async fn reporting_quota_does_not_change_how_an_upstream_is_billed() {
+    // **订阅账号也按价目表算费用。**以前报过额度头的上游从第二个请求起就
+    // 改记成订阅、不算钱，于是同一个账号的第一个请求有费用、之后的没有。
+    // 额度是额度，计费是计费：额度头只进额度，不改计费方式。
     let up = {
         let app = Router::new().fallback(axum::routing::any(|| async {
             axum::response::Response::builder()
@@ -2176,34 +2174,30 @@ async fn an_upstream_that_reports_quota_is_treated_as_subscription_from_then_on(
     tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    send_to(gw).await;
-    assert_eq!(
-        next_billing(&mut rx).await,
-        "per-token",
-        "第一个请求本来就判不出来 —— 那时还没见过额度头"
-    );
-    send_to(gw).await;
-    assert_eq!(
-        next_billing(&mut rx).await,
-        "subscription",
-        "见过额度头之后还按量算钱 —— 那个金额是编出来的"
-    );
+    for n in 1..=2 {
+        send_to(gw).await;
+        assert_eq!(
+            next_billing(&mut rx).await,
+            "per-token",
+            "第 {n} 个请求：报过额度头之后不该改记成别的计费方式"
+        );
+    }
 }
 
 #[tokio::test]
-async fn writing_billing_in_the_config_removes_the_first_request_ambiguity() {
-    // 在乎那一条记录的人，在配置里写一行就没有歧义了。
+async fn free_billing_in_the_config_goes_out_with_the_request() {
+    // 本地模型、免费额度写 `billing: free`，记账那一层按这个词记 $0
     let (up, _) = start_upstream(false).await;
     let mut cfg = cfg_with(
         vec![Provider {
-            name: "订阅账号".into(),
+            name: "本地".into(),
             base_url: format!("http://{up}"),
             key: Some("k".into()),
             ..Default::default()
         }],
         vec![],
     );
-    cfg.providers[0].billing = Some(tw_config::Billing::Subscription);
+    cfg.providers[0].billing = tw_config::Billing::Free;
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
     let gw = {
@@ -2218,7 +2212,7 @@ async fn writing_billing_in_the_config_removes_the_first_request_ambiguity() {
         if let Ok(Ok(tw_api::Event::RequestRouted { billing, .. })) =
             tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
         {
-            assert_eq!(billing, "subscription", "配置里写了却没生效");
+            assert_eq!(billing, "free", "配置里写了却没生效");
             return;
         }
     }
