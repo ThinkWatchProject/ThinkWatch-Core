@@ -45,7 +45,13 @@ pub use tw_types::Msg;
 /// **7 把手动配置的说明拆成了步骤、字段和地址**（`ManualClient.how` 没了，
 /// 换成 `setup`；能接管的客户端也带上了 `manual`），客户端的最近一次请求改按
 /// 为它生成的密钥算。照 6 写的界面会把手动配置那一栏画成空白。
-pub const CONTROL_API_VERSION: u32 = 8;
+///
+/// **9 网关不再有自己的并发上限**：概览里的 `limits` 没了，只剩每把密钥
+/// 自己的 `max_concurrent`，超出的请求等着、不再被拒（失败来源里没有了
+/// `overloaded`）。放行网段不再有「空 = 私网段」：不写是默认名单、空就是
+/// 只有本机，`ListenView` 带上了默认名单；`GET /interfaces` 每张网卡一行。
+/// 照 8 写的界面会画出一节改了也不起作用的并发设置。
+pub const CONTROL_API_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -146,8 +152,8 @@ pub enum Event {
         usage: Option<UsageView>,
     },
     /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表
-    /// （`auth` / `config` / `upstream` / `request` / `overloaded` /
-    /// `rate_limited` / `denied`），另外多一个 `internal`：网关自己的代码
+    /// （`auth` / `config` / `upstream` / `request` / `rate_limited` /
+    /// `denied`），另外多一个 `internal`：网关自己的代码
     /// 崩掉了。它只出现在这里 —— 那时往往已经没有一个 HTTP 响应能带上它。
     RequestFailed {
         id: u64,
@@ -666,8 +672,6 @@ pub struct Overview {
     pub default_route: String,
     /// 客户端自己发的辅助请求怎么处理
     pub client_probes: Vec<ProbeView>,
-    /// 并发上限
-    pub limits: LimitsView,
     /// 日志留多久
     pub retention: RetentionView,
     /// 自定义价目表。默认价目表不在这里 —— 它的状态看 `/pricing`
@@ -732,16 +736,6 @@ pub struct ProbeView {
     pub id: String,
     /// `intercept` / `route` / `passthrough`
     pub mode: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LimitsView {
-    /// 单个上游
-    pub per_provider: usize,
-    /// 队列上限。满了才真的拒绝
-    pub queue_depth: usize,
-    /// 排太久还是要放弃
-    pub queue_timeout_secs: u64,
 }
 
 /// 日志留多久。两个期限分开，因为正文和记录行的代价差三个数量级 ——
@@ -1082,8 +1076,8 @@ pub struct ListenSave {
     /// 同配置里的 `listen.gateway.bind`：`loopback` / `all` / 网卡名 / 地址
     pub bind: String,
     pub port: u16,
-    /// 放行网段。**只在监听超出本机时有意义**；空 = 按私网段放行
-    #[serde(default)]
+    /// 放行网段。**只在监听超出本机时有意义**；空 = 除本机外谁都连不上。
+    /// 和默认名单一样时配置里不写这一项
     pub allow_from: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -1109,11 +1103,11 @@ pub struct KeyValue {
 pub struct ListenView {
     pub bind: String,
     pub port: u16,
-    /// 配置里写的放行网段。**空 = 监听超出本机时按私网段放行。**
-    ///
-    /// 给的是写了什么，不是生效的那份：生效的那份在空的时候被填成私网段，
-    /// 界面拿它回填表单再存回去，一份「没写」的配置就被改写成了六行默认值。
+    /// 放行网段，就是生效的那一份：配置里没写时是默认名单，空 = 除本机外
+    /// 谁都连不上。本机永远放行，不在名单里
     pub allow_from: Vec<String>,
+    /// 默认名单（私网段）。界面上「恢复默认」用
+    pub default_allow_from: Vec<String>,
     /// 非 loopback 时为真。界面上要据此把「关闭密钥校验」置灰
     pub exposed: bool,
 }
@@ -1228,14 +1222,15 @@ pub struct ConfigText {
     pub version: String,
 }
 
-/// 这台机器上的一张网卡（`GET /interfaces`）。
+/// 这台机器上的一张网卡（`GET /interfaces`），**一张一行**。
 ///
 /// **界面上「绑在哪张网卡」那个选单要的就是它。**没有它，用户只能自己
 /// 去 `ifconfig` 抄一个地址填进配置文件，而填错的后果是网关起不来。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NicView {
-    /// `en0`、`lo0`、`utun3`
+    /// `en0`、`lo0`、`utun3`。配置里按它存
     pub name: String,
+    /// 绑这张网卡时真正监听的地址：有 IPv4 就是 IPv4
     pub addr: String,
     /// 回环地址。界面上这一档叫「仅本机」，不该混在「选一张网卡」里
     pub loopback: bool,

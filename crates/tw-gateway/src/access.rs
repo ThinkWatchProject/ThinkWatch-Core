@@ -114,10 +114,8 @@ pub struct AllowList {
 }
 
 impl AllowList {
-    /// 空列表 = 全放行。
-    ///
-    /// 这看起来危险，但它只在 `bind: loopback` 下成立 —— 那时候能连过来
-    /// 的本来就只有本机。非 loopback 的默认值由配置层填成私网段。
+    /// 名单就是名单：空的就是除本机外谁都不放。默认名单（私网段）由配置
+    /// 层在没写的时候填上。
     pub fn parse(entries: &[String]) -> Result<Self, CidrError> {
         Ok(Self {
             ranges: entries
@@ -125,16 +123,6 @@ impl AllowList {
                 .map(|s| s.parse())
                 .collect::<Result<_, _>>()?,
         })
-    }
-
-    pub fn private_default() -> Self {
-        Self::parse(
-            &PRIVATE_RANGES
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-        )
-        .expect("the built-in private ranges are valid CIDRs")
     }
 
     /// 放不放行这个来源。
@@ -145,7 +133,7 @@ impl AllowList {
     /// 他得到的是所有客户端同时断线，而原因藏在一个看起来毫不相关的设置里。
     /// 本机来的请求照样要过密钥那一道。
     pub fn allows(&self, ip: IpAddr) -> bool {
-        is_loopback(ip) || self.ranges.is_empty() || self.ranges.iter().any(|c| c.contains(ip))
+        is_loopback(ip) || self.ranges.iter().any(|c| c.contains(ip))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -215,22 +203,32 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_allow_list_permits_everything() {
-        // 只在 loopback 下成立 —— 那时能连过来的本来就只有本机。
+    fn an_empty_allow_list_lets_in_only_this_machine() {
+        // 空的就是空的。删掉最后一条不该等于放行所有，也不该等于默认名单
         let a = AllowList::default();
-        assert!(a.allows(ip("8.8.8.8")));
+        assert!(!a.allows(ip("192.168.1.5")));
+        assert!(!a.allows(ip("8.8.8.8")));
+        assert!(a.allows(ip("127.0.0.1")));
         assert!(a.is_empty());
     }
 
     #[test]
-    fn the_private_default_covers_the_three_rfc1918_ranges_and_loopback() {
-        let a = AllowList::private_default();
+    fn the_private_default_covers_the_private_ranges_and_nothing_public() {
+        let a = AllowList::parse(
+            &PRIVATE_RANGES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("the built-in private ranges are valid CIDRs");
+        // 回环不在名单里，照样放行
         for good in [
             "127.0.0.1",
             "10.1.2.3",
             "172.20.0.5",
             "192.168.1.100",
             "::1",
+            "fd94:db59:5dfe:4525::1",
         ] {
             assert!(a.allows(ip(good)), "{good} 该被放行");
         }

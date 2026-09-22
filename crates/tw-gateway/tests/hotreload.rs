@@ -452,33 +452,6 @@ async fn a_request_in_flight_finishes_on_the_config_it_started_with() {
 }
 
 #[tokio::test]
-async fn the_gate_is_only_rebuilt_when_the_limits_actually_change() {
-    // 跟着配置一起换的话，每改一次规则，队列里排着的请求就会失去位置，
-    // 而已经在跑的那些的通行证会变成孤儿 —— 那一瞬间的实际并发可以到
-    // 上限的两倍。
-    let (a, _) = counting_upstream("a").await;
-    let c = cfg(vec![provider("a", a)], vec![]);
-    let state = tw_gateway::AppState::new(c.clone()).unwrap();
-    let g0 = state.gate();
-
-    let mut same_limits = c.clone();
-    same_limits.routes = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
-        name: "r".into(),
-        when: Default::default(),
-        to: Some("a".into()),
-        set: None,
-        deny: None,
-    }])];
-    state.reload(same_limits).unwrap();
-    assert!(Arc::ptr_eq(&g0, &state.gate()), "无关改动换掉了并发闸门");
-
-    let mut new_limits = c.clone();
-    new_limits.limits.per_provider = 3;
-    state.reload(new_limits).unwrap();
-    assert!(!Arc::ptr_eq(&g0, &state.gate()), "改了上限却没换闸门");
-}
-
-#[tokio::test]
 async fn reloading_from_zero_providers_to_one_starts_working_without_a_restart() {
     // 首次运行的那条路：core 先起来（零 provider），用户在界面上加了
     // 第一个上游，然后**不重启**就该能用。
@@ -502,7 +475,7 @@ async fn the_allow_list_is_reloaded_too() {
     assert!(ask(gw).await.contains("\"a\""));
 
     let other: std::net::IpAddr = "192.168.7.7".parse().unwrap();
-    assert!(state.runtime().allow.allows(other), "仅本机时名单是空的");
+    assert!(state.runtime().allow.allows(other), "默认名单是私网段");
 
     // 监听改成所有网卡，只放行一个不含那台设备的段
     c.listen.gateway.bind = tw_config::Bind::All;

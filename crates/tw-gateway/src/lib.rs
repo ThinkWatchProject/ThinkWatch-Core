@@ -46,7 +46,7 @@ pub use l1::{
     proxy_target,
 };
 pub use l3::{Estimate, L3Result};
-pub use limits::{Gate, LimitError, Limits};
+pub use limits::Gate;
 pub use listen::{Listening, bind_failure, serve_at};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quota::{Quota, from_headers as quota_from_headers};

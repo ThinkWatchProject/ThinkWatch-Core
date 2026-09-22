@@ -52,5 +52,5 @@ futures = { workspace = true }
 tw-api = { workspace = true }
 tw-engine = { workspace = true }
 serde_yaml_ng = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 serde_json = { workspace = true }
