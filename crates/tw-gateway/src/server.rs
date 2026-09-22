@@ -1011,7 +1011,8 @@ pub fn router(state: AppState) -> Router {
 ///
 /// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、熔断对它一样
 /// 有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
-/// 每一帧上重新点一遍管线的保护。
+/// 每一帧上重新点一遍管线的保护。路由事件也由那边发：选中的那一家接没
+/// 接下，要和它握完手才知道。
 #[allow(clippy::too_many_arguments)]
 async fn ws_upgrade(
     state: AppState,
@@ -1074,7 +1075,6 @@ async fn ws_upgrade(
                 "The credential for upstream `{upstream}` could not be obtained: {detail}"
             ))
         })?;
-    let url = crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref());
     let id = state.bus.next_id();
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
@@ -1084,6 +1084,7 @@ async fn ws_upgrade(
         peer: from.peer,
         key_masked: from.key,
         provider: name.clone(),
+        billing: state.billing_of(provider).slug().to_string(),
         model: String::new(),
         method: "WS".to_string(),
         path: uri.path().to_string(),
@@ -1100,7 +1101,13 @@ async fn ws_upgrade(
         now_ms() as i64,
         None,
     );
-    let provider = provider.clone();
+    let upstream = crate::ws::Upstream {
+        url: crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref()),
+        headers: upstream_headers,
+        provider: provider.clone(),
+        rule: decision.matched_rule,
+        group: decision.via_group,
+    };
     let rules = crate::ws::Rules {
         redact_mode: rt.config.security.redact.mode,
         redact: rt.redact.clone(),
@@ -1112,17 +1119,7 @@ async fn ws_upgrade(
         let _live = live;
         let mut ending = ending;
         ending.responded(101);
-        crate::ws::proxy(
-            state,
-            sock,
-            url,
-            upstream_headers,
-            provider,
-            rules,
-            id,
-            ending,
-        )
-        .await;
+        crate::ws::proxy(state, sock, upstream, rules, id, ending).await;
     }))
 }
 
@@ -1670,6 +1667,11 @@ async fn pipeline(
     }
 
     let id = state.bus.next_id();
+    // 头一个候选。故障转移之后实际服务的是谁、按什么记账，由后面的
+    // `RequestRouted` 改过来
+    let first = alive
+        .first()
+        .and_then(|n| rt.config.providers.iter().find(|p| &p.name == *n));
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
         client: client_name.clone(),
@@ -1682,6 +1684,11 @@ async fn pipeline(
         peer: from.peer,
         key_masked: from.key,
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
+        billing: first
+            .map(|p| state.billing_of(p))
+            .unwrap_or(tw_config::Billing::PerToken)
+            .slug()
+            .to_string(),
         model: facts.model.clone(),
         method: "POST".to_string(),
         path: uri.path().to_string(),
@@ -2611,7 +2618,7 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Resu
 }
 
 /// 上游回了话的一跳：`served` 或者 `status`。
-fn hop(
+pub(crate) fn hop(
     provider: &str,
     outcome: &str,
     status: u16,
@@ -2627,7 +2634,11 @@ fn hop(
 }
 
 /// 没有收到响应的一跳。
-fn hop_failed(provider: &str, error: String, started: std::time::Instant) -> tw_api::AttemptView {
+pub(crate) fn hop_failed(
+    provider: &str,
+    error: String,
+    started: std::time::Instant,
+) -> tw_api::AttemptView {
     tw_api::AttemptView {
         provider: provider.to_string(),
         outcome: "error".to_string(),

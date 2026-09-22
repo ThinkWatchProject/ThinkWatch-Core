@@ -13,6 +13,8 @@ use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures::{SinkExt, StreamExt};
+use tokio::sync::broadcast::Receiver;
+use tw_api::Event;
 use tw_config::{Client, Config, Listen, Provider, Security, SecurityMode};
 
 const USER_KEY: &str = "sk-ant-api03-USERSOWNKEYAAAAAAAAAAAAAA";
@@ -238,5 +240,199 @@ async fn an_upgrade_without_a_gateway_key_is_refused() {
     assert!(
         tokio_tungstenite::connect_async(req).await.is_err(),
         "没带密钥也升级成功了"
+    );
+}
+
+// ---------------------------------------------------------------- 路由与计费
+
+/// 起一个网关，**先订阅事件再起服务** —— 之后才订的话，早到的事件就看不见了。
+async fn serve(cfg: Config) -> (SocketAddr, Receiver<Event>) {
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let events = state.bus.subscribe();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    (addr, events)
+}
+
+/// 一个订阅账号，经一条有名字的规则、一个策略组选中。
+fn routed_to_an_account(up: SocketAddr) -> Config {
+    Config {
+        version: 1,
+        clients: vec![Client {
+            name: "codex".into(),
+            key: "tw-wskey".into(),
+            ..Default::default()
+        }],
+        providers: vec![Provider {
+            name: "订阅账号".into(),
+            base_url: format!("http://{up}"),
+            key: Some("sk-upstream".into()),
+            protocol: Some(tw_config::Protocol::Anthropic),
+            billing: Some(tw_config::Billing::Subscription),
+            ..Default::default()
+        }],
+        groups: vec![tw_engine::Group {
+            name: "账号池".into(),
+            kind: tw_engine::GroupType::Fallback,
+            providers: vec!["订阅账号".into()],
+            session_affinity: false,
+            selected: None,
+        }],
+        routes: vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
+            name: "Codex 走账号".into(),
+            when: Default::default(),
+            to: Some("账号池".into()),
+            set: None,
+            deny: None,
+        }])],
+        ..Default::default()
+    }
+}
+
+/// 一次请求的事件：开始、路由、结局，**按到达的顺序**，到结局为止。
+async fn until_the_ending(rx: &mut Receiver<Event>) -> Vec<Event> {
+    let mut got = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("5 秒内没等到结局")
+            .expect("事件流断了");
+        let ending = matches!(
+            ev,
+            Event::RequestFinished { .. }
+                | Event::RequestFailed { .. }
+                | Event::RequestCancelled { .. }
+        );
+        if ending
+            || matches!(
+                ev,
+                Event::RequestStarted { .. } | Event::RequestRouted { .. }
+            )
+        {
+            got.push(ev);
+        }
+        if ending {
+            return got;
+        }
+    }
+}
+
+/// 路由事件里的那一跳和计费方式。**必须在结局之前到** —— 存储层落库时手上
+/// 没有它的话，这一行照样没有尝试链、照样说不出按什么记账。
+fn the_route(evs: &[Event]) -> (String, Option<String>, tw_api::AttemptView, String) {
+    let at = evs
+        .iter()
+        .position(|e| matches!(e, Event::RequestRouted { .. }))
+        .unwrap_or_else(|| panic!("WS 请求没有发路由事件：{evs:?}"));
+    assert!(at < evs.len() - 1, "路由事件到在了结局之后：{evs:?}");
+    let Event::RequestRouted {
+        rule,
+        group,
+        attempts,
+        billing,
+        ..
+    } = &evs[at]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        attempts.len(),
+        1,
+        "WS 不做故障转移，尝试链只有一跳：{attempts:?}"
+    );
+    (
+        rule.clone(),
+        group.clone(),
+        attempts[0].clone(),
+        billing.clone(),
+    )
+}
+
+/// **一次升级也报路由**：命中了哪条规则、经过哪个组、那一家接没接下、按什么
+/// 记账 —— 和 HTTP 那条路同一个形状。以前 WS 这条路只有开始和结局，详情里说
+/// 「没有路由信息」，订阅账号上的会话还被当成按量计费、没有用量的请求。
+#[tokio::test]
+async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
+    let (up, _seen) = start_upstream("echo").await;
+    let (gw, mut events) = serve(routed_to_an_account(up)).await;
+    let mut c = connect(gw).await;
+    c.send(tokio_tungstenite::tungstenite::Message::Text("hi".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), c.next())
+        .await
+        .expect("等回帧超时")
+        .unwrap()
+        .unwrap();
+    c.close(None).await.unwrap();
+
+    let evs = until_the_ending(&mut events).await;
+    // 开始事件就说清按什么记账：升级没完成客户端就走了的，只有这一个
+    assert!(
+        matches!(&evs[0], Event::RequestStarted { billing, .. } if billing == "subscription"),
+        "{evs:?}"
+    );
+    let (rule, group, hop, billing) = the_route(&evs);
+    assert_eq!(rule, "Codex 走账号");
+    assert_eq!(group.as_deref(), Some("账号池"));
+    assert_eq!(
+        (hop.provider.as_str(), hop.outcome.as_str(), hop.status),
+        ("订阅账号", "served", Some(101))
+    );
+    assert_eq!(billing, "subscription");
+    assert!(
+        matches!(evs.last(), Some(Event::RequestFinished { status: 101, .. })),
+        "{evs:?}"
+    );
+}
+
+/// 上游不同意升级：**它答了话，只是没接下** —— 尝试链上记的是它回的状态码。
+/// 没接下的不按那一家记账，哪怕它是订阅账号：和 HTTP 那条路每家都失败时一样。
+#[tokio::test]
+async fn an_upstream_that_refuses_the_upgrade_is_reported_with_its_status() {
+    let up = {
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let (gw, mut events) = serve(routed_to_an_account(up)).await;
+    let _c = connect(gw).await;
+
+    let evs = until_the_ending(&mut events).await;
+    let (_, _, hop, billing) = the_route(&evs);
+    assert_eq!((hop.outcome.as_str(), hop.status), ("status", Some(403)));
+    assert_eq!(hop.error, None);
+    assert_eq!(billing, "per-token", "没接下的请求被数成了订阅额度");
+    assert!(
+        matches!(evs.last(), Some(Event::RequestFailed { source, .. }) if source == "upstream"),
+        "{evs:?}"
+    );
+}
+
+/// 连不上：**失败的那一跳也要报**，而且说清为什么 —— 失败的时候恰恰最需要看它。
+#[tokio::test]
+async fn an_unreachable_upstream_is_reported_as_a_failed_hop() {
+    // 绑一个端口再立刻放掉，拿到一个确定没人在听的端口
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    let (gw, mut events) = serve(routed_to_an_account(dead)).await;
+    let _c = connect(gw).await;
+
+    let evs = until_the_ending(&mut events).await;
+    let (_, _, hop, billing) = the_route(&evs);
+    assert_eq!((hop.outcome.as_str(), hop.status), ("error", None));
+    let why = hop.error.expect("失败的那一跳没说原因");
+    assert!(why.contains(&dead.to_string()), "{why}");
+    assert_eq!(billing, "per-token");
+    assert!(
+        matches!(evs.last(), Some(Event::RequestFailed { source, .. }) if source == "upstream"),
+        "{evs:?}"
     );
 }
