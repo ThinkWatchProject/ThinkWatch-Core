@@ -2297,3 +2297,64 @@ async fn writing_billing_in_the_config_removes_the_first_request_ambiguity() {
     }
     panic!("没等到路由事件");
 }
+
+/// 额度的重置是一个**时刻**。以前存的是「还有多少秒」，之后原样给出去 ——
+/// 界面每次读到的都是收到响应那一刻的秒数，一个不会走的倒计时。
+#[tokio::test]
+async fn a_quota_reset_is_kept_as_the_moment_it_happens() {
+    let up = {
+        let app = Router::new().fallback(axum::routing::any(|| async {
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .header("anthropic-ratelimit-unified-5h-utilization", "40")
+                .header("anthropic-ratelimit-unified-5h-reset", "7200")
+                .body(axum::body::Body::from(r#"{"id":"m"}"#))
+                .unwrap()
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let state = tw_gateway::AppState::new(cfg_with(
+        vec![Provider {
+            name: "订阅账号".into(),
+            base_url: format!("http://{up}"),
+            key: Some("k".into()),
+            ..Default::default()
+        }],
+        vec![],
+    ))
+    .unwrap();
+    let kept = state.clone();
+    let mut rx = state.bus.subscribe();
+    let gw = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send_to(gw).await;
+
+    let (resets_at, seen_at) = loop {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(tw_api::Event::QuotaSeen { windows, at_ms, .. })) => {
+                break (windows[0].resets_at_ms, at_ms);
+            }
+            Ok(Ok(_)) => continue,
+            other => panic!("没等到额度事件：{other:?}"),
+        }
+    };
+    let resets_at = resets_at.expect("上游说了多久重置，事件里却没有");
+    // 收到响应的那一刻往后两小时。两个时刻各自取的钟，差几毫秒
+    assert!(
+        (seen_at + 7_200_000 - 1_000..=seen_at + 7_200_000 + 1_000).contains(&resets_at),
+        "{resets_at} vs {seen_at}"
+    );
+    // **存下来的是同一个时刻**：过一会儿再问，它不会变成「又是两小时」
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        kept.quotas()["订阅账号"].windows[0].resets_at_ms,
+        Some(resets_at)
+    );
+}
