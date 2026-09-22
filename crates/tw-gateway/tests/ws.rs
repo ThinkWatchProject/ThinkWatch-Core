@@ -271,7 +271,7 @@ fn routed_to_an_account(up: SocketAddr) -> Config {
             base_url: format!("http://{up}"),
             key: Some("sk-upstream".into()),
             protocol: Some(tw_config::Protocol::Anthropic),
-            billing: Some(tw_config::Billing::Subscription),
+            billing: tw_config::Billing::Free,
             ..Default::default()
         }],
         groups: vec![tw_engine::Group {
@@ -353,7 +353,7 @@ fn the_route(evs: &[Event]) -> (String, Option<String>, tw_api::AttemptView, Str
 
 /// **一次升级也报路由**：命中了哪条规则、经过哪个组、那一家接没接下、按什么
 /// 记账 —— 和 HTTP 那条路同一个形状。以前 WS 这条路只有开始和结局，详情里说
-/// 「没有路由信息」，订阅账号上的会话还被当成按量计费、没有用量的请求。
+/// 「没有路由信息」，上游的计费方式也没跟着报。
 #[tokio::test]
 async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
     let (up, _seen) = start_upstream("echo").await;
@@ -372,7 +372,7 @@ async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
     let evs = until_the_ending(&mut events).await;
     // 开始事件就说清按什么记账：升级没完成客户端就走了的，只有这一个
     assert!(
-        matches!(&evs[0], Event::RequestStarted { billing, .. } if billing == "subscription"),
+        matches!(&evs[0], Event::RequestStarted { billing, .. } if billing == "free"),
         "{evs:?}"
     );
     let (rule, group, hop, billing) = the_route(&evs);
@@ -382,7 +382,7 @@ async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
         (hop.provider.as_str(), hop.outcome.as_str(), hop.status),
         ("订阅账号", "served", Some(101))
     );
-    assert_eq!(billing, "subscription");
+    assert_eq!(billing, "free");
     assert!(
         matches!(evs.last(), Some(Event::RequestFinished { status: 101, .. })),
         "{evs:?}"
@@ -407,7 +407,7 @@ async fn an_upstream_that_refuses_the_upgrade_is_reported_with_its_status() {
     let (_, _, hop, billing) = the_route(&evs);
     assert_eq!((hop.outcome.as_str(), hop.status), ("status", Some(403)));
     assert_eq!(hop.error, None);
-    assert_eq!(billing, "per-token", "没接下的请求被数成了订阅额度");
+    assert_eq!(billing, "per-token", "没接下的请求被按那一家记成了不计费");
     assert!(
         matches!(evs.last(), Some(Event::RequestFailed { source, .. }) if source == "upstream"),
         "{evs:?}"

@@ -412,7 +412,8 @@ fn to_provider(
             .billing
             .as_deref()
             .map(|v| slug("billing mode", v))
-            .transpose()?,
+            .transpose()?
+            .unwrap_or_default(),
         proxy: input.proxy.trim().to_string(),
         on_proxy_fail: slug("setting for an unusable proxy", &input.on_proxy_fail)?,
         models_only: input

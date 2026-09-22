@@ -260,7 +260,6 @@ fn logged_in(name: &str, e: &Endpoints, refresh: &str) -> String {
         "  - name: {name}
     base_url: {backend}
     protocol: chatgpt
-    billing: subscription
     oauth:
       access: at-cfg
       expires_at: 2099-01-01T00:00:00Z
@@ -477,7 +476,9 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
     let p = b.provider("chatgpt").expect("登录之后配置里应当有这个上游");
     assert_eq!(p.effective_protocol(), Some(tw_config::Protocol::Chatgpt));
     assert_eq!(p.base_url, b.endpoints.backend);
-    assert_eq!(p.billing, Some(tw_config::Billing::Subscription));
+    // 订阅账号也按价目表算费用：登录建的上游不写计费方式，就是按量计费
+    assert_eq!(p.billing, tw_config::Billing::PerToken);
+    assert!(!b.file().contains("billing"), "{}", b.file());
     let o = p.oauth.as_ref().unwrap();
     assert_eq!(o.refresh, "rt-login");
     assert_eq!(o.access.as_deref(), Some("at-login"));
@@ -612,8 +613,8 @@ async fn a_rejected_code_fails_the_login_and_leaves_the_config_alone() {
 async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
     let b = bed(|e| {
         logged_in("chatgpt", e, "rt-old").replace(
-            "    billing: subscription\n",
-            "    billing: subscription\n    models_only: [gpt-5.5]\n",
+            "    protocol: chatgpt\n",
+            "    protocol: chatgpt\n    billing: free\n    models_only: [gpt-5.5]\n",
         )
     })
     .await;
@@ -627,6 +628,11 @@ async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
         ("rt-login", Some("at-login"))
     );
     assert_eq!(p.models_only.as_deref(), Some(&["gpt-5.5".to_string()][..]));
+    assert_eq!(
+        p.billing,
+        tw_config::Billing::Free,
+        "重新登录改掉了计费方式"
+    );
     assert_eq!(p.headers.len(), 1, "账户 ID 只留一个");
     assert_eq!(
         p.headers.get("chatgpt-account-id").unwrap().value.raw(),

@@ -467,7 +467,7 @@ async fn a_client_that_leaves_before_the_response_headers_is_reported_once_as_ca
 #[tokio::test]
 async fn a_request_abandoned_before_any_upstream_answered_still_says_how_it_is_billed() {
     let mut p = provider(silent_upstream().await);
-    p.billing = Some(tw_config::Billing::Subscription);
+    p.billing = tw_config::Billing::Free;
     let (gw, mut events) = serve(cfg(p)).await;
 
     let gave_up = tokio::time::timeout(Duration::from_millis(500), post(gw).send()).await;
@@ -486,9 +486,8 @@ async fn a_request_abandoned_before_any_upstream_answered_still_says_how_it_is_b
         }
     }
     assert!(
-        seen.iter().any(
-            |e| matches!(e, Event::RequestStarted { billing, .. } if billing == "subscription")
-        ),
+        seen.iter()
+            .any(|e| matches!(e, Event::RequestStarted { billing, .. } if billing == "free")),
         "开始事件没说要发往的那一家怎么收钱：{seen:?}"
     );
     assert!(

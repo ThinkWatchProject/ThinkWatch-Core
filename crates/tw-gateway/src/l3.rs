@@ -299,11 +299,11 @@ mod tests {
         assert!(e.quote.cost_micros.is_some());
         let e = estimate(
             &prices(),
-            "订阅",
+            "本地",
             "claude-sonnet-4-5",
-            tw_config::Billing::Subscription,
+            tw_config::Billing::Free,
         );
-        assert_eq!(e.quote.cost_micros, None);
+        assert_eq!(e.quote.cost_micros, Some(0));
         assert_eq!(e.input_tokens, probe_input_tokens());
     }
 

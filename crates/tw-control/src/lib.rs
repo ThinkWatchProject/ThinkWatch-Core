@@ -427,8 +427,7 @@ fn provider_view(
             tw_gateway::health::State::Open => "open".into(),
         },
         auth_rejected: s.gateway.auth_rejected(&p.name),
-        billing: p.billing.map(|b| b.slug().to_string()),
-        billing_effective: s.gateway.billing_of(p).slug().to_string(),
+        billing: p.billing.slug().to_string(),
         references: tw_config::refs::provider_refs(cfg, &p.name)
             .iter()
             .map(resources::reference_view)
@@ -669,8 +668,6 @@ async fn summary(
         cost_micros_estimated: x.cost_micros_estimated,
         unpriced_requests: x.unpriced_requests,
         no_usage_requests: x.no_usage_requests,
-        subscription_requests: x.subscription_requests,
-        subscription_tokens: x.subscription_tokens,
         cache_saved_micros: x.cache_saved_micros,
         // **和安全日志数的是同一批**：概览上点开这个数，落到的日志就是这么多条
         security: g.db().security_counts(from, to).map_err(internal)?,
@@ -740,9 +737,8 @@ async fn speed_quote(
         targets(&cfg, &req.providers)?
             .into_iter()
             .map(|p| {
-                // 计费方式和记账同一个口径：配置里写明了，或者最近一次响应里报过额度
-                let e =
-                    tw_gateway::l3::estimate(&book, &p.name, &req.model, s.gateway.billing_of(p));
+                // 和记账同一个口径：按这家的计费方式和价目表
+                let e = tw_gateway::l3::estimate(&book, &p.name, &req.model, p.billing);
                 (e, tw_gateway::models::fit(&catalog, p, &req.model))
             })
             .collect();
@@ -1307,7 +1303,6 @@ fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {
         priced_turns: s.priced_turns as u64,
         unpriced_turns: s.unpriced_turns as u64,
         no_usage_turns: s.no_usage_turns as u64,
-        subscription_turns: s.subscription_turns as u64,
         input_tokens: s.input_tokens,
         output_tokens: s.output_tokens,
         cache_read_tokens: s.cache_read_tokens,
