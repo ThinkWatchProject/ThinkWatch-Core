@@ -17,7 +17,7 @@
 //! 这个模块只负责 ①②③ 并把失败说清楚。④⑤ 归数据面，因为运行时对象
 //! （provider 池、Client、规则树）是它的东西。
 
-use crate::{Config, SCHEMA_VERSION, ValidationError, validate};
+use crate::{Config, ValidationError, validate};
 
 /// 卡在哪一关。**分开是为了让用户知道该看哪儿**：语法错要看那一行，
 /// 语义错要看整段配置的逻辑。
@@ -146,11 +146,6 @@ fn excerpt_of(text: &str, line: usize) -> Option<String> {
     Some(format!("{cut}…"))
 }
 
-/// 这个 schema 版本我们认吗。
-pub fn schema_supported(version: u32) -> bool {
-    version <= SCHEMA_VERSION
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,8 +218,6 @@ mod tests {
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Schema);
         assert!(r.message.contains("Upgrade the app"), "{r:?}");
-        assert!(!schema_supported(999));
-        assert!(schema_supported(1));
     }
 
     #[test]

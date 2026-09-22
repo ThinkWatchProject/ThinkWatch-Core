@@ -136,14 +136,13 @@ pub fn strip(text: &str, prefix: &str) -> String {
     out
 }
 
-/// 旁文件里的一个字段。**字段名用中文，因为读它的是人。**
+/// 旁文件里的一个字段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarField {
     pub field: String,
     /// 机器用的路径分段。**不能靠切 `field` 里的点号还原它** —— 键名
     /// 本身就可能带点（`[projects."/Users/x/a.b"]` 这种），拆错了就会
     /// 去改一个不存在的字段，然后「还原成功」地什么都没还原。
-    #[serde(default)]
     pub path: Vec<String>,
     /// 机器读的标记：`missing` / `value` / `secret`
     pub was: String,
@@ -175,7 +174,7 @@ pub struct SidecarRecord {
     /// 还原时要能把它**整个删掉** —— 否则「还原」之后会留下一个用户
     /// 从来没有过的文件。但只在它还是空的时候删：用户可能在这期间往
     /// 里加了自己的东西。
-    #[serde(rename = "file_created_by_us", default)]
+    #[serde(rename = "file_created_by_us")]
     pub created_file: bool,
     pub originals: Vec<SidecarField>,
 }
@@ -334,8 +333,8 @@ mod tests {
     #[test]
     fn a_block_the_user_has_edited_is_left_alone_rather_than_guessed_at() {
         // 认不出来就不动。宁可留下几行注释，也不能删掉别的东西。
-        let src = "# === ThinkWatch 接管开始 ===\n# 用户把结束标记删了\nmodel = \"x\"\n";
-        assert_eq!(strip(src, "#"), src);
+        let src = format!("# {BEGIN}\n# 用户把结束标记删了\nmodel = \"x\"\n");
+        assert_eq!(strip(&src, "#"), src);
         assert_eq!(strip("完全没有哨兵\n", "#"), "完全没有哨兵\n");
     }
 

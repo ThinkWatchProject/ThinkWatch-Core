@@ -75,6 +75,8 @@ pub enum ValidationError {
         name: String,
         detail: String,
     },
+    #[error("security.{guard} names `{id}`, which is not a built-in rule")]
+    UnknownRule { guard: &'static str, id: String },
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -260,6 +262,14 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             .iter()
             .map(|c| (c.name.as_str(), c.pattern.as_str())),
     )?;
+    // 按 id 开关、改处置的内置规则得真的存在。**写错一个 id 和写错一个字段名
+    // 是同一种错**：跳过它，用户停用的那条会照样在报
+    if let Some((guard, id)) = cfg.security.unknown_rule() {
+        return Err(ValidationError::UnknownRule {
+            guard,
+            id: id.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -552,5 +562,59 @@ mod tests {
         ));
         // 两项防护各管各的名字
         assert!(validate(&with_rules(&[("同名", "a")], &[("同名", "b")])).is_ok());
+    }
+
+    /// 按 id 写到的内置规则得真的存在：写错的 id 和写错的字段名一样拒绝，
+    /// 说出是哪一项下的哪个 id。
+    #[test]
+    fn a_builtin_rule_id_that_does_not_exist_is_refused_and_named() {
+        let mut x = with_rules(&[], &[]);
+        x.security.redact.disable = vec!["jwt".into()];
+        x.security.inspect_tools.actions = [("rm-rf-root".to_string(), crate::ToolAction::Record)]
+            .into_iter()
+            .collect();
+        assert!(validate(&x).is_ok(), "{:?}", validate(&x));
+
+        let mut typo = x.clone();
+        typo.security.redact.enable = vec!["jwtt".into()];
+        let e = validate(&typo).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ValidationError::UnknownRule {
+                    guard: "redact",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("jwtt"), "{e}");
+
+        for tools in [
+            crate::ToolPolicy {
+                disable: vec!["rm-rf-rooot".into()],
+                ..Default::default()
+            },
+            crate::ToolPolicy {
+                actions: [("没有这条".to_string(), crate::ToolAction::Cut)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        ] {
+            let mut bad = x.clone();
+            bad.security.inspect_tools = tools;
+            assert!(
+                matches!(
+                    validate(&bad),
+                    Err(ValidationError::UnknownRule {
+                        guard: "inspect_tools",
+                        ..
+                    })
+                ),
+                "{:?}",
+                validate(&bad)
+            );
+        }
     }
 }

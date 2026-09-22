@@ -162,11 +162,10 @@ impl Runtime {
         // config.yaml 的 `security` 里，所以「改了规则」和「改了别的配置」
         // 走同一条热重载路径。
         //
-        // 自定义规则的正则在配置校验时已经编过一次，这里再失败只可能是有人
-        // 绕过了校验，照样拒绝这份配置。认不出的内置规则 id 不拒绝：一条
-        // 内置规则将来可能改名，用户停用过它的那一行不该让整份配置失效
+        // 自定义规则的正则、内置规则的 id 在配置校验时已经查过一次，这里再
+        // 失败只可能是有人绕过了校验，照样拒绝这份配置
         let sec = &config.security;
-        let (redact, unknown) = tw_redact::rules::RuleSet::build(
+        let redact = tw_redact::rules::RuleSet::build(
             &sec.redact.enable,
             &sec.redact.disable,
             sec.redact.active_custom(),
@@ -177,9 +176,6 @@ impl Runtime {
         let tools = tw_scan::rules::tool_rules(&sec.inspect_tools).map_err(|e| {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         })?;
-        for id in unknown.iter().chain(&tools.warnings) {
-            tracing::warn!(rule = %id, "`{id}` is not the id of a built-in rule, so turning it on or off did nothing");
-        }
         Ok(Self {
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
