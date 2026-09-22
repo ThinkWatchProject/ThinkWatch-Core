@@ -1059,7 +1059,10 @@ pub struct KeyValue {
 pub struct ListenView {
     pub bind: String,
     pub port: u16,
-    /// 实际生效的白名单（`lan`/`all` 下会是默认填的私网段）
+    /// 配置里写的放行网段。**空 = 监听超出本机时按私网段放行。**
+    ///
+    /// 给的是写了什么，不是生效的那份：生效的那份在空的时候被填成私网段，
+    /// 界面拿它回填表单再存回去，一份「没写」的配置就被改写成了六行默认值。
     pub allow_from: Vec<String>,
     /// 非 loopback 时为真。界面上要据此把「关闭密钥校验」置灰
     pub exposed: bool,

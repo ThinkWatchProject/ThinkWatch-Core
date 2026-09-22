@@ -336,7 +336,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             // `addr(192.168.1.5)` —— 界面拿它去比对档位，永远不相等。
             bind: cfg.listen.gateway.bind.to_string(),
             port: cfg.listen.gateway.port,
-            allow_from: cfg.listen.gateway.effective_allow_from(),
+            allow_from: cfg.listen.gateway.allow_from.clone(),
             exposed: cfg.listen.gateway.bind.is_exposed(),
         },
     })

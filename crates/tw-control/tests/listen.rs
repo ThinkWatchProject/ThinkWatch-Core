@@ -255,3 +255,21 @@ async fn a_stale_version_is_refused_like_any_other_edit() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn the_overview_says_what_was_written_not_the_private_default() {
+    // 生效的那份在空的时候被填成私网段；界面拿它回填表单再存回去的话，
+    // 一份「没写」的配置就被改写成了六行默认值
+    let b = bed("version: 1
+clients:
+  - name: default
+    key: tw-aaaa
+listen:
+  gateway:
+    bind: all
+");
+    let (_, ov) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(ov["listen"]["bind"], "all");
+    assert_eq!(ov["listen"]["exposed"], true);
+    assert_eq!(ov["listen"]["allow_from"], serde_json::json!([]));
+}
