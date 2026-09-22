@@ -518,27 +518,16 @@ impl Db {
 }
 
 impl Db {
-    /// 每个客户端旁证最后一次出现是什么时候。**接管的观察窗口靠它**：
-    /// 我们改了一个文件，但那个文件有没有被读到，只有请求能
-    /// 证明。
     /// 每把网关密钥最后一次被用在什么时候。
     ///
-    /// **和 `last_seen_by_hint` 不是一回事。**那个按客户端自报的标识分组，
-    /// 标识是请求头里来的、可以伪造；这个按密钥分组，而密钥是网关自己认出来的。
-    /// 「这把钥匙还有没有人在用」只能问这一个。
+    /// **接管的观察窗口也靠它**：我们改了一个文件，但那个文件有没有被读到，
+    /// 只有带着为那个客户端生成的密钥的请求能证明。按请求头里自报的客户端
+    /// 标识分组的话，那个标识谁都能写 —— 「这把钥匙还有没有人在用」「接好了
+    /// 没有」都只能按密钥问。
     pub fn last_seen_by_client(&self) -> Result<Vec<(String, i64)>, DbError> {
         let mut st = self.conn.prepare(
             "SELECT client, MAX(at_ms) FROM requests
              WHERE client <> '' GROUP BY client",
-        )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn last_seen_by_hint(&self) -> Result<Vec<(String, i64)>, DbError> {
-        let mut st = self.conn.prepare(
-            "SELECT client_hint, MAX(at_ms) FROM requests
-             WHERE client_hint IS NOT NULL GROUP BY client_hint",
         )?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1678,28 +1667,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_observation_window_can_ask_when_a_client_was_last_seen() {
-        // 我们改了一个文件，但那个文件有没有被读到，只有请求能证明。
+    fn the_observation_window_asks_by_key_not_by_what_the_headers_claim() {
+        // 我们改了一个文件，但那个文件有没有被读到，只有请求能证明 —— 而且是
+        // 带着那把密钥的请求。自报的标识不算数
         let d = tempfile::tempdir().unwrap();
         let db = Db::open(&d.path().join("data.db")).unwrap();
-        for (i, (hint, at)) in [
-            (Some("codex"), 100),
-            (Some("codex"), 300),
-            (Some("claude-code"), 200),
-            (None, 400),
+        for (i, (client, hint, at)) in [
+            ("codex", Some("codex"), 100),
+            ("codex", None, 300),
+            ("default", Some("claude-code"), 200),
         ]
         .into_iter()
         .enumerate()
         {
             let mut r = row(i as i64 + 1, at);
+            r.client = client.to_string();
             r.client_hint = hint.map(|s| s.to_string());
             db.insert(&r).unwrap();
         }
-        let mut got = db.last_seen_by_hint().unwrap();
+        let mut got = db.last_seen_by_client().unwrap();
         got.sort();
         assert_eq!(
             got,
-            vec![("claude-code".to_string(), 200), ("codex".to_string(), 300)]
+            vec![("codex".to_string(), 300), ("default".to_string(), 200)]
         );
     }
 
