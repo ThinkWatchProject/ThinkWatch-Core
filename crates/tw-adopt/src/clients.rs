@@ -129,6 +129,9 @@ pub struct Client {
     pub process: &'static [&'static str],
     /// 它会读的环境变量。扫 shell 配置时找这些名字。
     pub env_vars: &'static [&'static str],
+    /// 密钥不在配置文件里、要在客户端自己的界面里填时，手动配置多出来的那一步
+    /// （「码，英文原句」）。只有 Zed 是这样：它的密钥走自己的凭据存储。
+    pub key_elsewhere: Option<(&'static str, &'static str)>,
     /// 它的配置文件优先级**高于**真实 shell 环境变量。
     ///
     /// Claude Code 是这样（`env` 块会盖住 shell 里的 export），所以对它
@@ -226,6 +229,7 @@ pub fn adoptable() -> Vec<Client> {
                 "ANTHROPIC_MODEL",
             ],
             // `env` 块会盖住 shell 里的 export
+            key_elsewhere: None,
             config_beats_env: true,
         },
         Client {
@@ -252,6 +256,7 @@ pub fn adoptable() -> Vec<Client> {
             marker: &[".codex"],
             process: &["codex"],
             env_vars: &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"],
+            key_elsewhere: None,
             config_beats_env: false,
         },
         Client {
@@ -269,6 +274,7 @@ pub fn adoptable() -> Vec<Client> {
             marker: &[".config/opencode", ".local/share/opencode"],
             process: &["opencode"],
             env_vars: &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+            key_elsewhere: None,
             config_beats_env: false,
         },
         Client {
@@ -288,6 +294,10 @@ pub fn adoptable() -> Vec<Client> {
             marker: &[".config/zed"],
             process: &["Zed"],
             env_vars: &[],
+            key_elsewhere: Some((
+                "adopt.manual.zed.key",
+                "Then enter the key in Zed's settings, under the ThinkWatch provider.",
+            )),
             config_beats_env: false,
         },
         Client {
@@ -314,6 +324,7 @@ pub fn adoptable() -> Vec<Client> {
             marker: &[".aider.conf.yml", ".aider.model.settings.yml"],
             process: &["aider"],
             env_vars: &["OPENAI_API_BASE", "OPENAI_API_KEY"],
+            key_elsewhere: None,
             config_beats_env: false,
         },
     ]
@@ -325,27 +336,41 @@ pub fn adoptable() -> Vec<Client> {
 /// Tab 补全和 inline edit 仍然走它自己的后端 —— 显示成「已接管」会让
 /// 用户以为所有流量都在我们这儿。
 pub struct ManualOnly {
+    /// 为它生成专用密钥时用的标识：`cursor` / `continue` / `gemini-cli`
+    pub id: &'static str,
     pub name: &'static str,
-    /// 这个客户端的码前缀：步骤是 `<prefix>.how`，提醒是 `<prefix>.caveat`
+    /// 这个客户端的码前缀：每一步是 `<prefix>.<后缀>`，提醒是 `<prefix>.caveat`
     code: &'static str,
-    /// 手动配置的步骤。`{v1}` 是带 `/v1` 的网关地址，`{base}` 是不带的
-    steps: &'static str,
+    /// 手动配置的几步，每步「码的后缀，英文原句」。
+    ///
+    /// **地址和密钥不写进句子。**以前是一整句带着地址的话，用户得从句子里
+    /// 抠出一段 URL；现在两样东西各在界面上有自己的复制按钮，句子只说
+    /// 「填到哪儿」。
+    steps: &'static [(&'static str, &'static str)],
+    /// 填带 `/v1` 的地址还是不带的
+    v1: bool,
     caveat: &'static str,
 }
 
 impl ManualOnly {
-    /// 手动配置的步骤，**网关地址已经填好**。以前这里写的是「填我们的
-    /// 地址」，用户还得自己去找那个地址是什么。
-    pub fn how(&self, gw: &Gateway) -> Msg {
-        let v1 = gw.v1();
-        let base = gw.base.trim_end_matches('/').to_string();
-        Msg {
-            code: format!("{}.how", self.code),
-            args: BTreeMap::from([
-                ("v1".to_string(), v1.clone()),
-                ("base".to_string(), base.clone()),
-            ]),
-            text: self.steps.replace("{v1}", &v1).replace("{base}", &base),
+    /// 手动配置的几步
+    pub fn steps(&self) -> Vec<Msg> {
+        self.steps
+            .iter()
+            .map(|(suffix, text)| Msg {
+                code: format!("{}.{suffix}", self.code),
+                args: BTreeMap::new(),
+                text: text.to_string(),
+            })
+            .collect()
+    }
+
+    /// 要填的网关地址，这个客户端要的写法
+    pub fn endpoint(&self, gw: &Gateway) -> String {
+        if self.v1 {
+            gw.v1()
+        } else {
+            gw.base.trim_end_matches('/').to_string()
         }
     }
 
@@ -363,15 +388,35 @@ impl ManualOnly {
 pub fn manual_only() -> Vec<ManualOnly> {
     vec![
         ManualOnly {
+            id: "cursor",
             name: "Cursor",
             code: "adopt.manual.cursor",
-            steps: "In Cursor, under Settings → Models, turn on Override OpenAI Base URL and enter {v1}.",
+            steps: &[
+                ("open", "In Cursor, open Settings → Models."),
+                (
+                    "base",
+                    "Turn on Override OpenAI Base URL and enter the gateway address.",
+                ),
+                (
+                    "key",
+                    "Enter the key as the OpenAI API Key, then click Verify.",
+                ),
+            ],
+            v1: true,
             caveat: "Tab completion and inline edit still go to Cursor's own service rather than the gateway, so only part of Cursor is covered.",
         },
         ManualOnly {
+            id: "continue",
             name: "Continue",
             code: "adopt.manual.continue",
-            steps: "Add an entry to the models list in ~/.continue/config.yaml with apiBase set to {v1}.",
+            steps: &[
+                ("open", "Open ~/.continue/config.yaml."),
+                (
+                    "entry",
+                    "Add an entry to the models list with provider set to openai, apiBase set to the gateway address and apiKey set to the key.",
+                ),
+            ],
+            v1: true,
             // **接管它要往一个 YAML 列表里插一个新条目**，那是结构性
             // 改写，不是替换一个标量。我们的 YAML 补丁只做后者
             // （见 crate::yaml 开头那段）。宁可少接管一个客户端，也不
@@ -379,9 +424,17 @@ pub fn manual_only() -> Vec<ManualOnly> {
             caveat: "This needs a new entry in the models list, which is not written automatically; follow the steps above.",
         },
         ManualOnly {
+            id: "gemini-cli",
             name: "Gemini CLI",
             code: "adopt.manual.gemini_cli",
-            steps: "Add export GOOGLE_GEMINI_BASE_URL={base} to the shell configuration, then reopen the terminal.",
+            steps: &[
+                (
+                    "export",
+                    "In the shell configuration, export GOOGLE_GEMINI_BASE_URL set to the gateway address and GEMINI_API_KEY set to the key.",
+                ),
+                ("reopen", "Then reopen the terminal."),
+            ],
+            v1: false,
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
             // 「只改 endpoint 和 key 字段」的边界 ——
             // **报告是我们的职责，修改是他的权利。**
@@ -516,6 +569,39 @@ pub fn edits(client: &Client, gw: &Gateway) -> Vec<Edit> {
 }
 
 impl Client {
+    /// 手动配置的几步：打开哪个文件、写下面那几项（就是接管时写的那几项，
+    /// 见 [`edits`]），密钥要另外填的再加一步。
+    ///
+    /// **没检测到它的时候也要给。**配置文件不在默认位置、或者装在别的
+    /// 用户目录下时，检测不到不等于用不了 —— 照着做一样能接上。
+    pub fn manual_steps(&self) -> Vec<Msg> {
+        let file = format!("~/{}", self.config);
+        let mut out = vec![Msg {
+            code: "adopt.manual.file".into(),
+            args: BTreeMap::from([("file".to_string(), file.clone())]),
+            text: format!("Open {file} and set the fields below."),
+        }];
+        if let Some((code, text)) = self.key_elsewhere {
+            out.push(Msg {
+                code: code.into(),
+                args: BTreeMap::new(),
+                text: text.into(),
+            });
+        }
+        out
+    }
+
+    /// 要填的网关地址：接管时写进它配置的那一个（有的带 `/v1`，有的不带）
+    pub fn endpoint(&self, gw: &Gateway) -> String {
+        edits(self, gw)
+            .into_iter()
+            .find_map(|e| match &e.value {
+                Val::Str(s) if !e.secret && (*s == gw.base || *s == gw.v1()) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| gw.base.clone())
+    }
+
     pub fn config_path(&self, home: &std::path::Path) -> PathBuf {
         home.join(self.config)
     }
@@ -627,18 +713,24 @@ mod tests {
             "{}",
             cursor.caveat
         );
-        // 步骤里要有真实的地址，而不是一个让用户自己去找的说法
+        // 地址是真实的地址，而不是一个让用户自己去找的说法；**不在句子里**，
+        // 界面单独给它一个复制按钮
         let gw = Gateway {
             base: "http://127.0.0.1:8788".into(),
             key: None,
         };
-        assert!(
-            cursor.how(&gw).text.contains("http://127.0.0.1:8788/v1"),
-            "{}",
-            cursor.how(&gw)
+        assert_eq!(cursor.endpoint(&gw), "http://127.0.0.1:8788/v1");
+        let gemini = m.iter().find(|c| c.id == "gemini-cli").unwrap();
+        assert_eq!(
+            gemini.endpoint(&gw),
+            "http://127.0.0.1:8788",
+            "Gemini CLI 不要 /v1"
         );
         for c in &m {
-            assert!(!c.how(&gw).text.contains('{'), "{}：{}", c.name, c.how(&gw));
+            for step in c.steps() {
+                assert!(!step.text.contains("127.0.0.1"), "{}：{}", c.name, step);
+                assert!(!step.text.contains('{'), "{}：{}", c.name, step);
+            }
         }
         assert!(
             !adoptable().iter().any(|c| c.name == "Cursor"),
@@ -663,10 +755,42 @@ mod tests {
             base: "http://127.0.0.1:8787".into(),
             key: None,
         };
+        let _ = &gw;
         for m in manual_only() {
-            assert!(!m.how(&gw).code.is_empty(), "{}：步骤没有码", m.name);
+            assert!(!m.steps().is_empty(), "{}：没有步骤", m.name);
+            for step in m.steps() {
+                assert!(!step.code.is_empty(), "{}：步骤没有码", m.name);
+            }
             assert!(!m.caveat().code.is_empty(), "{}：提醒没有码", m.name);
         }
+        for c in adoptable() {
+            for step in c.manual_steps() {
+                assert!(!step.code.is_empty(), "{}：手动配置的步骤没有码", c.id);
+            }
+        }
+    }
+
+    /// 没检测到的客户端也要能照着手动配上：打开哪个文件、写哪几项、填哪个地址。
+    #[test]
+    fn every_adoptable_client_says_how_to_do_it_by_hand() {
+        let gw = Gateway {
+            base: "http://127.0.0.1:18790".into(),
+            key: Some("tw-k".into()),
+        };
+        let by = |id: &str| adoptable().into_iter().find(|c| c.id == id).unwrap();
+        // 各要各的写法：Claude Code 不带 /v1，其余带
+        assert_eq!(by("claude-code").endpoint(&gw), "http://127.0.0.1:18790");
+        for id in ["codex", "opencode", "zed", "aider"] {
+            assert_eq!(by(id).endpoint(&gw), "http://127.0.0.1:18790/v1", "{id}");
+        }
+        for c in adoptable() {
+            let steps = c.manual_steps();
+            assert_eq!(steps[0].arg("file"), format!("~/{}", c.config), "{}", c.id);
+            assert!(!edits(&c, &gw).is_empty(), "{}：没有要写的字段", c.id);
+        }
+        // Zed 的密钥不在配置文件里，多一步在它自己的设置里填
+        assert_eq!(by("zed").manual_steps().len(), 2);
+        assert_eq!(by("claude-code").manual_steps().len(), 1);
     }
 
     /// **`note()` 给的是整句，不是半截。**这两个 `note()` 都会被接到

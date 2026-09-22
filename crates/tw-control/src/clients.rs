@@ -96,30 +96,44 @@ async fn ensure_key(
     client: &tw_adopt::clients::Client,
     key_name: Option<&str>,
 ) -> Result<Gateway, Fail> {
+    let (_, key, _) = prepare_key(s, client.id, key_name).await?;
+    Ok(Gateway {
+        base: gateway_base(s),
+        key: Some(key),
+    })
+}
+
+/// 为这个客户端准备一把钥匙：指名的 → 为它留着的 → 新建一把绑给它。
+/// 返回（名字，明文，是不是这次新建的）。
+///
+/// 接管和手动配置走的是同一条：手动配 Cursor 时拿到的那把，和接管 Claude Code
+/// 时生成的那把一样，都记着是为谁生成的 —— 流量、路由、并发上限才分得清是谁。
+async fn prepare_key(
+    s: &ControlState,
+    client: &str,
+    key_name: Option<&str>,
+) -> Result<(String, String, bool), Fail> {
     let chosen = {
         let cfg = s.config();
-        let picked = key_for(&cfg, client.id, key_name)?;
+        let picked = key_for(&cfg, client, key_name)?;
         // 指名的、或者已经为它留着的：认这一把。否则为它新建
-        let mine = key_name.is_some() || cfg.client_key(client.id).is_some();
+        let mine = key_name.is_some() || cfg.client_key(client).is_some();
         if mine { Some(picked) } else { None }
     };
     if let Some(c) = chosen {
         // 指名一把还没绑过的，就此绑给它 —— 否则「这把是谁的」这件事只存在于
         // 用户此刻的记忆里
-        if c.client.as_deref() != Some(client.id) {
-            bind(s, &c.name, client.id).await?;
+        if c.client.as_deref() != Some(client) {
+            bind(s, &c.name, client).await?;
         }
-        return Ok(Gateway {
-            base: gateway_base(s),
-            key: Some(c.key),
-        });
+        return Ok((c.name, c.key, false));
     }
-    let name = free_name(&s.config(), client.id);
+    let name = free_name(&s.config(), client);
     let key = tw_config::generate_key();
     let item = tw_config::Client {
         name: name.clone(),
         key: key.clone(),
-        client: Some(client.id.to_string()),
+        client: Some(client.to_string()),
         ..Default::default()
     };
     s.cfg
@@ -138,10 +152,25 @@ async fn ensure_key(
                 msg!("control.key_create_failed", detail = e => "The gateway key could not be created: {detail}"),
             )
         })?;
-    Ok(Gateway {
-        base: gateway_base(s),
-        key: Some(key),
-    })
+    Ok((name, key, true))
+}
+
+/// 为一个客户端准备它的专用密钥（`POST /clients/{id}/key`）。**手动配置时用**：
+/// 接管不了的 Cursor、没检测到的 Claude Code，照着步骤填进去的应该是一把只属于
+/// 它的钥匙，而不是默认那把。已经有为它留着的就直接给那把。
+pub async fn client_key(
+    State(s): State<ControlState>,
+    Path(id): Path<String>,
+) -> Result<Json<tw_api::ClientKey>, Fail> {
+    let known = adoptable().iter().any(|c| c.id == id) || manual_only().iter().any(|m| m.id == id);
+    if !known {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.client_unknown", client = id.clone() => "`{client}` is not a client we know."),
+        ));
+    }
+    let (name, key, created) = prepare_key(&s, &id, None).await?;
+    Ok(Json(tw_api::ClientKey { name, key, created }))
 }
 
 /// 把一把已有的钥匙记成某个客户端的。
@@ -186,49 +215,143 @@ fn free_name(cfg: &tw_config::Config, id: &str) -> String {
 
 pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsResponse>, Fail> {
     // 观察窗口的依据：**我们改了一个文件，但那个文件有没有被读到，
-    // 只有请求能证明**。
+    // 只有请求能证明** —— 而且是带着为它生成的那把密钥的请求。按请求头里
+    // 自报的客户端标识算的话，一个没接管的客户端冒用那个标识就能让它显示成
+    // 「使用中」
     let seen: Vec<(String, i64)> = match &s.store {
-        Some(st) => st.lock().await.db().last_seen_by_hint().unwrap_or_default(),
+        Some(st) => st
+            .lock()
+            .await
+            .db()
+            .last_seen_by_client()
+            .unwrap_or_default(),
         None => Vec::new(),
     };
+    let cfg = s.config();
+    let key_of = |id: &str| cfg.client_key(id).map(|c| c.name.clone());
+    let seen_of = |key: &Option<String>| {
+        key.as_ref()
+            .and_then(|k| seen.iter().find(|(n, _)| n == k).map(|(_, at)| *at as u64))
+    };
+    let base = gateway_base(&s);
+    // 手动配置时要写的字段按一把占位的密钥算：值本来就不回显，只要知道哪一项是密钥
+    let gw = Gateway {
+        base: base.clone(),
+        key: Some(String::new()),
+    };
+    let defs = adoptable();
     let clients = detect::detect(&s.home)
         .into_iter()
-        .map(|d| tw_api::DetectedClient {
-            last_seen_ms: seen
+        .map(|d| {
+            let key = key_of(d.id);
+            let manual = defs
                 .iter()
-                .find(|(h, _)| h == d.id)
-                .map(|(_, at)| *at as u64),
-            id: d.id.to_string(),
-            name: d.name.to_string(),
-            path: d.path.display().to_string(),
-            real: d.real.display().to_string(),
-            installed: d.installed,
-            has_config: d.has_config,
-            adopted_at_ms: d.adopted_at_ms,
-            endpoint: d.endpoint,
-            shadows: d.shadows.iter().map(|p| p.display().to_string()).collect(),
-            takes_effect: d.takes_effect.slug().to_string(),
-            warns_when_silent: d.takes_effect.warns_when_silent(),
-            verified: d.verified.slug().to_string(),
-            costs: d.costs,
+                .find(|c| c.id == d.id)
+                .map(|c| setup_of(c, &gw))
+                .unwrap_or_else(|| tw_api::ManualSetup {
+                    steps: Vec::new(),
+                    fields: Vec::new(),
+                    endpoint: base.clone(),
+                });
+            tw_api::DetectedClient {
+                last_seen_ms: seen_of(&key),
+                key,
+                manual,
+                id: d.id.to_string(),
+                name: d.name.to_string(),
+                path: d.path.display().to_string(),
+                real: d.real.display().to_string(),
+                installed: d.installed,
+                has_config: d.has_config,
+                adopted_at_ms: d.adopted_at_ms,
+                endpoint: d.endpoint,
+                shadows: d.shadows.iter().map(|p| p.display().to_string()).collect(),
+                takes_effect: d.takes_effect.slug().to_string(),
+                warns_when_silent: d.takes_effect.warns_when_silent(),
+                verified: d.verified.slug().to_string(),
+                costs: d.costs,
+            }
+        })
+        .collect();
+    let manual = manual_only()
+        .into_iter()
+        .map(|m| {
+            let key = key_of(m.id);
+            tw_api::ManualClient {
+                id: m.id.to_string(),
+                name: m.name.to_string(),
+                last_seen_ms: seen_of(&key),
+                key,
+                setup: tw_api::ManualSetup {
+                    steps: m.steps(),
+                    fields: Vec::new(),
+                    endpoint: m.endpoint(&gw),
+                },
+                caveat: m.caveat(),
+            }
         })
         .collect();
     Ok(Json(tw_api::ClientsResponse {
         clients,
-        manual: manual_only()
-            .into_iter()
-            .map(|m| tw_api::ManualClient {
-                name: m.name.to_string(),
-                how: m.how(&Gateway {
-                    base: gateway_base(&s),
-                    key: None,
-                }),
-                caveat: m.caveat(),
-            })
-            .collect(),
-        gateway_base: gateway_base(&s),
-        keys: s.config().clients.iter().map(|c| c.name.clone()).collect(),
+        manual,
+        keys: cfg.clients.iter().map(|c| c.name.clone()).collect(),
+        gateway_base: base,
     }))
+}
+
+/// 手动配置一个能接管的客户端：打开哪个文件、写哪几项、填哪个地址。
+/// 写的那几项就是接管时写的那几项 —— 两条路写出来的配置一模一样。
+fn setup_of(c: &tw_adopt::clients::Client, gw: &Gateway) -> tw_api::ManualSetup {
+    tw_api::ManualSetup {
+        steps: c.manual_steps(),
+        fields: tw_adopt::clients::edits(c, gw)
+            .iter()
+            .map(|e| field("set", &e.path, Some(&e.value), e.secret))
+            .collect(),
+        endpoint: c.endpoint(gw),
+    }
+}
+
+/// 一处字段改动在界面上的样子。**密钥不回显**，哪怕是打码的。
+fn field(
+    op: &str,
+    path: &[String],
+    value: Option<&tw_adopt::json::Val>,
+    secret: bool,
+) -> tw_api::FieldChange {
+    tw_api::FieldChange {
+        op: op.to_string(),
+        path: path.join("."),
+        value: if secret {
+            None
+        } else {
+            value.map(|v| v.to_line())
+        },
+        secret,
+    }
+}
+
+/// 接管这个客户端时哪几项是密钥。按一把占位的密钥算 —— 只看路径
+fn secret_paths(c: &tw_adopt::clients::Client) -> Vec<Vec<String>> {
+    let gw = Gateway {
+        base: String::new(),
+        key: Some(String::new()),
+    };
+    tw_adopt::clients::edits(c, &gw)
+        .into_iter()
+        .filter(|e| e.secret)
+        .map(|e| e.path)
+        .collect()
+}
+
+fn fields_of(p: &plan::Plan, secrets: &[Vec<String>]) -> Vec<tw_api::FieldChange> {
+    p.targets
+        .iter()
+        .map(|t| match t {
+            plan::Target::Set(path, v) => field("set", path, Some(v), secrets.contains(path)),
+            plan::Target::Remove(path) => field("remove", path, None, secrets.contains(path)),
+        })
+        .collect()
 }
 
 /// 密钥在界面上的样子。
@@ -257,6 +380,8 @@ fn view(p: &plan::Plan, fields: Vec<tw_api::FieldChange>, key: Option<&str>) -> 
         noop: p.is_noop(),
         carries_secret: p.carries_secret,
         fields,
+        key: None,
+        key_created: false,
     }
 }
 
@@ -270,28 +395,19 @@ pub async fn plan_adopt(
     // 而 diff 里的密钥本来就是打码的
     let gw = gateway_for(&s, c.id, req.key_name.as_deref())?;
     let p = plan::plan_adopt(&c, &s.home, &gw).map_err(bad)?;
-    let fields = p
-        .targets
-        .iter()
-        .map(|t| match t {
-            plan::Target::Set(path, v) => tw_api::FieldChange {
-                op: "set".into(),
-                path: path.join("."),
-                // **密钥不回显**，哪怕是打码的
-                value: (!path.iter().any(|k| {
-                    let k = k.to_ascii_lowercase();
-                    k.contains("token") || k.contains("key")
-                }))
-                .then(|| v.to_line()),
-            },
-            plan::Target::Remove(path) => tw_api::FieldChange {
-                op: "remove".into(),
-                path: path.join("."),
-                value: None,
-            },
-        })
-        .collect();
-    Ok(Json(view(&p, fields, gw.key.as_deref())))
+    let mut v = view(&p, fields_of(&p, &secret_paths(&c)), gw.key.as_deref());
+    // 落盘时写进去的是哪一把：和 `prepare_key` 同一个顺序 —— 指名的、为它留着的，
+    // 都没有就是这次新建的那把。**要在确认之前说**：新建一把和沿用一把，
+    // 对用户是两件事
+    let cfg = s.config();
+    let (name, created) = match (req.key_name.as_deref(), cfg.client_key(c.id)) {
+        (Some(n), _) => (n.to_string(), false),
+        (None, Some(k)) => (k.name.clone(), false),
+        (None, None) => (free_name(&cfg, c.id), true),
+    };
+    v.key = Some(name);
+    v.key_created = created;
+    Ok(Json(v))
 }
 
 /// 算一份还原改动。**不写任何东西。**
@@ -304,11 +420,13 @@ pub async fn plan_restore(
     // 还原的 diff 里，**要打码的是用户自己的原始密钥** —— 它正要被写
     // 回去，而它比我们那把更不该出现在截图里
     let keys: Vec<String> = s.config().clients.iter().map(|c| c.key.clone()).collect();
-    let mut v = view(&p, Vec::new(), None);
+    let mut v = view(&p, fields_of(&p, &secret_paths(&c)), None);
     for k in &keys {
         v.before = v.before.as_deref().map(|t| mask(t, Some(k)));
         v.after = mask(&v.after, Some(k));
     }
+    // 还原不删密钥：说清留下的是哪一把，下次接管直接用它
+    v.key = s.config().client_key(c.id).map(|k| k.name.clone());
     Ok(Json(v))
 }
 
@@ -439,7 +557,10 @@ pub async fn mcp_plan_op(
             path: p.field.join("."),
             // 值是一整段 server 配置，里面可能有密钥，diff 里已经能看到打过码的样子
             value: None,
+            secret: false,
         }],
+        key: None,
+        key_created: false,
     }))
 }
 

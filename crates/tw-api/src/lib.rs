@@ -36,7 +36,11 @@ pub use tw_types::Msg;
 ///
 /// **6 概览带上了配置版本号，协议里不再有为老版本留的默认值。**照 5 写的
 /// 界面从别处读版本号；而缺了这些字段的 core 现在连概览都解析不了。
-pub const CONTROL_API_VERSION: u32 = 6;
+///
+/// **7 把手动配置的说明拆成了步骤、字段和地址**（`ManualClient.how` 没了，
+/// 换成 `setup`；能接管的客户端也带上了 `manual`），客户端的最近一次请求改按
+/// 为它生成的密钥算。照 6 写的界面会把手动配置那一栏画成空白。
+pub const CONTROL_API_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -2608,17 +2612,59 @@ pub struct DetectedClient {
     pub verified: String,
     /// 接管之后会失去或改变的功能
     pub costs: Vec<Msg>,
-    /// 最后一次收到这个客户端的请求。**接管有没有真的生效，只有它能证明**
+    /// 为它生成的那把网关密钥（取消接管之后仍然记着）。还没有就不给
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// 最后一次收到**那把密钥**的请求。**接管有没有真的生效，只有它能证明。**
+    ///
+    /// 按密钥算，不按请求头里自报的客户端标识 —— 后者可以伪造，而「接好了没有」
+    /// 要的正是一个不能伪造的答案。没有密钥就没有这个值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    /// 手动配置的方法：没检测到它（配置文件不在默认位置）时照着做
+    pub manual: ManualSetup,
 }
 
 /// 接管不了、只能给指引的。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualClient {
+    /// `cursor` / `continue` / `gemini-cli`。为它生成专用密钥时用
+    pub id: String,
     pub name: String,
-    /// 手动配置的步骤，网关地址已经填在里面
-    pub how: Msg,
+    /// 为它生成的那把网关密钥。还没有就不给
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// 最后一次收到那把密钥的请求
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+    pub setup: ManualSetup,
+    /// 配完还漏什么（Cursor 的补全不经过网关之类）
     pub caveat: Msg,
+}
+
+/// 手动配置一个客户端的方法。
+///
+/// **地址和密钥不写进句子里**：界面各给一个复制按钮。写进句子的话，用户
+/// 得从一句话里抠出一段 URL，而密钥根本不该出现在一句说明里。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualSetup {
+    /// 按顺序做的几步
+    pub steps: Vec<Msg>,
+    /// 要写进配置文件的字段，就是接管时写的那几项。只有能接管的客户端有；
+    /// 密钥那一项不给值（`secret` 为真），界面换成密钥的复制按钮
+    pub fields: Vec<FieldChange>,
+    /// 要填的网关地址，这个客户端要的写法（有的带 `/v1`）
+    pub endpoint: String,
+}
+
+/// 为某个客户端准备的那把网关密钥（`POST /clients/{id}/key`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientKey {
+    pub name: String,
+    /// 明文。这一步就是为了拿去填进客户端
+    pub key: String,
+    /// 这次新建的（此前没有为它留着的）
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2658,6 +2704,12 @@ pub struct PlanView {
     pub carries_secret: bool,
     /// 这次会改哪些字段。diff 之外再给一份摘要
     pub fields: Vec<FieldChange>,
+    /// 写进去的是哪把网关密钥（还原时是留下来的那把）。MCP 的改动没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// 那把密钥要在接管的那一刻新建（此前没有为这个客户端留着的）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_created: bool,
 }
 
 /// 配置文件里的一处改动。
@@ -2667,9 +2719,12 @@ pub struct FieldChange {
     pub op: String,
     /// 字段路径，按层级用 `.` 连起来：`env.ANTHROPIC_BASE_URL`
     pub path: String,
-    /// 要写入的值。写的是网关密钥或者一整段结构时不给
+    /// 要写入的值。写的是网关密钥时不给
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// 这一项是网关密钥。**值不回显**，哪怕是打码的；界面写成「密钥 xxx」
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
