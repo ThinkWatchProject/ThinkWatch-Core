@@ -1171,7 +1171,7 @@ mod first_write_tests {
 
     /// 一整段还没写过的设置，改它里面的某一项。
     ///
-    /// `limits`、`client_probes` 这些默认根本不在文件里，「改里面某一
+    /// `retention`、`client_probes` 这些默认根本不在文件里，「改里面某一
     /// 项」就是它们的第一次写入。父节点必须先存在的话，这些设置在界面
     /// 上从头到尾是死的。
     #[test]
@@ -1179,16 +1179,19 @@ mod first_write_tests {
         let cfg = "version: 1\nlisten:\n  gateway:\n    port: 18780\n";
         let out = insert(
             cfg,
-            &[Step::key("limits"), Step::key("max_body_bytes")],
+            &[Step::key("retention"), Step::key("body_max_bytes")],
             &Scalar::Int(8_388_608),
         )
         .unwrap();
         let back: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
-        assert_eq!(back["limits"]["max_body_bytes"].as_i64(), Some(8_388_608));
+        assert_eq!(
+            back["retention"]["body_max_bytes"].as_i64(),
+            Some(8_388_608)
+        );
         // 原来的东西一个没动
         assert_eq!(back["listen"]["gateway"]["port"].as_i64(), Some(18780));
         assert!(
-            out.contains("\nlimits:\n  max_body_bytes: 8388608"),
+            out.contains("\nretention:\n  body_max_bytes: 8388608"),
             "{out}"
         );
     }

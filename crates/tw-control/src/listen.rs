@@ -67,12 +67,13 @@ async fn save(
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
             let at = |k: &'static str| [Step::key("listen"), Step::key("gateway"), Step::key(k)];
             // **默认值不写进文件。**出厂的配置里没有这一段，存一次「仅本机」
-            // 不该让它凭空多出三行
+            // 不该让它凭空多出三行。放行网段是空的时候要写成 `[]`：不写是
+            // 默认名单，不是空
             let bind_v =
                 (bind != tw_config::Bind::Loopback).then(|| Value::String(bind.to_string()));
             let port_v = (req.port != tw_config::DEFAULT_GATEWAY_PORT)
                 .then(|| Value::Number(req.port.into()));
-            let allow_v = (!allow.is_empty())
+            let allow_v = (allow != tw_config::default_allow_from())
                 .then(|| Value::Sequence(allow.iter().cloned().map(Value::String).collect()));
             let out = edit::set(text, &at("bind"), bind_v.as_ref())?;
             let out = edit::set(&out, &at("port"), port_v.as_ref())?;

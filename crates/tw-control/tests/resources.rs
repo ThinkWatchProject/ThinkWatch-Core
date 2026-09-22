@@ -125,7 +125,7 @@ async fn the_overview_carries_the_version_an_edit_is_based_on() {
         "/config",
         serde_json::json!({
             "base_version": before,
-            "ops": [{ "op": "replace", "path": "/limits/per_provider", "value": 7 }],
+            "ops": [{ "op": "replace", "path": "/retention/body_days", "value": 7 }],
         }),
     )
     .await;
@@ -143,7 +143,7 @@ async fn the_overview_carries_the_version_an_edit_is_based_on() {
     let edit = |base: String| {
         serde_json::json!({
             "base_version": base,
-            "ops": [{ "op": "replace", "path": "/limits/per_provider", "value": 8 }],
+            "ops": [{ "op": "replace", "path": "/retention/body_days", "value": 8 }],
         })
     };
     let (st, body) = call(&b.app, "PATCH", "/config", edit(written)).await;

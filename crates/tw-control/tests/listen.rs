@@ -121,7 +121,7 @@ async fn saving_writes_what_was_chosen_and_leaves_no_trace_of_defaults() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "loopback", "port": tw_config::DEFAULT_GATEWAY_PORT }),
+        serde_json::json!({ "bind": "loopback", "port": tw_config::DEFAULT_GATEWAY_PORT, "allow_from": tw_config::default_allow_from() }),
     )
     .await;
     // 8788 可能正被开发者自己的网关占着：那时拒绝是对的，这一半就不测了
@@ -147,7 +147,7 @@ async fn a_port_in_use_is_refused_and_nothing_is_written() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "loopback", "port": taken }),
+        serde_json::json!({ "bind": "loopback", "port": taken, "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
@@ -167,7 +167,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "en97", "port": free_port() }),
+        serde_json::json!({ "bind": "en97", "port": free_port(), "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
@@ -185,7 +185,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "192.168.1.5@wifi", "port": free_port() }),
+        serde_json::json!({ "bind": "192.168.1.5@wifi", "port": free_port(), "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
@@ -195,7 +195,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "loopback", "port": 0 }),
+        serde_json::json!({ "bind": "loopback", "port": 0, "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
@@ -226,7 +226,7 @@ async fn the_status_follows_the_listener_after_a_save() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "loopback", "port": p2 }),
+        serde_json::json!({ "bind": "loopback", "port": p2, "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -250,16 +250,15 @@ async fn a_stale_version_is_refused_like_any_other_edit() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "loopback", "port": free_port(), "base_version": "nope" }),
+        serde_json::json!({ "bind": "loopback", "port": free_port(), "base_version": "nope", "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
-async fn the_overview_says_what_was_written_not_the_private_default() {
-    // 生效的那份在空的时候被填成私网段；界面拿它回填表单再存回去的话，
-    // 一份「没写」的配置就被改写成了六行默认值
+async fn the_allow_list_is_what_the_file_says_with_the_default_beside_it() {
+    // 没写是默认名单；界面照着它画出几条网段，还要知道「恢复默认」恢复成什么
     let b = bed("version: 1
 clients:
   - name: default
@@ -269,7 +268,51 @@ listen:
     bind: all
 ");
     let (_, ov) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let default = serde_json::json!(tw_config::default_allow_from());
     assert_eq!(ov["listen"]["bind"], "all");
     assert_eq!(ov["listen"]["exposed"], true);
-    assert_eq!(ov["listen"]["allow_from"], serde_json::json!([]));
+    assert_eq!(ov["listen"]["allow_from"], default);
+    assert_eq!(ov["listen"]["default_allow_from"], default);
+}
+
+#[tokio::test]
+async fn an_empty_allow_list_is_written_down_and_the_default_one_is_not() {
+    // 不写 = 默认名单，所以空的必须写成 `[]`；和默认名单一样的不写，
+    // 配置文件不因为存了一次就多出几行
+    let b = bed(&yaml(free_port()));
+    let port = free_port();
+    let save = |allow: serde_json::Value| serde_json::json!({ "bind": "all", "port": port, "allow_from": allow });
+    let (st, v) = call(&b.app, "PUT", "/listen", save(serde_json::json!([]))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.listen().allow_from.is_empty(), "{}", b.file());
+    assert!(b.file().contains("allow_from: []"), "{}", b.file());
+
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/listen",
+        save(serde_json::json!(tw_config::default_allow_from())),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.listen().allow_from, tw_config::default_allow_from());
+    assert!(!b.file().contains("allow_from"), "{}", b.file());
+}
+
+#[tokio::test]
+async fn interfaces_come_one_per_name() {
+    // 配置里按名字存：同一张网卡列两行，选第二行等于选第一行
+    let b = bed(&yaml(free_port()));
+    let (st, v) = call(&b.app, "GET", "/interfaces", serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    let mut unique = names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(names.len(), unique.len(), "{names:?}");
 }

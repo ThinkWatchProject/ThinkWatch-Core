@@ -73,6 +73,43 @@ pub fn list() -> Vec<Nic> {
     out
 }
 
+/// 每张网卡一行，地址是按名字绑它时真正监听的那一个。
+///
+/// **同一张网卡只出现一次。**配置里按名字存（`bind: en0`），一张网卡的
+/// IPv4 和 IPv6 各列一行的话，两行存下去都是 `en0`，选单上选第二行等于
+/// 选第一行。
+///
+/// **有 IPv4 就用 IPv4。**客户端配置里写的是 `http://<地址>:端口`，而一个
+/// IPv6 地址在那个位置要加方括号，多数客户端的输入框对此毫无准备。
+pub fn by_name() -> Vec<Nic> {
+    one_per_name(list())
+}
+
+fn one_per_name(all: Vec<Nic>) -> Vec<Nic> {
+    let mut out: Vec<Nic> = Vec::new();
+    for n in all {
+        match out.iter_mut().find(|x| x.name == n.name) {
+            None => out.push(n),
+            Some(x) if x.addr.is_ipv6() && n.addr.is_ipv4() => *x = n,
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// 系统里有没有叫这个名字的网卡，**有没有地址都算**。
+///
+/// [`list`] 只列有地址的：网线拔了、Wi-Fi 断了的网卡不在里面。「没有这张
+/// 网卡」和「这张网卡此刻没有地址」要分开说 —— 前者多半是拼错了，后者
+/// 插上网线就好。
+pub fn exists(name: &str) -> bool {
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: 传进去的是一个以 NUL 结尾的字符串，函数只读它
+    unsafe { libc::if_nametoindex(c.as_ptr()) != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +144,33 @@ mod tests {
         if let (Some(lb), Some(real)) = (first_loopback, last_real) {
             assert!(lb > real, "回环排在真实网卡前面了：{all:?}");
         }
+    }
+
+    #[test]
+    fn one_row_per_interface_with_the_ipv4_address_when_there_is_one() {
+        let nic = |name: &str, addr: &str| Nic {
+            name: name.into(),
+            addr: addr.parse().unwrap(),
+        };
+        let rows = one_per_name(vec![
+            nic("en0", "fd94:db59:5dfe:4525::1"),
+            nic("en0", "10.0.3.7"),
+            nic("en0", "10.0.3.8"),
+            nic("utun3", "fd00::2"),
+        ]);
+        assert_eq!(
+            rows,
+            vec![nic("en0", "10.0.3.7"), nic("utun3", "fd00::2")],
+            "同一张网卡列了两行，或者没挑 IPv4"
+        );
+    }
+
+    #[test]
+    fn every_listed_interface_exists_and_a_made_up_one_does_not() {
+        for n in by_name() {
+            assert!(exists(&n.name), "{n:?}");
+        }
+        assert!(!exists("tw-no-such0"));
+        assert!(!exists("bad\0name"));
     }
 }
