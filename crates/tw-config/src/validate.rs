@@ -36,6 +36,10 @@ pub enum ValidationError {
     BadBaseUrl { name: String, url: String },
     #[error("the value of gateway key `{name}` is empty")]
     EmptyKey { name: String },
+    #[error(
+        "gateway key `{name}` has max_concurrent: 0, so every request made with it would wait forever. Leave max_concurrent out for no limit"
+    )]
+    ZeroConcurrency { name: String },
     #[error("the routing configuration is wrong: {0}")]
     Routing(#[from] tw_engine::RouteError),
     #[error(
@@ -143,6 +147,13 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
         }
         if c.key.trim().is_empty() {
             return Err(ValidationError::EmptyKey {
+                name: c.name.clone(),
+            });
+        }
+        // 超出上限的请求不拒绝、也不设等待时限（见 tw-gateway 的 limits），
+        // 上限是 0 的话，这把密钥的每个请求都会一直等下去
+        if c.max_concurrent == Some(0) {
+            return Err(ValidationError::ZeroConcurrency {
                 name: c.name.clone(),
             });
         }
@@ -453,20 +464,15 @@ mod tests {
     }
 
     #[test]
-    fn exposing_the_gateway_defaults_the_allow_list_to_private_ranges() {
-        // **不是放行所有**。想放开得手动写 0.0.0.0/0，那时他
-        // 至少知道自己做了什么。
+    fn a_zero_concurrency_limit_is_refused_rather_than_waiting_forever() {
         let mut k = cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")]);
-        assert!(
-            k.listen.gateway.effective_allow_from().is_empty(),
-            "loopback 下不填"
-        );
-        k.listen.gateway.bind = crate::Bind::All;
-        let eff = k.listen.gateway.effective_allow_from();
-        assert!(eff.iter().any(|s| s == "192.168.0.0/16"), "{eff:?}");
-        // 用户写了就用他的，不要偷偷加
-        k.listen.gateway.allow_from = vec!["10.1.2.0/24".into()];
-        assert_eq!(k.listen.gateway.effective_allow_from(), vec!["10.1.2.0/24"]);
+        k.clients[0].max_concurrent = Some(0);
+        assert!(matches!(
+            validate(&k),
+            Err(ValidationError::ZeroConcurrency { .. })
+        ));
+        k.clients[0].max_concurrent = Some(1);
+        assert!(validate(&k).is_ok());
     }
 
     #[test]

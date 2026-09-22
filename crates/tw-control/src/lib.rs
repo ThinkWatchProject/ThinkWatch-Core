@@ -156,7 +156,7 @@ pub fn router(state: ControlState) -> Router {
 /// 已经不存在的地址。
 async fn interfaces() -> Json<Vec<tw_api::NicView>> {
     Json(
-        tw_config::nics::list()
+        tw_config::nics::by_name()
             .into_iter()
             .map(|n| tw_api::NicView {
                 name: n.name,
@@ -340,11 +340,6 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             })
             .collect(),
         price_sheets: pricing::sheet_views(cfg),
-        limits: tw_api::LimitsView {
-            per_provider: cfg.limits.per_provider,
-            queue_depth: cfg.limits.queue_depth,
-            queue_timeout_secs: cfg.limits.queue_timeout_secs,
-        },
         retention: tw_api::RetentionView {
             body_days: cfg.retention.body_days,
             row_days: cfg.retention.row_days,
@@ -360,6 +355,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             bind: cfg.listen.gateway.bind.to_string(),
             port: cfg.listen.gateway.port,
             allow_from: cfg.listen.gateway.allow_from.clone(),
+            default_allow_from: tw_config::default_allow_from(),
             exposed: cfg.listen.gateway.bind.is_exposed(),
         },
     })

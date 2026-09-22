@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-pub use tw_types::Limits;
 
 pub mod chatgpt;
 pub mod credential;
@@ -83,9 +82,6 @@ pub struct Config {
     /// 日志留多久。不写就是默认值。
     #[serde(default, skip_serializing_if = "is_default")]
     pub retention: tw_types::Retention,
-    /// 并发上限。不写就是默认值。
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub limits: Limits,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<tw_engine::Group>,
     /// 路由。一条路由是一组按顺序求值的规则。
@@ -124,7 +120,6 @@ impl Default for Config {
             client_probes: ClientProbes::default(),
             security: Security::default(),
             retention: tw_types::Retention::default(),
-            limits: Limits::default(),
             groups: Vec::new(),
             routes: Vec::new(),
             default_route: None,
@@ -244,9 +239,23 @@ pub struct GatewayListen {
     pub bind: Bind,
     #[serde(default = "default_port")]
     pub port: u16,
-    /// 只在绑到本机之外时生效的来源白名单（CIDR）。
-    #[serde(default)]
+    /// 除本机之外，哪些来源可以连（CIDR，或者单个地址）。**本机永远放行。**
+    ///
+    /// 不写就是私网段（[`default_allow_from`]），写成空列表就是只有本机。
+    /// **没有「空 = 什么」的特例**：空列表若意味着「按私网段放行」，界面上
+    /// 是一个空格子、实际放行的是四个网段，删掉最后一条反而把默认名单请了
+    /// 回来。
+    #[serde(default = "default_allow_from")]
     pub allow_from: Vec<String>,
+}
+
+/// 放行网段的默认名单：私网段。**不是放行所有** —— 想放开得手动写
+/// `0.0.0.0/0`，那时他至少知道自己做了什么。
+pub fn default_allow_from() -> Vec<String> {
+    tw_types::PRIVATE_RANGES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn default_port() -> u16 {
@@ -282,7 +291,7 @@ impl Default for GatewayListen {
         Self {
             bind: Bind::default(),
             port: DEFAULT_GATEWAY_PORT,
-            allow_from: Vec::new(),
+            allow_from: default_allow_from(),
         }
     }
 }
@@ -340,50 +349,29 @@ impl Bind {
             Bind::Loopback => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             Bind::All => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             Bind::Addr(a) => Ok(*a),
-            Bind::Nic(name) => {
-                let mut found = false;
-                // **同一张网卡可以有好几个地址。**取 IPv4 那个：客户端配置里
-                // 写的是 `http://<地址>:端口`，而一个 IPv6 地址在那个位置要
-                // 加方括号，多数客户端的输入框对此毫无准备。
-                let mut v6 = None;
-                for n in nics::list() {
-                    if n.name != *name {
-                        continue;
-                    }
-                    found = true;
-                    match n.addr {
-                        std::net::IpAddr::V4(_) => return Ok(n.addr),
-                        std::net::IpAddr::V6(_) => v6 = v6.or(Some(n.addr)),
-                    }
-                }
-                match (found, v6) {
-                    (_, Some(a)) => Ok(a),
-                    (true, None) => Err(BindError::NicHasNoAddr { name: name.clone() }),
-                    (false, None) => Err(BindError::NoSuchNic {
-                        name: name.clone(),
-                        available: {
-                            let mut names: Vec<String> =
-                                nics::list().into_iter().map(|n| n.name).collect();
-                            names.dedup();
-                            names
-                        },
-                    }),
-                }
-            }
+            // 一张网卡有好几个地址时用哪一个，由 `nics::by_name` 说了算 ——
+            // 界面上的选单列的也是它，选单上写的就是真要监听的那个
+            Bind::Nic(name) => match nics::by_name().into_iter().find(|n| n.name == *name) {
+                Some(n) => Ok(n.addr),
+                None if nics::exists(name) => Err(BindError::NicHasNoAddr { name: name.clone() }),
+                None => Err(BindError::NoSuchNic {
+                    name: name.clone(),
+                    available: nics::by_name().into_iter().map(|n| n.name).collect(),
+                }),
+            },
         }
     }
 
     /// 本机之外连得上吗。
     ///
-    /// **这个判断决定了两件强制行为**：密钥校验不可关闭，
-    /// 以及 `allow_from` 为空时自动填私网段。
+    /// **这个判断决定了一件强制行为**：密钥校验不可关闭。
     ///
     /// 写死地址的那一档判的是地址本身而不是枚举变体 —— `bind: 127.0.0.1`
     /// 和 `loopback` 是同一件事，不该因为换了个写法就被当成暴露在外。
     ///
     /// **网卡名一律算暴露，不去解析。**这个判断要在任何时候都答得出，
-    /// 包括那张网卡当下没有地址的时候；而它决定的是密钥强制和白名单
-    /// 默认值 —— 答不上来时错在保守那一侧，比为一个判断去做系统调用好。
+    /// 包括那张网卡当下没有地址的时候；而它决定的是密钥强制 —— 答不上来
+    /// 时错在保守那一侧，比为一个判断去做系统调用好。
     /// 代价是 `bind: lo0` 会被当成暴露，那没有坏处。
     pub fn is_exposed(&self) -> bool {
         match self {
@@ -465,23 +453,6 @@ impl<'de> Deserialize<'de> for Bind {
                 )))
             }
         }
-    }
-}
-
-impl GatewayListen {
-    /// 实际生效的来源白名单。
-    ///
-    /// **暴露在局域网、而用户没写白名单时，默认填私网段** ——
-    /// 而不是放行所有。想放开得手动写 `0.0.0.0/0`，那时他至少知道自己
-    /// 做了什么。
-    pub fn effective_allow_from(&self) -> Vec<String> {
-        if !self.bind.is_exposed() || !self.allow_from.is_empty() {
-            return self.allow_from.clone();
-        }
-        tw_types::PRIVATE_RANGES
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
     }
 }
 
@@ -1041,8 +1012,7 @@ mod tests {
     /// 写错字段名要报错，不能悄悄忽略。
     #[test]
     fn a_typo_in_retention_is_rejected_rather_than_ignored() {
-        // 「改了个上限，界面说写成功了，什么都没发生」是 `Limits` 上
-        // 记过的那个教训
+        // 悄悄忽略的话，用户改了个期限，界面说写成功了，什么都没发生
         let text = "version: 1\nretention:\n  body_dayz: 3\n";
         assert!(serde_yaml_ng::from_str::<Config>(text).is_err());
     }
@@ -1067,7 +1037,26 @@ providers:
         // 什么都没写的段落必须有能用的默认值
         assert_eq!(cfg.listen.gateway.bind, Bind::Loopback);
         assert_eq!(cfg.listen.gateway.port, DEFAULT_GATEWAY_PORT);
-        assert!(cfg.listen.gateway.allow_from.is_empty());
+        assert_eq!(cfg.listen.gateway.allow_from, default_allow_from());
+    }
+
+    #[test]
+    fn the_allow_list_is_exactly_what_is_written() {
+        // 不写是私网段；写成空的就是空的（只有本机），不会被悄悄填回默认名单
+        let parse = |text: &str| serde_yaml_ng::from_str::<Config>(text).unwrap();
+        let unset = parse("version: 1\nlisten:\n  gateway:\n    bind: all\n");
+        assert_eq!(unset.listen.gateway.allow_from, default_allow_from());
+        assert!(
+            !unset
+                .listen
+                .gateway
+                .allow_from
+                .iter()
+                .any(|r| r == "0.0.0.0/0"),
+            "默认名单不是放行所有"
+        );
+        let empty = parse("version: 1\nlisten:\n  gateway:\n    bind: all\n    allow_from: []\n");
+        assert!(empty.listen.gateway.allow_from.is_empty());
     }
 
     #[test]

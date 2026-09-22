@@ -22,12 +22,8 @@ pub enum Source {
     Upstream,
     /// 请求本身有问题
     Request,
-    /// 我们这一层排不下了。**这是唯一一个我们主动拒绝的场景**，
-    /// 而它的存在是为了防止队列撑爆内存。
-    Overloaded,
-    /// 上游说「慢点」。**和 `Overloaded` 分开**：那是我们自己的队列满了，
-    /// 这是对面的额度到顶了。回 502 的话客户端会当成「服务器坏了」而不是
-    /// 「该退避了」，而它们该做的事完全不同。
+    /// 上游说「慢点」：对面的额度到顶了。回 502 的话客户端会当成「服务器
+    /// 坏了」而不是「该退避了」，而它们该做的事完全不同。
     RateLimited,
     /// 一条 `deny` 规则挡下来的。
     ///
@@ -46,7 +42,6 @@ impl Source {
             Source::Config => "config",
             Source::Upstream => "upstream",
             Source::Request => "request",
-            Source::Overloaded => "overloaded",
             Source::RateLimited => "rate_limited",
             Source::Denied => "denied",
         }
@@ -58,7 +53,6 @@ impl Source {
             Source::Upstream => StatusCode::BAD_GATEWAY,
             Source::Request => StatusCode::BAD_REQUEST,
             // 429 而不是 503：客户端至少知道这是限流，可以退避。
-            Source::Overloaded => StatusCode::TOO_MANY_REQUESTS,
             Source::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Source::Denied => StatusCode::FORBIDDEN,
         }
@@ -70,7 +64,7 @@ impl Source {
             Source::Config => "api_error",
             Source::Upstream => "api_error",
             Source::Request => "invalid_request_error",
-            Source::Overloaded | Source::RateLimited => "rate_limit_error",
+            Source::RateLimited => "rate_limit_error",
             Source::Denied => "permission_error",
         }
     }
@@ -83,7 +77,7 @@ impl Source {
             Source::Auth => "invalid_request_error",
             Source::Config | Source::Upstream => "server_error",
             Source::Request => "invalid_request_error",
-            Source::Overloaded | Source::RateLimited => "rate_limit_exceeded",
+            Source::RateLimited => "rate_limit_exceeded",
             Source::Denied => "invalid_request_error",
         }
     }
@@ -94,7 +88,7 @@ impl Source {
             Source::Auth => "UNAUTHENTICATED",
             Source::Config | Source::Upstream => "UNAVAILABLE",
             Source::Request => "INVALID_ARGUMENT",
-            Source::Overloaded | Source::RateLimited => "RESOURCE_EXHAUSTED",
+            Source::RateLimited => "RESOURCE_EXHAUSTED",
             Source::Denied => "PERMISSION_DENIED",
         }
     }

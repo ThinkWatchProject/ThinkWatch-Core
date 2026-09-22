@@ -376,7 +376,7 @@ pub fn substitute_template(
 /// 会有一周十倍于平时的时候 —— 没有上限的话，那一周会把磁盘吃光，
 /// 而用户直到硬盘满了才知道。
 ///
-/// 住在 tw-types 的理由和 [`Limits`] 一样：配置和存储层都要认它。
+/// 住在 tw-types 是因为配置和存储层都要认它。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retention {
@@ -411,62 +411,14 @@ impl Default for Retention {
     }
 }
 
-/// 并发上限。住在 tw-types 是因为配置和数据面都要认
-/// 它，而它本身只是几个数字 —— 不该为此让 tw-config 依赖 tw-gateway。
+/// 放行网段的默认名单：RFC1918 的三个私网段和 IPv6 的唯一本地地址段。
 ///
-/// **没有全局上限。**一个本机网关同时在跑的请求，就是这台电脑上几个客户端
-/// 各自开着的那几个会话；再压一道总闸，挡住的只会是用户自己的并行任务。
-/// 要防的是另外两件事：一个变慢的上游占住所有请求（`per_provider`），和
-/// 某一把密钥后面的失控脚本（密钥自己的 `max_concurrent`）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-// 配置里的每一个结构都拒未知字段，唯独这一个在 tw-types 里，漏了。
-// 表现是 `max_body_bytes: 8388608` 写进去不报错、也不生效 —— 用户改
-// 了个上限，界面说写成功了，什么都没发生。（这一层别的类型是聊天接口
-// 的线上类型，上游随时会加字段，那些恰恰不能拒。）
-#[serde(deny_unknown_fields)]
-pub struct Limits {
-    /// 单个上游
-    #[serde(default = "d_per_provider")]
-    pub per_provider: usize,
-    /// 队列上限。满了才真的拒绝
-    #[serde(default = "d_queue_depth")]
-    pub queue_depth: usize,
-    /// 排太久还是要放弃
-    #[serde(default = "d_queue_timeout")]
-    pub queue_timeout_secs: u64,
-}
-
-fn d_per_provider() -> usize {
-    8
-}
-fn d_queue_depth() -> usize {
-    64
-}
-fn d_queue_timeout() -> u64 {
-    30
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            per_provider: d_per_provider(),
-            queue_depth: d_queue_depth(),
-            queue_timeout_secs: d_queue_timeout(),
-        }
-    }
-}
-
-/// RFC1918 三个私网段 + 回环。监听非 loopback 时 `allow_from` 的默认值。
-/// 住在这里是因为配置层要用它填默认值，数据面要用它
-/// 判断 —— 而它只是一组字符串。
-pub const PRIVATE_RANGES: &[&str] = &[
-    "127.0.0.0/8",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "::1/128",
-    "fc00::/7",
-];
+/// **不含回环。**本机永远放行（见 tw-gateway 的 `AllowList::allows`），写进
+/// 名单只会在界面上多出两条删了也不起作用的条目。
+///
+/// 住在这里是因为配置层要用它填默认值，控制面要把它交给界面「恢复默认」——
+/// 而它只是一组字符串。
+pub const PRIVATE_RANGES: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"];
 
 #[cfg(test)]
 mod call_ctx_tests {

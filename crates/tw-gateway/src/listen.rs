@@ -114,11 +114,7 @@ async fn bind_all(
 
 fn start(state: &AppState, want: SocketAddr, listener: TcpListener) -> std::io::Result<Bound> {
     let actual = listener.local_addr()?;
-    if state.runtime().allow.is_empty() {
-        tracing::info!(%actual, "the gateway is listening");
-    } else {
-        tracing::info!(%actual, "the gateway is listening (source allow-list in effect)");
-    }
+    tracing::info!(%actual, "the gateway is listening");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let st = state.clone();
     tokio::spawn(async move {

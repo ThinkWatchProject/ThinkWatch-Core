@@ -152,8 +152,8 @@ impl Runtime {
                 None => clients.insert(p.name.clone(), client_for_provider(&config, p)?),
             };
         }
-        let allow = crate::access::AllowList::parse(&config.listen.gateway.effective_allow_from())
-            .map_err(|e| {
+        let allow =
+            crate::access::AllowList::parse(&config.listen.gateway.allow_from).map_err(|e| {
                 GatewayError::config(msg!(
                     "gw.config.allow_from", detail = e => "listen.gateway.allow_from: {detail}"
                 ))
@@ -208,13 +208,12 @@ pub struct AppState {
     /// **一次 `store` 就是一次生效**：正在跑的请求持有旧的 `Arc`，跑完
     /// 自然释放；新请求看到的是新的。中间没有任何一个瞬间是半新半旧的。
     rt: Arc<arc_swap::ArcSwap<Runtime>>,
-    /// 并发闸门。排队不拒绝。
+    /// 每把密钥自己的并发上限。等，不拒绝。
     ///
     /// **不在 Runtime 里，因为它握着正在跑的请求的通行证。**跟着配置一起
-    /// 换的话，每改一次规则，队列里排着的请求就会失去位置，而已经在跑的
-    /// 那些的通行证会变成孤儿 —— 于是那一瞬间的实际并发可以到上限的两倍。
-    /// 只有 `limits` 真的变了才换它。
-    gate: Arc<arc_swap::ArcSwap<crate::limits::Gate>>,
+    /// 换的话，每改一次配置，排着的请求就会失去位置，而已经在跑的那些的
+    /// 通行证会变成孤儿。上限改了由它自己在原地加减（见 `limits`）。
+    gate: Arc<crate::limits::Gate>,
     /// 探测和别的杂事用的默认 Client（不走代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
@@ -322,7 +321,6 @@ impl AppState {
                 "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
             ))
         })?;
-        let limits = config.limits.clone();
         let pricing_config = config.pricing.clone();
         let price_assign = config.price_assign();
         let models = Arc::new(crate::models::Directory::default());
@@ -330,9 +328,7 @@ impl AppState {
         let rt = Runtime::build(config, None)?;
         let state = Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
-            gate: Arc::new(arc_swap::ArcSwap::from_pointee(crate::limits::Gate::new(
-                limits,
-            ))),
+            gate: Default::default(),
             http,
             bus: tw_observe::EventBus::new(),
             health: Arc::new(Health::new()),
@@ -830,10 +826,6 @@ impl AppState {
         &self.relisten
     }
 
-    pub fn gate(&self) -> Arc<crate::limits::Gate> {
-        self.gate.load_full()
-    }
-
     /// 接上 body 的去处。**观测层起来之后才调** —— 在那之前 body 一律
     /// 丢掉，而请求照常。
     pub fn set_body_sink(&self, tx: crate::bodies::BodySender) {
@@ -945,8 +937,6 @@ impl AppState {
     /// 而那时旧配置必须原样继续服务。
     pub fn reload(&self, config: tw_config::Config) -> Result<(), GatewayError> {
         let old = self.rt.load();
-        let limits_changed = old.config.limits != config.limits;
-        let new_limits = config.limits.clone();
         let next = Runtime::build(config, Some(&old))?;
         // 比的是写法不是解析出来的地址：网卡名要问系统，而那是监听那一边的事
         let (was, now) = (&old.config.listen.gateway, &next.config.listen.gateway);
@@ -966,10 +956,6 @@ impl AppState {
             // 只通知，不在这里重建 —— 换监听器要 await，而这个函数被
             // 文件监听那条同步路径调用。谁在监听谁去换。
             self.relisten();
-        }
-        if limits_changed {
-            self.gate
-                .store(Arc::new(crate::limits::Gate::new(new_limits)));
         }
         Ok(())
     }
@@ -1655,35 +1641,15 @@ async fn pipeline(
             .order(Some(&gname), &decision.candidates, &facts_rt);
     }
 
-    // 管线第 3 步：准入。**排队而不是拒绝** —— 客户端收到 429
-    // 通常不会优雅重试，一个本来只需要多等两秒的请求会变成一次任务中断。
-    //
-    // 闸门在路由**之后**取：要知道走哪个 provider 才能算 per_provider
-    // 那一维。
-    let client_limit = rt
+    // 管线第 3 步：这把密钥自己的并发上限。**等，不拒绝** —— 理由在
+    // `crate::limits`。放在路由之后：被规则挡下的请求不用先等一轮
+    let limit = rt
         .config
         .clients
         .iter()
         .find(|c| c.name == client_name)
         .and_then(|c| c.max_concurrent);
-    let _pass = state
-        .gate()
-        .acquire(
-            decision
-                .candidates
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("?"),
-            &client_name,
-            client_limit,
-        )
-        .await
-        .map_err(|e| {
-            GatewayError::new(
-                crate::error::Source::Overloaded,
-                msg!("gw.overloaded", detail = e => "{detail}"),
-            )
-        })?;
+    let _pass = state.gate.acquire(&client_name, limit).await;
 
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
     // 两条边界都在 `Health::filter` 里，理由写在那儿。
