@@ -30,7 +30,7 @@ const SCHEMA: i64 = 17;
 /// IS NULL AND billing = 'per-token'`，于是每一条失败都被数成「模型不在价目
 /// 表里」；时间桶、分组和会话只看 `cost_micros IS NULL`，连订阅制也数了进去。
 const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
-                         AND billing IN ('', 'per-token'))";
+                         AND billing = 'per-token')";
 
 /// 这一行算不出钱，**因为没有拿到用量**：上游没报，或者连接在它报之前就
 /// 结束了（客户端取消、WebSocket 会话）。配价格解决不了它，而它多半花了钱，
@@ -40,7 +40,7 @@ const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
 /// 失败的不数 —— 响应开始之前的失败不计费，断在中间的会带着用量，归到上面
 /// 那种；上游回了 4xx 的也不数，那种响应不计费。
 const NO_USAGE: &str = "(cost_micros IS NULL AND input_tokens IS NULL AND error IS NULL \
-                         AND billing IN ('', 'per-token') AND (cancelled = 1 OR status < 300))";
+                         AND billing = 'per-token' AND (cancelled = 1 OR status < 300))";
 
 /// 这一行由订阅制上游服务：**没有金额，但不是缺了什么** —— 这笔账按订阅额度
 /// 算，不按用量算。和上面两种都不相交（那两种只数按 token 计费的）。
@@ -110,9 +110,11 @@ pub struct RequestRow {
     /// 客户端没等到响应结束就走了。**和 `error` 是两件事**：它不算失败，
     /// 用量只算到断开那一刻，所以金额是估算
     pub cancelled: bool,
-    /// 路由决策与尝试链，JSON。没经过路由的（WebSocket、本地应答）是 None
+    /// 路由决策与尝试链，JSON。本地应答的是 None；路由还没报出结论请求就
+    /// 结束了的也是：上游应答之前客户端就走了、被第二阶段规则拒绝
     pub routing: Option<String>,
-    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
+    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `free` / `unknown`。
+    /// 本地应答是 `free`
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     pub cache_saved_micros: Option<i64>,
@@ -1866,6 +1868,40 @@ mod cost_state_tests {
         assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (0, 3));
         let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
         assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 3));
+    }
+
+    /// **钱缺着的只有按量计费的那些。**订阅、不计费、计费方式未知的，没有
+    /// 用量也好、模型不在价目表里也好，哪一种都不是：这笔账本来就不按价目表算。
+    #[test]
+    fn only_a_per_token_row_can_be_missing_its_money() {
+        let db = Db::in_memory().unwrap();
+        for (i, billing) in ["per-token", "subscription", "free", "unknown"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = i as i64 * 2 + 1;
+            let mut no_usage = without_usage(id, 100);
+            no_usage.billing = billing.into();
+            db.insert(&no_usage).unwrap();
+            let mut no_price = unknown_model(id + 1, 100);
+            no_price.billing = billing.into();
+            db.insert(&no_price).unwrap();
+        }
+
+        let s = db.summary(0, 1000).unwrap();
+        assert_eq!((s.unpriced_requests, s.no_usage_requests), (1, 1));
+        let b = db.cost_buckets(0, 1000, 1000).unwrap();
+        assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (1, 1));
+        let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
+        let total = |f: fn(&tw_api::CostGroup) -> i64| g.iter().map(f).sum::<i64>();
+        assert_eq!(
+            (
+                total(|g| g.unpriced_requests),
+                total(|g| g.no_usage_requests)
+            ),
+            (1, 1)
+        );
+        assert_eq!(db.unpriced_recent(365_000).unwrap().0, 1);
     }
 
     /// 订阅制的那一行**哪一种都不是**：这笔账不在金额这个维度上。汇总早就

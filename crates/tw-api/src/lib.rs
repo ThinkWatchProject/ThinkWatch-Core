@@ -102,6 +102,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_masked: Option<String>,
         provider: String,
+        /// `provider` 那一家怎么收钱，和 `RequestRouted::billing` 同一套词。
+        ///
+        /// **算数的是 `RequestRouted` 报的那个**（最终服务的那家）。这里先报
+        /// 一个，是因为不是每个请求都等得到那一条：上游应答之前客户端就走了
+        /// 的、WebSocket 升级没完成就断开的、被第二阶段规则拒绝的，手上只有
+        /// 这一个 —— 少了它，那一行说不出该按什么记账。
+        billing: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账
         model: String,
@@ -190,6 +197,9 @@ pub enum Event {
     /// **单独一个事件，因为成功和失败两条路都要发它。**挂在
     /// `RequestFinished` 上的话，失败的那条路就没有尝试链 —— 而那恰恰
     /// 是最需要看它的时候。
+    ///
+    /// WebSocket 那条路也发：和上游的握手有了结果就发。那条路不做故障转移，
+    /// 尝试链只有一跳。
     RequestRouted {
         id: u64,
         /// 命中了哪条规则。**日志和界面都要显示它** —— 「命中第 4 条」
@@ -204,6 +214,9 @@ pub enum Event {
         ///
         /// **必须跟着这次请求走，不能事后查配置** —— 配置随时会被热重载，
         /// 而一条三天前的记录该按它当时那家的计费方式算。
+        ///
+        /// 一家都没接下时是 `per-token`：那一行没有用量、没有金额，记成订阅
+        /// 的话会被数进订阅额度的次数里。
         billing: String,
     },
     /// 一个请求发出前，按出站脱敏的规则找到了东西。
@@ -522,6 +535,9 @@ pub struct AttemptView {
     ///   —— 请求本身有问题，换一个上游也一样被拒。
     /// - `status`：上游返回 5xx 或 429，换下一个上游。
     /// - `error`：没有收到响应（超时、无法连接）。
+    ///
+    /// WebSocket 的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
+    /// 状态码是 `status`，连不上是 `error`。
     pub outcome: String,
     /// 上游返回的状态码。`error` 时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1931,12 +1947,14 @@ pub struct HistoryRow {
     /// 客户端没等到响应结束就走了。**不是失败**（`error` 是空的）；用量
     /// 只算到断开那一刻，所以有金额的话一定是估算
     pub cancelled: bool,
-    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
+    /// 服务它的那家怎么收钱：`per-token` / `subscription` / `free` / `unknown`。
+    /// 本地应答的是 `free`：网关自己答的，费用确实是零
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_saved_micros: Option<i64>,
-    /// 路由决策与尝试链。没经过路由的（WebSocket、本地应答）没有它
+    /// 路由决策与尝试链。本地应答的没有它；路由还没报出结论请求就结束了的
+    /// 也没有：上游应答之前客户端就走了、被第二阶段规则拒绝
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingView>,
     /// 按什么价格算的。没算出金额的没有它
@@ -3005,6 +3023,7 @@ mod tests {
                 client_hint: None,
                 session_fp: None,
                 provider: "p".into(),
+                billing: "per-token".into(),
                 model: "m".into(),
                 method: "POST".into(),
                 path: "/v1/messages".into(),

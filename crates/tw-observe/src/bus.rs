@@ -141,6 +141,7 @@ mod tests {
             client_hint: None,
             session_fp: None,
             provider: "p".into(),
+            billing: "per-token".into(),
             model: "m".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),

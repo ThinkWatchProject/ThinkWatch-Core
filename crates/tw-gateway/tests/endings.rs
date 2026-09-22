@@ -462,6 +462,43 @@ async fn a_client_that_leaves_before_the_response_headers_is_reported_once_as_ca
     assert_eq!(model_of(&got[0]), MODEL);
 }
 
+/// 上游还没应答客户端就走了：**路由事件等不到了**，这一行按什么记账只能看
+/// 开始事件 —— 它说的是要发往的那一家。
+#[tokio::test]
+async fn a_request_abandoned_before_any_upstream_answered_still_says_how_it_is_billed() {
+    let mut p = provider(silent_upstream().await);
+    p.billing = Some(tw_config::Billing::Subscription);
+    let (gw, mut events) = serve(cfg(p)).await;
+
+    let gave_up = tokio::time::timeout(Duration::from_millis(500), post(gw).send()).await;
+    assert!(gave_up.is_err(), "上游一直不回，这个请求不该有响应");
+
+    let mut seen = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("5 秒内没等到结局")
+            .unwrap();
+        let cancelled = matches!(ev, Event::RequestCancelled { .. });
+        seen.push(ev);
+        if cancelled {
+            break;
+        }
+    }
+    assert!(
+        seen.iter().any(
+            |e| matches!(e, Event::RequestStarted { billing, .. } if billing == "subscription")
+        ),
+        "开始事件没说要发往的那一家怎么收钱：{seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, Event::RequestRouted { .. })),
+        "路由还没走完，不该有路由事件：{seen:?}"
+    );
+}
+
 /// 选中上游之后才生效的规则拒绝了这次请求（阶段二）。
 ///
 /// **这时候开始事件已经发出去了。**以前这条路径直接返回错误、什么都不报，
