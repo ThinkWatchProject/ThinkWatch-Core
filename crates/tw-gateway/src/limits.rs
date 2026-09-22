@@ -31,10 +31,9 @@ pub enum LimitError {
     QueueFull(usize),
 }
 
-/// 三个维度叠加，取最严的那个。
+/// 两个维度叠加，取最严的那个。**没有全局那一道** —— 见 [`Limits`]。
 pub struct Gate {
     limits: Limits,
-    global: Arc<Semaphore>,
     per_provider: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
     per_client: std::sync::Mutex<HashMap<String, Arc<Semaphore>>>,
     /// 正在排队的数量。**这是队列上限的依据** —— 不是信号量的等待者数，
@@ -52,7 +51,6 @@ pub struct Pass {
 impl Gate {
     pub fn new(limits: Limits) -> Self {
         Self {
-            global: Arc::new(Semaphore::new(limits.max_concurrent)),
             per_provider: Default::default(),
             per_client: Default::default(),
             queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -99,15 +97,16 @@ impl Gate {
         }
 
         let timeout = Duration::from_secs(self.limits.queue_timeout_secs);
-        let mut sems = vec![
-            self.global.clone(),
-            Self::sem(&self.per_provider, provider, self.limits.per_provider),
-        ];
+        let mut sems = vec![Self::sem(
+            &self.per_provider,
+            provider,
+            self.limits.per_provider,
+        )];
         if let Some(n) = client_limit {
             sems.push(Self::sem(&self.per_client, client, n));
         }
 
-        // **按固定顺序取**（全局 → provider → client）。顺序不固定的话
+        // **按固定顺序取**（provider → client）。顺序不固定的话
         // 两个请求可能各拿一半然后互等 —— 一个只在高并发下偶发的死锁，
         // 是最难查的那种。
         let acquire_all = async {
@@ -136,9 +135,8 @@ impl Gate {
 mod tests {
     use super::*;
 
-    fn gate(max: usize, per: usize, depth: usize, timeout: u64) -> Gate {
+    fn gate(per: usize, depth: usize, timeout: u64) -> Gate {
         Gate::new(Limits {
-            max_concurrent: max,
             per_provider: per,
             queue_depth: depth,
             queue_timeout_secs: timeout,
@@ -147,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn under_the_limit_everything_passes_immediately() {
-        let g = gate(4, 4, 64, 30);
+        let g = gate(4, 64, 30);
         let mut held = Vec::new();
         for _ in 0..4 {
             held.push(g.acquire("p", "c", None).await.unwrap());
@@ -159,7 +157,7 @@ mod tests {
     async fn over_the_limit_it_queues_rather_than_rejecting() {
         // **这是这个模块存在的理由。**客户端收到 429 通常不会优雅重试，
         // 一个本来只需要多等两秒的请求会变成一次任务中断。
-        let g = Arc::new(gate(1, 1, 64, 30));
+        let g = Arc::new(gate(1, 64, 30));
         let first = g.acquire("p", "c", None).await.unwrap();
 
         let g2 = g.clone();
@@ -175,7 +173,7 @@ mod tests {
     async fn a_permit_is_returned_when_it_is_dropped() {
         // 手工释放迟早会在某条错误路径上漏掉，而漏掉的表现是并发数
         // 只减不增，最后所有请求一起卡死。
-        let g = gate(1, 1, 64, 1);
+        let g = gate(1, 64, 1);
         {
             let _p = g.acquire("p", "c", None).await.unwrap();
         }
@@ -185,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn queuing_too_long_gives_up_with_a_message_that_names_the_cause() {
-        let g = Arc::new(gate(1, 1, 64, 1));
+        let g = Arc::new(gate(1, 64, 1));
         let _held = g.acquire("p", "c", None).await.unwrap();
         let e = g.acquire("p", "c", None).await.unwrap_err();
         assert!(matches!(e, LimitError::Timeout(_)));
@@ -196,7 +194,7 @@ mod tests {
     async fn a_full_queue_is_the_one_case_that_really_refuses() {
         // 队列必须有上限：失控的脚本会把队列撑爆，内存跟着涨 ——
         // 那比拒绝更糟。
-        let g = Arc::new(gate(1, 1, 2, 30));
+        let g = Arc::new(gate(1, 2, 30));
         let _held = g.acquire("p", "c", None).await.unwrap();
         let mut waiters = Vec::new();
         for _ in 0..2 {
@@ -220,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn different_providers_do_not_block_each_other() {
         // per_provider 是独立的：一个慢上游不该拖住另一个。
-        let g = gate(8, 1, 64, 1);
+        let g = gate(1, 64, 1);
         let _a = g.acquire("slow", "c", None).await.unwrap();
         assert!(g.acquire("fast", "c", None).await.is_ok());
     }
@@ -228,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn a_per_client_limit_stops_one_machine_taking_everything() {
         // 监听局域网时这是刚需：某台机器上的失控脚本不该能占满全部并发。
-        let g = Arc::new(gate(8, 8, 64, 1));
+        let g = Arc::new(gate(8, 64, 1));
         let _a = g.acquire("p", "greedy", Some(1)).await.unwrap();
         assert!(
             g.acquire("p", "greedy", Some(1)).await.is_err(),
@@ -241,10 +239,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_strictest_of_the_three_dimensions_wins() {
-        // 全局 8、单上游 1 —— 生效的是 1。
-        let g = gate(8, 1, 64, 1);
-        let _a = g.acquire("p", "c", None).await.unwrap();
-        assert!(g.acquire("p", "c", None).await.is_err());
+    async fn the_stricter_of_the_two_dimensions_wins() {
+        // 单上游 8、这把密钥 1 —— 生效的是 1；反过来也一样。
+        let g = gate(8, 64, 1);
+        let _a = g.acquire("p", "c", Some(1)).await.unwrap();
+        assert!(g.acquire("p", "c", Some(1)).await.is_err());
+        let g = gate(1, 64, 1);
+        let _a = g.acquire("p", "c", Some(8)).await.unwrap();
+        assert!(g.acquire("p", "c", Some(8)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn there_is_no_ceiling_across_upstreams() {
+        // 没有全局上限：几个上游各自满载时，总数可以超过任何一个的上限。
+        // 一台电脑上几个客户端各开几个会话，本来就该同时跑
+        let g = gate(2, 64, 1);
+        let mut held = Vec::new();
+        for p in ["a", "b", "c", "d"] {
+            held.push(g.acquire(p, "k", None).await.unwrap());
+            held.push(g.acquire(p, "k", None).await.unwrap());
+        }
+        assert_eq!(held.len(), 8);
     }
 }

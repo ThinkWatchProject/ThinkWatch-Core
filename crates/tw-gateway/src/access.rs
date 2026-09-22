@@ -97,6 +97,16 @@ fn masked_v6(ip: Ipv6Addr, prefix: u8) -> u128 {
     }
 }
 
+/// 回环地址，包括 IPv4 映射成 IPv6 的那种（绑 `0.0.0.0` 时 macOS 可能这样报对端）。
+fn is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 /// 来源白名单。
 #[derive(Debug, Clone, Default)]
 pub struct AllowList {
@@ -127,8 +137,15 @@ impl AllowList {
         .expect("the built-in private ranges are valid CIDRs")
     }
 
+    /// 放不放行这个来源。
+    ///
+    /// **本机永远放行。**白名单管的是别的设备；这台电脑上的程序本来就连得上
+    /// 回环，而接管时写进客户端配置的正是 `127.0.0.1`。一份只写了
+    /// `192.168.1.0/24` 的名单把本机挡在外面，从来不会是用户想要的 ——
+    /// 他得到的是所有客户端同时断线，而原因藏在一个看起来毫不相关的设置里。
+    /// 本机来的请求照样要过密钥那一道。
     pub fn allows(&self, ip: IpAddr) -> bool {
-        self.ranges.is_empty() || self.ranges.iter().any(|c| c.contains(ip))
+        is_loopback(ip) || self.ranges.is_empty() || self.ranges.iter().any(|c| c.contains(ip))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -227,6 +244,15 @@ mod tests {
         let a = AllowList::parse(&["192.168.1.0/24".to_string()]).unwrap();
         assert!(a.allows(ip("192.168.1.50")));
         assert!(!a.allows(ip("192.168.2.50")));
-        assert!(!a.allows(ip("127.0.0.1")), "写了白名单就只认白名单");
+    }
+
+    #[test]
+    fn this_machine_is_let_in_whatever_the_list_says() {
+        // 名单管的是别的设备。把本机挡在外面的结果是接管过的客户端全部断线
+        let a = AllowList::parse(&["192.168.1.0/24".to_string()]).unwrap();
+        assert!(a.allows(ip("127.0.0.1")));
+        assert!(a.allows(ip("::1")));
+        assert!(a.allows(ip("::ffff:127.0.0.1")));
+        assert!(!a.allows(ip("10.0.0.1")));
     }
 }

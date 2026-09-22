@@ -253,13 +253,26 @@ fn default_port() -> u16 {
 }
 
 impl GatewayListen {
-    /// 实际要监听的地址。
+    /// 实际要监听的地址，**配置里写的那个排在最后**。
     ///
-    /// **一个函数，不是两处各拼一遍。**bind 和 port 分开写的地方多了，
+    /// **一个函数，不是几处各拼一遍。**bind 和 port 分开写的地方多了，
     /// 迟早有一处忘了跟着改 —— 而它的表现是「监听在了一个谁也没想到的
     /// 地址上」。
-    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, BindError> {
-        Ok(std::net::SocketAddr::new(self.bind.resolve()?, self.port))
+    ///
+    /// **绑一张具体的网卡时，本机回环也要听。**只绑 `192.168.1.5` 的话，
+    /// 连 `127.0.0.1` 的请求一律被拒 —— 而接管时写进客户端配置的正是
+    /// `127.0.0.1`。用户选「局域网」是想让别的设备也能连，不是想让这台
+    /// 电脑上的客户端全部断线。`0.0.0.0` 本来就包含回环，不用另加。
+    pub fn addrs(&self) -> Result<Vec<std::net::SocketAddr>, BindError> {
+        let ip = self.bind.resolve()?;
+        let at = |ip| std::net::SocketAddr::new(ip, self.port);
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Ok(vec![at(ip)]);
+        }
+        Ok(vec![
+            at(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            at(ip),
+        ])
     }
 }
 
@@ -1120,6 +1133,32 @@ providers:
         assert_eq!(b, Bind::Addr("192.168.1.5".parse().unwrap()));
         assert_eq!(b.socket_string(), "192.168.1.5");
         assert!(b.is_exposed());
+    }
+
+    #[test]
+    fn a_concrete_interface_is_listened_on_alongside_loopback() {
+        // 只绑网卡地址的话，接管时写进客户端的 127.0.0.1 就连不上了
+        let listen = |bind: &str| GatewayListen {
+            bind: serde_yaml_ng::from_str(bind).unwrap(),
+            port: 18790,
+            allow_from: Vec::new(),
+        };
+        let addrs = |bind: &str| -> Vec<String> {
+            listen(bind)
+                .addrs()
+                .unwrap()
+                .iter()
+                .map(|a| a.to_string())
+                .collect()
+        };
+        assert_eq!(
+            addrs("192.168.1.5"),
+            ["127.0.0.1:18790", "192.168.1.5:18790"]
+        );
+        // 这几种本来就连得上回环，不重复监听
+        assert_eq!(addrs("loopback"), ["127.0.0.1:18790"]);
+        assert_eq!(addrs("127.0.0.1"), ["127.0.0.1:18790"]);
+        assert_eq!(addrs("all"), ["0.0.0.0:18790"]);
     }
 
     #[test]

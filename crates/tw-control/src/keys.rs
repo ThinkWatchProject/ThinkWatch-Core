@@ -53,11 +53,23 @@ fn not_found(name: &str) -> ApplyError {
 
 // ---------------------------------------------------------------- 读
 
-async fn list(State(s): State<ControlState>) -> Json<Vec<tw_api::ClientView>> {
-    Json(views(&s).await)
+/// 密钥的值给不给明文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reveal {
+    /// 密钥页：值原样显示，旁边一个复制按钮
+    Plain,
+    /// 概览：到处都在读，用不着密钥的值
+    Masked,
 }
 
-pub async fn views(s: &ControlState) -> Vec<tw_api::ClientView> {
+/// **密钥页给明文。**这把钥匙只能连本机这个网关，它的作用就是被复制进
+/// 客户端配置 —— 只给头尾几位的话，用户要么点「复制」贴出来看一眼，要么
+/// 去翻 config.yaml，两条路都比直接显示更糟。上游的凭据不走这里，照旧脱敏。
+async fn list(State(s): State<ControlState>) -> Json<Vec<tw_api::ClientView>> {
+    Json(views(&s, Reveal::Plain).await)
+}
+
+pub async fn views(s: &ControlState, reveal: Reveal) -> Vec<tw_api::ClientView> {
     let cfg = s.config();
     let default = cfg.default_client().map(|c| c.name.clone());
     // **按密钥算最后一次使用，不按客户端自报的标识** —— 后者可以伪造，
@@ -75,7 +87,10 @@ pub async fn views(s: &ControlState) -> Vec<tw_api::ClientView> {
         .iter()
         .map(|c| tw_api::ClientView {
             name: c.name.clone(),
-            key: tw_secret::mask_secret(&c.key),
+            key: match reveal {
+                Reveal::Plain => c.key.clone(),
+                Reveal::Masked => tw_secret::mask_secret(&c.key),
+            },
             max_concurrent: c.max_concurrent,
             route: c.route.clone(),
             allow: c.allow.clone(),
@@ -90,7 +105,8 @@ pub async fn views(s: &ControlState) -> Vec<tw_api::ClientView> {
         .collect()
 }
 
-/// 明文。**单独一个接口**：列表一直在刷，而明文只在用户点「复制」那一刻需要。
+/// 一把的明文。「复制」走这里：它要的是此刻配置里的那个值，不是界面手里
+/// 可能已经过期的那份列表。
 async fn value(
     State(s): State<ControlState>,
     Path(name): Path<String>,

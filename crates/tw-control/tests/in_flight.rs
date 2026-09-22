@@ -22,7 +22,6 @@ fn app() -> (tempfile::TempDir, tw_observe::EventBus, axum::Router) {
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus.clone())),
         gateway: gw,
-        gateway_addr: None,
         store: None,
         started: std::time::Instant::now(),
         price_updater: Default::default(),

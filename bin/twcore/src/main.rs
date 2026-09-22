@@ -706,9 +706,11 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // **`bind` 写的是网卡名时，这一步要问系统。**问不出来就在这里停，
     // 而不是带着一个猜出来的地址起监听 —— 错误里说清是哪张网卡，以及
     // 这台机器上真有哪些
-    let addr = listen
-        .socket_addr()
+    let addrs = listen
+        .addrs()
         .with_context(|| format!("resolving bind: {}", listen.bind))?;
+    // 配置里写的那个排在最后；日志和报错里说它，不说顺带开着的回环
+    let addr = *addrs.last().expect("addrs() never returns an empty list");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -799,7 +801,6 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             started: std::time::Instant::now(),
             gateway: state.clone(),
             cfg: manager,
-            gateway_addr: if safe { None } else { Some(addr.to_string()) },
             store,
             price_updater: Default::default(),
             chatgpt: Default::default(),
@@ -874,13 +875,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 
         tracing::info!(%addr, "starting");
         tokio::select! {
-            r = async {
-                if overridden {
-                    tw_gateway::serve(state, addr).await
-                } else {
-                    tw_gateway::serve_following_config(state, addr).await
-                }
-            } => {
+            r = tw_gateway::serve_at(state, addrs, !overridden) => {
                 r.with_context(|| format!("{addr} could not be listened on. If the port is taken, check whether an earlier instance has fully exited"))
             }
             msg = control_dead => {

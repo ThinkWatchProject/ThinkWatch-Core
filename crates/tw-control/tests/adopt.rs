@@ -36,7 +36,6 @@ fn bed_with_store(store: Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Reco
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
-        gateway_addr: None,
         store,
         started: std::time::Instant::now(),
         price_updater: Default::default(),

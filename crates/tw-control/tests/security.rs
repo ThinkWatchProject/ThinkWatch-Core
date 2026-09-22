@@ -112,7 +112,6 @@ fn bed_with(yaml: &str, seed: impl FnOnce(&tw_store::Db)) -> Bed {
     let state = ControlState {
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
-        gateway_addr: None,
         store: Some(Arc::new(tokio::sync::Mutex::new(rec))),
         started: std::time::Instant::now(),
         price_updater: Default::default(),

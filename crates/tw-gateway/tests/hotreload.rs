@@ -255,8 +255,9 @@ async fn the_event_stream_is_not_interrupted_by_a_reload() {
     let (a, _) = counting_upstream("a").await;
     let c = cfg(vec![provider("a", a)], vec![]);
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
-    let mut rx = state.bus.subscribe();
     let gw = serve(state.clone()).await;
+    // 起监听时报的那一条（`ListenChanged`）不是这里要看的：订阅从重载之前开始就够了
+    let mut rx = state.bus.subscribe();
 
     let mut next = c.clone();
     next.clients[0].max_concurrent = Some(3);
@@ -472,7 +473,7 @@ async fn the_gate_is_only_rebuilt_when_the_limits_actually_change() {
     assert!(Arc::ptr_eq(&g0, &state.gate()), "无关改动换掉了并发闸门");
 
     let mut new_limits = c.clone();
-    new_limits.limits.max_concurrent = 3;
+    new_limits.limits.per_provider = 3;
     state.reload(new_limits).unwrap();
     assert!(!Arc::ptr_eq(&g0, &state.gate()), "改了上限却没换闸门");
 }
@@ -500,15 +501,16 @@ async fn the_allow_list_is_reloaded_too() {
     let gw = serve(state.clone()).await;
     assert!(ask(gw).await.contains("\"a\""));
 
-    // 监听改成 lan 并且只放行一个不含 127.0.0.1 的段
+    let other: std::net::IpAddr = "192.168.7.7".parse().unwrap();
+    assert!(state.runtime().allow.allows(other), "仅本机时名单是空的");
+
+    // 监听改成所有网卡，只放行一个不含那台设备的段
     c.listen.gateway.bind = tw_config::Bind::All;
     c.listen.gateway.allow_from = vec!["10.0.0.0/8".into()];
     state.reload(c).unwrap();
-    let after = ask(gw).await;
-    assert!(
-        after.contains("not among the allowed source addresses"),
-        "白名单没生效：{after}"
-    );
+    assert!(!state.runtime().allow.allows(other), "白名单没生效");
+    // 本机永远放行：名单管的是别的设备
+    assert!(ask(gw).await.contains("\"a\""), "本机被新名单挡在了外面");
 }
 
 #[tokio::test]
@@ -529,10 +531,9 @@ async fn changing_the_port_actually_moves_the_listener() {
     };
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
-    let s = state.clone();
-    let start = c.listen.gateway.socket_addr().unwrap();
-    tokio::spawn(async move { tw_gateway::serve_following_config(s, start).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    let mut events = state.bus.subscribe();
+    following(&state, &c).await;
+    assert_eq!(primary(&state), Some(p1));
 
     let at = |port: u16| async move {
         reqwest::Client::new()
@@ -553,6 +554,85 @@ async fn changing_the_port_actually_moves_the_listener() {
 
     assert!(at(p2).await.is_ok(), "新端口上什么都没有");
     assert!(at(p1).await.is_err(), "旧端口还在服务");
+    // **界面上的地址跟着走**：状态和事件都说新端口，不是启动时的那个
+    assert_eq!(primary(&state), Some(p2));
+    let said = listen_events(&mut events);
+    assert_eq!(
+        said.last().and_then(|(a, _)| a.clone()),
+        Some(format!("127.0.0.1:{p2}")),
+        "{said:?}"
+    );
+}
+
+/// 起一个跟着配置走的网关，等它绑上。
+async fn following(state: &tw_gateway::AppState, c: &Config) {
+    let s = state.clone();
+    let want = c.listen.gateway.addrs().unwrap();
+    tokio::spawn(async move { tw_gateway::serve_at(s, want, true).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+}
+
+fn primary(state: &tw_gateway::AppState) -> Option<u16> {
+    state.listening().primary().map(|a| a.port())
+}
+
+/// 到现在为止发出来的换监听事件：(地址, 没换成的原因的码)
+fn listen_events(
+    rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>,
+) -> Vec<(Option<String>, Option<String>)> {
+    let mut out = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if let tw_api::Event::ListenChanged { addr, error, .. } = e {
+            out.push((addr, error.map(|m| m.code)));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_port_already_taken_keeps_the_old_listener_and_says_why() {
+    // **绑不上就什么都不动。**以前这一步失败会让整个网关退出，守护进程再按
+    // 同一份配置拉起来、再失败 —— 用户改了个端口，换来的是所有客户端断线
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    c.listen.gateway.port = p1;
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    let mut events = state.bus.subscribe();
+    following(&state, &c).await;
+
+    let mut next = c.clone();
+    next.listen.gateway.port = taken;
+    state.reload(next).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let gw: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    assert!(ask(gw).await.contains("\"a\""), "旧端口不该停");
+    let now = state.listening();
+    assert_eq!(primary(&state), Some(p1), "地址该是还在服务的那个");
+    assert_eq!(
+        now.error.as_ref().map(|m| m.code.as_str()),
+        Some("gw.listen.port_taken"),
+        "{now:?}"
+    );
+    assert!(
+        listen_events(&mut events)
+            .iter()
+            .any(|(_, e)| e.as_deref() == Some("gw.listen.port_taken")),
+        "没换成也要说一声"
+    );
+
+    // 占着的程序退了，再存一次同样的配置：这回换过去，那句话也跟着消失
+    drop(squatter);
+    state.relisten();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(primary(&state), Some(taken));
+    assert!(state.listening().error.is_none());
 }
 
 #[tokio::test]
@@ -583,10 +663,7 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
     };
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
-    let s = state.clone();
-    let start = c.listen.gateway.socket_addr().unwrap();
-    tokio::spawn(async move { tw_gateway::serve_following_config(s, start).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    following(&state, &c).await;
 
     let inflight = tokio::spawn(async move {
         reqwest::Client::new()
@@ -601,6 +678,13 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
     let mut next = c.clone();
     next.listen.gateway.port = p2;
     state.reload(next).unwrap();
+
+    // **新端口不等旧请求跑完就要能连。**以前是等旧的那一个排空了才去绑
+    // 新的 —— 一个长的流在跑时，这几分钟里两边都不接新连接
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(!inflight.is_finished(), "测试的前提：旧请求还在跑");
+    let probe = tokio::net::TcpStream::connect(("127.0.0.1", p2)).await;
+    assert!(probe.is_ok(), "旧请求还没跑完，新端口就该能连了");
 
     let r = inflight
         .await
