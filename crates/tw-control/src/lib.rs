@@ -1004,6 +1004,7 @@ fn history_row(
         session: r.session,
         client_hint: r.client_hint,
         peer: r.peer,
+        key_masked: r.key_masked,
         security,
     }
 }

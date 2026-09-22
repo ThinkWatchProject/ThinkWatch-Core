@@ -34,6 +34,7 @@ fn app() -> (tempfile::TempDir, tw_observe::EventBus, axum::Router) {
 
 fn started(id: u64, model: &str) -> tw_api::Event {
     tw_api::Event::RequestStarted {
+        key_masked: None,
         peer: None,
         id,
         client: "我".into(),
