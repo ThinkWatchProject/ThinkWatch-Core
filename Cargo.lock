@@ -2813,6 +2813,7 @@ dependencies = [
  "tokio",
  "tw-engine",
  "tw-pricing",
+ "tw-redact",
  "tw-secret",
  "tw-types",
  "tw-yaml",

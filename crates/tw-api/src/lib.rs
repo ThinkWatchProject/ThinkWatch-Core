@@ -33,7 +33,10 @@ pub use tw_types::Msg;
 ///
 /// **5 去掉了全局并发上限**（`limits.max_concurrent`），`GET /keys` 改给明文，
 /// 状态里的监听地址跟着真实的监听器走。照 4 写的界面会画出一个空的「全局」格子。
-pub const CONTROL_API_VERSION: u32 = 5;
+///
+/// **6 概览带上了配置版本号，协议里不再有为老版本留的默认值。**照 5 写的
+/// 界面从别处读版本号；而缺了这些字段的 core 现在连概览都解析不了。
+pub const CONTROL_API_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -97,7 +100,6 @@ pub enum Event {
         provider: String,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账
-        #[serde(default)]
         model: String,
         method: String,
         path: String,
@@ -118,7 +120,6 @@ pub enum Event {
         /// 结束时有人在听的请求，它的用量就不知道该记在哪个模型上。
         ///
         /// WebSocket 那条路是空串：升级请求里没有模型名（和开始事件一样）。
-        #[serde(default)]
         model: String,
         status: u16,
         bytes: u64,
@@ -135,7 +136,6 @@ pub enum Event {
     RequestFailed {
         id: u64,
         /// 模型名。理由见 `RequestFinished::model`
-        #[serde(default)]
         model: String,
         source: String,
         message: Msg,
@@ -170,7 +170,6 @@ pub enum Event {
     RequestCancelled {
         id: u64,
         /// 模型名。理由见 `RequestFinished::model`
-        #[serde(default)]
         model: String,
         /// 上游的响应头还没到就走了的，**没有状态码** —— 不是 0
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,7 +200,6 @@ pub enum Event {
         ///
         /// **必须跟着这次请求走，不能事后查配置** —— 配置随时会被热重载，
         /// 而一条三天前的记录该按它当时那家的计费方式算。
-        #[serde(default)]
         billing: String,
     },
     /// 一个请求发出前，按出站脱敏的规则找到了东西。
@@ -298,7 +296,6 @@ pub enum Event {
         /// 内置规则的 id，或者自定义规则的名字
         rule: String,
         /// 自定义规则
-        #[serde(default)]
         custom: bool,
         /// 为什么值得看一眼（英文）。自定义规则是空的，名字就是说明
         why: String,
@@ -605,10 +602,16 @@ impl Event {
 /// 界面需要的是「有哪些上游、规则怎么写的、谁健康」，不是那份 YAML。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Overview {
+    /// 配置文件现在的版本号。和 `GET /config` 的 `version`、改配置时带的
+    /// `base_version` 是同一个。
+    ///
+    /// **跟着概览一起给。**界面上能改的每一格都画自这份概览，改的时候要带上
+    /// 它。分开读的话，界面在 core 起来之前挂上、那一次读失败，就一直拿不到
+    /// —— 所有写入都卡在「还没读到版本号」上，等多久都不会好。
+    pub config_version: String,
     pub providers: Vec<ProviderView>,
     /// 配置里定义过的代理。**界面上换代理要从这里选** —— 让用户
     /// 手打一个名字，打错了就是一次静默的「配了没生效」
-    #[serde(default)]
     pub proxies: Vec<ProxyView>,
     pub routes: Vec<RouteView>,
     pub groups: Vec<GroupView>,
@@ -619,22 +622,16 @@ pub struct Overview {
     /// **界面要能配它们，而不只是显示。**三态的整个设计前提是「出厂停在
     /// 观察态，用户看到证据之后自己决定要不要切到拦截」，一个切不了的开关
     /// 让那个设计不成立。规则在 `/security` 里。
-    #[serde(default)]
     pub security: SecurityView,
     /// 没绑路由的密钥走哪条
-    #[serde(default)]
     pub default_route: String,
     /// 客户端自己发的辅助请求怎么处理
-    #[serde(default)]
     pub client_probes: Vec<ProbeView>,
     /// 并发上限
-    #[serde(default)]
     pub limits: LimitsView,
     /// 日志留多久
-    #[serde(default)]
     pub retention: RetentionView,
     /// 自定义价目表。默认价目表不在这里 —— 它的状态看 `/pricing`
-    #[serde(default)]
     pub price_sheets: Vec<PriceSheetView>,
 }
 
@@ -770,7 +767,6 @@ pub struct ProviderView {
     pub health: String,
     /// 配置里写明的计费方式：`per-token` / `subscription` / `free` / `unknown`。
     /// 空 = 自动识别
-    #[serde(default)]
     pub billing: Option<String>,
     /// 实际按什么计费。没写明时自动识别：报过订阅额度的是 `subscription`，
     /// 否则 `per-token`
@@ -778,7 +774,6 @@ pub struct ProviderView {
     /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
     pub references: Vec<ReferenceView>,
     /// 选的价目表。空 = 默认价目表
-    #[serde(default)]
     pub pricing: Option<String>,
 }
 
@@ -850,14 +845,11 @@ pub struct RuleView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<RuleRewrite>,
     /// 没有条件，匹配全部请求
-    #[serde(default)]
     pub catch_all: bool,
     /// 在选定上游之后才判断（条件里有 `provider_would_be`）
-    #[serde(default)]
     pub phase_two: bool,
     /// 它的转发或拒绝不会被采用：前面已经有一条匹配全部请求的转发或拒绝。
     /// 它附加的改写照常生效
-    #[serde(default)]
     pub shadowed: bool,
 }
 
@@ -893,10 +885,8 @@ pub struct RouteView {
     /// 没绑路由的密钥走的就是这条
     pub default: bool,
     /// 网关按配置补出来的默认路由：配置文件里没有它。**编辑并保存即写入配置**
-    #[serde(default)]
     pub builtin: bool,
     /// 有一条匹配全部请求的转发或拒绝。没有的话，哪条规则都没命中的请求会失败
-    #[serde(default)]
     pub has_catch_all: bool,
     /// **显式绑了这条路由的密钥。**默认路由这里通常是空的 —— 走它的人
     /// 是「没绑」，不是「绑了它」，而把所有密钥列进来会让人以为那是
@@ -909,13 +899,11 @@ pub struct RouteView {
 pub struct GroupView {
     pub name: String,
     /// 内置的「全部上游」：成员是全部上游，按上游列表的顺序。不能编辑、不能删除
-    #[serde(default)]
     pub builtin: bool,
     /// 配置里写的 `type`：`fallback` / `select` / `load-balance` /
     /// `url-test` / `cheapest`
     pub kind: String,
     /// 同一次会话固定走同一家。**这一项直接决定账单**
-    #[serde(default)]
     pub session_affinity: bool,
     /// `select` 组当前选中谁。
     ///
@@ -937,10 +925,8 @@ pub struct ClientView {
     pub key: String,
     pub max_concurrent: Option<usize>,
     /// 绑的那条路由。`None` = 走默认路由
-    #[serde(default)]
     pub route: Option<String>,
     /// 这把密钥能看到哪些模型。三态：不写 / 写非空 / 写 `[]`（一个都不给）
-    #[serde(default)]
     pub allow: Option<Vec<String>>,
     /// 为哪个客户端生成的（`claude-code` / `codex` …）。取消接管之后仍然记着
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1807,7 +1793,6 @@ pub struct CostBucket {
     /// 价目表里没有这个模型的条数（用量是有的），见 `Summary::unpriced_requests`
     pub unpriced_requests: i64,
     /// 没有拿到用量的条数，见 `Summary::no_usage_requests`
-    #[serde(default)]
     pub no_usage_requests: i64,
 }
 
@@ -1830,13 +1815,9 @@ pub struct CostBucketGroup {
     ///
     /// **四类分开给。**它们的单价差十倍以上，加成一个数之后既算不回
     /// 钱，也说不清「这段时间是在写新上下文还是在吃缓存」。
-    #[serde(default)]
     pub input_tokens: i64,
-    #[serde(default)]
     pub output_tokens: i64,
-    #[serde(default)]
     pub cache_read_tokens: i64,
-    #[serde(default)]
     pub cache_write_tokens: i64,
 }
 
@@ -1851,7 +1832,6 @@ pub struct CostGroup {
     pub input_tokens: i64,
     pub output_tokens: i64,
     /// 没有拿到用量的条数
-    #[serde(default)]
     pub no_usage_requests: i64,
 }
 
@@ -1891,25 +1871,20 @@ pub struct Summary {
     /// 和 `unpriced_requests` 一样让金额合计偏低，但配价格解决不了它 ——
     /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
     /// 取消的，失败的和上游回了 4xx 的不算。
-    #[serde(default)]
     pub no_usage_requests: i64,
     /// 走订阅型上游的请求数。**不参与金额合计** ——
     /// 订阅制的边际成本是零，按价目表算出来的数字是纯虚构的
-    #[serde(default)]
     pub subscription_requests: i64,
     /// 那些请求用掉的 token。**它才是订阅用户该看的量**
-    #[serde(default)]
     pub subscription_tokens: i64,
     /// 用了缓存之后净省下多少微分。
     ///
     /// **净额：命中节省的部分，减去写入产生的溢价。**用户想知道的是
     /// 「如果完全不用缓存，这段时间要多花还是少花」—— 而缓存写入按
     /// 1.25 倍单价计费，所以这个数可以是负的。
-    #[serde(default)]
     pub cache_saved_micros: i64,
     /// 本区间两项防护各留下了几条记录。**和安全日志数的是同一批** —— 概览上
     /// 点开这个数，落到的日志就是这么多条
-    #[serde(default)]
     pub security: SecurityCounts,
     /// 价目表的快照日期。**成本旁边要标它** —— 一个两个月前
     /// 的价目表算出来的数字，可信度和昨天的完全不同
@@ -1946,27 +1921,24 @@ pub struct HistoryRow {
     /// 这个成本是估的吗。**界面上要标出来**
     pub cost_estimated: bool,
     /// 失败的原因。**带着码** —— 翻历史时界面照样能说自己那句话；
-    /// 码是空串的是加这两列之前的老记录，那时只存了正文
     pub error: Option<Msg>,
     /// 本地应答的
     pub local: bool,
     /// 客户端没等到响应结束就走了。**不是失败**（`error` 是空的）；用量
     /// 只算到断开那一刻，所以有金额的话一定是估算
-    #[serde(default)]
     pub cancelled: bool,
     /// 服务它的那家怎么收钱：`per-token` / `subscription` / `unknown`
-    #[serde(default)]
     pub billing: String,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_saved_micros: Option<i64>,
-    /// 路由决策与尝试链。老记录没有它
+    /// 路由决策与尝试链。没经过路由的（WebSocket、本地应答）没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingView>,
-    /// 按什么价格算的。没算出金额的、老记录没有它
+    /// 按什么价格算的。没算出金额的没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSourceView>,
-    /// 服务它的那一跳做过的格式转换。直通的、老记录没有它
+    /// 服务它的那一跳做过的格式转换。直通的没有它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translated: Option<TranslatedView>,
     /// 它属于哪一次会话，和 [`SessionView::id`] 是同一个值。
@@ -1976,7 +1948,7 @@ pub struct HistoryRow {
     /// 任务；看着一次很贵的任务，也回不到具体是哪一条。库里这一列一直
     /// 都在（`requests.session`，还建了索引），只是没有交出来。
     ///
-    /// 认不出会话的请求（拼不出指纹的、老记录）是 `None`。
+    /// 认不出会话的请求（拼不出指纹的，比如 WebSocket、本地应答）是 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，
@@ -2253,16 +2225,13 @@ pub struct SessionView {
     /// 有价格的那些轮次加起来，单位是**微分**
     pub cost_micros: i64,
     /// 其中估算的那部分。**不为 0 时，合计要标成估算** —— 估算不能冒充实测
-    #[serde(default)]
     pub cost_micros_estimated: i64,
     /// 算出了价格的轮数。**一轮都没有时，合计不是 $0，是「没有价格」**
-    #[serde(default)]
     pub priced_turns: u64,
     /// **价目表里没有那个模型的轮数。**「$1.23」和「$1.23，另有 4 轮没有
     /// 价格」是两个不同的结论
     pub unpriced_turns: u64,
     /// 没有拿到用量、所以算不出钱的轮数
-    #[serde(default)]
     pub no_usage_turns: u64,
     /// 由订阅制上游服务的轮数：计入订阅额度，**没有金额，也不是「无法计价」**。
     /// 和上面三个数互不相交，和概览的 `subscription_requests` 数的是同一类请求。
@@ -2295,11 +2264,9 @@ pub struct TurnView {
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
     /// 客户端没等到这一轮结束就走了（见 `HistoryRow::cancelled`）
-    #[serde(default)]
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号** —— 以前这里没有这个字段，
     /// 估算的金额在瀑布图上和实测的长得一模一样
-    #[serde(default)]
     pub cost_estimated: bool,
     /// 服务它的那家怎么收钱，和 `HistoryRow::billing` 同一套词：`per-token` /
     /// `subscription` / `free` / `unknown`。**订阅制那一轮的 `cost_micros` 也是
@@ -2551,7 +2518,6 @@ pub struct SetView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunResult {
     /// 按哪条路由求的值。草稿是草稿的名字
-    #[serde(default)]
     pub route: String,
     /// 经过的组按什么排候选：`fallback` / `select` / `load-balance` /
     /// `url-test` / `cheapest`。
@@ -2583,10 +2549,8 @@ pub struct DryRunResult {
     /// 候选链里此刻熔断着的那些。**试算是静态的，但熔断是当下的事实**
     pub circuit_open: Vec<String>,
     /// 规则选中、但服务不了这个请求而被跳过的上游
-    #[serde(default)]
     pub skipped: Vec<SkippedView>,
     /// 候选链里要转换格式的上游：客户端的格式和上游的协议不同
-    #[serde(default)]
     pub converted: Vec<ConvertedView>,
 }
 
@@ -2865,10 +2829,6 @@ pub struct GuardDetail {
     pub mode: String,
     /// 按界面上的顺序：内置的在前，自定义的在后
     pub rules: Vec<SecurityRuleView>,
-    /// 配置里写了、但认不出的内置规则 id。**要说出来** —— 多半是拼错了，
-    /// 而它的表现是「我明明停用了它，怎么还在报」
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unknown: Vec<String>,
 }
 
 /// 两项防护。

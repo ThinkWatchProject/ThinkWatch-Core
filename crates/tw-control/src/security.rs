@@ -176,13 +176,6 @@ fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
     tw_api::GuardDetail {
         mode: p.mode.slug().to_string(),
         rules,
-        unknown: p
-            .enable
-            .iter()
-            .chain(&p.disable)
-            .filter(|id| tw_redact::rules::builtin(id).is_none())
-            .cloned()
-            .collect(),
     }
 }
 
@@ -229,18 +222,6 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
     tw_api::GuardDetail {
         mode: p.mode.slug().to_string(),
         rules,
-        unknown: {
-            let mut ids: Vec<String> = p
-                .enable
-                .iter()
-                .chain(&p.disable)
-                .chain(p.actions.keys())
-                .filter(|id| !builtin.iter().any(|r| &&r.id == id))
-                .cloned()
-                .collect();
-            ids.dedup();
-            ids
-        },
     }
 }
 
@@ -653,9 +634,9 @@ mod tests {
     }
 
     #[test]
-    fn switched_rules_and_unknown_ids_show_up_as_they_are() {
+    fn switched_rules_show_up_as_they_are() {
         let v = redact_view(&tw_config::RedactPolicy {
-            enable: vec!["internal-ip".into(), "拼错了".into()],
+            enable: vec!["internal-ip".into()],
             disable: vec!["jwt".into()],
             ..Default::default()
         });
@@ -667,7 +648,6 @@ mod tests {
                 .enabled
         );
         assert!(!v.rules.iter().find(|r| r.id == "jwt").unwrap().enabled);
-        assert_eq!(v.unknown, vec!["拼错了".to_string()]);
     }
 
     #[test]

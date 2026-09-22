@@ -126,10 +126,8 @@ impl<'de> Deserialize<'de> for Secret {
         struct V;
         impl serde::de::Visitor<'_> for V {
             type Value = Secret;
-            // **说清楚该怎么写。**serde 默认只会说「expected a string」，而写错成
-            // `key: { oauth: ... }` 的人要知道的是 OAuth 放在哪儿
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a string, which may contain ${VAR}. An OAuth credential belongs in the upstream's oauth field")
+                f.write_str("a string, which may contain ${VAR}")
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Secret, E> {
                 Ok(Secret(v.to_string()))
@@ -722,16 +720,6 @@ mod tests {
                 "{name}"
             );
         }
-    }
-
-    #[test]
-    fn a_key_written_as_a_mapping_says_where_oauth_goes() {
-        let e = serde_yaml_ng::from_str::<Provider>(
-            "name: a\nbase_url: https://x\nkey:\n  oauth:\n    refresh: r\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("oauth"), "{e}");
     }
 
     #[test]

@@ -39,18 +39,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    /// 历史文件名里的那一段。**文件名是存盘格式**，和控制面发的 `slug()`
-    /// 分开：外部编辑在文件名里一直叫 `ext`，改掉它就读不懂已有的历史。
-    fn file_tag(&self) -> &'static str {
-        match self {
-            Origin::Ui => "ui",
-            Origin::Cli => "cli",
-            Origin::External => "ext",
-            Origin::Rollback => "rollback",
-            Origin::Rotation => "rotation",
-        }
-    }
-    /// 控制面发给界面的值。
+    /// 控制面发给界面的值，也是历史文件名里的那一段。
     pub fn slug(&self) -> &'static str {
         match self {
             Origin::Ui => "ui",
@@ -155,7 +144,7 @@ pub fn snapshot(
     // 名字里带上时间、来源和版本号 —— 光看文件名就能读懂这一版是什么。
     let file = dir.join(format!(
         "{at_ms}-{}-{}.yaml",
-        origin.file_tag(),
+        origin.slug(),
         &version["blake3:".len()..]
     ));
     store::write_atomic(&file, text)?;

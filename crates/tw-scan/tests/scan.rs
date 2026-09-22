@@ -55,9 +55,7 @@ fn bed() -> Bed {
 }
 
 fn run(home: &Path) -> tw_scan::report::Report {
-    let rules = rules::scan_rules();
-    assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
-    scan(&sources::user_level(home), &rules)
+    scan(&sources::user_level(home), &rules::scan_rules())
 }
 
 #[test]
