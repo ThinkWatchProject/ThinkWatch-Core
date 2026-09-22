@@ -26,10 +26,13 @@ pub struct Window {
     pub window: String,
     /// 用了百分之多少。0–100
     pub used_percent: f64,
-    /// 还有多少秒重置。**上游没给就是 None** —— 那时界面上只能说
-    /// 「不知道什么时候重置」，不能编一个倒计时
+    /// 什么时候重置，Unix 毫秒。**读响应头的那一刻就换成时刻**：上游说的
+    /// 「还有多少秒」只在那一刻成立，存下来原样再给出去，就是一个不会走的倒计时。
+    ///
+    /// **上游没给就是 None** —— 那时界面上只能说「不知道什么时候重置」，不能编
+    /// 一个倒计时
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reset_in_secs: Option<u64>,
+    pub resets_at_ms: Option<u64>,
     /// `allowed` / `allowed_warning` / `rejected`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -79,7 +82,9 @@ impl Quota {
 
 /// 从响应头里读额度。**读不到就是空的**，不是零 —— 按量付费的账号本来
 /// 就没有这些头，把它当成「用了 0%」会在菜单栏上显示一个假的进度条。
-pub fn from_headers(h: &HeaderMap) -> Quota {
+///
+/// `now_ms`：收到这些头的时刻。「还有多少秒重置」要靠它换成时刻
+pub fn from_headers(h: &HeaderMap, now_ms: u64) -> Quota {
     let mut windows = Vec::new();
     let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
 
@@ -96,8 +101,8 @@ pub fn from_headers(h: &HeaderMap) -> Quota {
             // 百分比**：一个真实的 0.62 和一个真实的 62 都要能读对，而
             // 「用了 0.62%」这种值在订阅场景下没有意义。
             used_percent: normalize_percent(u),
-            reset_in_secs: get(&format!("anthropic-ratelimit-unified-{key}-reset"))
-                .and_then(parse_reset),
+            resets_at_ms: get(&format!("anthropic-ratelimit-unified-{key}-reset"))
+                .and_then(|v| parse_reset(v, now_ms)),
             status: get(&format!("anthropic-ratelimit-unified-{key}-status"))
                 .map(|s| s.to_string()),
         });
@@ -136,8 +141,9 @@ pub fn from_headers(h: &HeaderMap) -> Quota {
         windows.push(Window {
             window,
             used_percent,
-            reset_in_secs: get(&format!("x-codex-{prefix}-reset-after-seconds"))
-                .and_then(|v| v.parse().ok()),
+            resets_at_ms: get(&format!("x-codex-{prefix}-reset-after-seconds"))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| after(now_ms, secs)),
             // Codex 不报状态。用满就是被拒 —— 这是上游数字的直接结论，不是推断
             status: (used_percent >= 100.0).then(|| "rejected".to_string()),
         });
@@ -160,25 +166,42 @@ fn normalize_percent(v: f64) -> f64 {
     p.clamp(0.0, 100.0)
 }
 
-/// `reset` 头可能是秒数，也可能是一个 RFC 3339 时间戳。
+/// `reset` 头换成重置的时刻。它可能是还有多少秒、一个 Unix 时间戳（秒），
+/// 也可能是一个 RFC 3339 时间戳。
 ///
-/// **认不出来就是 None。**编一个倒计时出来，用户会照着它安排自己的活。
-fn parse_reset(v: &str) -> Option<u64> {
-    if let Ok(secs) = v.parse::<u64>() {
-        return Some(secs);
-    }
-    // `2026-09-09T12:00:00Z`
-    let t = chrono::DateTime::parse_from_rfc3339(v).ok()?;
-    let now = chrono::Utc::now();
-    let d = t.with_timezone(&chrono::Utc) - now;
-    d.num_seconds().try_into().ok()
+/// **秒数和时间戳按大小分**：额度窗口最长一周（60 万秒出头），而任何一个
+/// 近年的时间戳都在十亿以上，两者之间隔着三个数量级。以前纯数字一律当成秒数，
+/// 一个时间戳会被读成「五十多年后重置」。
+///
+/// **认不出来就是 None。**编一个倒计时出来，用户会照着它安排自己的活。已经
+/// 过去的时刻同样是 None。
+fn parse_reset(v: &str, now_ms: u64) -> Option<u64> {
+    let at = match v.parse::<u64>() {
+        Ok(n) if n >= EPOCH_SECONDS => n.checked_mul(1000)?,
+        Ok(secs) => after(now_ms, secs),
+        // `2026-09-09T12:00:00Z`
+        Err(_) => chrono::DateTime::parse_from_rfc3339(v)
+            .ok()?
+            .timestamp_millis()
+            .try_into()
+            .ok()?,
+    };
+    (at >= now_ms).then_some(at)
+}
+
+/// 比它大的数字是 Unix 时间戳（秒），不是「还有多少秒」：2001 年之后的任何时刻
+const EPOCH_SECONDS: u64 = 1_000_000_000;
+
+/// `now_ms` 之后 `secs` 秒的时刻
+fn after(now_ms: u64, secs: u64) -> u64 {
+    now_ms.saturating_add(secs.saturating_mul(1000))
 }
 
 /// 从 reqwest 的响应头读。
 ///
 /// **两个 HeaderMap 类型，一段逻辑。**reqwest 和 axum 各有各的
 /// `HeaderMap`，而把解析抄两遍必然会漂移出两套行为。
-pub fn from_headers_reqwest(h: &reqwest::header::HeaderMap) -> Quota {
+pub fn from_headers_reqwest(h: &reqwest::header::HeaderMap, now_ms: u64) -> Quota {
     let mut axum_map = HeaderMap::new();
     for (k, v) in h.iter() {
         if let (Ok(name), Ok(val)) = (
@@ -188,14 +211,17 @@ pub fn from_headers_reqwest(h: &reqwest::header::HeaderMap) -> Quota {
             axum_map.insert(name, val);
         }
     }
-    from_headers(&axum_map)
+    from_headers(&axum_map, now_ms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+    /// 收到这些头的时刻。测试里固定下来，重置时刻才能算准
+    const NOW: u64 = 1_758_000_000_000;
+
+    fn headers_at(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
             h.insert(
@@ -208,17 +234,21 @@ mod tests {
 
     #[test]
     fn anthropic_windows_are_read_straight_from_the_headers() {
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "62"),
-            ("anthropic-ratelimit-unified-5h-reset", "7200"),
-            ("anthropic-ratelimit-unified-5h-status", "allowed"),
-            ("anthropic-ratelimit-unified-7d-utilization", "18"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "62"),
+                ("anthropic-ratelimit-unified-5h-reset", "7200"),
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-7d-utilization", "18"),
+            ]),
+            NOW,
+        );
         assert_eq!(q.windows.len(), 2);
         let five = &q.windows[0];
         assert_eq!(five.window, "5h");
         assert_eq!(five.used_percent, 62.0);
-        assert_eq!(five.reset_in_secs, Some(7200));
+        // 两小时之后，**是时刻** —— 过一会儿再读，它还是同一个时刻
+        assert_eq!(five.resets_at_ms, Some(NOW + 7_200_000));
         assert_eq!(five.status.as_deref(), Some("allowed"));
     }
 
@@ -226,10 +256,10 @@ mod tests {
     fn a_fractional_utilization_is_read_as_a_percentage_too() {
         // 各家给 0–1 还是 0–100 不一样，而「用了 0.62%」在订阅场景下
         // 没有意义 —— 读错的话菜单栏上会显示一个几乎空着的进度条。
-        let q = from_headers(&headers(&[(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "0.62",
-        )]));
+        let q = from_headers(
+            &headers_at(&[("anthropic-ratelimit-unified-5h-utilization", "0.62")]),
+            NOW,
+        );
         assert_eq!(q.windows[0].used_percent, 62.0);
     }
 
@@ -237,131 +267,189 @@ mod tests {
     fn a_pay_as_you_go_response_yields_nothing_not_zero() {
         // **按量付费的账号本来就没有这些头。**当成「用了 0%」会在菜单栏
         // 上显示一个假的进度条。
-        let q = from_headers(&headers(&[("content-type", "application/json")]));
+        let q = from_headers(&headers_at(&[("content-type", "application/json")]), NOW);
         assert!(q.is_empty());
         assert!(q.tightest().is_none());
     }
 
     #[test]
     fn codex_headers_work_too() {
-        let q = from_headers(&headers(&[
-            ("x-codex-primary-used-percent", "45"),
-            ("x-codex-primary-reset-after-seconds", "86400"),
-            ("x-codex-secondary-used-percent", "88"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("x-codex-primary-used-percent", "45"),
+                ("x-codex-primary-reset-after-seconds", "86400"),
+                ("x-codex-secondary-used-percent", "88"),
+            ]),
+            NOW,
+        );
         assert_eq!(q.windows.len(), 2);
         assert_eq!(q.tightest().unwrap().used_percent, 88.0);
-        assert_eq!(q.windows[0].reset_in_secs, Some(86400));
+        assert_eq!(q.windows[0].resets_at_ms, Some(NOW + 86_400_000));
     }
 
     #[test]
     fn a_codex_window_is_named_by_its_length_and_an_unused_one_is_left_out() {
         // Plus 账号实测的那组头：secondary 报 0 分钟，那个窗口没有启用
-        let q = from_headers(&headers(&[
-            ("x-codex-primary-used-percent", "21"),
-            ("x-codex-primary-window-minutes", "10080"),
-            ("x-codex-primary-reset-after-seconds", "410912"),
-            ("x-codex-secondary-used-percent", "0"),
-            ("x-codex-secondary-window-minutes", "0"),
-            ("x-codex-secondary-reset-after-seconds", "0"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("x-codex-primary-used-percent", "21"),
+                ("x-codex-primary-window-minutes", "10080"),
+                ("x-codex-primary-reset-after-seconds", "410912"),
+                ("x-codex-secondary-used-percent", "0"),
+                ("x-codex-secondary-window-minutes", "0"),
+                ("x-codex-secondary-reset-after-seconds", "0"),
+            ]),
+            NOW,
+        );
         assert_eq!(q.windows.len(), 1, "{q:?}");
         assert_eq!(q.windows[0].window, "weekly");
         assert_eq!(q.windows[0].used_percent, 21.0);
         assert!(!q.windows[0].rejected());
 
-        let five = from_headers(&headers(&[
-            ("x-codex-primary-used-percent", "1"),
-            ("x-codex-primary-window-minutes", "300"),
-        ]));
+        let five = from_headers(
+            &headers_at(&[
+                ("x-codex-primary-used-percent", "1"),
+                ("x-codex-primary-window-minutes", "300"),
+            ]),
+            NOW,
+        );
         assert_eq!(five.windows[0].window, "5h");
         assert_eq!(five.windows[0].used_percent, 1.0, "1% 不是 100%");
     }
 
     #[test]
     fn a_full_codex_window_is_rejected() {
-        let q = from_headers(&headers(&[
-            ("x-codex-primary-used-percent", "100"),
-            ("x-codex-primary-window-minutes", "10080"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("x-codex-primary-used-percent", "100"),
+                ("x-codex-primary-window-minutes", "10080"),
+            ]),
+            NOW,
+        );
         assert!(q.windows[0].rejected());
     }
 
     #[test]
     fn the_tightest_window_is_the_one_the_menubar_shows() {
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "20"),
-            ("anthropic-ratelimit-unified-7d-utilization", "91"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "20"),
+                ("anthropic-ratelimit-unified-7d-utilization", "91"),
+            ]),
+            NOW,
+        );
         assert_eq!(q.tightest().unwrap().window, "7d");
     }
 
     #[test]
     fn an_upstream_warning_is_taken_at_face_value() {
         // **限流不再是突然发生的**。
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "30"),
-            ("anthropic-ratelimit-unified-5h-status", "allowed_warning"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "30"),
+                ("anthropic-ratelimit-unified-5h-status", "allowed_warning"),
+            ]),
+            NOW,
+        );
         assert!(q.windows[0].warning(), "上游说快到了，我们却没当回事");
         assert!(!q.windows[0].rejected());
     }
 
     #[test]
     fn a_rejected_status_is_distinct_from_a_warning() {
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "100"),
-            ("anthropic-ratelimit-unified-5h-status", "rejected"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "100"),
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ]),
+            NOW,
+        );
         assert!(q.windows[0].rejected());
     }
 
     #[test]
     fn the_seven_day_threshold_header_turns_into_a_warning() {
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-7d-utilization", "83"),
-            ("anthropic-ratelimit-unified-7d-surpassed-threshold", "true"),
-        ]));
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-7d-utilization", "83"),
+                ("anthropic-ratelimit-unified-7d-surpassed-threshold", "true"),
+            ]),
+            NOW,
+        );
         assert!(q.windows[0].warning());
     }
 
     #[test]
     fn a_reset_header_we_cannot_read_becomes_none_not_a_made_up_countdown() {
         // **编一个倒计时出来，用户会照着它安排自己的活。**
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "50"),
-            ("anthropic-ratelimit-unified-5h-reset", "不是时间"),
-        ]));
-        assert_eq!(q.windows[0].reset_in_secs, None);
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "50"),
+                ("anthropic-ratelimit-unified-5h-reset", "不是时间"),
+            ]),
+            NOW,
+        );
+        assert_eq!(q.windows[0].resets_at_ms, None);
     }
 
     #[test]
-    fn an_rfc3339_reset_timestamp_is_turned_into_seconds() {
-        let then = chrono::Utc::now() + chrono::Duration::seconds(3600);
-        let q = from_headers(&headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "50"),
-            ("anthropic-ratelimit-unified-5h-reset", &then.to_rfc3339()),
-        ]));
-        let s = q.windows[0].reset_in_secs.expect("时间戳没认出来");
-        assert!((3590..=3600).contains(&s), "{s}");
+    fn an_rfc3339_reset_timestamp_is_taken_as_the_moment_it_names() {
+        let then = chrono::DateTime::from_timestamp_millis((NOW + 3_600_000) as i64).unwrap();
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "50"),
+                ("anthropic-ratelimit-unified-5h-reset", &then.to_rfc3339()),
+            ]),
+            NOW,
+        );
+        assert_eq!(q.windows[0].resets_at_ms, Some(NOW + 3_600_000));
+    }
+
+    /// 纯数字也可能是 Unix 时间戳。**当成秒数的话**，一个时间戳会被读成
+    /// 「五十多年后重置」—— 额度窗口最长一周，时间戳在十亿以上，两者分得开。
+    #[test]
+    fn a_numeric_unix_timestamp_is_not_read_as_a_countdown() {
+        let at_secs = NOW / 1000 + 5 * 3600;
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "50"),
+                ("anthropic-ratelimit-unified-5h-reset", &at_secs.to_string()),
+            ]),
+            NOW,
+        );
+        assert_eq!(q.windows[0].resets_at_ms, Some(at_secs * 1000));
+    }
+
+    /// 已经过去的时刻不是一个倒计时：那个窗口已经重置过了，这一份额度是旧的。
+    #[test]
+    fn a_reset_moment_already_past_is_none() {
+        let past = chrono::DateTime::from_timestamp_millis((NOW - 60_000) as i64).unwrap();
+        let q = from_headers(
+            &headers_at(&[
+                ("anthropic-ratelimit-unified-5h-utilization", "50"),
+                ("anthropic-ratelimit-unified-5h-reset", &past.to_rfc3339()),
+            ]),
+            NOW,
+        );
+        assert_eq!(q.windows[0].resets_at_ms, None);
     }
 
     #[test]
     fn a_percentage_out_of_range_is_clamped_rather_than_shown_as_is() {
         // 一个 150% 的进度条只会让人以为界面坏了。
-        let q = from_headers(&headers(&[(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "150",
-        )]));
+        let q = from_headers(
+            &headers_at(&[("anthropic-ratelimit-unified-5h-utilization", "150")]),
+            NOW,
+        );
         assert_eq!(q.windows[0].used_percent, 100.0);
     }
 
     #[test]
     fn a_garbage_utilization_header_is_skipped_not_defaulted_to_zero() {
-        let q = from_headers(&headers(&[(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "unknown",
-        )]));
+        let q = from_headers(
+            &headers_at(&[("anthropic-ratelimit-unified-5h-utilization", "unknown")]),
+            NOW,
+        );
         assert!(q.is_empty(), "读不懂的头产生了一个假窗口");
     }
 }

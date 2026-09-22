@@ -127,16 +127,24 @@ fn config(p: Provider) -> Config {
     }
 }
 
-async fn serve(cfg: Config) -> (SocketAddr, tokio::sync::broadcast::Receiver<tw_api::Event>) {
+/// 起一个网关。**状态也交出来**：变化靠事件，现状要从它上面读
+async fn serve(
+    cfg: Config,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Receiver<tw_api::Event>,
+    tw_gateway::AppState,
+) {
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let rx = state.bus.subscribe();
+    let kept = state.clone();
     let addr = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     };
     tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(60)).await;
-    (addr, rx)
+    (addr, rx, kept)
 }
 
 async fn ask(gw: SocketAddr) -> u16 {
@@ -191,7 +199,7 @@ async fn next_change(
 #[tokio::test]
 async fn an_upstream_that_rejects_the_credential_is_reported_once_and_again_when_it_recovers() {
     let up = upstream(2).await;
-    let (gw, mut rx) = serve(config(Provider {
+    let (gw, mut rx, st) = serve(config(Provider {
         name: "relay".into(),
         base_url: format!("http://{up}"),
         key: Some(tw_config::Secret::new("sk-stale")),
@@ -201,6 +209,8 @@ async fn an_upstream_that_rejects_the_credential_is_reported_once_and_again_when
 
     assert_eq!(ask(gw).await, 401);
     assert_eq!(next_change(&mut rx, "auth").await.0, "rejected");
+    // **现状也要问得到**：界面晚打开就错过了那条事件，概览靠的是它
+    assert_eq!(st.auth_rejected("relay"), Some(401));
     // 第二次还是 401：**同一件事不再说第二遍**
     assert_eq!(ask(gw).await, 401);
     // 凭据又被接受了
@@ -210,6 +220,7 @@ async fn an_upstream_that_rejects_the_credential_is_reported_once_and_again_when
         (state.as_str(), provider.as_deref()),
         ("accepted", Some("relay"))
     );
+    assert_eq!(st.auth_rejected("relay"), None);
 }
 
 #[tokio::test]
@@ -230,18 +241,23 @@ async fn a_dead_proxy_is_named_as_the_cause_and_reported_again_when_it_comes_bac
         addr: px.to_string(),
         auth: None,
     }];
-    let (gw, mut rx) = serve(cfg).await;
+    let (gw, mut rx, st) = serve(cfg).await;
 
     // 代理连上就断：请求失败，而失败的是代理不是上游
     assert_ne!(ask(gw).await, 200);
     let (state, code) = next_change(&mut rx, "proxy").await;
     assert_eq!(state, "unreachable");
     assert!(
-        code.is_some_and(|c| c.starts_with("l1.")),
+        code.as_ref().is_some_and(|c| c.starts_with("l1.")),
         "要说清卡在哪一步"
     );
+    // **现状和事件说的是同一件事**：界面晚打开时读的是这一份
+    let fault = st.proxy_fault("代理一").expect("不通的代理，现状里没有");
+    assert_eq!(Some(fault.detail.code), code);
+    assert!(fault.failed.is_some(), "要说清卡在哪一步");
 
     broken.store(false, Ordering::SeqCst);
     assert_eq!(ask(gw).await, 200);
     assert_eq!(next_change(&mut rx, "proxy").await.0, "reachable");
+    assert!(st.proxy_fault("代理一").is_none(), "通了，现状还说不通");
 }

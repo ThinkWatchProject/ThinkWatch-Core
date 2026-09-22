@@ -817,10 +817,16 @@ async fn usage_shows_the_limits_without_personal_details() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["plan"], "plus");
     assert_eq!(v["reset_credits"], 2);
-    assert_eq!(
-        v["windows"],
-        json!([{"window": "weekly", "used_percent": 21.0, "reset_in_secs": 410907}]),
-        "长度为 0 的窗口不算"
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1, "长度为 0 的窗口不算：{v}");
+    assert_eq!(windows[0]["window"], "weekly");
+    assert_eq!(windows[0]["used_percent"], 21.0);
+    // 「还有 410907 秒」换成了重置的时刻
+    let now = now_ms();
+    let at = windows[0]["resets_at_ms"].as_u64().expect("没有重置时刻");
+    assert!(
+        (now + 410_907_000 - 60_000..=now + 410_907_000).contains(&at),
+        "{at} vs {now}"
     );
     // 邮箱要给：账号不止一个时，它是用户分辨哪个是哪个的唯一一项
     assert_eq!(v["email"], "someone@example.com");
@@ -1007,4 +1013,11 @@ async fn a_login_still_used_by_another_upstream_is_not_revoked() {
     assert_eq!(st, StatusCode::OK, "{v}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(b.openai.revoked.lock().unwrap().is_empty());
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }

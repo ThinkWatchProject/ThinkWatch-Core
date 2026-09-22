@@ -131,6 +131,46 @@ impl Recorder {
         &self.db
     }
 
+    /// 一个还在跑的请求到目前为止的样子。
+    ///
+    /// **记录要等结局才落库**，而详情里最常被点开的，恰恰是那个跑了很久还没
+    /// 结束的请求。这里给已经知道的那些：身份和上游、响应头到了就有状态码、
+    /// 路由走完就有尝试链；耗时、用量、金额要等结局。不在跑（已经落库、或者
+    /// 根本没有这个号）是 None。
+    pub fn in_flight_row(&self, id: u64) -> Option<RequestRow> {
+        let p = self.inflight.get(&id)?;
+        Some(RequestRow {
+            id: id as i64,
+            at_ms: p.at_ms,
+            client: p.client.clone(),
+            client_hint: p.client_hint.clone(),
+            peer: p.peer.clone(),
+            key_masked: p.key_masked.clone(),
+            session: p.session.clone(),
+            provider: p.provider.clone(),
+            model: p.model.clone(),
+            path: p.path.clone(),
+            status: p.status,
+            ttfb_ms: p.ttfb_ms,
+            duration_ms: None,
+            bytes: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_micros: None,
+            cost_estimated: false,
+            error: None,
+            local: false,
+            cancelled: false,
+            routing: p.routing.clone(),
+            billing: p.billing.clone(),
+            cache_saved_micros: None,
+            price_source: None,
+            translated: p.translated.clone(),
+        })
+    }
+
     pub fn blobs(&self) -> &Blobs {
         &self.blobs
     }
@@ -468,7 +508,9 @@ impl Recorder {
             | Event::AuthChanged { .. }
             | Event::ListenChanged { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
-            | Event::RequestPriced { .. } => {}
+            | Event::RequestPriced { .. }
+            // 只发给事件流上掉队的那一个订阅者，从不进总线
+            | Event::EventsDropped { .. } => {}
         }
     }
 
