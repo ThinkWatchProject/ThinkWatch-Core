@@ -960,12 +960,69 @@ pub use security::{
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
 pub use validate::validate;
 
-/// 默认配置目录：`~/.thinkwatch`。
+/// 按哪套习惯去放数据目录。
+///
+/// **是个参数，不是就地一个 `cfg!`。**这样两边的判断在同一台机器上都测得到
+/// ——我们现在只有 macOS 的 CI，而写错的那一支恰恰是没人跑的那一支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Convention {
+    /// `$HOME/.thinkwatch`
+    Unix,
+    /// `%APPDATA%\ThinkWatch`
+    Windows,
+}
+
+impl Convention {
+    /// 这台机器用哪一套。
+    pub const HERE: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Unix
+    };
+}
+
+/// 默认配置目录。
+///
+/// `THINKWATCH_HOME` 最优先 —— 测试靠它隔离，用户靠它换地方。
+///
+/// 没有它就按平台的习惯：unix 上是 `~/.thinkwatch`；Windows 上是
+/// `%APPDATA%\ThinkWatch`，**不是 `%USERPROFILE%\.thinkwatch`** —— 点开头的
+/// 目录是 unix 的习惯，而在 Windows 上，用户要去找一个程序存了什么的时候
+/// 是去 APPDATA 找的。
+///
+/// **和「用户的 home」不是一回事**，后者用来顺着去找各家客户端的配置
+/// （`~/.claude`、`~/.codex` 这些点开头的目录在 Windows 上确实躺在
+/// `%USERPROFILE%` 下），见 `tw_control::home_dir`。
 pub fn default_dir() -> PathBuf {
-    std::env::var_os("THINKWATCH_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".thinkwatch")))
-        .unwrap_or_else(|| PathBuf::from(".thinkwatch"))
+    pick_dir(
+        Convention::HERE,
+        std::env::var_os("THINKWATCH_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("APPDATA"),
+    )
+}
+
+fn pick_dir(
+    conv: Convention,
+    explicit: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+) -> PathBuf {
+    // 设成空串当作没设。`PathBuf::from("")` 是一个谁都解释不了的路径，而它
+    // 会一路走到「打不开这个文件」才暴露出来。
+    if let Some(e) = explicit.filter(|v| !v.is_empty()) {
+        return PathBuf::from(e);
+    }
+    let base = match conv {
+        Convention::Unix => home.filter(|v| !v.is_empty()).map(|h| (h, ".thinkwatch")),
+        Convention::Windows => appdata.filter(|v| !v.is_empty()).map(|a| (a, "ThinkWatch")),
+    };
+    match base {
+        Some((dir, leaf)) => PathBuf::from(dir).join(leaf),
+        // 环境里什么都问不出来：退到当前目录下的一个相对路径。**不退到根目录**
+        // —— 那会让我们往系统盘里写东西。
+        None => PathBuf::from(".thinkwatch"),
+    }
 }
 
 pub fn default_path() -> PathBuf {
@@ -1324,5 +1381,93 @@ mod strictness_tests {
         assert!(!p("x", "https://api.anthropic.com.evil.com").is_official_endpoint());
         // 塞进 userinfo 里同样不行
         assert!(!p("x", "https://api.anthropic.com@evil.com/v1").is_official_endpoint());
+    }
+}
+
+#[cfg(test)]
+mod dir_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    /// 显式指定的那个谁也推不翻它 —— 测试靠它隔离，推翻了测试就会去写
+    /// 真正的 `~/.thinkwatch`。
+    #[test]
+    fn thinkwatch_home_wins_on_either_platform() {
+        for conv in [Convention::Unix, Convention::Windows] {
+            assert_eq!(
+                pick_dir(
+                    conv,
+                    os("/somewhere/else"),
+                    os("/home/x"),
+                    os("C:\\AppData")
+                ),
+                PathBuf::from("/somewhere/else"),
+                "{conv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_puts_it_under_home_and_windows_under_appdata() {
+        assert_eq!(
+            pick_dir(Convention::Unix, None, os("/home/x"), os("C:\\AppData")),
+            PathBuf::from("/home/x/.thinkwatch")
+        );
+        assert_eq!(
+            pick_dir(Convention::Windows, None, os("/home/x"), os("C:\\AppData")),
+            PathBuf::from("C:\\AppData").join("ThinkWatch")
+        );
+    }
+
+    /// 两边各看各的变量。**Windows 上的 `HOME` 通常根本不存在**，而在装了
+    /// Git Bash 的机器上它又存在 —— 两种情况都不该影响数据目录去哪儿。
+    #[test]
+    fn neither_platform_reads_the_other_ones_variable() {
+        assert_eq!(
+            pick_dir(Convention::Unix, None, os("/home/x"), None),
+            PathBuf::from("/home/x/.thinkwatch"),
+            "unix 不需要 APPDATA"
+        );
+        assert_eq!(
+            pick_dir(Convention::Windows, None, os("/home/x"), None),
+            PathBuf::from(".thinkwatch"),
+            "Windows 上有 HOME 也不能拿它当 APPDATA 使"
+        );
+    }
+
+    /// 设成空串等于没设。`PathBuf::from("")` 要到「打不开这个文件」才暴露。
+    #[test]
+    fn an_empty_variable_counts_as_unset() {
+        assert_eq!(
+            pick_dir(Convention::Unix, os(""), os("/home/x"), None),
+            PathBuf::from("/home/x/.thinkwatch")
+        );
+        assert_eq!(
+            pick_dir(Convention::Unix, None, os(""), None),
+            PathBuf::from(".thinkwatch")
+        );
+    }
+
+    /// 什么都问不出来时退到相对路径，**不是根目录**。
+    #[test]
+    fn with_nothing_to_go_on_it_stays_relative() {
+        for conv in [Convention::Unix, Convention::Windows] {
+            let got = pick_dir(conv, None, None, None);
+            assert_eq!(got, PathBuf::from(".thinkwatch"), "{conv:?}");
+            assert!(!got.is_absolute(), "{conv:?} 落到了绝对路径：{got:?}");
+        }
+    }
+
+    /// 这台机器上那一套是哪一套。
+    #[test]
+    fn here_follows_the_platform_it_was_compiled_for() {
+        #[cfg(windows)]
+        assert_eq!(Convention::HERE, Convention::Windows);
+        #[cfg(not(windows))]
+        assert_eq!(Convention::HERE, Convention::Unix);
     }
 }
