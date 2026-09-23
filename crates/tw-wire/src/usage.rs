@@ -7,17 +7,19 @@
 //! 所以这里是个**旁路嗅探器**：字节照常流向客户端，同时喂它一份。它只
 //! 记那几个数字，内存是有界的。
 //!
-//! 四种格式、两种模式都要认：
+//! 五种格式、两种模式都要认：
 //!
-//! | | Anthropic | OpenAI Chat | OpenAI Responses | Gemini |
-//! |---|---|---|---|---|
-//! | 非流式 | 末尾一个 `usage` | 同 | 同 | `usageMetadata` |
-//! | 流式 | `message_start` 给输入、`message_delta` 给输出 | 末尾一个带 `usage` 的 chunk | `response.completed` 里的 `usage` | 每一帧都带累计的 `usageMetadata` |
+//! | | Anthropic | OpenAI Chat | OpenAI Responses | Gemini | Bedrock |
+//! |---|---|---|---|---|---|
+//! | 非流式 | 末尾一个 `usage` | 同 | 同 | `usageMetadata` | 末尾一个 `usage` |
+//! | 流式 | `message_start` 给输入、`message_delta` 给输出 | 末尾一个带 `usage` 的 chunk | `response.completed` 里的 `usage` | 每一帧都带累计的 `usageMetadata` | `metadata` 事件里的 `usage` |
+//!
+//! Bedrock 的流是二进制帧，要先经 `tw_upstream::eventstream` 转成 SSE 再喂进来。
 //!
 //! 流式那一行决定了实现形状：usage **可能出现在流的任何位置，而且不止
 //! 一次**，所以不能只看结尾。
 //!
-//! **三家对「输入」的定义不一样**：Anthropic 的 `input_tokens` 不含缓存命中；
+//! **几家对「输入」的定义不一样**：Anthropic 的 `input_tokens` 和 Bedrock 的 `inputTokens` 不含缓存命中；
 //! OpenAI（两种格式）和 Gemini 的输入数**包含**缓存命中。不减掉的话，命中缓存的
 //! 那部分会按输入价再算一遍。
 
@@ -153,7 +155,7 @@ impl Sniffer {
     fn merge(&mut self, v: &Value) {
         let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
         let mut got = false;
-        // Anthropic 和 OpenAI 各叫各的名字，两套都认
+        // Anthropic、OpenAI、Bedrock 各叫各的名字，都认
         let mut take = |keys: &[&str], slot: &mut u64| {
             for k in keys {
                 let x = n(k);
@@ -163,13 +165,22 @@ impl Sniffer {
                 }
             }
         };
-        take(&["input_tokens", "prompt_tokens"], &mut self.seen.input);
         take(
-            &["output_tokens", "completion_tokens"],
+            &["input_tokens", "prompt_tokens", "inputTokens"],
+            &mut self.seen.input,
+        );
+        take(
+            &["output_tokens", "completion_tokens", "outputTokens"],
             &mut self.seen.output,
         );
-        take(&["cache_read_input_tokens"], &mut self.seen.cache_read);
-        take(&["cache_creation_input_tokens"], &mut self.seen.cache_write);
+        take(
+            &["cache_read_input_tokens", "cacheReadInputTokens"],
+            &mut self.seen.cache_read,
+        );
+        take(
+            &["cache_creation_input_tokens", "cacheWriteInputTokens"],
+            &mut self.seen.cache_write,
+        );
         // OpenAI 把缓存读写放在明细里（Chat 叫 `prompt_tokens_details`，Responses
         // 叫 `input_tokens_details`），**而且它们是输入数的子集** —— 直接相加会
         // 重复计费。
@@ -311,6 +322,27 @@ mod tests {
         let (a, b) = (chunk(10), chunk(80));
         let u = sniff(&[&a, &b]).unwrap();
         assert_eq!((u.input, u.cache_read, u.output), (400, 600, 130));
+    }
+
+    #[test]
+    fn a_bedrock_response_is_read_by_its_own_names() {
+        // Converse 用驼峰，而且和 Anthropic 一样：`inputTokens` 不含缓存。
+        // 以前一个都不认，Bedrock 的请求全按估算记账
+        let whole = r#"{"output":{"message":{"role":"assistant","content":[{"text":"hi"}]}},"stopReason":"end_turn",
+            "usage":{"inputTokens":60,"outputTokens":20,"cacheReadInputTokens":40,"cacheWriteInputTokens":5,"totalTokens":125}}"#;
+        let u = sniff(&[whole]).unwrap();
+        assert_eq!(
+            (u.input, u.cache_read, u.cache_write, u.output),
+            (60, 40, 5, 20)
+        );
+
+        // 流：拆帧之后是 `metadata` 事件
+        let u = sniff(&[
+            "event: messageStop\ndata: {\"stopReason\":\"end_turn\"}\n\n",
+            "event: metadata\ndata: {\"usage\":{\"inputTokens\":60,\"outputTokens\":20,\"totalTokens\":80},\"metrics\":{\"latencyMs\":300}}\n\n",
+        ])
+        .unwrap();
+        assert_eq!((u.input, u.output), (60, 20));
     }
 
     #[test]
