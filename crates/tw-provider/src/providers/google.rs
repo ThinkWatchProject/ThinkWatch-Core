@@ -117,6 +117,29 @@ fn convert_request(req: &ChatCompletionRequest) -> GeminiRequest {
     }
 }
 
+/// Gemini 的停止原因 → OpenAI 的写法。
+///
+/// 整包和流式都要用：**流式那条路原先什么都不映射**，见 `stream_chat_completion`。
+fn finish_reason_of(raw: &str) -> String {
+    match raw {
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        other => other.to_lowercase(),
+    }
+}
+
+/// Gemini 报的用量 → 我们的 `Usage`。
+///
+/// **流式的每一帧都带着累计值**，所以每一帧都要填：调用方取的是最后
+/// 一个带用量的块，而那一帧上的数就是这次请求的最终用量。
+fn usage_of(u: GeminiUsageMetadata) -> Usage {
+    Usage {
+        prompt_tokens: u.prompt_token_count.unwrap_or(0),
+        completion_tokens: u.candidates_token_count.unwrap_or(0),
+        total_tokens: u.total_token_count.unwrap_or(0),
+    }
+}
+
 fn convert_response(resp: GeminiResponse, model: &str) -> ChatCompletionResponse {
     let (text, finish_reason) = resp
         .candidates
@@ -134,20 +157,12 @@ fn convert_response(resp: GeminiResponse, model: &str) -> ChatCompletionResponse
                         .cloned()
                 })
                 .unwrap_or_default();
-            let reason = c.finish_reason.map(|r| match r.as_str() {
-                "STOP" => "stop".to_string(),
-                "MAX_TOKENS" => "length".to_string(),
-                other => other.to_lowercase(),
-            });
+            let reason = c.finish_reason.as_deref().map(finish_reason_of);
             (text, reason)
         })
         .unwrap_or_default();
 
-    let usage = resp.usage_metadata.map(|u| Usage {
-        prompt_tokens: u.prompt_token_count.unwrap_or(0),
-        completion_tokens: u.candidates_token_count.unwrap_or(0),
-        total_tokens: u.total_token_count.unwrap_or(0),
-    });
+    let usage = resp.usage_metadata.map(usage_of);
 
     ChatCompletionResponse {
         id: format!("gemini-{}", uuid::Uuid::new_v4()),
@@ -161,6 +176,42 @@ fn convert_response(resp: GeminiResponse, model: &str) -> ChatCompletionResponse
                 content: serde_json::Value::String(text),
                 ..Default::default()
             },
+            finish_reason,
+        }],
+        usage,
+    }
+}
+
+/// 流式的一帧 → 一个块。
+///
+/// **用量和停止原因原先在这里被丢掉**：两个字段都写死 `None`，而 Gemini
+/// 每一帧都带着累计用量。丢掉的后果不是少一个数字 —— 调用方拿不到用量
+/// 就只能按字符数估算计费，于是经 Gemini 的流式请求从来没有按真实用量
+/// 记过账。
+fn convert_chunk(resp: GeminiResponse, chunk_id: &str, model: &str) -> ChatCompletionChunk {
+    // 每一帧都填：用量是累计的，调用方取最后一个带用量的块
+    let usage = resp.usage_metadata.map(usage_of);
+    let (text, finish_reason) = resp
+        .candidates
+        .and_then(|c| c.into_iter().next())
+        .map(|c| {
+            let text = c
+                .content
+                .and_then(|content| content.parts.into_iter().next())
+                .and_then(|p| p.text)
+                .unwrap_or_default();
+            (text, c.finish_reason.as_deref().map(finish_reason_of))
+        })
+        .unwrap_or_default();
+
+    ChatCompletionChunk {
+        id: chunk_id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created: chrono::Utc::now().timestamp(),
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: serde_json::json!({ "content": text }),
             finish_reason,
         }],
         usage,
@@ -251,28 +302,117 @@ impl AiProvider for GoogleProvider {
                 }
 
                 if let Ok(gemini_resp) = serde_json::from_str::<GeminiResponse>(&data) {
-                    let text = gemini_resp
-                        .candidates
-                        .and_then(|c| c.into_iter().next())
-                        .and_then(|c| c.content)
-                        .and_then(|content| content.parts.into_iter().next())
-                        .and_then(|p| p.text)
-                        .unwrap_or_default();
-
-                    yield Ok(ChatCompletionChunk {
-                        id: chunk_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created: chrono::Utc::now().timestamp(),
-                        model: model.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: serde_json::json!({"content": text}),
-                            finish_reason: None,
-                        }],
-                        usage: None,
-                    });
+                    yield Ok(convert_chunk(gemini_resp, &chunk_id, &model));
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(json: &str) -> GeminiResponse {
+        serde_json::from_str(json).expect("frame parses")
+    }
+
+    #[test]
+    fn a_streamed_frame_carries_the_usage_gemini_reported() {
+        // 这正是原先丢掉的东西：帧里有用量，块上却是 None，于是计费
+        // 退回按字符数估算
+        let chunk = convert_chunk(
+            frame(
+                r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],
+                    "usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3,"totalTokenCount":14}}"#,
+            ),
+            "id",
+            "gemini-2.5-pro",
+        );
+
+        let usage = chunk.usage.expect("the frame reported usage");
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 14);
+    }
+
+    #[test]
+    fn a_frame_without_usage_reports_none_rather_than_zeros() {
+        // 早期的帧不带用量。**零和「没说」不是一回事** —— 报成零会让
+        // 调用方以为这次请求真的没花 token
+        let chunk = convert_chunk(
+            frame(r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#),
+            "id",
+            "gemini-2.5-pro",
+        );
+        assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn the_last_frames_cumulative_count_is_the_one_that_counts() {
+        // Gemini 每一帧都报累计值，所以每一帧都要填：调用方取最后一个
+        // 带用量的块，而那一帧上的数就是这次请求的最终用量
+        let first = convert_chunk(
+            frame(
+                r#"{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":1,"totalTokenCount":12}}"#,
+            ),
+            "id",
+            "m",
+        );
+        let last = convert_chunk(
+            frame(
+                r#"{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":9,"totalTokenCount":20}}"#,
+            ),
+            "id",
+            "m",
+        );
+        assert_eq!(first.usage.expect("first").completion_tokens, 1);
+        assert_eq!(last.usage.expect("last").completion_tokens, 9);
+    }
+
+    #[test]
+    fn a_streamed_frame_translates_the_stop_reason() {
+        // 和用量一样，这个字段原先也写死 None
+        let stop = convert_chunk(
+            frame(r#"{"candidates":[{"finishReason":"STOP"}]}"#),
+            "id",
+            "m",
+        );
+        assert_eq!(stop.choices[0].finish_reason.as_deref(), Some("stop"));
+
+        let cut = convert_chunk(
+            frame(r#"{"candidates":[{"finishReason":"MAX_TOKENS"}]}"#),
+            "id",
+            "m",
+        );
+        assert_eq!(cut.choices[0].finish_reason.as_deref(), Some("length"));
+
+        let unknown = convert_chunk(
+            frame(r#"{"candidates":[{"finishReason":"SAFETY"}]}"#),
+            "id",
+            "m",
+        );
+        assert_eq!(unknown.choices[0].finish_reason.as_deref(), Some("safety"));
+    }
+
+    #[test]
+    fn the_whole_response_and_a_frame_agree_on_the_numbers() {
+        // 两条路读的是同一个字段。它们曾经不一致过 —— 整包读了，
+        // 流式没读
+        let json = r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],
+                       "usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":2,"totalTokenCount":9}}"#;
+        let whole = convert_response(frame(json), "m");
+        let streamed = convert_chunk(frame(json), "id", "m");
+
+        let w = whole.usage.expect("whole");
+        let s = streamed.usage.expect("streamed");
+        assert_eq!(
+            (w.prompt_tokens, w.completion_tokens),
+            (s.prompt_tokens, s.completion_tokens)
+        );
+        assert_eq!(
+            whole.choices[0].finish_reason,
+            streamed.choices[0].finish_reason
+        );
     }
 }
