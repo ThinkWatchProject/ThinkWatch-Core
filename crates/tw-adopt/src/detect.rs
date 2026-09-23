@@ -145,6 +145,9 @@ pub struct Finding {
     pub fix: Option<Msg>,
 }
 
+/// 只有 `ps` 那一支要：它拿到的是「跑了多久」，得从现在往回倒。Windows
+/// 那一支直接拿到创建时刻。
+#[cfg(not(windows))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
