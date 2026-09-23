@@ -234,13 +234,13 @@ pub struct AppState {
     /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
     /// —— 一次慢磁盘写就变成一次慢请求，而观测永远不该有这个权力。
     /// `None` 表示观测层没起来，那时什么都不做。
-    body_sink: Arc<std::sync::Mutex<Option<tw_wire::bodies::BodySender>>>,
+    body_sink: Arc<std::sync::Mutex<Option<crate::bodies::BodySender>>>,
     /// 每个上游最近一次报的订阅额度。
     ///
     /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
     /// 五分钟前的百分比，价值几乎为零，而它会让「重启之后显示的是旧
     /// 数字」变成一个要解释的问题。下一个请求回来就有新的了。
-    quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, tw_wire::quota::Quota>>>,
+    quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::quota::Quota>>>,
     /// 监听地址变了。**这是「温」那一级**（三级热重载） ——
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
@@ -696,16 +696,12 @@ impl AppState {
     /// **429 的那一跳也要读**：额度用完时上游回的正是 429，只读成功那一跳的话，
     /// 「用完了」这件事永远看不到。
     pub(crate) fn note_quota(&self, id: u64, provider: &str, headers: &reqwest::header::HeaderMap) {
-        self.record_quota(
-            id,
-            provider,
-            tw_wire::quota::from_headers(headers, now_ms()),
-        );
+        self.record_quota(id, provider, crate::quota::from_headers(headers, now_ms()));
     }
 
     /// 记下一份额度。**账号接口问来的也走这里**：额度只在内存里，冷启动之后要等第一次
     /// 请求才有，而界面一打开就该看得见
-    pub fn record_quota(&self, id: u64, provider: &str, quota: tw_wire::quota::Quota) {
+    pub fn record_quota(&self, id: u64, provider: &str, quota: crate::quota::Quota) {
         if quota.is_empty() {
             return;
         }
@@ -828,7 +824,7 @@ impl AppState {
 
     /// 接上 body 的去处。**观测层起来之后才调** —— 在那之前 body 一律
     /// 丢掉，而请求照常。
-    pub fn set_body_sink(&self, tx: tw_wire::bodies::BodySender) {
+    pub fn set_body_sink(&self, tx: crate::bodies::BodySender) {
         if let Ok(mut g) = self.body_sink.lock() {
             *g = Some(tx);
         }
@@ -875,12 +871,12 @@ impl AppState {
         }
     }
 
-    fn body_sink(&self) -> Option<tw_wire::bodies::BodySender> {
+    fn body_sink(&self) -> Option<crate::bodies::BodySender> {
         self.body_sink.lock().ok().and_then(|g| g.clone())
     }
 
     /// 每个上游最近一次报的订阅额度。
-    pub fn quotas(&self) -> std::collections::HashMap<String, tw_wire::quota::Quota> {
+    pub fn quotas(&self) -> std::collections::HashMap<String, crate::quota::Quota> {
         self.quotas.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
@@ -1690,12 +1686,12 @@ async fn pipeline(
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
     // 整个解析的，所以本来就在）。
-    tw_wire::bodies::offer(
+    crate::bodies::offer(
         &sink,
-        tw_wire::bodies::BodyRecord {
+        crate::bodies::BodyRecord {
             id,
             at_ms,
-            kind: tw_wire::bodies::BodyKind::Request,
+            kind: crate::bodies::BodyKind::Request,
             body: body.clone(),
             original_len: body.len(),
         },

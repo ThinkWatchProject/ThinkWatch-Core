@@ -2883,6 +2883,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3024,12 +3025,7 @@ dependencies = [
 name = "tw-wire"
 version = "0.37.0"
 dependencies = [
- "bytes",
- "chrono",
- "http 1.5.0",
- "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
