@@ -240,7 +240,7 @@ pub struct AppState {
     /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
     /// 五分钟前的百分比，价值几乎为零，而它会让「重启之后显示的是旧
     /// 数字」变成一个要解释的问题。下一个请求回来就有新的了。
-    quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::quota::Quota>>>,
+    quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, tw_wire::quota::Quota>>>,
     /// 监听地址变了。**这是「温」那一级**（三级热重载） ——
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
@@ -699,13 +699,13 @@ impl AppState {
         self.record_quota(
             id,
             provider,
-            crate::quota::from_headers_reqwest(headers, now_ms()),
+            tw_wire::quota::from_headers(headers, now_ms()),
         );
     }
 
     /// 记下一份额度。**账号接口问来的也走这里**：额度只在内存里，冷启动之后要等第一次
     /// 请求才有，而界面一打开就该看得见
-    pub fn record_quota(&self, id: u64, provider: &str, quota: crate::quota::Quota) {
+    pub fn record_quota(&self, id: u64, provider: &str, quota: tw_wire::quota::Quota) {
         if quota.is_empty() {
             return;
         }
@@ -880,7 +880,7 @@ impl AppState {
     }
 
     /// 每个上游最近一次报的订阅额度。
-    pub fn quotas(&self) -> std::collections::HashMap<String, crate::quota::Quota> {
+    pub fn quotas(&self) -> std::collections::HashMap<String, tw_wire::quota::Quota> {
         self.quotas.lock().map(|g| g.clone()).unwrap_or_default()
     }
 

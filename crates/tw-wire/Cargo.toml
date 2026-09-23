@@ -9,7 +9,12 @@ description = "Sideband readers for a streaming response: usage sniffing and bod
 
 [dependencies]
 bytes = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# 只要 HeaderMap。**不要 axum 也不要 reqwest** —— 共享层不该规定下游用哪个
+# HTTP 框架，而两者的 HeaderMap 本来就都是这个 crate 的类型
+http = "1"
 # 只要一个 mpsc 发送端。**不用 workspace 那份** —— 那份带着网络、信号、
 # 计时器，而这个 crate 要能被企业版直接依赖，背什么进去是它说了算
 tokio = { version = "1", default-features = false, features = ["sync"] }
