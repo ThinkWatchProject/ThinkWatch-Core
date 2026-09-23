@@ -224,6 +224,28 @@ pub fn backup_root() -> PathBuf {
 /// 同一毫秒里最多几份备份。补零宽度跟着它走，超了排序就不对了。
 const BACKUP_SEQ_MAX: u32 = 9999;
 
+/// 把来源路径压成**一个**文件名，放进备份目录里。
+///
+/// 一眼能看出这份备份是谁的：`/Users/x/.claude/settings.json` 变成
+/// `Users%x%.claude%settings.json`。
+///
+/// # 两种分隔符和那个冒号
+///
+/// 只处理 `/` 的话，Windows 上 `C:\Users\x\c.json` 原样留着反斜杠 —— 而
+/// **`Path::join` 碰上一个绝对路径会把前面整个丢掉**，于是「备份目录里的
+/// 那个文件」悄悄变回了用户原本那个配置文件。
+///
+/// 那条路上接着是 `create_new`，它报「文件已存在」——**那一声是它救了一命**：
+/// 没有它，备份这一步会拿备份内容去覆盖用户自己的配置，而这个模块存在的
+/// 全部理由就是不弄坏别人的文件。
+///
+/// 冒号也要换掉：`C:` 里那个在 Windows 的文件名中非法。
+fn flat_name(real: &Path) -> String {
+    real.to_string_lossy()
+        .trim_start_matches(['/', '\\'])
+        .replace(['/', '\\', ':'], "%")
+}
+
 fn backup_to(root: &Path, real: &Path, text: &str) -> Result<PathBuf, ForeignError> {
     backup_at(root, real, text, now_ms())
 }
@@ -231,10 +253,7 @@ fn backup_to(root: &Path, real: &Path, text: &str) -> Result<PathBuf, ForeignErr
 /// 时间戳从外面传进来，测试才能稳定地造出「同一毫秒」。
 fn backup_at(root: &Path, real: &Path, text: &str, ms: u64) -> Result<PathBuf, ForeignError> {
     // 目录名里带上来源路径的形状，一眼能看出这是谁的备份
-    let flat = real
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .replace('/', "%");
+    let flat = flat_name(real);
     std::fs::create_dir_all(root).map_err(|source| ForeignError::Write {
         path: root.to_path_buf(),
         source,
@@ -503,6 +522,36 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&a.backup).unwrap(), "三个月的设置");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "接管之后");
         assert!(!a.created);
+    }
+
+    /// **压出来的必须是一个文件名，不是一条路径。**
+    ///
+    /// 这个测试在 macOS 上就能抓到那个 Windows 的 bug：那里的分隔符是反斜杠，
+    /// 只换 `/` 的话它们原样留着，而一个还带着分隔符的「文件名」`join` 上去
+    /// 就不再落在备份目录里 —— Windows 上更狠，绝对路径会让 `join` 把前面
+    /// 整个丢掉，于是那个路径指回了用户自己的配置文件。
+    #[test]
+    fn a_source_path_is_flattened_into_a_single_name() {
+        for p in [
+            "/Users/x/.claude/settings.json",
+            "C:\\Users\\x\\.claude\\settings.json",
+            "\\\\server\\share\\c.json",
+        ] {
+            let n = flat_name(Path::new(p));
+            assert!(!n.contains('/'), "{p} -> {n}");
+            assert!(!n.contains('\\'), "{p} -> {n}");
+            assert!(!n.contains(':'), "{p} -> {n}");
+            assert!(!n.is_empty(), "{p} -> 空");
+            assert!(
+                !Path::new(&n).is_absolute(),
+                "{p} -> {n} 还是绝对路径，join 会把备份目录丢掉"
+            );
+        }
+        // 老样子不变：unix 的路径压出来还是原来那个名字
+        assert_eq!(
+            flat_name(Path::new("/Users/x/.claude/settings.json")),
+            "Users%x%.claude%settings.json"
+        );
     }
 
     #[test]
