@@ -25,31 +25,64 @@ use crate::foreign::{self, Applied, Change, ForeignError};
 use crate::json::Val;
 use crate::sentinel::{self, Original, SidecarRecord, Was};
 
+/// 接管或还原算不出来、落不了盘的原因。
+///
+/// **英文只写一遍**：`Display` 就是 [`PlanError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
-    #[error("the configuration of {client} could not be read: {source}")]
+    #[error("{}", self.msg())]
     Read {
         client: String,
         source: ForeignError,
     },
-    #[error("the configuration of {client} could not be parsed, so nothing was changed: {msg}")]
+    #[error("{}", self.msg())]
     Parse { client: String, msg: String },
-    #[error("{0}")]
+    #[error(transparent)]
     Write(#[from] ForeignError),
-    #[error("the record beside {path} belongs to {other}, not {client}, so nothing was changed")]
+    #[error("{}", self.msg())]
     ForeignSidecar {
         path: PathBuf,
         other: String,
         client: String,
     },
-    #[error(
-        "there is no record for {client}, so there is nothing to restore from. To restore by hand, look at {path}"
-    )]
+    #[error("{}", self.msg())]
     NoRecord { client: String, path: PathBuf },
-    #[error(
-        "the original value for {client} is a secret kept only in the full backup, and the backup {backup} is gone"
-    )]
-    SecretGone { client: String, backup: PathBuf },
+}
+
+impl PlanError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            // **读不到的那个文件本身就是该客户端的配置**，所以直接说文件那一句：
+            // 两句套在一起（「X 的配置读不出来：某文件读不出来：…」）只是把同一件
+            // 事说了两遍
+            PlanError::Read { client, source } => match source {
+                ForeignError::Read { path, source } => msg!(
+                    "adopt.plan.read_failed", client = client, path = path.display(), detail = source =>
+                    "the configuration of {client} could not be read: {path}: {detail}"
+                ),
+                other => other.msg(),
+            },
+            PlanError::Parse { client, msg } => msg!(
+                "adopt.plan.parse_failed", client = client, detail = msg =>
+                "the configuration of {client} could not be parsed, so nothing was changed: {detail}"
+            ),
+            PlanError::Write(e) => e.msg(),
+            PlanError::ForeignSidecar {
+                path,
+                other,
+                client,
+            } => msg!(
+                "adopt.plan.foreign_record", path = path.display(), other = other, client = client =>
+                "the record beside {path} belongs to {other}, not {client}, so nothing was changed"
+            ),
+            PlanError::NoRecord { client, path } => msg!(
+                "adopt.plan.no_record", client = client, path = path.display() =>
+                "there is no record for {client}, so there is nothing to restore from. To restore \
+                 by hand, look at {path}"
+            ),
+        }
+    }
 }
 
 /// 这次改动对某条路径做了什么。写回校验的参照物就是它们叠出来的。
@@ -621,5 +654,96 @@ fn rollback(a: &Applied) -> std::io::Result<()> {
     } else {
         let text = std::fs::read_to_string(&a.backup)?;
         std::fs::write(&a.real, text)
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+    use crate::mcp::McpError;
+
+    #[test]
+    fn every_adopt_error_has_its_own_code() {
+        let p = || PathBuf::from("/h/.claude/settings.json");
+        let io = || std::io::Error::other("denied");
+        let foreign = || {
+            vec![
+                ForeignError::Read {
+                    path: p(),
+                    source: io(),
+                },
+                ForeignError::Write {
+                    path: p(),
+                    source: io(),
+                },
+                ForeignError::ChangedUnderUs { path: p() },
+                ForeignError::VerifyFailed("x".into()),
+                ForeignError::Readback { path: p() },
+                ForeignError::LinkLoop { path: p() },
+            ]
+        };
+        let mut all: Vec<(Msg, String)> = foreign()
+            .into_iter()
+            .map(|e| (e.msg(), e.to_string()))
+            .collect();
+        for e in [
+            PlanError::Read {
+                client: "claude-code".into(),
+                source: ForeignError::Read {
+                    path: p(),
+                    source: io(),
+                },
+            },
+            PlanError::Parse {
+                client: "claude-code".into(),
+                msg: "x".into(),
+            },
+            PlanError::ForeignSidecar {
+                path: p(),
+                other: "codex".into(),
+                client: "claude-code".into(),
+            },
+            PlanError::NoRecord {
+                client: "claude-code".into(),
+                path: p(),
+            },
+        ] {
+            all.push((e.msg(), e.to_string()));
+        }
+        for e in [
+            McpError::UnknownClient("x".into()),
+            McpError::Parse {
+                client: "zed".into(),
+                msg: "x".into(),
+            },
+            McpError::NotThere {
+                client: "zed".into(),
+                name: "fs".into(),
+            },
+        ] {
+            all.push((e.msg(), e.to_string()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (m, display) in &all {
+            assert!(m.code.starts_with("adopt."), "{m:?}");
+            assert!(!m.text.is_empty() && &m.text == display, "{m:?}");
+            assert!(seen.insert(m.code.clone()), "码重复了：{}", m.code);
+        }
+        // 包着的那几层用里面那一句的码
+        let w = PlanError::Write(ForeignError::LinkLoop { path: p() });
+        assert_eq!(w.msg().code, "adopt.file.link_loop");
+        let r = PlanError::Read {
+            client: "x".into(),
+            source: ForeignError::LinkLoop { path: p() },
+        };
+        assert_eq!(r.msg().code, "adopt.file.link_loop");
+        // 不能写的理由本来就有码，直接说它
+        let e = crate::mcp::target("zed").unwrap().why_not().unwrap();
+        let m = McpError::NotCopyable {
+            client: "zed".into(),
+            why: e.clone(),
+        }
+        .msg();
+        assert_eq!(m, e);
     }
 }

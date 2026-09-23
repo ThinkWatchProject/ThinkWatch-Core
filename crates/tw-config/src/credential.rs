@@ -20,6 +20,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Protocol, Provider};
+use tw_types::{Msg, msg};
 
 /// `headers` 里换成 OAuth access token 的占位符。
 pub const ACCESS_TOKEN: &str = "{{access_token}}";
@@ -248,59 +249,132 @@ pub fn auth_header(protocol: Option<Protocol>) -> (&'static str, &'static str) {
 }
 
 /// 凭据写法上的问题。**每一条都指到具体的那一行**，而不是「凭据无效」。
+///
+/// **英文只写一遍**：`Display` 就是 [`CredentialError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
-    #[error("the API key is empty")]
+    #[error("{}", self.msg())]
     EmptyKey,
-    #[error("key and oauth are alternatives; fill in one of them")]
+    #[error("{}", self.msg())]
     KeyAndOauth,
-    #[error("neither refresh nor endpoint of oauth can be empty")]
+    #[error("{}", self.msg())]
     EmptyOauth,
-    #[error("a Claude subscription sign-in is not supported here; use an Anthropic API key")]
+    #[error("{}", self.msg())]
     ClaudeSubscription,
-    #[error("the Google sign-in of Gemini CLI is not supported here; use a Gemini API key")]
+    #[error("{}", self.msg())]
     GoogleSubscription,
-    #[error("a ChatGPT account upstream takes only the credential obtained by signing in")]
+    #[error("{}", self.msg())]
     ChatgptWithoutLogin,
-    #[error(
-        "the `{0}` header says where a request came from; the gateway sends it truthfully and it cannot be set in the configuration"
-    )]
+    #[error("{}", self.msg())]
     IdentityHeader(String),
-    #[error("there can be at most {MAX_HEADERS} headers")]
+    #[error("{}", self.msg())]
     TooManyHeaders,
-    #[error(
-        "the header name `{0}` is not valid: letters, digits and - _ . ~ only, and at most {MAX_HEADER_NAME} characters"
-    )]
+    #[error("{}", self.msg())]
     BadHeaderName(String),
-    #[error("the `{0}` header is the gateway's to manage and cannot be set in the configuration")]
+    #[error("{}", self.msg())]
     ReservedHeader(String),
-    #[error("the `{0}` header appears twice (header names are case-insensitive)")]
+    #[error("{}", self.msg())]
     DuplicateHeader(String),
-    #[error(
-        "the value of the `{0}` header cannot contain a newline and is at most {MAX_HEADER_VALUE} characters"
-    )]
+    #[error("{}", self.msg())]
     BadHeaderValue(String),
-    #[error(
-        "{placeholder} in the `{name}` header is not recognized; only {{{{access_token}}}} and {{{{client}}}} are"
-    )]
+    #[error("{}", self.msg())]
     UnknownPlaceholder { name: String, placeholder: String },
-    #[error(
-        "the `{0}` header uses {{{{access_token}}}}, and this upstream has no oauth configured"
-    )]
+    #[error("{}", self.msg())]
     TokenWithoutOauth(String),
-    #[error(
-        "a key is filled in, so the API key goes out in the `{0}` header; `{0}` cannot also be set among the headers"
-    )]
+    #[error("{}", self.msg())]
     KeyAndAuthHeader(String),
-    #[error(
-        "with oauth configured, the token goes out in the `{0}` header by default. To set that header yourself, mark where the token goes with {{{{access_token}}}}"
-    )]
+    #[error("{}", self.msg())]
     OauthAndAuthHeader(String),
-    #[error("an OAuth access token could not be obtained")]
+    #[error("{}", self.msg())]
     NoToken,
     /// 环境变量没设之类。存成文字：这个错误要能比较，而底下那个类型不能
-    #[error("{0}")]
+    #[error("{}", self.msg())]
     Env(String),
+}
+
+impl CredentialError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        use CredentialError::*;
+        match self {
+            EmptyKey => msg!("config.credential.empty_key" => "the API key is empty"),
+            KeyAndOauth => msg!(
+                "config.credential.key_and_oauth" =>
+                "key and oauth are alternatives; fill in one of them"
+            ),
+            EmptyOauth => msg!(
+                "config.credential.empty_oauth" =>
+                "neither refresh nor endpoint of oauth can be empty"
+            ),
+            ClaudeSubscription => msg!(
+                "config.credential.claude_subscription" =>
+                "a Claude subscription sign-in is not supported here; use an Anthropic API key"
+            ),
+            GoogleSubscription => msg!(
+                "config.credential.google_subscription" =>
+                "the Google sign-in of Gemini CLI is not supported here; use a Gemini API key"
+            ),
+            ChatgptWithoutLogin => msg!(
+                "config.credential.chatgpt_without_login" =>
+                "a ChatGPT account upstream takes only the credential obtained by signing in"
+            ),
+            IdentityHeader(h) => msg!(
+                "config.credential.identity_header", header = h =>
+                "the `{header}` header says where a request came from; the gateway sends it \
+                 truthfully and it cannot be set in the configuration"
+            ),
+            TooManyHeaders => msg!(
+                "config.credential.too_many_headers", max = MAX_HEADERS =>
+                "there can be at most {max} headers"
+            ),
+            BadHeaderName(h) => msg!(
+                "config.credential.bad_header_name", header = h, max = MAX_HEADER_NAME =>
+                "the header name `{header}` is not valid: letters, digits and - _ . ~ only, and at \
+                 most {max} characters"
+            ),
+            ReservedHeader(h) => msg!(
+                "config.credential.reserved_header", header = h =>
+                "the `{header}` header is the gateway's to manage and cannot be set in the \
+                 configuration"
+            ),
+            DuplicateHeader(h) => msg!(
+                "config.credential.duplicate_header", header = h =>
+                "the `{header}` header appears twice (header names are case-insensitive)"
+            ),
+            BadHeaderValue(h) => msg!(
+                "config.credential.bad_header_value", header = h, max = MAX_HEADER_VALUE =>
+                "the value of the `{header}` header cannot contain a newline and is at most {max} \
+                 characters"
+            ),
+            UnknownPlaceholder { name, placeholder } => msg!(
+                "config.credential.unknown_placeholder", header = name, placeholder = placeholder =>
+                "{placeholder} in the `{header}` header is not recognized; only {{{{access_token}}}} \
+                 and {{{{client}}}} are"
+            ),
+            TokenWithoutOauth(h) => msg!(
+                "config.credential.token_without_oauth", header = h =>
+                "the `{header}` header uses {{{{access_token}}}}, and this upstream has no oauth \
+                 configured"
+            ),
+            KeyAndAuthHeader(h) => msg!(
+                "config.credential.key_and_auth_header", header = h =>
+                "a key is filled in, so the API key goes out in the `{header}` header; `{header}` \
+                 cannot also be set among the headers"
+            ),
+            OauthAndAuthHeader(h) => msg!(
+                "config.credential.oauth_and_auth_header", header = h =>
+                "with oauth configured, the token goes out in the `{header}` header by default. To \
+                 set that header yourself, mark where the token goes with {{{{access_token}}}}"
+            ),
+            NoToken => msg!(
+                "config.credential.no_token" =>
+                "an OAuth access token could not be obtained"
+            ),
+            // 只在转发时出现（展开 `${VAR}`），写法检查碰不到它。**底下那句已经
+            // 是文字了**，这里只能原样带出去
+            Env(d) => msg!("config.credential.env", detail = d => "{detail}"),
+        }
+    }
 }
 
 impl From<SecretResolveError> for CredentialError {

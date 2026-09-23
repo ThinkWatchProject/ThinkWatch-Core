@@ -35,7 +35,7 @@ use tw_config::history::Origin;
 use tw_gateway::chatgpt;
 
 use crate::{ControlState, Fail, fail};
-use tw_types::msg;
+use tw_types::{Msg, msg};
 
 /// 登录要在多久之内完成。和 Codex 一样是 15 分钟
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
@@ -204,7 +204,7 @@ impl Want {
             return Err(fail(
                 StatusCode::CONFLICT,
                 msg!(
-                    "control.name_taken_not_chatgpt", name = name =>
+                    "control.name_taken_not_chatgpt", name = &name =>
                     "There is already an upstream named `{name}`, and it is not a ChatGPT account. \
                      Use a different name."
                 ),
@@ -327,12 +327,8 @@ async fn start_device(
     want: Want,
 ) -> Result<(Current, tw_api::ChatgptLogin), Fail> {
     let issuer = s.chatgpt.endpoints.issuer.clone();
-    let http = client_for(s, &want.name, &want.proxy).map_err(|e| {
-        fail(
-            StatusCode::BAD_GATEWAY,
-            msg!("control.upstream_call_failed", detail = e => "{detail}"),
-        )
-    })?;
+    let http =
+        client_for(s, &want.name, &want.proxy).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))?;
     let asked = serde_json::json!({ "client_id": chatgpt::CLIENT_ID });
     let resp = send(
         &http,
@@ -366,7 +362,10 @@ async fn start_device(
     let code: DeviceCode = serde_json::from_str(&text).map_err(|e| {
         fail(
             StatusCode::BAD_GATEWAY,
-            msg!("control.upstream_call_failed", detail = e => "{detail}"),
+            msg!(
+                "control.device_code_unreadable", detail = e =>
+                "The answer to the device code request could not be read: {detail}"
+            ),
         )
     })?;
     let id = chatgpt::new_state();
@@ -540,12 +539,7 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> Result<Json<tw_api::ChatgptLoginStatus>, Fail> {
     let mut status = {
-        let g = s.chatgpt.current.lock().map_err(|e| {
-            fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                msg!("control.internal", detail = e => "{detail}"),
-            )
-        })?;
+        let g = s.chatgpt.current.lock().map_err(crate::internal)?;
         let c = g.as_ref().filter(|c| c.status.id == id).ok_or_else(|| {
             fail(
                 StatusCode::NOT_FOUND,
@@ -679,7 +673,7 @@ async fn exchange_and_save(
     redirect_uri: &str,
 ) -> Result<(String, Option<String>), String> {
     let endpoints = &s.chatgpt.endpoints;
-    let http = client_for(s, name, proxy)?;
+    let http = client_for(s, name, proxy).map_err(|m| m.text)?;
     let tokens =
         chatgpt::exchange_code(&http, &endpoints.token, code, verifier, redirect_uri).await?;
     let account = chatgpt::account(&tokens.id_token);
@@ -705,8 +699,10 @@ async fn exchange_and_save(
             if let Some(e) = existing
                 && e.effective_protocol() != Some(Protocol::Chatgpt)
             {
-                return Err(crate::resources::invalid(format!(
-                    "there is already an upstream named `{name}`, and it is not a ChatGPT account"
+                return Err(crate::resources::invalid(msg!(
+                    "control.name_taken_not_chatgpt", name = &name =>
+                    "There is already an upstream named `{name}`, and it is not a ChatGPT account. \
+                     Use a different name."
                 )));
             }
             let mut p = existing.cloned().unwrap_or_else(|| tw_config::Provider {
@@ -733,7 +729,7 @@ async fn exchange_and_save(
             }
             p.headers = tw_config::Headers::new(headers);
             p.check_credential()
-                .map_err(|e| crate::resources::invalid(e.to_string()))?;
+                .map_err(|e| crate::resources::invalid(e.msg()))?;
             let current = existing.map(|_| name.as_str());
             Ok(tw_config::edit::upsert(
                 text,
@@ -754,14 +750,15 @@ async fn exchange_and_save(
 }
 
 /// 按出站方式建一个客户端。**要代理才能访问 OpenAI 的用户，直连会卡在换 token 这一步**
-fn client_for(s: &ControlState, name: &str, proxy: &str) -> Result<reqwest::Client, String> {
+fn client_for(s: &ControlState, name: &str, proxy: &str) -> Result<reqwest::Client, Msg> {
     let route = tw_config::Provider {
         name: name.to_string(),
         base_url: s.chatgpt.endpoints.backend.clone(),
         proxy: proxy.to_string(),
         ..Default::default()
     };
-    tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| e.message().to_string())
+    // 代理没定义、密码读不到这些，数据面那句自己带码
+    tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| e.detail)
 }
 
 fn announce(

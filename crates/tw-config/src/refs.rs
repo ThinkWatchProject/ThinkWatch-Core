@@ -416,7 +416,7 @@ routes:
         // 静默退回默认价的话，算出来的钱看起来正常，而折扣从没生效过
         let text = CFG.replace("    proxy: hk\n", "    proxy: hk\n    pricing: 没有这张\n");
         let e = crate::try_parse(&text).unwrap_err();
-        assert!(e.message.contains("没有这张"), "{}", e.message);
+        assert!(e.message.text.contains("没有这张"), "{}", e.message);
     }
 
     #[test]

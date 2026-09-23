@@ -52,7 +52,7 @@ async fn create_provider(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let p = to_provider(&req.provider, None).map_err(|e| invalid(e.text))?;
+            let p = to_provider(&req.provider, None).map_err(invalid)?;
             Ok(edit::upsert(text, edit::PROVIDERS, None, &mapping(&p)?)?)
         })
         .await
@@ -73,7 +73,7 @@ async fn update_provider(
                 .iter()
                 .find(|p| p.name == name)
                 .ok_or_else(|| not_found("upstream", &name))?;
-            let p = to_provider(&req.provider, Some(existing)).map_err(|e| invalid(e.text))?;
+            let p = to_provider(&req.provider, Some(existing)).map_err(invalid)?;
             let mut out = edit::upsert(text, edit::PROVIDERS, Some(&name), &mapping(&p)?)?;
             if p.name != name {
                 // **和那一项在同一个版本里改** —— 分两次写的话，中间那一版
@@ -100,9 +100,10 @@ async fn delete_provider(
         .transform(q.base_version.as_deref(), Origin::Ui, |text, cfg| {
             let used = refs::provider_refs(cfg, &name);
             if !used.is_empty() {
-                return Err(ApplyError::InUse(format!(
-                    "Upstream `{name}` is still referenced by {}; drop those references before deleting it.",
-                    describe(&used)
+                return Err(ApplyError::InUse(msg!(
+                    "control.upstream_in_use", upstream = &name, refs = describe(&used) =>
+                    "Upstream `{upstream}` is still referenced by {refs}; drop those references \
+                     before deleting it."
                 )));
             }
             login = chatgpt_login(cfg, &name, &s.chatgpt.endpoints.token);
@@ -425,9 +426,7 @@ fn to_provider(
     };
     // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时
     // 报一条指着 YAML 的错误
-    provider
-        .check_credential()
-        .map_err(|e| msg!("control.bad_credential", detail = e => "{detail}"))?;
+    provider.check_credential().map_err(|e| e.msg())?;
     Ok(provider)
 }
 
@@ -440,7 +439,7 @@ async fn create_proxy(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let px = to_proxy(&req.proxy, None).map_err(|e| invalid(e.text))?;
+            let px = to_proxy(&req.proxy, None).map_err(invalid)?;
             Ok(edit::upsert(text, edit::PROXIES, None, &mapping(&px)?)?)
         })
         .await
@@ -461,7 +460,7 @@ async fn update_proxy(
                 .iter()
                 .find(|p| p.name == name)
                 .ok_or_else(|| not_found("proxy", &name))?;
-            let px = to_proxy(&req.proxy, Some(existing)).map_err(|e| invalid(e.text))?;
+            let px = to_proxy(&req.proxy, Some(existing)).map_err(invalid)?;
             let mut out = edit::upsert(text, edit::PROXIES, Some(&name), &mapping(&px)?)?;
             if px.name != name {
                 out = refs::rename_proxy(&out, cfg, &name, &px.name)?;
@@ -483,9 +482,10 @@ async fn delete_proxy(
         .transform(q.base_version.as_deref(), Origin::Ui, |text, cfg| {
             let users = refs::proxy_users(cfg, &name);
             if !users.is_empty() {
-                return Err(ApplyError::InUse(format!(
-                    "Proxy `{name}` is still used by upstream {}; unlink those before deleting it.",
-                    quoted(&users)
+                return Err(ApplyError::InUse(msg!(
+                    "control.proxy_in_use", proxy = name, upstreams = quoted(&users) =>
+                    "Proxy `{proxy}` is still used by upstream {upstreams}; unlink those before \
+                     deleting it."
                 )));
             }
             Ok(edit::remove(text, edit::PROXIES, &name)?)
@@ -597,16 +597,19 @@ fn slug<T: serde::de::DeserializeOwned>(what: &'static str, v: &str) -> Result<T
     })
 }
 
+/// 结构 → YAML 映射。**失败是我们自己的类型写坏了**，不是用户填错了什么
 pub(crate) fn mapping<T: serde::Serialize>(v: &T) -> Result<serde_yaml_ng::Mapping, ApplyError> {
+    let unwritable = |d: String| ApplyError::Edit(EditError::Unwritable(d));
     match serde_yaml_ng::to_value(v) {
         Ok(Value::Mapping(m)) => Ok(m),
-        Ok(_) => Err(invalid("it does not serialize to a mapping".to_string())),
-        Err(e) => Err(invalid(e.to_string())),
+        Ok(_) => Err(unwritable("it does not serialize to a mapping".to_string())),
+        Err(e) => Err(unwritable(e.to_string())),
     }
 }
 
-pub(crate) fn invalid(msg: String) -> ApplyError {
-    ApplyError::Edit(EditError::Unwritable(msg))
+/// 交过来的东西写得不对。那句话自己带码，原样发给界面
+pub(crate) fn invalid(m: Msg) -> ApplyError {
+    ApplyError::Invalid(m)
 }
 
 pub(crate) fn not_found(what: &'static str, name: &str) -> ApplyError {

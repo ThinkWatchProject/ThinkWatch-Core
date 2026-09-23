@@ -24,30 +24,64 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tw_types::{Msg, msg};
 
+/// 往别人的配置文件里写的时候，哪一道没过。
+///
+/// **英文只写一遍**：`Display` 就是 [`ForeignError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, Error)]
 pub enum ForeignError {
-    #[error("{path} could not be read: {source}")]
+    #[error("{}", self.msg())]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} could not be written: {source}")]
+    #[error("{}", self.msg())]
     Write {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error(
-        "{path} changed after it was confirmed, so nothing was written. Look at the change again"
-    )]
+    #[error("{}", self.msg())]
     ChangedUnderUs { path: PathBuf },
-    #[error("the edited content did not pass its check, so nothing was written ({0})")]
+    /// 里面是解析器的原话，或者「和预期的改动对不上」那一句
+    #[error("{}", self.msg())]
     VerifyFailed(String),
-    #[error(
-        "what was read back after writing is not what was expected; restored from the backup: {path}"
-    )]
+    #[error("{}", self.msg())]
     Readback { path: PathBuf },
-    #[error("too many levels of symbolic link: {path}")]
+    #[error("{}", self.msg())]
     LinkLoop { path: PathBuf },
+}
+
+impl ForeignError {
+    /// 给人看的那句话，带码。`Read` / `Write` 的 `detail` 是系统的原话。
+    pub fn msg(&self) -> Msg {
+        match self {
+            ForeignError::Read { path, source } => msg!(
+                "adopt.file.read_failed", path = path.display(), detail = source =>
+                "{path} could not be read: {detail}"
+            ),
+            ForeignError::Write { path, source } => msg!(
+                "adopt.file.write_failed", path = path.display(), detail = source =>
+                "{path} could not be written: {detail}"
+            ),
+            ForeignError::ChangedUnderUs { path } => msg!(
+                "adopt.file.changed", path = path.display() =>
+                "{path} changed after it was confirmed, so nothing was written. Look at the \
+                 change again"
+            ),
+            ForeignError::VerifyFailed(d) => msg!(
+                "adopt.file.verify_failed", detail = d =>
+                "the edited content did not pass its check, so nothing was written ({detail})"
+            ),
+            ForeignError::Readback { path } => msg!(
+                "adopt.file.readback_mismatch", path = path.display() =>
+                "what was read back after writing is not what was expected; restored from the \
+                 backup: {path}"
+            ),
+            ForeignError::LinkLoop { path } => msg!(
+                "adopt.file.link_loop", path = path.display() =>
+                "too many levels of symbolic link: {path}"
+            ),
+        }
+    }
 }
 
 /// 写完之后的交代。**每一项都要能在 UI 上说出来** —— 用户敢按「接管」

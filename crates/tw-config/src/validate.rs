@@ -1,86 +1,194 @@
 //! 语义校验。**解析成功不等于配置对**，而错误信息要能直接行动。
 
+use tw_types::{Msg, msg};
+
 use crate::{Config, SCHEMA_VERSION};
 
+/// 配置合起来不成立的地方。
+///
+/// **英文只写一遍**：`Display` 就是 [`ValidationError::msg`] 的原句，界面拿码去翻。
+/// `what` 这类参数是一个英文词（`upstream`、`redaction`），界面按它查自己的词表。
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error(
-        "the configuration is schema version {found}, and this twcore supports up to {supported}. Upgrade the app, or put the configuration back in the older form"
-    )]
+    #[error("{}", self.msg())]
     SchemaTooNew { found: u32, supported: u32 },
-    #[error(
-        "the configuration has no gateway key under `clients`, so every request is refused. One is generated on first start"
-    )]
+    #[error("{}", self.msg())]
     NoClients,
-    #[error(
-        "the upstream name {0} appears twice. Routing rules refer to an upstream by name, so names have to be unique"
-    )]
+    #[error("{}", self.msg())]
     DuplicateProvider(String),
-    #[error("the gateway key name {0} appears twice")]
+    #[error("{}", self.msg())]
     DuplicateClient(String),
-    #[error(
-        "gateway keys `{0}` and `{1}` have the same value. The gateway tells clients apart by key, so the values have to be unique"
-    )]
+    #[error("{}", self.msg())]
     DuplicateKey(String, String),
-    #[error("default_key points at gateway key `{0}`, which does not exist")]
+    #[error("{}", self.msg())]
     MissingDefaultKey(String),
-    #[error(
-        "the default gateway key `{0}` is disabled. Every client that has not been pointed at the gateway explicitly uses it, and disabling it breaks all of them"
-    )]
+    #[error("{}", self.msg())]
     DisabledDefaultKey(String),
-    #[error(
-        "gateway keys `{0}` and `{1}` both say they were made for client `{2}`. A client has exactly one"
-    )]
+    #[error("{}", self.msg())]
     DuplicateClientKey(String, String, String),
-    #[error("the endpoint of upstream `{name}` is neither http nor https: {url}")]
+    #[error("{}", self.msg())]
     BadBaseUrl { name: String, url: String },
-    #[error("the value of gateway key `{name}` is empty")]
+    #[error("{}", self.msg())]
     EmptyKey { name: String },
-    #[error(
-        "gateway key `{name}` has max_concurrent: 0, so every request made with it would wait forever. Leave max_concurrent out for no limit"
-    )]
+    #[error("{}", self.msg())]
     ZeroConcurrency { name: String },
-    #[error("the routing configuration is wrong: {0}")]
+    #[error("{}", self.msg())]
     Routing(#[from] tw_engine::RouteError),
-    #[error(
-        "`{0}` is the name of both an upstream and a group, so a rule's `to` cannot say which one it means. Rename one of them"
-    )]
+    #[error("{}", self.msg())]
     NameCollision(String),
-    #[error("`{entry}` in listen.gateway.allow_from is wrong: {reason}")]
-    BadCidr { entry: String, reason: String },
-    #[error("the credential of upstream `{name}`: {source}")]
+    #[error("{}", self.msg())]
+    BadCidr { entry: String },
+    #[error("{}", self.msg())]
     Credential {
         name: String,
         source: crate::CredentialError,
     },
-    #[error("{0}")]
+    #[error(transparent)]
     Pricing(#[from] tw_pricing::SheetError),
-    #[error("upstream `{provider}` uses price sheet `{sheet}`, which does not exist")]
+    #[error("{}", self.msg())]
     UnknownPriceSheet { provider: String, sheet: String },
-    #[error(
-        "the scope of upstream `{name}` (models_only) is empty, so it offers no model at all. To pause the upstream, disable it instead (disabled: true)"
-    )]
+    #[error("{}", self.msg())]
     EmptyModelsOnly { name: String },
-    #[error("the scope of upstream `{name}` (models_only) has an empty entry")]
+    #[error("{}", self.msg())]
     BlankModelsOnly { name: String },
-    #[error(
-        "the {what} name `{name}` starts with __, which is reserved for built-ins. Use a different name"
-    )]
+    #[error("{}", self.msg())]
     ReservedName { what: &'static str, name: String },
-    #[error("a custom {what} rule has no name")]
+    #[error("{}", self.msg())]
     EmptyRuleName { what: &'static str },
-    #[error("the custom {what} rule name `{name}` appears twice")]
+    #[error("{}", self.msg())]
     DuplicateRuleName { what: &'static str, name: String },
-    #[error(
-        "the pattern of custom {what} rule `{name}` is not a valid regular expression: {detail}"
-    )]
+    #[error("{}", self.msg())]
+    EmptyRulePattern { what: &'static str, name: String },
+    /// `detail` 是正则库的原话
+    #[error("{}", self.msg())]
     BadRulePattern {
         what: &'static str,
         name: String,
         detail: String,
     },
-    #[error("security.{guard} names `{id}`, which is not a built-in rule")]
+    #[error("{}", self.msg())]
     UnknownRule { guard: &'static str, id: String },
+}
+
+impl ValidationError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        use ValidationError::*;
+        match self {
+            SchemaTooNew { found, supported } => msg!(
+                "config.schema_too_new", found = found, supported = supported =>
+                "the configuration is schema version {found}, and this twcore supports up to \
+                 {supported}. Upgrade the app, or put the configuration back in the older form"
+            ),
+            NoClients => msg!(
+                "config.no_clients" =>
+                "the configuration has no gateway key under `clients`, so every request is \
+                 refused. One is generated on first start"
+            ),
+            DuplicateProvider(name) => msg!(
+                "config.duplicate_upstream", upstream = name =>
+                "the upstream name {upstream} appears twice. Routing rules refer to an upstream by \
+                 name, so names have to be unique"
+            ),
+            DuplicateClient(name) => msg!(
+                "config.duplicate_key_name", key = name =>
+                "the gateway key name {key} appears twice"
+            ),
+            DuplicateKey(a, b) => msg!(
+                "config.duplicate_key_value", key = a, other = b =>
+                "gateway keys `{key}` and `{other}` have the same value. The gateway tells clients \
+                 apart by key, so the values have to be unique"
+            ),
+            MissingDefaultKey(key) => msg!(
+                "config.default_key_missing", key = key =>
+                "default_key points at gateway key `{key}`, which does not exist"
+            ),
+            DisabledDefaultKey(key) => msg!(
+                "config.default_key_disabled", key = key =>
+                "the default gateway key `{key}` is disabled. Every client that has not been \
+                 pointed at the gateway explicitly uses it, and disabling it breaks all of them"
+            ),
+            DuplicateClientKey(a, b, client) => msg!(
+                "config.duplicate_client_key", key = a, other = b, client = client =>
+                "gateway keys `{key}` and `{other}` both say they were made for client `{client}`. \
+                 A client has exactly one"
+            ),
+            BadBaseUrl { name, url } => msg!(
+                "config.bad_base_url", upstream = name, url = url =>
+                "the endpoint of upstream `{upstream}` is neither http nor https: {url}"
+            ),
+            EmptyKey { name } => msg!(
+                "config.empty_key", key = name =>
+                "the value of gateway key `{key}` is empty"
+            ),
+            ZeroConcurrency { name } => msg!(
+                "config.zero_concurrency", key = name =>
+                "gateway key `{key}` has max_concurrent: 0, so every request made with it would \
+                 wait forever. Leave max_concurrent out for no limit"
+            ),
+            // 路由那几句本身就说清了是哪条规则、哪个组，前面不用再垫一句
+            Routing(e) => e.msg(),
+            NameCollision(name) => msg!(
+                "config.name_collision", name = name =>
+                "`{name}` is the name of both an upstream and a group, so a rule's `to` cannot say \
+                 which one it means. Rename one of them"
+            ),
+            BadCidr { entry } => msg!(
+                "config.bad_allow_from", entry = entry =>
+                "`{entry}` in listen.gateway.allow_from is wrong: not a valid IP address or CIDR; \
+                 it is written as 192.168.0.0/16"
+            ),
+            // **码还是凭据那一条的码，多带一个 `upstream`。**同一句话在编辑上游的
+            // 对话框里不用说是哪个上游（就是正在改的那个），在整份配置的校验里
+            // 必须说 —— 为此给每一条再造一个「带上游名」的码，码表就翻了一倍
+            Credential { name, source } => {
+                let mut m = source.msg();
+                m.text = format!("the credential of upstream `{name}`: {}", m.text);
+                m.args.insert("upstream".into(), name.clone());
+                m
+            }
+            Pricing(e) => e.msg(),
+            UnknownPriceSheet { provider, sheet } => msg!(
+                "config.unknown_price_sheet", upstream = provider, sheet = sheet =>
+                "upstream `{upstream}` uses price sheet `{sheet}`, which does not exist"
+            ),
+            EmptyModelsOnly { name } => msg!(
+                "config.empty_models_only", upstream = name =>
+                "the scope of upstream `{upstream}` (models_only) is empty, so it offers no model \
+                 at all. To pause the upstream, disable it instead (disabled: true)"
+            ),
+            BlankModelsOnly { name } => msg!(
+                "config.blank_models_only", upstream = name =>
+                "the scope of upstream `{upstream}` (models_only) has an empty entry"
+            ),
+            ReservedName { what, name } => msg!(
+                "config.reserved_name", what = what, name = name =>
+                "the {what} name `{name}` starts with __, which is reserved for built-ins. Use a \
+                 different name"
+            ),
+            EmptyRuleName { what } => msg!(
+                "config.rule_name_empty", what = what =>
+                "a custom {what} rule has no name"
+            ),
+            DuplicateRuleName { what, name } => msg!(
+                "config.rule_name_taken", what = what, name = name =>
+                "the custom {what} rule name `{name}` appears twice"
+            ),
+            EmptyRulePattern { what, name } => msg!(
+                "config.rule_pattern_empty", what = what, name = name =>
+                "the pattern of custom {what} rule `{name}` is empty"
+            ),
+            BadRulePattern { what, name, detail } => msg!(
+                "config.rule_pattern_bad", what = what, name = name, detail = detail =>
+                "the pattern of custom {what} rule `{name}` is not a valid regular expression: \
+                 {detail}"
+            ),
+            UnknownRule { guard, id } => msg!(
+                "config.unknown_rule", guard = guard, rule = id =>
+                "security.{guard} names `{rule}`, which is not a built-in rule"
+            ),
+        }
+    }
 }
 
 pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
@@ -229,8 +337,6 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             let _ = e;
             return Err(ValidationError::BadCidr {
                 entry: entry.clone(),
-                reason: "not a valid IP address or CIDR; it is written as 192.168.0.0/16"
-                    .to_string(),
             });
         }
     }
@@ -303,18 +409,20 @@ fn check_rules<'a>(
                 name: name.to_string(),
             });
         }
-        let bad = |detail: String| ValidationError::BadRulePattern {
-            what,
-            name: name.to_string(),
-            detail,
-        };
         if pattern.is_empty() {
-            return Err(bad("the pattern is empty".to_string()));
+            return Err(ValidationError::EmptyRulePattern {
+                what,
+                name: name.to_string(),
+            });
         }
         regex::RegexBuilder::new(pattern)
             .size_limit(1 << 20)
             .build()
-            .map_err(|e| bad(e.to_string()))?;
+            .map_err(|e| ValidationError::BadRulePattern {
+                what,
+                name: name.to_string(),
+                detail: e.to_string(),
+            })?;
     }
     Ok(())
 }
@@ -397,7 +505,7 @@ mod tests {
     #[test]
     fn a_key_written_as_a_mapping_says_what_to_write_instead() {
         let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    key:\n      whatever: 1\n";
-        let e = crate::try_parse(y).unwrap_err().message;
+        let e = crate::try_parse(y).unwrap_err().message.text;
         assert!(e.contains("a string"), "没说该写成什么：{e}");
     }
 
@@ -405,7 +513,7 @@ mod tests {
     fn an_oauth_typo_lets_serde_say_which_field() {
         // **serde 自己的话比我们能补的任何一句都准**
         let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    oauth:\n      refresh: r\n      endpoint: https://a/token\n      refresh_befor: 5m\n";
-        let e = crate::try_parse(y).unwrap_err().message;
+        let e = crate::try_parse(y).unwrap_err().message.text;
         assert!(e.contains("refresh_befor"), "{e}");
         assert!(e.contains("refresh_before"), "没提示正确的拼法：{e}");
     }
@@ -413,7 +521,7 @@ mod tests {
     #[test]
     fn an_oauth_missing_a_required_field_says_which_one() {
         let y = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: p\n    base_url: https://api.example.com\n    oauth:\n      endpoint: https://a/token\n";
-        let e = crate::try_parse(y).unwrap_err().message;
+        let e = crate::try_parse(y).unwrap_err().message.text;
         assert!(e.contains("refresh"), "{e}");
     }
 
@@ -622,5 +730,204 @@ mod tests {
                 validate(&bad)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+    use crate::CredentialError;
+    use crate::edit::EditError;
+    use crate::store::StoreError;
+
+    /// 码非空、带层名、英文就是 `Display`、同一个枚举里不重复。
+    fn check(prefix: &str, all: &[(Msg, String)]) {
+        let mut seen = std::collections::HashSet::new();
+        for (m, display) in all {
+            assert!(m.code.starts_with(prefix), "{m:?}");
+            assert!(!m.text.is_empty(), "{m:?}");
+            assert_eq!(&m.text, display, "{m:?}");
+            assert!(seen.insert(m.code.clone()), "码重复了：{}", m.code);
+        }
+    }
+
+    #[test]
+    fn every_credential_error_has_its_own_code() {
+        use CredentialError::*;
+        let all = [
+            EmptyKey,
+            KeyAndOauth,
+            EmptyOauth,
+            ClaudeSubscription,
+            GoogleSubscription,
+            ChatgptWithoutLogin,
+            IdentityHeader("h".into()),
+            TooManyHeaders,
+            BadHeaderName("h".into()),
+            ReservedHeader("h".into()),
+            DuplicateHeader("h".into()),
+            BadHeaderValue("h".into()),
+            UnknownPlaceholder {
+                name: "h".into(),
+                placeholder: "{{x}}".into(),
+            },
+            TokenWithoutOauth("h".into()),
+            KeyAndAuthHeader("h".into()),
+            OauthAndAuthHeader("h".into()),
+            NoToken,
+            Env("the environment variable X is not set".into()),
+        ];
+        check(
+            "config.credential.",
+            &all.iter()
+                .map(|e| (e.msg(), e.to_string()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn every_store_and_edit_error_has_its_own_code() {
+        let path = std::path::PathBuf::from("/x/config.yaml");
+        let store = [
+            StoreError::Io {
+                path: path.clone(),
+                source: std::io::Error::other("denied"),
+            },
+            StoreError::Missing { path },
+            StoreError::Conflict {
+                expected: "a".into(),
+                current: "b".into(),
+            },
+        ];
+        check(
+            "config.store.",
+            &store
+                .iter()
+                .map(|e| (e.msg(), e.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        let edit = [
+            EditError::NameTaken {
+                what: "proxy",
+                name: "hk".into(),
+            },
+            EditError::NotFound {
+                what: "proxy",
+                name: "hk".into(),
+            },
+            EditError::Parse("x".into()),
+            EditError::Multiline,
+            EditError::Nameless { what: "proxy" },
+            EditError::Unwritable("x".into()),
+            EditError::SelfCheck("x".into()),
+        ];
+        check(
+            "config.edit.",
+            &edit
+                .iter()
+                .map(|e| (e.msg(), e.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        // 包着的那一层直接用它自己的码
+        let e = EditError::Yaml(tw_yaml::PatchError::NotScalar("a".into()));
+        assert_eq!(e.msg().code, "yaml.not_scalar");
+    }
+
+    #[test]
+    fn every_validation_error_has_its_own_code() {
+        use ValidationError::*;
+        let all = [
+            SchemaTooNew {
+                found: 9,
+                supported: 1,
+            },
+            NoClients,
+            DuplicateProvider("a".into()),
+            DuplicateClient("k".into()),
+            DuplicateKey("k".into(), "j".into()),
+            MissingDefaultKey("k".into()),
+            DisabledDefaultKey("k".into()),
+            DuplicateClientKey("k".into(), "j".into(), "codex".into()),
+            BadBaseUrl {
+                name: "a".into(),
+                url: "ftp://x".into(),
+            },
+            EmptyKey { name: "k".into() },
+            ZeroConcurrency { name: "k".into() },
+            NameCollision("a".into()),
+            BadCidr { entry: "x".into() },
+            UnknownPriceSheet {
+                provider: "a".into(),
+                sheet: "s".into(),
+            },
+            EmptyModelsOnly { name: "a".into() },
+            BlankModelsOnly { name: "a".into() },
+            ReservedName {
+                what: "upstream",
+                name: "__a".into(),
+            },
+            EmptyRuleName { what: "redaction" },
+            DuplicateRuleName {
+                what: "redaction",
+                name: "r".into(),
+            },
+            EmptyRulePattern {
+                what: "redaction",
+                name: "r".into(),
+            },
+            BadRulePattern {
+                what: "redaction",
+                name: "r".into(),
+                detail: "unclosed group".into(),
+            },
+            UnknownRule {
+                guard: "redact",
+                id: "x".into(),
+            },
+        ];
+        check(
+            "config.",
+            &all.iter()
+                .map(|e| (e.msg(), e.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        // 包着的那几层：码是里面那一句的，不是一个套话
+        assert_eq!(
+            Routing(tw_engine::RouteError::EmptyGroup("g".into()))
+                .msg()
+                .code,
+            "engine.empty_group"
+        );
+        assert_eq!(
+            Pricing(tw_pricing::SheetError::EmptyName).msg().code,
+            "pricing.sheet.empty_name"
+        );
+        // 凭据那一条多带一个上游名，英文前面也补上
+        let e = Credential {
+            name: "官方".into(),
+            source: CredentialError::EmptyKey,
+        };
+        let m = e.msg();
+        assert_eq!(m.code, "config.credential.empty_key");
+        assert_eq!(m.arg("upstream"), "官方");
+        assert_eq!(m.text, e.to_string());
+        assert!(m.text.contains("官方"), "{m:?}");
+    }
+
+    #[test]
+    fn a_rejected_config_says_which_stage_and_line_around_serdes_words() {
+        // 语法错：serde 的原话翻不了，外面那一层（哪一关、第几行）带码
+        let r =
+            crate::try_parse("version: 1\nclients:\n  - name: \"c\n    key: tw-k\n").unwrap_err();
+        let m = r.msg();
+        assert_eq!(m.code, "config.rejected_at", "{m:?}");
+        assert_eq!(m.arg("stage"), "syntax");
+        assert!(
+            !m.arg("line").is_empty() && !m.arg("detail").is_empty(),
+            "{m:?}"
+        );
+        // 语义错：直接就是那一句
+        let r = crate::try_parse("version: 1\n").unwrap_err();
+        assert_eq!(r.msg().code, "config.no_clients");
     }
 }

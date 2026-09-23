@@ -260,7 +260,7 @@ async fn events(
             q.before,
             q.limit.unwrap_or(100).clamp(1, PAGE_MAX),
         )
-        .map_err(crate::internal)?;
+        .map_err(crate::records)?;
     Ok(Json(tw_api::SecurityEventsPage { events, more }))
 }
 

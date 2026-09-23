@@ -38,7 +38,7 @@ use tw_config::Protocol;
 use tw_config::history::Origin;
 
 use crate::{ControlState, Fail, fail};
-use tw_types::msg;
+use tw_types::{Msg, msg};
 
 /// 登录要在多久之内完成。平台给的期限更短就按它的
 const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
@@ -228,7 +228,7 @@ impl Want {
             return Err(fail(
                 StatusCode::CONFLICT,
                 msg!(
-                    "control.name_taken_not_zai", name = name =>
+                    "control.name_taken_not_zai", name = &name =>
                     "There is already an upstream named `{name}`, and it is not an account of this \
                      service. Use a different name."
                 ),
@@ -308,12 +308,7 @@ async fn init(s: &ControlState, want: &Want, http: &reqwest::Client) -> Result<F
         Some(json!({ "provider": want.family.slug() })),
     )
     .await
-    .map_err(|e| {
-        fail(
-            StatusCode::BAD_GATEWAY,
-            msg!("control.upstream_call_failed", detail = e => "{detail}"),
-        )
-    })?;
+    .map_err(|e| fail(StatusCode::BAD_GATEWAY, e.msg()))?;
     let str_of = |k: &str| {
         d.get(k)
             .and_then(|v| v.as_str())
@@ -381,7 +376,7 @@ async fn await_login(s: ControlState, want: Want, http: reqwest::Client, flow: F
         .await
         {
             Ok(d) => d,
-            Err(why) => return settle(&s, &flow.id, Err(why)),
+            Err(why) => return settle(&s, &flow.id, Err(why.into())),
         };
         match d.get("status").and_then(|v| v.as_str()) {
             Some("pending") => {
@@ -602,8 +597,10 @@ async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Stri
             if let Some(e) = existing
                 && e.base_url.trim_end_matches('/') != upstream.trim_end_matches('/')
             {
-                return Err(crate::resources::invalid(format!(
-                    "there is already an upstream named `{name}`, and it is not an account of this service"
+                return Err(crate::resources::invalid(msg!(
+                    "control.name_taken_not_zai", name = &name =>
+                    "There is already an upstream named `{name}`, and it is not an account of this \
+                     service. Use a different name."
                 )));
             }
             let mut p = existing.cloned().unwrap_or_else(|| tw_config::Provider {
@@ -619,7 +616,7 @@ async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Stri
             // 这类上游从不用 OAuth。上一次登录留下的（不该有）也一并清掉
             p.oauth = None;
             p.check_credential()
-                .map_err(|e| crate::resources::invalid(e.to_string()))?;
+                .map_err(|e| crate::resources::invalid(e.msg()))?;
             let current = existing.map(|_| name.as_str());
             Ok(tw_config::edit::upsert(
                 text,
@@ -706,12 +703,7 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> Result<Json<tw_api::ZaiLoginStatus>, Fail> {
     let mut status = {
-        let g = s.zai.current.lock().map_err(|e| {
-            fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                msg!("control.internal", detail = e => "{detail}"),
-            )
-        })?;
+        let g = s.zai.current.lock().map_err(crate::internal)?;
         let c = g.as_ref().filter(|c| c.status.id == id).ok_or_else(|| {
             fail(
                 StatusCode::NOT_FOUND,
@@ -742,6 +734,75 @@ async fn cancel(
 ///
 /// 出错的话里只有**这一步在做什么**，没有地址：建 key 那几个地址的路径里带着密钥的
 /// id，而错误会进日志、也会显示给用户。
+/// 调一次账号平台的接口没成。
+///
+/// **结构留着，句子等到要说的时候再拼。**登录流程里的那些失败最后是登录
+/// 状态里的一行字（`to_string`，带着「在做哪一步」）；开始登录那一步是一条
+/// 控制面的错误，要带码（[`CallError::msg`]）。先拼成英文再往外发的话，
+/// 后一种就只剩把整句塞进 `{detail}` 一条路。
+#[derive(Debug)]
+struct CallError {
+    /// 在做哪一步，英文词组，只进 `Display`
+    doing: String,
+    why: CallFailure,
+}
+
+#[derive(Debug)]
+enum CallFailure {
+    /// 连不上、超时。数据面那句自己带码
+    Unreachable(Msg),
+    Status {
+        status: u16,
+        body: String,
+    },
+    NotJson {
+        body: String,
+    },
+    Refused {
+        why: String,
+    },
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let doing = &self.doing;
+        match &self.why {
+            CallFailure::Unreachable(m) => write!(f, "{doing} failed: {m}"),
+            CallFailure::Status { status, body } => write!(f, "{doing} answered {status}: {body}"),
+            CallFailure::NotJson { body } => write!(f, "{doing} did not answer JSON: {body}"),
+            CallFailure::Refused { why } => write!(f, "{doing} was refused: {why}"),
+        }
+    }
+}
+
+impl From<CallError> for String {
+    fn from(e: CallError) -> Self {
+        e.to_string()
+    }
+}
+
+impl CallError {
+    /// 带码的说法。**不说在做哪一步** —— 那是一个英文词组，而用得上这句话的
+    /// 只有开始登录那一处，界面自己知道那是哪一步。
+    fn msg(&self) -> Msg {
+        match &self.why {
+            CallFailure::Unreachable(m) => m.clone(),
+            CallFailure::Status { status, body } => msg!(
+                "control.account_service_status", status = status, detail = body =>
+                "The account service answered {status}: {detail}"
+            ),
+            CallFailure::NotJson { body } => msg!(
+                "control.account_service_not_json", detail = body =>
+                "The account service did not answer JSON: {detail}"
+            ),
+            CallFailure::Refused { why } => msg!(
+                "control.account_service_refused", why = why =>
+                "The account service refused the request: {why}"
+            ),
+        }
+    }
+}
+
 async fn data(
     http: &reqwest::Client,
     method: reqwest::Method,
@@ -749,7 +810,11 @@ async fn data(
     doing: &str,
     auth: Option<&str>,
     body: Option<Value>,
-) -> Result<Value, String> {
+) -> Result<Value, CallError> {
+    let fail = |why| CallError {
+        doing: doing.to_string(),
+        why,
+    };
     let mut req = http
         .request(method, url)
         .timeout(API_TIMEOUT)
@@ -762,22 +827,20 @@ async fn data(
         req = req.json(&body);
     }
     let resp = req.send().await.map_err(|e| {
-        format!(
-            "{doing} failed: {}",
-            tw_gateway::forward::map_reqwest_error(e).message()
-        )
+        fail(CallFailure::Unreachable(
+            tw_gateway::forward::map_reqwest_error(e).detail,
+        ))
     })?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!(
-            "{doing} answered {}: {}",
-            status.as_u16(),
-            brief(&text)
-        ));
+        return Err(fail(CallFailure::Status {
+            status: status.as_u16(),
+            body: brief(&text),
+        }));
     }
     let v: Value = serde_json::from_str(&text)
-        .map_err(|_| format!("{doing} did not answer JSON: {}", brief(&text)))?;
+        .map_err(|_| fail(CallFailure::NotJson { body: brief(&text) }))?;
     if !business_ok(v.get("code")) {
         let why = v
             .get("msg")
@@ -785,7 +848,9 @@ async fn data(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .unwrap_or("no reason given");
-        return Err(format!("{doing} was refused: {why}"));
+        return Err(fail(CallFailure::Refused {
+            why: why.to_string(),
+        }));
     }
     Ok(v.get("data").cloned().unwrap_or(Value::Null))
 }
@@ -813,12 +878,9 @@ fn client_for(s: &ControlState, want: &Want) -> Result<reqwest::Client, Fail> {
         proxy: want.proxy.clone(),
         ..Default::default()
     };
-    tw_gateway::client_for_provider(&s.config(), &route).map_err(|e| {
-        fail(
-            StatusCode::BAD_GATEWAY,
-            msg!("control.upstream_call_failed", detail = e.message().to_string() => "{detail}"),
-        )
-    })
+    // 代理没定义、密码读不到这些，数据面那句自己带码
+    tw_gateway::client_for_provider(&s.config(), &route)
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, e.detail))
 }
 
 fn announce(
@@ -893,5 +955,50 @@ mod tests {
             Some(("o1".to_string(), "p1".to_string()))
         );
         assert_eq!(pick_place(&json!({"organizations": []})), None);
+    }
+}
+
+#[cfg(test)]
+mod call_error_codes {
+    use super::*;
+
+    /// 开始登录那一步的失败带码发出去；登录状态里那一行照旧说在做哪一步。
+    #[test]
+    fn a_failed_call_has_a_code_and_still_says_what_it_was_doing() {
+        let e = |why| CallError {
+            doing: "asking for an authorization address".into(),
+            why,
+        };
+        let unreachable = msg!("gw.upstream.timeout" => "timed out");
+        let all = [
+            (
+                e(CallFailure::Unreachable(unreachable.clone())),
+                "gw.upstream.timeout",
+            ),
+            (
+                e(CallFailure::Status {
+                    status: 500,
+                    body: "x".into(),
+                }),
+                "control.account_service_status",
+            ),
+            (
+                e(CallFailure::NotJson { body: "x".into() }),
+                "control.account_service_not_json",
+            ),
+            (
+                e(CallFailure::Refused { why: "x".into() }),
+                "control.account_service_refused",
+            ),
+        ];
+        for (err, code) in all {
+            assert_eq!(err.msg().code, code);
+            assert!(!err.msg().text.is_empty());
+            let line: String = err.into();
+            assert!(
+                line.starts_with("asking for an authorization address"),
+                "{line}"
+            );
+        }
     }
 }

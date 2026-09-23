@@ -17,6 +17,8 @@
 //! 这个模块只负责 ①②③ 并把失败说清楚。④⑤ 归数据面，因为运行时对象
 //! （provider 池、Client、规则树）是它的东西。
 
+use tw_types::{Msg, msg};
+
 use crate::{Config, ValidationError, validate};
 
 /// 卡在哪一关。**分开是为了让用户知道该看哪儿**：语法错要看那一行，
@@ -54,7 +56,13 @@ impl Stage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rejected {
     pub stage: Stage,
-    pub message: String,
+    /// 为什么。语义错是带码的一句话；语法和字段错是 serde 的原话，码是
+    /// [`UNPARSABLE`]、句子只有 `{detail}` —— 那句话我们翻不了，给人看时
+    /// 由 [`Rejected::msg`] 在外面补上哪一关、哪一行。
+    ///
+    /// **装箱**：它是 `try_parse` 的 `Err` 侧，而一条 `Msg` 有三个堆上的字段，
+    /// 不装箱的话成功那一路每次都要抬着这么大一块走。
+    pub message: Box<Msg>,
     /// 1 起。**只有语法和字段错误有行号** —— 语义错误是整份配置的
     /// 问题，硬指一行只会误导。
     pub line: Option<usize>,
@@ -70,6 +78,34 @@ impl std::fmt::Display for Rejected {
             write!(f, " (line {l})")?;
         }
         write!(f, ": {}", self.message)
+    }
+}
+
+/// serde 读不进来时 [`Rejected::message`] 的码。
+pub const UNPARSABLE: &str = "config.unparsable";
+
+impl Rejected {
+    /// 给人看的那句话，带码。
+    ///
+    /// **语义错直接就是那一句**：它说清了是哪个上游、哪条规则，前面再垫
+    /// 一句「语义错误」只会把人要找的那半句挤到后面去。语法和字段错的
+    /// 原话是 serde 的英文，能翻的只有外面那一层：哪一关、第几行。
+    pub fn msg(&self) -> Msg {
+        if self.message.code != UNPARSABLE {
+            return (*self.message).clone();
+        }
+        let stage = self.stage.slug();
+        let detail = &self.message.text;
+        match self.line {
+            Some(line) => msg!(
+                "config.rejected_at", stage = stage, line = line, detail = detail =>
+                "{stage} error (line {line}): {detail}"
+            ),
+            None => msg!(
+                "config.rejected", stage = stage, detail = detail =>
+                "{stage} error: {detail}"
+            ),
+        }
     }
 }
 
@@ -92,7 +128,7 @@ pub fn try_parse(text: &str) -> Result<Config, Rejected> {
                 } else {
                     Stage::Syntax
                 },
-                message: e.to_string(),
+                message: Box::new(msg!(UNPARSABLE, detail = e => "{detail}")),
                 line,
                 column: loc.as_ref().map(|l| l.column()),
                 excerpt: line.and_then(|l| excerpt_of(text, l)),
@@ -102,7 +138,7 @@ pub fn try_parse(text: &str) -> Result<Config, Rejected> {
     if let Err(e) = validate(&cfg) {
         return Err(Rejected {
             stage: stage_of(&e),
-            message: e.to_string(),
+            message: Box::new(e.msg()),
             // 语义错误没有一个诚实的行号。**编一个出来比不给更糟** ——
             // 用户会盯着那一行看半天，而问题在别处。
             line: None,
@@ -179,7 +215,7 @@ mod tests {
         // serde 的「missing field `clients`」说不出下一步做什么。
         let r = try_parse("version: 1\n").unwrap_err();
         assert_eq!(r.stage, Stage::Semantics, "{r:?}");
-        assert!(r.message.contains("generated on first start"), "{r:?}");
+        assert!(r.message.text.contains("generated on first start"), "{r:?}");
     }
 
     #[test]
@@ -188,7 +224,7 @@ mod tests {
         let bad = "version: 1\nclients:\n  - name: c\n    kye: tw-k\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Schema, "{r:?}");
-        assert!(r.message.contains("kye"), "{r:?}");
+        assert!(r.message.text.contains("kye"), "{r:?}");
         assert_eq!(r.line, Some(4), "{r:?}");
     }
 
@@ -199,7 +235,7 @@ mod tests {
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Semantics, "{r:?}");
         assert!(r.line.is_none(), "语义错不该编行号：{r:?}");
-        assert!(r.message.contains("appears twice"), "{r:?}");
+        assert!(r.message.text.contains("appears twice"), "{r:?}");
     }
 
     #[test]
@@ -209,7 +245,7 @@ mod tests {
         let bad = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\nroutes:\n  - name: 默认\n    rules:\n      - name: r\n        to: 已经删掉的组\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Semantics);
-        assert!(r.message.contains("已经删掉的组"), "{r:?}");
+        assert!(r.message.text.contains("已经删掉的组"), "{r:?}");
     }
 
     #[test]
@@ -217,7 +253,7 @@ mod tests {
         let bad = "version: 999\nclients:\n  - name: c\n    key: tw-k\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Schema);
-        assert!(r.message.contains("Upgrade the app"), "{r:?}");
+        assert!(r.message.text.contains("Upgrade the app"), "{r:?}");
     }
 
     #[test]

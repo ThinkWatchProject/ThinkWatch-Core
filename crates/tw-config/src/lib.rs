@@ -839,7 +839,7 @@ pub fn patch_oauth_tokens(
     // 而用户下一次启动才撞上它（「先校验再写」同一条）。
     let re = try_parse(&out).map_err(|r| RotateError::Broke {
         provider: provider.to_string(),
-        why: r.message,
+        why: r.message.text,
     })?;
     let ok = re
         .providers

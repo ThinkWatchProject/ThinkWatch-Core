@@ -31,10 +31,16 @@ async fn save(
     // `bind` 的写法和配置文件里一样，按同一套规则读 —— 界面和手写的
     // 配置不该有两种说法
     let bind: tw_config::Bind =
-        serde_yaml_ng::from_value(Value::String(req.bind.trim().to_string())).map_err(|e| {
+        serde_yaml_ng::from_value(Value::String(req.bind.trim().to_string())).map_err(|_| {
             fail(
                 StatusCode::BAD_REQUEST,
-                msg!("control.listen.bad_bind", detail = e => "{detail}"),
+                // 交进来的是一个字符串，**读不成 `Bind` 只有一种可能**：四种写法
+                // 都不是。那句话是 `Bind` 自己的 serde 报错，这里照着说一遍、带上码
+                msg!(
+                    "control.listen.bind_invalid", bind = req.bind.trim() =>
+                    "bind takes loopback, all, the name of an interface such as en0, or an \
+                     address such as 192.168.1.5; it reads {bind}"
+                ),
             )
         })?;
     if req.port == 0 {

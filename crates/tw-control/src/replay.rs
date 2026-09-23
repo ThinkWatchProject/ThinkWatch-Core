@@ -42,21 +42,12 @@ fn stored_body(
     g: &tw_store::Recorder,
     id: i64,
 ) -> Result<(tw_store::db::RequestRow, Vec<u8>), Fail> {
-    let row = g
-        .db()
-        .get(id)
-        .map_err(|e| {
-            fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                msg!("control.internal", detail = e => "{detail}"),
-            )
-        })?
-        .ok_or_else(|| {
-            fail(
-                StatusCode::NOT_FOUND,
-                msg!("control.request_not_found", id = id => "There is no request {id}."),
-            )
-        })?;
+    let row = g.db().get(id).map_err(crate::records)?.ok_or_else(|| {
+        fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.request_not_found", id = id => "There is no request {id}."),
+        )
+    })?;
     let raw = g
         .blobs()
         .get(row.at_ms, id, tw_store::Which::Request)
@@ -212,11 +203,9 @@ pub async fn run(
     let mut r = http.post(&url).header("content-type", "application/json");
     r = tw_gateway::forward::apply_headers(r, &headers);
     let resp = r.body(body).send().await.map_err(|e| {
+        // 连不上、超时这些，数据面已经有带码的说法了
         let why = tw_gateway::forward::map_reqwest_error(e);
-        fail(
-            StatusCode::BAD_GATEWAY,
-            msg!("control.upstream_call_failed", detail = why.message() => "{detail}"),
-        )
+        fail(StatusCode::BAD_GATEWAY, why.detail)
     })?;
 
     let status = resp.status().as_u16();
@@ -263,21 +252,12 @@ pub async fn fixture(
         )
     })?;
     let g = store.lock().await;
-    let row = g
-        .db()
-        .get(id)
-        .map_err(|e| {
-            fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                msg!("control.internal", detail = e => "{detail}"),
-            )
-        })?
-        .ok_or_else(|| {
-            fail(
-                StatusCode::NOT_FOUND,
-                msg!("control.request_not_found", id = id => "There is no request {id}."),
-            )
-        })?;
+    let row = g.db().get(id).map_err(crate::records)?.ok_or_else(|| {
+        fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.request_not_found", id = id => "There is no request {id}."),
+        )
+    })?;
     let body = |which| -> String {
         g.blobs()
             .get(row.at_ms, id, which)
@@ -332,10 +312,5 @@ pub async fn fixture(
             body: resp,
         },
     );
-    serde_yaml_ng::to_string(&f).map_err(|e| {
-        fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            msg!("control.internal", detail = e => "{detail}"),
-        )
-    })
+    serde_yaml_ng::to_string(&f).map_err(crate::internal)
 }
