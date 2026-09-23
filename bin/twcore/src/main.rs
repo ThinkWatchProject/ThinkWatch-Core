@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod lockfile;
+mod proc;
 
 use lockfile::{LockFile, LockOutcome};
 
@@ -856,7 +857,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    if !parent_alive(ppid) {
+                    if !proc::alive(ppid) {
                         tracing::info!(ppid, "the parent exited; exiting with it");
                         std::process::exit(0);
                     }
@@ -967,18 +968,6 @@ fn build_store(
         events,
         rx,
     ))
-}
-
-fn parent_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
 }
 
 async fn shutdown_signal() {

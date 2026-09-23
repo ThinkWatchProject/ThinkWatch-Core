@@ -29,7 +29,7 @@ impl LockFile {
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(pid) = text.trim().parse::<u32>()
             && pid != std::process::id()
-            && process_alive(pid)
+            && crate::proc::alive(pid)
         {
             return Ok(LockOutcome::AlreadyRunning { pid });
         }
@@ -45,23 +45,6 @@ impl Drop for LockFile {
     fn drop(&mut self) {
         // 尽力而为。删不掉也无所谓 —— 下次启动的僵尸检测会认出它。
         let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// 这个 pid 还活着吗。
-///
-/// `kill(pid, 0)` 是 POSIX 上的标准问法：不发信号，只做权限和存在性检查。
-fn process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    unsafe {
-        // ESRCH 表示进程不存在；EPERM 表示存在但不归我们管（也算活着）。
-        libc::kill(pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
     }
 }
 
