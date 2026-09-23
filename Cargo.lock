@@ -2817,6 +2817,7 @@ dependencies = [
  "tw-secret",
  "tw-types",
  "tw-yaml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
