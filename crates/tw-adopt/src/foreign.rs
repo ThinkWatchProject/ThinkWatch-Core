@@ -421,10 +421,26 @@ mod tests {
         assert!(strays.is_empty(), "留下了临时文件：{strays:?}");
     }
 
-    // **unix 专有。**Windows 上建符号链接要特权，跟随的语义也不一样 ——
-    // `resolve` 在那边走的是另一条分支（见 `cfg(not(unix))`），而那条分支
-    // 眼下没有测试覆盖，要等接管整体支持 Windows 时一起补。
-    #[cfg(unix)]
+    /// 建一条指向文件的符号链接。**建不了返回 `false`**：Windows 上这要
+    /// 管理员或开了开发者模式，普通账号跑测试会拿到 `ERROR_PRIVILEGE_NOT_HELD`。
+    /// 那是机器的限制，不是被测代码的错；CI 的 Windows 机器是管理员，会真跑。
+    fn symlink_to_file(real: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::symlink(real, link);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::symlink_file(real, link);
+        match r {
+            Ok(()) => true,
+            Err(e) if cfg!(windows) && e.raw_os_error() == Some(1314) => {
+                eprintln!("跳过：这台机器上不能建符号链接");
+                false
+            }
+            Err(e) => panic!("建符号链接失败：{e}"),
+        }
+    }
+
+    /// `resolve` 两个平台是同一段代码（`symlink_metadata` + `read_link` 在
+    /// Windows 上一样认符号链接），所以这条测试两边都跑。
     #[test]
     fn a_symlink_is_written_through_to_its_target() {
         // cc-switch #6785：直接 rename 会把 dotfile 管理器的软链换成
@@ -434,7 +450,9 @@ mod tests {
         std::fs::create_dir_all(real.parent().unwrap()).unwrap();
         std::fs::write(&real, "old").unwrap();
         let link = d.path().join("settings.json");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        if !symlink_to_file(&real, &link) {
+            return;
+        }
 
         let a = apply(
             &Change {
@@ -672,26 +690,28 @@ mod tests {
         assert!(a.warnings.is_empty(), "{:?}", a.warnings);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_symlink_loop_is_refused_instead_of_hanging() {
         let d = tempfile::tempdir().unwrap();
         let a = d.path().join("a");
         let b = d.path().join("b");
-        std::os::unix::fs::symlink(&b, &a).unwrap();
-        std::os::unix::fs::symlink(&a, &b).unwrap();
+        if !(symlink_to_file(&b, &a) && symlink_to_file(&a, &b)) {
+            return;
+        }
         assert!(matches!(resolve(&a), Err(ForeignError::LinkLoop { .. })));
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_relative_symlink_resolves_against_its_own_directory() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("real")).unwrap();
-        let target = d.path().join("real/x.json");
+        let target = d.path().join("real").join("x.json");
         std::fs::write(&target, "t").unwrap();
         let link = d.path().join("x.json");
-        std::os::unix::fs::symlink("real/x.json", &link).unwrap();
+        // 用本平台的分隔符拼：Windows 上链接里存的就是这一串
+        if !symlink_to_file(&Path::new("real").join("x.json"), &link) {
+            return;
+        }
         assert_eq!(
             std::fs::read_to_string(resolve(&link).unwrap()).unwrap(),
             "t"
