@@ -12,3 +12,15 @@ description = "Talking to an upstream: URL assembly and header handling, shared 
 # 规定下游用哪个 HTTP 框架，而两者的 HeaderMap 本来就都是这个 crate 的
 http = "1"
 reqwest = { workspace = true }
+
+# ── SigV4：只有 Bedrock 要，桌面版不接它 ─────────────────────
+# 这一串会连同一个 http 0.2 一起进来，所以关在 feature 后面
+aws-sigv4 = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+sigv4 = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:serde_json"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
