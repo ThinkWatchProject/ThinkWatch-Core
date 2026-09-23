@@ -234,9 +234,6 @@ fn shell_exports(home: &Path, names: &[&str]) -> Vec<(PathBuf, usize, String)> {
     out
 }
 
-/// macOS 上的管理策略文件。**优先级压过一切**，包括用户自己的配置。
-const MANAGED: &str = "/Library/Application Support/ClaudeCode/managed-settings.json";
-
 /// 走一遍优先级链。`project` 是当前项目目录（有的话）。
 pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding> {
     let d = detect_one(c, home);
@@ -350,8 +347,9 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
 
     // 四、管理策略文件。**最高优先级，压过一切**
     if c.id == "claude-code" {
-        if Path::new(MANAGED).exists() {
-            let text = std::fs::read_to_string(MANAGED).unwrap_or_default();
+        let managed = crate::paths::managed_settings();
+        if managed.exists() {
+            let text = std::fs::read_to_string(&managed).unwrap_or_default();
             let hits: Vec<_> = c.env_vars.iter().filter(|v| text.contains(**v)).collect();
             out.push(Finding {
                 level: if hits.is_empty() {
@@ -360,7 +358,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                     Level::Blocking
                 },
                 title: msg!("adopt.diag.managed" => "This machine has a managed-policy file"),
-                detail: msg!("adopt.diag.managed.detail", path = MANAGED => "{path} takes precedence over everything else, including the user's own configuration."),
+                detail: msg!("adopt.diag.managed.detail", path = managed.display() => "{path} takes precedence over everything else, including the user's own configuration."),
                 fix: None,
             });
         } else {

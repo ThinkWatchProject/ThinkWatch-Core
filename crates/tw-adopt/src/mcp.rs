@@ -83,7 +83,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "claude-desktop",
             name: "Claude Desktop",
-            config: "Library/Application Support/Claude/claude_desktop_config.json",
+            config: crate::paths::claude_desktop_config(),
             format: Format::Json,
             key: "mcpServers",
             copyable: true,

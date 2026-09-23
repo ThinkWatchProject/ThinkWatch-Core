@@ -159,7 +159,7 @@ pub fn user_level(home: &Path) -> Vec<Source> {
         f(
             "claude-desktop",
             Kind::Mcp,
-            home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+            home.join(tw_adopt::paths::claude_desktop_config()),
         ),
         f("cursor", Kind::Mcp, home.join(".cursor/mcp.json")),
         f("codex", Kind::Mcp, home.join(".codex/config.toml")),
@@ -249,10 +249,9 @@ mod tests {
         // 它是订阅制、接管不了，但它的 MCP 配置是危险度第二高的攻击面。
         // 漏掉它等于扫描留了个洞。
         let d = tempfile::tempdir().unwrap();
-        touch(
-            &d.path()
-                .join("Library/Application Support/Claude/claude_desktop_config.json"),
-        );
+        // 路径按平台走 —— 写死 macOS 那一条的话，这个测试在 Windows 上
+        // 会造一个没人找的文件，然后报告扫描漏了它。
+        touch(&d.path().join(tw_adopt::paths::claude_desktop_config()));
         let got = user_level(d.path());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].client, "claude-desktop");
