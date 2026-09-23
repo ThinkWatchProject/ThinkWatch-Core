@@ -36,6 +36,7 @@ rand = { workspace = true }
 uuid = { workspace = true }
 tw-redact = { workspace = true }
 tw-dialect = { workspace = true }
+tw-wire = { workspace = true }
 tw-scan = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

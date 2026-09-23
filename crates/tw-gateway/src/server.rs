@@ -234,7 +234,7 @@ pub struct AppState {
     /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
     /// —— 一次慢磁盘写就变成一次慢请求，而观测永远不该有这个权力。
     /// `None` 表示观测层没起来，那时什么都不做。
-    body_sink: Arc<std::sync::Mutex<Option<crate::bodies::BodySender>>>,
+    body_sink: Arc<std::sync::Mutex<Option<tw_wire::bodies::BodySender>>>,
     /// 每个上游最近一次报的订阅额度。
     ///
     /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
@@ -828,7 +828,7 @@ impl AppState {
 
     /// 接上 body 的去处。**观测层起来之后才调** —— 在那之前 body 一律
     /// 丢掉，而请求照常。
-    pub fn set_body_sink(&self, tx: crate::bodies::BodySender) {
+    pub fn set_body_sink(&self, tx: tw_wire::bodies::BodySender) {
         if let Ok(mut g) = self.body_sink.lock() {
             *g = Some(tx);
         }
@@ -875,7 +875,7 @@ impl AppState {
         }
     }
 
-    fn body_sink(&self) -> Option<crate::bodies::BodySender> {
+    fn body_sink(&self) -> Option<tw_wire::bodies::BodySender> {
         self.body_sink.lock().ok().and_then(|g| g.clone())
     }
 
@@ -1690,12 +1690,12 @@ async fn pipeline(
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
     // 整个解析的，所以本来就在）。
-    crate::bodies::offer(
+    tw_wire::bodies::offer(
         &sink,
-        crate::bodies::BodyRecord {
+        tw_wire::bodies::BodyRecord {
             id,
             at_ms,
-            kind: crate::bodies::BodyKind::Request,
+            kind: tw_wire::bodies::BodyKind::Request,
             body: body.clone(),
             original_len: body.len(),
         },
