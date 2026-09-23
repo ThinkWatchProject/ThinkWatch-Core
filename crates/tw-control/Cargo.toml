@@ -17,7 +17,7 @@ rand = { workspace = true }
 tw-config = { workspace = true }
 tw-adopt = { workspace = true }
 tw-scan = { workspace = true }
-tw-redact = { workspace = true }
+tw-guard = { workspace = true }
 bytes = { workspace = true }
 tw-engine = { workspace = true }
 tw-gateway = { workspace = true }

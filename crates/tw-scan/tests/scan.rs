@@ -6,8 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
+use tw_guard::tools::rules;
 use tw_scan::report::{Level, scan};
-use tw_scan::{rules, sources};
+use tw_scan::sources;
 
 fn write(p: &Path, s: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -254,7 +255,8 @@ fn the_source_code_itself_contains_no_way_to_delete_anything() {
         "src/report.rs",
         "src/hidden.rs",
         "src/sources.rs",
-        "src/rules.rs",
+        // 规则引擎住在 tw-guard，扫描器用的也是它
+        "../tw-guard/src/tools/rules.rs",
     ] {
         let src = std::fs::read_to_string(f).unwrap();
         // 测试里当然要造文件。看的是产品代码那一半

@@ -15,6 +15,7 @@ serde_yaml_ng = { workspace = true }
 tw-adopt = { workspace = true }
 tw-config = { workspace = true }
 tw-types = { workspace = true }
+tw-guard = { workspace = true }
 notify = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

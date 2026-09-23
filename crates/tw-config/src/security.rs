@@ -32,7 +32,6 @@
 //! 不是数据，而且住在这里白捡了变更历史和一键回滚。
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -188,33 +187,61 @@ impl RedactPolicy {
     }
 }
 
-/// 内置规则的清单，编译进二进制。
+/// 工具调用审查的内置规则 id：tw-guard 内置规则里「危险命令」那一组。
 ///
-/// **放在这里而不是 tw-scan**：`config.yaml` 按 id 引用其中「危险命令」那一组
-/// （`security.inspect_tools` 的 `enable` / `disable` / `actions`），校验要认得出
-/// 这些 id，而 tw-scan 依赖本 crate、反过来引用不了。规则怎么编译、怎么匹配
-/// 仍然是 tw-scan 的事。
-pub const BUILTIN_RULES: &str = include_str!("../data/rules.yaml");
+/// `config.yaml` 按 id 引用它们（`security.inspect_tools` 的 `enable` /
+/// `disable` / `actions`），校验要认得出。
+fn tool_rule_ids() -> impl Iterator<Item = &'static str> {
+    tw_guard::tools::rules::builtin()
+        .dangerous
+        .iter()
+        .map(|s| s.id.as_str())
+}
 
-/// 工具调用审查的内置规则 id：[`BUILTIN_RULES`] 里「危险命令」那一组。
-fn tool_rule_ids() -> &'static [String] {
-    #[derive(Deserialize)]
-    struct File {
-        dangerous: Vec<Spec>,
+impl ToolAction {
+    /// 一条内置规则出厂时在拦截档下做什么。
+    pub fn factory(spec: &tw_guard::tools::rules::RuleSpec) -> Self {
+        if spec.high() {
+            ToolAction::Cut
+        } else {
+            ToolAction::Record
+        }
     }
-    #[derive(Deserialize)]
-    struct Spec {
-        id: String,
+}
+
+impl ToolPolicy {
+    /// 这一份配置下的工具调用审查规则：内置的去掉停用的、按改过的处置走，
+    /// 再加上启用着的自定义规则。
+    ///
+    /// 自定义规则的正则在配置校验时已经编过一次；这里再编失败只可能是有人绕过
+    /// 了校验，照样当错误返回，不静默跳过。
+    pub fn rules(
+        &self,
+    ) -> Result<tw_guard::tools::rules::Rules, tw_guard::tools::rules::RuleError> {
+        tw_guard::tools::rules::tool_rules(
+            &self.disable,
+            |id| self.cut(id),
+            self.custom
+                .iter()
+                .filter(|c| !c.disabled)
+                .map(|c| tw_guard::tools::rules::Custom {
+                    name: &c.name,
+                    pattern: &c.pattern,
+                    cut: c.action == ToolAction::Cut,
+                }),
+        )
     }
-    static IDS: OnceLock<Vec<String>> = OnceLock::new();
-    IDS.get_or_init(|| {
-        serde_yaml_ng::from_str::<File>(BUILTIN_RULES)
-            .expect("the built-in rules file parses, and a test keeps it so")
-            .dangerous
-            .into_iter()
-            .map(|s| s.id)
-            .collect()
-    })
+
+    /// 只有一条内置规则，**不管它启用没有**，处置按这份配置走。安全页上
+    /// 「试一条停用着的规则」用它。
+    pub fn one_builtin(&self, id: &str) -> Option<tw_guard::tools::rules::Rules> {
+        tw_guard::tools::rules::one_builtin(id, self.cut(id))
+    }
+
+    /// 用户改过这条内置规则的处置的话，改成了什么。
+    fn cut(&self, id: &str) -> Option<bool> {
+        self.actions.get(id).map(|a| *a == ToolAction::Cut)
+    }
 }
 
 /// 两项防护。
@@ -238,14 +265,14 @@ impl Security {
         r.enable
             .iter()
             .chain(&r.disable)
-            .find(|id| tw_redact::rules::builtin(id).is_none())
+            .find(|id| tw_guard::redact::rules::builtin(id).is_none())
             .map(|id| ("redact", id.as_str()))
             .or_else(|| {
                 t.enable
                     .iter()
                     .chain(&t.disable)
                     .chain(t.actions.keys())
-                    .find(|id| !tool_rule_ids().contains(id))
+                    .find(|id| !tool_rule_ids().any(|t| t == id.as_str()))
                     .map(|id| ("inspect_tools", id.as_str()))
             })
     }
@@ -292,6 +319,45 @@ mod tests {
         for a in [ToolAction::Cut, ToolAction::Record] {
             assert_eq!(ToolAction::from_slug(a.slug()), Some(a));
         }
+    }
+
+    /// 配置到规则的翻译：停用、改处置、自定义规则的启停，一样不能丢。
+    #[test]
+    fn the_tool_policy_reaches_the_rules() {
+        let p = ToolPolicy {
+            disable: vec!["chmod-777".to_string()],
+            actions: [
+                ("rm-rf-root".to_string(), ToolAction::Cut),
+                ("curl-pipe-sh".to_string(), ToolAction::Record),
+            ]
+            .into(),
+            custom: vec![
+                CustomToolRule {
+                    name: "删除集群资源".to_string(),
+                    pattern: r"kubectl\s+delete".to_string(),
+                    action: ToolAction::Cut,
+                    disabled: false,
+                },
+                CustomToolRule {
+                    name: "停用的".to_string(),
+                    pattern: "zzz".to_string(),
+                    action: ToolAction::Cut,
+                    disabled: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let rs = p.rules().unwrap();
+        let high = |id: &str| rs.rules.iter().find(|r| r.id == id).map(|r| r.high);
+        assert_eq!(high("chmod-777"), None, "停用的还在");
+        assert_eq!(high("rm-rf-root"), Some(true));
+        assert_eq!(high("curl-pipe-sh"), Some(false));
+        assert_eq!(high("base64-decode-exec"), Some(true), "没改的照出厂");
+        assert_eq!(high("删除集群资源"), Some(true));
+        assert_eq!(high("停用的"), None, "停用的自定义规则还在");
+        // 只试一条时也按改过的处置走，而且不管它停没停用
+        assert!(p.one_builtin("rm-rf-root").unwrap().rules[0].high);
+        assert!(p.one_builtin("chmod-777").is_some());
     }
 
     #[test]

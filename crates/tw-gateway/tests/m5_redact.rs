@@ -48,7 +48,7 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
                         );
                         for c in echoed.chars() {
                             out.push_str(&format!(
-                                "event: content_block_delta\ndata: {{\"delta\":{{\"text\":{}}}}}\n\n",
+                                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}\n\n",
                                 serde_json::to_string(&c.to_string()).unwrap()
                             ));
                         }

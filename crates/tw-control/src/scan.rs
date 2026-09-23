@@ -53,7 +53,7 @@ pub async fn scan(
 ) -> Json<tw_api::ScanResponse> {
     // **只用内置规则。**安全页上的规则只作用于经过网关的请求：在那边停用
     // 一条误报，不该让这边悄悄少查一样东西
-    let rules = tw_scan::rules::scan_rules();
+    let rules = tw_guard::tools::rules::scan_rules();
 
     let mut sources = tw_scan::sources::user_level(&s.home);
     for proj in &p.project {
@@ -130,7 +130,7 @@ pub fn spawn_watcher(
         let mut seen = tw_scan::watch::Seen::default();
         // 先垫一次底：把此刻已经存在的那些记下来，它们不算「新出现」
         // 内置规则，和打开页面时扫的是同一套
-        let rules = tw_scan::rules::scan_rules();
+        let rules = tw_guard::tools::rules::scan_rules();
         let scan_now = |home: &std::path::Path| {
             tw_scan::report::scan(&tw_scan::sources::user_level(home), &rules)
         };

@@ -215,7 +215,7 @@ pub async fn run(
 
     // 回显还原之后再脱敏给人看。**两步都要**：还原是为了让内容和原来
     // 那次可比，脱敏是因为这段文字会被复制进 issue
-    let restored = tw_redact::redact::restore(&text, &ledger);
+    let restored = tw_guard::redact::replace::restore(&text, &ledger);
     Ok(Json(tw_api::ReplayResult {
         provider: provider.name.clone(),
         status,

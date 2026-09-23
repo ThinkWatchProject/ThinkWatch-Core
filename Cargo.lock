@@ -1527,16 +1527,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "metrics"
-version = "0.24.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
-dependencies = [
- "portable-atomic",
- "rapidhash",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1689,12 +1679,6 @@ dependencies = [
  "opaque-debug",
  "universal-hash",
 ]
-
-[[package]]
-name = "portable-atomic"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "potential_utf"
@@ -1869,15 +1853,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "rapidhash"
-version = "4.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
-dependencies = [
- "rustversion",
 ]
 
 [[package]]
@@ -2815,8 +2790,8 @@ dependencies = [
  "tokio",
  "tw-api",
  "tw-engine",
+ "tw-guard",
  "tw-pricing",
- "tw-redact",
  "tw-secret",
  "tw-types",
  "tw-yaml",
@@ -2852,9 +2827,9 @@ dependencies = [
  "tw-config",
  "tw-engine",
  "tw-gateway",
+ "tw-guard",
  "tw-observe",
  "tw-pricing",
- "tw-redact",
  "tw-scan",
  "tw-secret",
  "tw-store",
@@ -2930,15 +2905,28 @@ dependencies = [
  "tw-config",
  "tw-dialect",
  "tw-engine",
+ "tw-guard",
  "tw-observe",
  "tw-pricing",
- "tw-redact",
- "tw-scan",
  "tw-secret",
  "tw-types",
  "tw-upstream",
  "tw-wire",
  "uuid",
+]
+
+[[package]]
+name = "tw-guard"
+version = "0.36.0"
+dependencies = [
+ "base64",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+ "tw-dialect",
+ "tw-secret",
 ]
 
 [[package]]
@@ -2964,30 +2952,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tw-redact"
-version = "0.36.0"
-dependencies = [
- "base64",
- "regex",
- "serde",
- "serde_json",
- "thiserror",
- "tw-secret",
-]
-
-[[package]]
-name = "tw-resil"
-version = "0.36.0"
-dependencies = [
- "futures",
- "metrics",
- "rand 0.10.2",
- "tokio",
- "tracing",
- "tw-types",
-]
-
-[[package]]
 name = "tw-scan"
 version = "0.36.0"
 dependencies = [
@@ -3002,6 +2966,7 @@ dependencies = [
  "tracing",
  "tw-adopt",
  "tw-config",
+ "tw-guard",
  "tw-types",
 ]
 
@@ -3095,6 +3060,7 @@ dependencies = [
  "tw-config",
  "tw-control",
  "tw-gateway",
+ "tw-guard",
  "tw-observe",
  "tw-pricing",
  "tw-scan",

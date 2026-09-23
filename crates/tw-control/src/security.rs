@@ -118,8 +118,8 @@ pub fn view(cfg: &tw_config::Config) -> tw_api::SecurityDetail {
     }
 }
 
-fn matcher(m: &tw_redact::rules::Matcher) -> tw_api::Matcher {
-    use tw_redact::rules::Matcher as M;
+fn matcher(m: &tw_guard::redact::rules::Matcher) -> tw_api::Matcher {
+    use tw_guard::redact::rules::Matcher as M;
     match *m {
         M::Prefix { prefix, min_tail } => tw_api::Matcher::Prefix {
             prefix: prefix.to_string(),
@@ -137,7 +137,7 @@ fn matcher(m: &tw_redact::rules::Matcher) -> tw_api::Matcher {
 }
 
 fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
-    let mut rules: Vec<tw_api::SecurityRuleView> = tw_redact::rules::BUILTINS
+    let mut rules: Vec<tw_api::SecurityRuleView> = tw_guard::redact::rules::BUILTINS
         .iter()
         .map(|b| {
             let on = if b.on_by_default {
@@ -180,7 +180,7 @@ fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
 }
 
 fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
-    let builtin = &tw_scan::rules::builtin().dangerous;
+    let builtin = &tw_guard::tools::rules::builtin().dangerous;
     let mut rules: Vec<tw_api::SecurityRuleView> = builtin
         .iter()
         .map(|r| tw_api::SecurityRuleView {
@@ -198,11 +198,11 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
                 p.actions
                     .get(&r.id)
                     .copied()
-                    .unwrap_or_else(|| tw_scan::rules::factory_action(r))
+                    .unwrap_or_else(|| tw_config::ToolAction::factory(r))
                     .slug()
                     .into(),
             ),
-            default_action: Some(tw_scan::rules::factory_action(r).slug().into()),
+            default_action: Some(tw_config::ToolAction::factory(r).slug().into()),
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
@@ -307,8 +307,8 @@ async fn toggle_builtin(
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
     let on_by_default = match guard {
-        Guard::Redact => tw_redact::rules::builtin(&id).map(|b| b.on_by_default),
-        Guard::Tools => tw_scan::rules::builtin()
+        Guard::Redact => tw_guard::redact::rules::builtin(&id).map(|b| b.on_by_default),
+        Guard::Tools => tw_guard::tools::rules::builtin()
             .dangerous
             .iter()
             .any(|r| r.id == id)
@@ -368,13 +368,13 @@ async fn set_builtin_action(
             ),
         ));
     }
-    let spec = tw_scan::rules::builtin()
+    let spec = tw_guard::tools::rules::builtin()
         .dangerous
         .iter()
         .find(|r| r.id == id)
         .ok_or_else(|| unknown_rule(&id))?;
     let action = action_of(&req.action)?;
-    let factory = tw_scan::rules::factory_action(spec);
+    let factory = tw_config::ToolAction::factory(spec);
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
@@ -402,7 +402,7 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
         ));
     }
     // **正则在保存时编译**，写错当场说清楚，不等加载时再跳过
-    tw_redact::rules::compile(name, &req.pattern).map_err(bad_pattern)?;
+    tw_guard::redact::rules::compile(name, &req.pattern).map_err(bad_pattern)?;
     let mut m = Mapping::new();
     m.insert("name".into(), name.into());
     m.insert("pattern".into(), req.pattern.as_str().into());
@@ -422,7 +422,7 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
     Ok(m)
 }
 
-fn bad_pattern(e: tw_redact::rules::BadPattern) -> Fail {
+fn bad_pattern(e: tw_guard::redact::rules::BadPattern) -> Fail {
     fail(
         StatusCode::BAD_REQUEST,
         msg!(
@@ -525,25 +525,25 @@ async fn test(
             let trial;
             let rules = match (&req.pattern, &req.rule) {
                 (Some(p), _) => {
-                    trial = tw_redact::rules::RuleSet::none()
+                    trial = tw_guard::redact::rules::RuleSet::none()
                         .with_custom(TRIAL, p)
                         .map_err(bad_pattern)?;
                     &trial
                 }
                 (None, Some(id)) => {
-                    let b = tw_redact::rules::builtin(id).ok_or_else(|| unknown_rule(id))?;
-                    trial = tw_redact::rules::RuleSet::only(&[b.id]);
+                    let b = tw_guard::redact::rules::builtin(id).ok_or_else(|| unknown_rule(id))?;
+                    trial = tw_guard::redact::rules::RuleSet::only(&[b.id]);
                     &trial
                 }
                 (None, None) => rt.redact.as_ref(),
             };
             // **按它在请求体里的样子找**，结论才和真的请求一致
-            tw_redact::rules::scan_plain(&req.sample, rules)
+            tw_guard::redact::rules::scan_plain(&req.sample, rules)
                 .into_iter()
                 .map(|h| {
                     let value = &req.sample[h.bytes.clone()];
                     tw_api::SecurityTestHit {
-                        excerpt: tw_redact::rules::masked(&h.rule, value),
+                        excerpt: tw_guard::redact::rules::masked(&h.rule, value),
                         start: utf16_at(&req.sample, h.bytes.start),
                         end: utf16_at(&req.sample, h.bytes.end),
                         rule: h.rule.id().to_string(),
@@ -558,8 +558,8 @@ async fn test(
             let rules = match (&req.pattern, &req.rule) {
                 (Some(p), _) => {
                     // 只要正则引擎那半句：规则名是这里临时起的，说出来只会让人困惑
-                    trial = tw_scan::rules::single(TRIAL, p, true).map_err(
-                        |tw_scan::rules::RuleError::BadPattern { detail, .. }| {
+                    trial = tw_guard::tools::rules::single(TRIAL, p, true).map_err(
+                        |tw_guard::tools::rules::RuleError::BadPattern { detail, .. }| {
                             fail(
                                 StatusCode::BAD_REQUEST,
                                 msg!(
@@ -572,7 +572,11 @@ async fn test(
                     &trial
                 }
                 (None, Some(id)) => {
-                    trial = tw_scan::rules::one_builtin(id, &s.config().security.inspect_tools)
+                    trial = s
+                        .config()
+                        .security
+                        .inspect_tools
+                        .one_builtin(id)
                         .ok_or_else(|| unknown_rule(id))?;
                     &trial
                 }
@@ -615,7 +619,7 @@ mod tests {
     #[test]
     fn every_builtin_redaction_rule_is_listed_with_its_default() {
         let v = redact_view(&Default::default());
-        assert_eq!(v.rules.len(), tw_redact::rules::BUILTINS.len());
+        assert_eq!(v.rules.len(), tw_guard::redact::rules::BUILTINS.len());
         let ip = v.rules.iter().find(|r| r.id == "internal-ip").unwrap();
         assert!(!ip.enabled && !ip.on_by_default);
         let key = v

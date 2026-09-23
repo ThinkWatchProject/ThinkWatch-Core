@@ -43,10 +43,10 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
 ## Crate layers
 
 ```
-tw-types · tw-dialect · tw-wire · tw-upstream · tw-resil · tw-crypto   ← shape fixed by the outside world
-tw-engine · tw-pricing · tw-redact · tw-yaml · tw-secret               ← domain logic
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe                 ← assembly
-tw-gateway · tw-control                                                ← data plane / control plane
+tw-types · tw-dialect · tw-wire · tw-upstream · tw-crypto   ← shape fixed by the outside world
+tw-engine · tw-pricing · tw-guard · tw-yaml · tw-secret     ← domain logic
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe      ← assembly
+tw-gateway · tw-control                                     ← data plane / control plane
 ```
 
 The top two layers are stable against external reality — the server edition

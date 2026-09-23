@@ -34,11 +34,10 @@ blake3 = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
-tw-redact = { workspace = true }
+tw-guard = { workspace = true }
 tw-dialect = { workspace = true }
 tw-upstream = { workspace = true }
 tw-wire = { workspace = true }
-tw-scan = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

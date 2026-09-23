@@ -47,8 +47,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::tools::rules::Rules;
 use serde_json::Value;
-use tw_scan::rules::Rules;
 
 /// 命中了什么。
 #[derive(Debug, Clone)]
@@ -671,7 +671,7 @@ mod tests {
     use super::*;
 
     fn rules() -> Arc<Rules> {
-        Arc::new(tw_scan::rules::tool_rules(&Default::default()).unwrap())
+        Arc::new(crate::tools::rules::tool_rules(&[], |_| None, []).unwrap())
     }
 
     fn start(index: u64, name: &str) -> String {
