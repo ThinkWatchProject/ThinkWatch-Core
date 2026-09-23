@@ -22,6 +22,11 @@ tracing = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # 同名环境变量设在哪儿：注册表，见 detect.rs
+    "Win32_System_Registry",
+    # 客户端进程什么时候起的：枚举进程 + 取创建时刻，见 detect.rs
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
