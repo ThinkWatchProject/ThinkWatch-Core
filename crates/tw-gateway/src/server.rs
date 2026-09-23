@@ -1710,7 +1710,8 @@ async fn pipeline(
     let mut attempts: Vec<String> = Vec::new();
     // 成功那一次的脱敏账本。**必须是成功那一次的** —— 每一跳发出去的体可能
     // 转换过格式，占位符按那一份的顺序编号
-    let mut used_ledger = tw_guard::redact::replace::Ledger::default();
+    let mut used_ledger =
+        tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET);
     // 成功那一跳的转换。**必须是成功那一次的** —— 故障转移从 Anthropic 上游
     // 切到 OpenAI 上游时，两跳转成的格式不一样；直通时是 None
     let mut used_session: Option<tw_dialect::convert::Session> = None;
@@ -2223,7 +2224,14 @@ async fn pipeline(
     //
     // **没脱敏过就是个空壳**，`process` 直接把字节原样递出去 —— 绝大多数
     // 请求走的是这条路，它不该为这个功能付任何延迟。
-    let mut restorer = tw_guard::redact::sse::Body::new(&used_ledger, is_sse);
+    //
+    // 还原看的是**上游的原话**（转换之前），所以按上游的格式认帧
+    let upstream_dialect = session
+        .as_ref()
+        .map(|s| s.upstream)
+        .or_else(|| api.map(|a| a.dialect()))
+        .unwrap_or(tw_dialect::ir::Dialect::Anthropic);
+    let mut restorer = tw_guard::redact::sse::Body::new(&used_ledger, is_sse, upstream_dialect);
     // 流式转换器。**同格式时是 None，整段零成本。**
     //
     // 位置在还原**之后**：占位符是我们在出站时塞进去的，先换回真值再

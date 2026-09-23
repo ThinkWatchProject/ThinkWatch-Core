@@ -217,6 +217,7 @@ pub fn record(
         let redacted = tw_guard::redact::replace::redact(
             &r.body,
             &tw_guard::redact::rules::RuleSet::only(&all),
+            tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
         )
         .text;
         Recorded {

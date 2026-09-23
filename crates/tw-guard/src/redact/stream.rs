@@ -1,11 +1,10 @@
 //! 流式还原：占位符被切在两个 chunk 中间时怎么办。
 //!
-//! 做法和企业版的 `PiiStreamRestorer` 一样：**扣住尾部那段「还可能长成
-//! 占位符」的内容不发**，等下一个 chunk 到了再判断。
+//! **扣住尾部那段「还可能长成占位符」的内容不发**，等下一个 chunk 到了再判断。
 //!
-//! # 一处必须改掉的地方
+//! # 判据：必须是账本里某个占位符的前缀
 //!
-//! 企业版的判据是「最右边那个 `{{` 之后没有 `}}` 就全扣住」。照搬到
+//! 企业版最早的判据是「最右边那个 `{{` 之后没有 `}}` 就全扣住」。照搬到
 //! `<<TW_SECRET_n>>` 上会**当场坏掉**：
 //!
 //! ```text
@@ -13,56 +12,15 @@
 //! cat <<EOF                       ← heredoc 同样常见
 //! ```
 //!
-//! 按那个判据，`<<` 之后的所有内容会一直扣着，直到某处出现 `>>` 或者流
-//! 结束 —— 用户看到的是**响应卡住**。而这是个给写代码的人用的网关，
-//! 「响应里有 `<<`」不是边角情况，是常态。
+//! `<<` 之后的所有内容会一直扣着，直到某处出现 `>>` 或者流结束 —— 用户看到的
+//! 是**响应卡住**。`{{` 也一样：Jinja、Handlebars、Vue 的模板里到处都是。
 //!
-//! 所以判据换成：**扣住的那一段必须是占位符的一个合法前缀**。
-//! `<< x` 里 `<<` 后面是空格，一眼就不可能长成 `<<TW_SECRET_`，立刻放行。
-//! 顺带还加了个长度上限 —— 就算判据写漏了，扣住的也永远是几十个字节。
+//! 所以扣住的那一段必须是**这次真的发出去过的某个占位符**的一个严格前缀。
+//! 只有账本里的占位符才需要还原，别的都不必等：`<< x` 立刻放行，一个模型自己
+//! 编出来的 `<<TW_SECRET_9>>` 也原样过去。扣住的长度因此天然封顶在最长的那个
+//! 占位符上 —— 几十个字节。
 
-use crate::redact::replace::{CLOSE, Ledger, OPEN};
-
-/// 扣住的字节数上限。`<<TW_SECRET_` + 一串数字 + `>>`，几十字节封顶。
-const MAX_HOLD: usize = 48;
-
-/// `tail` 有没有可能是某个占位符的开头。
-///
-/// 文法就是 `<<TW_SECRET_` + 至少一位数字 + `>>`。
-fn viable_prefix(tail: &[u8]) -> bool {
-    if tail.len() > MAX_HOLD {
-        return false;
-    }
-    let open = OPEN.as_bytes();
-    let close = CLOSE.as_bytes();
-    // 还在 `<<TW_SECRET_` 里面
-    if tail.len() <= open.len() {
-        return tail == &open[..tail.len()];
-    }
-    if &tail[..open.len()] != open {
-        return false;
-    }
-    let rest = &tail[open.len()..];
-    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-    if digits == rest.len() {
-        // 数字还在往下写
-        return true;
-    }
-    // 数字写完了，接下来只能是 `>` 或者 `>>`
-    let after = &rest[digits..];
-    digits > 0 && after.len() < close.len() && after == &close[..after.len()]
-}
-
-/// 从哪个字节开始必须扣住。返回 `buf.len()` 表示全都能发。
-fn hold_from(buf: &[u8]) -> usize {
-    let window = buf.len().saturating_sub(MAX_HOLD);
-    for p in window..buf.len() {
-        if buf[p] == b'<' && viable_prefix(&buf[p..]) {
-            return p;
-        }
-    }
-    buf.len()
-}
+use crate::redact::replace::Ledger;
 
 /// 一条流上的还原器。
 ///
@@ -70,13 +28,22 @@ fn hold_from(buf: &[u8]) -> usize {
 /// 还原的结果。**顺序和内容都不变，唯一的差别是有些字节晚几毫秒发出去。
 pub struct Restorer {
     table: std::collections::HashMap<String, String>,
+    /// 占位符开头的第一个字节。先按它筛，再比前缀
+    lead: u8,
+    open: &'static str,
+    /// 最长的占位符有多长：扣住的永远不会比它更多
+    longest: usize,
     buffer: String,
 }
 
 impl Restorer {
     pub fn new(ledger: &Ledger) -> Self {
+        let open = ledger.scheme().open;
         Self {
             table: ledger.table().clone(),
+            lead: open.as_bytes()[0],
+            open,
+            longest: ledger.table().keys().map(String::len).max().unwrap_or(0),
             buffer: String::new(),
         }
     }
@@ -93,7 +60,7 @@ impl Restorer {
             return next.to_string();
         }
         self.buffer.push_str(next);
-        let cut = hold_from(self.buffer.as_bytes());
+        let cut = self.hold_from();
         if cut == 0 {
             return String::new();
         }
@@ -104,8 +71,8 @@ impl Restorer {
 
     /// 流结束了，把扣住的那点吐出来。
     ///
-    /// **残留的半截原样发出去。**一个到流末尾都没收尾的 `<<TW_SECRET_`
-    /// 永远不会变成占位符了，那就让客户端看到上游真正说了什么。
+    /// **残留的半截原样发出去。**一个到流末尾都没收尾的占位符开头永远不会
+    /// 变成占位符了，那就让客户端看到上游真正说了什么。
     pub fn flush(&mut self) -> String {
         if self.buffer.is_empty() {
             return String::new();
@@ -123,8 +90,30 @@ impl Restorer {
         self.restore(s)
     }
 
+    /// 从哪个字节开始必须扣住。返回 `buffer.len()` 表示全都能发。
+    ///
+    /// 切点总落在占位符开头那个 ASCII 字节上，所以一定是字符边界。
+    fn hold_from(&self) -> usize {
+        let buf = self.buffer.as_bytes();
+        let window = buf.len().saturating_sub(self.longest);
+        for p in window..buf.len() {
+            if buf[p] != self.lead {
+                continue;
+            }
+            let tail = &buf[p..];
+            if self
+                .table
+                .keys()
+                .any(|k| k.len() > tail.len() && k.as_bytes().starts_with(tail))
+            {
+                return p;
+            }
+        }
+        buf.len()
+    }
+
     fn restore(&self, s: &str) -> String {
-        if !s.contains(OPEN) {
+        if !s.contains(self.open) {
             return s.to_string();
         }
         let mut out = s.to_string();
@@ -193,13 +182,18 @@ impl ByteRestorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redact::replace::redact;
+    use crate::redact::replace::{Scheme, redact};
     use crate::redact::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn ledger() -> Ledger {
-        redact(&format!("k={KEY}"), &RuleSet::only(&["anthropic-api-key"])).ledger
+        redact(
+            &format!("k={KEY}"),
+            &RuleSet::only(&["anthropic-api-key"]),
+            Ledger::new(Scheme::SECRET),
+        )
+        .ledger
     }
 
     /// 把一段内容按给定的切法喂进去，返回客户端最终看到的东西。
@@ -231,9 +225,8 @@ mod tests {
 
     #[test]
     fn cpp_stream_operators_do_not_stall_the_stream() {
-        // **企业版的判据在这里当场坏掉。**按「最右边的 `<<` 之后没有
-        // `>>` 就全扣住」，下面这段会一直卡到流结束。而这是个给写代码的
-        // 人用的网关 —— 「响应里有 `<<`」不是边角情况，是常态。
+        // **「最右边的 `<<` 之后没有 `>>` 就全扣住」在这里当场坏掉**：下面
+        // 这段会一直卡到流结束。而「响应里有 `<<`」不是边角情况，是常态。
         let l = ledger();
         let mut r = Restorer::new(&l);
         let out = r.process("std::cout << x << std::endl;");
@@ -296,22 +289,49 @@ mod tests {
 
     #[test]
     fn nothing_is_ever_held_for_long() {
-        // 就算判据写漏了，扣住的也永远是几十个字节 —— 而不是整条响应。
+        // 扣住的永远不比最长的那个占位符长 —— 而不是整条响应。
         let l = ledger();
         let mut r = Restorer::new(&l);
         let long = format!("<<TW_SECRET_{}", "1".repeat(500));
         let out = r.process(&long);
         assert!(
-            out.len() >= long.len() - MAX_HOLD,
+            out.len() >= long.len() - "<<TW_SECRET_1>>".len(),
             "扣住了 {} 个字节",
             long.len() - out.len()
         );
     }
 
     #[test]
+    fn a_placeholder_nobody_issued_is_not_waited_for() {
+        // 模型自己编的 `<<TW_SECRET_9>>` 不在账本里，没有还原的可能，也就
+        // 没有等的理由
+        let l = ledger();
+        let mut r = Restorer::new(&l);
+        assert_eq!(r.process("看 <<TW_SECRET_9"), "看 <<TW_SECRET_9");
+    }
+
+    #[test]
+    fn brace_placeholders_are_held_the_same_way_and_templates_are_not() {
+        // 企业版的 `{{EMAIL_1}}`。模板里的 `{{ name }}` 不该被扣住
+        let scheme = Scheme {
+            open: "{{",
+            close: "}}",
+            label: "PII",
+        };
+        let rules = RuleSet::none()
+            .with_labeled("email", r"[a-z]+@[a-z]+\.com", Some("EMAIL"))
+            .unwrap();
+        let l =
+            crate::redact::replace::redact_plain("找 a@b.com", &rules, Ledger::new(scheme)).ledger;
+        let mut r = Restorer::new(&l);
+        assert_eq!(r.process("Hello {{ name }}, {{EMA"), "Hello {{ name }}, ");
+        assert_eq!(r.process("IL_1}} 好"), "a@b.com 好");
+    }
+
+    #[test]
     fn a_stream_with_nothing_to_restore_never_buffers() {
         // 没脱敏的请求不该为这个功能付任何延迟。
-        let mut r = Restorer::new(&Ledger::default());
+        let mut r = Restorer::new(&Ledger::new(Scheme::SECRET));
         assert!(r.is_noop());
         assert_eq!(
             r.process("<<TW_SECRET_1>> 原样过去"),
@@ -358,13 +378,18 @@ mod tests {
 #[cfg(test)]
 mod byte_tests {
     use super::*;
-    use crate::redact::replace::redact;
+    use crate::redact::replace::{Scheme, redact};
     use crate::redact::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn ledger() -> Ledger {
-        redact(&format!("k={KEY}"), &RuleSet::only(&["anthropic-api-key"])).ledger
+        redact(
+            &format!("k={KEY}"),
+            &RuleSet::only(&["anthropic-api-key"]),
+            Ledger::new(Scheme::SECRET),
+        )
+        .ledger
     }
 
     fn feed_bytes(chunks: &[&[u8]]) -> String {
@@ -413,7 +438,7 @@ mod byte_tests {
 
     #[test]
     fn a_stream_with_nothing_to_restore_is_copied_straight_through() {
-        let mut r = ByteRestorer::new(&Ledger::default());
+        let mut r = ByteRestorer::new(&Ledger::new(Scheme::SECRET));
         assert!(r.is_noop());
         let raw = &[0xff, 0xfe, 0x00][..];
         assert_eq!(r.process(raw), raw.to_vec(), "二进制体也该原样过去");

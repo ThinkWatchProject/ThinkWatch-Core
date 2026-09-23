@@ -245,6 +245,8 @@ pub struct Hit {
     /// 在原文里的字节区间
     pub bytes: Range<usize>,
     pub rule: Rule,
+    /// 占位符里用的标签。`None` 用账本的默认标签
+    pub label: Option<Arc<str>>,
 }
 
 /// 一条编译好的自定义规则。
@@ -252,6 +254,8 @@ pub struct Hit {
 pub struct Custom {
     pub name: Arc<str>,
     pub re: regex::Regex,
+    /// 占位符里的标签（企业版的 `EMAIL`、`PHONE`）。`None` 用账本的默认标签
+    pub label: Option<Arc<str>>,
 }
 
 /// 一个自定义规则的正则写错了。
@@ -348,16 +352,28 @@ impl RuleSet {
             set.custom.push(Custom {
                 name: Arc::from(name),
                 re: compile(name, pattern)?,
+                label: None,
             });
         }
         Ok(set)
     }
 
     /// 再加一条自定义规则。
-    pub fn with_custom(mut self, name: &str, pattern: &str) -> Result<Self, BadPattern> {
+    pub fn with_custom(self, name: &str, pattern: &str) -> Result<Self, BadPattern> {
+        self.with_labeled(name, pattern, None)
+    }
+
+    /// 再加一条自定义规则，占位符用它自己的标签：`{{EMAIL_1}}` 里的 `EMAIL`。
+    pub fn with_labeled(
+        mut self,
+        name: &str,
+        pattern: &str,
+        label: Option<&str>,
+    ) -> Result<Self, BadPattern> {
         self.custom.push(Custom {
             name: Arc::from(name),
             re: compile(name, pattern)?,
+            label: label.map(Arc::from),
         });
         Ok(self)
     }
@@ -488,6 +504,7 @@ fn private_keys(text: &str, out: &mut Vec<Hit>) {
         out.push(Hit {
             bytes: begin..end,
             rule: Rule::Builtin("private-key"),
+            label: None,
         });
         from = end;
     }
@@ -558,6 +575,7 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
             out.push(Hit {
                 bytes: c + 1..j,
                 rule: Rule::Builtin("conn-string-password"),
+                label: None,
             });
         }
         from = after;
@@ -639,6 +657,7 @@ fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
                 out.push(Hit {
                     bytes,
                     rule: Rule::Custom(c.name.clone()),
+                    label: c.label.clone(),
                 });
             }
         }
@@ -668,6 +687,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(Hit {
                 bytes: span,
                 rule: Rule::Builtin(id),
+                label: None,
             });
             return;
         }
@@ -675,6 +695,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(Hit {
                 bytes: span,
                 rule: Rule::Builtin("jwt"),
+                label: None,
             });
             return;
         }
@@ -682,6 +703,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(Hit {
                 bytes: span,
                 rule: Rule::Builtin(id),
+                label: None,
             });
         }
     });
@@ -737,6 +759,7 @@ pub fn scan_plain(text: &str, set: &RuleSet) -> Vec<Hit> {
             (end > start).then_some(Hit {
                 bytes: start..end,
                 rule: h.rule,
+                label: h.label,
             })
         })
         .collect()
@@ -881,7 +904,11 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, "private-key");
         // 换掉之后 JSON 还得是合法的
-        let r = crate::redact::replace::redact(body, &all());
+        let r = crate::redact::replace::redact(
+            body,
+            &all(),
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
         serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
         // 而且能一字不差地换回来
         assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
@@ -997,7 +1024,11 @@ mod tests {
             "content": "pw=hunter2\n下一行 \"引号\" pw=abc\"def"
         }))
         .unwrap();
-        let r = crate::redact::replace::redact(&body, &set);
+        let r = crate::redact::replace::redact(
+            &body,
+            &set,
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
         let v: serde_json::Value = serde_json::from_str(&r.text).expect("换完不是合法 JSON");
         let content = v["content"].as_str().unwrap();
         assert!(content.starts_with("<<TW_SECRET_1>>\n下一行"), "{content}");

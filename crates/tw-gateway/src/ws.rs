@@ -116,7 +116,7 @@ pub struct Rules {
 /// 一次连接里两个方向各自的状态。
 struct Pipes {
     /// **整条连接一本账。**每帧各起一本的话，第二帧的
-    /// `<<TW_SECRET_1>>` 会和第一帧的撞车（见 `redact_into` 的注释）
+    /// `<<TW_SECRET_1>>` 会和第一帧的撞车（见 `tw_guard::redact::replace::apply` 的注释）
     ledger: tw_guard::redact::replace::Ledger,
     /// 工具调用审查关着的时候没有它
     wall: Option<tw_guard::tools::wall::Wall>,
@@ -176,7 +176,7 @@ pub async fn proxy(
         }
     };
     let mut p = Pipes {
-        ledger: tw_guard::redact::replace::Ledger::default(),
+        ledger: tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
         wall: rules
             .inspect_mode
             .detects()
@@ -337,10 +337,15 @@ async fn pump(
                                 at_ms: crate::server::now_ms(),
                             });
                             if mode.acts() {
-                                let r = tw_guard::redact::replace::redact_into(
+                                let r = tw_guard::redact::replace::redact(
                                     t.as_str(),
                                     &p.rules.redact,
-                                    std::mem::take(&mut p.ledger),
+                                    std::mem::replace(
+                                        &mut p.ledger,
+                                        tw_guard::redact::replace::Ledger::new(
+                                            tw_guard::redact::replace::Scheme::SECRET,
+                                        ),
+                                    ),
                                 );
                                 p.ledger = r.ledger;
                                 UpMsg::Text(r.text.into())
