@@ -149,7 +149,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "zed",
             name: "Zed",
-            config: ".config/zed/settings.json",
+            config: crate::paths::zed_settings(),
             format: Format::Json,
             key: "context_servers",
             copyable: false,
@@ -170,7 +170,7 @@ pub fn target(client: &str) -> Result<Target, McpError> {
 
 impl Target {
     pub fn path(&self, home: &Path) -> PathBuf {
-        home.join(self.config)
+        crate::paths::under(home, self.config)
     }
     fn check(&self) -> Result<(), McpError> {
         if self.copyable {
