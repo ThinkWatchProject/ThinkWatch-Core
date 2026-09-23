@@ -2857,6 +2857,7 @@ dependencies = [
  "tw-secret",
  "tw-store",
  "tw-types",
+ "tw-wire",
  "tw-yaml",
 ]
 
@@ -3075,6 +3076,9 @@ name = "tw-wire"
 version = "0.29.0"
 dependencies = [
  "bytes",
+ "chrono",
+ "http 1.5.0",
+ "serde",
  "serde_json",
  "tokio",
 ]

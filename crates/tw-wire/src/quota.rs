@@ -16,7 +16,7 @@
 //! 直接显示，我们推断的要标成推断。理由和三态成本完全一样：
 //! **一个编出来的精确数字，比一个诚实的「不知道」更有害。**
 
-use axum::http::HeaderMap;
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 /// 一个额度窗口的状态。**每个字段都直接来自响应头，没有一个是推算的。**
@@ -197,23 +197,6 @@ fn after(now_ms: u64, secs: u64) -> u64 {
     now_ms.saturating_add(secs.saturating_mul(1000))
 }
 
-/// 从 reqwest 的响应头读。
-///
-/// **两个 HeaderMap 类型，一段逻辑。**reqwest 和 axum 各有各的
-/// `HeaderMap`，而把解析抄两遍必然会漂移出两套行为。
-pub fn from_headers_reqwest(h: &reqwest::header::HeaderMap, now_ms: u64) -> Quota {
-    let mut axum_map = HeaderMap::new();
-    for (k, v) in h.iter() {
-        if let (Ok(name), Ok(val)) = (
-            axum::http::HeaderName::from_bytes(k.as_ref()),
-            axum::http::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            axum_map.insert(name, val);
-        }
-    }
-    from_headers(&axum_map, now_ms)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +208,7 @@ mod tests {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
             h.insert(
-                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
                 v.parse().unwrap(),
             );
         }

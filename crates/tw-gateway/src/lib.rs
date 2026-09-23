@@ -26,7 +26,6 @@ pub mod live;
 pub mod models;
 pub mod oauth;
 pub mod probe;
-pub mod quota;
 pub mod quote;
 pub mod server;
 pub mod session;
@@ -46,10 +45,9 @@ pub use l3::{Estimate, L3Result};
 pub use limits::Gate;
 pub use listen::{Listening, bind_failure, serve_at};
 pub use probe::{ModelList, ProbeResult, probe};
-pub use quota::{Quota, from_headers as quota_from_headers};
 pub use quote::Quote;
 pub use server::{AppState, Runtime, client_for_provider, router, serve};
-pub use tw_wire::{BodyKind, BodyRecord, BodySender, Sniffer, Usage};
+pub use tw_wire::{BodyKind, BodyRecord, BodySender, Quota, Sniffer, Usage, quota_from_headers};
 
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";
