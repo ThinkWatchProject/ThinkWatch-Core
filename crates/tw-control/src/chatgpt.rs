@@ -962,11 +962,11 @@ async fn usage(
     s.gateway.record_quota(
         s.bus().next_id(),
         &name,
-        tw_wire::quota::Quota {
+        tw_gateway::quota::Quota {
             windows: usage
                 .windows
                 .iter()
-                .map(|w| tw_wire::quota::Window {
+                .map(|w| tw_gateway::quota::Window {
                     window: w.window.clone(),
                     used_percent: w.used_percent,
                     resets_at_ms: w.resets_at_ms,
@@ -988,7 +988,7 @@ fn parse_usage(v: &Value, now_ms: u64) -> tw_api::ChatgptUsage {
         let secs = w.get("limit_window_seconds")?.as_u64().filter(|s| *s > 0)?;
         let used = w.get("used_percent")?.as_f64()?.clamp(0.0, 100.0);
         Some(tw_api::QuotaWindow {
-            window: tw_wire::quota::codex_window(secs / 60),
+            window: tw_gateway::quota::codex_window(secs / 60),
             used_percent: used,
             resets_at_ms: w
                 .get("reset_after_seconds")
