@@ -157,10 +157,59 @@ fn write_atomic(real: &Path, text: &str, keep_mode: Option<u32>) -> Result<(), F
     }
     #[cfg(not(unix))]
     let _ = keep_mode;
-    std::fs::rename(&tmp, real).map_err(|source| ForeignError::Write {
+    replace(&tmp, real).map_err(|source| ForeignError::Write {
         path: real.to_path_buf(),
         source,
     })
+}
+
+/// 把 `tmp` 挪成 `real`，**目标已经存在也照挪**。
+///
+/// unix 的 `rename(2)` 本来就是这个语义，所以那边直接用。
+#[cfg(unix)]
+fn replace(tmp: &Path, real: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, real)
+}
+
+/// Windows 上 `rename` **目标存在就失败**（`ERROR_ALREADY_EXISTS`）。
+///
+/// 而这个函数的每一次调用，目标都是存在的 —— 它重写的是用户已经有的那份
+/// 客户端配置。也就是说接管在那个平台上从第一步就走不下去，而且报的是
+/// 「文件已存在」，一句在这个语境里毫无意义的话。
+///
+/// **不是「先删掉再挪」。**那中间有一个窗口，窗口里用户的配置文件不存在；
+/// 要是进程恰好在那一刻没了，他丢的是原文件而我们连备份都还没交代清楚。
+/// `MoveFileExW` 带 `MOVEFILE_REPLACE_EXISTING` 是同一个卷上的原子替换，
+/// 也就是 unix 那条 `rename` 在这里的对应物。
+#[cfg(windows)]
+fn replace(tmp: &Path, real: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let (from, to) = (wide(tmp), wide(real));
+    // SAFETY: 两个参数都是以 NUL 结尾的 UTF-16，函数只读它们。
+    //
+    // `WRITE_THROUGH`：这一次挪动落盘了再返回。改的是别人的配置文件，
+    // 而「说改完了、断电之后发现没改」比「改失败」难查得多。
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// 备份目录：`~/.thinkwatch/backups/<毫秒时间戳>-<序号>/`。
@@ -329,6 +378,29 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("backups");
         (d, root)
+    }
+
+    /// **目标已经存在是常态，不是边角情况** —— 这个函数重写的就是用户
+    /// 手上那份客户端配置。
+    ///
+    /// 在 unix 上这个测试看不出任何名堂，`rename` 本来就覆盖。它是给
+    /// Windows 立的桩：那里 `rename` 遇到已存在的目标直接失败，于是接管
+    /// 在第一步就断了，报的还是一句「文件已存在」。
+    #[test]
+    fn writing_over_a_file_that_is_already_there_works() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.json");
+        std::fs::write(&p, "before").unwrap();
+        write_atomic(&p, "after", None).expect("覆盖一个已存在的文件");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "after");
+        // 临时文件没留下
+        let strays: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("thinkwatch-"))
+            .collect();
+        assert!(strays.is_empty(), "留下了临时文件：{strays:?}");
     }
 
     #[test]

@@ -17,5 +17,12 @@ toml_edit = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# 原子替换一个已存在的文件：`rename` 在这个平台上做不到，见 foreign.rs
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile = "3"
