@@ -434,6 +434,34 @@ else
   bad "经过网关多花了 ${OVER}ms，目标是解析加路由 < 2ms、中继 < 1ms"
 fi
 
+# ---------------------------------------------------------------- 请它退出
+#
+# **放在最后**：这一条真的会把 core 停掉，后面就没有控制面可用了。
+#
+# 这是整条链唯一被端到端验证的地方 —— 一条 HTTP 请求扳开关、主循环的
+# select 醒过来、进程自己退出。单元测试能证明开关会被扳动，证明不了它
+# 接在主循环上；而接错的样子是请求返回 202、进程稳稳地继续跑。
+step "请它退出，它就退"
+CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "${AUTH[@]}" \
+         -XPOST http://localhost/shutdown)
+if [ "$CODE" = 202 ]; then
+  ok "控制面收下了这条请求"
+else
+  bad "请它退出返回 $CODE" "$(cat "$TMP/out")"
+fi
+# 给它几秒真正退出。**等的是进程没了，不是 socket 没了** —— 后者在
+# 一个卡住的进程上也可能发生。
+GONE=0
+for _ in $(seq 1 50); do
+  kill -0 "$CORE_PID" 2>/dev/null || { GONE=1; break; }
+  sleep 0.2
+done
+if [ "$GONE" = 1 ]; then
+  ok "进程在几秒内自己退了"
+else
+  bad "请过它退出之后，进程还在跑（pid $CORE_PID）"
+fi
+
 # ---------------------------------------------------------------- 收尾
 step "结果"
 printf '通过 %d，失败 %d，超标但没回归 %d\n' "$PASS" "$FAIL" "$WARN"

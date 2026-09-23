@@ -37,6 +37,7 @@ fn bed() -> Bed {
     let bus = gw.bus.clone();
     let home = d.path().join("home");
     let state = ControlState {
+        shutdown: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: None,

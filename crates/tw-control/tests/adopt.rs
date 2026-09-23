@@ -34,6 +34,7 @@ fn bed_with_store(store: Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Reco
     let home = d.path().join("home");
     std::fs::create_dir_all(home.join(".claude")).unwrap();
     let state = ControlState {
+        shutdown: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store,

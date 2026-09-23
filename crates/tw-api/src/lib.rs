@@ -59,7 +59,14 @@ pub use tw_types::Msg;
 /// **11 推理测速的错误是 [`Msg`]、输出上限可以是空。**ChatGPT 账号那种上游不接受
 /// 输出上限，报价里的上限和金额都是空的；错误原来是一句英文字符串，中文界面上
 /// 只能原样显示。照 10 写的界面会把错误画成一个对象。
-pub const CONTROL_API_VERSION: u32 = 11;
+///
+/// **12 起控制面要凭据。**没带 `Authorization: Bearer` 的请求一律 401，
+/// 连 `/status` 都读不到 —— 所以照 11 写的客户端**看不到这次跳号**，它先
+/// 撞上的是 401。跳号在这里仍然要记，因为这一行是这个协议的变更史，而
+/// 「什么时候开始要凭据」是读它的人必须查得到的一件事。
+///
+/// 同一版加了 `POST /shutdown`。新增端点本身不破坏什么，它跟着这次走。
+pub const CONTROL_API_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
