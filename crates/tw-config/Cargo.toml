@@ -36,6 +36,11 @@ windows-sys = { workspace = true, features = [
     # IP_ADAPTER_ADDRESSES_LH 挂在这个 feature 下，不是 IpHelper 下
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # 建数据目录时带上 ACL，见 private_dir
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

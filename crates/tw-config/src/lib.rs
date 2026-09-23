@@ -12,6 +12,7 @@ pub mod edit;
 pub mod history;
 mod init;
 pub mod nics;
+pub mod private_dir;
 mod probes;
 pub mod proxy;
 pub mod refs;
