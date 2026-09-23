@@ -86,7 +86,11 @@ pub fn detect_one(c: &Client, home: &Path) -> Detected {
     Detected {
         id: c.id,
         name: c.name,
-        installed: c.marker.iter().any(|m| home.join(m).exists()) || text.is_some(),
+        installed: c
+            .marker
+            .iter()
+            .any(|m| crate::paths::under(home, m).exists())
+            || text.is_some(),
         has_config: text.is_some(),
         adopted_at_ms: rec
             .filter(|r: &SidecarRecord| r.client == c.id)
@@ -573,7 +577,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
 
     // 三、项目级配置盖住了用户级
     if let Some(proj) = project {
-        let local = proj.join(c.config);
+        let local = crate::paths::under(proj, c.config);
         if local.exists() {
             out.push(Finding {
                 level: Level::Suspect,

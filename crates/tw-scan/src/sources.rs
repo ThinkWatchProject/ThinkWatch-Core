@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tw_adopt::paths::under;
+
 /// 这份文件属于哪类攻击面。**顺序就是危险度**（那张表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -145,45 +147,49 @@ pub fn user_level(home: &Path) -> Vec<Source> {
         f(
             "claude-code",
             Kind::Hooks,
-            home.join(".claude/settings.json"),
+            under(home, ".claude/settings.json"),
         ),
         f(
             "claude-code",
             Kind::Hooks,
-            home.join(".claude/settings.local.json"),
+            under(home, ".claude/settings.local.json"),
         ),
         // 危险度第二：MCP
-        f("claude-code", Kind::Mcp, home.join(".claude.json")),
+        f("claude-code", Kind::Mcp, under(home, ".claude.json")),
         // **Claude Desktop 只在这张表里**：它是订阅制，接管不了，但它的
         // MCP 配置是危险度第二高的攻击面。漏掉它等于扫描留了个洞
         f(
             "claude-desktop",
             Kind::Mcp,
-            home.join(tw_adopt::paths::claude_desktop_config()),
+            under(home, tw_adopt::paths::claude_desktop_config()),
         ),
-        f("cursor", Kind::Mcp, home.join(".cursor/mcp.json")),
-        f("codex", Kind::Mcp, home.join(".codex/config.toml")),
+        f("cursor", Kind::Mcp, under(home, ".cursor/mcp.json")),
+        f("codex", Kind::Mcp, under(home, ".codex/config.toml")),
         f(
             "opencode",
             Kind::Mcp,
-            home.join(".config/opencode/opencode.json"),
+            under(home, ".config/opencode/opencode.json"),
         ),
-        f("zed", Kind::Mcp, home.join(".config/zed/settings.json")),
+        f(
+            "zed",
+            Kind::Mcp,
+            under(home, tw_adopt::paths::zed_settings()),
+        ),
         // 指令类
         f(
             "claude-code",
             Kind::Instructions,
-            home.join(".claude/CLAUDE.md"),
+            under(home, ".claude/CLAUDE.md"),
         ),
-        f("codex", Kind::Instructions, home.join(".codex/AGENTS.md")),
+        f("codex", Kind::Instructions, under(home, ".codex/AGENTS.md")),
     ];
-    for p in skills_in(&home.join(".claude/skills")) {
+    for p in skills_in(&under(home, ".claude/skills")) {
         v.push(f("claude-code", Kind::Skill, p));
     }
-    for p in md_in(&home.join(".claude/commands")) {
+    for p in md_in(&under(home, ".claude/commands")) {
         v.push(f("claude-code", Kind::Command, p));
     }
-    for p in md_in(&home.join(".claude/agents")) {
+    for p in md_in(&under(home, ".claude/agents")) {
         v.push(f("claude-code", Kind::Agent, p));
     }
     v.retain(|s| s.path.exists());
@@ -199,25 +205,25 @@ pub fn in_project(dir: &Path) -> Vec<Source> {
         f(
             "claude-code",
             Kind::Hooks,
-            dir.join(".claude/settings.json"),
+            under(dir, ".claude/settings.json"),
         ),
         f(
             "claude-code",
             Kind::Hooks,
-            dir.join(".claude/settings.local.json"),
+            under(dir, ".claude/settings.local.json"),
         ),
-        f("claude-code", Kind::Mcp, dir.join(".mcp.json")),
-        f("claude-code", Kind::Instructions, dir.join("CLAUDE.md")),
-        f("codex", Kind::Instructions, dir.join("AGENTS.md")),
-        f("cursor", Kind::Instructions, dir.join(".cursorrules")),
+        f("claude-code", Kind::Mcp, under(dir, ".mcp.json")),
+        f("claude-code", Kind::Instructions, under(dir, "CLAUDE.md")),
+        f("codex", Kind::Instructions, under(dir, "AGENTS.md")),
+        f("cursor", Kind::Instructions, under(dir, ".cursorrules")),
     ];
-    for p in md_in(&dir.join(".claude/commands")) {
+    for p in md_in(&under(dir, ".claude/commands")) {
         v.push(f("claude-code", Kind::Command, p));
     }
-    for p in md_in(&dir.join(".claude/agents")) {
+    for p in md_in(&under(dir, ".claude/agents")) {
         v.push(f("claude-code", Kind::Agent, p));
     }
-    for p in skills_in(&dir.join(".claude/skills")) {
+    for p in skills_in(&under(dir, ".claude/skills")) {
         v.push(f("claude-code", Kind::Skill, p));
     }
     v.retain(|s| s.path.exists());
