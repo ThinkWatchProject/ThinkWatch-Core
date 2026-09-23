@@ -9,7 +9,6 @@ description = "Retries, circuit breaking, and failover"
 
 [dependencies]
 tw-types = { workspace = true }
-tw-provider = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
