@@ -218,7 +218,7 @@ fn replace(tmp: &Path, real: &Path) -> std::io::Result<()> {
 /// 工具会把 mtime 全改成同一天）。序号补零到固定宽度，同一毫秒里的
 /// 几份也按先后排。
 pub fn backup_root() -> PathBuf {
-    tw_config::default_dir().join("backups")
+    tw_api::data::dir().join("backups")
 }
 
 /// 同一毫秒里最多几份备份。补零宽度跟着它走，超了排序就不对了。

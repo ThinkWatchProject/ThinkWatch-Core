@@ -72,7 +72,7 @@ pub struct ControlState {
 
 /// 用户的 home。
 ///
-/// **不是数据目录**（那个是 `tw_config::default_dir`）。这里只用来顺着它去找
+/// **不是数据目录**（那个是 `tw_api::data::dir`）。这里只用来顺着它去找
 /// 各家客户端的配置 —— `~/.claude`、`~/.codex`、`~/.cursor`，而这些点开头的
 /// 目录在 Windows 上同样躺在 `%USERPROFILE%` 下。
 ///
@@ -1665,7 +1665,7 @@ mod socket_path_tests {
     #[test]
     fn the_default_path_fits_with_room_to_spare() {
         // 这条不是形式主义：如果哪天默认目录变深了，它会立刻响。
-        let p = tw_config::default_dir().join("twcore.sock");
+        let p = tw_api::data::dir().join("twcore.sock");
         socket_path_fits(&p).unwrap();
     }
 

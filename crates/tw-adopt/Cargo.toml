@@ -11,6 +11,8 @@ description = "Detect local AI clients, take over their configuration, and resto
 serde = { workspace = true }
 tw-config = { path = "../tw-config" }
 tw-types = { workspace = true }
+# 数据目录在哪由契约层回答，见 `tw_api::data`
+tw-api = { workspace = true }
 tw-yaml = { path = "../tw-yaml" }
 serde_json = { workspace = true }
 toml_edit = { workspace = true }
