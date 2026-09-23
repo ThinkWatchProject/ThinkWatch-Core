@@ -837,7 +837,13 @@ mod tests {
         }
         for c in adoptable() {
             let steps = c.manual_steps();
-            assert_eq!(steps[0].arg("file"), format!("~/{}", c.config), "{}", c.id);
+            // 写法按平台（`~/…` 或 `%USERPROFILE%\…`），各自的样子见 paths 里那条测试
+            assert_eq!(
+                steps[0].arg("file"),
+                crate::paths::shown(c.config),
+                "{}",
+                c.id
+            );
             assert!(!edits(&c, &gw).is_empty(), "{}：没有要写的字段", c.id);
         }
         // Zed 的密钥不在配置文件里，多一步在它自己的设置里填
