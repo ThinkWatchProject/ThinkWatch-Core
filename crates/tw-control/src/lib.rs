@@ -1,8 +1,11 @@
 //! 控制面：unix socket 上的 HTTP。
 //!
-//! **不占 TCP 端口**。理由不是省端口，是权限：一个
-//! `0700` 的 socket 文件天然只有当前用户能连，不需要再发明一套 token。
-//! 只有用户显式开启远程访问时才监听 TCP，那时才需要 token。
+//! **不占 TCP 端口**。理由不是省端口，是权限：一个 `0700` 的 socket 文件
+//! 天然只有当前用户能连。
+//!
+//! 但那是文件系统给的保证，**只在这个平台上成立** —— Windows 上没有对等物，
+//! 控制面在那里只能落在回环 TCP 上。所以凭据这道门是另外装的一道，两个平台
+//! 都走它，见 [`token`]。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +33,7 @@ pub mod rotation;
 pub mod routes;
 pub mod scan;
 pub mod security;
+pub mod token;
 pub mod zai;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
@@ -1468,7 +1472,11 @@ pub fn socket_path_fits(path: &Path) -> Result<(), ControlError> {
 ///
 /// 陈旧的 socket 文件直接删掉重建 —— 它和 lock 文件不一样，没有「另一个
 /// 实例可能还在用」的歧义：单实例锁已经在上一步挡住了。
-pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlError> {
+pub async fn serve_unix(
+    state: ControlState,
+    path: &Path,
+    token: token::Token,
+) -> Result<(), ControlError> {
     socket_path_fits(path)?;
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -1483,12 +1491,13 @@ pub async fn serve_unix(state: ControlState, path: &Path) -> Result<(), ControlE
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // 0700：只有当前用户能连。这就是不需要 token 的原因。
+        // 0700：只有当前用户能连。凭据那道门在它之外，不是替代它 ——
+        // 两道都在，而只有这一道是平台给的。
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
     tracing::info!(path = %path.display(), "the control plane is listening");
 
-    let app = router(state);
+    let app = token::guard(router(state), token);
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(x) => x,
