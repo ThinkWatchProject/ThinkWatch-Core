@@ -59,6 +59,8 @@ pub fn keeps_header(client: Dialect, name: &str) -> bool {
             "conversation_id",
             "version",
         ],
+        // SigV4 签的是这一次请求的内容，转发给别的上游只会是一个签错的头
+        Dialect::Bedrock => &["x-amzn-bedrock-accept", "x-amzn-bedrock-save"],
         Dialect::Gemini => &["x-goog-api-client", "x-goog-user-project"],
     };
     !own.contains(&name.as_str())

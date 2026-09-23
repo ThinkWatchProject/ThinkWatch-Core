@@ -29,6 +29,8 @@ pub enum Dialect {
     Responses,
     /// Gemini：`/v1beta/models/{model}:generateContent`
     Gemini,
+    /// Bedrock Converse：`/model/{id}/converse`
+    Bedrock,
 }
 
 impl Dialect {
@@ -39,6 +41,7 @@ impl Dialect {
             Dialect::Chat => "openai-chat",
             Dialect::Responses => "openai-responses",
             Dialect::Gemini => "gemini",
+            Dialect::Bedrock => "bedrock",
         }
     }
 
@@ -48,6 +51,9 @@ impl Dialect {
             Dialect::Anthropic => Vendor::Anthropic,
             Dialect::Chat | Dialect::Responses => Vendor::OpenAi,
             Dialect::Gemini => Vendor::Google,
+            // Converse 上跑的是各家原厂模型。推理签名按 Anthropic 认 ——
+            // Bedrock 上有推理的就是 Claude
+            Dialect::Bedrock => Vendor::Anthropic,
         }
     }
 }
@@ -552,26 +558,32 @@ impl Feature {
             (Reasoning, Chat) => "reasoning_effort",
             (Reasoning, Responses) => "reasoning",
             (Reasoning, Gemini) => "generationConfig.thinkingConfig",
+            (Reasoning, Bedrock) => "additionalModelRequestFields.thinking",
             (ReasoningHistory, Anthropic) => "messages.content.thinking",
             (ReasoningHistory, Chat) => "messages.reasoning_content",
             (ReasoningHistory, Responses) => "input.reasoning",
             (ReasoningHistory, Gemini) => "contents.parts.thought",
+            (ReasoningHistory, Bedrock) => "messages.content.reasoningContent",
             (Format, Anthropic) => "output_config.format",
             (Format, Chat) => "response_format",
             (Format, Responses) => "text.format",
             (Format, Gemini) => "generationConfig.responseJsonSchema",
+            (Format, Bedrock) => "outputConfig.textFormat",
             (MediaUrl, Anthropic) => "messages.content.image.source.url",
             (MediaUrl, Chat) => "messages.content.image_url",
             (MediaUrl, Responses) => "input.content.input_image.image_url",
             (MediaUrl, Gemini) => "contents.parts.fileData",
+            (MediaUrl, Bedrock) => "messages.content.image.source.s3Location",
             (File, Anthropic) => "messages.content.document",
             (File, Chat) => "messages.content.file",
             (File, Responses) => "input.content.input_file",
             (File, Gemini) => "contents.parts.inlineData",
+            (File, Bedrock) => "messages.content.document",
             (ToolResultImage, Anthropic) => "messages.content.tool_result.content.image",
             (ToolResultImage, Chat) => "messages.content",
             (ToolResultImage, Responses) => "input.function_call_output.output.input_image",
             (ToolResultImage, Gemini) => "contents.parts.functionResponse.parts",
+            (ToolResultImage, Bedrock) => "messages.content.toolResult.content.image",
             (FreeformFormat, _) => "tools.custom.format",
         }
     }

@@ -185,6 +185,14 @@ pub fn apply_set(
                     g.insert("maxOutputTokens".into(), t);
                 }
             }
+            Dialect::Bedrock => {
+                let c = obj
+                    .entry("inferenceConfig")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(c) = c.as_object_mut() {
+                    c.insert("maxTokens".into(), t);
+                }
+            }
         }
     }
     if let Some(th) = set.thinking {
@@ -211,6 +219,15 @@ pub fn apply_set(
                         .and_then(|g| g.as_object_mut())
                     {
                         g.remove("thinkingConfig");
+                    }
+                }
+                // Converse 没有一等公民的思考开关，它在透传口袋里
+                Dialect::Bedrock => {
+                    if let Some(f) = obj
+                        .get_mut("additionalModelRequestFields")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        f.remove("thinking");
                     }
                 }
             }

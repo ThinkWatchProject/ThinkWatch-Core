@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tw_dialect::convert::{Session, prepare};
 use tw_dialect::frame::Decoder;
 use tw_dialect::ir::*;
-use tw_dialect::{anthropic, chat, gemini, responses};
+use tw_dialect::{anthropic, bedrock, chat, gemini, responses};
 
 const ALL: [Dialect; 4] = [
     Dialect::Anthropic,
@@ -49,6 +49,11 @@ fn client_request(d: Dialect, stream: bool) -> (Vec<u8>, String, Option<String>)
             "contents": [{"role": "user", "parts": [{"text": "北京天气？"}]}],
             "tools": [{"functionDeclarations": [{"name": "get_weather", "description": "查天气", "parametersJsonSchema": schema()}]}],
         }),
+        Dialect::Bedrock => json!({
+            "messages": [{"role": "user", "content": [{"text": "北京天气？"}]}],
+            "inferenceConfig": {"maxTokens": 1024},
+            "toolConfig": {"tools": [{"toolSpec": {"name": "get_weather", "description": "查天气", "inputSchema": {"json": schema()}}}]},
+        }),
     };
     let (path, query) = match d {
         Dialect::Anthropic => ("/v1/messages".to_string(), None),
@@ -64,6 +69,14 @@ fn client_request(d: Dialect, stream: bool) -> (Vec<u8>, String, Option<String>)
                 format!("/v1beta/models/test-model:{action}"),
                 stream.then(|| "alt=sse".to_string()),
             )
+        }
+        Dialect::Bedrock => {
+            let action = if stream {
+                "converse-stream"
+            } else {
+                "converse"
+            };
+            (format!("/model/test-model/{action}"), None)
         }
     };
     (body.to_string().into_bytes(), path, query)
@@ -104,6 +117,14 @@ fn upstream_response(d: Dialect) -> Value {
             ]}, "finishReason": "STOP"}],
             "usageMetadata": {"promptTokenCount": 100, "cachedContentTokenCount": 40, "candidatesTokenCount": 20},
             "modelVersion": "up-model", "responseId": "r_up"
+        }),
+        Dialect::Bedrock => json!({
+            "output": {"message": {"role": "assistant", "content": [
+                {"text": "天气晴"},
+                {"toolUse": {"toolUseId": "call_up_1", "name": "get_weather", "input": {"city": "北京"}}}
+            ]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 60, "cacheReadInputTokens": 40, "outputTokens": 20, "totalTokens": 120}
         }),
     }
 }
@@ -179,6 +200,21 @@ fn upstream_stream(d: Dialect) -> String {
             ]
             .concat()
         }
+        // 传输层已经把 eventstream 的二进制帧拆成了这个形状：
+        // `:event-type` 头进 event，载荷进 data
+        Dialect::Bedrock => [
+            named("messageStart", json!({"role": "assistant"})),
+            named("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"text": "天气"}})),
+            named("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"text": "晴"}})),
+            named("contentBlockStop", json!({"contentBlockIndex": 0})),
+            named("contentBlockStart", json!({"contentBlockIndex": 1, "start": {"toolUse": {"toolUseId": "call_up_1", "name": "get_weather"}}})),
+            named("contentBlockDelta", json!({"contentBlockIndex": 1, "delta": {"toolUse": {"input": "{\"city\":"}}})),
+            named("contentBlockDelta", json!({"contentBlockIndex": 1, "delta": {"toolUse": {"input": "\"北京\"}"}}})),
+            named("contentBlockStop", json!({"contentBlockIndex": 1})),
+            named("messageStop", json!({"stopReason": "tool_use"})),
+            named("metadata", json!({"usage": {"inputTokens": 60, "cacheReadInputTokens": 40, "outputTokens": 20, "totalTokens": 120}})),
+        ]
+        .concat(),
     }
 }
 
@@ -225,6 +261,7 @@ fn decode_client_response(d: Dialect, body: &[u8]) -> Response {
         Dialect::Chat => chat::decode_response(&v),
         Dialect::Responses => responses::decode_response(&v),
         Dialect::Gemini => gemini::decode_response(&v),
+        Dialect::Bedrock => bedrock::decode_response(&v),
     }
 }
 
@@ -251,6 +288,11 @@ fn decode_client_stream(d: Dialect, bytes: &[u8]) -> Response {
         }
         Dialect::Gemini => {
             let mut p = gemini::stream::Parser::default();
+            frames.iter().for_each(|f| p.frame(f, &mut events));
+            p.finish(&mut events);
+        }
+        Dialect::Bedrock => {
+            let mut p = bedrock::stream::Parser::default();
             frames.iter().for_each(|f| p.frame(f, &mut events));
             p.finish(&mut events);
         }
@@ -326,6 +368,7 @@ fn the_request_reaches_every_upstream_in_its_own_shape() {
                 Dialect::Chat => chat::decode_request(&v, &mut d, &mut shape),
                 Dialect::Responses => responses::decode_request(&v, &mut d, &mut shape),
                 Dialect::Gemini => gemini::decode_request(&v, "test-model", false, &mut d),
+                Dialect::Bedrock => bedrock::decode_request(&v, "test-model", false, &mut d),
             }
             .unwrap();
             let at = format!("{client:?} → {upstream:?}");

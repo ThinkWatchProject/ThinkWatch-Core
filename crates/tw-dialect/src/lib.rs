@@ -6,6 +6,7 @@
 //! [`ir`] 里的中间表示。这个 crate 只依赖 serde，不碰网络，企业版网关也可以直接用。
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod chat;
 pub mod convert;
 pub mod frame;

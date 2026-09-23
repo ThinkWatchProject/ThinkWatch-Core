@@ -78,6 +78,7 @@ pub fn drop_output_limit(request: &mut tw_dialect::ir::Request, client: Dialect)
             Dialect::Anthropic | Dialect::Chat => "max_tokens",
             Dialect::Responses => "max_output_tokens",
             Dialect::Gemini => "generationConfig.maxOutputTokens",
+            Dialect::Bedrock => "inferenceConfig.maxTokens",
         }
         .to_string(),
     )
