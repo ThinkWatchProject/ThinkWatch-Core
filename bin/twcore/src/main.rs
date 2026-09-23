@@ -227,10 +227,10 @@ fn cmd_scan(_config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<(
     Ok(())
 }
 
+/// 用户的 home。**问 tw-control 要，不在这儿再写一遍** —— 之前这里有一份
+/// 自己的拷贝，于是「home 是什么」在两个地方各有一个答案。
 fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    tw_control::home_dir()
 }
 
 fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {

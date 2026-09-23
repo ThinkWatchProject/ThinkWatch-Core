@@ -62,10 +62,21 @@ pub struct ControlState {
     pub home: std::path::PathBuf,
 }
 
-/// `$HOME`。取不到时给一个空路径，而不是 `/` —— 空路径会让后续的
-/// 「文件不存在」自然发生，`/` 则会让我们去翻系统根目录。
+/// 用户的 home。
+///
+/// **不是数据目录**（那个是 `tw_config::default_dir`）。这里只用来顺着它去找
+/// 各家客户端的配置 —— `~/.claude`、`~/.codex`、`~/.cursor`，而这些点开头的
+/// 目录在 Windows 上同样躺在 `%USERPROFILE%` 下。
+///
+/// 取不到时给一个空路径，而不是 `/` —— 空路径会让后续的「文件不存在」自然
+/// 发生，`/` 则会让我们去翻系统根目录。
 pub fn home_dir() -> std::path::PathBuf {
-    std::env::var_os("HOME")
+    // Windows 上没有 `HOME`。
+    #[cfg(windows)]
+    const VAR: &str = "USERPROFILE";
+    #[cfg(not(windows))]
+    const VAR: &str = "HOME";
+    std::env::var_os(VAR)
         .map(std::path::PathBuf::from)
         .unwrap_or_default()
 }
