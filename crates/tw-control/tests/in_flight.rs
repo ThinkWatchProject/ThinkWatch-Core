@@ -20,6 +20,7 @@ fn app() -> (tempfile::TempDir, tw_observe::EventBus, axum::Router) {
     let gw = tw_gateway::AppState::new(cfg).unwrap();
     let bus = gw.bus.clone();
     let state = ControlState {
+        shutdown: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus.clone())),
         gateway: gw,
         store: None,

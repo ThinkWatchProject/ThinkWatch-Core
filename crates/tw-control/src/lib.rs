@@ -33,9 +33,11 @@ pub mod rotation;
 pub mod routes;
 pub mod scan;
 pub mod security;
+pub mod shutdown;
 pub mod token;
 pub mod zai;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
+pub use shutdown::Shutdown;
 pub use tw_observe::EventBus;
 
 #[derive(Clone)]
@@ -58,6 +60,8 @@ pub struct ControlState {
     /// Z.ai / BigModel 账号的登录。**同一时刻也只有一次** —— 理由不是端口，是
     /// 「一次登录」在界面上就是一件正在进行的事，两件同时进行没人说得清哪件成了
     pub zai: Arc<zai::Accounts>,
+    /// 请网关退出的那个开关。控制面上的 `POST /shutdown` 扳它，主循环等它。
+    pub shutdown: Shutdown,
     /// 用户的 home。接管要顺着它去找各客户端的配置。
     ///
     /// **是个字段，不是每次现读 `$HOME`。**进程级的环境变量是全局可变
@@ -109,6 +113,7 @@ impl ControlState {
 pub fn router(state: ControlState) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/shutdown", post(ask_shutdown))
         .route("/interfaces", get(interfaces))
         .merge(keys::router())
         .merge(listen::router())
@@ -184,6 +189,26 @@ async fn interfaces() -> Json<Vec<tw_api::NicView>> {
                 addr: n.addr.to_string(),
             })
             .collect(),
+    )
+}
+
+/// 请网关退出。
+///
+/// 理由见 [`shutdown`] 那个模块：Windows 上没有 SIGTERM，而桌面端要在改完
+/// 配置之后重启 core、在装更新之前停掉它并且等它真的退出。
+async fn ask_shutdown(State(s): State<ControlState>) -> (StatusCode, Json<Msg>) {
+    tracing::info!("asked to shut down over the control plane");
+    // **先把话说完再退。**立刻扳开关的话，这条响应可能还没写出去进程就没了，
+    // 而客户端看到的是连接被重置 —— 和「core 崩了」长得一模一样，偏偏这是
+    // 它自己要求的那一次退出。
+    let sw = s.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sw.ask();
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(msg!("control.shutdown" => "The gateway is shutting down.")),
     )
 }
 

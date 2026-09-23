@@ -728,6 +728,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // **在起任何东西之前问**。等到 bind 失败时，网关已经在监听、客户端
     // 可能已经连上来了，而这条错误当时只会进日志。
     tw_control::endpoint_usable(&endpoint)?;
+    // 「该退了」的开关。**在起任何东西之前建好** —— 控制面和主循环各拿
+    // 一份，而控制面可能在主循环开始等之前就收到那条请求。
+    let shutdown = tw_control::Shutdown::default();
     // 控制面的凭据，同样在起任何东西之前拿到：桌面端从环境变量交过来，
     // 手工启动时生成一个写进配置目录。取不到就停在这儿 —— 一个装不上门的
     // 控制面不该先起来再说。
@@ -810,6 +813,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 控制面无论如何都要起来 —— **网关挂了的时候，用户最需要的恰恰
         // 是能改配置**。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
+            shutdown: shutdown.clone(),
             home: tw_control::home_dir(),
             started: std::time::Instant::now(),
             gateway: state.clone(),
@@ -878,7 +882,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                 msg = control_dead => {
                     anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
                 }
-                _ = shutdown_signal() => {}
+                _ = shutdown_requested(&shutdown) => {}
             }
             return Ok(());
         }
@@ -895,7 +899,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             msg = control_dead => {
                 anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))
             }
-            _ = shutdown_signal() => {
+            _ = shutdown_requested(&shutdown) => {
                 tracing::info!("got a shutdown signal");
                 Ok(())
             }
@@ -975,7 +979,14 @@ fn build_store(
     ))
 }
 
-async fn shutdown_signal() {
+/// 等一个「该退了」。
+///
+/// 三个来源：Ctrl-C、SIGTERM，以及控制面上的那条请求。
+///
+/// **第三个不是锦上添花。**Windows 上根本没有 SIGTERM，而桌面端要在改完配置
+/// 之后重启 core、装更新之前停掉它 —— 那个平台上剩下的只有强杀，而强杀意味着
+/// WAL 没收尾、在途请求断在半路。见 `tw_control::shutdown`。
+async fn shutdown_requested(asked: &tw_control::Shutdown) {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
     };
@@ -988,5 +999,5 @@ async fn shutdown_signal() {
     };
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    tokio::select! { _ = ctrl_c => {}, _ = term => {}, _ = asked.asked() => {} }
 }
