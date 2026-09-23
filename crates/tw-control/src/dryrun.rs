@@ -96,18 +96,10 @@ pub async fn dry_run(
             .iter()
             .map(|r| crate::routes::to_rule(r, &cfg))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    msg!("control.bad_rule", detail = e => "{detail}"),
-                )
-            })?;
-        engine.check_rules(&draft).map_err(|e| {
-            fail(
-                StatusCode::BAD_REQUEST,
-                msg!("control.bad_rule", detail = e => "{detail}"),
-            )
-        })?;
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        engine
+            .check_rules(&draft)
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, e.msg()))?;
         (d.name.clone(), draft.as_slice())
     } else if let Some(name) = req.route.as_deref().filter(|n| !n.is_empty()) {
         let rules = engine
@@ -309,10 +301,7 @@ pub async fn dry_run(
             out.outcome = "no_match".into();
         }
         Err(e) => {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                msg!("control.route_failed", detail = e => "{detail}"),
-            ));
+            return Err(fail(StatusCode::BAD_REQUEST, e.msg()));
         }
     }
     Ok(Json(out))

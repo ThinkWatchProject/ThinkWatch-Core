@@ -5,6 +5,7 @@
 //! 所以引擎只有一条代码路径，用户看到的却是零配置可用。
 
 use serde::{Deserialize, Serialize};
+use tw_types::{Msg, msg};
 
 use crate::facts::RequestFacts;
 use crate::rule::{MatchError, When};
@@ -461,36 +462,80 @@ pub enum Outcome2 {
     },
 }
 
+/// 路由出不来的原因。
+///
+/// **英文只写一遍**：`Display` 就是 [`RouteError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RouteError {
-    #[error("no rule matched, and there is no catch-all. Add a rule without a `when` at the end")]
+    #[error("{}", self.msg())]
     NoMatch,
-    #[error(
-        "rule `{0}` sets both provider_would_be and to. provider_would_be can only be evaluated once an upstream is chosen, so such a rule takes only set or deny"
-    )]
+    #[error("{}", self.msg())]
     PhaseTwoWithTo(String),
-    #[error("rule `{0}` sets none of to, deny or set, so matching it does nothing")]
+    #[error("{}", self.msg())]
     NoAction(String),
-    #[error("rule `{rule}` points at `{target}`, which is neither an upstream nor a group")]
+    #[error("{}", self.msg())]
     UnknownTarget { rule: String, target: String },
-    #[error("group `{0}` has no upstream in it")]
+    #[error("{}", self.msg())]
     EmptyGroup(String),
-    #[error(
-        "there is more than one group named `{0}`. Rules refer to a group by name, so names have to be unique"
-    )]
+    #[error("{}", self.msg())]
     DuplicateGroup(String),
-    #[error(
-        "there is more than one route named `{0}`. A gateway key binds to a route by name, so names have to be unique"
-    )]
+    #[error("{}", self.msg())]
     DuplicateRoute(String),
-    #[error(
-        "default_route points at route `{0}`, which does not exist, so a gateway key with no route of its own matches nothing"
-    )]
+    #[error("{}", self.msg())]
     UnknownDefaultRoute(String),
-    #[error("gateway key `{client}` binds to route `{route}`, which does not exist")]
+    #[error("{}", self.msg())]
     UnknownRoute { client: String, route: String },
     #[error(transparent)]
     Match(#[from] MatchError),
+}
+
+impl RouteError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            RouteError::NoMatch => msg!(
+                "engine.no_match" =>
+                "no rule matched, and there is no catch-all. Add a rule without a `when` at the end"
+            ),
+            RouteError::PhaseTwoWithTo(rule) => msg!(
+                "engine.phase_two_with_to", rule = rule =>
+                "rule `{rule}` sets both provider_would_be and to. provider_would_be can only be \
+                 evaluated once an upstream is chosen, so such a rule takes only set or deny"
+            ),
+            RouteError::NoAction(rule) => msg!(
+                "engine.no_action", rule = rule =>
+                "rule `{rule}` sets none of to, deny or set, so matching it does nothing"
+            ),
+            RouteError::UnknownTarget { rule, target } => msg!(
+                "engine.unknown_target", rule = rule, target = target =>
+                "rule `{rule}` points at `{target}`, which is neither an upstream nor a group"
+            ),
+            RouteError::EmptyGroup(group) => msg!(
+                "engine.empty_group", group = group =>
+                "group `{group}` has no upstream in it"
+            ),
+            RouteError::DuplicateGroup(group) => msg!(
+                "engine.duplicate_group", group = group =>
+                "there is more than one group named `{group}`. Rules refer to a group by name, so \
+                 names have to be unique"
+            ),
+            RouteError::DuplicateRoute(route) => msg!(
+                "engine.duplicate_route", route = route =>
+                "there is more than one route named `{route}`. A gateway key binds to a route by \
+                 name, so names have to be unique"
+            ),
+            RouteError::UnknownDefaultRoute(route) => msg!(
+                "engine.unknown_default_route", route = route =>
+                "default_route points at route `{route}`, which does not exist, so a gateway key \
+                 with no route of its own matches nothing"
+            ),
+            RouteError::UnknownRoute { client, route } => msg!(
+                "engine.unknown_route", key = client, route = route =>
+                "gateway key `{key}` binds to route `{route}`, which does not exist"
+            ),
+            RouteError::Match(e) => e.msg(),
+        }
+    }
 }
 
 pub struct Engine {
@@ -1863,5 +1908,51 @@ mod builtin_tests {
             vec![rule("兜底", "{}", "pool")],
         );
         assert_eq!(e.validate(), Err(RouteError::DuplicateGroup("pool".into())));
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+    use crate::num::ParseError;
+
+    #[test]
+    fn every_route_error_has_its_own_code() {
+        let bad = |source| {
+            RouteError::Match(MatchError::BadCompare {
+                field: "input_tokens",
+                source,
+            })
+        };
+        let all = [
+            RouteError::NoMatch,
+            RouteError::PhaseTwoWithTo("r".into()),
+            RouteError::NoAction("r".into()),
+            RouteError::UnknownTarget {
+                rule: "r".into(),
+                target: "t".into(),
+            },
+            RouteError::EmptyGroup("g".into()),
+            RouteError::DuplicateGroup("g".into()),
+            RouteError::DuplicateRoute("x".into()),
+            RouteError::UnknownDefaultRoute("x".into()),
+            RouteError::UnknownRoute {
+                client: "k".into(),
+                route: "x".into(),
+            },
+            bad(ParseError::Empty),
+            bad(ParseError::NoOperator("200k".into())),
+            bad(ParseError::BadNumber(">x".into())),
+            bad(ParseError::BadUnit(">2q".into())),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for e in &all {
+            let m = e.msg();
+            assert!(m.code.starts_with("engine."), "{m:?}");
+            assert!(!m.text.is_empty() && m.text == e.to_string(), "{m:?}");
+            assert!(seen.insert(m.code.clone()), "码重复了：{}", m.code);
+        }
+        let m = bad(ParseError::BadUnit(">2q".into())).msg();
+        assert_eq!((m.arg("field"), m.arg("value")), ("input_tokens", ">2q"));
     }
 }

@@ -15,6 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use tw_types::{Msg, msg};
+
 /// 一次写入之后文件长什么样。
 ///
 /// 三个字段缺一不可：**只看 mtime 会漏判**（文件系统的时间精度不够，
@@ -73,20 +75,43 @@ pub fn version_of(text: &str) -> String {
     format!("blake3:{}", &hash_of(text)[..12])
 }
 
+/// 读写配置文件时的失败。
+///
+/// **英文只写一遍**：`Display` 就是 [`StoreError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("{path} could not be read: {source}")]
+    #[error("{}", self.msg())]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} does not exist")]
+    #[error("{}", self.msg())]
     Missing { path: PathBuf },
     /// **有人在我们读到和写下之间改了这个文件。**
-    #[error(
-        "the configuration file changed in the meantime (it is now {current}, and this edit is based on {expected}), so it was not overwritten. Look at the current content and try again"
-    )]
+    #[error("{}", self.msg())]
     Conflict { expected: String, current: String },
+}
+
+impl StoreError {
+    /// 给人看的那句话，带码。`Io` 的 `detail` 是系统的原话，只能原样带出去。
+    pub fn msg(&self) -> Msg {
+        match self {
+            StoreError::Io { path, source } => msg!(
+                "config.store.read_failed", path = path.display(), detail = source =>
+                "{path} could not be read: {detail}"
+            ),
+            StoreError::Missing { path } => msg!(
+                "config.store.missing", path = path.display() =>
+                "{path} does not exist"
+            ),
+            StoreError::Conflict { expected, current } => msg!(
+                "config.store.conflict", expected = expected, current = current =>
+                "the configuration file changed in the meantime (it is now {current}, and this \
+                 edit is based on {expected}), so it was not overwritten. Look at the current \
+                 content and try again"
+            ),
+        }
+    }
 }
 
 /// 一份读到内存里的配置文本，带着它的来源和版本。

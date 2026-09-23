@@ -436,7 +436,7 @@ fn bad(e: plan::PlanError) -> Fail {
         plan::PlanError::ForeignSidecar { .. } => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
-    fail(code, msg!("control.adopt_failed", detail = e => "{detail}"))
+    fail(code, e.msg())
 }
 
 /// 落盘。**用户在 diff 上点过确认之后才该到这里。**
@@ -484,12 +484,7 @@ pub async fn restore(
 // ---------------------------------------------------------------- MCP 矩阵
 
 fn mcp_target(id: &str) -> Result<tw_adopt::mcp::Target, Fail> {
-    tw_adopt::mcp::target(id).map_err(|e| {
-        fail(
-            StatusCode::NOT_FOUND,
-            msg!("control.mcp_target_unknown", detail = e => "{detail}"),
-        )
-    })
+    tw_adopt::mcp::target(id).map_err(|e| fail(StatusCode::NOT_FOUND, e.msg()))
 }
 
 fn mcp_err(e: tw_adopt::mcp::McpError) -> Fail {
@@ -501,7 +496,7 @@ fn mcp_err(e: tw_adopt::mcp::McpError) -> Fail {
         tw_adopt::mcp::McpError::NotCopyable { .. } => StatusCode::NOT_IMPLEMENTED,
         _ => StatusCode::BAD_REQUEST,
     };
-    fail(code, msg!("control.mcp_failed", detail = e => "{detail}"))
+    fail(code, e.msg())
 }
 
 /// 能写和不能写的分别是哪些。

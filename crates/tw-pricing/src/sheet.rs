@@ -31,6 +31,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use tw_types::{Msg, msg};
 
 use crate::ModelPrice;
 
@@ -100,33 +101,74 @@ pub struct PerMillion {
     pub output_above_200k: Option<f64>,
 }
 
+/// 价目表写错的地方。
+///
+/// **英文只写一遍**：`Display` 就是 [`SheetError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SheetError {
-    #[error("a price sheet has no name")]
+    #[error("{}", self.msg())]
     EmptyName,
-    #[error("the price sheet name `{0}` cannot start or end with whitespace")]
+    #[error("{}", self.msg())]
     PaddedName(String),
-    #[error("the price sheet name {0} appears twice")]
+    #[error("{}", self.msg())]
     DuplicateName(String),
-    #[error(
-        "the multiplier {value} of price sheet `{sheet}` is not valid; a multiplier is greater than 0"
-    )]
+    #[error("{}", self.msg())]
     BadMultiplier { sheet: String, value: f64 },
-    #[error("a model in price sheet `{sheet}` has no name")]
+    #[error("{}", self.msg())]
     EmptyModel { sheet: String },
-    #[error(
-        "the {field} of model {model} in price sheet `{sheet}` is {value}; a price cannot be negative"
-    )]
+    #[error("{}", self.msg())]
     BadPrice {
         sheet: String,
         model: String,
+        /// 哪一项价格，英文词组（`input price`）。界面按它查自己的词表
         field: &'static str,
         value: f64,
     },
-    #[error(
-        "model {model} in price sheet `{sheet}` needs both the long-context input price and the output price, or neither"
-    )]
+    #[error("{}", self.msg())]
     HalfLongContext { sheet: String, model: String },
+}
+
+impl SheetError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            SheetError::EmptyName => {
+                msg!("pricing.sheet.empty_name" => "a price sheet has no name")
+            }
+            SheetError::PaddedName(sheet) => msg!(
+                "pricing.sheet.padded_name", sheet = sheet =>
+                "the price sheet name `{sheet}` cannot start or end with whitespace"
+            ),
+            SheetError::DuplicateName(sheet) => msg!(
+                "pricing.sheet.duplicate_name", sheet = sheet =>
+                "the price sheet name {sheet} appears twice"
+            ),
+            SheetError::BadMultiplier { sheet, value } => msg!(
+                "pricing.sheet.bad_multiplier", sheet = sheet, value = value =>
+                "the multiplier {value} of price sheet `{sheet}` is not valid; a multiplier is \
+                 greater than 0"
+            ),
+            SheetError::EmptyModel { sheet } => msg!(
+                "pricing.sheet.empty_model", sheet = sheet =>
+                "a model in price sheet `{sheet}` has no name"
+            ),
+            SheetError::BadPrice {
+                sheet,
+                model,
+                field,
+                value,
+            } => msg!(
+                "pricing.sheet.bad_price", sheet = sheet, model = model, field = field, value = value =>
+                "the {field} of model {model} in price sheet `{sheet}` is {value}; a price cannot \
+                 be negative"
+            ),
+            SheetError::HalfLongContext { sheet, model } => msg!(
+                "pricing.sheet.half_long_context", sheet = sheet, model = model =>
+                "model {model} in price sheet `{sheet}` needs both the long-context input price \
+                 and the output price, or neither"
+            ),
+        }
+    }
 }
 
 impl PricingConfig {
@@ -364,5 +406,41 @@ mod tests {
         assert_eq!(v.cache_write_1h, 1.25);
         // 显示的和写回去的是同一组数：换算一个来回不变
         assert_eq!(PerMillion::of(&v.to_price(None)), v);
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+
+    #[test]
+    fn every_sheet_error_has_its_own_code() {
+        let all = [
+            SheetError::EmptyName,
+            SheetError::PaddedName(" a".into()),
+            SheetError::DuplicateName("a".into()),
+            SheetError::BadMultiplier {
+                sheet: "a".into(),
+                value: 0.0,
+            },
+            SheetError::EmptyModel { sheet: "a".into() },
+            SheetError::BadPrice {
+                sheet: "a".into(),
+                model: "m".into(),
+                field: "input price",
+                value: -1.0,
+            },
+            SheetError::HalfLongContext {
+                sheet: "a".into(),
+                model: "m".into(),
+            },
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for e in &all {
+            let m = e.msg();
+            assert!(m.code.starts_with("pricing.sheet."), "{m:?}");
+            assert!(!m.text.is_empty() && m.text == e.to_string(), "{m:?}");
+            assert!(seen.insert(m.code.clone()), "码重复了：{}", m.code);
+        }
     }
 }

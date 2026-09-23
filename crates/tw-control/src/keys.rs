@@ -166,11 +166,11 @@ async fn update(
             let c = to_client(&req.key, Some(existing), cfg)?;
             // 默认密钥停用 = 把所有手动配置的客户端一起关掉，而它们不在这一页上
             if c.disabled && cfg.default_client().map(|d| d.name.as_str()) == Some(name.as_str()) {
-                return Err(ApplyError::InUse(
+                return Err(ApplyError::InUse(msg!(
+                    "control.default_key_cannot_disable" =>
                     "The default key cannot be disabled. Every client that has not been pointed \
                      at the gateway explicitly uses it, and disabling it would break all of them."
-                        .to_string(),
-                ));
+                )));
             }
             let mut out =
                 edit::upsert(text, CLIENTS, Some(&name), &crate::resources::mapping(&c)?)?;
@@ -203,24 +203,25 @@ async fn delete_key(
                 .find(|c| c.name == name)
                 .ok_or_else(|| not_found(&name))?;
             if cfg.default_client().map(|d| d.name.as_str()) == Some(name.as_str()) {
-                return Err(ApplyError::InUse(
+                return Err(ApplyError::InUse(msg!(
+                    "control.default_key_cannot_delete" =>
                     "The default key cannot be deleted. Every client that has not been pointed at \
                      the gateway explicitly uses it, and they could not connect without it."
-                        .to_string(),
-                ));
+                )));
             }
             if let Some(label) = &adopted {
-                return Err(ApplyError::InUse(format!(
-                    "{label} is pointed at the gateway and has this key in its configuration. Restore \
-                 it before deleting the key."
+                return Err(ApplyError::InUse(msg!(
+                    "control.key_used_by_client", client = label =>
+                    "{client} is pointed at the gateway and has this key in its configuration. \
+                     Restore it before deleting the key."
                 )));
             }
             let used = refs::client_refs(cfg, &c.name);
             if !used.is_empty() {
-                return Err(ApplyError::InUse(format!(
-                    "Gateway key `{name}` is still referenced by {}; drop those references before \
-                     deleting it.",
-                    used.join(", ")
+                return Err(ApplyError::InUse(msg!(
+                    "control.key_in_use", key = name, refs = used.join(", ") =>
+                    "Gateway key `{key}` is still referenced by {refs}; drop those references \
+                     before deleting it."
                 )));
             }
             Ok(edit::remove(text, CLIENTS, &name)?)
@@ -243,9 +244,9 @@ async fn set_default(
                 .find(|c| c.name == req.name)
                 .ok_or_else(|| not_found(&req.name))?;
             if c.disabled {
-                return Err(ApplyError::InUse(format!(
-                    "Gateway key `{}` is disabled, so it cannot be the default key.",
-                    req.name
+                return Err(ApplyError::InUse(msg!(
+                    "control.disabled_key_cannot_be_default", key = req.name =>
+                    "Gateway key `{key}` is disabled, so it cannot be the default key."
                 )));
             }
             // 默认值不写进文件
@@ -367,7 +368,7 @@ fn to_client(
     cfg: &tw_config::Config,
 ) -> Result<tw_config::Client, ApplyError> {
     let name = crate::resources::checked_name(&input.name, "gateway key")
-        .map_err(|e| crate::resources::invalid(e.text))?;
+        .map_err(crate::resources::invalid)?;
     if let Some(r) = input
         .route
         .as_deref()

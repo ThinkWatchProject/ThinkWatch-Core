@@ -10,6 +10,7 @@ description = "YAML patch layer that makes minimal edits to the original text"
 [dependencies]
 saphyr-parser = { workspace = true }
 thiserror = { workspace = true }
+tw-types = { workspace = true }
 
 [dev-dependencies]
 serde_yaml_ng = { workspace = true }

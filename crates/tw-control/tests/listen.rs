@@ -198,7 +198,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "control.listen.bad_bind");
+    assert_eq!(v["code"], "control.listen.bind_invalid");
 
     let (st, v) = call(
         &b.app,

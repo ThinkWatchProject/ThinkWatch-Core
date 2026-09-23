@@ -363,7 +363,9 @@ async fn a_client_whose_mcp_shape_we_have_not_verified_refuses_and_explains() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{out}");
-    assert!(out.contains("is unverified"), "{out}");
+    // 说的是**为什么**不能写，带着那条理由自己的码
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["code"], "adopt.mcp.zed_structure", "{out}");
 }
 
 #[tokio::test]

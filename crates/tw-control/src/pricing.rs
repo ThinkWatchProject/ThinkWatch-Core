@@ -170,14 +170,57 @@ struct Attempt {
     error: Option<String>,
 }
 
+/// 刷新默认价目表没成。
+///
+/// **英文只写一遍**：`Display` 就是 [`RefreshError::msg`] 的原句（它也是价目
+/// 页上「上次刷新失败」那一行），界面拿码去翻。`detail` 都是网络库、JSON
+/// 解析器或文件系统的原话。
 #[derive(Debug, thiserror::Error)]
 pub enum RefreshError {
-    #[error("{0}")]
-    Fetch(String),
-    #[error("what was downloaded is not a price data set: {0}")]
+    #[error("{}", self.msg())]
+    Unreachable(String),
+    #[error("{}", self.msg())]
+    Status(u16),
+    #[error("{}", self.msg())]
+    BrokeOff(String),
+    #[error("{}", self.msg())]
+    TooLarge { mb: usize },
+    #[error("{}", self.msg())]
     Dataset(String),
-    #[error("the price sheet could not be saved: {0}")]
+    #[error("{}", self.msg())]
     Save(String),
+}
+
+impl RefreshError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            RefreshError::Unreachable(d) => msg!(
+                "control.pricing.unreachable", detail = d =>
+                "the price data source could not be reached: {detail}"
+            ),
+            RefreshError::Status(status) => msg!(
+                "control.pricing.status", status = status =>
+                "the price data source answered HTTP {status}"
+            ),
+            RefreshError::BrokeOff(d) => msg!(
+                "control.pricing.broke_off", detail = d =>
+                "the download broke off: {detail}"
+            ),
+            RefreshError::TooLarge { mb } => msg!(
+                "control.pricing.too_large", mb = mb =>
+                "what was downloaded is not a price data set: the file is over {mb} MB"
+            ),
+            RefreshError::Dataset(d) => msg!(
+                "control.pricing.not_a_dataset", detail = d =>
+                "what was downloaded is not a price data set: {detail}"
+            ),
+            RefreshError::Save(d) => msg!(
+                "control.pricing.save_failed", detail = d =>
+                "the price sheet could not be saved: {detail}"
+            ),
+        }
+    }
 }
 
 impl Default for Updater {
@@ -278,29 +321,20 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshErro
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
-        .map_err(|e| {
-            RefreshError::Fetch(format!(
-                "the price data source could not be reached: {}",
-                chain(&e)
-            ))
-        })?;
+        .map_err(|e| RefreshError::Unreachable(chain(&e)))?;
     if !resp.status().is_success() {
-        return Err(RefreshError::Fetch(format!(
-            "the price data source answered HTTP {}",
-            resp.status().as_u16()
-        )));
+        return Err(RefreshError::Status(resp.status().as_u16()));
     }
     let mut raw = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| RefreshError::Fetch(format!("the download broke off: {}", chain(&e))))?
+        .map_err(|e| RefreshError::BrokeOff(chain(&e)))?
     {
         if raw.len() + chunk.len() > MAX_DATASET {
-            return Err(RefreshError::Dataset(format!(
-                "the file is over {} MB",
-                MAX_DATASET / 1024 / 1024
-            )));
+            return Err(RefreshError::TooLarge {
+                mb: MAX_DATASET / 1024 / 1024,
+            });
         }
         raw.extend_from_slice(&chunk);
     }
@@ -308,8 +342,13 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshErro
 }
 
 fn apply(s: &ControlState, raw: &[u8]) -> Result<usize, RefreshError> {
-    let table = tw_pricing::Table::fetched(raw, local_date(SystemTime::now()))
-        .map_err(|e| RefreshError::Dataset(e.to_string()))?;
+    // 解析器那句外面还套着一层「价格数据解析不了」，和这里要说的是同一件事，
+    // 只取里面那句原话
+    let table = tw_pricing::Table::fetched(raw, local_date(SystemTime::now())).map_err(|e| {
+        RefreshError::Dataset(match e {
+            tw_pricing::PricingError::Dataset(d) | tw_pricing::PricingError::Snapshot(d) => d,
+        })
+    })?;
     // 解析成功就一定是 UTF-8（JSON 只能是）
     let text = std::str::from_utf8(raw).map_err(|e| RefreshError::Dataset(e.to_string()))?;
     tw_config::store::write_atomic(&data_path(s.config_path()), text)
@@ -371,10 +410,7 @@ async fn refresh_now(
             RefreshError::Save(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_GATEWAY,
         };
-        fail(
-            code,
-            msg!("control.pricing_refresh_failed", detail = e => "{detail}"),
-        )
+        fail(code, e.msg())
     })?;
     Ok(Json(tw_api::PricingRefreshed {
         status: pricing_status(&s).await,
@@ -431,12 +467,7 @@ async fn query(
             (loaded, Some(name))
         }
         tw_api::SheetRef::Draft { sheet } => {
-            let def = sheet_def(&sheet).map_err(|e| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    msg!("control.bad_price_sheet", detail = e => "{detail}"),
-                )
-            })?;
+            let def = sheet_def(&sheet).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
             let name = def.name.clone();
             (Arc::new(loaded.with_draft(def)), Some(name))
         }
@@ -535,7 +566,7 @@ async fn create_sheet(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
-            let def = sheet_def(&req.sheet).map_err(|e| invalid(e.text))?;
+            let def = sheet_def(&req.sheet).map_err(invalid)?;
             let mut out = edit::upsert(text, edit::PRICE_SHEETS, None, &mapping(&def)?)?;
             if let Some(used_by) = &req.used_by {
                 out = assign(&out, cfg, None, &def.name, used_by)?;
@@ -555,7 +586,7 @@ async fn update_sheet(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
-            let def = sheet_def(&req.sheet).map_err(|e| invalid(e.text))?;
+            let def = sheet_def(&req.sheet).map_err(invalid)?;
             let mut out = edit::upsert(text, edit::PRICE_SHEETS, Some(&name), &mapping(&def)?)?;
             if def.name != name {
                 // **和那一张在同一个版本里改** —— 分两次写的话，中间那一版的
@@ -582,9 +613,10 @@ async fn delete_sheet(
         .transform(q.base_version.as_deref(), Origin::Ui, |text, cfg| {
             let users = refs::sheet_users(cfg, &name);
             if !users.is_empty() {
-                return Err(ApplyError::InUse(format!(
-                    "Price sheet `{name}` is still used by upstream {}; unlink those before deleting it.",
-                    quoted(&users)
+                return Err(ApplyError::InUse(msg!(
+                    "control.sheet_in_use", sheet = name, upstreams = quoted(&users) =>
+                    "Price sheet `{sheet}` is still used by upstream {upstreams}; unlink those \
+                     before deleting it."
                 )));
             }
             Ok(edit::remove(text, edit::PRICE_SHEETS, &name)?)
@@ -657,8 +689,7 @@ fn sheet_def(input: &tw_api::PriceSheetInput) -> Result<tw_pricing::SheetDef, Ms
             .map(|(m, p)| (m.clone(), per_million(p)))
             .collect(),
     };
-    def.validate()
-        .map_err(|e| msg!("control.bad_price_sheet", detail = e => "{detail}"))?;
+    def.validate().map_err(|e| e.msg())?;
     Ok(def)
 }
 
@@ -738,8 +769,32 @@ mod tests {
         let tomorrow = now + Duration::from_secs(24 * 3600 + 1);
         assert!(u.due(&config, tomorrow));
         // 那时刷新失败了：一小时之内不再试
-        u.record(&Err(RefreshError::Fetch("离线".into())), tomorrow);
+        u.record(&Err(RefreshError::Unreachable("离线".into())), tomorrow);
         assert!(!u.due(&config, tomorrow + Duration::from_secs(60)));
         assert!(u.due(&config, tomorrow + Duration::from_secs(3601)));
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+
+    #[test]
+    fn every_refresh_error_has_its_own_code() {
+        let all = [
+            RefreshError::Unreachable("x".into()),
+            RefreshError::Status(503),
+            RefreshError::BrokeOff("x".into()),
+            RefreshError::TooLarge { mb: 16 },
+            RefreshError::Dataset("x".into()),
+            RefreshError::Save("x".into()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for e in &all {
+            let m = e.msg();
+            assert!(m.code.starts_with("control.pricing."), "{m:?}");
+            assert!(!m.text.is_empty() && m.text == e.to_string(), "{m:?}");
+            assert!(seen.insert(m.code.clone()), "码重复了：{}", m.code);
+        }
     }
 }

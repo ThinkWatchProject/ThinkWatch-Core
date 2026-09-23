@@ -2893,6 +2893,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tw-dialect",
+ "tw-types",
 ]
 
 [[package]]
@@ -2959,6 +2960,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "thiserror",
+ "tw-types",
 ]
 
 [[package]]
@@ -3104,6 +3106,7 @@ dependencies = [
  "saphyr-parser",
  "serde_yaml_ng",
  "thiserror",
+ "tw-types",
 ]
 
 [[package]]

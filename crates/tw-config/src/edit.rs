@@ -18,23 +18,76 @@
 //! 和写之前完全一样。对不上就不返回。
 
 use serde_yaml_ng::{Mapping, Value};
+use tw_types::{Msg, msg};
 use tw_yaml::{Put, Step};
 
+/// 按名字改一项时的失败。
+///
+/// **英文只写一遍**：`Display` 就是 [`EditError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
-    #[error("there is already a {what} named `{name}`")]
+    /// `what` 是 [`Section::what`] 那个词（`upstream`、`price sheet`），
+    /// 界面按它查自己的词表
+    #[error("{}", self.msg())]
     NameTaken { what: &'static str, name: String },
-    #[error("there is no {what} named `{name}`")]
+    #[error("{}", self.msg())]
     NotFound { what: &'static str, name: String },
-    #[error("{0}")]
+    #[error(transparent)]
     Yaml(#[from] tw_yaml::PatchError),
-    #[error("the configuration file could not be parsed: {0}")]
+    #[error("{}", self.msg())]
     Parse(String),
+    /// 值里有换行。**这一种是用户能填出来的**，所以单独一个码
+    #[error("{}", self.msg())]
+    Multiline,
+    /// 交过来的那一项没有 `name`
+    #[error("{}", self.msg())]
+    Nameless { what: &'static str },
     /// 渲染不出一个能安全写进去的值。
-    #[error("{0}")]
+    #[error("{}", self.msg())]
     Unwritable(String),
-    #[error("the edited content is not what was expected ({0}), so nothing was written")]
+    #[error("{}", self.msg())]
     SelfCheck(String),
+}
+
+impl EditError {
+    /// 给人看的那句话，带码。
+    ///
+    /// `Parse`、`Unwritable`、`SelfCheck` 的 `detail` 是解析器或序列化器的
+    /// 原话 —— 这三种都是「我们自己写坏了」，正常使用碰不到，句子说清是
+    /// 哪一步就够了。
+    pub fn msg(&self) -> Msg {
+        match self {
+            EditError::NameTaken { what, name } => msg!(
+                "config.edit.name_taken", what = what, name = name =>
+                "there is already a {what} named `{name}`"
+            ),
+            EditError::NotFound { what, name } => msg!(
+                "config.edit.not_found", what = what, name = name =>
+                "there is no {what} named `{name}`"
+            ),
+            EditError::Yaml(e) => e.msg(),
+            EditError::Parse(d) => msg!(
+                "config.edit.parse", detail = d =>
+                "the configuration file could not be parsed: {detail}"
+            ),
+            EditError::Multiline => msg!(
+                "config.edit.multiline" =>
+                "a value cannot contain a newline"
+            ),
+            EditError::Nameless { what } => msg!(
+                "config.edit.nameless", what = what =>
+                "the {what} has no name"
+            ),
+            EditError::Unwritable(d) => msg!(
+                "config.edit.unwritable", detail = d =>
+                "the value cannot be written into the configuration: {detail}"
+            ),
+            EditError::SelfCheck(d) => msg!(
+                "config.edit.self_check", detail = d =>
+                "the edited content is not what was expected ({detail}), so nothing was written"
+            ),
+        }
+    }
 }
 
 /// 配置里的一段列表，以及它在错误信息里叫什么。
@@ -107,7 +160,7 @@ pub fn upsert(
     let name = item
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| EditError::Unwritable(format!("the {} has no name", section.what)))?
+        .ok_or(EditError::Nameless { what: section.what })?
         .to_string();
     let taken = section.index_of(&doc, &name);
     let steps = section.steps();
@@ -245,9 +298,7 @@ fn render_block(v: &Value) -> Result<String, EditError> {
 /// 内容的一部分 —— 这一层不去冒那个险。配置里本来也没有需要多行的字段。
 fn reject_multiline(v: &Value) -> Result<(), EditError> {
     match v {
-        Value::String(s) if s.contains('\n') || s.contains('\r') => Err(EditError::Unwritable(
-            "a value cannot contain a newline".to_string(),
-        )),
+        Value::String(s) if s.contains('\n') || s.contains('\r') => Err(EditError::Multiline),
         Value::Mapping(m) => m.iter().try_for_each(|(k, v)| {
             reject_multiline(k)?;
             reject_multiline(v)
@@ -471,7 +522,7 @@ providers:
             &map("name: x\ntype: http\naddr: \"a\\nb\"\n"),
         )
         .unwrap_err();
-        assert!(matches!(e, EditError::Unwritable(_)), "{e}");
+        assert!(matches!(e, EditError::Multiline), "{e}");
     }
 
     #[test]
