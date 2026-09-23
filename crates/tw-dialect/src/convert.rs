@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::frame::{self, Frame};
 use crate::ir::*;
-use crate::{anthropic, chat, gemini, responses};
+use crate::{anthropic, bedrock, chat, gemini, responses};
 
 /// 改写好的上游请求。
 #[derive(Debug, Clone)]
@@ -67,6 +67,14 @@ pub fn decode(
             shape.gemini_sse = query.is_some_and(|q| q.split('&').any(|kv| kv == "alt=sse"));
             gemini::decode_request(body, &model, stream, &mut dropped)?
         }
+        Dialect::Bedrock => {
+            let (model, stream) = bedrock_path(path).ok_or_else(|| {
+                Rejection(format!(
+                    "The path {path} does not say which Bedrock model to call, or how."
+                ))
+            })?;
+            bedrock::decode_request(body, &model, stream, &mut dropped)?
+        }
     };
     Ok(Decoded {
         client,
@@ -97,6 +105,18 @@ impl Decoded {
                 "/v1/responses".to_string(),
                 None,
             ),
+            Dialect::Bedrock => {
+                let action = if request.stream {
+                    "converse-stream"
+                } else {
+                    "converse"
+                };
+                (
+                    bedrock::encode_request(request, target, &mut dropped),
+                    format!("/model/{}/{action}", request.model),
+                    None,
+                )
+            }
             Dialect::Gemini => {
                 let model = request
                     .model
@@ -151,6 +171,20 @@ pub fn prepare(
     let v: Value = serde_json::from_slice(body)
         .map_err(|_| Rejection("The request body is not valid JSON.".into()))?;
     Ok(decode(client, &v, path, query)?.encode(target))
+}
+
+/// `/model/anthropic.claude-sonnet-4-v1:0/converse-stream` → (模型, 是否流式)
+///
+/// 模型 id 自己带冒号和点，所以按最后一段分，不是按分隔符找
+fn bedrock_path(path: &str) -> Option<(String, bool)> {
+    let rest = path.split_once("/model/")?.1;
+    let (model, action) = rest.rsplit_once('/')?;
+    let stream = match action {
+        "converse-stream" => true,
+        "converse" => false,
+        _ => return None,
+    };
+    Some((model.to_string(), stream))
 }
 
 /// `/v1beta/models/gemini-2.5-pro:streamGenerateContent` → (模型, 是否流式)
@@ -220,6 +254,7 @@ impl Session {
             Dialect::Chat => chat::decode_response(&v),
             Dialect::Responses => responses::decode_response(&v),
             Dialect::Gemini => gemini::decode_response(&v),
+            Dialect::Bedrock => bedrock::decode_response(&v),
         };
         self.normalize(&mut r);
         Some(self.encode(&r))
@@ -231,6 +266,7 @@ impl Session {
             Dialect::Chat => chat::encode_response(r, self),
             Dialect::Responses => responses::encode_response(r, self),
             Dialect::Gemini => gemini::encode_response(r, self),
+            Dialect::Bedrock => bedrock::encode_response(r, self),
         };
         v.to_string().into_bytes()
     }
@@ -257,6 +293,7 @@ impl Session {
             Dialect::Chat => chat::decode_response(&v),
             Dialect::Responses => responses::decode_response(&v),
             Dialect::Gemini => gemini::decode_response(&v),
+            Dialect::Bedrock => bedrock::decode_response(&v),
         };
         self.normalize(&mut r);
         let mut w = Writer::new(self);
@@ -276,6 +313,7 @@ impl Session {
                 Dialect::Anthropic => anthropic::response::error_message(&v),
                 Dialect::Chat | Dialect::Responses => chat::response::error_message(&v),
                 Dialect::Gemini => gemini::response::error_message(&v),
+                Dialect::Bedrock => bedrock::response::error_message(&v),
             })
             .unwrap_or_else(|| {
                 let text = String::from_utf8_lossy(body);
@@ -348,6 +386,7 @@ pub fn error_body(client: Dialect, status: u16, message: &str) -> Vec<u8> {
         Dialect::Anthropic => anthropic::response::error_body(status, message),
         Dialect::Chat | Dialect::Responses => chat::response::error_body(status, message),
         Dialect::Gemini => gemini::response::error_body(status, message),
+        Dialect::Bedrock => bedrock::response::error_body(status, message),
     };
     v.to_string().into_bytes()
 }
@@ -408,6 +447,7 @@ enum Parser {
     Chat(chat::stream::Parser),
     Responses(responses::stream::Parser),
     Gemini(gemini::stream::Parser),
+    Bedrock(bedrock::stream::Parser),
 }
 
 impl Parser {
@@ -417,6 +457,7 @@ impl Parser {
             Dialect::Chat => Parser::Chat(Default::default()),
             Dialect::Responses => Parser::Responses(Default::default()),
             Dialect::Gemini => Parser::Gemini(Default::default()),
+            Dialect::Bedrock => Parser::Bedrock(Default::default()),
         }
     }
 
@@ -426,6 +467,7 @@ impl Parser {
             Parser::Chat(p) => p.frame(f, out),
             Parser::Responses(p) => p.frame(f, out),
             Parser::Gemini(p) => p.frame(f, out),
+            Parser::Bedrock(p) => p.frame(f, out),
         }
     }
 
@@ -435,6 +477,7 @@ impl Parser {
             Parser::Chat(p) => p.finish(out),
             Parser::Responses(p) => p.finish(out),
             Parser::Gemini(p) => p.finish(out),
+            Parser::Bedrock(p) => p.finish(out),
         }
     }
 }
@@ -444,6 +487,7 @@ enum Writer {
     Chat(chat::stream::Writer),
     Responses(responses::stream::Writer),
     Gemini(gemini::stream::Writer),
+    Bedrock(bedrock::stream::Writer),
 }
 
 impl Writer {
@@ -453,6 +497,7 @@ impl Writer {
             Dialect::Chat => Writer::Chat(chat::stream::Writer::new(s)),
             Dialect::Responses => Writer::Responses(responses::stream::Writer::new(s)),
             Dialect::Gemini => Writer::Gemini(gemini::stream::Writer::new(s)),
+            Dialect::Bedrock => Writer::Bedrock(bedrock::stream::Writer::new(s)),
         }
     }
 
@@ -462,6 +507,7 @@ impl Writer {
             Writer::Chat(w) => w.event(e),
             Writer::Responses(w) => w.event(e),
             Writer::Gemini(w) => w.event(e),
+            Writer::Bedrock(w) => w.event(e),
         }
     }
 
@@ -471,6 +517,7 @@ impl Writer {
             Writer::Chat(w) => w.finish(),
             Writer::Responses(w) => w.finish(),
             Writer::Gemini(w) => w.finish(),
+            Writer::Bedrock(w) => w.finish(),
         }
     }
 }
@@ -768,6 +815,20 @@ pub fn strip_carried(client: Dialect, body: &[u8]) -> Option<Vec<u8>> {
     };
     let mut changed = false;
     match client {
+        Dialect::Bedrock => {
+            let messages = v.get_mut("messages")?.as_array_mut()?;
+            for m in messages.iter_mut() {
+                if let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) {
+                    let before = blocks.len();
+                    blocks.retain(|b| {
+                        !b.get("reasoningContent")
+                            .and_then(|r| r.get("reasoningText"))
+                            .is_some_and(|t| carried(t.get("signature")))
+                    });
+                    changed |= blocks.len() != before;
+                }
+            }
+        }
         Dialect::Anthropic => {
             let messages = v.get_mut("messages")?.as_array_mut()?;
             for m in messages.iter_mut() {
