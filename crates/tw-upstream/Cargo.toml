@@ -1,0 +1,14 @@
+[package]
+name = "tw-upstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Talking to an upstream: URL assembly and header handling, shared by both gateways"
+
+[dependencies]
+# HeaderMap 和 HeaderName。**不要 axum 也不要 reqwest** —— 共享层不该
+# 规定下游用哪个 HTTP 框架，而两者的 HeaderMap 本来就都是这个 crate 的
+http = "1"
+reqwest = { workspace = true }
