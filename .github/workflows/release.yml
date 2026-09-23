@@ -12,6 +12,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # **排练。**手工触发时照常构建、照常自检，但什么都不发。
+  #
+  # 理由是这条流水线唯一一个「发现了也没法在本次补救」的性质：tag 一旦
+  # 推上去，流水线错了就得把它撤回来。而这里新增的那条 Windows 支线要靠
+  # 交叉编译到 arm64，那件事成不成只有真跑一次才知道 —— 用一个 tag 去
+  # 问这个问题太贵了。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -44,10 +51,15 @@ jobs:
           BIN=target/aarch64-apple-darwin/release/twcore
           file "$BIN" | grep -q arm64
           GOT=$("$BIN" --version | awk '{print $2}')
-          WANT="${GITHUB_REF_NAME#v}"
-          if [ "$GOT" != "$WANT" ]; then
-            echo "tag 是 $WANT，而二进制报的是 $GOT —— Cargo.toml 的版本没跟上" >&2
-            exit 1
+          # 排练时没有 tag 可对，只把版本打出来
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            WANT="${GITHUB_REF_NAME#v}"
+            if [ "$GOT" != "$WANT" ]; then
+              echo "tag 是 $WANT，而二进制报的是 $GOT —— Cargo.toml 的版本没跟上" >&2
+              exit 1
+            fi
+          else
+            echo "排练：二进制报的是 $GOT"
           fi
           "$BIN" --help > /dev/null
 
@@ -61,10 +73,103 @@ jobs:
           cat twcore-aarch64-apple-darwin.sha256
 
       - uses: softprops/action-gh-release@v2
+        # 排练不发布。
+        if: github.ref_type == 'tag'
         with:
           files: |
             dist/twcore-aarch64-apple-darwin
             dist/twcore-aarch64-apple-darwin.sha256
           # 发布说明留空，从 tag 的信息里来 —— 让一份自动生成的清单
           # 冒充发布说明，读的人得不到任何东西
+          generate_release_notes: true
+
+  twcore-windows:
+    name: twcore (Windows x64 + arm64)
+    # **两个架构都发**（x64 和 arm64）。x64 原生编，arm64 在同一台 x64
+    # runner 上交叉编 —— MSVC 的 ARM64 工具链在这个镜像里，而起一台
+    # arm64 runner 只为编一个二进制不划算。
+    #
+    # 交叉编译成不成，靠上面那个排练模式先问清楚，而不是拿一个 tag 去问。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: |
+          cargo build --release -p twcore --target x86_64-pc-windows-msvc
+          cargo build --release -p twcore --target aarch64-pc-windows-msvc
+
+      # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出任何
+      # 问题 —— 而它会一路发到用户手里。
+      #
+      # arm64 那个在这台机器上跑不起来（x64 runner），所以只能查它到底是不是
+      # arm64 —— 读 PE 头里的 machine 字段，等价于 macOS 那边的 `file | grep
+      # arm64`。**这一条不是走过场**：交叉编译配错目标的表现正是产出一个
+      # 名字叫 arm64 的 x64 二进制。
+      - name: They are what they claim to be, and the x64 one runs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-PeMachine([string]$path) {
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $br = New-Object System.IO.BinaryReader($fs)
+              $fs.Position = 0x3C
+              $fs.Position = $br.ReadInt32()
+              if ($br.ReadUInt32() -ne 0x00004550) { throw "$path is not a PE file" }
+              return $br.ReadUInt16()
+            } finally { $fs.Dispose() }
+          }
+          $want = @{
+            "target\x86_64-pc-windows-msvc\release\twcore.exe"  = 0x8664
+            "target\aarch64-pc-windows-msvc\release\twcore.exe" = 0xAA64
+          }
+          foreach ($p in $want.Keys) {
+            $got = Get-PeMachine $p
+            if ($got -ne $want[$p]) {
+              throw ("{0} is machine 0x{1:X4}, expected 0x{2:X4}" -f $p, $got, $want[$p])
+            }
+            Write-Host ("{0}: 0x{1:X4}" -f $p, $got)
+          }
+
+          $exe = "target\x86_64-pc-windows-msvc\release\twcore.exe"
+          $got = (& $exe --version).Split(" ")[1]
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $wantVer = $env:GITHUB_REF_NAME.TrimStart("v")
+            if ($got -ne $wantVer) {
+              throw "the tag says $wantVer but the binary reports $got -- Cargo.toml did not keep up"
+            }
+          } else {
+            Write-Host "rehearsal: the binary reports $got"
+          }
+          & $exe --help | Out-Null
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          foreach ($t in @("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")) {
+            $out = "dist\twcore-$t.exe"
+            Copy-Item "target\$t\release\twcore.exe" $out
+            # **和 macOS 那边同一种校验文件**：`<sha>  <文件名>`，两列，
+            # 两个空格 —— 下载的人用同一条 shasum -c 就能核。
+            $h = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+            "$h  twcore-$t.exe" | Set-Content -NoNewline -Encoding ascii "$out.sha256"
+            Get-Content "$out.sha256"
+          }
+
+      - uses: softprops/action-gh-release@v2
+        # 排练不发布。
+        if: github.ref_type == 'tag'
+        with:
+          files: |
+            dist/twcore-x86_64-pc-windows-msvc.exe
+            dist/twcore-x86_64-pc-windows-msvc.exe.sha256
+            dist/twcore-aarch64-pc-windows-msvc.exe
+            dist/twcore-aarch64-pc-windows-msvc.exe.sha256
           generate_release_notes: true
