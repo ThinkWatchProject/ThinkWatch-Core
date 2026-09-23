@@ -52,4 +52,6 @@ tempfile = "3"
 tw-observe = { workspace = true }
 tw-api = { workspace = true }
 tw-types = { workspace = true }
+# 网卡那条断言要对着本机真实的清单比，不写死某个平台的名字
+tw-config = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

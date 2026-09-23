@@ -175,11 +175,18 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["code"], "gw.listen.no_such_nic");
     assert_eq!(v["args"]["name"], "en97");
-    // 真有哪些网卡一并说出来，用户不必再去跑一次 ifconfig
-    assert!(
-        v["args"]["available"].as_str().unwrap().contains("lo0"),
-        "{v}"
-    );
+    // 真有哪些网卡一并说出来，用户不必再去跑一次 ifconfig。
+    //
+    // **不写死任何一个名字。**原来这里断言的是 `lo0`，而那是这台机器的
+    // 名字，不是这条断言要说的事 —— Windows 上回环叫「Loopback
+    // Pseudo-Interface 1」，网卡叫「Ethernet 3」。改成对着本机真实的清单
+    // 比，反而比原来强：它要求**每一张**都列出来了，不是碰巧有一张。
+    let listed = v["args"]["available"].as_str().unwrap();
+    let here = tw_config::nics::by_name();
+    assert!(!here.is_empty(), "本机一张网卡都没有？");
+    for n in &here {
+        assert!(listed.contains(&n.name), "{} 不在「{listed}」里", n.name);
+    }
     assert_eq!(b.file(), before);
 
     // 写法本身不对的，按配置文件的那套规则说

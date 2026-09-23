@@ -44,3 +44,99 @@ jobs:
       # 脚本自己会 build，这一步只是跑它。
       - name: Smoke (real binary, real socket, real data plane)
         run: ./scripts/smoke.sh
+
+  # **这台机器上没有 unix socket，也没有信号。**core 在这两件事上各有一套
+  # 平台实现，而在这个任务出现之前，Windows 那一半从来没有被编译过 ——
+  # 一个 `#[cfg(windows)]` 模块「检查通过」和「根本没人看过它」长得一模一样。
+  #
+  # 不重复跑 `cargo fmt`：格式和平台无关，跑两遍只是慢一倍。
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # **失败也存。**这个 action 默认只在任务成功时保存缓存，而一个
+          # 刚立起来、还在逐条修的任务恰恰一次都不会成功 —— 于是「红 →
+          # 不存缓存 → 从零编译 → 还是红」自己维持住了，每一轮都要把
+          # rusqlite 的 SQLite 和 aws-lc-sys 重编一遍。
+          #
+          # cargo 自己按指纹判断哪些要重编，所以缓存下一个失败构建的
+          # target 目录是安全的，它只是省掉那些与失败无关的部分。
+          cache-on-failure: true
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p twcore
+
+      # macOS 那边的 smoke 脚本在这里跑不了（`stat -f`、`curl --unix-socket`、
+      # 一堆 BSD 的写法），移植它是另一件事。但**至少要证明这个二进制真的
+      # 起得来、控制面真的应答** —— 那两样恰恰是这个平台上和 unix 完全不同的
+      # 实现：回环端口换掉了 socket，凭据是唯一的门。
+      #
+      # 不验这个的话，Windows 上的失败模式是「CI 全绿，而用户装上之后界面
+      # 永远停在连接页」。
+      - name: It starts, and the control plane answers only with the token
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $home_ = Join-Path $env:RUNNER_TEMP "tw"
+          New-Item -ItemType Directory -Force -Path $home_ | Out-Null
+          $env:THINKWATCH_HOME = $home_
+          $cfg = Join-Path $home_ "config.yaml"
+          $proc = Start-Process -FilePath "target\release\twcore.exe" `
+            -ArgumentList "serve","--config",$cfg,"--port","18999" `
+            -PassThru -NoNewWindow `
+            -RedirectStandardOutput (Join-Path $home_ "out.log") `
+            -RedirectStandardError  (Join-Path $home_ "err.log")
+
+          # 端口是 core 绑到之后才写出来的，所以它出现就等于「听起来了」
+          $portFile = Join-Path $home_ "control.port"
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not (Test-Path $portFile)) {
+            if ($proc.HasExited) {
+              Get-Content (Join-Path $home_ "err.log") -ErrorAction SilentlyContinue
+              throw "core exited before it started listening (code $($proc.ExitCode))"
+            }
+            if ((Get-Date) -gt $deadline) {
+              Get-Content (Join-Path $home_ "err.log") -ErrorAction SilentlyContinue
+              throw "core never wrote $portFile"
+            }
+            Start-Sleep -Milliseconds 200
+          }
+          $port  = (Get-Content $portFile -Raw).Trim()
+          $token = (Get-Content (Join-Path $home_ "control.token") -Raw).Trim()
+          $url   = "http://127.0.0.1:$port/status"
+          Write-Host "control plane on $port"
+
+          try {
+            $no = Invoke-WebRequest -Uri $url -SkipHttpErrorCheck -TimeoutSec 10
+            if ($no.StatusCode -ne 401) { throw "without a token the control plane answered $($no.StatusCode), not 401" }
+
+            $yes = Invoke-WebRequest -Uri $url -TimeoutSec 10 -Headers @{ Authorization = "Bearer $token" }
+            if ($yes.StatusCode -ne 200) { throw "with the token it answered $($yes.StatusCode)" }
+            $status = $yes.Content | ConvertFrom-Json
+            if (-not $status.version) { throw "the status carried no version: $($yes.Content)" }
+            Write-Host "gateway $($status.version), api $($status.api_version)"
+            # **请它退出，它就该退。**这条路在这个平台上没有替代品：
+            # 没有 SIGTERM，而桌面端要靠它在改完配置后重启 core、在装更新
+            # 之前停掉它。只能强杀意味着 WAL 不收尾、在途请求断在半路。
+            $bye = Invoke-WebRequest -Uri "http://127.0.0.1:$port/shutdown" -Method Post `
+                     -TimeoutSec 10 -Headers @{ Authorization = "Bearer $token" }
+            if ($bye.StatusCode -ne 202) { throw "asking it to exit answered $($bye.StatusCode)" }
+            # 等**进程**没了，不是等端口没了 —— 一个卡住的进程也可能丢掉监听
+            if (-not $proc.WaitForExit(10000)) {
+              throw "it was asked to exit and is still running after 10s"
+            }
+            Write-Host "it exited on request"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }

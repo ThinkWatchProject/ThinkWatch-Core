@@ -154,13 +154,16 @@ mod windows {
         GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
         GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
     };
+    use windows_sys::Win32::NetworkManagement::Ndis::IF_OPER_STATUS;
     use windows_sys::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
     };
 
     /// `IfOperStatusUp`。**只认「up」这一档**，和 unix 那边的 `IFF_UP` 对齐：
     /// 「正在连」「已断开」的网卡绑不上去。
-    const OPER_STATUS_UP: i32 = 1;
+    ///
+    /// 类型跟着 `IF_OPER_STATUS` 走（就是 `i32`），这样比较的时候不用转换。
+    const OPER_STATUS_UP: IF_OPER_STATUS = 1;
 
     /// 一张网卡上我们关心的东西。
     struct Adapter {
@@ -271,7 +274,7 @@ mod windows {
             }
             out.push(Adapter {
                 name,
-                up: a.OperStatus as i32 == OPER_STATUS_UP,
+                up: a.OperStatus == OPER_STATUS_UP,
                 addrs,
             });
         }

@@ -224,11 +224,19 @@ fn product_text_is_written_not_spoken() {
 
     let mut found = Vec::new();
     for f in &files {
-        let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();
-        // 集成测试和这个文件自己都不查
-        if rel.contains("/tests/") {
+        let rel_path = f.strip_prefix(&root).unwrap_or(f);
+        // 集成测试和这个文件自己都不查。
+        //
+        // **按路径的组成部分判断，不在字符串里找斜杠。**Windows 上分隔符是
+        // `\`，`contains("/tests/")` 在那里恒为 false —— 于是这个测试开始扫
+        // 测试文件，而第一个撞上的就是它自己那张禁用词表。
+        if rel_path
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("tests"))
+        {
             continue;
         }
+        let rel = rel_path.display().to_string();
         let src = std::fs::read_to_string(f).unwrap();
         // 看的是产品代码那一半（测试模块在文件末尾）
         let product = src.split("#[cfg(test)]").next().unwrap();
