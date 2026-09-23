@@ -671,7 +671,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     let dir = path
         .parent()
         .map(PathBuf::from)
-        .unwrap_or_else(tw_config::default_dir);
+        .unwrap_or_else(tw_api::data::dir);
     // **数据目录在这儿建，而且只在这儿。**后面每一步（锁、控制面的 socket、
     // 凭据文件）都会顺手 `create_dir_all`，谁先到谁建 —— 而 Windows 上「谁
     // 建的」决定了它的 ACL，也就决定了那份明文密钥同机的其他用户读不读得到。

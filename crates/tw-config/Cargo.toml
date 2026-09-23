@@ -10,6 +10,8 @@ description = "YAML config schema, loading, and validation"
 [dependencies]
 tw-engine = { workspace = true }
 tw-types = { workspace = true }
+# 数据目录在哪由契约层回答，见 `tw_api::data`
+tw-api = { workspace = true }
 tw-secret = { workspace = true }
 # 校验要认得出配置里写到的内置脱敏规则 id
 tw-redact = { workspace = true }
