@@ -748,7 +748,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         //
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
-        let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_wire::bodies::CHANNEL_CAP);
         let store = build_store(&dir, state.bus.clone(), state.pricing.clone(), body_rx);
         if store.is_some() {
             state.set_body_sink(body_tx);
@@ -951,7 +951,7 @@ fn build_store(
     }
     // 两边的 body 结构在这里对接。**一次移动，不复制** —— `Bytes` 的
     // 克隆是引用计数。
-    let (tx, rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
+    let (tx, rx) = tokio::sync::mpsc::channel(tw_wire::bodies::CHANNEL_CAP);
     let mut bodies = bodies;
     tokio::spawn(async move {
         while let Some(b) = bodies.recv().await {

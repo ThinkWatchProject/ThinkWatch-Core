@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     # ── 第一层 · 共用协议层（企业版也依赖）────────────────
     "crates/tw-types",
+    "crates/tw-wire",
     "crates/tw-protocol",
     "crates/tw-provider",
     "crates/tw-resil",
@@ -43,6 +44,7 @@ version = "0.29.0"
 [workspace.dependencies]
 # ── 内部 crate ───────────────────────────────────────────
 tw-types    = { path = "crates/tw-types" }
+tw-wire     = { path = "crates/tw-wire" }
 tw-protocol = { path = "crates/tw-protocol" }
 tw-provider = { path = "crates/tw-provider" }
 tw-resil    = { path = "crates/tw-resil" }
