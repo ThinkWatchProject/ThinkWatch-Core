@@ -79,6 +79,9 @@ notify = "8"
 # 请求历史。bundled 是刻意的：零外部依赖，用户不必装 sqlite
 rusqlite = { version = "0.40", features = ["bundled"] }
 libc = "0.2"
+# Windows 上问系统要网卡清单。**纯 Rust 的绑定**，不编译任何 C ——
+# 和 unix 那边直接用 libc 是同一个取舍，见 tw-config 的 nics。
+windows-sys = "0.61"
 # 内置价目表压缩着放（2.3 MB → 110 KB）
 flate2 = "1"
 # regex-automata / regex-syntax 已经在依赖树里（tracing 的 EnvFilter），
