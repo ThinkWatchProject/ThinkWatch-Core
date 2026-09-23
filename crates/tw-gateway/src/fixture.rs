@@ -112,7 +112,7 @@ pub fn extract(request: &Recorded, response: &Recorded) -> Extracted {
     }
 
     // ---- 响应侧：同样复用线上那个嗅探器
-    let mut sniffer = crate::usage::Sniffer::new();
+    let mut sniffer = tw_wire::usage::Sniffer::new();
     sniffer.feed(response.body.as_bytes());
     out.usage = sniffer
         .finish()

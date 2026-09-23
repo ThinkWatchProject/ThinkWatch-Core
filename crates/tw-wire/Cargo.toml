@@ -1,0 +1,18 @@
+[package]
+name = "tw-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sideband readers for a streaming response: usage sniffing and body capture"
+
+[dependencies]
+bytes = { workspace = true }
+serde_json = { workspace = true }
+# 只要一个 mpsc 发送端。**不用 workspace 那份** —— 那份带着网络、信号、
+# 计时器，而这个 crate 要能被企业版直接依赖，背什么进去是它说了算
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
