@@ -387,7 +387,6 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn ok(_: &str) -> Result<(), String> {
         Ok(())
@@ -422,6 +421,10 @@ mod tests {
         assert!(strays.is_empty(), "留下了临时文件：{strays:?}");
     }
 
+    // **unix 专有。**Windows 上建符号链接要特权，跟随的语义也不一样 ——
+    // `resolve` 在那边走的是另一条分支（见 `cfg(not(unix))`），而那条分支
+    // 眼下没有测试覆盖，要等接管整体支持 Windows 时一起补。
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_written_through_to_its_target() {
         // cc-switch #6785：直接 rename 会把 dotfile 管理器的软链换成
@@ -612,10 +615,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}");
     }
 
+    // **unix 专有。**Windows 没有 mode 位，「这个文件对别人也可读」那条
+    // 判断在那边是 ACL 的事，是另一套。
+    #[cfg(unix)]
     #[test]
     fn the_original_permissions_are_kept_and_a_loose_one_is_reported() {
         // 不擅自 chmod：那超出了「只改 endpoint 和 key 字段」的边界。
         // 报告是我们的职责，修改是他的权利。
+        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
         let (d, root) = dirs();
         let p = d.path().join("c.json");
@@ -643,6 +650,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_tight_file_carrying_a_secret_gets_no_warning() {
         use std::os::unix::fs::PermissionsExt;
@@ -664,6 +672,7 @@ mod tests {
         assert!(a.warnings.is_empty(), "{:?}", a.warnings);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_loop_is_refused_instead_of_hanging() {
         let d = tempfile::tempdir().unwrap();
@@ -674,6 +683,7 @@ mod tests {
         assert!(matches!(resolve(&a), Err(ForeignError::LinkLoop { .. })));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_relative_symlink_resolves_against_its_own_directory() {
         let d = tempfile::tempdir().unwrap();
