@@ -896,6 +896,26 @@ mod tests {
         })
     }
 
+    /// 一个确实没人在听的本机端口。
+    ///
+    /// **「绑一个随机端口再 drop」本身是有竞态的**：端口一释放，同一批
+    /// 并行测试里别的用例就可能绑到它 —— 这个文件里有七处在绑随机端口，
+    /// 其中几处还起了真的 SOCKS5 服务器。于是「死端口」活了过来，
+    /// 测试看到的不是 TCP 拒绝而是一次握手。Windows 上撞得尤其勤。
+    ///
+    /// 所以拿到之后先自己连一次确认它是死的，活着就换一个。
+    async fn dead_port() -> SocketAddr {
+        for _ in 0..64 {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            if tokio::net::TcpStream::connect(a).await.is_err() {
+                return a;
+            }
+        }
+        panic!("连着 64 次都没拿到一个没人监听的端口");
+    }
+
     /// 起一个只接受连接、什么都不说的 TCP 端口。
     async fn dead_ear() -> SocketAddr {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -933,9 +953,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_port_fails_at_tcp_and_the_error_names_that_phase() {
         // 一句「连接失败」说不出该修什么。
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
+        let a = dead_port().await;
         let r = l1(&format!("http://{a}"), None).await;
         assert!(!r.ok);
         assert_eq!(
@@ -1270,9 +1288,7 @@ mod tests {
     async fn a_refused_proxy_port_says_nothing_is_listening_not_just_an_errno() {
         // 「Connection refused (os error 61)」和「那个端口上没有东西在听」
         // 之间隔着一次搜索。
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
+        let a = dead_port().await;
         let p = hop(tw_config::ProxyKind::Socks5h, a, None);
         let r = l1_proxy(&p, "api.anthropic.com", 443).await;
         assert!(!r.ok);
@@ -1322,9 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_proxy_fails_at_the_proxy_hop_not_at_the_upstream() {
         // 说成「连不上上游」会让人去查上游 —— 而上游根本没被碰过。
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
+        let a = dead_port().await;
         let p = hop(tw_config::ProxyKind::Socks5h, a, None);
         let r = l1("https://api.anthropic.com", Some(&p)).await;
         assert!(!r.ok);
