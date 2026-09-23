@@ -66,7 +66,8 @@ mod tests {
     fn a_stale_lock_from_a_dead_process_is_taken_over() {
         // 「上次没退干净」是最常见的情况，不该需要用户手动删文件。
         let d = tempfile::tempdir().unwrap();
-        // pid 1 之外挑一个几乎肯定不存在的
+        // 挑一个几乎肯定不存在的。Windows 的 pid 都是 4 的倍数，所以
+        // 999999 在那里根本不可能是一个 pid；macOS 的 pid_max 是 99998。
         std::fs::write(d.path().join("twcore.lock"), "999999").unwrap();
         assert!(matches!(
             LockFile::acquire(d.path()).unwrap(),
@@ -84,13 +85,40 @@ mod tests {
         ));
     }
 
+    /// 一个会活一会儿的子进程。
+    ///
+    /// **不借用 pid 1。**那在 unix 上是 init/launchd，而 Windows 上根本没有
+    /// 这个 pid —— 这条测试要的只是「一个确实活着、又不是我们自己的 pid」，
+    /// 起一个就是了，不必挑一个碰巧存在的。
+    fn sleeping_child() -> std::process::Child {
+        #[cfg(windows)]
+        // `timeout` 要一个控制台，测试进程里没有；`ping` 不要
+        let mut c = std::process::Command::new("ping");
+        #[cfg(windows)]
+        c.args(["-n", "60", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let mut c = std::process::Command::new("sleep");
+        #[cfg(not(windows))]
+        c.arg("60");
+        c.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("起一个会活一会儿的子进程")
+    }
+
     #[test]
     fn a_live_pid_blocks_and_reports_who() {
         let d = tempfile::tempdir().unwrap();
-        // 用 pid 1（init/launchd），它一定活着且不是我们
-        std::fs::write(d.path().join("twcore.lock"), "1").unwrap();
-        match LockFile::acquire(d.path()).unwrap() {
-            LockOutcome::AlreadyRunning { pid } => assert_eq!(pid, 1),
+        let mut child = sleeping_child();
+        let alive = child.id();
+        std::fs::write(d.path().join("twcore.lock"), alive.to_string()).unwrap();
+        let got = LockFile::acquire(d.path());
+        // **先收尸再断言** —— 断言失败会 panic，而 panic 之后这个子进程
+        // 就留在那儿活满六十秒
+        let _ = child.kill();
+        let _ = child.wait();
+        match got.unwrap() {
+            LockOutcome::AlreadyRunning { pid } => assert_eq!(pid, alive),
             other => panic!("应该被挡住，实际 {other:?}"),
         }
     }
