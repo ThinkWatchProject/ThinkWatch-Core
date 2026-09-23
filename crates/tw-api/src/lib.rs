@@ -56,7 +56,10 @@ pub use tw_types::Msg;
 /// 价目表算费用。上游视图的 `billing` 必有，`billing_effective` 没了；汇总的
 /// `subscription_requests` / `subscription_tokens` 和会话的 `subscription_turns`
 /// 没了。照 9 写的界面会去读已经不存在的字段。
-pub const CONTROL_API_VERSION: u32 = 10;
+/// **11 推理测速的错误是 [`Msg`]、输出上限可以是空。**ChatGPT 账号那种上游不接受
+/// 输出上限，报价里的上限和金额都是空的；错误原来是一句英文字符串，中文界面上
+/// 只能原样显示。照 10 写的界面会把错误画成一个对象。
+pub const CONTROL_API_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -2198,7 +2201,10 @@ pub struct SpeedEstimate {
     pub model: String,
     /// 输入 token。**精确值** —— 请求是固定的
     pub input_tokens: u64,
-    pub max_output_tokens: u64,
+    /// 输出上限。**空 = 这家不接受输出上限**（ChatGPT 账号的 Codex 后端），
+    /// 那时按量计费的 `cost_micros` 也是空的 —— 回答有多长由模型决定
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// 微分。按量计费算得出来时是那个数，不计费时是 0，无法计价时是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
@@ -2248,7 +2254,7 @@ pub struct SpeedResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
 }
 
 /// 观测这一层在不在记。

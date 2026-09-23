@@ -175,6 +175,10 @@ fn price_from(v: &serde_json::Value) -> Option<ModelPrice> {
         output_above_200k: f("output_cost_per_token_above_200k_tokens"),
         max_input_tokens: v.get("max_input_tokens").and_then(|x| x.as_u64()),
         max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
+        reasoning: v
+            .get("supports_reasoning")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -203,6 +207,9 @@ mod tests {
                 .and_then(|p| p.max_output_tokens)
                 .is_some_and(|n| n >= 32_000)
         );
+        // 会不会推理也要读进来：测速的探测请求按它决定留多少输出额度
+        assert!(t.get("gpt-5").is_some_and(|p| p.reasoning));
+        assert!(t.get("gpt-4o").is_some_and(|p| !p.reasoning));
     }
 
     #[test]

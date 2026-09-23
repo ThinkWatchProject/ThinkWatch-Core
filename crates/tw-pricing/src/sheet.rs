@@ -226,6 +226,8 @@ impl PerMillion {
             output_above_200k: self.output_above_200k.map(|v| v * M),
             max_input_tokens: base.and_then(|b| b.max_input_tokens),
             max_output_tokens: base.and_then(|b| b.max_output_tokens),
+            // 覆盖价只改单价：模型会不会推理不是价格的一部分
+            reasoning: base.is_some_and(|b| b.reasoning),
         }
     }
 

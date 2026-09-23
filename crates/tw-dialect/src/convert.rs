@@ -124,6 +124,22 @@ impl Decoded {
     }
 }
 
+/// 自己造的请求 → 上游请求。
+///
+/// **没有客户端的那一方用它**：测速发的是一个固定的探测请求，不是在转发谁的请求
+/// （见 `tw_gateway::l3`）。走这条路而不是各处手写一份请求体，是因为「一个请求在
+/// 这种格式里长什么样」只该有一个答案 —— 手写的那一份迟早和转发时真正发出去的
+/// 不一样，而那时「转发正常、测速失败」查起来毫无头绪。
+pub fn encode(request: &Request, target: &Target) -> Prepared {
+    Decoded {
+        client: target.dialect,
+        request: request.clone(),
+        dropped: Dropped::new(target.dialect),
+        shape: ClientShape::default(),
+    }
+    .encode(target)
+}
+
 /// 客户端请求 → 上游请求，一步到位。
 pub fn prepare(
     client: Dialect,
@@ -529,6 +545,49 @@ impl Normalizer {
     }
 }
 
+/// 只读一条流：上游的字节 → 中间表示的事件。
+///
+/// **不写出任何东西。**测速这类自己发请求的地方要的是「第一个 token 什么时候到、
+/// 用了多少、上游有没有在流里报错」，不是把流转给谁。
+///
+/// **按上游格式解析，不在字节里找关键字**：「第一个 token」在四种格式里是四个不同的
+/// 事件，而 `message_start`、`response.created` 这些是上游收到请求立刻就发的 ——
+/// 认错了，测出来的是建连速度，不是模型开口的速度。
+pub struct Reader {
+    decoder: frame::Decoder,
+    parser: Parser,
+}
+
+impl Reader {
+    pub fn new(upstream: Dialect) -> Reader {
+        Reader {
+            decoder: frame::Decoder::default(),
+            parser: Parser::new(upstream),
+        }
+    }
+
+    /// 喂一块上游字节，吐出这一块里读全了的事件
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Event> {
+        let frames = self.decoder.feed(chunk);
+        let mut out = Vec::new();
+        for f in &frames {
+            self.parser.frame(f, &mut out);
+        }
+        out
+    }
+
+    /// 流结束了：最后一帧后面不带空行的上游也要读到（见 [`frame::Decoder::flush`]）
+    pub fn finish(&mut self) -> Vec<Event> {
+        let frames = self.decoder.flush();
+        let mut out = Vec::new();
+        for f in &frames {
+            self.parser.frame(f, &mut out);
+        }
+        self.parser.finish(&mut out);
+        out
+    }
+}
+
 /// 上游的流 → 客户端的流。**边收边转**，不整块缓冲。
 pub struct StreamConverter {
     decoder: frame::Decoder,
@@ -774,6 +833,91 @@ mod tests {
             official: true,
             default_max_tokens: 16000,
         }
+    }
+
+    /// 自己造的请求，四种格式各编码一次
+    fn probe(d: Dialect) -> Prepared {
+        let r = Request {
+            model: "m".into(),
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![Part::Text("Hi".into())],
+            }],
+            max_tokens: Some(8),
+            stream: true,
+            ..Default::default()
+        };
+        encode(&r, &target(d))
+    }
+
+    #[test]
+    fn a_request_with_no_client_behind_it_encodes_like_any_other() {
+        // 测速自己造探测请求，走的是转发时同一个编码器
+        let p = probe(Dialect::Anthropic);
+        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        assert_eq!(p.path, "/v1/messages");
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["messages"][0]["content"][0]["text"], "Hi");
+
+        // 官方端点的推理模型不认 max_tokens，编码器会写成 max_completion_tokens
+        let v: Value = serde_json::from_slice(&probe(Dialect::Chat).body).unwrap();
+        assert_eq!(v["max_completion_tokens"], 8);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+
+        let p = probe(Dialect::Responses);
+        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        assert_eq!(p.path, "/v1/responses");
+        assert_eq!(v["max_output_tokens"], 8);
+        assert_eq!(v["store"], false);
+        assert_eq!(v["input"][0]["content"][0]["text"], "Hi");
+
+        let p = probe(Dialect::Gemini);
+        assert_eq!(p.path, "/v1beta/models/m:streamGenerateContent");
+        assert_eq!(p.query.as_deref(), Some("alt=sse"));
+        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        assert_eq!(v["generationConfig"]["maxOutputTokens"], 8);
+    }
+
+    #[test]
+    fn reading_a_stream_gives_the_first_real_token_and_the_usage() {
+        // **只读不写**：测速要的是第一个文字 token 落在哪一刻
+        let mut r = Reader::new(Dialect::Responses);
+        let mut events = r.feed(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Delta { .. })),
+            "上游收到请求立刻就发的那一帧不是第一个 token"
+        );
+        events = r.feed(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"output_index\":0,\"content_index\":0,\"delta\":\"He\"}\n\n",
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Delta { delta: Delta::Text(t), .. } if t == "He"
+        )));
+        events = r.feed(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":8}}}\n\n",
+        );
+        let usage = events.iter().find_map(|e| match e {
+            Event::Usage(u) => Some(*u),
+            _ => None,
+        });
+        assert_eq!(usage.map(|u| (u.input, u.output)), Some((10, 8)));
+    }
+
+    #[test]
+    fn a_stream_that_reports_an_error_says_so() {
+        // 上游 200 之后在流里报错：读流的人必须看得见，否则这次测速会被算成成功
+        let mut r = Reader::new(Dialect::Anthropic);
+        let events = r.feed(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Error { message } if message.contains("overloaded")
+        )));
     }
 
     #[test]
