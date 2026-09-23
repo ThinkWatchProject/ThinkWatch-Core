@@ -54,6 +54,11 @@ pub struct ModelPrice {
     /// 没写时用它 —— 写大了上游会拒绝，写小了回答会被截断
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// 这个模型自己会推理。**推理 token 也算输出** —— 测速的探测请求要给它留出
+    /// 量（见 `tw_gateway::l3`），按一句话的长度设上限的话，它会把额度全用在
+    /// 推理上，一个可见的 token 都不吐
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning: bool,
 }
 
 /// 一次调用用掉了什么。

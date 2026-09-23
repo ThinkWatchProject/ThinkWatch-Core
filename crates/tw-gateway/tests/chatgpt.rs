@@ -638,3 +638,82 @@ async fn models_come_from_the_codex_models_endpoint() {
     let uri = backend.seen.lock().unwrap()[0].0.clone();
     assert_eq!(uri, "/backend-api/codex/models?client_version=0.0.0");
 }
+
+/// 推理测速（L3）打在 ChatGPT 账号上游上。
+///
+/// 以前这里直接报「还不支持这种上游，什么都没发」—— 测速只写了 Anthropic 和
+/// OpenAI Chat 两种协议。Codex 后端的三处不同（路径不在 `/v1` 下、不认输出上限、
+/// 流式响应不带 Content-Type）都要和转发时一样接住。
+#[tokio::test]
+async fn an_inference_test_reaches_the_codex_backend_and_times_the_first_token() {
+    let tokens = Arc::new(TokenServer::default());
+    let token_url = start_token_server(tokens.clone()).await;
+    let backend = Arc::new(Backend::default());
+    let base = start_backend(backend.clone()).await;
+    let p = chatgpt_provider(&base, &token_url);
+    let state = tw_gateway::AppState::new(Config {
+        version: 1,
+        listen: Listen::default(),
+        providers: vec![p.clone()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    // 上限：Codex 后端不接受，所以报价里是空的，发出去的请求里也不该有
+    let cap = tw_gateway::l3::max_output_tokens(
+        &state.pricing.load(),
+        "gpt-5.5",
+        Some(Protocol::Chatgpt),
+    );
+    assert_eq!(cap, None);
+
+    let http = state.client_for(&p.name);
+    let headers = state.headers_for(&p, &http, None).await.unwrap();
+    let r = tw_gateway::l3::run(&http, &p, &headers, "gpt-5.5", cap).await;
+
+    assert!(r.ok, "{:?}", r.error);
+    assert!(r.ttft_ms.is_some(), "没量到首 token：{r:?}");
+    // 用量从 `response.completed` 里来，哪怕这条流没有 Content-Type
+    assert_eq!(r.input_tokens, Some(23));
+    assert_eq!(r.output_tokens, Some(5));
+
+    let (uri, h, sent) = backend.seen.lock().unwrap()[0].clone();
+    assert_eq!(uri, "/backend-api/codex/responses");
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["store"], false);
+    assert!(sent.get("max_output_tokens").is_none(), "{sent}");
+    assert_eq!(sent["input"][0]["content"][0]["text"], "Hi");
+    let header = |k: &str| h.get(k).map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(header("originator").as_deref(), Some("thinkwatch"));
+    assert!(header("user-agent").unwrap().starts_with("thinkwatch/"));
+    assert_eq!(header("chatgpt-account-id").as_deref(), Some("acc-123"));
+    assert_eq!(header("authorization").as_deref(), Some("Bearer at-1"));
+}
+
+/// 上游拒绝这次测速时，说的是上游的原话，而不是「这家不通」
+#[tokio::test]
+async fn a_refused_inference_test_carries_what_the_backend_said() {
+    let tokens = Arc::new(TokenServer::default());
+    let token_url = start_token_server(tokens.clone()).await;
+    let backend = Arc::new(Backend {
+        exhausted: true,
+        ..Default::default()
+    });
+    let base = start_backend(backend.clone()).await;
+    let p = chatgpt_provider(&base, &token_url);
+    let state = tw_gateway::AppState::new(Config {
+        version: 1,
+        listen: Listen::default(),
+        providers: vec![p.clone()],
+        ..Default::default()
+    })
+    .unwrap();
+    let http = state.client_for(&p.name);
+    let headers = state.headers_for(&p, &http, None).await.unwrap();
+    let r = tw_gateway::l3::run(&http, &p, &headers, "gpt-5.5", None).await;
+    assert!(!r.ok);
+    let e = r.error.expect("没有错误");
+    assert_eq!(e.code, "l3.refused");
+    assert_eq!(e.arg("status"), "429");
+    assert!(e.arg("detail").contains("usage limit"), "{}", e.text);
+}

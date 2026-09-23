@@ -737,8 +737,15 @@ async fn speed_quote(
         targets(&cfg, &req.providers)?
             .into_iter()
             .map(|p| {
-                // 和记账同一个口径：按这家的计费方式和价目表
-                let e = tw_gateway::l3::estimate(&book, &p.name, &req.model, p.billing);
+                // 和记账同一个口径：按这家的计费方式和价目表。**协议也要给**：
+                // 输出上限报多少由它决定（见 `tw_gateway::l3::max_output_tokens`）
+                let e = tw_gateway::l3::estimate(
+                    &book,
+                    &p.name,
+                    &req.model,
+                    p.billing,
+                    p.effective_protocol(),
+                );
                 (e, tw_gateway::models::fit(&catalog, p, &req.model))
             })
             .collect();
@@ -789,20 +796,29 @@ async fn speed_run(
                     total_ms: 0,
                     input_tokens: None,
                     output_tokens: None,
-                    error: Some(format!("the credential could not be obtained: {e}")),
+                    error: Some(msg!(
+                        "control.credentials_failed", upstream = p.name.clone(), detail = e =>
+                        "The credential for upstream `{upstream}` could not be obtained: {detail}"
+                    )),
                 });
                 continue;
             }
         };
         // **发请求也用这一家的 client。**以前只有换 token 走它、真正的测速
         // 请求走默认 client —— 要走代理的上游在这里连不上，而转发时它是通的
+        //
+        // 输出上限和报价里那个是同一个数：摆给用户看的上限和真正发出去的不一样，
+        // 那份报价就不是这次消耗的报价
         let r = tw_gateway::l3::run(
             &pk_http,
-            &p.base_url,
+            p,
             &headers,
-            p.effective_protocol(),
-            &p.name,
             &req.model,
+            tw_gateway::l3::max_output_tokens(
+                &s.gateway.pricing.load(),
+                &req.model,
+                p.effective_protocol(),
+            ),
         )
         .await;
         out.push(tw_api::SpeedResult {

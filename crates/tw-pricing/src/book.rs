@@ -232,6 +232,7 @@ impl ModelPrice {
             output_above_200k: self.output_above_200k.map(|v| v * m),
             max_input_tokens: self.max_input_tokens,
             max_output_tokens: self.max_output_tokens,
+            reasoning: self.reasoning,
         }
     }
 
