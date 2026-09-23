@@ -2964,43 +2964,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tw-protocol"
-version = "0.34.0"
-dependencies = [
- "bytes",
- "futures",
- "metrics",
- "reqwest",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "tw-provider"
-version = "0.34.0"
-dependencies = [
- "async-stream",
- "aws-credential-types",
- "aws-sigv4",
- "aws-smithy-eventstream",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "hmac",
- "http 1.5.0",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tracing",
- "tw-protocol",
- "tw-types",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "tw-redact"
 version = "0.34.0"
 dependencies = [
@@ -3081,10 +3044,15 @@ version = "0.34.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
+ "aws-smithy-eventstream",
+ "aws-smithy-types",
+ "bytes",
  "http 1.5.0",
  "reqwest",
  "serde_json",
  "tokio",
+ "tw-dialect",
+ "tw-wire",
 ]
 
 [[package]]
@@ -3182,12 +3150,6 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
-
-[[package]]
-name = "urlencoding"
-version = "2.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf-8"

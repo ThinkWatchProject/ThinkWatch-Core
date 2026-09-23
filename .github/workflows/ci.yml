@@ -36,6 +36,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # 桌面版不开 `bedrock`，上面两步就一行都不编它。企业版开，所以单独查
+      - name: clippy + test (tw-upstream, bedrock)
+        run: |
+          cargo clippy -p tw-upstream --all-targets --features bedrock -- -D warnings
+          cargo test -p tw-upstream --features bedrock
+
       - name: Build
         run: cargo build --release -p twcore
 

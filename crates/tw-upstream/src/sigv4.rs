@@ -4,7 +4,7 @@
 //! 方法、URL、时间和请求体的哈希。所以**签名必须在请求体最终定稿之后**，
 //! 改一个字节签名就失效。
 //!
-//! 桌面版不接 Bedrock，所以这一整套在 `sigv4` feature 后面 —— 否则它会把
+//! 桌面版不接 Bedrock，所以这一整套在 `bedrock` feature 后面 —— 否则它会把
 //! `aws-sigv4`、`aws-credential-types`、`aws-smithy-*` 连同一个 `http 0.2`
 //! 拖给每一个依赖这个 crate 的人。
 

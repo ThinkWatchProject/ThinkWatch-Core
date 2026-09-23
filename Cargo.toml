@@ -5,8 +5,6 @@ members = [
     "crates/tw-types",
     "crates/tw-upstream",
     "crates/tw-wire",
-    "crates/tw-protocol",
-    "crates/tw-provider",
     "crates/tw-resil",
     "crates/tw-crypto",
     # ── 第二层 · 桌面网关（企业版永不依赖）────────────────
@@ -47,8 +45,6 @@ version = "0.34.0"
 tw-types    = { path = "crates/tw-types" }
 tw-upstream = { path = "crates/tw-upstream" }
 tw-wire     = { path = "crates/tw-wire" }
-tw-protocol = { path = "crates/tw-protocol" }
-tw-provider = { path = "crates/tw-provider" }
 tw-resil    = { path = "crates/tw-resil" }
 tw-crypto   = { path = "crates/tw-crypto" }
 tw-api      = { path = "crates/tw-api" }
@@ -132,12 +128,11 @@ rand = "0.10"
 aes-gcm = "=0.10.3"
 
 clap = { version = "4", features = ["derive"] }
-# ── Bedrock 的 SigV4 签名（tw-provider）──────────────────
+# ── Bedrock：SigV4 签名与 eventstream 拆帧（tw-upstream 的 bedrock feature）──
 aws-sigv4 = "1"
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-eventstream = "0.60"
-http_1x = { package = "http", version = "1" }
-urlencoding = "2"
+aws-smithy-types = "1"
 
 
 [profile.release]
