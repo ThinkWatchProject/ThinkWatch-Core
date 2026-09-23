@@ -287,7 +287,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "zed",
             name: "Zed",
-            config: ".config/zed/settings.json",
+            config: crate::paths::zed_settings(),
             format: Format::Json,
             takes_effect: TakesEffect::Immediately,
             shadowed_by: &[],
@@ -298,7 +298,7 @@ pub fn adoptable() -> Vec<Client> {
                 "Zed keeps its key outside the configuration file, so it has to be filled in once in Zed's settings.",
             )],
             verified: Verified::FieldsOnly,
-            marker: &[".config/zed"],
+            marker: &[crate::paths::ZED_DIR],
             process: &["Zed"],
             env_vars: &[],
             key_elsewhere: Some((
@@ -346,7 +346,7 @@ pub struct ManualOnly {
     /// 为它生成专用密钥时用的标识：`cursor` / `continue` / `gemini-cli`
     pub id: &'static str,
     pub name: &'static str,
-    /// 这个客户端的码前缀：每一步是 `<prefix>.<后缀>`，提醒是 `<prefix>.caveat`
+    /// 这个客户端的码前缀：每一步是 `<prefix>.<后缀>`，提醒也是 `<prefix>.<后缀>`（见 `caveat`）
     code: &'static str,
     /// 手动配置的几步，每步「码的后缀，英文原句」。
     ///
@@ -356,7 +356,9 @@ pub struct ManualOnly {
     steps: &'static [(&'static str, &'static str)],
     /// 填带 `/v1` 的地址还是不带的
     v1: bool,
-    caveat: &'static str,
+    /// 提醒，「码的后缀，英文原句」。**后缀也可以按平台分** —— 两个平台
+    /// 说的不是一句话时，用各自的码，界面才能各翻各的
+    caveat: (&'static str, &'static str),
 }
 
 impl ManualOnly {
@@ -384,10 +386,11 @@ impl ManualOnly {
     /// 接管不了的那一句提醒。**必须和步骤一起给** —— 只说怎么配、不说
     /// 配完还漏什么，等于说了假话
     pub fn caveat(&self) -> Msg {
+        let (suffix, text) = self.caveat;
         Msg {
-            code: format!("{}.caveat", self.code),
+            code: format!("{}.{suffix}", self.code),
             args: BTreeMap::new(),
-            text: self.caveat.to_string(),
+            text: text.to_string(),
         }
     }
 }
@@ -410,14 +413,20 @@ pub fn manual_only() -> Vec<ManualOnly> {
                 ),
             ],
             v1: true,
-            caveat: "Tab completion and inline edit still go to Cursor's own service rather than the gateway, so only part of Cursor is covered.",
+            caveat: (
+                "caveat",
+                "Tab completion and inline edit still go to Cursor's own service rather than the gateway, so only part of Cursor is covered.",
+            ),
         },
         ManualOnly {
             id: "continue",
             name: "Continue",
             code: "adopt.manual.continue",
             steps: &[
+                #[cfg(not(windows))]
                 ("open", "Open ~/.continue/config.yaml."),
+                #[cfg(windows)]
+                ("open_windows", r"Open %USERPROFILE%\.continue\config.yaml."),
                 (
                     "entry",
                     "Add an entry to the models list with provider set to openai, apiBase set to the gateway address and apiKey set to the key.",
@@ -428,12 +437,18 @@ pub fn manual_only() -> Vec<ManualOnly> {
             // 改写，不是替换一个标量。我们的 YAML 补丁只做后者
             // （见 crate::yaml 开头那段）。宁可少接管一个客户端，也不
             // 要写一段我们自己没把握的结构。
-            caveat: "This needs a new entry in the models list, which is not written automatically; follow the steps above.",
+            caveat: (
+                "caveat",
+                "This needs a new entry in the models list, which is not written automatically; follow the steps above.",
+            ),
         },
         ManualOnly {
             id: "gemini-cli",
             name: "Gemini CLI",
             code: "adopt.manual.gemini_cli",
+            // **Windows 上没有 shell 配置文件可 export**：用户级环境变量用 setx
+            // 写，写完只对之后打开的终端生效。两个平台各用各的码
+            #[cfg(not(windows))]
             steps: &[
                 (
                     "export",
@@ -441,11 +456,28 @@ pub fn manual_only() -> Vec<ManualOnly> {
                 ),
                 ("reopen", "Then reopen the terminal."),
             ],
+            #[cfg(windows)]
+            steps: &[
+                (
+                    "setx",
+                    "In a terminal, run setx GOOGLE_GEMINI_BASE_URL followed by the gateway address, and setx GEMINI_API_KEY followed by the key.",
+                ),
+                ("reopen", "Then reopen the terminal."),
+            ],
             v1: false,
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
             // 「只改 endpoint 和 key 字段」的边界 ——
             // **报告是我们的职责，修改是他的权利。**
-            caveat: "Gemini CLI reads the endpoint only from the environment. ThinkWatch does not edit shell configuration files, so add it by hand.",
+            #[cfg(not(windows))]
+            caveat: (
+                "caveat",
+                "Gemini CLI reads the endpoint only from the environment. ThinkWatch does not edit shell configuration files, so add it by hand.",
+            ),
+            #[cfg(windows)]
+            caveat: (
+                "caveat_windows",
+                "Gemini CLI reads the endpoint only from the environment. ThinkWatch does not change environment variables, so add them by hand.",
+            ),
         },
     ]
 }
@@ -592,7 +624,7 @@ impl Client {
     /// **没检测到它的时候也要给。**配置文件不在默认位置、或者装在别的
     /// 用户目录下时，检测不到不等于用不了 —— 照着做一样能接上。
     pub fn manual_steps(&self) -> Vec<Msg> {
-        let file = format!("~/{}", self.config);
+        let file = crate::paths::shown(self.config);
         let mut out = vec![Msg {
             code: "adopt.manual.file".into(),
             args: BTreeMap::from([("file".to_string(), file.clone())]),
@@ -620,10 +652,13 @@ impl Client {
     }
 
     pub fn config_path(&self, home: &std::path::Path) -> PathBuf {
-        home.join(self.config)
+        crate::paths::under(home, self.config)
     }
     pub fn shadow_paths(&self, home: &std::path::Path) -> Vec<PathBuf> {
-        self.shadowed_by.iter().map(|p| home.join(p)).collect()
+        self.shadowed_by
+            .iter()
+            .map(|p| crate::paths::under(home, p))
+            .collect()
     }
     /// 注释前缀。JSON 没有 —— 那时哨兵走旁文件。
     pub fn comment_prefix(&self) -> Option<&'static str> {
@@ -726,9 +761,9 @@ mod tests {
         let m = manual_only();
         let cursor = m.iter().find(|c| c.name == "Cursor").unwrap();
         assert!(
-            cursor.caveat.contains("Tab completion"),
+            cursor.caveat.1.contains("Tab completion"),
             "{}",
-            cursor.caveat
+            cursor.caveat.1
         );
         // 地址是真实的地址，而不是一个让用户自己去找的说法；**不在句子里**，
         // 界面单独给它一个复制按钮
@@ -802,7 +837,13 @@ mod tests {
         }
         for c in adoptable() {
             let steps = c.manual_steps();
-            assert_eq!(steps[0].arg("file"), format!("~/{}", c.config), "{}", c.id);
+            // 写法按平台（`~/…` 或 `%USERPROFILE%\…`），各自的样子见 paths 里那条测试
+            assert_eq!(
+                steps[0].arg("file"),
+                crate::paths::shown(c.config),
+                "{}",
+                c.id
+            );
             assert!(!edits(&c, &gw).is_empty(), "{}：没有要写的字段", c.id);
         }
         // Zed 的密钥不在配置文件里，多一步在它自己的设置里填

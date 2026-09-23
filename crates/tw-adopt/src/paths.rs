@@ -17,7 +17,57 @@
 //!
 //! 机器级的那一个（管理策略）没有 home 可言，它读环境变量。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// 把一条用 `/` 写的相对路径接到 `base` 下面。
+///
+/// **按 `/` 拆开逐段接，不直接 `join`。**这些相对路径在源码里一律用 `/` 写，
+/// 直接 `base.join(".claude/settings.json")` 在 Windows 上得到的是
+/// `C:\Users\x\.claude/settings.json` —— 文件照样找得到（Windows 两种分隔符
+/// 都认），但界面上显示的就是这么一串正反斜杠混着的路径。逐段接出来的是
+/// 那个平台自己的写法。
+pub fn under(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .filter(|c| !c.is_empty())
+        .fold(base.to_path_buf(), |p, c| p.join(c))
+}
+
+/// 给人看的写法：「打开 … 」那一步里的路径。
+///
+/// macOS 上是 `~/.claude/settings.json`；Windows 上没有 `~`，写成资源管理器
+/// 地址栏里能直接粘贴的 `%USERPROFILE%\.claude\settings.json`。
+pub fn shown(rel: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(r"%USERPROFILE%\{}", rel.replace('/', r"\"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("~/{rel}")
+    }
+}
+
+/// Zed 的设置文件，相对 home。
+///
+/// Windows 上的 Zed 按那个平台的习惯放在漫游的 AppData 下，不是 `~/.config`。
+pub fn zed_settings() -> &'static str {
+    #[cfg(windows)]
+    {
+        "AppData/Roaming/Zed/settings.json"
+    }
+    #[cfg(not(windows))]
+    {
+        ".config/zed/settings.json"
+    }
+}
+
+/// Zed 装过的痕迹：它的设置目录。**是常量不是函数**：它要放进
+/// `marker: &[…]` 那个静态切片里，函数的返回值进不去。
+pub const ZED_DIR: &str = if cfg!(windows) {
+    "AppData/Roaming/Zed"
+} else {
+    ".config/zed"
+};
 
 /// Claude Desktop 的配置，相对 home。
 ///
@@ -72,6 +122,34 @@ mod tests {
             std::path::Path::new("/tmp/h").join(p),
             std::path::Path::new("/tmp/h").join(p),
         );
+    }
+
+    /// 接出来的每一段都是一个组件：没有哪一段里还夹着 `/`。
+    #[test]
+    fn a_relative_path_is_joined_one_component_at_a_time() {
+        let p = under(Path::new("/h"), ".claude/settings.json");
+        let parts: Vec<_> = p.components().map(|c| c.as_os_str().to_owned()).collect();
+        assert_eq!(parts.last().unwrap(), "settings.json");
+        assert_eq!(parts[parts.len() - 2], ".claude");
+        assert!(
+            parts
+                .iter()
+                .all(|c| !c.to_string_lossy().contains('/') || c == "/")
+        );
+        assert_eq!(
+            under(Path::new("/h"), "a//b/"),
+            Path::new("/h").join("a").join("b")
+        );
+    }
+
+    #[test]
+    fn the_shown_path_is_written_the_platform_way() {
+        let s = shown(".claude/settings.json");
+        if cfg!(windows) {
+            assert_eq!(s, r"%USERPROFILE%\.claude\settings.json");
+        } else {
+            assert_eq!(s, "~/.claude/settings.json");
+        }
     }
 
     /// 机器级的那一个反过来：必须是绝对的。
