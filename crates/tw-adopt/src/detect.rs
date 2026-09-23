@@ -286,28 +286,40 @@ fn running_since(markers: &[&str]) -> Vec<u64> {
     out
 }
 
-/// 查过哪些地方。**说出来**，否则「没有同名变量」这句话没人知道它有多可信。
+/// 「查过了，没有同名变量」那一条的标题和正文。
+///
+/// **每个平台一套消息码，不共用一句再往里填词。**界面按码翻译整句：两个
+/// 平台说的本来就是两句话（一个是 shell 文件，一个是注册表），共用一个码的
+/// 话，界面那边的译文只能照着其中一个平台写 —— 另一个平台就会读到一句不对
+/// 的中文。查过哪些地方要**说出来**，否则「没有」这句话没人知道它有多可信。
 #[cfg(not(windows))]
-const LOOKED_IN: &str = ".zshrc, .zprofile, .bashrc and the rest";
+fn nothing_else_sets_it() -> (Msg, Msg) {
+    (
+        msg!("adopt.diag.no_exports" => "No shell file exports a variable of the same name"),
+        msg!("adopt.diag.no_exports.detail" => "Checked .zshrc, .zprofile, .bashrc and the rest."),
+    )
+}
 #[cfg(windows)]
-const LOOKED_IN: &str = "the user and machine environment in the registry";
+fn nothing_else_sets_it() -> (Msg, Msg) {
+    (
+        msg!("adopt.diag.no_registry_env" => "No environment variable of the same name is set"),
+        msg!("adopt.diag.no_registry_env.detail" => "Checked the user and the machine environment variables."),
+    )
+}
 
 /// 一处「同名变量在别处被设过」。
 ///
-/// **位置不一定是个路径**：unix 上是一个文件，Windows 上是注册表里的一个
-/// 键 —— 后者没有文件，也没有行号。做成 `PathBuf` 就得在 Windows 那一支编
-/// 一个假路径出来。
-///
-/// 它会被填进一句英文里（`{name} is already set in {at}`），所以**写英文**，
-/// 而且要是个名词短语。
+/// **句子由各平台那一支整句给出**，理由见 `nothing_else_sets_it`：unix 上是
+/// 「某文件第几行导出了它」，Windows 上是「注册表里某个键下设了它」—— 后者
+/// 没有文件，也没有行号。
 pub struct EnvConflict {
-    /// 在哪儿设的，照着这句话去找得到。
-    pub at: String,
-    /// 哪个变量。
-    pub name: String,
-    /// 怎么把它去掉。**一句照着做就行的话**，不是一条通用建议 ——
-    /// 而两个平台照着做的东西完全不同，所以由各自那一支给出来。
+    /// 在哪儿、设了哪个变量。
+    pub title: Msg,
+    /// 怎么把它去掉。**一句照着做就行的话**，不是一条通用建议。
     pub fix: Msg,
+    /// 「这个客户端读环境变量，于是它盖住了写进配置的值」。unix 上说的是
+    /// 「这一行」，Windows 上是「这个变量」—— 也是两句话。
+    pub overrides: fn(client: &str) -> Msg,
 }
 
 /// 别处设过同名变量的地方。
@@ -319,9 +331,13 @@ fn env_conflicts(home: &Path, names: &[&str]) -> Vec<EnvConflict> {
     shell_exports(home, names)
         .into_iter()
         .map(|(f, line, name)| EnvConflict {
-            // 行号不进这里：`fix` 那条 sed 命令已经把它带上了
-            at: f.display().to_string(),
-            name,
+            title: msg!(
+                "adopt.diag.shell_export",
+                path = f.display(),
+                name = name,
+                line = line
+                => "{path} exports {name} on line {line}"
+            ),
             // 命令给出来，执行与否是他的事
             fix: msg!(
                 "adopt.diag.delete_line",
@@ -329,6 +345,13 @@ fn env_conflicts(home: &Path, names: &[&str]) -> Vec<EnvConflict> {
                 line = line
                 => "sed -i '' '{line}d' {path}"
             ),
+            overrides: |client| {
+                msg!(
+                    "adopt.diag.shell_export.overrides",
+                    client = client
+                    => "{client} reads the environment, so this line overrides what was written here."
+                )
+            },
         })
         .collect()
 }
@@ -370,14 +393,25 @@ fn env_conflicts(_home: &Path, names: &[&str]) -> Vec<EnvConflict> {
         rc == 0
     }
 
+    fn registry_overrides(client: &str) -> Msg {
+        msg!(
+            "adopt.diag.registry_env.overrides",
+            client = client
+            => "{client} reads the environment, so this variable overrides what was written here."
+        )
+    }
+
     const USER: &str = "Environment";
     const MACHINE: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     let mut out = Vec::new();
     for n in names {
         if is_set(HKEY_CURRENT_USER, USER, n) {
             out.push(EnvConflict {
-                at: format!(r"HKCU\{USER}"),
-                name: (*n).to_string(),
+                title: msg!(
+                    "adopt.diag.registry_env", name = n, key = format!(r"HKCU\{USER}")
+                    => "{name} is set in the registry under {key}"
+                ),
+                overrides: registry_overrides,
                 // **删掉，不是设成空**：一个设成空串的变量仍然是「设过的」，
                 // 照样会盖住配置文件里的值。改完要重开终端才生效。
                 fix: msg!(
@@ -388,8 +422,11 @@ fn env_conflicts(_home: &Path, names: &[&str]) -> Vec<EnvConflict> {
         }
         if is_set(HKEY_LOCAL_MACHINE, MACHINE, n) {
             out.push(EnvConflict {
-                at: format!(r"HKLM\{MACHINE}"),
-                name: (*n).to_string(),
+                title: msg!(
+                    "adopt.diag.registry_env", name = n, key = format!(r"HKLM\{MACHINE}")
+                    => "{name} is set in the registry under {key}"
+                ),
+                overrides: registry_overrides,
                 // 机器级的那份要管理员才改得动，说出来免得他照着跑一次被拒
                 fix: msg!(
                     "adopt.diag.unset_env_machine", name = n, root = "HKLM", key = MACHINE
@@ -580,18 +617,20 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     // 五、别处设了同名的环境变量
     let exports = env_conflicts(home, c.env_vars);
     if exports.is_empty() {
+        let (clear_title, clear_detail) = nothing_else_sets_it();
         out.push(Finding {
             level: Level::Clear,
-            title: msg!("adopt.diag.no_exports" => "Nothing else sets a variable of the same name"),
-            detail: msg!(
-                "adopt.diag.no_exports.detail",
-                looked = LOOKED_IN
-                => "Looked in {looked}."
-            ),
+            title: clear_title,
+            detail: clear_detail,
             fix: None,
         });
     } else {
-        for EnvConflict { at: f, name, fix } in exports {
+        for EnvConflict {
+            title,
+            fix,
+            overrides,
+        } in exports
+        {
             // **同一条发现，对不同客户端的结论相反。**不区分的话就会
             // 给出一条错误的诊断。
             let (level, detail) = if c.config_beats_env {
@@ -604,23 +643,11 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                     ),
                 )
             } else {
-                (
-                    Level::Blocking,
-                    msg!(
-                        "adopt.diag.shell_export.overrides",
-                        client = c.name
-                        => "{client} reads the environment, so this line overrides what was written here."
-                    ),
-                )
+                (Level::Blocking, overrides(c.name))
             };
             out.push(Finding {
                 level,
-                title: msg!(
-                    "adopt.diag.shell_export",
-                    path = f,
-                    name = name
-                    => "{name} is already set in {path}"
-                ),
+                title,
                 detail,
                 fix: Some(fix),
             });
