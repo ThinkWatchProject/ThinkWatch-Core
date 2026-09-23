@@ -110,12 +110,12 @@ dangerous:
   # 才是动手。分不开的话，这条规则会在每次「帮我看看定时任务」时误报。
   - id: crontab-install
     name: Install a scheduled job
-    pattern: 'crontab\s+(-r\b|-\s*$|[^\s-][^\n]{0,40})'
+    pattern: 'crontab\s+(-r\b|-\s*($|["'';&|)])|[^\s-][^\n]{0,40})'
     why: Installs a scheduled job, or deletes every existing one
     level: high
   - id: rm-rf-root
     name: Delete home or root
-    pattern: 'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$)'
+    pattern: 'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$|["'';&|)])'
     why: Deletes the whole home directory or the root
     level: medium
   - id: chmod-777
