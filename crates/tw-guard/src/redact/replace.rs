@@ -154,18 +154,38 @@ pub fn redact_plain(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     apply(text, &hits, ledger)
 }
 
+/// 扫 + 换一段**解码过的正文**（见 [`crate::redact::rules::scan_text`]）。
+pub fn redact_text(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
+    let hits = crate::redact::rules::scan_text(text, rules);
+    apply(text, &hits, ledger)
+}
+
 /// 一次性还原（非流式响应、错误信息）。
 ///
-/// **不用按 JSON 转义**：换下来的值里从来没有引号和反斜杠（见
-/// [`crate::redact::rules::scan`]），原样放回 JSON 字符串里也还是合法的 JSON。
+/// 按 [`crate::redact::rules::scan`] / `scan_plain` 换下来的值里从来没有引号和
+/// 反斜杠，原样放回 JSON 字符串里也还是合法的 JSON。按 `scan_text` 换的可能有，
+/// 整包 JSON 用 [`restore_json`]。
 pub fn restore(text: &str, ledger: &Ledger) -> String {
+    swap(text, ledger, |s| s.to_string())
+}
+
+/// 一次性还原一份 **JSON 文本**：原值按 JSON 字符串转义之后再放回去 —— 一个
+/// 带引号的值原样塞回去，整份 JSON 就坏了。
+pub fn restore_json(text: &str, ledger: &Ledger) -> String {
+    swap(text, ledger, |s| {
+        let quoted = serde_json::to_string(s).unwrap_or_default();
+        quoted[1..quoted.len().saturating_sub(1)].to_string()
+    })
+}
+
+fn swap(text: &str, ledger: &Ledger, put: impl Fn(&str) -> String) -> String {
     if ledger.is_empty() || !text.contains(ledger.scheme.open) {
         return text.to_string();
     }
     let mut out = text.to_string();
     for (ph, original) in ledger.table() {
         if out.contains(ph.as_str()) {
-            out = out.replace(ph.as_str(), original);
+            out = out.replace(ph.as_str(), &put(original));
         }
     }
     out
@@ -356,5 +376,22 @@ mod tests {
         assert_eq!(restore(&r.text, &r.ledger), t);
         let pairs: std::collections::HashMap<_, _> = r.ledger.replacements().collect();
         assert_eq!(pairs["c@d.com"], "{{EMAIL_2}}");
+    }
+
+    #[test]
+    fn decoded_text_is_matched_as_written_and_restored_into_json_escaped() {
+        // 正文上的 `password="x"`：截在引号处的话，换下来的只是 `password=`，
+        // 真值原样发出去
+        let rules = RuleSet::none()
+            .with_labeled("pw", r#"password="[^"]*""#, Some("SECRET"))
+            .unwrap();
+        let text = r#"用 password="hunter2" 登录"#;
+        let r = redact_text(text, &rules, l());
+        assert_eq!(r.text, "用 <<SECRET_1>> 登录");
+        // 回显在一份 JSON 里：放回去要转义，否则整份 JSON 就坏了
+        let body = serde_json::json!({ "text": r.text }).to_string();
+        let back: serde_json::Value =
+            serde_json::from_str(&restore_json(&body, &r.ledger)).expect("still JSON");
+        assert_eq!(back["text"], text);
     }
 }

@@ -705,9 +705,13 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
         }
     });
     custom_hits(text, set, &mut out);
+    disjoint(out)
+}
+
+/// 排好序、去掉重叠的。**重叠的只留第一个。**私钥块里的 base64 会被 token
+/// 扫描当成别的东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段。
+fn disjoint(mut out: Vec<Hit>) -> Vec<Hit> {
     out.sort_by_key(|h| (h.bytes.start, std::cmp::Reverse(h.bytes.end)));
-    // **重叠的只留第一个。**私钥块里的 base64 会被 token 扫描当成别的
-    // 东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段
     let mut kept: Vec<Hit> = Vec::with_capacity(out.len());
     for h in out {
         if kept.last().is_some_and(|p| p.bytes.end > h.bytes.start) {
@@ -760,6 +764,31 @@ pub fn scan_plain(text: &str, set: &RuleSet) -> Vec<Hit> {
             })
         })
         .collect()
+}
+
+/// 扫一段**解码过的正文**：自定义规则按正则本来的意思匹配。
+///
+/// 和 [`scan_plain`] 的差别只在自定义规则上。桌面版扫的是线上那份 JSON，所以
+/// 自定义规则的命中止于引号和反斜杠（见 `json_safe`）；而一个先解码请求、在
+/// 正文上找、再把结果带回去的调用方（企业版）看到的就是正文，`password="x"`
+/// 截成 `password=` 只会让真值漏出去。它换下来的值可能带引号，整包还原时要用
+/// [`crate::redact::replace::restore_json`]。
+pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
+    let builtins = RuleSet {
+        on: set.on.clone(),
+        custom: Vec::new(),
+    };
+    let mut out = scan_plain(text, &builtins);
+    for c in &set.custom {
+        for m in c.re.find_iter(text).filter(|m| !m.is_empty()) {
+            out.push(Hit {
+                bytes: m.range(),
+                rule: Rule::Custom(c.name.clone()),
+                label: c.label.clone(),
+            });
+        }
+    }
+    disjoint(out)
 }
 
 /// 报出去的样子。**一律打码** —— 「发现了 sk-ant-xxx」这句话本身就是一次
