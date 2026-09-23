@@ -116,6 +116,7 @@ fn bed_with(yaml: &str, seed: impl FnOnce(&tw_store::Db)) -> Bed {
         started: std::time::Instant::now(),
         price_updater: Default::default(),
         chatgpt: Default::default(),
+        zai: Default::default(),
         // **测试里绝不能碰开发者自己的配置**
         home: d.path().join("home"),
     };

@@ -354,6 +354,7 @@ async fn bed(extra: impl FnOnce(&Endpoints) -> String) -> Bed {
         started: std::time::Instant::now(),
         price_updater: Default::default(),
         chatgpt: Arc::new(Accounts::new(endpoints.clone())),
+        zai: Default::default(),
         home: d.path().join("home"),
     };
     Bed {
@@ -856,7 +857,7 @@ async fn usage_shows_the_limits_without_personal_details() {
     assert_eq!(header("authorization"), "Bearer at-cfg");
     assert_eq!(header("chatgpt-account-id"), "acct-1");
     assert_eq!(header("originator"), "thinkwatch");
-    assert_eq!(header("user-agent"), tw_gateway::chatgpt::user_agent());
+    assert_eq!(header("user-agent"), tw_gateway::user_agent());
     assert!(h.get("session-id").is_none());
     assert!(
         b.openai.token_forms.lock().unwrap().is_empty(),
