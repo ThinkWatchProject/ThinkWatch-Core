@@ -100,7 +100,7 @@ pub fn targets() -> Vec<Target> {
         },
         Target {
             client: "codex",
-            name: "Codex CLI",
+            name: "Codex",
             config: ".codex/config.toml",
             format: Format::Toml,
             key: "mcp_servers",

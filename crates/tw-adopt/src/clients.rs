@@ -232,9 +232,15 @@ pub fn adoptable() -> Vec<Client> {
             key_elsewhere: None,
             config_beats_env: true,
         },
+        // **不叫「Codex CLI」。**`~/.codex/config.toml` 是一份配置、两个
+        // 前端：命令行的 codex，和 ChatGPT 桌面版内置的那一个
+        // （`ChatGPT.app/Contents/Resources/codex`，同一个二进制）。桌面版
+        // 启动 app-server 时不带任何 provider 覆盖，`model_provider` 完全
+        // 由这个文件决定 —— 只装了桌面版的用户看到「Codex CLI」，会以为
+        // 在说一个他没装的东西。
         Client {
             id: "codex",
-            name: "Codex CLI",
+            name: "Codex",
             config: ".codex/config.toml",
             format: Format::Toml,
             // **读环境变量的，必须关掉终端重开**
@@ -245,7 +251,12 @@ pub fn adoptable() -> Vec<Client> {
             costs: &[
                 (
                     "adopt.cost.codex.model_list",
-                    "Codex CLI does not read the model list from the gateway, so a custom model name has no effect; its local model catalogue decides.",
+                    "Codex does not read the model list from the gateway, so a custom model name has no effect; its local model catalogue decides.",
+                ),
+                // 接管这个文件顺带接管了桌面版，**这件事要在确认之前说**
+                (
+                    "adopt.cost.codex.chatgpt_desktop",
+                    "The ChatGPT desktop app reads the same configuration file, so its local Codex sessions go through the gateway as well; the app has to be restarted for that to take effect.",
                 ),
                 (
                     "adopt.cost.codex.reopen_terminal",
@@ -467,7 +478,11 @@ pub fn edits(client: &Client, gw: &Gateway) -> Vec<Edit> {
         // 的，并且用一个本地嗅探器实跑验证过：请求真的落在
         // `POST /v1/responses`，`http_headers` 原样送达，
         // `experimental_bearer_token` 变成 `Authorization: Bearer`。
-        // 一个 GET 都没有 —— 它确实不问我们要模型列表。
+        //
+        // 0.139.0 上一个 GET 都没有。**0.153.4 变了**：命令行和 ChatGPT
+        // 桌面版都会先来一个 `GET /v1/models?client_version=…`。拿到的列表
+        // 有没有真的影响可用模型还没实测，所以 `adopt.cost.codex.model_list`
+        // 那一句先照原样留着。
         "codex" => {
             let p = |k: &str| {
                 vec![
