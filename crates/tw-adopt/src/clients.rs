@@ -249,10 +249,6 @@ pub fn adoptable() -> Vec<Client> {
             // 所以它不构成遮蔽 —— 但它确实存在，值得在诊断里提一句
             shadowed_by: &[],
             costs: &[
-                (
-                    "adopt.cost.codex.model_list",
-                    "Codex does not read the model list from the gateway, so a custom model name has no effect; its local model catalogue decides.",
-                ),
                 // 接管这个文件顺带接管了桌面版，**这件事要在确认之前说**
                 (
                     "adopt.cost.codex.chatgpt_desktop",
@@ -479,10 +475,16 @@ pub fn edits(client: &Client, gw: &Gateway) -> Vec<Edit> {
         // `POST /v1/responses`，`http_headers` 原样送达，
         // `experimental_bearer_token` 变成 `Authorization: Bearer`。
         //
-        // 0.139.0 上一个 GET 都没有。**0.153.4 变了**：命令行和 ChatGPT
-        // 桌面版都会先来一个 `GET /v1/models?client_version=…`。拿到的列表
-        // 有没有真的影响可用模型还没实测，所以 `adopt.cost.codex.model_list`
-        // 那一句先照原样留着。
+        // **这里曾经有一条「Codex 不从网关取模型列表」的接管代价，删了。**
+        // 0.139.0 确实一个 GET 都没有，0.153.4 开始会先来一个
+        // `GET /v1/models?client_version=…` —— 但它要的是 Codex 自己的目录
+        // 格式（顶层 `models`），网关答的是 OpenAI 的 `data` 形状，它解码
+        // 失败，只记一行日志。**而这不影响任何人用**：codex 的
+        // `models-manager/models.json` 是 `include_str!` 编进二进制的，远端
+        // 目录只是补充；模型名在内置表里就没有任何提示，不在就按兜底的
+        // 272k 上下文跑。openai/codex 今天的 main 上还加了闸 —— 设了自定义
+        // base_url 又没设 `model_catalog_url` 的 provider 直接跳过这次请求。
+        // 一条不拦人、还在自己消失的事，不值得占接管对话框的一行。
         "codex" => {
             let p = |k: &str| {
                 vec![
