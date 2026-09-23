@@ -37,7 +37,22 @@ pub fn candidates(model: &str) -> Vec<String> {
     if let Some(stripped) = strip_date_suffix(m) {
         push(stripped.rsplit('/').next().unwrap_or(stripped).to_string());
     }
+    // GLM 在数据集里**只有带前缀的键**（`zai/glm-5.2`），而客户端发来的是裸名字
+    // `glm-5.2` —— 不补这一个候选，走 Z.ai 和 BigModel 的每一条请求都是「价格未知」。
+    //
+    // **放在最后一位**：第三方中转上的同名模型价格和官方不同，前面那几个候选（原名、
+    // 剥掉前缀的名字）先命中的算数，官方价只是兜底。中转的真实价格本来就得靠自定义
+    // 价目表 —— 那是第二层该管的事。
+    if let Some(glm) = zai_key(bare) {
+        push(glm);
+    }
     out
+}
+
+/// GLM 的官方价格在数据集里的键。**只认 `glm-` 开头** —— 别的名字没有这个规律，
+/// 给它们凑一个前缀就是在猜
+fn zai_key(bare: &str) -> Option<String> {
+    bare.starts_with("glm-").then(|| format!("zai/{bare}"))
 }
 
 /// 跨平台的最后一招：Bedrock 的写法。
@@ -123,6 +138,17 @@ mod tests {
         let c = candidates("anthropic/claude-sonnet-4-5");
         assert_eq!(c[0], "anthropic/claude-sonnet-4-5");
         assert!(c.contains(&"claude-sonnet-4-5".to_string()), "{c:?}");
+    }
+
+    #[test]
+    fn a_glm_model_also_gets_looked_up_under_its_vendor_prefix() {
+        // 数据集里只有 `zai/glm-…`。客户端发来的是裸名字，**不补这一个候选，
+        // 走 Z.ai 的请求就全是「价格未知」**。
+        let c = candidates("glm-4.6");
+        assert_eq!(c[0], "glm-4.6", "先按原样查");
+        assert_eq!(c.last().unwrap(), "zai/glm-4.6", "官方价只是兜底，排在最后");
+        // 别的名字不凑前缀
+        assert!(!candidates("kimi-k2").iter().any(|c| c.starts_with("zai/")));
     }
 
     #[test]

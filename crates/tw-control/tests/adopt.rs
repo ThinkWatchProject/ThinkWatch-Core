@@ -40,6 +40,7 @@ fn bed_with_store(store: Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Reco
         started: std::time::Instant::now(),
         price_updater: Default::default(),
         chatgpt: Default::default(),
+        zai: Default::default(),
         // 接管走这个 home。**测试里绝不能碰开发者自己的配置**，而且它
         // 是个字段而不是进程级的 $HOME —— 后者会让并行跑的测试互相踩。
         home: home.clone(),

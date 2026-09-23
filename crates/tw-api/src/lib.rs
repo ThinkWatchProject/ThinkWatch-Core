@@ -2191,6 +2191,52 @@ pub struct ResetCreditUsed {
     pub windows_reset: i64,
 }
 
+/// 用 Z.ai 或 BigModel 的账号登录（`POST /zai/login`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZaiLoginStart {
+    /// 登哪一家：`zai`（api.z.ai）或 `bigmodel`（open.bigmodel.cn）。不给是 `zai`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// 登录后写进配置的上游名。不给就是那一家的名字；已经有同名的同一家账号上游时，
+    /// 换掉它的密钥（重新登录），其余设置不动
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 登录期间调它们的接口走哪条路：`direct` / `system` / 代理名。不给是 `direct`。
+    /// 新建上游时也写成它的出站方式
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+/// 一次进行中的 Z.ai 登录。
+///
+/// **没有回到应用的地址**：授权完成后浏览器停在对方自己的页面上，那一页不是我们的，
+/// 我们只能靠轮询知道登录成了。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZaiLogin {
+    pub id: String,
+    /// 在浏览器里打开的授权地址
+    pub authorize_url: String,
+    /// 多少秒内要完成
+    pub expires_in_secs: u64,
+}
+
+/// 登录进行到哪一步（`GET /zai/login/{id}`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZaiLoginStatus {
+    pub id: String,
+    /// `pending` / `done` / `failed` / `expired` / `cancelled`
+    pub status: String,
+    /// 写进配置的上游名。`done` 时有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// 登的是哪个账号，邮箱或者昵称。`done` 时有，对方没给就没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// `failed` 时的原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// L3 测速要花多少。
 ///
 /// **这是「你确认要花钱吗」那个对话框的全部内容。**触发前必须显示它，

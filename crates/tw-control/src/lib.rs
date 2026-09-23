@@ -30,6 +30,7 @@ pub mod rotation;
 pub mod routes;
 pub mod scan;
 pub mod security;
+pub mod zai;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use tw_observe::EventBus;
 
@@ -50,6 +51,9 @@ pub struct ControlState {
     pub price_updater: Arc<pricing::Updater>,
     /// ChatGPT 账号的登录。**同一时刻只有一次**：回调端口只有一个
     pub chatgpt: Arc<chatgpt::Accounts>,
+    /// Z.ai / BigModel 账号的登录。**同一时刻也只有一次** —— 理由不是端口，是
+    /// 「一次登录」在界面上就是一件正在进行的事，两件同时进行没人说得清哪件成了
+    pub zai: Arc<zai::Accounts>,
     /// 用户的 home。接管要顺着它去找各客户端的配置。
     ///
     /// **是个字段，不是每次现读 `$HOME`。**进程级的环境变量是全局可变
@@ -146,6 +150,7 @@ pub fn router(state: ControlState) -> Router {
         .merge(security::router())
         .merge(pricing::router())
         .merge(chatgpt::router())
+        .merge(zai::router())
         .with_state(state)
 }
 

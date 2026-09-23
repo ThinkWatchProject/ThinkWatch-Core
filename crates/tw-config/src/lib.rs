@@ -746,6 +746,7 @@ impl Provider {
             "api.deepseek.com",
             "api.moonshot.cn",
             "open.bigmodel.cn",
+            "api.z.ai",
             "dashscope.aliyuncs.com",
             "chatgpt.com",
         ];
