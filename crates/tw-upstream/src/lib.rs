@@ -11,7 +11,9 @@
 //! 企业版设 300 秒并禁止重定向，因为它是多租户而且 base_url 由管理员填），
 //! 那是各自的权衡，不是共用件。
 
-#[cfg(feature = "sigv4")]
+#[cfg(feature = "bedrock")]
+pub mod eventstream;
+#[cfg(feature = "bedrock")]
 pub mod sigv4;
 
 use http::{HeaderMap, HeaderName, HeaderValue};

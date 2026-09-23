@@ -13,14 +13,30 @@ description = "Talking to an upstream: URL assembly and header handling, shared 
 http = "1"
 reqwest = { workspace = true }
 
-# ── SigV4：只有 Bedrock 要，桌面版不接它 ─────────────────────
+# ── Bedrock：SigV4 签名、eventstream 拆帧。桌面版不接它 ─────────
 # 这一串会连同一个 http 0.2 一起进来，所以关在 feature 后面
 aws-sigv4 = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
+aws-smithy-eventstream = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [features]
-sigv4 = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:serde_json"]
+bedrock = [
+    "dep:aws-sigv4",
+    "dep:aws-credential-types",
+    "dep:aws-smithy-eventstream",
+    "dep:bytes",
+    "dep:serde_json",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+aws-smithy-types = { workspace = true }
+# 从线上的二进制帧一路走到客户端格式，证明拆帧和方言的约定对得上
+tw-dialect = { workspace = true }
+tw-wire = { workspace = true }
+
+[[test]]
+name = "bedrock_stream"
+required-features = ["bedrock"]
