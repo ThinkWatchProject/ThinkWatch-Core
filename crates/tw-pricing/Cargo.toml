@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 flate2 = { workspace = true }
 thiserror = { workspace = true }
+tw-types = { workspace = true }
 
 [dev-dependencies]
 # 价目表写在 config.yaml 里，而读 YAML 是 tw-config 的事。这里只在测试里用它

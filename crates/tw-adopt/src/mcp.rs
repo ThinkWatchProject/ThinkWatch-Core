@@ -11,26 +11,53 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tw_types::Msg;
+use tw_types::{Msg, msg};
 
 use crate::clients::Format;
 use crate::foreign::{self, Applied, Change, ForeignError};
 use crate::json::Val;
 
+/// 搬 MCP server 时的失败。
+///
+/// **英文只写一遍**：`Display` 就是 [`McpError::msg`] 的原句，界面拿码去翻。
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    #[error("{0} is not a client we know")]
+    #[error("{}", self.msg())]
     UnknownClient(String),
-    #[error("the MCP configuration of {client} could not be parsed, so nothing was changed: {msg}")]
+    #[error("{}", self.msg())]
     Parse { client: String, msg: String },
-    #[error("{0}")]
+    #[error(transparent)]
     Write(#[from] ForeignError),
-    #[error("{client} has no MCP server named `{name}`")]
+    #[error("{}", self.msg())]
     NotThere { client: String, name: String },
-    #[error(
-        "the MCP configuration format of {client} is unverified, so it is not written to ({why})"
-    )]
-    NotCopyable { client: String, why: String },
+    /// 不能写的那个理由，带码。见 [`Target::why_not`]
+    #[error("{}", self.msg())]
+    NotCopyable { client: String, why: Msg },
+}
+
+impl McpError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            McpError::UnknownClient(client) => msg!(
+                "adopt.mcp.unknown_client", client = client =>
+                "{client} is not a client we know"
+            ),
+            McpError::Parse { client, msg } => msg!(
+                "adopt.mcp.parse_failed", client = client, detail = msg =>
+                "the MCP configuration of {client} could not be parsed, so nothing was changed: \
+                 {detail}"
+            ),
+            McpError::Write(e) => e.msg(),
+            McpError::NotThere { client, name } => msg!(
+                "adopt.mcp.not_there", client = client, name = name =>
+                "{client} has no MCP server named `{name}`"
+            ),
+            // **理由那半句本来就有自己的码**（`adopt.mcp.unverified_format` 那几条），
+            // 套进一句「格式未验证」里就又成了英文 —— 直接说理由
+            McpError::NotCopyable { why, .. } => why.clone(),
+        }
+    }
 }
 
 /// 一个能被写入的 MCP 配置位置。
@@ -151,9 +178,14 @@ impl Target {
         } else {
             Err(McpError::NotCopyable {
                 client: self.client.to_string(),
-                // 这一条是护栏：界面对不能写的目标根本不给按钮。
-                // 英文原句就够了，控制面会把它当 detail 包进去
-                why: self.why_not.map(|(_, t)| t.to_string()).unwrap_or_default(),
+                // 这一条是护栏：界面对不能写的目标根本不给按钮
+                why: self.why_not().unwrap_or_else(|| {
+                    msg!(
+                        "adopt.mcp.not_copyable", client = self.client =>
+                        "the MCP configuration format of {client} is unverified, so it is not \
+                         written to"
+                    )
+                }),
             })
         }
     }

@@ -655,7 +655,7 @@ async fn cost_buckets(
     let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let x = g.db().cost_buckets(from, to, bucket).map_err(internal)?;
+    let x = g.db().cost_buckets(from, to, bucket).map_err(records)?;
     Ok(Json(x))
 }
 
@@ -677,7 +677,7 @@ async fn cost_buckets_by(
     let x = g
         .db()
         .cost_buckets_by(q.dim, from, to, bucket)
-        .map_err(internal)?;
+        .map_err(records)?;
     Ok(Json(x))
 }
 
@@ -688,7 +688,7 @@ async fn cost_by(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let x = g.db().cost_by(q.dim, from, to).map_err(internal)?;
+    let x = g.db().cost_by(q.dim, from, to).map_err(records)?;
     Ok(Json(x))
 }
 
@@ -700,7 +700,7 @@ async fn summary(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let x = g.db().summary(from, to).map_err(internal)?;
+    let x = g.db().summary(from, to).map_err(records)?;
     Ok(Json(tw_api::Summary {
         requests: x.requests,
         failed: x.failed,
@@ -715,7 +715,7 @@ async fn summary(
         no_usage_requests: x.no_usage_requests,
         cache_saved_micros: x.cache_saved_micros,
         // **和安全日志数的是同一批**：概览上点开这个数，落到的日志就是这么多条
-        security: g.db().security_counts(from, to).map_err(internal)?,
+        security: g.db().security_counts(from, to).map_err(records)?,
         pricing_date: s.gateway.pricing.load().table().date.clone(),
     }))
 }
@@ -727,14 +727,14 @@ async fn history(
 ) -> Result<Json<Vec<tw_api::HistoryRow>>, Fail> {
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let rows = g.db().recent(q.within(), q.limit()).map_err(internal)?;
+    let rows = g.db().recent(q.within(), q.limit()).map_err(records)?;
     // 这一段里的安全记录一次取完，按请求号挂上去。**流量页的徽标靠它**：
     // 以前徽标只来自实时事件，关窗再开就没了
     let mut security = match (
         rows.iter().map(|r| r.id).min(),
         rows.iter().map(|r| r.id).max(),
     ) {
-        (Some(from), Some(to)) => g.db().security_of_requests(from, to).map_err(internal)?,
+        (Some(from), Some(to)) => g.db().security_of_requests(from, to).map_err(records)?,
         _ => Default::default(),
     };
     Ok(Json(
@@ -754,7 +754,7 @@ async fn latency(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let xs = g.db().latency_by_model(from, to).map_err(internal)?;
+    let xs = g.db().latency_by_model(from, to).map_err(records)?;
     Ok(Json(
         xs.into_iter()
             .map(|l| tw_api::LatencyView {
@@ -927,7 +927,7 @@ async fn request_detail(
     let g = store.lock().await;
     // **还在跑的也答。**记录要等结局才落库，而用户点开的往往正是那个跑了很久的
     // 请求：给到目前为止知道的，标着还在跑
-    let (row, in_flight) = match g.db().get(id).map_err(internal)? {
+    let (row, in_flight) = match g.db().get(id).map_err(records)? {
         Some(row) => (row, false),
         None => {
             let row = u64::try_from(id)
@@ -959,7 +959,7 @@ async fn request_detail(
     let security = g
         .db()
         .security_of_requests(id, id)
-        .map_err(internal)?
+        .map_err(records)?
         .remove(&id)
         .unwrap_or_default();
     let detail = tw_api::RequestDetail {
@@ -1008,7 +1008,7 @@ async fn latency_by_provider(
     let (from, to) = q.range();
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let xs = g.db().latency_by_provider(from, to).map_err(internal)?;
+    let xs = g.db().latency_by_provider(from, to).map_err(records)?;
     Ok(Json(
         xs.into_iter()
             .map(|l| tw_api::LatencyView {
@@ -1220,7 +1220,7 @@ impl ListQuery {
 
 /// 当前配置的原文。**文本模式直接显示它。**
 async fn get_config(State(s): State<ControlState>) -> Result<Json<tw_api::ConfigText>, Fail> {
-    let c = s.cfg.current().map_err(internal)?;
+    let c = s.cfg.current().map_err(unreadable_config)?;
     Ok(Json(tw_api::ConfigText {
         path: c.path.display().to_string(),
         version: c.version(),
@@ -1265,7 +1265,7 @@ async fn put_config(
 async fn config_history(
     State(s): State<ControlState>,
 ) -> Result<Json<Vec<tw_api::ConfigVersion>>, Fail> {
-    let all = tw_config::history::list(s.config_path()).map_err(internal)?;
+    let all = tw_config::history::list(s.config_path()).map_err(unreadable_config)?;
     let now = s.cfg.current().map(|c| c.version()).unwrap_or_default();
     // **新的在前。**用户找的几乎总是最近那几版。
     Ok(Json(
@@ -1301,15 +1301,36 @@ pub(crate) fn fail(code: StatusCode, detail: Msg) -> Fail {
     (code, Json(detail))
 }
 
-/// 内部错误：数据库读不了、序列化不了之类。
+/// 内部错误：锁坏了、序列化不了之类 —— **正常使用碰不到的那一类**。
 ///
-/// **这一类只有一个码。**界面对它们能说的只有同一句话（「这一步没做成」），
-/// 真正有用的是 `detail` 里那句原话，而那句话是给看日志的人读的。
+/// 界面对它们能说的只有同一句话（「网关内部出了问题」），真正有用的是
+/// `detail` 里那句原话，而那句话是给看日志的人读的。
 pub(crate) fn internal(e: impl std::fmt::Display) -> Fail {
     fail(
         StatusCode::INTERNAL_SERVER_ERROR,
-        msg!("control.internal", detail = e => "{detail}"),
+        msg!(
+            "control.internal_error", detail = e =>
+            "Something went wrong inside the gateway: {detail}"
+        ),
     )
+}
+
+/// 请求记录的库读不了。**和 [`internal`] 分开**：这一类用户看得见后果
+/// （流量页空着），说清是记录读不出来，比一句「内部错误」有用。`detail`
+/// 是 SQLite 的原话。
+pub(crate) fn records(e: tw_store::db::DbError) -> Fail {
+    fail(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        msg!(
+            "control.records_unreadable", detail = e =>
+            "The request records could not be read: {detail}"
+        ),
+    )
+}
+
+/// 配置文件读不了（不存在、没权限）。那句话自己带码。
+pub(crate) fn unreadable_config(e: tw_config::StoreError) -> Fail {
+    fail(StatusCode::INTERNAL_SERVER_ERROR, e.msg())
 }
 
 /// 配置里没有这个名字的上游。
@@ -1340,16 +1361,16 @@ pub(crate) fn apply_fail(e: ApplyError) -> Fail {
         ApplyError::Rejected(_)
         | ApplyError::Build(_)
         | ApplyError::BadPath(_)
-        | ApplyError::Edit(EditError::Unwritable(_))
+        | ApplyError::Invalid(_)
+        | ApplyError::Edit(
+            EditError::Unwritable(_) | EditError::Multiline | EditError::Nameless { .. },
+        )
         | ApplyError::Edit(EditError::Yaml(_)) => StatusCode::BAD_REQUEST,
         ApplyError::Edit(EditError::Parse(_) | EditError::SelfCheck(_)) | ApplyError::Store(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    fail(
-        code,
-        msg!("control.config_rejected", detail = e => "{detail}"),
-    )
+    fail(code, e.msg())
 }
 
 fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {

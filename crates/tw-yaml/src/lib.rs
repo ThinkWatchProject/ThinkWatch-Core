@@ -15,6 +15,7 @@
 use std::ops::Range;
 
 use saphyr_parser::{Event, Parser, ScalarStyle, Span};
+use tw_types::{Msg, msg};
 
 mod edit;
 mod render;
@@ -57,32 +58,70 @@ impl From<usize> for Step {
     }
 }
 
+/// 改不动的原因。
+///
+/// **英文只写一遍**：`Display` 就是 [`PatchError::msg`] 的原句，界面拿码去
+/// 翻，命令行和日志看原句 —— 两处各写一份的话，迟早会说成两件事。
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PatchError {
-    #[error("the YAML could not be parsed: {0}")]
+    #[error("{}", self.msg())]
     Parse(String),
-    #[error("{0} could not be located in the configuration")]
+    #[error("{}", self.msg())]
     NotFound(String),
-    #[error("{0} is not a scalar, and only a scalar can be changed in place")]
+    #[error("{}", self.msg())]
     NotScalar(String),
     /// **写之前的最后一道闸。**改完在内存里重新解析一遍，对不上就拒绝
     /// 写入。开销几百微秒，换来「永远不会写出一个自己都解析不了的文件」。
-    #[error("the edit did not pass its own check, so nothing was written: {0}")]
+    #[error("{}", self.msg())]
     SelfCheck(String),
     /// 同一个 map 里出现了两个同名的键。
-    #[error(
-        "{0} appears more than once in the configuration, so a change to it may not take effect; remove the duplicates by hand first"
-    )]
+    #[error("{}", self.msg())]
     Duplicate(String),
-    #[error(
-        "{0} is a multi-line block (| or >) and cannot be changed automatically; edit the configuration file directly"
-    )]
+    #[error("{}", self.msg())]
     BlockScalar(String),
     /// 锚点和别名让「改一处」不再是改一处。
-    #[error(
-        "{0} sits inside a YAML anchor or alias (&x / *x), so a change reaches every use of it; edit the configuration file directly"
-    )]
+    #[error("{}", self.msg())]
     AnchorOrAlias(String),
+}
+
+impl PatchError {
+    /// 给人看的那句话，带码。`Parse` 和 `SelfCheck` 里是解析器的原话，
+    /// 只能原样放进 `detail`；其余几种的参数都是路径（`providers[1].base_url`）。
+    pub fn msg(&self) -> Msg {
+        match self {
+            PatchError::Parse(d) => msg!(
+                "yaml.parse", detail = d =>
+                "the YAML could not be parsed: {detail}"
+            ),
+            PatchError::NotFound(p) => msg!(
+                "yaml.not_found", path = p =>
+                "{path} could not be located in the configuration"
+            ),
+            PatchError::NotScalar(p) => msg!(
+                "yaml.not_scalar", path = p =>
+                "{path} is not a scalar, and only a scalar can be changed in place"
+            ),
+            PatchError::SelfCheck(d) => msg!(
+                "yaml.self_check", detail = d =>
+                "the edit did not pass its own check, so nothing was written: {detail}"
+            ),
+            PatchError::Duplicate(p) => msg!(
+                "yaml.duplicate", path = p =>
+                "{path} appears more than once in the configuration, so a change to it may not \
+                 take effect; remove the duplicates by hand first"
+            ),
+            PatchError::BlockScalar(p) => msg!(
+                "yaml.block_scalar", path = p =>
+                "{path} is a multi-line block (| or >) and cannot be changed automatically; edit \
+                 the configuration file directly"
+            ),
+            PatchError::AnchorOrAlias(p) => msg!(
+                "yaml.anchor_or_alias", path = p =>
+                "{path} sits inside a YAML anchor or alias (&x / *x), so a change reaches every \
+                 use of it; edit the configuration file directly"
+            ),
+        }
+    }
 }
 
 /// 路径的人话形式（`providers[1].base_url`）。错误信息和写回校验都用它。
@@ -1396,5 +1435,33 @@ mod undo_tests {
         let back: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
         assert!(back["default_route"].is_null(), "{out}");
         assert_eq!(back["routes"].as_sequence().unwrap().len(), 1, "{out}");
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+
+    /// **每一种都有自己的码。**以前这一层的话被人整句塞进 `{detail}`，
+    /// 界面拿到的码只说「改配置失败了」
+    #[test]
+    fn every_patch_error_has_its_own_code() {
+        let all = [
+            PatchError::Parse("x".into()),
+            PatchError::NotFound("a.b".into()),
+            PatchError::NotScalar("a.b".into()),
+            PatchError::SelfCheck("x".into()),
+            PatchError::Duplicate("a.b".into()),
+            PatchError::BlockScalar("a.b".into()),
+            PatchError::AnchorOrAlias("a.b".into()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for e in &all {
+            let m = e.msg();
+            assert!(m.code.starts_with("yaml."), "{m:?}");
+            assert!(!m.text.is_empty() && m.text == e.to_string(), "{m:?}");
+            assert!(seen.insert(m.code.clone()), "码重复了：{}", m.code);
+        }
+        assert_eq!(PatchError::NotFound("a.b".into()).msg().arg("path"), "a.b");
     }
 }

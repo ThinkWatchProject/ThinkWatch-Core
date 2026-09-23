@@ -12,6 +12,7 @@ serde = { workspace = true }
 tw-dialect = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tw-types = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

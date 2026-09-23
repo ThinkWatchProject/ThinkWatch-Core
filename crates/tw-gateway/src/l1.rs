@@ -310,8 +310,48 @@ fn is_timeout(m: &Msg) -> bool {
 async fn phase<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> Result<T, Msg> {
     match tokio::time::timeout(PHASE_TIMEOUT, f).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(msg!("l1.io", detail = e => "{detail}")),
+        Ok(Err(e)) => Err(io_message(&e)),
         Err(_) => Err(timed_out()),
+    }
+}
+
+/// 一次读写失败怎么说。
+///
+/// **按 `ErrorKind` 分，不按系统原话分。**原话是英文的、带一个 errno，而
+/// 且每个平台说法不同（macOS 的「Connection reset by peer」到 Windows 上是
+/// 一整句 WSA 的解释）；种类是标准库替各平台归好的类。常见的几种各有一个
+/// 码，界面能说成自己的话；剩下的才只能把原话原样带出去。
+fn io_message(e: &std::io::Error) -> Msg {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        ConnectionRefused => msg!("l1.io.refused" => "The connection was refused."),
+        ConnectionReset => msg!("l1.io.reset" => "The connection was reset by the other end."),
+        ConnectionAborted => msg!("l1.io.aborted" => "The connection was aborted."),
+        TimedOut => msg!("l1.io.timed_out" => "The connection timed out."),
+        AddrNotAvailable => msg!(
+            "l1.io.addr_not_available" =>
+            "The address is not available on this machine."
+        ),
+        NotFound => msg!("l1.io.not_found" => "The target was not found."),
+        PermissionDenied => msg!(
+            "l1.io.permission_denied" =>
+            "The operating system did not allow the connection. A firewall or a network \
+             permission setting may be blocking it."
+        ),
+        UnexpectedEof => msg!(
+            "l1.io.eof" =>
+            "The other end closed the connection before answering."
+        ),
+        BrokenPipe => msg!(
+            "l1.io.broken_pipe" =>
+            "The other end closed the connection while data was being sent."
+        ),
+        HostUnreachable => msg!("l1.io.host_unreachable" => "The host cannot be reached."),
+        NetworkUnreachable => msg!(
+            "l1.io.network_unreachable" =>
+            "The network cannot be reached. Check this machine's network."
+        ),
+        _ => msg!("l1.io", detail = e => "{detail}"),
     }
 }
 
@@ -531,28 +571,32 @@ async fn connect_via_proxy(
     }
 }
 
-/// TCP 建连失败的系统原话是英文的，而且只有一个 errno。
-/// 「Connection refused (os error 61)」和「那个端口上没有东西在听」
-/// 之间隔着一次搜索。
+/// TCP 建连失败时说哪一句。
+///
+/// 系统原话是英文的，而且只有一个 errno：「Connection refused (os error 61)」
+/// 和「那个端口上没有东西在听」之间隔着一次搜索。**按 [`io_message`] 给的
+/// 码判**，不按原话判 —— 原话每个平台不一样。
+///
+/// 拒绝、超时、不可达这三种在建连这一步有更能行动的说法（带着地址）；其余
+/// 已经有码的种类原样用；只有落到 `l1.io` 的，才把原话放进 `l1.tcp.failed`。
 fn tcp_message(e: &Msg, addr: SocketAddr) -> Msg {
-    let l = e.text.to_ascii_lowercase();
-    if l.contains("refused") {
-        msg!(
+    match e.code.as_str() {
+        "l1.io.refused" => msg!(
             "l1.tcp.refused", addr = addr =>
             "{addr} refused the connection: nothing is listening on that port. Check the address and the port."
-        )
-    } else if is_timeout(e) || l.contains("timed out") {
-        msg!(
+        ),
+        "l1.io.timed_out" | TIMED_OUT => msg!(
             "l1.tcp.timeout", addr = addr =>
             "{addr} did not answer. Check the network, or whether this address has to be reached through a proxy."
-        )
-    } else if l.contains("unreachable") {
-        msg!(
+        ),
+        "l1.io.host_unreachable" | "l1.io.network_unreachable" => msg!(
             "l1.tcp.unreachable", addr = addr =>
             "The network {addr} is on cannot be reached. Check this machine's network."
-        )
-    } else {
-        msg!("l1.tcp.failed", addr = addr, detail = e.text.clone() => "{addr} could not be reached: {detail}")
+        ),
+        "l1.io" => {
+            msg!("l1.tcp.failed", addr = addr, detail = e.text.clone() => "{addr} could not be reached: {detail}")
+        }
+        _ => e.clone(),
     }
 }
 
@@ -1343,5 +1387,53 @@ mod tests {
         let r = l1("https://api.anthropic.com", Some(&p)).await;
         assert!(!r.ok);
         assert_eq!(r.failed, Some(Stage::new(Step::Tcp, Peer::Proxy)), "{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod io_codes {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    /// **常见的几种各有一个码**，只有剩下的才把系统原话原样带出去。
+    #[test]
+    fn common_io_failures_get_their_own_codes() {
+        let kinds = [
+            (ErrorKind::ConnectionRefused, "l1.io.refused"),
+            (ErrorKind::ConnectionReset, "l1.io.reset"),
+            (ErrorKind::ConnectionAborted, "l1.io.aborted"),
+            (ErrorKind::TimedOut, "l1.io.timed_out"),
+            (ErrorKind::AddrNotAvailable, "l1.io.addr_not_available"),
+            (ErrorKind::NotFound, "l1.io.not_found"),
+            (ErrorKind::PermissionDenied, "l1.io.permission_denied"),
+            (ErrorKind::UnexpectedEof, "l1.io.eof"),
+            (ErrorKind::BrokenPipe, "l1.io.broken_pipe"),
+            (ErrorKind::HostUnreachable, "l1.io.host_unreachable"),
+            (ErrorKind::NetworkUnreachable, "l1.io.network_unreachable"),
+        ];
+        for (kind, code) in kinds {
+            let m = io_message(&Error::new(kind, "os error 1"));
+            assert_eq!(m.code, code);
+            assert!(!m.text.is_empty() && !m.text.contains("os error"), "{m:?}");
+        }
+        let m = io_message(&Error::other("something rare"));
+        assert_eq!(
+            (m.code.as_str(), m.arg("detail")),
+            ("l1.io", "something rare")
+        );
+    }
+
+    #[test]
+    fn connect_failures_name_the_address_where_that_helps() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let at = |kind| tcp_message(&io_message(&Error::new(kind, "x")), addr).code;
+        assert_eq!(at(ErrorKind::ConnectionRefused), "l1.tcp.refused");
+        assert_eq!(at(ErrorKind::TimedOut), "l1.tcp.timeout");
+        assert_eq!(tcp_message(&timed_out(), addr).code, "l1.tcp.timeout");
+        assert_eq!(at(ErrorKind::NetworkUnreachable), "l1.tcp.unreachable");
+        assert_eq!(at(ErrorKind::HostUnreachable), "l1.tcp.unreachable");
+        // 别的已有码的种类原样用；落到 `l1.io` 的才进 `l1.tcp.failed`
+        assert_eq!(at(ErrorKind::PermissionDenied), "l1.io.permission_denied");
+        assert_eq!(at(ErrorKind::Other), "l1.tcp.failed");
     }
 }

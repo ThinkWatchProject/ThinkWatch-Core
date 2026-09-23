@@ -8,6 +8,7 @@
 //! 括号嵌套直接消失。
 
 use serde::{Deserialize, Serialize};
+use tw_types::{Msg, msg};
 
 use crate::facts::RequestFacts;
 use crate::num::Compare;
@@ -196,11 +197,44 @@ impl When {
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum MatchError {
-    #[error("condition {field} is written wrongly: {source}")]
+    #[error("{}", self.msg())]
     BadCompare {
         field: &'static str,
         source: crate::num::ParseError,
     },
+}
+
+impl MatchError {
+    /// 给人看的那句话，带码。
+    ///
+    /// **比较式错在哪儿要拆成各自的码**，不能把 `ParseError` 的原句当 `detail`
+    /// 塞进去 —— 那半句是英文，中文界面上就成了一句话两种语言。所以这里把
+    /// `ParseError` 的四种说法各抄一遍：它自己的 `Display` 还要留给 serde，
+    /// 读配置文件时的报错走的是那一条。
+    pub fn msg(&self) -> Msg {
+        use crate::num::ParseError;
+        let MatchError::BadCompare { field, source } = self;
+        match source {
+            ParseError::Empty => msg!(
+                "engine.compare.empty", field = field =>
+                "condition {field} is written wrongly: the comparison is empty"
+            ),
+            ParseError::NoOperator(v) => msg!(
+                "engine.compare.no_operator", field = field, value = v =>
+                "condition {field} is written wrongly: `{value}` has no comparison operator; it \
+                 starts with one of > < >= <= =, as in \">200k\""
+            ),
+            ParseError::BadNumber(v) => msg!(
+                "engine.compare.bad_number", field = field, value = v =>
+                "condition {field} is written wrongly: the number in `{value}` could not be parsed"
+            ),
+            ParseError::BadUnit(v) => msg!(
+                "engine.compare.bad_unit", field = field, value = v =>
+                "condition {field} is written wrongly: the unit in `{value}` is not recognized. k \
+                 (thousand) and m (million) are; an amount is written as $2.5"
+            ),
+        }
+    }
 }
 
 /// 只支持 `*`，因为模型名里只需要这个。

@@ -23,6 +23,7 @@ use tw_config::history::Origin;
 use tw_config::refs;
 use tw_engine::rule::{OneOrMany, When};
 use tw_engine::{Group, GroupType, RouteSet, Rule, SetAction};
+use tw_types::{Msg, msg};
 use tw_yaml::Step;
 
 use crate::resources::{checked_name, invalid, mapping};
@@ -110,9 +111,10 @@ async fn delete_route(
         .transform(q.base_version.as_deref(), Origin::Ui, |text, cfg| {
             let engine = cfg.engine();
             if engine.default_route() == name {
-                return Err(ApplyError::InUse(format!(
-                    "Route `{name}` is the default route and cannot be deleted. Make another route the \
-             default first."
+                return Err(ApplyError::InUse(msg!(
+                    "control.default_route_cannot_delete", route = name =>
+                    "Route `{route}` is the default route and cannot be deleted. Make another route \
+                     the default first."
                 )));
             }
             if !cfg.routes.iter().any(|r| r.name == name) {
@@ -125,9 +127,10 @@ async fn delete_route(
                 .filter(|t| !t.is_empty() && *t != engine.default_route());
             if let Some(t) = target {
                 if t == name {
-                    return Err(invalid(format!(
-            "a key cannot be moved onto route `{name}`, which is being deleted"
-        )));
+                    return Err(invalid(msg!(
+                        "control.reassign_to_deleted_route", route = name =>
+                        "a key cannot be moved onto route `{route}`, which is being deleted"
+                    )));
                 }
                 if engine.rules_of(t).is_none() {
                     return Err(not_found("route", t));
@@ -224,8 +227,9 @@ fn route_probes(text: &str, probes: &[String]) -> Result<String, ApplyError> {
     for p in probes {
         // 总称不是一个可以单独设置的类别
         if p == "assistant_internal" || !INTENTS.contains(&p.as_str()) {
-            return Err(invalid(format!(
-                "there is no auxiliary-request class `{p}`"
+            return Err(invalid(msg!(
+                "control.unknown_probe_class", class = p =>
+                "there is no auxiliary-request class `{class}`"
             )));
         }
         out = edit::set(
@@ -245,8 +249,8 @@ fn route_of(client: usize) -> [Step; 3] {
     ]
 }
 
-fn to_route(input: &tw_api::RouteInput, cfg: &tw_config::Config) -> Result<RouteSet, String> {
-    let name = checked_name(&input.name, "route").map_err(|e| e.text)?;
+fn to_route(input: &tw_api::RouteInput, cfg: &tw_config::Config) -> Result<RouteSet, Msg> {
+    let name = checked_name(&input.name, "route")?;
     reserved(&name, "route")?;
     let mut seen = HashSet::new();
     let rules = input
@@ -255,18 +259,21 @@ fn to_route(input: &tw_api::RouteInput, cfg: &tw_config::Config) -> Result<Route
         .map(|r| {
             let rule = to_rule(r, cfg)?;
             if !seen.insert(rule.name.clone()) {
-                return Err(format!("the route has two rules named `{}`", rule.name));
+                return Err(msg!(
+                    "control.route.duplicate_rule", rule = rule.name =>
+                    "the route has two rules named `{rule}`"
+                ));
             }
             Ok(rule)
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, Msg>>()?;
     Ok(RouteSet { name, rules })
 }
 
 /// 界面交过来的一条规则 → 配置里的规则。**写法错在哪儿，这里就说哪儿。**
-pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Result<Rule, String> {
-    let name = checked_name(&input.name, "rule").map_err(|e| e.text)?;
-    let when = when_from(&input.conditions, cfg).map_err(|e| format!("rule `{name}`: {e}"))?;
+pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Result<Rule, Msg> {
+    let name = checked_name(&input.name, "rule")?;
+    let when = when_from(&name, &input.conditions, cfg)?;
     let to = input
         .to
         .as_deref()
@@ -274,11 +281,19 @@ pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Res
         .filter(|t| !t.is_empty())
         .map(str::to_string);
     let deny = match input.deny.as_deref().map(str::trim) {
-        Some("") => return Err(format!("rule `{name}`: a denial needs a reason")),
+        Some("") => {
+            return Err(msg!(
+                "control.rule.deny_needs_reason", rule = name =>
+                "rule `{rule}`: a denial needs a reason"
+            ));
+        }
         other => other.map(str::to_string),
     };
     if to.is_some() && deny.is_some() {
-        return Err(format!("rule `{name}` cannot both forward and deny"));
+        return Err(msg!(
+            "control.rule.forward_and_deny", rule = name =>
+            "rule `{rule}` cannot both forward and deny"
+        ));
     }
     let set = input.set.as_ref().and_then(|s| {
         let a = SetAction {
@@ -320,13 +335,23 @@ const INTENTS: &[&str] = &[
 /// **和视图用同一套写法**（`ConditionView`），界面拿到什么交回什么。取值
 /// 在这里查：打错的客户端格式、不存在的密钥或上游，写进去的后果都是这条
 /// 规则永远不命中，而那是完全静默的。
-fn when_from(conds: &[tw_api::ConditionView], cfg: &tw_config::Config) -> Result<When, String> {
+///
+/// **每一句都带着规则名**（`rule` 参数）：一条路由里有好几条规则，只说
+/// 「条件没填值」的话，用户得一条条去找。
+fn when_from(
+    rule: &str,
+    conds: &[tw_api::ConditionView],
+    cfg: &tw_config::Config,
+) -> Result<When, Msg> {
     let mut w = When::default();
     let mut seen = HashSet::new();
     for c in conds {
         let field = c.field.as_str();
         if !seen.insert(field) {
-            return Err(format!("condition `{field}` appears twice"));
+            return Err(msg!(
+                "control.rule.condition_twice", rule = rule, field = field =>
+                "rule `{rule}`: condition `{field}` appears twice"
+            ));
         }
         let vals: Vec<String> = c
             .values
@@ -334,28 +359,40 @@ fn when_from(conds: &[tw_api::ConditionView], cfg: &tw_config::Config) -> Result
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .collect();
-        let one = || -> Result<String, String> {
+        let no_value = || {
+            msg!(
+                "control.rule.condition_no_value", rule = rule, field = field =>
+                "rule `{rule}`: condition `{field}` has no value"
+            )
+        };
+        let one = || -> Result<String, Msg> {
             match vals.as_slice() {
                 [v] => Ok(v.clone()),
-                [] => Err(format!("condition `{field}` has no value")),
-                _ => Err(format!("condition `{field}` takes exactly one value")),
-            }
-        };
-        let flag = || -> Result<bool, String> {
-            match one()?.as_str() {
-                "true" => Ok(true),
-                "false" => Ok(false),
-                v => Err(format!(
-                    "condition `{field}` takes true or false, and got `{v}`"
+                [] => Err(no_value()),
+                _ => Err(msg!(
+                    "control.rule.condition_one_value", rule = rule, field = field =>
+                    "rule `{rule}`: condition `{field}` takes exactly one value"
                 )),
             }
         };
-        let many = |allowed: &dyn Fn(&str) -> bool, what: &str| -> Result<OneOrMany, String> {
+        let flag = || -> Result<bool, Msg> {
+            match one()?.as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                v => Err(msg!(
+                    "control.rule.condition_not_bool", rule = rule, field = field, value = v =>
+                    "rule `{rule}`: condition `{field}` takes true or false, and got `{value}`"
+                )),
+            }
+        };
+        let many = |allowed: &dyn Fn(&str) -> bool,
+                    unknown: &dyn Fn(&str) -> Msg|
+         -> Result<OneOrMany, Msg> {
             if let Some(bad) = vals.iter().find(|v| !allowed(v.as_str())) {
-                return Err(format!("there is no {what} `{bad}`"));
+                return Err(unknown(bad));
             }
             match vals.as_slice() {
-                [] => Err(format!("condition `{field}` has no value")),
+                [] => Err(no_value()),
                 [v] => Ok(OneOrMany::One(v.clone())),
                 vs => Ok(OneOrMany::Many(vs.to_vec())),
             }
@@ -365,14 +402,20 @@ fn when_from(conds: &[tw_api::ConditionView], cfg: &tw_config::Config) -> Result
             "client" => {
                 let k = one()?;
                 if !cfg.clients.iter().any(|c| c.name == k) {
-                    return Err(format!("there is no gateway key `{k}`"));
+                    return Err(msg!(
+                        "control.rule.no_such_key", rule = rule, key = k =>
+                        "rule `{rule}`: there is no gateway key `{key}`"
+                    ));
                 }
                 w.client = Some(k);
             }
             "dialect" => {
                 let d = one()?;
                 if !DIALECTS.contains(&d.as_str()) {
-                    return Err(format!("`{d}` is not a client format we support"));
+                    return Err(msg!(
+                        "control.rule.unknown_dialect", rule = rule, dialect = d =>
+                        "rule `{rule}`: `{dialect}` is not a client format we support"
+                    ));
                 }
                 w.dialect = Some(d);
             }
@@ -385,19 +428,43 @@ fn when_from(conds: &[tw_api::ConditionView], cfg: &tw_config::Config) -> Result
             "thinking" => w.thinking = Some(flag()?),
             "stream" => w.stream = Some(flag()?),
             "intent" => {
-                w.intent = Some(many(&|v| INTENTS.contains(&v), "auxiliary-request class")?)
+                w.intent = Some(many(&|v| INTENTS.contains(&v), &|v| {
+                    msg!(
+                        "control.rule.no_such_probe_class", rule = rule, class = v =>
+                        "rule `{rule}`: there is no auxiliary-request class `{class}`"
+                    )
+                })?)
             }
             "provider_would_be" => {
                 w.provider_would_be = Some(many(
                     &|v| cfg.providers.iter().any(|p| p.name == v),
-                    "upstream",
+                    &|v| {
+                        msg!(
+                            "control.rule.no_such_upstream", rule = rule, upstream = v =>
+                            "rule `{rule}`: there is no upstream `{upstream}`"
+                        )
+                    },
                 )?)
             }
-            other => return Err(format!("`{other}` is not a condition we support")),
+            other => {
+                return Err(msg!(
+                    "control.rule.unknown_condition", rule = rule, field = other =>
+                    "rule `{rule}`: `{field}` is not a condition we support"
+                ));
+            }
         }
     }
     // 比较式写错了（`200k` 少了比较符）：保存之前就说
-    w.validate().map_err(|e| e.to_string())?;
+    //
+    // 那句话是引擎的（`engine.compare.*`），不认识规则名。**码不变，多带一个
+    // `rule`**，英文前面补上是哪条规则 —— 为此再给每一种写法错误造一个「带
+    // 规则名」的码，码表就翻了一倍
+    w.validate().map_err(|e| {
+        let mut m = e.msg();
+        m.text = format!("rule `{rule}`: {}", m.text);
+        m.args.insert("rule".into(), rule.to_string());
+        m
+    })?;
     Ok(w)
 }
 
@@ -455,8 +522,10 @@ async fn delete_group(
                     .map(|r| format!("rule `{}` of route `{}`", r.rule, r.route))
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Err(ApplyError::InUse(format!(
-                    "Group `{name}` is still referenced by {by}; drop those references before deleting it."
+                return Err(ApplyError::InUse(msg!(
+                    "control.group_in_use", group = name, refs = by =>
+                    "Group `{group}` is still referenced by {refs}; drop those references before \
+                     deleting it."
                 )));
             }
             Ok(edit::remove(text, edit::GROUPS, &name)?)
@@ -468,39 +537,54 @@ async fn delete_group(
 
 fn builtin_group(name: &str) -> Result<(), ApplyError> {
     if tw_engine::is_builtin_group(name) {
-        return Err(ApplyError::InUse(
+        return Err(ApplyError::InUse(msg!(
+            "control.builtin_group_fixed" =>
             "The built-in group of every upstream follows the upstream list; it cannot be edited \
              or deleted."
-                .to_string(),
-        ));
+        )));
     }
     Ok(())
 }
 
-fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group, String> {
-    let name = checked_name(&input.name, "group").map_err(|e| e.text)?;
+fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group, Msg> {
+    let name = checked_name(&input.name, "group")?;
     reserved(&name, "group")?;
     if cfg.providers.iter().any(|p| p.name == name) {
-        return Err(format!(
+        return Err(msg!(
+            "control.group.name_is_upstream", name = name =>
             "`{name}` is already the name of an upstream. A rule points at an upstream or a group \
              by name, so the two cannot share one."
         ));
     }
-    let kind: GroupType = serde_yaml_ng::from_value(Value::String(input.kind.clone()))
-        .map_err(|_| format!("`{}` is not a strategy we support", input.kind))?;
+    let kind: GroupType =
+        serde_yaml_ng::from_value(Value::String(input.kind.clone())).map_err(|_| {
+            msg!(
+                "control.group.unknown_strategy", strategy = &input.kind =>
+                "`{strategy}` is not a strategy we support"
+            )
+        })?;
     let mut providers = Vec::new();
     for p in &input.providers {
         let p = p.trim();
         if !cfg.providers.iter().any(|x| x.name == p) {
-            return Err(format!("there is no upstream `{p}`"));
+            return Err(msg!(
+                "control.group.no_such_upstream", upstream = p =>
+                "there is no upstream `{upstream}`"
+            ));
         }
         if providers.iter().any(|x| x == p) {
-            return Err(format!("upstream `{p}` appears twice"));
+            return Err(msg!(
+                "control.group.upstream_twice", upstream = p =>
+                "upstream `{upstream}` appears twice"
+            ));
         }
         providers.push(p.to_string());
     }
     if providers.is_empty() {
-        return Err("a group needs at least one upstream".to_string());
+        return Err(msg!(
+            "control.group.empty" =>
+            "a group needs at least one upstream"
+        ));
     }
     // 手动选择要有一个优先使用的成员；没选就是第一个。其余策略不写这一项
     let selected = match kind {
@@ -513,7 +597,10 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
                 .unwrap_or(&providers[0])
                 .to_string();
             if !providers.contains(&sel) {
-                return Err(format!("the preferred upstream `{sel}` is not a member"));
+                return Err(msg!(
+                    "control.group.preferred_not_member", upstream = sel =>
+                    "the preferred upstream `{upstream}` is not a member"
+                ));
             }
             Some(sel)
         }
@@ -575,11 +662,11 @@ pub(crate) fn rule_view(r: &Rule, n: tw_engine::RuleNotes) -> tw_api::RuleView {
 
 // ─────────────────────────────────────────────────────────── 共用
 
-fn reserved(name: &str, what: &str) -> Result<(), String> {
+fn reserved(name: &str, what: &str) -> Result<(), Msg> {
     if name.starts_with(tw_engine::RESERVED_PREFIX) {
-        return Err(format!(
-            "a {what} name cannot start with {}; those are reserved for built-ins",
-            tw_engine::RESERVED_PREFIX
+        return Err(msg!(
+            "control.name_reserved", kind = what, prefix = tw_engine::RESERVED_PREFIX =>
+            "a {kind} name cannot start with {prefix}; those are reserved for built-ins"
         ));
     }
     Ok(())
@@ -597,4 +684,120 @@ fn name_taken(what: &'static str, name: &str) -> ApplyError {
         what,
         name: name.to_string(),
     })
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+
+    fn cfg() -> tw_config::Config {
+        tw_config::try_parse(
+            "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\n",
+        )
+        .unwrap()
+    }
+
+    fn rule(conds: &[(&str, &[&str])]) -> tw_api::RuleInput {
+        tw_api::RuleInput {
+            name: "长上下文".into(),
+            conditions: conds
+                .iter()
+                .map(|(f, vs)| tw_api::ConditionView {
+                    field: f.to_string(),
+                    values: vs.iter().map(|v| v.to_string()).collect(),
+                })
+                .collect(),
+            to: Some("a".into()),
+            deny: None,
+            set: None,
+        }
+    }
+
+    /// **每一句都有自己的码，而且带着规则名。**以前这些是拼好的英文，
+    /// 经 `invalid` 塞进 `control.config_rejected` 的 `{detail}`
+    #[test]
+    fn a_rule_that_is_written_wrongly_says_so_with_its_own_code() {
+        let c = cfg();
+        let code = |r: tw_api::RuleInput| {
+            let m = to_rule(&r, &c).unwrap_err();
+            assert_eq!(m.arg("rule"), "长上下文", "{m:?}");
+            assert!(!m.text.is_empty(), "{m:?}");
+            m.code
+        };
+        assert_eq!(
+            code(rule(&[("model", &[])])),
+            "control.rule.condition_no_value"
+        );
+        assert_eq!(
+            code(rule(&[("model", &["a", "b"])])),
+            "control.rule.condition_one_value"
+        );
+        assert_eq!(
+            code(rule(&[("model", &["a"]), ("model", &["b"])])),
+            "control.rule.condition_twice"
+        );
+        assert_eq!(
+            code(rule(&[("cache", &["yes"])])),
+            "control.rule.condition_not_bool"
+        );
+        assert_eq!(
+            code(rule(&[("client", &["nobody"])])),
+            "control.rule.no_such_key"
+        );
+        assert_eq!(
+            code(rule(&[("dialect", &["cobol"])])),
+            "control.rule.unknown_dialect"
+        );
+        assert_eq!(
+            code(rule(&[("intent", &["chat"])])),
+            "control.rule.no_such_probe_class"
+        );
+        assert_eq!(
+            code(rule(&[("provider_would_be", &["b"])])),
+            "control.rule.no_such_upstream"
+        );
+        assert_eq!(
+            code(rule(&[("color", &["red"])])),
+            "control.rule.unknown_condition"
+        );
+        // 比较式写错是引擎那一句，**码不变，多带一个规则名**
+        assert_eq!(
+            code(rule(&[("input_tokens", &["200k"])])),
+            "engine.compare.no_operator"
+        );
+        let mut r = rule(&[]);
+        r.deny = Some("no".into());
+        assert_eq!(code(r), "control.rule.forward_and_deny");
+    }
+
+    #[test]
+    fn a_group_that_is_written_wrongly_says_so_with_its_own_code() {
+        let c = cfg();
+        let g = |name: &str, kind: &str, providers: &[&str]| tw_api::GroupInput {
+            name: name.into(),
+            kind: kind.into(),
+            providers: providers.iter().map(|p| p.to_string()).collect(),
+            selected: None,
+            session_affinity: true,
+        };
+        let code = |i: tw_api::GroupInput| to_group(&i, &c).unwrap_err().code;
+        assert_eq!(
+            code(g("a", "fallback", &["a"])),
+            "control.group.name_is_upstream"
+        );
+        assert_eq!(code(g("__x", "fallback", &["a"])), "control.name_reserved");
+        assert_eq!(
+            code(g("g", "random", &["a"])),
+            "control.group.unknown_strategy"
+        );
+        assert_eq!(
+            code(g("g", "fallback", &["b"])),
+            "control.group.no_such_upstream"
+        );
+        assert_eq!(
+            code(g("g", "fallback", &["a", "a"])),
+            "control.group.upstream_twice"
+        );
+        assert_eq!(code(g("g", "fallback", &[])), "control.group.empty");
+    }
 }

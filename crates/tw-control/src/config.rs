@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tw_config::history::Origin;
 use tw_config::store::{self, Fingerprint};
+use tw_types::{Msg, msg};
 
 /// 配置的唯一入口。**UI、CLI、文件监听都走它** —— 三条路各写一遍，
 /// 就会有两条忘了存历史、一条忘了防回环。
@@ -23,6 +24,11 @@ pub struct ConfigManager {
     seen: Mutex<Option<Fingerprint>>,
 }
 
+/// 一次配置改动没成的原因。
+///
+/// **每一种都带着自己那句带码的话**（[`ApplyError::msg`]），控制面原样发给
+/// 界面。以前这里存的是拼好的英文，发出去时再整句塞进一个 `{detail}`
+/// —— 界面拿到的码只说「改配置失败了」，真正的原因在一句它翻不了的英文里。
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
     #[error(transparent)]
@@ -30,23 +36,46 @@ pub enum ApplyError {
     /// 三道校验里的任意一道没过。**旧配置还在服务。**
     #[error("{0}")]
     Rejected(tw_config::Rejected),
-    /// 校验过了但运行时对象建不起来 —— 同样保持旧的。
+    /// 校验过了但运行时对象建不起来 —— 同样保持旧的。里面是数据面说的那句
     #[error("the configuration parses but cannot be applied: {0}")]
-    Build(String),
+    Build(Msg),
     /// patch 指的那个位置有问题。**和 Build 分开**：那句「配置能读但
     /// 用不起来」会让人去查配置，而该查的是这次请求写的路径。
     #[error("{0}")]
-    BadPath(String),
-    #[error(
-        "version mismatch: this edit is based on {base}, and the current version is {current}. Refresh and edit again"
-    )]
+    BadPath(Msg),
+    #[error("{}", self.msg())]
     Stale { base: String, current: String },
     /// 按资源改（上游、代理、价目表）时的失败：名字撞了、找不到、值写不进去。
     #[error(transparent)]
     Edit(#[from] tw_config::edit::EditError),
+    /// 交过来的东西本身写得不对（名字空着、凭据写法不对、规则缺值）。
+    /// **和 `Edit` 分开**：那边是「配置现在不允许」，这边是「请求写错了」
+    #[error("{0}")]
+    Invalid(Msg),
     /// 还有别的配置在引用它，删不掉。**消息里要说清是谁。**
     #[error("{0}")]
-    InUse(String),
+    InUse(Msg),
+}
+
+impl ApplyError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            ApplyError::Store(e) => e.msg(),
+            ApplyError::Rejected(r) => r.msg(),
+            // 数据面那句本身就说清了哪个上游、哪个代理，前面不再垫一句
+            ApplyError::Build(m)
+            | ApplyError::BadPath(m)
+            | ApplyError::Invalid(m)
+            | ApplyError::InUse(m) => m.clone(),
+            ApplyError::Stale { base, current } => msg!(
+                "control.config_stale", base = base, current = current =>
+                "version mismatch: this edit is based on {base}, and the current version is \
+                 {current}. Refresh and edit again"
+            ),
+            ApplyError::Edit(e) => e.msg(),
+        }
+    }
 }
 
 impl ConfigManager {
@@ -100,7 +129,7 @@ impl ConfigManager {
             self.bus.emit(tw_api::Event::ConfigRejected {
                 id: self.bus.next_id(),
                 stage: r.stage.slug().to_string(),
-                message: r.message.clone(),
+                message: r.message.text.clone(),
                 line: r.line,
                 excerpt: r.excerpt.clone(),
                 origin: origin.slug().to_string(),
@@ -113,7 +142,7 @@ impl ConfigManager {
         })?;
         self.gateway
             .reload(cfg)
-            .map_err(|e| ApplyError::Build(e.message().to_string()))?;
+            .map_err(|e| ApplyError::Build(e.detail))?;
         // 存刚刚生效的这一版。加上写入路径在写之前存的那一次，去重
         // 之后的效果是「每个存在过的版本各一条」，最新那条就是现在跑
         // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。
@@ -197,7 +226,12 @@ impl ConfigManager {
             .iter()
             .rev()
             .find(|v| v.version == version || v.version.ends_with(version))
-            .ok_or_else(|| ApplyError::BadPath(format!("the version history has no {version}")))?;
+            .ok_or_else(|| {
+                ApplyError::BadPath(msg!(
+                    "control.no_such_version", version = version =>
+                    "the version history has no {version}"
+                ))
+            })?;
         let text = tw_config::history::read(target)?;
         let cur = self.current().ok();
         // 回滚也走同一条写入路径，所以它同样会：校验、存历史、防回环。
@@ -253,12 +287,7 @@ pub async fn path_at(
     axum::extract::State(s): axum::extract::State<crate::ControlState>,
     axum::extract::Query(q): axum::extract::Query<AtQuery>,
 ) -> Result<axum::Json<tw_api::ConfigAt>, crate::Fail> {
-    let cur = s.cfg.current().map_err(|e| {
-        crate::fail(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            tw_types::msg!("control.internal", detail = e => "{detail}"),
-        )
-    })?;
+    let cur = s.cfg.current().map_err(crate::unreadable_config)?;
     let path = tw_yaml::path_at(&cur.text, q.offset.min(cur.text.len()));
     let mut out = tw_api::ConfigAt {
         section: None,
@@ -292,8 +321,8 @@ pub struct AtQuery {
 ///
 /// 段落是数字时仍然当下标用：`/routes/0/to` 是合理的写法，因为规则的
 /// 顺序本身就是它的语义（自上而下首个命中）。
-pub fn resolve_path(text: &str, pointer: &str) -> Result<Vec<tw_yaml::Step>, String> {
-    let nodes = tw_yaml::nodes(text).map_err(|e| e.to_string())?;
+pub fn resolve_path(text: &str, pointer: &str) -> Result<Vec<tw_yaml::Step>, Msg> {
+    let nodes = tw_yaml::nodes(text).map_err(|e| e.msg())?;
     let mut out: Vec<tw_yaml::Step> = Vec::new();
     for seg in pointer.trim_matches('/').split('/') {
         if seg.is_empty() {
@@ -329,8 +358,9 @@ pub fn resolve_path(text: &str, pointer: &str) -> Result<Vec<tw_yaml::Step>, Str
             match idx {
                 Some(i) => out.push(tw_yaml::Step::Index(i)),
                 None => {
-                    return Err(format!(
-                        "{pointer} has no entry named `{seg}`. List entries are found by name, or by index."
+                    return Err(msg!(
+                        "control.patch.no_entry", path = pointer, name = seg =>
+                        "{path} has no entry named `{name}`. List entries are found by name, or by index."
                     ));
                 }
             }
@@ -376,46 +406,47 @@ impl ConfigManager {
                     // **`insert` 而不是 `set`。**配置里绝大多数字段是可选的、
                     // 默认不写的，只能改「用户碰巧写过」的字段，等于表单模式在
                     // 他最需要的时候是死的。已经写过的走 `set`，那是它的第一步。
-                    tw_yaml::insert(&text, &steps, &scalar).map_err(|e| {
-                        ApplyError::BadPath(format!("{path} could not be changed: {e}"))
-                    })?
+                    // 改不动的原因（找不到、不是标量、在锚点里）那一句本身就
+                    // 带着路径，前面不再垫一句「改不了」
+                    tw_yaml::insert(&text, &steps, &scalar).map_err(bad_path)?
                 }
                 tw_api::PatchOp::Append { path, item } => {
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
-                    tw_yaml::append(&text, &steps, item).map_err(|e| {
-                        ApplyError::BadPath(format!("nothing could be added to {path}: {e}"))
-                    })?
+                    tw_yaml::append(&text, &steps, item).map_err(bad_path)?
                 }
                 tw_api::PatchOp::Remove { path } => {
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
                     // 路径指向那一项，最后一步就是它在列表里的位置。
                     // **按名字解析、按下标删** —— 名字是用户写的，下标是
                     // 我们刚刚算出来的，中间没有任何一次用户可见的重排。
-                    let (last, parent) = steps.split_last().ok_or_else(|| {
-                        ApplyError::BadPath(format!("{path} does not point at an entry of a list"))
-                    })?;
-                    let tw_yaml::Step::Index(i) = last else {
-                        return Err(ApplyError::BadPath(format!(
-                            "{path} does not point at an entry of a list. A delete names the entry, as in /clients/codex."
-                        )));
+                    let not_an_entry = || {
+                        ApplyError::BadPath(msg!(
+                            "control.patch.not_an_entry", path = path =>
+                            "{path} does not point at an entry of a list. A delete names the \
+                             entry, as in /clients/codex."
+                        ))
                     };
-                    tw_yaml::remove(&text, parent, *i).map_err(|e| {
-                        ApplyError::BadPath(format!("{path} could not be deleted: {e}"))
-                    })?
+                    let (last, parent) = steps.split_last().ok_or_else(not_an_entry)?;
+                    let tw_yaml::Step::Index(i) = last else {
+                        return Err(not_an_entry());
+                    };
+                    tw_yaml::remove(&text, parent, *i).map_err(bad_path)?
                 }
                 tw_api::PatchOp::Clear { path } => {
                     // 要清的列表可能根本还没写进文件 —— 「一个都不给」
                     // 正是用户第一次碰 `allow` 的那一下。`resolve_path`
                     // 对没写过的键会原样留成 Key，走得通。
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
-                    tw_yaml::clear_seq(&text, &steps).map_err(|e| {
-                        ApplyError::BadPath(format!("{path} could not be cleared: {e}"))
-                    })?
+                    tw_yaml::clear_seq(&text, &steps).map_err(bad_path)?
                 }
             };
         }
         self.write(&text, Some(&cur.version()), origin).await
     }
+}
+
+fn bad_path(e: tw_yaml::PatchError) -> ApplyError {
+    ApplyError::BadPath(e.msg())
 }
 
 #[cfg(test)]
@@ -462,5 +493,44 @@ mod patch_seq_tests {
     fn removing_a_name_that_is_not_there_says_so_instead_of_deleting_something_else() {
         // **最该防的一条**：解析不到就报错，不要退化成「删第 0 项」。
         assert!(resolve_path(CFG, "/clients/不存在").is_err());
+    }
+}
+
+#[cfg(test)]
+mod msg_codes {
+    use super::*;
+
+    /// **改配置失败时发出去的是原因自己的码**，不是一个装着英文的套话。
+    #[test]
+    fn an_apply_error_speaks_with_the_code_of_its_cause() {
+        let stale = ApplyError::Stale {
+            base: "a".into(),
+            current: "b".into(),
+        };
+        assert_eq!(stale.msg().code, "control.config_stale");
+        assert_eq!(stale.msg().text, stale.to_string());
+        let inner = msg!("t.x" => "x");
+        for e in [
+            ApplyError::Invalid(inner.clone()),
+            ApplyError::InUse(inner.clone()),
+            ApplyError::BadPath(inner.clone()),
+            ApplyError::Build(inner.clone()),
+        ] {
+            assert_eq!(e.msg(), inner);
+        }
+        let e = ApplyError::Edit(tw_config::edit::EditError::Multiline);
+        assert_eq!(e.msg().code, "config.edit.multiline");
+        let e = ApplyError::Store(tw_config::StoreError::Missing { path: "/x".into() });
+        assert_eq!(e.msg().code, "config.store.missing");
+        let e = ApplyError::Rejected(tw_config::try_parse("version: 1\n").unwrap_err());
+        assert_eq!(e.msg().code, "config.no_clients");
+    }
+
+    #[test]
+    fn a_patch_path_that_names_no_entry_has_its_own_code() {
+        let cfg = "version: 1\nclients:\n  - name: c\n    key: tw-k\n";
+        let m = resolve_path(cfg, "/clients/不存在").unwrap_err();
+        assert_eq!(m.code, "control.patch.no_entry");
+        assert_eq!(m.arg("name"), "不存在");
     }
 }
