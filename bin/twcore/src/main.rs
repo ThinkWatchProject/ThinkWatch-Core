@@ -719,10 +719,11 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let socket = dir.join("twcore.sock");
+    // 控制面听在哪由平台决定，见 `tw_api::control::Endpoint`。
+    let endpoint = tw_api::control::Endpoint::in_dir(&dir);
     // **在起任何东西之前问**。等到 bind 失败时，网关已经在监听、客户端
     // 可能已经连上来了，而这条错误当时只会进日志。
-    tw_control::socket_path_fits(&socket)?;
+    tw_control::endpoint_usable(&endpoint)?;
     // 控制面的凭据，同样在起任何东西之前拿到：桌面端从环境变量交过来，
     // 手工启动时生成一个写进配置目录。取不到就停在这儿 —— 一个装不上门的
     // 控制面不该先起来再说。
@@ -832,7 +833,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             }
         };
 
-        let sock = socket.clone();
+        let at = endpoint.clone();
         // **控制面没了就得退，不能只记一行日志。**
         //
         // 一个没有控制面的 core 是 UI 完全够不着的：连不上、改不了配置、
@@ -841,10 +842,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 太长）只在日志里躺着。退出让那句话有机会走到人眼前。
         let (control_died, control_dead) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let r = tw_control::serve_unix(control, &sock, control_token).await;
+            let r = tw_control::serve(control, &at, control_token).await;
             let msg = match r {
                 Err(e) => format!("{e}"),
-                // serve_unix 正常返回意味着 accept 循环结束了，同样是没了
+                // serve 正常返回意味着 accept 循环结束了，同样是没了
                 Ok(()) => "the control plane ended unexpectedly".to_string(),
             };
             let _ = control_died.send(msg);

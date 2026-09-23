@@ -3216,3 +3216,90 @@ mod tests {
         assert!(s.gateway_addr.is_none());
     }
 }
+
+/// 控制面在哪儿、拿什么进门。
+///
+/// **这是契约的一部分，不是两边各自的约定。**core 在这儿听，桌面端到这儿连
+/// —— 以前两边各拼一次 `<数据目录>/twcore.sock`，能对上只是因为那一行足够
+/// 短。Windows 上这个答案要分岔（那里没有 unix socket），两份各写一次就是
+/// 两份会漂，而漂掉的表现是「界面连不上一个正在跑的网关」。
+///
+/// **仍然没有 IO**，遵守这个 crate 的规矩（见模块头）：这里只有名字和形状，
+/// 真正去绑、去读的是各自那一侧。
+pub mod control {
+    use std::path::{Path, PathBuf};
+
+    /// unix socket 文件，在数据目录下。
+    pub const SOCKET_FILE: &str = "twcore.sock";
+    /// Windows 上控制面绑到哪个端口，由 core 写、由客户端读。
+    pub const PORT_FILE: &str = "control.port";
+    /// 手工启动 core 时凭据落在哪。
+    pub const TOKEN_FILE: &str = "control.token";
+    /// 父进程把凭据交过来的环境变量。**走环境不走 argv** —— Windows 上任意
+    /// 同用户进程都看得见别人的命令行。
+    pub const TOKEN_ENV: &str = "TW_CONTROL_TOKEN";
+
+    /// 控制面听在哪。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Endpoint {
+        /// 一个 `0700` 的 unix socket 文件。**权限是文件系统给的**，所以这
+        /// 一档天然只有当前用户连得上。
+        Socket(PathBuf),
+        /// 回环上的一个端口。Windows 只有这一档。
+        ///
+        /// **端口不固定**：固定端口会和别的软件撞，也省了想连进来的人一步。
+        /// core 绑到一个系统给的空闲端口，再把号码写进这个文件。
+        ///
+        /// 回环端口挡不住同机的任何进程，也问不出对端是谁（unix socket 问
+        /// 得出，`SO_PEERCRED`）—— 那一档的门**全靠凭据**。
+        Loopback { port_file: PathBuf },
+    }
+
+    impl Endpoint {
+        /// 这个平台默认听在数据目录的什么位置。
+        pub fn in_dir(dir: &Path) -> Self {
+            #[cfg(unix)]
+            {
+                Endpoint::Socket(dir.join(SOCKET_FILE))
+            }
+            #[cfg(not(unix))]
+            {
+                Endpoint::Loopback {
+                    port_file: dir.join(PORT_FILE),
+                }
+            }
+        }
+    }
+
+    /// 凭据文件在哪。
+    pub fn token_file(dir: &Path) -> PathBuf {
+        dir.join(TOKEN_FILE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 两个仓库拼出来的必须是同一个位置 —— 这个函数存在的全部理由。
+        #[test]
+        fn the_endpoint_lands_in_the_data_directory() {
+            let d = Path::new("/data");
+            match Endpoint::in_dir(d) {
+                Endpoint::Socket(p) => assert_eq!(p, d.join(SOCKET_FILE)),
+                Endpoint::Loopback { port_file } => assert_eq!(port_file, d.join(PORT_FILE)),
+            }
+            assert_eq!(token_file(d), d.join(TOKEN_FILE));
+        }
+
+        /// 平台决定用哪一档，不是调用方挑。
+        #[test]
+        fn each_platform_gets_the_only_transport_it_has() {
+            let got = Endpoint::in_dir(Path::new("/data"));
+            if cfg!(unix) {
+                assert!(matches!(got, Endpoint::Socket(_)));
+            } else {
+                assert!(matches!(got, Endpoint::Loopback { .. }));
+            }
+        }
+    }
+}

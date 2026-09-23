@@ -31,11 +31,9 @@ use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use tw_types::msg;
 
-/// 桌面端把 token 交过来的那个环境变量。
-pub const ENV: &str = "TW_CONTROL_TOKEN";
-
-/// 手工启动时 token 落在哪（相对配置目录）。
-pub const FILE: &str = "control.token";
+// 名字住在契约层：桌面端要知道环境变量叫什么才能把 token 交过来，而它
+// 依赖的是 tw-api，够不着这个 crate。两边各写一遍字符串就是两边会漂。
+use tw_api::control::{TOKEN_ENV as ENV, token_file};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
@@ -84,7 +82,7 @@ impl Token {
     }
 
     fn load_or_create(dir: &Path) -> Result<Self, TokenError> {
-        let path = dir.join(FILE);
+        let path = token_file(dir);
         match std::fs::read_to_string(&path) {
             Ok(s) if !s.trim().is_empty() => return Ok(Self(s.trim().to_string())),
             // 空文件：当没有过，重新生成盖掉。理由同 `from_env` 里那条。
@@ -284,7 +282,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(d.path().join(FILE))
+            let mode = std::fs::metadata(token_file(d.path()))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -296,7 +294,7 @@ mod tests {
     #[test]
     fn an_empty_file_is_replaced_rather_than_trusted() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join(FILE), "   \n").unwrap();
+        std::fs::write(token_file(d.path()), "   \n").unwrap();
         let t = Token::load_or_create(d.path()).unwrap();
         assert_eq!(t.as_str().len(), 64);
     }
@@ -305,7 +303,7 @@ mod tests {
     #[test]
     fn surrounding_whitespace_in_the_file_is_not_part_of_the_token() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join(FILE), "  abc123\n").unwrap();
+        std::fs::write(token_file(d.path()), "  abc123\n").unwrap();
         assert!(Token::load_or_create(d.path()).unwrap().matches("abc123"));
     }
 
