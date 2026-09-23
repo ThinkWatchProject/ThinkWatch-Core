@@ -30,8 +30,6 @@ pub use tw_config::chatgpt::{ACCOUNT_HEADER, BASE_URL, CLIENT_ID, TOKEN_ENDPOINT
 pub const ISSUER: &str = "https://auth.openai.com";
 /// 登出时吊销 refresh token
 pub const REVOKE_ENDPOINT: &str = "https://auth.openai.com/oauth/revoke";
-/// 请求来自谁。**如实写 ThinkWatch**
-pub const ORIGINATOR: &str = "thinkwatch";
 /// 模型清单要的 `client_version`。
 ///
 /// 后端不带这个参数就回 400。ThinkWatch 不实现任何 Codex 客户端版本的特性，所以如实报
@@ -44,16 +42,6 @@ pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 pub const SCOPE: &str = "openid profile email offline_access";
 
 const RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
-
-/// 发给 Codex 后端的 User-Agent：`thinkwatch/0.5.0 (macos; aarch64)`
-pub fn user_agent() -> String {
-    format!(
-        "{ORIGINATOR}/{} ({}; {})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
-}
 
 // ---------------------------------------------------------------- 请求
 
@@ -124,8 +112,8 @@ pub fn identity_headers(
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut out = vec![
-        ("originator".to_string(), ORIGINATOR.to_string()),
-        ("user-agent".to_string(), user_agent()),
+        ("originator".to_string(), crate::ORIGINATOR.to_string()),
+        ("user-agent".to_string(), crate::user_agent()),
         ("session-id".to_string(), session),
         ("accept".to_string(), "text/event-stream".to_string()),
     ];
@@ -270,7 +258,7 @@ pub fn authorize_url(issuer: &str, redirect_uri: &str, pkce: &Pkce, state: &str)
         .append_pair("code_challenge_method", "S256")
         .append_pair("id_token_add_organizations", "true")
         .append_pair("state", state)
-        .append_pair("originator", ORIGINATOR);
+        .append_pair("originator", crate::ORIGINATOR);
     url.to_string()
 }
 

@@ -807,6 +807,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             store,
             price_updater: Default::default(),
             chatgpt: Default::default(),
+            zai: Default::default(),
         };
         // 盯着客户端配置面。**只报告** —— 这条路径上没有任何
         // 一处会改用户的文件。盯不住就只是少了「变更时告警」，页面上

@@ -53,3 +53,33 @@ pub use quota::{Quota, from_headers as quota_from_headers};
 pub use quote::Quote;
 pub use server::{AppState, Runtime, client_for_provider, router, serve};
 pub use usage::{Sniffer, Usage};
+
+/// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
+pub const ORIGINATOR: &str = "thinkwatch";
+
+/// 如实说明自己是谁的 User-Agent：`thinkwatch/0.29.0 (macos; aarch64)`。
+///
+/// **账号类上游的接口也用它**（ChatGPT 的 Codex 后端、Z.ai 的业务接口）。对方认不认
+/// 我们是对方的事；冒充它们自己的客户端不在我们的选项里。
+pub fn user_agent() -> String {
+    format!(
+        "{ORIGINATOR}/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// 一串不可猜的十六进制令牌。
+///
+/// Z.ai 的命令行登录拿它当轮询凭据：**它由我们生成**，服务端只是记住它，所以这一次
+/// 登录的结果只有拿着它的人取得到。
+pub fn opaque_token(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::fill(buf.as_mut_slice());
+    buf.iter().fold(String::new(), |mut out, b| {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
