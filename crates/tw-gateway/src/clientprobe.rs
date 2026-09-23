@@ -205,21 +205,13 @@ pub fn wants_stream(body: &Bytes) -> bool {
 /// 严格的 SDK 会校验它。
 fn message_id() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut s = String::from("msg_01");
-    // 不引 rand：探测应答的 id 只需要「看起来是个 id」且互不相同。
-    let mut x = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ 0x9E37_79B9_7F4A_7C15;
-    for _ in 0..22 {
-        // xorshift64
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.push(ALPHABET[(x % ALPHABET.len() as u64) as usize] as char);
-    }
-    s
+    // **不用时钟做种子。**以前是纳秒时间戳喂 xorshift：同一时刻进来的两个
+    // 探测请求拿到同一个 id，而这台机器上时钟的分辨率没有纳秒那么细 ——
+    // 测试里连着生成两次就撞过。
+    let tail: String = (0..22)
+        .map(|_| ALPHABET[rand::random_range(0..ALPHABET.len())] as char)
+        .collect();
+    format!("msg_01{tail}")
 }
 
 /// 伪造的应答内容。
@@ -548,6 +540,9 @@ mod tests {
         assert_eq!(a.len(), 6 + 22, "{a}");
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         assert_ne!(a, b_, "两次生成撞了");
+        // 连着生成一批也不撞。时钟做种子的时候，这一条几乎每次都红
+        let many: std::collections::HashSet<_> = (0..1000).map(|_| message_id()).collect();
+        assert_eq!(many.len(), 1000);
     }
 
     #[test]
