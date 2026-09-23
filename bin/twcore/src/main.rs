@@ -748,7 +748,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         //
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
-        let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_wire::bodies::CHANNEL_CAP);
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
         let store = build_store(&dir, state.bus.clone(), state.pricing.clone(), body_rx);
         if store.is_some() {
             state.set_body_sink(body_tx);
@@ -919,7 +919,7 @@ fn build_store(
     bus: tw_observe::EventBus,
     // **和网关同一份价格簿**，不是一份副本：改了价目表，下一个结束的请求就按新价算
     pricing: tw_pricing::Shared,
-    bodies: tokio::sync::mpsc::Receiver<tw_gateway::BodyRecord>,
+    bodies: tokio::sync::mpsc::Receiver<tw_gateway::bodies::BodyRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let events = bus.subscribe();
     let (db, blobs) = match tw_store::open(dir) {
@@ -951,7 +951,7 @@ fn build_store(
     }
     // 两边的 body 结构在这里对接。**一次移动，不复制** —— `Bytes` 的
     // 克隆是引用计数。
-    let (tx, rx) = tokio::sync::mpsc::channel(tw_wire::bodies::CHANNEL_CAP);
+    let (tx, rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
     let mut bodies = bodies;
     tokio::spawn(async move {
         while let Some(b) = bodies.recv().await {
@@ -959,8 +959,8 @@ fn build_store(
                 id: b.id,
                 at_ms: b.at_ms,
                 which: match b.kind {
-                    tw_gateway::BodyKind::Request => tw_store::Which::Request,
-                    tw_gateway::BodyKind::Response => tw_store::Which::Response,
+                    tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
+                    tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
                 },
                 body: b.body,
                 original_len: b.original_len,
