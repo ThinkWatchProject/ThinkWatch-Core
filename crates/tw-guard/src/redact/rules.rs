@@ -275,13 +275,10 @@ pub fn compile(name: &str, pattern: &str) -> Result<regex::Regex, BadPattern> {
             detail: "the pattern is empty".to_string(),
         });
     }
-    regex::RegexBuilder::new(pattern)
-        .size_limit(1 << 20)
-        .build()
-        .map_err(|e| BadPattern {
-            name: name.to_string(),
-            detail: e.to_string(),
-        })
+    crate::bounded(pattern).map_err(|e| BadPattern {
+        name: name.to_string(),
+        detail: e.to_string(),
+    })
 }
 
 /// 这一次按哪些规则找。
@@ -820,6 +817,13 @@ mod tests {
             .into_iter()
             .map(|h| (h.rule.id().to_string(), text[h.bytes].to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_pattern_that_compiles_into_something_huge_is_refused() {
+        // 默认上限下它能编过，然后每个请求都付几毫秒
+        assert!(compile("大", "(a|aa|aaa){5000}").is_err());
+        assert!(compile("正常", r"corp_[A-Za-z0-9]{12}").is_ok());
     }
 
     #[test]

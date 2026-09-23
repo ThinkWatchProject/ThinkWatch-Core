@@ -106,13 +106,10 @@ pub fn builtin() -> &'static RuleFile {
 }
 
 fn compile(spec: &RuleSpec, group: &'static str, custom: bool) -> Result<Rule, RuleError> {
-    let re = regex::RegexBuilder::new(&spec.pattern)
-        .size_limit(1 << 20)
-        .build()
-        .map_err(|e| RuleError::BadPattern {
-            name: spec.id.clone(),
-            detail: e.to_string(),
-        })?;
+    let re = crate::bounded(&spec.pattern).map_err(|e| RuleError::BadPattern {
+        name: spec.id.clone(),
+        detail: e.to_string(),
+    })?;
     Ok(Rule {
         id: spec.id.clone(),
         name: spec.name.clone(),

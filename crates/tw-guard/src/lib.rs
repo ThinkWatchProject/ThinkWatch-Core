@@ -7,3 +7,13 @@
 
 pub mod redact;
 pub mod tools;
+
+/// 编一条调用方给的正则。**编译后的大小有上限**（NFA 和 DFA 各 1 MiB）——
+/// 这条正则要在每个请求上跑，而 `(a|aa){200}` 这种写法在默认的 10 MiB 上限下
+/// 要编好几秒、占几 MB，然后每个请求都付一遍。
+fn bounded(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+}
