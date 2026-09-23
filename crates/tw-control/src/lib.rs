@@ -1448,6 +1448,20 @@ pub enum ControlError {
         len: usize,
         max: usize,
     },
+    /// 端口号写不进去。**这不是小事**：写不进去，客户端就找不到控制面，
+    /// 而网关本身照常在转发 —— 一个「跑着但够不着」的 core。
+    #[error("the control-plane port could not be written to {path}: {source}")]
+    PortFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// 这个平台上没有 unix socket。
+    ///
+    /// `Endpoint::in_dir` 不会给出这一档，所以走到这里说明有人显式指定了它
+    /// —— 与其静默换一种传输，不如说清楚。
+    #[cfg(not(unix))]
+    #[error("this platform has no unix sockets, so the control plane cannot listen on {path}")]
+    NoUnixSockets { path: PathBuf },
 }
 
 /// `sockaddr_un.sun_path` 的容量。macOS 104、Linux 108，取小的那个 ——
@@ -1468,15 +1482,34 @@ pub fn socket_path_fits(path: &Path) -> Result<(), ControlError> {
     Ok(())
 }
 
-/// 在 unix socket 上起控制面。
+/// 起控制面。
+///
+/// 两种传输，**挑哪一种不是调用方的事**：`Endpoint::in_dir` 按平台给出这台
+/// 机器上唯一可用的那一种（见 [`tw_api::control::Endpoint`]）。这里只负责把
+/// 它听起来。
+pub async fn serve(
+    state: ControlState,
+    at: &tw_api::control::Endpoint,
+    token: token::Token,
+) -> Result<(), ControlError> {
+    use tw_api::control::Endpoint;
+    // 门装在这儿，不装进 `router()` —— 理由见 `token::guard`
+    let app = token::guard(router(state), token);
+    match at {
+        #[cfg(unix)]
+        Endpoint::Socket(path) => serve_socket(app, path).await,
+        #[cfg(not(unix))]
+        Endpoint::Socket(path) => Err(ControlError::NoUnixSockets { path: path.clone() }),
+        Endpoint::Loopback { port_file } => serve_loopback(app, port_file).await,
+    }
+}
+
+/// unix socket 上的控制面。
 ///
 /// 陈旧的 socket 文件直接删掉重建 —— 它和 lock 文件不一样，没有「另一个
 /// 实例可能还在用」的歧义：单实例锁已经在上一步挡住了。
-pub async fn serve_unix(
-    state: ControlState,
-    path: &Path,
-    token: token::Token,
-) -> Result<(), ControlError> {
+#[cfg(unix)]
+async fn serve_socket(app: Router, path: &Path) -> Result<(), ControlError> {
     socket_path_fits(path)?;
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -1488,7 +1521,6 @@ pub async fn serve_unix(
         path: path.to_path_buf(),
         source,
     })?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         // 0700：只有当前用户能连。凭据那道门在它之外，不是替代它 ——
@@ -1496,37 +1528,91 @@ pub async fn serve_unix(
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
     tracing::info!(path = %path.display(), "the control plane is listening");
-
-    let app = token::guard(router(state), token);
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!("the control plane could not accept a connection: {e}");
-                continue;
-            }
-        };
-        let svc = app.clone();
-        tokio::spawn(async move {
-            let io = hyper_util::rt::TokioIo::new(stream);
-            let svc = hyper::service::service_fn(move |req| {
-                use tower::ServiceExt;
-                svc.clone().oneshot(req)
-            });
-            if let Err(e) =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, svc)
-                    .await
-            {
-                tracing::debug!("a control-plane connection ended: {e}");
-            }
-        });
+        match listener.accept().await {
+            Ok((stream, _)) => hand_off(stream, app.clone()),
+            Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
+        }
     }
 }
 
-/// 默认 socket 路径。和配置放一起，这样「一个目录装下全部状态」这条成立。
-pub fn default_socket_path() -> PathBuf {
-    tw_config::default_dir().join("twcore.sock")
+/// 回环 TCP 上的控制面。Windows 只有这一档。
+///
+/// **绑 0 号端口**，让系统挑一个空闲的，再把号码写进那个文件。固定端口会和
+/// 别的软件撞，而撞上的表现是 core 起不来；它也省了想连进来的人一步。
+///
+/// 端口文件**先绑后写**：写完才说得出真实的号码，而反过来（先写一个想要的
+/// 号再去绑）会在绑失败时留下一个指向别人的文件。
+///
+/// 这一档**挡不住同机的任何进程**，也问不出对端是谁 —— 门全在凭据上，
+/// 见 [`token`]。
+async fn serve_loopback(app: Router, port_file: &Path) -> Result<(), ControlError> {
+    use std::net::Ipv4Addr;
+    if let Some(dir) = port_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|source| ControlError::Bind {
+            path: port_file.to_path_buf(),
+            source,
+        })?;
+    let port = listener
+        .local_addr()
+        .map_err(|source| ControlError::Bind {
+            path: port_file.to_path_buf(),
+            source,
+        })?
+        .port();
+    std::fs::write(port_file, port.to_string()).map_err(|source| ControlError::PortFile {
+        path: port_file.to_path_buf(),
+        source,
+    })?;
+    tracing::info!(port, "the control plane is listening on loopback");
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => hand_off(stream, app.clone()),
+            Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
+        }
+    }
+}
+
+/// 一条连接交给 hyper。
+///
+/// **两种传输共用**：它们的差别只在怎么拿到这个流，拿到之后的每一件事
+/// （协议协商、错误怎么记）都该一模一样 —— 写两遍就是两遍会漂。
+fn hand_off<S>(stream: S, app: Router)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let svc = hyper::service::service_fn(move |req| {
+            use tower::ServiceExt;
+            app.clone().oneshot(req)
+        });
+        if let Err(e) =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await
+        {
+            tracing::debug!("a control-plane connection ended: {e}");
+        }
+    });
+}
+
+/// 在起任何东西之前问一句：这个地址听得起来吗。
+///
+/// **不是等到 bind 的那一刻才发现。**那时网关已经在监听、客户端可能已经
+/// 连上来了，而这条错误当时只会进日志。
+pub fn endpoint_usable(at: &tw_api::control::Endpoint) -> Result<(), ControlError> {
+    use tw_api::control::Endpoint;
+    match at {
+        Endpoint::Socket(p) => socket_path_fits(p),
+        // 回环那一档没有等价的前置条件：端口由系统挑，挑不出来时 bind 自己
+        // 会说，而那句话已经够清楚了。
+        Endpoint::Loopback { .. } => Ok(()),
+    }
 }
 
 #[cfg(test)]
