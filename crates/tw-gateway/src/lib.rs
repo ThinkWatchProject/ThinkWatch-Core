@@ -29,7 +29,6 @@ pub mod probe;
 pub mod quote;
 pub mod server;
 pub mod session;
-pub mod toolwall;
 pub mod translate;
 pub mod ws;
 

@@ -252,14 +252,14 @@ fn product_text_is_written_not_spoken() {
     }
 
     // 内置扫描规则的说明会原样出现在发现和工具调用告警里
-    let rules = root.join("crates/tw-config/data/rules.yaml");
+    let rules = root.join("crates/tw-guard/data/rules.yaml");
     for (n, l) in std::fs::read_to_string(&rules).unwrap().lines().enumerate() {
         let Some(why) = l.trim().strip_prefix("why:") else {
             continue;
         };
         for w in SPOKEN.iter().filter(|w| why.contains(**w)) {
             found.push(format!(
-                "crates/tw-config/data/rules.yaml:{}  「{w}」  {why}",
+                "crates/tw-guard/data/rules.yaml:{}  「{w}」  {why}",
                 n + 1
             ));
         }

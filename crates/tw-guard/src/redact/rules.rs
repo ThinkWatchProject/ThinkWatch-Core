@@ -245,6 +245,8 @@ pub struct Hit {
     /// 在原文里的字节区间
     pub bytes: Range<usize>,
     pub rule: Rule,
+    /// 占位符里用的标签。`None` 用账本的默认标签
+    pub label: Option<Arc<str>>,
 }
 
 /// 一条编译好的自定义规则。
@@ -252,6 +254,8 @@ pub struct Hit {
 pub struct Custom {
     pub name: Arc<str>,
     pub re: regex::Regex,
+    /// 占位符里的标签（企业版的 `EMAIL`、`PHONE`）。`None` 用账本的默认标签
+    pub label: Option<Arc<str>>,
 }
 
 /// 一个自定义规则的正则写错了。
@@ -271,13 +275,10 @@ pub fn compile(name: &str, pattern: &str) -> Result<regex::Regex, BadPattern> {
             detail: "the pattern is empty".to_string(),
         });
     }
-    regex::RegexBuilder::new(pattern)
-        .size_limit(1 << 20)
-        .build()
-        .map_err(|e| BadPattern {
-            name: name.to_string(),
-            detail: e.to_string(),
-        })
+    crate::bounded(pattern).map_err(|e| BadPattern {
+        name: name.to_string(),
+        detail: e.to_string(),
+    })
 }
 
 /// 这一次按哪些规则找。
@@ -348,16 +349,28 @@ impl RuleSet {
             set.custom.push(Custom {
                 name: Arc::from(name),
                 re: compile(name, pattern)?,
+                label: None,
             });
         }
         Ok(set)
     }
 
     /// 再加一条自定义规则。
-    pub fn with_custom(mut self, name: &str, pattern: &str) -> Result<Self, BadPattern> {
+    pub fn with_custom(self, name: &str, pattern: &str) -> Result<Self, BadPattern> {
+        self.with_labeled(name, pattern, None)
+    }
+
+    /// 再加一条自定义规则，占位符用它自己的标签：`{{EMAIL_1}}` 里的 `EMAIL`。
+    pub fn with_labeled(
+        mut self,
+        name: &str,
+        pattern: &str,
+        label: Option<&str>,
+    ) -> Result<Self, BadPattern> {
         self.custom.push(Custom {
             name: Arc::from(name),
             re: compile(name, pattern)?,
+            label: label.map(Arc::from),
         });
         Ok(self)
     }
@@ -488,6 +501,7 @@ fn private_keys(text: &str, out: &mut Vec<Hit>) {
         out.push(Hit {
             bytes: begin..end,
             rule: Rule::Builtin("private-key"),
+            label: None,
         });
         from = end;
     }
@@ -558,6 +572,7 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
             out.push(Hit {
                 bytes: c + 1..j,
                 rule: Rule::Builtin("conn-string-password"),
+                label: None,
             });
         }
         from = after;
@@ -639,6 +654,7 @@ fn custom_hits(text: &str, set: &RuleSet, out: &mut Vec<Hit>) {
                 out.push(Hit {
                     bytes,
                     rule: Rule::Custom(c.name.clone()),
+                    label: c.label.clone(),
                 });
             }
         }
@@ -668,6 +684,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(Hit {
                 bytes: span,
                 rule: Rule::Builtin(id),
+                label: None,
             });
             return;
         }
@@ -675,6 +692,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(Hit {
                 bytes: span,
                 rule: Rule::Builtin("jwt"),
+                label: None,
             });
             return;
         }
@@ -682,13 +700,18 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(Hit {
                 bytes: span,
                 rule: Rule::Builtin(id),
+                label: None,
             });
         }
     });
     custom_hits(text, set, &mut out);
+    disjoint(out)
+}
+
+/// 排好序、去掉重叠的。**重叠的只留第一个。**私钥块里的 base64 会被 token
+/// 扫描当成别的东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段。
+fn disjoint(mut out: Vec<Hit>) -> Vec<Hit> {
     out.sort_by_key(|h| (h.bytes.start, std::cmp::Reverse(h.bytes.end)));
-    // **重叠的只留第一个。**私钥块里的 base64 会被 token 扫描当成别的
-    // 东西，两段嵌在一起替换会把偏移彻底搞乱。同一个起点上留长的那段
     let mut kept: Vec<Hit> = Vec::with_capacity(out.len());
     for h in out {
         if kept.last().is_some_and(|p| p.bytes.end > h.bytes.start) {
@@ -737,9 +760,35 @@ pub fn scan_plain(text: &str, set: &RuleSet) -> Vec<Hit> {
             (end > start).then_some(Hit {
                 bytes: start..end,
                 rule: h.rule,
+                label: h.label,
             })
         })
         .collect()
+}
+
+/// 扫一段**解码过的正文**：自定义规则按正则本来的意思匹配。
+///
+/// 和 [`scan_plain`] 的差别只在自定义规则上。桌面版扫的是线上那份 JSON，所以
+/// 自定义规则的命中止于引号和反斜杠（见 `json_safe`）；而一个先解码请求、在
+/// 正文上找、再把结果带回去的调用方（企业版）看到的就是正文，`password="x"`
+/// 截成 `password=` 只会让真值漏出去。它换下来的值可能带引号，整包还原时要用
+/// [`crate::redact::replace::restore_json`]。
+pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
+    let builtins = RuleSet {
+        on: set.on.clone(),
+        custom: Vec::new(),
+    };
+    let mut out = scan_plain(text, &builtins);
+    for c in &set.custom {
+        for m in c.re.find_iter(text).filter(|m| !m.is_empty()) {
+            out.push(Hit {
+                bytes: m.range(),
+                rule: Rule::Custom(c.name.clone()),
+                label: c.label.clone(),
+            });
+        }
+    }
+    disjoint(out)
 }
 
 /// 报出去的样子。**一律打码** —— 「发现了 sk-ant-xxx」这句话本身就是一次
@@ -797,6 +846,13 @@ mod tests {
             .into_iter()
             .map(|h| (h.rule.id().to_string(), text[h.bytes].to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_pattern_that_compiles_into_something_huge_is_refused() {
+        // 默认上限下它能编过，然后每个请求都付几毫秒
+        assert!(compile("大", "(a|aa|aaa){5000}").is_err());
+        assert!(compile("正常", r"corp_[A-Za-z0-9]{12}").is_ok());
     }
 
     #[test]
@@ -881,10 +937,14 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, "private-key");
         // 换掉之后 JSON 还得是合法的
-        let r = crate::redact::redact(body, &all());
+        let r = crate::redact::replace::redact(
+            body,
+            &all(),
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
         serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
         // 而且能一字不差地换回来
-        assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
+        assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
     }
 
     #[test]
@@ -997,12 +1057,16 @@ mod tests {
             "content": "pw=hunter2\n下一行 \"引号\" pw=abc\"def"
         }))
         .unwrap();
-        let r = crate::redact::redact(&body, &set);
+        let r = crate::redact::replace::redact(
+            &body,
+            &set,
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
         let v: serde_json::Value = serde_json::from_str(&r.text).expect("换完不是合法 JSON");
         let content = v["content"].as_str().unwrap();
         assert!(content.starts_with("<<TW_SECRET_1>>\n下一行"), "{content}");
         assert!(content.contains("<<TW_SECRET_2>>\"def"), "{content}");
-        assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
+        assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
     }
 
     #[test]

@@ -392,7 +392,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
 
 /// 一组自定义规则：名字不空、不重复，正则编得过。
 ///
-/// 上限和数据面编译时一样（`tw_redact::rules::compile`）：一条要在每个请求上
+/// 上限和数据面编译时一样（`tw_guard::redact::rules::compile`）：一条要在每个请求上
 /// 跑的正则，编出来的东西不能太大。
 fn check_rules<'a>(
     what: &'static str,

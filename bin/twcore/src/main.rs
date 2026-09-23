@@ -158,7 +158,7 @@ fn main() -> Result<()> {
 fn cmd_scan(_config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
     // **只用内置规则**，和应用里 MCP 页扫的是同一套。安全页上的规则只作用于
     // 经过网关的请求
-    let rules = tw_scan::rules::scan_rules();
+    let rules = tw_guard::tools::rules::scan_rules();
     let mut srcs = tw_scan::sources::user_level(&home());
     for p in &projects {
         srcs.extend(tw_scan::sources::in_project(p));
@@ -630,7 +630,7 @@ fn cmd_check(path: &Path) -> Result<()> {
                     // **本机的 http 不算明文过网。**报它是个假警报，而
                     // 假警报的代价是用户学会忽略这一栏的所有话（
                     // 没有风险的时候要说「安全」，不是把话说满）。
-                    // tw-redact 的内网规则出于同一个理由排除回环。
+                    // tw-guard 的内网规则出于同一个理由排除回环。
                     let loopback = o.endpoint.starts_with("http://127.0.0.1")
                         || o.endpoint.starts_with("http://localhost")
                         || o.endpoint.starts_with("http://[::1]");

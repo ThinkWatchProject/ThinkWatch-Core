@@ -1,6 +1,6 @@
 //! 数据面守卫：出站脱敏的接线。
 //!
-//! 规则本身住在 [`tw_redact`] 里，这个文件只回答一个问题：**一个请求体该
+//! 规则本身住在 [`tw_guard::redact`] 里，这个文件只回答一个问题：**一个请求体该
 //! 怎么处理。**
 //!
 //! # 全局的，对所有上游一视同仁
@@ -17,8 +17,8 @@
 //! 转换过格式的，要换的是真正发出去的那一份。
 
 use tw_config::SecurityMode as Mode;
-use tw_redact::redact::Ledger;
-use tw_redact::rules::{Finding, RuleSet};
+use tw_guard::redact::replace::{Ledger, Scheme};
+use tw_guard::redact::rules::{Finding, RuleSet};
 
 /// 找一遍。**观察档和拦截档都找**，关闭时不找。
 ///
@@ -30,26 +30,26 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
     let Ok(text) = std::str::from_utf8(body) else {
         return Vec::new();
     };
-    let hits = tw_redact::rules::scan(text, rules);
-    tw_redact::rules::findings(text, &hits)
+    let hits = tw_guard::redact::rules::scan(text, rules);
+    tw_guard::redact::rules::findings(text, &hits)
 }
 
 /// 拦截档下换掉要发出去的这一份。返回换过的体和还原用的账本；**不在拦截档、
 /// 或者没找到东西时与进来时逐字节相同**，账本是空的。
 pub fn replace(mode: Mode, rules: &RuleSet, body: bytes::Bytes) -> (bytes::Bytes, Ledger) {
     if !mode.acts() || rules.is_empty() {
-        return (body, Ledger::default());
+        return (body, Ledger::new(Scheme::SECRET));
     }
     // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求
     let Ok(text) = std::str::from_utf8(&body) else {
-        return (body, Ledger::default());
+        return (body, Ledger::new(Scheme::SECRET));
     };
-    let hits = tw_redact::rules::scan(text, rules);
+    let hits = tw_guard::redact::rules::scan(text, rules);
     if hits.is_empty() {
         // 没命中就原样返回，连一次拷贝都不做
-        return (body, Ledger::default());
+        return (body, Ledger::new(Scheme::SECRET));
     }
-    let r = tw_redact::redact::apply(text, &hits);
+    let r = tw_guard::redact::replace::apply(text, &hits, Ledger::new(Scheme::SECRET));
     (bytes::Bytes::from(r.text), r.ledger)
 }
 

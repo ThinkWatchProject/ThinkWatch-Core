@@ -1,11 +1,11 @@
 [package]
-name = "tw-redact"
+name = "tw-guard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Outbound redaction: replace credentials with placeholders, and restore them when a response echoes them back"
+description = "Guards shared by both gateways: outbound redaction and restoration, and inspection of the tool calls an upstream returns"
 
 [dependencies]
 serde = { workspace = true }
@@ -14,6 +14,8 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tw-secret = { workspace = true }
+serde_yaml_ng = { workspace = true }
+tw-dialect = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

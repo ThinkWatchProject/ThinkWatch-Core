@@ -261,6 +261,12 @@ pub enum GatewayError {
     /// "monthly budget"). Maps to 429 in `IntoResponse`.
     #[error("Rate limited: {0}")]
     LocalRateLimited(String),
+    /// Refused by the gateway's own policy — a tool call the upstream
+    /// returned matched a rule set to cut it. Neither the caller's fault
+    /// (not 400) nor the upstream failing (not 502): the answer exists
+    /// and the gateway will not hand it over. Maps to 403.
+    #[error("Blocked by policy: {0}")]
+    PolicyBlocked(String),
 }
 
 impl GatewayError {
@@ -281,6 +287,7 @@ impl GatewayError {
             GatewayError::NetworkError(_) => 502,
             GatewayError::UpstreamRateLimited { .. } | GatewayError::LocalRateLimited(_) => 429,
             GatewayError::UpstreamAuthError => 401,
+            GatewayError::PolicyBlocked(_) => 403,
         }
     }
 
@@ -298,6 +305,7 @@ impl GatewayError {
             GatewayError::UpstreamRateLimited { .. } => "UpstreamRateLimited",
             GatewayError::LocalRateLimited(_) => "LocalRateLimited",
             GatewayError::UpstreamAuthError => "UpstreamAuthError",
+            GatewayError::PolicyBlocked(_) => "PolicyBlocked",
         }
     }
 
@@ -429,6 +437,14 @@ mod call_ctx_tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_policy_refusal_is_forbidden_not_a_bad_request_or_an_upstream_failure() {
+        let e = GatewayError::PolicyBlocked("the tool call matched a rule".into());
+        assert_eq!(e.status_code(), 403);
+        assert_eq!(e.error_tag(), "PolicyBlocked");
+        assert_eq!(e.retry_after_secs(), None);
     }
 
     #[test]
