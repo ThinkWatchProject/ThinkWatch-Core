@@ -21,8 +21,8 @@ use tw_adopt::json::Val;
 use tw_types::{Msg, msg};
 
 use crate::hidden;
-use crate::rules::Rules;
 use crate::sources::{self, Source};
+use tw_guard::tools::rules::Rules;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {

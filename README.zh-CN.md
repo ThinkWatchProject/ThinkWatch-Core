@@ -38,10 +38,10 @@ cargo run -p twcore -- serve    # 起网关和控制面
 ## crate 分层
 
 ```
-tw-types · tw-dialect · tw-wire · tw-upstream · tw-resil · tw-crypto   ← 形状由外部现实决定
-tw-engine · tw-pricing · tw-redact · tw-yaml · tw-secret               ← 领域逻辑
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe                 ← 装配
-tw-gateway · tw-control                                                ← 数据面 / 控制面
+tw-types · tw-dialect · tw-wire · tw-upstream · tw-crypto   ← 形状由外部现实决定
+tw-engine · tw-pricing · tw-guard · tw-yaml · tw-secret     ← 领域逻辑
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe      ← 装配
+tw-gateway · tw-control                                     ← 数据面 / 控制面
 ```
 
 上面两层对外部稳定，服务端版本直接依赖它们。下面两层是单机的实现

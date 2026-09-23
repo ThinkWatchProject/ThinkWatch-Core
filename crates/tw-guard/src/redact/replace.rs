@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::rules::{Hit, RuleSet};
+use crate::redact::rules::{Hit, RuleSet};
 
 /// 占位符长什么样：`<<TW_SECRET_1>>`。
 pub const OPEN: &str = "<<TW_SECRET_";
@@ -21,7 +21,7 @@ pub fn placeholder(n: usize) -> String {
 /// 不同的占位符，会让模型以为那是三个不同的东西 —— 而它可能正在帮你
 /// 对比「这两处的 key 是不是同一把」。
 ///
-/// 换了哪些、各几处不记在这里：那是 [`crate::rules::findings`] 从命中里
+/// 换了哪些、各几处不记在这里：那是 [`crate::redact::rules::findings`] 从命中里
 /// 算出来的，观察档（不换）和拦截档（换）报的是同一份。
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
@@ -93,13 +93,13 @@ pub fn apply_into(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
 
 /// 扫 + 换，一步到位。
 pub fn redact(text: &str, rules: &RuleSet) -> Redacted {
-    let hits = crate::rules::scan(text, rules);
+    let hits = crate::redact::rules::scan(text, rules);
     apply(text, &hits)
 }
 
 /// 扫 + 换，接着一本已有的账本编号。见 [`apply_into`]。
 pub fn redact_into(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
-    let hits = crate::rules::scan(text, rules);
+    let hits = crate::redact::rules::scan(text, rules);
     apply_into(text, &hits, ledger)
 }
 
@@ -120,7 +120,7 @@ pub fn restore(text: &str, ledger: &Ledger) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{BUILTINS, RuleSet};
+    use crate::redact::rules::{BUILTINS, RuleSet};
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 

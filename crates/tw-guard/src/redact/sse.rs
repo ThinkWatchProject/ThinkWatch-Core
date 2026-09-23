@@ -21,7 +21,7 @@
 //! # 做法
 //!
 //! 拆出每一帧，找到装正文的那个字段，解码 → 喂给
-//! [`crate::stream::Restorer`] → 把它吐出来的那段写回去。扣住的尾巴跨帧
+//! [`crate::redact::stream::Restorer`] → 把它吐出来的那段写回去。扣住的尾巴跨帧
 //! 攒着，下一帧的正文接在它后面。
 //!
 //! **不认识的帧原样转发。**心跳、`ping`、我们没见过的事件类型 —— 这条
@@ -29,8 +29,8 @@
 
 use serde_json::Value;
 
-use crate::redact::Ledger;
-use crate::stream::Restorer;
+use crate::redact::replace::Ledger;
+use crate::redact::stream::Restorer;
 
 /// 正文可能挂在哪几个字段上。**按方言列，不是猜。**
 ///
@@ -203,7 +203,7 @@ fn find_frame_end(buf: &[u8]) -> Option<usize> {
 /// 第一版就是那么写的，SSE 那半从来没还原成功过。
 pub enum Body {
     Sse(SseRestorer),
-    Whole(crate::stream::ByteRestorer),
+    Whole(crate::redact::stream::ByteRestorer),
 }
 
 impl Body {
@@ -211,7 +211,7 @@ impl Body {
         if is_sse {
             Body::Sse(SseRestorer::new(ledger))
         } else {
-            Body::Whole(crate::stream::ByteRestorer::new(ledger))
+            Body::Whole(crate::redact::stream::ByteRestorer::new(ledger))
         }
     }
     pub fn is_noop(&self) -> bool {
@@ -237,8 +237,8 @@ impl Body {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redact::redact;
-    use crate::rules::RuleSet;
+    use crate::redact::replace::redact;
+    use crate::redact::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 

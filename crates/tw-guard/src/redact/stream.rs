@@ -21,7 +21,7 @@
 //! `<< x` 里 `<<` 后面是空格，一眼就不可能长成 `<<TW_SECRET_`，立刻放行。
 //! 顺带还加了个长度上限 —— 就算判据写漏了，扣住的也永远是几十个字节。
 
-use crate::redact::{CLOSE, Ledger, OPEN};
+use crate::redact::replace::{CLOSE, Ledger, OPEN};
 
 /// 扣住的字节数上限。`<<TW_SECRET_` + 一串数字 + `>>`，几十字节封顶。
 const MAX_HOLD: usize = 48;
@@ -193,8 +193,8 @@ impl ByteRestorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redact::redact;
-    use crate::rules::RuleSet;
+    use crate::redact::replace::redact;
+    use crate::redact::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -270,7 +270,7 @@ mod tests {
         // 唯一的差别只是有些字节晚几毫秒发出去。
         let text = "开头 <<TW_SECRET_1>> 中间 a << b 结尾 <<TW_SECRET_1>>";
         let l = ledger();
-        let want = crate::redact::restore(text, &l);
+        let want = crate::redact::replace::restore(text, &l);
         for size in 1..=text.len().min(40) {
             let mut chunks = Vec::new();
             let mut rest = text;
@@ -358,8 +358,8 @@ mod tests {
 #[cfg(test)]
 mod byte_tests {
     use super::*;
-    use crate::redact::redact;
-    use crate::rules::RuleSet;
+    use crate::redact::replace::redact;
+    use crate::redact::rules::RuleSet;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 

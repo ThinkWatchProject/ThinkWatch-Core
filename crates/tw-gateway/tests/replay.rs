@@ -53,11 +53,15 @@ fn no_fixture_carries_a_credential() {
     for (name, f) in load_all() {
         let dump = serde_yaml_ng::to_string(&f).unwrap();
         // 内置的凭据规则全开，内网地址不算（夹具里的 10.x 是示意）
-        let all: Vec<&str> = tw_redact::rules::BUILTINS.iter().map(|b| b.id).collect();
-        let hits = tw_redact::rules::scan(&dump, &tw_redact::rules::RuleSet::only(&all));
+        let all: Vec<&str> = tw_guard::redact::rules::BUILTINS
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        let hits =
+            tw_guard::redact::rules::scan(&dump, &tw_guard::redact::rules::RuleSet::only(&all));
         let real: Vec<_> = hits
             .iter()
-            .filter(|h| h.rule.kind() != tw_redact::rules::Kind::Internal)
+            .filter(|h| h.rule.kind() != tw_guard::redact::rules::Kind::Internal)
             .map(|h| format!("{}（{}）", h.rule.id(), &dump[h.bytes.clone()]))
             .collect();
         assert!(real.is_empty(), "{name} 里有凭据：{real:?}");

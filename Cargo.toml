@@ -5,7 +5,6 @@ members = [
     "crates/tw-types",
     "crates/tw-upstream",
     "crates/tw-wire",
-    "crates/tw-resil",
     "crates/tw-crypto",
     # ── 第二层 · 桌面网关（企业版永不依赖）────────────────
     "crates/tw-api",
@@ -16,7 +15,7 @@ members = [
     "crates/tw-pricing",
     "crates/tw-adopt",
     "crates/tw-scan",
-    "crates/tw-redact",
+    "crates/tw-guard",
     "crates/tw-dialect",
     "crates/tw-engine",
     "crates/tw-observe",
@@ -26,8 +25,6 @@ members = [
     "bin/twcore",
 ]
 
-# 其余 crate 在有内容时再加进来，不预先建空壳：
-#   tw-redact / tw-pricing / tw-engine / tw-guard / tw-store / tw-observe
 
 [workspace.package]
 edition = "2024"
@@ -45,7 +42,6 @@ version = "0.36.0"
 tw-types    = { path = "crates/tw-types" }
 tw-upstream = { path = "crates/tw-upstream" }
 tw-wire     = { path = "crates/tw-wire" }
-tw-resil    = { path = "crates/tw-resil" }
 tw-crypto   = { path = "crates/tw-crypto" }
 tw-api      = { path = "crates/tw-api" }
 tw-secret   = { path = "crates/tw-secret" }
@@ -59,7 +55,7 @@ tw-store    = { path = "crates/tw-store" }
 tw-pricing  = { path = "crates/tw-pricing" }
 tw-adopt    = { path = "crates/tw-adopt" }
 tw-scan     = { path = "crates/tw-scan" }
-tw-redact   = { path = "crates/tw-redact" }
+tw-guard    = { path = "crates/tw-guard" }
 tw-dialect  = { path = "crates/tw-dialect" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────

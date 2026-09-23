@@ -108,18 +108,18 @@ pub struct Upstream {
 /// 它开始时的配置走多久，和普通请求按开始时的运行时走是同一个道理。
 pub struct Rules {
     pub redact_mode: tw_config::SecurityMode,
-    pub redact: Arc<tw_redact::rules::RuleSet>,
+    pub redact: Arc<tw_guard::redact::rules::RuleSet>,
     pub inspect_mode: tw_config::SecurityMode,
-    pub tools: Arc<tw_scan::rules::Rules>,
+    pub tools: Arc<tw_guard::tools::rules::Rules>,
 }
 
 /// 一次连接里两个方向各自的状态。
 struct Pipes {
     /// **整条连接一本账。**每帧各起一本的话，第二帧的
     /// `<<TW_SECRET_1>>` 会和第一帧的撞车（见 `redact_into` 的注释）
-    ledger: tw_redact::redact::Ledger,
+    ledger: tw_guard::redact::replace::Ledger,
     /// 工具调用审查关着的时候没有它
-    wall: Option<crate::toolwall::Wall>,
+    wall: Option<tw_guard::tools::wall::Wall>,
     rules: Rules,
     provider: String,
     id: u64,
@@ -176,11 +176,11 @@ pub async fn proxy(
         }
     };
     let mut p = Pipes {
-        ledger: tw_redact::redact::Ledger::default(),
+        ledger: tw_guard::redact::replace::Ledger::default(),
         wall: rules
             .inspect_mode
             .detects()
-            .then(|| crate::toolwall::Wall::new(rules.tools.clone())),
+            .then(|| tw_guard::tools::wall::Wall::new(rules.tools.clone())),
         rules,
         provider: upstream.provider.name,
         id,
@@ -337,7 +337,7 @@ async fn pump(
                                 at_ms: crate::server::now_ms(),
                             });
                             if mode.acts() {
-                                let r = tw_redact::redact::redact_into(
+                                let r = tw_guard::redact::replace::redact_into(
                                     t.as_str(),
                                     &p.rules.redact,
                                     std::mem::take(&mut p.ledger),
@@ -376,7 +376,7 @@ async fn pump(
                 };
                 let out = match m {
                     UpMsg::Text(t) => {
-                        let restored = tw_redact::redact::restore(t.as_str(), &p.ledger);
+                        let restored = tw_guard::redact::replace::restore(t.as_str(), &p.ledger);
                         let hits = match p.wall.as_mut() {
                             Some(w) => w.feed(as_sse(&restored).as_bytes()),
                             None => Vec::new(),

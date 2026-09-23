@@ -210,9 +210,15 @@ pub fn record(
     let clean = |r: Recorded| -> Recorded {
         // 两道：先按凭据规则换成占位符（结构还在，值没了），再走一遍
         // 通用打码兜住规则没认出来的
-        let all: Vec<&str> = tw_redact::rules::BUILTINS.iter().map(|b| b.id).collect();
-        let redacted =
-            tw_redact::redact::redact(&r.body, &tw_redact::rules::RuleSet::only(&all)).text;
+        let all: Vec<&str> = tw_guard::redact::rules::BUILTINS
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        let redacted = tw_guard::redact::replace::redact(
+            &r.body,
+            &tw_guard::redact::rules::RuleSet::only(&all),
+        )
+        .text;
         Recorded {
             body: tw_secret::mask_body(&redacted),
             ..r

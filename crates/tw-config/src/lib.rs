@@ -954,8 +954,8 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
 pub use security::{
-    BUILTIN_RULES, CustomRedactRule, CustomToolRule, Mode as SecurityMode, RedactPolicy, Security,
-    ToolAction, ToolPolicy,
+    CustomRedactRule, CustomToolRule, Mode as SecurityMode, RedactPolicy, Security, ToolAction,
+    ToolPolicy,
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};

@@ -14,7 +14,7 @@ tw-types = { workspace = true }
 tw-api = { workspace = true }
 tw-secret = { workspace = true }
 # 校验要认得出配置里写到的内置脱敏规则 id
-tw-redact = { workspace = true }
+tw-guard = { workspace = true }
 regex = { workspace = true }
 tw-pricing = { workspace = true }
 # 凭据轮换要把一个标量写回 config.yaml。**span 补丁，不是

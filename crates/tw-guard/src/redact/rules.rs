@@ -881,10 +881,10 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, "private-key");
         // 换掉之后 JSON 还得是合法的
-        let r = crate::redact::redact(body, &all());
+        let r = crate::redact::replace::redact(body, &all());
         serde_json::from_str::<serde_json::Value>(&r.text).expect("换完不是合法 JSON");
         // 而且能一字不差地换回来
-        assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
+        assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
     }
 
     #[test]
@@ -997,12 +997,12 @@ mod tests {
             "content": "pw=hunter2\n下一行 \"引号\" pw=abc\"def"
         }))
         .unwrap();
-        let r = crate::redact::redact(&body, &set);
+        let r = crate::redact::replace::redact(&body, &set);
         let v: serde_json::Value = serde_json::from_str(&r.text).expect("换完不是合法 JSON");
         let content = v["content"].as_str().unwrap();
         assert!(content.starts_with("<<TW_SECRET_1>>\n下一行"), "{content}");
         assert!(content.contains("<<TW_SECRET_2>>\"def"), "{content}");
-        assert_eq!(crate::redact::restore(&r.text, &r.ledger), body);
+        assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
     }
 
     #[test]
