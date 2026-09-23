@@ -3016,7 +3016,6 @@ dependencies = [
  "rand 0.10.2",
  "tokio",
  "tracing",
- "tw-provider",
  "tw-types",
 ]
 
