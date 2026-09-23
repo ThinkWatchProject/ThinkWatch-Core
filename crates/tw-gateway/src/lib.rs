@@ -35,7 +35,6 @@ pub mod translate;
 pub mod ws;
 
 pub use access::{AllowList, Cidr};
-pub use tw_wire::{BodyKind, BodyRecord, BodySender, Sniffer, Usage};
 pub use clientprobe::{ProbeKind, classify};
 pub use error::GatewayError;
 pub use health::Health;
@@ -50,6 +49,7 @@ pub use probe::{ModelList, ProbeResult, probe};
 pub use quota::{Quota, from_headers as quota_from_headers};
 pub use quote::Quote;
 pub use server::{AppState, Runtime, client_for_provider, router, serve};
+pub use tw_wire::{BodyKind, BodyRecord, BodySender, Sniffer, Usage};
 
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";
