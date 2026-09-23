@@ -18,6 +18,11 @@ export HOME="$FAKE_HOME"
 export THINKWATCH_HOME="$FAKE_HOME/.thinkwatch"
 mkdir -p "$THINKWATCH_HOME" "$FAKE_HOME/.claude"
 SOCK="$THINKWATCH_HOME/twcore.sock"
+# 控制面要凭据。**这个脚本自己定它是什么**，通过环境变量交给 twcore ——
+# 比等它自己生成一个、再去文件里把它捞回来少一步竞态（那个文件是在它
+# 启动过程中写的，而这里几乎同时就要用）。
+export TW_CONTROL_TOKEN="smoke-$$-$RANDOM"
+AUTH=(-H "Authorization: Bearer $TW_CONTROL_TOKEN")
 PORT=18999
 UPPORT=18998
 PASS=0; FAIL=0
@@ -200,7 +205,7 @@ else
   # 根本没被当成 UTF-8。所以把这一次的路由决策和 core 日志一起交出来 ——
   # 少了这些，CI 上的一次失败在本机复现不出来就只能靠猜。
   sleep 0.5
-  CHAIN=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+  CHAIN=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" 2>/dev/null \
             | python3 -c 'import sys, json
 # /history 是个顶层数组。字段名在演化，所以打印整行而不是挑几个 ——
 # 挑错了名字就什么都看不到，而这段代码只在出事那一次跑。
@@ -240,7 +245,7 @@ echo "$S" | grep -q 'content_block_stop' && bad "切断之后还发了 content_b
 # 行一律没有用量，这笔钱就不在账上。
 GOT=""
 for _ in $(seq 1 20); do
-  GOT=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+  GOT=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" 2>/dev/null \
           | python3 -c 'import sys, json
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
@@ -268,7 +273,7 @@ else
   GOT=""
   # 落库是异步的：事件先过广播，再由存储层的任务写进去
   for _ in $(seq 1 20); do
-    GOT=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" 2>/dev/null \
+    GOT=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" 2>/dev/null \
             | python3 -c 'import sys, json
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
@@ -284,10 +289,20 @@ print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/d
 fi
 
 # ---------------------------------------------------------------- 控制面
-step "控制面（每个端点）"
+step "控制面要凭据"
 sleep 1
-get() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "http://localhost$1"; }
-post() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" -XPOST \
+# **只有这里能证明门是真的。**单元测试测的是那一层中间件，而「它到底有没有
+# 被挂到真正对外的那份路由表上」只有真二进制加真 socket 答得出来 —— 漏挂的
+# 样子是所有测试照常通过，而控制面对整台机器敞着。
+NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://localhost/status)
+[ "$NOAUTH" = 401 ] && ok "不带凭据被拒" || bad "不带凭据竟然进去了" "$NOAUTH"
+WRONG=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" \
+          -H 'Authorization: Bearer not-the-one' http://localhost/status)
+[ "$WRONG" = 401 ] && ok "凭据不对被拒" || bad "凭据不对竟然进去了" "$WRONG"
+
+step "控制面（每个端点）"
+get() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost$1"; }
+post() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "${AUTH[@]}" -XPOST \
            -H 'content-type: application/json' -d "$2" "http://localhost$1"; }
 
 # **带上时间窗再打一次。**不带参数时一切正常、带上 `from_ms` 就 400，
@@ -314,11 +329,11 @@ C=$(post /dryrun '{"model":"claude-sonnet-4-5","route":"默认"}'); [ "$C" = "20
 C=$(post /clients/plan '{"client":"claude-code"}'); [ "$C" = "200" ] && ok "POST /clients/plan" || bad "POST /clients/plan 返回 $C"
 # 页面打开时补问模型清单：立刻返回开始问的那几家，不等上游回话
 C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" || bad "POST /models/refresh 返回 $C"
-C=$(curl -s --unix-socket "$SOCK" http://localhost/overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
+C=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" http://localhost/overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
 [ "$C" = "True" ] && ok "/overview 带模型获取状态" || bad "/overview 的模型状态字段不对：$C"
 C=$(get /clients/claude-code/why); [ "$C" = "200" ] && ok "GET /clients/{id}/why" || bad "返回 $C"
 
-ID=$(curl -s --unix-socket "$SOCK" "http://localhost/history?limit=1" \
+ID=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["id"] if d else 0)')
 if [ "$ID" != "0" ]; then
   C=$(get "/request/$ID"); [ "$C" = "200" ] && ok "GET /request/{id}" || bad "返回 $C"
