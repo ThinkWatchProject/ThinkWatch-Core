@@ -145,6 +145,9 @@ pub struct Finding {
     pub fix: Option<Msg>,
 }
 
+/// 只有 `ps` 那一支要：它拿到的是「跑了多久」，得从现在往回倒。Windows
+/// 那一支直接拿到创建时刻。
+#[cfg(not(windows))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -156,6 +159,7 @@ fn now_ms() -> u64 {
 ///
 /// macOS 的 `ps` 没有 `etimes`（整秒），只有这个格式；`lstart` 是本地化
 /// 日期，解析它反而更脆。
+#[cfg(not(windows))]
 fn parse_etime(s: &str) -> Option<u64> {
     let (days, rest) = match s.split_once('-') {
         Some((d, r)) => (d.trim().parse::<u64>().ok()?, r),
@@ -172,6 +176,7 @@ fn parse_etime(s: &str) -> Option<u64> {
 }
 
 /// 正在跑的进程里，匹配这些片段的那些各自启动于什么时候（毫秒时间戳）。
+#[cfg(not(windows))]
 fn running_since(markers: &[&str]) -> Vec<u64> {
     let Ok(out) = std::process::Command::new("ps")
         .args(["-Ao", "pid=,etime=,comm="])
@@ -196,7 +201,208 @@ fn running_since(markers: &[&str]) -> Vec<u64> {
         .collect()
 }
 
+/// Windows 上没有 `ps`。
+///
+/// 起 PowerShell 问 `Get-Process` 也能拿到，但那要半秒钟才出结果，而这一条
+/// 是诊断页面上的一行字 —— 直接枚举，快装接口都在 kernel32 里。
+///
+/// **打不开的进程直接跳过**：别的用户跑的、以及系统进程，`OpenProcess` 会
+/// 失败。那不是错误，只是我们看不见它 —— 而我们要找的客户端是这个用户自己
+/// 起的，本来就在能看见的那一堆里。
+#[cfg(windows)]
+fn running_since(markers: &[&str]) -> Vec<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    /// FILETIME 从 1601-01-01 起算，单位 100 纳秒。这个常数是它到 unix
+    /// 纪元之间的毫秒数。
+    const EPOCH_DELTA_MS: u64 = 11_644_473_600_000;
+
+    /// 进程的创建时刻，毫秒时间戳。
+    fn started_ms(pid: u32) -> Option<u64> {
+        // SAFETY: 只问信息，不动进程。失败返回空句柄，下面判掉了。
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            return None;
+        }
+        let mut created = FILETIME::default();
+        let (mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: 句柄有效，四个出参都是本地变量。后三个用不上，但这个
+        // 函数不接受空指针。
+        let ok = unsafe {
+            windows_sys::Win32::System::Threading::GetProcessTimes(
+                h,
+                &mut created,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        // SAFETY: 上面刚开的，只关这一次。
+        unsafe { CloseHandle(h) };
+        if ok == 0 {
+            return None;
+        }
+        let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        // 1601 年之前没有进程；真拿到个小得离谱的值也不该算出一个负的
+        // 时间戳来，所以用 checked_sub
+        (ticks / 10_000).checked_sub(EPOCH_DELTA_MS)
+    }
+
+    // SAFETY: 参数是常量，失败返回 INVALID_HANDLE_VALUE，下面判掉了。
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut e = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    // SAFETY: 句柄有效，`e.dwSize` 已经按文档填好 —— 不填这个函数会直接失败。
+    let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
+    while more {
+        let name = String::from_utf16_lossy(
+            &e.szExeFile[..e.szExeFile.iter().position(|&c| c == 0).unwrap_or(0)],
+        );
+        if markers.iter().any(|m| name.contains(m))
+            && let Some(ms) = started_ms(e.th32ProcessID)
+        {
+            out.push(ms);
+        }
+        // SAFETY: 同上。返回 0 表示枚举完了。
+        more = unsafe { Process32NextW(snap, &mut e) } != 0;
+    }
+    // SAFETY: 快照句柄，只关这一次。
+    unsafe { CloseHandle(snap) };
+    out
+}
+
+/// 查过哪些地方。**说出来**，否则「没有同名变量」这句话没人知道它有多可信。
+#[cfg(not(windows))]
+const LOOKED_IN: &str = ".zshrc, .zprofile, .bashrc and the rest";
+#[cfg(windows)]
+const LOOKED_IN: &str = "the user and machine environment in the registry";
+
+/// 一处「同名变量在别处被设过」。
+///
+/// **位置不一定是个路径**：unix 上是一个文件，Windows 上是注册表里的一个
+/// 键 —— 后者没有文件，也没有行号。做成 `PathBuf` 就得在 Windows 那一支编
+/// 一个假路径出来。
+///
+/// 它会被填进一句英文里（`{name} is already set in {at}`），所以**写英文**，
+/// 而且要是个名词短语。
+pub struct EnvConflict {
+    /// 在哪儿设的，照着这句话去找得到。
+    pub at: String,
+    /// 哪个变量。
+    pub name: String,
+    /// 怎么把它去掉。**一句照着做就行的话**，不是一条通用建议 ——
+    /// 而两个平台照着做的东西完全不同，所以由各自那一支给出来。
+    pub fix: Msg,
+}
+
+/// 别处设过同名变量的地方。
+///
+/// 这件事要紧的原因见 `diagnose` 里那一段：**环境变量会盖住我们写进配置文件的
+/// 值**，而那正是「接管了但没生效」最常见的一种。
+#[cfg(not(windows))]
+fn env_conflicts(home: &Path, names: &[&str]) -> Vec<EnvConflict> {
+    shell_exports(home, names)
+        .into_iter()
+        .map(|(f, line, name)| EnvConflict {
+            // 行号不进这里：`fix` 那条 sed 命令已经把它带上了
+            at: f.display().to_string(),
+            name,
+            // 命令给出来，执行与否是他的事
+            fix: msg!(
+                "adopt.diag.delete_line",
+                path = f.display(),
+                line = line
+                => "sed -i '' '{line}d' {path}"
+            ),
+        })
+        .collect()
+}
+
+/// Windows 上没有 shell 配置这回事。
+///
+/// 同名变量设在注册表里：`HKCU\Environment` 是这个用户的，
+/// `HKLM\…\Session Manager\Environment` 是整台机器的。**两处都要看** ——
+/// 只看用户那一处的话，一个由管理员设在机器级的变量会照样盖住我们写的值，
+/// 而诊断会说「没有同名变量」。
+///
+/// 只报名字，不报值：这些变量里可能装着别的服务的密钥，而这一条要回答的
+/// 只是「有没有」。
+#[cfg(windows)]
+fn env_conflicts(_home: &Path, names: &[&str]) -> Vec<EnvConflict> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_ANY, RegGetValueW,
+    };
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    fn is_set(root: HKEY, sub: &str, name: &str) -> bool {
+        let (sub, name) = (wide(sub), wide(name));
+        let mut len: u32 = 0;
+        // SAFETY: 两个字符串都以 NUL 结尾；缓冲区传空指针只为问「在不在」，
+        // 函数那时只回写需要的字节数。
+        let rc = unsafe {
+            RegGetValueW(
+                root,
+                sub.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_ANY,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        rc == 0
+    }
+
+    const USER: &str = "Environment";
+    const MACHINE: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    let mut out = Vec::new();
+    for n in names {
+        if is_set(HKEY_CURRENT_USER, USER, n) {
+            out.push(EnvConflict {
+                at: format!(r"HKCU\{USER}"),
+                name: (*n).to_string(),
+                // **删掉，不是设成空**：一个设成空串的变量仍然是「设过的」，
+                // 照样会盖住配置文件里的值。改完要重开终端才生效。
+                fix: msg!(
+                    "adopt.diag.unset_env", name = n, root = "HKCU", key = USER
+                    => "reg delete \"{root}\\{key}\" /v {name} /f  (open a new terminal afterwards)"
+                ),
+            });
+        }
+        if is_set(HKEY_LOCAL_MACHINE, MACHINE, n) {
+            out.push(EnvConflict {
+                at: format!(r"HKLM\{MACHINE}"),
+                name: (*n).to_string(),
+                // 机器级的那份要管理员才改得动，说出来免得他照着跑一次被拒
+                fix: msg!(
+                    "adopt.diag.unset_env_machine", name = n, root = "HKLM", key = MACHINE
+                    => "reg delete \"{root}\\{key}\" /v {name} /f  (needs an administrator terminal)"
+                ),
+            });
+        }
+    }
+    out
+}
+
 /// shell 配置里 export 了同名变量的那些行。
+#[cfg(not(windows))]
 fn shell_exports(home: &Path, names: &[&str]) -> Vec<(PathBuf, usize, String)> {
     let files = [
         ".zshrc",
@@ -371,17 +577,21 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
         }
     }
 
-    // 五、shell 里 export 了同名变量
-    let exports = shell_exports(home, c.env_vars);
+    // 五、别处设了同名的环境变量
+    let exports = env_conflicts(home, c.env_vars);
     if exports.is_empty() {
         out.push(Finding {
             level: Level::Clear,
-            title: msg!("adopt.diag.no_exports" => "No shell file exports a variable of the same name"),
-            detail: msg!("adopt.diag.no_exports.detail" => "Checked .zshrc, .zprofile, .bashrc and the rest."),
+            title: msg!("adopt.diag.no_exports" => "Nothing else sets a variable of the same name"),
+            detail: msg!(
+                "adopt.diag.no_exports.detail",
+                looked = LOOKED_IN
+                => "Looked in {looked}."
+            ),
             fix: None,
         });
     } else {
-        for (f, line, name) in exports {
+        for EnvConflict { at: f, name, fix } in exports {
             // **同一条发现，对不同客户端的结论相反。**不区分的话就会
             // 给出一条错误的诊断。
             let (level, detail) = if c.config_beats_env {
@@ -407,19 +617,12 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 level,
                 title: msg!(
                     "adopt.diag.shell_export",
-                    path = f.display(),
-                    name = name,
-                    line = line
-                    => "{path} exports {name} on line {line}"
+                    path = f,
+                    name = name
+                    => "{name} is already set in {path}"
                 ),
                 detail,
-                // 命令给出来，执行与否是他的事
-                fix: Some(msg!(
-                    "adopt.diag.delete_line",
-                    path = f.display(),
-                    line = line
-                    => "sed -i '' '{line}d' {path}"
-                )),
+                fix: Some(fix),
             });
         }
     }
@@ -465,6 +668,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn etime_parses_every_shape_ps_emits() {
         assert_eq!(parse_etime("05:12"), Some(5 * 60 + 12));
         assert_eq!(parse_etime("01:05:12"), Some(3600 + 5 * 60 + 12));
@@ -476,6 +680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn a_commented_out_export_is_not_reported() {
         // 漏掉这个判断就会天天误报，而误报几次之后真正该看的那一次
         // 也不会被看。
@@ -489,6 +694,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn a_real_export_is_reported_with_its_line_number() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -502,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_same_shell_export_is_blocking_for_codex_but_only_a_note_for_claude_code() {
         // Claude Code 的 env 块会盖住 shell 的 export，Codex 不会。
         // **同一条发现，两个相反的结论。**
@@ -552,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_fix_is_a_command_we_hand_over_not_one_we_run() {
         // 报告是我们的职责，修改是他的权利。
         let d = tempfile::tempdir().unwrap();

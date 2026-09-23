@@ -210,6 +210,8 @@ async fn asking_about_a_client_we_do_not_know_is_a_404_not_a_panic() {
 }
 
 #[tokio::test]
+// 写的是 .zshrc；Windows 上同名变量在注册表里，测试不该去改真机的注册表
+#[cfg(not(windows))]
 async fn the_diagnosis_hands_over_a_command_rather_than_running_it() {
     let b = bed();
     std::fs::write(
