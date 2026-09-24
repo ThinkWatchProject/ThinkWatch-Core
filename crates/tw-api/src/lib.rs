@@ -500,7 +500,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `/mcp/*` 和 `ClientsChanged` / `ScanAlert` 两个事件都删了，只留
 /// `POST /clients/{id}/key`；更换密钥不再同步客户端的配置（`KeyRotated` 没有
 /// `synced` / `failed` 了），删密钥也不再查它是不是写在一个接管着的客户端里。
-pub const CONTROL_API_VERSION: u32 = 19;
+///
+/// **20 加了远程控制端口**（`listen.control.remote`）。`Status` 多了
+/// `remote_control`（开没开、听在哪、为什么没听上）和 `gateway_reachable`
+/// （别的机器连网关用哪几个地址）。从远程端口进来的连接不能关 core、不能
+/// 取诊断包、不能改 `listen.control` 这一节（403，`control.remote.*`）。
+/// 照 19 写的客户端会缺这两个字段。
+pub const CONTROL_API_VERSION: u32 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -533,6 +539,36 @@ pub struct Status {
     ///
     /// 重启网关之前要看它 —— 重启会掐断所有还没结束的流。
     pub in_flight: usize,
+    /// 远程控制端口此刻的样子。
+    pub remote_control: RemoteControlView,
+    /// 别的机器连网关该用的地址（`地址:端口`），**不含回环**。
+    ///
+    /// 网关绑在一张网卡上时就是那一个；绑 `all` 时是这台机器每张网卡的地址
+    /// （每张一个，有 IPv4 用 IPv4）；只绑回环时是空的 —— 别的机器根本连不上。
+    ///
+    /// **core 不知道对方是从哪条路过来的**（NAT、端口转发、域名都看不见）。
+    /// 桌面端连远程 core 时，优先用它自己连控制面时拨的那个主机加上网关的
+    /// 端口（`gateway_addr` 里的端口）：那个主机名已经被证明从那台 Mac 上
+    /// 连得通。这里的清单是给它核对和兜底用的。
+    pub gateway_reachable: Vec<String>,
+}
+
+/// 远程控制端口（`listen.control.remote`）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RemoteControlView {
+    /// 配置里开着吗
+    pub enabled: bool,
+    /// **此刻真的在听的地址**。开着却是空的，原因在 `error`；换端口没换成时
+    /// 这里仍是旧的那个
+    pub addr: Option<String>,
+    /// 配置里的地址没能听上的原因（端口被占、网卡没有地址）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Msg>,
+    /// 放行哪些来源。本机永远放行
+    pub allow_from: Vec<String>,
+    /// 别的机器连这个端口用的地址（`地址:端口`），规则同 `Status.gateway_reachable`
+    pub reachable: Vec<String>,
 }
 
 /// 一次请求的观测事件。UI 的实时列表吃这个。
@@ -3992,6 +4028,8 @@ mod tests {
             providers: 1,
             uptime_secs: 0,
             in_flight: 3,
+            remote_control: RemoteControlView::default(),
+            gateway_reachable: vec![],
         };
         let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.gateway_addr.as_deref(), Some("127.0.0.1:8788"));
@@ -4004,7 +4042,8 @@ mod tests {
         // 而不是「gateway_addr 是空字符串」这种约定。
         let json = r#"{"api_version":1,"version":"x","pid":1,"gateway_addr":null,
                        "config_path":"/x","clients":0,"providers":0,"uptime_secs":0,
-                       "in_flight":0}"#;
+                       "in_flight":0,"gateway_reachable":[],
+                       "remote_control":{"enabled":false,"addr":null,"allow_from":[],"reachable":[]}}"#;
         let s: Status = serde_json::from_str(json).unwrap();
         assert!(s.gateway_addr.is_none());
     }

@@ -32,6 +32,7 @@ mod gate;
 pub mod keys;
 pub mod listen;
 pub mod pricing;
+pub mod remote;
 pub mod replay;
 pub mod resources;
 pub mod rotation;
@@ -65,6 +66,8 @@ pub struct ControlState {
     pub zai: Arc<zai::Accounts>,
     /// 请网关退出的那个开关。控制面上的 `POST /shutdown` 扳它，主循环等它。
     pub shutdown: Shutdown,
+    /// 远程控制端口此刻在听哪儿、谁被晾着。
+    pub remote: Arc<remote::Remote>,
 }
 
 impl ControlState {
@@ -160,6 +163,10 @@ async fn interfaces() -> Json<Vec<tw_api::NicView>> {
 /// 理由见 [`shutdown`] 那个模块：Windows 上没有 SIGTERM，而桌面端要在改完
 /// 配置之后重启 core、在装更新之前停掉它并且等它真的退出。
 async fn ask_shutdown(State(s): State<ControlState>) -> (StatusCode, Json<Msg>) {
+    // 服务器上 core 归 systemd 管：从远程关掉它，就只能去服务器上重新拉起
+    if remote::is_remote() {
+        return remote::refused(remote::Refused::Shutdown);
+    }
     tracing::info!("asked to shut down over the control plane");
     // **先把话说完再退。**立刻扳开关的话，这条响应可能还没写出去进程就没了，
     // 而客户端看到的是连接被重置 —— 和「core 崩了」长得一模一样，偏偏这是
@@ -178,6 +185,19 @@ async fn ask_shutdown(State(s): State<ControlState>) -> (StatusCode, Json<Msg>) 
 async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
     let cfg = s.config();
     let listening = s.gateway.listening();
+    let rl = s.remote.listening();
+    let gateway_reachable = listening
+        .primary()
+        .map(remote::reachable)
+        .unwrap_or_default();
+    let rcfg = cfg.listen.control.remote.as_ref();
+    let remote_control = tw_api::RemoteControlView {
+        enabled: rcfg.is_some_and(|r| r.enabled),
+        addr: rl.addr.map(|a| a.to_string()),
+        error: rl.error,
+        allow_from: rcfg.map(|r| r.allow_from.clone()).unwrap_or_default(),
+        reachable: rl.addr.map(remote::reachable).unwrap_or_default(),
+    };
     Json(tw_api::Status {
         api_version: tw_api::CONTROL_API_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -192,6 +212,8 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
         providers: cfg.providers.len(),
         uptime_secs: s.started.elapsed().as_secs(),
         in_flight: s.gateway.live.count(),
+        remote_control,
+        gateway_reachable,
     })
 }
 
@@ -1249,7 +1271,7 @@ pub(crate) fn apply_fail(e: ApplyError) -> Fail {
         }
         ApplyError::Edit(EditError::NotFound { .. }) => StatusCode::NOT_FOUND,
         // 不是请求写错了，是这条路上不许改
-        ApplyError::ControlKeyLocked => StatusCode::FORBIDDEN,
+        ApplyError::ControlKeyLocked | ApplyError::RemoteControlLocked => StatusCode::FORBIDDEN,
         ApplyError::Rejected(_)
         | ApplyError::Build(_)
         | ApplyError::BadPath(_)
@@ -1429,10 +1451,14 @@ pub fn socket_path_fits(path: &Path) -> Result<(), ControlError> {
 /// **每条连接先握手**（见 `gate`），握上了才交给 HTTP。门装在这一层，不装进
 /// `router()`：`router()` 是路由表本身，十几个集成测试直接拿它跑处理函数，
 /// 它们测的不是门。
+///
+/// 远程控制端口（`listen.control.remote`）在这里一并跟起来。**它是另开的**：
+/// 绑不上、写错了都不影响本机的通道，原因记在 `Status.remote_control`。
 pub async fn serve(state: ControlState, at: &tw_api::control::Address) -> Result<(), ControlError> {
     use tw_api::control::Address;
     let gate = gate::Gate::new(&state);
-    let app = router(state);
+    let app = router(state.clone());
+    tokio::spawn(remote::follow(state, app.clone(), gate.clone()));
     match at {
         #[cfg(unix)]
         Address::Socket(path) => serve_socket(app, gate, path).await,
@@ -1468,7 +1494,7 @@ async fn serve_socket(app: Router, gate: gate::Gate, path: &Path) -> Result<(), 
     tracing::info!(path = %path.display(), "the control plane is listening");
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone()),
+            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone(), None),
             Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
         }
     }
@@ -1513,7 +1539,7 @@ async fn serve_loopback(
     tracing::info!(port, "the control plane is listening on loopback");
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone()),
+            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone(), None),
             Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
         }
     }
@@ -1523,36 +1549,79 @@ async fn serve_loopback(
 ///
 /// **每种传输共用**：它们的差别只在怎么拿到这个流，拿到之后的每一件事
 /// （握手、协议协商、错误怎么记）都该一模一样 —— 写两遍就是两遍会漂。
-/// 远程端口接进来的连接也走这里。
-fn hand_off<S>(stream: S, app: Router, gate: gate::Gate)
+/// 远程端口接进来的连接也走这里，多带一个 [`RemoteConn`]。
+fn hand_off<S>(stream: S, app: Router, gate: gate::Gate, remote: Option<RemoteConn>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
-        let Some(link) = gate.admit(stream).await else {
-            return;
+        let link = match gate.admit(stream).await {
+            Ok(l) => l,
+            Err(e) => {
+                // 远程来源的失败要记账（节流）。版本不一致不算：钥匙是对的
+                if let Some(r) = remote
+                    && !matches!(e, tw_link::LinkError::VersionMismatch { .. })
+                {
+                    (r.on_failure)();
+                }
+                return;
+            }
         };
         let io = hyper_util::rt::TokioIo::new(link.stream);
         let svc = hyper::service::service_fn(move |req| {
             use tower::ServiceExt;
             app.clone().oneshot(req)
         });
-        let builder =
-            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-        let conn = builder.serve_connection(io, svc);
-        tokio::select! {
-            r = conn => {
-                if let Err(e) = r {
-                    tracing::debug!("a control-plane connection ended: {e}");
+        let Some(mut r) = remote else {
+            let builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let conn = builder.serve_connection(io, svc);
+            tokio::select! {
+                r = conn => {
+                    if let Err(e) = r {
+                        tracing::debug!("a control-plane connection ended: {e}");
+                    }
+                }
+                // 钥匙换了：用旧钥匙进来的这一条断开（理由见 `gate`）。连接直接丢掉，
+                // 事件流也跟着断，对面重连时按新钥匙握手
+                _ = gate.key_changed_from(&link.key) => {
+                    tracing::info!("the control key changed; closing a connection made with the previous one");
                 }
             }
-            // 钥匙换了：用旧钥匙进来的这一条断开（理由见 `gate`）。连接直接丢掉，
-            // 事件流也跟着断，对面重连时按新钥匙握手
-            _ = gate.key_changed_from(&link.key) => {
-                tracing::info!("the control key changed; closing a connection made with the previous one");
+            return;
+        };
+        // 远程连接**只说 HTTP/1.1**：请求在这条连接自己的任务里处理，「这是远程」
+        // 的标记（`remote::is_remote`）一路都在。HTTP/2 会把每个请求派到别的任务上，
+        // 标记就丢了 —— 丢了的样子是远程连接能关掉 core
+        let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+        remote::as_remote(async {
+            tokio::select! {
+                r = conn => {
+                    if let Err(e) = r {
+                        tracing::debug!("a remote control connection ended: {e}");
+                    }
+                }
+                _ = gate.key_changed_from(&link.key) => {
+                    tracing::info!("the control key changed; closing a remote connection made with the previous one");
+                }
+                // 远程端口关了或换了地址：从它进来的一起断开
+                _ = r.closed.changed() => {
+                    tracing::info!("the remote control port closed; closing a connection made through it");
+                }
             }
-        }
+        })
+        .await;
     });
+}
+
+/// 从远程端口进来的一条连接多带的东西。
+pub(crate) struct RemoteConn {
+    /// 握手没成：记一笔（节流）
+    pub(crate) on_failure: Box<dyn FnOnce() + Send>,
+    /// 远程端口停了，这条也断
+    pub(crate) closed: tokio::sync::watch::Receiver<()>,
+    /// 占着一个并发名额，连接结束时还回去
+    pub(crate) _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// 在起任何东西之前问一句：这个地址听得起来吗。

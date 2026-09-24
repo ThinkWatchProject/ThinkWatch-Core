@@ -44,6 +44,7 @@ pub fn generate_initial() -> Config {
         listen: Listen {
             control: ControlListen {
                 key: Some(generate_control_key().to_hex()),
+                remote: None,
             },
             ..Default::default()
         },
