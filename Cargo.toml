@@ -1,19 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    # ── 第一层 · 共用（企业版依赖，含传递依赖）──────────
-    # 企业版直接用：tw-types、tw-upstream、tw-wire、tw-crypto、
-    # tw-dialect、tw-guard、tw-breaker；tw-secret 经 tw-guard 带进去。
-    # 改这一层要 grep 企业版。
-    "crates/tw-types",
-    "crates/tw-upstream",
-    "crates/tw-wire",
-    "crates/tw-crypto",
+    # ── 第一层 · 共用（企业版依赖的只有这三个）──────────
+    # 只准依赖彼此和第三方 crate，不准依赖第二层 —— tw-dialect 里的
+    # layer_one_depends_only_on_itself 测试守着这条。改这一层要 grep 企业版；
+    # CI 的 enterprise 任务会拿企业版对着这次改动编译一遍。
+    # **只有一方在用的「共用件」搬回那一方**，不留在这里。
     "crates/tw-dialect",
     "crates/tw-guard",
-    "crates/tw-secret",
     "crates/tw-breaker",
     # ── 第二层 · 桌面网关（企业版不依赖）────────────────
+    "crates/tw-types",
+    "crates/tw-secret",
     "crates/tw-api",
     "crates/tw-config",
     "crates/tw-yaml",
@@ -44,9 +42,6 @@ version = "0.41.0"
 [workspace.dependencies]
 # ── 内部 crate ───────────────────────────────────────────
 tw-types    = { path = "crates/tw-types" }
-tw-upstream = { path = "crates/tw-upstream" }
-tw-wire     = { path = "crates/tw-wire" }
-tw-crypto   = { path = "crates/tw-crypto" }
 tw-api      = { path = "crates/tw-api" }
 tw-secret   = { path = "crates/tw-secret" }
 tw-config   = { path = "crates/tw-config" }
@@ -125,16 +120,7 @@ sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 
-# 与企业版一样：加密相关一律精确锁定，防止 cargo update 悄悄换掉验证默认值
-aes-gcm = "=0.10.3"
-
 clap = { version = "4", features = ["derive"] }
-# ── Bedrock：SigV4 签名与 eventstream 拆帧（tw-upstream 的 bedrock feature）──
-aws-sigv4 = "1"
-aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
-aws-smithy-eventstream = "0.60"
-aws-smithy-types = "1"
-
 
 [profile.release]
 # 桌面 sidecar：体积比极限吞吐重要。企业版用 lto = true + codegen-units = 1，

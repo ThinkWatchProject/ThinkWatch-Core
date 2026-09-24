@@ -36,10 +36,16 @@ pub fn stop_reason_str(s: &StopReason) -> Value {
 
 pub fn usage(u: &Value) -> Usage {
     let n = |k: &str| u64_of(u, k).unwrap_or(0);
+    // 1 小时缓存写。细分在 `cache_creation` 里；有它就整笔按 1 小时算
+    let one_hour = u
+        .get("cache_creation")
+        .and_then(|d| u64_of(d, "ephemeral_1h_input_tokens"))
+        .unwrap_or(0);
     Usage {
         input: n("input_tokens"),
         cache_read: n("cache_read_input_tokens"),
-        cache_write: n("cache_creation_input_tokens"),
+        cache_write: n("cache_creation_input_tokens").max(one_hour),
+        cache_1h: one_hour > 0,
         output: n("output_tokens"),
         reasoning: u
             .get("output_tokens_details")
@@ -49,12 +55,19 @@ pub fn usage(u: &Value) -> Usage {
 }
 
 pub fn usage_json(u: &Usage) -> Value {
-    json!({
+    let mut v = json!({
         "input_tokens": u.input,
         "output_tokens": u.output,
         "cache_read_input_tokens": u.cache_read,
         "cache_creation_input_tokens": u.cache_write,
-    })
+    });
+    if u.cache_1h {
+        v["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": u.cache_write,
+        });
+    }
+    v
 }
 
 /// 上游 Anthropic 的整包响应 → 中间表示。
@@ -178,6 +191,22 @@ pub fn error_message(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_one_hour_cache_tier_survives_a_round_trip() {
+        let u = usage(
+            &json!({"input_tokens": 10, "cache_creation_input_tokens": 2000,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 2000}}),
+        );
+        assert!(u.cache_1h);
+        assert_eq!(u.cache_write, 2000);
+        assert_eq!(usage(&usage_json(&u)), u);
+        // 5 分钟档不算
+        let u = usage(&json!({"cache_creation_input_tokens": 2000,
+            "cache_creation": {"ephemeral_5m_input_tokens": 2000, "ephemeral_1h_input_tokens": 0}}));
+        assert!(!u.cache_1h);
+        assert!(usage_json(&u).get("cache_creation").is_none());
+    }
     use crate::convert::Session;
 
     #[test]

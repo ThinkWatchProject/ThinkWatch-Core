@@ -428,17 +428,27 @@ pub enum StopReason {
 
 /// 用量。**`input` 不含缓存读写**，和 Anthropic 的语义一致：三者不重叠，
 /// 加起来才是全部输入。`output` 含推理。
+///
+/// 方言转换和计费读的是同一个：各家响应里的 `usage` 由各自模块的 `usage()` 解析，
+/// 旁路嗅探（[`crate::usage::Sniffer`]）也调它们，每条换算只写一处。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**，
+    /// 而上游只在 Anthropic 那边给这个细分
+    pub cache_1h: bool,
     pub output: u64,
     /// `output` 里有多少是推理
     pub reasoning: u64,
 }
 
 impl Usage {
+    pub fn is_empty(&self) -> bool {
+        *self == Usage::default()
+    }
+
     pub fn prompt_total(&self) -> u64 {
         self.input + self.cache_read + self.cache_write
     }
@@ -449,6 +459,7 @@ impl Usage {
         self.input = self.input.max(other.input);
         self.cache_read = self.cache_read.max(other.cache_read);
         self.cache_write = self.cache_write.max(other.cache_write);
+        self.cache_1h |= other.cache_1h;
         self.output = self.output.max(other.output);
         self.reasoning = self.reasoning.max(other.reasoning);
     }

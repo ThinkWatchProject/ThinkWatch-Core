@@ -6,7 +6,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-pub use tw_types::PRIVATE_RANGES;
+pub use tw_config::PRIVATE_RANGES;
 
 /// 一条 CIDR。自己解析而不是引一个 crate —— 这里只需要「一个 IP 在不在
 /// 这个段里」，而多一个依赖就多一份要跟着升级的东西。

@@ -21,7 +21,6 @@ tw-guard = { workspace = true }
 bytes = { workspace = true }
 tw-engine = { workspace = true }
 tw-gateway = { workspace = true }
-tw-wire = { workspace = true }
 tw-observe = { workspace = true }
 tw-secret = { workspace = true }
 tw-store = { workspace = true }
