@@ -414,7 +414,8 @@ pub struct TurnRow {
     pub cache_read_tokens: Option<i64>,
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub error: Option<String>,
+    /// 失败的原因，带着码
+    pub error: Option<Msg>,
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号**
     pub cost_estimated: bool,
@@ -493,7 +494,7 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
                     cache_read_tokens, cost_micros, duration_ms, error, cancelled,
-                    cost_estimated, billing
+                    cost_estimated, billing, error_code, error_args
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -507,7 +508,7 @@ impl Db {
                 cache_read_tokens: r.get(6)?,
                 cost_micros: r.get(7)?,
                 duration_ms: r.get(8)?,
-                error: r.get(9)?,
+                error: error_from(r)?,
                 cancelled: r.get::<_, i64>(10)? != 0,
                 cost_estimated: r.get::<_, i64>(11)? != 0,
                 billing: slug_col(r, 12, tw_api::Billing::from_slug)?,

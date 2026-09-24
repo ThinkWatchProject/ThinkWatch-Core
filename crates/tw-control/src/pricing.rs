@@ -167,7 +167,7 @@ impl Default for Schedule {
 #[derive(Debug, Clone, Default)]
 struct Attempt {
     at_ms: Option<u64>,
-    error: Option<String>,
+    error: Option<Msg>,
 }
 
 /// 刷新默认价目表没成。
@@ -247,7 +247,7 @@ impl Updater {
     fn record(&self, r: &Result<usize, RefreshError>, at: SystemTime) {
         if let Ok(mut last) = self.last.lock() {
             last.at_ms = Some(millis(at));
-            last.error = r.as_ref().err().map(ToString::to_string);
+            last.error = r.as_ref().err().map(RefreshError::msg);
         }
     }
 

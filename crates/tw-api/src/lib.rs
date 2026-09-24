@@ -479,7 +479,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 状态、配置来源、试算的结论和明细……）；换了类型的原因：`CredentialRotated` /
 /// `CredentialExpired` 的 `detail`、`OAuthView.failure`、三处登录的 `error`、
 /// `ConfigRejected.message`、`RuleTrace.error`。照 14 写的界面会把这些画成一个对象。
-pub const CONTROL_API_VERSION: u32 = 15;
+///
+/// **16 把最后几处原因也换成了 [`Msg`]**：`KeySyncFailed.error`、`PricingStatus.error`、
+/// `TurnView.error`。照 15 写的界面会把它们画成一个对象。
+pub const CONTROL_API_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1600,7 +1603,7 @@ pub struct KeySynced {
 pub struct KeySyncFailed {
     pub client: String,
     pub name: String,
-    pub error: String,
+    pub error: Msg,
 }
 
 /// 保存监听设置（`PUT /listen`）。
@@ -1897,7 +1900,7 @@ pub struct PricingStatus {
     pub checked_at_ms: Option<u64>,
     /// 最近一次刷新失败的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
     /// 最近 7 天里**无法计价**的请求数。
     ///
     /// 用户不会主动想起要配价格，只有「有 37 次请求无法计价」这种具体
@@ -3153,7 +3156,7 @@ pub struct TurnView {
     /// **没有价格就是 None，不是 0**
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub error: Option<String>,
+    pub error: Option<Msg>,
     /// 客户端没等到这一轮结束就走了（见 `HistoryRow::cancelled`）
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号** —— 以前这里没有这个字段，

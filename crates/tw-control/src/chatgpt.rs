@@ -948,11 +948,13 @@ async fn send(
     }
     req.send().await.map_err(|e| {
         let why = tw_gateway::forward::map_reqwest_error(e);
+        // 连不上的那句数据面自己带码，这里只补上「连的是 ChatGPT 后端」
         fail(
             StatusCode::BAD_GATEWAY,
-            msg!(
-                "control.chatgpt_backend_unreachable", detail = why.message() =>
-                "The ChatGPT backend could not be reached: {detail}"
+            why.detail.in_context(
+                "backend",
+                "chatgpt",
+                "The ChatGPT backend could not be reached",
             ),
         )
     })
