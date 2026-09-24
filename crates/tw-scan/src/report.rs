@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use tw_adopt::json::Val;
 use tw_types::{Msg, msg};
 
-use crate::hidden;
 use crate::sources::{self, Source};
+use tw_guard::hidden;
 use tw_guard::tools::rules::Rules;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -301,10 +301,11 @@ pub fn scan(sources: &[Source], rules: &Rules) -> Report {
 
         // 一、藏起来的东西。**每一份都扫**，配置文件也不例外
         for h in hidden::scan(&text) {
-            let level = match h.kind {
-                // 标签字符和双向控制符在指令文件里没有任何正当用途
-                hidden::Kind::Tag | hidden::Kind::Bidi => Level::High,
-                _ => Level::Medium,
+            // 标签字符和双向控制符在任何文本里都没有正当用途
+            let level = if h.kind.smuggles() {
+                Level::High
+            } else {
+                Level::Medium
             };
             r.findings.push(Finding {
                 level,

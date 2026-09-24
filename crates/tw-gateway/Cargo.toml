@@ -10,6 +10,7 @@ description = "Data-plane HTTP server"
 [dependencies]
 tw-api = { workspace = true }
 tw-config = { workspace = true }
+tw-breaker = { workspace = true }
 tw-engine = { workspace = true }
 tw-observe = { workspace = true }
 tw-secret = { workspace = true }

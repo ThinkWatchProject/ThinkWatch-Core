@@ -38,6 +38,15 @@ impl Kind {
             Kind::PrivateUse => "private_use",
         }
     }
+    /// 在**任何**正文里都没有正当用途的两种：标签字符和双向覆盖。
+    ///
+    /// 其余几种只在指令文件里可疑：对话正文里零宽连接符组成表情（👨‍👩‍👧），
+    /// 波斯文要零宽不连字，俄文就是西里尔字母。扫用户消息、工具结果这类
+    /// 正文时只看这两种；扫配置文件时它们是最高那一档。
+    pub fn smuggles(&self) -> bool {
+        matches!(self, Kind::Tag | Kind::Bidi)
+    }
+
     /// 一句给人看的话。**说清「它能干什么」，不是「它是什么」** ——
     /// 「U+200B ZWSP」对绝大多数人不构成信息。
     pub fn why(&self) -> &'static str {
@@ -250,6 +259,17 @@ pub fn scan(text: &str) -> Vec<Hit> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_tags_and_bidi_overrides_smuggle() {
+        // 表情里的零宽连接符、俄文的西里尔字母在对话里是正常的
+        let smuggles = |s: &str| scan(s).iter().any(|h| h.kind.smuggles());
+        assert!(smuggles("hi\u{E0049}\u{E0067}"), "标签字符");
+        assert!(smuggles("abc\u{202E}fed"), "双向覆盖");
+        assert!(!smuggles("👨\u{200D}👩\u{200D}👧"), "表情");
+        assert!(!smuggles("Привет, как дела?"), "俄文");
+        assert!(!smuggles("مرحبا"), "阿拉伯文本身不带覆盖符");
+    }
+
     use super::*;
 
     #[test]

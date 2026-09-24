@@ -1,5 +1,8 @@
 //! 上游健康与熔断。
 //!
+//! 状态机是共用的（`tw-breaker`，企业版的路由和 MCP 熔断跑的是同一个），
+//! 这里是桌面版的**规矩**：
+//!
 //! **只有两个旋钮**：连续失败阈值和冷却时长。cc-switch
 //! 那套有五个，其中「错误率 + 最小请求数」这条路径在单用户场景下几乎永远
 //! 打不满 —— 要先攒够十几个请求才生效，而那时用户早就自己发现了。
@@ -12,9 +15,10 @@
 //! 2. **只有一个候选时完全旁路熔断器。**否则唯一的上游一旦被自己熔断，
 //!    就把用户锁死了，熔断纯粹是自伤。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+pub use tw_breaker::State;
+use tw_breaker::{Breakers, Policy, Trip};
 
 /// 连续失败多少次算坏。
 pub const FAILURE_THRESHOLD: u32 = 3;
@@ -22,54 +26,52 @@ pub const FAILURE_THRESHOLD: u32 = 3;
 /// 熔断之后多久放一个探测过去。
 pub const COOLDOWN: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Closed,
-    /// 熔断中。到点之后第一个请求会被放过去探路（半开）
-    Open,
-}
-
-#[derive(Debug, Default)]
-struct Entry {
-    consecutive_failures: u32,
-    opened_at: Option<Instant>,
-}
-
-/// 这一条现在算什么状态。**时间也是输入** —— 冷却到点就自动算合上，
-/// 下一个请求自然成为探测。
-fn effective(e: &Entry) -> State {
-    match e.opened_at {
-        Some(t) if t.elapsed() < COOLDOWN => State::Open,
-        _ => State::Closed,
-    }
-}
+/// 桌面版的规矩：连续失败 3 次打开，冷却 60 秒，一次成功就闭合。
+pub const POLICY: Policy = Policy {
+    trip: Trip::Consecutive(FAILURE_THRESHOLD),
+    cooldown: COOLDOWN,
+    probes: 1,
+};
 
 /// 每个 provider 的健康状态。
 ///
 /// **不持久化**。桌面应用重启频繁，把「这家挂了」的判断带过重启
 /// 意味着用户重启后第一个请求还在被上一次的故障惩罚 —— 而重启本身往往
 /// 就是他为了解决问题做的事。
-#[derive(Default)]
 pub struct Health {
-    inner: Mutex<HashMap<String, Entry>>,
+    breakers: Breakers<String>,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Health {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            breakers: Breakers::new(POLICY),
+        }
     }
 
-    /// 这家现在能进候选链吗。
+    #[cfg(test)]
+    fn with_clock(clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        Self {
+            breakers: Breakers::with_clock(POLICY, clock),
+        }
+    }
+
+    /// 这家现在能进候选链吗。冷却到点的算半开，放行。
     ///
-    /// **和「能不能收一个探测请求」是两件事**，所以是两个方法。合成一个
-    /// 的话，光是排候选顺序就会把半开状态的唯一探测机会用掉。
+    /// **和「能不能收一个探测请求」是两件事**：只看不改，光是排候选顺序
+    /// 不该把半开状态的探测机会用掉。
     pub fn is_available(&self, name: &str) -> bool {
-        self.state(name) == State::Closed
+        self.breakers.admits(&name.to_string())
     }
 
     pub fn state(&self, name: &str) -> State {
-        let g = self.inner.lock().unwrap();
-        g.get(name).map_or(State::Closed, effective)
+        self.breakers.state(&name.to_string())
     }
 
     /// 记一次成功。**返回的是状态变化，没变就是 `None`。**
@@ -77,42 +79,19 @@ impl Health {
     /// 调用方要拿它去发事件：熔断开合是界面上看得见的状态，而看得见的
     /// 状态必须能被推出去 —— 否则界面只能轮询。
     pub fn record_success(&self, name: &str) -> Option<State> {
-        let mut g = self.inner.lock().unwrap();
-        let e = g.entry(name.to_string()).or_default();
-        let before = effective(e);
-        e.consecutive_failures = 0;
-        e.opened_at = None;
-        (before != State::Closed).then_some(State::Closed)
+        self.breakers.record(&name.to_string(), true)
     }
 
     /// 记一次失败，同样返回状态变化。
-    ///
-    /// 冷却到点之后那次探测又失败时，这里会再报一次 `Open` —— **那不是
-    /// 重复**：中间确实经过了一段「可以再试」的时间，而它又被关上了。
     pub fn record_failure(&self, name: &str) -> Option<State> {
-        let mut g = self.inner.lock().unwrap();
-        let e = g.entry(name.to_string()).or_default();
-        let before = effective(e);
-        e.consecutive_failures += 1;
-        if e.consecutive_failures >= FAILURE_THRESHOLD {
-            e.opened_at = Some(Instant::now());
-        }
-        let after = effective(e);
-        (before != after).then_some(after)
+        self.breakers.record(&name.to_string(), false)
     }
 
-    /// 这家还要等多久才轮到探测。
+    /// 这家还要等多久才轮到探测。见 [`tw_breaker::Breaker::cooldown_left`]。
     ///
-    /// `None` = 根本不在熔断态（成功过，或者从来没熔断过）。
-    /// `Some(0)` = 冷却走完了，下一个请求就是那次探测。
-    ///
-    /// **专门给「报一条恢复」的定时器用。**它必须能分清「到点了」和
-    /// 「中途又失败、冷却被顶到更晚了」—— 后者返回的是新的剩余时间，
-    /// 定时器据此接着等，而不是现在就宣布恢复。
+    /// **专门给「报一条恢复」的定时器用。**
     pub fn cooldown_left(&self, name: &str) -> Option<Duration> {
-        let g = self.inner.lock().unwrap();
-        let t = g.get(name)?.opened_at?;
-        Some(COOLDOWN.saturating_sub(t.elapsed()))
+        self.breakers.cooldown_left(&name.to_string())
     }
 
     /// 从候选里挑出还能用的，**并说明是不是 fail-open**。
@@ -283,5 +262,25 @@ mod tests {
         }
         assert!(!h.is_available("a"));
         assert!(h.is_available("b"));
+    }
+
+    #[test]
+    fn after_the_cooldown_the_next_request_is_a_probe() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let now = std::sync::Arc::new(AtomicI64::new(0));
+        let h = Health::with_clock({
+            let now = now.clone();
+            std::sync::Arc::new(move || now.load(Ordering::SeqCst))
+        });
+        for _ in 0..3 {
+            h.record_failure("a");
+        }
+        assert!(!h.is_available("a"));
+        now.store(COOLDOWN.as_millis() as i64, Ordering::SeqCst);
+        assert!(h.is_available("a"), "冷却到点就放一个过去");
+        assert_eq!(h.cooldown_left("a"), Some(Duration::ZERO));
+        // 探测又失败：再报一次打开
+        assert_eq!(h.record_failure("a"), Some(State::Open));
+        assert!(!h.is_available("a"));
     }
 }

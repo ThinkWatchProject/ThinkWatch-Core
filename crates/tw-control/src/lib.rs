@@ -468,7 +468,8 @@ fn provider_view(
         model_count: s.gateway.catalog.load().count_for(&p.name),
         disabled: p.disabled,
         health: match s.health().state(&p.name) {
-            tw_gateway::health::State::Closed => "ok".into(),
+            // 冷却到点的半开照常放行，界面上和闭合一样是「正常」
+            tw_gateway::health::State::Closed | tw_gateway::health::State::HalfOpen => "ok".into(),
             tw_gateway::health::State::Open => "open".into(),
         },
         auth_rejected: s.gateway.auth_rejected(&p.name),
