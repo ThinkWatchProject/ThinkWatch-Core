@@ -272,7 +272,7 @@ pub struct ControlListen {
 /// remote:
 ///   enabled: true
 ///   bind: all               # 和网关同样的写法：loopback / all / 网卡名 / 地址
-///   port: 41327             # 写进配置时随机生成
+///   port: 23483             # 写进配置时随机生成
 ///   allow_from: [192.168.1.0/24]
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
