@@ -89,7 +89,7 @@ clean the diff is:
   protections.** Replay came close to being a legitimate way around
   redaction.
 - **One door into the control plane.** Every transport (unix socket,
-  Windows loopback port, and the remote port to come) hands its
+  Windows loopback port, and the remote control port) hands its
   connections to the same handshake before HTTP. The control key never
   leaves through the control plane and cannot be changed through it.
 
