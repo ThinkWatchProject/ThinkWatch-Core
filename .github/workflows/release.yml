@@ -252,15 +252,42 @@ jobs:
           fi
           "$BIN" --help > /dev/null
 
+      # **两种形态。**裸二进制给桌面版的流水线和 `twcore upgrade`（它们只要
+      # 那一个文件）；压缩包给服务器上的首次安装（`scripts/install.sh`）：
+      # 里面还有 systemd unit，装的 unit 和装的二进制出自同一个 commit。
+      # 压缩包还保住了可执行位 —— 裸文件下载下来是 0644。
       - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/twcore dist/twcore-${{ matrix.target }}
+          # 压缩包里的目录和裸二进制同名，所以在 dist 外面搭
+          STAGE="$RUNNER_TEMP/stage/twcore-$TARGET"
+          mkdir -p dist "$STAGE"
+          cp "target/$TARGET/release/twcore" "dist/twcore-$TARGET"
+          install -m 0755 "target/$TARGET/release/twcore" "$STAGE/twcore"
+          install -m 0644 packaging/systemd/twcore.service LICENSE "$STAGE/"
+          tar -czf "dist/twcore-$TARGET.tar.gz" --owner=0 --group=0 -C "$RUNNER_TEMP/stage" "twcore-$TARGET"
           cd dist
           # 和另外两个平台同一种校验文件：`<sha>  <文件名>`
-          sha256sum twcore-${{ matrix.target }} > twcore-${{ matrix.target }}.sha256
-          cat twcore-${{ matrix.target }}.sha256
+          sha256sum "twcore-$TARGET" > "twcore-$TARGET.sha256"
+          sha256sum "twcore-$TARGET.tar.gz" > "twcore-$TARGET.tar.gz.sha256"
+          cat ./*.sha256
+          tar -tzvf "twcore-$TARGET.tar.gz"
+
+      # 装脚本认的就是这个布局，这里照着它的步骤解一遍、跑一遍 —— 布局改了
+      # 而脚本没跟上，在这里就挂，而不是在用户的服务器上。
+      - name: The archive is what install.sh expects
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          T=$(mktemp -d)
+          (cd dist && sha256sum -c "twcore-$TARGET.tar.gz.sha256")
+          tar -xzf "dist/twcore-$TARGET.tar.gz" -C "$T"
+          test -x "$T/twcore-$TARGET/twcore"
+          test -f "$T/twcore-$TARGET/twcore.service"
+          "$T/twcore-$TARGET/twcore" --version
 
       - uses: softprops/action-gh-release@v2
         # 排练不发布。
@@ -269,4 +296,6 @@ jobs:
           files: |
             dist/twcore-${{ matrix.target }}
             dist/twcore-${{ matrix.target }}.sha256
+            dist/twcore-${{ matrix.target }}.tar.gz
+            dist/twcore-${{ matrix.target }}.tar.gz.sha256
           generate_release_notes: true

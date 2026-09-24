@@ -2816,13 +2816,18 @@ name = "twcore"
 version = "0.46.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
