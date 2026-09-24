@@ -17,8 +17,12 @@ use tw_link::LinkError;
 const KEY: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
 
 fn yaml(port: u16, enabled: bool, allow: &str) -> String {
+    yaml_at("loopback", port, enabled, allow)
+}
+
+fn yaml_at(bind: &str, port: u16, enabled: bool, allow: &str) -> String {
     format!(
-        "version: 1\nlisten:\n  control:\n    key: {KEY}\n    remote:\n      enabled: {enabled}\n      bind: loopback\n      port: {port}\n      allow_from: {allow}\nclients:\n  - name: default\n    key: tw-aaaa\n"
+        "version: 1\nlisten:\n  control:\n    key: {KEY}\n    remote:\n      enabled: {enabled}\n      bind: {bind}\n      port: {port}\n      allow_from: {allow}\nclients:\n  - name: default\n    key: tw-aaaa\n"
     )
 }
 
@@ -411,4 +415,69 @@ async fn a_port_that_cannot_be_bound_at_start_does_not_take_the_local_channel_do
     assert_eq!(v["remote_control"]["enabled"], true);
     assert_eq!(v["remote_control"]["addr"], serde_json::Value::Null);
     drop(taken);
+}
+
+/// 名单收窄：已经连着、现在不再放行的来源**当场**断开，不等它重连。名单改了
+/// 却仍放行它的，连接照常。
+#[tokio::test]
+async fn narrowing_allow_from_closes_the_connections_it_no_longer_lets_in() {
+    let port = free_port();
+    let b = bed(yaml(port, true, "[127.0.0.1]")).await;
+    let addr = b.until(|l| l.addr.is_some()).await.addr.unwrap();
+    let (mut s, conn) = open_tcp(addr, KEY).await.unwrap();
+    assert_eq!(
+        send(&mut s, "GET", "/status", serde_json::Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // 换成一份仍然放行它的名单：连接不动
+    b.rewrite(&yaml(port, true, "[127.0.0.0/8]")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!conn.is_finished(), "名单仍放行它，连接不该断");
+    assert_eq!(
+        send(&mut s, "GET", "/status", serde_json::Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // 把它划出去：当场断开
+    b.rewrite(&yaml(port, true, "[10.0.0.0/8]")).await;
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("名单不再放行，已经连着的也该断开")
+        .unwrap();
+    // 端口本身还开着（没换地址），只是它进不来了
+    assert_eq!(b.state.remote.listening().addr, Some(addr));
+    assert!(matches!(open_tcp(addr, KEY).await, Err(LinkError::Closed)));
+}
+
+/// 同一个端口从 `all` 换到一个具体地址、再换回来：地址有重叠，先绑新的会撞上
+/// 旧的自己。要能当场换过去，不报错。
+#[tokio::test]
+async fn the_same_port_moves_between_all_and_a_specific_address_live() {
+    let port = free_port();
+    let b = bed(yaml_at("all", port, true, "[127.0.0.1]")).await;
+    let l = b.until(|l| l.addr.is_some()).await;
+    assert!(l.addr.unwrap().ip().is_unspecified(), "{l:?}");
+    let local: SocketAddr = ([127, 0, 0, 1], port).into();
+    assert!(open_tcp(local, KEY).await.is_ok());
+
+    b.rewrite(&yaml_at("127.0.0.1", port, true, "[127.0.0.1]"))
+        .await;
+    let l = b
+        .until(|l| l.addr.is_some_and(|a| a.ip().is_loopback()) || l.error.is_some())
+        .await;
+    assert_eq!(l.error, None, "同一个端口换地址不该失败");
+    assert_eq!(l.addr, Some(local));
+    assert!(open_tcp(local, KEY).await.is_ok());
+
+    b.rewrite(&yaml_at("all", port, true, "[127.0.0.1]")).await;
+    let l = b
+        .until(|l| l.addr.is_some_and(|a| a.ip().is_unspecified()) || l.error.is_some())
+        .await;
+    assert_eq!(l.error, None, "换回 all 也不该失败");
+    assert!(open_tcp(local, KEY).await.is_ok());
 }

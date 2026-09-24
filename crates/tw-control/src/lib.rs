@@ -1608,6 +1608,10 @@ where
                 _ = r.closed.changed() => {
                     tracing::info!("the remote control port closed; closing a connection made through it");
                 }
+                // 名单改了、把这个来源划出去了：现在就断，不等它重连
+                _ = &mut r.revoked => {
+                    tracing::info!("allow_from no longer lets this source in; closing its remote connection");
+                }
             }
         })
         .await;
@@ -1620,6 +1624,8 @@ pub(crate) struct RemoteConn {
     pub(crate) on_failure: Box<dyn FnOnce() + Send>,
     /// 远程端口停了，这条也断
     pub(crate) closed: tokio::sync::watch::Receiver<()>,
+    /// 放行名单不再放它了，这条也断
+    pub(crate) revoked: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     /// 占着一个并发名额，连接结束时还回去
     pub(crate) _slot: tokio::sync::OwnedSemaphorePermit,
 }

@@ -99,6 +99,8 @@ pub struct Remote {
     listening: Mutex<Listening>,
     strikes: Mutex<HashMap<IpAddr, Strikes>>,
     slots: Arc<Semaphore>,
+    /// 每换入一次配置跳一下。已经连着的远程连接听它，名单把自己划出去了就断开
+    reloads: watch::Sender<u64>,
 }
 
 impl Default for Remote {
@@ -107,6 +109,7 @@ impl Default for Remote {
             listening: Mutex::default(),
             strikes: Mutex::default(),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            reloads: watch::channel(0).0,
         }
     }
 }
@@ -193,7 +196,18 @@ pub fn reachable(addr: SocketAddr) -> Vec<String> {
 /// 进来的连接也一起断开**：关掉远程端口的意思就是现在谁都不能从远程进来。
 struct Running {
     want: SocketAddr,
-    _stop: watch::Sender<()>,
+    stop: watch::Sender<()>,
+    /// accept 循环。**它结束了，监听的 socket 才真的放开** —— 同一个端口换地址
+    /// 时要等到这一刻才能绑新的
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    /// 停下，等 socket 放开。从它进来的连接随之断开。
+    async fn close(self) {
+        drop(self.stop);
+        let _ = self.task.await;
+    }
 }
 
 /// 跟着配置开关远程端口。`serve` 起一次，一直跑。
@@ -207,6 +221,8 @@ pub(crate) async fn follow(state: ControlState, app: Router, gate: Gate) {
     let mut running: Option<Running> = None;
     loop {
         apply(&state, &app, &gate, &mut running).await;
+        // 已经连着的远程连接各自对一遍名单（见 `revoked`）
+        state.remote.reloads.send_modify(|n| *n += 1);
         loop {
             match events.recv().await {
                 Ok(tw_api::Event::ConfigReloaded { .. }) | Err(RecvError::Lagged(_)) => break,
@@ -253,6 +269,40 @@ async fn apply(state: &ControlState, app: &Router, gate: &Gate, running: &mut Op
     }
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
+        // **同一个端口、地址有重叠**（`all` 换成一张网卡，或者反过来）：旧的还占着，
+        // 新的绑不上。先放开旧的再绑；新的还是绑不上，就把旧的原样绑回去
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AddrInUse
+                && running
+                    .as_ref()
+                    .is_some_and(|run| run.want.port() == addr.port()) =>
+        {
+            let old = running.take().expect("checked just above");
+            let old_want = old.want;
+            old.close().await;
+            match TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(%addr, %e, "the remote control port cannot be listened on");
+                    let error = Some(tw_gateway::listen::bind_failure(addr, &e));
+                    match TcpListener::bind(old_want).await {
+                        Ok(l) => {
+                            let actual = l.local_addr().ok();
+                            *running = Some(start(state, app, gate, old_want, l));
+                            r.set_listening(Listening {
+                                addr: actual,
+                                error,
+                            });
+                        }
+                        Err(e2) => {
+                            tracing::warn!(%old_want, %e2, "the previous remote control address could not be taken back either");
+                            r.set_listening(Listening { addr: None, error });
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!(%addr, %e, "the remote control port cannot be listened on");
             r.set_listening(Listening {
@@ -263,24 +313,58 @@ async fn apply(state: &ControlState, app: &Router, gate: &Gate, running: &mut Op
         }
     };
     let actual = listener.local_addr().ok();
-    let (stop, stopped) = watch::channel(());
-    // 旧的那个丢掉：不再接新连接，从它进来的也断开
-    *running = Some(Running {
-        want: addr,
-        _stop: stop,
-    });
+    // 旧的那个关掉：不再接新连接，从它进来的也断开
+    if let Some(old) = running.take() {
+        old.close().await;
+    }
+    *running = Some(start(state, app, gate, addr, listener));
     r.set_listening(Listening {
         addr: actual,
         error: None,
     });
     tracing::info!(addr = ?actual, "the remote control port is listening");
-    tokio::spawn(accept_loop(
+}
+
+fn start(
+    state: &ControlState,
+    app: &Router,
+    gate: &Gate,
+    want: SocketAddr,
+    listener: TcpListener,
+) -> Running {
+    let (stop, stopped) = watch::channel(());
+    let task = tokio::spawn(accept_loop(
         listener,
         stopped,
         state.clone(),
         app.clone(),
         gate.clone(),
     ));
+    Running { want, stop, task }
+}
+
+/// 等到这个来源不再被放行：名单改了把它划出去，或者远程端口关了。
+///
+/// **名单收窄要当场生效**：撤掉一台机器的意思是它现在就进不来，不是等它下次
+/// 重连。和换钥匙断开旧连接是同一个道理。
+async fn revoked(state: ControlState, mut reloads: watch::Receiver<u64>, ip: IpAddr) {
+    loop {
+        if reloads.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        let entries = state
+            .config()
+            .listen
+            .control
+            .remote
+            .as_ref()
+            .filter(|r| r.enabled)
+            .map(|r| r.allow_from.clone())
+            .unwrap_or_default();
+        if !allowed(&entries, ip) {
+            return;
+        }
+    }
 }
 
 async fn accept_loop(
@@ -324,6 +408,8 @@ async fn accept_loop(
             continue;
         };
         let remote = state.remote.clone();
+        // 订阅在这里、在 accept 的这一刻：之后的每一次换入都看得到
+        let reloads = state.remote.reloads.subscribe();
         crate::hand_off(
             stream,
             app.clone(),
@@ -331,6 +417,7 @@ async fn accept_loop(
             Some(crate::RemoteConn {
                 on_failure: Box::new(move || remote.strike(ip, Instant::now())),
                 closed: stopped.clone(),
+                revoked: Box::pin(revoked(state.clone(), reloads, ip)),
                 _slot: slot,
             }),
         );
