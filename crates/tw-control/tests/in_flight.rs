@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
-const BASE: &str = "version: 1\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n    key: sk-x\n";
+const BASE: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n    key: sk-x\n";
 
 fn app() -> (tempfile::TempDir, tw_observe::EventBus, axum::Router) {
     let d = tempfile::tempdir().unwrap();

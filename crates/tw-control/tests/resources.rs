@@ -12,6 +12,9 @@ use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
 const BASE: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k

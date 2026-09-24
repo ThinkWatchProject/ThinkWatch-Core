@@ -10,7 +10,7 @@ use std::time::Duration;
 use tw_config::history::Origin;
 use tw_control::{ApplyError, ConfigManager};
 
-const BASE: &str = "version: 1\n# 别动我这句注释\nclients:\n  - name: c\n    key: tw-k\n";
+const BASE: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\n# 别动我这句注释\nclients:\n  - name: c\n    key: tw-k\n";
 
 fn setup() -> (tempfile::TempDir, Arc<ConfigManager>, tw_observe::EventBus) {
     let d = tempfile::tempdir().unwrap();
@@ -127,7 +127,7 @@ async fn writing_on_a_stale_version_is_refused_with_both_versions() {
     std::fs::write(mgr.path(), format!("{BASE}providers: []\n")).unwrap();
 
     let e = mgr
-        .write("version: 1\nclients: []\n", Some(&stale), Origin::Ui)
+        .write("version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients: []\n", Some(&stale), Origin::Ui)
         .await
         .unwrap_err();
     assert!(matches!(e, ApplyError::Stale { .. }), "{e:?}");
@@ -190,8 +190,9 @@ async fn every_write_leaves_the_previous_version_in_history() {
         .iter()
         .map(|v| tw_config::history::read(v).unwrap())
         .collect();
+    // 历史里存的钥匙是打码的
     assert!(
-        texts.contains(&BASE.to_string()),
+        texts.contains(&tw_config::control_key::mask(BASE)),
         "改之前那一版没进历史：{texts:?}"
     );
 }

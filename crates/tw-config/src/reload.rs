@@ -172,7 +172,8 @@ fn stage_of(e: &ValidationError) -> Stage {
 /// 进界面、可能被用户复制到 issue 里（统一脱敏）。
 fn excerpt_of(text: &str, line: usize) -> Option<String> {
     let raw = text.lines().nth(line.checked_sub(1)?)?;
-    let masked = tw_secret::mask_line(raw);
+    // 控制面的钥匙整个换掉：`mask_line` 留头留尾，而它是那扇门的全部凭据
+    let masked = tw_secret::mask_line(&crate::control_key::mask_hex_runs(raw));
     // 超长的行截断。**按字符边界截**，按字节切多字节字符会 panic。
     const MAX: usize = 160;
     if masked.chars().count() <= MAX {
@@ -186,26 +187,34 @@ fn excerpt_of(text: &str, line: usize) -> Option<String> {
 mod tests {
     use super::*;
 
-    const GOOD: &str = "version: 1\nclients:\n  - name: c\n    key: tw-k\n";
+    const GOOD: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\n";
 
     #[test]
     fn a_good_config_goes_through() {
         assert!(try_parse(GOOD).is_ok());
     }
 
+    /// 没有钥匙的配置不收：它一旦换进来，下一条连接谁都进不来。
+    #[test]
+    fn a_config_without_a_control_key_is_refused_as_a_semantic_error() {
+        let r = try_parse("version: 1\nclients:\n  - name: c\n    key: tw-k\n").unwrap_err();
+        assert_eq!(r.stage, Stage::Semantics, "{r:?}");
+        assert_eq!(r.message.code, "config.control_key_missing");
+    }
+
     #[test]
     fn a_syntax_error_points_at_the_line() {
         // 「手抖打错一个字母」的典型：引号没闭合。
-        let bad = "version: 1\nclients:\n  - name: \"c\n    key: tw-k\n";
+        let bad = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: \"c\n    key: tw-k\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Syntax, "{r:?}");
         assert!(r.line.is_some(), "语法错必须给行号：{r:?}");
     }
 
     #[test]
-    fn a_config_with_neither_providers_nor_a_listen_block_still_loads() {
-        // 「六行」。零 provider 是首次运行的正常状态，而逼用户
-        // 写一行 `providers: []` 只是为了让解析器高兴。
+    fn a_config_without_providers_still_loads() {
+        // 零 provider 是首次运行的正常状态，而逼用户写一行 `providers: []`
+        // 只是为了让解析器高兴。`listen` 那一节只有控制面的钥匙。
         let cfg = try_parse(GOOD).expect("最小配置该能加载");
         assert!(cfg.providers.is_empty());
     }
@@ -213,7 +222,7 @@ mod tests {
     #[test]
     fn a_config_with_no_clients_at_all_gets_the_helpful_message_not_serdes() {
         // serde 的「missing field `clients`」说不出下一步做什么。
-        let r = try_parse("version: 1\n").unwrap_err();
+        let r = try_parse("version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\n").unwrap_err();
         assert_eq!(r.stage, Stage::Semantics, "{r:?}");
         assert!(r.message.text.contains("generated on first start"), "{r:?}");
     }
@@ -231,7 +240,7 @@ mod tests {
     #[test]
     fn a_semantic_error_has_no_line_number_because_there_is_no_honest_one() {
         // **编一个行号出来比不给更糟** —— 用户会盯着那一行看半天。
-        let bad = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\n  - name: a\n    base_url: https://y\n    key: k\n";
+        let bad = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\n  - name: a\n    base_url: https://y\n    key: k\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Semantics, "{r:?}");
         assert!(r.line.is_none(), "语义错不该编行号：{r:?}");
@@ -242,7 +251,7 @@ mod tests {
     fn a_route_pointing_at_a_deleted_group_is_caught_before_anything_swaps_in() {
         // **语法正确但语义错误的配置最危险**：YAML 完全合法，运行时却会
         // 把请求路由到空处。
-        let bad = "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\nroutes:\n  - name: 默认\n    rules:\n      - name: r\n        to: 已经删掉的组\n";
+        let bad = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\nroutes:\n  - name: 默认\n    rules:\n      - name: r\n        to: 已经删掉的组\n";
         let r = try_parse(bad).unwrap_err();
         assert_eq!(r.stage, Stage::Semantics);
         assert!(r.message.text.contains("已经删掉的组"), "{r:?}");
@@ -260,8 +269,7 @@ mod tests {
     fn the_excerpt_never_carries_a_key_in_the_clear() {
         // 出错那一行完全可能就是写着密钥的那一行，而这段文字要进日志、
         // 进界面、可能被复制到 issue 里。
-        let bad =
-            "version: 1\nclients:\n  - name: c\n    key: sk-ant-verysecretvalue\n    kye: 1\n";
+        let bad = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: sk-ant-verysecretvalue\n    kye: 1\n";
         let r = try_parse(bad).unwrap_err();
         let ex = r.excerpt.unwrap_or_default();
         assert!(!ex.contains("verysecretvalue"), "密钥原文进了摘录：{ex}");
@@ -271,7 +279,9 @@ mod tests {
     fn a_very_long_line_is_cut_on_a_character_boundary() {
         // 按字节切多字节字符会 panic —— 这个项目栽过两次。
         let long = "很".repeat(500);
-        let bad = format!("version: 1\nx: {long}\nclients:\n  - name: c\n    kye: 1\n");
+        let bad = format!(
+            "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nx: {long}\nclients:\n  - name: c\n    kye: 1\n"
+        );
         let r = try_parse(&bad).unwrap_err();
         // 不 panic 就算过；顺便确认真的截了
         if let Some(ex) = r.excerpt {

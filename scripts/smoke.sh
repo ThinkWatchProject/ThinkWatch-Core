@@ -18,11 +18,10 @@ export HOME="$FAKE_HOME"
 export THINKWATCH_HOME="$FAKE_HOME/.thinkwatch"
 mkdir -p "$THINKWATCH_HOME" "$FAKE_HOME/.claude"
 SOCK="$THINKWATCH_HOME/twcore.sock"
-# 控制面要凭据。**这个脚本自己定它是什么**，通过环境变量交给 twcore ——
-# 比等它自己生成一个、再去文件里把它捞回来少一步竞态（那个文件是在它
-# 启动过程中写的，而这里几乎同时就要用）。
-export TW_CONTROL_TOKEN="smoke-$$-$RANDOM"
-AUTH=(-H "Authorization: Bearer $TW_CONTROL_TOKEN")
+# 控制面的每条连接先握手（钥匙在 config.yaml 的 listen.control.key），curl
+# 敲不开它。`twcore call` 读同一份配置里的钥匙、走和桌面端同一条握手。
+# 带 --out 时正文写进文件、只打印状态码，和原来 curl -o -w 的用法一样
+ctl() { "$BIN" --config "$CFG" call "$@"; }
 PORT=18999
 UPPORT=18998
 PASS=0; FAIL=0
@@ -176,7 +175,10 @@ security:
     mode: enforce
 """)
 PY
+# 这份配置故意没写控制面的钥匙：老用户的配置就是这样。check 要认得它（钥匙
+# 由 serve 补上），serve 起来之后要只多出钥匙那几行
 "$BIN" --config "$CFG" check >/dev/null 2>&1 && ok "check 认得这份配置" || bad "check 不认这份配置"
+cp "$CFG" "$TMP/config.before"
 
 # ---------------------------------------------------------------- 起服务
 step "起服务"
@@ -198,6 +200,19 @@ fi
 CORE_PID=$!
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
 [ -S "$SOCK" ] && ok "控制面 socket 起来了" || { bad "socket 没出现" "$(tail -3 "$TMP/core.log")"; exit 1; }
+# **钥匙在监听之前就写好了**：socket 出现的那一刻，配置里已经有它
+KEY=$(python3 - "$CFG" <<'PY'
+import re, sys
+m = re.search(r'^    key: ([0-9a-f]{64})$', open(sys.argv[1], encoding='utf-8').read(), re.M)
+print(m.group(1) if m else "")
+PY
+)
+[ -n "$KEY" ] && ok "serve 给没有钥匙的配置补上了钥匙" || bad "配置里没有钥匙" "$(head -12 "$CFG")"
+ADDED=$(diff "$TMP/config.before" "$CFG" | grep -c '^>')
+REMOVED=$(diff "$TMP/config.before" "$CFG" | grep -c '^<')
+[ "$ADDED" = 2 ] && [ "$REMOVED" = 0 ] && ok "只多出钥匙那两行，别的一个字节没动" \
+  || bad "补钥匙改动了别的地方" "$(diff "$TMP/config.before" "$CFG" | head -8)"
+[ "$("$BIN" --config "$CFG" control-key)" = "$KEY" ] && ok "control-key 打印的就是这把" || bad "control-key 打印的不是配置里那把"
 
 MODE=$(mode_of "$THINKWATCH_HOME/data.db" || echo -)
 [ "$MODE" = "600" ] && ok "data.db 是 0600" || bad "data.db 权限是 $MODE"
@@ -215,7 +230,7 @@ else
   # 根本没被当成 UTF-8。所以把这一次的路由决策和 core 日志一起交出来 ——
   # 少了这些，CI 上的一次失败在本机复现不出来就只能靠猜。
   sleep 0.5
-  CHAIN=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" 2>/dev/null \
+  CHAIN=$(ctl "/history?limit=1" 2>/dev/null \
             | python3 -c 'import sys, json
 # /history 是个顶层数组。字段名在演化，所以打印整行而不是挑几个 ——
 # 挑错了名字就什么都看不到，而这段代码只在出事那一次跑。
@@ -255,7 +270,7 @@ echo "$S" | grep -q 'content_block_stop' && bad "切断之后还发了 content_b
 # 行一律没有用量，这笔钱就不在账上。
 GOT=""
 for _ in $(seq 1 20); do
-  GOT=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" 2>/dev/null \
+  GOT=$(ctl "/history?limit=1" 2>/dev/null \
           | python3 -c 'import sys, json
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
@@ -283,7 +298,7 @@ else
   GOT=""
   # 落库是异步的：事件先过广播，再由存储层的任务写进去
   for _ in $(seq 1 20); do
-    GOT=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" 2>/dev/null \
+    GOT=$(ctl "/history?limit=1" 2>/dev/null \
             | python3 -c 'import sys, json
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
@@ -299,21 +314,32 @@ print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/d
 fi
 
 # ---------------------------------------------------------------- 控制面
-step "控制面要凭据"
+step "控制面要握手"
 sleep 1
-# **只有这里能证明门是真的。**单元测试测的是那一层中间件，而「它到底有没有
-# 被挂到真正对外的那份路由表上」只有真二进制加真 socket 答得出来 —— 漏挂的
+# **只有这里能证明门是真的。**单元测试测的是握手本身，而「它到底有没有挡在
+# 真正对外的那个 socket 前面」只有真二进制加真 socket 答得出来 —— 漏挂的
 # 样子是所有测试照常通过，而控制面对整台机器敞着。
-NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://localhost/status)
-[ "$NOAUTH" = 401 ] && ok "不带凭据被拒" || bad "不带凭据竟然进去了" "$NOAUTH"
-WRONG=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" \
-          -H 'Authorization: Bearer not-the-one' http://localhost/status)
-[ "$WRONG" = 401 ] && ok "凭据不对被拒" || bad "凭据不对竟然进去了" "$WRONG"
+PLAIN=$(curl -s -m 5 -o "$TMP/plain" -w '%{http_code}' --unix-socket "$SOCK" http://localhost/status)
+if [ "$PLAIN" != 200 ] && ! grep -q api_version "$TMP/plain" 2>/dev/null; then
+  ok "不握手的 HTTP 进不来"
+else
+  bad "不握手的 HTTP 竟然进去了" "$PLAIN $(head -c 200 "$TMP/plain")"
+fi
+# 钥匙不对：另一份配置、同一个 socket
+mkdir -p "$TMP/wrong"
+printf 'listen:\n  control:\n    key: %s\n' "$(printf '0%.0s' $(seq 1 64))" > "$TMP/wrong/config.yaml"
+ln -s "$SOCK" "$TMP/wrong/twcore.sock"
+if "$BIN" --config "$TMP/wrong/config.yaml" call /status > "$TMP/wrong/out" 2> "$TMP/wrong/err"; then
+  bad "钥匙不对竟然进去了" "$(head -c 200 "$TMP/wrong/out")"
+else
+  grep -q "does not match" "$TMP/wrong/err" && ok "钥匙不对被拒，而且说的是钥匙不对" \
+    || bad "钥匙不对被拒，但说法不对" "$(cat "$TMP/wrong/err")"
+fi
+ctl /status | grep -q '"api_version"' && ok "钥匙对了就进得来" || bad "拿着对的钥匙也进不来"
 
 step "控制面（每个端点）"
-get() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost$1"; }
-post() { curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "${AUTH[@]}" -XPOST \
-           -H 'content-type: application/json' -d "$2" "http://localhost$1"; }
+get() { ctl --out "$TMP/out" "$1"; }
+post() { ctl --out "$TMP/out" -X POST -d "$2" "$1"; }
 
 # **带上时间窗再打一次。**不带参数时一切正常、带上 `from_ms` 就 400，
 # 是这两个端点真实发生过的形态：`#[serde(flatten)]` 让 serde 走
@@ -340,11 +366,11 @@ C=$(post /scan '{"projects":["'"$TMP"'"]}'); [ "$C" = "200" ] && ok "POST /scan�
 C=$(post /clients/plan '{"client":"claude-code"}'); [ "$C" = "200" ] && ok "POST /clients/plan" || bad "POST /clients/plan 返回 $C"
 # 页面打开时补问模型清单：立刻返回开始问的那几家，不等上游回话
 C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" || bad "POST /models/refresh 返回 $C"
-C=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" http://localhost/overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
+C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
 [ "$C" = "True" ] && ok "/overview 带模型获取状态" || bad "/overview 的模型状态字段不对：$C"
 C=$(get /clients/claude-code/why); [ "$C" = "200" ] && ok "GET /clients/{id}/why" || bad "返回 $C"
 
-ID=$(curl -s --unix-socket "$SOCK" "${AUTH[@]}" "http://localhost/history?limit=1" \
+ID=$(ctl "/history?limit=1" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["id"] if d else 0)')
 if [ "$ID" != "0" ]; then
   C=$(get "/request/$ID"); [ "$C" = "200" ] && ok "GET /request/{id}" || bad "返回 $C"
@@ -357,10 +383,17 @@ fi
 # ---------------------------------------------------------------- 诊断包
 step "诊断包不带密钥出门"
 get /diagnostics >/dev/null
-if grep -qE 'sk-upstream-smoke|tw-smoketestkey0123456789' "$TMP/out"; then
+if grep -qE "sk-upstream-smoke|tw-smoketestkey0123456789|$KEY" "$TMP/out"; then
   bad "诊断包里有真密钥"
 else
   ok "诊断包里没有真密钥"
+fi
+# 控制面的钥匙不从控制面出去：编辑器拿到的原文里是打码
+get /config >/dev/null
+if grep -q "$KEY" "$TMP/out"; then
+  bad "GET /config 带出了控制面的钥匙"
+else
+  ok "GET /config 里的钥匙是打码的"
 fi
 
 # ---------------------------------------------------------------- 只有一份配置
@@ -452,9 +485,21 @@ fi
 # 这是整条链唯一被端到端验证的地方 —— 一条 HTTP 请求扳开关、主循环的
 # select 醒过来、进程自己退出。单元测试能证明开关会被扳动，证明不了它
 # 接在主循环上；而接错的样子是请求返回 202、进程稳稳地继续跑。
+# **换钥匙**：跑着的 core 从文件监听拿到新钥匙，旧的那把立刻进不来
+step "换钥匙"
+NEW=$("$BIN" --config "$CFG" control-key --rotate 2>/dev/null)
+[ -n "$NEW" ] && [ "$NEW" != "$KEY" ] && ok "control-key --rotate 换了一把" || bad "没换成" "$NEW"
+sleep 1.5
+ctl /status | grep -q '"api_version"' && ok "新钥匙进得来" || bad "换完钥匙进不来了" "$(tail -3 "$TMP/core.log")"
+printf 'listen:\n  control:\n    key: %s\n' "$KEY" > "$TMP/wrong/config.yaml"
+if "$BIN" --config "$TMP/wrong/config.yaml" call /status >/dev/null 2>&1; then
+  bad "旧钥匙换掉之后还进得来"
+else
+  ok "旧钥匙进不来了"
+fi
+
 step "请它退出，它就退"
-CODE=$(curl -s -o "$TMP/out" -w '%{http_code}' --unix-socket "$SOCK" "${AUTH[@]}" \
-         -XPOST http://localhost/shutdown)
+CODE=$(ctl --out "$TMP/out" -X POST /shutdown)
 if [ "$CODE" = 202 ]; then
   ok "控制面收下了这条请求"
 else

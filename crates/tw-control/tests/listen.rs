@@ -96,6 +96,8 @@ clients:
 listen:
   gateway:
     port: {port}
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 "
     )
 }
@@ -132,7 +134,10 @@ async fn saving_writes_what_was_chosen_and_leaves_no_trace_of_defaults() {
         return;
     }
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(!b.file().contains("listen"), "{}", b.file());
+    // `listen` 本身还在：控制面的钥匙住在它下面
+    let file = b.file();
+    assert!(!file.contains("gateway"), "{file}");
+    assert!(file.contains("listen:\n  control:\n    key: "), "{file}");
 }
 
 #[tokio::test]
@@ -277,6 +282,8 @@ clients:
 listen:
   gateway:
     bind: all
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 ");
     let (_, ov) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
     let default = serde_json::json!(tw_config::default_allow_from());

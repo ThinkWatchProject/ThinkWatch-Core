@@ -486,7 +486,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **17 起「此刻有什么不对」都能问到**，不必从事件流开头听起：`Status.config_rejected`
 /// （磁盘上那份配置没通过校验、旧的还在服务）和 `ProviderView.writeback_failed`
 /// （换发的凭据没能写回配置）。半路才连上的一方（桌面端的提醒）按它们对账。
-pub const CONTROL_API_VERSION: u32 = 17;
+///
+/// **18 起每条控制面连接先握手，Bearer 头没了。**握手是 Noise
+/// （`tw-link`），钥匙是配置里的 `listen.control.key`，`TW_CONTROL_TOKEN` 和
+/// `control.token` 都不在了。和 12 一样，照 17 写的客户端**看不到这次跳号**：
+/// 它连 HTTP 都说不上，握手第一条就被拒。版本号从这一版起在握手里交换
+/// （`tw_link::ClientHello.proto`），不一致时握手就说，不必等到 `/status`。
+/// 同一版起 `GET /config` 发出的正文里钥匙是打码的（[`control::KEY_MASK`]）。
+pub const CONTROL_API_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -4411,7 +4418,7 @@ mod tests {
 /// 数据目录在哪。
 ///
 /// **在契约层，不在 tw-config。**core 和桌面端必须落到同一个目录 —— 端口文件、
-/// 凭据文件、配置都在里面，两边各算一遍、算得不一样的话，界面找不到一个正在
+/// socket、配置（连同控制面的钥匙）都在里面，两边各算一遍、算得不一样的话，界面找不到一个正在
 /// 跑的网关。以前桌面端自己只看 `HOME`，Windows 上那个变量默认不存在，于是它
 /// 落到当前目录下的 `.thinkwatch`，而 core 在 `%APPDATA%\ThinkWatch`。控制面
 /// 的地址（`control::Address`）因为同样的理由搬到了这里。
@@ -4439,7 +4446,7 @@ pub mod data {
         };
     }
 
-    /// 数据目录：配置、请求库、锁、控制面的端口和凭据文件都在这里。
+    /// 数据目录：配置、请求库、锁、控制面的 socket 或端口文件都在这里。
     ///
     /// `THINKWATCH_HOME` 最优先 —— 测试靠它隔离，用户靠它换地方。
     ///
@@ -4572,7 +4579,7 @@ pub mod data {
     }
 }
 
-/// 控制面在哪儿、拿什么进门。
+/// 控制面在哪儿、拿哪把钥匙进门。
 ///
 /// **这是契约的一部分，不是两边各自的约定。**core 在这儿听，桌面端到这儿连
 /// —— 以前两边各拼一次 `<数据目录>/twcore.sock`，能对上只是因为那一行足够
@@ -4588,11 +4595,22 @@ pub mod control {
     pub const SOCKET_FILE: &str = "twcore.sock";
     /// Windows 上控制面绑到哪个端口，由 core 写、由客户端读。
     pub const PORT_FILE: &str = "control.port";
-    /// 手工启动 core 时凭据落在哪。
-    pub const TOKEN_FILE: &str = "control.token";
-    /// 父进程把凭据交过来的环境变量。**走环境不走 argv** —— Windows 上任意
-    /// 同用户进程都看得见别人的命令行。
-    pub const TOKEN_ENV: &str = "TW_CONTROL_TOKEN";
+    /// 数据目录下的配置文件。控制面的钥匙就写在它里面（[`KEY_PATH`]）。
+    pub const CONFIG_FILE: &str = "config.yaml";
+    /// 钥匙在配置里的位置：`listen.control.key`。
+    ///
+    /// **两边拼的是同一个位置**：core 生成、补上、打码都照它找，桌面端读
+    /// 也照它找。各写一遍字符串，漂掉的表现是「界面拿着空钥匙去敲门」。
+    pub const KEY_PATH: [&str; 3] = ["listen", "control", "key"];
+    /// 钥匙写成多少个十六进制字符。32 字节。
+    pub const KEY_HEX_LEN: usize = 64;
+    /// 配置正文发给界面、写进历史时，钥匙换成这一串。
+    ///
+    /// **和一把真钥匙一样长**（64 个字符）：界面按光标位置问「这是哪一段」
+    /// （`GET /config/at`），打码前后长度一样，后面每一处的偏移才对得上。
+    /// 它不是十六进制，所以不会被错当成一把钥匙；整份写回时带着它，就是
+    /// 「钥匙不动」。
+    pub const KEY_MASK: &str = "hidden-see-twcore-control-key-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
     /// 控制面听在哪，客户端到哪儿连。
     ///
@@ -4608,7 +4626,7 @@ pub mod control {
         /// core 绑到一个系统给的空闲端口，再把号码写进这个文件。
         ///
         /// 回环端口挡不住同机的任何进程，也问不出对端是谁（unix socket 问
-        /// 得出，`SO_PEERCRED`）—— 那一档的门**全靠凭据**。
+        /// 得出，`SO_PEERCRED`）—— 那一档的门**全靠握手**。
         Loopback { port_file: PathBuf },
     }
 
@@ -4628,9 +4646,102 @@ pub mod control {
         }
     }
 
-    /// 凭据文件在哪。
-    pub fn token_file(dir: &Path) -> PathBuf {
-        dir.join(TOKEN_FILE)
+    /// 配置文件在哪。
+    pub fn config_file(dir: &Path) -> PathBuf {
+        dir.join(CONFIG_FILE)
+    }
+
+    /// 控制面的钥匙：32 个随机字节，配置里写成 64 个十六进制字符。
+    ///
+    /// 它是握手（`tw-link`，Noise 的 PSK）的全部凭据：不知道它的一方连第一条
+    /// 握手消息都解不开。**住在契约层而不是 tw-link**：tw-config 要按它校验
+    /// 配置，而 tw-config 不该为了一个格式检查背上整套加密库。生成随机数的
+    /// 那一步在 tw-config（它本来就依赖 rand），这里只有格式，仍然没有 IO。
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct ControlKey([u8; 32]);
+
+    /// 一串文字不是一把钥匙的原因。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum KeyFormatError {
+        /// 长度不对。`len` 是去掉首尾空白之后的字符数
+        Length { len: usize },
+        /// 有不是十六进制的字符
+        NotHex,
+    }
+
+    impl std::fmt::Display for KeyFormatError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                KeyFormatError::Length { len } => write!(
+                    f,
+                    "the control key is {len} characters long; it has to be {KEY_HEX_LEN} \
+                     hexadecimal characters"
+                ),
+                KeyFormatError::NotHex => write!(
+                    f,
+                    "the control key has characters that are not hexadecimal; it has to be \
+                     {KEY_HEX_LEN} of 0-9 and a-f"
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for KeyFormatError {}
+
+    impl ControlKey {
+        /// 按配置里的写法读：正好 64 个十六进制字符，大小写都认，首尾空白不算。
+        ///
+        /// **短了不是「弱一点」，是不收。**一把好猜的钥匙和没有钥匙差不多，
+        /// 而这把钥匙守着能改全部配置、能关掉 core 的那扇门。
+        pub fn parse(s: &str) -> Result<Self, KeyFormatError> {
+            let s = s.trim();
+            let len = s.chars().count();
+            if len != KEY_HEX_LEN || s.len() != KEY_HEX_LEN {
+                return Err(KeyFormatError::Length { len });
+            }
+            let mut out = [0u8; 32];
+            for (i, pair) in s.as_bytes().chunks(2).enumerate() {
+                let hi = hex_digit(pair[0]).ok_or(KeyFormatError::NotHex)?;
+                let lo = hex_digit(pair[1]).ok_or(KeyFormatError::NotHex)?;
+                out[i] = (hi << 4) | lo;
+            }
+            Ok(Self(out))
+        }
+
+        pub fn from_bytes(bytes: [u8; 32]) -> Self {
+            Self(bytes)
+        }
+
+        pub fn as_bytes(&self) -> &[u8; 32] {
+            &self.0
+        }
+
+        /// 写进配置的样子：64 个小写十六进制字符。
+        pub fn to_hex(&self) -> String {
+            let mut out = String::with_capacity(KEY_HEX_LEN);
+            for b in self.0 {
+                use std::fmt::Write;
+                let _ = write!(out, "{b:02x}");
+            }
+            out
+        }
+    }
+
+    fn hex_digit(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    /// **不打印出来。**钥匙会跟着别的结构体一起落进 `tracing` 的 Debug 输出，
+    /// 而日志是会被整段贴进 issue 的。
+    impl std::fmt::Debug for ControlKey {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ControlKey(<redacted>)")
+        }
     }
 
     #[cfg(test)]
@@ -4645,7 +4756,49 @@ pub mod control {
                 Address::Socket(p) => assert_eq!(p, d.join(SOCKET_FILE)),
                 Address::Loopback { port_file } => assert_eq!(port_file, d.join(PORT_FILE)),
             }
-            assert_eq!(token_file(d), d.join(TOKEN_FILE));
+            assert_eq!(config_file(d), d.join(CONFIG_FILE));
+        }
+
+        #[test]
+        fn a_key_is_exactly_64_hex_characters() {
+            let hex = "9f2c".repeat(16);
+            let k = ControlKey::parse(&hex).unwrap();
+            assert_eq!(k.to_hex(), hex);
+            assert_eq!(k.as_bytes()[0], 0x9f);
+            // 大写也认，写回去是小写；首尾空白不算
+            let loud = format!("  {}  ", hex.to_uppercase());
+            assert_eq!(ControlKey::parse(&loud).unwrap(), k);
+            assert_eq!(
+                ControlKey::parse(&hex[..62]),
+                Err(KeyFormatError::Length { len: 62 })
+            );
+            assert_eq!(
+                ControlKey::parse(&format!("{hex}00")),
+                Err(KeyFormatError::Length { len: 66 })
+            );
+            assert_eq!(
+                ControlKey::parse(""),
+                Err(KeyFormatError::Length { len: 0 })
+            );
+            let bad = format!("{}zz", &hex[..62]);
+            assert_eq!(ControlKey::parse(&bad), Err(KeyFormatError::NotHex));
+            // 多字节字符：字节数凑得上 64，字符数凑不上
+            let wide = format!("{}\u{e9}", &hex[..62]);
+            assert_eq!(wide.len(), 64);
+            assert!(ControlKey::parse(&wide).is_err());
+        }
+
+        /// 打码用的那一串长度和真钥匙一样，但它本身不是一把钥匙。
+        #[test]
+        fn the_mask_is_as_long_as_a_key_and_is_not_one() {
+            assert_eq!(KEY_MASK.len(), KEY_HEX_LEN);
+            assert!(ControlKey::parse(KEY_MASK).is_err());
+        }
+
+        #[test]
+        fn a_key_does_not_print_itself() {
+            let k = ControlKey::from_bytes([0xab; 32]);
+            assert!(!format!("{k:?}").contains("abab"));
         }
 
         /// 平台决定用哪一档，不是调用方挑。
