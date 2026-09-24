@@ -58,18 +58,8 @@ endpoints! {
     ReplayRun: POST "/replay/run", api::ReplayRequest => api::ReplayResult;
     DryRun: POST "/dryrun", api::DryRunRequest => api::DryRunResult;
 
-    // ─────────────────────────────────────────────── 客户端与接管
-    Scan: POST "/scan", api::ScanRequest => api::ScanResponse;
-    Clients: GET "/clients", () => api::ClientsResponse;
-    PlanAdopt: POST "/clients/plan", api::AdoptRequest => api::PlanView;
-    Adopt: POST "/clients/adopt", api::AdoptRequest => api::AdoptResponse;
-    PlanRestore: GET "/clients/{id}/restore/plan" [id], () => api::PlanView;
-    Restore: POST "/clients/{id}/restore" [id], () => api::AdoptResponse;
-    Why: GET "/clients/{id}/why" [id], () => Vec<api::FindingView>;
+    // ─────────────────────────────────────────────── 客户端（接管本身在桌面端）
     ClientKey: POST "/clients/{id}/key" [id], () => api::ClientKey;
-    McpTargets: GET "/mcp/targets", () => Vec<api::McpTargetView>;
-    McpPlan: POST "/mcp/plan", api::McpOpRequest => api::PlanView;
-    McpApply: POST "/mcp/apply", api::McpOpRequest => api::AdoptResponse;
 
     // ─────────────────────────────────────────────── 密钥
     Keys: GET "/keys", () => Vec<api::ClientView>;

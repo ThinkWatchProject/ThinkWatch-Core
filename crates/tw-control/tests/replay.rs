@@ -146,7 +146,6 @@ fn app(config: &str) -> (tempfile::TempDir, axum::Router) {
         price_updater: Default::default(),
         chatgpt: Default::default(),
         zai: Default::default(),
-        home: d.path().join("home"),
     };
     (d, tw_control::router(state))
 }

@@ -10,8 +10,8 @@ description = "Control-plane contract: request and response types, plus a client
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-# `Msg` 住在 tw-types：会造消息的 crate 有一半够不着 tw-api（tw-config、
-# tw-adopt 都只依赖 tw-types），而契约这一层反过来依赖它没有问题 ——
+# `Msg` 住在 tw-types：会造消息的 crate 有一半够不着 tw-api（tw-config 只依赖
+# tw-types，桌面端的接管 crate 也是），而契约这一层反过来依赖它没有问题 ——
 # tw-types 自己零依赖。
 tw-types = { workspace = true }
 ts-rs = { workspace = true, optional = true }

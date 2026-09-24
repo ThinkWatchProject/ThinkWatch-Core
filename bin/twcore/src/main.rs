@@ -72,20 +72,6 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
     },
-    /// Scan the clients on this machine: hooks, MCP, skills and instruction files. Read-only
-    Scan {
-        /// Extra project directories to scan; projects are not found automatically
-        #[arg(long)]
-        project: Vec<PathBuf>,
-        /// Print the full inventory as well, not only the findings
-        #[arg(long)]
-        inventory: bool,
-    },
-    /// List the AI clients on this machine and where each one points
-    Clients {
-        #[command(subcommand)]
-        what: ClientsCmd,
-    },
     /// Print the control key, which the desktop app connects with
     //
     // 远程连接时用户在服务器上跑它，把钥匙抄进应用
@@ -126,22 +112,6 @@ enum Command {
         #[arg(long)]
         version: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum ClientsCmd {
-    /// Scan the clients on this machine. Read-only
-    List,
-    /// Work out why a change has not taken effect, layer by layer
-    Why {
-        /// The client id, such as claude-code
-        client: String,
-        /// The current project directory, to see whether a project file overrides the user one
-        #[arg(long)]
-        project: Option<PathBuf>,
-    },
-    /// Work out the change and print it, without writing anything
-    Plan { client: String },
 }
 
 #[derive(Subcommand)]
@@ -191,8 +161,6 @@ fn main() -> Result<()> {
         Command::Serve { port, safe, parent } => cmd_serve(&path, port, safe, parent),
         Command::Speed { provider, proxy } => cmd_speed(&path, provider, proxy),
         Command::Config { what } => cmd_config(&path, what),
-        Command::Clients { what } => cmd_clients(&path, what),
-        Command::Scan { project, inventory } => cmd_scan(&path, project, inventory),
         Command::ControlKey { rotate } => cmd_control_key(&path, rotate),
         Command::Call {
             path: endpoint,
@@ -209,187 +177,6 @@ fn main() -> Result<()> {
             restart,
             version,
         }),
-    }
-}
-
-/// 静态扫描。**只报告，不删任何东西。**
-fn cmd_scan(_config: &Path, projects: Vec<PathBuf>, inventory: bool) -> Result<()> {
-    // **只用内置规则**，和应用里 MCP 页扫的是同一套。安全页上的规则只作用于
-    // 经过网关的请求
-    let rules = tw_guard::tools::rules::scan_rules();
-    let mut srcs = tw_scan::sources::user_level(&home());
-    for p in &projects {
-        srcs.extend(tw_scan::sources::in_project(p));
-    }
-    println!(
-        "scanned {} files ({} built-in rules)",
-        srcs.len(),
-        rules.rules.len()
-    );
-    let r = tw_scan::report::scan(&srcs, &rules);
-
-    if inventory {
-        let conflicting = tw_scan::report::conflicting(&r.mcp);
-        println!("\nMCP servers ({}):", r.mcp.len());
-        for m in &r.mcp {
-            let mark = if conflicting.contains(&m.name) {
-                " ⚠ same name, different configuration"
-            } else {
-                ""
-            };
-            let off = if m.enabled { "" } else { " (disabled)" };
-            let what = match &m.url {
-                Some(u) => format!("remote {u}"),
-                None => format!("{} {}", m.command, m.args.join(" ")),
-            };
-            println!("  {:<20} {:<14} {what}{off}{mark}", m.name, m.client);
-            if !m.env_keys.is_empty() {
-                println!(
-                    "  {:<20} {:<14} reads the environment variables {}",
-                    "",
-                    "",
-                    m.env_keys.join(", ")
-                );
-            }
-        }
-        println!("\nhooks ({}):", r.hooks.len());
-        for h in &r.hooks {
-            println!("  {:<14} {:<14} {}", h.event, h.client, h.command);
-        }
-        println!("\nskills ({}):", r.skills.len());
-        for s in &r.skills {
-            println!("  {:<20} {}", s.name, s.path.display());
-        }
-    }
-
-    for u in &r.unreadable {
-        println!("⚠ could not be read: {u}");
-    }
-    if r.findings.is_empty() {
-        // 没风险的时候要说「安全」，而不是什么都不显示
-        println!("\n✓ nothing found.");
-        return Ok(());
-    }
-    println!("\n{} findings:", r.findings.len());
-    for f in &r.findings {
-        let mark = match f.level {
-            tw_scan::report::Level::High => "✗ high",
-            tw_scan::report::Level::Medium => "? suspicious",
-            tw_scan::report::Level::Low => "· note",
-        };
-        println!("{mark}  {}", f.title);
-        println!("       {}:{}", f.path.display(), f.line);
-        println!("       {}", f.excerpt.trim());
-        println!("       {}", f.detail);
-    }
-    println!("\nThe scan only reports; it deletes nothing.");
-    Ok(())
-}
-
-/// 用户的 home。**问 tw-control 要，不在这儿再写一遍** —— 之前这里有一份
-/// 自己的拷贝，于是「home 是什么」在两个地方各有一个答案。
-fn home() -> PathBuf {
-    tw_control::home_dir()
-}
-
-fn cmd_clients(path: &Path, what: ClientsCmd) -> Result<()> {
-    use tw_adopt::clients::{Gateway, adoptable, manual_only};
-    use tw_adopt::detect;
-
-    match what {
-        ClientsCmd::List => {
-            for d in detect::detect(&home()) {
-                let state = match (d.installed, d.adopted_at_ms, &d.endpoint) {
-                    (false, _, _) => "not installed".to_string(),
-                    (true, Some(at), Some(ep)) => {
-                        format!("pointed at the gateway {} → {ep}", fmt_time(at))
-                    }
-                    // **「我们写过」和「现在还是那样」是两回事。**
-                    (true, Some(at), None) => {
-                        format!(
-                            "was pointed at the gateway {}, and the fields written then are gone",
-                            fmt_time(at)
-                        )
-                    }
-                    (true, None, Some(ep)) => format!("not pointed at the gateway; points at {ep}"),
-                    (true, None, None) => "installed, not pointed at the gateway".to_string(),
-                };
-                println!("{:<14} {:<12} {state}", d.id, d.name);
-                println!("               {}", d.real.display());
-                if d.real != d.path {
-                    println!("               ({} is a symbolic link)", d.path.display());
-                }
-                for s in &d.shadows {
-                    println!("               ⚠ {} takes precedence", s.display());
-                }
-                if d.verified == tw_adopt::clients::Verified::FieldsOnly {
-                    println!("               ⓘ {}", d.verified.note());
-                }
-            }
-            // 配置读不了时照样列出步骤，地址按默认端口给
-            let port = tw_config::load(path)
-                .map(|c| c.listen.gateway.port)
-                .unwrap_or(tw_config::DEFAULT_GATEWAY_PORT);
-            let gw = Gateway {
-                base: format!("http://127.0.0.1:{port}"),
-                key: None,
-            };
-            println!();
-            println!("Clients that have to be configured by hand:");
-            for m in manual_only() {
-                println!("  {:<12} gateway address: {}", m.name, m.endpoint(&gw));
-                for step in m.steps() {
-                    println!("               {step}");
-                }
-                println!("               {}", m.caveat());
-            }
-            Ok(())
-        }
-        ClientsCmd::Why { client, project } => {
-            let c = adoptable()
-                .into_iter()
-                .find(|c| c.id == client)
-                .ok_or_else(|| anyhow::anyhow!("{client} is not a client we know"))?;
-            for f in detect::diagnose(&c, &home(), project.as_deref()) {
-                let mark = match f.level {
-                    detect::Level::Blocking => "✗",
-                    detect::Level::Suspect => "?",
-                    detect::Level::Clear => "✓",
-                };
-                println!("{mark} {}", f.title);
-                println!("  {}", f.detail);
-                if let Some(fix) = &f.fix {
-                    println!("  → {fix}");
-                }
-            }
-            Ok(())
-        }
-        ClientsCmd::Plan { client } => {
-            let c = adoptable()
-                .into_iter()
-                .find(|c| c.id == client)
-                .ok_or_else(|| anyhow::anyhow!("{client} is not a client we know"))?;
-            let cfg = tw_config::load(path)?;
-            // 0.0.0.0 是监听地址，不是能填进客户端配置的地址 —— 客户端
-            // 得知道往哪儿连，那永远是 127.0.0.1
-            let gw = Gateway {
-                base: format!("http://127.0.0.1:{}", cfg.listen.gateway.port),
-                key: None,
-            };
-            let plan = tw_adopt::plan::plan_adopt(&c, &home(), &gw)?;
-            println!("will change: {}", plan.path.display());
-            if plan.is_noop() {
-                println!("(the configuration is already as it should be)");
-                return Ok(());
-            }
-            for n in &plan.notes {
-                println!("  · {n}");
-            }
-            println!("\n--- after ---");
-            println!("{}", plan.after);
-            println!("--- a preview; nothing was written ---");
-            Ok(())
-        }
     }
 }
 
@@ -933,7 +720,6 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 是能改配置**。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
             shutdown: shutdown.clone(),
-            home: tw_control::home_dir(),
             started: std::time::Instant::now(),
             gateway: state.clone(),
             cfg: manager,
@@ -942,23 +728,12 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             chatgpt: Default::default(),
             zai: Default::default(),
         };
-        // 盯着客户端配置面。**只报告** —— 这条路径上没有任何
-        // 一处会改用户的文件。盯不住就只是少了「变更时告警」，页面上
-        // 那份「打开时扫一次」照常可用，所以说一句就继续。
         // 凭据轮换要写回 config.yaml。**这是这个程序里唯一一次
         // 不是人发起的配置写入** —— 理由是服务器换发新 refresh token 的
         // 那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
         // 定期刷新默认价目表（`pricing.auto_update`，默认开）
         tw_control::pricing::spawn(control.clone());
-
-        let _scan_watch = match tw_control::scan::spawn_watcher(control.clone()) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!("the clients' configuration cannot be watched, so a change there raises nothing: {e}");
-                None
-            }
-        };
 
         let at = endpoint.clone();
         // **控制面没了就得退，不能只记一行日志。**
