@@ -22,6 +22,19 @@ pub enum KeyPosition {
     Bearer,
 }
 
+impl KeyPosition {
+    /// 路径认不出客户端时，出错用哪种格式回。**这是剩下唯一可靠的线索** ——
+    /// key 的位置是 SDK 自己决定的。
+    pub fn dialect(self) -> tw_dialect::ir::Dialect {
+        use tw_dialect::ir::Dialect;
+        match self {
+            KeyPosition::AnthropicHeader => Dialect::Anthropic,
+            KeyPosition::GoogleHeader => Dialect::Gemini,
+            KeyPosition::Bearer => Dialect::Chat,
+        }
+    }
+}
+
 /// 四个位置，因为四种客户端各写各的。
 ///
 /// 顺序有讲究：**先看专用头，最后才看 query**。query 里的 key 会进访问

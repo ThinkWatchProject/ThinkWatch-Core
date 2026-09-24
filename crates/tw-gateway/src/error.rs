@@ -5,8 +5,9 @@
 //! 另外每个错误都带 `x-thinkwatch-error` 头和 `[ThinkWatch]` 前缀 ——
 //! 让人一眼看出这一层是谁，而不是去怀疑上游。
 
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use tw_dialect::ir::Dialect;
 use tw_types::Msg;
 #[cfg(test)]
 use tw_types::msg;
@@ -57,65 +58,6 @@ impl Source {
             Source::Denied => StatusCode::FORBIDDEN,
         }
     }
-    /// Anthropic 的 error.type 词表。
-    fn anthropic_type(&self) -> &'static str {
-        match self {
-            Source::Auth => "authentication_error",
-            Source::Config => "api_error",
-            Source::Upstream => "api_error",
-            Source::Request => "invalid_request_error",
-            Source::RateLimited => "rate_limit_error",
-            Source::Denied => "permission_error",
-        }
-    }
-
-    /// OpenAI 的 `error.type` 词表。**和 Anthropic 的不是一套词** ——
-    /// 直接把 `authentication_error` 塞进 OpenAI 形状里，客户端的错误
-    /// 分支会全部走空。
-    fn openai_type(&self) -> &'static str {
-        match self {
-            Source::Auth => "invalid_request_error",
-            Source::Config | Source::Upstream => "server_error",
-            Source::Request => "invalid_request_error",
-            Source::RateLimited => "rate_limit_exceeded",
-            Source::Denied => "invalid_request_error",
-        }
-    }
-
-    /// Google 的 `status`。
-    fn google_status(&self) -> &'static str {
-        match self {
-            Source::Auth => "UNAUTHENTICATED",
-            Source::Config | Source::Upstream => "UNAVAILABLE",
-            Source::Request => "INVALID_ARGUMENT",
-            Source::RateLimited => "RESOURCE_EXHAUSTED",
-            Source::Denied => "PERMISSION_DENIED",
-        }
-    }
-}
-
-/// 入站方言。**错误体要用它的原生形状** —— 一个 Anthropic 客户端收到
-/// OpenAI 形状的 error body，会在解析时炸掉，然后报一个和真实原因完全
-/// 无关的错。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Dialect {
-    /// 猜不出时的默认。桌面版的主用例是 Claude Code
-    #[default]
-    Anthropic,
-    Openai,
-    Gemini,
-}
-
-impl Dialect {
-    /// 从客户端把 key 放在哪儿推断。**这是我们唯一可靠的线索** ——
-    /// 路径和 UA 都可以被中间层改写，而 key 的位置是 SDK 自己决定的。
-    pub fn from_key_position(p: crate::auth::KeyPosition) -> Self {
-        match p {
-            crate::auth::KeyPosition::AnthropicHeader => Dialect::Anthropic,
-            crate::auth::KeyPosition::GoogleHeader => Dialect::Gemini,
-            crate::auth::KeyPosition::Bearer => Dialect::Openai,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -124,8 +66,8 @@ pub struct GatewayError {
     /// 为什么失败。**发给 AI 客户端的是 `detail.text`**（它们只认字符串），
     /// 界面拿 `detail.code` 去自己的词表里找句子。见 [`tw_types::Msg`]。
     pub detail: Msg,
-    /// 用哪种方言的形状回。**认证失败时还不知道方言**（key 就是没认出
-    /// 来），所以它有默认值而不是必填。
+    /// 用哪种格式的形状回。**认证失败时还不知道格式**（key 就是没认出
+    /// 来），所以先按 Anthropic —— 桌面版的主用例是 Claude Code。
     pub dialect: Dialect,
 }
 
@@ -134,7 +76,7 @@ impl GatewayError {
         Self {
             source,
             detail,
-            dialect: Dialect::default(),
+            dialect: Dialect::Anthropic,
         }
     }
 
@@ -157,7 +99,7 @@ impl GatewayError {
         self.detail.args.insert("attempts".into(), chain);
         self
     }
-    /// 认出客户端之后补上方言。**忘了调只会退回 Anthropic 形状**，
+    /// 认出客户端之后补上格式。**忘了调只会退回 Anthropic 形状**，
     /// 那是个安全的默认，不是一个静默的错误。
     pub fn in_dialect(mut self, d: Dialect) -> Self {
         self.dialect = d;
@@ -184,79 +126,49 @@ impl GatewayError {
 }
 
 impl GatewayError {
+    /// 发给客户端的那句话。`[ThinkWatch]` 前缀不是装饰：没有它，用户看到
+    /// 一个 401 会先去查上游的密钥 —— 而问题在中间这一层。
+    fn client_message(&self) -> String {
+        format!("[ThinkWatch] {}", self.detail.text)
+    }
+
     /// 流中途断掉时，唯一还能说话的地方是流本身。
     ///
     /// 首字节已经发出去了，状态码和响应头都改不了 —— 什么都不做的话，
     /// 客户端看到的是一个**戛然而止的流**，而截断和「答完了」在 SSE
-    /// 里长得一模一样。
+    /// 里长得一模一样。帧的形状见 [`tw_dialect::convert::error_frame`]。
     pub fn sse_frame(&self) -> String {
-        let msg = format!("[ThinkWatch] {}", self.detail.text);
-        let data = match self.dialect {
-            Dialect::Anthropic => serde_json::json!({
-                "type": "error",
-                "error": { "type": self.source.anthropic_type(), "message": msg },
-            }),
-            Dialect::Openai => serde_json::json!({
-                "error": {
-                    "message": msg,
-                    "type": self.source.openai_type(),
-                    "code": self.source.slug(),
-                }
-            }),
-            Dialect::Gemini => serde_json::json!({
-                "error": {
-                    "code": self.source.status().as_u16(),
-                    "message": msg,
-                    "status": self.source.google_status(),
-                }
-            }),
-        };
-        format!("event: error\ndata: {data}\n\n")
+        tw_dialect::convert::error_frame(
+            self.dialect,
+            self.source.status().as_u16(),
+            &self.client_message(),
+        )
     }
 
-    /// 这个错误的响应体，**客户端方言的形状**。
+    /// 这个错误的响应体，**客户端格式的形状**（见
+    /// [`tw_dialect::convert::error_body`]）。
     ///
     /// 非流式的响应体被扣下来时要顶替它的位置：状态码和响应头那时已经
     /// 发出去了，body 是唯一还能说话的地方 —— 和 `sse_frame` 在流上扮
     /// 演的是同一个角色。
     pub fn body_bytes(&self) -> Vec<u8> {
-        self.body_value().to_string().into_bytes()
-    }
-
-    fn body_value(&self) -> serde_json::Value {
-        // `[ThinkWatch]` 前缀不是装饰。没有它，用户看到一个 401 会先去
-        // 查上游的密钥 —— 而问题在中间这一层。
-        let msg = format!("[ThinkWatch] {}", self.detail.text);
-        match self.dialect {
-            Dialect::Anthropic => serde_json::json!({
-                "type": "error",
-                "error": { "type": self.source.anthropic_type(), "message": msg },
-            }),
-            // OpenAI 没有外层的 `type`，而 `param` / `code` 是它自己那套
-            Dialect::Openai => serde_json::json!({
-                "error": {
-                    "message": msg,
-                    "type": self.source.openai_type(),
-                    "param": serde_json::Value::Null,
-                    "code": self.source.slug(),
-                }
-            }),
-            Dialect::Gemini => serde_json::json!({
-                "error": {
-                    "code": self.source.status().as_u16(),
-                    "message": msg,
-                    "status": self.source.google_status(),
-                }
-            }),
-        }
+        tw_dialect::convert::error_body(
+            self.dialect,
+            self.source.status().as_u16(),
+            &self.client_message(),
+        )
     }
 }
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        let body = self.body_value();
-        let mut resp = (self.source.status(), axum::Json(body)).into_response();
-        resp.headers_mut().insert(
+        let mut resp = (self.source.status(), self.body_bytes()).into_response();
+        let h = resp.headers_mut();
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        h.insert(
             "x-thinkwatch-error",
             HeaderValue::from_static(self.source.slug()),
         );
@@ -329,5 +241,33 @@ mod tests {
             assert_eq!(status, want_status);
             assert_eq!(slug, want_slug);
         }
+    }
+
+    #[tokio::test]
+    async fn each_client_gets_the_error_in_its_own_shape() {
+        let e = || GatewayError::rate_limited(msg!("t.x" => "slow down"));
+        let (_, _, json) = body_of(e().in_dialect(Dialect::Chat)).await;
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert!(json["error"]["param"].is_null());
+        let (_, _, json) = body_of(e().in_dialect(Dialect::Gemini)).await;
+        assert_eq!(json["error"]["code"], 429);
+        assert_eq!(json["error"]["status"], "RESOURCE_EXHAUSTED");
+        // 上游坏了在 Google 的词表里是 UNAVAILABLE，不是 INTERNAL（那是说我们自己坏了）
+        let (_, _, json) =
+            body_of(GatewayError::upstream(msg!("t.x" => "x")).in_dialect(Dialect::Gemini)).await;
+        assert_eq!(json["error"]["status"], "UNAVAILABLE");
+    }
+
+    #[test]
+    fn a_responses_stream_is_told_with_response_failed() {
+        // Chat 形状的 `{"error":…}` 在 Responses 的流里是一帧没人认的数据，客户端
+        // 看到的是流没说完就断了
+        let f = GatewayError::upstream(msg!("t.x" => "reset"))
+            .in_dialect(Dialect::Responses)
+            .sse_frame();
+        assert!(f.starts_with("event: response.failed\n"), "{f}");
+        assert!(f.contains("[ThinkWatch] reset"), "{f}");
+        let a = GatewayError::upstream(msg!("t.x" => "reset")).sse_frame();
+        assert!(a.starts_with("event: error\n"), "{a}");
     }
 }

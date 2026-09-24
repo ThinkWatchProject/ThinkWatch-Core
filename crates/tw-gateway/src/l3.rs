@@ -137,7 +137,7 @@ pub fn probe_request(
         &probe(model, max_output_tokens),
         &ir::Target {
             dialect,
-            official: provider.is_official_endpoint(),
+            official: tw_dialect::official::is_official_host(&provider.base_url),
             default_max_tokens: MAX_TOKENS,
         },
     );

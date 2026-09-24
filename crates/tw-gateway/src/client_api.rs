@@ -126,15 +126,6 @@ impl ClientApi {
             ClientApi::Gemini => &[Protocol::Gemini],
         }
     }
-
-    /// 出错时用哪种格式回。
-    pub fn error_dialect(&self) -> crate::error::Dialect {
-        match self {
-            ClientApi::AnthropicMessages => crate::error::Dialect::Anthropic,
-            ClientApi::OpenaiChat | ClientApi::OpenaiResponses => crate::error::Dialect::Openai,
-            ClientApi::Gemini => crate::error::Dialect::Gemini,
-        }
-    }
 }
 
 /// 这些协议写进模型目录时的名字，给目录的过滤用。
@@ -239,7 +230,7 @@ mod tests {
     fn claude_code_is_an_anthropic_client_wherever_it_puts_the_key() {
         // 这正是改成看路径的原因：`ANTHROPIC_AUTH_TOKEN` 发的是 Bearer
         let api = ClientApi::of_path("/v1/messages").unwrap();
-        assert_eq!(api.error_dialect(), crate::error::Dialect::Anthropic);
+        assert_eq!(api.dialect(), Dialect::Anthropic);
         assert!(api.servable_by(true).contains(&Protocol::Anthropic));
     }
 

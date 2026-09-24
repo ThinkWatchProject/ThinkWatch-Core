@@ -37,6 +37,39 @@ fn base_client_builder() -> reqwest::ClientBuilder {
         .http2_keep_alive_interval(std::time::Duration::from_secs(15))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(15))
         .http2_keep_alive_while_idle(true)
+        // **不跟重定向。**这些客户端发出去的请求都带着凭据：上游的
+        // `x-api-key`、`x-goog-api-key`、配置里写的自定义头、OAuth 的
+        // refresh token。reqwest 默认跟到别的主机时只摘 `authorization`
+        // 这几个标准头，别的照带，https 跳到 http 也照跟 —— 一个被劫持
+        // 或写错的上游一句 302 就能把密钥引到任何地方。3xx 原样交还给
+        // 客户端，由它决定
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// 拉公开数据（默认价目表）用的客户端。
+///
+/// **不带任何凭据**，所以可以跟重定向（托管地址搬家时 GitHub 会回 301）；
+/// 但不从 https 降到 http —— 降级之后内容可以被路上任何人换掉。超时和
+/// 系统代理同数据面那一套。
+pub fn public_client() -> Result<reqwest::Client, GatewayError> {
+    base_client_builder()
+        .redirect(reqwest::redirect::Policy::custom(|a| {
+            let downgrade = a.url().scheme() == "http"
+                && a.previous().last().is_some_and(|u| u.scheme() == "https");
+            if downgrade {
+                a.error("refused to follow a redirect from https to http")
+            } else if a.previous().len() >= 10 {
+                a.error("too many redirects")
+            } else {
+                a.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| {
+            GatewayError::config(msg!(
+                "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
+            ))
+        })
 }
 
 /// 给一个 provider 建 Client，带上它该走的代理。
@@ -1305,8 +1338,8 @@ async fn passthrough(
     // **认证失败在这一行之前，那时方言还猜不出来** —— key 就是没认出来
     // 的，只能退回 Anthropic 形状，而那是桌面版的主用例。
     let dialect = api
-        .map(|a| a.error_dialect())
-        .unwrap_or_else(|| crate::error::Dialect::from_key_position(position));
+        .map(|a| a.dialect())
+        .unwrap_or_else(|| position.dialect());
     //
     // 这个请求的结局（见 `crate::ending`）。**管线发出开始事件时把它放
     // 进来。**
@@ -1420,7 +1453,7 @@ async fn pipeline(
     body: Bytes,
     client_name: String,
     api: Option<crate::client_api::ClientApi>,
-    dialect: crate::error::Dialect,
+    dialect: tw_dialect::ir::Dialect,
     started: std::time::Instant,
     live: crate::live::Pass,
     from: Sender,
@@ -1823,7 +1856,9 @@ async fn pipeline(
                             d.clone()
                                 .encode(&tw_dialect::ir::Target {
                                     dialect: tw_dialect::ir::Dialect::Responses,
-                                    official: provider.is_official_endpoint(),
+                                    official: tw_dialect::official::is_official_host(
+                                        &provider.base_url,
+                                    ),
                                     default_max_tokens: 0,
                                 })
                                 .session,
@@ -1869,7 +1904,7 @@ async fn pipeline(
                 };
                 let p = d.encode(&tw_dialect::ir::Target {
                     dialect,
-                    official: provider.is_official_endpoint(),
+                    official: tw_dialect::official::is_official_host(&provider.base_url),
                     default_max_tokens: crate::translate::default_max_tokens(
                         &state.pricing.load(),
                         &d.request.model,

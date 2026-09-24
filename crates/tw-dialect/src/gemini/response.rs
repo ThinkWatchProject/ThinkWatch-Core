@@ -165,7 +165,7 @@ pub fn error_body(status: u16, message: &str) -> Value {
         403 => "PERMISSION_DENIED",
         404 => "NOT_FOUND",
         429 => "RESOURCE_EXHAUSTED",
-        503 | 529 => "UNAVAILABLE",
+        502 | 503 | 529 => "UNAVAILABLE",
         504 => "DEADLINE_EXCEEDED",
         _ => "INTERNAL",
     };

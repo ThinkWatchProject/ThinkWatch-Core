@@ -752,43 +752,6 @@ impl Provider {
         self.protocol
             .or_else(|| Self::guess_protocol(&self.base_url))
     }
-
-    /// 这是不是一个厂商官方的端点。格式转换按它决定要不要照官方接口的
-    /// 严格要求来写请求。
-    ///
-    /// **判据只有域名。**一个中转站可以把自己叫做 `anthropic-official`，
-    /// 但它没法让自己的 base_url 变成 `api.anthropic.com`。
-    pub fn is_official_endpoint(&self) -> bool {
-        const OFFICIAL: &[&str] = &[
-            "api.anthropic.com",
-            "api.openai.com",
-            "generativelanguage.googleapis.com",
-            "api.x.ai",
-            "api.deepseek.com",
-            "api.moonshot.cn",
-            "open.bigmodel.cn",
-            "api.z.ai",
-            "dashscope.aliyuncs.com",
-            "chatgpt.com",
-        ];
-        let h = self.base_url.to_ascii_lowercase();
-        // **要在 host 上比，不能只看包含。**`https://evil.com/api.anthropic.com/`
-        // 里也「含有」那个域名
-        let host = h
-            .split("://")
-            .nth(1)
-            .unwrap_or(&h)
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .split('@')
-            .next_back()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("");
-        OFFICIAL.contains(&host) || host.ends_with(".amazonaws.com")
-    }
 }
 
 /// 刷新之后要写回配置的值。
@@ -1370,29 +1333,5 @@ mod strictness_tests {
         let m = e.to_string();
         assert!(!m.contains("不是合法的 YAML"), "{m}");
         assert!(m.contains("nope"), "{m}");
-    }
-
-    #[test]
-    fn an_official_endpoint_is_recognised_by_host_not_by_name() {
-        // **一个中转站可以把自己叫做 `anthropic-official`，但它没法让
-        // 自己的 base_url 变成 `api.anthropic.com`。**域名是这里唯一
-        // 不可伪装的东西。
-        let p = |name: &str, url: &str| Provider {
-            name: name.into(),
-            base_url: url.into(),
-            ..Default::default()
-        };
-        assert!(p("随便叫", "https://api.anthropic.com").is_official_endpoint());
-        assert!(p("x", "https://api.anthropic.com/v1/").is_official_endpoint());
-        assert!(p("x", "https://bedrock-runtime.us-east-1.amazonaws.com").is_official_endpoint());
-
-        // 名字骗不了人
-        assert!(!p("anthropic-official", "https://relay.example.com").is_official_endpoint());
-        // 把官方域名塞进路径里也骗不了
-        assert!(!p("x", "https://evil.com/api.anthropic.com/v1").is_official_endpoint());
-        // 塞进子域名也不行
-        assert!(!p("x", "https://api.anthropic.com.evil.com").is_official_endpoint());
-        // 塞进 userinfo 里同样不行
-        assert!(!p("x", "https://api.anthropic.com@evil.com/v1").is_official_endpoint());
     }
 }

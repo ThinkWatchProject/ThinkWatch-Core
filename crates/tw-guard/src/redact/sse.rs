@@ -510,8 +510,8 @@ impl SseRestorer {
         let mut out = Vec::new();
         // 帧之间用空行分隔。**收不齐就等下一块** —— 半帧转发出去，
         // 客户端那边会当成一帧解析失败
-        while let Some(end) = find_frame_end(&self.partial) {
-            let frame: Vec<u8> = self.partial.drain(..end).collect();
+        while let Some((n, sep)) = tw_dialect::frame::frame_end(&self.partial) {
+            let frame: Vec<u8> = self.partial.drain(..n + sep).collect();
             out.extend_from_slice(&self.rewrite(&frame));
         }
         out
@@ -536,15 +536,16 @@ impl SseRestorer {
             return frame.to_vec();
         };
         // 多行 `data:` 按规范用换行连起来
-        let data: Vec<&str> = text
-            .split_inclusive('\n')
-            .filter_map(|l| l.trim_end_matches(['\n', '\r']).strip_prefix("data:"))
-            .map(|d| d.strip_prefix(' ').unwrap_or(d))
-            .collect();
-        if data.is_empty() {
+        if !text
+            .lines()
+            .any(|l| tw_dialect::frame::data_of(l).is_some())
+        {
             return frame.to_vec();
         }
-        let Ok(mut v) = serde_json::from_str::<Value>(&data.join("\n")) else {
+        let data = tw_dialect::frame::parse(frame)
+            .map(|f| f.data)
+            .unwrap_or_default();
+        let Ok(mut v) = serde_json::from_str::<Value>(&data) else {
             // `[DONE]` 这类：流就要结束了，扣住的尾巴得赶在它前面
             let mut out: Vec<u8> = self
                 .frames
@@ -569,7 +570,7 @@ impl SseRestorer {
         let json = serde_json::to_string(&v).unwrap_or_default();
         let mut wrote = false;
         for line in text.split_inclusive('\n') {
-            if line.trim_end_matches(['\n', '\r']).starts_with("data:") {
+            if tw_dialect::frame::data_of(line.trim_end_matches(['\n', '\r'])).is_some() {
                 if !wrote {
                     out.extend_from_slice(b"data: ");
                     out.extend_from_slice(json.as_bytes());
@@ -585,15 +586,6 @@ impl SseRestorer {
         }
         out
     }
-}
-
-/// 一帧到哪儿结束（含分隔的空行）。
-fn find_frame_end(buf: &[u8]) -> Option<usize> {
-    // `\n\n` 或者 `\r\n\r\n`
-    buf.windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|i| i + 2)
-        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
 }
 
 /// 一条响应流上的还原器，按内容类型分派。

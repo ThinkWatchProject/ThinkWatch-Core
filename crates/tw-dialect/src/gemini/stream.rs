@@ -266,10 +266,7 @@ impl Writer {
             Event::Usage(u) => self.usage.get_or_insert_default().merge(u),
             Event::Stop(s) => self.stop = Some(s.clone()),
             Event::Error { message } => {
-                self.write(
-                    &json!({ "error": { "code": 500, "message": message, "status": "INTERNAL" } }),
-                    &mut out,
-                );
+                self.write(&super::response::error_body(500, message), &mut out);
                 self.close(&mut out);
             }
         }
@@ -305,6 +302,11 @@ impl Writer {
         self.close(&mut out);
         out
     }
+}
+
+/// 流里的一个错误帧（`alt=sse` 的写法）
+pub(crate) fn error_frame(status: u16, message: &str) -> String {
+    frame::data(&super::response::error_body(status, message))
 }
 
 #[cfg(test)]

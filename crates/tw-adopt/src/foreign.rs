@@ -182,11 +182,13 @@ fn write_atomic(real: &Path, text: &str, keep_mode: Option<u32>) -> Result<(), F
         path: tmp.clone(),
         source,
     };
-    std::fs::write(&tmp, text).map_err(w)?;
+    // 临时文件**生来就是 0600**：里面已经是换上的网关密钥。写完再放宽成原文件
+    // 的权限位（用户自己给的，`chmod` 不受 umask 影响，照原样还回去）。
+    let _ = std::fs::remove_file(&tmp);
+    write_private(&tmp, text.as_bytes()).map_err(w)?;
     #[cfg(unix)]
-    {
+    if let Some(mode) = keep_mode.filter(|m| *m != 0o600) {
         use std::os::unix::fs::PermissionsExt;
-        let mode = keep_mode.unwrap_or(0o600);
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(w)?;
     }
     #[cfg(not(unix))]
@@ -195,6 +197,21 @@ fn write_atomic(real: &Path, text: &str, keep_mode: Option<u32>) -> Result<(), F
         path: real.to_path_buf(),
         source,
     })
+}
+
+/// 写一个只给自己看的文件：**新建时带着 `0600` 建出来**，不是建完再 `chmod`
+/// —— 那中间有一个按 umask 给的 0644 窗口。文件已经在的话 `mode` 不生效，
+/// 权限保持原样（调用方要收紧就自己再 `chmod`）。
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
 }
 
 /// 把 `tmp` 挪成 `real`，**目标已经存在也照挪**。

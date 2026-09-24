@@ -66,7 +66,7 @@ impl Blobs {
     pub fn put(&self, at_ms: i64, id: i64, which: Which, body: &[u8]) -> bool {
         let p = self.path_for(at_ms, id, which);
         let Some(dir) = p.parent() else { return false };
-        if std::fs::create_dir_all(dir).is_err() {
+        if create_private_dirs(dir).is_err() {
             return false;
         }
         #[cfg(unix)]
@@ -79,7 +79,7 @@ impl Blobs {
         // 截断而不是跳过：**开头那几 KB 是最有用的部分**（模型名、system
         // prompt、工具定义都在前面），而完整存下来会挤掉别人的。
         let slice = &body[..body.len().min(MAX_ONE)];
-        match std::fs::write(&p, slice) {
+        match write_private(&p, slice) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
@@ -122,7 +122,7 @@ impl Blobs {
             let p = self
                 .path_for(at_ms, id, which)
                 .with_extension(format!("{}.len", which.suffix()));
-            if std::fs::write(&p, original_len.to_string()).is_ok() {
+            if write_private(&p, original_len.to_string().as_bytes()).is_ok() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -192,6 +192,33 @@ impl Blobs {
     pub fn total_bytes(&self) -> u64 {
         self.days().iter().map(|(_, p)| dir_size(p)).sum()
     }
+}
+
+/// 建目录，**新建的每一层生来就是 0700**（`mkdir(2)` 那一刻给，不是事后收）。
+fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+/// 写一个只给自己看的文件：**新建时带着 0600 建出来**，不是写完再 `chmod`
+/// —— 那中间有一个按 umask 给的 0644 窗口，窗口里别的用户能打开它。已经在的
+/// 文件 `mode` 不生效，由调用方随后收紧。
+fn write_private(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(p)?.write_all(bytes)
 }
 
 fn looks_like_a_day(n: &str) -> bool {

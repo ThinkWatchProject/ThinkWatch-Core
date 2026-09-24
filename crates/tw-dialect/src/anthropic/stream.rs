@@ -239,10 +239,7 @@ impl Writer {
             Event::Stop(s) => self.stop = Some(s.clone()),
             Event::Error { message } => {
                 self.failed = true;
-                out.push_str(&frame::named(
-                    "error",
-                    &json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
-                ));
+                out.push_str(&error_frame(500, message));
             }
         }
         out
@@ -305,6 +302,11 @@ impl Writer {
         ));
         out
     }
+}
+
+/// 流里的一个错误帧。`status` 决定 `error.type`，和整包错误体同一张表
+pub(crate) fn error_frame(status: u16, message: &str) -> String {
+    frame::named("error", &super::response::error_body(status, message))
 }
 
 #[cfg(test)]

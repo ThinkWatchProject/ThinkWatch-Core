@@ -186,7 +186,7 @@ pub fn write_if_unchanged(
 /// 原子写 + `0600`。
 ///
 /// 先写临时文件再 rename —— **中断的写不该留下半份配置**。权限不能靠
-/// umask 的运气：这个文件里有明文密钥。
+/// umask 的运气：这个文件里有明文密钥。历史版本也走这里。
 pub fn write_atomic(path: &Path, text: &str) -> Result<Fingerprint, StoreError> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -203,11 +203,22 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<Fingerprint, StoreError> 
         path: tmp.clone(),
         source,
     };
-    std::fs::write(&tmp, text).map_err(io)?;
+    // **建的那一刻就是 0600**，不是建完再 `chmod` —— 那中间有一个按 umask
+    // 给的 0644 窗口，窗口里别的用户已经能把它打开。上一次崩溃留下的同名
+    // 临时文件先删掉，`create_new` 才让 `mode` 一定生效。
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        opts.open(&tmp)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .map_err(io)?;
     }
     std::fs::rename(&tmp, path).map_err(|source| StoreError::Io {
         path: path.to_path_buf(),
