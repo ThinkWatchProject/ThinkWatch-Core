@@ -161,19 +161,19 @@ pub fn user_level(home: &Path) -> Vec<Source> {
         f(
             "claude-desktop",
             Kind::Mcp,
-            under(home, tw_adopt::paths::claude_desktop_config()),
+            tw_adopt::paths::CLAUDE_DESKTOP_CONFIG.resolve(home),
         ),
         f("cursor", Kind::Mcp, under(home, ".cursor/mcp.json")),
         f("codex", Kind::Mcp, under(home, ".codex/config.toml")),
         f(
             "opencode",
             Kind::Mcp,
-            under(home, ".config/opencode/opencode.json"),
+            tw_adopt::paths::OPENCODE_CONFIG.resolve(home),
         ),
         f(
             "zed",
             Kind::Mcp,
-            under(home, tw_adopt::paths::zed_settings()),
+            tw_adopt::paths::ZED_SETTINGS.resolve(home),
         ),
         // 指令类
         f(
@@ -257,7 +257,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         // 路径按平台走 —— 写死 macOS 那一条的话，这个测试在 Windows 上
         // 会造一个没人找的文件，然后报告扫描漏了它。
-        touch(&d.path().join(tw_adopt::paths::claude_desktop_config()));
+        touch(&tw_adopt::paths::CLAUDE_DESKTOP_CONFIG.resolve(d.path()));
         let got = user_level(d.path());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].client, "claude-desktop");

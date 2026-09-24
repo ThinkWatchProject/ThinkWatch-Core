@@ -26,7 +26,7 @@ fn bed(client: &str, contents: &str) -> Bed {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let c = adoptable().into_iter().find(|c| c.id == client).unwrap();
-    let p = home.join(c.config);
+    let p = c.config_path(&home);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     if !contents.is_empty() {
         std::fs::write(&p, contents).unwrap();
@@ -338,7 +338,7 @@ fn every_adoptable_client_survives_a_round_trip() {
         let b = bed(c.id, seed);
         let p = plan_adopt(&c, &b.home, &gw()).unwrap();
         apply(&c, &p, &b.backups).unwrap();
-        let after = read(&b.home.join(c.config));
+        let after = read(&c.config_path(&b.home));
         assert!(
             after.contains("别动"),
             "{} 把用户原有的字段弄丢了：\n{after}",
@@ -348,7 +348,7 @@ fn every_adoptable_client_survives_a_round_trip() {
         let r = plan_restore(&c, &b.home).unwrap();
         apply_restore(&c, &r, &b.backups).unwrap();
         assert_eq!(
-            read(&b.home.join(c.config)),
+            read(&c.config_path(&b.home)),
             seed,
             "{} 还原之后对不上",
             c.id
@@ -373,7 +373,7 @@ fn a_gateway_without_a_key_writes_no_key_field() {
         let p = plan_adopt(&c, &b.home, &g).unwrap();
         assert!(!p.carries_secret, "{} 说自己要写密钥，可是没有密钥", c.id);
         apply(&c, &p, &b.backups).unwrap();
-        let after = read(&b.home.join(c.config));
+        let after = read(&c.config_path(&b.home));
         assert!(
             !after.contains("\"apiKey\": \"\""),
             "{} 写了一个空密钥：{after}",

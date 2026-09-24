@@ -753,7 +753,7 @@ async fn every_client_says_how_to_connect_it_by_hand() {
     assert_eq!(cc.manual.endpoint, base, "Claude Code 要的地址不带 /v1");
     assert_eq!(
         cc.manual.steps[0].arg("file"),
-        tw_adopt::paths::shown(".claude/settings.json")
+        tw_adopt::paths::Loc::Home(".claude/settings.json").shown()
     );
     let url = cc
         .manual

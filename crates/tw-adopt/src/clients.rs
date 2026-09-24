@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tw_types::{Msg, msg};
 
 use crate::json::Val;
+use crate::paths::Loc;
 
 /// 配置文件是什么格式。**决定了怎么做字段级合并，以及哨兵往哪儿放。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,8 +104,8 @@ impl Verified {
 pub struct Client {
     pub id: &'static str,
     pub name: &'static str,
-    /// 配置文件，相对 `$HOME`
-    pub config: &'static str,
+    /// 配置文件
+    pub config: Loc,
     pub format: Format,
     pub takes_effect: TakesEffect,
     /// 优先级比主配置更高、会盖住我们的那些文件（诊断链）。
@@ -120,12 +121,15 @@ pub struct Client {
     /// 不认识这个码的客户端。
     pub costs: &'static [(&'static str, &'static str)],
     pub verified: Verified,
-    /// 判断「这台机器上装了它吗」的痕迹，相对 `$HOME`。
+    /// 判断「这台机器上装了它吗」的痕迹。
     ///
     /// 不能只看配置文件在不在：`.aider.conf.yml` 这种，没接管过的用户
     /// 本来就没有；而 `~/.claude/` 这种，装了就一定有。
-    pub marker: &'static [&'static str],
-    /// 进程名里认得出它的片段。诊断「客户端没重启」要用。
+    pub marker: &'static [Loc],
+    /// 认得出它的进程名开头。诊断「客户端没重启」要用。
+    ///
+    /// **是开头，不是全名**：Linux 的进程名截到 15 个字节，带目标三元组的
+    /// 二进制名（`codex-x86_64-unknown-linux-musl`）截完只剩前面一段。
     pub process: &'static [&'static str],
     /// 它会读的环境变量。扫 shell 配置时找这些名字。
     pub env_vars: &'static [&'static str],
@@ -192,6 +196,21 @@ fn secret(path: &[&str], value: Val) -> Edit {
 /// Codex 的 `openai` / `ollama` / `lmstudio` 是保留 id，不能撞。
 pub const PROVIDER_ID: &str = "thinkwatch";
 
+/// Zed 的进程名。
+///
+/// 三个平台各是各的，照 Zed 自己的打包脚本：macOS 上是
+/// `Zed.app/Contents/MacOS/zed`（`ps` 给的是路径，取最后一段就是小写的
+/// `zed`）；Linux 的包把编辑器放在 `libexec/zed-editor`，`bin/zed` 只是个
+/// 命令行前端 —— 认前者，否则一个挂着 `--wait` 的命令行会被当成编辑器；
+/// Windows 上是 `Zed.exe`。
+const ZED_PROCESS: &str = if cfg!(windows) {
+    "Zed"
+} else if cfg!(target_os = "macos") {
+    "zed"
+} else {
+    "zed-editor"
+};
+
 /// 表一：能接管 API 端点的。
 ///
 /// 字段名都对应上游当前文档，不是猜的。
@@ -200,7 +219,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "claude-code",
             name: "Claude Code",
-            config: ".claude/settings.json",
+            config: Loc::Home(".claude/settings.json"),
             format: Format::Json,
             takes_effect: TakesEffect::Immediately,
             // **`settings.local.json` 优先级更高。**cc-switch #6828 栽在这里
@@ -220,7 +239,7 @@ pub fn adoptable() -> Vec<Client> {
                 ),
             ],
             verified: Verified::FieldsOnly,
-            marker: &[".claude"],
+            marker: &[Loc::Home(".claude")],
             process: &["claude"],
             env_vars: &[
                 "ANTHROPIC_BASE_URL",
@@ -234,14 +253,15 @@ pub fn adoptable() -> Vec<Client> {
         },
         // **不叫「Codex CLI」。**`~/.codex/config.toml` 是一份配置、两个
         // 前端：命令行的 codex，和 ChatGPT 桌面版内置的那一个
-        // （`ChatGPT.app/Contents/Resources/codex`，同一个二进制）。桌面版
+        // （macOS 上是 `ChatGPT.app/Contents/Resources/codex`，同一个二进制；
+        // Windows 和 Linux 上也有这个桌面版）。桌面版
         // 启动 app-server 时不带任何 provider 覆盖，`model_provider` 完全
         // 由这个文件决定 —— 只装了桌面版的用户看到「Codex CLI」，会以为
         // 在说一个他没装的东西。
         Client {
             id: "codex",
             name: "Codex",
-            config: ".codex/config.toml",
+            config: Loc::Home(".codex/config.toml"),
             format: Format::Toml,
             // **读环境变量的，必须关掉终端重开**
             takes_effect: TakesEffect::OnRestart,
@@ -260,7 +280,7 @@ pub fn adoptable() -> Vec<Client> {
                 ),
             ],
             verified: Verified::Measured,
-            marker: &[".codex"],
+            marker: &[Loc::Home(".codex")],
             process: &["codex"],
             env_vars: &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"],
             key_elsewhere: None,
@@ -269,7 +289,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "opencode",
             name: "opencode",
-            config: ".config/opencode/opencode.json",
+            config: crate::paths::OPENCODE_CONFIG,
             format: Format::Json,
             takes_effect: TakesEffect::OnRestart,
             shadowed_by: &[],
@@ -278,7 +298,7 @@ pub fn adoptable() -> Vec<Client> {
                 "opencode has to be restarted afterwards.",
             )],
             verified: Verified::FieldsOnly,
-            marker: &[".config/opencode", ".local/share/opencode"],
+            marker: &[Loc::XdgConfig("opencode"), Loc::XdgData("opencode")],
             process: &["opencode"],
             env_vars: &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
             key_elsewhere: None,
@@ -287,7 +307,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "zed",
             name: "Zed",
-            config: crate::paths::zed_settings(),
+            config: crate::paths::ZED_SETTINGS,
             format: Format::Json,
             takes_effect: TakesEffect::Immediately,
             shadowed_by: &[],
@@ -299,7 +319,7 @@ pub fn adoptable() -> Vec<Client> {
             )],
             verified: Verified::FieldsOnly,
             marker: &[crate::paths::ZED_DIR],
-            process: &["Zed"],
+            process: &[ZED_PROCESS],
             env_vars: &[],
             key_elsewhere: Some((
                 code!("adopt.manual.zed.key"),
@@ -310,7 +330,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "aider",
             name: "Aider",
-            config: ".aider.conf.yml",
+            config: Loc::Home(".aider.conf.yml"),
             format: Format::Yaml,
             takes_effect: TakesEffect::OnRestart,
             // **三层查找，后面的覆盖前面的**（home → 仓库根 → cwd）。
@@ -328,7 +348,10 @@ pub fn adoptable() -> Vec<Client> {
             ],
             verified: Verified::FieldsOnly,
             // 没接管过的用户本来就没有这个文件，所以它自己就是那个痕迹
-            marker: &[".aider.conf.yml", ".aider.model.settings.yml"],
+            marker: &[
+                Loc::Home(".aider.conf.yml"),
+                Loc::Home(".aider.model.settings.yml"),
+            ],
             process: &["aider"],
             env_vars: &["OPENAI_API_BASE", "OPENAI_API_KEY"],
             key_elsewhere: None,
@@ -634,7 +657,7 @@ impl Client {
     /// **没检测到它的时候也要给。**配置文件不在默认位置、或者装在别的
     /// 用户目录下时，检测不到不等于用不了 —— 照着做一样能接上。
     pub fn manual_steps(&self) -> Vec<Msg> {
-        let file = crate::paths::shown(self.config);
+        let file = self.config.shown();
         let mut out = vec![msg!(
             "adopt.manual.file", file = file =>
             "Open {file} and set the fields below."
@@ -661,7 +684,7 @@ impl Client {
     }
 
     pub fn config_path(&self, home: &std::path::Path) -> PathBuf {
-        crate::paths::under(home, self.config)
+        self.config.resolve(home)
     }
     pub fn shadow_paths(&self, home: &std::path::Path) -> Vec<PathBuf> {
         self.shadowed_by
@@ -691,9 +714,10 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "有重复的 id");
         for c in &cs {
+            let home = std::path::Path::new("/h");
             assert!(
-                !c.config.starts_with('/'),
-                "{} 的路径该是相对 home 的",
+                c.config_path(home).starts_with(home),
+                "{} 的路径该在 home 底下",
                 c.id
             );
             assert!(!c.name.is_empty());
@@ -847,12 +871,7 @@ mod tests {
         for c in adoptable() {
             let steps = c.manual_steps();
             // 写法按平台（`~/…` 或 `%USERPROFILE%\…`），各自的样子见 paths 里那条测试
-            assert_eq!(
-                steps[0].arg("file"),
-                crate::paths::shown(c.config),
-                "{}",
-                c.id
-            );
+            assert_eq!(steps[0].arg("file"), c.config.shown(), "{}", c.id);
             assert!(!edits(&c, &gw).is_empty(), "{}：没有要写的字段", c.id);
         }
         // Zed 的密钥不在配置文件里，多一步在它自己的设置里填
