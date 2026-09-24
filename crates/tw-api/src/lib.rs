@@ -15,6 +15,22 @@ use serde::{Deserialize, Serialize};
 /// 一句给人读的错误或说明，类型都是它**，不是 `String`。
 pub use tw_types::Msg;
 
+mod endpoint;
+pub mod ep;
+#[cfg(feature = "ts")]
+pub mod ts;
+pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
+
+/// core 发得出的每一个消息码（[`Msg::code`]），一行一个，按字母排。
+///
+/// **界面按码翻译，所以这就是它要翻的全部。**桌面端从钉着的那个 tag 读它，和
+/// 自己的译文表对一遍：清单里有、表里没有的，中文界面上就是英文。
+///
+/// `#` 开头的行是说明。码后面可以跟一个标记：`passthrough` 是句子只有占位符
+/// （系统或上游的原话），照 `text` 显示；`test` 是只在测试里出现的。这份清单由
+/// twcore 的 `tests/msg_codes.rs` 从源码生成、并且在 CI 上核对。
+pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
+
 /// 控制面协议版本。UI 和 CLI 连上来时检查，不匹配就明确提示「请升级
 /// 客户端」，而不是以奇怪的方式失败。
 ///
@@ -66,9 +82,15 @@ pub use tw_types::Msg;
 /// 「什么时候开始要凭据」是读它的人必须查得到的一件事。
 ///
 /// 同一版加了 `POST /shutdown`。新增端点本身不破坏什么，它跟着这次走。
-pub const CONTROL_API_VERSION: u32 = 12;
+///
+/// **13 起端点只在 [`ep`] 里写一次**，core 按它注册、客户端按它拼。顺带：扫描
+/// 换成了 `POST /scan`（项目目录走请求体，查询串里那种写法 core 一直读不了）；
+/// 框架替我们回的失败（路径不存在、方法不对、请求体读不成）也是 [`ErrorBody`]，
+/// 不再是纯文本或空响应体；传输地址改名 `control::Address`。
+pub const CONTROL_API_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Status {
     pub api_version: u32,
     /// 二进制的 CalVer
@@ -97,6 +119,7 @@ pub struct Status {
 
 /// 一次请求的观测事件。UI 的实时列表吃这个。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     /// 请求进来了
@@ -564,6 +587,7 @@ pub enum Event {
 /// **失败的原因要留着** —— 一条说「试过 A → B → C」的链，和一条还说清
 /// 每一跳为什么失败的链，排查价值差得远。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AttemptView {
     pub provider: String,
     /// - `served`：这一跳接下了请求，尝试链到此为止。上游回的是 4xx 也算
@@ -585,6 +609,7 @@ pub struct AttemptView {
 
 /// 一次请求的路由决策。**详情抽屉的 Routing 那一页吃它。**
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RoutingView {
     pub rule: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +622,7 @@ pub struct RoutingView {
 /// 我们自己推断的东西不放进这个结构 —— 界面上必须能区分「上游说的」和
 /// 「我们猜的」，而混在一个类型里就区分不了了。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct QuotaWindow {
     /// `5h` / `7d`（Anthropic）/ `weekly`（Codex）
     pub window: String,
@@ -612,6 +638,7 @@ pub struct QuotaWindow {
 
 /// 一次调用的用量。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct UsageView {
     pub input: u64,
     pub output: u64,
@@ -660,6 +687,7 @@ impl Event {
 /// **不是配置文件本身**：密钥一律只给来源描述，不给值（统一脱敏）。
 /// 界面需要的是「有哪些上游、规则怎么写的、谁健康」，不是那份 YAML。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Overview {
     /// 配置文件现在的版本号。和 `GET /config` 的 `version`、改配置时带的
     /// `base_version` 是同一个。
@@ -694,6 +722,7 @@ pub struct Overview {
 
 /// 一张自定义价目表。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PriceSheetView {
     pub name: String,
     pub multiplier: f64,
@@ -709,6 +738,7 @@ pub struct PriceSheetView {
 /// 这个视图会进日志、进诊断包、进用户贴出来的截图。有没有认证是要
 /// 显示的，认证内容不是。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxyView {
     pub name: String,
     /// `socks5h` / `socks5` / `http` / `https`
@@ -730,6 +760,7 @@ pub struct ProxyView {
 
 /// 网关发现一个代理不通时，检出来的样子。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxyFault {
     /// 卡在哪一步。说不出来的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -745,6 +776,7 @@ pub struct ProxyFault {
 /// `when.intent` 只有在对应那一类被配成 `route` 时才可能命中，所以
 /// 界面上那些写了 `intent` 的规则永远不会生效，而用户无从知道为什么。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProbeView {
     /// `health_check` / `warmup` / `titling` / `topic_detect` / `suggestion`
     pub id: String,
@@ -755,6 +787,7 @@ pub struct ProbeView {
 /// 日志留多久。两个期限分开，因为正文和记录行的代价差三个数量级 ——
 /// 一条正文几十 KB，一行记录几百字节。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RetentionView {
     /// 请求和响应的正文留几天
     pub body_days: u64,
@@ -772,12 +805,14 @@ pub struct RetentionView {
 /// **「拦截」在两项上做的事不一样**：脱敏是替换成占位符，审查是切断响应。
 /// 规则和日志在 [`SecurityDetail`] 和 `/security/events` 里，不塞进概览。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityView {
     pub redact: String,
     pub inspect_tools: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderView {
     pub name: String,
     /// 已脱敏。**编辑时不要原样写回** —— 地址里带了凭据的话，写回去的
@@ -847,6 +882,7 @@ pub struct ProviderView {
 
 /// 一个可能是密钥的值给界面看的样子。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecretView {
     /// 打过码的值。带 `${NAME}` 的值原样给 —— 它写的是从哪个环境变量读
     pub display: String,
@@ -857,6 +893,7 @@ pub struct SecretView {
 
 /// 一行请求头给界面看的样子。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HeaderView {
     pub name: String,
     /// **可能是密钥的值是打过码的**；公开的头（`anthropic-version` 之类）、
@@ -867,6 +904,7 @@ pub struct HeaderView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct OAuthView {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -884,6 +922,7 @@ pub struct OAuthView {
 
 /// 配置里引用了某个上游的一处。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReferenceView {
     /// 路由规则的去向（`to`）
@@ -899,6 +938,7 @@ pub enum ReferenceView {
 /// **是全文，不是摘要** —— 编辑对话框靠它回填：条件、去向、拒绝原因、
 /// 参数改写、安全要求，交回来的 [`RuleInput`] 是同一套写法。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RuleView {
     pub name: String,
     /// `when` 里写了的条件，按固定顺序。空 = 兜底
@@ -923,6 +963,7 @@ pub struct RuleView {
 
 /// 规则里的参数改写。每一项不写就是不改。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RuleRewrite {
     /// 换一个模型。**整个 prompt cache 随之作废**
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -936,6 +977,7 @@ pub struct RuleRewrite {
 
 /// 规则里的一个条件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConditionView {
     /// `when` 里的键：`model` / `client` / `dialect` / `input_tokens` /
     /// `max_tokens` / `tool_count` / `intent` / `provider_would_be` /
@@ -948,6 +990,7 @@ pub struct ConditionView {
 
 /// 一条路由 —— 一组规则，加上它分给了谁。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RouteView {
     pub name: String,
     /// 没绑路由的密钥走的就是这条
@@ -964,6 +1007,7 @@ pub struct RouteView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GroupView {
     pub name: String,
     /// 内置的「全部上游」：成员是全部上游，按上游列表的顺序。不能编辑、不能删除
@@ -986,6 +1030,7 @@ pub struct GroupView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ClientView {
     pub name: String,
     /// `GET /keys` 给明文 —— 密钥页要把它原样显示出来、给出复制按钮。
@@ -1013,6 +1058,7 @@ pub struct ClientView {
 
 /// 新建或保存一把网关密钥（`POST /keys`、`PUT /keys/{name}`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeySave {
     pub key: KeyInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1022,6 +1068,7 @@ pub struct KeySave {
 /// 一把密钥上用户能改的东西。**密钥的值不在里面** —— 它由 core 生成，
 /// 要换就走更换，那条路会把新值同步给已接管的客户端。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyInput {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1085,7 @@ pub struct KeyInput {
 
 /// 换哪把密钥（`POST /keys/{name}/rotate`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyRotate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -1045,6 +1093,7 @@ pub struct KeyRotate {
 
 /// 换完之后的结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyRotated {
     pub version: String,
     /// 新的密钥值。**只在这里给一次**，之后列表里只有脱敏的
@@ -1058,6 +1107,7 @@ pub struct KeyRotated {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeySynced {
     /// 客户端 id（`claude-code` …）
     pub client: String,
@@ -1071,6 +1121,7 @@ pub struct KeySynced {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeySyncFailed {
     pub client: String,
     pub name: String,
@@ -1082,6 +1133,7 @@ pub struct KeySyncFailed {
 /// **三项一起存**，而不是三个补丁：从「仅本机」换到「局域网」时网卡和
 /// 端口往往一起改，分开存的话中间那一版监听在一个用户没选过的地址上。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ListenSave {
     /// 同配置里的 `listen.gateway.bind`：`loopback` / `all` / 网卡名 / 地址
     pub bind: String,
@@ -1095,6 +1147,7 @@ pub struct ListenSave {
 
 /// 设默认密钥（`PUT /default_key`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DefaultKeySave {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1104,12 +1157,14 @@ pub struct DefaultKeySave {
 /// 一把密钥的明文（`GET /keys/{name}/value`）。「复制」按名字取此刻配置里的
 /// 值，不依赖界面手里那份列表是不是最新的。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyValue {
     pub name: String,
     pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ListenView {
     pub bind: String,
     pub port: u16,
@@ -1127,6 +1182,7 @@ pub struct ListenView {
 /// 说「这家不提供模型列表」，而那在第二种情况下是编的 —— 把我们自己的
 /// 解析缺口说成了对方的特性。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelList {
     Listed {
@@ -1145,6 +1201,7 @@ pub enum ModelList {
 
 /// 检测一个上游的结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderTestResult {
     /// 地址通、凭据被接受
     pub ok: bool,
@@ -1168,6 +1225,7 @@ pub struct ProviderTestResult {
 /// 里存在两次，两边不通。这里的规矩是：测的候选池就是运行时故障转移的
 /// 候选池，同一份数据（架构红线）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -1175,6 +1233,7 @@ pub struct L1Request {
 
 /// 建连的哪一步、对着谁。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Stage {
     /// `config`（地址或代理配置用不了，没有开始建连）/ `dns` / `tcp` /
     /// `tls` / `handshake`（代理协议的握手，含认证）
@@ -1184,6 +1243,7 @@ pub struct L1Stage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Segment {
     pub stage: L1Stage,
     pub ms: u64,
@@ -1191,6 +1251,7 @@ pub struct L1Segment {
 
 /// 没有出现在分段里的那一步，和原因。**不说的话，缺一段看起来就像 bug。**
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Skip {
     pub stage: L1Stage,
     /// `plain_http`（`http://` 地址没有 TLS）/ `ip_address`（地址已经是 IP，
@@ -1201,6 +1262,7 @@ pub struct L1Skip {
 /// **分段是个列表而不是固定的 DNS/TCP/TLS 三段**，因为走代理时的形状本来
 /// 就不同：多出代理握手，而 `socks5h` 下根本没有本地 DNS 那一段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Result {
     /// 测的是哪个上游或代理的名字 —— 回显出来，别让用户猜点的那一下测了谁
     pub target: String,
@@ -1225,6 +1287,7 @@ pub struct L1Result {
 /// **给的是原文，不是结构。**界面的文本模式直接显示它；表单模式改完
 /// 之后带着 `version` 回来，那就是乐观并发的凭据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigText {
     pub path: String,
     pub text: String,
@@ -1237,6 +1300,7 @@ pub struct ConfigText {
 /// **界面上「绑在哪张网卡」那个选单要的就是它。**没有它，用户只能自己
 /// 去 `ifconfig` 抄一个地址填进配置文件，而填错的后果是网关起不来。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct NicView {
     /// `en0`、`lo0`、`utun3`。配置里按它存
     pub name: String,
@@ -1252,6 +1316,7 @@ pub struct NicView {
 /// 整份发过来的话，两个人同时改就必然有一个人的改动被悄悄吃掉 ——
 /// 而那正是 cc-switch 那批 issue 的形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigPatch {
     /// 你基于哪一版。**对不上就是 409。**不给表示「我知道我在覆盖」
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1264,6 +1329,7 @@ pub struct ConfigPatch {
 /// `path` 用**名字**而不是下标：`/providers/relay-cn/base_url`。
 /// 下标会在用户重排上游之后指向另一个东西，而那种错误完全静默。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PatchOp {
     Replace {
@@ -1298,6 +1364,7 @@ pub enum PatchOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(untagged)]
 pub enum PatchValue {
     Str(String),
@@ -1311,6 +1378,7 @@ pub enum PatchValue {
 
 /// 默认价目表现在的状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PricingStatus {
     /// 这份表的数据日期。**费用旁边要标它**
     pub date: String,
@@ -1338,6 +1406,7 @@ pub struct PricingStatus {
 
 /// 一个无法计价的 (上游, 模型)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct UnpricedModel {
     pub provider: String,
     pub model: String,
@@ -1346,6 +1415,7 @@ pub struct UnpricedModel {
 
 /// 刷新了一次之后。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PricingRefreshed {
     pub status: PricingStatus,
     /// 和刷新之前比，价格变了、新增或者移除了的模型数
@@ -1354,6 +1424,7 @@ pub struct PricingRefreshed {
 
 /// 开关定期刷新。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AutoUpdateSave {
     pub on: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1365,6 +1436,7 @@ pub struct AutoUpdateSave {
 /// 查价返回的是**实际计费用的**单价：数据集里没单独定价的缓存档已经按
 /// 计费规则补上。所以它可以原样作为一条覆盖价的起点。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PriceFields {
     pub input: f64,
     pub output: f64,
@@ -1380,6 +1452,7 @@ pub struct PriceFields {
 
 /// 一个价格是从哪儿来的。**每一笔费用都要能追溯到它。**
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PriceSourceView {
     /// 默认价目表。`date` 是那份表的数据日期
@@ -1396,6 +1469,7 @@ pub enum PriceSourceView {
 
 /// 新建或修改一张价目表时交过来的定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PriceSheetInput {
     pub name: String,
     /// 作用于默认价目表的全部单价
@@ -1411,6 +1485,7 @@ fn one() -> f64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PriceSheetSave {
     pub sheet: PriceSheetInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1424,6 +1499,7 @@ pub struct PriceSheetSave {
 
 /// 按哪张价目表查价。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SheetRef {
     /// 默认价目表
@@ -1436,6 +1512,7 @@ pub enum SheetRef {
 
 /// 查价。**界面不自己实现计价顺序**，要显示什么价就来问。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PriceQuery {
     pub sheet: SheetRef,
     /// 要查的模型。给了就只查这些
@@ -1451,6 +1528,7 @@ pub struct PriceQuery {
 
 /// 一个模型查到的价格。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ResolvedPrice {
     pub model: String,
     /// 价格和来源。`None` = 无法计价
@@ -1466,6 +1544,7 @@ pub struct ResolvedPrice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PriceQueryResult {
     pub items: Vec<ResolvedPrice>,
     /// 按名字搜时，一共有多少个模型对得上（`items` 可能被 `limit` 截断）
@@ -1474,6 +1553,7 @@ pub struct PriceQueryResult {
 
 /// 光标落在配置的哪一段上。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigAt {
     /// `providers` / `groups` / `routes` / `clients`…
     pub section: Option<String>,
@@ -1488,12 +1568,14 @@ pub struct ConfigAt {
 /// —— 后者是前者的退路（结构性的增删一律引导到文本模式），而两者
 /// 都必须带 `base_version`，都会走那三道校验。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigWrite {
     pub base_version: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigWritten {
     pub version: String,
 }
@@ -1505,6 +1587,7 @@ pub struct ConfigWritten {
 /// **结构，不是 YAML。**以前界面拼一段 YAML 交给补丁接口 —— 拼字符串的
 /// 那一方不知道引号规则，一个带 `#` 的值就能写坏整份配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderInput {
     pub name: String,
     /// 修改时**不给就是保持原样**：视图里的地址是打过码的，原样写回去
@@ -1551,6 +1634,7 @@ pub struct ProviderInput {
 /// 按接口地址自动识别的结果。给编辑中、还没保存的上游显示「自动识别」
 /// 会选成什么。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderPreviewRequest {
     pub base_url: String,
     /// 表单里选定的协议。不给就是「自动识别」。只影响 `auth_header`
@@ -1559,6 +1643,7 @@ pub struct ProviderPreviewRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderPreview {
     /// 按地址推断的接口协议。推断不出是空（转发时按 Anthropic 处理）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1570,6 +1655,7 @@ pub struct ProviderPreview {
 
 /// 一个上游的模型清单。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderModelsView {
     pub provider: String,
     /// `discovered`（上游列出的）/ `manual`（手动清单）/ `none`
@@ -1589,12 +1675,14 @@ pub struct ProviderModelsView {
 
 /// 页面打开时补问模型清单：开始问的是哪几家。答案随 `models_changed` 到。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModelsRefreshing {
     pub providers: Vec<String>,
 }
 
 /// 清单里的一个模型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModelRow {
     pub id: String,
     /// 在启用范围里
@@ -1621,6 +1709,7 @@ fn fail_closed() -> String {
 
 /// 一个密钥类的值怎么改。**三态**，因为视图里拿不到原值：不动就得有「保持原样」。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum SecretChange {
     #[default]
@@ -1633,6 +1722,7 @@ pub enum SecretChange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HeaderInput {
     pub name: String,
     /// 不给表示沿用同名那一行的原值
@@ -1641,6 +1731,7 @@ pub struct HeaderInput {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OAuthChange {
     #[default]
@@ -1662,6 +1753,7 @@ pub enum OAuthChange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderSave {
     pub provider: ProviderInput,
     /// 你基于哪一版。**对不上就是 409**
@@ -1671,6 +1763,7 @@ pub struct ProviderSave {
 
 /// 检测一个上游，**不保存**。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderTest {
     pub provider: ProviderInput,
     /// 正在编辑的是哪一家。给了的话，表单里没改的凭据和地址从它那儿取
@@ -1679,6 +1772,7 @@ pub struct ProviderTest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxyInput {
     pub name: String,
     /// `socks5h` / `socks5` / `http` / `https`
@@ -1693,6 +1787,7 @@ pub struct ProxyInput {
 /// **三态**，因为视图里拿不到原来的用户名和密码：编辑时不动认证，就得有
 /// 一个「保持原样」的说法，而不是把空值当成「清掉」。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProxyAuthInput {
     /// 保持原来的认证（新建时等同于不需要认证）
@@ -1704,6 +1799,7 @@ pub enum ProxyAuthInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxySave {
     pub proxy: ProxyInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1712,6 +1808,7 @@ pub struct ProxySave {
 
 /// 检测一个代理，**不保存**。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxyTest {
     pub proxy: ProxyInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1722,6 +1819,7 @@ pub struct ProxyTest {
 
 /// 新建或修改一条路由时交过来的定义。**规则的顺序就是数组的顺序。**
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RouteInput {
     pub name: String,
     #[serde(default)]
@@ -1733,6 +1831,7 @@ pub struct RouteInput {
 /// **条件和视图是同一套写法**（[`ConditionView`]）：界面拿到什么，就交回
 /// 什么，不必再学一种格式。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RuleInput {
     pub name: String,
     /// 空 = 兜底，匹配全部请求
@@ -1748,6 +1847,7 @@ pub struct RuleInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RouteSave {
     pub route: RouteInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1767,6 +1867,7 @@ pub struct RouteSave {
 
 /// 删除一条路由。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RouteDelete {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -1777,6 +1878,7 @@ pub struct RouteDelete {
 
 /// 更换默认路由。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DefaultRouteSave {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1785,6 +1887,7 @@ pub struct DefaultRouteSave {
 
 /// 新建或修改一个策略组时交过来的定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GroupInput {
     pub name: String,
     /// `fallback` / `select` / `load-balance` / `url-test` / `cheapest`
@@ -1800,6 +1903,7 @@ pub struct GroupInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GroupSave {
     pub group: GroupInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1808,13 +1912,122 @@ pub struct GroupSave {
 
 /// 网关知道的一个模型，以及能提供它的上游（已按启用范围与停用过滤）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KnownModel {
     pub id: String,
     pub providers: Vec<String>,
 }
 
+/// 聚合类端点的时间窗（`GET /summary`、`/latency`）。**缺省是「今天」而不是
+/// 「最近 24 小时」** —— 用户问的是「今天花了多少」，那是个从零点算起的问题。
+///
+/// **查询串里的类型都把字段摊平写，不用 `#[serde(flatten)]`。**flatten 会让
+/// serde 走 `deserialize_any`，而查询串里一切都是字符串 —— `from_ms=123` 被当成
+/// 字符串喂给 `i64`，整个请求 400。只在同时带上时间窗时才失败，单元测试看不见。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Window {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+}
+
+/// `GET /summary/buckets`：时间窗 + 桶宽。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct BucketQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_ms: Option<i64>,
+}
+
+/// `GET /summary/buckets/by`：再按一个维度分组。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct BucketGroupQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_ms: Option<i64>,
+    /// 和 `GroupQuery` 同一条理由：是枚举不是字符串，它会变成列名。
+    pub dim: CostDim,
+}
+
+/// `GET /summary/by`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct GroupQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+    /// **是枚举不是字符串。**它会决定 SQL 里的列名，用字符串就是一个
+    /// 注入口；写错的值在这里被 serde 直接拒掉，而不是拼进查询。
+    pub dim: CostDim,
+}
+
+/// 一张列表要的两样：看哪一段，最多几条（`GET /history`、`/sessions`）。
+///
+/// **时间窗是可选的，而且缺省不是「今天」。**「最近 N 条」本身就是一个完整
+/// 的回答，而缺省成今天的话，过了零点这张表会空掉。两端各自可缺：只给
+/// `from_ms` 就是「从那时起到现在」。条数缺省 200、最多 2000。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// 安全日志一页要的：哪一项、哪一段、从哪条往前、几条（`GET /security/events`）。
+/// 缺省是全部，不是今天；条数缺省 100、最多 500。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityEventsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+    /// 只要这条之前的（翻页）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `GET /config/at`：配置原文里的第几个字节落在哪个字段上。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ConfigAtQuery {
+    pub offset: usize,
+}
+
+/// `POST /scan`：除了用户级的配置面，还扫哪些项目目录。**我们不去找项目，
+/// 只看用户指的。**
+///
+/// 是请求体不是查询串：一串目录在查询串里是同一个键写好几次，而 axum 的
+/// `Query` 读不了那种写法 —— 以前是 `GET /scan?project=…`，带上一个目录就 400。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ScanRequest {
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
 /// 删除时带上的版本。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BaseVersion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -1822,6 +2035,7 @@ pub struct BaseVersion {
 
 /// 历史里的一版。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigVersion {
     pub version: String,
     pub at_ms: u64,
@@ -1837,6 +2051,7 @@ pub struct ConfigVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RollbackRequest {
     pub version: String,
 }
@@ -1852,6 +2067,7 @@ pub struct RollbackRequest {
 /// 把第三种当成 0 加进柱子，那根柱子就是偏低的，而看图的人没有线索
 /// 知道少算了什么。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CostBucket {
     /// 桶的起点
     pub at_ms: i64,
@@ -1872,6 +2088,7 @@ pub struct CostBucket {
 /// 这两个问题只用看一次；而把它们拆成一张趋势图加一张构成图，读的人
 /// 要在两张图之间自己对时间。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CostBucketGroup {
     pub at_ms: i64,
     /// 模型名或上游名，看查的是哪一维
@@ -1892,6 +2109,7 @@ pub struct CostBucketGroup {
 
 /// 按模型或上游分组的花费（钱花在哪儿）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CostGroup {
     pub name: String,
     pub requests: i64,
@@ -1907,6 +2125,7 @@ pub struct CostGroup {
 /// 分组维度。**是个枚举不是字符串** —— 它最终来自 query string，
 /// 而把它拼进 SQL 的列名里就是一个注入口。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
 pub enum CostDim {
     Model,
@@ -1917,6 +2136,7 @@ pub enum CostDim {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Summary {
     pub requests: i64,
     pub failed: i64,
@@ -1956,6 +2176,7 @@ pub struct Summary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct LatencyView {
     pub model: String,
     pub p50: i64,
@@ -1966,6 +2187,7 @@ pub struct LatencyView {
 
 /// 一条历史请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HistoryRow {
     pub id: i64,
     pub at_ms: i64,
@@ -2037,6 +2259,7 @@ pub struct HistoryRow {
 
 /// 一次请求做过的格式转换。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TranslatedView {
     /// 客户端的格式：`anthropic` / `openai-chat` / `openai-responses` / `gemini`
     pub from: String,
@@ -2049,6 +2272,7 @@ pub struct TranslatedView {
 
 /// 一条请求的全部细节。**详情抽屉吃这个。**
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RequestDetail {
     pub row: HistoryRow,
     pub request_body: Option<BodyView>,
@@ -2062,6 +2286,7 @@ pub struct RequestDetail {
 
 /// 一份存下来的 body。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BodyView {
     /// **已脱敏**。这段文字会被复制到 issue 里
     pub text: String,
@@ -2073,6 +2298,7 @@ pub struct BodyView {
 
 /// 一个上游的订阅额度。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderQuota {
     pub provider: String,
     pub windows: Vec<QuotaWindow>,
@@ -2082,6 +2308,7 @@ pub struct ProviderQuota {
 
 /// 发起 ChatGPT 登录（`POST /chatgpt/login`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ChatgptLoginStart {
     /// 登录后写进配置的上游名。不给就是 `chatgpt`；已经有同名的 ChatGPT 账号上游时，
     /// 换掉它的凭据（重新登录），其余设置不动
@@ -2102,6 +2329,7 @@ pub struct ChatgptLoginStart {
 
 /// 一次进行中的登录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ChatgptLogin {
     pub id: String,
     /// 在浏览器里打开的授权地址。`browser` 登录才有
@@ -2119,6 +2347,7 @@ pub struct ChatgptLogin {
 
 /// 登录进行到哪一步（`GET /chatgpt/login/{id}`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ChatgptLoginStatus {
     pub id: String,
     /// `pending` / `done` / `failed` / `expired` / `cancelled`
@@ -2136,6 +2365,7 @@ pub struct ChatgptLoginStatus {
 
 /// ChatGPT 账号的用量（`GET /providers/{name}/chatgpt/usage`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ChatgptUsage {
     /// 登的是哪个账号。**只有邮箱** —— 同一份回答里的用户 ID
     /// 和账户 ID 不往外带：界面认账号靠邮箱，那两个读不出是谁
@@ -2152,6 +2382,7 @@ pub struct ChatgptUsage {
 
 /// 一张额度重置卡。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ResetCreditView {
     pub id: String,
     /// 重置哪种额度，后端的原词
@@ -2169,6 +2400,7 @@ pub struct ResetCreditView {
 
 /// 账号上的额度重置卡（`GET /providers/{name}/chatgpt/resets`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ResetCredits {
     pub available_count: i64,
     pub credits: Vec<ResetCreditView>,
@@ -2178,6 +2410,7 @@ pub struct ResetCredits {
 ///
 /// **卡用掉就回不来**，所以只在用户明确点下去时发，网关自己从不用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ResetCreditUse {
     /// 幂等键。同一次操作重试时用同一个值，后端不会重复扣卡
     pub idempotency_key: String,
@@ -2187,6 +2420,7 @@ pub struct ResetCreditUse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ResetCreditUsed {
     /// - `reset`：额度已重置
     /// - `nothing_to_reset`：额度没用完，不需要重置，没有扣卡
@@ -2200,6 +2434,7 @@ pub struct ResetCreditUsed {
 
 /// 用 Z.ai 或 BigModel 的账号登录（`POST /zai/login`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ZaiLoginStart {
     /// 登哪一家：`zai`（api.z.ai）或 `bigmodel`（open.bigmodel.cn）。不给是 `zai`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2219,6 +2454,7 @@ pub struct ZaiLoginStart {
 /// **没有回到应用的地址**：授权完成后浏览器停在对方自己的页面上，那一页不是我们的，
 /// 我们只能靠轮询知道登录成了。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ZaiLogin {
     pub id: String,
     /// 在浏览器里打开的授权地址
@@ -2229,6 +2465,7 @@ pub struct ZaiLogin {
 
 /// 登录进行到哪一步（`GET /zai/login/{id}`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ZaiLoginStatus {
     pub id: String,
     /// `pending` / `done` / `failed` / `expired` / `cancelled`
@@ -2249,6 +2486,7 @@ pub struct ZaiLoginStatus {
 /// **这是「你确认要花钱吗」那个对话框的全部内容。**触发前必须显示它，
 /// 而不是点了才知道。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedEstimate {
     pub provider: String,
     pub model: String,
@@ -2271,6 +2509,7 @@ pub struct SpeedEstimate {
 
 /// 一批测速的账。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedQuote {
     pub items: Vec<SpeedEstimate>,
     /// 总计。有一项算不出来就是 None —— 给一个看起来完整的数字，用户会
@@ -2281,6 +2520,7 @@ pub struct SpeedQuote {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedRunRequest {
     /// 测哪几家。空 = 所有上游
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2292,6 +2532,7 @@ pub struct SpeedRunRequest {
 
 /// 一次 L3 测速的结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedResult {
     pub provider: String,
     pub model: String,
@@ -2315,6 +2556,7 @@ pub struct SpeedResult {
 /// **不看磁盘还剩多少。**那是操作系统的事，网关管好自己占的那一份就够了
 /// —— 正文按天数和总量回收（见 `tw_store::blobs`），摘要按天数回收。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct StorageStatus {
     /// 请求记录启动了没有。`false` = 数据库打不开之类，这段时间的请求都不会留下
     pub recording: bool,
@@ -2333,6 +2575,7 @@ pub struct StorageStatus {
 /// **孤立地看单个请求，看不出任何有用的东西** —— Claude Code 的一次任务
 /// 是几十到上百个请求，携带不断增长的上下文。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionView {
     pub id: String,
     pub client: String,
@@ -2364,6 +2607,7 @@ pub struct SessionView {
 
 /// 会话里的一轮。上下文增长曲线和成本瀑布画的就是它。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TurnView {
     pub id: i64,
     pub at_ms: u64,
@@ -2387,6 +2631,7 @@ pub struct TurnView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionDetail {
     pub session: SessionView,
     pub turns: Vec<TurnView>,
@@ -2396,6 +2641,7 @@ pub struct SessionDetail {
 
 /// 把存下来的那条请求，原样发给另一个上游。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReplayRequest {
     pub id: i64,
     pub provider: String,
@@ -2403,6 +2649,7 @@ pub struct ReplayRequest {
 
 /// 报价。**按下确认之前必须看到它**（和 L3 测速同一条纪律）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReplayQuote {
     pub model: String,
     pub provider: String,
@@ -2419,6 +2666,7 @@ pub struct ReplayQuote {
 
 /// 原来那一次长什么样，用来并排比。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReplayOriginal {
     pub provider: String,
     pub status: Option<u16>,
@@ -2428,6 +2676,7 @@ pub struct ReplayOriginal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReplayResult {
     pub provider: String,
     pub status: u16,
@@ -2443,6 +2692,7 @@ pub struct ReplayResult {
 
 /// 一处发现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScanFinding {
     /// `high` | `medium` | `low`
     pub level: String,
@@ -2461,6 +2711,7 @@ pub struct ScanFinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct McpView {
     pub name: String,
     pub client: String,
@@ -2477,6 +2728,7 @@ pub struct McpView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SkillView {
     pub name: String,
     pub client: String,
@@ -2485,6 +2737,7 @@ pub struct SkillView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HookView {
     pub client: String,
     pub event: String,
@@ -2496,6 +2749,7 @@ pub struct HookView {
 ///
 /// **不存任何东西**：这是此刻磁盘上的真实情况，页面关了就没了。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScanResponse {
     pub findings: Vec<ScanFinding>,
     pub mcp: Vec<McpView>,
@@ -2512,6 +2766,7 @@ pub struct ScanResponse {
 
 /// 在矩阵上点一下。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct McpOpRequest {
     /// `copy` 或 `remove`
     pub op: String,
@@ -2525,6 +2780,7 @@ pub struct McpOpRequest {
 
 /// 哪些客户端能被写入，哪些只能看。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct McpTargetView {
     pub client: String,
     pub name: String,
@@ -2543,6 +2799,7 @@ pub struct McpTargetView {
 /// **每个字段都对应规则里能写的一个条件**。默认值就是一个最
 /// 普通的请求 —— 用户只需要改他关心的那一两个。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DryRunRequest {
     pub model: String,
     /// 哪把密钥发的。只给它时按这把密钥使用的路由求值；规则里的 `client`
@@ -2590,6 +2847,7 @@ fn default_true() -> bool {
 /// 一条规则在这次试算里的下场。**没命中的也要列出来，并说清为什么** ——
 /// 「为什么没走我以为的那条」和「走了哪条」是同一个问题的两面。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RuleTrace {
     pub name: String,
     /// `matched` | `skipped` | `phase_two`（条件要等选定上游之后才能求值，
@@ -2609,6 +2867,7 @@ pub struct RuleTrace {
 
 /// 一个没对上的条件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct MismatchView {
     /// 和 `ConditionView.field` 同一个词表
     pub field: String,
@@ -2620,6 +2879,7 @@ pub struct MismatchView {
 
 /// 一项参数改写。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SetView {
     /// `model`（换模型，整个 prompt cache 作废）/ `max_tokens` / `thinking` /
     /// `only_at_session_start`（以上改写只在新会话开始时应用，值是 `true`）
@@ -2628,6 +2888,7 @@ pub struct SetView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DryRunResult {
     /// 按哪条路由求的值。草稿是草稿的名字
     pub route: String,
@@ -2668,6 +2929,7 @@ pub struct DryRunResult {
 
 /// 一个要转换格式的候选上游。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConvertedView {
     pub provider: String,
     /// 客户端的格式：`anthropic` / `openai-chat` / `openai-responses` / `gemini`
@@ -2678,6 +2940,7 @@ pub struct ConvertedView {
 
 /// 一个被跳过的候选上游。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SkippedView {
     pub provider: String,
     /// `disabled` / `out_of_scope` / `not_offered`
@@ -2692,6 +2955,7 @@ pub struct SkippedView {
 
 /// 一个客户端此刻的样子。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DetectedClient {
     pub id: String,
     pub name: String,
@@ -2735,6 +2999,7 @@ pub struct DetectedClient {
 
 /// 接管不了、只能给指引的。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ManualClient {
     /// `cursor` / `continue` / `gemini-cli`。为它生成专用密钥时用
     pub id: String,
@@ -2755,6 +3020,7 @@ pub struct ManualClient {
 /// **地址和密钥不写进句子里**：界面各给一个复制按钮。写进句子的话，用户
 /// 得从一句话里抠出一段 URL，而密钥根本不该出现在一句说明里。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ManualSetup {
     /// 按顺序做的几步
     pub steps: Vec<Msg>,
@@ -2767,6 +3033,7 @@ pub struct ManualSetup {
 
 /// 为某个客户端准备的那把网关密钥（`POST /clients/{id}/key`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ClientKey {
     pub name: String,
     /// 明文。这一步就是为了拿去填进客户端
@@ -2776,6 +3043,7 @@ pub struct ClientKey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ClientsResponse {
     pub clients: Vec<DetectedClient>,
     pub manual: Vec<ManualClient>,
@@ -2786,6 +3054,7 @@ pub struct ClientsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AdoptRequest {
     pub client: String,
     /// 用哪把网关密钥。不写就用第一把 —— 为「一个 key 就够」的人设计
@@ -2795,6 +3064,7 @@ pub struct AdoptRequest {
 
 /// 算好但还没落盘的改动。**UI 拿它画 diff 让用户确认。**
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PlanView {
     pub client: String,
     pub path: String,
@@ -2822,6 +3092,7 @@ pub struct PlanView {
 
 /// 配置文件里的一处改动。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct FieldChange {
     /// `set` | `remove`
     pub op: String,
@@ -2836,6 +3107,7 @@ pub struct FieldChange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AdoptResponse {
     pub real: String,
     pub backup: String,
@@ -2848,6 +3120,7 @@ pub struct AdoptResponse {
 
 /// 一条诊断发现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct FindingView {
     /// `blocking` | `suspect` | `clear`
     pub level: String,
@@ -2861,6 +3134,7 @@ pub struct FindingView {
 
 /// 出站脱敏找到的一项：哪条规则、哪个值（已打码）、在这个请求里出现了几次。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecretItem {
     /// 内置规则的 id（`anthropic-api-key` …），或者自定义规则的名字
     pub rule: String,
@@ -2876,6 +3150,7 @@ pub struct SecretItem {
 
 /// 两项防护在一段时间里各留下了几条记录。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityCounts {
     /// 出站脱敏找到的（每条 = 一个请求里的一个值）
     pub secrets: i64,
@@ -2892,6 +3167,7 @@ pub struct SecurityCounts {
 /// **一条是一次命中**：出站脱敏是「一个请求里的一个值」（出现几次合成
 /// 一条，`count` 说几次），工具调用审查是「一个工具调用命中一条规则」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityEventView {
     pub id: i64,
     pub at_ms: i64,
@@ -2932,6 +3208,7 @@ pub struct SecurityEventView {
 
 /// 安全日志的一页。**按时间倒序**，`more` 说后面还有没有。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityEventsPage {
     pub events: Vec<SecurityEventView>,
     pub more: bool,
@@ -2939,6 +3216,7 @@ pub struct SecurityEventsPage {
 
 /// 一条内置规则按什么认。**给界面说明用**，界面按类型写成自己的话。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Matcher {
     /// 以 `prefix` 开头，其后至少还有 `min_tail` 个字符
@@ -2961,6 +3239,7 @@ pub enum Matcher {
 
 /// 一条规则。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityRuleView {
     /// 内置规则的 id，或者自定义规则的名字
     pub id: String,
@@ -2987,6 +3266,7 @@ pub struct SecurityRuleView {
 
 /// 一项防护的档位和规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GuardDetail {
     /// `off` / `observe` / `enforce`
     pub mode: String,
@@ -2996,6 +3276,7 @@ pub struct GuardDetail {
 
 /// 两项防护。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityDetail {
     pub redact: GuardDetail,
     pub inspect_tools: GuardDetail,
@@ -3003,6 +3284,7 @@ pub struct SecurityDetail {
 
 /// 改档位。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModeSave {
     /// `off` / `observe` / `enforce`
     pub mode: String,
@@ -3012,6 +3294,7 @@ pub struct ModeSave {
 
 /// 启用或停用一条规则（内置的或自定义的）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RuleToggle {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3021,6 +3304,7 @@ pub struct RuleToggle {
 /// 改一条内置规则在拦截档下做什么。只有工具调用审查的规则有这一项 ——
 /// 出站脱敏命中之后做什么由档位决定。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActionSave {
     /// `cut` / `record`
     pub action: String,
@@ -3030,6 +3314,7 @@ pub struct ActionSave {
 
 /// 新建或修改一条自定义规则。改的时候名字可以变，那就是改名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CustomRuleSave {
     pub name: String,
     pub pattern: String,
@@ -3049,6 +3334,7 @@ fn yes() -> bool {
 /// 拿一段文本试一试。给了 `pattern` 就只试这一条正则，给了 `rule` 就只试
 /// 这一条内置规则（停用着的也能试），都不给就按现在启用的全部规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityTestRequest {
     pub sample: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3059,6 +3345,7 @@ pub struct SecurityTestRequest {
 
 /// 试出来的一处。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityTestHit {
     pub rule: String,
     #[serde(default)]
@@ -3075,6 +3362,7 @@ pub struct SecurityTestHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityTestResult {
     pub hits: Vec<SecurityTestHit>,
 }
@@ -3230,7 +3518,7 @@ mod tests {
 /// 凭据文件、配置都在里面，两边各算一遍、算得不一样的话，界面找不到一个正在
 /// 跑的网关。以前桌面端自己只看 `HOME`，Windows 上那个变量默认不存在，于是它
 /// 落到当前目录下的 `.thinkwatch`，而 core 在 `%APPDATA%\ThinkWatch`。控制面
-/// 的地址（`control::Endpoint`）因为同样的理由搬到了这里。
+/// 的地址（`control::Address`）因为同样的理由搬到了这里。
 pub mod data {
     use std::path::PathBuf;
 
@@ -3410,9 +3698,11 @@ pub mod control {
     /// 同用户进程都看得见别人的命令行。
     pub const TOKEN_ENV: &str = "TW_CONTROL_TOKEN";
 
-    /// 控制面听在哪。
+    /// 控制面听在哪，客户端到哪儿连。
+    ///
+    /// 叫 `Address` 不叫 `Endpoint`：[`crate::Endpoint`] 是控制面上的一个端点。
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum Endpoint {
+    pub enum Address {
         /// 一个 `0700` 的 unix socket 文件。**权限是文件系统给的**，所以这
         /// 一档天然只有当前用户连得上。
         Socket(PathBuf),
@@ -3426,16 +3716,16 @@ pub mod control {
         Loopback { port_file: PathBuf },
     }
 
-    impl Endpoint {
+    impl Address {
         /// 这个平台默认听在数据目录的什么位置。
         pub fn in_dir(dir: &Path) -> Self {
             #[cfg(unix)]
             {
-                Endpoint::Socket(dir.join(SOCKET_FILE))
+                Address::Socket(dir.join(SOCKET_FILE))
             }
             #[cfg(not(unix))]
             {
-                Endpoint::Loopback {
+                Address::Loopback {
                     port_file: dir.join(PORT_FILE),
                 }
             }
@@ -3455,9 +3745,9 @@ pub mod control {
         #[test]
         fn the_endpoint_lands_in_the_data_directory() {
             let d = Path::new("/data");
-            match Endpoint::in_dir(d) {
-                Endpoint::Socket(p) => assert_eq!(p, d.join(SOCKET_FILE)),
-                Endpoint::Loopback { port_file } => assert_eq!(port_file, d.join(PORT_FILE)),
+            match Address::in_dir(d) {
+                Address::Socket(p) => assert_eq!(p, d.join(SOCKET_FILE)),
+                Address::Loopback { port_file } => assert_eq!(port_file, d.join(PORT_FILE)),
             }
             assert_eq!(token_file(d), d.join(TOKEN_FILE));
         }
@@ -3465,11 +3755,11 @@ pub mod control {
         /// 平台决定用哪一档，不是调用方挑。
         #[test]
         fn each_platform_gets_the_only_transport_it_has() {
-            let got = Endpoint::in_dir(Path::new("/data"));
+            let got = Address::in_dir(Path::new("/data"));
             if cfg!(unix) {
-                assert!(matches!(got, Endpoint::Socket(_)));
+                assert!(matches!(got, Address::Socket(_)));
             } else {
-                assert!(matches!(got, Endpoint::Loopback { .. }));
+                assert!(matches!(got, Address::Loopback { .. }));
             }
         }
     }

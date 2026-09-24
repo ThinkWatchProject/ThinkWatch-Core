@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tw_types::Msg;
+use tw_types::{Msg, msg};
 
 use crate::json::Val;
 
@@ -207,15 +207,15 @@ pub fn adoptable() -> Vec<Client> {
             shadowed_by: &[".claude/settings.local.json"],
             costs: &[
                 (
-                    "adopt.cost.claude_code.remote_control",
+                    code!("adopt.cost.claude_code.remote_control"),
                     "Remote Control and voice input do not work when the endpoint is not an official domain.",
                 ),
                 (
-                    "adopt.cost.claude_code.mcp_tool_search",
+                    code!("adopt.cost.claude_code.mcp_tool_search"),
                     "MCP tool search is off by default.",
                 ),
                 (
-                    "adopt.cost.claude_code.welcome_screen",
+                    code!("adopt.cost.claude_code.welcome_screen"),
                     "Claude Code may show its welcome screen once; closing it is enough.",
                 ),
             ],
@@ -251,11 +251,11 @@ pub fn adoptable() -> Vec<Client> {
             costs: &[
                 // 接管这个文件顺带接管了桌面版，**这件事要在确认之前说**
                 (
-                    "adopt.cost.codex.chatgpt_desktop",
+                    code!("adopt.cost.codex.chatgpt_desktop"),
                     "The ChatGPT desktop app reads the same configuration file, so its local Codex sessions go through the gateway as well; the app has to be restarted for that to take effect.",
                 ),
                 (
-                    "adopt.cost.codex.reopen_terminal",
+                    code!("adopt.cost.codex.reopen_terminal"),
                     "The terminal has to be reopened afterwards.",
                 ),
             ],
@@ -274,7 +274,7 @@ pub fn adoptable() -> Vec<Client> {
             takes_effect: TakesEffect::OnRestart,
             shadowed_by: &[],
             costs: &[(
-                "adopt.cost.opencode.restart",
+                code!("adopt.cost.opencode.restart"),
                 "opencode has to be restarted afterwards.",
             )],
             verified: Verified::FieldsOnly,
@@ -294,7 +294,7 @@ pub fn adoptable() -> Vec<Client> {
             // **只算部分接管**：Zed 的密钥走它自己的凭据存储，不在
             // settings.json 里，我们写不进去。
             costs: &[(
-                "adopt.cost.zed.key_store",
+                code!("adopt.cost.zed.key_store"),
                 "Zed keeps its key outside the configuration file, so it has to be filled in once in Zed's settings.",
             )],
             verified: Verified::FieldsOnly,
@@ -302,7 +302,7 @@ pub fn adoptable() -> Vec<Client> {
             process: &["Zed"],
             env_vars: &[],
             key_elsewhere: Some((
-                "adopt.manual.zed.key",
+                code!("adopt.manual.zed.key"),
                 "Then enter the key in Zed's settings, under the ThinkWatch provider.",
             )),
             config_beats_env: false,
@@ -318,11 +318,11 @@ pub fn adoptable() -> Vec<Client> {
             shadowed_by: &[],
             costs: &[
                 (
-                    "adopt.cost.aider.lookup_order",
+                    code!("adopt.cost.aider.lookup_order"),
                     "Aider reads the home directory, then the Git project root, then the current directory, and each one overrides the last; only the home directory is changed here.",
                 ),
                 (
-                    "adopt.cost.aider.restart",
+                    code!("adopt.cost.aider.restart"),
                     "Aider has to be restarted afterwards.",
                 ),
             ],
@@ -346,9 +346,7 @@ pub struct ManualOnly {
     /// 为它生成专用密钥时用的标识：`cursor` / `continue` / `gemini-cli`
     pub id: &'static str,
     pub name: &'static str,
-    /// 这个客户端的码前缀：每一步是 `<prefix>.<后缀>`，提醒也是 `<prefix>.<后缀>`（见 `caveat`）
-    code: &'static str,
-    /// 手动配置的几步，每步「码的后缀，英文原句」。
+    /// 手动配置的几步，每步「码，英文原句」。
     ///
     /// **地址和密钥不写进句子。**以前是一整句带着地址的话，用户得从句子里
     /// 抠出一段 URL；现在两样东西各在界面上有自己的复制按钮，句子只说
@@ -356,8 +354,8 @@ pub struct ManualOnly {
     steps: &'static [(&'static str, &'static str)],
     /// 填带 `/v1` 的地址还是不带的
     v1: bool,
-    /// 提醒，「码的后缀，英文原句」。**后缀也可以按平台分** —— 两个平台
-    /// 说的不是一句话时，用各自的码，界面才能各翻各的
+    /// 提醒，「码，英文原句」。**码也可以按平台分** —— 两个平台说的不是
+    /// 一句话时，用各自的码，界面才能各翻各的
     caveat: (&'static str, &'static str),
 }
 
@@ -366,8 +364,8 @@ impl ManualOnly {
     pub fn steps(&self) -> Vec<Msg> {
         self.steps
             .iter()
-            .map(|(suffix, text)| Msg {
-                code: format!("{}.{suffix}", self.code),
+            .map(|(code, text)| Msg {
+                code: code.to_string(),
                 args: BTreeMap::new(),
                 text: text.to_string(),
             })
@@ -386,9 +384,9 @@ impl ManualOnly {
     /// 接管不了的那一句提醒。**必须和步骤一起给** —— 只说怎么配、不说
     /// 配完还漏什么，等于说了假话
     pub fn caveat(&self) -> Msg {
-        let (suffix, text) = self.caveat;
+        let (code, text) = self.caveat;
         Msg {
-            code: format!("{}.{suffix}", self.code),
+            code: code.to_string(),
             args: BTreeMap::new(),
             text: text.to_string(),
         }
@@ -400,35 +398,42 @@ pub fn manual_only() -> Vec<ManualOnly> {
         ManualOnly {
             id: "cursor",
             name: "Cursor",
-            code: "adopt.manual.cursor",
             steps: &[
-                ("open", "In Cursor, open Settings → Models."),
                 (
-                    "base",
+                    code!("adopt.manual.cursor.open"),
+                    "In Cursor, open Settings → Models.",
+                ),
+                (
+                    code!("adopt.manual.cursor.base"),
                     "Turn on Override OpenAI Base URL and enter the gateway address.",
                 ),
                 (
-                    "key",
+                    code!("adopt.manual.cursor.key"),
                     "Enter the key as the OpenAI API Key, then click Verify.",
                 ),
             ],
             v1: true,
             caveat: (
-                "caveat",
+                code!("adopt.manual.cursor.caveat"),
                 "Tab completion and inline edit still go to Cursor's own service rather than the gateway, so only part of Cursor is covered.",
             ),
         },
         ManualOnly {
             id: "continue",
             name: "Continue",
-            code: "adopt.manual.continue",
             steps: &[
                 #[cfg(not(windows))]
-                ("open", "Open ~/.continue/config.yaml."),
-                #[cfg(windows)]
-                ("open_windows", r"Open %USERPROFILE%\.continue\config.yaml."),
                 (
-                    "entry",
+                    code!("adopt.manual.continue.open"),
+                    "Open ~/.continue/config.yaml.",
+                ),
+                #[cfg(windows)]
+                (
+                    code!("adopt.manual.continue.open_windows"),
+                    r"Open %USERPROFILE%\.continue\config.yaml.",
+                ),
+                (
+                    code!("adopt.manual.continue.entry"),
                     "Add an entry to the models list with provider set to openai, apiBase set to the gateway address and apiKey set to the key.",
                 ),
             ],
@@ -438,31 +443,36 @@ pub fn manual_only() -> Vec<ManualOnly> {
             // （见 crate::yaml 开头那段）。宁可少接管一个客户端，也不
             // 要写一段我们自己没把握的结构。
             caveat: (
-                "caveat",
+                code!("adopt.manual.continue.caveat"),
                 "This needs a new entry in the models list, which is not written automatically; follow the steps above.",
             ),
         },
         ManualOnly {
             id: "gemini-cli",
             name: "Gemini CLI",
-            code: "adopt.manual.gemini_cli",
             // **Windows 上没有 shell 配置文件可 export**：用户级环境变量用 setx
             // 写，写完只对之后打开的终端生效。两个平台各用各的码
             #[cfg(not(windows))]
             steps: &[
                 (
-                    "export",
+                    code!("adopt.manual.gemini_cli.export"),
                     "In the shell configuration, export GOOGLE_GEMINI_BASE_URL set to the gateway address and GEMINI_API_KEY set to the key.",
                 ),
-                ("reopen", "Then reopen the terminal."),
+                (
+                    code!("adopt.manual.gemini_cli.reopen"),
+                    "Then reopen the terminal.",
+                ),
             ],
             #[cfg(windows)]
             steps: &[
                 (
-                    "setx",
+                    code!("adopt.manual.gemini_cli.setx"),
                     "In a terminal, run setx GOOGLE_GEMINI_BASE_URL followed by the gateway address, and setx GEMINI_API_KEY followed by the key.",
                 ),
-                ("reopen", "Then reopen the terminal."),
+                (
+                    code!("adopt.manual.gemini_cli.reopen"),
+                    "Then reopen the terminal.",
+                ),
             ],
             v1: false,
             // 它只认环境变量，没有可写的配置字段。改 .zshrc 超出了
@@ -470,12 +480,12 @@ pub fn manual_only() -> Vec<ManualOnly> {
             // **报告是我们的职责，修改是他的权利。**
             #[cfg(not(windows))]
             caveat: (
-                "caveat",
+                code!("adopt.manual.gemini_cli.caveat"),
                 "Gemini CLI reads the endpoint only from the environment. ThinkWatch does not edit shell configuration files, so add it by hand.",
             ),
             #[cfg(windows)]
             caveat: (
-                "caveat_windows",
+                code!("adopt.manual.gemini_cli.caveat_windows"),
                 "Gemini CLI reads the endpoint only from the environment. ThinkWatch does not change environment variables, so add them by hand.",
             ),
         },
@@ -625,11 +635,10 @@ impl Client {
     /// 用户目录下时，检测不到不等于用不了 —— 照着做一样能接上。
     pub fn manual_steps(&self) -> Vec<Msg> {
         let file = crate::paths::shown(self.config);
-        let mut out = vec![Msg {
-            code: "adopt.manual.file".into(),
-            args: BTreeMap::from([("file".to_string(), file.clone())]),
-            text: format!("Open {file} and set the fields below."),
-        }];
+        let mut out = vec![msg!(
+            "adopt.manual.file", file = file =>
+            "Open {file} and set the fields below."
+        )];
         if let Some((code, text)) = self.key_elsewhere {
             out.push(Msg {
                 code: code.into(),

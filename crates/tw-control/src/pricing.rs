@@ -19,28 +19,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
 use serde_yaml_ng::Value;
 use tw_config::edit;
 use tw_config::history::Origin;
 use tw_config::refs;
 use tw_yaml::Step;
 
+use crate::contract::RouterExt;
 use crate::resources::{checked_name, invalid, mapping, quoted};
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_api::ep;
 use tw_types::{Msg, msg};
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/pricing", get(status))
-        .route("/pricing/refresh", post(refresh_now))
-        .route("/pricing/auto_update", put(set_auto_update))
-        .route("/pricing/query", post(query))
-        .route("/pricing/sheets", post(create_sheet))
-        .route(
-            "/pricing/sheets/{name}",
-            get(sheet).put(update_sheet).delete(delete_sheet),
-        )
+        .at(ep::Pricing, status)
+        .at(ep::RefreshPricing, refresh_now)
+        .at(ep::SetPricingAutoUpdate, set_auto_update)
+        .at(ep::QueryPrice, query)
+        .at(ep::CreatePriceSheet, create_sheet)
+        .at(ep::PriceSheet, sheet)
+        .at(ep::UpdatePriceSheet, update_sheet)
+        .at(ep::DeletePriceSheet, delete_sheet)
 }
 
 // ─────────────────────────────────────────────────────────── 默认价目表

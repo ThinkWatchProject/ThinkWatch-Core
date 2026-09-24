@@ -1,0 +1,2 @@
+# 桌面端按行读消息码清单，换行不能随平台变
+crates/tw-api/msg-codes.txt text eol=lf

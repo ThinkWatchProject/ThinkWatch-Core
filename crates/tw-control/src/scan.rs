@@ -9,11 +9,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::{Query, State},
-};
-use serde::Deserialize;
+use axum::{Json, extract::State};
 
 use crate::ControlState;
 
@@ -39,24 +35,16 @@ pub fn finding_view(f: &tw_scan::report::Finding) -> tw_api::ScanFinding {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Params {
-    /// 额外扫哪些项目目录。**我们不去找项目，只看用户指的**（
-    /// 范围约定）
-    #[serde(default)]
-    pub project: Vec<String>,
-}
-
 pub async fn scan(
     State(s): State<ControlState>,
-    Query(p): Query<Params>,
+    Json(p): Json<tw_api::ScanRequest>,
 ) -> Json<tw_api::ScanResponse> {
     // **只用内置规则。**安全页上的规则只作用于经过网关的请求：在那边停用
     // 一条误报，不该让这边悄悄少查一样东西
     let rules = tw_guard::tools::rules::scan_rules();
 
     let mut sources = tw_scan::sources::user_level(&s.home);
-    for proj in &p.project {
+    for proj in &p.projects {
         sources.extend(tw_scan::sources::in_project(std::path::Path::new(proj)));
     }
     let scanned = sources.len();
@@ -102,7 +90,7 @@ pub async fn scan(
             .collect(),
         unreadable: r.unreadable,
         scanned,
-        projects: p.project,
+        projects: p.projects,
     })
 }
 

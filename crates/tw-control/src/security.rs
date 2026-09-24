@@ -17,7 +17,6 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
 use serde_yaml_ng::{Mapping, Value};
 use tw_config::edit;
 use tw_config::history::Origin;
@@ -25,24 +24,21 @@ use tw_config::{SecurityMode, ToolAction};
 use tw_types::msg;
 use tw_yaml::Step;
 
+use crate::contract::RouterExt;
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_api::ep;
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/security", get(detail))
-        .route("/security/events", get(events))
-        .route("/security/{guard}/mode", put(set_mode))
-        .route("/security/{guard}/builtin/{id}", put(toggle_builtin))
-        .route(
-            "/security/{guard}/builtin/{id}/action",
-            put(set_builtin_action),
-        )
-        .route("/security/{guard}/custom", post(create_custom))
-        .route(
-            "/security/{guard}/custom/{name}",
-            put(update_custom).delete(delete_custom),
-        )
-        .route("/security/{guard}/test", post(test))
+        .at(ep::Security, detail)
+        .at(ep::SecurityEvents, events)
+        .at(ep::SetSecurityMode, set_mode)
+        .at(ep::ToggleBuiltinRule, toggle_builtin)
+        .at(ep::SetBuiltinRuleAction, set_builtin_action)
+        .at(ep::CreateCustomRule, create_custom)
+        .at(ep::UpdateCustomRule, update_custom)
+        .at(ep::DeleteCustomRule, delete_custom)
+        .at(ep::TestSecurity, test)
 }
 
 /// 哪一项防护。路径里写的就是配置里的那个键。
@@ -225,23 +221,12 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
     }
 }
 
-/// 日志一页要的：哪一项、哪一段、从哪条往前、几条。
-#[derive(Debug, serde::Deserialize)]
-struct EventsQuery {
-    guard: Option<String>,
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-    /// 只要这条之前的（翻页）
-    before: Option<i64>,
-    limit: Option<usize>,
-}
-
 /// 一页最多多少条。
 const PAGE_MAX: usize = 500;
 
 async fn events(
     State(s): State<ControlState>,
-    Query(q): Query<EventsQuery>,
+    Query(q): Query<tw_api::SecurityEventsQuery>,
 ) -> Result<Json<tw_api::SecurityEventsPage>, Fail> {
     let guard = match q.guard.as_deref() {
         None | Some("") => None,
@@ -471,15 +456,10 @@ async fn update_custom(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct DeleteQuery {
-    base_version: Option<String>,
-}
-
 async fn delete_custom(
     State(s): State<ControlState>,
     Path((guard, name)): Path<(String, String)>,
-    Query(q): Query<DeleteQuery>,
+    Query(q): Query<tw_api::BaseVersion>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
     let version = s

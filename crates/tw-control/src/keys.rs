@@ -20,7 +20,6 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
 use serde_yaml_ng::Value;
 use tw_adopt::{detect, plan};
 use tw_config::edit;
@@ -28,16 +27,20 @@ use tw_config::history::Origin;
 use tw_config::refs;
 use tw_yaml::Step;
 
+use crate::contract::RouterExt;
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_api::ep;
 use tw_types::msg;
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/keys", get(list).post(create))
-        .route("/keys/{name}", put(update).delete(delete_key))
-        .route("/keys/{name}/value", get(value))
-        .route("/keys/{name}/rotate", post(rotate))
-        .route("/default_key", put(set_default))
+        .at(ep::Keys, list)
+        .at(ep::CreateKey, create)
+        .at(ep::UpdateKey, update)
+        .at(ep::DeleteKey, delete_key)
+        .at(ep::KeyValue, value)
+        .at(ep::RotateKey, rotate)
+        .at(ep::SetDefaultKey, set_default)
 }
 
 /// 配置里密钥那一段。**没有 `edit::Section` 常量**：它在 `tw-config` 里

@@ -723,8 +723,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    // 控制面听在哪由平台决定，见 `tw_api::control::Endpoint`。
-    let endpoint = tw_api::control::Endpoint::in_dir(&dir);
+    // 控制面听在哪由平台决定，见 `tw_api::control::Address`。
+    let endpoint = tw_api::control::Address::in_dir(&dir);
     // **在起任何东西之前问**。等到 bind 失败时，网关已经在监听、客户端
     // 可能已经连上来了，而这条错误当时只会进日志。
     tw_control::endpoint_usable(&endpoint)?;

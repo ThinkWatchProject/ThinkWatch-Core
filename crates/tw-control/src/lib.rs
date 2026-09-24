@@ -13,15 +13,18 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use tokio::sync::broadcast;
+use tw_api::ep;
 use tw_types::{Msg, msg};
+
+use contract::RouterExt;
 
 pub mod chatgpt;
 pub mod clients;
 pub mod config;
+mod contract;
 pub mod diagnostics;
 pub mod dryrun;
 pub mod keys;
@@ -112,65 +115,66 @@ impl ControlState {
 
 pub fn router(state: ControlState) -> Router {
     Router::new()
-        .route("/status", get(status))
-        .route("/shutdown", post(ask_shutdown))
-        .route("/interfaces", get(interfaces))
+        .at(ep::Status, status)
+        .at(ep::Shutdown, ask_shutdown)
+        .at(ep::Interfaces, interfaces)
         .merge(keys::router())
         .merge(listen::router())
-        .route("/events", get(events))
-        .route("/in-flight", get(in_flight))
-        .route("/overview", get(overview))
-        .route("/l1", post(l1))
-        .route(
-            "/config",
-            get(get_config).patch(patch_config).put(put_config),
-        )
-        .route("/config/history", get(config_history))
-        .route("/config/at", get(config::path_at))
-        .route("/config/rollback", post(config_rollback))
-        .route("/summary", get(summary))
-        .route("/summary/buckets", get(cost_buckets))
-        .route("/summary/buckets/by", get(cost_buckets_by))
-        .route("/summary/by", get(cost_by))
-        .route("/history", get(history))
-        .route("/latency", get(latency))
-        .route("/latency/provider", get(latency_by_provider))
-        .route("/storage", get(storage))
-        .route("/quota", get(quota))
-        .route("/speed/quote", post(speed_quote))
-        .route("/speed/run", post(speed_run))
-        .route("/request/{id}", get(request_detail))
-        // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认
+        .at(ep::Events, events)
+        .at(ep::InFlight, in_flight)
+        .at(ep::Overview, overview)
+        .at(ep::L1, l1)
+        .at(ep::GetConfig, get_config)
+        .at(ep::PatchConfig, patch_config)
+        .at(ep::PutConfig, put_config)
+        .at(ep::ConfigHistory, config_history)
+        .at(ep::ConfigAt, config::path_at)
+        .at(ep::ConfigRollback, config_rollback)
+        .at(ep::Summary, summary)
+        .at(ep::CostBuckets, cost_buckets)
+        .at(ep::CostBucketsBy, cost_buckets_by)
+        .at(ep::CostBy, cost_by)
+        .at(ep::History, history)
+        .at(ep::Latency, latency)
+        .at(ep::LatencyByProvider, latency_by_provider)
+        .at(ep::Storage, storage)
+        .at(ep::Quota, quota)
+        .at(ep::SpeedQuote, speed_quote)
+        .at(ep::SpeedRun, speed_run)
+        .at(ep::RequestDetail, request_detail)
         // 诊断包（脱敏纪律）。**只读，不写任何文件**
-        .route("/diagnostics", get(diagnostics::bundle))
-        // **报价和真跑是两个端点**：这一步花钱（和 L3 测速同一条纪律）
+        .at(ep::Diagnostics, diagnostics::bundle)
         // 把一条真实请求变成回放用例。**录制不是新功能** ——
         // 每个请求本来就在存储里
-        .route("/request/{id}/fixture", get(replay::fixture))
-        .route("/replay/quote", post(replay::quote))
-        .route("/replay/run", post(replay::run))
-        .route("/sessions", get(sessions))
-        .route("/sessions/{id}", get(session_detail))
-        .route("/dryrun", post(dryrun::dry_run))
+        .at(ep::Fixture, replay::fixture)
+        // **报价和真跑是两个端点**：这一步花钱（和 L3 测速同一条纪律）
+        .at(ep::ReplayQuote, replay::quote)
+        .at(ep::ReplayRun, replay::run)
+        .at(ep::Sessions, sessions)
+        .at(ep::SessionDetail, session_detail)
+        .at(ep::DryRun, dryrun::dry_run)
         // **每次现扫，什么都不存**
-        .route("/scan", get(scan::scan))
-        .route("/clients", get(clients::list))
-        .route("/clients/plan", post(clients::plan_adopt))
-        .route("/clients/adopt", post(clients::adopt))
-        .route("/clients/{id}/restore/plan", get(clients::plan_restore))
-        .route("/clients/{id}/restore", post(clients::restore))
-        .route("/clients/{id}/why", get(clients::why))
-        .route("/clients/{id}/key", post(clients::client_key))
+        .at(ep::Scan, scan::scan)
+        // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认
+        .at(ep::Clients, clients::list)
+        .at(ep::PlanAdopt, clients::plan_adopt)
+        .at(ep::Adopt, clients::adopt)
+        .at(ep::PlanRestore, clients::plan_restore)
+        .at(ep::Restore, clients::restore)
+        .at(ep::Why, clients::why)
+        .at(ep::ClientKey, clients::client_key)
         // 矩阵上点一下。**plan 和 apply 同样是两步**
-        .route("/mcp/targets", get(clients::mcp_targets))
-        .route("/mcp/plan", post(clients::mcp_plan_op))
-        .route("/mcp/apply", post(clients::mcp_apply))
+        .at(ep::McpTargets, clients::mcp_targets)
+        .at(ep::McpPlan, clients::mcp_plan_op)
+        .at(ep::McpApply, clients::mcp_apply)
         .merge(resources::router())
         .merge(routes::router())
         .merge(security::router())
         .merge(pricing::router())
         .merge(chatgpt::router())
         .merge(zai::router())
+        .fallback(contract::no_such_endpoint)
+        .layer(axum::middleware::from_fn(contract::errors_are_messages))
         .with_state(state)
 }
 
@@ -649,9 +653,9 @@ fn l1_stage(s: tw_gateway::Stage) -> tw_api::L1Stage {
 /// 请求会让我们凭空造出几万个零。
 async fn cost_buckets(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<BucketQuery>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::BucketQuery>,
 ) -> Result<Json<Vec<tw_api::CostBucket>>, Fail> {
-    let (from, to) = q.range();
+    let (from, to) = range(q.from_ms, q.to_ms);
     // 桶宽有下限，否则一个 `bucket_ms=1` 能让这条查询扫出几百万个分组。
     let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
     let store = need_store(&s)?;
@@ -663,13 +667,9 @@ async fn cost_buckets(
 /// 按模型或上游分组的花费（钱花在哪儿）。
 async fn cost_buckets_by(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<BucketGroupQuery>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::BucketGroupQuery>,
 ) -> Result<Json<Vec<tw_api::CostBucketGroup>>, Fail> {
-    let (from, to) = Window {
-        from_ms: q.from_ms,
-        to_ms: q.to_ms,
-    }
-    .range();
+    let (from, to) = range(q.from_ms, q.to_ms);
     // 桶宽有下限，和 `/summary/buckets` 同一条理由：`bucket_ms=1` 能让
     // 这条查询扫出几百万个分组，而这一条还要再乘上模型个数。
     let bucket = q.bucket_ms.unwrap_or(3_600_000).max(1_000);
@@ -684,9 +684,9 @@ async fn cost_buckets_by(
 
 async fn cost_by(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<GroupQuery>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::GroupQuery>,
 ) -> Result<Json<Vec<tw_api::CostGroup>>, Fail> {
-    let (from, to) = q.range();
+    let (from, to) = range(q.from_ms, q.to_ms);
     let store = need_store(&s)?;
     let g = store.lock().await;
     let x = g.db().cost_by(q.dim, from, to).map_err(records)?;
@@ -696,9 +696,9 @@ async fn cost_by(
 /// 一段时间的汇总。不给参数就是「今天」。
 async fn summary(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<Window>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
 ) -> Result<Json<tw_api::Summary>, Fail> {
-    let (from, to) = q.range();
+    let (from, to) = range(q.from_ms, q.to_ms);
     let store = need_store(&s)?;
     let g = store.lock().await;
     let x = g.db().summary(from, to).map_err(records)?;
@@ -724,11 +724,11 @@ async fn summary(
 /// 最近的请求。**实时列表走内存 ring buffer，这个是给「翻历史」的**。
 async fn history(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<ListQuery>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::ListQuery>,
 ) -> Result<Json<Vec<tw_api::HistoryRow>>, Fail> {
     let store = need_store(&s)?;
     let g = store.lock().await;
-    let rows = g.db().recent(q.within(), q.limit()).map_err(records)?;
+    let rows = g.db().recent(within(&q), list_limit(&q)).map_err(records)?;
     // 这一段里的安全记录一次取完，按请求号挂上去。**流量页的徽标靠它**：
     // 以前徽标只来自实时事件，关窗再开就没了
     let mut security = match (
@@ -750,9 +750,9 @@ async fn history(
 
 async fn latency(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<Window>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
 ) -> Result<Json<Vec<tw_api::LatencyView>>, Fail> {
-    let (from, to) = q.range();
+    let (from, to) = range(q.from_ms, q.to_ms);
     let store = need_store(&s)?;
     let g = store.lock().await;
     let xs = g.db().latency_by_model(from, to).map_err(records)?;
@@ -1004,9 +1004,9 @@ async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>
 /// 和按模型分是两个问题：前者的下一步是换上游，后者是换模型。
 async fn latency_by_provider(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<Window>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
 ) -> Result<Json<Vec<tw_api::LatencyView>>, Fail> {
-    let (from, to) = q.range();
+    let (from, to) = range(q.from_ms, q.to_ms);
     let store = need_store(&s)?;
     let g = store.lock().await;
     let xs = g.db().latency_by_provider(from, to).map_err(records)?;
@@ -1104,76 +1104,13 @@ fn history_row(
     }
 }
 
-/// 时间窗。**默认是「今天」而不是「最近 24 小时」** —— 用户问的是
-/// 「今天花了多少」，那是个从零点算起的问题。
-#[derive(Debug, serde::Deserialize)]
-struct Window {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-}
-
-/// **不能用 `#[serde(flatten)]` 摊平 `Window`。**
-///
-/// flatten 会让 serde 走 `deserialize_any`，而 query string 里一切都是
-/// 字符串 —— 于是 `from_ms=123` 被当成字符串喂给 `i64`，整个请求 400：
-/// `invalid type: string "123", expected i64`。
-///
-/// 表现很坏：不带参数时一切正常，只有在**同时带上时间窗**的时候才失败，
-/// 而界面恰恰总是带着它调。单元测试看不见这件事 —— 它只在真的经过一次
-/// query string 解析时才发生。
-#[derive(serde::Deserialize)]
-struct BucketQuery {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-    bucket_ms: Option<i64>,
-}
-
-impl BucketQuery {
-    fn range(&self) -> (i64, i64) {
-        Window {
-            from_ms: self.from_ms,
-            to_ms: self.to_ms,
-        }
-        .range()
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct BucketGroupQuery {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-    bucket_ms: Option<i64>,
-    /// 和 `GroupQuery` 同一条理由：是枚举不是字符串，它会变成列名。
-    dim: tw_api::CostDim,
-}
-
-#[derive(serde::Deserialize)]
-struct GroupQuery {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-    /// **是枚举不是字符串。**它会决定 SQL 里的列名，用字符串就是一个
-    /// 注入口；写错的值在这里被 serde 直接拒掉，而不是拼进查询。
-    dim: tw_api::CostDim,
-}
-
-impl GroupQuery {
-    fn range(&self) -> (i64, i64) {
-        Window {
-            from_ms: self.from_ms,
-            to_ms: self.to_ms,
-        }
-        .range()
-    }
-}
-
-impl Window {
-    fn range(&self) -> (i64, i64) {
-        let now = now_ms();
-        // 本地时区的零点。UTC 零点对一个桌面工具没有意义 —— 用户在
-        // 东八区，UTC 零点是他的早上八点。
-        let midnight = local_midnight_ms(now);
-        (self.from_ms.unwrap_or(midnight), self.to_ms.unwrap_or(now))
-    }
+/// 时间窗的两端。**缺省是「今天」**，理由见 [`tw_api::Window`]。
+fn range(from_ms: Option<i64>, to_ms: Option<i64>) -> (i64, i64) {
+    let now = now_ms();
+    // 本地时区的零点。UTC 零点对一个桌面工具没有意义 —— 用户在
+    // 东八区，UTC 零点是他的早上八点。
+    let midnight = local_midnight_ms(now);
+    (from_ms.unwrap_or(midnight), to_ms.unwrap_or(now))
 }
 
 fn local_midnight_ms(now_ms: i64) -> i64 {
@@ -1189,34 +1126,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 一张列表要的两样：看哪一段，最多几条。
-///
-/// **时间窗是可选的，而且缺省不是「今天」。**聚合类的端点缺省到今天是
-/// 对的（见 [`Window`]）；列表类的不是 —— 「最近 N 条」本身就是一个
-/// 完整的回答，而缺省成今天的话，过了零点这张表会空掉，那时用户什么
-/// 都没做。
-///
-/// 两端各自可缺：只给 `from_ms` 就是「从那时起到现在」。
-///
-/// 字段摊平写、不用 `#[serde(flatten)]`，理由见 [`Window`] 上面那段。
-#[derive(Debug, serde::Deserialize)]
-struct ListQuery {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
-    limit: Option<usize>,
+/// 列表的时间窗：**缺省是不限**，不是今天（见 [`tw_api::ListQuery`]）。
+fn within(q: &tw_api::ListQuery) -> Option<(i64, i64)> {
+    match (q.from_ms, q.to_ms) {
+        (None, None) => None,
+        (f, t) => Some((f.unwrap_or(i64::MIN), t.unwrap_or_else(now_ms))),
+    }
 }
 
-impl ListQuery {
-    fn within(&self) -> Option<(i64, i64)> {
-        match (self.from_ms, self.to_ms) {
-            (None, None) => None,
-            (f, t) => Some((f.unwrap_or(i64::MIN), t.unwrap_or_else(now_ms))),
-        }
-    }
-
-    fn limit(&self) -> usize {
-        self.limit.unwrap_or(200).min(2000)
-    }
+fn list_limit(q: &tw_api::ListQuery) -> usize {
+    q.limit.unwrap_or(200).min(2000)
 }
 
 /// 当前配置的原文。**文本模式直接显示它。**
@@ -1426,7 +1345,7 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
 /// 界面上少一块统计，而不是弹一个错。
 async fn sessions(
     State(s): State<ControlState>,
-    axum::extract::Query(q): axum::extract::Query<ListQuery>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::ListQuery>,
 ) -> Json<Vec<tw_api::SessionView>> {
     let Some(store) = &s.store else {
         return Json(Vec::new());
@@ -1434,7 +1353,7 @@ async fn sessions(
     let g = store.lock().await;
     Json(
         g.db()
-            .sessions(q.within(), q.limit())
+            .sessions(within(&q), list_limit(&q))
             .unwrap_or_default()
             .iter()
             .map(session_view)
@@ -1504,7 +1423,7 @@ pub enum ControlError {
     },
     /// 这个平台上没有 unix socket。
     ///
-    /// `Endpoint::in_dir` 不会给出这一档，所以走到这里说明有人显式指定了它
+    /// `Address::in_dir` 不会给出这一档，所以走到这里说明有人显式指定了它
     /// —— 与其静默换一种传输，不如说清楚。
     #[cfg(not(unix))]
     #[error("this platform has no unix sockets, so the control plane cannot listen on {path}")]
@@ -1531,23 +1450,23 @@ pub fn socket_path_fits(path: &Path) -> Result<(), ControlError> {
 
 /// 起控制面。
 ///
-/// 两种传输，**挑哪一种不是调用方的事**：`Endpoint::in_dir` 按平台给出这台
-/// 机器上唯一可用的那一种（见 [`tw_api::control::Endpoint`]）。这里只负责把
+/// 两种传输，**挑哪一种不是调用方的事**：`Address::in_dir` 按平台给出这台
+/// 机器上唯一可用的那一种（见 [`tw_api::control::Address`]）。这里只负责把
 /// 它听起来。
 pub async fn serve(
     state: ControlState,
-    at: &tw_api::control::Endpoint,
+    at: &tw_api::control::Address,
     token: token::Token,
 ) -> Result<(), ControlError> {
-    use tw_api::control::Endpoint;
+    use tw_api::control::Address;
     // 门装在这儿，不装进 `router()` —— 理由见 `token::guard`
     let app = token::guard(router(state), token);
     match at {
         #[cfg(unix)]
-        Endpoint::Socket(path) => serve_socket(app, path).await,
+        Address::Socket(path) => serve_socket(app, path).await,
         #[cfg(not(unix))]
-        Endpoint::Socket(path) => Err(ControlError::NoUnixSockets { path: path.clone() }),
-        Endpoint::Loopback { port_file } => serve_loopback(app, port_file).await,
+        Address::Socket(path) => Err(ControlError::NoUnixSockets { path: path.clone() }),
+        Address::Loopback { port_file } => serve_loopback(app, port_file).await,
     }
 }
 
@@ -1652,13 +1571,13 @@ where
 ///
 /// **不是等到 bind 的那一刻才发现。**那时网关已经在监听、客户端可能已经
 /// 连上来了，而这条错误当时只会进日志。
-pub fn endpoint_usable(at: &tw_api::control::Endpoint) -> Result<(), ControlError> {
-    use tw_api::control::Endpoint;
+pub fn endpoint_usable(at: &tw_api::control::Address) -> Result<(), ControlError> {
+    use tw_api::control::Address;
     match at {
-        Endpoint::Socket(p) => socket_path_fits(p),
+        Address::Socket(p) => socket_path_fits(p),
         // 回环那一档没有等价的前置条件：端口由系统挑，挑不出来时 bind 自己
         // 会说，而那句话已经够清楚了。
-        Endpoint::Loopback { .. } => Ok(()),
+        Address::Loopback { .. } => Ok(()),
     }
 }
 

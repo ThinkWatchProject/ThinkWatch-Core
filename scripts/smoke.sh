@@ -319,13 +319,14 @@ for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=36000
 done
 
 for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
-          /security/events /clients /scan /sessions /mcp/targets /diagnostics /config /config/history /models; do
+          /security/events /clients /sessions /mcp/targets /diagnostics /config /config/history /models; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done
 
 # 试算要说清按哪条路由算：不指定密钥或路由时是 400，不再悄悄取第一把密钥
 C=$(post /dryrun '{"model":"claude-sonnet-4-5","route":"默认"}'); [ "$C" = "200" ] && ok "POST /dryrun" || bad "POST /dryrun 返回 $C"
+C=$(post /scan '{"projects":["'"$TMP"'"]}'); [ "$C" = "200" ] && ok "POST /scan（带项目目录）" || bad "POST /scan 返回 $C"
 C=$(post /clients/plan '{"client":"claude-code"}'); [ "$C" = "200" ] && ok "POST /clients/plan" || bad "POST /clients/plan 返回 $C"
 # 页面打开时补问模型清单：立刻返回开始问的那几家，不等上游回话
 C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" || bad "POST /models/refresh 返回 $C"

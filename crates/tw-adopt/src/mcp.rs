@@ -142,7 +142,7 @@ pub fn targets() -> Vec<Target> {
             key: "mcp",
             copyable: false,
             why_not: Some((
-                "adopt.mcp.unverified_format",
+                code!("adopt.mcp.unverified_format"),
                 "this client's MCP configuration format is not verified yet, and writing to it could leave the client unable to read its own configuration",
             )),
         },
@@ -154,7 +154,7 @@ pub fn targets() -> Vec<Target> {
             key: "context_servers",
             copyable: false,
             why_not: Some((
-                "adopt.mcp.zed_structure",
+                code!("adopt.mcp.zed_structure"),
                 "Zed's context servers use a different structure and do not take the command/args form",
             )),
         },

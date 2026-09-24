@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 /// 码的写法是点分小写，从粗到细：`l1.dns.timeout`、`l1.proxy.auth_rejected`。
 /// 第一段是发出它的那一层。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Msg {
     pub code: String,
     /// 填进句子里的参数，按名字取。**值已经写成字符串** —— 界面只是

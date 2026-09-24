@@ -9,6 +9,11 @@ description = "A message for people: a stable code, its arguments, and the Engli
 
 [dependencies]
 serde = { workspace = true }
+# 给桌面端导出 TypeScript 类型用（`Msg`）。**默认关**：企业版不背它
+ts-rs = { workspace = true, optional = true }
+
+[features]
+ts = ["dep:ts-rs"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -16,7 +16,6 @@ use std::collections::HashSet;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post, put};
 use serde_yaml_ng::Value;
 use tw_config::edit::{self, EditError};
 use tw_config::history::Origin;
@@ -26,17 +25,21 @@ use tw_engine::{Group, GroupType, RouteSet, Rule, SetAction};
 use tw_types::{Msg, msg};
 use tw_yaml::Step;
 
+use crate::contract::RouterExt;
 use crate::resources::{checked_name, invalid, mapping};
 use crate::{ApplyError, ControlState, Fail, apply_fail};
+use tw_api::ep;
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/routes", post(create_route))
-        .route("/routes/{name}", put(update_route).delete(delete_route))
-        .route("/default_route", put(set_default_route))
-        .route("/groups", post(create_group))
-        .route("/groups/{name}", put(update_group).delete(delete_group))
-        .route("/models", get(known_models))
+        .at(ep::CreateRoute, create_route)
+        .at(ep::UpdateRoute, update_route)
+        .at(ep::DeleteRoute, delete_route)
+        .at(ep::SetDefaultRoute, set_default_route)
+        .at(ep::CreateGroup, create_group)
+        .at(ep::UpdateGroup, update_group)
+        .at(ep::DeleteGroup, delete_group)
+        .at(ep::KnownModels, known_models)
 }
 
 // ─────────────────────────────────────────────────────────── 路由

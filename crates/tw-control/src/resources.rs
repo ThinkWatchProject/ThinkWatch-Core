@@ -17,30 +17,30 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
 use serde_yaml_ng::Value;
 use tw_config::edit::{self, EditError};
 use tw_config::history::Origin;
 use tw_config::refs::{self, ProviderRef};
 
+use crate::contract::RouterExt;
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
+use tw_api::ep;
 use tw_types::{Msg, msg};
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/providers", post(create_provider))
-        .route("/providers/test", post(test_provider))
-        .route("/providers/preview", post(preview_provider))
-        .route(
-            "/providers/{name}",
-            put(update_provider).delete(delete_provider),
-        )
-        .route("/providers/{name}/models", get(provider_models))
-        .route("/providers/{name}/models/refresh", post(refresh_models))
-        .route("/models/refresh", post(refresh_stale_models))
-        .route("/proxies", post(create_proxy))
-        .route("/proxies/test", post(test_proxy))
-        .route("/proxies/{name}", put(update_proxy).delete(delete_proxy))
+        .at(ep::CreateProvider, create_provider)
+        .at(ep::TestProvider, test_provider)
+        .at(ep::PreviewProvider, preview_provider)
+        .at(ep::UpdateProvider, update_provider)
+        .at(ep::DeleteProvider, delete_provider)
+        .at(ep::ProviderModels, provider_models)
+        .at(ep::RefreshProviderModels, refresh_models)
+        .at(ep::RefreshStaleModels, refresh_stale_models)
+        .at(ep::CreateProxy, create_proxy)
+        .at(ep::TestProxy, test_proxy)
+        .at(ep::UpdateProxy, update_proxy)
+        .at(ep::DeleteProxy, delete_proxy)
 }
 
 // ─────────────────────────────────────────────────────────── 上游
