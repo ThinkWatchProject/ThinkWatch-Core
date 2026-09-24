@@ -2775,6 +2775,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tw-breaker"
+version = "0.39.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tw-config"
 version = "0.39.0"
 dependencies = [
@@ -2903,6 +2911,7 @@ dependencies = [
  "tower",
  "tracing",
  "tw-api",
+ "tw-breaker",
  "tw-config",
  "tw-dialect",
  "tw-engine",

@@ -253,7 +253,7 @@ fn the_source_code_itself_contains_no_way_to_delete_anything() {
     // 一个安全扫描器长出删除能力的那天，会是从某个「顺手」的 PR 开始的。
     for f in [
         "src/report.rs",
-        "src/hidden.rs",
+        "../tw-guard/src/hidden.rs",
         "src/sources.rs",
         // 规则引擎住在 tw-guard，扫描器用的也是它
         "../tw-guard/src/tools/rules.rs",
