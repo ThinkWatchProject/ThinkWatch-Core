@@ -38,17 +38,19 @@ cargo run -p twcore -- serve    # 起网关和控制面
 ## crate 分层
 
 ```
-tw-types · tw-dialect · tw-wire · tw-upstream · tw-crypto   ← 形状由外部现实决定
-tw-engine · tw-pricing · tw-guard · tw-breaker · tw-yaml · tw-secret   ← 领域逻辑
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe      ← 装配
-tw-gateway · tw-control                                     ← 数据面 / 控制面
+tw-dialect · tw-guard · tw-breaker                        ← 与服务端版本共用
+tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret   ← 领域逻辑
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe    ← 装配
+tw-gateway · tw-control                                   ← 数据面 / 控制面
 ```
 
-上面两层对外部稳定。服务端版本直接依赖其中的 tw-types、tw-dialect、
-tw-wire、tw-upstream、tw-crypto、tw-guard、tw-breaker，tw-secret 经
-tw-guard 间接带进去。下面两层是单机的实现
-（SQLite、unix socket），**有意不共用** —— 单机 SQLite 和多租户 Postgres
-差得太远，强行统一只会造出一个两边都别扭的抽象。
+服务端版本只依赖最上面一层：格式转换与用量解析（tw-dialect）、脱敏与工具调用
+审查（tw-guard）、熔断状态机（tw-breaker）。这三个只依赖彼此 —— 有测试守着，
+CI 也会拿服务端版本对着每一次改动编译一遍。只有一方在用的东西住在那一方，
+不放在这里。
+
+下面三层是单机的实现（SQLite、unix socket），**有意不共用** —— 单机 SQLite
+和多租户 Postgres 差得太远，强行统一只会造出一个两边都别扭的抽象。
 
 ## 开发
 

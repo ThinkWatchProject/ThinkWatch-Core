@@ -38,8 +38,6 @@ rand = { workspace = true }
 uuid = { workspace = true }
 tw-guard = { workspace = true }
 tw-dialect = { workspace = true }
-tw-upstream = { workspace = true }
-tw-wire = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

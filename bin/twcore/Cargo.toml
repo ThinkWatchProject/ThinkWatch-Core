@@ -23,7 +23,6 @@ clap = { workspace = true }
 tw-adopt = { workspace = true }
 tw-scan = { workspace = true }
 tw-guard = { workspace = true }
-tw-wire = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

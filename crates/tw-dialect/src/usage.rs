@@ -14,16 +14,21 @@
 //! | 非流式 | 末尾一个 `usage` | 同 | 同 | `usageMetadata` | 末尾一个 `usage` |
 //! | 流式 | `message_start` 给输入、`message_delta` 给输出 | 末尾一个带 `usage` 的 chunk | `response.completed` 里的 `usage` | 每一帧都带累计的 `usageMetadata` | `metadata` 事件里的 `usage` |
 //!
-//! Bedrock 的流是二进制帧，要先经 `tw_upstream::eventstream` 转成 SSE 再喂进来。
+//! Bedrock 的流是二进制帧，要由调用方先转成 SSE（`:event-type` 进 `event:`，
+//! 载荷进 `data:`）再喂进来。
 //!
 //! 流式那一行决定了实现形状：usage **可能出现在流的任何位置，而且不止
 //! 一次**，所以不能只看结尾。
 //!
-//! **几家对「输入」的定义不一样**：Anthropic 的 `input_tokens` 和 Bedrock 的 `inputTokens` 不含缓存命中；
-//! OpenAI（两种格式）和 Gemini 的输入数**包含**缓存命中。不减掉的话，命中缓存的
-//! 那部分会按输入价再算一遍。
+//! **数字怎么换算不在这里。**找到的对象交给那一家的 `usage()`（和方言转换用的
+//! 是同一个），这里只负责「在字节流里找到它」和「认出它是哪一家的」。几家对
+//! 「输入」的定义不一样（OpenAI 和 Gemini 的输入数包含缓存命中），那些换算
+//! 各写在各家的模块里，只有一处。
 
 use serde_json::Value;
+
+pub use crate::ir::Usage;
+use crate::{anthropic, bedrock, chat, gemini, responses};
 
 /// 跨 chunk 的接续窗口。
 ///
@@ -35,23 +40,6 @@ const CARRY: usize = 4096;
 /// 上限足以装下任何真实的，同时挡住「响应体里恰好有个叫 usage 的巨大
 /// 字段」那种情况。
 const MAX_OBJECT: usize = 8192;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Usage {
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**，
-    /// 而上游只在 Anthropic 那边给这个细分
-    pub cache_1h: bool,
-}
-
-impl Usage {
-    pub fn is_empty(&self) -> bool {
-        *self == Usage::default()
-    }
-}
 
 /// 一边流一边嗅。
 #[derive(Debug, Default)]
@@ -138,11 +126,11 @@ impl Sniffer {
                 continue;
             };
             if let Ok(v) = serde_json::from_slice::<Value>(&buf[open..=end]) {
-                if gemini {
-                    self.merge_gemini(&v);
+                self.merge(if gemini {
+                    gemini::response::usage(&v)
                 } else {
-                    self.merge(&v);
-                }
+                    read(&v)
+                });
             }
         }
     }
@@ -151,91 +139,43 @@ impl Sniffer {
     ///
     /// **每个字段取较大值。**Anthropic 的 `message_start` 给输入、
     /// `message_delta` 给累计输出，两者都只带自己那部分；取较大值让
-    /// 「后来的那个把前面的清零」不会发生。
-    fn merge(&mut self, v: &Value) {
-        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let mut got = false;
-        // Anthropic、OpenAI、Bedrock 各叫各的名字，都认
-        let mut take = |keys: &[&str], slot: &mut u64| {
-            for k in keys {
-                let x = n(k);
-                if x > 0 {
-                    got = true;
-                    *slot = (*slot).max(x);
-                }
-            }
-        };
-        take(
-            &["input_tokens", "prompt_tokens", "inputTokens"],
-            &mut self.seen.input,
-        );
-        take(
-            &["output_tokens", "completion_tokens", "outputTokens"],
-            &mut self.seen.output,
-        );
-        take(
-            &["cache_read_input_tokens", "cacheReadInputTokens"],
-            &mut self.seen.cache_read,
-        );
-        take(
-            &["cache_creation_input_tokens", "cacheWriteInputTokens"],
-            &mut self.seen.cache_write,
-        );
-        // OpenAI 把缓存读写放在明细里（Chat 叫 `prompt_tokens_details`，Responses
-        // 叫 `input_tokens_details`），**而且它们是输入数的子集** —— 直接相加会
-        // 重复计费。
-        let details = v
-            .get("prompt_tokens_details")
-            .or_else(|| v.get("input_tokens_details"));
-        let detail = |k: &str| {
-            details
-                .and_then(|d| d.get(k))
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-        };
-        let (read, write) = (detail("cached_tokens"), detail("cache_write_tokens"));
-        if read + write > 0 {
-            got = true;
-            self.seen.cache_read = self.seen.cache_read.max(read);
-            self.seen.cache_write = self.seen.cache_write.max(write);
-            self.seen.input = self.seen.input.saturating_sub(read + write);
-        }
-        // 1 小时缓存写。Anthropic 在 `cache_creation` 里给细分
-        if let Some(d) = v.get("cache_creation") {
-            let h = d
-                .get("ephemeral_1h_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if h > 0 {
-                got = true;
-                self.seen.cache_1h = true;
-                self.seen.cache_write = self.seen.cache_write.max(h);
-            }
-        }
-        self.found |= got;
-    }
-
-    /// 合并一个 Gemini 的 `usageMetadata`。**流里每一帧都带，数字是累计的**，
-    /// 取较大值就是最终数。`promptTokenCount` 包含缓存命中，`candidatesTokenCount`
-    /// 不含思考
-    fn merge_gemini(&mut self, v: &Value) {
-        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let cached = n("cachedContentTokenCount");
-        let input = (n("promptTokenCount") + n("toolUsePromptTokenCount")).saturating_sub(cached);
-        let output = n("candidatesTokenCount") + n("thoughtsTokenCount");
-        if input + cached + output == 0 {
+    /// 「后来的那个把前面的清零」不会发生。Gemini 每一帧都带累计数，
+    /// 取较大值就是最终数。
+    fn merge(&mut self, u: Usage) {
+        if u.is_empty() {
             return;
         }
         self.found = true;
-        self.seen.input = self.seen.input.max(input);
-        self.seen.cache_read = self.seen.cache_read.max(cached);
-        self.seen.output = self.seen.output.max(output);
+        self.seen.merge(&u);
     }
 
     /// 嗅到了什么。**没嗅到就是 None，不是零** —— 零会让一次真实的
     /// 调用看起来是免费的。
     pub fn finish(self) -> Option<Usage> {
         self.found.then_some(self.seen)
+    }
+}
+
+/// 读一个不知道是哪家的 `usage` 对象：按只有那一家才有的字段名认出来，
+/// 交给那一家的解析器。
+///
+/// Anthropic 和 Responses 都叫 `input_tokens` / `output_tokens`，区别在明细：
+/// Responses 有 `input_tokens_details` 和 `total_tokens`，而且它的输入数包含
+/// 缓存命中 —— 认错了，缓存那部分会按输入价再算一遍。
+pub fn read(v: &Value) -> Usage {
+    let has = |k: &str| v.get(k).is_some();
+    if has("prompt_tokens") || has("completion_tokens") || has("prompt_tokens_details") {
+        chat::response::usage(v)
+    } else if has("inputTokens")
+        || has("outputTokens")
+        || has("cacheReadInputTokens")
+        || has("cacheWriteInputTokens")
+    {
+        bedrock::response::usage(v)
+    } else if has("input_tokens_details") || has("total_tokens") {
+        responses::response::usage(v)
+    } else {
+        anthropic::response::usage(v)
     }
 }
 
@@ -494,6 +434,39 @@ mod tests {
         s.feed(br#"data: {"usage":{"input_tokens":11,"output_tokens":22}}"#);
         let u = s.finish().unwrap();
         assert_eq!((u.input, u.output), (11, 22));
+    }
+
+    #[test]
+    fn chat_cache_writes_are_also_part_of_the_prompt() {
+        let u = sniff(&[r#"{"usage":{"prompt_tokens":1000,"completion_tokens":50,
+                "prompt_tokens_details":{"cached_tokens":600,"cache_write_tokens":300},
+                "completion_tokens_details":{"reasoning_tokens":20}}}"#])
+        .unwrap();
+        assert_eq!(
+            (u.input, u.cache_read, u.cache_write, u.output, u.reasoning),
+            (100, 600, 300, 50, 20)
+        );
+    }
+
+    #[test]
+    fn the_sniffer_and_the_dialect_read_a_usage_object_the_same_way() {
+        // 同一个对象，旁路嗅探和方言转换得出同一组数 —— 换算只有一处
+        let anthropic = serde_json::json!({"input_tokens":10,"cache_creation_input_tokens":2000,
+            "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2000}});
+        let responses = serde_json::json!({"input_tokens":5000,"output_tokens":300,"total_tokens":5300,
+            "input_tokens_details":{"cached_tokens":4000}});
+        let bedrock =
+            serde_json::json!({"inputTokens":60,"outputTokens":20,"cacheReadInputTokens":40});
+        for (v, parsed) in [
+            (&anthropic, anthropic::response::usage(&anthropic)),
+            (&responses, responses::response::usage(&responses)),
+            (&bedrock, bedrock::response::usage(&bedrock)),
+        ] {
+            assert_eq!(read(v), parsed, "{v}");
+            let sniffed = sniff(&[&format!(r#"{{"usage":{v}}}"#)]).unwrap();
+            assert_eq!(sniffed, parsed, "{v}");
+        }
+        assert!(read(&anthropic).cache_1h);
     }
 
     #[test]
