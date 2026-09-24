@@ -42,7 +42,7 @@ fn started(id: u64, model: &str) -> tw_api::Event {
         client_hint: Some("claude-code".into()),
         session_fp: None,
         provider: "官方".into(),
-        billing: "per-token".into(),
+        billing: tw_api::Billing::PerToken,
         model: model.into(),
         method: "POST".into(),
         path: "/v1/messages".into(),

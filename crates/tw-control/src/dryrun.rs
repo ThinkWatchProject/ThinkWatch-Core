@@ -50,12 +50,13 @@ use crate::ControlState;
 use tw_types::msg;
 
 use crate::{Fail, fail};
+use tw_api::{ConditionField, DryRunOutcome, RuleEffect, RuleVerdict, SetField};
 
 fn facts(req: &tw_api::DryRunRequest) -> RequestFacts {
     RequestFacts {
         model: req.model.clone(),
         client: req.client.clone(),
-        dialect: req.dialect.clone(),
+        dialect: req.dialect.slug().to_string(),
         input_tokens: req.input_tokens,
         max_tokens: req.max_tokens,
         cache: req.cache,
@@ -130,10 +131,10 @@ pub async fn dry_run(
         .client_probes
         .all()
         .into_iter()
-        .find(|(slug, _)| *slug == f.intent)
+        .find(|(class, _)| class.slug() == f.intent)
         .and_then(|(_, action)| match action {
-            tw_config::ProbeAction::Intercept => Some("intercepted"),
-            tw_config::ProbeAction::Passthrough => Some("passthrough"),
+            tw_config::ProbeAction::Intercept => Some(DryRunOutcome::Intercepted),
+            tw_config::ProbeAction::Passthrough => Some(DryRunOutcome::Passthrough),
             // 交给路由的那些照常往下走，和普通请求一样
             tw_config::ProbeAction::Route => None,
         });
@@ -152,7 +153,7 @@ pub async fn dry_run(
             trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 // 阶段二的条件要等路由决定完才知道，静态试算给不了结论
-                verdict: "phase_two".into(),
+                verdict: RuleVerdict::PhaseTwo,
                 mismatch: None,
                 error: None,
                 effect: None,
@@ -165,32 +166,32 @@ pub async fn dry_run(
                 // 规则在试算里命中，而去向早已由前面的规则决定
                 let effect = if !decided && r.decides() {
                     decided = true;
-                    "decide"
+                    RuleEffect::Decide
                 } else if r.adds() {
-                    "apply"
+                    RuleEffect::Apply
                 } else {
-                    "none"
+                    RuleEffect::None
                 };
                 trace.push(tw_api::RuleTrace {
                     name: r.name.clone(),
-                    verdict: "matched".into(),
+                    verdict: RuleVerdict::Matched,
                     mismatch: None,
                     error: None,
-                    effect: Some(effect.into()),
+                    effect: Some(effect),
                 })
             }
             Ok(false) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
-                verdict: "skipped".into(),
+                verdict: RuleVerdict::Skipped,
                 mismatch: unmatched(&r.when, &f),
                 error: None,
                 effect: None,
             }),
             Err(e) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
-                verdict: "skipped".into(),
+                verdict: RuleVerdict::Skipped,
                 mismatch: None,
-                error: Some(e.to_string()),
+                error: Some(e.msg()),
                 effect: None,
             }),
         }
@@ -198,7 +199,7 @@ pub async fn dry_run(
 
     let mut out = tw_api::DryRunResult {
         route,
-        outcome: short.unwrap_or("no_match").into(),
+        outcome: short.unwrap_or(DryRunOutcome::NoMatch),
         strategy: None,
         rule: None,
         reason: None,
@@ -218,7 +219,7 @@ pub async fn dry_run(
 
     match engine.route_with(rules, &f) {
         Ok(Outcome::Route(mut d)) => {
-            out.outcome = "route".into();
+            out.outcome = DryRunOutcome::Route;
             out.rule = Some(d.matched_rule.clone());
             out.via_group = d.via_group.clone();
             // 按这个组的配置判断：开着会话粘滞的轮询组不伤缓存
@@ -232,7 +233,7 @@ pub async fn dry_run(
                 .via_group
                 .as_deref()
                 .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .map(|g| g.kind.slug().to_string());
+                .map(|g| crate::routes::group_kind(g.kind));
             // 和数据面同一步：去掉服务不了这个请求的候选（停用的、范围外的、
             // 清单里没有这个模型的）。**被跳过的要列出来** —— 「规则明明写的
             // 是 A」正是用户会来试算的原因
@@ -247,12 +248,12 @@ pub async fn dry_run(
                 .iter()
                 .map(|(provider, why)| tw_api::SkippedView {
                     provider: provider.clone(),
-                    reason: why.slug().to_string(),
+                    reason: (*why).into(),
                 })
                 .collect();
             // 服务不了的原因都在 `skipped` 里，不再另说一遍
             if serving.usable.is_empty() {
-                out.outcome = "unavailable".into();
+                out.outcome = DryRunOutcome::Unavailable;
                 return Ok(Json(out));
             }
             d.candidates = serving.usable;
@@ -283,22 +284,24 @@ pub async fn dry_run(
                 .filter_map(|name| {
                     let p = rt.config.providers.iter().find(|p| &p.name == name)?;
                     // 比的是格式，不是协议：ChatGPT 账号说的就是 Responses 格式
-                    let to = tw_gateway::translate::dialect_of(p.effective_protocol()?).slug();
+                    let to = tw_gateway::wire::dialect(tw_gateway::translate::dialect_of(
+                        p.effective_protocol()?,
+                    ));
                     (to != req.dialect).then(|| tw_api::ConvertedView {
                         provider: name.clone(),
-                        from: req.dialect.clone(),
-                        to: to.to_string(),
+                        from: req.dialect,
+                        to,
                     })
                 })
                 .collect();
         }
         Ok(Outcome::Deny { rule, reason }) => {
-            out.outcome = "deny".into();
+            out.outcome = DryRunOutcome::Deny;
             out.rule = Some(rule);
             out.reason = Some(reason);
         }
         Err(RouteError::NoMatch) => {
-            out.outcome = "no_match".into();
+            out.outcome = DryRunOutcome::NoMatch;
         }
         Err(e) => {
             return Err(fail(StatusCode::BAD_REQUEST, e.msg()));
@@ -309,25 +312,20 @@ pub async fn dry_run(
 
 fn describe(set: &tw_engine::SetAction) -> Vec<tw_api::SetView> {
     let mut v = Vec::new();
-    let mut push = |field: &str, value: String| {
-        v.push(tw_api::SetView {
-            field: field.to_string(),
-            value,
-        })
-    };
+    let mut push = |field: SetField, value: String| v.push(tw_api::SetView { field, value });
     // 换模型会作废整个 prompt cache，而这件事在长会话里可能比不换还贵 ——
     // 界面上要说出来，所以它单独是一项，不和别的参数混在一起
     if let Some(m) = &set.model {
-        push("model", m.clone());
+        push(SetField::Model, m.clone());
     }
     if let Some(t) = set.max_tokens {
-        push("max_tokens", t.to_string());
+        push(SetField::MaxTokens, t.to_string());
     }
     if let Some(t) = set.thinking {
-        push("thinking", t.to_string());
+        push(SetField::Thinking, t.to_string());
     }
     if set.only_at_session_start {
-        push("only_at_session_start", "true".to_string());
+        push(SetField::OnlyAtSessionStart, "true".to_string());
     }
     v
 }
@@ -337,21 +335,17 @@ fn describe(set: &tw_engine::SetAction) -> Vec<tw_api::SetView> {
 /// **逐条试，报第一个不满足的。**报「不匹配」等于什么都没说 —— 用户看
 /// 试算就是为了知道差在哪儿。
 fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::MismatchView> {
-    let miss = |field: &str, want: Vec<String>, got: String| {
-        Some(tw_api::MismatchView {
-            field: field.to_string(),
-            want,
-            got,
-        })
+    let miss = |field: ConditionField, want: Vec<String>, got: String| {
+        Some(tw_api::MismatchView { field, want, got })
     };
     if let Some(w) = &when.model
         && !tw_engine::rule::glob_match(w, &f.model)
     {
-        return miss("model", vec![w.clone()], f.model.clone());
+        return miss(ConditionField::Model, vec![w.clone()], f.model.clone());
     }
     for (field, want, got) in [
-        ("client", &when.client, &f.client),
-        ("dialect", &when.dialect, &f.dialect),
+        (ConditionField::Client, &when.client, &f.client),
+        (ConditionField::Dialect, &when.dialect, &f.dialect),
     ] {
         if let Some(w) = want
             && w != got
@@ -365,14 +359,18 @@ fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::M
         && (f.intent.is_empty() || !(w.contains(&f.intent) || w.contains("assistant_internal")))
     {
         // 实际值为空表示真实的用户请求，由界面说明
-        return miss("intent", crate::one_or_many(w), f.intent.clone());
+        return miss(
+            ConditionField::Intent,
+            crate::one_or_many(w),
+            f.intent.clone(),
+        );
     }
     for (want, got, field) in [
-        (when.cache, f.cache, "cache"),
-        (when.tools, f.tools, "tools"),
-        (when.image, f.image, "image"),
-        (when.thinking, f.thinking, "thinking"),
-        (when.stream, f.stream, "stream"),
+        (when.cache, f.cache, ConditionField::Cache),
+        (when.tools, f.tools, ConditionField::Tools),
+        (when.image, f.image, ConditionField::Image),
+        (when.thinking, f.thinking, ConditionField::Thinking),
+        (when.stream, f.stream, ConditionField::Stream),
     ] {
         if let Some(w) = want
             && w != got
@@ -383,9 +381,17 @@ fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::M
     // **逐个比较，报真没对上的那个。**以前这里报的是第一个写了的数量条件，
     // 哪怕它其实满足 —— 「要求输入 >100k，实际 200000」这种自相矛盾的话
     for (want, got, field) in [
-        (&when.input_tokens, Some(f.input_tokens), "input_tokens"),
-        (&when.tool_count, Some(f.tool_count as u64), "tool_count"),
-        (&when.max_tokens, f.max_tokens, "max_tokens"),
+        (
+            &when.input_tokens,
+            Some(f.input_tokens),
+            ConditionField::InputTokens,
+        ),
+        (
+            &when.tool_count,
+            Some(f.tool_count as u64),
+            ConditionField::ToolCount,
+        ),
+        (&when.max_tokens, f.max_tokens, ConditionField::MaxTokens),
     ] {
         let Some(w) = want else { continue };
         let Ok(cmp) = w.parse::<tw_engine::num::Compare>() else {

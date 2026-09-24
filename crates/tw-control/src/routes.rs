@@ -349,8 +349,8 @@ fn when_from(
     let mut w = When::default();
     let mut seen = HashSet::new();
     for c in conds {
-        let field = c.field.as_str();
-        if !seen.insert(field) {
+        let field = c.field.slug();
+        if !seen.insert(c.field) {
             return Err(msg!(
                 "control.rule.condition_twice", rule = rule, field = field =>
                 "rule `{rule}`: condition `{field}` appears twice"
@@ -400,9 +400,10 @@ fn when_from(
                 vs => Ok(OneOrMany::Many(vs.to_vec())),
             }
         };
-        match field {
-            "model" => w.model = Some(one()?),
-            "client" => {
+        use tw_api::ConditionField as F;
+        match c.field {
+            F::Model => w.model = Some(one()?),
+            F::Client => {
                 let k = one()?;
                 if !cfg.clients.iter().any(|c| c.name == k) {
                     return Err(msg!(
@@ -412,7 +413,7 @@ fn when_from(
                 }
                 w.client = Some(k);
             }
-            "dialect" => {
+            F::Dialect => {
                 let d = one()?;
                 if !DIALECTS.contains(&d.as_str()) {
                     return Err(msg!(
@@ -422,15 +423,15 @@ fn when_from(
                 }
                 w.dialect = Some(d);
             }
-            "input_tokens" => w.input_tokens = Some(one()?),
-            "max_tokens" => w.max_tokens = Some(one()?),
-            "tool_count" => w.tool_count = Some(one()?),
-            "cache" => w.cache = Some(flag()?),
-            "tools" => w.tools = Some(flag()?),
-            "image" => w.image = Some(flag()?),
-            "thinking" => w.thinking = Some(flag()?),
-            "stream" => w.stream = Some(flag()?),
-            "intent" => {
+            F::InputTokens => w.input_tokens = Some(one()?),
+            F::MaxTokens => w.max_tokens = Some(one()?),
+            F::ToolCount => w.tool_count = Some(one()?),
+            F::Cache => w.cache = Some(flag()?),
+            F::Tools => w.tools = Some(flag()?),
+            F::Image => w.image = Some(flag()?),
+            F::Thinking => w.thinking = Some(flag()?),
+            F::Stream => w.stream = Some(flag()?),
+            F::Intent => {
                 w.intent = Some(many(&|v| INTENTS.contains(&v), &|v| {
                     msg!(
                         "control.rule.no_such_probe_class", rule = rule, class = v =>
@@ -438,7 +439,7 @@ fn when_from(
                     )
                 })?)
             }
-            "provider_would_be" => {
+            F::ProviderWouldBe => {
                 w.provider_would_be = Some(many(
                     &|v| cfg.providers.iter().any(|p| p.name == v),
                     &|v| {
@@ -448,12 +449,6 @@ fn when_from(
                         )
                     },
                 )?)
-            }
-            other => {
-                return Err(msg!(
-                    "control.rule.unknown_condition", rule = rule, field = other =>
-                    "rule `{rule}`: `{field}` is not a condition we support"
-                ));
             }
         }
     }
@@ -722,7 +717,7 @@ mod msg_codes {
             conditions: conds
                 .iter()
                 .map(|(f, vs)| tw_api::ConditionView {
-                    field: f.to_string(),
+                    field: tw_api::ConditionField::from_slug(f).unwrap(),
                     values: vs.iter().map(|v| v.to_string()).collect(),
                 })
                 .collect(),
@@ -774,10 +769,6 @@ mod msg_codes {
         assert_eq!(
             code(rule(&[("provider_would_be", &["b"])])),
             "control.rule.no_such_upstream"
-        );
-        assert_eq!(
-            code(rule(&[("color", &["red"])])),
-            "control.rule.unknown_condition"
         );
         // 比较式写错是引擎那一句，**码不变，多带一个规则名**
         assert_eq!(

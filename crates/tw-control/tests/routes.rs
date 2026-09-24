@@ -344,7 +344,6 @@ async fn a_broken_condition_is_refused_before_anything_is_written() {
             json!([{ "field": "cache", "values": ["yes"] }]),
             "takes true or false",
         ),
-        (json!([{ "field": "colour", "values": ["red"] }]), "colour"),
     ] {
         let (st, v) = call(
             &b.app,
@@ -359,6 +358,19 @@ async fn a_broken_condition_is_refused_before_anything_is_written() {
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
         assert!(v["text"].as_str().unwrap_or_default().contains(says), "{v}");
     }
+    // 条件的键不在集合里：请求体本身读不成
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/routes/codex",
+        json!({ "route": { "name": "codex", "rules": [
+            rule("坏的", json!([{ "field": "colour", "values": ["red"] }]), "中转"),
+            catch_all("主力"),
+        ]}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["code"], "control.request_rejected", "{v}");
     assert_eq!(b.file(), before);
 }
 

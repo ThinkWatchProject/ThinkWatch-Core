@@ -36,7 +36,7 @@ use tw_gateway::chatgpt;
 
 use crate::contract::RouterExt;
 use crate::{ControlState, Fail, fail};
-use tw_api::ep;
+use tw_api::{LoginStatus, ep};
 use tw_types::{Msg, msg};
 
 /// 登录要在多久之内完成。和 Codex 一样是 15 分钟
@@ -122,8 +122,8 @@ impl Current {
     async fn stop(self, s: &ControlState) {
         self.task.abort();
         let _ = self.task.await;
-        if self.status.status == "pending" {
-            announce(s, &self.status.id, "cancelled", None, None);
+        if self.status.status == LoginStatus::Pending {
+            announce(s, &self.status.id, LoginStatus::Cancelled, None, None);
         }
     }
 }
@@ -177,15 +177,9 @@ impl Want {
                 .filter(|x| !x.is_empty())
                 .map(str::to_string)
         };
-        let mode = match given(&req.mode).as_deref() {
-            None | Some("browser") => Mode::Browser,
-            Some("device") => Mode::Device,
-            Some(other) => {
-                return Err(fail(
-                    StatusCode::BAD_REQUEST,
-                    msg!("control.unknown_signin_mode", mode = other => "`{mode}` is not a sign-in mode we support."),
-                ));
-            }
+        let mode = match req.mode {
+            None | Some(tw_api::ChatgptLoginMode::Browser) => Mode::Browser,
+            Some(tw_api::ChatgptLoginMode::Device) => Mode::Device,
         };
         let name = given(&req.name).unwrap_or_else(|| DEFAULT_NAME.to_string());
         let proxy = given(&req.proxy).unwrap_or_else(|| tw_config::DIRECT.to_string());
@@ -389,7 +383,7 @@ async fn start_device(
 fn pending(id: &str) -> tw_api::ChatgptLoginStatus {
     tw_api::ChatgptLoginStatus {
         id: id.to_string(),
-        status: "pending".into(),
+        status: LoginStatus::Pending,
         provider: None,
         plan: None,
         error: None,
@@ -434,7 +428,7 @@ async fn await_device(
     while tokio::time::Instant::now() < deadline {
         let resp = match send(&http, reqwest::Method::POST, &url, &[], Some(&asked)).await {
             Ok(r) => r,
-            Err((_, why)) => return settle(&s, &id, Err(why.0.text)),
+            Err((_, why)) => return settle(&s, &id, Err(why.0)),
         };
         let status = resp.status();
         // 还没批：接着等
@@ -447,10 +441,10 @@ async fn await_device(
             return settle(
                 &s,
                 &id,
-                Err(format!(
-                    "signing in answered {}: {}",
-                    status.as_u16(),
-                    brief(&text)
+                Err(msg!(
+                    "control.chatgpt_login.device_status",
+                    status = status.as_u16(), body = brief(&text) =>
+                    "Signing in answered {status}: {body}"
                 )),
             );
         }
@@ -466,26 +460,37 @@ async fn await_device(
                 )
                 .await
             }
-            Err(e) => Err(format!("the approval response could not be read: {e}")),
+            Err(e) => Err(msg!(
+                "control.chatgpt_login.approval_unreadable", detail = e =>
+                "The approval response could not be read: {detail}"
+            )),
         };
         return settle(&s, &id, done);
     }
     s.chatgpt.set_status(tw_api::ChatgptLoginStatus {
         id: id.clone(),
-        status: "expired".into(),
+        status: LoginStatus::Expired,
         provider: None,
         plan: None,
-        error: Some("the authorization was not completed within 15 minutes".into()),
+        error: Some(not_in_time()),
     });
-    announce(&s, &id, "expired", None, None);
+    announce(&s, &id, LoginStatus::Expired, None, None);
+}
+
+/// 十五分钟里没有完成授权
+fn not_in_time() -> Msg {
+    msg!(
+        "control.chatgpt_login.expired" =>
+        "The authorization was not completed within 15 minutes."
+    )
 }
 
 /// 记下登录的结果，并告诉界面一声
-fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), String>) {
+fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Msg>) {
     let status = match done {
         Ok((provider, plan)) => tw_api::ChatgptLoginStatus {
             id: id.to_string(),
-            status: "done".into(),
+            status: LoginStatus::Done,
             provider: Some(provider),
             plan,
             error: None,
@@ -494,7 +499,7 @@ fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Str
             tracing::warn!("the ChatGPT sign-in did not finish: {why}");
             tw_api::ChatgptLoginStatus {
                 id: id.to_string(),
-                status: "failed".into(),
+                status: LoginStatus::Failed,
                 provider: None,
                 plan: None,
                 error: Some(why),
@@ -502,7 +507,7 @@ fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Str
         }
     };
     s.chatgpt.set_status(status.clone());
-    announce(s, id, &status.status, status.provider, status.error);
+    announce(s, id, status.status, status.provider, status.error);
 }
 
 /// 出错时给用户看的那一小段响应
@@ -550,16 +555,16 @@ async fn cancel(
                 ),
             )
         })?;
-        if c.status.status != "pending" {
+        if c.status.status != LoginStatus::Pending {
             return Ok(Json(c.status.clone()));
         }
         // 不用等它停下：端口晚一点让出来也没关系，下一次登录会等
         c.task.abort();
         c.status.clone()
     };
-    status.status = "cancelled".into();
+    status.status = LoginStatus::Cancelled;
     s.chatgpt.set_status(status.clone());
-    announce(&s, &id, "cancelled", None, None);
+    announce(&s, &id, LoginStatus::Cancelled, None, None);
     Ok(Json(status))
 }
 
@@ -598,12 +603,12 @@ async fn serve_callback(flow: Arc<Flow>, listener: tokio::net::TcpListener) {
     if !flow.settled.load(Ordering::SeqCst) {
         flow.s.chatgpt.set_status(tw_api::ChatgptLoginStatus {
             id: flow.id.clone(),
-            status: "expired".into(),
+            status: LoginStatus::Expired,
             provider: None,
             plan: None,
-            error: Some("the authorization was not completed within 15 minutes".into()),
+            error: Some(not_in_time()),
         });
-        announce(&flow.s, &flow.id, "expired", None, None);
+        announce(&flow.s, &flow.id, LoginStatus::Expired, None, None);
     }
 }
 
@@ -626,9 +631,10 @@ async fn callback(
     let result = match (q.get("error"), q.get("code").filter(|c| !c.is_empty())) {
         (Some(e), _) => {
             let detail = q.get("error_description").unwrap_or(e);
-            Err(format!(
-                "the authorization page returned an error: {}",
-                detail.chars().take(200).collect::<String>()
+            Err(msg!(
+                "control.chatgpt_login.page_error",
+                detail = detail.chars().take(200).collect::<String>() =>
+                "The authorization page returned an error: {detail}"
             ))
         }
         (None, Some(code)) => {
@@ -642,7 +648,10 @@ async fn callback(
             )
             .await
         }
-        (None, None) => Err("the callback carried no authorization code".to_string()),
+        (None, None) => Err(msg!(
+            "control.chatgpt_login.no_code" =>
+            "The callback carried no authorization code."
+        )),
     };
     let html = match &result {
         Ok(_) => page(
@@ -652,7 +661,7 @@ async fn callback(
         ),
         Err(why) => page(
             "The ChatGPT sign-in did not finish",
-            &format!("{why}. Go back to ThinkWatch and start again."),
+            &format!("{} Go back to ThinkWatch and start again.", why.text),
             flow.return_to.as_deref(),
         ),
     };
@@ -672,9 +681,9 @@ async fn exchange_and_save(
     code: &str,
     verifier: &str,
     redirect_uri: &str,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, Option<String>), Msg> {
     let endpoints = &s.chatgpt.endpoints;
-    let http = client_for(s, name, proxy).map_err(|m| m.text)?;
+    let http = client_for(s, name, proxy)?;
     let tokens =
         chatgpt::exchange_code(&http, &endpoints.token, code, verifier, redirect_uri).await?;
     let account = chatgpt::account(&tokens.id_token);
@@ -740,7 +749,7 @@ async fn exchange_and_save(
             )?)
         })
         .await
-        .map_err(|e| format!("the configuration could not be written: {e}"))?;
+        .map_err(|e| e.msg())?;
     // 模型清单现在就问一次：不然要等到下一轮定时刷新，新上游的模型才出现
     let gateway = s.gateway.clone();
     let provider = name.clone();
@@ -765,14 +774,14 @@ fn client_for(s: &ControlState, name: &str, proxy: &str) -> Result<reqwest::Clie
 fn announce(
     s: &ControlState,
     login: &str,
-    status: &str,
+    status: LoginStatus,
     provider: Option<String>,
-    error: Option<String>,
+    error: Option<Msg>,
 ) {
     s.bus().emit(tw_api::Event::LoginFinished {
         id: s.bus().next_id(),
         login: login.to_string(),
-        status: status.to_string(),
+        status,
         provider,
         error,
         at_ms: now_ms(),
@@ -875,13 +884,10 @@ async fn account_call(
     }
     let http = s.gateway.client_for(name);
     let url = chatgpt::wham_url(&p.base_url, path);
-    let no_credential = |e: String| {
+    let no_credential = |e: Msg| {
         fail(
             StatusCode::BAD_GATEWAY,
-            msg!(
-                "control.credentials_failed", upstream = name, detail = e =>
-                "The credential for upstream `{upstream}` could not be obtained: {detail}"
-            ),
+            tw_gateway::credential_failed(e, name),
         )
     };
     let headers = s

@@ -49,7 +49,7 @@ fn req(id: i64, at_ms: i64) -> RequestRow {
         local: false,
         cancelled: false,
         routing: None,
-        billing: "per-token".into(),
+        billing: tw_api::Billing::PerToken,
         cache_saved_micros: Some(1_500),
         price_source: None,
         translated: None,
@@ -124,7 +124,7 @@ fn four_a_free_upstream_does_not_distort_the_money() {
     for i in 3..=6 {
         let mut r = req(i, NOW);
         r.provider = "本地模型".into();
-        r.billing = "free".into();
+        r.billing = tw_api::Billing::Free;
         r.cost_micros = Some(0);
         db.insert(&r).unwrap();
     }

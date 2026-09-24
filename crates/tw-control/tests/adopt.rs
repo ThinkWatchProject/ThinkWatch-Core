@@ -152,7 +152,7 @@ async fn the_plan_summary_never_echoes_the_key() {
         .iter()
         .find(|f| f.path == "env.ANTHROPIC_AUTH_TOKEN")
         .expect("写密钥的那一项要列出来");
-    assert_eq!(key.op, "set");
+    assert_eq!(key.op, tw_api::FieldOp::Set);
     assert_eq!(key.value, None, "{key:?}");
 }
 
@@ -476,7 +476,7 @@ async fn replaying_a_truncated_body_is_refused_rather_than_misleading() {
         local: false,
         cancelled: false,
         routing: None,
-        billing: String::new(),
+        billing: tw_api::Billing::PerToken,
         cache_saved_micros: None,
         price_source: None,
         translated: None,
@@ -814,7 +814,7 @@ async fn the_plan_says_which_key_goes_in_and_whether_it_is_made_now() {
     assert!(
         r.fields
             .iter()
-            .any(|f| f.op == "remove" && f.path == "env.ANTHROPIC_BASE_URL"),
+            .any(|f| f.op == tw_api::FieldOp::Remove && f.path == "env.ANTHROPIC_BASE_URL"),
         "{:?}",
         r.fields
     );
@@ -868,7 +868,7 @@ async fn in_use_is_proven_by_the_clients_own_key_not_by_what_the_headers_claim()
         local: false,
         cancelled: false,
         routing: None,
-        billing: String::new(),
+        billing: tw_api::Billing::PerToken,
         cache_saved_micros: None,
         price_source: None,
         translated: None,

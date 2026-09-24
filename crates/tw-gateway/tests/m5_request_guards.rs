@@ -164,7 +164,7 @@ async fn events(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> Vec
 
 fn failed_source(evs: &[tw_api::Event]) -> Option<String> {
     evs.iter().find_map(|e| match e {
-        tw_api::Event::RequestFailed { source, .. } => Some(source.clone()),
+        tw_api::Event::RequestFailed { source, .. } => Some(source.slug().to_string()),
         _ => None,
     })
 }

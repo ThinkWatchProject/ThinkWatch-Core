@@ -75,6 +75,15 @@ pub enum Verified {
     FieldsOnly,
 }
 
+impl From<Verified> for tw_api::Verification {
+    fn from(v: Verified) -> Self {
+        match v {
+            Verified::Measured => Self::Measured,
+            Verified::FieldsOnly => Self::FieldsOnly,
+        }
+    }
+}
+
 impl Verified {
     /// 控制面发给界面的值。
     pub fn slug(&self) -> &'static str {
