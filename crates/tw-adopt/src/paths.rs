@@ -15,7 +15,11 @@
 //! 配置。默认位置就在 home 底下，这是绝大多数；而「没发现」比「改错文件」
 //! 便宜得多。
 //!
-//! 机器级的那一个（管理策略）没有 home 可言，它读环境变量。
+//! XDG 目录是个例外：那几个客户端**自己**认 `$XDG_CONFIG_HOME`，设了它的
+//! 用户，`~/.config` 下那份就不是在用的那份 —— 照默认位置去改，改的正是一份
+//! 错文件。所以它们要读变量，而隔离靠 [`Loc::resolve`] 里那条规矩守住。
+//!
+//! 机器级的那一个（管理策略）没有 home 可言，它是个固定路径。
 
 use std::path::{Path, PathBuf};
 
@@ -32,76 +36,170 @@ pub fn under(base: &Path, rel: &str) -> PathBuf {
         .fold(base.to_path_buf(), |p, c| p.join(c))
 }
 
-/// 给人看的写法：「打开 … 」那一步里的路径。
+/// 一条配置路径从哪儿算起。
 ///
-/// macOS 上是 `~/.claude/settings.json`；Windows 上没有 `~`，写成资源管理器
-/// 地址栏里能直接粘贴的 `%USERPROFILE%\.claude\settings.json`。
-pub fn shown(rel: &str) -> String {
-    #[cfg(windows)]
-    {
-        format!(r"%USERPROFILE%\{}", rel.replace('/', r"\"))
+/// 大多数客户端的配置在 home 底下一个固定的相对位置；有几个跟着 XDG 走
+/// （opencode 在每个平台上，Zed 和 Claude Desktop 在 Linux 上）。**要能在
+/// 常量里构造**：它们放在 `marker: &[…]` 那种静态切片里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loc {
+    /// 相对 home
+    Home(&'static str),
+    /// 相对 XDG 配置目录：`$XDG_CONFIG_HOME`，没设就是 `~/.config`
+    XdgConfig(&'static str),
+    /// 相对 XDG 数据目录：`$XDG_DATA_HOME`，没设就是 `~/.local/share`
+    XdgData(&'static str),
+}
+
+impl Loc {
+    /// 在 `home` 这个用户底下，它落在哪儿。
+    pub fn resolve(&self, home: &Path) -> PathBuf {
+        self.resolve_with(home, env_home().as_deref(), |v| std::env::var_os(v))
     }
-    #[cfg(not(windows))]
-    {
-        format!("~/{rel}")
+
+    /// [`Loc::resolve`] 去掉进程环境的那一半，测试直接喂。
+    ///
+    /// **XDG 变量只在 `home` 就是这个进程自己的 home 时才认。**变量描述的是
+    /// 跑着这个进程的那个用户；调用方传来别的 home（测试传的临时目录就是）
+    /// 时，拿开发者自己的 `$XDG_CONFIG_HOME` 去套它，测试改到的就是真的配置
+    /// —— 这正是本文件开头那条隔离要挡的事。
+    ///
+    /// 相对路径的值不认：XDG 规范要求这类值是绝对路径，相对的当没设（Zed
+    /// 用的 `dirs` 也是这么做的）。
+    fn resolve_with(
+        &self,
+        home: &Path,
+        proc_home: Option<&Path>,
+        var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> PathBuf {
+        let xdg = |name: &str, default: &str, rel: &str| {
+            let base = var(name)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute() && proc_home == Some(home))
+                .unwrap_or_else(|| under(home, default));
+            under(&base, rel)
+        };
+        match *self {
+            Loc::Home(rel) => under(home, rel),
+            Loc::XdgConfig(rel) => xdg("XDG_CONFIG_HOME", ".config", rel),
+            Loc::XdgData(rel) => xdg("XDG_DATA_HOME", ".local/share", rel),
+        }
+    }
+
+    /// 相对 home 的那一段。XDG 那两种没有固定的一段，所以是 `None` ——
+    /// 「项目里有一份同名配置」（`<项目>/.claude/settings.json` 那种）只对
+    /// 前者说得通。
+    pub fn home_rel(&self) -> Option<&'static str> {
+        match *self {
+            Loc::Home(rel) => Some(rel),
+            Loc::XdgConfig(_) | Loc::XdgData(_) => None,
+        }
+    }
+
+    /// 给人看的写法：「打开 … 」那一步里的路径。
+    ///
+    /// macOS 和 Linux 上是 `~/.claude/settings.json`；Windows 上没有 `~`，
+    /// 写成资源管理器地址栏里能直接粘贴的 `%USERPROFILE%\.claude\settings.json`。
+    /// XDG 目录被挪到 home 外面的，给完整路径。
+    pub fn shown(&self) -> String {
+        let home = env_home().unwrap_or_default();
+        let p = self.resolve(&home);
+        let rel = match p.strip_prefix(&home) {
+            Ok(rel) if !home.as_os_str().is_empty() => rel,
+            _ => return p.display().to_string(),
+        };
+        let parts: Vec<_> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        #[cfg(windows)]
+        {
+            format!(r"%USERPROFILE%\{}", parts.join(r"\"))
+        }
+        #[cfg(not(windows))]
+        {
+            format!("~/{}", parts.join("/"))
+        }
     }
 }
 
-/// Zed 的设置文件，相对 home。
-///
-/// Windows 上的 Zed 按那个平台的习惯放在漫游的 AppData 下，不是 `~/.config`。
-pub fn zed_settings() -> &'static str {
+/// 这个进程自己的 home。和 tw-control 的 `home_dir` 读的是同一个变量。
+fn env_home() -> Option<PathBuf> {
     #[cfg(windows)]
-    {
-        "AppData/Roaming/Zed/settings.json"
-    }
+    const VAR: &str = "USERPROFILE";
     #[cfg(not(windows))]
-    {
-        ".config/zed/settings.json"
-    }
+    const VAR: &str = "HOME";
+    std::env::var_os(VAR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
-/// Zed 装过的痕迹：它的设置目录。**是常量不是函数**：它要放进
-/// `marker: &[…]` 那个静态切片里，函数的返回值进不去。
-pub const ZED_DIR: &str = if cfg!(windows) {
-    "AppData/Roaming/Zed"
+/// Zed 的设置文件。
+///
+/// 三个平台三个地方，都照 Zed 自己的 `paths::config_dir()`：Windows 上在漫游
+/// 的 AppData 下；Linux 上是 `$XDG_CONFIG_HOME/zed`（经 `dirs::config_dir`）；
+/// macOS 上**写死** `~/.config/zed`，不看 XDG。
+pub const ZED_SETTINGS: Loc = if cfg!(windows) {
+    Loc::Home("AppData/Roaming/Zed/settings.json")
+} else if cfg!(target_os = "macos") {
+    Loc::Home(".config/zed/settings.json")
 } else {
-    ".config/zed"
+    Loc::XdgConfig("zed/settings.json")
 };
 
-/// Claude Desktop 的配置，相对 home。
+/// Zed 装过的痕迹：它的设置目录。
+pub const ZED_DIR: Loc = if cfg!(windows) {
+    Loc::Home("AppData/Roaming/Zed")
+} else if cfg!(target_os = "macos") {
+    Loc::Home(".config/zed")
+} else {
+    Loc::XdgConfig("zed")
+};
+
+/// opencode 的全局配置。它用 `xdg-basedir`，**每个平台都**认
+/// `$XDG_CONFIG_HOME`，没设才是 `~/.config/opencode`。
+pub const OPENCODE_CONFIG: Loc = Loc::XdgConfig("opencode/opencode.json");
+
+/// Claude Desktop 的配置。
 ///
-/// macOS 上在 `Library/Application Support/` 下，Windows 上在漫游的 AppData 下
-/// —— 两边都是各自平台放这类东西的地方，不是我们挑的。
-pub fn claude_desktop_config() -> &'static str {
-    #[cfg(windows)]
-    {
-        "AppData/Roaming/Claude/claude_desktop_config.json"
-    }
-    #[cfg(not(windows))]
-    {
-        "Library/Application Support/Claude/claude_desktop_config.json"
-    }
-}
+/// 它是 Electron 应用，这个文件在 `userData` 下，也就是 Electron 的 `appData`
+/// 加应用名：macOS 上是 `Library/Application Support/Claude/`，Windows 上是
+/// 漫游的 AppData，Linux（beta，只出 Debian 系的包）上是
+/// `$XDG_CONFIG_HOME/Claude`，没设就是 `~/.config/Claude`。
+pub const CLAUDE_DESKTOP_CONFIG: Loc = if cfg!(windows) {
+    Loc::Home("AppData/Roaming/Claude/claude_desktop_config.json")
+} else if cfg!(target_os = "macos") {
+    Loc::Home("Library/Application Support/Claude/claude_desktop_config.json")
+} else {
+    Loc::XdgConfig("Claude/claude_desktop_config.json")
+};
 
 /// 机器级的管理策略文件。**优先级压过一切**，包括用户自己的配置。
 ///
-/// 机器级，所以这一个不相对 home。
+/// 机器级，所以这一个不相对 home。位置照 Claude Code 文档「Deploy managed
+/// settings」：macOS `/Library/Application Support/ClaudeCode/`，Linux（和
+/// WSL）`/etc/claude-code/`，Windows `C:\Program Files\ClaudeCode\`。Windows
+/// 上旧的 `C:\ProgramData\ClaudeCode\` 文档明说**不再读**，看它等于看一个
+/// 已经不起作用的文件。
 pub fn managed_settings() -> PathBuf {
     #[cfg(windows)]
     {
         // **不写死 `C:\`** —— 系统盘不一定是 C，而写死的后果是在那些机器上
         // 报「这台机器没有管理策略」，也就是对一个真的压过用户配置的东西
         // 视而不见。
-        std::env::var_os("PROGRAMDATA")
+        std::env::var_os("ProgramFiles")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
             .join("ClaudeCode")
             .join("managed-settings.json")
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json")
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        PathBuf::from("/etc/claude-code/managed-settings.json")
     }
 }
 
@@ -111,17 +209,11 @@ mod tests {
 
     /// 相对 home，不是绝对路径 —— 否则 `home.join(…)` 会把 home 整个丢掉。
     #[test]
-    fn the_desktop_config_is_relative_to_home() {
-        let p = claude_desktop_config();
-        assert!(
-            !PathBuf::from(p).is_absolute(),
-            "绝对路径会让 home.join() 忽略 home：{p}"
-        );
+    fn the_desktop_config_is_under_home() {
+        let h = Path::new("/tmp/h");
+        let p = CLAUDE_DESKTOP_CONFIG.resolve_with(h, None, |_| None);
+        assert!(p.starts_with(h), "{}", p.display());
         assert!(p.ends_with("claude_desktop_config.json"));
-        assert_eq!(
-            std::path::Path::new("/tmp/h").join(p),
-            std::path::Path::new("/tmp/h").join(p),
-        );
     }
 
     /// 接出来的每一段都是一个组件：没有哪一段里还夹着 `/`。
@@ -144,7 +236,7 @@ mod tests {
 
     #[test]
     fn the_shown_path_is_written_the_platform_way() {
-        let s = shown(".claude/settings.json");
+        let s = Loc::Home(".claude/settings.json").shown();
         if cfg!(windows) {
             assert_eq!(s, r"%USERPROFILE%\.claude\settings.json");
         } else {
@@ -157,16 +249,85 @@ mod tests {
     fn the_managed_policy_is_machine_wide() {
         assert!(managed_settings().is_absolute());
         assert!(managed_settings().ends_with("managed-settings.json"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                managed_settings(),
+                Path::new("/etc/claude-code/managed-settings.json")
+            );
+        }
     }
 
     /// 每个平台指向自己那套习惯的位置。
     #[test]
     fn each_platform_points_at_its_own_convention() {
-        let p = claude_desktop_config();
+        let h = Path::new("/h");
+        let p = CLAUDE_DESKTOP_CONFIG.resolve_with(h, None, |_| None);
+        let z = ZED_SETTINGS.resolve_with(h, None, |_| None);
         if cfg!(windows) {
-            assert!(p.starts_with("AppData/"), "{p}");
+            assert!(p.starts_with(h.join("AppData")), "{}", p.display());
+        } else if cfg!(target_os = "macos") {
+            assert!(p.starts_with(h.join("Library")), "{}", p.display());
+            assert_eq!(z, under(h, ".config/zed/settings.json"));
         } else {
-            assert!(p.starts_with("Library/"), "{p}");
+            assert_eq!(p, under(h, ".config/Claude/claude_desktop_config.json"));
+            assert_eq!(z, under(h, ".config/zed/settings.json"));
         }
+    }
+
+    /// 设了 `$XDG_CONFIG_HOME` 的用户，认它的客户端就不在 `~/.config` 了。
+    ///
+    /// Windows 上 `/home/u` 不是绝对路径，这条只在 unix 上跑。
+    #[test]
+    #[cfg(not(windows))]
+    fn xdg_config_home_is_honoured_for_the_process_own_home() {
+        let h = Path::new("/home/u");
+        let var = |n: &str| (n == "XDG_CONFIG_HOME").then(|| "/home/u/.cfg".into());
+        assert_eq!(
+            OPENCODE_CONFIG.resolve_with(h, Some(h), var),
+            Path::new("/home/u/.cfg/opencode/opencode.json")
+        );
+        // 没设就是默认位置
+        assert_eq!(
+            OPENCODE_CONFIG.resolve_with(h, Some(h), |_| None),
+            Path::new("/home/u/.config/opencode/opencode.json")
+        );
+        // 数据目录走它自己的变量
+        let data = |n: &str| (n == "XDG_DATA_HOME").then(|| "/data/u".into());
+        assert_eq!(
+            Loc::XdgData("opencode").resolve_with(h, Some(h), data),
+            Path::new("/data/u/opencode")
+        );
+        // 跟 home 走的那些不看它
+        assert_eq!(
+            Loc::Home(".codex/config.toml").resolve_with(h, Some(h), var),
+            Path::new("/home/u/.codex/config.toml")
+        );
+    }
+
+    /// **隔离。**传进来的不是这个进程的 home（测试的临时目录就是），变量
+    /// 描述的就不是它 —— 认了的话，测试改的是开发者真的配置。
+    #[test]
+    fn xdg_config_home_is_ignored_for_any_other_home() {
+        let var = |_: &str| Some("/home/me/.config".into());
+        let tmp = Path::new("/tmp/test-home");
+        assert_eq!(
+            OPENCODE_CONFIG.resolve_with(tmp, Some(Path::new("/home/me")), var),
+            Path::new("/tmp/test-home/.config/opencode/opencode.json")
+        );
+        assert_eq!(
+            OPENCODE_CONFIG.resolve_with(tmp, None, var),
+            Path::new("/tmp/test-home/.config/opencode/opencode.json")
+        );
+    }
+
+    /// 相对路径的值当没设，这是 XDG 规范的要求。
+    #[test]
+    fn a_relative_xdg_value_is_ignored() {
+        let h = Path::new("/home/u");
+        let var = |_: &str| Some("cfg".into());
+        assert_eq!(
+            OPENCODE_CONFIG.resolve_with(h, Some(h), var),
+            Path::new("/home/u/.config/opencode/opencode.json")
+        );
     }
 }

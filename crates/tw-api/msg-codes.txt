@@ -14,6 +14,7 @@ adopt.cost.opencode.restart
 adopt.cost.zed.key_store
 adopt.diag.adopt_again
 adopt.diag.delete_line
+adopt.diag.delete_line_gnu
 adopt.diag.endpoint_ok
 adopt.diag.endpoint_ok.detail
 adopt.diag.fields_gone
