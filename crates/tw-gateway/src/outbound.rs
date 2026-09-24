@@ -47,11 +47,7 @@ pub fn public_client() -> Result<reqwest::Client, GatewayError> {
             }
         }))
         .build()
-        .map_err(|e| {
-            GatewayError::config(msg!(
-                "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
-            ))
-        })
+        .map_err(|e| client_error(&e))
 }
 
 /// 给一个 provider 建 Client，带上它该走的代理。
@@ -109,11 +105,25 @@ pub fn client_for_provider(
             }
         }
     }
-    b.build().map_err(|e| {
-        GatewayError::config(msg!(
-            "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
-        ))
-    })
+    b.build().map_err(|e| client_error(&e))
+}
+
+/// 建不起 HTTP 客户端。
+///
+/// **原因要一层层展开。**reqwest 自己只说最外面一层（「builder error」），
+/// 真正的原因在 `source()` 里 —— 比如机器上一张系统根证书都没有（干净的
+/// Linux 容器、没装 `ca-certificates`），而那正是用户要知道的那一句。
+pub(crate) fn client_error(e: &reqwest::Error) -> GatewayError {
+    let mut detail = e.to_string();
+    let mut cur = std::error::Error::source(e);
+    while let Some(c) = cur {
+        detail.push_str(": ");
+        detail.push_str(&c.to_string());
+        cur = c.source();
+    }
+    GatewayError::config(msg!(
+        "gw.config.http_client", detail = detail => "The HTTP client could not be created: {detail}"
+    ))
 }
 
 /// 决定一个 Client 能不能复用的那几个字段。
