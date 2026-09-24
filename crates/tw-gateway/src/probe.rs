@@ -7,6 +7,7 @@
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tw_types::{Msg, msg};
 
 /// 探测超时。比数据面的建连超时短 —— 探测是交互式的，用户在等着看结果，
 /// 十秒的白屏比一条「连不上」难受得多。
@@ -57,17 +58,17 @@ pub struct ProbeResult {
     /// L2 的结果，**带上为什么**
     pub models: ModelList,
     /// 失败时说清楚下一步做什么
-    pub error: Option<String>,
+    pub error: Option<Msg>,
 }
 
 impl ProbeResult {
-    fn fail(latency_ms: u64, protocol: Option<String>, msg: impl Into<String>) -> Self {
+    fn fail(latency_ms: u64, protocol: Option<String>, why: Msg) -> Self {
         Self {
             ok: false,
             protocol,
             latency_ms,
             models: ModelList::Empty,
-            error: Some(msg.into()),
+            error: Some(why),
         }
     }
 }
@@ -101,17 +102,26 @@ pub async fn probe(
         Ok(r) => r,
         Err(e) => {
             let ms = started.elapsed().as_millis() as u64;
-            let msg = if e.is_timeout() {
-                format!(
-                    "no answer within {PROBE_TIMEOUT:?}. Check the endpoint address, or whether this upstream has to be reached through a proxy"
+            let why = if e.is_timeout() {
+                msg!(
+                    "gw.probe.timeout", secs = PROBE_TIMEOUT.as_secs() =>
+                    "No answer within {secs} seconds. Check the endpoint address, or whether this \
+                     upstream has to be reached through a proxy."
                 )
             } else if e.is_connect() {
-                "could not connect. Check the spelling of the endpoint address and the network; if this upstream has to be reached through a proxy, configure the proxy first"
-                    .to_string()
+                msg!(
+                    "gw.probe.connect" =>
+                    "Could not connect. Check the spelling of the endpoint address and the network; \
+                     if this upstream has to be reached through a proxy, configure the proxy first."
+                )
             } else {
-                format!("the request failed: {e}")
+                // reqwest 的原话：系统或 TLS 库给的，没有别的说法
+                msg!(
+                    "gw.probe.request_failed", detail = e =>
+                    "The request failed: {detail}"
+                )
             };
-            return ProbeResult::fail(ms, proto_name, msg);
+            return ProbeResult::fail(ms, proto_name, why);
         }
     };
 
@@ -124,9 +134,10 @@ pub async fn probe(
         return ProbeResult::fail(
             ms,
             proto_name,
-            format!(
-                "the upstream rejected this key (HTTP {}). Check the key for stray whitespace, and that it belongs to this upstream",
-                status.as_u16()
+            msg!(
+                "gw.probe.key_rejected", status = status.as_u16() =>
+                "The upstream rejected this key (HTTP {status}). Check the key for stray whitespace, \
+                 and that it belongs to this upstream."
             ),
         );
     }

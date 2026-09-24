@@ -26,7 +26,7 @@ use tw_yaml::Step;
 
 use crate::contract::RouterExt;
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
-use tw_api::ep;
+use tw_api::{RuleAction, ep};
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
@@ -42,28 +42,27 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::TestSecurity, test)
 }
 
-/// 哪一项防护。路径里写的就是配置里的那个键。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Guard {
-    Redact,
-    Tools,
-    Hidden,
-    Content,
-    Output,
+/// 哪一项防护：契约里的那个集合。路径里写的就是配置里的那个键。
+use tw_api::Guard;
+
+/// 这一边对每项防护要知道的事。
+trait GuardExt: Sized {
+    fn parse(s: &str) -> Result<Self, Fail>;
+    fn key(self) -> &'static str;
+    fn custom_section(self) -> Result<edit::Section, Fail>;
+    fn path(self, leaf: &str) -> Vec<Step>;
+    fn default_mode(self) -> SecurityMode;
+    fn lists(self, cfg: &tw_config::Config) -> (&[String], &[String]);
 }
 
-impl Guard {
+impl GuardExt for Guard {
     fn parse(s: &str) -> Result<Self, Fail> {
-        match s {
-            "redact" => Ok(Guard::Redact),
-            "inspect_tools" => Ok(Guard::Tools),
-            "hidden_text" => Ok(Guard::Hidden),
-            "content" => Ok(Guard::Content),
-            "output_limit" => Ok(Guard::Output),
-            other => Err(fail(
+        match Guard::from_slug(s) {
+            Some(g) => Ok(g),
+            None => Err(fail(
                 StatusCode::NOT_FOUND,
                 msg!(
-                    "security.guard_unknown", guard = other =>
+                    "security.guard_unknown", guard = s =>
                     "`{guard}` is not a line of defence; it is redact, inspect_tools, hidden_text, \
                      content or output_limit."
                 ),
@@ -71,13 +70,7 @@ impl Guard {
         }
     }
     fn key(self) -> &'static str {
-        match self {
-            Guard::Redact => "redact",
-            Guard::Tools => "inspect_tools",
-            Guard::Hidden => "hidden_text",
-            Guard::Content => "content",
-            Guard::Output => "output_limit",
-        }
+        self.slug()
     }
     /// 自定义规则那一节。**只有这三项有自定义规则**
     fn custom_section(self) -> Result<edit::Section, Fail> {
@@ -86,7 +79,7 @@ impl Guard {
                 path: &["security", "redact", "custom"],
                 what: "redaction rule",
             }),
-            Guard::Tools => Ok(edit::Section {
+            Guard::InspectTools => Ok(edit::Section {
                 path: &["security", "inspect_tools", "custom"],
                 what: "tool-call rule",
             }),
@@ -94,7 +87,7 @@ impl Guard {
                 path: &["security", "content", "custom"],
                 what: "content rule",
             }),
-            Guard::Hidden | Guard::Output => Err(fail(
+            Guard::HiddenText | Guard::OutputLimit => Err(fail(
                 StatusCode::BAD_REQUEST,
                 msg!(
                     "security.no_custom_rules", guard = self.key() =>
@@ -113,7 +106,7 @@ impl Guard {
     /// 出厂的档位：输出长度出厂是关的，其余是观察
     fn default_mode(self) -> SecurityMode {
         match self {
-            Guard::Output => SecurityMode::Off,
+            Guard::OutputLimit => SecurityMode::Off,
             _ => SecurityMode::default(),
         }
     }
@@ -122,11 +115,27 @@ impl Guard {
         let s = &cfg.security;
         match self {
             Guard::Redact => (&s.redact.enable, &s.redact.disable),
-            Guard::Tools => (&s.inspect_tools.enable, &s.inspect_tools.disable),
+            Guard::InspectTools => (&s.inspect_tools.enable, &s.inspect_tools.disable),
             Guard::Content => (&s.content.enable, &s.content.disable),
-            Guard::Hidden => (&[], &s.hidden_text.disable),
-            Guard::Output => (&[], &[]),
+            Guard::HiddenText => (&[], &s.hidden_text.disable),
+            Guard::OutputLimit => (&[], &[]),
         }
+    }
+}
+
+/// 工具调用审查的动作在契约里的样子。
+fn tool_action(a: ToolAction) -> RuleAction {
+    match a {
+        ToolAction::Cut => RuleAction::Cut,
+        ToolAction::Record => RuleAction::Record,
+    }
+}
+
+/// 内容过滤的动作在契约里的样子。
+fn content_action(a: ContentAction) -> RuleAction {
+    match a {
+        ContentAction::Block => RuleAction::Block,
+        ContentAction::Record => RuleAction::Record,
     }
 }
 
@@ -198,8 +207,8 @@ fn content_view(p: &tw_config::ContentPolicy) -> tw_api::GuardDetail {
             matcher: content_matcher(b.matching, &b.pattern),
             enabled: p.builtin_on(b),
             on_by_default: b.on_by_default,
-            action: Some(p.builtin_action(b).slug().into()),
-            default_action: Some(ContentAction::factory(b).slug().into()),
+            action: Some(content_action(p.builtin_action(b))),
+            default_action: Some(content_action(ContentAction::factory(b))),
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
@@ -211,7 +220,7 @@ fn content_view(p: &tw_config::ContentPolicy) -> tw_api::GuardDetail {
         matcher: content_matcher(c.matching.engine(), &c.pattern),
         enabled: !c.disabled,
         on_by_default: true,
-        action: Some(c.action.slug().into()),
+        action: Some(content_action(c.action)),
         default_action: None,
     }));
     tw_api::GuardDetail {
@@ -296,15 +305,13 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
             },
             enabled: !p.disable.contains(&r.id),
             on_by_default: true,
-            action: Some(
+            action: Some(tool_action(
                 p.actions
                     .get(&r.id)
                     .copied()
-                    .unwrap_or_else(|| tw_config::ToolAction::factory(r))
-                    .slug()
-                    .into(),
-            ),
-            default_action: Some(tw_config::ToolAction::factory(r).slug().into()),
+                    .unwrap_or_else(|| tw_config::ToolAction::factory(r)),
+            )),
+            default_action: Some(tool_action(tw_config::ToolAction::factory(r))),
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
@@ -318,7 +325,7 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
         },
         enabled: !c.disabled,
         on_by_default: true,
-        action: Some(c.action.slug().into()),
+        action: Some(tool_action(c.action)),
         default_action: None,
     }));
     tw_api::GuardDetail {
@@ -334,10 +341,7 @@ async fn events(
     State(s): State<ControlState>,
     Query(q): Query<tw_api::SecurityEventsQuery>,
 ) -> Result<Json<tw_api::SecurityEventsPage>, Fail> {
-    let guard = match q.guard.as_deref() {
-        None | Some("") => None,
-        Some(g) => Some(Guard::parse(g)?.key()),
-    };
+    let guard = q.guard.map(Guard::slug);
     let store = crate::need_store(&s)?;
     let g = store.lock().await;
     // **缺省是「全部」，不是「今天」。**这是一张列表，「最近 N 条」本身就是
@@ -399,17 +403,17 @@ async fn toggle_builtin(
     let guard = Guard::parse(&guard)?;
     let on_by_default = match guard {
         Guard::Redact => tw_guard::redact::rules::builtin(&id).map(|b| b.on_by_default),
-        Guard::Tools => tw_guard::tools::rules::builtin()
+        Guard::InspectTools => tw_guard::tools::rules::builtin()
             .dangerous
             .iter()
             .any(|r| r.id == id)
             .then_some(true),
         Guard::Content => tw_guard::content::builtin(&id).map(|b| b.on_by_default),
-        Guard::Hidden => tw_guard::hidden::SMUGGLING
+        Guard::HiddenText => tw_guard::hidden::SMUGGLING
             .iter()
             .any(|k| k.slug() == id)
             .then_some(true),
-        Guard::Output => None,
+        Guard::OutputLimit => None,
     }
     .ok_or_else(|| unknown_rule(&id))?;
     let version = s
@@ -435,12 +439,13 @@ async fn toggle_builtin(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-fn action_of(slug: &str) -> Result<ToolAction, Fail> {
-    ToolAction::from_slug(slug).ok_or_else(|| {
+/// 契约里的规则动作，工具调用审查认的那两个。
+fn action_of(a: RuleAction) -> Result<ToolAction, Fail> {
+    ToolAction::from_slug(a.slug()).ok_or_else(|| {
         fail(
             StatusCode::BAD_REQUEST,
             msg!(
-                "security.unknown_action", action = slug.to_string() =>
+                "security.unknown_action", action = a.slug() =>
                 "`{action}` is not an action; it is cut or record."
             ),
         )
@@ -459,25 +464,25 @@ async fn set_builtin_action(
     let guard = Guard::parse(&guard)?;
     // 这条改成什么、出厂是什么，都写成 slug：两项各有各的词
     let (action, factory) = match guard {
-        Guard::Tools => {
+        Guard::InspectTools => {
             let spec = tw_guard::tools::rules::builtin()
                 .dangerous
                 .iter()
                 .find(|r| r.id == id)
                 .ok_or_else(|| unknown_rule(&id))?;
             (
-                action_of(&req.action)?.slug(),
+                action_of(req.action)?.slug(),
                 tw_config::ToolAction::factory(spec).slug(),
             )
         }
         Guard::Content => {
             let b = tw_guard::content::builtin(&id).ok_or_else(|| unknown_rule(&id))?;
             (
-                content_action_of(&req.action)?.slug(),
+                content_action_of(req.action)?.slug(),
                 ContentAction::factory(b).slug(),
             )
         }
-        Guard::Redact | Guard::Hidden | Guard::Output => {
+        Guard::Redact | Guard::HiddenText | Guard::OutputLimit => {
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 msg!(
@@ -505,12 +510,13 @@ async fn set_builtin_action(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-fn content_action_of(slug: &str) -> Result<ContentAction, Fail> {
-    ContentAction::from_slug(slug).ok_or_else(|| {
+/// 契约里的规则动作，内容过滤认的那两个。
+fn content_action_of(a: RuleAction) -> Result<ContentAction, Fail> {
+    ContentAction::from_slug(a.slug()).ok_or_else(|| {
         fail(
             StatusCode::BAD_REQUEST,
             msg!(
-                "security.unknown_content_action", action = slug.to_string() =>
+                "security.unknown_content_action", action = a.slug() =>
                 "`{action}` is not an action; it is block or record."
             ),
         )
@@ -524,7 +530,7 @@ async fn set_limit(
     Json(req): Json<tw_api::LimitSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
-    if guard != Guard::Output {
+    if guard != Guard::OutputLimit {
         return Err(fail(
             StatusCode::BAD_REQUEST,
             msg!(
@@ -579,7 +585,7 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
                 )
             })?,
         };
-        let action = match req.action.as_deref() {
+        let action = match req.action {
             None => ContentAction::default(),
             Some(a) => content_action_of(a)?,
         };
@@ -614,8 +620,8 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
     }
     // **正则在保存时编译**，写错当场说清楚，不等加载时再跳过
     tw_guard::redact::rules::compile(name, &req.pattern).map_err(bad_pattern)?;
-    if guard == Guard::Tools {
-        let action = match req.action.as_deref() {
+    if guard == Guard::InspectTools {
+        let action = match req.action {
             None => ToolAction::default(),
             Some(a) => action_of(a)?,
         };
@@ -753,7 +759,7 @@ async fn test(
                 })
                 .collect()
         }
-        Guard::Tools => {
+        Guard::InspectTools => {
             let trial;
             let rules = match (&req.pattern, &req.rule) {
                 (Some(p), _) => {
@@ -794,7 +800,11 @@ async fn test(
                         start: utf16_at(&req.sample, m.start()),
                         end: utf16_at(&req.sample, m.end()),
                         excerpt: m.as_str().chars().take(120).collect(),
-                        action: Some(if r.high { "cut" } else { "record" }.into()),
+                        action: Some(if r.high {
+                            RuleAction::Cut
+                        } else {
+                            RuleAction::Record
+                        }),
                     })
                 })
                 .collect();
@@ -846,20 +856,17 @@ async fn test(
                     start: utf16_at(&req.sample, h.bytes.start),
                     end: utf16_at(&req.sample, h.bytes.end),
                     excerpt: req.sample[h.bytes.clone()].chars().take(120).collect(),
-                    action: Some(
-                        if h.action == tw_guard::content::Action::Block {
-                            "block"
-                        } else {
-                            "record"
-                        }
-                        .into(),
-                    ),
+                    action: Some(if h.action == tw_guard::content::Action::Block {
+                        RuleAction::Block
+                    } else {
+                        RuleAction::Record
+                    }),
                     rule: h.rule,
                     custom: h.custom,
                 })
                 .collect()
         }
-        Guard::Hidden => {
+        Guard::HiddenText => {
             // 给了 `rule` 就只试那一种（关着的也能试），不给按现在开着的
             let kinds = match &req.rule {
                 Some(id) => vec![
@@ -892,7 +899,7 @@ async fn test(
                 })
                 .collect()
         }
-        Guard::Output => {
+        Guard::OutputLimit => {
             return Err(fail(
                 StatusCode::BAD_REQUEST,
                 msg!(
@@ -966,12 +973,12 @@ mod tests {
             ..Default::default()
         });
         let curl = v.rules.iter().find(|r| r.id == "curl-pipe-sh").unwrap();
-        assert_eq!(curl.action.as_deref(), Some("cut"));
+        assert_eq!(curl.action, Some(RuleAction::Cut));
         assert!(!curl.why.is_empty());
         let rm = v.rules.iter().find(|r| r.id == "rm-rf-root").unwrap();
-        assert_eq!(rm.action.as_deref(), Some("record"));
+        assert_eq!(rm.action, Some(RuleAction::Record));
         let mine = v.rules.last().unwrap();
         assert!(mine.custom && !mine.enabled);
-        assert_eq!(mine.action.as_deref(), Some("cut"));
+        assert_eq!(mine.action, Some(RuleAction::Cut));
     }
 }

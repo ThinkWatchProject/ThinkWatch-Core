@@ -569,8 +569,8 @@ async fn an_unsaved_oauth_credential_is_not_refreshed_just_to_test_it() {
     .await;
     let v = json(&body);
     assert_eq!(v["ok"], false);
-    assert!(
-        v["error"].as_str().unwrap().contains("has to be saved"),
+    assert_eq!(
+        v["error"]["code"], "control.provider_test.oauth_unsaved",
         "{body}"
     );
 }

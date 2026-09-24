@@ -223,7 +223,9 @@ async fn an_upstream_that_refuses_the_key_is_failed_with_the_reason_not_merely_u
         (p["model_status"].as_str(), p["model_source"].as_str()),
         (Some("failed"), Some("none"))
     );
-    assert!(p["model_error"].as_str().unwrap().contains("401"), "{p}");
+    // 一句带码的话，界面按码翻；状态码是参数
+    assert_eq!(p["model_error"]["code"], "gw.probe.key_rejected", "{p}");
+    assert_eq!(p["model_error"]["args"]["status"], "401", "{p}");
 }
 
 #[tokio::test]
@@ -239,7 +241,8 @@ async fn a_refresh_the_upstream_refuses_says_why_and_the_manual_list_stands_in()
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["source"], "manual");
-    assert!(v["error"].as_str().unwrap().contains("401"), "{v}");
+    assert_eq!(v["error"]["code"], "gw.probe.key_rejected", "{v}");
+    assert!(v["error"]["text"].as_str().unwrap().contains("401"), "{v}");
     assert_eq!(v["models"][0]["id"], "手写的模型");
 
     let (st, _) = call(

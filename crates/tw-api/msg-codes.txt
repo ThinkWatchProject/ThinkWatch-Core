@@ -174,7 +174,6 @@ control.group.empty
 control.group.name_is_upstream
 control.group.no_such_upstream
 control.group.preferred_not_member
-control.group.unknown_strategy
 control.group.upstream_twice
 control.group_in_use
 control.header_no_value
@@ -206,6 +205,8 @@ control.pricing.save_failed
 control.pricing.status
 control.pricing.too_large
 control.pricing.unreachable
+control.provider_test.credentials
+control.provider_test.oauth_unsaved
 control.proxy_addr_form
 control.proxy_in_use
 control.proxy_not_found
@@ -290,8 +291,17 @@ gw.model.no_upstream
 gw.model.no_upstream_available
 gw.model.not_allowed
 gw.model.unknown
+gw.models.check_failed
+gw.models.credentials
+gw.models.empty
+gw.models.no_endpoint
+gw.models.unrecognized
 gw.output_limit.cut
 gw.output_limit.withheld
+gw.probe.connect
+gw.probe.key_rejected
+gw.probe.request_failed
+gw.probe.timeout
 gw.request.body_too_large
 gw.route.all_selected_disabled
 gw.route.denied

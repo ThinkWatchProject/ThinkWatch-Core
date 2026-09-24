@@ -163,8 +163,8 @@ impl AppState {
                 };
             let fault = result.as_ref().map(|(stage, why)| tw_api::ProxyFault {
                 failed: stage.as_ref().map(|s| tw_api::L1Stage {
-                    step: s.step.slug().into(),
-                    peer: s.peer.slug().into(),
+                    step: s.step,
+                    peer: s.peer,
                 }),
                 detail: why.clone(),
                 at_ms: now_ms(),

@@ -23,7 +23,11 @@ fn now_ms() -> u64 {
 /// 把一条发现变成给界面看的样子。
 pub fn finding_view(f: &tw_scan::report::Finding) -> tw_api::ScanFinding {
     tw_api::ScanFinding {
-        level: f.level.slug().to_string(),
+        level: match f.level {
+            tw_scan::report::Level::High => tw_api::ScanLevel::High,
+            tw_scan::report::Level::Medium => tw_api::ScanLevel::Medium,
+            tw_scan::report::Level::Low => tw_api::ScanLevel::Low,
+        },
         rule: f.rule.clone(),
         kind: f.kind.slug().to_string(),
         client: f.client.clone(),
