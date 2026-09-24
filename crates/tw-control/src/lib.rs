@@ -223,6 +223,7 @@ async fn status(State(s): State<ControlState>) -> Json<tw_api::Status> {
         // 这里自然是 None
         gateway_addr: listening.primary().map(|a| a.to_string()),
         listen_error: listening.error,
+        config_rejected: s.cfg.rejected(),
         config_path: s.config_path().display().to_string(),
         clients: cfg.clients.len(),
         providers: cfg.providers.len(),
@@ -484,6 +485,7 @@ fn provider_view(
             tw_gateway::health::State::Open => tw_api::Health::Open,
         },
         auth_rejected: s.gateway.auth_rejected(&p.name),
+        writeback_failed: s.gateway.writeback_failed(&p.name),
         billing: p.billing.into(),
         references: tw_config::refs::provider_refs(cfg, &p.name)
             .iter()

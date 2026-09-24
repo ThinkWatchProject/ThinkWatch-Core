@@ -482,7 +482,11 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 ///
 /// **16 把最后几处原因也换成了 [`Msg`]**：`KeySyncFailed.error`、`PricingStatus.error`、
 /// `TurnView.error`。照 15 写的界面会把它们画成一个对象。
-pub const CONTROL_API_VERSION: u32 = 16;
+///
+/// **17 起「此刻有什么不对」都能问到**，不必从事件流开头听起：`Status.config_rejected`
+/// （磁盘上那份配置没通过校验、旧的还在服务）和 `ProviderView.writeback_failed`
+/// （换发的凭据没能写回配置）。半路才连上的一方（桌面端的提醒）按它们对账。
+pub const CONTROL_API_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -501,6 +505,11 @@ pub struct Status {
     /// 旧的地址还在服务**，也就是 `gateway_addr` 说的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_error: Option<Msg>,
+    /// 磁盘上的配置文件最近一次改动没通过校验：**旧的那一版还在服务**。
+    /// 下一次换入成功（改好了、或者界面写了一版）就没有了。和 `ConfigRejected`
+    /// 事件说的是同一件事 —— 事件是那一刻，这里是现在
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_rejected: Option<ConfigRejection>,
     pub config_path: String,
     pub clients: usize,
     pub providers: usize,
@@ -1160,6 +1169,22 @@ pub struct RunningView {
     pub at_ms: u64,
 }
 
+/// 配置文件没通过校验的那一次。字段和 [`Event::ConfigRejected`] 一样。
+///
+/// **只记外部改动**（在编辑器里改的、命令行写的）：界面自己写坏的根本没落盘，
+/// 那是一次保存失败，保存那条路当场就说了。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ConfigRejection {
+    pub stage: ConfigStage,
+    pub message: Msg,
+    /// 1 起。语义错误没有
+    pub line: Option<usize>,
+    /// 出错那一行的原文，**已脱敏**
+    pub excerpt: Option<String>,
+    pub at_ms: u64,
+}
+
 /// 界面要显示的配置概览。
 ///
 /// **不是配置文件本身**：密钥一律只给来源描述，不给值（统一脱敏）。
@@ -1353,6 +1378,10 @@ pub struct ProviderView {
     /// 上游永远不会熔断。和 `AuthChanged` 说的是同一件事：一个是现状，一个是变化
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_rejected: Option<u16>,
+    /// token 端点换发的新凭据**没能写回配置**的原因。这时新凭据只在内存里，旧的
+    /// 已经作废：网关一重启，这家上游就要重新登录。写回成功就没有了
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_failed: Option<Msg>,
     /// 计费方式：`per-token`（按价目表算，订阅账号也是）/ `free`（记 $0）
     pub billing: Billing,
     /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
@@ -4355,6 +4384,7 @@ mod tests {
             pid: 1,
             gateway_addr: Some("127.0.0.1:8788".into()),
             listen_error: None,
+            config_rejected: None,
             config_path: "/x/config.yaml".into(),
             clients: 1,
             providers: 1,
