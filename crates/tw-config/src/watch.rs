@@ -54,6 +54,20 @@ mod tests {
         Closed,
     }
 
+    /// 测试用的目录，Linux 上在内存盘上。
+    ///
+    /// 这里好几条断言是「只报一次」，而它的前提是写入之间的间隔不超过去抖窗口。
+    /// 在 CI 的磁盘上，一次 `fs::write` 卡两三百毫秒是常事（别的测试在同时写盘），
+    /// 那时报两次是监听对、测试错 —— 理由和复现办法见 `tw_watch` 的同名函数。
+    fn scratch() -> tempfile::TempDir {
+        let shm = Path::new("/dev/shm");
+        if cfg!(target_os = "linux") && shm.is_dir() {
+            tempfile::tempdir_in(shm).unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
     async fn recv(rx: &mut tokio::sync::mpsc::Receiver<()>, within: Duration) -> Signal {
         match tokio::time::timeout(within, rx.recv()).await {
             Ok(Some(())) => Signal::Got,
@@ -64,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_edit_produces_exactly_one_signal() {
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let p = d.path().join("config.yaml");
         std::fs::write(&p, "a: 1\n").unwrap();
         let (_w, mut rx) = watch(&p).unwrap();
@@ -87,7 +101,7 @@ mod tests {
     async fn a_save_that_writes_a_temp_file_and_renames_still_works() {
         // **编辑器就是这么保存的。**盯着文件而不是目录的话，这里之后
         // 监听会永久失效，而且不报任何错。
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let p = d.path().join("config.yaml");
         std::fs::write(&p, "a: 1\n").unwrap();
         let (_w, mut rx) = watch(&p).unwrap();
@@ -106,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_burst_of_writes_collapses_into_one_signal() {
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let p = d.path().join("config.yaml");
         std::fs::write(&p, "a: 0\n").unwrap();
         let (_w, mut rx) = watch(&p).unwrap();
@@ -126,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn a_sibling_file_does_not_wake_us_up() {
         // 历史目录就在配置旁边，每存一版都会动那个目录。
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let p = d.path().join("config.yaml");
         // **故意不建 config.yaml。**过滤器是按文件名判的，所以这个测试
         // 里唯一可能穿过它的事件就是 config.yaml 自己的 —— 而它不存在，
@@ -154,7 +168,7 @@ mod tests {
     async fn deleting_the_file_is_reported_too() {
         // 删掉配置文件是一件必须知道的事 —— 不然网关会拿着一份内存里的
         // 幽灵配置继续跑，而用户以为自己已经清空了它。
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let p = d.path().join("config.yaml");
         std::fs::write(&p, "a: 1\n").unwrap();
         let (_w, mut rx) = watch(&p).unwrap();
@@ -169,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn watching_a_file_that_does_not_exist_yet_still_works() {
         // 首次运行时配置还没生成，而监听可能先起来。
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let p = d.path().join("config.yaml");
         let (_w, mut rx) = watch(&p).unwrap();
         std::fs::write(&p, "a: 1\n").unwrap();
