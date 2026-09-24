@@ -26,11 +26,13 @@ pub mod listen;
 pub mod live;
 pub mod models;
 pub mod oauth;
+pub mod outbound;
 pub mod probe;
 pub mod quota;
 pub mod quote;
 pub mod server;
 pub mod session;
+pub mod state;
 pub mod translate;
 pub mod ws;
 
@@ -45,9 +47,11 @@ pub use l1::{
 pub use l3::{Estimate, L3Result};
 pub use limits::Gate;
 pub use listen::{Listening, bind_failure, serve_at};
+pub use outbound::{client_for_provider, public_client};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quote::Quote;
-pub use server::{AppState, Runtime, client_for_provider, public_client, router, serve};
+pub use server::{router, serve};
+pub use state::{AppState, Runtime};
 
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";
