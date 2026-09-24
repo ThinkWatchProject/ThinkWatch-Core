@@ -205,11 +205,10 @@ impl AppState {
     pub fn new(config: tw_config::Config) -> Result<Self, GatewayError> {
         // **不走任何代理，连系统代理也不读** —— 和上游默认的 `direct` 一样。
         // 它只在一家上游不在当前运行时里时顶上，那时没有别的出站设置可依
-        let http = base_client_builder().no_proxy().build().map_err(|e| {
-            GatewayError::config(msg!(
-                "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
-            ))
-        })?;
+        let http = base_client_builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| crate::outbound::client_error(&e))?;
         let pricing_config = config.pricing.clone();
         let price_assign = config.price_assign();
         let models = Arc::new(crate::models::Directory::default());
