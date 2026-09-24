@@ -103,11 +103,6 @@ impl ControlState {
     pub fn bus(&self) -> &EventBus {
         &self.gateway.bus
     }
-    /// 探测复用数据面的 HTTP 客户端 —— 同一套超时、同一套代理设置。
-    /// 另起一个会让「探测通了但实际请求不通」变成可能。
-    pub fn http(&self) -> &reqwest::Client {
-        &self.gateway.http
-    }
     pub fn health(&self) -> &Arc<tw_gateway::Health> {
         &self.gateway.health
     }

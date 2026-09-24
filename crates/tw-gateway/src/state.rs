@@ -123,7 +123,7 @@ pub struct AppState {
     /// 换的话，每改一次配置，排着的请求就会失去位置，而已经在跑的那些的
     /// 通行证会变成孤儿。上限改了由它自己在原地加减（见 `limits`）。
     pub(crate) gate: Arc<crate::limits::Gate>,
-    /// 探测和别的杂事用的默认 Client（不走代理）
+    /// 一家上游不在当前运行时里时顶上的 Client（直连，不读系统代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
     /// 没有人在看。**跨重载存活**：界面上的实时列表不该因为改了配置断一次。
@@ -202,7 +202,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: tw_config::Config) -> Result<Self, GatewayError> {
-        let http = base_client_builder().build().map_err(|e| {
+        // **不走任何代理，连系统代理也不读** —— 和上游默认的 `direct` 一样。
+        // 它只在一家上游不在当前运行时里时顶上，那时没有别的出站设置可依
+        let http = base_client_builder().no_proxy().build().map_err(|e| {
             GatewayError::config(msg!(
                 "gw.config.http_client", detail = e => "The HTTP client could not be created: {detail}"
             ))
