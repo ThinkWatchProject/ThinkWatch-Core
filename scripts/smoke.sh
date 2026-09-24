@@ -37,6 +37,10 @@ bad()  { FAIL=$((FAIL+1)); printf '  ✗ %s\n' "$1"; [ $# -gt 1 ] && printf '   
 # 两个都会让人停止看这一行。
 warn() { WARN=$((WARN+1)); printf '  ⚠ %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; }
 step() { printf '\n== %s\n' "$1"; }
+# 权限位、修改时间 + 大小。**GNU 先问**：BSD 的 `stat -f` 在 GNU 上是「查文件
+# 系统」，同一串参数照样返回 0、吐出一行不相干的东西，而不是失败退到下一种。
+mode_of()  { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+mtime_size() { stat -c '%Y %s' "$1" 2>/dev/null || stat -f '%m %z' "$1" 2>/dev/null; }
 
 cleanup() {
   [ -n "${CORE_PID:-}" ] && kill "$CORE_PID" 2>/dev/null
@@ -50,6 +54,12 @@ trap cleanup EXIT
 cat > "$TMP/upstream.py" <<'PY'
 import http.server, json, sys, time
 class H(http.server.BaseHTTPRequestHandler):
+    # **关掉 Nagle。**这个处理器先写响应头、再单独写正文，两次小写。开着
+    # Nagle 的话，正文要等对端确认了响应头才发；而 core 用的是池里的旧
+    # 连接，Linux 在旧连接上会把确认攒 40ms 再发 —— 于是每条请求平白多出
+    # 40ms，下面那条「转发的额外延迟」在 Linux 上就这么红过。真正的上游
+    # 不会这样一次响应拆成两段小写，这是假上游自己的毛病。
+    disable_nagle_algorithm = True
     # **默认是 HTTP/1.0，每条响应之后关连接。**core 那边是带连接池的
     # 客户端，会拿一条它以为还活着的连接去发下一个请求。配上 1.1 才是
     # 这个假上游该模拟的形状。
@@ -114,7 +124,7 @@ step "构建"
 if cargo build --release -p twcore --manifest-path "$ROOT/Cargo.toml" 2>&1 | grep -q '^error'; then
   bad "构建失败"; exit 1
 fi
-BIN="$ROOT/target/release/twcore"
+BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/twcore"
 ok "twcore 构建好了"
 
 # ---------------------------------------------------------------- init
@@ -123,7 +133,7 @@ CFG="$THINKWATCH_HOME/config.yaml"
 "$BIN" --config "$CFG" init >/dev/null 2>&1
 [ -f "$CFG" ] && ok "init 生成了配置" || bad "init 没生成配置"
 # **明文密钥的文件必须是 0600**
-MODE=$(stat -f '%Lp' "$CFG" 2>/dev/null || stat -c '%a' "$CFG")
+MODE=$(mode_of "$CFG")
 [ "$MODE" = "600" ] && ok "config.yaml 是 0600" || bad "config.yaml 权限是 $MODE，该是 600"
 
 python3 - "$CFG" "$UPPORT" "$PORT" <<'PY'
@@ -189,7 +199,7 @@ CORE_PID=$!
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
 [ -S "$SOCK" ] && ok "控制面 socket 起来了" || { bad "socket 没出现" "$(tail -3 "$TMP/core.log")"; exit 1; }
 
-MODE=$(stat -f '%Lp' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo -)
+MODE=$(mode_of "$THINKWATCH_HOME/data.db" || echo -)
 [ "$MODE" = "600" ] && ok "data.db 是 0600" || bad "data.db 权限是 $MODE"
 
 # ---------------------------------------------------------------- 数据面
@@ -396,9 +406,9 @@ fi
 
 # 空闲时不写盘（最后一条）。**没有请求就不该有任何写入** ——
 # 一个常驻进程每秒摸一次磁盘，在笔记本上就是电量
-DB_BEFORE=$(stat -f '%m %z' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo "0 0")
+DB_BEFORE=$(mtime_size "$THINKWATCH_HOME/data.db" || echo "0 0")
 sleep 3
-DB_AFTER=$(stat -f '%m %z' "$THINKWATCH_HOME/data.db" 2>/dev/null || echo "1 1")
+DB_AFTER=$(mtime_size "$THINKWATCH_HOME/data.db" || echo "1 1")
 [ "$DB_BEFORE" = "$DB_AFTER" ] && ok "空闲 3 秒没有写盘" \
   || bad "空闲时还在写盘" "before=$DB_BEFORE after=$DB_AFTER"
 

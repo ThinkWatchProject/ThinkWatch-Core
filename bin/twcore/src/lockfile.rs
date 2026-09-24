@@ -66,9 +66,19 @@ mod tests {
     fn a_stale_lock_from_a_dead_process_is_taken_over() {
         // 「上次没退干净」是最常见的情况，不该需要用户手动删文件。
         let d = tempfile::tempdir().unwrap();
-        // 挑一个几乎肯定不存在的。Windows 的 pid 都是 4 的倍数，所以
-        // 999999 在那里根本不可能是一个 pid；macOS 的 pid_max 是 99998。
-        std::fs::write(d.path().join("twcore.lock"), "999999").unwrap();
+        // **不编一个 pid。**以前这里写死 999999，理由是 macOS 的 pid_max
+        // 是 99998、Windows 的 pid 都是 4 的倍数 —— 而 Linux 上 systemd 把
+        // pid_max 设成 4194304，999999 完全可能是一个活着的进程。起一个、
+        // 等它退干净，拿它的号：这个号此刻一定没人用（除非刚好被回收，
+        // 那个窗口比编一个号小得多）。
+        let pid = {
+            let mut c = sleeping_child();
+            let pid = c.id();
+            c.kill().unwrap();
+            c.wait().unwrap();
+            pid
+        };
+        std::fs::write(d.path().join("twcore.lock"), pid.to_string()).unwrap();
         assert!(matches!(
             LockFile::acquire(d.path()).unwrap(),
             LockOutcome::Acquired(_)
