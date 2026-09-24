@@ -584,6 +584,29 @@ fn shell_exports(home: &Path, names: &[&str]) -> Vec<(PathBuf, usize, String)> {
     out
 }
 
+/// 一份优先级更高的文件里，会盖住我们写的那些字段。
+///
+/// 多数客户端认的是环境变量那一块（Claude Code 的 `env` 块），出现变量名就
+/// 算。opencode 逐层**深合并**：更高的那份文件只有写了 `provider.thinkwatch`
+/// 才会盖住我们写的东西，别的键（`$schema`、别的 provider）和我们并存。
+fn overriding_fields(c: &Client, text: &str) -> Vec<String> {
+    match c.id {
+        "opencode" => {
+            let path = ["provider", crate::clients::PROVIDER_ID];
+            match crate::json::get(text, &path) {
+                Ok(Some(_)) => vec![path.join(".")],
+                _ => Vec::new(),
+            }
+        }
+        _ => c
+            .env_vars
+            .iter()
+            .filter(|v| text.contains(**v))
+            .map(|v| v.to_string())
+            .collect(),
+    }
+}
+
 /// 走一遍优先级链。`project` 是当前项目目录（有的话）。
 pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding> {
     let d = detect_one(c, home);
@@ -648,7 +671,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     } else {
         for s in &d.shadows {
             let text = std::fs::read_to_string(s).unwrap_or_default();
-            let hits: Vec<_> = c.env_vars.iter().filter(|v| text.contains(**v)).collect();
+            let hits = overriding_fields(c, &text);
             out.push(Finding {
                 level: if hits.is_empty() {
                     Level::Suspect
@@ -665,11 +688,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
                 } else {
                     msg!(
                         "adopt.diag.shadowed.fields",
-                        fields = hits
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        fields = hits.join(", ")
                         => "The file carries {fields}, which overrides what was written here."
                     )
                 },
@@ -682,7 +701,7 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     if let Some(proj) = project {
         // 只有跟着 home 走的那几种说得上「项目里有一份同名的」；XDG 目录下的
         // 全局配置在项目里没有对应的位置
-        let local = c.config.home_rel().map(|r| crate::paths::under(proj, r));
+        let local = c.config[0].home_rel().map(|r| crate::paths::under(proj, r));
         if let Some(local) = local.filter(|p| p.exists()) {
             out.push(Finding {
                 level: Level::Suspect,
@@ -698,22 +717,41 @@ pub fn diagnose(c: &Client, home: &Path, project: Option<&Path>) -> Vec<Finding>
     }
 
     // 四、管理策略文件。**最高优先级，压过一切**
+    //
+    // `managed-settings.json` 和 `managed-settings.d/` 里的分片合起来是同一个
+    // 来源：先读前者，再按字母序合并分片，同一个键后读的赢。每个文件各报
+    // 一条 —— 用户要去改的是具体哪一个文件。
     if c.id == "claude-code" {
         let managed = crate::paths::managed_settings();
+        let dropins = crate::paths::managed_settings_dropins();
+        let level = |p: &Path| {
+            let text = std::fs::read_to_string(p).unwrap_or_default();
+            if overriding_fields(c, &text).is_empty() {
+                Level::Suspect
+            } else {
+                Level::Blocking
+            }
+        };
         if managed.exists() {
-            let text = std::fs::read_to_string(&managed).unwrap_or_default();
-            let hits: Vec<_> = c.env_vars.iter().filter(|v| text.contains(**v)).collect();
             out.push(Finding {
-                level: if hits.is_empty() {
-                    Level::Suspect
-                } else {
-                    Level::Blocking
-                },
+                level: level(&managed),
                 title: msg!("adopt.diag.managed" => "This machine has a managed-policy file"),
                 detail: msg!("adopt.diag.managed.detail", path = managed.display() => "{path} takes precedence over everything else, including the user's own configuration."),
                 fix: None,
             });
-        } else {
+        }
+        for p in &dropins {
+            out.push(Finding {
+                level: level(p),
+                title: msg!("adopt.diag.managed_dropin" => "This machine has a managed-policy drop-in file"),
+                detail: msg!(
+                    "adopt.diag.managed_dropin.detail", path = p.display()
+                    => "{path} is merged after managed-settings.json; like it, it takes precedence over everything else, including the user's own configuration."
+                ),
+                fix: None,
+            });
+        }
+        if !managed.exists() && dropins.is_empty() {
             out.push(Finding {
                 level: Level::Clear,
                 title: msg!("adopt.diag.no_managed" => "This machine has no managed-policy file"),
@@ -1070,6 +1108,69 @@ mod tests {
         };
         assert!(has("codex"));
         assert!(!has("opencode"));
+    }
+
+    fn adopt(id: &str, home: &Path, backups: &Path) {
+        let gw = crate::clients::Gateway {
+            base: "http://127.0.0.1:8080".into(),
+            key: None,
+        };
+        let p = crate::plan::plan_adopt(&c(id), home, &gw).unwrap();
+        crate::plan::apply(&c(id), &p, backups).unwrap();
+    }
+
+    /// 刚装好的 opencode 自己建的是 `opencode.jsonc`：写进它，而不是另起一份
+    /// 会被它盖住的 `opencode.json`，也不为那一行 `$schema` 报「被盖住」。
+    #[test]
+    fn opencode_is_written_where_opencode_itself_writes() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        let jsonc = crate::paths::OPENCODE_CONFIGS[0].resolve(&home);
+        std::fs::create_dir_all(jsonc.parent().unwrap()).unwrap();
+        std::fs::write(
+            &jsonc,
+            "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}",
+        )
+        .unwrap();
+        adopt("opencode", &home, &d.path().join("b"));
+
+        assert_eq!(c("opencode").config_path(&home), jsonc);
+        assert!(std::fs::read_to_string(&jsonc).unwrap().contains("baseURL"));
+        assert!(!crate::paths::OPENCODE_CONFIGS[1].resolve(&home).exists());
+        let got = detect_one(&c("opencode"), &home);
+        assert!(got.shadows.is_empty(), "{:?}", got.shadows);
+        assert!(got.adopted_at_ms.is_some());
+    }
+
+    /// 接管之后用户才建了 `opencode.jsonc`：仍然认原来那一份（记录和原文在
+    /// 它旁边），并且说出更高的那份盖住了什么。
+    #[test]
+    fn a_later_opencode_jsonc_is_reported_as_taking_precedence() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        let json = crate::paths::OPENCODE_CONFIGS[1].resolve(&home);
+        let jsonc = crate::paths::OPENCODE_CONFIGS[0].resolve(&home);
+        std::fs::create_dir_all(json.parent().unwrap()).unwrap();
+        std::fs::write(&json, "{}\n").unwrap();
+        adopt("opencode", &home, &d.path().join("b"));
+        assert_eq!(c("opencode").config_path(&home), json);
+
+        let shadow = |jsonc_text: &str| {
+            std::fs::write(&jsonc, jsonc_text).unwrap();
+            assert_eq!(c("opencode").config_path(&home), json, "换了文件就还原不了");
+            diagnose(&c("opencode"), &home, None)
+                .into_iter()
+                .find(|f| f.title.code == "adopt.diag.shadowed")
+                .expect("没报被盖住")
+        };
+        // 别的键和我们并存，只是提一句
+        let f = shadow("{ // 我的\n  \"theme\": \"x\" }");
+        assert_eq!(f.level, Level::Suspect);
+        assert_eq!(f.detail.code, "adopt.diag.shadowed.no_fields");
+        // 写了同名 provider 的，才真的盖住
+        let f = shadow("{ \"provider\": { \"thinkwatch\": { \"options\": {} } } }");
+        assert_eq!(f.level, Level::Blocking);
+        assert_eq!(f.detail.arg("fields"), "provider.thinkwatch");
     }
 
     #[test]

@@ -23,6 +23,8 @@ adopt.diag.look_at
 adopt.diag.look_at_fields
 adopt.diag.managed
 adopt.diag.managed.detail
+adopt.diag.managed_dropin
+adopt.diag.managed_dropin.detail
 adopt.diag.no_exports
 adopt.diag.no_exports.detail
 adopt.diag.no_managed

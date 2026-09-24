@@ -124,7 +124,7 @@ impl Loc {
 }
 
 /// 这个进程自己的 home。和 tw-control 的 `home_dir` 读的是同一个变量。
-fn env_home() -> Option<PathBuf> {
+pub fn env_home() -> Option<PathBuf> {
     #[cfg(windows)]
     const VAR: &str = "USERPROFILE";
     #[cfg(not(windows))]
@@ -156,9 +156,30 @@ pub const ZED_DIR: Loc = if cfg!(windows) {
     Loc::XdgConfig("zed")
 };
 
-/// opencode 的全局配置。它用 `xdg-basedir`，**每个平台都**认
-/// `$XDG_CONFIG_HOME`，没设才是 `~/.config/opencode`。
-pub const OPENCODE_CONFIG: Loc = Loc::XdgConfig("opencode/opencode.json");
+/// opencode 的全局配置。**三个文件、按优先级从高到低。**
+///
+/// 目录用 `xdg-basedir`，**每个平台都**认 `$XDG_CONFIG_HOME`，没设才是
+/// `~/.config/opencode`。目录里它依次读 `config.json`、`opencode.json`、
+/// `opencode.jsonc` 再逐层深合并，后读的赢；它自己要写全局配置时，写的是
+/// 这三个里按 jsonc → json → config.json 找到的第一个，一个都没有就新建
+/// `opencode.jsonc` —— 所以刚装好的 opencode 手里就是一份 `opencode.jsonc`。
+///
+/// 我们照它自己的挑法挑：写进它认作「那份全局配置」的文件，也就是在的几个
+/// 里优先级最高的那一个。只认 `opencode.json` 的话，刚装好的用户每个人都会
+/// 看到一条「有文件盖住了它」的提示，而那份 jsonc 里其实只有一行 `$schema`。
+pub const OPENCODE_CONFIGS: &[Loc] = &[
+    Loc::XdgConfig("opencode/opencode.jsonc"),
+    Loc::XdgConfig("opencode/opencode.json"),
+    Loc::XdgConfig("opencode/config.json"),
+];
+
+/// 按优先级从高到低排好的几个位置里，第一个存在的是第几个；都不在就是
+/// 第一个（该新建的那一个）。
+pub fn first_existing(locs: &[Loc], home: &Path) -> usize {
+    locs.iter()
+        .position(|l| l.resolve(home).exists())
+        .unwrap_or(0)
+}
 
 /// Claude Desktop 的配置。
 ///
@@ -201,6 +222,41 @@ pub fn managed_settings() -> PathBuf {
     {
         PathBuf::from("/etc/claude-code/managed-settings.json")
     }
+}
+
+/// 管理策略的分片：和 [`managed_settings`] 同一目录下的 `managed-settings.d/`。
+///
+/// 文档（「Split a file-based policy across teams」）：先读
+/// `managed-settings.json`，再按字母序合并目录里每个 `*.json`，同一个键**后读
+/// 的赢**（`env` 这类嵌套块逐键合并）；隐藏文件和不以 `.json` 结尾的不读。
+/// 两者合起来是同一个管理策略来源，一样压过用户自己的配置 —— 只看
+/// `managed-settings.json` 的话，放在分片里的 `ANTHROPIC_BASE_URL` 我们看
+/// 不见，而它恰恰盖在最上面。
+pub fn managed_settings_dropins() -> Vec<PathBuf> {
+    let file = managed_settings();
+    let Some(dir) = file.parent() else {
+        return Vec::new();
+    };
+    dropins_in(&dir.join("managed-settings.d"))
+}
+
+/// 一个目录里 Claude Code 会读的那些分片，按它读的顺序。
+fn dropins_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = rd
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            !n.starts_with('.') && n.ends_with(".json")
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -283,12 +339,12 @@ mod tests {
         let h = Path::new("/home/u");
         let var = |n: &str| (n == "XDG_CONFIG_HOME").then(|| "/home/u/.cfg".into());
         assert_eq!(
-            OPENCODE_CONFIG.resolve_with(h, Some(h), var),
+            OPENCODE_CONFIGS[1].resolve_with(h, Some(h), var),
             Path::new("/home/u/.cfg/opencode/opencode.json")
         );
         // 没设就是默认位置
         assert_eq!(
-            OPENCODE_CONFIG.resolve_with(h, Some(h), |_| None),
+            OPENCODE_CONFIGS[1].resolve_with(h, Some(h), |_| None),
             Path::new("/home/u/.config/opencode/opencode.json")
         );
         // 数据目录走它自己的变量
@@ -311,13 +367,51 @@ mod tests {
         let var = |_: &str| Some("/home/me/.config".into());
         let tmp = Path::new("/tmp/test-home");
         assert_eq!(
-            OPENCODE_CONFIG.resolve_with(tmp, Some(Path::new("/home/me")), var),
+            OPENCODE_CONFIGS[1].resolve_with(tmp, Some(Path::new("/home/me")), var),
             Path::new("/tmp/test-home/.config/opencode/opencode.json")
         );
         assert_eq!(
-            OPENCODE_CONFIG.resolve_with(tmp, None, var),
+            OPENCODE_CONFIGS[1].resolve_with(tmp, None, var),
             Path::new("/tmp/test-home/.config/opencode/opencode.json")
         );
+    }
+
+    /// 分片按文件名排好，隐藏的和不是 `.json` 的不算。
+    #[test]
+    fn managed_dropins_are_read_in_claude_code_order() {
+        let d = tempfile::tempdir().unwrap();
+        for f in [
+            "20-b.json",
+            "10-a.json",
+            ".hidden.json",
+            "notes.txt",
+            "x.json.bak",
+        ] {
+            std::fs::write(d.path().join(f), "{}").unwrap();
+        }
+        std::fs::create_dir(d.path().join("30-dir.json")).unwrap();
+        let got: Vec<_> = dropins_in(d.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, ["10-a.json", "20-b.json"]);
+        assert!(dropins_in(&d.path().join("没有这个目录")).is_empty());
+    }
+
+    /// 在的几个里优先级最高的那一个；都不在就是该新建的第一个。
+    #[test]
+    fn the_opencode_file_is_the_one_opencode_itself_would_write() {
+        let d = tempfile::tempdir().unwrap();
+        let h = d.path();
+        assert_eq!(first_existing(OPENCODE_CONFIGS, h), 0, "都不在：新建 jsonc");
+        let json = OPENCODE_CONFIGS[1].resolve(h);
+        std::fs::create_dir_all(json.parent().unwrap()).unwrap();
+        std::fs::write(OPENCODE_CONFIGS[2].resolve(h), "{}").unwrap();
+        assert_eq!(first_existing(OPENCODE_CONFIGS, h), 2);
+        std::fs::write(&json, "{}").unwrap();
+        assert_eq!(first_existing(OPENCODE_CONFIGS, h), 1);
+        std::fs::write(OPENCODE_CONFIGS[0].resolve(h), "{}").unwrap();
+        assert_eq!(first_existing(OPENCODE_CONFIGS, h), 0);
     }
 
     /// 相对路径的值当没设，这是 XDG 规范的要求。
@@ -326,7 +420,7 @@ mod tests {
         let h = Path::new("/home/u");
         let var = |_: &str| Some("cfg".into());
         assert_eq!(
-            OPENCODE_CONFIG.resolve_with(h, Some(h), var),
+            OPENCODE_CONFIGS[1].resolve_with(h, Some(h), var),
             Path::new("/home/u/.config/opencode/opencode.json")
         );
     }
