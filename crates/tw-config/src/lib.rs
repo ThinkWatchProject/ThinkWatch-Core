@@ -343,9 +343,13 @@ pub enum BindError {
         name: String,
         available: Vec<String>,
     },
-    /// 网卡在，但此刻没有地址：网线拔了、Wi-Fi 没连上、还没拿到 DHCP。
-    #[error("interface `{name}` currently has no address")]
-    NicHasNoAddr { name: String },
+    /// 网卡在，但此刻用不了：网线拔了、Wi-Fi 没连上、还没拿到 DHCP。
+    ///
+    /// **不说「没有地址」。**没连上的网卡常常还挂着地址（静态配的、或者
+    /// 一个没有容器接着的 `docker0`），[`nics::list`] 按「连着没有」把它们
+    /// 筛掉了 —— 这时说「没有地址」是错的，而用户要做的事两种情况一样。
+    #[error("interface `{name}` is not connected right now")]
+    NicOffline { name: String },
 }
 
 impl Bind {
@@ -361,7 +365,7 @@ impl Bind {
             // 界面上的选单列的也是它，选单上写的就是真要监听的那个
             Bind::Nic(name) => match nics::by_name().into_iter().find(|n| n.name == *name) {
                 Some(n) => Ok(n.addr),
-                None if nics::exists(name) => Err(BindError::NicHasNoAddr { name: name.clone() }),
+                None if nics::exists(name) => Err(BindError::NicOffline { name: name.clone() }),
                 None => Err(BindError::NoSuchNic {
                     name: name.clone(),
                     available: nics::by_name().into_iter().map(|n| n.name).collect(),

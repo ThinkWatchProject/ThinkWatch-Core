@@ -128,6 +128,33 @@ jobs:
         working-directory: enterprise
         run: cargo check --workspace --all-targets
 
+  # **同是 unix，不等于和 macOS 一样。**`getifaddrs` 给的标志、sysfs 里有
+  # 没有 `device`、pid 的上限、`stat` 的参数，这些在 macOS 上测过不说明
+  # 任何事 —— 而桌面版要在 22.04 上跑，所以就在 22.04 上测。
+  #
+  # 不重复跑 `cargo fmt`：格式和平台无关。
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 理由见下面 windows 那一段
+          cache-on-failure: true
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # 真二进制、真 socket、真数据面，和 macOS 那一步是同一个脚本
+      - name: Smoke (real binary, real socket, real data plane)
+        run: ./scripts/smoke.sh
+
   # **这台机器上没有 unix socket，也没有信号。**core 在这两件事上各有一套
   # 平台实现，而在这个任务出现之前，Windows 那一半从来没有被编译过 ——
   # 一个 `#[cfg(windows)]` 模块「检查通过」和「根本没人看过它」长得一模一样。

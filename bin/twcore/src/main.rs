@@ -861,8 +861,11 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 
         if let Some(ppid) = parent {
             // 父进程守望：GUI 没了我们跟着退。轮询而不是用 kqueue，是因为
-            // 这段代码要能在被 launchd 重新 parent 之后仍然正确 —— 那时
-            // getppid() 会变成 1，而我们要看的是原来那个 pid 还在不在。
+            // 这段代码要能在被重新 parent 之后仍然正确 —— macOS 上收养我们的
+            // 是 launchd（getppid() 变成 1），Linux 桌面会话里多半是
+            // `systemd --user`（它是 subreaper，getppid() 变成它的 pid，不是 1）。
+            // 所以**不看 getppid()**，只看原来那个 pid 还在不在，哪个平台、
+            // 谁来收养都一样。
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

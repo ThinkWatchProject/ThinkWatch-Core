@@ -173,3 +173,100 @@ jobs:
             dist/twcore-aarch64-pc-windows-msvc.exe
             dist/twcore-aarch64-pc-windows-msvc.exe.sha256
           generate_release_notes: true
+
+  twcore-linux:
+    name: twcore (${{ matrix.target }})
+    # **两个架构都原生编**，各在自己架构的 runner 上 —— 交叉编 aarch64 要
+    # 一套 aarch64 的 glibc sysroot 和链接器，而 GitHub 给公开仓库提供了
+    # arm64 的 Linux runner（`ubuntu-22.04-arm`），原生编还能顺手把产物
+    # 跑一遍，交叉编的跑不了。
+    #
+    # **两个都是 22.04，不是 24.04。**glibc 只向后兼容：在 2.39（24.04）上
+    # 链出来的二进制，拿到 2.35（22.04）上会报 `GLIBC_2.38 not found` 起不来。
+    # 桌面版在 Linux 上的底线就是 22.04（WebKitGTK 4.1），core 跟它对齐。
+    #
+    # **不用 musl 静态编。**它能摆脱 glibc 版本，但桌面版本体反正要 glibc
+    # 2.35+，core 单独摆脱它换不来什么；而 musl 的内存分配器在多线程下慢得
+    # 多、DNS 解析的行为和 glibc 不同 —— 用户机器上出了问题，排查的是一个
+    # 和系统里其他程序都不一样的运行时。同一个 glibc 底线，排查也简单。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            file_arch: x86-64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            file_arch: ARM aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p twcore --target ${{ matrix.target }}
+
+      # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出任何
+      # 问题 —— 而它会一路发到用户手里。
+      #
+      # 比 macOS 那段多一条 glibc 的上限：runner 的镜像哪天换了、或者有人把
+      # 上面的 22.04 改成了 latest，产物就会悄悄要求一个更新的 glibc，而在
+      # 构建机上它照样跑得起来 —— 只有用户的 22.04 上起不来。
+      - name: It runs, it is the version on the tag, and it needs glibc 2.35 at most
+        env:
+          FILE_ARCH: ${{ matrix.file_arch }}
+        run: |
+          set -euo pipefail
+          BIN=target/${{ matrix.target }}/release/twcore
+          file "$BIN"
+          file "$BIN" | grep -q "$FILE_ARCH"
+
+          MAX_GLIBC=2.35
+          NEED=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          if [ -z "$NEED" ]; then
+            echo "objdump found no GLIBC_ symbol versions in $BIN" >&2
+            exit 1
+          fi
+          echo "needs glibc $NEED (limit $MAX_GLIBC)"
+          if [ "$(printf '%s\n%s\n' "$NEED" "$MAX_GLIBC" | sort -V | tail -n 1)" != "$MAX_GLIBC" ]; then
+            echo "twcore needs glibc $NEED, newer than $MAX_GLIBC (Ubuntu 22.04)" >&2
+            exit 1
+          fi
+
+          GOT=$("$BIN" --version | awk '{print $2}')
+          # 排练时没有 tag 可对，只把版本打出来
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            WANT="${GITHUB_REF_NAME#v}"
+            if [ "$GOT" != "$WANT" ]; then
+              echo "the tag says $WANT but the binary reports $GOT -- Cargo.toml did not keep up" >&2
+              exit 1
+            fi
+          else
+            echo "rehearsal: the binary reports $GOT"
+          fi
+          "$BIN" --help > /dev/null
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/twcore dist/twcore-${{ matrix.target }}
+          cd dist
+          # 和另外两个平台同一种校验文件：`<sha>  <文件名>`
+          sha256sum twcore-${{ matrix.target }} > twcore-${{ matrix.target }}.sha256
+          cat twcore-${{ matrix.target }}.sha256
+
+      - uses: softprops/action-gh-release@v2
+        # 排练不发布。
+        if: github.ref_type == 'tag'
+        with:
+          files: |
+            dist/twcore-${{ matrix.target }}
+            dist/twcore-${{ matrix.target }}.sha256
+          generate_release_notes: true

@@ -61,16 +61,16 @@ pub fn bind_failure(addr: SocketAddr, e: &std::io::Error) -> Msg {
 }
 
 /// 网卡解析不出地址的原因，说给人听。**两种情况要做的事不同**：名字不对要
-/// 改设置，网卡没地址要去插网线、连 Wi-Fi。
+/// 改设置，网卡没连上要去插网线、连 Wi-Fi。
 pub fn unresolved(e: &tw_config::BindError) -> Msg {
     match e {
         tw_config::BindError::NoSuchNic { name, available } => msg!(
             "gw.listen.no_such_nic", name = name, available = available.join(", ") =>
             "This machine has no interface named {name}; it has {available}."
         ),
-        tw_config::BindError::NicHasNoAddr { name } => msg!(
-            "gw.listen.nic_no_addr", name = name =>
-            "Interface {name} currently has no address. Check the cable or the Wi-Fi connection."
+        tw_config::BindError::NicOffline { name } => msg!(
+            "gw.listen.nic_offline", name = name =>
+            "Interface {name} is not connected right now. Check the cable or the Wi-Fi connection."
         ),
     }
 }
