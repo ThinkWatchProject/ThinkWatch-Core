@@ -131,6 +131,7 @@ config.empty_key
 config.empty_models_only
 config.name_collision
 config.no_clients
+config.output_limit_range
 config.rejected
 config.rejected_at
 config.reserved_name
@@ -272,8 +273,11 @@ gw.config.proxy_password
 gw.config.proxy_undefined
 gw.config.proxy_unusable
 gw.config.security_rules passthrough
+gw.content.refused
 gw.convert.failed
 gw.credentials.failed
+gw.hidden_text.refused_message
+gw.hidden_text.refused_tool_result
 gw.internal
 gw.listen.addr_unavailable
 gw.listen.bind_failed
@@ -285,6 +289,8 @@ gw.model.no_upstream
 gw.model.no_upstream_available
 gw.model.not_allowed
 gw.model.unknown
+gw.output_limit.cut
+gw.output_limit.withheld
 gw.request.body_too_large
 gw.route.all_selected_disabled
 gw.route.denied
@@ -383,11 +389,18 @@ scan.rule
 scan.rule.detail
 scan.skill.all_tools
 scan.skill.all_tools.detail
+security.bad_content_pattern
 security.bad_pattern
-security.no_action
+security.guard_unknown
+security.limit_range
+security.no_action_of_its_own
+security.no_custom_rules
+security.no_limit
+security.nothing_to_test
 security.rule_name_empty
 security.unknown_action
-security.unknown_guard
+security.unknown_content_action
+security.unknown_match
 security.unknown_mode
 security.unknown_rule
 t.auth test

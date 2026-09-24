@@ -338,6 +338,85 @@ impl Recorder {
                     });
                 }
             }
+            // 藏匿字符：一种藏法在一个地方一条，`count` 是几个字符
+            Event::HiddenTextFound {
+                id,
+                provider,
+                blocked,
+                items,
+                at_ms,
+            } => {
+                let client = self.inflight.get(id).map(|p| p.client.clone());
+                for it in items {
+                    let excerpt = if it.revealed.is_empty() {
+                        it.example.clone()
+                    } else {
+                        format!("{} {}", it.example, it.revealed)
+                    };
+                    self.record_security(crate::db::SecurityEvent {
+                        at_ms: *at_ms as i64,
+                        request_id: *id as i64,
+                        guard: "hidden_text".into(),
+                        rule: it.kind.clone(),
+                        custom: false,
+                        action: if *blocked { "blocked" } else { "recorded" }.into(),
+                        provider: provider.clone(),
+                        client: client.clone().unwrap_or_default(),
+                        tool: it.in_tool_result.then(|| "tool_result".to_string()),
+                        excerpt,
+                        count: it.count as i64,
+                    });
+                }
+            }
+            Event::ContentMatched {
+                id,
+                provider,
+                rule,
+                custom,
+                blocked,
+                in_tool_result,
+                excerpt,
+                at_ms,
+                ..
+            } => {
+                let client = self.inflight.get(id).map(|p| p.client.clone());
+                self.record_security(crate::db::SecurityEvent {
+                    at_ms: *at_ms as i64,
+                    request_id: *id as i64,
+                    guard: "content".into(),
+                    rule: rule.clone(),
+                    custom: *custom,
+                    action: if *blocked { "blocked" } else { "recorded" }.into(),
+                    provider: provider.clone(),
+                    client: client.unwrap_or_default(),
+                    tool: in_tool_result.then(|| "tool_result".to_string()),
+                    excerpt: excerpt.clone(),
+                    count: 1,
+                });
+            }
+            Event::OutputLimited {
+                id,
+                provider,
+                max_chars,
+                seen_chars,
+                cut,
+                at_ms,
+            } => {
+                let client = self.inflight.get(id).map(|p| p.client.clone());
+                self.record_security(crate::db::SecurityEvent {
+                    at_ms: *at_ms as i64,
+                    request_id: *id as i64,
+                    guard: "output_limit".into(),
+                    rule: "max_chars".into(),
+                    custom: false,
+                    action: if *cut { "cut" } else { "recorded" }.into(),
+                    provider: provider.clone(),
+                    client: client.unwrap_or_default(),
+                    tool: None,
+                    excerpt: max_chars.to_string(),
+                    count: *seen_chars as i64,
+                });
+            }
             /*
                 一个工具调用命中了规则。**以前这条事件不落库** —— 只在请求行上
                 记一个「命中了几条」，于是命中了哪条规则、调用长什么样，关窗
@@ -1343,6 +1422,79 @@ mod security_tests {
         assert_eq!(counts.tool_calls, 1);
         assert_eq!(counts.tool_calls_cut, 1);
         assert_eq!(counts.secrets, 0);
+    }
+
+    /// 后加的三项防护进同一张表，各自的做了什么和计数都对得上。
+    #[test]
+    fn the_request_and_output_guards_are_logged_and_counted() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&tw_api::Event::HiddenTextFound {
+            id: 1,
+            provider: "relay".into(),
+            blocked: true,
+            items: vec![tw_api::HiddenItem {
+                kind: "tag".into(),
+                in_tool_result: true,
+                count: 6,
+                example: "U+E0069".into(),
+                revealed: "ignore".into(),
+            }],
+            at_ms: 30,
+        });
+        r.on_event(&tw_api::Event::ContentMatched {
+            id: 1,
+            provider: "relay".into(),
+            rule: "jailbreak".into(),
+            custom: false,
+            action: "block".into(),
+            blocked: false,
+            in_tool_result: false,
+            excerpt: "please jailbreak".into(),
+            at_ms: 31,
+        });
+        r.on_event(&tw_api::Event::OutputLimited {
+            id: 1,
+            provider: "relay".into(),
+            max_chars: 100,
+            seen_chars: 130,
+            cut: true,
+            at_ms: 32,
+        });
+        let (got, _) = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        assert_eq!(got.len(), 3, "{got:?}");
+        let [limit, content, hidden] = &got[..] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (
+                hidden.guard.as_str(),
+                hidden.rule.as_str(),
+                hidden.action.as_str()
+            ),
+            ("hidden_text", "tag", "blocked")
+        );
+        assert_eq!(hidden.tool.as_deref(), Some("tool_result"));
+        assert_eq!(hidden.excerpt, "U+E0069 ignore");
+        assert_eq!(hidden.count, 6);
+        assert_eq!(
+            (content.guard.as_str(), content.action.as_str()),
+            ("content", "recorded")
+        );
+        assert_eq!(content.tool, None);
+        assert_eq!(
+            (
+                limit.guard.as_str(),
+                limit.action.as_str(),
+                limit.excerpt.as_str()
+            ),
+            ("output_limit", "cut", "100")
+        );
+        assert_eq!(limit.count, 130);
+        let c = r.db().security_counts(0, i64::MAX).unwrap();
+        assert_eq!((c.hidden_text, c.hidden_text_blocked), (1, 1));
+        assert_eq!((c.content, c.content_blocked), (1, 0));
+        assert_eq!((c.output_limit, c.output_limit_cut), (1, 1));
     }
 }
 

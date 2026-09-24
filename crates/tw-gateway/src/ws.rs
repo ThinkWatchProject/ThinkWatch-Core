@@ -13,9 +13,9 @@
 //!
 //! 所以这里每一帧文本都过同一套：
 //!
-//! - 客户端 → 上游：出站脱敏，和普通请求同一套函数、同一份全局规则 ——
-//!   观察档记录，拦截档替换；
-//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
+//! - 客户端 → 上游：请求防护（藏匿字符、内容过滤）和出站脱敏，和普通请求同一套
+//!   函数、同一份全局规则 —— 观察档记录，拦截档拒绝或替换；
+//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查和输出长度。
 //!
 //! # 两条明说的边界
 //!
@@ -101,13 +101,17 @@ pub struct Upstream {
     pub group: Option<String>,
 }
 
-/// 两项防护此刻的档位和规则。**升级那一刻取一次**：一条连接活多久，就按
+/// 各项防护此刻的档位和规则。**升级那一刻取一次**：一条连接活多久，就按
 /// 它开始时的配置走多久，和普通请求按开始时的运行时走是同一个道理。
 pub struct Rules {
     pub redact_mode: tw_config::SecurityMode,
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
     pub inspect_mode: tw_config::SecurityMode,
     pub tools: Arc<tw_guard::tools::rules::Rules>,
+    /// 藏匿字符和内容过滤
+    pub screen: crate::guard::Screen,
+    pub limit_mode: tw_config::SecurityMode,
+    pub limit: tw_guard::output::Limit,
 }
 
 /// 一次连接里两个方向各自的状态。
@@ -117,6 +121,10 @@ struct Pipes {
     ledger: tw_guard::redact::replace::Ledger,
     /// 工具调用审查关着的时候没有它
     wall: Option<tw_guard::tools::wall::Wall>,
+    /// 输出长度。**整条连接一个**：一条连接上是一次次的回答，数的是这条连接上
+    /// 模型一共说了多少 —— 按回答分开数要认得每一次回答的边界，而 WS 上的帧形状
+    /// 没有实测过（见 [`as_sse`]）
+    meter: Option<tw_guard::output::Meter>,
     rules: Rules,
     provider: String,
     id: u64,
@@ -178,6 +186,10 @@ pub async fn proxy(
             .inspect_mode
             .detects()
             .then(|| tw_guard::tools::wall::Wall::new(rules.tools.clone())),
+        meter: rules
+            .limit_mode
+            .detects()
+            .then(|| tw_guard::output::Meter::sse(rules.limit, tw_dialect::ir::Dialect::Responses)),
         rules,
         provider: upstream.provider.name,
         id,
@@ -301,7 +313,8 @@ enum End {
     Closed,
     /// 上游那边出错断了，或者写不过去了
     Broke(Msg),
-    /// 上游返回了高危工具调用，被切断了
+    /// 被防护切断了：上游返回了高危工具调用、回答超了输出长度，或者客户端发来的
+    /// 一帧被请求防护拒了
     Cut(Msg),
 }
 
@@ -321,6 +334,13 @@ async fn pump(
                 let Some(Ok(m)) = msg else { break End::Closed };
                 let out = match m {
                     Message::Text(t) => {
+                        // 请求防护在脱敏之前：看的是客户端的原话
+                        if let Some(why) = screen_frame(&state, p, t.as_str()) {
+                            let _ = c_tx.send(Message::Text(
+                                format!("[ThinkWatch] {}", why.text).into(),
+                            )).await;
+                            break End::Cut(why);
+                        }
                         let mode = p.rules.redact_mode;
                         let found = crate::guard::find(mode, &p.rules.redact, t.as_bytes());
                         if found.is_empty() {
@@ -411,6 +431,23 @@ async fn pump(
                             )).await;
                             break End::Cut(why.expect("set on the same pass that set deadly"));
                         }
+                        // 输出长度：**超了的那一帧不发**，和 SSE 那条路同一条纪律
+                        if let Some(t) = p.meter.as_mut().and_then(|m| m.feed(as_sse(&restored).as_bytes()))
+                            && let Some(why) = crate::guard::output_limited(
+                                &state.bus,
+                                p.id,
+                                &p.provider,
+                                p.rules.limit_mode,
+                                p.rules.limit.max,
+                                t.seen,
+                                false,
+                            )
+                        {
+                            let _ = c_tx.send(Message::Text(
+                                format!("[ThinkWatch] {}", why.text).into(),
+                            )).await;
+                            break End::Cut(why);
+                        }
                         ending.count(restored.len());
                         Message::Text(restored.into())
                     }
@@ -436,6 +473,29 @@ async fn pump(
     }
     let _ = c_tx.close().await;
     let _ = u_tx.close().await;
+}
+
+/// 客户端发来的一帧过一遍请求防护。拦截档下该拒的话，返回告诉客户端的那句话。
+///
+/// Codex 在 WS 上发的是 `{"type":"response.create", …}`，其余字段就是一个 Responses
+/// 请求，**解得开就按消息结构看**，和 HTTP 那条路一样只看调用方的消息；解不开的
+/// 只查藏匿字符（见 [`crate::guard::screen_text`]）。
+fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Option<Msg> {
+    let s = &p.rules.screen;
+    if !s.hidden_mode.detects() && !s.content_mode.detects() {
+        return None;
+    }
+    let decoded = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"))
+        .and_then(|v| {
+            tw_dialect::convert::decode(tw_dialect::ir::Dialect::Responses, &v, "/responses", None)
+                .ok()
+        });
+    match decoded {
+        Some(d) => crate::guard::screen(&state.bus, p.id, &p.provider, s, &d.request),
+        None => crate::guard::screen_text(&state.bus, p.id, &p.provider, s, text),
+    }
 }
 
 /// 把一帧喂成工具墙认得的样子。

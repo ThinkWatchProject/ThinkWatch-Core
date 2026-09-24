@@ -113,6 +113,9 @@ pub(super) async fn ws_upgrade(
         redact: rt.redact.clone(),
         inspect_mode: rt.config.security.inspect_tools.mode,
         tools: rt.tools.clone(),
+        screen: crate::guard::Screen::of(&rt),
+        limit_mode: rt.config.security.output_limit.mode,
+        limit: rt.config.security.output_limit.limit(),
     };
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久

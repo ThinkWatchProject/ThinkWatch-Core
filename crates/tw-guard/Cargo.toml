@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Guards shared by both gateways: outbound redaction and restoration, and inspection of the tool calls an upstream returns"
+description = "Guards shared by both gateways: outbound redaction and restoration, inspection of the tool calls an upstream returns, hidden characters, content filtering and an output length limit"
 
 [dependencies]
 serde = { workspace = true }

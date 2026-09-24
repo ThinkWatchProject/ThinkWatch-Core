@@ -68,6 +68,8 @@ pub enum ValidationError {
     },
     #[error("{}", self.msg())]
     UnknownRule { guard: &'static str, id: String },
+    #[error("{}", self.msg())]
+    OutputLimitRange { max: usize, ceiling: usize },
 }
 
 impl ValidationError {
@@ -186,6 +188,10 @@ impl ValidationError {
             UnknownRule { guard, id } => msg!(
                 "config.unknown_rule", guard = guard, rule = id =>
                 "security.{guard} names `{rule}`, which is not a built-in rule"
+            ),
+            OutputLimitRange { max, ceiling } => msg!(
+                "config.output_limit_range", max = max, ceiling = ceiling =>
+                "security.output_limit.max_chars is {max}; it has to be between 1 and {ceiling}"
             ),
         }
     }
@@ -379,6 +385,14 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             .iter()
             .map(|c| (c.name.as_str(), c.pattern.as_str())),
     )?;
+    check_content_rules(&cfg.security.content.custom)?;
+    let max = cfg.security.output_limit.max_chars;
+    if max == 0 || max > crate::MAX_CHARS_CEILING {
+        return Err(ValidationError::OutputLimitRange {
+            max,
+            ceiling: crate::MAX_CHARS_CEILING,
+        });
+    }
     // 按 id 开关、改处置的内置规则得真的存在。**写错一个 id 和写错一个字段名
     // 是同一种错**：跳过它，用户停用的那条会照样在报
     if let Some((guard, id)) = cfg.security.unknown_rule() {
@@ -423,6 +437,45 @@ fn check_rules<'a>(
                 name: name.to_string(),
                 detail: e.to_string(),
             })?;
+    }
+    Ok(())
+}
+
+/// 自定义的内容规则：名字不空、不重复，写着正则的编得过。**编法和数据面同一个**
+/// （`tw_guard::content::Rule::new`：不分大小写、编译后的大小有上限）。
+fn check_content_rules(rules: &[crate::CustomContentRule]) -> Result<(), ValidationError> {
+    const WHAT: &str = "content";
+    let mut seen = std::collections::HashSet::new();
+    for c in rules {
+        let name = c.name.as_str();
+        if name.trim().is_empty() {
+            return Err(ValidationError::EmptyRuleName { what: WHAT });
+        }
+        if !seen.insert(name) {
+            return Err(ValidationError::DuplicateRuleName {
+                what: WHAT,
+                name: name.to_string(),
+            });
+        }
+        if c.pattern.trim().is_empty() {
+            return Err(ValidationError::EmptyRulePattern {
+                what: WHAT,
+                name: name.to_string(),
+            });
+        }
+        tw_guard::content::Rule::new(tw_guard::content::RuleInput {
+            id: name,
+            name,
+            custom: true,
+            pattern: &c.pattern,
+            matching: c.matching.engine(),
+            action: tw_guard::content::Action::Warn,
+        })
+        .map_err(|e| ValidationError::BadRulePattern {
+            what: WHAT,
+            name: name.to_string(),
+            detail: e.detail,
+        })?;
     }
     Ok(())
 }
@@ -678,6 +731,51 @@ mod tests {
         assert!(validate(&with_rules(&[("同名", "a")], &[("同名", "b")])).is_ok());
     }
 
+    #[test]
+    fn content_rules_are_checked_like_the_others_and_a_keyword_is_not_a_regex() {
+        let mut x = with_rules(&[], &[]);
+        let rule = |name: &str, pattern: &str, matching| crate::CustomContentRule {
+            name: name.into(),
+            pattern: pattern.into(),
+            matching,
+            action: crate::ContentAction::Block,
+            disabled: false,
+        };
+        // 子串里的括号不是正则
+        x.security.content.custom = vec![rule("括号", "f(", crate::ContentMatch::Contains)];
+        assert!(validate(&x).is_ok(), "{:?}", validate(&x));
+        x.security.content.custom = vec![rule("括号", "f(", crate::ContentMatch::Regex)];
+        assert!(matches!(
+            validate(&x),
+            Err(ValidationError::BadRulePattern {
+                what: "content",
+                ..
+            })
+        ));
+        x.security.content.custom = vec![
+            rule("同名", "a", crate::ContentMatch::Contains),
+            rule("同名", "b", crate::ContentMatch::Contains),
+        ];
+        assert!(matches!(
+            validate(&x),
+            Err(ValidationError::DuplicateRuleName { .. })
+        ));
+    }
+
+    #[test]
+    fn the_output_limit_has_to_be_a_sensible_number() {
+        let mut x = with_rules(&[], &[]);
+        for bad in [0, crate::MAX_CHARS_CEILING + 1] {
+            x.security.output_limit.max_chars = bad;
+            assert!(
+                matches!(validate(&x), Err(ValidationError::OutputLimitRange { .. })),
+                "{bad}"
+            );
+        }
+        x.security.output_limit.max_chars = 1;
+        assert!(validate(&x).is_ok());
+    }
+
     /// 按 id 写到的内置规则得真的存在：写错的 id 和写错的字段名一样拒绝，
     /// 说出是哪一项下的哪个 id。
     #[test]
@@ -884,6 +982,7 @@ mod msg_codes {
                 guard: "redact",
                 id: "x".into(),
             },
+            OutputLimitRange { max: 0, ceiling: 1 },
         ];
         check(
             "config.",

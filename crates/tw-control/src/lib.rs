@@ -377,6 +377,9 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         security: tw_api::SecurityView {
             redact: cfg.security.redact.mode.slug().to_string(),
             inspect_tools: cfg.security.inspect_tools.mode.slug().to_string(),
+            hidden_text: cfg.security.hidden_text.mode.slug().to_string(),
+            content: cfg.security.content.mode.slug().to_string(),
+            output_limit: cfg.security.output_limit.mode.slug().to_string(),
         },
         default_route: engine.default_route().to_string(),
         client_probes: cfg

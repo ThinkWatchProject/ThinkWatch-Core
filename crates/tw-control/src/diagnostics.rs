@@ -161,7 +161,7 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
         let _ = writeln!(out, "| {} | {} |", c.name, tw_secret::mask_secret(&c.key));
     }
 
-    // ---- 两项防护：档位，以及和出厂不一样的那几处（只有规则名，不含正则 ——
+    // ---- 各项防护：档位，以及和出厂不一样的那几处（只有规则名，不含正则 ——
     // 自定义规则的正则里可能写着公司内部的东西）
     let _ = writeln!(out, "\n## Security\n\n| | |\n|---|---|");
     let changes = |enable: &[String], disable: &[String], custom: Vec<&str>| {
@@ -208,6 +208,32 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
                 t.custom.iter().map(|c| c.name.as_str()).collect()
             )
         ),
+    );
+    let h = &cfg.security.hidden_text;
+    line(
+        &mut out,
+        "Hidden characters",
+        format!("{}{}", h.mode.label(), changes(&[], &h.disable, Vec::new())),
+    );
+    let c = &cfg.security.content;
+    line(
+        &mut out,
+        "Content filter",
+        format!(
+            "{}{}",
+            c.mode.label(),
+            changes(
+                &c.enable,
+                &c.disable,
+                c.custom.iter().map(|c| c.name.as_str()).collect()
+            )
+        ),
+    );
+    let o = &cfg.security.output_limit;
+    line(
+        &mut out,
+        "Output limit",
+        format!("{} ({} characters)", o.mode.label(), o.max_chars),
     );
 
     // ---- 存储和最近的失败

@@ -607,7 +607,7 @@ fn data_line(line: &str) -> Option<Value> {
 /// 开头的 `[` 和末尾的 `]` 各自成一帧；每个元素连同它前面的分隔符（`,`、空白）算一帧。
 /// **分隔符算在后面那个元素上**：命中时从分隔符起一个字节都不发，客户端收到的前缀停在
 /// 上一个完整元素的末尾。
-fn find_element_end(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_element_end(buf: &[u8]) -> Option<usize> {
     let start = buf
         .iter()
         .position(|b| !(b.is_ascii_whitespace() || *b == b','))?;

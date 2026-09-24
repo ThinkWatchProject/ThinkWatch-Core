@@ -267,6 +267,48 @@ pub enum Event {
         /// 一家都没接下时是 `per-token`：没有哪一家的计费方式可以跟着走。
         billing: String,
     },
+    /// 调用方发来的正文里（连同工具结果）有藏起来的字符：标签字符或双向控制符。
+    ///
+    /// **观察档和拦截档报的是同一条**，差别只在 `blocked`：拦截档下这个请求没有
+    /// 发出去，随后是一条来源为 `denied` 的失败。
+    HiddenTextFound {
+        id: u64,
+        /// 这时要发往的上游（故障转移之前的首选）
+        provider: String,
+        /// 请求被拒了吗。`false` = 观察档，只记录
+        blocked: bool,
+        items: Vec<HiddenItem>,
+        at_ms: u64,
+    },
+    /// 调用方发来的正文里（连同工具结果）命中了内容规则。**一条规则一条事件**。
+    ContentMatched {
+        id: u64,
+        provider: String,
+        /// 内置规则的 id，或者自定义规则的名字
+        rule: String,
+        custom: bool,
+        /// 这条规则在拦截档下做什么：`block` / `record`
+        action: String,
+        /// 请求被拒了吗。**拦截档 + 规则是拦**两者同时成立才会
+        blocked: bool,
+        /// 在工具结果里，而不是调用方自己打的字
+        in_tool_result: bool,
+        /// 命中处前后的一小段，**已截断**
+        excerpt: String,
+        at_ms: u64,
+    },
+    /// 模型这一次回答的正文超过了输出长度上限。**一个请求最多一条**，在超的那一刻报。
+    OutputLimited {
+        id: u64,
+        provider: String,
+        /// 上限，按字符数
+        max_chars: u64,
+        /// 超的那一刻数到了多少
+        seen_chars: u64,
+        /// 切断了吗：流从那一帧起不再发、整包整份不发。`false` = 观察档，只记录
+        cut: bool,
+        at_ms: u64,
+    },
     /// 一个请求发出前，按出站脱敏的规则找到了东西。
     ///
     /// **观察档和拦截档报的是同一条**，差别只在 `replaced`：观察档只记录，
@@ -665,6 +707,9 @@ impl Event {
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
             | Event::SecretsFound { id, .. }
+            | Event::HiddenTextFound { id, .. }
+            | Event::ContentMatched { id, .. }
+            | Event::OutputLimited { id, .. }
             | Event::ScanAlert { id, .. }
             | Event::RequestPriced { id, .. }
             | Event::ClientsChanged { id, .. }
@@ -800,15 +845,19 @@ pub struct RetentionView {
     pub body_bytes_now: u64,
 }
 
-/// 两项防护各在哪一档：`off` / `observe` / `enforce`。
+/// 每项防护各在哪一档：`off` / `observe` / `enforce`。
 ///
-/// **「拦截」在两项上做的事不一样**：脱敏是替换成占位符，审查是切断响应。
+/// **「拦截」在各项上做的事不一样**：脱敏是替换成占位符，工具调用审查和输出长度
+/// 是切断响应，藏匿字符和内容过滤是拒绝请求。
 /// 规则和日志在 [`SecurityDetail`] 和 `/security/events` 里，不塞进概览。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityView {
     pub redact: String,
     pub inspect_tools: String,
+    pub hidden_text: String,
+    pub content: String,
+    pub output_limit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3148,7 +3197,22 @@ pub struct SecretItem {
     pub count: u64,
 }
 
-/// 两项防护在一段时间里各留下了几条记录。
+/// 藏匿字符的一种：哪一种、在哪儿、几处、第一个长什么样。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HiddenItem {
+    /// `tag`（Unicode 标签字符）/ `bidi`（双向控制符）
+    pub kind: String,
+    /// 在工具结果里，而不是调用方自己打的字
+    pub in_tool_result: bool,
+    pub count: u64,
+    /// 第一个的码位，写成 `U+E0049`
+    pub example: String,
+    /// 标签字符解出来的原文（最多 120 个字符）：**藏的是什么**。双向控制符是空的
+    pub revealed: String,
+}
+
+/// 各项防护在一段时间里各留下了几条记录。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityCounts {
@@ -3160,6 +3224,18 @@ pub struct SecurityCounts {
     pub tool_calls: i64,
     /// 其中被切断的
     pub tool_calls_cut: i64,
+    /// 藏匿字符（每条 = 一个请求里一种藏法在一个地方）
+    pub hidden_text: i64,
+    /// 其中请求被拒的
+    pub hidden_text_blocked: i64,
+    /// 命中内容规则的（每条 = 一个请求命中一条规则）
+    pub content: i64,
+    /// 其中请求被拒的
+    pub content_blocked: i64,
+    /// 回答超过输出长度的
+    pub output_limit: i64,
+    /// 其中被切断的
+    pub output_limit_cut: i64,
 }
 
 /// 安全日志的一条。
@@ -3172,13 +3248,15 @@ pub struct SecurityEventView {
     pub id: i64,
     pub at_ms: i64,
     pub request_id: i64,
-    /// `redact` / `inspect_tools`
+    /// `redact` / `inspect_tools` / `hidden_text` / `content` / `output_limit`
     pub guard: String,
-    /// 内置规则的 id，或者自定义规则的名字
+    /// 内置规则的 id，或者自定义规则的名字。藏匿字符是那一种（`tag` / `bidi`），
+    /// 输出长度是 `max_chars`
     pub rule: String,
     #[serde(default)]
     pub custom: bool,
-    /// 做了什么：`recorded`（只记录）/ `replaced`（已替换）/ `cut`（已切断）
+    /// 做了什么：`recorded`（只记录）/ `replaced`（已替换）/ `cut`（已切断）/
+    /// `blocked`（请求被拒，没有发出去）
     pub action: String,
     /// 请求最终由哪个上游服务；还没结束的是当时的首选
     pub provider: String,
@@ -3187,12 +3265,14 @@ pub struct SecurityEventView {
     /// 请求的模型。还没落库的请求是空的
     #[serde(default)]
     pub model: String,
-    /// 工具调用审查：哪个工具
+    /// 工具调用审查：哪个工具。藏匿字符和内容过滤：在工具结果里时是 `tool_result`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// 出站脱敏是打码后的值；工具调用审查是命中的那一小段（已截断）
+    /// 出站脱敏是打码后的值；工具调用审查、内容过滤是命中的那一小段（已截断）；
+    /// 藏匿字符是第一个的码位，标签字符后面跟一个空格和解出来的原文；输出长度是上限
     pub excerpt: String,
-    /// 出站脱敏：这个值在请求里出现了几次
+    /// 出站脱敏：这个值在请求里出现了几次。藏匿字符：几个字符。输出长度：超的那一刻
+    /// 数到了多少个字符。其余是 1
     pub count: i64,
     /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，
     /// 只用来显示；身份是 `client` 那把密钥
@@ -3233,8 +3313,12 @@ pub enum Matcher {
     PrivateIp,
     /// 以这几个后缀结尾的域名
     DomainSuffix { suffixes: Vec<String> },
-    /// 正则表达式：工具调用审查的全部规则，和两项防护的自定义规则
+    /// 正则表达式：工具调用审查的全部规则，和各项防护的自定义规则
     Regex { pattern: String },
+    /// 不分大小写的子串：内容过滤的关键词规则
+    Contains { text: String },
+    /// 这几段码位里的字符：藏匿字符的两种，写成 `U+E0000–U+E007F`
+    Codepoints { ranges: Vec<String> },
 }
 
 /// 一条规则。
@@ -3250,16 +3334,17 @@ pub struct SecurityRuleView {
     /// 为什么值得看一眼（英文）。出站脱敏和自定义规则没有
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
-    /// 类别。出站脱敏：`api-keys` … `custom`；工具调用审查：`command` / `custom`
+    /// 类别。出站脱敏：`api-keys` … `custom`；工具调用审查：`command` / `custom`；
+    /// 内容过滤：`injection` / `persona` / `chinese` / `custom`；藏匿字符：`invisible`
     pub kind: String,
     pub matcher: Matcher,
     pub enabled: bool,
     /// 出厂时开不开。自定义规则是 `true`
     pub on_by_default: bool,
-    /// 工具调用审查：拦截档下做什么，`cut` / `record`
+    /// 工具调用审查：拦截档下做什么，`cut` / `record`；内容过滤：`block` / `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// 内置的工具调用规则出厂时拦截档下做什么。和 `action` 不一样就是改过
+    /// 内置规则出厂时拦截档下做什么。和 `action` 不一样就是改过
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_action: Option<String>,
 }
@@ -3274,12 +3359,30 @@ pub struct GuardDetail {
     pub rules: Vec<SecurityRuleView>,
 }
 
-/// 两项防护。
+/// 输出长度的档位和上限。它没有规则，只有一个数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct OutputLimitDetail {
+    /// `off` / `observe` / `enforce`
+    pub mode: String,
+    /// 上限，按字符数
+    pub max_chars: u64,
+    /// 出厂的上限
+    pub default_max_chars: u64,
+    /// 最多能设多大
+    pub ceiling: u64,
+}
+
+/// 各项防护。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityDetail {
     pub redact: GuardDetail,
     pub inspect_tools: GuardDetail,
+    /// 规则就是那两种藏法，可以各自关掉
+    pub hidden_text: GuardDetail,
+    pub content: GuardDetail,
+    pub output_limit: OutputLimitDetail,
 }
 
 /// 改档位。
@@ -3301,12 +3404,12 @@ pub struct RuleToggle {
     pub base_version: Option<String>,
 }
 
-/// 改一条内置规则在拦截档下做什么。只有工具调用审查的规则有这一项 ——
-/// 出站脱敏命中之后做什么由档位决定。
+/// 改一条内置规则在拦截档下做什么。只有工具调用审查和内容过滤的规则有这一项 ——
+/// 别的防护命中之后做什么由档位决定。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActionSave {
-    /// `cut` / `record`
+    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `record`
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -3318,9 +3421,13 @@ pub struct ActionSave {
 pub struct CustomRuleSave {
     pub name: String,
     pub pattern: String,
-    /// 工具调用审查才有：`cut` / `record`。不给按 `record`
+    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `record`。不给按 `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// 内容过滤才有：`contains`（不分大小写的子串）/ `regex`。不给按 `contains`。
+    /// 别的防护的自定义规则都是正则
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matching: Option<String>,
     #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3331,6 +3438,16 @@ fn yes() -> bool {
     true
 }
 
+/// 改输出长度的上限。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LimitSave {
+    /// 按字符数，1 到 [`OutputLimitDetail::ceiling`]
+    pub max_chars: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
 /// 拿一段文本试一试。给了 `pattern` 就只试这一条正则，给了 `rule` 就只试
 /// 这一条内置规则（停用着的也能试），都不给就按现在启用的全部规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3339,6 +3456,9 @@ pub struct SecurityTestRequest {
     pub sample: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// 内容过滤试 `pattern` 时怎么认：`contains` / `regex`，不给按 `contains`
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matching: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
 }
@@ -3354,9 +3474,10 @@ pub struct SecurityTestHit {
     /// 下标切就能标出来
     pub start: usize,
     pub end: usize,
-    /// 出站脱敏：打码后的值；工具调用审查：命中的那一小段
+    /// 出站脱敏：打码后的值；工具调用审查、内容过滤：命中的那一小段；藏匿字符：
+    /// 那个字符的码位
     pub excerpt: String,
-    /// 工具调用审查：拦截档下做什么
+    /// 工具调用审查、内容过滤：拦截档下做什么
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
