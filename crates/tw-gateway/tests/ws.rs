@@ -51,6 +51,29 @@ async fn handle(mut sock: WebSocket, st: Up) {
     while let Some(Ok(m)) = sock.recv().await {
         let Message::Text(t) = m else { continue };
         st.seen.lock().unwrap().push(t.to_string());
+        // 一次 Responses 回答：created、三段正文、completed。**一次请求一串帧**，
+        // id 按第几次请求编
+        if st.script == "responses" {
+            let n = st.seen.lock().unwrap().len();
+            let id = format!("resp_{n}");
+            let mut frames = vec![
+                serde_json::json!({"type": "response.created", "response": {"id": id, "status": "in_progress"}}),
+            ];
+            for d in ["abcd", "efgh", "ijkl"] {
+                frames.push(serde_json::json!({"type": "response.output_text.delta", "item_id": "i", "output_index": 0, "content_index": 0, "delta": d}));
+            }
+            frames.push(serde_json::json!({"type": "response.completed", "response": {"id": id, "status": "completed"}}));
+            for f in frames {
+                if sock
+                    .send(Message::Text(f.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            continue;
+        }
         let reply = match st.script {
             // **回显是刻意的**：模型确实会重复你给它的东西，而那正是
             // 还原要处理的情况
@@ -520,39 +543,56 @@ async fn hidden_characters_in_a_frame_refuse_it_before_the_upstream() {
     assert_eq!(source.as_deref(), Some("denied"));
 }
 
-/// 上游一帧一帧地回，超过输出长度的那一帧不发、连接切断。
+/// **输出长度按一次回答数**：超了只切掉那一次回答（替它发 `response.failed`、剩下的
+/// 帧不发），连接照常，下一次回答重新数。
 #[tokio::test]
-async fn an_answer_over_the_output_limit_cuts_the_connection() {
-    let (up, _seen) = start_upstream("verbatim").await;
+async fn the_output_limit_cuts_one_response_and_the_connection_goes_on() {
+    let (up, _seen) = start_upstream("responses").await;
     let (gw, _rx) = serve(guarded(
         up,
         Security {
             output_limit: tw_config::OutputLimitPolicy {
                 mode: SecurityMode::Enforce,
-                max_chars: 5,
+                max_chars: 6,
             },
             ..Default::default()
         },
     ))
     .await;
     let mut c = connect(gw).await;
-    // 上游原样回这一帧：一个 Responses 的正文增量，八个字符
-    let delta = serde_json::json!({
-        "type": "response.output_text.delta", "item_id": "i", "output_index": 0,
-        "content_index": 0, "delta": "abcdefgh"
-    });
-    c.send(tokio_tungstenite::tungstenite::Message::Text(
-        delta.to_string().into(),
-    ))
-    .await
-    .unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(3), c.next())
+    for n in 1..=2 {
+        c.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "response.create", "model": "gpt-5", "input": "hi"})
+                .to_string()
+                .into(),
+        ))
         .await
-        .expect("等回帧超时")
-        .unwrap()
-        .unwrap()
-        .into_text()
         .unwrap();
-    assert!(first.contains("output limit"), "{first}");
-    assert!(!first.contains("abcdefgh"), "{first}");
+        // 收到这次回答的帧，直到安静下来
+        let mut got: Vec<serde_json::Value> = Vec::new();
+        while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_millis(500), c.next()).await
+        {
+            got.push(serde_json::from_str(&m.into_text().unwrap()).unwrap());
+        }
+        let kinds: Vec<&str> = got.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "response.created",
+                "response.output_text.delta",
+                "response.failed"
+            ],
+            "第 {n} 次：{got:?}"
+        );
+        assert_eq!(got[1]["delta"], "abcd");
+        let failed = &got[2]["response"];
+        assert_eq!(failed["id"], format!("resp_{n}"), "要说是哪一次回答");
+        assert_eq!(failed["status"], "failed");
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("output limit")),
+            "{failed}"
+        );
+    }
 }

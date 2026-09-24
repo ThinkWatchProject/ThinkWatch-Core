@@ -511,6 +511,62 @@ async fn a_dangerous_call_in_a_gemini_json_array_stream_is_cut() {
         "命中之前的元素应该照常送到：{body}"
     );
     assert!(!body.contains("evil.sh"), "危险的调用送到了客户端：{body}");
+    assert_array_ends_in_error(&body, "我来装一下依赖。");
+}
+
+/// 被切断的 JSON 数组流**仍然是一个完整的数组**：前面的元素照发，最后一个是
+/// Gemini 形状的错误
+fn assert_array_ends_in_error(body: &str, first_text: &str) {
+    let arr: Vec<Value> = serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("不是完整的 JSON 数组（{e}）：{body}"));
+    assert!(arr.len() >= 2, "{body}");
+    assert_eq!(
+        arr[0]["candidates"][0]["content"]["parts"][0]["text"], first_text,
+        "{body}"
+    );
+    let last = arr.last().unwrap();
+    assert!(
+        last["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("[ThinkWatch]")),
+        "最后一个元素要是错误：{body}"
+    );
+    assert!(last["error"]["status"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn an_answer_over_the_output_limit_closes_a_gemini_json_array_with_an_error() {
+    let el = |t: &str| json!({"candidates": [{"content": {"role": "model", "parts": [{"text": t}]}, "index": 0}]});
+    let (up, _) = upstream(
+        200,
+        "application/json",
+        format!("[{},\r\n{},\r\n{}]", el("abcd"), el("efgh"), el("ijkl")),
+    )
+    .await;
+    let p = provider(up, Protocol::Gemini);
+    let (gw, _) = gateway_with(
+        p,
+        Security {
+            output_limit: tw_config::OutputLimitPolicy {
+                mode: SecurityMode::Enforce,
+                max_chars: 6,
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, ct, body) = post(
+        gw,
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        &[("x-goog-api-key", "tw-k")],
+        json!({"contents": [{"role": "user", "parts": [{"text": "说点什么"}]}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ct, "application/json");
+    assert!(!body.contains("efgh"), "越界那一个元素发出去了：{body}");
+    assert!(body.contains("output limit"), "{body}");
+    assert_array_ends_in_error(&body, "abcd");
 }
 
 #[tokio::test]
@@ -539,4 +595,6 @@ async fn a_dangerous_call_is_cut_in_a_converted_gemini_json_array_stream() {
     );
     assert!(!body.contains("evil.sh"), "危险的调用送到了客户端：{body}");
     assert!(body.contains("[ThinkWatch]"), "要说清楚是谁切断的：{body}");
+    // 转换出来的数组由转换器收尾，一样是完整的
+    assert_array_ends_in_error(&body, "我来装一下依赖。");
 }
