@@ -213,3 +213,79 @@ async fn an_external_edit_also_lands_in_history_so_it_can_be_undone() {
         "外部改动没进历史"
     );
 }
+
+/// 被拒是**现状**，不只是那一刻的事件：半路才连上的一方问得到；改好了就没有了
+#[tokio::test]
+async fn a_rejected_file_stays_visible_until_the_next_good_one() {
+    let (_d, mgr, bus) = setup();
+    let mut rx = bus.subscribe();
+    let _w = tw_control::spawn_watcher(mgr.clone()).unwrap();
+    assert!(mgr.rejected().is_none());
+
+    std::fs::write(
+        mgr.path(),
+        "version: 1\nclients:\n  - name: c\n    kye: tw-k\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        next_config_event(&mut rx).await,
+        tw_api::Event::ConfigRejected { .. }
+    ));
+    let r = mgr.rejected().expect("被拒要留着");
+    assert_eq!(r.stage, tw_api::ConfigStage::Schema);
+    assert_eq!(r.line, Some(4));
+
+    let good = format!("{BASE}providers: []\n");
+    std::fs::write(mgr.path(), &good).unwrap();
+    assert!(matches!(
+        next_config_event(&mut rx).await,
+        tw_api::Event::ConfigReloaded { .. }
+    ));
+    assert!(mgr.rejected().is_none(), "改好了就不该还挂着");
+}
+
+/// 写坏之后又原样改回在服务的那一版：文件内容和现状一致，**被拒那件事过去了**，
+/// 要说一声（不然界面上的那条一直挂着），也不该重载一遍
+#[tokio::test]
+async fn reverting_a_rejected_edit_clears_the_rejection() {
+    let (_d, mgr, bus) = setup();
+    let mut rx = bus.subscribe();
+    let _w = tw_control::spawn_watcher(mgr.clone()).unwrap();
+
+    std::fs::write(
+        mgr.path(),
+        "version: 1\nclients:\n  - name: c\n    kye: tw-k\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        next_config_event(&mut rx).await,
+        tw_api::Event::ConfigRejected { .. }
+    ));
+    std::fs::write(mgr.path(), BASE).unwrap();
+    match next_config_event(&mut rx).await {
+        tw_api::Event::ConfigReloaded {
+            origin, version, ..
+        } => {
+            assert_eq!(origin, tw_api::ConfigOrigin::External);
+            assert_eq!(version, mgr.current().unwrap().version());
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(mgr.rejected().is_none());
+}
+
+/// 界面自己写坏的根本没落盘：**不算现状**，保存那条路当场就报了
+#[tokio::test]
+async fn a_rejected_write_from_the_interface_is_not_a_standing_rejection() {
+    let (_d, mgr, _bus) = setup();
+    let e = mgr
+        .write(
+            "version: 1\nclients:\n  - name: c\n    kye: tw-k\n",
+            None,
+            Origin::Ui,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, ApplyError::Rejected(_)), "{e:?}");
+    assert!(mgr.rejected().is_none());
+}

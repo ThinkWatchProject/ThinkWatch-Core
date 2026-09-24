@@ -189,6 +189,9 @@ pub struct AppState {
     /// 忽略通知，包括那些真该看的。失败不一样：它要一直挂着，
     /// 而且从成功变成失败是**状态变了**，必须重新说。
     rotation_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 换发的凭据没能写回的那几家，和最后一次的原因。**是现状**：半路才连上的界面按它
+    /// 补上那条提醒（`ProviderView.writeback_failed`）；写回成功就清掉
+    writeback_failed: Arc<std::sync::Mutex<std::collections::HashMap<String, tw_types::Msg>>>,
     /// 已经报过「凭据失效」的上游。**只在失效的那一刻报一次**，恢复之后清掉
     expired_told: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// 已经报过「用完」的额度窗口：(上游, 窗口)。**窗口恢复之后清掉**，再用完会重新报
@@ -240,6 +243,7 @@ impl AppState {
             )),
             renewal_sink: Arc::new(std::sync::Mutex::new(None)),
             rotation_told: Arc::new(std::sync::Mutex::new(Default::default())),
+            writeback_failed: Arc::new(std::sync::Mutex::new(Default::default())),
             expired_told: Arc::new(std::sync::Mutex::new(Default::default())),
             exhausted: Arc::new(std::sync::Mutex::new(Default::default())),
             rejected: Arc::new(std::sync::Mutex::new(Default::default())),

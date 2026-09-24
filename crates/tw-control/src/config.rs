@@ -22,6 +22,9 @@ pub struct ConfigManager {
     /// 上一次**我们自己**写下去的样子。文件事件来了先和它比 ——
     /// 一样就是自己写的，直接忽略，否则会形成回环。
     seen: Mutex<Option<Fingerprint>>,
+    /// 磁盘上那份最近一次外部改动没通过校验（`Status.config_rejected`）。**是现状，不是
+    /// 那一刻**：半路才连上的界面按它补上那条提醒；换入成功就清掉
+    rejected: std::sync::Mutex<Option<tw_api::ConfigRejection>>,
 }
 
 /// 一次配置改动没成的原因。
@@ -86,6 +89,18 @@ impl ConfigManager {
             gateway,
             bus,
             seen: Mutex::new(seen),
+            rejected: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 磁盘上那份配置此刻是不是没通过校验、旧的还在服务
+    pub fn rejected(&self) -> Option<tw_api::ConfigRejection> {
+        self.rejected.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn set_rejected(&self, r: Option<tw_api::ConfigRejection>) {
+        if let Ok(mut g) = self.rejected.lock() {
+            *g = r;
         }
     }
 
@@ -110,6 +125,18 @@ impl ConfigManager {
             {
                 // **这是回环的唯一出口。**没有它，我们写一次文件，监听
                 // 响一次，我们再重载一次，严重时是个循环。
+                //
+                // 写坏之后又改回了在服务的那一版：文件和现状又对上了，被拒那件事
+                // 就过去了 —— 要说一声，否则界面上那条「未通过校验」一直挂着
+                if self.rejected().is_some() {
+                    self.set_rejected(None);
+                    self.bus.emit(tw_api::Event::ConfigReloaded {
+                        id: self.bus.next_id(),
+                        version: store::version_of(&loaded.text),
+                        origin: Origin::External.into(),
+                        at_ms: now_ms(),
+                    });
+                }
                 return Ok(None);
             }
         }
@@ -126,6 +153,17 @@ impl ConfigManager {
             // **先告诉界面，再返回错误。**这条路径最常见的调用方是文件
             // 监听，而它的错误没有人接 —— 不发事件的话，用户在编辑器里
             // 写错一个字，界面上什么都不会发生。
+            let at_ms = now_ms();
+            // 只有外部改动会留在盘上：界面自己写坏的根本没落盘
+            if origin == Origin::External {
+                self.set_rejected(Some(tw_api::ConfigRejection {
+                    stage: r.stage.into(),
+                    message: (*r.message).clone(),
+                    line: r.line,
+                    excerpt: r.excerpt.clone(),
+                    at_ms,
+                }));
+            }
             self.bus.emit(tw_api::Event::ConfigRejected {
                 id: self.bus.next_id(),
                 stage: r.stage.into(),
@@ -133,7 +171,7 @@ impl ConfigManager {
                 line: r.line,
                 excerpt: r.excerpt.clone(),
                 origin: origin.into(),
-                at_ms: now_ms(),
+                at_ms,
             });
             tracing::warn!(
                 "the configuration did not validate; staying on the previous version: {r}"
@@ -146,6 +184,7 @@ impl ConfigManager {
         // 存刚刚生效的这一版。加上写入路径在写之前存的那一次，去重
         // 之后的效果是「每个存在过的版本各一条」，最新那条就是现在跑
         // 着的 —— 于是「回到上一版」在列表上就是第二条，不用数。
+        self.set_rejected(None);
         let _ = tw_config::history::snapshot(&self.path, text, origin);
         let version = store::version_of(text);
         tracing::info!(%version, origin = origin.slug(), "the configuration is in effect");
