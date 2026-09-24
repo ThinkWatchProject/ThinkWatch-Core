@@ -1,0 +1,14 @@
+[package]
+name = "tw-breaker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The circuit-breaker state machine both gateways run: pure data and pure transitions, stored wherever the caller keeps it"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

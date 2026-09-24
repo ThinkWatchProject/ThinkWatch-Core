@@ -16,6 +16,7 @@ members = [
     "crates/tw-adopt",
     "crates/tw-scan",
     "crates/tw-guard",
+    "crates/tw-breaker",
     "crates/tw-dialect",
     "crates/tw-engine",
     "crates/tw-observe",
@@ -56,6 +57,7 @@ tw-pricing  = { path = "crates/tw-pricing" }
 tw-adopt    = { path = "crates/tw-adopt" }
 tw-scan     = { path = "crates/tw-scan" }
 tw-guard    = { path = "crates/tw-guard" }
+tw-breaker  = { path = "crates/tw-breaker" }
 tw-dialect  = { path = "crates/tw-dialect" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
