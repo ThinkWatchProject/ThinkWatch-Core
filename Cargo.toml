@@ -19,6 +19,7 @@ members = [
     "crates/tw-pricing",
     "crates/tw-adopt",
     "crates/tw-scan",
+    "crates/tw-watch",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
@@ -54,6 +55,7 @@ tw-store    = { path = "crates/tw-store" }
 tw-pricing  = { path = "crates/tw-pricing" }
 tw-adopt    = { path = "crates/tw-adopt" }
 tw-scan     = { path = "crates/tw-scan" }
+tw-watch    = { path = "crates/tw-watch" }
 tw-guard    = { path = "crates/tw-guard" }
 tw-breaker  = { path = "crates/tw-breaker" }
 tw-dialect  = { path = "crates/tw-dialect" }
@@ -70,7 +72,7 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
-# 文件监听。盯配置文件那一份
+# 文件监听，只有 tw-watch 直接用
 notify = "8"
 # 请求历史。bundled 是刻意的：零外部依赖，用户不必装 sqlite
 rusqlite = { version = "0.40", features = ["bundled"] }

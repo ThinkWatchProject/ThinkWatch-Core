@@ -93,3 +93,54 @@ async fn nothing_running_is_an_empty_list() {
     let (_d, _bus, router) = app();
     assert!(get(router).await.is_empty());
 }
+
+async fn live(router: axum::Router) -> serde_json::Value {
+    let resp = router
+        .oneshot(Request::get("/live").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// `/live`：菜单栏要的在跑的请求和生成速率，由 core 数好。
+#[tokio::test]
+async fn live_gives_the_running_requests_and_the_generation_rate() {
+    let (_d, bus, router) = app();
+    let idle = live(router.clone()).await;
+    assert_eq!(idle["running"], serde_json::json!([]));
+    // 这一分钟里没有跑完的：是空，不是 0
+    assert!(idle["tokens_per_sec"].is_null(), "{idle}");
+
+    bus.emit(started(1, "claude-sonnet-5"));
+    bus.emit(tw_api::Event::RequestHeaders {
+        id: 1,
+        status: 200,
+        ttfb_ms: 1_000,
+    });
+    bus.emit(tw_api::Event::RequestFinished {
+        id: 1,
+        model: "claude-sonnet-5".into(),
+        status: 200,
+        bytes: 10,
+        duration_ms: 3_000,
+        usage: Some(tw_api::UsageView {
+            output: 100,
+            ..Default::default()
+        }),
+    });
+    bus.emit(started(2, "gpt-5.5"));
+
+    let v = live(router).await;
+    assert_eq!(v["tokens_per_sec"], 50, "{v}");
+    assert_eq!(v["running"].as_array().unwrap().len(), 1);
+    let r = &v["running"][0];
+    assert_eq!(r["id"], 2);
+    assert_eq!(r["client"], "我");
+    assert_eq!(r["client_hint"], "claude-code");
+    assert_eq!(r["model"], "gpt-5.5");
+    assert_eq!(r["at_ms"], 1_002);
+}

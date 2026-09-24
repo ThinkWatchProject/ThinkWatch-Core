@@ -38,10 +38,10 @@ cargo run -p twcore -- serve    # 起网关和控制面
 ## crate 分层
 
 ```
-tw-dialect · tw-guard · tw-breaker                        ← 与服务端版本共用
-tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret   ← 领域逻辑
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe    ← 装配
-tw-gateway · tw-control                                   ← 数据面 / 控制面
+tw-dialect · tw-guard · tw-breaker                                   ← 与服务端版本共用
+tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret · tw-watch   ← 领域逻辑
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe               ← 装配
+tw-gateway · tw-control                                              ← 数据面 / 控制面
 ```
 
 服务端版本只依赖最上面一层：格式转换与用量解析（tw-dialect）、脱敏与工具调用
