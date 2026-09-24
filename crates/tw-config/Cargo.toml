@@ -25,7 +25,7 @@ serde_yaml_ng = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
-notify = { workspace = true }
+tw-watch = { workspace = true }
 # 网卡枚举：`bind` 认网卡名，要问系统它现在是哪个地址。
 # getifaddrs 一共不到五十行，不值得引第三方 crate
 libc = { workspace = true }

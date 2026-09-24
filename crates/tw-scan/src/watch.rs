@@ -16,9 +16,7 @@
 //! 监听的目录集合就是 [`crate::sources`] 划定的那一批，一个不多。无界的
 //! FSEvents 监听既是性能问题，也和「空闲时接近零」的目标冲突。
 //!
-//! **盯目录不盯文件**（和 tw-config 的监听同一条理由）：编辑器保存是
-//! 「写临时文件再 rename」，盯着文件的监听会在第一次保存之后永久失效，
-//! 而且不报任何错。
+//! **盯目录不盯文件、不递归、去抖**，和配置文件的监听是同一份（[`tw_watch`]）。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,19 +25,7 @@ use std::time::Duration;
 /// 聚合窗口。一次保存会触发好几个事件（建临时文件、rename、改属性）。
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 
-#[derive(Debug, thiserror::Error)]
-pub enum WatchError {
-    #[error("changes to {path} could not be watched: {source}")]
-    Start {
-        path: PathBuf,
-        source: notify::Error,
-    },
-}
-
-/// 一个活着的监听。**扔掉它就停止监听。**
-pub struct Watch {
-    _inner: notify::RecommendedWatcher,
-}
+pub use tw_watch::{Watch, WatchError};
 
 /// 要盯的目录集合。
 ///
@@ -78,64 +64,13 @@ fn interesting(p: &Path) -> bool {
         .is_some_and(|e| INTERESTING.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
-/// 盯住这些目录，聚合出的每一次改动发一个信号。
+/// 盯住这些目录，聚合出的每一次改动发一个信号（见 [`tw_watch::watch`]）。
 ///
-/// 发的是「有事发生了」而不是「文件现在长这样」：**读文件是调用方的
-/// 事** —— 事件到达时写入可能还没完成。
+/// **只有我们关心的那几种文件算数。这一条撑着「空闲接近零」** —— `$HOME` 在
+/// 监听集合里（`~/.claude.json` 的父目录就是它）。我们自己写的备份和旁文件也
+/// 不算：接管一次会触发一轮扫描，那一轮又什么都发现不了。
 pub fn watch(dirs: &[PathBuf]) -> Result<(Watch, tokio::sync::mpsc::Receiver<()>), WatchError> {
-    use notify::{EventKind, RecursiveMode, Watcher as _};
-
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<()>();
-
-    let mut w = notify::recommended_watcher(move |ev: notify::Result<notify::Event>| {
-        let Ok(ev) = ev else { return };
-        // 只关心内容和存在性。**访问时间之类的不算** —— 备份和索引工具
-        // 会大量产生它们，而那会让「空闲时接近零」变成一句空话。
-        if !matches!(
-            ev.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) {
-            return;
-        }
-        // 只有我们关心的那几种文件算数。**这一条撑着「空闲接近零」** ——
-        // `$HOME` 在监听集合里（`~/.claude.json` 的父目录就是它）。
-        //
-        // 我们自己写的备份和旁文件也不算：接管一次会触发一轮扫描，
-        // 那一轮又什么都发现不了。
-        if !ev.paths.iter().any(|p| interesting(p) && !is_ours(p)) {
-            return;
-        }
-        let _ = raw_tx.send(());
-    })
-    .map_err(|source| WatchError::Start {
-        path: PathBuf::new(),
-        source,
-    })?;
-
-    for d in dirs {
-        w.watch(d, RecursiveMode::NonRecursive)
-            .map_err(|source| WatchError::Start {
-                path: d.clone(),
-                source,
-            })?;
-    }
-
-    std::thread::spawn(move || {
-        while raw_rx.recv().is_ok() {
-            loop {
-                match raw_rx.recv_timeout(DEBOUNCE) {
-                    Ok(()) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            // 满了就丢：信号是「去看一眼」，堆积两个和一个是一回事
-            let _ = tx.try_send(());
-        }
-    });
-
-    Ok((Watch { _inner: w }, rx))
+    tw_watch::watch(dirs, DEBOUNCE, |p| interesting(p) && !is_ours(p))
 }
 
 /// 这个路径是我们自己写的吗。

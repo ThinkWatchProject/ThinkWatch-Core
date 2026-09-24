@@ -18,6 +18,8 @@ endpoints! {
     Events: GET "/events", () => api::Event, events;
     /// 此刻还没结束的请求，按开始事件的样子给
     InFlight: GET "/in-flight", () => Vec<api::Event>;
+    /// 此刻的实时读数：在跑的请求、最近一分钟的生成速率
+    Live: GET "/live", () => api::LiveView;
     Overview: GET "/overview", () => api::Overview;
     /// 连通性分段测速
     L1: POST "/l1", api::L1Request => Vec<api::L1Result>;

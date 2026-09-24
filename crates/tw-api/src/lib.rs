@@ -727,6 +727,36 @@ impl Event {
     }
 }
 
+/// 此刻的实时读数（`GET /live`）：在跑的请求，和最近跑完的请求生成得多快。
+///
+/// **按事件数出来的，core 里只数一份。**以前菜单栏自己听事件流、自己记在跑的和
+/// 跑完的：半路才开始听的那一段要拿 `/in-flight` 对账，丢过事件要重对，而这些
+/// core 的事件总线本来就在记。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LiveView {
+    /// 开始了、还没有结局的请求，开始得早的在前。和 `/in-flight` 是同一批
+    pub running: Vec<RunningView>,
+    /// 最近一分钟跑完的请求平均每秒生成多少 token：**每个请求的输出除以它生成用的
+    /// 时间**（总耗时减去首字节），按 token 加权。这一分钟里没有跑完的是空，不是 0
+    pub tokens_per_sec: Option<u32>,
+}
+
+/// 一个在跑的请求。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RunningView {
+    pub id: u64,
+    /// 网关密钥的名字
+    pub client: String,
+    /// 按请求头推测的应用。**可以伪造**，只用来显示
+    pub client_hint: Option<String>,
+    pub model: String,
+    /// 开始时的首选上游
+    pub provider: String,
+    pub at_ms: u64,
+}
+
 /// 界面要显示的配置概览。
 ///
 /// **不是配置文件本身**：密钥一律只给来源描述，不给值（统一脱敏）。

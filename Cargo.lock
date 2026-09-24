@@ -2442,7 +2442,6 @@ version = "0.42.0"
 dependencies = [
  "blake3",
  "libc",
- "notify",
  "rand 0.10.2",
  "regex",
  "serde",
@@ -2456,6 +2455,7 @@ dependencies = [
  "tw-pricing",
  "tw-secret",
  "tw-types",
+ "tw-watch",
  "tw-yaml",
  "windows-sys 0.61.2",
 ]
@@ -2604,19 +2604,18 @@ dependencies = [
 name = "tw-scan"
 version = "0.42.0"
 dependencies = [
- "notify",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
  "tw-adopt",
  "tw-config",
  "tw-guard",
  "tw-types",
+ "tw-watch",
 ]
 
 [[package]]
@@ -2650,6 +2649,16 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
+]
+
+[[package]]
+name = "tw-watch"
+version = "0.42.0"
+dependencies = [
+ "notify",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
