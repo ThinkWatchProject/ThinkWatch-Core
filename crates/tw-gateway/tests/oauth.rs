@@ -428,6 +428,11 @@ async fn without_a_config_manager_the_rotation_is_reported_as_not_persisted() {
     }
     // 事件里一个 token 都不能有
     assert!(!seen.iter().any(|s| s.2.text.contains("rt-")), "{seen:?}");
+    // **没写回是现状**：半路才连上的界面问得到（`ProviderView.writeback_failed`）
+    let now = state.writeback_failed("p").expect("没写回要留着");
+    assert!(now.text.contains("not written back"), "{now}");
+    state.report_rotation("p", true, seen[0].2.clone());
+    assert!(state.writeback_failed("p").is_none(), "写回成功就清掉");
 }
 
 /// 用户在 config.yaml 里换了 refresh token 之后，**缓存不能盖住这个修改**。

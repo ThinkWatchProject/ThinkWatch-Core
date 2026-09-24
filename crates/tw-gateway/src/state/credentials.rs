@@ -154,12 +154,27 @@ impl AppState {
         });
     }
 
+    /// 这一家换发的凭据没能写回的话，最后一次的原因（见 [`AppState::report_rotation`]）
+    pub fn writeback_failed(&self, provider: &str) -> Option<Msg> {
+        self.writeback_failed
+            .lock()
+            .ok()
+            .and_then(|g| g.get(provider).cloned())
+    }
+
     /// 凭据轮换的结果报给界面。
     ///
     /// **写成功也要报一次。**用户的 config.yaml 被我们改了 —— 哪怕改得
     /// 完全正确，不说一声也是不对的：他的编辑器会弹「文件已在磁盘上更改」，
     /// 而那时他应该已经知道原因。
     pub fn report_rotation(&self, provider: &str, persisted: bool, detail: Msg) {
+        if let Ok(mut g) = self.writeback_failed.lock() {
+            if persisted {
+                g.remove(provider);
+            } else {
+                g.insert(provider.to_string(), detail.clone());
+            }
+        }
         {
             let mut told = self.rotation_told.lock().expect("lock not poisoned");
             if persisted {
