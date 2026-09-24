@@ -1,4 +1,4 @@
-//! 数据面守卫：出站脱敏的接线。
+//! 数据面守卫：出站脱敏、请求防护（藏匿字符、内容过滤）和输出长度的接线。
 //!
 //! 规则本身住在 [`tw_guard::redact`] 里，这个文件只回答一个问题：**一个请求体该
 //! 怎么处理。**
@@ -65,6 +65,215 @@ pub fn items(found: &[Finding]) -> Vec<tw_api::SecretItem> {
             count: f.count,
         })
         .collect()
+}
+
+/// 请求防护此刻的档位和规则：藏匿字符和内容过滤。
+///
+/// **HTTP 和 WebSocket 两条路共用**（见 [`screen`]）。升级那一刻取一次，一条连接
+/// 活多久就按它开始时的配置走多久。
+#[derive(Clone)]
+pub struct Screen {
+    pub hidden_mode: Mode,
+    pub hidden: Vec<tw_guard::hidden::Kind>,
+    pub content_mode: Mode,
+    pub content: std::sync::Arc<tw_guard::content::Rules>,
+}
+
+impl Screen {
+    pub fn of(rt: &crate::state::Runtime) -> Self {
+        let sec = &rt.config.security;
+        Self {
+            hidden_mode: sec.hidden_text.mode,
+            hidden: rt.hidden.clone(),
+            content_mode: sec.content.mode,
+            content: rt.content.clone(),
+        }
+    }
+}
+
+/// 看一遍调用方发来的正文（连同工具结果）：藏匿字符、内容规则。
+///
+/// **两项都看完、都报完再下结论** —— 一个请求既藏了字符又命中了规则，日志里两件
+/// 事都该在。拦截档下该拒的话返回给客户端的那句话；藏匿字符排在前面，它几乎不会
+/// 误报。
+pub fn screen(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    s: &Screen,
+    request: &tw_dialect::ir::Request,
+) -> Option<tw_types::Msg> {
+    let hidden = if s.hidden_mode.detects() {
+        tw_guard::hidden::scan_request(request, &s.hidden)
+    } else {
+        Vec::new()
+    };
+    let mut refusal = hidden_found(bus, id, provider, s.hidden_mode, &hidden);
+    if s.content_mode.detects() && !s.content.is_empty() {
+        let hits = s.content.scan_request(request);
+        let refused = content_matched(bus, id, provider, s.content_mode, &hits);
+        refusal = refusal.or(refused);
+    }
+    refusal
+}
+
+/// 没法按消息结构读的正文（解不开的 WebSocket 帧）：**只查藏匿字符** —— 它在任何
+/// 地方都没有正当用途；内容规则按整段原文查的话，系统提示里的话也会被当成调用方的。
+pub fn screen_text(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    s: &Screen,
+    text: &str,
+) -> Option<tw_types::Msg> {
+    if !s.hidden_mode.detects() {
+        return None;
+    }
+    let mut found = Vec::new();
+    tw_guard::hidden::scan_smuggled(text, false, &s.hidden, &mut found);
+    hidden_found(bus, id, provider, s.hidden_mode, &found)
+}
+
+fn hidden_found(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    mode: Mode,
+    found: &[tw_guard::hidden::Smuggled],
+) -> Option<tw_types::Msg> {
+    if found.is_empty() {
+        return None;
+    }
+    let blocked = mode.acts();
+    tracing::warn!(
+        provider,
+        blocked,
+        kinds = ?found.iter().map(|f| f.kind.slug()).collect::<Vec<_>>(),
+        "the request carries invisible characters"
+    );
+    bus.emit(tw_api::Event::HiddenTextFound {
+        id,
+        provider: provider.to_string(),
+        blocked,
+        items: found
+            .iter()
+            .map(|f| tw_api::HiddenItem {
+                kind: f.kind.slug().to_string(),
+                in_tool_result: f.in_tool_result,
+                count: f.count as u64,
+                example: f.example.clone(),
+                revealed: f.revealed.clone(),
+            })
+            .collect(),
+        at_ms: crate::server::now_ms(),
+    });
+    if !blocked {
+        return None;
+    }
+    let mut kinds: Vec<&str> = found.iter().map(|f| f.kind.slug()).collect();
+    kinds.dedup();
+    let kinds = kinds.join(", ");
+    // 在工具结果里和在调用方自己打的字里，是两句话：前者要去查是哪个工具抓回来的
+    Some(if found.iter().any(|f| f.in_tool_result) {
+        tw_types::msg!(
+            "gw.hidden_text.refused_tool_result", kinds = kinds =>
+            "A tool result in this request contains invisible characters that can hide \
+             instructions from a reader ({kinds}), so the request was not sent."
+        )
+    } else {
+        tw_types::msg!(
+            "gw.hidden_text.refused_message", kinds = kinds =>
+            "The message contains invisible characters that can hide instructions from a \
+             reader ({kinds}), so the request was not sent."
+        )
+    })
+}
+
+fn content_matched(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    mode: Mode,
+    hits: &[tw_guard::content::Hit],
+) -> Option<tw_types::Msg> {
+    use tw_guard::content::Action;
+    let worst = tw_guard::content::worst(hits)?;
+    // 规则是拦 + 拦截档 = 拒
+    let refuse = mode.acts() && worst.action == Action::Block;
+    for h in hits {
+        let blocking = h.action == Action::Block;
+        bus.emit(tw_api::Event::ContentMatched {
+            id,
+            provider: provider.to_string(),
+            rule: h.rule.clone(),
+            custom: h.custom,
+            action: if blocking { "block" } else { "record" }.to_string(),
+            blocked: refuse && blocking,
+            in_tool_result: h.in_tool_result,
+            excerpt: h.snippet.clone(),
+            at_ms: crate::server::now_ms(),
+        });
+    }
+    // 命中的原文是调用方的正文，**不进应用日志**：日志只说哪条规则
+    tracing::info!(
+        provider,
+        refused = refuse,
+        rules = ?hits.iter().map(|h| h.rule.as_str()).collect::<Vec<_>>(),
+        "the request matched content rules"
+    );
+    refuse.then(|| {
+        tw_types::msg!(
+            "gw.content.refused",
+            rule = worst.rule.clone(), name = worst.name.clone(), excerpt = worst.snippet.clone() =>
+            "Content rule “{name}” matched this request (“{excerpt}”), so it was not sent."
+        )
+    })
+}
+
+/// 回答超过了输出长度：报一条，拦截档下给出切断时告诉客户端的那句话。
+///
+/// `whole`：整包（整份没发）还是流（从那一帧起没发）—— 两句话。
+pub fn output_limited(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    mode: Mode,
+    max: usize,
+    seen: usize,
+    whole: bool,
+) -> Option<tw_types::Msg> {
+    let cut = mode.acts();
+    tracing::warn!(
+        provider,
+        max,
+        seen,
+        cut,
+        "the answer passed the output limit"
+    );
+    bus.emit(tw_api::Event::OutputLimited {
+        id,
+        provider: provider.to_string(),
+        max_chars: max as u64,
+        seen_chars: seen as u64,
+        cut,
+        at_ms: crate::server::now_ms(),
+    });
+    if !cut {
+        return None;
+    }
+    Some(if whole {
+        tw_types::msg!(
+            "gw.output_limit.withheld", upstream = provider.to_string(), max = max, seen = seen =>
+            "The answer from upstream `{upstream}` is {seen} characters, over the output limit of \
+             {max}, so it was withheld."
+        )
+    } else {
+        tw_types::msg!(
+            "gw.output_limit.cut", upstream = provider.to_string(), max = max =>
+            "The answer from upstream `{upstream}` passed the output limit of {max} characters, \
+             so it was cut off."
+        )
+    })
 }
 
 #[cfg(test)]

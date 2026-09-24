@@ -766,7 +766,7 @@ impl Db {
         Ok(out)
     }
 
-    /// 一段时间里两项防护各留下了几条记录。**和日志数的是同一批。**
+    /// 一段时间里各项防护各留下了几条记录。**和日志数的是同一批。**
     pub fn security_counts(
         &self,
         since_ms: i64,
@@ -777,7 +777,13 @@ impl Db {
                 COALESCE(SUM(guard = 'redact'), 0),
                 COALESCE(SUM(guard = 'redact' AND action = 'replaced'), 0),
                 COALESCE(SUM(guard = 'inspect_tools'), 0),
-                COALESCE(SUM(guard = 'inspect_tools' AND action = 'cut'), 0)
+                COALESCE(SUM(guard = 'inspect_tools' AND action = 'cut'), 0),
+                COALESCE(SUM(guard = 'hidden_text'), 0),
+                COALESCE(SUM(guard = 'hidden_text' AND action = 'blocked'), 0),
+                COALESCE(SUM(guard = 'content'), 0),
+                COALESCE(SUM(guard = 'content' AND action = 'blocked'), 0),
+                COALESCE(SUM(guard = 'output_limit'), 0),
+                COALESCE(SUM(guard = 'output_limit' AND action = 'cut'), 0)
              FROM security_events WHERE at_ms >= ?1 AND at_ms < ?2",
             params![since_ms, until_ms],
             |r| {
@@ -786,6 +792,12 @@ impl Db {
                     secrets_replaced: r.get(1)?,
                     tool_calls: r.get(2)?,
                     tool_calls_cut: r.get(3)?,
+                    hidden_text: r.get(4)?,
+                    hidden_text_blocked: r.get(5)?,
+                    content: r.get(6)?,
+                    content_blocked: r.get(7)?,
+                    output_limit: r.get(8)?,
+                    output_limit_cut: r.get(9)?,
                 })
             },
         )?)
@@ -1076,12 +1088,12 @@ pub struct Summary {
 pub struct SecurityEvent {
     pub at_ms: i64,
     pub request_id: i64,
-    /// `redact` / `inspect_tools`
+    /// `redact` / `inspect_tools` / `hidden_text` / `content` / `output_limit`
     pub guard: String,
     /// 内置规则的 id，或者自定义规则的名字
     pub rule: String,
     pub custom: bool,
-    /// `recorded` / `replaced` / `cut`
+    /// `recorded` / `replaced` / `cut` / `blocked`
     pub action: String,
     pub provider: String,
     pub client: String,

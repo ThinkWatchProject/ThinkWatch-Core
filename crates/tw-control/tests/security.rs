@@ -1,4 +1,4 @@
-//! 两项防护的接口：规则列得出来、关得掉、能写自己的；测试和日志。
+//! 各项防护的接口：规则列得出来、关得掉、能写自己的；测试和日志。
 //!
 //! 断言落在**配置文件本身**上：写进去的是不是只有和出厂不一样的那几处、
 //! 写坏的正则有没有当场拒绝。测试接口的结论要和网关一致，所以改完规则之后
@@ -433,7 +433,7 @@ async fn a_built_in_rule_s_action_is_written_only_while_it_differs_from_the_fact
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "security.no_action");
+    assert_eq!(v["code"], "security.no_action_of_its_own");
 
     let (st, v) = call(
         &b.app,
@@ -702,4 +702,299 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     assert_eq!(v["row"]["security"].as_array().unwrap().len(), 2, "{v}");
     let (_, v) = call(&b.app, "GET", "/history?limit=10", serde_json::Value::Null).await;
     assert_eq!(v[0]["security"].as_array().unwrap().len(), 2, "{v}");
+}
+
+// ─────────────────────────────────────────────────────────── 藏匿字符、内容过滤、输出长度
+
+#[tokio::test]
+async fn the_three_newer_guards_are_listed_with_their_defaults() {
+    let b = bed(BASE);
+    let (st, v) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["hidden_text"]["mode"], "observe");
+    assert_eq!(v["content"]["mode"], "observe");
+    assert_eq!(v["output_limit"]["mode"], "off", "输出长度出厂是关的");
+    assert_eq!(v["output_limit"]["max_chars"], 100_000);
+    assert_eq!(v["output_limit"]["ceiling"], 1_000_000);
+
+    let tag = rule(&v, "hidden_text", "tag");
+    assert_eq!(tag["matcher"]["kind"], "codepoints");
+    assert_eq!(tag["matcher"]["ranges"][0], "U+E0000–U+E007F");
+    assert_eq!(tag["enabled"], true);
+
+    let ignore = rule(&v, "content", "ignore-previous-instructions");
+    assert_eq!(ignore["enabled"], true);
+    assert_eq!(ignore["matcher"]["kind"], "contains");
+    assert_eq!(ignore["action"], "block");
+    assert_eq!(ignore["kind"], "injection");
+    let act_as = rule(&v, "content", "act-as");
+    assert_eq!(act_as["enabled"], false, "出厂关着");
+    assert_eq!(act_as["action"], "record");
+    assert_eq!(
+        rule(&v, "content", "base64-wall")["matcher"]["kind"],
+        "regex"
+    );
+
+    // 概览里也带上了三项的档位
+    let (_, o) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(o["security"]["hidden_text"], "observe", "{}", o["security"]);
+    assert_eq!(o["security"]["output_limit"], "off");
+}
+
+#[tokio::test]
+async fn content_rules_are_switched_retuned_and_written_like_the_others() {
+    let b = bed(BASE);
+    let before = b.file();
+    for (path, body) in [
+        (
+            "/security/content/builtin/act-as",
+            json!({ "enabled": true }),
+        ),
+        (
+            "/security/content/builtin/ignore-all-previous",
+            json!({ "enabled": false }),
+        ),
+        (
+            "/security/content/builtin/jailbreak/action",
+            json!({ "action": "record" }),
+        ),
+        (
+            "/security/hidden_text/builtin/bidi",
+            json!({ "enabled": false }),
+        ),
+    ] {
+        let (st, v) = call(&b.app, "PUT", path, body).await;
+        assert_eq!(st, StatusCode::OK, "{path}: {v}");
+    }
+    let c = b.parsed().security;
+    assert_eq!(c.content.enable, ["act-as"]);
+    assert_eq!(c.content.disable, ["ignore-all-previous"]);
+    assert_eq!(
+        c.content.actions.get("jailbreak"),
+        Some(&tw_config::ContentAction::Record)
+    );
+    assert_eq!(c.hidden_text.disable, ["bidi"]);
+
+    // 按改过的试：act-as 开了，而且只记
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/test",
+        json!({ "sample": "Please act as my lawyer" }),
+    )
+    .await;
+    assert_eq!(v["hits"][0]["rule"], "act-as", "{v}");
+    assert_eq!(v["hits"][0]["action"], "record");
+    assert_eq!(v["hits"][0]["start"], 7);
+
+    // 都改回出厂：文件一个字节都不差
+    for (path, body) in [
+        (
+            "/security/content/builtin/act-as",
+            json!({ "enabled": false }),
+        ),
+        (
+            "/security/content/builtin/ignore-all-previous",
+            json!({ "enabled": true }),
+        ),
+        (
+            "/security/content/builtin/jailbreak/action",
+            json!({ "action": "block" }),
+        ),
+        (
+            "/security/hidden_text/builtin/bidi",
+            json!({ "enabled": true }),
+        ),
+    ] {
+        let (st, v) = call(&b.app, "PUT", path, body).await;
+        assert_eq!(st, StatusCode::OK, "{path}: {v}");
+    }
+    assert_eq!(b.file(), before);
+
+    // 内容规则的处置是 block / record，不是 cut
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/builtin/jailbreak/action",
+        json!({ "action": "cut" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.unknown_content_action");
+    // 藏匿字符只有那两种
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/security/hidden_text/builtin/zero_width",
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_custom_content_rule_says_how_it_matches_and_a_keyword_is_not_a_regex() {
+    let b = bed(BASE);
+    // 子串里的括号是字面的
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/custom",
+        json!({ "name": "函数名", "pattern": "launch(", "action": "block" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/custom",
+        json!({ "name": "内部单号", "pattern": "TKT-\\d{6}", "match": "regex" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let c = b.parsed().security.content.custom;
+    assert_eq!(c[0].matching, tw_config::ContentMatch::Contains);
+    assert_eq!(c[0].action, tw_config::ContentAction::Block);
+    assert_eq!(c[1].matching, tw_config::ContentMatch::Regex);
+    assert_eq!(
+        c[1].action,
+        tw_config::ContentAction::Record,
+        "不写就是只记"
+    );
+    // 默认值不写进文件
+    assert!(!b.file().contains("match: contains"), "{}", b.file());
+
+    let (_, v) = call(&b.app, "GET", "/security", serde_json::Value::Null).await;
+    assert_eq!(rule(&v, "content", "函数名")["matcher"]["kind"], "contains");
+    assert_eq!(rule(&v, "content", "内部单号")["matcher"]["kind"], "regex");
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/content/custom",
+        json!({ "name": "坏的", "pattern": "launch(", "match": "regex" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.bad_content_pattern");
+    // 没有自定义规则的那两项
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/hidden_text/custom",
+        json!({ "name": "x", "pattern": "y" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.no_custom_rules");
+}
+
+#[tokio::test]
+async fn the_output_limit_is_switched_on_and_its_number_written_only_when_it_differs() {
+    let b = bed(BASE);
+    let before = b.file();
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/output_limit/mode",
+        json!({ "mode": "enforce" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/output_limit/limit",
+        json!({ "max_chars": 20000 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let o = b.parsed().security.output_limit;
+    assert_eq!(o.mode, tw_config::SecurityMode::Enforce);
+    assert_eq!(o.max_chars, 20000);
+
+    for bad in [0, 1_000_001] {
+        let (st, v) = call(
+            &b.app,
+            "PUT",
+            "/security/output_limit/limit",
+            json!({ "max_chars": bad }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "security.limit_range");
+    }
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/content/limit",
+        json!({ "max_chars": 5 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "security.no_limit");
+
+    // 回到出厂：关掉、数字回到默认，两行都删
+    call(
+        &b.app,
+        "PUT",
+        "/security/output_limit/mode",
+        json!({ "mode": "off" }),
+    )
+    .await;
+    call(
+        &b.app,
+        "PUT",
+        "/security/output_limit/limit",
+        json!({ "max_chars": 100000 }),
+    )
+    .await;
+    assert_eq!(b.file(), before);
+}
+
+#[tokio::test]
+async fn trying_hidden_characters_marks_each_one() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/hidden_text/test",
+        json!({ "sample": "中文\u{202E}ab\u{E0041}" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let hits = v["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{v}");
+    assert_eq!(hits[0]["rule"], "bidi");
+    assert_eq!(hits[0]["start"], 2);
+    assert_eq!(hits[0]["excerpt"], "U+202E");
+    // U+E0041 在 JavaScript 里是两个码元
+    assert_eq!(hits[1]["rule"], "tag");
+    assert_eq!(
+        (hits[1]["start"].as_u64(), hits[1]["end"].as_u64()),
+        (Some(5), Some(7))
+    );
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/security/output_limit/test",
+        json!({ "sample": "x" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+}
+
+#[tokio::test]
+async fn an_unknown_guard_names_all_five() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/security/firewall/mode",
+        json!({ "mode": "off" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["code"], "security.guard_unknown");
 }
