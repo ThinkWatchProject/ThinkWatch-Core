@@ -189,12 +189,14 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
     }
     assert_eq!(b.file(), before);
 
-    // 写法本身不对的，按配置文件的那套规则说
+    // 写法本身不对的，按配置文件的那套规则说。**带控制字符的在两个平台上
+    // 都不是网卡名**（Windows 的网卡名什么可见字符都可能有，`@` 挡不住它；
+    // 首尾的空白又会先被 trim 掉）
     let (st, v) = call(
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "192.168.1.5@wifi", "port": free_port(), "allow_from": [] }),
+        serde_json::json!({ "bind": "192.168.1.5\twifi", "port": free_port(), "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");

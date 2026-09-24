@@ -407,17 +407,37 @@ impl std::fmt::Display for Bind {
 
 /// 看起来像不像一个网卡名。
 ///
-/// **只判形状，不问系统。**Linux 的 `IFNAMSIZ` 是 16，BSD 一系更短；
-/// 名字里出现的是字母数字加 `.` `-` `_`（`en0`、`utun3`、`br-a1b2`、
-/// `enp0s31f6`）。够宽松，能收下没见过的命名法。**它拦不住把 `loopback`
-/// 拼成 `lookback`** —— 那照样是个合法形状，会被当成网卡名收下，到启动
-/// 时才发现。所以 [`BindError::NoSuchNic`] 要把真有哪些网卡说出来。
+/// **只判形状，不问系统。**它拦不住把 `loopback` 拼成 `lookback` —— 那照样
+/// 是个合法形状，会被当成网卡名收下，到启动时才发现。所以
+/// [`BindError::NoSuchNic`] 要把真有哪些网卡说出来。
 fn looks_like_nic(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() < 16
-        && s.starts_with(|c: char| c.is_ascii_alphabetic())
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    nic_shape(cfg!(windows), s)
+}
+
+/// 两个平台的网卡名**不是同一种东西**，所以形状各判各的。
+///
+/// - unix：内核给的短名。Linux 的 `IFNAMSIZ` 是 16，BSD 一系更短；字母数字加
+///   `.` `-` `_`（`en0`、`utun3`、`br-a1b2`、`enp0s31f6`）。
+/// - Windows：我们用的是网卡的显示名（见 `nics.rs`，那里特意没用 GUID），
+///   也就是用户在「网络连接」里看到、能改的那个：`以太网`、`WLAN 2`、
+///   `vEthernet (Default Switch)`。中文、空格、括号都是常态，按 unix 那套
+///   判，这台机器上的每一张网卡都选不了。这边只挡明显不是名字的：空的、
+///   首尾带空白的、带控制字符的、长得离谱的（系统上限是 256 个字符）。
+///
+/// **是个参数，不是就地一个 `cfg!`**：两套规则在任何一台机器上都测得到。
+fn nic_shape(windows: bool, s: &str) -> bool {
+    if windows {
+        !s.is_empty()
+            && s.chars().count() <= 256
+            && s.trim() == s
+            && !s.chars().any(char::is_control)
+    } else {
+        !s.is_empty()
+            && s.len() < 16
+            && s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    }
 }
 
 impl Serialize for Bind {
@@ -1185,6 +1205,62 @@ providers:
         assert!(e.contains(&lo.name), "没把机器上真有的网卡说出来：{e}");
     }
 
+    /// Windows 上的网卡名是显示名：中文、空格、括号都是常态。按 unix 那套
+    /// 判的话，一台中文 Windows 上的每一张网卡都选不了 —— 真机上就是这么发现的。
+    #[test]
+    fn windows_interface_names_are_display_names() {
+        for name in ["以太网", "WLAN 2", "vEthernet (Default Switch)", "Wi-Fi"] {
+            assert!(nic_shape(true, name), "{name}");
+        }
+        for bad in ["", " 以太网", "以太网 ", "a\nb"] {
+            assert!(!nic_shape(true, bad), "{bad:?}");
+        }
+        // unix 那边还是原来那套：内核给的短名
+        for name in ["en0", "utun3", "br-a1b2", "enp0s31f6"] {
+            assert!(nic_shape(false, name), "{name}");
+        }
+        for bad in [
+            "以太网",
+            "WLAN 2",
+            "vEthernet (Default Switch)",
+            "0en",
+            "abcdefghijklmnop",
+        ] {
+            assert!(!nic_shape(false, bad), "{bad}");
+        }
+    }
+
+    /// 这样的名字写进配置、再读回来还是它自己 —— 空格、括号、中文都要
+    /// 过得了 YAML 那一关。写配置的是 `edit::set`（界面保存走的那一条）。
+    /// 写和读在哪都测；读成网卡名只在 Windows 上成立。
+    #[test]
+    fn a_windows_interface_name_survives_the_config_file() {
+        let at = [
+            tw_yaml::Step::key("listen"),
+            tw_yaml::Step::key("gateway"),
+            tw_yaml::Step::key("bind"),
+        ];
+        for name in ["以太网", "vEthernet (Default Switch)", "WLAN 2"] {
+            let text = edit::set(
+                "version: 1\n",
+                &at,
+                Some(&serde_yaml_ng::Value::String(name.to_string())),
+            )
+            .unwrap();
+            let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
+            let raw = cfg["listen"]["gateway"]["bind"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(raw, name, "写进去再读回来变了样：{text}");
+            if cfg!(windows) {
+                let b: Bind =
+                    serde_yaml_ng::from_value(cfg["listen"]["gateway"]["bind"].clone()).unwrap();
+                assert_eq!(b, Bind::Nic(name.to_string()), "{text}");
+            }
+        }
+    }
+
     #[test]
     fn every_bind_form_round_trips_through_yaml() {
         for raw in ["loopback", "all", "en0", "192.168.1.5", "::1"] {
@@ -1197,9 +1273,10 @@ providers:
     #[test]
     fn a_bind_typo_says_what_the_forms_are() {
         // 这个字段写错的后果是整份配置加载失败、网关起不来 ——
-        // 那条错误必须自带答案。**「@」不是网卡名的合法字符**，所以它
-        // 走不到「当成网卡名收下」那条路上
-        let e = serde_yaml_ng::from_str::<Bind>("192.168.1.5@wifi")
+        // 那条错误必须自带答案。**开头带空格的在两个平台上都不是网卡名**，
+        // 所以它走不到「当成网卡名收下」那条路上（Windows 的网卡名什么字符
+        // 都可能有，`@` 挡不住它）
+        let e = serde_yaml_ng::from_str::<Bind>("\" 192.168.1.5@wifi\"")
             .unwrap_err()
             .to_string();
         assert!(e.contains("loopback"), "{e}");
@@ -1207,7 +1284,7 @@ providers:
         assert!(e.contains("en0"), "{e}");
         assert!(e.contains("192.168.1.5"), "{e}");
         assert!(
-            e.contains("192.168.1.5@wifi"),
+            e.contains(" 192.168.1.5@wifi"),
             "没把写错的那个词说出来：{e}"
         );
     }
