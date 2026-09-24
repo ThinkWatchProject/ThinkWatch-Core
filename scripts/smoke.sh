@@ -54,6 +54,12 @@ trap cleanup EXIT
 cat > "$TMP/upstream.py" <<'PY'
 import http.server, json, sys, time
 class H(http.server.BaseHTTPRequestHandler):
+    # **关掉 Nagle。**这个处理器先写响应头、再单独写正文，两次小写。开着
+    # Nagle 的话，正文要等对端确认了响应头才发；而 core 用的是池里的旧
+    # 连接，Linux 在旧连接上会把确认攒 40ms 再发 —— 于是每条请求平白多出
+    # 40ms，下面那条「转发的额外延迟」在 Linux 上就这么红过。真正的上游
+    # 不会这样一次响应拆成两段小写，这是假上游自己的毛病。
+    disable_nagle_algorithm = True
     # **默认是 HTTP/1.0，每条响应之后关连接。**core 那边是带连接池的
     # 客户端，会拿一条它以为还活着的连接去发下一个请求。配上 1.1 才是
     # 这个假上游该模拟的形状。
