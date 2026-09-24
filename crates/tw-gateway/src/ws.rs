@@ -15,7 +15,8 @@
 //!
 //! - 客户端 → 上游：请求防护（藏匿字符、内容过滤）和出站脱敏，和普通请求同一套
 //!   函数、同一份全局规则 —— 观察档记录，拦截档拒绝或替换；
-//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查和输出长度。
+//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查和输出长度。输出长度按
+//!   一次回答数，超了只切掉那一次回答（替它发 `response.failed`），连接照常。
 //!
 //! # 两条明说的边界
 //!
@@ -121,10 +122,16 @@ struct Pipes {
     ledger: tw_guard::redact::replace::Ledger,
     /// 工具调用审查关着的时候没有它
     wall: Option<tw_guard::tools::wall::Wall>,
-    /// 输出长度。**整条连接一个**：一条连接上是一次次的回答，数的是这条连接上
-    /// 模型一共说了多少 —— 按回答分开数要认得每一次回答的边界，而 WS 上的帧形状
-    /// 没有实测过（见 [`as_sse`]）
+    /// 输出长度。**一次回答一个**：Responses 的 WS 上一条连接依次跑好几次回答，
+    /// 每次从 `response.created` 开始，到 `response.completed` / `failed` /
+    /// `incomplete` 结束，一次只有一个在跑。每个 `response.created` 换一个新的
     meter: Option<tw_guard::output::Meter>,
+    /// 正在跑的那次回答的 id（`response.created` 里的）。切断时的
+    /// `response.failed` 要说是哪一次
+    response: Option<String>,
+    /// 这次回答超了输出长度、已经替它发过 `response.failed`：它剩下的帧（包括上游
+    /// 自己的收尾）一帧都不再发，下一次回答照常
+    dropping: bool,
     rules: Rules,
     provider: String,
     id: u64,
@@ -190,6 +197,8 @@ pub async fn proxy(
             .limit_mode
             .detects()
             .then(|| tw_guard::output::Meter::sse(rules.limit, tw_dialect::ir::Dialect::Responses)),
+        response: None,
+        dropping: false,
         rules,
         provider: upstream.provider.name,
         id,
@@ -399,6 +408,26 @@ async fn pump(
                 let out = match m {
                     UpMsg::Text(t) => {
                         let restored = tw_guard::redact::replace::restore(t.as_str(), &p.ledger);
+                        // 回答的边界：一次新的回答重新数；被切掉的那次剩下的帧不发
+                        let kind = frame_kind(&restored);
+                        if kind.as_deref() == Some("response.created") {
+                            p.response = response_id(&restored);
+                            p.dropping = false;
+                            if p.rules.limit_mode.detects() {
+                                p.meter = Some(tw_guard::output::Meter::sse(
+                                    p.rules.limit,
+                                    tw_dialect::ir::Dialect::Responses,
+                                ));
+                            }
+                        } else if p.dropping {
+                            if matches!(
+                                kind.as_deref(),
+                                Some("response.completed" | "response.failed" | "response.incomplete")
+                            ) {
+                                p.dropping = false;
+                            }
+                            continue;
+                        }
                         let hits = match p.wall.as_mut() {
                             Some(w) => w.feed(as_sse(&restored).as_bytes()),
                             None => Vec::new(),
@@ -443,10 +472,15 @@ async fn pump(
                                 false,
                             )
                         {
-                            let _ = c_tx.send(Message::Text(
-                                format!("[ThinkWatch] {}", why.text).into(),
-                            )).await;
-                            break End::Cut(why);
+                            // **切掉的是这一次回答，不是整条连接**：替它发一个
+                            // `response.failed`，这次回答剩下的帧不再发，客户端
+                            // 可以在同一条连接上接着发下一次请求
+                            let failed = failed_frame(why, p.response.as_deref());
+                            p.dropping = true;
+                            if c_tx.send(Message::Text(failed.into())).await.is_err() {
+                                break End::Closed;
+                            }
+                            continue;
                         }
                         ending.count(restored.len());
                         Message::Text(restored.into())
@@ -496,6 +530,35 @@ fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Option<Msg> {
         Some(d) => crate::guard::screen(&state.bus, p.id, &p.provider, s, &d.request),
         None => crate::guard::screen_text(&state.bus, p.id, &p.provider, s, text),
     }
+}
+
+/// 一帧的 `type`：Responses 的事件都带着它（`response.created` …）。不是 JSON 的是 None
+fn frame_kind(frame: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    v.get("type")?.as_str().map(str::to_string)
+}
+
+/// `response.created` 里那次回答的 id
+fn response_id(frame: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    v.pointer("/response/id")?.as_str().map(str::to_string)
+}
+
+/// 替被切掉的那次回答发的 `response.failed`：和 SSE 那条路同一个形状
+/// （`tw_dialect` 的错误帧），id 换成这次回答的
+fn failed_frame(why: Msg, response: Option<&str>) -> String {
+    let sse = crate::error::GatewayError::denied(why)
+        .in_dialect(tw_dialect::ir::Dialect::Responses)
+        .sse_frame();
+    let Some(mut v) = tw_dialect::frame::parse(sse.as_bytes())
+        .and_then(|f| serde_json::from_str::<serde_json::Value>(&f.data).ok())
+    else {
+        return sse;
+    };
+    if let Some(id) = response {
+        v["response"]["id"] = serde_json::Value::String(id.to_string());
+    }
+    v.to_string()
 }
 
 /// 把一帧喂成工具墙认得的样子。

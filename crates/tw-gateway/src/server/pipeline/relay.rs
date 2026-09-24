@@ -109,6 +109,7 @@ pub(super) fn respond(
                     // 把还原后的存进去会让那一页说谎。
                     ending.feed(&chunk);
                     let (out, cut) = relay.chunk(&chunk);
+                    relay.sent(&out);
                     if !out.is_empty() {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
                     }
@@ -312,6 +313,10 @@ struct Relay {
     meter: Option<tw_guard::output::Meter>,
     /// 客户端收到的格式：输出长度按它读
     client_dialect: tw_dialect::ir::Dialect,
+    /// 直通的 JSON 数组流发到哪儿了：开头的 `[` 发了没有、之后有没有发过元素。
+    /// **切断时要把数组收好**（见 [`Relay::error_tail`]）
+    array_opened: bool,
+    array_element: bool,
     bus: tw_observe::EventBus,
     id: u64,
     provider: String,
@@ -389,6 +394,8 @@ impl Relay {
             limit_mode,
             meter,
             client_dialect,
+            array_opened: false,
+            array_element: false,
             bus: state.bus.clone(),
             id,
             provider: provider.name.clone(),
@@ -594,6 +601,24 @@ impl Relay {
         (tail, None)
     }
 
+    /// 记下发给客户端的这一段。**只有直通的 JSON 数组流要记**：切断的位置总在元素
+    /// 边界上（分隔符算在后面那个元素上），所以只要知道 `[` 之后有没有过 `{`
+    fn sent(&mut self, out: &[u8]) {
+        if !self.plan.client_json_stream || self.session.is_some() {
+            return;
+        }
+        for b in out {
+            match b {
+                b'[' if !self.array_opened => self.array_opened = true,
+                b'{' if self.array_opened => {
+                    self.array_element = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 流断了之后还能对客户端说的最后一句：按它收到的格式收尾。
     fn error_tail(&mut self, err: &GatewayError) -> Option<Vec<u8>> {
         if let Some(c) = self.back.as_mut() {
@@ -615,6 +640,18 @@ impl Relay {
             })
         } else if self.plan.is_sse && self.session.is_none() {
             Some(err.sse_frame().into_bytes())
+        } else if self.plan.client_json_stream && self.session.is_none() {
+            // 直通的 Gemini JSON 数组：**补一个错误元素再把数组收上**，客户端拿到的
+            // 是一个完整的数组、最后一个元素是错误，而不是半截 JSON
+            let mut out = Vec::new();
+            if !self.array_opened {
+                out.push(b'[');
+            } else if self.array_element {
+                out.extend_from_slice(b",\r\n");
+            }
+            out.extend(err.body_bytes());
+            out.push(b']');
+            Some(out)
         } else if self.hold {
             // 整份攒着的那条路：body 还没发，整个换成错误体
             Some(err.body_bytes())
