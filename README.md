@@ -22,6 +22,11 @@ cargo run -p twcore -- check    # validate only, don't start
 cargo run -p twcore -- serve    # start the gateway and control plane
 ```
 
+Every field of `config.yaml` is described in the
+[configuration reference](docs/config.md). To run `twcore` on a Linux server
+and manage it from the desktop app, see
+[Running core on a server](docs/server.md).
+
 ## What it does
 
 Point a client (Claude Code, Codex, and friends) at a local port, and:
