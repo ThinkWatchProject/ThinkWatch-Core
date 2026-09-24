@@ -166,11 +166,6 @@ pub fn user_level(home: &Path) -> Vec<Source> {
         f("cursor", Kind::Mcp, under(home, ".cursor/mcp.json")),
         f("codex", Kind::Mcp, under(home, ".codex/config.toml")),
         f(
-            "opencode",
-            Kind::Mcp,
-            tw_adopt::paths::OPENCODE_CONFIG.resolve(home),
-        ),
-        f(
             "zed",
             Kind::Mcp,
             tw_adopt::paths::ZED_SETTINGS.resolve(home),
@@ -183,6 +178,10 @@ pub fn user_level(home: &Path) -> Vec<Source> {
         ),
         f("codex", Kind::Instructions, under(home, ".codex/AGENTS.md")),
     ];
+    // opencode 三个文件都读、逐层合并，哪个里都可能有 MCP
+    for l in tw_adopt::paths::OPENCODE_CONFIGS {
+        v.push(f("opencode", Kind::Mcp, l.resolve(home)));
+    }
     for p in skills_in(&under(home, ".claude/skills")) {
         v.push(f("claude-code", Kind::Skill, p));
     }
