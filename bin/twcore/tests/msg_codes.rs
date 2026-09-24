@@ -459,7 +459,10 @@ fn the_manifest_lists_every_code_core_can_emit() {
         std::fs::write(&path, &want).unwrap();
         return;
     }
-    let have = std::fs::read_to_string(&path).unwrap_or_default();
+    // Windows 上的检出可能把换行换成了 CRLF，内容一样就算一样
+    let have = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     if have != want {
         let (h, w) = (codes_in(&have), codes_in(&want));
         let added: Vec<_> = w.difference(&h).collect();
@@ -471,7 +474,7 @@ fn the_manifest_lists_every_code_core_can_emit() {
         );
     }
     // 桌面端读的是 tw-api 里的这个常量，它就是这个文件
-    assert_eq!(tw_api::MSG_CODES, want);
+    assert_eq!(tw_api::MSG_CODES.replace("\r\n", "\n"), want);
 }
 
 /// 表里的码运行时真的发出来的，清单里都有 —— 有人往表里加了一行却没用
