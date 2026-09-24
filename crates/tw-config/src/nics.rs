@@ -34,19 +34,40 @@ fn is_link_local_v6(a: &Ipv6Addr) -> bool {
     a.segments()[0] & 0xffc0 == 0xfe80
 }
 
-/// 列出所有已配好地址、并且已经 up 的网卡。
+/// 列出所有已配好地址、已经 up 并且连着的网卡。
 ///
-/// **跳过没有地址的和没 up 的** —— 一张插着网线但没拿到 IP 的网卡绑不
-/// 上去，列在选单里只会让人选了之后发现起不来。
+/// **跳过没有地址的、没 up 的、没连上的** —— 一张插着网线但没拿到 IP 的
+/// 网卡绑不上去，列在选单里只会让人选了之后发现起不来。
+///
+/// 「连着」在 unix 上是 `IFF_RUNNING`：网线拔了、Wi-Fi 断了，或者一个没有
+/// 容器接着的 `docker0`/`br-*`，它们往往还挂着地址、也是 up 的，但局域网里
+/// 谁都连不到那个地址上。Windows 那边的「up」（`IfOperStatusUp`）本来就是
+/// 这个意思。
 pub fn list() -> Vec<Nic> {
     let mut out = imp::list();
-    // 回环排最后：它在选单里对应的是「仅本机」那一档，不该混在
-    // 「选一张网卡」的候选里排在前面。
-    //
-    // **排序在这里，不在各自的平台实现里** —— 它是一条界面上的规矩，
-    // 和系统怎么把网卡交给我们没有关系。
-    out.sort_by_key(|n| (n.addr.is_loopback(), n.name.clone(), n.addr.to_string()));
+    order(&mut out, imp::is_physical);
     out
+}
+
+/// 选单里的顺序。
+///
+/// - **回环排最后**：它在选单里对应的是「仅本机」那一档，不该混在「选一张
+///   网卡」的候选里排在前面。
+/// - **物理网卡排在虚拟网卡前面**：装了 Docker 的 Linux 上，`br-1a2b3c`、
+///   `docker0` 按字母排会压在 `enp3s0`、`wlp2s0` 前面，而局域网里别的机器
+///   要连的几乎总是后者。虚拟的仍然列出来 —— 有人就是要绑 `tailscale0`。
+///
+/// **排序在这里，不在各自的平台实现里** —— 它是一条界面上的规矩，和系统
+/// 怎么把网卡交给我们没有关系。平台只回答「这张是不是物理的」。
+fn order(nics: &mut [Nic], physical: impl Fn(&str) -> bool) {
+    nics.sort_by_cached_key(|n| {
+        (
+            n.addr.is_loopback(),
+            !physical(&n.name),
+            n.name.clone(),
+            n.addr.to_string(),
+        )
+    });
 }
 
 /// 每张网卡一行，地址是按名字绑它时真正监听的那一个。
@@ -73,10 +94,10 @@ fn one_per_name(all: Vec<Nic>) -> Vec<Nic> {
     out
 }
 
-/// 系统里有没有叫这个名字的网卡，**有没有地址都算**。
+/// 系统里有没有叫这个名字的网卡，**有没有地址、连没连上都算**。
 ///
-/// [`list`] 只列有地址的：网线拔了、Wi-Fi 断了的网卡不在里面。「没有这张
-/// 网卡」和「这张网卡此刻没有地址」要分开说 —— 前者多半是拼错了，后者
+/// [`list`] 只列有地址、连着的：网线拔了、Wi-Fi 断了的网卡不在里面。「没有
+/// 这张网卡」和「这张网卡此刻没连上」要分开说 —— 前者多半是拼错了，后者
 /// 插上网线就好。
 pub fn exists(name: &str) -> bool {
     imp::exists(name)
@@ -106,7 +127,11 @@ mod unix {
             while !cur.is_null() {
                 let e = &*cur;
                 cur = e.ifa_next;
-                if e.ifa_addr.is_null() || e.ifa_flags & libc::IFF_UP as u32 == 0 {
+                // 要 up，也要 running（连着）。glibc 和 macOS 的 getifaddrs
+                // 给每个地址条目带的都是**所属网卡**的标志，所以这里按地址
+                // 逐条判就等于按网卡判。
+                let want = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+                if e.ifa_addr.is_null() || e.ifa_flags & want != want {
                     continue;
                 }
                 let name = match CStr::from_ptr(e.ifa_name).to_str() {
@@ -135,6 +160,29 @@ mod unix {
         out
     }
 
+    /// Linux 上，**背后有一个设备的**是物理网卡：内核给它在 sysfs 里建一个
+    /// `device` 链接，指向 PCI/USB 上那块硬件。`docker0`、`br-*`、`veth*`、
+    /// `virbr0`、`tailscale0`、`wg0`、`tun0`、`lo` 都没有。
+    ///
+    /// 读不到 sysfs（容器里没挂、权限不够）时算虚拟 —— 那样只影响排序，
+    /// 不影响列不列。
+    #[cfg(target_os = "linux")]
+    pub fn is_physical(name: &str) -> bool {
+        // 名字是内核给的短名，不会含 `/`；含了就不是一张网卡，别拿它拼路径
+        !name.contains('/')
+            && std::path::Path::new("/sys/class/net")
+                .join(name)
+                .join("device")
+                .exists()
+    }
+
+    /// 其他 unix（macOS）上不分：一律当物理网卡，于是顺序和以前一样只按
+    /// 名字排。
+    #[cfg(not(target_os = "linux"))]
+    pub fn is_physical(_name: &str) -> bool {
+        true
+    }
+
     pub fn exists(name: &str) -> bool {
         let Ok(c) = std::ffi::CString::new(name) else {
             return false;
@@ -159,7 +207,8 @@ mod windows {
         AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
     };
 
-    /// `IfOperStatusUp`。**只认「up」这一档**，和 unix 那边的 `IFF_UP` 对齐：
+    /// `IfOperStatusUp`。**只认「up」这一档**，和 unix 那边的
+    /// `IFF_UP | IFF_RUNNING` 对齐：
     /// 「正在连」「已断开」的网卡绑不上去。
     ///
     /// 类型跟着 `IF_OPER_STATUS` 走（就是 `i32`），这样比较的时候不用转换。
@@ -317,6 +366,13 @@ mod windows {
             .collect()
     }
 
+    /// 不分物理和虚拟：Windows 的虚拟网卡（Hyper-V 的 `vEthernet`、VPN）
+    /// 没有一个像 sysfs `device` 那样可靠的判据，而按名字猜会猜错中文系统
+    /// 上的显示名。顺序照旧只按名字排。
+    pub fn is_physical(_name: &str) -> bool {
+        true
+    }
+
     /// **不看 up、也不看有没有地址** —— 见 [`super::exists`] 上那段。
     pub fn exists(name: &str) -> bool {
         !name.is_empty() && adapters().iter().any(|a| a.name == name)
@@ -372,6 +428,90 @@ mod tests {
             vec![nic("en0", "10.0.3.7"), nic("utun3", "fd00::2")],
             "同一张网卡列了两行，或者没挑 IPv4"
         );
+    }
+
+    /// 装了 Docker 的 Linux：按字母排的话 `br-*`、`docker0` 压在真网卡前面。
+    #[test]
+    fn physical_interfaces_come_before_virtual_ones_and_loopback_is_last() {
+        let nic = |name: &str, addr: &str| Nic {
+            name: name.into(),
+            addr: addr.parse().unwrap(),
+        };
+        let mut rows = vec![
+            nic("lo", "127.0.0.1"),
+            nic("br-1a2b3c", "172.18.0.1"),
+            nic("wlp2s0", "192.168.1.9"),
+            nic("docker0", "172.17.0.1"),
+            nic("enp3s0", "fd00::5"),
+            nic("enp3s0", "192.168.1.5"),
+            nic("tailscale0", "100.64.0.2"),
+        ];
+        order(&mut rows, |n| n.starts_with("enp") || n.starts_with("wlp"));
+        let names: Vec<&str> = rows.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "enp3s0",
+                "enp3s0",
+                "wlp2s0",
+                "br-1a2b3c",
+                "docker0",
+                "tailscale0",
+                "lo"
+            ]
+        );
+        // 排完再按名字并成一行一张，挑的仍是 IPv4，顺序不变
+        let one: Vec<String> = one_per_name(rows)
+            .into_iter()
+            .map(|n| format!("{} {}", n.name, n.addr))
+            .collect();
+        assert_eq!(
+            one,
+            [
+                "enp3s0 192.168.1.5",
+                "wlp2s0 192.168.1.9",
+                "br-1a2b3c 172.18.0.1",
+                "docker0 172.17.0.1",
+                "tailscale0 100.64.0.2",
+                "lo 127.0.0.1"
+            ]
+        );
+    }
+
+    /// 一个平台不分物理虚拟（macOS、Windows）时，顺序就是原来那样：名字，
+    /// 回环最后。
+    #[test]
+    fn without_a_physical_signal_the_order_is_by_name_with_loopback_last() {
+        let nic = |name: &str, addr: &str| Nic {
+            name: name.into(),
+            addr: addr.parse().unwrap(),
+        };
+        let mut rows = vec![
+            nic("lo0", "::1"),
+            nic("utun3", "fd00::2"),
+            nic("lo0", "127.0.0.1"),
+            nic("en0", "10.0.3.7"),
+        ];
+        order(&mut rows, |_| true);
+        assert_eq!(
+            rows,
+            vec![
+                nic("en0", "10.0.3.7"),
+                nic("utun3", "fd00::2"),
+                nic("lo0", "127.0.0.1"),
+                nic("lo0", "::1"),
+            ]
+        );
+    }
+
+    /// Linux 上回环背后没有设备，算虚拟 —— 它排最后靠的是「是不是回环」
+    /// 那一键，不是这一键。编出来的名字、带路径的名字都不算物理。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_loopback_is_not_physical_and_a_made_up_name_is_not_either() {
+        assert!(!imp::is_physical("lo"));
+        assert!(!imp::is_physical("tw-no-such0"));
+        assert!(!imp::is_physical("../lo"));
     }
 
     /// 名字里可以有空格和中文 —— Windows 上「以太网」「Wi-Fi 2」都是常见的。

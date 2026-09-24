@@ -300,7 +300,7 @@ gw.internal
 gw.listen.addr_unavailable
 gw.listen.bind_failed
 gw.listen.denied
-gw.listen.nic_no_addr
+gw.listen.nic_offline
 gw.listen.no_such_nic
 gw.listen.port_taken
 gw.model.no_upstream
