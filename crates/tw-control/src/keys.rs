@@ -338,7 +338,7 @@ async fn rotate(
             Err(e) => failed.push(tw_api::KeySyncFailed {
                 client: c.id.to_string(),
                 name: c.name.to_string(),
-                error: e.to_string(),
+                error: e.msg(),
             }),
         }
     }

@@ -500,7 +500,12 @@ async fn a_failed_refresh_keeps_the_table_and_reports_why() {
         assert!(r["text"].as_str().unwrap().contains(says), "{r}");
         let (_, status) = call(&b.app, "GET", "/pricing", serde_json::json!(null)).await;
         assert_eq!(status["source"], "builtin");
-        assert!(status["error"].as_str().unwrap().contains(says), "{status}");
+        // 和刷新那一次回的是同一句，带着同一个码
+        assert_eq!(status["error"]["code"], r["code"], "{status}");
+        assert!(
+            status["error"]["text"].as_str().unwrap().contains(says),
+            "{status}"
+        );
         assert!(!b.data_file().exists());
     }
 }
