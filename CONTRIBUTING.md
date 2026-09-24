@@ -56,7 +56,8 @@ surface lints you cannot reproduce — `rustup update stable` before
 blaming CI.
 
 `scripts/smoke.sh` runs the real binary against a real socket and a real
-data plane. **It catches what unit tests structurally cannot** — file
+data plane, talking to the control plane through `twcore call` (every
+control connection starts with a Noise handshake, so curl cannot). **It catches what unit tests structurally cannot** — file
 permissions, socket path limits, an endpoint that simply isn't
 registered, a config field silently swallowed. This project's first four
 real bugs were all in those seams. Tests that hit the live network are
@@ -81,6 +82,10 @@ clean the diff is:
 - **Anything that bypasses the main pipeline re-applies its
   protections.** Replay came close to being a legitimate way around
   redaction.
+- **One door into the control plane.** Every transport (unix socket,
+  Windows loopback port, and the remote port to come) hands its
+  connections to the same handshake before HTTP. The control key never
+  leaves through the control plane and cannot be changed through it.
 
 ## The price list
 

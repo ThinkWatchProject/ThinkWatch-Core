@@ -21,6 +21,8 @@ version: 1
 listen:
   gateway:
     port: 8788        # 换端口记得同步改客户端
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 
 clients:
   - name: claude-code

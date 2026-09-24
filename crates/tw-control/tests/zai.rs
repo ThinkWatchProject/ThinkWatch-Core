@@ -194,6 +194,9 @@ async fn start_zai(z: Arc<Zai>) -> Endpoints {
 // ---------------------------------------------------------------- 控制面
 
 const BASE: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k

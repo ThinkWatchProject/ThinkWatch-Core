@@ -147,7 +147,10 @@ pub fn snapshot(
         origin.slug(),
         &version["blake3:".len()..]
     ));
-    store::write_atomic(&file, text)?;
+    // **钥匙不进历史**：存的是打码的原文，版本号仍按真原文算（文件名里那一段），
+    // 「哪一版是现在这版」照样对得上。回滚到这一版时打码换回当时磁盘上的钥匙
+    // （见 [`crate::control_key::unmask`]）—— 回滚不该顺手把门锁换掉
+    store::write_atomic(&file, &crate::control_key::mask(text))?;
     prune(config_path)?;
     Ok(Some(Version {
         file,
@@ -237,10 +240,15 @@ pub fn rollback(config_path: &Path, version: &str) -> Result<String, RollbackErr
         .rev()
         .find(|v| v.version == version || v.version.ends_with(version))
         .ok_or_else(|| RollbackError::NoSuchVersion(version.to_string()))?;
-    let text = read(target)?;
+    let mut text = read(target)?;
     // 先把「现在这一版」存进历史，再覆盖
     if let Ok(cur) = store::read(config_path) {
         snapshot(config_path, &cur.text, Origin::Rollback)?;
+        // 历史里的钥匙是打码的，换回现在这一把
+        let real = crate::control_key::raw_in(&cur.text).ok().flatten();
+        if let Ok(t) = crate::control_key::unmask(&text, real.as_deref()) {
+            text = t;
+        }
     }
     store::write_atomic(config_path, &text)?;
     Ok(text)
@@ -449,5 +457,29 @@ mod ordering_tests {
             "a: 199\n",
             "最新的那一版不是最后一个"
         );
+    }
+
+    /// 历史里没有钥匙；回滚回去，钥匙是现在这一把，不是当时那一把。
+    #[test]
+    fn history_never_holds_the_control_key_and_a_rollback_keeps_the_current_one() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.yaml");
+        let old_key = "a".repeat(64);
+        let new_key = "b".repeat(64);
+        let with = |k: &str, port: u16| {
+            format!("version: 1\nlisten:\n  control:\n    key: {k}\nport: {port}\n")
+        };
+        let v1 = snapshot(&p, &with(&old_key, 1), Origin::Ui)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v1.version, store::version_of(&with(&old_key, 1)));
+        let stored = read(&v1).unwrap();
+        assert!(!stored.contains(&old_key), "{stored}");
+        assert!(stored.contains(tw_api::control::KEY_MASK), "{stored}");
+
+        std::fs::write(&p, with(&new_key, 2)).unwrap();
+        let back = rollback(&p, &v1.version).unwrap();
+        assert_eq!(back, with(&new_key, 1));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), with(&new_key, 1));
     }
 }

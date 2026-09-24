@@ -10,10 +10,10 @@ description = "Control-plane API server over a unix socket"
 [dependencies]
 tw-api = { workspace = true }
 tw-types = { workspace = true }
+# 每条控制面连接先握手
+tw-link = { workspace = true }
 # 列网卡用 getifaddrs —— 比引一个 crate 便宜
 libc = { workspace = true }
-# 生成控制面的凭据
-rand = { workspace = true }
 tw-config = { workspace = true }
 tw-adopt = { workspace = true }
 tw-scan = { workspace = true }

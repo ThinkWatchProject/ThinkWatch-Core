@@ -12,6 +12,9 @@ use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
 const BASE: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 # 这把是默认的，别动
 clients:
   - name: default
@@ -127,6 +130,9 @@ async fn the_list_shows_the_value_and_says_which_one_is_the_default() {
 #[tokio::test]
 async fn default_key_names_one_even_when_it_is_not_called_default() {
     let b = bed("version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 default_key: codex
 clients:
   - name: default
@@ -162,6 +168,9 @@ async fn a_new_key_gets_its_value_from_core_and_keeps_the_comments() {
 #[tokio::test]
 async fn renaming_a_key_carries_the_rules_and_the_default_with_it() {
     let b = bed("version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 default_key: codex
 clients:
   - name: codex
@@ -221,6 +230,9 @@ async fn the_default_key_can_be_neither_deleted_nor_disabled() {
 #[tokio::test]
 async fn a_key_a_rule_still_points_at_cannot_be_deleted() {
     let b = bed("version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: default
     key: tw-aaaa

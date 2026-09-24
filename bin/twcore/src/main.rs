@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod call;
 mod lockfile;
 mod proc;
 
@@ -84,6 +85,32 @@ enum Command {
         #[command(subcommand)]
         what: ClientsCmd,
     },
+    /// Print the control key, which the desktop app connects with
+    //
+    // 远程连接时用户在服务器上跑它，把钥匙抄进应用
+    ControlKey {
+        /// Replace the key with a new one. A running core takes the new key within a second
+        /// and closes the connections made with the previous one
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Send one request to the running core's control plane and print the response
+    //
+    // **curl 敲不开控制面了**：每条连接先握手。调试、脚本、smoke 用这个 ——
+    // 它读的是同一份配置里的钥匙，走的是和桌面端同一条握手
+    Call {
+        /// The endpoint, such as /status or /history?limit=1
+        path: String,
+        /// The HTTP method
+        #[arg(short = 'X', long, default_value = "GET")]
+        method: String,
+        /// A JSON request body
+        #[arg(short, long)]
+        data: Option<String>,
+        /// Write the response body to this file and print only the status code
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -151,6 +178,13 @@ fn main() -> Result<()> {
         Command::Config { what } => cmd_config(&path, what),
         Command::Clients { what } => cmd_clients(&path, what),
         Command::Scan { project, inventory } => cmd_scan(&path, project, inventory),
+        Command::ControlKey { rotate } => cmd_control_key(&path, rotate),
+        Command::Call {
+            path: endpoint,
+            method,
+            data,
+            out,
+        } => call::run(&path, &endpoint, &method, data, out),
     }
 }
 
@@ -551,6 +585,36 @@ fn print_l1(target: &str, via: Option<&str>, r: &tw_gateway::L1Result) {
     println!();
 }
 
+/// 打印控制面的钥匙，或者换一把。
+///
+/// **只在 core 那台机器上能跑**：它读写的是本机的配置文件。换钥匙不经过
+/// 控制面 —— 经控制面进来的一方改得动这扇门，就改得掉别人进来的路。
+fn cmd_control_key(path: &Path, rotate: bool) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!(
+            "{} does not exist. twcore serve writes it on first start; twcore init writes it \
+             without starting",
+            path.display()
+        );
+    }
+    if rotate {
+        let key = tw_config::control_key::rotate_file(path)?;
+        println!("{}", key.to_hex());
+        eprintln!(
+            "(a running core takes the new key within a second and closes the connections made \
+             with the previous one; the desktop app on this machine reconnects by itself, and one \
+             on another machine needs the new key)"
+        );
+        return Ok(());
+    }
+    // 还没有钥匙的旧配置：补上再打印。`serve` 起来时也会这样补，这里先补
+    // 不改变任何行为，只是省得让人先去起一次 core
+    tw_config::control_key::ensure_file(path)?;
+    let key = tw_link::read_key(path)?;
+    println!("{}", key.to_hex());
+    Ok(())
+}
+
 fn cmd_init(path: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         anyhow::bail!(
@@ -569,6 +633,11 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
         "(configure a client with it. The tw- prefix tells a gateway key from an upstream API key.)"
     );
     println!();
+    println!(
+        "The configuration also holds the control key, which the desktop app connects with; \
+         twcore control-key prints it."
+    );
+    println!();
     println!("Next: add an upstream under providers, then run twcore serve.");
     Ok(())
 }
@@ -579,10 +648,29 @@ fn write_config(path: &Path, cfg: &tw_config::Config) -> Result<()> {
     Ok(tw_config::write(path, cfg)?)
 }
 
+/// 读配置、按 `serve` 会看到的样子校验。
+///
+/// **缺控制面的钥匙不算错**：`serve` 起来时会补上（只补那一行），这里在内存里
+/// 同样补一把再校验，说一句就好 —— 否则升级之后的第一次 check 会把一份好好的
+/// 配置报成坏的。
+fn check_like_serve(path: &Path) -> Result<(tw_config::Config, bool)> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let (text, added) = match tw_config::control_key::ensure(&text) {
+        Ok(Some(with_key)) => (with_key, true),
+        _ => (text, false),
+    };
+    let cfg = tw_config::try_parse(&text).map_err(|r| anyhow::anyhow!("{r}"))?;
+    Ok((cfg, added))
+}
+
 fn cmd_check(path: &Path) -> Result<()> {
-    match tw_config::load(path) {
-        Ok(cfg) => {
+    match check_like_serve(path) {
+        Ok((cfg, key_missing)) => {
             println!("✅ {} is valid", path.display());
+            if key_missing {
+                println!("   · it has no control key yet; twcore serve adds one when it starts");
+            }
             println!(
                 "   {} gateway keys, {} upstreams",
                 cfg.clients.len(),
@@ -673,7 +761,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         .map(PathBuf::from)
         .unwrap_or_else(tw_api::data::dir);
     // **数据目录在这儿建，而且只在这儿。**后面每一步（锁、控制面的 socket、
-    // 凭据文件）都会顺手 `create_dir_all`，谁先到谁建 —— 而 Windows 上「谁
+    // 端口文件）都会顺手 `create_dir_all`，谁先到谁建 —— 而 Windows 上「谁
     // 建的」决定了它的 ACL，也就决定了那份明文密钥同机的其他用户读不读得到。
     tw_config::private_dir::create(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let _lock = match LockFile::acquire(&dir)? {
@@ -702,6 +790,17 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         tw_config::write(path, &cfg)
             .with_context(|| format!("writing the initial configuration {}", path.display()))?;
         tracing::info!(path = %path.display(), "first run; wrote an initial configuration");
+    } else {
+        // **控制面的钥匙在监听之前写好**：桌面端看到 socket 出现就来读它。旧配置
+        // 没有这一行就只补这一行（最小替换，注释和排版不动）—— 升级不需要迁移。
+        // 补不上（YAML 写坏了）不在这里停：下一步加载会说清哪一行坏了
+        match tw_config::control_key::ensure_file(path) {
+            Ok(true) => {
+                tracing::info!(path = %path.display(), "added a control key to the configuration")
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("a control key could not be added to the configuration: {e}"),
+        }
     }
     let cfg = tw_config::load(path).with_context(|| format!("loading {}", path.display()))?;
     // `--port` 是一个**显式的覆盖**，配置文件不该推翻它。所以给了它
@@ -731,10 +830,6 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     // 「该退了」的开关。**在起任何东西之前建好** —— 控制面和主循环各拿
     // 一份，而控制面可能在主循环开始等之前就收到那条请求。
     let shutdown = tw_control::Shutdown::default();
-    // 控制面的凭据，同样在起任何东西之前拿到：桌面端从环境变量交过来，
-    // 手工启动时生成一个写进配置目录。取不到就停在这儿 —— 一个装不上门的
-    // 控制面不该先起来再说。
-    let control_token = tw_control::token::Token::resolve(&dir)?;
     let config_path = path.to_path_buf();
     rt.block_on(async move {
         let state = tw_gateway::AppState::new(cfg.clone())
@@ -850,7 +945,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 太长）只在日志里躺着。退出让那句话有机会走到人眼前。
         let (control_died, control_dead) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let r = tw_control::serve(control, &at, control_token).await;
+            let r = tw_control::serve(control, &at).await;
             let msg = match r {
                 Err(e) => format!("{e}"),
                 // serve 正常返回意味着 accept 循环结束了，同样是没了

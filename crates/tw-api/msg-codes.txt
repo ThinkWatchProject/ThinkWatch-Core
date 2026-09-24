@@ -99,6 +99,8 @@ adopt.warn.world_readable
 config.bad_allow_from
 config.bad_base_url
 config.blank_models_only
+config.control_key_invalid
+config.control_key_missing
 config.credential.bad_header_name
 config.credential.bad_header_value
 config.credential.chatgpt_without_login
@@ -171,6 +173,7 @@ control.chatgpt_login.no_code
 control.chatgpt_login.page_error
 control.client_unknown
 control.config_stale
+control.control_key_locked
 control.default_key_cannot_delete
 control.default_key_cannot_disable
 control.default_route_cannot_delete
@@ -249,7 +252,6 @@ control.signin_gone
 control.signin_response_unusable
 control.store_off
 control.store_unavailable
-control.unauthorized
 control.unknown_probe_class
 control.upstream_in_use
 control.upstream_not_found

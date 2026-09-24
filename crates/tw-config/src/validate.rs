@@ -70,6 +70,10 @@ pub enum ValidationError {
     UnknownRule { guard: &'static str, id: String },
     #[error("{}", self.msg())]
     OutputLimitRange { max: usize, ceiling: usize },
+    #[error("{}", self.msg())]
+    ControlKeyMissing,
+    #[error("{}", self.msg())]
+    ControlKeyInvalid,
 }
 
 impl ValidationError {
@@ -192,6 +196,17 @@ impl ValidationError {
             OutputLimitRange { max, ceiling } => msg!(
                 "config.output_limit_range", max = max, ceiling = ceiling =>
                 "security.output_limit.max_chars is {max}; it has to be between 1 and {ceiling}"
+            ),
+            ControlKeyMissing => msg!(
+                "config.control_key_missing" =>
+                "the configuration has no listen.control.key, the key the desktop app connects \
+                 with. twcore serve writes one when it starts; twcore control-key --rotate \
+                 writes a new one"
+            ),
+            ControlKeyInvalid => msg!(
+                "config.control_key_invalid" =>
+                "listen.control.key has to be 64 hexadecimal characters. twcore control-key \
+                 --rotate writes a new one"
             ),
         }
     }
@@ -401,6 +416,16 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             id: id.to_string(),
         });
     }
+    // 控制面的钥匙。**缺了、短了、不是十六进制，整份配置都不收**，旧的继续
+    // 服务：一份没有钥匙的配置换进来，下一条连接谁都进不来 —— 包括要把它
+    // 改回去的那个界面；一把好猜的短钥匙和没有差不多
+    match cfg.listen.control.key.as_deref() {
+        None => return Err(ValidationError::ControlKeyMissing),
+        Some(k) if tw_api::control::ControlKey::parse(k).is_err() => {
+            return Err(ValidationError::ControlKeyInvalid);
+        }
+        Some(_) => {}
+    }
     Ok(())
 }
 
@@ -505,7 +530,12 @@ mod tests {
     fn cfg(clients: Vec<Client>, providers: Vec<Provider>) -> Config {
         Config {
             version: 1,
-            listen: Listen::default(),
+            listen: Listen {
+                control: crate::ControlListen {
+                    key: Some("c0ffee00".repeat(8)),
+                },
+                ..Default::default()
+            },
             clients,
             providers,
             ..Default::default()
@@ -526,6 +556,37 @@ mod tests {
             protocol: None,
             ..Default::default()
         }
+    }
+
+    /// 控制面的钥匙：缺了、短了、不是十六进制，都不收。
+    #[test]
+    fn the_control_key_has_to_be_there_and_be_64_hex_characters() {
+        let with = |k: Option<&str>| {
+            let mut c = cfg(vec![c("d", "tw-1")], vec![]);
+            c.listen.control.key = k.map(str::to_string);
+            validate(&c)
+        };
+        assert!(with(Some(&"ab".repeat(32))).is_ok());
+        assert!(with(Some(&"AB".repeat(32))).is_ok(), "大写也是十六进制");
+        assert!(matches!(
+            with(None),
+            Err(ValidationError::ControlKeyMissing)
+        ));
+        for bad in [
+            "",
+            "abc",
+            &"ab".repeat(31),
+            &"zz".repeat(32),
+            tw_api::control::KEY_MASK,
+        ] {
+            assert!(
+                matches!(with(Some(bad)), Err(ValidationError::ControlKeyInvalid)),
+                "{bad}"
+            );
+        }
+        let m = ValidationError::ControlKeyMissing.msg();
+        assert_eq!(m.code, "config.control_key_missing");
+        assert!(m.text.contains("twcore control-key --rotate"), "{m:?}");
     }
 
     #[test]

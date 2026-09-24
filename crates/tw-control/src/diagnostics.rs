@@ -302,7 +302,10 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
         //
         // `mask_config_yaml` 按**字段名**打（schema 就是答案），里面照旧
         // 叠一层 `mask_body`：仔细的那一处不能被另一处抵消。
+        //
+        // 控制面的钥匙**整个换掉**，不是留头留尾：它是那扇门的全部凭据。
         Ok(text) => {
+            let text = tw_config::control_key::mask(&text);
             let _ = writeln!(out, "{}", tw_secret::mask_config_yaml(&text));
         }
         Err(e) => {

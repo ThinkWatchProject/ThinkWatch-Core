@@ -12,7 +12,7 @@ use tower::ServiceExt;
 use tw_api::{Endpoint, ErrorBody, Method, ep};
 use tw_control::{ConfigManager, ControlState};
 
-const BASE: &str = "version: 1\nclients:\n  - name: me\n    key: tw-contract-test-key\nproviders:\n  - name: official\n    base_url: https://api.anthropic.com\n    key: sk-x\n";
+const BASE: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: me\n    key: tw-contract-test-key\nproviders:\n  - name: official\n    base_url: https://api.anthropic.com\n    key: sk-x\n";
 
 fn app() -> (tempfile::TempDir, axum::Router) {
     let d = tempfile::tempdir().unwrap();

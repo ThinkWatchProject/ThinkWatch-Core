@@ -123,6 +123,8 @@ listen:
   gateway:
     bind: loopback
     port: 8788
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: claude-code
     key: tw-testkey

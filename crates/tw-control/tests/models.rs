@@ -97,6 +97,9 @@ async fn upstream() -> std::net::SocketAddr {
 fn config(up: std::net::SocketAddr, key: &str, extra: &str) -> String {
     format!(
         "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k
@@ -301,6 +304,9 @@ async fn disabling_and_scoping_an_upstream_is_written_and_an_empty_scope_is_refu
 #[tokio::test]
 async fn the_dry_run_names_the_upstreams_it_skips_and_why() {
     let yaml = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k

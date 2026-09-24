@@ -244,6 +244,9 @@ async fn start_openai(o: Arc<OpenAi>) -> Endpoints {
 // ---------------------------------------------------------------- 控制面
 
 const RELAY: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k

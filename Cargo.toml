@@ -24,6 +24,8 @@ members = [
     "crates/tw-observe",
     "crates/tw-gateway",
     "crates/tw-control",
+    # 控制通道的握手与加密。桌面端按 tag 依赖它，所以只依赖契约层和 tw-yaml
+    "crates/tw-link",
     # ── bin ──────────────────────────────────────────────
     "bin/twcore",
 ]
@@ -59,6 +61,7 @@ tw-watch    = { path = "crates/tw-watch" }
 tw-guard    = { path = "crates/tw-guard" }
 tw-breaker  = { path = "crates/tw-breaker" }
 tw-dialect  = { path = "crates/tw-dialect" }
+tw-link     = { path = "crates/tw-link" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
@@ -103,6 +106,9 @@ tokio-rustls = "0.26"
 # 栈，否则会出现「数据面信任的根证书」和「WS 信任的」是两套
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 base64 = "0.22"
+# 控制通道的握手（tw-link）。Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s 用到的
+# 三样算法之外一概不开：默认特性会带上 AES-GCM、SHA2
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
 
 futures = "0.3"
 tokio-stream = "0.1"

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod chatgpt;
+pub mod control_key;
 pub mod credential;
 pub mod edit;
 pub mod history;
@@ -25,7 +26,7 @@ pub mod watch;
 mod wire;
 
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
-pub use init::{generate_initial, generate_key};
+pub use init::{generate_control_key, generate_initial, generate_key};
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
 
@@ -229,8 +230,52 @@ impl Config {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub gateway: GatewayListen,
+    /// 控制面。**钥匙在这里**，而钥匙每份配置都有 —— 所以 `listen` 这一段
+    /// 从第一天起就在文件里，里面只有这一行。
+    #[serde(default)]
+    pub control: ControlListen,
+}
+
+/// 控制面怎么进。
+///
+/// 本机的通道（unix socket、Windows 的回环端口）不用配：它在哪儿由平台
+/// 决定（`tw_api::control::Address`），这里只有进门的钥匙。
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlListen {
+    /// 64 个十六进制字符。**每一种通道共用这一把**：握手（`tw-link`）拿它当
+    /// PSK，不知道它的一方连第一条握手消息都写不对。
+    ///
+    /// `twcore serve` 在控制面起来之前保证它在（没有就生成、只补这一行）；
+    /// 界面上看到的是打码的（`tw_api::control::KEY_MASK`），也改不了它 ——
+    /// 只有 `twcore control-key --rotate` 和直接改文件能换。
+    ///
+    /// 这里是一串文字而不是 [`tw_api::control::ControlKey`]：写错了的时候，
+    /// 校验要能说一句带码的话（[`ValidationError::ControlKeyInvalid`]），而
+    /// 不是一句解析器的原话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    // ── 远程控制端口（`remote: { enabled, bind, port, allow_from }`）加在这里。
+    // 它是**另开的**一个网络端口，给另一台机器上的桌面端用，本机的通道照旧；
+    // 钥匙还是上面这一把。
+}
+
+/// **钥匙不打印。**`Config` 会整个落进 Debug 输出，而日志是会被贴进 issue 的。
+impl std::fmt::Debug for ControlListen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlListen")
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl ControlListen {
+    /// 此刻的钥匙。校验过的配置里一定有；没有或写坏了是 `None`。
+    pub fn key(&self) -> Option<tw_api::control::ControlKey> {
+        tw_api::control::ControlKey::parse(self.key.as_deref()?).ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

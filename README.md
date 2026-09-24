@@ -46,7 +46,7 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
 tw-dialect · tw-guard · tw-breaker                                   ← shared with the server edition
 tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret · tw-watch   ← domain logic
 tw-config · tw-store · tw-scan · tw-adopt · tw-observe               ← assembly
-tw-gateway · tw-control                                              ← data plane / control plane
+tw-gateway · tw-control · tw-link                                    ← data plane / control plane
 ```
 
 The server edition depends on the top layer and nothing else: format
@@ -70,6 +70,26 @@ scripts/smoke.sh           # from a clean slate, exercise every path on the real
 
 `scripts/smoke.sh` touches nothing of yours — `HOME` and `THINKWATCH_HOME` both
 point at a temporary directory that is deleted when it finishes.
+
+## The control plane
+
+The control plane listens on a unix socket (a loopback port on Windows).
+Every connection starts with a handshake —
+`Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`, implemented in `tw-link` — keyed by
+`listen.control.key` in `config.yaml`. `twcore serve` writes that key before it
+starts listening (into a new configuration, or as one added line in an existing
+one). HTTP runs inside the encrypted channel, so curl cannot talk to it;
+`twcore call` can:
+
+```
+twcore control-key              # print the key the desktop app connects with
+twcore control-key --rotate     # replace it; connections made with the old key are closed
+twcore call /status
+twcore call -X POST -d '{"model":"claude-sonnet-4-5","route":"default"}' /dryrun
+```
+
+The configuration text the control plane hands out has the key masked, and a
+write through the control plane cannot change it.
 
 ## License
 

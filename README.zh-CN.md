@@ -41,7 +41,7 @@ cargo run -p twcore -- serve    # 起网关和控制面
 tw-dialect · tw-guard · tw-breaker                                   ← 与服务端版本共用
 tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret · tw-watch   ← 领域逻辑
 tw-config · tw-store · tw-scan · tw-adopt · tw-observe               ← 装配
-tw-gateway · tw-control                                              ← 数据面 / 控制面
+tw-gateway · tw-control · tw-link                                    ← 数据面 / 控制面
 ```
 
 服务端版本只依赖最上面一层：格式转换与用量解析（tw-dialect）、脱敏与工具调用
@@ -61,6 +61,23 @@ scripts/smoke.sh           # 从零起，在真二进制上把每条路走一遍
 
 `scripts/smoke.sh` 不碰你自己的任何东西 —— `HOME` 和 `THINKWATCH_HOME`
 都指向一个临时目录，跑完就删。
+
+## 控制面
+
+控制面听在一个 unix socket 上（Windows 上是一个回环端口）。每条连接先握手
+（`Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`，实现在 `tw-link`），钥匙是
+`config.yaml` 里的 `listen.control.key`。`twcore serve` 在开始监听之前写好它
+（新配置自带；旧配置只补这一行）。HTTP 跑在加密的通道里面，curl 连不上，
+用 `twcore call`：
+
+```
+twcore control-key              # 打印桌面端连接用的钥匙
+twcore control-key --rotate     # 换一把；用旧钥匙建的连接随即断开
+twcore call /status
+twcore call -X POST -d '{"model":"claude-sonnet-4-5","route":"default"}' /dryrun
+```
+
+控制面发出去的配置原文里钥匙是打码的，经控制面的写入也改不了它。
 
 ## License
 

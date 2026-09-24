@@ -706,7 +706,7 @@ mod msg_codes {
 
     fn cfg() -> tw_config::Config {
         tw_config::try_parse(
-            "version: 1\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\n",
+            "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\n",
         )
         .unwrap()
     }

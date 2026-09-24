@@ -11,6 +11,9 @@ use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
 const CFG: &str = r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: 我
     key: tw-k

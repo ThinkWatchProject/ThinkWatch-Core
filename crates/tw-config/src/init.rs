@@ -3,7 +3,7 @@
 //! **整文件生成，不走最小替换** —— 那是两套机制：这里是从无到
 //! 有，那里是改一个字节而保住其余全部。
 
-use crate::{Client, Config};
+use crate::{Client, Config, ControlListen, Listen};
 
 /// 生成一把网关密钥。
 ///
@@ -19,6 +19,16 @@ pub fn generate_key() -> String {
     format!("tw-{body}")
 }
 
+/// 生成一把控制面的钥匙：32 个随机字节。
+///
+/// **`serve` 首次运行、`serve` 给旧配置补钥匙、`init`、`control-key --rotate`
+/// 都用它**，不各生成各的。
+pub fn generate_control_key() -> tw_api::control::ControlKey {
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    tw_api::control::ControlKey::from_bytes(bytes)
+}
+
 /// 一份还没有上游的骨架配置。
 ///
 /// 它**是合法的**（见 `validate` 里那段注释）：core 要能带着它起来，
@@ -31,6 +41,12 @@ pub fn generate_initial() -> Config {
             key: generate_key(),
             ..Default::default()
         }],
+        listen: Listen {
+            control: ControlListen {
+                key: Some(generate_control_key().to_hex()),
+            },
+            ..Default::default()
+        },
         // 其余全是默认值：没有 provider、没有代理、没有规则。
         // 层 0（不写规则也能跑）就是这份配置的形状。
         ..Default::default()
@@ -70,6 +86,24 @@ mod tests {
         // 而且它是合法的 —— core 要能带着它起来，否则 UI 连「你还没配
         // 上游」都说不出口。
         assert!(crate::validate::validate(&c).is_ok());
+    }
+
+    /// 骨架配置里有钥匙，而网关那一段仍然是默认值、不写进文件。
+    #[test]
+    fn the_skeleton_carries_a_control_key_and_nothing_else_under_listen() {
+        let c = generate_initial();
+        assert!(c.listen.control.key().is_some());
+        let text = serde_yaml_ng::to_string(&c).unwrap();
+        assert!(text.contains("control:"), "{text}");
+        assert!(
+            !text.contains("gateway"),
+            "默认的网关监听被写进文件了：{text}"
+        );
+        assert_ne!(
+            generate_initial().listen.control.key,
+            c.listen.control.key,
+            "每份配置的钥匙都该是新生成的"
+        );
     }
 
     #[test]

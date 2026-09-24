@@ -179,7 +179,7 @@ async fn a_direct_upstream_is_replayed_directly_even_with_a_system_proxy() {
     system_proxy();
     let upstream = answering(200, "from the upstream").await;
     let (_d, app) = app(&format!(
-        "version: 1\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  \
+        "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  \
          - name: 本机\n    base_url: http://{upstream}\n    key: sk-x\n    billing: free\n"
     ));
 
@@ -195,7 +195,7 @@ async fn an_upstream_with_a_proxy_is_replayed_through_that_proxy() {
     let proxy = answering(200, "via its own proxy").await;
     // 没有人听的地址：直连的话只会连不上
     let (_d, app) = app(&format!(
-        "version: 1\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproxies:\n  \
+        "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproxies:\n  \
          - {{ name: 自己的, type: http, addr: \"{proxy}\" }}\nproviders:\n  \
          - name: 本机\n    base_url: http://127.0.0.1:9\n    key: sk-x\n    billing: free\n    \
          proxy: 自己的\n"
