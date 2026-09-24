@@ -381,7 +381,15 @@ async fn pricing_status(s: &ControlState) -> tw_api::PricingStatus {
     let (date, source, models) = {
         let book = s.gateway.pricing.load();
         let t = book.table();
-        (t.date.clone(), t.source.slug().to_string(), t.len())
+        (
+            t.date.clone(),
+            match t.source {
+                tw_pricing::TableSource::Builtin => tw_api::PricingSource::Builtin,
+                tw_pricing::TableSource::Fetched => tw_api::PricingSource::Fetched,
+                tw_pricing::TableSource::Empty => tw_api::PricingSource::Empty,
+            },
+            t.len(),
+        )
     };
     let last = s.price_updater.last();
     // **拿不到存储就是 0** —— 观测层起不来时网关照常转发，这一页也该照常打开

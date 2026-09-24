@@ -132,10 +132,7 @@ pub(super) async fn try_upstreams<'a>(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
-                let err = GatewayError::config(msg!(
-                    "gw.credentials.failed", upstream = provider.name.clone(), detail = e =>
-                    "The credential for upstream `{upstream}` could not be obtained: {detail}"
-                ));
+                let err = GatewayError::config(crate::state::credential_failed(e, &provider.name));
                 chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
                 last_err = Some(err);
                 continue;
@@ -239,7 +236,7 @@ pub(super) async fn try_upstreams<'a>(
         rule: decision.matched_rule.clone(),
         group: decision.via_group.clone(),
         attempts: chain,
-        billing: billing.slug().to_string(),
+        billing: billing.into(),
     });
 
     let Some(served) = served else {
@@ -339,12 +336,12 @@ fn prepare(
                 // **只动 Codex 后端不认的那几个字段**，其余原样发（见 `chatgpt` 模块）
                 let (shaped, dropped) = crate::chatgpt::shape_passthrough(&out);
                 if !dropped.is_empty() {
-                    let responses = tw_dialect::ir::Dialect::Responses.slug();
+                    let responses = tw_api::Dialect::OpenaiResponses;
                     state.bus.emit(tw_api::Event::Translated {
                         id,
                         provider: provider.name.clone(),
-                        from: responses.into(),
-                        to: responses.into(),
+                        from: responses,
+                        to: responses,
                         dropped,
                         at_ms: crate::server::now_ms(),
                     });
@@ -411,8 +408,8 @@ fn prepare(
             state.bus.emit(tw_api::Event::Translated {
                 id,
                 provider: provider.name.clone(),
-                from: d.client.slug().into(),
-                to: dialect.slug().into(),
+                from: crate::wire::dialect(d.client),
+                to: crate::wire::dialect(dialect),
                 dropped,
                 at_ms: crate::server::now_ms(),
             });

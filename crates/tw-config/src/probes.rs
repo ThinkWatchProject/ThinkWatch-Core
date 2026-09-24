@@ -45,13 +45,14 @@ impl ClientProbes {
     /// **这份清单住在这里而不是界面里**：增删一类是这个结构体的事，
     /// 而一个只在前端硬编码的清单会在加了第六类的那天悄悄少一行。每一类
     /// 叫什么、是什么请求，由界面按 id 自己写。
-    pub fn all(&self) -> [(&'static str, ProbeAction); 5] {
+    pub fn all(&self) -> [(tw_api::ProbeClass, ProbeAction); 5] {
+        use tw_api::ProbeClass;
         [
-            ("health_check", self.health_check),
-            ("warmup", self.warmup),
-            ("titling", self.titling),
-            ("topic_detect", self.topic_detect),
-            ("suggestion", self.suggestion),
+            (ProbeClass::HealthCheck, self.health_check),
+            (ProbeClass::Warmup, self.warmup),
+            (ProbeClass::Titling, self.titling),
+            (ProbeClass::TopicDetect, self.topic_detect),
+            (ProbeClass::Suggestion, self.suggestion),
         ]
     }
 }

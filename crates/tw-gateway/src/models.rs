@@ -375,10 +375,7 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     let headers = match state.headers_for(p, http).await {
         Ok(h) => h,
         Err(e) => {
-            return Answer::Failed(msg!(
-                "gw.models.credentials", detail = e =>
-                "The credential could not be obtained: {detail}"
-            ));
+            return Answer::Failed(crate::state::credential_failed(e, &p.name));
         }
     };
     let r = crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await;

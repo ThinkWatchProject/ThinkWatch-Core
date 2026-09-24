@@ -246,7 +246,7 @@ mod tests {
             client_hint: None,
             session_fp: None,
             provider: "p".into(),
-            billing: "per-token".into(),
+            billing: tw_api::Billing::PerToken,
             model: "m".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
@@ -272,7 +272,7 @@ mod tests {
         b.emit(tw_api::Event::RequestFailed {
             id: 2,
             model: "m".into(),
-            source: "upstream".into(),
+            source: tw_api::FailureSource::Upstream,
             message: tw_api::Msg {
                 code: "t.x".into(),
                 args: Default::default(),

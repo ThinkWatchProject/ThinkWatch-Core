@@ -56,7 +56,349 @@ macro_rules! slug_enum {
                 }
             }
         }
+        /// 写出来就是线上的那个词
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.slug())
+            }
+        }
+        /// 和线上的那个词比
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.slug() == other
+            }
+        }
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.slug() == *other
+            }
+        }
     };
+}
+
+// ---------------------------------------------------------------- 取值固定的词
+//
+// 下面这些是散在各处的字段共用的词表，按主题排。只在一个地方用到的集合写在
+// 它的类型旁边。
+
+slug_enum! {
+    /// 一个上游怎么收钱。
+    pub enum Billing {
+        /// 按价目表算，订阅账号也是
+        PerToken = "per-token",
+        /// 记 $0
+        Free = "free",
+    }
+}
+
+slug_enum! {
+    /// 上游说的接口协议。
+    pub enum Protocol {
+        Anthropic = "anthropic",
+        OpenaiChat = "openai-chat",
+        OpenaiResponses = "openai-responses",
+        Gemini = "gemini",
+        /// ChatGPT 账号登录的 Codex 后端
+        Chatgpt = "chatgpt",
+    }
+}
+
+slug_enum! {
+    /// 请求体的格式（方言）。
+    pub enum Dialect {
+        Anthropic = "anthropic",
+        OpenaiChat = "openai-chat",
+        OpenaiResponses = "openai-responses",
+        Gemini = "gemini",
+        /// 只有企业版接 Bedrock；桌面版不会发出这个词
+        Bedrock = "bedrock",
+    }
+}
+
+slug_enum! {
+    /// 代理的类型。
+    pub enum ProxyKind {
+        /// 把域名交给代理解析
+        Socks5h = "socks5h",
+        /// 本地解析 DNS
+        Socks5 = "socks5",
+        Http = "http",
+        Https = "https",
+    }
+}
+
+slug_enum! {
+    /// 代理用不了时怎么办。
+    pub enum OnProxyFail {
+        /// 请求失败
+        Fail = "fail",
+        /// 改走直连
+        Direct = "direct",
+    }
+}
+
+slug_enum! {
+    /// 一个上游的模型清单从哪儿来。
+    pub enum ModelSource {
+        /// 上游列出的
+        Discovered = "discovered",
+        /// 配置里手写的
+        Manual = "manual",
+        /// 都没有：不知道它有什么
+        None = "none",
+    }
+}
+
+slug_enum! {
+    /// 一个上游现在能不能进候选链。
+    pub enum Health {
+        Ok = "ok",
+        /// 熔断中
+        Open = "open",
+    }
+}
+
+slug_enum! {
+    /// 熔断器的状态变成了什么。
+    pub enum BreakerState {
+        /// 熔断中，不进候选链
+        Open = "open",
+        /// 可以用
+        Closed = "closed",
+    }
+}
+
+slug_enum! {
+    /// 代理通不通。
+    pub enum ProxyState {
+        /// 刚刚检查不通
+        Unreachable = "unreachable",
+        /// 又通了
+        Reachable = "reachable",
+    }
+}
+
+slug_enum! {
+    /// 上游接不接受凭据。
+    pub enum AuthState {
+        /// 上游拒绝了凭据
+        Rejected = "rejected",
+        /// 又能用了
+        Accepted = "accepted",
+    }
+}
+
+slug_enum! {
+    /// 一个请求失败在哪一方。和 HTTP 响应里的 `x-thinkwatch-error` 同一个词表，
+    /// 另外多一个 `internal`。
+    pub enum FailureSource {
+        Auth = "auth",
+        Config = "config",
+        Upstream = "upstream",
+        Request = "request",
+        RateLimited = "rate_limited",
+        Denied = "denied",
+        /// 网关自己的代码崩掉了
+        Internal = "internal",
+    }
+}
+
+slug_enum! {
+    /// 一项防护的档位。
+    pub enum GuardMode {
+        Off = "off",
+        /// 只记录
+        Observe = "observe",
+        /// 拦截
+        Enforce = "enforce",
+    }
+}
+
+slug_enum! {
+    /// 安全日志的一条做了什么。
+    pub enum SecurityOutcome {
+        /// 只记录
+        Recorded = "recorded",
+        /// 已替换成占位符
+        Replaced = "replaced",
+        /// 已切断
+        Cut = "cut",
+        /// 请求被拒，没有发出去
+        Blocked = "blocked",
+    }
+}
+
+slug_enum! {
+    /// 内容规则怎么认。
+    pub enum ContentMatch {
+        /// 不分大小写的子串
+        Contains = "contains",
+        Regex = "regex",
+    }
+}
+
+slug_enum! {
+    /// 出站脱敏找到的东西属于哪一类。
+    pub enum SecretKind {
+        ApiKeys = "api-keys",
+        PrivateKeys = "private-keys",
+        Jwt = "jwt",
+        ConnStrings = "conn-strings",
+        /// 内网地址
+        Internal = "internal",
+        /// 自定义规则找到的
+        Custom = "custom",
+    }
+}
+
+slug_enum! {
+    /// 藏匿字符的藏法。
+    pub enum HiddenKind {
+        /// 零宽字符
+        ZeroWidth = "zero_width",
+        /// Unicode 标签字符
+        Tag = "tag",
+        /// 双向控制符
+        Bidi = "bidi",
+        /// 同形异义字
+        Homoglyph = "homoglyph",
+        /// 私用区
+        PrivateUse = "private_use",
+    }
+}
+
+slug_enum! {
+    /// 一次账号登录走到哪儿了。
+    pub enum LoginStatus {
+        Pending = "pending",
+        Done = "done",
+        Failed = "failed",
+        Expired = "expired",
+        Cancelled = "cancelled",
+    }
+}
+
+slug_enum! {
+    /// ChatGPT 在哪台设备上授权。
+    pub enum ChatgptLoginMode {
+        /// 这台机器的浏览器
+        Browser = "browser",
+        /// 把码输到另一台设备上
+        Device = "device",
+    }
+}
+
+slug_enum! {
+    /// 登哪一家的账号。
+    pub enum ZaiFamily {
+        Zai = "zai",
+        Bigmodel = "bigmodel",
+    }
+}
+
+slug_enum! {
+    /// 一版配置是谁写的。
+    pub enum ConfigOrigin {
+        /// 界面
+        Ui = "ui",
+        /// 命令行
+        Cli = "cli",
+        /// 别的程序或者编辑器
+        External = "external",
+        /// 回滚
+        Rollback = "rollback",
+        /// OAuth 凭据轮换之后写回
+        Rotation = "rotation",
+    }
+}
+
+slug_enum! {
+    /// 配置错在哪一层。
+    pub enum ConfigStage {
+        /// YAML 写坏了
+        Syntax = "syntax",
+        /// 字段名或取值不对
+        Schema = "schema",
+        /// 单看每个字段都对，合起来不成立
+        Semantics = "semantics",
+    }
+}
+
+slug_enum! {
+    /// 价目表从哪儿来。
+    pub enum PricingSource {
+        /// 随版本内置
+        Builtin = "builtin",
+        /// 联网刷新过
+        Fetched = "fetched",
+        Empty = "empty",
+    }
+}
+
+slug_enum! {
+    /// 客户端自己发的辅助请求是哪一类。
+    pub enum ProbeClass {
+        HealthCheck = "health_check",
+        Warmup = "warmup",
+        Titling = "titling",
+        TopicDetect = "topic_detect",
+        Suggestion = "suggestion",
+    }
+}
+
+slug_enum! {
+    /// 一类辅助请求怎么处理。
+    pub enum ProbeMode {
+        /// 网关自己答
+        Intercept = "intercept",
+        /// 照常走路由
+        Route = "route",
+        /// 原样转发
+        Passthrough = "passthrough",
+    }
+}
+
+slug_enum! {
+    /// 路由规则 `when` 里的键。
+    pub enum ConditionField {
+        Model = "model",
+        Client = "client",
+        Dialect = "dialect",
+        InputTokens = "input_tokens",
+        MaxTokens = "max_tokens",
+        ToolCount = "tool_count",
+        Intent = "intent",
+        ProviderWouldBe = "provider_would_be",
+        Cache = "cache",
+        Tools = "tools",
+        Image = "image",
+        Thinking = "thinking",
+        Stream = "stream",
+    }
+}
+
+slug_enum! {
+    /// 路由规则 `set` 里的改写。
+    pub enum SetField {
+        /// 换模型，整个 prompt cache 作废
+        Model = "model",
+        MaxTokens = "max_tokens",
+        Thinking = "thinking",
+        /// 以上改写只在新会话开始时应用
+        OnlyAtSessionStart = "only_at_session_start",
+    }
+}
+
+slug_enum! {
+    /// 一个上游为什么服务不了这个模型。
+    pub enum ServeSkip {
+        /// 上游停用了
+        Disabled = "disabled",
+        /// 不在启用范围里
+        OutOfScope = "out_of_scope",
+        /// 模型清单里没有
+        NotOffered = "not_offered",
+    }
 }
 
 /// core 发得出的每一个消息码（[`Msg::code`]），一行一个，按字母排。
@@ -131,7 +473,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 变的是类型；尝试链每一跳的 `error`、模型清单的 `model_error` / `error`、
 /// 检测上游的 `error` 原来是一句英文字符串，中文界面上只能原样显示。照 13 写的
 /// 界面会把这三处画成一个对象。
-pub const CONTROL_API_VERSION: u32 = 14;
+///
+/// **15 把剩下的固定取值也换成了枚举，凭据和账号登录的原因是 [`Msg`]。**线上的词
+/// 没变（计费方式、协议、格式、代理类型、档位、熔断和代理状态、失败来源、登录
+/// 状态、配置来源、试算的结论和明细……）；换了类型的原因：`CredentialRotated` /
+/// `CredentialExpired` 的 `detail`、`OAuthView.failure`、三处登录的 `error`、
+/// `ConfigRejected.message`、`RuleTrace.error`。照 14 写的界面会把这些画成一个对象。
+pub const CONTROL_API_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -201,7 +549,7 @@ pub enum Event {
         /// 一个，是因为不是每个请求都等得到那一条：上游应答之前客户端就走了
         /// 的、WebSocket 升级没完成就断开的、被第二阶段规则拒绝的，手上只有
         /// 这一个 —— 少了它，那一行说不出该按什么记账。
-        billing: String,
+        billing: Billing,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账
         model: String,
@@ -241,7 +589,7 @@ pub enum Event {
         id: u64,
         /// 模型名。理由见 `RequestFinished::model`
         model: String,
-        source: String,
+        source: FailureSource,
         message: Msg,
         /// 失败之前从上游收到了多少字节。**响应头都没到的没有**
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,7 +657,7 @@ pub enum Event {
         /// 而一条三天前的记录该按它当时那家的计费方式算。
         ///
         /// 一家都没接下时是 `per-token`：没有哪一家的计费方式可以跟着走。
-        billing: String,
+        billing: Billing,
     },
     /// 调用方发来的正文里（连同工具结果）有藏起来的字符：标签字符或双向控制符。
     ///
@@ -388,7 +736,7 @@ pub enum Event {
         /// 写回 config.yaml 成功了吗
         persisted: bool,
         /// 人话。成功时说写到哪儿了，失败时说卡在哪一步。**不含 token**
-        detail: String,
+        detail: Msg,
         at_ms: u64,
     },
     /// OAuth 凭据失效了：refresh token 过期、被用过或者被吊销。
@@ -399,7 +747,7 @@ pub enum Event {
         id: u64,
         provider: String,
         /// 失效的原因，**已打码**
-        detail: String,
+        detail: Msg,
         at_ms: u64,
     },
     /// 一次账号登录结束了：成功、失败、过期或者取消。
@@ -411,11 +759,11 @@ pub enum Event {
         /// 发起登录时拿到的 ID
         login: String,
         /// `done` / `failed` / `expired` / `cancelled`
-        status: String,
+        status: LoginStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        error: Option<Msg>,
         at_ms: u64,
     },
     /// 这次请求做了方言互转（M6+）。
@@ -426,8 +774,8 @@ pub enum Event {
     Translated {
         id: u64,
         provider: String,
-        from: String,
-        to: String,
+        from: Dialect,
+        to: Dialect,
         /// 丢掉的字段，按它在请求体里的位置写：`thinking`、`top_k`、
         /// `messages.content.thinking`、`messages.content.image.source.file` …
         dropped: Vec<String>,
@@ -511,7 +859,7 @@ pub enum Event {
         id: u64,
         provider: String,
         /// `open` = 熔断中，不进候选链；`closed` = 可以用
-        state: String,
+        state: BreakerState,
         at_ms: u64,
     },
     /// 某家上游的模型清单开始获取了，或者获取完了（列出来了、没列出来、
@@ -533,7 +881,7 @@ pub enum Event {
         id: u64,
         proxy: String,
         /// `unreachable` = 刚刚检查不通；`reachable` = 又通了
-        state: String,
+        state: ProxyState,
         /// 不通时卡在建连的哪一步。**和原因分开** —— 「卡在到代理的 TCP
         /// 握手」要去改的地方和「代理拒绝了用户名和密码」完全不同，而把
         /// 两句话拼成一个字符串之后，界面就只能整句照搬
@@ -552,7 +900,7 @@ pub enum Event {
         id: u64,
         provider: String,
         /// `rejected` = 上游拒绝了凭据；`accepted` = 又能用了
-        state: String,
+        state: AuthState,
         /// 被拒时上游给的状态码
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
@@ -606,7 +954,7 @@ pub enum Event {
         /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
         version: String,
         /// `ui` / `cli` / `external` / `rollback` / `rotation`
-        origin: String,
+        origin: ConfigOrigin,
         at_ms: u64,
     },
     /// 新配置没过关，**旧的还在服务**。
@@ -617,8 +965,8 @@ pub enum Event {
         id: u64,
         /// `syntax`（YAML 写坏了）/ `schema`（字段名或取值不对）/
         /// `semantics`（单看每个字段都对，合起来不成立）
-        stage: String,
-        message: String,
+        stage: ConfigStage,
+        message: Msg,
         /// 1 起。语义错误没有，那时硬指一行只会误导
         line: Option<usize>,
         /// 出错那一行的原文，**已脱敏**
@@ -627,7 +975,7 @@ pub enum Event {
         ///
         /// **界面靠它区分「用户在编辑器里写错了」和「界面自己刚写坏了」** ——
         /// 前者要提醒，后者是保存失败，那条路自己会报。
-        origin: String,
+        origin: ConfigOrigin,
         at_ms: u64,
     },
     /// 客户端的辅助请求被本地应答了，一个字节都没发给上游。
@@ -653,7 +1001,7 @@ pub enum Event {
 
         /// 哪一类辅助请求，和 `ProbeView.id` 同一个词表。字段叫 `probe` 而
         /// 不是 `kind` —— 那个名字已经被枚举的 tag 占了
-        probe: String,
+        probe: ProbeClass,
         at_ms: u64,
     },
     /// 这个订阅者跟不上，事件流丢了它 `count` 条事件。
@@ -869,7 +1217,7 @@ pub struct PriceSheetView {
 pub struct ProxyView {
     pub name: String,
     /// `socks5h` / `socks5` / `http` / `https`
-    pub kind: String,
+    pub kind: ProxyKind,
     pub addr: String,
     /// 有没有认证。**用户名和密码都不在这里** —— 用户名是凭据的一半，
     /// 而这个视图会进日志、进诊断包、进用户贴出来的截图
@@ -906,9 +1254,9 @@ pub struct ProxyFault {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProbeView {
     /// `health_check` / `warmup` / `titling` / `topic_detect` / `suggestion`
-    pub id: String,
+    pub id: ProbeClass,
     /// `intercept` / `route` / `passthrough`
-    pub mode: String,
+    pub mode: ProbeMode,
 }
 
 /// 日志留多久。两个期限分开，因为正文和记录行的代价差三个数量级 ——
@@ -932,14 +1280,14 @@ pub struct RetentionView {
 /// **「拦截」在各项上做的事不一样**：脱敏是替换成占位符，工具调用审查和输出长度
 /// 是切断响应，藏匿字符和内容过滤是拒绝请求。
 /// 规则和日志在 [`SecurityDetail`] 和 `/security/events` 里，不塞进概览。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityView {
-    pub redact: String,
-    pub inspect_tools: String,
-    pub hidden_text: String,
-    pub content: String,
-    pub output_limit: String,
+    pub redact: GuardMode,
+    pub inspect_tools: GuardMode,
+    pub hidden_text: GuardMode,
+    pub content: GuardMode,
+    pub output_limit: GuardMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -964,13 +1312,13 @@ pub struct ProviderView {
     pub oauth: Option<OAuthView>,
     /// 实际生效的协议：`anthropic` / `openai-chat` / `openai-responses` /
     /// `gemini`。猜不出来时为空
-    pub protocol: Option<String>,
+    pub protocol: Option<Protocol>,
     /// 协议是配置里写明的，还是按地址推断的
     pub protocol_explicit: bool,
     /// `direct` / `system` / 代理名
     pub proxy: String,
     /// `fail` / `direct`
-    pub on_proxy_fail: String,
+    pub on_proxy_fail: OnProxyFail,
     /// 服务不提供模型列表时用的手动清单
     pub models: Vec<String>,
     /// 启用范围：只用这些模型（ID 或 glob）。空 = 它提供的全部
@@ -978,7 +1326,7 @@ pub struct ProviderView {
     pub models_only: Option<Vec<String>>,
     /// 模型清单从哪儿来：`discovered`（上游列出的）/ `manual`（手动清单）/
     /// `none`（不知道它有什么）
-    pub model_source: String,
+    pub model_source: ModelSource,
     /// 最近一次向上游获取清单的结果
     pub model_status: ModelListStatus,
     /// 正在获取。上一次的结果照常有效
@@ -994,7 +1342,7 @@ pub struct ProviderView {
     /// 停用：不参与路由，模型不出现在 `/v1/models` 里
     pub disabled: bool,
     /// `ok` / `open`（熔断中）
-    pub health: String,
+    pub health: Health,
     /// 上游拒绝了凭据：最近一次得到答复的请求回的是这个状态码（401 / 403）。
     /// 没被拒是空的，被拒之后有请求成功了也是空的。
     ///
@@ -1003,7 +1351,7 @@ pub struct ProviderView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_rejected: Option<u16>,
     /// 计费方式：`per-token`（按价目表算，订阅账号也是）/ `free`（记 $0）
-    pub billing: String,
+    pub billing: Billing,
     /// 谁在引用它。**删之前要知道**，改名时它们会跟着改
     pub references: Vec<ReferenceView>,
     /// 选的价目表。空 = 默认价目表
@@ -1044,7 +1392,7 @@ pub struct OAuthView {
     pub expires_at: Option<String>,
     /// 最近一次刷新失败的原因。**已打码**；没失败过、或者已经恢复就没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<String>,
+    pub failure: Option<Msg>,
     /// 凭据已经失效，只有重新登录能恢复
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_login: bool,
@@ -1112,7 +1460,7 @@ pub struct ConditionView {
     /// `when` 里的键：`model` / `client` / `dialect` / `input_tokens` /
     /// `max_tokens` / `tool_count` / `intent` / `provider_would_be` /
     /// `cache` / `tools` / `image` / `thinking` / `stream`
-    pub field: String,
+    pub field: ConditionField,
     /// 写的值。`intent` 和 `provider_would_be` 可以写多个，满足其一即可；
     /// 布尔条件是 `true` / `false`；数量条件是比较式（`>200k`）
     pub values: Vec<String>,
@@ -1333,7 +1681,7 @@ pub struct ProviderTestResult {
     /// 地址通、凭据被接受
     pub ok: bool,
     /// 按哪种协议测的
-    pub protocol: Option<String>,
+    pub protocol: Option<Protocol>,
     pub latency_ms: u64,
     pub models: ModelList,
     /// 经由哪个代理。直连时为空
@@ -1539,7 +1887,7 @@ pub struct PricingStatus {
     /// 这份表的数据日期。**费用旁边要标它**
     pub date: String,
     /// `builtin`（随版本内置）/ `fetched`（联网刷新过）/ `empty`
-    pub source: String,
+    pub source: PricingSource,
     /// 表里有多少个模型
     pub models: usize,
     /// 定期刷新开没开
@@ -1763,13 +2111,13 @@ pub struct ProviderInput {
     /// `anthropic` / `openai-chat` / `openai-responses` / `gemini`。
     /// 不给就按地址推断
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    pub protocol: Option<Protocol>,
     /// `direct` / `system` / 代理名
     #[serde(default = "direct")]
     pub proxy: String,
     /// `fail` / `direct`
     #[serde(default = "fail_closed")]
-    pub on_proxy_fail: String,
+    pub on_proxy_fail: OnProxyFail,
     /// 服务不提供模型列表时的手动清单
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
@@ -1778,7 +2126,7 @@ pub struct ProviderInput {
     pub models_only: Option<Vec<String>>,
     /// `per-token` / `free`。不给就是按量计费
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub billing: Option<String>,
+    pub billing: Option<Billing>,
     /// 按哪张价目表计价。不给就是默认价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
@@ -1795,7 +2143,7 @@ pub struct ProviderPreviewRequest {
     pub base_url: String,
     /// 表单里选定的协议。不给就是「自动识别」。只影响 `auth_header`
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    pub protocol: Option<Protocol>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1803,7 +2151,7 @@ pub struct ProviderPreviewRequest {
 pub struct ProviderPreview {
     /// 按地址推断的接口协议。推断不出是空（转发时按 Anthropic 处理）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    pub protocol: Option<Protocol>,
     /// API 密钥放在哪个请求头里：`x-api-key` / `authorization` / `x-goog-api-key`。
     /// 选定了协议按选定的算，否则按推断出的
     pub auth_header: String,
@@ -1829,7 +2177,7 @@ slug_enum! {
 pub struct ProviderModelsView {
     pub provider: String,
     /// `discovered`（上游列出的）/ `manual`（手动清单）/ `none`
-    pub source: String,
+    pub source: ModelSource,
     /// 最近一次获取的结果，同 [`ProviderView::model_status`]
     pub status: ModelListStatus,
     /// 正在获取
@@ -1873,8 +2221,8 @@ fn direct() -> String {
     "direct".to_string()
 }
 
-fn fail_closed() -> String {
-    "fail".to_string()
+fn fail_closed() -> OnProxyFail {
+    OnProxyFail::Fail
 }
 
 /// 一个密钥类的值怎么改。**三态**，因为视图里拿不到原值：不动就得有「保持原样」。
@@ -1946,7 +2294,7 @@ pub struct ProviderTest {
 pub struct ProxyInput {
     pub name: String,
     /// `socks5h` / `socks5` / `http` / `https`
-    pub kind: String,
+    pub kind: ProxyKind,
     /// `host:port`
     pub addr: String,
     pub auth: ProxyAuthInput,
@@ -2226,7 +2574,7 @@ pub struct ConfigVersion {
     pub version: String,
     pub at_ms: u64,
     /// `ui` / `cli` / `external` / `rollback` / `rotation`
-    pub origin: String,
+    pub origin: ConfigOrigin,
     pub bytes: u64,
     /// 这一版是现在跑着的那一版吗。
     ///
@@ -2401,7 +2749,7 @@ pub struct HistoryRow {
     pub cancelled: bool,
     /// 服务它的那家怎么收钱：`per-token` / `free`。本地应答的是 `free`：网关
     /// 自己答的，费用确实是零
-    pub billing: String,
+    pub billing: Billing,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_saved_micros: Option<i64>,
@@ -2448,9 +2796,9 @@ pub struct HistoryRow {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TranslatedView {
     /// 客户端的格式：`anthropic` / `openai-chat` / `openai-responses` / `gemini`
-    pub from: String,
+    pub from: Dialect,
     /// 服务它的上游的格式
-    pub to: String,
+    pub to: Dialect,
     /// 客户端请求里转不过去、被丢掉的字段路径
     #[serde(default)]
     pub dropped: Vec<String>,
@@ -2510,7 +2858,7 @@ pub struct ChatgptLoginStart {
     /// 在哪台设备上授权：`browser`（默认，在这台机器上开浏览器）或 `device`（拿一个
     /// 一次性码，去别的设备上输）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    pub mode: Option<ChatgptLoginMode>,
 }
 
 /// 一次进行中的登录。
@@ -2537,7 +2885,7 @@ pub struct ChatgptLogin {
 pub struct ChatgptLoginStatus {
     pub id: String,
     /// `pending` / `done` / `failed` / `expired` / `cancelled`
-    pub status: String,
+    pub status: LoginStatus,
     /// 写进配置的上游名。`done` 时有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -2546,7 +2894,7 @@ pub struct ChatgptLoginStatus {
     pub plan: Option<String>,
     /// `failed` 时的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
 }
 
 /// ChatGPT 账号的用量（`GET /providers/{name}/chatgpt/usage`）。
@@ -2624,7 +2972,7 @@ pub struct ResetCreditUsed {
 pub struct ZaiLoginStart {
     /// 登哪一家：`zai`（api.z.ai）或 `bigmodel`（open.bigmodel.cn）。不给是 `zai`
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub family: Option<String>,
+    pub family: Option<ZaiFamily>,
     /// 登录后写进配置的上游名。不给就是那一家的名字；已经有同名的同一家账号上游时，
     /// 换掉它的密钥（重新登录），其余设置不动
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2655,7 +3003,7 @@ pub struct ZaiLogin {
 pub struct ZaiLoginStatus {
     pub id: String,
     /// `pending` / `done` / `failed` / `expired` / `cancelled`
-    pub status: String,
+    pub status: LoginStatus,
     /// 写进配置的上游名。`done` 时有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -2664,7 +3012,7 @@ pub struct ZaiLoginStatus {
     pub account: Option<String>,
     /// `failed` 时的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
 }
 
 /// L3 测速要花多少。
@@ -2686,11 +3034,11 @@ pub struct SpeedEstimate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<i64>,
     /// 这家的计费方式：`per-token` / `free`
-    pub billing: String,
+    pub billing: Billing,
     /// 这家服务不了这个模型：`out_of_scope`（不在启用范围里）/
     /// `not_offered`（模型清单里没有）。有值时不进合计，也不会被测
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skipped: Option<String>,
+    pub skipped: Option<ServeSkip>,
 }
 
 /// 一批测速的账。
@@ -2813,7 +3161,7 @@ pub struct TurnView {
     pub cost_estimated: bool,
     /// 服务它的那家怎么收钱，和 `HistoryRow::billing` 同一套词：`per-token` /
     /// `free`
-    pub billing: String,
+    pub billing: Billing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2844,7 +3192,7 @@ pub struct ReplayQuote {
     /// `None` = 这个模型无法计价。**不是 0**
     pub cost_micros: Option<i64>,
     /// 要重放到的那家的计费方式：`per-token` / `free`
-    pub billing: String,
+    pub billing: Billing,
     /// 发出去之前会不会脱敏。用户有权在按下去之前知道
     pub will_redact: bool,
     pub pricing_date: String,
@@ -2885,6 +3233,18 @@ slug_enum! {
     }
 }
 
+slug_enum! {
+    /// 扫描发现出在客户端配置面的哪一类东西里。
+    pub enum ScanSource {
+        Hooks = "hooks",
+        Mcp = "mcp",
+        Skill = "skill",
+        Command = "command",
+        Agent = "agent",
+        Instructions = "instructions",
+    }
+}
+
 /// 一处发现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2893,7 +3253,7 @@ pub struct ScanFinding {
     /// 哪条规则命中的
     pub rule: String,
     /// `hooks` | `mcp` | `skill` | `command` | `agent` | `instructions`
-    pub kind: String,
+    pub kind: ScanSource,
     pub client: String,
     pub path: String,
     /// 第几行，从 1 开始
@@ -2958,12 +3318,21 @@ pub struct ScanResponse {
     pub projects: Vec<String>,
 }
 
+slug_enum! {
+    /// MCP 矩阵上的一下。
+    pub enum McpOp {
+        /// 从一个客户端拷到另一个
+        Copy = "copy",
+        Remove = "remove",
+    }
+}
+
 /// 在矩阵上点一下。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct McpOpRequest {
     /// `copy` 或 `remove`
-    pub op: String,
+    pub op: McpOp,
     pub name: String,
     /// `copy` 时从哪个客户端取
     #[serde(default)]
@@ -3007,7 +3376,7 @@ pub struct DryRunRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<RouteInput>,
     #[serde(default = "default_dialect")]
-    pub dialect: String,
+    pub dialect: Dialect,
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
@@ -3031,11 +3400,33 @@ pub struct DryRunRequest {
     pub intent: String,
 }
 
-fn default_dialect() -> String {
-    "anthropic".to_string()
+fn default_dialect() -> Dialect {
+    Dialect::Anthropic
 }
 fn default_true() -> bool {
     true
+}
+
+slug_enum! {
+    /// 试算时一条规则的结论。
+    pub enum RuleVerdict {
+        Matched = "matched",
+        Skipped = "skipped",
+        /// 条件要等选定上游之后才能求值，静态试算给不了结论
+        PhaseTwo = "phase_two",
+    }
+}
+
+slug_enum! {
+    /// 一条命中的规则起了什么作用。
+    pub enum RuleEffect {
+        /// 决定了去向
+        Decide = "decide",
+        /// 附加了改写
+        Apply = "apply",
+        /// 去向已由前面的规则决定，也没有附加项
+        None = "none",
+    }
 }
 
 /// 一条规则在这次试算里的下场。**没命中的也要列出来，并说清为什么** ——
@@ -3046,17 +3437,17 @@ pub struct RuleTrace {
     pub name: String,
     /// `matched` | `skipped` | `phase_two`（条件要等选定上游之后才能求值，
     /// 静态试算给不了结论）
-    pub verdict: String,
+    pub verdict: RuleVerdict,
     /// 没命中时，第一个没对上的条件
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mismatch: Option<MismatchView>,
     /// 条件本身写错了、没法求值时的说明
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
     /// 命中时它起了什么作用：`decide`（决定了去向）/ `apply`（附加了改写或
     /// 安全要求）/ `none`（去向已由前面的规则决定，也没有附加项）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effect: Option<String>,
+    pub effect: Option<RuleEffect>,
 }
 
 /// 一个没对上的条件。
@@ -3064,7 +3455,7 @@ pub struct RuleTrace {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct MismatchView {
     /// 和 `ConditionView.field` 同一个词表
-    pub field: String,
+    pub field: ConditionField,
     /// 规则里写的值。`intent` 写了多个时逐个列出
     pub want: Vec<String>,
     /// 这个请求实际的值。`intent` 为空表示真实的用户请求
@@ -3077,8 +3468,26 @@ pub struct MismatchView {
 pub struct SetView {
     /// `model`（换模型，整个 prompt cache 作废）/ `max_tokens` / `thinking` /
     /// `only_at_session_start`（以上改写只在新会话开始时应用，值是 `true`）
-    pub field: String,
+    pub field: SetField,
     pub value: String,
+}
+
+slug_enum! {
+    /// 一次试算的结论。
+    pub enum DryRunOutcome {
+        /// 走到了某个上游或组
+        Route = "route",
+        /// 被规则拒绝
+        Deny = "deny",
+        /// 没有规则命中
+        NoMatch = "no_match",
+        /// 选中的上游都服务不了，见 `skipped`
+        Unavailable = "unavailable",
+        /// 客户端的辅助请求，网关自己答
+        Intercepted = "intercepted",
+        /// 客户端的辅助请求，原样转发
+        Passthrough = "passthrough",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3092,14 +3501,14 @@ pub struct DryRunResult {
     /// **不说的话，用户看不懂候选为什么是这个顺序** —— 「我明明把官方
     /// 写在第一个」。直指 provider 时是 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<String>,
+    pub strategy: Option<GroupKind>,
     /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，
     /// 见 `skipped`）| `intercepted` | `passthrough`
     ///
     /// **后两个说的是这个请求压根没到规则那一层。**客户端自己发的辅助
     /// 请求先过 `client_probes`：本地应答的一个字节都不出本机，原样放行的
     /// 直接转发 —— 两种情况下 `trace` 都是空的，因为确实一条规则都没求值。
-    pub outcome: String,
+    pub outcome: DryRunOutcome,
     /// 命中的规则名
     pub rule: Option<String>,
     /// `deny` 时规则里写的拒绝理由
@@ -3127,9 +3536,9 @@ pub struct DryRunResult {
 pub struct ConvertedView {
     pub provider: String,
     /// 客户端的格式：`anthropic` / `openai-chat` / `openai-responses` / `gemini`
-    pub from: String,
+    pub from: Dialect,
     /// 这个上游的格式
-    pub to: String,
+    pub to: Dialect,
 }
 
 /// 一个被跳过的候选上游。
@@ -3138,7 +3547,7 @@ pub struct ConvertedView {
 pub struct SkippedView {
     pub provider: String,
     /// `disabled` / `out_of_scope` / `not_offered`
-    pub reason: String,
+    pub reason: ServeSkip,
 }
 
 // ---------------------------------------------------------- 客户端接管
@@ -3154,6 +3563,16 @@ slug_enum! {
         Immediately = "immediately",
         /// 客户端重新启动后才生效，读环境变量的要重开终端
         OnRestart = "on_restart",
+    }
+}
+
+slug_enum! {
+    /// 一个客户端的接管方式验证到什么程度。
+    pub enum Verification {
+        /// 在本机实际运行验证过
+        Measured = "measured",
+        /// 字段名查证过，没有在本机实际运行验证
+        FieldsOnly = "fields_only",
     }
 }
 
@@ -3183,7 +3602,7 @@ pub struct DetectedClient {
     pub warns_when_silent: bool,
     /// `measured`（在本机实际运行验证过）| `fields_only`（字段名查证过，
     /// 没有在本机实际运行验证）
-    pub verified: String,
+    pub verified: Verification,
     /// 接管之后会失去或改变的功能
     pub costs: Vec<Msg>,
     /// 为它生成的那把网关密钥（取消接管之后仍然记着）。还没有就不给
@@ -3292,12 +3711,20 @@ pub struct PlanView {
     pub key_created: bool,
 }
 
+slug_enum! {
+    /// 对一个字段做什么。
+    pub enum FieldOp {
+        Set = "set",
+        Remove = "remove",
+    }
+}
+
 /// 配置文件里的一处改动。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct FieldChange {
     /// `set` | `remove`
-    pub op: String,
+    pub op: FieldOp,
     /// 字段路径，按层级用 `.` 连起来：`env.ANTHROPIC_BASE_URL`
     pub path: String,
     /// 要写入的值。写的是网关密钥时不给
@@ -3354,7 +3781,7 @@ pub struct SecretItem {
     #[serde(default)]
     pub custom: bool,
     /// 类别：`api-keys` / `private-keys` / `jwt` / `conn-strings` / `internal` / `custom`
-    pub kind: String,
+    pub kind: SecretKind,
     /// **已打码。**报出来的东西一律打码 —— 「发现了 sk-ant-xxx」这句话本身
     /// 就是一次泄漏。内网地址和内部域名例外，它们不是凭据
     pub masked: String,
@@ -3366,7 +3793,7 @@ pub struct SecretItem {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HiddenItem {
     /// `tag`（Unicode 标签字符）/ `bidi`（双向控制符）
-    pub kind: String,
+    pub kind: HiddenKind,
     /// 在工具结果里，而不是调用方自己打的字
     pub in_tool_result: bool,
     pub count: u64,
@@ -3449,7 +3876,7 @@ pub struct SecurityEventView {
     pub custom: bool,
     /// 做了什么：`recorded`（只记录）/ `replaced`（已替换）/ `cut`（已切断）/
     /// `blocked`（请求被拒，没有发出去）
-    pub action: String,
+    pub action: SecurityOutcome,
     /// 请求最终由哪个上游服务；还没结束的是当时的首选
     pub provider: String,
     /// 哪把网关密钥
@@ -3546,7 +3973,7 @@ pub struct SecurityRuleView {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GuardDetail {
     /// `off` / `observe` / `enforce`
-    pub mode: String,
+    pub mode: GuardMode,
     /// 按界面上的顺序：内置的在前，自定义的在后
     pub rules: Vec<SecurityRuleView>,
 }
@@ -3556,7 +3983,7 @@ pub struct GuardDetail {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct OutputLimitDetail {
     /// `off` / `observe` / `enforce`
-    pub mode: String,
+    pub mode: GuardMode,
     /// 上限，按字符数
     pub max_chars: u64,
     /// 出厂的上限
@@ -3582,7 +4009,7 @@ pub struct SecurityDetail {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModeSave {
     /// `off` / `observe` / `enforce`
-    pub mode: String,
+    pub mode: GuardMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
 }
@@ -3619,7 +4046,7 @@ pub struct CustomRuleSave {
     /// 内容过滤才有：`contains`（不分大小写的子串）/ `regex`。不给按 `contains`。
     /// 别的防护的自定义规则都是正则
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
-    pub matching: Option<String>,
+    pub matching: Option<ContentMatch>,
     #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3650,7 +4077,7 @@ pub struct SecurityTestRequest {
     pub pattern: Option<String>,
     /// 内容过滤试 `pattern` 时怎么认：`contains` / `regex`，不给按 `contains`
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
-    pub matching: Option<String>,
+    pub matching: Option<ContentMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
 }
@@ -3702,25 +4129,69 @@ mod tests {
             }
             assert!(from("no-such-word").is_none());
         }
-        check(Guard::ALL, Guard::slug, Guard::from_slug);
-        check(GroupKind::ALL, GroupKind::slug, GroupKind::from_slug);
+        check(Billing::ALL, Billing::slug, Billing::from_slug);
+        check(Protocol::ALL, Protocol::slug, Protocol::from_slug);
+        check(Dialect::ALL, Dialect::slug, Dialect::from_slug);
+        check(ProxyKind::ALL, ProxyKind::slug, ProxyKind::from_slug);
+        check(OnProxyFail::ALL, OnProxyFail::slug, OnProxyFail::from_slug);
+        check(ModelSource::ALL, ModelSource::slug, ModelSource::from_slug);
+        check(Health::ALL, Health::slug, Health::from_slug);
         check(
-            ModelListStatus::ALL,
-            ModelListStatus::slug,
-            ModelListStatus::from_slug,
+            BreakerState::ALL,
+            BreakerState::slug,
+            BreakerState::from_slug,
         );
-        check(TakesEffect::ALL, TakesEffect::slug, TakesEffect::from_slug);
+        check(ProxyState::ALL, ProxyState::slug, ProxyState::from_slug);
+        check(AuthState::ALL, AuthState::slug, AuthState::from_slug);
+        check(
+            FailureSource::ALL,
+            FailureSource::slug,
+            FailureSource::from_slug,
+        );
+        check(GuardMode::ALL, GuardMode::slug, GuardMode::from_slug);
+        check(
+            SecurityOutcome::ALL,
+            SecurityOutcome::slug,
+            SecurityOutcome::from_slug,
+        );
+        check(
+            ContentMatch::ALL,
+            ContentMatch::slug,
+            ContentMatch::from_slug,
+        );
+        check(SecretKind::ALL, SecretKind::slug, SecretKind::from_slug);
+        check(HiddenKind::ALL, HiddenKind::slug, HiddenKind::from_slug);
+        check(LoginStatus::ALL, LoginStatus::slug, LoginStatus::from_slug);
+        check(
+            ChatgptLoginMode::ALL,
+            ChatgptLoginMode::slug,
+            ChatgptLoginMode::from_slug,
+        );
+        check(ZaiFamily::ALL, ZaiFamily::slug, ZaiFamily::from_slug);
+        check(
+            ConfigOrigin::ALL,
+            ConfigOrigin::slug,
+            ConfigOrigin::from_slug,
+        );
+        check(ConfigStage::ALL, ConfigStage::slug, ConfigStage::from_slug);
+        check(
+            PricingSource::ALL,
+            PricingSource::slug,
+            PricingSource::from_slug,
+        );
+        check(ProbeClass::ALL, ProbeClass::slug, ProbeClass::from_slug);
+        check(ProbeMode::ALL, ProbeMode::slug, ProbeMode::from_slug);
+        check(
+            ConditionField::ALL,
+            ConditionField::slug,
+            ConditionField::from_slug,
+        );
+        check(SetField::ALL, SetField::slug, SetField::from_slug);
+        check(ServeSkip::ALL, ServeSkip::slug, ServeSkip::from_slug);
         check(
             AttemptOutcome::ALL,
             AttemptOutcome::slug,
             AttemptOutcome::from_slug,
-        );
-        check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);
-        check(ScanLevel::ALL, ScanLevel::slug, ScanLevel::from_slug);
-        check(
-            FindingLevel::ALL,
-            FindingLevel::slug,
-            FindingLevel::from_slug,
         );
         check(L1Step::ALL, L1Step::slug, L1Step::from_slug);
         check(L1Peer::ALL, L1Peer::slug, L1Peer::from_slug);
@@ -3729,6 +4200,36 @@ mod tests {
             L1SkipReason::slug,
             L1SkipReason::from_slug,
         );
+        check(
+            ModelListStatus::ALL,
+            ModelListStatus::slug,
+            ModelListStatus::from_slug,
+        );
+        check(GroupKind::ALL, GroupKind::slug, GroupKind::from_slug);
+        check(ScanLevel::ALL, ScanLevel::slug, ScanLevel::from_slug);
+        check(ScanSource::ALL, ScanSource::slug, ScanSource::from_slug);
+        check(McpOp::ALL, McpOp::slug, McpOp::from_slug);
+        check(RuleVerdict::ALL, RuleVerdict::slug, RuleVerdict::from_slug);
+        check(RuleEffect::ALL, RuleEffect::slug, RuleEffect::from_slug);
+        check(
+            DryRunOutcome::ALL,
+            DryRunOutcome::slug,
+            DryRunOutcome::from_slug,
+        );
+        check(TakesEffect::ALL, TakesEffect::slug, TakesEffect::from_slug);
+        check(
+            Verification::ALL,
+            Verification::slug,
+            Verification::from_slug,
+        );
+        check(FieldOp::ALL, FieldOp::slug, FieldOp::from_slug);
+        check(
+            FindingLevel::ALL,
+            FindingLevel::slug,
+            FindingLevel::from_slug,
+        );
+        check(Guard::ALL, Guard::slug, Guard::from_slug);
+        check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);
         assert_eq!(GroupKind::LoadBalance.slug(), "load-balance");
         assert_eq!(Guard::InspectTools.slug(), "inspect_tools");
     }
@@ -3763,7 +4264,7 @@ mod tests {
                 client_hint: None,
                 session_fp: None,
                 provider: "p".into(),
-                billing: "per-token".into(),
+                billing: Billing::PerToken,
                 model: "m".into(),
                 method: "POST".into(),
                 path: "/v1/messages".into(),
@@ -3785,7 +4286,7 @@ mod tests {
             Event::RequestFailed {
                 id: 7,
                 model: String::new(),
-                source: "upstream".into(),
+                source: FailureSource::Upstream,
                 message: tw_types::msg!("t.x" => "x"),
                 bytes: None,
                 duration_ms: None,

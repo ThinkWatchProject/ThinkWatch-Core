@@ -106,7 +106,6 @@ config.credential.claude_subscription
 config.credential.duplicate_header
 config.credential.empty_key
 config.credential.empty_oauth
-config.credential.env passthrough
 config.credential.google_subscription
 config.credential.identity_header
 config.credential.key_and_auth_header
@@ -138,11 +137,16 @@ config.output_limit_range
 config.rejected
 config.rejected_at
 config.reserved_name
+config.rotate.no_provider
+config.rotate.read_back_differs
 config.rule_name_empty
 config.rule_name_taken
 config.rule_pattern_bad
 config.rule_pattern_empty
 config.schema_too_new
+config.secret.empty_name
+config.secret.env_missing
+config.secret.unterminated
 config.store.conflict
 config.store.missing
 config.store.read_failed
@@ -161,9 +165,13 @@ control.callback_ports_busy
 control.chatgpt_backend_not_json
 control.chatgpt_backend_status
 control.chatgpt_backend_unreachable
+control.chatgpt_login.approval_unreadable
+control.chatgpt_login.device_status
+control.chatgpt_login.expired
+control.chatgpt_login.no_code
+control.chatgpt_login.page_error
 control.client_unknown
 control.config_stale
-control.credentials_failed
 control.default_key_cannot_delete
 control.default_key_cannot_disable
 control.default_route_cannot_delete
@@ -207,7 +215,6 @@ control.pricing.save_failed
 control.pricing.status
 control.pricing.too_large
 control.pricing.unreachable
-control.provider_test.credentials
 control.provider_test.oauth_unsaved
 control.proxy_addr_form
 control.proxy_in_use
@@ -222,6 +229,7 @@ control.request_rejected
 control.reset_card_result_unreadable
 control.reset_cards_unreadable
 control.response_body_gone
+control.rotation.written
 control.route.duplicate_rule
 control.route_not_found
 control.rule.condition_no_value
@@ -233,7 +241,6 @@ control.rule.forward_and_deny
 control.rule.no_such_key
 control.rule.no_such_probe_class
 control.rule.no_such_upstream
-control.rule.unknown_condition
 control.rule.unknown_dialect
 control.session_not_found
 control.sheet_in_use
@@ -244,14 +251,19 @@ control.signin_response_unusable
 control.store_off
 control.store_unavailable
 control.unauthorized
-control.unknown_account_family
 control.unknown_probe_class
-control.unknown_signin_mode
-control.unsupported_action
-control.unsupported_value
 control.upstream_in_use
 control.upstream_not_found
 control.user_empty
+control.zai_login.expired
+control.zai_login.key_id_unexpected
+control.zai_login.key_without_id
+control.zai_login.key_without_secret
+control.zai_login.no_access_token
+control.zai_login.no_account_token
+control.zai_login.no_project
+control.zai_login.refused
+control.zai_login.unknown_state
 engine.compare.bad_number
 engine.compare.bad_unit
 engine.compare.empty
@@ -270,16 +282,18 @@ gw.auth.key_invalid
 gw.auth.no_key
 gw.auth.source_not_allowed
 gw.auth.source_not_allowed_hint
+gw.chatgpt.token_missing
+gw.chatgpt.token_not_json
+gw.chatgpt.token_status
+gw.chatgpt.token_unreachable
 gw.config.allow_from
 gw.config.http_client
 gw.config.no_upstreams
-gw.config.proxy_password
 gw.config.proxy_undefined
 gw.config.proxy_unusable
 gw.config.security_rules passthrough
 gw.content.refused
 gw.convert.failed
-gw.credentials.failed
 gw.hidden_text.refused_message
 gw.hidden_text.refused_tool_result
 gw.internal
@@ -294,10 +308,19 @@ gw.model.no_upstream_available
 gw.model.not_allowed
 gw.model.unknown
 gw.models.check_failed
-gw.models.credentials
 gw.models.empty
 gw.models.no_endpoint
 gw.models.unrecognized
+gw.oauth.backoff.no_token
+gw.oauth.backoff.status
+gw.oauth.backoff.unreachable
+gw.oauth.expired
+gw.oauth.no_token
+gw.oauth.not_configured
+gw.oauth.rotation_no_manager
+gw.oauth.rotation_queue_full
+gw.oauth.status
+gw.oauth.unreachable
 gw.output_limit.cut
 gw.output_limit.withheld
 gw.probe.connect
@@ -332,7 +355,6 @@ l1.config.no_host
 l1.config.proxy_addr_form
 l1.config.proxy_addr_ipv6_brackets
 l1.config.proxy_addr_ipv6_form
-l1.config.proxy_password
 l1.config.proxy_port_not_a_number
 l1.config.proxy_undefined
 l1.config.system_proxy
@@ -413,8 +435,6 @@ security.nothing_to_test
 security.rule_name_empty
 security.unknown_action
 security.unknown_content_action
-security.unknown_match
-security.unknown_mode
 security.unknown_rule
 t.auth test
 t.broke test

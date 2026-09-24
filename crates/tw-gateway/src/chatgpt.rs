@@ -23,6 +23,7 @@ use bytes::Bytes;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tw_dialect::ir::Dialect;
+use tw_types::{Msg, msg};
 
 pub use tw_config::chatgpt::{ACCOUNT_HEADER, BASE_URL, CLIENT_ID, TOKEN_ENDPOINT};
 
@@ -313,7 +314,7 @@ pub async fn exchange_code(
     code: &str,
     verifier: &str,
     redirect_uri: &str,
-) -> Result<Tokens, String> {
+) -> Result<Tokens, Msg> {
     let resp = http
         .post(token_endpoint)
         .form(&[
@@ -326,9 +327,10 @@ pub async fn exchange_code(
         .send()
         .await
         .map_err(|e| {
-            format!(
-                "{} could not be reached: {e}",
-                tw_secret::redact_url(token_endpoint)
+            msg!(
+                "gw.chatgpt.token_unreachable",
+                endpoint = tw_secret::redact_url(token_endpoint), detail = e =>
+                "{endpoint} could not be reached: {detail}"
             )
         })?;
     let status = resp.status().as_u16();
@@ -339,13 +341,21 @@ pub async fn exchange_code(
                 .replace(code, "<omitted>")
                 .replace(verifier, "<omitted>"),
         );
-        return Err(format!(
-            "the token endpoint answered {status}: {}",
-            body.chars().take(400).collect::<String>()
+        return Err(msg!(
+            "gw.chatgpt.token_status",
+            status = status, body = body.chars().take(400).collect::<String>() =>
+            "The token endpoint answered {status}: {body}"
         ));
     }
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|_| "the token endpoint's response is not JSON".to_string())?;
+    let v: Value = serde_json::from_str(&text).map_err(
+        |_| msg!("gw.chatgpt.token_not_json" => "The token endpoint's response is not JSON."),
+    )?;
+    let missing = |field: &str| {
+        msg!(
+            "gw.chatgpt.token_missing", field = field =>
+            "The token endpoint's response has no {field}."
+        )
+    };
     let field = |k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())
@@ -353,10 +363,9 @@ pub async fn exchange_code(
             .map(str::to_string)
     };
     Ok(Tokens {
-        id_token: field("id_token").ok_or("the token endpoint's response has no id_token")?,
-        access: field("access_token").ok_or("the token endpoint's response has no access_token")?,
-        refresh: field("refresh_token")
-            .ok_or("the token endpoint's response has no refresh_token")?,
+        id_token: field("id_token").ok_or_else(|| missing("id_token"))?,
+        access: field("access_token").ok_or_else(|| missing("access_token"))?,
+        refresh: field("refresh_token").ok_or_else(|| missing("refresh_token"))?,
         expires_in: v.get("expires_in").and_then(|x| x.as_u64()),
     })
 }

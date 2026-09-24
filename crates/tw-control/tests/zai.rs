@@ -256,7 +256,7 @@ impl Bed {
                     ..
                 }) = self.events.recv().await
                 {
-                    return (status, provider, error);
+                    return (status.slug().to_string(), provider, error.map(|m| m.text));
                 }
             }
         })
@@ -512,7 +512,8 @@ async fn an_unknown_family_and_an_unknown_proxy_are_both_refused() {
     let (st, _) = b
         .call("POST", "/zai/login", json!({"family": "openai"}))
         .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 取值不在集合里：请求体本身读不成
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
     let (st, _) = b.call("POST", "/zai/login", json!({"proxy": "nope"})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(b.zai.hit("/api/v1/oauth/cli/init"), 0);

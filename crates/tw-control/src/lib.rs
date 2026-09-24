@@ -322,7 +322,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .iter()
             .map(|x| tw_api::ProxyView {
                 name: x.name.clone(),
-                kind: x.kind.slug().to_string(),
+                kind: x.kind.into(),
                 addr: x.addr.clone(),
                 // **密码不出这个函数。**它和上游的 key 是同一类东西，
                 // 而这个视图会进日志、进诊断包、进用户贴出来的截图。
@@ -377,11 +377,11 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         // 用不着它
         clients: keys::views(&s, keys::Reveal::Masked).await,
         security: tw_api::SecurityView {
-            redact: cfg.security.redact.mode.slug().to_string(),
-            inspect_tools: cfg.security.inspect_tools.mode.slug().to_string(),
-            hidden_text: cfg.security.hidden_text.mode.slug().to_string(),
-            content: cfg.security.content.mode.slug().to_string(),
-            output_limit: cfg.security.output_limit.mode.slug().to_string(),
+            redact: cfg.security.redact.mode.into(),
+            inspect_tools: cfg.security.inspect_tools.mode.into(),
+            hidden_text: cfg.security.hidden_text.mode.into(),
+            content: cfg.security.content.mode.into(),
+            output_limit: cfg.security.output_limit.mode.into(),
         },
         default_route: engine.default_route().to_string(),
         client_probes: cfg
@@ -389,8 +389,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .all()
             .into_iter()
             .map(|(id, mode)| tw_api::ProbeView {
-                id: id.to_string(),
-                mode: mode.slug().to_string(),
+                id,
+                mode: mode.into(),
             })
             .collect(),
         price_sheets: pricing::sheet_views(cfg),
@@ -463,14 +463,14 @@ fn provider_view(
                 failure: failure.map(|(why, _)| why),
             }
         }),
-        protocol: p.effective_protocol().map(|x| x.slug().to_string()),
+        protocol: p.effective_protocol().map(Into::into),
         protocol_explicit: p.protocol.is_some(),
         proxy: p.proxy.clone(),
-        on_proxy_fail: p.on_proxy_fail.slug().to_string(),
+        on_proxy_fail: p.on_proxy_fail.into(),
         models: p.models.clone(),
         models_only: p.models_only.clone(),
-        model_source: listing.source.slug().to_string(),
-        model_status: model_status(listing.status),
+        model_source: listing.source.into(),
+        model_status: listing.status.into(),
         model_fetching: listing.fetching,
         model_checked_at_ms: listing.checked_at_ms,
         model_error: listing.error,
@@ -478,11 +478,13 @@ fn provider_view(
         disabled: p.disabled,
         health: match s.health().state(&p.name) {
             // 冷却到点的半开照常放行，界面上和闭合一样是「正常」
-            tw_gateway::health::State::Closed | tw_gateway::health::State::HalfOpen => "ok".into(),
-            tw_gateway::health::State::Open => "open".into(),
+            tw_gateway::health::State::Closed | tw_gateway::health::State::HalfOpen => {
+                tw_api::Health::Ok
+            }
+            tw_gateway::health::State::Open => tw_api::Health::Open,
         },
         auth_rejected: s.gateway.auth_rejected(&p.name),
-        billing: p.billing.slug().to_string(),
+        billing: p.billing.into(),
         references: tw_config::refs::provider_refs(cfg, &p.name)
             .iter()
             .map(resources::reference_view)
@@ -497,39 +499,37 @@ fn provider_view(
 /// 没命中」，正是那类「我明明配了」问题的来源。这里给键和值，每个条件
 /// 怎么称呼由界面决定。
 pub(crate) fn describe_when(w: &tw_engine::rule::When) -> Vec<tw_api::ConditionView> {
+    use tw_api::ConditionField;
     let mut out = Vec::new();
-    let mut push = |field: &str, values: Vec<String>| {
-        out.push(tw_api::ConditionView {
-            field: field.to_string(),
-            values,
-        })
+    let mut push = |field: ConditionField, values: Vec<String>| {
+        out.push(tw_api::ConditionView { field, values })
     };
     for (field, v) in [
-        ("model", &w.model),
-        ("client", &w.client),
-        ("dialect", &w.dialect),
-        ("input_tokens", &w.input_tokens),
-        ("max_tokens", &w.max_tokens),
-        ("tool_count", &w.tool_count),
+        (ConditionField::Model, &w.model),
+        (ConditionField::Client, &w.client),
+        (ConditionField::Dialect, &w.dialect),
+        (ConditionField::InputTokens, &w.input_tokens),
+        (ConditionField::MaxTokens, &w.max_tokens),
+        (ConditionField::ToolCount, &w.tool_count),
     ] {
         if let Some(x) = v {
             push(field, vec![x.clone()]);
         }
     }
     if let Some(i) = &w.intent {
-        push("intent", one_or_many(i));
+        push(ConditionField::Intent, one_or_many(i));
     }
     // **不写出来的话，一条只有 provider_would_be 的规则在界面上会显示成
     // 「兜底」**（条件为空就是兜底的标记）—— 那是个会让人查半天的假象。
     if let Some(p) = &w.provider_would_be {
-        push("provider_would_be", one_or_many(p));
+        push(ConditionField::ProviderWouldBe, one_or_many(p));
     }
     for (field, v) in [
-        ("cache", w.cache),
-        ("tools", w.tools),
-        ("image", w.image),
-        ("thinking", w.thinking),
-        ("stream", w.stream),
+        (ConditionField::Cache, w.cache),
+        (ConditionField::Tools, w.tools),
+        (ConditionField::Image, w.image),
+        (ConditionField::Thinking, w.thinking),
+        (ConditionField::Stream, w.stream),
     ] {
         if let Some(b) = v {
             push(field, vec![b.to_string()]);
@@ -645,17 +645,6 @@ fn l1_stage(s: tw_gateway::Stage) -> tw_api::L1Stage {
     tw_api::L1Stage {
         step: s.step,
         peer: s.peer,
-    }
-}
-
-/// 契约里的模型清单状态。
-pub(crate) fn model_status(s: tw_gateway::models::Status) -> tw_api::ModelListStatus {
-    use tw_gateway::models::Status;
-    match s {
-        Status::Pending => tw_api::ModelListStatus::Pending,
-        Status::Listed => tw_api::ModelListStatus::Listed,
-        Status::NoList => tw_api::ModelListStatus::NoList,
-        Status::Failed => tw_api::ModelListStatus::Failed,
     }
 }
 
@@ -858,10 +847,7 @@ async fn speed_run(
                     total_ms: 0,
                     input_tokens: None,
                     output_tokens: None,
-                    error: Some(msg!(
-                        "control.credentials_failed", upstream = p.name.clone(), detail = e =>
-                        "The credential for upstream `{upstream}` could not be obtained: {detail}"
-                    )),
+                    error: Some(tw_gateway::credential_failed(e, &p.name)),
                 });
                 continue;
             }
@@ -908,8 +894,8 @@ fn quote_item(
         input_tokens: e.input_tokens,
         max_output_tokens: e.max_output_tokens,
         cost_micros: e.quote.cost_micros,
-        billing: e.quote.billing.slug().to_string(),
-        skipped: skip.map(|s| s.slug().to_string()),
+        billing: e.quote.billing.into(),
+        skipped: skip.map(Into::into),
     }
 }
 
@@ -1211,7 +1197,7 @@ async fn config_history(
                 current: v.version == now,
                 version: v.version,
                 at_ms: v.at_ms,
-                origin: v.origin.slug().to_string(),
+                origin: v.origin.into(),
                 bytes: v.bytes,
             })
             .collect(),
@@ -1351,7 +1337,7 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
         error: t.error.clone(),
         cancelled: t.cancelled,
         cost_estimated: t.cost_estimated,
-        billing: t.billing.clone(),
+        billing: t.billing,
     }
 }
 
@@ -1665,7 +1651,7 @@ mod describe_tests {
         assert_eq!(lines.len(), fields.len(), "有 when 字段没列出来：{lines:?}");
         // 界面按 `field` 取名称，所以它必须就是配置里的那个键
         for l in &lines {
-            assert!(fields.contains_key(&l.field), "{l:?}");
+            assert!(fields.contains_key(l.field.slug()), "{l:?}");
         }
     }
 
@@ -1675,7 +1661,11 @@ mod describe_tests {
             serde_yaml_ng::from_str("{ provider_would_be: relay }").unwrap();
         let lines = describe_when(&w);
         assert!(!lines.is_empty(), "空的条件列表在界面上就是「兜底」");
-        assert_eq!(lines[0].field, "provider_would_be", "{lines:?}");
+        assert_eq!(
+            lines[0].field,
+            tw_api::ConditionField::ProviderWouldBe,
+            "{lines:?}"
+        );
         assert_eq!(lines[0].values, ["relay"], "{lines:?}");
     }
 }
@@ -1698,7 +1688,7 @@ mod event_stream_tests {
             bus.emit(tw_api::Event::HealthChanged {
                 id: i,
                 provider: "p".into(),
-                state: "open".into(),
+                state: tw_api::BreakerState::Open,
                 at_ms: 0,
             });
         }

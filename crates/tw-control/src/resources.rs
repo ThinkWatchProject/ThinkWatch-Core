@@ -155,16 +155,11 @@ async fn preview_provider(
     };
     // 选定了协议，密钥就按选定的协议放；「自动识别」那一项要说的仍是按地址推断的结果
     let chosen = tw_config::Provider {
-        protocol: req
-            .protocol
-            .as_deref()
-            .map(|v| slug("protocol", v))
-            .transpose()
-            .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?,
+        protocol: req.protocol.map(Into::into),
         ..p.clone()
     };
     Ok(Json(tw_api::ProviderPreview {
-        protocol: p.effective_protocol().map(|x| x.slug().to_string()),
+        protocol: p.effective_protocol().map(Into::into),
         auth_header: chosen.auth_header().0.to_string(),
     }))
 }
@@ -192,7 +187,7 @@ async fn test_provider(
     let via = (p.proxy != tw_config::DIRECT).then(|| p.proxy.clone());
     let failed = |error: Msg| tw_api::ProviderTestResult {
         ok: false,
-        protocol: protocol.map(|x| x.slug().to_string()),
+        protocol: protocol.map(Into::into),
         latency_ms: 0,
         models: tw_api::ModelList::Empty,
         via: via.clone(),
@@ -222,12 +217,7 @@ async fn test_provider(
         (tw_api::OAuthChange::Keep, Some(e)) if e.oauth.is_some() && p.oauth.is_some() => {
             match s.gateway.oauth_token_for(e, &http).await {
                 Ok(t) => Some(t),
-                Err(e) => {
-                    return Ok(Json(failed(msg!(
-                        "control.provider_test.credentials", detail = e =>
-                        "The credential could not be obtained: {detail}"
-                    ))));
-                }
+                Err(e) => return Ok(Json(failed(tw_gateway::credential_failed(e, &p.name)))),
             }
         }
         _ => None,
@@ -239,7 +229,7 @@ async fn test_provider(
     let r = tw_gateway::probe(&http, &p.base_url, &headers, protocol).await;
     Ok(Json(tw_api::ProviderTestResult {
         ok: r.ok,
-        protocol: protocol.map(|x| x.slug().to_string()),
+        protocol: protocol.map(Into::into),
         latency_ms: r.latency_ms,
         models: crate::model_list(r.models),
         via,
@@ -296,8 +286,8 @@ fn models_view(
     let date = &book.table().date;
     tw_api::ProviderModelsView {
         provider: p.name.clone(),
-        source: listing.source.slug().to_string(),
-        status: crate::model_status(listing.status),
+        source: listing.source.into(),
+        status: listing.status.into(),
         fetching: listing.fetching,
         checked_at_ms: listing.checked_at_ms,
         error: listing.error,
@@ -403,25 +393,16 @@ fn to_provider(
         key,
         headers: tw_config::Headers::new(headers),
         oauth,
-        protocol: input
-            .protocol
-            .as_deref()
-            .map(|v| slug("protocol", v))
-            .transpose()?,
+        protocol: input.protocol.map(Into::into),
         models: input
             .models
             .iter()
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
             .collect(),
-        billing: input
-            .billing
-            .as_deref()
-            .map(|v| slug("billing mode", v))
-            .transpose()?
-            .unwrap_or_default(),
+        billing: input.billing.map(Into::into).unwrap_or_default(),
         proxy: input.proxy.trim().to_string(),
-        on_proxy_fail: slug("setting for an unusable proxy", &input.on_proxy_fail)?,
+        on_proxy_fail: input.on_proxy_fail.into(),
         models_only: input
             .models_only
             .as_ref()
@@ -567,7 +548,7 @@ fn to_proxy(
     };
     Ok(tw_config::Proxy {
         name,
-        kind: slug("proxy kind", &input.kind)?,
+        kind: input.kind.into(),
         addr,
         auth,
     })
@@ -590,16 +571,6 @@ pub(crate) fn checked_name(raw: &str, what: &'static str) -> Result<String, Msg>
         ));
     }
     Ok(raw.to_string())
-}
-
-/// 界面上的一个选项值 → 配置里的枚举。**和 YAML 里写的词是同一套**。
-fn slug<T: serde::de::DeserializeOwned>(what: &'static str, v: &str) -> Result<T, Msg> {
-    serde_yaml_ng::from_value(Value::String(v.to_string())).map_err(|_| {
-        msg!(
-            "control.unsupported_value", kind = what, value = v =>
-            "`{value}` is not a {kind} we support."
-        )
-    })
 }
 
 /// 结构 → YAML 映射。**失败是我们自己的类型写坏了**，不是用户填错了什么

@@ -81,9 +81,10 @@ pub fn client_for_provider(
                 ))
             })?;
             let url = proxy.url().map_err(|e| {
-                GatewayError::config(msg!(
-                    "gw.config.proxy_password", proxy = name, detail = e =>
-                    "The password for proxy `{proxy}` could not be read: {detail}"
+                GatewayError::config(e.msg().in_context(
+                    "proxy",
+                    name,
+                    &format!("The password for proxy `{name}` could not be read"),
                 ))
             })?;
             match reqwest::Proxy::all(&url) {

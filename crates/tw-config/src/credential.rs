@@ -148,10 +148,45 @@ impl<'de> Deserialize<'de> for Secret {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+/// `${ENV}` 展开不了。**英文只写一遍**：`Display` 就是 [`SecretResolveError::msg`] 的原句。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SecretResolveError {
-    #[error(transparent)]
-    Env(#[from] tw_secret::SecretError),
+    #[error("{}", self.msg())]
+    MissingEnv(String),
+    #[error("{}", self.msg())]
+    Unterminated { pos: usize },
+    #[error("{}", self.msg())]
+    EmptyName,
+}
+
+impl From<tw_secret::SecretError> for SecretResolveError {
+    fn from(e: tw_secret::SecretError) -> Self {
+        use tw_secret::SecretError;
+        match e {
+            SecretError::MissingEnv(v) => Self::MissingEnv(v),
+            SecretError::Unterminated { pos } => Self::Unterminated { pos },
+            SecretError::EmptyName => Self::EmptyName,
+        }
+    }
+}
+
+impl SecretResolveError {
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            Self::MissingEnv(var) => msg!(
+                "config.secret.env_missing", var = var =>
+                "the environment variable {var} is not set"
+            ),
+            Self::Unterminated { pos } => msg!(
+                "config.secret.unterminated", pos = pos =>
+                "the ${{...}} at character {pos} is not closed"
+            ),
+            Self::EmptyName => msg!(
+                "config.secret.empty_name" => "the variable name is empty: ${{}}"
+            ),
+        }
+    }
 }
 
 /// 一行请求头。
@@ -284,9 +319,9 @@ pub enum CredentialError {
     OauthAndAuthHeader(String),
     #[error("{}", self.msg())]
     NoToken,
-    /// 环境变量没设之类。存成文字：这个错误要能比较，而底下那个类型不能
+    /// 环境变量没设之类
     #[error("{}", self.msg())]
-    Env(String),
+    Env(SecretResolveError),
 }
 
 impl CredentialError {
@@ -366,16 +401,15 @@ impl CredentialError {
                 "config.credential.no_token" =>
                 "an OAuth access token could not be obtained"
             ),
-            // 只在转发时出现（展开 `${VAR}`），写法检查碰不到它。**底下那句已经
-            // 是文字了**，这里只能原样带出去
-            Env(d) => msg!("config.credential.env", detail = d => "{detail}"),
+            // 只在转发时出现（展开 `${VAR}`），写法检查碰不到它
+            Env(e) => e.msg(),
         }
     }
 }
 
 impl From<SecretResolveError> for CredentialError {
     fn from(e: SecretResolveError) -> Self {
-        CredentialError::Env(e.to_string())
+        CredentialError::Env(e)
     }
 }
 

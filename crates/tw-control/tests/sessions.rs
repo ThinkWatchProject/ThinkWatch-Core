@@ -40,7 +40,7 @@ fn turn(id: i64, billing: &str) -> tw_store::db::RequestRow {
         local: false,
         cancelled: false,
         routing: None,
-        billing: billing.into(),
+        billing: tw_api::Billing::from_slug(billing).unwrap(),
         cache_saved_micros: None,
         price_source: None,
         translated: None,

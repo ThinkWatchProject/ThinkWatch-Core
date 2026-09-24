@@ -373,7 +373,7 @@ fn the_route(evs: &[Event]) -> (String, Option<String>, tw_api::AttemptView, Str
         rule.clone(),
         group.clone(),
         attempts[0].clone(),
-        billing.clone(),
+        billing.slug().to_string(),
     )
 }
 
@@ -540,7 +540,7 @@ async fn hidden_characters_in_a_frame_refuse_it_before_the_upstream() {
     let (blocked, items) = found.expect("没有记录");
     assert!(blocked);
     assert_eq!(items[0].revealed, "rm -rf ~");
-    assert_eq!(source.as_deref(), Some("denied"));
+    assert_eq!(source.map(|s| s.slug()), Some("denied"));
 }
 
 /// **输出长度按一次回答数**：超了只切掉那一次回答（替它发 `response.failed`、剩下的

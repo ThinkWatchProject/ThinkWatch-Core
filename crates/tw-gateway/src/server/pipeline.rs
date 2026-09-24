@@ -148,7 +148,7 @@ fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
                 client_hint: crate::hint::client_hint(&req.headers),
                 peer: req.from.peer.clone(),
                 key_masked: req.from.key.clone(),
-                probe: kind.slug().to_string(),
+                probe: kind.into(),
                 at_ms: now_ms(),
             });
             tracing::debug!(client = %req.client_name, kind = kind.slug(), "answered locally");
@@ -352,11 +352,7 @@ fn start(
         peer: req.from.peer.clone(),
         key_masked: req.from.key.clone(),
         provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
-        billing: first
-            .map(|p| p.billing)
-            .unwrap_or_default()
-            .slug()
-            .to_string(),
+        billing: first.map(|p| p.billing).unwrap_or_default().into(),
         model: facts.model.clone(),
         method: "POST".to_string(),
         path: req.uri.path().to_string(),

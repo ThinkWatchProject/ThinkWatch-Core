@@ -147,9 +147,10 @@ pub fn hop_of(px: &tw_config::Proxy) -> Result<ProxyHop, Msg> {
         Some(a) => Some((
             a.user.clone(),
             a.pass.resolve().map_err(|e| {
-                msg!(
-                    "l1.config.proxy_password", proxy = px.name.clone(), detail = e =>
-                    "The password for proxy `{proxy}` could not be read: {detail}"
+                e.msg().in_context(
+                    "proxy",
+                    &px.name,
+                    &format!("The password for proxy `{}` could not be read", px.name),
                 )
             })?,
         )),

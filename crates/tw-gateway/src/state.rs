@@ -11,6 +11,7 @@ use crate::outbound::{base_client_builder, client_for_provider, proxy_shape};
 use tw_types::msg;
 
 mod credentials;
+pub use credentials::credential_failed;
 mod upstream;
 
 /// 一次配置换入时**整块换掉**的那部分。

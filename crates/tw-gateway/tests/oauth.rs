@@ -424,10 +424,10 @@ async fn without_a_config_manager_the_rotation_is_reported_as_not_persisted() {
     for one in &seen {
         assert_eq!(one.0, "p");
         assert!(!one.1, "没写却说写了：{seen:?}");
-        assert!(one.2.contains("not written back"), "{seen:?}");
+        assert!(one.2.text.contains("not written back"), "{seen:?}");
     }
     // 事件里一个 token 都不能有
-    assert!(!seen.iter().any(|s| s.2.contains("rt-")), "{seen:?}");
+    assert!(!seen.iter().any(|s| s.2.text.contains("rt-")), "{seen:?}");
 }
 
 /// 用户在 config.yaml 里换了 refresh token 之后，**缓存不能盖住这个修改**。

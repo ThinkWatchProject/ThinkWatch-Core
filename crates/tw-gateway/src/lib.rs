@@ -34,6 +34,7 @@ pub mod server;
 pub mod session;
 pub mod state;
 pub mod translate;
+pub mod wire;
 pub mod ws;
 
 pub use access::{AllowList, Cidr};
@@ -51,6 +52,7 @@ pub use outbound::{client_for_provider, public_client};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quote::Quote;
 pub use server::{router, serve};
+pub use state::credential_failed;
 pub use state::{AppState, Runtime};
 
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。

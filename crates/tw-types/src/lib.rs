@@ -48,6 +48,17 @@ impl Msg {
     pub fn arg(&self, name: &str) -> &str {
         self.args.get(name).map(String::as_str).unwrap_or_default()
     }
+
+    /// 同一句话放进一个更大的场合：**码不变**，多带一个参数，英文前面补上场合。
+    ///
+    /// 界面按码翻那句话本身，场合（哪个上游、哪个代理）在参数里，放不放由界面
+    /// 定。为每一种「场合 × 原因」各造一个码，码表会成倍地长，而那些码说的
+    /// 都是同一个原因
+    pub fn in_context(mut self, name: &str, value: impl ToString, lead: &str) -> Msg {
+        self.args.insert(name.to_string(), value.to_string());
+        self.text = format!("{lead}: {}", self.text);
+        self
+    }
 }
 
 /// 造一条 [`Msg`]。

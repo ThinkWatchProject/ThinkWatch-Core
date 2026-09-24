@@ -111,7 +111,7 @@ fn row(id: i64, provider: &str) -> tw_store::db::RequestRow {
         local: false,
         cancelled: false,
         routing: None,
-        billing: "free".into(),
+        billing: tw_api::Billing::Free,
         cache_saved_micros: None,
         price_source: None,
         translated: None,

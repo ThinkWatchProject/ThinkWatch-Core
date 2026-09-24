@@ -60,7 +60,7 @@ pub fn items(found: &[Finding]) -> Vec<tw_api::SecretItem> {
         .map(|f| tw_api::SecretItem {
             rule: f.rule.id().to_string(),
             custom: f.rule.custom(),
-            kind: f.rule.kind().slug().to_string(),
+            kind: crate::wire::secret_kind(f.rule.kind()),
             masked: f.masked.clone(),
             count: f.count,
         })
@@ -158,7 +158,7 @@ fn hidden_found(
         items: found
             .iter()
             .map(|f| tw_api::HiddenItem {
-                kind: f.kind.slug().to_string(),
+                kind: crate::wire::hidden_kind(f.kind),
                 in_tool_result: f.in_tool_result,
                 count: f.count as u64,
                 example: f.example.clone(),
@@ -350,7 +350,7 @@ mod tests {
     fn the_event_items_name_the_rule_and_never_carry_the_value() {
         let it = items(&find(Mode::Observe, &RuleSet::defaults(), &body()));
         assert_eq!(it[0].rule, "anthropic-api-key");
-        assert_eq!(it[0].kind, "api-keys");
+        assert_eq!(it[0].kind, tw_api::SecretKind::ApiKeys);
         assert!(!it[0].custom);
         assert!(!it[0].masked.contains("AAAAAAAAAAAA"), "{}", it[0].masked);
     }

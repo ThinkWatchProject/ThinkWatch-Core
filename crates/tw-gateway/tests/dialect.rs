@@ -295,7 +295,7 @@ async fn what_could_not_be_translated_is_reported_to_the_user() {
         }
     }
     let (from, to, dropped) = found.expect("没发翻译事件");
-    assert_eq!((from.as_str(), to.as_str()), ("anthropic", "openai-chat"));
+    assert_eq!((from.slug(), to.slug()), ("anthropic", "openai-chat"));
     assert_eq!(
         dropped,
         ["tools.web_search_20250305"],

@@ -276,7 +276,7 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
                 shadows: d.shadows.iter().map(|p| p.display().to_string()).collect(),
                 takes_effect: takes_effect(d.takes_effect),
                 warns_when_silent: d.takes_effect.warns_when_silent(),
-                verified: d.verified.slug().to_string(),
+                verified: d.verified.into(),
                 costs: d.costs,
             }
         })
@@ -314,7 +314,7 @@ fn setup_of(c: &tw_adopt::clients::Client, gw: &Gateway) -> tw_api::ManualSetup 
         steps: c.manual_steps(),
         fields: tw_adopt::clients::edits(c, gw)
             .iter()
-            .map(|e| field("set", &e.path, Some(&e.value), e.secret))
+            .map(|e| field(tw_api::FieldOp::Set, &e.path, Some(&e.value), e.secret))
             .collect(),
         endpoint: c.endpoint(gw),
     }
@@ -322,13 +322,13 @@ fn setup_of(c: &tw_adopt::clients::Client, gw: &Gateway) -> tw_api::ManualSetup 
 
 /// 一处字段改动在界面上的样子。**密钥不回显**，哪怕是打码的。
 fn field(
-    op: &str,
+    op: tw_api::FieldOp,
     path: &[String],
     value: Option<&tw_adopt::json::Val>,
     secret: bool,
 ) -> tw_api::FieldChange {
     tw_api::FieldChange {
-        op: op.to_string(),
+        op,
         path: path.join("."),
         value: if secret {
             None
@@ -356,8 +356,12 @@ fn fields_of(p: &plan::Plan, secrets: &[Vec<String>]) -> Vec<tw_api::FieldChange
     p.targets
         .iter()
         .map(|t| match t {
-            plan::Target::Set(path, v) => field("set", path, Some(v), secrets.contains(path)),
-            plan::Target::Remove(path) => field("remove", path, None, secrets.contains(path)),
+            plan::Target::Set(path, v) => {
+                field(tw_api::FieldOp::Set, path, Some(v), secrets.contains(path))
+            }
+            plan::Target::Remove(path) => {
+                field(tw_api::FieldOp::Remove, path, None, secrets.contains(path))
+            }
         })
         .collect()
 }
@@ -525,17 +529,15 @@ pub async fn mcp_targets(State(_s): State<ControlState>) -> Json<Vec<tw_api::Mcp
 
 fn mcp_plan(s: &ControlState, req: &tw_api::McpOpRequest) -> Result<tw_adopt::mcp::Plan, Fail> {
     let to = mcp_target(&req.to)?;
-    match req.op.as_str() {
-        "remove" => tw_adopt::mcp::plan_remove(&to, &s.home, &req.name).map_err(mcp_err),
-        "copy" => {
+    match req.op {
+        tw_api::McpOp::Remove => {
+            tw_adopt::mcp::plan_remove(&to, &s.home, &req.name).map_err(mcp_err)
+        }
+        tw_api::McpOp::Copy => {
             let from = mcp_target(req.from.as_deref().unwrap_or_default())?;
             let v = tw_adopt::mcp::read_server(&from, &s.home, &req.name).map_err(mcp_err)?;
             tw_adopt::mcp::plan_copy(&to, &s.home, &req.name, &v).map_err(mcp_err)
         }
-        other => Err(fail(
-            StatusCode::BAD_REQUEST,
-            msg!("control.unsupported_action", action = other => "`{action}` is not an action we support."),
-        )),
     }
 }
 
@@ -556,7 +558,11 @@ pub async fn mcp_plan_op(
         // MCP 的 env 里可能有密钥，而我们正把它抄进另一个文件
         carries_secret: true,
         fields: vec![tw_api::FieldChange {
-            op: if p.remove { "remove" } else { "set" }.to_string(),
+            op: if p.remove {
+                tw_api::FieldOp::Remove
+            } else {
+                tw_api::FieldOp::Set
+            },
             path: p.field.join("."),
             // 值是一整段 server 配置，里面可能有密钥，diff 里已经能看到打过码的样子
             value: None,

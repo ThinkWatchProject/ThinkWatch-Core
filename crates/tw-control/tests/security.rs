@@ -65,7 +65,7 @@ fn request(id: i64, at_ms: i64, provider: &str) -> tw_store::db::RequestRow {
         local: false,
         cancelled: false,
         routing: None,
-        billing: "per-token".into(),
+        billing: tw_api::Billing::PerToken,
         cache_saved_micros: None,
         price_source: None,
         translated: None,
@@ -85,7 +85,7 @@ fn event(
         guard: tw_api::Guard::from_slug(guard).unwrap(),
         rule: rule.into(),
         custom: false,
-        action: action.into(),
+        action: tw_api::SecurityOutcome::from_slug(action).unwrap(),
         // 记录发生在请求发出之前，那时的首选；落库的请求行说的是最终服务它的那家
         provider: "首选".into(),
         client: String::new(),
@@ -238,8 +238,9 @@ async fn the_mode_is_written_and_going_back_to_observe_takes_the_line_out() {
         json!({ "mode": "block" }),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "security.unknown_mode");
+    // 取值不在集合里：请求体本身读不成
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["code"], "control.request_rejected");
 }
 
 // ─────────────────────────────────────────────────────────── 内置规则的开关

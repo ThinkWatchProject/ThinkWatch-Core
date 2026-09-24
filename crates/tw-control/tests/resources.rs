@@ -223,7 +223,8 @@ async fn billing_is_per_token_or_free_and_nothing_else() {
             serde_json::json!({ "provider": { "name": "官方", "billing": gone }}),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "{gone}：{body}");
+        // 取值不在集合里：请求体本身读不成
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{gone}：{body}");
     }
     assert_eq!(b.file(), before, "拒绝了的保存不该动配置");
 }

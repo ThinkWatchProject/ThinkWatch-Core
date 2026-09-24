@@ -191,7 +191,7 @@ async fn opening_the_breaker_is_announced_on_the_bus() {
     assert_eq!(
         opened
             .iter()
-            .filter(|(p, s)| p == "dead" && s == "open")
+            .filter(|(p, s)| p == "dead" && *s == tw_api::BreakerState::Open)
             .count(),
         1,
         "dead 熔断了却没报，或者报了不止一次：{opened:?}"

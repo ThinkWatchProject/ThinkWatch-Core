@@ -176,7 +176,7 @@ pub async fn proxy(
         rule: upstream.rule,
         group: upstream.group,
         attempts: vec![attempt],
-        billing: billing.slug().to_string(),
+        billing: billing.into(),
     });
     let up = match connected {
         Ok(up) => up,
@@ -210,7 +210,7 @@ pub async fn proxy(
 struct NotConnected {
     /// `x-thinkwatch-error` 那个词表：地址、头写坏了是 `config`，其余是
     /// `upstream`
-    source: &'static str,
+    source: tw_api::FailureSource,
     /// 上游回了 101 以外的状态码：**它答了话，只是没接下这条连接**。根本
     /// 没连上的（地址不通、TLS 失败、握手中途断了）没有
     status: Option<u16>,
@@ -220,7 +220,7 @@ struct NotConnected {
 /// 按路由选中的那一家建连：拼请求、带上头、握手。
 async fn connect(upstream: &Upstream) -> Result<Stream, NotConnected> {
     let config = |why: Msg| NotConnected {
-        source: "config",
+        source: tw_api::FailureSource::Config,
         status: None,
         why,
     };
@@ -249,7 +249,7 @@ async fn connect(upstream: &Upstream) -> Result<Stream, NotConnected> {
     dial(&upstream.url, req)
         .await
         .map_err(|(status, detail)| NotConnected {
-            source: "upstream",
+            source: tw_api::FailureSource::Upstream,
             status,
             why: msg!(
                 "gw.ws.connect_failed", detail = detail =>
@@ -502,8 +502,8 @@ async fn pump(
     // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了
     match end {
         End::Closed => ending.finished(101),
-        End::Broke(why) => ending.failed("upstream", why),
-        End::Cut(why) => ending.failed("denied", why),
+        End::Broke(why) => ending.failed(tw_api::FailureSource::Upstream, why),
+        End::Cut(why) => ending.failed(tw_api::FailureSource::Denied, why),
     }
     let _ = c_tx.close().await;
     let _ = u_tx.close().await;

@@ -392,7 +392,8 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
         serde_json::json!({ "base_url": "https://api.anthropic.com", "protocol": "grpc" }),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 取值不在集合里：请求体本身读不成
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
 
     let (_, v) = call(
         &b.app,

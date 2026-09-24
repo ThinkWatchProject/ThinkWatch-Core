@@ -38,7 +38,7 @@ use tw_config::history::Origin;
 
 use crate::contract::RouterExt;
 use crate::{ControlState, Fail, fail};
-use tw_api::ep;
+use tw_api::{LoginStatus, ep};
 use tw_types::{Msg, msg};
 
 /// 登录要在多久之内完成。平台给的期限更短就按它的
@@ -77,13 +77,6 @@ pub enum Family {
 }
 
 impl Family {
-    fn parse(v: &str) -> Option<Self> {
-        match v {
-            "zai" => Some(Self::Zai),
-            "bigmodel" => Some(Self::Bigmodel),
-            _ => None,
-        }
-    }
     pub fn slug(&self) -> &'static str {
         match self {
             Self::Zai => "zai",
@@ -174,8 +167,8 @@ impl Current {
     /// 登录，而在等的那一步只是一个带超时的 GET
     fn stop(self, s: &ControlState) {
         self.task.abort();
-        if self.status.status == "pending" {
-            announce(s, &self.status.id, "cancelled", None, None);
+        if self.status.status == LoginStatus::Pending {
+            announce(s, &self.status.id, LoginStatus::Cancelled, None, None);
         }
     }
 }
@@ -200,14 +193,9 @@ impl Want {
                 .filter(|x| !x.is_empty())
                 .map(str::to_string)
         };
-        let family = match given(&req.family) {
-            None => Family::Zai,
-            Some(v) => Family::parse(&v).ok_or_else(|| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    msg!("control.unknown_account_family", family = v => "`{family}` is not an account we can sign in to."),
-                )
-            })?,
+        let family = match req.family {
+            None | Some(tw_api::ZaiFamily::Zai) => Family::Zai,
+            Some(tw_api::ZaiFamily::Bigmodel) => Family::Bigmodel,
         };
         let name = given(&req.name).unwrap_or_else(|| family.default_name().to_string());
         let proxy = given(&req.proxy).unwrap_or_else(|| tw_config::DIRECT.to_string());
@@ -305,7 +293,7 @@ async fn init(s: &ControlState, want: &Want, http: &reqwest::Client) -> Result<F
         http,
         reqwest::Method::POST,
         &url,
-        "asking for an authorization address",
+        Step::AuthorizeUrl,
         Some(&format!("Bearer {poll_token}")),
         Some(json!({ "provider": want.family.slug() })),
     )
@@ -371,7 +359,7 @@ async fn await_login(s: ControlState, want: Want, http: reqwest::Client, flow: F
             &http,
             reqwest::Method::GET,
             &url,
-            "waiting for the authorization",
+            Step::WaitAuthorization,
             Some(&auth),
             None,
         )
@@ -390,15 +378,19 @@ async fn await_login(s: ControlState, want: Want, http: reqwest::Client, flow: F
                 return settle(&s, &flow.id, done);
             }
             Some("failed") => {
-                return settle(&s, &flow.id, Err("the authorization was refused".into()));
+                return settle(
+                    &s,
+                    &flow.id,
+                    Err(msg!("control.zai_login.refused" => "The authorization was refused.")),
+                );
             }
             other => {
                 return settle(
                     &s,
                     &flow.id,
-                    Err(format!(
-                        "the authorization is in a state we do not know: {}",
-                        other.unwrap_or("none")
+                    Err(msg!(
+                        "control.zai_login.unknown_state", state = other.unwrap_or("none") =>
+                        "The authorization is in a state we do not know: {state}"
                     )),
                 );
             }
@@ -406,12 +398,14 @@ async fn await_login(s: ControlState, want: Want, http: reqwest::Client, flow: F
     }
     s.zai.set_status(tw_api::ZaiLoginStatus {
         id: flow.id.clone(),
-        status: "expired".into(),
+        status: LoginStatus::Expired,
         provider: None,
         account: None,
-        error: Some("the authorization was not completed in time".into()),
+        error: Some(msg!(
+            "control.zai_login.expired" => "The authorization was not completed in time."
+        )),
     });
-    announce(&s, &flow.id, "expired", None, None);
+    announce(&s, &flow.id, LoginStatus::Expired, None, None);
 }
 
 /// 授权完了：换一把 key，写进配置。
@@ -420,7 +414,7 @@ async fn finish(
     want: &Want,
     http: &reqwest::Client,
     ready: &Value,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, Option<String>), Msg> {
     // 这一家的令牌挂在以它自己命名的那个键下：`data.zai.access_token`
     let access = ready
         .get(want.family.slug())
@@ -428,7 +422,12 @@ async fn finish(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or("the authorization came back without an access token")?;
+        .ok_or_else(|| {
+            msg!(
+                "control.zai_login.no_access_token" =>
+                "The authorization came back without an access token."
+            )
+        })?;
     let account = ready
         .get("user")
         .and_then(|u| {
@@ -456,7 +455,7 @@ async fn mint_key(
     endpoints: &Endpoints,
     family: Family,
     access: &str,
-) -> Result<String, String> {
+) -> Result<String, Msg> {
     let host = endpoints.business(family).trim_end_matches('/');
     let auth = match family {
         // Z.ai 的业务接口只认它自己换发的平台令牌，OAuth 那个 access token 在这儿用不了
@@ -465,7 +464,7 @@ async fn mint_key(
                 http,
                 reqwest::Method::POST,
                 &format!("{host}/api/auth/z/login"),
-                "exchanging the sign-in for an account token",
+                Step::ExchangeToken,
                 None,
                 Some(json!({ "token": access })),
             )
@@ -476,7 +475,12 @@ async fn mint_key(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .ok_or("the account token response has no token in it")?;
+                .ok_or_else(|| {
+                    msg!(
+                        "control.zai_login.no_account_token" =>
+                        "The account token response has no token in it."
+                    )
+                })?;
             format!("Bearer {token}")
         }
         // BigModel 的业务接口直接认 OAuth 的 access token，**而且不带 `Bearer ` 前缀**
@@ -486,19 +490,23 @@ async fn mint_key(
         http,
         reqwest::Method::GET,
         &format!("{host}/api/biz/customer/getCustomerInfo"),
-        "reading the account",
+        Step::ReadAccount,
         Some(&auth),
         None,
     )
     .await?;
-    let (org, project) = pick_place(&info)
-        .ok_or("the account has no organization and project an API key could go into")?;
+    let (org, project) = pick_place(&info).ok_or_else(|| {
+        msg!(
+            "control.zai_login.no_project" =>
+            "The account has no organization and project an API key could go into."
+        )
+    })?;
     let keys = format!("{host}/api/biz/v1/organization/{org}/projects/{project}/api_keys");
     let listed = data(
         http,
         reqwest::Method::GET,
         &keys,
-        "listing the account's API keys",
+        Step::ListKeys,
         Some(&auth),
         None,
     )
@@ -517,7 +525,7 @@ async fn mint_key(
             http,
             reqwest::Method::POST,
             &keys,
-            "creating an API key",
+            Step::CreateKey,
             Some(&auth),
             Some(json!({ "name": KEY_NAME })),
         )
@@ -525,7 +533,9 @@ async fn mint_key(
         .get("apiKey")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .ok_or("the new API key came back without an id")?,
+        .ok_or_else(|| {
+            msg!("control.zai_login.key_without_id" => "The new API key came back without an id.")
+        })?,
     };
     // **id 要接进 URL 的路径里。**对方给什么我们就接什么的话，一个带 `/` 或 `?` 的值
     // 就能把请求发到另一个接口上
@@ -534,13 +544,16 @@ async fn mint_key(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
     {
-        return Err("the API key's id has characters we do not expect".into());
+        return Err(msg!(
+            "control.zai_login.key_id_unexpected" =>
+            "The API key's id has characters we do not expect."
+        ));
     }
     let secret = data(
         http,
         reqwest::Method::GET,
         &format!("{keys}/copy/{id}"),
-        "reading the API key",
+        Step::ReadKey,
         Some(&auth),
         None,
     )
@@ -554,7 +567,10 @@ async fn mint_key(
         (_, Some(secret)) => Ok(format!("{id}.{secret}")),
         // Z.ai 的密钥是 `id.secret` 两段，少一段用不了 —— 宁可现在就说，不要写一把
         // 发出去就是 401 的密钥进配置
-        (Family::Zai, None) => Err("the API key came back without its secret half".into()),
+        (Family::Zai, None) => Err(msg!(
+            "control.zai_login.key_without_secret" =>
+            "The API key came back without its secret half."
+        )),
         (Family::Bigmodel, None) => Ok(id),
     }
 }
@@ -589,7 +605,7 @@ fn pick_place(info: &Value) -> Option<(String, String)> {
 ///
 /// **重新登录只换密钥**，出站方式、模型范围、停用状态这些都不动 —— 用户在上游页上
 /// 调过的东西不该因为换一次密钥就回到默认值。
-async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, String> {
+async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Msg> {
     let name = want.name.clone();
     let proxy = want.proxy.clone();
     let upstream = s.zai.endpoints.upstream(want.family).to_string();
@@ -628,7 +644,7 @@ async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Stri
             )?)
         })
         .await
-        .map_err(|e| format!("the configuration could not be written: {e}"))?;
+        .map_err(|e| e.msg())?;
     // 模型清单现在就问一次：不然要等到下一轮定时刷新，新上游的模型才出现
     let gateway = s.gateway.clone();
     let provider = name.clone();
@@ -643,7 +659,7 @@ async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Stri
 fn pending(id: &str) -> tw_api::ZaiLoginStatus {
     tw_api::ZaiLoginStatus {
         id: id.to_string(),
-        status: "pending".into(),
+        status: LoginStatus::Pending,
         provider: None,
         account: None,
         error: None,
@@ -651,11 +667,11 @@ fn pending(id: &str) -> tw_api::ZaiLoginStatus {
 }
 
 /// 记下登录的结果，并告诉界面一声
-fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), String>) {
+fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Msg>) {
     let status = match done {
         Ok((provider, account)) => tw_api::ZaiLoginStatus {
             id: id.to_string(),
-            status: "done".into(),
+            status: LoginStatus::Done,
             provider: Some(provider),
             account,
             error: None,
@@ -664,7 +680,7 @@ fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Str
             tracing::warn!("the sign-in did not finish: {why}");
             tw_api::ZaiLoginStatus {
                 id: id.to_string(),
-                status: "failed".into(),
+                status: LoginStatus::Failed,
                 provider: None,
                 account: None,
                 error: Some(why),
@@ -672,7 +688,7 @@ fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Str
         }
     };
     s.zai.set_status(status.clone());
-    announce(s, id, &status.status, status.provider, status.error);
+    announce(s, id, status.status, status.provider, status.error);
 }
 
 async fn status(
@@ -715,15 +731,15 @@ async fn cancel(
                 ),
             )
         })?;
-        if c.status.status != "pending" {
+        if c.status.status != LoginStatus::Pending {
             return Ok(Json(c.status.clone()));
         }
         c.task.abort();
         c.status.clone()
     };
-    status.status = "cancelled".into();
+    status.status = LoginStatus::Cancelled;
     s.zai.set_status(status.clone());
-    announce(&s, &id, "cancelled", None, None);
+    announce(&s, &id, LoginStatus::Cancelled, None, None);
     Ok(Json(status))
 }
 
@@ -744,9 +760,48 @@ async fn cancel(
 /// 后一种就只剩把整句塞进 `{detail}` 一条路。
 #[derive(Debug)]
 struct CallError {
-    /// 在做哪一步，英文词组，只进 `Display`
-    doing: String,
+    /// 在做哪一步
+    doing: Step,
     why: CallFailure,
+}
+
+/// 登录流程里调对方接口的那几步。登录状态里的失败要说卡在哪一步，
+/// 步骤是参数 `step`，界面按词自己说
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    AuthorizeUrl,
+    WaitAuthorization,
+    ExchangeToken,
+    ReadAccount,
+    ListKeys,
+    CreateKey,
+    ReadKey,
+}
+
+impl Step {
+    fn slug(self) -> &'static str {
+        match self {
+            Step::AuthorizeUrl => "authorize_url",
+            Step::WaitAuthorization => "wait_authorization",
+            Step::ExchangeToken => "exchange_token",
+            Step::ReadAccount => "read_account",
+            Step::ListKeys => "list_keys",
+            Step::CreateKey => "create_key",
+            Step::ReadKey => "read_key",
+        }
+    }
+    /// 英文原句里的说法
+    fn phrase(self) -> &'static str {
+        match self {
+            Step::AuthorizeUrl => "Asking for an authorization address",
+            Step::WaitAuthorization => "Waiting for the authorization",
+            Step::ExchangeToken => "Exchanging the sign-in for an account token",
+            Step::ReadAccount => "Reading the account",
+            Step::ListKeys => "Listing the account's API keys",
+            Step::CreateKey => "Creating an API key",
+            Step::ReadKey => "Reading the API key",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -767,25 +822,26 @@ enum CallFailure {
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let doing = &self.doing;
-        match &self.why {
-            CallFailure::Unreachable(m) => write!(f, "{doing} failed: {m}"),
-            CallFailure::Status { status, body } => write!(f, "{doing} answered {status}: {body}"),
-            CallFailure::NotJson { body } => write!(f, "{doing} did not answer JSON: {body}"),
-            CallFailure::Refused { why } => write!(f, "{doing} was refused: {why}"),
-        }
+        f.write_str(&self.in_flow().text)
     }
 }
 
-impl From<CallError> for String {
+/// 登录流程里的失败：带上卡在哪一步
+impl From<CallError> for Msg {
     fn from(e: CallError) -> Self {
-        e.to_string()
+        e.in_flow()
     }
 }
 
 impl CallError {
-    /// 带码的说法。**不说在做哪一步** —— 那是一个英文词组，而用得上这句话的
-    /// 只有开始登录那一处，界面自己知道那是哪一步。
+    /// 登录状态里的那一句：原因放进「哪一步」这个场合，码还是原因的码
+    fn in_flow(&self) -> Msg {
+        self.msg()
+            .in_context("step", self.doing.slug(), self.doing.phrase())
+    }
+
+    /// 带码的说法。**不说在做哪一步** —— 开始登录那一处用它，界面自己知道
+    /// 那是哪一步。
     fn msg(&self) -> Msg {
         match &self.why {
             CallFailure::Unreachable(m) => m.clone(),
@@ -809,14 +865,11 @@ async fn data(
     http: &reqwest::Client,
     method: reqwest::Method,
     url: &str,
-    doing: &str,
+    doing: Step,
     auth: Option<&str>,
     body: Option<Value>,
 ) -> Result<Value, CallError> {
-    let fail = |why| CallError {
-        doing: doing.to_string(),
-        why,
-    };
+    let fail = |why| CallError { doing, why };
     let mut req = http
         .request(method, url)
         .timeout(API_TIMEOUT)
@@ -888,14 +941,14 @@ fn client_for(s: &ControlState, want: &Want) -> Result<reqwest::Client, Fail> {
 fn announce(
     s: &ControlState,
     login: &str,
-    status: &str,
+    status: LoginStatus,
     provider: Option<String>,
-    error: Option<String>,
+    error: Option<Msg>,
 ) {
     s.bus().emit(tw_api::Event::LoginFinished {
         id: s.bus().next_id(),
         login: login.to_string(),
-        status: status.to_string(),
+        status,
         provider,
         error,
         at_ms: now_ms(),
@@ -968,7 +1021,7 @@ mod call_error_codes {
     #[test]
     fn a_failed_call_has_a_code_and_still_says_what_it_was_doing() {
         let e = |why| CallError {
-            doing: "asking for an authorization address".into(),
+            doing: Step::AuthorizeUrl,
             why,
         };
         let unreachable = msg!("gw.upstream.timeout" => "timed out");
@@ -996,9 +1049,10 @@ mod call_error_codes {
         for (err, code) in all {
             assert_eq!(err.msg().code, code);
             assert!(!err.msg().text.is_empty());
-            let line: String = err.into();
+            let line: Msg = err.into();
+            assert_eq!(line.arg("step"), "authorize_url", "{line:?}");
             assert!(
-                line.starts_with("asking for an authorization address"),
+                line.text.starts_with("Asking for an authorization address"),
                 "{line}"
             );
         }

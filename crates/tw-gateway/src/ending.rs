@@ -118,12 +118,12 @@ impl Ending {
     /// `x-thinkwatch-error` 那个词表。
     ///
     /// **断在流中间的失败也带着用量** —— 上游已经为它计了费。
-    pub fn failed(mut self, source: &str, message: Msg) {
+    pub fn failed(mut self, source: tw_api::FailureSource, message: Msg) {
         let usage = self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
             model: std::mem::take(&mut self.model),
-            source: source.to_string(),
+            source,
             message,
             bytes: self.received(),
             duration_ms: Some(self.duration_ms()),
@@ -176,7 +176,7 @@ impl Drop for Ending {
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
                 model: std::mem::take(&mut self.model),
-                source: "internal".to_string(),
+                source: tw_api::FailureSource::Internal,
                 message: msg!(
                     "gw.internal" => "The request was interrupted by an error inside the gateway."
                 ),
@@ -265,7 +265,7 @@ mod tests {
         let mut e = responding(&bus);
         e.feed(MESSAGE_START);
         e.failed(
-            "upstream",
+            tw_api::FailureSource::Upstream,
             msg!("t.broke" => "the stream broke: the upstream disconnected"),
         );
 
@@ -279,7 +279,7 @@ mod tests {
                 usage: Some(u),
                 ..
             } => {
-                assert_eq!(source, "upstream");
+                assert_eq!(*source, tw_api::FailureSource::Upstream);
                 assert_eq!(*bytes, Some(MESSAGE_START.len() as u64));
                 // **断在中间也要带着用量**：输入在第一帧里就齐了，上游已经为它计费
                 assert_eq!((u.input, u.cache_read), (5000, 4000));
@@ -296,7 +296,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         responding(&bus).finished(200);
-        responding(&bus).failed("upstream", msg!("t.x" => "x"));
+        responding(&bus).failed(tw_api::FailureSource::Upstream, msg!("t.x" => "x"));
         drop(responding(&bus));
 
         let got = drain(&mut rx);
@@ -318,8 +318,10 @@ mod tests {
     fn a_failure_before_the_response_headers_has_a_duration_but_no_bytes_or_usage() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None)
-            .failed("rate_limited", msg!("t.limited" => "`up` rate-limited us"));
+        Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None).failed(
+            tw_api::FailureSource::RateLimited,
+            msg!("t.limited" => "`up` rate-limited us"),
+        );
 
         let got = drain(&mut rx);
         assert!(
@@ -458,7 +460,7 @@ mod tests {
         assert!(
             matches!(
                 got.as_slice(),
-                [Event::RequestFailed { source, model, .. }] if source == "internal" && model == MODEL
+                [Event::RequestFailed { source, model, .. }] if *source == tw_api::FailureSource::Internal && model == MODEL
             ),
             "{got:?}"
         );

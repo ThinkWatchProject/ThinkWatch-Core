@@ -60,7 +60,11 @@ impl AppState {
         self.bus.emit(tw_api::Event::AuthChanged {
             id: self.bus.next_id(),
             provider: provider.to_string(),
-            state: if rejected { "rejected" } else { "accepted" }.into(),
+            state: if rejected {
+                tw_api::AuthState::Rejected
+            } else {
+                tw_api::AuthState::Accepted
+            },
             status: rejected.then_some(status),
             at_ms: now_ms(),
         });
@@ -88,7 +92,7 @@ impl AppState {
             self.bus.emit(tw_api::Event::ProxyChanged {
                 id: self.bus.next_id(),
                 proxy: proxy.to_string(),
-                state: "reachable".into(),
+                state: tw_api::ProxyState::Reachable,
                 failed: None,
                 detail: None,
                 at_ms: now_ms(),
@@ -201,11 +205,10 @@ impl AppState {
                 id: state.bus.next_id(),
                 proxy: name,
                 state: if detail.is_some() {
-                    "unreachable"
+                    tw_api::ProxyState::Unreachable
                 } else {
-                    "reachable"
-                }
-                .into(),
+                    tw_api::ProxyState::Reachable
+                },
                 failed,
                 detail,
                 at_ms: now_ms(),

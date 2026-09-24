@@ -564,7 +564,7 @@ async fn a_request_every_upstream_refused_is_failed_once_for_the_reason_it_was_r
             assert!(duration_ms.is_some());
             assert_eq!(
                 header.as_ref().map(|h| h.to_str().unwrap()),
-                Some(source.as_str())
+                Some(source.slug())
             );
         }
         other => panic!("该是一次失败，实际 {other:?}"),

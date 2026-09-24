@@ -69,12 +69,10 @@ pub(super) async fn ws_upgrade(
         )));
     }
     let http = rt.clients.get(&name).unwrap_or(&state.http);
-    let upstream_headers = state.headers_for(provider, http).await.map_err(|e| {
-        GatewayError::config(msg!(
-            "gw.credentials.failed", upstream = name.clone(), detail = e =>
-            "The credential for upstream `{upstream}` could not be obtained: {detail}"
-        ))
-    })?;
+    let upstream_headers = state
+        .headers_for(provider, http)
+        .await
+        .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
     let id = state.bus.next_id();
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
@@ -84,7 +82,7 @@ pub(super) async fn ws_upgrade(
         peer: from.peer,
         key_masked: from.key,
         provider: name.clone(),
-        billing: provider.billing.slug().to_string(),
+        billing: provider.billing.into(),
         model: String::new(),
         method: "WS".to_string(),
         path: uri.path().to_string(),
