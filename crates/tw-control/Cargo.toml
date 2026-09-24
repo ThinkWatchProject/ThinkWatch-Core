@@ -42,6 +42,8 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# 契约测试按 tw-api 的类型拼查询串，和客户端一样
+serde_urlencoded = "0.7"
 # 测试里的假 OpenAI：拼 id_token、核对 PKCE
 base64 = { workspace = true }
 sha2 = { workspace = true }

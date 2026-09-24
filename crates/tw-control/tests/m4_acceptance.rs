@@ -168,7 +168,7 @@ async fn two_a_zero_width_character_in_a_skill_is_found_and_located_to_a_line() 
     )
     .unwrap();
 
-    let body = get(&b.app, "/scan").await;
+    let (_, body) = post(&b.app, "/scan", "{}").await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let found = v["findings"]
         .as_array()
@@ -192,7 +192,7 @@ async fn three_scanning_never_touches_a_single_byte() {
     std::fs::write(&skill, text).unwrap();
     let before = std::fs::metadata(&skill).unwrap().len();
 
-    let body = get(&b.app, "/scan").await;
+    let (_, body) = post(&b.app, "/scan", "{}").await;
     assert!(body.contains("SKILL.md"), "什么都没扫出来：{body}");
 
     assert_eq!(

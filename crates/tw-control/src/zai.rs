@@ -32,12 +32,13 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tw_config::Protocol;
 use tw_config::history::Origin;
 
+use crate::contract::RouterExt;
 use crate::{ControlState, Fail, fail};
+use tw_api::ep;
 use tw_types::{Msg, msg};
 
 /// 登录要在多久之内完成。平台给的期限更短就按它的
@@ -59,8 +60,9 @@ const DEFAULT_PROJECT: &str = "默认项目";
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/zai/login", post(start))
-        .route("/zai/login/{id}", get(status).delete(cancel))
+        .at(ep::StartZaiLogin, start)
+        .at(ep::ZaiLoginStatus, status)
+        .at(ep::CancelZaiLogin, cancel)
 }
 
 // ---------------------------------------------------------------- 哪一家

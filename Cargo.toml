@@ -121,6 +121,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 
 clap = { version = "4", features = ["derive"] }
+# 控制面契约导出成 TypeScript（tw-api 的 `ts` feature）。**不开任何 serde 以外的
+# 类型实现**：契约里只有 std 和 serde 的类型
+ts-rs = { version = "12", default-features = false, features = ["serde-compat"] }
 
 [profile.release]
 # 桌面 sidecar：体积比极限吞吐重要。企业版用 lto = true + codegen-units = 1，

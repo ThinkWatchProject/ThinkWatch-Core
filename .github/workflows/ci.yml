@@ -36,6 +36,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+
+      # 桌面端从 tw-api 导出前端类型（`ts` feature）。**默认关**，上面几步一行都
+      # 不编它 —— 而它坏掉的表现是桌面端接下一个 tag 时才发现导不出来。导出来
+      # 的文件再过一遍 tsc：ts-rs 生成的东西本身也可能不是合法的 TypeScript
+      - name: TypeScript bindings (tw-api, ts)
+        run: |
+          cargo clippy -p tw-api --all-targets --features ts -- -D warnings
+          cargo test -p tw-api --features ts
+          cargo run -p tw-api --features ts --example export_ts -- "$RUNNER_TEMP/tw-api-ts"
+          npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 "$RUNNER_TEMP/tw-api-ts/tw-api.ts"
+
       - name: Build
         run: cargo build --release -p twcore
 

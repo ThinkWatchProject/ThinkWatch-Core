@@ -28,13 +28,15 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
-use axum::routing::{get, post};
+use axum::routing::get;
 use serde_json::Value;
 use tw_config::Protocol;
 use tw_config::history::Origin;
 use tw_gateway::chatgpt;
 
+use crate::contract::RouterExt;
 use crate::{ControlState, Fail, fail};
+use tw_api::ep;
 use tw_types::{Msg, msg};
 
 /// 登录要在多久之内完成。和 Codex 一样是 15 分钟
@@ -49,13 +51,12 @@ const API_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
-        .route("/chatgpt/login", post(start))
-        .route("/chatgpt/login/{id}", get(status).delete(cancel))
-        .route("/providers/{name}/chatgpt/usage", get(usage))
-        .route(
-            "/providers/{name}/chatgpt/resets",
-            get(list_resets).post(use_reset),
-        )
+        .at(ep::StartChatgptLogin, start)
+        .at(ep::ChatgptLoginStatus, status)
+        .at(ep::CancelChatgptLogin, cancel)
+        .at(ep::ChatgptUsage, usage)
+        .at(ep::ChatgptResets, list_resets)
+        .at(ep::UseChatgptReset, use_reset)
 }
 
 /// 登录要用的地址。**平时是 OpenAI 的**，测试里换成本机的假服务器
