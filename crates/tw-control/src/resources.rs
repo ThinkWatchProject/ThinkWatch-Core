@@ -227,7 +227,7 @@ async fn test_provider(
         }
         _ => None,
     };
-    let headers = match p.outbound_headers(token.as_deref(), None) {
+    let headers = match p.outbound_headers(token.as_deref()) {
         Ok(h) => h,
         Err(e) => return Ok(Json(failed(e.to_string()))),
     };

@@ -662,7 +662,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            p.outbound_headers(None, None),
+            p.outbound_headers(None),
             Err(tw_config::CredentialError::NoToken)
         );
     }

@@ -654,7 +654,7 @@ fn cmd_check(path: &Path) -> Result<()> {
                     println!(
                         "     · OAuth: getting a token needs the network, and happens once the gateway starts"
                     );
-                } else if let Err(e) = p.outbound_headers(None, None) {
+                } else if let Err(e) = p.outbound_headers(None) {
                     println!("     ⚠ the credential could not be obtained: {e}");
                 }
             }

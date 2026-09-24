@@ -830,7 +830,7 @@ async fn speed_run(
         // OAuth 那类要联网换 token，所以走网关那条 async 的路。
         // **用这一家自己的 client** —— 换 token 要走它的代理。
         let pk_http = s.gateway.client_for(&p.name);
-        let headers = match s.gateway.headers_for(p, &pk_http, None).await {
+        let headers = match s.gateway.headers_for(p, &pk_http).await {
             Ok(h) => h,
             Err(e) => {
                 out.push(tw_api::SpeedResult {
