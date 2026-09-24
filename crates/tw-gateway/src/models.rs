@@ -26,7 +26,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::probe::ModelList;
-use crate::server::{AppState, Runtime, now_ms};
+use crate::server::now_ms;
+use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
 /// 多久向每个上游重新问一次。
@@ -146,7 +147,7 @@ fn identity(cfg: &tw_config::Config, p: &tw_config::Provider) -> String {
         "{}|{key}|{:?}|{}",
         p.base_url,
         p.effective_protocol(),
-        crate::server::proxy_shape(cfg, p)
+        crate::outbound::proxy_shape(cfg, p)
     );
     // **存指纹，不存原文** —— 这张表不该多出一份密钥
     blake3::hash(raw.as_bytes()).to_hex().to_string()
@@ -515,7 +516,7 @@ pub fn spawn(state: AppState) {
         loop {
             let now = now_ms();
             if seeded_at.is_none_or(|t| now.saturating_sub(t) >= REFRESH_EVERY.as_millis() as u64) {
-                crate::server::seed_latency(&state).await;
+                crate::latency::seed_url_test(&state).await;
                 seeded_at = Some(now);
             }
             let due = state.models.due(&state.config(), now);

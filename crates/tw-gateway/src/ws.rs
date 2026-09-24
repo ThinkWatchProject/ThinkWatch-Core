@@ -32,7 +32,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::protocol::Message as UpMsg;
 
-use crate::server::AppState;
+use crate::state::AppState;
 use tw_types::{Msg, msg};
 
 /// `Option<WebSocketUpgrade>` 的替身。
