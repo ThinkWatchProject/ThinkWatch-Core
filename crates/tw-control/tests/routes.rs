@@ -14,6 +14,9 @@ use tw_control::{ConfigManager, ControlState};
 
 /// 没有默认路由：它由网关合成，兜底指向「全部上游」。
 const BASE: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: claude-code
     key: tw-a

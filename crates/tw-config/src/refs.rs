@@ -312,6 +312,9 @@ mod tests {
     use super::*;
 
     const CFG: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k

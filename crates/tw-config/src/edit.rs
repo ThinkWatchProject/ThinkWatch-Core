@@ -392,6 +392,9 @@ mod tests {
     }
 
     const CFG: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: default
     key: tw-a

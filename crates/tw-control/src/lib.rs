@@ -4,8 +4,9 @@
 //! 天然只有当前用户能连。
 //!
 //! 但那是文件系统给的保证，**只在这个平台上成立** —— Windows 上没有对等物，
-//! 控制面在那里只能落在回环 TCP 上。所以凭据这道门是另外装的一道，两个平台
-//! 都走它，见 [`token`]。
+//! 控制面在那里只能落在回环 TCP 上。所以每条连接先握手（`tw-link`，钥匙是
+//! 配置里的 `listen.control.key`），这道门是另外装的一道，每一种通道都走它，
+//! 见 `gate`。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ pub mod config;
 mod contract;
 pub mod diagnostics;
 pub mod dryrun;
+mod gate;
 pub mod keys;
 pub mod listen;
 pub mod pricing;
@@ -37,7 +39,6 @@ pub mod routes;
 pub mod scan;
 pub mod security;
 pub mod shutdown;
-pub mod token;
 pub mod zai;
 pub use config::{ApplyError, ConfigManager, resolve_path, spawn_watcher};
 pub use shutdown::Shutdown;
@@ -1143,12 +1144,15 @@ fn list_limit(q: &tw_api::ListQuery) -> usize {
 }
 
 /// 当前配置的原文。**文本模式直接显示它。**
+///
+/// 控制面的钥匙是打码的（`tw_api::control::KEY_MASK`）：界面用不着它，而
+/// 编辑器里的原文会被复制、截图。整份写回来时带着打码，就是钥匙不动。
 async fn get_config(State(s): State<ControlState>) -> Result<Json<tw_api::ConfigText>, Fail> {
     let c = s.cfg.current().map_err(unreadable_config)?;
     Ok(Json(tw_api::ConfigText {
         path: c.path.display().to_string(),
         version: c.version(),
-        text: c.text,
+        text: tw_config::control_key::mask(&c.text),
     }))
 }
 
@@ -1282,6 +1286,8 @@ pub(crate) fn apply_fail(e: ApplyError) -> Fail {
             StatusCode::CONFLICT
         }
         ApplyError::Edit(EditError::NotFound { .. }) => StatusCode::NOT_FOUND,
+        // 不是请求写错了，是这条路上不许改
+        ApplyError::ControlKeyLocked => StatusCode::FORBIDDEN,
         ApplyError::Rejected(_)
         | ApplyError::Build(_)
         | ApplyError::BadPath(_)
@@ -1457,20 +1463,20 @@ pub fn socket_path_fits(path: &Path) -> Result<(), ControlError> {
 /// 两种传输，**挑哪一种不是调用方的事**：`Address::in_dir` 按平台给出这台
 /// 机器上唯一可用的那一种（见 [`tw_api::control::Address`]）。这里只负责把
 /// 它听起来。
-pub async fn serve(
-    state: ControlState,
-    at: &tw_api::control::Address,
-    token: token::Token,
-) -> Result<(), ControlError> {
+///
+/// **每条连接先握手**（见 `gate`），握上了才交给 HTTP。门装在这一层，不装进
+/// `router()`：`router()` 是路由表本身，十几个集成测试直接拿它跑处理函数，
+/// 它们测的不是门。
+pub async fn serve(state: ControlState, at: &tw_api::control::Address) -> Result<(), ControlError> {
     use tw_api::control::Address;
-    // 门装在这儿，不装进 `router()` —— 理由见 `token::guard`
-    let app = token::guard(router(state), token);
+    let gate = gate::Gate::new(&state);
+    let app = router(state);
     match at {
         #[cfg(unix)]
-        Address::Socket(path) => serve_socket(app, path).await,
+        Address::Socket(path) => serve_socket(app, gate, path).await,
         #[cfg(not(unix))]
         Address::Socket(path) => Err(ControlError::NoUnixSockets { path: path.clone() }),
-        Address::Loopback { port_file } => serve_loopback(app, port_file).await,
+        Address::Loopback { port_file } => serve_loopback(app, gate, port_file).await,
     }
 }
 
@@ -1479,7 +1485,7 @@ pub async fn serve(
 /// 陈旧的 socket 文件直接删掉重建 —— 它和 lock 文件不一样，没有「另一个
 /// 实例可能还在用」的歧义：单实例锁已经在上一步挡住了。
 #[cfg(unix)]
-async fn serve_socket(app: Router, path: &Path) -> Result<(), ControlError> {
+async fn serve_socket(app: Router, gate: gate::Gate, path: &Path) -> Result<(), ControlError> {
     socket_path_fits(path)?;
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -1493,14 +1499,14 @@ async fn serve_socket(app: Router, path: &Path) -> Result<(), ControlError> {
     })?;
     {
         use std::os::unix::fs::PermissionsExt;
-        // 0700：只有当前用户能连。凭据那道门在它之外，不是替代它 ——
+        // 0700：只有当前用户能连。握手那道门在它之外，不是替代它 ——
         // 两道都在，而只有这一道是平台给的。
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
     tracing::info!(path = %path.display(), "the control plane is listening");
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => hand_off(stream, app.clone()),
+            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone()),
             Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
         }
     }
@@ -1514,9 +1520,13 @@ async fn serve_socket(app: Router, path: &Path) -> Result<(), ControlError> {
 /// 端口文件**先绑后写**：写完才说得出真实的号码，而反过来（先写一个想要的
 /// 号再去绑）会在绑失败时留下一个指向别人的文件。
 ///
-/// 这一档**挡不住同机的任何进程**，也问不出对端是谁 —— 门全在凭据上，
-/// 见 [`token`]。
-async fn serve_loopback(app: Router, port_file: &Path) -> Result<(), ControlError> {
+/// 这一档**挡不住同机的任何进程**，也问不出对端是谁 —— 门全在握手上，
+/// 见 `gate`。
+async fn serve_loopback(
+    app: Router,
+    gate: gate::Gate,
+    port_file: &Path,
+) -> Result<(), ControlError> {
     use std::net::Ipv4Addr;
     if let Some(dir) = port_file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1541,32 +1551,44 @@ async fn serve_loopback(app: Router, port_file: &Path) -> Result<(), ControlErro
     tracing::info!(port, "the control plane is listening on loopback");
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => hand_off(stream, app.clone()),
+            Ok((stream, _)) => hand_off(stream, app.clone(), gate.clone()),
             Err(e) => tracing::warn!("the control plane could not accept a connection: {e}"),
         }
     }
 }
 
-/// 一条连接交给 hyper。
+/// 一条连接：先握手，握上了交给 hyper。
 ///
-/// **两种传输共用**：它们的差别只在怎么拿到这个流，拿到之后的每一件事
-/// （协议协商、错误怎么记）都该一模一样 —— 写两遍就是两遍会漂。
-fn hand_off<S>(stream: S, app: Router)
+/// **每种传输共用**：它们的差别只在怎么拿到这个流，拿到之后的每一件事
+/// （握手、协议协商、错误怎么记）都该一模一样 —— 写两遍就是两遍会漂。
+/// 远程端口接进来的连接也走这里。
+fn hand_off<S>(stream: S, app: Router, gate: gate::Gate)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
-        let io = hyper_util::rt::TokioIo::new(stream);
+        let Some(link) = gate.admit(stream).await else {
+            return;
+        };
+        let io = hyper_util::rt::TokioIo::new(link.stream);
         let svc = hyper::service::service_fn(move |req| {
             use tower::ServiceExt;
             app.clone().oneshot(req)
         });
-        if let Err(e) =
-            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await
-        {
-            tracing::debug!("a control-plane connection ended: {e}");
+        let builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let conn = builder.serve_connection(io, svc);
+        tokio::select! {
+            r = conn => {
+                if let Err(e) = r {
+                    tracing::debug!("a control-plane connection ended: {e}");
+                }
+            }
+            // 钥匙换了：用旧钥匙进来的这一条断开（理由见 `gate`）。连接直接丢掉，
+            // 事件流也跟着断，对面重连时按新钥匙握手
+            _ = gate.key_changed_from(&link.key) => {
+                tracing::info!("the control key changed; closing a connection made with the previous one");
+            }
         }
     });
 }

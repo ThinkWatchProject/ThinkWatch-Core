@@ -96,6 +96,8 @@ clients:
 listen:
   gateway:
     port: {port}
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 "
     )
 }
@@ -277,6 +279,8 @@ clients:
 listen:
   gateway:
     bind: all
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 ");
     let (_, ov) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
     let default = serde_json::json!(tw_config::default_allow_from());

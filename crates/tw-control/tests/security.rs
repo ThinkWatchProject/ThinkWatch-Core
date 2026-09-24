@@ -13,6 +13,9 @@ use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
 const BASE: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 # 默认那把
 clients:
   - name: default

@@ -58,6 +58,9 @@ pub enum ApplyError {
     /// 还有别的配置在引用它，删不掉。**消息里要说清是谁。**
     #[error("{0}")]
     InUse(Msg),
+    /// 这次写入改了（或删了）控制面的钥匙。经控制面进来的写入不能动它。
+    #[error("{}", self.msg())]
+    ControlKeyLocked,
 }
 
 impl ApplyError {
@@ -77,6 +80,11 @@ impl ApplyError {
                  {current}. Refresh and edit again"
             ),
             ApplyError::Edit(e) => e.msg(),
+            ApplyError::ControlKeyLocked => msg!(
+                "control.control_key_locked" =>
+                "listen.control.key cannot be changed from here. Run twcore control-key --rotate \
+                 on the machine the core runs on, or edit the configuration file there"
+            ),
         }
     }
 }
@@ -201,6 +209,12 @@ impl ConfigManager {
     ///
     /// `base_version` 是乐观并发的凭据：**对不上就是 409**，
     /// 而不是覆盖。`None` 表示调用方明确要覆盖（比如首次生成）。
+    ///
+    /// **控制面的钥匙在这条路上改不了。**界面拿到的原文里钥匙是打码的，写回来
+    /// 带着打码就换回生效的那一把；换成别的、删掉，一律拒绝
+    /// （[`ApplyError::ControlKeyLocked`]）。能换钥匙的只有 `twcore control-key
+    /// --rotate` 和直接改文件 —— 都得在 core 那台机器上。经控制面进来的一方
+    /// 改得动这扇门，就改得掉别人进来的路。
     pub async fn write(
         &self,
         new_text: &str,
@@ -216,9 +230,17 @@ impl ConfigManager {
                 current: cur.version(),
             });
         }
+        let in_effect = self.gateway.config().listen.control.key.clone();
+        // 换不回来（原文读不成 YAML）就原样往下走，校验会说它哪里坏了
+        let unmasked = tw_config::control_key::unmask(new_text, in_effect.as_deref()).ok();
+        let new_text = unmasked.as_deref().unwrap_or(new_text);
         // **先校验再写。**写完才发现读不回来，那份坏配置已经在盘上了 ——
         // 而用户下一次启动会撞上它。
-        tw_config::try_parse(new_text).map_err(ApplyError::Rejected)?;
+        let next = tw_config::try_parse(new_text).map_err(ApplyError::Rejected)?;
+        let parse = |k: Option<&str>| k.and_then(|k| tw_api::control::ControlKey::parse(k).ok());
+        if parse(next.listen.control.key.as_deref()) != parse(in_effect.as_deref()) {
+            return Err(ApplyError::ControlKeyLocked);
+        }
         // 改之前那一版进历史。**这一步在写盘之前** —— 写完再存的话，
         // 中间崩一次就永远丢了那一版，而那恰恰是最需要它的时刻。
         let _ = tw_config::history::snapshot(&self.path, &cur.text, origin);
@@ -487,7 +509,7 @@ fn bad_path(e: tw_yaml::PatchError) -> ApplyError {
 mod patch_seq_tests {
     use super::*;
 
-    const CFG: &str = "version: 1\nclients:\n  # 首次运行生成的\n  - name: default\n    key: tw-aaa\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n    key: sk-a\n";
+    const CFG: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  # 首次运行生成的\n  - name: default\n    key: tw-aaa\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com\n    key: sk-a\n";
 
     /// 这三条是「界面能不能建东西」的全部依据。
     #[test]
@@ -556,13 +578,13 @@ mod msg_codes {
         assert_eq!(e.msg().code, "config.edit.multiline");
         let e = ApplyError::Store(tw_config::StoreError::Missing { path: "/x".into() });
         assert_eq!(e.msg().code, "config.store.missing");
-        let e = ApplyError::Rejected(tw_config::try_parse("version: 1\n").unwrap_err());
+        let e = ApplyError::Rejected(tw_config::try_parse("version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\n").unwrap_err());
         assert_eq!(e.msg().code, "config.no_clients");
     }
 
     #[test]
     fn a_patch_path_that_names_no_entry_has_its_own_code() {
-        let cfg = "version: 1\nclients:\n  - name: c\n    key: tw-k\n";
+        let cfg = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\n";
         let m = resolve_path(cfg, "/clients/不存在").unwrap_err();
         assert_eq!(m.code, "control.patch.no_entry");
         assert_eq!(m.arg("name"), "不存在");

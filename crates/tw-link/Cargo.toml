@@ -1,0 +1,26 @@
+[package]
+name = "tw-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Control-channel handshake and encryption (Noise NNpsk0), shared by core and the desktop app"
+
+[dependencies]
+# 钥匙的格式和控制面的版本号都在契约层
+tw-api = { workspace = true }
+# 从 config.yaml 里读钥匙。**不拖 serde_yaml**：只找一个标量，tw-yaml 就是
+# 为「按路径找到那一段」写的，桌面端本来也要它
+tw-yaml = { workspace = true }
+# Noise 的实现。**只开这一套算法**：X25519、ChaChaPoly、BLAKE2s，不带 AES、
+# SHA2、ring —— 握手名字里写着用哪几个，多开的只是多编译的
+snow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+tempfile = "3"

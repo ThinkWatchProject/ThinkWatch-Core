@@ -113,6 +113,9 @@ async fn the_speed_run_goes_out_through_the_upstreams_own_proxy() {
     let proxy = proxy_that_answers(seen.clone()).await;
     let yaml = format!(
         "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k
@@ -150,6 +153,9 @@ providers:
 async fn every_upstream_is_quoted_by_its_price_sheet_and_free_is_zero() {
     // 订阅账号也按价目表报价；不计费的那一家报 0，合计照样算得出来
     let b = bed("version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k
@@ -191,6 +197,9 @@ providers:
 #[tokio::test]
 async fn a_quote_covers_the_chosen_upstreams_and_marks_the_ones_that_cannot_serve_the_model() {
     let b = bed("version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
 clients:
   - name: c
     key: tw-k
