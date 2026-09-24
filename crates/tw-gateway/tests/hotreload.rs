@@ -666,3 +666,171 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("slow"));
 }
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn bind(raw: &str) -> tw_config::Bind {
+    serde_yaml_ng::from_str(raw).unwrap()
+}
+
+/// 换一次监听，等它换完（看状态里的地址，不靠睡多久）。
+async fn switch(state: &tw_gateway::AppState, next: Config) {
+    let want = next.listen.gateway.addrs().unwrap();
+    state.reload(next).unwrap();
+    for _ in 0..100 {
+        let now = state.listening();
+        if now.addrs == want || now.error.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the listener never switched: {:?}", state.listening());
+}
+
+#[tokio::test]
+async fn switching_between_all_interfaces_and_one_address_on_the_same_port_takes_effect() {
+    // **同一个端口上，通配地址和具体地址不能并存**（Linux）：`bind: all` 换成
+    // 一张网卡时，新的 127.0.0.1 撞上的是我们自己还没退场的 0.0.0.0。以前这一步
+    // 报「端口被占」然后守着旧的，要重启才生效
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    let port = free_port();
+    c.listen.gateway.port = port;
+    c.listen.gateway.bind = bind("all");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    following(&state, &c).await;
+    let gw: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    assert!(ask(gw).await.contains("\"a\""));
+
+    for to in ["127.0.0.1", "all", "127.0.0.1"] {
+        let mut next = c.clone();
+        next.listen.gateway.bind = bind(to);
+        switch(&state, next.clone()).await;
+        let now = state.listening();
+        assert_eq!(now.error, None, "switching to {to}: {now:?}");
+        assert_eq!(
+            now.addrs,
+            next.listen.gateway.addrs().unwrap(),
+            "switching to {to}"
+        );
+        assert!(
+            ask(gw).await.contains("\"a\""),
+            "nothing answers after switching to {to}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_pre_save_check_does_not_call_our_own_port_taken() {
+    // 控制面在写配置之前问「绑不绑得上」。挡路的是我们自己在听的那一个时，
+    // 不该回答「被别的程序占了」—— 那样这份设置根本存不进去
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    c.listen.gateway.port = free_port();
+    c.listen.gateway.bind = bind("all");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    following(&state, &c).await;
+    let mut next = c.clone();
+    next.listen.gateway.bind = bind("127.0.0.1");
+    let want = next.listen.gateway.addrs().unwrap();
+    assert_eq!(tw_gateway::listen::check(&state, &want).await, Ok(()));
+
+    // 真被别人占着的，照样说
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = squatter.local_addr().unwrap();
+    let e = tw_gateway::listen::check(&state, &[taken])
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "gw.listen.port_taken");
+}
+
+#[tokio::test]
+async fn a_request_in_flight_survives_the_old_listener_giving_way() {
+    // 旧的先让出端口时，**让的只是监听**：已经连上、跑到一半的请求照常跑完
+    let slow = {
+        let app = Router::new().fallback(any(|| async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"by":"slow"}"#))
+                .unwrap()
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let mut c = cfg(vec![provider("slow", slow)], vec![]);
+    let port = free_port();
+    c.listen.gateway.port = port;
+    c.listen.gateway.bind = bind("all");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    following(&state, &c).await;
+
+    let inflight = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .timeout(Duration::from_secs(10))
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let mut next = c.clone();
+    next.listen.gateway.bind = bind("127.0.0.1");
+    switch(&state, next).await;
+    assert_eq!(state.listening().error, None);
+    assert!(!inflight.is_finished(), "测试的前提：旧请求还在跑");
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok(),
+        "旧请求还没跑完，新的监听就该能连了"
+    );
+    let r = inflight
+        .await
+        .unwrap()
+        .expect("让出端口把跑到一半的请求掐了");
+    assert_eq!(r.status(), 200);
+}
+
+#[tokio::test]
+async fn when_the_new_address_is_really_taken_the_old_one_is_taken_back() {
+    // 让出来之后新的还是绑不上（这回真是别的程序）：旧的原样绑回去，并说清原因。
+    //
+    // 场景：0.0.0.0:p 在听，换到 [::1]:p，而 [::1]:p 被别人占着。同端口，所以
+    // 走「先让出来」那条路；让了也没用，于是回到 0.0.0.0:p
+    let port = free_port();
+    let Ok(squatter) = std::net::TcpListener::bind(("::1", port)) else {
+        eprintln!("no IPv6 loopback here; skipping");
+        return;
+    };
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    c.listen.gateway.port = port;
+    c.listen.gateway.bind = bind("all");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    following(&state, &c).await;
+    let before = state.listening().addrs;
+
+    let mut next = c.clone();
+    next.listen.gateway.bind = bind("::1");
+    switch(&state, next).await;
+    let now = state.listening();
+    assert_eq!(
+        now.error.as_ref().map(|m| m.code.as_str()),
+        Some("gw.listen.port_taken"),
+        "{now:?}"
+    );
+    assert_eq!(now.addrs, before, "旧的该原样回来");
+    let gw: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    assert!(ask(gw).await.contains("\"a\""), "旧的地址不该停");
+    drop(squatter);
+}
