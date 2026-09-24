@@ -32,6 +32,10 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `twcore upgrade`：问 Release、下载、核对校验和。都是依赖树里已有的
+reqwest = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # 只剩一处在用：问一个 pid 还在不在（见 src/proc.rs）
@@ -45,3 +49,6 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile = "3"
+# `twcore upgrade` 的测试对着一个假的 GitHub 跑
+axum = { workspace = true }
+serde_json = { workspace = true }

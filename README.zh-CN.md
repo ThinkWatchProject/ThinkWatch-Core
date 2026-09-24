@@ -20,6 +20,9 @@ cargo run -p twcore -- check    # 只校验，不启动
 cargo run -p twcore -- serve    # 起网关和控制面
 ```
 
+`config.yaml` 的每个字段见[配置手册](docs/config.zh-CN.md)。在 Linux 服务器上运行
+`twcore`、由桌面应用远程管理，见[在服务器上运行 core](docs/server.zh-CN.md)。
+
 ## 它做什么
 
 把客户端（Claude Code、Codex 之类）指向本地的一个端口，然后：

@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 mod call;
 mod lockfile;
 mod proc;
+mod upgrade;
 
 use lockfile::{LockFile, LockOutcome};
 
@@ -111,6 +112,20 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Replace this twcore with another release from GitHub; the configuration is left alone
+    //
+    // 只给单独装的 twcore 用（服务器上）。桌面应用包里的那份由应用更新，见 upgrade.rs
+    Upgrade {
+        /// Only compare with the release and report; change nothing
+        #[arg(long)]
+        check: bool,
+        /// Restart twcore.service afterwards when systemd runs it
+        #[arg(long)]
+        restart: bool,
+        /// Install this version rather than the latest, such as 0.47.0
+        #[arg(long)]
+        version: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -185,6 +200,15 @@ fn main() -> Result<()> {
             data,
             out,
         } => call::run(&path, &endpoint, &method, data, out),
+        Command::Upgrade {
+            check,
+            restart,
+            version,
+        } => upgrade::run(upgrade::Opts {
+            check,
+            restart,
+            version,
+        }),
     }
 }
 

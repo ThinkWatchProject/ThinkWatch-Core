@@ -87,6 +87,38 @@ clean the diff is:
   connections to the same handshake before HTTP. The control key never
   leaves through the control plane and cannot be changed through it.
 
+## The configuration reference
+
+`docs/config.md` and `docs/config.zh-CN.md` are written by hand, except the
+field tables and the built-in rule lists: everything between
+`<!-- generated: … -->` and `<!-- /generated -->` is rendered from
+`crates/tw-config/tests/manual/schema.rs`, and
+`cargo test -p tw-config --test manual` fails when the two differ.
+
+That file declares every section of `config.yaml` against its Rust type, and
+the test checks the declaration against the code rather than trusting it:
+
+- **Field names** come from serde itself (a probe deserializer records the
+  names a derived `Deserialize` asks for), so a field added to a config
+  type and not to the manual fails with the field's name.
+- **Defaults are proven.** A declared default is written into a minimal
+  section and parsed; it has to mean the same as leaving the field out. A
+  field marked required has to fail without it.
+- **Enum values** (`protocol`, `mode`, `type` …) are read from serde, not
+  copied.
+- **Examples** in the manuals are parsed as configuration.
+
+When you change a config type, add or change its row (English and Chinese),
+then regenerate:
+
+```bash
+UPDATE_CONFIG_DOCS=1 cargo test -p tw-config --test manual
+```
+
+A section that is designed but not in the code yet is declared as
+`Ty::Pending`: it is rendered, and the test fails as soon as the code starts
+reading that field, so the declaration gets switched to the real type.
+
 ## The price list
 
 Prices come in two layers.
@@ -113,20 +145,36 @@ answered on the request itself.
 
 ## Cutting a release
 
-`twcore` ships inside the desktop app's `.app`, so "which build is in
-there" has to be a fact somebody can check rather than whatever sat in
-a `target/` directory that afternoon.
+`twcore` ships inside the desktop app, and on its own for servers, so
+"which build is in there" has to be a fact somebody can check rather than
+whatever sat in a `target/` directory that afternoon.
 
 1. Bump `version` in the workspace `Cargo.toml`, land it on `main`.
 2. Tag that commit `vX.Y.Z` and push the tag.
-3. `release.yml` builds `twcore` for `aarch64-apple-darwin`, checks the
+3. `release.yml` builds `twcore` for every target below, checks each
    binary actually runs and reports the version on the tag, and attaches
-   it to a GitHub Release with a `sha256`.
+   them to a GitHub Release, each with a `.sha256` (`<sha>  <file>`).
+
+| Target | Files |
+|---|---|
+| `aarch64-apple-darwin` | `twcore-aarch64-apple-darwin` |
+| `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` | `twcore-<target>.exe` |
+| `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `twcore-<target>`, and `twcore-<target>.tar.gz` holding the binary, `twcore.service` and `LICENSE` |
+
+The bare binaries are what the desktop app's pipeline bundles and what
+`twcore upgrade` downloads. The Linux tarballs are what
+`scripts/install.sh` installs on a server; they carry the systemd unit so
+the unit and the binary come from the same commit. The file names are a
+contract with both: `twcore upgrade` has a test that reads `release.yml`.
+
+To try a change to `release.yml` without publishing, run it by hand
+(`workflow_dispatch`): it builds and checks everything and uploads nothing.
 
 The desktop app pins `tw-api` to the same tag and bundles the binary
 from that release. Those two have to come from one commit: the binary
 speaks a protocol, and the app compiles a mirror of it.
 
-Apple Silicon only, deliberately. An Intel user downloading a file that
-will not open is worse served than one who finds no download at all;
-supporting them means a universal binary, which is its own decision.
+On macOS, Apple Silicon only, deliberately. An Intel user downloading a
+file that will not open is worse served than one who finds no download
+at all; supporting them means a universal binary, which is its own
+decision.
