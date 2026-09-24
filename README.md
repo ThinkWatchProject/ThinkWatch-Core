@@ -44,13 +44,14 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
 
 ```
 tw-types · tw-dialect · tw-wire · tw-upstream · tw-crypto   ← shape fixed by the outside world
-tw-engine · tw-pricing · tw-guard · tw-yaml · tw-secret     ← domain logic
+tw-engine · tw-pricing · tw-guard · tw-breaker · tw-yaml · tw-secret   ← domain logic
 tw-config · tw-store · tw-scan · tw-adopt · tw-observe      ← assembly
 tw-gateway · tw-control                                     ← data plane / control plane
 ```
 
-The top two layers are stable against external reality — the server edition
-depends on them directly. The bottom two are the single-machine implementation
+The top two layers are stable against external reality. The server edition
+depends on tw-types, tw-dialect, tw-wire, tw-upstream, tw-crypto, tw-guard and
+tw-breaker directly, and on tw-secret through tw-guard. The bottom two are the single-machine implementation
 (SQLite, unix socket) and are deliberately **not** shared: single-machine SQLite
 and multi-tenant Postgres are different enough that forcing one abstraction over
 both would serve neither.
