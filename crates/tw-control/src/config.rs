@@ -61,6 +61,9 @@ pub enum ApplyError {
     /// 这次写入改了（或删了）控制面的钥匙。经控制面进来的写入不能动它。
     #[error("{}", self.msg())]
     ControlKeyLocked,
+    /// 从远程端口进来的写入改了 `listen.control` 这一节。
+    #[error("{}", self.msg())]
+    RemoteControlLocked,
 }
 
 impl ApplyError {
@@ -84,6 +87,12 @@ impl ApplyError {
                 "control.control_key_locked" =>
                 "listen.control.key cannot be changed from here. Run twcore control-key --rotate \
                  on the machine the core runs on, or edit the configuration file there"
+            ),
+            ApplyError::RemoteControlLocked => msg!(
+                "control.remote.control_section_locked" =>
+                "listen.control cannot be changed over a remote connection: it holds the port \
+                 this connection came in through. Change it on the server with twcore remote, or \
+                 by editing the configuration file there"
             ),
         }
     }
@@ -240,6 +249,13 @@ impl ConfigManager {
         let parse = |k: Option<&str>| k.and_then(|k| tw_api::control::ControlKey::parse(k).ok());
         if parse(next.listen.control.key.as_deref()) != parse(in_effect.as_deref()) {
             return Err(ApplyError::ControlKeyLocked);
+        }
+        // 远程进来的改不了自己进来的那扇门：改错一个端口、一条放行网段，就再也
+        // 连不上了，而服务器上的人未必在
+        if crate::remote::is_remote()
+            && next.listen.control.remote != self.gateway.config().listen.control.remote
+        {
+            return Err(ApplyError::RemoteControlLocked);
         }
         // 改之前那一版进历史。**这一步在写盘之前** —— 写完再存的话，
         // 中间崩一次就永远丢了那一版，而那恰恰是最需要它的时刻。

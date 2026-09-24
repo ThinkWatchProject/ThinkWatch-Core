@@ -246,10 +246,10 @@ addition to the local channel, so a mistake here (a port that is taken, an
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Listen on the remote port. Unset or `false`: no network port is opened for control. |
+| `enabled` | bool | `false` | Listen on the remote port. Unset or `false`: no network port is opened for control. `twcore remote enable` and `twcore remote disable` switch it; a running core follows within a second. |
 | `bind` | `loopback` \| `all` \| interface name \| IP address | `all` | Interface to listen on, written as for `listen.gateway.bind`. |
-| `port` | integer | generated | TCP port. There is no fixed default: a random free port is written when the section is generated, like the key. |
-| `allow_from` | list of strings | `[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7]` | Sources that may connect, as for `listen.gateway.allow_from`. A connection from anywhere else is closed before the handshake, without a byte in reply. |
+| `port` | integer | **required** | TCP port. There is no fixed default: `twcore init` and `twcore remote enable` write a random port between 20000 and 32000 (never the gateway's) when they write this section. It cannot be 0 or the gateway's port. |
+| `allow_from` | list of strings | `[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7]` | Sources that may connect, as for `listen.gateway.allow_from`, except that this machine is not let in automatically (it has the local channel). A connection from anywhere else is closed before the handshake, without a byte in reply; narrowing the list also closes open connections it no longer allows. A source that fails the handshake 5 times within a minute is ignored for a minute. |
 <!-- /generated -->
 
 ```yaml
@@ -259,7 +259,7 @@ listen:
     remote:
       enabled: true
       bind: all
-      port: 41327            # random, written when the section is generated
+      port: 23483            # random, written when the section is generated
       allow_from: [192.168.1.0/24]
 ```
 

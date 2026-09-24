@@ -65,26 +65,25 @@ impl Gate {
     }
 
     /// 握手。失败时该回的都回过了，这里只记一行，**不记钥匙**。
-    pub(crate) async fn admit<S>(&self, stream: S) -> Option<tw_link::Accepted<S>>
+    pub(crate) async fn admit<S>(&self, stream: S) -> Result<tw_link::Accepted<S>, LinkError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        match self.acceptor.accept(stream).await {
+        let r = self.acceptor.accept(stream).await;
+        match &r {
             Ok(a) => {
                 tracing::debug!(app = %a.hello.app, "a control-plane client connected");
-                Some(a)
             }
             Err(e @ (LinkError::WrongKey | LinkError::VersionMismatch { .. })) => {
                 // 桌面端和 core 版本不一致、拿着旧钥匙的，都是用户看得到的状态，
                 // 值得在日志里留一行
                 tracing::info!("a control-plane connection was turned away: {e}");
-                None
             }
             Err(e) => {
                 tracing::debug!("a control-plane handshake did not finish: {e}");
-                None
             }
         }
+        r
     }
 
     /// 等到钥匙换成了别的（不再是 `used`）。

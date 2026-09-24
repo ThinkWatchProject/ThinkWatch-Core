@@ -81,6 +81,14 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+    /// Show, open or close the remote control port, which a desktop app on another machine
+    /// connects to
+    //
+    // 只能在 core 这台机器上开关：经控制面进来的一方改不了自己进来的那扇门
+    Remote {
+        #[command(subcommand)]
+        what: Option<RemoteCmd>,
+    },
     /// Send one request to the running core's control plane and print the response
     //
     // **curl 敲不开控制面了**：每条连接先握手。调试、脚本、smoke 用这个 ——
@@ -112,6 +120,27 @@ enum Command {
         #[arg(long)]
         version: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Print whether the remote control port is open and where to connect
+    Show,
+    /// Open the remote control port. A running core starts listening within a second
+    Enable {
+        /// loopback, all, an interface name such as eth0, or an address; all by default
+        #[arg(long)]
+        bind: Option<String>,
+        /// The port; a random one is picked the first time
+        #[arg(long)]
+        port: Option<u16>,
+        /// A source allowed to connect (CIDR or address); repeat for several. Replaces the
+        /// list; the private ranges by default
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+    },
+    /// Close the remote control port; the port and the allowed sources are kept
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -162,6 +191,7 @@ fn main() -> Result<()> {
         Command::Speed { provider, proxy } => cmd_speed(&path, provider, proxy),
         Command::Config { what } => cmd_config(&path, what),
         Command::ControlKey { rotate } => cmd_control_key(&path, rotate),
+        Command::Remote { what } => cmd_remote(&path, what.unwrap_or(RemoteCmd::Show)),
         Command::Call {
             path: endpoint,
             method,
@@ -416,13 +446,95 @@ fn cmd_control_key(path: &Path, rotate: bool) -> Result<()> {
              with the previous one; the desktop app on this machine reconnects by itself, and one \
              on another machine needs the new key)"
         );
+        print_remote(path);
         return Ok(());
     }
     // 还没有钥匙的旧配置：补上再打印。`serve` 起来时也会这样补，这里先补
     // 不改变任何行为，只是省得让人先去起一次 core
     tw_config::control_key::ensure_file(path)?;
     let key = tw_link::read_key(path)?;
+    // **标准输出只有钥匙**：`$(twcore control-key)` 拿到的就是它。连接要的其余
+    // 几样（地址、端口）走标准错误，终端上照样看得见
     println!("{}", key.to_hex());
+    print_remote(path);
+    Ok(())
+}
+
+/// 远程控制端口开没开、从别的机器该连哪儿。**按配置文件说**：core 可能没在跑，
+/// 在跑的话它听的就是这里写的（绑不上时 `twcore call /status` 说为什么）。
+fn print_remote(path: &Path) {
+    let Ok(cfg) = tw_config::load(path) else {
+        return;
+    };
+    match cfg.listen.control.remote.filter(|r| r.enabled) {
+        None => eprintln!("remote control: off (twcore remote enable opens it)"),
+        Some(r) => {
+            let addrs = match r.bind.resolve() {
+                Ok(ip) => tw_control::remote::reachable(std::net::SocketAddr::new(ip, r.port)),
+                Err(e) => {
+                    eprintln!("remote control: port {}, but {e}", r.port);
+                    return;
+                }
+            };
+            if addrs.is_empty() {
+                eprintln!(
+                    "remote control: port {}, listening on loopback only, so no other machine can \
+                     connect",
+                    r.port
+                );
+            } else {
+                eprintln!(
+                    "remote control: port {}; connect to {}",
+                    r.port,
+                    addrs.join(" or ")
+                );
+            }
+            eprintln!("allowed sources: {}", r.allow_from.join(", "));
+        }
+    }
+}
+
+fn cmd_remote(path: &Path, what: RemoteCmd) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!(
+            "{} does not exist. twcore init writes it; twcore serve writes it on first start",
+            path.display()
+        );
+    }
+    match what {
+        RemoteCmd::Show => {}
+        RemoteCmd::Enable { bind, port, allow } => {
+            let bind = match bind {
+                None => None,
+                Some(b) => Some(
+                    serde_yaml_ng::from_value::<tw_config::Bind>(serde_yaml_ng::Value::String(
+                        b.trim().to_string(),
+                    ))
+                    .with_context(|| {
+                        format!(
+                            "--bind takes loopback, all, an interface name or an address; it \
+                             reads {b}"
+                        )
+                    })?,
+                ),
+            };
+            let e = tw_config::remote::Enable {
+                bind,
+                port,
+                allow_from: (!allow.is_empty()).then_some(allow),
+            };
+            tw_config::remote::enable_file(path, &e)?;
+            eprintln!("(a running core opens the port within a second)");
+        }
+        RemoteCmd::Disable => {
+            tw_config::remote::disable_file(path)?;
+            eprintln!(
+                "(a running core closes the port within a second, and the connections made \
+                 through it)"
+            );
+        }
+    }
+    print_remote(path);
     Ok(())
 }
 
@@ -434,7 +546,15 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
             path.display()
         );
     }
-    let cfg = tw_config::generate_initial();
+    let mut cfg = tw_config::generate_initial();
+    // **服务器上手工部署才跑 init**：远程控制端口这一节写出来、关着，端口现挑。
+    // 要用时把 enabled 改成 true（或者 twcore remote enable）
+    cfg.listen.control.remote = Some(tw_config::RemoteListen {
+        enabled: false,
+        bind: tw_config::Bind::All,
+        port: tw_config::generate_remote_port(cfg.listen.gateway.port),
+        allow_from: tw_config::default_allow_from(),
+    });
     let key = cfg.clients[0].key.clone();
     write_config(path, &cfg)?;
     println!("wrote {}", path.display());
@@ -446,7 +566,8 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     println!();
     println!(
         "The configuration also holds the control key, which the desktop app connects with; \
-         twcore control-key prints it."
+         twcore control-key prints it. To let a desktop app on another machine connect, run \
+         twcore remote enable."
     );
     println!();
     println!("Next: add an upstream under providers, then run twcore serve.");
@@ -720,6 +841,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 是能改配置**。安全模式就是「只有这一半」。
         let control = tw_control::ControlState {
             shutdown: shutdown.clone(),
+            remote: Default::default(),
             started: std::time::Instant::now(),
             gateway: state.clone(),
             cfg: manager,

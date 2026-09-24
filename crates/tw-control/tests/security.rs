@@ -114,6 +114,7 @@ fn bed_with(yaml: &str, seed: impl FnOnce(&tw_store::Db)) -> Bed {
     let bus = gw.bus.clone();
     let state = ControlState {
         shutdown: Default::default(),
+        remote: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: Some(Arc::new(tokio::sync::Mutex::new(rec))),

@@ -86,6 +86,18 @@ twcore call -X POST -d '{"model":"claude-sonnet-4-5","route":"default"}' /dryrun
 
 控制面发出去的配置原文里钥匙是打码的，经控制面的写入也改不了它。
 
+另一台机器上的桌面端经远程控制端口（`listen.control.remote`）连进来。它是在本机
+通道之外另开的，钥匙和握手都一样：
+
+```
+twcore remote enable --allow 192.168.1.0/24   # 端口第一次随机挑
+twcore remote disable
+twcore control-key                             # 标准输出是钥匙，地址和端口在标准错误
+```
+
+`allow_from` 之外的来源直接关掉、不回任何字节；同一来源一分钟内握手失败五次，
+之后一分钟不理它；远程连接不能关 core、不能取诊断包、不能改 `listen.control`。
+
 ## License
 
 MIT

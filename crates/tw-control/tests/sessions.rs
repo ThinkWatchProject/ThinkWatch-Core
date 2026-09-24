@@ -65,6 +65,7 @@ fn app(rows: &[tw_store::db::RequestRow]) -> (tempfile::TempDir, axum::Router) {
     let bus = gw.bus.clone();
     let state = ControlState {
         shutdown: Default::default(),
+        remote: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
         gateway: gw,
         store: Some(Arc::new(tokio::sync::Mutex::new(rec))),
