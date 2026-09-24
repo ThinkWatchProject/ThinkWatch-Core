@@ -171,22 +171,20 @@ pub async fn run(
                 ),
             )
         })?;
-    // OAuth 要联网换 token。重放不经过数据面，但**凭据这一层
-    // 必须走同一条路** —— 否则一个 OAuth 上游在重放里永远是「密钥取不到」
-    let pk_http = s.gateway.client_for(&provider.name);
-    let headers = s
-        .gateway
-        .headers_for(provider, &pk_http)
-        .await
-        .map_err(|e| {
-            fail(
-                StatusCode::BAD_REQUEST,
-                msg!(
-                    "control.credentials_failed", upstream = provider.name.clone(), detail = e =>
-                    "The credential for upstream `{upstream}` could not be obtained: {detail}"
-                ),
-            )
-        })?;
+    // **这一家自己的 client，和数据面转发用的是同一个**：它带着这家该走的
+    // 代理（`direct` 就是不走任何代理，连系统代理也不读）。换 token 和发请求
+    // 都用它 —— 用别的 client，重放就会走一条和原请求不同的出站路径：本机
+    // 上游被送进系统代理、指定的代理被绕过，比出来的结果是另一条路的
+    let http = s.gateway.client_for(&provider.name);
+    let headers = s.gateway.headers_for(provider, &http).await.map_err(|e| {
+        fail(
+            StatusCode::BAD_REQUEST,
+            msg!(
+                "control.credentials_failed", upstream = provider.name.clone(), detail = e =>
+                "The credential for upstream `{upstream}` could not be obtained: {detail}"
+            ),
+        )
+    })?;
 
     // **脱敏照做。**重放不经过数据面的管线，少了这一行，一条本来会被
     // 脱敏的请求会因为「重放」这个动作把密钥原样发出去
@@ -198,7 +196,6 @@ pub async fn run(
     );
 
     let url = tw_gateway::forward::upstream_url(&provider.base_url, &row.path, None);
-    let http = s.http().clone();
     let started = Instant::now();
     let mut r = http.post(&url).header("content-type", "application/json");
     r = tw_gateway::forward::apply_headers(r, &headers);
