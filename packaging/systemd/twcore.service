@@ -1,0 +1,67 @@
+# ThinkWatch Core as a system service.
+#
+# Installed by scripts/install.sh as /etc/systemd/system/twcore.service.
+# Setup and the configuration it reads: docs/server.md.
+#
+# Core keeps everything in its data directory, /var/lib/thinkwatch
+# (THINKWATCH_HOME): config.yaml, the request database, the history and the
+# local control socket. It is the only place the service can write.
+
+[Unit]
+Description=ThinkWatch Core (AI gateway)
+Documentation=https://github.com/ThinkWatchProject/ThinkWatch-Core/blob/main/docs/server.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=thinkwatch
+Group=thinkwatch
+Environment=THINKWATCH_HOME=/var/lib/thinkwatch
+# ${VAR} in config.yaml reads this environment: upstream keys, proxy
+# passwords, HTTPS_PROXY for `proxy: system`. Optional (the leading -).
+EnvironmentFile=-/etc/thinkwatch/env
+ExecStart=/usr/local/bin/twcore serve
+# Core reloads config.yaml on its own; a restart is needed only for a new
+# binary or a changed environment file.
+Restart=on-failure
+RestartSec=2s
+# SIGTERM lets requests in flight finish and the database close cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Creates /var/lib/thinkwatch owned by the service user, private to it.
+StateDirectory=thinkwatch
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening. Core needs the network, its data directory, and nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+# AF_UNIX for the local control socket, AF_NETLINK to look up an
+# interface named in `bind`.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Ports above 1024 need no capability. To listen on a lower one, set both
+# AmbientCapabilities= and CapabilityBoundingSet= to CAP_NET_BIND_SERVICE.
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
