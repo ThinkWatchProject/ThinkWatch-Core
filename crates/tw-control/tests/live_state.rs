@@ -103,7 +103,7 @@ fn started(id: u64) -> tw_api::Event {
         peer: None,
         key_masked: None,
         provider: "官方".into(),
-        billing: "per-token".into(),
+        billing: tw_api::Billing::PerToken,
         model: "claude-sonnet-4-5".into(),
         method: "POST".into(),
         path: "/v1/messages".into(),
@@ -144,7 +144,7 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
                 error: None,
                 ms: 900,
             }],
-            billing: "per-token".into(),
+            billing: tw_api::Billing::PerToken,
         });
     }
 
@@ -241,7 +241,7 @@ async fn the_overview_says_which_proxy_is_down_and_why() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(tw_api::Event::ProxyChanged { state, .. }) = rx.recv().await
-                && state == "unreachable"
+                && state == tw_api::ProxyState::Unreachable
             {
                 return;
             }

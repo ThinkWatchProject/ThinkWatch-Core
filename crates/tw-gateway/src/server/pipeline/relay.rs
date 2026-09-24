@@ -148,7 +148,7 @@ pub(super) fn respond(
                 // 码保持不变，只在句子前面点明它断在流里 —— 界面认的是码
                 let mut why = err.detail.clone();
                 why.text = format!("the response stream broke: {}", why.text);
-                ending.failed(err.source.slug(), why);
+                ending.failed(err.source.into(), why);
                 if let Some(frame) = relay.error_tail(&err) {
                     yield Ok(Bytes::from(frame));
                 }

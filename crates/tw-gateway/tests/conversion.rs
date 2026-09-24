@@ -216,7 +216,10 @@ async fn a_chat_client_reaches_claude_with_the_headers_anthropic_needs() {
             _ => {}
         }
     }
-    assert_eq!(translated, Some(("openai-chat".into(), "anthropic".into())));
+    assert_eq!(
+        translated,
+        Some((tw_api::Dialect::OpenaiChat, tw_api::Dialect::Anthropic))
+    );
     // 用量嗅的是上游原话（Anthropic 格式）
     assert_eq!(finished.map(|u| (u.input, u.output)), Some((30, 12)));
 }

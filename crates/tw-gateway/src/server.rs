@@ -141,7 +141,7 @@ async fn passthrough(
     let result = pipeline::pipeline(state, rt, req, live, &mut ending).await;
     if let Some(end) = ending.take() {
         match &result {
-            Err(e) => end.failed(e.source.slug(), e.detail.clone()),
+            Err(e) => end.failed(e.source.into(), e.detail.clone()),
             // 成功的路径都把结局交给了响应体，**走到这里是漏交了**。那也只能
             // 按拿到的状态码报结束 —— 不能让它掉在地上，被记成一次取消
             Ok(resp) => end.finished(resp.status().as_u16()),
@@ -179,7 +179,11 @@ fn note_health(
         bus.emit(tw_api::Event::HealthChanged {
             id,
             provider: name,
-            state: if open { "open" } else { "closed" }.into(),
+            state: if open {
+                tw_api::BreakerState::Open
+            } else {
+                tw_api::BreakerState::Closed
+            },
             at_ms: now_ms(),
         });
     };

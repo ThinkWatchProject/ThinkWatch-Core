@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tw_config::OAuth;
+use tw_types::{Msg, msg};
 
 /// 刷新失败之后至少等多久再试。
 ///
@@ -50,25 +51,71 @@ const FRESH_ENOUGH: Duration = Duration::from_secs(60);
 /// refresh token，缓存随即不再作数，下一个请求立刻用新的。
 const EXPIRED_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 
-#[derive(Debug, thiserror::Error)]
+/// 换 access token 失败了。**英文只写一遍**：`Display` 就是 [`OauthError::msg`] 的原句，
+/// 界面拿码去翻；端点回的正文（已打码）和连接库的原话留在参数里。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OauthError {
-    #[error("{endpoint} could not be reached while refreshing the token: {why}")]
-    Http { endpoint: String, why: String },
-    #[error("the token endpoint answered {status}: {body}")]
+    /// 连不上 token 端点。`detail` 是连接库的原话
+    #[error("{}", self.msg())]
+    Http { endpoint: String, detail: String },
+    /// `body` 是端点回的正文，已打码、已截断
+    #[error("{}", self.msg())]
     Status { status: u16, body: String },
-    #[error("the token endpoint's response has no access_token")]
+    #[error("{}", self.msg())]
     NoToken,
-    #[error("the last token refresh failed ({why}); retrying in {secs} s")]
-    Backoff { why: String, secs: u64 },
+    /// 上一次失败了，还在退避。`cause` 是上一次的原因，不会是它自己或 `Expired`
+    #[error("{}", self.msg())]
+    Backoff { cause: Box<OauthError>, secs: u64 },
     /// refresh token 已经作废。**重试没有用**，要重新登录或换一个 refresh token
-    #[error("the OAuth credential has expired; sign in again or replace the refresh token ({why})")]
-    Expired { why: String },
+    #[error("{}", self.msg())]
+    Expired { status: u16, body: String },
 }
 
 impl OauthError {
     /// 要不要重新登录才能恢复。
     pub fn needs_login(&self) -> bool {
         matches!(self, OauthError::Expired { .. })
+    }
+
+    /// 给人看的那句话，带码。
+    pub fn msg(&self) -> Msg {
+        match self {
+            OauthError::Http { endpoint, detail } => msg!(
+                "gw.oauth.unreachable", endpoint = endpoint, detail = detail =>
+                "The token endpoint {endpoint} could not be reached: {detail}"
+            ),
+            OauthError::Status { status, body } => msg!(
+                "gw.oauth.status", status = status, body = body =>
+                "The token endpoint answered {status}: {body}"
+            ),
+            OauthError::NoToken => msg!(
+                "gw.oauth.no_token" => "The token endpoint's response has no access_token."
+            ),
+            OauthError::Expired { status, body } => msg!(
+                "gw.oauth.expired", status = status, body = body =>
+                "The OAuth credential has expired; sign in again or replace the refresh token. \
+                 The token endpoint answered {status}: {body}"
+            ),
+            OauthError::Backoff { cause, secs } => match cause.as_ref() {
+                OauthError::Http { endpoint, detail } => msg!(
+                    "gw.oauth.backoff.unreachable", secs = secs, endpoint = endpoint, detail = detail =>
+                    "The last token refresh failed and is retried in {secs} s: the token endpoint \
+                     {endpoint} could not be reached: {detail}"
+                ),
+                OauthError::Status { status, body } => msg!(
+                    "gw.oauth.backoff.status", secs = secs, status = status, body = body =>
+                    "The last token refresh failed and is retried in {secs} s: the token endpoint \
+                     answered {status}: {body}"
+                ),
+                OauthError::NoToken => msg!(
+                    "gw.oauth.backoff.no_token", secs = secs =>
+                    "The last token refresh failed and is retried in {secs} s: the token \
+                     endpoint's response has no access_token."
+                ),
+                // 不会退避在这两种上：作废的另记，退避不套退避
+                OauthError::Backoff { .. } | OauthError::Expired { .. } => cause.msg(),
+            },
+        }
     }
 }
 
@@ -103,21 +150,23 @@ struct Live {
 }
 
 struct Failure {
-    why: String,
+    /// 上一次为什么失败
+    cause: OauthError,
     until: Instant,
-    /// refresh token 作废了（见 [`OauthError::Expired`]）
-    expired: bool,
 }
 
 impl Failure {
+    /// refresh token 作废了（见 [`OauthError::Expired`]）
+    fn expired(&self) -> bool {
+        self.cause.needs_login()
+    }
+
     fn error(&self) -> OauthError {
-        if self.expired {
-            OauthError::Expired {
-                why: self.why.clone(),
-            }
+        if self.expired() {
+            self.cause.clone()
         } else {
             OauthError::Backoff {
-                why: self.why.clone(),
+                cause: Box::new(self.cause.clone()),
                 secs: self
                     .until
                     .saturating_duration_since(Instant::now())
@@ -257,14 +306,14 @@ impl Cache {
     }
 
     /// 这家最近一次刷新失败的原因，和是不是要重新登录。没失败过、或者已经恢复，是 `None`。
-    pub fn failure(&self, provider: &str, cfg: &OAuth) -> Option<(String, bool)> {
+    pub fn failure(&self, provider: &str, cfg: &OAuth) -> Option<(Msg, bool)> {
         let g = self.inner.lock().expect("lock not poisoned");
         let f = g
             .get(provider)
             .filter(|l| l.usable_for(cfg))?
             .failed
             .as_ref()?;
-        Some((f.error().to_string(), f.expired))
+        Some((f.error().msg(), f.expired()))
     }
 
     fn flight(&self, provider: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -341,10 +390,7 @@ impl Cache {
             Err(e) => {
                 // **记下失败并退避。**没有它，一个坏掉的 token 端点会被
                 // 每个请求敲一次
-                let (why, expired) = match &e {
-                    OauthError::Expired { why } => (why.clone(), true),
-                    other => (other.to_string(), false),
-                };
+                let expired = e.needs_login();
                 let until = Instant::now() + if expired { EXPIRED_BACKOFF } else { BACKOFF };
                 let mut g = self.inner.lock().expect("lock not poisoned");
                 let entry = g.entry(provider.to_string()).or_insert_with(|| Live {
@@ -357,9 +403,8 @@ impl Cache {
                 });
                 entry.fp = fingerprint(cfg);
                 entry.failed = Some(Failure {
-                    why,
+                    cause: e.clone(),
                     until,
-                    expired,
                 });
                 return Err(e);
             }
@@ -515,7 +560,7 @@ async fn exchange(cfg: &OAuth, refresh: &str, http: &reqwest::Client) -> Result<
     };
     let resp = req.send().await.map_err(|e| OauthError::Http {
         endpoint: tw_secret::redact_url(&cfg.endpoint),
-        why: e.to_string(),
+        detail: e.to_string(),
     })?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -532,9 +577,7 @@ async fn exchange(cfg: &OAuth, refresh: &str, http: &reqwest::Client) -> Result<
         let masked = tw_secret::mask_body(&scrubbed);
         let body = masked.chars().take(400).collect::<String>();
         if is_expired(status, &text) {
-            return Err(OauthError::Expired {
-                why: format!("the token endpoint answered {status}: {body}"),
-            });
+            return Err(OauthError::Expired { status, body });
         }
         return Err(OauthError::Status { status, body });
     }
@@ -632,7 +675,12 @@ mod tests {
         let second = rt.block_on(c.token("p", &o, &http)).unwrap_err();
         // 第二次直接被退避挡住，没有再去连
         assert!(matches!(second, OauthError::Backoff { .. }), "{second}");
-        assert!(second.to_string().contains("retrying in"), "{second}");
+        assert_eq!(
+            second.msg().code,
+            "gw.oauth.backoff.unreachable",
+            "{second}"
+        );
+        assert!(second.to_string().contains("retried in"), "{second}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod security;
 pub mod store;
 mod validate;
 pub mod watch;
+mod wire;
 
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_initial, generate_key};
@@ -828,7 +829,7 @@ pub fn patch_oauth_tokens(
     // 而用户下一次启动才撞上它（「先校验再写」同一条）。
     let re = try_parse(&out).map_err(|r| RotateError::Broke {
         provider: provider.to_string(),
-        why: r.message.text,
+        why: r.msg(),
     })?;
     let ok = re
         .providers
@@ -843,7 +844,10 @@ pub fn patch_oauth_tokens(
     if !ok {
         return Err(RotateError::Broke {
             provider: provider.to_string(),
-            why: "the token read back after writing is not the new one".into(),
+            why: tw_types::msg!(
+                "config.rotate.read_back_differs" =>
+                "the token read back after writing is not the new one"
+            ),
         });
     }
     Ok(out)
@@ -855,22 +859,50 @@ fn provider_index(text: &str, provider: &str) -> Option<usize> {
     cfg.providers.iter().position(|p| p.name == provider)
 }
 
+/// 轮换之后写回凭据没成。**英文只写一遍**：`Display` 就是 [`RotateError::msg`] 的原句。
 #[derive(Debug, thiserror::Error)]
 pub enum RotateError {
-    #[error("the configuration no longer has an upstream `{provider}`")]
+    #[error("{}", self.msg())]
     NoProvider { provider: String },
     /// **说清「形状不对」而不是「写失败」。**用户可能把凭据写成了
     /// 别的形状（锚点、块标量），那时正确的动作是他自己去改，
     /// 而不是让我们猜。
-    #[error("oauth.refresh of upstream `{provider}` could not be located: {source}")]
+    #[error("{}", self.msg())]
     Shape {
         provider: String,
+        #[source]
         source: tw_yaml::PatchError,
     },
-    #[error(
-        "after writing the new credential for upstream `{provider}` the configuration could not be read, so nothing was written: {why}"
-    )]
-    Broke { provider: String, why: String },
+    #[error("{}", self.msg())]
+    Broke {
+        provider: String,
+        why: tw_types::Msg,
+    },
+}
+
+impl RotateError {
+    /// 给人看的那句话，带码。原因自己带码，放进「哪个上游」这个场合
+    pub fn msg(&self) -> tw_types::Msg {
+        match self {
+            RotateError::NoProvider { provider } => tw_types::msg!(
+                "config.rotate.no_provider", provider = provider =>
+                "the configuration no longer has an upstream `{provider}`"
+            ),
+            RotateError::Shape { provider, source } => source.msg().in_context(
+                "provider",
+                provider,
+                &format!("oauth.refresh of upstream `{provider}` could not be located"),
+            ),
+            RotateError::Broke { provider, why } => why.clone().in_context(
+                "provider",
+                provider,
+                &format!(
+                    "after writing the new credential for upstream `{provider}` the \
+                     configuration could not be read, so nothing was written"
+                ),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

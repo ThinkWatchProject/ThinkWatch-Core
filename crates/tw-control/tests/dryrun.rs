@@ -103,7 +103,7 @@ async fn send(app: &axum::Router, body: &str) -> (StatusCode, String) {
 async fn a_plain_request_falls_through_to_the_catch_all() {
     let (_d, app) = app();
     let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
-    assert_eq!(r.outcome, "route");
+    assert_eq!(r.outcome.slug(), "route");
     assert_eq!(r.rule.as_deref(), Some("其余都试试"));
     assert_eq!(r.via_group.as_deref(), Some("都试试"));
     assert_eq!(r.candidates.len(), 2);
@@ -173,15 +173,11 @@ async fn the_trace_says_which_rule_decided_and_which_only_added_something() {
         r.trace
             .iter()
             .find(|t| t.name == name)
-            .and_then(|t| t.effect.clone())
+            .and_then(|t| t.effect.map(|e| e.slug()))
     };
-    assert_eq!(effect("带缓存的必须走官方").as_deref(), Some("decide"));
-    assert_eq!(effect("超长上下文降级").as_deref(), Some("apply"));
-    assert_eq!(
-        effect("其余都试试").as_deref(),
-        Some("none"),
-        "命中了，但去向早已决定"
-    );
+    assert_eq!(effect("带缓存的必须走官方"), Some("decide"));
+    assert_eq!(effect("超长上下文降级"), Some("apply"));
+    assert_eq!(effect("其余都试试"), Some("none"), "命中了，但去向早已决定");
     assert_eq!(effect("图片一律拒绝"), None, "没命中就没有作用");
 }
 
@@ -200,11 +196,11 @@ async fn the_mismatch_is_the_condition_that_really_failed() {
     };
     let r = run(&app, &draft(r#","max_tokens":8000"#)).await;
     let m = r.trace[0].mismatch.as_ref().unwrap();
-    assert_eq!((m.field.as_str(), m.got.as_str()), ("max_tokens", "8000"));
+    assert_eq!((m.field.slug(), m.got.as_str()), ("max_tokens", "8000"));
     // 请求没写 max_tokens：实际值留空，而不是报一个 0
     let r = run(&app, &draft("")).await;
     let m = r.trace[0].mismatch.as_ref().unwrap();
-    assert_eq!((m.field.as_str(), m.got.as_str()), ("max_tokens", ""));
+    assert_eq!((m.field.slug(), m.got.as_str()), ("max_tokens", ""));
 
     // `assistant_internal` 是五类里的任意一类：卡住的是模型，不是它。
     //
@@ -220,7 +216,7 @@ async fn the_mismatch_is_the_condition_that_really_failed() {
             {"name":"兜底","to":"官方"}]}}"#,
     )
     .await;
-    assert_eq!(r.trace[0].mismatch.as_ref().unwrap().field, "model");
+    assert_eq!(r.trace[0].mismatch.as_ref().unwrap().field.slug(), "model");
 }
 
 #[tokio::test]
@@ -243,12 +239,12 @@ async fn every_rule_that_did_not_match_says_what_it_wanted() {
         .iter()
         .find(|t| t.name == "带缓存的必须走官方")
         .unwrap();
-    assert_eq!(cache_rule.verdict, "skipped");
+    assert_eq!(cache_rule.verdict.slug(), "skipped");
     // 要说清要什么、实际是什么
     assert_eq!(
         cache_rule.mismatch,
         Some(tw_api::MismatchView {
-            field: "cache".into(),
+            field: tw_api::ConditionField::Cache,
             want: vec!["true".into()],
             got: "false".into(),
         })
@@ -256,7 +252,7 @@ async fn every_rule_that_did_not_match_says_what_it_wanted() {
 
     let long = r.trace.iter().find(|t| t.name == "超长上下文降级").unwrap();
     assert_eq!(
-        long.mismatch.as_ref().map(|m| m.field.as_str()),
+        long.mismatch.as_ref().map(|m| m.field.slug()),
         Some("input_tokens"),
         "{long:?}"
     );
@@ -267,7 +263,7 @@ async fn a_deny_rule_reports_the_reason_the_client_would_see() {
     // 一个没有理由的拒绝和一个 bug 在用户眼里没有区别。
     let (_d, app) = app();
     let r = run(&app, r#"{"model":"claude-sonnet-4-5","image":true}"#).await;
-    assert_eq!(r.outcome, "deny");
+    assert_eq!(r.outcome.slug(), "deny");
     assert_eq!(r.reason.as_deref(), Some("这个上游不收图片"));
     assert!(r.candidates.is_empty());
 }
@@ -286,7 +282,7 @@ async fn a_set_only_rule_still_shows_up_as_matched_and_says_what_it_changes() {
     assert!(
         r.trace
             .iter()
-            .any(|t| t.name == "超长上下文降级" && t.verdict == "matched"),
+            .any(|t| t.name == "超长上下文降级" && t.verdict.slug() == "matched"),
         "{:?}",
         r.trace
     );
@@ -295,7 +291,7 @@ async fn a_set_only_rule_still_shows_up_as_matched_and_says_what_it_changes() {
     assert!(
         r.set
             .iter()
-            .any(|s| s.field == "model" && s.value == "claude-haiku-4-5"),
+            .any(|s| s.field.slug() == "model" && s.value == "claude-haiku-4-5"),
         "{:?}",
         r.set
     );
@@ -320,7 +316,7 @@ async fn the_defaults_describe_an_ordinary_request() {
     // 用户只该改他关心的那一两个字段。
     let (_d, app) = app();
     let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
-    assert_eq!(r.outcome, "route");
+    assert_eq!(r.outcome.slug(), "route");
     let trace: Vec<_> = r.trace.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(trace.len(), 4, "每条规则都要有个交代：{trace:?}");
 }
@@ -339,8 +335,8 @@ async fn a_candidate_in_another_format_is_listed_as_converted() {
         r.converted,
         vec![tw_api::ConvertedView {
             provider: "官方".into(),
-            from: "openai-chat".into(),
-            to: "anthropic".into(),
+            from: tw_api::Dialect::OpenaiChat,
+            to: tw_api::Dialect::Anthropic,
         }],
         "协议认不出来的中转站直通，不算转换"
     );
@@ -361,7 +357,7 @@ async fn a_locally_answered_probe_never_reaches_the_rules() {
         r#"{"model":"claude-sonnet-4-5","intent":"health_check"}"#,
     )
     .await;
-    assert_eq!(r.outcome, "intercepted");
+    assert_eq!(r.outcome.slug(), "intercepted");
     assert!(r.candidates.is_empty(), "本地应答不会发给任何上游：{r:?}");
     assert!(r.rule.is_none());
     // 一条规则都没求值，所以明细是空的。一份「全部未命中」的明细会
@@ -374,7 +370,7 @@ async fn a_passed_through_probe_says_so_instead_of_naming_a_rule() {
     let (_d, app) = app();
     // 起标题出厂是原样放行：它转发，但不经过规则
     let r = run(&app, r#"{"model":"claude-sonnet-4-5","intent":"titling"}"#).await;
-    assert_eq!(r.outcome, "passthrough");
+    assert_eq!(r.outcome.slug(), "passthrough");
     assert!(r.trace.is_empty());
 }
 
@@ -387,7 +383,7 @@ async fn a_routed_probe_is_evaluated_like_any_other_request() {
         r#"{"model":"claude-sonnet-4-5","intent":"health_check"}"#,
     )
     .await;
-    assert_eq!(r.outcome, "route");
+    assert_eq!(r.outcome.slug(), "route");
     assert_eq!(r.rule.as_deref(), Some("其余都试试"));
     assert!(!r.trace.is_empty(), "交给路由的要走完规则：{r:?}");
 }

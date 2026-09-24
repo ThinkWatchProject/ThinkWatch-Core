@@ -572,7 +572,8 @@ async fn a_revoked_login_fails_fast_and_is_reported_once() {
         .failure(&p.name, p.oauth.as_ref().unwrap())
         .expect("失败要能查到");
     assert!(relogin);
-    assert!(why.contains("invalid_grant"), "{why}");
+    assert_eq!(why.code, "gw.oauth.expired", "{why}");
+    assert!(why.text.contains("invalid_grant"), "{why}");
 }
 
 #[tokio::test]

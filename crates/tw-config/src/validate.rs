@@ -873,12 +873,23 @@ mod msg_codes {
             KeyAndAuthHeader("h".into()),
             OauthAndAuthHeader("h".into()),
             NoToken,
-            Env("the environment variable X is not set".into()),
         ];
         check(
             "config.credential.",
             &all.iter()
                 .map(|e| (e.msg(), e.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        // `${ENV}` 展开不了的那几种自己有码，凭据里的 `Env` 原样用它们
+        let env = [
+            crate::SecretResolveError::MissingEnv("X".into()),
+            crate::SecretResolveError::Unterminated { pos: 3 },
+            crate::SecretResolveError::EmptyName,
+        ];
+        check(
+            "config.secret.",
+            &env.iter()
+                .map(|e| (CredentialError::Env(e.clone()).msg(), e.to_string()))
                 .collect::<Vec<_>>(),
         );
     }

@@ -23,6 +23,8 @@
 
 use std::time::Duration;
 
+use tw_types::{Msg, msg};
+
 use tw_config::history::Origin;
 use tw_gateway::oauth::Renewed;
 
@@ -51,7 +53,7 @@ pub fn spawn(state: crate::ControlState) {
             let (ok, detail) = persist(&state, &r).await;
             if r.refresh.is_some() {
                 // 换发了 refresh token：成没成都要报（「成功」只报一次，由网关那边管）
-                state.gateway.report_rotation(&r.provider, ok, &detail);
+                state.gateway.report_rotation(&r.provider, ok, detail);
             } else if !ok {
                 tracing::warn!(provider = %r.provider, "the access token could not be written back to config.yaml: {detail}");
             }
@@ -59,43 +61,35 @@ pub fn spawn(state: crate::ControlState) {
     });
 }
 
-/// 真正写那一次。返回（成没成，人话）。
-async fn persist(state: &crate::ControlState, r: &Renewed) -> (bool, String) {
-    let mut last = String::new();
-    for attempt in 1..=TRIES {
+/// 真正写那一次。返回（成没成，那句话）。
+///
+/// 没写成时那句话就是最后一次的原因。**要在重启之前处理**这件事由 `persisted`
+/// 说，界面据此提醒 —— 不拼进原因里，拼进去的话原因就翻不了了
+async fn persist(state: &crate::ControlState, r: &Renewed) -> (bool, Msg) {
+    let mut attempt = 1;
+    loop {
         match once(state, r).await {
             Ok(version) => {
                 return (
                     true,
-                    format!(
-                        "written back to {} (version {version})",
-                        state.cfg.path().display()
+                    msg!(
+                        "control.rotation.written",
+                        path = state.cfg.path().display(), version = version =>
+                        "Written back to {path} (version {version})."
                     ),
                 );
             }
-            Err(why) => {
-                last = why;
-                if attempt < TRIES {
-                    tokio::time::sleep(GAP).await;
-                }
+            Err(why) if attempt >= TRIES => return (false, why),
+            Err(_) => {
+                attempt += 1;
+                tokio::time::sleep(GAP).await;
             }
         }
     }
-    (
-        false,
-        format!(
-            "{last}. Deal with this before a restart: check the file's permissions, and whether \
-             another program is holding it. Once that is fixed the next rotation writes itself \
-             back; if it still cannot, authorize again for a fresh credential."
-        ),
-    )
 }
 
-async fn once(state: &crate::ControlState, r: &Renewed) -> Result<String, String> {
-    let cur = state
-        .cfg
-        .current()
-        .map_err(|e| format!("config.yaml could not be read: {e}"))?;
+async fn once(state: &crate::ControlState, r: &Renewed) -> Result<String, Msg> {
+    let cur = state.cfg.current().map_err(|e| e.msg())?;
     // 打完补丁的文本自己会先被解析一遍（`patch_oauth_tokens` 里），
     // 所以到这儿的一定是一份能加载的配置
     let patched = tw_config::patch_oauth_tokens(
@@ -107,7 +101,7 @@ async fn once(state: &crate::ControlState, r: &Renewed) -> Result<String, String
             refresh: r.refresh.as_deref(),
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.msg())?;
     if patched == cur.text {
         // 已经是这个值了 —— 比如重启之后又收到一次同样的轮换。
         // **不写**：一次没有内容变化的写会白白多一条历史和一次重载
@@ -117,7 +111,7 @@ async fn once(state: &crate::ControlState, r: &Renewed) -> Result<String, String
         .cfg
         .write(&patched, Some(&cur.version()), Origin::Rotation)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.msg())
 }
 
 #[cfg(test)]

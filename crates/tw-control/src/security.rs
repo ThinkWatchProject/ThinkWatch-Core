@@ -153,7 +153,7 @@ pub fn view(cfg: &tw_config::Config) -> tw_api::SecurityDetail {
         hidden_text: hidden_view(&cfg.security.hidden_text),
         content: content_view(&cfg.security.content),
         output_limit: tw_api::OutputLimitDetail {
-            mode: o.mode.slug().to_string(),
+            mode: o.mode.into(),
             max_chars: o.max_chars as u64,
             default_max_chars: tw_config::DEFAULT_MAX_CHARS as u64,
             ceiling: tw_config::MAX_CHARS_CEILING as u64,
@@ -163,7 +163,7 @@ pub fn view(cfg: &tw_config::Config) -> tw_api::SecurityDetail {
 
 fn hidden_view(p: &tw_config::HiddenPolicy) -> tw_api::GuardDetail {
     tw_api::GuardDetail {
-        mode: p.mode.slug().to_string(),
+        mode: p.mode.into(),
         rules: tw_guard::hidden::SMUGGLING
             .iter()
             .map(|k| tw_api::SecurityRuleView {
@@ -224,7 +224,7 @@ fn content_view(p: &tw_config::ContentPolicy) -> tw_api::GuardDetail {
         default_action: None,
     }));
     tw_api::GuardDetail {
-        mode: p.mode.slug().to_string(),
+        mode: p.mode.into(),
         rules,
     }
 }
@@ -285,7 +285,7 @@ fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
         default_action: None,
     }));
     tw_api::GuardDetail {
-        mode: p.mode.slug().to_string(),
+        mode: p.mode.into(),
         rules,
     }
 }
@@ -329,7 +329,7 @@ fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
         default_action: None,
     }));
     tw_api::GuardDetail {
-        mode: p.mode.slug().to_string(),
+        mode: p.mode.into(),
         rules,
     }
 }
@@ -367,15 +367,7 @@ async fn set_mode(
     Json(req): Json<tw_api::ModeSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
-    let mode = SecurityMode::from_slug(&req.mode).ok_or_else(|| {
-        fail(
-            StatusCode::BAD_REQUEST,
-            msg!(
-                "security.unknown_mode", mode = req.mode.clone() =>
-                "`{mode}` is not a mode; it is off, observe or enforce."
-            ),
-        )
-    })?;
+    let mode = SecurityMode::from(req.mode);
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
@@ -573,18 +565,7 @@ fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fa
     m.insert("name".into(), name.into());
     m.insert("pattern".into(), req.pattern.as_str().into());
     if guard == Guard::Content {
-        let matching = match req.matching.as_deref() {
-            None => ContentMatch::default(),
-            Some(x) => ContentMatch::from_slug(x).ok_or_else(|| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    msg!(
-                        "security.unknown_match", matching = x.to_string() =>
-                        "`{matching}` is not a way to match; it is contains or regex."
-                    ),
-                )
-            })?,
-        };
+        let matching = req.matching.map(ContentMatch::from).unwrap_or_default();
         let action = match req.action {
             None => ContentAction::default(),
             Some(a) => content_action_of(a)?,
@@ -816,10 +797,7 @@ async fn test(
             let trial;
             let rules = match (&req.pattern, &req.rule) {
                 (Some(p), _) => {
-                    let matching = match req.matching.as_deref() {
-                        None => ContentMatch::default(),
-                        Some(x) => ContentMatch::from_slug(x).unwrap_or_default(),
-                    };
+                    let matching = req.matching.map(ContentMatch::from).unwrap_or_default();
                     trial = tw_guard::content::Rules::build([tw_guard::content::RuleInput {
                         id: TRIAL,
                         name: TRIAL,

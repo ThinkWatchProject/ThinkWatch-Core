@@ -174,7 +174,7 @@ async fn next_change(
             match rx.recv().await.unwrap() {
                 tw_api::Event::AuthChanged {
                     provider, state, ..
-                } if want == "auth" => return (state, Some(provider)),
+                } if want == "auth" => return (state.slug().to_string(), Some(provider)),
                 tw_api::Event::ProxyChanged {
                     proxy,
                     state,
@@ -184,7 +184,7 @@ async fn next_change(
                     assert_eq!(proxy, "代理一");
                     // **返回码，不返回句子。**这条测试要的是「说清卡在哪一步」，
                     // 而句子随时会改措辞 —— 比字符串的话，改一个词就红
-                    return (state, detail.map(|d| d.code));
+                    return (state.slug().to_string(), detail.map(|d| d.code));
                 }
                 _ => {}
             }

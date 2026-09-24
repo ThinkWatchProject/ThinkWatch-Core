@@ -308,7 +308,7 @@ async fn next_billing(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) 
         if let Ok(Ok(tw_api::Event::RequestRouted { billing, .. })) =
             tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
         {
-            return billing;
+            return billing.slug().to_string();
         }
     }
     panic!("没等到路由事件");

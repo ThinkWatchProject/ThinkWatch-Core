@@ -326,7 +326,7 @@ impl Bed {
                     ..
                 }) = self.events.recv().await
                 {
-                    return (login, status, provider);
+                    return (login, status.slug().to_string(), provider);
                 }
             }
         })
@@ -577,8 +577,12 @@ async fn a_callback_with_the_wrong_state_does_not_end_the_login() {
         .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
         .await;
     assert_eq!(v["status"], "failed");
+    assert_eq!(
+        v["error"]["code"], "control.chatgpt_login.page_error",
+        "{v}"
+    );
     assert!(
-        v["error"]
+        v["error"]["text"]
             .as_str()
             .unwrap()
             .contains("The user denied access"),
@@ -604,7 +608,7 @@ async fn a_rejected_code_fails_the_login_and_leaves_the_config_alone() {
         .await;
     assert_eq!(v["status"], "failed");
     assert!(
-        !v["error"].as_str().unwrap().contains("bad"),
+        !v["error"]["text"].as_str().unwrap().contains("bad"),
         "授权码不进错误信息：{v}"
     );
     assert_eq!(b.login_finished().await.1, "failed");
@@ -808,7 +812,8 @@ async fn a_login_mode_that_is_not_understood_is_refused() {
     let (st, _) = b
         .call("POST", "/chatgpt/login", json!({"mode": "carrier-pigeon"}))
         .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 取值不在集合里：请求体本身读不成
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 // ---------------------------------------------------------------- 用量与重置卡

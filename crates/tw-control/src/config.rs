@@ -128,11 +128,11 @@ impl ConfigManager {
             // 写错一个字，界面上什么都不会发生。
             self.bus.emit(tw_api::Event::ConfigRejected {
                 id: self.bus.next_id(),
-                stage: r.stage.slug().to_string(),
-                message: r.message.text.clone(),
+                stage: r.stage.into(),
+                message: (*r.message).clone(),
                 line: r.line,
                 excerpt: r.excerpt.clone(),
-                origin: origin.slug().to_string(),
+                origin: origin.into(),
                 at_ms: now_ms(),
             });
             tracing::warn!(
@@ -152,7 +152,7 @@ impl ConfigManager {
         self.bus.emit(tw_api::Event::ConfigReloaded {
             id: self.bus.next_id(),
             version: version.clone(),
-            origin: origin.slug().to_string(),
+            origin: origin.into(),
             at_ms: now_ms(),
         });
         Ok(version)

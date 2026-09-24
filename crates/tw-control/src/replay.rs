@@ -130,7 +130,7 @@ pub async fn quote(
         body_bytes: raw.len() as i64,
         input_tokens: input as i64,
         cost_micros: quote.cost_micros,
-        billing: quote.billing.slug().to_string(),
+        billing: quote.billing.into(),
         // 脱敏在重放里照做，但用户有权在按下去之前知道：拦截档下、这份请求体
         // 里确实有要换的东西
         will_redact: {
@@ -179,10 +179,7 @@ pub async fn run(
     let headers = s.gateway.headers_for(provider, &http).await.map_err(|e| {
         fail(
             StatusCode::BAD_REQUEST,
-            msg!(
-                "control.credentials_failed", upstream = provider.name.clone(), detail = e =>
-                "The credential for upstream `{upstream}` could not be obtained: {detail}"
-            ),
+            tw_gateway::credential_failed(e, &provider.name),
         )
     })?;
 

@@ -107,7 +107,7 @@ pub struct RequestRow {
     /// 结束了的也是：上游应答之前客户端就走了、被第二阶段规则拒绝
     pub routing: Option<String>,
     /// 服务它的那家怎么收钱：`per-token` / `free`。本地应答是 `free`
-    pub billing: String,
+    pub billing: tw_api::Billing,
     /// 缓存命中省下了多少微分。`None` = 算不出来
     pub cache_saved_micros: Option<i64>,
     /// 金额按什么价格算的，JSON（`tw_api::PriceSourceView`）。没算出金额的
@@ -313,7 +313,7 @@ impl Db {
                 r.error.as_ref().map(|e| e.text.as_str()),
                 r.local as i64,
                 r.routing,
-                r.billing,
+                r.billing.slug(),
                 r.cache_saved_micros,
                 r.client_hint,
                 r.session,
@@ -419,7 +419,7 @@ pub struct TurnRow {
     /// 这一轮的金额是估算。**瀑布图上要带记号**
     pub cost_estimated: bool,
     /// 服务它的那家怎么收钱（见 `RequestRow::billing`）
-    pub billing: String,
+    pub billing: tw_api::Billing,
 }
 
 impl Db {
@@ -510,7 +510,7 @@ impl Db {
                 error: r.get(9)?,
                 cancelled: r.get::<_, i64>(10)? != 0,
                 cost_estimated: r.get::<_, i64>(11)? != 0,
-                billing: r.get(12)?,
+                billing: slug_col(r, 12, tw_api::Billing::from_slug)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -700,7 +700,7 @@ impl Db {
                 e.guard.slug(),
                 e.rule,
                 e.custom as i64,
-                e.action,
+                e.action.slug(),
                 e.provider,
                 e.client,
                 e.tool,
@@ -1047,7 +1047,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         local: r.get::<_, i64>("local")? != 0,
         cancelled: r.get::<_, i64>("cancelled")? != 0,
         routing: r.get("routing")?,
-        billing: r.get("billing")?,
+        billing: slug_col(r, "billing", tw_api::Billing::from_slug)?,
         cache_saved_micros: r.get("cache_saved_micros")?,
         price_source: r.get("price_source")?,
         translated: r.get("translated")?,
@@ -1092,8 +1092,7 @@ pub struct SecurityEvent {
     /// 内置规则的 id，或者自定义规则的名字
     pub rule: String,
     pub custom: bool,
-    /// `recorded` / `replaced` / `cut` / `blocked`
-    pub action: String,
+    pub action: tw_api::SecurityOutcome,
     pub provider: String,
     pub client: String,
     pub tool: Option<String>,
@@ -1112,24 +1111,31 @@ const SECURITY_SELECT: &str =
         r.client_hint, r.peer, r.key_masked
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
+/// 存成词的一列读回契约里的枚举。不认得的词是这一行坏了
+fn slug_col<T, I: rusqlite::RowIndex>(
+    r: &rusqlite::Row,
+    i: I,
+    from_slug: fn(&str) -> Option<T>,
+) -> rusqlite::Result<T> {
+    let w: String = r.get(i)?;
+    from_slug(&w).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("`{w}` is not one of the stored words").into(),
+        )
+    })
+}
+
 fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventView> {
     Ok(tw_api::SecurityEventView {
         id: r.get(0)?,
         at_ms: r.get(1)?,
         request_id: r.get(2)?,
-        guard: {
-            let g: String = r.get(3)?;
-            tw_api::Guard::from_slug(&g).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    format!("`{g}` is not a guard").into(),
-                )
-            })?
-        },
+        guard: slug_col(r, 3, tw_api::Guard::from_slug)?,
         rule: r.get(4)?,
         custom: r.get::<_, i64>(5)? != 0,
-        action: r.get(6)?,
+        action: slug_col(r, 6, tw_api::SecurityOutcome::from_slug)?,
         provider: r.get(7)?,
         client: r.get(8)?,
         model: r.get(9)?,
@@ -1190,7 +1196,7 @@ pub(crate) mod tests {
             local: false,
             cancelled: false,
             routing: None,
-            billing: "per-token".into(),
+            billing: tw_api::Billing::PerToken,
             cache_saved_micros: None,
             price_source: None,
             translated: None,
@@ -1863,13 +1869,16 @@ mod cost_state_tests {
     #[test]
     fn only_a_per_token_row_can_be_missing_its_money() {
         let db = Db::in_memory().unwrap();
-        for (i, billing) in ["per-token", "free"].into_iter().enumerate() {
+        for (i, billing) in [tw_api::Billing::PerToken, tw_api::Billing::Free]
+            .into_iter()
+            .enumerate()
+        {
             let id = i as i64 * 2 + 1;
             let mut no_usage = without_usage(id, 100);
-            no_usage.billing = billing.into();
+            no_usage.billing = billing;
             db.insert(&no_usage).unwrap();
             let mut no_price = unknown_model(id + 1, 100);
-            no_price.billing = billing.into();
+            no_price.billing = billing;
             db.insert(&no_price).unwrap();
         }
 
