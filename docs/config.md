@@ -30,6 +30,9 @@ control socket (`twcore.sock`; on Windows a loopback port recorded in
 
 ```yaml
 version: 1
+listen:
+  control:
+    key: 6629…753d       # generated
 clients:
   - name: default
     key: tw-…            # generated
@@ -167,6 +170,7 @@ clients send requests to, and the control channel the desktop app and
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `gateway` | object, [`listen.gateway`](#cfg-listen-gateway) | — | The AI gateway: the address clients send requests to. |
+| `control` | object, [`listen.control`](#cfg-listen-control) | — | The control channel: how the desktop app and `twcore` commands reach core. It holds the control key, so every configuration has it. |
 <!-- /generated -->
 
 #### `listen.gateway`

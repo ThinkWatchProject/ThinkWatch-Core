@@ -371,7 +371,20 @@ fn check_section(s: &Section, all: &[Section], errs: &mut Vec<String>) {
             minimal,
         } => {
             let code: BTreeSet<&str> = fields().into_iter().collect();
-            let declared: BTreeSet<&str> = s.rows.iter().map(|r| r.name).collect();
+            // 指向一节还没进代码的对象的那一行，同样还没进代码：它由那一节的
+            // `Ty::Pending` 看着，这里不数它
+            let pending = |r: &Row| match r.kind {
+                Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) => all
+                    .iter()
+                    .any(|x| x.path == p && matches!(x.ty, Ty::Pending { .. })),
+                _ => false,
+            };
+            let declared: BTreeSet<&str> = s
+                .rows
+                .iter()
+                .filter(|r| !pending(r))
+                .map(|r| r.name)
+                .collect();
             for f in code.difference(&declared) {
                 errs.push(format!(
                     "`{}.{f}` is in the code but not in the manual: add a row for it in \

@@ -213,15 +213,26 @@ pub fn sections() -> Vec<Section> {
         Section {
             path: "listen",
             ty: checked!(Listen, "{}"),
-            rows: vec![row(
-                "gateway",
-                Kind::Obj("listen.gateway"),
-                Def::Section,
-                t(
-                    "The AI gateway: the address clients send requests to.",
-                    "AI 网关，即客户端发送请求的地址。",
+            rows: vec![
+                row(
+                    "gateway",
+                    Kind::Obj("listen.gateway"),
+                    Def::Section,
+                    t(
+                        "The AI gateway: the address clients send requests to.",
+                        "AI 网关，即客户端发送请求的地址。",
+                    ),
                 ),
-            )],
+                row(
+                    "control",
+                    Kind::Obj("listen.control"),
+                    Def::Section,
+                    t(
+                        "The control channel: how the desktop app and `twcore` commands reach core. It holds the control key, so every configuration has it.",
+                        "控制通道，即桌面应用和 `twcore` 命令连接 core 的途径。其中有控制密钥，因此每份配置都有这一节。",
+                    ),
+                ),
+            ],
         },
         Section {
             path: "listen.gateway",
@@ -255,9 +266,7 @@ pub fn sections() -> Vec<Section> {
         },
         Section {
             path: "listen.control",
-            ty: Ty::Pending {
-                probe: "version: 1\nlisten:\n  control: {}\n",
-            },
+            ty: checked!(ControlListen, "{}"),
             rows: vec![
                 row(
                     "key",

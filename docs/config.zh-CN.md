@@ -19,6 +19,9 @@ ThinkWatch Core 只读一个文件：`config.yaml`。本文逐项说明其中每
 
 ```yaml
 version: 1
+listen:
+  control:
+    key: 6629…753d       # 自动生成
 clients:
   - name: default
     key: tw-…            # 自动生成
@@ -114,6 +117,7 @@ core 在哪里接受连接。连接分两种：客户端发送请求的 AI 网�
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `gateway` | 对象，见 [`listen.gateway`](#cfg-listen-gateway) | — | AI 网关，即客户端发送请求的地址。 |
+| `control` | 对象，见 [`listen.control`](#cfg-listen-control) | — | 控制通道，即桌面应用和 `twcore` 命令连接 core 的途径。其中有控制密钥，因此每份配置都有这一节。 |
 <!-- /generated -->
 
 #### `listen.gateway`
