@@ -69,9 +69,18 @@ three things:
    all`, and list their networks in `listen.gateway.allow_from`.
 2. **Open the remote control port**: `listen.control.remote.enabled: true`,
    and list the networks the desktop app connects from in its
-   `allow_from`. `twcore init` writes this section with a random port and
-   `enabled: false`; if your file has no `remote` section, add one with any
-   free port.
+   `allow_from`. `twcore init` writes this section with `enabled: false` and
+   a random port between 20000 and 32000. The same can be done with a
+   command, which also writes the section if the file has none:
+
+   ```sh
+   sudo -u thinkwatch THINKWATCH_HOME=/var/lib/thinkwatch twcore remote enable --allow 192.168.1.0/24
+   ```
+
+   `--allow` can be repeated and replaces the list; `--bind` and `--port`
+   change the interface and the port. `twcore remote disable` closes the
+   port again and keeps the rest, and `twcore remote` shows the current
+   state. A running core follows within a second.
 3. **Add at least one upstream** under `providers`, or add it later from the
    desktop app.
 
@@ -87,7 +96,7 @@ listen:
     remote:
       enabled: true
       bind: all
-      port: 41327             # written by twcore init
+      port: 23483             # written by twcore init, at random
       allow_from: [192.168.1.0/24]
 clients:
   - name: default
@@ -154,6 +163,19 @@ Show the control key on the server:
 sudo -u thinkwatch THINKWATCH_HOME=/var/lib/thinkwatch twcore control-key
 ```
 
+```
+9f2c…e41a
+remote control: port 23483; connect to 192.168.1.20:23483
+allowed sources: 192.168.1.0/24
+```
+
+The first line, the key, is the only thing on standard output, so
+`$(twcore control-key)` in a script gets just the key. The two lines after
+it go to standard error: the port, the addresses of this server's
+interfaces that listen on it, and the allowed sources. When the port is
+closed the second line reads `remote control: off (twcore remote enable
+opens it)`.
+
 In the desktop app, open **Settings → Connections → Add remote connection**
 and enter:
 
@@ -164,11 +186,22 @@ and enter:
 The app tests the connection before saving and says what is wrong if it
 fails: no answer (address, port, firewall, `enabled`), connection closed
 (this Mac's address is probably not in `allow_from`), wrong key, or
-different versions.
+different versions. `allow_from` for this port does not let the server
+itself in automatically; commands on the server use the local channel.
+
+A source that fails the handshake five times within a minute is ignored
+for a minute. Removing a network from `allow_from` also closes the
+connections already open from it.
 
 The key is kept in the Mac's keychain. To replace it, run
-`twcore control-key --rotate` on the server; connected apps then have to be
-given the new key.
+`twcore control-key --rotate` on the server; connections made with the old
+key are closed at once, and connected apps then have to be given the new
+key.
+
+A remote connection can do everything the app does on its own Mac except
+three things, which the server refuses: stopping core (systemd runs it),
+taking the diagnostic bundle, and changing `listen.control`, the section
+it came in through. Do those on the server.
 
 ### Point clients at the server
 

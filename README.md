@@ -101,6 +101,20 @@ twcore call -X POST -d '{"model":"claude-sonnet-4-5","route":"default"}' /dryrun
 The configuration text the control plane hands out has the key masked, and a
 write through the control plane cannot change it.
 
+A desktop app on another machine connects through the remote control port,
+`listen.control.remote`. It is opened in addition to the local channel, with the
+same key and handshake:
+
+```
+twcore remote enable --allow 192.168.1.0/24   # the port is picked at random the first time
+twcore remote disable
+twcore control-key                             # prints the key; the address and port go to stderr
+```
+
+Sources outside `allow_from` are closed without a reply, a source that fails the
+handshake five times in a minute is ignored for a minute, and a remote connection
+cannot stop the core, take the diagnostic bundle, or change `listen.control`.
+
 ## License
 
 MIT

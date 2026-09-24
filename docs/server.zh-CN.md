@@ -48,7 +48,13 @@ alias twc='sudo -u thinkwatch THINKWATCH_HOME=/var/lib/thinkwatch twcore'
 以 root 身份打开 `/var/lib/thinkwatch/config.yaml`（可用 `sudoedit`），修改三处：
 
 1. **让网络中的客户端能访问网关**：`listen.gateway.bind: all`，并在 `listen.gateway.allow_from` 中列出客户端所在的网段。
-2. **打开远程控制端口**：`listen.control.remote.enabled: true`，并在其 `allow_from` 中列出桌面应用所在的网段。`twcore init` 生成的配置带有这一节，端口随机，`enabled: false`；文件中没有 `remote` 这一节时，自行添加，端口任选一个空闲的。
+2. **打开远程控制端口**：`listen.control.remote.enabled: true`，并在其 `allow_from` 中列出桌面应用所在的网段。`twcore init` 生成的配置带有这一节，`enabled: false`，端口是 20000 到 32000 之间随机的一个。也可以用命令完成，文件中没有这一节时命令会一并写出：
+
+   ```sh
+   sudo -u thinkwatch THINKWATCH_HOME=/var/lib/thinkwatch twcore remote enable --allow 192.168.1.0/24
+   ```
+
+   `--allow` 可以写多次，替换整个名单；`--bind`、`--port` 改网卡和端口。`twcore remote disable` 关闭端口，其余设置保留；`twcore remote` 查看当前状态。运行中的 core 在一秒内跟上。
 3. **在 `providers` 下添加至少一个上游**，也可以之后在桌面应用中添加。
 
 ```yaml
@@ -63,7 +69,7 @@ listen:
     remote:
       enabled: true
       bind: all
-      port: 41327             # twcore init 生成
+      port: 23483             # twcore init 随机生成
       allow_from: [192.168.1.0/24]
 clients:
   - name: default
@@ -119,15 +125,27 @@ unit 以 `thinkwatch` 身份运行 core，失败后自动重启，并把它与�
 sudo -u thinkwatch THINKWATCH_HOME=/var/lib/thinkwatch twcore control-key
 ```
 
+```
+9f2c…e41a
+remote control: port 23483; connect to 192.168.1.20:23483
+allowed sources: 192.168.1.0/24
+```
+
+第一行是密钥，也是标准输出上唯一的内容，脚本里 `$(twcore control-key)` 取到的就是密钥。后两行在标准错误上：端口、这台服务器上在该端口监听的网卡地址，以及放行的来源。端口关闭时第二行是 `remote control: off (twcore remote enable opens it)`。
+
 在桌面应用中打开 **设置 → 连接 → 添加远程连接**，填写：
 
 - **地址**：服务器的主机名或 IP 地址；
 - **控制端口**：`listen.control.remote.port` 的值；
 - **密钥**：`twcore control-key` 输出的 64 个字符。
 
-应用在保存前先试连，失败时说明原因：无响应（检查地址、端口、防火墙和 `enabled`）、连接被关闭（本机地址可能不在 `allow_from` 中）、密钥不正确、版本不一致。
+应用在保存前先试连，失败时说明原因：无响应（检查地址、端口、防火墙和 `enabled`）、连接被关闭（本机地址可能不在 `allow_from` 中）、密钥不正确、版本不一致。这个端口的 `allow_from` 不会自动放行服务器本机；服务器上的命令走本地通道。
 
-密钥保存在 Mac 的钥匙串中。要更换密钥，在服务器上执行 `twcore control-key --rotate`，之后已连接的应用需要填入新密钥。
+同一来源一分钟内握手失败五次，之后一分钟不理它。从 `allow_from` 中删掉一个网段，已经从那里连着的连接也随即断开。
+
+密钥保存在 Mac 的钥匙串中。要更换密钥，在服务器上执行 `twcore control-key --rotate`：用旧密钥建立的连接立即断开，之后已连接的应用需要填入新密钥。
+
+远程连接能做应用在本机能做的一切，只有三件事服务器会拒绝：停止 core（它由 systemd 管理）、生成诊断包、修改 `listen.control`（这条连接进来的那一节）。这三件事在服务器上操作。
 
 ### 让客户端指向服务器
 

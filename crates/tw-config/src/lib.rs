@@ -18,6 +18,7 @@ mod probes;
 pub mod proxy;
 pub mod refs;
 pub mod reload;
+pub mod remote;
 mod retention;
 mod security;
 pub mod store;
@@ -257,9 +258,57 @@ pub struct ControlListen {
     /// 不是一句解析器的原话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    // ── 远程控制端口（`remote: { enabled, bind, port, allow_from }`）加在这里。
-    // 它是**另开的**一个网络端口，给另一台机器上的桌面端用，本机的通道照旧；
-    // 钥匙还是上面这一把。
+    /// 远程控制端口：给另一台机器上的桌面端用。**另开的**一个网络端口，本机的
+    /// 通道（socket、Windows 的回环端口）照旧在；钥匙还是上面这一把。
+    ///
+    /// 不写，或者 `enabled: false`，就不听。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteListen>,
+}
+
+/// `listen.control.remote`。
+///
+/// ```yaml
+/// remote:
+///   enabled: true
+///   bind: all               # 和网关同样的写法：loopback / all / 网卡名 / 地址
+///   port: 23483             # 写进配置时随机生成
+///   allow_from: [192.168.1.0/24]
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteListen {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 默认 `all`：这个端口存在的理由就是让别的机器连进来，只听回环等于没开。
+    #[serde(default = "bind_all")]
+    pub bind: Bind,
+    /// **没有默认值**，写进配置时随机挑一个（[`generate_remote_port`]）：一个
+    /// 人人都知道的固定端口只会招来更多扫描，而它也省不了谁一步 —— 连接时
+    /// 反正要从服务器上抄钥匙，端口跟着一起抄。
+    pub port: u16,
+    /// 和网关一样：不写是私网段（[`default_allow_from`]），写成空列表就是只有
+    /// 本机。名单之外的来源 accept 之后立刻关掉，一个字节都不回。
+    #[serde(default = "default_allow_from")]
+    pub allow_from: Vec<String>,
+}
+
+fn bind_all() -> Bind {
+    Bind::All
+}
+
+/// 远程控制端口从哪一段里挑：不需要特权，也躲开系统分给临时连接的那一段
+/// （Linux 默认 32768 起，Windows 49152 起）。
+pub const REMOTE_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=32000;
+
+/// 随机挑一个远程控制端口，**避开网关的端口**。
+pub fn generate_remote_port(gateway_port: u16) -> u16 {
+    loop {
+        let p = rand::random_range(REMOTE_PORT_RANGE);
+        if p != gateway_port {
+            return p;
+        }
+    }
 }
 
 /// **钥匙不打印。**`Config` 会整个落进 Debug 输出，而日志是会被贴进 issue 的。
@@ -267,6 +316,7 @@ impl std::fmt::Debug for ControlListen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlListen")
             .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .field("remote", &self.remote)
             .finish()
     }
 }

@@ -29,7 +29,11 @@ fn line(out: &mut String, k: &str, v: impl std::fmt::Display) {
 }
 
 /// 攒一份诊断包。**只读，不写任何文件。**
-pub async fn bundle(State(s): State<ControlState>) -> String {
+pub async fn bundle(State(s): State<ControlState>) -> Result<String, crate::Fail> {
+    // 生成在服务器上、写的是服务器的文件系统：远程拿不到它
+    if crate::remote::is_remote() {
+        return Err(crate::remote::refused(crate::remote::Refused::Diagnostics));
+    }
     let mut out = String::new();
     let cfg = s.config();
     let _ = writeln!(out, "# ThinkWatch diagnostics bundle\n");
@@ -318,5 +322,5 @@ pub async fn bundle(State(s): State<ControlState>) -> String {
         out,
         "\n---\n\nThis file carries no request or response bodies. They are in the request detail view."
     );
-    out
+    Ok(out)
 }

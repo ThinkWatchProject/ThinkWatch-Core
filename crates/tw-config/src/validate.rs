@@ -74,6 +74,12 @@ pub enum ValidationError {
     ControlKeyMissing,
     #[error("{}", self.msg())]
     ControlKeyInvalid,
+    #[error("{}", self.msg())]
+    RemotePortZero,
+    #[error("{}", self.msg())]
+    RemotePortIsGateway { port: u16 },
+    #[error("{}", self.msg())]
+    BadRemoteCidr { entry: String },
 }
 
 impl ValidationError {
@@ -207,6 +213,21 @@ impl ValidationError {
                 "config.control_key_invalid" =>
                 "listen.control.key has to be 64 hexadecimal characters. twcore control-key \
                  --rotate writes a new one"
+            ),
+            RemotePortZero => msg!(
+                "config.remote_port_zero" =>
+                "listen.control.remote.port is 0; it has to be between 1 and 65535. twcore remote \
+                 enable picks a free one"
+            ),
+            RemotePortIsGateway { port } => msg!(
+                "config.remote_port_is_gateway", port = port =>
+                "listen.control.remote.port is {port}, the same as the gateway's port. The two \
+                 need different ports"
+            ),
+            BadRemoteCidr { entry } => msg!(
+                "config.bad_remote_allow_from", entry = entry =>
+                "`{entry}` in listen.control.remote.allow_from is wrong: not a valid IP address or \
+                 CIDR; it is written as 192.168.0.0/16"
             ),
         }
     }
@@ -426,6 +447,23 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
         }
         Some(_) => {}
     }
+    // 远程控制端口。**没开也照样查**：开关一拨就生效，写错的地方要在写下去
+    // 的那一刻说，不是等到有人打开它的时候
+    if let Some(r) = &cfg.listen.control.remote {
+        if r.port == 0 {
+            return Err(ValidationError::RemotePortZero);
+        }
+        if r.port == cfg.listen.gateway.port {
+            return Err(ValidationError::RemotePortIsGateway { port: r.port });
+        }
+        for entry in &r.allow_from {
+            if entry.parse::<std::net::IpAddr>().is_err() && entry.parse::<CidrLike>().is_err() {
+                return Err(ValidationError::BadRemoteCidr {
+                    entry: entry.clone(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -533,6 +571,7 @@ mod tests {
             listen: Listen {
                 control: crate::ControlListen {
                     key: Some("c0ffee00".repeat(8)),
+                    remote: None,
                 },
                 ..Default::default()
             },

@@ -5,6 +5,7 @@
 #   test         only produced by tests; never reaches a UI
 config.bad_allow_from
 config.bad_base_url
+config.bad_remote_allow_from
 config.blank_models_only
 config.control_key_invalid
 config.control_key_missing
@@ -45,6 +46,8 @@ config.no_clients
 config.output_limit_range
 config.rejected
 config.rejected_at
+config.remote_port_is_gateway
+config.remote_port_zero
 config.reserved_name
 config.rotate.no_provider
 config.rotate.read_back_differs
@@ -129,6 +132,9 @@ control.proxy_not_found
 control.reassign_to_deleted_route
 control.records_unreadable
 control.redirect_must_be_app_scheme
+control.remote.control_section_locked
+control.remote.diagnostics_refused
+control.remote.shutdown_refused
 control.request_body_gone
 control.request_body_truncated
 control.request_not_found

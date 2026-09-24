@@ -7,7 +7,7 @@
 //! 说明写给手写配置文件的人：这个字段管什么、不写是什么意思、写错了会怎样。
 //! 两种语言各写一遍，**不是互译的字面对照**，各自按各自的习惯说。
 
-use super::{Def, Kind, Lang, Row, Section, T2, Ty};
+use super::{Def, Kind, Lang, Row, Section, T2};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
@@ -290,17 +290,15 @@ pub fn sections() -> Vec<Section> {
         },
         Section {
             path: "listen.control.remote",
-            ty: Ty::Pending {
-                probe: "version: 1\nlisten:\n  control:\n    remote: {}\n",
-            },
+            ty: checked!(RemoteListen, "{port: 20000}"),
             rows: vec![
                 row(
                     "enabled",
                     Kind::Bool,
                     Def::Is("false"),
                     t(
-                        "Listen on the remote port. Unset or `false`: no network port is opened for control.",
-                        "是否监听远程端口。不写或 `false`：不为控制面开任何网络端口。",
+                        "Listen on the remote port. Unset or `false`: no network port is opened for control. `twcore remote enable` and `twcore remote disable` switch it; a running core follows within a second.",
+                        "是否监听远程端口。不写或 `false`：不为控制面开任何网络端口。`twcore remote enable` / `twcore remote disable` 切换它；运行中的 core 在一秒内跟上。",
                     ),
                 ),
                 row(
@@ -315,10 +313,10 @@ pub fn sections() -> Vec<Section> {
                 row(
                     "port",
                     Kind::Int,
-                    Def::Said(t("generated", "自动生成")),
+                    Def::Required,
                     t(
-                        "TCP port. There is no fixed default: a random free port is written when the section is generated, like the key.",
-                        "TCP 端口。没有固定默认值：和密钥一样，生成这一节时写入一个随机端口。",
+                        "TCP port. There is no fixed default: `twcore init` and `twcore remote enable` write a random port between 20000 and 32000 (never the gateway's) when they write this section. It cannot be 0 or the gateway's port.",
+                        "TCP 端口。没有固定默认值：`twcore init` 和 `twcore remote enable` 写出这一节时随机写入 20000 到 32000 之间的一个端口（不会和网关相同）。不能是 0，也不能和网关端口相同。",
                     ),
                 ),
                 row(
@@ -326,8 +324,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Is("[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7]"),
                     t(
-                        "Sources that may connect, as for `listen.gateway.allow_from`. A connection from anywhere else is closed before the handshake, without a byte in reply.",
-                        "允许连接的来源，写法同 `listen.gateway.allow_from`。其他来源的连接在握手之前关闭，不回任何字节。",
+                        "Sources that may connect, as for `listen.gateway.allow_from`, except that this machine is not let in automatically (it has the local channel). A connection from anywhere else is closed before the handshake, without a byte in reply; narrowing the list also closes open connections it no longer allows. A source that fails the handshake 5 times within a minute is ignored for a minute.",
+                        "允许连接的来源，写法同 `listen.gateway.allow_from`，但本机不会自动放行（本机有本地通道）。其他来源的连接在握手之前关闭，不回任何字节；收窄名单时，已经连着、不再放行的连接也随即断开。同一来源一分钟内握手失败 5 次，之后一分钟不理它。",
                     ),
                 ),
             ],
