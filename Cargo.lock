@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "tw-adopt"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "tw-api"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2776,7 +2776,7 @@ dependencies = [
 
 [[package]]
 name = "tw-breaker"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2784,7 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "tw-config"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "blake3",
  "libc",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "tw-control"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "axum",
  "base64",
@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "tw-crypto"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "tw-dialect"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2868,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "tw-engine"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "tw-gateway"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "tw-guard"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "base64",
  "regex",
@@ -2941,7 +2941,7 @@ dependencies = [
 
 [[package]]
 name = "tw-observe"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "tw-pricing"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "arc-swap",
  "flate2",
@@ -2963,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "tw-scan"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "notify",
  "regex",
@@ -2982,14 +2982,14 @@ dependencies = [
 
 [[package]]
 name = "tw-secret"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tw-store"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "bytes",
  "rusqlite",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "tw-types"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "tw-upstream"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -3032,14 +3032,14 @@ dependencies = [
 
 [[package]]
 name = "tw-wire"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "tw-yaml"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "saphyr-parser",
  "serde_yaml_ng",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "twcore"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "chrono",
