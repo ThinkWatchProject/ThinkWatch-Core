@@ -1327,7 +1327,7 @@ providers:
             ..Default::default()
         };
         assert_eq!(
-            p.outbound_headers(None, None).unwrap(),
+            p.outbound_headers(None).unwrap(),
             vec![("x-api-key".to_string(), "sk-from-env".to_string())]
         );
     }

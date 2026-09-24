@@ -374,19 +374,16 @@ impl AppState {
     /// `http` 必须是**这一家自己的** client：换 token 要走它该走的代理。
     /// 用一个干净的 client 去换，代理后面的用户会得到一个
     /// 「数据面通、刷新不通」的组合 —— 而那个症状看起来完全不像凭据问题。
-    ///
-    /// `client`：发起请求的网关密钥名，填 `{{client}}` 用。后台的探测没有这个人。
     pub async fn headers_for(
         &self,
         p: &tw_config::Provider,
         http: &reqwest::Client,
-        client: Option<&str>,
     ) -> Result<Vec<(String, String)>, String> {
         let token = match &p.oauth {
             Some(o) => Some(self.oauth_token(p, o, http).await?),
             None => None,
         };
-        p.outbound_headers(token.as_deref(), client)
+        p.outbound_headers(token.as_deref())
             .map_err(|e| e.to_string())
     }
 
@@ -413,7 +410,6 @@ impl AppState {
         &self,
         p: &tw_config::Provider,
         http: &reqwest::Client,
-        client: Option<&str>,
         sent_at: std::time::Instant,
     ) -> Result<Vec<(String, String)>, String> {
         let o = p
@@ -425,8 +421,7 @@ impl AppState {
             .invalidate_and_refresh(&p.name, o, http, sent_at)
             .await;
         let token = self.settle_token(p, got)?;
-        p.outbound_headers(Some(&token), client)
-            .map_err(|e| e.to_string())
+        p.outbound_headers(Some(&token)).map_err(|e| e.to_string())
     }
 
     /// 换一个 access token，服务器换发了新的 refresh token 就交给控制面写回。
@@ -1047,15 +1042,12 @@ async fn ws_upgrade(
         )));
     }
     let http = rt.clients.get(&name).unwrap_or(&state.http);
-    let upstream_headers = state
-        .headers_for(provider, http, Some(&client_name))
-        .await
-        .map_err(|e| {
-            GatewayError::config(msg!(
-                "gw.credentials.failed", upstream = name.clone(), detail = e =>
-                "The credential for upstream `{upstream}` could not be obtained: {detail}"
-            ))
-        })?;
+    let upstream_headers = state.headers_for(provider, http).await.map_err(|e| {
+        GatewayError::config(msg!(
+            "gw.credentials.failed", upstream = name.clone(), detail = e =>
+            "The credential for upstream `{upstream}` could not be obtained: {detail}"
+        ))
+    })?;
     let id = state.bus.next_id();
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
@@ -1921,7 +1913,7 @@ async fn pipeline(
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
         let http = rt.clients.get(&provider.name).unwrap_or(&state.http);
-        let upstream_headers = match state.headers_for(provider, http, Some(&client_name)).await {
+        let upstream_headers = match state.headers_for(provider, http).await {
             Ok(h) => h,
             Err(e) => {
                 // 密钥取不到是这一家的问题（环境变量没设、token 端点
@@ -1996,10 +1988,7 @@ async fn pipeline(
         // 吊销了、提前失效了；不重试的话，这个请求连同之后每一个请求都会原样失败，直到
         // 缓存里那个 token 按时间过期。换回来的还是 401，说明问题不在 token
         if provider.oauth.is_some() && matches!(&sent, Ok(r) if r.status() == 401) {
-            match state
-                .headers_after_401(provider, http, Some(&client_name), sent_at)
-                .await
-            {
+            match state.headers_after_401(provider, http, sent_at).await {
                 // 换回来的还是同一个（刚换过不久）：再发一次也是 401
                 Ok(fresh) if fresh != upstream_headers => {
                     sent = build(&fresh).body(outbound.clone()).send().await;

@@ -371,7 +371,7 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
 async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer {
     // 用这一家自己的 client：它带着该走的代理，换 OAuth token 也要走那条路
     let http = rt.clients.get(&p.name).unwrap_or(&state.http);
-    let headers = match state.headers_for(p, http, None).await {
+    let headers = match state.headers_for(p, http).await {
         Ok(h) => h,
         Err(e) => return Answer::Failed(format!("the credential could not be obtained: {e}")),
     };
