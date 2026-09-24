@@ -176,7 +176,7 @@ pub async fn run(
     let pk_http = s.gateway.client_for(&provider.name);
     let headers = s
         .gateway
-        .headers_for(provider, &pk_http, None)
+        .headers_for(provider, &pk_http)
         .await
         .map_err(|e| {
             fail(

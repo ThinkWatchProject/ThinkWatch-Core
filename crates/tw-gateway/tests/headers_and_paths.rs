@@ -185,7 +185,7 @@ async fn configured_headers_are_sent_and_replace_the_ones_the_client_sent() {
         },
         Header {
             name: "X-Relay-Caller".into(),
-            value: Secret::new("{{client}}"),
+            value: Secret::new("thinkwatch"),
         },
     ]);
     let gw = start_gateway(p).await;
@@ -204,7 +204,7 @@ async fn configured_headers_are_sent_and_replace_the_ones_the_client_sent() {
     let g = seen.lock().unwrap();
     let versions: Vec<_> = g.headers.get_all("anthropic-version").iter().collect();
     assert_eq!(versions, ["2099-01-01"], "同名头应该被盖掉，而不是并存");
-    assert_eq!(g.headers.get("x-relay-caller").unwrap(), "laptop");
+    assert_eq!(g.headers.get("x-relay-caller").unwrap(), "thinkwatch");
     assert!(g.headers.get("x-thinkwatch-client").is_none());
 }
 

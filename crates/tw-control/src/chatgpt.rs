@@ -885,13 +885,13 @@ async fn account_call(
     };
     let headers = s
         .gateway
-        .headers_for(p, &http, None)
+        .headers_for(p, &http)
         .await
         .map_err(no_credential)?;
     let sent_at = std::time::Instant::now();
     let mut resp = send(&http, method.clone(), &url, &headers, body).await?;
     if resp.status() == StatusCode::UNAUTHORIZED
-        && let Ok(fresh) = s.gateway.headers_after_401(p, &http, None, sent_at).await
+        && let Ok(fresh) = s.gateway.headers_after_401(p, &http, sent_at).await
         && fresh != headers
     {
         resp = send(&http, method, &url, &fresh, body).await?;

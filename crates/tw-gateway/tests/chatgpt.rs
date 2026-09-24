@@ -668,7 +668,7 @@ async fn an_inference_test_reaches_the_codex_backend_and_times_the_first_token()
     assert_eq!(cap, None);
 
     let http = state.client_for(&p.name);
-    let headers = state.headers_for(&p, &http, None).await.unwrap();
+    let headers = state.headers_for(&p, &http).await.unwrap();
     let r = tw_gateway::l3::run(&http, &p, &headers, "gpt-5.5", cap).await;
 
     assert!(r.ok, "{:?}", r.error);
@@ -709,7 +709,7 @@ async fn a_refused_inference_test_carries_what_the_backend_said() {
     })
     .unwrap();
     let http = state.client_for(&p.name);
-    let headers = state.headers_for(&p, &http, None).await.unwrap();
+    let headers = state.headers_for(&p, &http).await.unwrap();
     let r = tw_gateway::l3::run(&http, &p, &headers, "gpt-5.5", None).await;
     assert!(!r.ok);
     let e = r.error.expect("没有错误");

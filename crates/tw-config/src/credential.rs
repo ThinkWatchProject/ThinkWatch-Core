@@ -11,8 +11,7 @@
 //! - **`oauth`**：access token 由 refresh token 换发。token 默认放进协议的鉴权头，
 //!   也可以在 `headers` 里用 `{{access_token}}` 指定放在哪儿、怎么拼。
 //!
-//! 值里可以写 `${ENV}` 从环境变量读；`{{client}}` 换成发起这次请求的那把网关
-//! 密钥的名字，给按调用方记账的中转站用。
+//! 值里可以写 `${ENV}` 从环境变量读。
 //!
 //! **没有「跑一条命令拿密钥」这一类，而且不会有**：配置文件不该能执行程序 ——
 //! 「配置被同步、被分享、被 AI 改」都是目标场景，那时抄一份配置就等于跑一段代码。
@@ -24,8 +23,6 @@ use tw_types::{Msg, msg};
 
 /// `headers` 里换成 OAuth access token 的占位符。
 pub const ACCESS_TOKEN: &str = "{{access_token}}";
-/// `headers` 里换成网关密钥名字的占位符。
-pub const CLIENT: &str = "{{client}}";
 
 /// 一个请求头最多几行、名字和值最长多少。**上限是给写错兜底的** —— 一个把整段
 /// PEM 贴进请求头的配置，该在加载时被拦下，而不是在上游那边变成一个 431。
@@ -347,9 +344,8 @@ impl CredentialError {
                  characters"
             ),
             UnknownPlaceholder { name, placeholder } => msg!(
-                "config.credential.unknown_placeholder", header = name, placeholder = placeholder =>
-                "{placeholder} in the `{header}` header is not recognized; only {{{{access_token}}}} \
-                 and {{{{client}}}} are"
+                "config.credential.unrecognized_placeholder", header = name, placeholder = placeholder =>
+                "{placeholder} in the `{header}` header is not recognized; only {{{{access_token}}}} is"
             ),
             TokenWithoutOauth(h) => msg!(
                 "config.credential.token_without_oauth", header = h =>
@@ -493,7 +489,7 @@ impl Provider {
                 return Err(CredentialError::BadHeaderValue(h.name.clone()));
             }
             for p in placeholders(raw) {
-                if p != ACCESS_TOKEN && p != CLIENT {
+                if p != ACCESS_TOKEN {
                     return Err(CredentialError::UnknownPlaceholder {
                         name: h.name.clone(),
                         placeholder: p.to_string(),
@@ -518,11 +514,9 @@ impl Provider {
     /// 要发给这家的全部请求头，值已经展开。
     ///
     /// `access_token`：配了 oauth 时由调用方换好传进来（换 token 要联网，这里是同步的）。
-    /// `client`：发起请求的那把网关密钥的名字，没有就换成空串。
     pub fn outbound_headers(
         &self,
         access_token: Option<&str>,
-        client: Option<&str>,
     ) -> Result<Vec<(String, String)>, CredentialError> {
         let (auth_name, prefix) = self.auth_header();
         let mut out = Vec::with_capacity(self.headers.len() + 1);
@@ -537,9 +531,6 @@ impl Provider {
             let mut v = h.value.resolve()?;
             if v.contains(ACCESS_TOKEN) {
                 v = v.replace(ACCESS_TOKEN, access_token.ok_or(CredentialError::NoToken)?);
-            }
-            if v.contains(CLIENT) {
-                v = v.replace(CLIENT, client.unwrap_or_default());
             }
             out.push((h.name.trim().to_string(), v));
         }
@@ -596,17 +587,17 @@ mod tests {
     fn a_key_goes_into_the_header_its_protocol_expects() {
         let anthropic = p("name: a\nbase_url: https://api.anthropic.com\nkey: sk-a\n");
         assert_eq!(
-            anthropic.outbound_headers(None, None).unwrap(),
+            anthropic.outbound_headers(None).unwrap(),
             vec![("x-api-key".to_string(), "sk-a".to_string())]
         );
         let openai = p("name: o\nbase_url: https://api.openai.com\nkey: sk-o\n");
         assert_eq!(
-            openai.outbound_headers(None, None).unwrap(),
+            openai.outbound_headers(None).unwrap(),
             vec![("authorization".to_string(), "Bearer sk-o".to_string())]
         );
         let gemini = p("name: g\nbase_url: https://generativelanguage.googleapis.com\nkey: g-k\n");
         assert_eq!(
-            gemini.outbound_headers(None, None).unwrap(),
+            gemini.outbound_headers(None).unwrap(),
             vec![("x-goog-api-key".to_string(), "g-k".to_string())]
         );
     }
@@ -614,14 +605,14 @@ mod tests {
     #[test]
     fn headers_keep_their_order_and_come_after_the_key() {
         let x = p(
-            "name: r\nbase_url: https://relay.example\nkey: sk-r\nheaders:\n  anthropic-version: 2023-06-01\n  X-Tenant: team-{{client}}\n",
+            "name: r\nbase_url: https://relay.example\nkey: sk-r\nheaders:\n  anthropic-version: 2023-06-01\n  X-Tenant: team-a\n",
         );
         assert_eq!(
-            x.outbound_headers(None, Some("laptop")).unwrap(),
+            x.outbound_headers(None).unwrap(),
             vec![
                 ("x-api-key".to_string(), "sk-r".to_string()),
                 ("anthropic-version".to_string(), "2023-06-01".to_string()),
-                ("X-Tenant".to_string(), "team-laptop".to_string()),
+                ("X-Tenant".to_string(), "team-a".to_string()),
             ]
         );
         // 往返一次顺序不变
@@ -634,7 +625,7 @@ mod tests {
         let x = p("name: r\nbase_url: https://relay.example\nheaders:\n  X-Relay-Token: t-1\n");
         x.check_credential().unwrap();
         assert_eq!(
-            x.outbound_headers(None, None).unwrap(),
+            x.outbound_headers(None).unwrap(),
             vec![("X-Relay-Token".to_string(), "t-1".to_string())]
         );
     }
@@ -645,7 +636,7 @@ mod tests {
         x.oauth = Some(oauth());
         x.check_credential().unwrap();
         assert_eq!(
-            x.outbound_headers(Some("at-1"), None).unwrap(),
+            x.outbound_headers(Some("at-1")).unwrap(),
             vec![("authorization".to_string(), "Bearer at-1".to_string())]
         );
         x.headers = Headers::new(vec![Header {
@@ -654,7 +645,7 @@ mod tests {
         }]);
         x.check_credential().unwrap();
         assert_eq!(
-            x.outbound_headers(Some("at-2"), None).unwrap(),
+            x.outbound_headers(Some("at-2")).unwrap(),
             vec![("X-Token".to_string(), "Token at-2".to_string())]
         );
     }
@@ -703,6 +694,16 @@ mod tests {
             unknown.check_credential(),
             Err(CredentialError::UnknownPlaceholder { .. })
         ));
+        // 按调用方填网关密钥名的 {{client}} 已经不支持了
+        let client =
+            p("name: r\nbase_url: https://relay.example\nheaders:\n  X-A: \"{{client}}\"\n");
+        assert_eq!(
+            client.check_credential(),
+            Err(CredentialError::UnknownPlaceholder {
+                name: "X-A".into(),
+                placeholder: "{{client}}".into(),
+            })
+        );
         let no_oauth =
             p("name: r\nbase_url: https://relay.example\nheaders:\n  X-A: \"{{access_token}}\"\n");
         assert_eq!(
@@ -768,7 +769,7 @@ mod tests {
         });
         login.check_credential().unwrap();
         assert_eq!(
-            login.outbound_headers(Some("at"), None).unwrap(),
+            login.outbound_headers(Some("at")).unwrap(),
             vec![
                 ("authorization".to_string(), "Bearer at".to_string()),
                 ("ChatGPT-Account-Id".to_string(), "acc-1".to_string()),
@@ -810,7 +811,7 @@ mod tests {
             "name: r\nbase_url: https://relay.example\nheaders:\n  Authorization: Token ${TW_TEST_RELAY_TOKEN}\n",
         );
         assert_eq!(
-            x.outbound_headers(None, None).unwrap(),
+            x.outbound_headers(None).unwrap(),
             vec![("Authorization".to_string(), "Token from-env".to_string())]
         );
     }
