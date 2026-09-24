@@ -160,11 +160,11 @@ pub async fn proxy(
     // 报在结局之前，存储层落库时手上才有它
     let name = &upstream.provider.name;
     let attempt = match &connected {
-        Ok(_) => crate::server::hop(name, "served", 101, hop_started),
+        Ok(_) => crate::server::hop(name, tw_api::AttemptOutcome::Served, 101, hop_started),
         Err(NotConnected {
             status: Some(s), ..
-        }) => crate::server::hop(name, "status", *s, hop_started),
-        Err(e) => crate::server::hop_failed(name, e.why.text.clone(), hop_started),
+        }) => crate::server::hop(name, tw_api::AttemptOutcome::Status, *s, hop_started),
+        Err(e) => crate::server::hop_failed(name, e.why.clone(), hop_started),
     };
     // 和 HTTP 那条路同一个规矩：没接下的不按那一家记账
     let billing = match &connected {

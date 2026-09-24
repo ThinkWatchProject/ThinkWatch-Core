@@ -364,7 +364,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             .map(|g| tw_api::GroupView {
                 name: g.name.clone(),
                 builtin: tw_engine::is_builtin_group(&g.name),
-                kind: g.kind.slug().to_string(),
+                kind: routes::group_kind(g.kind),
                 session_affinity: g.session_affinity,
                 selected: g.selected.clone(),
                 providers: g.providers.clone(),
@@ -470,7 +470,7 @@ fn provider_view(
         models: p.models.clone(),
         models_only: p.models_only.clone(),
         model_source: listing.source.slug().to_string(),
-        model_status: listing.status.slug().to_string(),
+        model_status: model_status(listing.status),
         model_fetching: listing.fetching,
         model_checked_at_ms: listing.checked_at_ms,
         model_error: listing.error,
@@ -633,7 +633,7 @@ pub(crate) fn l1_view(
             .into_iter()
             .map(|x| tw_api::L1Skip {
                 stage: l1_stage(x.stage),
-                reason: x.reason.slug().to_string(),
+                reason: x.reason,
             })
             .collect(),
         failed: r.failed.map(l1_stage),
@@ -643,8 +643,19 @@ pub(crate) fn l1_view(
 
 fn l1_stage(s: tw_gateway::Stage) -> tw_api::L1Stage {
     tw_api::L1Stage {
-        step: s.step.slug().to_string(),
-        peer: s.peer.slug().to_string(),
+        step: s.step,
+        peer: s.peer,
+    }
+}
+
+/// 契约里的模型清单状态。
+pub(crate) fn model_status(s: tw_gateway::models::Status) -> tw_api::ModelListStatus {
+    use tw_gateway::models::Status;
+    match s {
+        Status::Pending => tw_api::ModelListStatus::Pending,
+        Status::Listed => tw_api::ModelListStatus::Listed,
+        Status::NoList => tw_api::ModelListStatus::NoList,
+        Status::Failed => tw_api::ModelListStatus::Failed,
     }
 }
 

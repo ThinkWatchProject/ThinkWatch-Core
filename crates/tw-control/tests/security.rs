@@ -82,7 +82,7 @@ fn event(
     tw_store::SecurityEvent {
         at_ms,
         request_id,
-        guard: guard.into(),
+        guard: tw_api::Guard::from_slug(guard).unwrap(),
         rule: rule.into(),
         custom: false,
         action: action.into(),
@@ -447,7 +447,8 @@ async fn a_built_in_rule_s_action_is_written_only_while_it_differs_from_the_fact
         &b.app,
         "PUT",
         "/security/inspect_tools/builtin/rm-rf-root/action",
-        json!({ "action": "delete" }),
+        // 内容过滤的动作，工具调用审查不认
+        json!({ "action": "block" }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");

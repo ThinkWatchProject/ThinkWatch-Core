@@ -21,6 +21,44 @@ pub mod ep;
 pub mod ts;
 pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 
+/// 取值是一个固定集合的字段：线上是 slug，类型是枚举。
+///
+/// **线上仍然是那个词**（`#[serde(rename)]`），导出到前端是字符串字面量的联合，
+/// 界面不用再自己收窄一遍 —— 手写的收窄和这边的集合对不上时，多出来的值会
+/// 悄悄走进错的分支。`slug()` / `from_slug()` 给存库、拼路径这些要字符串的地方。
+macro_rules! slug_enum {
+    (
+        $(#[$m:meta])*
+        pub enum $name:ident {
+            $( $(#[$vm:meta])* $v:ident = $s:literal, )+
+        }
+    ) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        pub enum $name {
+            $( $(#[$vm])* #[serde(rename = $s)] $v, )+
+        }
+        impl $name {
+            /// 全部取值，按声明的顺序
+            pub const ALL: &'static [Self] = &[$(Self::$v),+];
+            /// 线上的那个词
+            pub fn slug(self) -> &'static str {
+                match self {
+                    $(Self::$v => $s,)+
+                }
+            }
+            /// 反过来。不在集合里的是 `None`
+            pub fn from_slug(s: &str) -> Option<Self> {
+                match s {
+                    $($s => Some(Self::$v),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
 /// core 发得出的每一个消息码（[`Msg::code`]），一行一个，按字母排。
 ///
 /// **界面按码翻译，所以这就是它要翻的全部。**桌面端从钉着的那个 tag 读它，和
@@ -87,7 +125,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 换成了 `POST /scan`（项目目录走请求体，查询串里那种写法 core 一直读不了）；
 /// 框架替我们回的失败（路径不存在、方法不对、请求体读不成）也是 [`ErrorBody`]，
 /// 不再是纯文本或空响应体；传输地址改名 `control::Address`。
-pub const CONTROL_API_VERSION: u32 = 13;
+///
+/// **14 起取值固定的字段是枚举，三处原因是 [`Msg`]。**线上的词没变（防护、策略组
+/// 类型、模型清单状态、生效时机、尝试结果、规则动作、发现等级、测速的步骤），
+/// 变的是类型；尝试链每一跳的 `error`、模型清单的 `model_error` / `error`、
+/// 检测上游的 `error` 原来是一句英文字符串，中文界面上只能原样显示。照 13 写的
+/// 界面会把这三处画成一个对象。
+pub const CONTROL_API_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -288,7 +332,7 @@ pub enum Event {
         rule: String,
         custom: bool,
         /// 这条规则在拦截档下做什么：`block` / `record`
-        action: String,
+        action: RuleAction,
         /// 请求被拒了吗。**拦截档 + 规则是拦**两者同时成立才会
         blocked: bool,
         /// 在工具结果里，而不是调用方自己打的字
@@ -409,7 +453,7 @@ pub enum Event {
         /// 命中的那一小段，**已截断**
         excerpt: String,
         /// 这条规则在拦截档下做什么：`cut` / `record`
-        action: String,
+        action: RuleAction,
         /// 真的切断了流吗。**拦截档 + 规则是切断**两者同时成立才会
         blocked: bool,
         at_ms: u64,
@@ -624,6 +668,19 @@ pub enum Event {
     EventsDropped { id: u64, count: u64, at_ms: u64 },
 }
 
+slug_enum! {
+    /// 尝试链里一跳的结果。
+    pub enum AttemptOutcome {
+        /// 这一跳接下了请求，尝试链到此为止。上游回的是 4xx 也算 —— 请求本身有
+        /// 问题，换一个上游也一样被拒
+        Served = "served",
+        /// 上游返回 5xx 或 429，换下一个上游
+        Status = "status",
+        /// 没有收到响应（超时、无法连接），或者这一跳没有发出去
+        Error = "error",
+    }
+}
+
 /// 尝试链里的一跳。
 ///
 /// **失败的原因要留着** —— 一条说「试过 A → B → C」的链，和一条还说清
@@ -632,20 +689,15 @@ pub enum Event {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AttemptView {
     pub provider: String,
-    /// - `served`：这一跳接下了请求，尝试链到此为止。上游回的是 4xx 也算
-    ///   —— 请求本身有问题，换一个上游也一样被拒。
-    /// - `status`：上游返回 5xx 或 429，换下一个上游。
-    /// - `error`：没有收到响应（超时、无法连接）。
-    ///
     /// WebSocket 的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
     /// 状态码是 `status`，连不上是 `error`。
-    pub outcome: String,
+    pub outcome: AttemptOutcome,
     /// 上游返回的状态码。`error` 时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// `error` 时的说明
+    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
     pub ms: u64,
 }
 
@@ -927,9 +979,8 @@ pub struct ProviderView {
     /// 模型清单从哪儿来：`discovered`（上游列出的）/ `manual`（手动清单）/
     /// `none`（不知道它有什么）
     pub model_source: String,
-    /// 最近一次向上游获取清单的结果：`pending`（还没获取，停用的上游一直是
-    /// 这样）/ `listed` / `no_list`（上游不提供清单）/ `failed`（没问到）
-    pub model_status: String,
+    /// 最近一次向上游获取清单的结果
+    pub model_status: ModelListStatus,
     /// 正在获取。上一次的结果照常有效
     pub model_fetching: bool,
     /// 最近一次获取的时间。还没获取过是空
@@ -937,7 +988,7 @@ pub struct ProviderView {
     pub model_checked_at_ms: Option<u64>,
     /// `no_list` / `failed` 的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_error: Option<String>,
+    pub model_error: Option<Msg>,
     /// 现在能服务的模型数，已按启用范围过滤。停用时是 0
     pub model_count: usize,
     /// 停用：不参与路由，模型不出现在 `/v1/models` 里
@@ -1091,9 +1142,8 @@ pub struct GroupView {
     pub name: String,
     /// 内置的「全部上游」：成员是全部上游，按上游列表的顺序。不能编辑、不能删除
     pub builtin: bool,
-    /// 配置里写的 `type`：`fallback` / `select` / `load-balance` /
-    /// `url-test` / `cheapest`
-    pub kind: String,
+    /// 配置里写的 `type`
+    pub kind: GroupKind,
     /// 同一次会话固定走同一家。**这一项直接决定账单**
     pub session_affinity: bool,
     /// `select` 组当前选中谁。
@@ -1192,9 +1242,7 @@ pub struct KeySynced {
     pub client: String,
     /// 界面上显示的名字
     pub name: String,
-    /// `immediately` 下一个请求就用新的；`on_restart` 要重启那个客户端。
-    /// 和 `DetectedClient.takes_effect` 同一个词表
-    pub takes_effect: String,
+    pub takes_effect: TakesEffect,
     /// 改之前的全文备份在哪
     pub backup: String,
 }
@@ -1291,7 +1339,8 @@ pub struct ProviderTestResult {
     /// 经由哪个代理。直连时为空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
-    pub error: Option<String>,
+    /// 失败的原因，和下一步该查什么
+    pub error: Option<Msg>,
 }
 
 /// L1 测速：只握手，不发业务请求。**零成本零副作用**。
@@ -1310,15 +1359,45 @@ pub struct L1Request {
     pub provider: Option<String>,
 }
 
+slug_enum! {
+    /// 建连的哪一步。
+    pub enum L1Step {
+        /// 地址或代理配置用不了，没有开始建连
+        Config = "config",
+        Dns = "dns",
+        Tcp = "tcp",
+        Tls = "tls",
+        /// 代理协议的握手，含认证
+        Handshake = "handshake",
+    }
+}
+
+slug_enum! {
+    /// 建连的那一步对着谁。
+    pub enum L1Peer {
+        Upstream = "upstream",
+        Proxy = "proxy",
+    }
+}
+
+slug_enum! {
+    /// 建连时没有出现的那一步为什么没有。
+    pub enum L1SkipReason {
+        /// `http://` 地址没有 TLS
+        PlainHttp = "plain_http",
+        /// 地址已经是 IP，不需要解析
+        IpAddress = "ip_address",
+        /// `socks5h` 和 HTTP CONNECT 由代理解析域名
+        ProxyResolves = "proxy_resolves",
+    }
+}
+
 /// 建连的哪一步、对着谁。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Stage {
-    /// `config`（地址或代理配置用不了，没有开始建连）/ `dns` / `tcp` /
-    /// `tls` / `handshake`（代理协议的握手，含认证）
-    pub step: String,
-    /// `upstream` / `proxy`
-    pub peer: String,
+    pub step: L1Step,
+    pub peer: L1Peer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1333,9 +1412,7 @@ pub struct L1Segment {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct L1Skip {
     pub stage: L1Stage,
-    /// `plain_http`（`http://` 地址没有 TLS）/ `ip_address`（地址已经是 IP，
-    /// 不需要解析）/ `proxy_resolves`（`socks5h` 和 HTTP CONNECT 由代理解析域名）
-    pub reason: String,
+    pub reason: L1SkipReason,
 }
 
 /// **分段是个列表而不是固定的 DNS/TCP/TLS 三段**，因为走代理时的形状本来
@@ -1732,6 +1809,20 @@ pub struct ProviderPreview {
     pub auth_header: String,
 }
 
+slug_enum! {
+    /// 最近一次向上游获取模型清单的结果。
+    pub enum ModelListStatus {
+        /// 还没获取。停用的上游一直是这样
+        Pending = "pending",
+        /// 上游列出了清单
+        Listed = "listed",
+        /// 问到了，但上游不提供清单（没有这个接口、格式认不出、空的）
+        NoList = "no_list",
+        /// 没问到：连不上、凭据被拒、取不到凭据
+        Failed = "failed",
+    }
+}
+
 /// 一个上游的模型清单。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1740,7 +1831,7 @@ pub struct ProviderModelsView {
     /// `discovered`（上游列出的）/ `manual`（手动清单）/ `none`
     pub source: String,
     /// 最近一次获取的结果，同 [`ProviderView::model_status`]
-    pub status: String,
+    pub status: ModelListStatus,
     /// 正在获取
     pub fetching: bool,
     /// 最近一次向上游获取清单的时间。还没获取过是空
@@ -1748,7 +1839,7 @@ pub struct ProviderModelsView {
     pub checked_at_ms: Option<u64>,
     /// 没从上游拿到清单的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<Msg>,
     pub models: Vec<ModelRow>,
 }
 
@@ -1964,13 +2055,28 @@ pub struct DefaultRouteSave {
     pub base_version: Option<String>,
 }
 
+slug_enum! {
+    /// 策略组按什么排候选：配置里 `type` 写的那个词。
+    pub enum GroupKind {
+        /// 按顺序，前一个不可用才用下一个
+        Fallback = "fallback",
+        /// 用选中的那一个，不可用时按顺序
+        Select = "select",
+        /// 轮流
+        LoadBalance = "load-balance",
+        /// 选最快的
+        UrlTest = "url-test",
+        /// 选最便宜的
+        Cheapest = "cheapest",
+    }
+}
+
 /// 新建或修改一个策略组时交过来的定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct GroupInput {
     pub name: String,
-    /// `fallback` / `select` / `load-balance` / `url-test` / `cheapest`
-    pub kind: String,
+    pub kind: GroupKind,
     /// 成员，按顺序
     pub providers: Vec<String>,
     /// `select` 组优先使用的成员
@@ -2072,8 +2178,9 @@ pub struct ListQuery {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityEventsQuery {
+    /// 只要这一项的。不给是全部
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard: Option<String>,
+    pub guard: Option<Guard>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2769,12 +2876,20 @@ pub struct ReplayResult {
 
 // ---------------------------------------------------------------- 静态扫描
 
+slug_enum! {
+    /// 一处扫描发现有多要紧。
+    pub enum ScanLevel {
+        High = "high",
+        Medium = "medium",
+        Low = "low",
+    }
+}
+
 /// 一处发现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScanFinding {
-    /// `high` | `medium` | `low`
-    pub level: String,
+    pub level: ScanLevel,
     /// 哪条规则命中的
     pub rule: String,
     /// `hooks` | `mcp` | `skill` | `command` | `agent` | `instructions`
@@ -3032,6 +3147,16 @@ pub struct SkippedView {
 // config.yaml 里的一把网关密钥，这个是本机上装着的一个 AI 客户端 App。
 // 中文都叫「客户端」，混起来的话，「有几个客户端」这句话就有两个答案。
 
+slug_enum! {
+    /// 改了客户端的配置之后，什么时候生效。
+    pub enum TakesEffect {
+        /// 下一个请求就使用新配置
+        Immediately = "immediately",
+        /// 客户端重新启动后才生效，读环境变量的要重开终端
+        OnRestart = "on_restart",
+    }
+}
+
 /// 一个客户端此刻的样子。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3050,9 +3175,7 @@ pub struct DetectedClient {
     /// 配置里此刻的端点。**读出来的**，不是拿我们自己的记录充数
     pub endpoint: Option<String>,
     pub shadows: Vec<String>,
-    /// `immediately`（下一个请求就使用新配置）| `on_restart`（客户端重新
-    /// 启动后才生效，读环境变量的要重开终端）
-    pub takes_effect: String,
+    pub takes_effect: TakesEffect,
     /// 接管之后要不要在「一直没收到请求」时提示。
     ///
     /// **需要重开终端的客户端不提示** —— 用户可能一整天都没重开过，那时
@@ -3193,16 +3316,27 @@ pub struct AdoptResponse {
     pub created: bool,
     /// 不至于失败、但用户该知道的事（符号链接、权限太松……）
     pub warnings: Vec<Msg>,
-    /// 改动什么时候生效，和 `DetectedClient.takes_effect` 同一个词表
-    pub takes_effect: String,
+    /// 改动什么时候生效
+    pub takes_effect: TakesEffect,
+}
+
+slug_enum! {
+    /// 一条诊断发现的结论。
+    pub enum FindingLevel {
+        /// 就是它让接管没有生效
+        Blocking = "blocking",
+        /// 可能有关，要人看一眼
+        Suspect = "suspect",
+        /// 查过了，没有问题
+        Clear = "clear",
+    }
 }
 
 /// 一条诊断发现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct FindingView {
-    /// `blocking` | `suspect` | `clear`
-    pub level: String,
+    pub level: FindingLevel,
     pub title: Msg,
     pub detail: Msg,
     /// 用户可以自己执行的下一步。**我们不替他执行。**
@@ -3242,6 +3376,35 @@ pub struct HiddenItem {
     pub revealed: String,
 }
 
+slug_enum! {
+    /// 哪一项防护。配置里 `security` 下的那个键，也是接口路径里的那一段。
+    pub enum Guard {
+        /// 出站脱敏
+        Redact = "redact",
+        /// 工具调用审查
+        InspectTools = "inspect_tools",
+        /// 藏匿字符
+        HiddenText = "hidden_text",
+        /// 内容过滤
+        Content = "content",
+        /// 输出长度
+        OutputLimit = "output_limit",
+    }
+}
+
+slug_enum! {
+    /// 一条规则在拦截档下做什么。工具调用审查是 `cut` / `record`，内容过滤是
+    /// `block` / `record`；别的防护命中之后做什么由档位决定，没有这一项。
+    pub enum RuleAction {
+        /// 切断这个工具调用所在的流（工具调用审查）
+        Cut = "cut",
+        /// 拒绝这个请求，不发出去（内容过滤）
+        Block = "block",
+        /// 只记录
+        Record = "record",
+    }
+}
+
 /// 各项防护在一段时间里各留下了几条记录。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3278,8 +3441,7 @@ pub struct SecurityEventView {
     pub id: i64,
     pub at_ms: i64,
     pub request_id: i64,
-    /// `redact` / `inspect_tools` / `hidden_text` / `content` / `output_limit`
-    pub guard: String,
+    pub guard: Guard,
     /// 内置规则的 id，或者自定义规则的名字。藏匿字符是那一种（`tag` / `bidi`），
     /// 输出长度是 `max_chars`
     pub rule: String,
@@ -3371,12 +3533,12 @@ pub struct SecurityRuleView {
     pub enabled: bool,
     /// 出厂时开不开。自定义规则是 `true`
     pub on_by_default: bool,
-    /// 工具调用审查：拦截档下做什么，`cut` / `record`；内容过滤：`block` / `record`
+    /// 工具调用审查、内容过滤：拦截档下做什么
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+    pub action: Option<RuleAction>,
     /// 内置规则出厂时拦截档下做什么。和 `action` 不一样就是改过
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_action: Option<String>,
+    pub default_action: Option<RuleAction>,
 }
 
 /// 一项防护的档位和规则。
@@ -3440,7 +3602,7 @@ pub struct RuleToggle {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActionSave {
     /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `record`
-    pub action: String,
+    pub action: RuleAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
 }
@@ -3453,7 +3615,7 @@ pub struct CustomRuleSave {
     pub pattern: String,
     /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `record`。不给按 `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+    pub action: Option<RuleAction>,
     /// 内容过滤才有：`contains`（不分大小写的子串）/ `regex`。不给按 `contains`。
     /// 别的防护的自定义规则都是正则
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
@@ -3509,7 +3671,7 @@ pub struct SecurityTestHit {
     pub excerpt: String,
     /// 工具调用审查、内容过滤：拦截档下做什么
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+    pub action: Option<RuleAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3521,6 +3683,55 @@ pub struct SecurityTestResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 枚举化的字段在线上仍然是那个词，`slug()` 说的也是它。
+    #[test]
+    fn closed_sets_keep_their_words_on_the_wire() {
+        fn check<
+            T: Copy + Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        >(
+            all: &[T],
+            slug: fn(T) -> &'static str,
+            from: fn(&str) -> Option<T>,
+        ) {
+            for &v in all {
+                let wire = serde_json::to_value(v).unwrap();
+                assert_eq!(wire, serde_json::Value::from(slug(v)), "{v:?}");
+                assert_eq!(serde_json::from_value::<T>(wire).unwrap(), v);
+                assert_eq!(from(slug(v)), Some(v));
+            }
+            assert!(from("no-such-word").is_none());
+        }
+        check(Guard::ALL, Guard::slug, Guard::from_slug);
+        check(GroupKind::ALL, GroupKind::slug, GroupKind::from_slug);
+        check(
+            ModelListStatus::ALL,
+            ModelListStatus::slug,
+            ModelListStatus::from_slug,
+        );
+        check(TakesEffect::ALL, TakesEffect::slug, TakesEffect::from_slug);
+        check(
+            AttemptOutcome::ALL,
+            AttemptOutcome::slug,
+            AttemptOutcome::from_slug,
+        );
+        check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);
+        check(ScanLevel::ALL, ScanLevel::slug, ScanLevel::from_slug);
+        check(
+            FindingLevel::ALL,
+            FindingLevel::slug,
+            FindingLevel::from_slug,
+        );
+        check(L1Step::ALL, L1Step::slug, L1Step::from_slug);
+        check(L1Peer::ALL, L1Peer::slug, L1Peer::from_slug);
+        check(
+            L1SkipReason::ALL,
+            L1SkipReason::slug,
+            L1SkipReason::from_slug,
+        );
+        assert_eq!(GroupKind::LoadBalance.slug(), "load-balance");
+        assert_eq!(Guard::InspectTools.slug(), "inspect_tools");
+    }
 
     #[test]
     fn events_carry_a_discriminating_tag() {

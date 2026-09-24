@@ -405,7 +405,7 @@ async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
     assert_eq!(rule, "Codex 走账号");
     assert_eq!(group.as_deref(), Some("账号池"));
     assert_eq!(
-        (hop.provider.as_str(), hop.outcome.as_str(), hop.status),
+        (hop.provider.as_str(), hop.outcome.slug(), hop.status),
         ("订阅账号", "served", Some(101))
     );
     assert_eq!(billing, "free");
@@ -431,7 +431,7 @@ async fn an_upstream_that_refuses_the_upgrade_is_reported_with_its_status() {
 
     let evs = until_the_ending(&mut events).await;
     let (_, _, hop, billing) = the_route(&evs);
-    assert_eq!((hop.outcome.as_str(), hop.status), ("status", Some(403)));
+    assert_eq!((hop.outcome.slug(), hop.status), ("status", Some(403)));
     assert_eq!(hop.error, None);
     assert_eq!(billing, "per-token", "没接下的请求被按那一家记成了不计费");
     assert!(
@@ -453,9 +453,9 @@ async fn an_unreachable_upstream_is_reported_as_a_failed_hop() {
 
     let evs = until_the_ending(&mut events).await;
     let (_, _, hop, billing) = the_route(&evs);
-    assert_eq!((hop.outcome.as_str(), hop.status), ("error", None));
+    assert_eq!((hop.outcome.slug(), hop.status), ("error", None));
     let why = hop.error.expect("失败的那一跳没说原因");
-    assert!(why.contains(&dead.to_string()), "{why}");
+    assert!(why.text.contains(&dead.to_string()), "{why}");
     assert_eq!(billing, "per-token");
     assert!(
         matches!(evs.last(), Some(Event::RequestFailed { source, .. }) if source == "upstream"),

@@ -207,7 +207,11 @@ fn content_matched(
             provider: provider.to_string(),
             rule: h.rule.clone(),
             custom: h.custom,
-            action: if blocking { "block" } else { "record" }.to_string(),
+            action: if blocking {
+                tw_api::RuleAction::Block
+            } else {
+                tw_api::RuleAction::Record
+            },
             blocked: refuse && blocking,
             in_tool_result: h.in_tool_result,
             excerpt: h.snippet.clone(),

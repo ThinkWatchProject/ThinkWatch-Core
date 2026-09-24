@@ -110,7 +110,7 @@ async fn a_client_that_needs_a_restart_says_so_and_gets_no_silence_warning() {
     let (_, body) = get(&b.app, "/clients").await;
     let v: tw_api::ClientsResponse = serde_json::from_str(&body).unwrap();
     let codex = v.clients.iter().find(|c| c.id == "codex").unwrap();
-    assert_eq!(codex.takes_effect, "on_restart");
+    assert_eq!(codex.takes_effect, tw_api::TakesEffect::OnRestart);
     assert!(!codex.warns_when_silent);
 }
 
@@ -235,7 +235,10 @@ async fn the_diagnosis_hands_over_a_command_rather_than_running_it() {
         "我们把用户的 .zshrc 改了"
     );
     // 查干净的项也要说出来
-    assert!(v.iter().any(|f| f.level == "clear"), "{v:?}");
+    assert!(
+        v.iter().any(|f| f.level == tw_api::FindingLevel::Clear),
+        "{v:?}"
+    );
 }
 
 #[tokio::test]

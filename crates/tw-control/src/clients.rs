@@ -17,6 +17,14 @@ use tw_types::msg;
 
 use crate::{Fail, fail};
 
+/// 契约里的「什么时候生效」。
+pub(crate) fn takes_effect(t: tw_adopt::clients::TakesEffect) -> tw_api::TakesEffect {
+    match t {
+        tw_adopt::clients::TakesEffect::Immediately => tw_api::TakesEffect::Immediately,
+        tw_adopt::clients::TakesEffect::OnRestart => tw_api::TakesEffect::OnRestart,
+    }
+}
+
 fn find(id: &str) -> Result<tw_adopt::clients::Client, Fail> {
     adoptable().into_iter().find(|c| c.id == id).ok_or_else(|| {
         fail(
@@ -266,7 +274,7 @@ pub async fn list(State(s): State<ControlState>) -> Result<Json<tw_api::ClientsR
                 adopted_at_ms: d.adopted_at_ms,
                 endpoint: d.endpoint,
                 shadows: d.shadows.iter().map(|p| p.display().to_string()).collect(),
-                takes_effect: d.takes_effect.slug().to_string(),
+                takes_effect: takes_effect(d.takes_effect),
                 warns_when_silent: d.takes_effect.warns_when_silent(),
                 verified: d.verified.slug().to_string(),
                 costs: d.costs,
@@ -456,7 +464,7 @@ pub async fn adopt(
         created: a.created,
         warnings: a.warnings,
         // **在接管完成那一屏说，不是等五分钟后再说**
-        takes_effect: c.takes_effect.slug().to_string(),
+        takes_effect: takes_effect(c.takes_effect),
     }))
 }
 
@@ -477,7 +485,7 @@ pub async fn restore(
         backup: a.backup.display().to_string(),
         created: false,
         warnings: p.notes,
-        takes_effect: c.takes_effect.slug().to_string(),
+        takes_effect: takes_effect(c.takes_effect),
     }))
 }
 
@@ -572,7 +580,7 @@ pub async fn mcp_apply(
         created: a.created,
         warnings: a.warnings,
         // 客户端只在启动时读 MCP 配置
-        takes_effect: tw_adopt::clients::TakesEffect::OnRestart.slug().to_string(),
+        takes_effect: tw_api::TakesEffect::OnRestart,
     }))
 }
 
@@ -587,9 +595,9 @@ pub async fn why(
             .into_iter()
             .map(|f| tw_api::FindingView {
                 level: match f.level {
-                    detect::Level::Blocking => "blocking".into(),
-                    detect::Level::Suspect => "suspect".into(),
-                    detect::Level::Clear => "clear".into(),
+                    detect::Level::Blocking => tw_api::FindingLevel::Blocking,
+                    detect::Level::Suspect => tw_api::FindingLevel::Suspect,
+                    detect::Level::Clear => tw_api::FindingLevel::Clear,
                 },
                 title: f.title,
                 detail: f.detail,

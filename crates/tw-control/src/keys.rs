@@ -330,7 +330,7 @@ async fn rotate(
             Ok(a) => synced.push(tw_api::KeySynced {
                 client: c.id.to_string(),
                 name: c.name.to_string(),
-                takes_effect: c.takes_effect.slug().to_string(),
+                takes_effect: crate::clients::takes_effect(c.takes_effect),
                 backup: a.backup.display().to_string(),
             }),
             // **密钥已经换了**，这一条不能把整次更换报成失败 —— 那会让用户

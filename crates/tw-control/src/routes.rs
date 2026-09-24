@@ -549,6 +549,28 @@ fn builtin_group(name: &str) -> Result<(), ApplyError> {
     Ok(())
 }
 
+/// 契约里的策略组类型和引擎里的是同一组词，两边各写一遍，靠这两个穷尽的
+/// `match` 对齐。
+pub(crate) fn group_kind(t: GroupType) -> tw_api::GroupKind {
+    match t {
+        GroupType::Fallback => tw_api::GroupKind::Fallback,
+        GroupType::Select => tw_api::GroupKind::Select,
+        GroupType::LoadBalance => tw_api::GroupKind::LoadBalance,
+        GroupType::UrlTest => tw_api::GroupKind::UrlTest,
+        GroupType::Cheapest => tw_api::GroupKind::Cheapest,
+    }
+}
+
+fn group_type(k: tw_api::GroupKind) -> GroupType {
+    match k {
+        tw_api::GroupKind::Fallback => GroupType::Fallback,
+        tw_api::GroupKind::Select => GroupType::Select,
+        tw_api::GroupKind::LoadBalance => GroupType::LoadBalance,
+        tw_api::GroupKind::UrlTest => GroupType::UrlTest,
+        tw_api::GroupKind::Cheapest => GroupType::Cheapest,
+    }
+}
+
 fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group, Msg> {
     let name = checked_name(&input.name, "group")?;
     reserved(&name, "group")?;
@@ -559,13 +581,7 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
              by name, so the two cannot share one."
         ));
     }
-    let kind: GroupType =
-        serde_yaml_ng::from_value(Value::String(input.kind.clone())).map_err(|_| {
-            msg!(
-                "control.group.unknown_strategy", strategy = &input.kind =>
-                "`{strategy}` is not a strategy we support"
-            )
-        })?;
+    let kind = group_type(input.kind);
     let mut providers = Vec::new();
     for p in &input.providers {
         let p = p.trim();
@@ -778,7 +794,7 @@ mod msg_codes {
         let c = cfg();
         let g = |name: &str, kind: &str, providers: &[&str]| tw_api::GroupInput {
             name: name.into(),
-            kind: kind.into(),
+            kind: tw_api::GroupKind::from_slug(kind).unwrap(),
             providers: providers.iter().map(|p| p.to_string()).collect(),
             selected: None,
             session_affinity: true,
@@ -789,10 +805,6 @@ mod msg_codes {
             "control.group.name_is_upstream"
         );
         assert_eq!(code(g("__x", "fallback", &["a"])), "control.name_reserved");
-        assert_eq!(
-            code(g("g", "random", &["a"])),
-            "control.group.unknown_strategy"
-        );
         assert_eq!(
             code(g("g", "fallback", &["b"])),
             "control.group.no_such_upstream"

@@ -2057,12 +2057,17 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
     assert_eq!(group.as_deref(), Some("全部"));
     assert_eq!(attempts.len(), 3, "{attempts:?}");
     assert_eq!(attempts[0].provider, "挂了的");
-    assert_eq!(attempts[0].outcome, "status", "{:?}", attempts[0]);
+    assert_eq!(
+        attempts[0].outcome,
+        tw_api::AttemptOutcome::Status,
+        "{:?}",
+        attempts[0]
+    );
     assert_eq!(attempts[0].status, Some(503), "{:?}", attempts[0]);
     assert_eq!(attempts[1].provider, "限流的");
     assert_eq!(attempts[1].status, Some(429), "{:?}", attempts[1]);
     assert_eq!(attempts[2].provider, "好的");
-    assert_eq!(attempts[2].outcome, "served");
+    assert_eq!(attempts[2].outcome, tw_api::AttemptOutcome::Served);
     assert_eq!(attempts[2].status, Some(200));
 }
 
@@ -2095,7 +2100,7 @@ async fn a_request_that_succeeds_first_try_still_has_a_chain_of_one() {
             tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
         {
             assert_eq!(attempts.len(), 1);
-            assert_eq!(attempts[0].outcome, "served");
+            assert_eq!(attempts[0].outcome, tw_api::AttemptOutcome::Served);
             return;
         }
     }
@@ -2131,7 +2136,12 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
             tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
         {
             assert_eq!(attempts.len(), 1);
-            assert_eq!(attempts[0].outcome, "status", "{:?}", attempts[0]);
+            assert_eq!(
+                attempts[0].outcome,
+                tw_api::AttemptOutcome::Status,
+                "{:?}",
+                attempts[0]
+            );
             assert_eq!(attempts[0].status, Some(503), "{:?}", attempts[0]);
             return;
         }

@@ -546,7 +546,7 @@ fn print_l1(target: &str, via: Option<&str>, r: &tw_gateway::L1Result) {
         }
     }
     for s in &r.skipped {
-        println!("     · {}", s.reason.label());
+        println!("     · {}", s.label());
     }
     println!();
 }

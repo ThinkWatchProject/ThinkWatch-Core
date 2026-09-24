@@ -103,7 +103,7 @@ pub struct Listing {
     /// 最近一次向上游问的时间。还没问过是空
     pub checked_at_ms: Option<u64>,
     /// 没从上游拿到清单的原因
-    pub error: Option<String>,
+    pub error: Option<tw_types::Msg>,
 }
 
 /// 最近一次向上游问的结果。
@@ -114,9 +114,9 @@ enum Answer {
     /// 列出来了
     Listed(Vec<String>),
     /// 问到了，但上游没给出清单：没有这个接口、格式认不出、空的
-    NoList(String),
+    NoList(tw_types::Msg),
     /// 没问到：连不上、密钥被拒、取不到密钥
-    Failed(String),
+    Failed(tw_types::Msg),
 }
 
 #[derive(Debug, Clone)]
@@ -374,23 +374,33 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     let http = rt.clients.get(&p.name).unwrap_or(&state.http);
     let headers = match state.headers_for(p, http).await {
         Ok(h) => h,
-        Err(e) => return Answer::Failed(format!("the credential could not be obtained: {e}")),
+        Err(e) => {
+            return Answer::Failed(msg!(
+                "gw.models.credentials", detail = e =>
+                "The credential could not be obtained: {detail}"
+            ));
+        }
     };
     let r = crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await;
     if !r.ok {
-        return Answer::Failed(r.error.unwrap_or_else(|| "the check failed".to_string()));
+        return Answer::Failed(
+            r.error
+                .unwrap_or_else(|| msg!("gw.models.check_failed" => "The check failed.")),
+        );
     }
     match r.models {
         ModelList::Listed { models } => Answer::Listed(models),
-        ModelList::NotImplemented { status } => Answer::NoList(format!(
-            "the upstream has no model-list endpoint (HTTP {status})"
+        ModelList::NotImplemented { status } => Answer::NoList(msg!(
+            "gw.models.no_endpoint", status = status =>
+            "The upstream has no model-list endpoint (HTTP {status})."
         )),
-        ModelList::Unrecognized { .. } => Answer::NoList(
-            "the model list the upstream returned is in an unrecognized format".to_string(),
-        ),
-        ModelList::Empty => {
-            Answer::NoList("the model list the upstream returned is empty".to_string())
-        }
+        ModelList::Unrecognized { .. } => Answer::NoList(msg!(
+            "gw.models.unrecognized" =>
+            "The model list the upstream returned is in an unrecognized format."
+        )),
+        ModelList::Empty => Answer::NoList(msg!(
+            "gw.models.empty" => "The model list the upstream returned is empty."
+        )),
     }
 }
 
@@ -642,6 +652,15 @@ pub fn serving(
 mod tests {
     use super::*;
 
+    /// 一句原因。码不要紧，这里比的是哪一句
+    fn why(text: &str) -> tw_types::Msg {
+        tw_types::Msg {
+            code: "test.why".into(),
+            args: Default::default(),
+            text: text.into(),
+        }
+    }
+
     fn provider(name: &str) -> tw_config::Provider {
         tw_config::Provider {
             name: name.into(),
@@ -744,13 +763,13 @@ mod tests {
         d.record(
             "a",
             &identity(&c, &c.providers[0]),
-            Answer::Failed("连不上".into()),
+            Answer::Failed(why("连不上")),
             0,
         );
         d.record(
             "b",
             &identity(&c, &c.providers[1]),
-            Answer::NoList("没有接口".into()),
+            Answer::NoList(why("没有接口")),
             0,
         );
         let cat = published(&d, &c);
@@ -762,7 +781,10 @@ mod tests {
         assert_eq!(d.due(&c, hour), ["a"]);
         assert_eq!(d.due(&c, REFRESH_EVERY.as_millis() as u64), ["a", "b"]);
         assert_eq!(
-            d.listing(&c.providers[1]).error.as_deref(),
+            d.listing(&c.providers[1])
+                .error
+                .as_ref()
+                .map(|m| m.text.as_str()),
             Some("没有接口")
         );
     }
@@ -792,13 +814,13 @@ mod tests {
         d.record(
             "failed",
             &id("failed"),
-            Answer::Failed("连不上".into()),
+            Answer::Failed(why("连不上")),
             now - minute,
         );
         d.record(
             "failed-now",
             &id("failed-now"),
-            Answer::Failed("连不上".into()),
+            Answer::Failed(why("连不上")),
             now - 1,
         );
         d.record(
@@ -816,7 +838,7 @@ mod tests {
         d.record(
             "no-list",
             &id("no-list"),
-            Answer::NoList("没有接口".into()),
+            Answer::NoList(why("没有接口")),
             now - minute,
         );
         d.begin("asking", &id("asking"));
@@ -836,12 +858,12 @@ mod tests {
         assert!(!d.listing(p).fetching);
         d.begin("a", &id);
         d.begin("a", &id);
-        d.record("a", &id, Answer::Failed("连不上".into()), 1);
+        d.record("a", &id, Answer::Failed(why("连不上")), 1);
         // 一个回来了，另一个还在问；上一次的答案照常可用
         let l = d.listing(p);
         assert!(l.fetching);
         assert_eq!(l.status, Status::Failed);
-        assert_eq!(l.error.as_deref(), Some("连不上"));
+        assert_eq!(l.error.as_ref().map(|m| m.text.as_str()), Some("连不上"));
         // 正在问的不再排进后台那一轮
         assert!(d.due(&c, REFRESH_EVERY.as_millis() as u64).is_empty());
         d.record("a", &id, Answer::Listed(vec!["m".into()]), 2);
@@ -881,13 +903,13 @@ mod tests {
         d.record(
             "a",
             &identity(&c, &c.providers[0]),
-            Answer::Failed("密钥被拒".into()),
+            Answer::Failed(why("密钥被拒")),
             1,
         );
         let l = d.listing(&c.providers[0]);
         // 清单来自手写的兜底，但「问了、没问到、为什么」一样要说
         assert_eq!((l.source, l.status), (Source::Manual, Status::Failed));
         assert_eq!(l.models, ["手写"]);
-        assert_eq!(l.error.as_deref(), Some("密钥被拒"));
+        assert_eq!(l.error.as_ref().map(|m| m.text.as_str()), Some("密钥被拒"));
     }
 }
