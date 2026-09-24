@@ -1,23 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
-    # ── 第一层 · 共用协议层（企业版也依赖）────────────────
+    # ── 第一层 · 共用（企业版依赖，含传递依赖）──────────
+    # 企业版直接用：tw-types、tw-upstream、tw-wire、tw-crypto、
+    # tw-dialect、tw-guard、tw-breaker；tw-secret 经 tw-guard 带进去。
+    # 改这一层要 grep 企业版。
     "crates/tw-types",
     "crates/tw-upstream",
     "crates/tw-wire",
     "crates/tw-crypto",
-    # ── 第二层 · 桌面网关（企业版永不依赖）────────────────
-    "crates/tw-api",
+    "crates/tw-dialect",
+    "crates/tw-guard",
     "crates/tw-secret",
+    "crates/tw-breaker",
+    # ── 第二层 · 桌面网关（企业版不依赖）────────────────
+    "crates/tw-api",
     "crates/tw-config",
     "crates/tw-yaml",
     "crates/tw-store",
     "crates/tw-pricing",
     "crates/tw-adopt",
     "crates/tw-scan",
-    "crates/tw-guard",
-    "crates/tw-breaker",
-    "crates/tw-dialect",
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
