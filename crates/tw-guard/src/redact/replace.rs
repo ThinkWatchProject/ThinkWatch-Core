@@ -148,12 +148,6 @@ pub fn redact(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     apply(text, &hits, ledger)
 }
 
-/// 扫 + 换一段**纯文本**（见 [`crate::redact::rules::scan_plain`]）。
-pub fn redact_plain(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
-    let hits = crate::redact::rules::scan_plain(text, rules);
-    apply(text, &hits, ledger)
-}
-
 /// 扫 + 换一段**解码过的正文**（见 [`crate::redact::rules::scan_text`]）。
 pub fn redact_text(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     let hits = crate::redact::rules::scan_text(text, rules);
@@ -368,7 +362,8 @@ mod tests {
             .with_custom("other", r"ID-\d+")
             .unwrap();
         let t = "a@b.com 13800138000 c@d.com a@b.com ID-7";
-        let r = redact_plain(t, &rules, Ledger::new(scheme));
+        let hits = crate::redact::rules::scan_plain(t, &rules);
+        let r = apply(t, &hits, Ledger::new(scheme));
         assert_eq!(
             r.text,
             "{{EMAIL_1}} {{PHONE_1}} {{EMAIL_2}} {{EMAIL_1}} {{PII_1}}"

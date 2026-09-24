@@ -182,7 +182,9 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// 正在跑的进程里，匹配这些片段的那些各自启动于什么时候（毫秒时间戳）。
 #[cfg(not(windows))]
 fn running_since(markers: &[&str]) -> Vec<u64> {
-    let Ok(out) = std::process::Command::new("ps")
+    // 写死绝对路径：按 PATH 找的话，谁往 PATH 前面塞一个同名程序，它就跟着
+    // core 一起跑起来了。macOS 和常见 Linux 发行版上都在这里
+    let Ok(out) = std::process::Command::new("/bin/ps")
         .args(["-Ao", "pid=,etime=,comm="])
         .output()
     else {

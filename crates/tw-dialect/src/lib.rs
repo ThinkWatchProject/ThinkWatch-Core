@@ -12,5 +12,6 @@ pub mod convert;
 pub mod frame;
 pub mod gemini;
 pub mod ir;
+pub mod official;
 pub mod responses;
 pub mod think;

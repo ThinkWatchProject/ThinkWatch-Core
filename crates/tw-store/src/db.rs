@@ -130,14 +130,27 @@ impl Db {
         {
             let _ = std::fs::create_dir_all(d);
         }
+        // **先把空文件以 0600 建出来，再交给 SQLite。**让 SQLite 自己建的话，
+        // 它按 umask 给 0644，下面的 `chmod` 之前别的用户已经能打开它。
+        // `-wal`、`-shm` 由 SQLite 照主库的权限位建，主库对了它们就对了
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path);
+        }
         let conn = Connection::open(path).map_err(|source| DbError::Open {
             path: path.display().to_string(),
             source,
         })?;
         // **0600。**这个库里有每一条请求的模型、上游、token 数和花费 ——
         // 同一台机器上的别的用户不该能读走一份你的使用记录（那条
-        // 「权限就是认证」的同一个道理）。WAL 模式还会带出两个兄弟文件，
-        // 一起收。
+        // 「权限就是认证」的同一个道理）。新库上面已经建对了，这里收的是
+        // 已经存在的库；WAL 模式还会带出两个兄弟文件，一起收。
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -1,14 +1,14 @@
 //! 建数据目录，**只给自己看**。
 //!
-//! # 为什么只有 Windows 这一支
+//! # 两个平台各管什么
 //!
 //! 配置里是明文 API key（这份配置不做 keychain，见 `credential`）。unix 上
-//! 护着它的是文件自己的 `0600`，目录是不是 0755 无所谓 —— 别人顶多列出
-//! 文件名。而 `create_dir_all` 撞上默认 umask 本来就给 0755，在那边强行
-//! 收紧只会让每一个存量用户下次启动时起不来。
+//! 护着它的首先是文件自己的 `0600`（建的时候就带着，见 `store::write_atomic`）；
+//! 目录新建时给 `0700`，别人连文件名（请求正文的日期目录、历史版本）也看不到。
+//! **已经存在的目录不去动** —— 用户自己放宽过的，是他的决定。
 //!
 //! Windows 上没有 mode 位：文件的权限是从**目录**继承来的。所以那里目录的
-//! ACL 就是那份密钥的全部保护。这个不对称就是这个模块只有一支实现的原因。
+//! ACL 就是那份密钥的全部保护。
 //!
 //! # 为什么是「建的时候设好」，不是「建完再查」
 //!
@@ -44,9 +44,14 @@ pub fn create(dir: &Path) -> std::io::Result<()> {
 mod imp {
     use std::path::Path;
 
-    /// unix：照常建。护着密钥的是文件自己的 `0600`，不是这个目录。
+    /// unix：建成 `0700`。`mode` 是在 `mkdir(2)` 那一刻给的，没有先宽后收的窗口。
     pub fn create_private(dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            // 查过不在、建的时候却在了：别的进程抢先一步，和 `create_dir_all` 一样不算错
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+            r => r,
+        }
     }
 }
 
@@ -223,5 +228,17 @@ mod tests {
         let dir = d.path().join("a/b/c");
         create(&dir).unwrap();
         assert!(dir.is_dir());
+    }
+
+    /// unix 上新建的数据目录只给自己：别人连里面的文件名也列不出来。
+    #[cfg(unix)]
+    #[test]
+    fn a_new_directory_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("a/data");
+        create(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "数据目录的权限是 {mode:o}");
     }
 }

@@ -39,7 +39,10 @@ impl Decoder {
 }
 
 /// 找第一个帧结尾：返回帧内容的长度和分隔符的长度。
-fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
+///
+/// **公开给要自己攒字节的那些**（tw-guard 的还原器和工具调用审查）：它们要按帧
+/// 转发原字节，用不了 [`Decoder`]，但帧在哪儿断必须和这里认的一致。
+pub fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i + 1 < buf.len() {
         match (buf[i], buf[i + 1]) {
@@ -52,18 +55,14 @@ fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn parse(raw: &[u8]) -> Option<Frame> {
+/// 解析一帧（不含结尾的空行）。既没有 `event` 也没有 `data` 的（注释、心跳）是 `None`。
+pub fn parse(raw: &[u8]) -> Option<Frame> {
     let text = String::from_utf8_lossy(raw);
     let mut event = None;
     let mut data: Vec<&str> = Vec::new();
     for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with(':') {
+        let Some((field, value)) = field(line) else {
             continue;
-        }
-        let (field, value) = match line.split_once(':') {
-            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
-            None => (line, ""),
         };
         match field {
             "event" => event = Some(value.to_string()),
@@ -78,6 +77,24 @@ fn parse(raw: &[u8]) -> Option<Frame> {
         event,
         data: data.join("\n"),
     })
+}
+
+/// 一行里的字段名和值。**冒号后面的空格可有可无**（规范：有就去掉一个），
+/// 注释行（`:` 开头）是 `None`。
+fn field(line: &str) -> Option<(&str, &str)> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.starts_with(':') {
+        return None;
+    }
+    Some(match line.split_once(':') {
+        Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+        None => (line, ""),
+    })
+}
+
+/// 这一行是 `data` 字段的话，它的值。`data:x` 和 `data: x` 一样。
+pub fn data_of(line: &str) -> Option<&str> {
+    field(line).and_then(|(f, v)| (f == "data").then_some(v))
 }
 
 /// `event: 名字` + `data: JSON`
@@ -120,6 +137,16 @@ mod tests {
         let mut d = Decoder::default();
         assert!(d.feed(b"data: [DONE]").is_empty());
         assert_eq!(d.flush()[0].data, "[DONE]");
+    }
+
+    #[test]
+    fn a_data_field_without_the_space_is_still_data() {
+        assert_eq!(data_of("data:{\"x\":1}"), Some("{\"x\":1}"));
+        assert_eq!(data_of("data: {\"x\":1}\r"), Some("{\"x\":1}"));
+        // 只去掉一个空格
+        assert_eq!(data_of("data:  x"), Some(" x"));
+        assert_eq!(data_of("event: x"), None);
+        assert_eq!(data_of(": data: x"), None);
     }
 
     #[test]

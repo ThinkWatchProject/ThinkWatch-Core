@@ -301,7 +301,7 @@ pub fn spawn(s: ControlState) {
 pub async fn refresh(s: &ControlState) -> Result<usize, RefreshError> {
     let u = s.price_updater.clone();
     let _one = u.running.lock().await;
-    let result = match fetch(s.http(), &u.url).await {
+    let result = match fetch(&u.url).await {
         Ok(raw) => {
             let s = s.clone();
             // 解析两 MB 的 JSON、写文件：都不该占着异步线程
@@ -315,7 +315,10 @@ pub async fn refresh(s: &ControlState) -> Result<usize, RefreshError> {
     result
 }
 
-async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, RefreshError> {
+/// **不用数据面那个客户端**：那个不跟重定向（它发的请求带凭据）。这里什么
+/// 凭据都不带，托管地址搬了家 GitHub 回的是 301，跟过去才拉得到。
+async fn fetch(url: &str) -> Result<Vec<u8>, RefreshError> {
+    let http = tw_gateway::public_client().map_err(|e| RefreshError::Unreachable(e.detail.text))?;
     let mut resp = http
         .get(url)
         .timeout(FETCH_TIMEOUT)

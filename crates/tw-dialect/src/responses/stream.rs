@@ -448,7 +448,7 @@ impl Writer {
                 self.start(&mut out);
                 self.finished = true;
                 let mut r = envelope(&self.id, self.created, &self.model, "failed");
-                r["error"] = json!({ "code": "server_error", "message": message });
+                r["error"] = failure(500, message);
                 self.emit("response.failed", json!({ "response": r }), &mut out);
             }
         }
@@ -616,6 +616,30 @@ impl Writer {
         self.emit(kind, json!({ "response": r }), &mut out);
         out
     }
+}
+
+/// 失败时 `response.error` 那一项。**Codex 按 `code` 决定退不退避**：429 说成
+/// `server_error` 的话它会立刻重试，而该做的是等一等
+fn failure(status: u16, message: &str) -> Value {
+    let code = match status {
+        429 => "rate_limit_exceeded",
+        _ => "server_error",
+    };
+    json!({ "code": code, "message": message })
+}
+
+/// 流里的一个错误帧：`response.failed`。**不是 Chat 形状的 `{"error":…}`** ——
+/// Responses 的客户端按事件类型分派，认不出的帧直接跳过，流就像是没说完一样断了。
+///
+/// 独立写出的这一帧不知道这条流的响应 id 和序号，所以 id 是新的、序号从 0 起；
+/// 客户端认的是事件类型和 `response.error`。
+pub(crate) fn error_frame(status: u16, message: &str) -> String {
+    let mut r = envelope(&response_id(None), unix_secs(), "", "failed");
+    r["error"] = failure(status, message);
+    frame::named(
+        "response.failed",
+        &json!({ "type": "response.failed", "sequence_number": 0, "response": r }),
+    )
 }
 
 #[cfg(test)]

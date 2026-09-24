@@ -245,9 +245,7 @@ impl Writer {
             Event::Stop(s) => self.stop = Some(s.clone()),
             Event::Error { message } => {
                 self.done = true;
-                out.push_str(&frame::data(&json!({
-                    "error": { "message": message, "type": "server_error", "param": null, "code": null },
-                })));
+                out.push_str(&error_frame(500, message));
             }
         }
         out
@@ -280,6 +278,11 @@ impl Writer {
         out.push_str("data: [DONE]\n\n");
         out
     }
+}
+
+/// 流里的一个错误帧：Chat 的流没有事件名，错误和别的块一样只是一行 `data:`
+pub(crate) fn error_frame(status: u16, message: &str) -> String {
+    frame::data(&super::response::error_body(status, message))
 }
 
 #[cfg(test)]

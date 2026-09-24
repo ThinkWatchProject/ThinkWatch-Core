@@ -47,7 +47,7 @@ pub use limits::Gate;
 pub use listen::{Listening, bind_failure, serve_at};
 pub use probe::{ModelList, ProbeResult, probe};
 pub use quote::Quote;
-pub use server::{AppState, Runtime, client_for_provider, router, serve};
+pub use server::{AppState, Runtime, client_for_provider, public_client, router, serve};
 
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";

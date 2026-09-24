@@ -636,7 +636,7 @@ fn now_ms() -> u64 {
 
 fn write_sidecar(path: &Path, rec: &SidecarRecord) -> Result<(), ForeignError> {
     let text = serde_json::to_string_pretty(rec).unwrap_or_default();
-    std::fs::write(path, text).map_err(|source| ForeignError::Write {
+    crate::foreign::write_private(path, text.as_bytes()).map_err(|source| ForeignError::Write {
         path: path.to_path_buf(),
         source,
     })?;
