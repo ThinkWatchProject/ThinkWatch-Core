@@ -17,7 +17,8 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tw_types::{Msg, msg};
 
-use crate::server::{AppState, now_ms, router};
+use crate::server::{now_ms, router};
+use crate::state::AppState;
 
 /// 此刻在听的地址，和上一次换监听为什么没换成。
 #[derive(Debug, Clone, Default, PartialEq)]

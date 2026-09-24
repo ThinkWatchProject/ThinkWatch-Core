@@ -96,6 +96,61 @@ impl Latency {
     }
 }
 
+/// 给 `url-test` 组的成员垫一个底（样本不够时用零成本的 L1 补）。
+///
+/// **只测 `url-test` 组里的那些，启动时和之后每天各测一次**（跟着模型清单
+/// 的刷新一起跑，见 [`crate::models::spawn`]）。
+/// 没有这一步的话，`url-test` 在攒够真实样本之前完全等同于 `fallback`
+/// —— 用户配了「选最快的」，而头几十个请求全落在配置里排第一那家。
+///
+/// L1 是握手计时，不发一个 API 请求、不花一分钱；也**不是定期
+/// 跑的** —— 真实流量一到就该由它说了算。
+pub async fn seed_url_test(state: &crate::state::AppState) {
+    let rt = state.runtime();
+    let mut want: Vec<String> = Vec::new();
+    for g in rt.engine.groups() {
+        if g.kind == tw_engine::GroupType::UrlTest {
+            want.extend(g.providers.iter().cloned());
+        }
+    }
+    want.sort();
+    want.dedup();
+    if want.is_empty() {
+        return;
+    }
+    for name in want {
+        // 停用的不参与路由，用不着垫
+        let Some(p) = rt
+            .config
+            .providers
+            .iter()
+            .find(|p| p.name == name && !p.disabled)
+        else {
+            continue;
+        };
+        // 走代理的那家要测它真正会走的那条路。`system` 测不了，
+        // 那时不垫底 —— 假装直连测一遍给的数字，测的根本不是那条路
+        let hop = match crate::l1::hop_for(&rt.config, p) {
+            Ok(h) => h,
+            Err(why) => {
+                tracing::debug!(provider = %name, %why, "this upstream cannot be link-tested, so no latency sample is seeded");
+                continue;
+            }
+        };
+        let r = crate::l1::l1(&p.base_url, hop.as_ref()).await;
+        if r.ok {
+            tracing::debug!(provider = %name, ms = r.total_ms, "seeding a latency sample from the link test");
+            state
+                .latency
+                .seed(&name, r.total_ms.min(u32::MAX as u64) as u32);
+        } else {
+            // **连都连不上的那家不垫。**它会因为「没样本」排在最后，
+            // 而那正是对的
+            tracing::debug!(provider = %name, "the link test could not connect, so no latency sample is seeded");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
