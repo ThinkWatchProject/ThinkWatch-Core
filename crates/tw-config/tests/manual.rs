@@ -547,7 +547,10 @@ fn the_manual_is_what_the_code_says() {
         ("docs/config.zh-CN.md", Lang::Zh),
     ] {
         let path = workspace().join(file);
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
+        // Windows 上的检出可能把换行转成了 CRLF，比的是内容不是换行
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{file}: {e}"))
+            .replace("\r\n", "\n");
         let (next, used) = match regenerate(&text, l, &all) {
             Ok(x) => x,
             Err(e) => {
@@ -607,7 +610,9 @@ fn the_examples_in_the_manual_parse() {
         "docs/server.md",
         "docs/server.zh-CN.md",
     ] {
-        let text = std::fs::read_to_string(workspace().join(file)).unwrap();
+        let text = std::fs::read_to_string(workspace().join(file))
+            .unwrap()
+            .replace("\r\n", "\n");
         let mut rest = text.as_str();
         while let Some(i) = rest.find("```yaml\n") {
             let body = &rest[i + 8..];
