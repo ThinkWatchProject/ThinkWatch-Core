@@ -66,7 +66,9 @@ impl McpError {
 pub struct Target {
     pub client: &'static str,
     pub name: &'static str,
-    pub config: Loc,
+    /// 按优先级从高到低；读写的是在的里面最高的那一个，见
+    /// [`crate::paths::first_existing`]
+    pub config: &'static [Loc],
     pub format: Format,
     /// server 挂在哪个键下面
     pub key: &'static str,
@@ -101,7 +103,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "claude-code",
             name: "Claude Code",
-            config: Loc::Home(".claude.json"),
+            config: &[Loc::Home(".claude.json")],
             format: Format::Json,
             key: "mcpServers",
             copyable: true,
@@ -110,7 +112,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "claude-desktop",
             name: "Claude Desktop",
-            config: crate::paths::CLAUDE_DESKTOP_CONFIG,
+            config: &[crate::paths::CLAUDE_DESKTOP_CONFIG],
             format: Format::Json,
             key: "mcpServers",
             copyable: true,
@@ -119,7 +121,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "cursor",
             name: "Cursor",
-            config: Loc::Home(".cursor/mcp.json"),
+            config: &[Loc::Home(".cursor/mcp.json")],
             format: Format::Json,
             key: "mcpServers",
             copyable: true,
@@ -128,7 +130,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "codex",
             name: "Codex",
-            config: Loc::Home(".codex/config.toml"),
+            config: &[Loc::Home(".codex/config.toml")],
             format: Format::Toml,
             key: "mcp_servers",
             copyable: true,
@@ -137,7 +139,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "opencode",
             name: "opencode",
-            config: crate::paths::OPENCODE_CONFIG,
+            config: crate::paths::OPENCODE_CONFIGS,
             format: Format::Json,
             key: "mcp",
             copyable: false,
@@ -149,7 +151,7 @@ pub fn targets() -> Vec<Target> {
         Target {
             client: "zed",
             name: "Zed",
-            config: crate::paths::ZED_SETTINGS,
+            config: &[crate::paths::ZED_SETTINGS],
             format: Format::Json,
             key: "context_servers",
             copyable: false,
@@ -170,7 +172,13 @@ pub fn target(client: &str) -> Result<Target, McpError> {
 
 impl Target {
     pub fn path(&self, home: &Path) -> PathBuf {
-        self.config.resolve(home)
+        self.config[crate::paths::first_existing(self.config, home)].resolve(home)
+    }
+    /// 给人看的路径。
+    pub fn shown(&self) -> String {
+        let i =
+            crate::paths::env_home().map_or(0, |h| crate::paths::first_existing(self.config, &h));
+        self.config[i].shown()
     }
     fn check(&self) -> Result<(), McpError> {
         if self.copyable {

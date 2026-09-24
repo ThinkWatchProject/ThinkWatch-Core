@@ -104,8 +104,9 @@ impl Verified {
 pub struct Client {
     pub id: &'static str,
     pub name: &'static str,
-    /// 配置文件
-    pub config: Loc,
+    /// 配置文件。**多数只有一个**；同一份配置能写在几个文件里的（opencode），
+    /// 按优先级从高到低列全，写哪一个见 [`Client::config_index`]。
+    pub config: &'static [Loc],
     pub format: Format,
     pub takes_effect: TakesEffect,
     /// 优先级比主配置更高、会盖住我们的那些文件（诊断链）。
@@ -219,7 +220,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "claude-code",
             name: "Claude Code",
-            config: Loc::Home(".claude/settings.json"),
+            config: &[Loc::Home(".claude/settings.json")],
             format: Format::Json,
             takes_effect: TakesEffect::Immediately,
             // **`settings.local.json` 优先级更高。**cc-switch #6828 栽在这里
@@ -261,7 +262,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "codex",
             name: "Codex",
-            config: Loc::Home(".codex/config.toml"),
+            config: &[Loc::Home(".codex/config.toml")],
             format: Format::Toml,
             // **读环境变量的，必须关掉终端重开**
             takes_effect: TakesEffect::OnRestart,
@@ -289,7 +290,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "opencode",
             name: "opencode",
-            config: crate::paths::OPENCODE_CONFIG,
+            config: crate::paths::OPENCODE_CONFIGS,
             format: Format::Json,
             takes_effect: TakesEffect::OnRestart,
             shadowed_by: &[],
@@ -307,7 +308,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "zed",
             name: "Zed",
-            config: crate::paths::ZED_SETTINGS,
+            config: &[crate::paths::ZED_SETTINGS],
             format: Format::Json,
             takes_effect: TakesEffect::Immediately,
             shadowed_by: &[],
@@ -330,7 +331,7 @@ pub fn adoptable() -> Vec<Client> {
         Client {
             id: "aider",
             name: "Aider",
-            config: Loc::Home(".aider.conf.yml"),
+            config: &[Loc::Home(".aider.conf.yml")],
             format: Format::Yaml,
             takes_effect: TakesEffect::OnRestart,
             // **三层查找，后面的覆盖前面的**（home → 仓库根 → cwd）。
@@ -657,7 +658,8 @@ impl Client {
     /// **没检测到它的时候也要给。**配置文件不在默认位置、或者装在别的
     /// 用户目录下时，检测不到不等于用不了 —— 照着做一样能接上。
     pub fn manual_steps(&self) -> Vec<Msg> {
-        let file = self.config.shown();
+        let i = crate::paths::env_home().map_or(0, |h| self.config_index(&h));
+        let file = self.config[i].shown();
         let mut out = vec![msg!(
             "adopt.manual.file", file = file =>
             "Open {file} and set the fields below."
@@ -683,13 +685,40 @@ impl Client {
             .unwrap_or_else(|| gw.base.clone())
     }
 
-    pub fn config_path(&self, home: &std::path::Path) -> PathBuf {
-        self.config.resolve(home)
+    /// [`Client::config`] 里写哪一个。
+    ///
+    /// **接管过的那一个优先**：接管之后用户才建了一份优先级更高的文件时，
+    /// 我们的记录和能还原的原文都在原来那一个旁边 —— 换过去就既还原不了，
+    /// 也会把「被盖住了」报成「没接管过」。没接管过就挑在的里面优先级最高的，
+    /// 这正是客户端自己要写全局配置时挑的那一个（见 `paths::OPENCODE_CONFIGS`）。
+    pub fn config_index(&self, home: &std::path::Path) -> usize {
+        if self.config.len() > 1 {
+            let ours = |l: &Loc| {
+                let p = l.resolve(home);
+                let real = crate::foreign::resolve(&p).unwrap_or(p);
+                std::fs::read_to_string(crate::sentinel::sidecar_path(&real))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<crate::sentinel::SidecarRecord>(&t).ok())
+                    .is_some_and(|r| r.client == self.id)
+            };
+            if let Some(i) = self.config.iter().position(ours) {
+                return i;
+            }
+        }
+        crate::paths::first_existing(self.config, home)
     }
+
+    pub fn config_path(&self, home: &std::path::Path) -> PathBuf {
+        self.config[self.config_index(home)].resolve(home)
+    }
+    /// 优先级比写的那一个更高的文件：固定的那几个（`settings.local.json`），
+    /// 加上同一份配置里排在它前面的文件名。
     pub fn shadow_paths(&self, home: &std::path::Path) -> Vec<PathBuf> {
+        let above = &self.config[..self.config_index(home)];
         self.shadowed_by
             .iter()
             .map(|p| crate::paths::under(home, p))
+            .chain(above.iter().map(|l| l.resolve(home)))
             .collect()
     }
     /// 注释前缀。JSON 没有 —— 那时哨兵走旁文件。
@@ -871,7 +900,7 @@ mod tests {
         for c in adoptable() {
             let steps = c.manual_steps();
             // 写法按平台（`~/…` 或 `%USERPROFILE%\…`），各自的样子见 paths 里那条测试
-            assert_eq!(steps[0].arg("file"), c.config.shown(), "{}", c.id);
+            assert_eq!(steps[0].arg("file"), c.config[0].shown(), "{}", c.id);
             assert!(!edits(&c, &gw).is_empty(), "{}：没有要写的字段", c.id);
         }
         // Zed 的密钥不在配置文件里，多一步在它自己的设置里填

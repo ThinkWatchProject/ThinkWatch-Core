@@ -515,7 +515,7 @@ pub async fn mcp_targets(State(_s): State<ControlState>) -> Json<Vec<tw_api::Mcp
             .map(|t| tw_api::McpTargetView {
                 client: t.client.to_string(),
                 name: t.name.to_string(),
-                path: t.config.shown(),
+                path: t.shown(),
                 copyable: t.copyable,
                 why_not: t.why_not(),
             })
