@@ -11,17 +11,18 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::put;
 use serde_yaml_ng::Value;
 use tw_config::edit;
 use tw_config::history::Origin;
 use tw_yaml::Step;
 
+use crate::contract::RouterExt;
 use crate::{ControlState, Fail, apply_fail, fail};
+use tw_api::ep;
 use tw_types::msg;
 
 pub fn router() -> axum::Router<ControlState> {
-    axum::Router::new().route("/listen", put(save))
+    axum::Router::new().at(ep::SaveListen, save)
 }
 
 async fn save(

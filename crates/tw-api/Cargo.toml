@@ -14,3 +14,13 @@ serde_json = { workspace = true }
 # tw-adopt 都只依赖 tw-types），而契约这一层反过来依赖它没有问题 ——
 # tw-types 自己零依赖。
 tw-types = { workspace = true }
+ts-rs = { workspace = true, optional = true }
+
+[features]
+# 把契约导出成 TypeScript：`tw_api::ts::export_all(dir)`。**默认关** ——
+# 只有桌面端生成前端类型时开，core 自己和企业版都不背 ts-rs。
+ts = ["dep:ts-rs", "tw-types/ts"]
+
+[[example]]
+name = "export_ts"
+required-features = ["ts"]

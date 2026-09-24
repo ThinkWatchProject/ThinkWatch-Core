@@ -285,7 +285,7 @@ pub fn spawn_watcher(
 /// 是「显示哪个表单」，而不是精确到字段。
 pub async fn path_at(
     axum::extract::State(s): axum::extract::State<crate::ControlState>,
-    axum::extract::Query(q): axum::extract::Query<AtQuery>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::ConfigAtQuery>,
 ) -> Result<axum::Json<tw_api::ConfigAt>, crate::Fail> {
     let cur = s.cfg.current().map_err(crate::unreadable_config)?;
     let path = tw_yaml::path_at(&cur.text, q.offset.min(cur.text.len()));
@@ -307,11 +307,6 @@ pub async fn path_at(
         }
     }
     Ok(axum::Json(out))
-}
-
-#[derive(serde::Deserialize)]
-pub struct AtQuery {
-    pub offset: usize,
 }
 
 /// 把 `/providers/relay-cn/base_url` 这样的路径解析成 `tw-yaml` 的步骤。
