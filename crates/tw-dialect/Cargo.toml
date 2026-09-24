@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Request, response and stream conversion between Anthropic Messages, OpenAI Chat Completions, OpenAI Responses and Gemini"
 
 [dependencies]

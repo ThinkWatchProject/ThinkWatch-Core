@@ -5,7 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Self-contained local AI gateway binary, and the engine behind ThinkWatch Lite"
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Self-contained AI gateway binary: the local gateway behind ThinkWatch Lite, or a standalone gateway on a server"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 tw-config = { workspace = true }
