@@ -37,7 +37,10 @@ impl ProxyKind {
     }
 }
 
+/// 写错的字段名是错误，和配置的其余部分一样（见 `Config` 上那段）：`passwd`
+/// 被静默丢掉的话，表现是代理一直 407，而配置文件里看着什么都写了。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyAuth {
     pub user: String,
     /// 支持 `${ENV}`，和上游的密钥同一套
@@ -45,6 +48,7 @@ pub struct ProxyAuth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proxy {
     pub name: String,
     #[serde(default, rename = "type")]
@@ -196,6 +200,22 @@ mod tests {
                 .unwrap()
                 .contains("hunter2")
         );
+    }
+
+    /// `typ: http` 被悄悄丢掉的话，代理按默认的 socks5h 去连一个 HTTP 代理，
+    /// 报的是连不上，而配置文件里看着明明写了类型。
+    #[test]
+    fn a_misspelled_proxy_field_is_an_error_that_names_it() {
+        let e = serde_yaml_ng::from_str::<Proxy>("{name: p, addr: '127.0.0.1:7890', typ: http}")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("typ"), "{e}");
+        let e = serde_yaml_ng::from_str::<Proxy>(
+            "{name: p, addr: '127.0.0.1:7890', auth: {user: a, passwd: b}}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("passwd"), "{e}");
     }
 
     #[test]

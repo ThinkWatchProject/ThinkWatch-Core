@@ -228,7 +228,7 @@ async fn the_overview_says_which_proxy_is_down_and_why() {
     let dead = dead_addr();
     let d = tempfile::tempdir().unwrap();
     let yaml = format!(
-        "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-k\nproxies:\n  - name: 代理一\n    kind: http\n    addr: {dead}\nproviders:\n  - name: 中转\n    base_url: http://127.0.0.1:9\n    protocol: anthropic\n    key: sk-x\n    proxy: 代理一\n"
+        "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-k\nproxies:\n  - name: 代理一\n    type: http\n    addr: {dead}\nproviders:\n  - name: 中转\n    base_url: http://127.0.0.1:9\n    protocol: anthropic\n    key: sk-x\n    proxy: 代理一\n"
     );
     let (gw, app) = control(&d, &yaml, None);
     let mut rx = gw.bus.subscribe();
