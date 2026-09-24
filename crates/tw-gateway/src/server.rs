@@ -222,28 +222,28 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Resu
 /// 上游回了话的一跳：`served` 或者 `status`。
 pub(crate) fn hop(
     provider: &str,
-    outcome: &str,
+    outcome: tw_api::AttemptOutcome,
     status: u16,
     started: std::time::Instant,
 ) -> tw_api::AttemptView {
     tw_api::AttemptView {
         provider: provider.to_string(),
-        outcome: outcome.to_string(),
+        outcome,
         status: Some(status),
         error: None,
         ms: started.elapsed().as_millis() as u64,
     }
 }
 
-/// 没有收到响应的一跳。
+/// 没有收到响应的一跳。`error` 和这一跳报给客户端的那条错误是同一句。
 pub(crate) fn hop_failed(
     provider: &str,
-    error: String,
+    error: tw_types::Msg,
     started: std::time::Instant,
 ) -> tw_api::AttemptView {
     tw_api::AttemptView {
         provider: provider.to_string(),
-        outcome: "error".to_string(),
+        outcome: tw_api::AttemptOutcome::Error,
         status: None,
         error: Some(error),
         ms: started.elapsed().as_millis() as u64,
@@ -283,7 +283,11 @@ pub(crate) fn flagged(
         custom: v.custom,
         why: v.why.clone(),
         excerpt: v.excerpt.clone(),
-        action: if v.cut { "cut" } else { "record" }.to_string(),
+        action: if v.cut {
+            tw_api::RuleAction::Cut
+        } else {
+            tw_api::RuleAction::Record
+        },
         blocked,
         at_ms: now_ms(),
     }

@@ -190,7 +190,7 @@ async fn test_provider(
     let p = to_provider(&req.provider, existing).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     let protocol = p.effective_protocol();
     let via = (p.proxy != tw_config::DIRECT).then(|| p.proxy.clone());
-    let failed = |error: String| tw_api::ProviderTestResult {
+    let failed = |error: Msg| tw_api::ProviderTestResult {
         ok: false,
         protocol: protocol.map(|x| x.slug().to_string()),
         latency_ms: 0,
@@ -200,7 +200,7 @@ async fn test_provider(
     };
     let http = match tw_gateway::client_for_provider(&cfg, &p) {
         Ok(h) => h,
-        Err(e) => return Ok(Json(failed(e.message().to_string()))),
+        Err(e) => return Ok(Json(failed(e.detail))),
     };
     // OAuth 的 token：新填的那份只能用现成的 access token；沿用原来那份时走网关，
     // **按原来的名字换** —— 缓存和轮换写回都认名字，而表单里可能刚改了名
@@ -211,25 +211,30 @@ async fn test_provider(
             match access.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
                 Some(a) => Some(a.to_string()),
                 None => {
-                    return Ok(Json(failed(
-                        "An OAuth credential has to be saved before it can be checked. To check it now, \
-                 fill in an access token as well."
-                            .to_string(),
-                    )));
+                    return Ok(Json(failed(msg!(
+                        "control.provider_test.oauth_unsaved" =>
+                        "An OAuth credential has to be saved before it can be checked. To check it \
+                         now, fill in an access token as well."
+                    ))));
                 }
             }
         }
         (tw_api::OAuthChange::Keep, Some(e)) if e.oauth.is_some() && p.oauth.is_some() => {
             match s.gateway.oauth_token_for(e, &http).await {
                 Ok(t) => Some(t),
-                Err(e) => return Ok(Json(failed(e))),
+                Err(e) => {
+                    return Ok(Json(failed(msg!(
+                        "control.provider_test.credentials", detail = e =>
+                        "The credential could not be obtained: {detail}"
+                    ))));
+                }
             }
         }
         _ => None,
     };
     let headers = match p.outbound_headers(token.as_deref()) {
         Ok(h) => h,
-        Err(e) => return Ok(Json(failed(e.to_string()))),
+        Err(e) => return Ok(Json(failed(e.msg()))),
     };
     let r = tw_gateway::probe(&http, &p.base_url, &headers, protocol).await;
     Ok(Json(tw_api::ProviderTestResult {
@@ -292,7 +297,7 @@ fn models_view(
     tw_api::ProviderModelsView {
         provider: p.name.clone(),
         source: listing.source.slug().to_string(),
-        status: listing.status.slug().to_string(),
+        status: crate::model_status(listing.status),
         fetching: listing.fetching,
         checked_at_ms: listing.checked_at_ms,
         error: listing.error,

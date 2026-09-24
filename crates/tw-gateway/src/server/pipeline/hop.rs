@@ -41,8 +41,8 @@ struct Outbound {
     session: Option<tw_dialect::convert::Session>,
 }
 
-/// 这一跳没发出去的原因：给尝试链的一句，和给客户端的那个错误。
-type Skip = (String, GatewayError);
+/// 这一跳没发出去的原因。尝试链里记的和报给客户端的是同一句。
+type Skip = GatewayError;
 
 pub(super) async fn try_upstreams<'a>(
     state: &AppState,
@@ -73,8 +73,8 @@ pub(super) async fn try_upstreams<'a>(
         attempts.push(provider.name.clone());
         let hop_started = std::time::Instant::now();
 
-        if let Some((why, err)) = protocol_mismatch(req, reading.generates, provider) {
-            chain.push(hop_failed(&provider.name, why, hop_started));
+        if let Some(err) = protocol_mismatch(req, reading.generates, provider) {
+            chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
             last_err = Some(err);
             continue;
         }
@@ -105,8 +105,8 @@ pub(super) async fn try_upstreams<'a>(
 
         let out = match prepare(state, req, reading, provider, &effective_set, id) {
             Ok(out) => out,
-            Err((why, err)) => {
-                chain.push(hop_failed(&provider.name, why, hop_started));
+            Err(err) => {
+                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
                 last_err = Some(err);
                 continue;
             }
@@ -132,15 +132,12 @@ pub(super) async fn try_upstreams<'a>(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
-                chain.push(hop_failed(
-                    &provider.name,
-                    format!("the credential could not be obtained: {e}"),
-                    hop_started,
-                ));
-                last_err = Some(GatewayError::config(msg!(
+                let err = GatewayError::config(msg!(
                     "gw.credentials.failed", upstream = provider.name.clone(), detail = e =>
                     "The credential for upstream `{upstream}` could not be obtained: {detail}"
-                )));
+                ));
+                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                last_err = Some(err);
                 continue;
             }
         };
@@ -172,7 +169,7 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 chain.push(hop(
                     &provider.name,
-                    "status",
+                    tw_api::AttemptOutcome::Status,
                     r.status().as_u16(),
                     hop_started,
                 ));
@@ -200,7 +197,7 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 chain.push(hop(
                     &provider.name,
-                    "served",
+                    tw_api::AttemptOutcome::Served,
                     r.status().as_u16(),
                     hop_started,
                 ));
@@ -222,11 +219,7 @@ pub(super) async fn try_upstreams<'a>(
                 // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                 state.check_proxy(&provider.proxy);
                 let err = forward::map_reqwest_error(e);
-                chain.push(hop_failed(
-                    &provider.name,
-                    err.message().to_string(),
-                    hop_started,
-                ));
+                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
                 last_err = Some(err);
                 continue;
             }
@@ -293,21 +286,13 @@ fn protocol_mismatch(
     if a.protocol() == p {
         return None;
     }
-    let why = format!(
-        "{} can only be served by a {} upstream",
-        req.uri.path(),
-        a.slug()
-    );
-    Some((
-        why,
-        GatewayError::new(
-            crate::error::Source::Request,
-            msg!(
-                "gw.route.protocol_mismatch",
-                path = req.uri.path(), wanted = a.slug(),
-                upstream = provider.name.clone(), got = p.slug() =>
-                "{path} can only be served by a {wanted} upstream, and `{upstream}` is {got}."
-            ),
+    Some(GatewayError::new(
+        crate::error::Source::Request,
+        msg!(
+            "gw.route.protocol_mismatch",
+            path = req.uri.path(), wanted = a.slug(),
+            upstream = provider.name.clone(), got = p.slug() =>
+            "{path} can only be served by a {wanted} upstream, and `{upstream}` is {got}."
         ),
     ))
 }
@@ -393,15 +378,12 @@ fn prepare(
                         Some(Err(rej)) => rej.0.clone(),
                         _ => "the request body is not valid JSON".to_string(),
                     };
-                    return Err((
-                        format!("could not be converted to {}: {why}", dialect.slug()),
-                        GatewayError::new(
-                            crate::error::Source::Request,
-                            msg!(
-                                "gw.convert.failed", upstream = provider.name.clone(), detail = why =>
-                                "The request could not be converted to the format upstream \
-                                 `{upstream}` speaks: {detail}"
-                            ),
+                    return Err(GatewayError::new(
+                        crate::error::Source::Request,
+                        msg!(
+                            "gw.convert.failed", upstream = provider.name.clone(), detail = why =>
+                            "The request could not be converted to the format upstream \
+                             `{upstream}` speaks: {detail}"
                         ),
                     ));
                 }

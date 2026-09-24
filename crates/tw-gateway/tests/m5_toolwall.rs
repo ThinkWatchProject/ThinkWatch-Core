@@ -136,7 +136,7 @@ async fn flagged(
             ..
         } = ev
         {
-            return Some((action == "cut", blocked, tool, rule));
+            return Some((action == tw_api::RuleAction::Cut, blocked, tool, rule));
         }
     }
     None

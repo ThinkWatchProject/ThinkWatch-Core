@@ -19,7 +19,7 @@ use tw_api::Msg;
 
 /// 当前 schema 版本。**表的样子一变就加一，改 [`Db::create`] 里那一份。**
 /// 不写迁移：项目还没有存量用户，版本对不上的库整个重建。
-const SCHEMA: i64 = 18;
+const SCHEMA: i64 = 19;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -697,7 +697,7 @@ impl Db {
             params![
                 e.at_ms,
                 e.request_id,
-                e.guard,
+                e.guard.slug(),
                 e.rule,
                 e.custom as i64,
                 e.action,
@@ -1088,8 +1088,7 @@ pub struct Summary {
 pub struct SecurityEvent {
     pub at_ms: i64,
     pub request_id: i64,
-    /// `redact` / `inspect_tools` / `hidden_text` / `content` / `output_limit`
-    pub guard: String,
+    pub guard: tw_api::Guard,
     /// 内置规则的 id，或者自定义规则的名字
     pub rule: String,
     pub custom: bool,
@@ -1118,7 +1117,16 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         id: r.get(0)?,
         at_ms: r.get(1)?,
         request_id: r.get(2)?,
-        guard: r.get(3)?,
+        guard: {
+            let g: String = r.get(3)?;
+            tw_api::Guard::from_slug(&g).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    format!("`{g}` is not a guard").into(),
+                )
+            })?
+        },
         rule: r.get(4)?,
         custom: r.get::<_, i64>(5)? != 0,
         action: r.get(6)?,

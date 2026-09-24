@@ -24,47 +24,8 @@ use tw_types::{Msg, msg};
 /// 一句「8 秒超时」和「TLS 握手 8 秒没完成」的可修复性差得远。
 const PHASE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 建连的哪一步。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Step {
-    /// 地址或代理配置用不了，还没有开始建连
-    Config,
-    Dns,
-    Tcp,
-    Tls,
-    /// 代理协议的握手，含认证
-    Handshake,
-}
-
-impl Step {
-    pub fn slug(&self) -> &'static str {
-        match self {
-            Step::Config => "config",
-            Step::Dns => "dns",
-            Step::Tcp => "tcp",
-            Step::Tls => "tls",
-            Step::Handshake => "handshake",
-        }
-    }
-}
-
-/// 这一步对着谁。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Peer {
-    Upstream,
-    Proxy,
-}
-
-impl Peer {
-    pub fn slug(&self) -> &'static str {
-        match self {
-            Peer::Upstream => "upstream",
-            Peer::Proxy => "proxy",
-        }
-    }
-}
+/// 建连的哪一步、对着谁、为什么缺一步：契约里的那几个集合，这里直接用。
+pub use tw_api::{L1Peer as Peer, L1SkipReason as SkipReason, L1Step as Step};
 
 /// 建连的一步，连同它对着谁。**失败时报的就是它**：「卡在到代理的 TCP
 /// 握手」和「卡在上游的 TLS 握手」该去修的地方完全不同。
@@ -95,39 +56,6 @@ impl Stage {
     }
 }
 
-/// 某一步为什么没有出现在分段里。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkipReason {
-    /// `http://` 地址没有 TLS
-    PlainHttp,
-    /// 地址已经是 IP，不需要解析
-    IpAddress,
-    /// `socks5h` 和 HTTP CONNECT 把域名交给代理解析
-    ProxyResolves,
-}
-
-impl SkipReason {
-    pub fn slug(&self) -> &'static str {
-        match self {
-            SkipReason::PlainHttp => "plain_http",
-            SkipReason::IpAddress => "ip_address",
-            SkipReason::ProxyResolves => "proxy_resolves",
-        }
-    }
-
-    /// 命令行里的说法。
-    pub fn label(&self) -> &'static str {
-        match self {
-            SkipReason::PlainHttp => "an http:// address has no TLS handshake",
-            SkipReason::IpAddress => "already an IP address, so no DNS lookup",
-            SkipReason::ProxyResolves => {
-                "the proxy resolves the name, so there is no local DNS lookup"
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Segment {
     pub stage: Stage,
@@ -139,6 +67,19 @@ pub struct Segment {
 pub struct Skip {
     pub stage: Stage,
     pub reason: SkipReason,
+}
+
+impl Skip {
+    /// 命令行里的说法。
+    pub fn label(&self) -> &'static str {
+        match self.reason {
+            SkipReason::PlainHttp => "an http:// address has no TLS handshake",
+            SkipReason::IpAddress => "already an IP address, so no DNS lookup",
+            SkipReason::ProxyResolves => {
+                "the proxy resolves the name, so there is no local DNS lookup"
+            }
+        }
+    }
 }
 
 /// **分段是个列表而不是固定的三个字段**，因为走代理时的形状本来就不同：
