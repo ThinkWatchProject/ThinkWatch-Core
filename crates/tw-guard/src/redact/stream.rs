@@ -321,8 +321,9 @@ mod tests {
         let rules = RuleSet::none()
             .with_labeled("email", r"[a-z]+@[a-z]+\.com", Some("EMAIL"))
             .unwrap();
-        let l =
-            crate::redact::replace::redact_plain("找 a@b.com", &rules, Ledger::new(scheme)).ledger;
+        let t = "找 a@b.com";
+        let hits = crate::redact::rules::scan_plain(t, &rules);
+        let l = crate::redact::replace::apply(t, &hits, Ledger::new(scheme)).ledger;
         let mut r = Restorer::new(&l);
         assert_eq!(r.process("Hello {{ name }}, {{EMA"), "Hello {{ name }}, ");
         assert_eq!(r.process("IL_1}} 好"), "a@b.com 好");

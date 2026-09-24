@@ -268,9 +268,7 @@ impl Writer {
                 self.stop = Some(s.clone());
                 String::new()
             }
-            Event::Error { message } => {
-                frame::named("modelStreamErrorException", &json!({ "message": message }))
-            }
+            Event::Error { message } => error_frame(message),
         }
     }
 
@@ -290,6 +288,11 @@ impl Writer {
         ));
         out
     }
+}
+
+/// 流里的一个错误帧
+pub(crate) fn error_frame(message: &str) -> String {
+    frame::named("modelStreamErrorException", &json!({ "message": message }))
 }
 
 #[cfg(test)]

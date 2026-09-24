@@ -1587,7 +1587,8 @@ async fn an_error_comes_back_in_the_dialect_the_client_speaks() {
     .json()
     .await
     .unwrap();
-    assert_eq!(v["error"]["status"], "UNAVAILABLE", "{v}");
+    // 状态和码是同一张表（gRPC 的 HTTP 映射）：500 是 INTERNAL
+    assert_eq!(v["error"]["status"], "INTERNAL", "{v}");
     assert_eq!(v["error"]["code"], 500, "{v}");
 }
 

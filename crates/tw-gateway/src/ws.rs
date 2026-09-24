@@ -75,19 +75,16 @@ pub fn is_upgrade(headers: &axum::http::HeaderMap) -> bool {
 }
 
 /// 把 `http(s)://host/path` 换成 `ws(s)://host/path`。
+///
+/// **地址先按 HTTP 那条路拼**（[`crate::forward::upstream_url`]），再换协议头 ——
+/// 查询串里的 `key=` 是网关密钥，HTTP 那条路会剔掉它；这里另写一份拼法的话，
+/// 就会漏掉这一步，把密钥发给上游。
 pub fn upstream_url(base: &str, path: &str, query: Option<&str>) -> String {
-    let scheme = if base.starts_with("https://") {
-        "wss://"
+    let http = crate::forward::upstream_url(base, path, query);
+    if let Some(rest) = http.strip_prefix("https://") {
+        format!("wss://{rest}")
     } else {
-        "ws://"
-    };
-    let host = base
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    match query {
-        Some(q) if !q.is_empty() => format!("{scheme}{host}{path}?{q}"),
-        _ => format!("{scheme}{host}{path}"),
+        format!("ws://{}", http.trim_start_matches("http://"))
     }
 }
 
@@ -500,5 +497,22 @@ mod tests {
         );
         // 空 query 不该留一个光秃秃的问号
         assert_eq!(upstream_url("http://h", "/x", Some("")), "ws://h/x");
+    }
+
+    #[test]
+    fn the_gateway_key_in_the_query_never_reaches_the_upstream() {
+        assert_eq!(
+            upstream_url("https://h", "/x", Some("key=tw-secret&alt=sse")),
+            "wss://h/x?alt=sse"
+        );
+        assert_eq!(
+            upstream_url("https://h", "/x", Some("key=tw-secret")),
+            "wss://h/x"
+        );
+        // 只剔名字正好是 `key` 的那一项
+        assert_eq!(
+            upstream_url("http://h", "/x", Some("monkey=1&key&keys=2")),
+            "ws://h/x?monkey=1&keys=2"
+        );
     }
 }

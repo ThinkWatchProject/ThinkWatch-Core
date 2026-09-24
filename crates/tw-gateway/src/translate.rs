@@ -69,7 +69,7 @@ pub fn keeps_header(client: Dialect, name: &str) -> bool {
 /// 转成这种格式时必须带的请求头（上游配置里写了同名头时以配置为准）。
 pub fn required_headers(target: Dialect) -> &'static [(&'static str, &'static str)] {
     match target {
-        Dialect::Anthropic => &[("anthropic-version", "2023-06-01")],
+        Dialect::Anthropic => &[("anthropic-version", tw_dialect::official::ANTHROPIC_VERSION)],
         _ => &[],
     }
 }
@@ -91,17 +91,12 @@ pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction) {
 /// 客户端没写最大输出、目标格式又必须写（Anthropic）时用多少。
 ///
 /// **价目表里有这个模型的输出上限就用它**：写大了上游拒绝，写小了回答被截断。
-/// 查不到时按模型名兜底：Claude 4 系列的上限都不低于 32000，Anthropic 兼容接口
-/// 背后的别家模型（DeepSeek 这类）多在 8192。
+/// 查不到时按模型名兜底（[`tw_dialect::official::fallback_max_output_tokens`]）。
 pub fn default_max_tokens(book: &tw_pricing::PriceBook, model: &str) -> u64 {
-    if let Some(n) = book.table().get(model).and_then(|p| p.max_output_tokens) {
-        return n;
-    }
-    if model.to_ascii_lowercase().contains("claude") {
-        32000
-    } else {
-        8192
-    }
+    book.table()
+        .get(model)
+        .and_then(|p| p.max_output_tokens)
+        .unwrap_or_else(|| tw_dialect::official::fallback_max_output_tokens(model))
 }
 
 #[cfg(test)]

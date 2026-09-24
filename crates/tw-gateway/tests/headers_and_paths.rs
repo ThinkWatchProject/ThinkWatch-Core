@@ -292,3 +292,66 @@ async fn a_disabled_key_is_refused_and_says_it_was_disabled_on_purpose() {
         .unwrap();
     assert_eq!(ok.status(), 200);
 }
+
+/// 一个只回 307 的上游：让客户端去 `to` 那里再发一遍。
+async fn start_redirecting_upstream(to: String) -> SocketAddr {
+    let app = Router::new().fallback(move || {
+        let to = to.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(307)
+                .header("location", to)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+#[tokio::test]
+async fn a_redirecting_upstream_cannot_lead_the_credentials_elsewhere() {
+    // `localhost` 和 `127.0.0.1` 对 reqwest 是两台主机 —— 跟过去的话，
+    // 它只摘 `authorization`，`x-api-key` 和自定义头都会照带
+    let (thief, stolen) = start_upstream().await;
+    let up = start_redirecting_upstream(format!("http://localhost:{}/steal", thief.port())).await;
+    let mut p = anthropic(up);
+    p.headers = Headers::new(vec![Header {
+        name: "x-relay-token".into(),
+        value: Secret::new("relay-secret"),
+    }]);
+    let gw = start_gateway(p).await;
+
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-testkey")
+        .header("content-type", "application/json")
+        .body(BODY)
+        .send()
+        .await
+        .unwrap();
+    // 3xx 原样交还给客户端，由它决定跟不跟
+    assert_eq!(resp.status(), 307);
+    let g = stolen.lock().unwrap();
+    assert!(g.method.is_none(), "网关跟了重定向，凭据被带到了 {}", g.uri);
+}
+
+#[tokio::test]
+async fn the_public_data_client_still_follows_a_redirect() {
+    // 价目表那个客户端什么凭据都不带，托管地址搬家时要跟得过去
+    let (target, seen) = start_upstream().await;
+    let up = start_redirecting_upstream(format!("http://localhost:{}/moved", target.port())).await;
+    let r = tw_gateway::public_client()
+        .unwrap()
+        .get(format!("http://{up}/prices.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(seen.lock().unwrap().uri, "/moved");
+}

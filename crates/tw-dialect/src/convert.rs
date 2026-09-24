@@ -391,6 +391,26 @@ pub fn error_body(client: Dialect, status: u16, message: &str) -> Vec<u8> {
     v.to_string().into_bytes()
 }
 
+/// 流已经开始之后，按客户端的格式写一个**独立的**错误帧。
+///
+/// 给不经过 [`StreamConverter`] 的那些流用：同格式直通时中途断了、被策略切断了，
+/// 状态码和响应头早已发出，流本身是唯一还能说话的地方。经过转换的流用
+/// [`StreamConverter::fail`]，它知道这条流的状态（Responses 的响应 id、Gemini 的
+/// 数组有没有开头），写出来的更完整。
+///
+/// `status` 是这个错误如果还能当响应状态码时会用的那个，决定错误的类别
+/// （Anthropic 的 `error.type`、Gemini 的 `status`、Responses 的 `error.code`）。
+/// Gemini 按 `alt=sse` 的写法写。
+pub fn error_frame(client: Dialect, status: u16, message: &str) -> String {
+    match client {
+        Dialect::Anthropic => anthropic::stream::error_frame(status, message),
+        Dialect::Chat => chat::stream::error_frame(status, message),
+        Dialect::Responses => responses::stream::error_frame(status, message),
+        Dialect::Gemini => gemini::stream::error_frame(status, message),
+        Dialect::Bedrock => bedrock::stream::error_frame(message),
+    }
+}
+
 /// 一个整包响应拆成流事件
 fn events_of(r: &Response) -> Vec<Event> {
     let mut out = vec![Event::Start {
@@ -1069,7 +1089,8 @@ mod tests {
 
         let s = Session::for_test(Dialect::Gemini, Dialect::Chat);
         let v: Value = serde_json::from_slice(&s.error(502, b"")).unwrap();
-        assert_eq!(v["error"]["status"], "INTERNAL");
+        // gRPC 的 HTTP 映射：502 是 UNAVAILABLE（INTERNAL 说的是回话的这一方自己坏了）
+        assert_eq!(v["error"]["status"], "UNAVAILABLE");
         assert!(v["error"]["message"].as_str().unwrap().contains("502"));
     }
 
@@ -1154,5 +1175,43 @@ mod tests {
                 .unwrap();
         assert_eq!(out["input"].as_array().unwrap().len(), 1);
         assert_eq!(out["input"][0]["id"], "rs_1");
+    }
+
+    /// 独立的错误帧：每种格式都是客户端认得的那种事件，类别跟着状态码走。
+    #[test]
+    fn an_error_frame_is_the_event_each_client_listens_for() {
+        let one = |d: Dialect, status: u16| {
+            let raw = error_frame(d, status, "boom");
+            let mut dec = frame::Decoder::default();
+            let mut f = dec.feed(raw.as_bytes());
+            assert_eq!(f.len(), 1, "{raw}");
+            let f = f.remove(0);
+            (f.event, serde_json::from_str::<Value>(&f.data).unwrap())
+        };
+        let (e, v) = one(Dialect::Anthropic, 429);
+        assert_eq!(e.as_deref(), Some("error"));
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["message"], "boom");
+
+        let (e, v) = one(Dialect::Chat, 502);
+        assert_eq!(e, None);
+        assert_eq!(v["error"]["type"], "server_error");
+
+        // **Responses 的客户端不认 Chat 形状的错误**，要的是 `response.failed`
+        let (e, v) = one(Dialect::Responses, 429);
+        assert_eq!(e.as_deref(), Some("response.failed"));
+        assert_eq!(v["type"], "response.failed");
+        assert_eq!(v["response"]["status"], "failed");
+        assert_eq!(v["response"]["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(v["response"]["error"]["message"], "boom");
+
+        let (e, v) = one(Dialect::Gemini, 502);
+        assert_eq!(e, None);
+        assert_eq!(v["error"]["code"], 502);
+        assert_eq!(v["error"]["status"], "UNAVAILABLE");
+
+        let (e, v) = one(Dialect::Bedrock, 500);
+        assert_eq!(e.as_deref(), Some("modelStreamErrorException"));
+        assert_eq!(v["message"], "boom");
     }
 }
