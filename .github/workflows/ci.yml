@@ -36,12 +36,6 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # 桌面版不开 `bedrock`，上面两步就一行都不编它。企业版开，所以单独查
-      - name: clippy + test (tw-upstream, bedrock)
-        run: |
-          cargo clippy -p tw-upstream --all-targets --features bedrock -- -D warnings
-          cargo test -p tw-upstream --features bedrock
-
       - name: Build
         run: cargo build --release -p twcore
 
@@ -50,6 +44,79 @@ jobs:
       # 脚本自己会 build，这一步只是跑它。
       - name: Smoke (real binary, real socket, real data plane)
         run: ./scripts/smoke.sh
+
+  # **第一层改了，企业版还编得过吗。**企业版钉 core 的 tag、只依赖第一层
+  # （tw-dialect、tw-guard、tw-breaker）。以前要等 core 发版、企业版升级那天
+  # 才知道某个改名或删掉的函数把它弄坏了，这里提前到 PR 上。
+  #
+  # 企业版取和这个 PR 同名的分支 —— 要改接口的一方在企业版开一个同名分支
+  # 把调用点跟上，两边一起绿；没有同名分支就取 dev。main 上的推送也对 dev。
+  # 两个仓库都是公开的，不需要令牌。企业版没有 `sqlx::query!` 这类编译期
+  # 连库的宏，`cargo check` 不需要数据库。
+  enterprise:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: core
+      - uses: dorny/paths-filter@v3
+        id: changed
+        with:
+          working-directory: core
+          filters: |
+            layer1:
+              - 'crates/tw-dialect/**'
+              - 'crates/tw-guard/**'
+              - 'crates/tw-breaker/**'
+              - 'Cargo.toml'
+              - '.github/workflows/ci.yml'
+
+      - name: Pick the enterprise branch
+        if: steps.changed.outputs.layer1 == 'true'
+        id: branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          ref=dev
+          if [ -n "$HEAD_REF" ] && git ls-remote --exit-code --heads \
+              https://github.com/ThinkWatchProject/ThinkWatch.git "$HEAD_REF" >/dev/null; then
+            ref="$HEAD_REF"
+          fi
+          echo "enterprise branch: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.changed.outputs.layer1 == 'true'
+        with:
+          repository: ThinkWatchProject/ThinkWatch
+          ref: ${{ steps.branch.outputs.ref }}
+          path: enterprise
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.changed.outputs.layer1 == 'true'
+      # 第一层全部指向这次的 core
+      - name: Point enterprise at this core
+        if: steps.changed.outputs.layer1 == 'true'
+        run: |
+          cat >> enterprise/Cargo.toml <<'TOML'
+
+          [patch."https://github.com/ThinkWatchProject/ThinkWatch-Core.git"]
+          tw-dialect = { path = "../core/crates/tw-dialect" }
+          tw-guard = { path = "../core/crates/tw-guard" }
+          tw-breaker = { path = "../core/crates/tw-breaker" }
+          TOML
+          # 企业版的 Cargo.lock 锁着它钉的那个版本；版本号不同时补丁会被
+          # 静默忽略（只报一条警告），编的还是旧的 core
+          cd enterprise && cargo update -p tw-dialect -p tw-guard -p tw-breaker
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changed.outputs.layer1 == 'true'
+        with:
+          workspaces: enterprise -> target
+
+      - name: cargo check (enterprise)
+        if: steps.changed.outputs.layer1 == 'true'
+        working-directory: enterprise
+        run: cargo check --workspace --all-targets
 
   # **这台机器上没有 unix socket，也没有信号。**core 在这两件事上各有一套
   # 平台实现，而在这个任务出现之前，Windows 那一半从来没有被编译过 ——

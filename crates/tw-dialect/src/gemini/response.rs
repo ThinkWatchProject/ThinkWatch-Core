@@ -41,6 +41,7 @@ pub fn usage(u: &Value) -> Usage {
         input: (n("promptTokenCount") + n("toolUsePromptTokenCount")).saturating_sub(cached),
         cache_read: cached,
         cache_write: 0,
+        cache_1h: false,
         output: n("candidatesTokenCount") + thoughts,
         reasoning: thoughts,
     }

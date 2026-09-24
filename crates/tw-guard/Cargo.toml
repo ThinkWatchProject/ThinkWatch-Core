@@ -13,7 +13,6 @@ base64 = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
-tw-secret = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tw-dialect = { workspace = true }
 

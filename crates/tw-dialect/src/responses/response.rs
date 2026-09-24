@@ -15,6 +15,7 @@ pub fn usage(u: &Value) -> Usage {
         input: n("input_tokens").saturating_sub(cache_read + cache_write),
         cache_read,
         cache_write,
+        cache_1h: false,
         output: n("output_tokens"),
         reasoning: u
             .get("output_tokens_details")

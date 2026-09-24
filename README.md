@@ -43,18 +43,23 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
 ## Crate layers
 
 ```
-tw-types · tw-dialect · tw-wire · tw-upstream · tw-crypto   ← shape fixed by the outside world
-tw-engine · tw-pricing · tw-guard · tw-breaker · tw-yaml · tw-secret   ← domain logic
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe      ← assembly
-tw-gateway · tw-control                                     ← data plane / control plane
+tw-dialect · tw-guard · tw-breaker                        ← shared with the server edition
+tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret   ← domain logic
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe    ← assembly
+tw-gateway · tw-control                                   ← data plane / control plane
 ```
 
-The top two layers are stable against external reality. The server edition
-depends on tw-types, tw-dialect, tw-wire, tw-upstream, tw-crypto, tw-guard and
-tw-breaker directly, and on tw-secret through tw-guard. The bottom two are the single-machine implementation
-(SQLite, unix socket) and are deliberately **not** shared: single-machine SQLite
-and multi-tenant Postgres are different enough that forcing one abstraction over
-both would serve neither.
+The server edition depends on the top layer and nothing else: format
+conversion and usage parsing (tw-dialect), redaction and tool-call inspection
+(tw-guard), and the circuit-breaker state machine (tw-breaker). Those three
+depend only on each other — a test enforces it, and CI builds the server
+edition against every change to them. A component only one side uses lives
+on that side, not here.
+
+Everything below is the single-machine implementation (SQLite, unix socket)
+and is deliberately **not** shared: single-machine SQLite and multi-tenant
+Postgres are different enough that forcing one abstraction over both would
+serve neither.
 
 ## Development
 

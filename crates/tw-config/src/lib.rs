@@ -17,6 +17,7 @@ mod probes;
 pub mod proxy;
 pub mod refs;
 pub mod reload;
+mod retention;
 mod security;
 pub mod store;
 mod validate;
@@ -82,7 +83,7 @@ pub struct Config {
     pub security: Security,
     /// 日志留多久。不写就是默认值。
     #[serde(default, skip_serializing_if = "is_default")]
-    pub retention: tw_types::Retention,
+    pub retention: Retention,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<tw_engine::Group>,
     /// 路由。一条路由是一组按顺序求值的规则。
@@ -120,7 +121,7 @@ impl Default for Config {
             pricing: tw_pricing::PricingConfig::default(),
             client_probes: ClientProbes::default(),
             security: Security::default(),
-            retention: tw_types::Retention::default(),
+            retention: Retention::default(),
             groups: Vec::new(),
             routes: Vec::new(),
             default_route: None,
@@ -250,13 +251,18 @@ pub struct GatewayListen {
     pub allow_from: Vec<String>,
 }
 
+/// 放行网段的默认名单：RFC1918 的三个私网段和 IPv6 的唯一本地地址段。
+///
+/// **不含回环。**本机永远放行（见 tw-gateway 的 `AllowList::allows`），写进
+/// 名单只会在界面上多出两条删了也不起作用的条目。
+///
+/// 配置层用它填默认值，控制面把它交给界面「恢复默认」。
+pub const PRIVATE_RANGES: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"];
+
 /// 放行网段的默认名单：私网段。**不是放行所有** —— 想放开得手动写
 /// `0.0.0.0/0`，那时他至少知道自己做了什么。
 pub fn default_allow_from() -> Vec<String> {
-    tw_types::PRIVATE_RANGES
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    PRIVATE_RANGES.iter().map(|s| s.to_string()).collect()
 }
 
 fn default_port() -> u16 {
@@ -936,6 +942,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
+pub use retention::Retention;
 pub use security::{
     CustomRedactRule, CustomToolRule, Mode as SecurityMode, RedactPolicy, Security, ToolAction,
     ToolPolicy,

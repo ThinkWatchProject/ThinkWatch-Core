@@ -46,6 +46,7 @@ pub fn usage(u: &Value) -> Usage {
         input: n("inputTokens"),
         cache_read: n("cacheReadInputTokens"),
         cache_write: n("cacheWriteInputTokens"),
+        cache_1h: false,
         output: n("outputTokens"),
         reasoning: 0,
     }
@@ -248,9 +249,8 @@ mod tests {
             usage: Some(Usage {
                 input: 60,
                 cache_read: 40,
-                cache_write: 0,
                 output: 20,
-                reasoning: 0,
+                ..Default::default()
             }),
         };
         let s = Session::for_test(Dialect::Bedrock, Dialect::Bedrock);

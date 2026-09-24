@@ -23,8 +23,8 @@
 use std::time::Instant;
 
 use crate::bodies::{BodyKind, BodyRecord, BodySender, ResponseTap};
+use tw_dialect::usage::{Sniffer, Usage};
 use tw_types::{Msg, msg};
-use tw_wire::usage::{Sniffer, Usage};
 
 /// 一个还欠着结局的请求。
 ///

@@ -800,7 +800,23 @@ pub fn masked(rule: &Rule, value: &str) -> String {
     if rule.kind() == Kind::Internal {
         return value.to_string();
     }
-    tw_secret::mask_secret(value)
+    mask(value)
+}
+
+/// 留头 5 尾 4，中间省略：`sk-a…7f9c`。
+///
+/// **按字符切，不按字节** —— 一个中文字符落在切口上，按字节切就是 panic。
+fn mask(s: &str) -> String {
+    const HEAD: usize = 5;
+    const TAIL: usize = 4;
+    let n = s.chars().count();
+    // 太短的串留不出信息量，整串打掉。这也覆盖了空串。
+    if n <= HEAD + TAIL + 1 {
+        return "…".repeat(n.min(3));
+    }
+    let head: String = s.chars().take(HEAD).collect();
+    let tail: String = s.chars().skip(n - TAIL).collect();
+    format!("{head}…{tail}")
 }
 
 /// 一次扫描按「哪条规则 × 哪个值」合起来的结果，给事件和日志用。
@@ -836,6 +852,14 @@ pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_value_keeps_only_its_ends_and_never_splits_a_character() {
+        assert_eq!(mask("sk-ant-api03-abcdef7f9c"), "sk-an…7f9c");
+        assert_eq!(mask("密钥密钥密钥密钥密钥密钥"), "密钥密钥密…密钥密钥");
+        assert_eq!(mask("short"), "………");
+        assert_eq!(mask(""), "");
+    }
 
     fn all() -> RuleSet {
         RuleSet::only(&BUILTINS.iter().map(|b| b.id).collect::<Vec<_>>())

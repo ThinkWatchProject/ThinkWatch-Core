@@ -36,6 +36,7 @@ pub fn usage(u: &Value) -> Usage {
         input: n("prompt_tokens").saturating_sub(cache_read + cache_write),
         cache_read,
         cache_write,
+        cache_1h: false,
         output: n("completion_tokens"),
         reasoning: u
             .get("completion_tokens_details")
