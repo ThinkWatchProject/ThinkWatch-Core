@@ -79,22 +79,34 @@ pub fn watch(
     }
 
     // notify 的回调跑在它自己的线程上，这里把它接到 tokio 上并去抖。
-    std::thread::spawn(move || {
-        while raw_rx.recv().is_ok() {
-            // 收到一个之后，把窗口内后续的全部吞掉 —— 一次保存的那一串事件因此只
-            // 产生一个信号。
-            loop {
-                match raw_rx.recv_timeout(debounce) {
-                    Ok(()) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            let _ = tx.try_send(());
-        }
-    });
+    std::thread::spawn(move || debounce_loop(&raw_rx, debounce, &tx));
 
     Ok((Watch { _inner: w }, rx))
+}
+
+/// 去抖：收到一个事件之后，把间隔不到 `window` 的后续事件全部并进来，静下来
+/// `window` 之后发**一个**信号。事件源断开就返回。
+///
+/// **「一阵」是按事件之间的间隔定义的，不是按谁发起的。**同一个人连写十次，
+/// 只要中间有一次写入本身卡了超过 `window`（磁盘忙时 `write` 会被限流），那就是
+/// 两阵、两个信号 —— 这是对的：第一阵之后读到的文件是那一刻的真实内容。
+fn debounce_loop(
+    raw_rx: &std::sync::mpsc::Receiver<()>,
+    window: Duration,
+    tx: &tokio::sync::mpsc::Sender<()>,
+) {
+    while raw_rx.recv().is_ok() {
+        // 收到一个之后，把窗口内后续的全部吞掉 —— 一次保存的那一串事件因此只
+        // 产生一个信号。
+        loop {
+            match raw_rx.recv_timeout(window) {
+                Ok(()) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        let _ = tx.try_send(());
+    }
 }
 
 #[cfg(test)]
@@ -124,9 +136,53 @@ mod tests {
         p.extension().is_some_and(|e| e == "md")
     }
 
+    /// 测试用的目录。**Linux 上放在内存盘（`/dev/shm`）上。**
+    ///
+    /// 「连写十次是一阵」的前提是任意两次写之间不超过去抖窗口。放在磁盘上时
+    /// 这个前提不归测试管：CI 的机器上别的测试同时在写盘，一次 `fs::write` 被
+    /// 截断之后的刷盘和脏页限流卡住两三百毫秒是常事（在 Docker 里加上 `dd`
+    /// 压盘就能复现，失败的那几次正好都有一次写超过了 200ms）。那时监听报两次
+    /// 是对的，错的是测试。内存盘上的写不碰磁盘，前提才真的成立。
+    ///
+    /// macOS 没有 `/dev/shm`，用系统的临时目录 —— 那边从来没有因此失败过。
+    fn scratch() -> tempfile::TempDir {
+        let shm = Path::new("/dev/shm");
+        if cfg!(target_os = "linux") && shm.is_dir() {
+            tempfile::tempdir_in(shm).unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
+    /// 去抖本身，不经过文件系统：事件之间有没有空隙完全由测试决定。
+    #[tokio::test]
+    async fn events_already_waiting_are_one_signal_and_a_later_one_is_another() {
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+        // 通道放得下每一个信号：`watch` 里那个容量 1 的通道会把多发的信号吞掉，
+        // 在这里用它就看不出去抖有没有并起来
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        // 十个事件在去抖开始之前就排好了：它们之间没有任何间隔
+        for _ in 0..10 {
+            raw_tx.send(()).unwrap();
+        }
+        std::thread::spawn(move || debounce_loop(&raw_rx, WINDOW, &tx));
+        assert_eq!(recv(&mut rx, Duration::from_secs(3)).await, Signal::Got);
+        assert_eq!(
+            recv(&mut rx, WINDOW * 3).await,
+            Signal::Quiet,
+            "排在一起的十个事件报了不止一次"
+        );
+        // 静下来之后的下一个事件是新的一阵
+        raw_tx.send(()).unwrap();
+        assert_eq!(recv(&mut rx, Duration::from_secs(3)).await, Signal::Got);
+        // 发端没了，去抖跟着结束
+        drop(raw_tx);
+        assert_eq!(recv(&mut rx, Duration::from_secs(3)).await, Signal::Closed);
+    }
+
     #[tokio::test]
     async fn a_burst_of_writes_is_one_signal() {
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let (_w, mut rx) = watch(&[d.path().to_path_buf()], WINDOW, only_md).unwrap();
         for i in 0..10 {
             std::fs::write(d.path().join("a.md"), format!("{i}\n")).unwrap();
@@ -142,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_the_filter_turns_down_stays_quiet() {
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let (_w, mut rx) = watch(&[d.path().to_path_buf()], WINDOW, only_md).unwrap();
         std::fs::write(d.path().join("x.log"), "x\n").unwrap();
         assert_eq!(
@@ -155,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_subdirectory_is_not_watched() {
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         std::fs::create_dir_all(d.path().join("history")).unwrap();
         let (_w, mut rx) = watch(&[d.path().to_path_buf()], WINDOW, only_md).unwrap();
         std::fs::write(d.path().join("history/1.md"), "x\n").unwrap();
@@ -168,7 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn several_directories_are_watched_at_once() {
-        let d = tempfile::tempdir().unwrap();
+        let d = scratch();
         let (a, b) = (d.path().join("a"), d.path().join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
