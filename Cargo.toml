@@ -17,8 +17,6 @@ members = [
     "crates/tw-yaml",
     "crates/tw-store",
     "crates/tw-pricing",
-    "crates/tw-adopt",
-    "crates/tw-scan",
     "crates/tw-watch",
     "crates/tw-engine",
     "crates/tw-observe",
@@ -55,8 +53,6 @@ tw-control  = { path = "crates/tw-control" }
 tw-yaml     = { path = "crates/tw-yaml" }
 tw-store    = { path = "crates/tw-store" }
 tw-pricing  = { path = "crates/tw-pricing" }
-tw-adopt    = { path = "crates/tw-adopt" }
-tw-scan     = { path = "crates/tw-scan" }
 tw-watch    = { path = "crates/tw-watch" }
 tw-guard    = { path = "crates/tw-guard" }
 tw-breaker  = { path = "crates/tw-breaker" }

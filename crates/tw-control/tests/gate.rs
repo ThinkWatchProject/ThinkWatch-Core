@@ -56,7 +56,6 @@ fn bed() -> Bed {
         price_updater: Default::default(),
         chatgpt: Default::default(),
         zai: Default::default(),
-        home: d.path().join("home"),
     };
     Bed { dir: d, state }
 }
@@ -155,7 +154,10 @@ async fn http_and_events_run_over_the_handshake(at: Address, b: &Bed) {
     let (mut s, _) = open(&at, &key(KEY)).await.unwrap();
     let (st, body) = get(&mut s, "/status").await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    assert!(body.contains("\"api_version\":18"), "{body}");
+    assert!(
+        body.contains(&format!("\"api_version\":{}", tw_api::CONTROL_API_VERSION)),
+        "{body}"
+    );
     // 同一条连接上接着发：keep-alive 照常
     let (st, body) = get(&mut s, "/config").await;
     assert_eq!(st, StatusCode::OK);

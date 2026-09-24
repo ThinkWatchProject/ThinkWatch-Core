@@ -20,8 +20,6 @@ chrono = { workspace = true }
 tw-secret = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tw-adopt = { workspace = true }
-tw-scan = { workspace = true }
 tw-guard = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tokio = { workspace = true }

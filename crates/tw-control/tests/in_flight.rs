@@ -28,7 +28,6 @@ fn app() -> (tempfile::TempDir, tw_observe::EventBus, axum::Router) {
         price_updater: Default::default(),
         chatgpt: Default::default(),
         zai: Default::default(),
-        home: d.path().join("home"),
     };
     (d, bus, tw_control::router(state))
 }

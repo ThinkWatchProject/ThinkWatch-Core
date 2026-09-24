@@ -15,8 +15,6 @@ tw-link = { workspace = true }
 # 列网卡用 getifaddrs —— 比引一个 crate 便宜
 libc = { workspace = true }
 tw-config = { workspace = true }
-tw-adopt = { workspace = true }
-tw-scan = { workspace = true }
 tw-guard = { workspace = true }
 bytes = { workspace = true }
 tw-engine = { workspace = true }

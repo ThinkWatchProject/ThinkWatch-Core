@@ -36,7 +36,6 @@ pub mod replay;
 pub mod resources;
 pub mod rotation;
 pub mod routes;
-pub mod scan;
 pub mod security;
 pub mod shutdown;
 pub mod zai;
@@ -66,31 +65,6 @@ pub struct ControlState {
     pub zai: Arc<zai::Accounts>,
     /// 请网关退出的那个开关。控制面上的 `POST /shutdown` 扳它，主循环等它。
     pub shutdown: Shutdown,
-    /// 用户的 home。接管要顺着它去找各客户端的配置。
-    ///
-    /// **是个字段，不是每次现读 `$HOME`。**进程级的环境变量是全局可变
-    /// 状态：测试里改一次，同进程里并行跑的另一个测试就会去读一个它
-    /// 没想到的目录 —— 而这个模块写的是用户其他软件的配置文件。
-    pub home: std::path::PathBuf,
-}
-
-/// 用户的 home。
-///
-/// **不是数据目录**（那个是 `tw_api::data::dir`）。这里只用来顺着它去找
-/// 各家客户端的配置 —— `~/.claude`、`~/.codex`、`~/.cursor`，而这些点开头的
-/// 目录在 Windows 上同样躺在 `%USERPROFILE%` 下。
-///
-/// 取不到时给一个空路径，而不是 `/` —— 空路径会让后续的「文件不存在」自然
-/// 发生，`/` 则会让我们去翻系统根目录。
-pub fn home_dir() -> std::path::PathBuf {
-    // Windows 上没有 `HOME`。
-    #[cfg(windows)]
-    const VAR: &str = "USERPROFILE";
-    #[cfg(not(windows))]
-    const VAR: &str = "HOME";
-    std::env::var_os(VAR)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
 }
 
 impl ControlState {
@@ -150,20 +124,8 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::Sessions, sessions)
         .at(ep::SessionDetail, session_detail)
         .at(ep::DryRun, dryrun::dry_run)
-        // **每次现扫，什么都不存**
-        .at(ep::Scan, scan::scan)
-        // 接管：**plan 和 adopt 是两个端点**，中间夹一次人的确认
-        .at(ep::Clients, clients::list)
-        .at(ep::PlanAdopt, clients::plan_adopt)
-        .at(ep::Adopt, clients::adopt)
-        .at(ep::PlanRestore, clients::plan_restore)
-        .at(ep::Restore, clients::restore)
-        .at(ep::Why, clients::why)
+        // 为客户端发专用密钥。接管本身在桌面端做
         .at(ep::ClientKey, clients::client_key)
-        // 矩阵上点一下。**plan 和 apply 同样是两步**
-        .at(ep::McpTargets, clients::mcp_targets)
-        .at(ep::McpPlan, clients::mcp_plan_op)
-        .at(ep::McpApply, clients::mcp_apply)
         .merge(resources::router())
         .merge(routes::router())
         .merge(security::router())

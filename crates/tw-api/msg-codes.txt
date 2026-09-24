@@ -3,99 +3,6 @@
 # A second column marks codes a UI does not translate:
 #   passthrough  the sentence is only placeholders (system or upstream text); show `text`
 #   test         only produced by tests; never reaches a UI
-adopt.cost.aider.lookup_order
-adopt.cost.aider.restart
-adopt.cost.claude_code.mcp_tool_search
-adopt.cost.claude_code.remote_control
-adopt.cost.claude_code.welcome_screen
-adopt.cost.codex.chatgpt_desktop
-adopt.cost.codex.reopen_terminal
-adopt.cost.opencode.restart
-adopt.cost.zed.key_store
-adopt.diag.adopt_again
-adopt.diag.delete_line
-adopt.diag.delete_line_gnu
-adopt.diag.endpoint_ok
-adopt.diag.endpoint_ok.detail
-adopt.diag.fields_gone
-adopt.diag.fields_gone.detail
-adopt.diag.look_at
-adopt.diag.look_at_fields
-adopt.diag.managed
-adopt.diag.managed.detail
-adopt.diag.managed_dropin
-adopt.diag.managed_dropin.detail
-adopt.diag.no_exports
-adopt.diag.no_exports.detail
-adopt.diag.no_managed
-adopt.diag.no_managed.detail
-adopt.diag.no_registry_env
-adopt.diag.no_registry_env.detail
-adopt.diag.no_shadow
-adopt.diag.no_shadow.absent
-adopt.diag.no_shadow.none
-adopt.diag.not_adopted
-adopt.diag.not_adopted.detail
-adopt.diag.not_running
-adopt.diag.not_running.detail
-adopt.diag.project_config
-adopt.diag.project_config.detail
-adopt.diag.registry_env
-adopt.diag.registry_env.overrides
-adopt.diag.restart
-adopt.diag.shadowed
-adopt.diag.shadowed.fields
-adopt.diag.shadowed.no_fields
-adopt.diag.shell_export
-adopt.diag.shell_export.harmless
-adopt.diag.shell_export.overrides
-adopt.diag.started_after
-adopt.diag.started_after.detail
-adopt.diag.started_before
-adopt.diag.started_before.detail
-adopt.diag.static_only
-adopt.diag.static_only.detail
-adopt.diag.unset_env
-adopt.diag.unset_env_machine
-adopt.file.changed
-adopt.file.link_loop
-adopt.file.read_failed
-adopt.file.readback_mismatch
-adopt.file.verify_failed
-adopt.file.write_failed
-adopt.manual.continue.caveat
-adopt.manual.continue.entry
-adopt.manual.continue.open
-adopt.manual.continue.open_windows
-adopt.manual.cursor.base
-adopt.manual.cursor.caveat
-adopt.manual.cursor.key
-adopt.manual.cursor.open
-adopt.manual.file
-adopt.manual.gemini_cli.caveat
-adopt.manual.gemini_cli.caveat_windows
-adopt.manual.gemini_cli.export
-adopt.manual.gemini_cli.reopen
-adopt.manual.gemini_cli.setx
-adopt.manual.zed.key
-adopt.mcp.not_copyable
-adopt.mcp.not_there
-adopt.mcp.parse_failed
-adopt.mcp.unknown_client
-adopt.mcp.unverified_format
-adopt.mcp.zed_structure
-adopt.plan.fields_only
-adopt.plan.foreign_record
-adopt.plan.no_record
-adopt.plan.parse_failed
-adopt.plan.read_failed
-adopt.plan.shadowed
-adopt.restore.config_gone
-adopt.restore.file_removed
-adopt.restore.secret_lost
-adopt.takes_effect
-adopt.warn.symlink
-adopt.warn.world_readable
 config.bad_allow_from
 config.bad_base_url
 config.blank_models_only
@@ -190,11 +97,9 @@ control.group.upstream_twice
 control.group_in_use
 control.header_no_value
 control.internal_error
-control.key_bind_failed
 control.key_create_failed
 control.key_in_use
 control.key_not_found
-control.key_used_by_client
 control.listen.bad_port
 control.listen.bind_invalid
 control.method_not_allowed
@@ -417,14 +322,6 @@ pricing.sheet.empty_model
 pricing.sheet.empty_name
 pricing.sheet.half_long_context
 pricing.sheet.padded_name
-scan.hidden
-scan.hidden.detail
-scan.mcp.remote
-scan.mcp.remote.detail
-scan.rule
-scan.rule.detail
-scan.skill.all_tools
-scan.skill.all_tools.detail
 security.bad_content_pattern
 security.bad_pattern
 security.guard_unknown
@@ -439,9 +336,7 @@ security.unknown_content_action
 security.unknown_rule
 t.auth test
 t.broke test
-t.detail test
 t.limited test
-t.title test
 t.upstream test
 t.x test
 yaml.anchor_or_alias

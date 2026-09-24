@@ -32,6 +32,12 @@ Both editions depend on these crates — the desktop app
 and the server edition. A change here reaches both, so "it works for my
 case" is not the bar.
 
+What is *not* here: adopting AI clients, editing their MCP servers and
+scanning their configuration. Those change files on the machine the
+desktop app runs on, so they live in the desktop app (its `tw-adopt` and
+`tw-scan` crates), and the only control-plane endpoint they use is
+`POST /clients/{id}/key`, which issues a client its own gateway key.
+
 ## Commit messages
 
 Conventional Commits (`fix(scope): subject`), in **English** — this is a
@@ -170,7 +176,8 @@ contract with both: `twcore upgrade` has a test that reads `release.yml`.
 To try a change to `release.yml` without publishing, run it by hand
 (`workflow_dispatch`): it builds and checks everything and uploads nothing.
 
-The desktop app pins `tw-api` to the same tag and bundles the binary
+The desktop app pins `tw-api` (and the few other crates it uses: `tw-types`,
+`tw-yaml`, `tw-guard`, `tw-watch`) to the same tag and bundles the binary
 from that release. Those two have to come from one commit: the binary
 speaks a protocol, and the app compiles a mirror of it.
 

@@ -493,7 +493,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 它连 HTTP 都说不上，握手第一条就被拒。版本号从这一版起在握手里交换
 /// （`tw_link::ClientHello.proto`），不一致时握手就说，不必等到 `/status`。
 /// 同一版起 `GET /config` 发出的正文里钥匙是打码的（[`control::KEY_MASK`]）。
-pub const CONTROL_API_VERSION: u32 = 18;
+///
+/// **19 起客户端接管、MCP、扫描不在控制面上**：它们改的是桌面端那台机器上的文件，
+/// 由桌面端自己做。`/scan`、`/clients`、`/clients/plan`、`/clients/adopt`、
+/// `/clients/{id}/restore/plan`、`/clients/{id}/restore`、`/clients/{id}/why`、
+/// `/mcp/*` 和 `ClientsChanged` / `ScanAlert` 两个事件都删了，只留
+/// `POST /clients/{id}/key`；更换密钥不再同步客户端的配置（`KeyRotated` 没有
+/// `synced` / `failed` 了），删密钥也不再查它是不是写在一个接管着的客户端里。
+pub const CONTROL_API_VERSION: u32 = 19;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -825,19 +832,6 @@ pub enum Event {
         blocked: bool,
         at_ms: u64,
     },
-    /// 客户端配置面上**新出现**了可疑的东西。
-    ///
-    /// **只报新出现的那些。**「一个用了半年的 skill 突然多了一段零宽
-    /// 字符」这个信号，比「这个文件里有可疑内容」强得多 —— 而后者在
-    /// 用户第一次打开页面时就已经全部看过了。
-    ///
-    /// 字段叫 `alerts` 而不是 `findings`，是为了和「打开页面扫一次」
-    /// 那份完整清单区分开：这里的每一条都值得打断用户一次。
-    ScanAlert {
-        id: u64,
-        alerts: Vec<ScanFinding>,
-        at_ms: u64,
-    },
     /// 这次请求花了多少钱 —— **在它跑完之后一小会儿才知道**。
     ///
     /// 价钱不在数据面的职责里：网关知道用了多少 token，而单价在存储层
@@ -859,13 +853,6 @@ pub enum Event {
         cache_saved_micros: Option<i64>,
         at_ms: u64,
     },
-    /// 客户端配置面上的文件动了 —— **不管改了什么**。
-    ///
-    /// 和 `ScanAlert` 是两件事。那条说的是「出现了可疑内容」，值得打断
-    /// 用户；这条只说「磁盘上那几个文件变了」，界面据此重读一遍接管
-    /// 状态。用户在编辑器里把 `ANTHROPIC_BASE_URL` 改回原样，一点都不
-    /// 可疑，但界面必须跟上 —— 没有这条，那一页只能每五秒重扫一次磁盘。
-    ClientsChanged { id: u64, at_ms: u64 },
     /// 某家上游的熔断器开了或者合上了。
     ///
     /// **这是少数几个不挂在任何一次请求上的状态变化。**熔断是攒够三次
@@ -1129,9 +1116,7 @@ impl Event {
             | Event::HiddenTextFound { id, .. }
             | Event::ContentMatched { id, .. }
             | Event::OutputLimited { id, .. }
-            | Event::ScanAlert { id, .. }
             | Event::RequestPriced { id, .. }
-            | Event::ClientsChanged { id, .. }
             | Event::HealthChanged { id, .. }
             | Event::ModelsChanged { id, .. }
             | Event::ProxyChanged { id, .. }
@@ -1582,7 +1567,7 @@ pub struct KeySave {
 }
 
 /// 一把密钥上用户能改的东西。**密钥的值不在里面** —— 它由 core 生成，
-/// 要换就走更换，那条路会把新值同步给已接管的客户端。
+/// 要换就走更换（新值写进已接管的客户端，由桌面端做）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyInput {
@@ -1612,34 +1597,8 @@ pub struct KeyRotate {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KeyRotated {
     pub version: String,
-    /// 新的密钥值。**只在这里给一次**，之后列表里只有脱敏的
+    /// 新的密钥值。**只在这里给一次**：正被接管的客户端的配置要换成它，由桌面端写
     pub key: String,
-    /// 跟着改好的客户端。空的就是没有客户端在用它
-    #[serde(default)]
-    pub synced: Vec<KeySynced>,
-    /// 同步不上的客户端。**密钥已经换了**，这些要用户自己去改
-    #[serde(default)]
-    pub failed: Vec<KeySyncFailed>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct KeySynced {
-    /// 客户端 id（`claude-code` …）
-    pub client: String,
-    /// 界面上显示的名字
-    pub name: String,
-    pub takes_effect: TakesEffect,
-    /// 改之前的全文备份在哪
-    pub backup: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct KeySyncFailed {
-    pub client: String,
-    pub name: String,
-    pub error: Msg,
 }
 
 /// 保存监听设置（`PUT /listen`）。
@@ -2586,18 +2545,6 @@ pub struct ConfigAtQuery {
     pub offset: usize,
 }
 
-/// `POST /scan`：除了用户级的配置面，还扫哪些项目目录。**我们不去找项目，
-/// 只看用户指的。**
-///
-/// 是请求体不是查询串：一串目录在查询串里是同一个键写好几次，而 axum 的
-/// `Query` 读不了那种写法 —— 以前是 `GET /scan?project=…`，带上一个目录就 400。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ScanRequest {
-    #[serde(default)]
-    pub projects: Vec<String>,
-}
-
 /// 删除时带上的版本。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3261,139 +3208,6 @@ pub struct ReplayResult {
     pub original: ReplayOriginal,
 }
 
-// ---------------------------------------------------------------- 静态扫描
-
-slug_enum! {
-    /// 一处扫描发现有多要紧。
-    pub enum ScanLevel {
-        High = "high",
-        Medium = "medium",
-        Low = "low",
-    }
-}
-
-slug_enum! {
-    /// 扫描发现出在客户端配置面的哪一类东西里。
-    pub enum ScanSource {
-        Hooks = "hooks",
-        Mcp = "mcp",
-        Skill = "skill",
-        Command = "command",
-        Agent = "agent",
-        Instructions = "instructions",
-    }
-}
-
-/// 一处发现。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ScanFinding {
-    pub level: ScanLevel,
-    /// 哪条规则命中的
-    pub rule: String,
-    /// `hooks` | `mcp` | `skill` | `command` | `agent` | `instructions`
-    pub kind: ScanSource,
-    pub client: String,
-    pub path: String,
-    /// 第几行，从 1 开始
-    pub line: usize,
-    pub title: Msg,
-    pub detail: Msg,
-    /// 命中的那一行，**不可见字符已经换成可见记号**
-    pub excerpt: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct McpView {
-    pub name: String,
-    pub client: String,
-    pub command: String,
-    pub args: Vec<String>,
-    /// 远端型的地址
-    pub url: Option<String>,
-    /// **只有名字，没有值**
-    pub env_keys: Vec<String>,
-    pub enabled: bool,
-    pub source: String,
-    /// 远端而且不在本机
-    pub third_party: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SkillView {
-    pub name: String,
-    pub client: String,
-    pub path: String,
-    pub allowed_tools: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct HookView {
-    pub client: String,
-    pub event: String,
-    pub command: String,
-    pub source: String,
-}
-
-/// 扫一次的结果。
-///
-/// **不存任何东西**：这是此刻磁盘上的真实情况，页面关了就没了。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ScanResponse {
-    pub findings: Vec<ScanFinding>,
-    pub mcp: Vec<McpView>,
-    pub skills: Vec<SkillView>,
-    pub hooks: Vec<HookView>,
-    /// 同名但配置不同的 MCP server 名字（矩阵上要标记号）
-    pub conflicting: Vec<String>,
-    /// 读不动的文件。**要显示** —— 悄悄跳过会给人「查过了」的错觉
-    pub unreadable: Vec<String>,
-    pub scanned: usize,
-    /// 这次连哪些项目目录一起扫了
-    pub projects: Vec<String>,
-}
-
-slug_enum! {
-    /// MCP 矩阵上的一下。
-    pub enum McpOp {
-        /// 从一个客户端拷到另一个
-        Copy = "copy",
-        Remove = "remove",
-    }
-}
-
-/// 在矩阵上点一下。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct McpOpRequest {
-    /// `copy` 或 `remove`
-    pub op: McpOp,
-    pub name: String,
-    /// `copy` 时从哪个客户端取
-    #[serde(default)]
-    pub from: Option<String>,
-    /// 写到（或从中删掉）哪个客户端
-    pub to: String,
-}
-
-/// 哪些客户端能被写入，哪些只能看。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct McpTargetView {
-    pub client: String,
-    pub name: String,
-    pub path: String,
-    /// 能不能往里写。**不能写的照样在清单里** —— 看得见是第一目标
-    pub copyable: bool,
-    /// 不能写的话，为什么。能写的时候没有
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub why_not: Option<Msg>,
-}
-
 // ---------------------------------------------------------------- 路由试算
 
 /// 「如果现在来这样一个请求，会走到哪儿」。
@@ -3589,107 +3403,10 @@ pub struct SkippedView {
     pub reason: ServeSkip,
 }
 
-// ---------------------------------------------------------- 客户端接管
+// ---------------------------------------------------------- 客户端
 //
-// **注意 `DetectedClient` 和上面的 `ClientView` 是两个东西**：那个是
-// config.yaml 里的一把网关密钥，这个是本机上装着的一个 AI 客户端 App。
-// 中文都叫「客户端」，混起来的话，「有几个客户端」这句话就有两个答案。
-
-slug_enum! {
-    /// 改了客户端的配置之后，什么时候生效。
-    pub enum TakesEffect {
-        /// 下一个请求就使用新配置
-        Immediately = "immediately",
-        /// 客户端重新启动后才生效，读环境变量的要重开终端
-        OnRestart = "on_restart",
-    }
-}
-
-slug_enum! {
-    /// 一个客户端的接管方式验证到什么程度。
-    pub enum Verification {
-        /// 在本机实际运行验证过
-        Measured = "measured",
-        /// 字段名查证过，没有在本机实际运行验证
-        FieldsOnly = "fields_only",
-    }
-}
-
-/// 一个客户端此刻的样子。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct DetectedClient {
-    pub id: String,
-    pub name: String,
-    /// 用户认得的那个路径
-    pub path: String,
-    /// 跟完符号链接的真身。**和 `path` 不同时要显示出来** —— 用户以为
-    /// 在改 ~/.claude/settings.json，实际写的可能是他 dotfiles 仓库里
-    /// 的那份，而那是个会被 git 提交的地方
-    pub real: String,
-    pub installed: bool,
-    pub has_config: bool,
-    pub adopted_at_ms: Option<u64>,
-    /// 配置里此刻的端点。**读出来的**，不是拿我们自己的记录充数
-    pub endpoint: Option<String>,
-    pub shadows: Vec<String>,
-    pub takes_effect: TakesEffect,
-    /// 接管之后要不要在「一直没收到请求」时提示。
-    ///
-    /// **需要重开终端的客户端不提示** —— 用户可能一整天都没重开过，那时
-    /// 弹「是不是没生效」是狼来了
-    pub warns_when_silent: bool,
-    /// `measured`（在本机实际运行验证过）| `fields_only`（字段名查证过，
-    /// 没有在本机实际运行验证）
-    pub verified: Verification,
-    /// 接管之后会失去或改变的功能
-    pub costs: Vec<Msg>,
-    /// 为它生成的那把网关密钥（取消接管之后仍然记着）。还没有就不给
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    /// 最后一次收到**那把密钥**的请求。**接管有没有真的生效，只有它能证明。**
-    ///
-    /// 按密钥算，不按请求头里自报的客户端标识 —— 后者可以伪造，而「接好了没有」
-    /// 要的正是一个不能伪造的答案。没有密钥就没有这个值
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen_ms: Option<u64>,
-    /// 手动配置的方法：没检测到它（配置文件不在默认位置）时照着做
-    pub manual: ManualSetup,
-}
-
-/// 接管不了、只能给指引的。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ManualClient {
-    /// `cursor` / `continue` / `gemini-cli`。为它生成专用密钥时用
-    pub id: String,
-    pub name: String,
-    /// 为它生成的那把网关密钥。还没有就不给
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    /// 最后一次收到那把密钥的请求
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen_ms: Option<u64>,
-    pub setup: ManualSetup,
-    /// 配完还漏什么（Cursor 的补全不经过网关之类）
-    pub caveat: Msg,
-}
-
-/// 手动配置一个客户端的方法。
-///
-/// **地址和密钥不写进句子里**：界面各给一个复制按钮。写进句子的话，用户
-/// 得从一句话里抠出一段 URL，而密钥根本不该出现在一句说明里。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ManualSetup {
-    /// 按顺序做的几步
-    pub steps: Vec<Msg>,
-    /// 要写进配置文件的字段，就是接管时写的那几项。只有能接管的客户端有；
-    /// 密钥那一项不给值（`secret` 为真），界面换成密钥的复制按钮
-    pub fields: Vec<FieldChange>,
-    /// 要填的网关地址，这个客户端要的写法（有的带 `/v1`）
-    pub endpoint: String,
-}
+// 接管、还原、MCP、扫描在桌面端做（改的是它那台机器上的文件），类型也在那边。
+// 这里只剩「为某个客户端发一把专用密钥」。
 
 /// 为某个客户端准备的那把网关密钥（`POST /clients/{id}/key`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3700,113 +3417,6 @@ pub struct ClientKey {
     pub key: String,
     /// 这次新建的（此前没有为它留着的）
     pub created: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct ClientsResponse {
-    pub clients: Vec<DetectedClient>,
-    pub manual: Vec<ManualClient>,
-    /// 客户端该连的地址
-    pub gateway_base: String,
-    /// config.yaml 里有哪几把网关密钥可选
-    pub keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct AdoptRequest {
-    pub client: String,
-    /// 用哪把网关密钥。不写就用第一把 —— 为「一个 key 就够」的人设计
-    #[serde(default)]
-    pub key_name: Option<String>,
-}
-
-/// 算好但还没落盘的改动。**UI 拿它画 diff 让用户确认。**
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct PlanView {
-    pub client: String,
-    pub path: String,
-    /// 改之前的原文，**密钥已打码**。
-    pub before: Option<String>,
-    /// 改之后的原文，**密钥已打码 —— 落盘写的是真值**。
-    ///
-    /// 界面上永远不显示真正的密钥，diff 里也不行：用户会截图这一屏来问
-    /// 「这样对吗」。
-    pub after: String,
-    pub notes: Vec<Msg>,
-    pub shadows: Vec<String>,
-    /// 已经是这样了，什么都不用改
-    pub noop: bool,
-    pub carries_secret: bool,
-    /// 这次会改哪些字段。diff 之外再给一份摘要
-    pub fields: Vec<FieldChange>,
-    /// 写进去的是哪把网关密钥（还原时是留下来的那把）。MCP 的改动没有
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    /// 那把密钥要在接管的那一刻新建（此前没有为这个客户端留着的）
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub key_created: bool,
-}
-
-slug_enum! {
-    /// 对一个字段做什么。
-    pub enum FieldOp {
-        Set = "set",
-        Remove = "remove",
-    }
-}
-
-/// 配置文件里的一处改动。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct FieldChange {
-    /// `set` | `remove`
-    pub op: FieldOp,
-    /// 字段路径，按层级用 `.` 连起来：`env.ANTHROPIC_BASE_URL`
-    pub path: String,
-    /// 要写入的值。写的是网关密钥时不给
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    /// 这一项是网关密钥。**值不回显**，哪怕是打码的；界面写成「密钥 xxx」
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub secret: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct AdoptResponse {
-    pub real: String,
-    pub backup: String,
-    pub created: bool,
-    /// 不至于失败、但用户该知道的事（符号链接、权限太松……）
-    pub warnings: Vec<Msg>,
-    /// 改动什么时候生效
-    pub takes_effect: TakesEffect,
-}
-
-slug_enum! {
-    /// 一条诊断发现的结论。
-    pub enum FindingLevel {
-        /// 就是它让接管没有生效
-        Blocking = "blocking",
-        /// 可能有关，要人看一眼
-        Suspect = "suspect",
-        /// 查过了，没有问题
-        Clear = "clear",
-    }
-}
-
-/// 一条诊断发现。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct FindingView {
-    pub level: FindingLevel,
-    pub title: Msg,
-    pub detail: Msg,
-    /// 用户可以自己执行的下一步。**我们不替他执行。**
-    pub fix: Option<Msg>,
 }
 
 // ---------------------------------------------------------------- 安全
@@ -4245,27 +3855,12 @@ mod tests {
             ModelListStatus::from_slug,
         );
         check(GroupKind::ALL, GroupKind::slug, GroupKind::from_slug);
-        check(ScanLevel::ALL, ScanLevel::slug, ScanLevel::from_slug);
-        check(ScanSource::ALL, ScanSource::slug, ScanSource::from_slug);
-        check(McpOp::ALL, McpOp::slug, McpOp::from_slug);
         check(RuleVerdict::ALL, RuleVerdict::slug, RuleVerdict::from_slug);
         check(RuleEffect::ALL, RuleEffect::slug, RuleEffect::from_slug);
         check(
             DryRunOutcome::ALL,
             DryRunOutcome::slug,
             DryRunOutcome::from_slug,
-        );
-        check(TakesEffect::ALL, TakesEffect::slug, TakesEffect::from_slug);
-        check(
-            Verification::ALL,
-            Verification::slug,
-            Verification::from_slug,
-        );
-        check(FieldOp::ALL, FieldOp::slug, FieldOp::from_slug);
-        check(
-            FindingLevel::ALL,
-            FindingLevel::slug,
-            FindingLevel::from_slug,
         );
         check(Guard::ALL, Guard::slug, Guard::from_slug);
         check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);

@@ -7,21 +7,15 @@
 //! 保证的规则散在界面里，或者根本没人保证：
 //!
 //! - **默认密钥删不得。**删掉之后，手动配置的客户端会在某个说不清的时刻断掉。
-//! - **正被接管的客户端的密钥删不得。**那个客户端配置里写着它的值，删掉的下一个
-//!   请求就是 401，而用户刚做的动作是「删一把看起来没用的钥匙」。
 //! - **改名要带着引用一起改。**规则里的 `client` 是精确匹配一个密钥名。
 //!
-//! # 更换密钥为什么要 core 做
-//!
-//! 换掉一把被接管的客户端在用的密钥，是两件必须一起成的事：改我们的配置，
-//! 和改它的配置。拆成两个接口由界面串的话，中间失败留下的是「界面说换好了、
-//! 那个客户端连不上」—— 而用户此刻正相信自己刚刚修好了一个安全问题。
+//! 和客户端有关的那一半不在这里：「正被接管的客户端的密钥删不得」「更换之后把
+//! 新值写进那个客户端的配置」要看的是桌面端所在那台机器上的文件，由桌面端做。
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde_yaml_ng::Value;
-use tw_adopt::{detect, plan};
 use tw_config::edit;
 use tw_config::history::Origin;
 use tw_config::refs;
@@ -194,9 +188,6 @@ async fn delete_key(
     Path(name): Path<String>,
     Query(q): Query<tw_api::BaseVersion>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    // 接管状态在对方配置旁边的记录里，读它要走文件系统 —— 在改配置之前问，
-    // 拿到的是「此刻」的答案
-    let adopted = adopted_client(&s, &name);
     let version = s
         .cfg
         .transform(q.base_version.as_deref(), Origin::Ui, |text, cfg| {
@@ -210,13 +201,6 @@ async fn delete_key(
                     "control.default_key_cannot_delete" =>
                     "The default key cannot be deleted. Every client that has not been pointed at \
                      the gateway explicitly uses it, and they could not connect without it."
-                )));
-            }
-            if let Some(label) = &adopted {
-                return Err(ApplyError::InUse(msg!(
-                    "control.key_used_by_client", client = label =>
-                    "{client} is pointed at the gateway and has this key in its configuration. \
-                     Restore it before deleting the key."
                 )));
             }
             let used = refs::client_refs(cfg, &c.name);
@@ -268,32 +252,22 @@ async fn set_default(
 
 // ---------------------------------------------------------------- 更换
 
-/// 换一把新的，并且**把新值同步给正在用它的那个客户端**。
+/// 换一把新的。**新值只在这里给一次**，之后列表里照旧显示。
 ///
-/// 顺序是刻意的：先改我们的配置，再改对方的。反过来的话，中间那一刻对方
-/// 配置里写着一把网关还不认识的钥匙。而按这个顺序，中间那一刻对方用的是
-/// 一把刚作废的钥匙 —— 同样是坏的，但**它是在用户刚按下「更换」的那一秒**，
-/// 界面正看着结果，而不是几小时后。
+/// 正被接管的客户端的配置里写着旧值：桌面端拿到新值之后，由它写进那个客户端的
+/// 配置（那个文件在它那台机器上）。
 async fn rotate(
     State(s): State<ControlState>,
     Path(name): Path<String>,
     Json(req): Json<tw_api::KeyRotate>,
 ) -> Result<Json<tw_api::KeyRotated>, Fail> {
     let fresh = tw_config::generate_key();
-    let owner = {
-        let cfg = s.config();
-        let c = cfg
-            .clients
-            .iter()
-            .find(|c| c.name == name)
-            .ok_or_else(|| {
-            fail(
-                StatusCode::NOT_FOUND,
-                msg!("control.key_not_found", key = name.clone() => "There is no gateway key named `{key}`."),
-            )
-        })?;
-        c.client.clone()
-    };
+    if !s.config().clients.iter().any(|c| c.name == name) {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.key_not_found", key = name.clone() => "There is no gateway key named `{key}`."),
+        ));
+    }
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
@@ -310,57 +284,10 @@ async fn rotate(
         })
         .await
         .map_err(apply_fail)?;
-
-    // 只有被接管的客户端要同步：没接管的那些，密钥根本没写进它们的配置
-    let mut synced = Vec::new();
-    let mut failed = Vec::new();
-    if let Some(id) = owner
-        && let Some(c) = tw_adopt::clients::adoptable()
-            .into_iter()
-            .find(|c| c.id == id)
-        && detect::detect_one(&c, &s.home).adopted_at_ms.is_some()
-    {
-        let gw = tw_adopt::clients::Gateway {
-            base: format!("http://127.0.0.1:{}", s.config().listen.gateway.port),
-            key: Some(fresh.clone()),
-        };
-        match plan::plan_adopt(&c, &s.home, &gw)
-            .and_then(|p| plan::apply(&c, &p, &tw_adopt::foreign::backup_root()))
-        {
-            Ok(a) => synced.push(tw_api::KeySynced {
-                client: c.id.to_string(),
-                name: c.name.to_string(),
-                takes_effect: crate::clients::takes_effect(c.takes_effect),
-                backup: a.backup.display().to_string(),
-            }),
-            // **密钥已经换了**，这一条不能把整次更换报成失败 —— 那会让用户
-            // 以为旧密钥还能用
-            Err(e) => failed.push(tw_api::KeySyncFailed {
-                client: c.id.to_string(),
-                name: c.name.to_string(),
-                error: e.msg(),
-            }),
-        }
-    }
     Ok(Json(tw_api::KeyRotated {
         version,
         key: fresh,
-        synced,
-        failed,
     }))
-}
-
-/// 这把密钥是为某个客户端生成的，而那个客户端此刻正被接管着吗。
-/// 返回它在界面上的名字。
-fn adopted_client(s: &ControlState, key: &str) -> Option<String> {
-    let cfg = s.config();
-    let id = cfg.clients.iter().find(|c| c.name == key)?.client.clone()?;
-    let c = tw_adopt::clients::adoptable()
-        .into_iter()
-        .find(|c| c.id == id)?;
-    detect::detect_one(&c, &s.home)
-        .adopted_at_ms
-        .map(|_| c.name.to_string())
 }
 
 // ---------------------------------------------------------------- 表单 → 配置
