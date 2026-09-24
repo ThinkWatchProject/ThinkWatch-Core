@@ -1,7 +1,7 @@
 //! core 发得出的每一个消息码都在 `crates/tw-api/msg-codes.txt` 里，清单里也
 //! 没有发不出的码。
 //!
-//! 桌面端按码翻译（`src/i18n/core.i18n.ts`），它钉着 core 的某个 tag，从那个
+//! 桌面端按码翻译（`src/i18n/core.zh.json`），它钉着 core 的某个 tag，从那个
 //! tag 的 tw-api 里读这份清单（[`tw_api::MSG_CODES`]），和自己的译文表对一遍：
 //! 多一个没翻的码，中文界面上那一句就悄悄变成英文。以前两边对得上全靠人记得。
 //!
@@ -9,9 +9,12 @@
 //! （`#[cfg(windows)]` 那一支），而清单要两个平台的都有。认得的写法只有两种：
 //!
 //! - `msg!("码", …)`，或者 `msg!(常量, …)` 而那个常量是个字符串字面量；
-//! - `code!("码")` —— 码和句子分开存在表里的地方（tw-adopt 的那几张表）。
+//! - `code!("码")` —— 码和句子分开存在表里的地方。
 //!
 //! `msg!` 的第一个参数是别的样子时这里直接失败，而不是漏掉它。
+//!
+//! 客户端接管、MCP、扫描的码不在这里：那些代码在桌面端，清单也在那边
+//! （桌面端仓库的 `src-tauri/msg-codes.txt`，同一套扫法）。
 //!
 //! 清单一行一个码，按字母排。后面可以跟一个标记：
 //!
@@ -475,32 +478,6 @@ fn the_manifest_lists_every_code_core_can_emit() {
     }
     // 桌面端读的是 tw-api 里的这个常量，它就是这个文件
     assert_eq!(tw_api::MSG_CODES.replace("\r\n", "\n"), want);
-}
-
-/// 表里的码运行时真的发出来的，清单里都有 —— 有人往表里加了一行却没用
-/// `code!` 包起来的话，这里会看到。
-#[test]
-fn codes_from_the_adoption_tables_are_in_the_manifest() {
-    let listed = codes_in(tw_api::MSG_CODES);
-    let mut produced = Vec::new();
-    for c in tw_adopt::clients::adoptable() {
-        produced.extend(c.costs.iter().map(|(code, _)| code.to_string()));
-        produced.extend(c.manual_steps().into_iter().map(|m| m.code));
-    }
-    for m in tw_adopt::clients::manual_only() {
-        produced.extend(m.steps().into_iter().map(|m| m.code));
-        produced.push(m.caveat().code);
-    }
-    for t in tw_adopt::mcp::targets() {
-        produced.extend(t.why_not().map(|m| m.code));
-    }
-    assert!(!produced.is_empty());
-    let missing: Vec<_> = produced.iter().filter(|c| !listed.contains(*c)).collect();
-    assert!(
-        missing.is_empty(),
-        "these codes come out of tw-adopt's tables but are not in {MANIFEST}: {missing:?} \
-         (wrap them in `code!(…)`)"
-    );
 }
 
 #[test]

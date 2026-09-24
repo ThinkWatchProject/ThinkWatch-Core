@@ -30,8 +30,6 @@ fn app() -> (tempfile::TempDir, axum::Router) {
         price_updater: Default::default(),
         chatgpt: Default::default(),
         zai: Default::default(),
-        // **测试里绝不能碰开发者自己的配置**
-        home: d.path().join("home"),
     };
     (d, tw_control::router(state))
 }
@@ -172,38 +170,4 @@ async fn query_strings_built_from_the_contract_types_are_accepted() {
     // 没有请求库，处理函数说的是「记录读不了」，不是查询串读不懂
     let code = body.map(|b| error(&b).code);
     assert_ne!(code.as_deref(), Some("control.request_rejected"), "{st}");
-}
-
-/// 扫描可以带好几个项目目录。
-#[tokio::test]
-async fn scan_takes_more_than_one_project() {
-    let (d, app) = app();
-    let dirs: Vec<String> = ["a", "b"]
-        .iter()
-        .map(|n| {
-            let p = d.path().join(n);
-            std::fs::create_dir_all(&p).unwrap();
-            p.display().to_string()
-        })
-        .collect();
-    let body = serde_json::to_string(&tw_api::ScanRequest {
-        projects: dirs.clone(),
-    })
-    .unwrap();
-    let r = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(ep::Scan::METHOD.as_str())
-                .uri(ep::Scan::PATH)
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
-    let got: tw_api::ScanResponse = serde_json::from_slice(&b).unwrap();
-    assert_eq!(got.projects, dirs);
 }

@@ -40,7 +40,7 @@ cargo run -p twcore -- serve    # 起网关和控制面
 ```
 tw-dialect · tw-guard · tw-breaker                                   ← 与服务端版本共用
 tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret · tw-watch   ← 领域逻辑
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe               ← 装配
+tw-config · tw-store · tw-observe                                    ← 装配
 tw-gateway · tw-control · tw-link                                    ← 数据面 / 控制面
 ```
 
@@ -48,6 +48,10 @@ tw-gateway · tw-control · tw-link                                    ← 数�
 审查（tw-guard）、熔断状态机（tw-breaker）。这三个只依赖彼此 —— 有测试守着，
 CI 也会拿服务端版本对着每一次改动编译一遍。只有一方在用的东西住在那一方，
 不放在这里。
+
+接管 AI 客户端（把它们的配置指向网关）、改它们的 MCP 服务器、扫描它们的配置
+都在桌面版里做：改的是桌面版所在那台机器上的文件，那台机器不一定跑着 core。
+core 只负责给一个客户端发它自己的网关密钥。
 
 下面三层是单机的实现（SQLite、unix socket），**有意不共用** —— 单机 SQLite
 和多租户 Postgres 差得太远，强行统一只会造出一个两边都别扭的抽象。

@@ -32,7 +32,6 @@ fn control(
         price_updater: Default::default(),
         chatgpt: Default::default(),
         zai: Default::default(),
-        home: d.path().join("home"),
     };
     (gw, tw_control::router(state))
 }

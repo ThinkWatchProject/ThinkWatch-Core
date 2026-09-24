@@ -359,7 +359,6 @@ async fn bed(extra: impl FnOnce(&Endpoints) -> String) -> Bed {
         price_updater: Default::default(),
         chatgpt: Arc::new(Accounts::new(endpoints.clone())),
         zai: Default::default(),
-        home: d.path().join("home"),
     };
     Bed {
         app: tw_control::router(state),

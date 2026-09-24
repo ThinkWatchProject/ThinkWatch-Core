@@ -65,8 +65,6 @@ fn bed(yaml: &str) -> Bed {
         price_updater: Default::default(),
         chatgpt: Default::default(),
         zai: Default::default(),
-        // **测试里绝不能碰开发者自己的配置**
-        home: d.path().join("home"),
     };
     Bed {
         app: tw_control::router(state),
@@ -307,8 +305,8 @@ async fn rotating_gives_a_new_value_once_and_leaves_everything_else_alone() {
     assert!(fresh.starts_with("tw-"), "{fresh}");
     assert_ne!(fresh, before);
     assert_eq!(b.key("codex").key, fresh);
-    // 没有客户端被接管，也就没有要同步的
-    assert_eq!(v["synced"].as_array().map(|a| a.len()), Some(0));
+    // 同步进客户端的配置是桌面端的事，这里不说
+    assert!(v.get("synced").is_none(), "{v}");
     // 别的东西一个没动
     assert_eq!(b.key("default").key, "tw-aaaa");
     assert_eq!(b.key("codex").client.as_deref(), Some("codex"));

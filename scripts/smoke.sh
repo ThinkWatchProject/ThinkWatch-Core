@@ -16,7 +16,7 @@ TMP="$(mktemp -d)"
 FAKE_HOME="$TMP/home"
 export HOME="$FAKE_HOME"
 export THINKWATCH_HOME="$FAKE_HOME/.thinkwatch"
-mkdir -p "$THINKWATCH_HOME" "$FAKE_HOME/.claude"
+mkdir -p "$THINKWATCH_HOME"
 SOCK="$THINKWATCH_HOME/twcore.sock"
 # 控制面的每条连接先握手（钥匙在 config.yaml 的 listen.control.key），curl
 # 敲不开它。`twcore call` 读同一份配置里的钥匙、走和桌面端同一条握手。
@@ -355,20 +355,17 @@ for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=36000
 done
 
 for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
-          /security/events /clients /sessions /mcp/targets /diagnostics /config /config/history /models; do
+          /security/events /sessions /diagnostics /config /config/history /models; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done
 
 # 试算要说清按哪条路由算：不指定密钥或路由时是 400，不再悄悄取第一把密钥
 C=$(post /dryrun '{"model":"claude-sonnet-4-5","route":"默认"}'); [ "$C" = "200" ] && ok "POST /dryrun" || bad "POST /dryrun 返回 $C"
-C=$(post /scan '{"projects":["'"$TMP"'"]}'); [ "$C" = "200" ] && ok "POST /scan（带项目目录）" || bad "POST /scan 返回 $C"
-C=$(post /clients/plan '{"client":"claude-code"}'); [ "$C" = "200" ] && ok "POST /clients/plan" || bad "POST /clients/plan 返回 $C"
 # 页面打开时补问模型清单：立刻返回开始问的那几家，不等上游回话
 C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" || bad "POST /models/refresh 返回 $C"
 C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
 [ "$C" = "True" ] && ok "/overview 带模型获取状态" || bad "/overview 的模型状态字段不对：$C"
-C=$(get /clients/claude-code/why); [ "$C" = "200" ] && ok "GET /clients/{id}/why" || bad "返回 $C"
 
 ID=$(ctl "/history?limit=1" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["id"] if d else 0)')
@@ -407,17 +404,13 @@ else
   bad "冒出了别的配置文件" "$STRAY"
 fi
 
-# ---------------------------------------------------------------- 接管往返
-step "接管与还原"
-printf '{\n  "model": "opusplan",\n  "env": { "MY_OWN": "别动我" }\n}\n' > "$FAKE_HOME/.claude/settings.json"
-BEFORE=$(cat "$FAKE_HOME/.claude/settings.json")
-C=$(post /clients/adopt '{"client":"claude-code"}')
-[ "$C" = "200" ] && ok "接管成功" || bad "接管返回 $C" "$(cat "$TMP/out")"
-grep -q 'ANTHROPIC_BASE_URL' "$FAKE_HOME/.claude/settings.json" && ok "端点写进去了" || bad "端点没写进去"
-C=$(post /clients/claude-code/restore '{}')
-[ "$C" = "200" ] && ok "还原成功" || bad "还原返回 $C"
-[ "$(cat "$FAKE_HOME/.claude/settings.json")" = "$BEFORE" ] && ok "还原之后文件一个字节都没变" \
-  || bad "还原之后文件不一样了" "$(diff <(echo "$BEFORE") "$FAKE_HOME/.claude/settings.json" | head -5)"
+# ---------------------------------------------------------------- 客户端的专用密钥
+# 接管本身在桌面端做；core 这边只发钥匙。**再要一次给的是同一把**
+step "客户端的专用密钥"
+C=$(post /clients/claude-code/key '{}')
+[ "$C" = "200" ] && ok "发了一把专用密钥" || bad "返回 $C" "$(cat "$TMP/out")"
+C=$(post /clients/claude-code/key '{}')
+grep -q '"created":false' "$TMP/out" && ok "再要一次给的是同一把" || bad "又新建了一把" "$(cat "$TMP/out")"
 
 # ---------------------------------------------------------------- 资源目标
 # 资源目标有四个数字，而在此之前**没有任何东西在守它们** —— 一个写在

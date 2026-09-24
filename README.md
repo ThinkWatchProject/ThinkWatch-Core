@@ -45,7 +45,7 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
 ```
 tw-dialect · tw-guard · tw-breaker                                   ← shared with the server edition
 tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret · tw-watch   ← domain logic
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe               ← assembly
+tw-config · tw-store · tw-observe                                    ← assembly
 tw-gateway · tw-control · tw-link                                    ← data plane / control plane
 ```
 
@@ -55,6 +55,11 @@ conversion and usage parsing (tw-dialect), redaction and tool-call inspection
 depend only on each other — a test enforces it, and CI builds the server
 edition against every change to them. A component only one side uses lives
 on that side, not here.
+
+Adopting AI clients (pointing their configuration at the gateway), editing
+their MCP servers and scanning their configuration live in the desktop app:
+they change files on the machine the app runs on, which need not be the one
+running core. Core only issues a client its own gateway key.
 
 Everything below is the single-machine implementation (SQLite, unix socket)
 and is deliberately **not** shared: single-machine SQLite and multi-tenant
