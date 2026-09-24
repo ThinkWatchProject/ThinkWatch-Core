@@ -1,103 +1,35 @@
 //! 盯着配置文件。
 //!
-//! 两个非做不可的细节，少哪个都会表现成「有时候能自动重载，有时候不能」：
-//!
-//! **一、盯目录，不盯文件。**编辑器保存不是「往原文件写」，而是「写一个
-//! 临时文件再 rename 过去」。rename 之后原来那个 inode 就没人指了 ——
-//! 盯着文件的监听会在第一次保存之后**永久失效**，而且不报任何错。
-//!
-//! **二、去抖。**一次保存常常触发好几个事件（建临时文件、rename、改
-//! 属性、改 mtime）。不聚合的话，一次保存会触发好几轮重载。
+//! 盯目录不盯文件、去抖，这两件少哪个都会表现成「有时候能自动重载，有时候
+//! 不能」—— 都在 [`tw_watch`] 里，和客户端配置面的监听是同一份。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub use tw_watch::{Watch, WatchError};
 
 /// 聚合窗口。**200ms 是照着编辑器保存的节奏定的** —— 那一串事件通常
 /// 在几十毫秒内发完，而人对「改完文件到界面反应」这件事的耐心是秒级的
 /// （M2 的验收标准写的是三秒）。
 pub const DEBOUNCE: Duration = Duration::from_millis(200);
 
-#[derive(Debug, thiserror::Error)]
-pub enum WatchError {
-    #[error("changes to {path} could not be watched: {source}")]
-    Start {
-        path: PathBuf,
-        source: notify::Error,
-    },
-}
-
-/// 一个活着的监听。**扔掉它就停止监听** —— 所以调用方必须留着它。
-pub struct Watch {
-    _inner: notify::RecommendedWatcher,
-}
-
-/// 盯住 `path`，每聚合出一次改动就往 channel 里发一个信号。
+/// 盯住 `path`，每聚合出一次改动就往 channel 里发一个信号（见 [`tw_watch::watch`]）。
 ///
-/// 发的是「有事发生了」而不是「文件现在长这样」：**读文件是调用方的
-/// 事**，因为只有它知道要不要读（比如上一次自己刚写过）。而在这里读
-/// 会引入一个更糟的问题 —— 事件到达时写入可能还没完成。
+/// 盯的是它所在的目录，只认这一个文件名：同目录下的其他文件（历史目录、我们
+/// 自己的临时文件）不算。
 pub fn watch(path: &Path) -> Result<(Watch, tokio::sync::mpsc::Receiver<()>), WatchError> {
-    use notify::{EventKind, RecursiveMode, Watcher as _};
-
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    let target = path.to_path_buf();
-    let file_name = target.file_name().map(|s| s.to_os_string());
+    let file_name = path.file_name().map(|s| s.to_os_string());
     // 目录不存在时盯不住 —— 但配置文件的目录在这一步之前已经建好了。
-    let dir = target
+    let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-
-    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<()>();
-    let mut w = notify::recommended_watcher(move |ev: notify::Result<notify::Event>| {
-        let Ok(ev) = ev else { return };
-        // 只关心内容/存在性的变化。**访问时间之类的不算** —— 有些工具
-        // （备份、索引）会大量产生它们。
-        if !matches!(
-            ev.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) {
-            return;
-        }
-        // 同目录下的其他文件（历史目录、我们自己的临时文件）不算
-        let hit = ev.paths.iter().any(|p| match (&file_name, p.file_name()) {
-            (Some(want), Some(got)) => want == got,
-            _ => false,
-        });
-        if hit {
-            let _ = raw_tx.send(());
-        }
-    })
-    .map_err(|source| WatchError::Start {
-        path: dir.clone(),
-        source,
-    })?;
-    // 非递归：历史目录就在旁边，递归会把每一次快照都当成一次改动。
-    w.watch(&dir, RecursiveMode::NonRecursive)
-        .map_err(|source| WatchError::Start {
-            path: dir.clone(),
-            source,
-        })?;
-
-    // notify 的回调跑在它自己的线程上，这里把它接到 tokio 上并去抖。
-    std::thread::spawn(move || {
-        while raw_rx.recv().is_ok() {
-            // 收到一个之后，把窗口内后续的全部吞掉 —— 一次保存的那一串
-            // 事件因此只产生一个信号。
-            loop {
-                match raw_rx.recv_timeout(DEBOUNCE) {
-                    Ok(()) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            // 满了就丢：信号是「去看一眼」，堆积两个和堆积一个是一回事。
-            let _ = tx.try_send(());
-        }
-    });
-
-    Ok((Watch { _inner: w }, rx))
+    tw_watch::watch(
+        &[dir],
+        DEBOUNCE,
+        move |p| matches!((&file_name, p.file_name()), (Some(want), Some(got)) if want == got),
+    )
 }
 
 #[cfg(test)]

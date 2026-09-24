@@ -43,10 +43,10 @@ Point a client (Claude Code, Codex, and friends) at a local port, and:
 ## Crate layers
 
 ```
-tw-dialect · tw-guard · tw-breaker                        ← shared with the server edition
-tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret   ← domain logic
-tw-config · tw-store · tw-scan · tw-adopt · tw-observe    ← assembly
-tw-gateway · tw-control                                   ← data plane / control plane
+tw-dialect · tw-guard · tw-breaker                                   ← shared with the server edition
+tw-types · tw-engine · tw-pricing · tw-yaml · tw-secret · tw-watch   ← domain logic
+tw-config · tw-store · tw-scan · tw-adopt · tw-observe               ← assembly
+tw-gateway · tw-control                                              ← data plane / control plane
 ```
 
 The server edition depends on the top layer and nothing else: format

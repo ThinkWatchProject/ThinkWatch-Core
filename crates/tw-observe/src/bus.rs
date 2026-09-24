@@ -8,20 +8,47 @@
 //! 注意这条豁免**不适用于成本记账**：那类数据丢了账单永久对不
 //! 上，必须走别的路径。这里只走「丢了只是图上少个点」的东西。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
 const CAPACITY: usize = 1024;
 
+/// 生成速率看最近这么久里跑完的请求
+pub const RATE_WINDOW: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<tw_api::Event>,
     next_id: Arc<AtomicU64>,
-    /// 开始了、还没有结局的请求：它们的开始事件，按 id。见 [`EventBus::in_flight`]
-    open: Arc<Mutex<BTreeMap<u64, tw_api::Event>>>,
+    /// 在跑的和最近跑完的。见 [`EventBus::in_flight`]、[`EventBus::live`]
+    tally: Arc<Mutex<Tally>>,
+}
+
+/// 按事件数出来的现状。
+#[derive(Default)]
+struct Tally {
+    /// 开始了、还没有结局的请求：它们的开始事件，按 id
+    open: BTreeMap<u64, tw_api::Event>,
+    /// 在跑的请求首字节用了多久，毫秒。生成用时要从总耗时里减掉它
+    ttfb: HashMap<u64, u64>,
+    /// 最近跑完的：（什么时候结束的，输出了多少 token，生成用了多少毫秒）
+    done: VecDeque<(Instant, u64, u64)>,
+}
+
+impl Tally {
+    fn forget(&mut self, now: Instant) {
+        while self
+            .done
+            .front()
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) > RATE_WINDOW)
+        {
+            self.done.pop_front();
+        }
+    }
 }
 
 impl Default for EventBus {
@@ -36,7 +63,7 @@ impl EventBus {
         Self {
             tx,
             next_id: Arc::new(AtomicU64::new(1)),
-            open: Arc::default(),
+            tally: Arc::default(),
         }
     }
 
@@ -82,16 +109,42 @@ impl EventBus {
     /// 正处在一次 unwind 里 —— 再 panic 一次，整个进程就没了。锁中毒了也照样
     /// 拿里面的表：少记一笔的快照，好过一个没了的网关。
     fn track(&self, ev: &tw_api::Event) {
+        self.track_at(ev, Instant::now());
+    }
+
+    fn track_at(&self, ev: &tw_api::Event, now: Instant) {
         use tw_api::Event as E;
-        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let mut t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
         match ev {
             E::RequestStarted { id, .. } => {
-                open.insert(*id, ev.clone());
+                t.open.insert(*id, ev.clone());
             }
-            E::RequestFinished { id, .. }
-            | E::RequestFailed { id, .. }
-            | E::RequestCancelled { id, .. } => {
-                open.remove(id);
+            E::RequestHeaders { id, ttfb_ms, .. } => {
+                if t.open.contains_key(id) {
+                    t.ttfb.insert(*id, *ttfb_ms);
+                }
+            }
+            E::RequestFinished {
+                id,
+                duration_ms,
+                usage,
+                ..
+            } => {
+                t.open.remove(id);
+                let ttfb = t.ttfb.remove(id);
+                // **只数跑完了的。**取消的、断掉的输出不全，拿来算速率只会偏低；
+                // 没有响应头的（WebSocket）不知道生成用了多久，不瞎算
+                if let (Some(u), Some(ttfb)) = (usage, ttfb) {
+                    let gen_ms = duration_ms.saturating_sub(ttfb);
+                    if u.output > 0 && gen_ms > 0 {
+                        t.done.push_back((now, u.output, gen_ms));
+                    }
+                }
+                t.forget(now);
+            }
+            E::RequestFailed { id, .. } | E::RequestCancelled { id, .. } => {
+                t.open.remove(id);
+                t.ttfb.remove(id);
             }
             _ => {}
         }
@@ -111,12 +164,64 @@ impl EventBus {
     ///
     /// 表不会只进不出：每个开始事件都欠着恰好一个结局，由 `Ending` 保证。
     pub fn in_flight(&self) -> Vec<tw_api::Event> {
-        self.open
+        self.tally
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .open
             .values()
             .cloned()
             .collect()
+    }
+
+    /// 此刻的实时读数：在跑的请求（和 [`EventBus::in_flight`] 同一批），和最近
+    /// 一分钟跑完的请求平均每秒生成多少 token。
+    ///
+    /// **量的是生成的快慢**：每个请求的输出除以它生成用的时间（总耗时减去首字节），
+    /// 按 token 加权。拿「一分钟里输出了多少」去除以六十的话，一个跑了一分钟才
+    /// 结束的长请求，要等它结束之后才把速率一次性摊进来，数字跟着请求的长短忽高
+    /// 忽低。
+    pub fn live(&self) -> tw_api::LiveView {
+        self.live_at(Instant::now())
+    }
+
+    fn live_at(&self, now: Instant) -> tw_api::LiveView {
+        let mut t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
+        t.forget(now);
+        let (tokens, ms) = t
+            .done
+            .iter()
+            .fold((0u64, 0u64), |(tok, ms), (_, out, gen_ms)| {
+                (tok + out, ms + gen_ms)
+            });
+        let mut running: Vec<tw_api::RunningView> = t
+            .open
+            .values()
+            .filter_map(|e| match e {
+                tw_api::Event::RequestStarted {
+                    id,
+                    client,
+                    client_hint,
+                    model,
+                    provider,
+                    at_ms,
+                    ..
+                } => Some(tw_api::RunningView {
+                    id: *id,
+                    client: client.clone(),
+                    client_hint: client_hint.clone(),
+                    model: model.clone(),
+                    provider: provider.clone(),
+                    at_ms: *at_ms,
+                }),
+                _ => None,
+            })
+            .collect();
+        running.sort_by_key(|r| (r.at_ms, r.id));
+        tw_api::LiveView {
+            running,
+            tokens_per_sec: (ms > 0)
+                .then(|| (tokens.saturating_mul(1000) / ms).min(u32::MAX as u64) as u32),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<tw_api::Event> {
@@ -213,6 +318,120 @@ mod tests {
         assert_eq!(
             b.in_flight().iter().map(|e| e.id()).collect::<Vec<_>>(),
             [3, 5, 7]
+        );
+    }
+
+    fn headers(id: u64, ttfb_ms: u64) -> tw_api::Event {
+        tw_api::Event::RequestHeaders {
+            id,
+            status: 200,
+            ttfb_ms,
+        }
+    }
+
+    fn finished(id: u64, duration_ms: u64, output: u64) -> tw_api::Event {
+        tw_api::Event::RequestFinished {
+            id,
+            model: "m".into(),
+            status: 200,
+            bytes: 1,
+            duration_ms,
+            usage: Some(tw_api::UsageView {
+                input: 10,
+                output,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// **量的是生成的快慢**：首字节之前那一段不算，几个请求按 token 加权。
+    #[test]
+    fn the_rate_is_output_over_generation_time() {
+        let b = EventBus::new();
+        let now = Instant::now();
+        // 首字节 1 秒，之后 2 秒生成了 100 个
+        b.track_at(&started(1), now);
+        b.track_at(&headers(1, 1_000), now);
+        b.track_at(&finished(1, 3_000, 100), now);
+        assert_eq!(b.live_at(now).tokens_per_sec, Some(50));
+        // 又一个：1 秒生成了 50 个。合起来 150 个 / 3 秒
+        b.track_at(&started(2), now);
+        b.track_at(&headers(2, 500), now);
+        b.track_at(&finished(2, 1_500, 50), now);
+        assert_eq!(b.live_at(now).tokens_per_sec, Some(50));
+    }
+
+    /// 一分钟之前跑完的不算；**没有就是没有**，不是 0
+    #[test]
+    fn an_idle_minute_has_no_rate() {
+        let b = EventBus::new();
+        let then = Instant::now();
+        assert_eq!(b.live_at(then).tokens_per_sec, None);
+        b.track_at(&started(1), then);
+        b.track_at(&headers(1, 100), then);
+        b.track_at(&finished(1, 1_100, 40), then);
+        assert_eq!(b.live_at(then).tokens_per_sec, Some(40));
+        let later = then + RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(b.live_at(later).tokens_per_sec, None);
+    }
+
+    /// 没有响应头的（WebSocket）、失败和取消的，都不拿来算速率
+    #[test]
+    fn only_finished_requests_with_their_headers_make_a_rate() {
+        let b = EventBus::new();
+        let now = Instant::now();
+        b.track_at(&started(1), now);
+        b.track_at(&finished(1, 2_000, 100), now);
+        b.track_at(&started(2), now);
+        b.track_at(&headers(2, 100), now);
+        b.track_at(
+            &tw_api::Event::RequestCancelled {
+                id: 2,
+                model: "m".into(),
+                status: Some(200),
+                bytes: 1,
+                duration_ms: 2_000,
+                usage: Some(tw_api::UsageView {
+                    output: 100,
+                    ..Default::default()
+                }),
+            },
+            now,
+        );
+        let live = b.live_at(now);
+        assert_eq!(live.tokens_per_sec, None);
+        assert!(live.running.is_empty());
+    }
+
+    /// 菜单的「进行中」要知道是谁、用什么模型、跑了多久；开始得早的在前
+    #[test]
+    fn the_running_list_says_who_what_and_since_when() {
+        let b = EventBus::new();
+        let mut ev = started(7);
+        if let tw_api::Event::RequestStarted {
+            client_hint, at_ms, ..
+        } = &mut ev
+        {
+            *client_hint = Some("codex".into());
+            *at_ms = 900;
+        }
+        b.emit(started(3));
+        b.emit(ev);
+        let live = b.live();
+        assert_eq!(
+            live.running.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [7, 3]
+        );
+        assert_eq!(
+            live.running[0],
+            tw_api::RunningView {
+                id: 7,
+                client: "c".into(),
+                client_hint: Some("codex".into()),
+                model: "m".into(),
+                provider: "p".into(),
+                at_ms: 900,
+            }
         );
     }
 

@@ -122,6 +122,7 @@ pub fn router(state: ControlState) -> Router {
         .merge(listen::router())
         .at(ep::Events, events)
         .at(ep::InFlight, in_flight)
+        .at(ep::Live, live)
         .at(ep::Overview, overview)
         .at(ep::L1, l1)
         .at(ep::GetConfig, get_config)
@@ -251,6 +252,12 @@ async fn events(
 /// 的请求它一个都不知道，直到它们结束 —— 数「进行中」就会少数。
 async fn in_flight(State(s): State<ControlState>) -> Json<Vec<tw_api::Event>> {
     Json(s.bus().in_flight())
+}
+
+/// 在跑的请求和最近的生成速率（见 `EventBus::live`）。菜单栏每次重收都问它，
+/// 不必自己听事件去数。
+async fn live(State(s): State<ControlState>) -> Json<tw_api::LiveView> {
+    Json(s.bus().live())
 }
 
 /// 事件流编码成 SSE。
