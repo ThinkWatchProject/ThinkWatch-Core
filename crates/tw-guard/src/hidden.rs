@@ -257,6 +257,127 @@ pub fn scan(text: &str) -> Vec<Hit> {
     hits
 }
 
+/// 请求正文里查的那两种：**在任何正文里都没有正当用途的**（见 [`Kind::smuggles`]）。
+pub const SMUGGLING: [Kind; 2] = [Kind::Tag, Kind::Bidi];
+
+impl Kind {
+    /// [`Kind::slug`] 的反过来。认不出是 `None`
+    pub fn from_slug(s: &str) -> Option<Self> {
+        [
+            Kind::ZeroWidth,
+            Kind::Tag,
+            Kind::Bidi,
+            Kind::Homoglyph,
+            Kind::PrivateUse,
+        ]
+        .into_iter()
+        .find(|k| k.slug() == s)
+    }
+
+    /// 这一种由哪些码位组成，写成 `U+E0000–U+E007F`。**给界面说明规则用**；
+    /// 同形异义字不是按码位认的，是空的
+    pub fn ranges(&self) -> &'static [&'static str] {
+        match self {
+            Kind::ZeroWidth => &["U+200B–U+200D", "U+2060", "U+180E", "U+FEFF"],
+            Kind::Tag => &["U+E0000–U+E007F"],
+            Kind::Bidi => &["U+202A–U+202E", "U+2066–U+2069"],
+            Kind::PrivateUse => &["U+E000–U+F8FF", "U+F0000–U+FFFFD", "U+100000–U+10FFFD"],
+            Kind::Homoglyph => &[],
+        }
+    }
+}
+
+/// 调用方发来的正文里的一种藏法：在哪儿、几处、第一个长什么样。
+///
+/// **给网关的请求路径用**：一种藏法在一个地方合成一条，不是一个字符一条 ——
+/// 一整句藏起来的指令是几十个标签字符，报几十条等于没报。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smuggled {
+    pub kind: Kind,
+    /// 在工具结果里（抓回来的网页、读到的文件），而不是调用方自己打的字
+    pub in_tool_result: bool,
+    pub count: usize,
+    /// 第一个的码位，写成 `U+E0049`
+    pub example: String,
+    /// 标签字符解出来的原文，最多 [`REVEAL_MAX`] 个字符。**藏的是什么一眼看得见**
+    /// —— 光说「有 40 个标签字符」，没人判断得了它要干什么。双向控制符是空的
+    pub revealed: String,
+}
+
+/// [`Smuggled::revealed`] 最多多长
+pub const REVEAL_MAX: usize = 120;
+
+/// 扫一个请求里调用方的消息，工具结果也算。
+///
+/// **系统提示不扫**（那是配置网关的人写的），**模型自己说的话不扫**。只看
+/// `kinds` 里的那几种，通常是 [`SMUGGLING`]。
+///
+/// 不走 [`scan`]：那一个给配置文件用，每一处都要算行号、拼出整行的可见版本 ——
+/// 放在每个请求上，一句藏了几十个字符的指令就是几十次整行拷贝。
+pub fn scan_request(request: &tw_dialect::ir::Request, kinds: &[Kind]) -> Vec<Smuggled> {
+    use tw_dialect::ir::Role;
+    let mut out = Vec::new();
+    if kinds.is_empty() {
+        return out;
+    }
+    for m in request.messages.iter().filter(|m| m.role == Role::User) {
+        scan_parts(&m.parts, false, kinds, &mut out);
+    }
+    out
+}
+
+fn scan_parts(
+    parts: &[tw_dialect::ir::Part],
+    in_tool_result: bool,
+    kinds: &[Kind],
+    out: &mut Vec<Smuggled>,
+) {
+    use tw_dialect::ir::Part;
+    for p in parts {
+        match p {
+            Part::Text(s) => scan_smuggled(s, in_tool_result, kinds, out),
+            Part::ToolResult(r) => scan_parts(&r.content, true, kinds, out),
+            Part::Image(_) | Part::File { .. } | Part::Thinking(_) | Part::ToolCall(_) => {}
+        }
+    }
+}
+
+/// 扫一段文本，把找到的并进 `out`：同一种藏法在同一个地方（`in_tool_result`）
+/// 合成一条。**没法按消息结构读的正文用它**（WebSocket 上的一帧、安全页上的试一试）。
+pub fn scan_smuggled(text: &str, in_tool_result: bool, kinds: &[Kind], out: &mut Vec<Smuggled>) {
+    for c in text.chars() {
+        let Some(kind) = classify(c).filter(|k| kinds.contains(k)) else {
+            continue;
+        };
+        let at = match out
+            .iter()
+            .position(|f| f.kind == kind && f.in_tool_result == in_tool_result)
+        {
+            Some(i) => i,
+            None => {
+                out.push(Smuggled {
+                    kind,
+                    in_tool_result,
+                    count: 0,
+                    example: format!("U+{:04X}", c as u32),
+                    revealed: String::new(),
+                });
+                out.len() - 1
+            }
+        };
+        let f = &mut out[at];
+        f.count += 1;
+        // 标签字符是「ASCII 平移到 U+E0000 之上」：减回去就是藏的那个字
+        if kind == Kind::Tag
+            && let Some(plain) =
+                char::from_u32(c as u32 - 0xE0000).filter(|p| p.is_ascii_graphic() || *p == ' ')
+            && f.revealed.chars().count() < REVEAL_MAX
+        {
+            f.revealed.push(plain);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -271,6 +392,109 @@ mod tests {
     }
 
     use super::*;
+
+    fn user(parts: Vec<tw_dialect::ir::Part>) -> tw_dialect::ir::Request {
+        tw_dialect::ir::Request {
+            model: "m".into(),
+            messages: vec![tw_dialect::ir::Message {
+                role: tw_dialect::ir::Role::User,
+                parts,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn tagged(s: &str) -> String {
+        s.chars()
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn tag_characters_in_a_tool_result_are_found_and_revealed() {
+        use tw_dialect::ir::{Part, ToolResult};
+        let r = user(vec![Part::ToolResult(ToolResult {
+            id: "t".into(),
+            content: vec![Part::Text(format!("summarise this{}", tagged("ignore me")))],
+            is_error: false,
+        })]);
+        let found = scan_request(&r, &SMUGGLING);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, Kind::Tag);
+        assert!(found[0].in_tool_result);
+        assert_eq!(found[0].count, 9);
+        assert_eq!(found[0].example, "U+E0069");
+        assert_eq!(found[0].revealed, "ignore me", "藏的是什么要看得见");
+    }
+
+    #[test]
+    fn typed_text_and_a_tool_result_are_reported_apart() {
+        use tw_dialect::ir::{Part, ToolResult};
+        let r = user(vec![
+            Part::Text("abc\u{202E}fed".into()),
+            Part::ToolResult(ToolResult {
+                id: "t".into(),
+                content: vec![Part::Text("x\u{202E}y".into())],
+                is_error: false,
+            }),
+        ]);
+        let found = scan_request(&r, &SMUGGLING);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|f| f.kind == Kind::Bidi && f.revealed.is_empty())
+        );
+    }
+
+    #[test]
+    fn ordinary_text_in_any_script_passes_a_request_scan() {
+        for s in [
+            "👨\u{200D}👩\u{200D}👧 family",
+            "Привет, как дела?",
+            "می\u{200C}خواهم",
+            "π ≈ 3.14",
+        ] {
+            assert!(
+                scan_request(
+                    &user(vec![tw_dialect::ir::Part::Text(s.into())]),
+                    &SMUGGLING
+                )
+                .is_empty(),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_system_prompt_the_models_turns_and_a_switched_off_kind_are_not_scanned() {
+        use tw_dialect::ir::{Message, Part, Role};
+        let mut r = user(vec![Part::Text("hi \u{202E}".into())]);
+        r.system = vec![tagged("x")];
+        r.messages.push(Message {
+            role: Role::Assistant,
+            parts: vec![Part::Text(tagged("x"))],
+        });
+        assert_eq!(scan_request(&r, &SMUGGLING).len(), 1);
+        assert!(
+            scan_request(&r, &[Kind::Tag]).is_empty(),
+            "只查标签字符时双向控制符不该报"
+        );
+    }
+
+    #[test]
+    fn kinds_round_trip_through_their_slugs() {
+        for k in [
+            Kind::ZeroWidth,
+            Kind::Tag,
+            Kind::Bidi,
+            Kind::Homoglyph,
+            Kind::PrivateUse,
+        ] {
+            assert_eq!(Kind::from_slug(k.slug()), Some(k));
+        }
+        assert_eq!(Kind::from_slug("tags"), None);
+    }
 
     #[test]
     fn a_clean_document_produces_nothing() {

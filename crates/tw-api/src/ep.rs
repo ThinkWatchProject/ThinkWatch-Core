@@ -118,6 +118,8 @@ endpoints! {
     SetSecurityMode: PUT "/security/{guard}/mode" [guard], api::ModeSave => api::ConfigWritten;
     ToggleBuiltinRule: PUT "/security/{guard}/builtin/{id}" [guard, id], api::RuleToggle => api::ConfigWritten;
     SetBuiltinRuleAction: PUT "/security/{guard}/builtin/{id}/action" [guard, id], api::ActionSave => api::ConfigWritten;
+    /// 只有 `output_limit` 有上限
+    SetSecurityLimit: PUT "/security/{guard}/limit" [guard], api::LimitSave => api::ConfigWritten;
     CreateCustomRule: POST "/security/{guard}/custom" [guard], api::CustomRuleSave => api::ConfigWritten;
     UpdateCustomRule: PUT "/security/{guard}/custom/{name}" [guard, name], api::CustomRuleSave => api::ConfigWritten;
     DeleteCustomRule: DELETE "/security/{guard}/custom/{name}" [guard, name], api::BaseVersion => api::ConfigWritten;

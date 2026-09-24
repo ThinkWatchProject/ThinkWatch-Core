@@ -97,6 +97,7 @@ pub(super) async fn pipeline(
         parsed.as_ref(),
         ending,
     );
+    screen(&state, &rt, &reading, &started)?;
     let served = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
     let ending = ending
         .take()
@@ -401,6 +402,36 @@ fn start(
         },
     );
     Started { id, alive }
+}
+
+/// 请求防护：调用方发来的正文里（连同工具结果）有没有藏起来的字符、有没有命中
+/// 内容规则（见 [`crate::guard::screen`]）。
+///
+/// **在开始事件之后**：记录要挂在这个请求上，拒掉的请求也要在流量里留一行 ——
+/// 被拒是一次来源为 `denied` 的失败。**在尝试上游之前**：拒掉的一个字节都不发。
+///
+/// 按解码出来的消息看，所以只有生成回答的请求才看：计 token、嵌入这些接口没有
+/// 「调用方的消息」可言；解不开的体也不看 —— 同格式直通照样发，上游可能认得它。
+fn screen(
+    state: &AppState,
+    rt: &Runtime,
+    reading: &crate::client_api::Reading,
+    started: &Started,
+) -> Result<(), GatewayError> {
+    let Some(Ok(d)) = &reading.decoded else {
+        return Ok(());
+    };
+    let provider = started.alive.first().map(String::as_str).unwrap_or("");
+    match crate::guard::screen(
+        &state.bus,
+        started.id,
+        provider,
+        &crate::guard::Screen::of(rt),
+        &d.request,
+    ) {
+        Some(why) => Err(GatewayError::denied(why)),
+        None => Ok(()),
+    }
 }
 
 /// 这个请求是 Claude Code 发的吗。

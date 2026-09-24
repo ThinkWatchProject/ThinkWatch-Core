@@ -37,6 +37,10 @@ pub struct Runtime {
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
     /// 工具调用审查的规则。同上。
     pub tools: Arc<tw_guard::tools::rules::Rules>,
+    /// 内容过滤的规则。同上
+    pub content: Arc<tw_guard::content::Rules>,
+    /// 藏匿字符查哪几种
+    pub hidden: Vec<tw_guard::hidden::Kind>,
 }
 
 impl Runtime {
@@ -71,7 +75,7 @@ impl Runtime {
                     "gw.config.allow_from", detail = e => "listen.gateway.allow_from: {detail}"
                 ))
             })?;
-        // 两项防护的规则编译一次，跟着运行时一起换 —— 它们住在
+        // 各项防护的规则编译一次，跟着运行时一起换 —— 它们住在
         // config.yaml 的 `security` 里，所以「改了规则」和「改了别的配置」
         // 走同一条热重载路径。
         //
@@ -89,6 +93,10 @@ impl Runtime {
         let tools = sec.inspect_tools.rules().map_err(|e| {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         })?;
+        let content = sec.content.rules().map_err(|e| {
+            GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
+        })?;
+        let hidden = sec.hidden_text.kinds();
         Ok(Self {
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
@@ -96,6 +104,8 @@ impl Runtime {
             allow,
             redact: Arc::new(redact),
             tools: Arc::new(tools),
+            content: Arc::new(content),
+            hidden,
         })
     }
 }

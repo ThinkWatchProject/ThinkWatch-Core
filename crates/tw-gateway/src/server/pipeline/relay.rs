@@ -305,6 +305,13 @@ struct Relay {
     hold: bool,
     /// 整包那几条路攒着的 body
     whole: Vec<u8>,
+    /// 输出长度的上限。关着、或者上游回的不是成功时没有它
+    limit: Option<tw_guard::output::Limit>,
+    limit_mode: tw_config::SecurityMode,
+    /// 流的计数器。整包的在 `finish` 里一次数完
+    meter: Option<tw_guard::output::Meter>,
+    /// 客户端收到的格式：输出长度按它读
+    client_dialect: tw_dialect::ir::Dialect,
     bus: tw_observe::EventBus,
     id: u64,
     provider: String,
@@ -349,7 +356,25 @@ impl Relay {
         } else {
             Some(tw_guard::tools::wall::Wall::json_body(rt.tools.clone()))
         };
-        let hold = wall.is_some() && plan.whole_body() && !plan.convert_whole && !plan.collect;
+        // 输出长度只管模型的回答：上游回的是错误就不数
+        let limit_mode = rt.config.security.output_limit.mode;
+        let limit = (limit_mode.detects() && plan.status.is_success())
+            .then(|| rt.config.security.output_limit.limit());
+        let client_dialect = session.as_ref().map_or(upstream_dialect, |s| s.client);
+        let meter = limit.and_then(|l| {
+            if plan.client_sse {
+                Some(tw_guard::output::Meter::sse(l, client_dialect))
+            } else if plan.client_json_stream {
+                Some(tw_guard::output::Meter::json_array(l))
+            } else {
+                None
+            }
+        });
+        // 整包要数完才发得出去，和审查一样得攒着
+        let hold = (wall.is_some() || limit.is_some())
+            && plan.whole_body()
+            && !plan.convert_whole
+            && !plan.collect;
         Self {
             plan,
             session,
@@ -360,13 +385,18 @@ impl Relay {
             inspect,
             hold,
             whole: Vec::new(),
+            limit,
+            limit_mode,
+            meter,
+            client_dialect,
             bus: state.bus.clone(),
             id,
             provider: provider.name.clone(),
         }
     }
 
-    /// 处理上游的一块：返回现在该写给客户端的字节，以及防火墙切断时的那个错误。
+    /// 处理上游的一块：返回现在该写给客户端的字节，以及工具调用审查或输出长度切断时的
+    /// 那个错误。
     fn chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, Option<GatewayError>) {
         let out = self.restorer.process(chunk);
         // 翻译在还原之后、审查之前：**审查看的必须是客户端
@@ -388,10 +418,31 @@ impl Relay {
         }
         // **审查的是客户端将要看到的那一版**（还原之后的），
         // 因为那才是它真正会去执行的东西
-        let Some(w) = self.wall.as_mut() else {
-            return (out, None);
-        };
-        for v in w.feed(&out) {
+        if let Some(cut) = self.wall_cut(&out) {
+            return cut;
+        }
+        // 输出长度数的也是客户端将要看到的那一版。**切在帧上**：超过的那一帧不发
+        if let Some(t) = self.meter.as_mut().and_then(|m| m.feed(&out))
+            && let Some(why) = crate::guard::output_limited(
+                &self.bus,
+                self.id,
+                &self.provider,
+                self.limit_mode,
+                self.limit.map_or(0, |l| l.max),
+                t.seen,
+                false,
+            )
+        {
+            let safe = t.safe_prefix.min(out.len());
+            return (out[..safe].to_vec(), Some(GatewayError::denied(why)));
+        }
+        (out, None)
+    }
+
+    /// 工具调用审查这一块。切断的话返回该发的前缀和那个错误
+    fn wall_cut(&mut self, out: &[u8]) -> Option<(Vec<u8>, Option<GatewayError>)> {
+        let w = self.wall.as_mut()?;
+        for v in w.feed(out) {
             // 规则是切断 + 拦截档 = 切断
             let blocked = v.cut && self.inspect.acts();
             self.bus.emit(flagged(self.id, &self.provider, &v, blocked));
@@ -414,10 +465,10 @@ impl Relay {
                 // 字节都不发 —— 「尽力阻断」的要点是客户端拼不出
                 // 完整的工具调用
                 let safe = v.safe_prefix.min(out.len());
-                return (out[..safe].to_vec(), Some(err));
+                return Some((out[..safe].to_vec(), Some(err)));
             }
         }
-        (out, None)
+        None
     }
 
     /// 流走完了（或者断了）：吐出扣住的尾巴，**在结束事件之前** —— 否则最后
@@ -513,6 +564,33 @@ impl Relay {
                 }
             }
         }
+        // 整包的输出长度：**整份到手了才数得清，而它一个字节都还没发出去**，所以超了
+        // 就整份不发。流式的在 `chunk` 里边收边数过了
+        if let Some(limit) = self.limit
+            && !broke
+            && self.meter.is_none()
+        {
+            let over = match &self.session {
+                // 客户端要流、上游给了整包：写给客户端的是转出来的流，数上游那一份整包
+                Some(s) if self.plan.convert_whole && s.stream => {
+                    limit.check_whole(&self.whole, s.upstream)
+                }
+                _ => limit.check_whole(&tail, self.client_dialect),
+            };
+            if let Some(seen) = over
+                && let Some(why) = crate::guard::output_limited(
+                    &self.bus,
+                    self.id,
+                    &self.provider,
+                    self.limit_mode,
+                    limit.max,
+                    seen,
+                    true,
+                )
+            {
+                return (Vec::new(), Some(GatewayError::denied(why)));
+            }
+        }
         (tail, None)
     }
 
@@ -528,6 +606,13 @@ impl Relay {
                 502,
                 &format!("[ThinkWatch] {}", err.message()),
             ))
+        } else if let (true, Some(s)) = (self.plan.convert_whole, self.session.as_ref()) {
+            // 整包转换那条路一个字节都还没发：客户端要流就写一个错误帧，要整包就写错误体
+            Some(if s.stream && self.plan.status.is_success() {
+                err.sse_frame().into_bytes()
+            } else {
+                err.body_bytes()
+            })
         } else if self.plan.is_sse && self.session.is_none() {
             Some(err.sse_frame().into_bytes())
         } else if self.hold {

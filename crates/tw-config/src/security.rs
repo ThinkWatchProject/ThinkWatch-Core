@@ -1,4 +1,4 @@
-//! 两项防护：出站脱敏、工具调用审查。
+//! 五项防护：出站脱敏、工具调用审查、藏匿字符、内容过滤、输出长度。
 //!
 //! # 全局的，不按上游、不按路由
 //!
@@ -7,11 +7,11 @@
 //! 请求到底按什么规格走 —— 观察档按全部类别检测、拦截档按上游的类别替换，
 //! 于是同一个请求观察时报「检测到外泄」，切到拦截后一处不换。
 //!
-//! 现在两项防护各有一个档位和一套规则，对所有请求一视同仁。
+//! 现在每项防护各有一个档位（有规则的还有一套规则），对所有请求一视同仁。
 //!
 //! # 三态：关闭 / 观察 / 拦截
 //!
-//! **出厂时都停在「观察」。**
+//! **出厂时停在「观察」**（输出长度除外：它没有一个说得过去的出厂上限，出厂是关的）。
 //!
 //! 安全功能第一次接触用户的方式如果是「误报打断了正在跑的任务」，它就
 //! 死了 —— 用户会关掉整个功能，而且再也不会打开。但直接关掉又等于白做。
@@ -244,7 +244,244 @@ impl ToolPolicy {
     }
 }
 
-/// 两项防护。
+/// 藏匿字符：调用方发来的正文里（连同工具结果）人眼看不见、模型读得到的字符。
+/// 拦截档的动作是**拒绝这个请求**。
+///
+/// 只查在任何正文里都没有正当用途的两种（`tw_guard::hidden::SMUGGLING`）：标签字符
+/// 和双向控制符。零宽连接符组成表情、波斯文要零宽不连字，那几种不查。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HiddenPolicy {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub mode: Mode,
+    /// 不查这几种，按 slug：`tag` / `bidi`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+}
+
+impl HiddenPolicy {
+    /// 要查的那几种
+    pub fn kinds(&self) -> Vec<tw_guard::hidden::Kind> {
+        tw_guard::hidden::SMUGGLING
+            .into_iter()
+            .filter(|k| !self.disable.iter().any(|d| d == k.slug()))
+            .collect()
+    }
+}
+
+/// 一条内容规则命中之后，在拦截档下做什么。观察档一律只记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentAction {
+    /// 不发出去
+    Block,
+    /// 只记录。**手写的规则不写就是它**（「零值 = 安全」）
+    #[default]
+    Record,
+}
+
+impl ContentAction {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ContentAction::Block => "block",
+            ContentAction::Record => "record",
+        }
+    }
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s {
+            "block" => Some(ContentAction::Block),
+            "record" => Some(ContentAction::Record),
+            _ => None,
+        }
+    }
+    /// 一条内置规则出厂时在拦截档下做什么：出厂处置是 `block` 的拦，其余只记
+    pub fn factory(b: &tw_guard::content::Builtin) -> Self {
+        if b.action == tw_guard::content::Action::Block {
+            ContentAction::Block
+        } else {
+            ContentAction::Record
+        }
+    }
+    fn engine(self) -> tw_guard::content::Action {
+        match self {
+            ContentAction::Block => tw_guard::content::Action::Block,
+            ContentAction::Record => tw_guard::content::Action::Warn,
+        }
+    }
+}
+
+/// 一条内容规则怎么认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentMatch {
+    /// 不分大小写的子串。**不写就是它**：关键词是最常见的写法
+    #[default]
+    Contains,
+    /// 不分大小写的正则
+    Regex,
+}
+
+impl ContentMatch {
+    pub fn slug(&self) -> &'static str {
+        self.engine().slug()
+    }
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match tw_guard::content::Match::from_slug(s)? {
+            tw_guard::content::Match::Contains => Some(ContentMatch::Contains),
+            tw_guard::content::Match::Regex => Some(ContentMatch::Regex),
+        }
+    }
+    pub fn engine(self) -> tw_guard::content::Match {
+        match self {
+            ContentMatch::Contains => tw_guard::content::Match::Contains,
+            ContentMatch::Regex => tw_guard::content::Match::Regex,
+        }
+    }
+}
+
+/// 用户自己写的一条内容规则。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomContentRule {
+    pub name: String,
+    pub pattern: String,
+    #[serde(rename = "match", default, skip_serializing_if = "is_default")]
+    pub matching: ContentMatch,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub action: ContentAction,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+}
+
+/// 内容过滤：调用方发来的正文里（连同工具结果）出现了某个词或某种写法。
+/// 拦截档的动作是**拒绝这个请求**，只对处置为「拦」的规则。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentPolicy {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub mode: Mode,
+    /// 打开这几条出厂时关着的内置规则，按 id
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enable: Vec<String>,
+    /// 关掉这几条内置规则，按 id
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+    /// 内置规则在拦截档下做什么，**只写和出厂不一样的**
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actions: BTreeMap<String, ContentAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom: Vec<CustomContentRule>,
+}
+
+impl ContentPolicy {
+    /// 这条内置规则现在开着吗
+    pub fn builtin_on(&self, b: &tw_guard::content::Builtin) -> bool {
+        if b.on_by_default {
+            !self.disable.contains(&b.id)
+        } else {
+            self.enable.contains(&b.id)
+        }
+    }
+
+    /// 这条内置规则在拦截档下做什么（改过的按改过的）
+    pub fn builtin_action(&self, b: &tw_guard::content::Builtin) -> ContentAction {
+        self.actions
+            .get(&b.id)
+            .copied()
+            .unwrap_or_else(|| ContentAction::factory(b))
+    }
+
+    /// 这一份配置下的规则：开着的内置规则按改过的处置走，再加上启用着的自定义规则。
+    pub fn rules(&self) -> Result<tw_guard::content::Rules, tw_guard::content::BadRule> {
+        use tw_guard::content::{RuleInput, Rules, builtins};
+        let builtin = builtins()
+            .iter()
+            .filter(|b| self.builtin_on(b))
+            .map(|b| RuleInput {
+                action: self.builtin_action(b).engine(),
+                ..RuleInput::from(b)
+            });
+        let custom = self
+            .custom
+            .iter()
+            .filter(|c| !c.disabled)
+            .map(|c| RuleInput {
+                id: &c.name,
+                name: &c.name,
+                custom: true,
+                pattern: &c.pattern,
+                matching: c.matching.engine(),
+                action: c.action.engine(),
+            });
+        Rules::build(builtin.chain(custom))
+    }
+
+    /// 只有一条内置规则，**不管它开没开**，处置按这份配置走。安全页上「试一条」用它
+    pub fn one_builtin(&self, id: &str) -> Option<tw_guard::content::Rules> {
+        let b = tw_guard::content::builtin(id)?;
+        tw_guard::content::Rules::build([tw_guard::content::RuleInput {
+            action: self.builtin_action(b).engine(),
+            ..tw_guard::content::RuleInput::from(b)
+        }])
+        .ok()
+    }
+}
+
+/// 输出长度：模型一次回答的正文最多多少个字符。拦截档的动作是**切断**：流从超过的
+/// 那一帧起不再发，整包整份不发。
+///
+/// **出厂是关的。**「多长算失控」没有一个对所有人都说得过去的数，开着一个随手定的
+/// 上限，只会在某次正常的长回答上突然截断。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputLimitPolicy {
+    #[serde(default = "mode_off", skip_serializing_if = "is_off")]
+    pub mode: Mode,
+    /// 按字符数（Unicode 标量），不是字节
+    #[serde(
+        default = "default_max_chars",
+        skip_serializing_if = "is_default_max_chars"
+    )]
+    pub max_chars: usize,
+}
+
+/// 输出长度出厂的上限（只在打开之后才用得上）
+pub const DEFAULT_MAX_CHARS: usize = 100_000;
+/// 输出长度最多能设多大。**再大就是写错了** —— 没有模型一次回答得出一百万个字
+pub const MAX_CHARS_CEILING: usize = 1_000_000;
+
+impl Default for OutputLimitPolicy {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Off,
+            max_chars: DEFAULT_MAX_CHARS,
+        }
+    }
+}
+
+impl OutputLimitPolicy {
+    pub fn limit(&self) -> tw_guard::output::Limit {
+        tw_guard::output::Limit {
+            max: self.max_chars,
+            unit: tw_guard::output::Unit::Chars,
+        }
+    }
+}
+
+fn mode_off() -> Mode {
+    Mode::Off
+}
+fn is_off(m: &Mode) -> bool {
+    *m == Mode::Off
+}
+fn default_max_chars() -> usize {
+    DEFAULT_MAX_CHARS
+}
+fn is_default_max_chars(n: &usize) -> bool {
+    *n == DEFAULT_MAX_CHARS
+}
+
+/// 五项防护。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Security {
@@ -252,6 +489,12 @@ pub struct Security {
     pub redact: RedactPolicy,
     #[serde(default, skip_serializing_if = "is_default")]
     pub inspect_tools: ToolPolicy,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub hidden_text: HiddenPolicy,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub content: ContentPolicy,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub output_limit: OutputLimitPolicy,
 }
 
 impl Security {
@@ -275,6 +518,26 @@ impl Security {
                     .find(|id| !tool_rule_ids().any(|t| t == id.as_str()))
                     .map(|id| ("inspect_tools", id.as_str()))
             })
+            .or_else(|| {
+                let c = &self.content;
+                c.enable
+                    .iter()
+                    .chain(&c.disable)
+                    .chain(c.actions.keys())
+                    .find(|id| tw_guard::content::builtin(id).is_none())
+                    .map(|id| ("content", id.as_str()))
+            })
+            .or_else(|| {
+                self.hidden_text
+                    .disable
+                    .iter()
+                    .find(|id| {
+                        !tw_guard::hidden::SMUGGLING
+                            .iter()
+                            .any(|k| k.slug() == id.as_str())
+                    })
+                    .map(|id| ("hidden_text", id.as_str()))
+            })
     }
 
     /// 「拦截」态在这项防护上具体做什么。
@@ -284,7 +547,8 @@ impl Security {
     pub fn enforce_verb(line: &str) -> &'static str {
         match line {
             "redact" => "replaces",
-            "inspect_tools" => "cuts off",
+            "inspect_tools" | "output_limit" => "cuts off",
+            "hidden_text" | "content" => "refuses",
             _ => "enforces",
         }
     }
@@ -398,6 +662,71 @@ mod tests {
         // 而它还在跑；或者以为自己开了拦截，而它只在观察。
         assert!(serde_yaml_ng::from_str::<Security>("redact:\n  mode: observ").is_err());
         assert!(serde_yaml_ng::from_str::<Security>("redcat:\n  mode: off").is_err());
+    }
+
+    #[test]
+    fn the_new_guards_ship_as_decided_and_write_nothing_by_default() {
+        let s = Security::default();
+        assert_eq!(s.hidden_text.mode, Mode::Observe);
+        assert_eq!(s.content.mode, Mode::Observe);
+        assert_eq!(s.output_limit.mode, Mode::Off, "输出长度出厂是关的");
+        assert_eq!(s.output_limit.max_chars, DEFAULT_MAX_CHARS);
+        let out = serde_yaml_ng::to_string(&s).unwrap();
+        assert_eq!(out.trim(), "{}", "{out}");
+        // 关的就是不写；写了 observe 要能读回来
+        let back: Security =
+            serde_yaml_ng::from_str("output_limit:\n  mode: observe\n  max_chars: 5000\n").unwrap();
+        assert_eq!(back.output_limit.mode, Mode::Observe);
+        assert_eq!(back.output_limit.max_chars, 5000);
+    }
+
+    #[test]
+    fn the_content_policy_reaches_the_rules() {
+        let p: ContentPolicy = serde_yaml_ng::from_str(
+            "enable: [jailbreak]\ndisable: [ignore-all-previous]\nactions:\n  jailbreak: record\ncustom:\n  - name: 内部代号\n    pattern: project-x\n  - name: 正则\n    pattern: 'secret\\s+plan'\n    match: regex\n    action: block\n  - name: 停用的\n    pattern: zzz\n    disabled: true\n",
+        )
+        .unwrap();
+        assert_eq!(p.custom[0].matching, ContentMatch::Contains, "不写就是子串");
+        assert_eq!(p.custom[0].action, ContentAction::Record, "不写就是只记");
+        let rs = p.rules().unwrap();
+        let action = |id: &str| rs.rules.iter().find(|r| r.id == id).map(|r| r.action);
+        use tw_guard::content::Action;
+        assert_eq!(action("ignore-previous-instructions"), Some(Action::Block));
+        assert_eq!(action("ignore-all-previous"), None, "停用的还在");
+        assert_eq!(
+            action("jailbreak"),
+            Some(Action::Warn),
+            "改成只记的没按改过的走"
+        );
+        assert_eq!(action("act-as"), None, "出厂关着的开了");
+        assert_eq!(action("内部代号"), Some(Action::Warn));
+        assert_eq!(action("正则"), Some(Action::Block));
+        assert_eq!(action("停用的"), None);
+        assert!(p.one_builtin("act-as").is_some(), "关着的也能单独试");
+    }
+
+    #[test]
+    fn a_hidden_kind_can_be_switched_off() {
+        let p = HiddenPolicy {
+            disable: vec!["bidi".into()],
+            ..Default::default()
+        };
+        assert_eq!(p.kinds(), vec![tw_guard::hidden::Kind::Tag]);
+        assert_eq!(HiddenPolicy::default().kinds().len(), 2);
+    }
+
+    #[test]
+    fn unknown_ids_on_the_new_guards_are_named() {
+        let mut s = Security::default();
+        s.content.actions = [("jailbrake".to_string(), ContentAction::Block)].into();
+        assert_eq!(s.unknown_rule(), Some(("content", "jailbrake")));
+        let mut s = Security::default();
+        s.hidden_text.disable = vec!["zero_width".into()];
+        assert_eq!(
+            s.unknown_rule(),
+            Some(("hidden_text", "zero_width")),
+            "只有两种可以关"
+        );
     }
 
     #[test]

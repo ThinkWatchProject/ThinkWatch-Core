@@ -1,0 +1,154 @@
+# 内容过滤的出厂规则。
+#
+# **放在 YAML 里而不是硬编码**，和 rules.yaml 同一个理由：这个列表会跟着新的写法
+# 演进。两个网关共用这一份 —— 企业版的「预设组」就是按 `group` 分的它。
+#
+# 每条规则：
+#
+# - `id`：配置按它引用，**改了就是另一条规则**；
+# - `name`：英文名。界面按 id 查自己的名称表，这里的英文是查不到时的退路；
+# - `match`：`contains`（不分大小写的子串）或 `regex`（不分大小写的正则）。
+#   `contains` 的首尾空格有意义（` dan ` 靠它不误伤 `dance`）；
+# - `action`：出厂的处置，`block` / `warn` / `log`；
+# - `group`：`injection`（覆盖指令的说法）/ `persona`（改换身份、套提示词）/
+#   `chinese`（中文的说法）；
+# - `on_by_default`：出厂时开不开。**只开误报极少的那几条** —— 「act as」
+#   「system prompt」在写代码的对话里天天出现，出厂就开等于让记录变成噪音。
+
+- id: ignore-previous-instructions
+  name: Ignore previous instructions
+  pattern: 'ignore previous instructions'
+  match: contains
+  action: block
+  group: injection
+  on_by_default: true
+- id: ignore-all-previous
+  name: Ignore all previous
+  pattern: 'ignore all previous'
+  match: contains
+  action: block
+  group: injection
+  on_by_default: true
+- id: disregard-your-instructions
+  name: Disregard your instructions
+  pattern: 'disregard your instructions'
+  match: contains
+  action: block
+  group: injection
+  on_by_default: true
+- id: jailbreak
+  name: Jailbreak
+  pattern: 'jailbreak'
+  match: contains
+  action: block
+  group: injection
+- id: dan
+  name: DAN
+  pattern: ' dan '
+  match: contains
+  action: block
+  group: injection
+- id: developer-mode
+  name: Developer mode
+  pattern: 'developer mode'
+  match: contains
+  action: block
+  group: injection
+
+- id: you-are-now
+  name: Persona manipulation
+  pattern: 'you are now'
+  match: contains
+  action: block
+  group: persona
+- id: new-persona
+  name: New persona
+  pattern: 'new persona'
+  match: contains
+  action: warn
+  group: persona
+- id: act-as
+  name: Act as
+  pattern: 'act as'
+  match: contains
+  action: warn
+  group: persona
+- id: pretend-to-be
+  name: Pretend to be
+  pattern: 'pretend to be'
+  match: contains
+  action: warn
+  group: persona
+- id: system-prompt
+  name: System prompt extraction
+  pattern: 'system prompt'
+  match: contains
+  action: warn
+  group: persona
+- id: reveal-your-instructions
+  name: Reveal instructions
+  pattern: 'reveal your instructions'
+  match: contains
+  action: warn
+  group: persona
+- id: what-are-your-rules
+  name: What are your rules
+  pattern: 'what are your rules'
+  match: contains
+  action: log
+  group: persona
+- id: base64-wall
+  name: Base64 smuggling
+  pattern: '[A-Za-z0-9+/=]{50,}'
+  match: regex
+  action: warn
+  group: persona
+
+- id: zh-ignore-previous
+  name: Ignore previous instructions (Chinese)
+  pattern: '忽略之前'
+  match: contains
+  action: block
+  group: chinese
+- id: zh-forget-your
+  name: Forget your instructions (Chinese)
+  pattern: '忘记你'
+  match: contains
+  action: block
+  group: chinese
+- id: zh-do-not-follow
+  name: Do not follow (Chinese)
+  pattern: '不要遵循'
+  match: contains
+  action: block
+  group: chinese
+- id: zh-you-are-now
+  name: You are now (Chinese)
+  pattern: '现在你是'
+  match: contains
+  action: block
+  group: chinese
+- id: zh-role-play
+  name: Role-play (Chinese)
+  pattern: '扮演'
+  match: contains
+  action: warn
+  group: chinese
+- id: zh-reveal-your
+  name: Reveal your instructions (Chinese)
+  pattern: '透露你的'
+  match: contains
+  action: warn
+  group: chinese
+- id: zh-system-prompt
+  name: System prompt (Chinese)
+  pattern: '系统提示词'
+  match: contains
+  action: warn
+  group: chinese
+- id: zh-jailbreak
+  name: Jailbreak (Chinese)
+  pattern: '越狱'
+  match: contains
+  action: block
+  group: chinese
