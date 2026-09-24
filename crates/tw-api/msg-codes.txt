@@ -164,7 +164,6 @@ control.builtin_group_fixed
 control.callback_ports_busy
 control.chatgpt_backend_not_json
 control.chatgpt_backend_status
-control.chatgpt_backend_unreachable
 control.chatgpt_login.approval_unreadable
 control.chatgpt_login.device_status
 control.chatgpt_login.expired
