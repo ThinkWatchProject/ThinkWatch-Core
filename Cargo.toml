@@ -140,3 +140,8 @@ strip = "symbols"
 # 保持 unwind：catch_unwind 要靠它兜住单个请求的 panic。
 # abort 会让那层防护失效，整个进程跟着死 —— 而 core 死了所有 AI 客户端一起瞎。
 panic = "unwind"
+
+# 开发和测试构建只留行号表：报错和 panic 仍能指到文件和行，变量级调试信息不要。
+# 每个集成测试都是链接整个 crate 的独立二进制，带完整调试信息时 target/ 会涨到上百 GB。
+[profile.dev]
+debug = "line-tables-only"
