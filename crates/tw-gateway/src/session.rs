@@ -5,14 +5,71 @@
 //! 其中 $3.1 是反复读同一个大文件」这种洞察只有会话视图能给。
 //!
 //! 判据是：**system prompt 指纹 + 首条 user message 指纹**，
-//! 再加时间窗聚类（那一步在 recorder 里，因为它需要「上一条是什么时候」）。
+//! 再加时间窗聚类（[`Sessions`]：同一个指纹隔太久再出现，算新的一次）。
+//!
+//! **会话在请求开始的那一刻就定下来，只定一次**：开始事件带着它，落库的那一行
+//! 记的也是它。以前事件里只有指纹，归到哪一次要等落库时再算 —— 一个还在跑的
+//! 请求就说不出自己属于哪次会话，界面上只能是散着的一行。
 //!
 //! 为什么这两个指纹够用：一次对话里，客户端每一轮都把完整历史发上来，
 //! 所以**开头那两段在整个会话里逐字不变**，而不同任务的开头几乎不会
 //! 撞上。不完美，但对单机单用户场景足够 —— 而「足够」是这里的正确目标：
 //! 为了那点边角情形去做精确的会话跟踪，要么得改协议，要么得让客户端配合。
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use serde_json::Value;
+
+/// 隔多久算另一次任务。
+///
+/// **半小时是按「人」定的，不是按机器**：中间去开了个会再回来接着改，
+/// 那多半还是同一件事；隔了一夜再打开同一个仓库，那通常不是。切错的
+/// 代价是对称的（并多了或分多了），所以取一个人能理解的整数。
+pub const SESSION_GAP_MS: u64 = 30 * 60 * 1000;
+
+/// 记着几段对话就清一次早就断了的。**清掉的不会改变任何结果**：隔了这么久再
+/// 出现，本来就要算新的一次
+const PRUNE_AT: usize = 4096;
+
+/// 每个对话指纹当前归到哪一次会话，以及它最后一次出现是什么时候。
+///
+/// **只在内存里。**core 重启之后，同一段对话会被算成新的一次任务 ——
+/// 那不理想，但比把它持久化成又一份状态好：会话是个观测概念，不是
+/// 事实来源。**跨配置重载存活**：改一条规则不该把正在进行的任务切成两段。
+#[derive(Default)]
+pub struct Sessions {
+    open: Mutex<HashMap<String, (String, u64)>>,
+}
+
+impl Sessions {
+    /// 这个指纹、在这一刻开始的请求，归到哪一次会话。
+    ///
+    /// **会话 id 里带着起始时刻**（`{指纹}-{毫秒}`），所以同一段对话隔天再聊会
+    /// 得到两条记录 —— 而那正是我们想要的：它们是两次任务。
+    pub fn assign(&self, fp: &str, at_ms: u64) -> String {
+        // 锁中毒了照样拿里面的表：少并一段会话，好过一个不转发的网关
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        if open.len() >= PRUNE_AT {
+            open.retain(|_, (_, last)| at_ms.saturating_sub(*last) <= SESSION_GAP_MS);
+        }
+        let fresh = format!("{fp}-{at_ms}");
+        let e = open
+            .entry(fp.to_string())
+            .or_insert_with(|| (fresh.clone(), at_ms));
+        if at_ms.saturating_sub(e.1) > SESSION_GAP_MS {
+            *e = (fresh, at_ms);
+        } else {
+            e.1 = e.1.max(at_ms);
+        }
+        e.0.clone()
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.open.lock().unwrap().len()
+    }
+}
 
 /// 一段文本的短指纹。
 fn fp(s: &str) -> String {
@@ -139,6 +196,55 @@ mod tests {
         });
         let w = json!({"messages": [{"role": "user", "content": "真正的第一句"}]});
         assert_eq!(fingerprint(&v), fingerprint(&w));
+    }
+
+    /// 同一个指纹、没隔太久：同一次会话，id 是头一个请求开始的时刻；**隔的是离上一个
+    /// 请求多久**，不是离会话开始多久 —— 一次连着改了两个小时的任务还是一次
+    #[test]
+    fn a_conversation_stays_one_session_until_it_goes_quiet_for_the_gap() {
+        let s = Sessions::default();
+        let min = 60_000;
+        let first = s.assign("fp", 1_000);
+        assert_eq!(first, "fp-1000");
+        for i in 1..=8 {
+            assert_eq!(s.assign("fp", 1_000 + i * 20 * min), first, "第 {i} 个请求");
+        }
+        let last = 1_000 + 8 * 20 * min;
+        // 隔半小时整还算同一次；从那个请求起再隔半小时零一毫秒，就是新的一次
+        assert_eq!(s.assign("fp", last + SESSION_GAP_MS), first);
+        let later = last + 2 * SESSION_GAP_MS + 1;
+        assert_eq!(s.assign("fp", later), format!("fp-{later}"));
+        // 另一段对话各算各的
+        assert_eq!(s.assign("other", later), format!("other-{later}"));
+    }
+
+    /// 并发的请求不一定按开始的先后拿到号：**晚到的一个早一点的时刻不把「最后一次」
+    /// 往回拨**
+    #[test]
+    fn an_out_of_order_request_does_not_rewind_the_last_seen_time() {
+        let s = Sessions::default();
+        let first = s.assign("fp", 10 * SESSION_GAP_MS);
+        assert_eq!(s.assign("fp", 10 * SESSION_GAP_MS + 1_000), first);
+        assert_eq!(s.assign("fp", 10 * SESSION_GAP_MS + 500), first);
+        assert_eq!(
+            s.assign("fp", 10 * SESSION_GAP_MS + 1_000 + SESSION_GAP_MS),
+            first,
+            "最后一次是 +1000 那一个，不是 +500"
+        );
+    }
+
+    /// 表不会一直长：早就断了的对话被清掉，而清掉它们不改变任何结果
+    #[test]
+    fn long_quiet_conversations_are_forgotten_without_changing_any_answer() {
+        let s = Sessions::default();
+        for i in 0..PRUNE_AT as u64 {
+            s.assign(&format!("old-{i}"), 0);
+        }
+        assert_eq!(s.tracked(), PRUNE_AT);
+        let now = 3 * SESSION_GAP_MS;
+        assert_eq!(s.assign("new", now), format!("new-{now}"));
+        assert_eq!(s.tracked(), 1, "早就断了的对话还留着");
+        assert_eq!(s.assign("old-1", now), format!("old-1-{now}"));
     }
 
     #[test]

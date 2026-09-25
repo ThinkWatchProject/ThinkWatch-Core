@@ -19,7 +19,10 @@ use tw_api::Msg;
 
 /// 当前 schema 版本。**表的样子一变就加一，改 [`Db::create`] 里那一份。**
 /// 不写迁移：项目还没有存量用户，版本对不上的库整个重建。
-const SCHEMA: i64 = 19;
+///
+/// **一列 JSON 的样子变了也算**（比如 `routing` 多了必有的字段）：旧的那些行
+/// 读出来是坏的，而读的一方会把「解不开」当成「没有」。
+const SCHEMA: i64 = 20;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -103,8 +106,9 @@ pub struct RequestRow {
     /// 客户端没等到响应结束就走了。**和 `error` 是两件事**：它不算失败，
     /// 用量只算到断开那一刻，所以金额是估算
     pub cancelled: bool,
-    /// 路由决策与尝试链，JSON。本地应答的是 None；路由还没报出结论请求就
-    /// 结束了的也是：上游应答之前客户端就走了、被第二阶段规则拒绝
+    /// 路由决策与尝试链，JSON（`tw_api::RoutingView`）。本地应答的是 None：它们
+    /// 没到规则那一层。路由还没报出结论请求就结束了的（上游应答之前客户端就走
+    /// 了）也有，是开始时就知道的那几项，尝试链是空的
     pub routing: Option<String>,
     /// 服务它的那家怎么收钱：`per-token` / `free`。本地应答是 `free`
     pub billing: tw_api::Billing,
@@ -241,7 +245,8 @@ impl Db {
                 -- 服务它的那家怎么收钱。**存在行上**：今天把一家改成不计费，
                 -- 昨天的账不该跟着变
                 billing            TEXT    NOT NULL,
-                -- 路由决策与尝试链，一列 JSON：永远跟着那一行一起取
+                -- 路由决策与尝试链，一列 JSON：走的路由、命中的规则、试过的上游。
+                -- 详情跟着那一行一起取；各条规则命中了多少也从这里数
                 routing            TEXT,
                 -- 客户端和上游说不同的格式时做过的转换，以及被丢掉的字段
                 translated         TEXT,
@@ -1014,6 +1019,99 @@ impl Db {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 各条路由走了多少请求、各条规则命中了多少（见 [`tw_api::RouteHits`]）。
+    ///
+    /// **按每一行记下的路由算**，不按现在的配置推：请求走的是它那一刻的路由和
+    /// 规则。一个请求算在这几条规则上，每条只算一次：决定去向的那一条、附加了
+    /// 改写的每一条、选定上游之后拒绝了它的那一条。本地应答的没有路由，不算。
+    pub fn route_hits(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<tw_api::RouteHits>, DbError> {
+        /// 数命中要的那几项。尝试链不用解
+        #[derive(serde::Deserialize)]
+        struct Routed {
+            route: String,
+            rule: String,
+            rewritten_by: Vec<String>,
+            denied_by: Option<String>,
+        }
+        #[derive(Default)]
+        struct Tally {
+            requests: i64,
+            failed: i64,
+            last_ms: i64,
+            decided: i64,
+        }
+        impl Tally {
+            fn add(&mut self, at_ms: i64, failed: bool) {
+                self.requests += 1;
+                self.failed += failed as i64;
+                self.last_ms = self.last_ms.max(at_ms);
+            }
+        }
+        let mut st = self.conn.prepare(
+            "SELECT at_ms, error IS NOT NULL, routing FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND routing IS NOT NULL",
+        )?;
+        let rows = st.query_map(params![since_ms, until_ms], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut routes: std::collections::BTreeMap<
+            String,
+            (Tally, std::collections::BTreeMap<String, Tally>),
+        > = Default::default();
+        for row in rows {
+            let (at_ms, failed, json) = row?;
+            // 解不开的那一行不算。**一条坏掉的记录不该让整张表出不来**
+            let Ok(r) = serde_json::from_str::<Routed>(&json) else {
+                continue;
+            };
+            let (total, rules) = routes.entry(r.route).or_default();
+            total.add(at_ms, failed);
+            let decider = rules.entry(r.rule.clone()).or_default();
+            decider.add(at_ms, failed);
+            decider.decided += 1;
+            let mut counted = vec![r.rule];
+            for name in r.rewritten_by.into_iter().chain(r.denied_by) {
+                if !counted.contains(&name) {
+                    rules.entry(name.clone()).or_default().add(at_ms, failed);
+                    counted.push(name);
+                }
+            }
+        }
+        let mut out: Vec<tw_api::RouteHits> = routes
+            .into_iter()
+            .map(|(route, (total, rules))| {
+                let mut rules: Vec<tw_api::RuleHits> = rules
+                    .into_iter()
+                    .map(|(rule, t)| tw_api::RuleHits {
+                        rule,
+                        decided: t.decided,
+                        requests: t.requests,
+                        failed: t.failed,
+                        last_ms: t.last_ms,
+                    })
+                    .collect();
+                rules.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.rule.cmp(&b.rule)));
+                tw_api::RouteHits {
+                    route,
+                    requests: total.requests,
+                    failed: total.failed,
+                    last_ms: total.last_ms,
+                    rules,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.route.cmp(&b.route)));
+        Ok(out)
     }
 
     /// 删掉太老的 metadata。返回删了几条。
@@ -2275,5 +2373,134 @@ mod security_log_tests {
             assert_eq!(p.total, 0);
             assert_eq!(p.by_outcome, SecurityOutcomeCounts::default());
         }
+    }
+}
+
+#[cfg(test)]
+mod route_hits_tests {
+    use super::tests::{row, upstream_failed};
+    use super::*;
+
+    /// 一个经过路由的请求落库的样子。
+    fn routed(
+        id: i64,
+        at_ms: i64,
+        route: &str,
+        rule: &str,
+        rewritten_by: &[&str],
+        denied_by: Option<&str>,
+    ) -> RequestRow {
+        let mut r = row(id, at_ms);
+        r.routing = Some(
+            serde_json::to_string(&tw_api::RoutingView {
+                route: route.into(),
+                rule: rule.into(),
+                group: None,
+                rewritten_by: rewritten_by.iter().map(|s| s.to_string()).collect(),
+                denied_by: denied_by.map(str::to_string),
+                attempts: vec![],
+            })
+            .unwrap(),
+        );
+        r
+    }
+
+    fn hits<'a>(route: &'a tw_api::RouteHits, rule: &str) -> &'a tw_api::RuleHits {
+        route
+            .rules
+            .iter()
+            .find(|h| h.rule == rule)
+            .unwrap_or_else(|| panic!("`{rule}` 不在 {route:?} 里"))
+    }
+
+    /// 每条路由走了多少、每条规则命中了多少、多少失败了、最后一次是什么时候。
+    ///
+    /// **一个请求算在它命中的每条规则上，每条只算一次**：决定去向的、附加了改写
+    /// 的、选定上游之后拒绝了它的。被规则拒绝的也算命中 —— 它们是失败。
+    #[test]
+    fn each_route_and_rule_counts_the_requests_it_matched() {
+        let db = Db::in_memory().unwrap();
+        // 「工作」：两个走官方，其中一个还被关了思考、上游失败了
+        db.insert(&routed(1, 100, "工作", "opus 走官方", &[], None))
+            .unwrap();
+        let mut failed = routed(2, 300, "工作", "opus 走官方", &["关掉思考"], None);
+        failed.error = Some(upstream_failed("503"));
+        db.insert(&failed).unwrap();
+        // 决定去向的那条自己也带着改写：只算一次
+        db.insert(&routed(3, 200, "工作", "兜底", &["兜底"], None))
+            .unwrap();
+        // 规则拒绝了（第一阶段）：命中了，失败了
+        let mut denied = routed(4, 400, "工作", "不许用 haiku", &[], None);
+        denied.error = Some(upstream_failed("denied"));
+        db.insert(&denied).unwrap();
+        // 选定上游之后被拒（第二阶段）：两条规则都命中了
+        let mut late = routed(5, 500, "默认", "兜底", &[], Some("中转不收密钥"));
+        late.error = Some(upstream_failed("denied"));
+        db.insert(&late).unwrap();
+
+        let got = db.route_hits(0, 1_000).unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.route.as_str()).collect::<Vec<_>>(),
+            ["工作", "默认"],
+            "走得多的在前"
+        );
+        let work = &got[0];
+        assert_eq!((work.requests, work.failed, work.last_ms), (4, 2, 400));
+        let opus = hits(work, "opus 走官方");
+        assert_eq!(
+            (opus.decided, opus.requests, opus.failed, opus.last_ms),
+            (2, 2, 1, 300)
+        );
+        let thinking = hits(work, "关掉思考");
+        assert_eq!(
+            (thinking.decided, thinking.requests, thinking.failed),
+            (0, 1, 1),
+            "只附加改写的规则也有命中，只是没决定去向"
+        );
+        let catch_all = hits(work, "兜底");
+        assert_eq!((catch_all.decided, catch_all.requests), (1, 1));
+        let deny = hits(work, "不许用 haiku");
+        assert_eq!((deny.decided, deny.requests, deny.failed), (1, 1, 1));
+        assert_eq!(
+            work.rules
+                .iter()
+                .map(|h| h.rule.as_str())
+                .collect::<Vec<_>>(),
+            ["opus 走官方", "不许用 haiku", "兜底", "关掉思考"],
+            "命中多的在前，一样多按名字"
+        );
+
+        let default = &got[1];
+        assert_eq!((default.requests, default.failed), (1, 1));
+        assert_eq!(hits(default, "兜底").decided, 1);
+        let late_deny = hits(default, "中转不收密钥");
+        assert_eq!(
+            (late_deny.decided, late_deny.requests, late_deny.failed),
+            (0, 1, 1)
+        );
+    }
+
+    /// 窗口外的、本地应答的、没有路由的不算；**一条解不开的记录不挡住别的**
+    #[test]
+    fn only_routed_requests_inside_the_window_count() {
+        let db = Db::in_memory().unwrap();
+        db.insert(&routed(1, 50, "默认", "兜底", &[], None))
+            .unwrap();
+        db.insert(&routed(2, 150, "默认", "兜底", &[], None))
+            .unwrap();
+        db.insert(&routed(3, 250, "默认", "兜底", &[], None))
+            .unwrap();
+        let mut local = routed(4, 150, "默认", "兜底", &[], None);
+        local.local = true;
+        db.insert(&local).unwrap();
+        db.insert(&row(5, 150)).unwrap();
+        let mut broken = row(6, 150);
+        broken.routing = Some("{\"rule\":".into());
+        db.insert(&broken).unwrap();
+
+        let got = db.route_hits(100, 200).unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!((got[0].requests, got[0].last_ms), (1, 150));
+        assert!(db.route_hits(1_000, 2_000).unwrap().is_empty());
     }
 }
