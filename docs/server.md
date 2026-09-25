@@ -212,8 +212,7 @@ for a minute. Removing a network from `allow_from` also closes the
 connections already open from it.
 
 The desktop app stores the key in its data directory, in a file readable
-only by the user who runs the app, rather than in the system keychain. To
-replace it, run `twcore control-key --rotate` on the server; connections
+only by the user who runs the app. To replace it, run `twcore control-key --rotate` on the server; connections
 made with the old key are closed at once, and connected apps then have to
 be given the new key.
 
