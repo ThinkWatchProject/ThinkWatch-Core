@@ -15,6 +15,7 @@ pub mod ending;
 pub mod error;
 pub mod fixture;
 pub mod forward;
+pub mod glm;
 pub mod guard;
 pub mod health;
 pub mod hint;

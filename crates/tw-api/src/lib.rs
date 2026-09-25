@@ -589,7 +589,11 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// ChatGPT 登录的结果（[`ChatgptLoginStatus`]）不再带 `plan`，换成 `account`：和
 /// [`OAuthView::account`] 同一块（邮箱、套餐），从同一个 access token 里读。照 21 写的
 /// 界面会把 `/summary/routes` 当成数组去读，在登录结果里找不到套餐。
-pub const CONTROL_API_VERSION: u32 = 22;
+///
+/// **23 起额度也来自 GLM Coding Plan**（Z.ai / BigModel 的上游）：窗口多了 `monthly`，
+/// 积分制套餐的窗口带上 [`QuotaWindow::credits`]（总额、已用、剩余）。照 22 写的界面
+/// 不认 `monthly`，也看不到剩余积分。
+pub const CONTROL_API_VERSION: u32 = 23;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1232,14 +1236,15 @@ pub struct RoutingView {
     pub attempts: Vec<AttemptView>,
 }
 
-/// 一个订阅额度窗口。**每个字段都直接来自上游的响应头。**
+/// 一个订阅额度窗口。**每个字段都直接来自上游**：响应头，或者账号的额度接口。
 ///
 /// 我们自己推断的东西不放进这个结构 —— 界面上必须能区分「上游说的」和
 /// 「我们猜的」，而混在一个类型里就区分不了了。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct QuotaWindow {
-    /// `5h` / `7d`（Anthropic）/ `weekly`（Codex）
+    /// `5h` / `7d`（Anthropic）/ `weekly`（Codex、GLM）/ `monthly`（GLM 老套餐每月的
+    /// MCP 调用次数）
     pub window: String,
     pub used_percent: f64,
     /// 什么时候重置，Unix 毫秒。**是时刻，不是「还有多少秒」**：上游报的秒数
@@ -1249,6 +1254,21 @@ pub struct QuotaWindow {
     pub resets_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// 积分制套餐（GLM Coding Plan）这个窗口的积分。别的套餐没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<QuotaCredits>,
+}
+
+/// 一个额度窗口的积分，三个数都是上游给的原数。
+///
+/// **剩余不是总额减已用算出来的**：上游给的三个数不一定对得上（实测总额 2000、已用 23、
+/// 剩余 1976），界面要显示剩余就显示它说的剩余。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct QuotaCredits {
+    pub total: f64,
+    pub used: f64,
+    pub remaining: f64,
 }
 
 /// 一次调用的用量。
