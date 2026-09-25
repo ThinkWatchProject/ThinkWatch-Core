@@ -998,6 +998,7 @@ async fn usage(
                     used_percent: w.used_percent,
                     resets_at_ms: w.resets_at_ms,
                     status: w.status.clone(),
+                    credits: None,
                 })
                 .collect(),
         },
@@ -1022,6 +1023,7 @@ fn parse_usage(v: &Value, now_ms: u64) -> tw_api::ChatgptUsage {
                 .and_then(|x| x.as_u64())
                 .map(|secs| now_ms.saturating_add(secs.saturating_mul(1000))),
             status: (used >= 100.0).then(|| "rejected".to_string()),
+            credits: None,
         })
     };
     let limits = &v["rate_limit"];

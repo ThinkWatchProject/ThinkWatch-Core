@@ -236,16 +236,7 @@ impl AppState {
         self.bus.emit(tw_api::Event::QuotaSeen {
             id,
             provider: provider.to_string(),
-            windows: quota
-                .windows
-                .iter()
-                .map(|w| tw_api::QuotaWindow {
-                    window: w.window.clone(),
-                    used_percent: w.used_percent,
-                    resets_at_ms: w.resets_at_ms,
-                    status: w.status.clone(),
-                })
-                .collect(),
+            windows: quota.windows.iter().map(Into::into).collect(),
             at_ms: now_ms(),
         });
         for w in &quota.windows {
@@ -272,6 +263,16 @@ impl AppState {
                     at_ms: now_ms(),
                 });
             }
+        }
+    }
+
+    /// 这一家没有额度数据了（比如 key 没有开通套餐）：记着的额度和「用完」都不再作数
+    pub(crate) fn forget_quota(&self, provider: &str) {
+        if let Ok(mut g) = self.quotas.lock() {
+            g.remove(provider);
+        }
+        if let Ok(mut g) = self.exhausted.lock() {
+            g.retain(|(p, _)| p != provider);
         }
     }
 
