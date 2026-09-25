@@ -289,6 +289,69 @@ slug_enum! {
 }
 
 slug_enum! {
+    /// ChatGPT 套餐里认得的那些词，和 Codex 客户端认的是同一份。
+    ///
+    /// **这个集合不归我们定**：OpenAI 一直在加（`go`、`prolite` 都是后来才有的），
+    /// 认不出来的词见 [`ChatgptPlan::Other`]。
+    pub enum KnownChatgptPlan {
+        Free = "free",
+        Go = "go",
+        Plus = "plus",
+        Pro = "pro",
+        ProLite = "prolite",
+        ProMax = "promax",
+        Team = "team",
+        Business = "business",
+        SelfServeBusinessProLite = "self_serve_business_prolite",
+        SelfServeBusinessUsageBased = "self_serve_business_usage_based",
+        /// 后端也写成 `hc`
+        Enterprise = "enterprise",
+        Ent26 = "ent26",
+        EnterpriseCbpAutomation = "enterprise_cbp_automation",
+        EnterpriseCbpUsageBased = "enterprise_cbp_usage_based",
+        /// 后端也写成 `education`
+        Edu = "edu",
+        EduPlus = "edu_plus",
+        EduPro = "edu_pro",
+    }
+}
+
+/// ChatGPT 账号的套餐。
+///
+/// **线上就是后端给的那个词**：认得的是 [`KnownChatgptPlan`]，认不出来的原样给。
+/// 集合是 OpenAI 的，它随时会多出一个新名字 —— 把新名字说成「未知」，比照原词
+/// 写出来更差。前端的类型是 `KnownChatgptPlan | string`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum ChatgptPlan {
+    Known(KnownChatgptPlan),
+    /// 认不出来的词，原样
+    Other(String),
+}
+
+impl ChatgptPlan {
+    /// 读后端给的词。大小写不论，同一个套餐的另一种写法归到一个词上（`hc` 就是
+    /// `enterprise`，`education` 就是 `edu`）；空的是 `None`
+    pub fn from_raw(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let lower = raw.to_ascii_lowercase();
+        let word = match lower.as_str() {
+            "hc" => "enterprise",
+            "education" => "edu",
+            w => w,
+        };
+        Some(match KnownChatgptPlan::from_slug(word) {
+            Some(k) => Self::Known(k),
+            None => Self::Other(raw.to_string()),
+        })
+    }
+}
+
+slug_enum! {
     /// 登哪一家的账号。
     pub enum ZaiFamily {
         Zai = "zai",
@@ -506,7 +569,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （别的机器连网关用哪几个地址）。从远程端口进来的连接不能关 core、不能
 /// 取诊断包、不能改 `listen.control` 这一节（403，`control.remote.*`）。
 /// 照 19 写的客户端会缺这两个字段。
-pub const CONTROL_API_VERSION: u32 = 20;
+///
+/// **21 起账号上游登的是谁在上游视图里**：`OAuthView.account`（邮箱、套餐）从凭据
+/// 自己的 access token 里读，不联网；`ChatgptUsage` 不再带 `email` 和 `plan`。套餐是
+/// [`ChatgptPlan`]：认得的词是枚举，认不出来的原样给，登录结果里的 `plan` 也换成了它。
+/// 照 20 写的界面会去用量里找邮箱和套餐，而那里已经没有了。
+pub const CONTROL_API_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1456,6 +1524,33 @@ pub struct OAuthView {
     /// 凭据已经失效，只有重新登录能恢复
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_login: bool,
+    /// 登的是哪个账号。**ChatGPT 账号上游才有**，令牌里一项都读不出来时没有。
+    ///
+    /// Z.ai / BigModel 的账号上游没有 `oauth` 这一节，也就没有它：那类登录的终点是一把
+    /// 普通 API key，key 里读不出是谁，登录时读到的账号名只在那一次登录的结果里
+    /// （[`ZaiLoginStatus::account`]），不随 key 保存
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountView>,
+}
+
+/// 一个账号上游登的是哪个账号。
+///
+/// **从这份凭据自己的 access token 里读，不联网**：ChatGPT 的 access token 是 JWT，套餐
+/// 在 `https://api.openai.com/auth` 里，邮箱在 `https://api.openai.com/profile` 里。登录
+/// 和每一次刷新都换来一个新的、并且写回配置，所以它跟着凭据走：套餐变了，下一次换
+/// token 之后这里就是新的；凭据失效之后，这里仍是最后登着的那个账号。
+///
+/// 账户 ID、用户 ID 同在令牌里，**不往外带**：界面认账号靠邮箱，那两个读不出是谁，
+/// 而它们一旦出去就会进日志
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AccountView {
+    /// 令牌里没写就没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// 令牌里没写就没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<ChatgptPlan>,
 }
 
 /// 配置里引用了某个上游的一处。
@@ -2919,24 +3014,21 @@ pub struct ChatgptLoginStatus {
     /// 写进配置的上游名。`done` 时有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// 套餐：`plus` / `pro` / `team` …。`done` 时有，令牌里没写就没有
+    /// 套餐。`done` 时有，令牌里没写就没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
+    pub plan: Option<ChatgptPlan>,
     /// `failed` 时的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Msg>,
 }
 
 /// ChatGPT 账号的用量（`GET /providers/{name}/chatgpt/usage`）。
+///
+/// **登的是谁不在这里**，在上游视图的 [`OAuthView::account`]：那一份从本机的凭据里读，
+/// 不用为了给一行上游标上账号去问一次后端
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ChatgptUsage {
-    /// 登的是哪个账号。**只有邮箱** —— 同一份回答里的用户 ID
-    /// 和账户 ID 不往外带：界面认账号靠邮箱，那两个读不出是谁
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
     /// 额度窗口，词表同 [`QuotaWindow`]
     pub windows: Vec<QuotaWindow>,
     /// 可用的额度重置卡张数。账号没有这一项时没有
@@ -3882,6 +3974,11 @@ mod tests {
             ChatgptLoginMode::slug,
             ChatgptLoginMode::from_slug,
         );
+        check(
+            KnownChatgptPlan::ALL,
+            KnownChatgptPlan::slug,
+            KnownChatgptPlan::from_slug,
+        );
         check(ZaiFamily::ALL, ZaiFamily::slug, ZaiFamily::from_slug);
         check(
             ConfigOrigin::ALL,
@@ -4076,6 +4173,72 @@ mod tests {
                        "remote_control":{"enabled":false,"addr":null,"allow_from":[],"reachable":[]}}"#;
         let s: Status = serde_json::from_str(json).unwrap();
         assert!(s.gateway_addr.is_none());
+    }
+
+    /// 套餐的集合是 OpenAI 的：认得的归到一个词上，认不出来的原样过去，线上都是那个词。
+    #[test]
+    fn a_plan_is_the_backends_word_known_or_not() {
+        use serde_json::json;
+        let plus = ChatgptPlan::from_raw("Plus").unwrap();
+        assert_eq!(plus, ChatgptPlan::Known(KnownChatgptPlan::Plus));
+        assert_eq!(serde_json::to_value(&plus).unwrap(), json!("plus"));
+        // 同一个套餐的另一种写法
+        assert_eq!(
+            ChatgptPlan::from_raw("hc"),
+            Some(ChatgptPlan::Known(KnownChatgptPlan::Enterprise))
+        );
+        assert_eq!(
+            ChatgptPlan::from_raw(" education "),
+            Some(ChatgptPlan::Known(KnownChatgptPlan::Edu))
+        );
+        for &k in KnownChatgptPlan::ALL {
+            assert_eq!(ChatgptPlan::from_raw(k.slug()), Some(ChatgptPlan::Known(k)));
+        }
+        // 新名字不是「未知」，是它自己
+        let new = ChatgptPlan::from_raw("pro_ultra").unwrap();
+        assert_eq!(new, ChatgptPlan::Other("pro_ultra".into()));
+        assert_eq!(serde_json::to_value(&new).unwrap(), json!("pro_ultra"));
+        // 读回来：认得的是枚举，认不出来的仍是原词
+        assert_eq!(
+            serde_json::from_value::<ChatgptPlan>(json!("team")).unwrap(),
+            ChatgptPlan::Known(KnownChatgptPlan::Team)
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatgptPlan>(json!("pro_ultra")).unwrap(),
+            new
+        );
+        for blank in ["", "  "] {
+            assert_eq!(ChatgptPlan::from_raw(blank), None, "{blank:?}");
+        }
+    }
+
+    /// 令牌里没写的项不出现；没有账号的凭据连这一块都没有。
+    #[test]
+    fn an_account_says_only_what_the_token_said() {
+        use serde_json::json;
+        let a = AccountView {
+            email: Some("someone@example.com".into()),
+            plan: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            json!({"email": "someone@example.com"})
+        );
+        let mut o = OAuthView {
+            endpoint: "https://auth.example/token".into(),
+            client_id: None,
+            expires_at: None,
+            failure: None,
+            needs_login: false,
+            account: None,
+        };
+        assert!(serde_json::to_value(&o).unwrap().get("account").is_none());
+        o.account = Some(AccountView {
+            email: None,
+            plan: ChatgptPlan::from_raw("pro"),
+        });
+        let back: OAuthView = serde_json::from_value(serde_json::to_value(&o).unwrap()).unwrap();
+        assert_eq!(back, o);
     }
 }
 

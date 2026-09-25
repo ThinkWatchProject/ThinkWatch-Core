@@ -447,6 +447,7 @@ fn provider_view(
                 expires_at: o.expires_at.clone(),
                 needs_login: failure.as_ref().is_some_and(|(_, relogin)| *relogin),
                 failure: failure.map(|(why, _)| why),
+                account: chatgpt::account_view(s, p, o),
             }
         }),
         protocol: p.effective_protocol().map(Into::into),

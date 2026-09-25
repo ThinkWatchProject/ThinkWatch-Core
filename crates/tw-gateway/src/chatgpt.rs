@@ -142,16 +142,29 @@ pub fn keeps_client_header(name: &str) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Account {
     pub account_id: Option<String>,
-    /// `plus` / `pro` / `team` …
-    pub plan: Option<String>,
+    /// 邮箱。id_token 写在顶层，access token 写在 `https://api.openai.com/profile` 里
+    pub email: Option<String>,
+    pub plan: Option<tw_api::ChatgptPlan>,
     /// 数据驻留。`no_constraint` 当成没有
     pub residency: Option<String>,
 }
 
-/// 从 id_token 或 access token 里读账户信息。
+impl Account {
+    /// 给界面看的那一块：邮箱和套餐。**账户 ID 不在里面**（见 [`tw_api::AccountView`]）；
+    /// 两项都读不出来时没有
+    pub fn view(&self) -> Option<tw_api::AccountView> {
+        (self.email.is_some() || self.plan.is_some()).then(|| tw_api::AccountView {
+            email: self.email.clone(),
+            plan: self.plan.clone(),
+        })
+    }
+}
+
+/// 从 id_token 或 access token 里读账户信息。两种令牌都是 JWT，账户和套餐都在
+/// `https://api.openai.com/auth` 里；邮箱的位置不一样（见 [`Account::email`]）。
 ///
-/// **不验签。**令牌是我们自己经 TLS 从 OpenAI 换来的，读它只是为了拿要随请求带上的值，
-/// 不拿它做任何授权判断。
+/// **不验签。**令牌是我们自己经 TLS 从 OpenAI 换来的，读它只是为了拿要随请求带上的值、
+/// 给界面看的账号，不拿它做任何授权判断。
 pub fn account(jwt: &str) -> Account {
     let claims = jwt
         .split('.')
@@ -164,7 +177,11 @@ pub fn account(jwt: &str) -> Account {
     Account {
         account_id: text(&auth["chatgpt_account_id"])
             .or_else(|| text(&claims["chatgpt_account_id"])),
-        plan: text(&auth["chatgpt_plan_type"]),
+        email: text(&claims["email"])
+            .or_else(|| text(&claims["https://api.openai.com/profile"]["email"])),
+        plan: auth["chatgpt_plan_type"]
+            .as_str()
+            .and_then(tw_api::ChatgptPlan::from_raw),
         residency: text(&auth["chatgpt_compute_residency"])
             .or_else(|| text(&claims["chatgpt_compute_residency"]))
             .filter(|r| r != "no_constraint"),
@@ -490,6 +507,7 @@ mod tests {
     #[test]
     fn account_fields_come_from_the_auth_claims() {
         let id = jwt(serde_json::json!({
+            "email": "someone@example.com",
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acc-1",
                 "chatgpt_plan_type": "plus",
@@ -500,11 +518,65 @@ mod tests {
             account(&id),
             Account {
                 account_id: Some("acc-1".into()),
-                plan: Some("plus".into()),
+                email: Some("someone@example.com".into()),
+                plan: tw_api::ChatgptPlan::from_raw("plus"),
                 residency: None,
             }
         );
         assert_eq!(account("not-a-jwt"), Account::default());
+        assert_eq!(account("not-a-jwt").view(), None);
+    }
+
+    /// access token 没有顶层的 `email`，邮箱在 profile 那一块里；界面那一块只有邮箱和套餐。
+    #[test]
+    fn the_access_token_says_who_is_signed_in() {
+        let access = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc-1",
+                "chatgpt_user_id": "user-1",
+                "chatgpt_plan_type": "prolite"
+            },
+            "https://api.openai.com/profile": {"email": "someone@example.com", "email_verified": true}
+        }));
+        let a = account(&access);
+        assert_eq!(
+            a.view(),
+            Some(tw_api::AccountView {
+                email: Some("someone@example.com".into()),
+                plan: Some(tw_api::ChatgptPlan::Known(
+                    tw_api::KnownChatgptPlan::ProLite
+                )),
+            })
+        );
+        let shown = serde_json::to_string(&a.view()).unwrap();
+        assert!(
+            !shown.contains("acc-1") && !shown.contains("user-1"),
+            "{shown}"
+        );
+
+        // 后端的另一种写法归到同一个词上；新名字原样；只有一项也照样给
+        let plan = |p: &str| {
+            account(&jwt(serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_plan_type": p}
+            })))
+            .view()
+        };
+        assert_eq!(
+            plan("hc").and_then(|v| v.plan),
+            Some(tw_api::ChatgptPlan::Known(
+                tw_api::KnownChatgptPlan::Enterprise
+            ))
+        );
+        assert_eq!(
+            plan("pro_ultra"),
+            Some(tw_api::AccountView {
+                email: None,
+                plan: Some(tw_api::ChatgptPlan::Other("pro_ultra".into())),
+            })
+        );
+        // 什么都没写：没有这一块，而不是一块空的
+        assert_eq!(plan(""), None);
+        assert_eq!(account(&jwt(serde_json::json!({"sub": "x"}))).view(), None);
     }
 
     #[test]

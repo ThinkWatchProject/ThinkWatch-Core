@@ -305,6 +305,18 @@ impl Cache {
         self.refresh(provider, cfg, http).await
     }
 
+    /// 这家此刻在用的 access token：手里那个（可能刚换来、还没写回配置），没有就是配置里
+    /// 写着的。**不联网、不换，也不记进缓存** —— 只是读，给「登的是谁」这类从令牌里读的
+    /// 事实用。过没过期不管：过期的令牌说的仍是最后登着的那个账号
+    pub fn access_in_use(&self, provider: &str, cfg: &OAuth) -> Option<String> {
+        let g = self.inner.lock().expect("lock not poisoned");
+        g.get(provider)
+            // 换 token 失败时留下的那一条可能没有 access token
+            .filter(|l| l.usable_for(cfg) && !l.access.is_empty())
+            .map(|l| l.access.clone())
+            .or_else(|| cfg.access.clone().filter(|a| !a.is_empty()))
+    }
+
     /// 这家最近一次刷新失败的原因，和是不是要重新登录。没失败过、或者已经恢复，是 `None`。
     pub fn failure(&self, provider: &str, cfg: &OAuth) -> Option<(Msg, bool)> {
         let g = self.inner.lock().expect("lock not poisoned");
@@ -661,6 +673,41 @@ mod tests {
             stale.expires_at = Some(bad);
             assert!(rt.block_on(Cache::new().token("p", &stale, &http)).is_err());
         }
+    }
+
+    #[test]
+    fn the_token_in_use_is_the_one_in_hand_then_the_configured_one() {
+        let c = Cache::new();
+        let mut o = cfg("http://127.0.0.1:1/nope");
+        // 没换过、配置里也没写：不知道
+        assert_eq!(c.access_in_use("p", &o), None);
+        o.access = Some("a-cfg".into());
+        assert_eq!(c.access_in_use("p", &o).as_deref(), Some("a-cfg"));
+        // 只是读：缓存里没有因此多出一条
+        assert!(c.inner.lock().unwrap().is_empty());
+
+        // 刚换来、还没写回配置的那个优先
+        let live = |access: &str| Live {
+            fp: fingerprint(&o),
+            access: access.into(),
+            renew_at: None,
+            refresh: o.refresh.clone(),
+            obtained: Some(Instant::now()),
+            failed: None,
+        };
+        c.inner.lock().unwrap().insert("p".into(), live("a-live"));
+        assert_eq!(c.access_in_use("p", &o).as_deref(), Some("a-live"));
+        assert_eq!(c.access_in_use("q", &o).as_deref(), Some("a-cfg"));
+
+        // 用户换了一份凭据：手里那个不再算数
+        let mut other = o.clone();
+        other.refresh = "r-someone-else".into();
+        other.access = Some("a-other".into());
+        assert_eq!(c.access_in_use("p", &other).as_deref(), Some("a-other"));
+
+        // 换 token 失败时留下的空条目不算，退回配置里的
+        c.inner.lock().unwrap().insert("p".into(), live(""));
+        assert_eq!(c.access_in_use("p", &o).as_deref(), Some("a-cfg"));
     }
 
     #[test]

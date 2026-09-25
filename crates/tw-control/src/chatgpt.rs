@@ -1,4 +1,4 @@
-//! ChatGPT 账号：登录、用量、额度重置卡。
+//! ChatGPT 账号：登录、登的是谁、用量、额度重置卡。
 //!
 //! # 登录
 //!
@@ -486,7 +486,7 @@ fn not_in_time() -> Msg {
 }
 
 /// 记下登录的结果，并告诉界面一声
-fn settle(s: &ControlState, id: &str, done: Result<(String, Option<String>), Msg>) {
+fn settle(s: &ControlState, id: &str, done: Result<(String, Option<tw_api::ChatgptPlan>), Msg>) {
     let status = match done {
         Ok((provider, plan)) => tw_api::ChatgptLoginStatus {
             id: id.to_string(),
@@ -681,7 +681,7 @@ async fn exchange_and_save(
     code: &str,
     verifier: &str,
     redirect_uri: &str,
-) -> Result<(String, Option<String>), Msg> {
+) -> Result<(String, Option<tw_api::ChatgptPlan>), Msg> {
     let endpoints = &s.chatgpt.endpoints;
     let http = client_for(s, name, proxy)?;
     let tokens =
@@ -757,6 +757,22 @@ async fn exchange_and_save(
         tw_gateway::models::refresh_one(&gateway, &provider).await;
     });
     Ok((name, account.plan))
+}
+
+/// 这个上游登的是哪个账号：从它在用的 access token 里读（见 [`tw_api::AccountView`]）。
+///
+/// **不联网。**界面每画一次上游列表都要它；为了给一行上游标上账号去问一次后端，就是
+/// 每打开一次上游页、每个账号一次真实调用
+pub(crate) fn account_view(
+    s: &ControlState,
+    p: &tw_config::Provider,
+    o: &tw_config::OAuth,
+) -> Option<tw_api::AccountView> {
+    if p.effective_protocol() != Some(Protocol::Chatgpt) {
+        return None;
+    }
+    let token = s.gateway.oauth.access_in_use(&p.name, o)?;
+    chatgpt::account(&token).view()
 }
 
 /// 按出站方式建一个客户端。**要代理才能访问 OpenAI 的用户，直连会卡在换 token 这一步**
@@ -987,9 +1003,9 @@ async fn usage(
     Ok(Json(usage))
 }
 
-/// `wham/usage` 的回答。**只取界面要用的几项**：额度、套餐，以及邮箱
-/// —— 账号不止一个时，邮箱是用户分得清哪个是哪个的唯一一项。同一份回答里
-/// 的用户 ID 和账户 ID 不往外带：界面用不上，而它们一旦出去就会进日志
+/// `wham/usage` 的回答。**只取额度和重置卡**：同一份回答里的邮箱、套餐由上游视图从
+/// 凭据里读（[`account_view`]），用户 ID 和账户 ID 不往外带 —— 界面用不上，而它们一旦
+/// 出去就会进日志
 ///
 /// `now_ms`：收到回答的时刻。「还有多少秒重置」要靠它换成时刻
 fn parse_usage(v: &Value, now_ms: u64) -> tw_api::ChatgptUsage {
@@ -1008,8 +1024,6 @@ fn parse_usage(v: &Value, now_ms: u64) -> tw_api::ChatgptUsage {
     };
     let limits = &v["rate_limit"];
     tw_api::ChatgptUsage {
-        email: v["email"].as_str().map(str::to_string),
-        plan: v["plan_type"].as_str().map(str::to_string),
         windows: [&limits["primary_window"], &limits["secondary_window"]]
             .into_iter()
             .filter_map(window)
@@ -1119,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_keeps_the_limits_and_who_is_signed_in() {
+    fn usage_keeps_the_limits_and_nothing_about_who() {
         let v = serde_json::json!({
             "email": "someone@example.com",
             "user_id": "user-1",
@@ -1133,8 +1147,6 @@ mod tests {
             "rate_limit_reset_credits": {"available_count": 2}
         });
         let u = parse_usage(&v, 1_758_000_000_000);
-        assert_eq!(u.email.as_deref(), Some("someone@example.com"));
-        assert_eq!(u.plan.as_deref(), Some("plus"));
         assert_eq!(u.windows.len(), 1);
         assert_eq!(u.windows[0].window, "weekly");
         assert_eq!(u.windows[0].used_percent, 21.0);
@@ -1144,8 +1156,10 @@ mod tests {
             Some(1_758_000_000_000 + 410_907_000)
         );
         assert_eq!(u.reset_credits, Some(2));
-        // 用户 ID 不往外带：界面读不出是谁，而它一旦出去就会进日志
+        // 登的是谁在上游视图里（从凭据读）；用户 ID 更不往外带
         let json = serde_json::to_string(&u).unwrap();
-        assert!(!json.contains("user-1"), "{json}");
+        for who in ["someone@example.com", "user-1", "plus"] {
+            assert!(!json.contains(who), "{json}");
+        }
     }
 }

@@ -194,6 +194,22 @@ mod tests {
         );
     }
 
+    /// 集合不归我们定的字段：认得的词是字面量，其余照样是字符串。
+    #[test]
+    fn an_open_set_is_its_known_words_or_any_string() {
+        let ts = typescript();
+        assert_eq!(
+            decl_of(&ts, "ChatgptPlan"),
+            "export type ChatgptPlan = KnownChatgptPlan | string"
+        );
+        let known = decl_of(&ts, "KnownChatgptPlan");
+        assert!(known.contains("\"prolite\""), "{known}");
+        let oauth = decl_of(&ts, "OAuthView");
+        assert!(oauth.contains("account?: AccountView"), "{oauth}");
+        let login = decl_of(&ts, "ChatgptLoginStatus");
+        assert!(login.contains("plan?: ChatgptPlan"), "{login}");
+    }
+
     #[test]
     fn every_endpoint_is_in_the_table() {
         let ts = typescript();
