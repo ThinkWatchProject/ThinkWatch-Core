@@ -341,17 +341,24 @@ jobs:
       # 同一个原因，这一个 job 也会接上第二份：Release 已经在了 —— 重跑这个
       # job（比如挂文件挂到一半断了），或者 Release 先手工建好了（v0.11.0 就是
       # 这样多出一份的）。所以只在它还不存在时生成
+      #
+      # **「不存在」只认 gh 查不到时的那句 `release not found`。**网络断了、令牌
+      # 不对、被限流，gh 一样失败；把那些也当成「不存在」，Release 其实在的话就又
+      # 接上一份。所以别的失败让这一步挂掉，原话留在日志里
       - name: Notes only for a release that does not exist yet
         id: notes
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "generate=false" >> "$GITHUB_OUTPUT"
+          if out=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
+            echo "generate=false"
+          elif grep -qx 'release not found' <<<"$out"; then
+            echo "generate=true"
           else
-            echo "generate=true" >> "$GITHUB_OUTPUT"
-          fi
+            echo "$out" >&2
+            exit 1
+          fi >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2
         # 排练到上面为止
