@@ -349,13 +349,14 @@ post() { ctl --out "$TMP/out" -X POST -d "$2" "$1"; }
 NOW=$(python3 -c 'import time;print(int(time.time()*1000))')
 DAY=$((NOW - 86400000))
 for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=3600000" \
-          "/summary/by?dim=model&from_ms=$DAY" "/history?limit=5&from_ms=$DAY"; do
+          "/summary/by?dim=model&from_ms=$DAY" "/summary/routes?from_ms=$DAY" \
+          "/history?limit=5&from_ms=$DAY"; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET ${ep%%\?*}（带时间窗）" || bad "GET $ep 返回 $C" "$(cat "$TMP/out" 2>/dev/null | head -c 200)"
 done
 
 for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
-          /security/events /sessions /diagnostics /config /config/history /models; do
+          /security/events /sessions /diagnostics /config /config/history /models /in-flight /live; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done
@@ -366,6 +367,10 @@ C=$(post /dryrun '{"model":"claude-sonnet-4-5","route":"默认"}'); [ "$C" = "20
 C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" || bad "POST /models/refresh 返回 $C"
 C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
 [ "$C" = "True" ] && ok "/overview 带模型获取状态" || bad "/overview 的模型状态字段不对：$C"
+
+# 经过路由的请求按路由和规则数得到：决定去向的那条规则至少命中过一次
+C=$(ctl "/summary/routes?from_ms=$DAY" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(bool(d) and d[0]["requests"]>0 and any(r["decided"]>0 for r in d[0]["rules"]))')
+[ "$C" = "True" ] && ok "/summary/routes 数到了经过路由的请求" || bad "/summary/routes 没数到请求：$C"
 
 ID=$(ctl "/history?limit=1" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["id"] if d else 0)')

@@ -1,7 +1,8 @@
 //! `/in-flight`：此刻还在跑的请求。
 //!
-//! 半路才来听事件流的一方拿它补上漏掉的开始事件。这里盯的是**界面拿到的
-//! 那份 JSON**：和事件流里的开始事件同一个形状，有了结局的不在里面。
+//! 半路才来听事件流的一方拿它补上漏掉的事件。这里盯的是**界面拿到的那份
+//! JSON**：core 的时钟，加上每个在跑的请求到目前为止的事件 —— 和事件流里同一个
+//! 形状；有了结局的不在里面。
 
 use std::sync::Arc;
 
@@ -40,7 +41,11 @@ fn started(id: u64, model: &str) -> tw_api::Event {
         id,
         client: "我".into(),
         client_hint: Some("claude-code".into()),
-        session_fp: None,
+        session: None,
+        route: "default".into(),
+        rule: "catch-all".into(),
+        group: None,
+        rewritten_by: vec![],
         provider: "官方".into(),
         billing: tw_api::Billing::PerToken,
         model: model.into(),
@@ -50,7 +55,7 @@ fn started(id: u64, model: &str) -> tw_api::Event {
     }
 }
 
-async fn get(router: axum::Router) -> Vec<serde_json::Value> {
+async fn get(router: axum::Router) -> serde_json::Value {
     let resp = router
         .oneshot(Request::get("/in-flight").body(Body::empty()).unwrap())
         .await
@@ -62,12 +67,35 @@ async fn get(router: axum::Router) -> Vec<serde_json::Value> {
     serde_json::from_slice(&body).unwrap()
 }
 
-/// 开始了没结束的在里面，结束了的不在；每一条都是一个完整的开始事件。
+/// 开始了没结束的在里面，结束了的不在；每一个都带着到目前为止的事件，第一条是
+/// 完整的开始事件，之后是响应头、路由 —— 界面按顺序过一遍自己处理事件的代码，
+/// 就和从头听起一样。
 #[tokio::test]
-async fn it_lists_the_start_of_every_request_that_has_not_ended() {
+async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
     let (_d, bus, router) = app();
     bus.emit(started(1, "claude-sonnet-5"));
     bus.emit(started(2, "gpt-5.5"));
+    bus.emit(tw_api::Event::RequestHeaders {
+        id: 2,
+        status: 200,
+        ttfb_ms: 700,
+    });
+    bus.emit(tw_api::Event::RequestRouted {
+        id: 2,
+        route: "default".into(),
+        rule: "catch-all".into(),
+        group: None,
+        rewritten_by: vec![],
+        denied_by: None,
+        attempts: vec![tw_api::AttemptView {
+            provider: "官方".into(),
+            outcome: tw_api::AttemptOutcome::Served,
+            status: Some(200),
+            error: None,
+            ms: 700,
+        }],
+        billing: tw_api::Billing::PerToken,
+    });
     bus.emit(tw_api::Event::RequestFinished {
         id: 1,
         model: "claude-sonnet-5".into(),
@@ -78,20 +106,39 @@ async fn it_lists_the_start_of_every_request_that_has_not_ended() {
     });
 
     let got = get(router).await;
-    assert_eq!(got.len(), 1, "{got:?}");
-    // **和事件流里的开始事件同一个形状** —— 界面拿它原样补一条开始
-    assert_eq!(got[0]["kind"], "request_started");
-    assert_eq!(got[0]["id"], 2);
-    assert_eq!(got[0]["model"], "gpt-5.5");
-    assert_eq!(got[0]["client"], "我");
-    assert_eq!(got[0]["at_ms"], 1_002);
+    // **core 的时钟**：界面拿它减 `at_ms` 算跑了多久，不用自己的时钟
+    assert!(
+        got["now_ms"]
+            .as_u64()
+            .is_some_and(|t| t > 1_700_000_000_000),
+        "{got}"
+    );
+    let requests = got["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 1, "{got}");
+    assert_eq!(requests[0]["id"], 2);
+    let events = requests[0]["events"].as_array().unwrap();
+    // **和事件流里同一个形状** —— 界面拿它们原样补上
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["request_started", "request_headers", "request_routed"]
+    );
+    assert_eq!(events[0]["model"], "gpt-5.5");
+    assert_eq!(events[0]["client"], "我");
+    assert_eq!(events[0]["route"], "default");
+    assert_eq!(events[0]["at_ms"], 1_002);
+    assert_eq!(events[1]["status"], 200);
+    assert_eq!(events[2]["attempts"][0]["provider"], "官方");
 }
 
-/// 什么都没在跑：一个空数组，不是 404，也不是 null。
+/// 什么都没在跑：一个空的列表，不是 404，也不是 null。
 #[tokio::test]
 async fn nothing_running_is_an_empty_list() {
     let (_d, _bus, router) = app();
-    assert!(get(router).await.is_empty());
+    let got = get(router).await;
+    assert_eq!(got["requests"], serde_json::json!([]), "{got}");
 }
 
 async fn live(router: axum::Router) -> serde_json::Value {
@@ -143,4 +190,10 @@ async fn live_gives_the_running_requests_and_the_generation_rate() {
     assert_eq!(r["client_hint"], "claude-code");
     assert_eq!(r["model"], "gpt-5.5");
     assert_eq!(r["at_ms"], 1_002);
+    // 路由的第一阶段开始时就有；跑了多久是 core 数的
+    assert_eq!(r["route"], "default");
+    assert_eq!(r["rule"], "catch-all");
+    assert!(r["elapsed_ms"].is_u64(), "{v}");
+    // 路由还没报出结论：不知道是哪家接下的
+    assert!(r["upstream"].is_null(), "{v}");
 }

@@ -14,7 +14,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 
-use super::{Sender, now_ms};
+use super::{Choice, Sender, now_ms};
 use crate::error::GatewayError;
 use crate::forward;
 use crate::state::{AppState, Runtime};
@@ -47,6 +47,8 @@ struct Started {
     id: u64,
     /// 熔断过滤之后的候选，按顺序试
     alive: Vec<String>,
+    /// 第一阶段的结论。路由事件在它上面补上第二阶段和尝试链
+    choice: Choice,
 }
 
 pub(super) async fn pipeline(
@@ -74,9 +76,19 @@ pub(super) async fn pipeline(
         )));
     }
 
-    let (reading, parsed) = read(&req, intent);
+    let (reading, fp) = read(&req, intent);
     admit(&state, &rt, &req, &reading)?;
-    let decision = route(&state, &rt, &reading, parsed.as_ref())?;
+    let (choice, decision) = match route(&state, &rt, &req, &reading, fp.as_deref())? {
+        Routed::Go(choice, decision) => (choice, decision),
+        // 规则做了决定，请求却一家上游都不会去。**照样开始、照样报路由**，失败由
+        // `passthrough` 按这个错误报 —— 不排队：它一个字节都不会发出去
+        Routed::Refused(choice, why) => {
+            let to = ("", tw_api::Billing::PerToken);
+            let id = open(&state, &req, &reading, &choice, to, fp.as_deref(), ending);
+            state.bus.emit(super::routed_nowhere(id, choice));
+            return Err(why);
+        }
+    };
 
     // 管线第 3 步：这把密钥自己的并发上限。**等，不拒绝** —— 理由在
     // `crate::limits`。放在路由之后：被规则挡下的请求不用先等一轮
@@ -93,8 +105,9 @@ pub(super) async fn pipeline(
         &rt,
         &req,
         &reading,
+        choice,
         &decision,
-        parsed.as_ref(),
+        fp.as_deref(),
         ending,
     );
     screen(&state, &rt, &reading, &started)?;
@@ -165,21 +178,24 @@ fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
     }
 }
 
-/// 管线第 2 步的前半：读出路由事实。
+/// 管线第 2 步的前半：读出路由事实，和这段对话的指纹。
 ///
-/// **只解析一次。**路由要它，会话指纹也要它，而 body 可能有
-/// 几百 KB —— 解两遍是白付一份钱。
+/// **只解析一次，指纹也只算一次。**路由要它，会话粘滞的策略组要指纹，开始事件
+/// 归会话也要指纹，而 body 可能有几百 KB —— 解两遍、哈希两遍是白付一份钱。
 ///
 /// 生成回答的请求解码成中间表示，**四种格式的客户端读出同一份路由事实**。
 /// body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** —— 我们的解析器
 /// 不认识的东西，上游可能完全认识（只有需要转换时才用得上解码结果）
-fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<serde_json::Value>) {
+fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<String>) {
     let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
     let mut reading =
         crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed.as_ref());
     reading.facts.client = req.client_name.clone();
     reading.facts.intent = intent;
-    (reading, parsed)
+    // 认出「这几十个请求是同一次任务」。**认不出来就是 None** —— 硬凑一个会把
+    // 互不相干的请求并成一个「会话」
+    let fp = parsed.as_ref().and_then(crate::session::fingerprint);
+    (reading, fp)
 }
 
 /// 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
@@ -228,18 +244,32 @@ fn admit(
     Err(GatewayError::new(crate::error::Source::Request, why))
 }
 
+/// 管线第 2 步的后半的结果。
+enum Routed {
+    /// 选出了候选，照常往下走
+    Go(Choice, tw_engine::Decision),
+    /// 规则做了决定，请求却一家上游都不会去：规则拒绝了它，或者规则选中的上游
+    /// 都服务不了它。**这一行要留下**（见 [`super::routed_nowhere`]）
+    Refused(Choice, GatewayError),
+}
+
 /// 管线第 2 步的后半：路由。**规则引擎在这里** —— M0 那句「取第一个
 /// provider」就是留给这一段的接缝。
 ///
 /// 出来的候选已经去掉了服务不了的、按策略组排好了序；熔断过滤在并发
 /// 闸门之后（见 [`start`]）。
+///
+/// 返回的错误是**规则还没做出决定**的那些（没有一条规则命中、规则求不了值）：
+/// 那时说不出这个请求算在哪条规则上，不留这一行，和鉴权没过一样。
 fn route(
     state: &AppState,
     rt: &Runtime,
+    req: &Inbound,
     reading: &crate::client_api::Reading,
-    parsed: Option<&serde_json::Value>,
-) -> Result<tw_engine::Decision, GatewayError> {
+    fp: Option<&str>,
+) -> Result<Routed, GatewayError> {
     let facts = &reading.facts;
+    let route = rt.engine.route_of(&req.client_name).to_string();
     let mut decision = match rt.engine.route(facts).map_err(|e| {
         GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
     })? {
@@ -248,11 +278,25 @@ fn route(
             // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
             // 眼里没有区别。
             tracing::info!(%rule, "a rule denied the request");
-            return Err(GatewayError::denied(msg!(
-                "gw.route.denied", rule = rule, reason = reason =>
+            let why = GatewayError::denied(msg!(
+                "gw.route.denied", rule = rule.clone(), reason = reason =>
                 "Rule `{rule}` denied this request: {reason}"
-            )));
+            ));
+            // 拒绝了就什么都没改：累积的改写跟着这个决定一起作废
+            let choice = Choice {
+                route,
+                rule,
+                group: None,
+                rewritten_by: Vec::new(),
+            };
+            return Ok(Routed::Refused(choice, why));
         }
+    };
+    let choice = Choice {
+        route,
+        rule: decision.matched_rule.clone(),
+        group: decision.via_group.clone(),
+        rewritten_by: decision.rewritten_by.clone(),
     };
     // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的。
     // **在排序之前** —— `cheapest` 和 `url-test` 要在能服务的上游里挑。
@@ -266,7 +310,7 @@ fn route(
         &facts.model,
     );
     if serving.usable.is_empty() {
-        return Err(serving.explain(&facts.model));
+        return Ok(Routed::Refused(choice, serving.explain(&facts.model)));
     }
     if !serving.skipped.is_empty() {
         tracing::debug!(skipped = ?serving.skipped, model = %facts.model, "skipping the candidates that cannot serve this request");
@@ -287,7 +331,6 @@ fn route(
             .map(|g| g.kind)
         && kind.needs_runtime()
     {
-        let session = parsed.and_then(crate::session::fingerprint);
         let facts_rt = tw_engine::Facts {
             seq: state.bus.peek_id(),
             ttfb_ms: match kind {
@@ -300,29 +343,30 @@ fn route(
                 }
                 _ => Default::default(),
             },
-            session,
+            session: fp.map(str::to_string),
         };
         decision.candidates = rt
             .engine
             .order(Some(&gname), &decision.candidates, &facts_rt);
     }
-    Ok(decision)
+    Ok(Routed::Go(choice, decision))
 }
 
 /// 发出开始事件：熔断过滤、`RequestStarted`、结局、入站脱敏的记录、请求体留档。
 ///
 /// **发了开始，就欠一个结局。**从这里起，管线返回的错误由调用方报成
 /// 失败，这个 future 被丢掉由 Drop 报成取消（见 `passthrough`）。
+#[allow(clippy::too_many_arguments)]
 fn start(
     state: &AppState,
     rt: &Runtime,
     req: &Inbound,
     reading: &crate::client_api::Reading,
+    choice: Choice,
     decision: &tw_engine::Decision,
-    parsed: Option<&serde_json::Value>,
+    fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Started {
-    let facts = &reading.facts;
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
     // 两条边界都在 `Health::filter` 里，理由写在那儿。
     let (alive, fail_open) = state.health.filter(&decision.candidates);
@@ -334,40 +378,25 @@ fn start(
     }
     let alive: Vec<String> = alive.into_iter().map(|s| s.to_string()).collect();
 
-    let id = state.bus.next_id();
     // 头一个候选。故障转移之后实际服务的是谁、按什么记账，由后面的
     // `RequestRouted` 改过来
-    let first = alive
-        .first()
-        .and_then(|n| rt.config.providers.iter().find(|p| &p.name == n));
-    state.bus.emit(tw_api::Event::RequestStarted {
-        id,
-        client: req.client_name.clone(),
-        // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
-        // 不参与鉴权、路由、配额（见 crate::hint）。
-        client_hint: crate::hint::client_hint(&req.headers),
-        // 认出「这几十个请求是同一次任务」。**认不出来就是
-        // None** —— 硬凑一个会把互不相干的请求并成一个「会话」
-        session_fp: parsed.and_then(crate::session::fingerprint),
-        peer: req.from.peer.clone(),
-        key_masked: req.from.key.clone(),
-        provider: alive.first().map(|s| s.as_str()).unwrap_or("?").to_string(),
-        billing: first.map(|p| p.billing).unwrap_or_default().into(),
-        model: facts.model.clone(),
-        method: "POST".to_string(),
-        path: req.uri.path().to_string(),
-        at_ms: now_ms(),
-    });
-    let sink = state.body_sink();
-    let at_ms = now_ms() as i64;
-    *ending = Some(crate::ending::Ending::new(
-        state.bus.clone(),
-        id,
-        facts.model.clone(),
-        req.started,
-        at_ms,
-        sink.clone(),
-    ));
+    let first = alive.first().map(String::as_str).unwrap_or_default();
+    let billing = rt
+        .config
+        .providers
+        .iter()
+        .find(|p| p.name == first)
+        .map(|p| p.billing)
+        .unwrap_or_default();
+    let id = open(
+        state,
+        req,
+        reading,
+        &choice,
+        (first, billing.into()),
+        fp,
+        ending,
+    );
 
     // 出站脱敏：按全局的规则看一遍客户端发来的原文。**观察档和拦截档报的
     // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
@@ -383,6 +412,56 @@ fn start(
             at_ms: now_ms(),
         });
     }
+    Started { id, alive, choice }
+}
+
+/// 发 `RequestStarted`、把这个请求欠着的结局放进 `ending`、把请求体交去留档，
+/// 交回这个请求的号。`to` 是要发往的那一家和它怎么收钱；一家都不会去的（被规则
+/// 拒绝了）是空的名字。
+///
+/// **会话在这里定**（见 [`crate::session::Sessions`]）：开始事件带着它，落库的
+/// 那一行记的也是它。
+fn open(
+    state: &AppState,
+    req: &Inbound,
+    reading: &crate::client_api::Reading,
+    choice: &Choice,
+    to: (&str, tw_api::Billing),
+    fp: Option<&str>,
+    ending: &mut Option<crate::ending::Ending>,
+) -> u64 {
+    let facts = &reading.facts;
+    let id = state.bus.next_id();
+    let at_ms = now_ms();
+    state.bus.emit(tw_api::Event::RequestStarted {
+        id,
+        client: req.client_name.clone(),
+        // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
+        // 不参与鉴权、路由、配额（见 crate::hint）。
+        client_hint: crate::hint::client_hint(&req.headers),
+        session: fp.map(|fp| state.sessions.assign(fp, at_ms)),
+        peer: req.from.peer.clone(),
+        key_masked: req.from.key.clone(),
+        route: choice.route.clone(),
+        rule: choice.rule.clone(),
+        group: choice.group.clone(),
+        rewritten_by: choice.rewritten_by.clone(),
+        provider: to.0.to_string(),
+        billing: to.1,
+        model: facts.model.clone(),
+        method: "POST".to_string(),
+        path: req.uri.path().to_string(),
+        at_ms,
+    });
+    let sink = state.body_sink();
+    *ending = Some(crate::ending::Ending::new(
+        state.bus.clone(),
+        id,
+        facts.model.clone(),
+        req.started,
+        at_ms as i64,
+        sink.clone(),
+    ));
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
@@ -391,13 +470,13 @@ fn start(
         &sink,
         crate::bodies::BodyRecord {
             id,
-            at_ms,
+            at_ms: at_ms as i64,
             kind: crate::bodies::BodyKind::Request,
             body: req.body.clone(),
             original_len: req.body.len(),
         },
     );
-    Started { id, alive }
+    id
 }
 
 /// 请求防护：调用方发来的正文里（连同工具结果）有没有藏起来的字符、有没有命中

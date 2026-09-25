@@ -99,7 +99,11 @@ fn started(id: u64) -> tw_api::Event {
         id,
         client: "我".into(),
         client_hint: Some("claude-code".into()),
-        session_fp: None,
+        session: None,
+        route: "default".into(),
+        rule: "catch-all".into(),
+        group: None,
+        rewritten_by: vec![],
         peer: None,
         key_masked: None,
         provider: "官方".into(),
@@ -135,8 +139,11 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
         });
         rec.on_event(&tw_api::Event::RequestRouted {
             id: 7,
+            route: "default".into(),
             rule: "catch-all".into(),
             group: Some("__all__".into()),
+            rewritten_by: vec![],
+            denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
                 outcome: tw_api::AttemptOutcome::Served,

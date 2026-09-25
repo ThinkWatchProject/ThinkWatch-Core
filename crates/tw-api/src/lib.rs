@@ -574,6 +574,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 自己的 access token 里读，不联网；`ChatgptUsage` 不再带 `email` 和 `plan`。套餐是
 /// [`ChatgptPlan`]：认得的词是枚举，认不出来的原样给，登录结果里的 `plan` 也换成了它。
 /// 照 20 写的界面会去用量里找邮箱和套餐，而那里已经没有了。
+///
+/// 同一版起**路由和会话在请求开始时就说清楚**：`RequestStarted` 的 `session_fp`
+/// 换成了 `session`（落库的那个会话 id，由网关在开始时定），并带上 `route`、
+/// `rule`、`group`、`rewritten_by`；`RequestRouted` 带上 `route`、`rewritten_by`、
+/// `denied_by`，规则拒绝了的请求也发。`GET /in-flight` 不再是开始事件的数组，是
+/// [`InFlight`]：core 的时钟加上每个在跑的请求到目前为止的事件。`RunningView`
+/// 多了 `elapsed_ms`、`session`、`route`、`rule`、`group`、`upstream`。新增
+/// `GET /summary/routes`。照 20 写的界面会把 `/in-flight` 当成数组去读。
 pub const CONTROL_API_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -657,12 +665,16 @@ pub enum Event {
         /// 生效了吗」。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_hint: Option<String>,
-        /// 这次请求属于哪一段对话的指纹。
+        /// 这次请求归到哪一次会话（任务）。**落库时 `requests.session` 就是这个值**，
+        /// 和 `SessionView.id` 是同一个。
         ///
-        /// **只是指纹，不是会话 id** —— 会话是「同一个指纹 + 没隔太久」，
-        /// 而「隔了多久」要看上一条是什么时候，那是 recorder 的活。
+        /// 由网关在开始的那一刻定，只定一次：同一段对话（system prompt 和第一句话
+        /// 的指纹）、离这段对话的上一个请求不超过半小时，就还是那一次；隔久了算
+        /// 新的一次。**开始时就给出来**，界面才能把一个还在跑的请求放进它的会话、
+        /// 把那次会话标成进行中。认不出会话的没有：正文里没有任何能认人的东西，
+        /// 或者是 WebSocket 升级（升级请求没有正文）
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_fp: Option<String>,
+        session: Option<String>,
         /// 请求从哪台机器来：**这条连接对面的地址**，不可伪造。本机（回环）
         /// 来的不记 —— 那是绝大多数请求，写上只是噪音；局域网来的才值得
         /// 说一句「来自 192.168.1.23」。几台机器共用一把密钥时，只有它分得开
@@ -672,13 +684,28 @@ pub enum Event {
         /// 用的那把** —— 密钥更换过之后，老记录上的尾巴照样对得上
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_masked: Option<String>,
+        /// 走的哪条路由：这把密钥指定的那条，没指定的是默认路由。
+        ///
+        /// **路由的第一阶段在开始之前就走完了**，所以这几项（路由、规则、策略组、
+        /// 改写）开始时就有：界面不必按密钥现在的配置去猜这个请求走的是哪条，
+        /// 那份配置在请求开始之后可能已经改过了。`RequestRouted` 带着同样的几项，
+        /// 外加第二阶段和尝试链的结果
+        route: String,
+        /// 决定去向的那条规则：路由里第一条命中的转发或拒绝
+        rule: String,
+        /// 规则把请求交给的策略组。规则直接指上游、或者拒绝了它时没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        /// 附加了参数改写的规则，按求值的顺序（`rule` 自己带着改写时也在里面）。
+        /// 选定上游之后才判断的那些要等 `RequestRouted`
+        rewritten_by: Vec<String>,
         provider: String,
         /// `provider` 那一家怎么收钱，和 `RequestRouted::billing` 同一套词。
         ///
         /// **算数的是 `RequestRouted` 报的那个**（最终服务的那家）。这里先报
         /// 一个，是因为不是每个请求都等得到那一条：上游应答之前客户端就走了
-        /// 的、WebSocket 升级没完成就断开的、被第二阶段规则拒绝的，手上只有
-        /// 这一个 —— 少了它，那一行说不出该按什么记账。
+        /// 的、WebSocket 升级没完成就断开的，手上只有这一个 —— 少了它，那一行
+        /// 说不出该按什么记账。
         billing: Billing,
         /// 客户端要的模型名。**成本要靠它查价**，而它只在请求体里 ——
         /// 少了这个字段，落库那一步就只能记一笔没有模型的账
@@ -771,13 +798,30 @@ pub enum Event {
     ///
     /// WebSocket 那条路也发：和上游的握手有了结果就发。那条路不做故障转移，
     /// 尝试链只有一跳。
+    ///
+    /// **规则做了决定、请求却一家上游都没到的也发**：规则拒绝了它（第一阶段），
+    /// 或者规则选中的上游都服务不了这个模型 —— 那时尝试链是空的，紧跟着一条
+    /// 失败。每条规则命中了多少请求要数得到它们（见 `GET /summary/routes`）。
+    ///
+    /// 带着的是这次请求**完整的路由记录**，落库的就是它（[`RoutingView`]）：开始
+    /// 事件里那几项（路由、规则、策略组、改写）在这里再给一遍，是这一份的终稿 ——
+    /// 改写多了第二阶段的，还有第二阶段的拒绝。
     RequestRouted {
         id: u64,
+        /// 走的哪条路由，同 `RequestStarted::route`
+        route: String,
         /// 命中了哪条规则。**日志和界面都要显示它** —— 「命中第 4 条」
         /// 远不如「命中『带缓存的必须走官方』」有用
         rule: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        /// 附加了参数改写的规则：开始事件里的那几条，加上选定上游之后才判断、
+        /// 又改写了它的（故障转移时每一跳各判断一次，合在一起，不重复）
+        rewritten_by: Vec<String>,
+        /// 选定上游之后才判断的规则拒绝了这次请求：是哪一条。**这时尝试链的最后
+        /// 一跳就是被拒的那一家**（没有发出去）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        denied_by: Option<String>,
         /// 试过哪几家、各自什么结果。**一次就成的也有一条** ——
         /// 「只试了一家」和「试了三家」在用户眼里应该是不同的
         attempts: Vec<AttemptView>,
@@ -1160,12 +1204,24 @@ pub struct AttemptView {
 }
 
 /// 一次请求的路由决策。**详情抽屉的 Routing 那一页吃它。**
+///
+/// 字段就是 [`Event::RequestRouted`] 里的那些（计费方式记在那一行上）。路由还没
+/// 报出结论请求就结束了的（上游应答之前客户端就走了）也有：开始时就知道的那几项，
+/// 尝试链是空的。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RoutingView {
+    /// 走的哪条路由：密钥指定的那条，没指定的是默认路由
+    pub route: String,
+    /// 决定去向的那条规则：第一条命中的转发或拒绝
     pub rule: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 附加了参数改写的规则，按求值的顺序（见 `RequestRouted::rewritten_by`）
+    pub rewritten_by: Vec<String>,
+    /// 选定上游之后才判断的规则拒绝了它：是哪一条
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_by: Option<String>,
     pub attempts: Vec<AttemptView>,
 }
 
@@ -1262,7 +1318,54 @@ pub struct RunningView {
     pub model: String,
     /// 开始时的首选上游
     pub provider: String,
+    /// 开始的时刻，**core 的时钟**
     pub at_ms: u64,
+    /// 已经跑了多久，毫秒，**core 算的**（按它自己的单调时钟）。界面拿自己的时钟
+    /// 去减 `at_ms` 的话，连的是另一台机器上的 core 时两边的时钟不一定对得上；
+    /// 问完之后往上走的那一截由界面自己数
+    pub elapsed_ms: u64,
+    /// 归到哪一次会话，同 `RequestStarted::session`
+    pub session: Option<String>,
+    /// 走的哪条路由、哪条规则决定的去向、经过哪个策略组 —— 开始时就知道
+    pub route: String,
+    pub rule: String,
+    pub group: Option<String>,
+    /// 实际接下它的上游：尝试链里接下了的那一跳。**路由报出结论之前没有**
+    /// （还在等上游的响应头，或者正在故障转移）
+    pub upstream: Option<String>,
+}
+
+/// 此刻还在跑的请求（`GET /in-flight`）：每一个到目前为止的事件，和 core 此刻的
+/// 时钟。
+///
+/// **给半路才来听事件流的一方重建现状用。**事件流只送订阅之后发生的事；一个在那
+/// 之前就开始、此刻还没结束的请求，它的开始、响应头、路由都早就发过了。把每个
+/// 请求的 `events` 按顺序喂给自己处理事件的那段代码，就和从头听起一样。
+///
+/// **和 `Status::in_flight` 不是一个数。**那个从连接进到数据面就算，排队等名额的、
+/// 鉴权没过的都在里面 —— 它回答的是「现在重启会掐断几个连接」。这里只有发过开始
+/// 事件的请求，和事件流里说的是同一批，也和 `LiveView::running` 是同一批。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct InFlight {
+    /// core 此刻的时钟，Unix 毫秒。**算「跑了多久」用它减开始事件的 `at_ms`**，
+    /// 两个都是 core 的时钟；界面自己的时钟和远程 core 的不一定对得上
+    pub now_ms: u64,
+    /// 开始了、还没有结局的请求，开始得早的在前
+    pub requests: Vec<InFlightRequest>,
+}
+
+/// 一个还在跑的请求到目前为止的事件。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct InFlightRequest {
+    pub id: u64,
+    /// 关于它的事件，**照事件流上的样子、按发生的先后**：第一条是 `RequestStarted`，
+    /// 之后是到目前为止发生了的 —— 响应头、路由、格式转换、防护的记录
+    /// （`RequestHeaders`、`RequestRouted`、`Translated`、`SecretsFound`、
+    /// `HiddenTextFound`、`ContentMatched`、`OutputLimited`、`ToolCallFlagged`）。
+    /// 说的是上游现状的（`QuotaSeen`）不在里面：那是 `/quota` 的事
+    pub events: Vec<Event>,
 }
 
 /// 配置文件没通过校验的那一次。字段和 [`Event::ConfigRejected`] 一样。
@@ -2781,6 +2884,49 @@ pub struct CostGroup {
     pub no_usage_requests: i64,
 }
 
+/// 一条路由在一段时间里走了多少请求，各条规则命中了多少（`GET /summary/routes`）。
+///
+/// **按请求落库时记下的路由算**，不按现在的配置推：一个请求走的是它那一刻的
+/// 路由和规则，之后改名、删掉、换了绑定都不改它。所以这里可能有配置里已经没有的
+/// 路由和规则，而配置里有、这段时间一次都没命中的不在这里 —— 「从来没命中过」
+/// 就是在配置里有、在这里找不到。
+///
+/// 数的是经过路由的请求：本地应答的不算（它们没到规则那一层）；规则还没做出决定
+/// 就失败了的也不算 —— 鉴权没过、模型不让用、没有一条规则命中。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RouteHits {
+    pub route: String,
+    /// 走这条路由的请求数
+    pub requests: i64,
+    /// 其中失败的。**被规则拒绝的也算**；客户端取消的不算（同 `Summary::failed`）
+    pub failed: i64,
+    /// 最后一个请求是什么时候开始的，Unix 毫秒
+    pub last_ms: i64,
+    /// 这条路由里各条规则命中了多少，多的在前。
+    ///
+    /// **一个请求可以算在几条规则上**：决定去向的那一条（转发或拒绝）、附加了参数
+    /// 改写的每一条、选定上游之后拒绝了它的那一条。所以各条加起来可以比
+    /// `requests` 多；决定去向的规则每个请求恰好一条
+    pub rules: Vec<RuleHits>,
+}
+
+/// 一条规则命中了多少请求。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RuleHits {
+    pub rule: String,
+    /// 它决定了去向（转发或拒绝）的请求数
+    pub decided: i64,
+    /// 它命中的请求数：决定了去向的、附加了改写的、选定上游之后拒绝了的，一个
+    /// 请求只算一次
+    pub requests: i64,
+    /// 其中失败的（同 `RouteHits::failed`）
+    pub failed: i64,
+    /// 最后一次命中的请求是什么时候开始的，Unix 毫秒
+    pub last_ms: i64,
+}
+
 /// 分组维度。**是个枚举不是字符串** —— 它最终来自 query string，
 /// 而把它拼进 SQL 的列名里就是一个注入口。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -2878,8 +3024,9 @@ pub struct HistoryRow {
     /// 缓存命中省下了多少微分。`None` = 算不出来
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_saved_micros: Option<i64>,
-    /// 路由决策与尝试链。本地应答的没有它；路由还没报出结论请求就结束了的
-    /// 也没有：上游应答之前客户端就走了、被第二阶段规则拒绝
+    /// 路由决策与尝试链。本地应答的没有它：它没到规则那一层。路由还没报出
+    /// 结论请求就结束了的（上游应答之前客户端就走了）有开始时就知道的那几项，
+    /// 尝试链是空的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingView>,
     /// 按什么价格算的。没算出金额的没有它
@@ -4059,7 +4206,11 @@ mod tests {
                 id: 7,
                 client: "c".into(),
                 client_hint: None,
-                session_fp: None,
+                session: None,
+                route: "default".into(),
+                rule: "catch-all".into(),
+                group: None,
+                rewritten_by: vec![],
                 provider: "p".into(),
                 billing: Billing::PerToken,
                 model: "m".into(),
@@ -4100,6 +4251,60 @@ mod tests {
         ] {
             assert_eq!(e.id(), 7);
         }
+    }
+
+    /// 开始事件带着会话和路由的第一阶段：界面不用等落库、不用按现在的配置去猜。
+    /// 没有的就不出现（认不出的会话、直接指上游的规则没有策略组）
+    #[test]
+    fn a_start_says_its_session_and_where_it_is_headed() {
+        let e = Event::RequestStarted {
+            key_masked: None,
+            peer: None,
+            id: 7,
+            client: "c".into(),
+            client_hint: None,
+            session: Some("abc-def-1000".into()),
+            route: "工作".into(),
+            rule: "opus 走官方".into(),
+            group: None,
+            rewritten_by: vec!["关掉思考".into()],
+            provider: "官方".into(),
+            billing: Billing::PerToken,
+            model: "m".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            at_ms: 0,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["session"], "abc-def-1000");
+        assert_eq!(v["route"], "工作");
+        assert_eq!(v["rule"], "opus 走官方");
+        assert_eq!(v["rewritten_by"], serde_json::json!(["关掉思考"]));
+        assert!(v.get("group").is_none(), "{v}");
+        assert!(v.get("session_fp").is_none(), "{v}");
+    }
+
+    /// `/in-flight` 是一个对象：core 的时钟，加上每个在跑的请求到目前为止的事件，
+    /// 事件照事件流上的样子
+    #[test]
+    fn the_in_flight_snapshot_carries_the_clock_and_each_requests_events() {
+        let snap = InFlight {
+            now_ms: 5_000,
+            requests: vec![InFlightRequest {
+                id: 3,
+                events: vec![Event::RequestHeaders {
+                    id: 3,
+                    status: 200,
+                    ttfb_ms: 40,
+                }],
+            }],
+        };
+        let v = serde_json::to_value(&snap).unwrap();
+        assert_eq!(v["now_ms"], 5_000);
+        assert_eq!(v["requests"][0]["id"], 3);
+        assert_eq!(v["requests"][0]["events"][0]["kind"], "request_headers");
+        let back: InFlight = serde_json::from_value(v).unwrap();
+        assert_eq!(back.requests[0].events[0].id(), 3);
     }
 
     /// 取消带着用量走 —— **存储层要拿它算钱**。而客户端在第一帧之前就走了

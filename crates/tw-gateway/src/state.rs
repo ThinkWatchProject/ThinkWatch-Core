@@ -202,6 +202,8 @@ pub struct AppState {
     proxies: Arc<std::sync::Mutex<std::collections::HashMap<String, upstream::ProxyState>>>,
     /// 正在服务中的请求数。见 [`crate::live`]。
     pub live: crate::live::Live,
+    /// 每段对话此刻归到哪一次会话（见 [`crate::session::Sessions`]）。**跨重载存活**
+    pub sessions: Arc<crate::session::Sessions>,
 }
 
 impl AppState {
@@ -249,6 +251,7 @@ impl AppState {
             rejected: Arc::new(std::sync::Mutex::new(Default::default())),
             proxies: Arc::new(std::sync::Mutex::new(Default::default())),
             live: crate::live::Live::default(),
+            sessions: Default::default(),
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();

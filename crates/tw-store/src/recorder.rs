@@ -28,8 +28,10 @@ struct Partial {
     path: String,
     status: Option<u16>,
     ttfb_ms: Option<i64>,
-    /// 路由决策，JSON。**在结束事件之前到达** —— 尝试链走完才发它
-    routing: Option<String>,
+    /// 路由决策。**开始事件就带着第一阶段的结论**（路由、规则、策略组、改写），
+    /// 尝试链走完之后路由事件换成终稿 —— 等不到路由事件的请求（上游应答之前
+    /// 客户端就走了）也说得出它走的是哪条路由、哪条规则
+    routing: tw_api::RoutingView,
     /// 服务它的那家怎么收钱。**开始事件就带着**（要发往的那一家的），路由
     /// 事件到了换成最终服务的那家的 —— 等不到路由事件的请求也有一个真实的值
     billing: tw_api::Billing,
@@ -62,12 +64,6 @@ pub struct Recorder {
     /// 结束的请求就按新价算，不用重启
     pricing: tw_pricing::Shared,
     inflight: HashMap<u64, Partial>,
-    /// 每个对话指纹当前归到哪一次会话，以及它最后一次出现是什么时候。
-    ///
-    /// **只在内存里。**core 重启之后，同一段对话会被算成新的一次任务 ——
-    /// 那不理想，但比把它持久化成第四份状态好：会话是个观测概念，不是
-    /// 事实来源。
-    sessions: HashMap<String, (String, i64)>,
     /// 算完价钱之后往回报一条。
     ///
     /// **这一层是唯一知道价钱的地方** —— 网关只知道用了多少 token，
@@ -77,13 +73,6 @@ pub struct Recorder {
     /// `None` 表示没人要听（测试、以及不带总线的调用方）。
     bus: Option<tw_observe::EventBus>,
 }
-
-/// 隔多久算另一次任务。
-///
-/// **半小时是按「人」定的，不是按机器**：中间去开了个会再回来接着改，
-/// 那多半还是同一件事；隔了一夜再打开同一个仓库，那通常不是。切错的
-/// 代价是对称的（并多了或分多了），所以取一个人能理解的整数。
-const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 
 /// 一个价格的来源，给界面看的样子。`date`：当时默认价目表的数据日期。
 pub fn price_source(source: &tw_pricing::Source, date: &str) -> tw_api::PriceSourceView {
@@ -109,7 +98,6 @@ impl Recorder {
             blobs,
             pricing,
             inflight: HashMap::new(),
-            sessions: HashMap::new(),
             bus: None,
         }
     }
@@ -163,7 +151,7 @@ impl Recorder {
             error: None,
             local: false,
             cancelled: false,
-            routing: p.routing.clone(),
+            routing: serde_json::to_string(&p.routing).ok(),
             billing: p.billing,
             cache_saved_micros: None,
             price_source: None,
@@ -185,32 +173,19 @@ impl Recorder {
     }
 
     /// 吃一个事件。
-    /// 指纹 → 会话 id。同一个指纹隔太久再出现，算新的一次任务。
-    fn session_for(&mut self, fp: &str, at_ms: i64) -> String {
-        // **会话 id 里带着起始时刻**，所以同一段对话隔天再聊会得到两条
-        // 记录 —— 而那正是我们想要的：它们是两次任务
-        let fresh = format!("{fp}-{at_ms}");
-        let e = self
-            .sessions
-            .entry(fp.to_string())
-            .or_insert((fresh.clone(), at_ms));
-        if at_ms - e.1 > SESSION_GAP_MS {
-            *e = (fresh, at_ms);
-        } else {
-            e.1 = at_ms.max(e.1);
-        }
-        e.0.clone()
-    }
-
     pub fn on_event(&mut self, ev: &Event) {
         match ev {
             Event::RequestStarted {
                 id,
                 client,
                 client_hint,
-                session_fp,
+                session,
                 peer,
                 key_masked,
+                route,
+                rule,
+                group,
+                rewritten_by,
                 provider,
                 billing,
                 model,
@@ -221,11 +196,6 @@ impl Recorder {
                 if self.inflight.len() >= MAX_INFLIGHT {
                     self.drop_oldest();
                 }
-                // **指纹在这里变成会话 id**：同一个指纹、离上一条不太久，
-                // 就还是那一次任务；隔久了就是新的一次
-                let session = session_fp
-                    .as_ref()
-                    .map(|fp| self.session_for(fp, *at_ms as i64));
                 self.inflight.insert(
                     *id,
                     Partial {
@@ -234,13 +204,22 @@ impl Recorder {
                         client_hint: client_hint.clone(),
                         peer: peer.clone(),
                         key_masked: key_masked.clone(),
-                        session,
+                        // **会话由网关在开始时定**，这里照记：事件里说的和落库的
+                        // 是同一个值，在跑的那一轮和落了库的那一轮归在同一次会话里
+                        session: session.clone(),
                         provider: provider.clone(),
                         model: model.clone(),
                         path: path.clone(),
                         status: None,
                         ttfb_ms: None,
-                        routing: None,
+                        routing: tw_api::RoutingView {
+                            route: route.clone(),
+                            rule: rule.clone(),
+                            group: group.clone(),
+                            rewritten_by: rewritten_by.clone(),
+                            denied_by: None,
+                            attempts: Vec::new(),
+                        },
                         billing: *billing,
                         translated: None,
                     },
@@ -248,8 +227,11 @@ impl Recorder {
             }
             Event::RequestRouted {
                 id,
+                route,
                 rule,
                 group,
+                rewritten_by,
+                denied_by,
                 attempts,
                 billing,
             } => {
@@ -269,12 +251,14 @@ impl Recorder {
                     if let Some(last) = attempts.last() {
                         p.provider = last.provider.clone();
                     }
-                    p.routing = serde_json::to_string(&tw_api::RoutingView {
+                    p.routing = tw_api::RoutingView {
+                        route: route.clone(),
                         rule: rule.clone(),
                         group: group.clone(),
+                        rewritten_by: rewritten_by.clone(),
+                        denied_by: denied_by.clone(),
                         attempts: attempts.clone(),
-                    })
-                    .ok();
+                    };
                     p.billing = *billing;
                     // 做转换的不是服务它的那一跳（转换那家失败了，后面一家直通）
                     let converted_by = p
@@ -698,7 +682,7 @@ impl Recorder {
             },
             local: false,
             cancelled: matches!(how, Ending::Cancelled),
-            routing: p.routing,
+            routing: serde_json::to_string(&p.routing).ok(),
             billing: p.billing,
             cache_saved_micros,
             price_source,
@@ -753,7 +737,11 @@ mod tests {
             peer: None,
             id,
             client_hint: None,
-            session_fp: None,
+            session: None,
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: None,
+            rewritten_by: vec![],
             client: "claude-code".into(),
             provider: "官方".into(),
             billing: tw_api::Billing::PerToken,
@@ -790,8 +778,11 @@ mod tests {
         r.on_event(&started(1, "claude-sonnet-4-5")); // provider = 官方
         r.on_event(&Event::RequestRouted {
             id: 1,
+            route: "default".into(),
             rule: "默认".into(),
             group: Some("__all__".into()),
+            rewritten_by: vec![],
+            denied_by: None,
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "官方".into(),
@@ -841,8 +832,11 @@ mod tests {
         r.on_event(&started(2, "claude-sonnet-4-5"));
         r.on_event(&Event::RequestRouted {
             id: 2,
+            route: "default".into(),
             rule: "默认".into(),
             group: None,
+            rewritten_by: vec![],
+            denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
                 outcome: tw_api::AttemptOutcome::Served,
@@ -854,6 +848,81 @@ mod tests {
         });
         r.on_event(&finished(2, None));
         assert_eq!(r.db().get(2).unwrap().unwrap().provider, "官方");
+    }
+
+    /// **会话由网关在开始时定，这里照记**：落库的和开始事件里说的是同一个值，
+    /// 不在这一层再算一遍（以前在这里按指纹和时间现算，于是在跑的那一轮说不出
+    /// 自己属于哪次会话）
+    #[test]
+    fn the_row_keeps_the_session_the_start_event_named() {
+        let (_d, mut r) = rec();
+        for (id, at_ms) in [(1, 1_000_000), (2, 9_000_000_000)] {
+            let mut ev = started(id, "claude-sonnet-4-5");
+            if let Event::RequestStarted {
+                session, at_ms: at, ..
+            } = &mut ev
+            {
+                *session = Some("fp-1000000".into());
+                *at = at_ms;
+            }
+            r.on_event(&ev);
+            r.on_event(&finished(id, None));
+        }
+        // 隔了很久也不另起一次：那是网关的判断，这里不改它
+        let sessions = r.db().sessions(None, 10).unwrap();
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].id, "fp-1000000");
+        assert_eq!(sessions[0].turns, 2);
+    }
+
+    /// 路由的终稿：走的路由、改写了它的规则、第二阶段的拒绝，都跟着这一行落库 ——
+    /// 每条规则命中了多少就从这里数
+    #[test]
+    fn the_route_rewrites_and_a_late_denial_are_kept_on_the_row() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        // 路由报出结论之前点开：开始时就知道的那几项已经在了
+        let early: tw_api::RoutingView =
+            serde_json::from_str(r.in_flight_row(1).unwrap().routing.as_deref().unwrap()).unwrap();
+        assert_eq!(early.route, "default");
+        assert!(early.attempts.is_empty());
+
+        r.on_event(&Event::RequestRouted {
+            id: 1,
+            route: "工作".into(),
+            rule: "兜底".into(),
+            group: Some("pool".into()),
+            rewritten_by: vec!["关掉思考".into(), "走中转时限长".into()],
+            denied_by: Some("中转不收密钥".into()),
+            attempts: vec![tw_api::AttemptView {
+                provider: "中转".into(),
+                outcome: tw_api::AttemptOutcome::Error,
+                status: None,
+                error: None,
+                ms: 0,
+            }],
+            billing: tw_api::Billing::PerToken,
+        });
+        r.on_event(&Event::RequestFailed {
+            id: 1,
+            model: String::new(),
+            source: tw_api::FailureSource::Denied,
+            message: tw_api::Msg {
+                code: "gw.route.denied".into(),
+                args: Default::default(),
+                text: "denied".into(),
+            },
+            bytes: None,
+            duration_ms: Some(1),
+            usage: None,
+        });
+        let row = r.db().get(1).unwrap().unwrap();
+        let routing: tw_api::RoutingView =
+            serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
+        assert_eq!(routing.route, "工作");
+        assert_eq!(routing.rewritten_by, ["关掉思考", "走中转时限长"]);
+        assert_eq!(routing.denied_by.as_deref(), Some("中转不收密钥"));
+        assert_eq!(row.provider, "中转", "归给被拒的那一家：请求本来要去那里");
     }
 
     #[test]
@@ -1098,8 +1167,11 @@ mod billing_tests {
     fn routed(id: u64, billing: tw_api::Billing) -> Event {
         Event::RequestRouted {
             id,
+            route: "default".into(),
             rule: "兜底".into(),
             group: None,
+            rewritten_by: vec![],
+            denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
                 outcome: tw_api::AttemptOutcome::Served,
@@ -1160,7 +1232,11 @@ mod billing_tests {
             peer: None,
             id,
             client_hint: None,
-            session_fp: None,
+            session: None,
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: None,
+            rewritten_by: vec![],
             client: "codex".into(),
             provider: "订阅账号".into(),
             billing,
@@ -1174,8 +1250,11 @@ mod billing_tests {
     fn ws_routed(id: u64, billing: tw_api::Billing) -> Event {
         Event::RequestRouted {
             id,
+            route: "default".into(),
             rule: "catch-all".into(),
             group: Some("__all__".into()),
+            rewritten_by: vec![],
+            denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
                 outcome: tw_api::AttemptOutcome::Served,
@@ -1248,7 +1327,11 @@ mod billing_tests {
                 peer: None,
                 id,
                 client_hint: None,
-                session_fp: None,
+                session: None,
+                route: "default".into(),
+                rule: "catch-all".into(),
+                group: None,
+                rewritten_by: vec![],
                 client: "claude-code".into(),
                 provider: "订阅账号".into(),
                 billing,
@@ -1269,7 +1352,14 @@ mod billing_tests {
 
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(row.billing, tw_api::Billing::Free);
-        assert_eq!(row.routing, None, "路由没走完，这一行本来就没有尝试链");
+        // 路由没走完：**开始时就知道的那几项还在**，尝试链是空的
+        let routing: tw_api::RoutingView =
+            serde_json::from_str(row.routing.as_deref().expect("开始时就知道走哪条路由")).unwrap();
+        assert_eq!(
+            (routing.route.as_str(), routing.rule.as_str()),
+            ("default", "catch-all")
+        );
+        assert!(routing.attempts.is_empty(), "{routing:?}");
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(
             s.no_usage_requests, 1,
@@ -1533,8 +1623,11 @@ mod translation_tests {
     fn routed(chain: &[&str]) -> tw_api::Event {
         tw_api::Event::RequestRouted {
             id: 1,
+            route: "default".into(),
             rule: "默认".into(),
             group: None,
+            rewritten_by: vec![],
+            denied_by: None,
             attempts: chain
                 .iter()
                 .map(|p| tw_api::AttemptView {
@@ -1857,7 +1950,11 @@ mod cancellation_tests {
             id: 1,
             client: "claude-code".into(),
             client_hint: None,
-            session_fp: Some("fp".into()),
+            session: Some("fp".into()),
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: None,
+            rewritten_by: vec![],
             provider: "官方".into(),
             billing: tw_api::Billing::PerToken,
             model: "claude-sonnet-4-5".into(),

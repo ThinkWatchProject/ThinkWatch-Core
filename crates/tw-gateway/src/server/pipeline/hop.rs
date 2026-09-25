@@ -59,6 +59,12 @@ pub(super) async fn try_upstreams<'a>(
     let mut chain: Vec<tw_api::AttemptView> = Vec::new();
     let mut last_err: Option<GatewayError> = None;
     let mut served: Option<Served<'a>> = None;
+    // 改写了这个请求的规则：第一阶段的，加上每一跳第二阶段又加的
+    let mut rewritten_by = started.choice.rewritten_by.clone();
+    // 第二阶段拒绝了它的那条规则
+    let mut denied_by: Option<String> = None;
+    // 不再试下一家的原因：第二阶段拒绝了，或者规则求不了值。**路由事件照样要发**
+    let mut halt: Option<GatewayError> = None;
 
     for name in &started.alive {
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
@@ -88,18 +94,35 @@ pub(super) async fn try_upstreams<'a>(
             .engine
             .phase_two(&reading.facts, &provider.name, &decision.set)
         {
-            Ok(tw_engine::Outcome2::Proceed(s)) => s,
+            Ok(tw_engine::Outcome2::Proceed {
+                set,
+                rewritten_by: more,
+            }) => {
+                for r in more {
+                    if !rewritten_by.contains(&r) {
+                        rewritten_by.push(r);
+                    }
+                }
+                set
+            }
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %provider.name, "a phase-two rule denied the request");
-                return Err(GatewayError::denied(msg!(
-                    "gw.route.denied", rule = rule, reason = reason =>
+                let err = GatewayError::denied(msg!(
+                    "gw.route.denied", rule = rule.clone(), reason = reason =>
                     "Rule `{rule}` denied this request: {reason}"
-                )));
+                ));
+                // 被拒的这一跳没有发出去。**它在尝试链上**，原因就是那条拒绝 ——
+                // 链上看得出请求本来要去哪家、在哪一步停下的
+                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                denied_by = Some(rule);
+                halt = Some(err);
+                break;
             }
             Err(e) => {
-                return Err(GatewayError::config(msg!(
+                halt = Some(GatewayError::config(msg!(
                     "gw.route.rule_failed", detail = e => "A rule could not be evaluated: {detail}"
                 )));
+                break;
             }
         };
 
@@ -231,13 +254,20 @@ pub(super) async fn try_upstreams<'a>(
         .as_ref()
         .map(|s| s.provider.billing)
         .unwrap_or_default();
+    let choice = &started.choice;
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
-        rule: decision.matched_rule.clone(),
-        group: decision.via_group.clone(),
+        route: choice.route.clone(),
+        rule: choice.rule.clone(),
+        group: choice.group.clone(),
+        rewritten_by,
+        denied_by,
         attempts: chain,
         billing: billing.into(),
     });
+    if let Some(err) = halt {
+        return Err(err);
+    }
 
     let Some(served) = served else {
         let mut err = last_err.unwrap_or_else(|| {

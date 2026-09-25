@@ -345,17 +345,33 @@ async fn a_request_is_in_flight_until_its_ending_and_not_after() {
     let resp = post(gw).send().await.unwrap();
     let mut body = resp.bytes_stream();
     body.next().await.unwrap().unwrap();
-    let open = bus.in_flight();
+    let open = bus.in_flight().requests;
     assert!(
-        matches!(open.as_slice(), [Event::RequestStarted { model, .. }] if model == MODEL),
+        matches!(open.as_slice(), [r] if matches!(&r.events[0], Event::RequestStarted { model, .. } if model == MODEL)),
         "第一帧到了、流还开着，它该在快照里：{open:?}"
+    );
+    // 快照里是它到目前为止的全部：响应头到了、路由报过了 —— 半路才来的一方
+    // 拿它们重建出来的，就是一直在听的一方看到的
+    assert!(
+        open[0]
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::RequestHeaders { status: 200, .. })),
+        "{open:?}"
+    );
+    assert!(
+        open[0]
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::RequestRouted { .. })),
+        "{open:?}"
     );
 
     drop(body);
     let got = endings(&mut events).await;
     assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
     assert!(
-        bus.in_flight().is_empty(),
+        bus.in_flight().requests.is_empty(),
         "结局报了，快照里还挂着：{:?}",
         bus.in_flight()
     );
