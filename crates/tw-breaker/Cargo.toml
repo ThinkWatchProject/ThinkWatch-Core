@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "The circuit-breaker state machine both gateways run: pure data and pure transitions, stored wherever the caller keeps it"
 
 [dependencies]

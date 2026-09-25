@@ -3,9 +3,9 @@
 [中文](server.zh-CN.md)
 
 ThinkWatch Core runs without a desktop: on a Linux machine it is started by
-systemd from its configuration file, and the ThinkWatch Lite app on a Mac
-connects to it over the network to show traffic and change settings. Clients
-anywhere on the network send their requests to the server's gateway.
+systemd from its configuration file, and ThinkWatch Lite on macOS, Windows or
+Linux connects to it over the network to show traffic and change settings.
+Clients anywhere on the network send their requests to the server's gateway.
 
 This page covers installing, configuring, starting, connecting and
 upgrading. Every field mentioned is described in the
@@ -185,7 +185,7 @@ and enter:
 
 The app tests the connection before saving and says what is wrong if it
 fails: no answer (address, port, firewall, `enabled`), connection closed
-(this Mac's address is probably not in `allow_from`), wrong key, or
+(this computer's address is probably not in `allow_from`), wrong key, or
 different versions. `allow_from` for this port does not let the server
 itself in automatically; commands on the server use the local channel.
 
@@ -193,21 +193,22 @@ A source that fails the handshake five times within a minute is ignored
 for a minute. Removing a network from `allow_from` also closes the
 connections already open from it.
 
-The key is kept in the Mac's keychain. To replace it, run
-`twcore control-key --rotate` on the server; connections made with the old
-key are closed at once, and connected apps then have to be given the new
-key.
+The desktop app stores the key in its data directory, in a file readable
+only by the user who runs the app, rather than in the system keychain. To
+replace it, run `twcore control-key --rotate` on the server; connections
+made with the old key are closed at once, and connected apps then have to
+be given the new key.
 
-A remote connection can do everything the app does on its own Mac except
-three things, which the server refuses: stopping core (systemd runs it),
-taking the diagnostic bundle, and changing `listen.control`, the section
-it came in through. Do those on the server.
+A remote connection can do everything the app does on its own computer
+except three things, which the server refuses: stopping core (systemd
+runs it), taking the diagnostic bundle, and changing `listen.control`,
+the section it came in through. Do those on the server.
 
 ### Point clients at the server
 
 Clients use the server's gateway, `http://<server>:8788`, with a gateway key
-from `clients`. The desktop app can point the clients on the Mac at the
-server (Clients page); on other machines, configure them by hand.
+from `clients`. The desktop app can point the clients on its own computer at
+the server (Clients page); on other machines, configure them by hand.
 
 ## Upgrading
 
