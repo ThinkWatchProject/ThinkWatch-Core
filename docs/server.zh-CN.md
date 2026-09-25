@@ -10,7 +10,7 @@ ThinkWatch Core 可以脱离桌面运行：在 Linux 机器上由 systemd 按配
 
 - x86_64 或 aarch64 的 Linux，glibc 2.35 或更新（Ubuntu 22.04、Debian 12 及以后）。
 - systemd。
-- 服务器上的 core 版本须与桌面应用一致。应用在连接时核对版本，不一致时显示双方的版本号。
+- 服务器上运行的 core 与桌面应用内置的 core 版本相同。应用只连接控制面协议版本与自身相同的 core：它在握手时核对，版本不一致时拒绝连接，并显示双方的版本，即服务器上的版本和应用需要的版本。切换版本的方法见[升级](#升级)。
 
 ## 1. 安装
 
@@ -18,11 +18,13 @@ ThinkWatch Core 可以脱离桌面运行：在 Linux 机器上由 systemd 按配
 curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh
 ```
 
-安装指定版本（即桌面应用要求的版本）：
+这条命令安装最新版本，它可能比桌面应用内置的 core 版本更新。安装指定版本时，把版本号传给脚本：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh -s -- --version 0.47.0
+curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh -s -- --version <版本>
 ```
+
+`<版本>` 是 `0.47.0` 这样的版本号。服务器运行的版本不同时，应用会指明它需要的版本，用 [`twcore upgrade --version`](#升级) 即可把服务器切换到该版本。
 
 安装脚本依次：
 
@@ -135,33 +137,41 @@ allowed sources: 192.168.1.0/24
 
 在桌面应用中打开 **设置 → 连接 → 添加远程连接**，填写：
 
+- **名称**：连接的名称，例如 `home-server`；
 - **地址**：服务器的主机名或 IP 地址；
 - **控制端口**：`listen.control.remote.port` 的值；
 - **密钥**：`twcore control-key` 输出的 64 个字符。
 
-应用在保存前先试连，失败时说明原因：无响应（检查地址、端口、防火墙和 `enabled`）、连接被关闭（本机地址可能不在 `allow_from` 中）、密钥不正确、版本不一致。这个端口的 `allow_from` 不会自动放行服务器本机；服务器上的命令走本地通道。
+**测试连接**完成握手并读取服务器上 core 的版本，不保存任何内容。**保存并切换**先做同样的测试，通过后才保存连接，并在切换前请求确认；**保存**只保存连接，不做测试。切换到远程连接时总是先测试，测试失败则留在当前连接上。测试失败时说明原因：无响应（检查地址、端口、防火墙和 `enabled`）、连接被关闭（本机地址可能不在 `allow_from` 中）、密钥不正确、版本不一致（见[升级](#升级)）。这个端口的 `allow_from` 不会自动放行服务器本机；服务器上的命令走本地通道。
 
-同一来源一分钟内握手失败五次，之后一分钟不理它。从 `allow_from` 中删掉一个网段，已经从那里连着的连接也随即断开。
+同一来源一分钟内握手失败五次后，接下来一分钟内来自它的连接一律忽略。从 `allow_from` 中删掉一个网段，已经从那里连着的连接也随即断开。
 
-桌面应用把密钥存放在其数据目录下的一个文件中，该文件只有运行应用的用户可以读取；不使用系统钥匙串。要更换密钥，在服务器上执行 `twcore control-key --rotate`：用旧密钥建立的连接立即断开，之后已连接的应用需要填入新密钥。
+桌面应用把密钥存放在其数据目录下的一个文件中，该文件只有运行应用的用户可以读取。要更换密钥，在服务器上执行 `twcore control-key --rotate`：用旧密钥建立的连接立即断开，之后已连接的应用需要填入新密钥。
 
-远程连接能做应用在本机能做的一切，只有三件事服务器会拒绝：停止 core（它由 systemd 管理）、生成诊断包、修改 `listen.control`（这条连接进来的那一节）。这三件事在服务器上操作。
+远程连接能做应用对本机 core 能做的一切，只有三件事服务器会拒绝：停止 core（它由 systemd 管理）、生成诊断包、修改 `listen.control`（这条连接进来的那一节）。这三件事在服务器上操作。连接远程 core 时，ChatGPT 账号只能用设备码登录，因为浏览器登录完成后会回到运行 core 的那台机器。
 
 ### 让客户端指向服务器
 
-客户端使用服务器的网关 `http://<服务器>:8788`，以及 `clients` 中的一把网关密钥。桌面应用可以把本机的客户端改为指向服务器（客户端页）；其他机器上的客户端需手动配置。
+客户端使用服务器的网关 `http://<服务器>:8788`，以及 `clients` 中的一把网关密钥。桌面应用可以把它所在机器上的客户端改为指向服务器（客户端页）；其他机器上的客户端需手动配置。
 
 ## 升级
+
+服务器上须运行桌面应用内置的 core 版本。两者不一致时（例如应用更新到内置较新 core 的版本之后），应用拒绝连接并显示双方的版本。此时把服务器切换到应用需要的版本：
+
+```sh
+sudo twcore upgrade --version <版本> --restart
+```
+
+带 `--version` 时，即使指定的版本比已安装的旧，`twcore upgrade` 也会安装它，因此同一条命令既能升级也能降级。较新版本的应用在版本不一致时会显示这条命令，并填好版本号。
+
+不带 `--version` 时，`twcore upgrade` 与最新版本比较并安装最新版本，而最新版本可能比应用需要的版本更新：
 
 ```sh
 sudo twcore upgrade --check       # 与最新版本比较，不做任何改动
 sudo twcore upgrade --restart     # 安装最新版本并重启服务
-sudo twcore upgrade --version 0.48.0 --restart
 ```
 
-`twcore upgrade` 下载适合本机的版本，校验 SHA-256，一步替换 `/usr/local/bin/twcore`，下载失败也不会留下损坏的程序。配置和数据不受影响。不带 `--restart` 时只打印重启服务的命令；在重启之前，运行中的进程仍是旧版本。
-
-服务器和桌面应用要一起升级：版本不一致时应用拒绝连接，并显示上面的命令及所需的版本。
+`twcore upgrade` 下载适合本机的版本，校验 SHA-256，一步替换 `/usr/local/bin/twcore`，下载失败也不会留下损坏的程序。它不改动配置和数据。不带 `--restart` 时只打印重启服务的命令；在重启之前，运行中的进程仍是旧版本。新版本保存请求记录的格式与原版本不同时，新版本启动后请求记录从空开始，配置保留。
 
 ## 卸载
 
