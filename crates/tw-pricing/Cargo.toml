@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Pricing: the public price table, user price sheets, and three-state cost (measured, estimated, unpriced)"
 
 [dependencies]

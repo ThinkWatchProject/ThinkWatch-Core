@@ -7,12 +7,19 @@
 # 这条流水线不重跑那四道门：tag 是从 main 上打的，而 main 上的每一个
 # commit 都过过 `ci.yml`。这里只做 CI 做不了的那件事 —— 产出一个别人
 # 能下载、能校验的文件。
+#
+# **所有平台一起发，或者都不发。**各平台的 job 只构建、自检，把文件交给
+# 最后的 `publish`，Release 由它一次写成。各挂各的时候，先编完的那个就把
+# Release 建了出来，`releases/latest` 随即指向它，而别的平台的文件还在路上
+# —— 那几分钟里 `scripts/install.sh` 和 `twcore upgrade` 在那些平台上找不到
+# 文件；某个平台编挂了，发出去的就是缺一块的 Release。
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  # **排练。**手工触发时照常构建、照常自检，但什么都不发。
+  # **排练。**手工触发时照常构建、照常自检，但什么都不发：文件留在这次
+  # 运行的产物（Artifacts）里，`publish` 照样把它们逐个核对，只是不写 Release。
   #
   # 理由是这条流水线唯一一个「发现了也没法在本次补救」的性质：tag 一旦
   # 推上去，流水线错了就得把它撤回来。而这里新增的那条 Windows 支线要靠
@@ -72,16 +79,12 @@ jobs:
           shasum -a 256 twcore-aarch64-apple-darwin > twcore-aarch64-apple-darwin.sha256
           cat twcore-aarch64-apple-darwin.sha256
 
-      - uses: softprops/action-gh-release@v2
-        # 排练不发布。
-        if: github.ref_type == 'tag'
+      # 交给 `publish`，Release 只由它来写
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/twcore-aarch64-apple-darwin
-            dist/twcore-aarch64-apple-darwin.sha256
-          # 发布说明留空，从 tag 的信息里来 —— 让一份自动生成的清单
-          # 冒充发布说明，读的人得不到任何东西
-          generate_release_notes: true
+          name: twcore-aarch64-apple-darwin
+          path: dist/
+          if-no-files-found: error
 
   twcore-windows:
     name: twcore (Windows x64 + arm64)
@@ -163,16 +166,11 @@ jobs:
             Get-Content "$out.sha256"
           }
 
-      - uses: softprops/action-gh-release@v2
-        # 排练不发布。
-        if: github.ref_type == 'tag'
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/twcore-x86_64-pc-windows-msvc.exe
-            dist/twcore-x86_64-pc-windows-msvc.exe.sha256
-            dist/twcore-aarch64-pc-windows-msvc.exe
-            dist/twcore-aarch64-pc-windows-msvc.exe.sha256
-          generate_release_notes: true
+          name: twcore-windows
+          path: dist/
+          if-no-files-found: error
 
   twcore-linux:
     name: twcore (${{ matrix.target }})
@@ -289,13 +287,84 @@ jobs:
           test -f "$T/twcore-$TARGET/twcore.service"
           "$T/twcore-$TARGET/twcore" --version
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: twcore-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # **Release 只在这里写，而且只写一次。**
+  #
+  # 以前每个构建 job 各自用 action-gh-release 挂自己的文件，每一次都带着
+  # `generate_release_notes`。Release 已经存在时，这个 action 照样再要一份
+  # 生成的说明，接在原有正文后面 —— 于是 v0.44.0 到 v0.47.0 的说明各有四份
+  # （四个 job），v0.30.0 到 v0.43.0 各有两份（macOS、Windows 两个 job）。
+  publish:
+    name: Publish
+    needs: [twcore, twcore-windows, twcore-linux]
+    runs-on: ubuntu-latest
+    env:
+      # 发出去的就是这些，一个不多、一个不少。文件名是和桌面版的流水线、
+      # `twcore upgrade`、`scripts/install.sh` 之间的约定，`twcore upgrade` 有
+      # 一条测试读这份文件核对它。加一个平台要在这里加上它的文件 —— 否则
+      # 下面的核对会指出多出来的那几个
+      FILES: |
+        dist/twcore-aarch64-apple-darwin
+        dist/twcore-aarch64-apple-darwin.sha256
+        dist/twcore-x86_64-pc-windows-msvc.exe
+        dist/twcore-x86_64-pc-windows-msvc.exe.sha256
+        dist/twcore-aarch64-pc-windows-msvc.exe
+        dist/twcore-aarch64-pc-windows-msvc.exe.sha256
+        dist/twcore-x86_64-unknown-linux-gnu
+        dist/twcore-x86_64-unknown-linux-gnu.sha256
+        dist/twcore-x86_64-unknown-linux-gnu.tar.gz
+        dist/twcore-x86_64-unknown-linux-gnu.tar.gz.sha256
+        dist/twcore-aarch64-unknown-linux-gnu
+        dist/twcore-aarch64-unknown-linux-gnu.sha256
+        dist/twcore-aarch64-unknown-linux-gnu.tar.gz
+        dist/twcore-aarch64-unknown-linux-gnu.tar.gz.sha256
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 排练也跑这一步：构建 job 交来的正好是清单上的文件，每个都对得上
+      # 它的校验和
+      - name: Every file is here, nothing else is, and each matches its checksum
+        run: |
+          set -euo pipefail
+          diff <(printf '%s' "$FILES" | sort) <(find dist -type f | sort)
+          cd dist
+          sha256sum -c ./*.sha256
+
+      # 同一个原因，这一个 job 也会接上第二份：Release 已经在了 —— 重跑这个
+      # job（比如挂文件挂到一半断了），或者 Release 先手工建好了（v0.11.0 就是
+      # 这样多出一份的）。所以只在它还不存在时生成
+      #
+      # **「不存在」只认 gh 查不到时的那句 `release not found`。**网络断了、令牌
+      # 不对、被限流，gh 一样失败；把那些也当成「不存在」，Release 其实在的话就又
+      # 接上一份。所以别的失败让这一步挂掉，原话留在日志里
+      - name: Notes only for a release that does not exist yet
+        id: notes
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if out=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
+            echo "generate=false"
+          elif grep -qx 'release not found' <<<"$out"; then
+            echo "generate=true"
+          else
+            echo "$out" >&2
+            exit 1
+          fi >> "$GITHUB_OUTPUT"
+
       - uses: softprops/action-gh-release@v2
-        # 排练不发布。
+        # 排练到上面为止
         if: github.ref_type == 'tag'
         with:
-          files: |
-            dist/twcore-${{ matrix.target }}
-            dist/twcore-${{ matrix.target }}.sha256
-            dist/twcore-${{ matrix.target }}.tar.gz
-            dist/twcore-${{ matrix.target }}.tar.gz.sha256
-          generate_release_notes: true
+          files: ${{ env.FILES }}
+          fail_on_unmatched_files: true
+          # GitHub 生成的说明：上一版以来合进 main 的 PR
+          generate_release_notes: ${{ steps.notes.outputs.generate }}

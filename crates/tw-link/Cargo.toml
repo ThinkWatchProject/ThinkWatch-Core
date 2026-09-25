@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Control-channel handshake and encryption (Noise NNpsk0), shared by core and the desktop app"
 
 [dependencies]

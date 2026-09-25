@@ -89,7 +89,7 @@ clean the diff is:
   protections.** Replay came close to being a legitimate way around
   redaction.
 - **One door into the control plane.** Every transport (unix socket,
-  Windows loopback port, and the remote port to come) hands its
+  Windows loopback port, and the remote control port) hands its
   connections to the same handshake before HTTP. The control key never
   leaves through the control plane and cannot be changed through it.
 
@@ -157,9 +157,15 @@ whatever sat in a `target/` directory that afternoon.
 
 1. Bump `version` in the workspace `Cargo.toml`, land it on `main`.
 2. Tag that commit `vX.Y.Z` and push the tag.
-3. `release.yml` builds `twcore` for every target below, checks each
-   binary actually runs and reports the version on the tag, and attaches
-   them to a GitHub Release, each with a `.sha256` (`<sha>  <file>`).
+3. `release.yml` builds `twcore` for every target below. It checks that
+   each binary is built for its target and, where the runner can execute
+   it, that it starts and reports the version on the tag. The Windows
+   arm64 binary is cross-compiled on an x64 runner, so only the machine
+   field in its PE header is checked. The Linux binaries are also checked
+   to need glibc 2.35 at most (Ubuntu 22.04). Once every target has
+   built, a single job attaches them all to a GitHub Release, each with a
+   `.sha256` (`<sha>  <file>`); if one target fails, nothing is
+   published.
 
 | Target | Files |
 |---|---|
@@ -173,13 +179,15 @@ The bare binaries are what the desktop app's pipeline bundles and what
 the unit and the binary come from the same commit. The file names are a
 contract with both: `twcore upgrade` has a test that reads `release.yml`.
 
-To try a change to `release.yml` without publishing, run it by hand
-(`workflow_dispatch`): it builds and checks everything and uploads nothing.
+To try a change to `release.yml` without publishing, run it by hand on
+your branch (`gh workflow run release.yml --ref <branch>`): it builds and
+checks everything, leaves the files as the run's artifacts, and publishes
+nothing.
 
-The desktop app pins `tw-api` (and the few other crates it uses: `tw-types`,
-`tw-yaml`, `tw-guard`, `tw-watch`) to the same tag and bundles the binary
-from that release. Those two have to come from one commit: the binary
-speaks a protocol, and the app compiles a mirror of it.
+The desktop app pins `tw-api` (and the few other crates it uses:
+`tw-types`, `tw-yaml`, `tw-guard`, `tw-watch`, `tw-link`) to the same tag
+and bundles the binary from that release. Those two have to come from one
+commit: the binary speaks a protocol, and the app compiles a mirror of it.
 
 On macOS, Apple Silicon only, deliberately. An Intel user downloading a
 file that will not open is worse served than one who finds no download

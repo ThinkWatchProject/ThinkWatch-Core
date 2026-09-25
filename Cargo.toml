@@ -35,6 +35,16 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/ThinkWatchProject/ThinkWatch-Core"
+homepage = "https://thinkwat.ch/core/"
+# 这些 crate 不发 crates.io（企业版和桌面版按 tag 从 git 取），docs.rs 上
+# 没有它们 —— 文档指向项目自己的
+documentation = "https://thinkwat.ch/docs/core/"
+readme = "README.md"
+# 关键词和分类说的是网关本身，只有网关那几个 crate（twcore、tw-gateway、
+# tw-control）继承；其余的 crate 各有各的事，只继承上面几项。
+# crates.io 的规矩：关键词最多五个，分类只能用它列出的 slug
+keywords = ["ai-gateway", "llm", "openai", "anthropic", "gemini"]
+categories = ["network-programming", "web-programming::http-server"]
 
 # 二进制走 CalVer，crate 走 SemVer —— 两者是两回事，卖给不同的人。
 # 这里是 crate 的版本。

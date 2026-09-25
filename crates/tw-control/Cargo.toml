@@ -5,7 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Control-plane API server over a unix socket"
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Control-plane API server over a unix socket, a loopback port on Windows, and an optional remote control port"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 tw-api = { workspace = true }
