@@ -239,35 +239,116 @@ pub(crate) async fn serve_detached(
     Ok(actual)
 }
 
+/// 多久再问一次系统：要听的网卡出现了没有、地址变了没有。
+///
+/// **网卡的出现和换地址没有通知可等。**WSL 的虚拟网卡要等 WSL 起来才有，WSL
+/// 每重启一次它换一个地址；DHCP 续租、换 Wi-Fi 也一样。问一次是一次
+/// `getifaddrs`（Windows 上是 `GetAdaptersAddresses`），几秒一次不值一提；
+/// 而等得太久，刚起来的 WSL 里的客户端就要多连不上几秒。
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 这一轮要听哪些地址，以及听不全的原因。
+///
+/// **网卡此刻不在，就先只听回环。**绑的是一张网卡时回环本来就要听（见
+/// `GatewayListen::addrs`），网卡那一个等它出现再补上 —— 不能因为一张迟到的
+/// 网卡让整个网关起不来：开机自启时 WSL 还没起，这台电脑上的客户端也跟着
+/// 全部断线。
+fn plan(listen: &tw_config::GatewayListen) -> (Vec<SocketAddr>, Option<Msg>) {
+    match listen.addrs() {
+        Ok(a) => (a, None),
+        Err(e) => (loopback_only(listen.port), Some(unresolved(&e))),
+    }
+}
+
+fn loopback_only(port: u16) -> Vec<SocketAddr> {
+    vec![SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port)]
+}
+
+/// 这个地址此刻不是这台机器的 —— 网卡的地址刚被收走，或者写死的那个地址还没
+/// 出现。**回环和通配地址不算**：它们绑不上从来不是「还没出现」。
+fn absent(a: SocketAddr, e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AddrNotAvailable
+        && !a.ip().is_loopback()
+        && !a.ip().is_unspecified()
+}
+
 /// 起服务。`follow` 为真时**跟着配置里的监听地址走**（「温」那一级热重载）。
 ///
 /// 命令行给了 `--port` 时 `follow` 为假：那是一个显式的覆盖，不该被配置
-/// 文件推翻。
+/// 文件推翻 —— 但起始那份设置里的网卡照样跟着：它出现、换地址时补上或换过去。
 ///
-/// 起始那一次绑不上是致命的，错误带着地址交给调用方 —— 那时还没有旧的
-/// 可以守，守护进程据此重启或进安全模式。之后的每一次换监听都不会让它返回。
-pub async fn serve_at(state: AppState, want: Vec<SocketAddr>, follow: bool) -> std::io::Result<()> {
+/// 起始那一次**回环绑不上是致命的**（多半是端口被占），错误带着地址交给调用方
+/// —— 那时还没有旧的可以守，守护进程据此重启或进安全模式。网卡此刻不在、写死
+/// 的地址此刻不是这台机器的，都不致命：先只听回环，[`RECHECK`] 一轮轮再问，
+/// 它出现了就补上。之后的每一次换监听都不会让它返回。
+pub async fn serve_at(
+    state: AppState,
+    listen: tw_config::GatewayListen,
+    follow: bool,
+) -> std::io::Result<()> {
+    let (want, mut note) = plan(&listen);
     let mut bound = Vec::with_capacity(want.len());
-    for (a, l) in bind_all(&want)
-        .await
-        .map_err(|(a, e)| std::io::Error::new(e.kind(), format!("{}", bind_failure(a, &e))))?
-    {
-        bound.push(start(&state, a, l)?);
-    }
-    state.set_listening(snapshot(&bound, None));
-    if !follow {
-        // 监听器各自在自己的任务里跑。这个 future 活着，它们就不收到停止信号
-        std::future::pending::<()>().await;
-    }
-    loop {
-        state.relisten_signal().notified().await;
-        let want = match state.runtime().config.listen.gateway.addrs() {
-            Ok(a) => a,
-            // **新配置的地址算不出来就守住旧的。**`bind` 指着一张刚被拔掉
-            // 的网卡时，正确的动作不是把一个正在工作的监听器拆掉 —— 那会
-            // 让所有客户端立刻断线，而它们本来好好的。
+    for a in want {
+        match TcpListener::bind(a).await {
+            Ok(l) => bound.push(start(&state, a, l)?),
+            Err(e) if absent(a, &e) => {
+                tracing::warn!(%a, %e, "not an address of this machine yet; listening without it until it is");
+                note = Some(bind_failure(a, &e));
+            }
             Err(e) => {
-                tracing::error!(%e, "the new listen address cannot be resolved; keeping the current one");
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}", bind_failure(a, &e)),
+                ));
+            }
+        }
+    }
+    if let Some(e) = &note {
+        tracing::warn!(%e, "listening on loopback only for now; the rest is added once it appears");
+    }
+    state.set_listening(snapshot(&bound, note));
+    // 眼下这些监听器是照着哪份设置绑的。**设置没变、网卡却解析不出来了**，是
+    // 我们跟着的那张网卡没了（WSL 关了）：退回只听回环，等它回来。设置变了
+    // 而新的解析不出来，那是另一回事，见下面
+    let mut following = (listen.bind.clone(), listen.port);
+    let mut recheck = tokio::time::interval(RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    recheck.tick().await;
+    loop {
+        // 被叫到的（配置换了、界面上存了一次）和到点再问的，**只有一处不同**：
+        // 到点再问不去请旧的让出端口 —— 那一下有几毫秒不接新连接，端口真被
+        // 别的程序占着时，每几秒来一次就成了每几秒断一次
+        let asked = tokio::select! {
+            _ = state.relisten_signal().notified() => true,
+            _ = recheck.tick() => false,
+        };
+        let listen = if follow {
+            state.runtime().config.listen.gateway.clone()
+        } else {
+            listen.clone()
+        };
+        let spec = (listen.bind.clone(), listen.port);
+        let (want, note) = match listen.addrs() {
+            Ok(a) => (a, None),
+            // 跟着的那张网卡没了：它那一个退场，回环照听，等它回来再补上。
+            // **留着它没有用** —— 那个地址上已经没人连得过来，而它回来时地址
+            // 多半换了（WSL 每重启一次换一个）。
+            //
+            // 此刻本来就只在听回环时也一样：没有什么正在工作的要守，改了端口
+            // 就该在新端口的回环上听，不必等网卡出现
+            Err(e) if spec == following || bound.iter().all(|b| b.want.ip().is_loopback()) => {
+                if asked || bound.iter().any(|b| !b.want.ip().is_loopback()) {
+                    tracing::warn!(%e, "the interface is gone; listening on loopback only until it is back");
+                }
+                (loopback_only(listen.port), Some(unresolved(&e)))
+            }
+            // **新配置的地址算不出来就守住旧的。**`bind` 刚改成一张此刻不在
+            // 的网卡时，正确的动作不是把一个正在工作的监听器拆掉 —— 那会
+            // 让连着的客户端立刻断线，而它们本来好好的。它出现了再换过去
+            Err(e) => {
+                if asked {
+                    tracing::error!(%e, "the new listen address cannot be resolved; keeping the current one");
+                }
                 state.set_listening(snapshot(&bound, Some(unresolved(&e))));
                 continue;
             }
@@ -275,7 +356,8 @@ pub async fn serve_at(state: AppState, want: Vec<SocketAddr>, follow: bool) -> s
         let have: Vec<SocketAddr> = bound.iter().map(|b| b.want).collect();
         if want == have {
             // 通知来了但地址没变（比如又改回去了）。上一次没换成的那句话到此作废
-            state.set_listening(snapshot(&bound, None));
+            following = spec;
+            state.set_listening(snapshot(&bound, note));
             continue;
         }
         // **还要的地址原样留着，只绑新增的** —— 从「仅本机」换到「局域网」时，
@@ -295,7 +377,8 @@ pub async fn serve_at(state: AppState, want: Vec<SocketAddr>, follow: bool) -> s
             // 挡路的可能是我们自己要退场的那几个（见模块文档）：先让它们放掉
             // 端口再试。**只在同端口时这么做** —— 别的端口被占，让出来也没用
             Err((a, e))
-                if e.kind() == std::io::ErrorKind::AddrInUse
+                if asked
+                    && e.kind() == std::io::ErrorKind::AddrInUse
                     && gone.iter().any(|b| b.want.port() == a.port()) =>
             {
                 let back: Vec<SocketAddr> = gone.iter().map(|b| b.want).collect();
@@ -325,7 +408,11 @@ pub async fn serve_at(state: AppState, want: Vec<SocketAddr>, follow: bool) -> s
                 }
             }
             Err((a, e)) => {
-                tracing::error!(%a, %e, "the new listen address cannot be bound; keeping the current one");
+                // 到点再问时每一轮都会走到这里（端口还被占着、网卡的地址还没
+                // 真正可用），只在被叫到的那一次记错误，免得日志每几秒一行
+                if asked {
+                    tracing::error!(%a, %e, "the new listen address cannot be bound; keeping the current one");
+                }
                 bound = keep.into_iter().chain(gone).collect();
                 bound.sort_by_key(|b| have.iter().position(|w| *w == b.want));
                 state.set_listening(snapshot(&bound, Some(bind_failure(a, &e))));
@@ -336,9 +423,10 @@ pub async fn serve_at(state: AppState, want: Vec<SocketAddr>, follow: bool) -> s
         for (a, l) in listeners {
             bound.push(start(&state, a, l)?);
         }
+        following = spec;
         // 配置里写的那个排在最后，和 `addrs()` 同一个顺序
         bound.sort_by_key(|b| want.iter().position(|w| *w == b.want));
-        state.set_listening(snapshot(&bound, None));
+        state.set_listening(snapshot(&bound, note));
     }
 }
 

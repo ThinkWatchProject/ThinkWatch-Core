@@ -739,14 +739,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
     if let Some(p) = port {
         listen.port = p;
     }
-    // **`bind` 写的是网卡名时，这一步要问系统。**问不出来就在这里停，
-    // 而不是带着一个猜出来的地址起监听 —— 错误里说清是哪张网卡，以及
-    // 这台机器上真有哪些
-    let addrs = listen
-        .addrs()
-        .with_context(|| format!("resolving bind: {}", listen.bind))?;
-    // 配置里写的那个排在最后；日志和报错里说它，不说顺带开着的回环
-    let addr = *addrs.last().expect("addrs() never returns an empty list");
+    // **`bind` 写的是网卡名时，这里不去问系统。**那张网卡此刻不在（开机自启时
+    // WSL 还没起来，它的虚拟网卡也就还没有）不该让网关起不来：监听那一边先只
+    // 听回环，网卡出现了再补上，换了地址也跟着换，见 `tw_gateway::serve_at`
+    let listen_at = format!("{}:{}", listen.bind, listen.port);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -907,10 +903,10 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 探测要打网络，而网关不该因为一次探测慢而起不来。
         tw_gateway::models::spawn(state.clone());
 
-        tracing::info!(%addr, "starting");
+        tracing::info!(listen = %listen_at, "starting");
         tokio::select! {
-            r = tw_gateway::serve_at(state, addrs, !overridden) => {
-                r.with_context(|| format!("{addr} could not be listened on. If the port is taken, check whether an earlier instance has fully exited"))
+            r = tw_gateway::serve_at(state, listen, !overridden) => {
+                r.with_context(|| format!("{listen_at} could not be listened on. If the port is taken, check whether an earlier instance has fully exited"))
             }
             msg = control_dead => {
                 anyhow::bail!("{}", msg.unwrap_or_else(|_| "the control plane stopped".into()))

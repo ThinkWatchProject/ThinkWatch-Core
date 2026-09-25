@@ -219,12 +219,7 @@ async fn the_status_follows_the_listener_after_a_save() {
     let p1 = spare_port();
     let b = bed(&yaml(p1));
     let gw = b.gw.clone();
-    let want = tw_config::try_parse(&b.file())
-        .unwrap()
-        .listen
-        .gateway
-        .addrs()
-        .unwrap();
+    let want = tw_config::try_parse(&b.file()).unwrap().listen.gateway;
     tokio::spawn(async move { tw_gateway::serve_at(gw, want, true).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(80)).await;
 

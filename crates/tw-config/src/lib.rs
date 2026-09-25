@@ -414,8 +414,8 @@ impl Default for GatewayListen {
 ///
 /// 写名字而不是写地址，是因为地址会变：DHCP 续租、换个 Wi-Fi，
 /// `192.168.1.5` 就不在了，网关起不来，而系统给的错误只有一句
-/// 「Can't assign requested address」。名字不会变，每次启动现问系统它
-/// 当下是哪个地址。**写死的地址仍然收** —— 有人就是要钉住那一个。
+/// 「Can't assign requested address」。名字不会变，网关每隔几秒现问系统它
+/// 当下是哪个地址，变了就换过去；网卡暂时不在时先只听回环，等它出现。**写死的地址仍然收** —— 有人就是要钉住那一个。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Bind {
     #[default]
@@ -450,7 +450,8 @@ pub enum BindError {
 impl Bind {
     /// 要监听的那个地址。**网卡名要问系统**，所以这一步可能失败。
     ///
-    /// 每次都现问，不缓存：换网络之后重启网关，拿到的就该是新地址。
+    /// 每次都现问，不缓存：换了网络，下一次问拿到的就该是新地址（网关的
+    /// 监听那一边每隔几秒问一次，见 `tw_gateway::serve_at`）。
     pub fn resolve(&self) -> Result<std::net::IpAddr, BindError> {
         match self {
             Bind::Loopback => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
