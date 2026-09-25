@@ -273,7 +273,7 @@ impl Session {
 
     /// 客户端收到的流是不是 SSE。Gemini 客户端不带 `alt=sse` 时是一个 JSON 数组
     pub fn client_sse(&self) -> bool {
-        !(self.client == Dialect::Gemini && !self.shape.gemini_sse)
+        self.client != Dialect::Gemini || self.shape.gemini_sse
     }
 
     /// 转换后的响应的 Content-Type
