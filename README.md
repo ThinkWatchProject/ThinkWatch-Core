@@ -54,8 +54,7 @@ Documentation: [configuration reference](docs/config.md) ·
   against a price sheet for upstreams that charge differently (a multiplier or
   per-model prices). An upstream such as a local model can be marked as free.
   Usage that cannot be priced is labelled unknown rather than counted as zero,
-  and each request keeps its cost together with the source and date of the
-  price.
+  and each request records its cost and where the price came from.
 - **Protections.** Five protections apply to every request, whatever the
   upstream, each in off, observe or enforce mode. In enforce mode, outbound
   redaction replaces credentials such as API keys, private keys and the
