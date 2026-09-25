@@ -218,9 +218,17 @@ struct Sender {
     key: Option<String>,
 }
 
-/// 在一个地址上起服务，**不跟配置走**。测试和命令行 `--port` 用它。
-pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
-    crate::listen::serve_at(state, vec![addr], false).await
+/// 在一个地址上起服务，**不跟配置走**。绑上了就返回，交回真的地址；服务在后台
+/// 一直跑到运行时结束。测试用它。
+///
+/// **端口给 0，由系统挑**，从返回值拿到真的端口。别先绑一个 0 端口拿号、放掉、
+/// 再把号交给这里：放掉之后号回到系统手里，并行的测试绑 0、发起连接都会被分到
+/// 它，赶在这里绑之前拿走就是一次和代码无关的「端口被占」。
+pub async fn serve(
+    state: AppState,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<std::net::SocketAddr> {
+    crate::listen::serve_detached(state, addr).await
 }
 
 /// 上游回了话的一跳：`served` 或者 `status`。

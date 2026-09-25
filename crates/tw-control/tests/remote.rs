@@ -14,6 +14,9 @@ use tw_api::control::{Address, ControlKey};
 use tw_control::{ConfigManager, ControlState};
 use tw_link::LinkError;
 
+mod common;
+use common::spare_port;
+
 const KEY: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
 
 fn yaml(port: u16, enabled: bool, allow: &str) -> String {
@@ -24,14 +27,6 @@ fn yaml_at(bind: &str, port: u16, enabled: bool, allow: &str) -> String {
     format!(
         "version: 1\nlisten:\n  control:\n    key: {KEY}\n    remote:\n      enabled: {enabled}\n      bind: {bind}\n      port: {port}\n      allow_from: {allow}\nclients:\n  - name: default\n    key: tw-aaaa\n"
     )
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 struct Bed {
@@ -176,7 +171,7 @@ async fn send(
 /// 放行的来源握得上手，状态里说得出开着、听在哪。
 #[tokio::test]
 async fn an_allowed_source_gets_in_and_the_status_says_where_it_listens() {
-    let port = free_port();
+    let port = spare_port();
     let b = bed(yaml(port, true, "[127.0.0.1]")).await;
     let l = b.until(|l| l.addr.is_some()).await;
     assert_eq!(l.addr.unwrap().port(), port);
@@ -196,7 +191,7 @@ async fn an_allowed_source_gets_in_and_the_status_says_where_it_listens() {
 /// 不是「钥匙不对」。
 #[tokio::test]
 async fn a_source_outside_allow_from_is_closed_without_a_word() {
-    let port = free_port();
+    let port = spare_port();
     let b = bed(yaml(port, true, "[10.0.0.0/8]")).await;
     let l = b.until(|l| l.addr.is_some()).await;
     let mut raw = tokio::net::TcpStream::connect(l.addr.unwrap())
@@ -229,7 +224,7 @@ async fn a_source_outside_allow_from_is_closed_without_a_word() {
 /// 同一个来源一分钟里握手失败五次，之后连对的钥匙也直接关掉。
 #[tokio::test]
 async fn five_wrong_keys_from_one_source_bench_it() {
-    let port = free_port();
+    let port = spare_port();
     let b = bed(yaml(port, true, "[127.0.0.1]")).await;
     let addr = b.until(|l| l.addr.is_some()).await.addr.unwrap();
     let wrong = "1".repeat(64);
@@ -259,7 +254,7 @@ async fn five_wrong_keys_from_one_source_bench_it() {
 /// 同样的事从本机的通道做得了。
 #[tokio::test]
 async fn a_remote_connection_cannot_stop_the_core_take_diagnostics_or_move_its_own_door() {
-    let port = free_port();
+    let port = spare_port();
     let b = bed(yaml(port, true, "[127.0.0.1]")).await;
     let addr = b.until(|l| l.addr.is_some()).await.addr.unwrap();
     let (mut r, _) = open_tcp(addr, KEY).await.unwrap();
@@ -350,7 +345,7 @@ async fn a_remote_connection_cannot_stop_the_core_take_diagnostics_or_move_its_o
 /// 旧的并说为什么，本机的通道照常。
 #[tokio::test]
 async fn it_follows_the_configuration_live() {
-    let p1 = free_port();
+    let p1 = spare_port();
     let b = bed(yaml(p1, true, "[127.0.0.1]")).await;
     let a1 = b.until(|l| l.addr.is_some()).await.addr.unwrap();
     let (mut s, conn) = open_tcp(a1, KEY).await.unwrap();
@@ -374,7 +369,7 @@ async fn it_follows_the_configuration_live() {
     ));
 
     // 换个端口打开
-    let p2 = free_port();
+    let p2 = spare_port();
     b.rewrite(&yaml(p2, true, "[127.0.0.1]")).await;
     let a2 = b
         .until(|l| l.addr.is_some_and(|a| a.port() == p2))
@@ -421,7 +416,7 @@ async fn a_port_that_cannot_be_bound_at_start_does_not_take_the_local_channel_do
 /// 却仍放行它的，连接照常。
 #[tokio::test]
 async fn narrowing_allow_from_closes_the_connections_it_no_longer_lets_in() {
-    let port = free_port();
+    let port = spare_port();
     let b = bed(yaml(port, true, "[127.0.0.1]")).await;
     let addr = b.until(|l| l.addr.is_some()).await.addr.unwrap();
     let (mut s, conn) = open_tcp(addr, KEY).await.unwrap();
@@ -458,7 +453,7 @@ async fn narrowing_allow_from_closes_the_connections_it_no_longer_lets_in() {
 /// 旧的自己。要能当场换过去，不报错。
 #[tokio::test]
 async fn the_same_port_moves_between_all_and_a_specific_address_live() {
-    let port = free_port();
+    let port = spare_port();
     let b = bed(yaml_at("all", port, true, "[127.0.0.1]")).await;
     let l = b.until(|l| l.addr.is_some()).await;
     assert!(l.addr.unwrap().ip().is_unspecified(), "{l:?}");

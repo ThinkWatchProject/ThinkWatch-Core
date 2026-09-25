@@ -91,12 +91,9 @@ fn grouped(mut cfg: Config, order: &[&str]) -> Config {
 }
 
 async fn serve(state: tw_gateway::AppState) -> SocketAddr {
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    let s = state.clone();
-    tokio::spawn(async move { tw_gateway::serve(s, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }

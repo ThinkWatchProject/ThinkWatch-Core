@@ -13,6 +13,9 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
+mod common;
+use common::spare_port;
+
 fn control(
     d: &tempfile::TempDir,
     yaml: &str,
@@ -52,11 +55,9 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, serde_json::Value) 
 
 /// 把网关真的跑起来：凭据和代理的状态只有真实转发才会碰到。
 async fn serve(gw: tw_gateway::AppState) -> SocketAddr {
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(gw, addr).await.unwrap() });
+    let addr = tw_gateway::serve(gw, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
     addr
 }
@@ -76,10 +77,9 @@ async fn ask(gw: SocketAddr) -> u16 {
         .as_u16()
 }
 
-/// 一个确定没人在听的地址。
+/// 一个确定没人在听的地址（见 [`spare_port`]）。
 fn dead_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    SocketAddr::from(([127, 0, 0, 1], spare_port()))
 }
 
 // ---------------------------------------------------------------- 还在跑的请求

@@ -888,14 +888,25 @@ mod tests {
     /// 并行测试里别的用例就可能绑到它 —— 这个文件里有七处在绑随机端口，
     /// 其中几处还起了真的 SOCKS5 服务器。于是「死端口」活了过来，
     /// 测试看到的不是 TCP 拒绝而是一次握手。Windows 上撞得尤其勤。
+    /// 放掉之前先连一次确认它是死的也不够：确认完了照样会被绑去。
     ///
-    /// 所以拿到之后先自己连一次确认它是死的，活着就换一个。
+    /// 所以从系统不会自己分出去的那一段里挑（和 core 挑远程控制端口同一段），
+    /// 号用 UDP 占着直到进程退出。UDP 和 TCP 是两套端口，占着 UDP 的号不妨碍
+    /// TCP 上没人听；而别的测试挑号时也先占 UDP 的同一个号（见集成测试的
+    /// `spare_port`），占不到就换，不会拿它去绑。
     async fn dead_port() -> SocketAddr {
+        use std::sync::{Mutex, PoisonError};
+        static HELD: Mutex<Vec<std::net::UdpSocket>> = Mutex::new(Vec::new());
         for _ in 0..64 {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
+            let port = rand::random_range(tw_config::REMOTE_PORT_RANGE);
+            let a = SocketAddr::from(([127, 0, 0, 1], port));
+            let Ok(hold) = std::net::UdpSocket::bind(a) else {
+                continue;
+            };
             if tokio::net::TcpStream::connect(a).await.is_err() {
+                HELD.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(hold);
                 return a;
             }
         }

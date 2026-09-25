@@ -16,6 +16,9 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use tw_config::{Client, Config, Listen, Provider};
 
+mod common;
+use common::spare_port;
+
 /// 假上游收到的东西，测试拿它来断言。
 #[derive(Default, Debug)]
 struct Seen {
@@ -83,13 +86,9 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
-    // 监听器才能带上 connect info（对端地址）。
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
@@ -259,13 +258,9 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
-    // 监听器才能带上 connect info（对端地址）。
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let resp = reqwest::Client::new()
@@ -342,13 +337,10 @@ async fn next_lifecycle(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>
 /// 超时，不告诉你卡在哪一行。
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
-    // 绑一个端口再立刻放掉，这样能拿到一个**确定没人在听**的端口。
+    // 一个**确定没人在听**的端口（见 `spare_port`）。
     // 不要写死一个「大概没人用」的端口号：低位端口在 macOS 上可能被
     // 防火墙黑洞掉，表现为连接挂住十秒而不是立刻被拒。
-    let dead_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let dead_port = spare_port();
     let cfg = Config {
         retention: Default::default(),
         default_route: None,
@@ -371,13 +363,9 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
-    // 监听器才能带上 connect info（对端地址）。
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let resp = tokio::time::timeout(
@@ -467,13 +455,9 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         ])],
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
-    // 监听器才能带上 connect info（对端地址）。
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let send = |model: &str| {
@@ -544,13 +528,9 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
-    // 监听器才能带上 connect info（对端地址）。
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let r = reqwest::Client::new()
@@ -594,13 +574,9 @@ fn cfg_with(providers: Vec<Provider>, routes: Vec<tw_engine::Rule>) -> Config {
 
 async fn serve_cfg(cfg: Config) -> SocketAddr {
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    // 先 bind 拿端口，再放掉让 serve 自己 bind —— serve 需要自己建
-    // 监听器才能带上 connect info（对端地址）。
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
@@ -1316,12 +1292,9 @@ async fn intercepting_a_probe_emits_its_own_event_not_a_request_pair() {
         vec![],
     );
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    let st = state.clone();
-    tokio::spawn(async move { tw_gateway::serve(st, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     // 监听起来时报的那一条不算：这里只看请求带出来的事件
     let mut rx = state.bus.subscribe();
@@ -1708,11 +1681,9 @@ async fn a_stream_that_dies_midway_says_so_instead_of_just_stopping() {
     );
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let text = reqwest::Client::new()
@@ -1803,11 +1774,9 @@ async fn the_upstream_usage_reaches_the_event_stream_without_buffering_the_respo
     ))
     .unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let text = reqwest::Client::new()
@@ -1857,11 +1826,9 @@ async fn an_upstream_that_gives_no_usage_reports_none_rather_than_zeroes() {
     ))
     .unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     send_to(gw).await;
 
@@ -1892,11 +1859,9 @@ async fn a_key_pasted_into_a_prompt_is_noticed_but_the_request_goes_through_unto
     ))
     .unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let raw = r#"{"model":"m","messages":[{"role":"user","content":"我的 key 是 sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234"}]}"#;
@@ -1958,11 +1923,9 @@ async fn turning_the_detector_off_stops_it_looking_at_all() {
     cfg.security.redact.mode = tw_config::SecurityMode::Off;
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
@@ -2027,11 +1990,9 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
     }])];
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(send_to(gw).await.status(), 200);
 
@@ -2087,11 +2048,9 @@ async fn a_request_that_succeeds_first_try_still_has_a_chain_of_one() {
     ))
     .unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     send_to(gw).await;
 
@@ -2123,11 +2082,9 @@ async fn a_request_that_fails_everywhere_still_reports_the_chain() {
     ))
     .unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_ne!(send_to(gw).await.status(), 200);
 
@@ -2178,11 +2135,9 @@ async fn reporting_quota_does_not_change_how_an_upstream_is_billed() {
     ))
     .unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     for n in 1..=2 {
@@ -2211,11 +2166,9 @@ async fn free_billing_in_the_config_goes_out_with_the_request() {
     cfg.providers[0].billing = tw_config::Billing::Free;
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     send_to(gw).await;
 
@@ -2260,11 +2213,9 @@ async fn a_quota_reset_is_kept_as_the_moment_it_happens() {
     .unwrap();
     let kept = state.clone();
     let mut rx = state.bus.subscribe();
-    let gw = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, gw).await.unwrap() });
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     send_to(gw).await;
 

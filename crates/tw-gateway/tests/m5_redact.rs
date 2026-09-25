@@ -104,11 +104,9 @@ async fn start_with(providers: Vec<Provider>, redact: RedactPolicy) -> SocketAdd
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
@@ -308,12 +306,9 @@ async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let mut rx = state.bus.subscribe();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    let s2 = state.clone();
-    tokio::spawn(async move { tw_gateway::serve(s2, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     ask(addr, &body_with_key(), false).await;

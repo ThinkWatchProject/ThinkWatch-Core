@@ -14,6 +14,9 @@ use axum::extract::State;
 use axum::routing::any;
 use tw_config::{Client, Config, Provider};
 
+mod common;
+use common::spare_port;
+
 async fn counting_upstream(name: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
@@ -60,12 +63,9 @@ fn provider(name: &str, at: SocketAddr) -> Provider {
 }
 
 async fn serve(state: tw_gateway::AppState) -> SocketAddr {
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    let s = state.clone();
-    tokio::spawn(async move { tw_gateway::serve(s, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
@@ -493,15 +493,7 @@ async fn changing_the_port_actually_moves_the_listener() {
     // 反应」比报错难查得多。
     let (up, _) = counting_upstream("a").await;
     let mut c = cfg(vec![provider("a", up)], vec![]);
-    // 先占两个端口拿号，再放掉
-    let (p1, p2) = {
-        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        (
-            a.local_addr().unwrap().port(),
-            b.local_addr().unwrap().port(),
-        )
-    };
+    let (p1, p2) = (spare_port(), spare_port());
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     let mut events = state.bus.subscribe();
@@ -568,12 +560,11 @@ async fn a_port_already_taken_keeps_the_old_listener_and_says_why() {
     // 同一份配置拉起来、再失败 —— 用户改了个端口，换来的是所有客户端断线
     let (up, _) = counting_upstream("a").await;
     let mut c = cfg(vec![provider("a", up)], vec![]);
-    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let taken = squatter.local_addr().unwrap().port();
-    let p1 = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // 占着的程序后面会退出、把端口让给网关：放掉的那一下不能有别人插进来，
+    // 所以它占的也是一个系统不会转手的号
+    let taken = spare_port();
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+    let p1 = spare_port();
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     let mut events = state.bus.subscribe();
@@ -626,14 +617,7 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
         a
     };
     let mut c = cfg(vec![provider("slow", slow)], vec![]);
-    let (p1, p2) = {
-        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        (
-            a.local_addr().unwrap().port(),
-            b.local_addr().unwrap().port(),
-        )
-    };
+    let (p1, p2) = (spare_port(), spare_port());
     c.listen.gateway.port = p1;
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     following(&state, &c).await;
@@ -667,14 +651,6 @@ async fn a_request_in_flight_survives_the_listener_being_rebuilt() {
     assert!(r.text().await.unwrap().contains("slow"));
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn bind(raw: &str) -> tw_config::Bind {
     serde_yaml_ng::from_str(raw).unwrap()
 }
@@ -700,7 +676,7 @@ async fn switching_between_all_interfaces_and_one_address_on_the_same_port_takes
     // 报「端口被占」然后守着旧的，要重启才生效
     let (up, _) = counting_upstream("a").await;
     let mut c = cfg(vec![provider("a", up)], vec![]);
-    let port = free_port();
+    let port = spare_port();
     c.listen.gateway.port = port;
     c.listen.gateway.bind = bind("all");
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
@@ -732,7 +708,7 @@ async fn the_pre_save_check_does_not_call_our_own_port_taken() {
     // 不该回答「被别的程序占了」—— 那样这份设置根本存不进去
     let (up, _) = counting_upstream("a").await;
     let mut c = cfg(vec![provider("a", up)], vec![]);
-    c.listen.gateway.port = free_port();
+    c.listen.gateway.port = spare_port();
     c.listen.gateway.bind = bind("all");
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
     following(&state, &c).await;
@@ -767,7 +743,7 @@ async fn a_request_in_flight_survives_the_old_listener_giving_way() {
         a
     };
     let mut c = cfg(vec![provider("slow", slow)], vec![]);
-    let port = free_port();
+    let port = spare_port();
     c.listen.gateway.port = port;
     c.listen.gateway.bind = bind("all");
     let state = tw_gateway::AppState::new(c.clone()).unwrap();
@@ -807,7 +783,7 @@ async fn when_the_new_address_is_really_taken_the_old_one_is_taken_back() {
     //
     // 场景：0.0.0.0:p 在听，换到 [::1]:p，而 [::1]:p 被别人占着。同端口，所以
     // 走「先让出来」那条路；让了也没用，于是回到 0.0.0.0:p
-    let port = free_port();
+    let port = spare_port();
     let Ok(squatter) = std::net::TcpListener::bind(("::1", port)) else {
         eprintln!("no IPv6 loopback here; skipping");
         return;

@@ -101,12 +101,9 @@ fn with_policy(up: SocketAddr, inspect_tools: ToolPolicy) -> Config {
 async fn run(cfg: Config) -> (String, tokio::sync::broadcast::Receiver<tw_api::Event>) {
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let rx = state.bus.subscribe();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    let s2 = state.clone();
-    tokio::spawn(async move { tw_gateway::serve(s2, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let body = reqwest::Client::new()
@@ -394,12 +391,9 @@ async fn start_json_upstream(body: String) -> SocketAddr {
 async fn run_whole(cfg: Config) -> (String, tokio::sync::broadcast::Receiver<tw_api::Event>) {
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let rx = state.bus.subscribe();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    let s2 = state.clone();
-    tokio::spawn(async move { tw_gateway::serve(s2, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let body = reqwest::Client::new()

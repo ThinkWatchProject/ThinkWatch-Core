@@ -20,6 +20,9 @@ use tokio::sync::broadcast::Receiver;
 use tw_api::Event;
 use tw_config::{Client, Config, Provider, Security, SecurityMode};
 
+mod common;
+use common::spare_port;
+
 /// Anthropic 流的第一帧。**输入和缓存读在这里就是齐的**，输出是个占位的
 /// 1 —— 累计输出要等流的末尾才报。
 /// 客户端要的模型名。**每一种结局都要带着它**（见 `model_of`）
@@ -209,11 +212,9 @@ async fn serve_with_bus(cfg: Config) -> (SocketAddr, Receiver<Event>, tw_observe
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let bus = state.bus.clone();
     let events = bus.subscribe();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     (addr, events, bus)
 }
@@ -612,11 +613,8 @@ async fn a_websocket_session_the_client_closes_is_finished() {
 
 #[tokio::test]
 async fn a_websocket_whose_upstream_cannot_be_reached_is_failed() {
-    // 绑一个端口再立刻放掉，拿到一个确定没人在听的端口
-    let dead = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
+    // 一个确定没人在听的端口（见 `spare_port`）
+    let dead = SocketAddr::from(([127, 0, 0, 1], spare_port()));
     let (gw, mut events) = serve(cfg(provider(dead))).await;
     let mut c = ws_connect(gw).await;
     // 网关会先说一句为什么，再关掉连接
