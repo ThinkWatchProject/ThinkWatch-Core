@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use bytes::Bytes;
 
@@ -44,10 +44,41 @@ pub fn router(state: AppState) -> Router {
             "/v1beta/models/{model}",
             get(get_model).fallback(passthrough),
         )
+        // Files API：网关不代管文件，一律 404（见 `no_files`）。带 `/v1` 和不带的都认，
+        // 和别的接口一样
+        .route("/v1/files", any(no_files))
+        .route("/v1/files/{*rest}", any(no_files))
+        .route("/files", any(no_files))
+        .route("/files/{*rest}", any(no_files))
         // M0 只有透传：任何方法、任何路径都往上游送。M1 加路由时，
         // 这里会先过规则引擎再决定送给谁。
         .fallback(any(passthrough))
         .with_state(state)
+}
+
+/// Files API 回 404。
+///
+/// **不能透传**：传上去的文件落在那一刻被选中的那家上游，之后引用它的请求可能被路由
+/// 到另一家（规则、故障转移），那家不认这个 file id。DeepSeek Harness 先把图片传到
+/// `/v1/files`，失败了就改成内联 base64 —— 404 正是让它退回内联的那个回答，内联的
+/// 图片哪家上游都能收（要转换时也转得过去）。
+async fn no_files(headers: HeaderMap) -> Response {
+    let dialect = if headers.contains_key("anthropic-version") {
+        tw_dialect::ir::Dialect::Anthropic
+    } else {
+        tw_dialect::ir::Dialect::Chat
+    };
+    let m = msg!(
+        "gw.files.unsupported" =>
+        "The gateway does not host files. Send images and documents inline in the request."
+    );
+    let body = tw_dialect::convert::error_body(dialect, 404, &format!("[ThinkWatch] {}", m.text));
+    let mut resp = (axum::http::StatusCode::NOT_FOUND, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 async fn passthrough(

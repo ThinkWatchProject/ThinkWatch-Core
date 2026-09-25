@@ -36,6 +36,9 @@ struct Outbound {
     target: Option<tw_dialect::ir::Dialect>,
     /// ChatGPT 账号（Codex 后端）：只收流式、不认输出上限、身份头由网关填
     chatgpt: bool,
+    /// DeepSeek Harness 的请求发给 DeepSeek 官方以外的上游：它自己的请求头不转发
+    /// （见 [`tw_dialect::harness`]）
+    harness_elsewhere: bool,
     /// 回程要用的转换会话：转换过的，或者直通到 Codex 后端、客户端却要整包时
     /// 收齐流要用的
     session: Option<tw_dialect::convert::Session>,
@@ -344,6 +347,9 @@ fn prepare(
     let client_dialect = req.api.map(|a| a.dialect());
     let target = crate::translate::plan(req.api, generates, provider.effective_protocol());
     let chatgpt = generates && provider.effective_protocol() == Some(tw_config::Protocol::Chatgpt);
+    // DeepSeek Harness 的扩展只有 DeepSeek 官方认。**发给它时一个字节都不改**
+    let harness = generates && reading.harness.is_some();
+    let to_deepseek = tw_dialect::official::is_deepseek_host(&provider.base_url);
     let mut path = req.uri.path().to_string();
     let mut query = req.query.clone();
     let mut session: Option<tw_dialect::convert::Session> = None;
@@ -367,20 +373,39 @@ fn prepare(
                 Some(b) => Bytes::from(b),
                 None => out,
             };
-            if chatgpt {
-                // **只动 Codex 后端不认的那几个字段**，其余原样发（见 `chatgpt` 模块）
-                let (shaped, dropped) = crate::chatgpt::shape_passthrough(&out);
-                if !dropped.is_empty() {
-                    let responses = tw_api::Dialect::OpenaiResponses;
-                    state.bus.emit(tw_api::Event::Translated {
-                        id,
-                        provider: provider.name.clone(),
-                        from: responses,
-                        to: responses,
-                        dropped,
-                        at_ms: crate::server::now_ms(),
-                    });
+            // DeepSeek Harness 发给别家：去掉只有 DeepSeek 认的扩展。**去掉了什么要说**，
+            // 和转换丢了字段一样记在这一跳上
+            let mut dropped = Vec::new();
+            let out = match client_dialect
+                .filter(|_| harness && !to_deepseek)
+                .and_then(|d| tw_dialect::harness::clean(d, &out))
+            {
+                Some(c) => {
+                    dropped = c.dropped;
+                    Bytes::from(c.body)
                 }
+                None => out,
+            };
+            let out = if chatgpt {
+                // **只动 Codex 后端不认的那几个字段**，其余原样发（见 `chatgpt` 模块）
+                let (shaped, more) = crate::chatgpt::shape_passthrough(&out);
+                dropped.extend(more);
+                shaped
+            } else {
+                out
+            };
+            if let Some(d) = client_dialect.filter(|_| !dropped.is_empty()) {
+                let same = crate::wire::dialect(d);
+                state.bus.emit(tw_api::Event::Translated {
+                    id,
+                    provider: provider.name.clone(),
+                    from: same,
+                    to: same,
+                    dropped,
+                    at_ms: crate::server::now_ms(),
+                });
+            }
+            if chatgpt {
                 // 客户端要整包，后端只给流：由网关收齐。收齐要知道客户端的格式，所以要一个会话
                 if let Some(Ok(d)) = &reading.decoded
                     && !d.request.stream
@@ -397,10 +422,8 @@ fn prepare(
                             .session,
                     );
                 }
-                shaped
-            } else {
-                out
             }
+            out
         }
         Some(dialect) => {
             let d = match &reading.decoded {
@@ -453,6 +476,11 @@ fn prepare(
             // **客户端要不要流由会话记着**，发给 Codex 后端的这一份一律是流式
             let body = if chatgpt {
                 Bytes::from(crate::chatgpt::force_stream(p.body.clone()))
+            } else if harness && to_deepseek {
+                // 转换成另一种格式发给 DeepSeek 官方：直连时它收得到的扩展照样带上
+                Bytes::from(
+                    tw_dialect::harness::carry(&req.body, &p.body).unwrap_or(p.body.clone()),
+                )
             } else {
                 Bytes::from(p.body.clone())
             };
@@ -472,6 +500,7 @@ fn prepare(
         query,
         target,
         chatgpt,
+        harness_elsewhere: harness && !to_deepseek,
         session,
     })
 }
@@ -493,6 +522,14 @@ async fn send(
     let required = target
         .map(crate::translate::required_headers)
         .unwrap_or_default();
+    // DeepSeek Harness 发给别家：它自己的头不转发；直通时 `anthropic-beta` 去掉对话中途
+    // 增删工具那一项（那些块已经去掉了），剩下的照发
+    let harness = out.harness_elsewhere;
+    let beta = headers
+        .get("anthropic-beta")
+        .filter(|_| harness && target.is_none())
+        .and_then(|v| v.to_str().ok())
+        .and_then(tw_dialect::harness::anthropic_beta);
     let build = |upstream_headers: &[(String, String)]| {
         let mut req = http.request(method.clone(), &url);
         req = forward::forward_headers_filtered(req, headers, |n| {
@@ -503,10 +540,18 @@ async fn send(
             // 请求来自谁由网关如实填写：客户端报的来源（比如 Codex CLI 的 originator）
             // 不转发，请求经过的是 ThinkWatch
             let identity = chatgpt && !crate::chatgpt::keeps_client_header(n);
+            let dsh = harness
+                && (tw_dialect::harness::own_header(n) || n.eq_ignore_ascii_case("anthropic-beta"));
             !own && !identity
+                && !dsh
                 && !required.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
                 && !forward::overridden(upstream_headers, n)
         });
+        if let Some(b) = &beta
+            && !forward::overridden(upstream_headers, "anthropic-beta")
+        {
+            req = req.header("anthropic-beta", b.as_str());
+        }
         // 目标格式必需的头（Anthropic 的 anthropic-version）。上游配置里写了同名头时以配置为准
         for (k, v) in required {
             if !forward::overridden(upstream_headers, k) {

@@ -145,6 +145,8 @@ pub struct Reading {
     /// 才用得上**：同格式直通时，我们解不开的东西上游可能完全认识
     pub decoded: Option<Result<Decoded, Rejection>>,
     pub facts: tw_engine::RequestFacts,
+    /// DeepSeek Harness 发的请求（见 [`tw_dialect::harness`]）。要看请求头，由管线填
+    pub harness: Option<tw_dialect::harness::Harness>,
 }
 
 pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -> Reading {
@@ -179,6 +181,7 @@ pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -
         generates,
         decoded,
         facts,
+        harness: None,
     }
 }
 

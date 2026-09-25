@@ -593,6 +593,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **23 起额度也来自 GLM Coding Plan**（Z.ai / BigModel 的上游）：窗口多了 `monthly`，
 /// 积分制套餐的窗口带上 [`QuotaWindow::credits`]（总额、已用、剩余）。照 22 写的界面
 /// 不认 `monthly`，也看不到剩余积分。
+///
+/// 同一版起**记录说得出请求带没带 DeepSeek Harness 的会话日志**：`RequestStarted` 和
+/// [`HistoryRow`] 多了 `session_log_bytes`（`dsh_session_log` 的字节数，没带的没有）。
+/// 照 22 写的界面看不到它。
 pub const CONTROL_API_VERSION: u32 = 23;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,6 +727,15 @@ pub enum Event {
         model: String,
         method: String,
         path: String,
+        /// 请求带着 DeepSeek Harness 的会话日志（`dsh_session_log`）：这是它序列化之后
+        /// 的字节数。没带是 None。
+        ///
+        /// **会话日志是整段对话**（工作目录、系统提示、每一轮的输入输出、工具的参数和
+        /// 结果），默认开着，每个请求补上一段，单次最多 8 MiB。它不进模型输入，只有
+        /// DeepSeek 官方收：发给别的上游之前网关会去掉它，界面要能说出「这个请求带着
+        /// 会话日志、有多大」
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_log_bytes: Option<u64>,
         at_ms: u64,
     },
     /// 收到上游响应头。**这个事件单独存在是有意的**：流式请求从这里
@@ -3105,6 +3118,10 @@ pub struct HistoryRow {
     /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`），请求那一刻的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_masked: Option<String>,
+    /// 请求带着 DeepSeek Harness 的会话日志：它的字节数。没带的没有，理由见
+    /// `Event::RequestStarted::session_log_bytes`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_log_bytes: Option<i64>,
     /// 这次请求在两项防护上留下的记录（和安全日志同一份）。没有就是空的。
     ///
     /// **流量页的徽标靠它。**以前徽标只来自实时事件，关窗再开就没了 ——
@@ -4270,6 +4287,7 @@ mod tests {
                 model: "m".into(),
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                session_log_bytes: None,
                 at_ms: 0,
             },
             Event::RequestHeaders {
@@ -4327,6 +4345,7 @@ mod tests {
             model: "m".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
+            session_log_bytes: None,
             at_ms: 0,
         };
         let v = serde_json::to_value(&e).unwrap();
