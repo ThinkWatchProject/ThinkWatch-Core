@@ -1383,8 +1383,9 @@ mod security_tests {
             r.on_event(&started(1, "claude-sonnet-4-5"));
             r.on_event(&secrets(replaced));
             r.on_event(&finished(1, None));
-            let (got, more) = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
-            assert!(!more);
+            let page = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+            assert!(!page.more);
+            let got = page.events;
             assert_eq!(got.len(), 2, "{got:?}");
             assert!(
                 got.iter()
@@ -1418,10 +1419,11 @@ mod security_tests {
             blocked: true,
             at_ms: 20,
         });
-        let (got, _) = r
+        let got = r
             .db()
             .security_events(Some("inspect_tools"), 0, i64::MAX, None, 10)
-            .unwrap();
+            .unwrap()
+            .events;
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].action, tw_api::SecurityOutcome::Cut);
         assert_eq!(got[0].tool.as_deref(), Some("Bash"));
@@ -1472,7 +1474,11 @@ mod security_tests {
             cut: true,
             at_ms: 32,
         });
-        let (got, _) = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        let got = r
+            .db()
+            .security_events(None, 0, i64::MAX, None, 10)
+            .unwrap()
+            .events;
         assert_eq!(got.len(), 3, "{got:?}");
         let [limit, content, hidden] = &got[..] else {
             unreachable!()
