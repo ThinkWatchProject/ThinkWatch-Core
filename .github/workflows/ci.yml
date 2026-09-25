@@ -137,6 +137,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # 发布页的正文只在推 tag 时才写（release.yml 的 publish）。脚本和
+      # `release-notes/` 下的说明在改它们的那个 PR 上就核对：链接对不对得上
+      # 发出去的文件、说明里有没有混进中文。只要 Python，放在编译之前
+      - name: Release page text
+        run: python3 scripts/release_notes_test.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
