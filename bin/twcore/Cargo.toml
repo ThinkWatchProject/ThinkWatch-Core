@@ -8,7 +8,8 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
-description = "Self-contained AI gateway binary: the local gateway behind ThinkWatch Lite, or a standalone gateway on a server"
+# `twcore --help` 的第一行也是它（main.rs 的 `about`）
+description = "Self-contained AI gateway: the local engine behind ThinkWatch Lite, or a standalone gateway on a server"
 keywords.workspace = true
 categories.workspace = true
 

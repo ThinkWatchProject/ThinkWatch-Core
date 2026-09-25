@@ -17,11 +17,8 @@ mod upgrade;
 use lockfile::{LockFile, LockOutcome};
 
 #[derive(Parser)]
-#[command(
-    name = "twcore",
-    version,
-    about = "The local AI gateway engine behind ThinkWatch Lite"
-)]
+// `about` 不写值就是 Cargo.toml 里的 description：一句话只写一处，两边不会各说各的
+#[command(name = "twcore", version, about)]
 struct Cli {
     /// Path to the configuration file; ~/.thinkwatch/config.yaml by default
     #[arg(long, global = true)]
