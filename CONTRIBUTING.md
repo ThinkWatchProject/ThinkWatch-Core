@@ -18,19 +18,25 @@ while thirty-five commits landed on `main` without it.
 
 ## What this repository is
 
-A set of crates, not an application. `bin/twcore` is a complete gateway
-binary and the thing to run when you want to see behavior:
+A set of crates, and the `twcore` binary built from them. `bin/twcore` is
+a complete gateway and the thing to run when you want to see behavior:
 
 ```bash
-cargo run -p twcore -- init     # write a commented config.yaml
+cargo run -p twcore -- init     # write an initial config.yaml
 cargo run -p twcore -- check    # validate only, don't start
 cargo run -p twcore -- serve    # start the gateway and control plane
 ```
 
-Both editions depend on these crates — the desktop app
-([ThinkWatch Lite](https://github.com/ThinkWatchProject/ThinkWatch-Lite))
-and the server edition. A change here reaches both, so "it works for my
-case" is not the bar.
+Two products are built on these crates.
+[ThinkWatch Lite](https://github.com/ThinkWatchProject/ThinkWatch-Lite),
+the desktop app, bundles `twcore` as its gateway and can also connect to
+one running on a server.
+[ThinkWatch Enterprise](https://github.com/ThinkWatchProject/ThinkWatch)
+depends on exactly three of the crates, `tw-dialect`, `tw-guard` and
+`tw-breaker`, and CI checks that it still compiles against every change
+to them. A change here reaches every installation of the app and every
+server running `twcore`, and a change to those three crates reaches
+ThinkWatch Enterprise as well, so "it works for my case" is not the bar.
 
 What is *not* here: adopting AI clients, editing their MCP servers and
 scanning their configuration. Those change files on the machine the
@@ -189,7 +195,7 @@ The desktop app pins `tw-api` (and the few other crates it uses:
 and bundles the binary from that release. Those two have to come from one
 commit: the binary speaks a protocol, and the app compiles a mirror of it.
 
-On macOS, Apple Silicon only, deliberately. An Intel user downloading a
+On macOS, Apple silicon only, deliberately. An Intel user downloading a
 file that will not open is worse served than one who finds no download
 at all; supporting them means a universal binary, which is its own
 decision.
