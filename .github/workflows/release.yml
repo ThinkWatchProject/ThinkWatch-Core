@@ -299,6 +299,7 @@ jobs:
   # `generate_release_notes`。Release 已经存在时，这个 action 照样再要一份
   # 生成的说明，接在原有正文后面 —— 于是 v0.44.0 到 v0.47.0 的说明各有四份
   # （四个 job），v0.30.0 到 v0.43.0 各有两份（macOS、Windows 两个 job）。
+  # 现在正文由下面一步自己拼好交给它，不再让它生成。
   publish:
     name: Publish
     needs: [twcore, twcore-windows, twcore-linux]
@@ -324,6 +325,10 @@ jobs:
         dist/twcore-aarch64-unknown-linux-gnu.tar.gz
         dist/twcore-aarch64-unknown-linux-gnu.tar.gz.sha256
     steps:
+      # 发布页的正文要用这个仓库里的脚本和 `release-notes/`。先取代码再下载产物：
+      # checkout 会清空工作目录
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -338,33 +343,55 @@ jobs:
           cd dist
           sha256sum -c ./*.sha256
 
-      # 同一个原因，这一个 job 也会接上第二份：Release 已经在了 —— 重跑这个
-      # job（比如挂文件挂到一半断了），或者 Release 先手工建好了（v0.11.0 就是
-      # 这样多出一份的）。所以只在它还不存在时生成
+      # 发布页：标题「ThinkWatch Core <版本>」，正文（英文）由
+      # `scripts/release_notes.py` 写 —— `release-notes/<版本>.md` 里的说明（可以
+      # 没有）、下载表、服务器上安装和升级的命令、核对方法，最后是 GitHub 按上一版
+      # 以来合进 main 的 PR 生成的清单。排练也写，写进这次运行的摘要里，不发布。
+      #
+      # **正文只写一次。**Release 已经在了 —— 重跑这个 job（比如挂文件挂到一半
+      # 断了），或者 Release 先手工建好了（v0.11.0 就是这样多出一份说明的）——
+      # 就不动它的正文。以前这里每跑一次就接上一份生成的清单。
       #
       # **「不存在」只认 gh 查不到时的那句 `release not found`。**网络断了、令牌
-      # 不对、被限流，gh 一样失败；把那些也当成「不存在」，Release 其实在的话就又
-      # 接上一份。所以别的失败让这一步挂掉，原话留在日志里
-      - name: Notes only for a release that does not exist yet
+      # 不对、被限流，gh 一样失败；把那些也当成「不存在」，Release 其实在的话它的
+      # 正文就被盖掉。所以别的失败让这一步挂掉，原话留在日志里
+      - name: The page text, only for a release that does not exist yet
         id: notes
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if out=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
-            echo "generate=false"
-          elif grep -qx 'release not found' <<<"$out"; then
-            echo "generate=true"
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+            if out=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
+              echo "release $GITHUB_REF_NAME already exists; its text is left as it is"
+              echo "path=" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif ! grep -qx 'release not found' <<<"$out"; then
+              echo "$out" >&2
+              exit 1
+            fi
           else
-            echo "$out" >&2
-            exit 1
-          fi >> "$GITHUB_OUTPUT"
+            # 排练没有 tag：用代码里的版本号
+            VERSION=$(awk -F'"' '/^version *= *"/ { print $2; exit }' Cargo.toml)
+          fi
+          # 清单向 GitHub 要：和它在发布页上「自动生成」的是同一份。排练时这个 tag
+          # 可能还不存在，那就算到这次的 commit 为止（tag 存在时 target_commitish
+          # 不起作用）
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="v$VERSION" -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$RUNNER_TEMP/changes.md"
+          python3 scripts/release_notes.py "$VERSION" "$RUNNER_TEMP/changes.md" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "path=$RUNNER_TEMP/notes.md" >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2
         # 排练到上面为止
         if: github.ref_type == 'tag'
         with:
+          name: ThinkWatch Core ${{ env.VERSION }}
+          # 空的话（Release 已经在了）这个 action 保留原有的正文
+          body_path: ${{ steps.notes.outputs.path }}
           files: ${{ env.FILES }}
           fail_on_unmatched_files: true
-          # GitHub 生成的说明：上一版以来合进 main 的 PR
-          generate_release_notes: ${{ steps.notes.outputs.generate }}
