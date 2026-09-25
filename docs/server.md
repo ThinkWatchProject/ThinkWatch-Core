@@ -16,8 +16,12 @@ upgrading. Every field mentioned is described in the
 - Linux on x86_64 or aarch64, with glibc 2.35 or newer (Ubuntu 22.04,
   Debian 12, or later).
 - systemd.
-- The server's core version has to match the desktop app's. The app checks
-  this when it connects and shows both versions if they differ.
+- On the server, the core version that the desktop app includes. The app
+  connects only to a core that speaks the same version of the control-plane
+  protocol: it checks this during the handshake and, when the versions
+  differ, refuses the connection and shows both, the version on the server
+  and the version the app needs. [Upgrading](#upgrading) describes how to
+  switch versions.
 
 ## 1. Install
 
@@ -25,11 +29,17 @@ upgrading. Every field mentioned is described in the
 curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh
 ```
 
-To install a particular version, the one your desktop app expects:
+This installs the latest release, which can be newer than the core version
+the desktop app includes. To install a particular version, pass it to the
+script:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh -s -- --version 0.47.0
+curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh -s -- --version <version>
 ```
+
+`<version>` is a release number such as `0.47.0`. When the server runs a
+different version, the app names the version it needs, and
+[`twcore upgrade --version`](#upgrading) switches the server to it.
 
 The script:
 
@@ -176,18 +186,26 @@ interfaces that listen on it, and the allowed sources. When the port is
 closed the second line reads `remote control: off (twcore remote enable
 opens it)`.
 
-In the desktop app, open **Settings → Connections → Add remote connection**
+In the desktop app, open **Settings → Connection → Add remote connection**
 and enter:
 
+- **Name**: a name for the connection, such as `home-server`;
 - **Address**: the server's host name or IP address;
 - **Control port**: `listen.control.remote.port`;
 - **Key**: the 64 characters `twcore control-key` printed.
 
-The app tests the connection before saving and says what is wrong if it
-fails: no answer (address, port, firewall, `enabled`), connection closed
-(this computer's address is probably not in `allow_from`), wrong key, or
-different versions. `allow_from` for this port does not let the server
-itself in automatically; commands on the server use the local channel.
+**Test connection** completes the handshake and reads the server's core
+version, without saving anything. **Save and switch** runs the same test
+first, saves the connection only when the test succeeds, and asks for
+confirmation before switching; **Save** stores the connection without
+testing it. Switching to a remote connection always tests it first, and the
+app stays on its current connection when the test fails. A failed test
+says what is wrong: no answer (address, port, firewall, `enabled`),
+connection closed (this computer's address is probably not in
+`allow_from`), wrong key, or different versions (see
+[Upgrading](#upgrading)). `allow_from` for this port does not let the
+server itself in automatically; commands on the server use the local
+channel.
 
 A source that fails the handshake five times within a minute is ignored
 for a minute. Removing a network from `allow_from` also closes the
@@ -199,34 +217,51 @@ replace it, run `twcore control-key --rotate` on the server; connections
 made with the old key are closed at once, and connected apps then have to
 be given the new key.
 
-A remote connection can do everything the app does on its own computer
+A remote connection can do everything the app does with its local core
 except three things, which the server refuses: stopping core (systemd
 runs it), taking the diagnostic bundle, and changing `listen.control`,
-the section it came in through. Do those on the server.
+the section it came in through. Do those on the server. ChatGPT accounts
+are signed in with a device code while the app is connected to a remote
+core, because a browser sign-in returns to the machine that runs core.
 
 ### Point clients at the server
 
 Clients use the server's gateway, `http://<server>:8788`, with a gateway key
-from `clients`. The desktop app can point the clients on its own computer at
-the server (Clients page); on other machines, configure them by hand.
+from `clients`. The desktop app can point the clients on the machine it
+runs on at the server (Clients page); on other machines, configure them by
+hand.
 
 ## Upgrading
+
+The server has to run the core version that the desktop app includes. When
+the two differ, for example after the app updates to a release that
+includes a newer core, the app refuses the connection and shows both
+versions. Switch the server to the version the app needs:
+
+```sh
+sudo twcore upgrade --version <version> --restart
+```
+
+With `--version`, `twcore upgrade` installs the named release even when it
+is older than the installed one, so the same command moves the server
+forward or back. Recent versions of the app show this command, with the
+version filled in, when the versions differ.
+
+Without `--version`, `twcore upgrade` compares with, and installs, the
+latest release, which can be newer than the version the app needs:
 
 ```sh
 sudo twcore upgrade --check       # compare with the latest release, change nothing
 sudo twcore upgrade --restart     # install the latest release and restart the service
-sudo twcore upgrade --version 0.48.0 --restart
 ```
 
 `twcore upgrade` downloads the release for this machine, checks its
 SHA-256 sum, and replaces `/usr/local/bin/twcore` in one step, so a failed
-download never leaves a broken binary. The configuration and the data are
-not touched. Without `--restart` it prints the command to restart the
-service; the running process keeps the old version until then.
-
-Upgrade the server and the desktop app together: the app refuses to connect
-to a core of another version and shows the command above with the version
-it needs.
+download never leaves a broken binary. It does not touch the configuration
+or the data. Without `--restart` it prints the command to restart the
+service; the running process keeps the old version until then. A version
+that stores request history in a different format from the previous one
+starts with an empty request history; the configuration is kept.
 
 ## Uninstalling
 
