@@ -161,7 +161,9 @@ answered on the request itself.
 "which build is in there" has to be a fact somebody can check rather than
 whatever sat in a `target/` directory that afternoon.
 
-1. Bump `version` in the workspace `Cargo.toml`, land it on `main`.
+1. Bump `version` in the workspace `Cargo.toml`, add
+   `release-notes/X.Y.Z.md` if the release page should carry a summary
+   (see below), and land both on `main`.
 2. Tag that commit `vX.Y.Z` and push the tag.
 3. `release.yml` builds `twcore` for every target below. It checks that
    each binary is built for its target and, where the runner can execute
@@ -185,10 +187,29 @@ The bare binaries are what the desktop app's pipeline bundles and what
 the unit and the binary come from the same commit. The file names are a
 contract with both: `twcore upgrade` has a test that reads `release.yml`.
 
+The release is titled `ThinkWatch Core X.Y.Z`. Its text, in English, is
+written by `scripts/release_notes.py` in this order:
+
+1. `release-notes/X.Y.Z.md`, when that file exists: a summary of the
+   release in paragraphs or lists, without a top-level heading. It goes
+   in with the version bump, because the tag fixes what the tree
+   contains.
+2. A table of the files for each platform.
+3. The commands that install this version on a server and switch an
+   existing installation to it.
+4. How to verify a download against its `.sha256`.
+5. GitHub's list of the pull requests merged since the previous release.
+
+The text is written when the release is created. A release that already
+exists keeps its text, so re-running the job does not add to it, and a
+correction after publishing is made on the release page itself. CI runs
+`python3 scripts/release_notes_test.py`, which checks the script against
+`release.yml` and renders every file in `release-notes/`.
+
 To try a change to `release.yml` without publishing, run it by hand on
 your branch (`gh workflow run release.yml --ref <branch>`): it builds and
-checks everything, leaves the files as the run's artifacts, and publishes
-nothing.
+checks everything, leaves the files as the run's artifacts, shows the
+release text in the run's summary, and publishes nothing.
 
 The desktop app pins `tw-api` (and the few other crates it uses:
 `tw-types`, `tw-yaml`, `tw-guard`, `tw-watch`, `tw-link`) to the same tag
