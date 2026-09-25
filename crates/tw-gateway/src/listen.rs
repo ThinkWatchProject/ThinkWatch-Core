@@ -220,6 +220,25 @@ fn snapshot(bound: &[Bound], error: Option<Msg>) -> Listening {
     }
 }
 
+/// 起服务，**不跟配置走**，绑上了就交回真的地址。见 [`crate::server::serve`]。
+pub(crate) async fn serve_detached(
+    state: AppState,
+    want: SocketAddr,
+) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind(want)
+        .await
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}", bind_failure(want, &e))))?;
+    let bound = start(&state, want, listener)?;
+    let actual = bound.actual;
+    state.set_listening(snapshot(std::slice::from_ref(&bound), None));
+    // 丢掉 `Bound` 就停止接新连接：把它留在一个不会结束的任务里
+    tokio::spawn(async move {
+        let _bound = bound;
+        std::future::pending::<()>().await
+    });
+    Ok(actual)
+}
+
 /// 起服务。`follow` 为真时**跟着配置里的监听地址走**（「温」那一级热重载）。
 ///
 /// 命令行给了 `--port` 时 `follow` 为假：那是一个显式的覆盖，不该被配置

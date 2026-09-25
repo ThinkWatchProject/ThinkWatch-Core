@@ -17,6 +17,9 @@ use tokio::sync::broadcast::Receiver;
 use tw_api::Event;
 use tw_config::{Client, Config, Listen, Provider, Security, SecurityMode};
 
+mod common;
+use common::spare_port;
+
 const USER_KEY: &str = "sk-ant-api03-USERSOWNKEYAAAAAAAAAAAAAA";
 
 /// 假上游：记下收到的每一帧，然后按剧本回。
@@ -119,10 +122,9 @@ async fn start_gateway(up: SocketAddr, mode: SecurityMode, inspect: SecurityMode
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
     addr
 }
@@ -275,10 +277,9 @@ async fn an_upgrade_without_a_gateway_key_is_refused() {
 async fn serve(cfg: Config) -> (SocketAddr, Receiver<Event>) {
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let events = state.bus.subscribe();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
     (addr, events)
 }
@@ -443,11 +444,8 @@ async fn an_upstream_that_refuses_the_upgrade_is_reported_with_its_status() {
 /// 连不上：**失败的那一跳也要报**，而且说清为什么 —— 失败的时候恰恰最需要看它。
 #[tokio::test]
 async fn an_unreachable_upstream_is_reported_as_a_failed_hop() {
-    // 绑一个端口再立刻放掉，拿到一个确定没人在听的端口
-    let dead = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
+    // 一个确定没人在听的端口（见 `spare_port`）
+    let dead = SocketAddr::from(([127, 0, 0, 1], spare_port()));
     let (gw, mut events) = serve(routed_to_an_account(dead)).await;
     let _c = connect(gw).await;
 

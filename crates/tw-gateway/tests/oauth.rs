@@ -158,10 +158,9 @@ async fn start_gateway(providers: Vec<Provider>) -> (SocketAddr, tw_gateway::App
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let handed = state.clone();
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
     (addr, handed)
 }

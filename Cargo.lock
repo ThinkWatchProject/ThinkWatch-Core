@@ -2544,6 +2544,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
