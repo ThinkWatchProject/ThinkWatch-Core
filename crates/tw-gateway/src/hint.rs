@@ -51,6 +51,14 @@ pub fn client_hint(headers: &HeaderMap) -> Option<String> {
             return Some(id.into());
         }
     }
+    // 四、Antigravity CLI（agy）。它没有自己的 UA，发的是 Go 版 genai SDK 的默认值。
+    // 实测 1.2.11：`google-genai-sdk/1.71.0 gl-go/go1.28-20260721-RC03 cl/951519500 +3ebc191975 X:…`
+    // 只看 `google-genai-sdk` 会把任何用 Go SDK 的程序都算成 agy；能分开的是
+    // `gl-go/` 后面那段 Google 内部 Go 工具链的版本号（带 `cl/`），外面编出来的只有
+    // `gl-go/go1.25.1`。
+    if ua.starts_with("google-genai-sdk/") && ua.contains(" gl-go/") && ua.contains(" cl/") {
+        return Some("antigravity-cli".into());
+    }
     None
 }
 
@@ -117,6 +125,28 @@ mod tests {
                 "deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness)"
             )])),
             Some("deepseek-harness".into())
+        );
+    }
+
+    #[test]
+    fn antigravity_cli_is_recognised_by_the_toolchain_in_its_user_agent() {
+        // agy 1.2.11 指向假服务器时抓到的原样；X-Goog-Api-Client 和 UA 相同。
+        let agy = "google-genai-sdk/1.71.0 gl-go/go1.28-20260721-RC03 cl/951519500 +3ebc191975 X:fieldtrack,boringcrypto,simd,mapsplitgroup";
+        assert_eq!(
+            client_hint(&h(&[
+                ("user-agent", agy),
+                ("x-goog-api-client", agy),
+                ("x-goog-api-key", "k"),
+            ])),
+            Some("antigravity-cli".into())
+        );
+        // 外面的人用 Go SDK 写的程序：同一个 UA 前缀，普通的 Go 版本号。不是 agy。
+        assert_eq!(
+            client_hint(&h(&[(
+                "user-agent",
+                "google-genai-sdk/1.71.0 gl-go/go1.25.1"
+            )])),
+            None
         );
     }
 
