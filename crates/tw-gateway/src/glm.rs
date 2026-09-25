@@ -7,7 +7,8 @@
 //! 问的纪律：
 //! - **界面来要时问**，60 秒内的多次合成一次；**有请求去这一家时顺手问**，5 分钟最多一次。
 //! - 失败了退避（30 秒、60 秒、120 秒、300 秒），不跟着界面的每一次刷新重试。
-//! - 这把 key 没有开通套餐：记成「没有额度数据」，隔一小时才再问。
+//! - 这把 key 没有开通套餐：记成「没有额度数据」，隔一小时才再问。刚才还有额度的 key
+//!   要连着说两次才算（一次临时的 500 和「没有套餐」长得一样）。
 //!
 //! 额度用完时模型请求回 429，业务码在 body 里（[`exhausted`]）。**那一刻就记成用完**，
 //! 不等下一次问额度。
@@ -324,6 +325,8 @@ struct Slot {
     quiet_until: u64,
     /// 正在问。**同一时刻只问一次**
     running: bool,
+    /// 上一次问来的是额度
+    had_quota: bool,
 }
 
 impl Slot {
@@ -339,10 +342,20 @@ impl Slot {
             .is_none_or(|t| now_ms.saturating_sub(t) >= every)
     }
 
-    fn settle(&mut self, answer: &Answer, now_ms: u64) {
+    /// 记下这一次的结果，交回该按哪个结论办。
+    ///
+    /// **刚才还有额度的 key 头一次说「没有套餐」，当成一次失败**：「没有套餐」认的是
+    /// 业务码 500，而一次临时的 500 长得一模一样。照「没有套餐」办要清掉额度、一小时
+    /// 不再问；当成失败只是按退避过一会儿再问。连着第二次还这么说，才是真没有了
+    fn settle(&mut self, answer: Answer, now_ms: u64) -> Answer {
+        let answer = match answer {
+            Answer::NoPlan if self.had_quota => Answer::Failed,
+            a => a,
+        };
+        self.had_quota = matches!(answer, Answer::Quota(_));
         self.running = false;
         self.asked_at = Some(now_ms);
-        match answer {
+        match &answer {
             Answer::Quota(_) => {
                 self.failures = 0;
                 self.quiet_until = 0;
@@ -357,6 +370,7 @@ impl Slot {
                 self.quiet_until = now_ms + BACKOFF_MS[i];
             }
         }
+        answer
     }
 }
 
@@ -398,14 +412,18 @@ impl Tracker {
         due
     }
 
-    /// 问完了。凭据在这中间换了的话，这个结果说的是旧的 key，不记
-    pub fn settle(&self, provider: &str, ident: &str, answer: &Answer, now_ms: u64) {
-        if let Ok(mut g) = self.slots.lock()
-            && let Some(slot) = g.get_mut(provider)
-            && slot.ident == ident
-        {
-            slot.settle(answer, now_ms);
-        }
+    /// 问完了：记下节奏，交回该按哪个结论办（见 `Slot::settle`）。凭据在这中间换了
+    /// 的话，这个结果说的是旧的 key，不记也不办，是 None
+    pub fn settle(
+        &self,
+        provider: &str,
+        ident: &str,
+        answer: Answer,
+        now_ms: u64,
+    ) -> Option<Answer> {
+        let mut g = self.slots.lock().ok()?;
+        let slot = g.get_mut(provider).filter(|s| s.ident == ident)?;
+        Some(slot.settle(answer, now_ms))
     }
 }
 
@@ -749,7 +767,7 @@ mod tests {
         assert!(t.claim("glm", "k", Why::Demand, NOW));
         // 正在问：再来的不另问
         assert!(!t.claim("glm", "k", Why::Demand, NOW + 1));
-        t.settle("glm", "k", &Answer::Quota(Quota::default()), NOW + 100);
+        t.settle("glm", "k", Answer::Quota(Quota::default()), NOW + 100);
         assert!(!t.claim("glm", "k", Why::Demand, NOW + 30_000));
         assert!(t.claim("glm", "k", Why::Demand, NOW + 100 + MINUTE_MS));
     }
@@ -758,14 +776,14 @@ mod tests {
     fn traffic_asks_at_most_every_five_minutes() {
         let t = Tracker::default();
         assert!(t.claim("glm", "k", Why::Traffic, NOW));
-        t.settle("glm", "k", &Answer::Quota(Quota::default()), NOW);
+        t.settle("glm", "k", Answer::Quota(Quota::default()), NOW);
         assert!(!t.claim("glm", "k", Why::Traffic, NOW + 4 * MINUTE_MS));
         // 界面来要的照样按一分钟算
         assert!(t.claim("glm", "k", Why::Demand, NOW + 2 * MINUTE_MS));
         t.settle(
             "glm",
             "k",
-            &Answer::Quota(Quota::default()),
+            Answer::Quota(Quota::default()),
             NOW + 2 * MINUTE_MS,
         );
         assert!(!t.claim("glm", "k", Why::Traffic, NOW + 6 * MINUTE_MS));
@@ -778,16 +796,16 @@ mod tests {
         let mut now = NOW;
         for wait in [30_000, 60_000, 120_000, 300_000, 300_000] {
             assert!(t.claim("glm", "k", Why::Demand, now), "at {}", now - NOW);
-            t.settle("glm", "k", &Answer::Failed, now);
+            t.settle("glm", "k", Answer::Failed, now);
             // 界面每分钟来要一次也不提前
             assert!(!t.claim("glm", "k", Why::Demand, now + wait - 1));
             now += wait.max(DEMAND_EVERY_MS);
         }
         // 成功一次，退避清零
         assert!(t.claim("glm", "k", Why::Demand, now));
-        t.settle("glm", "k", &Answer::Quota(Quota::default()), now);
+        t.settle("glm", "k", Answer::Quota(Quota::default()), now);
         assert!(t.claim("glm", "k", Why::Demand, now + DEMAND_EVERY_MS));
-        t.settle("glm", "k", &Answer::Rejected, now + DEMAND_EVERY_MS);
+        t.settle("glm", "k", Answer::Rejected, now + DEMAND_EVERY_MS);
         assert!(t.claim("glm", "k", Why::Demand, now + 2 * DEMAND_EVERY_MS));
     }
 
@@ -795,13 +813,35 @@ mod tests {
     fn a_key_without_a_plan_is_asked_again_only_after_an_hour_or_a_new_key() {
         let t = Tracker::default();
         assert!(t.claim("glm", "k", Why::Demand, NOW));
-        t.settle("glm", "k", &Answer::NoPlan, NOW);
+        t.settle("glm", "k", Answer::NoPlan, NOW);
         assert!(!t.claim("glm", "k", Why::Demand, NOW + 30 * MINUTE_MS));
         assert!(!t.claim("glm", "k", Why::Traffic, NOW + 30 * MINUTE_MS));
         // 换了 key：之前的结论说的是旧的那把
         assert!(t.claim("glm", "k2", Why::Demand, NOW + 30 * MINUTE_MS));
-        t.settle("glm", "k2", &Answer::NoPlan, NOW + 30 * MINUTE_MS);
+        t.settle("glm", "k2", Answer::NoPlan, NOW + 30 * MINUTE_MS);
         assert!(t.claim("glm", "k2", Why::Demand, NOW + 90 * MINUTE_MS));
+    }
+
+    /// 刚才还有额度的 key 头一次说「没有套餐」：多半是一次临时的 500，当成失败，
+    /// 过一会儿再问；连着第二次才信
+    #[test]
+    fn a_key_that_had_a_plan_must_say_no_plan_twice() {
+        let t = Tracker::default();
+        let q = Answer::Quota(Quota::default());
+        assert!(t.claim("glm", "k", Why::Demand, NOW));
+        assert_eq!(t.settle("glm", "k", q.clone(), NOW), Some(q));
+        assert!(t.claim("glm", "k", Why::Demand, NOW + MINUTE_MS));
+        assert_eq!(
+            t.settle("glm", "k", Answer::NoPlan, NOW + MINUTE_MS),
+            Some(Answer::Failed)
+        );
+        let later = NOW + 2 * MINUTE_MS;
+        assert!(t.claim("glm", "k", Why::Demand, later));
+        assert_eq!(
+            t.settle("glm", "k", Answer::NoPlan, later),
+            Some(Answer::NoPlan)
+        );
+        assert!(!t.claim("glm", "k", Why::Demand, later + 30 * MINUTE_MS));
     }
 
     #[test]
@@ -809,9 +849,9 @@ mod tests {
         let t = Tracker::default();
         assert!(t.claim("glm", "old", Why::Demand, NOW));
         assert!(t.claim("glm", "new", Why::Demand, NOW));
-        t.settle("glm", "old", &Answer::NoPlan, NOW);
+        t.settle("glm", "old", Answer::NoPlan, NOW);
         // 新 key 还在问，旧的结论没把它记成「没有套餐」
-        t.settle("glm", "new", &Answer::Quota(Quota::default()), NOW);
+        t.settle("glm", "new", Answer::Quota(Quota::default()), NOW);
         assert!(t.claim("glm", "new", Why::Demand, NOW + DEMAND_EVERY_MS));
     }
 }

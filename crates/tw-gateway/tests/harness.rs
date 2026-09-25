@@ -345,6 +345,57 @@ async fn messages_to_another_anthropic_upstream_are_cleaned_in_place() {
     );
 }
 
+/// `anthropic-beta` 分两行发：清理的那一行去掉，**另一行照发**
+#[tokio::test]
+async fn betas_sent_on_separate_lines_all_survive_the_cleaning() {
+    let (gw, _rx, log) = gateway(elsewhere(Protocol::Anthropic).await).await;
+    let (status, body) = send(
+        gw,
+        "/v1/messages",
+        &[
+            ("anthropic-version", "2023-06-01"),
+            ("anthropic-beta", TOOL_BETA),
+            ("anthropic-beta", "files-api-2025-04-14"),
+        ],
+        &messages_request().to_string(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let s = generation(&log);
+    assert_clean(&s);
+    let betas: Vec<_> = s.headers.get_all("anthropic-beta").iter().collect();
+    assert_eq!(betas, ["files-api-2025-04-14"]);
+}
+
+/// 不生成回答的请求（数 token）也是 dsh 发的：发给别家时一样不带它的头和会话日志
+#[tokio::test]
+async fn counting_tokens_elsewhere_is_cleaned_too() {
+    let (gw, _rx, log) = gateway(elsewhere(Protocol::Anthropic).await).await;
+    let mut req = messages_request();
+    req.as_object_mut().unwrap().remove("max_tokens");
+    let (status, body) = send(
+        gw,
+        "/v1/messages/count_tokens",
+        &[
+            ("anthropic-version", "2023-06-01"),
+            ("anthropic-beta", TOOL_BETA),
+        ],
+        &req.to_string(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let s = log
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|s| s.uri.ends_with("/count_tokens"))
+        .cloned()
+        .expect("the upstream got no count_tokens request");
+    assert_clean(&s);
+    assert!(s.headers.get("anthropic-beta").is_none());
+}
+
 #[tokio::test]
 async fn messages_to_an_openai_upstream_are_cleaned_by_the_conversion() {
     let (gw, mut rx, log) = gateway(elsewhere(Protocol::OpenaiChat).await).await;

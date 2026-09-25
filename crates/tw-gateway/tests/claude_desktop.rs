@@ -97,6 +97,10 @@ struct Gateway {
 }
 
 async fn gateway(p: Provider) -> Gateway {
+    gateway_pinging_for(p, tw_gateway::PING_FOR).await
+}
+
+async fn gateway_pinging_for(p: Provider, ping_for: Duration) -> Gateway {
     let cfg = Config {
         version: 1,
         listen: Listen::default(),
@@ -111,6 +115,7 @@ async fn gateway(p: Provider) -> Gateway {
     let mut state = tw_gateway::AppState::new(cfg).unwrap();
     // 心跳的间隔调短，一条测试不必干等十五秒
     state.ping_every = Duration::from_millis(100);
+    state.ping_for = ping_for;
     let events = state.bus.subscribe();
     let (tx, bodies) = tokio::sync::mpsc::channel(16);
     state.set_body_sink(tx);
@@ -341,6 +346,68 @@ async fn a_silent_converted_upstream_is_covered_with_pings() {
     }
     assert!(recorded.contains("\"content\":\"lo\""), "{recorded}");
     assert!(!recorded.contains("ping"), "心跳进了请求记录：{recorded}");
+}
+
+/// 上游在排队时只发 SSE 注释（DeepSeek 的 `: keep-alive`）。转换时注释被丢掉，
+/// 客户端什么都收不到 —— **心跳要看客户端那一边的静默**，不能被上游的注释推迟
+#[tokio::test]
+async fn upstream_comments_that_never_reach_the_client_do_not_hold_pings_back() {
+    let mut parts = vec![Some(CHAT_FIRST)];
+    for _ in 0..14 {
+        parts.push(Some(": keep-alive\n\n"));
+        parts.push(None);
+    }
+    parts.push(Some(CHAT_REST));
+    let up = stalling_upstream(parts, Duration::from_millis(50)).await;
+    let gw = gateway(provider(up, Protocol::OpenaiChat, &[])).await;
+    let text = stream_from(
+        &gw,
+        "/v1/messages",
+        json!({"model": "gpt-x", "max_tokens": 16, "stream": true,
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    let ping = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
+    assert!(text.matches(ping).count() >= 2, "{text}");
+    let rest = text.replace(ping, "");
+    assert!(!rest.contains("keep-alive"), "{rest}");
+    assert!(
+        rest.trim_end().ends_with("\"type\":\"message_stop\"}"),
+        "{rest}"
+    );
+}
+
+/// 上游一个字节都不发太久（连接半开了）：**不再补心跳**，让客户端自己的静默计时断开它。
+/// 一直补的话这个请求永远挂着
+#[tokio::test]
+async fn pings_stop_once_the_upstream_has_been_silent_too_long() {
+    let up = stalling_upstream(
+        vec![Some(CHAT_FIRST), None, Some(CHAT_REST)],
+        Duration::from_millis(1200),
+    )
+    .await;
+    let gw = gateway_pinging_for(
+        provider(up, Protocol::OpenaiChat, &[]),
+        Duration::from_millis(350),
+    )
+    .await;
+    let text = stream_from(
+        &gw,
+        "/v1/messages",
+        json!({"model": "gpt-x", "max_tokens": 16, "stream": true,
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    let ping = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
+    // 静默 1.2 秒、每 0.1 秒一次：一直补的话有十一个。只补前 0.35 秒的
+    let n = text.matches(ping).count();
+    assert!((1..=4).contains(&n), "{n}: {text}");
+    assert!(
+        text.replace(ping, "")
+            .trim_end()
+            .ends_with("\"type\":\"message_stop\"}"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
