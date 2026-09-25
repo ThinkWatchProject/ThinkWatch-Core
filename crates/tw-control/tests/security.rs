@@ -649,6 +649,12 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     let events = v["events"].as_array().unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(v["more"], true);
+    // 页头的数是整段的，不是这一页的
+    assert_eq!(v["total"], 3, "{v}");
+    assert_eq!(
+        v["by_outcome"],
+        json!({ "recorded": 1, "replaced": 1, "cut": 1, "blocked": 0 })
+    );
     assert_eq!(events[0]["rule"], "jwt", "倒序：新的在前");
     assert_eq!(events[0]["provider"], "首选");
     assert_eq!(
@@ -675,8 +681,9 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     .await;
     assert_eq!(v["events"].as_array().unwrap().len(), 1);
     assert_eq!(v["more"], false);
+    assert_eq!(v["total"], 3, "翻页不是筛选，总数不该变：{v}");
 
-    // 按类型、按时间段筛
+    // 按类型、按时间段筛：总数跟着一起筛
     let (_, v) = call(
         &b.app,
         "GET",
@@ -687,6 +694,11 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     let only = v["events"].as_array().unwrap();
     assert_eq!(only.len(), 1, "{v}");
     assert_eq!(only[0]["rule"], "jwt");
+    assert_eq!(v["total"], 1);
+    assert_eq!(
+        v["by_outcome"],
+        json!({ "recorded": 0, "replaced": 1, "cut": 0, "blocked": 0 })
+    );
 
     // 概览上的计数和日志数的是同一批
     let (_, v) = call(
@@ -706,6 +718,51 @@ async fn the_log_pages_backwards_and_names_the_upstream_that_served_the_request(
     assert_eq!(v["row"]["security"].as_array().unwrap().len(), 2, "{v}");
     let (_, v) = call(&b.app, "GET", "/history?limit=10", serde_json::Value::Null).await;
     assert_eq!(v[0]["security"].as_array().unwrap().len(), 2, "{v}");
+}
+
+/// 比一页多的时候，页头照样说得出一共几条（以前只能写「100+」）；一条都
+/// 没有的一段，四项都在、都是 0。
+#[tokio::test]
+async fn the_log_counts_past_one_page_and_an_empty_window_counts_zero() {
+    let b = bed_with(BASE, |db| {
+        for i in 0..150 {
+            let (guard, action) = match i % 3 {
+                0 => ("redact", "recorded"),
+                1 => ("redact", "replaced"),
+                _ => ("inspect_tools", "cut"),
+            };
+            db.insert_security_event(&event(i, 1_000 + i, guard, "r", action))
+                .unwrap();
+        }
+    });
+    // 不给条数是一页 100 条
+    let (st, v) = call(&b.app, "GET", "/security/events", serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["events"].as_array().unwrap().len(), 100);
+    assert_eq!(v["more"], true);
+    assert_eq!(v["total"], 150);
+    assert_eq!(
+        v["by_outcome"],
+        json!({ "recorded": 50, "replaced": 50, "cut": 50, "blocked": 0 })
+    );
+
+    let (st, v) = call(
+        &b.app,
+        "GET",
+        "/security/events?from_ms=5000&to_ms=6000",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v,
+        json!({
+            "events": [],
+            "more": false,
+            "total": 0,
+            "by_outcome": { "recorded": 0, "replaced": 0, "cut": 0, "blocked": 0 },
+        })
+    );
 }
 
 // ─────────────────────────────────────────────────────────── 藏匿字符、内容过滤、输出长度

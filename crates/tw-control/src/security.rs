@@ -346,7 +346,7 @@ async fn events(
     let g = store.lock().await;
     // **缺省是「全部」，不是「今天」。**这是一张列表，「最近 N 条」本身就是
     // 一个完整的回答
-    let (events, more) = g
+    let page = g
         .db()
         .security_events(
             guard,
@@ -356,7 +356,7 @@ async fn events(
             q.limit.unwrap_or(100).clamp(1, PAGE_MAX),
         )
         .map_err(crate::records)?;
-    Ok(Json(tw_api::SecurityEventsPage { events, more }))
+    Ok(Json(page))
 }
 
 // ---------------------------------------------------------------- 写

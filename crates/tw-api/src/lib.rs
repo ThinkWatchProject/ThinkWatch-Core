@@ -2647,12 +2647,20 @@ pub struct CostBucket {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CostBucketGroup {
     pub at_ms: i64,
-    /// 模型名或上游名，看查的是哪一维
+    /// 模型名、上游名或密钥名，看查的是哪一维
     pub name: String,
     pub requests: i64,
     pub failed: i64,
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
+    /// 这一格里这一项有几条请求的模型不在价目表里（用量是有的），见
+    /// `Summary::unpriced_requests`。
+    ///
+    /// **每一项自己带着。**这一项的金额是 0 时，要分得清「没有价格」和「确实
+    /// 没花钱」—— 只有整格的数的话，说不出缺着钱的是哪一项。
+    pub unpriced_requests: i64,
+    /// 这一格里这一项有几条请求没有拿到用量，见 `Summary::no_usage_requests`
+    pub no_usage_requests: i64,
     /// 这一格里这一项用掉的 token。
     ///
     /// **四类分开给。**它们的单价差十倍以上，加成一个数之后既算不回
@@ -3596,6 +3604,28 @@ pub struct SecurityEventView {
 pub struct SecurityEventsPage {
     pub events: Vec<SecurityEventView>,
     pub more: bool,
+    /// 这一段时间里、按这一项筛出来的一共几条 —— **整段的，不只是这一页**。
+    ///
+    /// `before` 是翻页的位置，不是筛选：翻到第几页，这个数都一样。页头的
+    /// 「N 次命中」是它；拿读到的条数去数，读满一页就只能写「100+」
+    pub total: i64,
+    /// `total` 里各做了什么。四项加起来就是 `total`
+    pub by_outcome: SecurityOutcomeCounts,
+}
+
+/// 一段安全日志里，每一种做法各几条（见 [`SecurityOutcome`]）。没有的是 0，
+/// 四项都在。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityOutcomeCounts {
+    /// 只记录
+    pub recorded: i64,
+    /// 已替换成占位符
+    pub replaced: i64,
+    /// 已切断
+    pub cut: i64,
+    /// 请求被拒，没有发出去
+    pub blocked: i64,
 }
 
 /// 一条内置规则按什么认。**给界面说明用**，界面按类型写成自己的话。

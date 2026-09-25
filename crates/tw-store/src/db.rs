@@ -712,11 +712,14 @@ impl Db {
         Ok(())
     }
 
-    /// 安全日志的一页，按时间倒序。
+    /// 安全日志的一页，按时间倒序，连同这一段一共几条、各做了什么。
     ///
     /// 上游、密钥和模型**尽量取请求那一行的**：记录发生在请求发出之前，那时
     /// 知道的只是首选的上游，而故障转移之后真正服务它的是另一家。请求还没
     /// 落库时退回记录自己的。
+    ///
+    /// **总数和这一页用同一句筛选**（[`SECURITY_FILTER`]）：页头的「一共几条」
+    /// 和往下翻能翻出来的是同一批。`before_id` 只管翻到哪儿，不进总数。
     pub fn security_events(
         &self,
         guard: Option<&str>,
@@ -724,11 +727,10 @@ impl Db {
         until_ms: i64,
         before_id: Option<i64>,
         limit: usize,
-    ) -> Result<(Vec<tw_api::SecurityEventView>, bool), DbError> {
+    ) -> Result<tw_api::SecurityEventsPage, DbError> {
         let mut st = self.conn.prepare(&format!(
             "{SECURITY_SELECT}
-             WHERE e.at_ms >= ?1 AND e.at_ms < ?2
-               AND (?3 IS NULL OR e.guard = ?3)
+             WHERE {SECURITY_FILTER}
                AND (?4 IS NULL OR e.id < ?4)
              ORDER BY e.id DESC
              LIMIT ?5"
@@ -737,10 +739,39 @@ impl Db {
             params![since_ms, until_ms, guard, before_id, limit as i64 + 1],
             security_view,
         )?;
-        let mut out = rows.collect::<Result<Vec<_>, _>>()?;
-        let more = out.len() > limit;
-        out.truncate(limit);
-        Ok((out, more))
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        let more = events.len() > limit;
+        events.truncate(limit);
+
+        let mut st = self.conn.prepare(&format!(
+            "SELECT e.action, COUNT(*) FROM security_events e
+             WHERE {SECURITY_FILTER}
+             GROUP BY e.action"
+        ))?;
+        let rows = st.query_map(params![since_ms, until_ms, guard], |r| {
+            Ok((
+                slug_col(r, 0, tw_api::SecurityOutcome::from_slug)?,
+                r.get::<_, i64>(1)?,
+            ))
+        })?;
+        let mut by = tw_api::SecurityOutcomeCounts::default();
+        for row in rows {
+            let (outcome, n) = row?;
+            // 逐个列出来：多一种做法时这里编译不过，而不是悄悄少数一种
+            let slot = match outcome {
+                tw_api::SecurityOutcome::Recorded => &mut by.recorded,
+                tw_api::SecurityOutcome::Replaced => &mut by.replaced,
+                tw_api::SecurityOutcome::Cut => &mut by.cut,
+                tw_api::SecurityOutcome::Blocked => &mut by.blocked,
+            };
+            *slot = n;
+        }
+        Ok(tw_api::SecurityEventsPage {
+            events,
+            more,
+            total: by.recorded + by.replaced + by.cut + by.blocked,
+            by_outcome: by,
+        })
     }
 
     /// 请求号落在 `[from, to]` 里的那些请求的安全记录，按请求号分好。
@@ -911,12 +942,16 @@ impl Db {
             tw_api::CostDim::Provider => "provider",
             tw_api::CostDim::Client => "client",
         };
+        // 缺着钱的两种和 `cost_buckets` 用同一对条件：每一格里各项加起来，
+        // 就是那一格自己的数
         let sql = format!(
             "SELECT ((at_ms - ?1) / ?3) AS b, {col},
                     COUNT(*),
                     SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+                    COALESCE(SUM({NO_PRICE}), 0),
+                    COALESCE(SUM({NO_USAGE}), 0),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0),
@@ -934,10 +969,12 @@ impl Db {
                 failed: r.get(3)?,
                 cost_micros_exact: r.get(4)?,
                 cost_micros_estimated: r.get(5)?,
-                input_tokens: r.get(6)?,
-                output_tokens: r.get(7)?,
-                cache_read_tokens: r.get(8)?,
-                cache_write_tokens: r.get(9)?,
+                unpriced_requests: r.get(6)?,
+                no_usage_requests: r.get(7)?,
+                input_tokens: r.get(8)?,
+                output_tokens: r.get(9)?,
+                cache_read_tokens: r.get(10)?,
+                cache_write_tokens: r.get(11)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1111,6 +1148,13 @@ const SECURITY_SELECT: &str =
         e.tool, e.excerpt, e.count,
         r.client_hint, r.peer, r.key_masked
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
+
+/// 安全日志按什么筛：`?1`–`?2` 这一段时间，`?3` 这一项（NULL 是全部）。
+///
+/// **读一页和数总数用的是这一句**，两句 SQL 各写一份条件的话，迟早有一边多
+/// 一个少一个，页头的数就和列表对不上了。只看 `e` 的列：连上请求那一行不会
+/// 多出或少掉一条记录。
+const SECURITY_FILTER: &str = "e.at_ms >= ?1 AND e.at_ms < ?2 AND (?3 IS NULL OR e.guard = ?3)";
 
 /// 存成词的一列读回契约里的枚举。不认得的词是这一行坏了
 fn slug_col<T, I: rusqlite::RowIndex>(
@@ -1863,6 +1907,10 @@ mod cost_state_tests {
         assert_eq!((b[0].unpriced_requests, b[0].no_usage_requests), (0, 3));
         let g = db.cost_by(tw_api::CostDim::Model, 0, 1000).unwrap();
         assert_eq!((g[0].unpriced_requests, g[0].no_usage_requests), (0, 3));
+        let bg = db
+            .cost_buckets_by(tw_api::CostDim::Model, 0, 1000, 1000)
+            .unwrap();
+        assert_eq!((bg[0].unpriced_requests, bg[0].no_usage_requests), (0, 3));
     }
 
     /// **钱缺着的只有按量计费的那些。**不计费的，没有用量也好、模型不在价目表
@@ -1896,7 +1944,126 @@ mod cost_state_tests {
             ),
             (1, 1)
         );
+        let bg = db
+            .cost_buckets_by(tw_api::CostDim::Model, 0, 1000, 1000)
+            .unwrap();
+        assert_eq!(
+            (
+                bg.iter().map(|g| g.unpriced_requests).sum::<i64>(),
+                bg.iter().map(|g| g.no_usage_requests).sum::<i64>()
+            ),
+            (1, 1)
+        );
         assert_eq!(db.unpriced_recent(365_000).unwrap().0, 1);
+    }
+
+    /// 分组的每一格**自己说缺着多少钱**，三个维度都是。
+    ///
+    /// 概览按模型分层的图上，一个模型那一格的金额是 0：没有价格、没有用量、
+    /// 还是确实不花钱，是三句不同的话。只有整格的数的话，说得出这一格缺着
+    /// 钱，说不出缺在哪个模型上。
+    #[test]
+    fn every_group_in_a_bucket_says_how_much_of_its_money_is_missing() {
+        use std::collections::BTreeMap;
+        use tw_api::CostDim;
+
+        let db = Db::in_memory().unwrap();
+        let hour = 3_600_000i64;
+        let t0 = 1_000_000_000i64;
+        // (模型, 上游, 密钥) 每一行各不相同地交叉开，三个维度分出来的组都不一样
+        let set = |mut r: RequestRow, model: &str, provider: &str, client: &str| {
+            r.model = model.into();
+            r.provider = provider.into();
+            r.client = client.into();
+            r
+        };
+        let mut free = unknown_model(7, t0 + hour + 3);
+        free.billing = tw_api::Billing::Free;
+        for r in [
+            // 第 0 格
+            set(row(1, t0 + 1), "opus", "官方", "alice"),
+            set(unknown_model(2, t0 + 2), "自起名", "中转", "alice"),
+            set(without_usage(3, t0 + 3), "opus", "中转", "bob"),
+            set(failed_before_usage(4, t0 + 4), "opus", "官方", "bob"),
+            // 第 1 格
+            set(unknown_model(5, t0 + hour + 1), "自起名", "官方", "bob"),
+            set(without_usage(6, t0 + hour + 2), "opus", "官方", "alice"),
+            // 不计费的：模型不在价目表里也不缺钱，这一组是真的 $0
+            set(free, "自起名", "中转", "bob"),
+        ] {
+            db.insert(&r).unwrap();
+        }
+
+        let missing = |dim| {
+            db.cost_buckets_by(dim, t0, t0 + 2 * hour, hour)
+                .unwrap()
+                .into_iter()
+                .map(|g| {
+                    (
+                        ((g.at_ms - t0) / hour, g.name),
+                        (g.unpriced_requests, g.no_usage_requests),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let want = |xs: [(i64, &str, (i64, i64)); 4]| {
+            xs.into_iter()
+                .map(|(b, name, n)| ((b, name.to_string()), n))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            missing(CostDim::Model),
+            want([
+                (0, "opus", (0, 1)),
+                (0, "自起名", (1, 0)),
+                (1, "opus", (0, 1)),
+                (1, "自起名", (1, 0)),
+            ])
+        );
+        assert_eq!(
+            missing(CostDim::Provider),
+            want([
+                (0, "官方", (0, 0)),
+                (0, "中转", (1, 1)),
+                (1, "官方", (1, 1)),
+                (1, "中转", (0, 0)),
+            ])
+        );
+        assert_eq!(
+            missing(CostDim::Client),
+            want([
+                (0, "alice", (1, 0)),
+                (0, "bob", (0, 1)),
+                (1, "alice", (0, 1)),
+                (1, "bob", (1, 0)),
+            ])
+        );
+
+        // 每一格里各组加起来，就是不分组那一格自己的数
+        let plain = db.cost_buckets(t0, t0 + 2 * hour, hour).unwrap();
+        assert_eq!(plain.len(), 2);
+        for dim in [CostDim::Model, CostDim::Provider, CostDim::Client] {
+            let by = db.cost_buckets_by(dim, t0, t0 + 2 * hour, hour).unwrap();
+            for b in &plain {
+                let here = by.iter().filter(|g| g.at_ms == b.at_ms);
+                let sum = here.fold((0, 0), |(p, u), g| {
+                    (p + g.unpriced_requests, u + g.no_usage_requests)
+                });
+                assert_eq!(
+                    sum,
+                    (b.unpriced_requests, b.no_usage_requests),
+                    "{dim:?} 在 {} 这一格加起来和不分组的对不上",
+                    b.at_ms
+                );
+            }
+        }
+
+        // 一条都没有的一段：没有组，不是一组零
+        assert!(
+            db.cost_buckets_by(CostDim::Model, t0 + 5 * hour, t0 + 6 * hour, hour)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// 价格页只列**配一个价格就能解决**的模型。列出一个失败了的、或者
@@ -1974,5 +2141,139 @@ mod cost_state_tests {
             turns.iter().map(|t| t.cost_estimated).collect::<Vec<_>>(),
             vec![false, true, false, false]
         );
+    }
+}
+
+#[cfg(test)]
+mod security_log_tests {
+    use super::*;
+    use tw_api::{Guard, SecurityOutcome, SecurityOutcomeCounts};
+
+    fn event(at_ms: i64, guard: Guard, action: SecurityOutcome) -> SecurityEvent {
+        SecurityEvent {
+            at_ms,
+            request_id: at_ms,
+            guard,
+            rule: "r".into(),
+            custom: false,
+            action,
+            provider: "官方".into(),
+            client: "default".into(),
+            tool: None,
+            excerpt: "…".into(),
+            count: 1,
+        }
+    }
+
+    /// 九条，时刻 1–9，号也是 1–9。只记录 3 条、已替换 1 条、已切断 3 条、
+    /// 被拒 2 条
+    fn seeded() -> Db {
+        let db = Db::in_memory().unwrap();
+        for (at, guard, action) in [
+            (1, Guard::Redact, SecurityOutcome::Recorded),
+            (2, Guard::Redact, SecurityOutcome::Replaced),
+            (3, Guard::InspectTools, SecurityOutcome::Cut),
+            (4, Guard::Redact, SecurityOutcome::Recorded),
+            (5, Guard::HiddenText, SecurityOutcome::Blocked),
+            (6, Guard::Content, SecurityOutcome::Recorded),
+            (7, Guard::InspectTools, SecurityOutcome::Cut),
+            (8, Guard::Content, SecurityOutcome::Blocked),
+            (9, Guard::OutputLimit, SecurityOutcome::Cut),
+        ] {
+            db.insert_security_event(&event(at, guard, action)).unwrap();
+        }
+        db
+    }
+
+    fn ids(p: &tw_api::SecurityEventsPage) -> Vec<i64> {
+        p.events.iter().map(|e| e.id).collect()
+    }
+
+    /// 页头的数是**整段的**。以前只能拿读到的条数去数，读满一页就只能写
+    /// 「100+」。往下翻页也不变：`before` 是翻到哪儿，不是筛选。
+    #[test]
+    fn the_total_counts_the_whole_window_not_just_the_page() {
+        let db = seeded();
+        let all = SecurityOutcomeCounts {
+            recorded: 3,
+            replaced: 1,
+            cut: 3,
+            blocked: 2,
+        };
+
+        let p = db.security_events(None, 0, i64::MAX, None, 4).unwrap();
+        assert_eq!(ids(&p), vec![9, 8, 7, 6]);
+        assert!(p.more);
+        assert_eq!(p.total, 9, "数的是这一页，不是这一段");
+        assert_eq!(p.by_outcome, all);
+
+        let p = db.security_events(None, 0, i64::MAX, Some(6), 4).unwrap();
+        assert_eq!(ids(&p), vec![5, 4, 3, 2]);
+        assert!(p.more);
+        assert_eq!((p.total, &p.by_outcome), (9, &all), "翻到第二页，总数变了");
+
+        let p = db.security_events(None, 0, i64::MAX, Some(2), 4).unwrap();
+        assert_eq!(ids(&p), vec![1]);
+        assert!(!p.more);
+        assert_eq!((p.total, &p.by_outcome), (9, &all));
+    }
+
+    /// **总数就是一页一页翻到底翻得出来的那些**，按哪一项、哪一段筛都一样：
+    /// 两句 SQL 用的是同一句筛选。
+    #[test]
+    fn the_total_is_what_paging_to_the_end_yields_under_every_filter() {
+        let db = seeded();
+        for (guard, since, until) in [
+            (None, 0, i64::MAX),
+            (Some("redact"), 0, i64::MAX),
+            (None, 3, 7),
+            (Some("inspect_tools"), 0, 8),
+            (Some("content"), 7, 100),
+            // 输出长度那条在 9，终点不含：一条都没有
+            (Some("output_limit"), 0, 9),
+        ] {
+            let first = db.security_events(guard, since, until, None, 2).unwrap();
+            let mut seen = first.events.clone();
+            let mut last = first.clone();
+            while last.more {
+                let before = last.events.last().unwrap().id;
+                last = db
+                    .security_events(guard, since, until, Some(before), 2)
+                    .unwrap();
+                assert_eq!(
+                    (last.total, &last.by_outcome),
+                    (first.total, &first.by_outcome),
+                    "{guard:?} {since}..{until}：翻页之后总数变了"
+                );
+                seen.extend(last.events.iter().cloned());
+            }
+            let mut counted = SecurityOutcomeCounts::default();
+            for e in &seen {
+                match e.action {
+                    SecurityOutcome::Recorded => counted.recorded += 1,
+                    SecurityOutcome::Replaced => counted.replaced += 1,
+                    SecurityOutcome::Cut => counted.cut += 1,
+                    SecurityOutcome::Blocked => counted.blocked += 1,
+                }
+            }
+            assert_eq!(
+                first.total,
+                seen.len() as i64,
+                "{guard:?} {since}..{until}：总数和翻得出来的条数对不上"
+            );
+            assert_eq!(first.by_outcome, counted, "{guard:?} {since}..{until}");
+        }
+    }
+
+    /// 一条都没有：零条，四项都在、都是 0。
+    #[test]
+    fn an_empty_window_counts_zero_of_everything() {
+        for db in [Db::in_memory().unwrap(), seeded()] {
+            let p = db.security_events(None, 100, 200, None, 10).unwrap();
+            assert!(p.events.is_empty());
+            assert!(!p.more);
+            assert_eq!(p.total, 0);
+            assert_eq!(p.by_outcome, SecurityOutcomeCounts::default());
+        }
     }
 }
