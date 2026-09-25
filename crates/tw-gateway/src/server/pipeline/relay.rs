@@ -97,6 +97,7 @@ pub(super) fn respond(
         && plan.client_sse
         && status.is_success())
     .then_some(state.ping_every);
+    let ping_for = state.ping_for;
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
@@ -106,17 +107,27 @@ pub(super) fn respond(
         let mut ending = ending;
         let mut chunks = std::pin::pin!(chunks);
         let mut broke: Option<GatewayError> = None;
+        // 客户端上一次收到字节的时刻。**心跳看的是客户端那一边的静默**，不是上游的：
+        // 上游在排队时发的 SSE 注释（DeepSeek 的 `: keep-alive`、OpenRouter 的
+        // `: OPENROUTER PROCESSING`）转换时被丢掉，上游不算静默，客户端却什么都没收到
+        let mut quiet_since = tokio::time::Instant::now();
+        // 上游上一次发来任何字节（注释也算）的时刻。**上游整个没了声音太久就不再补**：
+        // 半开的连接永远等不到下一个字节，一直补心跳的话客户端也永远不会放弃，这个
+        // 请求就挂在那儿了。停下之后由客户端自己的静默计时来断
+        let mut upstream_since = tokio::time::Instant::now();
         loop {
             let next = match ping_every {
                 None => chunks.next().await,
                 // `next()` 被超时丢掉不丢数据：它只是去问一次流，没拿走任何东西
-                Some(every) => match tokio::time::timeout(every, chunks.next()).await {
+                Some(every) => match tokio::time::timeout_at(quiet_since + every, chunks.next()).await {
                     Ok(next) => next,
                     Err(_) => {
+                        // 停在一帧中间时这一轮不补，也要重新计时，否则会原地空转
+                        quiet_since = tokio::time::Instant::now();
                         // **不经过留档、计量和审查**：心跳不是上游说的话，不进请求记录，
                         // 也不算输出。**只在帧的边界上插**，上游停在一帧中间时插进去
                         // 会把那一帧拆坏 —— 那时宁可不补
-                        if relay.between_frames() {
+                        if relay.between_frames() && upstream_since.elapsed() < ping_for {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(PING));
                         }
                         continue;
@@ -126,6 +137,7 @@ pub(super) fn respond(
             let Some(item) = next else { break };
             match item {
                 Ok(chunk) => {
+                    upstream_since = tokio::time::Instant::now();
                     // **旁路嗅探和留档，不缓冲**：字节照常流向客户端，同时
                     // 喂它一份。上游返回的 usage 是真相，而拿不到它就只能估。
                     //
@@ -136,6 +148,7 @@ pub(super) fn respond(
                     let (out, cut) = relay.chunk(&chunk);
                     relay.sent(&out);
                     if !out.is_empty() {
+                        quiet_since = tokio::time::Instant::now();
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
                     }
                     if let Some(err) = cut {

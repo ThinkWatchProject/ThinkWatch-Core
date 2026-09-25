@@ -22,8 +22,12 @@ impl AppState {
 
     /// 这一家是 GLM Coding Plan 的话，额度接口的地址和凭据的指纹。
     ///
-    /// 没有 key 的不算：额度跟着 key 走，没有 key 就没有可问的
+    /// 没有 key 的不算：额度跟着 key 走，没有 key 就没有可问的。**停用的也不算**：
+    /// 用户不想用它了，不该再拿它的 key 去问
     fn glm_target(&self, p: &tw_config::Provider) -> Option<(String, String)> {
+        if p.disabled {
+            return None;
+        }
         let key = p.key.as_ref()?;
         let url = self.glm.sites().quota_url(&p.base_url)?;
         // 指纹，不是 key 本身：它只用来认出「换了 key」
@@ -67,6 +71,11 @@ impl AppState {
         let p = p.clone();
         Some(tokio::spawn(async move {
             let answer = state.ask_glm(&p, &url).await;
+            // 节奏先记上，**按记下的那个结论办**：刚才还有套餐的 key 头一次说没有，
+            // 当成一次失败（见 `Tracker::settle`）
+            let Some(answer) = state.glm.settle(&p.name, &ident, answer, now_ms()) else {
+                return;
+            };
             match &answer {
                 Answer::Quota(q) => state.record_quota(state.bus.next_id(), &p.name, q.clone()),
                 // 没有套餐就没有额度数据：之前记着的也不再作数
@@ -78,7 +87,6 @@ impl AppState {
                     tracing::debug!(provider = %p.name, "the GLM quota could not be read")
                 }
             }
-            state.glm.settle(&p.name, &ident, &answer, now_ms());
         }))
     }
 
@@ -279,5 +287,8 @@ mod tests {
         let mut keyless = cfg.providers[0].clone();
         keyless.key = None;
         assert!(s.glm_target(&keyless).is_none());
+        let mut disabled = cfg.providers[0].clone();
+        disabled.disabled = true;
+        assert!(s.glm_target(&disabled).is_none());
     }
 }
