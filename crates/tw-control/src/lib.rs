@@ -692,15 +692,16 @@ async fn cost_by(
 /// 各条路由走了多少请求、各条规则命中了多少。不给参数就是「今天」。
 ///
 /// **路由图按它给线加粗、标出从没命中过的规则**：按请求落库时记下的路由和规则
-/// 数，不按现在的配置推（见 [`tw_api::RouteHits`]）。
+/// 数，不按现在的配置推（见 [`tw_api::RouteHits`]）。「从没命中过」只对记录说得上
+/// 话的那一段成立，所以一起给出记录从哪一刻起是全的（见 [`tw_api::RouteStats`]）。
 async fn route_stats(
     State(s): State<ControlState>,
     axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
-) -> Result<Json<Vec<tw_api::RouteHits>>, Fail> {
+) -> Result<Json<tw_api::RouteStats>, Fail> {
     let (from, to) = range(q.from_ms, q.to_ms);
     let store = need_store(&s)?;
     let g = store.lock().await;
-    Ok(Json(g.db().route_hits(from, to).map_err(records)?))
+    Ok(Json(g.db().route_stats(from, to).map_err(records)?))
 }
 
 /// 一段时间的汇总。不给参数就是「今天」。

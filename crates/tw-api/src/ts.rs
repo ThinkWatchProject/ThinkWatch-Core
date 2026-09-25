@@ -206,8 +206,20 @@ mod tests {
         assert!(known.contains("\"prolite\""), "{known}");
         let oauth = decl_of(&ts, "OAuthView");
         assert!(oauth.contains("account?: AccountView"), "{oauth}");
+        // 登录结果说的账号和上游视图是同一块
         let login = decl_of(&ts, "ChatgptLoginStatus");
-        assert!(login.contains("plan?: ChatgptPlan"), "{login}");
+        assert!(login.contains("account?: AccountView"), "{login}");
+        assert!(!login.contains("plan"), "{login}");
+    }
+
+    /// 命中数带着记录从哪一刻起是全的：必有的字段，没有记录时是 null，不是省掉。
+    #[test]
+    fn route_stats_say_where_their_history_starts() {
+        let ts = typescript();
+        let stats = decl_of(&ts, "RouteStats");
+        assert!(stats.contains("covered_since_ms: number | null"), "{stats}");
+        assert!(stats.contains("routes: Array<RouteHits>"), "{stats}");
+        assert!(ts.contains("  RouteStats: { req: Window; res: RouteStats };"));
     }
 
     #[test]

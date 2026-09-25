@@ -385,7 +385,7 @@ fn pending(id: &str) -> tw_api::ChatgptLoginStatus {
         id: id.to_string(),
         status: LoginStatus::Pending,
         provider: None,
-        plan: None,
+        account: None,
         error: None,
     }
 }
@@ -471,7 +471,7 @@ async fn await_device(
         id: id.clone(),
         status: LoginStatus::Expired,
         provider: None,
-        plan: None,
+        account: None,
         error: Some(not_in_time()),
     });
     announce(&s, &id, LoginStatus::Expired, None, None);
@@ -486,13 +486,13 @@ fn not_in_time() -> Msg {
 }
 
 /// 记下登录的结果，并告诉界面一声
-fn settle(s: &ControlState, id: &str, done: Result<(String, Option<tw_api::ChatgptPlan>), Msg>) {
+fn settle(s: &ControlState, id: &str, done: Result<(String, Option<tw_api::AccountView>), Msg>) {
     let status = match done {
-        Ok((provider, plan)) => tw_api::ChatgptLoginStatus {
+        Ok((provider, account)) => tw_api::ChatgptLoginStatus {
             id: id.to_string(),
             status: LoginStatus::Done,
             provider: Some(provider),
-            plan,
+            account,
             error: None,
         },
         Err(why) => {
@@ -501,7 +501,7 @@ fn settle(s: &ControlState, id: &str, done: Result<(String, Option<tw_api::Chatg
                 id: id.to_string(),
                 status: LoginStatus::Failed,
                 provider: None,
-                plan: None,
+                account: None,
                 error: Some(why),
             }
         }
@@ -605,7 +605,7 @@ async fn serve_callback(flow: Arc<Flow>, listener: tokio::net::TcpListener) {
             id: flow.id.clone(),
             status: LoginStatus::Expired,
             provider: None,
-            plan: None,
+            account: None,
             error: Some(not_in_time()),
         });
         announce(&flow.s, &flow.id, LoginStatus::Expired, None, None);
@@ -673,7 +673,10 @@ async fn callback(
     Html(html)
 }
 
-/// 用授权码换 token，写进配置。返回上游名和套餐。
+/// 用授权码换 token，写进配置。返回上游名和登的是哪个账号。
+///
+/// **账号从存进配置的 access token 里读**，和上游视图（[`account_view`]）同一个来源：
+/// 登录完成时说的和上游那一行说的不会是两个账号。id_token 只用来取账户 ID
 async fn exchange_and_save(
     s: &ControlState,
     name: &str,
@@ -681,12 +684,12 @@ async fn exchange_and_save(
     code: &str,
     verifier: &str,
     redirect_uri: &str,
-) -> Result<(String, Option<tw_api::ChatgptPlan>), Msg> {
+) -> Result<(String, Option<tw_api::AccountView>), Msg> {
     let endpoints = &s.chatgpt.endpoints;
     let http = client_for(s, name, proxy)?;
     let tokens =
         chatgpt::exchange_code(&http, &endpoints.token, code, verifier, redirect_uri).await?;
-    let account = chatgpt::account(&tokens.id_token);
+    let account_id = chatgpt::account(&tokens.id_token).account_id;
     let oauth = tw_config::OAuth {
         access: Some(tokens.access.clone()),
         expires_at: tokens.expires_in.map(|secs| {
@@ -702,7 +705,6 @@ async fn exchange_and_save(
     let name = name.to_string();
     let proxy = proxy.to_string();
     let backend = endpoints.backend.clone();
-    let account_id = account.account_id.clone();
     s.cfg
         .transform(None, Origin::Ui, |text, cfg| {
             let existing = cfg.providers.iter().find(|p| p.name == name);
@@ -756,7 +758,7 @@ async fn exchange_and_save(
     tokio::spawn(async move {
         tw_gateway::models::refresh_one(&gateway, &provider).await;
     });
-    Ok((name, account.plan))
+    Ok((name, chatgpt::account(&tokens.access).view()))
 }
 
 /// 这个上游登的是哪个账号：从它在用的 access token 里读（见 [`tw_api::AccountView`]）。

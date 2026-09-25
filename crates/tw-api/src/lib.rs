@@ -582,7 +582,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`InFlight`]：core 的时钟加上每个在跑的请求到目前为止的事件。`RunningView`
 /// 多了 `elapsed_ms`、`session`、`route`、`rule`、`group`、`upstream`。新增
 /// `GET /summary/routes`。照 20 写的界面会把 `/in-flight` 当成数组去读。
-pub const CONTROL_API_VERSION: u32 = 21;
+///
+/// **22 起命中数说清楚记录从哪一刻起是全的**：`GET /summary/routes` 不再是
+/// [`RouteHits`] 的数组，是 [`RouteStats`] —— `routes` 加上 `covered_since_ms`。库刚建好
+/// （新装、升级时重建）、记录留的天数比窗口短时，它比问的起点晚；库里没有记录时是空。
+/// ChatGPT 登录的结果（[`ChatgptLoginStatus`]）不再带 `plan`，换成 `account`：和
+/// [`OAuthView::account`] 同一块（邮箱、套餐），从同一个 access token 里读。照 21 写的
+/// 界面会把 `/summary/routes` 当成数组去读，在登录结果里找不到套餐。
+pub const CONTROL_API_VERSION: u32 = 22;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2884,12 +2891,35 @@ pub struct CostGroup {
     pub no_usage_requests: i64,
 }
 
-/// 一条路由在一段时间里走了多少请求，各条规则命中了多少（`GET /summary/routes`）。
+/// 一段时间里各条路由走了多少请求、各条规则命中了多少，以及这些数从哪一刻起是全的
+/// （`GET /summary/routes`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RouteStats {
+    /// 这段时间里记录从哪一刻起是全的，Unix 毫秒：问的起点和库里最老那条请求开始的
+    /// 时刻，取晚的那个。
+    ///
+    /// **数只数得到库里还在的请求。**刚装好、升级时库重建了、记录留的天数比窗口短，
+    /// 库里最老的那条都比窗口的起点晚：更早的那一截不是「没有命中」，是「不知道」。
+    /// 「这段时间一次都没命中」只对这一刻之后成立。
+    ///
+    /// - 等于问的起点：整段都有记录
+    /// - 比起点晚：记录从这一刻才开始，[`RouteStats::routes`] 数的是从这一刻到窗口结束
+    /// - 空：这段时间里没有一刻有记录 —— 库里一条请求都没有，或者最老的那条也在窗口
+    ///   结束之后。这时的「没有命中」什么都说明不了
+    ///
+    /// 有值时总在窗口里面：不早于问的起点，早于窗口的终点。
+    pub covered_since_ms: Option<i64>,
+    /// 各条路由，走得多的在前
+    pub routes: Vec<RouteHits>,
+}
+
+/// 一条路由在一段时间里走了多少请求，各条规则命中了多少。
 ///
 /// **按请求落库时记下的路由算**，不按现在的配置推：一个请求走的是它那一刻的
 /// 路由和规则，之后改名、删掉、换了绑定都不改它。所以这里可能有配置里已经没有的
 /// 路由和规则，而配置里有、这段时间一次都没命中的不在这里 —— 「从来没命中过」
-/// 就是在配置里有、在这里找不到。
+/// 就是在配置里有、在这里找不到（只对 [`RouteStats::covered_since_ms`] 之后成立）。
 ///
 /// 数的是经过路由的请求：本地应答的不算（它们没到规则那一层）；规则还没做出决定
 /// 就失败了的也不算 —— 鉴权没过、模型不让用、没有一条规则命中。
@@ -3161,9 +3191,13 @@ pub struct ChatgptLoginStatus {
     /// 写进配置的上游名。`done` 时有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// 套餐。`done` 时有，令牌里没写就没有
+    /// 登的是哪个账号：邮箱和套餐。`done` 时有，令牌里一项都读不出来时没有。
+    ///
+    /// **和上游视图的 [`OAuthView::account`] 是同一块、同一个来源**：从这次登录存进
+    /// 配置的 access token 里读。登录完成时说的账号和上游那一行说的是同一个，不用
+    /// 再去读一次概览
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<ChatgptPlan>,
+    pub account: Option<AccountView>,
     /// `failed` 时的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Msg>,

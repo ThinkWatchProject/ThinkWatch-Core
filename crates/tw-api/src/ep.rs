@@ -42,8 +42,8 @@ endpoints! {
     CostBuckets: GET "/summary/buckets", api::BucketQuery => Vec<api::CostBucket>;
     CostBucketsBy: GET "/summary/buckets/by", api::BucketGroupQuery => Vec<api::CostBucketGroup>;
     CostBy: GET "/summary/by", api::GroupQuery => Vec<api::CostGroup>;
-    /// 各条路由走了多少请求、各条规则命中了多少
-    RouteStats: GET "/summary/routes", api::Window => Vec<api::RouteHits>;
+    /// 各条路由走了多少请求、各条规则命中了多少，记录从哪一刻起是全的
+    RouteStats: GET "/summary/routes", api::Window => api::RouteStats;
     History: GET "/history", api::ListQuery => Vec<api::HistoryRow>;
     Latency: GET "/latency", api::Window => Vec<api::LatencyView>;
     LatencyByProvider: GET "/latency/provider", api::Window => Vec<api::LatencyView>;

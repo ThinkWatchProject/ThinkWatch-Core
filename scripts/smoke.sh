@@ -368,9 +368,10 @@ C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" ||
 C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
 [ "$C" = "True" ] && ok "/overview 带模型获取状态" || bad "/overview 的模型状态字段不对：$C"
 
-# 经过路由的请求按路由和规则数得到：决定去向的那条规则至少命中过一次
-C=$(ctl "/summary/routes?from_ms=$DAY" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(bool(d) and d[0]["requests"]>0 and any(r["decided"]>0 for r in d[0]["rules"]))')
-[ "$C" = "True" ] && ok "/summary/routes 数到了经过路由的请求" || bad "/summary/routes 没数到请求：$C"
+# 经过路由的请求按路由和规则数得到：决定去向的那条规则至少命中过一次。库是这次新建
+# 的，记录从第一个请求开始：比问的起点晚，不是空
+C=$(ctl "/summary/routes?from_ms=$DAY" | python3 -c 'import json,sys;d=json.load(sys.stdin);r=d["routes"];c=d["covered_since_ms"];print(bool(r) and r[0]["requests"]>0 and any(x["decided"]>0 for x in r[0]["rules"]) and c is not None and c>int(sys.argv[1]))' "$DAY")
+[ "$C" = "True" ] && ok "/summary/routes 数到了经过路由的请求，也说了记录从哪一刻开始" || bad "/summary/routes 没数到请求：$C"
 
 ID=$(ctl "/history?limit=1" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["id"] if d else 0)')
