@@ -44,6 +44,7 @@ impl Bed {
 
 fn request(id: i64, at_ms: i64, provider: &str) -> tw_store::db::RequestRow {
     tw_store::db::RequestRow {
+        session_log_bytes: None,
         key_masked: None,
         peer: None,
         id,

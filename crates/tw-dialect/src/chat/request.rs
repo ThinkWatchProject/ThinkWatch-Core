@@ -139,6 +139,27 @@ pub fn decode_request(
             summary: e.is_some(),
         });
     }
+    // DeepSeek、GLM、Kimi 的写法：`thinking.type` 开关推理，强度另写在 `reasoning_effort`。
+    // 关掉时以它为准
+    match v.get("thinking").and_then(|t| str_of(t, "type")) {
+        Some("disabled") => {
+            r.reasoning = Some(Reasoning {
+                enabled: false,
+                effort: None,
+                budget: None,
+                summary: false,
+            })
+        }
+        Some("enabled") if r.reasoning.is_none() => {
+            r.reasoning = Some(Reasoning {
+                enabled: true,
+                effort: None,
+                budget: None,
+                summary: true,
+            })
+        }
+        _ => {}
+    }
 
     r.format = match v.get("response_format").and_then(|f| str_of(f, "type")) {
         Some("json_object") => Some(Format::JsonObject),

@@ -38,6 +38,8 @@ struct Partial {
     /// 做过的格式转换，JSON，带着做转换的那一家。**只留服务它的那一跳的**：
     /// 故障转移前一跳转换过、后一跳直通时，这一行不该说它转换过
     translated: Option<String>,
+    /// 请求带着的 DeepSeek Harness 会话日志的字节数。开始事件带着
+    session_log_bytes: Option<i64>,
 }
 
 /// 在飞的请求最多攒多少条。
@@ -156,6 +158,7 @@ impl Recorder {
             cache_saved_micros: None,
             price_source: None,
             translated: p.translated.clone(),
+            session_log_bytes: p.session_log_bytes,
         })
     }
 
@@ -190,6 +193,7 @@ impl Recorder {
                 billing,
                 model,
                 path,
+                session_log_bytes,
                 at_ms,
                 ..
             } => {
@@ -222,6 +226,7 @@ impl Recorder {
                         },
                         billing: *billing,
                         translated: None,
+                        session_log_bytes: session_log_bytes.map(|b| b as i64),
                     },
                 );
             }
@@ -548,6 +553,7 @@ impl Recorder {
                     cache_saved_micros: None,
                     price_source: None,
                     translated: None,
+                    session_log_bytes: None,
                 });
             }
             // 配置事件、额度事件、扫描告警都不是请求，不落这张表。
@@ -687,6 +693,7 @@ impl Recorder {
             cache_saved_micros,
             price_source,
             translated: p.translated,
+            session_log_bytes: p.session_log_bytes,
         });
     }
 
@@ -748,6 +755,7 @@ mod tests {
             model: model.into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
+            session_log_bytes: None,
             at_ms: 1_000_000,
         }
     }
@@ -1243,6 +1251,7 @@ mod billing_tests {
             model: String::new(),
             method: "WS".into(),
             path: "/backend-api/codex/responses".into(),
+            session_log_bytes: None,
             at_ms: 1_000_000,
         }
     }
@@ -1338,6 +1347,7 @@ mod billing_tests {
                 model: "claude-sonnet-4-5".into(),
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                session_log_bytes: None,
                 at_ms: 1_000_000,
             });
             r.on_event(&Event::RequestCancelled {
@@ -1960,6 +1970,7 @@ mod cancellation_tests {
             model: "claude-sonnet-4-5".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
+            session_log_bytes: None,
             at_ms: 1_000_000,
         });
         r.on_event(&cancelled(1, partial()));

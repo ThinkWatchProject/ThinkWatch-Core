@@ -40,11 +40,22 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
     for m in arr_of(v, "messages") {
         let role = match str_of(m, "role") {
             Some("assistant") => Role::Assistant,
-            // 消息里的 system 角色：并进系统提示，位置信息丢失但内容保留
+            // 消息里的 system 角色：并进系统提示，位置信息丢失但内容保留。DeepSeek
+            // Harness 在这里放改过的系统提示，还有对话中途增删工具的 `tool_addition` /
+            // `tool_removal`：别家没有这种写法
             Some("system") => {
-                let t = text_of(m.get("content").unwrap_or(&Value::Null));
+                let content = m.get("content").unwrap_or(&Value::Null);
+                let t = text_of(content);
                 if !t.is_empty() {
                     r.system.push(t);
+                }
+                for b in content.as_array().into_iter().flatten() {
+                    match str_of(b, "type") {
+                        Some("text") => {}
+                        other => {
+                            dropped.path(format!("messages.content.{}", other.unwrap_or("unknown")))
+                        }
+                    }
                 }
                 continue;
             }
@@ -59,6 +70,11 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
     }
 
     for t in arr_of(v, "tools") {
+        // 推迟加载的工具：等工具搜索或者 `tool_addition` 来加载它，别家没有这回事，
+        // 发过去的是一个一开始就能用的工具
+        if t.get("defer_loading").and_then(Value::as_bool) == Some(true) {
+            dropped.path("tools.defer_loading");
+        }
         match str_of(t, "type") {
             None | Some("custom") => r.tools.push(Tool {
                 name: str_of(t, "name").unwrap_or_default().to_string(),

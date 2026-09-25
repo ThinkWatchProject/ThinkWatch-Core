@@ -39,6 +39,8 @@ pub fn client_hint(headers: &HeaderMap) -> Option<String> {
     let ua = get("user-agent");
     for (needle, id) in [
         ("claude-cli", "claude-code"),
+        // `deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness)`
+        ("deepseek-harness", "deepseek-harness"),
         ("codex", "codex"),
         ("opencode", "opencode"),
         ("aider", "aider"),
@@ -104,6 +106,17 @@ mod tests {
                 ("user-agent", "codex_exec/0.139.0 (Mac OS 26.6.2; arm64)"),
             ])),
             Some("codex".into())
+        );
+    }
+
+    #[test]
+    fn deepseek_harness_is_recognised_by_its_user_agent() {
+        assert_eq!(
+            client_hint(&h(&[(
+                "user-agent",
+                "deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness)"
+            )])),
+            Some("deepseek-harness".into())
         );
     }
 

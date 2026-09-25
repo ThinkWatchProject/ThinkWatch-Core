@@ -352,6 +352,7 @@ mod tests {
             model: "m".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
+            session_log_bytes: None,
             at_ms: 1_000 + id,
         }
     }

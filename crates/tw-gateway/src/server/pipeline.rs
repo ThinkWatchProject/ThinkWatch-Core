@@ -192,6 +192,12 @@ fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<St
         crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed.as_ref());
     reading.facts.client = req.client_name.clone();
     reading.facts.intent = intent;
+    reading.harness = tw_dialect::harness::detect(
+        req.headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok()),
+        parsed.as_ref(),
+    );
     // 认出「这几十个请求是同一次任务」。**认不出来就是 None** —— 硬凑一个会把
     // 互不相干的请求并成一个「会话」
     let fp = parsed.as_ref().and_then(crate::session::fingerprint);
@@ -451,6 +457,7 @@ fn open(
         model: facts.model.clone(),
         method: "POST".to_string(),
         path: req.uri.path().to_string(),
+        session_log_bytes: reading.harness.and_then(|h| h.session_log_bytes),
         at_ms,
     });
     let sink = state.body_sink();

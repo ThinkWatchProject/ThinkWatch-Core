@@ -35,6 +35,13 @@ pub fn is_official_host(url: &str) -> bool {
     OFFICIAL.contains(&host.as_str()) || host.ends_with(".amazonaws.com")
 }
 
+/// 这个地址是不是 DeepSeek 官方的端点。DeepSeek Harness 的扩展（见
+/// [`crate::harness`]）只有它认，发给别家之前要去掉。和 [`is_official_host`] 一样
+/// 在 host 上比。
+pub fn is_deepseek_host(url: &str) -> bool {
+    host_of(url).eq_ignore_ascii_case("api.deepseek.com")
+}
+
 /// 地址里的 host：去掉协议头、用户信息和端口，到路径、查询串、片段为止。
 fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
@@ -87,6 +94,15 @@ mod tests {
         }
         // 用户信息里放什么都不影响真正的 host
         assert!(is_official_host("https://user:pw@api.openai.com/v1"));
+    }
+
+    #[test]
+    fn deepseek_is_recognised_by_its_host_only() {
+        assert!(is_deepseek_host("https://api.deepseek.com"));
+        assert!(is_deepseek_host("https://API.DeepSeek.com/anthropic"));
+        assert!(!is_deepseek_host("https://relay.example.com/deepseek"));
+        assert!(!is_deepseek_host("https://api.deepseek.com.evil.com"));
+        assert!(!is_deepseek_host("https://api.deepseek.com@evil.com"));
     }
 
     #[test]

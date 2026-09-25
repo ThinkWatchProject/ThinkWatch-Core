@@ -1106,6 +1106,7 @@ fn history_row(
         client_hint: r.client_hint,
         peer: r.peer,
         key_masked: r.key_masked,
+        session_log_bytes: r.session_log_bytes,
         security,
     }
 }

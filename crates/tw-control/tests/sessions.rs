@@ -16,6 +16,7 @@ const BASE: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0
 fn turn(id: i64, billing: &str) -> tw_store::db::RequestRow {
     let per_token = billing == "per-token";
     tw_store::db::RequestRow {
+        session_log_bytes: None,
         key_masked: None,
         peer: None,
         id,

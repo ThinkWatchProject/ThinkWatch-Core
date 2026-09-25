@@ -8,7 +8,7 @@
 //! ```
 //!
 //! **同格式不经过这里**：客户端和上游说同一种格式时，网关原样转发，一个字节都不改。
-//! 唯一的例外见 [`strip_carried`]。
+//! 例外见 [`strip_carried`] 和 [`crate::harness::clean`]。
 
 use std::collections::{HashMap, HashSet};
 

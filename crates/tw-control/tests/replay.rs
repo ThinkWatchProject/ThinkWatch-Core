@@ -87,6 +87,7 @@ fn system_proxy() {
 
 fn row(id: i64, provider: &str) -> tw_store::db::RequestRow {
     tw_store::db::RequestRow {
+        session_log_bytes: None,
         key_masked: None,
         peer: None,
         id,

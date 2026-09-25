@@ -206,6 +206,7 @@ gw.config.proxy_unusable
 gw.config.security_rules passthrough
 gw.content.refused
 gw.convert.failed
+gw.files.unsupported
 gw.hidden_text.refused_message
 gw.hidden_text.refused_tool_result
 gw.internal
