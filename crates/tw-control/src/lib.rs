@@ -984,28 +984,26 @@ async fn request_detail(
 ///
 /// 按量付费的账号没有这些头，那时这个列表是空的 —— 界面据此决定显示
 /// 金额还是百分比，两种人格共用同一块地方。
+///
+/// GLM Coding Plan 的额度不在响应头里：**界面来要时去问**（60 秒内合成一次），问得慢的
+/// 不等，问完由 `QuotaSeen` 补上
 async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>> {
+    s.gateway.refresh_glm_quotas(GLM_QUOTA_WAIT).await;
     let mut out: Vec<tw_api::ProviderQuota> = s
         .gateway
         .quotas()
         .into_iter()
         .map(|(provider, q)| tw_api::ProviderQuota {
             provider,
-            windows: q
-                .windows
-                .into_iter()
-                .map(|w| tw_api::QuotaWindow {
-                    window: w.window,
-                    used_percent: w.used_percent,
-                    resets_at_ms: w.resets_at_ms,
-                    status: w.status,
-                })
-                .collect(),
+            windows: q.windows.iter().map(Into::into).collect(),
         })
         .collect();
     out.sort_by(|a, b| a.provider.cmp(&b.provider));
     Json(out)
 }
+
+/// 界面来要额度时，最多等 GLM 的额度接口多久
+const GLM_QUOTA_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 按上游分的延迟。**「哪家 TTFT 最差」问的是这个。**
 ///

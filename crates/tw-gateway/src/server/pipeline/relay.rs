@@ -59,6 +59,8 @@ pub(super) fn respond(
     // 订阅额度。**零成本** —— 这些头本来就在响应里，读一下
     // 就有了。按量付费的账号没有它们，那时什么都不发。
     state.note_quota(id, &provider.name, upstream.headers());
+    // GLM Coding Plan 的额度不在响应头里：有请求的时候隔一阵去问一次
+    state.glm_traffic(provider);
     // 上游收不收我们的凭据、经过的代理通不通：**都是状态变化，各只报一次**
     state.note_auth(&provider.name, status.as_u16());
     state.note_proxy_ok(&provider.proxy);

@@ -11,6 +11,7 @@ use crate::outbound::{base_client_builder, client_for_provider, proxy_shape};
 use tw_types::msg;
 
 mod credentials;
+mod glm;
 pub use credentials::credential_failed;
 mod upstream;
 
@@ -151,6 +152,8 @@ pub struct AppState {
     /// 五分钟前的百分比，价值几乎为零，而它会让「重启之后显示的是旧
     /// 数字」变成一个要解释的问题。下一个请求回来就有新的了。
     quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::quota::Quota>>>,
+    /// 每个 GLM Coding Plan 上游问额度的节奏（见 [`crate::glm`]）。**跨重载存活**
+    glm: Arc<crate::glm::Tracker>,
     /// 监听地址变了。**这是「温」那一级**（三级热重载） ——
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
@@ -232,6 +235,7 @@ impl AppState {
             models,
             body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
+            glm: Default::default(),
             relisten: Arc::new(tokio::sync::Notify::new()),
             listening: Arc::new(std::sync::Mutex::new(Default::default())),
             oauth: Arc::new(crate::oauth::Cache::new()),

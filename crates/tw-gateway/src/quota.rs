@@ -12,6 +12,9 @@
 //! 例外是他在界面上手动点「立即刷新」—— 那是他明确的意图，而且他知道
 //! 代价。
 //!
+//! GLM Coding Plan 是另一个例外：它的响应头里根本没有额度，只能去问账号的额度
+//! 接口。那个接口不占用户的额度，问的节奏和退避见 [`crate::glm`]。
+//!
 //! 一条贯穿这里的纪律：**分清真实信号和本地猜测。**上游给的数字可以
 //! 直接显示，我们推断的要标成推断。理由和三态成本完全一样：
 //! **一个编出来的精确数字，比一个诚实的「不知道」更有害。**
@@ -19,10 +22,10 @@
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
-/// 一个额度窗口的状态。**每个字段都直接来自响应头，没有一个是推算的。**
+/// 一个额度窗口的状态。**每个字段都直接来自上游（响应头或额度接口），没有一个是推算的。**
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
-    /// 哪个窗口：`5h` / `7d`（Anthropic）/ `weekly`（Codex）
+    /// 哪个窗口：`5h` / `7d`（Anthropic）/ `weekly`（Codex、GLM）/ `monthly`（GLM）
     pub window: String,
     /// 用了百分之多少。0–100
     pub used_percent: f64,
@@ -36,6 +39,21 @@ pub struct Window {
     /// `allowed` / `allowed_warning` / `rejected`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// 积分制套餐的积分（GLM Coding Plan）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<tw_api::QuotaCredits>,
+}
+
+impl From<&Window> for tw_api::QuotaWindow {
+    fn from(w: &Window) -> Self {
+        Self {
+            window: w.window.clone(),
+            used_percent: w.used_percent,
+            resets_at_ms: w.resets_at_ms,
+            status: w.status.clone(),
+            credits: w.credits,
+        }
+    }
 }
 
 impl Window {
@@ -105,6 +123,7 @@ pub fn from_headers(h: &HeaderMap, now_ms: u64) -> Quota {
                 .and_then(|v| parse_reset(v, now_ms)),
             status: get(&format!("anthropic-ratelimit-unified-{key}-status"))
                 .map(|s| s.to_string()),
+            credits: None,
         });
     }
     // 7 天窗口的越线标记是个独立的头
@@ -146,6 +165,7 @@ pub fn from_headers(h: &HeaderMap, now_ms: u64) -> Quota {
                 .map(|secs| after(now_ms, secs)),
             // Codex 不报状态。用满就是被拒 —— 这是上游数字的直接结论，不是推断
             status: (used_percent >= 100.0).then(|| "rejected".to_string()),
+            credits: None,
         });
     }
     Quota { windows }
