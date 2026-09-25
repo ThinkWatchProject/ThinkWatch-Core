@@ -90,8 +90,14 @@ pub(super) async fn list_models(
                 "name": format!("models/{m}"),
             })).collect::<Vec<_>>()
         }),
-        // Anthropic 和 OpenAI 的 /v1/models 形状一样
-        _ => serde_json::json!({
+        ListingShape::Anthropic => serde_json::json!({
+            "object": "list",
+            "data": models.iter().map(|m| anthropic_model(m, now)).collect::<Vec<_>>(),
+            "has_more": false,
+            "first_id": models.first(),
+            "last_id": models.last(),
+        }),
+        ListingShape::Openai => serde_json::json!({
             "object": "list",
             "data": models.iter().map(|m| serde_json::json!({
                 "id": m, "object": "model", "created": now,
@@ -99,6 +105,88 @@ pub(super) async fn list_models(
         }),
     };
     Ok(axum::Json(body).into_response())
+}
+
+/// Anthropic 格式的一个模型对象。
+///
+/// **是 OpenAI 那个对象的超集**：Anthropic 的字段（`type`、`display_name`、
+/// `created_at`）之外，`object` 和 `created` 照样在。只放 `x-api-key` 的客户端也被
+/// 认成 Anthropic，其中有按 OpenAI 的形状读列表的，不能让它们读不出来。
+///
+/// Claude 的模型再带上 `anthropic_family_tier`：Claude Desktop 按它把模型归到
+/// opus / sonnet / haiku，配置里写的 `sonnet` 这样的简称靠它解析。**只看模型名**，
+/// 名字里看不出是 Claude 的一律不标 —— 把别家的模型标成 Claude 是在替客户端撒谎。
+fn anthropic_model(id: &str, now: u64) -> serde_json::Value {
+    let created_at = chrono::DateTime::from_timestamp(now as i64, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut m = serde_json::json!({
+        "type": "model",
+        "id": id,
+        "display_name": display_name(id).unwrap_or_else(|| id.to_string()),
+        "created_at": created_at,
+        "object": "model",
+        "created": now,
+    });
+    if let Some(tier) = family_tier(id) {
+        m["anthropic_family_tier"] = tier.into();
+    }
+    m
+}
+
+/// Claude 模型的名字：`claude-sonnet-4-5-20250929` → `Claude Sonnet 4.5`。
+///
+/// 只认最后一段（`/` 之后）以 `claude-` 开头、每一节都是字母或数字的；日期那一节
+/// 去掉，相邻的数字用点连起来。**认不出就是 `None`**，调用方用模型 ID 本身 ——
+/// 客户端看到和 ID 一样的名字时会自己想办法，一个猜错的名字它却会照着显示。
+fn display_name(id: &str) -> Option<String> {
+    let last = id.rsplit('/').next()?;
+    let rest = last.strip_prefix("claude-")?;
+    let mut words: Vec<String> = vec!["Claude".into()];
+    let mut number = false;
+    for part in rest.split('-') {
+        if part.is_empty() {
+            return None;
+        }
+        if part.len() == 8 && part.bytes().all(|b| b.is_ascii_digit()) {
+            // 发布日期，不是名字的一部分
+            continue;
+        }
+        if part.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            match words.last_mut() {
+                Some(w) if number => {
+                    w.push('.');
+                    w.push_str(part);
+                }
+                _ => words.push(part.to_string()),
+            }
+            number = true;
+        } else if part.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            let mut c = part.chars();
+            let first = c.next()?.to_ascii_uppercase();
+            words.push(std::iter::once(first).chain(c).collect());
+            number = false;
+        } else {
+            return None;
+        }
+    }
+    (words.len() > 1).then(|| words.join(" "))
+}
+
+/// 名字里看得出是哪一档的 Claude 模型：`opus`、`sonnet` 或 `haiku`。
+fn family_tier(id: &str) -> Option<&'static str> {
+    let lower = id.to_ascii_lowercase();
+    if !lower.contains("claude") && !lower.contains("anthropic") {
+        return None;
+    }
+    let mut tiers = ["opus", "sonnet", "haiku"]
+        .into_iter()
+        .filter(|t| lower.contains(t));
+    // 名字里同时出现两档的（一个路由别名）不猜
+    match (tiers.next(), tiers.next()) {
+        (Some(t), None) => Some(t),
+        _ => None,
+    }
 }
 
 /// `GET /v1/models/:model`。
@@ -146,7 +234,56 @@ pub(super) async fn get_model(
         ListingShape::Gemini => {
             serde_json::json!({ "name": format!("models/{model}") })
         }
-        _ => serde_json::json!({ "id": model, "object": "model", "created": now }),
+        ListingShape::Anthropic => anthropic_model(&model, now),
+        ListingShape::Openai => {
+            serde_json::json!({ "id": model, "object": "model", "created": now })
+        }
     };
     Ok(axum::Json(body).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_model_ids_get_their_names() {
+        for (id, name) in [
+            ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+            ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
+            ("claude-opus-4-1-20250805", "Claude Opus 4.1"),
+            ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku"),
+            ("claude-fable-5-1", "Claude Fable 5.1"),
+            ("anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5"),
+        ] {
+            assert_eq!(display_name(id).as_deref(), Some(name), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_read_is_not_guessed() {
+        for id in [
+            "deepseek-chat",
+            "gpt-5",
+            "claude-",
+            "claude--x",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ] {
+            assert_eq!(display_name(id), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn only_claude_models_are_given_a_family_tier() {
+        assert_eq!(family_tier("claude-opus-4-1"), Some("opus"));
+        assert_eq!(family_tier("claude-3-5-haiku-20241022"), Some("haiku"));
+        assert_eq!(
+            family_tier("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            Some("sonnet")
+        );
+        assert_eq!(family_tier("claude-fable-5-1"), None);
+        // 名字里有 sonnet，但看不出是 Claude
+        assert_eq!(family_tier("my-sonnet-alias"), None);
+        assert_eq!(family_tier("claude-opus-or-sonnet"), None);
+    }
 }

@@ -55,6 +55,14 @@ pub use server::{router, serve};
 pub use state::credential_failed;
 pub use state::{AppState, Runtime};
 
+/// Anthropic 流里上游静默多久补一个 `ping`。
+///
+/// Claude Code（和内嵌它的 Claude Desktop）数的是网关发来的每一个字节：一条流静默
+/// 五分钟就被放弃，只有 ping 在来的话还肯多等一段。Anthropic 上游思考时自己会发
+/// ping，**转换别的上游时没有人发**，长时间的推理就会被客户端当成断线。十五秒远低于
+/// 那个上限，又不至于让一条正常的流塞满心跳
+pub const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";
 
