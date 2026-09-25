@@ -11,6 +11,9 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use tw_control::{ConfigManager, ControlState};
 
+mod common;
+use common::spare_port;
+
 struct Bed {
     dir: tempfile::TempDir,
     app: axum::Router,
@@ -78,14 +81,6 @@ async fn call(
     )
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn yaml(port: u16) -> String {
     format!(
         "version: 1
@@ -103,8 +98,8 @@ listen:
 
 #[tokio::test]
 async fn saving_writes_what_was_chosen_and_leaves_no_trace_of_defaults() {
-    let b = bed(&yaml(free_port()));
-    let port = free_port();
+    let b = bed(&yaml(spare_port()));
+    let port = spare_port();
     let (st, v) = call(
         &b.app,
         "PUT",
@@ -143,7 +138,7 @@ async fn saving_writes_what_was_chosen_and_leaves_no_trace_of_defaults() {
 async fn a_port_in_use_is_refused_and_nothing_is_written() {
     // **这个接口存在的理由。**写进去之后才发现绑不上，网关守着旧地址而配置
     // 文件说着新地址 —— 两边从那一刻起各说各的
-    let start = free_port();
+    let start = spare_port();
     let b = bed(&yaml(start));
     let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let taken = squatter.local_addr().unwrap().port();
@@ -167,13 +162,13 @@ async fn a_port_in_use_is_refused_and_nothing_is_written() {
 
 #[tokio::test]
 async fn an_interface_that_is_not_there_is_refused_by_name() {
-    let b = bed(&yaml(free_port()));
+    let b = bed(&yaml(spare_port()));
     let before = b.file();
     let (st, v) = call(
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "en97", "port": free_port(), "allow_from": [] }),
+        serde_json::json!({ "bind": "en97", "port": spare_port(), "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
@@ -200,7 +195,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "192.168.1.5\twifi", "port": free_port(), "allow_from": [] }),
+        serde_json::json!({ "bind": "192.168.1.5\twifi", "port": spare_port(), "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
@@ -221,7 +216,7 @@ async fn an_interface_that_is_not_there_is_refused_by_name() {
 async fn the_status_follows_the_listener_after_a_save() {
     // 界面左下角的地址以前是启动时记的一次：改了端口，网关已经在新端口上
     // 服务，状态里还写着旧的
-    let p1 = free_port();
+    let p1 = spare_port();
     let b = bed(&yaml(p1));
     let gw = b.gw.clone();
     let want = tw_config::try_parse(&b.file())
@@ -236,7 +231,7 @@ async fn the_status_follows_the_listener_after_a_save() {
     let (_, s) = call(&b.app, "GET", "/status", serde_json::Value::Null).await;
     assert_eq!(s["gateway_addr"], format!("127.0.0.1:{p1}"));
 
-    let p2 = free_port();
+    let p2 = spare_port();
     let (st, v) = call(
         &b.app,
         "PUT",
@@ -260,12 +255,12 @@ async fn the_status_follows_the_listener_after_a_save() {
 
 #[tokio::test]
 async fn a_stale_version_is_refused_like_any_other_edit() {
-    let b = bed(&yaml(free_port()));
+    let b = bed(&yaml(spare_port()));
     let (st, _) = call(
         &b.app,
         "PUT",
         "/listen",
-        serde_json::json!({ "bind": "loopback", "port": free_port(), "base_version": "nope", "allow_from": [] }),
+        serde_json::json!({ "bind": "loopback", "port": spare_port(), "base_version": "nope", "allow_from": [] }),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -296,8 +291,8 @@ listen:
 async fn an_empty_allow_list_is_written_down_and_the_default_one_is_not() {
     // 不写 = 默认名单，所以空的必须写成 `[]`；和默认名单一样的不写，
     // 配置文件不因为存了一次就多出几行
-    let b = bed(&yaml(free_port()));
-    let port = free_port();
+    let b = bed(&yaml(spare_port()));
+    let port = spare_port();
     let save = |allow: serde_json::Value| serde_json::json!({ "bind": "all", "port": port, "allow_from": allow });
     let (st, v) = call(&b.app, "PUT", "/listen", save(serde_json::json!([]))).await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -319,7 +314,7 @@ async fn an_empty_allow_list_is_written_down_and_the_default_one_is_not() {
 #[tokio::test]
 async fn interfaces_come_one_per_name() {
     // 配置里按名字存：同一张网卡列两行，选第二行等于选第一行
-    let b = bed(&yaml(free_port()));
+    let b = bed(&yaml(spare_port()));
     let (st, v) = call(&b.app, "GET", "/interfaces", serde_json::Value::Null).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let names: Vec<&str> = v

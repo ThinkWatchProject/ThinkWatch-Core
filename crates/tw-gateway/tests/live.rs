@@ -67,11 +67,9 @@ async fn serve(upstream: SocketAddr) -> (SocketAddr, tw_gateway::live::Live) {
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     let live = state.live.clone();
-    let addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap()
-    };
-    tokio::spawn(async move { tw_gateway::serve(state, addr).await.unwrap() });
+    let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     (addr, live)
 }
