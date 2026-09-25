@@ -210,6 +210,8 @@ pub struct AppState {
     /// Anthropic 流里上游静默多久就补一个 `ping`（见 `relay`）。**测试会把它调短**，
     /// 否则一条心跳的测试要干等十五秒
     pub ping_every: std::time::Duration,
+    /// 上游整个静默（连注释都没有）超过这么久，就不再补 `ping`（见 `relay`）。**测试会把它调短**
+    pub ping_for: std::time::Duration,
 }
 
 impl AppState {
@@ -260,6 +262,7 @@ impl AppState {
             live: crate::live::Live::default(),
             sessions: Default::default(),
             ping_every: crate::PING_EVERY,
+            ping_for: crate::PING_FOR,
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();

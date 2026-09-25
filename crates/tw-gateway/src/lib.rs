@@ -64,6 +64,13 @@ pub use state::{AppState, Runtime};
 /// 那个上限，又不至于让一条正常的流塞满心跳
 pub const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// 上游一个字节都不发（连 SSE 注释都没有）超过这么久，就不再替它补 `ping`。
+///
+/// 心跳让客户端相信连接还活着；上游的连接半开了（NAT、代理把它丢了）时，网关自己
+/// 永远等不到下一个字节，**一直补下去这个请求就永远挂着**。十分钟之后停下，客户端
+/// 自己的静默计时会断开它。正常在排队的上游会发 `: keep-alive` 这样的注释，不受影响
+pub const PING_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";
 
