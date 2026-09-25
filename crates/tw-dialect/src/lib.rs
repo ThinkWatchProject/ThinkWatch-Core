@@ -6,7 +6,8 @@
 //! [`ir`] 里的中间表示。这个 crate 只依赖 serde，不碰网络，企业版网关也可以直接用。
 //!
 //! 同样两边都用的还有：从响应里旁路嗅出用量（[`usage`]，换算和转换共用各家的
-//! `usage()`），以及拼上游地址（[`url`]）。
+//! `usage()`），拼上游地址（[`url`]），以及去掉 DeepSeek Harness 只发给 DeepSeek 的
+//! 扩展（[`harness`]）。
 
 pub mod anthropic;
 pub mod bedrock;
@@ -14,6 +15,7 @@ pub mod chat;
 pub mod convert;
 pub mod frame;
 pub mod gemini;
+pub mod harness;
 pub mod ir;
 pub mod official;
 pub mod responses;

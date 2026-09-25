@@ -111,6 +111,7 @@ fn started(id: u64) -> tw_api::Event {
         model: "claude-sonnet-4-5".into(),
         method: "POST".into(),
         path: "/v1/messages".into(),
+        session_log_bytes: None,
         at_ms: 1_758_000_000_000,
     }
 }

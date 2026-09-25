@@ -58,6 +58,7 @@ pub(super) async fn ws_upgrade(
             model: String::new(),
             method: "WS".to_string(),
             path: uri.path().to_string(),
+            session_log_bytes: None,
             at_ms,
         });
         // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成

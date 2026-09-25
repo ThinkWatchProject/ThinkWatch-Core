@@ -22,7 +22,7 @@ use tw_api::Msg;
 ///
 /// **一列 JSON 的样子变了也算**（比如 `routing` 多了必有的字段）：旧的那些行
 /// 读出来是坏的，而读的一方会把「解不开」当成「没有」。
-const SCHEMA: i64 = 20;
+const SCHEMA: i64 = 21;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -119,6 +119,8 @@ pub struct RequestRow {
     pub price_source: Option<String>,
     /// 服务它的那一跳做过的格式转换，JSON。直通的是 None
     pub translated: Option<String>,
+    /// 请求带着的 DeepSeek Harness 会话日志有多少字节。没带是 None
+    pub session_log_bytes: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -257,7 +259,10 @@ impl Db {
                 error_args         TEXT,
                 local              INTEGER NOT NULL,
                 -- 客户端没等到响应结束就走了。**不能写进 `error`**：它不算失败
-                cancelled          INTEGER NOT NULL
+                cancelled          INTEGER NOT NULL,
+                -- 请求带着 DeepSeek Harness 的会话日志：它的字节数。整段对话都在里面，
+                -- 界面要说得出哪些请求带着它
+                session_log_bytes  INTEGER
              );
              -- 几乎所有查询都是「最近的 N 条」或者「某段时间内的」
              CREATE INDEX requests_at ON requests (at_ms DESC);
@@ -296,8 +301,8 @@ impl Db {
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
               client_hint, session, cancelled, price_source, translated,
-              error_code, error_args, peer, key_masked)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+              error_code, error_args, peer, key_masked, session_log_bytes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
             params![
                 r.id,
                 r.at_ms,
@@ -332,6 +337,7 @@ impl Db {
                     .map(|e| serde_json::to_string(&e.args).unwrap_or_default()),
                 r.peer,
                 r.key_masked,
+                r.session_log_bytes,
             ],
         )?;
         Ok(())
@@ -1177,6 +1183,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         client_hint: r.get("client_hint")?,
         peer: r.get("peer")?,
         key_masked: r.get("key_masked")?,
+        session_log_bytes: r.get("session_log_bytes")?,
         session: r.get("session")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
@@ -1354,6 +1361,7 @@ pub(crate) mod tests {
             billing: tw_api::Billing::PerToken,
             cache_saved_micros: None,
             price_source: None,
+            session_log_bytes: None,
             translated: None,
         }
     }

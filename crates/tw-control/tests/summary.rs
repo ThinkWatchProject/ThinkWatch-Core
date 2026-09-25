@@ -15,6 +15,7 @@ const BASE: &str = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0
 /// 一条有用量、有价格的请求。
 fn req(id: i64, model: &str) -> tw_store::db::RequestRow {
     tw_store::db::RequestRow {
+        session_log_bytes: None,
         key_masked: None,
         peer: None,
         id,

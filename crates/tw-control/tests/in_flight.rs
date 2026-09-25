@@ -51,6 +51,7 @@ fn started(id: u64, model: &str) -> tw_api::Event {
         model: model.into(),
         method: "POST".into(),
         path: "/v1/messages".into(),
+        session_log_bytes: None,
         at_ms: 1_000 + id,
     }
 }
