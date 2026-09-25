@@ -1021,16 +1021,28 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 各条路由走了多少请求、各条规则命中了多少，以及记录从哪一刻起是全的（见
+    /// [`tw_api::RouteStats`]）。
+    pub fn route_stats(&self, since_ms: i64, until_ms: i64) -> Result<tw_api::RouteStats, DbError> {
+        // 库里最老的那条，**不论是不是经过了路由**：本地应答的那一行也说明那时候
+        // 已经在记了，那段时间里经过路由的请求都会在库里
+        let oldest: Option<i64> =
+            self.conn
+                .query_row("SELECT MIN(at_ms) FROM requests", [], |r| r.get(0))?;
+        Ok(tw_api::RouteStats {
+            covered_since_ms: oldest
+                .map(|o| o.max(since_ms))
+                .filter(|&from| from < until_ms),
+            routes: self.route_hits(since_ms, until_ms)?,
+        })
+    }
+
     /// 各条路由走了多少请求、各条规则命中了多少（见 [`tw_api::RouteHits`]）。
     ///
     /// **按每一行记下的路由算**，不按现在的配置推：请求走的是它那一刻的路由和
     /// 规则。一个请求算在这几条规则上，每条只算一次：决定去向的那一条、附加了
     /// 改写的每一条、选定上游之后拒绝了它的那一条。本地应答的没有路由，不算。
-    pub fn route_hits(
-        &self,
-        since_ms: i64,
-        until_ms: i64,
-    ) -> Result<Vec<tw_api::RouteHits>, DbError> {
+    fn route_hits(&self, since_ms: i64, until_ms: i64) -> Result<Vec<tw_api::RouteHits>, DbError> {
         /// 数命中要的那几项。尝试链不用解
         #[derive(serde::Deserialize)]
         struct Routed {
@@ -2377,7 +2389,7 @@ mod security_log_tests {
 }
 
 #[cfg(test)]
-mod route_hits_tests {
+mod route_stats_tests {
     use super::tests::{row, upstream_failed};
     use super::*;
 
@@ -2438,7 +2450,7 @@ mod route_hits_tests {
         late.error = Some(upstream_failed("denied"));
         db.insert(&late).unwrap();
 
-        let got = db.route_hits(0, 1_000).unwrap();
+        let got = db.route_stats(0, 1_000).unwrap().routes;
         assert_eq!(
             got.iter().map(|r| r.route.as_str()).collect::<Vec<_>>(),
             ["工作", "默认"],
@@ -2498,9 +2510,79 @@ mod route_hits_tests {
         broken.routing = Some("{\"rule\":".into());
         db.insert(&broken).unwrap();
 
-        let got = db.route_hits(100, 200).unwrap();
+        let got = db.route_stats(100, 200).unwrap().routes;
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!((got[0].requests, got[0].last_ms), (1, 150));
-        assert!(db.route_hits(1_000, 2_000).unwrap().is_empty());
+        assert!(db.route_stats(1_000, 2_000).unwrap().routes.is_empty());
+    }
+
+    /// 库里一条请求都没有（刚装好、升级时刚重建）：什么都说不上，不是「整段都没命中」。
+    #[test]
+    fn an_empty_store_covers_nothing() {
+        let db = Db::in_memory().unwrap();
+        let got = db.route_stats(0, 1_000).unwrap();
+        assert_eq!(got.covered_since_ms, None);
+        assert!(got.routes.is_empty());
+        // 线上是 null，不是省掉：界面必须想到这一种
+        let v = serde_json::to_value(&got).unwrap();
+        assert!(v["covered_since_ms"].is_null(), "{v}");
+        assert!(v.get("covered_since_ms").is_some(), "{v}");
+    }
+
+    /// 记录比窗口短（库在窗口中间才建好，或者留的天数比窗口短）：记录从最老那条开始的
+    /// 时刻起才是全的。**不论它是不是经过了路由** —— 本地应答的那一行也说明那时候
+    /// 已经在记了。
+    #[test]
+    fn history_shorter_than_the_window_starts_at_the_oldest_request() {
+        let db = Db::in_memory().unwrap();
+        let mut local = row(1, 400);
+        local.local = true;
+        db.insert(&local).unwrap();
+        db.insert(&routed(2, 600, "默认", "兜底", &[], None))
+            .unwrap();
+
+        let got = db.route_stats(0, 1_000).unwrap();
+        assert_eq!(got.covered_since_ms, Some(400));
+        assert_eq!(got.routes.len(), 1, "{got:?}");
+        assert_eq!(got.routes[0].requests, 1);
+
+        // 过期的记录删掉之后，最老的那条往后挪，记录的起点跟着挪
+        assert_eq!(db.prune_before(500).unwrap(), 1);
+        assert_eq!(
+            db.route_stats(0, 1_000).unwrap().covered_since_ms,
+            Some(600)
+        );
+    }
+
+    /// 记录比窗口长：整段都有记录，起点就是问的起点。窗口里没有请求也一样 ——
+    /// 那段时间在记，只是没有请求来。
+    #[test]
+    fn history_longer_than_the_window_covers_all_of_it() {
+        let db = Db::in_memory().unwrap();
+        db.insert(&routed(1, 50, "默认", "兜底", &[], None))
+            .unwrap();
+        db.insert(&routed(2, 500, "默认", "兜底", &[], None))
+            .unwrap();
+
+        let got = db.route_stats(100, 1_000).unwrap();
+        assert_eq!(got.covered_since_ms, Some(100));
+        assert_eq!(got.routes[0].requests, 1, "窗口外的那条不算：{got:?}");
+
+        let quiet = db.route_stats(100, 400).unwrap();
+        assert_eq!(quiet.covered_since_ms, Some(100));
+        assert!(quiet.routes.is_empty(), "{quiet:?}");
+    }
+
+    /// 窗口整个在记录开始之前（或者窗口本身是空的）：这段时间没有一刻有记录。
+    #[test]
+    fn a_window_before_the_history_began_covers_nothing() {
+        let db = Db::in_memory().unwrap();
+        db.insert(&routed(1, 500, "默认", "兜底", &[], None))
+            .unwrap();
+        assert_eq!(db.route_stats(0, 400).unwrap().covered_since_ms, None);
+        // 窗口的终点不含在内：恰好在终点开始的请求不在这段里
+        assert_eq!(db.route_stats(0, 500).unwrap().covered_since_ms, None);
+        assert_eq!(db.route_stats(0, 501).unwrap().covered_since_ms, Some(500));
+        assert_eq!(db.route_stats(700, 700).unwrap().covered_since_ms, None);
     }
 }

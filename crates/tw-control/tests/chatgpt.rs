@@ -43,6 +43,8 @@ struct OpenAi {
     device_approve_after: Mutex<u32>,
     /// 设备码的两个接口收到的请求体
     device_asks: Mutex<Vec<Value>>,
+    /// 登录换 token 时发的 id_token。不设就是 [`id_token`]
+    id_token: Mutex<Option<String>>,
 }
 
 fn jwt(claims: Value) -> String {
@@ -66,6 +68,14 @@ fn access_token(plan: &str) -> String {
         },
         "https://api.openai.com/profile": {"email": "someone@example.com", "email_verified": true},
         "sub": "auth0|someone"
+    }))
+}
+
+/// 登录换来的 id_token：邮箱在顶层，账户和套餐在 auth 那一块
+fn id_token() -> String {
+    jwt(json!({
+        "email": "someone@example.com",
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-1", "chatgpt_plan_type": "plus"}
     }))
 }
 
@@ -129,11 +139,9 @@ async fn token(
         }))
         .into_response();
     }
+    let id = o.id_token.lock().unwrap().clone().unwrap_or_else(id_token);
     axum::Json(json!({
-        "id_token": jwt(json!({
-            "email": "someone@example.com",
-            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-1", "chatgpt_plan_type": "plus"}
-        })),
+        "id_token": id,
         "access_token": at_login(),
         "refresh_token": "rt-login",
         "expires_in": 864000
@@ -506,6 +514,7 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
         (st, v["status"].as_str()),
         (StatusCode::OK, Some("pending"))
     );
+    assert!(v.get("account").is_none(), "还没登上，说不上是谁：{v}");
 
     let (code, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
     assert_eq!(code, 200);
@@ -526,13 +535,18 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
         s.challenge
     );
 
-    let (st, v) = b
+    let (st, done) = b
         .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
         .await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(v["status"], "done");
-    assert_eq!(v["provider"], "chatgpt");
-    assert_eq!(v["plan"], "plus");
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["provider"], "chatgpt");
+    // 登的是哪个账号：邮箱和套餐，没有单独的套餐一项
+    assert_eq!(
+        done["account"],
+        json!({"email": "someone@example.com", "plan": "plus"})
+    );
+    assert!(done.get("plan").is_none(), "{done}");
     assert_eq!(
         b.login_finished().await,
         (s.id.clone(), "done".into(), Some("chatgpt".into()))
@@ -562,11 +576,8 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
     );
     assert!(b.provider("relay").is_some(), "别的上游不动");
 
-    // 上游页马上就知道登的是谁：从刚写进配置的 access token 里读
-    assert_eq!(
-        b.oauth_view("chatgpt").await["account"],
-        json!({"email": "someone@example.com", "plan": "plus"})
-    );
+    // 上游页马上就知道登的是谁：从刚写进配置的 access token 里读，和登录结果是同一块
+    assert_eq!(b.oauth_view("chatgpt").await["account"], done["account"]);
 
     // 模型清单马上就去问，不等下一轮
     eventually("登录后获取模型清单", || {
@@ -647,6 +658,7 @@ async fn a_callback_with_the_wrong_state_does_not_end_the_login() {
         .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
         .await;
     assert_eq!(v["status"], "failed");
+    assert!(v.get("account").is_none(), "{v}");
     assert_eq!(
         v["error"]["code"], "control.chatgpt_login.page_error",
         "{v}"
@@ -706,6 +718,14 @@ async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
     let s = start_login(&b, json!({"name": "chatgpt"})).await;
     let (_, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
     assert!(page.contains("Signed in to ChatGPT"), "{page}");
+    let (_, done) = b
+        .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
+        .await;
+    assert_eq!(
+        done["account"],
+        json!({"email": "someone@example.com", "plan": "plus"}),
+        "登录结果说的是新登上的账号，不是原来那个"
+    );
     let p = b.provider("chatgpt").unwrap();
     let o = p.oauth.as_ref().unwrap();
     assert_eq!(
@@ -723,10 +743,42 @@ async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
         p.headers.get("chatgpt-account-id").unwrap().value.raw(),
         "acct-1"
     );
-    // 换了账号，上游页上跟着换
+    // 换了账号，上游页上跟着换，和登录结果说的是同一个
+    assert_eq!(b.oauth_view("chatgpt").await["account"], done["account"]);
+}
+
+/// 登录结果里的账号从存进配置的 access token 里读，和上游视图同一个来源：id_token 说得
+/// 少（只有账户 ID）时，登录结果照样是全的，和上游那一行一样。
+#[tokio::test]
+async fn the_login_result_names_the_account_from_the_token_the_upstream_view_reads() {
+    let mut b = bed(|_| String::new()).await;
+    *b.openai.id_token.lock().unwrap() = Some(jwt(json!({
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-1"}
+    })));
+    let s = start_login(&b, json!({})).await;
+    let (_, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
+    assert!(page.contains("Signed in to ChatGPT"), "{page}");
+    assert_eq!(b.login_finished().await.1, "done");
+
+    let (_, done) = b
+        .call("GET", &format!("/chatgpt/login/{}", s.id), Value::Null)
+        .await;
     assert_eq!(
-        b.oauth_view("chatgpt").await["account"],
-        json!({"email": "someone@example.com", "plan": "plus"})
+        done["account"],
+        json!({"email": "someone@example.com", "plan": "plus"}),
+        "{done}"
+    );
+    assert_eq!(b.oauth_view("chatgpt").await["account"], done["account"]);
+    // 账户 ID 仍然取自 id_token
+    assert_eq!(
+        b.provider("chatgpt")
+            .unwrap()
+            .headers
+            .get("ChatGPT-Account-Id")
+            .unwrap()
+            .value
+            .raw(),
+        "acct-1"
     );
 }
 
@@ -863,7 +915,11 @@ async fn a_device_login_waits_for_the_other_device_and_saves_the_account() {
     let (_, v) = b
         .call("GET", &format!("/chatgpt/login/{id}"), Value::Null)
         .await;
-    assert_eq!(v["plan"], "plus");
+    assert_eq!(
+        v["account"],
+        json!({"email": "someone@example.com", "plan": "plus"})
+    );
+    assert_eq!(b.oauth_view("chatgpt").await["account"], v["account"]);
     eventually("登录后获取模型清单", || {
         b.openai
             .backend
