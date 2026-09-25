@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::http::HeaderMap;
 use axum::response::Response;
 
-use super::{Sender, now_ms};
+use super::{Choice, Sender, now_ms};
 use crate::error::GatewayError;
 use crate::state::{AppState, Runtime};
 use tw_types::msg;
@@ -35,17 +35,72 @@ pub(super) async fn ws_upgrade(
         client: client_name.clone(),
         ..Default::default()
     };
+    let route = rt.engine.route_of(&client_name).to_string();
+    // 开始事件。**被规则拒绝的升级也发**（和 HTTP 那条路一样，见
+    // `super::routed_nowhere`）：流量里要有这一行，规则的命中也要数得到它
+    let open = |choice: &Choice, provider: &str, billing: tw_api::Billing| {
+        let id = state.bus.next_id();
+        let at_ms = now_ms();
+        state.bus.emit(tw_api::Event::RequestStarted {
+            id,
+            client: client_name.clone(),
+            client_hint: crate::hint::client_hint(&headers),
+            // 升级请求没有正文，认不出是哪段对话
+            session: None,
+            peer: from.peer.clone(),
+            key_masked: from.key.clone(),
+            route: choice.route.clone(),
+            rule: choice.rule.clone(),
+            group: choice.group.clone(),
+            rewritten_by: choice.rewritten_by.clone(),
+            provider: provider.to_string(),
+            billing,
+            model: String::new(),
+            method: "WS".to_string(),
+            path: uri.path().to_string(),
+            at_ms,
+        });
+        // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成
+        // 就被丢掉的 —— 客户端没等到 101 就走了 —— 由 Drop 报成取消。WS 帧
+        // 不留档，所以没有 body 的去处
+        let ending = crate::ending::Ending::new(
+            state.bus.clone(),
+            id,
+            String::new(),
+            started,
+            at_ms as i64,
+            None,
+        );
+        (id, ending)
+    };
     let decision = match rt.engine.route(&facts).map_err(|e| {
         GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
     })? {
         tw_engine::Outcome::Route(d) => d,
         tw_engine::Outcome::Deny { rule, reason } => {
             tracing::info!(%rule, "a rule denied the WebSocket upgrade");
-            return Err(GatewayError::denied(msg!(
-                "gw.route.denied", rule = rule, reason = reason =>
+            let err = GatewayError::denied(msg!(
+                "gw.route.denied", rule = rule.clone(), reason = reason =>
                 "Rule `{rule}` denied this request: {reason}"
-            )));
+            ));
+            let choice = Choice {
+                route,
+                rule,
+                group: None,
+                rewritten_by: Vec::new(),
+            };
+            let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
+            state.bus.emit(super::routed_nowhere(id, choice));
+            ending.failed(err.source.into(), err.detail.clone());
+            return Err(err);
         }
+    };
+    // 升级请求没有正文，规则附加的改写无从谈起
+    let choice = Choice {
+        route,
+        rule: decision.matched_rule.clone(),
+        group: decision.via_group.clone(),
+        rewritten_by: Vec::new(),
     };
     let (alive, _) = state.health.filter(&decision.candidates);
     let Some(name) = alive.first().map(|s| s.to_string()) else {
@@ -73,38 +128,14 @@ pub(super) async fn ws_upgrade(
         .headers_for(provider, http)
         .await
         .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
-    let id = state.bus.next_id();
-    state.bus.emit(tw_api::Event::RequestStarted {
-        id,
-        client: client_name,
-        client_hint: crate::hint::client_hint(&headers),
-        session_fp: None,
-        peer: from.peer,
-        key_masked: from.key,
-        provider: name.clone(),
-        billing: provider.billing.into(),
-        model: String::new(),
-        method: "WS".to_string(),
-        path: uri.path().to_string(),
-        at_ms: now_ms(),
-    });
-    // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成
-    // 就被丢掉的 —— 客户端没等到 101 就走了 —— 由 Drop 报成取消。WS 帧
-    // 不留档，所以没有 body 的去处
-    let ending = crate::ending::Ending::new(
-        state.bus.clone(),
-        id,
-        String::new(),
-        started,
-        now_ms() as i64,
-        None,
-    );
+    let (id, ending) = open(&choice, &name, provider.billing.into());
     let upstream = crate::ws::Upstream {
         url: crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref()),
         headers: upstream_headers,
         provider: provider.clone(),
-        rule: decision.matched_rule,
-        group: decision.via_group,
+        route: choice.route,
+        rule: choice.rule,
+        group: choice.group,
     };
     let rules = crate::ws::Rules {
         redact_mode: rt.config.security.redact.mode,

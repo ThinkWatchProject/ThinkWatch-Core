@@ -231,6 +231,41 @@ pub async fn serve(
     crate::listen::serve_detached(state, addr).await
 }
 
+/// 路由第一阶段的结论里跟着请求走的那几样。
+///
+/// **开始事件就带着它**：第一阶段在开始之前就走完了，界面不必按密钥现在的配置
+/// 去猜一个请求走的是哪条路由。路由事件带着它的终稿（改写多了第二阶段的），
+/// 存储层据此记下这个请求走的是哪条路由、命中了哪几条规则。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Choice {
+    /// 这把密钥走的路由：指定的那条，没指定的是默认路由
+    pub(crate) route: String,
+    /// 决定去向的那条规则：第一条命中的转发或拒绝
+    pub(crate) rule: String,
+    pub(crate) group: Option<String>,
+    /// 附加了参数改写的规则
+    pub(crate) rewritten_by: Vec<String>,
+}
+
+/// 规则做了决定、这个请求却一家上游都不会去时的路由事件：尝试链是空的。
+///
+/// **这样的请求照样留一行**（开始、这一条、然后一条失败）：被规则拒绝的、规则
+/// 选中的上游都服务不了它的，和别的失败一样要在流量里看得见，每条规则命中了
+/// 多少也要数得到它们。
+pub(crate) fn routed_nowhere(id: u64, choice: Choice) -> tw_api::Event {
+    tw_api::Event::RequestRouted {
+        id,
+        route: choice.route,
+        rule: choice.rule,
+        group: choice.group,
+        rewritten_by: choice.rewritten_by,
+        denied_by: None,
+        attempts: Vec::new(),
+        // 一家都没接下：没有哪一家的计费方式可以跟着走
+        billing: tw_api::Billing::PerToken,
+    }
+}
+
 /// 上游回了话的一跳：`served` 或者 `status`。
 pub(crate) fn hop(
     provider: &str,

@@ -16,8 +16,8 @@ endpoints! {
     Interfaces: GET "/interfaces", () => Vec<api::NicView>;
     /// 实时事件流
     Events: GET "/events", () => api::Event, events;
-    /// 此刻还没结束的请求，按开始事件的样子给
-    InFlight: GET "/in-flight", () => Vec<api::Event>;
+    /// 此刻还没结束的请求，每个到目前为止的事件，和 core 的时钟
+    InFlight: GET "/in-flight", () => api::InFlight;
     /// 此刻的实时读数：在跑的请求、最近一分钟的生成速率
     Live: GET "/live", () => api::LiveView;
     Overview: GET "/overview", () => api::Overview;
@@ -42,6 +42,8 @@ endpoints! {
     CostBuckets: GET "/summary/buckets", api::BucketQuery => Vec<api::CostBucket>;
     CostBucketsBy: GET "/summary/buckets/by", api::BucketGroupQuery => Vec<api::CostBucketGroup>;
     CostBy: GET "/summary/by", api::GroupQuery => Vec<api::CostGroup>;
+    /// 各条路由走了多少请求、各条规则命中了多少
+    RouteStats: GET "/summary/routes", api::Window => Vec<api::RouteHits>;
     History: GET "/history", api::ListQuery => Vec<api::HistoryRow>;
     Latency: GET "/latency", api::Window => Vec<api::LatencyView>;
     LatencyByProvider: GET "/latency/provider", api::Window => Vec<api::LatencyView>;

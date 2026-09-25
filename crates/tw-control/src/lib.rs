@@ -108,6 +108,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::CostBuckets, cost_buckets)
         .at(ep::CostBucketsBy, cost_buckets_by)
         .at(ep::CostBy, cost_by)
+        .at(ep::RouteStats, route_stats)
         .at(ep::History, history)
         .at(ep::Latency, latency)
         .at(ep::LatencyByProvider, latency_by_provider)
@@ -227,11 +228,13 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
-/// 此刻还在跑的请求：它们的开始事件，原样（见 `EventBus::in_flight`）。
+/// 此刻还在跑的请求：每个到目前为止的事件，原样，和 core 的时钟（见
+/// `EventBus::in_flight`）。
 ///
 /// **半路才开始听 `/events` 的一方先问这个。**不问的话，订阅之前就开始了
-/// 的请求它一个都不知道，直到它们结束 —— 数「进行中」就会少数。
-async fn in_flight(State(s): State<ControlState>) -> Json<Vec<tw_api::Event>> {
+/// 的请求它一个都不知道，直到它们结束 —— 数「进行中」就会少数，画路径只能
+/// 画到一半。
+async fn in_flight(State(s): State<ControlState>) -> Json<tw_api::InFlight> {
     Json(s.bus().in_flight())
 }
 
@@ -684,6 +687,20 @@ async fn cost_by(
     let g = store.lock().await;
     let x = g.db().cost_by(q.dim, from, to).map_err(records)?;
     Ok(Json(x))
+}
+
+/// 各条路由走了多少请求、各条规则命中了多少。不给参数就是「今天」。
+///
+/// **路由图按它给线加粗、标出从没命中过的规则**：按请求落库时记下的路由和规则
+/// 数，不按现在的配置推（见 [`tw_api::RouteHits`]）。
+async fn route_stats(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
+) -> Result<Json<Vec<tw_api::RouteHits>>, Fail> {
+    let (from, to) = range(q.from_ms, q.to_ms);
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    Ok(Json(g.db().route_hits(from, to).map_err(records)?))
 }
 
 /// 一段时间的汇总。不给参数就是「今天」。

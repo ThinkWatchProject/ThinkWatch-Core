@@ -437,6 +437,12 @@ pub struct Decision {
     pub via_group: Option<String>,
     /// 累积起来的参数改写
     pub set: SetAction,
+    /// 附加了参数改写的规则，按求值的顺序。决定去向的那条自己带着改写时也在里面。
+    ///
+    /// **流量里要说得出是谁改的**：模型被换掉、思考被关掉，而请求里写的不是这样，
+    /// 用户头一个要问的就是哪条规则干的；一条改写规则从来没命中过（条件写错了），
+    /// 也只有这样数得出来
+    pub rewritten_by: Vec<String>,
 }
 
 /// 阶段一结束时可能是「不让干」。
@@ -455,7 +461,11 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome2 {
     /// 继续，带上累积后的参数改写
-    Proceed(SetAction),
+    Proceed {
+        set: SetAction,
+        /// 这一轮又附加了改写的规则（只有阶段二的），按求值的顺序
+        rewritten_by: Vec<String>,
+    },
     Deny {
         rule: String,
         reason: String,
@@ -749,6 +759,7 @@ impl Engine {
     /// 代码，试算才不会算出一个和真实转发不一样的结果。
     pub fn route_with(&self, rules: &[Rule], facts: &RequestFacts) -> Result<Outcome, RouteError> {
         let mut set = SetAction::default();
+        let mut rewritten_by = Vec::new();
         let mut chosen: Option<&Rule> = None;
 
         for r in rules {
@@ -758,6 +769,9 @@ impl Engine {
             }
             if let Some(s) = &r.set {
                 set.merge(s);
+                if r.adds() {
+                    rewritten_by.push(r.name.clone());
+                }
             }
             if chosen.is_none() && (r.to.is_some() || r.deny.is_some()) {
                 chosen = Some(r);
@@ -779,6 +793,7 @@ impl Engine {
             matched_rule: r.name.clone(),
             via_group,
             set,
+            rewritten_by,
         }))
     }
 
@@ -793,6 +808,7 @@ impl Engine {
         base: &SetAction,
     ) -> Result<Outcome2, RouteError> {
         let mut set = base.clone();
+        let mut rewritten_by = Vec::new();
         for r in self.rules_for(&facts.client) {
             if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
                 continue;
@@ -805,9 +821,12 @@ impl Engine {
             }
             if let Some(s) = &r.set {
                 set.merge(s);
+                if r.adds() {
+                    rewritten_by.push(r.name.clone());
+                }
             }
         }
-        Ok(Outcome2::Proceed(set))
+        Ok(Outcome2::Proceed { set, rewritten_by })
     }
 
     fn resolve_target(&self, r: &Rule) -> Result<(Vec<String>, Option<String>), RouteError> {
@@ -1314,6 +1333,89 @@ mod tests {
         );
     }
 
+    /// 改写是谁加的要记下来：命中了、真的改了东西的才算，没命中的、只写了
+    /// `only_at_session_start` 的不算。决定去向的那条自己带着改写时也算。
+    #[test]
+    fn the_decision_names_every_rule_that_added_a_rewrite() {
+        let thinking_off = || {
+            Some(SetAction {
+                thinking: Some(false),
+                ..Default::default()
+            })
+        };
+        let e = Engine::with_default_rules(
+            vec!["a".into(), "b".into()],
+            vec![],
+            vec![
+                route_full("关掉思考", "{}", None, thinking_off(), None),
+                route_full(
+                    "只给 opus",
+                    "{ model: claude-opus-* }",
+                    None,
+                    thinking_off(),
+                    None,
+                ),
+                route_full(
+                    "只在会话开头",
+                    "{}",
+                    None,
+                    Some(SetAction {
+                        only_at_session_start: true,
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full(
+                    "走 a 并限长",
+                    "{}",
+                    Some("a"),
+                    Some(SetAction {
+                        max_tokens: Some(100),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("走 b", "{}", Some("b"), None, None),
+            ],
+        );
+        let d = decision(&e, &facts("x"));
+        assert_eq!(d.matched_rule, "走 a 并限长");
+        assert_eq!(d.rewritten_by, ["关掉思考", "走 a 并限长"]);
+    }
+
+    /// 阶段二按选中的那一家判断，**只报这一轮又加了改写的**；拒绝了就没有这一项
+    #[test]
+    fn phase_two_names_the_rules_that_rewrote_for_this_upstream() {
+        let e = Engine::with_default_rules(
+            vec!["official".into(), "relay".into()],
+            vec![],
+            vec![
+                route_full(
+                    "走中转的降级",
+                    "{ provider_would_be: relay }",
+                    None,
+                    Some(SetAction {
+                        thinking: Some(false),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                route_full("兜底", "{}", Some("relay"), None, None),
+            ],
+        );
+        let base = SetAction::default();
+        match e.phase_two(&facts("x"), "relay", &base).unwrap() {
+            Outcome2::Proceed { rewritten_by, .. } => assert_eq!(rewritten_by, ["走中转的降级"]),
+            other => panic!("{other:?}"),
+        }
+        match e.phase_two(&facts("x"), "official", &base).unwrap() {
+            Outcome2::Proceed { rewritten_by, .. } => assert!(rewritten_by.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // 阶段一看不见它
+        assert!(decision(&e, &facts("x")).rewritten_by.is_empty());
+    }
+
     #[test]
     fn a_later_set_overrides_an_earlier_one_on_the_same_field() {
         let e = Engine::with_default_rules(
@@ -1421,12 +1523,12 @@ mod tests {
         );
         let base = SetAction::default();
         match e.phase_two(&facts("x"), "relay", &base).unwrap() {
-            Outcome2::Proceed(s) => assert_eq!(s.thinking, Some(false)),
+            Outcome2::Proceed { set: s, .. } => assert_eq!(s.thinking, Some(false)),
             other => panic!("{other:?}"),
         }
         // 换一家就不该命中了 —— 这正是故障转移后必须重跑的理由
         match e.phase_two(&facts("x"), "official", &base).unwrap() {
-            Outcome2::Proceed(s) => assert_eq!(s.thinking, None),
+            Outcome2::Proceed { set: s, .. } => assert_eq!(s.thinking, None),
             other => panic!("{other:?}"),
         }
     }
@@ -1455,7 +1557,7 @@ mod tests {
         let base = SetAction::default();
         for (p, want) in [("a", Some(false)), ("b", Some(false)), ("c", None)] {
             match e.phase_two(&facts("x"), p, &base).unwrap() {
-                Outcome2::Proceed(s) => assert_eq!(s.thinking, want, "provider={p}"),
+                Outcome2::Proceed { set: s, .. } => assert_eq!(s.thinking, want, "provider={p}"),
                 other => panic!("{other:?}"),
             }
         }

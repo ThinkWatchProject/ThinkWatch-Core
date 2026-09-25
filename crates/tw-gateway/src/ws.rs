@@ -96,8 +96,9 @@ pub struct Upstream {
     /// 连上游时带的头：凭据，和配置里给这一家写的那些
     pub headers: Vec<(String, String)>,
     pub provider: tw_config::Provider,
-    /// 命中的规则和经过的策略组。**路由事件在这边发**，和 HTTP 那条路报的是
-    /// 同一个形状，只是要等握手有了结果
+    /// 走的路由、命中的规则和经过的策略组。**路由事件在这边发**，和 HTTP 那条路
+    /// 报的是同一个形状，只是要等握手有了结果
+    pub route: String,
     pub rule: String,
     pub group: Option<String>,
 }
@@ -173,8 +174,12 @@ pub async fn proxy(
     };
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
+        route: upstream.route,
         rule: upstream.rule,
         group: upstream.group,
+        // 升级请求没有正文，没有什么可改写的；第二阶段也不在这条路上跑
+        rewritten_by: Vec::new(),
+        denied_by: None,
         attempts: vec![attempt],
         billing: billing.into(),
     });

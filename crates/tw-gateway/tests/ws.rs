@@ -405,6 +405,16 @@ async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
     let (rule, group, hop, billing) = the_route(&evs);
     assert_eq!(rule, "Codex 走账号");
     assert_eq!(group.as_deref(), Some("账号池"));
+    // 走的哪条路由，开始和路由两条事件都说；升级请求没有正文，认不出会话
+    assert!(
+        matches!(&evs[0], Event::RequestStarted { route, session: None, .. } if route == "default"),
+        "{evs:?}"
+    );
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, Event::RequestRouted { route, .. } if route == "default")),
+        "{evs:?}"
+    );
     assert_eq!(
         (hop.provider.as_str(), hop.outcome.slug(), hop.status),
         ("订阅账号", "served", Some(101))
@@ -412,6 +422,52 @@ async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
     assert_eq!(billing, "free");
     assert!(
         matches!(evs.last(), Some(Event::RequestFinished { status: 101, .. })),
+        "{evs:?}"
+    );
+}
+
+/// 规则拒绝了这次升级：**和 HTTP 那条路一样留一行** —— 开始、空尝试链的路由、
+/// 一条来源为 `denied` 的失败。以前它在事件里根本不存在。
+#[tokio::test]
+async fn an_upgrade_a_rule_denies_is_recorded_like_any_denied_request() {
+    let (up, _seen) = start_upstream("echo").await;
+    let mut c = routed_to_an_account(up);
+    c.routes[0].rules.insert(
+        0,
+        tw_engine::Rule {
+            name: "Codex 不许连".into(),
+            when: serde_yaml_ng::from_str("{ client: codex }").unwrap(),
+            to: None,
+            set: None,
+            deny: Some("先别用 WebSocket".into()),
+        },
+    );
+    let (gw, mut events) = serve(c).await;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{gw}/backend-api/codex/responses")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("x-api-key", "tw-wskey".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "被拒绝的升级不该成功"
+    );
+
+    let evs = until_the_ending(&mut events).await;
+    assert_eq!(evs.len(), 3, "{evs:?}");
+    assert!(
+        matches!(&evs[0], Event::RequestStarted { rule, provider, method, .. }
+            if rule == "Codex 不许连" && provider.is_empty() && method == "WS"),
+        "{evs:?}"
+    );
+    assert!(
+        matches!(&evs[1], Event::RequestRouted { rule, attempts, .. }
+            if rule == "Codex 不许连" && attempts.is_empty()),
+        "{evs:?}"
+    );
+    assert!(
+        matches!(&evs[2], Event::RequestFailed { source, .. } if source == "denied"),
         "{evs:?}"
     );
 }

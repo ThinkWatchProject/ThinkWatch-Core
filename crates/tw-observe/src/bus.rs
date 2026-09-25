@@ -31,12 +31,69 @@ pub struct EventBus {
 /// 按事件数出来的现状。
 #[derive(Default)]
 struct Tally {
-    /// 开始了、还没有结局的请求：它们的开始事件，按 id
-    open: BTreeMap<u64, tw_api::Event>,
+    /// 开始了、还没有结局的请求，按 id
+    open: BTreeMap<u64, Open>,
     /// 在跑的请求首字节用了多久，毫秒。生成用时要从总耗时里减掉它
     ttfb: HashMap<u64, u64>,
     /// 最近跑完的：（什么时候结束的，输出了多少 token，生成用了多少毫秒）
     done: VecDeque<(Instant, u64, u64)>,
+}
+
+/// 一个还没有结局的请求。
+struct Open {
+    /// 开始事件记下的那一刻。**跑了多久按它算**：单调时钟，不怕系统时间被拨
+    since: Instant,
+    /// 到目前为止关于它的事件，按发生的先后，第一条是开始事件（见 [`about_the_request`]）
+    events: Vec<tw_api::Event>,
+}
+
+/// 这条事件说的是它挂着的那个请求本身吗 —— 是的话，半路才来的一方要重建那个请求，
+/// 就少不了它。
+///
+/// **一个一个列出来，不写通配**：新加一种事件，编译器会逼着人在这里想一遍它算
+/// 不算。挂着请求 id、说的却是别的事的不算：`QuotaSeen` 说的是那家上游现在还剩
+/// 多少额度（`/quota` 答得了），`RequestPriced` 在结局之后才到。
+fn about_the_request(ev: &tw_api::Event) -> bool {
+    use tw_api::Event as E;
+    match ev {
+        E::RequestHeaders { .. }
+        | E::RequestRouted { .. }
+        | E::Translated { .. }
+        | E::SecretsFound { .. }
+        | E::HiddenTextFound { .. }
+        | E::ContentMatched { .. }
+        | E::OutputLimited { .. }
+        | E::ToolCallFlagged { .. } => true,
+        // 开始和三种结局由 `track_at` 自己管
+        E::RequestStarted { .. }
+        | E::RequestFinished { .. }
+        | E::RequestFailed { .. }
+        | E::RequestCancelled { .. }
+        // 挂着请求的号、说的却是别的事的，和根本不挂在请求上的
+        | E::RequestPriced { .. }
+        | E::QuotaSeen { .. }
+        | E::QuotaExhausted { .. }
+        | E::LocallyAnswered { .. }
+        | E::CredentialRotated { .. }
+        | E::CredentialExpired { .. }
+        | E::LoginFinished { .. }
+        | E::HealthChanged { .. }
+        | E::ModelsChanged { .. }
+        | E::ProxyChanged { .. }
+        | E::AuthChanged { .. }
+        | E::ListenChanged { .. }
+        | E::ConfigReloaded { .. }
+        | E::ConfigRejected { .. }
+        | E::EventsDropped { .. } => false,
+    }
+}
+
+/// 此刻的系统时间，Unix 毫秒。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Tally {
@@ -117,10 +174,17 @@ impl EventBus {
         let mut t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
         match ev {
             E::RequestStarted { id, .. } => {
-                t.open.insert(*id, ev.clone());
+                t.open.insert(
+                    *id,
+                    Open {
+                        since: now,
+                        events: vec![ev.clone()],
+                    },
+                );
             }
             E::RequestHeaders { id, ttfb_ms, .. } => {
-                if t.open.contains_key(id) {
+                if let Some(o) = t.open.get_mut(id) {
+                    o.events.push(ev.clone());
                     t.ttfb.insert(*id, *ttfb_ms);
                 }
             }
@@ -146,16 +210,24 @@ impl EventBus {
                 t.open.remove(id);
                 t.ttfb.remove(id);
             }
+            // 别的事件挂着的 id 要么是一个请求的，要么是它自己取的号 —— 号从同一个
+            // 计数器里取，不会和一个在跑的请求撞上
+            other if about_the_request(other) => {
+                if let Some(o) = t.open.get_mut(&other.id()) {
+                    o.events.push(other.clone());
+                }
+            }
             _ => {}
         }
     }
 
-    /// 此刻还在跑的请求：它们的开始事件，**原样**，按 id 从小到大。
+    /// 此刻还在跑的请求：每个到目前为止的事件，**原样**、按发生的先后；请求按 id
+    /// 从小到大（也就是开始的先后）。连同 core 此刻的时钟。
     ///
     /// 给**半路才来听的一方**用。事件流只送订阅之后发生的事，一个在那之前
-    /// 就开始、此刻还没结束的请求，它的开始事件早就发过了 —— 听的人数
-    /// 「进行中」时就漏掉它，直到它结束。桌面版概览的实时档每次打开都是
-    /// 这样。把这份快照当成补发的开始事件处理，就和从头听起一样。
+    /// 就开始、此刻还没结束的请求，它的开始事件、响应头、路由早就发过了 ——
+    /// 只补开始的话，那一行就一直没有状态码、画不出它最后走到了哪家上游。把这些
+    /// 事件当成补发的处理，就和从头听起一样。
     ///
     /// **和 `Status::in_flight` 不是一个数。**那个从连接进到数据面就算，比
     /// 开始事件早，排队等名额的、鉴权没过的都在里面 —— 它回答的是「现在
@@ -163,14 +235,19 @@ impl EventBus {
     /// 同一批。
     ///
     /// 表不会只进不出：每个开始事件都欠着恰好一个结局，由 `Ending` 保证。
-    pub fn in_flight(&self) -> Vec<tw_api::Event> {
-        self.tally
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .open
-            .values()
-            .cloned()
-            .collect()
+    pub fn in_flight(&self) -> tw_api::InFlight {
+        let t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
+        tw_api::InFlight {
+            now_ms: now_ms(),
+            requests: t
+                .open
+                .iter()
+                .map(|(id, o)| tw_api::InFlightRequest {
+                    id: *id,
+                    events: o.events.clone(),
+                })
+                .collect(),
+        }
     }
 
     /// 此刻的实时读数：在跑的请求（和 [`EventBus::in_flight`] 同一批），和最近
@@ -193,29 +270,8 @@ impl EventBus {
             .fold((0u64, 0u64), |(tok, ms), (_, out, gen_ms)| {
                 (tok + out, ms + gen_ms)
             });
-        let mut running: Vec<tw_api::RunningView> = t
-            .open
-            .values()
-            .filter_map(|e| match e {
-                tw_api::Event::RequestStarted {
-                    id,
-                    client,
-                    client_hint,
-                    model,
-                    provider,
-                    at_ms,
-                    ..
-                } => Some(tw_api::RunningView {
-                    id: *id,
-                    client: client.clone(),
-                    client_hint: client_hint.clone(),
-                    model: model.clone(),
-                    provider: provider.clone(),
-                    at_ms: *at_ms,
-                }),
-                _ => None,
-            })
-            .collect();
+        let mut running: Vec<tw_api::RunningView> =
+            t.open.values().filter_map(|o| running(o, now)).collect();
         running.sort_by_key(|r| (r.at_ms, r.id));
         tw_api::LiveView {
             running,
@@ -233,6 +289,48 @@ impl EventBus {
     }
 }
 
+/// 一个在跑的请求此刻的样子：开始事件里的，加上路由报出来的那家上游。
+fn running(o: &Open, now: Instant) -> Option<tw_api::RunningView> {
+    let tw_api::Event::RequestStarted {
+        id,
+        client,
+        client_hint,
+        session,
+        route,
+        rule,
+        group,
+        model,
+        provider,
+        at_ms,
+        ..
+    } = o.events.first()?
+    else {
+        return None;
+    };
+    // 接下它的是尝试链里 `served` 的那一跳。路由事件到之前没有
+    let upstream = o.events.iter().find_map(|e| match e {
+        tw_api::Event::RequestRouted { attempts, .. } => attempts
+            .iter()
+            .find(|a| a.outcome == tw_api::AttemptOutcome::Served)
+            .map(|a| a.provider.clone()),
+        _ => None,
+    });
+    Some(tw_api::RunningView {
+        id: *id,
+        client: client.clone(),
+        client_hint: client_hint.clone(),
+        model: model.clone(),
+        provider: provider.clone(),
+        at_ms: *at_ms,
+        elapsed_ms: now.saturating_duration_since(o.since).as_millis() as u64,
+        session: session.clone(),
+        route: route.clone(),
+        rule: rule.clone(),
+        group: group.clone(),
+        upstream,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +342,11 @@ mod tests {
             id,
             client: "c".into(),
             client_hint: None,
-            session_fp: None,
+            session: None,
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: Some("__all__".into()),
+            rewritten_by: vec![],
             provider: "p".into(),
             billing: tw_api::Billing::PerToken,
             model: "m".into(),
@@ -296,13 +398,96 @@ mod tests {
             ttfb_ms: 5,
         });
 
-        let open = b.in_flight();
-        assert_eq!(open.iter().map(|e| e.id()).collect::<Vec<_>>(), [4]);
-        // **原样**：听的人拿它当补发的开始事件，字段一个都不能少
+        let open = b.in_flight().requests;
+        assert_eq!(open.iter().map(|r| r.id).collect::<Vec<_>>(), [4]);
+        // **原样**：听的人拿它当补发的事件，字段一个都不能少
         assert!(
-            matches!(&open[0], tw_api::Event::RequestStarted { model, at_ms: 1004, .. } if model == "m"),
+            matches!(&open[0].events[0], tw_api::Event::RequestStarted { model, at_ms: 1004, .. } if model == "m"),
             "{open:?}"
         );
+    }
+
+    fn routed(id: u64, served_by: &str) -> tw_api::Event {
+        tw_api::Event::RequestRouted {
+            id,
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: Some("__all__".into()),
+            rewritten_by: vec![],
+            denied_by: None,
+            attempts: vec![
+                tw_api::AttemptView {
+                    provider: "p".into(),
+                    outcome: tw_api::AttemptOutcome::Status,
+                    status: Some(503),
+                    error: None,
+                    ms: 10,
+                },
+                tw_api::AttemptView {
+                    provider: served_by.into(),
+                    outcome: tw_api::AttemptOutcome::Served,
+                    status: Some(200),
+                    error: None,
+                    ms: 20,
+                },
+            ],
+            billing: tw_api::Billing::PerToken,
+        }
+    }
+
+    /// 半路才来的一方要的是**每个在跑的请求到目前为止的全部**：开始、响应头、路由、
+    /// 防护的记录，按发生的先后 —— 只给开始的话，那一行没有状态码、画不到上游。
+    /// 说上游现状的额度不跟着请求走；结束了的整条不在
+    #[test]
+    fn in_flight_replays_everything_a_running_request_has_seen_so_far() {
+        let b = EventBus::new();
+        b.emit(started(1));
+        b.emit(started(2));
+        b.emit(headers(1, 30));
+        b.emit(tw_api::Event::QuotaSeen {
+            id: 1,
+            provider: "p".into(),
+            windows: vec![],
+            at_ms: 0,
+        });
+        b.emit(routed(1, "q"));
+        b.emit(tw_api::Event::Translated {
+            id: 1,
+            provider: "q".into(),
+            from: tw_api::Dialect::Anthropic,
+            to: tw_api::Dialect::OpenaiResponses,
+            dropped: vec![],
+            at_ms: 0,
+        });
+        // 自己取号的事件不会挂到哪个请求上
+        let own = b.next_id();
+        b.emit(tw_api::Event::HealthChanged {
+            id: own,
+            provider: "p".into(),
+            state: tw_api::BreakerState::Open,
+            at_ms: 0,
+        });
+        b.emit(finished(2, 10, 1));
+
+        let snap = b.in_flight();
+        assert!(
+            snap.now_ms > 1_700_000_000_000,
+            "core 的时钟：{}",
+            snap.now_ms
+        );
+        assert_eq!(snap.requests.len(), 1, "{snap:?}");
+        let kinds: Vec<&str> = snap.requests[0]
+            .events
+            .iter()
+            .map(|e| match e {
+                tw_api::Event::RequestStarted { .. } => "started",
+                tw_api::Event::RequestHeaders { .. } => "headers",
+                tw_api::Event::RequestRouted { .. } => "routed",
+                tw_api::Event::Translated { .. } => "translated",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["started", "headers", "routed", "translated"]);
     }
 
     /// 没有订阅者的时候照样记 —— 这份快照就是给还没来的订阅者准备的。
@@ -310,13 +495,17 @@ mod tests {
     #[test]
     fn in_flight_is_kept_with_no_subscriber_and_in_start_order() {
         let b = EventBus::new();
-        assert!(b.in_flight().is_empty());
+        assert!(b.in_flight().requests.is_empty());
         for id in [7, 3, 5] {
             b.emit(started(id));
         }
         assert_eq!(b.subscriber_count(), 0);
         assert_eq!(
-            b.in_flight().iter().map(|e| e.id()).collect::<Vec<_>>(),
+            b.in_flight()
+                .requests
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
             [3, 5, 7]
         );
     }
@@ -409,15 +598,20 @@ mod tests {
         let b = EventBus::new();
         let mut ev = started(7);
         if let tw_api::Event::RequestStarted {
-            client_hint, at_ms, ..
+            client_hint,
+            session,
+            at_ms,
+            ..
         } = &mut ev
         {
             *client_hint = Some("codex".into());
+            *session = Some("fp-900".into());
             *at_ms = 900;
         }
-        b.emit(started(3));
-        b.emit(ev);
-        let live = b.live();
+        let then = Instant::now();
+        b.track_at(&started(3), then);
+        b.track_at(&ev, then);
+        let live = b.live_at(then + Duration::from_millis(1_500));
         assert_eq!(
             live.running.iter().map(|r| r.id).collect::<Vec<_>>(),
             [7, 3]
@@ -431,8 +625,28 @@ mod tests {
                 model: "m".into(),
                 provider: "p".into(),
                 at_ms: 900,
+                // **core 数的**，按它自己的单调时钟 —— 不靠界面的时钟去减 `at_ms`
+                elapsed_ms: 1_500,
+                session: Some("fp-900".into()),
+                route: "default".into(),
+                rule: "catch-all".into(),
+                group: Some("__all__".into()),
+                // 路由还没报出结论：不知道最后是哪家接下的
+                upstream: None,
             }
         );
+    }
+
+    /// 路由报出结论之后，在跑的那一条知道是哪家接下的：尝试链里 `served` 的那一跳，
+    /// 不是开始时的首选
+    #[test]
+    fn a_running_request_names_the_upstream_that_took_it_once_routed() {
+        let b = EventBus::new();
+        b.emit(started(1));
+        b.emit(routed(1, "q"));
+        let live = b.live();
+        assert_eq!(live.running[0].provider, "p");
+        assert_eq!(live.running[0].upstream.as_deref(), Some("q"));
     }
 
     #[test]
