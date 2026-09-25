@@ -206,6 +206,11 @@ pub(super) async fn try_upstreams<'a>(
                         "Upstream `{upstream}` answered {status}."
                     ))
                 });
+                // GLM Coding Plan 的额度用完不在响应头里，在 429 的 body 里
+                if r.status() == 429 {
+                    state.note_glm_429(id, provider, r).await;
+                }
+                state.glm_traffic(provider);
                 continue;
             }
             Ok(r) => {
