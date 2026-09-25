@@ -149,8 +149,8 @@ directory `/var/lib/thinkwatch`, and installs `twcore.service`. When there is no
 configuration yet, it runs `twcore init` as that user, which writes a
 `config.yaml` with a gateway key, the control key, and the remote control port
 disabled on a random port between 20000 and 32000. The script does not start
-the service. To install a particular release, append
-`-s -- --version 0.47.0` to `sudo sh`.
+the service. It installs the latest release; to install a particular one,
+append `-s -- --version <version>` to `sudo sh`.
 
 Commands that read the configuration run as the service user, with its data
 directory:
@@ -168,14 +168,17 @@ For clients on other machines to use the gateway, set
 `listen.gateway.bind: all` in `config.yaml` and list their networks in
 `listen.gateway.allow_from`. Upstreams can be written under `providers` or
 added later from ThinkWatch Lite. In ThinkWatch Lite,
-**Settings → Connection → Add remote connection** takes the server's address,
-the control port and the key. The app connects only to a core of its own
-version, so the server and the app are upgraded together:
+**Settings → Connection → Add remote connection** takes a name, the server's
+address, the control port and the key. The app connects only to a core that
+speaks its control-plane protocol version, so the server runs the core version
+the app includes, which can be older than the latest release. When the
+versions differ, the app shows both, and `twcore upgrade --version` switches
+the server to the version the app needs, whether newer or older:
 
 ```sh
-sudo twcore upgrade --check                      # compare with the latest release; change nothing
-sudo twcore upgrade --restart                    # install the latest release and restart the service
-sudo twcore upgrade --version 0.47.0 --restart   # install a particular release
+sudo twcore upgrade --version <version> --restart   # install the version the app needs and restart the service
+sudo twcore upgrade --check                         # compare with the latest release; change nothing
+sudo twcore upgrade --restart                       # install the latest release and restart the service
 ```
 
 Neither port uses TLS: the control port is encrypted and authenticated by its
@@ -187,23 +190,24 @@ exposure and uninstalling. Every field of `config.yaml` is described in the
 
 ## Crate layers
 
-The workspace holds sixteen crates in two layers, and the `twcore` binary in
-`bin/twcore`.
+The workspace holds sixteen crates and the `twcore` binary in `bin/twcore`.
+It divides the crates in two: the three that ThinkWatch Enterprise depends
+on, and the crates of the gateway that `twcore` runs, which ThinkWatch
+Enterprise does not use. Within the second part, the crates are grouped by
+role. No crate depends on a group below its own.
 
-| Layer | Crates |
+| Group | Crates |
 |---|---|
 | Shared with ThinkWatch Enterprise | `tw-dialect` · `tw-guard` · `tw-breaker` |
 | Domain logic | `tw-types` · `tw-engine` · `tw-pricing` · `tw-yaml` · `tw-secret` · `tw-watch` |
+| Control-plane contract | `tw-api` · `tw-link` |
 | Assembly | `tw-config` · `tw-store` · `tw-observe` |
-| Data plane and control plane | `tw-gateway` · `tw-control` · `tw-api` · `tw-link` |
+| Data plane and control plane | `tw-gateway` · `tw-control` |
 
-The first row is the shared layer; the other rows make up the second layer,
-the gateway itself.
-
-ThinkWatch Enterprise depends on exactly the three crates of the shared layer:
-format conversion and usage parsing (`tw-dialect`), redaction, tool-call
-inspection and the other protections (`tw-guard`), and the circuit-breaker
-state machine (`tw-breaker`). These three crates depend only on one another; a test enforces
+ThinkWatch Enterprise depends on the first group and nothing else: format
+conversion and usage parsing (`tw-dialect`), redaction, tool-call inspection
+and the other protections (`tw-guard`), and the circuit-breaker state machine
+(`tw-breaker`). These three crates depend only on one another; a test enforces
 this, and CI checks that ThinkWatch Enterprise compiles against every change to
 them. A component that only one product uses lives in that product's
 repository.
@@ -215,9 +219,9 @@ scanning their configuration files are done in ThinkWatch Lite: they change
 files on the machine the app runs on, which need not be the machine running
 `twcore`. `twcore` only issues each client its own gateway key.
 
-The second layer implements a single `twcore` process: request history in
+The last two groups implement a single `twcore` process: request history in
 SQLite, the configuration in one YAML file, and a control plane reached over a
-local channel or the remote control port. It is deliberately not shared.
+local channel or the remote control port. They are deliberately not shared.
 ThinkWatch Enterprise is multi-tenant and keeps its state in PostgreSQL, Redis
 and ClickHouse, and one abstraction over both designs would serve neither.
 

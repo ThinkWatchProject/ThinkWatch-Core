@@ -78,7 +78,7 @@ twcore 可以作为 systemd 服务运行在 Linux（x86_64、aarch64）上。一
 curl -fsSL https://raw.githubusercontent.com/ThinkWatchProject/ThinkWatch-Core/main/scripts/install.sh | sudo sh
 ```
 
-脚本按 SHA-256 校验下载的文件，安装 `/usr/local/bin/twcore`，创建系统用户 `thinkwatch` 及其数据目录 `/var/lib/thinkwatch`，并安装 `twcore.service`。尚无配置时，脚本以该用户执行 `twcore init`，生成的 `config.yaml` 包含一把网关密钥、控制密钥，以及处于关闭状态的远程控制端口（端口号在 20000–32000 之间随机选取）。脚本不会启动服务。安装指定版本时，在 `sudo sh` 后加上 `-s -- --version 0.47.0`。
+脚本按 SHA-256 校验下载的文件，安装 `/usr/local/bin/twcore`，创建系统用户 `thinkwatch` 及其数据目录 `/var/lib/thinkwatch`，并安装 `twcore.service`。尚无配置时，脚本以该用户执行 `twcore init`，生成的 `config.yaml` 包含一把网关密钥、控制密钥，以及处于关闭状态的远程控制端口（端口号在 20000–32000 之间随机选取）。脚本不会启动服务。脚本安装最新版本；安装指定版本时，在 `sudo sh` 后加上 `-s -- --version <版本>`。
 
 读取配置的命令须以服务用户的身份、使用服务的数据目录执行：
 
@@ -91,34 +91,33 @@ sudo systemctl enable --now twcore         # 立即启动服务，并随系统�
 twc control-key                            # 标准输出是 ThinkWatch Lite 所需的密钥，地址和端口在标准错误
 ```
 
-要让其他机器上的客户端使用网关，在 `config.yaml` 中设置 `listen.gateway.bind: all`，并在 `listen.gateway.allow_from` 中列出它们所在的网段。上游可以写在 `providers` 下，也可以之后在 ThinkWatch Lite 中添加。在 ThinkWatch Lite 中打开 **设置 → 连接 → 添加远程连接**，填写服务器地址、控制端口和密钥。应用只连接与自身版本一致的 core，因此服务器与应用须一同升级：
+要让其他机器上的客户端使用网关，在 `config.yaml` 中设置 `listen.gateway.bind: all`，并在 `listen.gateway.allow_from` 中列出它们所在的网段。上游可以写在 `providers` 下，也可以之后在 ThinkWatch Lite 中添加。在 ThinkWatch Lite 中打开 **设置 → 连接 → 添加远程连接**，填写名称、服务器地址、控制端口和密钥。应用只连接控制面协议版本与自身相同的 core，因此服务器上运行的须是应用内置的 core 版本，它可能比最新版本旧。版本不一致时，应用显示双方的版本；`twcore upgrade --version` 可以把服务器切换到应用需要的版本，无论新旧：
 
 ```sh
+sudo twcore upgrade --version <版本> --restart   # 安装应用需要的版本并重启服务
 sudo twcore upgrade --check                      # 与最新 Release 比对，不做任何改动
 sudo twcore upgrade --restart                    # 安装最新 Release 并重启服务
-sudo twcore upgrade --version 0.47.0 --restart   # 安装指定版本
 ```
 
 两个端口都不使用 TLS：控制端口由握手完成加密和鉴权，网关端口以明文 HTTP 传输请求，因此两者都只应对可信网络开放。完整步骤见[在服务器上运行 core](docs/server.zh-CN.md)，包括 `/etc/thinkwatch/env` 中的密钥、网络暴露和卸载；`config.yaml` 的每个字段见[配置手册](docs/config.zh-CN.md)。
 
 ## crate 分层
 
-工作区共有十六个 crate，分为两层；`twcore` 二进制位于 `bin/twcore`。
+工作区共有十六个 crate，`twcore` 二进制位于 `bin/twcore`。这些 crate 分为两部分：ThinkWatch 企业版依赖的三个 crate，以及 `twcore` 所运行网关的其余 crate（ThinkWatch 企业版不使用）。第二部分再按职责分组。任何 crate 都不依赖排在其所在组下方的组。
 
-| 层 | crate |
+| 分组 | crate |
 |---|---|
 | 与 ThinkWatch 企业版共用 | `tw-dialect` · `tw-guard` · `tw-breaker` |
 | 领域逻辑 | `tw-types` · `tw-engine` · `tw-pricing` · `tw-yaml` · `tw-secret` · `tw-watch` |
+| 控制面契约 | `tw-api` · `tw-link` |
 | 装配 | `tw-config` · `tw-store` · `tw-observe` |
-| 数据面与控制面 | `tw-gateway` · `tw-control` · `tw-api` · `tw-link` |
+| 数据面与控制面 | `tw-gateway` · `tw-control` |
 
-第一行是共用层；其余各行组成第二层，即网关本身。
-
-ThinkWatch 企业版只依赖共用层的这三个 crate：格式转换与用量解析（`tw-dialect`），脱敏、工具调用审查及其他防护（`tw-guard`），以及熔断状态机（`tw-breaker`）。这三个 crate 只相互依赖，由测试保证；CI 会针对它们的每一次改动检查 ThinkWatch 企业版能否编译。只有一方使用的组件放在那一方的仓库中。
+ThinkWatch 企业版只依赖第一组，不依赖其他 crate：格式转换与用量解析（`tw-dialect`），脱敏、工具调用审查及其他防护（`tw-guard`），以及熔断状态机（`tw-breaker`）。这三个 crate 只相互依赖，由测试保证；CI 会针对它们的每一次改动检查 ThinkWatch 企业版能否编译。只有一方使用的组件放在那一方的仓库中。
 
 ThinkWatch Lite 把 `tw-api`、`tw-types`、`tw-yaml`、`tw-guard`、`tw-watch` 和 `tw-link` 固定在某个 Release 的 tag 上，并打包同一 Release 的 `twcore`。接管 AI 客户端（把其配置指向网关）、编辑其 MCP 服务器和扫描其配置文件都在 ThinkWatch Lite 中完成：这些操作修改的是应用所在机器上的文件，而这台机器不一定运行着 `twcore`。`twcore` 只负责为每个客户端签发专用的网关密钥。
 
-第二层实现的是单个 `twcore` 进程：请求记录保存在 SQLite 中，配置保存在一个 YAML 文件中，控制面经本机通道或远程控制端口访问。这一层有意不共用：ThinkWatch 企业版是多租户的，其状态保存在 PostgreSQL、Redis 和 ClickHouse 中，两种设计差异很大，用一个抽象同时覆盖两者，对双方都不合适。
+最后两组实现的是单个 `twcore` 进程：请求记录保存在 SQLite 中，配置保存在一个 YAML 文件中，控制面经本机通道或远程控制端口访问。这两组有意不共用：ThinkWatch 企业版是多租户的，其状态保存在 PostgreSQL、Redis 和 ClickHouse 中，两种设计差异很大，用一个抽象同时覆盖两者，对双方都不合适。
 
 ## 控制面
 
