@@ -1,4 +1,4 @@
-//! ChatGPT 账号：浏览器登录、用量、额度重置卡、删除时吊销。
+//! ChatGPT 账号：浏览器登录、登的是谁、用量、额度重置卡、删除时吊销。
 //!
 //! **全程只对本机的假 OpenAI**：登录页、token 端点、吊销接口和 ChatGPT 后端都是假的。
 //! 重置卡用掉就回不来，测试绝不能碰真实账号。
@@ -52,6 +52,33 @@ fn jwt(claims: Value) -> String {
     )
 }
 
+/// OpenAI 发的 access token 的样子：账户、套餐在 auth 那一块，邮箱在 profile 那一块，
+/// 顶层没有 `email`。**全是编的**，没有一个真令牌
+fn access_token(plan: &str) -> String {
+    jwt(json!({
+        "aud": ["https://api.openai.com/v1"],
+        "client_id": CLIENT_ID,
+        "exp": 4_000_000_000u64,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-1",
+            "chatgpt_user_id": "user-1",
+            "chatgpt_plan_type": plan
+        },
+        "https://api.openai.com/profile": {"email": "someone@example.com", "email_verified": true},
+        "sub": "auth0|someone"
+    }))
+}
+
+/// 登录换来的 access token
+fn at_login() -> String {
+    access_token("plus")
+}
+
+/// 刷新换来的：这期间账号升级了套餐
+fn at_refreshed() -> String {
+    access_token("pro")
+}
+
 async fn token(
     State(o): State<Arc<OpenAi>>,
     headers: HeaderMap,
@@ -96,7 +123,7 @@ async fn token(
     }
     if refresh {
         return axum::Json(json!({
-            "access_token": "at-refreshed",
+            "access_token": at_refreshed(),
             "refresh_token": "rt-rotated",
             "expires_in": 864000
         }))
@@ -107,7 +134,7 @@ async fn token(
             "email": "someone@example.com",
             "https://api.openai.com/auth": {"chatgpt_account_id": "acct-1", "chatgpt_plan_type": "plus"}
         })),
-        "access_token": "at-login",
+        "access_token": at_login(),
         "refresh_token": "rt-login",
         "expires_in": 864000
     }))
@@ -259,12 +286,17 @@ providers:
 
 /// 已经登录过的账号。access token 还有很久才过期，用它不用先换
 fn logged_in(name: &str, e: &Endpoints, refresh: &str) -> String {
+    logged_in_with(name, e, refresh, "at-cfg")
+}
+
+/// 同上，配置里写着的 access token 是 `access`
+fn logged_in_with(name: &str, e: &Endpoints, refresh: &str, access: &str) -> String {
     format!(
         "  - name: {name}
     base_url: {backend}
     protocol: chatgpt
     oauth:
-      access: at-cfg
+      access: {access}
       expires_at: 2099-01-01T00:00:00Z
       refresh: {refresh}
       endpoint: {token}
@@ -280,6 +312,7 @@ fn logged_in(name: &str, e: &Endpoints, refresh: &str) -> String {
 struct Bed {
     dir: tempfile::TempDir,
     app: axum::Router,
+    state: ControlState,
     events: tokio::sync::broadcast::Receiver<tw_api::Event>,
     openai: Arc<OpenAi>,
     endpoints: Endpoints,
@@ -288,6 +321,28 @@ struct Bed {
 impl Bed {
     fn file(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("config.yaml")).unwrap()
+    }
+    /// 重启：同一份配置文件、同一个假 OpenAI，内存里的一切（缓存的令牌、额度）从头来
+    fn restart(self) -> Bed {
+        let Bed {
+            dir,
+            openai,
+            endpoints,
+            ..
+        } = self;
+        open(dir, openai, endpoints)
+    }
+    /// 概览里这个上游的 `oauth` 那一块
+    async fn oauth_view(&self, name: &str) -> Value {
+        let (st, v) = self.call("GET", "/overview", Value::Null).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("概览里没有 {name}：{v}"))["oauth"]
+            .clone()
     }
     fn provider(&self, name: &str) -> Option<tw_config::Provider> {
         tw_config::try_parse(&self.file())
@@ -344,9 +399,14 @@ async fn bed(extra: impl FnOnce(&Endpoints) -> String) -> Bed {
     let endpoints = start_openai(openai.clone()).await;
     let yaml = format!("{RELAY}{}", extra(&endpoints));
     let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("config.yaml"), &yaml).unwrap();
+    open(d, openai, endpoints)
+}
+
+/// 按目录里的 config.yaml 起一个控制面
+fn open(d: tempfile::TempDir, openai: Arc<OpenAi>, endpoints: Endpoints) -> Bed {
     let p = d.path().join("config.yaml");
-    std::fs::write(&p, &yaml).unwrap();
-    let cfg = tw_config::try_parse(&yaml).unwrap();
+    let cfg = tw_config::try_parse(&std::fs::read_to_string(&p).unwrap()).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
     let bus = gw.bus.clone();
     let events = bus.subscribe();
@@ -362,7 +422,8 @@ async fn bed(extra: impl FnOnce(&Endpoints) -> String) -> Bed {
         zai: Default::default(),
     };
     Bed {
-        app: tw_control::router(state),
+        app: tw_control::router(state.clone()),
+        state,
         dir: d,
         events,
         openai,
@@ -486,7 +547,7 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
     assert!(!b.file().contains("billing"), "{}", b.file());
     let o = p.oauth.as_ref().unwrap();
     assert_eq!(o.refresh, "rt-login");
-    assert_eq!(o.access.as_deref(), Some("at-login"));
+    assert_eq!(o.access.as_deref(), Some(at_login().as_str()));
     assert_eq!(o.endpoint, b.endpoints.token);
     assert_eq!(o.client_id.as_deref(), Some(CLIENT_ID));
     let expires = chrono::DateTime::parse_from_rfc3339(o.expires_at.as_deref().unwrap()).unwrap();
@@ -500,6 +561,12 @@ async fn a_browser_login_writes_the_account_into_the_config_and_hands_back_to_th
         "acct-1"
     );
     assert!(b.provider("relay").is_some(), "别的上游不动");
+
+    // 上游页马上就知道登的是谁：从刚写进配置的 access token 里读
+    assert_eq!(
+        b.oauth_view("chatgpt").await["account"],
+        json!({"email": "someone@example.com", "plan": "plus"})
+    );
 
     // 模型清单马上就去问，不等下一轮
     eventually("登录后获取模型清单", || {
@@ -620,13 +687,22 @@ async fn a_rejected_code_fails_the_login_and_leaves_the_config_alone() {
 
 #[tokio::test]
 async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
+    // 上一次登的是另一个账号
+    let before = jwt(json!({
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "free"},
+        "https://api.openai.com/profile": {"email": "before@example.com"}
+    }));
     let b = bed(|e| {
-        logged_in("chatgpt", e, "rt-old").replace(
+        logged_in_with("chatgpt", e, "rt-old", &before).replace(
             "    protocol: chatgpt\n",
             "    protocol: chatgpt\n    billing: free\n    models_only: [gpt-5.5]\n",
         )
     })
     .await;
+    assert_eq!(
+        b.oauth_view("chatgpt").await["account"],
+        json!({"email": "before@example.com", "plan": "free"})
+    );
     let s = start_login(&b, json!({"name": "chatgpt"})).await;
     let (_, page) = browser(&format!("{}?code=code-1&state={}", s.redirect_uri, s.state)).await;
     assert!(page.contains("Signed in to ChatGPT"), "{page}");
@@ -634,7 +710,7 @@ async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
     let o = p.oauth.as_ref().unwrap();
     assert_eq!(
         (o.refresh.as_str(), o.access.as_deref()),
-        ("rt-login", Some("at-login"))
+        ("rt-login", Some(at_login().as_str()))
     );
     assert_eq!(p.models_only.as_deref(), Some(&["gpt-5.5".to_string()][..]));
     assert_eq!(
@@ -646,6 +722,11 @@ async fn logging_in_again_replaces_the_credentials_and_keeps_the_settings() {
     assert_eq!(
         p.headers.get("chatgpt-account-id").unwrap().value.raw(),
         "acct-1"
+    );
+    // 换了账号，上游页上跟着换
+    assert_eq!(
+        b.oauth_view("chatgpt").await["account"],
+        json!({"email": "someone@example.com", "plan": "plus"})
     );
 }
 
@@ -831,7 +912,6 @@ async fn usage_shows_the_limits_without_personal_details() {
         .call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null)
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["plan"], "plus");
     assert_eq!(v["reset_credits"], 2);
     let windows = v["windows"].as_array().unwrap();
     assert_eq!(windows.len(), 1, "长度为 0 的窗口不算：{v}");
@@ -844,14 +924,12 @@ async fn usage_shows_the_limits_without_personal_details() {
         (now + 410_907_000 - 60_000..=now + 410_907_000).contains(&at),
         "{at} vs {now}"
     );
-    // 邮箱要给：账号不止一个时，它是用户分辨哪个是哪个的唯一一项
-    assert_eq!(v["email"], "someone@example.com");
-    // 用户 ID 和账户 ID 不给：界面读不出是谁，而它们一旦出去就会进日志
+    // 登的是谁不在这里（在上游视图里，从凭据读）；用户 ID 和账户 ID 更不给：界面读不出
+    // 是谁，而它们一旦出去就会进日志
     let text = v.to_string();
-    assert!(
-        !text.contains("user-1") && !text.contains("acct-1"),
-        "{text}"
-    );
+    for who in ["someone@example.com", "plus", "user-1", "acct-1"] {
+        assert!(!text.contains(who), "{text}");
+    }
 
     // 问来的额度就是这个上游的额度：冷启动之后界面不用等第一次请求
     let (_, q) = b.call("GET", "/quota", Value::Null).await;
@@ -890,7 +968,13 @@ async fn a_revoked_access_token_is_renewed_once_and_the_call_goes_through() {
         .iter()
         .map(|(_, h)| h["authorization"].to_str().unwrap().to_string())
         .collect();
-    assert_eq!(auth, ["Bearer at-cfg", "Bearer at-refreshed"]);
+    assert_eq!(
+        auth,
+        [
+            "Bearer at-cfg".to_string(),
+            format!("Bearer {}", at_refreshed())
+        ]
+    );
     let forms = b.openai.token_forms.lock().unwrap();
     assert_eq!(forms.len(), 1);
     assert_eq!(forms[0]["grant_type"], "refresh_token");
@@ -976,6 +1060,98 @@ async fn reset_credits_are_listed_and_used_only_when_asked() {
     let seen = b.openai.backend.lock().unwrap();
     let (_, h) = seen.last().unwrap();
     assert_eq!(h.get("originator").unwrap(), "thinkwatch");
+}
+
+// ---------------------------------------------------------------- 登的是谁
+
+#[tokio::test]
+async fn who_is_signed_in_is_read_from_the_stored_credential_without_asking_anyone() {
+    let access = at_login();
+    let b = bed(|e| {
+        // 别家的 OAuth 上游，令牌里碰巧也有邮箱
+        let sso = format!(
+            "  - name: company-sso
+    base_url: https://llm.example
+    protocol: openai-chat
+    oauth:
+      access: {}
+      refresh: rt-sso
+      endpoint: {}
+",
+            jwt(json!({"email": "worker@example.com"})),
+            e.token
+        );
+        format!(
+            "{}{}{sso}",
+            logged_in_with("chatgpt", e, "rt-cfg", &access),
+            logged_in("opaque", e, "rt-opaque")
+        )
+    })
+    .await;
+
+    // 邮箱和套餐，别的都不带（账户 ID、用户 ID 同在令牌里）
+    let o = b.oauth_view("chatgpt").await;
+    assert_eq!(
+        o["account"],
+        json!({"email": "someone@example.com", "plan": "plus"})
+    );
+    // 令牌本身不出这个进程
+    let (_, all) = b.call("GET", "/overview", Value::Null).await;
+    let text = all.to_string();
+    for secret in [access.as_str(), "rt-cfg", "rt-sso", "rt-opaque"] {
+        assert!(!text.contains(secret), "{secret} 出现在概览里");
+    }
+    // 不是 ChatGPT 账号：套餐这个说法对它不成立，令牌里有邮箱也不读
+    let sso = b.oauth_view("company-sso").await;
+    assert!(sso.get("account").is_none(), "{sso}");
+    // 令牌里什么都读不出来：没有这一块，而不是一块空的
+    let opaque = b.oauth_view("opaque").await;
+    assert!(opaque.get("account").is_none(), "{opaque}");
+
+    // 全是从本机读的：token 端点和后端一次都没被问过
+    assert!(b.openai.token_forms.lock().unwrap().is_empty());
+    assert!(b.openai.backend.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_renewed_token_moves_the_account_along_and_survives_a_restart() {
+    let b = bed(|e| logged_in_with("chatgpt", e, "rt-cfg", &at_login())).await;
+    tw_control::rotation::spawn(b.state.clone());
+    assert_eq!(b.oauth_view("chatgpt").await["account"]["plan"], "plus");
+
+    // 后端不再认配置里的那个 access token：换一个。换回来的令牌说套餐已经是 pro
+    *b.openai.reject_access.lock().unwrap() = Some(at_login());
+    let (st, v) = b
+        .call("GET", "/providers/chatgpt/chatgpt/usage", Value::Null)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.openai.token_forms.lock().unwrap().len(), 1);
+    assert_eq!(
+        b.oauth_view("chatgpt").await["account"],
+        json!({"email": "someone@example.com", "plan": "pro"})
+    );
+
+    // 新令牌写回了配置。重启之后内存里什么都没有，还是从配置里的令牌读出同一个账号
+    eventually("新的 access token 写回配置", || {
+        b.provider("chatgpt")
+            .and_then(|p| p.oauth)
+            .and_then(|o| o.access)
+            == Some(at_refreshed())
+    })
+    .await;
+    let asked = |b: &Bed| {
+        (
+            b.openai.token_forms.lock().unwrap().len(),
+            b.openai.backend.lock().unwrap().len(),
+        )
+    };
+    let before = asked(&b);
+    let b = b.restart();
+    assert_eq!(
+        b.oauth_view("chatgpt").await["account"],
+        json!({"email": "someone@example.com", "plan": "pro"})
+    );
+    assert_eq!(asked(&b), before, "读账号不该联网");
 }
 
 // ---------------------------------------------------------------- 删除时吊销
