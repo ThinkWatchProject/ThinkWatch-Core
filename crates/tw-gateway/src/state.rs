@@ -204,6 +204,9 @@ pub struct AppState {
     pub live: crate::live::Live,
     /// 每段对话此刻归到哪一次会话（见 [`crate::session::Sessions`]）。**跨重载存活**
     pub sessions: Arc<crate::session::Sessions>,
+    /// Anthropic 流里上游静默多久就补一个 `ping`（见 `relay`）。**测试会把它调短**，
+    /// 否则一条心跳的测试要干等十五秒
+    pub ping_every: std::time::Duration,
 }
 
 impl AppState {
@@ -252,6 +255,7 @@ impl AppState {
             proxies: Arc::new(std::sync::Mutex::new(Default::default())),
             live: crate::live::Live::default(),
             sessions: Default::default(),
+            ping_every: crate::PING_EVERY,
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();

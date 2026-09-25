@@ -89,6 +89,12 @@ pub(super) fn respond(
     let mut relay = Relay::new(state, rt, req, plan, &ledger, session, provider, id);
     let chunks = upstream.bytes_stream();
     let dialect = req.dialect;
+    // 上游静默时补心跳：**只给 Anthropic Messages 的流**。那是客户端按字节计时、
+    // 认得 `ping` 事件的格式；别的格式没有这个事件，塞进去就是一帧解析不了的东西
+    let ping_every = (req.api == Some(crate::client_api::ClientApi::AnthropicMessages)
+        && plan.client_sse
+        && status.is_success())
+    .then_some(state.ping_every);
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
@@ -98,7 +104,24 @@ pub(super) fn respond(
         let mut ending = ending;
         let mut chunks = std::pin::pin!(chunks);
         let mut broke: Option<GatewayError> = None;
-        while let Some(item) = chunks.next().await {
+        loop {
+            let next = match ping_every {
+                None => chunks.next().await,
+                // `next()` 被超时丢掉不丢数据：它只是去问一次流，没拿走任何东西
+                Some(every) => match tokio::time::timeout(every, chunks.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        // **不经过留档、计量和审查**：心跳不是上游说的话，不进请求记录，
+                        // 也不算输出。**只在帧的边界上插**，上游停在一帧中间时插进去
+                        // 会把那一帧拆坏 —— 那时宁可不补
+                        if relay.between_frames() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(PING));
+                        }
+                        continue;
+                    }
+                },
+            };
+            let Some(item) = next else { break };
             match item {
                 Ok(chunk) => {
                     // **旁路嗅探和留档，不缓冲**：字节照常流向客户端，同时
@@ -160,6 +183,9 @@ pub(super) fn respond(
     *resp.headers_mut() = out_headers;
     resp
 }
+
+/// Anthropic 的心跳帧，和它自己的 API 发的一样。
+const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
 
 /// 响应头到手时就定下的处理方式。
 #[derive(Clone, Copy)]
@@ -317,6 +343,8 @@ struct Relay {
     /// **切断时要把数组收好**（见 [`Relay::error_tail`]）
     array_opened: bool,
     array_element: bool,
+    /// 发给客户端的最后一段停在帧的边界上（或者还什么都没发）。心跳只能插在这里
+    at_boundary: bool,
     bus: tw_observe::EventBus,
     id: u64,
     provider: String,
@@ -396,6 +424,7 @@ impl Relay {
             client_dialect,
             array_opened: false,
             array_element: false,
+            at_boundary: true,
             bus: state.bus.clone(),
             id,
             provider: provider.name.clone(),
@@ -601,9 +630,13 @@ impl Relay {
         (tail, None)
     }
 
-    /// 记下发给客户端的这一段。**只有直通的 JSON 数组流要记**：切断的位置总在元素
-    /// 边界上（分隔符算在后面那个元素上），所以只要知道 `[` 之后有没有过 `{`
+    /// 记下发给客户端的这一段：停没停在帧的边界上（心跳要看）。直通的 JSON 数组流
+    /// 还要记数组发到哪儿了：切断的位置总在元素边界上（分隔符算在后面那个元素上），
+    /// 所以只要知道 `[` 之后有没有过 `{`
     fn sent(&mut self, out: &[u8]) {
+        if !out.is_empty() {
+            self.at_boundary = out.ends_with(b"\n\n") || out.ends_with(b"\r\n\r\n");
+        }
         if !self.plan.client_json_stream || self.session.is_some() {
             return;
         }
@@ -617,6 +650,11 @@ impl Relay {
                 _ => {}
             }
         }
+    }
+
+    /// 现在插一帧会不会拆坏客户端正在收的那一帧。
+    fn between_frames(&self) -> bool {
+        self.at_boundary
     }
 
     /// 流断了之后还能对客户端说的最后一句：按它收到的格式收尾。
