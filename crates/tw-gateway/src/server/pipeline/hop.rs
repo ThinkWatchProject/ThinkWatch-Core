@@ -347,8 +347,9 @@ fn prepare(
     let client_dialect = req.api.map(|a| a.dialect());
     let target = crate::translate::plan(req.api, generates, provider.effective_protocol());
     let chatgpt = generates && provider.effective_protocol() == Some(tw_config::Protocol::Chatgpt);
-    // DeepSeek Harness 的扩展只有 DeepSeek 官方认。**发给它时一个字节都不改**
-    let harness = generates && reading.harness.is_some();
+    // DeepSeek Harness 的扩展只有 DeepSeek 官方认。**发给它时一个字节都不改**。
+    // 不止生成请求：数 token 这样的请求一样带着它的头，也可能带着会话日志
+    let harness = reading.harness.is_some();
     let to_deepseek = tw_dialect::official::is_deepseek_host(&provider.base_url);
     let mut path = req.uri.path().to_string();
     let mut query = req.query.clone();
@@ -525,11 +526,17 @@ async fn send(
     // DeepSeek Harness 发给别家：它自己的头不转发；直通时 `anthropic-beta` 去掉对话中途
     // 增删工具那一项（那些块已经去掉了），剩下的照发
     let harness = out.harness_elsewhere;
-    let beta = headers
-        .get("anthropic-beta")
-        .filter(|_| harness && target.is_none())
-        .and_then(|v| v.to_str().ok())
-        .and_then(tw_dialect::harness::anthropic_beta);
+    // 分几行发的也要都看：下面一律不转发原来的，只转发这一份
+    let beta = (harness && target.is_none())
+        .then(|| {
+            headers
+                .get_all("anthropic-beta")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .and_then(|v| tw_dialect::harness::anthropic_beta(&v));
     let build = |upstream_headers: &[(String, String)]| {
         let mut req = http.request(method.clone(), &url);
         req = forward::forward_headers_filtered(req, headers, |n| {
