@@ -243,8 +243,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Bind,
                     Def::Is("loopback"),
                     t(
-                        "`loopback` is this machine only; `all` is every interface; an interface name (`en0`, `eth0`) is looked up at start and follows address changes; a fixed IP address stops working when the address changes. Binding one interface also listens on 127.0.0.1.",
-                        "`loopback` 只有本机；`all` 所有网卡；网卡名（`en0`、`eth0`）在启动时解析，地址变了也能跟上；写死的 IP 地址在地址变化后失效。绑定单张网卡时同时监听 127.0.0.1。",
+                        "`loopback` is this machine only; `all` is every interface; an interface name (`en0`, `eth0`) is looked up again every few seconds and follows address changes, and while the interface is not there the gateway listens on 127.0.0.1 only and adds it once it appears; a fixed IP address stops working when the address changes. Binding one interface also listens on 127.0.0.1.",
+                        "`loopback` 只有本机；`all` 所有网卡；网卡名（`en0`、`eth0`）每隔几秒重新解析，地址变了也能跟上，网卡暂时不在时先只监听 127.0.0.1，出现后再补上；写死的 IP 地址在地址变化后失效。绑定单张网卡时同时监听 127.0.0.1。",
                     ),
                 ),
                 row(

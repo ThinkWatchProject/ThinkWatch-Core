@@ -180,7 +180,7 @@ clients send requests to, and the control channel the desktop app and
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `bind` | `loopback` \| `all` \| interface name \| IP address | `loopback` | `loopback` is this machine only; `all` is every interface; an interface name (`en0`, `eth0`) is looked up at start and follows address changes; a fixed IP address stops working when the address changes. Binding one interface also listens on 127.0.0.1. |
+| `bind` | `loopback` \| `all` \| interface name \| IP address | `loopback` | `loopback` is this machine only; `all` is every interface; an interface name (`en0`, `eth0`) is looked up again every few seconds and follows address changes, and while the interface is not there the gateway listens on 127.0.0.1 only and adds it once it appears; a fixed IP address stops working when the address changes. Binding one interface also listens on 127.0.0.1. |
 | `port` | integer | `8788` | TCP port of the gateway. |
 | `allow_from` | list of strings | `[10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7]` | Sources other than this machine that may connect, as CIDR ranges or single addresses. This machine is always allowed. `[]` means this machine only; `0.0.0.0/0` allows everyone and has to be written out. |
 <!-- /generated -->

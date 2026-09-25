@@ -532,7 +532,7 @@ async fn changing_the_port_actually_moves_the_listener() {
 /// 起一个跟着配置走的网关，等它绑上。
 async fn following(state: &tw_gateway::AppState, c: &Config) {
     let s = state.clone();
-    let want = c.listen.gateway.addrs().unwrap();
+    let want = c.listen.gateway.clone();
     tokio::spawn(async move { tw_gateway::serve_at(s, want, true).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(80)).await;
 }
@@ -809,4 +809,142 @@ async fn when_the_new_address_is_really_taken_the_old_one_is_taken_back() {
     let gw: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     assert!(ask(gw).await.contains("\"a\""), "旧的地址不该停");
     drop(squatter);
+}
+
+/// 起一个网关，**起始那一次绑定不许失败**：等它交回监听状态。
+async fn started(state: &tw_gateway::AppState, c: &Config) -> tw_gateway::Listening {
+    let s = state.clone();
+    let listen = c.listen.gateway.clone();
+    let serving = tokio::spawn(async move { tw_gateway::serve_at(s, listen, true).await });
+    for _ in 0..100 {
+        assert!(
+            !serving.is_finished(),
+            "the gateway gave up: {:?}",
+            serving.await
+        );
+        let now = state.listening();
+        if !now.addrs.is_empty() {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the gateway never started listening");
+}
+
+#[tokio::test]
+async fn an_interface_that_is_not_there_yet_does_not_stop_the_gateway_from_starting() {
+    // **开机自启时 WSL 还没起来**，它的虚拟网卡也就还不在。以前这一步让 twcore
+    // 直接退出，这台电脑上的客户端跟着全部连不上；现在先只听回环，网卡出现了
+    // 再补上
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    let port = spare_port();
+    c.listen.gateway.port = port;
+    c.listen.gateway.bind = bind("tw-not-here0");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    let now = started(&state, &c).await;
+
+    let lo: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    assert_eq!(now.addrs, [lo]);
+    assert_eq!(
+        now.error.as_ref().map(|m| m.code.as_str()),
+        Some("gw.listen.no_such_nic"),
+        "界面上要说清为什么只听了本机: {now:?}"
+    );
+    assert!(ask(lo).await.contains("\"a\""), "回环该照常服务");
+
+    // 换成一个解析得出来的设置：照常换过去，那句话也跟着消失
+    let mut next = c.clone();
+    next.listen.gateway.bind = bind("all");
+    let want = next.listen.gateway.addrs().unwrap();
+    state.reload(next).unwrap();
+    // `switch` 看见错误就回来，而这时错误本来就在：等地址换过去
+    for _ in 0..100 {
+        if state.listening().addrs == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let now = state.listening();
+    assert_eq!(now.addrs, want, "{now:?}");
+    assert_eq!(now.error, None, "{now:?}");
+    assert!(ask(lo).await.contains("\"a\""));
+}
+
+#[tokio::test]
+async fn an_address_that_is_not_on_this_machine_yet_does_not_stop_the_gateway_from_starting() {
+    // 写死的地址此刻不是这台机器的（网卡还没拿到它）：和网卡不在一样，先只听
+    // 回环。198.51.100.1 是文档专用的地址段，哪台机器上都不会有
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    let port = spare_port();
+    c.listen.gateway.port = port;
+    c.listen.gateway.bind = bind("198.51.100.1");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    let now = started(&state, &c).await;
+
+    let lo: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    assert_eq!(now.addrs, [lo]);
+    assert_eq!(
+        now.error.as_ref().map(|m| m.code.as_str()),
+        Some("gw.listen.addr_unavailable"),
+        "{now:?}"
+    );
+    assert!(ask(lo).await.contains("\"a\""));
+}
+
+#[tokio::test]
+async fn a_taken_loopback_port_still_stops_the_gateway_from_starting() {
+    // 回环那一个绑不上不是「还没出现」：端口被占，照旧交给调用方，守护进程
+    // 据此重启或进安全模式
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    c.listen.gateway.port = port;
+    c.listen.gateway.bind = bind("tw-not-here0");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        tw_gateway::serve_at(state, c.listen.gateway.clone(), true),
+    )
+    .await
+    .expect("serve_at should give up rather than wait");
+    assert_eq!(
+        r.unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse,
+        "端口被占要照旧报出来"
+    );
+}
+
+#[tokio::test]
+async fn a_new_port_takes_effect_on_loopback_while_the_interface_is_still_missing() {
+    // 网卡还没出现、只在听回环时改了端口：没有什么正在工作的要守，回环换到
+    // 新端口上，网卡那一个照旧等它出现
+    let (up, _) = counting_upstream("a").await;
+    let mut c = cfg(vec![provider("a", up)], vec![]);
+    c.listen.gateway.port = spare_port();
+    c.listen.gateway.bind = bind("tw-not-here0");
+    let state = tw_gateway::AppState::new(c.clone()).unwrap();
+    started(&state, &c).await;
+
+    let p2 = spare_port();
+    let lo2: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
+    let mut next = c.clone();
+    next.listen.gateway.port = p2;
+    state.reload(next).unwrap();
+    for _ in 0..100 {
+        if state.listening().addrs == [lo2] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let now = state.listening();
+    assert_eq!(now.addrs, [lo2], "{now:?}");
+    assert_eq!(
+        now.error.as_ref().map(|m| m.code.as_str()),
+        Some("gw.listen.no_such_nic"),
+        "{now:?}"
+    );
+    assert!(ask(lo2).await.contains("\"a\""));
 }
