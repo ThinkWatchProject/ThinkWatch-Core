@@ -267,6 +267,8 @@ async fn disabling_and_scoping_an_upstream_is_written_and_an_empty_scope_is_refu
         "/providers/relay",
         serde_json::json!({ "provider": {
             "name": "relay",
+            "base_url": format!("http://{up}"),
+            "key": "sk-good",
             "protocol": "anthropic",
             "models_only": ["claude-*"],
             "disabled": true,
@@ -289,6 +291,8 @@ async fn disabling_and_scoping_an_upstream_is_written_and_an_empty_scope_is_refu
         "/providers/relay",
         serde_json::json!({ "provider": {
             "name": "relay",
+            "base_url": format!("http://{up}"),
+            "key": "sk-good",
             "protocol": "anthropic",
             "models_only": [],
         }}),

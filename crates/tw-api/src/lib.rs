@@ -605,7 +605,16 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **额度撤下也有事件**：GLM 的 key 被判定没有套餐、core 清掉这一家的额度时，报一条
 /// `windows` 为空的 [`Event::QuotaSeen`]，界面当场收起那一格，不用等下一次读 `/quota`。
 /// 照 23 写的界面不知道空的 `QuotaSeen` 是撤下，还给一个再也不会来的 `monthly` 留着位置。
-pub const CONTROL_API_VERSION: u32 = 24;
+///
+/// **25 起上游和代理的设置原样给界面**：[`ProviderView`] 的地址、密钥、请求头值，
+/// [`OAuthView`] 的 refresh token 和 client secret，[`ProxyView::auth`] 的用户名和密码，
+/// 都是配置里写的样子，不再打码；`base_url_masked`、`SecretView`、`HeaderView.masked`、
+/// `ProxyView.has_auth` 删了。于是保存交的是整份定义：[`ProviderInput`] 的
+/// `base_url` 必给，`key` 不给就是没有密钥，每行请求头都带值，[`ProxyInput::auth`]
+/// 不给就是不需要认证 —— `SecretChange` 和 `ProxyAuthInput` 这两个「保持原样」都删了。
+/// 只有 OAuth 还能「保持原样」，见 [`OAuthChange::Keep`]。照 24 写的界面会去
+/// `key.display` 里找密钥，保存时不给地址会被拒。
+pub const CONTROL_API_VERSION: u32 = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1488,11 +1497,8 @@ pub struct PriceSheetView {
     pub used_by: Vec<String>,
 }
 
-/// 一个出站代理。
-///
-/// **密码不在这里。**`ProxyAuth.pass` 和上游的 key 是同一类东西 ——
-/// 这个视图会进日志、进诊断包、进用户贴出来的截图。有没有认证是要
-/// 显示的，认证内容不是。
+/// 一个出站代理，**认证原样给**：编辑对话框回填的就是它，密码由界面按需隐藏。
+/// 诊断包和日志里的代理另外打码，不用这个视图。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxyView {
@@ -1500,9 +1506,9 @@ pub struct ProxyView {
     /// `socks5h` / `socks5` / `http` / `https`
     pub kind: ProxyKind,
     pub addr: String,
-    /// 有没有认证。**用户名和密码都不在这里** —— 用户名是凭据的一半，
-    /// 而这个视图会进日志、进诊断包、进用户贴出来的截图
-    pub has_auth: bool,
+    /// 用户名和密码。不需要认证是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ProxyAuth>,
     /// 哪些上游在用它。删之前要知道，改名时它们会跟着改
     pub used_by: Vec<String>,
     /// 网关发现它不通了：经它转发的请求连不上之后检过一次，卡在哪一步、为什么。
@@ -1571,24 +1577,23 @@ pub struct SecurityView {
     pub output_limit: GuardMode,
 }
 
+/// 一个上游。**设置是配置里写的原样**，密钥也不打码：编辑对话框回填的就是它，
+/// 密钥由界面按需隐藏。`GET /config` 本来就给原文，这里打码挡不住什么，只让表单
+/// 回填不了。诊断包和日志里的上游另外打码，不用这个视图。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderView {
     pub name: String,
-    /// 已脱敏。**编辑时不要原样写回** —— 地址里带了凭据的话，写回去的
-    /// 是打过码的那一份。`base_url_masked` 告诉界面这一点
+    /// 配置里写的地址，原样
     pub base_url: String,
-    /// 地址里有被打码的部分（userinfo 之类）
-    pub base_url_masked: bool,
-    /// API 密钥：打过码的值，或者环境变量名。没有密钥是空
+    /// API 密钥，配置里写的原样：密钥本身，或者 `${NAME}`。没有密钥是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<SecretView>,
+    pub key: Option<String>,
     /// 密钥放在哪个请求头里发：`x-api-key` / `authorization` / `x-goog-api-key`
     pub auth_header: String,
-    /// 其余请求头，按配置里的顺序
+    /// 其余请求头，按配置里的顺序，值原样
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<HeaderView>,
-    /// OAuth 的 token 端点和 client id。**refresh token 和 client secret 永远不出这个进程**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthView>,
     /// 实际生效的协议：`anthropic` / `openai-chat` / `openai-responses` /
@@ -1643,35 +1648,25 @@ pub struct ProviderView {
     pub pricing: Option<String>,
 }
 
-/// 一个可能是密钥的值给界面看的样子。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecretView {
-    /// 打过码的值。带 `${NAME}` 的值原样给 —— 它写的是从哪个环境变量读
-    pub display: String,
-    /// 整个值恰好是一个 `${NAME}` 时的变量名。变量名不是秘密，编辑时要回填
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env: Option<String>,
-}
-
-/// 一行请求头给界面看的样子。
+/// 一行请求头，配置里写的原样。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HeaderView {
     pub name: String,
-    /// **可能是密钥的值是打过码的**；公开的头（`anthropic-version` 之类）、
-    /// 只由环境变量和占位符组成的值原样给
     pub value: String,
-    /// 值打过码。编辑时这一行不回填，留空表示保持原值
-    pub masked: bool,
 }
 
+/// OAuth 凭据，配置里写的原样。**access token 不在这里**：它由网关换发、写回，
+/// 界面拿到的那一把很快就过期。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct OAuthView {
     pub endpoint: String,
+    pub refresh: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
     /// access token 什么时候过期，RFC 3339。不知道就没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
@@ -2376,19 +2371,18 @@ pub struct ConfigWritten {
 ///
 /// **结构，不是 YAML。**以前界面拼一段 YAML 交给补丁接口 —— 拼字符串的
 /// 那一方不知道引号规则，一个带 `#` 的值就能写坏整份配置。
+///
+/// **整份定义就是保存之后的样子**：视图给的是原样的设置，界面回填、改完整份交回来。
+/// 只有 OAuth 能「保持原样」，见 [`OAuthChange::Keep`]。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderInput {
     pub name: String,
-    /// 修改时**不给就是保持原样**：视图里的地址是打过码的，原样写回去
-    /// 会把码写进配置
+    pub base_url: String,
+    /// API 密钥，可以写 `${NAME}` 从环境变量读。不给就是没有密钥
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    /// API 密钥。修改时默认保持原样 —— 界面拿不到原值，也不该拿到
-    #[serde(default)]
-    pub key: SecretChange,
-    /// 请求头，按顺序。**整张表就是保存之后的样子**：没列出来的行被删掉，
-    /// 某一行不给 `value` 表示沿用同名那一行的原值
+    pub key: Option<String>,
+    /// 请求头，按顺序。没列出来的行被删掉
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<HeaderInput>,
     /// OAuth。修改时默认保持原样
@@ -2511,33 +2505,22 @@ fn fail_closed() -> OnProxyFail {
     OnProxyFail::Fail
 }
 
-/// 一个密钥类的值怎么改。**三态**，因为视图里拿不到原值：不动就得有「保持原样」。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum SecretChange {
-    #[default]
-    Keep,
-    None,
-    /// 可以写 `${ENV}` 从环境变量读
-    Set {
-        value: String,
-    },
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HeaderInput {
     pub name: String,
-    /// 不给表示沿用同名那一行的原值
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    /// 可以写 `${NAME}`
+    pub value: String,
 }
 
+/// OAuth 凭据怎么改。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OAuthChange {
+    /// 保持原样，界面没改这几项时交它。**不能拿视图里的值交 `Set`**：网关随时会
+    /// 换发 token、把新的 refresh token 写回（服务端同时作废旧的），视图里的那把
+    /// 可能已经不能用了；access token 和过期时间视图里也没有
     #[default]
     Keep,
     None,
@@ -2570,7 +2553,8 @@ pub struct ProviderSave {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderTest {
     pub provider: ProviderInput,
-    /// 正在编辑的是哪一家。给了的话，表单里没改的凭据和地址从它那儿取
+    /// 正在编辑的是哪一家。OAuth 交的是 [`OAuthChange::Keep`] 时，按这个原来的名字
+    /// 向网关取 token —— 缓存和轮换写回都认名字，而表单里可能刚改了名
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
 }
@@ -2583,23 +2567,17 @@ pub struct ProxyInput {
     pub kind: ProxyKind,
     /// `host:port`
     pub addr: String,
-    pub auth: ProxyAuthInput,
+    /// 不给就是不需要认证
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ProxyAuth>,
 }
 
-/// 代理的认证怎么处理。
-///
-/// **三态**，因为视图里拿不到原来的用户名和密码：编辑时不动认证，就得有
-/// 一个「保持原样」的说法，而不是把空值当成「清掉」。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 代理的用户名和密码。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum ProxyAuthInput {
-    /// 保持原来的认证（新建时等同于不需要认证）
-    Keep,
-    /// 不需要认证
-    None,
-    /// 设成这一对
-    Set { user: String, pass: String },
+pub struct ProxyAuth {
+    pub user: String,
+    pub pass: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2615,6 +2593,7 @@ pub struct ProxySave {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProxyTest {
     pub proxy: ProxyInput,
+    /// 正在编辑的是哪一个。握手的目标取它原来服务的上游
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<String>,
 }
@@ -4518,7 +4497,9 @@ mod tests {
         );
         let mut o = OAuthView {
             endpoint: "https://auth.example/token".into(),
+            refresh: "rt".into(),
             client_id: None,
+            client_secret: None,
             expires_at: None,
             failure: None,
             needs_login: false,
