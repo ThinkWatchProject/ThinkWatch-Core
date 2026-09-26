@@ -597,7 +597,15 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 同一版起**记录说得出请求带没带 DeepSeek Harness 的会话日志**：`RequestStarted` 和
 /// [`HistoryRow`] 多了 `session_log_bytes`（`dsh_session_log` 的字节数，没带的没有）。
 /// 照 22 写的界面看不到它。
-pub const CONTROL_API_VERSION: u32 = 23;
+///
+/// **24 起 GLM 的额度不再数 MCP 工具的调用**：老套餐额度接口里 `TIME_LIMIT` 那一项数的是
+/// Z.ai 自家 MCP 工具（search-prime、web-reader、zread）的调用次数，这些调用不经过网关，
+/// core 不再读它 —— 窗口的词表里没有 `monthly` 了，模型请求上的 1310 只标 `weekly`，
+/// [`QuotaWindow::credits`] 只有积分制套餐（`CREDIT_LIMIT`）的窗口才有。同一版起
+/// **额度撤下也有事件**：GLM 的 key 被判定没有套餐、core 清掉这一家的额度时，报一条
+/// `windows` 为空的 [`Event::QuotaSeen`]，界面当场收起那一格，不用等下一次读 `/quota`。
+/// 照 23 写的界面不知道空的 `QuotaSeen` 是撤下，还给一个再也不会来的 `monthly` 留着位置。
+pub const CONTROL_API_VERSION: u32 = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1084,10 +1092,14 @@ pub enum Event {
         status: Option<u16>,
         at_ms: u64,
     },
-    /// 上游在响应头里报了订阅额度。
+    /// 一家上游的订阅额度：**这一家此刻的全部窗口**，收到就整个换掉，不和之前的合并。
     ///
-    /// **零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
-    /// 这些头，那时这个事件根本不会出现 —— 而不是报一个「用了 0%」。
+    /// 大多来自响应头，**零成本**：不发额外请求，顺着真实流量白捡。按量付费的账号没有
+    /// 这些头，那时这个事件根本不会出现 —— 而不是报一个「用了 0%」。GLM Coding Plan 和
+    /// ChatGPT 账号的额度也会去问账号的接口。
+    ///
+    /// **`windows` 是空的：这一家的额度撤下了**（GLM 的 key 被判定没有套餐）。之前报过的
+    /// 窗口都不再作数，`/quota` 里也没有它了 —— 那一格收起来，不是「用了 0%」。
     QuotaSeen {
         id: u64,
         provider: String,
@@ -1256,8 +1268,7 @@ pub struct RoutingView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct QuotaWindow {
-    /// `5h` / `7d`（Anthropic）/ `weekly`（Codex、GLM）/ `monthly`（GLM 老套餐每月的
-    /// MCP 调用次数）
+    /// `5h` / `7d`（Anthropic）/ `weekly`（Codex、GLM）
     pub window: String,
     pub used_percent: f64,
     /// 什么时候重置，Unix 毫秒。**是时刻，不是「还有多少秒」**：上游报的秒数
@@ -1267,12 +1278,15 @@ pub struct QuotaWindow {
     pub resets_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// 积分制套餐（GLM Coding Plan）这个窗口的积分。别的套餐没有
+    /// 这个窗口的积分。**只有 GLM Coding Plan 积分制套餐的窗口有**（额度接口里的
+    /// `CREDIT_LIMIT`）；按 token 算的老套餐、Anthropic、Codex 的窗口都没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<QuotaCredits>,
 }
 
-/// 一个额度窗口的积分，三个数都是上游给的原数。
+/// 积分制套餐一个额度窗口的积分：GLM Coding Plan 额度接口里 `CREDIT_LIMIT` 那一项的
+/// 总额（`usage`）、已用（`currentValue`）、剩余（`remaining`）。**只有这一种**，别的
+/// 窗口不带它。三个数都是上游给的原数。
 ///
 /// **剩余不是总额减已用算出来的**：上游给的三个数不一定对得上（实测总额 2000、已用 23、
 /// 剩余 1976），界面要显示剩余就显示它说的剩余。

@@ -78,7 +78,7 @@ impl AppState {
             };
             match &answer {
                 Answer::Quota(q) => state.record_quota(state.bus.next_id(), &p.name, q.clone()),
-                // 没有套餐就没有额度数据：之前记着的也不再作数
+                // 没有套餐就没有额度数据：之前记着的也不再作数，界面上的那一格马上收起
                 Answer::NoPlan => state.forget_quota(&p.name),
                 Answer::Rejected => {
                     tracing::warn!(provider = %p.name, "the GLM quota endpoint rejected the key")
@@ -144,7 +144,7 @@ impl AppState {
         let window = hit
             .window
             .map(str::to_string)
-            .unwrap_or_else(|| glm::guess_window(hit.code, &quota));
+            .unwrap_or_else(|| glm::guess_window(&quota));
         let known = quota
             .windows
             .iter()
@@ -263,6 +263,79 @@ mod tests {
         assert_eq!(w.resets_at_ms, Some(at));
         assert_eq!(w.used_percent, 100.0);
         assert!(w.rejected());
+    }
+
+    /// 1310 只标每周：消息里写着每月，已知额度里 5 小时用得更多，都一样
+    #[tokio::test]
+    async fn a_1310_marks_only_the_weekly_window() {
+        let s = state();
+        let window = |name: &str, used_percent: f64| crate::quota::Window {
+            window: name.into(),
+            used_percent,
+            resets_at_ms: None,
+            status: None,
+            credits: None,
+        };
+        s.record_quota(
+            1,
+            "glm",
+            crate::quota::Quota {
+                windows: vec![window("5h", 99.0), window("weekly", 40.0)],
+            },
+        );
+        let mut rx = s.bus.subscribe();
+        s.note_glm_exhausted(
+            2,
+            "glm",
+            br#"{"type":"error","error":{"type":"1310","message":"Monthly Limit Exhausted. Your limit will reset at 2099-10-06 10:00:00"}}"#,
+        );
+        let q = &s.quotas()["glm"];
+        let names: Vec<_> = q.windows.iter().map(|w| w.window.as_str()).collect();
+        assert_eq!(names, ["5h", "weekly"]);
+        let five = &q.windows[0];
+        assert_eq!(five.used_percent, 99.0);
+        assert!(!five.rejected());
+        let week = &q.windows[1];
+        assert_eq!(week.used_percent, 100.0);
+        assert!(week.rejected());
+
+        let mut exhausted = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if let tw_api::Event::QuotaExhausted { window, .. } = e {
+                exhausted.push(window);
+            }
+        }
+        assert_eq!(exhausted, ["weekly"]);
+    }
+
+    /// 判定没有套餐、记着的额度清掉了：**报一条窗口为空的 `QuotaSeen`**，界面当场收起。
+    /// 本来就没记着的，没有什么可收的，不报
+    #[tokio::test]
+    async fn forgetting_a_quota_tells_the_ui_with_an_empty_quota_seen() {
+        let s = state();
+        s.note_glm_exhausted(1, "glm", FIVE_HOURS);
+        let mut rx = s.bus.subscribe();
+        s.forget_quota("glm");
+        assert!(s.quotas().is_empty());
+        let seen: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                tw_api::Event::QuotaSeen {
+                    provider, windows, ..
+                } => Some((provider, windows)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen, [("glm".to_string(), vec![])]);
+
+        s.forget_quota("glm");
+        assert!(rx.try_recv().is_err(), "没记着的不报");
+
+        // 「用完」也不再作数：之后再用完，照样再报一次
+        s.note_glm_exhausted(2, "glm", FIVE_HOURS);
+        let exhausted = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e, tw_api::Event::QuotaExhausted { .. }))
+            .count();
+        assert_eq!(exhausted, 1);
     }
 
     #[tokio::test]
