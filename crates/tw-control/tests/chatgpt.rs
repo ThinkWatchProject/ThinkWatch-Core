@@ -1151,12 +1151,13 @@ async fn who_is_signed_in_is_read_from_the_stored_credential_without_asking_anyo
         o["account"],
         json!({"email": "someone@example.com", "plan": "plus"})
     );
-    // 令牌本身不出这个进程
+    // refresh token 是配置里写的，原样给；access token 由网关换发、写回，不在概览里
+    assert_eq!(o["refresh"], "rt-cfg");
     let (_, all) = b.call("GET", "/overview", Value::Null).await;
-    let text = all.to_string();
-    for secret in [access.as_str(), "rt-cfg", "rt-sso", "rt-opaque"] {
-        assert!(!text.contains(secret), "{secret} 出现在概览里");
-    }
+    assert!(
+        !all.to_string().contains(access.as_str()),
+        "access token 出现在概览里"
+    );
     // 不是 ChatGPT 账号：套餐这个说法对它不成立，令牌里有邮箱也不读
     let sso = b.oauth_view("company-sso").await;
     assert!(sso.get("account").is_none(), "{sso}");

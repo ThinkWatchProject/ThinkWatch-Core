@@ -313,9 +313,10 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 name: x.name.clone(),
                 kind: x.kind.into(),
                 addr: x.addr.clone(),
-                // **密码不出这个函数。**它和上游的 key 是同一类东西，
-                // 而这个视图会进日志、进诊断包、进用户贴出来的截图。
-                has_auth: x.auth.is_some(),
+                auth: x.auth.as_ref().map(|a| tw_api::ProxyAuth {
+                    user: a.user.clone(),
+                    pass: a.pass.raw().to_string(),
+                }),
                 used_by: tw_config::refs::proxy_users(cfg, &x.name),
                 unreachable: s.gateway.proxy_fault(&x.name),
             })
@@ -404,49 +405,33 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     })
 }
 
-/// 一行请求头给界面看的样子。
-///
-/// **不知道是不是密钥的，一律按密钥打码。**请求头名说明不了什么 ——
-/// `X-Relay-Token` 和 `X-Tenant` 看不出哪个是秘密。原样给的只有两类：已知
-/// 公开的头（`anthropic-version` 之类），和只由环境变量、占位符加上一个短前缀
-/// 组成的值（`Bearer ${RELAY_TOKEN}`）—— 那里面没有秘密可泄。
-fn header_view(h: &tw_config::Header) -> tw_api::HeaderView {
-    let raw = h.value.raw();
-    let masked = !(tw_secret::is_public_header(&h.name) || tw_secret::is_reference_only(raw));
-    tw_api::HeaderView {
-        name: h.name.clone(),
-        value: if masked {
-            tw_secret::mask_secret(raw)
-        } else {
-            raw.to_string()
-        },
-        masked,
-    }
-}
-
-/// 一个上游给界面看的样子。**任何一个字段都不带密钥原文。**
+/// 一个上游给界面看的样子：设置是配置里写的原样，见 [`tw_api::ProviderView`]。
 fn provider_view(
     s: &ControlState,
     cfg: &tw_config::Config,
     p: &tw_config::Provider,
 ) -> tw_api::ProviderView {
-    let base_url = tw_secret::redact_url(&p.base_url);
     let listing = s.gateway.models.listing(p);
     tw_api::ProviderView {
         name: p.name.clone(),
-        base_url_masked: base_url != p.base_url,
-        base_url,
-        key: p.key.as_ref().map(|k| tw_api::SecretView {
-            display: k.shown(),
-            env: k.env_var().map(str::to_string),
-        }),
+        base_url: p.base_url.clone(),
+        key: p.key.as_ref().map(|k| k.raw().to_string()),
         auth_header: p.auth_header().0.to_string(),
-        headers: p.headers.iter().map(header_view).collect(),
+        headers: p
+            .headers
+            .iter()
+            .map(|h| tw_api::HeaderView {
+                name: h.name.clone(),
+                value: h.value.raw().to_string(),
+            })
+            .collect(),
         oauth: p.oauth.as_ref().map(|o| {
             let failure = s.gateway.oauth.failure(&p.name, o);
             tw_api::OAuthView {
                 endpoint: o.endpoint.clone(),
+                refresh: o.refresh.clone(),
                 client_id: o.client_id.clone(),
+                client_secret: o.client_secret.clone(),
                 expires_at: o.expires_at.clone(),
                 needs_login: failure.as_ref().is_some_and(|(_, relogin)| *relogin),
                 failure: failure.map(|(why, _)| why),

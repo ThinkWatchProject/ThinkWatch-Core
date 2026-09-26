@@ -116,7 +116,6 @@ control.no_keys
 control.no_such_endpoint
 control.no_such_version
 control.not_a_chatgpt_account
-control.pass_has_expansion
 control.patch.no_entry
 control.patch.not_an_entry
 control.pricing.broke_off
