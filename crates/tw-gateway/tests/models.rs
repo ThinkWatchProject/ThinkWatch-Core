@@ -287,3 +287,102 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
     let msg = body["error"]["message"].as_str().unwrap();
     assert!(msg.contains("No upstream serves model"), "{msg}");
 }
+
+// ─────────────────────────────────────────────────────────── 改写模型
+
+/// 把请求交给 `to`、并把模型改写成 `model` 的一条规则。
+fn renaming(mut cfg: Config, to: &str, model: &str) -> Config {
+    cfg.routes = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
+        name: "改名".into(),
+        when: Default::default(),
+        to: Some(to.into()),
+        set: Some(tw_engine::SetAction {
+            model: Some(model.into()),
+            ..Default::default()
+        }),
+        deny: None,
+    }])];
+    cfg
+}
+
+#[tokio::test]
+async fn a_rule_that_renames_the_model_is_judged_by_the_name_it_sends() {
+    // 客户端只认 Claude 的名字（Claude Desktop 就是这样），上游是智谱：请求里的
+    // 名字哪一家的清单里都没有，改写后的才有。以前准入按请求里的名字拦，这条规则
+    // 永远用不上
+    let zhipu = upstream("zhipu", &["glm-5"]).await;
+    let cfg = renaming(config(vec![provider("zhipu", zhipu)]), "zhipu", "glm-5");
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    tw_gateway::models::refresh_all(&state).await;
+    let gw = serve(state).await;
+
+    let (status, body) = ask(gw, "claude-sonnet-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["by"], "zhipu");
+    assert_eq!(body["model"], "glm-5");
+}
+
+#[tokio::test]
+async fn a_rename_for_one_upstream_counts_for_that_upstream_only() {
+    // 阶段二的改写只在交给智谱时生效。官方停用了，组里只剩智谱：按请求里的名字，
+    // 它会被当成「没有这个模型」跳过
+    let official = upstream("official", &["claude-sonnet-4-5"]).await;
+    let zhipu = upstream("zhipu", &["glm-5"]).await;
+    let mut cfg = grouped(
+        config(vec![
+            provider("official", official),
+            provider("zhipu", zhipu),
+        ]),
+        &["official", "zhipu"],
+    );
+    cfg.routes[0].rules.insert(
+        0,
+        tw_engine::Rule {
+            name: "走智谱时改名".into(),
+            when: serde_yaml_ng::from_str("{ provider_would_be: zhipu }").unwrap(),
+            to: None,
+            set: Some(tw_engine::SetAction {
+                model: Some("glm-5".into()),
+                ..Default::default()
+            }),
+            deny: None,
+        },
+    );
+    cfg.providers[0].disabled = true;
+    let state = tw_gateway::AppState::new(cfg.clone()).unwrap();
+    tw_gateway::models::refresh_all(&state).await;
+    let gw = serve(state.clone()).await;
+
+    let (status, body) = ask(gw, "claude-sonnet-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["by"], "zhipu");
+    assert_eq!(body["model"], "glm-5");
+
+    // 官方回来了：它有这个名字，排在前面，照旧先给它，名字不改
+    cfg.providers[0].disabled = false;
+    state.reload(cfg).unwrap();
+    tw_gateway::models::refresh_all(&state).await;
+    let (status, body) = ask(gw, "claude-sonnet-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["by"], "official");
+    assert_eq!(body["model"], "claude-sonnet-4-5");
+}
+
+#[tokio::test]
+async fn a_rename_to_a_model_nobody_serves_says_both_names() {
+    let zhipu = upstream("zhipu", &["glm-5"]).await;
+    let cfg = renaming(config(vec![provider("zhipu", zhipu)]), "zhipu", "glm-9");
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    tw_gateway::models::refresh_all(&state).await;
+    let gw = serve(state).await;
+
+    let (status, body) = ask(gw, "claude-sonnet-4-5").await;
+    assert_eq!(status, 400, "{body}");
+    let msg = body["error"]["message"].as_str().unwrap();
+    // 客户端写的是一个名字，报错说的是另一个：两个都要说出来
+    assert!(
+        msg.contains("rewrote model claude-sonnet-4-5 to glm-9")
+            && msg.contains("no upstream serves glm-9"),
+        "{msg}"
+    );
+}

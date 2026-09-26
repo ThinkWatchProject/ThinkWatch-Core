@@ -319,17 +319,24 @@ impl AppState {
     /// `cheapest` 排序用的单价：每家跑这个模型的 (输入, 输出)，微分/百万 token。
     ///
     /// **路由和预演共用这一个** —— 各写一份的话，预演说会选 A，实际选的是 B。
+    ///
+    /// 每一家按它要的模型比（`asked`，见 [`tw_engine::Engine::models_asked`]）：
+    /// 一条按上游改写模型的规则，让同一个请求在两家要的是两个模型。
     pub fn unit_prices(
         &self,
         providers: &[tw_config::Provider],
+        asked: &[(String, String)],
         candidates: &[String],
-        model: &str,
     ) -> std::collections::HashMap<String, (i64, i64)> {
         let book = self.pricing.load();
         candidates
             .iter()
             .filter_map(|name| {
                 let p = providers.iter().find(|p| &p.name == name)?;
+                let model = asked
+                    .iter()
+                    .find(|(c, _)| c == name)
+                    .map_or("", |(_, m)| m.as_str());
                 // **不计费的就是最便宜的**；其余按它所选的价目表比，订阅账号
                 // 也一样。价目表里没有这个模型的不是「免费」 —— 排到最后去
                 match p.billing {
