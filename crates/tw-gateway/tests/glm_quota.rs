@@ -135,6 +135,41 @@ async fn a_key_without_a_plan_has_no_quota_and_is_not_asked_again_soon() {
     assert_eq!(g.asked.lock().unwrap().len(), 1);
 }
 
+/// 判定没有套餐、清掉了记着的额度：**当场报一条窗口为空的 `QuotaSeen`**，界面不用等
+/// 下一次读 `/quota` 才收起那一格。这里是 key 换成了一把没开通套餐的
+#[tokio::test]
+async fn a_key_found_to_have_no_plan_takes_its_quota_down_at_once() {
+    let g = Arc::new(Glm::default());
+    *g.quota.lock().unwrap() = credit_plan(now_ms());
+    let state = state_for(start_glm(g.clone()).await).await;
+    state.refresh_glm_quotas(Duration::from_secs(5)).await;
+    assert_eq!(state.quotas()["glm"].windows.len(), 2);
+
+    *g.quota.lock().unwrap() =
+        r#"{"code":500,"msg":"当前用户不存在coding plan","success":false}"#.into();
+    let mut cfg = (*state.config()).clone();
+    cfg.providers[0].key = Some("another-fake-glm-key".into());
+    state.reload(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    state.refresh_glm_quotas(Duration::from_secs(5)).await;
+
+    assert!(state.quotas().is_empty());
+    let windows = loop {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Ok(tw_api::Event::QuotaSeen {
+                provider, windows, ..
+            })) if provider == "glm" => break windows,
+            Ok(Ok(_)) => continue,
+            other => panic!("没等到撤下额度的事件：{other:?}"),
+        }
+    };
+    assert!(windows.is_empty(), "{windows:?}");
+    assert_eq!(
+        *g.asked.lock().unwrap(),
+        ["fake-glm-key", "another-fake-glm-key"]
+    );
+}
+
 #[tokio::test]
 async fn a_used_up_quota_in_a_429_is_reported_and_the_quota_is_asked() {
     let g = Arc::new(Glm::default());

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// 一个额度窗口的状态。**每个字段都直接来自上游（响应头或额度接口），没有一个是推算的。**
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
-    /// 哪个窗口：`5h` / `7d`（Anthropic）/ `weekly`（Codex、GLM）/ `monthly`（GLM）
+    /// 哪个窗口：`5h` / `7d`（Anthropic）/ `weekly`（Codex、GLM）
     pub window: String,
     /// 用了百分之多少。0–100
     pub used_percent: f64,
@@ -39,7 +39,7 @@ pub struct Window {
     /// `allowed` / `allowed_warning` / `rejected`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// 积分制套餐的积分（GLM Coding Plan）
+    /// 积分制套餐的积分（GLM Coding Plan 的 `CREDIT_LIMIT`）。别的窗口都没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<tw_api::QuotaCredits>,
 }

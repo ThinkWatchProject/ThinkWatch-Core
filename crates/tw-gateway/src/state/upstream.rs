@@ -266,13 +266,26 @@ impl AppState {
         }
     }
 
-    /// 这一家没有额度数据了（比如 key 没有开通套餐）：记着的额度和「用完」都不再作数
+    /// 这一家没有额度数据了（比如 key 没有开通套餐）：记着的额度和「用完」都不再作数。
+    ///
+    /// 记着的话，**报一条窗口为空的 `QuotaSeen`**：界面照着这个事件换上这一家的额度，
+    /// 空的就是没有了，当场收起，不用等下一次读 `/quota`。本来就没记着的不报
     pub(crate) fn forget_quota(&self, provider: &str) {
-        if let Ok(mut g) = self.quotas.lock() {
-            g.remove(provider);
-        }
+        let had = self
+            .quotas
+            .lock()
+            .map(|mut g| g.remove(provider).is_some())
+            .unwrap_or(false);
         if let Ok(mut g) = self.exhausted.lock() {
             g.retain(|(p, _)| p != provider);
+        }
+        if had {
+            self.bus.emit(tw_api::Event::QuotaSeen {
+                id: self.bus.next_id(),
+                provider: provider.to_string(),
+                windows: Vec::new(),
+                at_ms: now_ms(),
+            });
         }
     }
 
