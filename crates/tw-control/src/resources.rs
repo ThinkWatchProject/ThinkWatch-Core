@@ -316,42 +316,32 @@ fn to_provider(
     existing: Option<&tw_config::Provider>,
 ) -> Result<tw_config::Provider, Msg> {
     let name = checked_name(&input.name, "upstream")?;
-    let base_url = match (&input.base_url, existing) {
-        (Some(u), _) => u.trim().to_string(),
-        (None, Some(e)) => e.base_url.clone(),
-        (None, None) => {
-            return Err(msg!(
-                "control.base_url_empty" => "The endpoint address cannot be empty."
-            ));
-        }
-    };
-    let key = match (&input.key, existing) {
-        (tw_api::SecretChange::Keep, Some(e)) => e.key.clone(),
-        (tw_api::SecretChange::Keep, None) | (tw_api::SecretChange::None, _) => None,
-        (tw_api::SecretChange::Set { value }, _) => {
-            let v = value.trim();
-            if v.is_empty() {
-                return Err(msg!("control.api_key_empty" => "The API key cannot be empty."));
-            }
-            Some(tw_config::Secret::new(v))
-        }
+    let base_url = input.base_url.trim().to_string();
+    if base_url.is_empty() {
+        return Err(msg!(
+            "control.base_url_empty" => "The endpoint address cannot be empty."
+        ));
+    }
+    let key = match input.key.as_deref().map(str::trim) {
+        Some("") => return Err(msg!("control.api_key_empty" => "The API key cannot be empty.")),
+        Some(v) => Some(tw_config::Secret::new(v)),
+        None => None,
     };
     let headers = input
         .headers
         .iter()
         .map(|h| {
             let name = h.name.trim().to_string();
-            let value = match &h.value {
-                Some(v) => tw_config::Secret::new(v.trim()),
-                // 沿用原值：界面拿不到打码之前的值，这一行不动就不传
-                None => existing
-                    .and_then(|e| e.headers.get(&name))
-                    .map(|x| x.value.clone())
-                    .ok_or_else(|| {
-                    msg!("control.header_no_value", header = name.clone() => "Header `{header}` has no value.")
-                })?,
-            };
-            Ok(tw_config::Header { name, value })
+            let value = h.value.trim();
+            if value.is_empty() {
+                return Err(
+                    msg!("control.header_no_value", header = name => "Header `{header}` has no value."),
+                );
+            }
+            Ok(tw_config::Header {
+                name,
+                value: tw_config::Secret::new(value),
+            })
         })
         .collect::<Result<Vec<_>, Msg>>()?;
     let oauth = match (&input.oauth, existing) {
@@ -425,7 +415,7 @@ async fn create_proxy(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let px = to_proxy(&req.proxy, None).map_err(invalid)?;
+            let px = to_proxy(&req.proxy).map_err(invalid)?;
             Ok(edit::upsert(text, edit::PROXIES, None, &mapping(&px)?)?)
         })
         .await
@@ -441,12 +431,10 @@ async fn update_proxy(
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
-            let existing = cfg
-                .proxies
-                .iter()
-                .find(|p| p.name == name)
-                .ok_or_else(|| not_found("proxy", &name))?;
-            let px = to_proxy(&req.proxy, Some(existing)).map_err(invalid)?;
+            if !cfg.proxies.iter().any(|p| p.name == name) {
+                return Err(not_found("proxy", &name));
+            }
+            let px = to_proxy(&req.proxy).map_err(invalid)?;
             let mut out = edit::upsert(text, edit::PROXIES, Some(&name), &mapping(&px)?)?;
             if px.name != name {
                 out = refs::rename_proxy(&out, cfg, &name, &px.name)?;
@@ -487,16 +475,15 @@ async fn test_proxy(
     Json(req): Json<tw_api::ProxyTest>,
 ) -> Result<Json<tw_api::L1Result>, Fail> {
     let cfg = s.config();
-    let existing = match req.current.as_deref() {
-        Some(n) => Some(cfg.proxies.iter().find(|p| p.name == n).ok_or_else(|| {
-            fail(
-                StatusCode::NOT_FOUND,
-                msg!("control.proxy_not_found", proxy = n => "There is no proxy named `{proxy}`."),
-            )
-        })?),
-        None => None,
-    };
-    let px = to_proxy(&req.proxy, existing).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    if let Some(n) = req.current.as_deref()
+        && !cfg.proxies.iter().any(|p| p.name == n)
+    {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.proxy_not_found", proxy = n => "There is no proxy named `{proxy}`."),
+        ));
+    }
+    let px = to_proxy(&req.proxy).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     let hop = tw_gateway::hop_of(&px).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
     // 握手的目标：正在编辑的那个代理原来服务的上游
     let (host, port) = tw_gateway::proxy_target(&cfg, req.current.as_deref().unwrap_or(&px.name));
@@ -504,10 +491,7 @@ async fn test_proxy(
     Ok(Json(crate::l1_view(px.name.clone(), None, r)))
 }
 
-fn to_proxy(
-    input: &tw_api::ProxyInput,
-    existing: Option<&tw_config::Proxy>,
-) -> Result<tw_config::Proxy, Msg> {
+fn to_proxy(input: &tw_api::ProxyInput) -> Result<tw_config::Proxy, Msg> {
     let name = checked_name(&input.name, "proxy")?;
     if matches!(name.as_str(), tw_config::DIRECT | tw_config::SYSTEM) {
         return Err(msg!(
@@ -526,20 +510,14 @@ fn to_proxy(
         ));
     }
     let auth = match &input.auth {
-        // 没动认证：沿用原来那一份，**原值不经过界面**
-        tw_api::ProxyAuthInput::Keep => existing.and_then(|e| e.auth.clone()),
-        tw_api::ProxyAuthInput::None => None,
-        tw_api::ProxyAuthInput::Set { user, pass } => {
+        None => None,
+        Some(tw_api::ProxyAuth { user, pass }) => {
             let user = user.trim();
             if user.is_empty() {
                 return Err(msg!("control.user_empty" => "The user name cannot be empty."));
             }
-            // `${` 在配置里表示「从环境变量读」
-            if pass.contains("${") {
-                return Err(
-                    msg!("control.pass_has_expansion" => "A password cannot contain `${{`."),
-                );
-            }
+            // 和密钥一样可以写 `${NAME}`：界面回填的是配置里写的原样，手写的
+            // `pass: ${PROXY_PASSWORD}` 原样交回来
             Some(tw_config::proxy::ProxyAuth {
                 user: user.to_string(),
                 pass: tw_config::Secret::new(pass.clone()),

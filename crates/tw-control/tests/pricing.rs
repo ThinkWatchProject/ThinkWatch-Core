@@ -29,6 +29,17 @@ providers:
     key: sk-relay
 ";
 
+/// `BASE` 里的 relay-hk 整份定义，选的是 `pricing` 这张价目表（空 = 默认的）。
+/// 保存交的是整份：少交一项就是把它删了
+fn relay_hk(pricing: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "name": "relay-hk",
+        "base_url": "https://relay.example",
+        "key": "sk-relay",
+        "pricing": pricing,
+    })
+}
+
 struct Bed {
     dir: tempfile::TempDir,
     state: ControlState,
@@ -139,7 +150,7 @@ async fn a_sheet_is_created_chosen_renamed_and_deleted_only_once_nobody_uses_it(
         &b.app,
         "PUT",
         "/providers/relay-hk",
-        serde_json::json!({ "provider": { "name": "relay-hk", "pricing": "中转协议价" } }),
+        serde_json::json!({ "provider": relay_hk(Some("中转协议价")) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
@@ -181,7 +192,7 @@ async fn a_sheet_is_created_chosen_renamed_and_deleted_only_once_nobody_uses_it(
         &b.app,
         "PUT",
         "/providers/relay-hk",
-        serde_json::json!({ "provider": { "name": "relay-hk" } }),
+        serde_json::json!({ "provider": relay_hk(None) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
@@ -279,7 +290,7 @@ async fn an_upstream_cannot_choose_a_sheet_that_does_not_exist() {
         &b.app,
         "PUT",
         "/providers/relay-hk",
-        serde_json::json!({ "provider": { "name": "relay-hk", "pricing": "没有这张" } }),
+        serde_json::json!({ "provider": relay_hk(Some("没有这张")) }),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");

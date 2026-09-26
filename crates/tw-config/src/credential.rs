@@ -58,7 +58,8 @@ impl Secret {
         Self(s.into())
     }
 
-    /// 写在配置里的原文。**可能是明文密钥** —— 只给要写回配置的调用方用。
+    /// 写在配置里的原文。**可能是明文密钥** —— 给要写回配置的调用方，和编辑
+    /// 对话框要回填的上游视图。
     pub fn raw(&self) -> &str {
         &self.0
     }
@@ -68,16 +69,6 @@ impl Secret {
         Ok(tw_secret::expand_from_env(&self.0)?)
     }
 
-    /// 给界面的形态，**永远不含真实密钥**：带 `${NAME}` 的原样给（写的是
-    /// 从哪个环境变量读），其余打码。怎么称呼它由界面决定。
-    pub fn shown(&self) -> String {
-        if self.0.contains("${") {
-            self.0.clone()
-        } else {
-            tw_secret::mask_secret(&self.0)
-        }
-    }
-
     /// 命令行和诊断包里的说法，**永远不含真实密钥**。
     pub fn describe(&self) -> String {
         if self.0.contains("${") {
@@ -85,15 +76,6 @@ impl Secret {
         } else {
             tw_secret::mask_secret(&self.0)
         }
-    }
-
-    /// 整个值恰好是一个 `${VAR}` 时，那个变量名。
-    pub fn env_var(&self) -> Option<&str> {
-        let inner = self.0.trim().strip_prefix("${")?.strip_suffix('}')?;
-        let ok = !inner.is_empty()
-            && !inner.starts_with(|c: char| c.is_ascii_digit())
-            && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        ok.then_some(inner)
     }
 
     pub fn is_blank(&self) -> bool {
@@ -848,12 +830,5 @@ mod tests {
             x.outbound_headers(None).unwrap(),
             vec![("Authorization".to_string(), "Token from-env".to_string())]
         );
-    }
-
-    #[test]
-    fn the_env_var_name_is_recognised_only_when_it_is_the_whole_value() {
-        assert_eq!(Secret::new("${RELAY_KEY}").env_var(), Some("RELAY_KEY"));
-        assert_eq!(Secret::new("Bearer ${RELAY_KEY}").env_var(), None);
-        assert_eq!(Secret::new("sk-plain").env_var(), None);
     }
 }

@@ -103,9 +103,23 @@ fn relay(name: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "base_url": "https://relay.example",
-        "key": { "mode": "set", "value": "sk-relay#1: x" },
+        "key": "sk-relay#1: x",
         "protocol": "anthropic",
     })
+}
+
+/// `BASE` 里的「官方」整份定义，`changes` 里的几项替换上去。**保存交的是整份**：
+/// 少交一项就是把它删了
+fn official(changes: serde_json::Value) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "name": "官方",
+        "base_url": "https://api.anthropic.com",
+        "key": "sk-official",
+    });
+    for (k, v) in changes.as_object().unwrap() {
+        p[k] = v.clone();
+    }
+    p
 }
 
 // ─────────────────────────────────────────────────────────── 概览
@@ -186,14 +200,19 @@ async fn a_new_upstream_lands_with_its_key_intact_and_every_comment_kept() {
 }
 
 #[tokio::test]
-async fn editing_without_a_key_keeps_the_key_and_touches_only_what_changed() {
+async fn saving_an_upstream_as_the_overview_shows_it_touches_only_what_changed() {
+    // 界面回填的就是概览里的样子：地址和密钥原样交回去，文件里那两行一个字节不动
     let b = bed(BASE);
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let shown = &json(&body)["providers"][0];
     let (st, body) = call(
         &b.app,
         "PUT",
         "/providers/官方",
         serde_json::json!({ "provider": {
             "name": "官方",
+            "base_url": shown["base_url"],
+            "key": shown["key"],
             "proxy": "system",
             "billing": "free",
         }}),
@@ -201,7 +220,6 @@ async fn editing_without_a_key_keeps_the_key_and_touches_only_what_changed() {
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     let file = b.file();
-    // 没交地址和凭据 = 保持原样
     assert!(file.contains("key: sk-official"), "{file}");
     assert!(
         file.contains("base_url: https://api.anthropic.com  # 直连"),
@@ -222,7 +240,7 @@ async fn billing_is_per_token_or_free_and_nothing_else() {
             &b.app,
             "PUT",
             "/providers/官方",
-            serde_json::json!({ "provider": { "name": "官方", "billing": gone }}),
+            serde_json::json!({ "provider": official(serde_json::json!({ "billing": gone })) }),
         )
         .await;
         // 取值不在集合里：请求体本身读不成
@@ -238,7 +256,7 @@ async fn renaming_an_upstream_moves_its_references_in_the_same_version() {
         &b.app,
         "PUT",
         "/providers/官方",
-        serde_json::json!({ "provider": { "name": "anthropic" } }),
+        serde_json::json!({ "provider": official(serde_json::json!({ "name": "anthropic" })) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
@@ -304,7 +322,8 @@ async fn a_duplicate_name_and_a_stale_version_are_both_conflicts() {
 }
 
 #[tokio::test]
-async fn the_overview_says_where_a_credential_comes_from_and_never_the_value() {
+async fn the_overview_shows_the_settings_as_written() {
+    // 编辑对话框回填的就是它：地址带着路径、密钥和请求头都是原样，由界面决定藏不藏
     let b = bed(BASE);
     let (st, body) = call(
         &b.app,
@@ -312,8 +331,8 @@ async fn the_overview_says_where_a_credential_comes_from_and_never_the_value() {
         "/providers",
         serde_json::json!({ "provider": {
             "name": "env",
-            "base_url": "https://relay.example",
-            "key": { "mode": "set", "value": "${RELAY_KEY}" },
+            "base_url": "https://relay.example/v1",
+            "key": "${RELAY_KEY}",
             "headers": [
                 { "name": "X-Relay-Tenant", "value": "tenant-verysecretvalue" },
                 { "name": "anthropic-version", "value": "2023-06-01" },
@@ -323,15 +342,11 @@ async fn the_overview_says_where_a_credential_comes_from_and_never_the_value() {
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
-    assert!(!body.contains("sk-official"), "{body}");
-    assert!(!body.contains("tenant-verysecretvalue"), "{body}");
     let v = json(&body);
     let providers = v["providers"].as_array().unwrap();
     let official = &providers[0];
-    assert!(
-        official["key"]["display"].as_str().unwrap().contains('…'),
-        "{body}"
-    );
+    assert_eq!(official["base_url"], "https://api.anthropic.com", "{body}");
+    assert_eq!(official["key"], "sk-official", "{body}");
     assert_eq!(official["auth_header"], "x-api-key");
     assert_eq!(official["protocol"], "anthropic");
     assert_eq!(official["protocol_explicit"], false);
@@ -339,46 +354,35 @@ async fn the_overview_says_where_a_credential_comes_from_and_never_the_value() {
     assert!(official.get("trust").is_none(), "{body}");
     assert_eq!(official["references"][0]["kind"], "group");
     let env = providers.iter().find(|p| p["name"] == "env").unwrap();
-    assert_eq!(env["key"]["env"], "RELAY_KEY");
-    assert_eq!(env["headers"][0]["name"], "X-Relay-Tenant");
-    assert_eq!(env["headers"][0]["masked"], true);
-    assert_eq!(env["headers"][1]["value"], "2023-06-01");
-    assert_eq!(env["headers"][1]["masked"], false);
+    assert_eq!(env["base_url"], "https://relay.example/v1", "{body}");
+    assert_eq!(env["key"], "${RELAY_KEY}");
+    assert_eq!(
+        env["headers"],
+        serde_json::json!([
+            { "name": "X-Relay-Tenant", "value": "tenant-verysecretvalue" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+        ])
+    );
 }
 
 #[tokio::test]
-async fn a_header_saved_without_a_value_keeps_the_stored_one() {
-    // 视图里的值是打过码的，界面不回填 —— 不改的那一行就不带值
+async fn a_header_without_a_value_is_refused() {
     let b = bed(BASE);
-    call(
+    let before = b.file();
+    let (st, body) = call(
         &b.app,
         "POST",
         "/providers",
         serde_json::json!({ "provider": {
             "name": "relay",
             "base_url": "https://relay.example",
-            "headers": [{ "name": "X-Relay-Token", "value": "rt-1" }],
+            "headers": [{ "name": "X-Relay-Token", "value": "  " }],
         }}),
     )
     .await;
-    let (st, body) = call(
-        &b.app,
-        "PUT",
-        "/providers/relay",
-        serde_json::json!({ "provider": {
-            "name": "relay",
-            "headers": [
-                { "name": "X-Relay-Token" },
-                { "name": "X-Extra", "value": "e" },
-            ],
-        }}),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{body}");
-    let cfg = b.parsed();
-    let p = cfg.providers.iter().find(|p| p.name == "relay").unwrap();
-    assert_eq!(p.headers.get("x-relay-token").unwrap().value.raw(), "rt-1");
-    assert_eq!(p.headers.get("X-Extra").unwrap().value.raw(), "e");
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json(&body)["code"], "control.header_no_value", "{body}");
+    assert_eq!(b.file(), before);
 }
 
 #[tokio::test]
@@ -407,37 +411,52 @@ fn corp(auth: serde_json::Value) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn a_proxy_password_is_written_intact_kept_on_edit_and_never_shown() {
+async fn a_proxy_password_is_written_intact_and_shown_as_written() {
     let b = bed(BASE);
+    let auth = serde_json::json!({ "user": "svc", "pass": "p@ss #1: x" });
     let (st, body) = call(
         &b.app,
         "POST",
         "/proxies",
-        serde_json::json!({ "proxy": corp(serde_json::json!({ "mode": "set", "user": "svc", "pass": "p@ss #1: x" })) }),
+        serde_json::json!({ "proxy": corp(auth.clone()) }),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    // 改地址、不动认证
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(json(&body)["proxies"][0]["auth"], auth, "{body}");
+
+    // 改地址，认证照概览里的样子交回去
     let (st, body) = call(
         &b.app,
         "PUT",
         "/proxies/corp",
         serde_json::json!({ "proxy": {
-            "name": "corp", "kind": "http", "addr": "10.0.0.2:8080", "auth": { "mode": "keep" }
+            "name": "corp", "kind": "http", "addr": "10.0.0.2:8080", "auth": auth
         }}),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     let cfg = b.parsed();
-    let auth = cfg.proxies[0].auth.as_ref().expect("没动认证，认证不该丢");
-    assert_eq!(auth.user, "svc");
-    assert_eq!(auth.pass.raw(), "p@ss #1: x");
+    let written = cfg.proxies[0].auth.as_ref().unwrap();
+    assert_eq!(written.user, "svc");
+    assert_eq!(written.pass.raw(), "p@ss #1: x");
     assert_eq!(cfg.proxies[0].addr, "10.0.0.2:8080");
+}
 
-    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
-    assert!(!body.contains("p@ss"), "{body}");
-    assert!(!body.contains("\"svc\""), "用户名也是凭据的一半：{body}");
-    assert_eq!(json(&body)["proxies"][0]["has_auth"], true);
+#[tokio::test]
+async fn a_proxy_password_read_from_the_environment_round_trips() {
+    // 文档里的写法：`pass: ${PROXY_PASSWORD}`。概览原样给，界面原样交回来
+    let b = bed(BASE);
+    let auth = serde_json::json!({ "user": "svc", "pass": "${PROXY_PASSWORD}" });
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/proxies",
+        serde_json::json!({ "proxy": corp(auth) }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(b.file().contains("pass: ${PROXY_PASSWORD}"), "{}", b.file());
 }
 
 #[tokio::test]
@@ -447,7 +466,7 @@ async fn renaming_a_proxy_moves_the_upstreams_that_use_it_and_a_used_proxy_is_no
         &b.app,
         "POST",
         "/proxies",
-        serde_json::json!({ "proxy": corp(serde_json::json!({ "mode": "none" })) }),
+        serde_json::json!({ "proxy": corp(serde_json::Value::Null) }),
     )
     .await;
     let mut r = relay("relay");
@@ -470,7 +489,7 @@ async fn renaming_a_proxy_moves_the_upstreams_that_use_it_and_a_used_proxy_is_no
         "PUT",
         "/proxies/corp",
         serde_json::json!({ "proxy": {
-            "name": "corp-http", "kind": "http", "addr": "10.0.0.1:8080", "auth": { "mode": "keep" }
+            "name": "corp-http", "kind": "http", "addr": "10.0.0.1:8080"
         }}),
     )
     .await;
@@ -524,7 +543,7 @@ async fn testing_an_unsaved_upstream_uses_the_protocol_and_lists_the_models() {
         serde_json::json!({ "provider": {
             "name": "relay",
             "base_url": format!("http://{up}"),
-            "key": { "mode": "set", "value": "sk-good" },
+            "key": "sk-good",
             "protocol": "anthropic",
         }}),
     )
@@ -540,19 +559,20 @@ async fn testing_an_unsaved_upstream_uses_the_protocol_and_lists_the_models() {
 }
 
 #[tokio::test]
-async fn testing_an_edited_upstream_without_a_new_key_uses_the_stored_one() {
+async fn testing_an_edited_upstream_checks_what_the_form_holds() {
+    // 存着的是 `sk-official`，表单里改成了什么就测什么
     let up = fake_upstream().await;
-    let b = bed(&BASE
-        .replace("https://api.anthropic.com  # 直连", &format!("http://{up}"))
-        .replace("sk-official", "sk-good"));
-    let (_, body) = call(
-        &b.app,
-        "POST",
-        "/providers/test",
-        serde_json::json!({ "provider": { "name": "官方" }, "current": "官方" }),
-    )
-    .await;
+    let b = bed(BASE);
+    let test = |key: &str| {
+        serde_json::json!({
+            "provider": official(serde_json::json!({ "base_url": format!("http://{up}"), "key": key })),
+            "current": "官方",
+        })
+    };
+    let (_, body) = call(&b.app, "POST", "/providers/test", test("sk-good")).await;
     assert_eq!(json(&body)["ok"], true, "{body}");
+    let (_, body) = call(&b.app, "POST", "/providers/test", test("sk-official")).await;
+    assert_eq!(json(&body)["ok"], false, "{body}");
 }
 
 #[tokio::test]
@@ -612,7 +632,7 @@ async fn fake_connect_proxy() -> std::net::SocketAddr {
 }
 
 #[tokio::test]
-async fn testing_a_proxy_checks_its_credentials_including_the_stored_ones() {
+async fn testing_a_proxy_checks_its_credentials() {
     let px = fake_connect_proxy().await;
     let b = bed(BASE);
     let with = |auth: serde_json::Value| serde_json::json!({ "name": "corp", "kind": "http", "addr": px.to_string(), "auth": auth });
@@ -621,7 +641,7 @@ async fn testing_a_proxy_checks_its_credentials_including_the_stored_ones() {
         &b.app,
         "POST",
         "/proxies/test",
-        serde_json::json!({ "proxy": with(serde_json::json!({ "mode": "set", "user": "svc", "pass": "bad" })) }),
+        serde_json::json!({ "proxy": with(serde_json::json!({ "user": "svc", "pass": "bad" })) }),
     )
     .await;
     let v = json(&body);
@@ -629,19 +649,11 @@ async fn testing_a_proxy_checks_its_credentials_including_the_stored_ones() {
     // 按码断言：这条测的是「握手做完了、认证验过了」，不是那句话怎么写
     assert_eq!(v["error"]["code"], "l1.http_proxy.auth_required", "{body}");
 
-    // 存下正确的，再用「保持原样」检测 —— 用的是存着的那份
-    call(
-        &b.app,
-        "POST",
-        "/proxies",
-        serde_json::json!({ "proxy": with(serde_json::json!({ "mode": "set", "user": "svc", "pass": "good" })) }),
-    )
-    .await;
     let (_, body) = call(
         &b.app,
         "POST",
         "/proxies/test",
-        serde_json::json!({ "proxy": with(serde_json::json!({ "mode": "keep" })), "current": "corp" }),
+        serde_json::json!({ "proxy": with(serde_json::json!({ "user": "svc", "pass": "good" })) }),
     )
     .await;
     assert_eq!(json(&body)["ok"], true, "{body}");
