@@ -4,14 +4,48 @@
 /// 拼上游 URL。base_url 的尾斜杠在这里统一吃掉 —— 从浏览器地址栏粘一个
 /// URL 就会白送一个尾斜杠，而 `https://host//v1/messages` 换来的是一个
 /// 光秃秃的 404。查询串里的网关密钥去掉，见 [`without_gateway_key`]。
+///
+/// **地址以版本段结尾、路径又以同一段开头时，这一段只留一个。**服务商文档给的
+/// 地址常常带着版本段（`https://api.openai.com/v1`），客户端发来的路径也带着
+/// （`/v1/chat/completions`）—— 照拼就是 `…/v1/v1/chat/completions`，一个 404。
+/// 只认版本段（`v1`、`v1beta`）：别的段恰好同名，说明不了它们是同一段。
 pub fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
     let path = path.trim_start_matches('/');
+    let path = match last_path_segment(base).filter(|s| is_version(s)) {
+        Some(v) => match path.strip_prefix(v) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => rest.trim_start_matches('/'),
+            _ => path,
+        },
+        None => path,
+    };
     let query = query.map(without_gateway_key);
     match query {
         Some(q) if !q.is_empty() => format!("{base}/{path}?{q}"),
         _ => format!("{base}/{path}"),
     }
+}
+
+/// 地址路径的最后一段。**只有主机、没有路径的地址没有这一段** —— `http://v1:8080`
+/// 里的 `v1` 是主机名。
+fn last_path_segment(base: &str) -> Option<&str> {
+    let rest = &base[base.find("://")? + 3..];
+    let path = &rest[rest.find('/')?..];
+    path.rsplit('/').next().filter(|s| !s.is_empty())
+}
+
+/// `v1`、`v2`、`v1beta`、`v1alpha`、`v1beta1` 这样的版本段。
+fn is_version(seg: &str) -> bool {
+    let Some(rest) = seg.strip_prefix('v') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let tail = &rest[digits..];
+    let tail = ["alpha", "beta"]
+        .iter()
+        .find_map(|w| tail.strip_prefix(w))
+        .unwrap_or(tail);
+    digits > 0 && tail.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// 去掉查询串里的 `key=`。
@@ -41,6 +75,51 @@ mod tests {
         assert_eq!(
             upstream_url("https://api.example.com", "v1/messages", None),
             "https://api.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn a_version_segment_the_base_url_ends_with_is_not_repeated() {
+        // 服务商文档给的地址带着 `/v1`，客户端的路径也带着
+        assert_eq!(
+            upstream_url("https://api.openai.com/v1", "/v1/chat/completions", None),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            upstream_url("https://api.groq.com/openai/v1/", "/v1/models", None),
+            "https://api.groq.com/openai/v1/models"
+        );
+        assert_eq!(
+            upstream_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "/v1beta/models/m:streamGenerateContent",
+                Some("alt=sse")
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/m:streamGenerateContent?alt=sse"
+        );
+        // 不带版本段的地址照旧接在后面
+        assert_eq!(
+            upstream_url("https://relay.example/anthropic", "/v1/messages", None),
+            "https://relay.example/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn only_the_same_whole_version_segment_counts_as_a_repeat() {
+        // 不同的版本段是两段
+        assert_eq!(
+            upstream_url("https://x.example/v1", "/v1beta/models/m", None),
+            "https://x.example/v1/v1beta/models/m"
+        );
+        // 不是版本段的同名段不合并：说明不了是同一段
+        assert_eq!(
+            upstream_url("https://x.example/api", "/api/items", None),
+            "https://x.example/api/api/items"
+        );
+        // 主机名不是路径段
+        assert_eq!(
+            upstream_url("http://v1:8080", "/v1/messages", None),
+            "http://v1:8080/v1/messages"
         );
     }
 
