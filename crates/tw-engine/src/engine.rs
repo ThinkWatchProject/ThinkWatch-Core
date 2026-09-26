@@ -807,9 +807,20 @@ impl Engine {
         provider: &str,
         base: &SetAction,
     ) -> Result<Outcome2, RouteError> {
+        self.phase_two_with(self.rules_for(&facts.client), facts, provider, base)
+    }
+
+    /// 按给定的规则表走阶段二。试算按草稿求值时走这里，理由和 [`Self::route_with`] 一样。
+    pub fn phase_two_with(
+        &self,
+        rules: &[Rule],
+        facts: &RequestFacts,
+        provider: &str,
+        base: &SetAction,
+    ) -> Result<Outcome2, RouteError> {
         let mut set = base.clone();
         let mut rewritten_by = Vec::new();
-        for r in self.rules_for(&facts.client) {
+        for r in rules {
             if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
                 continue;
             }
@@ -827,6 +838,38 @@ impl Engine {
             }
         }
         Ok(Outcome2::Proceed { set, rewritten_by })
+    }
+
+    /// 每个候选实际会被要哪个模型，按候选的顺序。
+    ///
+    /// **规则改写过模型的，按改写后的算**：阶段二的盖过阶段一的，都没改写才是
+    /// 请求里写的那个。准入、跳过服务不了的候选、比价，看的都得是发出去的那个
+    /// 名字 —— 按客户端写的名字看，一条把 `claude-*` 改成 `glm-*` 的规则永远
+    /// 用不上：智谱的清单里没有 `claude-*`。
+    ///
+    /// 阶段二拒绝或求不了值时按阶段一算：那一跳本来就发不出去，尝试那一步会
+    /// 报出来。请求里读不出模型时一律是空的 —— 请求体都解不开，改写也写不进去。
+    pub fn models_asked(
+        &self,
+        rules: &[Rule],
+        facts: &RequestFacts,
+        d: &Decision,
+    ) -> Vec<(String, String)> {
+        d.candidates
+            .iter()
+            .map(|c| {
+                let model = if facts.model.is_empty() {
+                    String::new()
+                } else {
+                    let set = match self.phase_two_with(rules, facts, c, &d.set) {
+                        Ok(Outcome2::Proceed { set, .. }) => set.model,
+                        _ => d.set.model.clone(),
+                    };
+                    set.unwrap_or_else(|| facts.model.clone())
+                };
+                (c.clone(), model)
+            })
+            .collect()
     }
 
     fn resolve_target(&self, r: &Rule) -> Result<(Vec<String>, Option<String>), RouteError> {

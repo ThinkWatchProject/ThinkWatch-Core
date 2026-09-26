@@ -572,15 +572,23 @@ impl Skip {
 pub struct Serving {
     pub usable: Vec<String>,
     pub skipped: Vec<(String, Skip)>,
+    /// 每个候选要的模型，给 [`Self::explain`] 那句话用
+    asked: Vec<(String, String)>,
 }
 
 impl Serving {
-    /// 一个都不剩时给客户端的那句话。
+    /// 一个都不剩时给客户端的那句话。`model` 是阶段一之后要的模型；哪一家要的
+    /// 不是它（阶段二按上游改写过），就在那一家后面写出它要的那个。
     pub fn explain(&self, model: &str) -> crate::GatewayError {
         let why = self
             .skipped
             .iter()
-            .map(|(p, s)| format!("{p} {}", s.label()))
+            .map(
+                |(p, s)| match self.asked.iter().find(|(c, _)| c == p).map(|(_, m)| m) {
+                    Some(m) if !m.is_empty() && m != model => format!("{p} {} ({m})", s.label()),
+                    _ => format!("{p} {}", s.label()),
+                },
+            )
             .collect::<Vec<_>>()
             .join("; ");
         // 全是停用：请求没问题，是配置里能用的上游都关掉了
@@ -615,16 +623,21 @@ pub fn fit(catalog: &tw_engine::Catalog, p: &tw_config::Provider, model: &str) -
 
 /// 在路由选出的候选里去掉服务不了这个请求的上游。
 ///
-/// **没有模型清单的上游不跳过**：不知道它有什么，不等于它没有。`model`
-/// 是空的（请求体解析不了）时只看停用。
+/// `asked` 是每个候选和它要的模型（[`tw_engine::Engine::models_asked`]）：
+/// **每一家按它实际要的那个模型看**，规则改写过的就是改写后的。
+///
+/// **没有模型清单的上游不跳过**：不知道它有什么，不等于它没有。模型是空的
+/// （请求体解析不了）时只看停用。
 pub fn serving(
     cfg: &tw_config::Config,
     catalog: &tw_engine::Catalog,
-    candidates: &[String],
-    model: &str,
+    asked: &[(String, String)],
 ) -> Serving {
-    let mut out = Serving::default();
-    for name in candidates {
+    let mut out = Serving {
+        asked: asked.to_vec(),
+        ..Serving::default()
+    };
+    for (name, model) in asked {
         let Some(p) = cfg.providers.iter().find(|p| &p.name == name) else {
             // 配置里没有这一家：留给尝试那一步报出来
             out.usable.push(name.clone());
@@ -665,6 +678,14 @@ mod tests {
             key: Some("sk".into()),
             ..Default::default()
         }
+    }
+
+    /// 每个候选都要同一个模型：没有规则改写时的样子
+    fn asked(candidates: &[&str], model: &str) -> Vec<(String, String)> {
+        candidates
+            .iter()
+            .map(|c| (c.to_string(), model.to_string()))
+            .collect()
     }
 
     fn cfg(providers: Vec<tw_config::Provider>) -> tw_config::Config {
@@ -740,7 +761,7 @@ mod tests {
         c.providers[2].models_only = Some(vec!["c-1".into()]);
         let cat = published(&d, &c);
         assert_eq!(cat.all(), ["a-1", "a-2", "c-1"]);
-        let s = serving(&c, &cat, &["a".into(), "b".into(), "c".into()], "c-2");
+        let s = serving(&c, &cat, &asked(&["a", "b", "c"], "c-2"));
         assert_eq!(
             s.skipped,
             [
@@ -771,7 +792,7 @@ mod tests {
         );
         let cat = published(&d, &c);
         // 不知道它们有什么：不跳过
-        let s = serving(&c, &cat, &["a".into(), "b".into()], "m");
+        let s = serving(&c, &cat, &asked(&["a", "b"], "m"));
         assert_eq!(s.usable, ["a", "b"]);
         // 失败的一小时后重问，没有接口的一天后
         let hour = RETRY_AFTER.as_millis() as u64;

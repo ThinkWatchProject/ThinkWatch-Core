@@ -217,7 +217,9 @@ gw.listen.no_such_nic
 gw.listen.port_taken
 gw.model.no_upstream
 gw.model.no_upstream_available
+gw.model.no_upstream_rewritten
 gw.model.not_allowed
+gw.model.not_allowed_rewritten
 gw.model.unknown
 gw.models.check_failed
 gw.models.empty
