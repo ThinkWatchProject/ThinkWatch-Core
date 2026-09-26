@@ -364,6 +364,44 @@ routes:
 }
 
 #[tokio::test]
+async fn the_dry_run_judges_each_upstream_by_the_model_a_rule_rewrites_to() {
+    // 官方只开了 sonnet。一条规则把 opus 改成 sonnet 交给它：按请求里的名字，
+    // 试算会说它在范围外，而真的转发时发出去的是 sonnet
+    let yaml = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: 官方
+    base_url: https://api.anthropic.com
+    key: sk-a
+    models_only: [claude-sonnet-*]
+routes:
+  - name: default
+    rules:
+      - name: opus 换成 sonnet
+        to: 官方
+        set: { model: claude-sonnet-4-5 }
+";
+    let b = bed(yaml);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/dryrun",
+        serde_json::json!({ "model": "claude-opus-4-1", "client": "c" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["outcome"], "route", "{v}");
+    assert_eq!(v["rule"], "opus 换成 sonnet", "{v}");
+    assert_eq!(v["candidates"], serde_json::json!(["官方"]));
+    assert_eq!(v["skipped"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     let b = bed(&config(upstream().await, "sk-good", ""));
     let (st, v) = call(

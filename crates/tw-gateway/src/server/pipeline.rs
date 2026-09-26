@@ -77,7 +77,6 @@ pub(super) async fn pipeline(
     }
 
     let (reading, fp) = read(&req, intent);
-    admit(&state, &rt, &req, &reading)?;
     let (choice, decision) = match route(&state, &rt, &req, &reading, fp.as_deref())? {
         Routed::Go(choice, decision) => (choice, decision),
         // 规则做了决定，请求却一家上游都不会去。**照样开始、照样报路由**，失败由
@@ -204,8 +203,13 @@ fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<St
     (reading, fp)
 }
 
-/// 管线第 1.5 步：模型准入。**和 `GET /v1/models` 共用同一个函数**
-/// —— 列出来的一定能用，能用的一定列了出来。
+/// 管线第 2 步的中段：模型准入。**和 `GET /v1/models` 共用同一个函数**
+/// —— 列出来的一定能用。
+///
+/// **看的是发出去的模型，不是客户端写的那个**，所以放在规则做完决定之后：
+/// 一条把 `claude-*` 改成 `glm-*` 的规则，请求里的名字哪一家的清单里都没有，
+/// 改写后的才有。`asked` 里有一个过得去就放行 —— 哪一家服务不了，由下一步
+/// 把它跳过。
 ///
 /// 目录空着时不拦：那说明探测还没回来或者上游都不给列表，这时候拦
 /// 等于把整个网关关掉。
@@ -214,6 +218,8 @@ fn admit(
     rt: &Runtime,
     req: &Inbound,
     reading: &crate::client_api::Reading,
+    decision: &tw_engine::Decision,
+    asked: &[(String, String)],
 ) -> Result<(), GatewayError> {
     let facts = &reading.facts;
     let catalog = state.catalog.load();
@@ -229,23 +235,44 @@ fn admit(
     let servable = req
         .api
         .map(|a| crate::client_api::slugs(a.servable_by(reading.generates)));
-    if catalog.admits(&facts.model, servable.as_deref(), allow.as_deref()) {
+    // 阶段一之后要的模型。规则一家候选都没给时就看它
+    let model = decision.set.model.as_deref().unwrap_or(&facts.model);
+    let mut models: Vec<&str> = asked.iter().map(|(_, m)| m.as_str()).collect();
+    if models.is_empty() {
+        models.push(model);
+    }
+    if models
+        .iter()
+        .any(|m| catalog.admits(m, servable.as_deref(), allow.as_deref()))
+    {
         return Ok(());
     }
     // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
-    // 该去改的地方不一样
-    let why = if catalog.providers_for(&facts.model).is_empty() {
-        msg!(
+    // 该去改的地方不一样。**改写过的两个名字都要说**：客户端写的是一个，
+    // 报错里说的是另一个，不说清楚像是网关认错了模型
+    let offered = models.iter().any(|m| !catalog.providers_for(m).is_empty());
+    let why = match (offered, model != facts.model) {
+        (false, false) => msg!(
             "gw.model.no_upstream", model = facts.model.clone() =>
             "No upstream serves model {model}. GET /v1/models lists the models that \
              are available."
-        )
-    } else {
-        msg!(
+        ),
+        (true, false) => msg!(
             "gw.model.not_allowed", key = req.client_name.clone(), model = facts.model.clone() =>
             "Gateway key `{key}` may not use model {model}. GET /v1/models lists the \
              models that are available."
-        )
+        ),
+        (false, true) => msg!(
+            "gw.model.no_upstream_rewritten", from = facts.model.clone(), model = model =>
+            "A routing rule rewrote model {from} to {model}, and no upstream serves {model}. \
+             GET /v1/models lists the models that are available."
+        ),
+        (true, true) => msg!(
+            "gw.model.not_allowed_rewritten", from = facts.model.clone(), model = model,
+            key = req.client_name.clone() =>
+            "A routing rule rewrote model {from} to {model}, which gateway key `{key}` may not \
+             use. GET /v1/models lists the models that are available."
+        ),
     };
     Err(GatewayError::new(crate::error::Source::Request, why))
 }
@@ -266,7 +293,8 @@ enum Routed {
 /// 闸门之后（见 [`start`]）。
 ///
 /// 返回的错误是**规则还没做出决定**的那些（没有一条规则命中、规则求不了值）：
-/// 那时说不出这个请求算在哪条规则上，不留这一行，和鉴权没过一样。
+/// 那时说不出这个请求算在哪条规则上，不留这一行，和鉴权没过一样。模型准入没过
+/// （[`admit`]）也从这里返回，同样不留这一行 —— 和准入放在路由之前时一样。
 fn route(
     state: &AppState,
     rt: &Runtime,
@@ -304,22 +332,25 @@ fn route(
         group: decision.via_group.clone(),
         rewritten_by: decision.rewritten_by.clone(),
     };
+    // 每个候选实际要的模型：规则改写过的按改写后的算。准入、跳过、比价都看它
+    let asked = rt.engine.models_asked(
+        rt.engine.rules_for_client(&req.client_name),
+        facts,
+        &decision,
+    );
+    admit(state, rt, req, reading, &decision, &asked)?;
     // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的。
     // **在排序之前** —— `cheapest` 和 `url-test` 要在能服务的上游里挑。
     //
     // 不跳过的话，一家没有这个模型的上游排在前面，它回的 404 不触发故障
     // 转移，请求就在一家能服务它的上游旁边失败了。
-    let serving = crate::models::serving(
-        &rt.config,
-        &state.catalog.load(),
-        &decision.candidates,
-        &facts.model,
-    );
+    let serving = crate::models::serving(&rt.config, &state.catalog.load(), &asked);
+    let model = decision.set.model.as_deref().unwrap_or(&facts.model);
     if serving.usable.is_empty() {
-        return Ok(Routed::Refused(choice, serving.explain(&facts.model)));
+        return Ok(Routed::Refused(choice, serving.explain(model)));
     }
     if !serving.skipped.is_empty() {
-        tracing::debug!(skipped = ?serving.skipped, model = %facts.model, "skipping the candidates that cannot serve this request");
+        tracing::debug!(skipped = ?serving.skipped, %model, "skipping the candidates that cannot serve this request");
     }
     decision.candidates = serving.usable;
     // 策略组排序。**引擎给的是集合，顺序在这儿定** ——
@@ -345,7 +376,7 @@ fn route(
             },
             price: match kind {
                 tw_engine::GroupType::Cheapest => {
-                    state.unit_prices(&rt.config.providers, &decision.candidates, &facts.model)
+                    state.unit_prices(&rt.config.providers, &asked, &decision.candidates)
                 }
                 _ => Default::default(),
             },

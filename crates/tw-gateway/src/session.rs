@@ -6,6 +6,7 @@
 //!
 //! 判据是：**system prompt 指纹 + 首条 user message 指纹**，
 //! 再加时间窗聚类（[`Sessions`]：同一个指纹隔太久再出现，算新的一次）。
+//! 四种格式都认；请求自己带着会话标识（`prompt_cache_key`）时直接用它。
 //!
 //! **会话在请求开始的那一刻就定下来，只定一次**：开始事件带着它，落库的那一行
 //! 记的也是它。以前事件里只有指纹，归到哪一次要等落库时再算 —— 一个还在跑的
@@ -76,46 +77,75 @@ fn fp(s: &str) -> String {
     blake3::hash(s.as_bytes()).to_hex()[..12].to_string()
 }
 
-/// 把 `system` 摊平成文本。它可能是字符串，也可能是内容块数组。
-fn system_text(v: &Value) -> String {
-    match v.get("system") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
+/// 内容块数组里的文本，一块一行。
+fn text_of(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// 首条 user message 的文本。
+/// 系统提示摊平成文本：Anthropic 的 `system`、Responses 的 `instructions`（字符串
+/// 或内容块数组），Gemini 的 `systemInstruction`（REST 也收下划线写法，正文在
+/// `parts` 里）。Chat 的系统提示写在 messages 里，只看首条 user 就够了。
+fn system_text(v: &Value) -> String {
+    match v.get("system").or_else(|| v.get("instructions")) {
+        Some(Value::String(s)) => return s.clone(),
+        Some(Value::Array(a)) => return text_of(a),
+        _ => {}
+    }
+    v.get("systemInstruction")
+        .or_else(|| v.get("system_instruction"))
+        .and_then(|c| c.get("parts"))
+        .and_then(Value::as_array)
+        .map(|a| text_of(a))
+        .unwrap_or_default()
+}
+
+/// 首条 user 消息的文本。对话在 Anthropic 和 Chat 里是 `messages`，Responses 里是
+/// `input`（也可以直接是一句话），Gemini 里是 `contents`，正文在 `parts` 里。
 fn first_user_text(v: &Value) -> String {
-    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else {
+    if let Some(Value::String(s)) = v.get("input") {
+        return s.clone();
+    }
+    let Some(turns) = ["messages", "input", "contents"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(Value::as_array))
+    else {
         return String::new();
     };
-    let Some(first) = msgs
+    let Some(first) = turns
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
     else {
         return String::new();
     };
-    match first.get("content") {
+    match first.get("content").or_else(|| first.get("parts")) {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Some(Value::Array(a)) => text_of(a),
         _ => String::new(),
     }
 }
 
 /// 这次请求属于哪一段对话。
 ///
+/// **请求自己带着会话标识时用它**：`prompt_cache_key`，Codex 每段对话一个（就是
+/// 对话的 id）。同一个仓库里开的几段 Codex 对话，开头的指令和环境说明一字不差，
+/// 只看开头会把它们并成一段。没带的按系统提示和首条 user 消息认。
+///
 /// `None` = 认不出来。**认不出来就说认不出来** —— 硬凑一个指纹会把一堆
 /// 互不相干的请求并成一个「会话」，那比没有会话视图更糟。
 pub fn fingerprint(v: &Value) -> Option<String> {
+    if let Some(key) = v
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+    {
+        // 和按文本认的一个长相：两段 12 位
+        let h = blake3::hash(key.as_bytes()).to_hex();
+        return Some(format!("{}-{}", &h[..12], &h[12..24]));
+    }
     let sys = system_text(v);
     let user = first_user_text(v);
     // 两段都空 = 这个请求里没有任何能认人的东西
@@ -245,6 +275,84 @@ mod tests {
         assert_eq!(s.assign("new", now), format!("new-{now}"));
         assert_eq!(s.tracked(), 1, "早就断了的对话还留着");
         assert_eq!(s.assign("old-1", now), format!("old-1-{now}"));
+    }
+
+    /// Codex 发的 Responses 格式：系统提示在 `instructions`，对话在 `input`
+    fn responses(instructions: &str, first: &str, extra_turns: usize) -> Value {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": first}]
+        })];
+        for i in 0..extra_turns {
+            input.push(json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": format!("c{i}")}));
+            input.push(
+                json!({"type": "function_call_output", "call_id": format!("c{i}"), "output": "ok"}),
+            );
+        }
+        json!({"model": "gpt-5.5", "instructions": instructions, "input": input})
+    }
+
+    #[test]
+    fn a_responses_conversation_keeps_its_fingerprint_as_it_grows() {
+        let a = fingerprint(&responses("You are Codex", "fix the build", 0)).unwrap();
+        for turns in [1, 5, 40] {
+            let b = fingerprint(&responses("You are Codex", "fix the build", turns)).unwrap();
+            assert_eq!(a, b, "第 {turns} 轮的指纹变了");
+        }
+        let c = fingerprint(&responses("You are Codex", "write a test", 3)).unwrap();
+        assert_ne!(a, c);
+        // `input` 直接是一句话，和写成一条消息是同一段
+        let plain = json!({"instructions": "You are Codex", "input": "fix the build"});
+        assert_eq!(fingerprint(&plain), Some(a));
+    }
+
+    #[test]
+    fn a_request_that_names_its_conversation_is_taken_at_its_word() {
+        // 同一个仓库里的两段 Codex 对话：开头一字不差，靠 `prompt_cache_key` 分开
+        let mut one = responses("You are Codex", "<environment_context>", 2);
+        one["prompt_cache_key"] = json!("019a-conversation-one");
+        let mut two = responses("You are Codex", "<environment_context>", 2);
+        two["prompt_cache_key"] = json!("019a-conversation-two");
+        assert_ne!(fingerprint(&one), fingerprint(&two));
+        // 同一段对话越聊越长，还是它
+        let mut later = responses("You are Codex", "<environment_context>", 30);
+        later["prompt_cache_key"] = json!("019a-conversation-one");
+        assert_eq!(fingerprint(&one), fingerprint(&later));
+        // 空的不算数，照样按文本认
+        let mut empty = responses("You are Codex", "fix the build", 0);
+        empty["prompt_cache_key"] = json!("");
+        assert_eq!(
+            fingerprint(&empty),
+            fingerprint(&responses("You are Codex", "fix the build", 0))
+        );
+        // 标识本身也不进指纹原文
+        let f = fingerprint(&one).unwrap();
+        assert!(!f.contains("conversation"), "{f}");
+        assert_eq!(f.len(), 25, "和按文本认的一个长相：{f}");
+    }
+
+    #[test]
+    fn a_gemini_conversation_keeps_its_fingerprint_as_it_grows() {
+        let body = |turns: usize| {
+            let mut contents = vec![json!({"role": "user", "parts": [{"text": "重构这个模块"}]})];
+            for i in 0..turns {
+                contents.push(json!({"role": "model", "parts": [{"text": format!("回复 {i}")}]}));
+                contents.push(json!({"role": "user", "parts": [{"text": format!("再来 {i}")}]}));
+            }
+            json!({
+                "systemInstruction": {"parts": [{"text": "You are a coding agent"}]},
+                "contents": contents
+            })
+        };
+        let a = fingerprint(&body(0)).unwrap();
+        assert_eq!(fingerprint(&body(12)), Some(a.clone()));
+        // REST 的下划线写法是同一个东西
+        let snake = json!({
+            "system_instruction": {"parts": [{"text": "You are a coding agent"}]},
+            "contents": [{"role": "user", "parts": [{"text": "重构这个模块"}]}]
+        });
+        assert_eq!(fingerprint(&snake), Some(a));
     }
 
     #[test]

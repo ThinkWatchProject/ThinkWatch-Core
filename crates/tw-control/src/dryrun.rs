@@ -17,7 +17,7 @@ fn order_like_the_data_plane(
     s: &crate::ControlState,
     engine: &tw_engine::Engine,
     d: &tw_engine::Decision,
-    f: &tw_engine::RequestFacts,
+    asked: &[(String, String)],
 ) -> Vec<String> {
     let Some(gname) = d.via_group.clone() else {
         return d.candidates.clone();
@@ -38,9 +38,7 @@ fn order_like_the_data_plane(
         session: None,
         seq: s.gateway.bus.peek_id(),
         ttfb_ms: s.gateway.latency.snapshot(&d.candidates),
-        price: s
-            .gateway
-            .unit_prices(&cfg.providers, &d.candidates, &f.model),
+        price: s.gateway.unit_prices(&cfg.providers, asked, &d.candidates),
     };
     engine.order(Some(&gname), &d.candidates, &facts)
 }
@@ -237,12 +235,11 @@ pub async fn dry_run(
             // 和数据面同一步：去掉服务不了这个请求的候选（停用的、范围外的、
             // 清单里没有这个模型的）。**被跳过的要列出来** —— 「规则明明写的
             // 是 A」正是用户会来试算的原因
-            let serving = tw_gateway::models::serving(
-                &rt.config,
-                &s.gateway.catalog.load(),
-                &d.candidates,
-                &f.model,
-            );
+            //
+            // 每一家按它实际要的模型看：规则改写过的按改写后的算，和数据面一样
+            let asked = engine.models_asked(rules, &f, &d);
+            let serving =
+                tw_gateway::models::serving(&rt.config, &s.gateway.catalog.load(), &asked);
             out.skipped = serving
                 .skipped
                 .iter()
@@ -274,7 +271,7 @@ pub async fn dry_run(
             // 而它属于哪次会话取决于请求正文，试算没有那个东西。
             // 于是它显示的是轮转序列里的当前位置 —— 而那正是一个没有
             // 会话指纹的请求真的会走的路。
-            out.candidates = order_like_the_data_plane(&s, engine, &d, &f);
+            out.candidates = order_like_the_data_plane(&s, engine, &d, &asked);
             // 哪些候选要转换格式。**试算里要说出来**：转换可能丢掉请求里的字段，
             // 而「规则把我分到了一个别的格式的上游」本身就是用户来试算想知道的事。
             // 协议认不出来的上游直通，不算
