@@ -135,19 +135,28 @@ const CLOCK_SLACK_MS: u64 = MINUTE_MS;
 /// **按 `unit` / `number` 分，不按 `nextResetTime` 的先后猜**：周期末尾每周窗口会比
 /// 5 小时窗口先重置，按先后猜就把两个标反了。认不出来的一项不要 —— 没有名字的百分比
 /// 放上界面只会被当成另一个窗口。
+///
+/// **只认 token（老套餐）和积分（积分制）两种。**老套餐还有一项 `TIME_LIMIT`，数的是
+/// Z.ai 自家 MCP 工具（search-prime、web-reader、zread）的调用次数。这些调用不经过网关，
+/// 这一项整个不要：不报、不显示，用满了也不算用完
 fn window_of(item: &Value) -> Option<(&'static str, u64)> {
     let kind = item["type"].as_str().unwrap_or_default();
-    // 5 小时和每周是 token（老套餐）或积分（积分制）；每月是老套餐的 MCP 调用次数
-    let usage =
-        kind.eq_ignore_ascii_case("TOKENS_LIMIT") || kind.eq_ignore_ascii_case("CREDIT_LIMIT");
-    let calls = kind.eq_ignore_ascii_case("TIME_LIMIT");
+    if !(kind.eq_ignore_ascii_case("TOKENS_LIMIT") || kind.eq_ignore_ascii_case("CREDIT_LIMIT")) {
+        return None;
+    }
     match (item["unit"].as_i64(), item["number"].as_i64()) {
-        (Some(3), Some(5)) if usage => Some(("5h", 5 * HOUR_MS)),
+        (Some(3), Some(5)) => Some(("5h", 5 * HOUR_MS)),
         // 每周窗口的 `number` 见过 7 也见过 1，只认 `unit`
-        (Some(6), _) if usage => Some(("weekly", 7 * DAY_MS)),
-        (Some(5), Some(1)) if calls => Some(("monthly", 31 * DAY_MS)),
+        (Some(6), _) => Some(("weekly", 7 * DAY_MS)),
         _ => None,
     }
+}
+
+/// 积分制套餐的一项（`CREDIT_LIMIT`）。**只有它带的是积分**
+fn is_credit(item: &Value) -> bool {
+    item["type"]
+        .as_str()
+        .is_some_and(|k| k.eq_ignore_ascii_case("CREDIT_LIMIT"))
 }
 
 fn windows(items: &[Value], now_ms: u64) -> Vec<Window> {
@@ -164,12 +173,15 @@ fn windows(items: &[Value], now_ms: u64) -> Vec<Window> {
             continue;
         };
         let used_percent = used_percent.clamp(0.0, 100.0);
+        // **积分只来自积分制套餐。**老套餐的 token 窗口就算也带着这三个数，数的也是
+        // token，当成积分显示就错了
         let credits = match (
+            is_credit(item),
             item["usage"].as_f64(),
             item["currentValue"].as_f64(),
             item["remaining"].as_f64(),
         ) {
-            (Some(total), Some(used), Some(remaining)) => Some(tw_api::QuotaCredits {
+            (true, Some(total), Some(used), Some(remaining)) => Some(tw_api::QuotaCredits {
                 total,
                 used,
                 remaining,
@@ -211,9 +223,13 @@ pub struct Exhausted {
 /// 读 429 的 body：是额度用完的话，是哪个窗口、什么时候重置。
 ///
 /// 业务码在 Anthropic 端点上是 `error.type`（字符串），在 OpenAI 端点上是 `error.code`。
-/// **算用完的只有这几个**：1308（5 小时）、1310（每周或每月）、1316–1321（团队超额）。
+/// **算用完的只有这几个**：1308（5 小时）、1310（每周）、1316–1321（团队超额）。
 /// 套餐到期（1309）、公平使用限制（1313）、临时限流（1302、1305）都不是额度用完，
 /// 记成用完会让界面报一个重置之后也好不了的「用完了」。
+///
+/// **1310 只标每周。**它本来说的是「每周或每月」，可每月的那个数的是 MCP 工具的调用次数，
+/// 那些调用不经过网关（见 `window_of`）：模型请求上的 1310 说的只能是每周额度，消息
+/// 怎么写都一样
 pub fn exhausted(body: &[u8]) -> Option<Exhausted> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let err = v.get("error")?;
@@ -225,10 +241,11 @@ pub fn exhausted(body: &[u8]) -> Option<Exhausted> {
         return None;
     }
     let message = err["message"].as_str().unwrap_or_default();
-    let window = window_in(message).or(match code {
-        1308 => Some("5h"),
-        _ => None,
-    });
+    let window = match code {
+        1310 => Some("weekly"),
+        1308 => window_in(message).or(Some("5h")),
+        _ => window_in(message),
+    };
     Some(Exhausted {
         code,
         window,
@@ -244,8 +261,6 @@ fn window_in(message: &str) -> Option<&'static str> {
         Some("5h")
     } else if m.contains("week") || m.contains("周") {
         Some("weekly")
-    } else if m.contains("month") || m.contains("月") {
-        Some("monthly")
     } else {
         None
     }
@@ -276,17 +291,13 @@ fn reset_in(message: &str) -> Option<u64> {
         .ok()
 }
 
-/// 业务码和消息都没说是哪个窗口时，按已知的额度挑：候选里用得最多的那个。
-/// 一个都不知道就是每周 —— 1310 说的是「每周或每月」，新套餐只有每周
-pub fn guess_window(code: i64, known: &Quota) -> String {
-    let candidates: &[&str] = match code {
-        1310 => &["weekly", "monthly"],
-        _ => &["5h", "weekly", "monthly"],
-    };
+/// 业务码和消息都没说是哪个窗口时（团队超额的 1316–1321），按已知的额度挑：5 小时和
+/// 每周里用得最多的那个。一个都不知道就是每周
+pub fn guess_window(known: &Quota) -> String {
     known
         .windows
         .iter()
-        .filter(|w| candidates.contains(&w.window.as_str()))
+        .filter(|w| matches!(w.window.as_str(), "5h" | "weekly"))
         .max_by(|a, b| a.used_percent.total_cmp(&b.used_percent))
         .map(|w| w.window.clone())
         .unwrap_or_else(|| "weekly".to_string())
@@ -512,10 +523,10 @@ mod tests {
         assert_eq!(week.credits.map(|c| c.remaining), Some(9731.0));
     }
 
-    /// 老套餐 V1：一个 5 小时的 token 窗口，加每月的 MCP 调用次数。
-    /// 每月窗口放在前面，它先重置 —— **不按重置先后猜**
+    /// 老套餐 V1：一个 5 小时的 token 窗口，加 MCP 工具的调用次数（`TIME_LIMIT`）。
+    /// **调用次数不要**：那些调用不经过网关
     #[test]
-    fn an_old_v1_plan_has_five_hours_and_monthly_calls() {
+    fn an_old_v1_plan_has_only_the_five_hour_window() {
         let q = quota(&format!(
             r#"{{"code":200,"success":true,"data":{{"level":"pro","limits":[
                 {{"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":40,"remaining":960,"percentage":4,"nextResetTime":{m}}},
@@ -524,32 +535,43 @@ mod tests {
             m = NOW + 10 * MINUTE_MS,
             h = NOW + 3 * HOUR_MS,
         ));
-        assert_eq!(q.windows.len(), 2);
-        assert_eq!(window(&q, "5h").used_percent, 37.0);
-        assert_eq!(window(&q, "5h").credits, None);
-        let month = window(&q, "monthly");
-        assert_eq!(month.used_percent, 4.0);
-        assert_eq!(month.resets_at_ms, Some(NOW + 10 * MINUTE_MS));
+        assert_eq!(q.windows.len(), 1, "{q:?}");
+        let five = window(&q, "5h");
+        assert_eq!(five.used_percent, 37.0);
+        assert_eq!(five.resets_at_ms, Some(NOW + 3 * HOUR_MS));
+        assert_eq!(five.credits, None);
     }
 
-    /// 老套餐 V2：多了每周的 token 窗口，`number` 是 7
+    /// 老套餐 V2：多了每周的 token 窗口，`number` 是 7。**`TIME_LIMIT` 照样不要**，
+    /// 调用次数用满了也不要：那不是模型请求的额度
     #[test]
-    fn an_old_v2_plan_adds_a_weekly_window() {
+    fn an_old_v2_plan_adds_a_weekly_window_and_ignores_the_mcp_calls() {
         let q = quota(&format!(
             r#"{{"code":0,"data":{{"limits":[
                 {{"type":"TOKENS_LIMIT","unit":6,"number":7,"percentage":81,"nextResetTime":{w}}},
                 {{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":100,"nextResetTime":{h}}},
-                {{"type":"TIME_LIMIT","unit":5,"number":1,"percentage":0}}
+                {{"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":1000,"remaining":0,"percentage":100,"nextResetTime":{m}}}
             ]}}}}"#,
             w = NOW + 2 * HOUR_MS,
             h = NOW + 4 * HOUR_MS,
+            m = NOW + 10 * DAY_MS,
         ));
         let names: Vec<_> = q.windows.iter().map(|w| w.window.as_str()).collect();
-        assert_eq!(names, ["weekly", "5h", "monthly"]);
-        assert_eq!(window(&q, "weekly").used_percent, 81.0);
+        assert_eq!(names, ["weekly", "5h"]);
+        let week = window(&q, "weekly");
+        assert_eq!(week.used_percent, 81.0);
+        assert_eq!(week.status, None);
         // 用满就是被拒
         assert_eq!(window(&q, "5h").status.as_deref(), Some("rejected"));
-        assert_eq!(window(&q, "monthly").resets_at_ms, None);
+    }
+
+    /// 积分只来自积分制套餐：token 窗口带着同样三个数，那也是 token
+    #[test]
+    fn only_a_credit_window_has_credits() {
+        let q = quota(
+            r#"{"success":true,"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"usage":40000000,"currentValue":1000000,"remaining":39000000,"percentage":2}]}}"#,
+        );
+        assert_eq!(window(&q, "5h").credits, None);
     }
 
     #[test]
@@ -622,15 +644,20 @@ mod tests {
         let q = quota(&format!(
             r#"{{"success":true,"data":{{"limits":[
                 {{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":20,"nextResetTime":{late}}},
-                {{"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":20,"nextResetTime":{past}}},
-                {{"type":"TIME_LIMIT","unit":5,"number":1,"percentage":20,"nextResetTime":"明天"}}
+                {{"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":20,"nextResetTime":{past}}}
             ]}}}}"#,
             // 5 小时窗口却在 6 小时后重置
             late = NOW + 6 * HOUR_MS,
             // 已经过去了
             past = NOW - MINUTE_MS,
         ));
+        assert_eq!(q.windows.len(), 2, "{q:?}");
         assert!(q.windows.iter().all(|w| w.resets_at_ms.is_none()), "{q:?}");
+        // 不是时刻的也不要
+        let q = quota(
+            r#"{"success":true,"data":{"limits":[{"type":"CREDIT_LIMIT","unit":6,"number":1,"percentage":20,"nextResetTime":"明天"}]}}"#,
+        );
+        assert_eq!(window(&q, "weekly").resets_at_ms, None);
         // 差一点的钟不该让一个真实的时刻被丢掉
         let q = quota(&format!(
             r#"{{"success":true,"data":{{"limits":[{{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":20,"nextResetTime":{t}}}]}}}}"#,
@@ -703,19 +730,43 @@ mod tests {
         assert!(e.resets_at_ms.is_some());
     }
 
+    /// **1310 只标每周**：每月的那个上限数的是 MCP 工具的调用，不经过网关。消息里
+    /// 说的是每月、是 5 小时，都还是每周
     #[test]
-    fn monthly_and_team_limits_count_too() {
-        let e = exhausted(
-            br#"{"type":"error","error":{"type":"1310","message":"Monthly limit exhausted."}}"#,
-        )
-        .unwrap();
-        assert_eq!(e.window, Some("monthly"));
-        assert_eq!(e.resets_at_ms, None, "消息里没有时刻就没有");
-        for code in 1316..=1321 {
+    fn a_1310_is_the_weekly_window_whatever_the_message_says() {
+        for message in [
+            "Weekly/Monthly Limit Exhausted.",
+            "Monthly limit exhausted.",
+            "已达到每月使用上限。",
+            "Usage limit reached for 5 hour.",
+            "",
+        ] {
             let body =
-                format!(r#"{{"error":{{"code":"{code}","message":"Team quota exceeded"}}}}"#);
-            let e = exhausted(body.as_bytes()).unwrap_or_else(|| panic!("{code}"));
-            assert_eq!(e.window, None, "{code}：说不清是哪个窗口");
+                format!(r#"{{"type":"error","error":{{"type":"1310","message":"{message}"}}}}"#);
+            let e = exhausted(body.as_bytes()).unwrap_or_else(|| panic!("{message}"));
+            assert_eq!(e.code, 1310);
+            assert_eq!(e.window, Some("weekly"), "{message}");
+            assert_eq!(e.resets_at_ms, None, "消息里没有时刻就没有");
+        }
+    }
+
+    /// 团队超额：消息说了是 5 小时还是每周就照着标，说不清的交给 `guess_window`。
+    /// **说每月的也是说不清**：没有每月这个窗口
+    #[test]
+    fn team_limits_count_too() {
+        for code in 1316..=1321 {
+            let e = |message: &str| {
+                let body = format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#);
+                exhausted(body.as_bytes()).unwrap_or_else(|| panic!("{code}"))
+            };
+            assert_eq!(
+                e("Team quota exceeded").window,
+                None,
+                "{code}：说不清是哪个窗口"
+            );
+            assert_eq!(e("Team limit reached for 5 hour").window, Some("5h"));
+            assert_eq!(e("团队每周额度已用完").window, Some("weekly"));
+            assert_eq!(e("Team monthly limit exhausted").window, None, "{code}");
         }
     }
 
@@ -741,12 +792,15 @@ mod tests {
     #[test]
     fn an_unnamed_window_is_the_tightest_known_candidate() {
         let known = Quota {
-            windows: vec![w("5h", 100.0), w("weekly", 40.0), w("monthly", 90.0)],
+            windows: vec![w("5h", 100.0), w("weekly", 40.0)],
         };
-        // 1310 说的是每周或每月，不会是 5 小时
-        assert_eq!(guess_window(1310, &known), "monthly");
-        assert_eq!(guess_window(1318, &known), "5h");
-        assert_eq!(guess_window(1310, &Quota::default()), "weekly");
+        assert_eq!(guess_window(&known), "5h");
+        let known = Quota {
+            windows: vec![w("5h", 10.0), w("weekly", 90.0)],
+        };
+        assert_eq!(guess_window(&known), "weekly");
+        // 一个都不知道就是每周
+        assert_eq!(guess_window(&Quota::default()), "weekly");
     }
 
     fn w(name: &str, used: f64) -> Window {

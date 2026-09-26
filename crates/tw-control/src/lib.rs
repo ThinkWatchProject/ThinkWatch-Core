@@ -986,7 +986,7 @@ async fn request_detail(
 /// 金额还是百分比，两种人格共用同一块地方。
 ///
 /// GLM Coding Plan 的额度不在响应头里：**界面来要时去问**（60 秒内合成一次），问得慢的
-/// 不等，问完由 `QuotaSeen` 补上
+/// 不等，问完由 `QuotaSeen` 补上；判定没有套餐的，由一条窗口为空的 `QuotaSeen` 撤下
 async fn quota(State(s): State<ControlState>) -> Json<Vec<tw_api::ProviderQuota>> {
     s.gateway.refresh_glm_quotas(GLM_QUOTA_WAIT).await;
     let mut out: Vec<tw_api::ProviderQuota> = s
