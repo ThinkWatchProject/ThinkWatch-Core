@@ -799,6 +799,9 @@ mod tests {
             "session-id",
             "session_id",
             "version",
+            "X-OAI-Attestation",
+            "x-codex-installation-id",
+            "x-codex-turn-metadata",
         ] {
             let mut forged = login.clone();
             forged.headers = p(&format!(
