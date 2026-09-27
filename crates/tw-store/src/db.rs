@@ -22,7 +22,7 @@ use tw_api::Msg;
 ///
 /// **一列 JSON 的样子变了也算**（比如 `routing` 多了必有的字段）：旧的那些行
 /// 读出来是坏的，而读的一方会把「解不开」当成「没有」。
-const SCHEMA: i64 = 21;
+const SCHEMA: i64 = 22;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -84,8 +84,14 @@ pub struct RequestRow {
     pub path: String,
     /// 没走到上游就失败时是 None
     pub status: Option<u16>,
+    /// 响应头到的时刻
     pub ttfb_ms: Option<i64>,
+    /// 第一个 token 到的时刻。只有流式的有（`tw_api::Event::RequestFirstToken`）
+    pub ttft_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// 生成速度，token/秒。网关在结局里算好的（`RequestFinished::tokens_per_sec`），
+    /// 只有跑完的流式请求有
+    pub tokens_per_sec: Option<u32>,
     pub bytes: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -230,7 +236,13 @@ impl Db {
                 path               TEXT    NOT NULL,
                 status             INTEGER,
                 ttfb_ms            INTEGER,
+                -- 第一个 token 到的时刻。**和响应头是两个时刻**：流式响应的响应头一般
+                -- 一收到请求就回，用户等的是这一个。非流式的没有
+                ttft_ms            INTEGER,
                 duration_ms        INTEGER,
+                -- 生成速度，token/秒。**在记录的时候就定下**：推理被隐藏时要扣掉推理
+                -- token，而那只有看着流的网关知道，事后从这几列推不回来
+                tokens_per_sec     INTEGER,
                 bytes              INTEGER,
                 input_tokens       INTEGER,
                 output_tokens      INTEGER,
@@ -301,8 +313,9 @@ impl Db {
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
               client_hint, session, cancelled, price_source, translated,
-              error_code, error_args, peer, key_masked, session_log_bytes)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
+              error_code, error_args, peer, key_masked, session_log_bytes,
+              ttft_ms, tokens_per_sec)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)",
             params![
                 r.id,
                 r.at_ms,
@@ -338,6 +351,8 @@ impl Db {
                 r.peer,
                 r.key_masked,
                 r.session_log_bytes,
+                r.ttft_ms,
+                r.tokens_per_sec,
             ],
         )?;
         Ok(())
@@ -670,16 +685,19 @@ impl Db {
         })
     }
 
-    /// 某段时间内每个模型的延迟分位数。
+    /// 某段时间内每个模型第一个 token 到的时刻的分位数。
     ///
     /// **用分位数不用平均值**：AI 延迟是长尾分布，平均值会被极端
     /// 值拉偏。**样本数一起返回** —— 「800ms」是 3 个样本还是 300 个，
     /// 含义完全不同。
+    ///
+    /// **只有流式的有样本。**非流式的整段一起到：它的「第一个 token」就是总耗时，混进来
+    /// 的话，一个跑了三十秒的长回答会让这个模型看起来要等三十秒才开口。
     pub fn latency_by_model(&self, since_ms: i64, until_ms: i64) -> Result<Vec<Latency>, DbError> {
         let mut st = self.conn.prepare(
-            "SELECT model, ttfb_ms FROM requests
-             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttfb_ms IS NOT NULL
-             ORDER BY model, ttfb_ms",
+            "SELECT model, ttft_ms FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttft_ms IS NOT NULL
+             ORDER BY model, ttft_ms",
         )?;
         let rows = st.query_map(params![since_ms, until_ms], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -846,7 +864,7 @@ impl Db {
         )?)
     }
 
-    /// 按上游分的延迟分位数。
+    /// 按上游分的延迟分位数。样本和按模型分的一样，只有流式的。
     ///
     /// **和按模型分是两个问题。**「哪个模型慢」和「哪家上游慢」的下一步
     /// 完全不同：前者换模型，后者换上游。合成一张表的话两个问题都答不好
@@ -857,10 +875,10 @@ impl Db {
         until_ms: i64,
     ) -> Result<Vec<Latency>, DbError> {
         let mut st = self.conn.prepare(
-            "SELECT provider, ttfb_ms FROM requests
-             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttfb_ms IS NOT NULL
+            "SELECT provider, ttft_ms FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttft_ms IS NOT NULL
                AND provider <> ''
-             ORDER BY provider, ttfb_ms",
+             ORDER BY provider, ttft_ms",
         )?;
         let rows = st.query_map(params![since_ms, until_ms], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -875,6 +893,58 @@ impl Db {
             .map(|(model, xs)| Latency {
                 p50: percentile(&xs, 50),
                 p95: percentile(&xs, 95),
+                samples: xs.len(),
+                model,
+            })
+            .collect())
+    }
+
+    /// 某段时间内每个模型的生成速度中位数，token/秒。
+    ///
+    /// 和延迟一样用分位数、带样本数。样本是有速度的请求：跑完的流式请求（见
+    /// `tokens_per_sec` 那一列）。
+    pub fn token_rate_by_model(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<TokenRate>, DbError> {
+        self.token_rate("model", since_ms, until_ms)
+    }
+
+    /// 按上游分的生成速度中位数。**和按模型分是两个问题**，理由同延迟。
+    pub fn token_rate_by_provider(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<TokenRate>, DbError> {
+        self.token_rate("provider", since_ms, until_ms)
+    }
+
+    /// `by` 只会是上面两个调用方给的列名，不来自外面
+    fn token_rate(
+        &self,
+        by: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<TokenRate>, DbError> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {by}, tokens_per_sec FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND tokens_per_sec IS NOT NULL
+               AND {by} <> ''
+             ORDER BY {by}, tokens_per_sec"
+        ))?;
+        let rows = st.query_map(params![since_ms, until_ms], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut by: std::collections::BTreeMap<String, Vec<i64>> = Default::default();
+        for row in rows {
+            let (m, t) = row?;
+            by.entry(m).or_default().push(t);
+        }
+        Ok(by
+            .into_iter()
+            .map(|(model, xs)| TokenRate {
+                p50: percentile(&xs, 50).clamp(0, i64::from(u32::MAX)) as u32,
                 samples: xs.len(),
                 model,
             })
@@ -1190,7 +1260,9 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         path: r.get("path")?,
         status: r.get::<_, Option<i64>>("status")?.map(|s| s as u16),
         ttfb_ms: r.get("ttfb_ms")?,
+        ttft_ms: r.get("ttft_ms")?,
         duration_ms: r.get("duration_ms")?,
+        tokens_per_sec: r.get("tokens_per_sec")?,
         bytes: r.get("bytes")?,
         input_tokens: r.get("input_tokens")?,
         output_tokens: r.get("output_tokens")?,
@@ -1319,6 +1391,14 @@ pub struct Latency {
     pub samples: usize,
 }
 
+/// 生成速度的中位数。`model` 在按上游分的那个查询里是上游名
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenRate {
+    pub model: String,
+    pub p50: u32,
+    pub samples: usize,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1345,8 +1425,10 @@ pub(crate) mod tests {
             model: "claude-sonnet-4-5".into(),
             path: "/v1/messages".into(),
             status: Some(200),
-            ttfb_ms: Some(800),
+            ttfb_ms: Some(300),
+            ttft_ms: Some(800),
             duration_ms: Some(4000),
+            tokens_per_sec: Some(156),
             bytes: Some(12345),
             input_tokens: Some(1000),
             output_tokens: Some(500),
@@ -1595,12 +1677,16 @@ pub(crate) mod tests {
         let mut r = row(1, 1);
         r.status = None;
         r.ttfb_ms = None;
+        r.ttft_ms = None;
+        r.tokens_per_sec = None;
         r.cost_micros = None;
         r.input_tokens = None;
         db.insert(&r).unwrap();
         let got = db.get(1).unwrap().unwrap();
         assert_eq!(got.status, None);
         assert_eq!(got.ttfb_ms, None);
+        assert_eq!(got.ttft_ms, None);
+        assert_eq!(got.tokens_per_sec, None);
         assert_eq!(got.cost_micros, None);
         assert_eq!(got.input_tokens, None);
     }
@@ -1660,6 +1746,7 @@ pub(crate) mod tests {
         let mut probe = row(2, 200);
         probe.local = true;
         probe.ttfb_ms = Some(0);
+        probe.ttft_ms = Some(0);
         probe.cost_micros = Some(0);
         probe.input_tokens = Some(0);
         db.insert(&probe).unwrap();
@@ -1680,7 +1767,7 @@ pub(crate) mod tests {
         let db = Db::in_memory().unwrap();
         for (i, t) in (1..=100).enumerate() {
             let mut r = row(i as i64 + 1, 1000);
-            r.ttfb_ms = Some(t * 10);
+            r.ttft_ms = Some(t * 10);
             db.insert(&r).unwrap();
         }
         let lat = db.latency_by_model(0, 10_000).unwrap();
@@ -1698,11 +1785,11 @@ pub(crate) mod tests {
         let db = Db::in_memory().unwrap();
         for i in 1..=99 {
             let mut r = row(i, 1000);
-            r.ttfb_ms = Some(500);
+            r.ttft_ms = Some(500);
             db.insert(&r).unwrap();
         }
         let mut slow = row(100, 1000);
-        slow.ttfb_ms = Some(60_000);
+        slow.ttft_ms = Some(60_000);
         db.insert(&slow).unwrap();
         let lat = db.latency_by_model(0, 10_000).unwrap();
         assert_eq!(lat[0].p50, 500, "一个慢请求不该动 p50");
@@ -1713,16 +1800,93 @@ pub(crate) mod tests {
         let db = Db::in_memory().unwrap();
         let mut a = row(1, 1000);
         a.model = "claude-opus-4".into();
-        a.ttfb_ms = Some(3000);
+        a.ttft_ms = Some(3000);
         let mut b = row(2, 1000);
         b.model = "claude-3-5-haiku".into();
-        b.ttfb_ms = Some(300);
+        b.ttft_ms = Some(300);
         db.insert(&a).unwrap();
         db.insert(&b).unwrap();
         let lat = db.latency_by_model(0, 10_000).unwrap();
         assert_eq!(lat.len(), 2);
         let opus = lat.iter().find(|l| l.model == "claude-opus-4").unwrap();
         assert_eq!(opus.p50, 3000);
+    }
+
+    /// **延迟看第一个 token，不看响应头。**非流式的没有第一个 token，不进样本：它的
+    /// 响应头要等整段生成完才到，混进来的话这个模型看起来要等几十秒才开口
+    #[test]
+    fn latency_is_the_first_token_and_leaves_non_streaming_requests_out() {
+        let db = Db::in_memory().unwrap();
+        let mut streamed = row(1, 1000);
+        streamed.ttfb_ms = Some(200);
+        streamed.ttft_ms = Some(1_200);
+        let mut whole = row(2, 1000);
+        whole.ttfb_ms = Some(30_000);
+        whole.ttft_ms = None;
+        whole.tokens_per_sec = None;
+        db.insert(&streamed).unwrap();
+        db.insert(&whole).unwrap();
+        let lat = db.latency_by_model(0, 10_000).unwrap();
+        assert_eq!((lat[0].p50, lat[0].samples), (1_200, 1), "{lat:?}");
+        let by_provider = db.latency_by_provider(0, 10_000).unwrap();
+        assert_eq!((by_provider[0].p50, by_provider[0].samples), (1_200, 1));
+    }
+
+    /// 生成速度按模型、按上游各给中位数和样本数；没有速度的请求（非流式、本地应答）
+    /// 不进样本
+    #[test]
+    fn token_rate_is_the_median_by_model_and_by_upstream() {
+        let db = Db::in_memory().unwrap();
+        for (id, model, provider, rate) in [
+            (1, "sonnet", "anthropic", Some(80)),
+            (2, "sonnet", "anthropic", Some(90)),
+            (3, "sonnet", "openrouter", Some(120)),
+            (4, "haiku", "anthropic", Some(200)),
+            (5, "haiku", "anthropic", None),
+        ] {
+            let mut r = row(id, 1000);
+            r.model = model.into();
+            r.provider = provider.into();
+            r.tokens_per_sec = rate;
+            db.insert(&r).unwrap();
+        }
+        let mut probe = row(6, 1000);
+        probe.local = true;
+        probe.tokens_per_sec = Some(9_999);
+        db.insert(&probe).unwrap();
+
+        let by_model = db.token_rate_by_model(0, 10_000).unwrap();
+        assert_eq!(
+            by_model,
+            vec![
+                TokenRate {
+                    model: "haiku".into(),
+                    p50: 200,
+                    samples: 1
+                },
+                TokenRate {
+                    model: "sonnet".into(),
+                    p50: 90,
+                    samples: 3
+                },
+            ]
+        );
+        let by_provider = db.token_rate_by_provider(0, 10_000).unwrap();
+        assert_eq!(
+            by_provider,
+            vec![
+                TokenRate {
+                    model: "anthropic".into(),
+                    p50: 90,
+                    samples: 3
+                },
+                TokenRate {
+                    model: "openrouter".into(),
+                    p50: 120,
+                    samples: 1
+                },
+            ]
+        );
     }
 
     #[test]

@@ -88,7 +88,21 @@ pub(super) fn respond(
         &mut out_headers,
         session.as_ref(),
     );
-    let mut relay = Relay::new(state, rt, req, plan, &ledger, session, provider, id);
+    let upstream_dialect = upstream_dialect(req, session.as_ref());
+    // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
+    if generates && plan.is_sse && status.is_success() {
+        ending.streaming(upstream_dialect);
+    }
+    let mut relay = Relay::new(
+        state,
+        rt,
+        plan,
+        &ledger,
+        session,
+        provider,
+        id,
+        upstream_dialect,
+    );
     let chunks = upstream.bytes_stream();
     let dialect = req.dialect;
     // 上游静默时补心跳：**只给 Anthropic Messages 的流**。那是客户端按字节计时、
@@ -197,6 +211,17 @@ pub(super) fn respond(
     *resp.status_mut() = status;
     *resp.headers_mut() = out_headers;
     resp
+}
+
+/// 上游说的是哪种格式。转换过的看会话，直通的就是客户端那一种。
+fn upstream_dialect(
+    req: &Inbound,
+    session: Option<&tw_dialect::convert::Session>,
+) -> tw_dialect::ir::Dialect {
+    session
+        .map(|s| s.upstream)
+        .or_else(|| req.api.map(|a| a.dialect()))
+        .unwrap_or(tw_dialect::ir::Dialect::Anthropic)
 }
 
 /// Anthropic 的心跳帧，和它自己的 API 发的一样。
@@ -370,19 +395,14 @@ impl Relay {
     fn new(
         state: &AppState,
         rt: &Runtime,
-        req: &Inbound,
         plan: Plan,
         ledger: &tw_guard::redact::replace::Ledger,
         session: Option<tw_dialect::convert::Session>,
         provider: &tw_config::Provider,
         id: u64,
+        upstream_dialect: tw_dialect::ir::Dialect,
     ) -> Self {
         // 还原看的是**上游的原话**（转换之前），所以按上游的格式认帧
-        let upstream_dialect = session
-            .as_ref()
-            .map(|s| s.upstream)
-            .or_else(|| req.api.map(|a| a.dialect()))
-            .unwrap_or(tw_dialect::ir::Dialect::Anthropic);
         let restorer = tw_guard::redact::sse::Body::new(ledger, plan.is_sse, upstream_dialect);
         let back = if plan.convert_stream {
             session.as_ref().map(|s| s.stream())

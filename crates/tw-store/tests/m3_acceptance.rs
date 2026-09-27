@@ -37,8 +37,10 @@ fn req(id: i64, at_ms: i64) -> RequestRow {
         model: "claude-sonnet-4-5".into(),
         path: "/v1/messages".into(),
         status: Some(200),
-        ttfb_ms: Some(800),
+        ttfb_ms: Some(300),
+        ttft_ms: Some(800),
         duration_ms: Some(4000),
+        tokens_per_sec: Some(156),
         bytes: Some(1000),
         input_tokens: Some(1000),
         output_tokens: Some(500),
@@ -77,11 +79,12 @@ fn one_you_can_ask_what_yesterday_cost() {
     );
 }
 
-/// 验收二：**哪家 TTFT 最差。**
+/// 验收二：**哪家 TTFT 最差。**看的是第一个 token，不是响应头：响应头一样快的两家，
+/// 开口可以差好几秒
 #[test]
 fn two_you_can_ask_which_upstream_has_the_worst_ttft() {
     let (_d, db) = open();
-    for (i, p, ttfb) in [
+    for (i, p, ttft) in [
         (1i64, "官方", 300i64),
         (2, "官方", 320),
         (3, "中转", 2500),
@@ -89,7 +92,8 @@ fn two_you_can_ask_which_upstream_has_the_worst_ttft() {
     ] {
         let mut r = req(i, NOW);
         r.provider = p.into();
-        r.ttfb_ms = Some(ttfb);
+        r.ttfb_ms = Some(200);
+        r.ttft_ms = Some(ttft);
         db.insert(&r).unwrap();
     }
     let mut by = db.latency_by_provider(0, NOW + 1).unwrap();
