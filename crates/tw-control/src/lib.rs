@@ -112,6 +112,8 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::History, history)
         .at(ep::Latency, latency)
         .at(ep::LatencyByProvider, latency_by_provider)
+        .at(ep::TokenRate, token_rate)
+        .at(ep::TokenRateByProvider, token_rate_by_provider)
         .at(ep::Storage, storage)
         .at(ep::Quota, quota)
         .at(ep::SpeedQuote, speed_quote)
@@ -1014,6 +1016,38 @@ async fn latency_by_provider(
     ))
 }
 
+/// 生成速度的中位数，按模型。**「哪个模型吐得快」**
+async fn token_rate(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
+) -> Result<Json<Vec<tw_api::TokenRateView>>, Fail> {
+    let (from, to) = range(q.from_ms, q.to_ms);
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let xs = g.db().token_rate_by_model(from, to).map_err(records)?;
+    Ok(Json(xs.into_iter().map(token_rate_view).collect()))
+}
+
+/// 按上游分的生成速度。**和按模型分是两个问题**，理由同延迟
+async fn token_rate_by_provider(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
+) -> Result<Json<Vec<tw_api::TokenRateView>>, Fail> {
+    let (from, to) = range(q.from_ms, q.to_ms);
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    let xs = g.db().token_rate_by_provider(from, to).map_err(records)?;
+    Ok(Json(xs.into_iter().map(token_rate_view).collect()))
+}
+
+fn token_rate_view(r: tw_store::TokenRate) -> tw_api::TokenRateView {
+    tw_api::TokenRateView {
+        model: r.model,
+        p50: r.p50,
+        samples: r.samples,
+    }
+}
+
 async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     let Some(store) = &s.store else {
         return Json(tw_api::StorageStatus {
@@ -1060,7 +1094,9 @@ fn history_row(
         path: r.path,
         status: r.status,
         ttfb_ms: r.ttfb_ms,
+        ttft_ms: r.ttft_ms,
         duration_ms: r.duration_ms,
+        tokens_per_sec: r.tokens_per_sec,
         bytes: r.bytes,
         input_tokens: r.input_tokens,
         output_tokens: r.output_tokens,

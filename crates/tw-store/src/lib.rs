@@ -14,7 +14,7 @@ pub mod recorder;
 pub mod task;
 
 pub use blobs::{Blobs, Which};
-pub use db::{Db, DbError, Latency, RequestRow, SecurityEvent, Summary};
+pub use db::{Db, DbError, Latency, RequestRow, SecurityEvent, Summary, TokenRate};
 pub use recorder::{Recorder, price_source};
 pub use task::StoredBody;
 

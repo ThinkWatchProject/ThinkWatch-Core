@@ -104,6 +104,7 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
         bytes: 10,
         duration_ms: 5,
         usage: None,
+        tokens_per_sec: None,
     });
 
     let got = get(router).await;
@@ -167,7 +168,11 @@ async fn live_gives_the_running_requests_and_the_generation_rate() {
     bus.emit(tw_api::Event::RequestHeaders {
         id: 1,
         status: 200,
-        ttfb_ms: 1_000,
+        ttfb_ms: 400,
+    });
+    bus.emit(tw_api::Event::RequestFirstToken {
+        id: 1,
+        ttft_ms: 1_000,
     });
     bus.emit(tw_api::Event::RequestFinished {
         id: 1,
@@ -179,6 +184,7 @@ async fn live_gives_the_running_requests_and_the_generation_rate() {
             output: 100,
             ..Default::default()
         }),
+        tokens_per_sec: Some(50),
     });
     bus.emit(started(2, "gpt-5.5"));
 

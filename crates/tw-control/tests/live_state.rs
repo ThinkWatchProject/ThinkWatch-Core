@@ -187,6 +187,7 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
             bytes: 120,
             duration_ms: 4_000,
             usage: None,
+            tokens_per_sec: None,
         });
     let (st, v) = get(&app, "/request/7").await;
     assert_eq!(st, StatusCode::OK, "{v}");

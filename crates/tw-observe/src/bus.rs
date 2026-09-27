@@ -33,9 +33,9 @@ pub struct EventBus {
 struct Tally {
     /// 开始了、还没有结局的请求，按 id
     open: BTreeMap<u64, Open>,
-    /// 在跑的请求首字节用了多久，毫秒。生成用时要从总耗时里减掉它
-    ttfb: HashMap<u64, u64>,
-    /// 最近跑完的：（什么时候结束的，输出了多少 token，生成用了多少毫秒）
+    /// 在跑的请求第一个 token 用了多久，毫秒。生成用时要从总耗时里减掉它
+    ttft: HashMap<u64, u64>,
+    /// 最近跑完的：（什么时候结束的，第一个 token 之后吐了多少 token，生成用了多少毫秒）
     done: VecDeque<(Instant, u64, u64)>,
 }
 
@@ -57,6 +57,7 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
     use tw_api::Event as E;
     match ev {
         E::RequestHeaders { .. }
+        | E::RequestFirstToken { .. }
         | E::RequestRouted { .. }
         | E::Translated { .. }
         | E::SecretsFound { .. }
@@ -182,33 +183,35 @@ impl EventBus {
                     },
                 );
             }
-            E::RequestHeaders { id, ttfb_ms, .. } => {
+            E::RequestFirstToken { id, ttft_ms } => {
                 if let Some(o) = t.open.get_mut(id) {
                     o.events.push(ev.clone());
-                    t.ttfb.insert(*id, *ttfb_ms);
+                    t.ttft.insert(*id, *ttft_ms);
                 }
             }
             E::RequestFinished {
                 id,
                 duration_ms,
-                usage,
+                tokens_per_sec,
                 ..
             } => {
                 t.open.remove(id);
-                let ttfb = t.ttfb.remove(id);
-                // **只数跑完了的。**取消的、断掉的输出不全，拿来算速率只会偏低；
-                // 没有响应头的（WebSocket）不知道生成用了多久，不瞎算
-                if let (Some(u), Some(ttfb)) = (usage, ttfb) {
-                    let gen_ms = duration_ms.saturating_sub(ttfb);
-                    if u.output > 0 && gen_ms > 0 {
-                        t.done.push_back((now, u.output, gen_ms));
+                let ttft = t.ttft.remove(id);
+                // **只数有速度的。**速度怎么算、什么时候没有，由网关在结局里定（见
+                // `RequestFinished::tokens_per_sec`）：非流式的没有第一个 token，取消的、
+                // 断掉的输出不全。这里只按生成用的时间把它们合起来
+                if let (Some(rate), Some(ttft)) = (tokens_per_sec, ttft) {
+                    let gen_ms = duration_ms.saturating_sub(ttft);
+                    if *rate > 0 && gen_ms > 0 {
+                        t.done
+                            .push_back((now, u64::from(*rate) * gen_ms / 1000, gen_ms));
                     }
                 }
                 t.forget(now);
             }
             E::RequestFailed { id, .. } | E::RequestCancelled { id, .. } => {
                 t.open.remove(id);
-                t.ttfb.remove(id);
+                t.ttft.remove(id);
             }
             // 别的事件挂着的 id 要么是一个请求的，要么是它自己取的号 —— 号从同一个
             // 计数器里取，不会和一个在跑的请求撞上
@@ -253,8 +256,8 @@ impl EventBus {
     /// 此刻的实时读数：在跑的请求（和 [`EventBus::in_flight`] 同一批），和最近
     /// 一分钟跑完的请求平均每秒生成多少 token。
     ///
-    /// **量的是生成的快慢**：每个请求的输出除以它生成用的时间（总耗时减去首字节），
-    /// 按 token 加权。拿「一分钟里输出了多少」去除以六十的话，一个跑了一分钟才
+    /// **量的是生成的快慢**：每个请求的速度按它生成用的时间（总耗时减去第一个 token 的
+    /// 时刻）加权，也就是吐出的 token 合计除以生成用的时间合计。拿「一分钟里输出了多少」去除以六十的话，一个跑了一分钟才
     /// 结束的长请求，要等它结束之后才把速率一次性摊进来，数字跟着请求的长短忽高
     /// 忽低。
     pub fn live(&self) -> tw_api::LiveView {
@@ -371,6 +374,7 @@ mod tests {
             bytes: 0,
             duration_ms: 0,
             usage: None,
+            tokens_per_sec: None,
         });
         b.emit(tw_api::Event::RequestFailed {
             id: 2,
@@ -436,7 +440,7 @@ mod tests {
         }
     }
 
-    /// 半路才来的一方要的是**每个在跑的请求到目前为止的全部**：开始、响应头、路由、
+    /// 半路才来的一方要的是**每个在跑的请求到目前为止的全部**：开始、响应头、第一个 token、路由、
     /// 防护的记录，按发生的先后 —— 只给开始的话，那一行没有状态码、画不到上游。
     /// 说上游现状的额度不跟着请求走；结束了的整条不在
     #[test]
@@ -444,7 +448,12 @@ mod tests {
         let b = EventBus::new();
         b.emit(started(1));
         b.emit(started(2));
-        b.emit(headers(1, 30));
+        b.emit(tw_api::Event::RequestHeaders {
+            id: 1,
+            status: 200,
+            ttfb_ms: 30,
+        });
+        b.emit(first_token(1, 45));
         b.emit(tw_api::Event::QuotaSeen {
             id: 1,
             provider: "p".into(),
@@ -468,7 +477,7 @@ mod tests {
             state: tw_api::BreakerState::Open,
             at_ms: 0,
         });
-        b.emit(finished(2, 10, 1));
+        b.emit(finished(2, 10, None));
 
         let snap = b.in_flight();
         assert!(
@@ -483,12 +492,16 @@ mod tests {
             .map(|e| match e {
                 tw_api::Event::RequestStarted { .. } => "started",
                 tw_api::Event::RequestHeaders { .. } => "headers",
+                tw_api::Event::RequestFirstToken { .. } => "first token",
                 tw_api::Event::RequestRouted { .. } => "routed",
                 tw_api::Event::Translated { .. } => "translated",
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, ["started", "headers", "routed", "translated"]);
+        assert_eq!(
+            kinds,
+            ["started", "headers", "first token", "routed", "translated"]
+        );
     }
 
     /// 没有订阅者的时候照样记 —— 这份快照就是给还没来的订阅者准备的。
@@ -511,15 +524,11 @@ mod tests {
         );
     }
 
-    fn headers(id: u64, ttfb_ms: u64) -> tw_api::Event {
-        tw_api::Event::RequestHeaders {
-            id,
-            status: 200,
-            ttfb_ms,
-        }
+    fn first_token(id: u64, ttft_ms: u64) -> tw_api::Event {
+        tw_api::Event::RequestFirstToken { id, ttft_ms }
     }
 
-    fn finished(id: u64, duration_ms: u64, output: u64) -> tw_api::Event {
+    fn finished(id: u64, duration_ms: u64, tokens_per_sec: Option<u32>) -> tw_api::Event {
         tw_api::Event::RequestFinished {
             id,
             model: "m".into(),
@@ -528,27 +537,28 @@ mod tests {
             duration_ms,
             usage: Some(tw_api::UsageView {
                 input: 10,
-                output,
+                output: 100,
                 ..Default::default()
             }),
+            tokens_per_sec,
         }
     }
 
-    /// **量的是生成的快慢**：首字节之前那一段不算，几个请求按 token 加权。
+    /// **几个请求按生成用的时间加权**：吐出的 token 合计除以生成用的时间合计。
     #[test]
-    fn the_rate_is_output_over_generation_time() {
+    fn the_rate_weighs_each_request_by_its_generation_time() {
         let b = EventBus::new();
         let now = Instant::now();
-        // 首字节 1 秒，之后 2 秒生成了 100 个
+        // 第一个 token 在 1 秒，之后 2 秒、每秒 50 个
         b.track_at(&started(1), now);
-        b.track_at(&headers(1, 1_000), now);
-        b.track_at(&finished(1, 3_000, 100), now);
+        b.track_at(&first_token(1, 1_000), now);
+        b.track_at(&finished(1, 3_000, Some(50)), now);
         assert_eq!(b.live_at(now).tokens_per_sec, Some(50));
-        // 又一个：1 秒生成了 50 个。合起来 150 个 / 3 秒
+        // 又一个：1 秒、每秒 200 个。合起来 300 个 / 3 秒，不是两个速度的平均 125
         b.track_at(&started(2), now);
-        b.track_at(&headers(2, 500), now);
-        b.track_at(&finished(2, 1_500, 50), now);
-        assert_eq!(b.live_at(now).tokens_per_sec, Some(50));
+        b.track_at(&first_token(2, 500), now);
+        b.track_at(&finished(2, 1_500, Some(200)), now);
+        assert_eq!(b.live_at(now).tokens_per_sec, Some(100));
     }
 
     /// 一分钟之前跑完的不算；**没有就是没有**，不是 0
@@ -558,22 +568,31 @@ mod tests {
         let then = Instant::now();
         assert_eq!(b.live_at(then).tokens_per_sec, None);
         b.track_at(&started(1), then);
-        b.track_at(&headers(1, 100), then);
-        b.track_at(&finished(1, 1_100, 40), then);
+        b.track_at(&first_token(1, 100), then);
+        b.track_at(&finished(1, 1_100, Some(40)), then);
         assert_eq!(b.live_at(then).tokens_per_sec, Some(40));
         let later = then + RATE_WINDOW + Duration::from_secs(1);
         assert_eq!(b.live_at(later).tokens_per_sec, None);
     }
 
-    /// 没有响应头的（WebSocket）、失败和取消的，都不拿来算速率
+    /// 没有速度的（非流式：响应头要等整段生成完才到，没有第一个 token）、取消的，都不
+    /// 拿来算。**非流式的混进来会把数顶上天**：总耗时减去响应头只剩读 body 的几毫秒
     #[test]
-    fn only_finished_requests_with_their_headers_make_a_rate() {
+    fn only_requests_with_a_rate_make_the_rate() {
         let b = EventBus::new();
         let now = Instant::now();
         b.track_at(&started(1), now);
-        b.track_at(&finished(1, 2_000, 100), now);
+        b.track_at(
+            &tw_api::Event::RequestHeaders {
+                id: 1,
+                status: 200,
+                ttfb_ms: 1_995,
+            },
+            now,
+        );
+        b.track_at(&finished(1, 2_000, None), now);
         b.track_at(&started(2), now);
-        b.track_at(&headers(2, 100), now);
+        b.track_at(&first_token(2, 100), now);
         b.track_at(
             &tw_api::Event::RequestCancelled {
                 id: 2,
@@ -682,6 +701,7 @@ mod tests {
             bytes: 0,
             duration_ms: 0,
             usage: None,
+            tokens_per_sec: None,
         });
         assert_eq!(b.subscriber_count(), 0);
     }
@@ -697,6 +717,7 @@ mod tests {
             bytes: 1,
             duration_ms: 2,
             usage: None,
+            tokens_per_sec: None,
         });
         assert_eq!(rx.recv().await.unwrap().id(), 42);
     }
@@ -722,6 +743,7 @@ mod tests {
                 bytes: 0,
                 duration_ms: 0,
                 usage: None,
+                tokens_per_sec: None,
             });
         }
         // 生产端全程没阻塞；消费端会收到一个 Lagged
@@ -744,6 +766,7 @@ mod tests {
             bytes: 0,
             duration_ms: 0,
             usage: None,
+            tokens_per_sec: None,
         });
         assert_eq!(a.recv().await.unwrap().id(), 9);
         assert_eq!(c.recv().await.unwrap().id(), 9);

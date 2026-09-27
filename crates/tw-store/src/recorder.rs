@@ -28,6 +28,8 @@ struct Partial {
     path: String,
     status: Option<u16>,
     ttfb_ms: Option<i64>,
+    /// 第一个 token 到的时刻。流式的才有
+    ttft_ms: Option<i64>,
     /// 路由决策。**开始事件就带着第一阶段的结论**（路由、规则、策略组、改写），
     /// 尝试链走完之后路由事件换成终稿 —— 等不到路由事件的请求（上游应答之前
     /// 客户端就走了）也说得出它走的是哪条路由、哪条规则
@@ -54,7 +56,10 @@ const MAX_INFLIGHT: usize = 4096;
 /// 一个请求是怎么结束的。**三种结局落同一张表、走同一条算钱的路**，只在
 /// 这几处不同：失败有 `error`，取消有 `cancelled`，没跑完的金额是估算。
 enum Ending<'a> {
-    Finished,
+    /// 跑完了，带着网关算好的生成速度
+    Finished {
+        tokens_per_sec: Option<u32>,
+    },
     Cancelled,
     Failed(&'a tw_api::Msg),
 }
@@ -142,7 +147,9 @@ impl Recorder {
             path: p.path.clone(),
             status: p.status,
             ttfb_ms: p.ttfb_ms,
+            ttft_ms: p.ttft_ms,
             duration_ms: None,
+            tokens_per_sec: None,
             bytes: None,
             input_tokens: None,
             output_tokens: None,
@@ -216,6 +223,7 @@ impl Recorder {
                         path: path.clone(),
                         status: None,
                         ttfb_ms: None,
+                        ttft_ms: None,
                         routing: tw_api::RoutingView {
                             route: route.clone(),
                             rule: rule.clone(),
@@ -447,6 +455,11 @@ impl Recorder {
                     p.ttfb_ms = Some(*ttfb_ms as i64);
                 }
             }
+            Event::RequestFirstToken { id, ttft_ms } => {
+                if let Some(p) = self.inflight.get_mut(id) {
+                    p.ttft_ms = Some(*ttft_ms as i64);
+                }
+            }
             // 结局里的模型名不用：开始事件已经给过，这一行从那时就在 `inflight` 里
             Event::RequestFinished {
                 id,
@@ -454,6 +467,7 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
+                tokens_per_sec,
                 ..
             } => self.settle(
                 *id,
@@ -461,7 +475,9 @@ impl Recorder {
                 Some(*bytes),
                 Some(*duration_ms),
                 *usage,
-                Ending::Finished,
+                Ending::Finished {
+                    tokens_per_sec: *tokens_per_sec,
+                },
             ),
             /*
                 客户端没等到响应结束就走了。
@@ -534,7 +550,9 @@ impl Recorder {
                     path: probe.slug().to_string(),
                     status: Some(200),
                     ttfb_ms: Some(0),
+                    ttft_ms: None,
                     duration_ms: Some(0),
+                    tokens_per_sec: None,
                     bytes: None,
                     input_tokens: None,
                     output_tokens: None,
@@ -617,7 +635,7 @@ impl Recorder {
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
         // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
         // 占位。按它算出来的钱只会偏低，当成实测会让「今日花费」悄悄少一截。
-        let partial = !matches!(how, Ending::Finished);
+        let partial = !matches!(how, Ending::Finished { .. });
         let book = self.pricing.load();
         // **按这个请求实际走的上游查价** —— 同一个模型在不同上游不是同一个价
         let resolved = if free {
@@ -674,7 +692,12 @@ impl Recorder {
             path: p.path,
             status: status.or(p.status),
             ttfb_ms: p.ttfb_ms,
+            ttft_ms: p.ttft_ms,
             duration_ms: duration_ms.map(|d| d as i64),
+            tokens_per_sec: match how {
+                Ending::Finished { tokens_per_sec } => tokens_per_sec,
+                _ => None,
+            },
             bytes: bytes.map(|b| b as i64),
             input_tokens: u.map(|u| u.input as i64),
             output_tokens: u.map(|u| u.output as i64),
@@ -768,6 +791,7 @@ mod tests {
             bytes: 1234,
             duration_ms: 4000,
             usage,
+            tokens_per_sec: None,
         }
     }
 
@@ -956,6 +980,71 @@ mod tests {
         assert_eq!(row.ttfb_ms, Some(800), "响应头那个事件的信息丢了");
         assert_eq!(row.duration_ms, Some(4000));
         assert_eq!(row.input_tokens, Some(1000));
+    }
+
+    /// 第一个 token 的时刻和网关算好的速度都落进这一行；非流式的两个都没有
+    #[test]
+    fn the_first_token_and_the_rate_are_recorded() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestHeaders {
+            id: 1,
+            status: 200,
+            ttfb_ms: 300,
+        });
+        r.on_event(&Event::RequestFirstToken {
+            id: 1,
+            ttft_ms: 1_200,
+        });
+        let running = r.in_flight_row(1).unwrap();
+        assert_eq!(
+            running.ttft_ms,
+            Some(1_200),
+            "在跑的那一行也该有第一个 token 的时刻"
+        );
+        r.on_event(&Event::RequestFinished {
+            id: 1,
+            model: String::new(),
+            status: 200,
+            bytes: 1234,
+            duration_ms: 4000,
+            usage: None,
+            tokens_per_sec: Some(180),
+        });
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!((row.ttfb_ms, row.ttft_ms), (Some(300), Some(1_200)));
+        assert_eq!(row.tokens_per_sec, Some(180));
+
+        r.on_event(&started(2, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestHeaders {
+            id: 2,
+            status: 200,
+            ttfb_ms: 3_900,
+        });
+        r.on_event(&finished(2, None));
+        let row = r.db().get(2).unwrap().unwrap();
+        assert_eq!((row.ttft_ms, row.tokens_per_sec), (None, None));
+    }
+
+    /// 取消的：第一个 token 确实到过，照记；输出不全，没有速度
+    #[test]
+    fn a_cancelled_stream_keeps_its_first_token_but_has_no_rate() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestFirstToken {
+            id: 1,
+            ttft_ms: 900,
+        });
+        r.on_event(&Event::RequestCancelled {
+            id: 1,
+            model: String::new(),
+            status: Some(200),
+            bytes: 10,
+            duration_ms: 3_000,
+            usage: None,
+        });
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!((row.ttft_ms, row.tokens_per_sec), (Some(900), None));
     }
 
     #[test]
@@ -1284,6 +1373,7 @@ mod billing_tests {
             bytes: 2048,
             duration_ms: 600_000,
             usage: None,
+            tokens_per_sec: None,
         }
     }
 
@@ -1748,7 +1838,11 @@ mod cache_saving_tests {
             r.on_event(&tw_api::Event::RequestHeaders {
                 id,
                 status: 200,
-                ttfb_ms: if id == 1 { 3000 } else { 300 },
+                ttfb_ms: 100,
+            });
+            r.on_event(&tw_api::Event::RequestFirstToken {
+                id,
+                ttft_ms: if id == 1 { 3000 } else { 300 },
             });
             r.on_event(&finished(id, None));
         }

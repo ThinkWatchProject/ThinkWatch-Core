@@ -23,8 +23,15 @@
 use std::time::Instant;
 
 use crate::bodies::{BodyKind, BodyRecord, BodySender, ResponseTap};
+use tw_dialect::convert::Reader;
+use tw_dialect::ir;
 use tw_dialect::usage::{Sniffer, Usage};
 use tw_types::{Msg, msg};
+
+/// 生成用时不到这么久的，不给速度。**块太少，量的是上游怎么分块，不是模型多快**：
+/// 一段十几个 token 的回答常常一两块就到齐了，两块之间只隔几毫秒，一除就是几千
+/// token/秒。
+const MIN_GENERATION_MS: u64 = 500;
 
 /// 一个还欠着结局的请求。
 ///
@@ -49,8 +56,31 @@ pub struct Ending {
     /// 旁路嗅探。客户端走掉那一刻手里有多少用量，靠的就是它
     sniffer: Sniffer,
     tap: ResponseTap,
+    /// 认第一个 token 的。**只在上游回的是成功的流时才有**（见 [`Ending::streaming`]），
+    /// 认出来就扔掉 —— 之后的字节不必再解析
+    first: Option<FirstToken>,
+    /// 第一个 token 是什么时候、以什么开的头
+    opened: Option<Opened>,
     /// 报过了。**只能报一次**
     told: bool,
+}
+
+/// 还在等第一个 token。
+struct FirstToken {
+    reader: Reader,
+    /// 在那之前有过推理块，却一个推理的字都没有：推理被隐藏了
+    hidden_thought: bool,
+}
+
+/// 第一个 token 到的那一刻。
+#[derive(Debug, Clone, Copy)]
+struct Opened {
+    /// 从请求进来算，毫秒
+    ms: u64,
+    /// 开头的是推理的字：推理边想边吐，推理 token 都生成在这之后
+    with_thought: bool,
+    /// 开头之前推理被隐藏了：那些推理 token 生成在这之前
+    hidden_thought: bool,
 }
 
 impl Ending {
@@ -73,8 +103,22 @@ impl Ending {
             bytes: 0,
             sniffer: Sniffer::new(),
             tap: ResponseTap::new(),
+            first: None,
+            opened: None,
             told: false,
         }
+    }
+
+    /// 上游回的是成功的流：按它的格式认第一个 token（见 `tw_api::Event::RequestFirstToken`）。
+    ///
+    /// **按格式解析，不在字节里找关键字**，和测速（`crate::l3`）同一个读法：`message_start`、
+    /// `response.created` 这些开场帧是上游收到请求就发的，认成第一个 token 的话，量到的是
+    /// 建连有多快。
+    pub fn streaming(&mut self, upstream: ir::Dialect) {
+        self.first = Some(FirstToken {
+            reader: Reader::new(upstream),
+            hidden_thought: false,
+        });
     }
 
     /// 上游的响应头到了。从这里起，客户端再走掉，报出去的取消带着状态码。
@@ -88,6 +132,39 @@ impl Ending {
         self.bytes += chunk.len() as u64;
         self.sniffer.feed(chunk);
         self.tap.feed(chunk);
+        self.spot(chunk);
+    }
+
+    /// 在这一块里找第一个 token。找到就报，之后不再解析。
+    fn spot(&mut self, chunk: &[u8]) {
+        let Some(f) = self.first.as_mut() else {
+            return;
+        };
+        let mut opened = None;
+        for e in f.reader.feed(chunk) {
+            match opening(&e) {
+                Some(with_thought) => {
+                    opened = Some((with_thought, f.hidden_thought));
+                    break;
+                }
+                None if hides_thought(&e) => f.hidden_thought = true,
+                None => {}
+            }
+        }
+        let Some((with_thought, hidden_thought)) = opened else {
+            return;
+        };
+        self.first = None;
+        let ms = self.duration_ms();
+        self.opened = Some(Opened {
+            ms,
+            with_thought,
+            hidden_thought,
+        });
+        self.bus.emit(tw_api::Event::RequestFirstToken {
+            id: self.id,
+            ttft_ms: ms,
+        });
     }
 
     /// 只数字节，不嗅用量、不留档。
@@ -104,13 +181,16 @@ impl Ending {
     pub fn finished(mut self, status: u16) {
         self.status = Some(status);
         let usage = self.settle();
+        let duration_ms = self.duration_ms();
+        let tokens_per_sec = rate(self.opened, usage.as_ref(), duration_ms);
         self.bus.emit(tw_api::Event::RequestFinished {
             id: self.id,
             model: std::mem::take(&mut self.model),
             status,
             bytes: self.bytes,
-            duration_ms: self.duration_ms(),
-            usage,
+            duration_ms,
+            usage: usage.map(view),
+            tokens_per_sec,
         });
     }
 
@@ -127,12 +207,12 @@ impl Ending {
             message,
             bytes: self.received(),
             duration_ms: Some(self.duration_ms()),
-            usage,
+            usage: usage.map(view),
         });
     }
 
     /// 收尾：先把响应体交出去，再拿走用量。三种结局共用，只走一次。
-    fn settle(&mut self) -> Option<tw_api::UsageView> {
+    fn settle(&mut self) -> Option<Usage> {
         self.told = true;
         let (recorded, original_len) = std::mem::take(&mut self.tap).finish();
         if !recorded.is_empty() {
@@ -147,7 +227,7 @@ impl Ending {
                 },
             );
         }
-        std::mem::take(&mut self.sniffer).finish().map(view)
+        std::mem::take(&mut self.sniffer).finish()
     }
 
     fn duration_ms(&self) -> u64 {
@@ -169,7 +249,7 @@ impl Drop for Ending {
         // **这里什么都不能 panic。**Drop 可能正跑在一次 unwind 里，那时
         // 再 panic 一次，整个进程就没了。下面每一步都是不会失败的那种：
         // 往通道里 try_send、往广播里 send、读一下时钟。
-        let usage = self.settle();
+        let usage = self.settle().map(view);
         // 是网关自己的代码崩掉了。**记成取消会冤枉客户端** —— 排查的人
         // 会去问一个根本没做过这件事的客户端。
         if std::thread::panicking() {
@@ -195,6 +275,66 @@ impl Drop for Ending {
             usage,
         });
     }
+}
+
+/// 这个事件是不是模型开口了：`Some(true)` 是推理的字，`Some(false)` 是正文或工具调用。
+///
+/// **工具调用一开头就算**：块开头就带着工具名，那已经是模型吐出来的了；参数的第一段
+/// 常常是空的。
+fn opening(e: &ir::Event) -> Option<bool> {
+    match e {
+        ir::Event::Delta {
+            delta: ir::Delta::Thinking(t),
+            ..
+        } if !t.is_empty() => Some(true),
+        ir::Event::Delta {
+            delta: ir::Delta::Text(t) | ir::Delta::ToolInput(t),
+            ..
+        } if !t.is_empty() => Some(false),
+        ir::Event::BlockStart {
+            kind: ir::BlockKind::ToolCall { .. },
+            ..
+        } => Some(false),
+        _ => None,
+    }
+}
+
+/// 推理块开了头、或者只来了推理的签名：推理在进行，却没有字给出来
+fn hides_thought(e: &ir::Event) -> bool {
+    matches!(
+        e,
+        ir::Event::BlockStart {
+            kind: ir::BlockKind::Thinking,
+            ..
+        } | ir::Event::Delta {
+            delta: ir::Delta::Signature(_),
+            ..
+        }
+    )
+}
+
+/// 生成速度：第一个 token 之后吐出的输出，除以从那一刻到结束用的时间。
+///
+/// 分子要和分母对得上。推理被隐藏的，推理 token 生成在第一个 token 之前：上游报了其中
+/// 多少是推理就扣掉；没报（Anthropic 不分开报）就给不出，宁可没有也不给一个顶高好几倍
+/// 的数。推理边想边吐的，推理 token 都在分母之内，照数。
+fn rate(opened: Option<Opened>, usage: Option<&Usage>, duration_ms: u64) -> Option<u32> {
+    let o = opened?;
+    let u = usage?;
+    let counted = if o.with_thought {
+        u.output
+    } else if u.reasoning > 0 {
+        u.output.saturating_sub(u.reasoning)
+    } else if o.hidden_thought {
+        return None;
+    } else {
+        u.output
+    };
+    let gen_ms = duration_ms.saturating_sub(o.ms);
+    if counted == 0 || gen_ms < MIN_GENERATION_MS {
+        return None;
+    }
+    Some((counted.saturating_mul(1000) / gen_ms).min(u64::from(u32::MAX)) as u32)
 }
 
 fn view(u: Usage) -> tw_api::UsageView {
@@ -407,6 +547,141 @@ mod tests {
                 }]
             ),
             "{got:?}"
+        );
+    }
+
+    const TEXT_BLOCK: &[u8] = b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+    const TEXT_DELTA: &[u8] = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n";
+
+    fn first_tokens(got: &[Event]) -> Vec<u64> {
+        got.iter()
+            .filter_map(|e| match e {
+                Event::RequestFirstToken { ttft_ms, .. } => Some(*ttft_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **开场帧不算。**`message_start` 和空的文本块是上游收到请求就发的；第一个字才是
+    /// 模型开口。报一次，之后不再报
+    #[test]
+    fn the_first_token_is_the_first_word_not_the_opening_frames() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.streaming(ir::Dialect::Anthropic);
+        e.feed(MESSAGE_START);
+        e.feed(TEXT_BLOCK);
+        assert!(drain(&mut rx).is_empty(), "开场帧被当成了第一个 token");
+        e.feed(TEXT_DELTA);
+        e.feed(TEXT_DELTA);
+        let got = drain(&mut rx);
+        assert_eq!(first_tokens(&got).len(), 1, "{got:?}");
+        e.finished(200);
+        assert!(first_tokens(&drain(&mut rx)).is_empty());
+    }
+
+    /// 工具调用一开头就算：块开头就带着工具名，参数的第一段常常是空的
+    #[test]
+    fn a_tool_call_opens_the_answer_before_its_arguments() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.streaming(ir::Dialect::Anthropic);
+        e.feed(MESSAGE_START);
+        e.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}}\n\n");
+        assert_eq!(first_tokens(&drain(&mut rx)).len(), 1);
+        drop(e);
+    }
+
+    /// 没说是流的（非流式、上游回了错误）不解析，也就没有第一个 token
+    #[test]
+    fn a_response_that_is_not_a_stream_has_no_first_token() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.feed(TEXT_DELTA);
+        e.finished(200);
+        let got = drain(&mut rx);
+        assert!(first_tokens(&got).is_empty(), "{got:?}");
+        assert!(
+            matches!(
+                got.as_slice(),
+                [Event::RequestFinished {
+                    tokens_per_sec: None,
+                    ..
+                }]
+            ),
+            "{got:?}"
+        );
+    }
+
+    fn usage(output: u64, reasoning: u64) -> Usage {
+        Usage {
+            output,
+            reasoning,
+            ..Default::default()
+        }
+    }
+
+    fn opened(ms: u64, with_thought: bool, hidden_thought: bool) -> Option<Opened> {
+        Some(Opened {
+            ms,
+            with_thought,
+            hidden_thought,
+        })
+    }
+
+    /// 从第一个 token 算到结束：第一秒在排队、读输入，之后 5 秒吐了 500 个
+    #[test]
+    fn the_rate_counts_from_the_first_token() {
+        let u = usage(500, 0);
+        assert_eq!(
+            rate(opened(1_000, false, false), Some(&u), 6_000),
+            Some(100)
+        );
+    }
+
+    /// **推理被隐藏、上游报了其中多少是推理**：那 2000 个推理 token 生成在第一个 token
+    /// 之前，不扣掉的话是 1100 token/秒
+    #[test]
+    fn hidden_reasoning_is_left_out_when_the_upstream_says_how_much_it_was() {
+        let u = usage(2_200, 2_000);
+        assert_eq!(
+            rate(opened(20_000, false, true), Some(&u), 22_000),
+            Some(100)
+        );
+        // Chat Completions 的推理模型连推理块都不发，只在用量里报推理 token
+        assert_eq!(
+            rate(opened(20_000, false, false), Some(&u), 22_000),
+            Some(100)
+        );
+    }
+
+    /// 推理被隐藏、上游又不分开报（Anthropic）：给不出一个对的数，就不给
+    #[test]
+    fn hidden_reasoning_of_unknown_size_gives_no_rate() {
+        let u = usage(2_200, 0);
+        assert_eq!(rate(opened(20_000, false, true), Some(&u), 22_000), None);
+    }
+
+    /// 推理边想边吐的，推理 token 都生成在第一个 token 之后，照数
+    #[test]
+    fn visible_reasoning_is_counted() {
+        let u = usage(1_000, 800);
+        assert_eq!(rate(opened(1_000, true, true), Some(&u), 11_000), Some(100));
+    }
+
+    /// 生成不到半秒、没有第一个 token、没有用量、没有输出的，都没有速度
+    #[test]
+    fn a_rate_needs_a_first_token_output_and_enough_time() {
+        let u = usage(40, 0);
+        assert_eq!(rate(opened(1_000, false, false), Some(&u), 1_300), None);
+        assert_eq!(rate(None, Some(&u), 5_000), None);
+        assert_eq!(rate(opened(1_000, false, false), None, 5_000), None);
+        assert_eq!(
+            rate(opened(1_000, false, false), Some(&usage(0, 0)), 5_000),
+            None
         );
     }
 

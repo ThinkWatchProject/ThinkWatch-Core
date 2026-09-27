@@ -69,8 +69,8 @@ Documentation: [configuration reference](docs/config.md) ·
   starts in observe mode except the output limit, which starts off. Built-in
   rules can be turned off one at a time, and custom rules added.
 - **Request history and live events.** Every request is stored in a local
-  SQLite database with the rule it matched, each upstream attempt, its usage and
-  its cost. The control plane streams events as requests start and finish, and a
+  SQLite database with the rule it matched, each upstream attempt, its usage, its
+  cost, the time its first token arrived and its generation speed. The control plane streams events as requests start and finish, and a
   dry run shows where a request would be routed, and why, without sending it.
 - **One configuration file.** All settings are kept in `config.yaml`. A change,
   whether made in an editor, with `twcore config` or through the control plane,
