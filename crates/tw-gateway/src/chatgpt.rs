@@ -5,6 +5,8 @@
 //! 发给 Codex 后端的 `originator` 和 User-Agent 是 ThinkWatch 自己的，系统提示词是客户端
 //! 自己的，不冒充 Codex，也不做指纹。唯一借用的是 OAuth 客户端 ID（见
 //! [`tw_config::chatgpt::CLIENT_ID`]）。2026-09-18 用 Plus 账号实测过，后端照常服务。
+//! 客户端带来的官方身份（ChatGPT 应用出具的证明、Codex 的安装 ID）也不转发，见
+//! [`tw_config::chatgpt::IDENTITY_HEADERS`]。
 //!
 //! # 和 OpenAI Responses 不一样的地方
 //!
@@ -14,7 +16,8 @@
 //! - **不认 `max_output_tokens`**：回 400。发出去之前删掉，记进丢弃的字段
 //! - **流式响应没有 Content-Type**：按协议认定是 SSE，否则转换、回显还原和工具调用
 //!   审查都会走整包那条路
-//! - 模型清单在 `/models`，必须带 `client_version`，否则回 400
+//! - 模型清单在 `/models`，必须带 `client_version`，否则回 400；新模型按它藏（见
+//!   [`CLIENT_VERSION`]）
 //! - 额度在响应头 `x-codex-{primary,secondary}-*` 里，窗口多长看 `-window-minutes`
 
 use base64::Engine;
@@ -33,9 +36,14 @@ pub const ISSUER: &str = "https://auth.openai.com";
 pub const REVOKE_ENDPOINT: &str = "https://auth.openai.com/oauth/revoke";
 /// 模型清单要的 `client_version`。
 ///
-/// 后端不带这个参数就回 400。ThinkWatch 不实现任何 Codex 客户端版本的特性，所以如实报
-/// `0.0.0`；实测它照样返回全部模型。
-pub const CLIENT_VERSION: &str = "0.0.0";
+/// 后端不带这个参数就回 400，而且**按它藏新模型**：`minimal_client_version` 比它高的不列。
+/// 2026-09-27 用 Free 账号实测，报 `0.0.0` 或 `0.154.9` 都看不到要 0.155.0 的
+/// gpt-6-luna，报 `0.158.0` 起才有，而这个账号用它生成完全正常 —— 报得低，网关就把
+/// 账号能用的模型拒成「没有上游提供」。
+///
+/// 客户端驱动得了哪个模型是客户端的事，网关只转发，所以报一个比任何 Codex 都大的
+/// 版本：账号能用什么就列什么。它只是清单的筛选条件，请求来自谁仍由身份头如实说明
+pub const CLIENT_VERSION: &str = "99999.0.0";
 /// 授权完成后浏览器跳回本机的端口。**只有这两个能用**：它们是登记在 Codex 客户端上的回调
 /// 地址，换别的端口，登录页会拒绝跳转
 pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
@@ -46,11 +54,20 @@ const RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 
 // ---------------------------------------------------------------- 请求
 
+/// `client_metadata` 里说明客户端是谁的两项。Codex 把安装 ID 和夹着它的 turn 元数据
+/// 在请求体里又放了一份，和同名的请求头一样不发（见 [`tw_config::chatgpt::IDENTITY_HEADERS`]）
+const IDENTITY_METADATA: [&str; 2] = ["x-codex-installation-id", "x-codex-turn-metadata"];
+
 /// 客户端本来就说 Responses、这一跳直通时，把请求体改成 Codex 后端接受的样子。
 ///
-/// 返回改好的请求体和删掉的字段。**只动这三个字段**，其余原样留着：Codex CLI 这类客户端
-/// 带着自定义工具和加密的推理条目，经过中间表示转一遍会丢东西。请求体不是 JSON 对象时
-/// 原样返回，由后端说它哪里不对。
+/// 返回改好的请求体和删掉的字段。**只动这几处**，其余原样留着：Codex CLI 这类客户端
+/// 带着自定义工具和加密的推理条目，经过中间表示转一遍会丢东西。
+///
+/// - `max_output_tokens` 后端不认，删掉并报出来；`stream`、`store` 改成后端要的值
+/// - `client_metadata` 里说明客户端是谁的几项删掉，**不算丢弃的字段**：和身份请求头
+///   一样，是网关如实说明自己，不是为了兼容取舍了客户端的内容
+///
+/// 请求体不是 JSON 对象时原样返回，由后端说它哪里不对。
 pub fn shape_passthrough(body: &Bytes) -> (Bytes, Vec<String>) {
     let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
         return (body.clone(), Vec::new());
@@ -64,6 +81,14 @@ pub fn shape_passthrough(body: &Bytes) -> (Bytes, Vec<String>) {
     }
     obj.insert("stream".into(), Value::Bool(true));
     obj.insert("store".into(), Value::Bool(false));
+    if let Some(meta) = obj
+        .get_mut("client_metadata")
+        .and_then(Value::as_object_mut)
+    {
+        for key in IDENTITY_METADATA {
+            meta.remove(key);
+        }
+    }
     match serde_json::to_vec(&v) {
         Ok(b) => (Bytes::from(b), dropped),
         Err(_) => (body.clone(), Vec::new()),
@@ -431,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn a_passthrough_request_keeps_everything_but_the_three_fields() {
+    fn a_passthrough_request_keeps_everything_but_three_fields_and_the_client_identity() {
         let body = Bytes::from(
             serde_json::json!({
                 "model": "gpt-5.5",
@@ -440,19 +465,30 @@ mod tests {
                 "max_output_tokens": 256,
                 "stream": false,
                 "store": true,
-                "prompt_cache_key": "conv-1"
+                "prompt_cache_key": "conv-1",
+                "client_metadata": {
+                    "x-codex-installation-id": "inst-1",
+                    "x-codex-turn-metadata": "{\"installation_id\":\"inst-1\"}",
+                    "session_id": "conv-1",
+                    "x-codex-window-id": "w-1"
+                }
             })
             .to_string(),
         );
         let (out, dropped) = shape_passthrough(&body);
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(dropped, vec!["max_output_tokens"]);
+        assert_eq!(dropped, vec!["max_output_tokens"], "身份不算丢弃的字段");
         assert_eq!(v["stream"], true);
         assert_eq!(v["store"], false);
         assert!(v.get("max_output_tokens").is_none());
         assert_eq!(v["input"][0]["encrypted_content"], "enc");
         assert_eq!(v["tools"][0]["type"], "custom");
         assert_eq!(v["prompt_cache_key"], "conv-1");
+        // 安装 ID 不发，会话和窗口照旧
+        assert_eq!(
+            v["client_metadata"],
+            serde_json::json!({"session_id": "conv-1", "x-codex-window-id": "w-1"})
+        );
 
         // 不是 JSON 就原样交给后端，由它说哪里不对
         let raw = Bytes::from_static(b"not json");
@@ -502,6 +538,11 @@ mod tests {
         assert!(!keeps_client_header("user-agent"));
         assert!(!keeps_client_header("accept"));
         assert!(keeps_client_header("x-codex-turn-state"));
+        // 官方客户端才有的身份也不转发：证明是 ChatGPT 应用出具的，安装 ID 是 Codex 的
+        assert!(!keeps_client_header("X-OAI-Attestation"));
+        assert!(!keeps_client_header("x-codex-installation-id"));
+        assert!(!keeps_client_header("x-codex-turn-metadata"));
+        assert!(keeps_client_header("x-codex-window-id"));
     }
 
     #[test]
@@ -594,7 +635,7 @@ mod tests {
         assert_eq!(parse_models(&serde_json::json!({"data": []})), None);
         assert_eq!(
             models_url(BASE_URL),
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.0.0"
+            "https://chatgpt.com/backend-api/codex/models?client_version=99999.0.0"
         );
     }
 

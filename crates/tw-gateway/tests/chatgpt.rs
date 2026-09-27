@@ -285,7 +285,12 @@ fn codex_request(stream: bool) -> Value {
         "store": true,
         "max_output_tokens": 512,
         "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": "conv-1"
+        "prompt_cache_key": "conv-1",
+        "client_metadata": {
+            "x-codex-installation-id": "inst-1",
+            "x-codex-turn-metadata": "{\"installation_id\":\"inst-1\"}",
+            "session_id": "conv-1"
+        }
     })
 }
 
@@ -308,6 +313,11 @@ async fn a_codex_cli_request_reaches_the_backend_as_thinkwatch() {
             ("user-agent", "codex_cli_rs/0.153.0 (Mac OS 26.0; arm64)"),
             ("session_id", "conv-1"),
             ("version", "0.153.0"),
+            // ChatGPT 应用里的 Codex 还会带上应用出具的证明和安装 ID
+            ("x-oai-attestation", "att-from-the-app"),
+            ("x-codex-installation-id", "inst-1"),
+            ("x-codex-turn-metadata", "{\"installation_id\":\"inst-1\"}"),
+            ("x-codex-window-id", "w-1"),
         ],
         codex_request(true),
     )
@@ -343,6 +353,14 @@ async fn a_codex_cli_request_reaches_the_backend_as_thinkwatch() {
     );
     assert_eq!(h("session_id"), None);
     assert_eq!(h("version"), None);
+    for k in [
+        "x-oai-attestation",
+        "x-codex-installation-id",
+        "x-codex-turn-metadata",
+    ] {
+        assert_eq!(h(k), None, "官方客户端的身份不转发：{k}");
+    }
+    assert_eq!(h("x-codex-window-id").as_deref(), Some("w-1"));
     assert_eq!(h("chatgpt-account-id").as_deref(), Some("acc-123"));
     assert_eq!(h("authorization").as_deref(), Some("Bearer at-1"));
     assert_eq!(h("accept").as_deref(), Some("text/event-stream"));
@@ -352,6 +370,11 @@ async fn a_codex_cli_request_reaches_the_backend_as_thinkwatch() {
     assert!(sent.get("max_output_tokens").is_none(), "{sent}");
     assert_eq!(sent["prompt_cache_key"], "conv-1", "其余字段原样发");
     assert_eq!(sent["instructions"], "You are a coding agent.");
+    assert_eq!(
+        sent["client_metadata"],
+        json!({"session_id": "conv-1"}),
+        "请求体里的安装 ID 也不发"
+    );
 
     // Codex 刷新用 JSON
     let (token_ct, token_body) = tokens.seen.lock().unwrap()[0].clone();
@@ -635,7 +658,7 @@ async fn models_come_from_the_codex_models_endpoint() {
         other => panic!("{other:?}"),
     }
     let uri = backend.seen.lock().unwrap()[0].0.clone();
-    assert_eq!(uri, "/backend-api/codex/models?client_version=0.0.0");
+    assert_eq!(uri, "/backend-api/codex/models?client_version=99999.0.0");
 }
 
 /// 推理测速（L3）打在 ChatGPT 账号上游上。

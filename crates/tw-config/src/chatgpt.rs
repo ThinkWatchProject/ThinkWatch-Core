@@ -23,12 +23,20 @@ pub const ACCOUNT_HEADER: &str = "ChatGPT-Account-Id";
 ///
 /// **由网关如实填写，配置里不能写。**能写的话，一行配置就能让 ThinkWatch 冒充
 /// Codex 或别的客户端 —— 而接入 ChatGPT 账号的前提是如实说明自己是谁。
+///
+/// 后三个只有官方客户端才有：ChatGPT 应用给每个请求出具的证明、Codex 的安装 ID、
+/// 夹着安装 ID 的 turn 元数据。网关没有这些，如实就是不发。官方应用的证明配上
+/// ThinkWatch 登录拿到的令牌，很像令牌被盗用：2026-09-27 ChatGPT 应用经网关发出
+/// 第一个请求后，令牌 20 秒内就被吊销了
 pub const IDENTITY_HEADERS: &[&str] = &[
     "originator",
     "user-agent",
     "session-id",
     "session_id",
     "version",
+    "x-oai-attestation",
+    "x-codex-installation-id",
+    "x-codex-turn-metadata",
 ];
 
 /// 这个地址是不是 Codex 后端。
