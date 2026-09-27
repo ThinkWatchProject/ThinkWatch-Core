@@ -614,7 +614,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 不给就是不需要认证 —— `SecretChange` 和 `ProxyAuthInput` 这两个「保持原样」都删了。
 /// 只有 OAuth 还能「保持原样」，见 [`OAuthChange::Keep`]。照 24 写的界面会去
 /// `key.display` 里找密钥，保存时不给地址会被拒。
-pub const CONTROL_API_VERSION: u32 = 25;
+///
+/// **26 起上游多一个「转发客户端身份」**：[`ProviderView::forward_client_identity`] 和
+/// [`ProviderInput::forward_client_identity`]。发给上游的请求头同版改成白名单：默认只有
+/// 网关填的（含 ThinkWatch 的 User-Agent）、上游配置里写的和各协议要的那几个，客户端
+/// 自己的 User-Agent 和身份头只在这一项打开时才发。照 25 写的界面保存时不给这个字段，
+/// 会把它关掉。
+pub const CONTROL_API_VERSION: u32 = 26;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1601,6 +1607,8 @@ pub struct ProviderView {
     pub protocol: Option<Protocol>,
     /// 协议是配置里写明的，还是按地址推断的
     pub protocol_explicit: bool,
+    /// 把客户端自己的身份（User-Agent、身份请求头、请求体里的身份字段）如实发给这家
+    pub forward_client_identity: bool,
     /// `direct` / `system` / 代理名
     pub proxy: String,
     /// `fail` / `direct`
@@ -2392,6 +2400,9 @@ pub struct ProviderInput {
     /// 不给就按地址推断
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
+    /// 把客户端自己的身份如实发给这家。不给就是不发；ChatGPT 账号不能打开
+    #[serde(default)]
+    pub forward_client_identity: bool,
     /// `direct` / `system` / 代理名
     #[serde(default = "direct")]
     pub proxy: String,

@@ -440,6 +440,7 @@ fn provider_view(
         }),
         protocol: p.effective_protocol().map(Into::into),
         protocol_explicit: p.protocol.is_some(),
+        forward_client_identity: p.forward_client_identity,
         proxy: p.proxy.clone(),
         on_proxy_fail: p.on_proxy_fail.into(),
         models: p.models.clone(),

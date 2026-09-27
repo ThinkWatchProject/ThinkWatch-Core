@@ -40,33 +40,6 @@ pub fn plan(
     (target != api.dialect()).then_some(target)
 }
 
-/// 转换时，客户端发来的这个请求头还发不发给上游。
-pub fn keeps_header(client: Dialect, name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    let own: &[&str] = match client {
-        Dialect::Anthropic => &[
-            "anthropic-version",
-            "anthropic-beta",
-            "anthropic-dangerous-direct-browser-access",
-        ],
-        // Codex 带的 originator / session_id / version 说的是它和 OpenAI 之间的事
-        Dialect::Chat | Dialect::Responses => &[
-            "openai-beta",
-            "openai-organization",
-            "openai-project",
-            "chatgpt-account-id",
-            "originator",
-            "session_id",
-            "conversation_id",
-            "version",
-        ],
-        // SigV4 签的是这一次请求的内容，转发给别的上游只会是一个签错的头
-        Dialect::Bedrock => &["x-amzn-bedrock-accept", "x-amzn-bedrock-save"],
-        Dialect::Gemini => &["x-goog-api-client", "x-goog-user-project"],
-    };
-    !own.contains(&name.as_str())
-}
-
 /// 转成这种格式时必须带的请求头（上游配置里写了同名头时以配置为准）。
 pub fn required_headers(target: Dialect) -> &'static [(&'static str, &'static str)] {
     match target {
@@ -159,11 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clients_own_headers_stay_behind_and_anthropic_gets_its_version() {
-        assert!(!keeps_header(Dialect::Anthropic, "Anthropic-Beta"));
-        assert!(keeps_header(Dialect::Anthropic, "user-agent"));
-        assert!(!keeps_header(Dialect::Responses, "originator"));
-        assert!(!keeps_header(Dialect::Gemini, "x-goog-api-client"));
+    fn anthropic_gets_its_version_when_a_request_is_translated_to_it() {
         assert_eq!(
             required_headers(Dialect::Anthropic),
             [("anthropic-version", "2023-06-01")]

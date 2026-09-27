@@ -314,6 +314,7 @@ Upstreams: the APIs requests are forwarded to.
 | `headers` | map of header name → value | `{}` | Additional request headers, in the order written; values may use `${VAR}`, and `{{access_token}}` where `oauth` is set. At most 32. Headers HTTP or the gateway manages (`host`, `content-length`, `connection`, …) cannot be set. |
 | `oauth` | object, [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth credential: an access token obtained from a refresh token. Instead of `key`. |
 | `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` | — | API format of the upstream. Unset: recognized from `base_url` for the official endpoints, otherwise treated as `anthropic`. |
+| `forward_client_identity` | bool | `false` | Also send the client's own identity: its `User-Agent`, identity headers such as `x-app` and `originator`, and identity fields in the request body such as `metadata.user_id`. Values are the client's, never made up. Off: requests carry ThinkWatch's `User-Agent` and no client identity. For upstreams that admit only certain clients (Kimi For Coding, Bailian Coding Plan, relays restricted to official clients). Not available for `chatgpt`. |
 | `proxy` | string | `direct` | `direct`; `system`, the proxy in the core process's `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` environment variables; or the name of an entry in `proxies`. |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | When the proxy cannot be reached: `fail` the request, or go `direct`. |
 | `models` | list of strings | `[]` | Models to assume when the upstream does not answer `/v1/models`. |
@@ -349,6 +350,15 @@ providers:
     protocol: openai-chat
     billing: free
 ```
+
+A request carries the request itself and the headers its upstream needs,
+and nothing else from the client: the credential and the headers written in
+`headers`; ThinkWatch's own `User-Agent`; and, from the client's request, only
+the headers the upstream's protocol uses (`anthropic-*` for Anthropic,
+`Idempotency-Key` and `X-Client-Request-Id` for OpenAI, none for Gemini).
+Identity fields that clients fill in themselves, such as Claude Code's
+`metadata.user_id`, are removed from the body. For an upstream that admits only
+certain clients, turn on `forward_client_identity`.
 
 A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude

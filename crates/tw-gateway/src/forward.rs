@@ -12,28 +12,6 @@ pub use tw_dialect::url::upstream_url;
 use crate::error::GatewayError;
 use tw_types::msg;
 
-/// 这些头是「我们和客户端之间」的，不该转给上游。
-///
-/// `x-stainless-timeout` 那条不显然：客户端 SDK 自带的超时头传到上游，
-/// 会让上游按客户端的超时提前断流，表现为莫名其妙的截断。
-pub const STRIP: &[&str] = &[
-    "host",
-    "authorization",
-    "x-api-key",
-    "x-goog-api-key",
-    "content-length",
-    "connection",
-    "accept-encoding",
-    "x-stainless-timeout",
-];
-
-pub fn should_strip(name: &HeaderName) -> bool {
-    let n = name.as_str();
-    // `x-thinkwatch-*` 是客户端写给网关的（接管 Codex 时写进去的
-    // `X-ThinkWatch-Client`），上游不该看见
-    STRIP.contains(&n) || n.starts_with("x-thinkwatch-")
-}
-
 /// 把这家上游的请求头放上去。**凭据就在里面**（见 `tw_config::credential`）。
 ///
 /// **WS 升级那条路也走同一份** `Provider::outbound_headers`：各写一份的话，
@@ -55,33 +33,6 @@ pub fn apply_headers(
 /// 那一个同时发出去，上游收到的是两个值 —— 有的取第一个、有的直接 400。
 pub fn overridden(headers: &[(String, String)], name: &str) -> bool {
     headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
-}
-
-/// 把客户端的请求头搬到上游请求上，剔掉不该走的那些。
-pub fn forward_headers(
-    builder: reqwest::RequestBuilder,
-    incoming: &HeaderMap,
-) -> reqwest::RequestBuilder {
-    forward_headers_filtered(builder, incoming, |_| true)
-}
-
-/// 同上，但再过一道调用方给的筛子。
-///
-/// 方言互转要用它（M6+）：翻译到另一边之后，方言专属的头全是
-/// 噪音，而有些 OpenAI 兼容实现会因为不认识的头直接 400。
-pub fn forward_headers_filtered(
-    builder: reqwest::RequestBuilder,
-    incoming: &HeaderMap,
-    keep: impl Fn(&str) -> bool,
-) -> reqwest::RequestBuilder {
-    let mut b = builder;
-    for (name, value) in incoming.iter() {
-        if should_strip(name) || !keep(name.as_str()) {
-            continue;
-        }
-        b = b.header(name.clone(), value.clone());
-    }
-    b
 }
 
 /// 上游响应里也有不该原样回给客户端的头。
@@ -267,41 +218,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn headers_meant_for_the_gateway_never_reach_the_upstream() {
-        assert!(should_strip(&HeaderName::from_static(
-            "x-thinkwatch-client"
-        )));
-    }
-
-    #[test]
     fn a_configured_header_replaces_the_one_the_client_sent() {
         let configured = vec![("Anthropic-Version".to_string(), "2023-06-01".to_string())];
         assert!(overridden(&configured, "anthropic-version"));
         assert!(!overridden(&configured, "anthropic-beta"));
-    }
-
-    #[test]
-    fn our_own_auth_headers_never_reach_the_upstream() {
-        // 客户端带的是**我们的**网关密钥。原样转出去等于把它送给中转站。
-        for h in ["authorization", "x-api-key", "x-goog-api-key"] {
-            assert!(should_strip(&HeaderName::from_static(h)), "{h} 应该被剔掉");
-        }
-    }
-
-    #[test]
-    fn client_sdk_timeout_headers_are_stripped() {
-        // 传给上游会让它按客户端的超时提前断流，表现为莫名其妙的截断。
-        assert!(should_strip(&HeaderName::from_static(
-            "x-stainless-timeout"
-        )));
-    }
-
-    #[test]
-    fn dialect_headers_are_kept() {
-        // anthropic-version / anthropic-beta 是上游要认的，剔掉就废了。
-        for h in ["anthropic-version", "anthropic-beta", "content-type"] {
-            assert!(!should_strip(&HeaderName::from_static(h)), "{h} 不该被剔掉");
-        }
     }
 
     #[test]

@@ -384,6 +384,7 @@ fn to_provider(
         headers: tw_config::Headers::new(headers),
         oauth,
         protocol: input.protocol.map(Into::into),
+        forward_client_identity: input.forward_client_identity,
         models: input
             .models
             .iter()

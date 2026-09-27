@@ -306,12 +306,19 @@ async fn messages_to_another_anthropic_upstream_are_cleaned_in_place() {
     let s = generation(&log);
     assert_eq!(s.uri, "/v1/messages");
     assert_clean(&s);
-    // 别的 beta 照发，User-Agent 照发
+    // 别的 beta 照发。User-Agent 是 ThinkWatch 的：客户端是谁不外传（见 `egress`）
     assert_eq!(
         s.headers.get("anthropic-beta").unwrap(),
         "files-api-2025-04-14"
     );
-    assert_eq!(s.headers.get("user-agent").unwrap(), UA);
+    assert!(
+        s.headers
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("thinkwatch/")
+    );
     let v: Value = serde_json::from_slice(&s.body).unwrap();
     assert_eq!(
         v["system"],

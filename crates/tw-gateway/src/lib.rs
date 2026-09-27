@@ -11,6 +11,7 @@ pub mod bodies;
 pub mod chatgpt;
 pub mod client_api;
 pub mod clientprobe;
+pub mod egress;
 pub mod ending;
 pub mod error;
 pub mod fixture;

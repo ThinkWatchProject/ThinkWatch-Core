@@ -280,6 +280,8 @@ pub enum CredentialError {
     #[error("{}", self.msg())]
     ChatgptWithoutLogin,
     #[error("{}", self.msg())]
+    ChatgptClientIdentity,
+    #[error("{}", self.msg())]
     IdentityHeader(String),
     #[error("{}", self.msg())]
     TooManyHeaders,
@@ -331,6 +333,11 @@ impl CredentialError {
             ChatgptWithoutLogin => msg!(
                 "config.credential.chatgpt_without_login" =>
                 "a ChatGPT account upstream takes only the credential obtained by signing in"
+            ),
+            ChatgptClientIdentity => msg!(
+                "config.credential.chatgpt_client_identity" =>
+                "a ChatGPT account upstream always names ThinkWatch as the sender; it cannot \
+                 forward the client's identity"
             ),
             IdentityHeader(h) => msg!(
                 "config.credential.identity_header", header = h =>
@@ -473,6 +480,10 @@ impl Provider {
         let chatgpt = self.effective_protocol() == Some(Protocol::Chatgpt);
         if chatgpt && crate::chatgpt::is_backend(&self.base_url) && self.oauth.is_none() {
             return Err(CredentialError::ChatgptWithoutLogin);
+        }
+        // 接 ChatGPT 账号的前提是如实说明请求来自 ThinkWatch：转发客户端的身份就是冒充它
+        if chatgpt && self.forward_client_identity {
+            return Err(CredentialError::ChatgptClientIdentity);
         }
         if self.headers.len() > MAX_HEADERS {
             return Err(CredentialError::TooManyHeaders);
@@ -814,6 +825,13 @@ mod tests {
                 "{name}"
             );
         }
+        // 转发客户端的身份也是冒充
+        let mut forwarding = login.clone();
+        forwarding.forward_client_identity = true;
+        assert_eq!(
+            forwarding.check_credential(),
+            Err(CredentialError::ChatgptClientIdentity)
+        );
     }
 
     #[test]

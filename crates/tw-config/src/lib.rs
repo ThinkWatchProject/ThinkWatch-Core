@@ -158,6 +158,7 @@ impl Default for Provider {
             headers: Headers::default(),
             oauth: None,
             protocol: None,
+            forward_client_identity: false,
             proxy: default_proxy(),
             on_proxy_fail: OnProxyFail::default(),
             models: Vec::new(),
@@ -714,6 +715,15 @@ pub struct Provider {
     /// 不写就从 base_url 猜（最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
+    /// 把客户端自己的身份如实发给这家：它的 User-Agent 和 `x-app`、`originator` 这类
+    /// 身份头，以及请求体里的身份字段（Claude Code 的 `metadata.user_id` 等）。
+    ///
+    /// **默认不发**：请求由 ThinkWatch 发出，上游看到的是 ThinkWatch 的 User-Agent，
+    /// 客户端是谁、跑在什么系统上不外传。只给按客户端放行的上游打开：Kimi For Coding
+    /// 只接编程工具的 User-Agent，百炼 Coding Plan 拒绝通用的 User-Agent，有的中转站
+    /// 只放官方客户端。发的都是客户端的原值，不伪造。ChatGPT 账号不能打开，见 [`chatgpt`]
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub forward_client_identity: bool,
     /// 代理名，或内置的 `direct` / `system`。
     ///
     /// **默认 `direct` 而不是 `system`**：显式优于隐式。默认跟随系统的

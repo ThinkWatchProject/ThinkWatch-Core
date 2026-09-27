@@ -3,7 +3,9 @@
 //! 假的 token 端点和假的 Codex 后端，按 2026-09-18 实测到的样子回：流式响应**不带
 //! Content-Type**、额度在 `x-codex-*` 头里、token 端点收 JSON。验的是网关把这些接缝接对了：
 //!
-//! - 身份是 ThinkWatch 自己的，客户端报的来源不转发
+//! - 身份是 ThinkWatch 自己的：客户端的请求头只转 Codex 协议要的那几个，官方客户端的身份
+//!   和 Claude Code 这类客户端自己的头都不发
+//! - 请求体用 zstd 压缩（Codex 直连时就这么发）
 //! - 请求改成 Codex 后端接受的样子（只收流式、不认输出上限、路径是 `/responses`）
 //! - 没有 Content-Type 的流照样按流处理；客户端要整包时由网关收齐
 //! - 401 换一次 token 重发；并发请求只刷新一次；refresh token 作废只报一次
@@ -120,7 +122,7 @@ async fn start_backend(b: Arc<Backend>) -> String {
         State(b): State<Arc<Backend>>,
         OriginalUri(uri): OriginalUri,
         headers: HeaderMap,
-        body: String,
+        body: axum::body::Bytes,
     ) -> axum::response::Response {
         b.calls.fetch_add(1, Ordering::SeqCst);
         let auth = headers
@@ -128,7 +130,14 @@ async fn start_backend(b: Arc<Backend>) -> String {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let parsed = serde_json::from_str(&body).unwrap_or(Value::Null);
+        // 网关发来的请求体是 zstd 压缩的，和 Codex 直连时一样
+        let zstd = headers.get("content-encoding").is_some_and(|v| v == "zstd");
+        let body = if zstd {
+            zstd::stream::decode_all(&body[..]).expect("a zstd body")
+        } else {
+            body.to_vec()
+        };
+        let parsed = serde_json::from_slice(&body).unwrap_or(Value::Null);
         b.seen
             .lock()
             .unwrap()
@@ -318,6 +327,10 @@ async fn a_codex_cli_request_reaches_the_backend_as_thinkwatch() {
             ("x-codex-installation-id", "inst-1"),
             ("x-codex-turn-metadata", "{\"installation_id\":\"inst-1\"}"),
             ("x-codex-window-id", "w-1"),
+            ("x-codex-turn-state", "ts-1"),
+            ("x-openai-internal-codex-responses-lite", "true"),
+            // 客户端以后新加的头
+            ("x-codex-something-new", "1"),
         ],
         codex_request(true),
     )
@@ -357,10 +370,18 @@ async fn a_codex_cli_request_reaches_the_backend_as_thinkwatch() {
         "x-oai-attestation",
         "x-codex-installation-id",
         "x-codex-turn-metadata",
+        "x-codex-window-id",
+        "x-codex-something-new",
     ] {
-        assert_eq!(h(k), None, "官方客户端的身份不转发：{k}");
+        assert_eq!(h(k), None, "只转 Codex 协议要的头：{k}");
     }
-    assert_eq!(h("x-codex-window-id").as_deref(), Some("w-1"));
+    assert_eq!(h("x-codex-turn-state").as_deref(), Some("ts-1"));
+    assert_eq!(
+        h("x-openai-internal-codex-responses-lite").as_deref(),
+        Some("true")
+    );
+    assert_eq!(h("content-encoding").as_deref(), Some("zstd"));
+    assert_eq!(h("content-type").as_deref(), Some("application/json"));
     assert_eq!(h("chatgpt-account-id").as_deref(), Some("acc-123"));
     assert_eq!(h("authorization").as_deref(), Some("Bearer at-1"));
     assert_eq!(h("accept").as_deref(), Some("text/event-stream"));
@@ -404,6 +425,64 @@ async fn a_codex_cli_request_reaches_the_backend_as_thinkwatch() {
     assert_eq!(windows.len(), 1, "没启用的窗口不列：{windows:?}");
     assert_eq!(windows[0].window, "weekly");
     assert_eq!(windows[0].used_percent, 21.0);
+}
+
+#[tokio::test]
+async fn claude_code_reaches_the_codex_backend_without_its_own_headers() {
+    let tokens = Arc::new(TokenServer::default());
+    let token_url = start_token_server(tokens.clone()).await;
+    let backend = Arc::new(Backend::default());
+    let base = start_backend(backend.clone()).await;
+    let (gw, _, _rx) = start_gateway(chatgpt_provider(&base, &token_url)).await;
+
+    let (status, _, body) = post_json(
+        gw,
+        "/v1/messages",
+        &[
+            ("x-api-key", "tw-k"),
+            ("user-agent", "claude-cli/2.1.1 (external, cli)"),
+            ("x-app", "cli"),
+            ("anthropic-version", "2023-06-01"),
+            ("anthropic-beta", "claude-code-20250219"),
+            ("x-stainless-lang", "js"),
+            ("x-stainless-os", "MacOS"),
+            ("x-stainless-runtime-version", "v22.18.0"),
+            ("x-claude-code-session-id", "sess-1"),
+            ("cookie", "a=b"),
+            ("origin", "http://localhost:3000"),
+        ],
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "metadata": {"user_id": "user_abc_account_123_session_456"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let seen = backend.seen.lock().unwrap().clone();
+    let (_, headers, sent) = &seen[0];
+    let mut names: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
+    names.sort_unstable();
+    // 发出去的只有网关填的、上游配置里的；Claude Code 的头一个都没有
+    assert_eq!(
+        names,
+        [
+            "accept",
+            "authorization",
+            "chatgpt-account-id",
+            "content-encoding",
+            "content-length",
+            "content-type",
+            "host",
+            "originator",
+            "session-id",
+            "user-agent",
+        ]
+    );
+    assert!(sent.get("metadata").is_none(), "{sent}");
 }
 
 #[tokio::test]

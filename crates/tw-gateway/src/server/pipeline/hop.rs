@@ -36,9 +36,8 @@ struct Outbound {
     target: Option<tw_dialect::ir::Dialect>,
     /// ChatGPT 账号（Codex 后端）：只收流式、不认输出上限、身份头由网关填
     chatgpt: bool,
-    /// DeepSeek Harness 的请求发给 DeepSeek 官方以外的上游：它自己的请求头不转发
-    /// （见 [`tw_dialect::harness`]）
-    harness_elsewhere: bool,
+    /// 这一跳发哪些请求头（见 [`crate::egress`]）
+    hop: crate::egress::Hop,
     /// 回程要用的转换会话：转换过的，或者直通到 Codex 后端、客户端却要整包时
     /// 收齐流要用的
     session: Option<tw_dialect::convert::Session>,
@@ -392,8 +391,13 @@ fn prepare(
                 let (shaped, more) = crate::chatgpt::shape_passthrough(&out);
                 dropped.extend(more);
                 shaped
-            } else {
+            } else if provider.forward_client_identity {
                 out
+            } else {
+                // 客户端自动填的身份字段不发（见 `egress` 模块）。**不算丢弃的字段**
+                client_dialect
+                    .and_then(|d| crate::egress::strip_body_identity(d, &out))
+                    .unwrap_or(out)
             };
             if let Some(d) = client_dialect.filter(|_| !dropped.is_empty()) {
                 let same = crate::wire::dialect(d);
@@ -495,13 +499,20 @@ fn prepare(
         path = "/responses".to_string();
         query = None;
     }
+    let hop = crate::egress::Hop {
+        protocol: crate::egress::Hop::protocol_for(provider.effective_protocol(), client_dialect),
+        translated: target.is_some(),
+        client_identity: provider.forward_client_identity && !chatgpt,
+        harness_to_deepseek: harness && to_deepseek,
+        harness_elsewhere: harness && !to_deepseek,
+    };
     Ok(Outbound {
         body,
         path,
         query,
         target,
         chatgpt,
-        harness_elsewhere: harness && !to_deepseek,
+        hop,
         session,
     })
 }
@@ -518,16 +529,13 @@ async fn send(
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = forward::upstream_url(&provider.base_url, &out.path, out.query.as_deref());
     let method = reqwest::Method::from_bytes(b"POST").expect("POST is a valid method");
-    let client_dialect = req.api.map(|a| a.dialect());
-    let (target, chatgpt, headers) = (out.target, out.chatgpt, &req.headers);
+    let (target, chatgpt, hop, headers) = (out.target, out.chatgpt, out.hop, &req.headers);
     let required = target
         .map(crate::translate::required_headers)
         .unwrap_or_default();
-    // DeepSeek Harness 发给别家：它自己的头不转发；直通时 `anthropic-beta` 去掉对话中途
-    // 增删工具那一项（那些块已经去掉了），剩下的照发
-    let harness = out.harness_elsewhere;
-    // 分几行发的也要都看：下面一律不转发原来的，只转发这一份
-    let beta = (harness && target.is_none())
+    // DeepSeek Harness 发给别家：直通时 `anthropic-beta` 去掉对话中途增删工具那一项（那些块
+    // 已经去掉了），剩下的照发。分几行发的也要都看：客户端原来的不发，只发这一份
+    let beta = (hop.harness_elsewhere && target.is_none())
         .then(|| {
             headers
                 .get_all("anthropic-beta")
@@ -537,32 +545,44 @@ async fn send(
                 .join(",")
         })
         .and_then(|v| tw_dialect::harness::anthropic_beta(&v));
+    // Anthropic 格式原样直通、客户端没写 `anthropic-version`：Anthropic 要这个头，补上默认的
+    let version = (hop.protocol == Some(tw_config::Protocol::Anthropic)
+        && target.is_none()
+        && !headers.contains_key("anthropic-version"))
+    .then_some(("anthropic-version", tw_dialect::official::ANTHROPIC_VERSION));
+    let gateway = crate::egress::gateway_headers(&hop, headers);
+    // Codex 后端收 zstd 压缩的请求体（见 `chatgpt::compress`）
+    let (body, encoding) = match chatgpt.then(|| crate::chatgpt::compress(&body)).flatten() {
+        Some(z) => (z, Some("zstd")),
+        None => (body, None),
+    };
     let build = |upstream_headers: &[(String, String)]| {
         let mut req = http.request(method.clone(), &url);
-        req = forward::forward_headers_filtered(req, headers, |n| {
-            let own = match (target, client_dialect) {
-                (Some(_), Some(c)) => !crate::translate::keeps_header(c, n),
-                _ => false,
-            };
-            // 请求来自谁由网关如实填写：客户端报的来源（比如 Codex CLI 的 originator）
-            // 不转发，请求经过的是 ThinkWatch
-            let identity = chatgpt && !crate::chatgpt::keeps_client_header(n);
-            let dsh = harness
-                && (tw_dialect::harness::own_header(n) || n.eq_ignore_ascii_case("anthropic-beta"));
-            !own && !identity
-                && !dsh
+        // 从客户端取的：只有这种上游的协议要的那几个（白名单，见 `egress` 模块）
+        for (name, value) in headers {
+            let n = name.as_str();
+            if crate::egress::takes_from_client(&hop, n)
                 && !required.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
                 && !forward::overridden(upstream_headers, n)
-        });
+            {
+                req = req.header(name.clone(), value.clone());
+            }
+        }
         if let Some(b) = &beta
             && !forward::overridden(upstream_headers, "anthropic-beta")
         {
             req = req.header("anthropic-beta", b.as_str());
         }
         // 目标格式必需的头（Anthropic 的 anthropic-version）。上游配置里写了同名头时以配置为准
-        for (k, v) in required {
+        for (k, v) in required.iter().copied().chain(version) {
             if !forward::overridden(upstream_headers, k) {
-                req = req.header(*k, *v);
+                req = req.header(k, v);
+            }
+        }
+        // 网关自己填的：User-Agent，和转换过的请求体的类型。上游配置里写了同名头时以配置为准
+        for (k, v) in &gateway {
+            if !forward::overridden(upstream_headers, k) {
+                req = req.header(k.as_str(), v.as_str());
             }
         }
         req = forward::apply_headers(req, upstream_headers);
@@ -571,6 +591,9 @@ async fn send(
                 req,
                 &crate::chatgpt::identity_headers(headers, upstream_headers),
             );
+        }
+        if let Some(e) = encoding {
+            req = req.header(http::header::CONTENT_ENCODING, e);
         }
         req
     };
