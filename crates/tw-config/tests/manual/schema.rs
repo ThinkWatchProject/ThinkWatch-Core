@@ -460,6 +460,15 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "forward_client_identity",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Also send the client's own identity: its `User-Agent`, identity headers such as `x-app` and `originator`, and identity fields in the request body such as `metadata.user_id`. Values are the client's, never made up. Off: requests carry ThinkWatch's `User-Agent` and no client identity. For upstreams that admit only certain clients (Kimi For Coding, Bailian Coding Plan, relays restricted to official clients). Not available for `chatgpt`.",
+                        "同时发送客户端自己的身份：它的 `User-Agent`、`x-app` 和 `originator` 等身份请求头，以及请求体中的身份字段（如 `metadata.user_id`）。发送的都是客户端的原值，不做伪造。关闭时请求使用 ThinkWatch 的 `User-Agent`，不带客户端身份。用于只接受特定客户端的上游（Kimi For Coding、百炼 Coding Plan、只允许官方客户端的中转站）。`chatgpt` 不可用。",
+                    ),
+                ),
+                row(
                     "proxy",
                     Kind::Str,
                     Def::Is("direct"),

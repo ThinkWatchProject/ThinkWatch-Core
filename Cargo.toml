@@ -133,6 +133,9 @@ blake3 = "1"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
+# 发给 Codex 后端的请求体用 zstd 压缩（Codex 直连它时就这么发）。只要流式编码，
+# 不开旧格式和字典训练
+zstd = { version = "0.13", default-features = false }
 
 clap = { version = "4", features = ["derive"] }
 # 控制面契约导出成 TypeScript（tw-api 的 `ts` feature）。**不开任何 serde 以外的

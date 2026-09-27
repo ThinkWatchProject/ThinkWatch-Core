@@ -11,6 +11,7 @@ config.control_key_invalid
 config.control_key_missing
 config.credential.bad_header_name
 config.credential.bad_header_value
+config.credential.chatgpt_client_identity
 config.credential.chatgpt_without_login
 config.credential.claude_subscription
 config.credential.duplicate_header

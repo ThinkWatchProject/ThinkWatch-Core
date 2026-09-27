@@ -238,6 +238,7 @@ clients:
 | `headers` | 请求头名 → 值的映射 | `{}` | 额外的请求头，按书写顺序发送；值可以用 `${VAR}`，配置了 `oauth` 时可以用 `{{access_token}}`。最多 32 个。HTTP 或网关管理的请求头（`host`、`content-length`、`connection` 等）不能设置。 |
 | `oauth` | 对象，见 [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth 凭据：用 refresh token 换取 access token。与 `key` 二选一。 |
 | `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` | — | 上游的接口格式。不写：官方地址按 `base_url` 识别，其余按 `anthropic` 处理。 |
+| `forward_client_identity` | 布尔 | `false` | 同时发送客户端自己的身份：它的 `User-Agent`、`x-app` 和 `originator` 等身份请求头，以及请求体中的身份字段（如 `metadata.user_id`）。发送的都是客户端的原值，不做伪造。关闭时请求使用 ThinkWatch 的 `User-Agent`，不带客户端身份。用于只接受特定客户端的上游（Kimi For Coding、百炼 Coding Plan、只允许官方客户端的中转站）。`chatgpt` 不可用。 |
 | `proxy` | 字符串 | `direct` | `direct`；`system`，即 core 进程环境变量 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 中的代理；或 `proxies` 中某一项的名字。 |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | 代理不可用时：请求失败（`fail`），或改为直连（`direct`）。 |
 | `models` | 字符串列表 | `[]` | 上游不支持 `/v1/models` 时，按这份清单认定它提供的模型。 |
@@ -269,6 +270,8 @@ providers:
     protocol: openai-chat
     billing: free
 ```
+
+每个请求只带请求本身和上游需要的请求头，客户端的其他信息一律不发：凭据和 `headers` 中写的请求头、ThinkWatch 自己的 `User-Agent`，以及客户端请求中该上游协议使用的请求头（Anthropic 为 `anthropic-*`，OpenAI 为 `Idempotency-Key` 和 `X-Client-Request-Id`，Gemini 没有）。客户端自动填写的身份字段（如 Claude Code 的 `metadata.user_id`）从请求体中去掉。只接受特定客户端的上游，打开 `forward_client_identity`。
 
 ChatGPT 账号上游（`protocol: chatgpt`）只接受桌面应用登录得到的凭据，不能手写。不支持 Claude 和 Google 的订阅登录，请使用 API 密钥。
 
