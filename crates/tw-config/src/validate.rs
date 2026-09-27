@@ -959,6 +959,7 @@ mod msg_codes {
             ClaudeSubscription,
             GoogleSubscription,
             ChatgptWithoutLogin,
+            ChatgptClientIdentity,
             IdentityHeader("h".into()),
             TooManyHeaders,
             BadHeaderName("h".into()),

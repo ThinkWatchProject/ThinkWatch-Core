@@ -5,8 +5,8 @@
 //! 发给 Codex 后端的 `originator` 和 User-Agent 是 ThinkWatch 自己的，系统提示词是客户端
 //! 自己的，不冒充 Codex，也不做指纹。唯一借用的是 OAuth 客户端 ID（见
 //! [`tw_config::chatgpt::CLIENT_ID`]）。2026-09-18 用 Plus 账号实测过，后端照常服务。
-//! 客户端带来的官方身份（ChatGPT 应用出具的证明、Codex 的安装 ID）也不转发，见
-//! [`tw_config::chatgpt::IDENTITY_HEADERS`]。
+//! 客户端的请求头只转协议要的那三个（见 [`crate::egress`]），ChatGPT 应用出具的证明、
+//! Codex 的安装 ID 这些官方客户端的身份都不发。
 //!
 //! # 和 OpenAI Responses 不一样的地方
 //!
@@ -55,8 +55,34 @@ const RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 // ---------------------------------------------------------------- 请求
 
 /// `client_metadata` 里说明客户端是谁的两项。Codex 把安装 ID 和夹着它的 turn 元数据
-/// 在请求体里又放了一份，和同名的请求头一样不发（见 [`tw_config::chatgpt::IDENTITY_HEADERS`]）
-const IDENTITY_METADATA: [&str; 2] = ["x-codex-installation-id", "x-codex-turn-metadata"];
+/// 在请求体里又放了一份，和同名的请求头一样不发（见 [`crate::egress`]）
+pub(crate) const IDENTITY_METADATA: [&str; 2] =
+    ["x-codex-installation-id", "x-codex-turn-metadata"];
+
+/// 去掉 `client_metadata` 里说明客户端是谁的几项（[`IDENTITY_METADATA`]）。去掉了什么
+/// 返回 true
+pub(crate) fn remove_identity_metadata(obj: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(meta) = obj
+        .get_mut("client_metadata")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let mut removed = false;
+    for key in IDENTITY_METADATA {
+        removed |= meta.remove(key).is_some();
+    }
+    removed
+}
+
+/// 压缩发给 Codex 后端的请求体，配 `Content-Encoding: zstd` 发。
+///
+/// Codex 直连这个后端时就这么发（openai/codex 的 `http-client`：zstd 3 级），说明后端
+/// 收压缩的请求体。Codex 的请求带着整段对话，长会话到 MB 级，JSON 压下来通常只剩一两成，
+/// 经代理上传时省得最明显。这是标准的传输编码，和请求来自谁无关。压缩失败就原样发
+pub fn compress(body: &[u8]) -> Option<Bytes> {
+    zstd::stream::encode_all(body, 3).ok().map(Bytes::from)
+}
 
 /// 客户端本来就说 Responses、这一跳直通时，把请求体改成 Codex 后端接受的样子。
 ///
@@ -81,14 +107,7 @@ pub fn shape_passthrough(body: &Bytes) -> (Bytes, Vec<String>) {
     }
     obj.insert("stream".into(), Value::Bool(true));
     obj.insert("store".into(), Value::Bool(false));
-    if let Some(meta) = obj
-        .get_mut("client_metadata")
-        .and_then(Value::as_object_mut)
-    {
-        for key in IDENTITY_METADATA {
-            meta.remove(key);
-        }
-    }
+    remove_identity_metadata(obj);
     match serde_json::to_vec(&v) {
         Ok(b) => (Bytes::from(b), dropped),
         Err(_) => (body.clone(), Vec::new()),
@@ -153,12 +172,6 @@ pub fn identity_headers(
         out.push((RESIDENCY_HEADER.to_string(), r));
     }
     out
-}
-
-/// 客户端带来的这个请求头要不要发给 Codex 后端。说明来源的头由网关自己填，`accept` 也是
-pub fn keeps_client_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower != "accept" && !tw_config::chatgpt::IDENTITY_HEADERS.contains(&lower.as_str())
 }
 
 // ---------------------------------------------------------------- 账户
@@ -532,17 +545,6 @@ mod tests {
                 .any(|(n, v)| n == "session-id" && !v.is_empty())
         );
         assert!(!plain.iter().any(|(n, _)| n == RESIDENCY_HEADER));
-
-        // 客户端报的来源不转发：请求经过的是 ThinkWatch
-        assert!(!keeps_client_header("Originator"));
-        assert!(!keeps_client_header("user-agent"));
-        assert!(!keeps_client_header("accept"));
-        assert!(keeps_client_header("x-codex-turn-state"));
-        // 官方客户端才有的身份也不转发：证明是 ChatGPT 应用出具的，安装 ID 是 Codex 的
-        assert!(!keeps_client_header("X-OAI-Attestation"));
-        assert!(!keeps_client_header("x-codex-installation-id"));
-        assert!(!keeps_client_header("x-codex-turn-metadata"));
-        assert!(keeps_client_header("x-codex-window-id"));
     }
 
     #[test]
