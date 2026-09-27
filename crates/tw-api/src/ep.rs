@@ -47,6 +47,9 @@ endpoints! {
     History: GET "/history", api::ListQuery => Vec<api::HistoryRow>;
     Latency: GET "/latency", api::Window => Vec<api::LatencyView>;
     LatencyByProvider: GET "/latency/provider", api::Window => Vec<api::LatencyView>;
+    /// 生成速度的中位数，按模型、按上游
+    TokenRate: GET "/token-rate", api::Window => Vec<api::TokenRateView>;
+    TokenRateByProvider: GET "/token-rate/provider", api::Window => Vec<api::TokenRateView>;
     RequestDetail: GET "/request/{id}" [id], () => api::RequestDetail;
     /// 把一条记录变成回放用例（YAML）
     Fixture: GET "/request/{id}/fixture" [id], () => String, text;

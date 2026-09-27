@@ -620,7 +620,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 网关填的（含 ThinkWatch 的 User-Agent）、上游配置里写的和各协议要的那几个，客户端
 /// 自己的 User-Agent 和身份头只在这一项打开时才发。照 25 写的界面保存时不给这个字段，
 /// 会把它关掉。
-pub const CONTROL_API_VERSION: u32 = 26;
+///
+/// **27 起记第一个 token 到的时刻和生成速度**：新事件 [`Event::RequestFirstToken`]，
+/// `RequestFinished::tokens_per_sec`，[`HistoryRow`] 的 `ttft_ms` 和
+/// `tokens_per_sec`，按模型、按上游的速度中位数（`/token-rate`、`/token-rate/provider`）。
+/// `/latency` 两个端点和 [`LiveView::tokens_per_sec`] 同版改成从第一个 token 算：以前
+/// 从响应头算，非流式请求的响应头要等整段生成完才到，一条就能把速度顶到几万。照 26
+/// 写的界面不认那个新事件。
+pub const CONTROL_API_VERSION: u32 = 27;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -765,6 +772,15 @@ pub enum Event {
     /// 到结束可能还有好几分钟，UI 要能在这个点就把行画出来并显示
     /// 「进行中」，而不是等它结束才出现。
     RequestHeaders { id: u64, status: u16, ttfb_ms: u64 },
+    /// 上游吐出了第一个 token：文本、推理，或者一个工具调用开了头。
+    ///
+    /// **和响应头是两个时刻。**流式响应的响应头一般一收到请求就回，之后上游还要
+    /// 排队、读完整段输入，才开始生成 —— 用户等的是这一刻。`message_start`、
+    /// `response.created` 这类开场帧不算：那是上游收到请求就发的。
+    ///
+    /// 只有成功的流式响应有。非流式的整段一起到，没有「第一个」；不带 `alt=sse` 的
+    /// Gemini 流和 WebSocket 那条路不在这里解析，也没有。
+    RequestFirstToken { id: u64, ttft_ms: u64 },
     /// 结束了
     RequestFinished {
         id: u64,
@@ -784,6 +800,14 @@ pub enum Event {
         /// 调用看起来是免费的
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageView>,
+        /// 生成速度：每秒输出多少 token，**从第一个 token 算到结束**。
+        ///
+        /// 分母不含第一个 token 之前的排队和读输入；分子是那之后吐出来的输出。推理
+        /// 被隐藏的（第一个 token 之前模型一直在想、一个字都没吐），上游报了其中多少
+        /// 是推理就扣掉，没报就没有这个数 —— 那些推理 token 是在分母之外生成的，算进
+        /// 来会把速度顶高好几倍。没有第一个 token 的（非流式）、没有输出的，也没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_per_sec: Option<u32>,
     },
     /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表
     /// （`auth` / `config` / `upstream` / `request` / `rate_limited` /
@@ -1331,6 +1355,7 @@ impl Event {
         match self {
             Event::RequestStarted { id, .. }
             | Event::RequestHeaders { id, .. }
+            | Event::RequestFirstToken { id, .. }
             | Event::RequestFinished { id, .. }
             | Event::RequestFailed { id, .. }
             | Event::RequestCancelled { id, .. }
@@ -1370,8 +1395,10 @@ impl Event {
 pub struct LiveView {
     /// 开始了、还没有结局的请求，开始得早的在前。和 `/in-flight` 是同一批
     pub running: Vec<RunningView>,
-    /// 最近一分钟跑完的请求平均每秒生成多少 token：**每个请求的输出除以它生成用的
-    /// 时间**（总耗时减去首字节），按 token 加权。这一分钟里没有跑完的是空，不是 0
+    /// 最近一分钟跑完的请求平均每秒生成多少 token：每个请求的速度（见
+    /// `RequestFinished::tokens_per_sec`）按它生成用的时间加权，也就是这些请求
+    /// 吐出的 token 合计除以生成用的时间合计。**只数有速度的**：非流式的不算。这一分钟里
+    /// 没有的是空，不是 0
     pub tokens_per_sec: Option<u32>,
 }
 
@@ -1431,7 +1458,7 @@ pub struct InFlightRequest {
     pub id: u64,
     /// 关于它的事件，**照事件流上的样子、按发生的先后**：第一条是 `RequestStarted`，
     /// 之后是到目前为止发生了的 —— 响应头、路由、格式转换、防护的记录
-    /// （`RequestHeaders`、`RequestRouted`、`Translated`、`SecretsFound`、
+    /// （`RequestHeaders`、`RequestFirstToken`、`RequestRouted`、`Translated`、`SecretsFound`、
     /// `HiddenTextFound`、`ContentMatched`、`OutputLimited`、`ToolCallFlagged`）。
     /// 说的是上游现状的（`QuotaSeen`）不在里面：那是 `/quota` 的事
     pub events: Vec<Event>,
@@ -3047,6 +3074,10 @@ pub struct Summary {
     pub pricing_date: String,
 }
 
+/// 第一个 token 到的时刻的分位数（`GET /latency`、`/latency/provider`），毫秒。
+///
+/// **只有流式请求有样本**：非流式的没有第一个 token（见 [`Event::RequestFirstToken`]）。
+/// `model` 在按上游分的那个端点里是上游名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct LatencyView {
@@ -3054,6 +3085,19 @@ pub struct LatencyView {
     pub p50: i64,
     pub p95: i64,
     /// **样本数要一起给。**「800ms」是 3 个样本还是 300 个，含义完全不同
+    pub samples: usize,
+}
+
+/// 生成速度的中位数（`GET /token-rate`、`/token-rate/provider`），token/秒。
+///
+/// 样本是有速度的请求（见 `RequestFinished::tokens_per_sec`）。`model` 在按上游
+/// 分的那个端点里是上游名。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TokenRateView {
+    pub model: String,
+    pub p50: u32,
+    /// 和延迟一样：「90 token/秒」是 3 个样本还是 300 个，含义完全不同
     pub samples: usize,
 }
 
@@ -3068,8 +3112,14 @@ pub struct HistoryRow {
     pub model: String,
     pub path: String,
     pub status: Option<u16>,
+    /// 响应头到的时刻
     pub ttfb_ms: Option<i64>,
+    /// 第一个 token 到的时刻。只有流式请求有，见 [`Event::RequestFirstToken`]
+    pub ttft_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// 生成速度，token/秒。只有跑完的流式请求有，见
+    /// `RequestFinished::tokens_per_sec`
+    pub tokens_per_sec: Option<u32>,
     pub bytes: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -4263,6 +4313,7 @@ mod tests {
             bytes: 10,
             duration_ms: 5,
             usage: None,
+            tokens_per_sec: None,
         };
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "request_finished");
@@ -4299,6 +4350,7 @@ mod tests {
                 status: 200,
                 ttfb_ms: 1,
             },
+            Event::RequestFirstToken { id: 7, ttft_ms: 2 },
             Event::RequestFinished {
                 id: 7,
                 model: String::new(),
@@ -4306,6 +4358,7 @@ mod tests {
                 bytes: 1,
                 duration_ms: 1,
                 usage: None,
+                tokens_per_sec: None,
             },
             Event::RequestFailed {
                 id: 7,
