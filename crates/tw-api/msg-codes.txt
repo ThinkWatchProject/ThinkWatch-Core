@@ -274,6 +274,7 @@ gw.upstream.forward_failed
 gw.upstream.rate_limited
 gw.upstream.sign_failed
 gw.upstream.status
+gw.upstream.stream_error
 gw.upstream.stream_exception
 gw.upstream.timeout
 gw.upstream.unreachable
