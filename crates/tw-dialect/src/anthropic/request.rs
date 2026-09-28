@@ -27,13 +27,21 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
 
     match v.get("system") {
         Some(Value::String(s)) if !s.is_empty() => r.system.push(s.clone()),
-        Some(Value::Array(blocks)) => r.system.extend(
-            blocks
-                .iter()
-                .filter_map(|b| str_of(b, "text"))
-                .filter(|t| !t.is_empty())
-                .map(str::to_string),
-        ),
+        Some(Value::Array(blocks)) => {
+            for b in blocks {
+                if let Some(t) = str_of(b, "text").filter(|t| !t.is_empty()) {
+                    r.system.push(t.to_string());
+                }
+                if let Some(ttl) = cache_ttl(b)
+                    && let Some(last) = r.system.len().checked_sub(1)
+                {
+                    r.cache.push(CachePoint {
+                        after: CacheAfter::System(last),
+                        ttl,
+                    });
+                }
+            }
+        }
         _ => {}
     }
 
@@ -63,7 +71,28 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
         };
         let parts = match m.get("content") {
             Some(Value::String(s)) if !s.is_empty() => vec![Part::Text(s.clone())],
-            Some(Value::Array(blocks)) => blocks.iter().filter_map(|b| block(b, dropped)).collect(),
+            Some(Value::Array(blocks)) => {
+                let mut parts = Vec::new();
+                for b in blocks {
+                    if let Some(p) = block(b, dropped) {
+                        parts.push(p);
+                    }
+                    // 标在一个转不过去的块上的断点，落到它前面那一块：缓存的
+                    // 仍是到这里为止的开头
+                    if let Some(ttl) = cache_ttl(b)
+                        && let Some(last) = parts.len().checked_sub(1)
+                    {
+                        r.cache.push(CachePoint {
+                            after: CacheAfter::Part {
+                                message: r.messages.len(),
+                                part: last,
+                            },
+                            ttl,
+                        });
+                    }
+                }
+                parts
+            }
             _ => Vec::new(),
         };
         r.messages.push(Message { role, parts });
@@ -89,6 +118,14 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
             }),
             // 服务端工具（web_search_20250305、code_execution_… 这些）只有 Anthropic 能执行
             Some(other) => dropped.path(format!("tools.{other}")),
+        }
+        if let Some(ttl) = cache_ttl(t)
+            && let Some(last) = r.tools.len().checked_sub(1)
+        {
+            r.cache.push(CachePoint {
+                after: CacheAfter::Tool(last),
+                ttl,
+            });
         }
     }
 
@@ -161,6 +198,23 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
         }
     }
     Ok(r)
+}
+
+/// 一个块上的 `cache_control`。只有 `ephemeral` 这一种，`ttl` 缺省是 5 分钟
+fn cache_ttl(b: &Value) -> Option<CacheTtl> {
+    let c = b.get("cache_control")?;
+    (str_of(c, "type") == Some("ephemeral")).then(|| match str_of(c, "ttl") {
+        Some("1h") => CacheTtl::Long,
+        _ => CacheTtl::Short,
+    })
+}
+
+/// 中间表示的断点 → `cache_control`
+fn cache_control(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::Short => json!({ "type": "ephemeral" }),
+        CacheTtl::Long => json!({ "type": "ephemeral", "ttl": "1h" }),
+    }
 }
 
 fn block(b: &Value, dropped: &mut Dropped) -> Option<Part> {
@@ -292,21 +346,29 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
             Value::Array(
                 r.system
                     .iter()
-                    .map(|s| json!({ "type": "text", "text": s }))
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let mut b = json!({ "type": "text", "text": s });
+                        if let Some(ttl) = CacheAfter::find(&r.cache, CacheAfter::System(i)) {
+                            b["cache_control"] = cache_control(ttl);
+                        }
+                        b
+                    })
                     .collect(),
             ),
         );
     }
     out.insert(
         "messages".into(),
-        Value::Array(messages(&r.messages, dropped)),
+        Value::Array(messages(&r.messages, &r.cache, dropped)),
     );
 
     if !r.tools.is_empty() {
         let tools = r
             .tools
             .iter()
-            .map(|tool| {
+            .enumerate()
+            .map(|(i, tool)| {
                 let (schema, strict) = match &tool.kind {
                     ToolKind::Function { schema, strict } => (object_schema(schema), *strict),
                     ToolKind::Freeform { format } => {
@@ -322,6 +384,9 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
                 }
                 if strict == Some(true) {
                     o["strict"] = json!(true);
+                }
+                if let Some(ttl) = CacheAfter::find(&r.cache, CacheAfter::Tool(i)) {
+                    o["cache_control"] = cache_control(ttl);
                 }
                 o
             })
@@ -411,7 +476,7 @@ fn reasoning(
         .min(max_tokens.saturating_sub(1));
     // 手动模式还要求工具调用那一轮以思考块开头。那一轮来自别家时没有 Anthropic 的
     // 思考块，开着思考发过去是 400
-    if budget < 1024 || continues_tool_turn_without_thinking(&r.messages) {
+    if budget < 1024 || think::continues_tool_turn_without_thinking(&r.messages) {
         dropped.feature(Feature::Reasoning);
         return false;
     }
@@ -421,27 +486,6 @@ fn reasoning(
     }
     out.insert("thinking".into(), thinking);
     true
-}
-
-/// 最后一条是工具结果，而发起调用的那一轮没有 Anthropic 签发的思考块
-fn continues_tool_turn_without_thinking(messages: &[Message]) -> bool {
-    let merged = merge_roles(messages.to_vec());
-    let [.., assistant, user] = merged.as_slice() else {
-        return false;
-    };
-    if assistant.role != Role::Assistant
-        || !user.parts.iter().any(|p| matches!(p, Part::ToolResult(_)))
-        || !assistant
-            .parts
-            .iter()
-            .any(|p| matches!(p, Part::ToolCall(_)))
-    {
-        return false;
-    }
-    !matches!(
-        assistant.parts.first(),
-        Some(Part::Thinking(Thinking { signature: Some(s), .. })) if s.vendor == Vendor::Anthropic
-    )
 }
 
 fn sampling(
@@ -479,14 +523,15 @@ fn sampling(
     }
 }
 
-fn messages(msgs: &[Message], dropped: &mut Dropped) -> Vec<Value> {
+fn messages(msgs: &[Message], cache: &[CachePoint], dropped: &mut Dropped) -> Vec<Value> {
     // 每条消息拆成「工具结果」和「其他」两组：Anthropic 要求工具结果排在 user 消息
     // 最前面，合并相邻消息时也要保持这一点
     let mut out: Vec<(Role, Vec<Value>, Vec<Value>)> = Vec::new();
-    for m in msgs {
+    for (i, m) in msgs.iter().enumerate() {
         let mut results = Vec::new();
         let mut others = Vec::new();
-        for p in &m.parts {
+        for (j, p) in m.parts.iter().enumerate() {
+            let before = (results.len(), others.len());
             match p {
                 Part::Text(s) if !s.is_empty() => others.push(json!({ "type": "text", "text": s })),
                 Part::Text(_) => {}
@@ -530,6 +575,27 @@ fn messages(msgs: &[Message], dropped: &mut Dropped) -> Vec<Value> {
                     "input": c.input.to_object(),
                 })),
                 Part::ToolResult(res) => results.push(tool_result(res, dropped)),
+            }
+            // 断点标在这一块转出来的那个块上。思考块不能标（Anthropic 不许）
+            if let Some(ttl) = CacheAfter::find(
+                cache,
+                CacheAfter::Part {
+                    message: i,
+                    part: j,
+                },
+            ) {
+                let block = if results.len() > before.0 {
+                    results.last_mut()
+                } else if others.len() > before.1 {
+                    others.last_mut()
+                } else {
+                    None
+                };
+                if let Some(b) = block
+                    && !matches!(str_of(b, "type"), Some("thinking" | "redacted_thinking"))
+                {
+                    b["cache_control"] = cache_control(ttl);
+                }
             }
         }
         if results.is_empty() && others.is_empty() {
@@ -893,5 +959,66 @@ mod tests {
         assert_eq!(content[0]["type"], "tool_result");
         assert_eq!(content[0]["is_error"], true);
         assert_eq!(content[1]["type"], "text");
+    }
+
+    #[test]
+    fn cache_breakpoints_are_kept_where_the_client_put_them() {
+        let (r, _) = decode(CLAUDE_CODE);
+        assert_eq!(
+            r.cache,
+            [CachePoint {
+                after: CacheAfter::System(1),
+                ttl: CacheTtl::Short,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_breakpoint_on_a_block_that_does_not_convert_moves_to_the_block_before() {
+        // 缓存的仍然是到这里为止的开头
+        let (r, dropped) = decode(
+            r#"{"model":"m","max_tokens":1,"messages":[{"role":"assistant","content":[
+                {"type":"text","text":"查一下"},
+                {"type":"server_tool_use","id":"s","name":"web_search","input":{},"cache_control":{"type":"ephemeral","ttl":"1h"}}
+            ]}]}"#,
+        );
+        assert_eq!(dropped, ["messages.content.server_tool_use"]);
+        assert_eq!(
+            r.cache,
+            [CachePoint {
+                after: CacheAfter::Part {
+                    message: 0,
+                    part: 0,
+                },
+                ttl: CacheTtl::Long,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_converse_cache_point_comes_out_as_cache_control_on_the_same_block() {
+        let converse = json!({
+            "system": [{"text": "规则"}, {"cachePoint": {"type": "default", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": [
+                {"text": "a"}, {"cachePoint": {"type": "default"}}, {"text": "b"}
+            ]}],
+            "toolConfig": {"tools": [
+                {"toolSpec": {"name": "t", "inputSchema": {"json": {"type": "object"}}}},
+                {"cachePoint": {"type": "default"}}
+            ]}
+        });
+        let mut d = Dropped::new(Dialect::Bedrock);
+        let r =
+            crate::bedrock::decode_request(&converse, "claude-sonnet-4-5", false, &mut d).unwrap();
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        let (v, _) = encode(&r, Dialect::Bedrock, true);
+        assert_eq!(
+            v["system"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(v["tools"][0]["cache_control"], json!({"type": "ephemeral"}));
+        let content = &v["messages"][0]["content"];
+        assert_eq!(content[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(content[1].get("cache_control").is_none(), "{content}");
     }
 }

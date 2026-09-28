@@ -48,6 +48,8 @@ use crate::redact::stream::Restorer;
 /// 一张图）。
 const UNTOUCHED: &[&str] = &[
     "thinking",
+    // Bedrock 上 Claude 的思考过程，同样带签名
+    "reasoningContent",
     "signature",
     "thoughtSignature",
     "encrypted_content",
@@ -345,9 +347,28 @@ fn fields(d: Dialect, v: &Value) -> Vec<Field> {
                 }
             }
         }
-        // 从来不是任何一边要还原的流：客户端不说它，桌面版也不接它。
-        // 完整的占位符照样由 `walk` 还原
-        Dialect::Bedrock => {}
+        // Converse 的流在进门时已经拆成了 SSE（`event:` 是事件名，`data:` 是载荷），
+        // 载荷里不带事件名，按形状认：`contentBlockDelta` 带着 `delta`
+        Dialect::Bedrock => {
+            if let Some(delta) = v.get("delta") {
+                let i = u(v, "contentBlockIndex");
+                if delta.get("text").is_some_and(Value::is_string) {
+                    out.push(Field {
+                        lane: Lane::Text(i),
+                        path: vec![Key("delta"), Key("text")],
+                    });
+                }
+                if delta
+                    .pointer("/toolUse/input")
+                    .is_some_and(Value::is_string)
+                {
+                    out.push(Field {
+                        lane: Lane::Args(i),
+                        path: vec![Key("delta"), Key("toolUse"), Key("input")],
+                    });
+                }
+            }
+        }
     }
     out
 }
@@ -388,7 +409,21 @@ fn close(d: Dialect, v: &Value) -> Close {
                 .is_some_and(|f| !f.is_null());
             if done { Close::All } else { Close::None }
         }
-        Dialect::Bedrock => Close::None,
+        // `messageStop` 带 `stopReason`；`contentBlockStop` 只有下标，没有 `delta`
+        // 也没有 `start`
+        Dialect::Bedrock => {
+            if v.get("stopReason").is_some() {
+                Close::All
+            } else if v.get("contentBlockIndex").is_some()
+                && v.get("delta").is_none()
+                && v.get("start").is_none()
+            {
+                let i = u(v, "contentBlockIndex");
+                Close::Lanes(vec![Lane::Text(i), Lane::Args(i)])
+            } else {
+                Close::None
+            }
+        }
     }
 }
 
@@ -467,10 +502,13 @@ fn synth(d: Dialect, lane: Lane, last: &Value, tail: String) -> Synth {
                 data: Value::Object(m),
             }
         }
-        // `fields` 从不给 Bedrock 开路，走不到这里
-        (Dialect::Bedrock, _) => Synth {
-            event: None,
-            data: Value::String(tail),
+        (Dialect::Bedrock, Lane::Text(i)) => Synth {
+            event: Some("contentBlockDelta".into()),
+            data: json!({ "contentBlockIndex": i, "delta": { "text": tail } }),
+        },
+        (Dialect::Bedrock, Lane::Args(i)) => Synth {
+            event: Some("contentBlockDelta".into()),
+            data: json!({ "contentBlockIndex": i, "delta": { "toolUse": { "input": tail } } }),
         },
     }
 }
@@ -981,5 +1019,97 @@ mod tests {
         let mut out = b.process(r.text.as_bytes());
         out.extend(b.flush());
         assert_eq!(String::from_utf8(out).unwrap(), body);
+    }
+
+    fn converse(event: &str, data: Value) -> String {
+        named(event, data)
+    }
+
+    /// Converse：按内容块拼出 (index, 正文, 参数)
+    fn converse_blocks(out: &str) -> BTreeMap<u64, (String, String)> {
+        let mut m: BTreeMap<u64, (String, String)> = BTreeMap::new();
+        for v in values(out) {
+            let Some(d) = v.get("delta") else {
+                continue;
+            };
+            let e = m
+                .entry(v["contentBlockIndex"].as_u64().unwrap())
+                .or_default();
+            if let Some(s) = d["text"].as_str() {
+                e.0.push_str(s);
+            }
+            if let Some(s) = d["toolUse"]["input"].as_str() {
+                e.1.push_str(s);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn a_converse_stream_gets_its_text_and_its_tool_input_back() {
+        // Bedrock 按 token 吐字，占位符一样会被切开
+        let mut frames = vec![converse("messageStart", json!({"role": "assistant"}))];
+        frames.extend(["key 是 <<TW", "_SECRET_1>>"].iter().map(|t| {
+            converse(
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0, "delta": {"text": t}}),
+            )
+        }));
+        frames.push(converse(
+            "contentBlockStop",
+            json!({"contentBlockIndex": 0}),
+        ));
+        frames.push(converse(
+            "contentBlockStart",
+            json!({"contentBlockIndex": 1, "start": {"toolUse": {"toolUseId": "t", "name": "write"}}}),
+        ));
+        frames.extend([r#"{"v":"<<TW_SE"#, r#"CRET_1>>"}"#].iter().map(|t| {
+            converse(
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 1, "delta": {"toolUse": {"input": t}}}),
+            )
+        }));
+        frames.push(converse(
+            "contentBlockStop",
+            json!({"contentBlockIndex": 1}),
+        ));
+        frames.push(converse("messageStop", json!({"stopReason": "tool_use"})));
+
+        let out = run(Dialect::Bedrock, &frames);
+        let b = converse_blocks(&out);
+        assert_eq!(b[&0].0, format!("key 是 {KEY}"));
+        assert_eq!(b[&1].1, format!(r#"{{"v":"{KEY}"}}"#));
+    }
+
+    #[test]
+    fn a_converse_tail_is_written_as_a_converse_delta_before_its_block_stops() {
+        let frames = vec![
+            converse(
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0, "delta": {"text": "结果是 <<TW_SEC"}, "p": "abc"}),
+            ),
+            converse(
+                "contentBlockStop",
+                json!({"contentBlockIndex": 0, "p": "abcdef"}),
+            ),
+        ];
+        let out = run(Dialect::Bedrock, &frames);
+        assert_eq!(converse_blocks(&out)[&0].0, "结果是 <<TW_SEC");
+        let tail = out.find("<<TW_SEC").unwrap();
+        let stop = out.rfind("event: contentBlockStop").unwrap();
+        assert!(tail < stop, "{out}");
+        // 补出来的是 Converse 自己的事件，转换器认得它
+        assert!(out.contains("event: contentBlockDelta"), "{out}");
+    }
+
+    #[test]
+    fn converse_reasoning_is_left_as_the_upstream_signed_it() {
+        let frames = vec![converse(
+            "contentBlockDelta",
+            json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"text": "<<TW_SECRET_1>>"}}}),
+        )];
+        let out = run(Dialect::Bedrock, &frames);
+        assert!(out.contains("<<TW_SECRET_1>>"), "{out}");
+        assert!(!out.contains(KEY), "{out}");
     }
 }

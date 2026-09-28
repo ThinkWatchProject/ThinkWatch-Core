@@ -137,6 +137,32 @@ pub fn claude_adaptive(model: &str) -> bool {
     (major, minor) >= (4, 6)
 }
 
+/// 最后一条是工具结果，而发起调用的那一轮没有 Anthropic 签发的思考块。
+///
+/// Claude 按预算思考时，工具调用那一轮必须以思考块开头。那一轮来自别家（或者当时
+/// 没开思考）时手里没有这样的块，开着思考发过去是 400 —— 这时只能不开。Anthropic
+/// 和 Bedrock 上的 Claude 是同一个规矩。
+pub(crate) fn continues_tool_turn_without_thinking(messages: &[crate::ir::Message]) -> bool {
+    use crate::ir::{Part, Role, Thinking, Vendor, merge_roles};
+    let merged = merge_roles(messages.to_vec());
+    let [.., assistant, user] = merged.as_slice() else {
+        return false;
+    };
+    if assistant.role != Role::Assistant
+        || !user.parts.iter().any(|p| matches!(p, Part::ToolResult(_)))
+        || !assistant
+            .parts
+            .iter()
+            .any(|p| matches!(p, Part::ToolCall(_)))
+    {
+        return false;
+    }
+    !matches!(
+        assistant.parts.first(),
+        Some(Part::Thinking(Thinking { signature: Some(s), .. })) if s.vendor == Vendor::Anthropic
+    )
+}
+
 /// 这个 Gemini 模型用 `thinkingLevel` 而不是 `thinkingBudget`
 pub fn gemini_uses_level(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
