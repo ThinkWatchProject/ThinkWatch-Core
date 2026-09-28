@@ -51,7 +51,31 @@ trap cleanup EXIT
 
 # ---------------------------------------------------------------- 假上游
 cat > "$TMP/upstream.py" <<'PY'
-import http.server, json, sys, time
+import hashlib, http.server, json, struct, sys, time, zlib
+
+# ── 假的 Bedrock：Converse、ConverseStream（AWS eventstream 的二进制帧）和模型目录
+def frame(headers, payload):
+    """一帧 eventstream：前导（总长、头长、前导 CRC）、头、载荷、整帧 CRC"""
+    hb = b''
+    for k, v in headers:
+        kb, vb = k.encode(), v.encode()
+        hb += bytes([len(kb)]) + kb + bytes([7]) + struct.pack('>H', len(vb)) + vb
+    prelude = struct.pack('>II', 12 + len(hb) + len(payload) + 4, len(hb))
+    prelude += struct.pack('>I', zlib.crc32(prelude) & 0xffffffff)
+    msg = prelude + hb + payload
+    return msg + struct.pack('>I', zlib.crc32(msg) & 0xffffffff)
+
+def ev(kind, obj):
+    return frame([(':message-type', 'event'), (':event-type', kind),
+                  (':content-type', 'application/json')], json.dumps(obj).encode())
+
+def signed(headers, body):
+    """访问密钥签过名：签名覆盖的请求体哈希就是收到的这一份"""
+    auth = headers.get('authorization', '')
+    return (auth.startswith('AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7SMOKE/')
+            and 'x-amz-date' in headers
+            and headers.get('x-amz-content-sha256') == hashlib.sha256(body).hexdigest())
+
 class H(http.server.BaseHTTPRequestHandler):
     # **关掉 Nagle。**这个处理器先写响应头、再单独写正文，两次小写。开着
     # Nagle 的话，正文要等对端确认了响应头才发；而 core 用的是池里的旧
@@ -65,13 +89,39 @@ class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a): pass
+    def reply(self, status, ctype, out):
+        self.send_response(status); self.send_header('content-type', ctype)
+        self.send_header('content-length', str(len(out))); self.end_headers(); self.wfile.write(out)
     def do_GET(self):
+        if self.path.startswith('/foundation-models'):
+            return self.reply(200, 'application/json', json.dumps(
+                {"modelSummaries": [{"modelId": "amazon.nova-lite-v1:0"}]}).encode())
+        if self.path.startswith('/inference-profiles'):
+            return self.reply(200, 'application/json', json.dumps(
+                {"inferenceProfileSummaries": [
+                    {"inferenceProfileId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"}]}).encode())
         out = json.dumps({"data": [{"id": "claude-sonnet-4-5"}]}).encode()
         self.send_response(200); self.send_header('content-type','application/json')
         self.send_header('content-length', str(len(out))); self.end_headers(); self.wfile.write(out)
     def do_POST(self):
         n = int(self.headers.get('content-length', 0) or 0)
         body = self.rfile.read(n)
+        if self.path.startswith('/model/'):
+            if not signed(self.headers, body):
+                return self.reply(403, 'application/json', json.dumps(
+                    {"message": "The request signature we calculated does not match"}).encode())
+            if self.path.endswith('/converse-stream'):
+                out = (ev('messageStart', {"role": "assistant"})
+                       + ev('contentBlockDelta', {"contentBlockIndex": 0, "delta": {"text": "bedrock-"}})
+                       + ev('contentBlockDelta', {"contentBlockIndex": 0, "delta": {"text": "stream"}})
+                       + ev('contentBlockStop', {"contentBlockIndex": 0})
+                       + ev('messageStop', {"stopReason": "end_turn"})
+                       + ev('metadata', {"usage": {"inputTokens": 31, "outputTokens": 3, "totalTokens": 34}}))
+                return self.reply(200, 'application/vnd.amazon.eventstream', out)
+            return self.reply(200, 'application/json', json.dumps({
+                "output": {"message": {"role": "assistant", "content": [{"text": "bedrock-ok"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 30, "outputTokens": 2, "totalTokens": 32}}).encode())
         saw = "yes" if b"sk-ant-api03-SMOKEKEY" in body else "no"
         if b"SLOWSTREAM" in body:
             # 先吐第一帧（输入用量就在里面），然后长时间「思考」—— 客户端
@@ -154,6 +204,14 @@ providers:
     base_url: http://127.0.0.1:{upport}
     key: sk-upstream-smoke
     protocol: anthropic
+  # 假的 Bedrock 和它们是同一个服务：地址不是 AWS 的，签名用的区域写在 aws.region
+  - name: bedrock
+    base_url: http://127.0.0.1:{upport}
+    protocol: bedrock
+    aws:
+      access_key_id: AKIAIOSFODNN7SMOKE
+      secret_access_key: SMOKEsecretAccessKeyWithoutMuchShape
+      region: us-east-1
 # **把流量钉在 relay 上。**脱敏是全局的，走哪家都会换；钉住是为了让
 # 「这一条走了哪条路由」也有一个确定的答案，失败时少猜一件事。
 #
@@ -166,6 +224,10 @@ groups:
 routes:
   - name: 默认
     rules:
+      - name: Bedrock 的模型走 Bedrock
+        when:
+          model: "us.anthropic.*"
+        to: bedrock
       - name: 冒烟：这条必须走 relay，不许转移
         to: 只走中转
 security:
@@ -313,6 +375,39 @@ print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/d
     || bad "客户端中途走掉的请求没有按取消落库" "$GOT"
 fi
 
+# ---------------------------------------------------------------- Bedrock
+step "Bedrock"
+# 转成 Converse、访问密钥签名（假 Bedrock 核对签名覆盖的请求体哈希）、
+# eventstream 的流转成客户端的 SSE、用量照记
+BR='{"model":"us.anthropic.claude-sonnet-4-5-20250929-v1:0","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+BRS='{"model":"us.anthropic.claude-sonnet-4-5-20250929-v1:0","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}'
+R=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
+      -H 'content-type: application/json' -d "$BR")
+echo "$R" | grep -q 'bedrock-ok' && ok "Anthropic 格式的请求经 Converse 到了 Bedrock，签名对得上" \
+  || bad "Bedrock 的整包请求没通" "$R"
+S=$(curl -s -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smoketestkey0123456789' \
+      -H 'content-type: application/json' -d "$BRS")
+TEXT=$(printf '%s' "$S" | python3 -c 'import sys, json
+t = ""
+for line in sys.stdin.read().splitlines():
+    if line.startswith("data: "):
+        try: t += json.loads(line[6:]).get("delta", {}).get("text", "")
+        except Exception: pass
+print(t)')
+[ "$TEXT" = "bedrock-stream" ] && ok "eventstream 的流转成了客户端的 SSE" || bad "Bedrock 的流没转过来" "$S"
+GOT=""
+for _ in $(seq 1 20); do
+  GOT=$(ctl "/history?limit=1" 2>/dev/null \
+          | python3 -c 'import sys, json
+rows = json.load(sys.stdin)
+r = rows[0] if rows else {}
+good = r.get("provider") == "bedrock" and r.get("input_tokens") == 31 and r.get("output_tokens") == 3
+print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/dev/null)
+  [ "$GOT" = "ok" ] && break
+  sleep 0.25
+done
+[ "$GOT" = "ok" ] && ok "Bedrock 的流式请求落了库，带着用量" || bad "Bedrock 的请求没带着用量落库" "$GOT"
+
 # ---------------------------------------------------------------- 控制面
 step "控制面要握手"
 sleep 1
@@ -386,7 +481,7 @@ fi
 # ---------------------------------------------------------------- 诊断包
 step "诊断包不带密钥出门"
 get /diagnostics >/dev/null
-if grep -qE "sk-upstream-smoke|tw-smoketestkey0123456789|$KEY" "$TMP/out"; then
+if grep -qE "sk-upstream-smoke|tw-smoketestkey0123456789|SMOKEsecretAccessKey|$KEY" "$TMP/out"; then
   bad "诊断包里有真密钥"
 else
   ok "诊断包里没有真密钥"

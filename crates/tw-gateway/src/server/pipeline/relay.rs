@@ -74,6 +74,27 @@ pub(super) fn respond(
         out_headers.insert("x-thinkwatch-upstream", v);
     }
 
+    // **Bedrock 的流不是 SSE**，是 AWS eventstream 的二进制帧。在字节进门的地方就转成
+    // SSE（`event:` 是事件名，`data:` 是载荷），后面的一切 —— 用量、首 token、留档、
+    // 回显还原、转换、工具审查 —— 读的都是 SSE，不需要知道 Bedrock 有什么不同。
+    // 请求记录里留的也是转好的这一份：二进制帧存下来没人看得懂
+    let eventstream = provider.is_bedrock()
+        && status.is_success()
+        && out_headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_some_and(|v| {
+                v.as_bytes()
+                    .starts_with(tw_bedrock::eventstream::CONTENT_TYPE.as_bytes())
+            });
+    if eventstream {
+        out_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    let mut unframe = eventstream.then(tw_bedrock::eventstream::Transcoder::new);
+    let upstream_name = provider.name.clone();
+
     // 流结束时才知道总字节数和真实耗时 —— 对一个跑了六分钟的任务，
     // 这两个数字在响应头那一刻都还不存在。
     //
@@ -149,6 +170,21 @@ pub(super) fn respond(
                 },
             };
             let Some(item) = next else { break };
+            // eventstream 拆成 SSE。一帧没收齐时这一块什么都转不出来，等下一块
+            let item = match (item, unframe.as_mut()) {
+                (Ok(raw), Some(t)) => {
+                    upstream_since = tokio::time::Instant::now();
+                    match t.feed(&raw) {
+                        Ok(sse) if sse.is_empty() => continue,
+                        Ok(sse) => Ok(Bytes::from(sse)),
+                        Err(e) => {
+                            broke = Some(stream_error(&upstream_name, e).in_dialect(dialect));
+                            break;
+                        }
+                    }
+                }
+                (item, _) => item,
+            };
             match item {
                 Ok(chunk) => {
                     upstream_since = tokio::time::Instant::now();
@@ -730,6 +766,34 @@ impl Relay {
             Some(err.body_bytes())
         } else {
             None
+        }
+    }
+}
+
+/// Bedrock 的流断在半路：帧坏了，或者上游在流里报了异常（半路被限流之类）。
+///
+/// 异常名决定这是哪一种错：限流按限流报，客户端才知道该退避而不是换一家；其余的按
+/// 上游出错报。**流里的异常不带账号信息**（限流、校验、服务不可用这些），原话照说，
+/// 太长的截断。
+fn stream_error(upstream: &str, e: tw_bedrock::eventstream::StreamError) -> GatewayError {
+    use tw_bedrock::eventstream::StreamError;
+    match e {
+        StreamError::Malformed(detail) => GatewayError::upstream(msg!(
+            "gw.upstream.eventstream_broken", upstream = upstream, detail = detail =>
+            "Upstream `{upstream}` sent a damaged AWS eventstream frame: {detail}"
+        )),
+        StreamError::Upstream { kind, message } => {
+            let message: String = message.chars().take(500).collect();
+            let detail = msg!(
+                "gw.upstream.stream_exception",
+                upstream = upstream, kind = kind.clone(), message = message =>
+                "Upstream `{upstream}` ended the stream with {kind}: {message}"
+            );
+            if tw_bedrock::error::status_of(&kind) == 429 {
+                GatewayError::rate_limited(detail)
+            } else {
+                GatewayError::upstream(detail)
+            }
         }
     }
 }

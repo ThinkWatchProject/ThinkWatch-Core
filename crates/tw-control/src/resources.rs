@@ -161,6 +161,7 @@ async fn preview_provider(
     Ok(Json(tw_api::ProviderPreview {
         protocol: p.effective_protocol().map(Into::into),
         auth_header: chosen.auth_header().0.to_string(),
+        region: p.bedrock_region().map(str::to_string),
     }))
 }
 
@@ -226,7 +227,15 @@ async fn test_provider(
         Ok(h) => h,
         Err(e) => return Ok(Json(failed(e.msg()))),
     };
-    let r = tw_gateway::probe(&http, &p.base_url, &headers, protocol).await;
+    let r = if p.is_bedrock() {
+        let credentials = match p.aws_credentials() {
+            Ok(c) => c,
+            Err(e) => return Ok(Json(failed(e.msg()))),
+        };
+        tw_gateway::probe_bedrock(&http, &p, &headers, credentials.as_ref()).await
+    } else {
+        tw_gateway::probe(&http, &p.base_url, &headers, protocol).await
+    };
     Ok(Json(tw_api::ProviderTestResult {
         ok: r.ok,
         protocol: protocol.map(Into::into),
@@ -377,12 +386,26 @@ fn to_provider(
             })
         }
     };
+    // 会话令牌空着就是没有：界面交上来的是一个空的框
+    let nonblank = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+    };
+    let aws = input.aws.as_ref().map(|a| tw_config::Aws {
+        access_key_id: tw_config::Secret::new(a.access_key_id.trim()),
+        secret_access_key: tw_config::Secret::new(a.secret_access_key.trim()),
+        session_token: nonblank(&a.session_token).map(tw_config::Secret::new),
+        region: nonblank(&a.region),
+    });
     let provider = tw_config::Provider {
         name,
         base_url,
         key,
         headers: tw_config::Headers::new(headers),
         oauth,
+        aws,
         protocol: input.protocol.map(Into::into),
         forward_client_identity: input.forward_client_identity,
         models: input

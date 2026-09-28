@@ -50,8 +50,8 @@ impl Hop {
             Dialect::Chat => Some(Protocol::OpenaiChat),
             Dialect::Responses => Some(Protocol::OpenaiResponses),
             Dialect::Gemini => Some(Protocol::Gemini),
-            // Bedrock 不是一种上游协议：认不出的上游收到 Bedrock 格式也只能原样直通
-            Dialect::Bedrock => None,
+            // 客户端不说 Converse（`client_api` 认不出它的路径），走不到这里
+            Dialect::Bedrock => Some(Protocol::Bedrock),
         })
     }
 }
@@ -117,7 +117,8 @@ pub fn takes_from_client(hop: &Hop, name: &str) -> bool {
                 && !(hop.harness_elsewhere && n == "anthropic-beta")
         }
         Some(Protocol::OpenaiChat | Protocol::OpenaiResponses) => OPENAI.contains(&n.as_str()),
-        Some(Protocol::Gemini | Protocol::Chatgpt) | None => false,
+        // Bedrock 的请求一律是转换过的，头由网关和签名填
+        Some(Protocol::Gemini | Protocol::Chatgpt | Protocol::Bedrock) | None => false,
     }
 }
 
@@ -378,7 +379,10 @@ mod tests {
             Hop::protocol_for(Some(Protocol::Gemini), Some(Dialect::Anthropic)),
             Some(Protocol::Gemini)
         );
-        assert_eq!(Hop::protocol_for(None, Some(Dialect::Bedrock)), None);
+        assert_eq!(
+            Hop::protocol_for(None, Some(Dialect::Bedrock)),
+            Some(Protocol::Bedrock)
+        );
     }
 
     #[test]

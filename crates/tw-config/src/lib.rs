@@ -157,6 +157,7 @@ impl Default for Provider {
             key: None,
             headers: Headers::default(),
             oauth: None,
+            aws: None,
             protocol: None,
             forward_client_identity: false,
             proxy: default_proxy(),
@@ -669,6 +670,27 @@ pub struct OAuth {
     pub refresh_before: Option<String>,
 }
 
+/// Bedrock 的 AWS 访问密钥。
+///
+/// 每个请求用它们签一次名（SigV4）：签的是方法、地址、时间和请求体，所以签名在
+/// 转发时、请求体定稿之后才做，配置里只放密钥本身。每一项都可以写 `${ENV}`。
+///
+/// **只读密钥，不执行命令**：`aws sso login`、`credential_process` 这类要跑程序才拿得到
+/// 的凭证这里接不了，见 [`credential`]。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aws {
+    pub access_key_id: Secret,
+    pub secret_access_key: Secret,
+    /// 临时凭证（STS 发的）才有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<Secret>,
+    /// 签名用的区域。地址是标准的 `https://bedrock-runtime.<区域>.amazonaws.com` 时从
+    /// 地址读，不用写；地址是 VPC 端点或代理时必须写
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
 impl OAuth {
     /// 提前量。写坏了按默认走 —— **一个写错的提前量不该让上游整个不可用**。
     pub fn refresh_before(&self) -> std::time::Duration {
@@ -712,6 +734,10 @@ pub struct Provider {
     /// OAuth：access token 由 refresh token 换发，默认放进协议的鉴权头。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuth>,
+    /// Bedrock 的 AWS 访问密钥：每个请求用它们签名（SigV4）。和 `key`（Bedrock API
+    /// Key）二选一。见 [`Aws`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<Aws>,
     /// 不写就从 base_url 猜（最小配置）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
@@ -831,6 +857,9 @@ pub enum Protocol {
     /// ChatGPT 账号：Codex 后端。说的是 OpenAI Responses 格式，但只接受流式、
     /// 不认 `max_output_tokens`、身份头由网关填（见 [`chatgpt`]）
     Chatgpt,
+    /// Amazon Bedrock 的 Converse。生成请求一律转成它；流不是 SSE，是 AWS
+    /// eventstream 的二进制帧。凭证是 Bedrock API Key（`key`）或者访问密钥（`aws`）
+    Bedrock,
 }
 
 impl Protocol {
@@ -842,6 +871,7 @@ impl Protocol {
             Protocol::OpenaiResponses => "openai-responses",
             Protocol::Gemini => "gemini",
             Protocol::Chatgpt => "chatgpt",
+            Protocol::Bedrock => "bedrock",
         }
     }
 }
@@ -852,6 +882,9 @@ impl Provider {
     pub fn guess_protocol(base_url: &str) -> Option<Protocol> {
         if chatgpt::is_backend(base_url) {
             return Some(Protocol::Chatgpt);
+        }
+        if tw_bedrock::endpoint::region_of(base_url).is_some() {
+            return Some(Protocol::Bedrock);
         }
         let h = base_url.to_ascii_lowercase();
         if h.contains("api.anthropic.com") {
@@ -868,6 +901,26 @@ impl Provider {
     pub fn effective_protocol(&self) -> Option<Protocol> {
         self.protocol
             .or_else(|| Self::guess_protocol(&self.base_url))
+    }
+
+    /// 这家是不是 Bedrock。
+    pub fn is_bedrock(&self) -> bool {
+        self.effective_protocol() == Some(Protocol::Bedrock)
+    }
+
+    /// Bedrock 的区域：标准地址里的那个，没有就是 `aws.region`。
+    pub fn bedrock_region(&self) -> Option<&str> {
+        tw_bedrock::endpoint::region_of(&self.base_url)
+            .or_else(|| self.aws.as_ref().and_then(|a| a.region.as_deref()))
+    }
+
+    /// Bedrock 列模型的地方。标准地址对应区域的控制面；别的地址（代理、测试用的
+    /// 本地服务）由它自己回答 —— 控制面的路径和推理的不重叠。
+    pub fn bedrock_control_base(&self) -> String {
+        match tw_bedrock::endpoint::region_of(&self.base_url) {
+            Some(region) => tw_bedrock::endpoint::control_base(region),
+            None => self.base_url.trim_end_matches('/').to_string(),
+        }
     }
 }
 
@@ -1221,6 +1274,31 @@ providers:
             Provider::guess_protocol("https://relay.example.cn/v1"),
             None
         );
+    }
+
+    #[test]
+    fn a_bedrock_runtime_address_is_recognized_and_nothing_that_merely_looks_like_one() {
+        for url in [
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com/",
+        ] {
+            assert_eq!(
+                Provider::guess_protocol(url),
+                Some(Protocol::Bedrock),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://bedrock.us-east-1.amazonaws.com",
+            "https://relay.example/bedrock-runtime.us-east-1.amazonaws.com",
+            "https://bedrock-runtime.us-east-1.amazonaws.com.evil.example",
+        ] {
+            assert_ne!(
+                Provider::guess_protocol(url),
+                Some(Protocol::Bedrock),
+                "{url}"
+            );
+        }
     }
 
     #[test]

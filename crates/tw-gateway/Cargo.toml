@@ -16,6 +16,8 @@ categories.workspace = true
 tw-api = { workspace = true }
 tw-config = { workspace = true }
 tw-breaker = { workspace = true }
+# Bedrock：SigV4 签名、eventstream 拆帧、推理地址和模型目录，和企业版共用一份
+tw-bedrock = { workspace = true }
 tw-engine = { workspace = true }
 tw-observe = { workspace = true }
 tw-secret = { workspace = true }
@@ -49,6 +51,9 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+# 假的 Bedrock 要回 eventstream 的二进制帧
+aws-smithy-eventstream = { workspace = true }
+aws-smithy-types = { workspace = true }
 # 集成测试里要当 WS 客户端 —— 那一侧需要 connect
 tokio-tungstenite = { workspace = true, features = ["connect", "stream"] }
 tempfile = "3"

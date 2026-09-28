@@ -164,17 +164,47 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
+        // Bedrock 的访问密钥：每个请求签名要用。**和请求头在同一处取**：环境变量没设是
+        // 这一家的问题，换下一家
+        let aws = match provider.aws_credentials() {
+            Ok(c) => c,
+            Err(e) => {
+                note_health(
+                    &state.bus,
+                    &state.health,
+                    &provider.name,
+                    state.health.record_failure(&provider.name),
+                );
+                let err =
+                    GatewayError::config(crate::state::credential_failed(e.msg(), &provider.name));
+                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                last_err = Some(err);
+                continue;
+            }
+        };
+
         tracing::debug!(
             client = %req.client_name,
             provider = %provider.name,
             rule = %decision.matched_rule,
             group = ?decision.via_group,
-            url = %tw_secret::redact_url(&forward::upstream_url(&provider.base_url, &out.path, out.query.as_deref())),
+            url = %tw_secret::redact_url(&hop_url(provider, &out)),
             attempt = attempts.len(),
             "forwarding"
         );
 
-        match send(state, req, provider, http, &out, body, upstream_headers).await {
+        match send(
+            state,
+            req,
+            provider,
+            http,
+            &out,
+            body,
+            upstream_headers,
+            aws.as_ref(),
+        )
+        .await
+        {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
                 // 额度用完时上游回的正是 429，这一跳的额度头也要读
                 state.note_quota(id, &provider.name, r.headers());
@@ -216,6 +246,12 @@ pub(super) async fn try_upstreams<'a>(
                 continue;
             }
             Ok(r) => {
+                // Bedrock 拒绝凭证时的原话会点名账号和 IAM 身份：换成我们自己的话再交出去
+                let r = if provider.is_bedrock() && matches!(r.status().as_u16(), 401 | 403) {
+                    bedrock_refusal(provider, r).await
+                } else {
+                    r
+                };
                 note_health(
                     &state.bus,
                     &state.health,
@@ -243,9 +279,19 @@ pub(super) async fn try_upstreams<'a>(
                     &provider.name,
                     state.health.record_failure(&provider.name),
                 );
-                // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
-                state.check_proxy(&provider.proxy);
-                let err = forward::map_reqwest_error(e);
+                let err = match e {
+                    SendError::Http(e) => {
+                        // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
+                        state.check_proxy(&provider.proxy);
+                        forward::map_reqwest_error(e)
+                    }
+                    SendError::Sign(e) => GatewayError::config(msg!(
+                        "gw.upstream.sign_failed",
+                        upstream = provider.name.clone(), detail = e.0 =>
+                        "The request to upstream `{upstream}` could not be signed with its AWS \
+                         access keys: {detail}"
+                    )),
+                };
                 chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
                 last_err = Some(err);
                 continue;
@@ -478,9 +524,28 @@ fn prepare(
             });
             path = p.path.clone();
             query = p.query.clone();
+            // Bedrock 上的 Claude：客户端 `anthropic-beta` 里 Bedrock 认的那几个放进请求体
+            let claude_on_bedrock = dialect == tw_dialect::ir::Dialect::Bedrock
+                && d.client == tw_dialect::ir::Dialect::Anthropic
+                && d.request
+                    .model
+                    .to_ascii_lowercase()
+                    .contains("anthropic.claude");
+            let betas = if claude_on_bedrock {
+                tw_bedrock::beta::supported(
+                    req.headers
+                        .get_all("anthropic-beta")
+                        .iter()
+                        .filter_map(|v| v.to_str().ok()),
+                )
+            } else {
+                Vec::new()
+            };
             // **客户端要不要流由会话记着**，发给 Codex 后端的这一份一律是流式
             let body = if chatgpt {
                 Bytes::from(crate::chatgpt::force_stream(p.body.clone()))
+            } else if let Some(b) = tw_bedrock::beta::with_betas(&p.body, &betas) {
+                Bytes::from(b)
             } else if harness && to_deepseek {
                 // 转换成另一种格式发给 DeepSeek 官方：直连时它收得到的扩展照样带上
                 Bytes::from(
@@ -517,7 +582,31 @@ fn prepare(
     })
 }
 
+/// 这一跳发往的完整地址。
+///
+/// Bedrock 的模型 id 写在路径里，按 AWS 的规矩转义（ARN 里的 `/`），见
+/// [`tw_bedrock::endpoint::runtime_url`]。
+fn hop_url(provider: &tw_config::Provider, out: &Outbound) -> String {
+    if provider.is_bedrock() {
+        tw_bedrock::endpoint::runtime_url(&provider.base_url, &out.path)
+    } else {
+        forward::upstream_url(&provider.base_url, &out.path, out.query.as_deref())
+    }
+}
+
+/// 一跳没发出去的原因。
+enum SendError {
+    Http(reqwest::Error),
+    /// Bedrock 的请求没签成名
+    Sign(tw_bedrock::SignError),
+}
+
 /// 发出这一跳。OAuth 上游回 401 时换一个 token 再发一次。
+///
+/// `aws` 是 Bedrock 的访问密钥：有的话，请求在**全部定稿之后**（地址、请求头、请求体）
+/// 最后一步签名，签的就是 reqwest 实际要发的那个地址。上游自己的请求头里带着 Bedrock
+/// API Key 时不签。
+#[allow(clippy::too_many_arguments)]
 async fn send(
     state: &AppState,
     req: &Inbound,
@@ -526,8 +615,9 @@ async fn send(
     out: &Outbound,
     body: Bytes,
     upstream_headers: Vec<(String, String)>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let url = forward::upstream_url(&provider.base_url, &out.path, out.query.as_deref());
+    aws: Option<&tw_bedrock::Credentials>,
+) -> Result<reqwest::Response, SendError> {
+    let url = hop_url(provider, out);
     let method = reqwest::Method::from_bytes(b"POST").expect("POST is a valid method");
     let (target, chatgpt, hop, headers) = (out.target, out.chatgpt, out.hop, &req.headers);
     let required = target
@@ -598,6 +688,17 @@ async fn send(
         req
     };
     let sent_at = std::time::Instant::now();
+    let signer = aws
+        .filter(|_| !tw_bedrock::carries_api_key(upstream_headers.iter().map(|(k, _)| k.as_str())))
+        .map(|c| (c, provider.bedrock_region().unwrap_or_default()));
+    if let Some((credentials, region)) = signer {
+        let mut request = build(&upstream_headers)
+            .body(body.clone())
+            .build()
+            .map_err(SendError::Http)?;
+        crate::bedrock::sign_request(&mut request, credentials, region).map_err(SendError::Sign)?;
+        return http.execute(request).await.map_err(SendError::Http);
+    }
     let mut sent = build(&upstream_headers).body(body.clone()).send().await;
     // **OAuth 上游回 401：换一个 access token 再发一次，只一次。**token 可能在别处被
     // 吊销了、提前失效了；不重试的话，这个请求连同之后每一个请求都会原样失败，直到
@@ -614,5 +715,51 @@ async fn send(
             }
         }
     }
-    sent
+    sent.map_err(SendError::Http)
+}
+
+/// Bedrock 拒绝了凭证（401/403）：状态码和响应头照原样，正文换成我们自己的一句话。
+///
+/// **AWS 的原话会点名账号 ID 和 IAM 身份**（`User: arn:aws:iam::…` is not authorized…），
+/// 那不能交给客户端，也不能进请求记录。能说的是异常名：凭证被拒、过期、没有权限，是
+/// 哪一种由它分开。
+async fn bedrock_refusal(
+    provider: &tw_config::Provider,
+    r: reqwest::Response,
+) -> reqwest::Response {
+    let status = r.status();
+    let mut headers = r.headers().clone();
+    let named = headers
+        .get(tw_bedrock::error::ERROR_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = r.bytes().await.unwrap_or_default();
+    let kind = tw_bedrock::error::kind_of(named.as_deref(), &body);
+    let text = match kind.as_deref() {
+        Some("ExpiredTokenException") => msg!(
+            "gw.upstream.aws_token_expired", upstream = provider.name.clone() =>
+            "[ThinkWatch] The temporary AWS credential of upstream `{upstream}` has expired. \
+             Replace its session token and the access keys that came with it."
+        ),
+        other => msg!(
+            "gw.upstream.bedrock_refused",
+            upstream = provider.name.clone(), status = status.as_u16(),
+            kind = other.unwrap_or("no exception name") =>
+            "[ThinkWatch] AWS refused the credential of upstream `{upstream}` (HTTP {status}, \
+             {kind}). Check that the credential is valid and may use this model. AWS's own \
+             message names the account, so it is not passed on."
+        ),
+    };
+    for h in ["content-length", "content-type", "transfer-encoding"] {
+        headers.remove(h);
+    }
+    let body = serde_json::json!({ "message": text.text }).to_string();
+    let mut resp = http::Response::new(body);
+    *resp.status_mut() = status;
+    *resp.headers_mut() = headers;
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    reqwest::Response::from(resp)
 }

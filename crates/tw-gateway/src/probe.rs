@@ -73,6 +73,104 @@ impl ProbeResult {
     }
 }
 
+/// Bedrock 的清单要列好几页（基础模型、预设和应用推理配置），给得比一次请求宽
+const BEDROCK_PROBE_TIMEOUT: Duration = Duration::from_secs(16);
+
+/// 验一家 Bedrock 上游能不能用，顺带列出它能路由到的模型。
+///
+/// Bedrock 的推理地址没有 `/v1/models`：清单在区域的控制面上，由
+/// [`tw_bedrock::catalog`] 列（基础模型、AWS 预设的推理配置，和账号自己建的应用
+/// 推理配置）。认证和转发时一样：请求头里有 Bedrock API Key 就原样带上，否则用
+/// `credentials` 签名。
+///
+/// **403 不一定是凭证不对。**AWS 认出了身份、只是没给列模型的权限时回的是
+/// `AccessDeniedException`：凭证能用，请求照样能发，只是这里列不出清单 —— 那要说成
+/// 「列不了」，不能说成「密钥被拒」。AWS 的原话会点名账号和 IAM 身份，不往外说。
+pub async fn probe_bedrock(
+    http: &reqwest::Client,
+    provider: &tw_config::Provider,
+    headers: &[(String, String)],
+    credentials: Option<&tw_bedrock::Credentials>,
+) -> ProbeResult {
+    use tw_bedrock::catalog::{Auth, Failure, Profiles, list_models};
+
+    let proto_name = Some(format!("{:?}", tw_config::Protocol::Bedrock));
+    let started = Instant::now();
+    let auth = Auth {
+        headers,
+        credentials,
+        region: provider.bedrock_region().unwrap_or_default(),
+    };
+    let control = provider.bedrock_control_base();
+    let listing = tokio::time::timeout(
+        BEDROCK_PROBE_TIMEOUT,
+        list_models(http, &control, &auth, Profiles::WithApplication),
+    )
+    .await;
+    let ms = started.elapsed().as_millis() as u64;
+    let ok = |models: ModelList, note: Option<Msg>| ProbeResult {
+        ok: true,
+        protocol: proto_name.clone(),
+        latency_ms: ms,
+        models,
+        error: note,
+    };
+    match listing {
+        Err(_) => ProbeResult::fail(
+            ms,
+            proto_name.clone(),
+            msg!(
+                "gw.probe.timeout", secs = BEDROCK_PROBE_TIMEOUT.as_secs() =>
+                "No answer within {secs} seconds. Check the endpoint address, or whether this \
+                 upstream has to be reached through a proxy."
+            ),
+        ),
+        Ok(Ok(models)) if models.is_empty() => ok(ModelList::Empty, None),
+        Ok(Ok(models)) => ok(ModelList::Listed { models }, None),
+        Ok(Err(Failure::Status { status, kind, .. })) if status == 401 || status == 403 => {
+            match kind.as_deref() {
+                Some("AccessDeniedException") => ok(
+                    ModelList::NotImplemented { status },
+                    Some(msg!(
+                        "gw.probe.bedrock_list_denied" =>
+                        "The credential works, and it has no permission to list models \
+                         (bedrock:ListFoundationModels and bedrock:ListInferenceProfiles). \
+                         Requests are still forwarded; to route by model, list the models by hand."
+                    )),
+                ),
+                Some("ExpiredTokenException") => ProbeResult::fail(
+                    ms,
+                    proto_name.clone(),
+                    msg!(
+                        "gw.probe.aws_token_expired" =>
+                        "The temporary AWS credential has expired. Replace the session token and \
+                         the access keys that came with it."
+                    ),
+                ),
+                _ => ProbeResult::fail(
+                    ms,
+                    proto_name.clone(),
+                    msg!(
+                        "gw.probe.key_rejected", status = status =>
+                        "The upstream rejected this key (HTTP {status}). Check the key for stray \
+                         whitespace, and that it belongs to this upstream."
+                    ),
+                ),
+            }
+        }
+        // 认证这一关过了，列表本身没列出来
+        Ok(Err(Failure::Status { status, .. })) => ok(ModelList::NotImplemented { status }, None),
+        Ok(Err(Failure::Request(detail))) => ProbeResult::fail(
+            ms,
+            proto_name.clone(),
+            msg!(
+                "gw.probe.request_failed", detail = detail =>
+                "The request failed: {detail}"
+            ),
+        ),
+    }
+}
+
 /// 验一个上游能不能用。
 ///
 /// 判据是**「这把 key 能过认证吗」**，不是「有没有模型列表」。这两件事
