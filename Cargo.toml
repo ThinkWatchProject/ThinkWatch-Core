@@ -1,14 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    # ── 第一层 · 共用（企业版依赖的只有这三个）──────────
+    # ── 第一层 · 共用（企业版依赖的只有这四个）──────────
     # 只准依赖彼此和第三方 crate，不准依赖第二层 —— tw-dialect 里的
     # layer_one_depends_only_on_itself 测试守着这条。改这一层要 grep 企业版；
     # CI 的 enterprise 任务会拿企业版对着这次改动编译一遍。
-    # **只有一方在用的「共用件」搬回那一方**，不留在这里。
+    # **只有一方在用的「共用件」搬回那一方**，不留在这里；两边都用上了就搬回来
+    # （tw-bedrock 就是这么回来的）。
     "crates/tw-dialect",
     "crates/tw-guard",
     "crates/tw-breaker",
+    "crates/tw-bedrock",
     # ── 第二层 · 桌面网关（企业版不依赖）────────────────
     "crates/tw-types",
     "crates/tw-secret",
@@ -67,6 +69,7 @@ tw-watch    = { path = "crates/tw-watch" }
 tw-guard    = { path = "crates/tw-guard" }
 tw-breaker  = { path = "crates/tw-breaker" }
 tw-dialect  = { path = "crates/tw-dialect" }
+tw-bedrock  = { path = "crates/tw-bedrock" }
 tw-link     = { path = "crates/tw-link" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
@@ -119,6 +122,15 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 futures = "0.3"
 tokio-stream = "0.1"
 async-stream = "0.3"
+
+# ── Bedrock（tw-bedrock）：SigV4 签名、eventstream 拆帧 ─────────
+# aws-sigv4 1.5 起签名不再带 http 0.2，所以不再关在 feature 后面。
+# 最低要 rustc 1.94.1，比上面写的 rust-version 高 —— 两边的 CI 都用 stable
+aws-sigv4 = "1"
+aws-credential-types = "1"
+aws-smithy-eventstream = "0.60"
+aws-smithy-types = "1"
+percent-encoding = "2"
 
 thiserror = "2"
 anyhow = "1"

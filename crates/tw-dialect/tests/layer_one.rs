@@ -8,7 +8,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const LAYER_ONE: &[&str] = &["tw-dialect", "tw-guard", "tw-breaker"];
+const LAYER_ONE: &[&str] = &["tw-dialect", "tw-guard", "tw-breaker", "tw-bedrock"];
 
 #[test]
 fn layer_one_depends_only_on_itself() {

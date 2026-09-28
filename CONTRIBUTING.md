@@ -32,10 +32,10 @@ Two products are built on these crates.
 the desktop app, bundles `twcore` as its gateway and can also connect to
 one running on a server.
 [ThinkWatch Enterprise](https://github.com/ThinkWatchProject/ThinkWatch)
-depends on exactly three of the crates, `tw-dialect`, `tw-guard` and
-`tw-breaker`, and CI checks that it still compiles against every change
-to them. A change here reaches every installation of the app and every
-server running `twcore`, and a change to those three crates reaches
+depends on exactly four of the crates, `tw-dialect`, `tw-guard`,
+`tw-breaker` and `tw-bedrock`, and CI checks that it still compiles against
+every change to them. A change here reaches every installation of the app and
+every server running `twcore`, and a change to those four crates reaches
 ThinkWatch Enterprise as well, so "it works for my case" is not the bar.
 
 What is *not* here: adopting AI clients, editing their MCP servers and
