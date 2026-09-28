@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod aws_profile;
 pub mod chatgpt;
 pub mod control_key;
 pub mod credential;
@@ -670,21 +671,28 @@ pub struct OAuth {
     pub refresh_before: Option<String>,
 }
 
-/// Bedrock 的 AWS 访问密钥。
+/// Bedrock 的 AWS 访问密钥：写在这里，或者从 AWS 的凭证文件里按 profile 读。
 ///
 /// 每个请求用它们签一次名（SigV4）：签的是方法、地址、时间和请求体，所以签名在
 /// 转发时、请求体定稿之后才做，配置里只放密钥本身。每一项都可以写 `${ENV}`。
 ///
 /// **只读密钥，不执行命令**：`aws sso login`、`credential_process` 这类要跑程序才拿得到
 /// 的凭证这里接不了，见 [`credential`]。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Aws {
-    pub access_key_id: Secret,
-    pub secret_access_key: Secret,
+    /// 访问密钥 ID。和 `profile` 二选一
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<Secret>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<Secret>,
     /// 临时凭证（STS 发的）才有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_token: Option<Secret>,
+    /// 从 AWS 的凭证文件（`~/.aws/credentials`、`~/.aws/config`）读这个 profile 的密钥。
+    /// **文件变了下一个请求就用新的**，见 [`aws_profile`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// 签名用的区域。地址是标准的 `https://bedrock-runtime.<区域>.amazonaws.com` 时从
     /// 地址读，不用写；地址是 VPC 端点或代理时必须写
     #[serde(default, skip_serializing_if = "Option::is_none")]

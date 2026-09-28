@@ -455,8 +455,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("providers[].aws"),
                     Def::Unset,
                     t(
-                        "AWS access keys of a Bedrock upstream: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key.",
-                        "Bedrock 上游的 AWS 访问密钥：每个请求用它们签名（SigV4）。与 `key`（Bedrock API Key）二选一。",
+                        "AWS access keys of a Bedrock upstream, written there or read from an AWS profile: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key.",
+                        "Bedrock 上游的 AWS 访问密钥，写在这里或者从 AWS 的 profile 读：每个请求用它们签名（SigV4）。与 `key`（Bedrock API Key）二选一。",
                     ),
                 ),
                 row(
@@ -544,21 +544,22 @@ pub fn sections() -> Vec<Section> {
         },
         Section {
             path: "providers[].aws",
-            ty: checked!(
-                Aws,
-                "{access_key_id: AKIAIOSFODNN7EXAMPLE, secret_access_key: s}"
-            ),
+            // 字段都可选：写访问密钥还是写 profile，由写法检查管二选一
+            ty: checked!(Aws, "{}"),
             rows: vec![
                 row(
                     "access_key_id",
                     Kind::Secret,
-                    Def::Required,
-                    t("Access key ID.", "访问密钥 ID。"),
+                    Def::Unset,
+                    t(
+                        "Access key ID. Written together with `secret_access_key`; `profile` instead.",
+                        "访问密钥 ID。与 `secret_access_key` 一起写；也可以改写 `profile`。",
+                    ),
                 ),
                 row(
                     "secret_access_key",
                     Kind::Secret,
-                    Def::Required,
+                    Def::Unset,
                     t("Secret access key.", "私有访问密钥。"),
                 ),
                 row(
@@ -568,6 +569,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Session token of temporary credentials, such as those STS issues. When it expires, requests are refused until it is replaced.",
                         "临时凭证（如 STS 签发的）的会话令牌。过期之后请求会被拒绝，直到换上新的。",
+                    ),
+                ),
+                row(
+                    "profile",
+                    Kind::Str,
+                    Def::Unset,
+                    t(
+                        "Profile in the AWS credential files to read the access keys from, instead of writing them here: `~/.aws/credentials` and `~/.aws/config`, or the files `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` name, on the machine core runs on. The files are read again when they change.",
+                        "从 AWS 凭证文件读访问密钥时用的 profile，代替把密钥写在这里：`~/.aws/credentials` 和 `~/.aws/config`，或 `AWS_SHARED_CREDENTIALS_FILE`、`AWS_CONFIG_FILE` 指定的文件，读的是 core 所在机器上的。文件变了会重新读。",
                     ),
                 ),
                 row(

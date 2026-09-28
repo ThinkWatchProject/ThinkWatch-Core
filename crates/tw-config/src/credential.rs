@@ -333,6 +333,13 @@ pub enum CredentialError {
     #[error("{}", self.msg())]
     AwsEmpty,
     #[error("{}", self.msg())]
+    AwsProfileAndKeys,
+    #[error("{}", self.msg())]
+    AwsEmptyProfile,
+    /// profile 读不出密钥。只在转发、检查连接时出现：文件是那台机器上的，随时会变
+    #[error("{}", self.msg())]
+    AwsProfile(crate::aws_profile::ProfileError),
+    #[error("{}", self.msg())]
     AwsSignedHeader(String),
     #[error("{}", self.msg())]
     AwsNoRegion,
@@ -448,6 +455,16 @@ impl CredentialError {
                 "the access key ID, the secret access key and a session token, when given, cannot \
                  be empty"
             ),
+            AwsProfileAndKeys => msg!(
+                "config.credential.aws_profile_and_keys" =>
+                "aws.profile and the access keys are alternatives: keys read from an AWS profile, \
+                 or keys written here"
+            ),
+            AwsEmptyProfile => msg!(
+                "config.credential.aws_empty_profile" =>
+                "aws.profile names no profile; write a profile name such as default"
+            ),
+            AwsProfile(e) => e.msg(),
             AwsSignedHeader(h) => msg!(
                 "config.credential.aws_signed_header", header = h =>
                 "requests to this upstream are signed with its AWS access keys, and signing sets \
@@ -631,11 +648,22 @@ impl Provider {
             if self.key.is_some() {
                 return Err(CredentialError::KeyAndAws);
             }
-            if aws.access_key_id.is_blank()
-                || aws.secret_access_key.is_blank()
-                || aws.session_token.as_ref().is_some_and(Secret::is_blank)
-            {
-                return Err(CredentialError::AwsEmpty);
+            let keys = aws.access_key_id.is_some()
+                || aws.secret_access_key.is_some()
+                || aws.session_token.is_some();
+            match &aws.profile {
+                Some(_) if keys => return Err(CredentialError::AwsProfileAndKeys),
+                Some(p) if p.trim().is_empty() => return Err(CredentialError::AwsEmptyProfile),
+                Some(_) => {}
+                None => {
+                    let blank = |s: &Option<Secret>| s.as_ref().is_none_or(Secret::is_blank);
+                    if blank(&aws.access_key_id)
+                        || blank(&aws.secret_access_key)
+                        || aws.session_token.as_ref().is_some_and(Secret::is_blank)
+                    {
+                        return Err(CredentialError::AwsEmpty);
+                    }
+                }
             }
             match (host_region, aws.region.as_deref().map(str::trim)) {
                 (_, Some(given)) if tw_bedrock::endpoint::validate_region(given).is_err() => {
@@ -663,14 +691,24 @@ impl Provider {
         Ok(())
     }
 
-    /// 签名用的 AWS 凭证，`${ENV}` 已经展开。不用访问密钥的上游是 `None`。
+    /// 签名用的 AWS 凭证，`${ENV}` 已经展开，profile 按文件现在的样子读。不用访问密钥
+    /// 的上游是 `None`。
     pub fn aws_credentials(&self) -> Result<Option<tw_bedrock::Credentials>, CredentialError> {
         let Some(aws) = &self.aws else {
             return Ok(None);
         };
+        if let Some(profile) = &aws.profile {
+            return crate::aws_profile::credentials(profile.trim())
+                .map(Some)
+                .map_err(CredentialError::AwsProfile);
+        }
+        // 写法检查保证了两样都在；走到这里还缺，是没经过检查的配置
+        let (Some(id), Some(secret)) = (&aws.access_key_id, &aws.secret_access_key) else {
+            return Err(CredentialError::AwsEmpty);
+        };
         Ok(Some(tw_bedrock::Credentials {
-            access_key_id: aws.access_key_id.resolve()?,
-            secret_access_key: aws.secret_access_key.resolve()?,
+            access_key_id: id.resolve()?,
+            secret_access_key: secret.resolve()?,
             session_token: aws
                 .session_token
                 .as_ref()
@@ -727,14 +765,15 @@ impl Provider {
             s.push_str(h.value.raw());
         }
         if let Some(a) = &self.aws {
+            fn raw(v: &Option<Secret>) -> &str {
+                v.as_ref().map(Secret::raw).unwrap_or_default()
+            }
             s.push_str(&format!(
-                "|aws|{}|{}|{}|{}",
-                a.access_key_id.raw(),
-                a.secret_access_key.raw(),
-                a.session_token
-                    .as_ref()
-                    .map(Secret::raw)
-                    .unwrap_or_default(),
+                "|aws|{}|{}|{}|{}|{}",
+                raw(&a.access_key_id),
+                raw(&a.secret_access_key),
+                raw(&a.session_token),
+                a.profile.as_deref().unwrap_or_default(),
                 a.region.as_deref().unwrap_or_default()
             ));
         }
@@ -1082,6 +1121,30 @@ mod tests {
         assert_eq!(
             bedrock("aws:\n  access_key_id: ''\n  secret_access_key: s\n").check_credential(),
             Err(AwsEmpty)
+        );
+        // 只写了一半的密钥
+        assert_eq!(
+            bedrock("aws:\n  access_key_id: AKIA\n").check_credential(),
+            Err(AwsEmpty)
+        );
+        assert_eq!(bedrock("aws: {}\n").check_credential(), Err(AwsEmpty));
+    }
+
+    #[test]
+    fn a_profile_stands_in_for_the_keys_and_not_beside_them() {
+        use CredentialError::*;
+        assert_eq!(bedrock("aws:\n  profile: dev\n").check_credential(), Ok(()));
+        assert_eq!(
+            bedrock(&format!("{KEYS}  profile: dev\n")).check_credential(),
+            Err(AwsProfileAndKeys)
+        );
+        assert_eq!(
+            bedrock("aws:\n  profile: dev\n  session_token: t\n").check_credential(),
+            Err(AwsProfileAndKeys)
+        );
+        assert_eq!(
+            bedrock("aws:\n  profile: ' '\n").check_credential(),
+            Err(AwsEmptyProfile)
         );
     }
 

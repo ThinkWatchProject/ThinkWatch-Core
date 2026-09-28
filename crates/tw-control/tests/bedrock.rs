@@ -143,6 +143,38 @@ async fn access_keys_are_saved_and_shown_as_written() {
     assert!(p.get("key").is_none(), "{p}");
 }
 
+/// profile 只存名字：密钥留在 AWS 的凭证文件里，**配置里一个字都不抄**
+#[tokio::test]
+async fn a_profile_is_saved_by_name_alone() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/providers",
+        json!({"provider": {
+            "name": "bedrock",
+            "base_url": "https://bedrock-runtime.us-west-2.amazonaws.com",
+            "aws": {"profile": " dev ", "access_key_id": "", "secret_access_key": ""},
+        }}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let file = b.file();
+    assert!(file.contains("profile: dev"), "{file}");
+    assert!(!file.contains("access_key_id"), "{file}");
+
+    let (_, v) = call(&b.app, "GET", "/overview", Value::Null).await;
+    let p = v["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "bedrock")
+        .unwrap()
+        .clone();
+    assert_eq!(p["aws"], json!({"profile": "dev"}), "{p}");
+    assert_eq!(p["region"], "us-west-2");
+}
+
 #[tokio::test]
 async fn a_bedrock_upstream_is_refused_without_exactly_one_credential() {
     let b = bed(BASE);
@@ -164,6 +196,15 @@ async fn a_bedrock_upstream_is_refused_without_exactly_one_credential() {
         (
             json!({"name": "b", "base_url": url, "aws": {"access_key_id": "AKIA", "secret_access_key": "s", "region": "eu-west-1"}}),
             "config.credential.aws_region_mismatch",
+        ),
+        (
+            json!({"name": "b", "base_url": url, "aws": {"access_key_id": "AKIA", "secret_access_key": "s", "profile": "dev"}}),
+            "config.credential.aws_profile_and_keys",
+        ),
+        (
+            // 界面的空框什么都不算：既没有密钥，也没有 profile
+            json!({"name": "b", "base_url": url, "aws": {"access_key_id": " ", "profile": ""}}),
+            "config.credential.aws_empty",
         ),
     ] {
         let (st, v) = call(&b.app, "POST", "/providers", json!({"provider": provider})).await;

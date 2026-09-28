@@ -313,7 +313,7 @@ Upstreams: the APIs requests are forwarded to.
 | `key` | string, `${VAR}` allowed | — | API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI, and a Bedrock API key), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth` or `aws`. |
 | `headers` | map of header name → value | `{}` | Additional request headers, in the order written; values may use `${VAR}`, and `{{access_token}}` where `oauth` is set. At most 32. Headers HTTP or the gateway manages (`host`, `content-length`, `connection`, …) cannot be set. |
 | `oauth` | object, [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth credential: an access token obtained from a refresh token. Instead of `key`. |
-| `aws` | object, [`providers[].aws`](#cfg-providers-aws) | — | AWS access keys of a Bedrock upstream: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key. |
+| `aws` | object, [`providers[].aws`](#cfg-providers-aws) | — | AWS access keys of a Bedrock upstream, written there or read from an AWS profile: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key. |
 | `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` \| `bedrock` | — | API format of the upstream. Unset: recognized from `base_url` for the official endpoints (a Bedrock runtime endpoint is `bedrock`), otherwise treated as `anthropic`. |
 | `forward_client_identity` | bool | `false` | Also send the client's own identity: its `User-Agent`, identity headers such as `x-app` and `originator`, and identity fields in the request body such as `metadata.user_id`. Values are the client's, never made up. Off: requests carry ThinkWatch's `User-Agent` and no client identity. For upstreams that admit only certain clients (Kimi For Coding, Bailian Coding Plan, relays restricted to official clients). Not available for `chatgpt`. |
 | `proxy` | string | `direct` | `direct`; `system`, the proxy in the core process's `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` environment variables; or the name of an entry in `proxies`. |
@@ -401,19 +401,24 @@ the token goes:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `access_key_id` | string, `${VAR}` allowed | **required** | Access key ID. |
-| `secret_access_key` | string, `${VAR}` allowed | **required** | Secret access key. |
+| `access_key_id` | string, `${VAR}` allowed | — | Access key ID. Written together with `secret_access_key`; `profile` instead. |
+| `secret_access_key` | string, `${VAR}` allowed | — | Secret access key. |
 | `session_token` | string, `${VAR}` allowed | — | Session token of temporary credentials, such as those STS issues. When it expires, requests are refused until it is replaced. |
+| `profile` | string | — | Profile in the AWS credential files to read the access keys from, instead of writing them here: `~/.aws/credentials` and `~/.aws/config`, or the files `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` name, on the machine core runs on. The files are read again when they change. |
 | `region` | string | — | Region to sign for. Unset: the one in `base_url`, which must then be a standard runtime endpoint. Required when `base_url` is a VPC endpoint or a proxy. |
 <!-- /generated -->
 
 A Bedrock upstream authenticates in one of two ways. A Bedrock API key goes in
-`key` and is sent as `Authorization: Bearer`. AWS access keys go in `aws`:
-every request is signed with them (SigV4) once its body is final, and the keys
-themselves are never sent. Both can be read from the environment with
-`${VAR}`. Nothing runs a command to obtain a credential, so a profile that needs
-`aws sso login` or a `credential_process` cannot be used; export the keys it
-produces instead.
+`key` and is sent as `Authorization: Bearer`. AWS access keys go in `aws`,
+written there or read with `aws.profile` from a profile in the AWS credential
+files: every request is signed with them (SigV4) once its body is final, and the
+keys themselves are never sent. Keys written in the configuration can be read
+from the environment with `${VAR}`. A profile is read from the files on the
+machine core runs on, and read again when they change, so a tool that refreshes
+temporary keys in `~/.aws/credentials` needs no restart. Nothing runs a command
+to obtain a credential, so a profile that signs in through IAM Identity Center
+(`aws sso login`), runs a `credential_process` or assumes a role cannot be used;
+export the keys it produces instead.
 
 ```yaml
 providers:
@@ -427,6 +432,11 @@ providers:
       access_key_id: ${AWS_ACCESS_KEY_ID}
       secret_access_key: ${AWS_SECRET_ACCESS_KEY}
       session_token: ${AWS_SESSION_TOKEN}
+
+  - name: bedrock-profile
+    base_url: https://bedrock-runtime.us-west-2.amazonaws.com
+    aws:
+      profile: dev
 ```
 
 Requests are converted to Converse. The model list comes from the region's

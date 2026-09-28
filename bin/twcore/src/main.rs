@@ -617,10 +617,14 @@ fn cmd_check(path: &Path) -> Result<()> {
                         format!("API key {} ({})", k.describe(), p.auth_header().0)
                     }
                     (None, Some(_), _) => "OAuth".to_string(),
-                    // 签名用的密钥：说来源（环境变量还是写死的），不说值
+                    // 签名用的密钥：说来源（环境变量、写死的还是 profile），不说值
                     (None, None, Some(a)) => format!(
-                        "AWS access key {}, signed for {}",
-                        a.access_key_id.describe(),
+                        "{}, signed for {}",
+                        match (&a.profile, &a.access_key_id) {
+                            (Some(profile), _) => format!("AWS profile `{profile}`"),
+                            (None, Some(id)) => format!("AWS access key {}", id.describe()),
+                            (None, None) => "no AWS access key".to_string(),
+                        },
                         p.bedrock_region().unwrap_or("an unknown region")
                     ),
                     (None, None, None) if !p.headers.is_empty() => "headers".to_string(),

@@ -440,11 +440,15 @@ fn provider_view(
                 account: chatgpt::account_view(s, p, o),
             }
         }),
-        aws: p.aws.as_ref().map(|a| tw_api::AwsKeys {
-            access_key_id: a.access_key_id.raw().to_string(),
-            secret_access_key: a.secret_access_key.raw().to_string(),
-            session_token: a.session_token.as_ref().map(|t| t.raw().to_string()),
-            region: a.region.clone(),
+        aws: p.aws.as_ref().map(|a| {
+            let raw = |s: &Option<tw_config::Secret>| s.as_ref().map(|s| s.raw().to_string());
+            tw_api::AwsKeys {
+                access_key_id: raw(&a.access_key_id),
+                secret_access_key: raw(&a.secret_access_key),
+                session_token: raw(&a.session_token),
+                profile: a.profile.clone(),
+                region: a.region.clone(),
+            }
         }),
         region: p
             .is_bedrock()
