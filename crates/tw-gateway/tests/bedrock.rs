@@ -150,10 +150,10 @@ fn with_keys(up: SocketAddr) -> Provider {
         base_url: format!("http://{up}"),
         protocol: Some(Protocol::Bedrock),
         aws: Some(Aws {
-            access_key_id: Secret::new(AK),
-            secret_access_key: Secret::new(SK),
-            session_token: None,
+            access_key_id: Some(Secret::new(AK)),
+            secret_access_key: Some(Secret::new(SK)),
             region: Some(REGION.into()),
+            ..Default::default()
         }),
         ..Default::default()
     }
