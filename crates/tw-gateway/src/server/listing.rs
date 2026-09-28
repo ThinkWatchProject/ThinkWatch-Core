@@ -4,7 +4,6 @@ use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
-use super::now_ms;
 use crate::error::GatewayError;
 use crate::state::AppState;
 use tw_types::msg;
@@ -83,7 +82,6 @@ pub(super) async fn list_models(
         .load()
         .resolve_allowed(Some(&shape.protocols()), allow.as_deref());
 
-    let now = now_ms() / 1000;
     let body = match shape {
         ListingShape::Gemini => serde_json::json!({
             "models": models.iter().map(|m| serde_json::json!({
@@ -92,7 +90,7 @@ pub(super) async fn list_models(
         }),
         ListingShape::Anthropic => serde_json::json!({
             "object": "list",
-            "data": models.iter().map(|m| anthropic_model(m, now)).collect::<Vec<_>>(),
+            "data": models.iter().map(|m| anthropic_model(m)).collect::<Vec<_>>(),
             "has_more": false,
             "first_id": models.first(),
             "last_id": models.last(),
@@ -100,12 +98,19 @@ pub(super) async fn list_models(
         ListingShape::Openai => serde_json::json!({
             "object": "list",
             "data": models.iter().map(|m| serde_json::json!({
-                "id": m, "object": "model", "created": now,
+                "id": m, "object": "model", "created": RELEASED_AT,
             })).collect::<Vec<_>>()
         }),
     };
     Ok(axum::Json(body).into_response())
 }
+
+/// 模型的发布时间（Unix 秒）：网关不知道，填纪元零点。
+///
+/// Anthropic 的 `created_at` 和 OpenAI 的 `created` 说的都是模型本身什么时候发布，
+/// Anthropic 的文档写明不知道时就填纪元时间。**不能填请求的时刻** —— 那样同一个
+/// 模型每秒换一个发布时间，列表和单点查询跨过整秒就对不上。
+const RELEASED_AT: i64 = 0;
 
 /// Anthropic 格式的一个模型对象。
 ///
@@ -116,8 +121,8 @@ pub(super) async fn list_models(
 /// Claude 的模型再带上 `anthropic_family_tier`：Claude Desktop 按它把模型归到
 /// opus / sonnet / haiku，配置里写的 `sonnet` 这样的简称靠它解析。**只看模型名**，
 /// 名字里看不出是 Claude 的一律不标 —— 把别家的模型标成 Claude 是在替客户端撒谎。
-fn anthropic_model(id: &str, now: u64) -> serde_json::Value {
-    let created_at = chrono::DateTime::from_timestamp(now as i64, 0)
+fn anthropic_model(id: &str) -> serde_json::Value {
+    let created_at = chrono::DateTime::from_timestamp(RELEASED_AT, 0)
         .unwrap_or_default()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut m = serde_json::json!({
@@ -126,7 +131,7 @@ fn anthropic_model(id: &str, now: u64) -> serde_json::Value {
         "display_name": display_name(id).unwrap_or_else(|| id.to_string()),
         "created_at": created_at,
         "object": "model",
-        "created": now,
+        "created": RELEASED_AT,
     });
     if let Some(tier) = family_tier(id) {
         m["anthropic_family_tier"] = tier.into();
@@ -229,14 +234,13 @@ pub(super) async fn get_model(
             ),
         ));
     }
-    let now = now_ms() / 1000;
     let body = match shape {
         ListingShape::Gemini => {
             serde_json::json!({ "name": format!("models/{model}") })
         }
-        ListingShape::Anthropic => anthropic_model(&model, now),
+        ListingShape::Anthropic => anthropic_model(&model),
         ListingShape::Openai => {
-            serde_json::json!({ "id": model, "object": "model", "created": now })
+            serde_json::json!({ "id": model, "object": "model", "created": RELEASED_AT })
         }
     };
     Ok(axum::Json(body).into_response())
