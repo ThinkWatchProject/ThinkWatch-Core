@@ -423,13 +423,25 @@ async fn an_unrelated_edit_does_not_blank_the_model_list() {
 async fn a_request_in_flight_finishes_on_the_config_it_started_with() {
     // **正在跑的请求持有旧的 Arc，跑完自然释放。**中途换配置不该让它
     // 半途改道 —— 那会让一个请求跨在两份配置上。
+    //
+    // **等请求真的到了慢上游再换配置。**以前是发出去 80 毫秒后就换：CI 的机器
+    // 一慢，请求还没走到路由那一步配置就换了，它照新配置去了快上游 —— 测的就不是
+    // 「跑到一半」了，而这条测试就在 Linux 上时红时绿
+    let (arrived, arrived_rx) = tokio::sync::oneshot::channel::<()>();
+    let arrived = Arc::new(std::sync::Mutex::new(Some(arrived)));
     let slow = {
-        let app = Router::new().fallback(any(|| async {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            axum::response::Response::builder()
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(r#"{"by":"slow"}"#))
-                .unwrap()
+        let app = Router::new().fallback(any(move || {
+            let arrived = arrived.clone();
+            async move {
+                if let Some(tx) = arrived.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                axum::response::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"by":"slow"}"#))
+                    .unwrap()
+            }
         }));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = l.local_addr().unwrap();
@@ -441,7 +453,10 @@ async fn a_request_in_flight_finishes_on_the_config_it_started_with() {
     let gw = serve(state.clone()).await;
 
     let inflight = tokio::spawn(async move { ask(gw).await });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::timeout(Duration::from_secs(10), arrived_rx)
+        .await
+        .expect("the request never reached the slow upstream")
+        .unwrap();
     state
         .reload(cfg(vec![provider("fast", fast)], vec![]))
         .unwrap();
