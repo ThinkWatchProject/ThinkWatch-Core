@@ -378,7 +378,15 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
             return Answer::Failed(crate::state::credential_failed(e, &p.name));
         }
     };
-    let r = crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await;
+    let r = if p.is_bedrock() {
+        let credentials = match p.aws_credentials() {
+            Ok(c) => c,
+            Err(e) => return Answer::Failed(crate::state::credential_failed(e.msg(), &p.name)),
+        };
+        crate::probe::probe_bedrock(http, p, &headers, credentials.as_ref()).await
+    } else {
+        crate::probe::probe(http, &p.base_url, &headers, p.effective_protocol()).await
+    };
     if !r.ok {
         return Answer::Failed(
             r.error
@@ -387,10 +395,13 @@ async fn ask(state: &AppState, rt: &Runtime, p: &tw_config::Provider) -> Answer 
     }
     match r.models {
         ModelList::Listed { models } => Answer::Listed(models),
-        ModelList::NotImplemented { status } => Answer::NoList(msg!(
-            "gw.models.no_endpoint", status = status =>
-            "The upstream has no model-list endpoint (HTTP {status})."
-        )),
+        // 探测说了为什么列不出（Bedrock 没有列模型的权限）就用它的话
+        ModelList::NotImplemented { status } => Answer::NoList(r.error.unwrap_or_else(|| {
+            msg!(
+                "gw.models.no_endpoint", status = status =>
+                "The upstream has no model-list endpoint (HTTP {status})."
+            )
+        })),
         ModelList::Unrecognized { .. } => Answer::NoList(msg!(
             "gw.models.unrecognized" =>
             "The model list the upstream returned is in an unrecognized format."

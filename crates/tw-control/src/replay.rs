@@ -79,6 +79,26 @@ fn stored_body(
     Ok((row, raw))
 }
 
+/// 这家能不能收一次重放。
+///
+/// 重放发的是录下来的那份请求体，原样，发到原来的路径上：它只对说客户端那种格式的
+/// 上游有意义。**Bedrock 只收 Converse，而没有客户端说 Converse**，发过去只会得到一个
+/// 让人摸不着头脑的错误 —— 不如先说清楚。
+fn replayable_to(provider: &tw_config::Provider) -> Result<(), Fail> {
+    if provider.is_bedrock() {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            msg!(
+                "control.replay_bedrock", upstream = provider.name.clone() =>
+                "A replay sends the recorded request exactly as it was, and `{upstream}` is a \
+                 Bedrock upstream, which takes only the Converse format no client sends. Replay \
+                 it to an upstream that speaks the client's format."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 报价。**不发任何请求。**
 pub async fn quote(
     State(s): State<ControlState>,
@@ -108,6 +128,7 @@ pub async fn quote(
                 ),
             )
         })?;
+    replayable_to(provider)?;
 
     // 输入 token 用记录里的真值 —— 那是上游报回来的，比任何估算都准。
     // 没有的话按字节粗估（和路由用的是同一个系数）
@@ -171,6 +192,7 @@ pub async fn run(
                 ),
             )
         })?;
+    replayable_to(provider)?;
     // **这一家自己的 client，和数据面转发用的是同一个**：它带着这家该走的
     // 代理（`direct` 就是不走任何代理，连系统代理也不读）。换 token 和发请求
     // 都用它 —— 用别的 client，重放就会走一条和原请求不同的出站路径：本机

@@ -440,6 +440,16 @@ fn provider_view(
                 account: chatgpt::account_view(s, p, o),
             }
         }),
+        aws: p.aws.as_ref().map(|a| tw_api::AwsKeys {
+            access_key_id: a.access_key_id.raw().to_string(),
+            secret_access_key: a.secret_access_key.raw().to_string(),
+            session_token: a.session_token.as_ref().map(|t| t.raw().to_string()),
+            region: a.region.clone(),
+        }),
+        region: p
+            .is_bedrock()
+            .then(|| p.bedrock_region().map(str::to_string))
+            .flatten(),
         protocol: p.effective_protocol().map(Into::into),
         protocol_explicit: p.protocol.is_some(),
         forward_client_identity: p.forward_client_identity,

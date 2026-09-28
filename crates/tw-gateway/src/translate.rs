@@ -23,6 +23,7 @@ pub fn dialect_of(p: Protocol) -> Dialect {
         Protocol::OpenaiChat => Dialect::Chat,
         Protocol::OpenaiResponses | Protocol::Chatgpt => Dialect::Responses,
         Protocol::Gemini => Dialect::Gemini,
+        Protocol::Bedrock => Dialect::Bedrock,
     }
 }
 

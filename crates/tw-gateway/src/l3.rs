@@ -71,7 +71,7 @@ pub fn probe_input_tokens() -> u64 {
 /// - 其余：一句话的长度就够
 ///
 /// Anthropic 那边不看模型会不会推理：**要推理得在请求里写**，而探测请求不写，
-/// 所以它不会花额度在推理上。
+/// 所以它不会花额度在推理上。Bedrock 上的 Claude 也一样。
 pub fn max_output_tokens(
     book: &tw_pricing::PriceBook,
     model: &str,
@@ -80,8 +80,12 @@ pub fn max_output_tokens(
     if protocol == Some(Protocol::Chatgpt) {
         return None;
     }
-    let reasons = dialect_for(protocol) != Dialect::Anthropic
-        && book.table().get(model).is_some_and(|p| p.reasoning);
+    let asks_to_think = match dialect_for(protocol) {
+        Dialect::Anthropic => true,
+        Dialect::Bedrock => model.to_ascii_lowercase().contains("anthropic.claude"),
+        _ => false,
+    };
+    let reasons = !asks_to_think && book.table().get(model).is_some_and(|p| p.reasoning);
     Some(if reasons {
         REASONING_MAX_TOKENS
     } else {
@@ -210,7 +214,12 @@ pub async fn run(
     let started = Instant::now();
     let dialect = dialect_for(provider.effective_protocol());
     let probe = probe_request(provider, model, max_output_tokens, headers);
-    let url = crate::forward::upstream_url(&provider.base_url, &probe.path, probe.query.as_deref());
+    let bedrock = provider.is_bedrock();
+    let url = if bedrock {
+        tw_bedrock::endpoint::runtime_url(&provider.base_url, &probe.path)
+    } else {
+        crate::forward::upstream_url(&provider.base_url, &probe.path, probe.query.as_deref())
+    };
     let mut req = http
         .post(&url)
         // 测速不该无限等。**但也不能太短** —— 一个排队中的上游正是我们
@@ -236,7 +245,37 @@ pub async fn run(
         error,
     };
 
-    let resp = match req.body(probe.body).send().await {
+    // Bedrock 的访问密钥：和转发时一样，全部定稿之后最后一步签名
+    let aws = match provider.aws_credentials() {
+        Ok(c) => {
+            c.filter(|_| !tw_bedrock::carries_api_key(headers.iter().map(|(k, _)| k.as_str())))
+        }
+        Err(e) => {
+            let why = crate::state::credential_failed(e.msg(), &provider.name);
+            return result(false, 0, Some(why));
+        }
+    };
+    let sent = match aws {
+        None => req.body(probe.body).send().await,
+        Some(credentials) => match req.body(probe.body).build() {
+            Ok(mut request) => {
+                let region = provider.bedrock_region().unwrap_or_default();
+                if let Err(e) = crate::bedrock::sign_request(&mut request, &credentials, region) {
+                    return result(
+                        false,
+                        0,
+                        Some(msg!(
+                            "l3.sign_failed", detail = e.0 =>
+                            "The request could not be signed with the AWS access keys: {detail}"
+                        )),
+                    );
+                }
+                http.execute(request).await
+            }
+            Err(e) => Err(e),
+        },
+    };
+    let resp = match sent {
         Ok(r) => r,
         Err(e) => {
             let detail = crate::forward::map_reqwest_error(e).detail;
@@ -262,12 +301,34 @@ pub async fn run(
     // `response.created` 这些是上游收到请求立刻就发的，拿它们当 TTFT 会让所有上游
     // 看起来一样快 —— 而那正好抹掉了这次测速的全部信息。
     let mut reader = tw_dialect::convert::Reader::new(dialect);
+    // Bedrock 的流是 AWS eventstream 的二进制帧：先拆成 SSE，读法和转发时一样
+    let mut unframe = (bedrock
+        && resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_some_and(|v| {
+                v.as_bytes()
+                    .starts_with(tw_bedrock::eventstream::CONTENT_TYPE.as_bytes())
+            }))
+    .then(tw_bedrock::eventstream::Transcoder::new);
     let mut stream = resp.bytes_stream();
     use futures::StreamExt;
     // **时刻在收到那一块时就记下来**，不能等流结束再算
     let mut events: Vec<(u64, ir::Event)> = Vec::new();
+    let mut stream_error = None;
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
+        let chunk = match unframe.as_mut() {
+            None => chunk.to_vec(),
+            Some(t) => match t.feed(&chunk) {
+                Ok(sse) => sse,
+                // 流里的异常（半路被限流之类）和坏帧：这次测速没有跑完
+                Err(e) => {
+                    stream_error = Some(e.to_string());
+                    break;
+                }
+            },
+        };
         events.extend(reader.feed(&chunk).into_iter().map(|e| (at(&started), e)));
     }
     events.extend(reader.finish().into_iter().map(|e| (at(&started), e)));
@@ -275,7 +336,6 @@ pub async fn run(
     let answered = !events.is_empty();
     let mut ttft_ms = None;
     let mut usage: Option<ir::Usage> = None;
-    let mut stream_error = None;
     for (ms, e) in events {
         match e {
             // 推理也算开口了：会推理的模型先吐推理 token，把它排除掉的话，测出来的

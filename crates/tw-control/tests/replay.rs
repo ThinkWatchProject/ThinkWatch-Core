@@ -208,3 +208,32 @@ async fn an_upstream_with_a_proxy_is_replayed_through_that_proxy() {
     assert_eq!(v["status"], 200, "{v}");
     assert_eq!(v["body"], "via its own proxy", "{v}");
 }
+
+/// Bedrock 只收 Converse，而录下来的请求是客户端的格式：先说清楚，不发
+#[tokio::test]
+async fn a_bedrock_upstream_is_not_offered_a_replay_it_cannot_take() {
+    let (_d, app) = app(
+        "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  \
+         - name: br\n    base_url: https://bedrock-runtime.us-east-1.amazonaws.com\n    key: ABSK-x\n",
+    );
+    for path in ["/replay/quote", "/replay/run"] {
+        let req = tw_api::ReplayRequest {
+            id: 1,
+            provider: "br".into(),
+        };
+        let r = app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CONFLICT, "{path}");
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["code"], "control.replay_bedrock", "{path}: {v}");
+    }
+}

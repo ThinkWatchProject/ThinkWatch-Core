@@ -233,11 +233,12 @@ clients:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 上游的名字，不能重复，也不能和策略组同名。以 `__` 开头的名字保留给内置项。 |
-| `base_url` | 字符串 | **必填** | 接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。 |
-| `key` | 字符串，可写 `${VAR}` | — | API 密钥，放进协议规定的请求头：`x-api-key`（Anthropic）、`Authorization: Bearer`（OpenAI）、`x-goog-api-key`（Gemini）。上游不需要密钥、或凭据写在 `headers` 里时不写。不能和 `oauth` 同时写。 |
+| `base_url` | 字符串 | **必填** | 接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。 |
+| `key` | 字符串，可写 `${VAR}` | — | API 密钥，放进协议规定的请求头：`x-api-key`（Anthropic）、`Authorization: Bearer`（OpenAI，以及 Bedrock API Key）、`x-goog-api-key`（Gemini）。上游不需要密钥、或凭据写在 `headers` 里时不写。不能和 `oauth`、`aws` 同时写。 |
 | `headers` | 请求头名 → 值的映射 | `{}` | 额外的请求头，按书写顺序发送；值可以用 `${VAR}`，配置了 `oauth` 时可以用 `{{access_token}}`。最多 32 个。HTTP 或网关管理的请求头（`host`、`content-length`、`connection` 等）不能设置。 |
 | `oauth` | 对象，见 [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth 凭据：用 refresh token 换取 access token。与 `key` 二选一。 |
-| `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` | — | 上游的接口格式。不写：官方地址按 `base_url` 识别，其余按 `anthropic` 处理。 |
+| `aws` | 对象，见 [`providers[].aws`](#cfg-providers-aws) | — | Bedrock 上游的 AWS 访问密钥：每个请求用它们签名（SigV4）。与 `key`（Bedrock API Key）二选一。 |
+| `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` \| `bedrock` | — | 上游的接口格式。不写：官方地址按 `base_url` 识别（Bedrock 的推理地址是 `bedrock`），其余按 `anthropic` 处理。 |
 | `forward_client_identity` | 布尔 | `false` | 同时发送客户端自己的身份：它的 `User-Agent`、`x-app` 和 `originator` 等身份请求头，以及请求体中的身份字段（如 `metadata.user_id`）。发送的都是客户端的原值，不做伪造。关闭时请求使用 ThinkWatch 的 `User-Agent`，不带客户端身份。用于只接受特定客户端的上游（Kimi For Coding、百炼 Coding Plan、只允许官方客户端的中转站）。`chatgpt` 不可用。 |
 | `proxy` | 字符串 | `direct` | `direct`；`system`，即 core 进程环境变量 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 中的代理；或 `proxies` 中某一项的名字。 |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | 代理不可用时：请求失败（`fail`），或改为直连（`direct`）。 |
@@ -248,7 +249,7 @@ clients:
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 <!-- /generated -->
 
-凭据有三种写法：`key`，放进协议规定的请求头；`oauth`，用 refresh token 换取 token；`headers`，用于上游自有的鉴权方式。`headers` 可以和前两者同时使用，但不能再设置已经承载凭据的那个请求头。
+凭据有四种写法：`key`，放进协议规定的请求头；`oauth`，用 refresh token 换取 token；`aws`，Bedrock 上游签名请求用的访问密钥；`headers`，用于上游自有的鉴权方式。`headers` 可以和其余几种同时使用，但不能再设置已经承载凭据的那个请求头。
 
 ```yaml
 providers:
@@ -301,6 +302,37 @@ access token 默认放进协议的鉴权请求头。要放在别处，在 `heade
     headers:
       X-Access: Token {{access_token}}
 ```
+
+#### `providers[].aws`
+
+<!-- generated: table providers[].aws -->
+<a id="cfg-providers-aws"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `access_key_id` | 字符串，可写 `${VAR}` | **必填** | 访问密钥 ID。 |
+| `secret_access_key` | 字符串，可写 `${VAR}` | **必填** | 私有访问密钥。 |
+| `session_token` | 字符串，可写 `${VAR}` | — | 临时凭证（如 STS 签发的）的会话令牌。过期之后请求会被拒绝，直到换上新的。 |
+| `region` | 字符串 | — | 签名用的区域。不写：取 `base_url` 里的区域，这时 `base_url` 必须是标准的推理地址。`base_url` 是 VPC 端点或代理时必须写。 |
+<!-- /generated -->
+
+Bedrock 上游有两种认证方式。Bedrock API Key 写在 `key` 中，以 `Authorization: Bearer` 发送。AWS 访问密钥写在 `aws` 中：每个请求在请求体定稿之后用它们签名（SigV4），密钥本身不会发送。两者都可以用 `${VAR}` 从环境变量读取。获取凭证时不执行任何命令，因此需要 `aws sso login` 或 `credential_process` 的配置文件无法使用，请改为导出它们生成的密钥。
+
+```yaml
+providers:
+  - name: bedrock
+    base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+    key: ${AWS_BEARER_TOKEN_BEDROCK}
+
+  - name: bedrock-keys
+    base_url: https://bedrock-runtime.eu-west-1.amazonaws.com
+    aws:
+      access_key_id: ${AWS_ACCESS_KEY_ID}
+      secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      session_token: ${AWS_SESSION_TOKEN}
+```
+
+请求转换为 Converse 格式。模型清单取自所在区域的控制面：可按需调用的基础模型、AWS 预设的推理配置（`us.anthropic.claude-…`），以及账号自己创建的应用推理配置（按调用时使用的 ARN 列出）。列出清单需要 `bedrock:ListFoundationModels` 和 `bedrock:ListInferenceProfiles` 权限；没有这两项权限时请求照常转发，可以在 `models` 中手动列出模型。使用 VPC 端点或代理时，在 `base_url` 中写它的地址，在 `aws.region` 中写区域；模型清单也向该地址获取。
 
 ### `proxies`
 

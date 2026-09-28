@@ -9,8 +9,16 @@ config.bad_remote_allow_from
 config.blank_models_only
 config.control_key_invalid
 config.control_key_missing
+config.credential.aws_bad_region
+config.credential.aws_empty
+config.credential.aws_no_region
+config.credential.aws_not_bedrock
+config.credential.aws_region_mismatch
+config.credential.aws_signed_header
 config.credential.bad_header_name
 config.credential.bad_header_value
+config.credential.bedrock_no_credential
+config.credential.bedrock_oauth
 config.credential.chatgpt_client_identity
 config.credential.chatgpt_without_login
 config.credential.claude_subscription
@@ -20,6 +28,7 @@ config.credential.empty_oauth
 config.credential.google_subscription
 config.credential.identity_header
 config.credential.key_and_auth_header
+config.credential.key_and_aws
 config.credential.key_and_oauth
 config.credential.no_token
 config.credential.oauth_and_auth_header
@@ -135,6 +144,7 @@ control.redirect_must_be_app_scheme
 control.remote.control_section_locked
 control.remote.diagnostics_refused
 control.remote.shutdown_refused
+control.replay_bedrock
 control.request_body_gone
 control.request_body_truncated
 control.request_not_found
@@ -238,6 +248,8 @@ gw.oauth.status
 gw.oauth.unreachable
 gw.output_limit.cut
 gw.output_limit.withheld
+gw.probe.aws_token_expired
+gw.probe.bedrock_list_denied
 gw.probe.connect
 gw.probe.key_rejected
 gw.probe.request_failed
@@ -253,9 +265,14 @@ gw.route.selected_upstream_missing
 gw.route.upstream_missing
 gw.toolcall.blocked
 gw.toolcall.cut
+gw.upstream.aws_token_expired
+gw.upstream.bedrock_refused
+gw.upstream.eventstream_broken
 gw.upstream.forward_failed
 gw.upstream.rate_limited
+gw.upstream.sign_failed
 gw.upstream.status
+gw.upstream.stream_exception
 gw.upstream.timeout
 gw.upstream.unreachable
 gw.ws.bad_header
@@ -323,6 +340,7 @@ l1.tls.failed
 l1.unreachable
 l3.not_streamed
 l3.refused
+l3.sign_failed
 l3.stream_failed
 pricing.sheet.bad_multiplier
 pricing.sheet.bad_price

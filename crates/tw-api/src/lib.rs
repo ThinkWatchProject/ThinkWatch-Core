@@ -100,6 +100,8 @@ slug_enum! {
         Gemini = "gemini",
         /// ChatGPT 账号登录的 Codex 后端
         Chatgpt = "chatgpt",
+        /// Amazon Bedrock 的 Converse 接口：Bedrock API Key，或者 AWS 访问密钥签名
+        Bedrock = "bedrock",
     }
 }
 
@@ -110,7 +112,7 @@ slug_enum! {
         OpenaiChat = "openai-chat",
         OpenaiResponses = "openai-responses",
         Gemini = "gemini",
-        /// 只有企业版接 Bedrock；桌面版不会发出这个词
+        /// Bedrock 的 Converse。只会是上游的格式：客户端不说它
         Bedrock = "bedrock",
     }
 }
@@ -627,7 +629,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `/latency` 两个端点和 [`LiveView::tokens_per_sec`] 同版改成从第一个 token 算：以前
 /// 从响应头算，非流式请求的响应头要等整段生成完才到，一条就能把速度顶到几万。照 26
 /// 写的界面不认那个新事件。
-pub const CONTROL_API_VERSION: u32 = 27;
+///
+/// **28 起有 Bedrock 上游**：[`Protocol`] 多了 `bedrock`，[`ProviderInput::aws`] /
+/// [`ProviderView::aws`]（[`AwsKeys`]：AWS 访问密钥，每个请求签名）、
+/// [`ProviderView::region`] 和 [`ProviderPreview::region`]。Bedrock API Key 走
+/// 原来的 `key`，放进 `Authorization: Bearer`。照 27 写的界面解析不了带 `bedrock` 的
+/// 上游列表。
+pub const CONTROL_API_VERSION: u32 = 28;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1629,8 +1637,14 @@ pub struct ProviderView {
     pub headers: Vec<HeaderView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthView>,
+    /// Bedrock 的 AWS 访问密钥，配置里写的原样。用 API Key 的、别的协议的都是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsKeys>,
+    /// Bedrock 的区域：标准地址里的那个，或者 `aws.region`。别的协议是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// 实际生效的协议：`anthropic` / `openai-chat` / `openai-responses` /
-    /// `gemini`。猜不出来时为空
+    /// `gemini` / `bedrock`。猜不出来时为空
     pub protocol: Option<Protocol>,
     /// 协议是配置里写明的，还是按地址推断的
     pub protocol_explicit: bool,
@@ -1689,6 +1703,24 @@ pub struct ProviderView {
 pub struct HeaderView {
     pub name: String,
     pub value: String,
+}
+
+/// Bedrock 上游的 AWS 访问密钥：每个请求用它们签名（SigV4）。每一项都可以写
+/// `${NAME}` 从环境变量读。视图和保存用的是同一个：配置里写的原样。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AwsKeys {
+    /// 访问密钥 ID
+    pub access_key_id: String,
+    /// 私有访问密钥
+    pub secret_access_key: String,
+    /// 会话令牌：临时凭证才有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    /// 签名用的区域。地址是标准的 `https://bedrock-runtime.<区域>.amazonaws.com`
+    /// 时不用给，从地址读
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 /// OAuth 凭据，配置里写的原样。**access token 不在这里**：它由网关换发、写回，
@@ -2423,7 +2455,10 @@ pub struct ProviderInput {
     /// OAuth。修改时默认保持原样
     #[serde(default)]
     pub oauth: OAuthChange,
-    /// `anthropic` / `openai-chat` / `openai-responses` / `gemini`。
+    /// Bedrock 的 AWS 访问密钥。和 `key`（Bedrock API Key）二选一；不给就是不用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsKeys>,
+    /// `anthropic` / `openai-chat` / `openai-responses` / `gemini` / `bedrock`。
     /// 不给就按地址推断
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
@@ -2473,6 +2508,10 @@ pub struct ProviderPreview {
     /// API 密钥放在哪个请求头里：`x-api-key` / `authorization` / `x-goog-api-key`。
     /// 选定了协议按选定的算，否则按推断出的
     pub auth_header: String,
+    /// 标准 Bedrock 地址（`https://bedrock-runtime.<区域>.amazonaws.com`）里的区域。
+    /// 别的地址是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 slug_enum! {
