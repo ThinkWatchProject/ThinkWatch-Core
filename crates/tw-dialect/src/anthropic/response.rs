@@ -174,6 +174,8 @@ pub fn error_body(status: u16, message: &str) -> Value {
         404 => "not_found_error",
         413 => "request_too_large",
         429 => "rate_limit_error",
+        // 这个接口在这里没有。Claude Code 认它：数 token 回这个时，它改用别的办法数
+        501 => "not_supported",
         504 => "timeout_error",
         529 | 503 => "overloaded_error",
         _ => "api_error",
@@ -191,6 +193,11 @@ pub fn error_message(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_501_is_not_supported_the_way_claude_code_reads_it() {
+        assert_eq!(error_body(501, "x")["error"]["type"], "not_supported");
+    }
 
     #[test]
     fn the_one_hour_cache_tier_survives_a_round_trip() {

@@ -247,6 +247,24 @@ fn admit(
     {
         return Ok(());
     }
+    // 数 token 的模型只有 Bedrock 上游有：回 501 `not_supported`，Claude Code 会改用别的
+    // 办法数（见 `Source::NotSupported`）。说「没有上游提供它」的话，用户会去查一个其实
+    // 能用的模型
+    let bedrock = [tw_config::Protocol::Bedrock.slug()];
+    if crate::client_api::ClientApi::counts_tokens(req.uri.path())
+        && models
+            .iter()
+            .any(|m| catalog.admits(m, Some(&bedrock), allow.as_deref()))
+    {
+        return Err(GatewayError::new(
+            crate::error::Source::NotSupported,
+            msg!(
+                "gw.count_tokens.bedrock_model", model = model =>
+                "Counting tokens is not available for model {model}: only AWS Bedrock upstreams \
+                 serve it."
+            ),
+        ));
+    }
     // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
     // 该去改的地方不一样。**改写过的两个名字都要说**：客户端写的是一个，
     // 报错里说的是另一个，不说清楚像是网关认错了模型

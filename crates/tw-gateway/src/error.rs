@@ -33,6 +33,13 @@ pub enum Source {
     /// 去改他的请求，而该改的是规则。表里它是 403 +
     /// `permission_error`。
     Denied,
+    /// 这个接口在这一家上游那里没有，客户端该换一种办法。
+    ///
+    /// **501 `not_supported` 是 Claude Code 认的回答**：它的网关对接约定里，Bedrock
+    /// 上游数不了 token 时就回这个，客户端会改用一次 `max_tokens: 1` 的请求来数。回
+    /// 400 的话它当成请求写错了。对外的词表（`x-thinkwatch-error`、`RequestFailed.source`）
+    /// 里算 `request`：服务不了的是这个请求要的接口
+    NotSupported,
 }
 
 impl Source {
@@ -45,6 +52,7 @@ impl Source {
             Source::Request => "request",
             Source::RateLimited => "rate_limited",
             Source::Denied => "denied",
+            Source::NotSupported => "request",
         }
     }
     fn status(&self) -> StatusCode {
@@ -56,6 +64,7 @@ impl Source {
             // 429 而不是 503：客户端至少知道这是限流，可以退避。
             Source::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Source::Denied => StatusCode::FORBIDDEN,
+            Source::NotSupported => StatusCode::NOT_IMPLEMENTED,
         }
     }
 }

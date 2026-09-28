@@ -13,6 +13,7 @@ impl From<crate::error::Source> for FailureSource {
             Source::Request => Self::Request,
             Source::RateLimited => Self::RateLimited,
             Source::Denied => Self::Denied,
+            Source::NotSupported => Self::Request,
         }
     }
 }
