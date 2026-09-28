@@ -147,6 +147,23 @@ data: {"type":"message_stop"}
     .await
 }
 
+/// 正常开头，写到一半在流里报错 —— Anthropic 忙不过来时的样子。响应头是 200
+async fn overloaded_midway_upstream() -> SocketAddr {
+    listen(Router::new().fallback(any(|| async {
+        let mut body = MESSAGE_START.to_vec();
+        body.extend_from_slice(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+              event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Half an\"}}\n\n\
+              event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        axum::response::Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    })))
+    .await
+}
+
 async fn refusing_upstream(status: u16) -> SocketAddr {
     listen(Router::new().fallback(any(move || async move {
         axum::http::StatusCode::from_u16(status).unwrap()
@@ -681,4 +698,33 @@ async fn a_websocket_cut_for_a_dangerous_tool_call_is_failed_as_denied() {
         ),
         "该是一次带着工具名的拦截：{got:?}"
     );
+}
+
+/// 上游写到一半在流里报错：客户端照样收到上游的原话，**结局是一条失败**，不是成功 ——
+/// 否则这家上游看起来从不出错，而用户手里是半截回答
+#[tokio::test]
+async fn an_error_the_upstream_reports_partway_through_is_a_failure() {
+    let up = overloaded_midway_upstream().await;
+    let (gw, mut rx) = serve(cfg(provider(up))).await;
+    let resp = post(gw).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("overloaded_error"), "{text}");
+
+    let got = endings(&mut rx).await;
+    match got.as_slice() {
+        [
+            Event::RequestFailed {
+                source,
+                message,
+                usage: Some(u),
+                ..
+            },
+        ] => {
+            assert_eq!(*source, tw_api::FailureSource::Upstream);
+            assert_eq!(message.code, "gw.upstream.stream_error");
+            assert_eq!(u.input, 5000);
+        }
+        other => panic!("该是一条失败，实际 {other:?}"),
+    }
 }

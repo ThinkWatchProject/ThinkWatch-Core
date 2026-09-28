@@ -655,6 +655,28 @@ impl Reader {
     }
 }
 
+/// 这一帧是不是上游在流里报的错；是的话，上游怎么说的。
+///
+/// 上游先回了 200、写到一半才在流里报错：Anthropic 的 `event: error`（`overloaded_error`
+/// 就是这么来的）、Responses 的 `response.failed`、OpenAI Chat 和 Gemini 写进数据帧的
+/// `error`。**按上游格式解析**，和 [`Reader`] 是同一个读法。
+///
+/// 一条流有多少帧就调多少次，所以**先看像不像，像了才解析**：事件名是 `error`，或者
+/// 载荷里有 `"error"` 这个键。正文里的「error」在 JSON 里是转义过的字符串，碰不上
+/// 这个键；绝大多数帧连 JSON 都不必解析。
+pub fn stream_error(upstream: Dialect, f: &Frame) -> Option<String> {
+    if f.event.as_deref() != Some("error") && !f.data.contains("\"error\"") {
+        return None;
+    }
+    // 错误帧不靠前面的帧：一个新的解析器读这一帧就够了
+    let mut out = Vec::new();
+    Parser::new(upstream).frame(f, &mut out);
+    out.into_iter().find_map(|e| match e {
+        Event::Error { message } => Some(message),
+        _ => None,
+    })
+}
+
 /// 上游的流 → 客户端的流。**边收边转**，不整块缓冲。
 pub struct StreamConverter {
     decoder: frame::Decoder,
@@ -901,6 +923,83 @@ pub fn strip_carried(client: Dialect, body: &[u8]) -> Option<Vec<u8>> {
         Dialect::Chat => return None,
     }
     changed.then(|| v.to_string().into_bytes())
+}
+
+#[cfg(test)]
+mod stream_error_tests {
+    use super::*;
+
+    fn frame(event: Option<&str>, data: &str) -> Frame {
+        Frame {
+            event: event.map(str::to_string),
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn each_format_reports_what_the_upstream_said() {
+        for (dialect, f, said) in [
+            (
+                Dialect::Anthropic,
+                frame(
+                    Some("error"),
+                    r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                ),
+                "Overloaded",
+            ),
+            (
+                Dialect::Responses,
+                frame(
+                    Some("response.failed"),
+                    r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"boom"}}}"#,
+                ),
+                "boom",
+            ),
+            (
+                Dialect::Chat,
+                frame(
+                    None,
+                    r#"{"id":"c1","object":"chat.completion.chunk","error":{"code":"server_error","message":"Provider disconnected"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#,
+                ),
+                "Provider disconnected",
+            ),
+            (
+                Dialect::Gemini,
+                frame(
+                    None,
+                    r#"{"error":{"code":503,"message":"The model is overloaded.","status":"UNAVAILABLE"}}"#,
+                ),
+                "The model is overloaded.",
+            ),
+        ] {
+            assert_eq!(
+                stream_error(dialect, &f).as_deref(),
+                Some(said),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_that_only_mentions_an_error_is_not_one() {
+        // 模型写的字里有 error：在 JSON 里是转义过的字符串
+        let text = frame(
+            Some("content_block_delta"),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"return {"error": 1}"}}"#,
+        );
+        assert_eq!(stream_error(Dialect::Anthropic, &text), None);
+        // Responses 的每个响应对象都带着 `"error": null`：解析了，但不是错误
+        let done = frame(
+            Some("response.completed"),
+            r#"{"type":"response.completed","response":{"status":"completed","error":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        );
+        assert_eq!(stream_error(Dialect::Responses, &done), None);
+        let delta = frame(
+            None,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+        );
+        assert_eq!(stream_error(Dialect::Chat, &delta), None);
+    }
 }
 
 #[cfg(test)]

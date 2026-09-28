@@ -61,8 +61,32 @@ pub struct Ending {
     first: Option<FirstToken>,
     /// 第一个 token 是什么时候、以什么开的头
     opened: Option<Opened>,
+    /// 看上游有没有在流里报错。**只在上游回的是成功的流时才有**（见 [`Ending::streaming`]），
+    /// 认出来就扔掉
+    watch: Option<Watch>,
+    /// 上游在流里报的错：哪一家、原话。**有它就不是成功** —— 响应头是 200，回答却断在了
+    /// 半路
+    upstream_error: Option<(String, String)>,
     /// 报过了。**只能报一次**
     told: bool,
+}
+
+/// 盯着流里的错误帧。
+struct Watch {
+    /// 哪一家上游在说话。报出去的那句话要点名
+    provider: String,
+    dialect: ir::Dialect,
+    frames: tw_dialect::frame::Decoder,
+}
+
+impl Watch {
+    /// 这些帧里上游报的第一个错
+    fn error_in(&self, frames: Vec<tw_dialect::frame::Frame>) -> Option<(String, String)> {
+        frames
+            .iter()
+            .find_map(|f| tw_dialect::convert::stream_error(self.dialect, f))
+            .map(|message| (self.provider.clone(), message))
+    }
 }
 
 /// 还在等第一个 token。
@@ -105,19 +129,30 @@ impl Ending {
             tap: ResponseTap::new(),
             first: None,
             opened: None,
+            watch: None,
+            upstream_error: None,
             told: false,
         }
     }
 
-    /// 上游回的是成功的流：按它的格式认第一个 token（见 `tw_api::Event::RequestFirstToken`）。
+    /// 上游 `provider` 回的是成功的流：按它的格式认第一个 token（见
+    /// `tw_api::Event::RequestFirstToken`），也看它有没有在流里报错。
     ///
     /// **按格式解析，不在字节里找关键字**，和测速（`crate::l3`）同一个读法：`message_start`、
     /// `response.created` 这些开场帧是上游收到请求就发的，认成第一个 token 的话，量到的是
     /// 建连有多快。
-    pub fn streaming(&mut self, upstream: ir::Dialect) {
+    ///
+    /// **流里报了错的不是成功。**上游先回 200、写到一半才报 `overloaded_error` 的，客户端
+    /// 拿到的是半截回答加一个错误；记成成功的话，这家上游看起来从不出错。
+    pub fn streaming(&mut self, upstream: ir::Dialect, provider: &str) {
         self.first = Some(FirstToken {
             reader: Reader::new(upstream),
             hidden_thought: false,
+        });
+        self.watch = Some(Watch {
+            provider: provider.to_string(),
+            dialect: upstream,
+            frames: Default::default(),
         });
     }
 
@@ -133,6 +168,19 @@ impl Ending {
         self.sniffer.feed(chunk);
         self.tap.feed(chunk);
         self.spot(chunk);
+        self.watch_for_errors(chunk);
+    }
+
+    /// 在这一块里找上游报的错。找到一个就够了，之后不再看。
+    fn watch_for_errors(&mut self, chunk: &[u8]) {
+        let Some(w) = self.watch.as_mut() else {
+            return;
+        };
+        let frames = w.frames.feed(chunk);
+        if let Some(found) = w.error_in(frames) {
+            self.upstream_error = Some(found);
+            self.watch = None;
+        }
     }
 
     /// 在这一块里找第一个 token。找到就报，之后不再解析。
@@ -177,9 +225,25 @@ impl Ending {
         self.bytes += bytes as u64;
     }
 
-    /// 走完了。
+    /// 走完了。上游在流里报过错的，报的是失败（见 [`Ending::streaming`]）。
     pub fn finished(mut self, status: u16) {
         self.status = Some(status);
+        // 最后一帧后面不带空行的上游：收尾时再看一眼
+        if let Some(mut w) = self.watch.take() {
+            let frames = w.frames.flush();
+            self.upstream_error = self.upstream_error.take().or(w.error_in(frames));
+        }
+        if let Some((upstream, message)) = self.upstream_error.take() {
+            let message: String = message.chars().take(500).collect();
+            self.failed(
+                tw_api::FailureSource::Upstream,
+                msg!(
+                    "gw.upstream.stream_error", upstream = upstream, message = message =>
+                    "Upstream `{upstream}` reported an error partway through the response: {message}"
+                ),
+            );
+            return;
+        }
         let usage = self.settle();
         let duration_ms = self.duration_ms();
         let tokens_per_sec = rate(self.opened, usage.as_ref(), duration_ms);
@@ -428,6 +492,71 @@ mod tests {
         }
     }
 
+    /// 上游先回 200、写到一半才在流里报错：**不是成功**。结局是一条带着用量的失败 ——
+    /// 输入在第一帧里就齐了，上游已经为它计费
+    #[test]
+    fn an_error_partway_through_a_successful_stream_is_a_failure() {
+        const OVERLOADED: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.streaming(ir::Dialect::Anthropic, "官方");
+        e.feed(MESSAGE_START);
+        // 错误帧被切成一个字节一个字节地到
+        for b in OVERLOADED {
+            e.feed(std::slice::from_ref(b));
+        }
+        e.finished(200);
+
+        let got = drain(&mut rx);
+        match got.as_slice() {
+            [
+                Event::RequestFailed {
+                    source,
+                    message,
+                    usage: Some(u),
+                    ..
+                },
+            ] => {
+                assert_eq!(*source, tw_api::FailureSource::Upstream);
+                assert_eq!(message.code, "gw.upstream.stream_error");
+                assert!(message.text.contains("`官方`"), "{}", message.text);
+                assert!(message.text.ends_with("Overloaded"), "{}", message.text);
+                assert_eq!(u.input, 5000);
+            }
+            other => panic!("该是一条失败，实际 {other:?}"),
+        }
+    }
+
+    /// 最后一帧后面不带空行的上游：错误在收尾时才读得全
+    #[test]
+    fn an_error_in_the_last_unterminated_frame_is_still_seen() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.streaming(ir::Dialect::Chat, "中转");
+        e.feed(b"data: {\"error\":{\"message\":\"Provider disconnected\"}}");
+        e.finished(200);
+        assert!(
+            matches!(drain(&mut rx).as_slice(), [Event::RequestFailed { message, .. }]
+                if message.text.ends_with("Provider disconnected")),
+        );
+    }
+
+    /// 不是流的（非流式、错误响应）不看：那些不经过这里认错误
+    #[test]
+    fn only_a_stream_is_watched() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.feed(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"x\"}}\n\n");
+        e.finished(200);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [Event::RequestFinished { .. }]
+        ));
+    }
+
     /// **三种结局都带着模型名。**听事件的一方可能是请求开始之后才来的（界面
     /// 的实时曲线就是这样），它手上只有结局 —— 这笔用量记在哪个模型上，只能
     /// 看结局里写的。
@@ -569,7 +698,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Anthropic);
+        e.streaming(ir::Dialect::Anthropic, "up");
         e.feed(MESSAGE_START);
         e.feed(TEXT_BLOCK);
         assert!(drain(&mut rx).is_empty(), "开场帧被当成了第一个 token");
@@ -587,7 +716,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.streaming(ir::Dialect::Anthropic);
+        e.streaming(ir::Dialect::Anthropic, "up");
         e.feed(MESSAGE_START);
         e.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}}\n\n");
         assert_eq!(first_tokens(&drain(&mut rx)).len(), 1);

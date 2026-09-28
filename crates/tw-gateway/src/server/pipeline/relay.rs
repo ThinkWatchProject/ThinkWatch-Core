@@ -112,7 +112,7 @@ pub(super) fn respond(
     let upstream_dialect = upstream_dialect(req, session.as_ref());
     // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
     if generates && plan.is_sse && status.is_success() {
-        ending.streaming(upstream_dialect);
+        ending.streaming(upstream_dialect, &provider.name);
     }
     let mut relay = Relay::new(
         state,
