@@ -82,6 +82,49 @@ pub struct Request {
     pub reasoning: Option<Reasoning>,
     pub format: Option<Format>,
     pub stream: bool,
+    /// 提示缓存的断点，按出现顺序
+    pub cache: Vec<CachePoint>,
+}
+
+/// 提示缓存的断点：从请求开头到这里为止的内容，上游可以缓存起来，下一次同样开头的
+/// 请求直接读缓存。
+///
+/// **只有 Anthropic 和 Bedrock 上的模型要客户端标出来**：Anthropic 写成内容块上的
+/// `cache_control`，Converse 写成跟在后面的一个 `cachePoint` 块。OpenAI 和 Gemini
+/// 自己决定缓存什么，没有这个说法。转换时丢了它，请求照样成功，只是每次都按全价
+/// 重算一遍输入 —— Claude Code 这种每一轮都带着整段对话的客户端，费用会差出几倍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachePoint {
+    pub after: CacheAfter,
+    pub ttl: CacheTtl,
+}
+
+/// 断点落在哪一块后面。编号是中间表示里的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAfter {
+    /// 第几个工具
+    Tool(usize),
+    /// 第几段系统提示
+    System(usize),
+    /// 第几条消息的第几块
+    Part { message: usize, part: usize },
+}
+
+impl CacheAfter {
+    /// 按顺序排好的这一组断点里，落在 `at` 后面的那个
+    pub fn find(points: &[CachePoint], at: CacheAfter) -> Option<CacheTtl> {
+        points.iter().find(|c| c.after == at).map(|c| c.ttl)
+    }
+}
+
+/// 缓存留多久。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtl {
+    /// 5 分钟，两家的默认值
+    #[default]
+    Short,
+    /// 1 小时。写入更贵，读一样
+    Long,
 }
 
 /// 转换时要知道的上游情况。
@@ -540,6 +583,8 @@ pub enum Feature {
     ToolResultImage,
     /// 自由格式工具的语法约束
     FreeformFormat,
+    /// 提示缓存的断点，目标模型不认
+    Cache,
 }
 
 impl Feature {
@@ -596,6 +641,8 @@ impl Feature {
             (ToolResultImage, Gemini) => "contents.parts.functionResponse.parts",
             (ToolResultImage, Bedrock) => "messages.content.toolResult.content.image",
             (FreeformFormat, _) => "tools.custom.format",
+            (Cache, Bedrock) => "cachePoint",
+            (Cache, _) => "cache_control",
         }
     }
 }

@@ -9,6 +9,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::ir::*;
+use crate::think;
 
 /// 图片的 MIME → Converse 的 `format`。
 ///
@@ -65,156 +66,127 @@ fn document_name(name: Option<&str>, index: usize) -> String {
 
 // ───────────────────────────────────────────── 中间表示 → Converse
 
+/// 这个模型 id 是不是 Bedrock 上的 Claude：基础 id（`anthropic.claude-…`）、推理
+/// 配置（`us.anthropic.claude-…`）都认。应用推理配置的 ARN 看不出背后是谁，不算。
+fn is_claude(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("anthropic.claude")
+}
+
+/// 这个模型认不认提示缓存的断点。Bedrock 上只有 Claude 和 Nova 认；别的模型收到
+/// `cachePoint` 会拒掉整个请求，所以只给认得的发。应用推理配置的 ARN 看不出背后是
+/// 谁 —— 会把请求路由到 ARN 上的，基本是冲着 Claude 去的，照发。
+fn caches(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("anthropic.claude") || m.contains("amazon.nova") || m.starts_with("arn:")
+}
+
+/// 一个缓存断点块。`ttl` 缺省是 5 分钟
+fn cache_point(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::Short => json!({ "cachePoint": { "type": "default" } }),
+        CacheTtl::Long => json!({ "cachePoint": { "type": "default", "ttl": "1h" } }),
+    }
+}
+
 pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
     let mut out = Map::new();
+    // 断点放不放：模型不认就一个都不放，报出来
+    let cache: &[CachePoint] = if caches(&r.model) { &r.cache } else { &[] };
+    if cache.is_empty() && !r.cache.is_empty() {
+        dropped.feature(Feature::Cache);
+    }
 
     if !r.system.is_empty() {
-        let blocks: Vec<Value> = r.system.iter().map(|s| json!({ "text": s })).collect();
+        let mut blocks = Vec::new();
+        for (i, s) in r.system.iter().enumerate() {
+            blocks.push(json!({ "text": s }));
+            if let Some(ttl) = CacheAfter::find(cache, CacheAfter::System(i)) {
+                blocks.push(cache_point(ttl));
+            }
+        }
         out.insert("system".into(), Value::Array(blocks));
     }
 
-    let mut messages = Vec::new();
+    // 先一条一条转，断点跟在它那一块后面；再把相邻的同一方合成一条 —— Converse
+    // 要求一问一答交替。先合再转的话，断点就找不到它原来的位置了
+    let mut turns: Vec<(Role, Vec<Value>)> = Vec::new();
     let mut doc_index = 0usize;
-    for m in merge_roles(r.messages.clone()) {
+    for (i, m) in r.messages.iter().enumerate() {
         let mut content = Vec::new();
-        for p in &m.parts {
-            match p {
-                Part::Text(text) if !text.is_empty() => content.push(json!({ "text": text })),
-                Part::Text(_) => {}
-                Part::Image(media) => match media {
-                    Media::Base64 { mime, data } => match image_format(mime) {
-                        Some(format) => content.push(json!({
-                            "image": { "format": format, "source": { "bytes": data } },
-                        })),
-                        None => dropped.path("messages.content.image"),
+        for (j, p) in m.parts.iter().enumerate() {
+            let before = content.len();
+            content_block(p, &mut content, &mut doc_index, dropped);
+            if content.len() > before
+                && let Some(ttl) = CacheAfter::find(
+                    cache,
+                    CacheAfter::Part {
+                        message: i,
+                        part: j,
                     },
-                    // Converse 只收字节和 S3，没有取 URL 这一说
-                    Media::Url(_) => dropped.feature(Feature::MediaUrl),
-                },
-                Part::File { media, name } => match media {
-                    Media::Base64 { mime, data } => match document_format(mime, name.as_deref()) {
-                        Some(format) => {
-                            content.push(json!({
-                                "document": {
-                                    "format": format,
-                                    "name": document_name(name.as_deref(), doc_index),
-                                    "source": { "bytes": data },
-                                },
-                            }));
-                            doc_index += 1;
-                        }
-                        None => dropped.feature(Feature::File),
-                    },
-                    Media::Url(_) => dropped.feature(Feature::MediaUrl),
-                },
-                Part::Thinking(th) => match &th.signature {
-                    // 签名是 Bedrock 上的 Anthropic 模型签的，带回去才算数
-                    Some(s) if s.vendor == Vendor::Anthropic && !s.redacted => {
-                        content.push(json!({
-                            "reasoningContent": {
-                                "reasoningText": { "text": th.text, "signature": s.value },
-                            },
-                        }))
-                    }
-                    Some(s) if s.redacted => content.push(json!({
-                        "reasoningContent": { "redactedContent": s.value },
-                    })),
-                    _ => dropped.feature(Feature::ReasoningHistory),
-                },
-                Part::ToolCall(c) => content.push(json!({
-                    "toolUse": {
-                        "toolUseId": c.id,
-                        "name": c.name,
-                        "input": c.input.to_object(),
-                    },
-                })),
-                Part::ToolResult(res) => {
-                    let mut blocks = Vec::new();
-                    for part in &res.content {
-                        match part {
-                            Part::Text(t) if !t.is_empty() => blocks.push(json!({ "text": t })),
-                            Part::Text(_) => {}
-                            // toolResult 的内容块里图片是一等公民，不用丢
-                            Part::Image(Media::Base64 { mime, data }) => match image_format(mime) {
-                                Some(format) => blocks.push(json!({
-                                    "image": { "format": format, "source": { "bytes": data } },
-                                })),
-                                None => dropped.feature(Feature::ToolResultImage),
-                            },
-                            Part::Image(Media::Url(_)) => dropped.feature(Feature::MediaUrl),
-                            _ => {}
-                        }
-                    }
-                    if blocks.is_empty() {
-                        blocks.push(json!({ "text": res.text() }));
-                    }
-                    content.push(json!({
-                        "toolResult": {
-                            "toolUseId": res.id,
-                            "content": blocks,
-                            "status": if res.is_error { "error" } else { "success" },
-                        },
-                    }));
-                }
+                )
+            {
+                content.push(cache_point(ttl));
             }
         }
         if content.is_empty() {
             continue;
         }
-        messages.push(json!({
-            "role": if m.role == Role::User { "user" } else { "assistant" },
-            "content": content,
-        }));
+        match turns.last_mut() {
+            Some((role, c)) if *role == m.role => c.extend(content),
+            _ => turns.push((m.role, content)),
+        }
     }
+    let messages: Vec<Value> = turns
+        .into_iter()
+        .map(|(role, content)| {
+            json!({
+                "role": if role == Role::User { "user" } else { "assistant" },
+                "content": content,
+            })
+        })
+        .collect();
     out.insert("messages".into(), Value::Array(messages));
+
+    // ── 推理：Claude 的放进 additionalModelRequestFields，写法和 Anthropic 一样 ──
+    let mut extra = Map::new();
+    let max_tokens = r.max_tokens.unwrap_or(t.default_max_tokens);
+    let thinking = reasoning(r, max_tokens, dropped, &mut extra);
 
     // ── inferenceConfig：只有这四个 ────────────────────────────
     let mut cfg = Map::new();
-    cfg.insert(
-        "maxTokens".into(),
-        json!(r.max_tokens.unwrap_or(t.default_max_tokens)),
-    );
-    if let Some(v) = r.temperature {
-        cfg.insert("temperature".into(), json!(v));
-    }
-    if let Some(v) = r.top_p {
-        cfg.insert("topP".into(), json!(v));
-    }
+    cfg.insert("maxTokens".into(), json!(max_tokens));
+    sampling(r, thinking, dropped, &mut cfg, &mut extra);
     if !r.stop.is_empty() {
         cfg.insert("stopSequences".into(), json!(r.stop));
     }
     out.insert("inferenceConfig".into(), Value::Object(cfg));
 
     // ── additionalModelRequestFields：Converse 不解释的都塞这儿 ──
-    let mut extra = Map::new();
-    if let Some(k) = r.top_k {
-        extra.insert("top_k".into(), json!(k));
-    }
     if !extra.is_empty() {
         out.insert("additionalModelRequestFields".into(), Value::Object(extra));
     }
 
     if !r.tools.is_empty() {
-        let tools: Vec<Value> = r
-            .tools
-            .iter()
-            .map(|tool| {
-                let schema = match &tool.kind {
-                    ToolKind::Function { schema, .. } => schema.clone(),
-                    ToolKind::Freeform { format } => {
-                        if format.is_some() {
-                            dropped.feature(Feature::FreeformFormat);
-                        }
-                        freeform_schema()
+        let mut tools = Vec::new();
+        for (i, tool) in r.tools.iter().enumerate() {
+            let schema = match &tool.kind {
+                ToolKind::Function { schema, .. } => schema.clone(),
+                ToolKind::Freeform { format } => {
+                    if format.is_some() {
+                        dropped.feature(Feature::FreeformFormat);
                     }
-                };
-                let mut spec = json!({ "name": tool.name, "inputSchema": { "json": schema } });
-                if let Some(desc) = &tool.description {
-                    spec["description"] = json!(desc);
+                    freeform_schema()
                 }
-                json!({ "toolSpec": spec })
-            })
-            .collect();
+            };
+            let mut spec = json!({ "name": tool.name, "inputSchema": { "json": schema } });
+            if let Some(desc) = &tool.description {
+                spec["description"] = json!(desc);
+            }
+            tools.push(json!({ "toolSpec": spec }));
+            if let Some(ttl) = CacheAfter::find(cache, CacheAfter::Tool(i)) {
+                tools.push(cache_point(ttl));
+            }
+        }
 
         let mut config = json!({ "tools": tools });
         match &r.tool_choice {
@@ -246,14 +218,178 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
     if r.parallel_tool_calls.is_some() {
         dropped.feature(Feature::ParallelToolCalls);
     }
-    if r.reasoning.is_some() {
-        dropped.feature(Feature::Reasoning);
-    }
     if r.format.is_some() {
         dropped.feature(Feature::Format);
     }
 
     Value::Object(out)
+}
+
+/// 一块内容转成 Converse 的内容块，追加在 `content` 后面。转不过去的记进 `dropped`。
+fn content_block(p: &Part, content: &mut Vec<Value>, doc_index: &mut usize, dropped: &mut Dropped) {
+    match p {
+        Part::Text(text) if !text.is_empty() => content.push(json!({ "text": text })),
+        Part::Text(_) => {}
+        Part::Image(media) => match media {
+            Media::Base64 { mime, data } => match image_format(mime) {
+                Some(format) => content.push(json!({
+                    "image": { "format": format, "source": { "bytes": data } },
+                })),
+                None => dropped.path("messages.content.image"),
+            },
+            // Converse 只收字节和 S3，没有取 URL 这一说
+            Media::Url(_) => dropped.feature(Feature::MediaUrl),
+        },
+        Part::File { media, name } => match media {
+            Media::Base64 { mime, data } => match document_format(mime, name.as_deref()) {
+                Some(format) => {
+                    content.push(json!({
+                        "document": {
+                            "format": format,
+                            "name": document_name(name.as_deref(), *doc_index),
+                            "source": { "bytes": data },
+                        },
+                    }));
+                    *doc_index += 1;
+                }
+                None => dropped.feature(Feature::File),
+            },
+            Media::Url(_) => dropped.feature(Feature::MediaUrl),
+        },
+        Part::Thinking(th) => match &th.signature {
+            // 签名是 Bedrock 上的 Anthropic 模型签的，带回去才算数
+            Some(s) if s.vendor == Vendor::Anthropic && !s.redacted => content.push(json!({
+                "reasoningContent": {
+                    "reasoningText": { "text": th.text, "signature": s.value },
+                },
+            })),
+            Some(s) if s.redacted => content.push(json!({
+                "reasoningContent": { "redactedContent": s.value },
+            })),
+            _ => dropped.feature(Feature::ReasoningHistory),
+        },
+        Part::ToolCall(c) => content.push(json!({
+            "toolUse": {
+                "toolUseId": c.id,
+                "name": c.name,
+                "input": c.input.to_object(),
+            },
+        })),
+        Part::ToolResult(res) => {
+            let mut blocks = Vec::new();
+            for part in &res.content {
+                match part {
+                    Part::Text(t) if !t.is_empty() => blocks.push(json!({ "text": t })),
+                    Part::Text(_) => {}
+                    // toolResult 的内容块里图片是一等公民，不用丢
+                    Part::Image(Media::Base64 { mime, data }) => match image_format(mime) {
+                        Some(format) => blocks.push(json!({
+                            "image": { "format": format, "source": { "bytes": data } },
+                        })),
+                        None => dropped.feature(Feature::ToolResultImage),
+                    },
+                    Part::Image(Media::Url(_)) => dropped.feature(Feature::MediaUrl),
+                    _ => {}
+                }
+            }
+            if blocks.is_empty() {
+                blocks.push(json!({ "text": res.text() }));
+            }
+            content.push(json!({
+                "toolResult": {
+                    "toolUseId": res.id,
+                    "content": blocks,
+                    "status": if res.is_error { "error" } else { "success" },
+                },
+            }));
+        }
+    }
+}
+
+/// 推理配置。返回思考有没有开 —— 开了之后采样参数另有限制。
+///
+/// **只有 Claude 有**，写法和 Anthropic 的 Messages 一样，放在
+/// `additionalModelRequestFields` 里原样交给模型：4.6 及以后是 `adaptive` 加
+/// `output_config.effort`，之前是 `enabled` 加 `budget_tokens`（见
+/// [`crate::think::claude_adaptive`]）。别的模型、看不出背后是谁的 ARN，不开，报出来。
+fn reasoning(
+    r: &Request,
+    max_tokens: u64,
+    dropped: &mut Dropped,
+    extra: &mut Map<String, Value>,
+) -> bool {
+    let Some(re) = &r.reasoning else {
+        return false;
+    };
+    // 关掉：不写就是不开
+    if !re.enabled {
+        return false;
+    }
+    if !is_claude(&r.model) {
+        dropped.feature(Feature::Reasoning);
+        return false;
+    }
+    if think::claude_adaptive(&r.model) {
+        extra.insert("thinking".into(), json!({ "type": "adaptive" }));
+        if let Some(e) = think::effort(re) {
+            extra.insert(
+                "output_config".into(),
+                json!({ "effort": think::anthropic(e) }),
+            );
+        }
+        return true;
+    }
+    // 按预算：不少于 1024，且必须小于 maxTokens；工具调用那一轮得以思考块开头
+    let budget = think::budget(re)
+        .unwrap_or(think::budget_of_effort(Effort::Medium))
+        .min(max_tokens.saturating_sub(1));
+    if budget < 1024 || think::continues_tool_turn_without_thinking(&r.messages) {
+        dropped.feature(Feature::Reasoning);
+        return false;
+    }
+    extra.insert(
+        "thinking".into(),
+        json!({ "type": "enabled", "budget_tokens": budget }),
+    );
+    true
+}
+
+/// 采样参数。
+///
+/// Claude 在 Bedrock 上的限制和在 Anthropic 上一样：开着思考时 `temperature` 只能是
+/// 1、不许 `top_k`、`top_p` 不低于 0.95；Sonnet 4.5、Haiku 4.5 这些新模型
+/// `temperature` 和 `top_p` 只能二选一，两个都给就留 `temperature`。`top_k` 在
+/// `inferenceConfig` 里没有位置，走 `additionalModelRequestFields`。
+fn sampling(
+    r: &Request,
+    thinking: bool,
+    dropped: &mut Dropped,
+    cfg: &mut Map<String, Value>,
+    extra: &mut Map<String, Value>,
+) {
+    let claude = is_claude(&r.model);
+    if let Some(v) = r.temperature {
+        if thinking && v != 1.0 {
+            dropped.feature(Feature::Temperature);
+        } else {
+            cfg.insert("temperature".into(), json!(v));
+        }
+    }
+    if let Some(v) = r.top_p {
+        let both = claude && cfg.contains_key("temperature");
+        if both || (thinking && v < 0.95) {
+            dropped.feature(Feature::TopP);
+        } else {
+            cfg.insert("topP".into(), json!(v));
+        }
+    }
+    if let Some(k) = r.top_k {
+        if thinking {
+            dropped.feature(Feature::TopK);
+        } else {
+            extra.insert("top_k".into(), json!(k));
+        }
+    }
 }
 
 // ───────────────────────────────────────────── Converse → 中间表示
@@ -369,11 +505,10 @@ fn part(b: &Value, dropped: &mut Dropped) -> Option<Part> {
             is_error: res.get("status").and_then(Value::as_str) == Some("error"),
         }));
     }
-    // guardContent、cachePoint、citationsContent、video、audio、searchResult:
-    // 别的格式没有对应物
+    // guardContent、citationsContent、video、audio、searchResult：别的格式没有
+    // 对应物。cachePoint 由调用方记成断点
     for key in [
         "guardContent",
-        "cachePoint",
         "citationsContent",
         "video",
         "audio",
@@ -385,6 +520,15 @@ fn part(b: &Value, dropped: &mut Dropped) -> Option<Part> {
         }
     }
     None
+}
+
+/// 一个 `cachePoint` 块的 TTL。不是断点块就是 None
+fn cache_point_ttl(b: &Value) -> Option<CacheTtl> {
+    let c = b.get("cachePoint")?;
+    Some(match c.get("ttl").and_then(Value::as_str) {
+        Some("1h") => CacheTtl::Long,
+        _ => CacheTtl::Short,
+    })
 }
 
 /// Converse 的 document `format` → MIME。
@@ -420,8 +564,13 @@ pub fn decode_request(
             r.system.push(t.to_string());
         } else if s.get("guardContent").is_some() {
             dropped.path("system.guardContent");
-        } else if s.get("cachePoint").is_some() {
-            dropped.path("system.cachePoint");
+        } else if let Some(ttl) = cache_point_ttl(s)
+            && let Some(last) = r.system.len().checked_sub(1)
+        {
+            r.cache.push(CachePoint {
+                after: CacheAfter::System(last),
+                ttl,
+            });
         }
     }
 
@@ -434,13 +583,26 @@ pub fn decode_request(
             Some("assistant") => Role::Assistant,
             _ => Role::User,
         };
-        let parts: Vec<Part> = m
+        let mut parts: Vec<Part> = Vec::new();
+        for b in m
             .get("content")
             .and_then(Value::as_array)
             .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|b| part(b, dropped))
-            .collect();
+        {
+            if let Some(ttl) = cache_point_ttl(b) {
+                if let Some(last) = parts.len().checked_sub(1) {
+                    r.cache.push(CachePoint {
+                        after: CacheAfter::Part {
+                            message: r.messages.len(),
+                            part: last,
+                        },
+                        ttl,
+                    });
+                }
+            } else if let Some(p) = part(b, dropped) {
+                parts.push(p);
+            }
+        }
         if !parts.is_empty() {
             r.messages.push(Message { role, parts });
         }
@@ -459,14 +621,43 @@ pub fn decode_request(
         }
     }
 
-    // `top_k` 是我们自己编码时放进去的，读回来认它
-    if let Some(k) = v
-        .get("additionalModelRequestFields")
-        .and_then(|e| e.get("top_k"))
-        .and_then(Value::as_u64)
-    {
+    // `top_k` 和 Claude 的思考配置是我们自己编码时放进去的，读回来认它们
+    let extra = v.get("additionalModelRequestFields");
+    if let Some(k) = extra.and_then(|e| e.get("top_k")).and_then(Value::as_u64) {
         r.top_k = Some(k);
     }
+    let effort = extra
+        .and_then(|e| e.get("output_config"))
+        .and_then(|o| o.get("effort"))
+        .and_then(Value::as_str)
+        .and_then(think::parse_anthropic);
+    r.reasoning = match extra
+        .and_then(|e| e.get("thinking"))
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("enabled") => Some(Reasoning {
+            enabled: true,
+            effort,
+            budget: extra
+                .and_then(|e| e.pointer("/thinking/budget_tokens"))
+                .and_then(Value::as_u64),
+            summary: true,
+        }),
+        Some("adaptive") => Some(Reasoning {
+            enabled: true,
+            effort,
+            budget: None,
+            summary: true,
+        }),
+        Some("disabled") => Some(Reasoning {
+            enabled: false,
+            effort: None,
+            budget: None,
+            summary: false,
+        }),
+        _ => None,
+    };
 
     if let Some(cfg) = v.get("toolConfig") {
         for t in cfg
@@ -474,11 +665,18 @@ pub fn decode_request(
             .and_then(Value::as_array)
             .unwrap_or(&vec![])
         {
+            if let Some(ttl) = cache_point_ttl(t) {
+                if let Some(last) = r.tools.len().checked_sub(1) {
+                    r.cache.push(CachePoint {
+                        after: CacheAfter::Tool(last),
+                        ttl,
+                    });
+                }
+                continue;
+            }
             let Some(spec) = t.get("toolSpec") else {
-                for key in ["systemTool", "cachePoint"] {
-                    if t.get(key).is_some() {
-                        dropped.path(format!("toolConfig.tools.{key}"));
-                    }
+                if t.get("systemTool").is_some() {
+                    dropped.path("toolConfig.tools.systemTool");
                 }
                 continue;
             };
@@ -752,5 +950,285 @@ mod tests {
         assert_eq!(after.temperature, before.temperature);
         assert_eq!(after.top_p, before.top_p);
         assert_eq!(after.stop, before.stop);
+    }
+
+    /// Claude Code 那样的请求：系统提示第二段、最后一个工具、最后一条用户消息标了断点，
+    /// 其中一个是 1 小时
+    fn claude_code_like(model: &str) -> Request {
+        let mut d = Dropped::new(Dialect::Anthropic);
+        let mut r = crate::anthropic::decode_request(
+            &json!({
+                "model": model,
+                "max_tokens": 32000,
+                "system": [
+                    {"type": "text", "text": "You are Claude Code."},
+                    {"type": "text", "text": "Project rules.", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ],
+                "tools": [
+                    {"name": "Read", "input_schema": {"type": "object"}},
+                    {"name": "Edit", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}}
+                ],
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "读一下 a.rs"},
+                        {"type": "text", "text": "谢谢", "cache_control": {"type": "ephemeral"}}
+                    ]}
+                ]
+            }),
+            &mut d,
+        )
+        .unwrap();
+        r.model = model.into();
+        r
+    }
+
+    fn with_dropped(r: &Request) -> (Value, Vec<String>) {
+        let mut d = Dropped::new(Dialect::Anthropic);
+        let v = encode_request(r, &target(), &mut d);
+        (v, d.into_vec())
+    }
+
+    #[test]
+    fn cache_points_follow_the_blocks_the_client_marked() {
+        let r = claude_code_like("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+        assert_eq!(r.cache.len(), 3);
+        let (v, dropped) = with_dropped(&r);
+        assert!(dropped.is_empty(), "{dropped:?}");
+
+        assert_eq!(
+            v["system"],
+            json!([
+                {"text": "You are Claude Code."},
+                {"text": "Project rules."},
+                {"cachePoint": {"type": "default", "ttl": "1h"}}
+            ])
+        );
+        let tools = v["toolConfig"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[2], json!({"cachePoint": {"type": "default"}}));
+        assert_eq!(
+            v["messages"][0]["content"],
+            json!([
+                {"text": "读一下 a.rs"},
+                {"text": "谢谢"},
+                {"cachePoint": {"type": "default"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn a_cache_point_stays_after_its_block_when_turns_are_merged() {
+        // 两条相邻的用户消息合成一条；断点标在第一条上，就还跟在它后面，不跑到末尾
+        let r = Request {
+            model: "anthropic.claude-3-7-sonnet-20250219-v1:0".into(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![Part::Text("前面".into())],
+                },
+                Message {
+                    role: Role::User,
+                    parts: vec![Part::Text("后面".into())],
+                },
+            ],
+            cache: vec![CachePoint {
+                after: CacheAfter::Part {
+                    message: 0,
+                    part: 0,
+                },
+                ttl: CacheTtl::Short,
+            }],
+            ..Default::default()
+        };
+        let (v, _) = with_dropped(&r);
+        assert_eq!(
+            v["messages"],
+            json!([{"role": "user", "content": [
+                {"text": "前面"},
+                {"cachePoint": {"type": "default"}},
+                {"text": "后面"}
+            ]}])
+        );
+    }
+
+    #[test]
+    fn a_model_that_does_not_cache_gets_no_cache_points_and_it_is_reported() {
+        // 不认 cachePoint 的模型会拒掉整个请求
+        let r = claude_code_like("meta.llama3-70b-instruct-v1:0");
+        let (v, dropped) = with_dropped(&r);
+        assert!(!v.to_string().contains("cachePoint"), "{v}");
+        assert_eq!(dropped, ["cache_control"]);
+    }
+
+    #[test]
+    fn nova_and_an_application_profile_arn_get_cache_points() {
+        for model in [
+            "us.amazon.nova-pro-v1:0",
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2",
+        ] {
+            let (v, dropped) = with_dropped(&claude_code_like(model));
+            assert!(v.to_string().contains("cachePoint"), "{model}");
+            assert!(dropped.is_empty(), "{model}: {dropped:?}");
+        }
+    }
+
+    fn thinking(model: &str, effort: Option<Effort>, budget: Option<u64>) -> Request {
+        Request {
+            model: model.into(),
+            max_tokens: Some(32000),
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![Part::Text("想一想".into())],
+            }],
+            reasoning: Some(Reasoning {
+                enabled: true,
+                effort,
+                budget,
+                summary: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claude_4_5_thinks_on_a_budget_and_4_6_adaptively() {
+        let (v, dropped) = with_dropped(&thinking(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            None,
+            Some(10000),
+        ));
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(
+            v["additionalModelRequestFields"],
+            json!({"thinking": {"type": "enabled", "budget_tokens": 10000}})
+        );
+
+        let (v, dropped) = with_dropped(&thinking(
+            "global.anthropic.claude-opus-4-6-v1",
+            Some(Effort::High),
+            None,
+        ));
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(
+            v["additionalModelRequestFields"],
+            json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}})
+        );
+    }
+
+    #[test]
+    fn a_budget_stays_below_max_tokens() {
+        let mut r = thinking(
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            None,
+            Some(50000),
+        );
+        r.max_tokens = Some(8000);
+        let (v, _) = with_dropped(&r);
+        assert_eq!(
+            v["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            7999
+        );
+    }
+
+    #[test]
+    fn a_model_that_is_not_claude_does_not_think_and_it_is_reported() {
+        let (v, dropped) = with_dropped(&thinking(
+            "us.meta.llama4-maverick-17b-instruct-v1:0",
+            Some(Effort::High),
+            None,
+        ));
+        assert!(v.get("additionalModelRequestFields").is_none(), "{v}");
+        assert_eq!(dropped, ["thinking"]);
+    }
+
+    #[test]
+    fn budget_thinking_is_off_for_a_tool_turn_that_started_without_it() {
+        // 工具调用那一轮来自别家，没有签过名的思考块：开着思考发过去是 400
+        let mut r = thinking(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            None,
+            Some(4000),
+        );
+        r.messages = vec![
+            Message {
+                role: Role::User,
+                parts: vec![Part::Text("读 a.rs".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![Part::ToolCall(ToolCall {
+                    id: "tu_1".into(),
+                    name: "Read".into(),
+                    input: ToolInput::Json(json!({"path": "a.rs"})),
+                })],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![Part::ToolResult(ToolResult {
+                    id: "tu_1".into(),
+                    content: vec![Part::Text("fn main() {}".into())],
+                    is_error: false,
+                })],
+            },
+        ];
+        let (v, dropped) = with_dropped(&r);
+        assert!(v.get("additionalModelRequestFields").is_none(), "{v}");
+        assert_eq!(dropped, ["thinking"]);
+    }
+
+    #[test]
+    fn thinking_takes_away_what_claude_refuses_alongside_it() {
+        let mut r = thinking(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            None,
+            Some(4000),
+        );
+        r.temperature = Some(0.5);
+        r.top_p = Some(0.5);
+        r.top_k = Some(40);
+        let (v, dropped) = with_dropped(&r);
+        let cfg = &v["inferenceConfig"];
+        assert!(
+            cfg.get("temperature").is_none() && cfg.get("topP").is_none(),
+            "{cfg}"
+        );
+        assert!(v["additionalModelRequestFields"].get("top_k").is_none());
+        assert_eq!(dropped, ["temperature", "top_p", "top_k"]);
+    }
+
+    #[test]
+    fn claude_gets_temperature_or_top_p_but_not_both() {
+        let both = |model: &str| Request {
+            model: model.into(),
+            temperature: Some(0.3),
+            top_p: Some(0.8),
+            ..Default::default()
+        };
+        let (v, dropped) = with_dropped(&both("us.anthropic.claude-haiku-4-5-20251001-v1:0"));
+        assert_eq!(v["inferenceConfig"]["temperature"], 0.3);
+        assert!(v["inferenceConfig"].get("topP").is_none());
+        assert_eq!(dropped, ["top_p"]);
+
+        // 别的模型两个都认
+        let (v, dropped) = with_dropped(&both("meta.llama3-70b-instruct-v1:0"));
+        assert_eq!(v["inferenceConfig"]["topP"], 0.8);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn cache_points_and_thinking_come_back_from_converse() {
+        let mut before = claude_code_like("us.anthropic.claude-opus-4-6-v1");
+        before.reasoning = Some(Reasoning {
+            enabled: true,
+            effort: Some(Effort::High),
+            budget: None,
+            summary: true,
+        });
+        let (v, _) = with_dropped(&before);
+        let mut d = Dropped::new(Dialect::Bedrock);
+        let after = decode_request(&v, &before.model, false, &mut d).unwrap();
+        assert!(d.is_empty(), "{:?}", d.into_vec());
+        assert_eq!(after.cache, before.cache);
+        assert_eq!(after.reasoning, before.reasoning);
     }
 }

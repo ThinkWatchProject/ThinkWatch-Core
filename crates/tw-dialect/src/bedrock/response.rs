@@ -37,16 +37,27 @@ pub fn stop_reason_str(s: &StopReason) -> &str {
 
 /// Converse 的 `usage` → 中间表示。
 ///
-/// **`inputTokens` 含不含缓存,AWS 没有明说**，但 Bedrock 上跑的是各家原厂模型，
-/// 而 Anthropic 的语义是不含。按不含读:读错的话缓存那部分会被少算，而按含读
-/// 再减一遍，读错时会把正常输入减成负数
+/// `inputTokens` 不含缓存：AWS 的提示缓存文档写明，开了缓存时它只数没进缓存的那部分，
+/// 总输入是它加上读缓存、写缓存的两项 —— 和 Anthropic 的语义一样。
+///
+/// 写缓存按 TTL 的细分在 `cacheDetails` 里（`{inputTokens, ttl}`，`ttl` 是 `5m` 或
+/// `1h`）。1 小时的写入价差不多是 5 分钟的两倍，有一项是 `1h` 就记下来
 pub fn usage(u: &Value) -> Usage {
     let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let cache_1h = u
+        .get("cacheDetails")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|d| {
+            d.get("ttl").and_then(Value::as_str) == Some("1h")
+                && d.get("inputTokens").and_then(Value::as_u64).unwrap_or(0) > 0
+        });
     Usage {
         input: n("inputTokens"),
         cache_read: n("cacheReadInputTokens"),
         cache_write: n("cacheWriteInputTokens"),
-        cache_1h: false,
+        cache_1h,
         output: n("outputTokens"),
         reasoning: 0,
     }
@@ -178,8 +189,12 @@ pub fn error_body(_status: u16, message: &str) -> Value {
     json!({ "message": message })
 }
 
+/// AWS 的错误体里那句话：`message`，有的错误写成 `Message`
 pub fn error_message(v: &Value) -> Option<String> {
-    v.get("message").and_then(Value::as_str).map(str::to_string)
+    v.get("message")
+        .or_else(|| v.get("Message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -259,5 +274,38 @@ mod tests {
         assert_eq!(after.blocks, before.blocks);
         assert_eq!(after.stop, before.stop);
         assert_eq!(after.usage, before.usage);
+    }
+
+    #[test]
+    fn a_one_hour_cache_write_is_told_apart() {
+        let u = usage(&json!({
+            "inputTokens": 10,
+            "cacheReadInputTokens": 0,
+            "cacheWriteInputTokens": 3000,
+            "outputTokens": 5,
+            "cacheDetails": [{"inputTokens": 3000, "ttl": "1h"}]
+        }));
+        assert_eq!((u.input, u.cache_write, u.output), (10, 3000, 5));
+        assert!(u.cache_1h);
+
+        let five = usage(&json!({
+            "inputTokens": 10,
+            "cacheWriteInputTokens": 3000,
+            "outputTokens": 5,
+            "cacheDetails": [{"inputTokens": 3000, "ttl": "5m"}]
+        }));
+        assert!(!five.cache_1h);
+    }
+
+    #[test]
+    fn an_error_message_is_read_in_either_spelling() {
+        assert_eq!(
+            error_message(&json!({"message": "a"})).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            error_message(&json!({"Message": "b"})).as_deref(),
+            Some("b")
+        );
     }
 }
