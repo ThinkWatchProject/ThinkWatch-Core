@@ -439,6 +439,30 @@ async fn a_refused_credential_does_not_pass_on_what_aws_said_about_the_account()
     assert!(body.contains("[ThinkWatch]"), "{body}");
 }
 
+/// AWS 没说是哪种异常：换一句话说，不在句子里填一个英文词组（译文里那一格会是英文）
+#[tokio::test]
+async fn a_refusal_without_an_exception_name_is_its_own_sentence() {
+    let (up, _) = bedrock(Arc::new(|_| {
+        json_answer(
+            403,
+            json!({"message": "User: arn:aws:iam::123456789012:user/alice is not authorized"}),
+        )
+    }))
+    .await;
+    let (gw, _, _) = gateway(with_keys(up)).await;
+    let (status, body) = post(
+        gw,
+        "/v1/messages",
+        &[("x-api-key", "tw-k")],
+        json!({"model": MODEL, "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(!body.contains("123456789012"), "{body}");
+    assert!(body.contains("(HTTP 403)."), "{body}");
+    assert!(!body.contains("exception name"), "{body}");
+}
+
 #[tokio::test]
 async fn cache_points_and_the_betas_bedrock_takes_reach_it() {
     let (up, seen) = bedrock(Arc::new(|_| json_answer(200, converse_reply("ok")))).await;

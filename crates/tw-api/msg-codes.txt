@@ -277,6 +277,7 @@ gw.toolcall.cut
 gw.upstream.aws_profile_expired
 gw.upstream.aws_token_expired
 gw.upstream.bedrock_refused
+gw.upstream.bedrock_refused_unnamed
 gw.upstream.eventstream_broken
 gw.upstream.forward_failed
 gw.upstream.rate_limited

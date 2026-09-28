@@ -800,13 +800,21 @@ async fn bedrock_refusal(
             "[ThinkWatch] The temporary AWS credential of upstream `{upstream}` has expired. \
              Replace its session token and the access keys that came with it."
         ),
-        (other, _) => msg!(
+        (Some(kind), _) => msg!(
             "gw.upstream.bedrock_refused",
-            upstream = provider.name.clone(), status = status.as_u16(),
-            kind = other.unwrap_or("no exception name") =>
+            upstream = provider.name.clone(), status = status.as_u16(), kind = kind =>
             "[ThinkWatch] AWS refused the credential of upstream `{upstream}` (HTTP {status}, \
              {kind}). Check that the credential is valid and may use this model. AWS's own \
              message names the account, so it is not passed on."
+        ),
+        // AWS 没说是哪种异常：另一句话，不拿一个英文词组去填 `{kind}` —— 那一格在译文里
+        // 就是一段没翻译的英文
+        (None, _) => msg!(
+            "gw.upstream.bedrock_refused_unnamed",
+            upstream = provider.name.clone(), status = status.as_u16() =>
+            "[ThinkWatch] AWS refused the credential of upstream `{upstream}` (HTTP {status}). \
+             Check that the credential is valid and may use this model. AWS's own message names \
+             the account, so it is not passed on."
         ),
     };
     for h in ["content-length", "content-type", "transfer-encoding"] {
