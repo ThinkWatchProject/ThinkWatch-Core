@@ -423,6 +423,7 @@ mod tests {
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "p".into(),
+                    model: None,
                     outcome: tw_api::AttemptOutcome::Status,
                     status: Some(503),
                     error: None,
@@ -430,6 +431,7 @@ mod tests {
                 },
                 tw_api::AttemptView {
                     provider: served_by.into(),
+                    model: None,
                     outcome: tw_api::AttemptOutcome::Served,
                     status: Some(200),
                     error: None,

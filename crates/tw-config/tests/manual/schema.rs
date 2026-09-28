@@ -820,8 +820,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Num,
                     Def::Unset,
                     t(
-                        "Input price once a request's input exceeds 200K tokens. Written together with `output_above_200k`, or neither.",
-                        "单次请求输入超过 200K token 后的输入单价。与 `output_above_200k` 同时写或都不写。",
+                        "Input price once a request's input, cache reads and writes included, exceeds 200K tokens. Written together with `output_above_200k`, or neither. Cache prices stay the ones above.",
+                        "单次请求的输入（连同缓存读写）超过 200K token 后的输入单价。与 `output_above_200k` 同时写或都不写；缓存单价仍按上面写的算。",
                     ),
                 ),
                 row(
@@ -829,8 +829,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Num,
                     Def::Unset,
                     t(
-                        "Output price once a request's input exceeds 200K tokens.",
-                        "单次请求输入超过 200K token 后的输出单价。",
+                        "Output price once a request's input, cache reads and writes included, exceeds 200K tokens.",
+                        "单次请求的输入（连同缓存读写）超过 200K token 后的输出单价。",
                     ),
                 ),
             ],

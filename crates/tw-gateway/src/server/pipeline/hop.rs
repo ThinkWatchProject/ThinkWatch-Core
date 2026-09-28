@@ -82,7 +82,12 @@ pub(super) async fn try_upstreams<'a>(
         let hop_started = std::time::Instant::now();
 
         if let Some(err) = protocol_mismatch(req, reading.generates, provider) {
-            chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+            chain.push(hop_failed(
+                &provider.name,
+                None,
+                err.detail.clone(),
+                hop_started,
+            ));
             last_err = Some(err);
             continue;
         }
@@ -115,7 +120,12 @@ pub(super) async fn try_upstreams<'a>(
                 ));
                 // 被拒的这一跳没有发出去。**它在尝试链上**，原因就是那条拒绝 ——
                 // 链上看得出请求本来要去哪家、在哪一步停下的
-                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    None,
+                    err.detail.clone(),
+                    hop_started,
+                ));
                 denied_by = Some(rule);
                 halt = Some(err);
                 break;
@@ -128,10 +138,21 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
+        // 这一跳要发的模型名：规则改写过、和客户端要的不一样的才记（见 `AttemptView::model`）
+        let model = effective_set
+            .model
+            .clone()
+            .filter(|m| *m != reading.facts.model);
+
         let out = match prepare(state, req, reading, provider, &effective_set, id) {
             Ok(out) => out,
             Err(err) => {
-                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    model.clone(),
+                    err.detail.clone(),
+                    hop_started,
+                ));
                 last_err = Some(err);
                 continue;
             }
@@ -158,7 +179,12 @@ pub(super) async fn try_upstreams<'a>(
                     state.health.record_failure(&provider.name),
                 );
                 let err = GatewayError::config(crate::state::credential_failed(e, &provider.name));
-                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    model.clone(),
+                    err.detail.clone(),
+                    hop_started,
+                ));
                 last_err = Some(err);
                 continue;
             }
@@ -177,7 +203,12 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 let err =
                     GatewayError::config(crate::state::credential_failed(e.msg(), &provider.name));
-                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    model.clone(),
+                    err.detail.clone(),
+                    hop_started,
+                ));
                 last_err = Some(err);
                 continue;
             }
@@ -221,6 +252,7 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 chain.push(hop(
                     &provider.name,
+                    model.clone(),
                     tw_api::AttemptOutcome::Status,
                     r.status().as_u16(),
                     hop_started,
@@ -260,6 +292,7 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 chain.push(hop(
                     &provider.name,
+                    model.clone(),
                     tw_api::AttemptOutcome::Served,
                     r.status().as_u16(),
                     hop_started,
@@ -292,7 +325,12 @@ pub(super) async fn try_upstreams<'a>(
                          access keys: {detail}"
                     )),
                 };
-                chain.push(hop_failed(&provider.name, err.detail.clone(), hop_started));
+                chain.push(hop_failed(
+                    &provider.name,
+                    model.clone(),
+                    err.detail.clone(),
+                    hop_started,
+                ));
                 last_err = Some(err);
                 continue;
             }
