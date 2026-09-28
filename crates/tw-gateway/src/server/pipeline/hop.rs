@@ -786,13 +786,21 @@ async fn bedrock_refusal(
         .map(str::to_string);
     let body = r.bytes().await.unwrap_or_default();
     let kind = tw_bedrock::error::kind_of(named.as_deref(), &body);
-    let text = match kind.as_deref() {
-        Some("ExpiredTokenException") => msg!(
+    let profile = provider.aws.as_ref().and_then(|a| a.profile.clone());
+    let text = match (kind.as_deref(), profile) {
+        // profile 的密钥由刷新它的工具写回文件，下一个请求就读新的：不用改配置
+        (Some("ExpiredTokenException"), Some(profile)) => msg!(
+            "gw.upstream.aws_profile_expired",
+            upstream = provider.name.clone(), profile = profile =>
+            "[ThinkWatch] The temporary AWS credential of upstream `{upstream}` has expired. \
+             Refresh AWS profile `{profile}`; the next request reads it again."
+        ),
+        (Some("ExpiredTokenException"), None) => msg!(
             "gw.upstream.aws_token_expired", upstream = provider.name.clone() =>
             "[ThinkWatch] The temporary AWS credential of upstream `{upstream}` has expired. \
              Replace its session token and the access keys that came with it."
         ),
-        other => msg!(
+        (other, _) => msg!(
             "gw.upstream.bedrock_refused",
             upstream = provider.name.clone(), status = status.as_u16(),
             kind = other.unwrap_or("no exception name") =>

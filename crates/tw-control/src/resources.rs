@@ -386,17 +386,19 @@ fn to_provider(
             })
         }
     };
-    // 会话令牌空着就是没有：界面交上来的是一个空的框
+    // 空着的框就是没写：界面交上来的是空串
     let nonblank = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
             .filter(|x| !x.is_empty())
             .map(str::to_string)
     };
+    // 密钥和 profile 二选一由写法检查说（保存时校验）
     let aws = input.aws.as_ref().map(|a| tw_config::Aws {
-        access_key_id: tw_config::Secret::new(a.access_key_id.trim()),
-        secret_access_key: tw_config::Secret::new(a.secret_access_key.trim()),
+        access_key_id: nonblank(&a.access_key_id).map(tw_config::Secret::new),
+        secret_access_key: nonblank(&a.secret_access_key).map(tw_config::Secret::new),
         session_token: nonblank(&a.session_token).map(tw_config::Secret::new),
+        profile: nonblank(&a.profile),
         region: nonblank(&a.region),
     });
     let provider = tw_config::Provider {

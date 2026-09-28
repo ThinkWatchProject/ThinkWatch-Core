@@ -631,7 +631,8 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 写的界面不认那个新事件。
 ///
 /// **28 起有 Bedrock 上游**：[`Protocol`] 多了 `bedrock`，[`ProviderInput::aws`] /
-/// [`ProviderView::aws`]（[`AwsKeys`]：AWS 访问密钥，每个请求签名）、
+/// [`ProviderView::aws`]（[`AwsKeys`]：AWS 访问密钥，写在配置里或者从 AWS 的 profile 读，
+/// 每个请求签名）、
 /// [`ProviderView::region`] 和 [`ProviderPreview::region`]。Bedrock API Key 走
 /// 原来的 `key`，放进 `Authorization: Bearer`。照 27 写的界面解析不了带 `bedrock` 的
 /// 上游列表。
@@ -1711,18 +1712,26 @@ pub struct HeaderView {
     pub value: String,
 }
 
-/// Bedrock 上游的 AWS 访问密钥：每个请求用它们签名（SigV4）。每一项都可以写
-/// `${NAME}` 从环境变量读。视图和保存用的是同一个：配置里写的原样。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Bedrock 上游的 AWS 访问密钥：每个请求用它们签名（SigV4）。视图和保存用的是同一个：
+/// 配置里写的原样。
+///
+/// **两种写法二选一**：密钥写在这里（每一项都可以写 `${NAME}` 从环境变量读），或者
+/// 写一个 `profile`，从 core 所在机器的 AWS 凭证文件里读，文件变了下一个请求就用新的。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AwsKeys {
     /// 访问密钥 ID
-    pub access_key_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
     /// 私有访问密钥
-    pub secret_access_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
     /// 会话令牌：临时凭证才有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
+    /// AWS 凭证文件（`~/.aws/credentials`、`~/.aws/config`）里的 profile 名
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// 签名用的区域。地址是标准的 `https://bedrock-runtime.<区域>.amazonaws.com`
     /// 时不用给，从地址读
     #[serde(default, skip_serializing_if = "Option::is_none")]
