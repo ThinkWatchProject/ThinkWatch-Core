@@ -242,13 +242,11 @@ async fn models_are_listed_in_the_anthropic_shape() {
     assert_eq!(claude["id"], "claude-sonnet-4-5-20250929");
     assert_eq!(claude["display_name"], "Claude Sonnet 4.5");
     assert_eq!(claude["anthropic_family_tier"], "sonnet");
-    assert!(
-        chrono::DateTime::parse_from_rfc3339(claude["created_at"].as_str().unwrap()).is_ok(),
-        "{claude}"
-    );
+    // 发布时间网关不知道，填纪元零点；填请求的时刻的话每秒都不一样
+    assert_eq!(claude["created_at"], "1970-01-01T00:00:00Z");
     // OpenAI 那几个字段照样在
     assert_eq!(claude["object"], "model");
-    assert!(claude["created"].is_u64());
+    assert_eq!(claude["created"], 0);
     // 看不出是 Claude 的：名字就是 ID，也不标档位
     let alias = &data[1];
     assert_eq!(alias["display_name"], "my-alias");
@@ -279,6 +277,7 @@ async fn an_openai_client_still_gets_the_openai_listing() {
     assert_eq!(list["object"], "list");
     let m = &list["data"][0];
     assert_eq!(m["id"], "claude-sonnet-4-5");
+    assert_eq!(m["created"], 0);
     assert!(m.get("type").is_none(), "{m}");
     assert!(list.get("has_more").is_none(), "{list}");
 }
