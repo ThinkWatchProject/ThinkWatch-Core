@@ -43,7 +43,7 @@ struct Hidden;
 
 impl fmt::Debug for Hidden {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("***")
+        f.write_str("<hidden>")
     }
 }
 
