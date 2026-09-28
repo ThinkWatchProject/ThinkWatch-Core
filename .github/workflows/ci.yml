@@ -56,7 +56,7 @@ jobs:
         run: ./scripts/smoke.sh
 
   # **第一层改了，企业版还编得过吗。**企业版钉 core 的 tag、只依赖第一层
-  # （tw-dialect、tw-guard、tw-breaker）。以前要等 core 发版、企业版升级那天
+  # （tw-dialect、tw-guard、tw-breaker、tw-bedrock）。以前要等 core 发版、企业版升级那天
   # 才知道某个改名或删掉的函数把它弄坏了，这里提前到 PR 上。
   #
   # 企业版取和这个 PR 同名的分支 —— 要改接口的一方在企业版开一个同名分支
@@ -78,6 +78,7 @@ jobs:
               - 'crates/tw-dialect/**'
               - 'crates/tw-guard/**'
               - 'crates/tw-breaker/**'
+              - 'crates/tw-bedrock/**'
               - 'Cargo.toml'
               - '.github/workflows/ci.yml'
 
@@ -113,10 +114,20 @@ jobs:
           tw-dialect = { path = "../core/crates/tw-dialect" }
           tw-guard = { path = "../core/crates/tw-guard" }
           tw-breaker = { path = "../core/crates/tw-breaker" }
+          tw-bedrock = { path = "../core/crates/tw-bedrock" }
           TOML
           # 企业版的 Cargo.lock 锁着它钉的那个版本；版本号不同时补丁会被
-          # 静默忽略（只报一条警告），编的还是旧的 core
-          cd enterprise && cargo update -p tw-dialect -p tw-guard -p tw-breaker
+          # 静默忽略（只报一条警告），编的还是旧的 core。
+          #
+          # 只更新企业版确实依赖的：它还没用上的第一层 crate 不在 lock 里，
+          # `cargo update -p` 对它直接报错（补丁用不上只是一条警告）
+          cd enterprise
+          pkgs=()
+          for c in tw-dialect tw-guard tw-breaker tw-bedrock; do
+            if grep -qx "name = \"$c\"" Cargo.lock; then pkgs+=(-p "$c"); fi
+          done
+          echo "updating: ${pkgs[*]}"
+          cargo update "${pkgs[@]}"
 
       - uses: Swatinem/rust-cache@v2
         if: steps.changed.outputs.layer1 == 'true'

@@ -22,7 +22,8 @@ calls an upstream returns.
 desktop app for macOS, Windows and Linux, or as a standalone gateway on a Linux
 server, which ThinkWatch Lite connects to over an encrypted control channel.
 [ThinkWatch Enterprise](https://github.com/ThinkWatchProject/ThinkWatch)
-depends on three of the crates: `tw-dialect`, `tw-guard` and `tw-breaker`.
+depends on four of the crates: `tw-dialect`, `tw-guard`, `tw-breaker` and
+`tw-bedrock`.
 
 Documentation: [configuration reference](docs/config.md) ·
 [running core on a server](docs/server.md) ·
@@ -190,15 +191,15 @@ exposure and uninstalling. Every field of `config.yaml` is described in the
 
 ## Crate layers
 
-The workspace holds sixteen crates and the `twcore` binary in `bin/twcore`.
-It divides the crates in two: the three that ThinkWatch Enterprise depends
+The workspace holds seventeen crates and the `twcore` binary in `bin/twcore`.
+It divides the crates in two: the four that ThinkWatch Enterprise depends
 on, and the crates of the gateway that `twcore` runs, which ThinkWatch
 Enterprise does not use. Within the second part, the crates are grouped by
 role. No crate depends on a group below its own.
 
 | Group | Crates |
 |---|---|
-| Shared with ThinkWatch Enterprise | `tw-dialect` · `tw-guard` · `tw-breaker` |
+| Shared with ThinkWatch Enterprise | `tw-dialect` · `tw-guard` · `tw-breaker` · `tw-bedrock` |
 | Domain logic | `tw-types` · `tw-engine` · `tw-pricing` · `tw-yaml` · `tw-secret` · `tw-watch` |
 | Control-plane contract | `tw-api` · `tw-link` |
 | Assembly | `tw-config` · `tw-store` · `tw-observe` |
@@ -206,9 +207,10 @@ role. No crate depends on a group below its own.
 
 ThinkWatch Enterprise depends on the first group and nothing else: format
 conversion and usage parsing (`tw-dialect`), redaction, tool-call inspection
-and the other protections (`tw-guard`), and the circuit-breaker state machine
-(`tw-breaker`). These three crates depend only on one another; a test enforces
-this, and CI checks that ThinkWatch Enterprise compiles against every change to
+and the other protections (`tw-guard`), the circuit-breaker state machine
+(`tw-breaker`), and what only Amazon Bedrock needs on the wire: SigV4 signing,
+eventstream unframing, its addresses and its model catalog (`tw-bedrock`).
+These four crates depend only on one another; a test enforces this, and CI checks that ThinkWatch Enterprise compiles against every change to
 them. A component that only one product uses lives in that product's
 repository.
 

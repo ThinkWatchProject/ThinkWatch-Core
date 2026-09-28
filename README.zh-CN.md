@@ -12,7 +12,7 @@
 
 ThinkWatch Core 是一组 Rust crate，以及由它们构建的网关二进制 `twcore`。Claude Code、Codex 以及其他使用 Anthropic、OpenAI、Gemini 接口的客户端经由 `twcore` 发出请求；它按规则路由每个请求，在响应开始前故障转移到其他上游，记录每个请求的费用，在请求发出前脱敏其中的密钥，并审查上游返回的工具调用。
 
-`twcore` 既作为本机网关运行在桌面应用 [ThinkWatch Lite](https://github.com/ThinkWatchProject/ThinkWatch-Lite)（macOS、Windows、Linux）中，也可以作为独立网关部署在 Linux 服务器上，由 ThinkWatch Lite 通过加密的控制通道连接。[ThinkWatch 企业版](https://github.com/ThinkWatchProject/ThinkWatch)依赖其中三个 crate：`tw-dialect`、`tw-guard` 和 `tw-breaker`。
+`twcore` 既作为本机网关运行在桌面应用 [ThinkWatch Lite](https://github.com/ThinkWatchProject/ThinkWatch-Lite)（macOS、Windows、Linux）中，也可以作为独立网关部署在 Linux 服务器上，由 ThinkWatch Lite 通过加密的控制通道连接。[ThinkWatch 企业版](https://github.com/ThinkWatchProject/ThinkWatch)依赖其中四个 crate：`tw-dialect`、`tw-guard`、`tw-breaker` 和 `tw-bedrock`。
 
 文档：[配置手册](docs/config.zh-CN.md) · [在服务器上运行 core](docs/server.zh-CN.md) · [thinkwat.ch/zh-CN/core](https://thinkwat.ch/zh-CN/core/)
 
@@ -103,17 +103,17 @@ sudo twcore upgrade --restart                    # 安装最新 Release 并重�
 
 ## crate 分层
 
-工作区共有十六个 crate，`twcore` 二进制位于 `bin/twcore`。这些 crate 分为两部分：ThinkWatch 企业版依赖的三个 crate，以及 `twcore` 所运行网关的其余 crate（ThinkWatch 企业版不使用）。第二部分再按职责分组。任何 crate 都不依赖排在其所在组下方的组。
+工作区共有十七个 crate，`twcore` 二进制位于 `bin/twcore`。这些 crate 分为两部分：ThinkWatch 企业版依赖的四个 crate，以及 `twcore` 所运行网关的其余 crate（ThinkWatch 企业版不使用）。第二部分再按职责分组。任何 crate 都不依赖排在其所在组下方的组。
 
 | 分组 | crate |
 |---|---|
-| 与 ThinkWatch 企业版共用 | `tw-dialect` · `tw-guard` · `tw-breaker` |
+| 与 ThinkWatch 企业版共用 | `tw-dialect` · `tw-guard` · `tw-breaker` · `tw-bedrock` |
 | 领域逻辑 | `tw-types` · `tw-engine` · `tw-pricing` · `tw-yaml` · `tw-secret` · `tw-watch` |
 | 控制面契约 | `tw-api` · `tw-link` |
 | 装配 | `tw-config` · `tw-store` · `tw-observe` |
 | 数据面与控制面 | `tw-gateway` · `tw-control` |
 
-ThinkWatch 企业版只依赖第一组，不依赖其他 crate：格式转换与用量解析（`tw-dialect`），脱敏、工具调用审查及其他防护（`tw-guard`），以及熔断状态机（`tw-breaker`）。这三个 crate 只相互依赖，由测试保证；CI 会针对它们的每一次改动检查 ThinkWatch 企业版能否编译。只有一方使用的组件放在那一方的仓库中。
+ThinkWatch 企业版只依赖第一组，不依赖其他 crate：格式转换与用量解析（`tw-dialect`），脱敏、工具调用审查及其他防护（`tw-guard`），熔断状态机（`tw-breaker`），以及只有 Amazon Bedrock 需要的线上处理：SigV4 签名、eventstream 拆帧、地址与模型目录（`tw-bedrock`）。这四个 crate 只相互依赖，由测试保证；CI 会针对它们的每一次改动检查 ThinkWatch 企业版能否编译。只有一方使用的组件放在那一方的仓库中。
 
 ThinkWatch Lite 把 `tw-api`、`tw-types`、`tw-yaml`、`tw-guard`、`tw-watch` 和 `tw-link` 固定在某个 Release 的 tag 上，并打包同一 Release 的 `twcore`。接管 AI 客户端（把其配置指向网关）、编辑其 MCP 服务器和扫描其配置文件都在 ThinkWatch Lite 中完成：这些操作修改的是应用所在机器上的文件，而这台机器不一定运行着 `twcore`。`twcore` 只负责为每个客户端签发专用的网关密钥。
 

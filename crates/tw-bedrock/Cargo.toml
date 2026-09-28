@@ -1,0 +1,38 @@
+[package]
+name = "tw-bedrock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "What only Amazon Bedrock needs on the wire, for both gateways: SigV4 signing, eventstream to SSE, runtime and control-plane addresses, and the model catalog"
+
+[dependencies]
+# 签名。1.5 起签名不再带 http 0.2，所以不用再关在 feature 后面
+aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true }
+# ConverseStream 的二进制帧：拆帧、校验 CRC
+aws-smithy-eventstream = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+percent-encoding = { workspace = true }
+# 只有模型目录发请求。**不开任何 feature**：TLS、代理这些由调用方的
+# reqwest 决定，共享层不替它选
+reqwest = { version = "0.13", default-features = false }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# 假的控制面，和 core 别处的测试一样手写
+axum = { workspace = true }
+# 造 eventstream 帧
+aws-smithy-types = { workspace = true }
+# 从线上的二进制帧一路走到客户端格式，证明拆帧和方言的约定对得上
+tw-dialect = { workspace = true }
+# 照着 SigV4 规范另算一遍签名：和签名库各写各的，才不会错在一处
+hmac = "0.13"
+sha2 = { workspace = true }
+hex = "0.4"
