@@ -55,26 +55,93 @@ fn zai_key(bare: &str) -> Option<String> {
     bare.starts_with("glm-").then(|| format!("zai/{bare}"))
 }
 
-/// 跨平台的最后一招：Bedrock 的写法。
+/// 跨平台借价：本名查不到时，同一个模型在别的平台上的写法。按「越接近越靠前」排，
+/// 调用方依次查表，第一个命中的算数。
 ///
-/// 数据集里有些模型只有 `anthropic.<名字>-v1:0` 这个键，没有裸名字 ——
-/// `claude-3-5-haiku-20241022` 就是一个，而那是 Claude Code 真的会发的
-/// 模型。查不到它意味着那部分流量的成本整个是空的。
-///
-/// **但这不是等价替换。**本来以为「Bedrock 的单价和直连一样」，一条覆盖
+/// **借来的价格都不是精确的。**本来以为「Bedrock 的单价和直连一样」，一条覆盖
 /// 整份快照的测试当场证伪了：`claude-3-haiku-20240307` 的输入输出价一样，
-/// **缓存价差 17%**（读 3e-8 vs 2.5e-8，写 3e-7 vs 3.125e-7）。
+/// **缓存价差 17%**（读 3e-8 vs 2.5e-8，写 3e-7 vs 3.125e-7）；Claude 4.5 起
+/// Bedrock 的地域推理配置文件（`us.`、`eu.`……）还比全球的贵 10%。
 ///
-/// 所以它单独成一个函数、单独返回：用它算出来的成本一律标成**估算**
-/// （估算值必须在界面上明确标记）。给一个带波浪号的数字，比给一个
-/// 空白有用；而假装它精确，就是那种「看起来很确定的错数字」。
-pub fn cross_platform_fallback(model: &str) -> Option<String> {
-    let bare = model.trim().rsplit('/').next()?;
-    // 只对 Anthropic 的模型。Vertex 的价格差得更多
-    // （`vertex_ai/claude-3-5-haiku` 比 Bedrock 贵 25%），而按名字根本
-    // 分不出用户走的是哪条路 —— 分不出的时候就别猜。
-    bare.starts_with("claude-")
-        .then(|| format!("anthropic.{bare}-v1:0"))
+/// 所以它和 [`candidates`] 分开、单独返回：用它算出来的成本一律标成**估算**
+/// （估算值必须在界面上明确标记）。给一个带波浪号的数字，比给一个空白有用；
+/// 而假装它精确，就是那种「看起来很确定的错数字」。
+///
+/// 三种借法，都只对能证明是同一个模型的写法：
+///
+/// 1. Bedrock 推理配置文件 → 它以之命名的那个模型 id：`us.anthropic.claude-…` →
+///    `anthropic.claude-…`
+/// 2. Bedrock 上 Anthropic 模型的 id → Anthropic 自己的名字：
+///    `anthropic.claude-sonnet-4-5-20250929-v1:0` → `claude-sonnet-4-5-20250929`
+/// 3. Anthropic 的名字 → Bedrock 的 id。数据集里有些模型只有 Bedrock 的键 ——
+///    `claude-3-5-haiku-20241022` 就是一个，而那是 Claude Code 真的会发的模型
+///
+/// 只对 Anthropic 的模型做 2 和 3。Vertex 的价格差得更多（`vertex_ai/claude-3-5-haiku`
+/// 比 Bedrock 贵 25%），别家的模型在 Bedrock 上和直连的名字也对不上 —— 分不出的
+/// 时候就别猜。
+pub fn cross_platform(model: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // ARN 的最后一段就是模型 id 或推理配置文件 id
+    let Some(bare) = model.trim().rsplit('/').next().filter(|b| !b.is_empty()) else {
+        return out;
+    };
+    let mut push = |s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    let id = strip_geo(bare);
+    if let Some(id) = id {
+        push(id.to_string());
+    }
+    if let Some(direct) = anthropic_on_bedrock(id.unwrap_or(bare)) {
+        for c in candidates(direct) {
+            push(c);
+        }
+    }
+    if bare.starts_with("claude-") {
+        push(format!("anthropic.{bare}-v1:0"));
+    }
+    out
+}
+
+/// Bedrock 跨区域推理配置文件的地域前缀。配置文件以它支持的模型命名，前面加
+/// 一段地域：`us.anthropic.claude-…` 就是 `anthropic.claude-…` 在美国几个区域
+/// 之间调度。
+///
+/// **只认这几个**，取自价格数据集里 Bedrock 的键。认不出的前缀不剥 —— 查不到价
+/// 就说查不到。
+const BEDROCK_GEOS: &[&str] = &["us", "eu", "apac", "jp", "au", "us-gov", "global"];
+
+/// 剥掉推理配置文件的地域前缀，剩下的是模型 id。不是配置文件的 `None`。
+fn strip_geo(id: &str) -> Option<&str> {
+    let (geo, rest) = id.split_once('.')?;
+    // 剩下的得还是一个 `厂商.模型` 的 id：`us.x` 这种不是
+    (BEDROCK_GEOS.contains(&geo) && rest.contains('.')).then_some(rest)
+}
+
+/// Bedrock 上 Anthropic 模型的 id 去掉厂商和版本，剩下 Anthropic 自己的名字。
+///
+/// 版本后缀有三种写法：`-v1:0`、`-v1`（`claude-opus-4-6-v1`）、没有（`claude-opus-4-7`）。
+fn anthropic_on_bedrock(id: &str) -> Option<&str> {
+    let name = id.strip_prefix("anthropic.")?;
+    if !name.starts_with("claude-") {
+        return None;
+    }
+    // `rfind` 落在 ASCII 的 `-` 上，是字符边界；版本号只认 ASCII 数字和冒号
+    let Some(i) = name.rfind("-v") else {
+        return Some(name);
+    };
+    let (major, minor) = match name[i + 2..].split_once(':') {
+        Some((a, b)) => (a, Some(b)),
+        None => (&name[i + 2..], None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    if digits(major) && minor.is_none_or(digits) {
+        Some(&name[..i])
+    } else {
+        Some(name)
+    }
 }
 
 /// 结尾是不是一个日期版本号，是就剥掉。
@@ -187,6 +254,66 @@ mod tests {
     fn an_empty_or_whitespace_model_yields_nothing() {
         assert!(candidates("").is_empty());
         assert!(candidates("   ").is_empty());
+        assert!(cross_platform("").is_empty());
+        assert!(cross_platform("arn:aws:bedrock:us-east-1:1:inference-profile/").is_empty());
+    }
+
+    #[test]
+    fn an_inference_profile_borrows_from_its_model_then_from_anthropic() {
+        assert_eq!(
+            cross_platform("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            [
+                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "claude-sonnet-4-5-20250929",
+                "claude-sonnet-4-5",
+            ]
+        );
+        // 系统定义的配置文件的 ARN：最后一段就是它的 id
+        assert_eq!(
+            cross_platform(
+                "arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.anthropic.claude-opus-4-6-v1"
+            )[..2],
+            ["anthropic.claude-opus-4-6-v1", "claude-opus-4-6"]
+        );
+    }
+
+    #[test]
+    fn every_way_bedrock_writes_a_version_comes_off() {
+        for (id, name) in [
+            (
+                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "claude-sonnet-4-5-20250929",
+            ),
+            (
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                "claude-3-5-sonnet-20241022",
+            ),
+            ("anthropic.claude-opus-4-6-v1", "claude-opus-4-6"),
+            ("anthropic.claude-opus-4-7", "claude-opus-4-7"),
+        ] {
+            assert_eq!(cross_platform(id)[0], name, "{id}");
+        }
+    }
+
+    #[test]
+    fn only_known_geographies_and_only_anthropic_models_are_translated() {
+        // 认不出的前缀不剥
+        assert!(cross_platform("xx.anthropic.claude-opus-4-7").is_empty());
+        // 别家的模型：剥得掉地域，但不换成直连的名字
+        assert_eq!(
+            cross_platform("us.amazon.nova-pro-v1:0"),
+            ["amazon.nova-pro-v1:0"]
+        );
+        assert!(cross_platform("amazon.nova-pro-v1:0").is_empty());
+        assert!(cross_platform("gpt-4o").is_empty());
+        assert!(cross_platform("gemini-2.5-pro").is_empty());
+        // 厂商不是地域：`anthropic.` 不剥成别的 id，只换成直连的名字
+        assert_eq!(
+            cross_platform("anthropic.claude-opus-4-7"),
+            ["claude-opus-4-7"]
+        );
+        // 直连的名字 → Bedrock 的键
+        assert_eq!(cross_platform("claude-x"), ["anthropic.claude-x-v1:0"]);
     }
 }
 
@@ -212,6 +339,10 @@ mod multibyte_tests {
             let c = candidates(m);
             assert!(!c.is_empty(), "{m}");
             assert_eq!(c[0], m);
+            // 跨平台借价也会被每个查不到价的模型名调到
+            cross_platform(m);
+            cross_platform(&format!("us.anthropic.{m}-v中"));
+            cross_platform(&format!("anthropic.claude-{m}-v1:中"));
         }
     }
 

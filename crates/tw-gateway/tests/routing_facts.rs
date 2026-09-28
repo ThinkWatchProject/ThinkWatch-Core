@@ -415,3 +415,57 @@ async fn phase_two_rewrites_join_the_routed_record() {
         "{evs:?}"
     );
 }
+
+/// 规则改写了模型名：**尝试链上记着发出去的是哪个** —— 费用按它算，价格未知时
+/// 该补的也是它。没改写的不记，发出去的就是客户端要的那个
+#[tokio::test]
+async fn the_attempt_names_the_model_a_rule_rewrote_the_request_to() {
+    const BEDROCK: &str = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+    let up = upstream().await;
+    let (gw, mut events) = serve(cfg(
+        vec![provider("up", up)],
+        vec![
+            rule(
+                "换成 Bedrock 的名字",
+                "{ model: claude-sonnet-* }",
+                None,
+                Some(SetAction {
+                    model: Some(BEDROCK.into()),
+                    ..Default::default()
+                }),
+                None,
+            ),
+            rule(
+                "原样",
+                "{ model: claude-haiku-* }",
+                None,
+                Some(SetAction {
+                    model: Some("claude-haiku-4-5".into()),
+                    ..Default::default()
+                }),
+                None,
+            ),
+            rule("走池子", "{}", Some("池"), None, None),
+        ],
+    ))
+    .await;
+    let attempts = |evs: &[Event]| {
+        evs.iter()
+            .find_map(|e| match e {
+                Event::RequestRouted { attempts, .. } => Some(attempts.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{evs:?}"))
+    };
+
+    assert_eq!(ask(gw, &chat("claude-sonnet-4-5", "hi")).await, 200);
+    let evs = one_request(&mut events).await;
+    assert_eq!(attempts(&evs)[0].model.as_deref(), Some(BEDROCK));
+
+    // 改写成同一个名字等于没改写
+    assert_eq!(ask(gw, &chat("claude-haiku-4-5", "hi")).await, 200);
+    assert_eq!(attempts(&one_request(&mut events).await)[0].model, None);
+
+    assert_eq!(ask(gw, &chat("claude-opus-4-1", "hi")).await, 200);
+    assert_eq!(attempts(&one_request(&mut events).await)[0].model, None);
+}

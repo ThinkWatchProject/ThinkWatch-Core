@@ -637,11 +637,19 @@ impl Recorder {
         // 占位。按它算出来的钱只会偏低，当成实测会让「今日花费」悄悄少一截。
         let partial = !matches!(how, Ending::Finished { .. });
         let book = self.pricing.load();
-        // **按这个请求实际走的上游查价** —— 同一个模型在不同上游不是同一个价
+        // **按这个请求实际走的上游查价** —— 同一个模型在不同上游不是同一个价。
+        // **按发给它的那个模型名查**：规则把请求改写成另一个模型发出去的，上游
+        // 按那个模型收钱。改写记在服务它的那一跳上（尝试链的最后一跳，见路由事件）
+        let priced_as = p
+            .routing
+            .attempts
+            .last()
+            .and_then(|a| a.model.as_deref())
+            .unwrap_or(&p.model);
         let resolved = if free {
             None
         } else {
-            book.resolve_for(&p.provider, &p.model)
+            book.resolve_for(&p.provider, priced_as)
         };
         let cost = match (&u, &resolved) {
             _ if free => Some(Cost::Known(0)),
@@ -818,6 +826,7 @@ mod tests {
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "官方".into(),
+                    model: None,
                     outcome: tw_api::AttemptOutcome::Error,
                     status: None,
                     error: Some(tw_api::Msg {
@@ -829,6 +838,7 @@ mod tests {
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
+                    model: None,
                     outcome: tw_api::AttemptOutcome::Served,
                     status: Some(200),
                     error: None,
@@ -871,6 +881,7 @@ mod tests {
             denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
+                model: None,
                 outcome: tw_api::AttemptOutcome::Served,
                 status: Some(200),
                 error: None,
@@ -880,6 +891,54 @@ mod tests {
         });
         r.on_event(&finished(2, None));
         assert_eq!(r.db().get(2).unwrap().unwrap().provider, "官方");
+    }
+
+    /// 规则把请求改写成另一个模型发出去：**上游按发出去的那个收钱**，这一行的
+    /// 模型仍是客户端要的那个（按模型的统计看的是客户端要了什么）
+    #[test]
+    fn a_rewritten_request_is_priced_as_the_model_that_was_sent() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(3, "claude-opus-4-20250514"));
+        r.on_event(&Event::RequestRouted {
+            id: 3,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec!["换成 Haiku".into()],
+            denied_by: None,
+            attempts: vec![
+                tw_api::AttemptView {
+                    provider: "官方".into(),
+                    model: Some("claude-sonnet-4-5".into()),
+                    outcome: tw_api::AttemptOutcome::Status,
+                    status: Some(529),
+                    error: None,
+                    ms: 100,
+                },
+                tw_api::AttemptView {
+                    provider: "中转".into(),
+                    model: Some("claude-haiku-4-5".into()),
+                    outcome: tw_api::AttemptOutcome::Served,
+                    status: Some(200),
+                    error: None,
+                    ms: 300,
+                },
+            ],
+            billing: tw_api::Billing::PerToken,
+        });
+        r.on_event(&finished(
+            3,
+            Some(tw_api::UsageView {
+                input: 1000,
+                ..Default::default()
+            }),
+        ));
+        let row = r.db().get(3).unwrap().unwrap();
+        assert_eq!(row.model, "claude-opus-4-20250514");
+        // Haiku 4.5 的输入 $1/百万：一千 token 是 $0.001。按客户端要的 Opus 4 算是
+        // $0.015，按第一跳改写成的 Sonnet 4.5 算是 $0.003
+        assert_eq!(row.cost_micros, Some(1_000));
+        assert!(!row.cost_estimated);
     }
 
     /// **会话由网关在开始时定，这里照记**：落库的和开始事件里说的是同一个值，
@@ -928,6 +987,7 @@ mod tests {
             denied_by: Some("中转不收密钥".into()),
             attempts: vec![tw_api::AttemptView {
                 provider: "中转".into(),
+                model: None,
                 outcome: tw_api::AttemptOutcome::Error,
                 status: None,
                 error: None,
@@ -1271,6 +1331,7 @@ mod billing_tests {
             denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
+                model: None,
                 outcome: tw_api::AttemptOutcome::Served,
                 status: Some(200),
                 error: None,
@@ -1355,6 +1416,7 @@ mod billing_tests {
             denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
+                model: None,
                 outcome: tw_api::AttemptOutcome::Served,
                 status: Some(101),
                 error: None,
@@ -1732,6 +1794,7 @@ mod translation_tests {
                 .iter()
                 .map(|p| tw_api::AttemptView {
                     provider: p.to_string(),
+                    model: None,
                     outcome: tw_api::AttemptOutcome::Served,
                     status: Some(200),
                     error: None,

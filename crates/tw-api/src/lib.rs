@@ -1274,6 +1274,12 @@ slug_enum! {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AttemptView {
     pub provider: String,
+    /// 规则改写了模型名：这一跳发给（没发出去的，要发给）上游的是哪个。没改写的
+    /// 没有 —— 发出去的就是客户端要的那个（`RequestStarted::model`）。
+    ///
+    /// **费用按它算**：请求改写成另一个模型发出去，上游按那个模型收钱。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// WebSocket 的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
     /// 状态码是 `status`，连不上是 `error`。
     pub outcome: AttemptOutcome,
@@ -2295,7 +2301,9 @@ pub struct PriceFields {
     pub cache_read: f64,
     pub cache_write_5m: f64,
     pub cache_write_1h: f64,
-    /// 单次请求输入超过 200K tokens 之后的单价。**成对出现**；没有 = 不分档
+    /// 单次请求的输入（连同缓存读写）超过 200K tokens 之后的单价。**成对出现**；
+    /// 没有 = 没有 200K 这一档（门槛是别的数的档不在这里，见
+    /// `tw_pricing::PerMillion::of`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_above_200k: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

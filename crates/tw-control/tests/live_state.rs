@@ -147,6 +147,7 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
             denied_by: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
+                model: None,
                 outcome: tw_api::AttemptOutcome::Served,
                 status: Some(200),
                 error: None,

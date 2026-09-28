@@ -24,7 +24,7 @@ mod table;
 
 use serde::{Deserialize, Serialize};
 
-pub use book::{PriceBook, Rates, Resolved, Shared, Source, shared};
+pub use book::{Guessed, PriceBook, Rates, Resolved, Shared, Source, shared};
 pub use sheet::{PerMillion, PricingConfig, SheetDef, SheetError};
 pub use table::{SNAPSHOT_DATE, Table, TableSource, UPDATE_URL};
 
@@ -43,11 +43,9 @@ pub struct ModelPrice {
     pub cache_write_5m: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_1h: Option<f64>,
-    /// 长上下文分层。超过 200k 之后单价不同
+    /// 长上下文那一档。没有 = 不分档，多长的请求都按上面那组单价算
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_above_200k: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_above_200k: Option<f64>,
+    pub long: Option<LongTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<u64>,
     /// 一次最多输出多少。转换到必须写 `max_tokens` 的格式（Anthropic）、而客户端
@@ -61,7 +59,28 @@ pub struct ModelPrice {
     pub reasoning: bool,
 }
 
+/// 长上下文那一档：一次请求的输入超过 `above` 个 token，**整个请求**改按这一档的
+/// 单价算，输出也是。
+///
+/// 门槛因模型而异（Claude Sonnet 4/4.5 是 200K，GPT-5.4 起是 272K），数据集把它写在
+/// 键名里。缓存价这一档没写的是 `None`：计费时怎么补见 [`ModelPrice::rates`]。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LongTier {
+    pub above: u64,
+    pub input: f64,
+    pub output: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<f64>,
+}
+
 /// 一次调用用掉了什么。
+///
+/// `input` 是**没走缓存的**那部分：各家报的用量在进来时已经拆好，OpenAI 这类把
+/// 缓存命中算在输入里的，命中的那部分已经挪到了 `cache_read`。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
     pub input: u64,
@@ -70,6 +89,17 @@ pub struct Usage {
     pub cache_write: u64,
     /// 缓存写用的是 1 小时 TTL 吗。**差价接近一倍**，猜不得
     pub cache_1h: bool,
+}
+
+impl Usage {
+    /// 这次请求的输入一共多少：没走缓存的、从缓存读的、写进缓存的。
+    ///
+    /// **长上下文的门槛按它判断。**缓存读写一样占上下文窗口，Anthropic 的 200K
+    /// 门槛数的是这三项之和 —— 只数没走缓存的那部分，一个缓存暖好的 50 万 token
+    /// 的请求会被当成几千 token 的短请求计价。
+    pub fn prompt(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
 }
 
 /// 成本三态。
@@ -107,16 +137,16 @@ pub enum PricingError {
 mod snapshot_invariants {
     use super::*;
 
-    /// **这条测试是一条别名规则的全部依据。**
+    /// **这条测试是跨平台借价的全部依据。**
     ///
-    /// `name::candidates` 最后会试一次 `anthropic.<名字>-v1:0`，因为数据
-    /// 集里有些模型（比如 `claude-3-5-haiku-20241022`）只有那个键。那一
-    /// 步成立的前提是「Bedrock 的单价和直连一样」—— 而那不是我们能假设
-    /// 的事，只能是观察到的事实。
+    /// 查不到本名时，`name::cross_platform` 会在 Anthropic 的名字和 Bedrock 的
+    /// id 之间互相借价，因为数据集里有些模型（比如 `claude-3-5-haiku-20241022`）
+    /// 只有其中一种键。借来的价能用，前提是两边的输入输出价一样 —— 而那不是
+    /// 我们能假设的事，只能是观察到的事实。
     ///
-    /// 所以这里把它变成一条覆盖整份快照的检查：**凡是两种写法都在的模
-    /// 型，四个价格必须逐个相等**。哪天上游的数据不再满足它，这条会先响，
-    /// 而不是等用户发现账单对不上。
+    /// 所以这里把它变成一条覆盖整份快照的检查：**凡是两种写法都在的模型，输入
+    /// 输出价必须相等**；缓存价不一定，所以借来的价一律标成估算。哪天上游的数据
+    /// 不再满足它，这条会先响，而不是等用户发现账单对不上。
     #[test]
     fn bedrock_and_direct_prices_agree_on_the_headline_rates_but_not_on_cache() {
         let t = Table::builtin().unwrap();
@@ -242,11 +272,11 @@ mod cross_platform_tests {
     fn the_fallback_does_not_fire_for_non_anthropic_models() {
         // 按名字根本分不出用户走的是哪条路，而 Vertex 的价格差 25% ——
         // 分不出的时候就别猜。
-        assert!(name::cross_platform_fallback("gpt-4o").is_none());
-        assert!(name::cross_platform_fallback("gemini-2.5-pro").is_none());
+        assert!(name::cross_platform("gpt-4o").is_empty());
+        assert!(name::cross_platform("gemini-2.5-pro").is_empty());
         assert_eq!(
-            name::cross_platform_fallback("claude-x"),
-            Some("anthropic.claude-x-v1:0".to_string())
+            name::cross_platform("claude-x"),
+            ["anthropic.claude-x-v1:0"]
         );
     }
 

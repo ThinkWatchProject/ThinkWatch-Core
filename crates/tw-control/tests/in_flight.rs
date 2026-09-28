@@ -90,6 +90,7 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
         denied_by: None,
         attempts: vec![tw_api::AttemptView {
             provider: "官方".into(),
+            model: None,
             outcome: tw_api::AttemptOutcome::Served,
             status: Some(200),
             error: None,
