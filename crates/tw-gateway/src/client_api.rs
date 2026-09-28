@@ -79,6 +79,15 @@ impl ClientApi {
                 && (p.ends_with(":generateContent") || p.ends_with(":streamGenerateContent")))
     }
 
+    /// 这个路径是不是 Anthropic 的数 token（`/v1/messages/count_tokens`）。
+    ///
+    /// Bedrock 上游接不了它（见 [`crate::error::Source::NotSupported`]）：bedrock-runtime
+    /// 的 CountTokens 只数得了一部分老模型，较新的、只能跨区域推理的那些在那里数不了。
+    pub fn counts_tokens(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        p.strip_prefix("/v1").unwrap_or(p) == "/messages/count_tokens"
+    }
+
     /// 转换库里对应的格式
     pub fn dialect(&self) -> Dialect {
         match self {
@@ -220,6 +229,18 @@ mod tests {
             ("/v1/models/gemini-2.5-flash:countTokens", ClientApi::Gemini),
         ] {
             assert_eq!(ClientApi::of_path(path), Some(want), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_anthropics_count_tokens_path_counts_tokens() {
+        for (path, counts) in [
+            ("/v1/messages/count_tokens", true),
+            ("/messages/count_tokens/", true),
+            ("/v1/messages", false),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", false),
+        ] {
+            assert_eq!(ClientApi::counts_tokens(path), counts, "{path}");
         }
     }
 

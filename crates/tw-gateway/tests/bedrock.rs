@@ -607,3 +607,53 @@ async fn a_speed_test_reports_an_exception_inside_the_stream() {
     assert_eq!(e.code, "l3.stream_failed", "{e:?}");
     assert!(e.text.contains("serviceUnavailableException"), "{e:?}");
 }
+
+/// Anthropic 的数 token 到了 Bedrock 上游：回 501 `not_supported`，**什么都不发给 AWS**。
+/// Claude Code 认这个回答，会改用一次 `max_tokens: 1` 的请求来数；回 400 的话它当成
+/// 请求写错了
+#[tokio::test]
+async fn counting_tokens_is_not_supported_the_way_claude_code_expects() {
+    let (up, seen) = bedrock(Arc::new(|s: &Seen| {
+        let path = s.uri.split('?').next().unwrap();
+        match path {
+            "/foundation-models" => json_answer(200, json!({"modelSummaries": []})),
+            "/inference-profiles" => json_answer(
+                200,
+                json!({"inferenceProfileSummaries": [{"inferenceProfileId": MODEL}]}),
+            ),
+            _ => json_answer(500, json!({"message": "nothing else should arrive"})),
+        }
+    }))
+    .await;
+    let (gw, state, _) = gateway(with_keys(up)).await;
+    let body = json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]});
+    let count = |body: Value| {
+        post(
+            gw,
+            "/v1/messages/count_tokens",
+            &[("x-api-key", "tw-k")],
+            body,
+        )
+    };
+
+    // 模型清单还没取到：选上游时认出来
+    let (status, text) = count(body.clone()).await;
+    assert_eq!(status, 501, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["error"]["type"], "not_supported", "{text}");
+    assert!(text.contains("upstream `br`"), "{text}");
+
+    // 取到了：准入时就认出来
+    tw_gateway::models::refresh_one(&state, "br").await.unwrap();
+    let (status, text) = count(body).await;
+    assert_eq!(status, 501, "{text}");
+    assert!(
+        text.contains("only AWS Bedrock upstreams serve it"),
+        "{text}"
+    );
+
+    assert!(
+        seen.lock().unwrap().iter().all(|s| s.method == "GET"),
+        "counting tokens reached AWS"
+    );
+}

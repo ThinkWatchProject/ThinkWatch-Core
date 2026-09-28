@@ -404,6 +404,19 @@ fn protocol_mismatch(
     if a.protocol() == p {
         return None;
     }
+    // 数 token 到了 Bedrock 上游：501 `not_supported`，客户端会改用别的办法数（见
+    // `Source::NotSupported`）。**同样不发出去**
+    if p == tw_config::Protocol::Bedrock
+        && crate::client_api::ClientApi::counts_tokens(req.uri.path())
+    {
+        return Some(GatewayError::new(
+            crate::error::Source::NotSupported,
+            msg!(
+                "gw.count_tokens.bedrock_upstream", upstream = provider.name.clone() =>
+                "Counting tokens is not available through AWS Bedrock upstream `{upstream}`."
+            ),
+        ));
+    }
     Some(GatewayError::new(
         crate::error::Source::Request,
         msg!(
