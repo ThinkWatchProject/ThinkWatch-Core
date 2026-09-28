@@ -35,6 +35,10 @@ const SCHEMA: i64 = 22;
 const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
                          AND billing = 'per-token')";
 
+/// 这一行按哪个模型名查的价：改写过的是发给上游的那个，没改写的是客户端要的那个
+/// （见 `tw_store::recorder` 里的算钱那一段）
+const PRICED_AS: &str = "COALESCE(json_extract(routing, '$.attempts[#-1].model'), model)";
+
 /// 这一行算不出钱，**因为没有拿到用量**：上游没报，或者连接在它报之前就
 /// 结束了（客户端取消、WebSocket 会话）。配价格解决不了它，而它多半花了钱，
 /// 合计里缺着它 —— 所以要单独数出来，不能混进「没有价格」，也不能不数。
@@ -599,10 +603,15 @@ impl Db {
             |r| r.get(0),
         )?;
         // **按 (上游, 模型) 分。**同一个模型在不同上游按不同的价目表计价，
-        // 该在哪张表里补价格取决于它走的是哪家
+        // 该在哪张表里补价格取决于它走的是哪家。
+        //
+        // **模型是查价用的那个名字**：规则改写过的，是发给上游的那个（记在尝试链
+        // 最后一跳上，见 `tw_api::AttemptView::model`）—— 该补价格的是它，照着
+        // 客户端要的名字补，补了也还是算不出钱
         let mut st = self.conn.prepare(&format!(
-            "SELECT provider, model, COUNT(*) AS n FROM requests WHERE {filter} \
-             GROUP BY provider, model ORDER BY n DESC, provider, model LIMIT 20"
+            "SELECT provider, {PRICED_AS} AS priced_as, COUNT(*) AS n FROM requests \
+             WHERE {filter} GROUP BY provider, priced_as \
+             ORDER BY n DESC, provider, priced_as LIMIT 20"
         ))?;
         let rows = st.query_map([since], |r| {
             Ok(tw_api::UnpricedModel {
@@ -2375,6 +2384,42 @@ mod cost_state_tests {
                 requests: 1,
             }]
         );
+    }
+
+    /// 改写过模型名的请求按发出去的那个名字查价，**列出来的也得是那个名字** ——
+    /// 照着客户端要的名字补价格，那几行照样算不出钱
+    #[test]
+    fn the_pricing_page_names_the_model_that_was_sent() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let db = Db::in_memory().unwrap();
+        let arn = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/a1b2c3";
+        let mut r = unknown_model(1, now);
+        r.model = "claude-sonnet-4-5".into();
+        r.routing = Some(
+            serde_json::to_string(&tw_api::RoutingView {
+                attempts: vec![tw_api::AttemptView {
+                    provider: "官方".into(),
+                    model: Some(arn.into()),
+                    outcome: tw_api::AttemptOutcome::Served,
+                    status: Some(200),
+                    error: None,
+                    ms: 1,
+                }],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        db.insert(&r).unwrap();
+        // 没改写的照旧是客户端要的名字
+        db.insert(&unknown_model(2, now)).unwrap();
+        let (n, models) = db.unpriced_recent(7).unwrap();
+        assert_eq!(n, 2);
+        let mut names: Vec<_> = models.into_iter().map(|m| m.model).collect();
+        names.sort();
+        assert_eq!(names, [arn, "中转站自己起的名字"]);
     }
 
     /// 列表有上限，总数没有。

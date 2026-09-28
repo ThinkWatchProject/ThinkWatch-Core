@@ -411,8 +411,8 @@ proxies:
 | `cache_read` | 数字 | **必填** | 每百万缓存读取 token 的美元价格。 |
 | `cache_write_5m` | 数字 | **必填** | 每百万写入 5 分钟缓存 token 的美元价格。 |
 | `cache_write_1h` | 数字 | **必填** | 每百万写入 1 小时缓存 token 的美元价格。 |
-| `input_above_200k` | 数字 | — | 单次请求输入超过 200K token 后的输入单价。与 `output_above_200k` 同时写或都不写。 |
-| `output_above_200k` | 数字 | — | 单次请求输入超过 200K token 后的输出单价。 |
+| `input_above_200k` | 数字 | — | 单次请求的输入（连同缓存读写）超过 200K token 后的输入单价。与 `output_above_200k` 同时写或都不写；缓存单价仍按上面写的算。 |
+| `output_above_200k` | 数字 | — | 单次请求的输入（连同缓存读写）超过 200K token 后的输出单价。 |
 <!-- /generated -->
 
 ```yaml

@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use tw_types::{Msg, msg};
 
-use crate::ModelPrice;
+use crate::{LongTier, ModelPrice};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,7 +94,7 @@ pub struct PerMillion {
     pub cache_read: f64,
     pub cache_write_5m: f64,
     pub cache_write_1h: f64,
-    /// 单次请求输入超过 200K tokens 之后的单价
+    /// 单次请求的输入（连同缓存读写）超过 200K tokens 之后的单价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_above_200k: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,8 +264,19 @@ impl PerMillion {
             cache_read: Some(self.cache_read * M),
             cache_write_5m: Some(self.cache_write_5m * M),
             cache_write_1h: Some(self.cache_write_1h * M),
-            input_above_200k: self.input_above_200k.map(|v| v * M),
-            output_above_200k: self.output_above_200k.map(|v| v * M),
+            long: self
+                .input_above_200k
+                .zip(self.output_above_200k)
+                .map(|(input, output)| LongTier {
+                    above: 200_000,
+                    input: input * M,
+                    output: output * M,
+                    // 按写的算：长上下文那一档没单独写缓存价，长请求的缓存也按上面
+                    // 写的那组算，不按比例推
+                    cache_read: Some(self.cache_read * M),
+                    cache_write_5m: Some(self.cache_write_5m * M),
+                    cache_write_1h: Some(self.cache_write_1h * M),
+                }),
             max_input_tokens: base.and_then(|b| b.max_input_tokens),
             max_output_tokens: base.and_then(|b| b.max_output_tokens),
             // 覆盖价只改单价：模型会不会推理不是价格的一部分
@@ -277,20 +288,24 @@ impl PerMillion {
     ///
     /// 数据集里没单独定价的缓存档按计费时的同一套规则补上（见
     /// [`ModelPrice::rates`]）—— 显示出来的数字和记账用的必须是同一个。
+    ///
+    /// 长上下文只给 200K 那一档：这两个字段说的就是 200K。门槛是别的数的（GPT-5.4
+    /// 起是 272K）照样按它计费，只是不在这里显示 —— 显示成 200K 就是错的。
     pub fn of(p: &ModelPrice) -> Self {
         const M: f64 = 1e6;
         // 浮点换算会带出 `2.9999999999999996` 这种尾巴 —— 这个数要显示给人看，
         // 也可能被写回配置。十位小数足够表示任何真实的单价
         let r = |v: f64| (v * M * 1e10).round() / 1e10;
-        let rates = p.rates(false);
+        let rates = p.rates(0);
+        let long = p.long.as_ref().filter(|t| t.above == 200_000);
         Self {
             input: r(rates.input),
             output: r(rates.output),
             cache_read: r(rates.cache_read),
             cache_write_5m: r(rates.cache_write_5m),
             cache_write_1h: r(rates.cache_write_1h),
-            input_above_200k: p.input_above_200k.map(r),
-            output_above_200k: p.output_above_200k.map(r),
+            input_above_200k: long.map(|t| r(t.input)),
+            output_above_200k: long.map(|t| r(t.output)),
         }
     }
 }
@@ -386,8 +401,44 @@ mod tests {
         assert_eq!(per_m(p.cache_read), Some(0.25));
         assert_eq!(per_m(p.cache_write_5m), Some(2.0));
         // 没写长上下文单价就是不分档
-        assert_eq!(p.input_above_200k, None);
+        assert_eq!(p.long, None);
         assert_eq!(p.max_input_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn an_override_with_a_long_tier_charges_its_cache_as_written() {
+        let p = PerMillion {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write_5m: 3.75,
+            cache_write_1h: 6.0,
+            input_above_200k: Some(6.0),
+            output_above_200k: Some(22.5),
+        }
+        .to_price(None);
+        let long = p.rates(300_000);
+        let per_m = |v: f64| (v * 1e6 * 1e6).round() / 1e6;
+        assert_eq!(per_m(long.input), 6.0);
+        // 写的是 0.3 就是 0.3：覆盖价不按比例推
+        assert_eq!(per_m(long.cache_read), 0.3);
+        assert_eq!(long.guessed, crate::Guessed::default());
+    }
+
+    #[test]
+    fn a_tier_that_is_not_200k_is_not_shown_as_200k() {
+        let p = ModelPrice {
+            input: 5e-6,
+            output: 3e-5,
+            long: Some(LongTier {
+                above: 272_000,
+                input: 1e-5,
+                output: 4.5e-5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(PerMillion::of(&p).input_above_200k, None);
     }
 
     #[test]
@@ -402,8 +453,8 @@ mod tests {
         let v = PerMillion::of(&p);
         assert_eq!(v.cache_read, 1.0);
         assert_eq!(v.cache_write_5m, 1.25);
-        // 1 小时档没有就按 5 分钟档
-        assert_eq!(v.cache_write_1h, 1.25);
+        // 1 小时档没有：按输入价的 2 倍（Anthropic 公布的倍率）
+        assert_eq!(v.cache_write_1h, 2.0);
         // 显示的和写回去的是同一组数：换算一个来回不变
         assert_eq!(PerMillion::of(&v.to_price(None)), v);
     }

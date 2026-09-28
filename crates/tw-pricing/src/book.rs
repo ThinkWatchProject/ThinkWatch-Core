@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{Cost, Micros, ModelPrice, PricingConfig, SheetDef, Table, Usage, name, to_micros};
+use crate::{
+    Cost, LongTier, Micros, ModelPrice, PricingConfig, SheetDef, Table, Usage, name, to_micros,
+};
 
 /// 全进程共用的那一份，可以原子地整份换掉。
 pub type Shared = Arc<arc_swap::ArcSwap<PriceBook>>;
@@ -220,7 +222,7 @@ impl PriceBook {
 }
 
 impl ModelPrice {
-    /// 所有单价乘上同一个倍率。上下文窗口不变。
+    /// 所有单价乘上同一个倍率，长上下文那一档也乘。门槛和上下文窗口不变。
     pub fn scaled(&self, m: f64) -> ModelPrice {
         ModelPrice {
             input: self.input * m,
@@ -228,34 +230,72 @@ impl ModelPrice {
             cache_read: self.cache_read.map(|v| v * m),
             cache_write_5m: self.cache_write_5m.map(|v| v * m),
             cache_write_1h: self.cache_write_1h.map(|v| v * m),
-            input_above_200k: self.input_above_200k.map(|v| v * m),
-            output_above_200k: self.output_above_200k.map(|v| v * m),
+            long: self.long.as_ref().map(|t| LongTier {
+                above: t.above,
+                input: t.input * m,
+                output: t.output * m,
+                cache_read: t.cache_read.map(|v| v * m),
+                cache_write_5m: t.cache_write_5m.map(|v| v * m),
+                cache_write_1h: t.cache_write_1h.map(|v| v * m),
+            }),
             max_input_tokens: self.max_input_tokens,
             max_output_tokens: self.max_output_tokens,
             reasoning: self.reasoning,
         }
     }
 
-    /// 实际计费用的每 token 单价。`long`：这次请求落在长上下文那一档。
+    /// 实际计费用的每 token 单价。`prompt`：这次请求的输入一共多少（见
+    /// [`Usage::prompt`]），超过长上下文的门槛就按那一档算。
     ///
-    /// **计费和显示都走这里**，数据集里没单独定价的档在这里按它的约定补上：
-    /// 缓存读写没有单独价 = 按输入价算（那是「这家不区分」，不是「免费」）；
-    /// 1 小时写入没有 = 按 5 分钟写入算（**退回时只会低估**）。
-    pub fn rates(&self, long: bool) -> Rates {
-        let input = match self.input_above_200k {
-            Some(v) if long => v,
-            _ => self.input,
+    /// **计费和显示都走这里**，价目表上没写的单价在这里按下面的规则补上。补出来
+    /// 的记在 [`Rates::guessed`] 里，用到它们的费用标成估算：
+    ///
+    /// - 缓存读写一个单价都没写：按输入价算。那是「这家不区分」，不是「免费」，
+    ///   也不是猜的
+    /// - 1 小时写入没写、5 分钟的写了：按输入价的 2 倍算。1 小时缓存只有 Claude
+    ///   有，这是 Anthropic 公布的倍率 —— 以前退回 5 分钟档的价，会少算三成多
+    /// - 长上下文那一档没写缓存价：平档的缓存价按这一档输入价涨的比例放大。各家
+    ///   的长上下文都是这么涨的（Claude、Gemini、GPT-5.x 在数据集里都是）
+    pub fn rates(&self, prompt: u64) -> Rates {
+        let tier = self.long.as_ref().filter(|t| prompt > t.above);
+        let (input, output) = match tier {
+            Some(t) => (t.input, t.output),
+            None => (self.input, self.output),
         };
-        let output = match self.output_above_200k {
-            Some(v) if long => v,
-            _ => self.output,
+        // 平档的缓存价放大到这一档：输入价涨了多少倍就涨多少倍
+        let grow = |v: f64| {
+            if self.input > 0.0 {
+                v * input / self.input
+            } else {
+                v
+            }
         };
+        // 这一档写了的就用，没写的从平档推
+        let pick = |flat: Option<f64>, long: Option<Option<f64>>| match long {
+            None => (flat, false),
+            Some(Some(v)) => (Some(v), false),
+            Some(None) => (flat.map(grow), flat.is_some()),
+        };
+        let (read, read_guessed) = pick(self.cache_read, tier.map(|t| t.cache_read));
+        let (write_5m, write_5m_guessed) =
+            pick(self.cache_write_5m, tier.map(|t| t.cache_write_5m));
+        let (write_1h, write_1h_guessed) =
+            match pick(self.cache_write_1h, tier.map(|t| t.cache_write_1h)) {
+                (Some(v), guessed) => (v, guessed),
+                (None, _) if write_5m.is_some() => (2.0 * input, true),
+                (None, _) => (input, false),
+            };
         Rates {
             input,
             output,
-            cache_read: self.cache_read.unwrap_or(input),
-            cache_write_5m: self.cache_write_5m.unwrap_or(input),
-            cache_write_1h: self.cache_write_1h.or(self.cache_write_5m).unwrap_or(input),
+            cache_read: read.unwrap_or(input),
+            cache_write_5m: write_5m.unwrap_or(input),
+            cache_write_1h: write_1h,
+            guessed: Guessed {
+                cache_read: read_guessed,
+                cache_write_5m: write_5m_guessed,
+                cache_write_1h: write_1h_guessed,
+            },
         }
     }
 }
@@ -268,6 +308,16 @@ pub struct Rates {
     pub cache_read: f64,
     pub cache_write_5m: f64,
     pub cache_write_1h: f64,
+    /// 哪几项是推出来的、不是价目表上写的。**用到了它们的费用标成估算**
+    pub guessed: Guessed,
+}
+
+/// 推出来的缓存单价。输入输出价从来不推：没有它们就没有这个模型的价格。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Guessed {
+    pub cache_read: bool,
+    pub cache_write_5m: bool,
+    pub cache_write_1h: bool,
 }
 
 impl Rates {
@@ -278,18 +328,29 @@ impl Rates {
             self.cache_write_5m
         }
     }
+
+    /// 这些用量用到了推出来的单价吗
+    fn guessed_for(&self, u: &Usage) -> bool {
+        let g = self.guessed;
+        let write = if u.cache_1h {
+            g.cache_write_1h
+        } else {
+            g.cache_write_5m
+        };
+        (u.cache_read > 0 && g.cache_read) || (u.cache_write > 0 && write)
+    }
 }
 
 /// 按一个单价算一次调用的成本。
 pub(crate) fn cost_of(p: &ModelPrice, u: &Usage, estimated: bool) -> Cost {
-    // 长上下文分层：**按这次请求的输入量选档**，不是按模型的窗口。
-    let r = p.rates(u.input > 200_000);
+    // 长上下文分层：**按这次请求的输入量选档**（连同缓存读写），不是按模型的窗口。
+    let r = p.rates(u.prompt());
     let usd = u.input as f64 * r.input
         + u.output as f64 * r.output
         + u.cache_read as f64 * r.cache_read
         + u.cache_write as f64 * r.cache_write(u.cache_1h);
     let m = to_micros(usd);
-    if estimated {
+    if estimated || r.guessed_for(u) {
         Cost::Estimated(m)
     } else {
         Cost::Known(m)
@@ -302,9 +363,11 @@ pub(crate) fn cost_of(p: &ModelPrice, u: &Usage, estimated: bool) -> Cost {
 /// 省下的（读是 0.1 倍单价），以及写入多花的（**写是 1.25 倍单价，不是
 /// 免费的**）。所以它可以是负数，而负数是一条结论：这个用法上缓存在亏钱。
 ///
+/// 不用缓存的话这些 token 全是输入，**输入总量不变**，落在哪一档也不变。
+///
 /// 没有单独的缓存价时没有节省或溢价 —— 那时它本来就按输入价算。
 pub(crate) fn saving_of(p: &ModelPrice, u: &Usage) -> Micros {
-    let r = p.rates(u.input + u.cache_read > 200_000);
+    let r = p.rates(u.prompt());
     let saved = u.cache_read as f64 * (r.input - r.cache_read);
     let spent = u.cache_write as f64 * (r.cache_write(u.cache_1h) - r.input);
     to_micros(saved - spent)
@@ -400,15 +463,125 @@ sheets:
     }
 
     #[test]
-    fn a_long_request_is_charged_at_the_long_context_rates_including_its_cache_reads() {
-        // 数据集里 Sonnet 4.5 有长上下文档、但没有单独的长上下文缓存价
+    fn a_long_request_is_charged_at_the_long_context_rates_including_its_cache() {
+        // 数据集里 Sonnet 4.5 的长上下文档连缓存读写都有单独的价
         let b = book("{}", &[]);
         let r = b.resolve(None, "claude-sonnet-4-5").unwrap();
-        let long = r.price.rates(true);
+        let long = r.price.rates(200_001);
         assert_eq!(per_m(long.input), 6.0);
         assert_eq!(per_m(long.output), 22.5);
-        let short = r.price.rates(false);
+        assert_eq!(per_m(long.cache_read), 0.6);
+        assert_eq!(per_m(long.cache_write_5m), 7.5);
+        assert_eq!(per_m(long.cache_write_1h), 12.0);
+        assert_eq!(long.guessed, Guessed::default());
+        // 正好 200K 还是平档：「超过」才换档
+        let short = r.price.rates(200_000);
+        assert_eq!(per_m(short.input), 3.0);
         assert_eq!(per_m(short.cache_read), 0.3);
+    }
+
+    #[test]
+    fn the_threshold_counts_cache_reads_and_writes_too() {
+        // 一个缓存暖好的长请求：没走缓存的只有几千 token，加上缓存读写过了 200K。
+        // **只数没走缓存的那部分，它会被当成短请求按半价记**
+        let b = book("{}", &[]);
+        let u = Usage {
+            input: 5_000,
+            cache_read: 190_000,
+            cache_write: 10_000,
+            output: 1_000,
+            cache_1h: false,
+        };
+        let Cost::Known(m) = b.cost_for("anthropic", "claude-sonnet-4-5", &u, false) else {
+            panic!()
+        };
+        // 5000×6 + 190000×0.6 + 10000×7.5 + 1000×22.5，每百万 token 的美元
+        assert_eq!(m, 30_000 + 114_000 + 75_000 + 22_500);
+    }
+
+    #[test]
+    fn a_one_hour_write_without_its_own_price_is_twice_the_input_and_an_estimate() {
+        // Bedrock 上的 Sonnet 4 在数据集里没有 1 小时写入的价
+        let b = book("{}", &[]);
+        let r = b
+            .resolve(None, "us.anthropic.claude-sonnet-4-20250514-v1:0")
+            .unwrap();
+        assert!(!r.cross_platform, "本名就在数据集里");
+        assert_eq!(r.price.cache_write_1h, None);
+        assert_eq!(per_m(r.price.rates(0).cache_write_1h), 6.0);
+        let one_hour = Usage {
+            input: 1_000,
+            cache_write: 1_000,
+            cache_1h: true,
+            ..Default::default()
+        };
+        assert!(matches!(r.cost(&one_hour, false), Cost::Estimated(_)));
+        // 5 分钟的写入有价，照样是精确的
+        let five_minutes = Usage {
+            cache_1h: false,
+            ..one_hour
+        };
+        assert!(matches!(r.cost(&five_minutes, false), Cost::Known(_)));
+    }
+
+    #[test]
+    fn a_long_tier_without_cache_prices_grows_the_flat_ones_and_says_so() {
+        let t = Table::fetched(
+            br#"{"m": {"input_cost_per_token": 1e-6, "output_cost_per_token": 4e-6,
+                       "cache_read_input_token_cost": 1e-7,
+                       "input_cost_per_token_above_128k_tokens": 2e-6,
+                       "output_cost_per_token_above_128k_tokens": 6e-6}}"#,
+            "d".into(),
+        )
+        .unwrap();
+        let b = PriceBook::new(Arc::new(t), PricingConfig::default(), []);
+        let r = b.resolve(None, "m").unwrap();
+        let long = r.price.rates(128_001);
+        assert_eq!(per_m(long.cache_read), 0.2, "输入价翻倍，缓存读也翻倍");
+        assert!(long.guessed.cache_read);
+        // 没用到缓存读的长请求：推出来的那一项没用上，照样精确
+        let u = Usage {
+            input: 130_000,
+            ..Default::default()
+        };
+        assert!(matches!(r.cost(&u, false), Cost::Known(_)));
+        let u = Usage { cache_read: 1, ..u };
+        assert!(matches!(r.cost(&u, false), Cost::Estimated(_)));
+    }
+
+    #[test]
+    fn a_sheet_scales_the_long_context_tier_but_not_its_threshold() {
+        let b = book(SHEETS, &[("relay-hk", "中转协议价")]);
+        let r = b.resolve_for("relay-hk", "claude-sonnet-4-5").unwrap();
+        let long = r.price.long.unwrap();
+        assert_eq!(long.above, 200_000);
+        assert_eq!(per_m(long.input), 4.8);
+        assert_eq!(long.cache_read.map(per_m), Some(0.48));
+    }
+
+    #[test]
+    fn a_bedrock_profile_missing_from_the_table_borrows_and_is_marked_estimated() {
+        let b = book("{}", &[]);
+        // 数据集里有这个配置文件自己的键：按它的价，精确
+        let r = b
+            .resolve(None, "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .unwrap();
+        assert!(!r.cross_platform);
+        assert_eq!(per_m(r.price.input), 3.3, "地域配置文件比全球的贵 10%");
+        // 数据集里没有 APAC 的 Sonnet 4.5：借模型本身的价，标成估算
+        let r = b
+            .resolve(None, "apac.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .unwrap();
+        assert!(r.cross_platform);
+        assert_eq!(per_m(r.price.input), 3.0);
+        // 应用推理配置文件的 ARN 看不出是哪个模型：查不到就说查不到
+        assert!(
+            b.resolve(
+                None,
+                "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/a1b2c3"
+            )
+            .is_none()
+        );
     }
 
     #[test]

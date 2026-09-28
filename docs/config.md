@@ -523,8 +523,8 @@ pages. Every field is written out; nothing is inferred when pricing.
 | `cache_read` | number | **required** | US dollars per million tokens read from the prompt cache. |
 | `cache_write_5m` | number | **required** | US dollars per million tokens written to a 5-minute cache. |
 | `cache_write_1h` | number | **required** | US dollars per million tokens written to a 1-hour cache. |
-| `input_above_200k` | number | — | Input price once a request's input exceeds 200K tokens. Written together with `output_above_200k`, or neither. |
-| `output_above_200k` | number | — | Output price once a request's input exceeds 200K tokens. |
+| `input_above_200k` | number | — | Input price once a request's input, cache reads and writes included, exceeds 200K tokens. Written together with `output_above_200k`, or neither. Cache prices stay the ones above. |
+| `output_above_200k` | number | — | Output price once a request's input, cache reads and writes included, exceeds 200K tokens. |
 <!-- /generated -->
 
 ```yaml

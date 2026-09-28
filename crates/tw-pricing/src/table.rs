@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::{ModelPrice, PricingError, name};
+use crate::{LongTier, ModelPrice, PricingError, name};
 
 /// 内置快照。**pin 在一个具体的 commit 上**，来历见 `data/PROVENANCE.md`。
 const SNAPSHOT: &[u8] = include_bytes!("../data/model_prices.json.gz");
@@ -97,9 +97,11 @@ impl Table {
                 return Some((p, false));
             }
         }
-        // 跨平台的最后一招。**它不精确**，见 name::cross_platform_fallback
-        let c = name::cross_platform_fallback(model)?;
-        self.prices.get(&c).map(|p| (p, true))
+        // 跨平台借价。**它不精确**，见 name::cross_platform
+        name::cross_platform(model)
+            .iter()
+            .find_map(|c| self.prices.get(c))
+            .map(|p| (p, true))
     }
 
     pub fn get(&self, model: &str) -> Option<&ModelPrice> {
@@ -171,14 +173,43 @@ fn price_from(v: &serde_json::Value) -> Option<ModelPrice> {
         cache_read: f("cache_read_input_token_cost"),
         cache_write_5m: f("cache_creation_input_token_cost"),
         cache_write_1h: f("cache_creation_input_token_cost_above_1hr"),
-        input_above_200k: f("input_cost_per_token_above_200k_tokens"),
-        output_above_200k: f("output_cost_per_token_above_200k_tokens"),
+        long: long_tier(v, output),
         max_input_tokens: v.get("max_input_tokens").and_then(|x| x.as_u64()),
         max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
         reasoning: v
             .get("supports_reasoning")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+    })
+}
+
+/// 长上下文那一档。数据集把门槛写在键名里：`input_cost_per_token_above_200k_tokens`、
+/// `…_above_272k_tokens`。
+///
+/// **有输入单价才算有这一档**；输出没单独写的按平档的算。数据集里一个模型最多
+/// 一档，真有两档的话取门槛低的那一档 —— 多出来的那档不认，比认错了强。服务等级
+/// 的变体（`…_priority`、`…_flex`）不是这一档，不认。
+fn long_tier(v: &serde_json::Value, output: f64) -> Option<LongTier> {
+    let obj = v.as_object()?;
+    let k = obj
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix("input_cost_per_token_above_")?
+                .strip_suffix("k_tokens")?
+                .parse::<u64>()
+                .ok()
+        })
+        .min()?;
+    let f = |key: String| obj.get(&key).and_then(|x| x.as_f64());
+    Some(LongTier {
+        above: k * 1000,
+        input: f(format!("input_cost_per_token_above_{k}k_tokens"))?,
+        output: f(format!("output_cost_per_token_above_{k}k_tokens")).unwrap_or(output),
+        cache_read: f(format!("cache_read_input_token_cost_above_{k}k_tokens")),
+        cache_write_5m: f(format!("cache_creation_input_token_cost_above_{k}k_tokens")),
+        cache_write_1h: f(format!(
+            "cache_creation_input_token_cost_above_1hr_above_{k}k_tokens"
+        )),
     })
 }
 
@@ -236,5 +267,45 @@ mod tests {
         // b 改价、c 新增、gone 不在了；a 没变
         assert_eq!(new.changed_from(&old), 3);
         assert_eq!(new.changed_from(&new), 0);
+    }
+
+    #[test]
+    fn the_long_context_tier_is_read_with_its_threshold_and_cache_prices() {
+        let t = Table::builtin().unwrap();
+        let per_m = |v: f64| (v * 1e6 * 1e6).round() / 1e6;
+        // Claude Sonnet 4.5：200K 一档，缓存读写也有这一档的价
+        let long = t
+            .exact("claude-sonnet-4-5-20250929")
+            .and_then(|p| p.long.clone())
+            .unwrap();
+        assert_eq!(long.above, 200_000);
+        assert_eq!((per_m(long.input), per_m(long.output)), (6.0, 22.5));
+        assert_eq!(long.cache_read.map(per_m), Some(0.6));
+        assert_eq!(long.cache_write_5m.map(per_m), Some(7.5));
+        assert_eq!(long.cache_write_1h.map(per_m), Some(12.0));
+        // GPT-5.5：门槛是 272K，不是 200K
+        let long = t.exact("gpt-5.5").and_then(|p| p.long.clone()).unwrap();
+        assert_eq!(long.above, 272_000);
+        assert_eq!(per_m(long.input), 10.0);
+        // 服务等级的变体不是长上下文那一档
+        assert!(t.exact("gpt-4o").unwrap().long.is_none());
+    }
+
+    #[test]
+    fn a_tier_without_an_input_price_is_no_tier_and_a_missing_output_price_stays_flat() {
+        let t = Table::fetched(
+            br#"{
+                "a": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6,
+                      "output_cost_per_token_above_200k_tokens": 4e-6},
+                "b": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6,
+                      "input_cost_per_token_above_128k_tokens": 2e-6,
+                      "input_cost_per_token_above_128k_tokens_priority": 9e-6}
+            }"#,
+            "d".into(),
+        )
+        .unwrap();
+        assert!(t.exact("a").unwrap().long.is_none());
+        let b = t.exact("b").unwrap().long.clone().unwrap();
+        assert_eq!((b.above, b.input, b.output), (128_000, 2e-6, 2e-6));
     }
 }

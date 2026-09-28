@@ -301,15 +301,18 @@ pub(crate) fn routed_nowhere(id: u64, choice: Choice) -> tw_api::Event {
     }
 }
 
-/// 上游回了话的一跳：`served` 或者 `status`。
+/// 上游回了话的一跳：`served` 或者 `status`。`model`：改写过的模型名（见
+/// `AttemptView::model`）
 pub(crate) fn hop(
     provider: &str,
+    model: Option<String>,
     outcome: tw_api::AttemptOutcome,
     status: u16,
     started: std::time::Instant,
 ) -> tw_api::AttemptView {
     tw_api::AttemptView {
         provider: provider.to_string(),
+        model,
         outcome,
         status: Some(status),
         error: None,
@@ -320,11 +323,13 @@ pub(crate) fn hop(
 /// 没有收到响应的一跳。`error` 和这一跳报给客户端的那条错误是同一句。
 pub(crate) fn hop_failed(
     provider: &str,
+    model: Option<String>,
     error: tw_types::Msg,
     started: std::time::Instant,
 ) -> tw_api::AttemptView {
     tw_api::AttemptView {
         provider: provider.to_string(),
+        model,
         outcome: tw_api::AttemptOutcome::Error,
         status: None,
         error: Some(error),
