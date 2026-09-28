@@ -7,6 +7,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod bedrock;
 pub mod bodies;
 pub mod chatgpt;
 pub mod client_api;
@@ -51,7 +52,7 @@ pub use l3::{Estimate, L3Result};
 pub use limits::Gate;
 pub use listen::{Listening, bind_failure, serve_at};
 pub use outbound::{client_for_provider, public_client};
-pub use probe::{ModelList, ProbeResult, probe};
+pub use probe::{ModelList, ProbeResult, probe, probe_bedrock};
 pub use quote::Quote;
 pub use server::{router, serve};
 pub use state::credential_failed;

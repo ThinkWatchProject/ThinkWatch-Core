@@ -309,11 +309,12 @@ Upstreams: the APIs requests are forwarded to.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the upstream; unique, and not the name of a group. Names starting with `__` are reserved. |
-| `base_url` | string | **required** | Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). |
-| `key` | string, `${VAR}` allowed | — | API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth`. |
+| `base_url` | string | **required** | Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`. |
+| `key` | string, `${VAR}` allowed | — | API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI, and a Bedrock API key), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth` or `aws`. |
 | `headers` | map of header name → value | `{}` | Additional request headers, in the order written; values may use `${VAR}`, and `{{access_token}}` where `oauth` is set. At most 32. Headers HTTP or the gateway manages (`host`, `content-length`, `connection`, …) cannot be set. |
 | `oauth` | object, [`providers[].oauth`](#cfg-providers-oauth) | — | OAuth credential: an access token obtained from a refresh token. Instead of `key`. |
-| `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` | — | API format of the upstream. Unset: recognized from `base_url` for the official endpoints, otherwise treated as `anthropic`. |
+| `aws` | object, [`providers[].aws`](#cfg-providers-aws) | — | AWS access keys of a Bedrock upstream: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key. |
+| `protocol` | `anthropic` \| `openai-chat` \| `openai-responses` \| `gemini` \| `chatgpt` \| `bedrock` | — | API format of the upstream. Unset: recognized from `base_url` for the official endpoints (a Bedrock runtime endpoint is `bedrock`), otherwise treated as `anthropic`. |
 | `forward_client_identity` | bool | `false` | Also send the client's own identity: its `User-Agent`, identity headers such as `x-app` and `originator`, and identity fields in the request body such as `metadata.user_id`. Values are the client's, never made up. Off: requests carry ThinkWatch's `User-Agent` and no client identity. For upstreams that admit only certain clients (Kimi For Coding, Bailian Coding Plan, relays restricted to official clients). Not available for `chatgpt`. |
 | `proxy` | string | `direct` | `direct`; `system`, the proxy in the core process's `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` environment variables; or the name of an entry in `proxies`. |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | When the proxy cannot be reached: `fail` the request, or go `direct`. |
@@ -324,11 +325,11 @@ Upstreams: the APIs requests are forwarded to.
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 <!-- /generated -->
 
-A credential is one of three things: `key`, which goes in the header the
-protocol expects; `oauth`, a token obtained from a refresh token; or
-`headers`, when the upstream wants something of its own. `headers` can be
-combined with the other two, except for the header that already carries the
-credential.
+A credential is one of four things: `key`, which goes in the header the
+protocol expects; `oauth`, a token obtained from a refresh token; `aws`, the
+access keys a Bedrock upstream signs its requests with; or `headers`, when the
+upstream wants something of its own. `headers` can be combined with the
+others, except for the header that already carries the credential.
 
 ```yaml
 providers:
@@ -392,6 +393,50 @@ the token goes:
     headers:
       X-Access: Token {{access_token}}
 ```
+
+#### `providers[].aws`
+
+<!-- generated: table providers[].aws -->
+<a id="cfg-providers-aws"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `access_key_id` | string, `${VAR}` allowed | **required** | Access key ID. |
+| `secret_access_key` | string, `${VAR}` allowed | **required** | Secret access key. |
+| `session_token` | string, `${VAR}` allowed | — | Session token of temporary credentials, such as those STS issues. When it expires, requests are refused until it is replaced. |
+| `region` | string | — | Region to sign for. Unset: the one in `base_url`, which must then be a standard runtime endpoint. Required when `base_url` is a VPC endpoint or a proxy. |
+<!-- /generated -->
+
+A Bedrock upstream authenticates in one of two ways. A Bedrock API key goes in
+`key` and is sent as `Authorization: Bearer`. AWS access keys go in `aws`:
+every request is signed with them (SigV4) once its body is final, and the keys
+themselves are never sent. Both can be read from the environment with
+`${VAR}`. Nothing runs a command to obtain a credential, so a profile that needs
+`aws sso login` or a `credential_process` cannot be used; export the keys it
+produces instead.
+
+```yaml
+providers:
+  - name: bedrock
+    base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+    key: ${AWS_BEARER_TOKEN_BEDROCK}
+
+  - name: bedrock-keys
+    base_url: https://bedrock-runtime.eu-west-1.amazonaws.com
+    aws:
+      access_key_id: ${AWS_ACCESS_KEY_ID}
+      secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+      session_token: ${AWS_SESSION_TOKEN}
+```
+
+Requests are converted to Converse. The model list comes from the region's
+control plane: the foundation models that can be invoked on demand, the
+inference profiles AWS defines (`us.anthropic.claude-…`), and the account's
+application inference profiles, listed by the ARN they are invoked by. Listing
+needs `bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles`;
+without them requests are still forwarded, and `models` can list the models by
+hand. For a VPC endpoint or a proxy, write its address in `base_url` and the
+region in `aws.region`; the model list is asked of that address too.
 
 ### `proxies`
 

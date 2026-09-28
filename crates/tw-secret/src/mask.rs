@@ -273,6 +273,11 @@ fn is_secret_name(name: &str) -> bool {
         "access",
         "access_token",
         "client_secret",
+        // Bedrock 的 AWS 访问密钥（`aws:` 那一段）。**私有访问密钥长得不像密钥**：
+        // 40 个字符，数字常常只有一两个，按形状认不出来
+        "access_key_id",
+        "secret_access_key",
+        "session_token",
     ];
     NAMES.contains(&name)
 }
@@ -289,6 +294,8 @@ fn looks_like_credential(v: &str) -> bool {
         "github_pat_",
         "xoxb-",
         "AKIA",
+        // AWS 的临时访问密钥 ID
+        "ASIA",
         "AIza",
         "ya29.",
         "Bearer ",
@@ -669,6 +676,18 @@ mod body_tests {
             out.contains('"'),
             "引号没了，粘回去就不是合法 YAML 了：{out}"
         );
+    }
+
+    #[test]
+    fn a_bedrock_upstreams_aws_keys_are_masked() {
+        let cfg = "providers:\n  - name: bedrock\n    base_url: https://bedrock-runtime.us-east-1.amazonaws.com\n    aws:\n      access_key_id: AKIAIOSFODNN7EXAMPLE\n      secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n      session_token: FwoGZXIvYXdzEXAMPLE\n      region: us-east-1\n  - name: from-env\n    base_url: https://bedrock-runtime.us-east-1.amazonaws.com\n    aws:\n      access_key_id: ${AWS_ACCESS_KEY_ID}\n      secret_access_key: ${AWS_SECRET_ACCESS_KEY}\n";
+        let out = mask_config_yaml(cfg);
+        for secret in ["IOSFODNN7", "K7MDENG", "FwoGZXIvYXdz"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("region: us-east-1"), "{out}");
+        // 临时凭证的访问密钥 ID 出现在别处（请求体、报错）也认得出
+        assert!(!mask_body("the key is ASIAIOSFODNN7EXAMPLE here").contains("IOSFODNN7"));
     }
 
     #[test]

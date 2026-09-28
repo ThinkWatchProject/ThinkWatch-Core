@@ -117,6 +117,7 @@ impl ClientApi {
                 Protocol::OpenaiResponses,
                 Protocol::Gemini,
                 Protocol::Chatgpt,
+                Protocol::Bedrock,
             ];
         }
         match self {
@@ -255,7 +256,7 @@ mod tests {
         ] {
             assert_eq!(ClientApi::generates(path), generates, "{path}");
         }
-        assert_eq!(ClientApi::OpenaiChat.servable_by(true).len(), 5);
+        assert_eq!(ClientApi::OpenaiChat.servable_by(true).len(), 6);
         assert_eq!(
             ClientApi::AnthropicMessages.servable_by(false),
             [Protocol::Anthropic]

@@ -29,6 +29,7 @@ impl From<Protocol> for tw_api::Protocol {
             Protocol::OpenaiResponses => Self::OpenaiResponses,
             Protocol::Gemini => Self::Gemini,
             Protocol::Chatgpt => Self::Chatgpt,
+            Protocol::Bedrock => Self::Bedrock,
         }
     }
 }
@@ -41,6 +42,7 @@ impl From<tw_api::Protocol> for Protocol {
             tw_api::Protocol::OpenaiResponses => Self::OpenaiResponses,
             tw_api::Protocol::Gemini => Self::Gemini,
             tw_api::Protocol::Chatgpt => Self::Chatgpt,
+            tw_api::Protocol::Bedrock => Self::Bedrock,
         }
     }
 }

@@ -18,6 +18,8 @@ tw-api = { workspace = true }
 tw-secret = { workspace = true }
 # 校验要认得出配置里写到的内置脱敏规则 id
 tw-guard = { workspace = true }
+# Bedrock 的区域：认标准地址、校验区域代码，和转发时用的是同一份
+tw-bedrock = { workspace = true }
 regex = { workspace = true }
 tw-pricing = { workspace = true }
 # 凭据轮换要把一个标量写回 config.yaml。**span 补丁，不是

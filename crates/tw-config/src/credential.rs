@@ -10,6 +10,8 @@
 //!   `X-Relay-Token` 的中转站就接不进来。
 //! - **`oauth`**：access token 由 refresh token 换发。token 默认放进协议的鉴权头，
 //!   也可以在 `headers` 里用 `{{access_token}}` 指定放在哪儿、怎么拼。
+//! - **`aws`**：Bedrock 的 AWS 访问密钥。它们不放进哪个头：每个请求在转发时用它们
+//!   签名（SigV4）。Bedrock 的 API Key 走 `key`，和别家一样。
 //!
 //! 值里可以写 `${ENV}` 从环境变量读。
 //!
@@ -46,12 +48,28 @@ const RESERVED: &[&str] = &[
     "proxy-authorization",
 ];
 
+/// 用 AWS 访问密钥签名时由签名写的头。配置里再写一份，发出去的请求就对不上签名
+const SIGNED: &[&str] = &[
+    "authorization",
+    "x-amz-date",
+    "x-amz-content-sha256",
+    "x-amz-security-token",
+];
+
 /// 可以带 `${ENV}` 的字符串：密钥、代理密码、请求头的值。
 ///
 /// 明文写在配置里（不做 keychain）。配置文件里看不出 `${ENV}` 和明文的区别，
 /// 也不该看出 —— 两种写法对读的人是一回事。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secret(String);
+
+/// **Debug 不打印密钥**：`Provider` 这些带着它的结构会进日志和 panic 信息。
+/// `${ENV}` 照写（那不是密钥），明文只留头尾几个字符。
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Secret").field(&self.describe()).finish()
+    }
+}
 
 impl Secret {
     pub fn new(s: impl Into<String>) -> Self {
@@ -255,9 +273,10 @@ impl<'de> Deserialize<'de> for Headers {
 pub fn auth_header(protocol: Option<Protocol>) -> (&'static str, &'static str) {
     match protocol {
         Some(Protocol::Gemini) => ("x-goog-api-key", ""),
-        Some(Protocol::OpenaiChat) | Some(Protocol::OpenaiResponses) | Some(Protocol::Chatgpt) => {
-            ("authorization", "Bearer ")
-        }
+        Some(Protocol::OpenaiChat)
+        | Some(Protocol::OpenaiResponses)
+        | Some(Protocol::Chatgpt)
+        | Some(Protocol::Bedrock) => ("authorization", "Bearer "),
         Some(Protocol::Anthropic) | None => ("x-api-key", ""),
     }
 }
@@ -303,6 +322,24 @@ pub enum CredentialError {
     OauthAndAuthHeader(String),
     #[error("{}", self.msg())]
     NoToken,
+    #[error("{}", self.msg())]
+    BedrockOauth,
+    #[error("{}", self.msg())]
+    KeyAndAws,
+    #[error("{}", self.msg())]
+    BedrockNoCredential,
+    #[error("{}", self.msg())]
+    AwsNotBedrock,
+    #[error("{}", self.msg())]
+    AwsEmpty,
+    #[error("{}", self.msg())]
+    AwsSignedHeader(String),
+    #[error("{}", self.msg())]
+    AwsNoRegion,
+    #[error("{}", self.msg())]
+    AwsBadRegion(String),
+    #[error("{}", self.msg())]
+    AwsRegionMismatch { given: String, host: String },
     /// 环境变量没设之类
     #[error("{}", self.msg())]
     Env(SecretResolveError),
@@ -390,6 +427,47 @@ impl CredentialError {
                 "config.credential.no_token" =>
                 "an OAuth access token could not be obtained"
             ),
+            BedrockOauth => msg!(
+                "config.credential.bedrock_oauth" =>
+                "a Bedrock upstream takes a Bedrock API key (key) or AWS access keys (aws), not oauth"
+            ),
+            KeyAndAws => msg!(
+                "config.credential.key_and_aws" =>
+                "key and aws are alternatives: a Bedrock API key, or AWS access keys"
+            ),
+            BedrockNoCredential => msg!(
+                "config.credential.bedrock_no_credential" =>
+                "a Bedrock upstream needs a Bedrock API key (key) or AWS access keys (aws)"
+            ),
+            AwsNotBedrock => msg!(
+                "config.credential.aws_not_bedrock" =>
+                "aws (AWS access keys) is only for a Bedrock upstream"
+            ),
+            AwsEmpty => msg!(
+                "config.credential.aws_empty" =>
+                "the access key ID, the secret access key and a session token, when given, cannot \
+                 be empty"
+            ),
+            AwsSignedHeader(h) => msg!(
+                "config.credential.aws_signed_header", header = h =>
+                "requests to this upstream are signed with its AWS access keys, and signing sets \
+                 the `{header}` header; it cannot also be set among the headers"
+            ),
+            AwsNoRegion => msg!(
+                "config.credential.aws_no_region" =>
+                "the address is not a standard Bedrock address \
+                 (https://bedrock-runtime.<region>.amazonaws.com), so aws.region has to name the \
+                 region to sign for"
+            ),
+            AwsBadRegion(r) => msg!(
+                "config.credential.aws_bad_region", region = r =>
+                "`{region}` is not an AWS region code such as us-east-1"
+            ),
+            AwsRegionMismatch { given, host } => msg!(
+                "config.credential.aws_region_mismatch", given = given, host = host =>
+                "aws.region is {given}, and the address is in {host}; the region comes from the \
+                 address, so aws.region can be left out"
+            ),
             // 只在转发时出现（展开 `${VAR}`），写法检查碰不到它
             Env(e) => e.msg(),
         }
@@ -452,6 +530,7 @@ impl Provider {
         {
             return Err(CredentialError::EmptyKey);
         }
+        self.check_bedrock()?;
         if let Some(o) = &self.oauth {
             if self.key.is_some() {
                 return Err(CredentialError::KeyAndOauth);
@@ -507,6 +586,9 @@ impl Provider {
             if chatgpt && crate::chatgpt::IDENTITY_HEADERS.contains(&lower.as_str()) {
                 return Err(CredentialError::IdentityHeader(h.name.clone()));
             }
+            if self.aws.is_some() && SIGNED.contains(&lower.as_str()) {
+                return Err(CredentialError::AwsSignedHeader(h.name.clone()));
+            }
             if seen.contains(&lower) {
                 return Err(CredentialError::DuplicateHeader(h.name.clone()));
             }
@@ -536,6 +618,65 @@ impl Provider {
             }
         }
         Ok(())
+    }
+
+    /// Bedrock 的规矩：凭证二选一、访问密钥不能空、签名要知道区域。
+    fn check_bedrock(&self) -> Result<(), CredentialError> {
+        let bedrock = self.effective_protocol() == Some(Protocol::Bedrock);
+        let host_region = tw_bedrock::endpoint::region_of(&self.base_url);
+        if let Some(aws) = &self.aws {
+            if !bedrock {
+                return Err(CredentialError::AwsNotBedrock);
+            }
+            if self.key.is_some() {
+                return Err(CredentialError::KeyAndAws);
+            }
+            if aws.access_key_id.is_blank()
+                || aws.secret_access_key.is_blank()
+                || aws.session_token.as_ref().is_some_and(Secret::is_blank)
+            {
+                return Err(CredentialError::AwsEmpty);
+            }
+            match (host_region, aws.region.as_deref().map(str::trim)) {
+                (_, Some(given)) if tw_bedrock::endpoint::validate_region(given).is_err() => {
+                    return Err(CredentialError::AwsBadRegion(given.to_string()));
+                }
+                (Some(host), Some(given)) if host != given => {
+                    return Err(CredentialError::AwsRegionMismatch {
+                        given: given.to_string(),
+                        host: host.to_string(),
+                    });
+                }
+                (None, None) => return Err(CredentialError::AwsNoRegion),
+                _ => {}
+            }
+        }
+        if bedrock {
+            if self.oauth.is_some() {
+                return Err(CredentialError::BedrockOauth);
+            }
+            // AWS 自己的地址一定要凭证；代理（非标准地址）可以自己管认证
+            if self.key.is_none() && self.aws.is_none() && host_region.is_some() {
+                return Err(CredentialError::BedrockNoCredential);
+            }
+        }
+        Ok(())
+    }
+
+    /// 签名用的 AWS 凭证，`${ENV}` 已经展开。不用访问密钥的上游是 `None`。
+    pub fn aws_credentials(&self) -> Result<Option<tw_bedrock::Credentials>, CredentialError> {
+        let Some(aws) = &self.aws else {
+            return Ok(None);
+        };
+        Ok(Some(tw_bedrock::Credentials {
+            access_key_id: aws.access_key_id.resolve()?,
+            secret_access_key: aws.secret_access_key.resolve()?,
+            session_token: aws
+                .session_token
+                .as_ref()
+                .map(Secret::resolve)
+                .transpose()?,
+        }))
     }
 
     /// 要发给这家的全部请求头，值已经展开。
@@ -584,6 +725,18 @@ impl Provider {
             s.push_str(&h.name.to_ascii_lowercase());
             s.push('=');
             s.push_str(h.value.raw());
+        }
+        if let Some(a) = &self.aws {
+            s.push_str(&format!(
+                "|aws|{}|{}|{}|{}",
+                a.access_key_id.raw(),
+                a.secret_access_key.raw(),
+                a.session_token
+                    .as_ref()
+                    .map(Secret::raw)
+                    .unwrap_or_default(),
+                a.region.as_deref().unwrap_or_default()
+            ));
         }
         s
     }
@@ -851,5 +1004,166 @@ mod tests {
             x.outbound_headers(None).unwrap(),
             vec![("Authorization".to_string(), "Token from-env".to_string())]
         );
+    }
+
+    fn bedrock(extra: &str) -> Provider {
+        p(&format!(
+            "name: b\nbase_url: https://bedrock-runtime.us-east-1.amazonaws.com\n{extra}"
+        ))
+    }
+
+    const KEYS: &str =
+        "aws:\n  access_key_id: AKIAIOSFODNN7EXAMPLE\n  secret_access_key: wJalrXUtnFEMI\n";
+
+    #[test]
+    fn a_bedrock_api_key_is_a_bearer_token() {
+        let b = bedrock("key: ABSK-test\n");
+        assert_eq!(b.effective_protocol(), Some(Protocol::Bedrock));
+        assert_eq!(b.check_credential(), Ok(()));
+        assert_eq!(
+            b.outbound_headers(None).unwrap(),
+            vec![("authorization".to_string(), "Bearer ABSK-test".to_string())]
+        );
+        assert_eq!(b.aws_credentials(), Ok(None));
+    }
+
+    #[test]
+    fn access_keys_are_not_a_header_they_sign() {
+        let b = bedrock(KEYS);
+        assert_eq!(b.check_credential(), Ok(()));
+        assert!(b.outbound_headers(None).unwrap().is_empty());
+        let c = b.aws_credentials().unwrap().unwrap();
+        assert_eq!(c.access_key_id, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(c.session_token, None);
+        assert_eq!(b.bedrock_region(), Some("us-east-1"));
+        assert_eq!(
+            b.bedrock_control_base(),
+            "https://bedrock.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn access_keys_can_come_from_the_environment() {
+        let b = bedrock(
+            "aws:\n  access_key_id: ${TW_TEST_BEDROCK_AK}\n  secret_access_key: ${TW_TEST_BEDROCK_SK}\n  session_token: ${TW_TEST_BEDROCK_ST}\n",
+        );
+        assert_eq!(b.check_credential(), Ok(()));
+        // SAFETY: 测试里只有这一处设这几个变量
+        unsafe {
+            std::env::set_var("TW_TEST_BEDROCK_AK", "ASIAEXAMPLE");
+            std::env::set_var("TW_TEST_BEDROCK_SK", "secret");
+        }
+        // 没设的那个变量是这一家拿不到凭证，不是一个空字符串
+        assert!(matches!(
+            b.aws_credentials(),
+            Err(CredentialError::Env(SecretResolveError::MissingEnv(v))) if v == "TW_TEST_BEDROCK_ST"
+        ));
+        unsafe { std::env::set_var("TW_TEST_BEDROCK_ST", "token") };
+        let c = b.aws_credentials().unwrap().unwrap();
+        assert_eq!(
+            (c.access_key_id.as_str(), c.session_token.as_deref()),
+            ("ASIAEXAMPLE", Some("token"))
+        );
+    }
+
+    #[test]
+    fn a_bedrock_upstream_takes_one_credential() {
+        use CredentialError::*;
+        assert_eq!(
+            bedrock(&format!("key: ABSK-test\n{KEYS}")).check_credential(),
+            Err(KeyAndAws)
+        );
+        assert_eq!(bedrock("").check_credential(), Err(BedrockNoCredential));
+        assert_eq!(
+            bedrock("oauth:\n  refresh: r\n  endpoint: https://auth.example.com/token\n")
+                .check_credential(),
+            Err(BedrockOauth)
+        );
+        assert_eq!(
+            bedrock("aws:\n  access_key_id: ''\n  secret_access_key: s\n").check_credential(),
+            Err(AwsEmpty)
+        );
+    }
+
+    #[test]
+    fn access_keys_belong_to_bedrock_only() {
+        let x = p(&format!(
+            "name: o\nbase_url: https://api.openai.com\n{KEYS}"
+        ));
+        assert_eq!(x.check_credential(), Err(CredentialError::AwsNotBedrock));
+    }
+
+    #[test]
+    fn a_signed_upstream_cannot_set_what_signing_sets() {
+        let b = bedrock(&format!(
+            "{KEYS}headers:\n  X-Amz-Date: '20260101T000000Z'\n"
+        ));
+        assert_eq!(
+            b.check_credential(),
+            Err(CredentialError::AwsSignedHeader("X-Amz-Date".into()))
+        );
+        let b = bedrock(&format!("{KEYS}headers:\n  Authorization: Bearer x\n"));
+        assert_eq!(
+            b.check_credential(),
+            Err(CredentialError::AwsSignedHeader("Authorization".into()))
+        );
+    }
+
+    #[test]
+    fn the_region_comes_from_the_address_or_has_to_be_written() {
+        use CredentialError::*;
+        // 地址里有区域：写一个不一样的是写错了
+        assert_eq!(
+            bedrock(&format!("{KEYS}  region: eu-west-1\n")).check_credential(),
+            Err(AwsRegionMismatch {
+                given: "eu-west-1".into(),
+                host: "us-east-1".into()
+            })
+        );
+        assert_eq!(
+            bedrock(&format!("{KEYS}  region: us-east-1\n")).check_credential(),
+            Ok(())
+        );
+        // 代理或 VPC 端点：地址里没有区域，签名要知道
+        let proxy = |extra: &str| {
+            p(&format!(
+                "name: b\nbase_url: https://vpce-0a1b.bedrock-runtime.us-east-1.vpce.amazonaws.com\nprotocol: bedrock\n{KEYS}{extra}"
+            ))
+        };
+        assert_eq!(proxy("").check_credential(), Err(AwsNoRegion));
+        assert_eq!(
+            proxy("  region: us.east.1\n").check_credential(),
+            Err(AwsBadRegion("us.east.1".into()))
+        );
+        let ok = proxy("  region: us-east-1\n");
+        assert_eq!(ok.check_credential(), Ok(()));
+        assert_eq!(ok.bedrock_region(), Some("us-east-1"));
+        // 列模型也问它：控制面的路径和推理的不重叠
+        assert_eq!(
+            ok.bedrock_control_base(),
+            "https://vpce-0a1b.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+        );
+        // 一个自己管认证的代理可以不带凭证
+        let bare = p("name: b\nbase_url: http://127.0.0.1:8080\nprotocol: bedrock\n");
+        assert_eq!(bare.check_credential(), Ok(()));
+    }
+
+    #[test]
+    fn debug_never_shows_a_plain_secret() {
+        let b = bedrock("key: ABSK-abcdefghijklmnopqrstuvwxyz0123\n");
+        let shown = format!("{b:?}");
+        assert!(!shown.contains("abcdefghijklmnopqrstuvwxyz"), "{shown}");
+        let env = bedrock("key: ${BEDROCK_KEY}\n");
+        assert!(format!("{env:?}").contains("${BEDROCK_KEY}"));
+        let keys = bedrock(KEYS);
+        assert!(!format!("{keys:?}").contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn changing_the_access_keys_changes_the_identity() {
+        let a = bedrock(KEYS);
+        let b =
+            bedrock("aws:\n  access_key_id: AKIAIOSFODNN7EXAMPLE\n  secret_access_key: another\n");
+        assert_ne!(a.credential_identity(), b.credential_identity());
     }
 }

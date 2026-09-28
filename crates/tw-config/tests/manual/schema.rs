@@ -419,8 +419,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`).",
-                        "接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。",
+                        "Endpoint, `http://` or `https://`, up to the version segment where the provider documents one (`https://api.anthropic.com`, `https://api.openai.com/v1`). For Bedrock, the region's runtime endpoint: `https://bedrock-runtime.<region>.amazonaws.com`.",
+                        "接口地址，`http://` 或 `https://`，按服务商文档写到版本段为止（`https://api.anthropic.com`、`https://api.openai.com/v1`）。Bedrock 写所在区域的推理地址：`https://bedrock-runtime.<区域>.amazonaws.com`。",
                     ),
                 ),
                 row(
@@ -428,8 +428,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Secret,
                     Def::Unset,
                     t(
-                        "API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth`.",
-                        "API 密钥，放进协议规定的请求头：`x-api-key`（Anthropic）、`Authorization: Bearer`（OpenAI）、`x-goog-api-key`（Gemini）。上游不需要密钥、或凭据写在 `headers` 里时不写。不能和 `oauth` 同时写。",
+                        "API key. It goes in the header the protocol expects: `x-api-key` (Anthropic), `Authorization: Bearer` (OpenAI, and a Bedrock API key), `x-goog-api-key` (Gemini). Leave it out for upstreams without a key, or when the credential is written in `headers`. Cannot be combined with `oauth` or `aws`.",
+                        "API 密钥，放进协议规定的请求头：`x-api-key`（Anthropic）、`Authorization: Bearer`（OpenAI，以及 Bedrock API Key）、`x-goog-api-key`（Gemini）。上游不需要密钥、或凭据写在 `headers` 里时不写。不能和 `oauth`、`aws` 同时写。",
                     ),
                 ),
                 row(
@@ -451,12 +451,21 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "aws",
+                    Kind::Obj("providers[].aws"),
+                    Def::Unset,
+                    t(
+                        "AWS access keys of a Bedrock upstream: every request is signed with them (SigV4). Instead of `key`, which holds a Bedrock API key.",
+                        "Bedrock 上游的 AWS 访问密钥：每个请求用它们签名（SigV4）。与 `key`（Bedrock API Key）二选一。",
+                    ),
+                ),
+                row(
                     "protocol",
                     Kind::Enum(protocols),
                     Def::Unset,
                     t(
-                        "API format of the upstream. Unset: recognized from `base_url` for the official endpoints, otherwise treated as `anthropic`.",
-                        "上游的接口格式。不写：官方地址按 `base_url` 识别，其余按 `anthropic` 处理。",
+                        "API format of the upstream. Unset: recognized from `base_url` for the official endpoints (a Bedrock runtime endpoint is `bedrock`), otherwise treated as `anthropic`.",
+                        "上游的接口格式。不写：官方地址按 `base_url` 识别（Bedrock 的推理地址是 `bedrock`），其余按 `anthropic` 处理。",
                     ),
                 ),
                 row(
@@ -529,6 +538,45 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Take the upstream out of routing and out of the model list, and keep its configuration.",
                         "不参与路由，模型也不出现在模型列表里；配置原样保留。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "providers[].aws",
+            ty: checked!(
+                Aws,
+                "{access_key_id: AKIAIOSFODNN7EXAMPLE, secret_access_key: s}"
+            ),
+            rows: vec![
+                row(
+                    "access_key_id",
+                    Kind::Secret,
+                    Def::Required,
+                    t("Access key ID.", "访问密钥 ID。"),
+                ),
+                row(
+                    "secret_access_key",
+                    Kind::Secret,
+                    Def::Required,
+                    t("Secret access key.", "私有访问密钥。"),
+                ),
+                row(
+                    "session_token",
+                    Kind::Secret,
+                    Def::Unset,
+                    t(
+                        "Session token of temporary credentials, such as those STS issues. When it expires, requests are refused until it is replaced.",
+                        "临时凭证（如 STS 签发的）的会话令牌。过期之后请求会被拒绝，直到换上新的。",
+                    ),
+                ),
+                row(
+                    "region",
+                    Kind::Str,
+                    Def::Unset,
+                    t(
+                        "Region to sign for. Unset: the one in `base_url`, which must then be a standard runtime endpoint. Required when `base_url` is a VPC endpoint or a proxy.",
+                        "签名用的区域。不写：取 `base_url` 里的区域，这时 `base_url` 必须是标准的推理地址。`base_url` 是 VPC 端点或代理时必须写。",
                     ),
                 ),
             ],

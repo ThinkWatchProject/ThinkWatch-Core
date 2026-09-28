@@ -612,11 +612,19 @@ fn cmd_check(path: &Path) -> Result<()> {
                     None => "not recognized (forwarded in the Anthropic format)".to_string(),
                 };
                 // 说来源而不是值。
-                let credential = match (&p.key, &p.oauth) {
-                    (Some(k), _) => format!("API key {} ({})", k.describe(), p.auth_header().0),
-                    (None, Some(_)) => "OAuth".to_string(),
-                    (None, None) if !p.headers.is_empty() => "headers".to_string(),
-                    (None, None) => "no credential".to_string(),
+                let credential = match (&p.key, &p.oauth, &p.aws) {
+                    (Some(k), _, _) => {
+                        format!("API key {} ({})", k.describe(), p.auth_header().0)
+                    }
+                    (None, Some(_), _) => "OAuth".to_string(),
+                    // 签名用的密钥：说来源（环境变量还是写死的），不说值
+                    (None, None, Some(a)) => format!(
+                        "AWS access key {}, signed for {}",
+                        a.access_key_id.describe(),
+                        p.bedrock_region().unwrap_or("an unknown region")
+                    ),
+                    (None, None, None) if !p.headers.is_empty() => "headers".to_string(),
+                    (None, None, None) => "no credential".to_string(),
                 };
                 println!(
                     "   · {} → {} [{}]  {credential}",
@@ -673,6 +681,8 @@ fn cmd_check(path: &Path) -> Result<()> {
                     );
                 } else if let Err(e) = p.outbound_headers(None) {
                     println!("     ⚠ the credential could not be obtained: {e}");
+                } else if let Err(e) = p.aws_credentials() {
+                    println!("     ⚠ the AWS access keys could not be obtained: {e}");
                 }
             }
             Ok(())
