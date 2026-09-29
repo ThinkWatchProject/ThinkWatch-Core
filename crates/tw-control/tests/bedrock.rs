@@ -284,7 +284,7 @@ async fn no_permission_to_list_is_not_a_rejected_key() {
         (
             403,
             Some("AccessDeniedException:http://internal.amazon.com/coral/com.amazon.bedrock/"),
-            json!({"message": "User: arn:aws:iam::123456789012:user/alice is not authorized"}),
+            json!({"message": "User: arn:aws:iam::123456789012:user/alice is not authorized to perform: bedrock:ListFoundationModels because no identity-based policy allows the bedrock:ListFoundationModels action"}),
         )
     })
     .await;
@@ -306,4 +306,31 @@ async fn no_permission_to_list_is_not_a_rejected_key() {
     let v = test_with(&b, rejected).await;
     assert_eq!(v["ok"], false, "{v}");
     assert_eq!(v["error"]["code"], "gw.probe.key_rejected", "{v}");
+}
+
+/// Bedrock API Key 本身不对时，AWS 回的**也是** `AccessDeniedException`，只是原话不同（这两句
+/// 是拿格式不对、和格式对但不存在的 key 实际问出来的）。那是密钥被拒，不能说成「凭证能用、
+/// 只是列不了」—— 那样填错了 key，「检查连接」反倒说没问题
+#[tokio::test]
+async fn a_bedrock_api_key_that_is_not_valid_is_rejected() {
+    for message in [
+        "Authentication failed: Please make sure your API Key is valid.",
+        "Invalid API Key format: Must start with pre-defined prefix",
+    ] {
+        let up = control_plane(move |_| {
+            (
+                403,
+                Some("AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/"),
+                json!({"Message": message}),
+            )
+        })
+        .await;
+        let b = bed(BASE);
+        let v = test_with(&b, up).await;
+        assert_eq!(v["ok"], false, "{message}: {v}");
+        assert_eq!(
+            v["error"]["code"], "gw.probe.key_rejected",
+            "{message}: {v}"
+        );
+    }
 }

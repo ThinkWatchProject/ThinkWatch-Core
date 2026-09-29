@@ -86,6 +86,11 @@ const BEDROCK_PROBE_TIMEOUT: Duration = Duration::from_secs(16);
 /// **403 不一定是凭证不对。**AWS 认出了身份、只是没给列模型的权限时回的是
 /// `AccessDeniedException`：凭证能用，请求照样能发，只是这里列不出清单 —— 那要说成
 /// 「列不了」，不能说成「密钥被拒」。AWS 的原话会点名账号和 IAM 身份，不往外说。
+///
+/// **反过来也一样：`AccessDeniedException` 不一定是凭证能用。**Bedrock API Key 本身不对时
+/// 回的也是它，原话是「Authentication failed: …」「Invalid API Key format: …」。所以还要看
+/// 原话：说「is not authorized」的（`User: arn:… is not authorized to perform: …`）才是认出了
+/// 身份（[`identified`]）。
 pub async fn probe_bedrock(
     http: &reqwest::Client,
     provider: &tw_config::Provider,
@@ -127,37 +132,39 @@ pub async fn probe_bedrock(
         ),
         Ok(Ok(models)) if models.is_empty() => ok(ModelList::Empty, None),
         Ok(Ok(models)) => ok(ModelList::Listed { models }, None),
-        Ok(Err(Failure::Status { status, kind, .. })) if status == 401 || status == 403 => {
-            match kind.as_deref() {
-                Some("AccessDeniedException") => ok(
-                    ModelList::NotImplemented { status },
-                    Some(msg!(
-                        "gw.probe.bedrock_list_denied" =>
-                        "The credential works, and it has no permission to list models \
-                         (bedrock:ListFoundationModels and bedrock:ListInferenceProfiles). \
-                         Requests are still forwarded; to route by model, list the models by hand."
-                    )),
+        Ok(Err(Failure::Status {
+            status,
+            kind,
+            message,
+        })) if status == 401 || status == 403 => match kind.as_deref() {
+            Some("AccessDeniedException") if identified(&message) => ok(
+                ModelList::NotImplemented { status },
+                Some(msg!(
+                    "gw.probe.bedrock_list_denied" =>
+                    "The credential works, and it has no permission to list models \
+                     (bedrock:ListFoundationModels and bedrock:ListInferenceProfiles). \
+                     Requests are still forwarded; to route by model, list the models by hand."
+                )),
+            ),
+            Some("ExpiredTokenException") => ProbeResult::fail(
+                ms,
+                proto_name.clone(),
+                msg!(
+                    "gw.probe.aws_token_expired" =>
+                    "The temporary AWS credential has expired. Replace the session token and \
+                     the access keys that came with it."
                 ),
-                Some("ExpiredTokenException") => ProbeResult::fail(
-                    ms,
-                    proto_name.clone(),
-                    msg!(
-                        "gw.probe.aws_token_expired" =>
-                        "The temporary AWS credential has expired. Replace the session token and \
-                         the access keys that came with it."
-                    ),
+            ),
+            _ => ProbeResult::fail(
+                ms,
+                proto_name.clone(),
+                msg!(
+                    "gw.probe.key_rejected", status = status =>
+                    "The upstream rejected this key (HTTP {status}). Check the key for stray \
+                     whitespace, and that it belongs to this upstream."
                 ),
-                _ => ProbeResult::fail(
-                    ms,
-                    proto_name.clone(),
-                    msg!(
-                        "gw.probe.key_rejected", status = status =>
-                        "The upstream rejected this key (HTTP {status}). Check the key for stray \
-                         whitespace, and that it belongs to this upstream."
-                    ),
-                ),
-            }
-        }
+            ),
+        },
         // 认证这一关过了，列表本身没列出来
         Ok(Err(Failure::Status { status, .. })) => ok(ModelList::NotImplemented { status }, None),
         Ok(Err(Failure::Request(detail))) => ProbeResult::fail(
@@ -169,6 +176,14 @@ pub async fn probe_bedrock(
             ),
         ),
     }
+}
+
+/// AWS 拒绝的原话说的是「认出了你、但你没有这个权限」。
+///
+/// IAM 的拒绝一律是 `User: arn:… is not authorized to perform: <动作> …`；认证就没过的（API Key
+/// 不对、格式不对）说的是别的。**只拿来判断，原话不往外说**：它点名账号和 IAM 身份
+fn identified(message: &str) -> bool {
+    message.contains("is not authorized")
 }
 
 /// 验一个上游能不能用。
