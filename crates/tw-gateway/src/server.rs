@@ -229,7 +229,7 @@ fn note_health(
     }
     let (bus, health, name) = (bus.clone(), health.clone(), provider.to_string());
     tokio::spawn(async move {
-        let mut left = crate::health::COOLDOWN;
+        let mut left = health.cooldown_left(&name).unwrap_or_default();
         loop {
             tokio::time::sleep(left).await;
             match health.cooldown_left(&name) {

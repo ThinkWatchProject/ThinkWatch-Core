@@ -10,6 +10,7 @@ use bytes::Bytes;
 
 use super::{Inbound, Started};
 use crate::error::GatewayError;
+use crate::failure::{Cause, Verdict};
 use crate::forward;
 use crate::server::{hop, hop_failed, note_health};
 use crate::state::{AppState, Runtime};
@@ -82,7 +83,9 @@ pub(super) async fn try_upstreams<'a>(
     // 不再试下一家的原因：第二阶段拒绝了，或者规则求不了值。**路由事件照样要发**
     let mut halt: Option<GatewayError> = None;
 
-    for name in &started.alive {
+    for (i, name) in started.alive.iter().enumerate() {
+        // 后面没有别的候选了
+        let last = i + 1 == started.alive.len();
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
             // 校验时挡过一次，能到这儿说明配置在运行中被换过。
             last_err = Some(GatewayError::config(msg!(
@@ -288,53 +291,185 @@ pub(super) async fn try_upstreams<'a>(
             Err(e) => Err(e),
         };
         match sent {
-            Ok(r) if r.status().is_server_error() || r.status() == 429 => {
-                // 额度用完时上游回的正是 429，这一跳的额度头也要读
-                state.note_quota(id, &provider.name, r.headers());
-                // 上游回了话，说明代理是通的
-                state.note_proxy_ok(&provider.proxy);
-                // 5xx 和限流：换一家有意义，那边可能有不同的额度或地域。
-                // **4xx 不换**（除了 429）—— 请求本身有问题的话，换一家
-                // 也一样被拒，还会白白污染那家的健康度。
-                note_health(
-                    &state.bus,
-                    &state.health,
-                    &provider.name,
-                    state.health.record_failure(&provider.name),
-                );
-                chain.push(hop(
-                    &provider.name,
-                    model.clone(),
-                    tw_api::AttemptOutcome::Status,
-                    r.status().as_u16(),
-                    hop_started,
-                ));
-                // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
-                // 坏了」而不是「该退避了」，而它们该做的事完全不同。
-                last_err = Some(if r.status() == 429 {
-                    GatewayError::rate_limited(msg!(
-                        "gw.upstream.rate_limited", upstream = provider.name.clone() =>
-                        "Upstream `{upstream}` rate-limited the request."
-                    ))
-                } else {
-                    GatewayError::upstream(msg!(
-                        "gw.upstream.status", upstream = provider.name.clone(), status = r.status().as_u16() =>
-                        "Upstream `{upstream}` answered {status}."
-                    ))
-                });
-                // GLM Coding Plan 的额度用完不在响应头里，在 429 的 body 里
-                if r.status() == 429 {
-                    state.note_glm_429(id, provider, r).await;
+            Ok(r) if !r.status().is_success() => {
+                let status = r.status().as_u16();
+                // 同格式的上游没实现数 token（不少中转只做了生成回答）：网关自己估。
+                // **在判断换不换之前**：404 平时是「这家没有这个模型」，要换下一家
+                if counting && crate::count::unsupported(status) {
+                    note_health(
+                        &state.bus,
+                        &state.health,
+                        &provider.name,
+                        state.health.record_success(&provider.name),
+                    );
+                    chain.push(estimated_hop(
+                        provider,
+                        model.clone(),
+                        Some(status),
+                        hop_started,
+                    ));
+                    estimated = Some(provider);
+                    break;
                 }
-                state.glm_traffic(provider);
-                continue;
+                let headers = r.headers().clone();
+                let (head, r) = peek_body(r).await;
+                // GLM Coding Plan 的额度用完不在响应头里，在 429 的 body 里
+                if status == 429 {
+                    state.note_glm_429_body(id, provider, &head);
+                }
+                let verdict = crate::failure::classify(status, &headers, &head, now_ms());
+                // **最后一家的 4xx 交给客户端**：没有下一家可换了，上游自己的原话
+                // （「invalid x-api-key」）比我们转述的一句「回了 401」有用得多。
+                // 5xx 和 429 照旧报我们的话，带着尝试链
+                let hand_on = last && status < 500 && status != 429;
+                match verdict {
+                    Verdict::Failed(cause) if !hand_on => {
+                        // 5xx、限流、没钱了、额度用完、凭据被拒、没有这个模型：换一家有
+                        // 意义，那边是另一把密钥、另一个账户。停用多久看原因。
+                        //
+                        // 交给客户端的那一跳，下面这几样由回程（`relay`）去记
+                        //
+                        // 额度用完时上游回的正是 429，这一跳的额度头也要读
+                        state.note_quota(id, &provider.name, &headers);
+                        // 上游回了话，说明代理是通的
+                        state.note_proxy_ok(&provider.proxy);
+                        state.glm_traffic(provider);
+                        // 凭据被拒是要让用户知道的状态，**换了下一家也一样**
+                        state.note_auth(&provider.name, status);
+                        let cause = known_reset(state, &provider.name, cause);
+                        note_health(
+                            &state.bus,
+                            &state.health,
+                            &provider.name,
+                            state.health.record_cause(&provider.name, cause),
+                        );
+                        chain.push(hop(
+                            &provider.name,
+                            model.clone(),
+                            tw_api::AttemptOutcome::Status,
+                            status,
+                            hop_started,
+                        ));
+                        // **429 要保住 429。**塌成 502 的话，客户端会当成「服务器
+                        // 坏了」而不是「该退避了」，而它们该做的事完全不同。
+                        last_err = Some(if status == 429 {
+                            GatewayError::rate_limited(msg!(
+                                "gw.upstream.rate_limited", upstream = provider.name.clone() =>
+                                "Upstream `{upstream}` rate-limited the request."
+                            ))
+                        } else {
+                            GatewayError::upstream(msg!(
+                                "gw.upstream.status", upstream = provider.name.clone(), status = status =>
+                                "Upstream `{upstream}` answered {status}."
+                            ))
+                        });
+                        continue;
+                    }
+                    verdict => {
+                        // 请求本身的问题（换一家也一样被拒），或者最后一家的 4xx：原样交出去
+                        let change = match verdict {
+                            Verdict::Failed(cause) => state.health.record_cause(
+                                &provider.name,
+                                known_reset(state, &provider.name, cause),
+                            ),
+                            Verdict::ClientError => state.health.record_success(&provider.name),
+                        };
+                        note_health(&state.bus, &state.health, &provider.name, change);
+                        // Bedrock 拒绝凭证时的原话会点名账号和 IAM 身份：换成我们自己的话再交出去
+                        let r = if provider.is_bedrock() && matches!(status, 401 | 403) {
+                            bedrock_refusal(provider, r).await
+                        } else {
+                            r
+                        };
+                        chain.push(hop(
+                            &provider.name,
+                            model.clone(),
+                            tw_api::AttemptOutcome::Served,
+                            status,
+                            hop_started,
+                        ));
+                        served = Some(Served {
+                            upstream: r,
+                            provider,
+                            ledger,
+                            session: out.session,
+                        });
+                        break;
+                    }
+                }
             }
             Ok(r) => {
-                // Bedrock 拒绝凭证时的原话会点名账号和 IAM 身份：换成我们自己的话再交出去
-                let r = if provider.is_bedrock() && matches!(r.status().as_u16(), 401 | 403) {
-                    bedrock_refusal(provider, r).await
-                } else {
-                    r
+                // 流式回答：**第一段内容到之前**上游在流里报的错，照样换下一家（见
+                // `opening`）。最后一家不等 —— 没有下一家可换，等只会让客户端晚一点
+                // 看到同一个错误
+                let r = match opening_of(req, provider, &out, &r).filter(|_| !last) {
+                    None => r,
+                    Some((dialect, eventstream)) => {
+                        let wait = std::time::Duration::from_secs(
+                            rt.config.failover.stream_start_wait_secs,
+                        );
+                        match super::opening::watch(r, dialect, eventstream, wait).await {
+                            super::opening::Opening::Go(r) => r,
+                            super::opening::Opening::Failed {
+                                status,
+                                headers,
+                                body,
+                                kind,
+                                message,
+                                response,
+                            } => {
+                                match crate::failure::classify(status, &headers, &body, now_ms()) {
+                                    Verdict::ClientError => response,
+                                    Verdict::Failed(cause) => {
+                                        state.note_quota(id, &provider.name, &headers);
+                                        state.note_proxy_ok(&provider.proxy);
+                                        let cause = known_reset(state, &provider.name, cause);
+                                        note_health(
+                                            &state.bus,
+                                            &state.health,
+                                            &provider.name,
+                                            state.health.record_cause(&provider.name, cause),
+                                        );
+                                        let said = msg!(
+                                            "gw.upstream.stream_opening_error",
+                                            upstream = provider.name.clone(), kind = kind, message = message =>
+                                            "Upstream `{upstream}` started the answer and reported an error \
+                                             before any content ({kind}): {message}"
+                                        );
+                                        let err = if status == 429 {
+                                            GatewayError::rate_limited(said)
+                                        } else {
+                                            GatewayError::upstream(said)
+                                        };
+                                        chain.push(hop_failed(
+                                            &provider.name,
+                                            model.clone(),
+                                            err.detail.clone(),
+                                            hop_started,
+                                        ));
+                                        last_err = Some(err);
+                                        continue;
+                                    }
+                                }
+                            }
+                            super::opening::Opening::Broken(err) => {
+                                note_health(
+                                    &state.bus,
+                                    &state.health,
+                                    &provider.name,
+                                    state.health.record_failure(&provider.name),
+                                );
+                                chain.push(hop_failed(
+                                    &provider.name,
+                                    model.clone(),
+                                    err.detail.clone(),
+                                    hop_started,
+                                ));
+                                last_err = Some(err);
+                                continue;
+                            }
+                        }
+                    }
                 };
                 note_health(
                     &state.bus,
@@ -342,17 +477,6 @@ pub(super) async fn try_upstreams<'a>(
                     &provider.name,
                     state.health.record_success(&provider.name),
                 );
-                // 同格式的上游没实现数 token（不少中转只做了生成回答）：网关自己估
-                if counting && crate::count::unsupported(r.status().as_u16()) {
-                    chain.push(estimated_hop(
-                        provider,
-                        model.clone(),
-                        Some(r.status().as_u16()),
-                        hop_started,
-                    ));
-                    estimated = Some(provider);
-                    break;
-                }
                 chain.push(hop(
                     &provider.name,
                     model.clone(),
@@ -1079,4 +1203,81 @@ async fn bedrock_refusal(
         http::HeaderValue::from_static("application/json"),
     );
     reqwest::Response::from(resp)
+}
+
+/// 读错误响应的开头（最多 [`crate::failure::BODY_PEEK`]），交回读到的和一个照旧能从头
+/// 读起的响应 —— 这一跳可能还是要原样交给客户端的。
+async fn peek_body(r: reqwest::Response) -> (Bytes, reqwest::Response) {
+    use futures::StreamExt;
+    let status = r.status();
+    let headers = r.headers().clone();
+    let mut stream = r.bytes_stream();
+    let mut held: Vec<Bytes> = Vec::new();
+    let mut size = 0usize;
+    // 错误正文都很短。**读不完就算了**：这一跳多半已经失败了，读它只为认出原因，
+    // 不能因此拖住下一家
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while size < crate::failure::BODY_PEEK {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                size += chunk.len();
+                held.push(chunk);
+            }
+            _ => break,
+        }
+    }
+    let head: Vec<u8> = held.iter().flat_map(|c| c.iter().copied()).collect();
+    let replay = futures::stream::iter(held.into_iter().map(Ok::<_, reqwest::Error>));
+    let mut resp = http::Response::new(reqwest::Body::wrap_stream(replay.chain(stream)));
+    *resp.status_mut() = status;
+    *resp.headers_mut() = headers;
+    let head = Bytes::from(head);
+    (head, reqwest::Response::from(resp))
+}
+
+/// 额度用完、这一跳又没说什么时候重置的：看这家最近报的额度窗口（GLM 的在 429 的
+/// 正文里读过了，别家的在响应头里）。满了的窗口里取**最晚**重置的那个
+fn known_reset(state: &AppState, provider: &str, cause: Cause) -> Cause {
+    let Cause::QuotaUsedUp { resets_at_ms: None } = cause else {
+        return cause;
+    };
+    let now = now_ms();
+    let resets_at_ms = state.quotas().get(provider).and_then(|q| {
+        q.windows
+            .iter()
+            .filter(|w| w.rejected() || w.used_percent >= 100.0)
+            .filter_map(|w| w.resets_at_ms)
+            .filter(|t| *t > now)
+            .max()
+    });
+    Cause::QuotaUsedUp { resets_at_ms }
+}
+
+/// 这个回答要不要等开头：生成回答的流式响应才等。等的话，上游说的是哪种格式、
+/// 是不是 Bedrock 的二进制帧
+fn opening_of(
+    req: &Inbound,
+    provider: &tw_config::Provider,
+    out: &Outbound,
+    r: &reqwest::Response,
+) -> Option<(tw_dialect::ir::Dialect, bool)> {
+    if !r.status().is_success() {
+        return None;
+    }
+    let ct = r
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let eventstream =
+        provider.is_bedrock() && ct.starts_with(tw_bedrock::eventstream::CONTENT_TYPE);
+    if !(eventstream || ct.starts_with("text/event-stream")) {
+        return None;
+    }
+    let dialect = out.target.or_else(|| req.api.map(|a| a.dialect()))?;
+    Some((dialect, eventstream))
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(tw_breaker::now_ms()).unwrap_or(0)
 }

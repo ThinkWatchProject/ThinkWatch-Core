@@ -9,11 +9,6 @@ use crate::server::now_ms;
 /// 问一次额度接口最多等多久
 const ASK_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 429 的 body 最多读多少、等多久。**这一跳已经失败了**，读它只为认出额度用完，
-/// 不能因此拖住下一家
-const BODY_LIMIT: usize = 16 * 1024;
-const BODY_TIMEOUT: Duration = Duration::from_secs(2);
-
 impl AppState {
     /// 额度接口换成别的地址。**给测试用**：平时就是 Z.ai 和 BigModel 自己的
     pub fn set_glm_sites(&self, sites: glm::Sites) {
@@ -116,22 +111,14 @@ impl AppState {
     }
 
     /// 一个 GLM 上游回了 429：body 里说额度用完了的话，**那一刻就记成用完**，报一次
-    /// `QuotaExhausted`。
+    /// `QuotaExhausted`。`body` 是这个 429 正文的开头（转发那一边已经读过了）。
     ///
     /// 重置时刻以额度接口问来的为准；还没问到过，才用消息里说的
-    pub(crate) async fn note_glm_429(
-        &self,
-        id: u64,
-        p: &tw_config::Provider,
-        r: reqwest::Response,
-    ) {
+    pub(crate) fn note_glm_429_body(&self, id: u64, p: &tw_config::Provider, body: &[u8]) {
         if self.glm_target(p).is_none() {
             return;
         }
-        let Some(body) = read_capped(r).await else {
-            return;
-        };
-        self.note_glm_exhausted(id, &p.name, &body);
+        self.note_glm_exhausted(id, &p.name, body);
     }
 
     /// 读出来的 429 body 说额度用完了的话，记下来。
@@ -170,21 +157,6 @@ impl AppState {
         }
         self.record_quota(id, provider, quota);
     }
-}
-
-/// 读 body，最多 [`BODY_LIMIT`] 字节、[`BODY_TIMEOUT`]。读不完就算了
-async fn read_capped(mut r: reqwest::Response) -> Option<Vec<u8>> {
-    let read = async {
-        let mut out = Vec::new();
-        while let Some(chunk) = r.chunk().await.ok()? {
-            out.extend_from_slice(&chunk);
-            if out.len() > BODY_LIMIT {
-                return None;
-            }
-        }
-        Some(out)
-    };
-    tokio::time::timeout(BODY_TIMEOUT, read).await.ok()?
 }
 
 #[cfg(test)]

@@ -67,6 +67,7 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Seen>>) {
 async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
     let cfg = Config {
         retention: Default::default(),
+        failover: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -238,6 +239,7 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     let (up, _) = start_upstream(true).await;
     let cfg = Config {
         retention: Default::default(),
+        failover: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -343,6 +345,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     let dead_port = spare_port();
     let cfg = Config {
         retention: Default::default(),
+        failover: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -407,6 +410,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
 
     let cfg = Config {
         retention: Default::default(),
+        failover: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -509,6 +513,7 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
     let (up, seen) = start_upstream(false).await;
     let cfg = Config {
         retention: Default::default(),
+        failover: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -679,6 +684,162 @@ async fn rate_limiting_does_fail_over_because_another_account_may_have_quota() {
     .await;
     assert_eq!(send_to(gw).await.status(), 200);
     assert!(!seen.lock().unwrap().body.is_empty());
+}
+
+/// 回一个固定的状态码、类型和正文的上游，并数它被打了几次。
+async fn start_answering_upstream(
+    status: u16,
+    content_type: &'static str,
+    body: &'static str,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let app = Router::new().fallback(axum::routing::any(move || {
+        let counted = counted.clone();
+        async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+    }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, hits)
+}
+
+fn two(first: SocketAddr, second: SocketAddr) -> Config {
+    cfg_with(
+        vec![
+            Provider {
+                name: "first".into(),
+                base_url: format!("http://{first}"),
+                key: Some("k".into()),
+                ..Default::default()
+            },
+            Provider {
+                name: "second".into(),
+                base_url: format!("http://{second}"),
+                key: Some("k".into()),
+                ..Default::default()
+            },
+        ],
+        vec![],
+    )
+}
+
+#[tokio::test]
+async fn an_error_at_the_start_of_a_stream_moves_the_request_to_the_next_upstream() {
+    // 上游回了 200、开了流，第一个事件却是过载。客户端这时什么都还没收到，
+    // 换一家它完全无感；错误帧写给了它，就只能自己重试了
+    let (overloaded, _) = start_answering_upstream(
+        200,
+        "text/event-stream",
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n\
+         event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    )
+    .await;
+    let (good, hits) = start_answering_upstream(
+        200,
+        "text/event-stream",
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n\
+         event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"answer\"}}\n\n",
+    )
+    .await;
+    let gw = serve_cfg(two(overloaded, good)).await;
+    let text = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","stream":true}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "第二家接下了");
+    assert!(text.contains("answer"), "{text}");
+    assert!(
+        !text.contains("overloaded_error"),
+        "第一家的错误不该到客户端：{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_error_after_content_has_started_is_not_retried() {
+    // 内容已经交给客户端了，再换一家就是把同一段回答说两遍
+    let (broken, _) = start_answering_upstream(
+        200,
+        "text/event-stream",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"half\"}}\n\n\
+         event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    )
+    .await;
+    let (good, hits) = start_answering_upstream(200, "text/event-stream", "").await;
+    let gw = serve_cfg(two(broken, good)).await;
+    let text = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/messages"))
+        .header("x-api-key", "tw-k")
+        .body(r#"{"model":"claude-sonnet-4-5","stream":true}"#)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(
+        text.contains("half") && text.contains("overloaded_error"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_balance_moves_on_and_sets_the_upstream_aside() {
+    let (broke, broke_hits) = start_answering_upstream(
+        402,
+        "application/json",
+        r#"{"error":{"message":"Insufficient Balance"}}"#,
+    )
+    .await;
+    let (good, hits) = start_upstream(false).await;
+    let state = tw_gateway::AppState::new(two(broke, good)).unwrap();
+    let health = state.health.clone();
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(send_to(gw).await.status(), 200);
+    assert!(!hits.lock().unwrap().body.is_empty());
+    // **一次就停用**：上游说了原因，不必再撞两次
+    assert!(!health.is_available("first"));
+    assert_eq!(send_to(gw).await.status(), 200);
+    assert_eq!(broke_hits.load(Ordering::SeqCst), 1, "停用着的不再去试");
+}
+
+#[tokio::test]
+async fn the_last_upstreams_own_refusal_reaches_the_client() {
+    // 没有下一家可换了：上游自己的原话比「回了 401」有用
+    let (bad_key, _) = start_answering_upstream(
+        401,
+        "application/json",
+        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+    )
+    .await;
+    let (also_bad, _) = start_answering_upstream(
+        401,
+        "application/json",
+        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+    )
+    .await;
+    let gw = serve_cfg(two(bad_key, also_bad)).await;
+    let r = send_to(gw).await;
+    assert_eq!(r.status(), 401);
+    assert_eq!(r.headers().get("x-thinkwatch-upstream").unwrap(), "second");
+    assert!(r.text().await.unwrap().contains("invalid x-api-key"));
 }
 
 #[tokio::test]

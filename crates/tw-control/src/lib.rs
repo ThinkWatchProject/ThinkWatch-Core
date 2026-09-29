@@ -391,6 +391,18 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             // 判断松还是紧，除非同时看得见现在占了多少
             body_bytes_now,
         },
+        failover: {
+            let f = &cfg.failover;
+            tw_api::FailoverView {
+                failures_to_pause: f.failures_to_pause,
+                pause_secs: f.pause_secs,
+                max_pause_secs: f.max_pause_secs,
+                no_balance_pause_secs: f.no_balance_pause_secs,
+                quota_pause_secs: f.quota_pause_secs,
+                rate_limit_max_pause_secs: f.rate_limit_max_pause_secs,
+                stream_start_wait_secs: f.stream_start_wait_secs,
+            }
+        },
         listen: tw_api::ListenView {
             // **`Display` 不是 `Debug`。**`{:?}` 对 `Loopback` / `All`
             // 碰巧给出正确的小写词，对 `Addr(192.168.1.5)` 给的是

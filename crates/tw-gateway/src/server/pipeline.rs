@@ -21,6 +21,7 @@ use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
 mod hop;
+mod opening;
 mod relay;
 
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的

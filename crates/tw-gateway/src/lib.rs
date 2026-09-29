@@ -17,6 +17,7 @@ pub mod count;
 pub mod egress;
 pub mod ending;
 pub mod error;
+pub mod failure;
 pub mod fixture;
 pub mod forward;
 pub mod glm;

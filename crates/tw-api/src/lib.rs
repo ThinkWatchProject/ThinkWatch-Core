@@ -651,6 +651,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `:countTokens` 路由到别的格式的上游、或者上游回 404 / 405 时，网关自己估一个数回去。
 /// 尝试链多一种结果 [`AttemptOutcome::Estimated`]，那一行是 `local`、费用 0。照 29 写的
 /// 界面不认这个词。
+///
+/// 30 起概览还带 [`Overview::failover`]（[`FailoverView`]：上游失败之后停用多久、流开头
+/// 最多等多久）。照 29 写的界面读不出这一项，也就改不了它。
 pub const CONTROL_API_VERSION: u32 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1581,6 +1584,8 @@ pub struct Overview {
     pub client_probes: Vec<ProbeView>,
     /// 日志留多久
     pub retention: RetentionView,
+    /// 上游失败之后停用多久、流开头最多等多久
+    pub failover: FailoverView,
     /// 自定义价目表。默认价目表不在这里 —— 它的状态看 `/pricing`
     pub price_sheets: Vec<PriceSheetView>,
 }
@@ -1660,6 +1665,27 @@ pub struct RetentionView {
     /// 正文现在实际占了多少。**不是配置，是现状** —— 没有它，
     /// 「2 GB 上限」是个用户无从判断松紧的数字
     pub body_bytes_now: u64,
+}
+
+/// 上游失败之后停用多久、流开头最多等多久。和配置的 `failover` 一一对应，
+/// 没写的是默认值 —— **界面显示的就是真在用的数**，不是「空 = 默认」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FailoverView {
+    /// 说不出原因的失败连续几次之后停用
+    pub failures_to_pause: u32,
+    /// 这类失败第一次停用多少秒，之后每次翻倍
+    pub pause_secs: u64,
+    /// 翻倍的上限，秒
+    pub max_pause_secs: u64,
+    /// 余额不足时停用多少秒
+    pub no_balance_pause_secs: u64,
+    /// 额度用完、上游没说什么时候重置时停用多少秒
+    pub quota_pause_secs: u64,
+    /// 限流时按 `Retry-After` 停用，最多多少秒
+    pub rate_limit_max_pause_secs: u64,
+    /// 流式回答的开头最多等多少秒
+    pub stream_start_wait_secs: u64,
 }
 
 /// 每项防护各在哪一档：`off` / `observe` / `enforce`。
