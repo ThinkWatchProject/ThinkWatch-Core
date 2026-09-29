@@ -231,12 +231,14 @@ impl AppState {
         let models = Arc::new(crate::models::Directory::default());
         models.reconcile(&config);
         let rt = Runtime::build(config, None)?;
+        let health = Arc::new(Health::new());
+        health.configure(&rt.config.failover);
         let state = Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Default::default(),
             http,
             bus: tw_observe::EventBus::new(),
-            health: Arc::new(Health::new()),
+            health,
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
             models,
             body_sink: Arc::new(std::sync::Mutex::new(None)),
@@ -381,6 +383,7 @@ impl AppState {
         let (sheets, assign) = (next.config.pricing.clone(), next.config.price_assign());
         self.pricing
             .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
+        self.health.configure(&next.config.failover);
         self.rt.store(Arc::new(next));
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表
         // 即承诺），改了范围的立刻生效。新加的、地址凭据变了的在后台补问

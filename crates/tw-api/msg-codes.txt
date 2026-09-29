@@ -58,6 +58,7 @@ config.edit.self_check
 config.edit.unwritable
 config.empty_key
 config.empty_models_only
+config.failover_range
 config.name_collision
 config.no_clients
 config.output_limit_range
@@ -286,6 +287,7 @@ gw.upstream.sign_failed
 gw.upstream.status
 gw.upstream.stream_error
 gw.upstream.stream_exception
+gw.upstream.stream_opening_error
 gw.upstream.timeout
 gw.upstream.unreachable
 gw.ws.bad_header

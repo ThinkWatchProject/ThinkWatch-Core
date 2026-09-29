@@ -101,6 +101,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `client_probes` | 对象，见 [`client_probes`](#cfg-client_probes) | — | 客户端自行发出的辅助请求（连通性检查、预热、起标题）如何处理。 |
 | `security` | 对象，见 [`security`](#cfg-security) | — | 五项防护。出厂时都处在 `observe` 或 `off`，不改变、不拦截任何请求。 |
 | `retention` | 对象，见 [`retention`](#cfg-retention) | — | 请求日志保留多久。 |
+| `failover` | 对象，见 [`failover`](#cfg-failover) | — | 上游失败后停用多久，以及流式回答的开头最多等多久。 |
 | `groups` | 对象列表，见 [`groups[]`](#cfg-groups) | `[]` | 策略组：多个上游合用一个名字，并规定如何在其中选择。 |
 | `routes` | 对象列表，见 [`routes[]`](#cfg-routes) | `[]` | 路由。一条都不写时，请求按上游的声明顺序故障转移。 |
 | `default_route` | 字符串 | — | 未指定路由的密钥走哪条路由。不写：名为 `default` 的路由；没有这条路由时走内置的故障转移。 |
@@ -684,6 +685,29 @@ security:
 | `body_days` | 整数 | `7` | 请求和响应正文保留的天数。 |
 | `row_days` | 整数 | `90` | 每条请求记录（时间、模型、用量、费用）保留的天数。 |
 | `body_max_bytes` | 整数 | `2147483648` | 正文最多占用的字节数，超出时从最早的日期开始删除。默认 2 GiB。 |
+<!-- /generated -->
+
+### `failover`
+
+上游失败后会停用一段时间，接下来的请求直接交给下一个候选。停用多久取决于上游
+给出的原因：余额不足要等充值，额度用完要等到上游说的重置时刻，限流通常几秒钟就
+过去。只有一个候选的请求不受影响。
+
+流式回答在第一段内容交给客户端之前，上游在流里报的错误和错误状态码一样，会把
+请求换到下一个候选。
+
+<!-- generated: table failover -->
+<a id="cfg-failover"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `failures_to_pause` | 整数 | `3` | 没有说明原因的失败（5xx、连接失败）连续几次后停用这家上游，取值 1 到 100。 |
+| `pause_secs` | 整数 | `60` | 这类失败第一次停用的秒数。之后每停用一次翻一倍，直到 `max_pause_secs`；成功一次后回到这个值。 |
+| `max_pause_secs` | 整数 | `600` | 翻倍后的停用上限，单位秒，不小于 `pause_secs`。 |
+| `no_balance_pause_secs` | 整数 | `1800` | 上游报告余额不足时停用的秒数。 |
+| `quota_pause_secs` | 整数 | `3600` | 上游报告额度用完、但没有给出重置时间时停用的秒数。给出了重置时间的，停用到那一刻。 |
+| `rate_limit_max_pause_secs` | 整数 | `3600` | 被限流的上游按它给的 `Retry-After` 停用，最多这么多秒。没有 `Retry-After` 的按没有说明原因的失败计。 |
+| `stream_start_wait_secs` | 整数 | `15` | 流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。 |
 <!-- /generated -->
 
 ### `groups`

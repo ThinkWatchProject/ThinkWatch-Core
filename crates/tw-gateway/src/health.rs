@@ -3,9 +3,10 @@
 //! 状态机是共用的（`tw-breaker`，企业版的路由和 MCP 熔断跑的是同一个），
 //! 这里是桌面版的**规矩**：
 //!
-//! **只有两个旋钮**：连续失败阈值和冷却时长。cc-switch
-//! 那套有五个，其中「错误率 + 最小请求数」这条路径在单用户场景下几乎永远
-//! 打不满 —— 要先攒够十几个请求才生效，而那时用户早就自己发现了。
+//! **停用多久看失败的原因**（见 [`crate::failure`]）。上游说了原因的 —— 余额
+//! 不足、额度用完、限流并给了 `Retry-After` —— 一次就停用，停到那个原因该过去
+//! 的时候；说不出原因的（5xx、连不上）连续几次才停，停的时长每次翻倍，成功一次
+//! 就回到起点。几个数都在配置的 `failover` 里。
 //!
 //! 两条硬边界，它们比参数重要得多：
 //!
@@ -15,23 +16,28 @@
 //! 2. **只有一个候选时完全旁路熔断器。**否则唯一的上游一旦被自己熔断，
 //!    就把用户锁死了，熔断纯粹是自伤。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use tw_breaker::State;
-use tw_breaker::{Breakers, Policy, Trip};
+use tw_breaker::{Breaker, Policy, Tally, Trip};
 
-/// 连续失败多少次算坏。
-pub const FAILURE_THRESHOLD: u32 = 3;
+use crate::failure::Cause;
 
-/// 熔断之后多久放一个探测过去。
-pub const COOLDOWN: Duration = Duration::from_secs(60);
+type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-/// 桌面版的规矩：连续失败 3 次打开，冷却 60 秒，一次成功就闭合。
-pub const POLICY: Policy = Policy {
-    trip: Trip::Consecutive(FAILURE_THRESHOLD),
-    cooldown: COOLDOWN,
-    probes: 1,
-};
+/// 一家上游记着的东西。
+#[derive(Debug, Clone, Copy, Default)]
+struct Entry {
+    /// 说不出原因的失败走它：连续几次打开，冷却到点放一个探测过去
+    breaker: Breaker,
+    /// 它打开过几次（中间没有成功过）。冷却按它翻倍
+    trips: u32,
+    /// 上游说了原因的停用，到这一刻为止（Unix 毫秒）。**到点了也留着**，
+    /// 直到下一次成功 —— 报「恢复」的定时器要靠它知道这家曾经停过
+    held_until_ms: Option<i64>,
+}
 
 /// 每个 provider 的健康状态。
 ///
@@ -39,7 +45,10 @@ pub const POLICY: Policy = Policy {
 /// 意味着用户重启后第一个请求还在被上一次的故障惩罚 —— 而重启本身往往
 /// 就是他为了解决问题做的事。
 pub struct Health {
-    breakers: Breakers<String>,
+    map: Mutex<HashMap<String, Entry>>,
+    /// 配置里的 `failover`。**跟着配置换**（[`Self::configure`]），状态不丢
+    settings: Mutex<tw_config::Failover>,
+    clock: Clock,
 }
 
 impl Default for Health {
@@ -50,16 +59,69 @@ impl Default for Health {
 
 impl Health {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(tw_breaker::now_ms))
+    }
+
+    fn with_clock(clock: Clock) -> Self {
         Self {
-            breakers: Breakers::new(POLICY),
+            map: Mutex::new(HashMap::new()),
+            settings: Mutex::new(tw_config::Failover::default()),
+            clock,
         }
     }
 
-    #[cfg(test)]
-    fn with_clock(clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
-        Self {
-            breakers: Breakers::with_clock(POLICY, clock),
+    /// 换一份 `failover` 设置。已经停用着的照旧停着；之后的判断按新的算
+    pub fn configure(&self, settings: &tw_config::Failover) {
+        if let Ok(mut s) = self.settings.lock() {
+            *s = settings.clone();
         }
+    }
+
+    fn settings(&self) -> tw_config::Failover {
+        self.settings.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// 这家此刻的熔断规矩：冷却随它打开过的次数翻倍
+    fn policy(settings: &tw_config::Failover, trips: u32) -> Policy {
+        let doubled = settings
+            .pause_secs
+            .saturating_mul(1u64 << trips.saturating_sub(1).min(20));
+        Policy {
+            trip: Trip::Consecutive(settings.failures_to_pause),
+            cooldown: Duration::from_secs(doubled.min(settings.max_pause_secs)),
+            probes: 1,
+        }
+    }
+
+    fn state_of(e: &Entry, settings: &tw_config::Failover, now: i64) -> State {
+        if e.held_until_ms.is_some_and(|t| now < t) {
+            return State::Open;
+        }
+        e.breaker.state_at(&Self::policy(settings, e.trips), now)
+    }
+
+    fn entry(&self, name: &str) -> Entry {
+        self.map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(name).copied())
+            .unwrap_or_default()
+    }
+
+    /// 改一家的记录，返回状态变化（没变是 `None`）。
+    fn update(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut Entry, &tw_config::Failover, i64),
+    ) -> Option<State> {
+        let settings = self.settings();
+        let now = (self.clock)();
+        let mut map = self.map.lock().ok()?;
+        let e = map.entry(name.to_string()).or_default();
+        let before = Self::state_of(e, &settings, now);
+        f(e, &settings, now);
+        let after = Self::state_of(e, &settings, now);
+        (after != before).then_some(after)
     }
 
     /// 这家现在能进候选链吗。冷却到点的算半开，放行。
@@ -67,11 +129,11 @@ impl Health {
     /// **和「能不能收一个探测请求」是两件事**：只看不改，光是排候选顺序
     /// 不该把半开状态的探测机会用掉。
     pub fn is_available(&self, name: &str) -> bool {
-        self.breakers.admits(&name.to_string())
+        self.state(name) != State::Open
     }
 
     pub fn state(&self, name: &str) -> State {
-        self.breakers.state(&name.to_string())
+        Self::state_of(&self.entry(name), &self.settings(), (self.clock)())
     }
 
     /// 记一次成功。**返回的是状态变化，没变就是 `None`。**
@@ -79,19 +141,71 @@ impl Health {
     /// 调用方要拿它去发事件：熔断开合是界面上看得见的状态，而看得见的
     /// 状态必须能被推出去 —— 否则界面只能轮询。
     pub fn record_success(&self, name: &str) -> Option<State> {
-        self.breakers.record(&name.to_string(), true)
+        self.update(name, |e, s, now| {
+            e.breaker
+                .record(true, Tally::default(), &Self::policy(s, e.trips), now);
+            e.trips = 0;
+            e.held_until_ms = None;
+        })
     }
 
-    /// 记一次失败，同样返回状态变化。
+    /// 记一次说不出原因的失败，同样返回状态变化。
     pub fn record_failure(&self, name: &str) -> Option<State> {
-        self.breakers.record(&name.to_string(), false)
+        self.update(name, |e, s, now| {
+            let policy = Self::policy(s, e.trips);
+            let before = e.breaker.state_at(&policy, now);
+            e.breaker.record(false, Tally::default(), &policy, now);
+            // 这一次打开了（或者探测失败又打开了）：下一段冷却翻倍。
+            // 已经开着、冷却还没到时又失败的（只有一家候选时会这样）不算新的一次
+            if before != State::Open && e.breaker.state == State::Open {
+                e.trips = e.trips.saturating_add(1);
+            }
+        })
     }
 
-    /// 这家还要等多久才轮到探测。见 [`tw_breaker::Breaker::cooldown_left`]。
+    /// 记一次失败，按原因停用。返回状态变化。
+    pub fn record_cause(&self, name: &str, cause: Cause) -> Option<State> {
+        let s = self.settings();
+        let now = (self.clock)();
+        let secs =
+            |n: u64| now.saturating_add(i64::try_from(n.saturating_mul(1000)).unwrap_or(i64::MAX));
+        let until = match cause {
+            Cause::ModelUnavailable => return None,
+            Cause::NoBalance => secs(s.no_balance_pause_secs),
+            Cause::QuotaUsedUp { resets_at_ms } => resets_at_ms
+                .and_then(|t| i64::try_from(t).ok())
+                .filter(|t| *t > now)
+                .unwrap_or_else(|| secs(s.quota_pause_secs)),
+            Cause::RateLimited {
+                retry_after: Some(d),
+            } if !d.is_zero() => secs(d.as_secs().max(1).min(s.rate_limit_max_pause_secs)),
+            Cause::RateLimited { .. } | Cause::AuthRejected | Cause::Unexplained => {
+                return self.record_failure(name);
+            }
+        };
+        self.update(name, |e, _, _| {
+            e.held_until_ms = Some(e.held_until_ms.map_or(until, |t| t.max(until)));
+        })
+    }
+
+    /// 这家还要等多久才轮到探测。
+    ///
+    /// `None`：没停用过（或者停用之后已经成功过）。`Some(0)`：到点了。
     ///
     /// **专门给「报一条恢复」的定时器用。**
     pub fn cooldown_left(&self, name: &str) -> Option<Duration> {
-        self.breakers.cooldown_left(&name.to_string())
+        let e = self.entry(name);
+        let now = (self.clock)();
+        let held = e
+            .held_until_ms
+            .map(|t| Duration::from_millis(u64::try_from(t.saturating_sub(now)).unwrap_or(0)));
+        let breaker = e
+            .breaker
+            .cooldown_left(&Self::policy(&self.settings(), e.trips), now);
+        match (held, breaker) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// 从候选里挑出还能用的，**并说明是不是 fail-open**。
@@ -276,11 +390,119 @@ mod tests {
             h.record_failure("a");
         }
         assert!(!h.is_available("a"));
-        now.store(COOLDOWN.as_millis() as i64, Ordering::SeqCst);
+        now.store(60_000, Ordering::SeqCst);
         assert!(h.is_available("a"), "冷却到点就放一个过去");
         assert_eq!(h.cooldown_left("a"), Some(Duration::ZERO));
         // 探测又失败：再报一次打开
         assert_eq!(h.record_failure("a"), Some(State::Open));
         assert!(!h.is_available("a"));
+    }
+
+    fn clocked() -> (Health, std::sync::Arc<std::sync::atomic::AtomicI64>) {
+        let now = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1_000_000));
+        let h = Health::with_clock({
+            let now = now.clone();
+            std::sync::Arc::new(move || now.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        (h, now)
+    }
+
+    fn advance(now: &std::sync::atomic::AtomicI64, ms: i64) {
+        now.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn each_further_pause_doubles_until_the_ceiling_and_a_success_resets_it() {
+        let (h, now) = clocked();
+        for _ in 0..3 {
+            h.record_failure("a");
+        }
+        assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(60)));
+        // 探测又失败：第二段 120 秒
+        advance(&now, 60_000);
+        assert_eq!(h.record_failure("a"), Some(State::Open));
+        assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(120)));
+        advance(&now, 120_000);
+        h.record_failure("a");
+        assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(240)));
+        advance(&now, 240_000);
+        h.record_failure("a");
+        advance(&now, 480_000);
+        h.record_failure("a");
+        assert_eq!(
+            h.cooldown_left("a"),
+            Some(Duration::from_secs(600)),
+            "封顶在 max_pause_secs"
+        );
+        // 成功一次，下次打开又从 60 秒起
+        advance(&now, 600_000);
+        h.record_success("a");
+        for _ in 0..3 {
+            h.record_failure("a");
+        }
+        assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_stated_reason_sets_the_upstream_aside_at_once_for_as_long_as_it_says() {
+        let (h, now) = clocked();
+        assert_eq!(h.record_cause("a", Cause::NoBalance), Some(State::Open));
+        assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(1800)));
+
+        let reset = 1_000_000 + 5 * 3_600_000;
+        h.record_cause(
+            "b",
+            Cause::QuotaUsedUp {
+                resets_at_ms: Some(reset as u64),
+            },
+        );
+        assert_eq!(h.cooldown_left("b"), Some(Duration::from_secs(5 * 3600)));
+        h.record_cause("c", Cause::QuotaUsedUp { resets_at_ms: None });
+        assert_eq!(h.cooldown_left("c"), Some(Duration::from_secs(3600)));
+
+        // Retry-After 太长的按上限
+        h.record_cause(
+            "d",
+            Cause::RateLimited {
+                retry_after: Some(Duration::from_secs(99_999)),
+            },
+        );
+        assert_eq!(h.cooldown_left("d"), Some(Duration::from_secs(3600)));
+
+        // 到点了：能用，定时器看到 0；成功之后什么都不记得
+        advance(&now, 1_800_000);
+        assert!(h.is_available("a"));
+        assert_eq!(h.cooldown_left("a"), Some(Duration::ZERO));
+        h.record_success("a");
+        assert_eq!(h.cooldown_left("a"), None);
+    }
+
+    #[test]
+    fn a_missing_model_or_an_unstated_rate_limit_does_not_set_it_aside_at_once() {
+        let (h, _) = clocked();
+        assert_eq!(h.record_cause("a", Cause::ModelUnavailable), None);
+        assert!(h.is_available("a"));
+        // 没说多久的限流按说不出原因的失败算：连续三次才停
+        for _ in 0..2 {
+            h.record_cause("b", Cause::RateLimited { retry_after: None });
+        }
+        assert!(h.is_available("b"));
+        h.record_cause("b", Cause::Unexplained);
+        assert!(!h.is_available("b"));
+    }
+
+    #[test]
+    fn the_settings_come_from_the_configuration() {
+        let (h, _) = clocked();
+        h.configure(&tw_config::Failover {
+            failures_to_pause: 1,
+            pause_secs: 5,
+            no_balance_pause_secs: 7,
+            ..Default::default()
+        });
+        assert_eq!(h.record_failure("a"), Some(State::Open), "一次就停");
+        assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(5)));
+        h.record_cause("b", Cause::NoBalance);
+        assert_eq!(h.cooldown_left("b"), Some(Duration::from_secs(7)));
     }
 }

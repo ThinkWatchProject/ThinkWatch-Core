@@ -71,6 +71,13 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     OutputLimitRange { max: usize, ceiling: usize },
     #[error("{}", self.msg())]
+    FailoverRange {
+        field: &'static str,
+        value: u64,
+        min: u64,
+        max: u64,
+    },
+    #[error("{}", self.msg())]
     ControlKeyMissing,
     #[error("{}", self.msg())]
     ControlKeyInvalid,
@@ -202,6 +209,15 @@ impl ValidationError {
             OutputLimitRange { max, ceiling } => msg!(
                 "config.output_limit_range", max = max, ceiling = ceiling =>
                 "security.output_limit.max_chars is {max}; it has to be between 1 and {ceiling}"
+            ),
+            FailoverRange {
+                field,
+                value,
+                min,
+                max,
+            } => msg!(
+                "config.failover_range", field = field, value = value, min = min, max = max =>
+                "failover.{field} is {value}; it has to be between {min} and {max}"
             ),
             ControlKeyMissing => msg!(
                 "config.control_key_missing" =>
@@ -427,6 +443,14 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
         return Err(ValidationError::OutputLimitRange {
             max,
             ceiling: crate::MAX_CHARS_CEILING,
+        });
+    }
+    if let Some((field, value, min, max)) = cfg.failover.out_of_range() {
+        return Err(ValidationError::FailoverRange {
+            field,
+            value,
+            min,
+            max,
         });
     }
     // 按 id 开关、改处置的内置规则得真的存在。**写错一个 id 和写错一个字段名
@@ -874,6 +898,34 @@ mod tests {
         }
         x.security.output_limit.max_chars = 1;
         assert!(validate(&x).is_ok());
+    }
+
+    /// 停用时长写成 0 等于没有停用，上限比起点还小等于翻倍从一开始就封顶 ——
+    /// 都是写错了，说出是哪一项
+    #[test]
+    fn failover_numbers_have_to_be_in_range() {
+        let base = with_rules(&[], &[]);
+        assert!(validate(&base).is_ok());
+        type Bend = fn(&mut crate::Failover);
+        let cases: [(&str, Bend); 4] = [
+            ("failures_to_pause", |f| f.failures_to_pause = 0),
+            ("pause_secs", |f| f.pause_secs = 0),
+            ("max_pause_secs", |f| {
+                f.pause_secs = 120;
+                f.max_pause_secs = 60;
+            }),
+            ("stream_start_wait_secs", |f| {
+                f.stream_start_wait_secs = crate::MAX_STREAM_START_WAIT_SECS + 1
+            }),
+        ];
+        for (want, bend) in cases {
+            let mut x = base.clone();
+            bend(&mut x.failover);
+            match validate(&x) {
+                Err(ValidationError::FailoverRange { field, .. }) => assert_eq!(field, want),
+                other => panic!("{want} 该被拒，实际 {other:?}"),
+            }
+        }
     }
 
     /// 按 id 写到的内置规则得真的存在：写错的 id 和写错的字段名一样拒绝，

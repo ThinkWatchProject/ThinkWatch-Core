@@ -152,6 +152,7 @@ means.
 | `client_probes` | object, [`client_probes`](#cfg-client_probes) | — | What happens to the helper requests clients send on their own (health checks, warm-ups, titles). |
 | `security` | object, [`security`](#cfg-security) | — | The five guards. All of them start in `observe` or `off`, so out of the box nothing is changed or blocked. |
 | `retention` | object, [`retention`](#cfg-retention) | — | How long request logs are kept. |
+| `failover` | object, [`failover`](#cfg-failover) | — | How long an upstream is set aside after it fails, and how long the start of a stream is awaited. |
 | `groups` | list of [`groups[]`](#cfg-groups) | `[]` | Strategy groups: several upstreams behind one name, with a way to pick among them. |
 | `routes` | list of [`routes[]`](#cfg-routes) | `[]` | Routes. Without any, requests fail over across all upstreams in the order they are declared. |
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
@@ -814,6 +815,32 @@ a few hundred bytes. The byte limit covers bursts.
 | `body_days` | integer | `7` | Days to keep request and response bodies. |
 | `row_days` | integer | `90` | Days to keep the record of each request (time, model, usage, cost). |
 | `body_max_bytes` | integer | `2147483648` | Upper bound on the bytes bodies may take; beyond it the oldest days go first. The default is 2 GiB. |
+<!-- /generated -->
+
+### `failover`
+
+An upstream that fails is set aside for a while, so that the next requests
+go straight to the next candidate. How long depends on the reason the
+upstream gives: an insufficient balance waits for a top-up, a used-up quota
+waits until the moment the upstream says it resets, and a rate limit usually
+passes within seconds. A request with a single candidate is never affected.
+
+Before the first content of a streamed answer reaches the client, an error
+the upstream sends in the stream moves the request to the next candidate,
+the same as an error status would.
+
+<!-- generated: table failover -->
+<a id="cfg-failover"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `failures_to_pause` | integer | `3` | Consecutive failures without a stated reason (5xx, connection errors) before the upstream is set aside. From 1 to 100. |
+| `pause_secs` | integer | `60` | Seconds the first such pause lasts. Each further pause doubles it, up to `max_pause_secs`; one success resets it. |
+| `max_pause_secs` | integer | `600` | Upper bound on the doubled pause, in seconds; not less than `pause_secs`. |
+| `no_balance_pause_secs` | integer | `1800` | Seconds to set aside an upstream that reports an insufficient balance. |
+| `quota_pause_secs` | integer | `3600` | Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then. |
+| `rate_limit_max_pause_secs` | integer | `3600` | A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason. |
+| `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
 <!-- /generated -->
 
 ### `groups`
