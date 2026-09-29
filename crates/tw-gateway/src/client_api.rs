@@ -79,13 +79,17 @@ impl ClientApi {
                 && (p.ends_with(":generateContent") || p.ends_with(":streamGenerateContent")))
     }
 
-    /// 这个路径是不是 Anthropic 的数 token（`/v1/messages/count_tokens`）。
+    /// 这个路径是不是数 token：Anthropic 的 `/v1/messages/count_tokens`、Gemini 的
+    /// `:countTokens`。
     ///
-    /// Bedrock 上游接不了它（见 [`crate::error::Source::NotSupported`]）：bedrock-runtime
-    /// 的 CountTokens 只数得了一部分老模型，较新的、只能跨区域推理的那些在那里数不了。
+    /// **别的格式的上游也能「服务」它**：不发过去，网关自己估一个数（见 [`crate::count`]）。
+    /// 只有 Anthropic 的数 token 到了 Bedrock 上游例外，回 501（见
+    /// [`crate::error::Source::NotSupported`]）：bedrock-runtime 的 CountTokens 只数得了
+    /// 一部分老模型，Claude Code 认这个回答，会自己去数一个准的。
     pub fn counts_tokens(path: &str) -> bool {
         let p = path.trim_end_matches('/');
         p.strip_prefix("/v1").unwrap_or(p) == "/messages/count_tokens"
+            || (p.contains("/models/") && p.ends_with(":countTokens"))
     }
 
     /// 转换库里对应的格式
@@ -113,13 +117,15 @@ impl ClientApi {
         self.protocol().slug()
     }
 
-    /// 能服务这次调用的上游协议。
+    /// 能服务这次调用的上游协议。`any` 是生成回答，或者数 token（见
+    /// [`ClientApi::counts_tokens`]）。
     ///
     /// **模型准入、`/v1/models` 和转发时选不选这家，用的都是这一张表** ——
     /// 列出来的模型发过去一定有人能接。生成回答四种格式互相转换，谁都能服务；
-    /// 别的接口只有同格式的上游能处理（见 [`ClientApi::generates`]）。
-    pub fn servable_by(&self, generates: bool) -> &'static [Protocol] {
-        if generates {
+    /// 数 token 别的格式的上游由网关本地估算；别的接口只有同格式的上游能处理（见
+    /// [`ClientApi::generates`]）。
+    pub fn servable_by(&self, any: bool) -> &'static [Protocol] {
+        if any {
             return &[
                 Protocol::Anthropic,
                 Protocol::OpenaiChat,
@@ -233,12 +239,14 @@ mod tests {
     }
 
     #[test]
-    fn only_anthropics_count_tokens_path_counts_tokens() {
+    fn both_count_tokens_paths_count_tokens() {
         for (path, counts) in [
             ("/v1/messages/count_tokens", true),
             ("/messages/count_tokens/", true),
             ("/v1/messages", false),
-            ("/v1beta/models/gemini-2.5-pro:countTokens", false),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", true),
+            ("/v1beta/models/gemini-2.5-pro:generateContent", false),
+            ("/v1/embeddings", false),
         ] {
             assert_eq!(ClientApi::counts_tokens(path), counts, "{path}");
         }

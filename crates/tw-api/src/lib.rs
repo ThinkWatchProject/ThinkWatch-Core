@@ -646,7 +646,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （[`AffinityView`]）：这次沿用了这一轮的路由决定、留在了上次回答的那一家的，
 /// 说得出来。照 28 写的界面保存策略组时交的 `session_affinity` 被忽略，读
 /// `hurts_cache` 读到的是 undefined。
-pub const CONTROL_API_VERSION: u32 = 29;
+///
+/// **30 起数 token 可以由网关本地估算**：`/v1/messages/count_tokens` 和 Gemini 的
+/// `:countTokens` 路由到别的格式的上游、或者上游回 404 / 405 时，网关自己估一个数回去。
+/// 尝试链多一种结果 [`AttemptOutcome::Estimated`]，那一行是 `local`、费用 0。照 29 写的
+/// 界面不认这个词。
+pub const CONTROL_API_VERSION: u32 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1278,6 +1283,11 @@ slug_enum! {
         Status = "status",
         /// 没有收到响应（超时、无法连接），或者这一跳没有发出去
         Error = "error",
+        /// 数 token 的请求由网关本地估算，没有用这一家的回答：这一家不是客户端那种
+        /// 格式（没有发出去，没有 `status`），或者它回了 404 / 405、没实现这个接口
+        /// （`status` 是它回的那个）。尝试链到此为止，这一行记成网关自己答的
+        /// （[`HistoryRow::local`]），费用 0
+        Estimated = "estimated",
     }
 }
 

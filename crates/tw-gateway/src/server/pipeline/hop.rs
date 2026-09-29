@@ -27,6 +27,14 @@ pub(super) struct Served<'a> {
     pub(super) session: Option<tw_dialect::convert::Session>,
 }
 
+/// 这个请求的着落。
+pub(super) enum Answer<'a> {
+    /// 一家上游接下了它
+    Served(Box<Served<'a>>),
+    /// 数 token 的请求由网关本地估算（见 [`crate::count`]）：要回给客户端的正文
+    Estimated(Bytes),
+}
+
 /// 这一跳要发出去的东西。
 struct Outbound {
     body: Bytes,
@@ -53,8 +61,14 @@ pub(super) async fn try_upstreams<'a>(
     reading: &crate::client_api::Reading,
     decision: &tw_engine::Decision,
     started: &Started,
-) -> Result<Served<'a>, GatewayError> {
+) -> Result<Answer<'a>, GatewayError> {
     let id = started.id;
+    // 数 token（见 `crate::count`）：选中的那一家数不了就由网关估，**不换模型**
+    let counting = crate::client_api::ClientApi::counts_tokens(req.uri.path());
+    // 数 token 第一跳要的模型（规则改写过的是改写后的）。往下只换要同一个模型的
+    let mut count_model: Option<Option<String>> = None;
+    // 由网关估了数的那一家
+    let mut estimated: Option<&tw_config::Provider> = None;
     let mut attempts: Vec<String> = Vec::new();
     // 每一跳的结果和耗时。**失败的原因要留着** —— 一条说「试过 A → B →
     // C」的链，和一条还说清每一跳为什么失败的链，排查价值差得远。
@@ -78,9 +92,20 @@ pub(super) async fn try_upstreams<'a>(
             )));
             continue;
         };
+        // 数 token 选中的那一家失败了（5xx、429、连不上）：往下只换同格式的上游。
+        // **别的格式的那几家不估**：选中的那一家出了错，报出来的该是这个错
+        if counting && !attempts.is_empty() && !same_format(req, provider) {
+            continue;
+        }
         attempts.push(provider.name.clone());
         let hop_started = std::time::Instant::now();
 
+        // 数 token 选中的是别的格式的上游：不发，网关自己估
+        if counting && attempts.len() == 1 && estimates(req, provider) {
+            chain.push(estimated_hop(provider, None, None, hop_started));
+            estimated = Some(provider);
+            break;
+        }
         if let Some(err) = protocol_mismatch(req, reading.generates, provider) {
             chain.push(hop_failed(
                 &provider.name,
@@ -143,6 +168,17 @@ pub(super) async fn try_upstreams<'a>(
             .model
             .clone()
             .filter(|m| *m != reading.facts.model);
+        // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数
+        if counting {
+            match &count_model {
+                None => count_model = Some(model.clone()),
+                Some(first) if *first != model => {
+                    attempts.pop();
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
 
         let out = match prepare(state, req, reading, provider, &effective_set, id) {
             Ok(out) => out,
@@ -158,10 +194,12 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
+        // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
+        let unsealed = unseal_upfront(state, req, started, provider, &out);
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
         // 格式）。规则是全局的，每一跳换掉的是同一批东西
         let (body, ledger) =
-            crate::guard::replace(rt.config.security.redact.mode, &rt.redact, out.body.clone());
+            crate::guard::replace(rt.config.security.redact.mode, &rt.redact, unsealed);
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
@@ -224,18 +262,32 @@ pub(super) async fn try_upstreams<'a>(
             "forwarding"
         );
 
-        match send(
+        let sent = send(
             state,
             req,
             provider,
             http,
             &out,
-            body,
-            upstream_headers,
+            body.clone(),
+            upstream_headers.clone(),
             aws.as_ref(),
         )
-        .await
-        {
+        .await;
+        // 上游拒绝了别家封存的推理：去掉它们，同一家再发一次
+        let sent = match sent {
+            Ok(r) => {
+                let resend = Resend {
+                    out: &out,
+                    body: &body,
+                    headers: &upstream_headers,
+                    aws: aws.as_ref(),
+                    conversation: started.conversation.as_deref(),
+                };
+                resend_unsealed(state, req, provider, http, resend, r).await
+            }
+            Err(e) => Err(e),
+        };
+        match sent {
             Ok(r) if r.status().is_server_error() || r.status() == 429 => {
                 // 额度用完时上游回的正是 429，这一跳的额度头也要读
                 state.note_quota(id, &provider.name, r.headers());
@@ -290,6 +342,17 @@ pub(super) async fn try_upstreams<'a>(
                     &provider.name,
                     state.health.record_success(&provider.name),
                 );
+                // 同格式的上游没实现数 token（不少中转只做了生成回答）：网关自己估
+                if counting && crate::count::unsupported(r.status().as_u16()) {
+                    chain.push(estimated_hop(
+                        provider,
+                        model.clone(),
+                        Some(r.status().as_u16()),
+                        hop_started,
+                    ));
+                    estimated = Some(provider);
+                    break;
+                }
                 chain.push(hop(
                     &provider.name,
                     model.clone(),
@@ -341,10 +404,12 @@ pub(super) async fn try_upstreams<'a>(
     // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
     // 最终服务的那家怎么收钱。**跟着请求走，不能事后查配置** ——
     // 配置随时会被热重载，而一条三天前的记录该按它当时那家的算。
-    let billing = served
-        .as_ref()
-        .map(|s| s.provider.billing)
-        .unwrap_or_default();
+    // 网关估的数不花钱
+    let billing = match (&served, estimated) {
+        (_, Some(_)) => tw_config::Billing::Free,
+        (Some(s), None) => s.provider.billing,
+        (None, None) => Default::default(),
+    };
     let choice = &started.choice;
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
@@ -359,6 +424,18 @@ pub(super) async fn try_upstreams<'a>(
     });
     if let Some(err) = halt {
         return Err(err);
+    }
+    if let Some(provider) = estimated {
+        tracing::debug!(provider = %provider.name, "estimated the token count locally");
+        let client = req
+            .api
+            .map(|a| a.dialect())
+            .unwrap_or(tw_dialect::ir::Dialect::Anthropic);
+        return Ok(Answer::Estimated(Bytes::from(crate::count::answer(
+            client,
+            req.uri.path(),
+            &req.body,
+        ))));
     }
 
     let Some(served) = served else {
@@ -385,7 +462,42 @@ pub(super) async fn try_upstreams<'a>(
             served.provider.name
         );
     }
-    Ok(served)
+    Ok(Answer::Served(Box::new(served)))
+}
+
+/// 这一家和客户端是同一种格式（配置里没写格式的也算：照原样发过去）
+fn same_format(req: &Inbound, provider: &tw_config::Provider) -> bool {
+    match (req.api, provider.effective_protocol()) {
+        (Some(a), Some(p)) => a.protocol() == p,
+        _ => true,
+    }
+}
+
+/// 数 token 选中了这一家，由网关自己估：它不是客户端那种格式。
+///
+/// **Anthropic 的数 token 到了 Bedrock 上游例外**，回 501（见 [`protocol_mismatch`]）：
+/// Claude Code 认那个回答，会自己去数一个准的。
+fn estimates(req: &Inbound, provider: &tw_config::Provider) -> bool {
+    !same_format(req, provider)
+        && !(req.api == Some(crate::client_api::ClientApi::AnthropicMessages)
+            && provider.effective_protocol() == Some(tw_config::Protocol::Bedrock))
+}
+
+/// 网关估了数的那一跳。`status` 是上游回的（它没实现数 token），没发出去的没有
+fn estimated_hop(
+    provider: &tw_config::Provider,
+    model: Option<String>,
+    status: Option<u16>,
+    started: std::time::Instant,
+) -> tw_api::AttemptView {
+    tw_api::AttemptView {
+        provider: provider.name.clone(),
+        model,
+        outcome: tw_api::AttemptOutcome::Estimated,
+        status,
+        error: None,
+        ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 /// 生成回答以外的接口（计 token、嵌入……）没有别的格式可以转换，只能交给同格式
@@ -408,6 +520,7 @@ fn protocol_mismatch(
     // 数 token 到了 Bedrock 上游：501 `not_supported`，客户端会改用别的办法数（见
     // `Source::NotSupported`）。**同样不发出去**
     if p == tw_config::Protocol::Bedrock
+        && a == crate::client_api::ClientApi::AnthropicMessages
         && crate::client_api::ClientApi::counts_tokens(req.uri.path())
     {
         return Some(GatewayError::new(
@@ -672,6 +785,102 @@ fn prepare(
         hop,
         session,
     })
+}
+
+/// 这一跳发出去的那一份是什么格式：转换过的是目标格式，直通的是客户端的
+fn wire(req: &Inbound, out: &Outbound) -> Option<tw_dialect::ir::Dialect> {
+    out.target.or(req.api.map(|a| a.dialect()))
+}
+
+/// 这一跳要发的请求体，去掉这一家在这段对话里拒过的封存（见 [`crate::seal`]）。
+/// 没拒过的原样发
+fn unseal_upfront(
+    state: &AppState,
+    req: &Inbound,
+    started: &Started,
+    provider: &tw_config::Provider,
+    out: &Outbound,
+) -> Bytes {
+    let refused = wire(req, out).zip(
+        started
+            .conversation
+            .as_deref()
+            .and_then(|c| state.seals.of(c, &provider.name)),
+    );
+    match refused.and_then(|(w, only)| crate::seal::strip(w, &out.body, Some(&only))) {
+        Some((body, removed)) => {
+            tracing::debug!(
+                provider = %provider.name,
+                removed = removed.len(),
+                "left out the reasoning this upstream refused earlier in the conversation"
+            );
+            Bytes::from(body)
+        }
+        None => out.body.clone(),
+    }
+}
+
+/// 重发一次要用的：这一跳原来发的那些
+struct Resend<'a> {
+    out: &'a Outbound,
+    body: &'a Bytes,
+    headers: &'a [(String, String)],
+    aws: Option<&'a tw_bedrock::Credentials>,
+    conversation: Option<&'a str>,
+}
+
+/// 上游回 400、拒绝了请求里别家封存的推理（见 [`crate::seal`]）：去掉**全部**封存的
+/// 推理，同一家再发一次，只一次。拒过哪些记下来，这段对话往后发给它之前先去掉。
+///
+/// **不换一家**：换到哪一家都可能是另一个账号，同样解不开；而这一家好好的，只是
+/// 不认那几段笔记。不是这种 400 的原样交回去。
+async fn resend_unsealed(
+    state: &AppState,
+    req: &Inbound,
+    provider: &tw_config::Provider,
+    http: &reqwest::Client,
+    resend: Resend<'_>,
+    r: reqwest::Response,
+) -> Result<reqwest::Response, SendError> {
+    let Some(wire) = wire(req, resend.out) else {
+        return Ok(r);
+    };
+    if r.status() != 400 {
+        return Ok(r);
+    }
+    let Some((stripped, removed)) = crate::seal::strip(wire, resend.body, None) else {
+        return Ok(r);
+    };
+    let status = r.status();
+    let headers = r.headers().clone();
+    let said = r.bytes().await.map_err(SendError::Http)?;
+    if !crate::seal::refusal(wire, &said) {
+        let mut back = http::Response::new(said);
+        *back.status_mut() = status;
+        *back.headers_mut() = headers;
+        return Ok(reqwest::Response::from(back));
+    }
+    if let Some(c) = resend.conversation {
+        state
+            .seals
+            .note(c, &provider.name, &removed, crate::server::now_ms());
+    }
+    tracing::info!(
+        provider = %provider.name,
+        removed = removed.len(),
+        "the upstream refused reasoning sealed by another account; sending again without it"
+    );
+    send(
+        state,
+        req,
+        provider,
+        http,
+        resend.out,
+        Bytes::from(stripped),
+        resend.headers.to_vec(),
+        resend.aws,
+    )
+    .await
 }
 
 /// 这一跳发往的完整地址。

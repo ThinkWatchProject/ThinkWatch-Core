@@ -209,6 +209,8 @@ pub struct AppState {
     pub sessions: Arc<crate::session::Sessions>,
     /// 每段对话这一轮的路由决定、上次回答它的那一家（见 [`crate::affinity`]）。**跨重载存活**
     pub affinity: Arc<crate::affinity::Affinity>,
+    /// 每段对话里、每一家上游拒过的别家封存的推理（见 [`crate::seal`]）。**跨重载存活**
+    pub seals: Arc<crate::seal::Refused>,
     /// Anthropic 流里上游静默多久就补一个 `ping`（见 `relay`）。**测试会把它调短**，
     /// 否则一条心跳的测试要干等十五秒
     pub ping_every: std::time::Duration,
@@ -264,6 +266,7 @@ impl AppState {
             live: crate::live::Live::default(),
             sessions: Default::default(),
             affinity: Default::default(),
+            seals: Default::default(),
             ping_every: crate::PING_EVERY,
             ping_for: crate::PING_FOR,
         };

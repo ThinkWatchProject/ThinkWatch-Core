@@ -660,21 +660,18 @@ async fn counting_tokens_is_not_supported_the_way_claude_code_expects() {
         )
     };
 
-    // 模型清单还没取到：选上游时认出来
+    // 模型清单还没取到
     let (status, text) = count(body.clone()).await;
     assert_eq!(status, 501, "{text}");
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["error"]["type"], "not_supported", "{text}");
     assert!(text.contains("upstream `br`"), "{text}");
 
-    // 取到了：准入时就认出来
+    // 取到了：准入照样放行（数 token 不挑上游的格式），选上游时一样认出来
     tw_gateway::models::refresh_one(&state, "br").await.unwrap();
     let (status, text) = count(body).await;
     assert_eq!(status, 501, "{text}");
-    assert!(
-        text.contains("only AWS Bedrock upstreams serve it"),
-        "{text}"
-    );
+    assert!(text.contains("upstream `br`"), "{text}");
 
     assert!(
         seen.lock().unwrap().iter().all(|s| s.method == "GET"),
