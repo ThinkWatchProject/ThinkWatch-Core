@@ -51,8 +51,9 @@ pub struct Auth<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     /// AWS 回答了，拒绝了。`kind` 是异常名，比如 `AccessDeniedException`、
-    /// `UnrecognizedClientException` —— 凭证不对和凭证对但没有列模型的权限，
-    /// 靠它分开。`message` 是 AWS 的原话，**可能点名账号**，见 [`crate::error`]
+    /// `UnrecognizedClientException`；`message` 是 AWS 的原话，**可能点名账号**，见
+    /// [`crate::error`]。凭证不对和凭证对但没有列模型的权限要两样一起看：Bedrock API Key
+    /// 不对时回的也是 `AccessDeniedException`，只有原话不同
     Status {
         status: u16,
         kind: Option<String>,
