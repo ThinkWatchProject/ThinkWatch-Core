@@ -88,6 +88,7 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
         group: None,
         rewritten_by: vec![],
         denied_by: None,
+        affinity: None,
         attempts: vec![tw_api::AttemptView {
             provider: "官方".into(),
             model: None,

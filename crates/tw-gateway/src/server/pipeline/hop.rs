@@ -353,6 +353,7 @@ pub(super) async fn try_upstreams<'a>(
         group: choice.group.clone(),
         rewritten_by,
         denied_by,
+        affinity: choice.affinity.clone(),
         attempts: chain,
         billing: billing.into(),
     });

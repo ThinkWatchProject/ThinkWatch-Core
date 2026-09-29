@@ -1183,8 +1183,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(group_types),
                     Def::Is("fallback"),
                     t(
-                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price.",
-                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。",
+                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price.",
+                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。",
                     ),
                 ),
                 row(
@@ -1192,15 +1192,6 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Required,
                     t("Member upstreams, by name.", "成员上游的名字。"),
-                ),
-                row(
-                    "session_affinity",
-                    Kind::Bool,
-                    Def::Is("true"),
-                    t(
-                        "Keep a session on the same upstream so its prompt cache keeps hitting. Turning it off under `load-balance` spreads every turn and loses the cache.",
-                        "同一会话固定走同一家，使 prompt cache 持续命中。在 `load-balance` 下关闭会让每一轮都换一家，缓存随之失效。",
-                    ),
                 ),
                 row(
                     "selected",

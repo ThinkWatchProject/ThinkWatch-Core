@@ -827,15 +827,25 @@ group with `to`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the group; unique, and not the name of an upstream. |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
 | `providers` | list of strings | **required** | Member upstreams, by name. |
-| `session_affinity` | bool | `true` | Keep a session on the same upstream so its prompt cache keeps hitting. Turning it off under `load-balance` spreads every turn and loses the cache. |
 | `selected` | string | — | For `select`: the chosen member. |
 <!-- /generated -->
 
-`fallback` is the default because spreading a session across upstreams
-loses the prompt cache, which is worth far more than any spread of load on
-a single user's machine.
+`fallback` is the default because a single user's machine has no load to
+spread.
+
+Whatever the type, a conversation stays on the upstream that last answered
+it, so that what the upstream holds of it in its prompt cache is read again
+rather than paid for in full elsewhere. Within a turn (while the client sends
+tool results back) it always stays; across turns it stays while the previous
+answer read or wrote at least 1024 tokens of prompt cache and came less than
+five minutes ago. An upstream that is cooling down after failures releases
+the conversation, and whichever upstream answered after a failover is the one
+it stays on. The rule a turn matched at its start also holds for the rest of
+that turn: rules keyed on input size or images do not move a turn halfway,
+unless its input no longer fits the context window of a model the rule sends
+it to. `load-balance` therefore takes turns between new conversations.
 
 ### `routes`
 

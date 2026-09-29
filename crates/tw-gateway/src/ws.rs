@@ -181,6 +181,7 @@ pub async fn proxy(
         // 升级请求没有正文，没有什么可改写的；第二阶段也不在这条路上跑
         rewritten_by: Vec::new(),
         denied_by: None,
+        affinity: None,
         attempts: vec![attempt],
         billing: billing.into(),
     });

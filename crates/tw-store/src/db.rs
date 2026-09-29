@@ -2627,6 +2627,7 @@ mod route_stats_tests {
                 group: None,
                 rewritten_by: rewritten_by.iter().map(|s| s.to_string()).collect(),
                 denied_by: denied_by.map(str::to_string),
+                affinity: None,
                 attempts: vec![],
             })
             .unwrap(),
