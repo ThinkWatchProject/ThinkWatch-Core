@@ -333,6 +333,8 @@ async fn an_upstream_error_comes_back_in_the_clients_error_shape() {
     );
 }
 
+/// 数 token 到了别的格式的上游：不转成一次真的补全（那要花钱），也不发过去 ——
+/// 网关自己估一个数（见 `tw_gateway::count`）
 #[tokio::test]
 async fn counting_tokens_is_not_converted_into_a_paid_completion() {
     let (up, seen) = upstream(200, "application/json", "{}".into()).await;
@@ -344,8 +346,8 @@ async fn counting_tokens_is_not_converted_into_a_paid_completion() {
         json!({"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}),
     )
     .await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains("count_tokens"), "{body}");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("input_tokens"), "{body}");
     assert!(
         seen.lock().unwrap().uri.is_empty(),
         "请求被发到了别的格式的上游"

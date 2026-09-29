@@ -49,6 +49,8 @@ struct Started {
     alive: Vec<String>,
     /// 第一阶段的结论。路由事件在它上面补上第二阶段和尝试链
     choice: Choice,
+    /// 这是哪段对话（见 [`crate::affinity::identity`]）。认不出来是 None
+    conversation: Option<String>,
 }
 
 pub(super) async fn pipeline(
@@ -111,10 +113,17 @@ pub(super) async fn pipeline(
         ending,
     );
     screen(&state, &rt, &reading, &started)?;
-    let served = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
+    let answer = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
     let mut ending = ending
         .take()
         .expect("written when the start event was emitted");
+    // 网关估的数不是哪一家回答的：不记这段对话留在哪一家
+    let served = match answer {
+        hop::Answer::Served(served) => *served,
+        hop::Answer::Estimated(body) => {
+            return Ok(estimated(&state, &req, started.id, body, ending));
+        }
+    };
     // 记下实际回答的那一家：故障转移之后接下的备选，就是这段对话之后留下的那一家
     if let Some(c) = &conv {
         ending.answered_by(state.affinity.ticket(
@@ -133,6 +142,43 @@ pub(super) async fn pipeline(
         live,
         ending,
     ))
+}
+
+/// 数 token 由网关估了数（见 [`crate::count`]）：把它交给客户端，照常报响应头和结局。
+///
+/// **不经过 `relay`**：那里按上游的回答记首字节时间、额度、凭据和代理的状态，而这个
+/// 回答不是上游给的 —— 记上去的话，一家从没被问过的上游会显示成「刚刚答得飞快」。
+/// 响应头上带 `x-thinkwatch-local`，和本地应答的一样。
+fn estimated(
+    state: &AppState,
+    req: &Inbound,
+    id: u64,
+    body: Bytes,
+    mut ending: crate::ending::Ending,
+) -> Response {
+    state.bus.emit(tw_api::Event::RequestHeaders {
+        id,
+        status: 200,
+        ttfb_ms: req.started.elapsed().as_millis() as u64,
+    });
+    ending.responded(200);
+    // 留档：请求详情里看得到回了什么数
+    ending.feed(&body);
+    ending.finished(200);
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-thinkwatch-local"),
+                axum::http::HeaderValue::from_static("1"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// 管线第 1.3 步的结果。
@@ -282,9 +328,11 @@ fn admit(
         .iter()
         .find(|c| c.name == req.client_name)
         .and_then(|c| c.allow.clone());
+    // 数 token 也不挑格式：别的格式的上游由网关本地估算（见 `crate::count`）
+    let any = reading.generates || crate::client_api::ClientApi::counts_tokens(req.uri.path());
     let servable = req
         .api
-        .map(|a| crate::client_api::slugs(a.servable_by(reading.generates)));
+        .map(|a| crate::client_api::slugs(a.servable_by(any)));
     // 阶段一之后要的模型。规则一家候选都没给时就看它
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
     let mut models: Vec<&str> = asked.iter().map(|(_, m)| m.as_str()).collect();
@@ -296,24 +344,6 @@ fn admit(
         .any(|m| catalog.admits(m, servable.as_deref(), allow.as_deref()))
     {
         return Ok(());
-    }
-    // 数 token 的模型只有 Bedrock 上游有：回 501 `not_supported`，Claude Code 会改用别的
-    // 办法数（见 `Source::NotSupported`）。说「没有上游提供它」的话，用户会去查一个其实
-    // 能用的模型
-    let bedrock = [tw_config::Protocol::Bedrock.slug()];
-    if crate::client_api::ClientApi::counts_tokens(req.uri.path())
-        && models
-            .iter()
-            .any(|m| catalog.admits(m, Some(&bedrock), allow.as_deref()))
-    {
-        return Err(GatewayError::new(
-            crate::error::Source::NotSupported,
-            msg!(
-                "gw.count_tokens.bedrock_model", model = model =>
-                "Counting tokens is not available for model {model}: only AWS Bedrock upstreams \
-                 serve it."
-            ),
-        ));
     }
     // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
     // 该去改的地方不一样。**改写过的两个名字都要说**：客户端写的是一个，
@@ -552,7 +582,12 @@ fn start(
             at_ms: now_ms(),
         });
     }
-    Started { id, alive, choice }
+    Started {
+        id,
+        alive,
+        choice,
+        conversation: crate::affinity::identity(&req.headers, fp),
+    }
 }
 
 /// 发 `RequestStarted`、把这个请求欠着的结局放进 `ending`、把请求体交去留档，

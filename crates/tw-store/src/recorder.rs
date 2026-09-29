@@ -634,6 +634,13 @@ impl Recorder {
         // 这家所选价目表里该模型的单价」，订阅账号算出来的就是按 API 价格
         // 折算的费用。**不计费的记 $0**：那是一个确定的数。
         let free = p.billing == tw_api::Billing::Free;
+        // 数 token 由网关本地估算的（尝试链停在 `estimated` 上）：和本地应答一样记成
+        // `local` —— 没有用掉谁的 token，汇总和 token 统计都不算它
+        let local = p
+            .routing
+            .attempts
+            .last()
+            .is_some_and(|a| a.outcome == tw_api::AttemptOutcome::Estimated);
         //
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
         // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
@@ -649,13 +656,13 @@ impl Recorder {
             .last()
             .and_then(|a| a.model.as_deref())
             .unwrap_or(&p.model);
-        let resolved = if free {
+        let resolved = if free || local {
             None
         } else {
             book.resolve_for(&p.provider, priced_as)
         };
         let cost = match (&u, &resolved) {
-            _ if free => Some(Cost::Known(0)),
+            _ if free || local => Some(Cost::Known(0)),
             (Some(u), Some(r)) => Some(r.cost(u, partial)),
             _ => None,
         };
@@ -720,7 +727,7 @@ impl Recorder {
                 Ending::Failed(message) => Some((*message).clone()),
                 _ => None,
             },
-            local: false,
+            local,
             cancelled: matches!(how, Ending::Cancelled),
             routing: serde_json::to_string(&p.routing).ok(),
             billing: p.billing,
@@ -1285,6 +1292,42 @@ mod tests {
         );
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.requests, 0, "本地应答混进了请求总数");
+        assert_eq!(s.locally_answered, 1);
+    }
+
+    /// 数 token 由网关估了数：这一行是网关自己答的，费用 0，不进汇总
+    #[test]
+    fn a_token_count_estimated_locally_is_marked_local_and_free() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(3, "gpt-5"));
+        r.on_event(&Event::RequestRouted {
+            id: 3,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec![],
+            denied_by: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "官方".into(),
+                model: None,
+                outcome: tw_api::AttemptOutcome::Estimated,
+                status: Some(404),
+                error: None,
+                ms: 80,
+            }],
+            billing: tw_api::Billing::Free,
+            affinity: None,
+        });
+        r.on_event(&finished(3, None));
+        let row = r.db().get(3).unwrap().unwrap();
+        assert!(row.local);
+        assert_eq!(row.cost_micros, Some(0));
+        // 尝试链照样在：看得出估数是因为这一家没实现数 token
+        let routing: tw_api::RoutingView =
+            serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
+        assert_eq!(routing.attempts[0].status, Some(404));
+        let s = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(s.requests, 0, "估的数混进了请求总数");
         assert_eq!(s.locally_answered, 1);
     }
 
