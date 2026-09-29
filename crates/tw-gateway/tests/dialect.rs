@@ -300,6 +300,62 @@ async fn what_could_not_be_translated_is_reported_to_the_user() {
     );
 }
 
+/// Claude Code 搜网页的那个请求：只带服务端工具 `web_search`，并且强制模型用它。发到别的格式
+/// 的上游时这个工具发不过去 —— **不发**。照样发的话模型不搜索、直接回一段话，Claude Code
+/// 会把它当成搜索结果；客户端要收到的是说得清的一句
+#[tokio::test]
+async fn a_request_that_requires_a_server_tool_is_not_sent_without_it() {
+    let (up, seen) = start_openai_upstream(false).await;
+    let (gw, mut rx) = start_gateway(up).await;
+    let body = serde_json::json!({
+        "model": "deepseek-chat",
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": "You are an assistant for performing a web search tool use"}],
+        "messages": [{"role": "user", "content": "Perform a web search for the query: bedrock pricing"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+        "tool_choice": {"type": "tool", "name": "web_search"}
+    });
+    let (status, text) = ask(gw, body.to_string()).await;
+    assert_eq!(status, 400, "{text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("`web_search`") && m.contains("`deepseek`")),
+        "{text}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "没了这个工具的请求还是发出去了"
+    );
+
+    let mut code = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::RequestFailed { message, .. } = ev {
+            code = Some(message.code);
+            break;
+        }
+    }
+    assert_eq!(code.as_deref(), Some("gw.convert.tool_unsendable"));
+}
+
+/// 要求必须调用工具（`any`），而工具全是发不过去的服务端工具：一样不发
+#[tokio::test]
+async fn a_required_tool_call_with_only_server_tools_is_not_sent() {
+    let (up, seen) = start_openai_upstream(false).await;
+    let (gw, _) = start_gateway(up).await;
+    let body = serde_json::json!({
+        "model": "deepseek-chat",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "find it"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "tool_choice": {"type": "any"}
+    });
+    let (status, text) = ask(gw, body.to_string()).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn the_usage_sniffer_still_sees_the_numbers_after_translation() {
     // **这是最容易断的一处接缝。**翻译出来的流要能被我们自己的嗅探器

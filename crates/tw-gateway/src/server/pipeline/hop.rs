@@ -428,6 +428,42 @@ fn protocol_mismatch(
     ))
 }
 
+/// 请求强制要用、换成这一家的格式之后却没有了的工具。
+///
+/// Claude Code 搜网页时单独发一个请求，只带服务端工具 `web_search`，并且强制模型用它。服务端
+/// 工具只有它所属的那一家执行得了，换格式时被丢掉 —— 照样发出去，模型不搜索，直接回一段话，
+/// 而 Claude Code 把这段话当成搜索结果交给模型。**这样的一跳不发**：换下一家，同格式的上游
+/// 可能还在后面；都不行，客户端收到的是说得清的这一句，而不是一份编出来的结果。
+///
+/// 只管强制的。`auto` 时这类工具只是顺带挂着（有的客户端每个请求都带），丢掉之后模型照常回答。
+fn unsendable_tool(
+    request: &tw_dialect::ir::Request,
+    dropped: &[String],
+    upstream: &str,
+) -> Option<GatewayError> {
+    use tw_dialect::ir::ToolChoice;
+    let msg = match request.tool_choice.as_ref()? {
+        ToolChoice::Named(tool) if !request.tools.iter().any(|t| t.name == *tool) => msg!(
+            "gw.convert.tool_unsendable", tool = tool.clone(), upstream = upstream =>
+            "The request requires the tool `{tool}`, which cannot be sent to upstream `{upstream}` \
+             in its format. Server-side tools such as web search are carried out only by the \
+             provider they belong to."
+        ),
+        ToolChoice::Required
+            if request.tools.is_empty() && dropped.iter().any(|p| p.starts_with("tools.")) =>
+        {
+            msg!(
+                "gw.convert.tools_unsendable", upstream = upstream =>
+                "The request requires a tool call, and none of its tools can be sent to upstream \
+                 `{upstream}` in its format. Server-side tools such as web search are carried out \
+                 only by the provider they belong to."
+            )
+        }
+        _ => return None,
+    };
+    Some(GatewayError::new(crate::error::Source::Request, msg))
+}
+
 /// 把客户端的请求改成这一跳要发的样子：同格式时只做参数改写，
 /// 跨格式时转换。转换不了就换下一家：同格式的上游可能还在后面。
 fn prepare(
@@ -561,6 +597,10 @@ fn prepare(
                     &d.request.model,
                 ),
             });
+            // 请求强制要用的工具发不过去：这一跳不发，换下一家（见 `unsendable_tool`）
+            if let Some(err) = unsendable_tool(&d.request, &p.dropped, &provider.name) {
+                return Err(err);
+            }
             // **转换了就要说一声，丢了字段更要说。**用户会发现「扩展思考开了
             // 却没生效」而完全不知道从哪儿查起
             let mut dropped = p.dropped.clone();

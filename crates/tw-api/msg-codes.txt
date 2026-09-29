@@ -223,6 +223,8 @@ gw.config.proxy_unusable
 gw.config.security_rules passthrough
 gw.content.refused
 gw.convert.failed
+gw.convert.tool_unsendable
+gw.convert.tools_unsendable
 gw.count_tokens.bedrock_model
 gw.count_tokens.bedrock_upstream
 gw.files.unsupported
