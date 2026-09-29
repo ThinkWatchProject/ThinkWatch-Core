@@ -124,12 +124,18 @@ class H(http.server.BaseHTTPRequestHandler):
                 "usage": {"inputTokens": 30, "outputTokens": 2, "totalTokens": 32}}).encode())
         saw = "yes" if b"sk-ant-api03-SMOKEKEY" in body else "no"
         if b"SLOWSTREAM" in body:
-            # 先吐第一帧（输入用量就在里面），然后长时间「思考」—— 客户端
+            # 先吐开头（输入用量在 message_start 里），然后长时间「思考」—— 客户端
             # 会在这期间走掉。不给 content-length，读到连接关闭为止。
+            #
+            # **思考块的开头也要发**：网关在第一段内容到达之前不转发（开头报错还能
+            # 换一家），只有 message_start 的话客户端一个字节都收不到。真实上游
+            # 开始思考时也是马上发这一帧
             self.send_response(200); self.send_header('content-type','text/event-stream')
             self.send_header('connection','close'); self.end_headers()
             self.wfile.write(b'event: message_start\ndata: {"type":"message_start",'
-                             b'"message":{"usage":{"input_tokens":4321,"output_tokens":1}}}\n\n')
+                             b'"message":{"usage":{"input_tokens":4321,"output_tokens":1}}}\n\n'
+                             b'event: content_block_start\ndata: {"type":"content_block_start",'
+                             b'"index":0,"content_block":{"type":"thinking","thinking":""}}\n\n')
             self.wfile.flush()
             time.sleep(30)
             return

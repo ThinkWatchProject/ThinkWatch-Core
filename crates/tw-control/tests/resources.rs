@@ -170,6 +170,47 @@ async fn the_overview_carries_the_version_an_edit_is_based_on() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// 故障转移那一节不写就是默认值，概览照样给出真在用的数；改一项就只写那一项，
+/// 写错的数被拒
+#[tokio::test]
+async fn failover_settings_show_their_defaults_and_take_an_edit() {
+    let b = bed(BASE);
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let f = &json(&body)["failover"];
+    assert_eq!(f["failures_to_pause"], 3, "{body}");
+    assert_eq!(f["pause_secs"], 60);
+    assert_eq!(f["stream_start_wait_secs"], 15);
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/no_balance_pause_secs", "value": 900 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(b.parsed().failover.no_balance_pause_secs, 900);
+    assert!(
+        !b.file().contains("pause_secs: 60"),
+        "没改的默认值不写进文件：{}",
+        b.file()
+    );
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/stream_start_wait_secs", "value": 0 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("config.failover_range"), "{body}");
+}
+
 // ─────────────────────────────────────────────────────────── 上游
 
 #[tokio::test]

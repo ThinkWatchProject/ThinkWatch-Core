@@ -11,6 +11,7 @@ pub mod chatgpt;
 pub mod control_key;
 pub mod credential;
 pub mod edit;
+mod failover;
 pub mod history;
 mod init;
 pub mod nics;
@@ -88,6 +89,9 @@ pub struct Config {
     /// 日志留多久。不写就是默认值。
     #[serde(default, skip_serializing_if = "is_default")]
     pub retention: Retention,
+    /// 一家上游失败之后停用多久、流开头最多等多久。不写就是默认值。
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub failover: Failover,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<tw_engine::Group>,
     /// 路由。一条路由是一组按顺序求值的规则。
@@ -126,6 +130,7 @@ impl Default for Config {
             client_probes: ClientProbes::default(),
             security: Security::default(),
             retention: Retention::default(),
+            failover: Failover::default(),
             groups: Vec::new(),
             routes: Vec::new(),
             default_route: None,
@@ -1143,6 +1148,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
     Ok(())
 }
 
+pub use failover::{Failover, MAX_PAUSE_SECS, MAX_STREAM_START_WAIT_SECS};
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, try_parse};
 pub use retention::Retention;

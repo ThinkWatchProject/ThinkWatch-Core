@@ -172,6 +172,15 @@ pub fn sections() -> Vec<Section> {
                     t("How long request logs are kept.", "请求日志保留多久。"),
                 ),
                 row(
+                    "failover",
+                    Kind::Obj("failover"),
+                    Def::Section,
+                    t(
+                        "How long an upstream is set aside after it fails, and how long the start of a stream is awaited.",
+                        "上游失败后停用多久，以及流式回答的开头最多等多久。",
+                    ),
+                ),
+                row(
                     "groups",
                     Kind::Objs("groups[]"),
                     Def::Is("[]"),
@@ -1160,6 +1169,76 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Upper bound on the bytes bodies may take; beyond it the oldest days go first. The default is 2 GiB.",
                         "正文最多占用的字节数，超出时从最早的日期开始删除。默认 2 GiB。",
+                    ),
+                ),
+            ],
+        },
+        // ── failover ──────────────────────────────────────────
+        Section {
+            path: "failover",
+            ty: checked!(Failover, "{}"),
+            rows: vec![
+                row(
+                    "failures_to_pause",
+                    Kind::Int,
+                    Def::Is("3"),
+                    t(
+                        "Consecutive failures without a stated reason (5xx, connection errors) before the upstream is set aside. From 1 to 100.",
+                        "没有说明原因的失败（5xx、连接失败）连续几次后停用这家上游，取值 1 到 100。",
+                    ),
+                ),
+                row(
+                    "pause_secs",
+                    Kind::Int,
+                    Def::Is("60"),
+                    t(
+                        "Seconds the first such pause lasts. Each further pause doubles it, up to `max_pause_secs`; one success resets it.",
+                        "这类失败第一次停用的秒数。之后每停用一次翻一倍，直到 `max_pause_secs`；成功一次后回到这个值。",
+                    ),
+                ),
+                row(
+                    "max_pause_secs",
+                    Kind::Int,
+                    Def::Is("600"),
+                    t(
+                        "Upper bound on the doubled pause, in seconds; not less than `pause_secs`.",
+                        "翻倍后的停用上限，单位秒，不小于 `pause_secs`。",
+                    ),
+                ),
+                row(
+                    "no_balance_pause_secs",
+                    Kind::Int,
+                    Def::Is("1800"),
+                    t(
+                        "Seconds to set aside an upstream that reports an insufficient balance.",
+                        "上游报告余额不足时停用的秒数。",
+                    ),
+                ),
+                row(
+                    "quota_pause_secs",
+                    Kind::Int,
+                    Def::Is("3600"),
+                    t(
+                        "Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then.",
+                        "上游报告额度用完、但没有给出重置时间时停用的秒数。给出了重置时间的，停用到那一刻。",
+                    ),
+                ),
+                row(
+                    "rate_limit_max_pause_secs",
+                    Kind::Int,
+                    Def::Is("3600"),
+                    t(
+                        "A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason.",
+                        "被限流的上游按它给的 `Retry-After` 停用，最多这么多秒。没有 `Retry-After` 的按没有说明原因的失败计。",
+                    ),
+                ),
+                row(
+                    "stream_start_wait_secs",
+                    Kind::Int,
+                    Def::Is("15"),
+                    t(
+                        "Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120.",
+                        "流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。",
                     ),
                 ),
             ],
