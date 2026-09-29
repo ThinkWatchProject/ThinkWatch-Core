@@ -35,7 +35,6 @@ fn order_like_the_data_plane(
     }
     let cfg = s.config();
     let facts = tw_engine::Facts {
-        session: None,
         seq: s.gateway.bus.peek_id(),
         ttfb_ms: s.gateway.latency.snapshot(&d.candidates),
         price: s.gateway.unit_prices(&cfg.providers, asked, &d.candidates),
@@ -205,7 +204,6 @@ pub async fn dry_run(
         via_group: None,
         set: Vec::new(),
         trace,
-        hurts_cache: false,
         circuit_open: Vec::new(),
         skipped: Vec::new(),
         converted: Vec::new(),
@@ -220,12 +218,6 @@ pub async fn dry_run(
             out.outcome = DryRunOutcome::Route;
             out.rule = Some(d.matched_rule.clone());
             out.via_group = d.via_group.clone();
-            // 按这个组的配置判断：开着会话粘滞的轮询组不伤缓存
-            out.hurts_cache = d
-                .via_group
-                .as_deref()
-                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .is_some_and(|g| g.hurts_cache());
             out.set = describe(&d.set);
             out.strategy = d
                 .via_group

@@ -624,8 +624,6 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
         name,
         kind,
         providers,
-        // 只对轮询有意义；其余策略保持默认，不往文件里写
-        session_affinity: kind != GroupType::LoadBalance || input.session_affinity,
         selected,
     })
 }
@@ -788,7 +786,6 @@ mod msg_codes {
             kind: tw_api::GroupKind::from_slug(kind).unwrap(),
             providers: providers.iter().map(|p| p.to_string()).collect(),
             selected: None,
-            session_affinity: true,
         };
         let code = |i: tw_api::GroupInput| to_group(&i, &c).unwrap_err().code;
         assert_eq!(

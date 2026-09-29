@@ -6,6 +6,7 @@
 //! 时只需要换掉挑选逻辑。
 
 pub mod access;
+pub mod affinity;
 pub mod auth;
 pub mod bedrock;
 pub mod bodies;

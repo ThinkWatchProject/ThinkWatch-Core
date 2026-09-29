@@ -357,11 +357,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 name: g.name.clone(),
                 builtin: tw_engine::is_builtin_group(&g.name),
                 kind: routes::group_kind(g.kind),
-                session_affinity: g.session_affinity,
                 selected: g.selected.clone(),
                 providers: g.providers.clone(),
-                // 按这个组的配置判断：开着会话粘滞的轮询组不伤缓存
-                hurts_cache: g.hurts_cache(),
             })
             .collect(),
         // 和 `GET /keys` 同一份视图：概览里少一个字段的话，两处会各自

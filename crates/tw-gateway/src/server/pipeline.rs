@@ -77,7 +77,8 @@ pub(super) async fn pipeline(
     }
 
     let (reading, fp) = read(&req, intent);
-    let (choice, decision) = match route(&state, &rt, &req, &reading, fp.as_deref())? {
+    let conv = conversation(&rt, &req, &reading, fp.as_deref());
+    let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
         Routed::Go(choice, decision) => (choice, decision),
         // 规则做了决定，请求却一家上游都不会去。**照样开始、照样报路由**，失败由
         // `passthrough` 按这个错误报 —— 不排队：它一个字节都不会发出去
@@ -111,9 +112,17 @@ pub(super) async fn pipeline(
     );
     screen(&state, &rt, &reading, &started)?;
     let served = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
-    let ending = ending
+    let mut ending = ending
         .take()
         .expect("written when the start event was emitted");
+    // 记下实际回答的那一家：故障转移之后接下的备选，就是这段对话之后留下的那一家
+    if let Some(c) = &conv {
+        ending.answered_by(state.affinity.ticket(
+            c,
+            decision.via_group.clone(),
+            &served.provider.name,
+        ));
+    }
     Ok(relay::respond(
         &state,
         &rt,
@@ -179,8 +188,8 @@ fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
 
 /// 管线第 2 步的前半：读出路由事实，和这段对话的指纹。
 ///
-/// **只解析一次，指纹也只算一次。**路由要它，会话粘滞的策略组要指纹，开始事件
-/// 归会话也要指纹，而 body 可能有几百 KB —— 解两遍、哈希两遍是白付一份钱。
+/// **只解析一次，指纹也只算一次。**路由要它，认对话（见 `crate::affinity`）要指纹，
+/// 开始事件归会话也要指纹，而 body 可能有几百 KB —— 解两遍、哈希两遍是白付一份钱。
 ///
 /// 生成回答的请求解码成中间表示，**四种格式的客户端读出同一份路由事实**。
 /// body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** —— 我们的解析器
@@ -201,6 +210,47 @@ fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<St
     // 互不相干的请求并成一个「会话」
     let fp = parsed.as_ref().and_then(crate::session::fingerprint);
     (reading, fp)
+}
+
+/// 这次请求在哪段对话的第几轮（见 [`crate::affinity`]）。
+///
+/// **数得出轮次的才算**：要解码出整段对话才知道最后一条是不是工具结果。计 token、
+/// 嵌入、解不开的请求不记 —— 它们照常按策略排序。
+fn conversation(
+    rt: &Runtime,
+    req: &Inbound,
+    reading: &crate::client_api::Reading,
+    fp: Option<&str>,
+) -> Option<crate::affinity::Conversation> {
+    let Some(Ok(d)) = &reading.decoded else {
+        return None;
+    };
+    let id = crate::affinity::identity(&req.headers, fp)?;
+    Some(crate::affinity::Conversation::new(
+        rt.engine.route_of(&req.client_name),
+        &id,
+        crate::affinity::turn_of(&d.request),
+    ))
+}
+
+/// 输入超出了这个决定所选模型的上下文窗口：这一轮沿用的决定要重新求值。
+///
+/// 按候选里最小的那个窗口算，留 5% 的余量（输入是估的）。**知道窗口的才算**：价目表
+/// 里没写的模型，说不出它装不装得下，照常沿用。
+fn outgrown(
+    state: &AppState,
+    rt: &Runtime,
+    req: &Inbound,
+    facts: &tw_engine::RequestFacts,
+    d: &tw_engine::Decision,
+) -> bool {
+    let book = state.pricing.load();
+    rt.engine
+        .models_asked(rt.engine.rules_for_client(&req.client_name), facts, d)
+        .iter()
+        .filter_map(|(p, m)| book.resolve_for(p, m)?.price.max_input_tokens)
+        .min()
+        .is_some_and(|limit| facts.input_tokens.saturating_mul(100) >= limit.saturating_mul(95))
 }
 
 /// 管线第 2 步的中段：模型准入。**和 `GET /v1/models` 共用同一个函数**
@@ -318,37 +368,57 @@ fn route(
     rt: &Runtime,
     req: &Inbound,
     reading: &crate::client_api::Reading,
-    fp: Option<&str>,
+    conv: Option<&crate::affinity::Conversation>,
 ) -> Result<Routed, GatewayError> {
     let facts = &reading.facts;
     let route = rt.engine.route_of(&req.client_name).to_string();
-    let mut decision = match rt.engine.route(facts).map_err(|e| {
-        GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
-    })? {
-        tw_engine::Outcome::Route(d) => d,
-        tw_engine::Outcome::Deny { rule, reason } => {
-            // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
-            // 眼里没有区别。
-            tracing::info!(%rule, "a rule denied the request");
-            let why = GatewayError::denied(msg!(
-                "gw.route.denied", rule = rule.clone(), reason = reason =>
-                "Rule `{rule}` denied this request: {reason}"
-            ));
-            // 拒绝了就什么都没改：累积的改写跟着这个决定一起作废
-            let choice = Choice {
-                route,
-                rule,
-                group: None,
-                rewritten_by: Vec::new(),
-            };
-            return Ok(Routed::Refused(choice, why));
-        }
+    let now = now_ms();
+    // 同一轮里沿用这一轮开头的决定：按输入大小、有没有图片分流的规则，不能让一轮
+    // 半路换家（见 `crate::affinity`）。输入超出了所选模型的上下文的，重新求值
+    let held = conv
+        .and_then(|c| state.affinity.held(c, &rt.engine, now))
+        .filter(|d| !outgrown(state, rt, req, facts, d));
+    let held_route = held.is_some();
+    let mut decision = match held {
+        Some(d) => d,
+        None => match rt.engine.route(facts).map_err(|e| {
+            GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
+        })? {
+            tw_engine::Outcome::Route(d) => {
+                if let Some(c) = conv {
+                    state.affinity.decided(c, &rt.engine, &d, now);
+                }
+                d
+            }
+            tw_engine::Outcome::Deny { rule, reason } => {
+                // **带理由的拒绝。**一个没有理由的拒绝，和一个 bug，在用户
+                // 眼里没有区别。
+                tracing::info!(%rule, "a rule denied the request");
+                let why = GatewayError::denied(msg!(
+                    "gw.route.denied", rule = rule.clone(), reason = reason =>
+                    "Rule `{rule}` denied this request: {reason}"
+                ));
+                // 拒绝了就什么都没改：累积的改写跟着这个决定一起作废
+                let choice = Choice {
+                    route,
+                    rule,
+                    group: None,
+                    rewritten_by: Vec::new(),
+                    affinity: None,
+                };
+                return Ok(Routed::Refused(choice, why));
+            }
+        },
     };
-    let choice = Choice {
+    let mut choice = Choice {
         route,
         rule: decision.matched_rule.clone(),
         group: decision.via_group.clone(),
         rewritten_by: decision.rewritten_by.clone(),
+        affinity: held_route.then_some(tw_api::AffinityView {
+            held_route,
+            stayed: None,
+        }),
     };
     // 每个候选实际要的模型：规则改写过的按改写后的算。准入、跳过、比价都看它
     let asked = rt.engine.models_asked(
@@ -398,11 +468,26 @@ fn route(
                 }
                 _ => Default::default(),
             },
-            session: fp.map(str::to_string),
         };
         decision.candidates = rt
             .engine
             .order(Some(&gname), &decision.candidates, &facts_rt);
+    }
+    // 留在上次回答这段对话的那一家：同一轮里一律留，跨轮看缓存值不值得留。**排在
+    // 策略组排序之后** —— 该留的时候盖过策略，放开的时候策略照常说了算
+    if let Some(c) = conv
+        && let Some(why) = state.affinity.stay(
+            c,
+            decision.via_group.as_deref(),
+            &mut decision.candidates,
+            |p| state.health.is_available(p),
+            now,
+        )
+    {
+        choice.affinity = Some(tw_api::AffinityView {
+            held_route,
+            stayed: Some(why),
+        });
     }
     Ok(Routed::Go(choice, decision))
 }

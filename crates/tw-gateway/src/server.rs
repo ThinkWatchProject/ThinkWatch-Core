@@ -280,6 +280,8 @@ pub(crate) struct Choice {
     pub(crate) group: Option<String>,
     /// 附加了参数改写的规则
     pub(crate) rewritten_by: Vec<String>,
+    /// 这段对话之前的去向起的作用（见 [`crate::affinity`]）
+    pub(crate) affinity: Option<tw_api::AffinityView>,
 }
 
 /// 规则做了决定、这个请求却一家上游都不会去时的路由事件：尝试链是空的。
@@ -295,6 +297,7 @@ pub(crate) fn routed_nowhere(id: u64, choice: Choice) -> tw_api::Event {
         group: choice.group,
         rewritten_by: choice.rewritten_by,
         denied_by: None,
+        affinity: choice.affinity,
         attempts: Vec::new(),
         // 一家都没接下：没有哪一家的计费方式可以跟着走
         billing: tw_api::Billing::PerToken,

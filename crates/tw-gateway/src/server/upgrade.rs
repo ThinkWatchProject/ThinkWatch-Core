@@ -89,6 +89,7 @@ pub(super) async fn ws_upgrade(
                 rule,
                 group: None,
                 rewritten_by: Vec::new(),
+                affinity: None,
             };
             let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
             state.bus.emit(super::routed_nowhere(id, choice));
@@ -102,6 +103,8 @@ pub(super) async fn ws_upgrade(
         rule: decision.matched_rule.clone(),
         group: decision.via_group.clone(),
         rewritten_by: Vec::new(),
+        // WebSocket 那条路一条连接跑好几轮，不按对话记
+        affinity: None,
     };
     let (alive, _) = state.health.filter(&decision.candidates);
     let Some(name) = alive.first().map(|s| s.to_string()) else {

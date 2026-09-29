@@ -305,7 +305,6 @@ fn routed_to_an_account(up: SocketAddr) -> Config {
             name: "账号池".into(),
             kind: tw_engine::GroupType::Fallback,
             providers: vec!["订阅账号".into()],
-            session_affinity: false,
             selected: None,
         }],
         routes: vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {

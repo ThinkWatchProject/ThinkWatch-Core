@@ -28,10 +28,6 @@ groups:
   - name: 都试试
     type: load-balance
     providers: [官方, 中转]
-  - name: 真轮询
-    type: load-balance
-    session_affinity: false
-    providers: [官方, 中转]
 routes:
   - name: default
     rules:
@@ -111,22 +107,6 @@ async fn a_plain_request_falls_through_to_the_catch_all() {
     assert_eq!(r.via_group.as_deref(), Some("都试试"));
     assert_eq!(r.candidates.len(), 2);
     assert_eq!(r.route, "default");
-    // 开着会话粘滞（默认）的轮询不伤缓存：同一次对话始终落在同一家。
-    // 一律标成危险是假警报，而假警报会让人学会忽略这一栏
-    assert!(!r.hurts_cache, "粘滞的轮询不该报");
-}
-
-#[tokio::test]
-async fn round_robin_without_affinity_is_said_to_hurt_the_cache() {
-    // **要直说 —— 它决定账单。**
-    let (_d, app) = app();
-    let r = run(
-        &app,
-        r#"{"model":"claude-sonnet-4-5","draft":{"name":"草稿","rules":[{"name":"兜底","to":"真轮询"}]}}"#,
-    )
-    .await;
-    assert!(r.hurts_cache);
-    assert_eq!(r.route, "草稿");
 }
 
 #[tokio::test]
@@ -228,7 +208,6 @@ async fn a_cached_request_is_pinned_to_the_official_upstream() {
     let r = run(&app, r#"{"model":"claude-sonnet-4-5","cache":true}"#).await;
     assert_eq!(r.rule.as_deref(), Some("带缓存的必须走官方"));
     assert_eq!(r.candidates, vec!["官方".to_string()]);
-    assert!(!r.hurts_cache);
 }
 
 #[tokio::test]

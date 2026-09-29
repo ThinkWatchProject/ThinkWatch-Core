@@ -636,7 +636,17 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`ProviderView::region`] 和 [`ProviderPreview::region`]。Bedrock API Key 走
 /// 原来的 `key`，放进 `Authorization: Bearer`。照 27 写的界面解析不了带 `bedrock` 的
 /// 上游列表。
-pub const CONTROL_API_VERSION: u32 = 28;
+///
+/// **29 起一段对话留在上次回答它的那一家**，不再只是 `load-balance` 组按会话取模：
+/// 同一轮之内一律不换，跨轮时上一次回答读写的缓存值得留、又没凉才留；一轮开始时的
+/// 路由决定沿用到这一轮结束。于是策略组的 `session_affinity`（[`GroupView`]、
+/// [`GroupInput`]，配置里的 `groups[].session_affinity` 一并删了，写着它的配置加载
+/// 不了）和 `hurts_cache`（[`GroupView`]、[`DryRunResult`]）都删了：没有哪种策略还会在
+/// 对话半路丢掉缓存。[`Event::RequestRouted`] 和 [`RoutingView`] 多了 `affinity`
+/// （[`AffinityView`]）：这次沿用了这一轮的路由决定、留在了上次回答的那一家的，
+/// 说得出来。照 28 写的界面保存策略组时交的 `session_affinity` 被忽略，读
+/// `hurts_cache` 读到的是 undefined。
+pub const CONTROL_API_VERSION: u32 = 29;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -902,6 +912,10 @@ pub enum Event {
         /// 一跳就是被拒的那一家**（没有发出去）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         denied_by: Option<String>,
+        /// 这段对话之前的去向在这次路由里起了作用：沿用了这一轮的路由决定、留在了
+        /// 上次回答的那一家。都没有时没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affinity: Option<AffinityView>,
         /// 试过哪几家、各自什么结果。**一次就成的也有一条** ——
         /// 「只试了一家」和「试了三家」在用户眼里应该是不同的
         attempts: Vec<AttemptView>,
@@ -1312,7 +1326,35 @@ pub struct RoutingView {
     /// 选定上游之后才判断的规则拒绝了它：是哪一条
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied_by: Option<String>,
+    /// 这段对话之前的去向起的作用（见 `RequestRouted::affinity`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityView>,
     pub attempts: Vec<AttemptView>,
+}
+
+/// 一段对话之前的去向在这次路由里起的作用。
+///
+/// **缓存按上游隔离**：一段对话换一家，那一家要全价重算整段上下文。所以同一轮之内
+/// 路由决定不重新求值、也不换家；跨轮时上一次回答的缓存值得留、又没凉，才留下。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AffinityView {
+    /// 沿用了这一轮开头定下的路由决定（规则、策略组、改写）：同一轮里规则没有重新
+    /// 求值。输入超出了所选模型的上下文、重新求了值的，是 `false`
+    pub held_route: bool,
+    /// 排在最前面的是上次回答这段对话的那一家：留下的理由。没留的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stayed: Option<Stay>,
+}
+
+slug_enum! {
+    /// 留在上次回答这段对话的那一家的理由。
+    pub enum Stay {
+        /// 还在同一轮里：客户端在回传工具结果
+        Turn = "turn",
+        /// 新的一轮，而上一次回答读写的缓存值得留、又没凉
+        Cache = "cache",
+    }
 }
 
 /// 一个订阅额度窗口。**每个字段都直接来自上游**：响应头，或者账号的额度接口。
@@ -1881,8 +1923,6 @@ pub struct GroupView {
     pub builtin: bool,
     /// 配置里写的 `type`
     pub kind: GroupKind,
-    /// 同一次会话固定走同一家。**这一项直接决定账单**
-    pub session_affinity: bool,
     /// `select` 组当前选中谁。
     ///
     /// **界面要能切它** —— 这个策略本身就是「UI 上点选或托盘里切」，
@@ -1890,9 +1930,6 @@ pub struct GroupView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub providers: Vec<String>,
-    /// 这个组**按现在的配置**会不会让 prompt cache 不稳定（开着会话粘滞的
-    /// 轮询组不会）。**要在界面上直说** —— 它决定了用户的账单。
-    pub hurts_cache: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2789,9 +2826,6 @@ pub struct GroupInput {
     /// `select` 组优先使用的成员
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
-    /// 同一次会话固定走同一家。只对 `load-balance` 有意义
-    #[serde(default = "default_true")]
-    pub session_affinity: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3837,8 +3871,6 @@ pub struct DryRunResult {
     /// 累积起来的参数改写
     pub set: Vec<SetView>,
     pub trace: Vec<RuleTrace>,
-    /// 这条路会不会伤到 prompt cache。**要直说 —— 它决定账单**
-    pub hurts_cache: bool,
     /// 候选链里此刻熔断着的那些。**试算是静态的，但熔断是当下的事实**
     pub circuit_open: Vec<String>,
     /// 规则选中、但服务不了这个请求而被跳过的上游

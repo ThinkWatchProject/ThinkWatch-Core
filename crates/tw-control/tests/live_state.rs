@@ -145,6 +145,7 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
             group: Some("__all__".into()),
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
                 model: None,

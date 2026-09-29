@@ -420,6 +420,7 @@ mod tests {
             group: Some("__all__".into()),
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "p".into(),

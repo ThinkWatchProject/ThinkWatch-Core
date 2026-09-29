@@ -78,7 +78,6 @@ fn cfg(providers: Vec<Provider>, rules: Vec<Rule>) -> Config {
             name: "池".into(),
             kind: tw_engine::GroupType::Fallback,
             providers: vec!["up".into()],
-            session_affinity: false,
             selected: None,
         }],
         routes: vec![

@@ -67,6 +67,9 @@ pub struct Ending {
     /// 上游在流里报的错：哪一家、原话。**有它就不是成功** —— 响应头是 200，回答却断在了
     /// 半路
     upstream_error: Option<(String, String)>,
+    /// 这段对话这一次由谁回答（见 [`crate::affinity`]）。**成功走完了才记**：失败的、
+    /// 半路断了的不算回答过，下一次照常排序
+    answer: Option<crate::affinity::Ticket>,
     /// 报过了。**只能报一次**
     told: bool,
 }
@@ -131,6 +134,7 @@ impl Ending {
             opened: None,
             watch: None,
             upstream_error: None,
+            answer: None,
             told: false,
         }
     }
@@ -154,6 +158,11 @@ impl Ending {
             dialect: upstream,
             frames: Default::default(),
         });
+    }
+
+    /// 这一次由谁回答：成功走完时记下它和它读写了多少缓存。
+    pub fn answered_by(&mut self, ticket: crate::affinity::Ticket) {
+        self.answer = Some(ticket);
     }
 
     /// 上游的响应头到了。从这里起，客户端再走掉，报出去的取消带着状态码。
@@ -245,6 +254,11 @@ impl Ending {
             return;
         }
         let usage = self.settle();
+        if let Some(t) = self.answer.take()
+            && (200..300).contains(&status)
+        {
+            t.answered(usage.as_ref().map_or(0, |u| u.cache_read + u.cache_write));
+        }
         let duration_ms = self.duration_ms();
         let tokens_per_sec = rate(self.opened, usage.as_ref(), duration_ms);
         self.bus.emit(tw_api::Event::RequestFinished {

@@ -230,6 +230,7 @@ impl Recorder {
                             group: group.clone(),
                             rewritten_by: rewritten_by.clone(),
                             denied_by: None,
+                            affinity: None,
                             attempts: Vec::new(),
                         },
                         billing: *billing,
@@ -245,6 +246,7 @@ impl Recorder {
                 group,
                 rewritten_by,
                 denied_by,
+                affinity,
                 attempts,
                 billing,
             } => {
@@ -270,6 +272,7 @@ impl Recorder {
                         group: group.clone(),
                         rewritten_by: rewritten_by.clone(),
                         denied_by: denied_by.clone(),
+                        affinity: affinity.clone(),
                         attempts: attempts.clone(),
                     };
                     p.billing = *billing;
@@ -823,6 +826,7 @@ mod tests {
             group: Some("__all__".into()),
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "官方".into(),
@@ -879,6 +883,7 @@ mod tests {
             group: None,
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "官方".into(),
                 model: None,
@@ -906,6 +911,7 @@ mod tests {
             group: None,
             rewritten_by: vec!["换成 Haiku".into()],
             denied_by: None,
+            affinity: None,
             attempts: vec![
                 tw_api::AttemptView {
                     provider: "官方".into(),
@@ -985,6 +991,7 @@ mod tests {
             group: Some("pool".into()),
             rewritten_by: vec!["关掉思考".into(), "走中转时限长".into()],
             denied_by: Some("中转不收密钥".into()),
+            affinity: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "中转".into(),
                 model: None,
@@ -1329,6 +1336,7 @@ mod billing_tests {
             group: None,
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
                 model: None,
@@ -1414,6 +1422,7 @@ mod billing_tests {
             group: Some("__all__".into()),
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: vec![tw_api::AttemptView {
                 provider: "订阅账号".into(),
                 model: None,
@@ -1790,6 +1799,7 @@ mod translation_tests {
             group: None,
             rewritten_by: vec![],
             denied_by: None,
+            affinity: None,
             attempts: chain
                 .iter()
                 .map(|p| tw_api::AttemptView {
