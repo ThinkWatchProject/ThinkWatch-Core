@@ -696,13 +696,14 @@ security:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 策略组的名字，不能重复，也不能和上游同名。 |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。 |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。 |
 | `providers` | 字符串列表 | **必填** | 成员上游的名字。 |
-| `session_affinity` | 布尔 | `true` | 同一会话固定走同一家，使 prompt cache 持续命中。在 `load-balance` 下关闭会让每一轮都换一家，缓存随之失效。 |
 | `selected` | 字符串 | — | `select` 类型选中的成员。 |
 <!-- /generated -->
 
-默认类型为 `fallback`：把一个会话分散到多家上游会丢掉 prompt cache，而在单个使用者的机器上，分散负载换来的远不及缓存省下的。
+默认类型为 `fallback`：单个使用者的机器上没有需要分散的负载。
+
+无论哪种类型，一段对话都留在上次回答它的那一家上游，让上游缓存着的那部分被再次读取，而不是换一家全价重算。同一轮之内（客户端正在回传工具结果）一律不换；跨轮时，上一次回答读或写了至少 1024 个 token 的 prompt cache、且距今不到五分钟，才继续留下。上游因失败进入冷却时，对话随之放开；故障转移之后接下回答的那一家，就是之后留下的那一家。一轮开始时命中的规则也沿用到这一轮结束：按输入大小或图片分流的规则不会让一轮半路换家，除非输入已经超出规则所指模型的上下文窗口。因此 `load-balance` 轮流的是新对话。
 
 ### `routes`
 

@@ -12,10 +12,11 @@ use crate::rule::{MatchError, When};
 
 /// 策略组类型。
 ///
-/// **默认是 `fallback` 而不是负载均衡**，理由很硬：负载均衡会摧毁
-/// prompt cache。缓存按 provider 隔离，长会话每轮跳一家就永远命中不了，
-/// 而缓存命中与否成本差 5 到 10 倍 —— 随机分流的代价可能是账单翻几倍，
-/// 换来的是「分散负载」，**而单用户桌面场景根本没有需要分散的负载**。
+/// **默认是 `fallback` 而不是负载均衡**：单用户桌面场景根本没有需要分散的负载。
+///
+/// 哪种策略都不会在一段对话半路换家、丢掉上游缓存着的那部分：同一段对话留在上次
+/// 回答它的那一家，由网关按对话记着（见 `tw_gateway::affinity`）。**策略只决定
+/// 还没人回答过、或者缓存已经不值得留的时候谁排头。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum GroupType {
@@ -24,7 +25,7 @@ pub enum GroupType {
     Fallback,
     /// 手动指定一个。缓存友好
     Select,
-    /// 轮流。**必须开会话粘滞，否则缓存全废**
+    /// 轮流。**轮的是新对话**：已经有人回答过、缓存还热着的对话留在那一家
     LoadBalance,
     /// 选最快的。判据是**真实流量测出来的 TTFB**，样本不够时用启动时
     /// 那次零成本的 L1 握手计时补。
@@ -42,17 +43,6 @@ pub enum GroupType {
 }
 
 impl GroupType {
-    /// 这个策略会不会让 prompt cache 不稳定。
-    ///
-    /// UI 上选中时要给一句提示 —— **不要让用户为了省 20% 的单价，
-    /// 付出丢掉 90% 缓存折扣的代价**。
-    /// 这个**策略类型**天生会不会让 prompt cache 不稳定。
-    ///
-    /// 具体到一个组还要看它的配置 —— 用 [`Group::hurts_cache`]。
-    pub fn hurts_cache(&self) -> bool {
-        matches!(self, GroupType::LoadBalance | GroupType::UrlTest)
-    }
-
     /// 排顺序时要不要用到运行时的数字。
     ///
     /// **`fallback` 和 `select` 不需要**，而它们是绝大多数人的配置
@@ -79,9 +69,7 @@ impl GroupType {
 /// 和真实转发不一样的结果」。
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
-    /// 会话指纹。`None` = 认不出来这是哪次会话
-    pub session: Option<String>,
-    /// 轮转的种子。认不出会话时用它 —— 通常是请求序号
+    /// 轮转的种子 —— 通常是请求序号
     pub seq: u64,
     /// 每家的典型 TTFB（毫秒）。**缺席 = 样本不够**，不是「很快」
     pub ttfb_ms: std::collections::HashMap<String, u32>,
@@ -96,15 +84,6 @@ pub struct Facts {
 /// 叫 `type`，所以「顺手写成 `kind:`」几乎是必然会发生的。没有这一行的
 /// 时候它会被静默丢掉，用户得到一个 fallback 组，然后困惑于「我明明配了
 /// 负载均衡」。这个项目已经栽过一次同样的（`listen: { addr: ... }`）。
-fn default_true() -> bool {
-    true
-}
-
-/// 默认值不写进文件。
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
@@ -112,42 +91,9 @@ pub struct Group {
     #[serde(default, rename = "type")]
     pub kind: GroupType,
     pub providers: Vec<String>,
-    /// 同一个会话固定走同一家，缓存才能保住。
-    ///
-    /// **默认开，而且这个默认值是这一节最重要的一行。**不开的话，一次
-    /// 长会话每轮跳一家，prompt cache 全部失效 —— 而缓存命中与否成本
-    /// 差 5 到 10 倍。「分散负载」换来的是账单翻几倍，而单用户
-    /// 桌面场景根本没有需要分散的负载。
-    ///
-    /// 真想要纯轮询的人写一句 `session_affinity: false`，那是个明确的
-    /// 选择；而默认关掉，是让每一个不知道这件事的人默默付那笔钱。
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub session_affinity: bool,
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
-}
-
-impl Group {
-    /// 这个组**按现在这份配置**会不会让 prompt cache 不稳定。
-    ///
-    /// 三种情况分开看：
-    ///
-    /// - `load-balance` **开了粘滞就不伤缓存**：同一次对话始终落在同
-    ///   一家，缓存该命中还是命中。把它一律标成危险是个假警报，而假
-    ///   警报的代价是用户学会忽略这一栏的所有提示（没有风险的
-    ///   时候要说「安全」）。
-    /// - `url-test` **会伤**：排序随实测延迟变，一次对话中途完全可能
-    ///   换家。
-    /// - `cheapest` **不伤**：单价在一次对话里不会变，所以顺序是稳的
-    ///   —— 它换家的时机和 `fallback` 一样，只在上游不健康时。
-    pub fn hurts_cache(&self) -> bool {
-        match self.kind {
-            GroupType::LoadBalance => !self.session_affinity,
-            GroupType::UrlTest => true,
-            GroupType::Fallback | GroupType::Select | GroupType::Cheapest => false,
-        }
-    }
 }
 
 /// 按策略排序。**纯函数** —— 同样的输入永远给同样的顺序，试算页因此
@@ -156,7 +102,7 @@ pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
     match g.kind {
         // 这两种的顺序在 `expand_group` 里就定好了
         GroupType::Fallback | GroupType::Select => members.to_vec(),
-        GroupType::LoadBalance => rotate(g, members, f),
+        GroupType::LoadBalance => rotate(members, f),
         GroupType::UrlTest => {
             // 有样本的按 TTFB 升序；没样本的保持原有相对次序排在后面。
             // **`sort_by_key` 是稳定排序**，所以同速的两家不会每次换位
@@ -178,56 +124,20 @@ pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
     }
 }
 
-/// `load-balance` 的轮转。
+/// `load-balance` 的轮转：按 `seq` 轮到谁，谁排头。
 ///
-/// **认得出会话就固定一家**（不开粘滞的话，长会话每轮跳一家，
-/// prompt cache 全废，而缓存命中与否成本差 5 到 10 倍 —— 「分散负载」
-/// 换来的可能是账单翻几倍）。
-///
-/// 认不出会话时按 `seq` 轮转。**选中的那一家排头，其余顺次跟上**，
-/// 一个都不少 —— 故障转移还要用它们。
-fn rotate(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
+/// **选中的那一家排头，其余顺次跟上**，一个都不少 —— 故障转移还要用它们。
+/// 同一段对话不在这里粘：留在上次回答它的那一家由网关按对话记着，这里只管
+/// 还没人回答过的。
+fn rotate(members: &[String], f: &Facts) -> Vec<String> {
     if members.is_empty() {
         return Vec::new();
     }
-    let start = if g.session_affinity {
-        match &f.session {
-            // **同一个会话永远落在同一家。**用会话指纹取模，不用计数器
-            // —— 计数器会让「重启之后同一个会话换了一家」，而那正是
-            // 粘滞要防的
-            Some(s) => (hash64(s) % members.len() as u64) as usize,
-            // **认不出会话就钉住第一家，不要轮转。**
-            //
-            // 用户开粘滞是在说「别在一次对话里换家」。认不出这条属于
-            // 哪次对话的时候去轮转，做的正好是他要求的反面 —— 而那
-            // 时候的代价照样是缓存全废。钉住会让这部分流量集中在一家，
-            // 但**不均衡是可以看见的，缓存失效不是**。
-            None => 0,
-        }
-    } else {
-        (f.seq % members.len() as u64) as usize
-    };
+    let start = (f.seq % members.len() as u64) as usize;
     let mut out = Vec::with_capacity(members.len());
     out.extend_from_slice(&members[start..]);
     out.extend_from_slice(&members[..start]);
     out
-}
-
-/// 会话指纹 → 一个数。FNV-1a。
-///
-/// **不用 `DefaultHasher`。**它是 std 的 SipHash，文档明说不保证跨版本
-/// 稳定 —— 而这个数字决定一次对话钉在哪一家。它一变，所有正在进行的
-/// 会话会在同一时刻集体换家，**一次性把全部 prompt cache 作废**，而
-/// 现场表现只是「今天账单突然高了」，没有任何东西指向一次 Rust 升级。
-///
-/// 自己写五行，换来的是这个映射永远不变。不用于安全，只要稳定。
-fn hash64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// 改写请求参数。
@@ -596,7 +506,6 @@ impl Engine {
                 name: ALL_UPSTREAMS.to_string(),
                 kind: GroupType::Fallback,
                 providers: providers.clone(),
-                session_affinity: false,
                 selected: None,
             });
         }
@@ -1251,7 +1160,6 @@ mod tests {
             name: "pool".into(),
             kind: GroupType::Fallback,
             providers: vec!["official".into(), "relay".into()],
-            session_affinity: false,
             selected: None,
         };
         let e = Engine::with_default_rules(
@@ -1272,7 +1180,6 @@ mod tests {
             name: "pool".into(),
             kind: GroupType::Select,
             providers: vec!["a".into(), "b".into(), "c".into()],
-            session_affinity: false,
             selected: Some("b".into()),
         };
         let e = Engine::with_default_rules(
@@ -1310,7 +1217,6 @@ mod tests {
             name: "empty".into(),
             kind: GroupType::Fallback,
             providers: vec![],
-            session_affinity: false,
             selected: None,
         };
         let e =
@@ -1639,12 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn only_load_balance_is_flagged_as_bad_for_cache() {
-        // 这张表要在 UI 上直接显示，因为它决定了用户的账单。
-        assert!(!GroupType::Fallback.hurts_cache());
-        assert!(!GroupType::Select.hurts_cache());
-        assert!(GroupType::LoadBalance.hurts_cache());
-        // 而默认必须是不伤缓存的那个
+    fn the_default_group_type_is_fallback() {
         assert_eq!(GroupType::default(), GroupType::Fallback);
     }
 
@@ -1681,12 +1582,11 @@ mod tests {
         assert!(e.to_string().contains("ton"), "{e}");
     }
 
-    fn grp(kind: GroupType, sticky: bool) -> Group {
+    fn grp(kind: GroupType) -> Group {
         Group {
             name: "池子".into(),
             kind,
             providers: vec!["甲".into(), "乙".into(), "丙".into()],
-            session_affinity: sticky,
             selected: None,
         }
     }
@@ -1696,7 +1596,7 @@ mod tests {
         // **这条是回归测试。**曾经 `load-balance` 和 `fallback` 行为完全
         // 一样：引擎给出集合，而没有任何一层去转它，于是 6 个请求 6 次
         // 落在第一家 —— 一个宣称做完了、实际什么都没做的功能。
-        let g = grp(GroupType::LoadBalance, false);
+        let g = grp(GroupType::LoadBalance);
         let firsts: Vec<String> = (0..6)
             .map(|seq| {
                 let f = Facts {
@@ -1712,7 +1612,7 @@ mod tests {
     #[test]
     fn rotating_keeps_every_candidate_because_failover_still_needs_them() {
         // 「轮到乙」不等于「甲和丙不要了」——那一家挂了还要能切
-        let g = grp(GroupType::LoadBalance, false);
+        let g = grp(GroupType::LoadBalance);
         let f = Facts {
             seq: 1,
             ..Default::default()
@@ -1721,42 +1621,9 @@ mod tests {
     }
 
     #[test]
-    fn session_affinity_pins_one_conversation_to_one_upstream() {
-        // **不粘的话，长会话每轮跳一家，prompt cache 全废**，而缓存
-        // 命中与否成本差 5 到 10 倍
-        let g = grp(GroupType::LoadBalance, true);
-        let mut seen = std::collections::HashSet::new();
-        for seq in 0..20 {
-            let f = Facts {
-                session: Some("会话-abc".into()),
-                seq,
-                ..Default::default()
-            };
-            seen.insert(order_by(&g, &g.providers, &f)[0].clone());
-        }
-        assert_eq!(seen.len(), 1, "同一个会话跳家了：{seen:?}");
-    }
-
-    #[test]
-    fn different_sessions_do_land_on_different_upstreams() {
-        // 粘滞不能粘成「所有会话都挤在一家」——那就不是均衡了
-        let g = grp(GroupType::LoadBalance, true);
-        let seen: std::collections::HashSet<String> = (0..60)
-            .map(|i| {
-                let f = Facts {
-                    session: Some(format!("会话-{i}")),
-                    ..Default::default()
-                };
-                order_by(&g, &g.providers, &f)[0].clone()
-            })
-            .collect();
-        assert!(seen.len() > 1, "所有会话都挤在同一家：{seen:?}");
-    }
-
-    #[test]
     fn url_test_puts_the_fastest_first_and_the_unmeasured_last() {
         // **「没测到」不等于「慢」，但排前面就等于放弃了「选最快的」**
-        let g = grp(GroupType::UrlTest, false);
+        let g = grp(GroupType::UrlTest);
         let mut ttfb = std::collections::HashMap::new();
         ttfb.insert("丙".to_string(), 120u32);
         ttfb.insert("甲".to_string(), 400u32);
@@ -1771,7 +1638,7 @@ mod tests {
     #[test]
     fn two_equally_fast_upstreams_do_not_swap_places_every_request() {
         // 同速时换来换去会让 prompt cache 白白多断一次 —— 稳定排序
-        let g = grp(GroupType::UrlTest, false);
+        let g = grp(GroupType::UrlTest);
         let ttfb: std::collections::HashMap<String, u32> = [
             ("甲".to_string(), 100u32),
             ("乙".to_string(), 100),
@@ -1792,7 +1659,7 @@ mod tests {
     fn cheapest_sorts_by_input_price_and_puts_the_unpriced_last() {
         // **「最便宜」是一句关于钱的承诺** —— 挑一个不知道多少钱的，
         // 完全可能是最贵的那个
-        let g = grp(GroupType::Cheapest, false);
+        let g = grp(GroupType::Cheapest);
         let price: std::collections::HashMap<String, (i64, i64)> = [
             ("甲".to_string(), (3_000_000i64, 15_000_000i64)),
             ("丙".to_string(), (1_800_000, 9_000_000)),
@@ -1810,7 +1677,7 @@ mod tests {
     fn cheapest_uses_the_output_price_only_to_break_a_tie() {
         let g = Group {
             providers: vec!["甲".into(), "乙".into()],
-            ..grp(GroupType::Cheapest, false)
+            ..grp(GroupType::Cheapest)
         };
         let price: std::collections::HashMap<String, (i64, i64)> = [
             ("甲".to_string(), (1_000i64, 9_000i64)),
@@ -1828,7 +1695,7 @@ mod tests {
     #[test]
     fn fallback_and_select_never_get_reordered() {
         for kind in [GroupType::Fallback, GroupType::Select] {
-            let g = grp(kind, false);
+            let g = grp(kind);
             let f = Facts {
                 seq: 7,
                 ttfb_ms: [("丙".to_string(), 1u32)].into_iter().collect(),
@@ -1842,66 +1709,16 @@ mod tests {
             assert!(!kind.needs_runtime());
         }
     }
-    #[test]
-    fn the_session_to_slot_mapping_is_frozen_forever() {
-        // **这条测试就是那个「不许改」的锁。**这个数字决定一次对话钉在
-        // 哪一家；改掉它等于让所有正在进行的会话同时换家，一次性作废
-        // 全部 prompt cache —— 而现场表现只是「今天账单突然高了」。
-        //
-        // 真要换算法的话，先想清楚怎么让已经在跑的会话平滑过去。
-        assert_eq!(hash64(""), 0xcbf2_9ce4_8422_2325);
-        // 这三个值是用一份独立的 FNV-1a 实现（python）算出来的，
-        // 不是把这段代码的输出抄回来 —— 后者只能证明它没变，证明不了
-        // 它是对的
-        assert_eq!(hash64("会话-abc"), 16_378_437_173_232_644_658);
-        assert_eq!(hash64("a"), 0xaf63_dc4c_8601_ec8c);
-    }
 
+    /// 老配置里的 `session_affinity` 不再认：同一段对话留在哪一家由网关按对话记着，
+    /// 这一项没有要开关的东西了。**报错而不是静默丢掉**，和别的写错的字段一样
     #[test]
-    fn load_balance_is_sticky_unless_you_explicitly_turn_it_off() {
-        // **默认值站在缓存这边。**不写 session_affinity 的人，是不知道
-        // 这件事的人 —— 而默认关掉就是让他默默付那笔钱
-        let y = "name: 池子\ntype: load-balance\nproviders: [甲, 乙]\n";
-        let g: Group = serde_yaml_ng::from_str(y).unwrap();
-        assert!(g.session_affinity, "默认没开粘滞");
-        assert!(!g.hurts_cache(), "开着粘滞还报「会伤缓存」是个假警报");
-
-        let off: Group = serde_yaml_ng::from_str(&format!("{y}session_affinity: false\n")).unwrap();
-        assert!(!off.session_affinity);
-        assert!(off.hurts_cache(), "关了粘滞就该直说会伤缓存");
-    }
-
-    #[test]
-    fn an_unrecognisable_session_pins_instead_of_rotating() {
-        // 用户开粘滞是在说「别在一次对话里换家」。认不出这条属于哪次
-        // 对话时去轮转，做的正好是他要求的反面
-        let g = grp(GroupType::LoadBalance, true);
-        for seq in 0..6 {
-            let f = Facts {
-                session: None,
-                seq,
-                ..Default::default()
-            };
-            assert_eq!(
-                order_by(&g, &g.providers, &f)[0],
-                "甲",
-                "认不出会话时还在转"
-            );
-        }
-    }
-
-    #[test]
-    fn cheapest_does_not_get_flagged_as_cache_hostile() {
-        // 单价在一次对话里不会变，所以它的顺序是稳的 —— 换家的时机和
-        // fallback 一样，只在上游不健康时。**没有风险的时候要说「安全」**
-        let mut g = grp(GroupType::Cheapest, false);
-        g.kind = GroupType::Cheapest;
-        assert!(!g.hurts_cache());
-        let u = Group {
-            kind: GroupType::UrlTest,
-            ..g.clone()
-        };
-        assert!(u.hurts_cache(), "url-test 的排序随实测延迟变，会伤");
+    fn session_affinity_is_no_longer_a_group_field() {
+        let e = serde_yaml_ng::from_str::<Group>(
+            "name: g\ntype: load-balance\nproviders: [a]\nsession_affinity: false\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("session_affinity"), "{e}");
     }
 }
 
@@ -2044,7 +1861,6 @@ mod builtin_tests {
             name: n.into(),
             kind: GroupType::Fallback,
             providers: vec!["a".into()],
-            session_affinity: true,
             selected: None,
         };
         let e = Engine::with_default_rules(
