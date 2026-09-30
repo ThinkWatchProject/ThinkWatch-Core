@@ -34,9 +34,13 @@ Documentation: [configuration reference](docs/config.md) ·
   private keys and connection-string passwords with placeholders before a
   request leaves, and restore them where the answer repeats them, so a relay
   never sees the real values.
-- **Tool calls are checked.** Tool-call inspection can cut off an answer whose
-  tool call matches a dangerous-command rule; hidden-character detection, a
-  content filter and an output limit complete the five protections. All start
+- **Malicious tool calls are cut off.** A relay can rewrite an answer and slip
+  in a tool call for the client to run. Tool-call inspection can cut off an
+  answer whose tool call downloads and runs code, sends out environment
+  variables or credential files, reads private keys, or installs a startup item
+  or scheduled job, before the client receives it whole; hidden-character
+  detection, a content filter and an output limit complete the five
+  protections. All start
   in observe mode (the output limit starts off) and change nothing until set to
   enforce.
 - **Every request is traceable.** Each request is stored with the rule that
