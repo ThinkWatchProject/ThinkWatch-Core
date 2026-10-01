@@ -1,4 +1,11 @@
 <p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.png">
+    <img src="docs/brand/logo.png" alt="ThinkWatch Core" width="580">
+  </picture>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" />
   <img src="https://img.shields.io/badge/License-MIT-750014?style=for-the-badge" alt="License: MIT" />
   <img src="https://img.shields.io/badge/arm64-555555?style=for-the-badge&label=macOS&labelColor=000000&logo=apple&logoColor=white" alt="macOS: arm64" />
