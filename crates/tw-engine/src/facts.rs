@@ -47,9 +47,8 @@ impl RequestFacts {
             client: String::new(),
             intent: String::new(),
             dialect: String::new(),
-            // 粗估：4 字节约 1 token。**路由只需要量级** —— 「超过 200k」
-            // 和「小于 4k」这种判断，估算完全够用，而精确计数要跑一遍
-            // tokenizer，那是每个请求都要付的成本。
+            // **路由只需要量级** —— 「超过 200k」和「小于 4k」这种判断，估算完全够用，
+            // 而精确计数要跑一遍 tokenizer，那是每个请求都要付的成本。
             input_tokens: estimate_tokens(r),
             max_tokens: r.max_tokens,
             cache: has_cache_control(raw),
@@ -66,47 +65,138 @@ impl RequestFacts {
     }
 }
 
-/// 4 字节约 1 token 的粗估。
+/// 一张图按多少 token 算。
 ///
-/// 对中文会高估（一个汉字 3 字节但常常就是 1 个 token），但**路由只关心
-/// 量级**：`>200k` 和 `<4k` 这种阈值，估算误差改变不了结论。精确计数要
-/// 跑 tokenizer，那是每个请求都要付的成本，换来的精度没有用处。
+/// 各家按像素算，而这里不解码图片：取 Anthropic 一张接近上限的图（约 1.15 百万像素，
+/// 宽 × 高 / 750）的数。**宁可高估**：客户端拿这个数判断要不要压缩上下文，低估的
+/// 代价是请求超长被拒，高估只是早一点压缩。
+pub const IMAGE_TOKENS: u64 = 1_600;
+
+/// 一份文件（PDF 之类）按多少 token 算。页数不解析，按一页多一点算一个下限
+pub const FILE_TOKENS: u64 = 1_600;
+
+/// 每条消息的结构开销（角色、分隔符）
+const PER_MESSAGE: u64 = 3;
+
+/// 估一个请求的输入 token 数。
 ///
-/// 图片和文件不计：它们按 token 计价的方式各家不同，而把 base64 的字节数算进来
-/// 会把一张截图估成几十万 token。
-fn estimate_tokens(r: &Request) -> u64 {
-    let mut bytes: usize = r.system.iter().map(String::len).sum();
-    for p in r.messages.iter().flat_map(|m| &m.parts) {
-        bytes += match p {
-            Part::Text(t) => t.len(),
-            Part::Thinking(t) => t.text.len(),
-            Part::ToolCall(c) => {
-                c.name.len()
-                    + match &c.input {
-                        ToolInput::Json(v) => json_text_len(v),
-                        ToolInput::Text(t) => t.len(),
-                    }
-            }
-            Part::ToolResult(t) => t.text().len(),
-            Part::Image(_) | Part::File { .. } => 0,
-        };
+/// **整个 core 只有这一个估算**：路由条件里的 `input_tokens`、数 token 由网关自己答的
+/// 那个数（`tw_gateway::count`）、上游体检里拿来和上游报的输入比的那个数，都是它。
+/// 以前路由另有一份「4 字节 1 个 token」：中文估低四分之一、图片一律算 0、推理照算
+/// —— 同一个请求在两处是两个数，而体检比的偏偏就是这个数准不准。
+///
+/// 文字按 ASCII 四个字节一个 token、其余每个字符一个 token 算：英文和代码大约是
+/// 这个比例，中日韩文字一个字常常就是一个 token。工具定义和工具参数按它们序列化
+/// 之后的样子算，模型看到的就是那一段 JSON。图片、文件按固定的数算 —— 把 base64 的
+/// 字节数算进来会把一张截图估成几十万 token。
+///
+/// 推理（thinking）不算：早先几轮的推理上游不放进上下文。
+///
+/// **每个请求都要算一次**（路由要它），所以不分配：JSON 是边序列化边数，不真的写出
+/// 一个字符串。
+pub fn estimate_tokens(r: &Request) -> u64 {
+    let mut text = Text::default();
+    let mut fixed = 0u64;
+    for s in &r.system {
+        text.add(s);
     }
-    for t in &r.tools {
-        bytes += t.name.len() + t.description.as_ref().map_or(0, String::len);
-        if let ToolKind::Function { schema, .. } = &t.kind {
-            bytes += json_text_len(schema);
+    for m in &r.messages {
+        fixed += PER_MESSAGE;
+        for p in &m.parts {
+            fixed += part(&mut text, p);
         }
     }
-    (bytes / 4) as u64
+    for t in &r.tools {
+        text.add(&t.name);
+        if let Some(d) = &t.description {
+            text.add(d);
+        }
+        if let ToolKind::Function { schema, .. } = &t.kind {
+            text.add_json(schema);
+        }
+    }
+    text.tokens() + fixed
 }
 
-/// 只数文本内容的长度，不数 JSON 结构本身。
-fn json_text_len(v: &serde_json::Value) -> usize {
-    match v {
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(a) => a.iter().map(json_text_len).sum(),
-        serde_json::Value::Object(o) => o.values().map(json_text_len).sum(),
-        _ => 0,
+/// 一段 JSON 里所有字符串值，按 [`estimate_tokens`] 的算法估成 token。
+///
+/// 数 token 的请求体解不开时用：**数 token 不该因为我们的解析器不认识某个字段就失败**，
+/// 客户端拿不到这个数，那一轮就断了。
+pub fn estimate_strings(v: &serde_json::Value) -> u64 {
+    fn walk(v: &serde_json::Value, text: &mut Text) {
+        match v {
+            serde_json::Value::String(s) => text.add(s),
+            serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, text)),
+            serde_json::Value::Object(o) => o.values().for_each(|v| walk(v, text)),
+            _ => {}
+        }
+    }
+    let mut text = Text::default();
+    walk(v, &mut text);
+    text.tokens()
+}
+
+/// 一段内容：文字记进 `text`，图片、文件按固定的数返回。
+fn part(text: &mut Text, p: &Part) -> u64 {
+    match p {
+        Part::Text(t) => text.add(t),
+        Part::Thinking(_) => {}
+        Part::ToolCall(c) => {
+            text.add(&c.name);
+            match &c.input {
+                ToolInput::Json(v) => text.add_json(v),
+                ToolInput::Text(t) => text.add(t),
+            }
+        }
+        Part::ToolResult(t) => return t.content.iter().map(|p| part(text, p)).sum(),
+        Part::Image(_) => return IMAGE_TOKENS,
+        Part::File { .. } => return FILE_TOKENS,
+    }
+    0
+}
+
+/// 攒着的文字：ASCII 字节数和其余字符数分开数。
+#[derive(Default)]
+struct Text {
+    ascii: u64,
+    other: u64,
+}
+
+impl Text {
+    fn add(&mut self, s: &str) {
+        self.add_bytes(s.as_bytes());
+    }
+
+    /// 一段 UTF-8：ASCII 一个字节一个，其余的按字符数 —— 一个字符恰好有一个不是
+    /// 续字节（`10xxxxxx`）的首字节
+    fn add_bytes(&mut self, b: &[u8]) {
+        for &c in b {
+            if c.is_ascii() {
+                self.ascii += 1;
+            } else if c & 0xC0 != 0x80 {
+                self.other += 1;
+            }
+        }
+    }
+
+    /// 一个 JSON 值序列化之后的样子（和 `to_string()` 一字不差），边写边数
+    fn add_json(&mut self, v: &serde_json::Value) {
+        struct Count<'a>(&'a mut Text);
+        impl std::io::Write for Count<'_> {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.add_bytes(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // 往一个永远写得进去的地方写，不会失败
+        let _ = serde_json::to_writer(Count(self), v);
+    }
+
+    fn tokens(&self) -> u64 {
+        self.ascii.div_ceil(4) + self.other
     }
 }
 
@@ -294,5 +384,71 @@ mod tests {
         assert_eq!(f.model, "");
         assert_eq!(f.input_tokens, 0);
         assert!(!f.stream);
+    }
+
+    /// 中文一个字常常就是一个 token：按字节数除以四会把中文估低四分之一
+    #[test]
+    fn chinese_counts_a_token_a_character() {
+        let f = facts(r#"{"messages":[{"role":"user","content":"帮我重构这个文件"}]}"#);
+        assert_eq!(f.input_tokens, 8 + PER_MESSAGE);
+    }
+
+    /// 图片和文件按固定的数算，base64 有多长不算；工具定义和工具往来都算；推理不算
+    #[test]
+    fn images_tools_and_tool_traffic_all_count() {
+        let body = serde_json::json!({
+            "model": "m",
+            "tools": [{"name": "read_file", "description": "Read a file",
+                       "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "看图"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo".repeat(10_000)}},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "不该算进去的推理".repeat(100), "signature": "s"},
+                    {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "/a"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "file body"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                    ]},
+                ]},
+            ],
+        });
+        let n = facts(&body.to_string()).input_tokens;
+        assert!(n > 2 * IMAGE_TOKENS, "{n}");
+        assert!(n < 2 * IMAGE_TOKENS + 100, "{n}");
+    }
+
+    /// 工具定义和参数是边序列化边数的：**和 `to_string()` 之后再数一字不差**，没有漏掉
+    /// 也没有多数（非 ASCII 的字符按字符数，不按字节数）
+    #[test]
+    fn json_is_counted_exactly_as_it_serializes() {
+        for v in [
+            serde_json::json!({"type": "object", "properties": {"路径": {"type": "string",
+                "description": "文件的路径 🙂，带引号\"和反斜杠\\"}}, "required": ["路径"]}),
+            serde_json::json!([1, 2.5, null, true, "x"]),
+            serde_json::json!("只是一个字符串"),
+        ] {
+            let mut streamed = Text::default();
+            streamed.add_json(&v);
+            let mut written = Text::default();
+            written.add(&v.to_string());
+            assert_eq!(
+                (streamed.ascii, streamed.other),
+                (written.ascii, written.other),
+                "{v}"
+            );
+        }
+    }
+
+    /// 解不开的请求体：按里面所有字符串估，不是 0
+    #[test]
+    fn strings_anywhere_in_a_body_still_give_a_number() {
+        // 13 + 8 个 ASCII 字符；键名和数字不算
+        let v = serde_json::json!(["not an object", {"k": "abcdefgh"}, 3]);
+        assert_eq!(estimate_strings(&v), 21_u64.div_ceil(4));
     }
 }

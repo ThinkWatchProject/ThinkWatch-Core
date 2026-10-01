@@ -15,20 +15,7 @@
 //! 记成网关自己答的（`local`），费用 0，不进 token 统计 —— 它没有真的用掉谁的 token。
 
 use serde_json::Value;
-use tw_dialect::ir::{Dialect, Part, Request, ToolInput, ToolKind};
-
-/// 一张图按多少 token 算。
-///
-/// 各家按像素算，而这里不解码图片：取 Anthropic 一张接近上限的图（约 1.15 百万像素，
-/// 宽 × 高 / 750）的数。**宁可高估**：客户端拿这个数判断要不要压缩上下文，低估的
-/// 代价是请求超长被拒，高估只是早一点压缩。
-pub const IMAGE_TOKENS: u64 = 1_600;
-
-/// 一份文件（PDF 之类）按多少 token 算。页数不解析，按一页多一点算一个下限
-pub const FILE_TOKENS: u64 = 1_600;
-
-/// 每条消息的结构开销（角色、分隔符）
-const PER_MESSAGE: u64 = 3;
+use tw_dialect::ir::{Dialect, Request};
 
 /// 上游对数 token 回了这个状态码：它没实现这个接口，由网关来估。
 ///
@@ -38,92 +25,16 @@ pub fn unsupported(status: u16) -> bool {
     matches!(status, 404 | 405)
 }
 
-/// 估一个请求的输入 token 数。
-///
-/// 文字按 ASCII 四个字节一个 token、其余每个字符一个 token 算：英文和代码大约是
-/// 这个比例，中日韩文字一个字常常就是一个 token —— 按字节数除以四会把中文估低
-/// 四分之一。工具定义按它序列化之后的样子算，模型看到的就是那一段 JSON。
-///
-/// 推理（thinking）不算：早先几轮的推理上游不放进上下文。
-pub fn estimate(r: &Request) -> u64 {
-    let mut text = Text::default();
-    let mut fixed = 0u64;
-    for s in &r.system {
-        text.add(s);
-    }
-    for m in &r.messages {
-        fixed += PER_MESSAGE;
-        for p in &m.parts {
-            fixed += part(&mut text, p);
-        }
-    }
-    for t in &r.tools {
-        text.add(&t.name);
-        if let Some(d) = &t.description {
-            text.add(d);
-        }
-        if let ToolKind::Function { schema, .. } = &t.kind {
-            text.add(&schema.to_string());
-        }
-    }
-    text.tokens() + fixed
-}
-
-/// 一段内容：文字记进 `text`，图片、文件按固定的数返回。
-fn part(text: &mut Text, p: &Part) -> u64 {
-    match p {
-        Part::Text(t) => text.add(t),
-        Part::Thinking(_) => {}
-        Part::ToolCall(c) => {
-            text.add(&c.name);
-            match &c.input {
-                ToolInput::Json(v) => text.add(&v.to_string()),
-                ToolInput::Text(t) => text.add(t),
-            }
-        }
-        Part::ToolResult(t) => return t.content.iter().map(|p| part(text, p)).sum(),
-        Part::Image(_) => return IMAGE_TOKENS,
-        Part::File { .. } => return FILE_TOKENS,
-    }
-    0
-}
-
-/// 攒着的文字：ASCII 字节数和其余字符数分开数。
-#[derive(Default)]
-struct Text {
-    ascii: u64,
-    other: u64,
-}
-
-impl Text {
-    fn add(&mut self, s: &str) {
-        for c in s.chars() {
-            if c.is_ascii() {
-                self.ascii += 1;
-            } else {
-                self.other += 1;
-            }
-        }
-    }
-
-    fn tokens(&self) -> u64 {
-        self.ascii.div_ceil(4) + self.other
-    }
-}
-
 /// 替上游答这个数 token 的请求：要回给客户端的正文。`client` 是客户端的格式。
 ///
 /// 解不开的请求体照样给一个数：按里面所有字符串的长度估。**数 token 不该因为
 /// 我们的解析器不认识某个字段就失败** —— 客户端拿不到这个数，这一轮就断了。
 pub fn answer(client: Dialect, path: &str, body: &[u8]) -> Vec<u8> {
     let v = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    // 和路由条件、上游体检用的是同一个估算（见 `tw_engine::estimate_tokens`）
     let n = decode(client, path, &v)
-        .map(|r| estimate(&r))
-        .unwrap_or_else(|| {
-            let mut text = Text::default();
-            strings(&v, &mut text);
-            text.tokens()
-        });
+        .map(|r| tw_engine::estimate_tokens(&r))
+        .unwrap_or_else(|| tw_engine::estimate_strings(&v));
     let out = match client {
         Dialect::Gemini => serde_json::json!({ "totalTokens": n }),
         _ => serde_json::json!({ "input_tokens": n }),
@@ -145,16 +56,6 @@ fn decode(client: Dialect, path: &str, v: &Value) -> Option<Request> {
     tw_dialect::convert::decode(client, v, &path, None)
         .ok()
         .map(|d| d.request)
-}
-
-/// 所有字符串值
-fn strings(v: &Value, text: &mut Text) {
-    match v {
-        Value::String(s) => text.add(s),
-        Value::Array(a) => a.iter().for_each(|v| strings(v, text)),
-        Value::Object(o) => o.values().for_each(|v| strings(v, text)),
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -202,7 +103,8 @@ mod tests {
             "/v1/messages/count_tokens",
             json!({"model": "m", "messages": [{"role": "user", "content": "帮我重构这个文件"}]}),
         );
-        assert_eq!(v["input_tokens"], 8 + PER_MESSAGE);
+        // 一个字一个，加上一条消息的结构开销 3 个
+        assert_eq!(v["input_tokens"], 8 + 3);
     }
 
     #[test]
@@ -232,8 +134,9 @@ mod tests {
             .as_u64()
             .unwrap();
         // 两张图各按固定的数算，base64 的长度不算进去；推理不算
-        assert!(n > 2 * IMAGE_TOKENS, "{n}");
-        assert!(n < 2 * IMAGE_TOKENS + 100, "{n}");
+        let image = tw_engine::facts::IMAGE_TOKENS;
+        assert!(n > 2 * image, "{n}");
+        assert!(n < 2 * image + 100, "{n}");
     }
 
     #[test]

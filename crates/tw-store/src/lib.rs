@@ -10,6 +10,8 @@
 
 pub mod blobs;
 pub mod db;
+pub mod health;
+pub mod model_name;
 pub mod recorder;
 pub mod search;
 pub mod task;

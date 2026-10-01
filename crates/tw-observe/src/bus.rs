@@ -357,6 +357,7 @@ mod tests {
             path: "/v1/messages".into(),
             session_log_bytes: None,
             at_ms: 1_000 + id,
+            input_estimate: None,
         }
     }
 
@@ -375,6 +376,7 @@ mod tests {
             duration_ms: 0,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         });
         b.emit(tw_api::Event::RequestFailed {
             id: 2,
@@ -388,6 +390,7 @@ mod tests {
             bytes: None,
             duration_ms: None,
             usage: None,
+            answered_model: None,
         });
         b.emit(tw_api::Event::RequestCancelled {
             id: 3,
@@ -396,6 +399,7 @@ mod tests {
             bytes: 0,
             duration_ms: 0,
             usage: None,
+            answered_model: None,
         });
         b.emit(tw_api::Event::RequestHeaders {
             id: 4,
@@ -544,6 +548,7 @@ mod tests {
                 ..Default::default()
             }),
             tokens_per_sec,
+            answered_model: None,
         }
     }
 
@@ -607,6 +612,7 @@ mod tests {
                     output: 100,
                     ..Default::default()
                 }),
+                answered_model: None,
             },
             now,
         );
@@ -705,6 +711,7 @@ mod tests {
             duration_ms: 0,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         });
         assert_eq!(b.subscriber_count(), 0);
     }
@@ -721,6 +728,7 @@ mod tests {
             duration_ms: 2,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         });
         assert_eq!(rx.recv().await.unwrap().id(), 42);
     }
@@ -747,6 +755,7 @@ mod tests {
                 duration_ms: 0,
                 usage: None,
                 tokens_per_sec: None,
+                answered_model: None,
             });
         }
         // 生产端全程没阻塞；消费端会收到一个 Lagged
@@ -770,6 +779,7 @@ mod tests {
             duration_ms: 0,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         });
         assert_eq!(a.recv().await.unwrap().id(), 9);
         assert_eq!(c.recv().await.unwrap().id(), 9);
