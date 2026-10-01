@@ -461,7 +461,7 @@ pricing:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏：请求发出前，把其中的凭据替换掉。 |
+| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏：请求发出前，把其中的凭据、身份证号和银行卡号替换掉。 |
 | `inspect_tools` | 对象，见 [`security.inspect_tools`](#cfg-security-inspect_tools) | — | 工具调用审查：模型返回的工具调用中出现危险命令时切断响应。 |
 | `hidden_text` | 对象，见 [`security.hidden_text`](#cfg-security-hidden_text) | — | 人看不见、模型读得到的隐藏字符，出现时拒绝请求。 |
 | `content` | 对象，见 [`security.content`](#cfg-security-content) | — | 内容过滤：调用方发送的内容中出现指定的词或写法时拒绝请求。 |
@@ -470,7 +470,7 @@ pricing:
 
 #### `security.redact`
 
-请求发出前查找其中的凭据。`enforce` 下将其替换。
+请求发出前查找其中的凭据，以及居民身份证号和银行卡号。`enforce` 下将其替换为占位符，回答中重复出现时再换回原值。
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
@@ -522,9 +522,18 @@ pricing:
 | `private-key` | Private key | 开 |
 | `jwt` | JWT | 开 |
 | `conn-string-password` | Connection string password | 开 |
+| `cn-resident-id` | Chinese resident ID number | 开 |
+| `bank-card` | Bank card number | 开 |
 | `internal-ip` | Internal IP address | 关 |
 | `internal-domain` | Internal domain | 关 |
 <!-- /generated -->
+
+`cn-resident-id` 和 `bank-card` 查找的是个人号码而不是凭据，只认结构上核对得上的：
+
+- `cn-resident-id`：18 位的中华人民共和国居民身份证号码。前两位须是省级行政区划代码，出生日期须是 1900 年 1 月 1 日至今天之间的真实日期，末位须是正确的校验码（ISO 7064 MOD 11-2）。15 位的旧号码不认。
+- `bank-card`：卡号。开头和位数须属于银联、Visa、Mastercard、American Express、JCB、Discover 或 Diners Club，并通过 Luhn 校验；连续书写，或四位一组、以单个空格或单个连字符分隔均可（American Express 另认 4-6-5，Diners Club 另认 4-6-4）。Stripe、Braintree、Adyen 公开的测试卡号不认。
+
+夹在更长的一串字母或数字中间的号码不认；请求体中以 JSON 数值写出的号码（例如工具调用的参数）也不认，替换它会使请求体不再是合法的 JSON。占位符写明原来是什么（`<<TW_ID_NUMBER_1>>`、`<<TW_CARD_NUMBER_1>>`），安全日志中只显示最后四位。
 
 #### `security.inspect_tools`
 

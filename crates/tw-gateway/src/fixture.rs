@@ -199,7 +199,7 @@ fn collect(v: &serde_json::Value, out: &mut Extracted) {
 /// 录一个用例。**脱敏在这一步做，不是事后。**
 ///
 /// 规则开全部内置的 —— 录制不该按用户此刻的配置决定脱什么，它要脱的是
-/// 「任何可能是凭据的东西」。
+/// 「任何可能是凭据或者个人号码的东西」。
 pub fn record(
     name: &str,
     note: &str,

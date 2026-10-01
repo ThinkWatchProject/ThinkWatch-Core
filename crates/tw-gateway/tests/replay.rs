@@ -52,7 +52,7 @@ fn no_fixture_carries_a_credential() {
     // 的用例不走导出那条路。
     for (name, f) in load_all() {
         let dump = serde_yaml_ng::to_string(&f).unwrap();
-        // 内置的凭据规则全开，内网地址不算（夹具里的 10.x 是示意）
+        // 内置规则全开（凭据和个人号码），内网地址不算（夹具里的 10.x 是示意）
         let all: Vec<&str> = tw_guard::redact::rules::BUILTINS
             .iter()
             .map(|b| b.id)

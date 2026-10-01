@@ -916,8 +916,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security.redact"),
                     Def::Section,
                     t(
-                        "Outbound redaction: credentials found in a request are replaced before it leaves.",
-                        "出站脱敏：请求发出前，把其中的凭据替换掉。",
+                        "Outbound redaction: credentials, Chinese resident ID numbers and bank card numbers found in a request are replaced before it leaves.",
+                        "出站脱敏：请求发出前，把其中的凭据、身份证号和银行卡号替换掉。",
                     ),
                 ),
                 row(

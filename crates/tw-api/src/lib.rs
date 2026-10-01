@@ -246,6 +246,8 @@ slug_enum! {
         PrivateKeys = "private-keys",
         Jwt = "jwt",
         ConnStrings = "conn-strings",
+        /// 身份证号、银行卡号：个人信息，不是凭据
+        Personal = "personal",
         /// 内网地址
         Internal = "internal",
         /// 自定义规则找到的
@@ -3961,10 +3963,12 @@ pub struct SecretItem {
     pub rule: String,
     #[serde(default)]
     pub custom: bool,
-    /// 类别：`api-keys` / `private-keys` / `jwt` / `conn-strings` / `internal` / `custom`
+    /// 类别：`api-keys` / `private-keys` / `jwt` / `conn-strings` / `personal` /
+    /// `internal` / `custom`
     pub kind: SecretKind,
     /// **已打码。**报出来的东西一律打码 —— 「发现了 sk-ant-xxx」这句话本身
-    /// 就是一次泄漏。内网地址和内部域名例外，它们不是凭据
+    /// 就是一次泄漏。内网地址和内部域名例外，它们不是凭据；身份证号和卡号只留
+    /// 最后四位（`…1234`）
     pub masked: String,
     pub count: u64,
 }
@@ -4135,12 +4139,39 @@ pub enum Matcher {
     PrivateIp,
     /// 以这几个后缀结尾的域名
     DomainSuffix { suffixes: Vec<String> },
+    /// 18 位的中华人民共和国居民身份证号码：头两位是省级行政区划代码，第 7–14 位
+    /// 是 `born_since` 年 1 月 1 日到今天之间的真实日期，末位是对得上的
+    /// ISO 7064 MOD 11-2 校验码（`0`–`9` 或 `X`）。15 位的老号码不认
+    CnResidentId { born_since: u16 },
+    /// 卡号：开头和位数属于其中一家卡组织，并且通过 Luhn 校验。连着写的，或者
+    /// 四位一组、用一个空格或一个连字符隔开的（最后一组可以不足四位；American
+    /// Express 另有 4-6-5、Diners Club 另有 4-6-4）。公开的测试卡号不算
+    BankCard { networks: Vec<CardNetwork> },
     /// 正则表达式：工具调用审查的全部规则，和各项防护的自定义规则
     Regex { pattern: String },
     /// 不分大小写的子串：内容过滤的关键词规则
     Contains { text: String },
     /// 这几段码位里的字符：藏匿字符的两种，写成 `U+E0000–U+E007F`
     Codepoints { ranges: Vec<String> },
+}
+
+/// 一家卡组织认哪些卡号：以哪几段开头、一共几位。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CardNetwork {
+    /// 英文名（`UnionPay`、`Visa` …）。界面按它查自己的名称表
+    pub name: String,
+    pub prefixes: Vec<CardPrefix>,
+    /// 一共几位
+    pub lengths: Vec<u8>,
+}
+
+/// 卡号开头的一段，含两头、两头位数相同：`51`–`55`。只有一个数时两头相同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CardPrefix {
+    pub from: u32,
+    pub to: u32,
 }
 
 /// 一条规则。
@@ -4444,6 +4475,41 @@ mod tests {
         assert_eq!(v["id"], 1);
         // 结局自己带着模型名：开始之后才来听的一方只有它
         assert_eq!(v["model"], "claude-sonnet-5");
+    }
+
+    #[test]
+    fn the_personal_number_matchers_say_what_they_check() {
+        // 界面按 `kind` 写成自己的话，号段和位数照着画
+        let id = serde_json::to_value(Matcher::CnResidentId { born_since: 1900 }).unwrap();
+        assert_eq!(
+            id,
+            serde_json::json!({ "kind": "cn-resident-id", "born_since": 1900 })
+        );
+        let card = serde_json::to_value(Matcher::BankCard {
+            networks: vec![CardNetwork {
+                name: "Mastercard".into(),
+                prefixes: vec![
+                    CardPrefix { from: 51, to: 55 },
+                    CardPrefix {
+                        from: 2221,
+                        to: 2720,
+                    },
+                ],
+                lengths: vec![16],
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            card,
+            serde_json::json!({
+                "kind": "bank-card",
+                "networks": [{
+                    "name": "Mastercard",
+                    "prefixes": [{ "from": 51, "to": 55 }, { "from": 2221, "to": 2720 }],
+                    "lengths": [16],
+                }],
+            })
+        );
     }
 
     #[test]

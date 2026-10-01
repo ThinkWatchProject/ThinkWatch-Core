@@ -244,6 +244,21 @@ fn matcher(m: &tw_guard::redact::rules::Matcher) -> tw_api::Matcher {
         M::DomainSuffix { suffixes } => tw_api::Matcher::DomainSuffix {
             suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
         },
+        M::CnResidentId { born_since } => tw_api::Matcher::CnResidentId { born_since },
+        M::BankCard { networks } => tw_api::Matcher::BankCard {
+            networks: networks
+                .iter()
+                .map(|n| tw_api::CardNetwork {
+                    name: n.name.to_string(),
+                    prefixes: n
+                        .prefixes
+                        .iter()
+                        .map(|&(from, to)| tw_api::CardPrefix { from, to })
+                        .collect(),
+                    lengths: n.lengths.to_vec(),
+                })
+                .collect(),
+        },
     }
 }
 
@@ -920,6 +935,31 @@ mod tests {
                 min_tail: 20
             }
         );
+        // 两条个人号码的规则出厂就开着，判据带着界面要画的细节
+        let id = v.rules.iter().find(|r| r.id == "cn-resident-id").unwrap();
+        assert!(id.enabled && id.on_by_default);
+        assert_eq!(id.kind, "personal");
+        assert_eq!(
+            id.matcher,
+            tw_api::Matcher::CnResidentId { born_since: 1900 }
+        );
+        let card = v.rules.iter().find(|r| r.id == "bank-card").unwrap();
+        assert!(card.enabled && card.on_by_default);
+        let tw_api::Matcher::BankCard { networks } = &card.matcher else {
+            panic!("{:?}", card.matcher);
+        };
+        let amex = networks
+            .iter()
+            .find(|n| n.name == "American Express")
+            .unwrap();
+        assert_eq!(
+            amex.prefixes,
+            vec![
+                tw_api::CardPrefix { from: 34, to: 34 },
+                tw_api::CardPrefix { from: 37, to: 37 }
+            ]
+        );
+        assert_eq!(amex.lengths, vec![15]);
     }
 
     #[test]
