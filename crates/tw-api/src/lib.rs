@@ -656,7 +656,22 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 ///
 /// 30 起概览还带 [`Overview::failover`]（[`FailoverView`]：上游失败之后停用多久、流开头
 /// 最多等多久）。照 29 写的界面读不出这一项，也就改不了它。
-pub const CONTROL_API_VERSION: u32 = 30;
+///
+/// **31 起有上游体检**：新端点 `GET /upstreams/health`（[`UpstreamHealth`]：每家上游的请求、
+/// 失败、取消，回答里写的模型名和发出去的对不对得上，上游报的输入和本地估算之比、本该读得到
+/// 缓存的轮次读到了多少，各带样本数和别家服务同一个模型时的参照，以及首 token 和生成速度的
+/// 中位数）。[`Event::RequestStarted`] 多了 `input_estimate`，三种结局多了 `answered_model`。
+/// 照 30 写的界面看不到体检。
+///
+/// 31 起**整个请求历史都能搜**：`POST /history/search`（[`HistorySearchQuery`] →
+/// [`HistorySearchPage`]）按流量页的筛选条件翻遍库里每一条，往回一页一页取；`content` 时
+/// 还读正文还在的那些请求里新的一轮和回答（文字和工具调用），带打过码的摘录。照 30 写的
+/// 界面只看得到自己载入的那几千条。
+///
+/// 31 起出站脱敏有**身份证号和银行卡号**两条出厂就开的规则：[`Matcher`] 多了
+/// `cn-resident-id` 和 `bank-card`（[`CardNetwork`]、[`CardPrefix`]），[`SecretKind`] 多了
+/// `personal`。照 30 写的界面说不出这两条规则按什么认。
+pub const CONTROL_API_VERSION: u32 = 31;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
