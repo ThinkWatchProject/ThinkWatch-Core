@@ -2952,6 +2952,72 @@ pub struct ListQuery {
     pub limit: Option<usize>,
 }
 
+/// 在整份请求记录里找（`POST /history/search`）。
+///
+/// **筛法和流量页的筛选框一模一样**（桌面端 `requestTable.ts` 的 `filterRows`），只是
+/// 搬到了库里：那边只筛得到读进来的最近两千条，记录却留着三个月。几个条件之间是「且」。
+///
+/// 走请求体而不是查询串：错误码是一张清单，查询串放不下清单（core 读查询串用的
+/// `serde_urlencoded` 不认序列）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HistorySearchQuery {
+    /// 自由文本。**去掉首尾空白、不分大小写**，按子串对：路径、密钥名、按请求头
+    /// 认出的应用、来源地址、上游、模型、失败原因，任何一样里有就算。空的是不按
+    /// 文本筛
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub q: String,
+    /// 只要失败的
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// 只要无法计价的：跑完了、报了用量，却没算出金额。还在跑的、失败的、取消的、
+    /// 没报用量的不算 —— 它们没有金额是另一回事，和概览上「无法计价」那个数是同一批
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unpriced: bool,
+    /// 只要这把密钥的，整个名字相等。空串和不给一样
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// 只要这个上游服务的，整个名字相等。本地应答的没有上游，按上游筛时一条都不留
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// 只要这个模型的，**整个名字相等** —— 点 gpt-5.5 不该带出 gpt-5.5-codex
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 失败原因按码也算对上：界面上那句话是按码翻的，库里只有英文原句。界面把
+    /// **译文里含着 `q` 的那些码**交过来；英文原句照样按 `q` 对
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_codes: Vec<String>,
+    /// 本地应答的那几行「上游」一格写的是界面自己的一句说明（按当时的语言）。那句话
+    /// 里含着 `q` 时界面交 `true`，本地应答的就都算对上
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_matches: bool,
+    /// 也按正文找：请求里新的那一轮（最后一条用户消息，含工具结果）和回答的文字。
+    /// 只有正文还在盘上的那些能这样找，更早的照样按上面那几样对。没有 `q` 时不起作用
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_ms: Option<i64>,
+    /// 从这一条往前接着找：上一页的 [`HistorySearchPage::next`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<HistoryCursor>,
+    /// 一页最多几条。缺省 100、最多 500
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// 记录里的一个位置：一条请求开始的时刻和它的请求号。
+///
+/// **两样一起才定得住。**同一毫秒里开始的请求不止一条（并发的子代理、同时发出的
+/// 几个工具调用），只按时刻翻页，落在页缝上的那几条不是漏掉就是重复。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HistoryCursor {
+    pub at_ms: i64,
+    pub id: i64,
+}
+
 /// 安全日志一页要的：哪一项、哪一段、从哪条往前、几条（`GET /security/events`）。
 /// 缺省是全部，不是今天；条数缺省 100、最多 500。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3310,6 +3376,68 @@ pub struct HistoryRow {
     /// 而那正是用户回头翻「那一条到底被换了什么」的时候。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<SecurityEventView>,
+}
+
+/// 搜索的一页（`POST /history/search`），新的在前。
+///
+/// **按正文找的那一页不一定满。**正文要一份一份从盘上读，一次只读一定的量（见
+/// `stopped`），读完就把找到的先交回来；`next` 说从哪儿接着找，`next.at_ms` 就是
+/// 这一次往回找到了哪一刻。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HistorySearchPage {
+    /// 对上的请求，和 `GET /history` 同一个样子
+    pub rows: Vec<HistoryRow>,
+    /// 按正文对上的那些各自对上了哪一段，一条请求一项。按记录就对上的不在这里
+    /// （没有去读它的正文）
+    pub hits: Vec<ContentHit>,
+    /// 下一页从哪儿接着找：交回去当 [`HistorySearchQuery::before`]。`None` 是整段都
+    /// 找完了
+    pub next: Option<HistoryCursor>,
+    /// 按正文找时：正文最早留到哪一刻（盘上最老的那一天的零点，UTC）。比它早的
+    /// 正文已经清掉了，那些请求只按记录对。没按正文找、或者盘上一份正文都没有时
+    /// 是 `None`
+    pub bodies_since_ms: Option<i64>,
+    /// 这一页为什么停在这里
+    pub stopped: SearchStop,
+}
+
+slug_enum! {
+    /// 一页搜索停在哪儿的原因。
+    pub enum SearchStop {
+        /// 凑够了一页
+        Full = "full",
+        /// 正文读够了这一次的量，往前还没找。再问一次接着找
+        Budget = "budget",
+        /// 整段都找完了
+        End = "end",
+    }
+}
+
+/// 一条请求的正文里对上的那一段：命中的前后各四十来个字，空白并成一个空格，
+/// **已脱敏**（和详情抽屉里的正文同一套打码）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ContentHit {
+    /// 哪条请求
+    pub id: i64,
+    pub side: ContentSide,
+    /// 命中之前的那一段。前面还有字时以 `…` 开头
+    pub before: String,
+    /// 命中的那一段，原文的大小写
+    pub matched: String,
+    /// 命中之后的那一段。后面还有字时以 `…` 结尾
+    pub after: String,
+}
+
+slug_enum! {
+    /// 正文里的哪一边。
+    pub enum ContentSide {
+        /// 请求里新的那一轮：最后一条用户消息，含工具结果
+        Request = "request",
+        /// 回答的文字
+        Answer = "answer",
+    }
 }
 
 /// 一次请求做过的格式转换。

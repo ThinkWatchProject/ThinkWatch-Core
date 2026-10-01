@@ -14,8 +14,14 @@ description = "Request history and runtime state on SQLite and the filesystem"
 tw-api = { workspace = true }
 tw-observe = { workspace = true }
 tw-pricing = { workspace = true }
+# 按正文找：请求和回答怎么拆成文字，四种格式的读法都在这里，不另写一份
+tw-dialect = { workspace = true }
+# 按正文找时交出去的那一小段要和详情抽屉同一套打码
+tw-secret = { workspace = true }
 bytes = { workspace = true }
-rusqlite = { workspace = true }
+# functions：搜索要一个 SQL 函数，按界面同一种小写规则比子串（见 `search::sql`）。
+# 只是打开 rusqlite 已有的接口，不多编任何东西
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

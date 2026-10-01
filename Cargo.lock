@@ -2983,8 +2983,10 @@ dependencies = [
  "tokio",
  "tracing",
  "tw-api",
+ "tw-dialect",
  "tw-observe",
  "tw-pricing",
+ "tw-secret",
 ]
 
 [[package]]
