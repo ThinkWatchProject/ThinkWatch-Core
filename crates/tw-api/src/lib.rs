@@ -786,6 +786,15 @@ pub enum Event {
         model: String,
         method: String,
         path: String,
+        /// 本地估的输入 token 数，和数 token 的本地估算、路由条件里的 `input_tokens`
+        /// 是同一个数。上游体检拿它和上游报的输入比（`GET /upstreams/health`）。
+        ///
+        /// **说的是发给上游的那一份**：规则只改模型名、输出上限和推理开关，格式转换
+        /// 换的是同一段内容的写法，都不动它；脱敏换掉的几个值差出的几个 token，在这个
+        /// 估算本身的误差之内。解不开的请求没有：不是生成回答的（数 token、嵌入），
+        /// 和对话存在上游服务端的（`previous_response_id` 这些）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_estimate: Option<u64>,
         /// 请求带着 DeepSeek Harness 的会话日志（`dsh_session_log`）：这是它序列化之后
         /// 的字节数。没带是 None。
         ///
@@ -837,6 +846,13 @@ pub enum Event {
         /// 来会把速度顶高好几倍。没有第一个 token 的（非流式）、没有输出的，也没有
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_per_sec: Option<u32>,
+        /// 上游在回答里写的模型名：Anthropic 和 Chat 的 `model`、Responses 的
+        /// `response.model`、Gemini 的 `modelVersion`。**原样，不归一。**
+        ///
+        /// 回答里没写的没有：Bedrock 的 Converse 不写，WebSocket 那条路不看。和
+        /// `model` 不是一回事 —— 那是客户端要的，这是上游说它用的
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answered_model: Option<String>,
     },
     /// 失败了。`source` 和 HTTP 响应里的 `x-thinkwatch-error` 是同一个词表
     /// （`auth` / `config` / `upstream` / `request` / `rate_limited` /
@@ -862,6 +878,9 @@ pub enum Event {
         /// 按它算出来的钱只能是估算。响应头之前就失败的没有用量。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageView>,
+        /// 失败之前上游在回答里写的模型名（见 `RequestFinished::answered_model`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answered_model: Option<String>,
     },
     /// 客户端没等到响应结束就走了（Claude Code 里按一下 Esc）。
     ///
@@ -889,6 +908,9 @@ pub enum Event {
         /// **没嗅到就是 None，不是零** —— 客户端可能在第一帧之前就走了
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageView>,
+        /// 断开之前上游在回答里写的模型名（见 `RequestFinished::answered_model`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answered_model: Option<String>,
     },
     /// 路由决定完了，尝试链也走完了。
     ///
@@ -3296,6 +3318,173 @@ pub struct TokenRateView {
     pub samples: usize,
 }
 
+/// 上游体检（`GET /upstreams/health`）：一段时间里每家上游的几项事实，各带样本数。
+///
+/// **只摆事实和参照，不下结论。**中转站服务的是不是它说的那个模型、报的用量有没有
+/// 虚高、缓存是不是真的在起作用 —— core 给出偏差、样本数和别家的参照，怎么措辞是
+/// 界面的事。样本少的时候数字说明不了什么，所以每一项都带着样本数。
+///
+/// 只数这段时间里落了库的请求。**本地应答不算**（没经过上游），规则拒绝了、一家上游
+/// 都没去的也不算（不归哪一家）。请求归给最终服务它的那一家：故障转移之前失败的那
+/// 一跳不在这里。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct UpstreamHealth {
+    /// 实际数的那段时间，Unix 毫秒，含起点不含终点。不给参数时是最近 7 天
+    pub from_ms: i64,
+    pub to_ms: i64,
+    /// 这段时间里记录从哪一刻起是全的，同 [`RouteStats::covered_since_ms`]：库刚重建、
+    /// 记录留的天数比窗口短时比 `from_ms` 晚，这段时间里没有一刻有记录时是空
+    pub covered_since_ms: Option<i64>,
+    /// 每家上游一条，请求多的在前。这段时间里一条请求都没有的上游不在这里
+    pub upstreams: Vec<UpstreamCheckup>,
+}
+
+/// 一家上游的体检结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct UpstreamCheckup {
+    pub upstream: String,
+    /// 交给它的请求数。**客户端取消的不算**（见 `cancelled`）
+    pub requests: i64,
+    /// 其中失败的，口径同 [`Summary::failed`]
+    pub failed: i64,
+    /// 客户端没等到结束就走了的。**不是失败，也不在 `requests` 里**
+    pub cancelled: i64,
+    pub models: ModelConsistency,
+    pub input: InputVsEstimate,
+    pub cache: CacheReads,
+    /// 第一个 token 的中位数，毫秒。样本和 `/latency/provider` 的一样：流式的才有
+    pub ttft_ms: Option<MedianView>,
+    /// 生成速度的中位数，token/秒。样本和 `/token-rate/provider` 的一样
+    pub tokens_per_sec: Option<MedianView>,
+}
+
+/// 中位数和样本数。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MedianView {
+    pub p50: i64,
+    pub samples: i64,
+}
+
+/// 回答里写的模型名，和发出去的对不对得上。
+///
+/// 发出去的是规则改写之后的那个（尝试链最后一跳的 `model`，没改写的就是客户端要的）。
+/// 比之前两边都**归一**：大小写、日期和快照后缀（`-20250929`、`@20250929`、`-latest`）、
+/// `models/` 和厂商前缀（`anthropic/`）、Bedrock 的写法（`us.anthropic.…-v1:0`）、
+/// `4.5` 和 `4-5` 这类不是换了模型的差别都抹掉。归一宁可宽：错判一次「对不上」就是
+/// 冤枉一家诚实的上游。
+///
+/// **模型名是上游自己写的**：写得一致不能证明真是那个模型，写得不一致才是一条线索。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ModelConsistency {
+    /// 回答里写了模型名的请求数（取消的不算）
+    pub named: i64,
+    /// 其中和发出去的对不上的
+    pub differed: i64,
+    /// 对不上的里最常见的几对，最多三对，多的在前。归一之后是同一对的合在一起算，
+    /// 名字取其中最常见的那种写法
+    pub examples: Vec<ModelPair>,
+}
+
+/// 发出去的和回答里写的一对模型名。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ModelPair {
+    /// 发给上游的，原样
+    pub sent: String,
+    /// 上游在回答里写的，原样
+    pub answered: String,
+    pub count: i64,
+}
+
+/// 上游报的输入 token 和本地估算之比。
+///
+/// 输入按上游计费的口径算：没命中缓存的输入 + 缓存读 + 缓存写（几种格式落库时已经换算
+/// 成这三项互不重叠）。估算见 `RequestStarted::input_estimate`。样本是成功跑完、报了
+/// 用量、估算至少 1000 token 的请求：太短的请求里，消息格式自己的那几个 token 就能让
+/// 比值差出一截。
+///
+/// **估算本身只准到两三成**，单看一家的比值说明不了什么；有意义的是同一个模型在不同
+/// 上游之间比，所以 `by_model` 里每个模型都带着别的上游服务它时的比值。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct InputVsEstimate {
+    /// 所有模型合在一起。没有样本时是空
+    pub all: Option<RatioView>,
+    /// 按模型（发出去的那个，归一之后）分，样本多的在前
+    pub by_model: Vec<InputForModel>,
+}
+
+/// 一个模型的输入之比：这一家的，和别家的参照。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct InputForModel {
+    /// 归一之后的模型名
+    pub model: String,
+    pub here: RatioView,
+    /// 同一段时间里别的上游服务这个模型时的比值：几家的样本合在一起取中位数。
+    /// 只有这一家服务它时是空
+    pub others: Option<RatioView>,
+    /// `others` 是几家的
+    pub other_upstreams: i64,
+}
+
+/// 比值的中位数和样本数。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RatioView {
+    /// 中位数，精确到千分之一。1.0 是一样多
+    pub median: f64,
+    pub samples: i64,
+}
+
+/// 本该读得到缓存的轮次里，读到了多少。
+///
+/// 「本该读得到」：同一次会话里的后一轮，和它的前一轮发给同一家上游、同一个模型，离
+/// 前一轮开始不到 5 分钟（几家缓存最短的存活时间）；两轮的输入都至少 4096 token（几家
+/// 最小可缓存长度里最大的那个，再短上游本来就不缓存）。只数成功跑完、报了用量的轮次。
+///
+/// **读不读得到也看客户端**：Anthropic 和 Bedrock 上的模型要客户端标出缓存断点，不标
+/// 就一直是 0。所以 `by_model` 里带着别的上游的参照 —— 同样的客户端发给别家读得到，
+/// 才是一条线索。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CacheReads {
+    /// 所有模型合在一起
+    pub all: CacheTally,
+    /// 按模型（发出去的那个，归一之后）分，轮次多的在前
+    pub by_model: Vec<CacheForModel>,
+}
+
+/// 一个模型本该读得到缓存的轮次：这一家的，和别家的参照。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CacheForModel {
+    /// 归一之后的模型名
+    pub model: String,
+    pub here: CacheTally,
+    /// 别的上游服务这个模型时，几家合在一起。只有这一家服务它时是空
+    pub others: Option<CacheTally>,
+    /// `others` 是几家的
+    pub other_upstreams: i64,
+}
+
+/// 一组本该读得到缓存的轮次。读到的比例是 `cache_read_tokens / input_tokens`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CacheTally {
+    pub turns: i64,
+    /// 其中一个缓存 token 都没读到的
+    pub zero_read_turns: i64,
+    /// 这些轮次的输入一共多少：没命中缓存的输入 + 缓存读 + 缓存写
+    pub input_tokens: i64,
+    /// 其中缓存读的
+    pub cache_read_tokens: i64,
+}
+
 /// 一条历史请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -4598,6 +4787,7 @@ mod tests {
             duration_ms: 5,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         };
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "request_finished");
@@ -4661,6 +4851,7 @@ mod tests {
                 model: "m".into(),
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                input_estimate: None,
                 session_log_bytes: None,
                 at_ms: 0,
             },
@@ -4678,6 +4869,7 @@ mod tests {
                 duration_ms: 1,
                 usage: None,
                 tokens_per_sec: None,
+                answered_model: None,
             },
             Event::RequestFailed {
                 id: 7,
@@ -4687,6 +4879,7 @@ mod tests {
                 bytes: None,
                 duration_ms: None,
                 usage: None,
+                answered_model: None,
             },
             Event::RequestCancelled {
                 id: 7,
@@ -4695,6 +4888,7 @@ mod tests {
                 bytes: 1,
                 duration_ms: 1,
                 usage: None,
+                answered_model: None,
             },
         ] {
             assert_eq!(e.id(), 7);
@@ -4721,6 +4915,7 @@ mod tests {
             model: "m".into(),
             method: "POST".into(),
             path: "/v1/messages".into(),
+            input_estimate: None,
             session_log_bytes: None,
             at_ms: 0,
         };
@@ -4771,6 +4966,7 @@ mod tests {
                 output: 1,
                 ..Default::default()
             }),
+            answered_model: None,
         };
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "request_cancelled");
@@ -4789,10 +4985,73 @@ mod tests {
             bytes: 0,
             duration_ms: 10,
             usage: None,
+            answered_model: None,
         };
         let v = serde_json::to_value(&none).unwrap();
         assert!(v.get("usage").is_none(), "{v}");
         assert!(v.get("status").is_none(), "{v}");
+    }
+
+    /// 回答里写的模型名跟着结局走，本地估的输入跟着开始走；**没有的不出现**，不是空串、不是 0
+    #[test]
+    fn the_answered_model_and_the_input_estimate_travel_with_the_request() {
+        let done = Event::RequestFinished {
+            id: 1,
+            model: "claude-sonnet-4-5".into(),
+            status: 200,
+            bytes: 10,
+            duration_ms: 5,
+            usage: None,
+            tokens_per_sec: None,
+            answered_model: Some("claude-sonnet-4-5-20250929".into()),
+        };
+        let v = serde_json::to_value(&done).unwrap();
+        assert_eq!(v["answered_model"], "claude-sonnet-4-5-20250929");
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            Event::RequestFinished { answered_model: Some(m), .. } if m == "claude-sonnet-4-5-20250929"
+        ));
+
+        let silent = Event::RequestFailed {
+            id: 2,
+            model: String::new(),
+            source: FailureSource::Upstream,
+            message: tw_types::msg!("t.x" => "x"),
+            bytes: None,
+            duration_ms: None,
+            usage: None,
+            answered_model: None,
+        };
+        let v = serde_json::to_value(&silent).unwrap();
+        assert!(v.get("answered_model").is_none(), "{v}");
+
+        let started = |input_estimate| Event::RequestStarted {
+            key_masked: None,
+            peer: None,
+            id: 3,
+            client: "c".into(),
+            client_hint: None,
+            session: None,
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: None,
+            rewritten_by: vec![],
+            provider: "p".into(),
+            billing: Billing::PerToken,
+            model: "m".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            input_estimate,
+            session_log_bytes: None,
+            at_ms: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(started(Some(1234))).unwrap()["input_estimate"],
+            1234
+        );
+        let v = serde_json::to_value(started(None)).unwrap();
+        assert!(v.get("input_estimate").is_none(), "{v}");
     }
 
     #[test]

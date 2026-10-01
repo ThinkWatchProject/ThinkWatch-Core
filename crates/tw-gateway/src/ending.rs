@@ -253,7 +253,7 @@ impl Ending {
             );
             return;
         }
-        let usage = self.settle();
+        let (usage, answered_model) = self.settle();
         if let Some(t) = self.answer.take()
             && (200..300).contains(&status)
         {
@@ -269,6 +269,7 @@ impl Ending {
             duration_ms,
             usage: usage.map(view),
             tokens_per_sec,
+            answered_model,
         });
     }
 
@@ -277,7 +278,7 @@ impl Ending {
     ///
     /// **断在流中间的失败也带着用量** —— 上游已经为它计了费。
     pub fn failed(mut self, source: tw_api::FailureSource, message: Msg) {
-        let usage = self.settle();
+        let (usage, answered_model) = self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
             model: std::mem::take(&mut self.model),
@@ -286,11 +287,13 @@ impl Ending {
             bytes: self.received(),
             duration_ms: Some(self.duration_ms()),
             usage: usage.map(view),
+            answered_model,
         });
     }
 
-    /// 收尾：先把响应体交出去，再拿走用量。三种结局共用，只走一次。
-    fn settle(&mut self) -> Option<Usage> {
+    /// 收尾：先把响应体交出去，再拿走用量和回答里写的模型名（两样是嗅探器在同一遍里
+    /// 认的）。三种结局共用，只走一次。
+    fn settle(&mut self) -> (Option<Usage>, Option<String>) {
         self.told = true;
         let (recorded, original_len) = std::mem::take(&mut self.tap).finish();
         if !recorded.is_empty() {
@@ -305,7 +308,9 @@ impl Ending {
                 },
             );
         }
-        std::mem::take(&mut self.sniffer).finish()
+        let sniffer = std::mem::take(&mut self.sniffer);
+        let model = sniffer.model().map(str::to_string);
+        (sniffer.finish(), model)
     }
 
     fn duration_ms(&self) -> u64 {
@@ -327,7 +332,8 @@ impl Drop for Ending {
         // **这里什么都不能 panic。**Drop 可能正跑在一次 unwind 里，那时
         // 再 panic 一次，整个进程就没了。下面每一步都是不会失败的那种：
         // 往通道里 try_send、往广播里 send、读一下时钟。
-        let usage = self.settle().map(view);
+        let (usage, answered_model) = self.settle();
+        let usage = usage.map(view);
         // 是网关自己的代码崩掉了。**记成取消会冤枉客户端** —— 排查的人
         // 会去问一个根本没做过这件事的客户端。
         if std::thread::panicking() {
@@ -341,6 +347,7 @@ impl Drop for Ending {
                 bytes: self.received(),
                 duration_ms: Some(self.duration_ms()),
                 usage,
+                answered_model,
             });
             return;
         }
@@ -351,6 +358,7 @@ impl Drop for Ending {
             bytes: self.bytes,
             duration_ms: self.duration_ms(),
             usage,
+            answered_model,
         });
     }
 }
@@ -593,6 +601,44 @@ mod tests {
             };
             assert_eq!(model, MODEL, "{e:?}");
         }
+    }
+
+    /// **三种结局都带着上游在回答里写的模型名**（和用量同一遍认的）。没写的、没收到
+    /// 回答的、WebSocket 那条路只数字节的，都没有
+    #[test]
+    fn every_ending_carries_the_model_the_upstream_named() {
+        const NAMED: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"usage\":{\"input_tokens\":5000,\"output_tokens\":1}}}\n\n";
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let fed = || {
+            let mut e = responding(&bus);
+            e.feed(NAMED);
+            e
+        };
+        fed().finished(200);
+        fed().failed(tw_api::FailureSource::Upstream, msg!("t.x" => "x"));
+        drop(fed());
+        // 回答里没写模型名的
+        let mut silent = responding(&bus);
+        silent.feed(MESSAGE_START);
+        silent.finished(200);
+        // WebSocket 那条路只数字节
+        let mut ws = responding(&bus);
+        ws.count(NAMED.len());
+        ws.finished(101);
+
+        let got = drain(&mut rx);
+        let named: Vec<Option<&str>> = got
+            .iter()
+            .map(|e| match e {
+                Event::RequestFinished { answered_model, .. }
+                | Event::RequestFailed { answered_model, .. }
+                | Event::RequestCancelled { answered_model, .. } => answered_model.as_deref(),
+                other => panic!("该是一个结局，实际 {other:?}"),
+            })
+            .collect();
+        let sonnet = Some("claude-sonnet-4-5-20250929");
+        assert_eq!(named, [sonnet, sonnet, sonnet, None, None], "{got:?}");
     }
 
     /// 响应头之前就失败了（每家上游都拒绝、策略不让）。**没有字节、没有

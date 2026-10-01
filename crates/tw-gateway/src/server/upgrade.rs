@@ -58,6 +58,8 @@ pub(super) async fn ws_upgrade(
             model: String::new(),
             method: "WS".to_string(),
             path: uri.path().to_string(),
+            // 升级请求没有正文，没有可估的
+            input_estimate: None,
             session_log_bytes: None,
             at_ms,
         });

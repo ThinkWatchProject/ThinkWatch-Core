@@ -627,6 +627,11 @@ fn open(
         model: facts.model.clone(),
         method: "POST".to_string(),
         path: req.uri.path().to_string(),
+        // 路由已经估过的那个数，不再算一遍。**它也就是发给上游的那一份的估算**：之后每
+        // 一跳只会改模型名、输出上限和推理开关（规则）、换一种写法（格式转换）、把几个值
+        // 换成占位符（脱敏）—— 前两样不动这个数，脱敏差出的几个 token 在估算本身的误差
+        // 之内。解不开的请求没有中间表示，也就没有估算
+        input_estimate: matches!(reading.decoded, Some(Ok(_))).then_some(facts.input_tokens),
         session_log_bytes: reading.harness.and_then(|h| h.session_log_bytes),
         at_ms,
     });

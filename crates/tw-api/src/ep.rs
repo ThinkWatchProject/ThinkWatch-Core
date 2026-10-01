@@ -52,6 +52,9 @@ endpoints! {
     /// 生成速度的中位数，按模型、按上游
     TokenRate: GET "/token-rate", api::Window => Vec<api::TokenRateView>;
     TokenRateByProvider: GET "/token-rate/provider", api::Window => Vec<api::TokenRateView>;
+    /// 上游体检：每家上游的失败、回答里的模型名、输入用量和本地估算之比、缓存读、
+    /// 延迟与速度，各带样本数和别家的参照。不给时间窗是最近 7 天
+    UpstreamHealth: GET "/upstreams/health", api::Window => api::UpstreamHealth;
     RequestDetail: GET "/request/{id}" [id], () => api::RequestDetail;
     /// 把一条记录变成回放用例（YAML）
     Fixture: GET "/request/{id}/fixture" [id], () => String, text;

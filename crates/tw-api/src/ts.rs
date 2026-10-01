@@ -255,6 +255,33 @@ mod tests {
         ));
     }
 
+    /// 上游体检：没有样本的是 null（必有的字段，不是省掉），比值是普通的数
+    #[test]
+    fn the_upstream_checkup_says_what_it_has_no_samples_for() {
+        let ts = typescript();
+        assert!(ts.contains("  UpstreamHealth: { req: Window; res: UpstreamHealth };"));
+        let health = decl_of(&ts, "UpstreamHealth");
+        assert!(
+            health.contains("covered_since_ms: number | null"),
+            "{health}"
+        );
+        assert!(
+            health.contains("upstreams: Array<UpstreamCheckup>"),
+            "{health}"
+        );
+        let checkup = decl_of(&ts, "UpstreamCheckup");
+        assert!(checkup.contains("ttft_ms: MedianView | null"), "{checkup}");
+        let input = decl_of(&ts, "InputVsEstimate");
+        assert!(input.contains("all: RatioView | null"), "{input}");
+        let model = decl_of(&ts, "InputForModel");
+        assert!(model.contains("others: RatioView | null"), "{model}");
+        assert!(decl_of(&ts, "RatioView").contains("median: number"));
+        // 事件上的两样是可以不出现的字段
+        let event = decl_of(&ts, "Event");
+        assert!(event.contains("input_estimate?: number"), "{event}");
+        assert!(event.contains("answered_model?: string"), "{event}");
+    }
+
     #[test]
     fn every_endpoint_is_in_the_table() {
         let ts = typescript();

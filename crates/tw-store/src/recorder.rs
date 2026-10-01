@@ -42,6 +42,20 @@ struct Partial {
     translated: Option<String>,
     /// 请求带着的 DeepSeek Harness 会话日志的字节数。开始事件带着
     session_log_bytes: Option<i64>,
+    /// 本地估的输入 token 数。开始事件带着
+    input_estimate: Option<i64>,
+}
+
+impl Partial {
+    /// 发给上游的模型名：规则改写过的记在服务它的那一跳上（尝试链的最后一跳，见路由
+    /// 事件），没改写的就是客户端要的那个。**查价和体检都看它**：上游按它收钱、照它回答
+    fn sent_model(&self) -> &str {
+        self.routing
+            .attempts
+            .last()
+            .and_then(|a| a.model.as_deref())
+            .unwrap_or(&self.model)
+    }
 }
 
 /// 在飞的请求最多攒多少条。
@@ -144,6 +158,8 @@ impl Recorder {
             session: p.session.clone(),
             provider: p.provider.clone(),
             model: p.model.clone(),
+            sent_model: p.sent_model().to_string(),
+            answered_model: None,
             path: p.path.clone(),
             status: p.status,
             ttfb_ms: p.ttfb_ms,
@@ -155,6 +171,7 @@ impl Recorder {
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            input_estimate: p.input_estimate,
             cost_micros: None,
             cost_estimated: false,
             error: None,
@@ -200,6 +217,7 @@ impl Recorder {
                 billing,
                 model,
                 path,
+                input_estimate,
                 session_log_bytes,
                 at_ms,
                 ..
@@ -236,6 +254,7 @@ impl Recorder {
                         billing: *billing,
                         translated: None,
                         session_log_bytes: session_log_bytes.map(|b| b as i64),
+                        input_estimate: input_estimate.map(|n| n.min(i64::MAX as u64) as i64),
                     },
                 );
             }
@@ -471,6 +490,7 @@ impl Recorder {
                 duration_ms,
                 usage,
                 tokens_per_sec,
+                answered_model,
                 ..
             } => self.settle(
                 *id,
@@ -478,6 +498,7 @@ impl Recorder {
                 Some(*bytes),
                 Some(*duration_ms),
                 *usage,
+                answered_model.clone(),
                 Ending::Finished {
                     tokens_per_sec: *tokens_per_sec,
                 },
@@ -497,6 +518,7 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
+                answered_model,
                 ..
             } => self.settle(
                 *id,
@@ -504,6 +526,7 @@ impl Recorder {
                 Some(*bytes),
                 Some(*duration_ms),
                 *usage,
+                answered_model.clone(),
                 Ending::Cancelled,
             ),
             /*
@@ -519,6 +542,7 @@ impl Recorder {
                 bytes,
                 duration_ms,
                 usage,
+                answered_model,
                 ..
             } => self.settle(
                 *id,
@@ -526,6 +550,7 @@ impl Recorder {
                 *bytes,
                 *duration_ms,
                 *usage,
+                answered_model.clone(),
                 Ending::Failed(message),
             ),
             Event::LocallyAnswered {
@@ -550,6 +575,8 @@ impl Recorder {
                     session: None,
                     provider: String::new(),
                     model: String::new(),
+                    sent_model: String::new(),
+                    answered_model: None,
                     path: probe.slug().to_string(),
                     status: Some(200),
                     ttfb_ms: Some(0),
@@ -561,6 +588,7 @@ impl Recorder {
                     output_tokens: None,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
+                    input_estimate: None,
                     cost_micros: Some(0),
                     cost_estimated: false,
                     error: None,
@@ -603,6 +631,7 @@ impl Recorder {
     }
 
     /// 一个请求的结局：算钱，落库，把价钱报回去。
+    #[allow(clippy::too_many_arguments)]
     fn settle(
         &mut self,
         id: u64,
@@ -612,6 +641,7 @@ impl Recorder {
         bytes: Option<u64>,
         duration_ms: Option<u64>,
         usage: Option<tw_api::UsageView>,
+        answered_model: Option<String>,
         how: Ending<'_>,
     ) {
         let Some(p) = self.inflight.remove(&id) else {
@@ -649,13 +679,9 @@ impl Recorder {
         let book = self.pricing.load();
         // **按这个请求实际走的上游查价** —— 同一个模型在不同上游不是同一个价。
         // **按发给它的那个模型名查**：规则把请求改写成另一个模型发出去的，上游
-        // 按那个模型收钱。改写记在服务它的那一跳上（尝试链的最后一跳，见路由事件）
-        let priced_as = p
-            .routing
-            .attempts
-            .last()
-            .and_then(|a| a.model.as_deref())
-            .unwrap_or(&p.model);
+        // 按那个模型收钱
+        let sent_model = p.sent_model().to_string();
+        let priced_as = sent_model.as_str();
         let resolved = if free || local {
             None
         } else {
@@ -707,6 +733,8 @@ impl Recorder {
             session: p.session,
             provider: p.provider,
             model: p.model,
+            sent_model,
+            answered_model,
             path: p.path,
             status: status.or(p.status),
             ttfb_ms: p.ttfb_ms,
@@ -721,6 +749,7 @@ impl Recorder {
             output_tokens: u.map(|u| u.output as i64),
             cache_read_tokens: u.map(|u| u.cache_read as i64),
             cache_write_tokens: u.map(|u| u.cache_write as i64),
+            input_estimate: p.input_estimate,
             cost_micros,
             cost_estimated: estimated,
             error: match how {
@@ -798,6 +827,7 @@ mod tests {
             path: "/v1/messages".into(),
             session_log_bytes: None,
             at_ms: 1_000_000,
+            input_estimate: None,
         }
     }
 
@@ -810,6 +840,7 @@ mod tests {
             duration_ms: 4000,
             usage,
             tokens_per_sec: None,
+            answered_model: None,
         }
     }
 
@@ -954,6 +985,103 @@ mod tests {
         assert!(!row.cost_estimated);
     }
 
+    /// 发出去的模型名、上游在回答里写的模型名、本地估的输入，**都跟着这一行落库**：
+    /// 上游体检比的就是这几样。发出去的是规则改写之后的那个，不是客户端要的
+    #[test]
+    fn the_sent_and_answered_models_and_the_estimate_are_recorded() {
+        let (_d, mut r) = rec();
+        let mut ev = started(1, "claude-opus-4-1");
+        if let Event::RequestStarted { input_estimate, .. } = &mut ev {
+            *input_estimate = Some(12_345);
+        }
+        r.on_event(&ev);
+        // 路由报出结论之前点开：估算已经在了，发出去的还是客户端要的那个
+        let running = r.in_flight_row(1).unwrap();
+        assert_eq!(running.input_estimate, Some(12_345));
+        assert_eq!(running.sent_model, "claude-opus-4-1");
+        r.on_event(&Event::RequestRouted {
+            id: 1,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec!["换成 Sonnet".into()],
+            denied_by: None,
+            affinity: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "中转".into(),
+                model: Some("claude-sonnet-4-5".into()),
+                outcome: tw_api::AttemptOutcome::Served,
+                status: Some(200),
+                error: None,
+                ms: 300,
+            }],
+            billing: tw_api::Billing::PerToken,
+        });
+        assert_eq!(r.in_flight_row(1).unwrap().sent_model, "claude-sonnet-4-5");
+        r.on_event(&Event::RequestFinished {
+            id: 1,
+            model: String::new(),
+            status: 200,
+            bytes: 10,
+            duration_ms: 400,
+            usage: None,
+            tokens_per_sec: None,
+            answered_model: Some("claude-sonnet-4-5-20250929".into()),
+        });
+        let row = r.db().get(1).unwrap().unwrap();
+        assert_eq!(
+            row.model, "claude-opus-4-1",
+            "按模型的统计看的仍是客户端要的"
+        );
+        assert_eq!(row.sent_model, "claude-sonnet-4-5");
+        assert_eq!(
+            row.answered_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(row.input_estimate, Some(12_345));
+
+        // 没改写的：发出去的就是客户端要的。取消和失败的结局也带着回答里写的模型名
+        r.on_event(&started(2, "gpt-5"));
+        r.on_event(&Event::RequestCancelled {
+            id: 2,
+            model: String::new(),
+            status: Some(200),
+            bytes: 10,
+            duration_ms: 100,
+            usage: None,
+            answered_model: Some("gpt-5-2025-08-07".into()),
+        });
+        r.on_event(&started(3, "gpt-5"));
+        r.on_event(&Event::RequestFailed {
+            id: 3,
+            model: String::new(),
+            source: tw_api::FailureSource::Upstream,
+            message: tw_api::Msg {
+                code: "t.broke".into(),
+                args: Default::default(),
+                text: "broke".into(),
+            },
+            bytes: Some(10),
+            duration_ms: Some(100),
+            usage: None,
+            answered_model: None,
+        });
+        let cancelled = r.db().get(2).unwrap().unwrap();
+        assert_eq!(
+            (
+                cancelled.sent_model.as_str(),
+                cancelled.answered_model.as_deref()
+            ),
+            ("gpt-5", Some("gpt-5-2025-08-07"))
+        );
+        let failed = r.db().get(3).unwrap().unwrap();
+        assert_eq!(
+            (failed.answered_model, failed.input_estimate),
+            (None, None),
+            "没有的就是没有"
+        );
+    }
+
     /// **会话由网关在开始时定，这里照记**：落库的和开始事件里说的是同一个值，
     /// 不在这一层再算一遍（以前在这里按指纹和时间现算，于是在跑的那一轮说不出
     /// 自己属于哪次会话）
@@ -1021,6 +1149,7 @@ mod tests {
             bytes: None,
             duration_ms: Some(1),
             usage: None,
+            answered_model: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
         let routing: tw_api::RoutingView =
@@ -1084,6 +1213,7 @@ mod tests {
             duration_ms: 4000,
             usage: None,
             tokens_per_sec: Some(180),
+            answered_model: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!((row.ttfb_ms, row.ttft_ms), (Some(300), Some(1_200)));
@@ -1116,6 +1246,7 @@ mod tests {
             bytes: 10,
             duration_ms: 3_000,
             usage: None,
+            answered_model: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!((row.ttft_ms, row.tokens_per_sec), (Some(900), None));
@@ -1265,6 +1396,7 @@ mod tests {
             bytes: None,
             duration_ms: None,
             usage: None,
+            answered_model: None,
         });
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(row.error.map(|e| e.text).as_deref(), Some("cannot connect"));
@@ -1454,6 +1586,7 @@ mod billing_tests {
             path: "/backend-api/codex/responses".into(),
             session_log_bytes: None,
             at_ms: 1_000_000,
+            input_estimate: None,
         }
     }
 
@@ -1488,6 +1621,7 @@ mod billing_tests {
             duration_ms: 600_000,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         }
     }
 
@@ -1553,6 +1687,7 @@ mod billing_tests {
                 path: "/v1/messages".into(),
                 session_log_bytes: None,
                 at_ms: 1_000_000,
+                input_estimate: None,
             });
             r.on_event(&Event::RequestCancelled {
                 id,
@@ -1561,6 +1696,7 @@ mod billing_tests {
                 bytes: 0,
                 duration_ms: 3_000,
                 usage: None,
+                answered_model: None,
             });
         }
 
@@ -1985,6 +2121,7 @@ mod cancellation_tests {
             bytes: 312,
             duration_ms: 2_500,
             usage,
+            answered_model: None,
         }
     }
 
@@ -2098,6 +2235,7 @@ mod cancellation_tests {
             bytes: 0,
             duration_ms: 12_000,
             usage: None,
+            answered_model: None,
         });
 
         let row = r.db().get(1).unwrap().expect("响应头之前的取消也该落库");
@@ -2182,6 +2320,7 @@ mod cancellation_tests {
             path: "/v1/messages".into(),
             session_log_bytes: None,
             at_ms: 1_000_000,
+            input_estimate: None,
         });
         r.on_event(&cancelled(1, partial()));
 
@@ -2225,6 +2364,7 @@ mod failure_tests {
             bytes: Some(312),
             duration_ms: Some(2_500),
             usage,
+            answered_model: None,
         }
     }
 
@@ -2303,6 +2443,7 @@ mod failure_tests {
             bytes: None,
             duration_ms: Some(20_000),
             usage: None,
+            answered_model: None,
         });
 
         let row = r.db().get(1).unwrap().unwrap();

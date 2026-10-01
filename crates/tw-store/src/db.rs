@@ -22,7 +22,7 @@ use tw_api::Msg;
 ///
 /// **一列 JSON 的样子变了也算**（比如 `routing` 多了必有的字段）：旧的那些行
 /// 读出来是坏的，而读的一方会把「解不开」当成「没有」。
-const SCHEMA: i64 = 22;
+const SCHEMA: i64 = 23;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -34,10 +34,6 @@ const SCHEMA: i64 = 22;
 /// 表里」；时间桶、分组和会话只看 `cost_micros IS NULL`，数进了不该数的行。
 const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
                          AND billing = 'per-token')";
-
-/// 这一行按哪个模型名查的价：改写过的是发给上游的那个，没改写的是客户端要的那个
-/// （见 `tw_store::recorder` 里的算钱那一段）
-const PRICED_AS: &str = "COALESCE(json_extract(routing, '$.attempts[#-1].model'), model)";
 
 /// 这一行算不出钱，**因为没有拿到用量**：上游没报，或者连接在它报之前就
 /// 结束了（客户端取消、WebSocket 会话）。配价格解决不了它，而它多半花了钱，
@@ -84,7 +80,14 @@ pub struct RequestRow {
     /// 本地应答）是 None
     pub session: Option<String>,
     pub provider: String,
+    /// 客户端要的模型名。按模型的统计看的是它：客户端要了什么
     pub model: String,
+    /// 发给上游的模型名：规则改写过的是改写后的那个（尝试链最后一跳的 `model`），没改写
+    /// 的和 `model` 一样。**按它查价**，上游体检也拿它和回答里写的比 —— 上游收到的是它
+    pub sent_model: String,
+    /// 上游在回答里写的模型名，原样。回答里没写的是 None（Bedrock 的 Converse、
+    /// WebSocket、没收到回答的）
+    pub answered_model: Option<String>,
     pub path: String,
     /// 没走到上游就失败时是 None
     pub status: Option<u16>,
@@ -97,10 +100,15 @@ pub struct RequestRow {
     /// 只有跑完的流式请求有
     pub tokens_per_sec: Option<u32>,
     pub bytes: Option<i64>,
+    /// 上游报的输入，**不含缓存读写**：几种格式在解析时已经换算成三项互不重叠的数，
+    /// 三项加起来才是上游计费的全部输入
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
+    /// 本地估的输入 token 数（`tw_api::Event::RequestStarted::input_estimate`）。
+    /// 解不开的请求是 None
+    pub input_estimate: Option<i64>,
     /// 成本，单位是**微分**（百万分之一美元）。
     ///
     /// 用整数不用浮点：金额相加是这个字段唯一的用途，而浮点相加一万次
@@ -135,7 +143,8 @@ pub struct RequestRow {
 
 #[derive(Debug)]
 pub struct Db {
-    conn: Connection,
+    /// 上游体检的查询在 `crate::health`，和这里共用一个连接
+    pub(crate) conn: Connection,
 }
 
 impl Db {
@@ -244,6 +253,12 @@ impl Db {
                 session            TEXT,
                 provider           TEXT    NOT NULL,
                 model              TEXT    NOT NULL,
+                -- 发给上游的模型名。**和 `model` 分开存**：规则可以把请求改写成另一个
+                -- 模型发出去，上游按它收钱、照它回答，而按模型的统计看的是客户端要的那个
+                sent_model         TEXT    NOT NULL,
+                -- 上游在回答里写的模型名，原样。**在记录的时候就定下**：它只在响应体里，
+                -- 而响应体只留一段、过几天就删
+                answered_model     TEXT,
                 path               TEXT    NOT NULL,
                 status             INTEGER,
                 ttfb_ms            INTEGER,
@@ -259,6 +274,9 @@ impl Db {
                 output_tokens      INTEGER,
                 cache_read_tokens  INTEGER,
                 cache_write_tokens INTEGER,
+                -- 本地估的输入 token 数（发给上游的那一份）。**在记录的时候就定下**：
+                -- 事后要估就得把请求体再解析一遍，而请求体过几天就删
+                input_estimate     INTEGER,
                 cost_micros        INTEGER,
                 cost_estimated     INTEGER NOT NULL,
                 -- 缓存命中省下了多少。**在记录的时候算**：查询时算要把价目表
@@ -325,8 +343,8 @@ impl Db {
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
               client_hint, session, cancelled, price_source, translated,
               error_code, error_args, peer, key_masked, session_log_bytes,
-              ttft_ms, tokens_per_sec)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)",
+              ttft_ms, tokens_per_sec, sent_model, answered_model, input_estimate)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)",
             params![
                 r.id,
                 r.at_ms,
@@ -364,6 +382,9 @@ impl Db {
                 r.session_log_bytes,
                 r.ttft_ms,
                 r.tokens_per_sec,
+                r.sent_model,
+                r.answered_model,
+                r.input_estimate,
             ],
         )?;
         Ok(())
@@ -612,13 +633,12 @@ impl Db {
         // **按 (上游, 模型) 分。**同一个模型在不同上游按不同的价目表计价，
         // 该在哪张表里补价格取决于它走的是哪家。
         //
-        // **模型是查价用的那个名字**：规则改写过的，是发给上游的那个（记在尝试链
-        // 最后一跳上，见 `tw_api::AttemptView::model`）—— 该补价格的是它，照着
-        // 客户端要的名字补，补了也还是算不出钱
+        // **模型是查价用的那个名字**：规则改写过的，是发给上游的那个（`sent_model`）
+        // —— 该补价格的是它，照着客户端要的名字补，补了也还是算不出钱
         let mut st = self.conn.prepare(&format!(
-            "SELECT provider, {PRICED_AS} AS priced_as, COUNT(*) AS n FROM requests \
-             WHERE {filter} GROUP BY provider, priced_as \
-             ORDER BY n DESC, provider, priced_as LIMIT 20"
+            "SELECT provider, sent_model, COUNT(*) AS n FROM requests \
+             WHERE {filter} GROUP BY provider, sent_model \
+             ORDER BY n DESC, provider, sent_model LIMIT 20"
         ))?;
         let rows = st.query_map([since], |r| {
             Ok(tw_api::UnpricedModel {
@@ -1142,17 +1162,28 @@ impl Db {
     /// 各条路由走了多少请求、各条规则命中了多少，以及记录从哪一刻起是全的（见
     /// [`tw_api::RouteStats`]）。
     pub fn route_stats(&self, since_ms: i64, until_ms: i64) -> Result<tw_api::RouteStats, DbError> {
-        // 库里最老的那条，**不论是不是经过了路由**：本地应答的那一行也说明那时候
-        // 已经在记了，那段时间里经过路由的请求都会在库里
+        Ok(tw_api::RouteStats {
+            covered_since_ms: self.covered_since(since_ms, until_ms)?,
+            routes: self.route_hits(since_ms, until_ms)?,
+        })
+    }
+
+    /// 这段时间里记录从哪一刻起是全的（见 [`tw_api::RouteStats::covered_since_ms`]）：
+    /// 问的起点和库里最老那条请求开始的时刻，取晚的那个；落在窗口外就是空。
+    ///
+    /// 最老的那条**不论是不是经过了路由、是不是本地应答**：哪一行都说明那时候已经在记
+    /// 了，那段时间里的请求都会在库里
+    pub(crate) fn covered_since(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Option<i64>, DbError> {
         let oldest: Option<i64> =
             self.conn
                 .query_row("SELECT MIN(at_ms) FROM requests", [], |r| r.get(0))?;
-        Ok(tw_api::RouteStats {
-            covered_since_ms: oldest
-                .map(|o| o.max(since_ms))
-                .filter(|&from| from < until_ms),
-            routes: self.route_hits(since_ms, until_ms)?,
-        })
+        Ok(oldest
+            .map(|o| o.max(since_ms))
+            .filter(|&from| from < until_ms))
     }
 
     /// 各条路由走了多少请求、各条规则命中了多少（见 [`tw_api::RouteHits`]）。
@@ -1265,7 +1296,7 @@ impl Db {
 ///
 /// 两个样本的 p95 应该是较大那个：`ceil(0.95 × 2) = 2`。用
 /// `(n-1)·p/100` 会给出较小那个，于是小样本下的 p95 永远偏乐观。
-fn percentile(sorted: &[i64], p: usize) -> i64 {
+pub(crate) fn percentile(sorted: &[i64], p: usize) -> i64 {
     if sorted.is_empty() {
         return 0;
     }
@@ -1299,6 +1330,8 @@ pub(crate) fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         session: r.get("session")?,
         provider: r.get("provider")?,
         model: r.get("model")?,
+        sent_model: r.get("sent_model")?,
+        answered_model: r.get("answered_model")?,
         path: r.get("path")?,
         status: r.get::<_, Option<i64>>("status")?.map(|s| s as u16),
         ttfb_ms: r.get("ttfb_ms")?,
@@ -1310,6 +1343,7 @@ pub(crate) fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         output_tokens: r.get("output_tokens")?,
         cache_read_tokens: r.get("cache_read_tokens")?,
         cache_write_tokens: r.get("cache_write_tokens")?,
+        input_estimate: r.get("input_estimate")?,
         cost_micros: r.get("cost_micros")?,
         cost_estimated: r.get::<_, i64>("cost_estimated")? != 0,
         error: error_from(r)?,
@@ -1465,6 +1499,8 @@ pub(crate) mod tests {
             client: "claude-code".into(),
             provider: "官方".into(),
             model: "claude-sonnet-4-5".into(),
+            sent_model: "claude-sonnet-4-5".into(),
+            answered_model: None,
             path: "/v1/messages".into(),
             status: Some(200),
             ttfb_ms: Some(300),
@@ -1476,6 +1512,7 @@ pub(crate) mod tests {
             output_tokens: Some(500),
             cache_read_tokens: Some(200),
             cache_write_tokens: None,
+            input_estimate: None,
             cost_micros: Some(12_000),
             cost_estimated: false,
             error: None,
@@ -1706,9 +1743,18 @@ pub(crate) mod tests {
         // 漏掉一个字段的表现是「详情页上少一个数」，而那种缺失在肉眼
         // 检查里几乎发现不了。
         let db = Db::in_memory().unwrap();
-        let r = row(1, 1_000_000);
+        let mut r = row(1, 1_000_000);
+        r.sent_model = "claude-haiku-4-5".into();
+        r.answered_model = Some("claude-haiku-4-5-20251001".into());
+        r.input_estimate = Some(1_234);
         db.insert(&r).unwrap();
         assert_eq!(db.get(1).unwrap().unwrap(), r);
+        // 没有的照样是 None
+        let mut bare = row(2, 1_000_000);
+        bare.answered_model = None;
+        bare.input_estimate = None;
+        db.insert(&bare).unwrap();
+        assert_eq!(db.get(2).unwrap().unwrap(), bare);
     }
 
     #[test]
@@ -2173,6 +2219,7 @@ mod cost_state_tests {
     fn unknown_model(id: i64, at: i64) -> RequestRow {
         let mut r = row(id, at);
         r.model = "中转站自己起的名字".into();
+        r.sent_model = r.model.clone();
         r.cost_micros = None;
         r
     }
@@ -2431,6 +2478,7 @@ mod cost_state_tests {
         let arn = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/a1b2c3";
         let mut r = unknown_model(1, now);
         r.model = "claude-sonnet-4-5".into();
+        r.sent_model = arn.into();
         r.routing = Some(
             serde_json::to_string(&tw_api::RoutingView {
                 attempts: vec![tw_api::AttemptView {
@@ -2466,6 +2514,7 @@ mod cost_state_tests {
         for i in 0..25 {
             let mut r = unknown_model(i + 1, now);
             r.model = format!("m{i}");
+            r.sent_model = r.model.clone();
             db.insert(&r).unwrap();
         }
         let (n, models) = db.unpriced_recent(7).unwrap();

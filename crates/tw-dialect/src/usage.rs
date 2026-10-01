@@ -24,6 +24,9 @@
 //! 是同一个），这里只负责「在字节流里找到它」和「认出它是哪一家的」。几家对
 //! 「输入」的定义不一样（OpenAI 和 Gemini 的输入数包含缓存命中），那些换算
 //! 各写在各家的模块里，只有一处。
+//!
+//! **同一遍里还认上游在回答里写的模型名**（[`Sniffer::model`]）：字节已经在这里
+//! 过一遍了，事后再把响应体解析一遍只为一个名字，是白付一份钱。
 
 use serde_json::Value;
 
@@ -51,6 +54,8 @@ pub struct Sniffer {
     fed: usize,
     /// 曾经解析出过至少一个 usage 对象
     found: bool,
+    /// 回答里写的模型名
+    model: ModelSpotter,
 }
 
 /// 超过这么多字节还没嗅到就放弃。放弃之后成本会走估算那条路，
@@ -69,6 +74,7 @@ impl Sniffer {
             return;
         }
         self.fed += chunk.len();
+        self.model.feed(chunk);
 
         // 快速排除。**边界要单独看**：`"usage"` 七个字节完全可能被
         // chunk 切成两半，那时它在两边各自都找不到。这条是那个逐字节
@@ -153,6 +159,305 @@ impl Sniffer {
     /// 调用看起来是免费的。
     pub fn finish(self) -> Option<Usage> {
         self.found.then_some(self.seen)
+    }
+
+    /// 上游在回答里写的模型名（见 [`ModelSpotter`]）。**没写就是 None** —— 不拿请求里
+    /// 的名字去补：要比的正是这两个。
+    pub fn model(&self) -> Option<&str> {
+        self.model.found.as_deref()
+    }
+}
+
+/// 最多看这么多帧（一帧一个根对象）：没有一帧写了模型名，就当这家不写，不再找。
+///
+/// 写模型名的几家都写在头一两帧里（Anthropic 的 `message_start`、Responses 的
+/// `response.created`、Chat 和 Gemini 的每一帧；Azure 的头一帧是个模型名为空的
+/// 内容审核帧）。不写的那家（Bedrock 的 Converse）就不该为它数完整条流。
+const MODEL_FRAMES: u32 = 8;
+
+/// 模型名最长多少字节。再长的不是模型名，不认
+const MAX_MODEL_LEN: usize = 256;
+
+/// JSON 最多数到第几层。再深就不数了：根对象和它下面那一层早就过去了，而一个故意
+/// 嵌套很深的回答不该让这个栈一直长
+const MAX_DEPTH: usize = 64;
+
+/// 从回答里认出上游自己写的模型名。
+///
+/// **只认回答这一层的那个字段**，嵌在别处的同名键不算：
+///
+/// | | 在哪儿 |
+/// |---|---|
+/// | Anthropic | 整包的 `model`；流里 `message_start` 的 `message.model` |
+/// | OpenAI Chat | 整包和每个 chunk 的 `model` |
+/// | OpenAI Responses | 整包的 `model`；流里 `response.created` 这些帧的 `response.model` |
+/// | Gemini | 整包和每一帧的 `modelVersion`（`model_version` 也认） |
+/// | Bedrock | 不写：Converse 的回答里没有模型名 |
+///
+/// 「嵌在别处」的样子：Anthropic 整包里工具调用的 `input` 是一个原样的 JSON 对象，
+/// 参数里完全可能有一个叫 `model` 的键 —— 而中转站重新序列化时可能按键名排序，把
+/// `content` 排到 `model` 前面。认错了，就是在冤枉一家诚实的上游。
+///
+/// 所以边流边数 JSON 的层次，**不解析成值**：只在一帧的根对象、以及根下 `message` /
+/// `response` 那个对象里认这几个键。帧是 SSE 的 `data:` 一行，或者整包那一个对象，
+/// 或者 Gemini 不带 `alt=sse` 时那个数组里的每一个元素。认到一个非空的就停，之后的
+/// 字节不再看。
+#[derive(Debug, Default)]
+struct ModelSpotter {
+    found: Option<String>,
+    /// 不再找了：认到了、看够了帧、或者层次深得不像一个回答
+    done: bool,
+    /// 看完了几个根对象
+    roots: u32,
+    stack: Vec<Scope>,
+    in_str: bool,
+    escaped: bool,
+    /// 当前这个字符串攒不攒、攒来做什么
+    capture: Capture,
+    buf: Vec<u8>,
+    /// 攒的字符串超长了
+    overflow: bool,
+    /// 这一行开头对上了 `data:` 的几个字节；不在行首、或者已经对不上了是 `None`。
+    /// **对上了就是新的一帧**，层次从零数起：前一帧被截断、括号没配齐的话，后面的
+    /// 每一帧都会被数成它里面的一层，再也认不出根对象
+    line: Option<usize>,
+}
+
+/// 数到的一层。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Obj {
+        at: Level,
+        /// 刚读到的键是哪一个（冒号后面那个值归它）
+        key: Key,
+        /// 下一个字符串是键
+        want_key: bool,
+    },
+    Arr,
+}
+
+/// 一个对象在一帧里的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// 帧的根
+    Root,
+    /// 根下 `message` / `response` 的那个对象
+    Inner,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    None,
+    /// 这一层认的模型名的键
+    Model,
+    /// 根下的 `message` / `response`：它的值是 [`Level::Inner`] 那一层
+    Wrapper,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Capture {
+    #[default]
+    Skip,
+    /// 一个键：根和 `Inner` 那两层的键要认是哪一个
+    Key,
+    /// 模型名的值
+    Value,
+}
+
+impl ModelSpotter {
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut i = 0;
+        while i < chunk.len() && !self.done {
+            if self.in_str {
+                i = self.in_string(chunk, i);
+                continue;
+            }
+            let c = chunk[i];
+            i += 1;
+            self.at_line_start(c);
+            match c {
+                b'"' => self.open_string(),
+                b':' => {
+                    if let Some(Scope::Obj { want_key, .. }) = self.stack.last_mut() {
+                        *want_key = false;
+                    }
+                }
+                b',' => {
+                    if let Some(Scope::Obj { want_key, key, .. }) = self.stack.last_mut() {
+                        *want_key = true;
+                        *key = Key::None;
+                    }
+                }
+                b'{' => {
+                    let at = match self.stack.as_slice() {
+                        [] | [Scope::Arr] => Level::Root,
+                        [
+                            ..,
+                            Scope::Obj {
+                                at: Level::Root,
+                                key: Key::Wrapper,
+                                want_key: false,
+                            },
+                        ] => Level::Inner,
+                        _ => Level::Other,
+                    };
+                    self.push(Scope::Obj {
+                        at,
+                        key: Key::None,
+                        want_key: true,
+                    });
+                }
+                b'[' => self.push(Scope::Arr),
+                b'}' | b']' => {
+                    if let Some(Scope::Obj {
+                        at: Level::Root, ..
+                    }) = self.stack.pop()
+                    {
+                        self.roots += 1;
+                        self.done = self.roots >= MODEL_FRAMES;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn push(&mut self, s: Scope) {
+        if self.stack.len() >= MAX_DEPTH {
+            self.done = true;
+            return;
+        }
+        self.stack.push(s);
+    }
+
+    /// 字符串外面的一个字节：数这一行开头是不是 `data:`
+    fn at_line_start(&mut self, c: u8) {
+        const DATA: &[u8] = b"data:";
+        if c == b'\n' {
+            self.line = Some(0);
+            return;
+        }
+        let Some(n) = self.line else {
+            return;
+        };
+        if DATA.get(n) == Some(&c) {
+            self.line = Some(n + 1);
+            if n + 1 == DATA.len() {
+                self.stack.clear();
+                self.line = None;
+            }
+        } else {
+            self.line = None;
+        }
+    }
+
+    fn open_string(&mut self) {
+        self.in_str = true;
+        self.escaped = false;
+        self.overflow = false;
+        self.buf.clear();
+        self.capture = match self.stack.last() {
+            Some(Scope::Obj {
+                at: Level::Root | Level::Inner,
+                want_key: true,
+                ..
+            }) => Capture::Key,
+            Some(Scope::Obj {
+                at: Level::Root | Level::Inner,
+                key: Key::Model,
+                want_key: false,
+            }) => Capture::Value,
+            _ => Capture::Skip,
+        };
+    }
+
+    /// 字符串里面：从 `i` 读到这个字符串结束（或者这一块结束），返回读到了哪儿
+    fn in_string(&mut self, chunk: &[u8], mut i: usize) -> usize {
+        while i < chunk.len() {
+            let c = chunk[i];
+            i += 1;
+            if self.escaped {
+                self.escaped = false;
+                self.keep(c);
+                continue;
+            }
+            match c {
+                b'\\' => {
+                    self.escaped = true;
+                    self.keep(c);
+                }
+                b'"' => {
+                    self.in_str = false;
+                    self.close_string();
+                    return i;
+                }
+                // JSON 的字符串里不会有裸的换行：引号的配对已经乱了（帧被截断、
+                // 不是 JSON）。从头数起，下一帧照样认得出
+                b'\n' => {
+                    self.in_str = false;
+                    self.stack.clear();
+                    self.line = Some(0);
+                    return i;
+                }
+                _ => self.keep(c),
+            }
+        }
+        i
+    }
+
+    fn keep(&mut self, c: u8) {
+        let limit = match self.capture {
+            Capture::Skip => return,
+            // 认的几个键最长 13 个字节（`model_version`），再长就不是它们
+            Capture::Key => 16,
+            Capture::Value => MAX_MODEL_LEN,
+        };
+        if self.buf.len() >= limit {
+            self.overflow = true;
+        } else {
+            self.buf.push(c);
+        }
+    }
+
+    fn close_string(&mut self) {
+        match std::mem::take(&mut self.capture) {
+            Capture::Skip => {}
+            Capture::Key => {
+                if let Some(Scope::Obj { at, key, .. }) = self.stack.last_mut() {
+                    *key = match (*at, self.overflow, self.buf.as_slice()) {
+                        (_, true, _) => Key::Other,
+                        (Level::Root, _, b"model" | b"modelVersion" | b"model_version") => {
+                            Key::Model
+                        }
+                        (Level::Root, _, b"message" | b"response") => Key::Wrapper,
+                        (Level::Inner, _, b"model") => Key::Model,
+                        _ => Key::Other,
+                    };
+                }
+            }
+            Capture::Value => {
+                if self.overflow {
+                    return;
+                }
+                // 带转义的（`\/`、`\u…`）照 JSON 的规矩解开；绝大多数名字没有
+                let name = if self.buf.contains(&b'\\') {
+                    let mut quoted = Vec::with_capacity(self.buf.len() + 2);
+                    quoted.push(b'"');
+                    quoted.extend_from_slice(&self.buf);
+                    quoted.push(b'"');
+                    serde_json::from_slice::<String>(&quoted).ok()
+                } else {
+                    String::from_utf8(self.buf.clone()).ok()
+                };
+                // 空的不算：Azure 头一帧的 `"model": ""` 说的是「还没开始」
+                if let Some(name) = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+                    self.found = Some(name);
+                    self.done = true;
+                }
+            }
+        }
     }
 }
 
@@ -474,5 +779,215 @@ mod tests {
         // 上游中途断了。**半个 usage 比没有 usage 危险** —— 它会变成一个
         // 看起来正常但偏低的数字。
         assert!(sniff(&[r#"{"usage":{"input_tokens":123,"output_"#]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    /// 一整段喂进去，再一个字节一个字节地喂一遍：**两种喂法认出的必须是同一个**
+    /// —— chunk 的边界会切在任何地方，包括键名和模型名的中间。
+    fn model(body: &str) -> Option<String> {
+        let mut whole = Sniffer::new();
+        whole.feed(body.as_bytes());
+        let mut bytes = Sniffer::new();
+        for b in body.as_bytes() {
+            bytes.feed(std::slice::from_ref(b));
+        }
+        assert_eq!(whole.model(), bytes.model(), "逐字节喂的结果不一样：{body}");
+        whole.model().map(str::to_string)
+    }
+
+    #[test]
+    fn an_anthropic_stream_names_its_model_in_message_start() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",",
+            "\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5-20250929\",\"content\":[],",
+            "\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        );
+        assert_eq!(model(body).as_deref(), Some("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn an_anthropic_response_names_its_model_at_the_top() {
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-1-20250805",
+            "content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3,"output_tokens":1}}"#;
+        assert_eq!(model(body).as_deref(), Some("claude-opus-4-1-20250805"));
+    }
+
+    /// **工具参数里的 `model` 不是回答的模型名。**按键名排序的中转站会把 `content`
+    /// 排到 `model` 前面，参数先到 —— 认成它，就是冤枉一家诚实的上游。
+    #[test]
+    fn a_model_key_inside_a_tool_call_is_not_the_answer() {
+        let sorted = r#"{"content":[{"id":"t1","input":{"model":"gpt-4o-mini","n":1},"name":"pick","type":"tool_use"}],
+            "id":"msg_1","model":"claude-sonnet-4-5-20250929","role":"assistant","type":"message"}"#;
+        assert_eq!(model(sorted).as_deref(), Some("claude-sonnet-4-5-20250929"));
+        // 回答这一层没写的：嵌在里面的那个照样不算
+        let nested_only =
+            r#"{"content":[{"type":"tool_use","input":{"model":"gpt-4o-mini"}}],"type":"message"}"#;
+        assert_eq!(model(nested_only), None);
+        // 流里工具参数是转义过的字符串，本来就认不错
+        let stream = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",",
+            "\"partial_json\":\"{\\\"model\\\": \\\"x\\\"}\"}}\n\n",
+        );
+        assert_eq!(model(stream), None);
+    }
+
+    #[test]
+    fn a_chat_stream_names_its_model_in_every_chunk() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o-2024-08-06\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o-2024-08-06\",",
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(model(body).as_deref(), Some("gpt-4o-2024-08-06"));
+    }
+
+    /// Azure 的头一帧是内容审核的结果，模型名是空的：**空的不算**，往下一帧找
+    #[test]
+    fn an_empty_model_in_the_first_chunk_is_skipped() {
+        let body = concat!(
+            "data: {\"choices\":[],\"created\":0,\"id\":\"\",\"model\":\"\",\"object\":\"\",",
+            "\"prompt_filter_results\":[{\"prompt_index\":0,\"content_filter_results\":{}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}],\"created\":1,",
+            "\"id\":\"c1\",\"model\":\"gpt-4o-2024-11-20\",\"object\":\"chat.completion.chunk\"}\n\n",
+        );
+        assert_eq!(model(body).as_deref(), Some("gpt-4o-2024-11-20"));
+    }
+
+    #[test]
+    fn a_chat_response_names_its_model_at_the_top() {
+        let body = r#"{"id":"c1","object":"chat.completion","created":1,"model":"deepseek-chat",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}"#;
+        assert_eq!(model(body).as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn a_responses_stream_names_its_model_in_the_response_it_opens_with() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",",
+            "\"object\":\"response\",\"model\":\"gpt-5.1-codex\",\"output\":[],\"usage\":null}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        );
+        assert_eq!(model(body).as_deref(), Some("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn a_responses_response_names_its_model_at_the_top() {
+        let body = r#"{"id":"resp_1","object":"response","created_at":1,"status":"completed",
+            "model":"gpt-5-2025-08-07","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],
+            "usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}"#;
+        assert_eq!(model(body).as_deref(), Some("gpt-5-2025-08-07"));
+    }
+
+    /// Gemini 的模型名在每一帧的末尾，在候选内容之后 —— 内容里的 `"role":"model"`
+    /// 是一个值，不是模型名
+    #[test]
+    fn a_gemini_stream_names_its_model_version_after_the_candidates() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}],",
+            "\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1},",
+            "\"modelVersion\":\"gemini-2.5-pro\",\"responseId\":\"r1\"}\r\n\r\n",
+        );
+        assert_eq!(model(body).as_deref(), Some("gemini-2.5-pro"));
+        // 下划线的写法也认（和 Gemini 那一家的解析器一样）
+        let snake = r#"{"candidates":[],"model_version":"gemini-2.5-flash"}"#;
+        assert_eq!(model(snake).as_deref(), Some("gemini-2.5-flash"));
+    }
+
+    /// 不带 `alt=sse` 的 Gemini 流是一个逐步写出的 JSON 数组：数组里的每个元素是一帧
+    #[test]
+    fn a_gemini_json_array_stream_names_its_model_in_each_element() {
+        let body = "[{\n  \"candidates\": [{\"content\": {\"role\": \"model\", \"parts\": [{\"text\": \"hi\"}]}}],\n  \"modelVersion\": \"gemini-2.5-flash\"\n}\r\n,\r\n{\n  \"candidates\": []\n}\r\n]";
+        assert_eq!(model(body).as_deref(), Some("gemini-2.5-flash"));
+    }
+
+    /// Bedrock 的 Converse 不写模型名：**没有就是没有**，看够几帧就不再找
+    #[test]
+    fn a_bedrock_stream_names_no_model_and_the_search_stops() {
+        let mut s = Sniffer::new();
+        for _ in 0..20 {
+            s.feed(b"event: contentBlockDelta\ndata: {\"contentBlockIndex\":0,\"delta\":{\"text\":\"hi\"}}\n\n");
+        }
+        s.feed(b"event: metadata\ndata: {\"usage\":{\"inputTokens\":3,\"outputTokens\":1}}\n\n");
+        assert_eq!(s.model(), None);
+        assert!(s.model.done, "看够了帧还在找");
+        // 用量照常
+        assert_eq!(s.finish().map(|u| u.input), Some(3));
+    }
+
+    #[test]
+    fn an_escaped_model_name_is_unescaped() {
+        let body = r#"{"model":"models\/gemini-2.5-pro","candidates":[]}"#;
+        assert_eq!(model(body).as_deref(), Some("models/gemini-2.5-pro"));
+    }
+
+    /// 前一帧被截断了（括号没配齐、引号没收）：**下一帧照样认得出**
+    #[test]
+    fn a_broken_frame_does_not_hide_the_next_one() {
+        let unclosed = concat!(
+            "data: {\"type\":\"ping\",\"x\":{\"y\":1\n\n",
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4-5\"}}\n\n",
+        );
+        assert_eq!(model(unclosed).as_deref(), Some("claude-haiku-4-5"));
+        let cut_in_a_string = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"mod\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4-5\"}}\n\n",
+        );
+        assert_eq!(model(cut_in_a_string).as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    /// 只认根和 `message` / `response` 那一层：别的键下面的对象里写的 `model` 不算
+    #[test]
+    fn only_the_answer_level_counts() {
+        assert_eq!(model(r#"{"meta":{"model":"x"}}"#), None);
+        assert_eq!(
+            model(r#"{"message":{"content":[{"model":"x"}]},"type":"message_start"}"#),
+            None
+        );
+        // 值不是字符串的不算
+        assert_eq!(model(r#"{"model":null,"x":1}"#), None);
+        assert_eq!(model(r#"{"model":{"id":"x"}}"#), None);
+        // 错误响应里的 `"param":"model"` 是一个值
+        assert_eq!(
+            model(r#"{"error":{"message":"bad","param":"model","code":"model_not_found"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn a_response_without_a_model_has_none_and_usage_is_unaffected() {
+        let mut s = Sniffer::new();
+        s.feed(br#"{"id":"msg_01","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":7,"output_tokens":8}}"#);
+        assert_eq!(s.model(), None);
+        assert_eq!(s.finish().map(|u| (u.input, u.output)), Some((7, 8)));
+    }
+
+    /// 嵌得很深的回答：数到上限就不数了，不 panic、不一直长
+    #[test]
+    fn deep_nesting_stops_the_search() {
+        let mut s = Sniffer::new();
+        s.feed(&b"[".repeat(10_000));
+        assert!(s.model.stack.len() <= MAX_DEPTH);
+        assert!(s.model.done);
+        assert_eq!(s.model(), None);
+    }
+
+    /// 超长的值不是模型名
+    #[test]
+    fn an_overlong_value_is_not_a_model_name() {
+        let body = format!(r#"{{"model":"{}"}}"#, "x".repeat(MAX_MODEL_LEN + 1));
+        assert_eq!(model(&body), None);
     }
 }
