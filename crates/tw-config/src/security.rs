@@ -140,7 +140,7 @@ pub struct CustomToolRule {
     pub disabled: bool,
 }
 
-/// 出站脱敏：请求发出前，按规则查找凭据。拦截档的动作是**替换**。
+/// 出站脱敏：请求发出前，按规则查找凭据和个人号码。拦截档的动作是**替换**。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedactPolicy {
