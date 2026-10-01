@@ -115,6 +115,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::LatencyByProvider, latency_by_provider)
         .at(ep::TokenRate, token_rate)
         .at(ep::TokenRateByProvider, token_rate_by_provider)
+        .at(ep::UpstreamHealth, upstream_health)
         .at(ep::Storage, storage)
         .at(ep::Quota, quota)
         .at(ep::SpeedQuote, speed_quote)
@@ -1105,6 +1106,26 @@ async fn token_rate_by_provider(
     let g = store.lock().await;
     let xs = g.db().token_rate_by_provider(from, to).map_err(records)?;
     Ok(Json(xs.into_iter().map(token_rate_view).collect()))
+}
+
+/// 上游体检。**不给时间窗是最近 7 天**，不是别的聚合那样的「今天」：体检要的是样本，
+/// 一天里服务同一个模型的往往只有一家，拿不出参照；而「今天」过了零点就是空的。
+async fn upstream_health(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
+) -> Result<Json<tw_api::UpstreamHealth>, Fail> {
+    let (from, to) = health_window(q.from_ms, q.to_ms, now_ms());
+    let store = need_store(&s)?;
+    let g = store.lock().await;
+    Ok(Json(g.db().upstream_health(from, to).map_err(records)?))
+}
+
+/// 体检看多久：缺省是最近 7 天。只给了终点的，往前数 7 天
+const HEALTH_WINDOW_MS: i64 = 7 * 86_400_000;
+
+fn health_window(from_ms: Option<i64>, to_ms: Option<i64>, now_ms: i64) -> (i64, i64) {
+    let to = to_ms.unwrap_or(now_ms);
+    (from_ms.unwrap_or(to.saturating_sub(HEALTH_WINDOW_MS)), to)
 }
 
 fn token_rate_view(r: tw_store::TokenRate) -> tw_api::TokenRateView {

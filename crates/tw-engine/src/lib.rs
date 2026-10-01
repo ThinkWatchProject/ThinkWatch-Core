@@ -10,4 +10,4 @@ pub use engine::{
     Outcome, Outcome2, RESERVED_PREFIX, RouteError, RouteSet, Rule, RuleNotes, SetAction,
     has_catch_all, is_builtin_group, notes, order_by,
 };
-pub use facts::RequestFacts;
+pub use facts::{RequestFacts, estimate_strings, estimate_tokens};

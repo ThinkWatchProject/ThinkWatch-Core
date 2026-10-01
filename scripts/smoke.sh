@@ -154,7 +154,9 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.send_header('content-type','text/event-stream')
             self.send_header('content-length', str(len(b))); self.end_headers(); self.wfile.write(b)
             return
+        # 回答里写着它用的模型（带日期的快照）：上游体检拿它和发出去的比
         out = json.dumps({"type":"message","id":"m","saw_key":saw,
+                          "model":"claude-sonnet-4-5-20250929",
                           "usage":{"input_tokens":100,"output_tokens":20}}).encode()
         self.send_response(200); self.send_header('content-type','application/json')
         self.send_header('content-length', str(len(out))); self.end_headers(); self.wfile.write(out)
@@ -451,13 +453,14 @@ NOW=$(python3 -c 'import time;print(int(time.time()*1000))')
 DAY=$((NOW - 86400000))
 for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=3600000" \
           "/summary/by?dim=model&from_ms=$DAY" "/summary/routes?from_ms=$DAY" \
-          "/history?limit=5&from_ms=$DAY"; do
+          "/history?limit=5&from_ms=$DAY" "/upstreams/health?from_ms=$DAY"; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET ${ep%%\?*}（带时间窗）" || bad "GET $ep 返回 $C" "$(cat "$TMP/out" 2>/dev/null | head -c 200)"
 done
 
 for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
-          /security/events /sessions /diagnostics /config /config/history /models /in-flight /live; do
+          /security/events /sessions /diagnostics /config /config/history /models /in-flight /live \
+          /upstreams/health; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done
@@ -473,6 +476,16 @@ C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["provider
 # 的，记录从第一个请求开始：比问的起点晚，不是空
 C=$(ctl "/summary/routes?from_ms=$DAY" | python3 -c 'import json,sys;d=json.load(sys.stdin);r=d["routes"];c=d["covered_since_ms"];print(bool(r) and r[0]["requests"]>0 and any(x["decided"]>0 for x in r[0]["rules"]) and c is not None and c>int(sys.argv[1]))' "$DAY")
 [ "$C" = "True" ] && ok "/summary/routes 数到了经过路由的请求，也说了记录从哪一刻开始" || bad "/summary/routes 没数到请求：$C"
+
+# 上游体检：**回答里写的模型名一路走到了库里**（嗅探 → 结局事件 → 落库 → 查询）。
+# 假上游的整包回答写的是带日期的快照，发出去的是别名：归一之后对得上
+C=$(ctl "/upstreams/health?from_ms=$DAY" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+u={x["upstream"]: x for x in d["upstreams"]}
+r=u.get("relay") or {}
+m=r.get("models") or {}
+print(r.get("requests",0)>=2 and m.get("named",0)>=2 and m.get("differed")==0 and d["covered_since_ms"] is not None)')
+[ "$C" = "True" ] && ok "/upstreams/health 认出了回答里写的模型名，和发出去的对得上" || bad "/upstreams/health 不对：$C" "$(ctl "/upstreams/health?from_ms=$DAY" | head -c 600)"
 
 ID=$(ctl "/history?limit=1" \
       | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d[0]["id"] if d else 0)')

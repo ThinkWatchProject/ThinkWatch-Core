@@ -53,6 +53,7 @@ fn started(id: u64, model: &str) -> tw_api::Event {
         path: "/v1/messages".into(),
         session_log_bytes: None,
         at_ms: 1_000 + id,
+        input_estimate: None,
     }
 }
 
@@ -107,6 +108,7 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
         duration_ms: 5,
         usage: None,
         tokens_per_sec: None,
+        answered_model: None,
     });
 
     let got = get(router).await;
@@ -187,6 +189,7 @@ async fn live_gives_the_running_requests_and_the_generation_rate() {
             ..Default::default()
         }),
         tokens_per_sec: Some(50),
+        answered_model: None,
     });
     bus.emit(started(2, "gpt-5.5"));
 

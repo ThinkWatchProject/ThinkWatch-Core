@@ -113,6 +113,7 @@ fn started(id: u64) -> tw_api::Event {
         path: "/v1/messages".into(),
         session_log_bytes: None,
         at_ms: 1_758_000_000_000,
+        input_estimate: None,
     }
 }
 
@@ -190,6 +191,7 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
             duration_ms: 4_000,
             usage: None,
             tokens_per_sec: None,
+            answered_model: None,
         });
     let (st, v) = get(&app, "/request/7").await;
     assert_eq!(st, StatusCode::OK, "{v}");
