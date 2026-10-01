@@ -543,13 +543,17 @@ fn classify_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
 /// 常在行首。`\t` 同理；`\uXXXX` 也一样（Python 写的客户端默认把中文
 /// 都转成这种写法，`密钥：sk-…` 里的冒号就成了 `\uff1a`）。所以转义序列
 /// 整个算作分隔。
-fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>)) {
+///
+/// 回调的第三个参数说这个 token 在不在一个 JSON 字符串里面（数没转义的引号；
+/// 文本是 JSON 时才有意义）。
+fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
     let mut start: Option<usize> = None;
+    let mut quoted = false;
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         if c == '\\' {
             if let Some(s) = start.take() {
-                f(&text[s..i], s..i);
+                f(&text[s..i], s..i, quoted);
             }
             // 反斜杠后面那个字符是转义的一部分；`\u` 再带四位十六进制
             if let Some((_, 'u')) = chars.next() {
@@ -563,12 +567,17 @@ fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>)) {
         }
         if is_tok(c) {
             start.get_or_insert(i);
-        } else if let Some(s) = start.take() {
-            f(&text[s..i], s..i);
+            continue;
+        }
+        if let Some(s) = start.take() {
+            f(&text[s..i], s..i, quoted);
+        }
+        if c == '"' {
+            quoted = !quoted;
         }
     }
     if let Some(s) = start {
-        f(&text[s..], s..text.len());
+        f(&text[s..], s..text.len(), quoted);
     }
 }
 
@@ -1140,15 +1149,23 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     let want_card = set.is_on("bank-card");
     // 一次扫描问一次时钟。只开卡号那条时也要问：认出是身份证号的不当卡号换
     let today = if want_id || want_card { today_ymd() } else { 0 };
+    // **个人号码只在 JSON 的字符串里找。**字符串外面的数字是 JSON 的数值：工具
+    // 调用的参数（`"input":{"order_id":6222…}`）、`seed`。凭据规则在那儿天然认
+    // 不出东西，号码规则却认得出 —— 而把一个数值换成占位符，整个请求体就不是
+    // JSON 了。不是 JSON 的文本（直接拿来扫的一段话）不分里外
+    let json = text.trim_start().starts_with(['{', '[', '"']);
     let mut spaced = Spaced::default();
-    for_each_token(text, |tok, span| {
-        if want_id || want_card {
+    for_each_token(text, |tok, span, quoted| {
+        if (want_id || want_card) && (quoted || !json) {
             // 句末的句号不是号码的一部分：`…卡号是 6222 0212 3456 7894.`
             let body = tok.trim_end_matches('.');
             if want_card {
                 spaced.feed(text, span.start, body, body.len() < tok.len(), &mut out);
             }
             personal_token(body, span.start, want_id, want_card, today, &mut out);
+        } else if want_card {
+            // 字符串外面的东西把在接的那一串截断
+            spaced.finish(text, &mut out);
         }
         if let Some(id) = classify_token(tok, set) {
             out.push(builtin_hit(id, span));
@@ -1989,6 +2006,41 @@ mod tests {
             }
             assert_eq!(got, vec![(rule.to_string(), value.to_string())], "{t}");
         }
+    }
+
+    #[test]
+    fn a_number_outside_the_strings_of_a_body_is_a_json_number_and_left_alone() {
+        // 工具调用的参数、`seed` 是 JSON 的数值：换成占位符，整个请求体就不是 JSON 了
+        let body = r#"{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"get_order","input":{"order_id":6222021234567894,"ids":[4532015112830366, 6222021234567894]}}]},{"role":"user","content":"他说\"卡号是 6222021234567894\"，身份证 11010519491231002X"}],"seed":4532015112830366}"#;
+        let got = personal_found(body);
+        assert_eq!(
+            got,
+            vec![
+                ("bank-card".to_string(), "6222021234567894".to_string()),
+                (
+                    "cn-resident-id".to_string(),
+                    "11010519491231002X".to_string()
+                ),
+            ]
+        );
+        let r = crate::redact::replace::redact(
+            body,
+            &RuleSet::defaults(),
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.text).expect("换完不是合法 JSON");
+        assert_eq!(v["seed"], 4532015112830366u64);
+        assert_eq!(
+            v["messages"][0]["content"][0]["input"]["order_id"],
+            6222021234567894u64
+        );
+        assert_eq!(
+            v["messages"][1]["content"],
+            "他说\"卡号是 <<CARD_NUMBER_1>>\"，身份证 <<ID_NUMBER_1>>"
+        );
+        assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
+        // 不是 JSON 的一段话不分里外
+        assert_eq!(personal_found("order_id: 6222021234567894").len(), 1);
     }
 
     #[test]

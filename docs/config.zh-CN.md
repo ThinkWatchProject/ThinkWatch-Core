@@ -533,7 +533,7 @@ pricing:
 - `cn-resident-id`：18 位的中华人民共和国居民身份证号码。前两位须是省级行政区划代码，出生日期须是 1900 年 1 月 1 日至今天之间的真实日期，末位须是正确的校验码（ISO 7064 MOD 11-2）。15 位的旧号码不认。
 - `bank-card`：卡号。开头和位数须属于银联、Visa、Mastercard、American Express、JCB、Discover 或 Diners Club，并通过 Luhn 校验；连续书写，或四位一组、以单个空格或单个连字符分隔均可（American Express 另认 4-6-5，Diners Club 另认 4-6-4）。Stripe、Braintree、Adyen 公开的测试卡号不认。
 
-夹在更长的一串字母或数字中间的号码不认。占位符写明原来是什么（`<<ID_NUMBER_1>>`、`<<CARD_NUMBER_1>>`），安全日志中只显示最后四位。
+夹在更长的一串字母或数字中间的号码不认；请求体中以 JSON 数值写出的号码（例如工具调用的参数）也不认，替换它会使请求体不再是合法的 JSON。占位符写明原来是什么（`<<ID_NUMBER_1>>`、`<<CARD_NUMBER_1>>`），安全日志中只显示最后四位。
 
 #### `security.inspect_tools`
 
