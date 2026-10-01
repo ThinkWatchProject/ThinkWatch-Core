@@ -770,13 +770,13 @@ mod tests {
         db.conn()
         .execute(
             "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 99999)
-             INSERT INTO requests (id, at_ms, client, client_hint, provider, model, path, status,
+             INSERT INTO requests (id, at_ms, client, client_hint, provider, model, sent_model, path, status,
                 cost_estimated, billing, local, cancelled, input_tokens, output_tokens, cost_micros,
                 error, error_code)
              SELECT i + 1, ?1 - i * 60000,
                 CASE i % 3 WHEN 0 THEN 'claude-code' WHEN 1 THEN 'codex' ELSE 'Cursor 编辑器' END,
                 CASE i % 2 WHEN 0 THEN 'claude-code' END,
-                '官方', 'claude-sonnet-4-5', '/v1/messages', 200, 0, 'per-token', 0, 0, 1000, 200, 300,
+                '官方', 'claude-sonnet-4-5', 'claude-sonnet-4-5', '/v1/messages', 200, 0, 'per-token', 0, 0, 1000, 200, 300,
                 CASE WHEN i % 13 = 0 THEN 'Upstream `官方` answered HTTP 529: overloaded' END,
                 CASE WHEN i % 13 = 0 THEN 'gw.upstream.http' END
              FROM n",
