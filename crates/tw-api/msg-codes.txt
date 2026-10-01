@@ -237,6 +237,7 @@ gw.listen.denied
 gw.listen.nic_offline
 gw.listen.no_such_nic
 gw.listen.port_taken
+gw.method.not_forwarded
 gw.model.no_upstream
 gw.model.no_upstream_available
 gw.model.no_upstream_rewritten
