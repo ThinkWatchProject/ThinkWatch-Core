@@ -2991,7 +2991,8 @@ pub struct HistorySearchQuery {
     /// 里含着 `q` 时界面交 `true`，本地应答的就都算对上
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_matches: bool,
-    /// 也按正文找：请求里新的那一轮（最后一条用户消息，含工具结果）和回答的文字。
+    /// 也按正文找：请求里新的那一轮（最后一条用户消息，含工具结果）和回答（文字，和工具
+    /// 调用的名字与参数：模型跑的命令、写的代码都在这里；推理不算）。
     /// 只有正文还在盘上的那些能这样找，更早的照样按上面那几样对。没有 `q` 时不起作用
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub content: bool,
@@ -3435,7 +3436,7 @@ slug_enum! {
     pub enum ContentSide {
         /// 请求里新的那一轮：最后一条用户消息，含工具结果
         Request = "request",
-        /// 回答的文字
+        /// 回答：文字，和工具调用的名字与参数（一个调用一行）。推理不算
         Answer = "answer",
     }
 }

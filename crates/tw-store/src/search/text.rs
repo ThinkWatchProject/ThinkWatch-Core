@@ -1,10 +1,12 @@
-//! 从存下来的正文里拆出要找的那两段文字：请求里新的那一轮、回答。
+//! 从存下来的正文里拆出要找的那两段文字：请求里新的那一轮、回答（文字和工具调用）。
 //!
 //! **怎么读四种格式不在这里写**：请求按 tw-dialect 解成中间表示，回答按它的整包解码和
 //! 流读法读 —— 网关转换格式用的就是这几样。这里只决定读哪一段。
 
+use std::collections::HashMap;
+
 use serde_json::Value;
-use tw_dialect::ir::{Block, Delta, Dialect, Event, Part, Role};
+use tw_dialect::ir::{Block, BlockKind, Delta, Dialect, Event, Part, Role, ToolInput};
 
 /// 这个路径是不是生成回答的那个调用；是的话，客户端说的是哪种格式。
 ///
@@ -128,7 +130,14 @@ fn trim_for_reading(v: &mut Value, dialect: Dialect) {
     }
 }
 
-/// 回答的文字，一个文字块一行。推理和工具调用不算 —— 它们不是写给人看的那部分。
+/// 回答：文字和工具调用，按出现的先后一块一行。推理不算 —— 那是模型想的，不是它说的、
+/// 做的。
+///
+/// **工具调用要算。**编程客户端那边，模型真正做的事就是工具调用：一次 Edit 带着它写的
+/// 代码，一次 Bash 带着它跑的命令，「哪一次跑了 npm install」要找得到。一个调用一行：名字、
+/// 一个空格、参数。函数工具的参数是 JSON —— 流里是模型写出来的原样（同一块的片段接在
+/// 一起）；整包的回答里它已经是一个 JSON 对象，按紧凑的 JSON 写出（键按字母排）。自由格式
+/// 的工具（Codex 的 `apply_patch`）是它的原文。
 ///
 /// `body` 是上游的原话（存的就是它）：整包的 JSON、SSE 的流（Bedrock 的二进制帧在网关
 /// 进门时已经转成了 SSE），或者 Gemini 不带 `alt=sse` 时那个逐步写出的 JSON 数组。按
@@ -147,8 +156,10 @@ pub fn answer(body: &[u8], upstream: Dialect) -> Option<String> {
             };
             let mut out = String::new();
             for b in &r.blocks {
-                if let Block::Text(t) = b {
-                    line(&mut out, t);
+                match b {
+                    Block::Text(t) => line(&mut out, t),
+                    Block::ToolCall(c) => line(&mut out, &call(&c.name, &input_text(&c.input))),
+                    Block::Thinking(_) => {}
                 }
             }
             out
@@ -178,21 +189,79 @@ pub fn answer(body: &[u8], upstream: Dialect) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// 流里的文字增量接起来。换了一个文字块就另起一行
+/// 整包回答里一个工具调用的参数写成文字。
+fn input_text(input: &ToolInput) -> String {
+    match input {
+        // 不是合法 JSON 的参数，tw-dialect 原样留成一个字符串（见 `ToolInput::from_json_text`）：
+        // 照原样交出去，不再给它套一层引号和转义
+        ToolInput::Json(Value::String(s)) | ToolInput::Text(s) => s.clone(),
+        ToolInput::Json(v) => v.to_string(),
+    }
+}
+
+/// 一个工具调用的那一行：名字，有参数的话一个空格接着参数
+fn call(name: &str, input: &str) -> String {
+    match (name.is_empty(), input.is_empty()) {
+        (_, true) => name.to_string(),
+        (true, false) => input.to_string(),
+        (false, false) => format!("{name} {input}"),
+    }
+}
+
+/// 流里的事件拼回一块一块：文字块接起它的文字增量，工具调用接起它的参数片段。按块第一次
+/// 出现的先后排，一块一行
 fn text_of(events: Vec<Event>) -> String {
-    let mut out = String::new();
-    let mut block = None;
+    enum Piece {
+        Text(String),
+        Call { name: String, input: String },
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    // 块号 → 它在 `pieces` 里的位置
+    let mut at: HashMap<usize, usize> = HashMap::new();
     for e in events {
-        if let Event::Delta {
-            index,
-            delta: Delta::Text(t),
-        } = e
-        {
-            if block != Some(index) && !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
+        match e {
+            Event::BlockStart {
+                index,
+                kind: BlockKind::ToolCall { name, .. },
+            } => {
+                at.insert(index, pieces.len());
+                pieces.push(Piece::Call {
+                    name,
+                    input: String::new(),
+                });
             }
-            block = Some(index);
-            out.push_str(&t);
+            Event::Delta {
+                index,
+                delta: Delta::Text(t),
+            } => match at.get(&index).and_then(|&i| pieces.get_mut(i)) {
+                Some(Piece::Text(s)) => s.push_str(&t),
+                // 文字块不一定先报开始（Bedrock 的就没有）：第一段增量到了就算开了一块
+                _ => {
+                    at.insert(index, pieces.len());
+                    pieces.push(Piece::Text(t));
+                }
+            },
+            Event::Delta {
+                index,
+                delta: Delta::ToolInput(p),
+            } => match at.get(&index).and_then(|&i| pieces.get_mut(i)) {
+                Some(Piece::Call { input, .. }) => input.push_str(&p),
+                _ => {
+                    at.insert(index, pieces.len());
+                    pieces.push(Piece::Call {
+                        name: String::new(),
+                        input: p,
+                    });
+                }
+            },
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for p in pieces {
+        match p {
+            Piece::Text(t) => line(&mut out, &t),
+            Piece::Call { name, input } => line(&mut out, &call(&name, &input)),
         }
     }
     out
@@ -387,8 +456,10 @@ mod tests {
         s.into_bytes()
     }
 
+    /// 文字和工具调用按出现的先后一块一行，推理不算。工具调用是名字加参数：流里的参数
+    /// 片段原样接起来；开始帧里就给全了的（不再发片段）也算
     #[test]
-    fn the_answer_of_an_anthropic_stream_is_its_text_deltas() {
+    fn the_answer_of_an_anthropic_stream_is_its_text_and_tool_calls() {
         let body = sse(&[
             (
                 "message_start",
@@ -408,32 +479,43 @@ mod tests {
             ),
             (
                 "content_block_delta",
-                json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "答案是"}}),
+                json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "我来装"}}),
             ),
             ("ping", json!({"type": "ping"})),
             (
                 "content_block_delta",
-                json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "四十二"}}),
+                json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "依赖"}}),
             ),
             (
                 "content_block_start",
-                json!({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "t", "name": "Write", "input": {}}}),
+                json!({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}}),
             ),
             (
                 "content_block_delta",
-                json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"x\":1}"}}),
+                json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"npm ins"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "tall\", \"description\": \"装依赖\"}"}}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 3, "content_block": {"type": "tool_use", "id": "u", "name": "Read", "input": {"path": "a.rs"}}}),
             ),
             (
                 "message_delta",
                 json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}}),
             ),
         ]);
-        assert_eq!(answer(&body, Dialect::Anthropic).unwrap(), "答案是四十二");
+        assert_eq!(
+            answer(&body, Dialect::Anthropic).unwrap(),
+            "我来装依赖\nBash {\"command\": \"npm install\", \"description\": \"装依赖\"}\nRead {\"path\":\"a.rs\"}"
+        );
     }
 
     #[test]
     fn the_answer_is_read_from_streams_of_every_format() {
-        let chat = sse(&[
+        let mut chat = sse(&[
             (
                 "",
                 json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": "你"}}]}),
@@ -444,13 +526,31 @@ mod tests {
             ),
             (
                 "",
-                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1",
+                    "type": "function", "function": {"name": "Bash", "arguments": ""}}]}}]}),
+            ),
+            (
+                "",
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+                    "function": {"arguments": "{\"command\":"}}]}}]}),
+            ),
+            (
+                "",
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+                    "function": {"arguments": "\"npm install\"}"}}]}}]}),
+            ),
+            (
+                "",
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
             ),
         ]);
-        let mut chat = chat;
         chat.extend_from_slice(b"data: [DONE]\n\n");
-        assert_eq!(answer(&chat, Dialect::Chat).unwrap(), "你好");
+        assert_eq!(
+            answer(&chat, Dialect::Chat).unwrap(),
+            "你好\nBash {\"command\":\"npm install\"}"
+        );
 
+        // Codex：函数工具的参数是 JSON 片段，自由格式的 apply_patch 是原文片段
         let responses = sse(&[
             (
                 "response.created",
@@ -469,11 +569,53 @@ mod tests {
                 json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "成功"}),
             ),
             (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "reasoning"}}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"type": "response.reasoning_summary_text.delta", "output_index": 1, "delta": "推理不算"}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 2,
+                    "item": {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": ""}}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type": "response.function_call_arguments.delta", "output_index": 2, "delta": "{\"command\":[\"npm\","}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type": "response.function_call_arguments.delta", "output_index": 2, "delta": "\"install\"]}"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": 2,
+                    "item": {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{\"command\":[\"npm\",\"install\"]}"}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 3,
+                    "item": {"type": "custom_tool_call", "call_id": "c2", "name": "apply_patch", "input": ""}}),
+            ),
+            (
+                "response.custom_tool_call_input.delta",
+                json!({"type": "response.custom_tool_call_input.delta", "output_index": 3, "delta": "*** Begin Patch\n"}),
+            ),
+            (
+                "response.custom_tool_call_input.delta",
+                json!({"type": "response.custom_tool_call_input.delta", "output_index": 3, "delta": "*** End Patch"}),
+            ),
+            (
                 "response.completed",
                 json!({"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 2}}}),
             ),
         ]);
-        assert_eq!(answer(&responses, Dialect::Responses).unwrap(), "构建成功");
+        assert_eq!(
+            answer(&responses, Dialect::Responses).unwrap(),
+            "构建成功\nshell {\"command\":[\"npm\",\"install\"]}\napply_patch *** Begin Patch\n*** End Patch"
+        );
 
         let gemini = sse(&[
             (
@@ -482,19 +624,25 @@ mod tests {
             ),
             (
                 "",
-                json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "天"}]}, "finishReason": "STOP"}]}),
+                json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "天"},
+                    {"functionCall": {"name": "run_shell_command", "args": {"command": "npm install"}}}]},
+                    "finishReason": "STOP"}]}),
             ),
         ]);
-        assert_eq!(answer(&gemini, Dialect::Gemini).unwrap(), "晴天");
+        assert_eq!(
+            answer(&gemini, Dialect::Gemini).unwrap(),
+            "晴天\nrun_shell_command {\"command\":\"npm install\"}"
+        );
 
         // 不带 alt=sse 的 Gemini 流是一个 JSON 数组
         let array = json!([
             {"candidates": [{"content": {"role": "model", "parts": [{"text": "数"}]}}]},
-            {"candidates": [{"content": {"role": "model", "parts": [{"text": "组"}]}}]}
+            {"candidates": [{"content": {"role": "model", "parts": [{"text": "组"},
+                {"functionCall": {"name": "run_shell_command", "args": {"command": "npm install"}}}]}}]}
         ]);
         assert_eq!(
             answer(array.to_string().as_bytes(), Dialect::Gemini).unwrap(),
-            "数组"
+            "数组\nrun_shell_command {\"command\":\"npm install\"}"
         );
 
         // Bedrock 的二进制帧在网关进门时转成了 SSE：事件名进 `event:`
@@ -505,47 +653,95 @@ mod tests {
                 json!({"contentBlockIndex": 0, "delta": {"text": "基岩"}}),
             ),
             ("contentBlockStop", json!({"contentBlockIndex": 0})),
-            ("messageStop", json!({"stopReason": "end_turn"})),
+            (
+                "contentBlockStart",
+                json!({"contentBlockIndex": 1, "start": {"toolUse": {"toolUseId": "t1", "name": "Bash"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 1, "delta": {"toolUse": {"input": "{\"command\":"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 1, "delta": {"toolUse": {"input": "\"npm install\"}"}}}),
+            ),
+            ("contentBlockStop", json!({"contentBlockIndex": 1})),
+            ("messageStop", json!({"stopReason": "tool_use"})),
         ]);
-        assert_eq!(answer(&bedrock, Dialect::Bedrock).unwrap(), "基岩");
+        assert_eq!(
+            answer(&bedrock, Dialect::Bedrock).unwrap(),
+            "基岩\nBash {\"command\":\"npm install\"}"
+        );
     }
 
+    /// 整包的回答：工具调用的参数已经是 JSON 对象，按紧凑的 JSON 写出；自由格式的是原文
     #[test]
     fn the_answer_is_read_from_whole_responses_of_every_format() {
+        let bash = "Bash {\"command\":\"npm install\"}";
         let cases = [
             (
                 Dialect::Anthropic,
                 json!({"content": [
-                {"type": "thinking", "thinking": "不算"},
-                {"type": "text", "text": "整包"},
-                {"type": "tool_use", "id": "t", "name": "x", "input": {}}]}),
+                    {"type": "thinking", "thinking": "推理不算"},
+                    {"type": "text", "text": "整包"},
+                    {"type": "tool_use", "id": "t", "name": "Bash",
+                        "input": {"command": "npm install", "description": "装依赖"}}]}),
+                "整包\nBash {\"command\":\"npm install\",\"description\":\"装依赖\"}".to_string(),
             ),
             (
                 Dialect::Chat,
-                json!({"choices": [{"message": {"role": "assistant", "content": "整包"}}]}),
+                json!({"choices": [{"message": {"role": "assistant", "content": "整包",
+                    "reasoning_content": "推理不算",
+                    "tool_calls": [{"id": "c", "type": "function",
+                        "function": {"name": "Bash", "arguments": "{\"command\": \"npm install\"}"}}]}}]}),
+                format!("整包\n{bash}"),
             ),
             (
                 Dialect::Responses,
-                json!({"output": [{"type": "message", "role": "assistant",
-                "content": [{"type": "output_text", "text": "整包"}]}]}),
+                json!({"output": [
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "推理不算"}]},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "整包"}]},
+                    {"type": "function_call", "call_id": "c1", "name": "Bash", "arguments": "{\"command\":\"npm install\"}"},
+                    {"type": "custom_tool_call", "call_id": "c2", "name": "apply_patch", "input": "*** Begin Patch"}]}),
+                format!("整包\n{bash}\napply_patch *** Begin Patch"),
             ),
             (
                 Dialect::Gemini,
-                json!({"candidates": [{"content": {"parts": [{"text": "整包"}]}}]}),
+                json!({"candidates": [{"content": {"parts": [
+                    {"text": "推理不算", "thought": true},
+                    {"text": "整包"},
+                    {"functionCall": {"name": "Bash", "args": {"command": "npm install"}}}]}}]}),
+                format!("整包\n{bash}"),
             ),
             (
                 Dialect::Bedrock,
-                json!({"output": {"message": {"role": "assistant",
-                "content": [{"text": "整包"}]}}, "stopReason": "end_turn"}),
+                json!({"output": {"message": {"role": "assistant", "content": [
+                    {"reasoningContent": {"reasoningText": {"text": "推理不算"}}},
+                    {"text": "整包"},
+                    {"toolUse": {"toolUseId": "t", "name": "Bash", "input": {"command": "npm install"}}}]}},
+                    "stopReason": "tool_use"}),
+                format!("整包\n{bash}"),
             ),
         ];
-        for (d, v) in cases {
+        for (d, v, want) in cases {
             assert_eq!(
                 answer(v.to_string().as_bytes(), d).as_deref(),
-                Some("整包"),
+                Some(want.as_str()),
                 "{d:?}"
             );
         }
+    }
+
+    /// 不是合法 JSON 的参数照模型写的原样，不套引号和转义；只有工具调用的回答也有字
+    #[test]
+    fn tool_arguments_that_are_not_json_stay_as_written() {
+        let v = json!({"choices": [{"message": {"role": "assistant", "content": null,
+            "tool_calls": [{"id": "c", "type": "function",
+                "function": {"name": "Bash", "arguments": "npm install --save"}}]}}]});
+        assert_eq!(
+            answer(v.to_string().as_bytes(), Dialect::Chat).as_deref(),
+            Some("Bash npm install --save")
+        );
     }
 
     /// 流里的 `\u` 转义也一样解开

@@ -1039,6 +1039,76 @@ mod tests {
         assert_eq!(hit_of(&o, 1).side, ContentSide::Answer);
     }
 
+    /// 编程客户端那边，模型做的事是工具调用：「哪一次跑了 npm install」要找得到 ——
+    /// 流里的参数片段接起来找，整包回答里的参数（Chat 的写成 JSON 字符串里的 JSON）也找
+    #[test]
+    fn the_request_where_the_model_ran_a_command_is_found_by_its_tool_call() {
+        let d = disk();
+        let question = json!({"messages": [{"role": "user", "content": "装一下依赖"}]}).to_string();
+        d.put(
+            &at(1, NOW, "/v1/messages"),
+            question.as_bytes(),
+            &sse(&[
+                ("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+                ("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "好的"}})),
+                ("content_block_start", json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}})),
+                ("content_block_delta", json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"npm ins"}})),
+                ("content_block_delta", json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "tall\"}"}})),
+            ]),
+        );
+        d.put(
+            &at(2, NOW - 1, "/v1/chat/completions"),
+            question.as_bytes(),
+            json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "shell", "arguments": "{\"cmd\": \"npm install\"}"}}]}}]})
+            .to_string()
+            .as_bytes(),
+        );
+        // 只想了想、没有动手的那一条不算
+        d.put(
+            &at(3, NOW - 2, "/v1/messages"),
+            question.as_bytes(),
+            &sse(&[
+                ("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}})),
+                ("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "也许该跑 npm install"}})),
+            ]),
+        );
+        let o = d.find("NPM install");
+        assert_eq!(o.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
+        let h = hit_of(&o, 1);
+        assert_eq!(h.side, ContentSide::Answer);
+        assert_eq!(
+            (h.before.as_str(), h.matched.as_str(), h.after.as_str()),
+            ("好的 Bash {\"command\": \"", "npm install", "\"}")
+        );
+        let h = hit_of(&o, 2);
+        assert_eq!(
+            (h.side, h.before.as_str()),
+            (ContentSide::Answer, "shell {\"cmd\":\"")
+        );
+    }
+
+    /// 工具调用的参数里带着密钥（命令里 export 了一把）：摘录照样打码，只在密钥里的词不算
+    #[test]
+    fn a_secret_in_a_tool_call_is_masked_in_the_excerpt() {
+        let d = disk();
+        let key = "sk-proj-TOOLKEYAAAAAAAAAAAAAAAAAAAAAAAA";
+        d.put(
+            &at(1, NOW, "/v1/messages"),
+            json!({"messages": [{"role": "user", "content": "部署"}]}).to_string().as_bytes(),
+            &sse(&[
+                ("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}})),
+                ("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta",
+                    "partial_json": format!("{{\"command\": \"OPENAI_API_KEY={key} npm run deploy\"}}")}})),
+            ]),
+        );
+        let o = d.find("npm run deploy");
+        let h = hit_of(&o, 1);
+        assert!(!h.before.contains("TOOLKEYAAAA"), "{h:?}");
+        assert!(h.before.contains("OPENAI_API_KEY=sk-pr…"), "{h:?}");
+        assert!(d.find("toolkeyaaaa").rows.is_empty());
+    }
+
     /// 问和答里都有：报问里那一处
     #[test]
     fn a_hit_in_the_request_comes_before_one_in_the_answer() {
