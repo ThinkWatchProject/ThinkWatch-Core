@@ -50,8 +50,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/files/{*rest}", any(no_files))
         .route("/files", any(no_files))
         .route("/files/{*rest}", any(no_files))
-        // M0 只有透传：任何方法、任何路径都往上游送。M1 加路由时，
-        // 这里会先过规则引擎再决定送给谁。
+        // 其余的路径都交给管线：过规则选上游，再送过去。**只送 POST**，别的方法就地回
+        // 404（见 `passthrough`）
         .fallback(any(passthrough))
         .with_state(state)
 }
@@ -63,15 +63,23 @@ pub fn router(state: AppState) -> Router {
 /// `/v1/files`，失败了就改成内联 base64 —— 404 正是让它退回内联的那个回答，内联的
 /// 图片哪家上游都能收（要转换时也转得过去）。
 async fn no_files(headers: HeaderMap) -> Response {
+    not_found(
+        &headers,
+        msg!(
+            "gw.files.unsupported" =>
+            "The gateway does not host files. Send images and documents inline in the request."
+        ),
+    )
+}
+
+/// 就地回 404，错误体照客户端的格式写：带 `anthropic-version` 的按 Anthropic，别的按
+/// Chat Completions。不经过管线，不转发、不记录。
+fn not_found(headers: &HeaderMap, m: tw_types::Msg) -> Response {
     let dialect = if headers.contains_key("anthropic-version") {
         tw_dialect::ir::Dialect::Anthropic
     } else {
         tw_dialect::ir::Dialect::Chat
     };
-    let m = msg!(
-        "gw.files.unsupported" =>
-        "The gateway does not host files. Send images and documents inline in the request."
-    );
     let body = tw_dialect::convert::error_body(dialect, 404, &format!("[ThinkWatch] {}", m.text));
     let mut resp = (axum::http::StatusCode::NOT_FOUND, body).into_response();
     resp.headers_mut().insert(
@@ -81,9 +89,12 @@ async fn no_files(headers: HeaderMap) -> Response {
     resp
 }
 
+// 参数是 axum 的提取器，一样东西一个
+#[allow(clippy::too_many_arguments)]
 async fn passthrough(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    method: axum::http::Method,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
     // **必须排在 `body` 前面。**提取器按顺序跑，而 `Bytes` 会把体吃掉
@@ -140,6 +151,21 @@ async fn passthrough(
             from,
         )
         .await;
+    }
+    // **只有 POST 送往上游。**上游的接口都是 POST，发出去时也一律用 POST（见管线的
+    // `hop::send`）；别的方法走到这里，是客户端在探路 —— Hermes Agent 起来时拿 GET 挨个问
+    // `/api/tags`、`/version` 这些本机模型服务的地址，看网关是不是 Ollama、LM Studio。原来
+    // 这些请求被改成空正文的 POST 发给上游，每个都记成一条失败的请求，还在几家上游之间转一圈；
+    // 上游要是恰好回了 200，客户端还会把网关认成那种服务。它们不是一次调用：就地回 404，
+    // 不转发、不记录。**放在鉴权之后**：没带密钥的照旧是 401，不让陌生的来访者探出什么
+    if method != axum::http::Method::POST {
+        return Ok(not_found(
+            &headers,
+            msg!(
+                "gw.method.not_forwarded", method = method.as_str(), path = uri.path() =>
+                "{method} {path} is not an API call. The gateway forwards only POST requests to upstreams."
+            ),
+        ));
     }
     // 客户端调的是哪种 API：**看路径**（见 `client_api`）。认不出的路径照旧
     // 直通，出错时的格式退回按密钥位置猜。
