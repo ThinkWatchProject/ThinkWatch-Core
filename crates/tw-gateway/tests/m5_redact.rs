@@ -35,7 +35,7 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
                     *s.lock().unwrap() = body.to_vec();
                     let text = String::from_utf8_lossy(&body).to_string();
                     // 把请求里出现的东西挑出来放进回答里：占位符（`<<TW_SECRET_1>>`、
-                    // `<<ID_NUMBER_1>>` …），或者没换掉的原值
+                    // `<<TW_ID_NUMBER_1>>` …），或者没换掉的原值
                     let echoed = text
                         .split('"')
                         .find(|p| p.contains("<<") || p.contains("sk-ant-"))
@@ -378,7 +378,7 @@ async fn id_and_card_numbers_leave_as_named_placeholders_and_come_back_whole() {
         "中转站看见了原值：{sent}"
     );
     assert!(
-        sent.contains("身份证 <<ID_NUMBER_1>>，卡号 <<CARD_NUMBER_1>>，"),
+        sent.contains("身份证 <<TW_ID_NUMBER_1>>，卡号 <<TW_CARD_NUMBER_1>>，"),
         "{sent}"
     );
     let joined: String = got

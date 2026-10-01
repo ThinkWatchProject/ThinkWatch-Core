@@ -672,7 +672,7 @@ A number that is part of a longer run of letters or digits is not matched,
 and neither is one written as a JSON number in the request body (in a tool
 call's arguments, for instance), since replacing it would leave the body
 invalid JSON. The placeholders of these two rules say what was there
-(`<<ID_NUMBER_1>>`, `<<CARD_NUMBER_1>>`), and the security log shows only
+(`<<TW_ID_NUMBER_1>>`, `<<TW_CARD_NUMBER_1>>`), and the security log shows only
 the last four characters of what they found.
 
 #### `security.inspect_tools`

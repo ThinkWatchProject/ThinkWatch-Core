@@ -122,7 +122,7 @@ pub struct Builtin {
     pub matcher: Matcher,
     /// 占位符里的标签。`None` 用账本的默认标签（桌面版是 `TW_SECRET`）。
     ///
-    /// 个人号码写明是哪一种：模型看到 `<<ID_NUMBER_1>>` 才知道那里原来是个
+    /// 个人号码写明是哪一种：模型看到 `<<TW_ID_NUMBER_1>>` 才知道那里原来是个
     /// 身份证号，答得像样
     pub label: Option<&'static str>,
 }
@@ -282,7 +282,7 @@ pub const BUILTINS: &[Builtin] = &[
         matcher: Matcher::CnResidentId {
             born_since: BORN_SINCE,
         },
-        label: Some("ID_NUMBER"),
+        label: Some("TW_ID_NUMBER"),
     },
     Builtin {
         id: "bank-card",
@@ -292,7 +292,7 @@ pub const BUILTINS: &[Builtin] = &[
         matcher: Matcher::BankCard {
             networks: CARD_NETWORKS,
         },
-        label: Some("CARD_NUMBER"),
+        label: Some("TW_CARD_NUMBER"),
     },
     Builtin {
         id: "internal-ip",
@@ -1828,7 +1828,7 @@ mod tests {
                 &RuleSet::defaults(),
                 crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
             );
-            assert_eq!(r.text, "身份证号：<<ID_NUMBER_1>>，请核对", "{id}");
+            assert_eq!(r.text, "身份证号：<<TW_ID_NUMBER_1>>，请核对", "{id}");
             assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), t);
         }
     }
@@ -1920,7 +1920,7 @@ mod tests {
                 &RuleSet::defaults(),
                 crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
             );
-            assert_eq!(r.text, "卡号 <<CARD_NUMBER_1>> 尾号对一下", "{card}");
+            assert_eq!(r.text, "卡号 <<TW_CARD_NUMBER_1>> 尾号对一下", "{card}");
             assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), t);
         }
     }
@@ -2036,7 +2036,7 @@ mod tests {
         );
         assert_eq!(
             v["messages"][1]["content"],
-            "他说\"卡号是 <<CARD_NUMBER_1>>\"，身份证 <<ID_NUMBER_1>>"
+            "他说\"卡号是 <<TW_CARD_NUMBER_1>>\"，身份证 <<TW_ID_NUMBER_1>>"
         );
         assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
         // 不是 JSON 的一段话不分里外
@@ -2287,7 +2287,7 @@ mod tests {
 
     #[test]
     fn personal_placeholders_say_what_they_were_and_count_per_label() {
-        // 模型看到 `<<ID_NUMBER_1>>` 才知道那里是个身份证号；编号按标签各数各的，
+        // 模型看到 `<<TW_ID_NUMBER_1>>` 才知道那里是个身份证号；编号按标签各数各的，
         // 和凭据的 `<<TW_SECRET_n>>` 互不相干
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
         let body = serde_json::json!({
@@ -2304,12 +2304,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&r.text).expect("换完不是合法 JSON");
         assert_eq!(
             v["content"],
-            "key <<TW_SECRET_1>>\n身份证 <<ID_NUMBER_1>>\n卡 <<CARD_NUMBER_1>>\n另一张 <<CARD_NUMBER_2>>\n身份证 <<ID_NUMBER_1>>"
+            "key <<TW_SECRET_1>>\n身份证 <<TW_ID_NUMBER_1>>\n卡 <<TW_CARD_NUMBER_1>>\n另一张 <<TW_CARD_NUMBER_2>>\n身份证 <<TW_ID_NUMBER_1>>"
         );
         assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
         // 流式还原认得带标签的占位符，切成一个字符一段也拼得回来
         let mut s = crate::redact::stream::Restorer::new(&r.ledger);
-        let echoed = "你的卡号 <<CARD_NUMBER_1>> 和身份证 <<ID_NUMBER_1>>。";
+        let echoed = "你的卡号 <<TW_CARD_NUMBER_1>> 和身份证 <<TW_ID_NUMBER_1>>。";
         let mut out = String::new();
         for c in echoed.chars() {
             out.push_str(&s.process(&c.to_string()));
