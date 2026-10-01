@@ -41,6 +41,26 @@ fn day_of(at_ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// 一天的目录名换回那一天零点（UTC）的毫秒数，[`day_of`] 反过来。不是日期的是 `None`。
+fn start_of_day(name: &str) -> Option<i64> {
+    if !looks_like_a_day(name) {
+        return None;
+    }
+    let y: i64 = name[0..4].parse().ok()?;
+    let m: i64 = name[5..7].parse().ok()?;
+    let d: i64 = name[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // 同一位的 days_from_civil：三月算一年的头一个月，闰日落在年末
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe - 719_468) * 86_400_000)
+}
+
 impl Blobs {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -157,6 +177,15 @@ impl Blobs {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// 盘上最老的那一天从哪一刻起（那天零点，UTC）。一天都没有是 `None`。
+    ///
+    /// **按正文找时用它划界**：比它早的请求一份正文都不会有，不必一条一条去盘上问 ——
+    /// 三个月的记录里，正文只占最近几天。回收是整天整天地删（先删最老的），所以划在
+    /// 最老的那一天上是准的。
+    pub fn oldest_ms(&self) -> Option<i64> {
+        self.days().first().and_then(|(name, _)| start_of_day(name))
     }
 
     /// 回收：先按天数删，再按总量删。返回删掉的字节数。
@@ -299,6 +328,40 @@ mod tests {
         assert_eq!(day_of(1_709_164_800_000 + DAY), "2024-03-01");
         // 2000 是闰年，1900 不是（这是那个经典的错法）
         assert_eq!(day_of(951_782_400_000), "2000-02-29");
+    }
+
+    /// 目录名换回那一天的零点：和 `day_of` 互为反函数，闰日、世纪年都对得上
+    #[test]
+    fn a_day_name_turns_back_into_the_start_of_that_day() {
+        for ms in [
+            0,
+            DAY - 1,
+            1_709_164_800_000,
+            951_782_400_000,
+            1_788_912_000_000 + 12_345_678,
+            -DAY,
+        ] {
+            let start = start_of_day(&day_of(ms)).unwrap();
+            assert_eq!(start, ms - ms.rem_euclid(DAY), "{}", day_of(ms));
+        }
+        for d in 0..2000 {
+            assert_eq!(start_of_day(&day_of(d * DAY + 1)), Some(d * DAY));
+        }
+        assert_eq!(start_of_day("2026-13-01"), None);
+        assert_eq!(start_of_day("我的备份"), None);
+    }
+
+    #[test]
+    fn the_oldest_day_on_disk_is_where_bodies_start() {
+        let (_d, b) = setup();
+        assert_eq!(b.oldest_ms(), None, "一份正文都没有");
+        b.put(10 * DAY + 5, 1, Which::Request, b"x");
+        b.put(12 * DAY + 5, 2, Which::Request, b"y");
+        // 用户自己放的目录不算一天
+        std::fs::create_dir_all(b.root().join("0000-backup")).unwrap();
+        assert_eq!(b.oldest_ms(), Some(10 * DAY));
+        b.gc(13 * DAY, 1, MAX_BYTES);
+        assert_eq!(b.oldest_ms(), Some(12 * DAY));
     }
 
     #[test]

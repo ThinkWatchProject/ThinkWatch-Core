@@ -189,6 +189,11 @@ impl Db {
         Self::from_conn(Connection::open_in_memory()?)
     }
 
+    /// 给同一个 crate 里另写在别处的查询用（搜索在 `crate::search`）
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     fn from_conn(conn: Connection) -> Result<Self, DbError> {
         // WAL：读不挡写。**界面在查历史的同时数据面在写** —— 默认的
         // rollback journal 下那是互相阻塞的。
@@ -198,6 +203,8 @@ impl Db {
         // 而配置文件那边是原子写加 fsync，因为那份丢不起。
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // 搜索用的 SQL 函数。装在连接上，不进库文件：每次打开都要装
+        crate::search::register(&conn)?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if found != 0 && found != SCHEMA {
             return Err(DbError::OtherVersion {
@@ -836,6 +843,32 @@ impl Db {
         Ok(out)
     }
 
+    /// 这几条请求的安全记录，按请求号分好。
+    ///
+    /// 搜索翻出来的那一页散在整份记录里，按请求号的范围取（[`Db::security_of_requests`]）
+    /// 会把中间几万条请求的记录一起取回来，所以按号点名。
+    pub fn security_of(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<tw_api::SecurityEventView>>, DbError> {
+        let mut out: std::collections::HashMap<i64, Vec<tw_api::SecurityEventView>> =
+            Default::default();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let mut st = self.conn.prepare(&format!(
+            "{SECURITY_SELECT}
+             WHERE e.request_id IN (SELECT value FROM json_each(?1))
+             ORDER BY e.id"
+        ))?;
+        let ids = serde_json::to_string(ids).unwrap_or_default();
+        for r in st.query_map([ids], security_view)? {
+            let r = r?;
+            out.entry(r.request_id).or_default().push(r);
+        }
+        Ok(out)
+    }
+
     /// 一段时间里各项防护各留下了几条记录。**和日志数的是同一批。**
     pub fn security_counts(
         &self,
@@ -1254,7 +1287,7 @@ fn error_from(r: &rusqlite::Row) -> rusqlite::Result<Option<Msg>> {
     Ok(Some(Msg { code, args, text }))
 }
 
-fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
+pub(crate) fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
     Ok(RequestRow {
         id: r.get("id")?,
         at_ms: r.get("at_ms")?,

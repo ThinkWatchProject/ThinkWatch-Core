@@ -110,6 +110,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::CostBy, cost_by)
         .at(ep::RouteStats, route_stats)
         .at(ep::History, history)
+        .at(ep::HistorySearch, history_search)
         .at(ep::Latency, latency)
         .at(ep::LatencyByProvider, latency_by_provider)
         .at(ep::TokenRate, token_rate)
@@ -768,6 +769,49 @@ async fn history(
             })
             .collect(),
     ))
+}
+
+/// 在整份记录里找，一页一页往回翻（见 `tw_store::search`）。
+///
+/// **放到阻塞线程上跑**：按正文找要读盘、解析几百 KB 的 JSON，只按记录找也可能要把十万
+/// 条扫一遍，都不该占着异步线程。库只在取一批行的时候锁一下 —— 记录和正文的落盘走的是
+/// 同一把锁，读正文时一直攥着它的话，这一秒半里刚结束的请求都要排队。
+async fn history_search(
+    State(s): State<ControlState>,
+    Json(q): Json<tw_api::HistorySearchQuery>,
+) -> Result<Json<tw_api::HistorySearchPage>, Fail> {
+    let store = need_store(&s)?.clone();
+    let query = tw_store::search::Query::new(&q);
+    // 正文目录只是一个路径，读它不需要锁
+    let blobs = tw_store::Blobs::new(store.lock().await.blobs().root().to_path_buf());
+    let found = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            tw_store::search::run(&query, &blobs, tw_store::search::Budget::DEFAULT, |ask| {
+                store.blocking_lock().db().search_rows(ask)
+            })
+        })
+        .await
+        .map_err(internal)?
+        .map_err(records)?
+    };
+    // 这一页的安全记录，徽标靠它（和 `GET /history` 一样）
+    let ids: Vec<i64> = found.rows.iter().map(|r| r.id).collect();
+    let mut security = store.lock().await.db().security_of(&ids).map_err(records)?;
+    Ok(Json(tw_api::HistorySearchPage {
+        rows: found
+            .rows
+            .into_iter()
+            .map(|r| {
+                let sec = security.remove(&r.id).unwrap_or_default();
+                history_row(r, sec)
+            })
+            .collect(),
+        hits: found.hits,
+        next: found.next,
+        bodies_since_ms: found.bodies_since_ms,
+        stopped: found.stopped,
+    }))
 }
 
 async fn latency(

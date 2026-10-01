@@ -484,6 +484,33 @@ else
   bad "历史里一条记录都没有"
 fi
 
+# 在整份记录里找，也按正文找。**摘录不带密钥出门**：数据面那一节发过「我的 key 是
+# sk-ant-api03-SMOKEKEY…」，按正文找得到那两条，摘录是打过码的；只在密钥里出现的
+# 词找不到。正文是另一条通道异步落盘的，没落下来之前找不到，所以多等几轮
+GOT=""
+for _ in $(seq 1 20); do
+  C=$(post /history/search '{"q":"我的 key","content":true}')
+  GOT=$(python3 -c 'import sys, json
+raw = sys.stdin.read()
+p = json.loads(raw)
+hits = p.get("hits") or []
+good = (p.get("stopped") in ("end", "full") and len(hits) >= 2
+        and all(h["side"] == "request" for h in hits)
+        and all("sk-an" in h["after"] for h in hits) and "SMOKEKEYAAAA" not in raw)
+print("ok" if good else raw[:600])' < "$TMP/out" 2>&1)
+  [ "$C" = "200" ] && [ "$GOT" = "ok" ] && break
+  sleep 0.25
+done
+[ "$C" = "200" ] && [ "$GOT" = "ok" ] && ok "POST /history/search 按正文找到了那两条，摘录里的密钥打了码" \
+  || bad "按正文找没找对（$C）" "$GOT"
+C=$(post /history/search '{"q":"smokekeyaaaa","content":true}')
+if [ "$C" = "200" ] && ! grep -q "SMOKEKEYAAAA" "$TMP/out" \
+   && python3 -c 'import sys, json; sys.exit(0 if not json.load(sys.stdin)["hits"] else 1)' < "$TMP/out"; then
+  ok "只在密钥里出现的词按正文找不到"
+else
+  bad "按密钥里的字找到了东西（$C）" "$(head -c 400 "$TMP/out")"
+fi
+
 # ---------------------------------------------------------------- 诊断包
 step "诊断包不带密钥出门"
 get /diagnostics >/dev/null
