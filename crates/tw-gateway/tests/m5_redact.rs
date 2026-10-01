@@ -34,10 +34,11 @@ async fn start_upstream(sse: bool) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
                 move |State(s): State<Arc<Mutex<Vec<u8>>>>, body: bytes::Bytes| async move {
                     *s.lock().unwrap() = body.to_vec();
                     let text = String::from_utf8_lossy(&body).to_string();
-                    // 把请求里出现的东西挑出来放进回答里
+                    // 把请求里出现的东西挑出来放进回答里：占位符（`<<TW_SECRET_1>>`、
+                    // `<<ID_NUMBER_1>>` …），或者没换掉的原值
                     let echoed = text
                         .split('"')
-                        .find(|p| p.contains("<<TW_SECRET_") || p.contains("sk-ant-"))
+                        .find(|p| p.contains("<<") || p.contains("sk-ant-"))
                         .unwrap_or("（没看到）")
                         .to_string();
                     if sse {
@@ -335,4 +336,84 @@ async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
     assert_eq!(items[0].count, 1);
     let dump = format!("{items:?}");
     assert!(!dump.contains("USERSOWNKEY"), "事件里带出了原值：{dump}");
+}
+
+#[tokio::test]
+async fn id_and_card_numbers_leave_as_named_placeholders_and_come_back_whole() {
+    // 身份证号和卡号出厂就开着。占位符写明是哪一种；回显一个字符一帧，拼回来
+    // 也得是原样的号码；报给界面的只有最后四位
+    let (up, seen) = start_upstream(true).await;
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "claude-code".into(),
+            key: "tw-testkey".into(),
+            ..Default::default()
+        }],
+        providers: vec![provider("relay", up)],
+        security: Security {
+            redact: policy(SecurityMode::Enforce),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let id = "11010519491231002X";
+    let card = "6222 0212 3456 7894";
+    let body = format!(
+        r#"{{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{{"role":"user","content":"身份证 {id}，卡号 {card}，帮我填表"}}]}}"#
+    );
+    let got = ask(gw, &body, true).await;
+
+    let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+    assert!(
+        !sent.contains(id) && !sent.contains(card),
+        "中转站看见了原值：{sent}"
+    );
+    assert!(
+        sent.contains("身份证 <<ID_NUMBER_1>>，卡号 <<CARD_NUMBER_1>>，"),
+        "{sent}"
+    );
+    let joined: String = got
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .filter_map(|v| v["delta"]["text"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(joined, format!("身份证 {id}，卡号 {card}，帮我填表"));
+    assert!(!got.contains("_NUMBER_"), "占位符漏给客户端了：{got}");
+
+    let mut items = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::SecretsFound { items: it, .. } = ev {
+            items = Some(it);
+            break;
+        }
+    }
+    let mut items = items.expect("没发脱敏事件");
+    items.sort_by(|a, b| a.rule.cmp(&b.rule));
+    let reported: Vec<(&str, String, &str)> = items
+        .iter()
+        .map(|i| {
+            (
+                i.rule.as_str(),
+                i.kind.slug().to_string(),
+                i.masked.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            ("bank-card", "personal".to_string(), "…7894"),
+            ("cn-resident-id", "personal".to_string(), "…002X"),
+        ]
+    );
 }

@@ -97,6 +97,7 @@ pub fn secret_kind(k: tw_guard::redact::rules::Kind) -> tw_api::SecretKind {
         Kind::PrivateKeys => tw_api::SecretKind::PrivateKeys,
         Kind::Jwt => tw_api::SecretKind::Jwt,
         Kind::ConnStrings => tw_api::SecretKind::ConnStrings,
+        Kind::Personal => tw_api::SecretKind::Personal,
         Kind::Internal => tw_api::SecretKind::Internal,
         Kind::Custom => tw_api::SecretKind::Custom,
     }

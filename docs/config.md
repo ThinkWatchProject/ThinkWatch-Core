@@ -584,7 +584,7 @@ does differs per guard, and each says so below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction: credentials found in a request are replaced before it leaves. |
+| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction: credentials, Chinese resident ID numbers and bank card numbers found in a request are replaced before it leaves. |
 | `inspect_tools` | object, [`security.inspect_tools`](#cfg-security-inspect_tools) | — | Tool-call inspection: dangerous commands in the tool calls a model returns cut the response off. |
 | `hidden_text` | object, [`security.hidden_text`](#cfg-security-hidden_text) | — | Hidden characters that people cannot see and models can read refuse the request. |
 | `content` | object, [`security.content`](#cfg-security-content) | — | Content filter: words or patterns in what the caller sends refuse the request. |
@@ -593,8 +593,9 @@ does differs per guard, and each says so below.
 
 #### `security.redact`
 
-Before a request leaves, credentials in it are looked for. Under `enforce`
-they are replaced.
+Before a request leaves, credentials in it are looked for, and so are
+Chinese resident ID numbers and bank card numbers. Under `enforce` they are
+replaced with placeholders, and put back where the answer repeats them.
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
@@ -646,9 +647,31 @@ Built-in rules:
 | `private-key` | Private key | on |
 | `jwt` | JWT | on |
 | `conn-string-password` | Connection string password | on |
+| `cn-resident-id` | Chinese resident ID number | on |
+| `bank-card` | Bank card number | on |
 | `internal-ip` | Internal IP address | off |
 | `internal-domain` | Internal domain | off |
 <!-- /generated -->
+
+`cn-resident-id` and `bank-card` look for personal numbers rather than
+credentials, and match only what checks out by structure:
+
+- `cn-resident-id`: an 18-character resident ID number of the People's
+  Republic of China whose first two digits are a province-level code, whose
+  date of birth is a real date between 1900-01-01 and today, and whose last
+  character is the right check character (ISO 7064 MOD 11-2). The old
+  15-digit numbers are not matched.
+- `bank-card`: a card number whose prefix and length belong to UnionPay,
+  Visa, Mastercard, American Express, JCB, Discover or Diners Club and which
+  passes the Luhn check, written as one run of digits or in groups of four
+  separated by single spaces or single hyphens (American Express also 4-6-5,
+  Diners Club also 4-6-4). The test card numbers published by Stripe,
+  Braintree and Adyen are not matched.
+
+A number that is part of a longer run of letters or digits is not matched.
+The placeholders of these two rules say what was there (`<<ID_NUMBER_1>>`,
+`<<CARD_NUMBER_1>>`), and the security log shows only the last four
+characters of what they found.
 
 #### `security.inspect_tools`
 
