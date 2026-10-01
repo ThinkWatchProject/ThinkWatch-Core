@@ -222,6 +222,39 @@ mod tests {
         assert!(ts.contains("  RouteStats: { req: Window; res: RouteStats };"));
     }
 
+    /// 搜索的一页：接着找的位置和正文留到哪一刻是必有的字段，没有时是 null；请求里
+    /// 不给的条件可以整个省掉
+    #[test]
+    fn a_search_page_says_where_to_go_on_from() {
+        let ts = typescript();
+        let page = decl_of(&ts, "HistorySearchPage");
+        assert!(page.contains("rows: Array<HistoryRow>"), "{page}");
+        assert!(page.contains("hits: Array<ContentHit>"), "{page}");
+        assert!(page.contains("next: HistoryCursor | null"), "{page}");
+        assert!(page.contains("bodies_since_ms: number | null"), "{page}");
+        assert!(page.contains("stopped: SearchStop"), "{page}");
+        let q = decl_of(&ts, "HistorySearchQuery");
+        for field in [
+            "q?: string",
+            "failed?: boolean",
+            "error_codes?: Array<string>",
+            "before?: HistoryCursor",
+            "limit?: number",
+        ] {
+            assert!(q.contains(field), "{field}: {q}");
+        }
+        assert_eq!(
+            decl_of(&ts, "SearchStop"),
+            "export type SearchStop = \"full\" | \"budget\" | \"end\""
+        );
+        assert!(
+            ts.contains("  HistorySearch: { req: HistorySearchQuery; res: HistorySearchPage };")
+        );
+        assert!(ts.contains(
+            "  HistorySearch: { method: \"POST\", path: \"/history/search\", params: [], format: \"json\" },"
+        ));
+    }
+
     #[test]
     fn every_endpoint_is_in_the_table() {
         let ts = typescript();

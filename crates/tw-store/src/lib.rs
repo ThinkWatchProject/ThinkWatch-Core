@@ -11,6 +11,7 @@
 pub mod blobs;
 pub mod db;
 pub mod recorder;
+pub mod search;
 pub mod task;
 
 pub use blobs::{Blobs, Which};

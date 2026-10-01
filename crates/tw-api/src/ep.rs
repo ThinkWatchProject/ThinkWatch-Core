@@ -45,6 +45,8 @@ endpoints! {
     /// 各条路由走了多少请求、各条规则命中了多少，记录从哪一刻起是全的
     RouteStats: GET "/summary/routes", api::Window => api::RouteStats;
     History: GET "/history", api::ListQuery => Vec<api::HistoryRow>;
+    /// 在整份记录里找，一页一页往回翻；也可以按正文找
+    HistorySearch: POST "/history/search", api::HistorySearchQuery => api::HistorySearchPage;
     Latency: GET "/latency", api::Window => Vec<api::LatencyView>;
     LatencyByProvider: GET "/latency/provider", api::Window => Vec<api::LatencyView>;
     /// 生成速度的中位数，按模型、按上游
