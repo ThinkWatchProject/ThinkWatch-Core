@@ -631,13 +631,19 @@ fn is_b64url(s: &str) -> bool {
 /// 那个解码是必需的：光看「三段用点分开的 base64」会把版本号、文件路径、
 /// 甚至 `a.b.c` 这种普通标识符全算上。
 fn looks_like_jwt(tok: &str) -> bool {
-    let parts: Vec<&str> = tok.split('.').collect();
-    if parts.len() != 3 || !parts.iter().all(|p| is_b64url(p)) || parts[0].len() < 8 {
+    // 先数点，不把三段收集起来：每个 token 都要过这一关，绝大多数在这里就回去了
+    if tok.bytes().filter(|&b| b == b'.').count() != 2 || !tok.split('.').all(is_b64url) {
+        return false;
+    }
+    let Some((head, _)) = tok.split_once('.') else {
+        return false;
+    };
+    if head.len() < 8 {
         return false;
     }
     use base64::Engine as _;
     let Ok(head) =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0].trim_end_matches('='))
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(head.trim_end_matches('='))
     else {
         return false;
     };
@@ -689,15 +695,16 @@ fn conn_strings(text: &str, out: &mut Vec<Hit>) {
 // ---------------------------------------------------------------- 内网标识
 
 fn is_rfc1918(tok: &str) -> bool {
-    let p: Vec<&str> = tok.split('.').collect();
-    if p.len() != 4 {
-        return false;
+    // 四段读进一个定长数组，不收集：开着这条时每个 token 都要过一遍
+    let mut nums = [0u16; 4];
+    let mut parts = tok.split('.');
+    for n in &mut nums {
+        match parts.next().map(str::parse::<u16>) {
+            Some(Ok(v)) if v <= 255 => *n = v,
+            _ => return false,
+        }
     }
-    let nums: Vec<u16> = match p.iter().map(|x| x.parse::<u16>()).collect::<Result<_, _>>() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if nums.iter().any(|n| *n > 255) {
+    if parts.next().is_some() {
         return false;
     }
     match (nums[0], nums[1]) {
@@ -717,11 +724,15 @@ fn internal_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
     if set.is_on("internal-ip") && is_rfc1918(tok) {
         return Some("internal-ip");
     }
-    let lower = tok.to_ascii_lowercase();
+    // 后缀不分大小写地比，**不先转成小写**：每个 token 都要过这一关，转一次就是
+    // 一次分配
+    let t = tok.as_bytes();
     if set.is_on("internal-domain")
-        && INTERNAL_SUFFIXES.iter().any(|s| lower.ends_with(s))
-        && lower.len() > 7
-        && lower.contains('.')
+        && t.len() > 7
+        && t.contains(&b'.')
+        && INTERNAL_SUFFIXES.iter().any(|s| {
+            t.len() >= s.len() && t[t.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes())
+        })
     {
         return Some("internal-domain");
     }
@@ -1494,6 +1505,29 @@ mod tests {
         assert_eq!(got.len(), 3, "{got:?}");
         assert!(got.iter().all(|(k, _)| k == "internal-ip"));
         assert!(found("127.0.0.1 和 8.8.8.8 和 172.32.0.1").is_empty());
+    }
+
+    #[test]
+    fn internal_domains_are_found_whatever_their_case() {
+        let set = RuleSet::only(&["internal-domain"]);
+        let got: Vec<String> = scan(
+            "构建机 build.corp.internal、打印机 Printer.LOCAL、路由 gw.home.lan",
+            &set,
+        )
+        .into_iter()
+        .map(|h| h.rule.id().to_string())
+        .collect();
+        assert_eq!(got, vec!["internal-domain"; 3]);
+        // 太短的、只是后缀的、后缀不在词尾的，都不算
+        for t in [
+            "a.lan",
+            ".local",
+            "local",
+            "x.internal.example.com",
+            "localhost",
+        ] {
+            assert!(scan(t, &set).is_empty(), "{t}");
+        }
     }
 
     #[test]
