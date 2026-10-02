@@ -1605,8 +1605,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Is("[]"),
                     t(
-                        "Models the client asks for, as model ids or globs (`claude-*`). `[]`: every model.",
-                        "客户端请求的模型，写模型 ID 或通配（`claude-*`）。`[]`：所有模型。",
+                        "Models sent to the upstream, as model ids or globs (`claude-*`). When a routing rule renames the model, the new name is the one that matches. `[]`: every model.",
+                        "发给上游的模型，写模型 ID 或通配（`claude-*`）。路由规则改了模型名的，按改名之后的匹配。`[]`：所有模型。",
                     ),
                 ),
                 row(
@@ -1614,8 +1614,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Is("[]"),
                     t(
-                        "Upstreams whose answers the plugin handles, by name or glob. It applies to answers only: a request is changed before an upstream is chosen. `[]`: every upstream.",
-                        "插件处理哪些上游的回答，写名字或通配。只作用于回答：请求在选定上游之前就已改写。`[]`：所有上游。",
+                        "Upstreams the plugin handles, by name or glob, for requests and answers alike. `[]`: every upstream.",
+                        "插件处理哪些上游，写名字或通配，请求和回答都按它。`[]`：所有上游。",
                     ),
                 ),
             ],

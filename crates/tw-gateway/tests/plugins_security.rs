@@ -12,10 +12,8 @@
 //! - 没有插件改动的请求一个字节都不变；WebSocket（Codex 的 Responses WebSocket）那一路
 //!   同样看占位符、同样过工具调用审查、拒绝了不发给上游。
 //!
-//! 标了 `#[ignore]` 的有两类，断言写的都是该有的样子：
-//! - `pending`：等「先路由、再跑请求钩子」（契约附录二）落地后打开；
-//! - 还没解决的问题：插件写下的占位符会被换回真值（契约 I5 的写法），计 token 的请求不经过
-//!   请求钩子，插件改的 `params.model` 不再对照密钥的模型范围。
+//! 标了 `#[ignore]` 的两条是**还没解决的问题**，断言写的是该有的样子：插件写下的占位符会被
+//! 换回真值（契约 I5 的写法），计 token 的请求不经过请求钩子。
 
 mod plugin_harness;
 
@@ -379,10 +377,9 @@ export function onReplyText(text) { return text.repeat(50); }"#;
 }
 
 #[tokio::test]
-#[ignore = "addendum 2: a model a plugin writes into params.model is sent without checking it \
-            against the key's model list; see the track 4 report"]
 async fn a_plugin_cannot_switch_to_a_model_the_key_may_not_use() {
-    // 密钥只许用 claude-sonnet-*；插件把模型换成 opus
+    // 密钥只许用 claude-sonnet-*；插件把模型换成 opus。上游的模型清单不再对（契约附录二），
+    // 密钥的模型范围照样管：路由规则改的名字要过这一关，插件改的也要
     let to_opus = r#"
 export const manifest = { name: "换模型", api: 1, permissions: ["params"] };
 export function onRequest(req) { req.params.model = "claude-opus-4-1"; return req; }"#;
@@ -401,8 +398,6 @@ export function onRequest(req) { req.params.model = "claude-opus-4-1"; return re
 }
 
 // ── I8：每次发往上游跑一次，换上游就从原始请求重来 ─────────────────
-
-const PENDING: &str = "pending: route-first request hooks (contract addendum 2)";
 
 /// 每次运行写下这一次发往的上游和一个不会重复的记号
 const NONCE: &str = r#"
@@ -424,9 +419,7 @@ async fn failing_over(plugins: Vec<Plug>) -> (Upstream, Upstream, Gateway) {
 }
 
 #[tokio::test]
-#[ignore = "pending: route-first request hooks (contract addendum 2)"]
 async fn failing_over_starts_again_from_the_clients_original_request() {
-    let _ = PENDING;
     let (dead, up, gw) = failing_over(vec![Plug::new("nonce", NONCE)]).await;
     let r = gw.ask(plain("你好", false)).await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -487,7 +480,6 @@ async fn sending_again_without_sealed_reasoning_reuses_the_request_hook_result()
 }
 
 #[tokio::test]
-#[ignore = "pending: route-first request hooks (contract addendum 2)"]
 async fn a_request_hook_runs_only_for_the_upstreams_in_its_scope() {
     let (dead, up, gw) = failing_over(vec![Plug::new("nonce", NONCE).upstreams(&["second"])]).await;
     let r = gw.ask(plain("你好", false)).await;
@@ -509,7 +501,6 @@ async fn a_request_hook_runs_only_for_the_upstreams_in_its_scope() {
 }
 
 #[tokio::test]
-#[ignore = "pending: route-first request hooks (contract addendum 2)"]
 async fn a_broken_plugin_refuses_only_the_attempts_in_its_scope() {
     // 文件变了的插件，范围只有 second：发往 relay 的请求照常，不被它拒
     let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
@@ -526,7 +517,6 @@ async fn a_broken_plugin_refuses_only_the_attempts_in_its_scope() {
 }
 
 #[tokio::test]
-#[ignore = "pending: route-first request hooks (contract addendum 2)"]
 async fn a_plugin_failure_refuses_the_whole_request_without_failing_over() {
     // 插件只在发往 relay 时出错：拒绝的是整个请求，不会换到 second 去
     let throws = r#"
@@ -579,7 +569,6 @@ fn split_by_model(
 }
 
 #[tokio::test]
-#[ignore = "pending: route-first request hooks (contract addendum 2)"]
 async fn a_model_a_plugin_writes_renames_what_is_sent_without_rerouting() {
     // 路由按客户端的原话选了 relay；插件把模型改成 gpt-5，请求照样发给 relay，只是名字换了
     let rename = r#"
@@ -603,7 +592,6 @@ export function onRequest(req) { req.params.model = "gpt-5"; return req; }"#;
 }
 
 #[tokio::test]
-#[ignore = "pending: route-first request hooks (contract addendum 2)"]
 async fn the_request_hook_sees_the_upstream_and_both_model_names() {
     // 规则把 claude-sonnet-4-5 改名成 relay-sonnet 发给 relay：ctx.model 是改名之后的，
     // ctx.requested_model 是客户端要的，ctx.upstream 是这一跳的上游

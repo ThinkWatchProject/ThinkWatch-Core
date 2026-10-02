@@ -288,6 +288,7 @@ gw.plugin.failed
 gw.plugin.file_changed
 gw.plugin.manifest
 gw.plugin.memory_limit
+gw.plugin.model_not_allowed
 gw.plugin.not_located
 gw.plugin.nothing_to_try
 gw.plugin.output_limit

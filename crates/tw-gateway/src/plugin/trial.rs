@@ -6,6 +6,10 @@
 //!
 //! 给人看的前后两份都是**换过占位符的**：插件本来就只看得到占位符，界面上显示的也
 //! 不该是真值。试跑不进统计、不进日志圈、不留请求记录，日志交给调用方。
+//!
+//! `ctx` 按那一行记下的路由给：`upstream` 是回答它的那一家，`model` 是发给那一家的
+//! 模型名，`requested_model` 是客户端要的 —— 和那个请求当时跑插件时看到的一样
+//! （契约附录二）。
 
 use std::sync::Arc;
 
@@ -21,12 +25,16 @@ use super::request::{rejected, request_unreadable};
 use super::set::LogLine;
 use super::view;
 
-/// 存下来的请求：客户端调的路径、查询串、请求体，和请求那一行上记的客户端。
+/// 存下来的请求：客户端调的路径、查询串、请求体，和请求那一行上记的客户端、路由。
 pub struct StoredRequest<'a> {
     pub path: &'a str,
     pub query: Option<&'a str>,
     pub body: &'a [u8],
     pub client: Option<&'a str>,
+    /// 回答它的那一家（请求那一行的 `provider`）。没发出去的是空的
+    pub upstream: &'a str,
+    /// 发给那一家的模型名（请求那一行的 `sent_model`）。空的话按客户端要的那个
+    pub sent_model: &'a str,
 }
 
 /// 存下来的回答：上游的原话（流或者整包），它是什么格式、哪一家回的。
@@ -115,10 +123,23 @@ async fn tried(
     if let Some(r) = &request {
         bridge.learn(r.body);
     }
-    let model = match (&request, dialect) {
+    let requested = match (&request, dialect) {
         (Some(r), Some(d)) => super::request::asked_model(d, r.path, parsed.as_ref()),
         _ => String::new(),
     };
+    // 发给上游的模型名和上游：那一行记下的路由
+    let model = request
+        .as_ref()
+        .map(|r| r.sent_model)
+        .filter(|m| !m.is_empty())
+        .map_or_else(|| requested.clone(), str::to_string);
+    let upstream = request
+        .as_ref()
+        .map(|r| r.upstream)
+        .filter(|u| !u.is_empty())
+        .or(reply.as_ref().map(|r| r.provider))
+        .unwrap_or_default()
+        .to_string();
     let client = request.as_ref().and_then(|r| r.client);
     let name = host.manifest().name.clone();
 
@@ -131,10 +152,12 @@ async fn tried(
                 bridge.hide_value(&mut masked);
                 match view::build(d, &masked, r.path) {
                     Err(e) => t.error = Some(request_unreadable(e)),
-                    Ok(built) => {
+                    Ok(mut built) => {
                         let m = host.manifest();
+                        super::request::sending(&mut built.view, &model);
                         let input = view::trim(&built.view, &m.permissions);
-                        let ctx = super::request::ctx(client, &model, d, None, settings);
+                        let ctx =
+                            super::request::ctx(client, &model, &requested, d, &upstream, settings);
                         let (h, given) = (host.clone(), input.clone());
                         let before = pretty(&masked);
                         let ran = pool.run(move || h.on_request(given, ctx)).await;
@@ -238,8 +261,10 @@ async fn tried(
         dialect: client_dialect,
         client,
         model: &model,
+        requested_model: &requested,
         upstream: reply.provider,
         request_id: 0,
+        attempt: 0,
     };
     let mut chain = match super::reply::Chain::trial(pool, host.clone(), settings, &ctx).await {
         Ok(Some(c)) => c,

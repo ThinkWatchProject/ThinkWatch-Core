@@ -56,9 +56,10 @@ pub enum BodyKind {
     Request,
     Response,
     /// 插件改过之后的请求体（`Request` 存的是客户端发来的那一份）。**只有插件真的改了
-    /// 才存**，挨着 `Request` 放。交来的是要发出去的那一份（插件交回的占位符已经换回
-    /// 原值，见 [`crate::plugin::request`]），带着这个请求的 [`Redaction`]：落盘前和别的
-    /// 正文一样换掉、打码（[`BodyRecord::for_disk`]）
+    /// 才存**，挨着 `Request` 放。请求钩子每一跳跑一次，存的是最后发出去的那一跳收到的
+    /// 那一份 —— 回答的那一家收到的就是它（客户端那种格式、转换之前，插件交回的占位符
+    /// 已经换回原值，见 [`crate::plugin::request`]），带着那一跳的 [`Redaction`]：落盘前和
+    /// 别的正文一样换掉、打码（[`BodyRecord::for_disk`]）
     AfterPlugins,
 }
 

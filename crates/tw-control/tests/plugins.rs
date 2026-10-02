@@ -805,10 +805,17 @@ async fn a_request_shows_its_plugin_runs_and_the_body_after_them() {
         let g = b.store.lock().await;
         g.db().insert(&row(1, 1_000)).unwrap();
         g.db().insert(&row(2, 2_000)).unwrap();
-        g.record_plugin_run(&run_row(1, 1_000, tw_api::PluginOutcome::Changed));
+        // 故障转移过一次：第 0 跳、第 1 跳各跑一次请求钩子，回答钩子跑在回答的第 1 跳上
+        let mut first = run_row(1, 1_000, tw_api::PluginOutcome::Changed);
+        first.detail = Some(r#"{"attempt":0,"changed":["system"]}"#.into());
+        g.record_plugin_run(&first);
+        let mut second = run_row(1, 1_100, tw_api::PluginOutcome::Changed);
+        second.detail = Some(r#"{"attempt":1,"changed":["system"]}"#.into());
+        g.record_plugin_run(&second);
         let mut reply = run_row(1, 1_500, tw_api::PluginOutcome::Error);
         reply.hook = tw_api::PluginHook::Reply;
         reply.error = Some(tw_types::msg!("gw.plugin.failed" => "The plugin failed."));
+        reply.detail = Some(r#"{"attempt":1,"text_calls":1}"#.into());
         g.record_plugin_run(&reply);
         g.record_plugin_run(&run_row(2, 2_000, tw_api::PluginOutcome::Unchanged));
         g.record_body(
@@ -824,12 +831,17 @@ async fn a_request_shows_its_plugin_runs_and_the_body_after_them() {
     let (st, d) = call(&b.app, "GET", "/request/1", None).await;
     assert_eq!(st, StatusCode::OK, "{d}");
     let runs = d["plugins"].as_array().unwrap();
-    assert_eq!(runs.len(), 2);
+    assert_eq!(runs.len(), 3);
     assert_eq!(runs[0]["hook"], "request");
     assert_eq!(runs[0]["outcome"], "changed");
     assert_eq!(runs[0]["cpu_us"], 120);
-    assert_eq!(runs[1]["hook"], "reply");
-    assert_eq!(runs[1]["error"]["code"], "gw.plugin.failed");
+    let attempts: Vec<u64> = runs
+        .iter()
+        .map(|r| r["attempt"].as_u64().unwrap())
+        .collect();
+    assert_eq!(attempts, [0, 1, 1]);
+    assert_eq!(runs[2]["hook"], "reply");
+    assert_eq!(runs[2]["error"]["code"], "gw.plugin.failed");
     assert_eq!(d["row"]["plugin_changed"], true);
     let after = d["request_after_plugins"]["text"].as_str().unwrap();
     assert!(after.contains("today is Friday"), "{after}");

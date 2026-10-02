@@ -76,6 +76,8 @@ async fn a_trial_shows_both_sides_masked_and_leaves_no_trace() {
             query: None,
             body: &body,
             client: Some("claude-code"),
+            upstream: "anthropic",
+            sent_model: "claude-sonnet-4-5",
         }),
         Some(StoredReply {
             body: &answer,
@@ -130,6 +132,8 @@ async fn an_answer_from_another_format_is_read_in_the_clients_format() {
             query: None,
             body: &body,
             client: None,
+            upstream: "anthropic",
+            sent_model: "claude-sonnet-4-5",
         }),
         Some(StoredReply {
             body: chat.as_bytes(),
@@ -164,6 +168,8 @@ async fn a_rejection_is_reported_without_an_after() {
             query: None,
             body: &body,
             client: None,
+            upstream: "anthropic",
+            sent_model: "claude-sonnet-4-5",
         }),
         None,
     )
@@ -174,4 +180,44 @@ async fn a_rejection_is_reported_without_an_after() {
     let e = t.error.unwrap();
     assert_eq!(e.code, "gw.plugin.rejected");
     assert!(e.text.contains("not today"));
+}
+
+/// `ctx` 按那一行记下的路由给：回答它的那一家、发给它的模型名、客户端要的模型 —— 视图里
+/// 的模型名和 `ctx.model` 是同一个
+#[tokio::test]
+async fn a_trial_gives_the_plugin_the_routing_the_request_had() {
+    let pool = Arc::new(Pool::new(1, 4));
+    let body = request();
+    let saw = Arc::new(std::sync::Mutex::new(Value::Null));
+    let s = saw.clone();
+    let look = Double::new("look")
+        .permit(&[Permission::Params])
+        .on_request(move |view, ctx| {
+            *s.lock().unwrap() = json!({ "view": view, "ctx": ctx });
+            Invocation::ok(RequestOutcome::Unchanged)
+        })
+        .into_host();
+    let t = run(
+        pool,
+        look,
+        &Default::default(),
+        rules(),
+        Some(StoredRequest {
+            path: "/v1/messages",
+            query: None,
+            body: &body,
+            client: Some("claude-code"),
+            upstream: "relay",
+            sent_model: "glm-4.6",
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(t.error, None);
+    let saw = saw.lock().unwrap().clone();
+    assert_eq!(saw["ctx"]["upstream"], "relay");
+    assert_eq!(saw["ctx"]["model"], "glm-4.6");
+    assert_eq!(saw["ctx"]["requested_model"], "claude-sonnet-4-5");
+    assert_eq!(saw["view"]["model"], "glm-4.6");
+    assert_eq!(saw["view"]["params"]["model"], "glm-4.6");
 }

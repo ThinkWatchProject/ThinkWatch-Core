@@ -61,11 +61,15 @@ pub struct Call {
 pub struct ReplyCtx<'a> {
     pub dialect: Dialect,
     pub client: Option<&'a str>,
-    /// 客户端要的模型
+    /// 发给回答它的那一家的模型名：路由规则、请求钩子改过的是改过之后的
     pub model: &'a str,
+    /// 客户端要的模型
+    pub requested_model: &'a str,
     /// 回答它的那一家
     pub upstream: &'a str,
     pub request_id: u64,
+    /// 回答它的那一跳是尝试链上的第几跳。记在每一次运行的 `detail` 里
+    pub attempt: usize,
 }
 
 /// 一个插件在这次回答里的状态。
@@ -116,6 +120,7 @@ pub struct Chain {
     bridge: Bridge,
     dialect: Dialect,
     request_id: u64,
+    attempt: usize,
     recorded: bool,
 }
 
@@ -165,7 +170,7 @@ impl Chain {
         ctx: &ReplyCtx<'_>,
     ) -> Result<Option<Chain>, GatewayError> {
         let mut stages = Vec::new();
-        // 跑不了的插件在请求钩子那一步已经按 `on_error` 处理过了：这里只有能跑的
+        // 跑不了的插件在回答它的那一次发出去之前已经按 `on_error` 处理过了：这里只有能跑的
         for a in set.for_reply(ctx.client, ctx.model, ctx.upstream) {
             let Some(host) = a.ready().cloned() else {
                 continue;
@@ -174,8 +179,9 @@ impl Chain {
             let c = super::request::ctx(
                 ctx.client,
                 ctx.model,
+                ctx.requested_model,
                 ctx.dialect,
-                Some(ctx.upstream),
+                ctx.upstream,
                 &a.settings,
             );
             let made = state
@@ -195,7 +201,7 @@ impl Chain {
                         outcome: PluginOutcome::Error,
                         error: Some(why.clone()),
                         cpu_us: 0,
-                        detail: None,
+                        detail: Some(json!({ "attempt": ctx.attempt })),
                     };
                     state.plugin_ran(ctx.request_id, &a, run, Vec::new());
                     if a.on_error == OnError::Reject {
@@ -207,6 +213,7 @@ impl Chain {
                             bridge,
                             dialect: ctx.dialect,
                             request_id: ctx.request_id,
+                            attempt: ctx.attempt,
                             recorded: false,
                         };
                         started.finish();
@@ -225,6 +232,7 @@ impl Chain {
             bridge,
             dialect: ctx.dialect,
             request_id: ctx.request_id,
+            attempt: ctx.attempt,
             recorded: false,
         }))
     }
@@ -244,8 +252,9 @@ impl Chain {
         let c = super::request::ctx(
             ctx.client,
             ctx.model,
+            ctx.requested_model,
             ctx.dialect,
-            Some(ctx.upstream),
+            ctx.upstream,
             settings,
         );
         let instance = pool
@@ -261,6 +270,7 @@ impl Chain {
             bridge: Bridge::new(Arc::new(tw_guard::redact::rules::RuleSet::none())),
             dialect: ctx.dialect,
             request_id: ctx.request_id,
+            attempt: ctx.attempt,
             recorded: false,
         }))
     }
@@ -638,6 +648,7 @@ impl Chain {
                 error: s.error.clone(),
                 cpu_us: s.cpu.as_micros().min(u64::MAX as u128) as u64,
                 detail: Some(json!({
+                    "attempt": self.attempt,
                     "text_calls": c.text_calls,
                     "text_changed": c.text_changed,
                     "tool_calls": c.tool_calls,

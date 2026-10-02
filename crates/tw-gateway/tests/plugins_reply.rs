@@ -58,6 +58,15 @@ fn provider(base: SocketAddr, protocol: Protocol) -> Provider {
 }
 
 async fn gateway(p: Provider, security: Security, entries: Vec<Arc<Active>>) -> Gw {
+    gateway_routed(p, security, Vec::new(), entries).await
+}
+
+async fn gateway_routed(
+    p: Provider,
+    security: Security,
+    routes: Vec<tw_engine::RouteSet>,
+    entries: Vec<Arc<Active>>,
+) -> Gw {
     let cfg = Config {
         version: 1,
         listen: Listen::default(),
@@ -68,6 +77,7 @@ async fn gateway(p: Provider, security: Security, entries: Vec<Arc<Active>>) -> 
         }],
         providers: vec![p],
         security,
+        routes,
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
@@ -235,6 +245,57 @@ async fn a_converted_stream_is_rewritten_in_the_clients_format() {
     assert_eq!(ctx["format"], "anthropic");
     assert_eq!(ctx["upstream"], "up");
     assert_eq!(ctx["model"], "claude-sonnet-4-5");
+    assert_eq!(ctx["requested_model"], "claude-sonnet-4-5");
+}
+
+/// 规则把模型改了名发给上游：回答钩子的 `ctx.model` 是发出去的那个，`requested_model` 是
+/// 客户端要的；范围里的模型也按发出去的那个对
+#[tokio::test]
+async fn reply_hooks_see_and_are_scoped_by_the_model_sent_upstream() {
+    let up = upstream("text/event-stream", anthropic_sse(&["hello"], None)).await;
+    let saw = Arc::new(Mutex::new(Value::Null));
+    let s = saw.clone();
+    let spy = Double::new("spy")
+        .permit(&[Permission::ReplyText])
+        .on_reply(true, false, false, move |ctx| {
+            *s.lock().unwrap() = ctx;
+            Ok(Box::new(Closures {
+                text: Box::new(|t| Invocation::ok(Some(t.to_uppercase()))),
+                end: Box::new(|| Invocation::ok(None)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        });
+    let rename = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
+        name: "rename".into(),
+        when: Default::default(),
+        to: Some("up".into()),
+        set: Some(tw_engine::SetAction {
+            model: Some("glm-4.6".into()),
+            ..Default::default()
+        }),
+        deny: None,
+    }])];
+    let gw = gateway_routed(
+        provider(up, Protocol::Anthropic),
+        Security::default(),
+        rename,
+        vec![
+            entry_with("spy", spy, |a| a.scope.models = vec!["glm-*".into()]),
+            entry_with("asked", upper(), |a| {
+                a.scope.models = vec!["claude-*".into()]
+            }),
+        ],
+    )
+    .await;
+    let (status, body) = post(&gw, "/v1/messages", &ask(true)).await;
+    assert_eq!(status, 200, "{body}");
+    // 只有管发出去的那个模型的插件跑了（`upper` 跑了也是大写，所以看计数）
+    assert_eq!(anthropic_text(&body), "HELLO");
+    assert_eq!(gw.stats("asked").calls, 0);
+    let ctx = saw.lock().unwrap().clone();
+    assert_eq!(ctx["model"], "glm-4.6");
+    assert_eq!(ctx["requested_model"], "claude-sonnet-4-5");
+    assert_eq!(ctx["upstream"], "up");
 }
 
 #[tokio::test]

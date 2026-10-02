@@ -19,10 +19,12 @@
 //!   一次回答数，超了只切掉那一次回答（替它发 `response.failed`），连接照常。
 //!
 //! 脚本插件也在这条路上跑（见 [`crate::plugin`]）：客户端发来的每个
-//! `response.create` 是一次请求，排在请求防护和脱敏之前过请求钩子；上游每一次回答
+//! `response.create` 是一次请求。**这条路只有一跳**（升级时就连定了那一家，不换），
+//! 所以每个 `response.create` 过一遍请求钩子：上游是这条连接连的那一家，模型名是这一帧
+//! 写的（WebSocket 上没有规则改写）。位置和 HTTP 那条路的一跳一样 —— 请求防护先看
+//! 客户端的原话，插件改过的再看一遍插件加进来的，然后才脱敏、发出。上游每一次回答
 //! （`response.created` 到 `response.completed`）起一组回答钩子的实例，排在占位符
-//! 还原之后、工具墙之前 —— 和 HTTP 那条路的位置一样。插件出错而策略是拒绝时，切掉
-//! 的是那一次回答，连接照常。
+//! 还原之后、工具墙之前。插件出错而策略是拒绝时，切掉的是那一次回答，连接照常。
 //!
 //! # 两条明说的边界
 //!
@@ -152,8 +154,10 @@ struct Pipes {
     id: u64,
     /// 范围里可能有插件时才有
     plugins: Option<Plugins>,
-    /// 最近一次 `response.create` 要的模型和它的密钥映射：回答钩子用
-    asked_model: String,
+    /// 最近一次 `response.create`：客户端要的模型、发出去的模型（插件可能换了它）和
+    /// 它的密钥映射。回答钩子用
+    requested_model: String,
+    sent_model: String,
     bridge: Option<crate::plugin::bridge::Bridge>,
     /// 这一次回答的回答钩子
     reply: Option<crate::plugin::reply::Stream>,
@@ -232,7 +236,8 @@ pub async fn proxy(
         provider: upstream.provider.name,
         id,
         plugins,
-        asked_model: String::new(),
+        requested_model: String::new(),
+        sent_model: String::new(),
         bridge: None,
         reply: None,
     };
@@ -376,7 +381,15 @@ async fn pump(
                 let Some(Ok(m)) = msg else { break End::Closed };
                 let out = match m {
                     Message::Text(t) => {
-                        // 插件的请求钩子：排在请求防护和脱敏之前，它们看的是插件改过的那一版
+                        // 请求防护在插件和脱敏之前：看的是客户端的原话
+                        if let Some(why) = screen_frame(&state, p, t.as_str()) {
+                            let _ = c_tx.send(Message::Text(
+                                format!("[ThinkWatch] {}", why.text).into(),
+                            )).await;
+                            break End::Cut(why);
+                        }
+                        // 插件的请求钩子：改过的那一版再过一遍请求防护（只看插件加进来的），
+                        // 脱敏换的是改过的那一版
                         let t = match plugin_request(&state, p, t.as_str()).await {
                             Ok(t) => t,
                             Err(why) => {
@@ -386,13 +399,6 @@ async fn pump(
                                 break End::Cut(why);
                             }
                         };
-                        // 请求防护在脱敏之前：看的是客户端的原话
-                        if let Some(why) = screen_frame(&state, p, t.as_str()) {
-                            let _ = c_tx.send(Message::Text(
-                                format!("[ThinkWatch] {}", why.text).into(),
-                            )).await;
-                            break End::Cut(why);
-                        }
                         let mode = p.rules.redact_mode;
                         let found = crate::guard::find(mode, &p.rules.redact, t.as_bytes());
                         if found.is_empty() {
@@ -624,36 +630,89 @@ async fn fail_response(p: &mut Pipes, c_tx: &mut ClientSink, why: Msg) -> Flow {
 
 /// 一次 `response.create` 过插件的请求钩子。返回要发给上游的那一帧（插件改过的话是
 /// 改过的），被拒了返回告诉客户端的那句话。别的帧原样。
+///
+/// 这条路只有一跳：上游是这条连接连的那一家，发给它的模型名就是这一帧写的，运行记在
+/// 第 0 跳上。插件改过的那一版**再过一遍请求防护**，只看插件加进来的（客户端的原话已经
+/// 在 [`screen_frame`] 看过了）。
 async fn plugin_request(state: &AppState, p: &mut Pipes, text: &str) -> Result<String, Msg> {
     let Some(pc) = p.plugins.as_ref() else {
         return Ok(text.to_string());
     };
-    let create = serde_json::from_str::<serde_json::Value>(text)
+    let Some(frame) = serde_json::from_str::<serde_json::Value>(text)
         .ok()
-        .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"));
-    if !create {
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"))
+    else {
         return Ok(text.to_string());
-    }
-    let asked = crate::plugin::request::Asked {
-        dialect: tw_dialect::ir::Dialect::Responses,
-        path: "/responses",
-        client: pc.client.as_deref(),
     };
+    let requested = frame
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
     let body = bytes::Bytes::copy_from_slice(text.as_bytes());
-    match crate::plugin::request::run(&pc.pool, &pc.set, &p.rules.redact, &asked, &body).await {
-        Ok(plugged) => {
-            crate::plugin::request::record(state, p.id, &plugged);
-            p.asked_model = plugged.model.clone();
-            p.bridge = plugged.bridge.clone();
-            Ok(match &plugged.body {
-                Some(b) => String::from_utf8_lossy(b).into_owned(),
-                None => text.to_string(),
-            })
-        }
+    let mut hook = crate::plugin::request::Hook::new(
+        &pc.set,
+        p.rules.redact.clone(),
+        tw_dialect::ir::Dialect::Responses,
+        "/responses",
+        pc.client.as_deref(),
+        &body,
+    );
+    let to = crate::plugin::request::Target {
+        upstream: &p.provider,
+        model: &requested,
+        requested_model: &requested,
+        attempt: 0,
+    };
+    let plugged = match hook.attempt(&pc.pool, &to).await {
+        Ok(plugged) => plugged,
         Err(refused) => {
-            crate::plugin::request::record(state, p.id, &refused.plugged);
-            Err(refused.why)
+            crate::plugin::request::record(state, p.id, &refused.runs);
+            return Err(refused.why);
         }
+    };
+    crate::plugin::request::record(state, p.id, &plugged.runs);
+    let sent = plugged
+        .changed
+        .as_ref()
+        .and_then(|c| c.renamed.as_ref())
+        .map_or_else(|| requested.clone(), |r| r.model.clone());
+    p.bridge = plugged.bridge;
+    let out = match plugged.changed {
+        None => text.to_string(),
+        Some(c) => {
+            if let Some(why) = screen_changed(state, p, &frame, &c.value) {
+                return Err(why);
+            }
+            String::from_utf8_lossy(&c.body).into_owned()
+        }
+    };
+    p.requested_model = requested;
+    p.sent_model = sent;
+    Ok(out)
+}
+
+/// 插件改过的那一帧再看一遍请求防护：**只看插件加进来的**（见
+/// [`crate::guard::screen_more`]）。两份都要按 Responses 解得开；解不开的只查藏匿字符，
+/// 和 [`screen_frame`] 一样
+fn screen_changed(
+    state: &AppState,
+    p: &Pipes,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Option<Msg> {
+    let s = &p.rules.screen;
+    if !s.hidden_mode.detects() && !s.content_mode.detects() {
+        return None;
+    }
+    let decode = |v: &serde_json::Value| {
+        tw_dialect::convert::decode(tw_dialect::ir::Dialect::Responses, v, "/responses", None).ok()
+    };
+    match (decode(before), decode(after)) {
+        (Some(b), Some(a)) => {
+            crate::guard::screen_more(&state.bus, p.id, &p.provider, s, &b.request, &a.request)
+        }
+        _ => crate::guard::screen_text(&state.bus, p.id, &p.provider, s, &after.to_string()),
     }
 }
 
@@ -670,9 +729,11 @@ async fn start_reply(state: &AppState, p: &mut Pipes) -> Result<(), Msg> {
     let ctx = crate::plugin::reply::ReplyCtx {
         dialect: tw_dialect::ir::Dialect::Responses,
         client: pc.client.as_deref(),
-        model: &p.asked_model,
+        model: &p.sent_model,
+        requested_model: &p.requested_model,
         upstream: &p.provider,
         request_id: p.id,
+        attempt: 0,
     };
     match crate::plugin::reply::Chain::start(state, &pc.set, bridge, &ctx).await {
         Ok(Some(chain)) => {

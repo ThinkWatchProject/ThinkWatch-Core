@@ -5,6 +5,10 @@
 //!
 //! 「尝试链」要留下来：用户能看见故障转移在替他工作，**这是信任的来源**。
 //! 一个静默切换过的请求和一个一次就成的请求，在用户眼里应该是不同的。
+//!
+//! 每一跳先过插件的请求钩子（[`super::plug`]）：发往哪一家、发什么模型名这时都定了，
+//! 管这一跳的插件从客户端的原话起改，这一跳的转换、脱敏、发送用改过的那一份。换到下一
+//! 家时从原话重来；同一家重发（OAuth 换 token、去封存）用这一跳定好的请求体，不重跑。
 
 use bytes::Bytes;
 
@@ -20,6 +24,13 @@ use tw_types::msg;
 pub(super) struct Served<'a> {
     pub(super) upstream: reqwest::Response,
     pub(super) provider: &'a tw_config::Provider,
+    /// 发给它的模型名：路由规则、插件改过的是改过之后的。回答钩子的 `ctx.model` 和范围看它
+    pub(super) model: String,
+    /// 它是尝试链上的第几跳。回答钩子的运行记录按它分组
+    pub(super) attempt: usize,
+    /// 这一跳的密钥映射：跑过插件、或者管这一跳的插件里有回答钩子时才有（见
+    /// [`super::plug`]）
+    pub(super) bridge: Option<crate::plugin::bridge::Bridge>,
     /// 成功那一次的脱敏账本。**必须是成功那一次的** —— 每一跳都接着原文那本账换，
     /// 而那一跳发出去的体（可能转换过格式）里还有原文没有的值时，号是那一跳新发的
     pub(super) ledger: tw_guard::redact::replace::Ledger,
@@ -34,6 +45,35 @@ pub(super) enum Answer<'a> {
     Served(Box<Served<'a>>),
     /// 数 token 的请求由网关本地估算（见 [`crate::count`]）：要回给客户端的正文
     Estimated(Bytes),
+}
+
+/// 这一跳的客户端那种格式的请求：插件在这一跳改过的话是改过的那一份，没改过就是
+/// 客户端的原话。转换、参数改写都从它起。
+struct Asked<'r> {
+    body: &'r Bytes,
+    path: &'r str,
+    decoded: Option<&'r Result<tw_dialect::convert::Decoded, tw_dialect::ir::Rejection>>,
+}
+
+impl<'r> Asked<'r> {
+    fn of(
+        req: &'r Inbound,
+        reading: &'r crate::client_api::Reading,
+        plugged: &'r super::plug::Plugged,
+    ) -> Self {
+        match &plugged.rewritten {
+            Some(r) => Asked {
+                body: &r.body,
+                path: &r.path,
+                decoded: r.decoded.as_ref(),
+            },
+            None => Asked {
+                body: &req.body,
+                path: req.uri.path(),
+                decoded: reading.decoded.as_ref(),
+            },
+        }
+    }
 }
 
 /// 这一跳要发出去的东西。
@@ -62,6 +102,7 @@ pub(super) async fn try_upstreams<'a>(
     reading: &crate::client_api::Reading,
     decision: &tw_engine::Decision,
     started: &Started,
+    hook: &mut crate::plugin::request::Hook<'_>,
 ) -> Result<Answer<'a>, GatewayError> {
     let id = started.id;
     // 数 token（见 `crate::count`）：选中的那一家数不了就由网关估，**不换模型**
@@ -80,8 +121,11 @@ pub(super) async fn try_upstreams<'a>(
     let mut rewritten_by = started.choice.rewritten_by.clone();
     // 第二阶段拒绝了它的那条规则
     let mut denied_by: Option<String> = None;
-    // 不再试下一家的原因：第二阶段拒绝了，或者规则求不了值。**路由事件照样要发**
+    // 不再试下一家的原因：第二阶段拒绝了、规则求不了值、插件拒绝了。**路由事件照样要发**
     let mut halt: Option<GatewayError> = None;
+    // 最后发出去的那一跳，插件改过的话改过之后的请求和那一跳的账：存下来的「插件改过的
+    // 请求」就是它 —— 回答的那一家收到的那一份
+    let mut after_plugins: Option<(Bytes, tw_guard::redact::replace::Ledger)> = None;
 
     for (i, name) in started.alive.iter().enumerate() {
         // 后面没有别的候选了
@@ -125,10 +169,11 @@ pub(super) async fn try_upstreams<'a>(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let effective_set = match rt
-            .engine
-            .phase_two(&reading.facts, &provider.name, &decision.set)
-        {
+        let mut effective_set = match rt.engine.phase_two(
+            &reading.facts,
+            &provider.name,
+            &decision.set,
+        ) {
             Ok(tw_engine::Outcome2::Proceed {
                 set,
                 rewritten_by: more,
@@ -166,19 +211,18 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
-        // 这一跳要发的模型名：规则或者插件改写过、和客户端要的不一样的才记（见
-        // `AttemptView::model`）
-        let model = Some(
-            effective_set
-                .model
-                .clone()
-                .unwrap_or_else(|| reading.facts.model.clone()),
-        )
-        .filter(|m| m != req.asked_model(reading));
+        // 这一跳要发的模型名：规则改写过的是改写之后的
+        let sent = effective_set
+            .model
+            .clone()
+            .unwrap_or_else(|| reading.facts.model.clone());
+        // 改写过、和客户端要的不一样的才记（见 `AttemptView::model`）
+        let asked_other = |m: &String| *m != reading.facts.model;
         // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数
         if counting {
+            let model = Some(sent.clone()).filter(asked_other);
             match &count_model {
-                None => count_model = Some(model.clone()),
+                None => count_model = Some(model),
                 Some(first) if *first != model => {
                     attempts.pop();
                     continue;
@@ -187,7 +231,41 @@ pub(super) async fn try_upstreams<'a>(
             }
         }
 
-        let out = match prepare(state, req, reading, provider, &effective_set, id) {
+        // 插件的请求钩子：管这一跳的从客户端的原话起改。**拒绝的是整个请求**，不换下一家
+        let plugged = match super::plug::attempt(
+            state,
+            rt,
+            req,
+            reading,
+            started,
+            hook,
+            provider,
+            &sent,
+            chain.len(),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(why) => {
+                // 这一跳没有发出去。**它在尝试链上**，原因就是拒绝它的那句话
+                chain.push(hop_failed(
+                    &provider.name,
+                    Some(sent.clone()).filter(asked_other),
+                    why.clone(),
+                    hop_started,
+                ));
+                halt = Some(GatewayError::denied(why));
+                break;
+            }
+        };
+        // 插件换了发给这一家的模型名：和规则改写的一样，只是盖过它
+        if let Some(m) = &plugged.model {
+            effective_set.model = Some(m.clone());
+        }
+        let model = Some(plugged.model.clone().unwrap_or(sent)).filter(asked_other);
+
+        let asked = Asked::of(req, reading, &plugged);
+        let out = match prepare(state, req, reading, &asked, provider, &effective_set, id) {
             Ok(out) => out,
             Err(err) => {
                 chain.push(hop_failed(
@@ -205,13 +283,14 @@ pub(super) async fn try_upstreams<'a>(
         let unsealed = unseal_upfront(state, req, started, provider, &out);
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
         // 格式）。规则是全局的，每一跳换掉的是同一批东西；**接着原文那本账换**，
-        // 同一个值在每一跳、在存下来的那份请求里都是同一个占位符
-        let (body, ledger) = crate::guard::replace(
-            rt.config.security.redact.mode,
-            &rt.redact,
-            unsealed,
-            &started.ledger,
-        );
+        // 同一个值在每一跳、在存下来的那份请求里都是同一个占位符。插件改过的一跳接着
+        // 插件那本账（插件写进来的新值在那里编好了号）
+        let seed = plugged
+            .rewritten
+            .as_ref()
+            .map_or(&started.ledger, |r| &r.ledger);
+        let (body, ledger) =
+            crate::guard::replace(rt.config.security.redact.mode, &rt.redact, unsealed, seed);
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
@@ -273,6 +352,17 @@ pub(super) async fn try_upstreams<'a>(
             attempt = attempts.len(),
             "forwarding"
         );
+        // 这一跳要发出去了：插件改过的话，它收到的就是改过的那一份
+        after_plugins = plugged
+            .rewritten
+            .as_ref()
+            .map(|r| (r.body.clone(), ledger.clone()));
+        // 这一跳接下了的话，回答钩子要的
+        let sent_model = effective_set
+            .model
+            .clone()
+            .unwrap_or_else(|| reading.facts.model.clone());
+        let (attempt, bridge) = (chain.len(), plugged.bridge);
 
         let sent = send(
             state,
@@ -400,6 +490,9 @@ pub(super) async fn try_upstreams<'a>(
                         served = Some(Served {
                             upstream: r,
                             provider,
+                            model: sent_model,
+                            attempt,
+                            bridge,
                             ledger,
                             session: out.session,
                         });
@@ -496,6 +589,9 @@ pub(super) async fn try_upstreams<'a>(
                 served = Some(Served {
                     upstream: r,
                     provider,
+                    model: sent_model,
+                    attempt,
+                    bridge,
                     ledger,
                     session: out.session,
                 });
@@ -543,6 +639,25 @@ pub(super) async fn try_upstreams<'a>(
         (Some(s), None) => s.provider.billing,
         (None, None) => Default::default(),
     };
+    // 插件改过的请求：最后发出去的那一跳收到的那一份（回答的那一家收到的就是它）。
+    // 挂在请求那一行上，落盘前按那一跳的账换、打码
+    if let Some((body, ledger)) = after_plugins {
+        let len = body.len();
+        crate::bodies::offer(
+            &state.body_sink(),
+            crate::bodies::BodyRecord::new(
+                id,
+                started.at_ms as i64,
+                crate::bodies::BodyKind::AfterPlugins,
+                body,
+                len,
+                crate::bodies::Redaction {
+                    rules: rt.redact.clone(),
+                    ledger,
+                },
+            ),
+        );
+    }
     let choice = &started.choice;
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
@@ -711,12 +826,14 @@ fn unsendable_tool(
     Some(GatewayError::new(crate::error::Source::Request, msg))
 }
 
-/// 把客户端的请求改成这一跳要发的样子：同格式时只做参数改写，
-/// 跨格式时转换。转换不了就换下一家：同格式的上游可能还在后面。
+/// 把这一跳的请求（客户端那种格式，插件改过的话是改过的，见 [`Asked`]）改成要发的
+/// 样子：同格式时只做参数改写，跨格式时转换。转换不了就换下一家：同格式的上游可能
+/// 还在后面。
 fn prepare(
     state: &AppState,
     req: &Inbound,
     reading: &crate::client_api::Reading,
+    asked: &Asked<'_>,
     provider: &tw_config::Provider,
     effective_set: &tw_engine::SetAction,
     id: u64,
@@ -730,7 +847,7 @@ fn prepare(
     // 不止生成请求：数 token 这样的请求一样带着它的头，也可能带着会话日志
     let harness = reading.harness.is_some();
     let to_deepseek = tw_dialect::official::is_deepseek_host(&provider.base_url);
-    let mut path = req.uri.path().to_string();
+    let mut path = asked.path.to_string();
     let mut query = req.query.clone();
     let mut session: Option<tw_dialect::convert::Session> = None;
     let body = match target {
@@ -738,7 +855,7 @@ fn prepare(
             // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
             // 出站直通说过任何 body 改写都可能是缓存杀手，所以这是
             // 一个用户显式要求的例外，不是默认行为。
-            let out = forward::apply_set(&req.body, effective_set, client_dialect);
+            let out = forward::apply_set(asked.body, effective_set, client_dialect);
             if let (Some(tw_dialect::ir::Dialect::Gemini), Some(m)) =
                 (client_dialect, &effective_set.model)
             {
@@ -792,7 +909,7 @@ fn prepare(
             }
             if chatgpt {
                 // 客户端要整包，后端只给流：由网关收齐。收齐要知道客户端的格式，所以要一个会话
-                if let Some(Ok(d)) = &reading.decoded
+                if let Some(Ok(d)) = asked.decoded
                     && !d.request.stream
                 {
                     session = Some(
@@ -811,7 +928,7 @@ fn prepare(
             out
         }
         Some(dialect) => {
-            let d = match &reading.decoded {
+            let d = match asked.decoded {
                 Some(Ok(d)) => d,
                 other => {
                     let why = match other {
@@ -887,7 +1004,7 @@ fn prepare(
             } else if harness && to_deepseek {
                 // 转换成另一种格式发给 DeepSeek 官方：直连时它收得到的扩展照样带上
                 Bytes::from(
-                    tw_dialect::harness::carry(&req.body, &p.body).unwrap_or(p.body.clone()),
+                    tw_dialect::harness::carry(asked.body, &p.body).unwrap_or(p.body.clone()),
                 )
             } else {
                 Bytes::from(p.body.clone())
