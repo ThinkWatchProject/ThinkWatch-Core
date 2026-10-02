@@ -148,6 +148,7 @@ a time, and cannot stop core, take the diagnostic bundle or change
 | `tw-store` | Request history and runtime state on SQLite |
 | `tw-observe` | Event bus |
 | `tw-gateway` | Data plane: the life of a request |
+| `tw-plugin` | Script-plugin sandbox: QuickJS compiled to WebAssembly, run by Wasmtime |
 | `tw-control` | Control-plane server |
 
 ThinkWatch Enterprise depends only on the first four, which depend only on one
@@ -156,11 +157,32 @@ ThinkWatch Lite pins `tw-api`, `tw-types`, `tw-yaml`, `tw-guard`, `tw-watch` and
 `tw-link` to a release tag and bundles the `twcore` of the same release. Setting
 up AI clients and scanning their configuration happen in Lite, on the machine
 it runs on; `twcore` issues each client its own gateway key. The binary lives
-in `bin/twcore`.
+in `bin/twcore`. Only `tw-gateway` and `twcore` may depend on `tw-plugin`, the
+one crate whose build needs more than Rust (see below), so building Lite or
+Enterprise against these crates never does.
 
 ## Build and test
 
-Requires a recent stable Rust toolchain (1.94.1 or later).
+Requires a recent stable Rust toolchain (1.94.1 or later), plus an LLVM `clang`
+that can compile C to WebAssembly and the `llvm-ar` that comes with it. The
+plugin sandbox (`tw-plugin`) compiles QuickJS to WebAssembly while it builds;
+Apple's clang cannot target WebAssembly.
+
+| System | Install |
+|---|---|
+| macOS | `brew install llvm` (found where Homebrew puts it; it does not need to be on `PATH`) |
+| Debian, Ubuntu | `sudo apt install clang llvm` |
+| Fedora | `sudo dnf install clang llvm` |
+| Windows | the LLVM installer from [LLVM's releases](https://github.com/llvm/llvm-project/releases), or `winget install LLVM.LLVM` |
+
+The build tries Homebrew's LLVM, then `clang` and `clang-N` (`clang-19`,
+`clang-18`, …) on `PATH`, and uses the first that really produces WebAssembly.
+To pick one yourself, set `TW_WASM_CLANG`, and `TW_WASM_AR` when its `llvm-ar`
+is not next to it. Rust's `wasm32-unknown-unknown` target is listed in
+`rust-toolchain.toml`, so rustup installs it; the linking is done by the
+`rust-lld` that ships with Rust. Nothing is downloaded during the build. Each
+build records which clang it used and the SHA-256 of the WebAssembly module
+(`tw_plugin::GUEST_CLANG`, `tw_plugin::GUEST_WASM_SHA256`).
 
 ```sh
 cargo build --release -p twcore     # target/release/twcore

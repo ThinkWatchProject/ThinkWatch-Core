@@ -62,6 +62,19 @@ cargo test --workspace
 ./scripts/smoke.sh
 ```
 
+Building `tw-plugin` needs an LLVM clang that targets WebAssembly; the README's
+"Build and test" says how to install one. If you changed
+`crates/tw-plugin/guest`, which is not a workspace member, check it on its own
+as well (on macOS with Homebrew's LLVM):
+
+```bash
+cargo fmt --manifest-path crates/tw-plugin/guest/Cargo.toml -- --check
+CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang" \
+AR_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/llvm-ar" \
+  cargo clippy --manifest-path crates/tw-plugin/guest/Cargo.toml --target wasm32-unknown-unknown \
+  --target-dir target/tw-plugin-guest -- -D warnings
+```
+
 Warnings are errors, and relaxing that on CI is the same as removing it.
 The toolchain is `stable`, so a newer stable than your local one can
 surface lints you cannot reproduce — `rustup update stable` before
@@ -104,6 +117,33 @@ clean the diff is:
   Windows loopback port, and the remote control port) hands its
   connections to the same handshake before HTTP. The control key never
   leaves through the control plane and cannot be changed through it.
+
+## The plugin sandbox
+
+Script plugins run in `tw-plugin`: QuickJS-ng, from the pinned `rquickjs-sys`
+crate, compiled to `wasm32-unknown-unknown` and run by Wasmtime. Its
+`build.rs` does three things on every build, and nothing is committed or
+downloaded:
+
+1. **Compile the guest** (`crates/tw-plugin/guest`, outside the workspace,
+   with its own `Cargo.lock`) with the clang it finds. The module may import
+   two functions, a log line and the clock; the build fails if it imports
+   anything else.
+2. **Snapshot it.** It runs the bridge script (`src/bridge.js`) once inside the
+   module and writes the initialized memory back into it, so every sandbox
+   starts with QuickJS already set up.
+3. **Precompile it** with Cranelift for the target being built, cross targets
+   included. The binary embeds the result and contains only Wasmtime's
+   runtime, no compiler.
+
+Wasmtime is pinned to one exact version both as a dependency and as a
+build-dependency: a precompiled module only loads in the Wasmtime version, and
+with the settings (`src/engine.rs`), it was compiled with. Upgrade both
+together.
+
+Only `tw-gateway` and `twcore` may depend on `tw-plugin`.
+`crates/tw-plugin/tests/boundary.rs` fails when a crate that Lite or
+Enterprise builds reaches it, because their builds would suddenly need clang.
 
 ## The configuration reference
 
