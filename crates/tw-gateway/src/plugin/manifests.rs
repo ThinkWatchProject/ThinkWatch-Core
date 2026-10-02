@@ -23,8 +23,8 @@ use crate::plugin::set::Scope;
 /// 文件名，在插件目录里。点开头：它不是插件
 pub const FILE: &str = ".manifests.json";
 
-/// 这份格式自己的版本。**manifest 的读法或者这里的写法改了就加一**
-const FORMAT: u32 = 1;
+/// 这份格式自己的版本。**manifest 的读法或者这里的写法改了就加一**（2：多了 `requests`）
+const FORMAT: u32 = 2;
 
 /// 缓存认的版本：core 的版本、沙箱的哈希、这份格式的版本，三样有一样不同就不认
 pub fn version() -> String {
@@ -58,6 +58,7 @@ pub(crate) struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     permissions: Vec<tw_api::Permission>,
+    requests: Vec<tw_api::RequestKind>,
     scope: ScopeEntry,
     reply_mode: tw_api::ReplyMode,
     settings: Vec<SettingEntry>,
@@ -97,6 +98,7 @@ impl From<&Manifest> for Entry {
             api: m.api,
             description: m.description.clone(),
             permissions: m.permissions.clone(),
+            requests: m.requests.clone(),
             scope: ScopeEntry {
                 clients: m.scope.clients.clone(),
                 models: m.scope.models.clone(),
@@ -130,6 +132,7 @@ impl From<&Entry> for Manifest {
             api: e.api,
             description: e.description.clone(),
             permissions: e.permissions.clone(),
+            requests: e.requests.clone(),
             scope: Scope {
                 clients: e.scope.clients.clone(),
                 models: e.scope.models.clone(),
@@ -286,6 +289,7 @@ mod tests {
             api: 1,
             description: Some("在系统提示里写上今天的日期".into()),
             permissions: vec![tw_api::Permission::System],
+            requests: vec![tw_api::RequestKind::Conversation],
             scope: Scope {
                 clients: vec![],
                 models: vec!["deepseek*".into()],

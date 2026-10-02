@@ -179,6 +179,42 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
         ));
     }
 
+    // 处理哪几种请求：没写是只有对话。每一种都要有权限碰得到它，每个权限都要用得上
+    let requests = match &m["requests"] {
+        serde_json::Value::Null => crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
+        serde_json::Value::Array(a) if !a.is_empty() => {
+            let mut out = Vec::new();
+            for r in a {
+                let kind = r
+                    .as_str()
+                    .and_then(tw_api::RequestKind::from_slug)
+                    .ok_or_else(|| bad(format!("`{r}` in requests is not a kind of request")))?;
+                if out.contains(&kind) {
+                    return Err(bad(format!("`{r}` is listed twice in requests")));
+                }
+                out.push(kind);
+            }
+            out.sort_by_key(|k| tw_api::RequestKind::ALL.iter().position(|x| x == k));
+            out
+        }
+        _ => return Err(bad("requests has to be a non-empty list")),
+    };
+    let inputs = [tw_api::Permission::Messages, tw_api::Permission::Params];
+    let conversation = requests.contains(&tw_api::RequestKind::Conversation);
+    if requests
+        .iter()
+        .any(|k| *k != tw_api::RequestKind::Conversation && !inputs.iter().any(|p| has(*p)))
+    {
+        return Err(bad(
+            "embeddings and completions requests need the permission messages or params",
+        ));
+    }
+    if !conversation && permissions.iter().any(|p| !inputs.contains(p)) {
+        return Err(bad(
+            "a permission other than messages and params needs \"conversation\" in requests",
+        ));
+    }
+
     let list = |v: &serde_json::Value| -> Result<Vec<String>, LoadError> {
         match v {
             serde_json::Value::Null => Ok(Vec::new()),
@@ -238,6 +274,7 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
         api,
         description,
         permissions,
+        requests,
         scope,
         reply_mode,
         settings,
@@ -287,6 +324,35 @@ mod tests {
             FakeEngine.load(tool.as_bytes()),
             Err(LoadError::Manifest(_))
         ));
+    }
+
+    /// `requests` 照沙箱的规矩读：没写是只有对话；每一种都要有权限碰得到它
+    #[test]
+    fn requests_default_to_conversations_and_follow_the_sandbox_rules() {
+        use tw_api::RequestKind::*;
+        let load = |m: serde_json::Value| FakeEngine.load(source(m, &["onRequest"]).as_bytes());
+        let m = load(json!({"name": "n", "api": 1, "permissions": ["messages"]})).unwrap();
+        assert_eq!(m.manifest().requests, [Conversation]);
+        let m = load(json!({"name": "n", "api": 1, "permissions": ["messages"],
+                            "requests": ["embeddings", "conversation"]}))
+        .unwrap();
+        assert_eq!(m.manifest().requests, [Conversation, Embeddings]);
+        for requests in [
+            json!([]),
+            json!(["images"]),
+            json!(["completions", "completions"]),
+        ] {
+            let r = load(json!({"name": "n", "api": 1, "permissions": ["messages"],
+                                "requests": requests}));
+            assert!(matches!(r, Err(LoadError::Manifest(_))), "{requests}");
+        }
+        let only_system = load(json!({"name": "n", "api": 1, "permissions": ["system"],
+                                      "requests": ["conversation", "embeddings"]}));
+        assert!(matches!(only_system, Err(LoadError::Manifest(_))));
+        let no_conversation = load(json!({"name": "n", "api": 1,
+                                          "permissions": ["system", "messages"],
+                                          "requests": ["embeddings"]}));
+        assert!(matches!(no_conversation, Err(LoadError::Manifest(_))));
     }
 
     #[test]

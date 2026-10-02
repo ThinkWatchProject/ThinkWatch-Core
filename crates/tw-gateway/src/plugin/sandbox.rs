@@ -171,8 +171,17 @@ fn permission(p: tw_plugin::Permission) -> tw_api::Permission {
     }
 }
 
+fn request_kind(k: tw_plugin::RequestKind) -> tw_api::RequestKind {
+    match k {
+        tw_plugin::RequestKind::Conversation => tw_api::RequestKind::Conversation,
+        tw_plugin::RequestKind::Embeddings => tw_api::RequestKind::Embeddings,
+        tw_plugin::RequestKind::Completions => tw_api::RequestKind::Completions,
+    }
+}
+
 fn manifest(m: &tw_plugin::Manifest) -> Manifest {
     let granted: Vec<tw_api::Permission> = m.permissions.iter().copied().map(permission).collect();
+    let handled: Vec<tw_api::RequestKind> = m.requests.iter().copied().map(request_kind).collect();
     Manifest {
         name: m.name.clone(),
         api: m.api,
@@ -182,6 +191,11 @@ fn manifest(m: &tw_plugin::Manifest) -> Manifest {
             .iter()
             .copied()
             .filter(|p| granted.contains(p))
+            .collect(),
+        requests: tw_api::RequestKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| handled.contains(k))
             .collect(),
         scope: Scope {
             clients: m.scope.clients.clone(),

@@ -18,7 +18,8 @@
 //! 1. 读出这一刻的请求（前一个插件改过的话就是改过的）的视图，按权限裁掉没给的部分；
 //! 2. 认得出的密钥换成占位符（[`super::bridge`]）；
 //! 3. 在插件线程池上调 `onRequest`；
-//! 4. 核对交回来的东西（[`super::view::check`]），占位符换回去，写回原文。
+//! 4. 核对交回来的东西（[`super::view::Src::check`]，按这种请求的规矩），占位符换回去，
+//!    写回原文。
 //!
 //! 插件 `reject` 了，或者出错而它的 `on_error` 是拒绝，**整个请求被拒**，不换下一家：
 //! 换一家，管它的还是这个插件。文件变了、装不上的插件跑不了，管得着这一次的同样按
@@ -26,15 +27,22 @@
 //!
 //! # 哪些请求过插件
 //!
-//! **发往上游的每一个请求体都过**，不只生成回答的那些 —— 插件删掉的东西，不能从旁边的
-//! 接口漏出去（见 [`Shape`]）：
+//! 按客户端调的接口分成几种（见 [`Shape`]），**插件只处理它声明了的那几种**（manifest
+//! 的 `requests`，不写是只有对话）：
 //!
-//! - 生成回答：上面说的那样；
-//! - 数 token（Anthropic 的 `count_tokens`、Gemini 的 `:countTokens`、Responses 的
-//!   `input_tokens`）、Responses 的压缩：请求体就是一段对话，插件照样看、照样改，上游数的、
-//!   压的是改过的那一份。网关自己估数、一个字节都不发的那几种不跑插件；
-//! - 嵌入、旧版补全、认不出的接口：插件看不懂它们的请求体。管得着的插件按它的
-//!   `on_error`：拒绝就拒掉整个请求，跳过就原样发、记一笔跳过。
+//! - 对话 —— 生成回答：上面说的那样；数 token（Anthropic 的 `count_tokens`、Gemini 的
+//!   `:countTokens`、Responses 的 `input_tokens`）、Responses 的压缩：请求体就是一段对话，
+//!   插件照样看、照样改，上游数的、压的是改过的那一份 —— 插件删掉的东西不能从旁边的接口
+//!   漏出去。网关自己估数、一个字节都不发的那几种不跑插件；
+//! - 嵌入（OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、`:batchEmbedContents`）、
+//!   旧版补全（OpenAI 的 `/v1/completions`）：一项输入一条消息，只改得了文字（见
+//!   [`super::view::inputs`]）。回答钩子不在它们上面跑；
+//! - 别的接口（图片、音频、认不出的）：不属于任何一种，**所有插件都不管**。
+//!
+//! 没声明这一种的插件**不在这一次的范围里**：请求原样过去，什么都不记，它出错、文件
+//! 变了、装不上也拦不着这种请求 —— 不管它的 `on_error` 是什么。声明了的那几种里，请求体
+//! 读不出来（不是 JSON 之类）时，管得着的插件按它的 `on_error`：拒绝就拒掉整个请求，跳过
+//! 就原样发、记一笔跳过（`gw.plugin.cannot_read_body`）。
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -57,15 +65,19 @@ pub type Ran = (Arc<Active>, PluginRun, Vec<LogLine>);
 /// 插件怎么看一个请求体：按客户端调的接口分（见 [`crate::client_api::ClientApi`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
-    /// 生成回答
+    /// 生成回答（一段对话）
     Generate,
     /// 请求体和生成回答同一种形状、却不生成回答的接口：数 token、Responses 的压缩（见
-    /// [`crate::client_api::ClientApi::like_generation`]）。插件照样看、照样改，**`params`
-    /// 里只写回模型名**：这些接口不收输出上限、温度这些参数（带上是一个 400），数出来的
-    /// token 也和它们无关
+    /// [`crate::client_api::ClientApi::like_generation`]）。也算对话：插件照样看、照样改，
+    /// **`params` 里只写回模型名** —— 这些接口不收输出上限、温度这些参数（带上是一个
+    /// 400），数出来的 token 也和它们无关
     Alike,
-    /// 嵌入、旧版补全、认不出的接口：**插件看不懂这种请求体**（见 [`unreadable`]）
-    Opaque,
+    /// 嵌入：OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、`:batchEmbedContents`
+    Embeddings,
+    /// 旧版补全：OpenAI 的 `/v1/completions`
+    Completions,
+    /// 别的接口（图片、音频、认不出的……）：**不属于任何一种，插件一律不管**
+    Other,
 }
 
 impl Shape {
@@ -73,13 +85,28 @@ impl Shape {
     pub fn of(path: &str) -> Shape {
         use crate::client_api::ClientApi;
         if ClientApi::of_path(path).is_none() {
-            Shape::Opaque
+            Shape::Other
         } else if ClientApi::generates(path) {
             Shape::Generate
         } else if ClientApi::like_generation(path) {
             Shape::Alike
+        } else if ClientApi::embeds(path) {
+            Shape::Embeddings
+        } else if ClientApi::completes(path) {
+            Shape::Completions
         } else {
-            Shape::Opaque
+            Shape::Other
+        }
+    }
+
+    /// 插件怎么读这种请求体。`dialect` 是客户端的格式。**插件不管的接口是 None**
+    pub fn form(self, dialect: Dialect) -> Option<view::Form> {
+        match self {
+            Shape::Generate | Shape::Alike => Some(view::Form::Conversation(dialect)),
+            Shape::Embeddings if dialect == Dialect::Gemini => Some(view::Form::GeminiEmbed),
+            Shape::Embeddings => Some(view::Form::OpenaiEmbeddings),
+            Shape::Completions => Some(view::Form::OpenaiCompletions),
+            Shape::Other => None,
         }
     }
 }
@@ -101,6 +128,8 @@ pub struct Hook<'a> {
     body: &'a Bytes,
     /// 原文解析出来的 JSON。第一次有插件要跑时才解析
     parsed: Option<Option<Value>>,
+    /// 原文读不读得成插件的视图：读不成时是原因。和 `parsed` 一起第一次要用时才看
+    readable: Option<Result<(), String>>,
     /// 按原文编好号的那本账。第一次要用时才编
     base: Option<Bridge>,
 }
@@ -137,6 +166,9 @@ pub struct Changed {
     pub path: String,
     /// 插件改了 `params.model` 的话，发给这一家的新模型名
     pub renamed: Option<Renamed>,
+    /// 嵌入、旧版补全：改前、改后请求防护各看哪一份（见 [`view::inputs::screenable`]）。
+    /// 它们没有中间表示，管线拿这两份比，只看插件加进来的。对话是 None：管线自己解码
+    pub screen: Option<(tw_dialect::ir::Request, tw_dialect::ir::Request)>,
 }
 
 /// 插件换了发给这一家的模型名。
@@ -170,6 +202,7 @@ impl<'a> Hook<'a> {
             client,
             body,
             parsed: None,
+            readable: None,
             base: None,
         }
     }
@@ -187,13 +220,19 @@ impl<'a> Hook<'a> {
     }
 
     /// 发往 `to` 之前跑一遍管这一次的插件。**从客户端的原话起**，上一次尝试改过什么
-    /// 都不算。管这一次的一个都没有时什么都不做，连请求体都不解析。
+    /// 都不算。管这一次的一个都没有时什么都不做，连请求体都不解析：插件不管的接口、
+    /// 插件没声明的那种请求都是这样 —— 原样发，什么都不记。
     pub async fn attempt(&mut self, pool: &Pool, to: &Target<'_>) -> Result<Plugged, Box<Refused>> {
         let mut out = Plugged::default();
         if self.set.is_empty() {
             return Ok(out);
         }
-        let here = self.set.for_request(self.client, to.model, to.upstream);
+        let Some(form) = self.shape.form(self.dialect) else {
+            return Ok(out);
+        };
+        let here = self
+            .set
+            .for_request(form.kind(), self.client, to.model, to.upstream);
         if here.is_empty() {
             // 回答钩子要这个请求的密钥映射：管这一次的里面有，就现在记账。不生成回答的
             // 请求没有回答钩子可跑
@@ -207,19 +246,28 @@ impl<'a> Hook<'a> {
             }
             return Ok(out);
         }
-        if self.shape == Shape::Opaque {
-            // 空的请求体里没有插件能改的东西
-            if !self.body.iter().all(u8::is_ascii_whitespace) {
-                out.runs = unreadable(self.set, self.client, self.path, to)?;
-            }
-            return Ok(out);
-        }
         let mut bridge = self.base();
         let (body, dialect, client, shape) = (self.body, self.dialect, self.client, self.shape);
         let original = self
             .parsed
             .get_or_insert_with(|| serde_json::from_slice::<Value>(body).ok())
             .as_ref();
+        // 这种请求插件读得懂，这一个却读不成视图：管这一次的插件一个都跑不了，各按各的
+        // `on_error`。回答钩子照样要这本账（生成回答的请求，上游也许认得它）
+        let path = self.path;
+        let readable = self
+            .readable
+            .get_or_insert_with(|| match original {
+                None => Err("the request body is not JSON".into()),
+                Some(v) => view::build(form, wrapped_count(dialect, path, v).unwrap_or(v), path)
+                    .map(|_| ()),
+            })
+            .clone();
+        if let Err(why) = readable {
+            out.runs = unreadable(here, &why, to.attempt)?;
+            out.bridge = Some(bridge);
+            return Ok(out);
+        }
         let mut raw: Option<Cow<'_, Value>> = original.map(Cow::Borrowed);
         let mut path = self.path.to_string();
         // 发给这一家的模型名：前一个插件改了 `params.model`，后面的看到的就是新的
@@ -256,9 +304,8 @@ impl<'a> Hook<'a> {
                 let Some(current) = raw.as_deref() else {
                     return Err(Failure::Unreadable("the request body is not JSON".into()));
                 };
-                let conversation = wrapped_count(dialect, &path, current).unwrap_or(current);
-                let mut built =
-                    view::build(dialect, conversation, &path).map_err(Failure::Unreadable)?;
+                let readable = wrapped_count(dialect, &path, current).unwrap_or(current);
+                let mut built = view::build(form, readable, &path).map_err(Failure::Unreadable)?;
                 sending(&mut built.view, &model);
                 let mut input = view::trim(&built.view, &a.permissions);
                 bridge.hide_value(&mut input);
@@ -266,7 +313,7 @@ impl<'a> Hook<'a> {
                     client,
                     &model,
                     to.requested_model,
-                    dialect,
+                    form.name(),
                     to.upstream,
                     &a.settings,
                 );
@@ -281,13 +328,10 @@ impl<'a> Hook<'a> {
                     RequestOutcome::Unchanged => Ok(None),
                     RequestOutcome::Rejected(reason) => Err(Failure::Rejected(reason)),
                     RequestOutcome::Changed(returned) => {
-                        let mut edits = view::check(
-                            &input,
-                            &returned,
-                            &a.permissions,
-                            built.src.hidden_tools(),
-                        )
-                        .map_err(Failure::Edit)?;
+                        let mut edits = built
+                            .src
+                            .check(&input, &returned, &a.permissions)
+                            .map_err(Failure::Edit)?;
                         if shape == Shape::Alike {
                             model_only(&mut edits);
                         }
@@ -357,6 +401,13 @@ impl<'a> Hook<'a> {
         }
         if changed && let Some(v) = raw {
             let value = v.into_owned();
+            let screen = match (form, original) {
+                (view::Form::Conversation(_), _) | (_, None) => None,
+                (f, Some(before)) => Some((
+                    view::inputs::screenable(f, before, self.path),
+                    view::inputs::screenable(f, &value, &path),
+                )),
+            };
             match serde_json::to_vec(&value) {
                 Ok(b) => {
                     out.changed = Some(Changed {
@@ -364,6 +415,7 @@ impl<'a> Hook<'a> {
                         value,
                         path,
                         renamed: renamed_by.map(|by| Renamed { model, by }),
+                        screen,
                     })
                 }
                 // 序列化不该失败；真失败了就当没改过，不发半个请求体
@@ -377,36 +429,27 @@ impl<'a> Hook<'a> {
     }
 }
 
-/// 插件看不懂、却要发往上游的东西：[`Shape::Opaque`] 的请求体，不是 Responses 的
-/// WebSocket 连接上的帧。管这一次的插件一个都跑不了 —— 跑不了的插件（文件变了、装不上）
-/// 照旧，能跑的按它的 `on_error`：拒绝就拒掉整个请求，跳过就原样发、记一笔跳过。`path`
-/// 是客户端调的路径，报出来的就是它
-pub fn unreadable(
-    set: &PluginSet,
-    client: Option<&str>,
-    path: &str,
-    to: &Target<'_>,
-) -> Result<Vec<Ran>, Box<Refused>> {
+/// 这种请求插件读得懂、这一个的请求体却读不成视图（不是 JSON 之类）：`here` 里管这一次
+/// 的插件一个都跑不了。跑不了的插件（文件变了、装不上）照旧，能跑的按它的 `on_error`：
+/// 拒绝就拒掉整个请求，跳过就原样发、记一笔跳过。`why` 是读不成的原因
+fn unreadable(here: Vec<Arc<Active>>, why: &str, attempt: usize) -> Result<Vec<Ran>, Box<Refused>> {
     let mut runs = Vec::new();
-    for a in set.for_request(client, to.model, to.upstream) {
+    for a in here {
         let (outcome, error, refusal) = match &a.state {
-            super::set::State::Broken(why) => {
-                let (outcome, refusal) = broken(a.on_error, &a.name, why);
-                (outcome, broken_reason(&a.name, why), refusal)
+            super::set::State::Broken(b) => {
+                let (outcome, refusal) = broken(a.on_error, &a.name, b);
+                (outcome, broken_reason(&a.name, b), refusal)
             }
             super::set::State::Ready(_) => {
-                let why = cannot_read(&a.name, path);
+                let why = cannot_read(&a.name, why);
                 match a.on_error {
                     OnError::Skip => (PluginOutcome::Skipped, why, None),
                     OnError::Reject => (PluginOutcome::Error, why.clone(), Some(why)),
                 }
             }
         };
-        runs.push((
-            a.clone(),
-            not_run(&a, outcome, error, to.attempt),
-            Vec::new(),
-        ));
+        let run = not_run(&a, outcome, error, attempt);
+        runs.push((a, run, Vec::new()));
         if let Some(why) = refusal {
             return Err(Box::new(Refused { why, runs }));
         }
@@ -414,7 +457,7 @@ pub fn unreadable(
     Ok(runs)
 }
 
-/// 没跑的一次：跑不了的插件，看不懂的请求
+/// 没跑的一次：跑不了的插件，读不出来的请求体
 fn not_run(a: &Active, outcome: PluginOutcome, error: Msg, attempt: usize) -> PluginRun {
     PluginRun {
         plugin_id: a.id.clone(),
@@ -427,11 +470,12 @@ fn not_run(a: &Active, outcome: PluginOutcome, error: Msg, attempt: usize) -> Pl
     }
 }
 
-/// 插件看不懂这个接口的请求体（见 [`unreadable`]）
-pub(super) fn cannot_read(plugin: &str, path: &str) -> Msg {
+/// 插件声明了这种请求，这一个的请求体却读不成它的视图（见 [`unreadable`]）。`detail`
+/// 是读不成的原因
+pub(super) fn cannot_read(plugin: &str, detail: &str) -> Msg {
     msg!(
-        "gw.plugin.cannot_read", plugin = plugin, path = path =>
-        "Plugin `{plugin}` cannot read requests to {path}."
+        "gw.plugin.cannot_read_body", plugin = plugin, detail = detail =>
+        "Plugin `{plugin}` cannot read this request: {detail}"
     )
 }
 
@@ -527,12 +571,13 @@ pub fn asked_model(dialect: Dialect, path: &str, raw: Option<&Value>) -> String 
 }
 
 /// 插件看到的 `ctx`。请求钩子和回答钩子是同一个样子：`model` 是发给上游的模型名，
-/// `requested_model` 是客户端要的，`upstream` 是这一次发往的那一家
+/// `requested_model` 是客户端要的，`format` 是请求体的写法（[`view::Form::name`]），
+/// `upstream` 是这一次发往的那一家
 pub fn ctx(
     client: Option<&str>,
     model: &str,
     requested_model: &str,
-    dialect: Dialect,
+    format: &str,
     upstream: &str,
     settings: &serde_json::Map<String, Value>,
 ) -> Value {
@@ -540,7 +585,7 @@ pub fn ctx(
         "client": client,
         "model": model,
         "requested_model": requested_model,
-        "format": super::format_name(dialect),
+        "format": format,
         "upstream": upstream,
         "settings": settings,
     })

@@ -1478,3 +1478,111 @@ export function onRequest(req, ctx) {
     assert_eq!(v["status"], json!({"kind": "ok"}));
     assert_eq!(v["settings_schema"][0]["default"], "tomorrow");
 }
+
+/// 试跑记下的嵌入请求，从控制面一路到真的沙箱：声明了嵌入的插件跑在一项输入一条消息的
+/// 视图上，前后两份打着码，回答钩子不试；`inspect` 和列表说得出它处理哪几种请求。只处理
+/// 对话的插件说清它当时没跑
+#[tokio::test]
+async fn a_trial_on_a_recorded_embeddings_request_runs_only_plugins_that_declare_embeddings() {
+    let b = bed_with("real", false);
+    let scrub = r#"export const manifest = {
+  name: "Scrub inputs",
+  api: 1,
+  permissions: ["messages"],
+  requests: ["conversation", "embeddings"],
+};
+export function onRequest(req, ctx) {
+  console.log(ctx.format);
+  for (const m of req.messages) {
+    for (const p of m.parts) {
+      if (p.type === "text") p.text = p.text.replaceAll("PROJECT-X", "[removed]");
+    }
+  }
+  return req;
+}
+"#;
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": scrub})),
+    )
+    .await;
+    assert_eq!(
+        v["manifest"]["requests"],
+        json!(["conversation", "embeddings"]),
+        "{v}"
+    );
+    let id = b.install(scrub, json!({})).await;
+    assert_eq!(
+        b.plugin(&id).await["requests"],
+        json!(["conversation", "embeddings"])
+    );
+    let key = "sk-ant-api03-TRIALKEYAAAAAAAAAAAAAAAAAAAA";
+    let request = json!({
+        "model": "text-embedding-3-small",
+        "input": ["PROJECT-X roadmap", format!("key {key}"), [101, 102]]
+    })
+    .to_string();
+    let answer =
+        json!({"object": "list", "data": [], "model": "text-embedding-3-small"}).to_string();
+    let mut embeddings = row(9, 1_000);
+    embeddings.path = "/v1/embeddings".into();
+    embeddings.provider = "openai".into();
+    embeddings.model = "text-embedding-3-small".into();
+    embeddings.sent_model = "text-embedding-3-small".into();
+    {
+        let g = b.store.lock().await;
+        g.db().insert(&embeddings).unwrap();
+        g.record_body(
+            1_000,
+            9,
+            tw_store::Which::Request,
+            request.as_bytes(),
+            request.len(),
+        );
+        g.record_body(
+            1_000,
+            9,
+            tw_store::Which::Response,
+            answer.as_bytes(),
+            answer.len(),
+        );
+    }
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["error"].is_null(), "{v}");
+    assert!(v["reply"].is_null(), "{v}");
+    assert_eq!(v["request"]["outcome"], "changed", "{v}");
+    let after: Value = serde_json::from_str(v["request"]["after"].as_str().unwrap()).unwrap();
+    assert_eq!(after["input"][0], "[removed] roadmap");
+    assert_eq!(after["input"][2], json!([101, 102]));
+    assert!(
+        !v.to_string().contains("TRIALKEY"),
+        "a secret was shown: {v}"
+    );
+    assert_eq!(v["logs"][0]["text"], "openai_embeddings", "{v}");
+
+    // 只处理对话的插件：当时它就不在这个请求的范围里
+    let chat_only = r#"export const manifest = { name: "Chat only", api: 1, permissions: ["messages"] };
+export function onRequest(req) { return req; }
+"#;
+    let other = b.install(chat_only, json!({})).await;
+    assert_eq!(b.plugin(&other).await["requests"], json!(["conversation"]));
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{other}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["request"].is_null(), "{v}");
+    assert_eq!(v["error"]["code"], "gw.plugin.not_declared", "{v}");
+}

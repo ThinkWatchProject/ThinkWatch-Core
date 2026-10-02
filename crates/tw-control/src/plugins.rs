@@ -126,6 +126,7 @@ fn view(a: &Active, entry: &tw_config::Plugin) -> tw_api::PluginView {
         enabled: a.enabled,
         on_error: a.on_error,
         permissions: a.permissions.clone(),
+        requests: a.requests.clone(),
         scope: scope_view(&entry.scope),
         reply_mode: a.reply_mode,
         settings_schema: m.map(schema).unwrap_or_default(),
@@ -171,6 +172,7 @@ fn manifest_view(m: &Manifest) -> tw_api::ManifestView {
         name: m.name.clone(),
         description: m.description.clone(),
         permissions: m.permissions.clone(),
+        requests: m.requests.clone(),
         scope: tw_api::PluginScope {
             clients: m.scope.clients.clone(),
             models: m.scope.models.clone(),
@@ -1050,6 +1052,7 @@ async fn awaken(s: &ControlState, a: &Active) -> Result<Active, Msg> {
         on_error: a.on_error,
         scope: a.scope.clone(),
         permissions: m.permissions.clone(),
+        requests: m.requests.clone(),
         reply_mode: m.reply_mode,
         hooks: m.hooks,
         settings,

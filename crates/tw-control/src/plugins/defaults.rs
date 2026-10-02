@@ -11,7 +11,8 @@
 //!   哈希是发出去的那份字节的 —— 再记下来；
 //! - **给过、配置里还在、文件和批准的都还是给出去的那一份，而 core 带的已经是新版**：
 //!   换文件、底稿和配置里的哈希；开关、出错时怎么办、范围和还声明着的设置照旧，新声明的
-//!   设置取默认值；**新版要了旧版没要的权限就停用**；记下新版；
+//!   设置取默认值；**新版要了旧版没要的权限、或者多处理了一种请求（`requests`），就停用**；
+//!   记下新版；
 //! - **给过、配置里没有了**：用户删的。**不再加回去**；
 //! - **给过、文件被用户改过**（或者批准的已经是别的一份）：不动。
 //!
@@ -84,7 +85,8 @@ pub struct Seeded {
     pub added: Vec<String>,
     /// 换成了新版的
     pub updated: Vec<String>,
-    /// 换成新版时停用了的：开着，而新版要了旧版没要的权限。也在 `updated` 里
+    /// 换成新版时停用了的：开着，而新版要了旧版没要的权限、或者多处理了一种请求。也在
+    /// `updated` 里
     pub disabled: Vec<String>,
     /// 只记了一笔「给过了」的：用户自己的插件占着这个 id，或者新版已经装上了
     pub marked: Vec<String>,
@@ -259,7 +261,8 @@ impl Seeder {
                                 continue;
                             }
                         };
-                        // 旧版要过哪些权限。读不出来就当新版多要了 —— 宁可停用
+                        // 旧版要过哪些权限、处理哪几种请求。读不出来就当新版多要了 —— 宁可停用。
+                        // 多处理一种请求和多要一个权限一样：插件看得到、改得了的东西变多了
                         let more = if p.enabled {
                             let old = match bytes {
                                 Some(b) => compile(mgr, &b, false).await.ok(),
@@ -267,6 +270,7 @@ impl Seeder {
                             };
                             old.as_ref().is_none_or(|old| {
                                 new.permissions.iter().any(|x| !old.permissions.contains(x))
+                                    || new.requests.iter().any(|k| !old.requests.contains(k))
                             })
                         } else {
                             false

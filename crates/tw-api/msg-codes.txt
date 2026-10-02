@@ -282,7 +282,7 @@ gw.output_limit.withheld
 gw.plugin.answer_unreadable
 gw.plugin.api
 gw.plugin.bad_output
-gw.plugin.cannot_read
+gw.plugin.cannot_read_body
 gw.plugin.changed
 gw.plugin.cpu_limit
 gw.plugin.engine
@@ -291,6 +291,8 @@ gw.plugin.file_changed
 gw.plugin.manifest
 gw.plugin.memory_limit
 gw.plugin.model_not_allowed
+gw.plugin.not_applicable
+gw.plugin.not_declared
 gw.plugin.not_located
 gw.plugin.nothing_to_try
 gw.plugin.output_limit

@@ -199,6 +199,8 @@ pub struct Manifest {
     pub api: u32,
     pub description: Option<String>,
     pub permissions: BTreeSet<Permission>,
+    /// 插件处理哪几种请求（清单里的 `requests`）。没写是只有对话
+    pub requests: BTreeSet<RequestKind>,
     pub scope: Scope,
     pub reply_mode: ReplyMode,
     /// 按作者写的先后
@@ -252,6 +254,56 @@ impl Permission {
 
     pub fn from_manifest(s: &str) -> Option<Permission> {
         Permission::ALL.into_iter().find(|p| p.manifest_name() == s)
+    }
+}
+
+/// 一种请求（清单里 `requests` 的一项）。**插件只处理它声明了的那几种**：别的种类的
+/// 请求不过它，出了什么错也和它无关
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// 对话：Anthropic Messages、OpenAI Chat、Responses、Gemini 的生成，连同它们的数 token
+    /// 和压缩。不写 `requests` 时就是只有它
+    Conversation,
+    /// 嵌入：OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、`:batchEmbedContents`
+    Embeddings,
+    /// 旧版补全：OpenAI 的 `/v1/completions`
+    Completions,
+}
+
+impl RequestKind {
+    pub const ALL: [RequestKind; 3] = [
+        RequestKind::Conversation,
+        RequestKind::Embeddings,
+        RequestKind::Completions,
+    ];
+
+    /// 清单和控制面里都是这个词
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestKind::Conversation => "conversation",
+            RequestKind::Embeddings => "embeddings",
+            RequestKind::Completions => "completions",
+        }
+    }
+
+    pub fn from_manifest(s: &str) -> Option<RequestKind> {
+        RequestKind::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    /// 管得着这种请求的权限：它的视图里有的那几节，加上只在对话上跑的回答钩子。
+    ///
+    /// 嵌入和旧版补全的视图只有 `messages`（每项输入一条）和 `params`，没有系统提示、
+    /// 没有工具，回答钩子也不在它们上面跑
+    pub fn reached_by(self) -> &'static [Permission] {
+        match self {
+            RequestKind::Conversation => &Permission::ALL,
+            RequestKind::Embeddings | RequestKind::Completions => {
+                &[Permission::Messages, Permission::Params]
+            }
+        }
     }
 }
 

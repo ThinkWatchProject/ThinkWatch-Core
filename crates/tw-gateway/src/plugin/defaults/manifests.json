@@ -17,6 +17,9 @@
         "reply_tool_calls"
       ],
       "reply_mode": "stream",
+      "requests": [
+        "conversation"
+      ],
       "scope": {
         "clients": [],
         "models": [
@@ -43,6 +46,9 @@
         "system"
       ],
       "reply_mode": "block",
+      "requests": [
+        "conversation"
+      ],
       "scope": {
         "clients": [],
         "models": [],
@@ -75,6 +81,9 @@
         "reply_tool_calls"
       ],
       "reply_mode": "block",
+      "requests": [
+        "conversation"
+      ],
       "scope": {
         "clients": [],
         "models": [],

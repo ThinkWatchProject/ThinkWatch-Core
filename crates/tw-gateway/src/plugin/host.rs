@@ -178,6 +178,7 @@ pub mod double {
                     api: 1,
                     description: None,
                     permissions: Vec::new(),
+                    requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
                     scope: Scope::default(),
                     reply_mode: tw_api::ReplyMode::Block,
                     settings: Vec::new(),
@@ -194,6 +195,16 @@ pub mod double {
                     self.manifest.permissions.push(*p);
                 }
             }
+            self
+        }
+
+        /// 处理哪几种请求（manifest 的 `requests`）。不调就是只有对话
+        pub fn requests(mut self, kinds: &[tw_api::RequestKind]) -> Self {
+            self.manifest.requests = tw_api::RequestKind::ALL
+                .iter()
+                .copied()
+                .filter(|k| kinds.contains(k))
+                .collect();
             self
         }
 
@@ -320,6 +331,7 @@ pub mod double {
             on_error: tw_api::OnError::Reject,
             scope: Scope::default(),
             permissions: m.permissions.clone(),
+            requests: m.requests.clone(),
             reply_mode: m.reply_mode,
             hooks: m.hooks,
             settings: Default::default(),

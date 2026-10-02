@@ -383,3 +383,123 @@ export function onRequest(req) {
         assert_eq!(sent[0][k].to_string(), request[k].to_string(), "{k}");
     }
 }
+
+/// 声明了嵌入和补全的插件，在真的沙箱里：`requests` 读得出来，一项输入一条消息，上游收到
+/// 的是改过的那一份，一串 token 原样。只处理对话的那一个（一跑就抛错、出错时拒绝）**不跑
+/// 在这些请求上**，也拦不着它们
+#[tokio::test]
+async fn a_javascript_plugin_that_declares_embeddings_rewrites_their_inputs() {
+    const SCRUB: &str = r#"
+export const manifest = {
+  name: "Scrub", api: 1, permissions: ["messages"],
+  requests: ["conversation", "embeddings", "completions"],
+};
+export function onRequest(req, ctx) {
+  console.log(ctx.format + " " + req.messages.length + " " + req.format);
+  for (const m of req.messages) {
+    for (const p of m.parts) {
+      if (p.type === "text") p.text = p.text.replaceAll("PROJECT-X", "[removed]");
+    }
+  }
+  return req;
+}
+"#;
+    const STRICT: &str = r#"
+export const manifest = { name: "Strict", api: 1, permissions: ["messages"] };
+export function onRequest(req) {
+  throw new Error("conversations only");
+}
+"#;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let up = upstream(seen.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("plugins")).unwrap();
+    std::fs::write(tmp.path().join("plugins/scrub.js"), SCRUB).unwrap();
+    std::fs::write(tmp.path().join("plugins/strict.js"), STRICT).unwrap();
+    let plugin = |id: &str, src: &str| Plugin {
+        id: id.into(),
+        file: format!("plugins/{id}.js"),
+        sha256: sha256_hex(src.as_bytes()),
+        enabled: true,
+        on_error: PluginOnError::Reject,
+        scope: Default::default(),
+        settings: Default::default(),
+    };
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "claude-code".into(),
+            key: "tw-testkey".into(),
+            ..Default::default()
+        }],
+        providers: vec![Provider {
+            name: "openai".into(),
+            base_url: format!("http://{up}"),
+            key: Some("sk-upstream".into()),
+            protocol: Some(Protocol::OpenaiChat),
+            ..Default::default()
+        }],
+        plugins: vec![plugin("scrub", SCRUB), plugin("strict", STRICT)],
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    state.set_config_dir(tmp.path().to_path_buf());
+    let rt = state.runtime();
+    let scrub = rt.plugins.get("scrub").cloned().unwrap();
+    assert!(scrub.ready().is_some(), "{:?}", scrub.broken());
+    assert_eq!(
+        scrub.requests,
+        [
+            tw_api::RequestKind::Conversation,
+            tw_api::RequestKind::Embeddings,
+            tw_api::RequestKind::Completions
+        ]
+    );
+    let strict = rt.plugins.get("strict").cloned().unwrap();
+    assert_eq!(strict.requests, [tw_api::RequestKind::Conversation]);
+    let addr = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let post = |path: &'static str, body: Value| async move {
+        reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header("authorization", "Bearer tw-testkey")
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    let status = post(
+        "/v1/embeddings",
+        json!({ "model": "text-embedding-3-small", "input": ["PROJECT-X plan", [101, 102]] }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let status = post(
+        "/v1/completions",
+        json!({ "model": "gpt-3.5-turbo-instruct", "prompt": "Summarize PROJECT-X", "max_tokens": 8 }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["input"], json!(["[removed] plan", [101, 102]]));
+    assert_eq!(sent[1]["prompt"], "Summarize [removed]");
+    assert_eq!(sent[1]["max_tokens"], 8);
+    let logs: Vec<String> = scrub.logs.lines().into_iter().map(|l| l.text).collect();
+    assert_eq!(
+        logs,
+        [
+            "openai_embeddings 2 openai_embeddings",
+            "openai_completions 1 openai_completions"
+        ]
+    );
+    let st = scrub.stats.view();
+    assert_eq!((st.calls, st.changed, st.errors), (2, 2, 0));
+    // 只处理对话的那一个一次都没跑
+    assert_eq!(strict.stats.view(), tw_api::PluginStats::default());
+}

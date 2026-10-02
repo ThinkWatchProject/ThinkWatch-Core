@@ -7,7 +7,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
-use crate::{Hooks, LoadError, Manifest, Permission, ReplyMode, Scope, SettingKind, SettingSpec};
+use crate::{
+    Hooks, LoadError, Manifest, Permission, ReplyMode, RequestKind, Scope, SettingKind, SettingSpec,
+};
 
 const MAX_NAME: usize = 64;
 const MAX_DESCRIPTION: usize = 500;
@@ -97,7 +99,14 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
     for key in m.keys() {
         if !matches!(
             key.as_str(),
-            "name" | "api" | "description" | "permissions" | "match" | "reply" | "settings"
+            "name"
+                | "api"
+                | "description"
+                | "permissions"
+                | "requests"
+                | "match"
+                | "reply"
+                | "settings"
         ) {
             return Err(err(format!("the manifest has an unknown field `{key}`")));
         }
@@ -138,6 +147,7 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
     };
 
     let permissions = permissions(m.get("permissions"))?;
+    let requests = requests(m.get("requests"))?;
     let scope = scope(m.get("match"))?;
     let reply_mode = match m.get("reply") {
         None | Some(Value::Null) => ReplyMode::Block,
@@ -148,12 +158,14 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
     let settings = settings(m.get("settings"), info.settings_order.as_deref())?;
 
     check_hooks(&hooks, &permissions, reply_mode)?;
+    check_requests(&requests, &permissions)?;
 
     Ok(Manifest {
         name,
         api,
         description,
         permissions,
+        requests,
         scope,
         reply_mode,
         settings,
@@ -190,6 +202,70 @@ fn permissions(v: Option<&Value>) -> Result<BTreeSet<Permission>, LoadError> {
         }
     }
     Ok(out)
+}
+
+/// 插件处理哪几种请求。**不写就是只有对话**，写了就得是一张非空的单子
+fn requests(v: Option<&Value>) -> Result<BTreeSet<RequestKind>, LoadError> {
+    let list = match v {
+        None | Some(Value::Null) => return Ok(BTreeSet::from([RequestKind::Conversation])),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err(err("`requests` must be a list")),
+    };
+    if list.is_empty() {
+        return Err(err(
+            "`requests` must list at least one kind of request; leave it out to handle conversations only",
+        ));
+    }
+    let mut out = BTreeSet::new();
+    for r in list {
+        let Some(s) = r.as_str() else {
+            return Err(err("every entry of `requests` must be a string"));
+        };
+        let Some(kind) = RequestKind::from_manifest(s) else {
+            return Err(err(format!(
+                "`requests` lists \"{s}\", which is not a kind of request; the kinds are {}",
+                RequestKind::ALL
+                    .iter()
+                    .map(|k| format!("\"{}\"", k.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        if !out.insert(kind) {
+            return Err(err(format!("\"{s}\" is listed twice in `requests`")));
+        }
+    }
+    Ok(out)
+}
+
+/// 声明的请求和申请的权限对得上：**每一种请求都有权限碰得到它的视图**，**每个权限都在
+/// 某一种声明了的请求上用得着** —— 和钩子、权限一一对应是同一个道理，什么都不白要。
+///
+/// 嵌入和旧版补全的视图只有 `messages` 和 `params`，回答钩子也只在对话上跑：只要了
+/// `system` 的插件处理不了嵌入，不处理对话的插件用不着 `system`、`tools` 和回答钩子
+fn check_requests(
+    requests: &BTreeSet<RequestKind>,
+    perms: &BTreeSet<Permission>,
+) -> Result<(), LoadError> {
+    for kind in requests {
+        if !kind.reached_by().iter().any(|p| perms.contains(p)) {
+            return Err(err(format!(
+                "`requests` lists \"{}\", but none of the permissions applies to those requests; \
+                 they show only \"messages\" and \"params\"",
+                kind.as_str()
+            )));
+        }
+    }
+    for p in perms {
+        if !requests.iter().any(|k| k.reached_by().contains(p)) {
+            return Err(err(format!(
+                "permission \"{}\" only applies to conversations, and `requests` does not list \
+                 \"conversation\"",
+                p.manifest_name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn scope(v: Option<&Value>) -> Result<Scope, LoadError> {
