@@ -6,8 +6,13 @@
 
 use std::sync::Arc;
 
+use tw_types::{Msg, msg};
+
 use crate::plugin::host::PluginHost;
 use crate::plugin::set::Scope;
+
+/// 一个插件文件最多多大。**读文件时也按它截**：再大的文件反正编不了，不必整个读进来
+pub const MAX_SOURCE: usize = 1024 * 1024;
 
 /// 插件文件里 `manifest` 写的东西，加上它导出了哪些钩子。**由运行时读出来、校验过**：
 /// 权限和钩子对得上、设置项不超过上限，这里拿到的都是合规的。
@@ -79,6 +84,42 @@ pub enum LoadError {
     /// 运行时自己出了问题，或者根本没有运行时（见 [`Unavailable`]）
     #[error("{0}")]
     Engine(String),
+}
+
+impl LoadError {
+    /// 给人看的那句话，带码。语法错和 manifest 的原话是运行时的，放在 `detail` 里
+    pub fn msg(&self) -> Msg {
+        match self {
+            LoadError::TooLarge => msg!(
+                "gw.plugin.too_large", max = MAX_SOURCE =>
+                "The plugin file is larger than {max} bytes."
+            ),
+            LoadError::Syntax {
+                message,
+                line: Some(line),
+                column,
+            } => msg!(
+                "gw.plugin.syntax_at", line = line, column = column.unwrap_or(1), detail = message =>
+                "The plugin has a syntax error at line {line}, column {column}: {detail}"
+            ),
+            LoadError::Syntax { message, .. } => msg!(
+                "gw.plugin.syntax", detail = message =>
+                "The plugin has a syntax error: {detail}"
+            ),
+            LoadError::Manifest(d) => msg!(
+                "gw.plugin.manifest", detail = d =>
+                "The plugin's manifest is not valid: {detail}"
+            ),
+            LoadError::UnsupportedApi(api) => msg!(
+                "gw.plugin.api", api = api =>
+                "The plugin is written for plugin API {api}, and only API 1 is supported."
+            ),
+            LoadError::Engine(d) => msg!(
+                "gw.plugin.engine", detail = d =>
+                "The plugin engine cannot load plugins: {detail}"
+            ),
+        }
+    }
 }
 
 /// 插件运行时。**一个进程一个**，所有插件共用。

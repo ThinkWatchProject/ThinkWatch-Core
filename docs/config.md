@@ -157,6 +157,7 @@ means.
 | `routes` | list of [`routes[]`](#cfg-routes) | `[]` | Routes. Without any, requests fail over across all upstreams in the order they are declared. |
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
 | `default_key` | string | — | The gateway key for clients that were not given a key of their own. Unset: the key named `default`, or the first key. It cannot be disabled. |
+| `plugins` | list of [`plugins[]`](#cfg-plugins) | `[]` | Script plugins, in the order they run. The app installs them; each one's code is a file next to this one. |
 <!-- /generated -->
 
 ### `listen`
@@ -993,6 +994,62 @@ routes:
       - name: everything else
         to: fast
 default_route: default
+```
+
+### `plugins`
+
+Script plugins change requests before they reach an upstream and answers
+before they reach the client. They run in a sandbox inside core, without
+access to files, the network or the real values of secrets. The app installs
+them: each plugin's code goes to `plugins/<id>.js` next to this file, a copy
+of the approved code to `plugins/.approved/<id>.js`, and the code's SHA-256
+to `sha256`.
+
+A plugin runs only while its file has exactly the approved hash. When the
+file changes on disk or disappears, the plugin stops within seconds and the
+app shows the change for review. Until the change is approved, the requests
+the plugin covers are refused (`on_error: reject`) or pass without it
+(`on_error: skip`). A plugin that does not load is handled the same way.
+Neither keeps the rest of the configuration from taking effect.
+
+Plugins run in the order of this list.
+
+<!-- generated: table plugins[] -->
+<a id="cfg-plugins"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `id` | string | **required** | Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order` and `inspect` are taken by the control plane. |
+| `file` | string | **required** | The plugin's code, relative to this file's directory. It is always `plugins/<id>.js`; the app writes it. |
+| `sha256` | string | **required** | SHA-256 of the approved code, 64 lowercase hexadecimal characters. When the file no longer has this hash, the plugin stops running until the change is approved in the app. The approved code is kept in `plugins/.approved/<id>.js`. |
+| `enabled` | bool | `true` | Run the plugin. `false` keeps it installed and out of every request. |
+| `on_error` | `reject` \| `skip` | `reject` | When the plugin fails on a request, or cannot run because its file changed or does not load: `reject` refuses the requests it covers; `skip` lets them through without it. |
+| `scope` | object, [`plugins[].scope`](#cfg-plugins-scope) | — | Which requests the plugin handles. Filled from the plugin's own suggestion when it is installed. |
+| `settings` | map of setting → string, number or bool | `{}` | Values for the settings the plugin declares. A setting left out takes the plugin's default; one the plugin does not declare, or of the wrong type, stops the plugin from loading. |
+<!-- /generated -->
+
+<!-- generated: table plugins[].scope -->
+<a id="cfg-plugins-scope"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `clients` | list of strings | `[]` | Client apps (`claude-code`, `codex`, …), as names or globs. `[]`: every client, including requests whose app is not recognised. |
+| `models` | list of strings | `[]` | Models the client asks for, as model ids or globs (`claude-*`). `[]`: every model. |
+| `upstreams` | list of strings | `[]` | Upstreams whose answers the plugin handles, by name or glob. It applies to answers only: a request is changed before an upstream is chosen. `[]`: every upstream. |
+<!-- /generated -->
+
+```yaml
+plugins:
+  - id: add-date
+    file: plugins/add-date.js
+    sha256: 9f2b6c0e4a1d8f3b7c5e2a9d6f1b4c8e3a7d0f5b2c9e6a1d4f8b3c7e0a5d2f9b
+    enabled: true
+    on_error: reject
+    scope:
+      clients: [claude-code]
+      models: ["claude-*"]
+    settings:
+      note: Answer in English.
 ```
 
 ## Environment variables

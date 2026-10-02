@@ -95,27 +95,40 @@ impl EditError {
 pub struct Section {
     pub path: &'static [&'static str],
     pub what: &'static str,
+    /// 每一项靠哪个键认：几乎都是 `name`，插件是 `id`
+    pub key: &'static str,
 }
 
 pub const PROVIDERS: Section = Section {
     path: &["providers"],
     what: "upstream",
+    key: "name",
 };
 pub const PROXIES: Section = Section {
     path: &["proxies"],
     what: "proxy",
+    key: "name",
 };
 pub const PRICE_SHEETS: Section = Section {
     path: &["pricing", "sheets"],
     what: "price sheet",
+    key: "name",
 };
 pub const ROUTES: Section = Section {
     path: &["routes"],
     what: "route",
+    key: "name",
 };
 pub const GROUPS: Section = Section {
     path: &["groups"],
     what: "group",
+    key: "name",
+};
+
+pub const PLUGINS: Section = Section {
+    path: &["plugins"],
+    what: "plugin",
+    key: "id",
 };
 
 impl Section {
@@ -138,7 +151,7 @@ impl Section {
     pub fn index_of(&self, doc: &Value, name: &str) -> Option<usize> {
         self.items(doc)
             .iter()
-            .position(|it| it.get("name").and_then(Value::as_str) == Some(name))
+            .position(|it| it.get(self.key).and_then(Value::as_str) == Some(name))
     }
 }
 
@@ -158,7 +171,7 @@ pub fn upsert(
 ) -> Result<String, EditError> {
     let doc = parse(text)?;
     let name = item
-        .get("name")
+        .get(section.key)
         .and_then(Value::as_str)
         .ok_or(EditError::Nameless { what: section.what })?
         .to_string();
@@ -240,6 +253,50 @@ pub fn remove(text: &str, section: Section, name: &str) -> Result<String, EditEr
         || section.items(&got).len() + 1 != section.items(&doc).len()
     {
         return Err(EditError::SelfCheck(format!("{} `{name}`", section.what)));
+    }
+    Ok(out)
+}
+
+/// 按 `keys` 的顺序重排一段列表。`keys` 得正好是这一段里的每一项各一次。
+///
+/// 块式列表整项搬（注释跟着各自那一项走，见 [`tw_yaml::reorder`]）；手写成行内的
+/// （`[{…}, {…}]`）整段换掉 —— 行内写法里本来也放不下注释。
+pub fn reorder(text: &str, section: Section, keys: &[String]) -> Result<String, EditError> {
+    let doc = parse(text)?;
+    let items = section.items(&doc);
+    let order = keys
+        .iter()
+        .map(|k| {
+            section
+                .index_of(&doc, k)
+                .ok_or_else(|| EditError::NotFound {
+                    what: section.what,
+                    name: k.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = doc.clone();
+    let reordered: Vec<Value> = order.iter().map(|&i| items[i].clone()).collect();
+    let steps = section.steps();
+    let out = match tw_yaml::reorder(text, &steps, &order) {
+        Ok(out) => out,
+        // 行内写法、或者别的块式之外的写法：整段换成重排后的样子
+        Err(tw_yaml::PatchError::NotFound(_)) => {
+            set(text, &steps, Some(&Value::Sequence(reordered.clone())))?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // ── 语义核对 ─────────────────────────────────────────────────────
+    let mut cur = &mut expected;
+    for k in section.path {
+        cur = cur
+            .get_mut(*k)
+            .ok_or_else(|| EditError::SelfCheck(format!("{} order", section.what)))?;
+    }
+    *cur = Value::Sequence(reordered);
+    let got = parse(&out).map_err(|e| EditError::SelfCheck(e.to_string()))?;
+    if got != expected {
+        return Err(EditError::SelfCheck(format!("{} order", section.what)));
     }
     Ok(out)
 }

@@ -12,11 +12,16 @@
 //! 顺序。
 
 pub mod engine;
+/// 测试用的假引擎（见里面的说明）。**不是给生产用的**
+#[doc(hidden)]
+pub mod fake;
 pub mod host;
+pub mod load;
 pub mod set;
 
-pub use engine::{Engine, Hooks, LoadError, Manifest, SettingSpec, Unavailable};
+pub use engine::{Engine, Hooks, LoadError, MAX_SOURCE, Manifest, SettingSpec, Unavailable};
 pub use host::PluginHost;
+pub use load::{Plugins, RUN_CHANNEL_CAP, RunRecord, RunSender};
 pub use set::{Active, Broken, LogLine, LogRing, PluginRun, PluginSet, Scope, State, Stats};
 
 use tw_types::Msg;
@@ -25,8 +30,9 @@ impl crate::AppState {
     /// 记一次插件运行（不变式 I10：每一次运行的结果都记在请求上、界面看得到）。
     ///
     /// 计数、日志进这个插件自己的那一份（跨重载存活，见 [`Stats`]、[`LogRing`]）；
-    /// 出了错的再发一条 `plugin_failed` 给通知用。**数据面每跑完一个插件调一次**，
-    /// 跳过的（插件没加载起来、设的是出错时跳过）也调：那也是这个请求上发生过的事。
+    /// 运行记录交给存储层落在那个请求上（`plugin_runs`）；出了错的再发一条
+    /// `plugin_failed` 给通知用。**数据面每跑完一个插件调一次**，跳过的（插件没加载
+    /// 起来、设的是出错时跳过）也调：那也是这个请求上发生过的事。
     pub fn plugin_ran(&self, request_id: u64, active: &Active, run: PluginRun, logs: Vec<LogLine>) {
         let at_ms = now_ms();
         active.stats.note(&run, at_ms);
@@ -42,7 +48,23 @@ impl crate::AppState {
                 at_ms,
             });
         }
+        self.plugins.offer(RunRecord {
+            request_id,
+            at_ms,
+            run,
+        });
     }
+
+    /// 接上运行记录的去处。**观测层起来之后才调** —— 在那之前只计数、不落库
+    pub fn set_plugin_sink(&self, tx: RunSender) {
+        self.plugins.set_sink(tx);
+    }
+}
+
+/// 这个进程用的插件运行时。**沙箱还没接上**：在那之前每个插件都「加载不了」，
+/// 管得着的请求照它的 `on_error` 处置。
+pub fn default_engine() -> std::sync::Arc<dyn Engine> {
+    std::sync::Arc::new(Unavailable::default())
 }
 
 /// 出错却没说为什么。数据面总该给一句，这里只是不让通知空着

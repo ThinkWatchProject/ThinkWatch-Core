@@ -783,9 +783,18 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
         let (body_tx, body_rx) = tw_gateway::bodies::channel();
-        let store = build_store(&dir, state.bus.clone(), state.pricing.clone(), body_rx);
+        // 插件在每个请求上的运行记录，和正文同一个道理：网关交出去，存储层落库
+        let (run_tx, run_rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
+        let store = build_store(
+            &dir,
+            state.bus.clone(),
+            state.pricing.clone(),
+            body_rx,
+            run_rx,
+        );
         if store.is_some() {
             state.set_body_sink(body_tx);
+            state.set_plugin_sink(run_tx);
         }
 
         /*
@@ -840,6 +849,16 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             Ok(w) => Some(w),
             Err(e) => {
                 tracing::warn!("the configuration file cannot be watched, so a hand edit will not take effect on its own: {e}");
+                None
+            }
+        };
+        // 插件目录也盯着：**插件文件被改了，那个插件马上停用**，不等下一次改配置。
+        // 盯不住时退回到每次换配置时重算哈希，所以同样只说一句
+        let _plugin_watch = match tw_control::plugins::spawn_watcher(state.clone(), manager.path())
+        {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!("the plugin directory cannot be watched, so a changed plugin file is noticed only at the next configuration change: {e}");
                 None
             }
         };
@@ -946,6 +965,7 @@ fn build_store(
     // **和网关同一份价格簿**，不是一份副本：改了价目表，下一个结束的请求就按新价算
     pricing: tw_pricing::Shared,
     bodies: tokio::sync::mpsc::Receiver<tw_gateway::bodies::BodyRecord>,
+    runs: tokio::sync::mpsc::Receiver<tw_gateway::plugin::RunRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let events = bus.subscribe();
     let (db, blobs) = match tw_store::open(dir) {
@@ -1005,6 +1025,7 @@ fn build_store(
                 which: match kind {
                     tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
                     tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
+                    tw_gateway::bodies::BodyKind::AfterPlugins => tw_store::Which::AfterPlugins,
                 },
                 body,
                 original_len,
@@ -1016,13 +1037,36 @@ fn build_store(
             drop(held);
         }
     });
-    Some(tw_store::task::spawn(
+    let recorder = tw_store::task::spawn(
         // 算完价钱往回报一条 —— 见 `Event::RequestPriced`。这里是唯一
         // 同时看得见总线和存储层的地方，所以接线在这儿完成。
         tw_store::Recorder::new(db, blobs, pricing).reporting_to(bus),
         events,
         rx,
-    ))
+    );
+    // 插件的运行记录同样在这里对接：网关那边的一次运行，换成存储层的一行
+    let (run_tx, run_rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
+    let mut runs = runs;
+    tokio::spawn(async move {
+        while let Some(r) = runs.recv().await {
+            let row = tw_store::PluginRunRow {
+                request_id: r.request_id as i64,
+                at_ms: r.at_ms as i64,
+                plugin_id: r.run.plugin_id,
+                plugin_name: r.run.plugin_name,
+                hook: r.run.hook,
+                outcome: r.run.outcome,
+                error: r.run.error,
+                cpu_us: r.run.cpu_us.min(i64::MAX as u64) as i64,
+                detail: r.run.detail.map(|d| d.to_string()),
+            };
+            if run_tx.send(row).await.is_err() {
+                return;
+            }
+        }
+    });
+    tw_store::task::record_plugin_runs(recorder.clone(), run_rx);
+    Some(recorder)
 }
 
 /// 等一个「该退了」。

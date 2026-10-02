@@ -28,6 +28,19 @@ pub struct StoredBody {
     pub original_len: usize,
 }
 
+/// 把插件的运行记录写进库里，**和正文同一个道理**：数据面只管交出去，写库在这条
+/// 任务上。记录和请求那一行各走各的路，落库不分先后（见 `Db::insert_plugin_run`）。
+pub fn record_plugin_runs(
+    recorder: Arc<Mutex<Recorder>>,
+    mut runs: tokio::sync::mpsc::Receiver<crate::db::PluginRunRow>,
+) {
+    tokio::spawn(async move {
+        while let Some(r) = runs.recv().await {
+            recorder.lock().await.record_plugin_run(&r);
+        }
+    });
+}
+
 /// 起来。返回的 handle 给别的地方查历史用 —— **同一个 Recorder**，
 /// 不是第二个连接：两个连接会让「刚写进去的还查不到」变成可能。
 ///

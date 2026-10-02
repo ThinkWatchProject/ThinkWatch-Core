@@ -676,8 +676,11 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 从存下来的正文里读出每一轮新说的话、回答、推理、工具调用和结果，读不到的地方逐轮说出来
 /// （[`TranscriptGap`]）。照 31 写的界面只有每一轮的用量和金额。
 ///
-/// **33 起有脚本插件**：事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者文件变了、
-/// 加载不了而停用）。照 32 写的界面不认这个事件。
+/// **33 起有脚本插件**：`/plugins` 一组端点（列表、试编、装、改、换源码、看改动、批准、
+/// 排顺序、删、试跑、日志），事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者
+/// 文件变了、加载不了而停用），[`RequestDetail`] 多了 `plugins`（每一次运行）和
+/// `request_after_plugins`（插件改过的请求体），[`HistoryRow`] 多了 `plugin_changed`。
+/// 装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 32 写的界面看不到插件。
 pub const CONTROL_API_VERSION: u32 = 33;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3606,6 +3609,9 @@ pub struct HistoryRow {
     /// 而那正是用户回头翻「那一条到底被换了什么」的时候。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<SecurityEventView>,
+    /// 插件改过这个请求或它的回答。**流量页的徽标靠它**；改了什么见详情里的
+    /// [`RequestDetail::plugins`]
+    pub plugin_changed: bool,
 }
 
 /// 搜索的一页（`POST /history/search`），新的在前。
@@ -3688,8 +3694,13 @@ pub struct TranslatedView {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RequestDetail {
     pub row: HistoryRow,
+    /// 客户端发来的原样
     pub request_body: Option<BodyView>,
+    /// 插件改过之后、发往上游的那一份。**只有插件改了请求才有**
+    pub request_after_plugins: Option<BodyView>,
     pub response_body: Option<BodyView>,
+    /// 插件在这个请求上的每一次运行，按先后（请求钩子在前，回答钩子在后）
+    pub plugins: Vec<PluginRunView>,
     /// 这个请求还在跑。**记录在结局到了才落库**，这时的 `row` 是到目前为止
     /// 知道的那些：开始时的身份和上游，响应头到了就有状态码，路由走完就有
     /// 尝试链；耗时、用量、金额都还没有。请求体已经存下了，响应体要等结局。
@@ -4948,6 +4959,271 @@ pub struct PluginStats {
 pub struct PluginLastError {
     pub at_ms: u64,
     pub message: Msg,
+}
+
+/// 一个设置的值：字符串、数字或 true/false。
+///
+/// **线上就是那个值本身**（不带类型标记）：`"今天"`、`3`、`true`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum SettingValue {
+    Bool(bool),
+    Number(f64),
+    String(String),
+}
+
+impl SettingValue {
+    /// 是不是这种设置的类型
+    pub fn kind(&self) -> SettingKind {
+        match self {
+            SettingValue::Bool(_) => SettingKind::Boolean,
+            SettingValue::Number(_) => SettingKind::Number,
+            SettingValue::String(_) => SettingKind::String,
+        }
+    }
+}
+
+/// 插件管哪些请求。**每张单子里都是 `*` 通配**（不分大小写），空着是「都管」。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginScope {
+    /// 客户端应用：`claude-code`、`codex`……（请求记录上的 `client_hint`）
+    pub clients: Vec<String>,
+    /// 客户端要的模型
+    pub models: Vec<String>,
+    /// 服务回答的上游。**只管回答那一段**：改请求时还没选上游
+    pub upstreams: Vec<String>,
+}
+
+/// 插件声明的一个设置项。`label` 是**插件写的字**：界面当纯文本显示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SettingSpecView {
+    pub key: String,
+    pub kind: SettingKind,
+    pub label: String,
+    /// 和 `kind` 同一种类型
+    pub default: SettingValue,
+}
+
+/// 插件导出了哪些钩子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginHooks {
+    /// `onRequest`
+    pub request: bool,
+    /// `onReplyText`
+    pub reply_text: bool,
+    /// `onToolCall`
+    pub tool_call: bool,
+}
+
+/// 插件文件里的 manifest，加上它导出了哪些钩子。名字、说明、设置项的 `label`
+/// **都是插件写的字**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ManifestView {
+    pub name: String,
+    pub description: Option<String>,
+    pub permissions: Vec<Permission>,
+    /// 插件建议的范围。装上时照它填
+    pub scope: PluginScope,
+    pub reply_mode: ReplyMode,
+    pub settings_schema: Vec<SettingSpecView>,
+    pub hooks: PluginHooks,
+}
+
+/// 插件此刻能不能跑。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginStatus {
+    /// 在跑
+    Ok,
+    /// 停用着
+    Disabled,
+    /// 磁盘上的文件和批准过的不一样了（或者没了），**不跑**。看过改动、重新批准才
+    /// 回来（[`PluginSourceView`]、`ApprovePluginFile`）。停用着的插件文件变了也是它
+    Changed,
+    /// 加载不了：语法错、manifest 不合规矩、设置和 manifest 对不上……
+    Error { message: Msg },
+}
+
+/// 一个装上了的插件（`GET /plugins`），按运行的顺序。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginView {
+    pub id: String,
+    /// 插件自己起的名字。**插件写的字**。读不出 manifest 时是 id
+    pub name: String,
+    /// 插件写的字
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub on_error: OnError,
+    /// 读不出 manifest 时是空的
+    pub permissions: Vec<Permission>,
+    /// 生效的范围（配置里的）
+    pub scope: PluginScope,
+    pub reply_mode: ReplyMode,
+    pub settings_schema: Vec<SettingSpecView>,
+    /// 交给插件的值：配置里写的，没写的是默认值
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    /// 批准过的那一份的 SHA-256，小写十六进制
+    pub sha256: String,
+    pub status: PluginStatus,
+    pub stats: PluginStats,
+}
+
+/// 一份源码（`POST /plugins/inspect`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginSource {
+    pub source: String,
+}
+
+/// 编一份源码看到的东西。**什么都没留下**：不写文件、不改配置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginInspection {
+    /// 编得成才有
+    pub manifest: Option<ManifestView>,
+    /// 这份源码（UTF-8 字节）的 SHA-256。装、批准时核对的就是它
+    pub sha256: String,
+    /// 编不成的原因
+    pub error: Option<PluginLoadError>,
+}
+
+/// 编不成的原因。语法错带着行列（从 1 起）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginLoadError {
+    pub message: Msg,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+/// 装一个插件（`POST /plugins`）。
+///
+/// **网页不能调。**装插件要在系统的确认框里点头，那一步在桌面端的 Rust 里：它自己
+/// 再编一遍源码、把名字和权限摆给人看，点了头才发这个请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginCreate {
+    pub source: String,
+    /// 不给就从名字生成一个
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub enabled: bool,
+    pub on_error: OnError,
+    pub scope: PluginScope,
+    /// 没给的取默认值
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 改一个插件的开关、出错时怎么办、范围、设置（`PUT /plugins/{id}`）。**整份交**：
+/// 交上来的就是保存之后的样子。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginUpdate {
+    pub enabled: bool,
+    pub on_error: OnError,
+    pub scope: PluginScope,
+    /// 没给的取默认值
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 换一份源码（`PUT /plugins/{id}/source`）。**网页不能调**，理由同 [`PluginCreate`]。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginSourceReplace {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 批准磁盘上改过的那个文件（`POST /plugins/{id}/approve`）。**网页不能调**，理由同
+/// [`PluginCreate`]。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginApprove {
+    /// 看过的那一份的哈希（[`PluginSourceView::current_sha256`]）。**磁盘上的文件得
+    /// 正好是它**：看完到点头之间又被改了的，不批
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 批准过的那一份和磁盘上现在那一份（`GET /plugins/{id}/source`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginSourceView {
+    /// 批准时存下的那一份。**底稿没了、或者也被改过（哈希对不上）时是空的**：
+    /// 说不出批准的是什么，就不拿别的冒充
+    pub approved: String,
+    /// 配置里批准的哈希
+    pub approved_sha256: String,
+    /// 磁盘上现在的那一份。文件没了是 None
+    pub current: Option<String>,
+    pub current_sha256: Option<String>,
+}
+
+/// 排顺序（`PUT /plugins/order`）：**全部 id**，按新的顺序。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginOrder {
+    pub ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 拿一条记下的请求试跑一个插件（`POST /plugins/{id}/trial`）。**不连上游**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginTrial {
+    /// 请求记录的号（[`HistoryRow::id`]）
+    pub request_id: i64,
+}
+
+/// 试跑的结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginTrialResult {
+    /// 请求钩子跑在记下的请求上。插件没有请求钩子、请求体没留下时没有
+    pub request: Option<TrialSide>,
+    /// 回答钩子跑在记下的回答上。插件没有回答钩子、回答没留下时没有
+    pub reply: Option<TrialSide>,
+    /// 这次试跑写的日志。**不进插件的日志**
+    pub logs: Vec<PluginLogEntry>,
+    /// 试不了的原因（插件没加载起来、记录里没有可试的东西……）
+    pub error: Option<Msg>,
+}
+
+/// 试跑的一边：前后两份，排好版的 JSON，**已打码**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TrialSide {
+    pub before: String,
+    pub after: String,
+    pub outcome: PluginOutcome,
+}
+
+/// 一个插件在一个请求上的一次运行（详情抽屉的时间线）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginRunView {
+    pub plugin_id: String,
+    /// 当时的名字。**插件写的字**
+    pub plugin_name: String,
+    pub hook: PluginHook,
+    pub outcome: PluginOutcome,
+    /// 出错、拒绝的原因
+    pub error: Option<Msg>,
+    pub cpu_us: u64,
 }
 
 #[cfg(test)]

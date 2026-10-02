@@ -78,14 +78,17 @@ impl GuardExt for Guard {
             Guard::Redact => Ok(edit::Section {
                 path: &["security", "redact", "custom"],
                 what: "redaction rule",
+                key: "name",
             }),
             Guard::InspectTools => Ok(edit::Section {
                 path: &["security", "inspect_tools", "custom"],
                 what: "tool-call rule",
+                key: "name",
             }),
             Guard::Content => Ok(edit::Section {
                 path: &["security", "content", "custom"],
                 what: "content rule",
+                key: "name",
             }),
             Guard::HiddenText | Guard::OutputLimit => Err(fail(
                 StatusCode::BAD_REQUEST,

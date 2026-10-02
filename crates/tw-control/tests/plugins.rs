@@ -1,0 +1,949 @@
+//! 脚本插件的管理面：装、改、换源码、文件被改了、批准、排顺序、删、日志、记录。
+//!
+//! 断言落在**磁盘上**：插件文件和底稿写没写、写的是不是那一份字节、配置里那一条长
+//! 什么样 —— 网关照着这些重读插件，哈希对不上就不跑（不变式 I9）。引擎是假的
+//! （`tw_gateway::plugin::fake`）：它照约定的写法读出 manifest，不跑 JavaScript。
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use tw_control::{ConfigManager, ControlState};
+use tw_gateway::plugin::fake::{FakeEngine, source};
+
+const BASE: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+# 默认那把
+clients:
+  - name: default
+    key: tw-aaaa
+";
+
+struct Bed {
+    _tmp: tempfile::TempDir,
+    /// 配置文件所在的目录
+    dir: PathBuf,
+    gw: tw_gateway::AppState,
+    store: Arc<tokio::sync::Mutex<tw_store::Recorder>>,
+    app: axum::Router,
+}
+
+impl Bed {
+    fn config(&self) -> String {
+        std::fs::read_to_string(self.dir.join("config.yaml")).unwrap()
+    }
+    fn parsed(&self) -> tw_config::Config {
+        tw_config::try_parse(&self.config()).unwrap()
+    }
+    fn file(&self, id: &str) -> PathBuf {
+        tw_config::plugins::file_path(&self.dir, id)
+    }
+    fn approved(&self, id: &str) -> PathBuf {
+        tw_config::plugins::approved_path(&self.dir, id)
+    }
+    async fn version(&self) -> String {
+        let (_, v) = call(&self.app, "GET", "/overview", None).await;
+        v["config_version"].as_str().unwrap().to_string()
+    }
+    async fn plugins(&self) -> Vec<Value> {
+        let (st, v) = call(&self.app, "GET", "/plugins", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v.as_array().unwrap().clone()
+    }
+    async fn plugin(&self, id: &str) -> Value {
+        self.plugins()
+            .await
+            .into_iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("no plugin {id}"))
+    }
+    /// 装一个，返回 id
+    async fn install(&self, src: &str, extra: Value) -> String {
+        let mut body = json!({
+            "source": src,
+            "enabled": true,
+            "on_error": "reject",
+            "scope": { "clients": [], "models": [], "upstreams": [] },
+            "settings": {},
+            "base_version": self.version().await,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (st, v) = call(&self.app, "POST", "/plugins", Some(body)).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let cfg = self.parsed();
+        cfg.plugins.last().unwrap().id.clone()
+    }
+}
+
+/// 一张床：配置文件在 `dir`（相对临时目录的一段路径）里
+fn bed_in(sub: &str) -> Bed {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(sub);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("config.yaml");
+    std::fs::write(&p, BASE).unwrap();
+    let db = tw_store::Db::open(&dir.join("data.db")).unwrap();
+    let rec = tw_store::Recorder::new(
+        db,
+        tw_store::Blobs::new(dir.join("blobs")),
+        tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
+    );
+    let store = Arc::new(tokio::sync::Mutex::new(rec));
+    let gw = tw_gateway::AppState::new(tw_config::try_parse(BASE).unwrap()).unwrap();
+    gw.set_plugin_engine(Arc::new(FakeEngine));
+    let bus = gw.bus.clone();
+    let state = ControlState {
+        shutdown: Default::default(),
+        remote: Default::default(),
+        cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
+        gateway: gw.clone(),
+        store: Some(store.clone()),
+        started: std::time::Instant::now(),
+        price_updater: Default::default(),
+        chatgpt: Default::default(),
+        zai: Default::default(),
+    };
+    Bed {
+        _tmp: tmp,
+        dir,
+        gw,
+        store,
+        app: tw_control::router(state),
+    }
+}
+
+fn bed() -> Bed {
+    bed_in("home")
+}
+
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        req = req.header("content-type", "application/json");
+    }
+    let r = app
+        .clone()
+        .oneshot(
+            req.body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let st = r.status();
+    let b = axum::body::to_bytes(r.into_body(), 1 << 22).await.unwrap();
+    (st, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+fn add_date() -> String {
+    source(
+        json!({"name": "附加日期", "api": 1, "description": "在系统提示里写上今天的日期",
+               "permissions": ["system"], "match": {"clients": ["claude-code"]},
+               "settings": {"note": {"type": "string", "label": "附加内容", "default": "今天"},
+                            "days": {"type": "number", "label": "天数", "default": 1}}}),
+        &["onRequest"],
+    )
+}
+
+fn shout() -> String {
+    source(
+        json!({"name": "Shout", "api": 1, "permissions": ["reply.text"]}),
+        &["onReplyText"],
+    )
+}
+
+fn sha(s: &str) -> String {
+    tw_gateway::plugin::load::sha256_hex(s.as_bytes())
+}
+
+fn files_in(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
+    let b = bed();
+    let src = add_date();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": src})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["sha256"], sha(&src));
+    assert!(v["error"].is_null(), "{v}");
+    let m = &v["manifest"];
+    assert_eq!(m["name"], "附加日期");
+    assert_eq!(m["permissions"], json!(["system"]));
+    assert_eq!(m["scope"]["clients"], json!(["claude-code"]));
+    assert_eq!(
+        m["hooks"],
+        json!({"request": true, "reply_text": false, "tool_call": false})
+    );
+    assert_eq!(m["settings_schema"][0]["key"], "days");
+    assert_eq!(m["settings_schema"][0]["kind"], "number");
+    assert_eq!(m["settings_schema"][0]["default"], json!(1.0));
+
+    let bad = format!("{src}// @@syntax@@\n");
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": bad})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["manifest"].is_null());
+    assert_eq!(v["error"]["message"]["code"], "gw.plugin.syntax_at");
+    assert_eq!(v["error"]["line"], 3);
+    assert_eq!(v["error"]["column"], 1);
+
+    // 什么都没留下
+    assert_eq!(b.config(), BASE);
+    assert!(files_in(&b.dir.join("plugins")).is_empty());
+}
+
+#[tokio::test]
+async fn installing_writes_the_file_its_approved_copy_and_one_entry() {
+    let b = bed();
+    let src = add_date();
+    let id = b
+        .install(
+            &src,
+            json!({"scope": {"clients": ["claude-code"], "models": [], "upstreams": []},
+                              "settings": {"note": "明天"}}),
+        )
+        .await;
+    // 名字里没有拉丁字母
+    assert_eq!(id, "plugin");
+    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), src);
+    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), src);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [b.file(&id), b.approved(&id)] {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", p.display());
+        }
+        let mode = std::fs::metadata(b.dir.join("plugins"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    let cfg = b.parsed();
+    let p = &cfg.plugins[0];
+    assert_eq!(p.file, "plugins/plugin.js");
+    assert_eq!(p.sha256, sha(&src));
+    assert!(p.enabled);
+    assert_eq!(p.on_error, tw_config::PluginOnError::Reject);
+    assert_eq!(p.scope.clients, ["claude-code"]);
+    // 设置每一项都写明：给了的照写，没给的写默认值；整数写成整数
+    assert_eq!(p.settings["note"], serde_yaml_ng::Value::from("明天"));
+    assert_eq!(p.settings["days"], serde_yaml_ng::Value::from(1));
+    assert!(b.config().contains("    days: 1\n"), "{}", b.config());
+    // 注释还在
+    assert!(b.config().contains("# 默认那把"));
+
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "ok"}));
+    assert_eq!(v["name"], "附加日期");
+    assert_eq!(v["description"], "在系统提示里写上今天的日期");
+    assert_eq!(v["sha256"], sha(&src));
+    assert_eq!(v["settings"], json!({"note": "明天", "days": 1.0}));
+    assert_eq!(v["stats"]["calls"], 0);
+    // 网关手里的那一份能跑
+    let rt = b.gw.runtime();
+    assert!(rt.plugins.get(&id).unwrap().ready().is_some());
+}
+
+#[tokio::test]
+async fn an_id_is_checked_and_a_second_plugin_of_the_same_name_gets_its_own() {
+    let b = bed();
+    let first = b.install(&shout(), json!({})).await;
+    let second = b.install(&shout(), json!({})).await;
+    assert_eq!((first.as_str(), second.as_str()), ("shout", "shout-2"));
+
+    for (id, code) in [
+        ("Bad_Id", "control.plugin.bad_id"),
+        ("order", "control.plugin.reserved_id"),
+        ("shout", "control.plugin.id_taken"),
+    ] {
+        let (st, v) = call(
+            &b.app,
+            "POST",
+            "/plugins",
+            Some(
+                json!({"source": shout(), "id": id, "enabled": true, "on_error": "skip",
+                        "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}}),
+            ),
+        )
+        .await;
+        assert!(st.is_client_error(), "{id}: {st} {v}");
+        assert_eq!(v["code"], code, "{id}");
+    }
+}
+
+/// 同名的两个同时装：后一个看得见前一个，各得各的 id，文件互不覆盖
+#[tokio::test]
+async fn two_plugins_of_one_name_installed_at_once_get_their_own_ids() {
+    let b = bed();
+    let body = json!({"source": shout(), "enabled": true, "on_error": "reject",
+                      "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}});
+    let (one, two) = tokio::join!(
+        call(&b.app, "POST", "/plugins", Some(body.clone())),
+        call(&b.app, "POST", "/plugins", Some(body)),
+    );
+    assert_eq!(
+        (one.0, two.0),
+        (StatusCode::OK, StatusCode::OK),
+        "{} {}",
+        one.1,
+        two.1
+    );
+    let mut ids: Vec<String> = b.parsed().plugins.into_iter().map(|p| p.id).collect();
+    ids.sort();
+    assert_eq!(ids, ["shout", "shout-2"]);
+    assert!(b.file("shout").exists() && b.file("shout-2").exists());
+}
+
+/// 装之前编一遍：编不成、设置不对的都不装，**一个文件都不写**
+#[tokio::test]
+async fn a_plugin_that_does_not_load_or_has_wrong_settings_is_not_installed() {
+    let b = bed();
+    let body = |src: String, settings: Value| {
+        json!({"source": src, "enabled": true, "on_error": "reject",
+               "scope": {"clients": [], "models": [], "upstreams": []}, "settings": settings})
+    };
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(body(format!("{}// @@syntax@@\n", add_date()), json!({}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "gw.plugin.syntax_at");
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(body(add_date(), json!({"days": "x"}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "gw.plugin.setting_type");
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(body(add_date(), json!({"colour": "red"}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "gw.plugin.setting_unknown");
+    assert_eq!(b.config(), BASE);
+    assert!(files_in(&b.dir.join("plugins")).is_empty());
+}
+
+/// 配置没写成（版本对不上），刚写的文件还原：不留一个和配置对不上的插件文件
+#[tokio::test]
+async fn a_stale_write_puts_the_files_back() {
+    let b = bed();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(
+            json!({"source": shout(), "enabled": true, "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {},
+                    "base_version": "not-this-one"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(b.config(), BASE);
+    assert!(!b.file("shout").exists());
+    assert!(!b.approved("shout").exists());
+
+    // 换源码同理：旧的那一份原样回来
+    let id = b.install(&shout(), json!({})).await;
+    let newer = shout().replace("Shout", "Louder");
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        &format!("/plugins/{id}/source"),
+        Some(json!({"source": newer, "base_version": "not-this-one"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), shout());
+    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), shout());
+}
+
+#[tokio::test]
+async fn replacing_the_source_rewrites_the_file_the_copy_and_the_hash_and_keeps_fitting_settings() {
+    let b = bed();
+    let id = b
+        .install(
+            &add_date(),
+            json!({"settings": {"note": "明天", "days": 3}}),
+        )
+        .await;
+    // 新的一版：`days` 改成了字符串，`note` 没变，多了一个 `loud`
+    let newer = source(
+        json!({"name": "附加日期", "api": 1, "permissions": ["system"],
+               "settings": {"note": {"type": "string", "label": "附加内容", "default": ""},
+                            "days": {"type": "string", "label": "天数", "default": "1"},
+                            "loud": {"type": "boolean", "label": "大声", "default": true}}}),
+        &["onRequest"],
+    );
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/plugins/{id}/source"),
+        Some(json!({"source": newer, "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), newer);
+    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), newer);
+    let cfg = b.parsed();
+    let p = &cfg.plugins[0];
+    assert_eq!(p.sha256, sha(&newer));
+    assert_eq!(p.settings["note"], serde_yaml_ng::Value::from("明天"));
+    assert_eq!(p.settings["days"], serde_yaml_ng::Value::from("1"));
+    assert_eq!(p.settings["loud"], serde_yaml_ng::Value::from(true));
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/plugins/nobody/source",
+        Some(json!({"source": newer})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// I9：磁盘上的文件被改了，插件停用、说一声；看过改动、批准了才回来
+#[tokio::test]
+async fn a_file_edited_on_disk_stops_the_plugin_until_the_change_is_approved() {
+    let b = bed();
+    let id = b
+        .install(&add_date(), json!({"settings": {"days": 2}}))
+        .await;
+    let mut events = b.gw.bus.subscribe();
+
+    let edited = format!("{}// 加了一行\n", add_date());
+    std::fs::write(b.file(&id), &edited).unwrap();
+    b.gw.reload_plugins();
+
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "changed"}));
+    // 批准过的那一份照样显示
+    assert_eq!(v["name"], "附加日期");
+    assert!(b.gw.runtime().plugins.get(&id).unwrap().ready().is_none());
+    match events.try_recv().expect("no plugin_failed") {
+        tw_api::Event::PluginFailed {
+            plugin_id,
+            request_id,
+            message,
+            ..
+        } => {
+            assert_eq!(plugin_id, id);
+            assert_eq!(request_id, None);
+            assert_eq!(message.code, "gw.plugin.file_changed");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let (st, diff) = call(&b.app, "GET", &format!("/plugins/{id}/source"), None).await;
+    assert_eq!(st, StatusCode::OK, "{diff}");
+    assert_eq!(diff["approved"], add_date());
+    assert_eq!(diff["approved_sha256"], sha(&add_date()));
+    assert_eq!(diff["current"], edited);
+    assert_eq!(diff["current_sha256"], sha(&edited));
+
+    // 看过之后又被改了一次：不批
+    let again = format!("{edited}// 又一行\n");
+    std::fs::write(b.file(&id), &again).unwrap();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/approve"),
+        Some(json!({"sha256": sha(&edited), "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "control.plugin.file_moved_on");
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/approve"),
+        Some(json!({"sha256": sha(&again), "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.parsed().plugins[0].sha256, sha(&again));
+    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), again);
+    // 文件本身没被动过；设置照旧
+    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), again);
+    assert_eq!(
+        b.parsed().plugins[0].settings["days"],
+        serde_yaml_ng::Value::from(2)
+    );
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+}
+
+/// 文件被删掉也是「变了」；批准不了一个不存在的文件
+#[tokio::test]
+async fn a_deleted_file_is_changed_and_cannot_be_approved() {
+    let b = bed();
+    let id = b.install(&shout(), json!({})).await;
+    std::fs::remove_file(b.file(&id)).unwrap();
+    b.gw.reload_plugins();
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "changed"}));
+    let (_, diff) = call(&b.app, "GET", &format!("/plugins/{id}/source"), None).await;
+    assert!(
+        diff["current"].is_null() && diff["current_sha256"].is_null(),
+        "{diff}"
+    );
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/approve"),
+        Some(json!({"sha256": sha(&shout())})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "control.plugin.file_missing");
+}
+
+/// 底稿也被人动过：说不出批准的是什么，就不拿它冒充
+#[tokio::test]
+async fn a_tampered_approved_copy_is_not_shown_as_approved() {
+    let b = bed();
+    let id = b.install(&shout(), json!({})).await;
+    std::fs::write(b.approved(&id), "something else").unwrap();
+    let (_, diff) = call(&b.app, "GET", &format!("/plugins/{id}/source"), None).await;
+    assert_eq!(diff["approved"], "");
+    assert_eq!(diff["current"], shout());
+}
+
+/// 目录监听：插件文件一动，几秒之内就停用，不等下一次改配置
+#[tokio::test]
+async fn the_watcher_notices_an_edited_plugin_within_seconds() {
+    let b = bed();
+    let id = b.install(&shout(), json!({})).await;
+    let _w = tw_control::plugins::spawn_watcher(b.gw.clone(), &b.dir.join("config.yaml")).unwrap();
+    std::fs::write(b.file(&id), format!("{}// x\n", shout())).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if b.gw.runtime().plugins.get(&id).unwrap().broken().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the edited plugin kept running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "changed"}));
+}
+
+#[tokio::test]
+async fn updating_changes_the_switches_scope_and_settings_and_nothing_else() {
+    let b = bed();
+    let id = b.install(&add_date(), json!({})).await;
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/plugins/{id}"),
+        Some(json!({"enabled": false, "on_error": "skip",
+                    "scope": {"clients": [], "models": ["claude-*"], "upstreams": ["anthropic"]},
+                    "settings": {"note": "后天", "days": 2.5},
+                    "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let cfg = b.parsed();
+    let p = &cfg.plugins[0];
+    assert!(!p.enabled);
+    assert_eq!(p.on_error, tw_config::PluginOnError::Skip);
+    assert!(p.scope.clients.is_empty());
+    assert_eq!(p.scope.models, ["claude-*"]);
+    assert_eq!(p.settings["days"], serde_yaml_ng::Value::from(2.5));
+    assert_eq!(p.sha256, sha(&add_date()));
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "disabled"}));
+    assert_eq!(v["on_error"], "skip");
+    assert_eq!(v["scope"]["upstreams"], json!(["anthropic"]));
+
+    for (settings, code) in [
+        (json!({"days": true}), "gw.plugin.setting_type"),
+        (json!({"nope": 1}), "gw.plugin.setting_unknown"),
+    ] {
+        let (st, v) = call(
+            &b.app,
+            "PUT",
+            &format!("/plugins/{id}"),
+            Some(json!({"enabled": true, "on_error": "reject",
+                        "scope": {"clients": [], "models": [], "upstreams": []},
+                        "settings": settings})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], code);
+    }
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/plugins/{id}"),
+        Some(json!({"enabled": true, "on_error": "reject",
+                    "scope": {"clients": [" "], "models": [], "upstreams": []},
+                    "settings": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "control.plugin.blank_pattern");
+    let (st, _) = call(
+        &b.app,
+        "PUT",
+        "/plugins/nobody",
+        Some(json!({"enabled": true, "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reordering_changes_the_run_order_and_needs_every_plugin_once() {
+    let b = bed();
+    let a = b.install(&shout(), json!({"id": "a"})).await;
+    let c = b.install(&shout(), json!({"id": "c"})).await;
+    let d = b.install(&add_date(), json!({"id": "d"})).await;
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/plugins/order",
+        Some(json!({"ids": [d, a, c], "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ids: Vec<String> = b.parsed().plugins.into_iter().map(|p| p.id).collect();
+    assert_eq!(ids, ["d", "a", "c"]);
+    let listed: Vec<String> = b
+        .plugins()
+        .await
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed, ["d", "a", "c"]);
+    // 每一项搬过去时整项都在
+    assert_eq!(b.parsed().plugins[0].settings.len(), 2);
+
+    for ids in [
+        json!(["d", "a"]),
+        json!(["d", "a", "a"]),
+        json!(["d", "a", "x"]),
+    ] {
+        let (st, v) = call(&b.app, "PUT", "/plugins/order", Some(json!({"ids": ids}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "control.plugin.order");
+    }
+}
+
+#[tokio::test]
+async fn deleting_removes_the_entry_and_both_files() {
+    let b = bed();
+    let id = b.install(&shout(), json!({})).await;
+    let (st, v) = call(
+        &b.app,
+        "DELETE",
+        &format!("/plugins/{id}?base_version={}", b.version().await),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().plugins.is_empty());
+    assert!(!b.config().contains("plugins:"), "{}", b.config());
+    assert!(!b.file(&id).exists() && !b.approved(&id).exists());
+    assert!(b.plugins().await.is_empty());
+    let (st, _) = call(&b.app, "DELETE", &format!("/plugins/{id}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 计数和日志：数据面每跑一次报一次，界面从这里取
+#[tokio::test]
+async fn runs_show_up_in_the_stats_and_the_logs() {
+    let b = bed();
+    let id = b.install(&add_date(), json!({})).await;
+    let active = b.gw.runtime().plugins.get(&id).unwrap().clone();
+    b.gw.plugin_ran(
+        7,
+        &active,
+        tw_gateway::plugin::PluginRun {
+            plugin_id: id.clone(),
+            plugin_name: active.name.clone(),
+            hook: tw_api::PluginHook::Request,
+            outcome: tw_api::PluginOutcome::Changed,
+            error: None,
+            cpu_us: 300,
+            detail: None,
+        },
+        vec![tw_gateway::plugin::LogLine {
+            level: tw_api::PluginLogLevel::Warn,
+            text: "<b>not markup</b>".into(),
+        }],
+    );
+    let v = b.plugin(&id).await;
+    assert_eq!(v["stats"]["calls"], 1);
+    assert_eq!(v["stats"]["changed"], 1);
+    assert_eq!(v["stats"]["avg_cpu_us"], 300);
+    let (st, logs) = call(&b.app, "GET", &format!("/plugins/{id}/logs"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(logs[0]["request_id"], 7);
+    assert_eq!(logs[0]["hook"], "request");
+    assert_eq!(logs[0]["level"], "warn");
+    assert_eq!(logs[0]["text"], "<b>not markup</b>");
+    let (st, _) = call(&b.app, "GET", "/plugins/nobody/logs", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+fn row(id: i64, at_ms: i64) -> tw_store::RequestRow {
+    tw_store::RequestRow {
+        session_log_bytes: None,
+        key_masked: None,
+        peer: None,
+        id,
+        at_ms,
+        client: "default".into(),
+        client_hint: Some("claude-code".into()),
+        session: None,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-5".into(),
+        sent_model: "claude-sonnet-4-5".into(),
+        answered_model: None,
+        path: "/v1/messages".into(),
+        status: Some(200),
+        ttfb_ms: Some(100),
+        ttft_ms: None,
+        duration_ms: Some(200),
+        tokens_per_sec: None,
+        bytes: Some(10),
+        input_tokens: Some(50),
+        output_tokens: Some(20),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        input_estimate: None,
+        cost_micros: Some(1_000),
+        cost_estimated: false,
+        error: None,
+        local: false,
+        cancelled: false,
+        routing: None,
+        billing: tw_api::Billing::PerToken,
+        cache_saved_micros: None,
+        price_source: None,
+        translated: None,
+    }
+}
+
+fn run_row(request_id: i64, at_ms: i64, outcome: tw_api::PluginOutcome) -> tw_store::PluginRunRow {
+    tw_store::PluginRunRow {
+        request_id,
+        at_ms,
+        plugin_id: "add-date".into(),
+        plugin_name: "附加日期".into(),
+        hook: tw_api::PluginHook::Request,
+        outcome,
+        error: None,
+        cpu_us: 120,
+        detail: None,
+    }
+}
+
+/// I10：每一次运行记在那条请求上 —— 详情里列得出来，改过的请求在列表上带徽标，
+/// 改过之后的请求体和别的正文一样打着码给出来（落盘前那一道在网关的
+/// `BodyRecord::for_disk`，这里直接写进存储，看的是读出来那一道）
+#[tokio::test]
+async fn a_request_shows_its_plugin_runs_and_the_body_after_them() {
+    let b = bed();
+    {
+        let g = b.store.lock().await;
+        g.db().insert(&row(1, 1_000)).unwrap();
+        g.db().insert(&row(2, 2_000)).unwrap();
+        g.record_plugin_run(&run_row(1, 1_000, tw_api::PluginOutcome::Changed));
+        let mut reply = run_row(1, 1_500, tw_api::PluginOutcome::Error);
+        reply.hook = tw_api::PluginHook::Reply;
+        reply.error = Some(tw_types::msg!("gw.plugin.failed" => "The plugin failed."));
+        g.record_plugin_run(&reply);
+        g.record_plugin_run(&run_row(2, 2_000, tw_api::PluginOutcome::Unchanged));
+        g.record_body(
+            1_000,
+            1,
+            tw_store::Which::Request,
+            b"{\"system\":\"hi\"}",
+            15,
+        );
+        let after = br#"{"system":"hi, today is Friday","key":"sk-ant-api03-USERSOWNKEYAAAAAAAAAAAAAAAAAA"}"#;
+        g.record_body(1_000, 1, tw_store::Which::AfterPlugins, after, after.len());
+    }
+    let (st, d) = call(&b.app, "GET", "/request/1", None).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let runs = d["plugins"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["hook"], "request");
+    assert_eq!(runs[0]["outcome"], "changed");
+    assert_eq!(runs[0]["cpu_us"], 120);
+    assert_eq!(runs[1]["hook"], "reply");
+    assert_eq!(runs[1]["error"]["code"], "gw.plugin.failed");
+    assert_eq!(d["row"]["plugin_changed"], true);
+    let after = d["request_after_plugins"]["text"].as_str().unwrap();
+    assert!(after.contains("today is Friday"), "{after}");
+    assert!(
+        !after.contains("USERSOWNKEY"),
+        "a secret was shown: {after}"
+    );
+    assert_eq!(d["request_after_plugins"]["truncated"], false);
+
+    let (_, d2) = call(&b.app, "GET", "/request/2", None).await;
+    assert_eq!(d2["row"]["plugin_changed"], false);
+    assert!(d2["request_after_plugins"].is_null());
+
+    let (_, list) = call(&b.app, "GET", "/history?limit=10", None).await;
+    let flags: Vec<(i64, bool)> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_i64().unwrap(),
+                r["plugin_changed"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(flags, [(2, false), (1, true)]);
+    // 搜索翻出来的那一页也带着
+    let (_, page) = call(
+        &b.app,
+        "POST",
+        "/history/search",
+        Some(json!({"limit": 10})),
+    )
+    .await;
+    let flags: Vec<bool> = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["plugin_changed"].as_bool().unwrap())
+        .collect();
+    assert_eq!(flags, [false, true]);
+}
+
+#[tokio::test]
+async fn a_trial_needs_a_known_plugin_and_a_recorded_request() {
+    let b = bed();
+    let id = b.install(&add_date(), json!({})).await;
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["code"], "control.request_not_found");
+    b.store.lock().await.db().insert(&row(9, 1_000)).unwrap();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/nobody/trial",
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["error"]["code"].is_string(), "{v}");
+    assert!(v["logs"].as_array().unwrap().is_empty());
+
+    // 改过还没批准的代码不试
+    std::fs::write(b.file(&id), "changed").unwrap();
+    b.gw.reload_plugins();
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "control.plugin.trial_changed");
+}
+
+/// 远程 core：配置不在默认的地方，插件文件就在那份配置旁边 —— 文件由 core 自己写
+#[tokio::test]
+async fn plugin_files_live_next_to_the_configuration_wherever_it_is() {
+    let b = bed_in("srv/thinkwatch/etc");
+    let id = b.install(&shout(), json!({})).await;
+    let expected = b.dir.join("plugins").join(format!("{id}.js"));
+    assert!(expected.exists(), "{}", expected.display());
+    assert!(
+        b.dir
+            .join("plugins/.approved")
+            .join(format!("{id}.js"))
+            .exists()
+    );
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+    assert_eq!(
+        tw_control::plugins::dir_of(Path::new("config.yaml")),
+        PathBuf::from(".")
+    );
+}
+
+/// 一份手写的配置里插件文件改了（core 不在跑的时候）：启动时读到的就是「变了」
+#[tokio::test]
+async fn a_plugin_changed_while_core_was_down_starts_out_changed() {
+    let b = bed();
+    let id = b.install(&shout(), json!({})).await;
+    std::fs::write(b.file(&id), "tampered").unwrap();
+    // 重新起一份网关和控制面，读同一份配置
+    let cfg = b.parsed();
+    let gw = tw_gateway::AppState::new(cfg).unwrap();
+    gw.set_plugin_engine(Arc::new(FakeEngine));
+    let _mgr = ConfigManager::new(b.dir.join("config.yaml"), gw.clone(), gw.bus.clone());
+    let p = gw.runtime().plugins.get(&id).unwrap().clone();
+    assert_eq!(p.broken(), Some(&tw_gateway::plugin::Broken::Changed));
+}

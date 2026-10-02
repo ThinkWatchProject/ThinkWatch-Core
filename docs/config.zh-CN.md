@@ -106,6 +106,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `routes` | 对象列表，见 [`routes[]`](#cfg-routes) | `[]` | 路由。一条都不写时，请求按上游的声明顺序故障转移。 |
 | `default_route` | 字符串 | — | 未指定路由的密钥走哪条路由。不写：名为 `default` 的路由；没有这条路由时走内置的故障转移。 |
 | `default_key` | 字符串 | — | 没有专用密钥的客户端使用哪一把。不写：名为 `default` 的那把，没有则取第一把。这把密钥不能停用。 |
+| `plugins` | 对象列表，见 [`plugins[]`](#cfg-plugins) | `[]` | 脚本插件，按运行的顺序。由应用安装，每个插件的代码是本文件旁边的一个文件。 |
 <!-- /generated -->
 
 ### `listen`
@@ -822,6 +823,52 @@ routes:
       - name: 其余
         to: fast
 default_route: default
+```
+
+### `plugins`
+
+脚本插件在请求发往上游之前改写请求，在回答到达客户端之前改写回答。插件运行在 core 内部的沙箱中，无法访问文件、网络，也看不到密钥的真实值。插件由应用安装：代码写入本文件旁边的 `plugins/<id>.js`，批准过的代码另存一份在 `plugins/.approved/<id>.js`，代码的 SHA-256 写入 `sha256`。
+
+只有文件的哈希与批准时一致，插件才会运行。磁盘上的文件被改动或删除后，插件会在几秒内停止运行，应用里会列出改动供审阅。批准之前，插件覆盖的请求会被拒绝（`on_error: reject`），或者跳过这个插件照常发出（`on_error: skip`）。加载失败的插件按同样的方式处理。两种情况都不影响配置其余部分生效。
+
+插件按本列表的顺序运行。
+
+<!-- generated: table plugins[] -->
+<a id="cfg-plugins"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `id` | 字符串 | **必填** | 小写字母、数字和连字符，1 到 40 个字符，不能重复。`order` 和 `inspect` 被控制面占用。 |
+| `file` | 字符串 | **必填** | 插件的代码，相对本文件所在的目录。只能是 `plugins/<id>.js`，由应用写入。 |
+| `sha256` | 字符串 | **必填** | 批准过的代码的 SHA-256，64 个小写十六进制字符。文件的哈希与它不符时插件停止运行，直到在应用里批准这次改动。批准过的代码另存在 `plugins/.approved/<id>.js`。 |
+| `enabled` | 布尔 | `true` | 是否运行这个插件。`false`：插件保留，不参与任何请求。 |
+| `on_error` | `reject` \| `skip` | `reject` | 插件在请求上出错，或者因文件改动、加载失败而无法运行时：`reject` 拒绝它所覆盖的请求；`skip` 跳过这个插件，请求照常。 |
+| `scope` | 对象，见 [`plugins[].scope`](#cfg-plugins-scope) | — | 插件处理哪些请求。安装时按插件自己的建议填写。 |
+| `settings` | 设置项 → 字符串、数字或布尔的映射 | `{}` | 插件所声明设置项的值。未写的取插件的默认值；插件未声明的设置项或类型不符的值会使插件无法加载。 |
+<!-- /generated -->
+
+<!-- generated: table plugins[].scope -->
+<a id="cfg-plugins-scope"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `clients` | 字符串列表 | `[]` | 客户端应用（`claude-code`、`codex` 等），写名字或通配。`[]`：所有客户端，包括认不出应用的请求。 |
+| `models` | 字符串列表 | `[]` | 客户端请求的模型，写模型 ID 或通配（`claude-*`）。`[]`：所有模型。 |
+| `upstreams` | 字符串列表 | `[]` | 插件处理哪些上游的回答，写名字或通配。只作用于回答：请求在选定上游之前就已改写。`[]`：所有上游。 |
+<!-- /generated -->
+
+```yaml
+plugins:
+  - id: add-date
+    file: plugins/add-date.js
+    sha256: 9f2b6c0e4a1d8f3b7c5e2a9d6f1b4c8e3a7d0f5b2c9e6a1d4f8b3c7e0a5d2f9b
+    enabled: true
+    on_error: reject
+    scope:
+      clients: [claude-code]
+      models: ["claude-*"]
+    settings:
+      note: 用中文回答。
 ```
 
 ## 环境变量

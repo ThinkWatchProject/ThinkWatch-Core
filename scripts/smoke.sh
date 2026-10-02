@@ -286,6 +286,9 @@ REMOVED=$(diff "$TMP/config.before" "$CFG" | grep -c '^<')
 
 MODE=$(mode_of "$THINKWATCH_HOME/data.db" || echo -)
 [ "$MODE" = "600" ] && ok "data.db 是 0600" || bad "data.db 权限是 $MODE"
+# 插件目录起来就在（盯它要它在），**只给自己看**：插件代码和它的底稿都在里面
+MODE=$(mode_of "$THINKWATCH_HOME/plugins" || echo -)
+[ "$MODE" = "700" ] && ok "plugins/ 是 0700" || bad "plugins/ 权限是 $MODE，该是 700"
 
 # ---------------------------------------------------------------- 数据面
 step "数据面"
@@ -460,7 +463,7 @@ done
 
 for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
           /security/events /sessions /diagnostics /config /config/history /models /in-flight /live \
-          /upstreams/health; do
+          /upstreams/health /plugins; do
   C=$(get "$ep")
   [ "$C" = "200" ] && ok "GET $ep" || bad "GET $ep 返回 $C"
 done

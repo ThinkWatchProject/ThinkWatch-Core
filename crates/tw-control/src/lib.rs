@@ -31,6 +31,7 @@ pub mod dryrun;
 mod gate;
 pub mod keys;
 pub mod listen;
+pub mod plugins;
 pub mod pricing;
 pub mod remote;
 pub mod replay;
@@ -138,6 +139,7 @@ pub fn router(state: ControlState) -> Router {
         .merge(resources::router())
         .merge(routes::router())
         .merge(security::router())
+        .merge(plugins::router())
         .merge(pricing::router())
         .merge(chatgpt::router())
         .merge(zai::router())
@@ -763,11 +765,23 @@ async fn history(
         (Some(from), Some(to)) => g.db().security_of_requests(from, to).map_err(records)?,
         _ => Default::default(),
     };
+    // 插件改过的那些，同样一次取完
+    let changed = match (
+        rows.iter().map(|r| r.id).min(),
+        rows.iter().map(|r| r.id).max(),
+    ) {
+        (Some(from), Some(to)) => g
+            .db()
+            .changed_by_plugins_between(from, to)
+            .map_err(records)?,
+        _ => Default::default(),
+    };
     Ok(Json(
         rows.into_iter()
             .map(|r| {
                 let sec = security.remove(&r.id).unwrap_or_default();
-                history_row(r, sec)
+                let by_plugins = changed.contains(&r.id);
+                history_row(r, sec, by_plugins)
             })
             .collect(),
     ))
@@ -799,14 +813,21 @@ async fn history_search(
     };
     // 这一页的安全记录，徽标靠它（和 `GET /history` 一样）
     let ids: Vec<i64> = found.rows.iter().map(|r| r.id).collect();
-    let mut security = store.lock().await.db().security_of(&ids).map_err(records)?;
+    let (mut security, changed) = {
+        let g = store.lock().await;
+        (
+            g.db().security_of(&ids).map_err(records)?,
+            g.db().changed_by_plugins(&ids).map_err(records)?,
+        )
+    };
     Ok(Json(tw_api::HistorySearchPage {
         rows: found
             .rows
             .into_iter()
             .map(|r| {
                 let sec = security.remove(&r.id).unwrap_or_default();
-                history_row(r, sec)
+                let by_plugins = changed.contains(&r.id);
+                history_row(r, sec, by_plugins)
             })
             .collect(),
         hits: found.hits,
@@ -1028,10 +1049,30 @@ async fn request_detail(
         .map_err(records)?
         .remove(&id)
         .unwrap_or_default();
+    // 插件的每一次运行。**还在跑的请求也有**：请求钩子在发往上游之前就记下了
+    let plugins: Vec<tw_api::PluginRunView> = g
+        .db()
+        .plugin_runs(id)
+        .map_err(records)?
+        .into_iter()
+        .map(|r| tw_api::PluginRunView {
+            plugin_id: r.plugin_id,
+            plugin_name: r.plugin_name,
+            hook: r.hook,
+            outcome: r.outcome,
+            error: r.error,
+            cpu_us: r.cpu_us.max(0) as u64,
+        })
+        .collect();
+    let by_plugins = plugins
+        .iter()
+        .any(|p| p.outcome == tw_api::PluginOutcome::Changed);
     let detail = tw_api::RequestDetail {
         request_body: body(tw_store::Which::Request),
+        request_after_plugins: body(tw_store::Which::AfterPlugins),
         response_body: body(tw_store::Which::Response),
-        row: history_row(row, security),
+        plugins,
+        row: history_row(row, security, by_plugins),
         in_flight,
     };
     Ok(Json(detail))
@@ -1157,7 +1198,9 @@ async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
     })
 }
 
-fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Recorder>>, Fail> {
+pub(crate) fn need_store(
+    s: &ControlState,
+) -> Result<&Arc<tokio::sync::Mutex<tw_store::Recorder>>, Fail> {
     s.store.as_ref().ok_or_else(|| {
         fail(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1173,6 +1216,7 @@ fn need_store(s: &ControlState) -> Result<&Arc<tokio::sync::Mutex<tw_store::Reco
 fn history_row(
     r: tw_store::RequestRow,
     security: Vec<tw_api::SecurityEventView>,
+    plugin_changed: bool,
 ) -> tw_api::HistoryRow {
     tw_api::HistoryRow {
         id: r.id,
@@ -1219,6 +1263,7 @@ fn history_row(
         key_masked: r.key_masked,
         session_log_bytes: r.session_log_bytes,
         security,
+        plugin_changed,
     }
 }
 
