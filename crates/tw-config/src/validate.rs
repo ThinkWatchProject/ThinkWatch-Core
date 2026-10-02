@@ -74,6 +74,20 @@ pub enum ValidationError {
     RemotePortIsGateway { port: u16 },
     #[error("{}", self.msg())]
     BadRemoteCidr { entry: String },
+    #[error("{}", self.msg())]
+    PluginId { id: String },
+    #[error("{}", self.msg())]
+    PluginIdReserved { id: String },
+    #[error("{}", self.msg())]
+    DuplicatePlugin { id: String },
+    #[error("{}", self.msg())]
+    PluginFile { id: String, file: String },
+    #[error("{}", self.msg())]
+    PluginSha256 { id: String },
+    #[error("{}", self.msg())]
+    BlankPluginPattern { id: String },
+    #[error("{}", self.msg())]
+    PluginSettingType { id: String, key: String },
 }
 
 impl ValidationError {
@@ -207,6 +221,35 @@ impl ValidationError {
                 "config.bad_remote_allow_from", entry = entry =>
                 "`{entry}` in listen.control.remote.allow_from is wrong: not a valid IP address or \
                  CIDR; it is written as 192.168.0.0/16"
+            ),
+            PluginId { id } => msg!(
+                "config.plugin.bad_id", plugin = id, max = crate::plugins::ID_MAX =>
+                "the plugin id `{plugin}` is written wrongly: lowercase letters, digits and \
+                 hyphens, 1 to {max} characters"
+            ),
+            PluginIdReserved { id } => msg!(
+                "config.plugin.reserved_id", plugin = id =>
+                "`{plugin}` cannot be a plugin id: the control plane uses that word itself"
+            ),
+            DuplicatePlugin { id } => msg!(
+                "config.plugin.duplicate", plugin = id =>
+                "the plugin id `{plugin}` appears twice"
+            ),
+            PluginFile { id, file } => msg!(
+                "config.plugin.file", plugin = id, file = file =>
+                "the file of plugin `{plugin}` is {file}; it has to be plugins/{plugin}.js"
+            ),
+            PluginSha256 { id } => msg!(
+                "config.plugin.sha256", plugin = id =>
+                "the sha256 of plugin `{plugin}` has to be 64 lowercase hexadecimal characters"
+            ),
+            BlankPluginPattern { id } => msg!(
+                "config.plugin.blank_pattern", plugin = id =>
+                "the scope of plugin `{plugin}` has an empty entry"
+            ),
+            PluginSettingType { id, key } => msg!(
+                "config.plugin.setting_type", plugin = id, key = key =>
+                "setting `{key}` of plugin `{plugin}` has to be a string, a number or true/false"
             ),
         }
     }
@@ -405,6 +448,9 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
         }
         Some(_) => {}
     }
+    // 插件。**只查不看插件文件也判断得了的**：文件变没变、设置对不对得上 manifest，
+    // 是网关加载那一个插件时的事，出了问题只停那一个，不挡整份配置
+    crate::plugins::check(&cfg.plugins)?;
     // 远程控制端口。**没开也照样查**：开关一拨就生效，写错的地方要在写下去
     // 的那一刻说，不是等到有人打开它的时候
     if let Some(r) = &cfg.listen.control.remote {

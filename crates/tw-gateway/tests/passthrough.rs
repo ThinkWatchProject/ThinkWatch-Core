@@ -413,6 +413,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
         failover: Default::default(),
         default_route: None,
         default_key: None,
+        plugins: Vec::new(),
         version: 1,
         listen: Listen::default(),
         clients: vec![Client {

@@ -110,6 +110,7 @@ async fn world() -> World {
             let which = match disk.kind {
                 tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
                 tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
+                tw_gateway::bodies::BodyKind::AfterPlugins => tw_store::Which::AfterPlugins,
             };
             let stored = tw_store::StoredBody {
                 id: disk.id,

@@ -1,0 +1,388 @@
+//! 试跑：拿一个存下来的请求（和它的回答）让一个插件跑一遍，看它改了什么。
+//!
+//! **不碰任何上游**：请求钩子对着存下来的请求体跑，回答钩子对着存下来的回答跑 ——
+//! 回答先按客户端的格式收成一整份（流也收成整包），所以回答钩子是整块模式的行为
+//! （流式模式的插件收到一次全文，再调一次 `onReplyTextEnd`），和非流式的回答一样。
+//!
+//! 给人看的前后两份都是**换过占位符的**：插件本来就只看得到占位符，界面上显示的也
+//! 不该是真值。试跑不进统计、不进日志圈、不留请求记录，日志交给调用方。
+//!
+//! `ctx` 按那一行记下的路由给：`upstream` 是回答它的那一家，`model` 是发给那一家的
+//! 模型名，`requested_model` 是客户端要的 —— 和那个请求当时跑插件时看到的一样
+//! （契约附录二）。
+
+use std::sync::Arc;
+
+use serde_json::Value;
+use tw_api::{PluginHook as Hook, PluginOutcome as Outcome};
+use tw_dialect::ir::Dialect;
+use tw_types::{Msg, msg};
+
+use super::bridge::Bridge;
+use super::host::{PluginHost, RequestOutcome};
+use super::pool::Pool;
+use super::request::{Shape, cannot_read, rejected, request_unreadable};
+use super::set::LogLine;
+use super::view;
+
+/// 存下来的请求：客户端调的路径、查询串、请求体，和请求那一行上记的客户端、路由。
+pub struct StoredRequest<'a> {
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    pub body: &'a [u8],
+    pub client: Option<&'a str>,
+    /// 回答它的那一家（请求那一行的 `provider`）。没发出去的是空的
+    pub upstream: &'a str,
+    /// 发给那一家的模型名（请求那一行的 `sent_model`）。空的话按客户端要的那个
+    pub sent_model: &'a str,
+}
+
+/// 存下来的回答：上游的原话（流或者整包），它是什么格式、哪一家回的。
+pub struct StoredReply<'a> {
+    pub body: &'a [u8],
+    pub upstream: Dialect,
+    pub provider: &'a str,
+}
+
+/// 试跑的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trial {
+    pub request: Option<Side>,
+    pub reply: Option<Side>,
+    /// 按调用的先后，每条带着是哪个钩子写的
+    pub logs: Vec<(Hook, LogLine)>,
+    /// 插件拒绝了请求、出了错、或者存下来的东西读不出来
+    pub error: Option<Msg>,
+}
+
+/// 一边改之前和改之后：缩进排好的 JSON，密钥换成了占位符。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Side {
+    pub before: String,
+    pub after: String,
+    pub outcome: Outcome,
+}
+
+fn pretty(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+/// 试跑的这个请求调的接口插件一律不管：当时没有插件跑在它上面
+fn not_applicable(path: &str) -> Msg {
+    msg!(
+        "gw.plugin.not_applicable", path = path =>
+        "Plugins do not run on requests to {path}."
+    )
+}
+
+/// 插件没声明这种请求（manifest 的 `requests`）：当时它不在这个请求的范围里
+fn not_declared(plugin: &str) -> Msg {
+    msg!(
+        "gw.plugin.not_declared", plugin = plugin =>
+        "Plugin `{plugin}` does not handle this kind of request."
+    )
+}
+
+/// 存下来的回答读不出来
+fn answer_unreadable(detail: impl Into<String>) -> Msg {
+    msg!(
+        "gw.plugin.answer_unreadable", detail = detail.into() =>
+        "The answer could not be read for the plugin: {detail}"
+    )
+}
+
+/// 让 `host` 对着存下来的请求和回答各跑一遍。`rules` 是出站脱敏的规则（换占位符用），
+/// `settings` 是这个插件的设置。
+///
+/// 一边都没跑成（插件的钩子和存下来的东西对不上：只有回答钩子而回答没存下来……）
+/// 也给一句原因，不交回一个什么都没有的结果
+pub async fn run(
+    pool: Arc<Pool>,
+    host: Arc<dyn PluginHost>,
+    settings: &serde_json::Map<String, Value>,
+    rules: Arc<tw_guard::redact::rules::RuleSet>,
+    request: Option<StoredRequest<'_>>,
+    reply: Option<StoredReply<'_>>,
+) -> Trial {
+    let mut t = tried(pool, host, settings, rules, request, reply).await;
+    if t.request.is_none() && t.reply.is_none() && t.error.is_none() {
+        t.error = Some(msg!(
+            "gw.plugin.nothing_to_try" =>
+            "This request has nothing stored that the plugin's hooks run on."
+        ));
+    }
+    t
+}
+
+async fn tried(
+    pool: Arc<Pool>,
+    host: Arc<dyn PluginHost>,
+    settings: &serde_json::Map<String, Value>,
+    rules: Arc<tw_guard::redact::rules::RuleSet>,
+    request: Option<StoredRequest<'_>>,
+    reply: Option<StoredReply<'_>>,
+) -> Trial {
+    let mut t = Trial {
+        request: None,
+        reply: None,
+        logs: Vec::new(),
+        error: None,
+    };
+    let mut bridge = Bridge::new(rules);
+    let dialect = request
+        .as_ref()
+        .and_then(|r| crate::client_api::ClientApi::of_path(r.path))
+        .map(|a| a.dialect());
+    let parsed = request
+        .as_ref()
+        .and_then(|r| serde_json::from_slice::<Value>(r.body).ok());
+    if let Some(r) = &request {
+        bridge.learn(r.body);
+    }
+    let requested = match (&request, dialect) {
+        (Some(r), Some(d)) => super::request::asked_model(d, r.path, parsed.as_ref()),
+        _ => String::new(),
+    };
+    // 发给上游的模型名和上游：那一行记下的路由
+    let model = request
+        .as_ref()
+        .map(|r| r.sent_model)
+        .filter(|m| !m.is_empty())
+        .map_or_else(|| requested.clone(), str::to_string);
+    let upstream = request
+        .as_ref()
+        .map(|r| r.upstream)
+        .filter(|u| !u.is_empty())
+        .or(reply.as_ref().map(|r| r.provider))
+        .unwrap_or_default()
+        .to_string();
+    let client = request.as_ref().and_then(|r| r.client);
+    let name = host.manifest().name.clone();
+
+    // ── 请求钩子：和这个请求当时一样看（见 [`super::request::Shape`]）。插件不管的接口、
+    // 插件没声明的那种请求，当时它就没跑：试也不试，说清为什么
+    let shape = request.as_ref().map(|r| Shape::of(r.path));
+    if let (Some(r), Some(shape), true) = (&request, shape, host.manifest().hooks.request) {
+        // 认不出的接口没有格式，插件也不管它
+        let form = dialect.and_then(|d| Some((d, shape.form(d)?)));
+        match (form, parsed.as_ref()) {
+            (None, _) => t.error = Some(not_applicable(r.path)),
+            (Some((_, f)), _) if !host.manifest().requests.contains(&f.kind()) => {
+                t.error = Some(not_declared(&name))
+            }
+            (Some(_), None) => t.error = Some(cannot_read(&name, "the request body is not JSON")),
+            (Some((d, form)), Some(raw)) => {
+                let mut masked = raw.clone();
+                bridge.hide_value(&mut masked);
+                let readable = super::request::wrapped_count(d, r.path, &masked).unwrap_or(&masked);
+                match view::build(form, readable, r.path) {
+                    Err(e) => t.error = Some(cannot_read(&name, &e)),
+                    Ok(mut built) => {
+                        let m = host.manifest();
+                        super::request::sending(&mut built.view, &model);
+                        let input = view::trim(&built.view, &m.permissions);
+                        let ctx = super::request::ctx(
+                            client,
+                            &model,
+                            &requested,
+                            form.name(),
+                            &upstream,
+                            settings,
+                        );
+                        let (h, given) = (host.clone(), input.clone());
+                        let before = pretty(&masked);
+                        let ran = pool.run(move || h.on_request(given, ctx)).await;
+                        let (outcome, after, error): (Outcome, String, Option<Msg>) = match ran {
+                            Err(e) => (
+                                Outcome::Error,
+                                before.clone(),
+                                Some(super::host::RunError::Trap(e.to_string()).msg()),
+                            ),
+                            Ok(inv) => {
+                                t.logs
+                                    .extend(inv.logs.into_iter().map(|l| (Hook::Request, l)));
+                                match inv.result {
+                                    Err(e) => (Outcome::Error, before.clone(), Some(e.msg())),
+                                    Ok(RequestOutcome::Unchanged) => {
+                                        (Outcome::Unchanged, before.clone(), None)
+                                    }
+                                    Ok(RequestOutcome::Rejected(reason)) => (
+                                        Outcome::Rejected,
+                                        before.clone(),
+                                        Some(rejected(&name, reason)),
+                                    ),
+                                    Ok(RequestOutcome::Changed(out)) => {
+                                        match built.src.check(&input, &out, &m.permissions) {
+                                            Err(e) => {
+                                                (Outcome::Error, before.clone(), Some(e.msg()))
+                                            }
+                                            Ok(mut edits) => {
+                                                if shape == Shape::Alike {
+                                                    super::request::model_only(&mut edits);
+                                                }
+                                                if edits.is_empty() {
+                                                    (Outcome::Unchanged, before.clone(), None)
+                                                } else {
+                                                    let mut next = masked.clone();
+                                                    match super::request::write_back(
+                                                        d, &mut next, &built.src, &edits, r.path,
+                                                        &model,
+                                                    ) {
+                                                        Ok(_) => {
+                                                            (Outcome::Changed, pretty(&next), None)
+                                                        }
+                                                        Err(e) => (
+                                                            Outcome::Error,
+                                                            before.clone(),
+                                                            Some(e.msg()),
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        if error.is_some() {
+                            t.error = error;
+                        }
+                        t.request = Some(Side {
+                            before,
+                            after,
+                            outcome,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 回答钩子：只在生成回答的对话上跑（嵌入、补全、数 token 都不跑）
+    let Some(reply) = reply else {
+        return t;
+    };
+    if !host.manifest().hooks.on_reply() || shape.is_some_and(|s| s != Shape::Generate) {
+        return t;
+    }
+    // 回答按客户端的格式收成一整份
+    let client_dialect = dialect.unwrap_or(reply.upstream);
+    let whole = match (&request, parsed.as_ref()) {
+        (Some(r), Some(raw)) => collect(client_dialect, raw, r.path, r.query, &reply),
+        _ if client_dialect == reply.upstream && !looks_like_sse(reply.body) => {
+            Ok(reply.body.to_vec())
+        }
+        _ => Err(answer_unreadable("the request it answered is missing")),
+    };
+    let whole = match whole {
+        Ok(w) => w,
+        Err(e) => {
+            t.error.get_or_insert(e);
+            return t;
+        }
+    };
+    let Ok(mut masked) = serde_json::from_slice::<Value>(&whole) else {
+        t.error
+            .get_or_insert(answer_unreadable("the answer is not JSON"));
+        return t;
+    };
+    bridge.hide_value(&mut masked);
+    let before = pretty(&masked);
+    let ctx = super::reply::ReplyCtx {
+        dialect: client_dialect,
+        client,
+        model: &model,
+        requested_model: &requested,
+        upstream: reply.provider,
+        request_id: 0,
+        attempt: 0,
+    };
+    let mut chain = match super::reply::Chain::trial(pool, host.clone(), settings, &ctx).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return t,
+        Err(e) => {
+            t.error.get_or_insert(e);
+            t.reply = Some(Side {
+                after: before.clone(),
+                before,
+                outcome: Outcome::Error,
+            });
+            return t;
+        }
+    };
+    let ran = super::reply::whole(&mut chain, masked.to_string().as_bytes()).await;
+    t.logs.extend(
+        chain
+            .take_trial_logs()
+            .into_iter()
+            .map(|l| (Hook::Reply, l)),
+    );
+    let (outcome, after) = match ran {
+        Err(e) => {
+            t.error.get_or_insert(e.detail);
+            (Outcome::Error, before.clone())
+        }
+        Ok(b) => match serde_json::from_slice::<Value>(&b) {
+            Ok(v) if v != masked => (Outcome::Changed, pretty(&v)),
+            _ => (Outcome::Unchanged, before.clone()),
+        },
+    };
+    t.reply = Some(Side {
+        before,
+        after,
+        outcome,
+    });
+    t
+}
+
+fn looks_like_sse(body: &[u8]) -> bool {
+    let start = body
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    !matches!(body.get(start), Some(b'{') | Some(b'['))
+}
+
+/// 上游的原话按客户端的格式收成一整份：同一份转换会话（从存下来的请求解出来），流用
+/// 收集器收，整包按响应转。Gemini 不带 `alt=sse` 的流是一个 JSON 数组，先拆成帧
+fn collect(
+    client: Dialect,
+    raw: &Value,
+    path: &str,
+    query: Option<&str>,
+    reply: &StoredReply<'_>,
+) -> Result<Vec<u8>, Msg> {
+    let decoded = tw_dialect::convert::decode(client, raw, path, query)
+        .map_err(|e| request_unreadable(e.0))?;
+    let mut d = decoded;
+    // 收成整包：客户端那一侧按不要流算
+    d.request.stream = false;
+    let session = d
+        .encode(&tw_dialect::ir::Target {
+            dialect: reply.upstream,
+            official: false,
+            default_max_tokens: 0,
+        })
+        .session;
+    let body = reply.body;
+    if looks_like_sse(body) {
+        let mut c = session.collector();
+        c.process(body);
+        return c.finish().map_err(answer_unreadable);
+    }
+    if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
+        // JSON 数组的流：每个元素当成一帧
+        let elements: Vec<Value> =
+            serde_json::from_slice(body).map_err(|e| answer_unreadable(e.to_string()))?;
+        let sse: String = elements.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let mut c = session.collector();
+        c.process(sse.as_bytes());
+        return c.finish().map_err(answer_unreadable);
+    }
+    session
+        .response(body)
+        .ok_or_else(|| answer_unreadable("the answer is not JSON"))
+}
+
+#[cfg(test)]
+mod tests;

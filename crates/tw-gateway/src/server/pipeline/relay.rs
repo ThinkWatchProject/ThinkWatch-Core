@@ -31,6 +31,7 @@ pub(super) fn respond(
     id: u64,
     live: crate::live::Pass,
     mut ending: crate::ending::Ending,
+    plugins: Option<crate::plugin::reply::Chain>,
 ) -> Response {
     let Served {
         upstream,
@@ -38,6 +39,7 @@ pub(super) fn respond(
         ledger,
         session,
         refusal,
+        ..
     } = served;
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -129,6 +131,7 @@ pub(super) fn respond(
         provider,
         id,
         upstream_dialect,
+        plugins,
     );
     let chunks = upstream.bytes_stream();
     let dialect = req.dialect;
@@ -201,7 +204,7 @@ pub(super) fn respond(
                     // 影响，而请求详情里存的正是「我们发出去的和收回来的」，
                     // 把还原后的存进去会让那一页说谎。
                     ending.feed(&chunk);
-                    let (out, cut) = relay.chunk(&chunk);
+                    let (out, cut) = relay.chunk(&chunk).await;
                     relay.sent(&out);
                     if !out.is_empty() {
                         quiet_since = tokio::time::Instant::now();
@@ -218,7 +221,7 @@ pub(super) fn respond(
                 }
             }
         }
-        let (tail, denied) = relay.finish(broke.is_some());
+        let (tail, denied) = relay.finish(broke.is_some()).await;
         if !tail.is_empty() {
             yield Ok::<Bytes, std::io::Error>(Bytes::from(tail));
         }
@@ -244,7 +247,7 @@ pub(super) fn respond(
                 why.text = format!("the response stream broke: {}", why.text);
                 ending.failed(err.source.into(), why);
                 if let Some(frame) = relay.error_tail(&err) {
-                    yield Ok(Bytes::from(frame));
+                    yield Ok(Bytes::from(relay.plugins_tail(&frame)));
                 }
             }
         }
@@ -399,6 +402,8 @@ struct Relay {
     /// 拦截档更是被整个绕过去。
     /// **对所有上游一样**：切不切只看档位和规则的处置，不看上游是不是官方的
     wall: Option<tw_guard::tools::wall::Wall>,
+    /// 审查的规则。上游给了整包、客户端要流时，转出来的那条流要按流的形状另看一遍
+    tools: std::sync::Arc<tw_guard::tools::rules::Rules>,
     inspect: tw_config::SecurityMode,
     /// 非流式要拦得住，body 就不能边收边发 —— 发出去了就收不回来。
     ///
@@ -426,6 +431,19 @@ struct Relay {
     bus: tw_observe::EventBus,
     id: u64,
     provider: String,
+    /// 回答钩子（见 [`crate::plugin::reply`]）。**排在转换之后、工具调用审查之前**：审查
+    /// 看的是插件改过的那一版。范围内没有插件时是 None，整段零成本
+    plugins: Option<ReplyStage>,
+}
+
+/// 回答钩子在这条中继上怎么跑。
+enum ReplyStage {
+    /// 边流边改
+    Stream(crate::plugin::reply::Stream),
+    /// 整包：收齐了改那一份
+    Whole(crate::plugin::reply::Chain),
+    /// 上游给了整包、客户端要流：收尾时转出来的整条流过一遍
+    AtFinish(crate::plugin::reply::Stream),
 }
 
 impl Relay {
@@ -439,6 +457,7 @@ impl Relay {
         provider: &tw_config::Provider,
         id: u64,
         upstream_dialect: tw_dialect::ir::Dialect,
+        plugins: Option<crate::plugin::reply::Chain>,
     ) -> Self {
         // 还原看的是**上游的原话**（转换之前），所以按上游的格式认帧
         let restorer = tw_guard::redact::sse::Body::new(ledger, plan.is_sse, upstream_dialect);
@@ -462,8 +481,35 @@ impl Relay {
         } else {
             Some(tw_guard::tools::wall::Wall::json_body(rt.tools.clone()))
         };
-        // 整包要看完才发得出去：工具调用在整份里，看完之前一个字节都不能发
-        let hold = wall.is_some() && plan.whole_body() && !plan.convert_whole && !plan.collect;
+        // 回答钩子按客户端收到的样子分：流的边流边改，整包的收齐了再改
+        use crate::plugin::reply::{Framing, Stream};
+        let plugins = plugins.map(|chain| {
+            let framing = |sse: bool| {
+                if sse {
+                    Framing::Sse
+                } else {
+                    Framing::JsonArray
+                }
+            };
+            if plan.convert_stream
+                || (session.is_none() && (plan.is_sse || plan.client_json_stream))
+            {
+                ReplyStage::Stream(Stream::new(chain, framing(plan.client_sse)))
+            } else if let (true, Some(s)) = (plan.convert_whole, session.as_ref())
+                && s.stream
+                && plan.status.is_success()
+            {
+                ReplyStage::AtFinish(Stream::new(chain, framing(s.client_sse())))
+            } else {
+                ReplyStage::Whole(chain)
+            }
+        });
+        // 整包要看完才发得出去：工具调用在整份里，看完之前一个字节都不能发。插件要改整包
+        // 也一样，改完了才知道发什么
+        let hold = (wall.is_some() || matches!(plugins, Some(ReplyStage::Whole(_))))
+            && plan.whole_body()
+            && !plan.convert_whole
+            && !plan.collect;
         Self {
             plan,
             session,
@@ -471,6 +517,7 @@ impl Relay {
             back,
             collector,
             wall,
+            tools: rt.tools.clone(),
             inspect,
             hold,
             whole: Vec::new(),
@@ -484,11 +531,13 @@ impl Relay {
             bus: state.bus.clone(),
             id,
             provider: provider.name.clone(),
+            plugins,
         }
     }
 
-    /// 处理上游的一块：返回现在该写给客户端的字节，以及工具调用审查切断时的那个错误。
-    fn chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, Option<GatewayError>) {
+    /// 处理上游的一块：返回现在该写给客户端的字节，以及插件出错、工具调用审查切断时的
+    /// 那个错误。
+    async fn chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, Option<GatewayError>) {
         let out = self.restorer.process(chunk);
         // 翻译在还原之后、审查之前：**审查看的必须是客户端
         // 将要拿到的那一版**，而那一版是翻译过的
@@ -507,6 +556,17 @@ impl Relay {
             c.process(&out);
             return (Vec::new(), None);
         }
+        // 回答钩子：插件改过的才是客户端将要看到的那一版
+        let (out, failed) = match self.plugins.as_mut() {
+            Some(ReplyStage::Stream(s)) => s.feed(&out).await,
+            _ => (out, None),
+        };
+        let (out, cut) = self.guard(out);
+        (out, cut.or(failed))
+    }
+
+    /// 工具调用审查：看的是客户端将要收到的这一段
+    fn guard(&mut self, out: Vec<u8>) -> (Vec<u8>, Option<GatewayError>) {
         // **审查的是客户端将要看到的那一版**（还原之后的），
         // 因为那才是它真正会去执行的东西
         if let Some(cut) = self.wall_cut(&out) {
@@ -560,7 +620,7 @@ impl Relay {
     /// 几个字节会掉在流的外面。整包的那几条路在这里转换、收齐、审查。
     ///
     /// 返回要写给客户端的尾巴，和非流式审查扣下整份 body 时的那个错误。
-    fn finish(&mut self, broke: bool) -> (Vec<u8>, Option<GatewayError>) {
+    async fn finish(&mut self, broke: bool) -> (Vec<u8>, Option<GatewayError>) {
         let status = self.plan.status;
         let tail = self.restorer.flush();
         let tail = match (&self.session, self.back.as_mut()) {
@@ -616,6 +676,55 @@ impl Relay {
             }
             _ => tail,
         };
+        // 回答钩子的收尾：流的补上扣着的，整包的这时才改
+        let tail = match self.plugins.as_mut() {
+            None => tail,
+            Some(ReplyStage::Stream(s)) => {
+                let (mut out, failed) = s.feed(&tail).await;
+                if failed.is_none() {
+                    let (more, failed) = s.finish(broke).await;
+                    out.extend(more);
+                    if let Some(e) = failed {
+                        return self.guard_tail(out, e);
+                    }
+                } else if let Some(e) = failed {
+                    return self.guard_tail(out, e);
+                }
+                // 插件在收尾时补出来的（扣着的文字、攒着的工具调用）也要过审查
+                let (out, cut) = self.guard(out);
+                if let Some(e) = cut {
+                    return (out, Some(e));
+                }
+                out
+            }
+            Some(ReplyStage::AtFinish(s)) if !broke && status.is_success() => {
+                let (mut out, failed) = s.feed(&tail).await;
+                if let Some(e) = failed {
+                    return (out, Some(e));
+                }
+                let (more, failed) = s.finish(false).await;
+                out.extend(more);
+                if let Some(e) = failed {
+                    return (out, Some(e));
+                }
+                out
+            }
+            Some(ReplyStage::Whole(c)) if !broke && status.is_success() && !tail.is_empty() => {
+                match crate::plugin::reply::whole(c, &tail).await {
+                    Ok(b) => b,
+                    // 整份还一个字节都没发：换成错误
+                    Err(e) => return (Vec::new(), Some(e)),
+                }
+            }
+            Some(ReplyStage::Whole(c)) => {
+                c.finish();
+                tail
+            }
+            Some(ReplyStage::AtFinish(s)) => {
+                let _ = s.finish(true).await;
+                tail
+            }
+        };
         /*
           非流式：**整份到手了才看得见工具调用，而它一个字节都还没发出去。**
 
@@ -624,7 +733,39 @@ impl Relay {
           所以拦得干净。代价是状态码已经随响应头走了，改不动 —— body
           里换成错误体，和 `sse_frame` 在流上扮演的是同一个角色。
         */
-        if self.plan.whole_body()
+        // 上游给了整包、客户端要流：写给客户端的是转出来的流，按流的形状看。**一个字节都
+        // 还没发**，命中了整份不发 —— 以前这条路按整包去解析一条流，什么都看不见
+        let streamed = self
+            .session
+            .as_ref()
+            .filter(|s| self.plan.convert_whole && s.stream)
+            .map(|s| s.client_sse());
+        if let (Some(sse), true, true, true) =
+            (streamed, self.wall.is_some(), !broke, status.is_success())
+        {
+            let mut w = if sse {
+                tw_guard::tools::wall::Wall::new(self.tools.clone())
+            } else {
+                tw_guard::tools::wall::Wall::json_array(self.tools.clone())
+            };
+            for v in w.feed(&tail) {
+                let blocked = v.cut && self.inspect.acts();
+                self.bus.emit(flagged(
+                    self.id,
+                    &self.provider,
+                    &v,
+                    blocked,
+                    &self.redaction,
+                ));
+                if blocked {
+                    tracing::warn!(
+                        provider = %self.provider, tool = %v.tool, rule = %v.rule,
+                        "withheld the response: a tool call in the answer matched a cut rule"
+                    );
+                    return (Vec::new(), Some(withheld(&self.provider, &v)));
+                }
+            }
+        } else if self.plan.whole_body()
             && !broke
             && status.is_success()
             && let Some(w) = self.wall.as_mut()
@@ -643,20 +784,26 @@ impl Relay {
                         provider = %self.provider, tool = %v.tool, rule = %v.rule,
                         "withheld the response: a tool call in the answer matched a cut rule"
                     );
-                    // 和流式那句一样不说调用出自谁（见 `wall_cut`）
-                    let err = GatewayError::denied(msg!(
-                        "gw.toolcall.response_withheld",
-                        upstream = self.provider.clone(), tool = v.tool.clone(),
-                        rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
-                        "The answer contained a {tool} call that matched rule “{name}”{}, \
-                         so the response was withheld.",
-                        because(&v.why)
-                    ));
-                    return (Vec::new(), Some(err));
+                    return (Vec::new(), Some(withheld(&self.provider, &v)));
                 }
             }
         }
         (tail, None)
+    }
+
+    /// 插件在收尾时出错：出错之前能发的过一遍审查，再报这个错
+    fn guard_tail(&mut self, out: Vec<u8>, e: GatewayError) -> (Vec<u8>, Option<GatewayError>) {
+        let (out, cut) = self.guard(out);
+        (out, Some(cut.unwrap_or(e)))
+    }
+
+    /// 切断之后的收尾经过回答钩子那一层：不再交给插件，但 JSON 数组要按那一层发过的
+    /// 重新接好
+    fn plugins_tail(&mut self, frame: &[u8]) -> Vec<u8> {
+        match self.plugins.as_mut() {
+            Some(ReplyStage::Stream(s)) | Some(ReplyStage::AtFinish(s)) => s.tail(frame),
+            _ => frame.to_vec(),
+        }
     }
 
     /// 记下发给客户端的这一段：停没停在帧的边界上（心跳要看）。直通的 JSON 数组流
@@ -726,6 +873,19 @@ impl Relay {
             None
         }
     }
+}
+
+/// 整份扣下的回答报给客户端的那一句。和流式那句一样**不说调用出自谁**（见
+/// [`Relay::wall_cut`]）：有工具调用权限的插件也能造、能改回答里的调用
+fn withheld(provider: &str, v: &tw_guard::tools::wall::Verdict) -> GatewayError {
+    GatewayError::denied(msg!(
+        "gw.toolcall.response_withheld",
+        upstream = provider, tool = v.tool.clone(),
+        rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
+        "The answer contained a {tool} call that matched rule “{name}”{}, \
+         so the response was withheld.",
+        because(&v.why)
+    ))
 }
 
 /// Bedrock 的流断在半路：帧坏了，或者上游在流里报了异常（半路被限流之类）。

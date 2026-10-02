@@ -348,6 +348,54 @@ mod tests {
         );
     }
 
+    /// 插件：设置值是那个值本身，状态按 `kind` 分派，四个要系统确认框的端点照样在表里
+    /// （网页白名单在桌面端，不在这里）
+    #[test]
+    fn plugins_come_through() {
+        let ts = typescript();
+        assert_eq!(
+            decl_of(&ts, "SettingValue"),
+            "export type SettingValue = boolean | number | string"
+        );
+        assert_eq!(
+            decl_of(&ts, "PluginStatus"),
+            "export type PluginStatus = { \"kind\": \"ok\" } | { \"kind\": \"disabled\" } | \
+             { \"kind\": \"changed\" } | { \"kind\": \"error\", message: Msg, }"
+        );
+        let view = decl_of(&ts, "PluginView");
+        assert!(
+            view.contains("settings: { [key in string]: SettingValue }"),
+            "{view}"
+        );
+        assert!(view.contains("stats: PluginStats"), "{view}");
+        let detail = decl_of(&ts, "RequestDetail");
+        assert!(detail.contains("plugins: Array<PluginRunView>"), "{detail}");
+        assert!(
+            detail.contains("request_after_plugins: BodyView | null"),
+            "{detail}"
+        );
+        assert!(decl_of(&ts, "HistoryRow").contains("plugin_changed: boolean"));
+        let event = decl_of(&ts, "Event");
+        assert!(event.contains("\"kind\": \"plugin_failed\""), "{event}");
+        assert!(event.contains("request_id?: number"), "{event}");
+        for line in [
+            "  CreatePlugin: { req: PluginCreate; res: ConfigWritten };",
+            "  ReplacePluginSource: { req: PluginSourceReplace; res: ConfigWritten };",
+            "  ApprovePluginFile: { req: PluginApprove; res: ConfigWritten };",
+            "  UpdatePluginConfirmed: { req: PluginUpdate; res: ConfigWritten };",
+            "  UpdatePluginConfirmed: { method: \"PUT\", path: \"/plugins/{id}/confirmed\", params: [\"id\"], format: \"json\" },",
+            "  DeletePlugin: { req: BaseVersion; res: ConfigWritten };",
+            "  TrialPlugin: { req: PluginTrial; res: PluginTrialResult };",
+        ] {
+            assert!(ts.contains(line), "{line}");
+        }
+        // core 自己写配置（默认插件）的那一版有自己的来源
+        assert_eq!(
+            decl_of(&ts, "ConfigOrigin"),
+            "export type ConfigOrigin = \"ui\" | \"cli\" | \"external\" | \"rollback\" | \"rotation\" | \"defaults\""
+        );
+    }
+
     #[test]
     fn every_endpoint_is_in_the_table() {
         let ts = typescript();

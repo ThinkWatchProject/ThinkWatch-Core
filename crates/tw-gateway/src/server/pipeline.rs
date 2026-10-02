@@ -5,8 +5,8 @@
 //! 本地应答在准入之前（离线也要能答），准入在路由之前（列表即承诺），
 //! 并发闸门在路由之后（被规则挡下的不用先排队）。
 //!
-//! 发出开始事件之后的两段各自一个子模块：[`hop`] 依次试候选上游，
-//! [`relay`] 把选中那一家的响应交给客户端。
+//! 发出开始事件之后的两段各自一个子模块：[`hop`] 依次试候选上游（每一跳先过插件的
+//! 请求钩子，见 [`plug`]），[`relay`] 把选中那一家的响应交给客户端。
 
 use std::sync::Arc;
 
@@ -22,6 +22,7 @@ use tw_types::msg;
 
 mod hop;
 mod opening;
+mod plug;
 mod relay;
 
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
@@ -46,6 +47,8 @@ pub(super) struct Inbound {
 /// 发出开始事件之后，后面几步都要用的。
 struct Started {
     id: u64,
+    /// 开始的时刻：请求那一行的 `at_ms`。之后才交去存的正文（插件改过的请求）挂在它上面
+    at_ms: u64,
     /// 熔断过滤之后的候选，按顺序试
     alive: Vec<String>,
     /// 第一阶段的结论。路由事件在它上面补上第二阶段和尝试链
@@ -55,6 +58,8 @@ struct Started {
     /// 出站脱敏的账本：拦截档下按客户端原文编好了号，每一跳接着它换（见
     /// [`crate::guard::look`]）。别的档位是空的
     ledger: tw_guard::redact::replace::Ledger,
+    /// 出站脱敏在客户端原文里找到的。插件改过的那一跳只再报插件写进来的（见 [`plug`]）
+    found: Vec<tw_guard::redact::rules::Finding>,
 }
 
 pub(super) async fn pipeline(
@@ -82,6 +87,8 @@ pub(super) async fn pipeline(
         )));
     }
 
+    // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
+    // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
     let (mut reading, fp) = read(&req, intent);
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
@@ -93,7 +100,7 @@ pub(super) async fn pipeline(
             // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
             let (_, ledger) = look(&rt, &req);
             let redaction = redaction(&rt, ledger);
-            let id = open(
+            let (id, _) = open(
                 &state,
                 &req,
                 &reading,
@@ -136,17 +143,63 @@ pub(super) async fn pipeline(
     if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &screening) {
         return Err(GatewayError::denied(why));
     }
-    let answer = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
-    let mut ending = ending
-        .take()
-        .expect("written when the start event was emitted");
+    // 插件的请求钩子在每一跳里跑（见 `plug`）：从客户端的原话起改 —— 内容过滤删过的话是
+    // 删过的那一份 —— 几跳共用原文的解析和密钥的编号。插件表跟着运行时走：**整个请求是
+    // 同一份**，回答钩子用的也是它
+    let hint = crate::hint::client_hint(&req.headers);
+    let mut hook = crate::plugin::request::Hook::new(
+        &rt.plugins,
+        rt.redact.clone(),
+        req.dialect,
+        req.uri.path(),
+        hint.as_deref(),
+        &req.body,
+    );
+    let answer =
+        hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started, &mut hook).await?;
     // 网关估的数不是哪一家回答的：不记这段对话留在哪一家
-    let served = match answer {
+    let mut served = match answer {
         hop::Answer::Served(served) => *served,
         hop::Answer::Estimated(body) => {
+            let ending = ending
+                .take()
+                .expect("written when the start event was emitted");
             return Ok(estimated(&state, &req, started.id, body, ending));
         }
     };
+    // 这一跳的账比开头那本多了号（插件往请求里写了新的值，拦截档下接着编了号）：回答
+    // 落盘时按这一本换，回显的占位符和存下来的请求对得上
+    if served.ledger.len() != started.ledger.len()
+        && let Some(e) = ending.as_mut()
+    {
+        e.redact_with(redaction(&rt, served.ledger.clone()));
+    }
+    // 回答钩子：上游回了成功的回答才有。**在交出结局之前起实例**：起不来而策略是拒绝时，
+    // 这个请求按返回的错误收场，客户端还一个字节都没收到
+    let reply_plugins = match served.bridge.take() {
+        Some(bridge) if reading.generates && served.upstream.status().is_success() => {
+            // 拦截档下回答里的占位符是这一跳编的（接着请求的账），换回占位符时用同一本
+            let bridge = if served.ledger.is_empty() {
+                bridge
+            } else {
+                bridge.with_ledger(served.ledger.clone())
+            };
+            let ctx = crate::plugin::reply::ReplyCtx {
+                dialect: req.dialect,
+                client: hint.as_deref(),
+                model: &served.model,
+                requested_model: &reading.facts.model,
+                upstream: &served.provider.name,
+                request_id: started.id,
+                attempt: served.attempt,
+            };
+            crate::plugin::reply::Chain::start(&state, &rt.plugins, bridge, &ctx).await?
+        }
+        _ => None,
+    };
+    let mut ending = ending
+        .take()
+        .expect("written when the start event was emitted");
     // 记下实际回答的那一家：故障转移之后接下的备选，就是这段对话之后留下的那一家
     if let Some(c) = &conv {
         ending.answered_by(state.affinity.ticket(
@@ -164,6 +217,7 @@ pub(super) async fn pipeline(
         started.id,
         live,
         ending,
+        reply_plugins,
     ))
 }
 
@@ -587,7 +641,7 @@ fn start(
     // 那一跳的请求体可能是转换过格式的。拦截档下账本在这里就编好号：每一跳、
     // 存下来的那份请求都按它换，同一个值处处是同一个占位符
     let (found, ledger) = look(rt, req);
-    let id = open(
+    let (id, at_ms) = open(
         state,
         req,
         reading,
@@ -609,14 +663,19 @@ fn start(
     }
     Started {
         id,
+        at_ms,
         alive,
         choice,
         conversation: crate::affinity::identity(&req.headers, fp),
         ledger,
+        found,
     }
 }
 
 /// 出站脱敏看一遍客户端发来的原文（见 [`crate::guard::look`]）。
+///
+/// 插件的密钥映射按同一份原文、同一个找法编号（见 [`crate::plugin::bridge`]）：插件看到的
+/// 占位符和这本账里的是同一个号。插件往某一跳写进新的值，那一跳接着编（见 [`plug`]）。
 fn look(
     rt: &Runtime,
     req: &Inbound,
@@ -636,8 +695,8 @@ fn redaction(rt: &Runtime, ledger: tw_guard::redact::replace::Ledger) -> crate::
 }
 
 /// 发 `RequestStarted`、把这个请求欠着的结局放进 `ending`、把请求体交去留档，
-/// 交回这个请求的号。`to` 是要发往的那一家和它怎么收钱；一家都不会去的（被规则
-/// 拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码。
+/// 交回这个请求的号和开始的时刻。`to` 是要发往的那一家和它怎么收钱；一家都不会去的
+/// （被规则拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码。
 ///
 /// **会话在这里定**（见 [`crate::session::Sessions`]）：开始事件带着它，落库的
 /// 那一行记的也是它。
@@ -651,7 +710,7 @@ fn open(
     fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
     redaction: crate::bodies::Redaction,
-) -> u64 {
+) -> (u64, u64) {
     let facts = &reading.facts;
     let id = state.bus.next_id();
     let at_ms = now_ms();
@@ -697,7 +756,11 @@ fn open(
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
     // 整个解析的，所以本来就在）；比存得下的还长的，只拷开头那一段（见
     // `bodies::offer`）。**交出去的是原文**：换掉、打码在落盘那一头做，不占
-    // 转发这条路（见 `crate::bodies`）
+    // 转发这条路（见 `crate::bodies`）。
+    //
+    // 存的是**客户端发来的那一份**（内容过滤删过字的话是删过的样子，见 `screen`）。
+    // 插件改过的话，回答它的那一跳收到的那一份在试完上游之后另存（见 `hop`），换掉、
+    // 打码的规矩一样
     crate::bodies::offer(
         &sink,
         crate::bodies::BodyRecord::new(
@@ -709,15 +772,16 @@ fn open(
             redaction,
         ),
     );
-    id
+    (id, at_ms)
 }
 
 /// 管线第 4 步：内容过滤（见 [`crate::guard::screen`]）。**只下结论，不发事件**：记录
 /// 要挂在请求号上，开始之后再报（[`crate::guard::report`]）。
 ///
 /// **在开始事件之前**：处置档下删过的话，`req.body` 换成删过的那一份，中间表示也照它
-/// 重新解码 —— 之后的出站脱敏、开始事件、留档、每一跳的转换和发送用的都是它，存下来的
-/// 就是真正发出去的那一份。路由在这之前按客户端的原文做完了。
+/// 重新解码 —— 之后的出站脱敏、开始事件、留档、每一跳的插件、转换和发送用的都是它，
+/// 存下来的就是真正发出去的那一份（插件改过的另存，见 `hop`）。路由在这之前按客户端的
+/// 原文做完了。插件在某一跳改过的请求，在那一跳再查一遍，只报插件加进来的（见 [`plug`]）。
 ///
 /// 查的是会让模型读调用方正文的请求：生成回答和压缩上下文。**计 token 不查**：不跑
 /// 模型，查了只会在真正的请求之前把同一处命中多记一遍、还可能把计数请求拒掉（理由见

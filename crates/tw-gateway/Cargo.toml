@@ -45,6 +45,9 @@ rand = { workspace = true }
 uuid = { workspace = true }
 tw-guard = { workspace = true }
 tw-dialect = { workspace = true }
+# 脚本插件的沙箱。**编它要一个能出 wasm 的 clang**：依赖它的只能是网关和 twcore
+# （tw-plugin 的 tests/boundary.rs 守着）
+tw-plugin = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

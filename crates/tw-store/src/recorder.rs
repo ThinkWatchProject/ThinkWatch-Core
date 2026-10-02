@@ -199,6 +199,13 @@ impl Recorder {
             .put_with_len(at_ms, id as i64, which, body, original_len);
     }
 
+    /// 记一次插件运行（`plugin_runs` 一行）。**写不进去只记一行日志**
+    pub fn record_plugin_run(&self, r: &crate::db::PluginRunRow) {
+        if let Err(e) = self.db.insert_plugin_run(r) {
+            tracing::debug!("the plugin run could not be recorded: {e}");
+        }
+    }
+
     /// 吃一个事件。
     pub fn on_event(&mut self, ev: &Event) {
         match ev {
@@ -584,6 +591,8 @@ impl Recorder {
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
             | Event::ListenChanged { .. }
+            // 插件出错是一条通知。它在请求上的那次运行另走一条路落库
+            | Event::PluginFailed { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
             | Event::RequestPriced { .. }
             // 只发给事件流上掉队的那一个订阅者，从不进总线

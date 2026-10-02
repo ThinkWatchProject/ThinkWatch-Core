@@ -166,6 +166,8 @@ pub enum Kind {
     Compare,
     /// 请求头名 → 值
     Headers,
+    /// 插件的设置项 → 字符串、数字或布尔
+    Settings,
     /// 可选值由枚举生成
     Enum(fn() -> Vec<&'static str>),
     /// 键 → 枚举值
@@ -286,6 +288,10 @@ fn kind(k: &Kind, l: Lang) -> String {
             "比较式（`>200k`、`<=4k`、`==3`）",
         ),
         Kind::Headers => pick("map of header name → value", "请求头名 → 值的映射"),
+        Kind::Settings => pick(
+            "map of setting → string, number or bool",
+            "设置项 → 字符串、数字或布尔的映射",
+        ),
         Kind::Enum(f) => values(&f()),
         Kind::EnumMap(key, f) => format!(
             "{} {} → {}",

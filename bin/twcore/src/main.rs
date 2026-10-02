@@ -783,9 +783,18 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
         let (body_tx, body_rx) = tw_gateway::bodies::channel();
-        let store = build_store(&dir, state.bus.clone(), state.pricing.clone(), body_rx);
+        // 插件在每个请求上的运行记录，和正文同一个道理：网关交出去，存储层落库
+        let (run_tx, run_rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
+        let store = build_store(
+            &dir,
+            state.bus.clone(),
+            state.pricing.clone(),
+            body_rx,
+            run_rx,
+        );
         if store.is_some() {
             state.set_body_sink(body_tx);
+            state.set_plugin_sink(run_tx);
         }
 
         /*
@@ -833,6 +842,15 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             state.clone(),
             state.bus.clone(),
         ));
+        // 默认插件（随 core 发的那几个）：没给过的装上（停用着），没动过的换成新版。
+        // 启动时在控制面起来之前走一遍，界面第一次取插件就看得到它们；之后每换入一份
+        // 配置再走一遍。**不挡启动**：哪个没办成只记一行、说一声。安全模式不走 ——
+        // 那时只有控制面，不替人往配置里写东西
+        if !safe {
+            let seeder = tw_control::plugins::defaults::Seeder::shipped();
+            seeder.seed(&manager).await;
+            tw_control::plugins::defaults::spawn(seeder, manager.clone());
+        }
         // **监听要留着** —— 扔掉它就停止监听，而那个失效是静默的。
         // 起不来不是致命的：手改文件不会自动生效，但界面和 CLI 照常能用，
         // 所以说一句就继续。
@@ -840,6 +858,16 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             Ok(w) => Some(w),
             Err(e) => {
                 tracing::warn!("the configuration file cannot be watched, so a hand edit will not take effect on its own: {e}");
+                None
+            }
+        };
+        // 插件目录也盯着：**插件文件被改了，那个插件马上停用**，不等下一次改配置。
+        // 盯不住时退回到每次换配置时重算哈希，所以同样只说一句
+        let _plugin_watch = match tw_control::plugins::spawn_watcher(state.clone(), manager.path())
+        {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!("the plugin directory cannot be watched, so a changed plugin file is noticed only at the next configuration change: {e}");
                 None
             }
         };
@@ -857,9 +885,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             chatgpt: Default::default(),
             zai: Default::default(),
         };
-        // 凭据轮换要写回 config.yaml。**这是这个程序里唯一一次
-        // 不是人发起的配置写入** —— 理由是服务器换发新 refresh token 的
-        // 那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
+        // 凭据轮换要写回 config.yaml。**不是人发起的配置写入只有两种**，
+        // 这是一种（另一种是上面的默认插件）—— 理由是服务器换发新 refresh
+        // token 的那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
         // 定期刷新默认价目表（`pricing.auto_update`，默认开）
         tw_control::pricing::spawn(control.clone());
@@ -946,6 +974,7 @@ fn build_store(
     // **和网关同一份价格簿**，不是一份副本：改了价目表，下一个结束的请求就按新价算
     pricing: tw_pricing::Shared,
     bodies: tokio::sync::mpsc::Receiver<tw_gateway::bodies::BodyRecord>,
+    runs: tokio::sync::mpsc::Receiver<tw_gateway::plugin::RunRecord>,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let events = bus.subscribe();
     let (db, blobs) = match tw_store::open(dir) {
@@ -1005,6 +1034,7 @@ fn build_store(
                 which: match kind {
                     tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
                     tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
+                    tw_gateway::bodies::BodyKind::AfterPlugins => tw_store::Which::AfterPlugins,
                 },
                 body,
                 original_len,
@@ -1016,13 +1046,36 @@ fn build_store(
             drop(held);
         }
     });
-    Some(tw_store::task::spawn(
+    let recorder = tw_store::task::spawn(
         // 算完价钱往回报一条 —— 见 `Event::RequestPriced`。这里是唯一
         // 同时看得见总线和存储层的地方，所以接线在这儿完成。
         tw_store::Recorder::new(db, blobs, pricing).reporting_to(bus),
         events,
         rx,
-    ))
+    );
+    // 插件的运行记录同样在这里对接：网关那边的一次运行，换成存储层的一行
+    let (run_tx, run_rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
+    let mut runs = runs;
+    tokio::spawn(async move {
+        while let Some(r) = runs.recv().await {
+            let row = tw_store::PluginRunRow {
+                request_id: r.request_id as i64,
+                at_ms: r.at_ms as i64,
+                plugin_id: r.run.plugin_id,
+                plugin_name: r.run.plugin_name,
+                hook: r.run.hook,
+                outcome: r.run.outcome,
+                error: r.run.error,
+                cpu_us: r.run.cpu_us.min(i64::MAX as u64) as i64,
+                detail: r.run.detail.map(|d| d.to_string()),
+            };
+            if run_tx.send(row).await.is_err() {
+                return;
+            }
+        }
+    });
+    tw_store::task::record_plugin_runs(recorder.clone(), run_rx);
+    Some(recorder)
 }
 
 /// 等一个「该退了」。

@@ -23,6 +23,10 @@ members = [
     "crates/tw-engine",
     "crates/tw-observe",
     "crates/tw-gateway",
+    # 脚本插件的沙箱（QuickJS 跑在 Wasmtime 里）。编它要一个能出 wasm 的 clang，
+    # 所以**只有 tw-gateway 和 twcore 能依赖它** —— 桌面端从 git 编的那几个
+    # crate、企业版用的第一层都不能沾上，tw-plugin 的 tests/boundary.rs 守着
+    "crates/tw-plugin",
     "crates/tw-control",
     # 控制通道的握手与加密。桌面端按 tag 依赖它，所以只依赖契约层和 tw-yaml
     "crates/tw-link",
@@ -71,6 +75,7 @@ tw-breaker  = { path = "crates/tw-breaker" }
 tw-dialect  = { path = "crates/tw-dialect" }
 tw-bedrock  = { path = "crates/tw-bedrock" }
 tw-link     = { path = "crates/tw-link" }
+tw-plugin   = { path = "crates/tw-plugin" }
 
 # ── 版本与企业版 workspace 对齐，便于反向依赖时不打架 ────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
