@@ -221,3 +221,69 @@ async fn a_trial_gives_the_plugin_the_routing_the_request_had() {
     assert_eq!(saw["view"]["model"], "glm-4.6");
     assert_eq!(saw["view"]["params"]["model"], "glm-4.6");
 }
+
+/// 存下来的一个请求：路径和请求体，没记客户端、没记发出去的模型名
+fn stored<'a>(path: &'a str, body: &'a [u8]) -> StoredRequest<'a> {
+    StoredRequest {
+        path,
+        query: None,
+        body,
+        client: None,
+        upstream: "up",
+        sent_model: "",
+    }
+}
+
+/// 试跑数 token、嵌入这些请求，和它们当时一样看：Gemini 包着的数 token 改里面那一份、
+/// 只写回模型名；插件看不懂的请求体说清看不懂
+#[tokio::test]
+async fn a_trial_reads_counting_and_unreadable_requests_as_they_were_read() {
+    let tune = || {
+        Double::new("tune")
+            .permit(&[Permission::System, Permission::Params])
+            .on_request(|mut view, _| {
+                view["system"] = json!("Be brief.");
+                view["params"]["max_tokens"] = json!(99);
+                Invocation::ok(RequestOutcome::Changed(view))
+            })
+            .into_host()
+    };
+    let wrapped = json!({ "generateContentRequest": { "model": "models/gemini-2.5-pro",
+        "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] } })
+    .to_string();
+    let t = run(
+        Arc::new(Pool::new(1, 4)),
+        tune(),
+        &Default::default(),
+        rules(),
+        Some(stored(
+            "/v1beta/models/gemini-2.5-pro:countTokens",
+            wrapped.as_bytes(),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(t.error, None);
+    let req = t.request.unwrap();
+    assert_eq!(req.outcome, Outcome::Changed);
+    let after: Value = serde_json::from_str(&req.after).unwrap();
+    let inner = &after["generateContentRequest"];
+    assert_eq!(inner["systemInstruction"]["parts"][0]["text"], "Be brief.");
+    assert!(inner.get("generationConfig").is_none(), "{after}");
+
+    let embeddings = br#"{"model":"text-embedding-3-small","input":["hi"]}"#;
+    let t = run(
+        Arc::new(Pool::new(1, 4)),
+        tune(),
+        &Default::default(),
+        rules(),
+        Some(stored("/v1/embeddings", embeddings)),
+        None,
+    )
+    .await;
+    assert!(t.request.is_none());
+    assert_eq!(
+        t.error.map(|m| m.code).as_deref(),
+        Some("gw.plugin.cannot_read")
+    );
+}

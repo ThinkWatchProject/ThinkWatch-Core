@@ -92,6 +92,21 @@ impl ClientApi {
             || (p.contains("/models/") && p.ends_with(":countTokens"))
     }
 
+    /// 请求体和生成回答**同一种形状**、回来的却不是一次回答的接口：数 token（见
+    /// [`ClientApi::counts_tokens`]），Responses 的压缩和数 token（`/responses/compact`、
+    /// `/responses/input_tokens`，Codex 后端的 `/backend-api/codex/responses/compact`）。
+    ///
+    /// 插件的请求钩子照样看得懂它们（见 [`crate::plugin::request::Shape`]）
+    pub fn like_generation(path: &str) -> bool {
+        if Self::counts_tokens(path) {
+            return true;
+        }
+        let p = path.trim_end_matches('/');
+        let tail = p.strip_prefix("/v1").unwrap_or(p);
+        matches!(tail, "/responses/compact" | "/responses/input_tokens")
+            || p == "/backend-api/codex/responses/compact"
+    }
+
     /// 转换库里对应的格式
     pub fn dialect(&self) -> Dialect {
         match self {
@@ -249,6 +264,27 @@ mod tests {
             ("/v1/embeddings", false),
         ] {
             assert_eq!(ClientApi::counts_tokens(path), counts, "{path}");
+        }
+    }
+
+    #[test]
+    fn counting_and_compacting_take_a_generation_shaped_body() {
+        for (path, like) in [
+            ("/v1/messages/count_tokens", true),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", true),
+            ("/v1/responses/compact", true),
+            ("/responses/compact/", true),
+            ("/v1/responses/input_tokens", true),
+            ("/backend-api/codex/responses/compact", true),
+            // 生成回答本身不算：它是「生成」那一类
+            ("/v1/messages", false),
+            ("/v1/responses", false),
+            ("/v1/embeddings", false),
+            ("/v1/completions", false),
+            ("/v1/responses/resp_1/cancel", false),
+            ("/v1beta/models/gemini-embedding-001:embedContent", false),
+        ] {
+            assert_eq!(ClientApi::like_generation(path), like, "{path}");
         }
     }
 

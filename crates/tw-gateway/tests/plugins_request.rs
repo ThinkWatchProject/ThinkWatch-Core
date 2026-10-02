@@ -670,7 +670,7 @@ async fn an_inactive_plugin_follows_on_error_without_running() {
 }
 
 #[tokio::test]
-async fn out_of_scope_plugins_do_not_run_and_count_tokens_is_left_alone() {
+async fn out_of_scope_plugins_do_not_run_and_count_tokens_runs_the_ones_in_scope() {
     let up = Upstream::default();
     let base = start_upstream(up.clone()).await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -702,7 +702,7 @@ async fn out_of_scope_plugins_do_not_run_and_count_tokens_is_left_alone() {
     assert_eq!(status, 200);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    // 数 token 不是一次回答：范围内的插件也不跑
+    // 数 token 发往上游的也是一个请求体：范围内的插件照样跑，范围外的照样不跑
     let everyone = entry("everyone", counting(calls.clone()));
     let gw = gateway(
         vec![provider("a", base, Protocol::Anthropic)],
@@ -710,12 +710,12 @@ async fn out_of_scope_plugins_do_not_run_and_count_tokens_is_left_alone() {
         vec![everyone],
     )
     .await;
-    let _ = post(&gw, "/v1/messages/count_tokens", &anthropic_body()).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    // 生成回答的请求照常跑
-    let (status, _) = post(&gw, "/v1/messages", &anthropic_body()).await;
+    let (status, _) = post(&gw, "/v1/messages/count_tokens", &anthropic_body()).await;
     assert_eq!(status, 200);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (status, _) = post(&gw, "/v1/messages", &anthropic_body()).await;
+    assert_eq!(status, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// 把这一次的上游写进系统提示的插件，数自己跑了几次
@@ -1309,4 +1309,418 @@ async fn each_client_format_is_rewritten_in_its_own_shape() {
             assert_eq!(got_path, "/v1beta/models/gemini-2.5-flash:generateContent");
         }
     }
+}
+
+// ───────────────────────────────────────── 不生成回答的接口
+
+/// 插件要删掉的东西
+const MARK: &str = "SECRET-PROJECT";
+
+/// 把 [`MARK`] 从系统提示、消息文字和工具结果里删掉的插件
+fn scrub() -> Double {
+    Double::new("scrub")
+        .permit(&[Permission::System, Permission::Messages])
+        .on_request(|mut view, _| {
+            let s = view["system"].as_str().unwrap().replace(MARK, "[removed]");
+            view["system"] = json!(s);
+            for m in view["messages"].as_array_mut().unwrap() {
+                for p in m["parts"].as_array_mut().unwrap() {
+                    if (p["type"] == "text" || p["type"] == "tool_result")
+                        && let Some(t) = p["text"].as_str()
+                    {
+                        p["text"] = json!(t.replace(MARK, "[removed]"));
+                    }
+                }
+            }
+            Invocation::ok(RequestOutcome::Changed(view))
+        })
+}
+
+fn anthropic_count_body() -> Value {
+    json!({
+        "model": "claude-sonnet-4-5",
+        "system": format!("About {MARK}."),
+        "messages": [
+            { "role": "user", "content": format!("Plan {MARK}") },
+            { "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "Read", "input": { "path": "a" } }] },
+            { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": format!("{MARK} notes") }] }
+        ]
+    })
+}
+
+fn responses_body() -> Value {
+    json!({
+        "model": "gpt-5",
+        "instructions": format!("About {MARK}."),
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": format!("Plan {MARK}") }] }]
+    })
+}
+
+const GEMINI_COUNT: &str = "/v1beta/models/gemini-2.5-pro:countTokens";
+
+/// 数 token、Responses 的压缩：请求体就是一段对话，插件照样改，**上游数的、压的是改过的那
+/// 一份** —— 插件删掉的东西不从这些接口漏出去。每种客户端格式、Gemini 的两种写法都一样
+#[tokio::test]
+async fn token_counts_and_compactions_reach_the_upstream_as_the_plugins_left_them() {
+    let cases = [
+        (
+            "/v1/messages/count_tokens",
+            Protocol::Anthropic,
+            anthropic_count_body(),
+        ),
+        (
+            GEMINI_COUNT,
+            Protocol::Gemini,
+            json!({ "contents": [{ "role": "user", "parts": [{ "text": format!("Plan {MARK}") }] }] }),
+        ),
+        (
+            GEMINI_COUNT,
+            Protocol::Gemini,
+            json!({ "generateContentRequest": {
+                "model": "models/gemini-2.5-pro",
+                "systemInstruction": { "parts": [{ "text": format!("About {MARK}.") }] },
+                "contents": [{ "role": "user", "parts": [{ "text": format!("Plan {MARK}") }] }]
+            } }),
+        ),
+        (
+            "/v1/responses/compact",
+            Protocol::OpenaiResponses,
+            responses_body(),
+        ),
+        (
+            "/v1/responses/input_tokens",
+            Protocol::OpenaiResponses,
+            responses_body(),
+        ),
+        (
+            "/backend-api/codex/responses/compact",
+            Protocol::OpenaiResponses,
+            responses_body(),
+        ),
+    ];
+    for (path, protocol, body) in cases {
+        let up = Upstream::default();
+        let base = start_upstream(up.clone()).await;
+        let mut gw = gateway(
+            vec![provider("same", base, protocol)],
+            SecurityMode::Off,
+            vec![entry("scrub", scrub())],
+        )
+        .await;
+        let (status, answer) = post(&gw, path, &body).await;
+        assert_eq!(status, 200, "{path}: {answer}");
+        assert_eq!(up.hits(), 1, "{path}");
+        let (got_path, _) = up.seen.lock().unwrap()[0].clone();
+        assert_eq!(got_path, path);
+        let raw = String::from_utf8(up.raw.lock().unwrap()[0].to_vec()).unwrap();
+        assert!(!raw.contains(MARK), "{path}: the upstream got {raw}");
+        assert!(raw.contains("[removed]"), "{path}: {raw}");
+        // 和生成回答一样记在请求上：跑在第几跳、改了什么，改过的那一份另存
+        assert_eq!(
+            gw.runs(),
+            [("scrub".to_string(), "changed".to_string(), 0)],
+            "{path}"
+        );
+        let after = gw.after_plugins().await.expect("the body after plugins");
+        assert!(!after.to_string().contains(MARK), "{path}: {after}");
+        // 写法照原样：包着的还包着，没包着的没加系统提示也不包
+        if path == GEMINI_COUNT {
+            let sent: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                sent.get("generateContentRequest").is_some(),
+                body.get("generateContentRequest").is_some(),
+                "{sent}"
+            );
+        }
+    }
+}
+
+/// 数 token 上的插件和生成回答上的一样：同样按客户端、发出去的模型、上游挑，同样只看到
+/// 占位符，出错、`reject` 同样按 `on_error` 拒掉整个请求
+#[tokio::test]
+async fn counting_follows_the_same_scope_placeholders_and_on_error() {
+    const COUNT: &str = "/v1/messages/count_tokens";
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let providers = || vec![provider("a", base, Protocol::Anthropic)];
+
+    // 范围外：别的模型、别的上游的插件不跑，上游收到的是原话
+    for scoped in [
+        entry_with("scrub", scrub(), |a| a.scope.models = vec!["gpt-*".into()]),
+        entry_with("scrub", scrub(), |a| a.scope.upstreams = vec!["b".into()]),
+    ] {
+        up.raw.lock().unwrap().clear();
+        let gw = gateway(providers(), SecurityMode::Off, vec![scoped]).await;
+        let (status, _) = post(&gw, COUNT, &anthropic_count_body()).await;
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&up.raw.lock().unwrap()[0]).contains(MARK));
+        assert!(gw.runs().is_empty(), "{:?}", gw.runs());
+    }
+
+    // 占位符：插件看不到真的密钥，改过的地方换回去再发
+    let saw = Arc::new(Mutex::new(String::new()));
+    let s = saw.clone();
+    let checked = Double::new("checked")
+        .permit(&[Permission::Messages])
+        .on_request(move |mut view, ctx| {
+            *s.lock().unwrap() = view.to_string();
+            assert_eq!(ctx["upstream"], "a");
+            assert_eq!(ctx["model"], "claude-sonnet-4-5");
+            let t = view["messages"][0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            view["messages"][0]["parts"][0]["text"] = json!(format!("{t} (checked)"));
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    up.raw.lock().unwrap().clear();
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry("checked", checked)],
+    )
+    .await;
+    let body = json!({ "model": "claude-sonnet-4-5",
+                       "messages": [{ "role": "user", "content": format!("my key is {USER_KEY}") }] });
+    let (status, _) = post(&gw, COUNT, &body).await;
+    assert_eq!(status, 200);
+    let saw = saw.lock().unwrap().clone();
+    assert!(!saw.contains(USER_KEY), "the plugin saw the key: {saw}");
+    assert!(saw.contains("<<TW_SECRET_1>>"), "{saw}");
+    let sent: Value = serde_json::from_slice(&up.raw.lock().unwrap()[0]).unwrap();
+    assert_eq!(
+        sent["messages"][0]["content"],
+        format!("my key is {USER_KEY} (checked)")
+    );
+
+    // 出错、拒绝：拒绝时整个请求不发，跳过时原样发
+    let failing = || {
+        Double::new("failing")
+            .permit(&[Permission::Messages])
+            .on_request(|_, _| {
+                Invocation::err(RunError::Threw {
+                    message: "nope".into(),
+                    stack: None,
+                })
+            })
+    };
+    let refusing = Double::new("refusing")
+        .permit(&[Permission::Messages])
+        .on_request(|_, _| Invocation::ok(RequestOutcome::Rejected("not counted".into())));
+    for (e, code) in [
+        (entry("failing", failing()), "gw.plugin.request_failed"),
+        (entry("refusing", refusing), "gw.plugin.rejected"),
+    ] {
+        up.raw.lock().unwrap().clear();
+        let gw = gateway(providers(), SecurityMode::Off, vec![e]).await;
+        let rx = gw.state.bus.subscribe();
+        let (status, body) = post(&gw, COUNT, &anthropic_count_body()).await;
+        assert_eq!(status, 403, "{code}: {body}");
+        assert!(up.raw.lock().unwrap().is_empty(), "{code}");
+        let attempts = routed(rx).await;
+        assert_eq!(
+            attempts[0].error.as_ref().map(|e| e.code.as_str()),
+            Some(code)
+        );
+    }
+    up.raw.lock().unwrap().clear();
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry_with("failing", failing(), |a| {
+            a.on_error = OnError::Skip
+        })],
+    )
+    .await;
+    let (status, _) = post(&gw, COUNT, &anthropic_count_body()).await;
+    assert_eq!(status, 200);
+    let sent: Value = serde_json::from_slice(&up.raw.lock().unwrap()[0]).unwrap();
+    assert_eq!(sent, anthropic_count_body());
+    assert_eq!(gw.stats("failing").errors, 1);
+}
+
+/// 网关自己估的数：一个字节都不发给上游，也就不跑插件
+#[tokio::test]
+async fn a_count_the_gateway_estimates_runs_no_plugin() {
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gw = gateway(
+        vec![provider("chat", base, Protocol::OpenaiChat)],
+        SecurityMode::Off,
+        vec![entry("tag", tag(calls.clone()))],
+    )
+    .await;
+    let (status, answer) = post(&gw, "/v1/messages/count_tokens", &anthropic_count_body()).await;
+    assert_eq!(status, 200, "{answer}");
+    assert!(answer["input_tokens"].as_u64().unwrap() > 0, "{answer}");
+    assert_eq!(up.hits(), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(gw.runs().is_empty());
+}
+
+/// 数 token、压缩不收输出上限、温度这些参数：插件改的只写回模型名。Gemini 没包着的数
+/// token 请求，插件加了系统提示就包起来（外面那一层只收 `contents`），模型名跟着插件改
+#[tokio::test]
+async fn counting_and_compacting_take_only_the_model_from_params() {
+    let tune = Double::new("tune")
+        .permit(&[Permission::System, Permission::Params])
+        .on_request(|mut view, ctx| {
+            let s = view["system"].as_str().unwrap().to_string();
+            view["system"] = json!(format!("{s} Be brief.").trim().to_string());
+            view["params"]["max_tokens"] = json!(99);
+            view["params"]["temperature"] = json!(0.1);
+            if ctx["format"] == "gemini" {
+                view["params"]["model"] = json!("gemini-2.5-flash");
+            } else {
+                view["params"]["model"] =
+                    json!(format!("{}-renamed", ctx["model"].as_str().unwrap()));
+            }
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let cases = [
+        (
+            "/v1/messages/count_tokens",
+            Protocol::Anthropic,
+            json!({ "model": "claude-sonnet-4-5", "messages": [{ "role": "user", "content": "hi" }] }),
+        ),
+        (
+            "/v1/responses/compact",
+            Protocol::OpenaiResponses,
+            json!({ "model": "gpt-5", "input": "hi" }),
+        ),
+        (
+            GEMINI_COUNT,
+            Protocol::Gemini,
+            json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }),
+        ),
+        (
+            GEMINI_COUNT,
+            Protocol::Gemini,
+            json!({ "generateContentRequest": { "model": "models/gemini-2.5-pro",
+                    "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] } }),
+        ),
+    ];
+    for (path, protocol, body) in cases {
+        let up = Upstream::default();
+        let base = start_upstream(up.clone()).await;
+        let gw = gateway(
+            vec![provider("same", base, protocol)],
+            SecurityMode::Off,
+            vec![entry("tune", tune.clone())],
+        )
+        .await;
+        let (status, answer) = post(&gw, path, &body).await;
+        assert_eq!(status, 200, "{path}: {answer}");
+        let (got_path, sent) = up.seen.lock().unwrap()[0].clone();
+        let text = sent.to_string();
+        assert!(text.contains("Be brief."), "{path}: {text}");
+        for param in [
+            "max_tokens",
+            "max_output_tokens",
+            "maxOutputTokens",
+            "temperature",
+            "generationConfig",
+        ] {
+            assert!(!text.contains(param), "{path}: {param} was sent: {text}");
+        }
+        match protocol {
+            Protocol::Gemini => {
+                assert_eq!(got_path, "/v1beta/models/gemini-2.5-flash:countTokens");
+                let inner = &sent["generateContentRequest"];
+                assert_eq!(inner["model"], "models/gemini-2.5-flash", "{text}");
+                assert_eq!(
+                    inner["systemInstruction"]["parts"][0]["text"], "Be brief.",
+                    "{text}"
+                );
+                assert_eq!(inner["contents"][0]["parts"][0]["text"], "hi", "{text}");
+                assert!(sent.get("contents").is_none(), "{text}");
+            }
+            _ => assert!(
+                sent["model"].as_str().unwrap().ends_with("-renamed"),
+                "{path}: {text}"
+            ),
+        }
+    }
+}
+
+/// 插件看不懂的请求体（嵌入、认不出的接口）：管得着的插件按它的 `on_error` —— 拒绝就不发，
+/// 跳过就原样发、记一笔跳过。范围外的插件、空的请求体不算
+#[tokio::test]
+async fn requests_plugins_cannot_read_follow_on_error() {
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let embeddings =
+        json!({ "model": "text-embedding-3-small", "input": [format!("Plan {MARK}")] });
+    let providers = || vec![provider("chat", base, Protocol::OpenaiChat)];
+
+    let mut gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry("scrub", scrub())],
+    )
+    .await;
+    let (status, body) = post(&gw, "/v1/embeddings", &embeddings).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "[ThinkWatch] Plugin `Plugin scrub` cannot read requests to /v1/embeddings."
+    );
+    assert_eq!(up.hits(), 0);
+    assert_eq!(gw.runs(), [("scrub".to_string(), "error".to_string(), 0)]);
+    assert!(gw.after_plugins().await.is_none());
+    // 认不出的接口也一样
+    let (status, body) = post(
+        &gw,
+        "/v1/rerank",
+        &json!({ "model": "rerank-1", "query": MARK }),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(up.hits(), 0);
+
+    // 跳过：原样发，记一笔跳过（不算一次调用）
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry_with("scrub", scrub(), |a| a.on_error = OnError::Skip)],
+    )
+    .await;
+    let (status, _) = post(&gw, "/v1/embeddings", &embeddings).await;
+    assert_eq!(status, 200);
+    assert_eq!(up.hits(), 1);
+    assert_eq!(gw.runs(), [("scrub".to_string(), "skipped".to_string(), 0)]);
+    assert_eq!(gw.stats("scrub").calls, 0);
+
+    // 范围外的插件不算
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry_with("scrub", scrub(), |a| {
+            a.scope.models = vec!["claude-*".into()]
+        })],
+    )
+    .await;
+    let (status, _) = post(&gw, "/v1/embeddings", &embeddings).await;
+    assert_eq!(status, 200);
+    assert!(gw.runs().is_empty());
+
+    // 空的请求体里没有插件能改的东西（取消一次 Responses 的回答）
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let gw = gateway(
+        vec![provider("responses", base, Protocol::OpenaiResponses)],
+        SecurityMode::Off,
+        vec![entry("scrub", scrub())],
+    )
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{}/v1/responses/resp_1/cancel", gw.addr))
+        .header("authorization", "Bearer tw-testkey")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(up.hits(), 1);
+    assert!(gw.runs().is_empty(), "{:?}", gw.runs());
 }

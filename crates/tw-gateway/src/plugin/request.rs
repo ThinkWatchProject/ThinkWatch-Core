@@ -23,6 +23,18 @@
 //! 插件 `reject` 了，或者出错而它的 `on_error` 是拒绝，**整个请求被拒**，不换下一家：
 //! 换一家，管它的还是这个插件。文件变了、装不上的插件跑不了，管得着这一次的同样按
 //! `on_error` 处理；只管别的上游、别的模型的，这一次不算它。
+//!
+//! # 哪些请求过插件
+//!
+//! **发往上游的每一个请求体都过**，不只生成回答的那些 —— 插件删掉的东西，不能从旁边的
+//! 接口漏出去（见 [`Shape`]）：
+//!
+//! - 生成回答：上面说的那样；
+//! - 数 token（Anthropic 的 `count_tokens`、Gemini 的 `:countTokens`、Responses 的
+//!   `input_tokens`）、Responses 的压缩：请求体就是一段对话，插件照样看、照样改，上游数的、
+//!   压的是改过的那一份。网关自己估数、一个字节都不发的那几种不跑插件；
+//! - 嵌入、旧版补全、认不出的接口：插件看不懂它们的请求体。管得着的插件按它的
+//!   `on_error`：拒绝就拒掉整个请求，跳过就原样发、记一笔跳过。
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -42,6 +54,36 @@ use super::view;
 /// 一个插件在这一次上的运行，连同它写的日志。
 pub type Ran = (Arc<Active>, PluginRun, Vec<LogLine>);
 
+/// 插件怎么看一个请求体：按客户端调的接口分（见 [`crate::client_api::ClientApi`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// 生成回答
+    Generate,
+    /// 请求体和生成回答同一种形状、却不生成回答的接口：数 token、Responses 的压缩（见
+    /// [`crate::client_api::ClientApi::like_generation`]）。插件照样看、照样改，**`params`
+    /// 里只写回模型名**：这些接口不收输出上限、温度这些参数（带上是一个 400），数出来的
+    /// token 也和它们无关
+    Alike,
+    /// 嵌入、旧版补全、认不出的接口：**插件看不懂这种请求体**（见 [`unreadable`]）
+    Opaque,
+}
+
+impl Shape {
+    /// 客户端调的这个路径是哪一种
+    pub fn of(path: &str) -> Shape {
+        use crate::client_api::ClientApi;
+        if ClientApi::of_path(path).is_none() {
+            Shape::Opaque
+        } else if ClientApi::generates(path) {
+            Shape::Generate
+        } else if ClientApi::like_generation(path) {
+            Shape::Alike
+        } else {
+            Shape::Opaque
+        }
+    }
+}
+
 /// 一个请求上的请求钩子。管线每发往一个上游调一次 [`Hook::attempt`]，**每次都从客户端
 /// 的原话起**；原文只解析一次、密钥只编一次号，几次尝试共用。
 pub struct Hook<'a> {
@@ -51,6 +93,8 @@ pub struct Hook<'a> {
     dialect: Dialect,
     /// 客户端调的路径（Gemini 的模型在里面）
     path: &'a str,
+    /// 按路径分出来的那一种
+    shape: Shape,
     /// 客户端是哪个应用（请求那一行上记的那个，认不出是 `None`）
     client: Option<&'a str>,
     /// 客户端发来的原文
@@ -122,6 +166,7 @@ impl<'a> Hook<'a> {
             rules,
             dialect,
             path,
+            shape: Shape::of(path),
             client,
             body,
             parsed: None,
@@ -150,18 +195,27 @@ impl<'a> Hook<'a> {
         }
         let here = self.set.for_request(self.client, to.model, to.upstream);
         if here.is_empty() {
-            // 回答钩子要这个请求的密钥映射：管这一次的里面有，就现在记账
-            if !self
-                .set
-                .for_reply(self.client, to.model, to.upstream)
-                .is_empty()
+            // 回答钩子要这个请求的密钥映射：管这一次的里面有，就现在记账。不生成回答的
+            // 请求没有回答钩子可跑
+            if self.shape == Shape::Generate
+                && !self
+                    .set
+                    .for_reply(self.client, to.model, to.upstream)
+                    .is_empty()
             {
                 out.bridge = Some(self.base());
             }
             return Ok(out);
         }
+        if self.shape == Shape::Opaque {
+            // 空的请求体里没有插件能改的东西
+            if !self.body.iter().all(u8::is_ascii_whitespace) {
+                out.runs = unreadable(self.set, self.client, self.path, to)?;
+            }
+            return Ok(out);
+        }
         let mut bridge = self.base();
-        let (body, dialect, client) = (self.body, self.dialect, self.client);
+        let (body, dialect, client, shape) = (self.body, self.dialect, self.client, self.shape);
         let original = self
             .parsed
             .get_or_insert_with(|| serde_json::from_slice::<Value>(body).ok())
@@ -176,15 +230,7 @@ impl<'a> Hook<'a> {
             let host = match &a.state {
                 super::set::State::Broken(why) => {
                     let (outcome, refusal) = broken(a.on_error, &a.name, why);
-                    let run = PluginRun {
-                        plugin_id: a.id.clone(),
-                        plugin_name: a.name.clone(),
-                        hook: PluginHook::Request,
-                        outcome,
-                        error: Some(broken_reason(&a.name, why)),
-                        cpu_us: 0,
-                        detail: Some(json!({ "attempt": to.attempt })),
-                    };
+                    let run = not_run(&a, outcome, broken_reason(&a.name, why), to.attempt);
                     out.runs.push((a.clone(), run, Vec::new()));
                     if let Some(why) = refusal {
                         return Err(Box::new(Refused {
@@ -210,8 +256,9 @@ impl<'a> Hook<'a> {
                 let Some(current) = raw.as_deref() else {
                     return Err(Failure::Unreadable("the request body is not JSON".into()));
                 };
+                let conversation = wrapped_count(dialect, &path, current).unwrap_or(current);
                 let mut built =
-                    view::build(dialect, current, &path).map_err(Failure::Unreadable)?;
+                    view::build(dialect, conversation, &path).map_err(Failure::Unreadable)?;
                 sending(&mut built.view, &model);
                 let mut input = view::trim(&built.view, &a.permissions);
                 bridge.hide_value(&mut input);
@@ -241,6 +288,9 @@ impl<'a> Hook<'a> {
                             built.src.hidden_tools(),
                         )
                         .map_err(Failure::Edit)?;
+                        if shape == Shape::Alike {
+                            model_only(&mut edits);
+                        }
                         if edits.is_empty() {
                             return Ok(None);
                         }
@@ -248,8 +298,9 @@ impl<'a> Hook<'a> {
                         edits.reveal(&bridge);
                         let new_model = edits.params.as_ref().and_then(|p| p.model.clone());
                         let mut next = current.clone();
-                        let new_path = view::apply(&mut next, &built.src, &edits, &path)
-                            .map_err(Failure::Edit)?;
+                        let new_path =
+                            write_back(dialect, &mut next, &built.src, &edits, &path, &model)
+                                .map_err(Failure::Edit)?;
                         Ok(Some(Rewritten {
                             value: next,
                             path: new_path,
@@ -323,6 +374,127 @@ impl<'a> Hook<'a> {
         }
         out.bridge = Some(bridge);
         Ok(out)
+    }
+}
+
+/// 插件看不懂、却要发往上游的东西：[`Shape::Opaque`] 的请求体，不是 Responses 的
+/// WebSocket 连接上的帧。管这一次的插件一个都跑不了 —— 跑不了的插件（文件变了、装不上）
+/// 照旧，能跑的按它的 `on_error`：拒绝就拒掉整个请求，跳过就原样发、记一笔跳过。`path`
+/// 是客户端调的路径，报出来的就是它
+pub fn unreadable(
+    set: &PluginSet,
+    client: Option<&str>,
+    path: &str,
+    to: &Target<'_>,
+) -> Result<Vec<Ran>, Box<Refused>> {
+    let mut runs = Vec::new();
+    for a in set.for_request(client, to.model, to.upstream) {
+        let (outcome, error, refusal) = match &a.state {
+            super::set::State::Broken(why) => {
+                let (outcome, refusal) = broken(a.on_error, &a.name, why);
+                (outcome, broken_reason(&a.name, why), refusal)
+            }
+            super::set::State::Ready(_) => {
+                let why = cannot_read(&a.name, path);
+                match a.on_error {
+                    OnError::Skip => (PluginOutcome::Skipped, why, None),
+                    OnError::Reject => (PluginOutcome::Error, why.clone(), Some(why)),
+                }
+            }
+        };
+        runs.push((
+            a.clone(),
+            not_run(&a, outcome, error, to.attempt),
+            Vec::new(),
+        ));
+        if let Some(why) = refusal {
+            return Err(Box::new(Refused { why, runs }));
+        }
+    }
+    Ok(runs)
+}
+
+/// 没跑的一次：跑不了的插件，看不懂的请求
+fn not_run(a: &Active, outcome: PluginOutcome, error: Msg, attempt: usize) -> PluginRun {
+    PluginRun {
+        plugin_id: a.id.clone(),
+        plugin_name: a.name.clone(),
+        hook: PluginHook::Request,
+        outcome,
+        error: Some(error),
+        cpu_us: 0,
+        detail: Some(json!({ "attempt": attempt })),
+    }
+}
+
+/// 插件看不懂这个接口的请求体（见 [`unreadable`]）
+pub(super) fn cannot_read(plugin: &str, path: &str) -> Msg {
+    msg!(
+        "gw.plugin.cannot_read", plugin = plugin, path = path =>
+        "Plugin `{plugin}` cannot read requests to {path}."
+    )
+}
+
+/// Gemini 数 token 的请求
+fn gemini_count(dialect: Dialect, path: &str) -> bool {
+    dialect == Dialect::Gemini && path.trim_end_matches('/').ends_with(":countTokens")
+}
+
+/// Gemini 数 token 的请求体有两种写法：`contents` 直接放在外面，或者整个生成请求包在
+/// `generateContentRequest` 里。**插件看的、改的都是那一份生成请求**：包着的是里面那一份
+pub(super) fn wrapped_count<'v>(dialect: Dialect, path: &str, raw: &'v Value) -> Option<&'v Value> {
+    if !gemini_count(dialect, path) {
+        return None;
+    }
+    raw.get("generateContentRequest").filter(|v| v.is_object())
+}
+
+/// 把插件的改动写回原文（见 [`view::apply`]），返回新的路径（Gemini 换了模型时）。
+///
+/// Gemini 数 token 的请求体照它原来的写法写：包着的写回里面那一份；没包着的，插件加了
+/// 系统提示、工具就包起来 —— 外面那一层只收 `contents`，系统提示和工具要放进
+/// `generateContentRequest` 才数得进去，放在外面上游回 400。包着的那一份里也写着模型名
+/// （`models/…`），插件换了模型名就跟着换，和路径上的对得上。`model` 是发给这一家的模型名
+pub(super) fn write_back(
+    dialect: Dialect,
+    raw: &mut Value,
+    src: &view::Src,
+    edits: &view::Edits,
+    path: &str,
+    model: &str,
+) -> Result<Option<String>, view::EditError> {
+    if !gemini_count(dialect, path) {
+        return view::apply(raw, src, edits, path);
+    }
+    let renamed = edits.params.as_ref().and_then(|p| p.model.as_deref());
+    let wrapped = raw
+        .get("generateContentRequest")
+        .is_some_and(Value::is_object);
+    let new_path = match raw.get_mut("generateContentRequest") {
+        Some(inner) if wrapped => view::apply(inner, src, edits, path)?,
+        _ => view::apply(raw, src, edits, path)?,
+    };
+    if !wrapped && (edits.system.is_some() || edits.tools.is_some()) {
+        *raw = json!({ "generateContentRequest": std::mem::take(raw) });
+    }
+    if let Some(inner) = raw
+        .get_mut("generateContentRequest")
+        .and_then(Value::as_object_mut)
+        && (renamed.is_some() || !wrapped)
+    {
+        let model = renamed.unwrap_or(model);
+        inner.insert("model".into(), json!(format!("models/{model}")));
+    }
+    Ok(new_path)
+}
+
+/// 不生成回答的接口（[`Shape::Alike`]）：`params` 里只留模型名，别的改动不写回
+pub(super) fn model_only(edits: &mut view::Edits) {
+    if let Some(p) = edits.params.as_mut() {
+        *p = view::ParamsEdit {
+            model: p.model.take(),
+            ..Default::default()
+        };
     }
 }
 

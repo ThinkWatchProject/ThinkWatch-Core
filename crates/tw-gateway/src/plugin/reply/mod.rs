@@ -13,6 +13,11 @@
 //! 回答开始时给每个范围内的插件起一个实例（[`Chain::start`]），这次回答的文字和工具
 //! 调用都交给它，回答结束就扔掉（约定 I3）。
 //!
+//! 每个实例占一个名额，整个进程同时活着的回答实例有上限（见 [`super::pool`]）。名额满了，
+//! 这个插件这次回答不起实例，按它的 `on_error`：拒绝就是这个请求失败，跳过就是这次回答
+//! 绕过它。名额和实例放在一起，回答收尾（[`Chain::finish`]）、插件出错被拿掉、客户端走了
+//! （整条链被扔掉）时跟着实例一起还回去。
+//!
 //! - **文字**按块交：整块模式攒齐一块再交一次，交回来的才发给客户端；流式模式每段
 //!   增量交一次，交回什么现在就发什么（空串是先扣着），块结束时调 `onReplyTextEnd`
 //!   把扣着的补上。几个插件串起来，前一个交出的是后一个收到的。
@@ -36,8 +41,8 @@ use tw_dialect::ir::Dialect;
 use tw_types::{Msg, msg};
 
 use super::bridge::Bridge;
-use super::host::{Invocation, ReplyHost, RunError, ToolCallOutcome};
-use super::pool::Pool;
+use super::host::{Invocation, PluginHost, ReplyHost, RunError, ToolCallOutcome};
+use super::pool::{Pool, Slot};
 use super::set::{Active, LogLine, PluginRun, PluginSet};
 use crate::error::GatewayError;
 
@@ -82,14 +87,22 @@ struct Stage {
     text: bool,
     text_end: bool,
     tools: bool,
-    /// 出错之后被拿掉了（跳过）的是 None
-    instance: Option<Box<dyn ReplyHost>>,
+    /// 出错之后被拿掉了（跳过）的、回答收尾了的是 None
+    instance: Option<Instance>,
     lanes: HashMap<Lane, StageLane>,
     cpu: Duration,
     counts: Counts,
     error: Option<Msg>,
     /// 这次回答里它写的日志，回答结束时一起交出去
     logs: Vec<LogLine>,
+}
+
+/// 一个插件在这次回答里的实例，连同它占着的名额：**一起扔掉，一起还回去**。调用时整个
+/// 交给插件线程、跑完再交回来，所以在插件线程上没了（panic、调用方已经走了）的实例，
+/// 名额也跟着还
+struct Instance {
+    host: Box<dyn ReplyHost>,
+    _slot: Slot,
 }
 
 #[derive(Default)]
@@ -132,11 +145,56 @@ fn failed(name: &str, detail: &Msg) -> GatewayError {
     ))
 }
 
+/// 名额满了：这个插件这次回答没起实例（见 [`super::pool`]）。记在这次运行上，拒绝时
+/// 也是报给客户端的那一句
+fn busy(plugin: &str, max: usize) -> Msg {
+    msg!(
+        "gw.plugin.reply_busy", plugin = plugin, max = max =>
+        "Plugin `{plugin}` was not started for this answer: the limit of {max} plugins running \
+         on answers at the same time was reached."
+    )
+}
+
+/// 一个插件这次回答没起来。
+enum NotStarted {
+    /// 名额满了。记的、拒绝时报给客户端的都是 [`busy`] 那一句
+    Busy(Msg),
+    /// 起实例出错了。记的是这个错误，拒绝时报给客户端的是 [`failed`] 那一句
+    Failed(Msg),
+}
+
+impl NotStarted {
+    /// 记在这次运行上的那一句
+    fn why(&self) -> &Msg {
+        match self {
+            NotStarted::Busy(m) | NotStarted::Failed(m) => m,
+        }
+    }
+}
+
+/// 拿一个名额、在插件线程上起这个插件的实例。**名额交给插件线程上的那一步**：调用方
+/// 半路走了，实例照样起完，和名额一起扔掉
+async fn instantiate(
+    pool: &Pool,
+    host: Arc<dyn PluginHost>,
+    name: &str,
+    ctx: Value,
+) -> Result<Instance, NotStarted> {
+    let Some(slot) = pool.reply_slot() else {
+        return Err(NotStarted::Busy(busy(name, pool.reply_cap())));
+    };
+    pool.run(move || host.reply(ctx).map(|host| Instance { host, _slot: slot }))
+        .await
+        .map_err(|e| RunError::Trap(e.to_string()))
+        .and_then(|r| r)
+        .map_err(|e| NotStarted::Failed(e.msg()))
+}
+
 fn stage(
     active: Option<Arc<Active>>,
     m: &super::engine::Manifest,
     on_error: OnError,
-    instance: Box<dyn ReplyHost>,
+    instance: Instance,
 ) -> Stage {
     Stage {
         name: active
@@ -161,8 +219,8 @@ impl Chain {
     /// 给这次回答起插件实例。范围内一个回答钩子都没有时是 `None` —— 这次回答原样走，
     /// 不付任何代价。
     ///
-    /// 起实例失败按 `on_error`：拒绝就是这个错误（这时一个字节都还没发给客户端），
-    /// 跳过就不要它。
+    /// 起实例失败、名额满了（见 [`super::pool`]）按 `on_error`：拒绝就是这个错误（这时
+    /// 一个字节都还没发给客户端），跳过就不要它。两样都和别的插件错误一样记一笔。
     pub async fn start(
         state: &crate::AppState,
         set: &PluginSet,
@@ -184,28 +242,21 @@ impl Chain {
                 ctx.upstream,
                 &a.settings,
             );
-            let made = state
-                .plugin_pool
-                .run(move || host.reply(c))
-                .await
-                .map_err(|e| RunError::Trap(e.to_string()))
-                .and_then(|r| r);
-            match made {
+            match instantiate(&state.plugin_pool, host, &a.name, c).await {
                 Ok(instance) => stages.push(stage(Some(a.clone()), &m, a.on_error, instance)),
-                Err(err) => {
-                    let why = err.msg();
+                Err(not) => {
                     let run = PluginRun {
                         plugin_id: a.id.clone(),
                         plugin_name: a.name.clone(),
                         hook: PluginHook::Reply,
                         outcome: PluginOutcome::Error,
-                        error: Some(why.clone()),
+                        error: Some(not.why().clone()),
                         cpu_us: 0,
                         detail: Some(json!({ "attempt": ctx.attempt })),
                     };
                     state.plugin_ran(ctx.request_id, &a, run, Vec::new());
                     if a.on_error == OnError::Reject {
-                        // 已经起好的那几个也记一笔（一次都没调用过）
+                        // 已经起好的那几个也记一笔（一次都没调用过），名额还回去
                         let mut started = Chain {
                             pool: state.plugin_pool.clone(),
                             state: Some(state.clone()),
@@ -217,7 +268,10 @@ impl Chain {
                             recorded: false,
                         };
                         started.finish();
-                        return Err(failed(&a.name, &why));
+                        return Err(match not {
+                            NotStarted::Busy(why) => GatewayError::denied(why),
+                            NotStarted::Failed(why) => failed(&a.name, &why),
+                        });
                     }
                 }
             }
@@ -238,10 +292,10 @@ impl Chain {
     }
 
     /// 一条试跑用的链：只有这一个插件，日志收下来交给调用方，不进统计、日志圈和记录。
-    /// 起不来是那个错误
+    /// 起不来（名额满了也算）是那个错误
     pub(crate) async fn trial(
         pool: Arc<Pool>,
-        host: Arc<dyn super::host::PluginHost>,
+        host: Arc<dyn PluginHost>,
         settings: &serde_json::Map<String, Value>,
         ctx: &ReplyCtx<'_>,
     ) -> Result<Option<Chain>, Msg> {
@@ -257,11 +311,9 @@ impl Chain {
             ctx.upstream,
             settings,
         );
-        let instance = pool
-            .run(move || host.reply(c))
+        let instance = instantiate(&pool, host, &m.name, c)
             .await
-            .map_err(|e| RunError::Trap(e.to_string()).msg())?
-            .map_err(|e| e.msg())?;
+            .map_err(|not| not.why().clone())?;
         Ok(Some(Chain {
             pool,
             state: None,
@@ -305,7 +357,7 @@ impl Chain {
         let ran = self
             .pool
             .run(move || {
-                let inv = f(inst.as_mut());
+                let inv = f(inst.host.as_mut());
                 (inst, inv)
             })
             .await;
@@ -621,8 +673,14 @@ impl Chain {
         Ok(out)
     }
 
-    /// 回答结束了（或者断了）：每个插件一条记录，改了几处写在 `detail` 里。只记一次
+    /// 回答结束了（或者断了）：每个插件一条记录，改了几处写在 `detail` 里。只记一次。
+    ///
+    /// **实例这时就扔掉**，名额还回去：调用方还攥着这条链（流还要补一段收尾、整包还要过
+    /// 一遍审查）的那一会儿，实例已经用不上了
     pub fn finish(&mut self) {
+        for s in &mut self.stages {
+            s.instance = None;
+        }
         if self.recorded {
             return;
         }

@@ -282,6 +282,7 @@ gw.output_limit.withheld
 gw.plugin.answer_unreadable
 gw.plugin.api
 gw.plugin.bad_output
+gw.plugin.cannot_read
 gw.plugin.changed
 gw.plugin.cpu_limit
 gw.plugin.engine
@@ -296,6 +297,7 @@ gw.plugin.output_limit
 gw.plugin.permission_violation
 gw.plugin.reason passthrough
 gw.plugin.rejected
+gw.plugin.reply_busy
 gw.plugin.reply_failed
 gw.plugin.request_failed
 gw.plugin.request_unreadable

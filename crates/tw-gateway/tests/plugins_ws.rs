@@ -403,3 +403,107 @@ async fn content_a_plugin_adds_to_a_response_create_is_screened() {
         seen.lock().unwrap()
     );
 }
+
+/// Realtime 那样的 WebSocket 上游：记下收到的每一帧，原样回一帧
+async fn realtime_upstream() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let app = Router::new()
+        .route(
+            "/v1/realtime",
+            axum::routing::any(
+                |State(seen): State<Arc<Mutex<Vec<String>>>>, ws: WebSocketUpgrade| async move {
+                    ws.on_upgrade(move |mut sock: WebSocket| async move {
+                        while let Some(Ok(m)) = sock.recv().await {
+                            let Message::Text(t) = m else { continue };
+                            seen.lock().unwrap().push(t.to_string());
+                            if sock.send(Message::Text(t)).await.is_err() {
+                                return;
+                            }
+                        }
+                    })
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, seen)
+}
+
+/// 不是 Responses 的 WebSocket（比如 Realtime 的 `/v1/realtime`）：插件看不懂它的帧。管得着
+/// 的插件按它的 `on_error` 在升级时就处置 —— 拒绝就不接这条连接，跳过就接上、帧原样过去、
+/// 记一笔跳过
+#[tokio::test]
+async fn a_websocket_plugins_cannot_read_follows_on_error_at_the_upgrade() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let look = || {
+        Double::new("look")
+            .permit(&[Permission::Messages])
+            .on_request(|_, _| Invocation::ok(RequestOutcome::Unchanged))
+    };
+    let request = |gw: SocketAddr| {
+        let mut req = format!("ws://{gw}/v1/realtime")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("x-api-key", "tw-wskey".parse().unwrap());
+        req
+    };
+    let item = json!({ "type": "conversation.item.create",
+                       "item": { "type": "message", "role": "user",
+                                 "content": [{ "type": "input_text", "text": "secret plan" }] } })
+    .to_string();
+
+    // 拒绝：升级不成，一个字节都没到上游
+    let (up, seen) = realtime_upstream().await;
+    let (gw, runs) = gateway_with(up, vec![entry("look", look())], Default::default()).await;
+    match tokio_tungstenite::connect_async(request(gw)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+            assert_eq!(r.status(), 403);
+            let body =
+                String::from_utf8_lossy(r.body().as_deref().unwrap_or_default()).into_owned();
+            assert!(
+                body.contains("Plugin `Plugin look` cannot read requests to /v1/realtime."),
+                "{body}"
+            );
+        }
+        other => panic!("the upgrade went through: {:?}", other.map(|_| ())),
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(seen.lock().unwrap().is_empty());
+    let outcomes: Vec<String> = runs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.run.outcome.slug().to_string())
+        .collect();
+    assert_eq!(outcomes, ["error"]);
+
+    // 跳过：接上，帧原样过去，这条连接上记一笔跳过
+    let (up, seen) = realtime_upstream().await;
+    let (gw, runs) = gateway_with(
+        up,
+        vec![entry_with("look", look(), |a| {
+            a.on_error = tw_api::OnError::Skip
+        })],
+        Default::default(),
+    )
+    .await;
+    let (mut c, _) = tokio_tungstenite::connect_async(request(gw)).await.unwrap();
+    c.send(WsMsg::Text(item.clone().into())).await.unwrap();
+    let back = tokio::time::timeout(Duration::from_secs(3), c.next())
+        .await
+        .expect("no echo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.into_text().unwrap().as_str(), item);
+    assert_eq!(seen.lock().unwrap().as_slice(), [item]);
+    let outcomes: Vec<String> = runs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.run.outcome.slug().to_string())
+        .collect();
+    assert_eq!(outcomes, ["skipped"]);
+}

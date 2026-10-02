@@ -135,6 +135,60 @@ pub(super) async fn ws_upgrade(
         .await
         .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
     let (id, ending) = open(&choice, &name, provider.billing.into());
+    // 插件：升级那一刻的那一份表，一条连接用到底。**插件只看得懂 Responses 的 WebSocket**
+    // （每个 `response.create` 是一次请求）；别的路径上的帧插件看不懂，管得着的插件按它的
+    // `on_error` —— 拒绝就不接这条连接，跳过就记一笔、这条连接不过插件
+    let hint = crate::hint::client_hint(&headers);
+    let plugins = if rt.plugins.is_empty() {
+        None
+    } else if crate::client_api::ClientApi::of_path(uri.path())
+        == Some(crate::client_api::ClientApi::OpenaiResponses)
+        && crate::client_api::ClientApi::generates(uri.path())
+    {
+        Some(crate::ws::Plugins {
+            pool: state.plugin_pool.clone(),
+            set: rt.plugins.clone(),
+            client: hint.clone(),
+        })
+    } else {
+        let to = crate::plugin::request::Target {
+            upstream: &name,
+            // 升级请求没有正文：说不出是哪个模型
+            model: "",
+            requested_model: "",
+            attempt: 0,
+        };
+        let hop_started = std::time::Instant::now();
+        match crate::plugin::request::unreadable(&rt.plugins, hint.as_deref(), uri.path(), &to) {
+            Ok(runs) => {
+                crate::plugin::request::record(&state, id, &runs);
+                None
+            }
+            Err(refused) => {
+                crate::plugin::request::record(&state, id, &refused.runs);
+                let err = GatewayError::denied(refused.why);
+                // 和 HTTP 那条路一样：没发出去的这一跳在尝试链上，原因就是拒绝它的那句话
+                state.bus.emit(tw_api::Event::RequestRouted {
+                    id,
+                    route: choice.route,
+                    rule: choice.rule,
+                    group: choice.group,
+                    rewritten_by: Vec::new(),
+                    denied_by: None,
+                    affinity: None,
+                    attempts: vec![crate::server::hop_failed(
+                        &name,
+                        None,
+                        err.detail.clone(),
+                        hop_started,
+                    )],
+                    billing: tw_api::Billing::PerToken,
+                });
+                ending.failed(err.source.into(), err.detail.clone());
+                return Err(err);
+            }
+        }
+    };
     let upstream = crate::ws::Upstream {
         url: crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref()),
         headers: upstream_headers,
@@ -152,12 +206,6 @@ pub(super) async fn ws_upgrade(
         limit_mode: rt.config.security.output_limit.mode,
         limit: rt.config.security.output_limit.limit(),
     };
-    // 插件：升级那一刻的那一份表，一条连接用到底
-    let plugins = (!rt.plugins.is_empty()).then(|| crate::ws::Plugins {
-        pool: state.plugin_pool.clone(),
-        set: rt.plugins.clone(),
-        client: crate::hint::client_hint(&headers),
-    });
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久
         let _live = live;
