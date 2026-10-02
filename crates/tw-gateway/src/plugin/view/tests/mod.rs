@@ -32,7 +32,7 @@ fn edit(
     Ok((next, p))
 }
 
-fn view_of(d: Dialect, raw: &Value, path: &str) -> Value {
+fn view_of(d: impl Into<Form>, raw: &Value, path: &str) -> Value {
     build(d, raw, path).expect("builds").view
 }
 
@@ -1220,4 +1220,488 @@ fn placeholders_in_edits_are_revealed_before_write_back() {
         next["messages"][4]["content"],
         format!("my key is {KEY} (rotated)")
     );
+}
+
+// ───────────────────────────────────────────────────────── 嵌入、旧版补全
+
+/// 和 [`edit`] 一样，但按这种请求自己的规矩核对（[`Src::check`]，数据面走的就是它）。
+/// 插件有 `messages` 和 `params` 两个权限
+fn edit_inputs(
+    form: Form,
+    raw: &Value,
+    path: &str,
+    f: impl FnOnce(&mut Value),
+) -> Result<(Value, Option<String>), EditError> {
+    let built = build(form, raw, path).expect("builds");
+    let perms = [Permission::Messages, Permission::Params];
+    let input = trim(&built.view, &perms);
+    let mut out = input.clone();
+    f(&mut out);
+    let edits = built.src.check(&input, &out, &perms)?;
+    let mut next = raw.clone();
+    let p = apply(&mut next, &built.src, &edits, path)?;
+    Ok((next, p))
+}
+
+fn embeddings() -> Value {
+    json!({
+        "model": "text-embedding-3-small",
+        "input": ["the SECRET plan", "a second line", [9906, 1917]],
+        "encoding_format": "float",
+        "dimensions": 256,
+        "user": "u-1"
+    })
+}
+
+const EMBEDDINGS: &str = "/v1/embeddings";
+
+fn completions() -> Value {
+    json!({
+        "model": "gpt-3.5-turbo-instruct",
+        "prompt": ["Say hi to SECRET", [9906, 1917], "def f():"],
+        "suffix": "\n# end",
+        "max_tokens": 16,
+        "temperature": 0.5,
+        "stop": "\n\n",
+        "logprobs": 2,
+        "echo": false
+    })
+}
+
+const COMPLETIONS: &str = "/v1/completions";
+
+fn gemini_embed() -> Value {
+    json!({
+        "model": "models/gemini-embedding-001",
+        "content": { "parts": [{ "text": "the SECRET plan" }, { "text": "more" }] },
+        "taskType": "RETRIEVAL_DOCUMENT",
+        "title": "Plans",
+        "outputDimensionality": 768
+    })
+}
+
+const GEMINI_EMBED: &str = "/v1beta/models/gemini-embedding-001:embedContent";
+
+fn gemini_batch() -> Value {
+    json!({
+        "requests": [
+            { "model": "models/gemini-embedding-001", "taskType": "RETRIEVAL_QUERY",
+              "content": { "parts": [{ "text": "first SECRET" }] } },
+            { "model": "models/gemini-embedding-001",
+              "content": { "parts": [
+                  { "text": "second" },
+                  { "inlineData": { "mimeType": "image/png", "data": "iVBORw0KGgo=" } }
+              ] } }
+        ]
+    })
+}
+
+const GEMINI_BATCH: &str = "/v1beta/models/gemini-embedding-001:batchEmbedContents";
+
+/// 四种输入的单子各一份：(写法, 请求体, 路径, 第一段文字在原文里的位置)
+fn input_samples() -> Vec<(Form, Value, &'static str, &'static str)> {
+    vec![
+        (Form::OpenaiEmbeddings, embeddings(), EMBEDDINGS, "/input/0"),
+        (
+            Form::OpenaiCompletions,
+            completions(),
+            COMPLETIONS,
+            "/prompt/0",
+        ),
+        (
+            Form::GeminiEmbed,
+            gemini_embed(),
+            GEMINI_EMBED,
+            "/content/parts/0/text",
+        ),
+        (
+            Form::GeminiEmbed,
+            gemini_batch(),
+            GEMINI_BATCH,
+            "/requests/0/content/parts/0/text",
+        ),
+    ]
+}
+
+fn parts_of(v: &Value) -> Vec<Vec<(String, String)>> {
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            assert_eq!(m["role"], "user", "{m}");
+            m["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let t = p["type"].as_str().unwrap().to_string();
+                    let what = p["text"].as_str().or(p["label"].as_str()).unwrap();
+                    (t, what.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn pairs(list: &[&[(&str, &str)]]) -> Vec<Vec<(String, String)>> {
+    list.iter()
+        .map(|m| {
+            m.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+/// 一项输入一条 `user` 消息：文字是文字，一串 token 是只读的 `other`；没有系统提示和
+/// 工具；参数只有这种请求有的那几个
+#[test]
+fn inputs_read_as_one_user_message_each() {
+    let v = view_of(Form::OpenaiEmbeddings, &embeddings(), EMBEDDINGS);
+    assert_eq!(v["format"], "openai_embeddings");
+    assert_eq!(v["model"], "text-embedding-3-small");
+    assert_eq!(
+        parts_of(&v),
+        pairs(&[
+            &[("text", "the SECRET plan")],
+            &[("text", "a second line")],
+            &[("other", "tokens")]
+        ])
+    );
+    assert_eq!(v["params"], json!({ "model": "text-embedding-3-small" }));
+    assert!(v.get("system").is_none() && v.get("tools").is_none(), "{v}");
+
+    let v = view_of(Form::OpenaiCompletions, &completions(), COMPLETIONS);
+    assert_eq!(v["format"], "openai_completions");
+    assert_eq!(
+        parts_of(&v),
+        pairs(&[
+            &[("text", "Say hi to SECRET")],
+            &[("other", "tokens")],
+            &[("text", "def f():")]
+        ])
+    );
+    // `suffix`、`logprobs` 这些不给看
+    assert_eq!(
+        v["params"],
+        json!({ "model": "gpt-3.5-turbo-instruct", "max_tokens": 16, "temperature": 0.5, "stop": ["\n\n"] })
+    );
+
+    let v = view_of(Form::GeminiEmbed, &gemini_embed(), GEMINI_EMBED);
+    assert_eq!(v["format"], "gemini_embed");
+    assert_eq!(v["model"], "gemini-embedding-001");
+    assert_eq!(
+        parts_of(&v),
+        pairs(&[&[("text", "the SECRET plan"), ("text", "more")]])
+    );
+    assert_eq!(v["params"], json!({ "model": "gemini-embedding-001" }));
+
+    let v = view_of(Form::GeminiEmbed, &gemini_batch(), GEMINI_BATCH);
+    assert_eq!(
+        parts_of(&v),
+        pairs(&[
+            &[("text", "first SECRET")],
+            &[("text", "second"), ("other", "inlineData")]
+        ])
+    );
+}
+
+/// 一个字符串是一条消息，一串 token（全是数字的数组）也是一条，几串 token 是几条
+#[test]
+fn a_single_input_and_token_inputs() {
+    let one = json!({ "model": "m", "input": "hello" });
+    let v = view_of(Form::OpenaiEmbeddings, &one, EMBEDDINGS);
+    assert_eq!(parts_of(&v), pairs(&[&[("text", "hello")]]));
+    let (out, _) = edit_inputs(Form::OpenaiEmbeddings, &one, EMBEDDINGS, |v| {
+        msgs(v)[0]["parts"][0]["text"] = json!("hi")
+    })
+    .unwrap();
+    // 还是一个字符串
+    assert_eq!(out, json!({ "model": "m", "input": "hi" }));
+
+    let tokens = json!({ "model": "m", "prompt": [1, 2, 3] });
+    let v = view_of(Form::OpenaiCompletions, &tokens, COMPLETIONS);
+    assert_eq!(parts_of(&v), pairs(&[&[("other", "tokens")]]));
+    let many = json!({ "model": "m", "prompt": [[1, 2], [3]] });
+    let v = view_of(Form::OpenaiCompletions, &many, COMPLETIONS);
+    assert_eq!(
+        parts_of(&v),
+        pairs(&[&[("other", "tokens")], &[("other", "tokens")]])
+    );
+    // 一串 token 只读
+    let r = edit_inputs(Form::OpenaiCompletions, &tokens, COMPLETIONS, |v| {
+        msgs(v)[0]["parts"][0]["label"] = json!("text")
+    });
+    assert!(matches!(r, Err(EditError::PermissionViolation(_))), "{r:?}");
+    // 没有输入：一条消息都没有
+    let none = json!({ "model": "m" });
+    assert!(
+        view_of(Form::OpenaiCompletions, &none, COMPLETIONS)["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// 改一段文字：写回之后，除了那一段，**一个字节都不差**
+#[test]
+fn editing_one_input_changes_only_that_text() {
+    for (form, raw, path, at) in input_samples() {
+        let (out, new_path) = edit_inputs(form, &raw, path, |v| {
+            let t = v["messages"][0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .replace("SECRET", "[removed]");
+            v["messages"][0]["parts"][0]["text"] = json!(t);
+        })
+        .unwrap();
+        assert_eq!(new_path, None, "{form:?}");
+        let mut want = raw.clone();
+        let was = want.pointer(at).unwrap().as_str().unwrap().to_string();
+        *want.pointer_mut(at).unwrap() = json!(was.replace("SECRET", "[removed]"));
+        assert_ne!(want, raw);
+        assert_eq!(out.to_string(), want.to_string(), "{form:?}");
+    }
+}
+
+/// 原样交回是没改；只改了参数也只动参数
+#[test]
+fn returning_an_inputs_view_untouched_changes_nothing() {
+    for (form, raw, path, _) in input_samples() {
+        let built = build(form, &raw, path).unwrap();
+        let perms = [Permission::Messages, Permission::Params];
+        let input = trim(&built.view, &perms);
+        let edits = built.src.check(&input, &input, &perms).unwrap();
+        assert!(edits.is_empty(), "{form:?}: {edits:?}");
+    }
+}
+
+/// 消息、部分不能加、不能删、不能挪；只读的不能改；没有的那几节交回来也不收
+#[test]
+fn inputs_cannot_be_added_removed_or_reordered() {
+    use EditError::*;
+    let kind = |r: Result<(Value, Option<String>), EditError>| match r {
+        Err(PermissionViolation(_)) => "permission",
+        Err(BadOutput(_)) => "bad",
+        Ok(_) => "ok",
+    };
+    for (form, raw, path, _) in input_samples() {
+        let run = |f: &dyn Fn(&mut Value)| kind(edit_inputs(form, &raw, path, |v| f(v)));
+        let case = format!("{form:?} {path}");
+        // 加一条、删一条、挪一条
+        assert_eq!(
+            run(&|v| msgs(v)
+                .push(json!({ "role": "user", "parts": [{ "type": "text", "text": "more" }] }))),
+            "bad",
+            "{case}"
+        );
+        assert_eq!(
+            run(&|v| msgs(v).insert(
+                0,
+                json!({ "role": "user", "parts": [{ "type": "text", "text": "first" }] })
+            )),
+            "bad",
+            "{case}"
+        );
+        assert_eq!(
+            run(&|v| {
+                msgs(v).remove(0);
+            }),
+            "bad",
+            "{case}"
+        );
+        if v_len(&raw, form, path) > 1 {
+            assert_eq!(
+                run(&|v| {
+                    let last = msgs(v).len() - 1;
+                    msgs(v).remove(last);
+                }),
+                "bad",
+                "{case}"
+            );
+            assert_eq!(run(&|v| msgs(v).swap(0, 1)), "bad", "{case}");
+        }
+        // 部分也一样
+        assert_eq!(
+            run(&|v| v["messages"][0]["parts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "type": "text", "text": "more" }))),
+            "bad",
+            "{case}"
+        );
+        assert_eq!(
+            run(&|v| v["messages"][0]["parts"].as_array_mut().unwrap().clear()),
+            "bad",
+            "{case}"
+        );
+        // 角色只读
+        assert_eq!(
+            run(&|v| v["messages"][0]["role"] = json!("assistant")),
+            "permission",
+            "{case}"
+        );
+        // 没有系统提示、没有工具：权限再全也加不进去
+        let all = all();
+        let built = build(form, &raw, path).unwrap();
+        let input = trim(&built.view, &all);
+        for (k, x) in [("system", json!("be nice")), ("tools", json!([]))] {
+            let mut out = input.clone();
+            out[k] = x;
+            let r = built.src.check(&input, &out, &all);
+            assert!(matches!(r, Err(BadOutput(_))), "{case} {k}: {r:?}");
+        }
+    }
+}
+
+fn v_len(raw: &Value, form: Form, path: &str) -> usize {
+    view_of(form, raw, path)["messages"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// 只读的那几项（一串 token、图片）不能改；嵌入的参数只有模型名
+#[test]
+fn read_only_items_and_params_an_input_list_does_not_have() {
+    let r = edit_inputs(Form::OpenaiEmbeddings, &embeddings(), EMBEDDINGS, |v| {
+        v["messages"][2]["parts"][0] = json!({ "key": "m2.p0", "type": "text", "text": "x" })
+    });
+    assert!(matches!(r, Err(EditError::PermissionViolation(_))), "{r:?}");
+    let r = edit_inputs(Form::GeminiEmbed, &gemini_batch(), GEMINI_BATCH, |v| {
+        v["messages"][1]["parts"][1]["label"] = json!("text")
+    });
+    assert!(matches!(r, Err(EditError::PermissionViolation(_))), "{r:?}");
+    for (form, raw, path) in [
+        (Form::OpenaiEmbeddings, embeddings(), EMBEDDINGS),
+        (Form::GeminiEmbed, gemini_embed(), GEMINI_EMBED),
+    ] {
+        for (k, x) in [
+            ("max_tokens", json!(10)),
+            ("temperature", json!(0.1)),
+            ("top_p", json!(0.5)),
+            ("stop", json!(["x"])),
+        ] {
+            let r = edit_inputs(form, &raw, path, |v| v["params"][k] = x.clone());
+            assert!(
+                matches!(r, Err(EditError::BadOutput(_))),
+                "{form:?} {k}: {r:?}"
+            );
+        }
+    }
+}
+
+/// 补全的参数写回原来的写法：`stop` 原来是一个字符串还写成字符串；去掉的就去掉
+#[test]
+fn completions_params_are_written_back_in_their_own_fields() {
+    let (out, _) = edit_inputs(Form::OpenaiCompletions, &completions(), COMPLETIONS, |v| {
+        v["params"]["stop"] = json!(["END"]);
+        v["params"]["max_tokens"] = json!(64);
+        v["params"].as_object_mut().unwrap().remove("temperature");
+        v["params"]["top_p"] = json!(0.9);
+        v["params"]["model"] = json!("davinci-002");
+    })
+    .unwrap();
+    let mut want = completions();
+    want["stop"] = json!("END");
+    want["max_tokens"] = json!(64);
+    want.as_object_mut().unwrap().remove("temperature");
+    want["top_p"] = json!(0.9);
+    want["model"] = json!("davinci-002");
+    assert_eq!(out, want);
+    // 嵌入的模型名
+    let (out, path) = edit_inputs(Form::OpenaiEmbeddings, &embeddings(), EMBEDDINGS, |v| {
+        v["params"]["model"] = json!("text-embedding-3-large")
+    })
+    .unwrap();
+    assert_eq!(path, None);
+    assert_eq!(out["model"], "text-embedding-3-large");
+}
+
+/// Gemini 换模型：路径换，请求体里写着的 `models/…` 跟着换（批量的每一个请求都换）
+#[test]
+fn a_gemini_embedding_model_change_moves_the_path_and_the_named_models() {
+    let (out, path) = edit_inputs(Form::GeminiEmbed, &gemini_batch(), GEMINI_BATCH, |v| {
+        v["params"]["model"] = json!("text-embedding-004")
+    })
+    .unwrap();
+    assert_eq!(
+        path.as_deref(),
+        Some("/v1beta/models/text-embedding-004:batchEmbedContents")
+    );
+    for r in out["requests"].as_array().unwrap() {
+        assert_eq!(r["model"], "models/text-embedding-004");
+    }
+    let (out, path) = edit_inputs(Form::GeminiEmbed, &gemini_embed(), GEMINI_EMBED, |v| {
+        v["params"]["model"] = json!("text-embedding-004")
+    })
+    .unwrap();
+    assert_eq!(
+        path.as_deref(),
+        Some("/v1beta/models/text-embedding-004:embedContent")
+    );
+    assert_eq!(out["model"], "models/text-embedding-004");
+    // 没写 `model` 的不加
+    let mut bare = gemini_embed();
+    bare.as_object_mut().unwrap().remove("model");
+    let (out, _) = edit_inputs(Form::GeminiEmbed, &bare, GEMINI_EMBED, |v| {
+        v["params"]["model"] = json!("text-embedding-004")
+    })
+    .unwrap();
+    assert!(out.get("model").is_none(), "{out}");
+}
+
+/// 写回再守一道：哪怕拿对话的规矩核对过（加了、删了消息），写回时也不收
+#[test]
+fn write_back_refuses_edits_that_change_the_number_of_inputs() {
+    let raw = embeddings();
+    let built = build(Form::OpenaiEmbeddings, &raw, EMBEDDINGS).unwrap();
+    let perms = [Permission::Messages];
+    let input = trim(&built.view, &perms);
+    let mut out = input.clone();
+    msgs(&mut out).remove(1);
+    // 对话的规矩允许删消息
+    let edits = check(&input, &out, &perms, &[]).unwrap();
+    let mut next = raw.clone();
+    let r = apply(&mut next, &built.src, &edits, EMBEDDINGS);
+    assert!(matches!(r, Err(EditError::BadOutput(_))), "{r:?}");
+}
+
+/// 写回之后再读一遍还读得出来，什么样的返回值都不会让核对和写回 panic
+#[test]
+fn random_garbage_on_input_lists_never_panics() {
+    let mut rng = Rng(7);
+    for _ in 0..1000 {
+        for (form, raw, path, _) in input_samples() {
+            let built = build(form, &raw, path).unwrap();
+            let perms = all();
+            let input = trim(&built.view, &perms);
+            let mut out = input.clone();
+            if let Some(ms) = out["messages"].as_array_mut()
+                && !ms.is_empty()
+            {
+                let i = rng.below(ms.len());
+                match rng.below(5) {
+                    0 => {
+                        ms.remove(i);
+                    }
+                    1 => ms[i]["parts"][0]["text"] = json!(rng.text()),
+                    2 => ms[i]["parts"] = json!([]),
+                    3 => ms[i]["key"] = json!("m9"),
+                    _ => ms.swap(0, i),
+                }
+            }
+            if rng.chance(30) {
+                out["params"]["model"] = json!(rng.text());
+            }
+            if let Ok(edits) = built.src.check(&input, &out, &perms) {
+                let mut next = raw.clone();
+                if let Ok(p) = apply(&mut next, &built.src, &edits, path) {
+                    let path = p.unwrap_or(path.to_string());
+                    build(form, &next, &path).unwrap();
+                }
+            }
+        }
+    }
 }

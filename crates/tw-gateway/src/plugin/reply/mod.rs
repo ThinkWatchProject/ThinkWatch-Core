@@ -238,7 +238,7 @@ impl Chain {
                 ctx.client,
                 ctx.model,
                 ctx.requested_model,
-                ctx.dialect,
+                super::format_name(ctx.dialect),
                 ctx.upstream,
                 &a.settings,
             );
@@ -307,7 +307,7 @@ impl Chain {
             ctx.client,
             ctx.model,
             ctx.requested_model,
-            ctx.dialect,
+            super::format_name(ctx.dialect),
             ctx.upstream,
             settings,
         );

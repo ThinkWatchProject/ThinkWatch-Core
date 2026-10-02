@@ -501,6 +501,36 @@ async fn a_new_version_that_wants_more_permissions_comes_back_turned_off() {
     assert_eq!(v["permissions"], json!(["system", "messages"]));
 }
 
+/// 新版多处理了一种请求（`requests` 多了嵌入），权限一样：和多要一个权限一样，换上但
+/// 停用 —— 插件看得到、改得了的东西变多了，要用户自己再打开
+#[tokio::test]
+async fn a_new_version_that_handles_more_kinds_of_request_comes_back_turned_off() {
+    let b = bed();
+    let scrub = |requests: Value| {
+        source(
+            json!({"name": "Scrub", "api": 1, "permissions": ["messages"],
+                   "requests": requests}),
+            &["onRequest"],
+        )
+    };
+    let v1 = scrub(json!(["conversation"]));
+    seeder(&[("scrub", &v1)]).seed(&b.mgr).await;
+    b.customize("scrub", json!({})).await;
+    assert_eq!(b.plugin("scrub").await["requests"], json!(["conversation"]));
+
+    let v2 = scrub(json!(["conversation", "embeddings"]));
+    let done = seeder(&[("scrub", &v2)]).seed(&b.mgr).await;
+    assert_eq!(ids(&done.updated), ["scrub"], "{done:?}");
+    assert_eq!(ids(&done.disabled), ["scrub"], "{done:?}");
+    let p = b.entry("scrub").unwrap();
+    assert_eq!(p.sha256, sha(&v2));
+    assert!(!p.enabled);
+    let v = b.plugin("scrub").await;
+    assert_eq!(v["status"], json!({"kind": "disabled"}));
+    assert_eq!(v["permissions"], json!(["messages"]));
+    assert_eq!(v["requests"], json!(["conversation", "embeddings"]));
+}
+
 /// 用户自己的插件正好用了一个默认插件的 id：只记一笔「给过了」，它的文件和配置都不动，
 /// 之后出了新版也不动
 #[tokio::test]

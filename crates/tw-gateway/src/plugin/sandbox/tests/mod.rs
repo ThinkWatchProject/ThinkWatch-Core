@@ -108,9 +108,29 @@ fn the_manifest_is_carried_over() {
             tool_call: true
         }
     );
+    // 没写 `requests`：只处理对话
+    assert_eq!(m.requests, [tw_api::RequestKind::Conversation]);
     // 哈希的就是交进来的那些字节（不变式 I9）
     let sha: [u8; 32] = Sha256::digest(BOTH.as_bytes()).into();
     assert_eq!(h.sha256(), sha);
+}
+
+/// 声明了的几种请求换过来，按 `RequestKind::ALL` 排
+#[test]
+fn the_kinds_of_request_are_carried_over_in_order() {
+    let h = load(
+        r#"export const manifest = { name: "Inputs", api: 1, permissions: ["messages"],
+                                     requests: ["completions", "embeddings", "conversation"] };
+           export function onRequest(req) {}"#,
+    );
+    assert_eq!(
+        h.manifest().requests,
+        [
+            tw_api::RequestKind::Conversation,
+            tw_api::RequestKind::Embeddings,
+            tw_api::RequestKind::Completions
+        ]
+    );
 }
 
 #[test]

@@ -235,9 +235,9 @@ fn stored<'a>(path: &'a str, body: &'a [u8]) -> StoredRequest<'a> {
 }
 
 /// 试跑数 token、嵌入这些请求，和它们当时一样看：Gemini 包着的数 token 改里面那一份、
-/// 只写回模型名；插件看不懂的请求体说清看不懂
+/// 只写回模型名；插件没声明的那种请求、插件不管的接口，说清当时它就没跑
 #[tokio::test]
-async fn a_trial_reads_counting_and_unreadable_requests_as_they_were_read() {
+async fn a_trial_reads_counting_and_unhandled_requests_as_they_were_read() {
     let tune = || {
         Double::new("tune")
             .permit(&[Permission::System, Permission::Params])
@@ -271,6 +271,7 @@ async fn a_trial_reads_counting_and_unreadable_requests_as_they_were_read() {
     assert_eq!(inner["systemInstruction"]["parts"][0]["text"], "Be brief.");
     assert!(inner.get("generationConfig").is_none(), "{after}");
 
+    // 只处理对话的插件当时不在嵌入请求的范围里
     let embeddings = br#"{"model":"text-embedding-3-small","input":["hi"]}"#;
     let t = run(
         Arc::new(Pool::new(1, 4)),
@@ -284,6 +285,100 @@ async fn a_trial_reads_counting_and_unreadable_requests_as_they_were_read() {
     assert!(t.request.is_none());
     assert_eq!(
         t.error.map(|m| m.code).as_deref(),
-        Some("gw.plugin.cannot_read")
+        Some("gw.plugin.not_declared")
     );
+    // 插件一律不管的接口
+    let t = run(
+        Arc::new(Pool::new(1, 4)),
+        tune(),
+        &Default::default(),
+        rules(),
+        Some(stored("/v1/images/generations", br#"{"prompt":"a cat"}"#)),
+        None,
+    )
+    .await;
+    assert!(t.request.is_none());
+    let e = t.error.unwrap();
+    assert_eq!(
+        (e.code.as_str(), e.arg("path")),
+        ("gw.plugin.not_applicable", "/v1/images/generations")
+    );
+}
+
+/// 去掉记号的插件，声明了嵌入和补全
+fn scrubbing() -> Arc<dyn PluginHost> {
+    Double::new("scrub")
+        .permit(&[Permission::Messages])
+        .requests(&[
+            tw_api::RequestKind::Embeddings,
+            tw_api::RequestKind::Completions,
+        ])
+        .on_request(|mut view, ctx| {
+            assert_ne!(ctx["format"], "anthropic");
+            for m in view["messages"].as_array_mut().unwrap() {
+                for p in m["parts"].as_array_mut().unwrap() {
+                    if let Some(t) = p["text"].as_str() {
+                        p["text"] = json!(t.replace("CLASSIFIED", "[removed]"));
+                    }
+                }
+            }
+            Invocation::ok(RequestOutcome::Changed(view))
+        })
+        .into_host()
+}
+
+/// 试跑存下来的嵌入、补全请求：和当时一样，一项输入一条消息；前后两份打过码；`ctx.format`
+/// 说得出是哪一种
+#[tokio::test]
+async fn a_trial_runs_on_stored_embeddings_and_completions_requests() {
+    let cases: [(&str, Value, &str, &str); 3] = [
+        (
+            "/v1/embeddings",
+            json!({ "model": "text-embedding-3-small",
+                    "input": ["the CLASSIFIED plan", format!("key {KEY}"), [1, 2]] }),
+            "/input/0",
+            "the [removed] plan",
+        ),
+        (
+            "/v1/completions",
+            json!({ "model": "gpt-3.5-turbo-instruct", "prompt": format!("Say hi to CLASSIFIED {KEY}"),
+                    "max_tokens": 5 }),
+            "/prompt",
+            "Say hi to [removed] <<TW_SECRET_1>>",
+        ),
+        (
+            "/v1beta/models/gemini-embedding-001:batchEmbedContents",
+            json!({ "requests": [{ "model": "models/gemini-embedding-001",
+                                   "content": { "parts": [{ "text": format!("the CLASSIFIED plan {KEY}") }] } }] }),
+            "/requests/0/content/parts/0/text",
+            "the [removed] plan <<TW_SECRET_1>>",
+        ),
+    ];
+    for (path, body, at, want) in cases {
+        let bytes = body.to_string().into_bytes();
+        let t = run(
+            Arc::new(Pool::new(1, 4)),
+            scrubbing(),
+            &Default::default(),
+            rules(),
+            Some(stored(path, &bytes)),
+            // 回答钩子不在嵌入、补全上跑：存着的回答试跑也不看
+            Some(StoredReply {
+                body: br#"{"object":"list","data":[]}"#,
+                upstream: Dialect::Chat,
+                provider: "up",
+            }),
+        )
+        .await;
+        assert_eq!(t.error, None, "{path}");
+        assert!(t.reply.is_none(), "{path}");
+        let req = t.request.unwrap();
+        assert_eq!(req.outcome, Outcome::Changed, "{path}");
+        let after: Value = serde_json::from_str(&req.after).unwrap();
+        assert_eq!(after.pointer(at).unwrap(), want, "{path}");
+        assert!(
+            !req.before.contains(KEY) && !req.after.contains(KEY),
+            "{path}"
+        );
+    }
 }

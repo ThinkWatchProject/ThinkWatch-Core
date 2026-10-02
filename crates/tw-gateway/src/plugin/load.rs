@@ -204,6 +204,11 @@ impl Plugins {
                 on_error: p.on_error.into(),
                 scope: scope_of(&p.scope),
                 permissions: m.map(|m| m.permissions.clone()).unwrap_or_default(),
+                // 读不出 manifest 的按不写 `requests` 的算（见 `Active::requests`）
+                requests: m.map_or_else(
+                    || crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
+                    |m| m.requests.clone(),
+                ),
                 reply_mode: m.map_or(tw_api::ReplyMode::Block, |m| m.reply_mode),
                 hooks: m.map(|m| m.hooks).unwrap_or_default(),
                 settings,
@@ -402,6 +407,7 @@ fn placeholder(id: &str) -> Manifest {
         api: 1,
         description: None,
         permissions: Vec::new(),
+        requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
         scope: Scope::default(),
         reply_mode: tw_api::ReplyMode::Block,
         settings: Vec::new(),

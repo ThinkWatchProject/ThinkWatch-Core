@@ -431,11 +431,10 @@ async fn realtime_upstream() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     (addr, seen)
 }
 
-/// 不是 Responses 的 WebSocket（比如 Realtime 的 `/v1/realtime`）：插件看不懂它的帧。管得着
-/// 的插件按它的 `on_error` 在升级时就处置 —— 拒绝就不接这条连接，跳过就接上、帧原样过去、
-/// 记一笔跳过
+/// 不是 Responses 的 WebSocket（比如 Realtime 的 `/v1/realtime`）：不属于插件处理的任何一种
+/// 请求，**所有插件都不管** —— 出错时拒绝的、跳过的都一样：接上，帧原样过去，什么都不记
 #[tokio::test]
-async fn a_websocket_plugins_cannot_read_follows_on_error_at_the_upgrade() {
+async fn a_websocket_plugins_do_not_handle_passes_through_unrecorded() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let look = || {
         Double::new("look")
@@ -455,55 +454,30 @@ async fn a_websocket_plugins_cannot_read_follows_on_error_at_the_upgrade() {
                                  "content": [{ "type": "input_text", "text": "secret plan" }] } })
     .to_string();
 
-    // 拒绝：升级不成，一个字节都没到上游
-    let (up, seen) = realtime_upstream().await;
-    let (gw, runs) = gateway_with(up, vec![entry("look", look())], Default::default()).await;
-    match tokio_tungstenite::connect_async(request(gw)).await {
-        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
-            assert_eq!(r.status(), 403);
-            let body =
-                String::from_utf8_lossy(r.body().as_deref().unwrap_or_default()).into_owned();
-            assert!(
-                body.contains("Plugin `Plugin look` cannot read requests to /v1/realtime."),
-                "{body}"
-            );
-        }
-        other => panic!("the upgrade went through: {:?}", other.map(|_| ())),
+    for on_error in [tw_api::OnError::Reject, tw_api::OnError::Skip] {
+        let (up, seen) = realtime_upstream().await;
+        let (gw, runs) = gateway_with(
+            up,
+            vec![entry_with("look", look(), |a| a.on_error = on_error)],
+            Default::default(),
+        )
+        .await;
+        let (mut c, _) = tokio_tungstenite::connect_async(request(gw))
+            .await
+            .unwrap_or_else(|e| panic!("{on_error:?}: the upgrade was refused: {e}"));
+        c.send(WsMsg::Text(item.clone().into())).await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(3), c.next())
+            .await
+            .expect("no echo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.into_text().unwrap().as_str(), item, "{on_error:?}");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            std::slice::from_ref(&item),
+            "{on_error:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(runs.lock().unwrap().is_empty(), "{on_error:?}");
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(seen.lock().unwrap().is_empty());
-    let outcomes: Vec<String> = runs
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|r| r.run.outcome.slug().to_string())
-        .collect();
-    assert_eq!(outcomes, ["error"]);
-
-    // 跳过：接上，帧原样过去，这条连接上记一笔跳过
-    let (up, seen) = realtime_upstream().await;
-    let (gw, runs) = gateway_with(
-        up,
-        vec![entry_with("look", look(), |a| {
-            a.on_error = tw_api::OnError::Skip
-        })],
-        Default::default(),
-    )
-    .await;
-    let (mut c, _) = tokio_tungstenite::connect_async(request(gw)).await.unwrap();
-    c.send(WsMsg::Text(item.clone().into())).await.unwrap();
-    let back = tokio::time::timeout(Duration::from_secs(3), c.next())
-        .await
-        .expect("no echo")
-        .unwrap()
-        .unwrap();
-    assert_eq!(back.into_text().unwrap().as_str(), item);
-    assert_eq!(seen.lock().unwrap().as_slice(), [item]);
-    let outcomes: Vec<String> = runs
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|r| r.run.outcome.slug().to_string())
-        .collect();
-    assert_eq!(outcomes, ["skipped"]);
 }

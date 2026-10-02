@@ -19,6 +19,12 @@
 //! 认识、有没有重复、留下来的有没有挪位置、只读的东西改没改。核对只看视图本身，
 //! 和格式无关；写回时格式自己的限制（Anthropic 的消息里没有 system 角色）由各格式
 //! 报。
+//!
+//! # 不只对话（[`Form`]）
+//!
+//! 嵌入和旧版补全也有视图（[`inputs`]）：一项输入一条消息，只有文字能改，消息和部分
+//! 一个都不能多、不能少。数据面一律经 [`Src::check`] 核对 —— 它按这种请求的规矩来；
+//! [`check`] 本身是对话的规矩。
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,6 +38,7 @@ use super::bridge::Bridge;
 pub mod anthropic;
 pub mod chat;
 pub mod gemini;
+pub mod inputs;
 pub mod responses;
 mod segments;
 
@@ -111,6 +118,47 @@ impl Role {
     }
 }
 
+/// 插件读得懂的一种请求体：一段对话（客户端的四种格式各一种），或者一张输入的单子
+/// （嵌入、旧版补全，见 [`inputs`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    /// 生成回答，和形状一样的数 token、压缩
+    Conversation(Dialect),
+    /// OpenAI 的 `/v1/embeddings`
+    OpenaiEmbeddings,
+    /// OpenAI 的 `/v1/completions`
+    OpenaiCompletions,
+    /// Gemini 的 `:embedContent`、`:batchEmbedContents`
+    GeminiEmbed,
+}
+
+impl From<Dialect> for Form {
+    fn from(d: Dialect) -> Form {
+        Form::Conversation(d)
+    }
+}
+
+impl Form {
+    /// 插件那一侧的写法：视图的 `format`、`ctx.format`
+    pub fn name(self) -> &'static str {
+        match self {
+            Form::Conversation(d) => crate::plugin::format_name(d),
+            Form::OpenaiEmbeddings => "openai_embeddings",
+            Form::OpenaiCompletions => "openai_completions",
+            Form::GeminiEmbed => "gemini_embed",
+        }
+    }
+
+    /// 这是哪一种请求（manifest 的 `requests` 里的那个词）
+    pub fn kind(self) -> tw_api::RequestKind {
+        match self {
+            Form::Conversation(_) => tw_api::RequestKind::Conversation,
+            Form::OpenaiEmbeddings | Form::GeminiEmbed => tw_api::RequestKind::Embeddings,
+            Form::OpenaiCompletions => tw_api::RequestKind::Completions,
+        }
+    }
+}
+
 /// 一份读好的请求：完整的视图（还没按权限裁），和写回时要用的位置。
 pub struct Built {
     pub view: Value,
@@ -123,6 +171,8 @@ pub enum Src {
     Chat(chat::Src),
     Responses(responses::Src),
     Gemini(gemini::Src),
+    /// 嵌入、旧版补全
+    Inputs(inputs::Src),
 }
 
 impl Src {
@@ -133,23 +183,41 @@ impl Src {
             Src::Chat(s) => &s.hidden_tools,
             Src::Responses(s) => &s.hidden_tools,
             Src::Gemini(s) => &s.hidden_tools,
+            Src::Inputs(_) => &[],
+        }
+    }
+
+    /// 核对插件交回来的东西，**按这种请求的规矩**：对话是 [`check`]；嵌入、旧版补全在
+    /// 那之上再加一层（[`inputs::check`]：只有文字能改，消息和部分不增不减）。数据面
+    /// 一律走这里
+    pub fn check(
+        &self,
+        input: &Value,
+        output: &Value,
+        perms: &[Permission],
+    ) -> Result<Edits, EditError> {
+        match self {
+            Src::Inputs(s) => inputs::check(s, input, output, perms),
+            _ => check(input, output, perms, self.hidden_tools()),
         }
     }
 }
 
-/// 把客户端发来的请求读成视图。`path` 是客户端请求的路径（Gemini 的模型写在里面）。
+/// 把客户端发来的请求读成视图。`form` 是这种请求体怎么读（一段对话的话就是客户端的
+/// 格式，[`Dialect`] 直接转得过来），`path` 是客户端请求的路径（Gemini 的模型写在里面）。
 ///
-/// 不是 JSON 对象、或者不是这四种格式的，读不出来。
-pub fn build(dialect: Dialect, raw: &Value, path: &str) -> Result<Built, String> {
+/// 不是 JSON 对象、或者不是这几种请求体的，读不出来。
+pub fn build(form: impl Into<Form>, raw: &Value, path: &str) -> Result<Built, String> {
     if !raw.is_object() {
         return Err("the request body is not a JSON object".into());
     }
-    match dialect {
-        Dialect::Anthropic => Ok(anthropic::build(raw)),
-        Dialect::Chat => Ok(chat::build(raw)),
-        Dialect::Responses => Ok(responses::build(raw)),
-        Dialect::Gemini => gemini::build(raw, path),
-        Dialect::Bedrock => Err("Bedrock is not a client format".into()),
+    match form.into() {
+        Form::Conversation(Dialect::Anthropic) => Ok(anthropic::build(raw)),
+        Form::Conversation(Dialect::Chat) => Ok(chat::build(raw)),
+        Form::Conversation(Dialect::Responses) => Ok(responses::build(raw)),
+        Form::Conversation(Dialect::Gemini) => gemini::build(raw, path),
+        Form::Conversation(Dialect::Bedrock) => Err("Bedrock is not a client format".into()),
+        f => inputs::build(f, raw, path),
     }
 }
 
@@ -165,6 +233,7 @@ pub fn apply(
         Src::Chat(s) => chat::apply(raw, s, edits).map(|_| None),
         Src::Responses(s) => responses::apply(raw, s, edits).map(|_| None),
         Src::Gemini(s) => gemini::apply(raw, s, edits, path),
+        Src::Inputs(s) => inputs::apply(raw, s, edits, path),
     }
 }
 
@@ -372,6 +441,7 @@ pub fn check(
             }
             "system" => {
                 need(perms, Permission::System, "system")?;
+                given(input, "system")?;
                 let Some(s) = v.as_str() else {
                     return Err(bad("`system` must be a string"));
                 };
@@ -381,14 +451,17 @@ pub fn check(
             }
             "messages" => {
                 need(perms, Permission::Messages, "messages")?;
+                given(input, "messages")?;
                 edits.messages = check_messages(input, v)?;
             }
             "tools" => {
                 need(perms, Permission::Tools, "tools")?;
+                given(input, "tools")?;
                 edits.tools = check_tools(input, v, hidden_tools)?;
             }
             "params" => {
                 need(perms, Permission::Params, "params")?;
+                given(input, "params")?;
                 let p = check_params(input, v)?;
                 if !p.is_empty() {
                     edits.params = Some(p);
@@ -408,6 +481,15 @@ fn need(perms: &[Permission], p: Permission, section: &str) -> Result<(), EditEr
             "`{section}` was returned without the {} permission",
             p.slug()
         )))
+    }
+}
+
+/// 这一节插件拿到过没有。**交回来的不能凭空多出一节**：嵌入、补全的视图里本来就没有
+/// 系统提示和工具，权限再全也加不进去
+fn given(input: &Value, section: &str) -> Result<(), EditError> {
+    match input.get(section) {
+        Some(_) => Ok(()),
+        None => Err(bad(format!("this request has no `{section}`"))),
     }
 }
 

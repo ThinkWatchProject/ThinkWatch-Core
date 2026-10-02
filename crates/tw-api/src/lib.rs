@@ -691,6 +691,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （`UpdatePluginConfirmed`，请求体同 [`PluginUpdate`]）—— 它和装、换源码、批准一样
 /// 不给网页调，桌面端在系统的确认框里点了头才发。同一版起 core 自带几个默认插件，第一次
 /// 见到时装上、停用着，写配置的这一版来源是 [`ConfigOrigin::Defaults`]。
+///
+/// 33 起**插件说得出自己处理哪几种请求**：[`ManifestView`] 和 [`PluginView`] 多了
+/// `requests`（[`RequestKind`]：对话、嵌入、旧版补全）。插件只处理声明了的那几种 ——
+/// 不写是只有对话；嵌入和旧版补全要插件自己声明 —— 别的种类的请求不过它、不记录，
+/// 它出错、文件变了也拦不着它们。嵌入和旧版补全的视图是一项输入一条消息，`ctx.format`
+/// 多了 `openai_embeddings`、`openai_completions`、`gemini_embed`。
 pub const CONTROL_API_VERSION: u32 = 33;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4871,6 +4877,23 @@ slug_enum! {
 }
 
 slug_enum! {
+    /// 一种请求。插件**只处理它声明了的那几种**（插件文件里 manifest 的 `requests`，
+    /// 不写就是只有 `conversation`）：别的种类的请求原样过去，不记录，插件出了什么错也
+    /// 和它们无关。图片、音频这些别的接口不属于任何一种，所有插件都不管。
+    pub enum RequestKind {
+        /// 对话：Anthropic Messages、OpenAI Chat Completions、Responses、Gemini 的生成，
+        /// 连同它们的数 token 和压缩
+        Conversation = "conversation",
+        /// 嵌入：OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、
+        /// `:batchEmbedContents`。插件只改得了每项输入的文字，回答钩子不在它上面跑
+        Embeddings = "embeddings",
+        /// 旧版补全：OpenAI 的 `/v1/completions`。插件只改得了每段提示的文字和几个参数，
+        /// 回答钩子不在它上面跑
+        Completions = "completions",
+    }
+}
+
+slug_enum! {
     /// 插件出错（运行出错、文件变了、加载不了）时这个请求怎么办。
     pub enum OnError {
         /// 拒绝这个请求。出厂就是它：插件管不了的请求不该悄悄照原样发出去
@@ -5039,6 +5062,9 @@ pub struct ManifestView {
     pub name: String,
     pub description: Option<String>,
     pub permissions: Vec<Permission>,
+    /// 插件处理哪几种请求，按 [`RequestKind::ALL`] 的顺序。至少有一种；manifest 没写
+    /// `requests` 时是 `["conversation"]`
+    pub requests: Vec<RequestKind>,
     /// 插件建议的范围。装上时照它填
     pub scope: PluginScope,
     pub reply_mode: ReplyMode,
@@ -5075,6 +5101,9 @@ pub struct PluginView {
     pub on_error: OnError,
     /// 读不出 manifest 时是空的
     pub permissions: Vec<Permission>,
+    /// 插件处理哪几种请求，按 [`RequestKind::ALL`] 的顺序（见 [`ManifestView::requests`]）。
+    /// 读不出 manifest 时按出厂的算：`["conversation"]` —— 跑不了的插件拦的也就是这几种
+    pub requests: Vec<RequestKind>,
     /// 生效的范围（配置里的）
     pub scope: PluginScope,
     pub reply_mode: ReplyMode,
@@ -5360,6 +5389,7 @@ mod tests {
         check(Guard::ALL, Guard::slug, Guard::from_slug);
         check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);
         check(Permission::ALL, Permission::slug, Permission::from_slug);
+        check(RequestKind::ALL, RequestKind::slug, RequestKind::from_slug);
         check(OnError::ALL, OnError::slug, OnError::from_slug);
         check(ReplyMode::ALL, ReplyMode::slug, ReplyMode::from_slug);
         check(SettingKind::ALL, SettingKind::slug, SettingKind::from_slug);

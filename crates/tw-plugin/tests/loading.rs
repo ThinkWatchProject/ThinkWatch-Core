@@ -10,7 +10,7 @@ use std::time::Instant;
 use common::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tw_plugin::{LoadError, Permission, RequestOutcome};
+use tw_plugin::{LoadError, Permission, RequestKind, RequestOutcome};
 
 fn load_err(src: &[u8]) -> LoadError {
     let t = Instant::now();
@@ -223,6 +223,92 @@ fn manifests_that_break_the_rules_are_load_errors() {
         let r = rt().load(src.as_bytes());
         assert!(t.elapsed() < BOUND);
         assert!(r.is_err(), "{what}: loaded");
+    }
+}
+
+// ── 处理哪几种请求（`requests`）─────────────────────────────────────
+
+#[test]
+fn requests_default_to_conversations_and_can_list_more_kinds() {
+    let p = load_source(&plugin(
+        r#"{ name: "x", api: 1, permissions: ["messages"] }"#,
+        ON_REQUEST,
+    ));
+    assert_eq!(
+        p.manifest().requests,
+        BTreeSet::from([RequestKind::Conversation])
+    );
+    let p = load_source(&plugin(
+        r#"{ name: "x", api: 1, permissions: ["messages", "params"],
+             requests: ["embeddings", "conversation", "completions"] }"#,
+        ON_REQUEST,
+    ));
+    assert_eq!(p.manifest().requests, BTreeSet::from(RequestKind::ALL));
+    // 只处理嵌入的：权限只有嵌入的视图里有的那几节
+    let p = load_source(&plugin(
+        r#"{ name: "x", api: 1, permissions: ["messages"], requests: ["embeddings"] }"#,
+        ON_REQUEST,
+    ));
+    assert_eq!(
+        p.manifest().requests,
+        BTreeSet::from([RequestKind::Embeddings])
+    );
+}
+
+#[test]
+fn requests_that_break_the_rules_are_load_errors() {
+    let both = format!("{ON_REQUEST}\n{ON_TEXT}");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "an empty list",
+            r#"{ name: "x", api: 1, permissions: ["messages"], requests: [] }"#,
+            ON_REQUEST,
+        ),
+        (
+            "a kind that does not exist",
+            r#"{ name: "x", api: 1, permissions: ["messages"], requests: ["images"] }"#,
+            ON_REQUEST,
+        ),
+        (
+            "a string instead of a list",
+            r#"{ name: "x", api: 1, permissions: ["messages"], requests: "embeddings" }"#,
+            ON_REQUEST,
+        ),
+        (
+            "an entry that is not a string",
+            r#"{ name: "x", api: 1, permissions: ["messages"], requests: [1] }"#,
+            ON_REQUEST,
+        ),
+        (
+            "a kind listed twice",
+            r#"{ name: "x", api: 1, permissions: ["messages"], requests: ["embeddings", "embeddings"] }"#,
+            ON_REQUEST,
+        ),
+        // 嵌入的视图里没有系统提示：只要了 `system` 的插件碰不到嵌入请求里的任何东西
+        (
+            "a kind none of the permissions reaches",
+            r#"{ name: "x", api: 1, permissions: ["system"], requests: ["conversation", "embeddings"] }"#,
+            ON_REQUEST,
+        ),
+        // 不处理对话，`system` 就白要了
+        (
+            "a permission that only applies to conversations, without conversations",
+            r#"{ name: "x", api: 1, permissions: ["system", "messages"], requests: ["completions"] }"#,
+            ON_REQUEST,
+        ),
+        // 回答钩子只在对话上跑
+        (
+            "reply hooks without conversations",
+            r#"{ name: "x", api: 1, permissions: ["messages", "reply.text"], requests: ["embeddings"] }"#,
+            &both,
+        ),
+    ];
+    for (what, manifest, hooks) in cases {
+        match rt().load(plugin(manifest, hooks).as_bytes()) {
+            Err(LoadError::Manifest(why)) => assert!(why.contains("requests"), "{what}: {why}"),
+            Err(e) => panic!("{what}: {e:?}"),
+            Ok(_) => panic!("{what}: loaded"),
+        }
     }
 }
 

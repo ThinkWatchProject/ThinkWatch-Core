@@ -26,9 +26,9 @@
 //! （`response.created` 到 `response.completed`）起一组回答钩子的实例，排在占位符
 //! 还原之后、工具墙之前。插件出错而策略是拒绝时，切掉的是那一次回答，连接照常。
 //!
-//! **插件只看得懂 Responses 的 WebSocket。**别的路径上（比如 Realtime 的 `/v1/realtime`）
-//! 的帧插件看不懂，升级时就按管得着的插件的 `on_error` 处置：拒绝就不接这条连接，跳过就
-//! 记一笔、这条连接不过插件（见 `server::upgrade`、[`crate::plugin::request::unreadable`]）。
+//! **插件只管 Responses 的 WebSocket**（每个 `response.create` 是一次对话请求）。别的路径
+//! 上的连接（比如 Realtime 的 `/v1/realtime`）不属于插件处理的任何一种请求：所有插件都
+//! 不管，原样接上，什么都不记（见 `server::upgrade`）。
 //!
 //! # 两条明说的边界
 //!

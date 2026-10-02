@@ -1644,83 +1644,523 @@ async fn counting_and_compacting_take_only_the_model_from_params() {
     }
 }
 
-/// 插件看不懂的请求体（嵌入、认不出的接口）：管得着的插件按它的 `on_error` —— 拒绝就不发，
-/// 跳过就原样发、记一笔跳过。范围外的插件、空的请求体不算
+// ───────────────────────────────────────────────────────── 嵌入、旧版补全
+
+const EMBED_GEMINI: &str = "/v1beta/models/gemini-embedding-001:embedContent";
+const EMBED_GEMINI_BATCH: &str = "/v1beta/models/gemini-embedding-001:batchEmbedContents";
+
+fn embeddings_body() -> Value {
+    json!({ "model": "text-embedding-3-small", "dimensions": 256,
+            "input": [format!("Plan {MARK}"), "unrelated", [9906, 1917]] })
+}
+
+fn completions_body() -> Value {
+    json!({ "model": "gpt-3.5-turbo-instruct", "max_tokens": 16, "suffix": " end",
+            "prompt": [format!("Plan {MARK}"), [9906, 1917], format!("{MARK} notes")] })
+}
+
+fn gemini_embed_body() -> Value {
+    json!({ "model": "models/gemini-embedding-001", "taskType": "RETRIEVAL_DOCUMENT",
+            "content": { "parts": [{ "text": format!("Plan {MARK}") }] } })
+}
+
+fn gemini_batch_body() -> Value {
+    json!({ "requests": [
+        { "model": "models/gemini-embedding-001",
+          "content": { "parts": [{ "text": format!("Plan {MARK}") }] } },
+        { "model": "models/gemini-embedding-001",
+          "content": { "parts": [{ "text": "second" }, { "text": format!("{MARK} notes") }] } }
+    ] })
+}
+
+/// 四种非对话的请求体，各配一家同格式的上游：(路径, 协议, 请求体)
+fn input_cases() -> Vec<(&'static str, Protocol, Value)> {
+    vec![
+        ("/v1/embeddings", Protocol::OpenaiChat, embeddings_body()),
+        ("/v1/completions", Protocol::OpenaiChat, completions_body()),
+        (EMBED_GEMINI, Protocol::Gemini, gemini_embed_body()),
+        (EMBED_GEMINI_BATCH, Protocol::Gemini, gemini_batch_body()),
+    ]
+}
+
+/// 把 [`MARK`] 从每项输入的文字里删掉的插件，**声明了嵌入和补全**。`ctx.format` 记下来
+fn scrub_inputs(formats: Arc<Mutex<Vec<String>>>) -> Double {
+    Double::new("scrub inputs")
+        .permit(&[Permission::Messages])
+        .requests(&[
+            tw_api::RequestKind::Conversation,
+            tw_api::RequestKind::Embeddings,
+            tw_api::RequestKind::Completions,
+        ])
+        .on_request(move |mut view, ctx| {
+            formats
+                .lock()
+                .unwrap()
+                .push(ctx["format"].as_str().unwrap().to_string());
+            assert_eq!(view["format"], ctx["format"]);
+            for m in view["messages"].as_array_mut().unwrap() {
+                assert_eq!(m["role"], "user");
+                for p in m["parts"].as_array_mut().unwrap() {
+                    if p["type"] == "text" {
+                        let t = p["text"].as_str().unwrap().replace(MARK, "[removed]");
+                        p["text"] = json!(t);
+                    }
+                }
+            }
+            Invocation::ok(RequestOutcome::Changed(view))
+        })
+}
+
+/// 声明了嵌入、补全的插件：上游收到的是删过记号的那一份，**除了那几段文字一个字节都
+/// 不差**（客户端发来的就是排好序的紧凑 JSON，改过的请求体也是这么写的）。一串 token 原样；
+/// 改过的那一份照样存下来，运行照样记在请求上
 #[tokio::test]
-async fn requests_plugins_cannot_read_follow_on_error() {
+async fn a_plugin_that_declares_embeddings_and_completions_scrubs_their_inputs() {
+    for (path, protocol, body) in input_cases() {
+        let up = Upstream::default();
+        let base = start_upstream(up.clone()).await;
+        let formats = Arc::new(Mutex::new(Vec::new()));
+        let mut gw = gateway(
+            vec![provider("same", base, protocol)],
+            SecurityMode::Off,
+            vec![entry("scrub", scrub_inputs(formats.clone()))],
+        )
+        .await;
+        let (status, answer) = post(&gw, path, &body).await;
+        assert_eq!(status, 200, "{path}: {answer}");
+        assert_eq!(up.hits(), 1, "{path}");
+        let (got_path, _) = up.seen.lock().unwrap()[0].clone();
+        assert_eq!(got_path, path);
+        let raw = String::from_utf8(up.raw.lock().unwrap()[0].to_vec()).unwrap();
+        assert_eq!(
+            raw,
+            body.to_string().replace(MARK, "[removed]"),
+            "{path}: only the inputs' text may differ"
+        );
+        assert_eq!(
+            gw.runs(),
+            [("scrub".to_string(), "changed".to_string(), 0)],
+            "{path}"
+        );
+        let after = gw.after_plugins().await.expect("the body after plugins");
+        assert!(!after.to_string().contains(MARK), "{path}: {after}");
+        let want = match path {
+            "/v1/embeddings" => "openai_embeddings",
+            "/v1/completions" => "openai_completions",
+            _ => "gemini_embed",
+        };
+        assert_eq!(formats.lock().unwrap().as_slice(), [want], "{path}");
+    }
+}
+
+/// **没声明的那种请求不在插件的范围里**：原样发、什么都不记、不算一次调用 —— 出错时拒绝
+/// 也一样。插件一律不管的接口（认不出的、空正文的）也是这样
+#[tokio::test]
+async fn kinds_a_plugin_did_not_declare_pass_through_unrecorded() {
+    for on_error in [OnError::Reject, OnError::Skip] {
+        // 只处理对话的插件，跑一次就失败：在范围里的话，拒绝档下请求就被拒了
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let failing = Double::new("failing")
+            .permit(&[Permission::Messages])
+            .on_request(move |_, _| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Invocation::err(RunError::Threw {
+                    message: "nope".into(),
+                    stack: None,
+                })
+            });
+        for (path, protocol, body) in input_cases() {
+            let up = Upstream::default();
+            let base = start_upstream(up.clone()).await;
+            let gw = gateway(
+                vec![provider("same", base, protocol)],
+                SecurityMode::Off,
+                vec![entry_with("failing", failing.clone(), |a| {
+                    a.on_error = on_error
+                })],
+            )
+            .await;
+            let (status, answer) = post(&gw, path, &body).await;
+            assert_eq!(status, 200, "{on_error:?} {path}: {answer}");
+            // 原样：客户端发来的那些字节
+            assert_eq!(
+                up.raw.lock().unwrap()[0],
+                Bytes::from(body.to_string()),
+                "{on_error:?} {path}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(gw.runs().is_empty(), "{on_error:?} {path}: {:?}", gw.runs());
+            assert_eq!(gw.stats("failing"), tw_api::PluginStats::default());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{on_error:?}");
+    }
+
+    // 插件一律不管的接口：认不出的路径，和没有正文的那种（取消一次 Responses 的回答）
     let up = Upstream::default();
     let base = start_upstream(up.clone()).await;
-    let embeddings =
-        json!({ "model": "text-embedding-3-small", "input": [format!("Plan {MARK}")] });
-    let providers = || vec![provider("chat", base, Protocol::OpenaiChat)];
-
-    let mut gw = gateway(
-        providers(),
+    let gw = gateway(
+        vec![provider("chat", base, Protocol::OpenaiChat)],
         SecurityMode::Off,
-        vec![entry("scrub", scrub())],
+        vec![entry("scrub", scrub_inputs(Default::default()))],
     )
     .await;
-    let (status, body) = post(&gw, "/v1/embeddings", &embeddings).await;
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(
-        body["error"]["message"],
-        "[ThinkWatch] Plugin `Plugin scrub` cannot read requests to /v1/embeddings."
-    );
-    assert_eq!(up.hits(), 0);
-    assert_eq!(gw.runs(), [("scrub".to_string(), "error".to_string(), 0)]);
-    assert!(gw.after_plugins().await.is_none());
-    // 认不出的接口也一样
-    let (status, body) = post(
+    let (status, _) = post(
         &gw,
         "/v1/rerank",
         &json!({ "model": "rerank-1", "query": MARK }),
     )
     .await;
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(up.hits(), 0);
-
-    // 跳过：原样发，记一笔跳过（不算一次调用）
-    let gw = gateway(
-        providers(),
-        SecurityMode::Off,
-        vec![entry_with("scrub", scrub(), |a| a.on_error = OnError::Skip)],
-    )
-    .await;
-    let (status, _) = post(&gw, "/v1/embeddings", &embeddings).await;
     assert_eq!(status, 200);
-    assert_eq!(up.hits(), 1);
-    assert_eq!(gw.runs(), [("scrub".to_string(), "skipped".to_string(), 0)]);
-    assert_eq!(gw.stats("scrub").calls, 0);
-
-    // 范围外的插件不算
-    let gw = gateway(
-        providers(),
-        SecurityMode::Off,
-        vec![entry_with("scrub", scrub(), |a| {
-            a.scope.models = vec!["claude-*".into()]
-        })],
-    )
-    .await;
-    let (status, _) = post(&gw, "/v1/embeddings", &embeddings).await;
-    assert_eq!(status, 200);
-    assert!(gw.runs().is_empty());
-
-    // 空的请求体里没有插件能改的东西（取消一次 Responses 的回答）
+    assert!(String::from_utf8_lossy(&up.raw.lock().unwrap()[0]).contains(MARK));
     let up = Upstream::default();
     let base = start_upstream(up.clone()).await;
-    let gw = gateway(
+    let gw2 = gateway(
         vec![provider("responses", base, Protocol::OpenaiResponses)],
         SecurityMode::Off,
-        vec![entry("scrub", scrub())],
+        vec![entry("scrub", scrub_inputs(Default::default()))],
     )
     .await;
     let r = reqwest::Client::new()
-        .post(format!("http://{}/v1/responses/resp_1/cancel", gw.addr))
+        .post(format!("http://{}/v1/responses/resp_1/cancel", gw2.addr))
         .header("authorization", "Bearer tw-testkey")
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(up.hits(), 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(gw.runs().is_empty() && gw2.runs().is_empty());
+}
+
+/// 跑不了的插件（文件变了）只拦它声明过的那几种：只处理对话的拦不着嵌入，声明了嵌入的
+/// 照它的 `on_error` 拒掉嵌入请求
+#[tokio::test]
+async fn a_broken_plugin_only_rejects_the_kinds_it_declared() {
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let changed = |kinds: &[tw_api::RequestKind]| {
+        let mut a = double::active(
+            "old",
+            Double::new("Old")
+                .permit(&[Permission::Messages])
+                .requests(kinds),
+        );
+        a.state = PluginState::Broken(Broken::Changed);
+        Arc::new(a)
+    };
+    let providers = || vec![provider("chat", base, Protocol::OpenaiChat)];
+
+    // 只处理对话：嵌入照常，对话被拒
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![changed(&[tw_api::RequestKind::Conversation])],
+    )
+    .await;
+    let (status, answer) = post(&gw, "/v1/embeddings", &embeddings_body()).await;
+    assert_eq!(status, 200, "{answer}");
+    let (status, answer) = post(&gw, "/v1/completions", &completions_body()).await;
+    assert_eq!(status, 200, "{answer}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(gw.runs().is_empty(), "{:?}", gw.runs());
+    let chat = json!({ "model": "gpt-5", "messages": [{ "role": "user", "content": "hi" }] });
+    let (status, answer) = post(&gw, "/v1/chat/completions", &chat).await;
+    assert_eq!(status, 403, "{answer}");
+    assert_eq!(gw.runs(), [("old".to_string(), "error".to_string(), 0)]);
+    assert_eq!(up.hits(), 2);
+
+    // 声明了嵌入：嵌入被拒，补全照常
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![changed(&[tw_api::RequestKind::Embeddings])],
+    )
+    .await;
+    let (status, answer) = post(&gw, "/v1/embeddings", &embeddings_body()).await;
+    assert_eq!(status, 403, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("changed on disk"),
+        "{answer}"
+    );
+    let (status, _) = post(&gw, "/v1/completions", &completions_body()).await;
+    assert_eq!(status, 200);
+    assert_eq!(up.hits(), 3);
+}
+
+/// 嵌入、补全上的插件和对话上的一样：按发出去的模型、上游挑；只看到占位符；出错、
+/// `reject` 按 `on_error` 拒掉整个请求；不能多一项、少一项输入；请求体读不出来时按
+/// `on_error` —— 拒绝就不发（`gw.plugin.cannot_read_body`），跳过就原样发、记一笔跳过
+#[tokio::test]
+async fn embeddings_follow_the_same_scope_placeholders_and_on_error() {
+    const EMBED: &str = "/v1/embeddings";
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let providers = || vec![provider("a", base, Protocol::OpenaiChat)];
+    let kinds = [tw_api::RequestKind::Embeddings];
+
+    // 范围外：别的模型的插件不跑
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry_with("scrub", scrub_inputs(Default::default()), |a| {
+            a.scope.models = vec!["text-embedding-3-large".into()]
+        })],
+    )
+    .await;
+    let (status, _) = post(&gw, EMBED, &embeddings_body()).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&up.raw.lock().unwrap()[0]).contains(MARK));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(gw.runs().is_empty());
+
+    // 占位符：插件看不到真的密钥，改过的地方换回去再发
+    let saw = Arc::new(Mutex::new(String::new()));
+    let s = saw.clone();
+    let checked = Double::new("checked")
+        .permit(&[Permission::Messages])
+        .requests(&kinds)
+        .on_request(move |mut view, ctx| {
+            *s.lock().unwrap() = view.to_string();
+            assert_eq!(
+                (ctx["upstream"].as_str(), ctx["format"].as_str()),
+                (Some("a"), Some("openai_embeddings"))
+            );
+            let t = view["messages"][0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            view["messages"][0]["parts"][0]["text"] = json!(format!("{t} (checked)"));
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    up.raw.lock().unwrap().clear();
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry("checked", checked)],
+    )
+    .await;
+    let body =
+        json!({ "model": "text-embedding-3-small", "input": format!("my key is {USER_KEY}") });
+    let (status, _) = post(&gw, EMBED, &body).await;
+    assert_eq!(status, 200);
+    let saw = saw.lock().unwrap().clone();
+    assert!(!saw.contains(USER_KEY), "the plugin saw the key: {saw}");
+    assert!(saw.contains("<<TW_SECRET_1>>"), "{saw}");
+    let sent: Value = serde_json::from_slice(&up.raw.lock().unwrap()[0]).unwrap();
+    assert_eq!(sent["input"], format!("my key is {USER_KEY} (checked)"));
+
+    // 出错、拒绝、多加一项输入：整个请求不发
+    let failing = Double::new("failing")
+        .permit(&[Permission::Messages])
+        .requests(&kinds)
+        .on_request(|_, _| {
+            Invocation::err(RunError::Threw {
+                message: "nope".into(),
+                stack: None,
+            })
+        });
+    let refusing = Double::new("refusing")
+        .permit(&[Permission::Messages])
+        .requests(&kinds)
+        .on_request(|_, _| Invocation::ok(RequestOutcome::Rejected("not embedded".into())));
+    let adding = Double::new("adding")
+        .permit(&[Permission::Messages])
+        .requests(&kinds)
+        .on_request(|mut view, _| {
+            view["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "role": "user", "parts": [{ "type": "text", "text": "one more" }] }));
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    for (e, code) in [
+        (entry("failing", failing), "gw.plugin.request_failed"),
+        (entry("refusing", refusing), "gw.plugin.rejected"),
+        (entry("adding", adding), "gw.plugin.request_failed"),
+    ] {
+        up.raw.lock().unwrap().clear();
+        let gw = gateway(providers(), SecurityMode::Off, vec![e]).await;
+        let rx = gw.state.bus.subscribe();
+        let (status, body) = post(&gw, EMBED, &embeddings_body()).await;
+        assert_eq!(status, 403, "{code}: {body}");
+        assert!(up.raw.lock().unwrap().is_empty(), "{code}");
+        let attempts = routed(rx).await;
+        assert_eq!(
+            attempts[0].error.as_ref().map(|e| e.code.as_str()),
+            Some(code)
+        );
+    }
+
+    // 请求体读不出来：拒绝就不发，跳过就原样发、记一笔跳过（不算一次调用）
+    let not_json = |gw: SocketAddr| {
+        reqwest::Client::new()
+            .post(format!("http://{gw}/v1/embeddings"))
+            .header("x-api-key", "tw-testkey")
+            .header("content-type", "application/json")
+            .body("{ not json")
+    };
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry("scrub", scrub_inputs(Default::default()))],
+    )
+    .await;
+    up.raw.lock().unwrap().clear();
+    let r = not_json(gw.addr).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    let answer: Value = r.json().await.unwrap();
+    assert_eq!(
+        answer["error"]["message"],
+        "[ThinkWatch] Plugin `Plugin scrub` cannot read this request: the request body is not JSON"
+    );
+    assert!(up.raw.lock().unwrap().is_empty());
+    assert_eq!(gw.runs(), [("scrub".to_string(), "error".to_string(), 0)]);
+    let gw = gateway(
+        providers(),
+        SecurityMode::Off,
+        vec![entry_with("scrub", scrub_inputs(Default::default()), |a| {
+            a.on_error = OnError::Skip
+        })],
+    )
+    .await;
+    let r = not_json(gw.addr).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(up.raw.lock().unwrap()[0], Bytes::from("{ not json"));
+    assert_eq!(gw.runs(), [("scrub".to_string(), "skipped".to_string(), 0)]);
+    assert_eq!(gw.stats("scrub").calls, 0);
+}
+
+/// 一串 token 只读：插件原样交回，上游收到的是客户端的原话；改它就是越权
+#[tokio::test]
+async fn token_id_inputs_are_read_only() {
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let body = json!({ "model": "gpt-3.5-turbo-instruct", "prompt": [[1, 2, 3], [4, 5]] });
+    let saw = Arc::new(Mutex::new(Value::Null));
+    let s = saw.clone();
+    let look = Double::new("look")
+        .permit(&[Permission::Messages])
+        .requests(&[tw_api::RequestKind::Completions])
+        .on_request(move |view, _| {
+            *s.lock().unwrap() = view.clone();
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let gw = gateway(
+        vec![provider("a", base, Protocol::OpenaiChat)],
+        SecurityMode::Off,
+        vec![entry("look", look)],
+    )
+    .await;
+    let (status, _) = post(&gw, "/v1/completions", &body).await;
+    assert_eq!(status, 200);
+    assert_eq!(up.raw.lock().unwrap()[0], Bytes::from(body.to_string()));
+    let saw = saw.lock().unwrap().clone();
+    let parts: Vec<&Value> = saw["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["parts"][0])
+        .collect();
+    assert_eq!(parts.len(), 2);
+    for p in parts {
+        assert_eq!(
+            (p["type"].as_str(), p["label"].as_str()),
+            (Some("other"), Some("tokens"))
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        gw.runs(),
+        [("look".to_string(), "unchanged".to_string(), 0)]
+    );
+
+    let forge = Double::new("forge")
+        .permit(&[Permission::Messages])
+        .requests(&[tw_api::RequestKind::Completions])
+        .on_request(|mut view, _| {
+            view["messages"][0]["parts"][0] =
+                json!({ "key": "m0.p0", "type": "text", "text": "hi" });
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let gw = gateway(
+        vec![provider("a", base, Protocol::OpenaiChat)],
+        SecurityMode::Off,
+        vec![entry("forge", forge)],
+    )
+    .await;
+    let (status, answer) = post(&gw, "/v1/completions", &body).await;
+    assert_eq!(status, 403, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no permission to change"),
+        "{answer}"
+    );
+    assert_eq!(up.hits(), 1);
+}
+
+/// 插件改过的嵌入请求再看一遍请求防护，**只看插件加进来的**：插件写进来的命中拦下整个
+/// 请求；客户端原话里就有的（嵌入开头不看请求防护）不因为插件改了别的一项被拦
+#[tokio::test]
+async fn screening_sees_the_inputs_a_plugin_wrote() {
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let security = Security {
+        content: tw_config::ContentPolicy {
+            mode: SecurityMode::Enforce,
+            custom: vec![tw_config::CustomContentRule {
+                name: "no plan".into(),
+                pattern: "forbidden-plan".into(),
+                matching: Default::default(),
+                action: tw_config::ContentAction::Block,
+                disabled: false,
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let write = |text: &'static str| {
+        Double::new("write")
+            .permit(&[Permission::Messages])
+            .requests(&[tw_api::RequestKind::Embeddings])
+            .on_request(move |mut view, _| {
+                view["messages"][1]["parts"][0]["text"] = json!(text);
+                Invocation::ok(RequestOutcome::Changed(view))
+            })
+    };
+    let gw = gateway_with(
+        vec![provider("a", base, Protocol::OpenaiChat)],
+        SecurityMode::Off,
+        vec![entry("write", write("the forbidden-plan"))],
+        security.clone(),
+    )
+    .await;
+    let rx = gw.state.bus.subscribe();
+    let (status, body) = post(&gw, "/v1/embeddings", &embeddings_body()).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(up.raw.lock().unwrap().is_empty());
+    let attempts = routed(rx).await;
+    assert_eq!(
+        attempts[0].error.as_ref().map(|e| e.code.as_str()),
+        Some("gw.content.refused")
+    );
+
+    let gw = gateway_with(
+        vec![provider("a", base, Protocol::OpenaiChat)],
+        SecurityMode::Off,
+        vec![entry("write", write("harmless"))],
+        security,
+    )
+    .await;
+    let mut body = embeddings_body();
+    body["input"][0] = json!("the forbidden-plan, as the client wrote it");
+    let (status, answer) = post(&gw, "/v1/embeddings", &body).await;
+    assert_eq!(status, 200, "{answer}");
+    let sent: Value = serde_json::from_slice(&up.raw.lock().unwrap()[0]).unwrap();
+    assert_eq!(sent["input"][1], "harmless");
 }

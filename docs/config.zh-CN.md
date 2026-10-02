@@ -835,6 +835,8 @@ default_route: default
 
 插件在路由之后改写请求，请求每发往一个上游改写一次。故障转移到另一个上游时，从客户端发来的原样重新开始；插件看得到这一次发往哪个上游、用哪个模型名。路由、模型准入和会话归组看的都是客户端发来的原样。
 
+插件处理它在代码里声明的那几种请求：对话（Anthropic Messages、OpenAI Chat Completions 和 Responses、Gemini，连同它们的数 token 和压缩）、嵌入（`/v1/embeddings`、Gemini 的 `:embedContent` 和 `:batchEmbedContents`）和旧版补全（`/v1/completions`）。没有声明的插件只处理对话。插件不处理的那种请求不经过它，不论 `on_error` 怎么设。其他接口（图片、音频等）不经过任何插件。
+
 <!-- generated: table plugins[] -->
 <a id="cfg-plugins"></a>
 

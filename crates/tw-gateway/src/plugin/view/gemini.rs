@@ -61,12 +61,12 @@ fn name_in(v: &Value, camel: &str) -> String {
     field(v, camel).map_or_else(|| camel.to_string(), |(_, k)| k)
 }
 
-fn fstr<'a>(v: &'a Value, camel: &str) -> Option<&'a str> {
+pub(super) fn fstr<'a>(v: &'a Value, camel: &str) -> Option<&'a str> {
     field(v, camel).and_then(|(x, _)| x.as_str())
 }
 
 /// `/v1beta/models/gemini-2.5-pro:generateContent` 里的模型
-fn path_model(path: &str) -> Option<&str> {
+pub(super) fn path_model(path: &str) -> Option<&str> {
     let (_, rest) = path.split_once("/models/")?;
     let (model, _) = rest.rsplit_once(':')?;
     Some(model)

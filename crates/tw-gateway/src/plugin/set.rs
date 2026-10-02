@@ -91,6 +91,10 @@ pub struct Active {
     pub scope: Scope,
     /// 读不出 manifest 时是空的
     pub permissions: Vec<tw_api::Permission>,
+    /// 处理哪几种请求（manifest 的 `requests`）。**读不出 manifest 时按出厂的算**（只有
+    /// 对话，[`crate::plugin::engine::DEFAULT_REQUESTS`]）：说不出它声明过什么，就按不写
+    /// `requests` 的插件对待 —— 它拦的是对话，嵌入、补全照常过去
+    pub requests: Vec<tw_api::RequestKind>,
     pub reply_mode: ReplyMode,
     pub hooks: Hooks,
     /// 交给插件的设置：配置里写的盖在 manifest 的默认值上，键和类型都对过
@@ -116,6 +120,12 @@ impl Active {
             State::Ready(_) => None,
             State::Broken(b) => Some(b),
         }
+    }
+
+    /// 处不处理这一种请求。**不处理的种类在它的范围之外**：那种请求不过它，它跑不了、
+    /// 出了错也拦不着那种请求
+    pub fn handles(&self, kind: tw_api::RequestKind) -> bool {
+        self.requests.contains(&kind)
     }
 }
 
@@ -143,30 +153,34 @@ impl PluginSet {
         self.plugins.is_empty()
     }
 
-    /// 发往一个上游之前要过一遍的插件，按顺序：启用的、管得着这一次的，**连同跑不了
-    /// 的** —— 跑不了的由调用方照它的 `on_error` 拒绝请求或者跳过它（管得着就要处置，
-    /// 不管它有没有请求钩子：它一旦加载不了，回答那一段同样做不了）。能跑的只列有请求
-    /// 钩子的。**管不着这一次的不算**：只管别的上游的插件坏了，拦不着发往这一家的请求。
+    /// 发往一个上游之前要过一遍的插件，按顺序：启用的、处理 `kind` 这种请求的、管得着
+    /// 这一次的，**连同跑不了的** —— 跑不了的由调用方照它的 `on_error` 拒绝请求或者跳过它
+    /// （管得着就要处置，不管它有没有请求钩子：它一旦加载不了，回答那一段同样做不了）。
+    /// 能跑的只列有请求钩子的。**管不着这一次的不算**：只管别的上游的插件坏了，拦不着发往
+    /// 这一家的请求；只处理对话的插件坏了，拦不着嵌入和补全。
     pub fn for_request(
         &self,
+        kind: tw_api::RequestKind,
         client: Option<&str>,
         model: &str,
         upstream: &str,
     ) -> Vec<Arc<Active>> {
         self.plugins
             .iter()
-            .filter(|p| p.enabled && p.scope.covers(client, model, upstream))
+            .filter(|p| p.enabled && p.handles(kind) && p.scope.covers(client, model, upstream))
             .filter(|p| p.ready().is_none() || p.hooks.request)
             .cloned()
             .collect()
     }
 
     /// 这个回答上要过一遍的插件，按顺序：启用的、能跑的、有回答钩子的、管得着回答它的
-    /// 那一次的。**跑不了的不在这里**：它们在那一次发出去之前已经处置过了。
+    /// 那一次的。**跑不了的不在这里**：它们在那一次发出去之前已经处置过了。回答钩子只在
+    /// 对话上跑：不处理对话的插件不在这里（它也不该有回答钩子，清单校验时就拦了）
     pub fn for_reply(&self, client: Option<&str>, model: &str, upstream: &str) -> Vec<Arc<Active>> {
         self.plugins
             .iter()
             .filter(|p| p.enabled && p.ready().is_some() && p.hooks.on_reply())
+            .filter(|p| p.handles(tw_api::RequestKind::Conversation))
             .filter(|p| p.scope.covers(client, model, upstream))
             .cloned()
             .collect()
@@ -335,6 +349,7 @@ mod tests {
             api: 1,
             description: None,
             permissions: Vec::new(),
+            requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
             scope: Scope::default(),
             reply_mode: ReplyMode::Block,
             settings: Vec::new(),
@@ -351,6 +366,7 @@ mod tests {
             on_error: OnError::Reject,
             scope,
             permissions: Vec::new(),
+            requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
             reply_mode: ReplyMode::Block,
             hooks,
             settings: Default::default(),
@@ -373,6 +389,8 @@ mod tests {
         reply_text_end: false,
         tool_call: false,
     };
+
+    const CONVERSATION: tw_api::RequestKind = tw_api::RequestKind::Conversation;
 
     fn ids(v: &[Arc<Active>]) -> Vec<&str> {
         v.iter().map(|p| p.id.as_str()).collect()
@@ -414,7 +432,12 @@ mod tests {
             active("a-last", REQUEST, Scope::default(), None),
         ]);
         assert_eq!(
-            ids(&set.for_request(Some("claude-code"), "claude-opus-4-5", "anthropic")),
+            ids(&set.for_request(
+                CONVERSATION,
+                Some("claude-code"),
+                "claude-opus-4-5",
+                "anthropic"
+            )),
             ["b-first", "changed", "a-last"]
         );
     }
@@ -434,10 +457,13 @@ mod tests {
             active("everywhere", REQUEST, Scope::default(), None),
         ]);
         assert_eq!(
-            ids(&set.for_request(None, "m", "relay-a")),
+            ids(&set.for_request(CONVERSATION, None, "m", "relay-a")),
             ["only-a", "broken-a", "everywhere"]
         );
-        assert_eq!(ids(&set.for_request(None, "m", "relay-b")), ["everywhere"]);
+        assert_eq!(
+            ids(&set.for_request(CONVERSATION, None, "m", "relay-b")),
+            ["everywhere"]
+        );
     }
 
     /// 模型看的是发出去的那个：规则把 claude 改成 glm 发给中转，管 `glm-*` 的插件管这一次
@@ -449,10 +475,63 @@ mod tests {
             scope(&[], &["glm-*"], &[]),
             None,
         )]);
-        assert_eq!(ids(&set.for_request(None, "glm-4.6", "relay")), ["glm"]);
+        assert_eq!(
+            ids(&set.for_request(CONVERSATION, None, "glm-4.6", "relay")),
+            ["glm"]
+        );
         assert!(
-            set.for_request(None, "claude-sonnet-4-5", "relay")
+            set.for_request(CONVERSATION, None, "claude-sonnet-4-5", "relay")
                 .is_empty()
+        );
+    }
+
+    /// 只列处理这一种请求的插件，**跑不了的也一样**：只处理对话的插件坏了，拦不着嵌入和
+    /// 补全；声明了嵌入的坏了，拦的也只是嵌入（和对话，如果也声明了的话）
+    #[test]
+    fn the_request_list_has_only_plugins_that_handle_the_kind() {
+        use tw_api::RequestKind::*;
+        let with = |a: Arc<Active>, kinds: &[tw_api::RequestKind]| {
+            let mut a = Arc::try_unwrap(a).unwrap();
+            a.requests = kinds.to_vec();
+            Arc::new(a)
+        };
+        let set = PluginSet::new(vec![
+            active("chat", REQUEST, Scope::default(), None),
+            active(
+                "chat-broken",
+                REQUEST,
+                Scope::default(),
+                Some(Broken::Changed),
+            ),
+            with(
+                active("embeds", REQUEST, Scope::default(), None),
+                &[Conversation, Embeddings],
+            ),
+            with(
+                active(
+                    "embeds-broken",
+                    REQUEST,
+                    Scope::default(),
+                    Some(Broken::Changed),
+                ),
+                &[Embeddings],
+            ),
+            with(
+                active("completes", REQUEST, Scope::default(), None),
+                &[Completions],
+            ),
+        ]);
+        assert_eq!(
+            ids(&set.for_request(Embeddings, None, "m", "u")),
+            ["embeds", "embeds-broken"]
+        );
+        assert_eq!(
+            ids(&set.for_request(Completions, None, "m", "u")),
+            ["completes"]
+        );
+        assert_eq!(
+            ids(&set.for_request(Conversation, None, "m", "u")),
+            ["chat", "chat-broken", "embeds"]
         );
     }
 

@@ -1020,6 +1020,14 @@ the client sent, and the plugin sees which upstream and which model name the
 request goes to. Routing, model checks and session grouping use what the
 client sent.
 
+A plugin handles the kinds of request its code declares: conversations
+(Anthropic Messages, OpenAI Chat Completions and Responses, and Gemini,
+including their token counts and compaction), embeddings (`/v1/embeddings`,
+Gemini `:embedContent` and `:batchEmbedContents`) and legacy completions
+(`/v1/completions`). A plugin that declares none handles conversations only.
+Requests of a kind a plugin does not handle pass without it, whatever its
+`on_error`. Other endpoints, such as images and audio, pass without any plugin.
+
 <!-- generated: table plugins[] -->
 <a id="cfg-plugins"></a>
 

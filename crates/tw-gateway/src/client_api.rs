@@ -107,6 +107,26 @@ impl ClientApi {
             || p == "/backend-api/codex/responses/compact"
     }
 
+    /// 这个路径是不是嵌入：OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、
+    /// `:batchEmbedContents`。
+    ///
+    /// 插件声明了 `embeddings` 才处理它们（见 [`crate::plugin::request::Shape`]）
+    pub fn embeds(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        p.strip_prefix("/v1").unwrap_or(p) == "/embeddings"
+            || (p.contains("/models/")
+                && (p.ends_with(":embedContent") || p.ends_with(":batchEmbedContents")))
+    }
+
+    /// 这个路径是不是 OpenAI 的旧版补全（`/v1/completions`）。Anthropic 的旧版补全
+    /// （`/v1/complete`）不算：插件不管它。
+    ///
+    /// 插件声明了 `completions` 才处理它（见 [`crate::plugin::request::Shape`]）
+    pub fn completes(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        p.strip_prefix("/v1").unwrap_or(p) == "/completions"
+    }
+
     /// 转换库里对应的格式
     pub fn dialect(&self) -> Dialect {
         match self {
@@ -285,6 +305,35 @@ mod tests {
             ("/v1beta/models/gemini-embedding-001:embedContent", false),
         ] {
             assert_eq!(ClientApi::like_generation(path), like, "{path}");
+        }
+    }
+
+    /// 嵌入、旧版补全各是哪几个路径：生成回答、数 token、别家的旧版补全都不算
+    #[test]
+    fn embeddings_and_legacy_completions_are_told_apart_by_path() {
+        for (path, embeds, completes) in [
+            ("/v1/embeddings", true, false),
+            ("/embeddings/", true, false),
+            (
+                "/v1beta/models/gemini-embedding-001:embedContent",
+                true,
+                false,
+            ),
+            (
+                "/v1beta/models/text-embedding-004:batchEmbedContents",
+                true,
+                false,
+            ),
+            ("/v1/completions", false, true),
+            ("/completions", false, true),
+            ("/v1/chat/completions", false, false),
+            ("/v1/complete", false, false),
+            ("/v1/messages", false, false),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", false, false),
+            ("/v1/images/generations", false, false),
+        ] {
+            assert_eq!(ClientApi::embeds(path), embeds, "{path}");
+            assert_eq!(ClientApi::completes(path), completes, "{path}");
         }
     }
 

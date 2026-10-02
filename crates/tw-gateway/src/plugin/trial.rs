@@ -21,7 +21,7 @@ use tw_types::{Msg, msg};
 use super::bridge::Bridge;
 use super::host::{PluginHost, RequestOutcome};
 use super::pool::Pool;
-use super::request::{Shape, rejected, request_unreadable};
+use super::request::{Shape, cannot_read, rejected, request_unreadable};
 use super::set::LogLine;
 use super::view;
 
@@ -65,6 +65,22 @@ pub struct Side {
 
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+/// 试跑的这个请求调的接口插件一律不管：当时没有插件跑在它上面
+fn not_applicable(path: &str) -> Msg {
+    msg!(
+        "gw.plugin.not_applicable", path = path =>
+        "Plugins do not run on requests to {path}."
+    )
+}
+
+/// 插件没声明这种请求（manifest 的 `requests`）：当时它不在这个请求的范围里
+fn not_declared(plugin: &str) -> Msg {
+    msg!(
+        "gw.plugin.not_declared", plugin = plugin =>
+        "Plugin `{plugin}` does not handle this kind of request."
+    )
 }
 
 /// 存下来的回答读不出来
@@ -143,27 +159,36 @@ async fn tried(
     let client = request.as_ref().and_then(|r| r.client);
     let name = host.manifest().name.clone();
 
-    // ── 请求钩子：和这个请求当时一样看（见 [`super::request::Shape`]）
-    if let (Some(r), Some(d), true) = (&request, dialect, host.manifest().hooks.request) {
-        let shape = Shape::of(r.path);
-        match parsed.as_ref() {
-            _ if shape == Shape::Opaque => {
-                t.error = Some(super::request::cannot_read(&name, r.path))
+    // ── 请求钩子：和这个请求当时一样看（见 [`super::request::Shape`]）。插件不管的接口、
+    // 插件没声明的那种请求，当时它就没跑：试也不试，说清为什么
+    let shape = request.as_ref().map(|r| Shape::of(r.path));
+    if let (Some(r), Some(shape), true) = (&request, shape, host.manifest().hooks.request) {
+        // 认不出的接口没有格式，插件也不管它
+        let form = dialect.and_then(|d| Some((d, shape.form(d)?)));
+        match (form, parsed.as_ref()) {
+            (None, _) => t.error = Some(not_applicable(r.path)),
+            (Some((_, f)), _) if !host.manifest().requests.contains(&f.kind()) => {
+                t.error = Some(not_declared(&name))
             }
-            None => t.error = Some(request_unreadable("the request body is not JSON")),
-            Some(raw) => {
+            (Some(_), None) => t.error = Some(cannot_read(&name, "the request body is not JSON")),
+            (Some((d, form)), Some(raw)) => {
                 let mut masked = raw.clone();
                 bridge.hide_value(&mut masked);
-                let conversation =
-                    super::request::wrapped_count(d, r.path, &masked).unwrap_or(&masked);
-                match view::build(d, conversation, r.path) {
-                    Err(e) => t.error = Some(request_unreadable(e)),
+                let readable = super::request::wrapped_count(d, r.path, &masked).unwrap_or(&masked);
+                match view::build(form, readable, r.path) {
+                    Err(e) => t.error = Some(cannot_read(&name, &e)),
                     Ok(mut built) => {
                         let m = host.manifest();
                         super::request::sending(&mut built.view, &model);
                         let input = view::trim(&built.view, &m.permissions);
-                        let ctx =
-                            super::request::ctx(client, &model, &requested, d, &upstream, settings);
+                        let ctx = super::request::ctx(
+                            client,
+                            &model,
+                            &requested,
+                            form.name(),
+                            &upstream,
+                            settings,
+                        );
                         let (h, given) = (host.clone(), input.clone());
                         let before = pretty(&masked);
                         let ran = pool.run(move || h.on_request(given, ctx)).await;
@@ -187,12 +212,7 @@ async fn tried(
                                         Some(rejected(&name, reason)),
                                     ),
                                     Ok(RequestOutcome::Changed(out)) => {
-                                        match view::check(
-                                            &input,
-                                            &out,
-                                            &m.permissions,
-                                            built.src.hidden_tools(),
-                                        ) {
+                                        match built.src.check(&input, &out, &m.permissions) {
                                             Err(e) => {
                                                 (Outcome::Error, before.clone(), Some(e.msg()))
                                             }
@@ -238,11 +258,11 @@ async fn tried(
         }
     }
 
-    // ── 回答钩子
+    // ── 回答钩子：只在生成回答的对话上跑（嵌入、补全、数 token 都不跑）
     let Some(reply) = reply else {
         return t;
     };
-    if !host.manifest().hooks.on_reply() {
+    if !host.manifest().hooks.on_reply() || shape.is_some_and(|s| s != Shape::Generate) {
         return t;
     }
     // 回答按客户端的格式收成一整份

@@ -22,8 +22,9 @@
 //! - [`request`]：请求钩子。排在路由之后，**每发往一个上游跑一次**（契约附录二的 I7、
 //!   I8）：按这一次的客户端、发出去的模型和上游挑插件，从客户端的原话起改；换上游从
 //!   原话重来，同一家重发不重跑。改过的请求再过一遍内容审查，然后才转换格式、脱敏。
-//!   **发往上游的每个请求体都过**：数 token、Responses 的压缩也改，插件看不懂的接口按
-//!   插件的 `on_error` 处置（见 [`request::Shape`]）。
+//!   **插件只处理它声明了的那几种请求**（manifest 的 `requests`）：对话（连同数 token、
+//!   Responses 的压缩）是不写也有的，嵌入和旧版补全要插件自己声明；别的接口所有插件都
+//!   不管。没声明的那种请求不过它、不记录，它出了错也拦不着（见 [`request::Shape`]）。
 //! - [`reply`]：回答钩子。排在格式转换之后、工具调用审查和输出长度之前（I7）——
 //!   这两道防护看的就是插件改过的那一版。
 //! - [`pool`]：插件调用都是阻塞的、吃 CPU 的，放在专用线程池上跑，不占 tokio 的线程。
@@ -50,7 +51,9 @@ pub mod set;
 pub mod trial;
 pub mod view;
 
-pub use engine::{Engine, Hooks, LoadError, MAX_SOURCE, Manifest, SettingSpec, Unavailable};
+pub use engine::{
+    DEFAULT_REQUESTS, Engine, Hooks, LoadError, MAX_SOURCE, Manifest, SettingSpec, Unavailable,
+};
 pub use host::{Invocation, PluginHost, ReplyHost, RequestOutcome, RunError, ToolCallOutcome};
 pub use load::{Plugins, RUN_CHANNEL_CAP, RunRecord, RunSender};
 pub use set::{Active, Broken, LogLine, LogRing, PluginRun, PluginSet, Scope, State, Stats};
@@ -148,6 +151,7 @@ mod tests {
             on_error: tw_api::OnError::Reject,
             scope: Scope::default(),
             permissions: vec![tw_api::Permission::System],
+            requests: vec![tw_api::RequestKind::Conversation],
             reply_mode: tw_api::ReplyMode::Block,
             hooks: Hooks {
                 request: true,

@@ -16,8 +16,9 @@
 //! 换一家，管它的还是这些插件。
 //!
 //! **发往上游的每一跳都过这一步**，不只生成回答的：数 token、Responses 的压缩一样过插件
-//! （插件删掉的东西不能从这些接口漏出去），插件看不懂的接口按插件的 `on_error` 处置（见
-//! [`crate::plugin::request::Shape`]）。网关自己估数、不发出去的那一跳到不了这里。
+//! （插件删掉的东西不能从这些接口漏出去），嵌入和旧版补全过声明了它们的插件，别的接口
+//! 插件不管（见 [`crate::plugin::request::Shape`]）。网关自己估数、不发出去的那一跳到不了
+//! 这里。
 
 use bytes::Bytes;
 
@@ -94,15 +95,21 @@ pub(super) async fn attempt(
     let decoded = req.api.filter(|_| reading.generates).map(|api| {
         tw_dialect::convert::decode(api.dialect(), &c.value, &c.path, req.query.as_deref())
     });
-    // 请求防护：只看插件加进来的。解不开的不看 —— 和开头那一遍一样，同格式直通照样发
-    if let (Some(Ok(before)), Some(Ok(after))) = (&reading.decoded, &decoded)
+    // 请求防护：只看插件加进来的。解不开的不看 —— 和开头那一遍一样，同格式直通照样发。
+    // 嵌入、旧版补全没有中间表示：比的是改前改后每项输入的文字（见 `Changed::screen`）
+    let screened = match (&reading.decoded, &decoded, &c.screen) {
+        (Some(Ok(before)), Some(Ok(after)), _) => Some((&before.request, &after.request)),
+        (_, _, Some((before, after))) => Some((before, after)),
+        _ => None,
+    };
+    if let Some((before, after)) = screened
         && let Some(why) = crate::guard::screen_more(
             &state.bus,
             started.id,
             &provider.name,
             &crate::guard::Screen::of(rt),
-            &before.request,
-            &after.request,
+            before,
+            after,
         )
     {
         return Err(why);

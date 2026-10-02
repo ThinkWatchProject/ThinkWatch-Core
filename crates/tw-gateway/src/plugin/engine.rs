@@ -26,6 +26,10 @@ pub struct Manifest {
     pub description: Option<String>,
     /// 按 [`tw_api::Permission::ALL`] 的顺序，不重复
     pub permissions: Vec<tw_api::Permission>,
+    /// 插件处理哪几种请求（manifest 的 `requests`，没写是只有对话）。按
+    /// [`tw_api::RequestKind::ALL`] 的顺序，不重复、不空。**别的种类的请求不过它**（见
+    /// [`crate::plugin::set::PluginSet::for_request`]）
+    pub requests: Vec<tw_api::RequestKind>,
     /// 插件建议的范围。装上时照它填进配置，之后以配置为准
     pub scope: Scope,
     pub reply_mode: tw_api::ReplyMode,
@@ -64,6 +68,9 @@ impl Hooks {
         self.reply_text || self.tool_call
     }
 }
+
+/// 不写 `requests` 的插件处理的那几种：只有对话。读不出 manifest 的插件也按它算
+pub const DEFAULT_REQUESTS: &[tw_api::RequestKind] = &[tw_api::RequestKind::Conversation];
 
 /// 编不成的原因。
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
