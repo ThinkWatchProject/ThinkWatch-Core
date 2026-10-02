@@ -1,2 +1,5 @@
 [toolchain]
 channel = "stable"
+# 插件沙箱（crates/tw-plugin）里的 QuickJS 编成 wasm32-unknown-unknown。列在这里，
+# rustup 会自己把这个目标装上
+targets = ["wasm32-unknown-unknown"]

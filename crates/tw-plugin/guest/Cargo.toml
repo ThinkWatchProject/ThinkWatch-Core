@@ -1,0 +1,32 @@
+# 插件沙箱里跑的那个 QuickJS：编成 wasm32-unknown-unknown，没有 WASI。
+#
+# **它不是工作区成员**，平时的 `cargo build` / `cargo test` 不编它 —— 编它要一个
+# 能出 wasm 的 clang，而从源码编 core 只该需要 Rust。编好的 `qjs.wasm` 提交在
+# 旁边，`build.sh` 用钉死的工具链重编，CI 核对重编出来的和提交的逐字节相同。
+# 见 `build.sh` 和 `qjs.wasm.manifest`。
+[package]
+name = "tw-plugin-guest"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# QuickJS-ng 0.16.2 的 C 源码和它的绑定。只用绑定（没有 std，见 src/lib.rs）。
+# wasm32-unknown-unknown 下它用自己带的 wasi-libc（libc.a 与头文件）加一层垫片，
+# 只留一个时钟导入。**钉死版本**：换版本就是换引擎。
+rquickjs-sys = "=0.14.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+# 自成一个工作区，不被外面的 core 工作区收进去
+[workspace]

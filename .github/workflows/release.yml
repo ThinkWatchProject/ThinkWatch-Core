@@ -44,11 +44,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          # wasm32：插件沙箱里的 QuickJS（crates/tw-plugin/build.rs）
+          targets: aarch64-apple-darwin, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
+      # 编插件沙箱要一个能出 wasm 的 clang：Homebrew 的 llvm
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
+
+      # `-p tw-plugin`：网关还没接上插件之前，它不在 twcore 的依赖里，不点名就
+      # 没人编它 —— 而这条流水线要证明的正是每个目标平台都编得出沙箱
       - name: Build
-        run: cargo build --release -p twcore --target aarch64-apple-darwin
+        run: cargo build --release -p twcore -p tw-plugin --target aarch64-apple-darwin
+
+      # 这个平台的沙箱是哪个 clang 编的、wasm 的哈希：进摘要，也交给 publish
+      - name: Which compiler built the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh record target/aarch64-apple-darwin/release guest-build/aarch64-apple-darwin.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-build-aarch64-apple-darwin
+          path: guest-build/
+          if-no-files-found: error
 
       # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出
       # 任何问题 —— 而它会一路发到用户手里。
@@ -98,13 +114,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
+      # 镜像预装的 LLVM（C:\Program Files\LLVM）；没有就装官方发行版
+      - name: Toolchain for the plugin sandbox
+        shell: bash
+        run: bash scripts/wasm-toolchain.sh
+
+      # arm64 的沙箱机器码在 x64 上交叉编：build.rs 里的 Cranelift 直接编给目标平台
       - name: Build
         run: |
-          cargo build --release -p twcore --target x86_64-pc-windows-msvc
-          cargo build --release -p twcore --target aarch64-pc-windows-msvc
+          cargo build --release -p twcore -p tw-plugin --target x86_64-pc-windows-msvc
+          cargo build --release -p twcore -p tw-plugin --target aarch64-pc-windows-msvc
+
+      - name: Which compiler built the plugin sandbox
+        shell: bash
+        run: |
+          for t in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            bash scripts/wasm-toolchain.sh record "target/$t/release" "guest-build/$t.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-build-windows
+          path: guest-build/
+          if-no-files-found: error
 
       # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出任何
       # 问题 —— 而它会一路发到用户手里。
@@ -202,13 +236,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
+      # 两种 runner 都预装 clang-15，两个架构用同一个版本（见脚本）
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
+
       - name: Build
-        run: cargo build --release -p twcore --target ${{ matrix.target }}
+        run: cargo build --release -p twcore -p tw-plugin --target ${{ matrix.target }}
+
+      - name: Which compiler built the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh record "target/${{ matrix.target }}/release" "guest-build/${{ matrix.target }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-build-${{ matrix.target }}
+          path: guest-build/
+          if-no-files-found: error
 
       # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出任何
       # 问题 —— 而它会一路发到用户手里。
@@ -332,7 +378,32 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: twcore-*
           merge-multiple: true
+
+      # 每个平台的插件沙箱是哪个 clang 编的、wasm 的哈希。**只记录，不卡发版**：
+      # macOS 用 Homebrew 的 llvm、Linux 用 clang-15、Windows 用镜像里的 LLVM，
+      # 编译器不同，哈希本来就不同；同一个编译器编的（两个 Linux）应当相同
+      - uses: actions/download-artifact@v4
+        with:
+          path: guest-build
+          pattern: guest-build-*
+          merge-multiple: true
+      - name: Which compiler built each plugin sandbox
+        run: |
+          set -euo pipefail
+          {
+            echo "### Plugin sandbox"
+            echo
+            echo "| target | guest.wasm sha256 | clang |"
+            echo "|---|---|---|"
+            for f in guest-build/*.txt; do
+              t=$(basename "$f" .txt)
+              sha=$(awk '/^guest.wasm sha256 /{print $3}' "$f")
+              cc=$(sed -n 's/^clang //p' "$f" | head -n 1)
+              echo "| $t | \`$sha\` | $cc |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # 排练也跑这一步：构建 job 交来的正好是清单上的文件，每个都对得上
       # 它的校验和
