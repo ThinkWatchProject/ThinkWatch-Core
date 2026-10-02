@@ -43,6 +43,7 @@ pub(crate) const CLIENTS: edit::Section = edit::Section {
     path: &["clients"],
     what: "gateway key",
     key: "name",
+    multiline: &[],
 };
 
 fn not_found(name: &str) -> ApplyError {

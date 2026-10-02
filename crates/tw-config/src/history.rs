@@ -33,9 +33,12 @@ pub enum Origin {
     Rollback,
     /// token 端点换发了新的 refresh token，我们把它写回去了。
     ///
-    /// **这是唯一一次不是人发起的写入**，所以它在历史里要能一眼认出来
-    /// —— 用户看到「配置变了」时，第一个问题是「谁改的」。
+    /// **不是人发起的写入**，所以它在历史里要能一眼认出来 —— 用户看到「配置
+    /// 变了」时，第一个问题是「谁改的」。
     Rotation,
+    /// core 自己装上它自带的默认插件、或者把没动过的默认插件换成新版。同样不是
+    /// 人发起的，同样要一眼认得出来
+    Defaults,
 }
 
 impl Origin {
@@ -47,6 +50,7 @@ impl Origin {
             Origin::External => "external",
             Origin::Rollback => "rollback",
             Origin::Rotation => "rotation",
+            Origin::Defaults => "defaults",
         }
     }
     fn parse(s: &str) -> Origin {
@@ -55,6 +59,7 @@ impl Origin {
             "cli" => Origin::Cli,
             "rollback" => Origin::Rollback,
             "rotation" => Origin::Rotation,
+            "defaults" => Origin::Defaults,
             _ => Origin::External,
         }
     }
@@ -65,6 +70,7 @@ impl Origin {
             Origin::External => "an outside edit",
             Origin::Rollback => "a rollback",
             Origin::Rotation => "a credential rotation",
+            Origin::Defaults => "the default plugins",
         }
     }
 }

@@ -842,6 +842,15 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             state.clone(),
             state.bus.clone(),
         ));
+        // 默认插件（随 core 发的那几个）：没给过的装上（停用着），没动过的换成新版。
+        // 启动时在控制面起来之前走一遍，界面第一次取插件就看得到它们；之后每换入一份
+        // 配置再走一遍。**不挡启动**：哪个没办成只记一行、说一声。安全模式不走 ——
+        // 那时只有控制面，不替人往配置里写东西
+        if !safe {
+            let seeder = tw_control::plugins::defaults::Seeder::shipped();
+            seeder.seed(&manager).await;
+            tw_control::plugins::defaults::spawn(seeder, manager.clone());
+        }
         // **监听要留着** —— 扔掉它就停止监听，而那个失效是静默的。
         // 起不来不是致命的：手改文件不会自动生效，但界面和 CLI 照常能用，
         // 所以说一句就继续。
@@ -876,9 +885,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             chatgpt: Default::default(),
             zai: Default::default(),
         };
-        // 凭据轮换要写回 config.yaml。**这是这个程序里唯一一次
-        // 不是人发起的配置写入** —— 理由是服务器换发新 refresh token 的
-        // 那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
+        // 凭据轮换要写回 config.yaml。**不是人发起的配置写入只有两种**，
+        // 这是一种（另一种是上面的默认插件）—— 理由是服务器换发新 refresh
+        // token 的那一刻旧的就作废了，不写回等于让配置文件从那一秒起就是坏的。
         tw_control::rotation::spawn(control.clone());
         // 定期刷新默认价目表（`pricing.auto_update`，默认开）
         tw_control::pricing::spawn(control.clone());

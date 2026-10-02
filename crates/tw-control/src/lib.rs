@@ -1452,7 +1452,9 @@ pub(crate) fn apply_fail(e: ApplyError) -> Fail {
         }
         ApplyError::Edit(EditError::NotFound { .. }) => StatusCode::NOT_FOUND,
         // 不是请求写错了，是这条路上不许改
-        ApplyError::ControlKeyLocked | ApplyError::RemoteControlLocked => StatusCode::FORBIDDEN,
+        ApplyError::ControlKeyLocked
+        | ApplyError::RemoteControlLocked
+        | ApplyError::NeedsConfirmation(_) => StatusCode::FORBIDDEN,
         ApplyError::Rejected(_)
         | ApplyError::Build(_)
         | ApplyError::BadPath(_)

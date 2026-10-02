@@ -8,13 +8,19 @@
 //! 还原 —— 不留下一个和配置对不上的插件文件。整个过程攥着 `Plugins::edits`，目录
 //! 监听不会落在两半之间。
 //!
-//! # 三个端点网页调不了
+//! # 四个端点网页调不了
 //!
 //! 装（`CreatePlugin`）、换源码（`ReplacePluginSource`）、批准改过的文件
 //! （`ApprovePluginFile`）**不在桌面端网页的 `call` 白名单里**（不变式 I12）：这三件事
 //! 要在系统的确认框里点头，那一步在桌面端的 Rust 里，它自己再编一遍源码，把名字、
 //! 权限和哈希摆给人看。所以这里不假设调用方看过什么：源码在这里再编一遍，批准时
 //! 磁盘上的文件得正好是调用方看过的那一份（哈希核对）。
+//!
+//! 第四个是**确认过的改动**（`UpdatePluginConfirmed`）。改得了回答里工具调用的插件
+//! （`reply_tool_calls`）决定客户端执行什么：网页里注入的脚本要是能打开它、改它的设置
+//! 或范围，就能借它改客户端要跑的命令。所以 `UpdatePlugin`（网页调得到）对这种插件只做
+//! 停用、改出错时怎么办，打开、改设置、改范围要走确认过的那一条。**读不出权限的插件按
+//! 改得了算**：它此刻跑不了，可一旦又跑得了（运行时恢复了），网页替它打开的开关就生效了。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +39,8 @@ use tw_types::{Msg, msg};
 use crate::contract::RouterExt;
 use crate::{ApplyError, ControlState, Fail, apply_fail, fail, internal};
 
+pub mod defaults;
+
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
         .at(ep::Plugins, list)
@@ -40,6 +48,7 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::CreatePlugin, create)
         .at(ep::ReorderPlugins, reorder)
         .at(ep::UpdatePlugin, update)
+        .at(ep::UpdatePluginConfirmed, update_confirmed)
         .at(ep::DeletePlugin, delete)
         .at(ep::ReplacePluginSource, replace_source)
         .at(ep::PluginSourceDiff, source_diff)
@@ -619,20 +628,51 @@ async fn create(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
+/// 网页调得到的那一条：改得了工具调用的插件只能停用、改出错时怎么办（见模块说明）
 async fn update(
     State(s): State<ControlState>,
     UrlPath(id): UrlPath<String>,
     Json(req): Json<tw_api::PluginUpdate>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    save(&s, &id, req, false).await
+}
+
+/// 同一件事，桌面端在系统的确认框里点过头了：工具调用插件的开关、设置、范围也改得了。
+/// **网页不能调**（不在桌面端网页的白名单里）
+async fn update_confirmed(
+    State(s): State<ControlState>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<tw_api::PluginUpdate>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    save(&s, &id, req, true).await
+}
+
+/// 改开关、出错时怎么办、范围、设置。`confirmed`：点过头了（[`update_confirmed`]）
+async fn save(
+    s: &ControlState,
+    id: &str,
+    req: tw_api::PluginUpdate,
+    confirmed: bool,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     check_scope(&req.scope)?;
+    // **攥着写插件的那把锁**：读到的权限和写下去的配置说的是同一份插件 —— 换源码、
+    // 批准也攥着它，落不到两者之间
+    let _edit = s.gateway.plugins.edits.lock().await;
     // 设置对着它此刻的 manifest 查。读不出 manifest（文件变了、底稿也没了）就照交来的
     // 写：加载时还会再查一遍
-    let manifest = s
-        .gateway
-        .runtime()
-        .plugins
-        .get(&id)
-        .and_then(|a| a.manifest.clone());
+    let (approved, manifest, name) = {
+        let rt = s.gateway.runtime();
+        let approved = rt
+            .config
+            .plugins
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.sha256.clone());
+        let a = rt.plugins.get(id);
+        let manifest = a.and_then(|a| a.manifest.clone());
+        let name = a.map_or_else(|| id.to_string(), |a| a.name.clone());
+        (approved, manifest, name)
+    };
     let settings = match &manifest {
         Some(m) => settings_for(m, &req.settings)?,
         None => req.settings.clone(),
@@ -644,20 +684,74 @@ async fn update(
                 .plugins
                 .iter()
                 .find(|p| p.id == id)
-                .ok_or_else(|| missing(&id))?;
+                .ok_or_else(|| missing(id))?;
+            // manifest 得是配置里批准的那一份的；对不上（配置刚被别处改了）就是读不出
+            let known = manifest
+                .as_ref()
+                .filter(|_| approved.as_deref() == Some(p.sha256.as_str()));
+            if !confirmed && steers_tool_calls(known) && changes_what_it_does(p, &req, known) {
+                return Err(ApplyError::NeedsConfirmation(msg!(
+                    "control.plugin.needs_confirmation", plugin = &name =>
+                    "Turning on plugin `{plugin}`, or changing its settings or scope, has to be \
+                     confirmed in the app, because the plugin may change the tool calls in replies."
+                )));
+            }
             let item = entry(
-                &id,
+                id,
                 &p.sha256,
                 req.enabled,
                 req.on_error,
                 &req.scope,
                 &settings,
             );
-            Ok(edit::upsert(text, edit::PLUGINS, Some(&id), &item)?)
+            Ok(edit::upsert(text, edit::PLUGINS, Some(id), &item)?)
         })
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 改得了回答里的工具调用：权限里有 `reply_tool_calls`，**或者读不出它要什么权限**
+fn steers_tool_calls(m: Option<&Manifest>) -> bool {
+    m.is_none_or(|m| m.permissions.contains(&tw_api::Permission::ReplyToolCalls))
+}
+
+/// 这次改动里有没有要点头的：打开它、改设置、改范围。停用、改出错时怎么办都不算。
+/// **比的是生效的样子**：配置里没写的设置按默认值算，范围不看顺序和重复
+fn changes_what_it_does(
+    p: &tw_config::Plugin,
+    req: &tw_api::PluginUpdate,
+    m: Option<&Manifest>,
+) -> bool {
+    let turns_on = req.enabled && !p.enabled;
+    let norm = |v: &[String]| {
+        let mut v: Vec<String> = v.iter().map(|x| x.trim().to_string()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let scope = norm(&p.scope.clients) != norm(&req.scope.clients)
+        || norm(&p.scope.models) != norm(&req.scope.models)
+        || norm(&p.scope.upstreams) != norm(&req.scope.upstreams);
+    let now: BTreeMap<String, SettingValue> = p
+        .settings
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), from_yaml(v)?)))
+        .collect();
+    let effective = |given: &BTreeMap<String, SettingValue>| {
+        let all = tw_gateway::plugin::load::settings_of(m?, given).ok()?;
+        Some(
+            all.iter()
+                .filter_map(|(k, v)| Some((k.clone(), from_json(v)?)))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    };
+    let settings = match (effective(&now), effective(&req.settings)) {
+        (Some(a), Some(b)) => a != b,
+        // 算不出生效的样子（读不出 manifest、配置里的设置本来就不对）：照写的比
+        _ => now != req.settings,
+    };
+    turns_on || scope || settings
 }
 
 async fn replace_source(

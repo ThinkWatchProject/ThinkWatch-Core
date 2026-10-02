@@ -1063,6 +1063,273 @@ async fn a_trial_runs_the_plugin_on_the_recorded_request_and_answer() {
     );
 }
 
+/// 改得了回答里工具调用的插件：一份设置、一份范围
+fn rewrite_calls() -> String {
+    source(
+        json!({"name": "改工具调用", "api": 1, "permissions": ["reply.tool_calls"],
+               "match": {"models": ["claude-*", "gpt-*"]},
+               "settings": {"mode": {"type": "string", "label": "方式", "default": "a"},
+                            "depth": {"type": "number", "label": "层数", "default": 2}}}),
+        &["onToolCall"],
+    )
+}
+
+/// 一份 `PluginUpdate`：开关、出错时怎么办、模型范围、设置
+fn update_body(enabled: bool, on_error: &str, models: Value, settings: Value) -> Value {
+    json!({"enabled": enabled, "on_error": on_error,
+           "scope": {"clients": [], "models": models, "upstreams": []},
+           "settings": settings})
+}
+
+async fn put(b: &Bed, path: &str, mut body: Value) -> (StatusCode, Value) {
+    body["base_version"] = json!(b.version().await);
+    call(&b.app, "PUT", path, Some(body)).await
+}
+
+/// 网页那条路改不了工具调用插件做什么：打开它、改设置、改范围都要点过头。停用、改出错时
+/// 怎么办、排顺序、删照常；确认过的那条路什么都改得了
+#[tokio::test]
+async fn a_tool_call_plugin_is_turned_on_or_steered_only_after_a_confirmation() {
+    let b = bed();
+    let id = b
+        .install(
+            &rewrite_calls(),
+            json!({"enabled": false,
+                   "scope": {"clients": [], "models": ["claude-*", "gpt-*"], "upstreams": []}}),
+        )
+        .await;
+    let other = b.install(&shout(), json!({})).await;
+    let at = format!("/plugins/{id}");
+    let before = b.config();
+    let as_is = || {
+        update_body(
+            false,
+            "reject",
+            json!(["claude-*", "gpt-*"]),
+            json!({"mode": "a", "depth": 2}),
+        )
+    };
+
+    for (what, body) in [
+        (
+            "turning it on",
+            update_body(
+                true,
+                "reject",
+                json!(["claude-*", "gpt-*"]),
+                json!({"mode": "a", "depth": 2}),
+            ),
+        ),
+        (
+            "a setting",
+            update_body(
+                false,
+                "reject",
+                json!(["claude-*", "gpt-*"]),
+                json!({"mode": "b", "depth": 2}),
+            ),
+        ),
+        (
+            "a number setting",
+            update_body(
+                false,
+                "reject",
+                json!(["claude-*", "gpt-*"]),
+                json!({"mode": "a", "depth": 3}),
+            ),
+        ),
+        (
+            "the scope",
+            update_body(
+                false,
+                "reject",
+                json!(["*"]),
+                json!({"mode": "a", "depth": 2}),
+            ),
+        ),
+        (
+            "the scope by removing an entry",
+            update_body(
+                false,
+                "reject",
+                json!(["claude-*"]),
+                json!({"mode": "a", "depth": 2}),
+            ),
+        ),
+    ] {
+        let (st, v) = put(&b, &at, body).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {v}");
+        assert_eq!(
+            v["code"], "control.plugin.needs_confirmation",
+            "{what}: {v}"
+        );
+        assert_eq!(v["args"]["plugin"], "改工具调用", "{what}: {v}");
+        assert_eq!(b.config(), before, "{what}");
+    }
+
+    // 什么都没变、只是交回原样（顺序不同、没给的设置按默认值算）：照收
+    let (st, v) = put(&b, &at, as_is()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = put(
+        &b,
+        &at,
+        update_body(false, "reject", json!(["gpt-*", "claude-*"]), json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // 出错时怎么办照改
+    let (st, v) = put(
+        &b,
+        &at,
+        update_body(
+            false,
+            "skip",
+            json!(["claude-*", "gpt-*"]),
+            json!({"mode": "a"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        b.parsed().plugins[0].on_error,
+        tw_config::PluginOnError::Skip
+    );
+
+    // 确认过的那条路：打开、改设置、改范围一次改完
+    let (st, v) = put(
+        &b,
+        &format!("{at}/confirmed"),
+        update_body(
+            true,
+            "skip",
+            json!(["claude-*"]),
+            json!({"mode": "b", "depth": 5}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let p = b.parsed().plugins[0].clone();
+    assert!(p.enabled);
+    assert_eq!(p.scope.models, ["claude-*"]);
+    assert_eq!(p.settings["mode"], serde_yaml_ng::Value::from("b"));
+    assert_eq!(p.settings["depth"], serde_yaml_ng::Value::from(5));
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+
+    // 开着的时候：改设置照样要点头；只改出错时怎么办不用
+    let (st, v) = put(
+        &b,
+        &at,
+        update_body(
+            true,
+            "skip",
+            json!(["claude-*"]),
+            json!({"mode": "c", "depth": 5}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = put(
+        &b,
+        &at,
+        update_body(
+            true,
+            "reject",
+            json!(["claude-*"]),
+            json!({"mode": "b", "depth": 5}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // 停用照常
+    let (st, v) = put(
+        &b,
+        &at,
+        update_body(
+            false,
+            "reject",
+            json!(["claude-*"]),
+            json!({"mode": "b", "depth": 5}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!b.parsed().plugins[0].enabled);
+
+    // 排顺序、删照常
+    let (st, v) = put(&b, "/plugins/order", json!({"ids": [other, id]})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &b.app,
+        "DELETE",
+        &format!("{at}?base_version={}", b.version().await),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().plugins.iter().all(|p| p.id != id));
+
+    // 确认过的那条路也要插件在
+    let (st, _) = put(&b, "/plugins/nobody/confirmed", as_is()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 没有工具调用权限的插件：网页那条路照常打开、改设置、改范围
+#[tokio::test]
+async fn a_plugin_without_tool_calls_is_changed_without_a_confirmation() {
+    let b = bed();
+    let id = b.install(&add_date(), json!({"enabled": false})).await;
+    let (st, v) = put(
+        &b,
+        &format!("/plugins/{id}"),
+        update_body(
+            true,
+            "reject",
+            json!(["gpt-*"]),
+            json!({"note": "明天", "days": 4}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().plugins[0].enabled);
+}
+
+/// 读不出权限的插件（文件和底稿都被动过）按改得了工具调用算：它此刻跑不了，可一旦又跑得了，
+/// 网页替它打开的开关就生效了
+#[tokio::test]
+async fn a_plugin_whose_permissions_cannot_be_read_needs_a_confirmation_too() {
+    let b = bed();
+    let id = b.install(&shout(), json!({"enabled": false})).await;
+    std::fs::write(b.file(&id), "tampered").unwrap();
+    std::fs::write(b.approved(&id), "tampered too").unwrap();
+    b.gw.reload_plugins();
+    assert!(b.gw.runtime().plugins.get(&id).unwrap().manifest.is_none());
+    let (st, v) = put(
+        &b,
+        &format!("/plugins/{id}"),
+        update_body(true, "reject", json!([]), json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], "control.plugin.needs_confirmation");
+    assert_eq!(v["args"]["plugin"], id);
+    // 改出错时怎么办照常
+    let (st, v) = put(
+        &b,
+        &format!("/plugins/{id}"),
+        update_body(false, "skip", json!([]), json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = put(
+        &b,
+        &format!("/plugins/{id}/confirmed"),
+        update_body(true, "skip", json!([]), json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().plugins[0].enabled);
+}
+
 /// 远程 core：配置不在默认的地方，插件文件就在那份配置旁边 —— 文件由 core 自己写
 #[tokio::test]
 async fn plugin_files_live_next_to_the_configuration_wherever_it_is() {

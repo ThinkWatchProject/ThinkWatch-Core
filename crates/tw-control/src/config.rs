@@ -25,6 +25,8 @@ pub struct ConfigManager {
     /// 磁盘上那份最近一次外部改动没通过校验（`Status.config_rejected`）。**是现状，不是
     /// 那一刻**：半路才连上的界面按它补上那条提醒；换入成功就清掉
     rejected: std::sync::Mutex<Option<tw_api::ConfigRejection>>,
+    /// 每换入一份配置响一次（[`Self::applied`]）。默认插件那一路等着它
+    applied: tokio::sync::Notify,
 }
 
 /// 一次配置改动没成的原因。
@@ -64,6 +66,10 @@ pub enum ApplyError {
     /// 从远程端口进来的写入改了 `listen.control` 这一节。
     #[error("{}", self.msg())]
     RemoteControlLocked,
+    /// 这条路上做不了、要在系统的确认框里点过头的改动（改得了工具调用的插件：打开它、
+    /// 改设置、改范围）。**和 `Invalid` 分开**：请求本身没写错，换那条确认过的路就做得成
+    #[error("{0}")]
+    NeedsConfirmation(Msg),
 }
 
 impl ApplyError {
@@ -76,7 +82,8 @@ impl ApplyError {
             ApplyError::Build(m)
             | ApplyError::BadPath(m)
             | ApplyError::Invalid(m)
-            | ApplyError::InUse(m) => m.clone(),
+            | ApplyError::InUse(m)
+            | ApplyError::NeedsConfirmation(m) => m.clone(),
             ApplyError::Stale { base, current } => msg!(
                 "control.config_stale", base = base, current = current =>
                 "version mismatch: this edit is based on {base}, and the current version is \
@@ -109,7 +116,19 @@ impl ConfigManager {
             bus,
             seen: Mutex::new(seen),
             rejected: std::sync::Mutex::new(None),
+            applied: tokio::sync::Notify::new(),
         }
+    }
+
+    /// 数据面。管理面里要碰插件文件、编插件的那几处从这里拿
+    pub fn gateway(&self) -> &tw_gateway::AppState {
+        &self.gateway
+    }
+
+    /// 等下一次换入配置（哪一条路进来的都算）。**只给一个等的人**（默认插件那一路）：
+    /// 没人在等时响过的那一次记着，下一次等马上返回；连响几次只算一次
+    pub async fn applied(&self) {
+        self.applied.notified().await;
     }
 
     /// 磁盘上那份配置此刻是不是没通过校验、旧的还在服务
@@ -207,6 +226,7 @@ impl ConfigManager {
         let _ = tw_config::history::snapshot(&self.path, text, origin);
         let version = store::version_of(text);
         tracing::info!(%version, origin = origin.slug(), "the configuration is in effect");
+        self.applied.notify_one();
         self.bus.emit(tw_api::Event::ConfigReloaded {
             id: self.bus.next_id(),
             version: version.clone(),
@@ -589,6 +609,7 @@ mod msg_codes {
             ApplyError::InUse(inner.clone()),
             ApplyError::BadPath(inner.clone()),
             ApplyError::Build(inner.clone()),
+            ApplyError::NeedsConfirmation(inner.clone()),
         ] {
             assert_eq!(e.msg(), inner);
         }
