@@ -497,9 +497,10 @@ else
   bad "历史里一条记录都没有"
 fi
 
-# 在整份记录里找，也按正文找。**摘录不带密钥出门**：数据面那一节发过「我的 key 是
-# sk-ant-api03-SMOKEKEY…」，按正文找得到那两条，摘录是打过码的；只在密钥里出现的
-# 词找不到。正文是另一条通道异步落盘的，没落下来之前找不到，所以多等几轮
+# 在整份记录里找，也按正文找。**摘录不带密钥出门**：数据面那一节在拦截档下发过「我的
+# key 是 sk-ant-api03-SMOKEKEY…」，按正文找得到那两条，摘录里是发给上游的占位符（正文
+# 落盘之前就换过了）；只在密钥里出现的词找不到。正文是另一条通道异步落盘的，没落下来
+# 之前找不到，所以多等几轮
 GOT=""
 for _ in $(seq 1 20); do
   C=$(post /history/search '{"q":"我的 key","content":true}')
@@ -509,13 +510,21 @@ p = json.loads(raw)
 hits = p.get("hits") or []
 good = (p.get("stopped") in ("end", "full") and len(hits) >= 2
         and all(h["side"] == "request" for h in hits)
-        and all("sk-an" in h["after"] for h in hits) and "SMOKEKEYAAAA" not in raw)
+        and all("<<TW_SECRET_1>>" in h["after"] for h in hits) and "SMOKEKEYAAAA" not in raw)
 print("ok" if good else raw[:600])' < "$TMP/out" 2>&1)
   [ "$C" = "200" ] && [ "$GOT" = "ok" ] && break
   sleep 0.25
 done
-[ "$C" = "200" ] && [ "$GOT" = "ok" ] && ok "POST /history/search 按正文找到了那两条，摘录里的密钥打了码" \
+[ "$C" = "200" ] && [ "$GOT" = "ok" ] && ok "POST /history/search 按正文找到了那两条，摘录里是占位符" \
   || bad "按正文找没找对（$C）" "$GOT"
+# **落盘的不是原文**：拦截档下存的是发给上游的那一份，盘上没有一个文件带着那把密钥。
+# 读出来时再打码只是第二道。上面那一轮已经等到两条的正文都落了盘
+BLOBS="$THINKWATCH_HOME/blobs"
+if [ -d "$BLOBS" ] && ! grep -rqa "SMOKEKEY" "$BLOBS" && grep -rqa "<<TW_SECRET_1>>" "$BLOBS"; then
+  ok "落盘的正文里没有那把密钥，存的是发给上游的占位符"
+else
+  bad "落盘的正文不对" "带着密钥的：$(grep -rla "SMOKEKEY" "$BLOBS" 2>/dev/null | head -3)"
+fi
 C=$(post /history/search '{"q":"smokekeyaaaa","content":true}')
 if [ "$C" = "200" ] && ! grep -q "SMOKEKEYAAAA" "$TMP/out" \
    && python3 -c 'import sys, json; sys.exit(0 if not json.load(sys.stdin)["hits"] else 1)' < "$TMP/out"; then

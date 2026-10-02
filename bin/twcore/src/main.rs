@@ -782,7 +782,7 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         //
         // body 的通道在这里建：**它是唯一同时看得见网关和存储的地方**，
         // 而两边各有各的同形结构，是为了不让「观测」挂到「转发」下面。
-        let (body_tx, body_rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
+        let (body_tx, body_rx) = tw_gateway::bodies::channel();
         let store = build_store(&dir, state.bus.clone(), state.pricing.clone(), body_rx);
         if store.is_some() {
             state.set_body_sink(body_tx);
@@ -975,25 +975,45 @@ fn build_store(
             "could not read the last request id, so this run may overwrite the oldest records: {e}"
         ),
     }
-    // 两边的 body 结构在这里对接。**一次移动，不复制** —— `Bytes` 的
-    // 克隆是引用计数。
-    let (tx, rx) = tokio::sync::mpsc::channel(tw_gateway::bodies::CHANNEL_CAP);
+    /*
+      两边的 body 结构在这里对接，**落盘的不是原文**：脱敏规则认得出的值在这里换掉、
+      打码（`BodyRecord::for_disk`，见 `tw_gateway::bodies`）。放在阻塞线程上 ——
+      一份 4 MB 的正文要扫好几遍，占着异步线程的话，同一个线程上的转发都得等它。
+
+      交给存储层的这一头**只留一个空位**。等着落盘的正文由网关那一头按字节记账
+      （`bodies::QUEUED_MAX`），一份正文的额度要等存储层收下它才还回去；这里再开一个
+      大口子的话，攒在这里的那些就没人管了。
+    */
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
     let mut bodies = bodies;
     tokio::spawn(async move {
         while let Some(b) = bodies.recv().await {
+            let Ok(disk) = tokio::task::spawn_blocking(move || b.for_disk()).await else {
+                continue;
+            };
+            let tw_gateway::bodies::ForDisk {
+                id,
+                at_ms,
+                kind,
+                body,
+                original_len,
+                held,
+            } = disk;
             let mapped = tw_store::StoredBody {
-                id: b.id,
-                at_ms: b.at_ms,
-                which: match b.kind {
+                id,
+                at_ms,
+                which: match kind {
                     tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
                     tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
                 },
-                body: b.body,
-                original_len: b.original_len,
+                body,
+                original_len,
             };
             if tx.send(mapped).await.is_err() {
                 return;
             }
+            // 存储层收下了：额度还回去
+            drop(held);
         }
     });
     Some(tw_store::task::spawn(

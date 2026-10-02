@@ -543,32 +543,48 @@ mod tests {
 /// **按值的形状判，不按键名。**body 是 JSON，键名五花八门（`api_key`、
 /// `token`、`Authorization`、某个 MCP server 自己起的名字），而凭据的
 /// 形状是有限的几种。
+///
+/// **打第二遍不改动什么**：正文落盘之前打过一遍，读出来给人看时再打一遍。打过的码
+/// （`sk-an…7f9c`）里那 5 个字的开头自己又像一把密钥，不认得它的话第二遍会把它打成
+/// `………`，越打越看不出是什么。所以紧挨着 `…` 的 5 个字的开头、4 个字的结尾原样留着 ——
+/// 这么短的一段本来就不带信息，[`mask_secret`] 对它也只会给 `…`。
+///
+/// 按字节走，不先摊成一个字符数组：一份正文最多 4 MB，摊开就是 16 MB。
 pub fn mask_body(text: &str) -> String {
-    // 一个可能是凭据的 token 由这些字符组成
-    fn is_tok(c: char) -> bool {
-        c.is_ascii_alphanumeric() || "-_.".contains(c)
+    // 一个可能是凭据的 token 由这些字符组成。**全是 ASCII**，所以按字节找边界
+    fn is_tok(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
     }
+    const ELLIPSIS: &str = "…";
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        // 只在一个 token 的开头尝试匹配，否则 `xsk-abc` 里的 `sk-abc`
-        // 会被当成密钥
-        let at_boundary = i == 0 || !is_tok(chars[i - 1]);
-        if at_boundary {
-            let mut j = i;
-            while j < chars.len() && is_tok(chars[j]) {
-                j += 1;
-            }
-            let tok: String = chars[i..j].iter().collect();
-            if looks_like_credential(&tok) {
-                out.push_str(&mask_secret(&tok));
-                i = j;
-                continue;
-            }
+    while i < bytes.len() {
+        if !is_tok(bytes[i]) {
+            // 一段不是 token 的字原样照抄，到下一个 token 的开头为止
+            let j = bytes[i..]
+                .iter()
+                .position(|&b| is_tok(b))
+                .map_or(bytes.len(), |n| i + n);
+            out.push_str(&text[i..j]);
+            i = j;
+            continue;
         }
-        out.push(chars[i]);
-        i += 1;
+        // 只在一个 token 的开头尝试匹配（走到这里的都是：前一个字不是 token 的），否则
+        // `xsk-abc` 里的 `sk-abc` 会被当成密钥
+        let j = bytes[i..]
+            .iter()
+            .position(|&b| !is_tok(b))
+            .map_or(bytes.len(), |n| i + n);
+        let tok = &text[i..j];
+        let head_of_a_mask = tok.len() == 5 && text[j..].starts_with(ELLIPSIS);
+        let tail_of_a_mask = tok.len() == 4 && text[..i].ends_with(ELLIPSIS);
+        if !head_of_a_mask && !tail_of_a_mask && looks_like_credential(tok) {
+            out.push_str(&mask_secret(tok));
+        } else {
+            out.push_str(tok);
+        }
+        i = j;
     }
     out
 }
@@ -613,6 +629,38 @@ mod body_tests {
         let out = mask_body(s);
         assert!(!out.contains("aaaaaaaaaaaaaaaa"), "{out}");
         assert!(!out.contains("bbbbbbbbbbbbbbbb"), "{out}");
+    }
+
+    /// 正文落盘前打过一遍，读出来再打一遍。**第二遍不能再改**：`sk-an…7f9c` 的开头
+    /// `sk-an` 自己又像一把密钥，不认得它的话，第二遍会把它打成 `………7f9c`
+    #[test]
+    fn masking_twice_changes_nothing_the_first_time_did_not() {
+        for s in [
+            r#"{"content":"我的 key 是 sk-ant-api03-abcdefghijklmnopqrstuvwxyz，别外传"}"#,
+            "sk-ant-api03-aaaaaaaaaaaaaaaa 和 ghp_bbbbbbbbbbbbbbbbbbbb…",
+            "AKIA… tw-abc sk-x…AKIA 网关 tw-0123456789abcdef0123456789",
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8 和 \\nsk-ant-api03-zzzzzzzzzzzzzzzzzzzz",
+            "已经打过的 sk-an…wxyz、ghp_b…bbbb、………、…7894",
+            "",
+        ] {
+            let once = mask_body(s);
+            assert_eq!(mask_body(&once), once, "{s}");
+        }
+        // 已经打过的码原样留着，别的照打
+        assert_eq!(
+            mask_body("sk-an…wxyz 和 sk-ant-api03-abcdefghijklmnop"),
+            "sk-an…wxyz 和 sk-an…mnop"
+        );
+    }
+
+    /// 改成按字节走之后，打出来的和原来按字符走的一样（多字节的字夹在中间也一样）
+    #[test]
+    fn multibyte_text_around_a_key_is_copied_through_untouched() {
+        assert_eq!(
+            mask_body("前面的中文sk-ant-api03-abcdefghijklmnop后面也是中文"),
+            "前面的中文sk-an…mnop后面也是中文"
+        );
+        assert_eq!(mask_body("密钥：🔑sk-ant-x"), "密钥：🔑………");
     }
 
     #[test]

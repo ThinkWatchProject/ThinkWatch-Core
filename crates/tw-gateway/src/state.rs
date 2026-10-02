@@ -145,7 +145,7 @@ pub struct AppState {
     /// **有界通道，满了就丢。**直接调用意味着文件 I/O 跑在转发那条路上
     /// —— 一次慢磁盘写就变成一次慢请求，而观测永远不该有这个权力。
     /// `None` 表示观测层没起来，那时什么都不做。
-    body_sink: Arc<std::sync::Mutex<Option<crate::bodies::BodySender>>>,
+    body_sink: Arc<std::sync::Mutex<Option<crate::bodies::BodySink>>>,
     /// 每个上游最近一次报的订阅额度。
     ///
     /// **在内存里，不落库。**它是「现在还剩多少」，不是历史 —— 存一份
@@ -308,9 +308,9 @@ impl AppState {
         &self.relisten
     }
 
-    /// 接上 body 的去处。**观测层起来之后才调** —— 在那之前 body 一律
-    /// 丢掉，而请求照常。
-    pub fn set_body_sink(&self, tx: crate::bodies::BodySender) {
+    /// 接上 body 的去处（[`crate::bodies::channel`] 的发的那一头）。**观测层起来之后才调**
+    /// —— 在那之前 body 一律丢掉，而请求照常。
+    pub fn set_body_sink(&self, tx: crate::bodies::BodySink) {
         if let Ok(mut g) = self.body_sink.lock() {
             *g = Some(tx);
         }
@@ -364,7 +364,7 @@ impl AppState {
         }
     }
 
-    pub(crate) fn body_sink(&self) -> Option<crate::bodies::BodySender> {
+    pub(crate) fn body_sink(&self) -> Option<crate::bodies::BodySink> {
         self.body_sink.lock().ok().and_then(|g| g.clone())
     }
 
