@@ -61,9 +61,7 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::RequestRouted { .. }
         | E::Translated { .. }
         | E::SecretsFound { .. }
-        | E::HiddenTextFound { .. }
         | E::ContentMatched { .. }
-        | E::OutputLimited { .. }
         | E::ToolCallFlagged { .. } => true,
         // 开始和三种结局由 `track_at` 自己管
         E::RequestStarted { .. }

@@ -40,25 +40,14 @@ pub enum RuleAction {
     Record,
 }
 
-impl RuleAction {
-    pub const ALL: [RuleAction; 4] = [
-        RuleAction::Cut,
-        RuleAction::Block,
-        RuleAction::Strip,
-        RuleAction::Record,
-    ];
+words!(RuleAction {
+    Cut = "cut",
+    Block = "block",
+    Strip = "strip",
+    Record = "record",
+});
 
-    pub fn slug(self) -> &'static str {
-        match self {
-            RuleAction::Cut => "cut",
-            RuleAction::Block => "block",
-            RuleAction::Strip => "strip",
-            RuleAction::Record => "record",
-        }
-    }
-    pub fn from_slug(s: &str) -> Option<Self> {
-        RuleAction::ALL.into_iter().find(|a| a.slug() == s)
-    }
+impl RuleAction {
     /// 工具调用审查认的那两个
     pub fn tool(self) -> Option<ToolAction> {
         ToolAction::from_slug(self.slug())
@@ -840,7 +829,7 @@ mod tests {
         // 读得回来
         let back: SecurityDetail = serde_json::from_value(v).unwrap();
         assert_eq!(back, detail(&Security::default()));
-        for a in RuleAction::ALL {
+        for &a in RuleAction::ALL {
             assert_eq!(RuleAction::from_slug(a.slug()), Some(a));
             assert_eq!(serde_json::to_value(a).unwrap(), a.slug());
         }

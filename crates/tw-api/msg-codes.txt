@@ -61,7 +61,6 @@ config.empty_models_only
 config.failover_range
 config.name_collision
 config.no_clients
-config.output_limit_range
 config.rejected
 config.rejected_at
 config.remote_port_is_gateway
@@ -69,6 +68,8 @@ config.remote_port_zero
 config.reserved_name
 config.rotate.no_provider
 config.rotate.read_back_differs
+config.rule_codepoints_bad
+config.rule_label_bad
 config.rule_name_empty
 config.rule_name_taken
 config.rule_pattern_bad
@@ -223,13 +224,13 @@ gw.config.proxy_undefined
 gw.config.proxy_unusable
 gw.config.security_rules passthrough
 gw.content.refused
+gw.content.refused_invisible_message
+gw.content.refused_invisible_tool_result
 gw.convert.failed
 gw.convert.tool_unsendable
 gw.convert.tools_unsendable
 gw.count_tokens.bedrock_upstream
 gw.files.unsupported
-gw.hidden_text.refused_message
-gw.hidden_text.refused_tool_result
 gw.internal
 gw.listen.addr_unavailable
 gw.listen.bind_failed
@@ -258,8 +259,6 @@ gw.oauth.rotation_no_manager
 gw.oauth.rotation_queue_full
 gw.oauth.status
 gw.oauth.unreachable
-gw.output_limit.cut
-gw.output_limit.withheld
 gw.probe.aws_token_expired
 gw.probe.bedrock_list_denied
 gw.probe.connect
@@ -366,17 +365,16 @@ pricing.sheet.empty_model
 pricing.sheet.empty_name
 pricing.sheet.half_long_context
 pricing.sheet.padded_name
+security.bad_codepoints
 security.bad_content_pattern
+security.bad_label
 security.bad_pattern
-security.guard_unknown
-security.limit_range
+security.content_action_unknown
 security.no_action_of_its_own
-security.no_custom_rules
-security.no_limit
-security.nothing_to_test
+security.pattern_empty
 security.rule_name_empty
 security.unknown_action
-security.unknown_content_action
+security.unknown_guard
 security.unknown_rule
 t.auth test
 t.broke test

@@ -318,30 +318,20 @@ fn content(p: &ContentPolicy, req: &TrialRequest) -> Result<TrialResult, TrialEr
         .iter()
         .map(|(h, _, range)| {
             let hit = &e.hits[*h];
-            let points = rules
-                .rules
-                .iter()
-                .find(|r| r.id == hit.rule && r.custom == hit.custom)
-                .and_then(content::Rule::codepoints);
             TrialHit {
                 rule: hit.rule.clone(),
                 custom: hit.custom,
                 start: utf16_at(sample, range.start),
                 end: utf16_at(sample, range.end),
-                excerpt: match points {
-                    Some(_) => visible_run(&sample[range.clone()]),
-                    None => sample[range.clone()]
+                excerpt: if hit.matching == content::Match::Codepoints {
+                    visible_run(&sample[range.clone()])
+                } else {
+                    sample[range.clone()]
                         .chars()
                         .take(content::SNIPPET_MAX)
-                        .collect(),
+                        .collect()
                 },
-                action: Some(match hit.action {
-                    content::Action::Block => RuleAction::Block,
-                    content::Action::Strip => RuleAction::Strip,
-                    content::Action::Record | content::Action::Warn | content::Action::Log => {
-                        RuleAction::Record
-                    }
-                }),
+                action: Some(ContentAction::of(hit.action).into()),
             }
         })
         .collect();

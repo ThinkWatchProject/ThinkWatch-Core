@@ -74,26 +74,19 @@ pub enum Mode {
     Enforce,
 }
 
-impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Off, Mode::Observe, Mode::Enforce];
+words!(Mode {
+    Off = "off",
+    Observe = "observe",
+    Enforce = "enforce",
+});
 
+impl Mode {
     pub fn detects(&self) -> bool {
         !matches!(self, Mode::Off)
     }
     /// 会不会改变请求的去向或内容。**观察档永远是 false。**
     pub fn acts(&self) -> bool {
         matches!(self, Mode::Enforce)
-    }
-    /// 配置里写的那个词
-    pub fn slug(&self) -> &'static str {
-        match self {
-            Mode::Off => "off",
-            Mode::Observe => "observe",
-            Mode::Enforce => "enforce",
-        }
-    }
-    pub fn from_slug(s: &str) -> Option<Self> {
-        Mode::ALL.into_iter().find(|m| m.slug() == s)
     }
 }
 
@@ -112,19 +105,13 @@ pub enum Guard {
     Content,
 }
 
-impl Guard {
-    pub const ALL: [Guard; 3] = [Guard::Redact, Guard::InspectTools, Guard::Content];
+words!(Guard {
+    Redact = "redact",
+    InspectTools = "inspect_tools",
+    Content = "content",
+});
 
-    pub fn slug(self) -> &'static str {
-        match self {
-            Guard::Redact => "redact",
-            Guard::InspectTools => "inspect_tools",
-            Guard::Content => "content",
-        }
-    }
-    pub fn from_slug(s: &str) -> Option<Self> {
-        Guard::ALL.into_iter().find(|g| g.slug() == s)
-    }
+impl Guard {
     /// 错误信息里怎么称呼这一项的规则：`redaction` / `tool-call` / `content`
     pub fn rule_noun(self) -> &'static str {
         match self {
@@ -132,12 +119,6 @@ impl Guard {
             Guard::InspectTools => "tool-call",
             Guard::Content => "content",
         }
-    }
-}
-
-impl std::fmt::Display for Guard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.slug())
     }
 }
 
@@ -153,18 +134,12 @@ pub enum ToolAction {
     Record,
 }
 
+words!(ToolAction {
+    Cut = "cut",
+    Record = "record",
+});
+
 impl ToolAction {
-    pub fn slug(&self) -> &'static str {
-        match self {
-            ToolAction::Cut => "cut",
-            ToolAction::Record => "record",
-        }
-    }
-    pub fn from_slug(s: &str) -> Option<Self> {
-        [ToolAction::Cut, ToolAction::Record]
-            .into_iter()
-            .find(|a| a.slug() == s)
-    }
     /// 一条内置规则出厂时在「切断」档下做什么：能一步拿到执行权或者拿走凭据的切断
     pub fn factory(spec: &tool_rules::RuleSpec) -> Self {
         if spec.high() {
@@ -188,32 +163,23 @@ pub enum ContentAction {
     Record,
 }
 
+words!(ContentAction {
+    Block = "block",
+    Strip = "strip",
+    Record = "record",
+});
+
 impl ContentAction {
-    pub fn slug(&self) -> &'static str {
-        match self {
-            ContentAction::Block => "block",
-            ContentAction::Strip => "strip",
-            ContentAction::Record => "record",
-        }
-    }
-    pub fn from_slug(s: &str) -> Option<Self> {
-        [
-            ContentAction::Block,
-            ContentAction::Strip,
-            ContentAction::Record,
-        ]
-        .into_iter()
-        .find(|a| a.slug() == s)
-    }
-    /// 一条内置规则出厂时的处置。出厂文件里写 `warn` / `log` 的（`record` 以前的名字）
-    /// 是仅记录
+    /// 一条内置规则出厂时的处置
     pub fn factory(b: &content::Builtin) -> Self {
-        match b.action {
+        Self::of(b.action)
+    }
+    /// 引擎里的那个处置在策略里的写法
+    pub fn of(a: content::Action) -> Self {
+        match a {
             content::Action::Block => ContentAction::Block,
             content::Action::Strip => ContentAction::Strip,
-            content::Action::Record | content::Action::Warn | content::Action::Log => {
-                ContentAction::Record
-            }
+            content::Action::Record => ContentAction::Record,
         }
     }
     /// 引擎里的那个处置
@@ -240,13 +206,13 @@ pub enum ContentMatch {
     Codepoints,
 }
 
+words!(ContentMatch {
+    Contains = "contains",
+    Regex = "regex",
+    Codepoints = "codepoints",
+});
+
 impl ContentMatch {
-    pub fn slug(&self) -> &'static str {
-        self.engine().slug()
-    }
-    pub fn from_slug(s: &str) -> Option<Self> {
-        Some(Self::of(content::Match::from_slug(s)?))
-    }
     pub fn engine(self) -> content::Match {
         match self {
             ContentMatch::Contains => content::Match::Contains,
@@ -858,12 +824,12 @@ content:
 
     #[test]
     fn slugs_round_trip() {
-        for m in Mode::ALL {
+        for &m in Mode::ALL {
             assert_eq!(Mode::from_slug(m.slug()), Some(m));
             let back: Mode = serde_json::from_value(m.slug().into()).unwrap();
             assert_eq!(back, m);
         }
-        for g in Guard::ALL {
+        for &g in Guard::ALL {
             assert_eq!(Guard::from_slug(g.slug()), Some(g));
             assert_eq!(serde_json::to_value(g).unwrap(), g.slug());
         }
@@ -1094,9 +1060,7 @@ content:
         assert_eq!(action("码位"), Some(Action::Strip));
         assert_eq!(action("停用的"), None);
         assert!(p.one_builtin("act-as").is_some(), "关着的也能单独试");
-        // 出厂写的 warn / log 是仅记录
         let b = content::builtin("act-as").unwrap();
-        assert_eq!(b.action, content::Action::Warn);
         assert_eq!(ContentAction::factory(b), ContentAction::Record);
     }
 

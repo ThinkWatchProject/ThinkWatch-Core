@@ -84,7 +84,7 @@ const RULE_DISABLED: T2 = t(
 );
 
 /// 手册里要有的内置规则清单，`<!-- generated: rules … -->`。
-pub const RULE_LISTS: &[&str] = &["redact", "inspect_tools", "hidden_text", "content"];
+pub const RULE_LISTS: &[&str] = &["redact", "inspect_tools", "content"];
 
 pub fn sections() -> Vec<Section> {
     vec![
@@ -161,8 +161,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security"),
                     Def::Section,
                     t(
-                        "The five guards. All of them start in `observe` or `off`, so out of the box nothing is changed or blocked.",
-                        "五项防护。出厂时都处在 `observe` 或 `off`，不改变、不拦截任何请求。",
+                        "The three guards. All of them start in `observe`, so out of the box nothing is changed or refused.",
+                        "三项防护。出厂时都处在 `observe`，不改变、不拒绝任何请求。",
                     ),
                 ),
                 row(
@@ -916,8 +916,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Obj("security.redact"),
                     Def::Section,
                     t(
-                        "Outbound redaction: credentials, Chinese resident ID numbers and bank card numbers found in a request are replaced before it leaves.",
-                        "出站脱敏：请求发出前，把其中的凭据、身份证号和银行卡号替换掉。",
+                        "Outbound redaction: credentials and personal information anywhere in a request are replaced before it leaves.",
+                        "出站脱敏：请求发出前，把其中任何位置的凭据和个人信息替换掉。",
                     ),
                 ),
                 row(
@@ -930,30 +930,12 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
-                    "hidden_text",
-                    Kind::Obj("security.hidden_text"),
-                    Def::Section,
-                    t(
-                        "Hidden characters that people cannot see and models can read refuse the request.",
-                        "人看不见、模型读得到的隐藏字符，出现时拒绝请求。",
-                    ),
-                ),
-                row(
                     "content",
                     Kind::Obj("security.content"),
                     Def::Section,
                     t(
-                        "Content filter: words or patterns in what the caller sends refuse the request.",
-                        "内容过滤：调用方发送的内容中出现指定的词或写法时拒绝请求。",
-                    ),
-                ),
-                row(
-                    "output_limit",
-                    Kind::Obj("security.output_limit"),
-                    Def::Section,
-                    t(
-                        "Output length: a response longer than the limit is cut off.",
-                        "输出长度：回答超过上限时切断。",
+                        "Content filter: words, patterns or characters (hidden ones among them) in what the caller sends; each rule refuses the request, deletes what it matched, or only records it.",
+                        "内容过滤：调用方发送的内容中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除命中的内容或只记录。",
                     ),
                 ),
             ],
@@ -970,8 +952,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Objs("security.redact.custom[]"),
                     Def::Is("[]"),
                     t(
-                        "Rules of your own: whatever a pattern matches is treated as a credential.",
-                        "自定义规则：正则匹配到的内容按凭据处理。",
+                        "Rules of your own: whatever a pattern matches is replaced like a credential.",
+                        "自定义规则：正则匹配到的内容和凭据一样替换。",
                     ),
                 ),
             ],
@@ -986,6 +968,15 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t("Regular expression.", "正则表达式。"),
+                ),
+                row(
+                    "label",
+                    Kind::Str,
+                    Def::Is("SECRET"),
+                    t(
+                        "Placeholder name: what the pattern matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters.",
+                        "占位符名称：正则匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。",
+                    ),
                 ),
                 row("disabled", Kind::Bool, Def::Is("false"), RULE_DISABLED),
             ],
@@ -1041,22 +1032,6 @@ pub fn sections() -> Vec<Section> {
             ],
         },
         Section {
-            path: "security.hidden_text",
-            ty: checked!(HiddenPolicy, "{}"),
-            rows: vec![
-                row("mode", Kind::Enum(modes), Def::Is("observe"), MODE_DOC),
-                row(
-                    "disable",
-                    Kind::Strs,
-                    Def::Is("[]"),
-                    t(
-                        "Kinds not to look for: `tag`, `bidi`.",
-                        "不检查的种类：`tag`、`bidi`。",
-                    ),
-                ),
-            ],
-        },
-        Section {
             path: "security.content",
             ty: checked!(ContentPolicy, "{}"),
             rows: vec![
@@ -1090,8 +1065,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "A keyword, or a regular expression with `match: regex`. Case-insensitive either way.",
-                        "关键词；`match: regex` 时为正则表达式。均不区分大小写。",
+                        "A keyword; a regular expression with `match: regex`; code points with `match: codepoints` (`U+200B, U+E0000–U+E007F`). Keywords and regular expressions are case-insensitive.",
+                        "关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。关键词和正则不区分大小写。",
                     ),
                 ),
                 row(
@@ -1099,8 +1074,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(content_matches),
                     Def::Is("contains"),
                     t(
-                        "`contains`: the text contains `pattern`. `regex`: `pattern` is a regular expression.",
-                        "`contains`：正文包含 `pattern`。`regex`：`pattern` 是正则表达式。",
+                        "`contains`: the text contains `pattern`. `regex`: `pattern` is a regular expression. `codepoints`: the text has a character among the code points or ranges listed in `pattern`, separated by commas.",
+                        "`contains`：正文包含 `pattern`。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔。",
                     ),
                 ),
                 row(
@@ -1108,35 +1083,11 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(content_actions),
                     Def::Is("record"),
                     t(
-                        "Under `enforce`: `block` the request, or only `record` the match.",
-                        "`enforce` 下拒绝请求（`block`），或只记录（`record`）。",
+                        "Under `enforce`: `block` the request, `strip` what matched and send the rest, or only `record` the match.",
+                        "`enforce` 下拒绝请求（`block`）、删除命中的内容后发出（`strip`），或只记录（`record`）。",
                     ),
                 ),
                 row("disabled", Kind::Bool, Def::Is("false"), RULE_DISABLED),
-            ],
-        },
-        Section {
-            path: "security.output_limit",
-            ty: checked!(OutputLimitPolicy, "{}"),
-            rows: vec![
-                row(
-                    "mode",
-                    Kind::Enum(modes),
-                    Def::Is("off"),
-                    t(
-                        "Off out of the box: no single limit suits every use. `observe` records long responses; `enforce` stops the stream at the limit.",
-                        "出厂关闭：没有一个上限适合所有用途。`observe` 记录超长的回答；`enforce` 在超过上限处停止输出。",
-                    ),
-                ),
-                row(
-                    "max_chars",
-                    Kind::Int,
-                    Def::Is("100000"),
-                    t(
-                        "Limit in characters (Unicode scalar values), from 1 to 1000000.",
-                        "上限，按字符（Unicode 标量）计，取值 1 到 1000000。",
-                    ),
-                ),
             ],
         },
         // ── retention ─────────────────────────────────────────
@@ -1518,7 +1469,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             } else {
                 "| id | Name | Out of the box |\n|---|---|---|\n"
             };
-            for b in tw_config::security_interim::redact_builtins() {
+            for b in tw_guard::redact::rules::BUILTINS {
                 let on = if b.on_by_default { yes } else { no };
                 out += &format!("| `{}` | {} | {on} |\n", b.id, b.name);
             }
@@ -1540,33 +1491,10 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             } else {
                 "| id | Name | Group | Out of the box | Under `enforce`, out of the box |\n|---|---|---|---|---|\n"
             };
-            for b in tw_config::security_interim::content_builtins() {
+            for b in tw_guard::content::builtins() {
                 let on = if b.on_by_default { yes } else { no };
                 let a = ContentAction::factory(b).slug();
                 out += &format!("| `{}` | {} | {} | {on} | `{a}` |\n", b.id, b.name, b.group);
-            }
-        }
-        "hidden_text" => {
-            out += if zh {
-                "| 种类 | 说明 |\n|---|---|\n"
-            } else {
-                "| Kind | What it is |\n|---|---|\n"
-            };
-            for k in tw_guard::hidden::SMUGGLING {
-                let what = match (k.slug(), zh) {
-                    ("tag", false) => {
-                        "Unicode tag characters (U+E0000 to U+E007F): invisible everywhere, read by the model, able to carry a whole instruction."
-                    }
-                    ("tag", true) => {
-                        "Unicode 标签字符（U+E0000 至 U+E007F）：在任何地方都不可见，模型却能读到，足以藏下一整段指令。"
-                    }
-                    ("bidi", false) => {
-                        "Bidirectional control characters: make the order shown differ from the order the model reads."
-                    }
-                    ("bidi", true) => "双向控制符：使显示顺序与模型读到的顺序不一致。",
-                    (other, _) => panic!("hidden kind `{other}` has no description in the manual"),
-                };
-                out += &format!("| `{}` | {what} |\n", k.slug());
             }
         }
         _ => return None,

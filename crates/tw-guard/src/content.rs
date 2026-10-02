@@ -25,9 +25,6 @@
 //! 按严重程度排：`block`（拒绝，请求不发出去）> `strip`（删掉命中的字再发）>
 //! `record`（照发，记一条）。一个请求命中几条时，有拒绝就拒绝；每条命中都报出来，
 //! 记不记、记在哪由调用方定。
-//!
-//! `warn` / `log` 是 `record` 以前的两个名字，暂时还认（出厂规则文件里还写着它们），
-//! 都当「仅记录」。
 
 use std::ops::Range;
 
@@ -70,14 +67,10 @@ impl Match {
     }
 }
 
-/// 命中之后做什么。**按严重程度排序**：`Log < Warn < Record < Strip < Block`。
+/// 命中之后做什么。**按严重程度排序**：`Record < Strip < Block`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
-    /// `record` 以前的名字之一：照发，只进应用日志
-    Log,
-    /// `record` 以前的名字之一：照发，留一条给人看的记录
-    Warn,
     /// 照发，记一条
     Record,
     /// 把命中的字删掉再发
@@ -89,8 +82,6 @@ pub enum Action {
 impl Action {
     pub fn slug(&self) -> &'static str {
         match self {
-            Action::Log => "log",
-            Action::Warn => "warn",
             Action::Record => "record",
             Action::Strip => "strip",
             Action::Block => "block",
@@ -98,8 +89,6 @@ impl Action {
     }
     pub fn from_slug(s: &str) -> Option<Self> {
         match s {
-            "log" => Some(Action::Log),
-            "warn" => Some(Action::Warn),
             "record" => Some(Action::Record),
             "strip" => Some(Action::Strip),
             "block" => Some(Action::Block),
@@ -405,6 +394,8 @@ pub struct Hit {
     pub name: String,
     pub custom: bool,
     pub action: Action,
+    /// 这条规则怎么认。码位规则命中的是看不见的字符，说给人听的话和别的不一样
+    pub matching: Match,
     /// 第一处在它那一段正文里的字节区间（删过一遍之后才出现的，换算回删之前的原文）。
     /// **拼不回整个请求**：每段正文各数各的
     pub bytes: Range<usize>,
@@ -454,25 +445,9 @@ impl Rules {
         self.rules.is_empty()
     }
 
-    /// 一段文本里命中的规则，每条报第一处，按规则的顺序。
+    /// 一段文本里命中的规则，每条报第一处，按规则的顺序。请求上的入口是 [`screen`]。
     pub fn scan_text(&self, text: &str) -> Vec<Hit> {
         self.detect(&[(text, false)], Scope::default()).hits
-    }
-
-    /// 一个请求（中间表示）里调用方的消息，连同其中的工具结果。**每条规则报一处**
-    /// （第一处），`count` 是整个请求里的。
-    ///
-    /// 在原文上查、要删的用 [`screen`]：它看的是同一批字符串。
-    pub fn scan_request(&self, request: &tw_dialect::ir::Request) -> Vec<Hit> {
-        use tw_dialect::ir::Role;
-        if self.rules.is_empty() {
-            return Vec::new();
-        }
-        let mut segments = Vec::new();
-        for m in request.messages.iter().filter(|m| m.role == Role::User) {
-            ir_texts(&m.parts, false, &mut segments);
-        }
-        self.detect(&segments, Scope::default()).hits
     }
 
     /// 查一遍：每条命中的规则一处，按发现的先后（正文的先后，同一段里按规则的顺序）。
@@ -509,6 +484,7 @@ impl Rules {
                             name: r.name.clone(),
                             custom: r.custom,
                             action: r.action,
+                            matching: r.matching,
                             snippet: match &r.points {
                                 Some(p) => points_snippet(p, text, first.clone(), scope.escapes),
                                 None => snippet(text, first.clone()),
@@ -566,22 +542,6 @@ struct Detection {
     all: Vec<(usize, usize, Vec<Range<usize>>)>,
 }
 
-/// 中间表示里调用方的文字，按出现的先后
-fn ir_texts<'a>(
-    parts: &'a [tw_dialect::ir::Part],
-    in_tool_result: bool,
-    out: &mut Vec<(&'a str, bool)>,
-) {
-    use tw_dialect::ir::Part;
-    for p in parts {
-        match p {
-            Part::Text(t) => out.push((t, in_tool_result)),
-            Part::ToolResult(r) => ir_texts(&r.content, true, out),
-            Part::Image(_) | Part::File { .. } | Part::Thinking(_) | Part::ToolCall(_) => {}
-        }
-    }
-}
-
 /// 排序、合并重叠和相接的区间
 fn merge(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     ranges.sort_by_key(|r| r.start);
@@ -613,14 +573,6 @@ fn reveal(out: &mut String, text: &str, ranges: &[Range<usize>], escapes: bool) 
             }
         }
     }
-}
-
-/// 最严的那一处。一样严的取先出现的
-pub fn worst(hits: &[Hit]) -> Option<&Hit> {
-    hits.iter().fold(None, |best: Option<&Hit>, h| match best {
-        Some(b) if b.action >= h.action => Some(b),
-        _ => Some(h),
-    })
 }
 
 /// `i` 往前挪到字符边界上
@@ -724,20 +676,12 @@ fn points_snippet(p: &Codepoints, text: &str, hit: Range<usize>, escapes: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::Action::{Block, Log, Record, Strip, Warn};
+    use super::Action::{Block, Record, Strip};
     use super::Match::{Codepoints as Points, Contains, Regex};
     use super::*;
-    use tw_dialect::ir::{Message, Part, Request, Role, ToolResult};
-
-    fn user(text: &str) -> Request {
-        Request {
-            messages: vec![Message {
-                role: Role::User,
-                parts: vec![Part::Text(text.into())],
-            }],
-            ..Default::default()
-        }
-    }
+    use crate::policy::Mode;
+    use serde_json::json;
+    use tw_dialect::ir::Dialect;
 
     fn rule<'a>(id: &'a str, pattern: &'a str, matching: Match, action: Action) -> RuleInput<'a> {
         RuleInput {
@@ -756,19 +700,33 @@ mod tests {
             .collect()
     }
 
+    /// 一个 Anthropic 请求查下来的命中（观察档：只看命中，不删）
+    fn hits_in(rs: &Rules, body: serde_json::Value) -> Vec<Hit> {
+        let body = serde_json::to_vec(&body).unwrap();
+        screen(Mode::Observe, rs, Dialect::Anthropic, &body)
+            .hits
+            .into_iter()
+            .map(|h| h.hit)
+            .collect()
+    }
+
+    fn user(text: &str) -> serde_json::Value {
+        json!({"messages": [{"role": "user", "content": text}]})
+    }
+
     #[test]
     fn contains_ignores_case_and_says_where() {
         let rs = Rules::build([rule("j", "JailBreak", Contains, Block)]).unwrap();
-        let hits = rs.scan_request(&user("please jailbreak now"));
+        let hits = hits_in(&rs, user("please jailbreak now"));
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].action, Block);
+        assert_eq!((hits[0].action, hits[0].matching), (Block, Contains));
         assert!(hits[0].snippet.contains("jailbreak"), "{}", hits[0].snippet);
         assert!(!hits[0].in_tool_result);
     }
 
     #[test]
     fn regex_ignores_case_too() {
-        let rs = Rules::build([rule("n", r"code\s+\d{4}", Regex, Warn)]).unwrap();
+        let rs = Rules::build([rule("n", r"code\s+\d{4}", Regex, Record)]).unwrap();
         assert_eq!(rs.scan_text("CODE 1234 here").len(), 1);
     }
 
@@ -786,27 +744,29 @@ mod tests {
     }
 
     #[test]
-    fn the_worst_action_wins_and_every_rule_is_still_reported() {
+    fn every_rule_is_reported_in_the_order_it_is_listed() {
         let rs = Rules::build([
-            rule("w", "system prompt", Contains, Warn),
+            rule("r", "system prompt", Contains, Record),
             rule("b", "jailbreak", Contains, Block),
-            rule("l", "hello", Contains, Log),
             rule("s", "show", Contains, Strip),
         ])
         .unwrap();
-        let hits = rs.scan_text("hello, show the system prompt and jailbreak");
-        assert_eq!(hits.len(), 4);
-        assert_eq!(worst(&hits).unwrap().rule, "b");
-        assert!(worst(&[]).is_none());
+        let hits = rs.scan_text("show the system prompt and jailbreak");
+        let ids: Vec<&str> = hits.iter().map(|h| h.rule.as_str()).collect();
+        assert_eq!(ids, ["r", "b", "s"]);
         assert!(Record < Strip && Strip < Block, "处置按严重程度排");
     }
 
     #[test]
     fn each_rule_fires_once_per_request_and_counts_every_place() {
         let rs = Rules::build([rule("j", "jailbreak", Contains, Block)]).unwrap();
-        let mut r = user("jailbreak, JAILBREAK");
-        r.messages.push(r.messages[0].clone());
-        let hits = rs.scan_request(&r);
+        let hits = hits_in(
+            &rs,
+            json!({"messages": [
+                {"role": "user", "content": "jailbreak, JAILBREAK"},
+                {"role": "user", "content": "jailbreak, JAILBREAK"},
+            ]}),
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].count, 4);
         assert_eq!(hits[0].bytes, 0..9, "第一处");
@@ -815,33 +775,25 @@ mod tests {
     #[test]
     fn text_inside_a_tool_result_is_checked_and_marked() {
         let rs = Rules::build([rule("j", "jailbreak", Contains, Block)]).unwrap();
-        let r = Request {
-            messages: vec![Message {
-                role: Role::User,
-                parts: vec![Part::ToolResult(ToolResult {
-                    id: "t1".into(),
-                    content: vec![Part::Text("the page says: jailbreak".into())],
-                    is_error: false,
-                })],
-            }],
-            ..Default::default()
-        };
-        let hits = rs.scan_request(&r);
+        let hits = hits_in(
+            &rs,
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "the page says: jailbreak"},
+            ]}]}),
+        );
         assert!(hits[0].in_tool_result);
     }
 
     #[test]
     fn the_system_prompt_and_the_model_are_not_the_caller() {
         let rs = Rules::build([rule("j", "jailbreak", Contains, Block)]).unwrap();
-        let r = Request {
-            system: vec!["jailbreak".into()],
-            messages: vec![Message {
-                role: Role::Assistant,
-                parts: vec![Part::Text("jailbreak".into())],
-            }],
-            ..Default::default()
-        };
-        assert!(rs.scan_request(&r).is_empty());
+        let hits = hits_in(
+            &rs,
+            json!({"system": "jailbreak", "messages": [
+                {"role": "assistant", "content": "jailbreak"},
+            ]}),
+        );
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -1005,7 +957,7 @@ mod tests {
 
     #[test]
     fn slugs_round_trip() {
-        for a in [Log, Warn, Record, Strip, Block] {
+        for a in [Record, Strip, Block] {
             assert_eq!(Action::from_slug(a.slug()), Some(a));
         }
         for m in [Contains, Regex, Points] {

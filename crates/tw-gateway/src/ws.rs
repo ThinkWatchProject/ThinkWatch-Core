@@ -13,10 +13,9 @@
 //!
 //! 所以这里每一帧文本都过同一套：
 //!
-//! - 客户端 → 上游：请求防护（藏匿字符、内容过滤）和出站脱敏，和普通请求同一套
-//!   函数、同一份全局规则 —— 观察档记录，拦截档拒绝或替换；
-//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查和输出长度。输出长度按
-//!   一次回答数，超了只切掉那一次回答（替它发 `response.failed`），连接照常。
+//! - 客户端 → 上游：内容过滤和出站脱敏，和普通请求同一套函数、同一份全局规则 ——
+//!   观察档记录，处置档拒绝、删除或替换；
+//! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
 //!
 //! # 两条明说的边界
 //!
@@ -110,10 +109,8 @@ pub struct Rules {
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
     pub inspect_mode: tw_config::SecurityMode,
     pub tools: Arc<tw_guard::tools::rules::Rules>,
-    /// 藏匿字符和内容过滤
+    /// 内容过滤
     pub screen: crate::guard::Screen,
-    pub limit_mode: tw_config::SecurityMode,
-    pub limit: tw_guard::output::Limit,
 }
 
 /// 一次连接里两个方向各自的状态。
@@ -123,16 +120,6 @@ struct Pipes {
     ledger: tw_guard::redact::replace::Ledger,
     /// 工具调用审查关着的时候没有它
     wall: Option<tw_guard::tools::wall::Wall>,
-    /// 输出长度。**一次回答一个**：Responses 的 WS 上一条连接依次跑好几次回答，
-    /// 每次从 `response.created` 开始，到 `response.completed` / `failed` /
-    /// `incomplete` 结束，一次只有一个在跑。每个 `response.created` 换一个新的
-    meter: Option<tw_guard::output::Meter>,
-    /// 正在跑的那次回答的 id（`response.created` 里的）。切断时的
-    /// `response.failed` 要说是哪一次
-    response: Option<String>,
-    /// 这次回答超了输出长度、已经替它发过 `response.failed`：它剩下的帧（包括上游
-    /// 自己的收尾）一帧都不再发，下一次回答照常
-    dropping: bool,
     rules: Rules,
     provider: String,
     id: u64,
@@ -200,12 +187,6 @@ pub async fn proxy(
             .inspect_mode
             .detects()
             .then(|| tw_guard::tools::wall::Wall::new(rules.tools.clone())),
-        meter: rules
-            .limit_mode
-            .detects()
-            .then(|| tw_guard::output::Meter::sse(rules.limit, tw_dialect::ir::Dialect::Responses)),
-        response: None,
-        dropping: false,
         rules,
         provider: upstream.provider.name,
         id,
@@ -329,8 +310,7 @@ enum End {
     Closed,
     /// 上游那边出错断了，或者写不过去了
     Broke(Msg),
-    /// 被防护切断了：上游返回了高危工具调用、回答超了输出长度，或者客户端发来的
-    /// 一帧被请求防护拒了
+    /// 被防护切断了：上游返回了高危工具调用，或者客户端发来的一帧被内容过滤拒了
     Cut(Msg),
 }
 
@@ -350,17 +330,20 @@ async fn pump(
                 let Some(Ok(m)) = msg else { break End::Closed };
                 let out = match m {
                     Message::Text(t) => {
-                        // 请求防护在脱敏之前：看的是客户端的原话
-                        if let Some(why) = screen_frame(&state, p, t.as_str()) {
-                            let _ = c_tx.send(Message::Text(
-                                format!("[ThinkWatch] {}", why.text).into(),
-                            )).await;
-                            break End::Cut(why);
-                        }
+                        // 内容过滤在脱敏之前：看的是客户端的原话。删过的话，后面用删过的那一帧
+                        let text = match screen_frame(&state, p, t.as_str()) {
+                            Ok(text) => text,
+                            Err(why) => {
+                                let _ = c_tx.send(Message::Text(
+                                    format!("[ThinkWatch] {}", why.text).into(),
+                                )).await;
+                                break End::Cut(why);
+                            }
+                        };
                         let mode = p.rules.redact_mode;
-                        let found = crate::guard::find(mode, &p.rules.redact, t.as_bytes());
+                        let found = crate::guard::find(mode, &p.rules.redact, text.as_bytes());
                         if found.is_empty() {
-                            UpMsg::Text(t.as_str().into())
+                            UpMsg::Text(text.into())
                         } else {
                             state.bus.emit(tw_api::Event::SecretsFound {
                                 id: p.id,
@@ -370,9 +353,11 @@ async fn pump(
                                 at_ms: crate::server::now_ms(),
                             });
                             if mode.acts() {
-                                let r = tw_guard::redact::replace::redact(
-                                    t.as_str(),
-                                    &p.rules.redact,
+                                // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不换
+                                let hits = crate::guard::hits(&text, &p.rules.redact);
+                                let r = tw_guard::redact::replace::apply(
+                                    &text,
+                                    &hits,
                                     std::mem::replace(
                                         &mut p.ledger,
                                         tw_guard::redact::replace::Ledger::new(
@@ -383,7 +368,7 @@ async fn pump(
                                 p.ledger = r.ledger;
                                 UpMsg::Text(r.text.into())
                             } else {
-                                UpMsg::Text(t.as_str().into())
+                                UpMsg::Text(text.into())
                             }
                         }
                     }
@@ -415,26 +400,6 @@ async fn pump(
                 let out = match m {
                     UpMsg::Text(t) => {
                         let restored = tw_guard::redact::replace::restore(t.as_str(), &p.ledger);
-                        // 回答的边界：一次新的回答重新数；被切掉的那次剩下的帧不发
-                        let kind = frame_kind(&restored);
-                        if kind.as_deref() == Some("response.created") {
-                            p.response = response_id(&restored);
-                            p.dropping = false;
-                            if p.rules.limit_mode.detects() {
-                                p.meter = Some(tw_guard::output::Meter::sse(
-                                    p.rules.limit,
-                                    tw_dialect::ir::Dialect::Responses,
-                                ));
-                            }
-                        } else if p.dropping {
-                            if matches!(
-                                kind.as_deref(),
-                                Some("response.completed" | "response.failed" | "response.incomplete")
-                            ) {
-                                p.dropping = false;
-                            }
-                            continue;
-                        }
                         let hits = match p.wall.as_mut() {
                             Some(w) => w.feed(as_sse(&restored).as_bytes()),
                             None => Vec::new(),
@@ -457,7 +422,18 @@ async fn pump(
                                 ));
                             }
                             deadly |= blocked;
-                            state.bus.emit(crate::server::flagged(p.id, &p.provider, h, blocked));
+                            // 命中的那一段是还原过的：报出去之前和留档一样打码
+                            let redaction = crate::bodies::Redaction {
+                                rules: p.rules.redact.clone(),
+                                ledger: p.ledger.clone(),
+                            };
+                            state.bus.emit(crate::server::flagged(
+                                p.id,
+                                &p.provider,
+                                h,
+                                blocked,
+                                &redaction,
+                            ));
                         }
                         if deadly {
                             // **命中那一帧不发。**和 SSE 那条路同一条纪律：
@@ -466,28 +442,6 @@ async fn pump(
                                 "[ThinkWatch] the upstream returned a dangerous tool call; the connection was cut".into(),
                             )).await;
                             break End::Cut(why.expect("set on the same pass that set deadly"));
-                        }
-                        // 输出长度：**超了的那一帧不发**，和 SSE 那条路同一条纪律
-                        if let Some(t) = p.meter.as_mut().and_then(|m| m.feed(as_sse(&restored).as_bytes()))
-                            && let Some(why) = crate::guard::output_limited(
-                                &state.bus,
-                                p.id,
-                                &p.provider,
-                                p.rules.limit_mode,
-                                p.rules.limit.max,
-                                t.seen,
-                                false,
-                            )
-                        {
-                            // **切掉的是这一次回答，不是整条连接**：替它发一个
-                            // `response.failed`，这次回答剩下的帧不再发，客户端
-                            // 可以在同一条连接上接着发下一次请求
-                            let failed = failed_frame(why, p.response.as_deref());
-                            p.dropping = true;
-                            if c_tx.send(Message::Text(failed.into())).await.is_err() {
-                                break End::Closed;
-                            }
-                            continue;
                         }
                         ending.count(restored.len());
                         Message::Text(restored.into())
@@ -516,56 +470,33 @@ async fn pump(
     let _ = u_tx.close().await;
 }
 
-/// 客户端发来的一帧过一遍请求防护。拦截档下该拒的话，返回告诉客户端的那句话。
+/// 客户端发来的一帧过一遍内容过滤：处置档下该拒的话是告诉客户端的那句话，否则是要发
+/// 出去的那一帧（删过的话是删过的样子）。
 ///
 /// Codex 在 WS 上发的是 `{"type":"response.create", …}`，其余字段就是一个 Responses
-/// 请求，**解得开就按消息结构看**，和 HTTP 那条路一样只看调用方的消息；解不开的
-/// 只查藏匿字符（见 [`crate::guard::screen_text`]）。
-fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Option<Msg> {
+/// 请求：**按消息结构看**，和 HTTP 那条路一样只看调用方的消息、删也只删那里（见
+/// [`crate::guard::screen`]）。别的帧只用码位规则查整段原文（见
+/// [`crate::guard::screen_raw`]）。
+fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Result<String, Msg> {
     let s = &p.rules.screen;
-    if !s.hidden_mode.detects() && !s.content_mode.detects() {
-        return None;
+    if !s.mode.detects() {
+        return Ok(text.to_string());
     }
-    let decoded = serde_json::from_str::<serde_json::Value>(text)
+    let request = serde_json::from_str::<serde_json::Value>(text)
         .ok()
-        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"))
-        .and_then(|v| {
-            tw_dialect::convert::decode(tw_dialect::ir::Dialect::Responses, &v, "/responses", None)
-                .ok()
-        });
-    match decoded {
-        Some(d) => crate::guard::screen(&state.bus, p.id, &p.provider, s, &d.request),
-        None => crate::guard::screen_text(&state.bus, p.id, &p.provider, s, text),
-    }
-}
-
-/// 一帧的 `type`：Responses 的事件都带着它（`response.created` …）。不是 JSON 的是 None
-fn frame_kind(frame: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
-    v.get("type")?.as_str().map(str::to_string)
-}
-
-/// `response.created` 里那次回答的 id
-fn response_id(frame: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
-    v.pointer("/response/id")?.as_str().map(str::to_string)
-}
-
-/// 替被切掉的那次回答发的 `response.failed`：和 SSE 那条路同一个形状
-/// （`tw_dialect` 的错误帧），id 换成这次回答的
-fn failed_frame(why: Msg, response: Option<&str>) -> String {
-    let sse = crate::error::GatewayError::denied(why)
-        .in_dialect(tw_dialect::ir::Dialect::Responses)
-        .sse_frame();
-    let Some(mut v) = tw_dialect::frame::parse(sse.as_bytes())
-        .and_then(|f| serde_json::from_str::<serde_json::Value>(&f.data).ok())
-    else {
-        return sse;
+        .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"));
+    let sc = if request {
+        crate::guard::screen(s, tw_dialect::ir::Dialect::Responses, text.as_bytes())
+    } else {
+        crate::guard::screen_raw(s, text)
     };
-    if let Some(id) = response {
-        v["response"]["id"] = serde_json::Value::String(id.to_string());
+    if let Some(why) = crate::guard::report(&state.bus, p.id, &p.provider, &sc) {
+        return Err(why);
     }
-    v.to_string()
+    Ok(match sc.body {
+        Some(b) => String::from_utf8(b.to_vec()).unwrap_or_else(|_| text.to_string()),
+        None => text.to_string(),
+    })
 }
 
 /// 把一帧喂成工具墙认得的样子。

@@ -99,7 +99,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `proxies` | 对象列表，见 [`proxies[]`](#cfg-proxies) | `[]` | 出站代理。在这里声明一次，由 `providers[].proxy` 按名字引用。 |
 | `pricing` | 对象，见 [`pricing`](#cfg-pricing) | — | 默认价目表是否定期刷新，以及自定义价目表。 |
 | `client_probes` | 对象，见 [`client_probes`](#cfg-client_probes) | — | 客户端自行发出的辅助请求（连通性检查、预热、起标题）如何处理。 |
-| `security` | 对象，见 [`security`](#cfg-security) | — | 五项防护。出厂时都处在 `observe` 或 `off`，不改变、不拦截任何请求。 |
+| `security` | 对象，见 [`security`](#cfg-security) | — | 三项防护。出厂时都处在 `observe`，不改变、不拒绝任何请求。 |
 | `retention` | 对象，见 [`retention`](#cfg-retention) | — | 请求日志保留多久。 |
 | `failover` | 对象，见 [`failover`](#cfg-failover) | — | 上游失败后停用多久，以及流式回答的开头最多等多久。 |
 | `groups` | 对象列表，见 [`groups[]`](#cfg-groups) | `[]` | 策略组：多个上游合用一个名字，并规定如何在其中选择。 |
@@ -454,23 +454,21 @@ pricing:
 
 ### `security`
 
-五项防护，对所有上游一视同仁。每一项都有 `mode`：`off`、`observe`（检测并记录，不改变任何行为）、`enforce`（处置）。出厂时除输出长度为 `off` 外，其余都是 `observe`。各项在 `enforce` 下的处置不同，分别见下文。
+三项防护，对所有上游一视同仁。每一项都有 `mode`：`off`、`observe`（检测并记录，不改变任何行为）、`enforce`（处置）。出厂时三项都是 `observe`。各项在 `enforce` 下的处置不同：出站脱敏替换，工具调用审查切断响应，内容过滤按每条规则的处置拒绝、删除或只记录。
 
 <!-- generated: table security -->
 <a id="cfg-security"></a>
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏：请求发出前，把其中的凭据、身份证号和银行卡号替换掉。 |
+| `redact` | 对象，见 [`security.redact`](#cfg-security-redact) | — | 出站脱敏：请求发出前，把其中任何位置的凭据和个人信息替换掉。 |
 | `inspect_tools` | 对象，见 [`security.inspect_tools`](#cfg-security-inspect_tools) | — | 工具调用审查：模型返回的工具调用中出现危险命令时切断响应。 |
-| `hidden_text` | 对象，见 [`security.hidden_text`](#cfg-security-hidden_text) | — | 人看不见、模型读得到的隐藏字符，出现时拒绝请求。 |
-| `content` | 对象，见 [`security.content`](#cfg-security-content) | — | 内容过滤：调用方发送的内容中出现指定的词或写法时拒绝请求。 |
-| `output_limit` | 对象，见 [`security.output_limit`](#cfg-security-output_limit) | — | 输出长度：回答超过上限时切断。 |
+| `content` | 对象，见 [`security.content`](#cfg-security-content) | — | 内容过滤：调用方发送的内容中出现指定的词、写法或字符（包括隐藏字符）时，按规则拒绝请求、删除命中的内容或只记录。 |
 <!-- /generated -->
 
 #### `security.redact`
 
-请求发出前查找其中的凭据，以及居民身份证号和银行卡号。`enforce` 下将其替换为占位符，回答中重复出现时再换回原值。
+请求发出前，在整个请求中（包括系统提示、之前的回答和工具调用）查找凭据和个人信息。`enforce` 下将其替换为占位符，回答中重复出现时再换回原值。图片、文件等 base64 内容不查。
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
@@ -480,7 +478,7 @@ pricing:
 | `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
 | `enable` | 字符串列表 | `[]` | 打开出厂时关着的内置规则，按 id。 |
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
-| `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：正则匹配到的内容按凭据处理。 |
+| `custom` | 对象列表，见 [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | 自定义规则：正则匹配到的内容和凭据一样替换。 |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -490,6 +488,7 @@ pricing:
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和应用里显示的名字，也是规则的标识；同一项防护里不能重名。 |
 | `pattern` | 字符串 | **必填** | 正则表达式。 |
+| `label` | 字符串 | `SECRET` | 占位符名称：正则匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。 |
 | `disabled` | 布尔 | `false` | 停用这条规则，规则本身留在文件里。 |
 <!-- /generated -->
 
@@ -524,16 +523,23 @@ pricing:
 | `conn-string-password` | Connection string password | 开 |
 | `cn-resident-id` | Chinese resident ID number | 开 |
 | `bank-card` | Bank card number | 开 |
+| `email` | Email address | 关 |
+| `cn-mobile-phone` | Chinese mainland mobile number | 关 |
 | `internal-ip` | Internal IP address | 关 |
 | `internal-domain` | Internal domain | 关 |
 <!-- /generated -->
 
-`cn-resident-id` 和 `bank-card` 查找的是个人号码而不是凭据，只认结构上核对得上的：
+`cn-resident-id`、`bank-card`、`email`、`cn-mobile-phone` 查找的是个人信息而不是凭据。前两条出厂开启，只认结构上核对得上的：
 
 - `cn-resident-id`：18 位的中华人民共和国居民身份证号码。前两位须是省级行政区划代码，出生日期须是 1900 年 1 月 1 日至今天之间的真实日期，末位须是正确的校验码（ISO 7064 MOD 11-2）。15 位的旧号码不认。
 - `bank-card`：卡号。开头和位数须属于银联、Visa、Mastercard、American Express、JCB、Discover 或 Diners Club，并通过 Luhn 校验；连续书写，或四位一组、以单个空格或单个连字符分隔均可（American Express 另认 4-6-5，Diners Club 另认 4-6-4）。Stripe、Braintree、Adyen 公开的测试卡号不认。
 
-夹在更长的一串字母或数字中间的号码不认；请求体中以 JSON 数值写出的号码（例如工具调用的参数）也不认，替换它会使请求体不再是合法的 JSON。占位符写明原来是什么（`<<TW_ID_NUMBER_1>>`、`<<TW_CARD_NUMBER_1>>`），安全日志中只显示最后四位。
+`email` 和 `cn-mobile-phone` 出厂关闭：它们没有可核对的结构，代码和文档中形似的内容很多。
+
+- `email`：邮箱地址，域名至少两段、最后一段为两个以上的字母。URL 中的用户名（`https://user@host`）和 `icon@2x.png` 这类文件名不认。
+- `cn-mobile-phone`：中国大陆手机号，11 位数字，以 `1` 开头、第二位为 `3` 至 `9`，前后不紧挨其他数字。
+
+夹在更长的一串字母或数字中间的号码不认；请求体中以 JSON 数值写出的号码（例如工具调用的参数）也不认，替换它会使请求体不再是合法的 JSON。占位符写明原来是什么（`<<TW_ID_NUMBER_1>>`、`<<TW_CARD_NUMBER_1>>`、`<<TW_EMAIL_1>>`、`<<TW_PHONE_1>>`），安全日志中号码只显示最后四位，邮箱只显示第一个字和域名。自定义规则替换为 `<<TW_SECRET_1>>`，写了占位符名称（`label`）时用它。
 
 #### `security.inspect_tools`
 
@@ -581,29 +587,9 @@ pricing:
 | `upload-file-to-host` | Upload a local file to an external host | `record` |
 <!-- /generated -->
 
-#### `security.hidden_text`
-
-调用方发送的内容中（包括工具结果）人看不见、模型读得到的字符。`enforce` 下拒绝请求。
-
-<!-- generated: table security.hidden_text -->
-<a id="cfg-security-hidden_text"></a>
-
-| 字段 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
-| `disable` | 字符串列表 | `[]` | 不检查的种类：`tag`、`bidi`。 |
-<!-- /generated -->
-
-<!-- generated: rules hidden_text -->
-| 种类 | 说明 |
-|---|---|
-| `tag` | Unicode 标签字符（U+E0000 至 U+E007F）：在任何地方都不可见，模型却能读到，足以藏下一整段指令。 |
-| `bidi` | 双向控制符：使显示顺序与模型读到的顺序不一致。 |
-<!-- /generated -->
-
 #### `security.content`
 
-调用方发送的内容中出现的词或写法。`enforce` 下命中处置为 `block` 的规则时拒绝请求。
+调用方发送的内容中（用户消息及其中的工具结果，不含系统提示和模型自己的回答）出现的词、写法或字符。每条规则按关键词（`contains`）、正则（`regex`）或码位（`codepoints`）匹配，并写明 `enforce` 下的处置：`block` 拒绝请求，`strip` 把命中的内容从调用方的正文中全部删除后发出，`record` 只记录。删除之后会再检查一遍：被隐藏字符拆开的关键词，删掉隐藏字符后照样命中。
 
 <!-- generated: table security.content -->
 <a id="cfg-security-content"></a>
@@ -613,7 +599,7 @@ pricing:
 | `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` 不检测；`observe` 检测并记录，不改变任何行为；`enforce` 检测并处置。 |
 | `enable` | 字符串列表 | `[]` | 打开出厂时关着的内置规则，按 id。 |
 | `disable` | 字符串列表 | `[]` | 关掉内置规则，按 id。 |
-| `actions` | 映射： 内置规则 id → `block` \| `record` | `{}` | 内置规则在 `enforce` 下的处置，只写与出厂不同的。 |
+| `actions` | 映射： 内置规则 id → `block` \| `strip` \| `record` | `{}` | 内置规则在 `enforce` 下的处置，只写与出厂不同的。 |
 | `custom` | 对象列表，见 [`security.content.custom[]`](#cfg-security-content-custom) | `[]` | 自定义规则。 |
 <!-- /generated -->
 
@@ -623,9 +609,9 @@ pricing:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和应用里显示的名字，也是规则的标识；同一项防护里不能重名。 |
-| `pattern` | 字符串 | **必填** | 关键词；`match: regex` 时为正则表达式。均不区分大小写。 |
-| `match` | `contains` \| `regex` | `contains` | `contains`：正文包含 `pattern`。`regex`：`pattern` 是正则表达式。 |
-| `action` | `block` \| `record` | `record` | `enforce` 下拒绝请求（`block`），或只记录（`record`）。 |
+| `pattern` | 字符串 | **必填** | 关键词；`match: regex` 时为正则表达式；`match: codepoints` 时为码位（`U+200B, U+E0000–U+E007F`）。关键词和正则不区分大小写。 |
+| `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`：正文包含 `pattern`。`regex`：`pattern` 是正则表达式。`codepoints`：正文中出现 `pattern` 所列码位或码位范围内的字符，多个之间用逗号分隔。 |
+| `action` | `block` \| `strip` \| `record` | `record` | `enforce` 下拒绝请求（`block`）、删除命中的内容后发出（`strip`），或只记录（`record`）。 |
 | `disabled` | 布尔 | `false` | 停用这条规则，规则本身留在文件里。 |
 <!-- /generated -->
 
@@ -634,6 +620,10 @@ pricing:
 <!-- generated: rules content -->
 | id | 名称 | 分组 | 出厂 | `enforce` 下出厂处置 |
 |---|---|---|---|---|
+| `unicode-tags` | Unicode tag characters | invisible | 开 | `strip` |
+| `bidi-controls` | Bidirectional controls | invisible | 开 | `strip` |
+| `zero-width` | Zero-width characters | invisible | 关 | `strip` |
+| `private-use` | Private-use characters | invisible | 关 | `strip` |
 | `ignore-previous-instructions` | Ignore previous instructions | injection | 开 | `block` |
 | `ignore-all-previous` | Ignore all previous | injection | 开 | `block` |
 | `disregard-your-instructions` | Disregard your instructions | injection | 开 | `block` |
@@ -658,16 +648,7 @@ pricing:
 | `zh-jailbreak` | Jailbreak (Chinese) | chinese | 关 | `block` |
 <!-- /generated -->
 
-#### `security.output_limit`
-
-<!-- generated: table security.output_limit -->
-<a id="cfg-security-output_limit"></a>
-
-| 字段 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `off` | 出厂关闭：没有一个上限适合所有用途。`observe` 记录超长的回答；`enforce` 在超过上限处停止输出。 |
-| `max_chars` | 整数 | `100000` | 上限，按字符（Unicode 标量）计，取值 1 到 1000000。 |
-<!-- /generated -->
+`invisible`（隐藏字符）一组匹配人看不见、模型读得到的字符。Unicode 标签字符（U+E0000–U+E007F）和双向控制符（U+202A–U+202E、U+2066–U+2069）出厂开启；零宽字符（U+200B–U+200D、U+2060、U+FEFF）和私用区字符（U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD）出厂关闭，表情符号、波斯文和图标字体也会用到它们。四条在 `enforce` 下都删除命中的字符。
 
 ```yaml
 security:
@@ -677,11 +658,16 @@ security:
     custom:
       - name: employee-id
         pattern: 'EMP-\d{6}'
+        label: EMPLOYEE
   inspect_tools:
     mode: enforce
-  output_limit:
+  content:
     mode: enforce
-    max_chars: 200000
+    enable: [zero-width]
+    custom:
+      - name: project-x
+        pattern: project-x
+        action: strip
 ```
 
 ### `retention`

@@ -1,7 +1,8 @@
 //! 配置里的词和契约里的词：同一组词两边各有一个枚举，靠这里穷尽的 `match`
-//! 对齐。多一个变体，这里编译不过。
+//! 对齐。多一个变体，这里编译不过。安全防护的档位、匹配方式两边是同一个类型
+//! （`tw_guard::policy`），不用对齐。
 
-use crate::{Billing, OnProxyFail, ProbeAction, Protocol, ProxyKind, SecurityMode, Stage};
+use crate::{Billing, OnProxyFail, ProbeAction, Protocol, ProxyKind, Stage};
 
 impl From<Billing> for tw_api::Billing {
     fn from(b: Billing) -> Self {
@@ -83,55 +84,6 @@ impl From<tw_api::OnProxyFail> for OnProxyFail {
         match o {
             tw_api::OnProxyFail::Fail => Self::Fail,
             tw_api::OnProxyFail::Direct => Self::Direct,
-        }
-    }
-}
-
-impl From<SecurityMode> for tw_api::GuardMode {
-    fn from(m: SecurityMode) -> Self {
-        match m {
-            SecurityMode::Off => Self::Off,
-            SecurityMode::Observe => Self::Observe,
-            SecurityMode::Enforce => Self::Enforce,
-        }
-    }
-}
-
-/// 共享层（tw-guard）的档位。两边是同一组词；数据面调 tw-guard 的引擎时要它
-impl From<SecurityMode> for tw_guard::policy::Mode {
-    fn from(m: SecurityMode) -> Self {
-        match m {
-            SecurityMode::Off => Self::Off,
-            SecurityMode::Observe => Self::Observe,
-            SecurityMode::Enforce => Self::Enforce,
-        }
-    }
-}
-
-impl From<tw_api::GuardMode> for SecurityMode {
-    fn from(m: tw_api::GuardMode) -> Self {
-        match m {
-            tw_api::GuardMode::Off => Self::Off,
-            tw_api::GuardMode::Observe => Self::Observe,
-            tw_api::GuardMode::Enforce => Self::Enforce,
-        }
-    }
-}
-
-impl From<crate::ContentMatch> for tw_api::ContentMatch {
-    fn from(m: crate::ContentMatch) -> Self {
-        match m {
-            crate::ContentMatch::Contains => Self::Contains,
-            crate::ContentMatch::Regex => Self::Regex,
-        }
-    }
-}
-
-impl From<tw_api::ContentMatch> for crate::ContentMatch {
-    fn from(m: tw_api::ContentMatch) -> Self {
-        match m {
-            tw_api::ContentMatch::Contains => Self::Contains,
-            tw_api::ContentMatch::Regex => Self::Regex,
         }
     }
 }

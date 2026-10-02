@@ -10,8 +10,7 @@
 # - `match`：`contains`（不分大小写的子串）、`regex`（不分大小写的正则）或
 #   `codepoints`（按字符本身认，写成 `U+200B`、`U+E0000–U+E007F`）。
 #   `contains` 的首尾空格有意义（` dan ` 靠它不误伤 `dance`）；
-# - `action`：出厂的处置，`block`（拒绝）/ `strip`（删除）/ `record`（仅记录）。
-#   `warn` / `log` 是 `record` 以前的两个名字，暂时还认，都当「仅记录」；
+# - `action`：出厂的处置，`block`（拒绝）/ `strip`（删除）/ `record`（仅记录）；
 # - `group`：`invisible`（隐藏字符）/ `injection`（覆盖指令的说法）/ `persona`
 #   （改换身份、套提示词）/ `chinese`（中文的说法）；
 # - `on_by_default`：出厂时开不开。**只开误报极少的那几条** —— 「act as」
@@ -103,43 +102,43 @@
   name: New persona
   pattern: 'new persona'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: act-as
   name: Act as
   pattern: 'act as'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: pretend-to-be
   name: Pretend to be
   pattern: 'pretend to be'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: system-prompt
   name: System prompt extraction
   pattern: 'system prompt'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: reveal-your-instructions
   name: Reveal instructions
   pattern: 'reveal your instructions'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: what-are-your-rules
   name: What are your rules
   pattern: 'what are your rules'
   match: contains
-  action: log
+  action: record
   group: persona
 - id: base64-wall
   name: Base64 smuggling
   pattern: '[A-Za-z0-9+/=]{50,}'
   match: regex
-  action: warn
+  action: record
   group: persona
 
 - id: zh-ignore-previous
@@ -170,19 +169,19 @@
   name: Role-play (Chinese)
   pattern: '扮演'
   match: contains
-  action: warn
+  action: record
   group: chinese
 - id: zh-reveal-your
   name: Reveal your instructions (Chinese)
   pattern: '透露你的'
   match: contains
-  action: warn
+  action: record
   group: chinese
 - id: zh-system-prompt
   name: System prompt (Chinese)
   pattern: '系统提示词'
   match: contains
-  action: warn
+  action: record
   group: chinese
 - id: zh-jailbreak
   name: Jailbreak (Chinese)

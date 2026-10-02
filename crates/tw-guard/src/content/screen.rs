@@ -37,7 +37,9 @@ use crate::policy::Mode;
 const MAX_ROUNDS: usize = 4;
 
 /// 一条命中最后怎么样了。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(rename = "ContentOutcome"))]
+#[serde(rename_all = "lowercase")]
 pub enum Outcome {
     /// 仅记录：请求照常发出
     Recorded,
@@ -47,15 +49,11 @@ pub enum Outcome {
     Blocked,
 }
 
-impl Outcome {
-    pub fn slug(self) -> &'static str {
-        match self {
-            Outcome::Recorded => "recorded",
-            Outcome::Stripped => "stripped",
-            Outcome::Blocked => "blocked",
-        }
-    }
-}
+words!(Outcome {
+    Recorded = "recorded",
+    Stripped = "stripped",
+    Blocked = "blocked",
+});
 
 /// 一条规则的命中，和它最后怎么样了。
 #[derive(Debug, Clone, PartialEq, Eq)]
