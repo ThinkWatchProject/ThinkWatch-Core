@@ -82,8 +82,12 @@ impl Bed {
     }
 }
 
-/// 一张床：配置文件在 `dir`（相对临时目录的一段路径）里
+/// 一张床：配置文件在 `dir`（相对临时目录的一段路径）里，引擎是假的
 fn bed_in(sub: &str) -> Bed {
+    bed_with(sub, true)
+}
+
+fn bed_with(sub: &str, fake: bool) -> Bed {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join(sub);
     std::fs::create_dir_all(&dir).unwrap();
@@ -97,7 +101,9 @@ fn bed_in(sub: &str) -> Bed {
     );
     let store = Arc::new(tokio::sync::Mutex::new(rec));
     let gw = tw_gateway::AppState::new(tw_config::try_parse(BASE).unwrap()).unwrap();
-    gw.set_plugin_engine(Arc::new(FakeEngine));
+    if fake {
+        gw.set_plugin_engine(Arc::new(FakeEngine));
+    }
     let bus = gw.bus.clone();
     let state = ControlState {
         shutdown: Default::default(),
@@ -1078,4 +1084,69 @@ async fn a_plugin_changed_while_core_was_down_starts_out_changed() {
     let _mgr = ConfigManager::new(b.dir.join("config.yaml"), gw.clone(), gw.bus.clone());
     let p = gw.runtime().plugins.get(&id).unwrap().clone();
     assert_eq!(p.broken(), Some(&tw_gateway::plugin::Broken::Changed));
+}
+
+/// 真的沙箱：从源码到装上、文件被改、批准，整条路走一遍（不跑钩子，那是数据面的事）
+#[tokio::test]
+async fn a_real_plugin_goes_through_the_sandbox_from_source_to_approval() {
+    let b = bed_with("real", false);
+    let src = r#"export const manifest = {
+  name: "Add date",
+  api: 1,
+  permissions: ["system"],
+  match: { models: ["claude-*"] },
+  settings: { note: { type: "string", label: "Note", default: "today" } },
+};
+export function onRequest(req, ctx) {
+  return { ...req, system: `${req.system} ${ctx.settings.note}` };
+}
+"#;
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": src})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["error"].is_null(), "{v}");
+    assert_eq!(v["manifest"]["name"], "Add date");
+    assert_eq!(v["manifest"]["scope"]["models"], json!(["claude-*"]));
+
+    let broken = src.replace("return {", "return {{");
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": broken})),
+    )
+    .await;
+    assert!(v["manifest"].is_null(), "{v}");
+    assert!(v["error"]["line"].is_number(), "{v}");
+
+    let id = b
+        .install(
+            src,
+            json!({"scope": {"clients": [], "models": ["claude-*"], "upstreams": []}}),
+        )
+        .await;
+    assert_eq!(id, "add-date");
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+    assert!(b.gw.runtime().plugins.get(&id).unwrap().ready().is_some());
+
+    let edited = src.replace("today", "tomorrow");
+    std::fs::write(b.file(&id), &edited).unwrap();
+    b.gw.reload_plugins();
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "changed"}));
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/approve"),
+        Some(json!({"sha256": sha(&edited)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "ok"}));
+    assert_eq!(v["settings_schema"][0]["default"], "tomorrow");
 }
