@@ -1,0 +1,94 @@
+{
+  "deepseek-flags": {
+    "manifest": {
+      "api": 1,
+      "description": "DeepSeek 接口会拒收含特定地区旗帜表情的请求，含有它们的会话因此无法继续。请求发出前把这些表情换成 ASCII 占位文字，回答里再换回原样。默认对发往 deepseek 开头的模型的请求生效。",
+      "hooks": {
+        "reply_text": true,
+        "reply_text_end": true,
+        "request": true,
+        "tool_call": true
+      },
+      "name": "DeepSeek：替换会被拒收的旗帜表情",
+      "permissions": [
+        "system",
+        "messages",
+        "reply_text",
+        "reply_tool_calls"
+      ],
+      "reply_mode": "stream",
+      "scope": {
+        "clients": [],
+        "models": [
+          "deepseek*"
+        ],
+        "upstreams": []
+      },
+      "settings": []
+    },
+    "sha256": "75012e294a8e019db17c88652bd291fa2f6c03a0f625bd097bac553b153fb450"
+  },
+  "reply-language": {
+    "manifest": {
+      "api": 1,
+      "description": "在系统提示词末尾要求模型用指定的语言回答。",
+      "hooks": {
+        "reply_text": false,
+        "reply_text_end": false,
+        "request": true,
+        "tool_call": false
+      },
+      "name": "指定回答语言",
+      "permissions": [
+        "system"
+      ],
+      "reply_mode": "block",
+      "scope": {
+        "clients": [],
+        "models": [],
+        "upstreams": []
+      },
+      "settings": [
+        {
+          "default": "简体中文",
+          "key": "language",
+          "kind": "string",
+          "label": "回答语言"
+        }
+      ]
+    },
+    "sha256": "930de8249548edea683c7ce04970c592adb6c8d7d50eb1b72c8d5fb0609baede"
+  },
+  "wsl-paths": {
+    "manifest": {
+      "api": 1,
+      "description": "把工具调用参数里的盘符路径统一成客户端那一侧的写法（WSL 的 /mnt/c/… 或 Windows 的 C:\\…），回答和对话历史里的都改。",
+      "hooks": {
+        "reply_text": false,
+        "reply_text_end": false,
+        "request": true,
+        "tool_call": true
+      },
+      "name": "WSL 路径转换",
+      "permissions": [
+        "messages",
+        "reply_tool_calls"
+      ],
+      "reply_mode": "block",
+      "scope": {
+        "clients": [],
+        "models": [],
+        "upstreams": []
+      },
+      "settings": [
+        {
+          "default": false,
+          "key": "windows_client",
+          "kind": "boolean",
+          "label": "客户端运行在 Windows 上（关闭时按 WSL 处理）"
+        }
+      ]
+    },
+    "sha256": "83e1328d38fda8847a84f4a1791aaa84923da5b7dcfdf9b4f87e2b624ccf39e6"
+  }
+}

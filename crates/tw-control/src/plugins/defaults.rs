@@ -24,6 +24,13 @@
 //! 来源记成 `defaults`），**这一次要加、要换的一次写进去**：一版配置、一条历史。配置在
 //! 这中间被别处改了（版本对不上），刚写的文件还原，等那一次换入之后再走一遍。
 //!
+//! # 不起运行时
+//!
+//! 装上的默认插件都停用着，而沙箱一起来就是几 MB 常驻内存：**装它们不编**。范围、设置的
+//! 默认值从它们预先算好的 manifest 里读（[`tw_gateway::plugin::defaults::manifest`]），
+//! 顺手记进显示用的缓存，装上之后它们休眠着，列表照样说得出它们是什么。只有一种情况要
+//! 真的编：换新版的那个默认插件开着 —— 那时运行时本来就起着，新旧两版的权限按编出来的比。
+//!
 //! # 不挡启动、不挡换配置
 //!
 //! 哪一步不成只落在那一个插件上：记一行日志、发一条 `plugin_failed`（同一个问题只说
@@ -66,6 +73,8 @@ struct Shipped {
     source: String,
     /// 源码字节的 SHA-256：给出去的就是这一版
     sha256: String,
+    /// 预先算好的 manifest（随 core 发的才有）。没有就真的编一遍
+    manifest: Option<Manifest>,
 }
 
 /// 一次走下来做了什么。
@@ -117,24 +126,45 @@ struct Change {
 }
 
 impl Seeder {
-    /// 一组 (id, 源码)。**测试拿自己的插件走这一条**，生产用 [`Seeder::shipped`]
+    /// 一组 (id, 源码)，manifest 要真的编出来。**测试拿自己的插件走这一条**，生产用
+    /// [`Seeder::shipped`]
     pub fn new<'a>(shipped: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self::with(shipped.into_iter().map(|(id, source)| (id, source, None)))
+    }
+
+    /// 随 core 发的那几个，带着预先算好的 manifest：**装它们不起运行时**
+    pub fn shipped() -> Self {
+        Self::with(
+            tw_gateway::plugin::defaults::ALL
+                .iter()
+                .map(|(id, source)| (*id, *source, tw_gateway::plugin::defaults::manifest(id))),
+        )
+    }
+
+    fn with<'a>(shipped: impl Iterator<Item = (&'a str, &'a str, Option<Manifest>)>) -> Self {
         Self {
             shipped: shipped
-                .into_iter()
-                .map(|(id, source)| Shipped {
+                .map(|(id, source, manifest)| Shipped {
                     id: id.to_string(),
                     sha256: sha256_hex(source.as_bytes()),
                     source: source.to_string(),
+                    manifest,
                 })
                 .collect(),
             told: Mutex::default(),
         }
     }
 
-    /// 随 core 发的那几个
-    pub fn shipped() -> Self {
-        Self::new(tw_gateway::plugin::defaults::ALL.iter().copied())
+    /// 发出去的那一版的 manifest：预先算好的就拿来用（不编），记进显示用的缓存；没有就
+    /// 真的编一遍（编的时候自己会记）
+    async fn shipped_manifest(&self, mgr: &ConfigManager, s: &Shipped) -> Result<Manifest, Msg> {
+        match &s.manifest {
+            Some(m) => {
+                mgr.gateway().plugins.remember(&s.sha256, m);
+                Ok(m.clone())
+            }
+            None => compile(mgr, s.source.as_bytes(), true).await,
+        }
     }
 
     /// 走一遍（见模块说明）。**不会失败**：没办成的落在那一个插件上，下一次再试。
@@ -180,7 +210,7 @@ impl Seeder {
                     record.offered.insert(s.id.clone(), s.sha256.clone());
                     out.marked.push(s.id.clone());
                 }
-                (None, None) => match compile(mgr, s.source.as_bytes(), true).await {
+                (None, None) => match self.shipped_manifest(mgr, s).await {
                     Ok(m) => {
                         names.insert(s.id.clone(), m.name.clone());
                         plan.push(Change {
@@ -215,8 +245,14 @@ impl Seeder {
                     };
                     let on_disk = bytes.as_deref().map(sha256_hex);
                     if on_disk.as_deref() == Some(o.as_str()) && p.sha256 == o {
-                        // 没动过：换成新版
-                        let new = match compile(mgr, s.source.as_bytes(), true).await {
+                        // 没动过：换成新版。**开着的新旧两版都真的编**，权限按编出来的比（运行时
+                        // 反正起着）；停用着的不编，换上之后照样停用着，用不着比
+                        let new = if p.enabled {
+                            compile(mgr, s.source.as_bytes(), true).await
+                        } else {
+                            self.shipped_manifest(mgr, s).await
+                        };
+                        let new = match new {
                             Ok(m) => m,
                             Err(why) => {
                                 out.failed.push((s.id.clone(), why));
@@ -224,13 +260,17 @@ impl Seeder {
                             }
                         };
                         // 旧版要过哪些权限。读不出来就当新版多要了 —— 宁可停用
-                        let old = match bytes {
-                            Some(b) => compile(mgr, &b, false).await.ok(),
-                            None => None,
+                        let more = if p.enabled {
+                            let old = match bytes {
+                                Some(b) => compile(mgr, &b, false).await.ok(),
+                                None => None,
+                            };
+                            old.as_ref().is_none_or(|old| {
+                                new.permissions.iter().any(|x| !old.permissions.contains(x))
+                            })
+                        } else {
+                            false
                         };
-                        let more = old.as_ref().is_none_or(|old| {
-                            new.permissions.iter().any(|x| !old.permissions.contains(x))
-                        });
                         names.insert(s.id.clone(), new.name.clone());
                         plan.push(Change {
                             at,

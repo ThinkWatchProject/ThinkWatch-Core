@@ -658,21 +658,25 @@ async fn save(
     // **攥着写插件的那把锁**：读到的权限和写下去的配置说的是同一份插件 —— 换源码、
     // 批准也攥着它，落不到两者之间
     let _edit = s.gateway.plugins.edits.lock().await;
-    // 设置对着它此刻的 manifest 查。读不出 manifest（文件变了、底稿也没了）就照交来的
-    // 写：加载时还会再查一遍
-    let (approved, manifest, name) = {
+    let (current, shown) = {
         let rt = s.gateway.runtime();
-        let approved = rt
-            .config
-            .plugins
-            .iter()
-            .find(|p| p.id == id)
-            .map(|p| p.sha256.clone());
-        let a = rt.plugins.get(id);
-        let manifest = a.and_then(|a| a.manifest.clone());
-        let name = a.map_or_else(|| id.to_string(), |a| a.name.clone());
-        (approved, manifest, name)
+        let current = rt.config.plugins.iter().find(|p| p.id == id).cloned();
+        let shown = rt.plugins.get(id).map(|a| a.name.clone());
+        (current, shown)
     };
+    // 打开它、改设置、改范围（照写的比）：要按它的权限判断、按它的设置项核对，就**真的
+    // 编一遍**（停用着的插件这时才起运行时），不认显示用的缓存。只是停用、改出错时怎么办
+    // 的不用编。编不成、读不到批准的那份字节就当读不出权限：网页这条路拒绝
+    let approved = current.as_ref().map(|p| p.sha256.clone());
+    let manifest = match &current {
+        Some(p) if changes_what_it_does(p, &req, None) => compiled_manifest(s, id, &p.sha256).await,
+        _ => None,
+    };
+    let name = manifest
+        .as_ref()
+        .map(|m| m.name.clone())
+        .or(shown)
+        .unwrap_or_else(|| id.to_string());
     let settings = match &manifest {
         Some(m) => settings_for(m, &req.settings)?,
         None => req.settings.clone(),
@@ -709,6 +713,39 @@ async fn save(
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 这个插件**真的编出来**的 manifest。开着的插件手里就有；休眠的（停用着、运行时没起）、
+/// 加载出错的，把批准的那份字节编一遍。**安全上的判断只认它**，不认显示用的缓存。读不到
+/// 批准的那份字节、编不成是 None
+async fn compiled_manifest(s: &ControlState, id: &str, sha256: &str) -> Option<Manifest> {
+    let held = s
+        .gateway
+        .runtime()
+        .plugins
+        .get(id)
+        .and_then(|a| a.ready().cloned());
+    if let Some(h) = held
+        && !h.dormant()
+        && tw_gateway::plugin::load::hex(&h.sha256()) == sha256
+    {
+        return Some(h.manifest().clone());
+    }
+    let bytes = approved_bytes(s, id, sha256)?;
+    load(s, bytes, true).await.ok()?.ok()
+}
+
+/// 批准的那份字节：磁盘上的插件文件，文件变了时退回底稿。**哈希都得和配置里的一样**，
+/// 都对不上就没有
+fn approved_bytes(s: &ControlState, id: &str, sha256: &str) -> Option<Vec<u8>> {
+    let dir = config_dir(s);
+    [
+        tw_config::plugins::file_path(&dir, id),
+        tw_config::plugins::approved_path(&dir, id),
+    ]
+    .iter()
+    .filter_map(|p| read_capped(p).ok())
+    .find(|b| sha256_hex(b) == sha256)
 }
 
 /// 改得了回答里的工具调用：权限里有 `reply_tool_calls`，**或者读不出它要什么权限**
@@ -952,6 +989,15 @@ async fn trial(
         let reply = g.blobs().get(row.at_ms, row.id, tw_store::Which::Response);
         (row, request, reply)
     };
+    // 休眠的插件（停用着、运行时没起）：真的编一遍再试，设置按编出来的 manifest 重新对
+    let active = if active.ready().is_some_and(|h| h.dormant()) {
+        match awaken(&s, &active).await {
+            Ok(a) => std::sync::Arc::new(a),
+            Err(why) => return Ok(Json(refused(why))),
+        }
+    } else {
+        active
+    };
     // 跑不了的插件不试：改过的代码不跑（I9），加载不了的也跑不了
     let host = match &active.state {
         tw_gateway::plugin::State::Ready(h) => h.clone(),
@@ -969,6 +1015,49 @@ async fn trial(
     Ok(Json(
         run_trial(&s, &active, host, &row, request, reply).await,
     ))
+}
+
+/// 把一个休眠的插件真的编出来（试跑之前）：批准的那份字节编出来的宿主，设置按它的
+/// manifest 重新对过。读不到批准的那份字节、编不成、设置对不上就是试不了的原因
+async fn awaken(s: &ControlState, a: &Active) -> Result<Active, Msg> {
+    let entry = s
+        .gateway
+        .runtime()
+        .config
+        .plugins
+        .iter()
+        .find(|p| p.id == a.id)
+        .cloned()
+        .ok_or_else(|| not_found(&a.id).1.0)?;
+    let bytes = approved_bytes(s, &a.id, &entry.sha256).ok_or_else(|| {
+        msg!(
+            "control.plugin.trial_changed", plugin = &a.name =>
+            "The file of plugin `{plugin}` changed and has not been approved, so it cannot \
+             be tried."
+        )
+    })?;
+    let plugins = s.gateway.plugins.clone();
+    let host = tokio::task::spawn_blocking(move || plugins.prepare(&bytes))
+        .await
+        .map_err(|e| internal(e).1.0)?
+        .map_err(|e| e.msg())?;
+    let m = host.manifest().clone();
+    let settings = tw_gateway::plugin::load::settings_of(&m, &entry.settings)?;
+    Ok(Active {
+        id: a.id.clone(),
+        name: m.name.clone(),
+        enabled: a.enabled,
+        on_error: a.on_error,
+        scope: a.scope.clone(),
+        permissions: m.permissions.clone(),
+        reply_mode: m.reply_mode,
+        hooks: m.hooks,
+        settings,
+        manifest: Some(m),
+        state: tw_gateway::plugin::State::Ready(host),
+        stats: a.stats.clone(),
+        logs: a.logs.clone(),
+    })
 }
 
 fn refused(why: Msg) -> tw_api::PluginTrialResult {

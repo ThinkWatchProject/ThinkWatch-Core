@@ -12,17 +12,11 @@ use tw_config::Security;
 use tw_gateway::plugin::engine::Engine;
 
 const REPLY_LANGUAGE: &str = include_str!("../src/plugin/defaults/reply-language.js");
-const CURRENT_DATE: &str = include_str!("../src/plugin/defaults/current-date.js");
-const TERM_UNIFY: &str = include_str!("../src/plugin/defaults/term-unify.js");
-const REPLY_REDACT: &str = include_str!("../src/plugin/defaults/reply-redact.js");
 const WSL_PATHS: &str = include_str!("../src/plugin/defaults/wsl-paths.js");
 const DEEPSEEK_FLAGS: &str = include_str!("../src/plugin/defaults/deepseek-flags.js");
 
-const DEFAULTS: [(&str, &str); 6] = [
+const DEFAULTS: [(&str, &str); 3] = [
     ("reply-language", REPLY_LANGUAGE),
-    ("current-date", CURRENT_DATE),
-    ("term-unify", TERM_UNIFY),
-    ("reply-redact", REPLY_REDACT),
     ("wsl-paths", WSL_PATHS),
     ("deepseek-flags", DEEPSEEK_FLAGS),
 ];
@@ -70,34 +64,12 @@ fn every_default_loads_with_its_fixed_permissions_and_settings() {
         &'static [P],
         &'static [(&'static str, K)],
     );
-    let want: [Expected; 6] = [
+    let want: [Expected; 3] = [
         (
             "reply-language",
             "指定回答语言",
             &[P::System],
             &[("language", K::String)],
-        ),
-        (
-            "current-date",
-            "附加当前日期",
-            &[P::System],
-            &[("utc_offset", K::Number)],
-        ),
-        (
-            "term-unify",
-            "统一用词",
-            &[P::ReplyText],
-            &[("terms", K::String)],
-        ),
-        (
-            "reply-redact",
-            "回答内容打码",
-            &[P::ReplyText],
-            &[
-                ("patterns", K::String),
-                ("replacement", K::String),
-                ("ignore_case", K::Boolean),
-            ],
         ),
         (
             "wsl-paths",
@@ -160,16 +132,15 @@ fn the_defaults_directory_holds_exactly_the_tested_plugins() {
     );
 }
 
-// ── 改系统提示词的两个 ──────────────────────────────────────────
+// ── 改系统提示词的 ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn current_date_and_reply_language_append_to_the_system_prompt_in_every_format() {
+async fn reply_language_appends_to_the_system_prompt_in_every_format() {
     for fmt in FORMATS {
         let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
         let gw = Gateway::start(
             config(&up, Security::default()),
             vec![
-                Plug::new("current-date", CURRENT_DATE),
                 Plug::new("reply-language", REPLY_LANGUAGE)
                     .settings(json!({ "language": "English" })),
             ],
@@ -186,20 +157,10 @@ async fn current_date_and_reply_language_append_to_the_system_prompt_in_every_fo
         .await;
         let system = sent_system(&up.body(0));
         assert!(system.starts_with("你是助手。"), "{fmt:?}: {system}");
-        // 默认时区是 UTC+8
-        assert!(
-            system.contains("Today's date: 20") && system.contains("(UTC+8)."),
-            "{fmt:?}: {system}"
-        );
         assert!(
             system.contains(
                 "Always respond in English, unless the user explicitly asks for another language."
             ),
-            "{fmt:?}: {system}"
-        );
-        // 按插件表的顺序：日期在前
-        assert!(
-            system.find("Today's date").unwrap() < system.find("Always respond").unwrap(),
             "{fmt:?}: {system}"
         );
     }
@@ -225,132 +186,6 @@ async fn reply_language_takes_only_a_language_name() {
         .await;
     assert_ne!(r.status, 200, "{}", r.body);
     assert_eq!(up.hits(), 0);
-}
-
-// ── 改回答文字的两个 ────────────────────────────────────────────
-
-#[tokio::test]
-async fn term_unify_replaces_terms_split_across_streamed_pieces_in_every_format() {
-    for fmt in FORMATS {
-        for stream in [true, false] {
-            // 假上游一个字一帧：「登」「陆」必然落在两帧里
-            let up =
-                Upstream::start(vec![Answer::Text("请先登陆你的帐号，再打开登陆页".into())]).await;
-            let gw = Gateway::start(
-                config(&up, Security::default()),
-                vec![
-                    Plug::new("term-unify", TERM_UNIFY)
-                        .settings(json!({ "terms": "登陆=登录\n登陆页=登录界面\n帐号=账号" })),
-                ],
-            )
-            .await;
-            let r = ask(
-                &gw,
-                fmt,
-                MODEL,
-                "你是助手。",
-                &[Turn::User("怎么用".into())],
-                stream,
-            )
-            .await;
-            assert_eq!(
-                fmt.text(&r.body, stream),
-                "请先登录你的账号，再打开登录界面",
-                "{fmt:?} stream={stream}: {}",
-                r.body
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn reply_redact_masks_every_pattern_in_every_format() {
-    for fmt in FORMATS {
-        for stream in [true, false] {
-            let up = Upstream::start(vec![Answer::Text(
-                "员工 EMP-123456 在 Build-01.CORP.example.com 上，另见 example.com".into(),
-            )])
-            .await;
-            let gw = Gateway::start(
-                config(&up, Security::default()),
-                vec![Plug::new("reply-redact", REPLY_REDACT).settings(json!({
-                    "patterns": "EMP-\\d{6}\n[a-z0-9-]+\\.corp\\.example\\.com",
-                    "replacement": "[已隐藏]"
-                }))],
-            )
-            .await;
-            let r = ask(
-                &gw,
-                fmt,
-                MODEL,
-                "你是助手。",
-                &[Turn::User("谁在哪".into())],
-                stream,
-            )
-            .await;
-            assert_eq!(
-                fmt.text(&r.body, stream),
-                "员工 [已隐藏] 在 [已隐藏] 上，另见 example.com",
-                "{fmt:?} stream={stream}: {}",
-                r.body
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn multi_line_settings_tolerate_windows_line_endings_blank_lines_and_spaces() {
-    // 设置里的多行值：一行一条，`\r\n` 也认，空行和首尾的空白忽略
-    let up = Upstream::start(vec![Answer::Text("请先登陆帐号，工号 EMP-123456".into())]).await;
-    let gw = Gateway::start(
-        config(&up, Security::default()),
-        vec![
-            Plug::new("term-unify", TERM_UNIFY)
-                .settings(json!({ "terms": "登陆=登录\r\n\r\n   帐号 = 账号   \r\n" })),
-            Plug::new("reply-redact", REPLY_REDACT).settings(
-                json!({ "patterns": "\r\n  EMP-\\d{6}  \r\n\r\n", "replacement": "***" }),
-            ),
-        ],
-    )
-    .await;
-    for stream in [true, false] {
-        let r = ask(
-            &gw,
-            Fmt::Anthropic,
-            MODEL,
-            "你是助手。",
-            &[Turn::User("你好".into())],
-            stream,
-        )
-        .await;
-        assert_eq!(
-            Fmt::Anthropic.text(&r.body, stream),
-            "请先登录账号，工号 ***",
-            "stream={stream}: {}",
-            r.body
-        );
-    }
-}
-
-#[tokio::test]
-async fn reply_redact_without_patterns_changes_nothing() {
-    let up = Upstream::start(vec![Answer::Text("原样的回答".into())]).await;
-    let gw = Gateway::start(
-        config(&up, Security::default()),
-        vec![Plug::new("reply-redact", REPLY_REDACT)],
-    )
-    .await;
-    let r = ask(
-        &gw,
-        Fmt::Anthropic,
-        MODEL,
-        "你是助手。",
-        &[Turn::User("你好".into())],
-        true,
-    )
-    .await;
-    assert_eq!(Fmt::Anthropic.text(&r.body, true), "原样的回答");
-    assert_eq!(gw.outcomes("reply-redact"), ["unchanged"]);
 }
 
 // ── WSL 路径 ────────────────────────────────────────────────────

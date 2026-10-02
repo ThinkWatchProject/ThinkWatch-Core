@@ -4,9 +4,13 @@
 //!
 //! 断言落在磁盘上：插件文件和底稿、配置里那一条、`plugins/.defaults.json`。规则用自己
 //! 造的几个插件测（假引擎）；随 core 发的那一份清单另用真的沙箱整个走一遍。
+//!
+//! 还有**不起运行时**这一条：装默认插件、列出停用的插件都不编（数着引擎编了几次），
+//! 显示用的 manifest 缓存被人改了也骗不过「打开工具调用插件要点头」那道关。
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -15,6 +19,36 @@ use tower::ServiceExt;
 use tw_control::plugins::defaults::{Seeded, Seeder, record_path};
 use tw_control::{ConfigManager, ControlState};
 use tw_gateway::plugin::fake::{FakeEngine, source};
+use tw_gateway::plugin::{Engine, LoadError, PluginHost};
+
+/// 数着编了几次的引擎，编的事交给里面那一个
+struct Counting {
+    inner: Arc<dyn Engine>,
+    n: AtomicUsize,
+}
+
+impl Counting {
+    fn new(inner: Arc<dyn Engine>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            n: AtomicUsize::new(0),
+        })
+    }
+    fn count(&self) -> usize {
+        self.n.load(Ordering::SeqCst)
+    }
+}
+
+impl Engine for Counting {
+    fn load(&self, source: &[u8]) -> Result<Arc<dyn PluginHost>, LoadError> {
+        self.n.fetch_add(1, Ordering::SeqCst);
+        self.inner.load(source)
+    }
+}
+
+fn real() -> Arc<dyn Engine> {
+    Arc::new(tw_gateway::plugin::sandbox::Sandbox)
+}
 
 const BASE: &str = "version: 1
 listen:
@@ -27,7 +61,8 @@ clients:
 ";
 
 struct Bed {
-    _tmp: tempfile::TempDir,
+    /// 「重启」出来的那一份不拿着目录：它和原来那一份共用
+    _tmp: Option<tempfile::TempDir>,
     dir: PathBuf,
     gw: tw_gateway::AppState,
     mgr: Arc<ConfigManager>,
@@ -89,15 +124,32 @@ impl Bed {
 }
 
 fn bed_in(sub: &str, fake: bool) -> Bed {
+    let engine: Arc<dyn Engine> = if fake { Arc::new(FakeEngine) } else { real() };
+    bed_with(sub, engine)
+}
+
+fn bed_with(sub: &str, engine: Arc<dyn Engine>) -> Bed {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join(sub);
     std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("config.yaml");
-    std::fs::write(&p, BASE).unwrap();
-    let gw = tw_gateway::AppState::new(tw_config::try_parse(BASE).unwrap()).unwrap();
-    if fake {
-        gw.set_plugin_engine(Arc::new(FakeEngine));
+    std::fs::write(dir.join("config.yaml"), BASE).unwrap();
+    let mut b = open(dir, engine);
+    b._tmp = Some(tmp);
+    b
+}
+
+impl Bed {
+    /// 「重启」：同一个目录上起一份新的网关和控制面（编译结果、显示用的缓存都从头来）
+    fn restart(&self, engine: Arc<dyn Engine>) -> Bed {
+        open(self.dir.clone(), engine)
     }
+}
+
+fn open(dir: PathBuf, engine: Arc<dyn Engine>) -> Bed {
+    let p = dir.join("config.yaml");
+    let text = std::fs::read_to_string(&p).unwrap();
+    let gw = tw_gateway::AppState::new(tw_config::try_parse(&text).unwrap()).unwrap();
+    gw.set_plugin_engine(engine);
     let mgr = Arc::new(ConfigManager::new(p, gw.clone(), gw.bus.clone()));
     let state = ControlState {
         shutdown: Default::default(),
@@ -111,7 +163,7 @@ fn bed_in(sub: &str, fake: bool) -> Bed {
         zai: Default::default(),
     };
     Bed {
-        _tmp: tmp,
+        _tmp: None,
         dir,
         gw,
         mgr,
@@ -595,40 +647,225 @@ async fn an_unreadable_record_adds_nothing() {
     );
 }
 
-/// 随 core 发的那一份清单，真的沙箱：六个全装上、都停用着、都能跑；两行的默认设置
-/// 写得进配置
+/// 随 core 发的那一份清单，真的沙箱：每个都装上、都停用着；**一个都不编**（不起运行时），
+/// 列表照样说得出它们是什么 —— 重启之后也一样
 #[tokio::test]
-async fn the_shipped_defaults_go_in_turned_off_through_the_real_sandbox() {
-    let b = bed_in("real", false);
+async fn the_shipped_defaults_go_in_turned_off_without_starting_the_sandbox() {
+    let engine = Counting::new(real());
+    let b = bed_with("real", engine.clone());
     let done = Seeder::shipped().seed(&b.mgr).await;
-    let want: Vec<&str> = tw_gateway::plugin::defaults::ALL
-        .iter()
-        .map(|(id, _)| *id)
-        .collect();
+    let all = tw_gateway::plugin::defaults::ALL;
+    let want: Vec<&str> = all.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids(&done.added), want, "{done:?}");
     assert!(done.failed.is_empty(), "{done:?}");
-    for (id, src) in tw_gateway::plugin::defaults::ALL {
+    for (id, src) in all {
         let p = b.entry(id).unwrap();
         assert!(!p.enabled, "{id}");
         assert_eq!(p.sha256, sha(src), "{id}");
         let v = b.plugin(id).await;
         assert_eq!(v["status"], json!({"kind": "disabled"}), "{id}: {v}");
+        let m = tw_gateway::plugin::defaults::manifest(id).unwrap();
+        assert_eq!(v["name"], m.name.as_str(), "{id}");
         assert!(
-            b.gw.runtime().plugins.get(id).unwrap().ready().is_some(),
-            "{id}"
+            !v["permissions"].as_array().unwrap().is_empty(),
+            "{id}: {v}"
         );
+        let a = b.gw.runtime().plugins.get(id).unwrap().clone();
+        assert!(a.ready().unwrap().dormant(), "{id}");
     }
-    let terms = b.entry("term-unify").unwrap();
-    assert!(
-        terms.settings["terms"].as_str().unwrap().contains('\n'),
-        "{:?}",
-        terms.settings
-    );
     assert_eq!(
         b.entry("deepseek-flags").unwrap().scope.models,
         ["deepseek*"]
     );
+    assert_eq!(
+        b.plugin("reply-language").await["settings"],
+        json!({"language": "简体中文"})
+    );
+    assert_eq!(engine.count(), 0, "seeding or listing started the sandbox");
     assert_eq!(Seeder::shipped().seed(&b.mgr).await, Seeded::default());
+
+    // 重启：显示用的缓存里读得出来，照样不编
+    let engine = Counting::new(real());
+    let again = b.restart(engine.clone());
+    assert_eq!(Seeder::shipped().seed(&again.mgr).await, Seeded::default());
+    let v = again.plugin("wsl-paths").await;
+    assert_eq!(v["name"], "WSL 路径转换");
+    assert_eq!(v["permissions"], json!(["messages", "reply_tool_calls"]));
+    assert_eq!(engine.count(), 0);
+}
+
+/// 打开一个默认插件：这时才真的编（起运行时），编出来就能跑
+#[tokio::test]
+async fn enabling_a_default_compiles_it_and_then_it_runs() {
+    let engine = Counting::new(real());
+    let b = bed_with("real", engine.clone());
+    Seeder::shipped().seed(&b.mgr).await;
+    assert_eq!(engine.count(), 0);
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/plugins/reply-language",
+        Some(json!({"enabled": true, "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []},
+                    "settings": {"language": "English"}, "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(engine.count() > 0, "turning it on did not compile it");
+    assert_eq!(
+        b.plugin("reply-language").await["status"],
+        json!({"kind": "ok"})
+    );
+    let a =
+        b.gw.runtime()
+            .plugins
+            .get("reply-language")
+            .unwrap()
+            .clone();
+    let host = a.ready().unwrap().clone();
+    assert!(!host.dormant());
+    let out = tokio::task::spawn_blocking(move || {
+        host.on_request(
+            json!({"format": "anthropic", "model": "claude-sonnet-4-5", "system": "你是助手。"}),
+            json!({"client": null, "model": "claude-sonnet-4-5",
+                   "requested_model": "claude-sonnet-4-5", "format": "anthropic",
+                   "upstream": "anthropic", "settings": {"language": "English"}}),
+        )
+    })
+    .await
+    .unwrap();
+    match out.result {
+        Ok(tw_gateway::plugin::RequestOutcome::Changed(v)) => assert_eq!(
+            v["system"],
+            "你是助手。\n\nAlways respond in English, unless the user explicitly asks for another \
+             language."
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 一个改得了工具调用的插件，装上时停用着
+async fn install_calls(b: &Bed) -> String {
+    let src = source(
+        json!({"name": "改工具调用", "api": 1, "permissions": ["reply.tool_calls"],
+               "settings": {"mode": {"type": "string", "label": "方式", "default": "a"}}}),
+        &["onToolCall"],
+    );
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(
+            json!({"source": src, "id": "calls", "enabled": false, "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    src
+}
+
+fn cache_file(b: &Bed) -> PathBuf {
+    b.dir.join("plugins").join(".manifests.json")
+}
+
+/// 显示用的缓存被人改了（藏起了 reply_tool_calls）：列表上是改过的样子，可网页那条路照样
+/// 打不开它、改不了它的设置 —— 判断用的是真的编出来的 manifest
+#[tokio::test]
+async fn a_tampered_manifest_cache_cannot_hide_tool_calls_from_the_confirmation() {
+    let b = bed();
+    install_calls(&b).await;
+    let text = std::fs::read_to_string(cache_file(&b)).unwrap();
+    assert!(text.contains("\"reply_tool_calls\""), "{text}");
+    std::fs::write(
+        cache_file(&b),
+        text.replace("\"reply_tool_calls\"", "\"system\""),
+    )
+    .unwrap();
+
+    let engine = Counting::new(Arc::new(FakeEngine));
+    let again = b.restart(engine.clone());
+    let v = again.plugin("calls").await;
+    assert_eq!(v["permissions"], json!(["system"]), "{v}");
+    assert_eq!(engine.count(), 0);
+    // 只改出错时怎么办：用不着判断，也就不编
+    let (st, v) = call(
+        &again.app,
+        "PUT",
+        "/plugins/calls",
+        Some(json!({"enabled": false, "on_error": "skip",
+                    "scope": {"clients": [], "models": [], "upstreams": []},
+                    "settings": {"mode": "a"}, "base_version": again.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(engine.count(), 0, "an on_error change started the sandbox");
+    for (what, enabled, mode) in [("turning it on", true, "a"), ("a setting", false, "b")] {
+        let (st, v) = call(
+            &again.app,
+            "PUT",
+            "/plugins/calls",
+            Some(json!({"enabled": enabled, "on_error": "reject",
+                        "scope": {"clients": [], "models": [], "upstreams": []},
+                        "settings": {"mode": mode}, "base_version": again.version().await})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {v}");
+        assert_eq!(v["code"], "control.plugin.needs_confirmation", "{what}");
+    }
+    assert!(
+        engine.count() > 0,
+        "the decision was not made on a compiled manifest"
+    );
+    let p = again.entry("calls").unwrap();
+    assert!(!p.enabled);
+    assert_eq!(p.settings["mode"], serde_yaml_ng::Value::from("a"));
+    let (st, v) = call(
+        &again.app,
+        "PUT",
+        "/plugins/calls/confirmed",
+        Some(json!({"enabled": true, "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []},
+                    "settings": {"mode": "b"}, "base_version": again.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // 编过一遍之后，列表上也是真的那一份了
+    assert_eq!(
+        again.plugin("calls").await["permissions"],
+        json!(["reply_tool_calls"])
+    );
+}
+
+/// 缓存对不上（版本不对、是别的字节的）：不认，插件只按 id 和状态列出来，也不为此编
+#[tokio::test]
+async fn a_cache_entry_that_does_not_match_is_ignored() {
+    let b = bed();
+    let src = install_calls(&b).await;
+    let stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(cache_file(&b)).unwrap()).unwrap();
+    let sha_now = sha(&src);
+    assert!(stored["manifests"][&sha_now].is_object(), "{stored}");
+
+    let mut old_version = stored.clone();
+    old_version["version"] = json!("0.0.0/old/1");
+    let mut other_bytes = stored.clone();
+    let entry = other_bytes["manifests"][&sha_now].clone();
+    other_bytes["manifests"] = json!({ sha_now.replace(|c: char| c != '0', "0"): entry });
+    for (what, file) in [
+        ("another version", old_version.to_string()),
+        ("other bytes", other_bytes.to_string()),
+        ("a broken file", "{ not json".to_string()),
+    ] {
+        std::fs::write(cache_file(&b), file).unwrap();
+        let engine = Counting::new(Arc::new(FakeEngine));
+        let again = b.restart(engine.clone());
+        let v = again.plugin("calls").await;
+        assert_eq!(v["name"], "calls", "{what}: {v}");
+        assert_eq!(v["permissions"], json!([]), "{what}: {v}");
+        assert_eq!(v["status"], json!({"kind": "disabled"}), "{what}: {v}");
+        assert_eq!(engine.count(), 0, "{what}");
+    }
 }
 
 /// `deepseek-flags` 改得了回答里的工具调用：网页那条路打不开它，确认过的那条打得开

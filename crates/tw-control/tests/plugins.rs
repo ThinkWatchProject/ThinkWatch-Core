@@ -1063,6 +1063,51 @@ async fn a_trial_runs_the_plugin_on_the_recorded_request_and_answer() {
     );
 }
 
+/// 休眠的插件（停用着、运行时没起，只有显示用的 manifest）也试得了：试之前真的编一遍
+#[tokio::test]
+async fn a_dormant_plugin_is_compiled_for_a_trial() {
+    let b = bed();
+    b.gw.set_plugin_engine(Arc::new(Running));
+    let src = source(
+        json!({"name": "Both", "api": 1, "permissions": ["system", "reply.text"]}),
+        &["onRequest", "onReplyText"],
+    );
+    let id = b.install(&src, json!({"enabled": false})).await;
+    // 换一个运行时，编过的都清掉：一个插件都没开，它就休眠了
+    b.gw.set_plugin_engine(Arc::new(Running));
+    let a = b.gw.runtime().plugins.get(&id).unwrap().clone();
+    assert!(a.ready().unwrap().dormant());
+    let request = json!({
+        "model": "claude-sonnet-4-5", "max_tokens": 64,
+        "system": "Be brief.",
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+    .to_string();
+    {
+        let g = b.store.lock().await;
+        g.db().insert(&row(9, 1_000)).unwrap();
+        g.record_body(
+            1_000,
+            9,
+            tw_store::Which::Request,
+            request.as_bytes(),
+            request.len(),
+        );
+    }
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["error"].is_null(), "{v}");
+    assert_eq!(v["request"]["outcome"], "changed", "{v}");
+    let after = v["request"]["after"].as_str().unwrap();
+    assert!(after.contains("Be brief. Today is Friday."), "{after}");
+}
+
 /// 改得了回答里工具调用的插件：一份设置、一份范围
 fn rewrite_calls() -> String {
     source(
@@ -1293,8 +1338,9 @@ async fn a_plugin_without_tool_calls_is_changed_without_a_confirmation() {
     assert!(b.parsed().plugins[0].enabled);
 }
 
-/// 读不出权限的插件（文件和底稿都被动过）按改得了工具调用算：它此刻跑不了，可一旦又跑得了，
-/// 网页替它打开的开关就生效了
+/// 批准的那份字节读不回来（文件和底稿都被动过）：真的权限编不出来，按改得了工具调用算
+/// —— 它此刻跑不了，可一旦又跑得了，网页替它打开的开关就生效了。列表上显示的是之前编过
+/// 的那一份（只拿来显示），判断不认它
 #[tokio::test]
 async fn a_plugin_whose_permissions_cannot_be_read_needs_a_confirmation_too() {
     let b = bed();
@@ -1302,7 +1348,10 @@ async fn a_plugin_whose_permissions_cannot_be_read_needs_a_confirmation_too() {
     std::fs::write(b.file(&id), "tampered").unwrap();
     std::fs::write(b.approved(&id), "tampered too").unwrap();
     b.gw.reload_plugins();
-    assert!(b.gw.runtime().plugins.get(&id).unwrap().manifest.is_none());
+    assert_eq!(
+        b.gw.runtime().plugins.get(&id).unwrap().broken(),
+        Some(&tw_gateway::plugin::Broken::Changed)
+    );
     let (st, v) = put(
         &b,
         &format!("/plugins/{id}"),
@@ -1311,7 +1360,7 @@ async fn a_plugin_whose_permissions_cannot_be_read_needs_a_confirmation_too() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["code"], "control.plugin.needs_confirmation");
-    assert_eq!(v["args"]["plugin"], id);
+    assert_eq!(v["args"]["plugin"], "Shout");
     // 改出错时怎么办照常
     let (st, v) = put(
         &b,

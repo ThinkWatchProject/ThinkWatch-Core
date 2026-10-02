@@ -27,7 +27,8 @@
 //! - [`pool`]：插件调用都是阻塞的、吃 CPU 的，放在专用线程池上跑，不占 tokio 的线程。
 //! - [`trial`]：对着存下来的请求和回答试跑一个插件。
 //!
-//! [`defaults`] 是随 core 一起发的那几个插件（清单和源码）。
+//! [`defaults`] 是随 core 一起发的那几个插件（清单和源码）；[`manifests`] 是编过的插件的
+//! manifest 缓存，一个插件都没开时拿它显示停用的插件，不为此起运行时（见 [`load`]）。
 
 pub mod bridge;
 pub mod defaults;
@@ -37,6 +38,7 @@ pub mod engine;
 pub mod fake;
 pub mod host;
 pub mod load;
+pub mod manifests;
 pub mod pool;
 pub mod reply;
 pub mod request;
