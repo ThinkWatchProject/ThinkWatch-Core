@@ -1,4 +1,5 @@
-//! 插件端到端测试的架子：假上游、装着插件的网关、读客户端收到的东西。
+//! 插件端到端测试的架子：假上游、装着插件的网关、读客户端收到的东西。插件跑在网关
+//! 默认的引擎里，也就是生产上那一个（`tw_gateway::plugin::sandbox`）。
 //!
 //! 假上游说 Anthropic（`/v1/messages`）和 OpenAI Responses（`/v1/responses`），按请求
 //! 的 `stream` 回流式或整包。流式的文字**一个字符一帧**、工具参数分三片 —— 占位符
@@ -6,7 +7,9 @@
 
 #![allow(dead_code)]
 
-mod engine;
+mod ws;
+
+pub use ws::*;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -467,8 +470,8 @@ impl Gateway {
                     .collect(),
             });
         }
+        // 引擎用网关默认的那一个（`tw-plugin` 的沙箱），和生产上一样
         let state = tw_gateway::AppState::new(cfg).unwrap();
-        state.set_plugin_engine(Arc::new(engine::Sandbox(engine::runtime())));
         state.set_config_dir(dir.path().to_path_buf());
         let runs: Arc<Mutex<Vec<tw_gateway::plugin::load::RunRecord>>> = Default::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
@@ -535,6 +538,35 @@ impl Gateway {
         self.post("/v1/messages", body).await
     }
 
+    /// 原样发这些字节（空白、键的顺序、数字的写法都由调用方定）
+    pub async fn post_raw(&self, path: &str, body: &str) -> Resp {
+        let r = reqwest::Client::new()
+            .post(format!("http://{}{path}", self.addr))
+            .header("x-api-key", KEY)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let source = r
+            .headers()
+            .get("x-thinkwatch-error")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = r.text().await.unwrap();
+        wait_a_moment().await;
+        Resp {
+            status,
+            source,
+            body,
+        }
+    }
+
+    /// 连上网关的 WebSocket（Codex 的 Responses WebSocket 那一路）
+    pub async fn ws(&self) -> WsClient {
+        WsClient::connect(self.addr, KEY).await
+    }
+
     /// 向每个上游问一遍模型清单。模型准入要它：清单空着时网关不拦
     pub async fn refresh_models(&self) {
         tw_gateway::models::refresh_all(&self.state).await;
@@ -578,6 +610,17 @@ impl Gateway {
             .iter()
             .filter(|r| r.run.plugin_id == id)
             .map(|r| r.run.outcome.slug().to_string())
+            .collect()
+    }
+
+    /// 这个插件每次出错、被拒时记下的消息码，按先后
+    pub fn error_codes(&self, id: &str) -> Vec<String> {
+        self.runs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.run.plugin_id == id)
+            .filter_map(|r| r.run.error.as_ref().map(|m| m.code.clone()))
             .collect()
     }
 

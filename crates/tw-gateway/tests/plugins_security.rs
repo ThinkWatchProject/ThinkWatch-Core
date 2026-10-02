@@ -8,6 +8,8 @@
 //! - I8：故障转移、去封存重发不重跑请求钩子。
 //! - I9：文件变了的插件不跑：`reject` 拒绝请求，`skip` 原样放行。
 //! - I10：每次运行都有记录。
+//! - 没有插件改动的请求一个字节都不变；WebSocket（Codex 的 Responses WebSocket）那一路
+//!   同样看占位符、同样过工具调用审查、拒绝了不发给上游。
 //!
 //! 仓库根目录 `examples/plugins/` 里的示例也在这里走一整圈（删参数、改工具调用里的路径
 //! 要经过网关的写回才算数）。
@@ -366,7 +368,14 @@ export function onReplyText(text) { return text.repeat(50); }"#;
             text.chars().count(),
             r.body
         );
+        // 没有插件的话这段回答只有十个字，根本到不了上限：被切是因为插件写的那 500 个字
+        assert!(
+            r.body.contains("output limit"),
+            "{stream}: the answer was not cut by the output limit: {}",
+            r.body
+        );
     }
+    assert_eq!(gw.outcomes("inflate"), ["changed", "changed"]);
 }
 
 #[tokio::test]
@@ -595,8 +604,22 @@ async fn assert_refused(corpus_name: &str, settings: Value, what: &str) {
                 );
             }
         }
-        // 跑了、出错了：两种处置下都记成出错（`skip` 只决定请求接着走）
+        // 跑了、出错了：两种处置下都记成出错（`skip` 只决定请求接着走），原因是越权或坏输出
         assert_eq!(gw.outcomes("bad"), ["error"], "{what}");
+        let codes = gw.error_codes("bad");
+        assert!(
+            matches!(
+                codes.as_slice(),
+                [c] if c == "gw.plugin.permission_violation" || c == "gw.plugin.bad_output"
+            ),
+            "{what}: {codes:?}"
+        );
+        if on_error == OnError::Reject {
+            // 客户端拿到的是它自己格式的拒绝，说出是哪个插件
+            assert_eq!(r.source.as_deref(), Some("denied"), "{what}: {}", r.body);
+            assert!(r.body.contains("\"type\":\"error\""), "{what}: {}", r.body);
+            assert!(r.body.contains("Plugin `"), "{what}: {}", r.body);
+        }
     }
 }
 
@@ -712,6 +735,167 @@ export function onRequest() {}"#,
             ("see".into(), "reply".into(), "changed".into()),
         ])
     );
+}
+
+// ── 原样放行：没改就一个字节都不动 ───────────────────────────────
+
+#[tokio::test]
+async fn a_request_no_plugin_changed_reaches_the_upstream_byte_for_byte() {
+    // 插件把整个请求读一遍、原样交回，或者什么都不返回：上游收到的字节和没装插件时
+    // 一样 —— 空白、键的顺序、`1.0`、超出双精度的整数、转义写法都不变。差一个字节，
+    // 上游的提示词缓存每一轮都失效
+    let esc = format!("caf{}u00e9", '\\');
+    let raw = format!(
+        r#"{{
+  "model":"claude-sonnet-4-5",  "max_tokens": 1024,
+  "temperature": 1.0, "top_p": 0.90,
+  "system": [ {{"type": "text", "text": "你是助手。", "cache_control": {{"type": "ephemeral"}}}} ],
+  "tools": [{{"name": "Read", "description": "读 {esc}",
+             "input_schema": {{"type": "object", "properties": {{"n": {{"type": "number", "minimum": 0.0, "maximum": 12345678901234567890, "default": 1e3}}}}}}}}],
+  "messages": [ {{"role": "user", "content": [{{"type": "text", "text": "你好 {esc}", "cache_control": {{"type": "ephemeral"}}}}]}} ]
+}}"#
+    );
+    let echo_all = r#"
+export const manifest = { name: "读一遍", api: 1, permissions: ["system", "messages", "tools", "params"] };
+export function onRequest(req) {
+  JSON.stringify(req);
+  return JSON.parse(JSON.stringify(req));
+}"#;
+    let nothing = r#"
+export const manifest = { name: "不返回", api: 1, permissions: ["system", "messages", "tools", "params"] };
+export function onRequest(req) {}"#;
+
+    // 没装插件时上游收到的那一份
+    let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
+    let gw = Gateway::start(config(&up, Security::default()), vec![]).await;
+    gw.post_raw("/v1/messages", &raw).await;
+    let baseline = up.raw(0);
+
+    for (name, src) in [("echo-all", echo_all), ("nothing", nothing)] {
+        let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
+        let gw = Gateway::start(config(&up, Security::default()), vec![Plug::new(name, src)]).await;
+        let r = gw.post_raw("/v1/messages", &raw).await;
+        assert_eq!(r.status, 200, "{name}: {}", r.body);
+        assert_eq!(
+            up.raw(0),
+            baseline,
+            "{name}: the plugin's pass-through changed the bytes"
+        );
+        assert_eq!(gw.outcomes(name), ["unchanged"], "{name}");
+    }
+}
+
+// ── WebSocket 那一路 ─────────────────────────────────────────────
+
+fn ws_frame(text: &str) -> Value {
+    json!({
+        "type": "response.create", "model": "gpt-5", "instructions": "你是助手。",
+        "input": [{ "role": "user", "content": [{ "type": "input_text", "text": text }] }]
+    })
+}
+
+#[tokio::test]
+async fn on_a_websocket_the_request_hook_sees_placeholders() {
+    for mode in [SecurityMode::Enforce, SecurityMode::Observe] {
+        let up = WsUpstream::start(WsAnswer::Text("好的".into())).await;
+        let gw = Gateway::start(
+            ws_config(&up, redact(mode)),
+            vec![Plug::new("see", corpus("see-request"))],
+        )
+        .await;
+        let mut c = gw.ws().await;
+        let frames = c.ask(ws_frame(&format!("我的 key 是 {USER_KEY}"))).await;
+        assert!(!frames.is_empty(), "{mode:?}: no answer");
+        let sent = up.frames();
+        assert_eq!(sent.len(), 1, "{mode:?}: {sent:?}");
+        let v: Value = serde_json::from_str(&sent[0]).unwrap();
+        let seen = decode_seen(v["instructions"].as_str().unwrap());
+        assert!(
+            !seen.contains(USER_KEY),
+            "{mode:?}: the plugin saw the key: {seen}"
+        );
+        assert!(seen.contains("<<TW_SECRET_"), "{mode:?}: {seen}");
+        if mode == SecurityMode::Enforce {
+            assert!(!sent[0].contains(USER_KEY), "{mode:?}: {}", sent[0]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn on_a_websocket_the_reply_hook_sees_placeholders_and_the_client_gets_the_key() {
+    for mode in [SecurityMode::Enforce, SecurityMode::Observe] {
+        let up = WsUpstream::start(WsAnswer::Echo).await;
+        let gw = Gateway::start(
+            ws_config(&up, redact(mode)),
+            vec![Plug::new("see", corpus("see-reply"))],
+        )
+        .await;
+        let mut c = gw.ws().await;
+        let frames = c.ask(ws_frame(&format!("我的 key 是 {USER_KEY}"))).await;
+        let text = ws_text(&frames);
+        assert!(text.contains(USER_KEY), "{mode:?}: {frames:?}");
+        let seen = decode_seen(&text);
+        assert!(
+            !seen.contains(USER_KEY),
+            "{mode:?}: the plugin saw the key: {seen}"
+        );
+        assert!(seen.contains("<<TW_SECRET_"), "{mode:?}: {seen}");
+        assert!(
+            !frames.iter().any(|f| f.contains("<<TW_SECRET_")),
+            "{mode:?}: a placeholder leaked to the client: {frames:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn on_a_websocket_a_dangerous_call_written_by_a_plugin_is_cut() {
+    let up = WsUpstream::start(WsAnswer::Call {
+        name: "Read".into(),
+        arguments: json!({ "file_path": "/tmp/notes.txt" }),
+    })
+    .await;
+    let gw = Gateway::start(
+        ws_config(&up, tools(SecurityMode::Enforce)),
+        vec![Plug::new("inject", corpus("inject-tool-call"))],
+    )
+    .await;
+    let mut c = gw.ws().await;
+    let frames = c.ask(ws_frame("看看笔记")).await;
+    assert!(
+        !frames.iter().any(|f| f.contains("| sh")),
+        "the injected command reached the client: {frames:?}"
+    );
+    assert!(
+        ws_calls(&frames).iter().all(|(name, _)| name != "Bash"),
+        "{frames:?}"
+    );
+    // 插件真的换掉了那个调用，切断的是插件写的那一个
+    assert_eq!(gw.outcomes("inject"), ["changed"]);
+    assert!(
+        frames.iter().any(|f| f.contains("[ThinkWatch]")),
+        "the client was not told the answer was cut: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn on_a_websocket_a_refusal_never_reaches_the_upstream() {
+    let refuses = r#"
+export const manifest = { name: "拒绝", api: 1, permissions: ["messages"] };
+export function onRequest() { reject("不许发"); }"#;
+    let up = WsUpstream::start(WsAnswer::Text("好的".into())).await;
+    let gw = Gateway::start(
+        ws_config(&up, Security::default()),
+        vec![Plug::new("no", refuses)],
+    )
+    .await;
+    let mut c = gw.ws().await;
+    let frames = c.ask(ws_frame("你好")).await;
+    assert!(up.frames().is_empty(), "{:?}", up.frames());
+    assert!(
+        frames.iter().any(|f| f.contains("不许发")),
+        "the client was not told why: {frames:?}"
+    );
+    assert_eq!(gw.outcomes("no"), ["rejected"]);
 }
 
 // ── 示例插件 ─────────────────────────────────────────────────────
