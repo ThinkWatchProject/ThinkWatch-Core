@@ -3,7 +3,7 @@
 //! 插件是 JavaScript，**只在沙箱里跑**（`tw-plugin`，Wasmtime）。网关这一侧分三块：
 //!
 //! - [`engine`]：网关要从运行时那里拿到的东西 —— 把一份源码编成一个插件，读出它的
-//!   manifest。运行时还没接上时由一个替身顶着，所有插件都是「加载不了」；
+//!   manifest。真的那一个在 [`sandbox`]（`tw-plugin`），测试接假的；
 //! - [`host`]：一个编好的插件能做什么（跑请求钩子、回答钩子），数据面调它；
 //! - [`set`]：跟着配置一起换的那一份 —— 每个配置了的插件此刻的样子（能跑、文件
 //!   变了、加载出错）、范围、出错时怎么办，以及跨重载存活的计数和日志。
@@ -35,6 +35,7 @@ pub mod load;
 pub mod pool;
 pub mod reply;
 pub mod request;
+pub mod sandbox;
 pub mod set;
 pub mod trial;
 pub mod view;
@@ -94,10 +95,10 @@ impl crate::AppState {
     }
 }
 
-/// 这个进程用的插件运行时。**沙箱还没接上**：在那之前每个插件都「加载不了」，
-/// 管得着的请求照它的 `on_error` 处置。
+/// 这个进程用的插件运行时：`tw-plugin` 的沙箱，**第一次编插件时才起**（见
+/// [`sandbox::Sandbox`]）。
 pub fn default_engine() -> std::sync::Arc<dyn Engine> {
-    std::sync::Arc::new(Unavailable::default())
+    std::sync::Arc::new(sandbox::Sandbox::new(tw_plugin::Limits::default()))
 }
 
 /// 出错却没说为什么。数据面总该给一句，这里只是不让通知空着

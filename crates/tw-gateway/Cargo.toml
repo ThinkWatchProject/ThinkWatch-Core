@@ -19,6 +19,8 @@ tw-breaker = { workspace = true }
 # Bedrock：SigV4 签名、eventstream 拆帧、推理地址和模型目录，和企业版共用一份
 tw-bedrock = { workspace = true }
 tw-engine = { workspace = true }
+# 脚本插件的沙箱（QuickJS 跑在 Wasmtime 里）。接在 `plugin::sandbox` 上
+tw-plugin = { workspace = true }
 tw-observe = { workspace = true }
 tw-secret = { workspace = true }
 tw-pricing = { workspace = true }

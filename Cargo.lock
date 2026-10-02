@@ -3308,6 +3308,7 @@ dependencies = [
  "tw-engine",
  "tw-guard",
  "tw-observe",
+ "tw-plugin",
  "tw-pricing",
  "tw-secret",
  "tw-types",
