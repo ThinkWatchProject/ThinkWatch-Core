@@ -213,6 +213,12 @@ async fn a_dangerous_tool_call_cuts_the_connection() {
         !text.contains("evil.example.sh"),
         "**那条命令还是发给客户端了**：{text}"
     );
+    // 说明按命中的规则说，**不说这个调用出自谁**：插件也能造工具调用
+    assert!(
+        text.starts_with("[ThinkWatch] The answer contained a Bash call that matched rule “")
+            && text.ends_with(", so the connection was cut."),
+        "{text}"
+    );
 }
 
 /// 审查关掉时不该切 —— **安全档位说了算**（三态）。

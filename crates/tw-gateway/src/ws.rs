@@ -310,7 +310,7 @@ enum End {
     Closed,
     /// 上游那边出错断了，或者写不过去了
     Broke(Msg),
-    /// 被防护切断了：上游返回了高危工具调用，或者客户端发来的一帧被内容过滤拒了
+    /// 被防护切断了：回答里的工具调用命中了切断规则，或者客户端发来的一帧被内容过滤拒了
     Cut(Msg),
 }
 
@@ -406,22 +406,22 @@ async fn pump(
                         };
                         // **和主管线一模一样的判据**：规则是切断 + 拦截档
                         let acts = p.rules.inspect_mode.acts();
-                        let mut deadly = false;
-                        let mut why: Option<Msg> = None;
+                        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句
+                        let mut refusal: Option<Msg> = None;
                         for h in &hits {
                             let blocked = h.cut && acts;
-                            if blocked && why.is_none() {
-                                why = Some(msg!(
-                                    "gw.ws.toolcall_cut",
+                            if blocked && refusal.is_none() {
+                                // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）
+                                refusal = Some(msg!(
+                                    "gw.toolcall.connection_cut",
                                     upstream = p.provider.clone(), tool = h.tool.clone(),
                                     rule = h.rule.clone(), name = h.name.clone(),
-                                    detail = h.why.clone() =>
-                                    "The {tool} call returned by upstream `{upstream}` matched \
-                                     rule “{name}”{}, so the connection was cut.",
+                                    why = h.why.clone() =>
+                                    "The answer contained a {tool} call that matched rule \
+                                     “{name}”{}, so the connection was cut.",
                                     crate::server::because(&h.why)
                                 ));
                             }
-                            deadly |= blocked;
                             // 命中的那一段是还原过的：报出去之前和留档一样打码
                             let redaction = crate::bodies::Redaction {
                                 rules: p.rules.redact.clone(),
@@ -435,13 +435,14 @@ async fn pump(
                                 &redaction,
                             ));
                         }
-                        if deadly {
+                        if let Some(why) = refusal {
                             // **命中那一帧不发。**和 SSE 那条路同一条纪律：
-                            // 先判断再转发，而不是发完再说
+                            // 先判断再转发，而不是发完再说。告诉客户端的就是结局里
+                            // 那句带码的话，和内容过滤拒掉一帧时一样
                             let _ = c_tx.send(Message::Text(
-                                "[ThinkWatch] the upstream returned a dangerous tool call; the connection was cut".into(),
+                                format!("[ThinkWatch] {}", why.text).into(),
                             )).await;
-                            break End::Cut(why.expect("set on the same pass that set deadly"));
+                            break End::Cut(why);
                         }
                         ending.count(restored.len());
                         Message::Text(restored.into())

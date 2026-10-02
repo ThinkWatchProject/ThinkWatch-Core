@@ -531,14 +531,17 @@ impl Relay {
             if blocked {
                 tracing::warn!(
                     provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                    "cut the response stream: the upstream returned a dangerous tool call"
+                    "cut the response stream: a tool call in the answer matched a cut rule"
                 );
+                // **句子不说这个调用出自谁。**审查看的是最后交给客户端的那一份回答，
+                // 里面的工具调用不一定是上游给的 —— 有工具调用权限的插件也能造、能改。
+                // 上游照样在 `upstream` 参数和事件里，只是不当成调用的出处
                 let err = GatewayError::denied(msg!(
-                    "gw.toolcall.cut",
+                    "gw.toolcall.response_cut",
                     upstream = self.provider.clone(), tool = v.tool.clone(),
                     rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
-                    "The {tool} call returned by upstream `{upstream}` \
-                     matched rule “{name}”{}, so the response was cut off.",
+                    "The answer contained a {tool} call that matched rule “{name}”{}, \
+                     so the response was cut off.",
                     because(&v.why)
                 ));
                 // **命中那一帧之前的内容照常发。**模型在动手之前
@@ -638,14 +641,15 @@ impl Relay {
                 if blocked {
                     tracing::warn!(
                         provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                        "withheld the response: the upstream returned a dangerous tool call"
+                        "withheld the response: a tool call in the answer matched a cut rule"
                     );
+                    // 和流式那句一样不说调用出自谁（见 `wall_cut`）
                     let err = GatewayError::denied(msg!(
-                        "gw.toolcall.blocked",
+                        "gw.toolcall.response_withheld",
                         upstream = self.provider.clone(), tool = v.tool.clone(),
                         rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
-                        "The {tool} call returned by upstream `{upstream}` matched rule \
-                         “{name}”{}, so the response was withheld.",
+                        "The answer contained a {tool} call that matched rule “{name}”{}, \
+                         so the response was withheld.",
                         because(&v.why)
                     ));
                     return (Vec::new(), Some(err));
