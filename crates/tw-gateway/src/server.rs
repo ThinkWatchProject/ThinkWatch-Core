@@ -385,11 +385,16 @@ pub(crate) fn because(why: &str) -> String {
 
 /// 一次工具调用命中写成事件。流式、整包、WebSocket 三条路共用 —— 字段写漏
 /// 一个，就有一条路上的日志说不清是哪条规则。
+///
+/// **命中的那一段先打码**（`redaction`：和留档同一套，这个请求的规则和账本）。审查看的
+/// 是还原过占位符的回答，`curl … -H "Authorization: <<TW_SECRET_1>>"` 到这里已经是那把
+/// 真的密钥；原样写进事件，它就跟着进了安全日志、系统通知和界面。
 pub(crate) fn flagged(
     id: u64,
     provider: &str,
     v: &tw_guard::tools::wall::Verdict,
     blocked: bool,
+    redaction: &crate::bodies::Redaction,
 ) -> tw_api::Event {
     tw_api::Event::ToolCallFlagged {
         id,
@@ -398,7 +403,7 @@ pub(crate) fn flagged(
         rule: v.rule.clone(),
         custom: v.custom,
         why: v.why.clone(),
-        excerpt: v.excerpt.clone(),
+        excerpt: redaction.apply(&v.excerpt),
         action: if v.cut {
             tw_api::RuleAction::Cut
         } else {

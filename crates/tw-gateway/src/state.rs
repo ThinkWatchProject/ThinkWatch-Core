@@ -39,10 +39,8 @@ pub struct Runtime {
     pub redact: Arc<tw_guard::redact::rules::RuleSet>,
     /// 工具调用审查的规则。同上。
     pub tools: Arc<tw_guard::tools::rules::Rules>,
-    /// 内容过滤的规则。同上
+    /// 内容过滤的规则（隐藏字符那一组也在里面）。同上
     pub content: Arc<tw_guard::content::Rules>,
-    /// 藏匿字符查哪几种
-    pub hidden: Vec<tw_guard::hidden::Kind>,
 }
 
 impl Runtime {
@@ -84,21 +82,12 @@ impl Runtime {
         // 自定义规则的正则、内置规则的 id 在配置校验时已经查过一次，这里再
         // 失败只可能是有人绕过了校验，照样拒绝这份配置
         let sec = &config.security;
-        let redact = tw_guard::redact::rules::RuleSet::build(
-            &sec.redact.enable,
-            &sec.redact.disable,
-            sec.redact.active_custom(),
-        )
-        .map_err(|e| {
+        let bad = |e: tw_config::PolicyError| {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
-        })?;
-        let tools = sec.inspect_tools.rules().map_err(|e| {
-            GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
-        })?;
-        let content = sec.content.rules().map_err(|e| {
-            GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
-        })?;
-        let hidden = sec.hidden_text.kinds();
+        };
+        let redact = sec.redact.rules().map_err(bad)?;
+        let tools = sec.inspect_tools.rules().map_err(bad)?;
+        let content = sec.content.rules().map_err(bad)?;
         Ok(Self {
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
@@ -107,7 +96,6 @@ impl Runtime {
             redact: Arc::new(redact),
             tools: Arc::new(tools),
             content: Arc::new(content),
-            hidden,
         })
     }
 }

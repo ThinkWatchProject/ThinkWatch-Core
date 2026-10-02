@@ -53,23 +53,10 @@ pub enum ValidationError {
     BlankModelsOnly { name: String },
     #[error("{}", self.msg())]
     ReservedName { what: &'static str, name: String },
+    /// 安全防护的策略过不了共享层的校验（[`tw_guard::policy::Security::check`]）：自定义
+    /// 规则的名字、正则、码位、占位符名称，按 id 引用的内置规则
     #[error("{}", self.msg())]
-    EmptyRuleName { what: &'static str },
-    #[error("{}", self.msg())]
-    DuplicateRuleName { what: &'static str, name: String },
-    #[error("{}", self.msg())]
-    EmptyRulePattern { what: &'static str, name: String },
-    /// `detail` 是正则库的原话
-    #[error("{}", self.msg())]
-    BadRulePattern {
-        what: &'static str,
-        name: String,
-        detail: String,
-    },
-    #[error("{}", self.msg())]
-    UnknownRule { guard: &'static str, id: String },
-    #[error("{}", self.msg())]
-    OutputLimitRange { max: usize, ceiling: usize },
+    Security(crate::PolicyError),
     #[error("{}", self.msg())]
     FailoverRange {
         field: &'static str,
@@ -185,31 +172,7 @@ impl ValidationError {
                 "the {what} name `{name}` starts with __, which is reserved for built-ins. Use a \
                  different name"
             ),
-            EmptyRuleName { what } => msg!(
-                "config.rule_name_empty", what = what =>
-                "a custom {what} rule has no name"
-            ),
-            DuplicateRuleName { what, name } => msg!(
-                "config.rule_name_taken", what = what, name = name =>
-                "the custom {what} rule name `{name}` appears twice"
-            ),
-            EmptyRulePattern { what, name } => msg!(
-                "config.rule_pattern_empty", what = what, name = name =>
-                "the pattern of custom {what} rule `{name}` is empty"
-            ),
-            BadRulePattern { what, name, detail } => msg!(
-                "config.rule_pattern_bad", what = what, name = name, detail = detail =>
-                "the pattern of custom {what} rule `{name}` is not a valid regular expression: \
-                 {detail}"
-            ),
-            UnknownRule { guard, id } => msg!(
-                "config.unknown_rule", guard = guard, rule = id =>
-                "security.{guard} names `{rule}`, which is not a built-in rule"
-            ),
-            OutputLimitRange { max, ceiling } => msg!(
-                "config.output_limit_range", max = max, ceiling = ceiling =>
-                "security.output_limit.max_chars is {max}; it has to be between 1 and {ceiling}"
-            ),
+            Security(e) => crate::policy_msg(e),
             FailoverRange {
                 field,
                 value,
@@ -419,46 +382,17 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     // 「我明明配了为什么不生效」）。
     cfg.engine().validate()?;
 
-    // 自定义规则。**写坏的正则在这里就拒绝**，而不是加载之后跳过那一条：
-    // 一条静默失效的安全规则比没有更糟，因为用户以为它在
-    check_rules(
-        "redaction",
-        cfg.security
-            .redact
-            .custom
-            .iter()
-            .map(|c| (c.name.as_str(), c.pattern.as_str())),
-    )?;
-    check_rules(
-        "tool-call",
-        cfg.security
-            .inspect_tools
-            .custom
-            .iter()
-            .map(|c| (c.name.as_str(), c.pattern.as_str())),
-    )?;
-    check_content_rules(&cfg.security.content.custom)?;
-    let max = cfg.security.output_limit.max_chars;
-    if max == 0 || max > crate::MAX_CHARS_CEILING {
-        return Err(ValidationError::OutputLimitRange {
-            max,
-            ceiling: crate::MAX_CHARS_CEILING,
-        });
-    }
+    // 安全防护：自定义规则的名字、正则、码位、占位符名称，按 id 写到的内置规则，和企业版
+    // 存进系统设置时是同一套校验。**写坏的正则在这里就拒绝**，而不是加载之后跳过那一条：
+    // 一条静默失效的安全规则比没有更糟，因为用户以为它在；写错一个内置规则的 id 和写错
+    // 一个字段名是同一种错，跳过它，用户停用的那条会照样在报
+    cfg.security.check().map_err(ValidationError::Security)?;
     if let Some((field, value, min, max)) = cfg.failover.out_of_range() {
         return Err(ValidationError::FailoverRange {
             field,
             value,
             min,
             max,
-        });
-    }
-    // 按 id 开关、改处置的内置规则得真的存在。**写错一个 id 和写错一个字段名
-    // 是同一种错**：跳过它，用户停用的那条会照样在报
-    if let Some((guard, id)) = cfg.security.unknown_rule() {
-        return Err(ValidationError::UnknownRule {
-            guard,
-            id: id.to_string(),
         });
     }
     // 控制面的钥匙。**缺了、短了、不是十六进制，整份配置都不收**，旧的继续
@@ -487,82 +421,6 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 });
             }
         }
-    }
-    Ok(())
-}
-
-/// 一组自定义规则：名字不空、不重复，正则编得过。
-///
-/// 上限和数据面编译时一样（`tw_guard::redact::rules::compile`）：一条要在每个请求上
-/// 跑的正则，编出来的东西不能太大。
-fn check_rules<'a>(
-    what: &'static str,
-    rules: impl Iterator<Item = (&'a str, &'a str)>,
-) -> Result<(), ValidationError> {
-    let mut seen = std::collections::HashSet::new();
-    for (name, pattern) in rules {
-        if name.trim().is_empty() {
-            return Err(ValidationError::EmptyRuleName { what });
-        }
-        if !seen.insert(name) {
-            return Err(ValidationError::DuplicateRuleName {
-                what,
-                name: name.to_string(),
-            });
-        }
-        if pattern.is_empty() {
-            return Err(ValidationError::EmptyRulePattern {
-                what,
-                name: name.to_string(),
-            });
-        }
-        regex::RegexBuilder::new(pattern)
-            .size_limit(1 << 20)
-            .build()
-            .map_err(|e| ValidationError::BadRulePattern {
-                what,
-                name: name.to_string(),
-                detail: e.to_string(),
-            })?;
-    }
-    Ok(())
-}
-
-/// 自定义的内容规则：名字不空、不重复，写着正则的编得过。**编法和数据面同一个**
-/// （`tw_guard::content::Rule::new`：不分大小写、编译后的大小有上限）。
-fn check_content_rules(rules: &[crate::CustomContentRule]) -> Result<(), ValidationError> {
-    const WHAT: &str = "content";
-    let mut seen = std::collections::HashSet::new();
-    for c in rules {
-        let name = c.name.as_str();
-        if name.trim().is_empty() {
-            return Err(ValidationError::EmptyRuleName { what: WHAT });
-        }
-        if !seen.insert(name) {
-            return Err(ValidationError::DuplicateRuleName {
-                what: WHAT,
-                name: name.to_string(),
-            });
-        }
-        if c.pattern.trim().is_empty() {
-            return Err(ValidationError::EmptyRulePattern {
-                what: WHAT,
-                name: name.to_string(),
-            });
-        }
-        tw_guard::content::Rule::new(tw_guard::content::RuleInput {
-            id: name,
-            name,
-            custom: true,
-            pattern: &c.pattern,
-            matching: c.matching.engine(),
-            action: tw_guard::content::Action::Warn,
-        })
-        .map_err(|e| ValidationError::BadRulePattern {
-            what: WHAT,
-            name: name.to_string(),
-            detail: e.detail,
-        })?;
     }
     Ok(())
 }
@@ -807,6 +665,7 @@ mod tests {
             .map(|(n, pat)| crate::CustomRedactRule {
                 name: n.to_string(),
                 pattern: pat.to_string(),
+                label: None,
                 disabled: false,
             })
             .collect();
@@ -837,7 +696,13 @@ mod tests {
         let e = validate(&with_rules(&[("写坏了", "(")], &[])).unwrap_err();
         let m = e.to_string();
         assert!(m.contains("写坏了"), "{m}");
-        assert!(matches!(e, ValidationError::BadRulePattern { .. }), "{e:?}");
+        assert!(
+            matches!(
+                e,
+                ValidationError::Security(crate::PolicyError::BadPattern { .. })
+            ),
+            "{e:?}"
+        );
         assert!(validate(&with_rules(&[], &[("空的", "")])).is_err());
     }
 
@@ -845,11 +710,15 @@ mod tests {
     fn a_rule_name_is_required_and_unique_within_its_line_of_defence() {
         assert!(matches!(
             validate(&with_rules(&[(" ", "x")], &[])),
-            Err(ValidationError::EmptyRuleName { .. })
+            Err(ValidationError::Security(
+                crate::PolicyError::EmptyName { .. }
+            ))
         ));
         assert!(matches!(
             validate(&with_rules(&[("同名", "a"), ("同名", "b")], &[])),
-            Err(ValidationError::DuplicateRuleName { .. })
+            Err(ValidationError::Security(
+                crate::PolicyError::DuplicateName { .. }
+            ))
         ));
         // 两项防护各管各的名字
         assert!(validate(&with_rules(&[("同名", "a")], &[("同名", "b")])).is_ok());
@@ -871,10 +740,10 @@ mod tests {
         x.security.content.custom = vec![rule("括号", "f(", crate::ContentMatch::Regex)];
         assert!(matches!(
             validate(&x),
-            Err(ValidationError::BadRulePattern {
-                what: "content",
+            Err(ValidationError::Security(crate::PolicyError::BadPattern {
+                guard: tw_guard::policy::Guard::Content,
                 ..
-            })
+            }))
         ));
         x.security.content.custom = vec![
             rule("同名", "a", crate::ContentMatch::Contains),
@@ -882,22 +751,19 @@ mod tests {
         ];
         assert!(matches!(
             validate(&x),
-            Err(ValidationError::DuplicateRuleName { .. })
+            Err(ValidationError::Security(
+                crate::PolicyError::DuplicateName { .. }
+            ))
         ));
-    }
-
-    #[test]
-    fn the_output_limit_has_to_be_a_sensible_number() {
-        let mut x = with_rules(&[], &[]);
-        for bad in [0, crate::MAX_CHARS_CEILING + 1] {
-            x.security.output_limit.max_chars = bad;
-            assert!(
-                matches!(validate(&x), Err(ValidationError::OutputLimitRange { .. })),
-                "{bad}"
-            );
-        }
-        x.security.output_limit.max_chars = 1;
-        assert!(validate(&x).is_ok());
+        // 码位写错了说出是哪一项
+        x.security.content.custom = vec![rule(
+            "码位",
+            "U+200D-U+200B",
+            crate::ContentMatch::Codepoints,
+        )];
+        let e = validate(&x).unwrap_err();
+        assert_eq!(e.msg().code, "config.rule_codepoints_bad");
+        assert!(e.to_string().contains("U+200D"), "{e}");
     }
 
     /// 停用时长写成 0 等于没有停用，上限比起点还小等于翻倍从一开始就封顶 ——
@@ -945,10 +811,10 @@ mod tests {
         assert!(
             matches!(
                 e,
-                ValidationError::UnknownRule {
-                    guard: "redact",
+                ValidationError::Security(crate::PolicyError::UnknownRule {
+                    guard: tw_guard::policy::Guard::Redact,
                     ..
-                }
+                })
             ),
             "{e:?}"
         );
@@ -971,10 +837,10 @@ mod tests {
             assert!(
                 matches!(
                     validate(&bad),
-                    Err(ValidationError::UnknownRule {
-                        guard: "inspect_tools",
+                    Err(ValidationError::Security(crate::PolicyError::UnknownRule {
+                        guard: tw_guard::policy::Guard::InspectTools,
                         ..
-                    })
+                    }))
                 ),
                 "{:?}",
                 validate(&bad)
@@ -986,9 +852,10 @@ mod tests {
 #[cfg(test)]
 mod msg_codes {
     use super::*;
-    use crate::CredentialError;
     use crate::edit::EditError;
     use crate::store::StoreError;
+    use crate::{CredentialError, PolicyError};
+    use tw_guard::policy::Guard;
 
     /// 码非空、带层名、英文就是 `Display`、同一个枚举里不重复。
     fn check(prefix: &str, all: &[(Msg, String)]) {
@@ -1128,25 +995,34 @@ mod msg_codes {
                 what: "upstream",
                 name: "__a".into(),
             },
-            EmptyRuleName { what: "redaction" },
-            DuplicateRuleName {
-                what: "redaction",
+            Security(PolicyError::EmptyName {
+                guard: Guard::Redact,
+            }),
+            Security(PolicyError::DuplicateName {
+                guard: Guard::Redact,
                 name: "r".into(),
-            },
-            EmptyRulePattern {
-                what: "redaction",
+            }),
+            Security(PolicyError::EmptyPattern {
+                guard: Guard::Redact,
                 name: "r".into(),
-            },
-            BadRulePattern {
-                what: "redaction",
+            }),
+            Security(PolicyError::BadPattern {
+                guard: Guard::Redact,
                 name: "r".into(),
                 detail: "unclosed group".into(),
-            },
-            UnknownRule {
-                guard: "redact",
+            }),
+            Security(PolicyError::BadCodepoints {
+                name: "r".into(),
+                reason: tw_guard::content::CodepointError::Empty,
+            }),
+            Security(PolicyError::BadLabel {
+                name: "r".into(),
+                label: "x".into(),
+            }),
+            Security(PolicyError::UnknownRule {
+                guard: Guard::Redact,
                 id: "x".into(),
-            },
-            OutputLimitRange { max: 0, ceiling: 1 },
+            }),
         ];
         check(
             "config.",

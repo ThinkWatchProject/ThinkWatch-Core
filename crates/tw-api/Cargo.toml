@@ -17,12 +17,15 @@ serde_json = { workspace = true }
 # tw-types，桌面端的接管 crate 也是），而契约这一层反过来依赖它没有问题 ——
 # tw-types 自己零依赖。
 tw-types = { workspace = true }
+# 三项防护的规则视图和「测试…」的请求、结果在 tw-guard 里定义一份，两个产品共用；
+# 这里重导出（`tw_api::guard`）。它也不碰 IO，只是多了匹配引擎的那几个依赖
+tw-guard = { workspace = true }
 ts-rs = { workspace = true, optional = true }
 
 [features]
 # 把契约导出成 TypeScript：`tw_api::ts::export_all(dir)`。**默认关** ——
 # 只有桌面端生成前端类型时开，core 自己和企业版都不背 ts-rs。
-ts = ["dep:ts-rs", "tw-types/ts"]
+ts = ["dep:ts-rs", "tw-types/ts", "tw-guard/ts"]
 
 [[example]]
 name = "export_ts"

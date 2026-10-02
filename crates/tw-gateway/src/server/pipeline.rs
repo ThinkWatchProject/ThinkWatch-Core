@@ -60,7 +60,7 @@ struct Started {
 pub(super) async fn pipeline(
     state: AppState,
     rt: Arc<Runtime>,
-    req: Inbound,
+    mut req: Inbound,
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
@@ -82,7 +82,7 @@ pub(super) async fn pipeline(
         )));
     }
 
-    let (reading, fp) = read(&req, intent);
+    let (mut reading, fp) = read(&req, intent);
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
         Routed::Go(choice, decision) => (choice, decision),
@@ -118,6 +118,8 @@ pub(super) async fn pipeline(
         .and_then(|c| c.max_concurrent);
     let _pass = state.gate.acquire(&req.client_name, limit).await;
 
+    // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
+    let screening = screen(&rt, &mut req, &mut reading);
     let started = start(
         &state,
         &rt,
@@ -128,7 +130,12 @@ pub(super) async fn pipeline(
         fp.as_deref(),
         ending,
     );
-    screen(&state, &rt, &reading, &started)?;
+    // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
+    // 流量里照样留一行；一个字节都不发
+    let provider = started.alive.first().map(String::as_str).unwrap_or("");
+    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &screening) {
+        return Err(GatewayError::denied(why));
+    }
     let answer = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
     let mut ending = ending
         .take()
@@ -705,34 +712,48 @@ fn open(
     id
 }
 
-/// 请求防护：调用方发来的正文里（连同工具结果）有没有藏起来的字符、有没有命中
-/// 内容规则（见 [`crate::guard::screen`]）。
+/// 管线第 4 步：内容过滤（见 [`crate::guard::screen`]）。**只下结论，不发事件**：记录
+/// 要挂在请求号上，开始之后再报（[`crate::guard::report`]）。
 ///
-/// **在开始事件之后**：记录要挂在这个请求上，拒掉的请求也要在流量里留一行 ——
-/// 被拒是一次来源为 `denied` 的失败。**在尝试上游之前**：拒掉的一个字节都不发。
+/// **在开始事件之前**：处置档下删过的话，`req.body` 换成删过的那一份，中间表示也照它
+/// 重新解码 —— 之后的出站脱敏、开始事件、留档、每一跳的转换和发送用的都是它，存下来的
+/// 就是真正发出去的那一份。路由在这之前按客户端的原文做完了。
 ///
-/// 按解码出来的消息看，所以只有生成回答的请求才看：计 token、嵌入这些接口没有
-/// 「调用方的消息」可言；解不开的体也不看 —— 同格式直通照样发，上游可能认得它。
+/// 查的是会让模型读调用方正文的请求：生成回答和压缩上下文。**计 token 不查**：不跑
+/// 模型，查了只会在真正的请求之前把同一处命中多记一遍、还可能把计数请求拒掉（理由见
+/// [`crate::client_api::ClientApi::screened`]）。在原文上查，中间表示解不开的请求照样查
+/// （同格式直通照样发，上游可能认得它）。
 fn screen(
-    state: &AppState,
     rt: &Runtime,
-    reading: &crate::client_api::Reading,
-    started: &Started,
-) -> Result<(), GatewayError> {
-    let Some(Ok(d)) = &reading.decoded else {
-        return Ok(());
+    req: &mut Inbound,
+    reading: &mut crate::client_api::Reading,
+) -> tw_guard::content::Screening {
+    let screened = crate::client_api::ClientApi::screened(req.uri.path());
+    let Some(api) = req.api.filter(|_| screened) else {
+        return Default::default();
     };
-    let provider = started.alive.first().map(String::as_str).unwrap_or("");
-    match crate::guard::screen(
-        &state.bus,
-        started.id,
-        provider,
-        &crate::guard::Screen::of(rt),
-        &d.request,
-    ) {
-        Some(why) => Err(GatewayError::denied(why)),
-        None => Ok(()),
+    let dialect = api.dialect();
+    let sc = crate::guard::screen(&crate::guard::Screen::of(rt), dialect, &req.body);
+    if let Some(body) = &sc.body {
+        req.body = body.clone();
+        if reading.decoded.is_some() {
+            reading.decoded = Some(
+                serde_json::from_slice::<serde_json::Value>(body)
+                    .map_err(|_| {
+                        tw_dialect::ir::Rejection("The request body is not valid JSON.".into())
+                    })
+                    .and_then(|v| {
+                        tw_dialect::convert::decode(
+                            dialect,
+                            &v,
+                            req.uri.path(),
+                            req.query.as_deref(),
+                        )
+                    }),
+            );
+        }
     }
+    sc
 }
 
 /// 这个请求是 Claude Code 发的吗。
