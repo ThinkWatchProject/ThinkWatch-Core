@@ -260,6 +260,7 @@ gw.oauth.status
 gw.oauth.unreachable
 gw.output_limit.cut
 gw.output_limit.withheld
+gw.plugin.failed
 gw.probe.aws_token_expired
 gw.probe.bedrock_list_denied
 gw.probe.connect
@@ -378,8 +379,10 @@ security.unknown_action
 security.unknown_content_action
 security.unknown_rule
 t.auth test
+t.boom test
 t.broke test
 t.limited test
+t.plugin_threw test
 t.upstream test
 t.x test
 yaml.anchor_or_alias

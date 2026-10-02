@@ -671,7 +671,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 31 起出站脱敏有**身份证号和银行卡号**两条出厂就开的规则：[`Matcher`] 多了
 /// `cn-resident-id` 和 `bank-card`（[`CardNetwork`]、[`CardPrefix`]），[`SecretKind`] 多了
 /// `personal`。照 30 写的界面说不出这两条规则按什么认。
-pub const CONTROL_API_VERSION: u32 = 31;
+///
+/// **32 起有脚本插件**：事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者文件变了、
+/// 加载不了而停用）。照 31 写的界面不认这个事件。
+pub const CONTROL_API_VERSION: u32 = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1303,6 +1306,23 @@ pub enum Event {
         probe: ProbeClass,
         at_ms: u64,
     },
+    /// 一个插件没能把事情做成：在一个请求上运行出错（超时、超内存、抛了异常、交回的
+    /// 东西不合规矩），或者它的文件变了、加载不了，从此不再运行。
+    ///
+    /// **给通知用。**请求上的每一次运行都记在那条请求上（`RequestDetail::plugins`），
+    /// 这条只说出了错的；停用那一种只在变成停用的那一刻说一次。`id` 和别的通知一样
+    /// 是新取的号，出错的那个请求是 `request_id`。
+    PluginFailed {
+        id: u64,
+        plugin_id: String,
+        /// 插件自己起的名字。**插件写的字**，界面当纯文本显示
+        plugin_name: String,
+        /// 在哪个请求上出的错。停用（文件变了、加载不了）不挂在请求上，没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+        message: Msg,
+        at_ms: u64,
+    },
     /// 这个订阅者跟不上，事件流丢了它 `count` 条事件。
     ///
     /// **只发给掉队的那一个**，不进总线：别的订阅者什么都没丢。收到它就说明
@@ -1489,6 +1509,7 @@ impl Event {
             | Event::CredentialRotated { id, .. }
             | Event::CredentialExpired { id, .. }
             | Event::LoginFinished { id, .. }
+            | Event::PluginFailed { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }
@@ -4674,6 +4695,131 @@ pub struct SecurityTestResult {
     pub hits: Vec<SecurityTestHit>,
 }
 
+// ---------------------------------------------------------------- 脚本插件
+
+slug_enum! {
+    /// 一个插件要的权限：它能看、能改请求和回答的哪一部分。
+    ///
+    /// **插件文件里写成 `reply.text`、`reply.tool_calls`**（作者写的那种），线上是下划线
+    pub enum Permission {
+        /// 开头的那段系统指令
+        System = "system",
+        /// 对话里的消息
+        Messages = "messages",
+        /// 工具定义
+        Tools = "tools",
+        /// 模型名、`max_tokens` 这类参数。改了模型名，路由按新的走
+        Params = "params",
+        /// 回答里的文字
+        ReplyText = "reply_text",
+        /// 回答里的工具调用。**高风险**：改出来的调用照样过工具调用审查
+        ReplyToolCalls = "reply_tool_calls",
+    }
+}
+
+slug_enum! {
+    /// 插件出错（运行出错、文件变了、加载不了）时这个请求怎么办。
+    pub enum OnError {
+        /// 拒绝这个请求。出厂就是它：插件管不了的请求不该悄悄照原样发出去
+        Reject = "reject",
+        /// 跳过这个插件，请求照常
+        Skip = "skip",
+    }
+}
+
+slug_enum! {
+    /// 改回答文字的插件怎么拿到文字。
+    pub enum ReplyMode {
+        /// 一段文字整段交给插件，改完才发给客户端
+        Block = "block",
+        /// 边到边交，插件可以先压着一部分
+        Stream = "stream",
+    }
+}
+
+slug_enum! {
+    /// 插件设置项的类型。
+    pub enum SettingKind {
+        String = "string",
+        Number = "number",
+        Boolean = "boolean",
+    }
+}
+
+slug_enum! {
+    /// 插件在一个请求的哪一段上跑。
+    pub enum PluginHook {
+        /// 请求发往上游之前
+        Request = "request",
+        /// 回答到达客户端之前
+        Reply = "reply",
+    }
+}
+
+slug_enum! {
+    /// 一个插件在一个请求上的结果。
+    pub enum PluginOutcome {
+        /// 跑了，没改
+        Unchanged = "unchanged",
+        /// 跑了，改了
+        Changed = "changed",
+        /// 插件拒绝了这个请求（`reject()`）
+        Rejected = "rejected",
+        /// 出错了：超时、超内存、抛了异常、交回的东西不合规矩，或者插件没加载起来
+        Error = "error",
+        /// 没跑：插件没加载起来（文件变了、加载出错），而它设的是出错时跳过
+        Skipped = "skipped",
+    }
+}
+
+slug_enum! {
+    /// 插件日志一行的级别，`console.log` / `info` / `warn` / `error` 各一个。
+    pub enum PluginLogLevel {
+        Log = "log",
+        Info = "info",
+        Warn = "warn",
+        Error = "error",
+    }
+}
+
+/// 插件日志的一行。**原样是插件写的**：界面一律当纯文本显示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginLogEntry {
+    pub at_ms: u64,
+    /// 哪个请求上写的。和请求记录的号是同一个
+    pub request_id: Option<u64>,
+    pub hook: PluginHook,
+    pub level: PluginLogLevel,
+    pub text: String,
+}
+
+/// 一个插件从 core 这次启动以来跑得怎么样。**只在内存里**：重启就从零数起。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginStats {
+    /// 真的跑了几次（没跑的「跳过」不算）。请求上一次、一个回答一次
+    pub calls: u64,
+    /// 其中改了东西的
+    pub changed: u64,
+    /// 其中插件拒绝了请求的
+    pub rejected: u64,
+    /// 其中出错的
+    pub errors: u64,
+    /// 平均每次用了多少 CPU，微秒。没跑过是 0
+    pub avg_cpu_us: u64,
+    /// 最近一次出错
+    pub last_error: Option<PluginLastError>,
+}
+
+/// 插件最近一次出错。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginLastError {
+    pub at_ms: u64,
+    pub message: Msg,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4787,8 +4933,24 @@ mod tests {
         );
         check(Guard::ALL, Guard::slug, Guard::from_slug);
         check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);
+        check(Permission::ALL, Permission::slug, Permission::from_slug);
+        check(OnError::ALL, OnError::slug, OnError::from_slug);
+        check(ReplyMode::ALL, ReplyMode::slug, ReplyMode::from_slug);
+        check(SettingKind::ALL, SettingKind::slug, SettingKind::from_slug);
+        check(PluginHook::ALL, PluginHook::slug, PluginHook::from_slug);
+        check(
+            PluginOutcome::ALL,
+            PluginOutcome::slug,
+            PluginOutcome::from_slug,
+        );
+        check(
+            PluginLogLevel::ALL,
+            PluginLogLevel::slug,
+            PluginLogLevel::from_slug,
+        );
         assert_eq!(GroupKind::LoadBalance.slug(), "load-balance");
         assert_eq!(Guard::InspectTools.slug(), "inspect_tools");
+        assert_eq!(Permission::ReplyToolCalls.slug(), "reply_tool_calls");
     }
 
     #[test]

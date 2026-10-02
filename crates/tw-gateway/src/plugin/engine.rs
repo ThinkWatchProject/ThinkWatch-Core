@@ -1,0 +1,137 @@
+//! 网关要从插件运行时那里拿到的东西：把一份源码编成插件，读出它的 manifest。
+//!
+//! **这里是一道接缝**：沙箱在 `tw-plugin` 里，网关只认这个 trait。真的运行时接上之前，
+//! 由 [`Unavailable`] 顶着 —— 每个插件都「加载不了」，有一个就拒一个请求（出错时
+//! 拒绝是出厂的做法），而不是悄悄放过。测试拿一个假的引擎接在这里。
+
+use std::sync::Arc;
+
+use crate::plugin::host::PluginHost;
+use crate::plugin::set::Scope;
+
+/// 插件文件里 `manifest` 写的东西，加上它导出了哪些钩子。**由运行时读出来、校验过**：
+/// 权限和钩子对得上、设置项不超过上限，这里拿到的都是合规的。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Manifest {
+    /// 插件自己起的名字。**插件写的字**：界面当纯文本显示
+    pub name: String,
+    /// 插件接口的版本。只有 1
+    pub api: u32,
+    pub description: Option<String>,
+    /// 按 [`tw_api::Permission::ALL`] 的顺序，不重复
+    pub permissions: Vec<tw_api::Permission>,
+    /// 插件建议的范围。装上时照它填进配置，之后以配置为准
+    pub scope: Scope,
+    pub reply_mode: tw_api::ReplyMode,
+    /// 按插件写的顺序
+    pub settings: Vec<SettingSpec>,
+    pub hooks: Hooks,
+}
+
+/// 一个设置项。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingSpec {
+    pub key: String,
+    pub kind: tw_api::SettingKind,
+    /// 插件写的字
+    pub label: String,
+    /// 和 `kind` 同一种类型
+    pub default: serde_json::Value,
+}
+
+/// 插件导出了哪些钩子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hooks {
+    /// `onRequest`
+    pub request: bool,
+    /// `onReplyText`
+    pub reply_text: bool,
+    /// `onReplyTextEnd`，只在 stream 模式下有
+    pub reply_text_end: bool,
+    /// `onToolCall`
+    pub tool_call: bool,
+}
+
+impl Hooks {
+    /// 回答那一段有没有它的事
+    pub fn on_reply(&self) -> bool {
+        self.reply_text || self.tool_call
+    }
+}
+
+/// 编不成的原因。
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum LoadError {
+    #[error("the plugin file is larger than the limit")]
+    TooLarge,
+    /// 语法错。行列从 1 起，运行时说得出来才有
+    #[error("{message}")]
+    Syntax {
+        message: String,
+        line: Option<u32>,
+        column: Option<u32>,
+    },
+    /// manifest 不合规矩：缺字段、权限和钩子对不上、设置项写错了……原话是运行时的
+    #[error("{0}")]
+    Manifest(String),
+    #[error("the plugin is written for plugin API {0}, and only API 1 is supported")]
+    UnsupportedApi(u32),
+    /// 运行时自己出了问题，或者根本没有运行时（见 [`Unavailable`]）
+    #[error("{0}")]
+    Engine(String),
+}
+
+/// 插件运行时。**一个进程一个**，所有插件共用。
+pub trait Engine: Send + Sync {
+    /// 用**正好这些字节**编一个插件（不变式 I9：跑的就是哈希过、比对过的那一份）。
+    fn load(&self, source: &[u8]) -> Result<Arc<dyn PluginHost>, LoadError>;
+}
+
+/// 没有运行时：每个插件都加载不了，原因就是 `reason`。
+#[derive(Debug, Clone)]
+pub struct Unavailable(pub String);
+
+impl Default for Unavailable {
+    fn default() -> Self {
+        Self("the plugin engine is not available in this build".into())
+    }
+}
+
+impl Engine for Unavailable {
+    fn load(&self, _source: &[u8]) -> Result<Arc<dyn PluginHost>, LoadError> {
+        Err(LoadError::Engine(self.0.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_an_engine_every_plugin_fails_to_load_and_says_why() {
+        let e = Unavailable::default();
+        let Err(LoadError::Engine(why)) = e.load(b"export const manifest = {}") else {
+            panic!("the stand-in engine loaded something");
+        };
+        assert!(why.contains("not available"), "{why}");
+    }
+
+    #[test]
+    fn only_text_and_tool_call_hooks_make_a_plugin_part_of_the_reply() {
+        assert!(!Hooks::default().on_reply());
+        assert!(
+            !Hooks {
+                request: true,
+                ..Default::default()
+            }
+            .on_reply()
+        );
+        assert!(
+            Hooks {
+                tool_call: true,
+                ..Default::default()
+            }
+            .on_reply()
+        );
+    }
+}

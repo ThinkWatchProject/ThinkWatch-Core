@@ -623,6 +623,8 @@ impl Recorder {
             | Event::ProxyChanged { .. }
             | Event::AuthChanged { .. }
             | Event::ListenChanged { .. }
+            // 插件出错是一条通知。它在请求上的那次运行另走一条路落库
+            | Event::PluginFailed { .. }
             // 自己刚报出去的那条。**不能再处理一遍** —— 那是一个回路
             | Event::RequestPriced { .. }
             // 只发给事件流上掉队的那一个订阅者，从不进总线

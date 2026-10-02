@@ -43,6 +43,9 @@ pub struct Runtime {
     pub content: Arc<tw_guard::content::Rules>,
     /// 藏匿字符查哪几种
     pub hidden: Vec<tw_guard::hidden::Kind>,
+    /// 脚本插件，按配置里的顺序。**和配置一起建、一起换**：一个请求从头到尾看到的是
+    /// 同一份，请求钩子和回答钩子之间换了配置也不会跨在两份上
+    pub plugins: Arc<crate::plugin::PluginSet>,
 }
 
 impl Runtime {
@@ -108,6 +111,7 @@ impl Runtime {
             tools: Arc::new(tools),
             content: Arc::new(content),
             hidden,
+            plugins: Default::default(),
         })
     }
 }

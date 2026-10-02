@@ -33,6 +33,7 @@ pub mod live;
 pub mod models;
 pub mod oauth;
 pub mod outbound;
+pub mod plugin;
 pub mod probe;
 pub mod quota;
 pub mod quote;
