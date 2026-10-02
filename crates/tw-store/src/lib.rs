@@ -15,6 +15,7 @@ pub mod model_name;
 pub mod recorder;
 pub mod search;
 pub mod task;
+pub mod transcript;
 
 pub use blobs::{Blobs, Which};
 pub use db::{Db, DbError, Latency, RequestRow, SecurityEvent, Summary, TokenRate};

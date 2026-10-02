@@ -60,6 +60,8 @@ endpoints! {
     Fixture: GET "/request/{id}/fixture" [id], () => String, text;
     Sessions: GET "/sessions", api::ListQuery => Vec<api::SessionView>;
     SessionDetail: GET "/sessions/{id}" [id], () => api::SessionDetail;
+    /// 一次会话读成一段对话：每一轮新说的话、回答、工具调用和结果（已脱敏）
+    SessionTranscript: GET "/sessions/{id}/transcript" [id], () => api::Transcript;
 
     // ─────────────────────────────────────────────── 测速、回放、试路由
     SpeedQuote: POST "/speed/quote", api::SpeedRunRequest => api::SpeedQuote;
