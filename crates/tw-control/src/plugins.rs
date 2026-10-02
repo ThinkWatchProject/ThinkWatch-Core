@@ -889,7 +889,8 @@ fn refused(why: Msg) -> tw_api::PluginTrialResult {
 /// 试跑本身在数据面那一侧（视图、写回、占位符都在 [`tw_gateway::plugin::trial`]）。
 ///
 /// 存下来的回答是上游的原话：回答它的那一家说什么格式，看服务它的那一跳转换过没有，
-/// 和会话记录读回答是同一个办法
+/// 和会话记录读回答是同一个办法。插件的 `ctx` 按这一行的路由给：回答它的那一家，和发给
+/// 那一家的模型名
 async fn run_trial(
     s: &ControlState,
     active: &Active,
@@ -916,6 +917,8 @@ async fn run_trial(
             query: None,
             body,
             client: row.client_hint.as_deref(),
+            upstream: &row.provider,
+            sent_model: &row.sent_model,
         }),
         reply
             .as_deref()

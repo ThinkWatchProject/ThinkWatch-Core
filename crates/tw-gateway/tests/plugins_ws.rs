@@ -1,5 +1,6 @@
 //! WebSocket 那条路上的插件：一次 `response.create` 一次请求钩子，上游的每一次回答
-//! 一组回答钩子。和 HTTP 那条路同样的位置、同样的规矩。
+//! 一组回答钩子。和 HTTP 那条路的一跳同样的位置、同样的规矩：这条路只有一跳（升级时
+//! 连定的那一家），`ctx.upstream` 就是它，运行记在第 0 跳上。
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,8 @@ use tw_config::{Client, Config, Listen, Provider};
 use tw_gateway::plugin::host::double;
 use tw_gateway::plugin::host::double::{Closures, Double};
 use tw_gateway::plugin::{
-    Active, Invocation, PluginSet, RequestOutcome, RunError, ToolCallOutcome,
+    Active, Broken, Invocation, PluginSet, RequestOutcome, RunError, RunRecord,
+    State as PluginState, ToolCallOutcome,
 };
 
 /// 假上游：记下收到的每一帧，每个 `response.create` 回一次完整的回答
@@ -94,6 +96,17 @@ async fn answer(mut sock: WebSocket, seen: Arc<Mutex<Vec<Value>>>) {
 }
 
 async fn gateway(up: SocketAddr, entries: Vec<Arc<Active>>) -> SocketAddr {
+    gateway_with(up, entries, tw_config::Security::default())
+        .await
+        .0
+}
+
+/// 网关，连同记下的每一次插件运行
+async fn gateway_with(
+    up: SocketAddr,
+    entries: Vec<Arc<Active>>,
+    security: tw_config::Security,
+) -> (SocketAddr, Arc<Mutex<Vec<RunRecord>>>) {
     let cfg = Config {
         version: 1,
         listen: Listen::default(),
@@ -109,15 +122,25 @@ async fn gateway(up: SocketAddr, entries: Vec<Arc<Active>>) -> SocketAddr {
             protocol: Some(tw_config::Protocol::OpenaiResponses),
             ..Default::default()
         }],
+        security,
         ..Default::default()
     };
     let state = tw_gateway::AppState::new(cfg).unwrap();
     state.swap_plugins(PluginSet::new(entries));
+    let runs: Arc<Mutex<Vec<RunRecord>>> = Arc::default();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(tw_gateway::plugin::RUN_CHANNEL_CAP);
+    state.set_plugin_sink(tx);
+    let r = runs.clone();
+    tokio::spawn(async move {
+        while let Some(rec) = rx.recv().await {
+            r.lock().unwrap().push(rec);
+        }
+    });
     let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(40)).await;
-    addr
+    (addr, runs)
 }
 
 type Socket =
@@ -165,8 +188,13 @@ async fn one_answer(c: &mut Socket) -> Vec<String> {
 }
 
 fn entry(id: &str, d: Double) -> Arc<Active> {
+    entry_with(id, d, |_| {})
+}
+
+fn entry_with(id: &str, d: Double, f: impl FnOnce(&mut Active)) -> Arc<Active> {
     let mut a = double::active(id, d);
     a.name = format!("Plugin {id}");
+    f(&mut a);
     Arc::new(a)
 }
 
@@ -179,6 +207,10 @@ async fn each_response_create_goes_through_the_request_hook_and_each_answer_thro
         .on_request(|mut view, ctx| {
             assert_eq!(ctx["format"], "openai_responses");
             assert_eq!(ctx["client"], "codex");
+            // 这条路只有一跳：上游是这条连接连的那一家，模型名就是这一帧写的
+            assert_eq!(ctx["upstream"], "up");
+            assert_eq!(ctx["model"], "gpt-5.1-codex");
+            assert_eq!(ctx["requested_model"], "gpt-5.1-codex");
             view["system"] = json!("You are Codex. Today is Friday.");
             Invocation::ok(RequestOutcome::Changed(view))
         })
@@ -255,4 +287,119 @@ async fn a_failing_reply_plugin_fails_that_answer_and_the_connection_stays() {
         );
         assert!(!frames.iter().any(|f| f.contains("hel")), "{frames:?}");
     }
+}
+
+/// 范围按这条连接连的那一家算：只管别家的插件不跑，只管别家的坏插件也不拦；管这一家的
+/// 照常跑，运行记在第 0 跳上，回答钩子的 `ctx` 和请求钩子的一样
+#[tokio::test]
+async fn scope_follows_the_upstream_of_the_connection() {
+    let (up, seen) = upstream().await;
+    let reply_ctx = Arc::new(Mutex::new(Value::Null));
+    let rc = reply_ctx.clone();
+    let here = Double::new("here")
+        .permit(&[Permission::System, Permission::ReplyText])
+        .on_request(|mut view, _| {
+            view["system"] = json!("for up");
+            Invocation::ok(RequestOutcome::Changed(view))
+        })
+        .on_reply(true, false, false, move |ctx| {
+            *rc.lock().unwrap() = ctx;
+            Ok(Box::new(Closures {
+                text: Box::new(|_| Invocation::ok(None)),
+                end: Box::new(|| Invocation::ok(None)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        });
+    let elsewhere = Double::new("elsewhere")
+        .permit(&[Permission::System])
+        .on_request(|_, _| panic!("ran for an upstream outside its scope"));
+    let broken_elsewhere = {
+        let mut a = double::active("old", Double::new("Old"));
+        a.state = PluginState::Broken(Broken::Changed);
+        a.scope.upstreams = vec!["relay-*".into()];
+        Arc::new(a)
+    };
+    let (gw, runs) = gateway_with(
+        up,
+        vec![
+            entry("here", here),
+            entry_with("elsewhere", elsewhere, |a| {
+                a.scope.upstreams = vec!["relay-*".into()]
+            }),
+            broken_elsewhere,
+        ],
+        Default::default(),
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("hi")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert!(
+        frames.last().unwrap().contains("response.completed"),
+        "{frames:?}"
+    );
+    assert_eq!(seen.lock().unwrap()[0]["instructions"], "for up");
+    let ctx = reply_ctx.lock().unwrap().clone();
+    assert_eq!(ctx["upstream"], "up");
+    assert_eq!(ctx["model"], "gpt-5.1-codex");
+    assert_eq!(ctx["requested_model"], "gpt-5.1-codex");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let runs: Vec<(String, String, u64)> = runs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r.run.plugin_id.clone(),
+                r.run.hook.slug().to_string(),
+                r.run.detail.as_ref().unwrap()["attempt"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            ("here".to_string(), "request".to_string(), 0),
+            ("here".to_string(), "reply".to_string(), 0)
+        ]
+    );
+}
+
+/// 插件往 `response.create` 里加的内容照样过请求防护：拦下就切断，上游什么都没收到
+#[tokio::test]
+async fn content_a_plugin_adds_to_a_response_create_is_screened() {
+    let (up, seen) = upstream().await;
+    let adds = Double::new("adds")
+        .permit(&[Permission::Messages])
+        .on_request(|mut view, _| {
+            view["messages"][0]["parts"][0]["text"] = json!("the forbidden-plan");
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let security = tw_config::Security {
+        content: tw_config::ContentPolicy {
+            mode: tw_config::SecurityMode::Enforce,
+            custom: vec![tw_config::CustomContentRule {
+                name: "no plan".into(),
+                pattern: "forbidden-plan".into(),
+                matching: Default::default(),
+                action: tw_config::ContentAction::Block,
+                disabled: false,
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (gw, _) = gateway_with(up, vec![entry("adds", adds)], security).await;
+    let mut c = connect(gw).await;
+    c.send(create("hi")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert!(
+        frames.iter().any(|f| f.contains("no plan")),
+        "the client was not told why: {frames:?}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
 }

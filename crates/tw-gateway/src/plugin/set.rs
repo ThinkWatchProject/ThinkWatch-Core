@@ -18,26 +18,26 @@ use crate::plugin::host::PluginHost;
 
 /// 一个插件管哪些请求。**每张单子里都是 `*` 通配**（不分大小写，和路由规则同一种），
 /// 空着是「都管」。
+///
+/// **按每一次发往上游来看**（契约附录二）：请求钩子排在路由之后，每试一家上游跑一次，
+/// 那时这一次的客户端、发出去的模型和上游都定了 —— 请求钩子和回答钩子看的是同三样。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scope {
     /// 客户端应用：`claude-code`、`codex`……（请求记录上的 `client_hint`）
     pub clients: Vec<String>,
-    /// 客户端要的模型
+    /// **发给上游的模型**：路由规则改写过的是改写之后的那个，不是客户端写的
     pub models: Vec<String>,
-    /// 服务这个回答的上游。**只管回答那一段** —— 请求钩子跑的时候还没选上游
+    /// 这一次发往的上游
     pub upstreams: Vec<String>,
 }
 
 impl Scope {
-    /// 请求钩子管不管这个请求。认不出是哪个应用（`client` 是 None）时，只有不挑
-    /// 应用的插件管它
-    pub fn covers_request(&self, client: Option<&str>, model: &str) -> bool {
-        listed(&self.clients, client) && listed(&self.models, Some(model))
-    }
-
-    /// 回答钩子管不管这个回答
-    pub fn covers_reply(&self, client: Option<&str>, model: &str, upstream: &str) -> bool {
-        self.covers_request(client, model) && listed(&self.upstreams, Some(upstream))
+    /// 管不管发往 `upstream`、模型名是 `model` 的这一次。认不出是哪个应用（`client`
+    /// 是 None）时，只有不挑应用的插件管它
+    pub fn covers(&self, client: Option<&str>, model: &str, upstream: &str) -> bool {
+        listed(&self.clients, client)
+            && listed(&self.models, Some(model))
+            && listed(&self.upstreams, Some(upstream))
     }
 }
 
@@ -143,25 +143,31 @@ impl PluginSet {
         self.plugins.is_empty()
     }
 
-    /// 这个请求上要过一遍的插件，按顺序：启用的、范围管得着的，**连同跑不了的** ——
-    /// 跑不了的由调用方照它的 `on_error` 拒绝请求或者跳过它（管得着就要处置，不管它
-    /// 有没有请求钩子：它一旦加载不了，回答那一段同样做不了）。能跑的只列有请求钩子的。
-    pub fn for_request(&self, client: Option<&str>, model: &str) -> Vec<Arc<Active>> {
+    /// 发往一个上游之前要过一遍的插件，按顺序：启用的、管得着这一次的，**连同跑不了
+    /// 的** —— 跑不了的由调用方照它的 `on_error` 拒绝请求或者跳过它（管得着就要处置，
+    /// 不管它有没有请求钩子：它一旦加载不了，回答那一段同样做不了）。能跑的只列有请求
+    /// 钩子的。**管不着这一次的不算**：只管别的上游的插件坏了，拦不着发往这一家的请求。
+    pub fn for_request(
+        &self,
+        client: Option<&str>,
+        model: &str,
+        upstream: &str,
+    ) -> Vec<Arc<Active>> {
         self.plugins
             .iter()
-            .filter(|p| p.enabled && p.scope.covers_request(client, model))
+            .filter(|p| p.enabled && p.scope.covers(client, model, upstream))
             .filter(|p| p.ready().is_none() || p.hooks.request)
             .cloned()
             .collect()
     }
 
-    /// 这个回答上要过一遍的插件，按顺序：启用的、能跑的、有回答钩子的、范围管得着的
-    /// （连同上游）。**跑不了的不在这里**：它们在请求那一段已经处置过了。
+    /// 这个回答上要过一遍的插件，按顺序：启用的、能跑的、有回答钩子的、管得着回答它的
+    /// 那一次的。**跑不了的不在这里**：它们在那一次发出去之前已经处置过了。
     pub fn for_reply(&self, client: Option<&str>, model: &str, upstream: &str) -> Vec<Arc<Active>> {
         self.plugins
             .iter()
             .filter(|p| p.enabled && p.ready().is_some() && p.hooks.on_reply())
-            .filter(|p| p.scope.covers_reply(client, model, upstream))
+            .filter(|p| p.scope.covers(client, model, upstream))
             .cloned()
             .collect()
     }
@@ -375,23 +381,22 @@ mod tests {
     #[test]
     fn an_empty_list_covers_everything_and_globs_ignore_case() {
         let all = Scope::default();
-        assert!(all.covers_request(None, "anything"));
-        assert!(all.covers_reply(Some("codex"), "gpt-5", "openai"));
+        assert!(all.covers(None, "anything", "anywhere"));
+        assert!(all.covers(Some("codex"), "gpt-5", "openai"));
 
         let s = scope(&["claude-*"], &["Claude-Sonnet-*"], &["anthropic"]);
-        assert!(s.covers_request(Some("claude-code"), "claude-sonnet-4-5"));
-        assert!(!s.covers_request(Some("codex"), "claude-sonnet-4-5"));
-        assert!(!s.covers_request(Some("claude-code"), "gpt-5"));
-        assert!(s.covers_reply(Some("claude-code"), "claude-sonnet-4-5", "anthropic"));
-        assert!(!s.covers_reply(Some("claude-code"), "claude-sonnet-4-5", "relay"));
+        assert!(s.covers(Some("claude-code"), "claude-sonnet-4-5", "anthropic"));
+        assert!(!s.covers(Some("codex"), "claude-sonnet-4-5", "anthropic"));
+        assert!(!s.covers(Some("claude-code"), "gpt-5", "anthropic"));
+        assert!(!s.covers(Some("claude-code"), "claude-sonnet-4-5", "relay"));
     }
 
     /// 认不出是哪个应用的请求，挑应用的插件不管它 —— 管了就等于对每个不认识的
     /// 客户端都改请求
     #[test]
     fn an_unknown_client_is_covered_only_by_plugins_that_do_not_pick_clients() {
-        assert!(scope(&[], &[], &[]).covers_request(None, "m"));
-        assert!(!scope(&["*"], &[], &[]).covers_request(None, "m"));
+        assert!(scope(&[], &[], &[]).covers(None, "m", "u"));
+        assert!(!scope(&["*"], &[], &[]).covers(None, "m", "u"));
     }
 
     /// 请求钩子那一段：按配置的顺序；跑不了的也在（调用方照 `on_error` 处置），
@@ -409,8 +414,45 @@ mod tests {
             active("a-last", REQUEST, Scope::default(), None),
         ]);
         assert_eq!(
-            ids(&set.for_request(Some("claude-code"), "claude-opus-4-5")),
+            ids(&set.for_request(Some("claude-code"), "claude-opus-4-5", "anthropic")),
             ["b-first", "changed", "a-last"]
+        );
+    }
+
+    /// 发往哪一家定了才挑插件：只管某一家的，发往别家时不跑；**坏了的也一样** —— 它
+    /// 只拦发往它那一家的请求，不再因为「还不知道去哪儿」把别家的也拦下
+    #[test]
+    fn the_request_list_follows_the_upstream_of_the_attempt() {
+        let set = PluginSet::new(vec![
+            active("only-a", REQUEST, scope(&[], &[], &["relay-a"]), None),
+            active(
+                "broken-a",
+                REQUEST,
+                scope(&[], &[], &["relay-a"]),
+                Some(Broken::Changed),
+            ),
+            active("everywhere", REQUEST, Scope::default(), None),
+        ]);
+        assert_eq!(
+            ids(&set.for_request(None, "m", "relay-a")),
+            ["only-a", "broken-a", "everywhere"]
+        );
+        assert_eq!(ids(&set.for_request(None, "m", "relay-b")), ["everywhere"]);
+    }
+
+    /// 模型看的是发出去的那个：规则把 claude 改成 glm 发给中转，管 `glm-*` 的插件管这一次
+    #[test]
+    fn models_match_the_model_sent_upstream() {
+        let set = PluginSet::new(vec![active(
+            "glm",
+            REQUEST,
+            scope(&[], &["glm-*"], &[]),
+            None,
+        )]);
+        assert_eq!(ids(&set.for_request(None, "glm-4.6", "relay")), ["glm"]);
+        assert!(
+            set.for_request(None, "claude-sonnet-4-5", "relay")
+                .is_empty()
         );
     }
 

@@ -1014,6 +1014,12 @@ Neither keeps the rest of the configuration from taking effect.
 
 Plugins run in the order of this list.
 
+A plugin changes a request after routing, each time the request is sent to an
+upstream. A request that fails over to another upstream starts again from what
+the client sent, and the plugin sees which upstream and which model name the
+request goes to. Routing, model checks and session grouping use what the
+client sent.
+
 <!-- generated: table plugins[] -->
 <a id="cfg-plugins"></a>
 
@@ -1034,8 +1040,8 @@ Plugins run in the order of this list.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `clients` | list of strings | `[]` | Client apps (`claude-code`, `codex`, …), as names or globs. `[]`: every client, including requests whose app is not recognised. |
-| `models` | list of strings | `[]` | Models the client asks for, as model ids or globs (`claude-*`). `[]`: every model. |
-| `upstreams` | list of strings | `[]` | Upstreams whose answers the plugin handles, by name or glob. It applies to answers only: a request is changed before an upstream is chosen. `[]`: every upstream. |
+| `models` | list of strings | `[]` | Models sent to the upstream, as model ids or globs (`claude-*`). When a routing rule renames the model, the new name is the one that matches. `[]`: every model. |
+| `upstreams` | list of strings | `[]` | Upstreams the plugin handles, by name or glob, for requests and answers alike. `[]`: every upstream. |
 <!-- /generated -->
 
 ```yaml

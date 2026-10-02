@@ -38,6 +38,7 @@ pub(super) fn respond(
         provider,
         ledger,
         session,
+        ..
     } = served;
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);

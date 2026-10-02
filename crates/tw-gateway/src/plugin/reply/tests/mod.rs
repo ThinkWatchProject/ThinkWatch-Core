@@ -51,8 +51,10 @@ async fn chain_with(
             dialect,
             client: None,
             model: "m",
+            requested_model: "m",
             upstream: "u",
             request_id: 1,
+            attempt: 0,
         },
     )
     .await

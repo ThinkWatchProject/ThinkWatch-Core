@@ -130,6 +130,21 @@ pub fn replace(
     (bytes::Bytes::from(r.text), r.ledger)
 }
 
+/// `after` 里 `before` 没有的那些值：插件写进请求里的（见 [`crate::plugin::request`]）。
+///
+/// 按规则和打过码的样子比：同一个值在两份里打出来的码一样。客户端原话里就有的值，开头
+/// 那一遍已经报过了，插件改过的那一份里再出现不再报一次。
+pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
+    after
+        .into_iter()
+        .filter(|f| {
+            !before
+                .iter()
+                .any(|b| b.rule == f.rule && b.masked == f.masked)
+        })
+        .collect()
+}
+
 /// 找到的东西写成事件里的样子。
 pub fn items(found: &[Finding]) -> Vec<tw_api::SecretItem> {
     found
@@ -188,6 +203,64 @@ pub fn screen(
     let mut refusal = hidden_found(bus, id, provider, s.hidden_mode, &hidden);
     if s.content_mode.detects() && !s.content.is_empty() {
         let hits = s.content.scan_request(request);
+        let refused = content_matched(bus, id, provider, s.content_mode, &hits);
+        refusal = refusal.or(refused);
+    }
+    refusal
+}
+
+/// 插件改过的请求再看一遍：**只看插件加进来的。**
+///
+/// 客户端的原话在开头已经看过（[`screen`]），该报的报了、该拒的拒了；插件改过的那一份
+/// 要是整个再报一遍，同一处藏匿字符、同一条命中会在安全日志里出现两次。所以两份都扫，
+/// 原话里就有的那几处减掉，剩下的照 [`screen`] 的规矩报、下结论 —— 拦截档下原话里命中
+/// 「拦」的请求走不到这一步，这一遍拒不拒只看插件加进来的。
+pub fn screen_more(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    s: &Screen,
+    before: &tw_dialect::ir::Request,
+    after: &tw_dialect::ir::Request,
+) -> Option<tw_types::Msg> {
+    let hidden = if s.hidden_mode.detects() {
+        let was = tw_guard::hidden::scan_request(before, &s.hidden);
+        let mut now = tw_guard::hidden::scan_request(after, &s.hidden);
+        // 一种藏法在一个地方合成一条：插件往同一处又藏了几个，那一条就变了，整条再报
+        now.retain(|n| {
+            !was.iter().any(|w| {
+                w.kind == n.kind
+                    && w.in_tool_result == n.in_tool_result
+                    && w.example == n.example
+                    && w.revealed == n.revealed
+                    && n.count <= w.count
+            })
+        });
+        now
+    } else {
+        Vec::new()
+    };
+    let mut refusal = hidden_found(bus, id, provider, s.hidden_mode, &hidden);
+    if s.content_mode.detects() && !s.content.is_empty() {
+        let mut was = s.content.scan_request(before);
+        let mut hits = s.content.scan_request(after);
+        // 一处一处地减：原话里有一处，插件那一版里同样的一处就不是新的。位置不比 ——
+        // 插件在前面加了字，后面的位置都挪了
+        hits.retain(|h| {
+            match was.iter().position(|w| {
+                w.rule == h.rule
+                    && w.custom == h.custom
+                    && w.action == h.action
+                    && w.snippet == h.snippet
+                    && w.in_tool_result == h.in_tool_result
+            }) {
+                Some(i) => {
+                    was.swap_remove(i);
+                    false
+                }
+                None => true,
+            }
+        });
         let refused = content_matched(bus, id, provider, s.content_mode, &hits);
         refusal = refusal.or(refused);
     }

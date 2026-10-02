@@ -1056,6 +1056,13 @@ async fn request_detail(
         .map_err(records)?
         .into_iter()
         .map(|r| tw_api::PluginRunView {
+            // 第几跳记在 `detail` 里（数据面每一次运行都写）
+            attempt: r
+                .detail
+                .as_deref()
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                .and_then(|d| d.get("attempt").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0) as u32,
             plugin_id: r.plugin_id,
             plugin_name: r.plugin_name,
             hook: r.hook,

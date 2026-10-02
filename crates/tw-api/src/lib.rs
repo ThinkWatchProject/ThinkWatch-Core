@@ -678,9 +678,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 ///
 /// **33 起有脚本插件**：`/plugins` 一组端点（列表、试编、装、改、换源码、看改动、批准、
 /// 排顺序、删、试跑、日志），事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者
-/// 文件变了、加载不了而停用），[`RequestDetail`] 多了 `plugins`（每一次运行）和
-/// `request_after_plugins`（插件改过的请求体），[`HistoryRow`] 多了 `plugin_changed`。
-/// 装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 32 写的界面看不到插件。
+/// 文件变了、加载不了而停用），[`RequestDetail`] 多了 `plugins`（每一次运行，带着跑在
+/// 尝试链的第几跳）和 `request_after_plugins`（插件改过的请求体），[`HistoryRow`] 多了
+/// `plugin_changed`。装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 32
+/// 写的界面看不到插件。
 pub const CONTROL_API_VERSION: u32 = 33;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3696,10 +3697,12 @@ pub struct RequestDetail {
     pub row: HistoryRow,
     /// 客户端发来的原样
     pub request_body: Option<BodyView>,
-    /// 插件改过之后、发往上游的那一份。**只有插件改了请求才有**
+    /// 插件改过之后、发往上游的那一份：最后发出去的那一跳收到的（回答的那一家收到的就是
+    /// 它）。**只有插件改了那一跳的请求才有**
     pub request_after_plugins: Option<BodyView>,
     pub response_body: Option<BodyView>,
-    /// 插件在这个请求上的每一次运行，按先后（请求钩子在前，回答钩子在后）
+    /// 插件在这个请求上的每一次运行，按先后：每一跳的请求钩子，回答那一跳的回答钩子。
+    /// 按 [`PluginRunView::attempt`] 对着尝试链分组
     pub plugins: Vec<PluginRunView>,
     /// 这个请求还在跑。**记录在结局到了才落库**，这时的 `row` 是到目前为止
     /// 知道的那些：开始时的身份和上游，响应头到了就有状态码，路由走完就有
@@ -4990,9 +4993,9 @@ impl SettingValue {
 pub struct PluginScope {
     /// 客户端应用：`claude-code`、`codex`……（请求记录上的 `client_hint`）
     pub clients: Vec<String>,
-    /// 客户端要的模型
+    /// 发给上游的模型：路由规则改了名的，按改名之后的
     pub models: Vec<String>,
-    /// 服务回答的上游。**只管回答那一段**：改请求时还没选上游
+    /// 发往的上游。**请求和回答都按它**：请求钩子排在路由之后，每发往一个上游跑一次
     pub upstreams: Vec<String>,
 }
 
@@ -5220,6 +5223,9 @@ pub struct PluginRunView {
     /// 当时的名字。**插件写的字**
     pub plugin_name: String,
     pub hook: PluginHook,
+    /// 跑在尝试链上的第几跳（从 0 起，对着 [`RoutingView::attempts`]）。请求钩子每发往一个
+    /// 上游跑一次，故障转移换了上游就多一组；回答钩子跑在回答的那一跳上
+    pub attempt: u32,
     pub outcome: PluginOutcome,
     /// 出错、拒绝的原因
     pub error: Option<Msg>,

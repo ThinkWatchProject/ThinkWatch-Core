@@ -83,10 +83,10 @@ pub struct PluginScope {
     /// 客户端应用：`claude-code`、`codex`……
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clients: Vec<String>,
-    /// 客户端要的模型
+    /// 发给上游的模型：路由规则改了名的，按改名之后的
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
-    /// 服务回答的上游。只管回答那一段：改请求时还没选上游
+    /// 发往的上游。请求和回答都按它：请求钩子每发往一个上游跑一次
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<String>,
 }
