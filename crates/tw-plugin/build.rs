@@ -362,13 +362,12 @@ fn check_rust_wasm_target() {
 fn build_guest(manifest_dir: &Path, out_dir: &Path, tools: &Tools) -> Vec<u8> {
     let guest = manifest_dir.join("guest");
     let target_dir = out_dir.join("guest-target");
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let cargo_home = env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
         env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .map(|h| PathBuf::from(h).join(".cargo"))
     });
 
-    let mut cmd = Command::new(cargo);
+    let mut cmd = nested_cargo();
     cmd.args([
         "build",
         "--release",
@@ -381,8 +380,63 @@ fn build_guest(manifest_dir: &Path, out_dir: &Path, tools: &Tools) -> Vec<u8> {
     .arg("--target-dir")
     .arg(&target_dir);
 
-    // 外层 cargo 给构建脚本的环境里有它自己的编译选项（CI 的 `-D warnings`、
-    // clippy 的包装器、用户的 profile 覆盖），都不该落到这个独立的小工程上
+    // 编出来的东西不带构建机的路径：同一套工具链在哪台机器上编都一样
+    let mut remap = vec![
+        format!("--remap-path-prefix={}=/guest", guest.display()),
+        format!("--remap-path-prefix={}=/target", target_dir.display()),
+    ];
+    if let Some(h) = &cargo_home {
+        remap.push(format!("--remap-path-prefix={}=/cargo", h.display()));
+    }
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", remap.join("\u{1f}"));
+
+    // C 那一半交给探测到的 clang / llvm-ar。断言里的 __FILE__ 固定成一个名字：
+    // 否则它是构建目录下的绝对路径
+    let mut cflags = vec![
+        "-Wno-builtin-macro-redefined".to_string(),
+        "-D__FILE__=\"quickjs\"".to_string(),
+    ];
+    if cfg!(windows) {
+        // rquickjs-sys 把它带的 libc 头文件目录 canonicalize 成 `\\?\C:\…` 交给
+        // clang。这种写法里 `/` 不算分隔符，于是头文件里的
+        // `#include <bits/alltypes.h>` 找不到。同一个目录再用普通写法给一遍
+        let include = rquickjs_sys_dir(&guest)
+            .map(|d| d.join("vendor").join("wasi-libc").join("include"))
+            .unwrap_or_else(|e| fail(&format!("cannot locate rquickjs-sys: {e}")));
+        cflags.push("-isystem".into());
+        cflags.push(include.display().to_string());
+    }
+    let triple = WASM_TARGET.replace('-', "_");
+    // 按 shell 的规则拆：路径里可以有空格
+    let quoted: Vec<String> = cflags.iter().map(|f| sh_quote(f)).collect();
+    cmd.env(format!("CC_{triple}"), &tools.clang)
+        .env(format!("AR_{triple}"), &tools.ar)
+        .env("CC_SHELL_ESCAPED_FLAGS", "1")
+        .env(format!("CFLAGS_{triple}"), quoted.join(" "));
+
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| fail(&format!("cannot run cargo: {e}")));
+    if !status.success() {
+        fail(&format!(
+            "building the QuickJS guest for {WASM_TARGET} failed (clang: {})",
+            tools.clang.display()
+        ));
+    }
+    let wasm_path = target_dir
+        .join(WASM_TARGET)
+        .join("release")
+        .join("tw_plugin_guest.wasm");
+    fs::read(&wasm_path)
+        .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", wasm_path.display())))
+}
+
+/// 一个干净的 cargo：外层 cargo 给构建脚本的环境里有它自己的编译选项（CI 的
+/// `-D warnings`、clippy 的包装器、用户的 profile 覆盖、给本机用的 C 编译器和
+/// 选项），都不该落到这个独立的小工程上
+fn nested_cargo() -> Command {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut cmd = Command::new(cargo);
     for (key, _) in env::vars_os() {
         let Some(key) = key.to_str() else { continue };
         let drop = matches!(
@@ -404,48 +458,50 @@ fn build_guest(manifest_dir: &Path, out_dir: &Path, tools: &Tools) -> Vec<u8> {
                 | "CC"
                 | "CFLAGS"
                 | "AR"
+                | "TARGET_CC"
+                | "TARGET_CFLAGS"
+                | "TARGET_AR"
+                | "CC_SHELL_ESCAPED_FLAGS"
         ) || key.starts_with("CARGO_PROFILE_")
             || key.starts_with("CARGO_TARGET_");
         if drop {
             cmd.env_remove(key);
         }
     }
+    cmd
+}
 
-    // 编出来的东西不带构建机的路径：同一套工具链在哪台机器上编都一样
-    let mut remap = vec![
-        format!("--remap-path-prefix={}=/guest", guest.display()),
-        format!("--remap-path-prefix={}=/target", target_dir.display()),
-    ];
-    if let Some(h) = &cargo_home {
-        remap.push(format!("--remap-path-prefix={}=/cargo", h.display()));
+/// guest 用的那份 rquickjs-sys 在哪（问 cargo，源码可能在注册表缓存里，也可能
+/// 是 vendor 出来的）
+fn rquickjs_sys_dir(guest: &Path) -> Result<PathBuf, String> {
+    let out = nested_cargo()
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--manifest-path",
+        ])
+        .arg(guest.join("Cargo.toml"))
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
-    cmd.env("CARGO_ENCODED_RUSTFLAGS", remap.join("\u{1f}"));
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    meta["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["name"] == "rquickjs-sys")
+        .and_then(|p| p["manifest_path"].as_str())
+        .and_then(|m| Path::new(m).parent().map(Path::to_path_buf))
+        .ok_or_else(|| "rquickjs-sys is not in the guest's dependency graph".into())
+}
 
-    // C 那一半交给探测到的 clang / llvm-ar。断言里的 __FILE__ 固定成一个名字：
-    // 否则它是构建目录下的绝对路径
-    let triple = WASM_TARGET.replace('-', "_");
-    cmd.env(format!("CC_{triple}"), &tools.clang)
-        .env(format!("AR_{triple}"), &tools.ar)
-        .env(
-            format!("CFLAGS_{triple}"),
-            "-Wno-builtin-macro-redefined -D__FILE__=\"quickjs\"",
-        );
-
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| fail(&format!("cannot run cargo: {e}")));
-    if !status.success() {
-        fail(&format!(
-            "building the QuickJS guest for {WASM_TARGET} failed (clang: {})",
-            tools.clang.display()
-        ));
-    }
-    let wasm_path = target_dir
-        .join(WASM_TARGET)
-        .join("release")
-        .join("tw_plugin_guest.wasm");
-    fs::read(&wasm_path)
-        .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", wasm_path.display())))
+/// 给 cc 的 `CC_SHELL_ESCAPED_FLAGS` 用的单引号括起来的写法
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// 导入表必须正好是允许的那几个，内存必须是模块自己的、导出出来的

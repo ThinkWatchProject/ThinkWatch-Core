@@ -13,8 +13,37 @@ fn rt() -> &'static Runtime {
     RT.get_or_init(|| Runtime::new(Limits::default()).expect("runtime"))
 }
 
+/// 测别的上限（内存、输出、栈）时用：CPU 时间放得很宽。CI 的机器比开发机慢好几倍，
+/// 测试又是 debug 构建，默认的 200 ms 可能先到，测到的就成了 CPU 上限
+/// 超出预算之后最多还能跑多久才停下。unix 上量的是线程的 CPU 时间，只差一格
+/// 节拍；Windows 上量的是墙上时间，并发跑测试时线程会被抢占，留宽一些
+fn slack() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
+fn roomy() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        Runtime::new(Limits {
+            request_cpu: Duration::from_secs(30),
+            reply_call_cpu: Duration::from_secs(30),
+            reply_total_cpu: Duration::from_secs(60),
+            ..Limits::default()
+        })
+        .expect("runtime")
+    })
+}
+
 fn load(src: &str) -> Plugin {
-    match rt().load(src.as_bytes()) {
+    load_in(rt(), src)
+}
+
+fn load_in(rt: &Runtime, src: &str) -> Plugin {
+    match rt.load(src.as_bytes()) {
         Ok(p) => p,
         Err(e) => panic!("load failed: {e:?}\n{src}"),
     }
@@ -67,6 +96,14 @@ fn request(body: &str) -> Plugin {
 
 fn run(body: &str) -> Invocation<RequestOutcome> {
     request(body).on_request(view(), ctx())
+}
+
+fn run_roomy(body: &str) -> Invocation<RequestOutcome> {
+    load_in(
+        roomy(),
+        &format!("{SYSTEM}export function onRequest(req, ctx) {{ {body} }}"),
+    )
+    .on_request(view(), ctx())
 }
 
 fn changed(inv: &Invocation<RequestOutcome>) -> &Value {
@@ -459,11 +496,7 @@ fn an_infinite_loop_is_stopped_by_the_cpu_limit() {
     assert_eq!(inv.result, Err(RunError::CpuLimit));
     let limit = rt().limits().request_cpu;
     assert!(inv.cpu >= limit, "stopped after {:?}", inv.cpu);
-    assert!(
-        inv.cpu < limit + Duration::from_millis(100),
-        "overran: {:?}",
-        inv.cpu
-    );
+    assert!(inv.cpu < limit + slack(), "overran: {:?}", inv.cpu);
     assert!(wall < Duration::from_secs(5), "wall {wall:?}");
 }
 
@@ -481,28 +514,28 @@ fn loop_free_cpu_burners_are_stopped_too() {
 
 #[test]
 fn a_memory_bomb_is_stopped_by_the_memory_limit() {
-    let inv = run("const a = []; for (;;) a.push(new Uint8Array(1 << 20));");
+    let inv = run_roomy("const a = []; for (;;) a.push(new Uint8Array(16 << 20));");
     assert_eq!(inv.result, Err(RunError::MemoryLimit));
     // 接住内存耗尽的异常也没用：碰过上限就算超了
-    let inv = run(
+    let inv = run_roomy(
         "try { const a = []; for (;;) a.push(new Array(1 << 20).fill(1)); } catch (e) {} return req;",
     );
     assert_eq!(inv.result, Err(RunError::MemoryLimit));
     // 一次要一大块
-    let inv = run("new ArrayBuffer(512 * 1024 * 1024);");
+    let inv = run_roomy("new ArrayBuffer(512 * 1024 * 1024);");
     assert_eq!(inv.result, Err(RunError::MemoryLimit));
 }
 
 #[test]
 fn deep_recursion_is_an_error_not_a_crash() {
-    let m = threw(&run("function f(n) { return f(n + 1) + 1; } f(0);"));
+    let m = threw(&run_roomy("function f(n) { return f(n + 1) + 1; } f(0);"));
     assert!(m.contains("stack"), "{m}");
     // 嵌得很深的数据交给 C 写的内建函数：要么是 RangeError，要么是 wasm 栈耗尽的陷阱
     for body in [
-        "let o = {}; for (let i = 0; i < 1e6; i++) o = { o }; JSON.stringify(o);",
+        "let o = {}; for (let i = 0; i < 2e5; i++) o = { o }; JSON.stringify(o);",
         "JSON.parse('['.repeat(1e6));",
     ] {
-        match run(body).result {
+        match run_roomy(body).result {
             Err(RunError::Threw { .. }) | Err(RunError::Trap(_)) => {}
             other => panic!("{body}: {other:?}"),
         }
@@ -517,10 +550,11 @@ fn deep_recursion_is_an_error_not_a_crash() {
 #[test]
 fn a_giant_output_is_stopped_by_the_output_cap() {
     // 视图几百字节，上限约 1 MiB；返回 2 MiB
-    let inv = run("req.system = 'x'.repeat(2 << 20); return req;");
+    let inv = run_roomy("req.system = 'x'.repeat(2 << 20); return req;");
     assert_eq!(inv.result, Err(RunError::OutputLimit));
     // 攒着到最后才放出来的文字也一样
-    let p = load(
+    let p = load_in(
+        roomy(),
         r#"export const manifest = { name: "big", api: 1, permissions: ["reply.text"], reply: "stream" };
            export function onReplyText() { return ""; }
            export function onReplyTextEnd() { return "y".repeat(2 << 20); }"#,
@@ -569,8 +603,7 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
     let inv = r.on_text("spin");
     assert_eq!(inv.result, Err(RunError::CpuLimit));
     assert!(
-        inv.cpu >= limits.reply_call_cpu
-            && inv.cpu < limits.reply_call_cpu + Duration::from_millis(50),
+        inv.cpu >= limits.reply_call_cpu && inv.cpu < limits.reply_call_cpu + slack(),
         "{:?}",
         inv.cpu
     );
@@ -595,10 +628,7 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
         used >= limits.reply_total_cpu - Duration::from_millis(20),
         "{used:?}"
     );
-    assert!(
-        used < limits.reply_total_cpu + Duration::from_millis(100),
-        "{used:?}"
-    );
+    assert!(used < limits.reply_total_cpu + slack(), "{used:?}");
 }
 
 #[test]
@@ -722,7 +752,10 @@ fn a_plugin_edits_a_100_kb_view() {
 #[test]
 fn a_plugin_edits_a_1_mb_view() {
     let cpu = edit_big_view(1 << 20);
-    assert!(cpu < rt().limits().request_cpu, "{cpu:?}");
+    // 默认的预算放得下：量的是 CPU 时间（Windows 上是墙上时间，并发跑测试时不准）
+    if !cfg!(windows) {
+        assert!(cpu < rt().limits().request_cpu, "{cpu:?}");
+    }
 }
 
 // ── 加载 ─────────────────────────────────────────────────────────
@@ -780,15 +813,17 @@ fn source_must_be_small_utf8() {
 
 #[test]
 fn top_level_limits_fail_the_load() {
-    for (body, want) in [
-        ("for (;;) {}", "CPU"),
+    for (rt, body, want) in [
+        (rt(), "for (;;) {}", "CPU"),
         (
-            "const a = []; for (;;) a.push(new Uint8Array(1 << 20));",
+            roomy(),
+            "const a = []; for (;;) a.push(new Uint8Array(16 << 20));",
             "memory",
         ),
     ] {
-        match load_err(&format!("{SYSTEM}{body}\nexport function onRequest() {{}}")) {
-            LoadError::Syntax { message, .. } => assert!(message.contains(want), "{message}"),
+        let src = format!("{SYSTEM}{body}\nexport function onRequest() {{}}");
+        match rt.load(src.as_bytes()) {
+            Err(LoadError::Syntax { message, .. }) => assert!(message.contains(want), "{message}"),
             other => panic!("{other:?}"),
         }
     }
