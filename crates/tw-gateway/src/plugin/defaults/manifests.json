@@ -1,0 +1,94 @@
+{
+  "deepseek-flags": {
+    "manifest": {
+      "api": 1,
+      "description": "DeepSeek's API rejects requests that contain a certain regional flag emoji with 400 Content Exists Risk, and the whole conversation then stays stuck. This plugin replaces such emoji with placeholder text before sending and puts them back in answers and tool calls.",
+      "hooks": {
+        "reply_text": true,
+        "reply_text_end": true,
+        "request": true,
+        "tool_call": true
+      },
+      "name": "Avoid DeepSeek request rejections",
+      "permissions": [
+        "system",
+        "messages",
+        "reply_text",
+        "reply_tool_calls"
+      ],
+      "reply_mode": "stream",
+      "scope": {
+        "clients": [],
+        "models": [
+          "deepseek*"
+        ],
+        "upstreams": []
+      },
+      "settings": []
+    },
+    "sha256": "96a1069558726008bb19f39b09288585634570af55e02eec6194d4a50bee4327"
+  },
+  "reply-language": {
+    "manifest": {
+      "api": 1,
+      "description": "Adds a fixed line to the end of the system prompt that asks the model to answer in the language set here.",
+      "hooks": {
+        "reply_text": false,
+        "reply_text_end": false,
+        "request": true,
+        "tool_call": false
+      },
+      "name": "Answer in a chosen language",
+      "permissions": [
+        "system"
+      ],
+      "reply_mode": "block",
+      "scope": {
+        "clients": [],
+        "models": [],
+        "upstreams": []
+      },
+      "settings": [
+        {
+          "default": "简体中文",
+          "key": "language",
+          "kind": "string",
+          "label": "回答语言"
+        }
+      ]
+    },
+    "sha256": "df13934d4b0d7875f3c6f6882105757b7c3b4eb0a1f12bc9f35fc12ec2c26f5f"
+  },
+  "wsl-paths": {
+    "manifest": {
+      "api": 1,
+      "description": "Rewrites drive paths in tool-call arguments to the form the client can open (WSL /mnt/c/… or Windows C:\\…), in answers and in the conversation history.",
+      "hooks": {
+        "reply_text": false,
+        "reply_text_end": false,
+        "request": true,
+        "tool_call": true
+      },
+      "name": "Convert WSL and Windows paths",
+      "permissions": [
+        "messages",
+        "reply_tool_calls"
+      ],
+      "reply_mode": "block",
+      "scope": {
+        "clients": [],
+        "models": [],
+        "upstreams": []
+      },
+      "settings": [
+        {
+          "default": false,
+          "key": "windows_client",
+          "kind": "boolean",
+          "label": "客户端运行在 Windows 上（关闭时按 WSL 处理）"
+        }
+      ]
+    },
+    "sha256": "92d7f7b897659b92b66f8b9c369dba60983398cfe50a06c7b994c73f087aec0e"
+  }
+}

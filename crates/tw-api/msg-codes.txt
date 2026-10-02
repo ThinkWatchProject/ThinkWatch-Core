@@ -148,6 +148,7 @@ control.plugin.blank_pattern
 control.plugin.file_missing
 control.plugin.file_moved_on
 control.plugin.id_taken
+control.plugin.needs_confirmation
 control.plugin.not_found
 control.plugin.order
 control.plugin.reserved_id

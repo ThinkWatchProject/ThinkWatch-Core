@@ -334,7 +334,7 @@ mod tests {
         );
     }
 
-    /// 插件：设置值是那个值本身，状态按 `kind` 分派，三个要系统确认框的端点照样在表里
+    /// 插件：设置值是那个值本身，状态按 `kind` 分派，四个要系统确认框的端点照样在表里
     /// （网页白名单在桌面端，不在这里）
     #[test]
     fn plugins_come_through() {
@@ -368,11 +368,18 @@ mod tests {
             "  CreatePlugin: { req: PluginCreate; res: ConfigWritten };",
             "  ReplacePluginSource: { req: PluginSourceReplace; res: ConfigWritten };",
             "  ApprovePluginFile: { req: PluginApprove; res: ConfigWritten };",
+            "  UpdatePluginConfirmed: { req: PluginUpdate; res: ConfigWritten };",
+            "  UpdatePluginConfirmed: { method: \"PUT\", path: \"/plugins/{id}/confirmed\", params: [\"id\"], format: \"json\" },",
             "  DeletePlugin: { req: BaseVersion; res: ConfigWritten };",
             "  TrialPlugin: { req: PluginTrial; res: PluginTrialResult };",
         ] {
             assert!(ts.contains(line), "{line}");
         }
+        // core 自己写配置（默认插件）的那一版有自己的来源
+        assert_eq!(
+            decl_of(&ts, "ConfigOrigin"),
+            "export type ConfigOrigin = \"ui\" | \"cli\" | \"external\" | \"rollback\" | \"rotation\" | \"defaults\""
+        );
     }
 
     #[test]

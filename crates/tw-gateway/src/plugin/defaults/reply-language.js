@@ -10,9 +10,10 @@
 // 设置：回答语言，默认简体中文。
 
 export const manifest = {
-  name: "指定回答语言",
+  name: "Answer in a chosen language",
   api: 1,
-  description: "在系统提示词末尾要求模型用指定的语言回答。",
+  description:
+    "Adds a fixed line to the end of the system prompt that asks the model to answer in the language set here.",
   permissions: ["system"],
   settings: {
     language: { type: "string", label: "回答语言", default: "简体中文" },

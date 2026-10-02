@@ -278,10 +278,28 @@ print(m.group(1) if m else "")
 PY
 )
 [ -n "$KEY" ] && ok "serve 给没有钥匙的配置补上了钥匙" || bad "配置里没有钥匙" "$(head -12 "$CFG")"
-ADDED=$(diff "$TMP/config.before" "$CFG" | grep -c '^>')
-REMOVED=$(diff "$TMP/config.before" "$CFG" | grep -c '^<')
-[ "$ADDED" = 2 ] && [ "$REMOVED" = 0 ] && ok "只多出钥匙那两行，别的一个字节没动" \
-  || bad "补钥匙改动了别的地方" "$(diff "$TMP/config.before" "$CFG" | head -8)"
+# 第一次起来还会在末尾补上默认插件（`plugins:` 那一节，见下一条）：先把它拆出来，
+# 剩下的部分只该多出钥匙那两行
+python3 - "$CFG" "$TMP/config.head" "$TMP/config.plugins" <<'PY'
+import sys
+text = open(sys.argv[1], encoding='utf-8').read()
+i = text.find('\nplugins:\n')
+head, tail = (text[:i + 1], text[i + 1:]) if i >= 0 else (text, '')
+open(sys.argv[2], 'w', encoding='utf-8').write(head)
+open(sys.argv[3], 'w', encoding='utf-8').write(tail)
+PY
+ADDED=$(diff "$TMP/config.before" "$TMP/config.head" | grep -c '^>')
+REMOVED=$(diff "$TMP/config.before" "$TMP/config.head" | grep -c '^<')
+[ "$ADDED" = 2 ] && [ "$REMOVED" = 0 ] && ok "只多出钥匙那两行和末尾的默认插件，别的一个字节没动" \
+  || bad "补钥匙改动了别的地方" "$(diff "$TMP/config.before" "$TMP/config.head" | head -8)"
+# 默认插件：插件目录里的每一个都在配置里、都停用着；记下给过哪些的那个文件只给自己
+N=$(grep -c '^  - id: ' "$TMP/config.plugins")
+ON=$(grep -c '^    enabled: true' "$TMP/config.plugins")
+JS=$(find "$THINKWATCH_HOME/plugins" -maxdepth 1 -name '*.js' | wc -l | tr -d ' ')
+[ "$N" -gt 0 ] && [ "$N" = "$JS" ] && [ "$ON" = 0 ] && ok "装上了 $N 个默认插件，都停用着" \
+  || bad "默认插件不对：配置里 $N 个、文件 $JS 个、开着 $ON 个" "$(head -12 "$TMP/config.plugins")"
+MODE=$(mode_of "$THINKWATCH_HOME/plugins/.defaults.json" || echo -)
+[ "$MODE" = "600" ] && ok "plugins/.defaults.json 是 0600" || bad "plugins/.defaults.json 权限是 $MODE"
 [ "$("$BIN" --config "$CFG" control-key)" = "$KEY" ] && ok "control-key 打印的就是这把" || bad "control-key 打印的不是配置里那把"
 
 MODE=$(mode_of "$THINKWATCH_HOME/data.db" || echo -)

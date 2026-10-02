@@ -10,6 +10,18 @@
 //! 每次换配置都会把所有插件文件重读一遍、重算哈希 —— 这本身就是「文件变了」的一道
 //! 检查；另有一个盯着 `plugins/` 目录的监听（在控制面），文件一动就单独重载一次插件。
 //! 编译的结果按哈希缓存：同一份字节不编第二遍。
+//!
+//! **一个插件都没打开时不起运行时**：沙箱一起来就是几 MB 常驻内存，而 core 自带的默认
+//! 插件装上时都停用着 —— 一个插件都没打开的用户不该为它付这个钱。这时停用的插件照样读
+//! 文件、算哈希，但不编：它们是「休眠」的（[`PluginHost::dormant`]，跑不了任何钩子），
+//! 列表上显示的 manifest 来自缓存（[`super::manifests`]，只拿来显示），缓存里没有就只有
+//! id。有一个插件开着，运行时反正要起，所有插件照常编，缓存跟着补齐。
+//!
+//! **一个插件都没打开时不起运行时**：沙箱一起来就是几 MB 常驻内存，而 core 自带的默认
+//! 插件装上时都停用着 —— 一个插件都没打开的用户不该为它付这个钱。这时停用的插件照样读
+//! 文件、算哈希，但不编：它们是「休眠」的（[`PluginHost::dormant`]，跑不了任何钩子），
+//! 列表上显示的 manifest 来自缓存（[`super::manifests`]，只拿来显示），缓存里没有就只有
+//! id。有一个插件开着，运行时反正要起，所有插件照常编，缓存跟着补齐。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -21,6 +33,7 @@ use tw_types::{Msg, msg};
 
 use crate::plugin::engine::{Engine, LoadError, MAX_SOURCE, Manifest};
 use crate::plugin::host::PluginHost;
+use crate::plugin::manifests;
 use crate::plugin::set::{Active, Broken, LogRing, PluginSet, Scope, State, Stats};
 
 /// 一份编译结果：编好的插件，或者编不成的原因
@@ -35,6 +48,8 @@ pub struct Plugins {
     dir: RwLock<Option<PathBuf>>,
     tracks: Mutex<HashMap<String, Track>>,
     compiled: Mutex<HashMap<[u8; 32], Compiled>>,
+    /// 编过的 manifest 的缓存（[`manifests`]），**只拿来显示**休眠的插件
+    shown: Mutex<manifests::Cache>,
     sink: Mutex<Option<RunSender>>,
     /// 改插件文件和改配置是一件事的两半（写文件、写哈希）。**控制面改的时候攥着它**，
     /// 目录监听重载插件之前也要拿到它 —— 不然监听可能正好落在两半之间，把一个马上就要
@@ -71,6 +86,7 @@ impl Plugins {
             dir: RwLock::new(None),
             tracks: Mutex::default(),
             compiled: Mutex::default(),
+            shown: Mutex::default(),
             sink: Mutex::default(),
             edits: tokio::sync::Mutex::new(()),
         }
@@ -137,16 +153,39 @@ impl Plugins {
         self.compile(&*engine, Sha256::digest(source).into(), source)
     }
 
+    /// 记下一个编出来的 manifest，给以后显示休眠的插件用（[`manifests`]）。配置里的插件编
+    /// 过之后 [`Self::build`] 自己会记；**默认插件那一路不编**（它带着预先算好的
+    /// manifest），装上之前从这里记一笔
+    pub fn remember(&self, sha256: &str, m: &Manifest) {
+        if let Some(dir) = self.dir() {
+            self.shown
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .put(&dir, sha256, m);
+        }
+    }
+
     /// 照这份配置建一份插件。**不会失败**：哪个插件有问题，问题落在它自己的状态上。
     pub fn build(&self, config: &tw_config::Config) -> PluginSet {
         let dir = self.dir();
         let engine = self.engine();
         let mut used = HashSet::new();
         let mut out = Vec::with_capacity(config.plugins.len());
+        // 有一个开着，运行时反正要起：全都编。一个都没开：停用的只读文件、不编（休眠）
+        let awake = config.plugins.iter().any(|p| p.enabled);
         for p in &config.plugins {
             let track = self.track(&p.id);
             let (state, manifest) = match dir.as_deref() {
-                Some(dir) => self.load_one(dir, p, &*engine, &mut used),
+                Some(dir) if awake || p.enabled => {
+                    let (state, m) = self.load_one(dir, p, &*engine, &mut used);
+                    // 编出来的记一笔：之后（比如下一次启动）它停用着、运行时没起时，列表
+                    // 照样说得出它是什么
+                    if let Some(m) = &m {
+                        self.remember(&p.sha256, m);
+                    }
+                    (state, m)
+                }
+                Some(dir) => self.dormant_one(dir, p, &mut used),
                 None => (State::Broken(Broken::Error(not_located())), None),
             };
             let (state, settings) = match (state, &manifest) {
@@ -174,11 +213,20 @@ impl Plugins {
                 logs: track.logs,
             }));
         }
-        // 只留这一份还用得着的：编译结果、计数和日志。删掉的插件，它的计数跟着走
+        // 只留这一份还用得着的：编译结果、计数和日志、显示用的 manifest。删掉的插件，
+        // 它的计数跟着走
         self.compiled
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|k, _| used.contains(k));
+        if let Some(dir) = dir.as_deref() {
+            let approved: HashSet<String> =
+                config.plugins.iter().map(|p| p.sha256.clone()).collect();
+            self.shown
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keep(dir, &approved);
+        }
         self.tracks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -240,6 +288,65 @@ impl Plugins {
         }
     }
 
+    /// 停用着、运行时没起的一个插件：**不编**。文件照样读、哈希照样比（「文件变了」照样
+    /// 查得出来）；这个进程里编过的直接拿来用，没编过的是休眠的，显示用的 manifest 从缓存
+    /// 里拿，缓存里没有就只有 id
+    fn dormant_one(
+        &self,
+        dir: &Path,
+        p: &tw_config::Plugin,
+        used: &mut HashSet<[u8; 32]>,
+    ) -> (State, Option<Manifest>) {
+        let approved = unhex(&p.sha256);
+        let compiled = approved.and_then(|sha| {
+            let cache = self.compiled.lock().unwrap_or_else(PoisonError::into_inner);
+            match cache.get(&sha) {
+                Some(Ok(host)) => Some((sha, host.clone())),
+                _ => None,
+            }
+        });
+        let shown = match &compiled {
+            Some((sha, host)) => {
+                used.insert(*sha);
+                self.remember(&p.sha256, host.manifest());
+                Some(host.manifest().clone())
+            }
+            None => self
+                .shown
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(dir, &p.sha256),
+        };
+        let path = p.path_in(dir);
+        let bytes = match read_capped(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (State::Broken(Broken::Changed), shown);
+            }
+            Err(e) => {
+                return (
+                    State::Broken(Broken::Error(msg!(
+                        "gw.plugin.unreadable", file = &p.file, detail = e =>
+                        "The plugin file {file} cannot be read: {detail}"
+                    ))),
+                    shown,
+                );
+            }
+        };
+        let sha: [u8; 32] = Sha256::digest(&bytes).into();
+        if hex(&sha) != p.sha256 {
+            return (State::Broken(Broken::Changed), shown);
+        }
+        if let Some((_, host)) = compiled {
+            return (State::Ready(host), shown);
+        }
+        let host = Dormant {
+            manifest: shown.clone().unwrap_or_else(|| placeholder(&p.id)),
+            sha256: sha,
+        };
+        (State::Ready(Arc::new(host)), shown)
+    }
+
     /// 文件变了时，批准过的那一份的 manifest —— **只拿来显示**（名字、权限、设置项），
     /// 不跑。底稿也不是那一份了（被人动过、没了）就没有。
     fn approved_manifest(
@@ -266,6 +373,52 @@ impl Plugins {
             .or_insert_with(|| engine.load(bytes))
             .clone()
     }
+}
+
+/// 停用着、这个进程里还没编过的插件（见 [`Plugins::build`]）。**跑不了任何钩子**（
+/// [`PluginHost`] 的默认实现一律报错）：要它跑之前，调用方先真的编一遍。手里的 manifest
+/// 是缓存里的那一份或者只有名字的占位，**只拿来显示**
+struct Dormant {
+    manifest: Manifest,
+    sha256: [u8; 32],
+}
+
+impl PluginHost for Dormant {
+    fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+    fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+    fn dormant(&self) -> bool {
+        true
+    }
+}
+
+/// 缓存里没有它的 manifest 时的占位：名字就是 id，什么权限、钩子都没有
+fn placeholder(id: &str) -> Manifest {
+    Manifest {
+        name: id.to_string(),
+        api: 1,
+        description: None,
+        permissions: Vec::new(),
+        scope: Scope::default(),
+        reply_mode: tw_api::ReplyMode::Block,
+        settings: Vec::new(),
+        hooks: Default::default(),
+    }
+}
+
+/// 小写十六进制的 SHA-256 读回字节。写法不对是 None
+fn unhex(s: &str) -> Option<[u8; 32]> {
+    if !tw_config::plugins::valid_sha256(s) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// 读一个文件，**最多读到上限多一个字节**：再大的插件反正编不了，哈希也一定对不上
@@ -671,6 +824,106 @@ mod tests {
         off.enabled = false;
         let off = bed.build(vec![off]);
         assert!(newly_broken(&ok, &off).is_empty());
+    }
+
+    fn off(mut p: tw_config::Plugin) -> tw_config::Plugin {
+        p.enabled = false;
+        p
+    }
+
+    /// 一个插件都没开：停用的不编（不起运行时），休眠着；缓存里没有就只有 id
+    #[test]
+    fn with_nothing_enabled_a_disabled_plugin_is_not_compiled() {
+        let bed = Bed::new();
+        let engine = Arc::new(Counting(Default::default()));
+        bed.plugins.set_engine(engine.clone());
+        let set = bed.build(vec![off(bed.install("add-date", &add_date()))]);
+        assert_eq!(engine.count(), 0);
+        let a = set.get("add-date").unwrap();
+        let host = a.ready().expect("a dormant plugin is not broken");
+        assert!(host.dormant());
+        assert_eq!(a.name, "add-date");
+        assert!(a.manifest.is_none() && a.permissions.is_empty());
+        // 跑不了：钩子一律报错
+        assert!(host.on_request(json!({}), json!({})).result.is_err());
+    }
+
+    /// 编过一次的记在缓存里：下一个进程里它停用着，列表照样说得出它是什么，而且不编
+    #[test]
+    fn a_dormant_plugin_shows_the_manifest_remembered_from_an_earlier_compile() {
+        let bed = Bed::new();
+        let p = bed.install("add-date", &add_date());
+        bed.build(vec![p.clone()]);
+        let next = Plugins::new(Arc::new(Counting(Default::default())));
+        next.set_dir(bed.dir.path().to_path_buf());
+        let set = next.build(&tw_config::Config {
+            plugins: vec![off(p)],
+            ..Default::default()
+        });
+        let a = set.get("add-date").unwrap();
+        assert!(a.ready().unwrap().dormant());
+        assert_eq!(a.name, "附加日期");
+        assert_eq!(a.permissions, [tw_api::Permission::System]);
+        assert_eq!(a.settings["note"], json!("今天"));
+    }
+
+    /// 有一个开着，运行时反正要起：全都编，停用的也编（缓存跟着补齐）
+    #[test]
+    fn once_one_plugin_is_enabled_every_plugin_is_compiled() {
+        let bed = Bed::new();
+        let engine = Arc::new(Counting(Default::default()));
+        bed.plugins.set_engine(engine.clone());
+        let other = add_date().replace("附加日期", "另一个");
+        let set = bed.build(vec![
+            off(bed.install("add-date", &add_date())),
+            bed.install("other", &other),
+        ]);
+        assert_eq!(engine.count(), 2);
+        let a = set.get("add-date").unwrap();
+        assert!(!a.ready().unwrap().dormant());
+        assert_eq!(a.name, "附加日期");
+    }
+
+    /// 休眠的插件文件变了：照样是「变了」（只算哈希，不编），显示的是缓存里批准的那一份
+    #[test]
+    fn a_dormant_plugin_whose_file_changed_is_changed_without_compiling() {
+        let bed = Bed::new();
+        let p = bed.install("add-date", &add_date());
+        bed.plugins.remember(&p.sha256, &add_date_manifest());
+        let engine = Arc::new(Counting(Default::default()));
+        bed.plugins.set_engine(engine.clone());
+        std::fs::write(
+            tw_config::plugins::file_path(bed.dir.path(), "add-date"),
+            "changed",
+        )
+        .unwrap();
+        let set = bed.build(vec![off(p)]);
+        let a = set.get("add-date").unwrap();
+        assert_eq!(a.broken(), Some(&Broken::Changed));
+        assert_eq!(a.name, "附加日期");
+        assert_eq!(engine.count(), 0);
+    }
+
+    /// 缓存里是另一份字节的（插件换过源码）：不拿来冒充
+    #[test]
+    fn a_cached_manifest_of_other_bytes_is_not_used() {
+        let bed = Bed::new();
+        let old = bed.install("add-date", &add_date());
+        bed.plugins.remember(&old.sha256, &add_date_manifest());
+        let newer = add_date().replace("附加日期", "新的一版");
+        let p = bed.install("add-date", &newer);
+        let set = bed.build(vec![off(p)]);
+        let a = set.get("add-date").unwrap();
+        assert_eq!(a.name, "add-date");
+        assert!(a.manifest.is_none());
+    }
+
+    fn add_date_manifest() -> Manifest {
+        FakeEngine
+            .load(add_date().as_bytes())
+            .unwrap()
+            .manifest()
+            .clone()
     }
 
     /// 一个读不下的大文件：只读到上限多一个字节，哈希对不上，就是变了

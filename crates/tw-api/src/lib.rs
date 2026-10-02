@@ -376,6 +376,8 @@ slug_enum! {
         Rollback = "rollback",
         /// OAuth 凭据轮换之后写回
         Rotation = "rotation",
+        /// core 自己：装上它自带的默认插件，或者把没动过的默认插件换成新版
+        Defaults = "defaults",
     }
 }
 
@@ -682,6 +684,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 尝试链的第几跳）和 `request_after_plugins`（插件改过的请求体），[`HistoryRow`] 多了
 /// `plugin_changed`。装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 32
 /// 写的界面看不到插件。
+///
+/// 33 起**改得了工具调用的插件要点过头才能打开**：`UpdatePlugin` 拒绝打开权限里有
+/// `reply_tool_calls` 的插件（读不出权限的也算）、改它的设置或范围（403，
+/// `control.plugin.needs_confirmation`），这几样走新端点 `PUT /plugins/{id}/confirmed`
+/// （`UpdatePluginConfirmed`，请求体同 [`PluginUpdate`]）—— 它和装、换源码、批准一样
+/// 不给网页调，桌面端在系统的确认框里点了头才发。同一版起 core 自带几个默认插件，第一次
+/// 见到时装上、停用着，写配置的这一版来源是 [`ConfigOrigin::Defaults`]。
 pub const CONTROL_API_VERSION: u32 = 33;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1263,7 +1272,7 @@ pub enum Event {
         id: u64,
         /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
         version: String,
-        /// `ui` / `cli` / `external` / `rollback` / `rotation`
+        /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
         origin: ConfigOrigin,
         at_ms: u64,
     },
@@ -1281,7 +1290,7 @@ pub enum Event {
         line: Option<usize>,
         /// 出错那一行的原文，**已脱敏**
         excerpt: Option<String>,
-        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation`。
+        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`。
         ///
         /// **界面靠它区分「用户在编辑器里写错了」和「界面自己刚写坏了」** ——
         /// 前者要提醒，后者是保存失败，那条路自己会报。
@@ -3125,7 +3134,7 @@ pub struct BaseVersion {
 pub struct ConfigVersion {
     pub version: String,
     pub at_ms: u64,
-    /// `ui` / `cli` / `external` / `rollback` / `rotation`
+    /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
     pub origin: ConfigOrigin,
     pub bytes: u64,
     /// 这一版是现在跑着的那一版吗。
@@ -5128,6 +5137,11 @@ pub struct PluginCreate {
 
 /// 改一个插件的开关、出错时怎么办、范围、设置（`PUT /plugins/{id}`）。**整份交**：
 /// 交上来的就是保存之后的样子。
+///
+/// 插件改得了回答里的工具调用（权限有 [`Permission::ReplyToolCalls`]，或者读不出它要
+/// 什么权限）时，打开它、改设置、改范围这条路不收（`control.plugin.needs_confirmation`），
+/// 同一份请求体交给 `PUT /plugins/{id}/confirmed`：那个端点网页调不了，桌面端在系统的
+/// 确认框里点了头才发。比的是生效的值：没写进配置的设置按默认值算，范围不看顺序。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginUpdate {

@@ -1,4 +1,4 @@
-// DeepSeek：替换会被拒收的旗帜表情
+// 避免 DeepSeek 拒收请求
 //
 // DeepSeek 接口会拒收含特定地区旗帜表情的请求：模型还没运行就回 400 Content Exists Risk。
 // 这类表情一旦进入对话历史（例如工具抓回的网页、读到的文件），之后这个会话的每一次请求
@@ -22,10 +22,10 @@
 // 权限：system、messages（请求一侧替换），reply.text、reply.tool_calls（回答一侧换回）。
 
 export const manifest = {
-  name: "DeepSeek：替换会被拒收的旗帜表情",
+  name: "Avoid DeepSeek request rejections",
   api: 1,
   description:
-    "DeepSeek 接口会拒收含特定地区旗帜表情的请求，含有它们的会话因此无法继续。请求发出前把这些表情换成 ASCII 占位文字，回答里再换回原样。默认对发往 deepseek 开头的模型的请求生效。",
+    "DeepSeek's API rejects requests that contain a certain regional flag emoji with 400 Content Exists Risk, and the whole conversation then stays stuck. This plugin replaces such emoji with placeholder text before sending and puts them back in answers and tool calls.",
   permissions: ["system", "messages", "reply.text", "reply.tool_calls"],
   match: { models: ["deepseek*"] },
   reply: "stream",

@@ -97,38 +97,50 @@ pub struct Section {
     pub what: &'static str,
     /// 每一项靠哪个键认：几乎都是 `name`，插件是 `id`
     pub key: &'static str,
+    /// 每一项里**可以写多行文字**的那几个键：它们底下的字符串可以带换行（写出去是
+    /// 带转义的双引号，见 [`render`]）。**其余的一律单行** —— 名字、地址、密钥、请求头、
+    /// 模型和网段写成两行都不是原来那个东西，在这一层就拒绝（[`EditError::Multiline`]）
+    pub multiline: &'static [&'static str],
 }
 
 pub const PROVIDERS: Section = Section {
     path: &["providers"],
     what: "upstream",
     key: "name",
+    multiline: &[],
 };
 pub const PROXIES: Section = Section {
     path: &["proxies"],
     what: "proxy",
     key: "name",
+    multiline: &[],
 };
 pub const PRICE_SHEETS: Section = Section {
     path: &["pricing", "sheets"],
     what: "price sheet",
     key: "name",
+    multiline: &[],
 };
 pub const ROUTES: Section = Section {
     path: &["routes"],
     what: "route",
     key: "name",
+    multiline: &[],
 };
 pub const GROUPS: Section = Section {
     path: &["groups"],
     what: "group",
     key: "name",
+    multiline: &[],
 };
 
+/// 插件的设置是插件自己声明的文字，「一行一条」的写法很常见（统一用词的对照表、
+/// 打码的正则）。id、文件、哈希、范围照旧单行
 pub const PLUGINS: Section = Section {
     path: &["plugins"],
     what: "plugin",
     key: "id",
+    multiline: &["settings"],
 };
 
 impl Section {
@@ -186,6 +198,7 @@ pub fn upsert(
                     name,
                 });
             }
+            single_lines(section, item.iter())?;
             let block = render_block(&Value::Mapping(item.clone()))?;
             let out = tw_yaml::append(text, &steps, &block)?;
             (out, section.items(&doc).len())
@@ -207,6 +220,7 @@ pub fn upsert(
             path.push(Step::Index(index));
             let out = if tw_yaml::is_flow_at(text, &path)? {
                 // 行内写法里的键删不了、嵌套值塞不进去 —— 整项换成块式
+                single_lines(section, item.iter())?;
                 let block = render_block(&Value::Mapping(item.clone()))?;
                 tw_yaml::replace_item(text, &steps, index, &block)?
             } else {
@@ -214,7 +228,7 @@ pub fn upsert(
                     .as_mapping()
                     .cloned()
                     .unwrap_or_default();
-                sync_fields(text, &path, &old_item, item)?
+                sync_fields(text, &path, &old_item, item, section)?
             };
             (out, index)
         }
@@ -280,9 +294,10 @@ pub fn reorder(text: &str, section: Section, keys: &[String]) -> Result<String, 
     let steps = section.steps();
     let out = match tw_yaml::reorder(text, &steps, &order) {
         Ok(out) => out,
-        // 行内写法、或者别的块式之外的写法：整段换成重排后的样子
+        // 行内写法、或者别的块式之外的写法：整段换成重排后的样子。**不再查单行**：
+        // 搬的是文件里已有的值
         Err(tw_yaml::PatchError::NotFound(_)) => {
-            set(text, &steps, Some(&Value::Sequence(reordered.clone())))?
+            put_value(text, &steps, &Value::Sequence(reordered.clone()))?
         }
         Err(e) => return Err(e.into()),
     };
@@ -302,6 +317,8 @@ pub fn reorder(text: &str, section: Section, keys: &[String]) -> Result<String, 
 }
 
 /// 设一个值。`None` 表示删掉这个键、退回默认值 —— **默认值不写进文件**。
+///
+/// 按路径设的值**一律单行**：走这条路的都是名字、地址、开关、网段这一类。
 pub fn set(text: &str, path: &[Step], value: Option<&Value>) -> Result<String, EditError> {
     let exists = {
         let doc = parse(text)?;
@@ -311,10 +328,16 @@ pub fn set(text: &str, path: &[Step], value: Option<&Value>) -> Result<String, E
         None if !exists => Ok(text.to_string()),
         None => Ok(tw_yaml::remove_key(text, path)?),
         Some(v) => {
-            let rendered = render(v)?;
-            Ok(tw_yaml::put(text, path, rendered.as_put())?)
+            reject_multiline(v)?;
+            put_value(text, path, v)
         }
     }
+}
+
+/// 把一个值写到这个位置上，不查单行（调用方查过，或者搬的是文件里已有的值）
+fn put_value(text: &str, path: &[Step], v: &Value) -> Result<String, EditError> {
+    let rendered = render(v)?;
+    Ok(tw_yaml::put(text, path, rendered.as_put())?)
 }
 
 /// 一个值渲染成的文本，以及它该按单行还是按块写。
@@ -335,10 +358,32 @@ impl Rendered {
 
 /// 渲染一个值。引号和转义交给 serde —— 它知道哪些字符串不加引号会被
 /// 读成别的类型。
+///
+/// **带换行、制表符或别的控制字符的字符串除外**：serde 会把多行写成 `|-` 块标量，
+/// 而块标量里缩进是内容的一部分，这一层不去冒那个险。这些字符串写成**单行的双引号**，
+/// 每个这样的字符都转义（[`double_quoted`]）—— 值里写什么都动不了文件的结构。
+/// 做法是先在 serde 渲染的那一份里放一个占位的词，渲染完再换成双引号的写法：其余的
+/// 写法（键、嵌套、别的标量的引号）照旧由 serde 决定。
+///
+/// **这里只管写得对，不管该不该写**：哪些字段只能单行由调用方查（[`Section::multiline`]、
+/// [`set`]）。
 pub fn render(v: &Value) -> Result<Rendered, EditError> {
-    reject_multiline(v)?;
-    let text = serde_yaml_ng::to_string(v).map_err(|e| EditError::Unwritable(e.to_string()))?;
-    let text = text.trim_end_matches('\n').to_string();
+    let mut quoted = Vec::new();
+    let mark = free_mark(v);
+    let swapped = swap_escaped(v, &mark, &mut quoted);
+    let text =
+        serde_yaml_ng::to_string(&swapped).map_err(|e| EditError::Unwritable(e.to_string()))?;
+    let mut text = text.trim_end_matches('\n').to_string();
+    for (i, q) in quoted.iter().enumerate() {
+        let token = format!("{mark}{i}z");
+        // 占位的词得原样、只出现一次：被加了引号、或者撞上了别的字，就不是这个值了
+        if text.matches(token.as_str()).count() != 1 {
+            return Err(EditError::Unwritable(format!(
+                "the placeholder {token} did not come out of the renderer as written"
+            )));
+        }
+        text = text.replacen(token.as_str(), q, 1);
+    }
     let block = match v {
         Value::Mapping(m) => !m.is_empty(),
         Value::Sequence(s) => !s.is_empty(),
@@ -351,8 +396,101 @@ fn render_block(v: &Value) -> Result<String, EditError> {
     Ok(render(v)?.text)
 }
 
-/// **值里不许有换行。**serde 会把它写成 `|-` 块标量，而块标量里缩进是
-/// 内容的一部分 —— 这一层不去冒那个险。配置里本来也没有需要多行的字段。
+/// 这个字符要不要转义：控制字符（C0、DEL、C1，含制表符和换行）、YAML 1.1 当作换行的
+/// 那几个（NEL、LS、PS），以及 BOM 和两个非字符。**这些字符原样写进文件，要么读不回来，
+/// 要么读回来变了样**（YAML 1.1 的加载器把 LS 当换行，折成一个空格）
+fn escaped(c: char) -> bool {
+    let n = c as u32;
+    n < 0x20
+        || (0x7f..=0x9f).contains(&n)
+        || matches!(n, 0x2028 | 0x2029 | 0xfeff | 0xfffe | 0xffff)
+}
+
+/// 一个字符串写成单行的 YAML 双引号标量。`"` 和 `\` 加反斜杠，换行、回车、制表符用
+/// 各自的转义，其余要转义的写成 `\xNN` / `\uNNNN`，别的字符原样。
+fn double_quoted(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if escaped(c) => {
+                let n = c as u32;
+                if n <= 0xff {
+                    let _ = write!(out, "\\x{n:02x}");
+                } else {
+                    let _ = write!(out, "\\u{n:04x}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 占位词的前缀：`twq<n>x`，挑一个**哪个字符串里都没有**的 `n`（连同转义之后的写法）。
+/// 占位词是前缀加序号再加 `z` —— 结尾的 `z` 让第 1 个不会是第 10 个的开头
+fn free_mark(v: &Value) -> String {
+    let mut all = Vec::new();
+    strings(v, &mut all);
+    let taken = |mark: &str| {
+        all.iter().any(|s| {
+            s.contains(mark) || (s.chars().any(escaped) && double_quoted(s).contains(mark))
+        })
+    };
+    (0u64..)
+        .map(|n| format!("twq{n}x"))
+        .find(|m| !taken(m))
+        .unwrap_or_default()
+}
+
+fn strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::String(s) => out.push(s),
+        Value::Mapping(m) => {
+            for (k, v) in m {
+                strings(k, out);
+                strings(v, out);
+            }
+        }
+        Value::Sequence(s) => s.iter().for_each(|v| strings(v, out)),
+        Value::Tagged(t) => strings(&t.value, out),
+        _ => {}
+    }
+}
+
+/// 把要转义的字符串换成占位词（键和值都算），转义后的写法按序号收进 `quoted`
+fn swap_escaped(v: &Value, mark: &str, quoted: &mut Vec<String>) -> Value {
+    match v {
+        Value::String(s) if s.chars().any(escaped) => {
+            let token = format!("{mark}{}z", quoted.len());
+            quoted.push(double_quoted(s));
+            Value::String(token)
+        }
+        Value::Mapping(m) => Value::Mapping(
+            m.iter()
+                .map(|(k, v)| (swap_escaped(k, mark, quoted), swap_escaped(v, mark, quoted)))
+                .collect(),
+        ),
+        Value::Sequence(s) => {
+            Value::Sequence(s.iter().map(|v| swap_escaped(v, mark, quoted)).collect())
+        }
+        Value::Tagged(t) => Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: t.tag.clone(),
+            value: swap_escaped(&t.value, mark, quoted),
+        })),
+        other => other.clone(),
+    }
+}
+
+/// **单行的字段里不许有换行**：名字、地址、密钥写成两行就不是原来那个东西了。
+/// 哪些字段可以多行由那一段自己说（[`Section::multiline`]）
 fn reject_multiline(v: &Value) -> Result<(), EditError> {
     match v {
         Value::String(s) if s.contains('\n') || s.contains('\r') => Err(EditError::Multiline),
@@ -366,12 +504,29 @@ fn reject_multiline(v: &Value) -> Result<(), EditError> {
     }
 }
 
-/// 按字段把一项改成新的样子：删掉新结构里没有的键，写入新增或变了的键。
+/// 一项里要写的这些字段，除了这一段允许多行的，都得是单行
+fn single_lines<'a>(
+    section: Section,
+    fields: impl Iterator<Item = (&'a Value, &'a Value)>,
+) -> Result<(), EditError> {
+    for (k, v) in fields {
+        reject_multiline(k)?;
+        let free = k.as_str().is_some_and(|k| section.multiline.contains(&k));
+        if !free {
+            reject_multiline(v)?;
+        }
+    }
+    Ok(())
+}
+
+/// 按字段把一项改成新的样子：删掉新结构里没有的键，写入新增或变了的键。**只查要写的
+/// 那几个字段**：没变的字段原样留着，不管它是怎么写进文件的
 fn sync_fields(
     text: &str,
     path: &[Step],
     old: &Mapping,
     new: &Mapping,
+    section: Section,
 ) -> Result<String, EditError> {
     let mut out = text.to_string();
     let key_of = |k: &Value| -> Result<String, EditError> {
@@ -379,12 +534,17 @@ fn sync_fields(
             .map(str::to_string)
             .ok_or_else(|| EditError::Unwritable(format!("the key {k:?} is not a string")))
     };
+    let changed: Vec<(&Value, &Value)> = new
+        .iter()
+        .filter(|(k, v)| old.get(*k) != Some(*v))
+        .collect();
+    single_lines(section, changed.iter().copied())?;
     for (k, _) in old.iter().filter(|(k, _)| !new.contains_key(*k)) {
         let mut p = path.to_vec();
         p.push(Step::Key(key_of(k)?));
         out = tw_yaml::remove_key(&out, &p)?;
     }
-    for (k, v) in new.iter().filter(|(k, v)| old.get(*k) != Some(*v)) {
+    for (k, v) in changed {
         let mut p = path.to_vec();
         p.push(Step::Key(key_of(k)?));
         let rendered = render(v)?;
@@ -573,8 +733,9 @@ providers:
         assert_eq!(back, CFG);
     }
 
+    /// 单行的字段里有换行：拒绝。新加的、改的、按路径设的都一样
     #[test]
-    fn a_value_with_a_newline_is_refused() {
+    fn a_newline_in_a_single_line_field_is_refused() {
         let e = upsert(
             CFG,
             PROXIES,
@@ -583,6 +744,161 @@ providers:
         )
         .unwrap_err();
         assert!(matches!(e, EditError::Multiline), "{e}");
+        let e = upsert(
+            CFG,
+            PROVIDERS,
+            Some("官方"),
+            &map("name: 官方\nbase_url: https://api.anthropic.com\nkey: \"sk-a\\r\"\n"),
+        )
+        .unwrap_err();
+        assert!(matches!(e, EditError::Multiline), "{e}");
+        let e = set(
+            CFG,
+            &[Step::key("default_route")],
+            Some(&Value::String("a\nb".into())),
+        )
+        .unwrap_err();
+        assert!(matches!(e, EditError::Multiline), "{e}");
+    }
+
+    const PLUGIN: &str = "  - id: p\n    file: plugins/p.js\n    sha256: 6f1c000000000000000000000000000000000000000000000000000000000abc\n";
+
+    fn plugin_item(settings: &str) -> Mapping {
+        map(&format!(
+            "id: p\nfile: plugins/p.js\nsha256: 6f1c000000000000000000000000000000000000000000000000000000000abc\nsettings:\n{settings}"
+        ))
+    }
+
+    /// 插件的设置可以多行：写成一行双引号，换行转义，读回来一字不差 —— 新加的和改的都是
+    #[test]
+    fn a_plugin_setting_may_span_lines_and_is_written_on_one_line() {
+        let terms = "登陆=登录\n帐号=账号\n";
+        let out = upsert(
+            CFG,
+            PLUGINS,
+            None,
+            &plugin_item("  terms: \"登陆=登录\\n帐号=账号\\n\"\n"),
+        )
+        .unwrap();
+        assert!(
+            out.contains("\n      terms: \"登陆=登录\\n帐号=账号\\n\"\n"),
+            "{out}"
+        );
+        assert_eq!(
+            parse(&out).unwrap()["plugins"][0]["settings"]["terms"],
+            terms
+        );
+        assert!(out.contains("# 两家上游"), "{out}");
+
+        let patterns = "\\bsk-[a-z]+\\b\n\"quoted\"\t#1: x\r\n---\n...";
+        let mut item = plugin_item("  terms: x\n");
+        item["settings"]["terms"] = Value::String(patterns.into());
+        let again = upsert(&out, PLUGINS, Some("p"), &item).unwrap();
+        assert_eq!(
+            parse(&again).unwrap()["plugins"][0]["settings"]["terms"],
+            patterns
+        );
+        // 只有那一行变了
+        let changed: Vec<_> = again
+            .lines()
+            .filter(|l| !out.lines().any(|o| o == *l))
+            .collect();
+        assert_eq!(changed.len(), 1, "{again}");
+        assert!(changed[0].starts_with("      terms: \""), "{again}");
+    }
+
+    /// 插件那一项里只有设置能多行：范围里的模式、id 照旧单行
+    #[test]
+    fn only_the_settings_of_a_plugin_may_span_lines() {
+        let mut item = plugin_item("  note: ok\n");
+        item.insert("scope".into(), map("models: [\"a\\nb\"]\n").into());
+        let e = upsert(CFG, PLUGINS, None, &item).unwrap_err();
+        assert!(matches!(e, EditError::Multiline), "{e}");
+    }
+
+    /// 控制字符、制表符、YAML 1.1 当换行的那几个字符：单行字段里也能写，转义成双引号，
+    /// 读回来一字不差
+    #[test]
+    fn control_characters_and_line_separators_are_escaped_everywhere() {
+        for s in [
+            "a\tb",
+            "a\u{0}b",
+            "a\u{7}b\u{1b}",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{9f}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "\u{feff}a",
+            "a\u{fffe}\u{ffff}",
+            "\t",
+        ] {
+            let mut item = map("name: 官方\nbase_url: https://api.anthropic.com\nkey: sk-a\n");
+            item["key"] = Value::String(s.into());
+            let out = upsert(CFG, PROVIDERS, Some("官方"), &item)
+                .unwrap_or_else(|e| panic!("{s:?}: {e}"));
+            assert_eq!(parse(&out).unwrap()["providers"][0]["key"], s, "{out}");
+            assert!(out.contains("\n    key: \""), "{s:?}: {out}");
+            assert!(
+                !out.chars().any(|c| c != '\n' && escaped(c)),
+                "{s:?} was written raw: {out:?}"
+            );
+        }
+    }
+
+    /// 文件里本来就有一个多行的值（手写的块标量），这次没改它：只改的那个字段要查
+    #[test]
+    fn an_untouched_multiline_value_written_by_hand_does_not_block_an_edit() {
+        let text = CFG.replace(
+            "    key: sk-a\n",
+            "    key: sk-a\n    notes: |\n      第一行\n      第二行\n",
+        );
+        let mut item = parse(&text).unwrap()["providers"][0]
+            .as_mapping()
+            .cloned()
+            .unwrap();
+        item.insert("proxy".into(), "corp".into());
+        let out = upsert(&text, PROVIDERS, Some("官方"), &item).unwrap();
+        assert!(
+            out.contains("    notes: |\n      第一行\n      第二行\n"),
+            "{out}"
+        );
+        assert_eq!(parse(&out).unwrap()["providers"][0]["proxy"], "corp");
+    }
+
+    /// 行内写法的插件列表重排：整段重写，多行的设置照样搬过去
+    #[test]
+    fn reordering_a_flow_list_carries_multiline_settings_along() {
+        let text = format!(
+            "{CFG}plugins: [{{id: a, file: plugins/a.js, sha256: x, settings: {{t: \"1\\n2\"}}}}, {{id: b, file: plugins/b.js, sha256: y}}]\n"
+        );
+        let out = reorder(&text, PLUGINS, &["b".into(), "a".into()]).unwrap();
+        let v = parse(&out).unwrap();
+        assert_eq!(v["plugins"][0]["id"], "b");
+        assert_eq!(v["plugins"][1]["settings"]["t"], "1\n2");
+    }
+
+    /// 占位词撞上了值里本来就有的字：换一个
+    #[test]
+    fn the_placeholder_never_matches_text_that_is_already_there() {
+        let v: Value =
+            serde_yaml_ng::from_str("a: \"twq0x0z\\n\"\nb: twq0x0z\nc: twq1x\nd: \"x\\ty\"\n")
+                .unwrap();
+        let r = render(&v).unwrap();
+        let back: Value = serde_yaml_ng::from_str(&r.text).unwrap();
+        assert_eq!(back, v, "{}", r.text);
+        assert!(r.block);
+    }
+
+    #[test]
+    fn a_plugin_entry_appended_to_a_config_without_plugins_starts_the_section() {
+        let out = upsert(CFG, PLUGINS, None, &plugin_item("  t: \"a\\nb\"\n")).unwrap();
+        assert!(
+            out.ends_with(&format!(
+                "plugins:\n{PLUGIN}    settings:\n      t: \"a\\nb\"\n"
+            )),
+            "{out}"
+        );
     }
 
     #[test]

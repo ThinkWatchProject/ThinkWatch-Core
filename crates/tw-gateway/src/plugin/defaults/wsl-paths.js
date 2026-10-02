@@ -18,10 +18,10 @@
 // 设置：客户端运行在 Windows 上（关闭时按客户端在 WSL 里处理）。
 
 export const manifest = {
-  name: "WSL 路径转换",
+  name: "Convert WSL and Windows paths",
   api: 1,
   description:
-    "把工具调用参数里的盘符路径统一成客户端那一侧的写法（WSL 的 /mnt/c/… 或 Windows 的 C:\\…），回答和对话历史里的都改。",
+    "Rewrites drive paths in tool-call arguments to the form the client can open (WSL /mnt/c/… or Windows C:\\…), in answers and in the conversation history.",
   permissions: ["messages", "reply.tool_calls"],
   settings: {
     windows_client: {
