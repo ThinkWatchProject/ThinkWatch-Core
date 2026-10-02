@@ -897,7 +897,8 @@ async fn a_trial_needs_a_known_plugin_and_a_recorded_request() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(v["error"]["code"].is_string(), "{v}");
+    // 这一条什么正文都没存下来
+    assert_eq!(v["error"]["code"], "gw.plugin.nothing_to_try", "{v}");
     assert!(v["logs"].as_array().unwrap().is_empty());
 
     // 改过还没批准的代码不试
@@ -911,6 +912,137 @@ async fn a_trial_needs_a_known_plugin_and_a_recorded_request() {
     )
     .await;
     assert_eq!(v["error"]["code"], "control.plugin.trial_changed");
+}
+
+/// 跑得起钩子的引擎：manifest 照假引擎读，请求钩子在系统提示后面补一句，回答钩子把字
+/// 换成大写
+struct Running;
+
+struct RunningHost(Arc<dyn tw_gateway::plugin::PluginHost>);
+
+impl tw_gateway::plugin::PluginHost for RunningHost {
+    fn manifest(&self) -> &tw_gateway::plugin::Manifest {
+        self.0.manifest()
+    }
+    fn sha256(&self) -> [u8; 32] {
+        self.0.sha256()
+    }
+    fn on_request(
+        &self,
+        mut view: Value,
+        _ctx: Value,
+    ) -> tw_gateway::plugin::Invocation<tw_gateway::plugin::RequestOutcome> {
+        let system = view["system"].as_str().unwrap_or_default().to_string();
+        view["system"] = json!(format!("{system} Today is Friday."));
+        let mut inv =
+            tw_gateway::plugin::Invocation::ok(tw_gateway::plugin::RequestOutcome::Changed(view));
+        inv.logs.push(tw_gateway::plugin::LogLine {
+            level: tw_api::PluginLogLevel::Info,
+            text: "added the date".into(),
+        });
+        inv
+    }
+    fn reply(
+        &self,
+        _ctx: Value,
+    ) -> Result<Box<dyn tw_gateway::plugin::ReplyHost>, tw_gateway::plugin::RunError> {
+        use tw_gateway::plugin::{Invocation, ToolCallOutcome};
+        Ok(Box::new(tw_gateway::plugin::host::double::Closures {
+            text: Box::new(|t| Invocation::ok(Some(t.to_uppercase()))),
+            end: Box::new(|| Invocation::ok(None)),
+            tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+        }))
+    }
+}
+
+impl tw_gateway::plugin::Engine for Running {
+    fn load(
+        &self,
+        source: &[u8],
+    ) -> Result<Arc<dyn tw_gateway::plugin::PluginHost>, tw_gateway::plugin::LoadError> {
+        Ok(Arc::new(RunningHost(tw_gateway::plugin::Engine::load(
+            &FakeEngine,
+            source,
+        )?)))
+    }
+}
+
+/// 试跑接到数据面上：记下的请求和回答各跑一遍，前后两份都打着码，日志交回来、不进
+/// 插件自己的日志
+#[tokio::test]
+async fn a_trial_runs_the_plugin_on_the_recorded_request_and_answer() {
+    let b = bed();
+    b.gw.set_plugin_engine(Arc::new(Running));
+    let src = source(
+        json!({"name": "Both", "api": 1, "permissions": ["system", "reply.text"]}),
+        &["onRequest", "onReplyText"],
+    );
+    let id = b.install(&src, json!({})).await;
+    let key = "sk-ant-api03-TRIALKEYAAAAAAAAAAAAAAAAAAAA";
+    let request = json!({
+        "model": "claude-sonnet-4-5", "max_tokens": 64, "stream": true,
+        "system": "Be brief.",
+        "messages": [{"role": "user", "content": format!("my key is {key}")}]
+    })
+    .to_string();
+    let answer = [
+        json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello there"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+        json!({"type":"message_stop"}),
+    ]
+    .iter()
+    .map(|c| format!("event: {}\ndata: {c}\n\n", c["type"].as_str().unwrap()))
+    .collect::<String>();
+    {
+        let g = b.store.lock().await;
+        g.db().insert(&row(9, 1_000)).unwrap();
+        g.record_body(
+            1_000,
+            9,
+            tw_store::Which::Request,
+            request.as_bytes(),
+            request.len(),
+        );
+        g.record_body(
+            1_000,
+            9,
+            tw_store::Which::Response,
+            answer.as_bytes(),
+            answer.len(),
+        );
+    }
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        &format!("/plugins/{id}/trial"),
+        Some(json!({"request_id": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["error"].is_null(), "{v}");
+    assert_eq!(v["request"]["outcome"], "changed", "{v}");
+    let after = v["request"]["after"].as_str().unwrap();
+    assert!(after.contains("Be brief. Today is Friday."), "{after}");
+    assert_eq!(v["reply"]["outcome"], "changed", "{v}");
+    let reply: Value = serde_json::from_str(v["reply"]["after"].as_str().unwrap()).unwrap();
+    assert_eq!(reply["content"][0]["text"], "HELLO THERE");
+    assert!(
+        !v.to_string().contains("TRIALKEY"),
+        "a secret was shown: {v}"
+    );
+    let logs = v["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 1, "{v}");
+    assert_eq!(logs[0]["hook"], "request");
+    assert_eq!(logs[0]["request_id"], 9);
+    // 试跑不进插件自己的日志和计数
+    let (_, mine) = call(&b.app, "GET", &format!("/plugins/{id}/logs"), None).await;
+    assert!(
+        mine.as_array().is_none_or(|l| l.is_empty()),
+        "the trial was logged: {mine}"
+    );
 }
 
 /// 远程 core：配置不在默认的地方，插件文件就在那份配置旁边 —— 文件由 core 自己写

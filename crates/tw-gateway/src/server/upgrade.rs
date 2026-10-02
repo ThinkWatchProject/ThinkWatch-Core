@@ -152,11 +152,17 @@ pub(super) async fn ws_upgrade(
         limit_mode: rt.config.security.output_limit.mode,
         limit: rt.config.security.output_limit.limit(),
     };
+    // 插件：升级那一刻的那一份表，一条连接用到底
+    let plugins = (!rt.plugins.is_empty()).then(|| crate::ws::Plugins {
+        pool: state.plugin_pool.clone(),
+        set: rt.plugins.clone(),
+        client: crate::hint::client_hint(&headers),
+    });
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久
         let _live = live;
         let mut ending = ending;
         ending.responded(101);
-        crate::ws::proxy(state, sock, upstream, rules, id, ending).await;
+        crate::ws::proxy(state, sock, upstream, rules, id, ending, plugins).await;
     }))
 }

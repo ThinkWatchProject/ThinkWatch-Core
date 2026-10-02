@@ -198,6 +198,7 @@ async fn passthrough(
         dialect,
         started,
         from,
+        before: None,
     };
     let result = pipeline::pipeline(state, rt, req, live, &mut ending).await;
     if let Some(end) = ending.take() {
