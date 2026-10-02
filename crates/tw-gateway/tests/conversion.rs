@@ -538,41 +538,6 @@ fn assert_array_ends_in_error(body: &str, first_text: &str) {
 }
 
 #[tokio::test]
-async fn an_answer_over_the_output_limit_closes_a_gemini_json_array_with_an_error() {
-    let el = |t: &str| json!({"candidates": [{"content": {"role": "model", "parts": [{"text": t}]}, "index": 0}]});
-    let (up, _) = upstream(
-        200,
-        "application/json",
-        format!("[{},\r\n{},\r\n{}]", el("abcd"), el("efgh"), el("ijkl")),
-    )
-    .await;
-    let p = provider(up, Protocol::Gemini);
-    let (gw, _) = gateway_with(
-        p,
-        Security {
-            output_limit: tw_config::OutputLimitPolicy {
-                mode: SecurityMode::Enforce,
-                max_chars: 6,
-            },
-            ..Default::default()
-        },
-    )
-    .await;
-    let (status, ct, body) = post(
-        gw,
-        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
-        &[("x-goog-api-key", "tw-k")],
-        json!({"contents": [{"role": "user", "parts": [{"text": "说点什么"}]}]}),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(ct, "application/json");
-    assert!(!body.contains("efgh"), "越界那一个元素发出去了：{body}");
-    assert!(body.contains("output limit"), "{body}");
-    assert_array_ends_in_error(&body, "abcd");
-}
-
-#[tokio::test]
 async fn a_dangerous_call_is_cut_in_a_converted_gemini_json_array_stream() {
     let (up, _) = upstream(200, "text/event-stream", poisoned_anthropic_stream()).await;
     let p = provider(up, Protocol::Anthropic);

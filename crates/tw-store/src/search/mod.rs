@@ -1376,6 +1376,8 @@ mod tests {
                 tool: None,
                 excerpt: "sk-an…".into(),
                 count: 1,
+                matching: None,
+                revealed: None,
             })
             .unwrap();
         }

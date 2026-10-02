@@ -369,11 +369,9 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
         // 用不着它
         clients: keys::views(&s, keys::Reveal::Masked).await,
         security: tw_api::SecurityView {
-            redact: cfg.security.redact.mode.into(),
-            inspect_tools: cfg.security.inspect_tools.mode.into(),
-            hidden_text: cfg.security.hidden_text.mode.into(),
-            content: cfg.security.content.mode.into(),
-            output_limit: cfg.security.output_limit.mode.into(),
+            redact: cfg.security.redact.mode,
+            inspect_tools: cfg.security.inspect_tools.mode,
+            content: cfg.security.content.mode,
         },
         default_route: engine.default_route().to_string(),
         client_probes: cfg

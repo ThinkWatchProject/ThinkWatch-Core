@@ -72,14 +72,15 @@ pub fn gemini_path_with_model(path: &str, model: &str) -> String {
 /// 的例外，不是默认行为 —— cc-switch 那次把缓存命中率从 99% 打到 20%，
 /// 就是因为一个「看起来无害」的重写跑在了每个请求上。
 ///
-/// 字段名按客户端的格式写：同一个「最大输出」在四种格式里叫四个名字。认不出格式时
-/// 按 Anthropic 写。Gemini 的模型在路径里，见 [`gemini_path_with_model`]。
+/// 字段名按客户端的格式写（[`tw_dialect::params`]）：同一个「最大输出」在四种格式里叫
+/// 四个名字。认不出格式时按 Anthropic 写。Gemini 的模型在路径里，见
+/// [`gemini_path_with_model`]。
 pub fn apply_set(
     body: &Bytes,
     set: &tw_engine::SetAction,
     client: Option<tw_dialect::ir::Dialect>,
 ) -> Bytes {
-    use tw_dialect::ir::Dialect;
+    use tw_dialect::params;
     if set.is_empty() {
         return body.clone();
     }
@@ -88,87 +89,24 @@ pub fn apply_set(
         tracing::warn!("the request body is not JSON; skipping the parameter rewrites");
         return body.clone();
     };
-    let Some(obj) = v.as_object_mut() else {
+    if !v.is_object() {
         return body.clone();
-    };
-    let client = client.unwrap_or(Dialect::Anthropic);
-    if let Some(m) = &set.model
-        && client != Dialect::Gemini
-    {
-        obj.insert("model".into(), serde_json::Value::String(m.clone()));
+    }
+    let client = client.unwrap_or(tw_dialect::ir::Dialect::Anthropic);
+    if let Some(m) = &set.model {
+        params::set_model(client, &mut v, m);
     }
     if let Some(t) = set.max_tokens {
-        let t = serde_json::Value::from(t);
-        match client {
-            Dialect::Anthropic => {
-                obj.insert("max_tokens".into(), t);
-            }
-            Dialect::Chat => {
-                let key = if obj.contains_key("max_completion_tokens") {
-                    "max_completion_tokens"
-                } else {
-                    "max_tokens"
-                };
-                obj.insert(key.into(), t);
-            }
-            Dialect::Responses => {
-                obj.insert("max_output_tokens".into(), t);
-            }
-            Dialect::Gemini => {
-                let g = obj
-                    .entry("generationConfig")
-                    .or_insert_with(|| serde_json::json!({}));
-                if let Some(g) = g.as_object_mut() {
-                    g.insert("maxOutputTokens".into(), t);
-                }
-            }
-            Dialect::Bedrock => {
-                let c = obj
-                    .entry("inferenceConfig")
-                    .or_insert_with(|| serde_json::json!({}));
-                if let Some(c) = c.as_object_mut() {
-                    c.insert("maxTokens".into(), t);
-                }
-            }
-        }
+        params::set_max_output_tokens(client, &mut v, t);
     }
-    if let Some(th) = set.thinking {
-        if th {
-            // 开启思考需要一个 budget，而我们没有一个合理的值可以编。
-            // **只做「关掉」这一个方向** —— 那是降级场景真正需要的。
-            tracing::warn!(
-                "set.thinking: true is not supported yet (it needs budget_tokens); ignoring it"
-            );
-        } else {
-            match client {
-                Dialect::Anthropic => {
-                    obj.remove("thinking");
-                }
-                Dialect::Chat => {
-                    obj.remove("reasoning_effort");
-                }
-                Dialect::Responses => {
-                    obj.remove("reasoning");
-                }
-                Dialect::Gemini => {
-                    if let Some(g) = obj
-                        .get_mut("generationConfig")
-                        .and_then(|g| g.as_object_mut())
-                    {
-                        g.remove("thinkingConfig");
-                    }
-                }
-                // Converse 没有一等公民的思考开关，它在透传口袋里
-                Dialect::Bedrock => {
-                    if let Some(f) = obj
-                        .get_mut("additionalModelRequestFields")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        f.remove("thinking");
-                    }
-                }
-            }
-        }
+    match set.thinking {
+        // 开启思考需要一个 budget，而我们没有一个合理的值可以编。
+        // **只做「关掉」这一个方向** —— 那是降级场景真正需要的。
+        Some(true) => tracing::warn!(
+            "set.thinking: true is not supported yet (it needs budget_tokens); ignoring it"
+        ),
+        Some(false) => params::disable_thinking(client, &mut v),
+        None => {}
     }
     match serde_json::to_vec(&v) {
         Ok(b) => Bytes::from(b),

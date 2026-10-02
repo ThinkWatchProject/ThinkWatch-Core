@@ -1,19 +1,56 @@
 # 内容过滤的出厂规则。
 #
 # **放在 YAML 里而不是硬编码**，和 rules.yaml 同一个理由：这个列表会跟着新的写法
-# 演进。两个网关共用这一份 —— 企业版的「预设组」就是按 `group` 分的它。
+# 演进。两个网关共用这一份。
 #
 # 每条规则：
 #
 # - `id`：配置按它引用，**改了就是另一条规则**；
 # - `name`：英文名。界面按 id 查自己的名称表，这里的英文是查不到时的退路；
-# - `match`：`contains`（不分大小写的子串）或 `regex`（不分大小写的正则）。
+# - `match`：`contains`（不分大小写的子串）、`regex`（不分大小写的正则）或
+#   `codepoints`（按字符本身认，写成 `U+200B`、`U+E0000–U+E007F`）。
 #   `contains` 的首尾空格有意义（` dan ` 靠它不误伤 `dance`）；
-# - `action`：出厂的处置，`block` / `warn` / `log`；
-# - `group`：`injection`（覆盖指令的说法）/ `persona`（改换身份、套提示词）/
-#   `chinese`（中文的说法）；
+# - `action`：出厂的处置，`block`（拒绝）/ `strip`（删除）/ `record`（仅记录）；
+# - `group`：`invisible`（隐藏字符）/ `injection`（覆盖指令的说法）/ `persona`
+#   （改换身份、套提示词）/ `chinese`（中文的说法）；
 # - `on_by_default`：出厂时开不开。**只开误报极少的那几条** —— 「act as」
-#   「system prompt」在写代码的对话里天天出现，出厂就开等于让记录变成噪音。
+#   「system prompt」在写代码的对话里天天出现，出厂就开等于让记录变成噪音；
+# - `why`：规则名说不清的，一句英文说明（界面按 id 查译文）。
+#
+# 隐藏字符一组排在最前：人眼看不见、模型读得到的字符。出厂开着的只有标签字符和双向
+# 控制符 —— 它们在任何正文里都没有正当用途；零宽字符和私用区字符在正常文字里也有
+# （表情、波斯文、图标字体），出厂关着。
+
+- id: unicode-tags
+  name: Unicode tag characters
+  pattern: 'U+E0000–U+E007F'
+  match: codepoints
+  action: strip
+  group: invisible
+  on_by_default: true
+  why: Entirely invisible in an editor, yet carried into the model's context as they are, so they can hide a whole instruction.
+- id: bidi-controls
+  name: Bidirectional controls
+  pattern: 'U+202A–U+202E, U+2066–U+2069'
+  match: codepoints
+  action: strip
+  group: invisible
+  on_by_default: true
+  why: They can make the order shown on screen differ from the actual order of the characters.
+- id: zero-width
+  name: Zero-width characters
+  pattern: 'U+200B–U+200D, U+2060, U+FEFF'
+  match: codepoints
+  action: strip
+  group: invisible
+  why: Invisible in an editor, and read by the model. Emoji, Persian and other ordinary writing use them too.
+- id: private-use
+  name: Private-use characters
+  pattern: 'U+E000–U+F8FF, U+F0000–U+FFFFD, U+100000–U+10FFFD'
+  match: codepoints
+  action: strip
+  group: invisible
+  why: They have no standard meaning. Some icon fonts use them.
 
 - id: ignore-previous-instructions
   name: Ignore previous instructions
@@ -65,43 +102,43 @@
   name: New persona
   pattern: 'new persona'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: act-as
   name: Act as
   pattern: 'act as'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: pretend-to-be
   name: Pretend to be
   pattern: 'pretend to be'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: system-prompt
   name: System prompt extraction
   pattern: 'system prompt'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: reveal-your-instructions
   name: Reveal instructions
   pattern: 'reveal your instructions'
   match: contains
-  action: warn
+  action: record
   group: persona
 - id: what-are-your-rules
   name: What are your rules
   pattern: 'what are your rules'
   match: contains
-  action: log
+  action: record
   group: persona
 - id: base64-wall
   name: Base64 smuggling
   pattern: '[A-Za-z0-9+/=]{50,}'
   match: regex
-  action: warn
+  action: record
   group: persona
 
 - id: zh-ignore-previous
@@ -132,19 +169,19 @@
   name: Role-play (Chinese)
   pattern: '扮演'
   match: contains
-  action: warn
+  action: record
   group: chinese
 - id: zh-reveal-your
   name: Reveal your instructions (Chinese)
   pattern: '透露你的'
   match: contains
-  action: warn
+  action: record
   group: chinese
 - id: zh-system-prompt
   name: System prompt (Chinese)
   pattern: '系统提示词'
   match: contains
-  action: warn
+  action: record
   group: chinese
 - id: zh-jailbreak
   name: Jailbreak (Chinese)

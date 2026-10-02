@@ -194,6 +194,7 @@ async fn a_custom_rule_is_replaced_on_the_way_out_and_restored_on_the_way_back()
             custom: vec![tw_config::CustomRedactRule {
                 name: "公司令牌".into(),
                 pattern: r"corp_[A-Za-z0-9]{12}".into(),
+                label: None,
                 disabled: false,
             }],
             ..Default::default()

@@ -102,15 +102,3 @@ pub fn secret_kind(k: tw_guard::redact::rules::Kind) -> tw_api::SecretKind {
         Kind::Custom => tw_api::SecretKind::Custom,
     }
 }
-
-/// 藏匿字符的藏法在契约里的词。
-pub fn hidden_kind(k: tw_guard::hidden::Kind) -> tw_api::HiddenKind {
-    use tw_guard::hidden::Kind;
-    match k {
-        Kind::ZeroWidth => tw_api::HiddenKind::ZeroWidth,
-        Kind::Tag => tw_api::HiddenKind::Tag,
-        Kind::Bidi => tw_api::HiddenKind::Bidi,
-        Kind::Homoglyph => tw_api::HiddenKind::Homoglyph,
-        Kind::PrivateUse => tw_api::HiddenKind::PrivateUse,
-    }
-}

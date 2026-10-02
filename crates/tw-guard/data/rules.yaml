@@ -98,6 +98,18 @@ dangerous:
     pattern: '(?i)(cat|cp|scp|curl)[^\n]{0,200}(\.ssh/id_|\.aws/credentials|\.netrc)'
     why: Reads a private key or a cloud credential
     level: high
+  # 下面两条**一条正则认不出**：要跨参数把 URL、凭据、上传标记凑到一起看，所以由
+  # 代码实现（`check`，见 src/tools/net.rs），`pattern` 留空。它们一样是内置的危险命令
+  # 规则，照样能在安全页上逐条停用、改处置。
+  #
+  # 凭据发往既非本机、也不是这把凭据的服务商的地址：还原之后的工具调用里出现一把真的
+  # key 加一个陌生 host，就是把凭据送出去 —— 一步就能拿走凭据，高危、拦截档下切断。
+  - id: secret-to-unknown-host
+    name: Send a credential to an unknown host
+    pattern: ''
+    why: Sends a credential to a host that is neither local nor the credential's own provider
+    level: high
+    check: credential-to-network
   # **写入启动项**：只要写进去了，下次开终端就执行 —— 而且是在你完全
   # 不知情的时候。它和「下载即执行」并列为高危，理由是一样的：
   # 一步就能拿到执行权。
@@ -123,3 +135,12 @@ dangerous:
     pattern: 'chmod\s+(-R\s+)?777'
     why: Makes a file writable by everyone
     level: medium
+  # 把本地文件的内容上传到外部主机（`curl -T 文件`、`--data @文件`、`-F 字段=@文件` 等）。
+  # 开发里很常见（上传构建产物、贴日志），**出厂只记录**，先让人看见误报再说。代码实现，
+  # 见 src/tools/net.rs。
+  - id: upload-file-to-host
+    name: Upload a local file to an external host
+    pattern: ''
+    why: Uploads the contents of a local file to an external host
+    level: medium
+    check: file-to-network

@@ -1,16 +1,17 @@
-//! 认得出哪些东西是凭据，外加两种个人号码。
+//! 认得出哪些东西是凭据，外加几种个人信息。
 //!
-//! **桌面场景要脱的东西和企业完全不同。**企业关心合规 —— 客户的身份证
-//! 号、手机号不能流到第三方模型。个人开发者关心的是：**我的 API key、
-//! 私钥、内网地址，会不会被中转站顺走。**所以这套规则是凭据导向的，
-//! 手机号、邮箱、姓名这类个人信息一条都不收：它们没有能核对的结构，只能
-//! 按「长得像」去猜。
+//! **两个产品共用这一份目录。**个人开发者关心的是：**我的 API key、私钥、内网地址，
+//! 会不会被中转站顺走**；企业关心合规 —— 客户的身份证号、手机号、邮箱不能流到第三方
+//! 模型。凭据规则出厂就开；个人信息里只有能在结构上核对的两种出厂就开：
 //!
-//! **身份证号和银行卡号是两个例外**，是产品上点名要的：一旦漏出去就收不
-//! 回来，而且都能在结构上核对 —— 身份证号有省级地区码、真实的出生日期和
-//! MOD 11-2 校验码，卡号有卡组织的号段、位数和 Luhn 校验 —— 达得到和凭据
-//! 规则同一道门槛。它们自成一类（[`Kind::Personal`]），占位符写明是哪一种，
-//! 报出去只留最后四位。
+//! - **身份证号和银行卡号**，是产品上点名要的：一旦漏出去就收不回来，而且都能在
+//!   结构上核对 —— 身份证号有省级地区码、真实的出生日期和 MOD 11-2 校验码，卡号有
+//!   卡组织的号段、位数和 Luhn 校验 —— 达得到和凭据规则同一道门槛；
+//! - **邮箱和中国大陆手机号**出厂关着：它们没有能核对的结构，只能按「长得像」认，
+//!   在代码和文档里误报得多。要的人（企业版的合规场景）自己打开。
+//!
+//! 个人信息自成一类（[`Kind::Personal`]），占位符写明是哪一种，报出去只留认得出是
+//! 哪一个的最少部分（号码留最后四位，邮箱留第一个字和域名）。
 //!
 //! 贯穿全文件的一条：**宁可漏，不可吵。**一个天天误报的安全功能，用户
 //! 第二天就关了 ——而关掉之后，它连该抓的那次也抓不到了。所以
@@ -44,8 +45,8 @@ pub enum Kind {
     Jwt,
     /// `postgres://user:pass@` 这类带口令的 URI。**只换口令那一段**
     ConnStrings,
-    /// 身份证号、银行卡号：个人信息，不是凭据。占位符写明是哪一种，报出去
-    /// 只留最后四位
+    /// 身份证号、银行卡号、邮箱、手机号：个人信息，不是凭据。占位符写明是哪一种，
+    /// 报出去只留认得出是哪一个的最少部分
     Personal,
     /// RFC1918 地址、`.local` / `.internal` 域名
     Internal,
@@ -96,6 +97,11 @@ pub enum Matcher {
     /// 四位一组、用一个空格或一个连字符隔开的（最后一组可以不足四位；American
     /// Express 另有 4-6-5、Diners Club 另有 4-6-4）。公开的测试卡号不算
     BankCard { networks: &'static [CardNetwork] },
+    /// 邮箱地址：`本地部分@域名`，域名至少两段、最后一段是两个以上的字母。URL 里的
+    /// 用户名（`https://user@host`、`user:pass@host`）和 `icon@2x.png` 这类文件名不算
+    Email,
+    /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字
+    CnMobilePhone,
 }
 
 /// 一家卡组织认哪些卡号。
@@ -116,8 +122,8 @@ pub struct Builtin {
     pub kind: Kind,
     /// 英文名。界面按 id 查自己的名称表，查不到才用它
     pub name: &'static str,
-    /// 出厂时开不开。**只有内网地址那两条是关的**：RFC1918 地址在代码和
-    /// 文档里到处都是，而它的危害远小于一把 key，想脱的人自己开
+    /// 出厂时开不开。**关着的是内网地址和邮箱、手机号**：它们在代码和文档里到处
+    /// 都是，按「长得像」认误报得多，而危害远小于一把 key，想脱的人自己开
     pub on_by_default: bool,
     pub matcher: Matcher,
     /// 占位符里的标签。`None` 用账本的默认标签（桌面版是 `TW_SECRET`）。
@@ -293,6 +299,22 @@ pub const BUILTINS: &[Builtin] = &[
             networks: CARD_NETWORKS,
         },
         label: Some("TW_CARD_NUMBER"),
+    },
+    Builtin {
+        id: "email",
+        kind: Kind::Personal,
+        name: "Email address",
+        on_by_default: false,
+        matcher: Matcher::Email,
+        label: Some("TW_EMAIL"),
+    },
+    Builtin {
+        id: "cn-mobile-phone",
+        kind: Kind::Personal,
+        name: "Chinese mainland mobile number",
+        on_by_default: false,
+        matcher: Matcher::CnMobilePhone,
+        label: Some("TW_PHONE"),
     },
     Builtin {
         id: "internal-ip",
@@ -1087,6 +1109,100 @@ fn personal_token(
     }
 }
 
+/// 一个 token 里的中国大陆手机号：正好 11 位、`1` 开头、第二位是 `3`–`9` 的一串数字。
+///
+/// **前后不紧挨别的数字**：看的是一整串连着的数字，从更长的数字串里截一段去对的话，
+/// 订单号、时间戳里每隔几位就「有」一个手机号。字母挨着没关系（`tel13800138000`）。
+fn mobile_phones(tok: &str, at: usize, out: &mut Vec<Hit>) {
+    let b = tok.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i - start == 11 && b[start] == b'1' && (b'3'..=b'9').contains(&b[start + 1]) {
+            out.push(builtin_hit("cn-mobile-phone", at + start..at + i));
+        }
+    }
+}
+
+/// 邮箱本地部分里能有的字符
+fn is_local(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'%' | b'+' | b'-')
+}
+
+/// 邮箱地址：从每个 `@` 往两边找。
+///
+/// 往左是本地部分，往右是域名，**都止于 JSON 的转义**（请求体里的换行是 `\n` 两个
+/// 字符：行首的地址不能和那个 `n` 粘在一起）。不算的：
+///
+/// - URL 里的用户名：`@` 前面那段紧跟在 `/` 或 `:` 后面（`https://user@host`、
+///   `postgres://user:pass@host` —— 口令那一段归连接串那条规则）；
+/// - 域名不像域名的：只有一段（`user@localhost`）、最后一段不是两个以上的字母
+///   （`react@18.2.0`）；
+/// - 高分屏图片的文件名：`icon@2x.png`。
+fn emails(text: &str, out: &mut Vec<Hit>) {
+    let b = text.as_bytes();
+    for (at, _) in text.match_indices('@') {
+        // 往左：本地部分
+        let mut start = at;
+        while start > 0 && is_local(b[start - 1]) {
+            start -= 1;
+        }
+        // 前面是奇数个反斜杠：头一个字符是转义的一部分（`\n`、`\u00e9`）
+        let mut slashes = 0;
+        while start > slashes && b[start - 1 - slashes] == b'\\' {
+            slashes += 1;
+        }
+        if slashes % 2 == 1 {
+            let unicode = b[start] == b'u'
+                && b.get(start + 1..start + 5)
+                    .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit));
+            start = (start + if unicode { 5 } else { 1 }).min(at);
+        } else if start > 0 && matches!(b[start - 1], b'/' | b':') {
+            continue;
+        }
+        let local = &text[start..at];
+        if local.is_empty()
+            || local.len() > 64
+            || local.starts_with('.')
+            || local.ends_with('.')
+            || local.contains("..")
+        {
+            continue;
+        }
+        // 往右：域名。句末的句号不是域名的一部分
+        let mut end = at + 1;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || matches!(b[end], b'.' | b'-')) {
+            end += 1;
+        }
+        let domain = text[at + 1..end].trim_end_matches('.');
+        let labels: Vec<&str> = domain.split('.').collect();
+        let tld = labels.last().copied().unwrap_or_default();
+        let retina = labels[0].len() >= 2
+            && labels[0].ends_with('x')
+            && labels[0][..labels[0].len() - 1]
+                .bytes()
+                .all(|c| c.is_ascii_digit());
+        if labels.len() < 2
+            || retina
+            || !(2..=24).contains(&tld.len())
+            || !tld.bytes().all(|c| c.is_ascii_alphabetic())
+            || labels
+                .iter()
+                .any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-'))
+        {
+            continue;
+        }
+        out.push(builtin_hit("email", start..at + 1 + domain.len()));
+    }
+}
+
 // ---------------------------------------------------------------- 自定义
 
 /// 自定义规则的一处匹配，收成**在 JSON 字符串里换得安全**的一段。
@@ -1144,9 +1260,13 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_on("conn-string-password") {
         conn_strings(text, &mut out);
     }
+    if set.is_on("email") {
+        emails(text, &mut out);
+    }
     let want_jwt = set.is_on("jwt");
     let want_id = set.is_on("cn-resident-id");
     let want_card = set.is_on("bank-card");
+    let want_phone = set.is_on("cn-mobile-phone");
     // 一次扫描问一次时钟。只开卡号那条时也要问：认出是身份证号的不当卡号换
     let today = if want_id || want_card { today_ymd() } else { 0 };
     // **个人号码只在 JSON 的字符串里找。**字符串外面的数字是 JSON 的数值：工具
@@ -1156,6 +1276,9 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     let json = text.trim_start().starts_with(['{', '[', '"']);
     let mut spaced = Spaced::default();
     for_each_token(text, |tok, span, quoted| {
+        if want_phone && (quoted || !json) {
+            mobile_phones(tok, span.start, &mut out);
+        }
         if (want_id || want_card) && (quoted || !json) {
             // 句末的句号不是号码的一部分：`…卡号是 6222 0212 3456 7894.`
             let body = tok.trim_end_matches('.');
@@ -1214,6 +1337,12 @@ fn json_len(c: char) -> usize {
 /// 命中、在真的请求里却换不掉 —— 测试的结论就是错的。所以先编成 JSON
 /// 字符串再扫，再把区间换算回原文。
 pub fn scan_plain(text: &str, set: &RuleSet) -> Vec<Hit> {
+    plain_with(text, |encoded| scan(encoded, set))
+}
+
+/// 把一段纯文本编成 JSON 字符串交给 `find` 去找，找到的区间换算回原文。跨过转义、
+/// 落在转义序列中间的不要（见 [`scan_plain`]）。
+pub(crate) fn plain_with(text: &str, find: impl FnOnce(&str) -> Vec<Hit>) -> Vec<Hit> {
     let encoded = serde_json::to_string(text).unwrap_or_default();
     // 原文每个字符的起点在编码后的位置。首尾那对引号不算
     let mut map: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
@@ -1228,7 +1357,7 @@ pub fn scan_plain(text: &str, set: &RuleSet) -> Vec<Hit> {
             .ok()
             .map(|i| map[i].1)
     };
-    scan(&encoded, set)
+    find(&encoded)
         .into_iter()
         .filter_map(|h| {
             let start = back(h.bytes.start)?;
@@ -1273,13 +1402,30 @@ pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
 /// 内网地址和内部域名例外：它们不是凭据，而打码之后的 `…` 让人无从判断
 /// 那条记录说的是哪台机器。
 ///
-/// 身份证号和卡号只留最后四位：「留头 5」留下的正好是身份证号的地区码、卡号的
-/// 发卡行，而认出是哪一个号码，看最后四位就够了。
+/// 身份证号、卡号、手机号只留最后四位：「留头 5」留下的正好是身份证号的地区码、
+/// 卡号的发卡行，而认出是哪一个号码，看最后四位就够了。邮箱留第一个字和域名。
 pub fn masked(rule: &Rule, value: &str) -> String {
+    if matches!(rule, Rule::Builtin(id) if builtin(id).is_some_and(|b| b.matcher == Matcher::Email))
+    {
+        return mask_email(value);
+    }
     match rule.kind() {
         Kind::Internal => value.to_string(),
         Kind::Personal => last_four(value),
         _ => mask(value),
+    }
+}
+
+/// 邮箱只留本地部分的第一个字和域名：`j…@example.com`。认出是哪一个地址，看这些
+/// 就够了；本地部分只有一个字的，那个字也不留
+fn mask_email(s: &str) -> String {
+    let Some((local, domain)) = s.rsplit_once('@') else {
+        return mask(s);
+    };
+    let mut chars = local.chars();
+    match (chars.next(), chars.next()) {
+        (Some(first), Some(_)) => format!("{first}…@{domain}"),
+        _ => format!("…@{domain}"),
     }
 }
 
@@ -2330,5 +2476,130 @@ mod tests {
             .map(|h| &text[h.bytes.clone()])
             .collect();
         assert_eq!(got, vec!["6222 0212 3456 7894", "11010519491231002X"]);
+    }
+
+    // ------------------------------------------------------------ 邮箱、手机号
+
+    fn only(id: &'static str, text: &str) -> Vec<String> {
+        scan(text, &RuleSet::only(&[id]))
+            .into_iter()
+            .map(|h| text[h.bytes].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn email_and_mobile_numbers_ship_switched_off() {
+        // 它们没有能核对的结构，按「长得像」认，在代码和文档里误报得多
+        let t = "联系 zhang.san@example.com 或 13800138000";
+        assert!(scan(t, &RuleSet::defaults()).is_empty());
+        for id in ["email", "cn-mobile-phone"] {
+            let b = builtin(id).unwrap();
+            assert!(!b.on_by_default && b.kind == Kind::Personal, "{id}");
+        }
+        assert_eq!(builtin("email").unwrap().label, Some("TW_EMAIL"));
+        assert_eq!(builtin("cn-mobile-phone").unwrap().label, Some("TW_PHONE"));
+    }
+
+    #[test]
+    fn a_mobile_number_is_eleven_digits_on_their_own() {
+        assert_eq!(
+            only(
+                "cn-mobile-phone",
+                "电话13800138000，或者 tel:19912345678、+86 15012345678"
+            ),
+            ["13800138000", "19912345678", "15012345678"]
+        );
+        // 前后紧挨着数字的是更长的号码的一部分；第二位不是 3–9 的不是手机号
+        for t in [
+            "订单 138001380001",
+            "时间戳 1713800138000",
+            "12800138000",
+            "10800138000",
+            "1380013800",
+        ] {
+            assert!(only("cn-mobile-phone", t).is_empty(), "{t}");
+        }
+        // 字母挨着没关系
+        assert_eq!(only("cn-mobile-phone", "id13800138000x"), ["13800138000"]);
+        // JSON 的数值不是：换成占位符，请求体就不是 JSON 了
+        let body = r#"{"n":13800138000,"s":"13800138000"}"#;
+        let got = scan(body, &RuleSet::only(&["cn-mobile-phone"]));
+        assert_eq!(got.len(), 1);
+        assert_eq!(&body[got[0].bytes.clone()], "13800138000");
+        assert!(
+            got[0].bytes.start > body.find(':').unwrap() + 12,
+            "数值那个不算"
+        );
+    }
+
+    #[test]
+    fn an_email_address_is_found_and_urls_and_file_names_are_not() {
+        assert_eq!(
+            only(
+                "email",
+                "写信给 zhang.san+ai@mail.example.com.cn。抄送 a_b@x.io, git@github.com"
+            ),
+            [
+                "zhang.san+ai@mail.example.com.cn",
+                "a_b@x.io",
+                "git@github.com"
+            ]
+        );
+        for t in [
+            "https://user@example.com/x",
+            "postgres://u:pw@db.example.com/app",
+            "icon@2x.png",
+            "npm i react@18.2.0",
+            "user@localhost",
+            "@scope/package",
+            "a@b.c",
+            ".a@b.com",
+            "a..b@c.com",
+        ] {
+            assert!(only("email", t).is_empty(), "{t}: {:?}", only("email", t));
+        }
+    }
+
+    #[test]
+    fn an_email_after_a_json_escape_does_not_take_the_escape_with_it() {
+        // 请求体里的换行是 `\n` 两个字符，中文可能是 `\uXXXX`
+        for (t, want) in [
+            (r#"{"c":"to:\nzhang@example.com"}"#, "zhang@example.com"),
+            (r#"{"c":"\u90aezhang@example.com"}"#, "zhang@example.com"),
+            (r#"{"c":"C:\\nzhang@example.com"}"#, "nzhang@example.com"),
+        ] {
+            assert_eq!(only("email", t), [want], "{t}");
+        }
+    }
+
+    #[test]
+    fn personal_values_are_reported_with_the_least_that_says_which_one() {
+        let email = Rule::Builtin("email");
+        assert_eq!(masked(&email, "zhang.san@example.com"), "z…@example.com");
+        assert_eq!(masked(&email, "z@example.com"), "…@example.com");
+        assert_eq!(
+            masked(&Rule::Builtin("cn-mobile-phone"), "13800138000"),
+            "…8000"
+        );
+    }
+
+    #[test]
+    fn email_and_phone_placeholders_say_what_they_were() {
+        let set = RuleSet::only(&["email", "cn-mobile-phone"]);
+        let body = serde_json::json!({
+            "content": "张三 zhang@example.com 13800138000，李四 li@example.com"
+        })
+        .to_string();
+        let r = crate::redact::replace::redact(
+            &body,
+            &set,
+            crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.text).unwrap();
+        assert_eq!(
+            v["content"],
+            "张三 <<TW_EMAIL_1>> <<TW_PHONE_1>>，李四 <<TW_EMAIL_2>>"
+        );
+        assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
     }
 }
