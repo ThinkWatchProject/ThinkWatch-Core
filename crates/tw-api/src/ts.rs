@@ -282,6 +282,58 @@ mod tests {
         assert!(event.contains("answered_model?: string"), "{event}");
     }
 
+    /// 对话记录：请求号是字符串；可以为空的是 null（必有的字段，不是省掉）；块是按 `kind`
+    /// 分的联合，角色和缺口是字面量
+    #[test]
+    fn a_transcript_is_turns_of_messages_and_parts() {
+        let ts = typescript();
+        assert!(ts.contains("  SessionTranscript: { req: null; res: Transcript };"));
+        assert!(ts.contains(
+            "  SessionTranscript: { method: \"GET\", path: \"/sessions/{id}/transcript\", params: [\"id\"], format: \"json\" },"
+        ));
+        let transcript = decl_of(&ts, "Transcript");
+        for field in [
+            "session: string",
+            "system: string | null",
+            "turns: Array<TranscriptTurn>",
+        ] {
+            assert!(transcript.contains(field), "{field}: {transcript}");
+        }
+        let turn = decl_of(&ts, "TranscriptTurn");
+        for field in [
+            "id: string",
+            "restart: boolean",
+            "system_changed: string | null",
+            "input: Array<TranscriptMessage>",
+            "output: Array<TranscriptPart>",
+            "gaps: Array<TranscriptGap>",
+        ] {
+            assert!(turn.contains(field), "{field}: {turn}");
+        }
+        assert_eq!(
+            decl_of(&ts, "TranscriptMessage"),
+            "export type TranscriptMessage = { role: TranscriptRole, parts: Array<TranscriptPart>, }"
+        );
+        assert_eq!(
+            decl_of(&ts, "TranscriptPart"),
+            "export type TranscriptPart = { \"kind\": \"text\", text: string, } \
+             | { \"kind\": \"thinking\", text: string, } \
+             | { \"kind\": \"tool_call\", id: string, name: string, input: string, } \
+             | { \"kind\": \"tool_result\", call_id: string, text: string, is_error: boolean, } \
+             | { \"kind\": \"image\", media_type: string | null, bytes: number | null, } \
+             | { \"kind\": \"other\", label: string, }"
+        );
+        assert_eq!(
+            decl_of(&ts, "TranscriptRole"),
+            "export type TranscriptRole = \"user\" | \"assistant\" | \"tool\" | \"system\""
+        );
+        assert_eq!(
+            decl_of(&ts, "TranscriptGap"),
+            "export type TranscriptGap = \"request_missing\" | \"request_truncated\" \
+             | \"response_missing\" | \"response_truncated\" | \"response_unreadable\""
+        );
+    }
+
     #[test]
     fn every_endpoint_is_in_the_table() {
         let ts = typescript();

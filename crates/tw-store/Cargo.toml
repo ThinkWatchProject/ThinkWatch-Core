@@ -18,6 +18,8 @@ tw-pricing = { workspace = true }
 tw-dialect = { workspace = true }
 # 按正文找时交出去的那一小段要和详情抽屉同一套打码
 tw-secret = { workspace = true }
+# 对话记录比对前后两个请求的历史：每条消息只留一个指纹，不留正文
+blake3 = { workspace = true }
 bytes = { workspace = true }
 # functions：搜索要一个 SQL 函数，按界面同一种小写规则比子串（见 `search::sql`）。
 # 只是打开 rusqlite 已有的接口，不多编任何东西
