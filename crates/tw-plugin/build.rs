@@ -399,12 +399,17 @@ fn build_guest(manifest_dir: &Path, out_dir: &Path, tools: &Tools) -> Vec<u8> {
     if cfg!(windows) {
         // rquickjs-sys 把它带的 libc 头文件目录 canonicalize 成 `\\?\C:\…` 交给
         // clang。这种写法里 `/` 不算分隔符，于是头文件里的
-        // `#include <bits/alltypes.h>` 找不到。同一个目录再用普通写法给一遍
+        // `#include <bits/alltypes.h>` 找不到。同一个目录换普通写法再给一遍没用：
+        // clang 认出是同一个目录，把后给的那个去掉了。所以拷一份到 OUT_DIR，
+        // 当作另一个目录给它 —— 前一个找不到时就找到这里
         let include = rquickjs_sys_dir(&guest)
             .map(|d| d.join("vendor").join("wasi-libc").join("include"))
             .unwrap_or_else(|e| fail(&format!("cannot locate rquickjs-sys: {e}")));
+        let copy = out_dir.join("wasi-libc-include");
+        copy_dir(&include, &copy)
+            .unwrap_or_else(|e| fail(&format!("cannot copy {}: {e}", include.display())));
         cflags.push("-isystem".into());
-        cflags.push(include.display().to_string());
+        cflags.push(copy.display().to_string());
     }
     let triple = WASM_TARGET.replace('-', "_");
     // 按 shell 的规则拆：路径里可以有空格
@@ -497,6 +502,20 @@ fn rquickjs_sys_dir(guest: &Path) -> Result<PathBuf, String> {
         .and_then(|p| p["manifest_path"].as_str())
         .and_then(|m| Path::new(m).parent().map(Path::to_path_buf))
         .ok_or_else(|| "rquickjs-sys is not in the guest's dependency graph".into())
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// 给 cc 的 `CC_SHELL_ESCAPED_FLAGS` 用的单引号括起来的写法
