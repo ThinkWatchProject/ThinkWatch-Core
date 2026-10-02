@@ -1027,7 +1027,10 @@ A plugin changes a request after routing, each time the request is sent to an
 upstream. A request that fails over to another upstream starts again from what
 the client sent, and the plugin sees which upstream and which model name the
 request goes to. Routing, model checks and session grouping use what the
-client sent.
+client sent. A plugin that changes the model name only renames what is sent to
+that upstream: the request is not routed again, and the new name must still be
+one of the models the key may use ([`clients[].allow`](#cfg-clients)), or the
+request is not sent.
 
 A plugin handles the kinds of request its code declares: conversations
 (Anthropic Messages, OpenAI Chat Completions and Responses, and Gemini,

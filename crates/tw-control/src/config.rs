@@ -492,7 +492,12 @@ impl ConfigManager {
                 tw_api::PatchOp::Replace { path, value } => {
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
                     let scalar = match value {
-                        tw_api::PatchValue::Str(v) => tw_yaml::Scalar::Str(v.clone()),
+                        tw_api::PatchValue::Str(v) => {
+                            // 换行只进得了可以多行的字段（插件的设置），和按名字改一项同一份
+                            // 规矩。别的控制字符写成转义过的双引号，见 `tw_yaml::double_quoted`
+                            tw_config::edit::check_line_breaks(&steps, v)?;
+                            tw_yaml::Scalar::Str(v.clone())
+                        }
                         tw_api::PatchValue::Int(v) => tw_yaml::Scalar::Int(*v),
                         tw_api::PatchValue::Bool(v) => tw_yaml::Scalar::Bool(*v),
                         tw_api::PatchValue::Null => tw_yaml::Scalar::Null,

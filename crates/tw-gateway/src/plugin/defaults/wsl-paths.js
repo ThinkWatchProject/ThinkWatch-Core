@@ -16,6 +16,9 @@
 // 权限：messages（对话历史），reply.tool_calls（回答里的工具调用）。reply.tool_calls 是
 // 高风险权限：插件能改动模型要执行的操作；改过的工具调用照样经过 Lite 的工具调用审查。
 // 设置：客户端运行在 Windows 上（关闭时按客户端在 WSL 里处理）。
+//
+// 给人看的文字（名字、说明、设置项的标签）一律英文：界面按插件 id 和设置项的键换成用户
+// 的语言。
 
 export const manifest = {
   name: "Convert WSL and Windows paths",
@@ -26,7 +29,7 @@ export const manifest = {
   settings: {
     windows_client: {
       type: "boolean",
-      label: "客户端运行在 Windows 上（关闭时按 WSL 处理）",
+      label: "The client runs on Windows (otherwise WSL)",
       default: false,
     },
   },

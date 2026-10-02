@@ -59,11 +59,11 @@
           "default": "简体中文",
           "key": "language",
           "kind": "string",
-          "label": "回答语言"
+          "label": "Answer language"
         }
       ]
     },
-    "sha256": "df13934d4b0d7875f3c6f6882105757b7c3b4eb0a1f12bc9f35fc12ec2c26f5f"
+    "sha256": "a519a1c406641a7f18e71f6cb522a586ef85ed096b05429969ed5fac1569edf1"
   },
   "wsl-paths": {
     "manifest": {
@@ -94,10 +94,10 @@
           "default": false,
           "key": "windows_client",
           "kind": "boolean",
-          "label": "客户端运行在 Windows 上（关闭时按 WSL 处理）"
+          "label": "The client runs on Windows (otherwise WSL)"
         }
       ]
     },
-    "sha256": "92d7f7b897659b92b66f8b9c369dba60983398cfe50a06c7b994c73f087aec0e"
+    "sha256": "6140347e0898d022dc3dd92d7f48b9a380b58e1c42e7fc001008591dde9f9edf"
   }
 }

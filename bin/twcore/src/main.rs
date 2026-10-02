@@ -284,6 +284,10 @@ fn cmd_config(path: &Path, what: ConfigCmd) -> Result<()> {
             };
             let steps = tw_control::resolve_path(&cur.text, &pointer)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // 和 `PATCH /config` 同一份规矩：换行只进得了可以多行的字段
+            if let tw_yaml::Scalar::Str(s) = &scalar {
+                tw_config::edit::check_line_breaks(&steps, s)?;
+            }
             let next = tw_yaml::set(&cur.text, &steps, &scalar)?;
             // **先校验再写。**写完才发现读不回来，那份坏配置已经在盘上了。
             tw_config::try_parse(&next).map_err(|r| anyhow::anyhow!("{r}"))?;

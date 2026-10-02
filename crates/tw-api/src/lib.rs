@@ -4677,7 +4677,9 @@ slug_enum! {
         Messages = "messages",
         /// 工具定义
         Tools = "tools",
-        /// 模型名、`max_tokens` 这类参数。改了模型名，路由按新的走
+        /// 模型名、`max_tokens` 这类参数。改了模型名，只是换掉发给这一家上游的名字：
+        /// **不重新路由**，网关密钥的模型范围照样管 —— 不在范围里的，请求不发
+        /// （`gw.plugin.model_not_allowed`）
         Params = "params",
         /// 回答里的文字
         ReplyText = "reply_text",
