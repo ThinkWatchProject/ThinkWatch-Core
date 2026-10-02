@@ -930,3 +930,263 @@ async fn reply_runs_are_counted_on_the_plugins() {
         assert_eq!((v.calls, v.changed, v.errors), (1, 1, 0), "{}", a.id);
     }
 }
+
+// ───────────────────────────────────────────────────────── 名额
+
+/// 回答实例的名额只有 `n` 个的网关
+fn state_with_slots(n: usize) -> crate::AppState {
+    let mut s = state();
+    s.plugin_pool = Arc::new(Pool::with_replies(2, 8, n));
+    s
+}
+
+/// 一份插件，每个出错时怎么办各自给
+fn set_on_error(doubles: Vec<(Double, OnError)>) -> PluginSet {
+    PluginSet::new(
+        doubles
+            .into_iter()
+            .enumerate()
+            .map(|(i, (d, on_error))| {
+                let mut a = crate::plugin::host::double::active(&format!("p{i}"), d);
+                a.on_error = on_error;
+                Arc::new(a)
+            })
+            .collect(),
+    )
+}
+
+async fn start(state: &crate::AppState, set: &PluginSet) -> Result<Option<Chain>, GatewayError> {
+    Chain::start(
+        state,
+        set,
+        Bridge::new(Arc::new(tw_guard::redact::rules::RuleSet::none())),
+        &ReplyCtx {
+            dialect: Dialect::Anthropic,
+            client: None,
+            model: "m",
+            requested_model: "m",
+            upstream: "u",
+            request_id: 7,
+            attempt: 0,
+        },
+    )
+    .await
+}
+
+fn live(state: &crate::AppState) -> usize {
+    state.plugin_pool.live_replies()
+}
+
+/// 一个实例的名额从回答开始占到回答结束；**收尾时就还**，不等调用方扔掉这条流
+#[tokio::test]
+async fn a_slot_is_held_for_the_whole_answer_and_returned_when_it_ends() {
+    let state = state_with_slots(4);
+    let set = set_of(vec![upper(), hold_until_end()]);
+    let mut s = Stream::new(
+        start(&state, &set).await.unwrap().expect("in scope"),
+        Framing::Sse,
+    );
+    assert_eq!(live(&state), 2, "one slot per instance");
+    let input = anthropic_stream();
+    let (half, rest) = input.split_at(input.len() / 2);
+    let (_, err) = s.feed(half.as_bytes()).await;
+    assert!(err.is_none());
+    assert_eq!(live(&state), 2, "the answer is still streaming");
+    let (_, err) = s.feed(rest.as_bytes()).await;
+    assert!(err.is_none());
+    let (_, err) = s.finish(false).await;
+    assert!(err.is_none());
+    assert_eq!(
+        live(&state),
+        0,
+        "the answer ended and the slots stayed taken"
+    );
+    drop(s);
+
+    // 整包：改完那一份就还
+    let mut chain = start(&state, &set).await.unwrap().unwrap();
+    assert_eq!(live(&state), 2);
+    let body = json!({"id":"m","type":"message","role":"assistant",
+                      "content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn"});
+    let out = whole(&mut chain, body.to_string().as_bytes())
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out).contains("HELLO"));
+    assert_eq!(live(&state), 0);
+}
+
+/// 名额满了：**不等**，按这个插件的 `on_error` —— 拒绝是这个请求失败（码是
+/// `gw.plugin.reply_busy`），跳过是这次回答绕过它。两样都记成这个插件的一次出错
+#[tokio::test]
+async fn a_full_house_turns_plugins_away_by_their_on_error() {
+    let state = state_with_slots(1);
+    let holder = set_of(vec![upper()]);
+    let first = start(&state, &holder).await.unwrap().expect("in scope");
+    assert_eq!(live(&state), 1);
+
+    let mut events = state.bus.subscribe();
+    let rejecting = set_on_error(vec![(upper(), OnError::Reject)]);
+    let Err(err) = start(&state, &rejecting).await else {
+        panic!("started past the cap");
+    };
+    assert_eq!(err.detail.code, "gw.plugin.reply_busy");
+    assert_eq!(err.source, crate::error::Source::Denied);
+    assert_eq!(
+        err.detail.text,
+        "Plugin `upper` was not started for this answer: the limit of 1 plugins running on \
+         answers at the same time was reached."
+    );
+    let skipping = set_on_error(vec![(upper(), OnError::Skip)]);
+    assert!(
+        start(&state, &skipping).await.unwrap().is_none(),
+        "the only plugin was skipped: the answer goes through as it is"
+    );
+    for set in [&rejecting, &skipping] {
+        let a = &set.all()[0];
+        let v = a.stats.view();
+        assert_eq!((v.calls, v.errors), (1, 1));
+        assert_eq!(
+            v.last_error.map(|e| e.message.code).as_deref(),
+            Some("gw.plugin.reply_busy")
+        );
+    }
+    // 和别的插件错误一样发一条通知
+    let mut failed = 0;
+    while let Ok(ev) = events.try_recv() {
+        if let tw_api::Event::PluginFailed { message, .. } = ev {
+            assert_eq!(message.code, "gw.plugin.reply_busy");
+            failed += 1;
+        }
+    }
+    assert_eq!(failed, 2);
+
+    // 名额还回来，下一个回答照常起
+    drop(first);
+    assert_eq!(live(&state), 0);
+    let again = start(&state, &skipping).await.unwrap();
+    assert!(again.is_some());
+    drop(again);
+
+    // 前一个插件拿到了名额、后一个没拿到而策略是拒绝：已经起好的那个也还回去
+    let both = set_on_error(vec![(upper(), OnError::Skip), (upper(), OnError::Reject)]);
+    assert!(start(&state, &both).await.is_err());
+    assert_eq!(live(&state), 0, "the first plugin's slot was not returned");
+}
+
+/// 回答半路被扔掉（客户端走了、请求被取消）：名额跟着实例一起还
+#[tokio::test]
+async fn an_answer_dropped_halfway_returns_its_slots() {
+    let state = state_with_slots(4);
+    let set = set_of(vec![upper(), hold_until_end()]);
+    let mut s = Stream::new(start(&state, &set).await.unwrap().unwrap(), Framing::Sse);
+    let input = anthropic_stream();
+    let _ = s.feed(&input.as_bytes()[..input.len() / 2]).await;
+    assert_eq!(live(&state), 2);
+    drop(s);
+    assert_eq!(live(&state), 0);
+
+    // 一次都没用过就被扔掉的也一样
+    let chain = start(&state, &set).await.unwrap().unwrap();
+    assert_eq!(live(&state), 2);
+    drop(chain);
+    assert_eq!(live(&state), 0);
+}
+
+/// 插件出错：被拿掉的那一刻就还它的名额（跳过时回答还在接着流）；拒绝时这条流收尾就全还
+#[tokio::test]
+async fn a_plugin_that_errors_out_returns_its_slot() {
+    let boom = || {
+        Double::new("boom")
+            .permit(&[Permission::ReplyText])
+            .on_reply(true, false, false, |_| {
+                Ok(Box::new(Closures {
+                    text: Box::new(|_| Invocation::err(RunError::CpuLimit)),
+                    end: Box::new(|| Invocation::ok(None)),
+                    tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+                }))
+            })
+    };
+    let state = state_with_slots(4);
+    let input = anthropic_stream();
+    // 跳过：出错的那个插件被拿掉，另一个照常跑到回答结束
+    let set = set_on_error(vec![
+        (boom().mode(ReplyMode::Stream), OnError::Skip),
+        (upper(), OnError::Reject),
+    ]);
+    let mut s = Stream::new(start(&state, &set).await.unwrap().unwrap(), Framing::Sse);
+    assert_eq!(live(&state), 2);
+    let cut = input.find("lo 世界").unwrap();
+    let (_, err) = s.feed(&input.as_bytes()[..cut]).await;
+    assert!(err.is_none());
+    assert_eq!(live(&state), 1, "the failed plugin kept its slot");
+    let (_, err) = s.feed(&input.as_bytes()[cut..]).await;
+    assert!(err.is_none());
+    let _ = s.finish(false).await;
+    assert_eq!(live(&state), 0);
+
+    // 拒绝：这条流切断，中继收尾（断了的那一种）时全还
+    let set = set_on_error(vec![(boom(), OnError::Reject), (upper(), OnError::Reject)]);
+    let mut s = Stream::new(start(&state, &set).await.unwrap().unwrap(), Framing::Sse);
+    let (_, err) = s.feed(input.as_bytes()).await;
+    assert_eq!(err.expect("rejects").detail.code, "gw.plugin.reply_failed");
+    assert_eq!(live(&state), 1);
+    let _ = s.finish(true).await;
+    assert_eq!(live(&state), 0);
+}
+
+/// 插件线程上 panic 了：实例跟着没了，名额也跟着还
+#[tokio::test]
+async fn a_call_that_panics_returns_its_slot() {
+    let state = state_with_slots(4);
+    let panics = Double::new("panics")
+        .permit(&[Permission::ReplyText])
+        .on_reply(true, false, false, |_| {
+            Ok(Box::new(Closures {
+                text: Box::new(|_| panic!("the plugin host fell over")),
+                end: Box::new(|| Invocation::ok(None)),
+                tool: Box::new(|_| Invocation::ok(ToolCallOutcome::Unchanged)),
+            }))
+        });
+    let set = set_on_error(vec![(panics, OnError::Skip)]);
+    let mut s = Stream::new(start(&state, &set).await.unwrap().unwrap(), Framing::Sse);
+    assert_eq!(live(&state), 1);
+    let (out, err) = run(&mut s, &anthropic_stream(), 4096).await;
+    assert!(err.is_none());
+    assert_eq!(
+        anthropic_blocks(&out)[1].2,
+        "hello 世界",
+        "skipped: as it was"
+    );
+    assert_eq!(live(&state), 0);
+}
+
+/// 实例起不来：名额马上还，记的是那个错误，拒绝时报的是「插件出错」而不是「名额满了」
+#[tokio::test]
+async fn an_instance_that_fails_to_start_returns_its_slot() {
+    let state = state_with_slots(1);
+    let broken = Double::new("broken")
+        .permit(&[Permission::ReplyText])
+        .on_reply(true, false, false, |_| Err(RunError::MemoryLimit));
+    let set = set_on_error(vec![(broken, OnError::Reject)]);
+    let Err(err) = start(&state, &set).await else {
+        panic!("started a plugin whose instance failed");
+    };
+    assert_eq!(err.detail.code, "gw.plugin.reply_failed");
+    assert_eq!(live(&state), 0);
+    assert_eq!(
+        set.all()[0]
+            .stats
+            .view()
+            .last_error
+            .map(|e| e.message.code)
+            .as_deref(),
+        Some("gw.plugin.memory_limit")
+    );
+    // 名额还在：下一个插件照常起
+    assert!(
+        start(&state, &set_of(vec![upper()]))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

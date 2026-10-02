@@ -11,9 +11,11 @@
 //! - I10：每次运行都有记录。
 //! - 没有插件改动的请求一个字节都不变；WebSocket（Codex 的 Responses WebSocket）那一路
 //!   同样看占位符、同样过工具调用审查、拒绝了不发给上游。
+//! - 发往上游的不只是生成回答：数 token、Responses 的压缩带着整段对话，同样过请求钩子，
+//!   插件删掉的东西不从这些接口漏出去。
 //!
-//! 标了 `#[ignore]` 的两条是**还没解决的问题**，断言写的是该有的样子：插件写下的占位符会被
-//! 换回真值（契约 I5 的写法），计 token 的请求不经过请求钩子。
+//! 标了 `#[ignore]` 的那一条是**还没解决的问题**，断言写的是该有的样子：插件写下的占位符
+//! 会被换回真值（契约 I5 的写法）。
 
 mod plugin_harness;
 
@@ -1077,39 +1079,62 @@ export function onToolCall(call) {
     }
 }
 
+/// Claude Code 每一轮都会先发一次 `count_tokens`，带着整段对话；Codex 压缩上下文时把整段
+/// 对话发给 `/responses/compact`；Gemini 的客户端数 token 走 `:countTokens`。**插件删掉的
+/// 东西不能从这些接口漏出去**：上游收到的是插件改过的那一份
 #[tokio::test]
-#[ignore = "design gap: request hooks run only for generating calls, so a token-count request \
-            carries the client's text to the upstream without the plugin's rewrite; see the \
-            track 4 report"]
-async fn a_token_count_request_does_not_bypass_a_plugin_that_scrubs_the_prompt() {
-    // 一个把「机密」删掉的插件。Claude Code 每一轮都会先发一次 count_tokens，带着整段对话
+async fn a_token_count_or_compaction_does_not_bypass_a_plugin_that_scrubs_the_prompt() {
     let scrub = r#"
-export const manifest = { name: "删掉机密", api: 1, permissions: ["messages"] };
+export const manifest = { name: "删掉机密", api: 1, permissions: ["system", "messages"] };
 export function onRequest(req) {
+  req.system = req.system.replaceAll("机密", "[已删除]");
   for (const m of req.messages) for (const p of m.parts) {
-    if (p.type === "text") p.text = p.text.replaceAll("机密", "[已删除]");
+    if (p.type === "text" || p.type === "tool_result") p.text = p.text.replaceAll("机密", "[已删除]");
   }
   return req;
 }"#;
-    let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
-    let gw = Gateway::start(
-        config(&up, Security::default()),
-        vec![Plug::new("scrub", scrub)],
-    )
-    .await;
-    let r = gw
-        .post(
+    let responses = json!({
+        "model": "gpt-5", "instructions": "机密项目的助手",
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "机密的项目代号" }] }]
+    });
+    let cases = [
+        (
             "/v1/messages/count_tokens",
-            json!({ "model": "claude-sonnet-4-5", "messages": [{ "role": "user", "content": "机密的项目代号" }] }),
-        )
-        .await;
-    if up.hits() > 0 {
+            tw_config::Protocol::Anthropic,
+            json!({ "model": "claude-sonnet-4-5", "system": "机密项目的助手",
+                    "messages": [{ "role": "user", "content": "机密的项目代号" }] }),
+        ),
+        (
+            "/v1/responses/compact",
+            tw_config::Protocol::OpenaiResponses,
+            responses.clone(),
+        ),
+        (
+            "/backend-api/codex/responses/compact",
+            tw_config::Protocol::OpenaiResponses,
+            responses,
+        ),
+        (
+            "/v1beta/models/gemini-2.5-pro:countTokens",
+            tw_config::Protocol::Gemini,
+            json!({ "contents": [{ "role": "user", "parts": [{ "text": "机密的项目代号" }] }] }),
+        ),
+    ];
+    for (path, protocol, body) in cases {
+        let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
+        let mut cfg = config(&up, Security::default());
+        cfg.providers[0].protocol = Some(protocol);
+        let gw = Gateway::start(cfg, vec![Plug::new("scrub", scrub)]).await;
+        let r = gw.post(path, body).await;
+        assert_eq!(r.status, 200, "{path}: {}", r.body);
+        assert_eq!(up.hits(), 1, "{path}");
+        let sent = up.raw(0);
         assert!(
-            !up.raw(0).contains("机密"),
-            "the token count carried what the plugin removes: {} / {}",
-            up.raw(0),
-            r.body
+            !sent.contains("机密"),
+            "{path}: the upstream got what the plugin removes: {sent}"
         );
+        assert!(sent.contains("[已删除]"), "{path}: {sent}");
+        assert_eq!(gw.outcomes("scrub"), ["changed"], "{path}");
     }
 }
 

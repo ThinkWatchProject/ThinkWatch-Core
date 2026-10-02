@@ -14,6 +14,10 @@
 //!
 //! 插件拒绝了、出错而策略是拒绝、或者上面哪一道没过，**整个请求被拒**，不换下一家：
 //! 换一家，管它的还是这些插件。
+//!
+//! **发往上游的每一跳都过这一步**，不只生成回答的：数 token、Responses 的压缩一样过插件
+//! （插件删掉的东西不能从这些接口漏出去），插件看不懂的接口按插件的 `on_error` 处置（见
+//! [`crate::plugin::request::Shape`]）。网关自己估数、不发出去的那一跳到不了这里。
 
 use bytes::Bytes;
 
@@ -27,7 +31,7 @@ pub(super) struct Rewritten {
     pub(super) body: Bytes,
     /// 调的路径（Gemini 换了模型时是新的）
     pub(super) path: String,
-    /// 改过的请求解码出来的中间表示：格式转换用它
+    /// 改过的请求解码出来的中间表示：格式转换用它。不生成回答的请求不转换，没有
     pub(super) decoded: Option<Result<tw_dialect::convert::Decoded, tw_dialect::ir::Rejection>>,
     /// 这一跳出站脱敏接着编号的账：拦截档下是插件那本账接着编的（插件写进来的新值有了
     /// 新的号），别的档位是空的
@@ -61,10 +65,6 @@ pub(super) async fn attempt(
     model: &str,
     attempt: usize,
 ) -> Result<Plugged, Msg> {
-    // **只给生成回答的请求跑**：计 token、嵌入这些接口没有「一次回答」可言
-    let Some(api) = req.api.filter(|_| reading.generates) else {
-        return Ok(Plugged::default());
-    };
     let to = crate::plugin::request::Target {
         upstream: &provider.name,
         model,
@@ -89,10 +89,13 @@ pub(super) async fn attempt(
     if let Some(r) = &c.renamed {
         allowed(rt, req, r)?;
     }
-    let decoded =
-        tw_dialect::convert::decode(api.dialect(), &c.value, &c.path, req.query.as_deref());
+    // 生成回答的请求重新解码：格式转换和请求防护用改过的这一份。数 token、压缩这些不转换
+    // （只发给同格式的上游），开头也没过请求防护，不用解
+    let decoded = req.api.filter(|_| reading.generates).map(|api| {
+        tw_dialect::convert::decode(api.dialect(), &c.value, &c.path, req.query.as_deref())
+    });
     // 请求防护：只看插件加进来的。解不开的不看 —— 和开头那一遍一样，同格式直通照样发
-    if let (Some(Ok(before)), Ok(after)) = (&reading.decoded, &decoded)
+    if let (Some(Ok(before)), Some(Ok(after))) = (&reading.decoded, &decoded)
         && let Some(why) = crate::guard::screen_more(
             &state.bus,
             started.id,
@@ -125,7 +128,7 @@ pub(super) async fn attempt(
     out.rewritten = Some(Rewritten {
         body: c.body,
         path: c.path,
-        decoded: Some(decoded),
+        decoded,
         ledger,
     });
     Ok(out)

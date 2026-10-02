@@ -21,7 +21,7 @@ use tw_types::{Msg, msg};
 use super::bridge::Bridge;
 use super::host::{PluginHost, RequestOutcome};
 use super::pool::Pool;
-use super::request::{rejected, request_unreadable};
+use super::request::{Shape, rejected, request_unreadable};
 use super::set::LogLine;
 use super::view;
 
@@ -143,14 +143,20 @@ async fn tried(
     let client = request.as_ref().and_then(|r| r.client);
     let name = host.manifest().name.clone();
 
-    // ── 请求钩子
+    // ── 请求钩子：和这个请求当时一样看（见 [`super::request::Shape`]）
     if let (Some(r), Some(d), true) = (&request, dialect, host.manifest().hooks.request) {
+        let shape = Shape::of(r.path);
         match parsed.as_ref() {
+            _ if shape == Shape::Opaque => {
+                t.error = Some(super::request::cannot_read(&name, r.path))
+            }
             None => t.error = Some(request_unreadable("the request body is not JSON")),
             Some(raw) => {
                 let mut masked = raw.clone();
                 bridge.hide_value(&mut masked);
-                match view::build(d, &masked, r.path) {
+                let conversation =
+                    super::request::wrapped_count(d, r.path, &masked).unwrap_or(&masked);
+                match view::build(d, conversation, r.path) {
                     Err(e) => t.error = Some(request_unreadable(e)),
                     Ok(mut built) => {
                         let m = host.manifest();
@@ -190,22 +196,27 @@ async fn tried(
                                             Err(e) => {
                                                 (Outcome::Error, before.clone(), Some(e.msg()))
                                             }
-                                            Ok(edits) if edits.is_empty() => {
-                                                (Outcome::Unchanged, before.clone(), None)
-                                            }
-                                            Ok(edits) => {
-                                                let mut next = masked.clone();
-                                                match view::apply(
-                                                    &mut next, &built.src, &edits, r.path,
-                                                ) {
-                                                    Ok(_) => {
-                                                        (Outcome::Changed, pretty(&next), None)
+                                            Ok(mut edits) => {
+                                                if shape == Shape::Alike {
+                                                    super::request::model_only(&mut edits);
+                                                }
+                                                if edits.is_empty() {
+                                                    (Outcome::Unchanged, before.clone(), None)
+                                                } else {
+                                                    let mut next = masked.clone();
+                                                    match super::request::write_back(
+                                                        d, &mut next, &built.src, &edits, r.path,
+                                                        &model,
+                                                    ) {
+                                                        Ok(_) => {
+                                                            (Outcome::Changed, pretty(&next), None)
+                                                        }
+                                                        Err(e) => (
+                                                            Outcome::Error,
+                                                            before.clone(),
+                                                            Some(e.msg()),
+                                                        ),
                                                     }
-                                                    Err(e) => (
-                                                        Outcome::Error,
-                                                        before.clone(),
-                                                        Some(e.msg()),
-                                                    ),
                                                 }
                                             }
                                         }
