@@ -531,6 +531,11 @@ impl Chain {
                         changed = true;
                         self.stages[i].counts.dropped += 1;
                     }
+                    // 交回一个空数组也是去掉
+                    Ok(ToolCallOutcome::Replace(vals)) if vals.is_empty() => {
+                        changed = true;
+                        self.stages[i].counts.dropped += 1;
+                    }
                     Ok(ToolCallOutcome::Replace(vals)) => {
                         // 原样交回来的一个调用就是没改
                         if let [one] = vals.as_slice()
@@ -653,7 +658,8 @@ impl Drop for Chain {
     }
 }
 
-/// 交回来的调用和交出去的一样（id、名字、参数都没变）
+/// 交回来的调用和交出去的一样（id、名字、参数都没变）。参数按 JavaScript 的眼光比
+/// （[`tw_plugin::js_equal`]）：进出一趟 JS 的 `1.0` 回来是 `1`，那不算改
 fn same_call(v: &Value, given: &Value) -> bool {
     let o = match v.as_object() {
         Some(o) => o,
@@ -662,7 +668,10 @@ fn same_call(v: &Value, given: &Value) -> bool {
     o.keys()
         .all(|k| matches!(k.as_str(), "id" | "name" | "input"))
         && o.get("name") == given.get("name")
-        && o.get("input") == given.get("input")
+        && match (o.get("input"), given.get("input")) {
+            (Some(a), Some(b)) => tw_plugin::js_equal(a, b),
+            (a, b) => a == b,
+        }
         && o.get("id").is_none_or(|id| Some(id) == given.get("id"))
 }
 
