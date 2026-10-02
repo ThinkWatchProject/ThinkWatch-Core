@@ -220,13 +220,14 @@ fn tools(p: &ToolPolicy, req: &TrialRequest) -> Result<TrialResult, TrialError> 
         .rules
         .iter()
         .filter_map(|r| {
-            let m = r.re.find(sample)?;
+            // `find` 认两种规则：正则规则和代码实现的（联网外传凭据、上传本地文件）
+            let m = r.find(sample)?;
             Some(TrialHit {
                 rule: r.id.clone(),
                 custom: r.custom,
-                start: utf16_at(sample, m.start()),
-                end: utf16_at(sample, m.end()),
-                excerpt: m.as_str().chars().take(content::SNIPPET_MAX).collect(),
+                start: utf16_at(sample, m.start),
+                end: utf16_at(sample, m.end),
+                excerpt: m.text.chars().take(content::SNIPPET_MAX).collect(),
                 action: Some(if r.high {
                     RuleAction::Cut
                 } else {

@@ -127,6 +127,10 @@ pub enum Matcher {
     /// 这几段码位里的字符，一项一个。内置规则是规范写法（`U+200B`、`U+E0000–U+E007F`），
     /// 自定义规则是它存着的写法（各项用 `, ` 连起来就是存着的那一份的意思）
     Codepoints { ranges: Vec<String> },
+    /// 代码里实现的内置检查，没有可展示的模式：工具调用审查的「凭据发往陌生主机」
+    /// （`credential-to-network`）、「上传本地文件到外部主机」（`file-to-network`）。
+    /// `check` 是稳定的检查名，界面按它给出说明
+    Builtin { check: String },
 }
 
 /// 一家卡组织认哪些卡号：以哪几段开头、一共几位。
@@ -304,8 +308,14 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
             name: r.name.clone(),
             why: r.why.clone(),
             kind: "command".into(),
-            matcher: Matcher::Regex {
-                pattern: r.pattern.clone(),
+            // 代码实现的规则没有可展示的正则，给界面一个专门的 matcher
+            matcher: match &r.check {
+                Some(check) => Matcher::Builtin {
+                    check: check.clone(),
+                },
+                None => Matcher::Regex {
+                    pattern: r.pattern.clone(),
+                },
             },
             enabled: !p.disable.contains(&r.id),
             on_by_default: true,
@@ -505,6 +515,42 @@ mod tests {
         let mine = v.rules.last().unwrap();
         assert!(mine.custom && !mine.enabled && mine.label.is_none());
         assert_eq!(mine.action, Some(RuleAction::Cut));
+    }
+
+    #[test]
+    fn the_code_backed_tool_rules_are_listed_with_a_builtin_matcher() {
+        // 代码实现的两条规则（凭据外传、上传本地文件）在规则表里照样列得出来：
+        // 带专门的 matcher（没有正则可展示），处置按出厂（A 切断、B 仅记录）
+        let v = inspect_tools(&ToolPolicy::default());
+        let a = v
+            .rules
+            .iter()
+            .find(|r| r.id == "secret-to-unknown-host")
+            .expect("凭据外传规则应当在表里");
+        assert_eq!(
+            a.matcher,
+            Matcher::Builtin {
+                check: "credential-to-network".into()
+            }
+        );
+        assert_eq!(a.action, Some(RuleAction::Cut), "高危，拦截档下切断");
+        assert!(!a.why.is_empty());
+        let b = v
+            .rules
+            .iter()
+            .find(|r| r.id == "upload-file-to-host")
+            .expect("上传文件规则应当在表里");
+        assert_eq!(
+            b.matcher,
+            Matcher::Builtin {
+                check: "file-to-network".into()
+            }
+        );
+        assert_eq!(b.action, Some(RuleAction::Record), "出厂只记录");
+        // 经过一趟 JSON 还认得回来
+        let json = serde_json::to_value(&a.matcher).unwrap();
+        assert_eq!(json["kind"], "builtin");
+        assert_eq!(json["check"], "credential-to-network");
     }
 
     #[test]

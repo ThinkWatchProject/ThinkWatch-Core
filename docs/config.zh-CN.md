@@ -573,10 +573,12 @@ pricing:
 | `exfil-credentials` | Send out a credential file | `cut` |
 | `exfil-credentials-reversed` | Send out a credential file (verb first) | `cut` |
 | `ssh-key-read` | Read a private key or cloud credential | `cut` |
+| `secret-to-unknown-host` | Send a credential to an unknown host | `cut` |
 | `write-startup-item` | Write a startup item | `cut` |
 | `crontab-install` | Install a scheduled job | `cut` |
 | `rm-rf-root` | Delete home or root | `record` |
 | `chmod-777` | World-writable permissions | `record` |
+| `upload-file-to-host` | Upload a local file to an external host | `record` |
 <!-- /generated -->
 
 #### `security.hidden_text`
