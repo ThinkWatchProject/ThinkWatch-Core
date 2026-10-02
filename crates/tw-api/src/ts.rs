@@ -212,6 +212,20 @@ mod tests {
         assert!(!login.contains("plan"), "{login}");
     }
 
+    /// 会话里的一轮说得出上游回了什么：状态码和失败的原因都是必有的字段，没有时是 null
+    #[test]
+    fn a_turn_says_what_the_upstream_answered() {
+        let ts = typescript();
+        let turn = decl_of(&ts, "TurnView");
+        for field in [
+            "status: number | null",
+            "error: Msg | null",
+            "cancelled: boolean",
+        ] {
+            assert!(turn.contains(field), "{field}: {turn}");
+        }
+    }
+
     /// 命中数带着记录从哪一刻起是全的：必有的字段，没有记录时是 null，不是省掉。
     #[test]
     fn route_stats_say_where_their_history_starts() {

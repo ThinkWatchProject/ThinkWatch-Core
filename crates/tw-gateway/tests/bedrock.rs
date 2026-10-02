@@ -424,7 +424,7 @@ async fn a_refused_credential_does_not_pass_on_what_aws_said_about_the_account()
             .unwrap()
     }))
     .await;
-    let (gw, _, _) = gateway(with_keys(up)).await;
+    let (gw, _, mut rx) = gateway(with_keys(up)).await;
     let (status, body) = post(
         gw,
         "/v1/messages",
@@ -437,6 +437,20 @@ async fn a_refused_credential_does_not_pass_on_what_aws_said_about_the_account()
     assert!(!body.contains("alice"), "{body}");
     assert!(body.contains("AccessDeniedException"), "{body}");
     assert!(body.contains("[ThinkWatch]"), "{body}");
+    // 请求记录里失败的原因也是这一句（不带给客户端看的前缀），一样不点名账号
+    match ending(&mut rx).await {
+        tw_api::Event::RequestFailed {
+            message, source, ..
+        } => {
+            assert_eq!(source, tw_api::FailureSource::Upstream);
+            assert_eq!(message.code, "gw.upstream.bedrock_refused", "{message:?}");
+            assert_eq!(message.arg("kind"), "AccessDeniedException");
+            assert_eq!(message.arg("status"), "403");
+            assert!(!message.text.contains("123456789012"), "{message:?}");
+            assert!(!message.text.starts_with("[ThinkWatch]"), "{message:?}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// AWS 没说是哪种异常：换一句话说，不在句子里填一个英文词组（译文里那一格会是英文）

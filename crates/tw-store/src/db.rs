@@ -472,7 +472,10 @@ pub struct TurnRow {
     pub cache_read_tokens: Option<i64>,
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
-    /// 失败的原因，带着码
+    /// 上游回的状态码。没走到上游的是 None
+    pub status: Option<u16>,
+    /// 失败的原因，带着码。上游回了错误、原样交给客户端的也有（那时 `status` 是那个
+    /// 状态码），见 `tw_api::TurnView::error`
     pub error: Option<Msg>,
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号**
@@ -552,7 +555,7 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
                     cache_read_tokens, cost_micros, duration_ms, error, cancelled,
-                    cost_estimated, billing, error_code, error_args
+                    cost_estimated, billing, error_code, error_args, status
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -566,6 +569,7 @@ impl Db {
                 cache_read_tokens: r.get(6)?,
                 cost_micros: r.get(7)?,
                 duration_ms: r.get(8)?,
+                status: r.get(15)?,
                 error: error_from(r)?,
                 cancelled: r.get::<_, i64>(10)? != 0,
                 cost_estimated: r.get::<_, i64>(11)? != 0,

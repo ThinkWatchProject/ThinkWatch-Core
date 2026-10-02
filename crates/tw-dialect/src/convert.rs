@@ -307,23 +307,15 @@ impl Session {
 
     /// 上游的错误响应 → 客户端格式的错误体。状态码不变，说明取上游的原话
     pub fn error(&self, status: u16, body: &[u8]) -> Vec<u8> {
-        let message = serde_json::from_slice::<Value>(body)
-            .ok()
-            .and_then(|v| match self.upstream {
-                Dialect::Anthropic => anthropic::response::error_message(&v),
-                Dialect::Chat | Dialect::Responses => chat::response::error_message(&v),
-                Dialect::Gemini => gemini::response::error_message(&v),
-                Dialect::Bedrock => bedrock::response::error_message(&v),
-            })
-            .unwrap_or_else(|| {
-                let text = String::from_utf8_lossy(body);
-                let text = text.trim();
-                if text.is_empty() {
-                    format!("The upstream answered HTTP {status} with nothing else.")
-                } else {
-                    text.chars().take(2000).collect()
-                }
-            });
+        let message = error_message(self.upstream, body).unwrap_or_else(|| {
+            let text = String::from_utf8_lossy(body);
+            let text = text.trim();
+            if text.is_empty() {
+                format!("The upstream answered HTTP {status} with nothing else.")
+            } else {
+                text.chars().take(2000).collect()
+            }
+        });
         error_body(self.client, status, &message)
     }
 
@@ -377,6 +369,19 @@ impl Session {
                 gemini_sse: true,
             },
         }
+    }
+}
+
+/// 上游的错误体里那句说明，按它的格式读：Anthropic、OpenAI、Gemini 的 `error.message`
+/// （OpenAI 有时只给一个字符串），Bedrock 的 `message`。不是 JSON、或者没有这一项的是 None
+/// —— 正文里别的东西怎么办，由调用方定。
+pub fn error_message(upstream: Dialect, body: &[u8]) -> Option<String> {
+    let v = serde_json::from_slice::<Value>(body).ok()?;
+    match upstream {
+        Dialect::Anthropic => anthropic::response::error_message(&v),
+        Dialect::Chat | Dialect::Responses => chat::response::error_message(&v),
+        Dialect::Gemini => gemini::response::error_message(&v),
+        Dialect::Bedrock => bedrock::response::error_message(&v),
     }
 }
 
@@ -1191,6 +1196,46 @@ mod tests {
         // gRPC 的 HTTP 映射：502 是 UNAVAILABLE（INTERNAL 说的是回话的这一方自己坏了）
         assert_eq!(v["error"]["status"], "UNAVAILABLE");
         assert!(v["error"]["message"].as_str().unwrap().contains("502"));
+    }
+
+    /// 每种格式的错误体里那句说明。读不出来的交回 None，不拿正文凑一句
+    #[test]
+    fn the_message_in_an_error_body_is_read_in_the_upstreams_shape() {
+        let said = |d, body: &str| error_message(d, body.as_bytes());
+        assert_eq!(
+            said(
+                Dialect::Anthropic,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#
+            )
+            .as_deref(),
+            Some("prompt is too long")
+        );
+        assert_eq!(
+            said(
+                Dialect::Responses,
+                r#"{"error":{"message":"max_output_tokens is too large","code":"invalid_value"}}"#
+            )
+            .as_deref(),
+            Some("max_output_tokens is too large")
+        );
+        assert_eq!(
+            said(Dialect::Chat, r#"{"error":"model not found"}"#).as_deref(),
+            Some("model not found")
+        );
+        assert_eq!(
+            said(
+                Dialect::Gemini,
+                r#"[{"error":{"code":400,"message":"API key not valid","status":"INVALID_ARGUMENT"}}]"#
+            )
+            .as_deref(),
+            Some("API key not valid")
+        );
+        assert_eq!(
+            said(Dialect::Bedrock, r#"{"Message":"Malformed input request"}"#).as_deref(),
+            Some("Malformed input request")
+        );
+        assert_eq!(said(Dialect::Anthropic, r#"{"detail":"Not Found"}"#), None);
+        assert_eq!(said(Dialect::Anthropic, "Bad Gateway"), None);
     }
 
     #[test]
