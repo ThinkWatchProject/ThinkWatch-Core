@@ -97,6 +97,10 @@ impl ClientApi {
     /// 真正发请求之前先数一遍，查的话同一处命中会在那个请求之前多记一遍，处置档下还会把
     /// 计数请求拒掉 —— 客户端拿不到数，而随后真正的那个请求照样会被查到。嵌入也不查：
     /// 它不按正文里的话做事。
+    ///
+    /// **旧版补全也不查**（OpenAI 的 `/v1/completions`、Anthropic 的 `/v1/complete`）：它们
+    /// 只有一整段 `prompt`，分不出哪句是调用方打的、哪句是工具抓回来的 —— 内容过滤查的
+    /// 正是这两样；如今用它的几乎只剩编辑器里的代码补全，那里没有工具结果这条注入的路。
     pub fn screened(path: &str) -> bool {
         Self::of_path(path).is_some() && (Self::generates(path) || Self::compacts(path))
     }
