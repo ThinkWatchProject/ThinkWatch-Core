@@ -11,7 +11,8 @@
 //! 插件看到的 `model`（视图里的和 `params.model`）、`ctx.model` 都是**发给这一家的
 //! 模型名**（路由规则改写之后的），`ctx.requested_model` 是客户端要的，`ctx.upstream`
 //! 是这一家。插件改了 `params.model`，只是换掉发给这一家的名字：不重新路由，也不再对
-//! 一遍上游的模型清单。
+//! 一遍上游的模型清单；**网关密钥的模型范围照样管**，新名字不在范围里的，请求不发
+//! （`gw.plugin.model_not_allowed`，见 `server::pipeline::plug`）。
 //!
 //! # 每个插件一步
 //!

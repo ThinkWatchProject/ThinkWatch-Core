@@ -46,44 +46,8 @@ async fn answering(status: u16, body: &'static str) -> SocketAddr {
     addr
 }
 
-/// 一个假的系统代理：谁的请求进来都回 503，和真机上撞到的那一页一样。
-///
-/// **同一个测试进程里只设一次**：reqwest 建 client 时读环境变量，这个文件里的
-/// 测试都在它之后建 client。代理跑在自己的线程和运行时上 —— 每个
-/// `#[tokio::test]` 有自己的运行时，挂在头一个测试上的话，那个测试一结束它就没了
-fn system_proxy() {
-    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    ONCE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                tx.send(answering(503, "via the system proxy").await)
-                    .unwrap();
-                std::future::pending::<()>().await
-            });
-        });
-        let url = format!("http://{}", rx.recv().unwrap());
-        // SAFETY: 这个测试文件里只有这里写环境变量，而且写在任何 client 建起来之前
-        unsafe {
-            for k in [
-                "HTTP_PROXY",
-                "http_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "ALL_PROXY",
-            ] {
-                std::env::set_var(k, &url);
-            }
-            for k in ["NO_PROXY", "no_proxy"] {
-                std::env::remove_var(k);
-            }
-        }
-    });
-}
+/// 子进程靠这个环境变量认出自己（见 `replays_ignore_the_system_proxy`）
+const CHILD: &str = "TW_REPLAY_SYSTEM_PROXY_CHILD";
 
 fn row(id: i64, provider: &str) -> tw_store::db::RequestRow {
     tw_store::db::RequestRow {
@@ -186,10 +150,69 @@ async fn replay(app: &axum::Router, provider: &str) -> serde_json::Value {
     v
 }
 
-/// 直连的本机上游：系统里开着代理也不走它。数据面转发这一家时就是这样。
+/// 系统代理开着的时候，重放照样直连、照样走上游自己的代理：两条都在一个子进程里跑，
+/// 系统代理是一个谁来都回 503 的假代理，和真机上撞到的那一页一样。
+///
+/// **系统代理只写进子进程的环境变量。**reqwest 建 client 时从环境变量读系统代理，而在
+/// 这个跑着别的测试的进程里改环境变量（`set_var`）是未定义行为：别的线程里的 C 代码在
+/// 同时读它 —— SQLite 第一次打开库时读 `TMPDIR`，aws-lc 初始化时读 CPU 特性的开关 ——
+/// 而 glibc 的 `setenv` 会挪动整张环境表，读的那一方踩到释放了的内存。这个文件以前就这么
+/// 改，Linux 的 CI 上崩过一次（SIGSEGV，四条测试刚开始跑）。子进程的环境在它起来之前就
+/// 定好了，没有谁去改。
 #[tokio::test]
-async fn a_direct_upstream_is_replayed_directly_even_with_a_system_proxy() {
-    system_proxy();
+async fn replays_ignore_the_system_proxy() {
+    let proxy = answering(503, "via the system proxy").await;
+    let url = format!("http://{proxy}");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "child_with_a_system_proxy",
+            "--include-ignored",
+            "--nocapture",
+        ])
+        .env(CHILD, "1");
+    for k in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+    ] {
+        child.env(k, &url);
+    }
+    for k in ["NO_PROXY", "no_proxy"] {
+        child.env_remove(k);
+    }
+    // 等子进程的时候，这个运行时还要接着替假代理接客
+    let out = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .unwrap()
+        .expect("run the child");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+}
+
+#[tokio::test]
+#[ignore = "only runs as the child of replays_ignore_the_system_proxy"]
+async fn child_with_a_system_proxy() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    // 系统代理真的在：不在的话，下面两条什么都没证明
+    let system = std::env::var("HTTP_PROXY").expect("the parent sets the system proxy");
+    assert!(system.starts_with("http://127.0.0.1:"), "{system}");
+    a_direct_upstream_is_replayed_directly().await;
+    an_upstream_with_a_proxy_is_replayed_through_that_proxy().await;
+}
+
+/// 直连的本机上游：系统里开着代理也不走它。数据面转发这一家时就是这样。
+async fn a_direct_upstream_is_replayed_directly() {
     let upstream = answering(200, "from the upstream").await;
     let (_d, app) = app(&format!(
         "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  \
@@ -202,9 +225,7 @@ async fn a_direct_upstream_is_replayed_directly_even_with_a_system_proxy() {
 }
 
 /// 指定了代理的上游：重放走它的代理，而不是直连或系统代理。
-#[tokio::test]
 async fn an_upstream_with_a_proxy_is_replayed_through_that_proxy() {
-    system_proxy();
     let proxy = answering(200, "via its own proxy").await;
     // 没有人听的地址：直连的话只会连不上
     let (_d, app) = app(&format!(

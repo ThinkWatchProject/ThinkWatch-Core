@@ -19,7 +19,7 @@
 
 use serde_yaml_ng::{Mapping, Value};
 use tw_types::{Msg, msg};
-use tw_yaml::{Put, Step};
+use tw_yaml::{Put, Step, double_quoted, must_escape};
 
 /// 按名字改一项时的失败。
 ///
@@ -361,9 +361,9 @@ impl Rendered {
 ///
 /// **带换行、制表符或别的控制字符的字符串除外**：serde 会把多行写成 `|-` 块标量，
 /// 而块标量里缩进是内容的一部分，这一层不去冒那个险。这些字符串写成**单行的双引号**，
-/// 每个这样的字符都转义（[`double_quoted`]）—— 值里写什么都动不了文件的结构。
-/// 做法是先在 serde 渲染的那一份里放一个占位的词，渲染完再换成双引号的写法：其余的
-/// 写法（键、嵌套、别的标量的引号）照旧由 serde 决定。
+/// 每个这样的字符都转义（[`tw_yaml::double_quoted`]，按路径改一个值也用它）—— 值里写
+/// 什么都动不了文件的结构。做法是先在 serde 渲染的那一份里放一个占位的词，渲染完再换成
+/// 双引号的写法：其余的写法（键、嵌套、别的标量的引号）照旧由 serde 决定。
 ///
 /// **这里只管写得对，不管该不该写**：哪些字段只能单行由调用方查（[`Section::multiline`]、
 /// [`set`]）。
@@ -396,44 +396,6 @@ fn render_block(v: &Value) -> Result<String, EditError> {
     Ok(render(v)?.text)
 }
 
-/// 这个字符要不要转义：控制字符（C0、DEL、C1，含制表符和换行）、YAML 1.1 当作换行的
-/// 那几个（NEL、LS、PS），以及 BOM 和两个非字符。**这些字符原样写进文件，要么读不回来，
-/// 要么读回来变了样**（YAML 1.1 的加载器把 LS 当换行，折成一个空格）
-fn escaped(c: char) -> bool {
-    let n = c as u32;
-    n < 0x20
-        || (0x7f..=0x9f).contains(&n)
-        || matches!(n, 0x2028 | 0x2029 | 0xfeff | 0xfffe | 0xffff)
-}
-
-/// 一个字符串写成单行的 YAML 双引号标量。`"` 和 `\` 加反斜杠，换行、回车、制表符用
-/// 各自的转义，其余要转义的写成 `\xNN` / `\uNNNN`，别的字符原样。
-fn double_quoted(s: &str) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if escaped(c) => {
-                let n = c as u32;
-                if n <= 0xff {
-                    let _ = write!(out, "\\x{n:02x}");
-                } else {
-                    let _ = write!(out, "\\u{n:04x}");
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// 占位词的前缀：`twq<n>x`，挑一个**哪个字符串里都没有**的 `n`（连同转义之后的写法）。
 /// 占位词是前缀加序号再加 `z` —— 结尾的 `z` 让第 1 个不会是第 10 个的开头
 fn free_mark(v: &Value) -> String {
@@ -441,7 +403,7 @@ fn free_mark(v: &Value) -> String {
     strings(v, &mut all);
     let taken = |mark: &str| {
         all.iter().any(|s| {
-            s.contains(mark) || (s.chars().any(escaped) && double_quoted(s).contains(mark))
+            s.contains(mark) || (s.chars().any(must_escape) && double_quoted(s).contains(mark))
         })
     };
     (0u64..)
@@ -468,7 +430,7 @@ fn strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
 /// 把要转义的字符串换成占位词（键和值都算），转义后的写法按序号收进 `quoted`
 fn swap_escaped(v: &Value, mark: &str, quoted: &mut Vec<String>) -> Value {
     match v {
-        Value::String(s) if s.chars().any(escaped) => {
+        Value::String(s) if s.chars().any(must_escape) => {
             let token = format!("{mark}{}z", quoted.len());
             quoted.push(double_quoted(s));
             Value::String(token)
@@ -487,6 +449,36 @@ fn swap_escaped(v: &Value, mark: &str, quoted: &mut Vec<String>) -> Value {
         })),
         other => other.clone(),
     }
+}
+
+/// 有字段可以写多行的那几段（[`Section::multiline`] 不空的）。按路径写值时靠它认位置
+const MULTILINE_SECTIONS: &[Section] = &[PLUGINS];
+
+/// 按路径写一个字符串（`PATCH /config`、`twcore config set`）之前：**换行只进得了可以多行
+/// 的字段**。和按名字改一项是同一份规矩（各段的 [`Section::multiline`]，现在只有插件的
+/// 设置），别处带换行就拒绝（[`EditError::Multiline`]）。别的控制字符、LS、PS 不拦：写出去
+/// 是转义过的双引号（[`tw_yaml::double_quoted`]），读回来一字不差。
+///
+/// `path` 是解析好的路径（列表里的一项是下标）。
+pub fn check_line_breaks(path: &[Step], value: &str) -> Result<(), EditError> {
+    if !value.contains(['\n', '\r']) || multiline_at(path) {
+        return Ok(());
+    }
+    Err(EditError::Multiline)
+}
+
+/// 这个位置在哪一段的哪一项底下、那个键可以多行（`plugins[i].settings…`）
+fn multiline_at(path: &[Step]) -> bool {
+    MULTILINE_SECTIONS.iter().any(|s| {
+        let n = s.path.len();
+        path.len() > n + 1
+            && s.path
+                .iter()
+                .zip(path)
+                .all(|(k, st)| matches!(st, Step::Key(x) if x == k))
+            && matches!(path[n], Step::Index(_))
+            && matches!(&path[n + 1], Step::Key(k) if s.multiline.contains(&k.as_str()))
+    })
 }
 
 /// **单行的字段里不许有换行**：名字、地址、密钥写成两行就不是原来那个东西了。
@@ -807,6 +799,51 @@ providers:
         assert!(changed[0].starts_with("      terms: \""), "{again}");
     }
 
+    /// 按路径写（`PATCH /config`）：换行只进得了插件的设置，和按名字改一项同一份规矩；
+    /// 别的控制字符、LS、PS 不拦
+    #[test]
+    fn a_line_break_written_by_path_goes_only_into_plugin_settings() {
+        use tw_yaml::path;
+        for s in ["a\nb", "a\rb", "\r\n"] {
+            for p in [
+                &path!["clients", 0, "name"][..],
+                &path!["providers", 0, "key"],
+                &path!["plugins", 0, "id"],
+                &path!["plugins", 0, "scope", "models", 0],
+                &path!["listen", "gateway", "bind"],
+            ] {
+                let e = check_line_breaks(p, s).unwrap_err();
+                assert!(matches!(e, EditError::Multiline), "{p:?} {s:?}");
+                assert_eq!(e.msg().code, "config.edit.multiline");
+            }
+            check_line_breaks(&path!["plugins", 1, "settings", "terms"], s).unwrap();
+        }
+        for s in [
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{85}b",
+            "a\tb",
+            "a\u{0}b",
+            "plain",
+        ] {
+            check_line_breaks(&path!["clients", 0, "name"], s).unwrap();
+        }
+    }
+
+    /// 有字段能多行的段都在 [`MULTILINE_SECTIONS`] 里：按路径写的时候认得出它们
+    #[test]
+    fn every_section_with_multiline_fields_is_known_to_path_writes() {
+        for s in [PROVIDERS, PROXIES, PRICE_SHEETS, ROUTES, GROUPS, PLUGINS] {
+            if !s.multiline.is_empty() {
+                assert!(
+                    MULTILINE_SECTIONS.iter().any(|m| m.path == s.path),
+                    "{}",
+                    s.what
+                );
+            }
+        }
+    }
+
     /// 插件那一项里只有设置能多行：范围里的模式、id 照旧单行
     #[test]
     fn only_the_settings_of_a_plugin_may_span_lines() {
@@ -840,7 +877,7 @@ providers:
             assert_eq!(parse(&out).unwrap()["providers"][0]["key"], s, "{out}");
             assert!(out.contains("\n    key: \""), "{s:?}: {out}");
             assert!(
-                !out.chars().any(|c| c != '\n' && escaped(c)),
+                !out.chars().any(|c| c != '\n' && must_escape(c)),
                 "{s:?} was written raw: {out:?}"
             );
         }

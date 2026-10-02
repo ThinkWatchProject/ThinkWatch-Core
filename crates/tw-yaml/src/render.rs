@@ -42,15 +42,18 @@ fn needs_quotes(s: &str) -> bool {
     if s.trim() != s {
         return true;
     }
-    // 控制字符在纯量里根本不合法，只有双引号里的转义能表示它们
-    if s.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) {
+    // 控制字符、换行和 YAML 1.1 当换行的那几个，只有双引号里的转义能原样表示
+    if s.chars().any(must_escape) {
         return true;
     }
-    if s.contains(['\n', '\r', '\t'])
-        || s.starts_with([
-            '-', '?', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`',
-        ])
-    {
+    if s.starts_with([
+        '-', '?', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`',
+    ]) {
+        return true;
+    }
+    // `...` 开头的值单独拿出来读（`put` 写之前那道检查就是这么读的）是文档结束标记。
+    // `---` 已经被上面的 `-` 拦下了
+    if s.starts_with("...") {
         return true;
     }
     // 流式上下文（`[a, b]` / `{k: v}`）里这几个字符会切断纯量。这一层
@@ -90,7 +93,28 @@ fn needs_quotes(s: &str) -> bool {
     false
 }
 
-fn double_quote(s: &str) -> String {
+/// 这个字符写进 YAML 要不要转义：控制字符（C0、DEL、C1，含制表符和换行）、YAML 1.1
+/// 当作换行的那几个（NEL、LS、PS），以及 BOM 和两个非字符。
+///
+/// **这些字符原样写进文件，要么读不回来，要么读回来变了样。**配置的加载器（serde 那条路，
+/// libyaml）按 YAML 1.1 读：纯量里的 LS、PS、NEL 是换行，整份文件就解析不了；双引号里的
+/// NEL 折成一个空格，值悄悄变了；C1 控制字符和 U+FFFE 让整份文件被拒收。补丁层的自检用
+/// 的是 saphyr（YAML 1.2），它把 LS、PS 当普通字符，**自检拦不住** —— 所以写的时候就转义。
+/// BOM 和两个非字符各家解析器读法不一，一样转义。
+///
+/// 按路径改一个值（这里）和按名字改一项（`tw_config::edit`）用的是同一份判断。
+pub fn must_escape(c: char) -> bool {
+    let n = c as u32;
+    n < 0x20
+        || (0x7f..=0x9f).contains(&n)
+        || matches!(n, 0x2028 | 0x2029 | 0xfeff | 0xfffe | 0xffff)
+}
+
+/// 一个字符串写成单行的 YAML 双引号标量。`"` 和 `\` 加反斜杠，换行、回车、制表符用
+/// 各自的转义，其余要转义的（[`must_escape`]）写成 `\xNN` / `\uNNNN`，别的字符原样。
+/// 值里写什么都动不了文件的结构。
+pub fn double_quoted(s: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -100,11 +124,13 @@ fn double_quote(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            // **控制字符必须转义。**YAML 不允许它们裸着出现 —— 写出去
-            // 的文件我们自己的加载器都读不了。这条是测试撞出来的：
-            // 补丁层的自检用的是 saphyr，它比 serde 那条路宽松。
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
+            c if must_escape(c) => {
+                let n = c as u32;
+                if n <= 0xff {
+                    let _ = write!(out, "\\x{n:02x}");
+                } else {
+                    let _ = write!(out, "\\u{n:04x}");
+                }
             }
             c => out.push(c),
         }
@@ -125,14 +151,15 @@ pub fn render_scalar(v: &Scalar, was: ScalarStyle) -> String {
         other => return other.as_yaml_text(),
     };
     match was {
-        // 原来就是单引号：能继续单引号就继续
-        ScalarStyle::SingleQuoted if !s.contains(['\n', '\r']) => single_quote(&s),
-        ScalarStyle::DoubleQuoted => double_quote(&s),
+        // 原来就是单引号：能继续单引号就继续。单引号里什么都转义不了，要转义的字符一个
+        // 都不能有
+        ScalarStyle::SingleQuoted if !s.chars().any(must_escape) => single_quote(&s),
+        ScalarStyle::DoubleQuoted => double_quoted(&s),
         // 块标量（`|` / `>`）改成单行会破坏缩进语义，交给双引号更安全
-        ScalarStyle::Literal | ScalarStyle::Folded => double_quote(&s),
+        ScalarStyle::Literal | ScalarStyle::Folded => double_quoted(&s),
         _ => {
             if needs_quotes(&s) {
-                double_quote(&s)
+                double_quoted(&s)
             } else {
                 s
             }
@@ -169,6 +196,15 @@ mod tests {
         assert_eq!(plain("a #b"), "\"a #b\"");
         // 结尾的冒号也是分隔符
         assert_eq!(plain("a:"), "\"a:\"");
+    }
+
+    /// 单独读的时候是文档结束标记：新写一个键时，写之前那道检查读不回这个值
+    #[test]
+    fn a_value_starting_with_the_document_end_marker_is_quoted() {
+        for s in ["...", "... x", "...x"] {
+            assert!(plain(s).starts_with('"'), "{s} → {}", plain(s));
+        }
+        assert_eq!(plain("a ..."), "a ...");
     }
 
     #[test]
@@ -260,5 +296,67 @@ mod control_char_tests {
 
     fn plain_of(s: &str) -> String {
         render_scalar(&Scalar::s(s), ScalarStyle::Plain)
+    }
+
+    /// YAML 1.1 当换行的那几个（NEL、LS、PS）、C1、BOM 和两个非字符：不管原来是哪种
+    /// 写法，一律写成转义过的双引号。原样写出去的话，配置的加载器要么整份读不了，要么
+    /// 读回来变了样，而补丁层自己的自检（YAML 1.2）看不出来
+    #[test]
+    fn line_separators_and_the_rest_are_escaped_in_every_style() {
+        let cases = [
+            ("a\u{85}b", "\"a\\x85b\""),
+            ("a\u{9b}b", "\"a\\x9bb\""),
+            ("a\u{2028}b", "\"a\\u2028b\""),
+            ("a\u{2029}b", "\"a\\u2029b\""),
+            ("\u{feff}a", "\"\\ufeffa\""),
+            ("a\u{fffe}\u{ffff}", "\"a\\ufffe\\uffff\""),
+        ];
+        for (s, want) in cases {
+            for was in [
+                ScalarStyle::Plain,
+                ScalarStyle::SingleQuoted,
+                ScalarStyle::DoubleQuoted,
+                ScalarStyle::Literal,
+            ] {
+                assert_eq!(render_scalar(&Scalar::s(s), was), want, "{s:?} as {was:?}");
+            }
+        }
+    }
+
+    /// 单引号里什么都转义不了：带制表符、控制字符的值不再沿用单引号
+    #[test]
+    fn a_value_that_needs_escapes_leaves_single_quotes() {
+        assert_eq!(
+            render_scalar(&Scalar::s("a\tb"), ScalarStyle::SingleQuoted),
+            "\"a\\tb\""
+        );
+        assert_eq!(
+            render_scalar(&Scalar::s("a\u{1}b"), ScalarStyle::SingleQuoted),
+            "\"a\\x01b\""
+        );
+        // 不需要转义的照旧单引号
+        assert_eq!(
+            render_scalar(&Scalar::s("a\u{a0}b"), ScalarStyle::SingleQuoted),
+            "'a\u{a0}b'"
+        );
+    }
+
+    /// 读得回来：转义过的写法，serde（配置的加载器）读到的就是原来那个字符串
+    #[test]
+    fn what_is_escaped_reads_back_exactly() {
+        for s in [
+            "a\u{85}b",
+            "a\u{9b}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "\u{feff}a",
+            "a\u{fffe}\u{ffff}",
+            "a\u{0}\u{7f}\tb",
+        ] {
+            let text = format!("k: {}\n", double_quoted(s));
+            let v: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(&text).unwrap_or_else(|e| panic!("{s:?}: {e}\n{text}"));
+            assert_eq!(v["k"].as_str(), Some(s), "{text}");
+        }
     }
 }
