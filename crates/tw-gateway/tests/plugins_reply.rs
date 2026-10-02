@@ -1,7 +1,7 @@
 //! 插件的回答钩子，从假上游到客户端走一整圈。
 //!
 //! 要证明的是位置：插件看到的是客户端那种格式（转换之后的），改过的东西还要过工具
-//! 调用审查和输出长度；看到的是占位符；同格式直通、转换、整包、整包转成流、Gemini
+//! 调用审查；看到的是占位符；同格式直通、转换、整包、整包转成流、Gemini
 //! 的 JSON 数组几条路都走得通；出错时客户端收到的是一个说得清的收尾。
 
 use std::net::SocketAddr;
@@ -460,28 +460,6 @@ async fn a_dangerous_call_injected_into_a_whole_answer_written_as_a_stream_is_wi
     let (_, body) = post(&gw, "/v1/messages", &ask(true)).await;
     assert!(!body.contains("evil.sh"), "{body}");
     assert!(body.contains("[ThinkWatch]"), "{body}");
-}
-
-/// 输出长度数的是插件改过之后的那一版
-#[tokio::test]
-async fn the_output_limit_counts_what_the_plugin_wrote() {
-    let up = upstream("text/event-stream", anthropic_sse(&["hi"], None)).await;
-    let long = Double::new("long")
-        .permit(&[Permission::ReplyText])
-        .on_text(|_| Some("x".repeat(500)));
-    let security = Security {
-        output_limit: serde_yaml_ng::from_str("mode: enforce\nmax_chars: 100\n").unwrap(),
-        ..Default::default()
-    };
-    let gw = gateway(
-        provider(up, Protocol::Anthropic),
-        security,
-        vec![entry("long", long)],
-    )
-    .await;
-    let (_, body) = post(&gw, "/v1/messages", &ask(true)).await;
-    assert!(body.contains("output limit"), "{body}");
-    assert!(!anthropic_text(&body).contains(&"x".repeat(500)), "{body}");
 }
 
 /// 回答里的密钥：插件看到的是占位符，客户端收到的是真值 —— 拦截档上游回显的是

@@ -365,7 +365,7 @@ async fn scope_follows_the_upstream_of_the_connection() {
     );
 }
 
-/// 插件往 `response.create` 里加的内容照样过请求防护：拦下就切断，上游什么都没收到
+/// 插件往 `response.create` 里加的内容照样过内容过滤：拒绝就切断，上游什么都没收到
 #[tokio::test]
 async fn content_a_plugin_adds_to_a_response_create_is_screened() {
     let (up, seen) = upstream().await;

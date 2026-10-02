@@ -45,11 +45,13 @@ Documentation: [configuration reference](docs/config.md) ·
   in a tool call for the client to run. Tool-call inspection can cut off an
   answer whose tool call downloads and runs code, sends out environment
   variables or credential files, reads private keys, or installs a startup item
-  or scheduled job, before the client receives it whole; hidden-character
-  detection, a content filter and an output limit complete the five
-  protections. All start
-  in observe mode (the output limit starts off) and change nothing until set to
-  enforce.
+  or scheduled job, before the client receives it whole.
+- **Hidden instructions are removed.** Characters invisible on screen can carry
+  instructions that a model reads; the content filter can delete them from user
+  messages and tool results before a request leaves, or refuse a request that
+  tells the model to ignore its instructions. Outbound redaction, tool-call
+  inspection and the content filter all start in observe mode, which records
+  what they find and changes nothing.
 - **Every request is traceable.** Each request is stored with the rule that
   chose its upstream, every attempt, any format conversion, usage, cost and
   where its price came from, time to first token and generation speed. A dry
@@ -133,7 +135,7 @@ a time, and cannot stop core, take the diagnostic bundle or change
 | Crate | Role |
 |---|---|
 | `tw-dialect` | Conversion between the four API formats; usage parsing |
-| `tw-guard` | The five protections: redaction, tool-call inspection, hidden characters, content filter, output limit |
+| `tw-guard` | The three protections and their rules: outbound redaction, tool-call inspection, content filter |
 | `tw-breaker` | Circuit-breaker state machine |
 | `tw-bedrock` | Amazon Bedrock on the wire: SigV4 signing, eventstream, addresses, model catalog |
 | `tw-types` | Messages for people: stable code, arguments, English sentence |

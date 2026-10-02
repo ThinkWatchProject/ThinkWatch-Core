@@ -79,6 +79,32 @@ impl ClientApi {
                 && (p.ends_with(":generateContent") || p.ends_with(":streamGenerateContent")))
     }
 
+    /// 这个路径是不是压缩上下文：Responses 的 `/v1/responses/compact`、Codex 的
+    /// `/backend-api/codex/responses/compact`。整段对话发给上游，模型照着写一份摘要。
+    pub fn compacts(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        p.strip_prefix("/v1").unwrap_or(p) == "/responses/compact"
+            || p == "/backend-api/codex/responses/compact"
+    }
+
+    /// 内容过滤查不查这个请求：**会让模型读调用方正文的那几种** —— 生成回答
+    /// （[`ClientApi::generates`]），和压缩上下文（[`ClientApi::compacts`]）。压缩带着整段
+    /// 对话发给上游、真的会跑模型写摘要，藏在对话里的指令照样起作用，所以记录、删除、
+    /// 拒绝都和生成回答一样。
+    ///
+    /// **计 token 不查**（Anthropic 的 `count_tokens`、Gemini 的 `:countTokens`、Responses
+    /// 的 `/responses/input_tokens`）：它不跑模型，正文里的话没有机会被照着做。客户端常在
+    /// 真正发请求之前先数一遍，查的话同一处命中会在那个请求之前多记一遍，处置档下还会把
+    /// 计数请求拒掉 —— 客户端拿不到数，而随后真正的那个请求照样会被查到。嵌入也不查：
+    /// 它不按正文里的话做事。
+    ///
+    /// **旧版补全也不查**（OpenAI 的 `/v1/completions`、Anthropic 的 `/v1/complete`）：它们
+    /// 只有一整段 `prompt`，分不出哪句是调用方打的、哪句是工具抓回来的 —— 内容过滤查的
+    /// 正是这两样；如今用它的几乎只剩编辑器里的代码补全，那里没有工具结果这条注入的路。
+    pub fn screened(path: &str) -> bool {
+        Self::of_path(path).is_some() && (Self::generates(path) || Self::compacts(path))
+    }
+
     /// 这个路径是不是数 token：Anthropic 的 `/v1/messages/count_tokens`、Gemini 的
     /// `:countTokens`。
     ///
@@ -284,6 +310,28 @@ mod tests {
             ("/v1/embeddings", false),
         ] {
             assert_eq!(ClientApi::counts_tokens(path), counts, "{path}");
+        }
+    }
+
+    /// 内容过滤查的是会让模型读调用方正文的请求：生成回答和压缩上下文。计 token 不查
+    #[test]
+    fn content_is_screened_where_a_model_reads_it() {
+        for (path, screened) in [
+            ("/v1/messages", true),
+            ("/v1/chat/completions", true),
+            ("/v1/responses", true),
+            ("/backend-api/codex/responses", true),
+            ("/v1beta/models/gemini-2.5-pro:streamGenerateContent", true),
+            ("/v1/responses/compact", true),
+            ("/responses/compact/", true),
+            ("/backend-api/codex/responses/compact", true),
+            ("/v1/messages/count_tokens", false),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", false),
+            ("/v1/responses/input_tokens", false),
+            ("/v1/embeddings", false),
+            ("/v1/files", false),
+        ] {
+            assert_eq!(ClientApi::screened(path), screened, "{path}");
         }
     }
 

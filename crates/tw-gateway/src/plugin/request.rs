@@ -160,15 +160,27 @@ pub struct Plugged {
 /// 插件改过之后的请求：客户端那种格式，占位符已经换回原值。
 pub struct Changed {
     pub body: Bytes,
-    /// 改过之后的 JSON。管线要重新解码它（内容审查、格式转换）
+    /// 改过之后的 JSON。管线要重新解码它（格式转换）
     pub value: Value,
     /// 调的路径。Gemini 换了模型时是新的
     pub path: String,
     /// 插件改了 `params.model` 的话，发给这一家的新模型名
     pub renamed: Option<Renamed>,
-    /// 嵌入、旧版补全：改前、改后请求防护各看哪一份（见 [`view::inputs::screenable`]）。
-    /// 它们没有中间表示，管线拿这两份比，只看插件加进来的。对话是 None：管线自己解码
-    pub screen: Option<(tw_dialect::ir::Request, tw_dialect::ir::Request)>,
+    /// 嵌入、旧版补全：内容过滤再查一遍时要的（见 [`Inputs`]）。对话是 None：管线按
+    /// 消息结构查
+    pub inputs: Option<Inputs>,
+}
+
+/// 嵌入、旧版补全被插件改过：管线再查一遍内容过滤要用的。
+///
+/// 它们开头不过内容过滤（见 [`crate::client_api::ClientApi::screened`]），**插件写进去的
+/// 字照样要查**：管线拿插件拿到的那一份和改过的那一份里每项输入的文字各查一遍，只报插件
+/// 加进来的，删也删在那一项上（见 [`view::inputs::texts`]、[`view::inputs::rewrite_texts`]）
+pub struct Inputs {
+    /// 这种请求体怎么读
+    pub form: view::Form,
+    /// 插件拿到的那一份里每项输入的文字，按先后
+    pub before: Vec<String>,
 }
 
 /// 插件换了发给这一家的模型名。
@@ -401,12 +413,12 @@ impl<'a> Hook<'a> {
         }
         if changed && let Some(v) = raw {
             let value = v.into_owned();
-            let screen = match (form, original) {
+            let inputs = match (form, original) {
                 (view::Form::Conversation(_), _) | (_, None) => None,
-                (f, Some(before)) => Some((
-                    view::inputs::screenable(f, before, self.path),
-                    view::inputs::screenable(f, &value, &path),
-                )),
+                (f, Some(before)) => Some(Inputs {
+                    form: f,
+                    before: view::inputs::texts(f, before, self.path),
+                }),
             };
             match serde_json::to_vec(&value) {
                 Ok(b) => {
@@ -415,7 +427,7 @@ impl<'a> Hook<'a> {
                         value,
                         path,
                         renamed: renamed_by.map(|by| Renamed { model, by }),
-                        screen,
+                        inputs,
                     })
                 }
                 // 序列化不该失败；真失败了就当没改过，不发半个请求体

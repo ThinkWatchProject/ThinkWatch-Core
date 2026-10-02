@@ -2104,8 +2104,8 @@ async fn token_id_inputs_are_read_only() {
     assert_eq!(up.hits(), 1);
 }
 
-/// 插件改过的嵌入请求再看一遍请求防护，**只看插件加进来的**：插件写进来的命中拦下整个
-/// 请求；客户端原话里就有的（嵌入开头不看请求防护）不因为插件改了别的一项被拦
+/// 插件改过的嵌入请求再查一遍内容过滤，**只看插件加进来的**：插件写进来的命中拦下整个
+/// 请求；客户端原话里就有的（嵌入开头不过内容过滤）不因为插件改了别的一项被拦
 #[tokio::test]
 async fn screening_sees_the_inputs_a_plugin_wrote() {
     let up = Upstream::default();
@@ -2163,4 +2163,59 @@ async fn screening_sees_the_inputs_a_plugin_wrote() {
     assert_eq!(status, 200, "{answer}");
     let sent: Value = serde_json::from_slice(&up.raw.lock().unwrap()[0]).unwrap();
     assert_eq!(sent["input"][1], "harmless");
+}
+
+/// 处置档下，插件写进一项输入的零宽字符删掉之后再发：**删在插件改过的那一项上**。插件
+/// 没改的那几项和没有插件时一样不查、不动 —— 客户端自己写在里面的零宽字符原样到上游
+#[tokio::test]
+async fn hidden_characters_a_plugin_writes_into_an_input_are_stripped_there() {
+    let up = Upstream::default();
+    let base = start_upstream(up.clone()).await;
+    let security = Security {
+        content: tw_config::ContentPolicy {
+            mode: SecurityMode::Enforce,
+            enable: vec!["zero-width".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let hide = Double::new("hide")
+        .permit(&[Permission::Messages])
+        .requests(&[tw_api::RequestKind::Embeddings])
+        .on_request(|mut view, _| {
+            view["messages"][1]["parts"][0]["text"] = json!("un\u{200B}related");
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let gw = gateway_with(
+        vec![provider("a", base, Protocol::OpenaiChat)],
+        SecurityMode::Off,
+        vec![entry("hide", hide)],
+        security,
+    )
+    .await;
+    let mut rx = gw.state.bus.subscribe();
+    let mut body = embeddings_body();
+    body["input"][0] = json!("the client's own zero\u{200B}width");
+    let (status, answer) = post(&gw, "/v1/embeddings", &body).await;
+    assert_eq!(status, 200, "{answer}");
+    let sent: Value = serde_json::from_slice(&up.raw.lock().unwrap()[0]).unwrap();
+    assert_eq!(
+        sent["input"][1], "unrelated",
+        "what the plugin hid reached the upstream"
+    );
+    assert_eq!(
+        sent["input"][0], "the client's own zero\u{200B}width",
+        "an input the plugin did not touch was changed"
+    );
+    assert_eq!(sent["input"][2], json!([9906, 1917]));
+    let mut matched = Vec::new();
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        if let tw_api::Event::ContentMatched { rule, outcome, .. } = ev {
+            matched.push((rule, outcome));
+        }
+    }
+    assert_eq!(
+        matched,
+        [("zero-width".to_string(), tw_api::ContentOutcome::Stripped)]
+    );
 }

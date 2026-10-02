@@ -1,7 +1,8 @@
-//! 数据面守卫：出站脱敏、请求防护（藏匿字符、内容过滤）和输出长度的接线。
+//! 数据面守卫：出站脱敏和内容过滤的接线。
 //!
-//! 规则本身住在 [`tw_guard::redact`] 里，这个文件只回答一个问题：**一个请求体该
-//! 怎么处理。**
+//! 出站脱敏怎么找、怎么编号、每一跳怎么换在 [`tw_guard::redact::flow`]，内容过滤怎么查、
+//! 怎么删在 [`tw_guard::content`]（两个网关共用）。这里的几个函数是它们在桌面网关里的
+//! 入口，外加把结论写成事件。
 //!
 //! # 全局的，对所有上游一视同仁
 //!
@@ -18,116 +19,49 @@
 //!
 //! # 一个值一个占位符，整个请求里都一样
 //!
-//! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换。
-//! 以前每一跳各起一本账，按那一跳发出去的那份的先后编号：转换过格式、字段换了顺序的
-//! 那一跳，同一把密钥可能是 2 号，而上一跳、存下来的那份请求里它是 1 号 —— 请求详情里
-//! 存的请求和回答对不上号。
+//! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换
+//! （见 [`tw_guard::redact::flow`]）。
 
 use tw_config::SecurityMode as Mode;
-use tw_guard::redact::replace::{Ledger, Scheme};
+use tw_guard::content::Screening;
+use tw_guard::redact::flow;
+use tw_guard::redact::replace::Ledger;
 use tw_guard::redact::rules::{Finding, Hit, RuleSet};
 
-/// 按规则找一遍，**不算我们自己的占位符**。
-///
-/// 连接串里写着 `postgres://app:<<TW_SECRET_2>>@db` 的那一段，在口令那条规则看来就是
-/// 一个口令 —— 可它是我们换上去的：存下来的请求拿去重放、用户把详情里看到的东西贴回
-/// 对话，都会带着它。当成凭据的话，它会被再换一次、在安全日志里报一次、落盘时被打成
-/// `<<TW_…_2>>`。压在一个占位符上的命中都不算。
+/// 按规则找一遍，**不算我们自己的占位符，也不进 base64 载荷**（见 [`flow::hits`]）。
 pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
-    let mut hits = tw_guard::redact::rules::scan(text, rules);
-    if hits.is_empty() || !text.contains(Scheme::SECRET.open) {
-        return hits;
-    }
-    let ours = Scheme::SECRET.find_in(text);
-    hits.retain(|h| {
-        !ours
-            .iter()
-            .any(|(at, _, _)| at.start < h.bytes.end && h.bytes.start < at.end)
-    });
-    hits
+    flow::hits(text, rules)
 }
 
-/// 找一遍。**观察档和拦截档都找**，关闭时不找。
-///
-/// **不是 UTF-8 就不看。**图片之类的二进制体里不会有粘贴进来的 key。
+/// 找一遍。**观察档和拦截档都找**，关闭时不找（见 [`flow::find`]）。
 pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
-    if !mode.detects() || rules.is_empty() {
-        return Vec::new();
-    }
-    let Ok(text) = std::str::from_utf8(body) else {
-        return Vec::new();
-    };
-    tw_guard::redact::rules::findings(text, &hits(text, rules))
+    flow::find(mode, rules, body)
 }
 
-/// 一本新账，让开 `body` 里已经写着的占位符（见 [`Ledger::avoiding`]）。
-///
-/// 存下来的请求（拦截档下存的是换过的那一份）拿去重放时，里面写着的 1 号不能再发给
-/// 新找到的值 —— 回显里的 1 号会被还原成那个新值。
+/// 一本新账，让开 `body` 里已经写着的占位符（见 [`flow::ledger_for`]）。
 pub fn ledger_for(body: &[u8]) -> Ledger {
-    let fresh = Ledger::new(Scheme::SECRET);
-    match std::str::from_utf8(body) {
-        Ok(text) => fresh.avoiding(text),
-        Err(_) => fresh,
-    }
+    flow::ledger_for(body)
 }
 
-/// 看一遍客户端发来的原文：报出去的记录（同 [`find`]），和这个请求的账本。
-///
-/// **拦截档下账本在这里就编好号**：原文里找到的每个值按出现的先后发号，让开原文里本来
-/// 就写着的占位符。之后每一跳都接着这本账换（[`replace`]），存下来的那份请求也照它换
-/// （[`crate::bodies::Redaction`]）。不在拦截档时账本是空的。
+/// 看一遍客户端发来的原文：报出去的记录，和这个请求的账本（见 [`flow::look`]）。存下来的
+/// 那份请求也照这本账换（[`crate::bodies::Redaction`]）。
 pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) {
-    look_from(mode, rules, body, Ledger::new(Scheme::SECRET))
+    flow::look(mode, rules, body)
 }
 
-/// [`look`]，**接着 `seed` 的账编号**：插件跑过的请求，插件看到的占位符是按客户端原文
-/// 编的（见 [`crate::plugin::bridge`]），改过之后的这一份接着那本账编，同一个值还是同一个
-/// 号；插件改出来的新值接着往后编。
+/// [`look`]，接着 `seed` 的账编号（见 [`flow::look_from`]）。
 pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
-    let empty = || Ledger::new(Scheme::SECRET);
-    if !mode.detects() || rules.is_empty() {
-        return (Vec::new(), empty());
-    }
-    let Ok(text) = std::str::from_utf8(body) else {
-        return (Vec::new(), empty());
-    };
-    let hits = hits(text, rules);
-    let found = tw_guard::redact::rules::findings(text, &hits);
-    if !mode.acts() {
-        return (found, empty());
-    }
-    let seed = seed.avoiding(text);
-    let ledger = if hits.is_empty() {
-        seed
-    } else {
-        tw_guard::redact::replace::apply(text, &hits, seed).ledger
-    };
-    (found, ledger)
+    flow::look_from(mode, rules, body, seed)
 }
 
-/// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`look`]）。返回换过的体和
-/// 还原用的账本；**不在拦截档、或者没找到东西时与进来时逐字节相同**，账本就是交进来的那本。
+/// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`flow::replace`]）。
 pub fn replace(
     mode: Mode,
     rules: &RuleSet,
     body: bytes::Bytes,
     ledger: &Ledger,
 ) -> (bytes::Bytes, Ledger) {
-    if !mode.acts() || rules.is_empty() {
-        return (body, ledger.clone());
-    }
-    // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求
-    let Ok(text) = std::str::from_utf8(&body) else {
-        return (body, ledger.clone());
-    };
-    let hits = hits(text, rules);
-    if hits.is_empty() {
-        // 没命中就原样返回，连一次拷贝都不做
-        return (body, ledger.clone());
-    }
-    let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
-    (bytes::Bytes::from(r.text), r.ledger)
+    flow::replace(mode, rules, body, ledger)
 }
 
 /// `after` 里 `before` 没有的那些值：插件写进请求里的（见 [`crate::plugin::request`]）。
@@ -159,116 +93,190 @@ pub fn items(found: &[Finding]) -> Vec<tw_api::SecretItem> {
         .collect()
 }
 
-/// 请求防护此刻的档位和规则：藏匿字符和内容过滤。
+/// 内容过滤此刻的档位和规则。
 ///
 /// **HTTP 和 WebSocket 两条路共用**（见 [`screen`]）。升级那一刻取一次，一条连接
 /// 活多久就按它开始时的配置走多久。
 #[derive(Clone)]
 pub struct Screen {
-    pub hidden_mode: Mode,
-    pub hidden: Vec<tw_guard::hidden::Kind>,
-    pub content_mode: Mode,
-    pub content: std::sync::Arc<tw_guard::content::Rules>,
+    pub mode: Mode,
+    pub rules: std::sync::Arc<tw_guard::content::Rules>,
 }
 
 impl Screen {
     pub fn of(rt: &crate::state::Runtime) -> Self {
-        let sec = &rt.config.security;
         Self {
-            hidden_mode: sec.hidden_text.mode,
-            hidden: rt.hidden.clone(),
-            content_mode: sec.content.mode,
-            content: rt.content.clone(),
+            mode: rt.config.security.content.mode,
+            rules: rt.content.clone(),
         }
     }
 }
 
-/// 看一遍调用方发来的正文（连同工具结果）：藏匿字符、内容规则。
+/// 查一个请求：`body` 是要发出去的那一份原文，`dialect` 是它的格式（见
+/// [`tw_guard::content::screen`]）。处置档下删过的话，删过的请求体在
+/// [`Screening::body`] 里。
 ///
-/// **两项都看完、都报完再下结论** —— 一个请求既藏了字符又命中了规则，日志里两件
-/// 事都该在。拦截档下该拒的话返回给客户端的那句话；藏匿字符排在前面，它几乎不会
-/// 误报。
-pub fn screen(
-    bus: &tw_observe::EventBus,
-    id: u64,
-    provider: &str,
-    s: &Screen,
-    request: &tw_dialect::ir::Request,
-) -> Option<tw_types::Msg> {
-    let hidden = if s.hidden_mode.detects() {
-        tw_guard::hidden::scan_request(request, &s.hidden)
-    } else {
-        Vec::new()
-    };
-    let mut refusal = hidden_found(bus, id, provider, s.hidden_mode, &hidden);
-    if s.content_mode.detects() && !s.content.is_empty() {
-        let hits = s.content.scan_request(request);
-        let refused = content_matched(bus, id, provider, s.content_mode, &hits);
-        refusal = refusal.or(refused);
-    }
-    refusal
+/// **只下结论，不发事件**：开始事件和留档要用删过的那一份，记录要挂在请求号上，所以
+/// 先查、再开始、再报（[`report`]）。可以重复调用：请求被改过之后（插件改写）再查一遍，
+/// 用的也是它。
+pub fn screen(s: &Screen, dialect: tw_dialect::ir::Dialect, body: &[u8]) -> Screening {
+    tw_guard::content::screen(s.mode, &s.rules, dialect, body)
 }
 
-/// 插件改过的请求再看一遍：**只看插件加进来的。**
-///
-/// 客户端的原话在开头已经看过（[`screen`]），该报的报了、该拒的拒了；插件改过的那一份
-/// 要是整个再报一遍，同一处藏匿字符、同一条命中会在安全日志里出现两次。所以两份都扫，
-/// 原话里就有的那几处减掉，剩下的照 [`screen`] 的规矩报、下结论 —— 拦截档下原话里命中
-/// 「拦」的请求走不到这一步，这一遍拒不拒只看插件加进来的。
-pub fn screen_more(
+/// 把一次查下来的结论报出去：每条命中的规则一条 [`tw_api::Event::ContentMatched`]，挂在
+/// 请求 `id` 上。要拒绝时返回告诉客户端的那句话。
+pub fn report(
     bus: &tw_observe::EventBus,
     id: u64,
     provider: &str,
-    s: &Screen,
-    before: &tw_dialect::ir::Request,
-    after: &tw_dialect::ir::Request,
+    sc: &Screening,
 ) -> Option<tw_types::Msg> {
-    let hidden = if s.hidden_mode.detects() {
-        let was = tw_guard::hidden::scan_request(before, &s.hidden);
-        let mut now = tw_guard::hidden::scan_request(after, &s.hidden);
-        // 一种藏法在一个地方合成一条：插件往同一处又藏了几个，那一条就变了，整条再报
-        now.retain(|n| {
-            !was.iter().any(|w| {
-                w.kind == n.kind
-                    && w.in_tool_result == n.in_tool_result
-                    && w.example == n.example
-                    && w.revealed == n.revealed
-                    && n.count <= w.count
+    if sc.hits.is_empty() {
+        return None;
+    }
+    let at_ms = crate::server::now_ms();
+    for h in &sc.hits {
+        let hit = &h.hit;
+        bus.emit(tw_api::Event::ContentMatched {
+            id,
+            provider: provider.to_string(),
+            rule: hit.rule.clone(),
+            custom: hit.custom,
+            matching: tw_api::ContentMatch::of(hit.matching),
+            action: tw_guard::policy::ContentAction::of(hit.action).into(),
+            outcome: h.outcome,
+            in_tool_result: hit.in_tool_result,
+            excerpt: hit.snippet.clone(),
+            count: hit.count as u64,
+            revealed: (!hit.revealed.is_empty()).then(|| hit.revealed.clone()),
+            at_ms,
+        });
+    }
+    // 命中的原文是调用方的正文，**不进应用日志**：日志只说哪条规则、做了什么
+    tracing::info!(
+        provider,
+        refused = sc.refused.is_some(),
+        stripped = sc.body.is_some(),
+        rules = ?sc.hits.iter().map(|h| h.hit.rule.as_str()).collect::<Vec<_>>(),
+        "the request matched content rules"
+    );
+    sc.refusal().map(|r| refusal(&r.hit))
+}
+
+/// 插件改过的请求再查一遍：**只报插件加进来的，也只按插件加进来的拒绝**。`before` 是插件
+/// 拿到的那一份，`after` 是插件改过的那一份，都是 `dialect` 格式的原文。
+///
+/// 插件拿到的那一份在开头已经查过、报过了（[`screen`]、[`report`]）；改过的那一份整个再报
+/// 一遍的话，同一条命中会在安全日志里出现两次。所以两份都查，原来就在的命中减掉（见
+/// [`added`]）。
+///
+/// 处置档下，插件拿到的那一份一般不会命中拒绝规则 —— 命中了的请求在开头就拒了，走不到
+/// 插件这一步。嵌入、旧版补全例外：开头不查，客户端的原话里可以有。**拒绝的只是原来就在
+/// 的，不因为插件改了别处就拒**：那几条拒绝规则这一遍不算，再查一遍，插件加进来的字照样
+/// 删、照样报、照样能拒。
+pub fn rescreen(
+    s: &Screen,
+    dialect: tw_dialect::ir::Dialect,
+    before: &[u8],
+    after: &[u8],
+) -> Screening {
+    use tw_guard::content::Outcome;
+    let mut s = s.clone();
+    loop {
+        let was = screen(&s, dialect, before);
+        let now = screen(&s, dialect, after);
+        // 拒绝时，拒绝规则的每一条命中都是「已拒绝」：有一条是插件加进来的就拒
+        let blocking: Vec<&tw_guard::content::Hit> = now
+            .hits
+            .iter()
+            .filter(|h| h.outcome == Outcome::Blocked)
+            .map(|h| &h.hit)
+            .collect();
+        if now.refused.is_none() || blocking.iter().any(|h| !known(&was, h)) {
+            return added(&was, now);
+        }
+        // 拒绝它的全是原来就在的：这几条不算，再查一遍。每一轮至少少一条规则
+        let quiet: Vec<(String, bool)> = blocking
+            .iter()
+            .map(|h| (h.rule.clone(), h.custom))
+            .collect();
+        let rules = s
+            .rules
+            .rules
+            .iter()
+            .filter(|r| {
+                !quiet
+                    .iter()
+                    .any(|(id, custom)| r.id == *id && r.custom == *custom)
             })
-        });
-        now
-    } else {
-        Vec::new()
-    };
-    let mut refusal = hidden_found(bus, id, provider, s.hidden_mode, &hidden);
-    if s.content_mode.detects() && !s.content.is_empty() {
-        let mut was = s.content.scan_request(before);
-        let mut hits = s.content.scan_request(after);
-        // 一处一处地减：原话里有一处，插件那一版里同样的一处就不是新的。位置不比 ——
-        // 插件在前面加了字，后面的位置都挪了
-        hits.retain(|h| {
-            match was.iter().position(|w| {
-                w.rule == h.rule
-                    && w.custom == h.custom
-                    && w.action == h.action
-                    && w.snippet == h.snippet
-                    && w.in_tool_result == h.in_tool_result
-            }) {
-                Some(i) => {
-                    was.swap_remove(i);
-                    false
-                }
-                None => true,
-            }
-        });
-        let refused = content_matched(bus, id, provider, s.content_mode, &hits);
-        refusal = refusal.or(refused);
+            .cloned()
+            .collect();
+        s.rules = std::sync::Arc::new(tw_guard::content::Rules { rules });
     }
-    refusal
 }
 
-/// 没法按消息结构读的正文（解不开的 WebSocket 帧）：**只查藏匿字符** —— 它在任何
-/// 地方都没有正当用途；内容规则按整段原文查的话，系统提示里的话也会被当成调用方的。
+/// 插件改过的那一份查下来的结论里，**只留插件加进来的**：`before` 里就有的命中减掉 ——
+/// 同一条规则、处数没有变多的，算原来就在的。插件让一条规则多命中了几处，**整条再报**
+/// （处数是改过之后的）。拒绝时说了算的是头一条插件加进来的「已拒绝」；删过的请求体
+/// （[`Screening::body`]）照 `after`，这一跳发出去的就是它。
+///
+/// 拒绝它的全是原来就在的那种情况由 [`rescreen`] 先排除掉。
+pub fn added(before: &Screening, after: Screening) -> Screening {
+    let mut hits = Vec::with_capacity(after.hits.len());
+    let mut refused = None;
+    for h in after.hits {
+        if known(before, &h.hit) {
+            continue;
+        }
+        if refused.is_none() && h.outcome == tw_guard::content::Outcome::Blocked {
+            refused = Some(hits.len());
+        }
+        hits.push(h);
+    }
+    Screening {
+        hits,
+        refused,
+        body: after.body,
+    }
+}
+
+/// 这一条命中在 `before` 里就有：同一条规则，处数没有变多
+fn known(before: &Screening, h: &tw_guard::content::Hit) -> bool {
+    before
+        .hits
+        .iter()
+        .any(|b| b.hit.rule == h.rule && b.hit.custom == h.custom && h.count <= b.hit.count)
+}
+
+/// 拒绝时告诉客户端的那句话。码位规则命中的是看不见的字符，引一段片段没有用，说几个；
+/// 在工具结果里和在调用方自己打的字里是两句话：前者要去查是哪个工具抓回来的
+fn refusal(h: &tw_guard::content::Hit) -> tw_types::Msg {
+    if h.matching != tw_guard::content::Match::Codepoints {
+        return tw_types::msg!(
+            "gw.content.refused",
+            rule = h.rule.clone(), name = h.name.clone(), excerpt = h.snippet.clone() =>
+            "Content rule “{name}” matched this request (“{excerpt}”), so it was not sent."
+        );
+    }
+    if h.in_tool_result {
+        tw_types::msg!(
+            "gw.content.refused_invisible_tool_result",
+            rule = h.rule.clone(), name = h.name.clone(), count = h.count =>
+            "A tool result in this request contains {count} invisible characters that content \
+             rule “{name}” refuses, so the request was not sent."
+        )
+    } else {
+        tw_types::msg!(
+            "gw.content.refused_invisible_message",
+            rule = h.rule.clone(), name = h.name.clone(), count = h.count =>
+            "The message contains {count} invisible characters that content rule “{name}” \
+             refuses, so the request was not sent."
+        )
+    }
+}
+
+/// 没法按消息结构读的正文（解不开的 WebSocket 帧）：只用码位规则，查完就报（见
+/// [`screen_raw`]）。拒绝时返回告诉客户端的那句话。
 pub fn screen_text(
     bus: &tw_observe::EventBus,
     id: u64,
@@ -276,163 +284,22 @@ pub fn screen_text(
     s: &Screen,
     text: &str,
 ) -> Option<tw_types::Msg> {
-    if !s.hidden_mode.detects() {
-        return None;
-    }
-    let mut found = Vec::new();
-    tw_guard::hidden::scan_smuggled(text, false, &s.hidden, &mut found);
-    hidden_found(bus, id, provider, s.hidden_mode, &found)
+    report(bus, id, provider, &screen_raw(s, text))
 }
 
-fn hidden_found(
-    bus: &tw_observe::EventBus,
-    id: u64,
-    provider: &str,
-    mode: Mode,
-    found: &[tw_guard::hidden::Smuggled],
-) -> Option<tw_types::Msg> {
-    if found.is_empty() {
-        return None;
-    }
-    let blocked = mode.acts();
-    tracing::warn!(
-        provider,
-        blocked,
-        kinds = ?found.iter().map(|f| f.kind.slug()).collect::<Vec<_>>(),
-        "the request carries invisible characters"
-    );
-    bus.emit(tw_api::Event::HiddenTextFound {
-        id,
-        provider: provider.to_string(),
-        blocked,
-        items: found
-            .iter()
-            .map(|f| tw_api::HiddenItem {
-                kind: crate::wire::hidden_kind(f.kind),
-                in_tool_result: f.in_tool_result,
-                count: f.count as u64,
-                example: f.example.clone(),
-                revealed: f.revealed.clone(),
-            })
-            .collect(),
-        at_ms: crate::server::now_ms(),
-    });
-    if !blocked {
-        return None;
-    }
-    let mut kinds: Vec<&str> = found.iter().map(|f| f.kind.slug()).collect();
-    kinds.dedup();
-    let kinds = kinds.join(", ");
-    // 在工具结果里和在调用方自己打的字里，是两句话：前者要去查是哪个工具抓回来的
-    Some(if found.iter().any(|f| f.in_tool_result) {
-        tw_types::msg!(
-            "gw.hidden_text.refused_tool_result", kinds = kinds =>
-            "A tool result in this request contains invisible characters that can hide \
-             instructions from a reader ({kinds}), so the request was not sent."
-        )
-    } else {
-        tw_types::msg!(
-            "gw.hidden_text.refused_message", kinds = kinds =>
-            "The message contains invisible characters that can hide instructions from a \
-             reader ({kinds}), so the request was not sent."
-        )
-    })
-}
-
-fn content_matched(
-    bus: &tw_observe::EventBus,
-    id: u64,
-    provider: &str,
-    mode: Mode,
-    hits: &[tw_guard::content::Hit],
-) -> Option<tw_types::Msg> {
-    use tw_guard::content::Action;
-    let worst = tw_guard::content::worst(hits)?;
-    // 规则是拦 + 拦截档 = 拒
-    let refuse = mode.acts() && worst.action == Action::Block;
-    for h in hits {
-        let blocking = h.action == Action::Block;
-        bus.emit(tw_api::Event::ContentMatched {
-            id,
-            provider: provider.to_string(),
-            rule: h.rule.clone(),
-            custom: h.custom,
-            action: if blocking {
-                tw_api::RuleAction::Block
-            } else {
-                tw_api::RuleAction::Record
-            },
-            blocked: refuse && blocking,
-            in_tool_result: h.in_tool_result,
-            excerpt: h.snippet.clone(),
-            at_ms: crate::server::now_ms(),
-        });
-    }
-    // 命中的原文是调用方的正文，**不进应用日志**：日志只说哪条规则
-    tracing::info!(
-        provider,
-        refused = refuse,
-        rules = ?hits.iter().map(|h| h.rule.as_str()).collect::<Vec<_>>(),
-        "the request matched content rules"
-    );
-    refuse.then(|| {
-        tw_types::msg!(
-            "gw.content.refused",
-            rule = worst.rule.clone(), name = worst.name.clone(), excerpt = worst.snippet.clone() =>
-            "Content rule “{name}” matched this request (“{excerpt}”), so it was not sent."
-        )
-    })
-}
-
-/// 回答超过了输出长度：报一条，拦截档下给出切断时告诉客户端的那句话。
+/// [`screen_text`] 的结论本身，不发事件：只用码位规则查整段原文，认得 JSON 的 `\uXXXX`
+/// 写法（见 [`tw_guard::content::screen_text`]）。删过之后的文字在 [`Screening::body`] 里。
 ///
-/// `whole`：整包（整份没发）还是流（从那一帧起没发）—— 两句话。
-pub fn output_limited(
-    bus: &tw_observe::EventBus,
-    id: u64,
-    provider: &str,
-    mode: Mode,
-    max: usize,
-    seen: usize,
-    whole: bool,
-) -> Option<tw_types::Msg> {
-    let cut = mode.acts();
-    tracing::warn!(
-        provider,
-        max,
-        seen,
-        cut,
-        "the answer passed the output limit"
-    );
-    bus.emit(tw_api::Event::OutputLimited {
-        id,
-        provider: provider.to_string(),
-        max_chars: max as u64,
-        seen_chars: seen as u64,
-        cut,
-        at_ms: crate::server::now_ms(),
-    });
-    if !cut {
-        return None;
-    }
-    Some(if whole {
-        tw_types::msg!(
-            "gw.output_limit.withheld", upstream = provider.to_string(), max = max, seen = seen =>
-            "The answer from upstream `{upstream}` is {seen} characters, over the output limit of \
-             {max}, so it was withheld."
-        )
-    } else {
-        tw_types::msg!(
-            "gw.output_limit.cut", upstream = provider.to_string(), max = max =>
-            "The answer from upstream `{upstream}` passed the output limit of {max} characters, \
-             so it was cut off."
-        )
-    })
+/// 关键词和正则按整段原文查的话，系统提示里的话也会被当成调用方的；看不见的字符在任何
+/// 地方都没有正当用途，整段查没有误伤谁。
+pub fn screen_raw(s: &Screen, text: &str) -> Screening {
+    tw_guard::content::screen_text(s.mode, &s.rules, text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tw_guard::redact::replace::Scheme;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -597,5 +464,94 @@ mod tests {
             &ledger_for(stored.as_bytes()),
         );
         assert_eq!(&out[..], b"<<TW_SECRET_1>> <<TW_SECRET_2>>");
+    }
+
+    /// 内容过滤的几条规则：拒绝一个词、只记录一个词、删掉零宽字符
+    fn filter(mode: Mode) -> Screen {
+        use tw_guard::content::{Action, Match, RuleInput, Rules};
+        let rule = |id, pattern, matching, action| RuleInput {
+            id,
+            name: id,
+            custom: true,
+            pattern,
+            matching,
+            action,
+        };
+        Screen {
+            mode,
+            rules: std::sync::Arc::new(
+                Rules::build([
+                    rule("no plan", "forbidden-plan", Match::Contains, Action::Block),
+                    rule("falcon", "falcon", Match::Contains, Action::Record),
+                    rule("zero width", "U+200B", Match::Codepoints, Action::Strip),
+                ])
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn chat(text: &str) -> Vec<u8> {
+        serde_json::json!({ "messages": [{ "role": "user", "content": text }] })
+            .to_string()
+            .into_bytes()
+    }
+
+    fn rules_hit(sc: &Screening) -> Vec<(&str, tw_guard::content::Outcome)> {
+        sc.hits
+            .iter()
+            .map(|h| (h.hit.rule.as_str(), h.outcome))
+            .collect()
+    }
+
+    /// 插件拿到的那一份里本来就有的命中（嵌入、补全开头不查，原话里可以有拒绝规则的词）
+    /// 不再报、不拒；插件加进来的零宽字符照样删、照样报
+    #[test]
+    fn a_rewritten_request_is_judged_on_what_the_plugin_added() {
+        use tw_guard::content::Outcome;
+        let s = filter(Mode::Enforce);
+        let before = chat("the forbidden-plan, and falcon");
+        let after = chat("the forbidden-plan, and falcon, plus zero\u{200B}width");
+        let sc = rescreen(&s, tw_dialect::ir::Dialect::Chat, &before, &after);
+        assert_eq!(sc.refused, None);
+        assert_eq!(rules_hit(&sc), [("zero width", Outcome::Stripped)]);
+        let sent: serde_json::Value = serde_json::from_slice(sc.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sent["messages"][0]["content"],
+            "the forbidden-plan, and falcon, plus zerowidth"
+        );
+
+        // 插件又写了一处拒绝规则的词：拒，说了算的是那一条
+        let after = chat("the forbidden-plan, and falcon; also forbidden-plan");
+        let sc = rescreen(&s, tw_dialect::ir::Dialect::Chat, &before, &after);
+        assert_eq!(rules_hit(&sc), [("no plan", Outcome::Blocked)]);
+        assert_eq!(sc.refusal().map(|h| h.hit.count), Some(2));
+        assert!(sc.body.is_none());
+
+        // 什么都没加：什么都不报
+        let sc = rescreen(&s, tw_dialect::ir::Dialect::Chat, &before, &before);
+        assert!(sc.hits.is_empty() && sc.refused.is_none() && sc.body.is_none());
+    }
+
+    /// 观察档：插件让一条规则多命中了几处，整条再报（处数是改过之后的），请求原样
+    #[test]
+    fn under_observe_only_more_of_a_rule_is_reported_again() {
+        use tw_guard::content::Outcome;
+        let s = filter(Mode::Observe);
+        let before = chat("falcon");
+        let sc = rescreen(
+            &s,
+            tw_dialect::ir::Dialect::Chat,
+            &before,
+            &chat("falcon falcon forbidden-plan"),
+        );
+        assert_eq!(
+            rules_hit(&sc),
+            [
+                ("no plan", Outcome::Recorded),
+                ("falcon", Outcome::Recorded)
+            ]
+        );
+        assert_eq!(sc.hits[1].hit.count, 2);
+        assert!(sc.refused.is_none() && sc.body.is_none());
     }
 }

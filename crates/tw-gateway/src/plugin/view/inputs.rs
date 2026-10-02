@@ -181,35 +181,53 @@ pub fn build(form: Form, raw: &Value, path: &str) -> Result<Built, String> {
     })
 }
 
-/// 请求防护看的那一份：每项输入是一条用户消息，里面是它读得出的文字。
+/// 每项输入里读得出的文字，按先后：内容过滤查的那一份。
 ///
-/// 嵌入、补全没有中间表示（转换只为生成回答），插件改过之后再看一遍请求防护时
-/// （只看插件加进来的，见 [`crate::guard::screen_more`]）就拿改前、改后各一份比。读不成
+/// 嵌入、补全开头不过内容过滤（只有输入，分不出调用方自己打的字和工具抓回来的，见
+/// [`crate::client_api::ClientApi::screened`]），**插件写进去的字照样要查**：插件改过之后，
+/// 管线拿改前、改后的文字各查一遍，只报插件加进来的（见 `server::pipeline::plug`）。读不成
 /// 视图的是空的
-pub fn screenable(form: Form, raw: &Value, path: &str) -> tw_dialect::ir::Request {
-    use tw_dialect::ir::{Message, Part, Request, Role};
+pub fn texts(form: Form, raw: &Value, path: &str) -> Vec<String> {
     let view = build(form, raw, path)
         .map(|b| b.view)
         .unwrap_or(Value::Null);
-    let messages = view["messages"]
+    view["messages"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|m| Message {
-            role: Role::User,
-            parts: m["parts"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|p| p["type"] == "text")
-                .filter_map(|p| p["text"].as_str())
-                .map(|t| Part::Text(t.to_string()))
-                .collect(),
-        })
-        .collect();
-    Request {
-        messages,
-        ..Default::default()
+        .flat_map(|m| m["parts"].as_array().into_iter().flatten())
+        .filter(|p| p["type"] == "text")
+        .filter_map(|p| p["text"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 按 [`texts`] 的先后逐段改每项输入的文字，改在原文那一项上：内容过滤删过之后写回
+/// （见 `server::pipeline::plug`）。别的字段不动；读不成视图的什么都不做
+pub fn rewrite_texts(form: Form, raw: &mut Value, path: &str, mut f: impl FnMut(&mut String)) {
+    let Ok(built) = build(form, raw, path) else {
+        return;
+    };
+    let super::Src::Inputs(src) = &built.src else {
+        return;
+    };
+    let Some(obj) = raw.as_object_mut() else {
+        return;
+    };
+    for (k, m) in built.view["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (j, p) in m["parts"].as_array().into_iter().flatten().enumerate() {
+            if p["type"] != "text" {
+                continue;
+            }
+            if let Some(Value::String(t)) = slot(obj, src, src.items[k].0, j) {
+                f(t);
+            }
+        }
     }
 }
 
@@ -431,7 +449,23 @@ fn set_text(
     part: usize,
     t: &str,
 ) -> Result<(), EditError> {
-    let slot = match item {
+    match slot(obj, src, item, part) {
+        Some(v @ Value::String(_)) => {
+            *v = json!(t);
+            Ok(())
+        }
+        _ => Err(bad("only the text of an input can change")),
+    }
+}
+
+/// 一项输入的第 `part` 个部分在原文里的那个值（文字的话是那个字符串）
+fn slot<'v>(
+    obj: &'v mut Map<String, Value>,
+    src: &Src,
+    item: Item,
+    part: usize,
+) -> Option<&'v mut Value> {
+    match item {
         Item::Whole => obj.get_mut(src.form.field()),
         Item::At(i) => obj.get_mut(src.form.field()).and_then(|v| v.get_mut(i)),
         Item::Content => obj
@@ -446,12 +480,5 @@ fn set_text(
             .and_then(|c| c.get_mut("parts"))
             .and_then(|p| p.get_mut(part))
             .and_then(|p| p.get_mut("text")),
-    };
-    match slot {
-        Some(v @ Value::String(_)) => {
-            *v = json!(t);
-            Ok(())
-        }
-        _ => Err(bad("only the text of an input can change")),
     }
 }

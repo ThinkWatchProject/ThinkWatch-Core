@@ -3,16 +3,23 @@
 //! # 为什么规则要有自己的接口
 //!
 //! 在此之前规则是看不见的：脱敏规则写死在代码里，界面上只露出五个类别名；
-//! 工具调用规则只能去改 config.yaml。用户能做的只有在「关闭 / 观察 / 拦截」
+//! 工具调用规则只能去改 config.yaml。用户能做的只有在「关闭 / 观察 / 第三档」
 //! 之间选一个，而看不见一条误报是哪条规则报的，就只能把整项关掉 —— 连真有用
 //! 的那部分一起。
 //!
-//! 现在每条规则都列得出来、关得掉，也能写自己的。三件事由这里保证：
+//! 现在每条规则都列得出来、关得掉，也能写自己的。
 //!
-//! - **正则在保存时编译**，写错当场拒绝，而不是加载之后悄悄跳过那一条；
-//! - **内置规则只记改过默认开关的那几条**，没改过的不写进文件；
-//! - **测试和网关用的是同一个引擎、同一套判据**：出站脱敏的测试先把样本
-//!   编成请求体里的样子再找，结论才和真的请求一致。
+//! # 这里只管写文件
+//!
+//! **规则长什么样、出厂是什么、怎么校验、视图和「测试…」怎么算，都在共享层**
+//! （[`tw_guard::policy`]、[`tw_guard::view`]、[`tw_guard::trial`]）：企业版的管理
+//! 接口返回的是同一份 JSON。这里剩下的是桌面版自己的事 —— 把改动写进 config.yaml：
+//!
+//! - **一条规则在保存时就按读配置的那套校验查一遍**，写错当场说清楚，而不是写进去
+//!   之后整份配置加载不了；
+//! - **内置规则只记改过默认开关、默认处置的那几条**，没改过的不写进文件；
+//! - **自定义规则写成配置里那个类型序列化出来的样子**，默认值不写 —— 写进去的就是
+//!   读回来的那一份。
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -20,13 +27,17 @@ use axum::http::StatusCode;
 use serde_yaml_ng::{Mapping, Value};
 use tw_config::edit;
 use tw_config::history::Origin;
-use tw_config::{ContentAction, ContentMatch, SecurityMode, ToolAction};
+use tw_config::{
+    ContentAction, CustomContentRule, CustomRedactRule, CustomToolRule, PolicyError, SecurityMode,
+    ToolAction,
+};
+use tw_guard::trial::TrialError;
 use tw_types::msg;
 use tw_yaml::Step;
 
 use crate::contract::RouterExt;
-use crate::{ApplyError, ControlState, Fail, apply_fail, fail};
-use tw_api::{RuleAction, ep};
+use crate::{ApplyError, ControlState, Fail, apply_fail, fail, internal};
+use tw_api::{Guard, RuleAction, ep};
 
 pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
@@ -35,324 +46,91 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::SetSecurityMode, set_mode)
         .at(ep::ToggleBuiltinRule, toggle_builtin)
         .at(ep::SetBuiltinRuleAction, set_builtin_action)
-        .at(ep::SetSecurityLimit, set_limit)
         .at(ep::CreateCustomRule, create_custom)
         .at(ep::UpdateCustomRule, update_custom)
         .at(ep::DeleteCustomRule, delete_custom)
         .at(ep::TestSecurity, test)
 }
 
-/// 哪一项防护：契约里的那个集合。路径里写的就是配置里的那个键。
-use tw_api::Guard;
-
-/// 这一边对每项防护要知道的事。
+/// 这一边对每项防护要知道的事。路径里写的就是配置里的那个键。
 trait GuardExt: Sized {
     fn parse(s: &str) -> Result<Self, Fail>;
-    fn key(self) -> &'static str;
-    fn custom_section(self) -> Result<edit::Section, Fail>;
+    fn custom_section(self) -> edit::Section;
     fn path(self, leaf: &str) -> Vec<Step>;
-    fn default_mode(self) -> SecurityMode;
     fn lists(self, cfg: &tw_config::Config) -> (&[String], &[String]);
+    fn on_by_default(self, id: &str) -> Option<bool>;
 }
 
 impl GuardExt for Guard {
     fn parse(s: &str) -> Result<Self, Fail> {
-        match Guard::from_slug(s) {
-            Some(g) => Ok(g),
-            None => Err(fail(
+        Guard::from_slug(s).ok_or_else(|| {
+            fail(
                 StatusCode::NOT_FOUND,
                 msg!(
-                    "security.guard_unknown", guard = s =>
-                    "`{guard}` is not a line of defence; it is redact, inspect_tools, hidden_text, \
-                     content or output_limit."
+                    "security.unknown_guard", guard = s =>
+                    "`{guard}` is not a line of defence; it is redact, inspect_tools or content."
                 ),
-            )),
-        }
+            )
+        })
     }
-    fn key(self) -> &'static str {
-        self.slug()
-    }
-    /// 自定义规则那一节。**只有这三项有自定义规则**
-    fn custom_section(self) -> Result<edit::Section, Fail> {
+    /// 自定义规则那一节
+    fn custom_section(self) -> edit::Section {
         match self {
-            Guard::Redact => Ok(edit::Section {
+            Guard::Redact => edit::Section {
                 path: &["security", "redact", "custom"],
                 what: "redaction rule",
                 key: "name",
                 multiline: &[],
-            }),
-            Guard::InspectTools => Ok(edit::Section {
+            },
+            Guard::InspectTools => edit::Section {
                 path: &["security", "inspect_tools", "custom"],
                 what: "tool-call rule",
                 key: "name",
                 multiline: &[],
-            }),
-            Guard::Content => Ok(edit::Section {
+            },
+            Guard::Content => edit::Section {
                 path: &["security", "content", "custom"],
                 what: "content rule",
                 key: "name",
                 multiline: &[],
-            }),
-            Guard::HiddenText | Guard::OutputLimit => Err(fail(
-                StatusCode::BAD_REQUEST,
-                msg!(
-                    "security.no_custom_rules", guard = self.key() =>
-                    "`{guard}` has no custom rules."
-                ),
-            )),
+            },
         }
     }
     fn path(self, leaf: &str) -> Vec<Step> {
         vec![
             Step::key("security"),
-            Step::key(self.key()),
+            Step::key(self.slug()),
             Step::key(leaf),
         ]
     }
-    /// 出厂的档位：输出长度出厂是关的，其余是观察
-    fn default_mode(self) -> SecurityMode {
-        match self {
-            Guard::OutputLimit => SecurityMode::Off,
-            _ => SecurityMode::default(),
-        }
-    }
-    /// 配置里这一项的启停名单：`(enable, disable)`。藏匿字符只有 `disable`
+    /// 配置里这一项的启停名单：`(enable, disable)`
     fn lists(self, cfg: &tw_config::Config) -> (&[String], &[String]) {
         let s = &cfg.security;
         match self {
             Guard::Redact => (&s.redact.enable, &s.redact.disable),
             Guard::InspectTools => (&s.inspect_tools.enable, &s.inspect_tools.disable),
             Guard::Content => (&s.content.enable, &s.content.disable),
-            Guard::HiddenText => (&[], &s.hidden_text.disable),
-            Guard::OutputLimit => (&[], &[]),
         }
     }
-}
-
-/// 工具调用审查的动作在契约里的样子。
-fn tool_action(a: ToolAction) -> RuleAction {
-    match a {
-        ToolAction::Cut => RuleAction::Cut,
-        ToolAction::Record => RuleAction::Record,
-    }
-}
-
-/// 内容过滤的动作在契约里的样子。
-fn content_action(a: ContentAction) -> RuleAction {
-    match a {
-        ContentAction::Block => RuleAction::Block,
-        ContentAction::Record => RuleAction::Record,
+    /// 这条内置规则出厂时开不开。不是这一项的内置规则是 `None`
+    fn on_by_default(self, id: &str) -> Option<bool> {
+        match self {
+            Guard::Redact => tw_guard::redact::rules::builtin(id).map(|b| b.on_by_default),
+            // 危险命令一组出厂全开
+            Guard::InspectTools => tw_guard::tools::rules::builtin()
+                .dangerous
+                .iter()
+                .any(|r| r.id == id)
+                .then_some(true),
+            Guard::Content => tw_guard::content::builtin(id).map(|b| b.on_by_default),
+        }
     }
 }
 
 // ---------------------------------------------------------------- 读
 
 async fn detail(State(s): State<ControlState>) -> Json<tw_api::SecurityDetail> {
-    Json(view(&s.config()))
-}
-
-pub fn view(cfg: &tw_config::Config) -> tw_api::SecurityDetail {
-    let o = &cfg.security.output_limit;
-    tw_api::SecurityDetail {
-        redact: redact_view(&cfg.security.redact),
-        inspect_tools: tools_view(&cfg.security.inspect_tools),
-        hidden_text: hidden_view(&cfg.security.hidden_text),
-        content: content_view(&cfg.security.content),
-        output_limit: tw_api::OutputLimitDetail {
-            mode: o.mode.into(),
-            max_chars: o.max_chars as u64,
-            default_max_chars: tw_config::DEFAULT_MAX_CHARS as u64,
-            ceiling: tw_config::MAX_CHARS_CEILING as u64,
-        },
-    }
-}
-
-fn hidden_view(p: &tw_config::HiddenPolicy) -> tw_api::GuardDetail {
-    tw_api::GuardDetail {
-        mode: p.mode.into(),
-        rules: tw_guard::hidden::SMUGGLING
-            .iter()
-            .map(|k| tw_api::SecurityRuleView {
-                id: k.slug().to_string(),
-                custom: false,
-                name: k.slug().to_string(),
-                why: k.why().to_string(),
-                kind: "invisible".into(),
-                matcher: tw_api::Matcher::Codepoints {
-                    ranges: k.ranges().iter().map(|r| r.to_string()).collect(),
-                },
-                enabled: !p.disable.iter().any(|d| d == k.slug()),
-                on_by_default: true,
-                action: None,
-                default_action: None,
-            })
-            .collect(),
-    }
-}
-
-fn content_matcher(matching: tw_guard::content::Match, pattern: &str) -> tw_api::Matcher {
-    match matching {
-        tw_guard::content::Match::Contains => tw_api::Matcher::Contains {
-            text: pattern.to_string(),
-        },
-        tw_guard::content::Match::Regex => tw_api::Matcher::Regex {
-            pattern: pattern.to_string(),
-        },
-    }
-}
-
-fn content_view(p: &tw_config::ContentPolicy) -> tw_api::GuardDetail {
-    let mut rules: Vec<tw_api::SecurityRuleView> = tw_guard::content::builtins()
-        .iter()
-        .map(|b| tw_api::SecurityRuleView {
-            id: b.id.clone(),
-            custom: false,
-            name: b.name.clone(),
-            why: String::new(),
-            kind: b.group.clone(),
-            matcher: content_matcher(b.matching, &b.pattern),
-            enabled: p.builtin_on(b),
-            on_by_default: b.on_by_default,
-            action: Some(content_action(p.builtin_action(b))),
-            default_action: Some(content_action(ContentAction::factory(b))),
-        })
-        .collect();
-    rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
-        id: c.name.clone(),
-        custom: true,
-        name: c.name.clone(),
-        why: String::new(),
-        kind: "custom".into(),
-        matcher: content_matcher(c.matching.engine(), &c.pattern),
-        enabled: !c.disabled,
-        on_by_default: true,
-        action: Some(content_action(c.action)),
-        default_action: None,
-    }));
-    tw_api::GuardDetail {
-        mode: p.mode.into(),
-        rules,
-    }
-}
-
-fn matcher(m: &tw_guard::redact::rules::Matcher) -> tw_api::Matcher {
-    use tw_guard::redact::rules::Matcher as M;
-    match *m {
-        M::Prefix { prefix, min_tail } => tw_api::Matcher::Prefix {
-            prefix: prefix.to_string(),
-            min_tail,
-        },
-        M::OpenaiLegacy { min_len } => tw_api::Matcher::OpenaiLegacy { min_len },
-        M::Pem => tw_api::Matcher::Pem,
-        M::Jwt => tw_api::Matcher::Jwt,
-        M::ConnString => tw_api::Matcher::ConnString,
-        M::PrivateIp => tw_api::Matcher::PrivateIp,
-        M::DomainSuffix { suffixes } => tw_api::Matcher::DomainSuffix {
-            suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
-        },
-        M::CnResidentId { born_since } => tw_api::Matcher::CnResidentId { born_since },
-        M::BankCard { networks } => tw_api::Matcher::BankCard {
-            networks: networks
-                .iter()
-                .map(|n| tw_api::CardNetwork {
-                    name: n.name.to_string(),
-                    prefixes: n
-                        .prefixes
-                        .iter()
-                        .map(|&(from, to)| tw_api::CardPrefix { from, to })
-                        .collect(),
-                    lengths: n.lengths.to_vec(),
-                })
-                .collect(),
-        },
-    }
-}
-
-fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
-    let mut rules: Vec<tw_api::SecurityRuleView> = tw_guard::redact::rules::BUILTINS
-        .iter()
-        .map(|b| {
-            let on = if b.on_by_default {
-                !p.disable.iter().any(|x| x == b.id)
-            } else {
-                p.enable.iter().any(|x| x == b.id)
-            };
-            tw_api::SecurityRuleView {
-                id: b.id.to_string(),
-                custom: false,
-                name: b.name.to_string(),
-                why: String::new(),
-                kind: b.kind.slug().to_string(),
-                matcher: matcher(&b.matcher),
-                enabled: on,
-                on_by_default: b.on_by_default,
-                action: None,
-                default_action: None,
-            }
-        })
-        .collect();
-    rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
-        id: c.name.clone(),
-        custom: true,
-        name: c.name.clone(),
-        why: String::new(),
-        kind: "custom".into(),
-        matcher: tw_api::Matcher::Regex {
-            pattern: c.pattern.clone(),
-        },
-        enabled: !c.disabled,
-        on_by_default: true,
-        action: None,
-        default_action: None,
-    }));
-    tw_api::GuardDetail {
-        mode: p.mode.into(),
-        rules,
-    }
-}
-
-fn tools_view(p: &tw_config::ToolPolicy) -> tw_api::GuardDetail {
-    let builtin = &tw_guard::tools::rules::builtin().dangerous;
-    let mut rules: Vec<tw_api::SecurityRuleView> = builtin
-        .iter()
-        .map(|r| tw_api::SecurityRuleView {
-            id: r.id.clone(),
-            custom: false,
-            name: r.name.clone(),
-            why: r.why.clone(),
-            kind: "command".into(),
-            matcher: tw_api::Matcher::Regex {
-                pattern: r.pattern.clone(),
-            },
-            enabled: !p.disable.contains(&r.id),
-            on_by_default: true,
-            action: Some(tool_action(
-                p.actions
-                    .get(&r.id)
-                    .copied()
-                    .unwrap_or_else(|| tw_config::ToolAction::factory(r)),
-            )),
-            default_action: Some(tool_action(tw_config::ToolAction::factory(r))),
-        })
-        .collect();
-    rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
-        id: c.name.clone(),
-        custom: true,
-        name: c.name.clone(),
-        why: String::new(),
-        kind: "custom".into(),
-        matcher: tw_api::Matcher::Regex {
-            pattern: c.pattern.clone(),
-        },
-        enabled: !c.disabled,
-        on_by_default: true,
-        action: Some(tool_action(c.action)),
-        default_action: None,
-    }));
-    tw_api::GuardDetail {
-        mode: p.mode.into(),
-        rules,
-    }
+    Json(tw_guard::view::detail(&s.config().security))
 }
 
 /// 一页最多多少条。
@@ -388,12 +166,12 @@ async fn set_mode(
     Json(req): Json<tw_api::ModeSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
-    let mode = SecurityMode::from(req.mode);
+    let mode: SecurityMode = req.mode;
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
             // **默认值不写进文件**：退回出厂的档位就是把这一行删掉
-            let value = (mode != guard.default_mode()).then(|| Value::from(mode.slug()));
+            let value = (mode != SecurityMode::default()).then(|| Value::from(mode.slug()));
             Ok(edit::set(text, &guard.path("mode"), value.as_ref())?)
         })
         .await
@@ -414,21 +192,7 @@ async fn toggle_builtin(
     Json(req): Json<tw_api::RuleToggle>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
-    let on_by_default = match guard {
-        Guard::Redact => tw_guard::redact::rules::builtin(&id).map(|b| b.on_by_default),
-        Guard::InspectTools => tw_guard::tools::rules::builtin()
-            .dangerous
-            .iter()
-            .any(|r| r.id == id)
-            .then_some(true),
-        Guard::Content => tw_guard::content::builtin(&id).map(|b| b.on_by_default),
-        Guard::HiddenText => tw_guard::hidden::SMUGGLING
-            .iter()
-            .any(|k| k.slug() == id)
-            .then_some(true),
-        Guard::OutputLimit => None,
-    }
-    .ok_or_else(|| unknown_rule(&id))?;
+    let on_by_default = guard.on_by_default(&id).ok_or_else(|| unknown_rule(&id))?;
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
@@ -453,21 +217,50 @@ async fn toggle_builtin(
 }
 
 /// 契约里的规则动作，工具调用审查认的那两个。
-fn action_of(a: RuleAction) -> Result<ToolAction, Fail> {
-    ToolAction::from_slug(a.slug()).ok_or_else(|| {
-        fail(
-            StatusCode::BAD_REQUEST,
-            msg!(
-                "security.unknown_action", action = a.slug() =>
-                "`{action}` is not an action; it is cut or record."
-            ),
-        )
-    })
+fn tool_action_of(a: RuleAction) -> Result<ToolAction, Fail> {
+    a.tool().ok_or_else(|| not_a_tool_action(a))
 }
 
-/// 改一条内置规则在拦截档下做什么。
+fn not_a_tool_action(a: RuleAction) -> Fail {
+    fail(
+        StatusCode::BAD_REQUEST,
+        msg!(
+            "security.unknown_action", action = a.slug() =>
+            "`{action}` is not an action; it is cut or record."
+        ),
+    )
+}
+
+/// 契约里的规则动作，内容过滤认的那三个。
+fn content_action_of(a: RuleAction) -> Result<ContentAction, Fail> {
+    a.content().ok_or_else(|| not_a_content_action(a))
+}
+
+fn not_a_content_action(a: RuleAction) -> Fail {
+    fail(
+        StatusCode::BAD_REQUEST,
+        msg!(
+            "security.content_action_unknown", action = a.slug() =>
+            "`{action}` is not an action; it is block, strip or record."
+        ),
+    )
+}
+
+/// 出站脱敏的规则命中就替换，没有处置可言。
+fn no_action_of_its_own(guard: Guard) -> Fail {
+    fail(
+        StatusCode::BAD_REQUEST,
+        msg!(
+            "security.no_action_of_its_own", guard = guard.slug() =>
+            "The rules of `{guard}` have no action of their own; the mode decides what \
+             happens to a match."
+        ),
+    )
+}
+
+/// 改一条内置规则在第三档下做什么。
 ///
-/// **内置规则提供的只是一条正则。**命中之后切不切，和自定义规则一样由用户
+/// **内置规则提供的只是一条判据。**命中之后怎么处置，和自定义规则一样由用户
 /// 定 —— 不必为了改处置先复制成一条自定义规则。和出厂一样的就把那一行删掉。
 async fn set_builtin_action(
     State(s): State<ControlState>,
@@ -484,8 +277,8 @@ async fn set_builtin_action(
                 .find(|r| r.id == id)
                 .ok_or_else(|| unknown_rule(&id))?;
             (
-                action_of(req.action)?.slug(),
-                tw_config::ToolAction::factory(spec).slug(),
+                tool_action_of(req.action)?.slug(),
+                ToolAction::factory(spec).slug(),
             )
         }
         Guard::Content => {
@@ -495,23 +288,14 @@ async fn set_builtin_action(
                 ContentAction::factory(b).slug(),
             )
         }
-        Guard::Redact | Guard::HiddenText | Guard::OutputLimit => {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                msg!(
-                    "security.no_action_of_its_own", guard = guard.key() =>
-                    "The rules of `{guard}` have no action of their own; the mode decides what \
-                     happens to a match."
-                ),
-            ));
-        }
+        Guard::Redact => return Err(no_action_of_its_own(guard)),
     };
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
             let path = [
                 Step::key("security"),
-                Step::key(guard.key()),
+                Step::key(guard.slug()),
                 Step::key("actions"),
                 Step::key(id.as_str()),
             ];
@@ -523,128 +307,124 @@ async fn set_builtin_action(
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-/// 契约里的规则动作，内容过滤认的那两个。
-fn content_action_of(a: RuleAction) -> Result<ContentAction, Fail> {
-    ContentAction::from_slug(a.slug()).ok_or_else(|| {
-        fail(
-            StatusCode::BAD_REQUEST,
-            msg!(
-                "security.unknown_content_action", action = a.slug() =>
-                "`{action}` is not an action; it is block or record."
-            ),
-        )
-    })
-}
-
-/// 改输出长度的上限。和出厂一样就把那一行删掉。
-async fn set_limit(
-    State(s): State<ControlState>,
-    Path(guard): Path<String>,
-    Json(req): Json<tw_api::LimitSave>,
-) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let guard = Guard::parse(&guard)?;
-    if guard != Guard::OutputLimit {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            msg!(
-                "security.no_limit", guard = guard.key() =>
-                "`{guard}` has no limit; only output_limit does."
-            ),
-        ));
+/// 一条规则序列化成配置里的样子：一个映射，默认值不写。
+fn item<T: serde::Serialize>(rule: &T) -> Result<Mapping, Fail> {
+    match serde_yaml_ng::to_value(rule) {
+        Ok(Value::Mapping(m)) => Ok(m),
+        Ok(other) => Err(internal(format!("a rule became {other:?}, not a mapping"))),
+        Err(e) => Err(internal(e)),
     }
-    let max = req.max_chars as usize;
-    if max == 0 || max > tw_config::MAX_CHARS_CEILING {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            msg!(
-                "security.limit_range", max = req.max_chars, ceiling = tw_config::MAX_CHARS_CEILING =>
-                "The output limit is {max}; it has to be between 1 and {ceiling} characters."
-            ),
-        ));
-    }
-    let version = s
-        .cfg
-        .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            let value = (max != tw_config::DEFAULT_MAX_CHARS).then(|| Value::from(max as u64));
-            Ok(edit::set(text, &guard.path("max_chars"), value.as_ref())?)
-        })
-        .await
-        .map_err(apply_fail)?;
-    Ok(Json(tw_api::ConfigWritten { version }))
 }
 
 /// 检查一条自定义规则，写成配置里的样子。
+///
+/// **和读配置用的是同一套校验**（[`tw_config::Security::check`]）：先把这一条放进一份
+/// 只有它的策略里查一遍，过了才写。名字重不重复由写文件那一步说（它看得见别的规则）。
 fn custom_item(guard: Guard, req: &tw_api::CustomRuleSave) -> Result<Mapping, Fail> {
-    let name = req.name.trim();
-    if name.is_empty() {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            msg!("security.rule_name_empty" => "A rule needs a name."),
-        ));
-    }
-    let mut m = Mapping::new();
-    m.insert("name".into(), name.into());
-    m.insert("pattern".into(), req.pattern.as_str().into());
-    if guard == Guard::Content {
-        let matching = req.matching.map(ContentMatch::from).unwrap_or_default();
-        let action = match req.action {
-            None => ContentAction::default(),
-            Some(a) => content_action_of(a)?,
-        };
-        // **和数据面同一种编法**：不分大小写、编译后的大小有上限
-        tw_guard::content::Rule::new(tw_guard::content::RuleInput {
-            id: name,
-            name,
-            custom: true,
-            pattern: &req.pattern,
-            matching: matching.engine(),
-            action: tw_guard::content::Action::Warn,
-        })
-        .map_err(|e| {
-            fail(
-                StatusCode::BAD_REQUEST,
-                msg!(
-                    "security.bad_content_pattern", detail = e.detail =>
-                    "The pattern cannot be used: {detail}"
-                ),
-            )
-        })?;
-        if matching != ContentMatch::default() {
-            m.insert("match".into(), matching.slug().into());
+    let name = req.name.trim().to_string();
+    let pattern = req.pattern.clone();
+    let disabled = !req.enabled;
+    let mut one = tw_config::Security::default();
+    let m = match guard {
+        Guard::Redact => {
+            let rule = CustomRedactRule {
+                name,
+                pattern,
+                // 出厂的标签和没写一样，不写进文件
+                label: req
+                    .label
+                    .clone()
+                    .filter(|l| l != tw_guard::policy::DEFAULT_LABEL),
+                disabled,
+            };
+            let m = item(&rule)?;
+            one.redact.custom.push(rule);
+            m
         }
-        if action != ContentAction::default() {
-            m.insert("action".into(), action.slug().into());
+        Guard::InspectTools => {
+            let rule = CustomToolRule {
+                name,
+                pattern,
+                action: req
+                    .action
+                    .map(tool_action_of)
+                    .transpose()?
+                    .unwrap_or_default(),
+                disabled,
+            };
+            let m = item(&rule)?;
+            one.inspect_tools.custom.push(rule);
+            m
         }
-        if !req.enabled {
-            m.insert("disabled".into(), true.into());
+        Guard::Content => {
+            let rule = CustomContentRule {
+                name,
+                pattern,
+                matching: req.matching.unwrap_or_default(),
+                action: req
+                    .action
+                    .map(content_action_of)
+                    .transpose()?
+                    .unwrap_or_default(),
+                disabled,
+            };
+            let m = item(&rule)?;
+            one.content.custom.push(rule);
+            m
         }
-        return Ok(m);
-    }
-    // **正则在保存时编译**，写错当场说清楚，不等加载时再跳过
-    tw_guard::redact::rules::compile(name, &req.pattern).map_err(bad_pattern)?;
-    if guard == Guard::InspectTools {
-        let action = match req.action {
-            None => ToolAction::default(),
-            Some(a) => action_of(a)?,
-        };
-        // 默认值不写进文件
-        if action != ToolAction::default() {
-            m.insert("action".into(), action.slug().into());
-        }
-    }
-    if !req.enabled {
-        m.insert("disabled".into(), true.into());
-    }
+    };
+    one.check().map_err(rule_fail)?;
     Ok(m)
 }
 
-fn bad_pattern(e: tw_guard::redact::rules::BadPattern) -> Fail {
-    fail(
-        StatusCode::BAD_REQUEST,
-        msg!(
-            "security.bad_pattern", detail = e.detail =>
+/// 一条自定义规则过不了校验。
+fn rule_fail(e: PolicyError) -> Fail {
+    let m = match e {
+        PolicyError::EmptyName { .. } => {
+            msg!("security.rule_name_empty" => "A rule needs a name.")
+        }
+        PolicyError::EmptyPattern { .. } => pattern_empty(),
+        PolicyError::BadPattern { guard, detail, .. } => bad_pattern(guard, detail),
+        PolicyError::BadCodepoints { reason, .. } => bad_codepoints(reason),
+        PolicyError::BadLabel { label, .. } => bad_label(label),
+        // 只有一条规则的策略里不会有：名字重复由写文件那一步说，内置规则的 id 不在这里写
+        e @ (PolicyError::DuplicateName { .. } | PolicyError::UnknownRule { .. }) => {
+            tw_config::policy_msg(&e)
+        }
+    };
+    fail(StatusCode::BAD_REQUEST, m)
+}
+
+fn pattern_empty() -> tw_types::Msg {
+    msg!("security.pattern_empty" => "The pattern is empty.")
+}
+
+/// 内容过滤的判据不只是正则（还有码位、编出来的大小上限），说法各用各的码
+fn bad_pattern(guard: Guard, detail: String) -> tw_types::Msg {
+    match guard {
+        Guard::Content => msg!(
+            "security.bad_content_pattern", detail = detail =>
+            "The pattern cannot be used: {detail}"
+        ),
+        Guard::Redact | Guard::InspectTools => msg!(
+            "security.bad_pattern", detail = detail =>
             "The pattern is not a valid regular expression: {detail}"
         ),
+    }
+}
+
+fn bad_codepoints(reason: tw_guard::content::CodepointError) -> tw_types::Msg {
+    msg!(
+        "security.bad_codepoints", detail = reason.to_string() =>
+        "The code points are not written right: {detail}"
+    )
+}
+
+fn bad_label(label: String) -> tw_types::Msg {
+    msg!(
+        "security.bad_label", label = label =>
+        "The placeholder name `{label}` has to be 1 to 24 capital letters, digits and \
+         underscores, starting with a letter."
     )
 }
 
@@ -654,12 +434,11 @@ async fn create_custom(
     Json(req): Json<tw_api::CustomRuleSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
-    let section = guard.custom_section()?;
     let item = custom_item(guard, &req)?;
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            Ok(edit::upsert(text, section, None, &item)?)
+            Ok(edit::upsert(text, guard.custom_section(), None, &item)?)
         })
         .await
         .map_err(apply_fail)?;
@@ -672,12 +451,16 @@ async fn update_custom(
     Json(req): Json<tw_api::CustomRuleSave>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
-    let section = guard.custom_section()?;
     let item = custom_item(guard, &req)?;
     let version = s
         .cfg
         .transform(req.base_version.as_deref(), Origin::Ui, |text, _| {
-            Ok(edit::upsert(text, section, Some(&name), &item)?)
+            Ok(edit::upsert(
+                text,
+                guard.custom_section(),
+                Some(&name),
+                &item,
+            )?)
         })
         .await
         .map_err(apply_fail)?;
@@ -689,7 +472,7 @@ async fn delete_custom(
     Path((guard, name)): Path<(String, String)>,
     Query(q): Query<tw_api::BaseVersion>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let section = Guard::parse(&guard)?.custom_section()?;
+    let section = Guard::parse(&guard)?.custom_section();
     let version = s
         .cfg
         .transform(q.base_version.as_deref(), Origin::Ui, |text, _| {
@@ -702,14 +485,6 @@ async fn delete_custom(
 
 // ---------------------------------------------------------------- 测试
 
-/// 一个字节下标换成 UTF-16 码元下标。界面是 JavaScript，按它的下标切。
-fn utf16_at(text: &str, byte: usize) -> usize {
-    text[..byte].encode_utf16().count()
-}
-
-/// 名字给「只试这一条」用。**不会写进任何地方。**
-const TRIAL: &str = "trial";
-
 fn unknown_rule(id: &str) -> Fail {
     fail(
         StatusCode::NOT_FOUND,
@@ -720,289 +495,262 @@ fn unknown_rule(id: &str) -> Fail {
     )
 }
 
+/// 「测试…」。怎么算全在共享层（[`tw_guard::trial`]）：按配置里现在这一份策略试，
+/// 和网关手里那一份是同一份。
 async fn test(
     State(s): State<ControlState>,
     Path(guard): Path<String>,
     Json(req): Json<tw_api::SecurityTestRequest>,
 ) -> Result<Json<tw_api::SecurityTestResult>, Fail> {
     let guard = Guard::parse(&guard)?;
-    // 「按现在启用的规则」用的就是网关手里那一份，不另编一份
-    let rt = s.gateway.runtime();
-    let hits = match guard {
-        Guard::Redact => {
-            let trial;
-            let rules = match (&req.pattern, &req.rule) {
-                (Some(p), _) => {
-                    trial = tw_guard::redact::rules::RuleSet::none()
-                        .with_custom(TRIAL, p)
-                        .map_err(bad_pattern)?;
-                    &trial
-                }
-                (None, Some(id)) => {
-                    let b = tw_guard::redact::rules::builtin(id).ok_or_else(|| unknown_rule(id))?;
-                    trial = tw_guard::redact::rules::RuleSet::only(&[b.id]);
-                    &trial
-                }
-                (None, None) => rt.redact.as_ref(),
+    tw_guard::trial::run(guard, &s.config().security, &req)
+        .map(Json)
+        .map_err(|e| trial_fail(guard, e))
+}
+
+/// 试不了。码和保存一条规则时报的是同一组
+fn trial_fail(guard: Guard, e: TrialError) -> Fail {
+    let m = match e {
+        TrialError::UnknownRule { id, .. } => return unknown_rule(&id),
+        TrialError::BadAction { guard, action } => {
+            return match guard {
+                Guard::InspectTools => not_a_tool_action(action),
+                Guard::Content => not_a_content_action(action),
+                Guard::Redact => no_action_of_its_own(guard),
             };
-            // **按它在请求体里的样子找**，结论才和真的请求一致
-            tw_guard::redact::rules::scan_plain(&req.sample, rules)
-                .into_iter()
-                .map(|h| {
-                    let value = &req.sample[h.bytes.clone()];
-                    tw_api::SecurityTestHit {
-                        excerpt: tw_guard::redact::rules::masked(&h.rule, value),
-                        start: utf16_at(&req.sample, h.bytes.start),
-                        end: utf16_at(&req.sample, h.bytes.end),
-                        rule: h.rule.id().to_string(),
-                        custom: h.rule.custom(),
-                        action: None,
-                    }
-                })
-                .collect()
         }
-        Guard::InspectTools => {
-            let trial;
-            let rules = match (&req.pattern, &req.rule) {
-                (Some(p), _) => {
-                    // 只要正则引擎那半句：规则名是这里临时起的，说出来只会让人困惑
-                    trial = tw_guard::tools::rules::single(TRIAL, p, true).map_err(
-                        |tw_guard::tools::rules::RuleError::BadPattern { detail, .. }| {
-                            fail(
-                                StatusCode::BAD_REQUEST,
-                                msg!(
-                                    "security.bad_pattern", detail = detail =>
-                                    "The pattern is not a valid regular expression: {detail}"
-                                ),
-                            )
-                        },
-                    )?;
-                    &trial
-                }
-                (None, Some(id)) => {
-                    trial = s
-                        .config()
-                        .security
-                        .inspect_tools
-                        .one_builtin(id)
-                        .ok_or_else(|| unknown_rule(id))?;
-                    &trial
-                }
-                (None, None) => rt.tools.as_ref(),
-            };
-            // 和网关一样：**每条规则只报第一处**
-            let mut out: Vec<tw_api::SecurityTestHit> = rules
-                .rules
-                .iter()
-                .filter_map(|r| {
-                    let m = r.re.find(&req.sample)?;
-                    Some(tw_api::SecurityTestHit {
-                        rule: r.id.clone(),
-                        custom: r.custom,
-                        start: utf16_at(&req.sample, m.start()),
-                        end: utf16_at(&req.sample, m.end()),
-                        excerpt: m.as_str().chars().take(120).collect(),
-                        action: Some(if r.high {
-                            RuleAction::Cut
-                        } else {
-                            RuleAction::Record
-                        }),
-                    })
-                })
-                .collect();
-            out.sort_by_key(|h| h.start);
-            out
-        }
-        Guard::Content => {
-            let cfg = s.config();
-            let trial;
-            let rules = match (&req.pattern, &req.rule) {
-                (Some(p), _) => {
-                    let matching = req.matching.map(ContentMatch::from).unwrap_or_default();
-                    trial = tw_guard::content::Rules::build([tw_guard::content::RuleInput {
-                        id: TRIAL,
-                        name: TRIAL,
-                        custom: true,
-                        pattern: p,
-                        matching: matching.engine(),
-                        action: tw_guard::content::Action::Warn,
-                    }])
-                    .map_err(|e| {
-                        fail(
-                            StatusCode::BAD_REQUEST,
-                            msg!(
-                                "security.bad_content_pattern", detail = e.detail =>
-                                "The pattern cannot be used: {detail}"
-                            ),
-                        )
-                    })?;
-                    &trial
-                }
-                (None, Some(id)) => {
-                    trial = cfg
-                        .security
-                        .content
-                        .one_builtin(id)
-                        .ok_or_else(|| unknown_rule(id))?;
-                    &trial
-                }
-                (None, None) => rt.content.as_ref(),
-            };
-            rules
-                .scan_text(&req.sample)
-                .into_iter()
-                .map(|h| tw_api::SecurityTestHit {
-                    start: utf16_at(&req.sample, h.bytes.start),
-                    end: utf16_at(&req.sample, h.bytes.end),
-                    excerpt: req.sample[h.bytes.clone()].chars().take(120).collect(),
-                    action: Some(if h.action == tw_guard::content::Action::Block {
-                        RuleAction::Block
-                    } else {
-                        RuleAction::Record
-                    }),
-                    rule: h.rule,
-                    custom: h.custom,
-                })
-                .collect()
-        }
-        Guard::HiddenText => {
-            // 给了 `rule` 就只试那一种（关着的也能试），不给按现在开着的
-            let kinds = match &req.rule {
-                Some(id) => vec![
-                    tw_guard::hidden::Kind::from_slug(id)
-                        .filter(|k| tw_guard::hidden::SMUGGLING.contains(k))
-                        .ok_or_else(|| unknown_rule(id))?,
-                ],
-                None => rt.hidden.clone(),
-            };
-            // 一个字符一处：界面要把每一个都标出来
-            req.sample
-                .char_indices()
-                .filter_map(|(i, c)| {
-                    let mut found = Vec::new();
-                    tw_guard::hidden::scan_smuggled(
-                        &req.sample[i..i + c.len_utf8()],
-                        false,
-                        &kinds,
-                        &mut found,
-                    );
-                    let f = found.pop()?;
-                    Some(tw_api::SecurityTestHit {
-                        rule: f.kind.slug().to_string(),
-                        custom: false,
-                        start: utf16_at(&req.sample, i),
-                        end: utf16_at(&req.sample, i + c.len_utf8()),
-                        excerpt: f.example,
-                        action: None,
-                    })
-                })
-                .collect()
-        }
-        Guard::OutputLimit => {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                msg!(
-                    "security.nothing_to_test" =>
-                    "The output limit has no rules to try a sample against."
-                ),
-            ));
-        }
+        // 配置读进来时校验过，到这里还编不起来是绕过校验写进去的：那是这边的问题
+        TrialError::Policy(e) => return internal(e),
+        TrialError::EmptyPattern => pattern_empty(),
+        TrialError::BadPattern { detail } => bad_pattern(guard, detail),
+        TrialError::BadCodepoints { reason } => bad_codepoints(reason),
+        TrialError::BadLabel { label } => bad_label(label),
     };
-    Ok(Json(tw_api::SecurityTestResult { hits }))
+    fail(StatusCode::BAD_REQUEST, m)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn utf16_offsets_count_what_javascript_counts() {
-        // 中文一个字一个码元，emoji 两个 —— 按字节算的话界面标错位置
-        let t = "中文🙂sk";
-        assert_eq!(utf16_at(t, t.find("sk").unwrap()), 4);
+    fn save(name: &str, pattern: &str) -> tw_api::CustomRuleSave {
+        tw_api::CustomRuleSave {
+            name: name.into(),
+            pattern: pattern.into(),
+            action: None,
+            matching: None,
+            label: None,
+            enabled: true,
+            base_version: None,
+        }
     }
 
+    fn yaml(m: &Mapping) -> String {
+        serde_yaml_ng::to_string(m).unwrap()
+    }
+
+    fn code(f: Fail) -> String {
+        f.1.0.code.to_string()
+    }
+
+    /// 写进文件的只有和默认不一样的那几项，写出来的就是配置读回来的那一份
     #[test]
-    fn every_builtin_redaction_rule_is_listed_with_its_default() {
-        let v = redact_view(&Default::default());
-        assert_eq!(v.rules.len(), tw_guard::redact::rules::BUILTINS.len());
-        let ip = v.rules.iter().find(|r| r.id == "internal-ip").unwrap();
-        assert!(!ip.enabled && !ip.on_by_default);
-        let key = v
-            .rules
-            .iter()
-            .find(|r| r.id == "anthropic-api-key")
-            .unwrap();
-        assert!(key.enabled);
+    fn a_custom_rule_is_written_as_the_config_reads_it() {
+        let m = custom_item(Guard::Redact, &save(" 项目代号 ", "Project-[A-Z]+")).unwrap();
+        assert_eq!(yaml(&m), "name: 项目代号\npattern: Project-[A-Z]+\n");
+        // 出厂的标签显式交上来也不写：和没写是同一份
+        let m = custom_item(
+            Guard::Redact,
+            &tw_api::CustomRuleSave {
+                label: Some("SECRET".into()),
+                ..save("a", "x")
+            },
+        )
+        .unwrap();
+        assert!(!yaml(&m).contains("label"), "{}", yaml(&m));
+        let m = custom_item(
+            Guard::Redact,
+            &tw_api::CustomRuleSave {
+                label: Some("PROJECT".into()),
+                enabled: false,
+                ..save("a", "x")
+            },
+        )
+        .unwrap();
         assert_eq!(
-            key.matcher,
-            tw_api::Matcher::Prefix {
-                prefix: "sk-ant-".into(),
-                min_tail: 20
-            }
+            yaml(&m),
+            "name: a\npattern: x\nlabel: PROJECT\ndisabled: true\n"
         );
-        // 两条个人号码的规则出厂就开着，判据带着界面要画的细节
-        let id = v.rules.iter().find(|r| r.id == "cn-resident-id").unwrap();
-        assert!(id.enabled && id.on_by_default);
-        assert_eq!(id.kind, "personal");
+        let m = custom_item(
+            Guard::Content,
+            &tw_api::CustomRuleSave {
+                matching: Some(tw_api::ContentMatch::Codepoints),
+                action: Some(RuleAction::Strip),
+                ..save("零宽", "U+200B–U+200D")
+            },
+        )
+        .unwrap();
         assert_eq!(
-            id.matcher,
-            tw_api::Matcher::CnResidentId { born_since: 1900 }
+            yaml(&m),
+            "name: 零宽\npattern: U+200B–U+200D\nmatch: codepoints\naction: strip\n"
         );
-        let card = v.rules.iter().find(|r| r.id == "bank-card").unwrap();
-        assert!(card.enabled && card.on_by_default);
-        let tw_api::Matcher::BankCard { networks } = &card.matcher else {
-            panic!("{:?}", card.matcher);
+        let back: tw_config::CustomContentRule =
+            serde_yaml_ng::from_value(Value::Mapping(m)).unwrap();
+        assert_eq!(back.action, ContentAction::Strip);
+        let m = custom_item(
+            Guard::InspectTools,
+            &tw_api::CustomRuleSave {
+                action: Some(RuleAction::Cut),
+                ..save("删集群", r"kubectl\s+delete")
+            },
+        )
+        .unwrap();
+        assert!(yaml(&m).contains("action: cut"), "{}", yaml(&m));
+    }
+
+    /// 写错的当场说清楚，每一种一个码
+    #[test]
+    fn a_bad_custom_rule_is_refused_with_its_own_code() {
+        let cases = [
+            (Guard::Redact, save("  ", "x"), "security.rule_name_empty"),
+            (Guard::Redact, save("a", ""), "security.pattern_empty"),
+            (Guard::Content, save("a", "  "), "security.pattern_empty"),
+            (Guard::Redact, save("a", "("), "security.bad_pattern"),
+            (Guard::InspectTools, save("a", "("), "security.bad_pattern"),
+            (
+                Guard::Content,
+                tw_api::CustomRuleSave {
+                    matching: Some(tw_api::ContentMatch::Regex),
+                    ..save("a", "(")
+                },
+                "security.bad_content_pattern",
+            ),
+            (
+                Guard::Content,
+                tw_api::CustomRuleSave {
+                    matching: Some(tw_api::ContentMatch::Codepoints),
+                    ..save("a", "U+GG")
+                },
+                "security.bad_codepoints",
+            ),
+            (
+                Guard::Redact,
+                tw_api::CustomRuleSave {
+                    label: Some("project".into()),
+                    ..save("a", "x")
+                },
+                "security.bad_label",
+            ),
+            (
+                Guard::InspectTools,
+                tw_api::CustomRuleSave {
+                    action: Some(RuleAction::Strip),
+                    ..save("a", "x")
+                },
+                "security.unknown_action",
+            ),
+            (
+                Guard::Content,
+                tw_api::CustomRuleSave {
+                    action: Some(RuleAction::Cut),
+                    ..save("a", "x")
+                },
+                "security.content_action_unknown",
+            ),
+        ];
+        for (guard, req, want) in cases {
+            let got = code(custom_item(guard, &req).unwrap_err());
+            assert_eq!(got, want, "{guard} {:?}", req.pattern);
+        }
+    }
+
+    /// 「测试…」报的错和保存时同一组码；名字是临时起的，不出现在话里
+    #[test]
+    fn a_trial_that_cannot_run_says_why_with_the_same_codes() {
+        let policy = tw_config::Security::default();
+        let run = |guard: Guard, req: tw_api::SecurityTestRequest| {
+            code(trial_fail(
+                guard,
+                tw_guard::trial::run(guard, &policy, &req).unwrap_err(),
+            ))
         };
-        let amex = networks
-            .iter()
-            .find(|n| n.name == "American Express")
-            .unwrap();
+        let req = |pattern: &str| tw_api::SecurityTestRequest {
+            sample: "x".into(),
+            pattern: Some(pattern.into()),
+            ..Default::default()
+        };
+        assert_eq!(run(Guard::Redact, req("(")), "security.bad_pattern");
+        assert_eq!(run(Guard::Redact, req("")), "security.pattern_empty");
         assert_eq!(
-            amex.prefixes,
-            vec![
-                tw_api::CardPrefix { from: 34, to: 34 },
-                tw_api::CardPrefix { from: 37, to: 37 }
-            ]
+            run(
+                Guard::Content,
+                tw_api::SecurityTestRequest {
+                    matching: Some(tw_api::ContentMatch::Codepoints),
+                    ..req("U+11FFFF")
+                }
+            ),
+            "security.bad_codepoints"
         );
-        assert_eq!(amex.lengths, vec![15]);
+        assert_eq!(
+            run(
+                Guard::Redact,
+                tw_api::SecurityTestRequest {
+                    label: Some("1ABC".into()),
+                    ..req("x")
+                }
+            ),
+            "security.bad_label"
+        );
+        assert_eq!(
+            run(
+                Guard::Redact,
+                tw_api::SecurityTestRequest {
+                    action: Some(RuleAction::Record),
+                    ..req("x")
+                }
+            ),
+            "security.no_action_of_its_own"
+        );
+        assert_eq!(
+            run(
+                Guard::Content,
+                tw_api::SecurityTestRequest {
+                    action: Some(RuleAction::Cut),
+                    ..req("x")
+                }
+            ),
+            "security.content_action_unknown"
+        );
+        let f = trial_fail(
+            Guard::Content,
+            tw_guard::trial::run(
+                Guard::Content,
+                &policy,
+                &tw_api::SecurityTestRequest {
+                    rule: Some("no-such-rule".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(f.0, StatusCode::NOT_FOUND);
+        assert_eq!(code(f), "security.unknown_rule");
     }
 
     #[test]
-    fn switched_rules_show_up_as_they_are() {
-        let v = redact_view(&tw_config::RedactPolicy {
-            enable: vec!["internal-ip".into()],
-            disable: vec!["jwt".into()],
-            ..Default::default()
-        });
-        assert!(
-            v.rules
-                .iter()
-                .find(|r| r.id == "internal-ip")
-                .unwrap()
-                .enabled
+    fn every_guard_knows_its_builtin_rules_and_their_defaults() {
+        assert_eq!(Guard::Redact.on_by_default("internal-ip"), Some(false));
+        assert_eq!(Guard::Redact.on_by_default("anthropic-api-key"), Some(true));
+        assert_eq!(
+            Guard::InspectTools.on_by_default("curl-pipe-sh"),
+            Some(true)
         );
-        assert!(!v.rules.iter().find(|r| r.id == "jwt").unwrap().enabled);
-    }
-
-    #[test]
-    fn tool_rules_say_what_they_do_in_enforce() {
-        let v = tools_view(&tw_config::ToolPolicy {
-            custom: vec![tw_config::CustomToolRule {
-                name: "删除集群资源".into(),
-                pattern: r"kubectl\s+delete".into(),
-                action: ToolAction::Cut,
-                disabled: true,
-            }],
-            ..Default::default()
-        });
-        let curl = v.rules.iter().find(|r| r.id == "curl-pipe-sh").unwrap();
-        assert_eq!(curl.action, Some(RuleAction::Cut));
-        assert!(!curl.why.is_empty());
-        let rm = v.rules.iter().find(|r| r.id == "rm-rf-root").unwrap();
-        assert_eq!(rm.action, Some(RuleAction::Record));
-        let mine = v.rules.last().unwrap();
-        assert!(mine.custom && !mine.enabled);
-        assert_eq!(mine.action, Some(RuleAction::Cut));
+        assert_eq!(Guard::Content.on_by_default("unicode-tags"), Some(true));
+        assert_eq!(Guard::Content.on_by_default("zero-width"), Some(false));
+        assert_eq!(Guard::Content.on_by_default("anthropic-api-key"), None);
+        assert_eq!(
+            code(Guard::parse("hidden_text").unwrap_err()),
+            "security.unknown_guard"
+        );
     }
 }

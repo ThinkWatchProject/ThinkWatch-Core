@@ -38,6 +38,7 @@ pub(super) fn respond(
         provider,
         ledger,
         session,
+        refusal,
         ..
     } = served;
     let status =
@@ -115,6 +116,11 @@ pub(super) fn respond(
     // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
     if generates && plan.is_sse && status.is_success() {
         ending.streaming(upstream_dialect, &provider.name);
+    }
+    // 回的不是 2xx：原样交给客户端，**这个请求照样是失败的** —— 客户端拿到的是上游的
+    // 错误，不是回答。原因在错误正文里，交完时读（见 `Ending::refused`）
+    if !status.is_success() {
+        ending.refused(upstream_dialect, &provider.name, refusal);
     }
     let mut relay = Relay::new(
         state,
@@ -413,13 +419,9 @@ struct Relay {
     hold: bool,
     /// 整包那几条路攒着的 body
     whole: Vec<u8>,
-    /// 输出长度的上限。关着、或者上游回的不是成功时没有它
-    limit: Option<tw_guard::output::Limit>,
-    limit_mode: tw_config::SecurityMode,
-    /// 流的计数器。整包的在 `finish` 里一次数完
-    meter: Option<tw_guard::output::Meter>,
-    /// 客户端收到的格式：输出长度按它读
-    client_dialect: tw_dialect::ir::Dialect,
+    /// 工具调用命中的片段报出去之前怎么打码：和留档同一套（这个请求的规则和账本）。
+    /// 命中的那一段是还原过占位符的，里面可能就是一把真的密钥
+    redaction: crate::bodies::Redaction,
     /// 直通的 JSON 数组流发到哪儿了：开头的 `[` 发了没有、之后有没有发过元素。
     /// **切断时要把数组收好**（见 [`Relay::error_tail`]）
     array_opened: bool,
@@ -429,8 +431,8 @@ struct Relay {
     bus: tw_observe::EventBus,
     id: u64,
     provider: String,
-    /// 回答钩子（见 [`crate::plugin::reply`]）。**排在转换之后、工具调用审查和输出长度
-    /// 之前**：那两道看的是插件改过的那一版。范围内没有插件时是 None，整段零成本
+    /// 回答钩子（见 [`crate::plugin::reply`]）。**排在转换之后、工具调用审查之前**：审查
+    /// 看的是插件改过的那一版。范围内没有插件时是 None，整段零成本
     plugins: Option<ReplyStage>,
 }
 
@@ -479,20 +481,6 @@ impl Relay {
         } else {
             Some(tw_guard::tools::wall::Wall::json_body(rt.tools.clone()))
         };
-        // 输出长度只管模型的回答：上游回的是错误就不数
-        let limit_mode = rt.config.security.output_limit.mode;
-        let limit = (limit_mode.detects() && plan.status.is_success())
-            .then(|| rt.config.security.output_limit.limit());
-        let client_dialect = session.as_ref().map_or(upstream_dialect, |s| s.client);
-        let meter = limit.and_then(|l| {
-            if plan.client_sse {
-                Some(tw_guard::output::Meter::sse(l, client_dialect))
-            } else if plan.client_json_stream {
-                Some(tw_guard::output::Meter::json_array(l))
-            } else {
-                None
-            }
-        });
         // 回答钩子按客户端收到的样子分：流的边流边改，整包的收齐了再改
         use crate::plugin::reply::{Framing, Stream};
         let plugins = plugins.map(|chain| {
@@ -516,12 +504,12 @@ impl Relay {
                 ReplyStage::Whole(chain)
             }
         });
-        // 整包要数完才发得出去，和审查一样得攒着；插件要改整包也一样
-        let hold =
-            (wall.is_some() || limit.is_some() || matches!(plugins, Some(ReplyStage::Whole(_))))
-                && plan.whole_body()
-                && !plan.convert_whole
-                && !plan.collect;
+        // 整包要看完才发得出去：工具调用在整份里，看完之前一个字节都不能发。插件要改整包
+        // 也一样，改完了才知道发什么
+        let hold = (wall.is_some() || matches!(plugins, Some(ReplyStage::Whole(_))))
+            && plan.whole_body()
+            && !plan.convert_whole
+            && !plan.collect;
         Self {
             plan,
             session,
@@ -533,10 +521,10 @@ impl Relay {
             inspect,
             hold,
             whole: Vec::new(),
-            limit,
-            limit_mode,
-            meter,
-            client_dialect,
+            redaction: crate::bodies::Redaction {
+                rules: rt.redact.clone(),
+                ledger: ledger.clone(),
+            },
             array_opened: false,
             array_element: false,
             at_boundary: true,
@@ -547,8 +535,8 @@ impl Relay {
         }
     }
 
-    /// 处理上游的一块：返回现在该写给客户端的字节，以及插件出错、工具调用审查或输出长度
-    /// 切断时的那个错误。
+    /// 处理上游的一块：返回现在该写给客户端的字节，以及插件出错、工具调用审查切断时的
+    /// 那个错误。
     async fn chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, Option<GatewayError>) {
         let out = self.restorer.process(chunk);
         // 翻译在还原之后、审查之前：**审查看的必须是客户端
@@ -577,27 +565,12 @@ impl Relay {
         (out, cut.or(failed))
     }
 
-    /// 工具调用审查和输出长度：看的是客户端将要收到的这一段
+    /// 工具调用审查：看的是客户端将要收到的这一段
     fn guard(&mut self, out: Vec<u8>) -> (Vec<u8>, Option<GatewayError>) {
         // **审查的是客户端将要看到的那一版**（还原之后的），
         // 因为那才是它真正会去执行的东西
         if let Some(cut) = self.wall_cut(&out) {
             return cut;
-        }
-        // 输出长度数的也是客户端将要看到的那一版。**切在帧上**：超过的那一帧不发
-        if let Some(t) = self.meter.as_mut().and_then(|m| m.feed(&out))
-            && let Some(why) = crate::guard::output_limited(
-                &self.bus,
-                self.id,
-                &self.provider,
-                self.limit_mode,
-                self.limit.map_or(0, |l| l.max),
-                t.seen,
-                false,
-            )
-        {
-            let safe = t.safe_prefix.min(out.len());
-            return (out[..safe].to_vec(), Some(GatewayError::denied(why)));
         }
         (out, None)
     }
@@ -608,18 +581,27 @@ impl Relay {
         for v in w.feed(out) {
             // 规则是切断 + 拦截档 = 切断
             let blocked = v.cut && self.inspect.acts();
-            self.bus.emit(flagged(self.id, &self.provider, &v, blocked));
+            self.bus.emit(flagged(
+                self.id,
+                &self.provider,
+                &v,
+                blocked,
+                &self.redaction,
+            ));
             if blocked {
                 tracing::warn!(
                     provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                    "cut the response stream: the upstream returned a dangerous tool call"
+                    "cut the response stream: a tool call in the answer matched a cut rule"
                 );
+                // **句子不说这个调用出自谁。**审查看的是最后交给客户端的那一份回答，
+                // 里面的工具调用不一定是上游给的 —— 有工具调用权限的插件也能造、能改。
+                // 上游照样在 `upstream` 参数和事件里，只是不当成调用的出处
                 let err = GatewayError::denied(msg!(
-                    "gw.toolcall.cut",
+                    "gw.toolcall.response_cut",
                     upstream = self.provider.clone(), tool = v.tool.clone(),
                     rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
-                    "The {tool} call returned by upstream `{upstream}` \
-                     matched rule “{name}”{}, so the response was cut off.",
+                    "The answer contained a {tool} call that matched rule “{name}”{}, \
+                     so the response was cut off.",
                     because(&v.why)
                 ));
                 // **命中那一帧之前的内容照常发。**模型在动手之前
@@ -768,11 +750,17 @@ impl Relay {
             };
             for v in w.feed(&tail) {
                 let blocked = v.cut && self.inspect.acts();
-                self.bus.emit(flagged(self.id, &self.provider, &v, blocked));
+                self.bus.emit(flagged(
+                    self.id,
+                    &self.provider,
+                    &v,
+                    blocked,
+                    &self.redaction,
+                ));
                 if blocked {
                     tracing::warn!(
                         provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                        "withheld the response: the upstream returned a dangerous tool call"
+                        "withheld the response: a tool call in the answer matched a cut rule"
                     );
                     return (Vec::new(), Some(withheld(&self.provider, &v)));
                 }
@@ -784,41 +772,20 @@ impl Relay {
         {
             for v in w.whole(&tail) {
                 let blocked = v.cut && self.inspect.acts();
-                self.bus.emit(flagged(self.id, &self.provider, &v, blocked));
+                self.bus.emit(flagged(
+                    self.id,
+                    &self.provider,
+                    &v,
+                    blocked,
+                    &self.redaction,
+                ));
                 if blocked {
                     tracing::warn!(
                         provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                        "withheld the response: the upstream returned a dangerous tool call"
+                        "withheld the response: a tool call in the answer matched a cut rule"
                     );
                     return (Vec::new(), Some(withheld(&self.provider, &v)));
                 }
-            }
-        }
-        // 整包的输出长度：**整份到手了才数得清，而它一个字节都还没发出去**，所以超了
-        // 就整份不发。流式的在 `chunk` 里边收边数过了
-        if let Some(limit) = self.limit
-            && !broke
-            && self.meter.is_none()
-        {
-            let over = match &self.session {
-                // 客户端要流、上游给了整包：写给客户端的是转出来的流，数上游那一份整包
-                Some(s) if self.plan.convert_whole && s.stream => {
-                    limit.check_whole(&self.whole, s.upstream)
-                }
-                _ => limit.check_whole(&tail, self.client_dialect),
-            };
-            if let Some(seen) = over
-                && let Some(why) = crate::guard::output_limited(
-                    &self.bus,
-                    self.id,
-                    &self.provider,
-                    self.limit_mode,
-                    limit.max,
-                    seen,
-                    true,
-                )
-            {
-                return (Vec::new(), Some(GatewayError::denied(why)));
             }
         }
         (tail, None)
@@ -908,14 +875,15 @@ impl Relay {
     }
 }
 
-/// 整份扣下的回答报给客户端的那一句
+/// 整份扣下的回答报给客户端的那一句。和流式那句一样**不说调用出自谁**（见
+/// [`Relay::wall_cut`]）：有工具调用权限的插件也能造、能改回答里的调用
 fn withheld(provider: &str, v: &tw_guard::tools::wall::Verdict) -> GatewayError {
     GatewayError::denied(msg!(
-        "gw.toolcall.blocked",
+        "gw.toolcall.response_withheld",
         upstream = provider, tool = v.tool.clone(),
         rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
-        "The {tool} call returned by upstream `{upstream}` matched rule \
-         “{name}”{}, so the response was withheld.",
+        "The answer contained a {tool} call that matched rule “{name}”{}, \
+         so the response was withheld.",
         because(&v.why)
     ))
 }

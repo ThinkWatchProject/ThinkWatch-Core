@@ -23,8 +23,11 @@ use tw_api::Msg;
 /// **一列 JSON 的样子变了也算**（比如 `routing` 多了必有的字段）：旧的那些行
 /// 读出来是坏的，而读的一方会把「解不开」当成「没有」。
 ///
-/// 24：插件在每个请求上的运行记录（`plugin_runs`）。
-const SCHEMA: i64 = 24;
+/// 24：安全日志多了内容过滤的匹配方式和解出来的隐藏内容（`security_events` 的
+/// `matching`、`revealed`），结局多了「已删除」。
+///
+/// 25：插件在每个请求上的运行记录（`plugin_runs`）。
+const SCHEMA: i64 = 25;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -326,7 +329,11 @@ impl Db {
                 tool       TEXT,
                 -- **已打码或已截断。**存原文等于把泄漏搬了个家
                 excerpt    TEXT    NOT NULL,
-                count      INTEGER NOT NULL
+                count      INTEGER NOT NULL,
+                -- 内容过滤：规则怎么认（contains / regex / codepoints）。别的防护是 NULL
+                matching   TEXT,
+                -- 内容过滤的码位规则命中标签字符时解出来的原文。别的时候是 NULL
+                revealed   TEXT
              );
              CREATE INDEX security_events_at ON security_events (at_ms DESC);
              CREATE INDEX security_events_request ON security_events (request_id);
@@ -498,7 +505,10 @@ pub struct TurnRow {
     pub cache_read_tokens: Option<i64>,
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
-    /// 失败的原因，带着码
+    /// 上游回的状态码。没走到上游的是 None
+    pub status: Option<u16>,
+    /// 失败的原因，带着码。上游回了错误、原样交给客户端的也有（那时 `status` 是那个
+    /// 状态码），见 `tw_api::TurnView::error`
     pub error: Option<Msg>,
     pub cancelled: bool,
     /// 这一轮的金额是估算。**瀑布图上要带记号**
@@ -578,7 +588,7 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
                     cache_read_tokens, cost_micros, duration_ms, error, cancelled,
-                    cost_estimated, billing, error_code, error_args
+                    cost_estimated, billing, error_code, error_args, status
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -592,6 +602,7 @@ impl Db {
                 cache_read_tokens: r.get(6)?,
                 cost_micros: r.get(7)?,
                 duration_ms: r.get(8)?,
+                status: r.get(15)?,
                 error: error_from(r)?,
                 cancelled: r.get::<_, i64>(10)? != 0,
                 cost_estimated: r.get::<_, i64>(11)? != 0,
@@ -794,8 +805,9 @@ impl Db {
     pub fn insert_security_event(&self, e: &SecurityEvent) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT INTO security_events
-             (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count,
+              matching, revealed)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 e.at_ms,
                 e.request_id,
@@ -808,6 +820,8 @@ impl Db {
                 e.tool,
                 e.excerpt,
                 e.count,
+                e.matching.map(tw_api::ContentMatch::slug),
+                e.revealed,
             ],
         )?;
         Ok(())
@@ -863,6 +877,7 @@ impl Db {
                 tw_api::SecurityOutcome::Recorded => &mut by.recorded,
                 tw_api::SecurityOutcome::Replaced => &mut by.replaced,
                 tw_api::SecurityOutcome::Cut => &mut by.cut,
+                tw_api::SecurityOutcome::Stripped => &mut by.stripped,
                 tw_api::SecurityOutcome::Blocked => &mut by.blocked,
             };
             *slot = n;
@@ -870,7 +885,7 @@ impl Db {
         Ok(tw_api::SecurityEventsPage {
             events,
             more,
-            total: by.recorded + by.replaced + by.cut + by.blocked,
+            total: by.recorded + by.replaced + by.cut + by.stripped + by.blocked,
             by_outcome: by,
         })
     }
@@ -937,12 +952,9 @@ impl Db {
                 COALESCE(SUM(guard = 'redact' AND action = 'replaced'), 0),
                 COALESCE(SUM(guard = 'inspect_tools'), 0),
                 COALESCE(SUM(guard = 'inspect_tools' AND action = 'cut'), 0),
-                COALESCE(SUM(guard = 'hidden_text'), 0),
-                COALESCE(SUM(guard = 'hidden_text' AND action = 'blocked'), 0),
                 COALESCE(SUM(guard = 'content'), 0),
                 COALESCE(SUM(guard = 'content' AND action = 'blocked'), 0),
-                COALESCE(SUM(guard = 'output_limit'), 0),
-                COALESCE(SUM(guard = 'output_limit' AND action = 'cut'), 0)
+                COALESCE(SUM(guard = 'content' AND action = 'stripped'), 0)
              FROM security_events WHERE at_ms >= ?1 AND at_ms < ?2",
             params![since_ms, until_ms],
             |r| {
@@ -951,12 +963,9 @@ impl Db {
                     secrets_replaced: r.get(1)?,
                     tool_calls: r.get(2)?,
                     tool_calls_cut: r.get(3)?,
-                    hidden_text: r.get(4)?,
-                    hidden_text_blocked: r.get(5)?,
-                    content: r.get(6)?,
-                    content_blocked: r.get(7)?,
-                    output_limit: r.get(8)?,
-                    output_limit_cut: r.get(9)?,
+                    content: r.get(4)?,
+                    content_blocked: r.get(5)?,
+                    content_stripped: r.get(6)?,
                 })
             },
         )?)
@@ -1541,6 +1550,10 @@ pub struct SecurityEvent {
     /// **已打码或已截断**
     pub excerpt: String,
     pub count: i64,
+    /// 内容过滤：规则怎么认
+    pub matching: Option<tw_api::ContentMatch>,
+    /// 内容过滤的码位规则解出来的隐藏内容
+    pub revealed: Option<String>,
 }
 
 /// 读安全日志时的那段 SELECT。**上游、密钥、模型优先取请求那一行的。**
@@ -1550,7 +1563,8 @@ const SECURITY_SELECT: &str =
         COALESCE(NULLIF(r.client, ''), e.client),
         COALESCE(r.model, ''),
         e.tool, e.excerpt, e.count,
-        r.client_hint, r.peer, r.key_masked
+        r.client_hint, r.peer, r.key_masked,
+        e.matching, e.revealed
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 /// 安全日志按什么筛：`?1`–`?2` 这一段时间，`?3` 这一项（NULL 是全部）。
@@ -1591,6 +1605,11 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         tool: r.get(10)?,
         excerpt: r.get(11)?,
         count: r.get(12)?,
+        matching: match r.get::<_, Option<String>>(16)? {
+            Some(_) => Some(slug_col(r, 16, tw_api::ContentMatch::from_slug)?),
+            None => None,
+        },
+        revealed: r.get(17)?,
         client_hint: r.get(13)?,
         peer: r.get(14)?,
         key_masked: r.get(15)?,
@@ -2794,11 +2813,13 @@ mod security_log_tests {
             tool: None,
             excerpt: "…".into(),
             count: 1,
+            matching: (guard == Guard::Content).then_some(tw_api::ContentMatch::Contains),
+            revealed: None,
         }
     }
 
-    /// 九条，时刻 1–9，号也是 1–9。只记录 3 条、已替换 1 条、已切断 3 条、
-    /// 被拒 2 条
+    /// 九条，时刻 1–9，号也是 1–9。只记录 3 条、已替换 1 条、已切断 2 条、
+    /// 已删除 1 条、被拒 2 条
     fn seeded() -> Db {
         let db = Db::in_memory().unwrap();
         for (at, guard, action) in [
@@ -2806,11 +2827,11 @@ mod security_log_tests {
             (2, Guard::Redact, SecurityOutcome::Replaced),
             (3, Guard::InspectTools, SecurityOutcome::Cut),
             (4, Guard::Redact, SecurityOutcome::Recorded),
-            (5, Guard::HiddenText, SecurityOutcome::Blocked),
+            (5, Guard::Content, SecurityOutcome::Blocked),
             (6, Guard::Content, SecurityOutcome::Recorded),
             (7, Guard::InspectTools, SecurityOutcome::Cut),
             (8, Guard::Content, SecurityOutcome::Blocked),
-            (9, Guard::OutputLimit, SecurityOutcome::Cut),
+            (9, Guard::Content, SecurityOutcome::Stripped),
         ] {
             db.insert_security_event(&event(at, guard, action)).unwrap();
         }
@@ -2829,7 +2850,8 @@ mod security_log_tests {
         let all = SecurityOutcomeCounts {
             recorded: 3,
             replaced: 1,
-            cut: 3,
+            cut: 2,
+            stripped: 1,
             blocked: 2,
         };
 
@@ -2861,8 +2883,8 @@ mod security_log_tests {
             (None, 3, 7),
             (Some("inspect_tools"), 0, 8),
             (Some("content"), 7, 100),
-            // 输出长度那条在 9，终点不含：一条都没有
-            (Some("output_limit"), 0, 9),
+            // 删除的那条在 9，终点不含：数不到它
+            (Some("content"), 0, 9),
         ] {
             let first = db.security_events(guard, since, until, None, 2).unwrap();
             let mut seen = first.events.clone();
@@ -2885,6 +2907,7 @@ mod security_log_tests {
                     SecurityOutcome::Recorded => counted.recorded += 1,
                     SecurityOutcome::Replaced => counted.replaced += 1,
                     SecurityOutcome::Cut => counted.cut += 1,
+                    SecurityOutcome::Stripped => counted.stripped += 1,
                     SecurityOutcome::Blocked => counted.blocked += 1,
                 }
             }
@@ -2897,7 +2920,7 @@ mod security_log_tests {
         }
     }
 
-    /// 一条都没有：零条，四项都在、都是 0。
+    /// 一条都没有：零条，五项都在、都是 0。
     #[test]
     fn an_empty_window_counts_zero_of_everything() {
         for db in [Db::in_memory().unwrap(), seeded()] {

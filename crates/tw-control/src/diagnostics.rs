@@ -191,7 +191,7 @@ pub async fn bundle(State(s): State<ControlState>) -> Result<String, crate::Fail
         "Outbound redaction",
         format!(
             "{}{}",
-            r.mode.label(),
+            r.mode.slug(),
             changes(
                 &r.enable,
                 &r.disable,
@@ -205,7 +205,7 @@ pub async fn bundle(State(s): State<ControlState>) -> Result<String, crate::Fail
         "Tool-call inspection",
         format!(
             "{}{}",
-            t.mode.label(),
+            t.mode.slug(),
             changes(
                 &t.enable,
                 &t.disable,
@@ -213,31 +213,19 @@ pub async fn bundle(State(s): State<ControlState>) -> Result<String, crate::Fail
             )
         ),
     );
-    let h = &cfg.security.hidden_text;
-    line(
-        &mut out,
-        "Hidden characters",
-        format!("{}{}", h.mode.label(), changes(&[], &h.disable, Vec::new())),
-    );
     let c = &cfg.security.content;
     line(
         &mut out,
         "Content filter",
         format!(
             "{}{}",
-            c.mode.label(),
+            c.mode.slug(),
             changes(
                 &c.enable,
                 &c.disable,
                 c.custom.iter().map(|c| c.name.as_str()).collect()
             )
         ),
-    );
-    let o = &cfg.security.output_limit;
-    line(
-        &mut out,
-        "Output limit",
-        format!("{} ({} characters)", o.mode.label(), o.max_chars),
     );
 
     // ---- 存储和最近的失败

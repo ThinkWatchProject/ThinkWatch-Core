@@ -150,7 +150,7 @@ means.
 | `proxies` | list of [`proxies[]`](#cfg-proxies) | `[]` | Outbound proxies, declared once and referred to by name from `providers[].proxy`. |
 | `pricing` | object, [`pricing`](#cfg-pricing) | — | Refreshing the default price table, and price sheets of your own. |
 | `client_probes` | object, [`client_probes`](#cfg-client_probes) | — | What happens to the helper requests clients send on their own (health checks, warm-ups, titles). |
-| `security` | object, [`security`](#cfg-security) | — | The five guards. All of them start in `observe` or `off`, so out of the box nothing is changed or blocked. |
+| `security` | object, [`security`](#cfg-security) | — | The three guards. All of them start in `observe`, so out of the box nothing is changed or refused. |
 | `retention` | object, [`retention`](#cfg-retention) | — | How long request logs are kept. |
 | `failover` | object, [`failover`](#cfg-failover) | — | How long an upstream is set aside after it fails, and how long the start of a stream is awaited. |
 | `groups` | list of [`groups[]`](#cfg-groups) | `[]` | Strategy groups: several upstreams behind one name, with a way to pick among them. |
@@ -575,28 +575,29 @@ answered locally (`intercept`, nothing is sent upstream), passed through
 
 ### `security`
 
-Five guards, applied to every upstream alike. Each has a `mode`: `off`,
-`observe` (detect and record, change nothing) or `enforce` (act). They start
-in `observe`, except the output limit, which starts `off`. What `enforce`
-does differs per guard, and each says so below.
+Three guards, applied to every upstream alike. Each has a `mode`: `off`,
+`observe` (detect and record, change nothing) or `enforce` (act). All three
+start in `observe`. What `enforce` does differs per guard: redaction replaces,
+tool-call inspection cuts the response off, and the content filter does what
+each rule says (refuse, delete or record).
 
 <!-- generated: table security -->
 <a id="cfg-security"></a>
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction: credentials, Chinese resident ID numbers and bank card numbers found in a request are replaced before it leaves. |
+| `redact` | object, [`security.redact`](#cfg-security-redact) | — | Outbound redaction: credentials and personal information anywhere in a request are replaced before it leaves. |
 | `inspect_tools` | object, [`security.inspect_tools`](#cfg-security-inspect_tools) | — | Tool-call inspection: dangerous commands in the tool calls a model returns cut the response off. |
-| `hidden_text` | object, [`security.hidden_text`](#cfg-security-hidden_text) | — | Hidden characters that people cannot see and models can read refuse the request. |
-| `content` | object, [`security.content`](#cfg-security-content) | — | Content filter: words or patterns in what the caller sends refuse the request. |
-| `output_limit` | object, [`security.output_limit`](#cfg-security-output_limit) | — | Output length: a response longer than the limit is cut off. |
+| `content` | object, [`security.content`](#cfg-security-content) | — | Content filter: words, patterns or characters (hidden ones among them) in what the caller sends; each rule refuses the request, deletes what it matched, or only records it. |
 <!-- /generated -->
 
 #### `security.redact`
 
-Before a request leaves, credentials in it are looked for, and so are
-Chinese resident ID numbers and bank card numbers. Under `enforce` they are
-replaced with placeholders, and put back where the answer repeats them.
+Before a request leaves, the whole request (system prompt, earlier answers
+and tool calls included) is searched for credentials and personal
+information. Under `enforce` what is found is replaced with placeholders, and
+put back where the answer repeats them. Images, files and other base64
+payloads are not searched.
 
 <!-- generated: table security.redact -->
 <a id="cfg-security-redact"></a>
@@ -606,7 +607,7 @@ replaced with placeholders, and put back where the answer repeats them.
 | `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
 | `enable` | list of strings | `[]` | Built-in rules to switch on that are off out of the box, by id. |
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
-| `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a pattern matches is treated as a credential. |
+| `custom` | list of [`security.redact.custom[]`](#cfg-security-redact-custom) | `[]` | Rules of your own: whatever a pattern matches is replaced like a credential. |
 <!-- /generated -->
 
 <!-- generated: table security.redact.custom[] -->
@@ -616,6 +617,7 @@ replaced with placeholders, and put back where the answer repeats them.
 |---|---|---|---|
 | `name` | string | **required** | Name shown in logs and in the app; it identifies the rule and has to be unique within this guard. |
 | `pattern` | string | **required** | Regular expression. |
+| `label` | string | `SECRET` | Placeholder name: what the pattern matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters. |
 | `disabled` | bool | `false` | Switches the rule off and keeps it in the file. |
 <!-- /generated -->
 
@@ -650,12 +652,15 @@ Built-in rules:
 | `conn-string-password` | Connection string password | on |
 | `cn-resident-id` | Chinese resident ID number | on |
 | `bank-card` | Bank card number | on |
+| `email` | Email address | off |
+| `cn-mobile-phone` | Chinese mainland mobile number | off |
 | `internal-ip` | Internal IP address | off |
 | `internal-domain` | Internal domain | off |
 <!-- /generated -->
 
-`cn-resident-id` and `bank-card` look for personal numbers rather than
-credentials, and match only what checks out by structure:
+`cn-resident-id`, `bank-card`, `email` and `cn-mobile-phone` look for
+personal information rather than credentials. The first two are on out of the
+box and match only what checks out by structure:
 
 - `cn-resident-id`: an 18-character resident ID number of the People's
   Republic of China whose first two digits are a province-level code, whose
@@ -669,12 +674,25 @@ credentials, and match only what checks out by structure:
   Diners Club also 4-6-4). The test card numbers published by Stripe,
   Braintree and Adyen are not matched.
 
+`email` and `cn-mobile-phone` are off out of the box: they have no structure
+to check, and code and documents are full of things that look like them.
+
+- `email`: an address whose domain has at least two parts, the last of them
+  two or more letters. User names in URLs (`https://user@host`) and file
+  names such as `icon@2x.png` are not matched.
+- `cn-mobile-phone`: a Chinese mainland mobile number, 11 digits starting
+  with `1` and a second digit from `3` to `9`, not part of a longer run of
+  digits.
+
 A number that is part of a longer run of letters or digits is not matched,
 and neither is one written as a JSON number in the request body (in a tool
 call's arguments, for instance), since replacing it would leave the body
-invalid JSON. The placeholders of these two rules say what was there
-(`<<TW_ID_NUMBER_1>>`, `<<TW_CARD_NUMBER_1>>`), and the security log shows only
-the last four characters of what they found.
+invalid JSON. The placeholders of these rules say what was there
+(`<<TW_ID_NUMBER_1>>`, `<<TW_CARD_NUMBER_1>>`, `<<TW_EMAIL_1>>`,
+`<<TW_PHONE_1>>`), and the security log shows only the last four characters
+of a number, and the first character and the domain of an email address. A
+custom rule replaces with `<<TW_SECRET_1>>` unless it names its own
+placeholder (`label`).
 
 #### `security.inspect_tools`
 
@@ -716,37 +734,23 @@ Built-in rules:
 | `exfil-credentials` | Send out a credential file | `cut` |
 | `exfil-credentials-reversed` | Send out a credential file (verb first) | `cut` |
 | `ssh-key-read` | Read a private key or cloud credential | `cut` |
+| `secret-to-unknown-host` | Send a credential to an unknown host | `cut` |
 | `write-startup-item` | Write a startup item | `cut` |
 | `crontab-install` | Install a scheduled job | `cut` |
 | `rm-rf-root` | Delete home or root | `record` |
 | `chmod-777` | World-writable permissions | `record` |
-<!-- /generated -->
-
-#### `security.hidden_text`
-
-Characters people cannot see and models can read, in what the caller sends
-(tool results included). Under `enforce`, the request is refused.
-
-<!-- generated: table security.hidden_text -->
-<a id="cfg-security-hidden_text"></a>
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
-| `disable` | list of strings | `[]` | Kinds not to look for: `tag`, `bidi`. |
-<!-- /generated -->
-
-<!-- generated: rules hidden_text -->
-| Kind | What it is |
-|---|---|
-| `tag` | Unicode tag characters (U+E0000 to U+E007F): invisible everywhere, read by the model, able to carry a whole instruction. |
-| `bidi` | Bidirectional control characters: make the order shown differ from the order the model reads. |
+| `upload-file-to-host` | Upload a local file to an external host | `record` |
 <!-- /generated -->
 
 #### `security.content`
 
-Words or patterns in what the caller sends. Under `enforce`, a match with
-rules set to `block` refuses the request.
+Words, patterns or characters in what the caller sends: user messages and
+the tool results in them, not the system prompt or the model's own turns.
+Each rule matches a keyword (`contains`), a regular expression (`regex`) or
+code points (`codepoints`), and says what happens under `enforce`: `block`
+refuses the request, `strip` deletes every match from the caller's text and
+sends the rest, `record` only records it. After deleting, the text is checked
+again, so a keyword split by hidden characters is caught once they are gone.
 
 <!-- generated: table security.content -->
 <a id="cfg-security-content"></a>
@@ -756,7 +760,7 @@ rules set to `block` refuses the request.
 | `mode` | `off` \| `observe` \| `enforce` | `observe` | `off` does nothing; `observe` detects and records only, and changes nothing; `enforce` detects and acts. |
 | `enable` | list of strings | `[]` | Built-in rules to switch on that are off out of the box, by id. |
 | `disable` | list of strings | `[]` | Built-in rules to switch off, by id. |
-| `actions` | map of built-in rule id → `block` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting. |
+| `actions` | map of built-in rule id → `block` \| `strip` \| `record` | `{}` | What a built-in rule does under `enforce`, written only where it differs from the factory setting. |
 | `custom` | list of [`security.content.custom[]`](#cfg-security-content-custom) | `[]` | Rules of your own. |
 <!-- /generated -->
 
@@ -766,9 +770,9 @@ rules set to `block` refuses the request.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name shown in logs and in the app; it identifies the rule and has to be unique within this guard. |
-| `pattern` | string | **required** | A keyword, or a regular expression with `match: regex`. Case-insensitive either way. |
-| `match` | `contains` \| `regex` | `contains` | `contains`: the text contains `pattern`. `regex`: `pattern` is a regular expression. |
-| `action` | `block` \| `record` | `record` | Under `enforce`: `block` the request, or only `record` the match. |
+| `pattern` | string | **required** | A keyword; a regular expression with `match: regex`; code points with `match: codepoints` (`U+200B, U+E0000–U+E007F`). Keywords and regular expressions are case-insensitive. |
+| `match` | `contains` \| `regex` \| `codepoints` | `contains` | `contains`: the text contains `pattern`. `regex`: `pattern` is a regular expression. `codepoints`: the text has a character among the code points or ranges listed in `pattern`, separated by commas. |
+| `action` | `block` \| `strip` \| `record` | `record` | Under `enforce`: `block` the request, `strip` what matched and send the rest, or only `record` the match. |
 | `disabled` | bool | `false` | Switches the rule off and keeps it in the file. |
 <!-- /generated -->
 
@@ -777,6 +781,10 @@ Built-in rules:
 <!-- generated: rules content -->
 | id | Name | Group | Out of the box | Under `enforce`, out of the box |
 |---|---|---|---|---|
+| `unicode-tags` | Unicode tag characters | invisible | on | `strip` |
+| `bidi-controls` | Bidirectional controls | invisible | on | `strip` |
+| `zero-width` | Zero-width characters | invisible | off | `strip` |
+| `private-use` | Private-use characters | invisible | off | `strip` |
 | `ignore-previous-instructions` | Ignore previous instructions | injection | on | `block` |
 | `ignore-all-previous` | Ignore all previous | injection | on | `block` |
 | `disregard-your-instructions` | Disregard your instructions | injection | on | `block` |
@@ -801,16 +809,12 @@ Built-in rules:
 | `zh-jailbreak` | Jailbreak (Chinese) | chinese | off | `block` |
 <!-- /generated -->
 
-#### `security.output_limit`
-
-<!-- generated: table security.output_limit -->
-<a id="cfg-security-output_limit"></a>
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `mode` | `off` \| `observe` \| `enforce` | `off` | Off out of the box: no single limit suits every use. `observe` records long responses; `enforce` stops the stream at the limit. |
-| `max_chars` | integer | `100000` | Limit in characters (Unicode scalar values), from 1 to 1000000. |
-<!-- /generated -->
+The `invisible` group matches characters people cannot see and models can
+read. Unicode tag characters (U+E0000–U+E007F) and bidirectional controls
+(U+202A–U+202E, U+2066–U+2069) are on out of the box; zero-width characters
+(U+200B–U+200D, U+2060, U+FEFF) and private-use characters (U+E000–U+F8FF,
+U+F0000–U+FFFFD, U+100000–U+10FFFD) are off, since emoji, Persian and icon
+fonts use them too. All four delete what they match under `enforce`.
 
 ```yaml
 security:
@@ -820,11 +824,16 @@ security:
     custom:
       - name: employee-id
         pattern: 'EMP-\d{6}'
+        label: EMPLOYEE
   inspect_tools:
     mode: enforce
-  output_limit:
+  content:
     mode: enforce
-    max_chars: 200000
+    enable: [zero-width]
+    custom:
+      - name: project-x
+        pattern: project-x
+        action: strip
 ```
 
 ### `retention`

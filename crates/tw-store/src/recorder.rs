@@ -361,47 +361,23 @@ impl Recorder {
                         tool: None,
                         excerpt: it.masked.clone(),
                         count: it.count as i64,
+                        matching: None,
+                        revealed: None,
                     });
                 }
             }
-            // 藏匿字符：一种藏法在一个地方一条，`count` 是几个字符
-            Event::HiddenTextFound {
-                id,
-                provider,
-                blocked,
-                items,
-                at_ms,
-            } => {
-                let client = self.inflight.get(id).map(|p| p.client.clone());
-                for it in items {
-                    let excerpt = if it.revealed.is_empty() {
-                        it.example.clone()
-                    } else {
-                        format!("{} {}", it.example, it.revealed)
-                    };
-                    self.record_security(crate::db::SecurityEvent {
-                        at_ms: *at_ms as i64,
-                        request_id: *id as i64,
-                        guard: tw_api::Guard::HiddenText,
-                        rule: it.kind.slug().to_string(),
-                        custom: false,
-                        action: if *blocked { tw_api::SecurityOutcome::Blocked } else { tw_api::SecurityOutcome::Recorded },
-                        provider: provider.clone(),
-                        client: client.clone().unwrap_or_default(),
-                        tool: it.in_tool_result.then(|| "tool_result".to_string()),
-                        excerpt,
-                        count: it.count as i64,
-                    });
-                }
-            }
+            // 内容过滤：一条规则一条，`count` 是几处（码位规则是几个字符）
             Event::ContentMatched {
                 id,
                 provider,
                 rule,
                 custom,
-                blocked,
+                matching,
+                outcome,
                 in_tool_result,
                 excerpt,
+                count,
+                revealed,
                 at_ms,
                 ..
             } => {
@@ -412,35 +388,18 @@ impl Recorder {
                     guard: tw_api::Guard::Content,
                     rule: rule.clone(),
                     custom: *custom,
-                    action: if *blocked { tw_api::SecurityOutcome::Blocked } else { tw_api::SecurityOutcome::Recorded },
+                    action: match outcome {
+                        tw_api::ContentOutcome::Recorded => tw_api::SecurityOutcome::Recorded,
+                        tw_api::ContentOutcome::Stripped => tw_api::SecurityOutcome::Stripped,
+                        tw_api::ContentOutcome::Blocked => tw_api::SecurityOutcome::Blocked,
+                    },
                     provider: provider.clone(),
                     client: client.unwrap_or_default(),
                     tool: in_tool_result.then(|| "tool_result".to_string()),
                     excerpt: excerpt.clone(),
-                    count: 1,
-                });
-            }
-            Event::OutputLimited {
-                id,
-                provider,
-                max_chars,
-                seen_chars,
-                cut,
-                at_ms,
-            } => {
-                let client = self.inflight.get(id).map(|p| p.client.clone());
-                self.record_security(crate::db::SecurityEvent {
-                    at_ms: *at_ms as i64,
-                    request_id: *id as i64,
-                    guard: tw_api::Guard::OutputLimit,
-                    rule: "max_chars".into(),
-                    custom: false,
-                    action: if *cut { tw_api::SecurityOutcome::Cut } else { tw_api::SecurityOutcome::Recorded },
-                    provider: provider.clone(),
-                    client: client.unwrap_or_default(),
-                    tool: None,
-                    excerpt: max_chars.to_string(),
-                    count: *seen_chars as i64,
+                    count: *count as i64,
+                    matching: Some(*matching),
+                    revealed: revealed.clone(),
                 });
             }
             /*
@@ -472,6 +431,8 @@ impl Recorder {
                     tool: Some(tool.clone()),
                     excerpt: excerpt.clone(),
                     count: 1,
+                    matching: None,
+                    revealed: None,
                 });
             }
             Event::RequestHeaders {
@@ -1886,81 +1847,87 @@ mod security_tests {
         assert_eq!(counts.secrets, 0);
     }
 
-    /// 后加的三项防护进同一张表，各自的做了什么和计数都对得上。
+    /// 内容过滤进同一张表：做了什么、几处、匹配方式和解出来的隐藏内容都在，计数对得上
     #[test]
-    fn the_request_and_output_guards_are_logged_and_counted() {
+    fn content_matches_are_logged_and_counted_by_what_happened() {
         let (_d, mut r) = rec();
         r.on_event(&started(1, "claude-sonnet-4-5"));
-        r.on_event(&tw_api::Event::HiddenTextFound {
-            id: 1,
-            provider: "relay".into(),
-            blocked: true,
-            items: vec![tw_api::HiddenItem {
-                kind: tw_api::HiddenKind::Tag,
-                in_tool_result: true,
-                count: 6,
-                example: "U+E0069".into(),
-                revealed: "ignore".into(),
-            }],
-            at_ms: 30,
-        });
-        r.on_event(&tw_api::Event::ContentMatched {
-            id: 1,
-            provider: "relay".into(),
-            rule: "jailbreak".into(),
-            custom: false,
-            action: tw_api::RuleAction::Block,
-            blocked: false,
-            in_tool_result: false,
-            excerpt: "please jailbreak".into(),
-            at_ms: 31,
-        });
-        r.on_event(&tw_api::Event::OutputLimited {
-            id: 1,
-            provider: "relay".into(),
-            max_chars: 100,
-            seen_chars: 130,
-            cut: true,
-            at_ms: 32,
-        });
+        let matched = |rule: &str, outcome, matching, count, revealed: Option<&str>, at_ms| {
+            tw_api::Event::ContentMatched {
+                id: 1,
+                provider: "relay".into(),
+                rule: rule.into(),
+                custom: false,
+                matching,
+                action: tw_api::RuleAction::Strip,
+                outcome,
+                in_tool_result: rule == "unicode-tags",
+                excerpt: format!("{rule}…"),
+                count,
+                revealed: revealed.map(str::to_string),
+                at_ms,
+            }
+        };
+        r.on_event(&matched(
+            "unicode-tags",
+            tw_api::ContentOutcome::Stripped,
+            tw_api::ContentMatch::Codepoints,
+            6,
+            Some("ignore"),
+            30,
+        ));
+        r.on_event(&matched(
+            "jailbreak",
+            tw_api::ContentOutcome::Recorded,
+            tw_api::ContentMatch::Contains,
+            2,
+            None,
+            31,
+        ));
+        r.on_event(&matched(
+            "ignore-previous-instructions",
+            tw_api::ContentOutcome::Blocked,
+            tw_api::ContentMatch::Contains,
+            1,
+            None,
+            32,
+        ));
         let got = r
             .db()
-            .security_events(None, 0, i64::MAX, None, 10)
-            .unwrap()
-            .events;
-        assert_eq!(got.len(), 3, "{got:?}");
-        let [limit, content, hidden] = &got[..] else {
-            unreachable!()
+            .security_events(Some("content"), 0, i64::MAX, None, 10)
+            .unwrap();
+        let [blocked, recorded, stripped] = &got.events[..] else {
+            panic!("{:?}", got.events)
         };
+        assert_eq!(stripped.action, tw_api::SecurityOutcome::Stripped);
+        assert_eq!(stripped.tool.as_deref(), Some("tool_result"));
+        assert_eq!(stripped.count, 6);
+        assert_eq!(stripped.matching, Some(tw_api::ContentMatch::Codepoints));
+        assert_eq!(stripped.revealed.as_deref(), Some("ignore"));
+        assert_eq!(recorded.action, tw_api::SecurityOutcome::Recorded);
+        assert_eq!((recorded.count, recorded.revealed.as_deref()), (2, None));
+        assert_eq!(recorded.tool, None);
+        assert_eq!(blocked.action, tw_api::SecurityOutcome::Blocked);
         assert_eq!(
             (
-                hidden.guard.slug(),
-                hidden.rule.as_str(),
-                hidden.action.slug()
+                got.by_outcome.stripped,
+                got.by_outcome.blocked,
+                got.by_outcome.recorded
             ),
-            ("hidden_text", "tag", "blocked")
+            (1, 1, 1)
         );
-        assert_eq!(hidden.tool.as_deref(), Some("tool_result"));
-        assert_eq!(hidden.excerpt, "U+E0069 ignore");
-        assert_eq!(hidden.count, 6);
-        assert_eq!(
-            (content.guard.slug(), content.action.slug()),
-            ("content", "recorded")
-        );
-        assert_eq!(content.tool, None);
-        assert_eq!(
-            (
-                limit.guard.slug(),
-                limit.action.slug(),
-                limit.excerpt.as_str()
-            ),
-            ("output_limit", "cut", "100")
-        );
-        assert_eq!(limit.count, 130);
         let c = r.db().security_counts(0, i64::MAX).unwrap();
-        assert_eq!((c.hidden_text, c.hidden_text_blocked), (1, 1));
-        assert_eq!((c.content, c.content_blocked), (1, 0));
-        assert_eq!((c.output_limit, c.output_limit_cut), (1, 1));
+        assert_eq!(
+            (c.content, c.content_blocked, c.content_stripped),
+            (3, 1, 1)
+        );
+        // 别的防护没有匹配方式
+        let all = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        assert!(
+            all.events
+                .iter()
+                .all(|e| (e.guard == tw_api::Guard::Content) == e.matching.is_some())
+        );
     }
 }
 
@@ -2460,6 +2427,107 @@ mod failure_tests {
         assert_eq!(row.input_tokens, None);
         assert_eq!(row.bytes, None, "响应头都没到，没有「收到了多少字节」");
         assert_eq!(row.duration_ms, Some(20_000));
+    }
+
+    /// 上游回了 4xx、原样交给了客户端（网关报的是失败，见 `tw_gateway::ending`）：这一行
+    /// 是失败，状态码是上游回的那个。**会话里那一轮也一样**：状态码和原因都在，数进会话和
+    /// 概览的失败，不数进「没有用量」（那种响应不计费）。同一次会话里成功的、取消的那两轮
+    /// 照旧
+    #[test]
+    fn an_error_answer_is_a_failed_turn_with_the_status_the_upstream_answered() {
+        let (_d, mut r) = rec();
+        let start = |id| {
+            let mut ev = started(id, "claude-sonnet-4-5");
+            if let Event::RequestStarted { session, .. } = &mut ev {
+                *session = Some("s".into());
+            }
+            ev
+        };
+        let headers = |id, status| Event::RequestHeaders {
+            id,
+            status,
+            ttfb_ms: 300,
+        };
+        r.on_event(&start(1));
+        r.on_event(&headers(1, 200));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                input: 1_000,
+                output: 10,
+                ..Default::default()
+            }),
+        ));
+        let said = tw_api::Msg {
+            code: "gw.upstream.status_message".into(),
+            args: [
+                ("upstream", "官方"),
+                ("status", "400"),
+                ("message", "prompt is too long"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            text: "Upstream `官方` answered 400: prompt is too long".into(),
+        };
+        r.on_event(&start(2));
+        r.on_event(&headers(2, 400));
+        r.on_event(&Event::RequestFailed {
+            id: 2,
+            model: String::new(),
+            source: tw_api::FailureSource::Upstream,
+            message: said.clone(),
+            bytes: Some(120),
+            duration_ms: Some(320),
+            usage: None,
+            answered_model: None,
+        });
+        r.on_event(&start(3));
+        r.on_event(&headers(3, 200));
+        r.on_event(&Event::RequestCancelled {
+            id: 3,
+            model: String::new(),
+            status: Some(200),
+            bytes: 40,
+            duration_ms: 900,
+            usage: None,
+            answered_model: None,
+        });
+
+        let row = r.db().get(2).unwrap().unwrap();
+        assert_eq!(row.status, Some(400), "状态码来自响应头那个事件");
+        assert_eq!(row.error.as_ref(), Some(&said));
+        assert!(!row.cancelled);
+        assert_eq!(row.cost_micros, None);
+
+        let turns = r.db().turns("s").unwrap();
+        let seen: Vec<_> = turns
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    t.status,
+                    t.error.as_ref().map(|e| e.code.as_str()),
+                    t.cancelled,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, Some(200), None, false),
+                (2, Some(400), Some("gw.upstream.status_message"), false),
+                (3, Some(200), None, true),
+            ]
+        );
+        let s = &r.db().sessions(None, 10).unwrap()[0];
+        assert_eq!((s.turns, s.errors, s.no_usage_turns), (3, 1, 1), "{s:?}");
+        let sum = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(
+            (sum.requests, sum.failed, sum.no_usage_requests),
+            (3, 1, 1),
+            "{sum:?}"
+        );
     }
 
     /// 算出来的价钱照样报回总线，**标着估算**。

@@ -456,8 +456,20 @@ async fn a_stream_the_tool_firewall_cuts_is_denied_and_keeps_its_usage() {
             ..
         } => {
             assert_eq!(source, "denied");
-            assert_eq!(message.code, "gw.toolcall.cut", "{message}");
+            assert_eq!(message.code, "gw.toolcall.response_cut", "{message}");
             assert_eq!(message.arg("tool"), "Bash", "{message}");
+            assert_eq!(message.arg("rule"), "curl-pipe-sh", "{message}");
+            // **句子不说这个调用出自谁**：插件也能造工具调用。上游另作一个参数留着
+            assert_eq!(message.arg("upstream"), "up", "{message}");
+            let said = format!(
+                "The answer contained a Bash call that matched rule “{}” ({}), \
+                 so the response was cut off.",
+                message.arg("name"),
+                message.arg("why")
+            );
+            assert!(message.text.ends_with(&said), "{message}");
+            // 客户端在流里收到的是同一句
+            assert!(text.contains(&format!("[ThinkWatch] {said}")), "{text}");
             let u = usage.expect("切断之前的用量没有带上");
             assert_eq!(u.input, 5000);
         }
@@ -606,6 +618,52 @@ async fn a_request_every_upstream_refused_is_failed_once_for_the_reason_it_was_r
     assert_eq!(model_of(&got[0]), MODEL);
 }
 
+/// 上游回了 4xx（请求本身的问题，换一家也一样被拒）：**原话原样交给客户端，结局是一次
+/// 失败**，来自 `upstream`，原因是上游在错误正文里说的那句话。以前报的是结束 —— 那一行
+/// 在流量、概览、会话里都像是成功的，对话里只剩用户的那句话
+#[tokio::test]
+async fn an_error_answer_passed_on_to_the_client_is_failed_once_in_the_upstreams_words() {
+    const SAID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 212000 tokens > 200000 maximum"}}"#;
+    let up = listen(Router::new().fallback(any(|| async {
+        axum::response::Response::builder()
+            .status(400)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(SAID))
+            .unwrap()
+    })))
+    .await;
+    let (gw, mut events) = serve(cfg(provider(up))).await;
+    let r = post(gw).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    // 那是上游说的话，不是网关的错误
+    assert!(r.headers().get("x-thinkwatch-error").is_none());
+    assert_eq!(r.text().await.unwrap(), SAID);
+
+    let got = endings(&mut events).await;
+    assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
+    match &got[0] {
+        Event::RequestFailed {
+            source,
+            message,
+            bytes,
+            ..
+        } => {
+            assert_eq!(source, "upstream");
+            assert_eq!(message.code, "gw.upstream.status_message");
+            assert_eq!(message.arg("upstream"), "up");
+            assert_eq!(message.arg("status"), "400");
+            assert_eq!(
+                message.arg("message"),
+                "prompt is too long: 212000 tokens > 200000 maximum"
+            );
+            // 响应头到了：收到的字节是有的
+            assert_eq!(*bytes, Some(SAID.len() as u64));
+        }
+        other => panic!("该是一次失败，实际 {other:?}"),
+    }
+    assert_eq!(model_of(&got[0]), MODEL);
+}
+
 // ---------------------------------------------------------------- WebSocket
 
 /// 一次 Codex 会话结束了。**以前 WS 这条路只有开始、没有结局**，每一条连接
@@ -688,16 +746,40 @@ async fn a_websocket_cut_for_a_dangerous_tool_call_is_failed_as_denied() {
         .await
         .unwrap();
 
+    let said = tokio::time::timeout(Duration::from_secs(3), client.next())
+        .await
+        .expect("等说明超时")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap()
+        .to_string();
+
     let got = endings(&mut events).await;
     assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
-    assert!(
-        matches!(
-            &got[0],
-            Event::RequestFailed { source, message, .. }
-                if source == "denied" && message.arg("tool") == "Bash"
-        ),
-        "该是一次带着工具名的拦截：{got:?}"
+    let Event::RequestFailed {
+        source, message, ..
+    } = &got[0]
+    else {
+        panic!("该是一次拦截，实际 {got:?}");
+    };
+    assert_eq!(source, "denied");
+    assert_eq!(message.code, "gw.toolcall.connection_cut", "{message}");
+    assert_eq!(message.arg("tool"), "Bash", "{message}");
+    assert_eq!(message.arg("rule"), "curl-pipe-sh", "{message}");
+    // **句子不说这个调用出自谁**：插件也能造工具调用。上游另作一个参数留着
+    assert_eq!(message.arg("upstream"), "up", "{message}");
+    assert_eq!(
+        message.text,
+        format!(
+            "The answer contained a Bash call that matched rule “{}” ({}), \
+             so the connection was cut.",
+            message.arg("name"),
+            message.arg("why")
+        )
     );
+    // 告诉客户端的就是结局里那句带码的话，不是另写的一句
+    assert_eq!(said, format!("[ThinkWatch] {}", message.text));
 }
 
 /// 上游写到一半在流里报错：客户端照样收到上游的原话，**结局是一条失败**，不是成功 ——

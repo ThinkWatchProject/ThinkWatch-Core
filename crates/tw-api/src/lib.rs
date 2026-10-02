@@ -21,6 +21,20 @@ pub mod ep;
 pub mod ts;
 pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 
+// 三项防护的规则视图、「测试…」、档位和几个取值固定的词在 tw-guard 里定义一次，企业版的
+// 管理接口返回同一份 JSON。导出成 TypeScript 时名字照旧（`GuardMode`、`SecurityRuleView`、
+// `SecurityTestRequest`……）
+pub use tw_guard::content::Outcome as ContentOutcome;
+pub use tw_guard::policy::{ContentMatch, Guard, Mode as GuardMode};
+pub use tw_guard::trial::{
+    TrialHit as SecurityTestHit, TrialRequest as SecurityTestRequest,
+    TrialResult as SecurityTestResult,
+};
+pub use tw_guard::view::{
+    CardNetwork, CardPrefix, GuardDetail, Matcher, RuleAction, RuleView as SecurityRuleView,
+    SecurityDetail,
+};
+
 /// 取值是一个固定集合的字段：线上是 slug，类型是枚举。
 ///
 /// **线上仍然是那个词**（`#[serde(rename)]`），导出到前端是字符串字面量的联合，
@@ -206,17 +220,6 @@ slug_enum! {
 }
 
 slug_enum! {
-    /// 一项防护的档位。
-    pub enum GuardMode {
-        Off = "off",
-        /// 只记录
-        Observe = "observe",
-        /// 拦截
-        Enforce = "enforce",
-    }
-}
-
-slug_enum! {
     /// 安全日志的一条做了什么。
     pub enum SecurityOutcome {
         /// 只记录
@@ -225,17 +228,10 @@ slug_enum! {
         Replaced = "replaced",
         /// 已切断
         Cut = "cut",
+        /// 命中的文字删掉之后发出
+        Stripped = "stripped",
         /// 请求被拒，没有发出去
         Blocked = "blocked",
-    }
-}
-
-slug_enum! {
-    /// 内容规则怎么认。
-    pub enum ContentMatch {
-        /// 不分大小写的子串
-        Contains = "contains",
-        Regex = "regex",
     }
 }
 
@@ -246,28 +242,12 @@ slug_enum! {
         PrivateKeys = "private-keys",
         Jwt = "jwt",
         ConnStrings = "conn-strings",
-        /// 身份证号、银行卡号：个人信息，不是凭据
+        /// 身份证号、银行卡号、邮箱、手机号：个人信息，不是凭据
         Personal = "personal",
         /// 内网地址
         Internal = "internal",
         /// 自定义规则找到的
         Custom = "custom",
-    }
-}
-
-slug_enum! {
-    /// 藏匿字符的藏法。
-    pub enum HiddenKind {
-        /// 零宽字符
-        ZeroWidth = "zero_width",
-        /// Unicode 标签字符
-        Tag = "tag",
-        /// 双向控制符
-        Bidi = "bidi",
-        /// 同形异义字
-        Homoglyph = "homoglyph",
-        /// 私用区
-        PrivateUse = "private_use",
     }
 }
 
@@ -678,26 +658,46 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 从存下来的正文里读出每一轮新说的话、回答、推理、工具调用和结果，读不到的地方逐轮说出来
 /// （[`TranscriptGap`]）。照 31 写的界面只有每一轮的用量和金额。
 ///
-/// **33 起有脚本插件**：`/plugins` 一组端点（列表、试编、装、改、换源码、看改动、批准、
+/// 同一版起**上游回了错误、原样交给客户端的请求是失败的**：结局是 [`Event::RequestFailed`]
+/// （`upstream`，上游在错误正文里说的话是 `gw.upstream.status_message`），记录的 `error`
+/// 有值，概览、会话、上游体检都数它。以前它是 `RequestFinished`、`error` 为空，对话里那
+/// 一轮只剩用户的话，没有回答，也说不出为什么。[`TurnView`] 多了 `status`，说得出上游回了
+/// 什么。照 31 写的界面看不到那个状态码。
+///
+/// **33 起安全防护只剩三项**：出站脱敏、工具调用审查、内容过滤。藏匿字符并进了内容过滤
+/// （「隐藏字符」一组内置规则，按码位认），输出长度删了：[`Guard`]、[`SecurityDetail`]、
+/// [`SecurityView`]、[`SecurityCounts`] 都只剩这三项，端点 `PUT /security/{guard}/limit`
+/// 删了，事件 `hidden_text_found`、`output_limited` 没有了，配置里写 `hidden_text`、
+/// `output_limit` 加载不了。内容规则多了处置「删除」（[`RuleAction`] 的 `strip`，命中的字
+/// 删掉之后发出）和写法「码位」（[`ContentMatch`] 的 `codepoints`）；[`Event::ContentMatched`]
+/// 按结局（[`ContentOutcome`]）说，带着几处、解出来的隐藏内容和匹配方式，不再是
+/// `blocked`；安全日志（[`SecurityEventView`]）多了 `revealed` 和 `match`，结局多了
+/// `stripped`（[`SecurityOutcome`]、[`SecurityOutcomeCounts`]）。出站脱敏的规则有了占位符
+/// 名称（[`SecurityRuleView`] 和 [`CustomRuleSave`] 的 `label`），内置目录多了邮箱和手机号
+/// （[`Matcher`] 的 `email`、`cn-mobile-phone`）。「测试…」可以带处置（`action`），结果
+/// 多了发出去的样子（`output`）和会不会被拒（`refused`）。规则视图、测试和这几个词的类型
+/// 在 tw-guard 里定义，企业版的管理接口返回同一份。照 32 写的界面读不懂这些。
+///
+/// **34 起有脚本插件**：`/plugins` 一组端点（列表、试编、装、改、换源码、看改动、批准、
 /// 排顺序、删、试跑、日志），事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者
 /// 文件变了、加载不了而停用），[`RequestDetail`] 多了 `plugins`（每一次运行，带着跑在
 /// 尝试链的第几跳）和 `request_after_plugins`（插件改过的请求体），[`HistoryRow`] 多了
-/// `plugin_changed`。装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 32
+/// `plugin_changed`。装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 33
 /// 写的界面看不到插件。
 ///
-/// 33 起**改得了工具调用的插件要点过头才能打开**：`UpdatePlugin` 拒绝打开权限里有
+/// 34 起**改得了工具调用的插件要点过头才能打开**：`UpdatePlugin` 拒绝打开权限里有
 /// `reply_tool_calls` 的插件（读不出权限的也算）、改它的设置或范围（403，
 /// `control.plugin.needs_confirmation`），这几样走新端点 `PUT /plugins/{id}/confirmed`
 /// （`UpdatePluginConfirmed`，请求体同 [`PluginUpdate`]）—— 它和装、换源码、批准一样
 /// 不给网页调，桌面端在系统的确认框里点了头才发。同一版起 core 自带几个默认插件，第一次
 /// 见到时装上、停用着，写配置的这一版来源是 [`ConfigOrigin::Defaults`]。
 ///
-/// 33 起**插件说得出自己处理哪几种请求**：[`ManifestView`] 和 [`PluginView`] 多了
+/// 34 起**插件说得出自己处理哪几种请求**：[`ManifestView`] 和 [`PluginView`] 多了
 /// `requests`（[`RequestKind`]：对话、嵌入、旧版补全）。插件只处理声明了的那几种 ——
 /// 不写是只有对话；嵌入和旧版补全要插件自己声明 —— 别的种类的请求不过它、不记录，
 /// 它出错、文件变了也拦不着它们。嵌入和旧版补全的视图是一项输入一条消息，`ctx.format`
 /// 多了 `openai_embeddings`、`openai_completions`、`gemini_embed`。
-pub const CONTROL_API_VERSION: u32 = 33;
+pub const CONTROL_API_VERSION: u32 = 34;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -860,7 +860,9 @@ pub enum Event {
     /// 只有成功的流式响应有。非流式的整段一起到，没有「第一个」；不带 `alt=sse` 的
     /// Gemini 流和 WebSocket 那条路不在这里解析，也没有。
     RequestFirstToken { id: u64, ttft_ms: u64 },
-    /// 结束了
+    /// 结束了：上游回的是成功的状态码（2xx；WebSocket 那条路是升级成功的 101），回答
+    /// 交完了。**上游回了别的、原样交给了客户端的不是这一条**，是 `RequestFailed` ——
+    /// 客户端拿到的是上游的错误，不是回答
     RequestFinished {
         id: u64,
         /// 客户端要的模型名，和 `RequestStarted` 里的是同一个。
@@ -899,6 +901,10 @@ pub enum Event {
     /// （`auth` / `config` / `upstream` / `request` / `rate_limited` /
     /// `denied`），另外多一个 `internal`：网关自己的代码
     /// 崩掉了。它只出现在这里 —— 那时往往已经没有一个 HTTP 响应能带上它。
+    ///
+    /// **上游回了错误（不是 2xx）、原样交给客户端的也是失败**（`upstream`）：先有那个
+    /// 状态码的 `RequestHeaders`，`message` 是上游在错误正文里说的话
+    /// （`gw.upstream.status_message`，读不出来的是 `gw.upstream.status`）。
     RequestFailed {
         id: u64,
         /// 模型名。理由见 `RequestFinished::model`
@@ -1000,46 +1006,37 @@ pub enum Event {
         /// 一家都没接下时是 `per-token`：没有哪一家的计费方式可以跟着走。
         billing: Billing,
     },
-    /// 调用方发来的正文里（连同工具结果）有藏起来的字符：标签字符或双向控制符。
+    /// 调用方发来的正文里（连同工具结果）命中了内容规则。**一条规则一条事件**，在请求
+    /// 开始之后报（结论在开始之前就定了：删过的请求，开始事件和存下来的就是删过的那一份）。
     ///
-    /// **观察档和拦截档报的是同一条**，差别只在 `blocked`：拦截档下这个请求没有
-    /// 发出去，随后是一条来源为 `denied` 的失败。
-    HiddenTextFound {
-        id: u64,
-        /// 这时要发往的上游（故障转移之前的首选）
-        provider: String,
-        /// 请求被拒了吗。`false` = 观察档，只记录
-        blocked: bool,
-        items: Vec<HiddenItem>,
-        at_ms: u64,
-    },
-    /// 调用方发来的正文里（连同工具结果）命中了内容规则。**一条规则一条事件**。
+    /// 处置档下：拒绝的那几条是 `blocked`，请求没有发出去，随后是一条来源为 `denied` 的
+    /// 失败（别的命中是 `recorded`：没发出去也就没删）；不拒绝时删除规则命中的是
+    /// `stripped`，命中的字已经删掉。观察档一律 `recorded`。
     ContentMatched {
         id: u64,
+        /// 这时要发往的上游（故障转移之前的首选）
         provider: String,
         /// 内置规则的 id，或者自定义规则的名字
         rule: String,
         custom: bool,
-        /// 这条规则在拦截档下做什么：`block` / `record`
+        /// 这条规则怎么认：码位规则命中的是看不见的字符，`count` 是几个字符
+        #[serde(rename = "match")]
+        matching: ContentMatch,
+        /// 这条规则在处置档下做什么：`block` / `strip` / `record`
         action: RuleAction,
-        /// 请求被拒了吗。**拦截档 + 规则是拦**两者同时成立才会
-        blocked: bool,
-        /// 在工具结果里，而不是调用方自己打的字
+        /// 实际做了什么
+        outcome: ContentOutcome,
+        /// 第一处在工具结果里，而不是调用方自己打的字
         in_tool_result: bool,
-        /// 命中处前后的一小段，**已截断**
+        /// 第一处前后的一小段，**已截断**。码位规则命中的字符画成 `‹U+E0049›`，连成一串
+        /// 的写成 `‹U+E0049 ×12›`
         excerpt: String,
-        at_ms: u64,
-    },
-    /// 模型这一次回答的正文超过了输出长度上限。**一个请求最多一条**，在超的那一刻报。
-    OutputLimited {
-        id: u64,
-        provider: String,
-        /// 上限，按字符数
-        max_chars: u64,
-        /// 超的那一刻数到了多少
-        seen_chars: u64,
-        /// 切断了吗：流从那一帧起不再发、整包整份不发。`false` = 观察档，只记录
-        cut: bool,
+        /// 这条规则在整个请求里命中了几处；码位规则是几个字符
+        count: u64,
+        /// 码位规则命中了标签字符时，它们解出来的 ASCII 原文（最多 120 个字符）。别的时候
+        /// 没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revealed: Option<String>,
         at_ms: u64,
     },
     /// 一个请求发出前，按出站脱敏的规则找到了东西。
@@ -1362,7 +1359,8 @@ slug_enum! {
     /// 尝试链里一跳的结果。
     pub enum AttemptOutcome {
         /// 这一跳接下了请求，尝试链到此为止。上游回的是 4xx 也算 —— 请求本身有
-        /// 问题，换一个上游也一样被拒
+        /// 问题，换一个上游也一样被拒；那个错误原样交给客户端，**请求本身记成失败**
+        /// （见 [`Event::RequestFailed`]）
         Served = "served",
         /// 上游返回 5xx 或 429，换下一个上游
         Status = "status",
@@ -1519,9 +1517,7 @@ impl Event {
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
             | Event::SecretsFound { id, .. }
-            | Event::HiddenTextFound { id, .. }
             | Event::ContentMatched { id, .. }
-            | Event::OutputLimited { id, .. }
             | Event::RequestPriced { id, .. }
             | Event::HealthChanged { id, .. }
             | Event::ModelsChanged { id, .. }
@@ -1612,7 +1608,7 @@ pub struct InFlightRequest {
     /// 关于它的事件，**照事件流上的样子、按发生的先后**：第一条是 `RequestStarted`，
     /// 之后是到目前为止发生了的 —— 响应头、路由、格式转换、防护的记录
     /// （`RequestHeaders`、`RequestFirstToken`、`RequestRouted`、`Translated`、`SecretsFound`、
-    /// `HiddenTextFound`、`ContentMatched`、`OutputLimited`、`ToolCallFlagged`）。
+    /// `ContentMatched`、`ToolCallFlagged`）。
     /// 说的是上游现状的（`QuotaSeen`）不在里面：那是 `/quota` 的事
     pub events: Vec<Event>,
 }
@@ -1773,17 +1769,15 @@ pub struct FailoverView {
 
 /// 每项防护各在哪一档：`off` / `observe` / `enforce`。
 ///
-/// **「拦截」在各项上做的事不一样**：脱敏是替换成占位符，工具调用审查和输出长度
-/// 是切断响应，藏匿字符和内容过滤是拒绝请求。
-/// 规则和日志在 [`SecurityDetail`] 和 `/security/events` 里，不塞进概览。
+/// **第三档在各项上做的事不一样**：脱敏是替换成占位符，工具调用审查是切断响应，内容
+/// 过滤按规则各自拒绝、删除或仅记录。规则和日志在 [`SecurityDetail`] 和
+/// `/security/events` 里，不塞进概览。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityView {
     pub redact: GuardMode,
     pub inspect_tools: GuardMode,
-    pub hidden_text: GuardMode,
     pub content: GuardMode,
-    pub output_limit: GuardMode,
 }
 
 /// 一个上游。**设置是配置里写的原样**，密钥也不打码：编辑对话框回填的就是它，
@@ -3314,6 +3308,8 @@ pub enum CostDim {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Summary {
     pub requests: i64,
+    /// 失败的请求（[`HistoryRow::error`] 有值的）：网关没转发成的，和上游回了错误、原样
+    /// 交给客户端的。客户端先走了的不算（见 [`HistoryRow::cancelled`]）
     pub failed: i64,
     /// 本地应答的次数。**是个正向数字**，单独显示
     pub locally_answered: i64,
@@ -3334,7 +3330,7 @@ pub struct Summary {
     ///
     /// 和 `unpriced_requests` 一样让金额合计偏低，但配价格解决不了它 ——
     /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
-    /// 取消的，失败的和上游回了 4xx 的不算。
+    /// 取消的，失败的不算（上游回了错误的也是失败，那种响应不计费）。
     pub no_usage_requests: i64,
     /// 用了缓存之后净省下多少微分。
     ///
@@ -3571,7 +3567,11 @@ pub struct HistoryRow {
     pub cost_micros: Option<i64>,
     /// 这个成本是估的吗。**界面上要标出来**
     pub cost_estimated: bool,
-    /// 失败的原因。**带着码** —— 翻历史时界面照样能说自己那句话；
+    /// 失败的原因。**带着码** —— 翻历史时界面照样能说自己那句话。
+    ///
+    /// **有它就是失败**，数失败的地方都按它数（概览、会话、上游体检、搜索的筛选）：网关
+    /// 没转发成的（连不上、被拒、断在半路），和上游回了错误（不是 2xx）、原样交给客户端
+    /// 的 —— 那时 `status` 是上游回的那个状态码，这一句是它在错误正文里说的话
     pub error: Option<Msg>,
     /// 本地应答的
     pub local: bool,
@@ -3710,7 +3710,8 @@ pub struct TranslatedView {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RequestDetail {
     pub row: HistoryRow,
-    /// 客户端发来的原样
+    /// 客户端发来的那一份。内容过滤删过字的话是删过的样子：插件拿到的、没有插件时发往
+    /// 上游的都是它
     pub request_body: Option<BodyView>,
     /// 插件改过之后、发往上游的那一份：最后发出去的那一跳收到的（回答的那一家收到的就是
     /// 它）。**只有插件改了那一跳的请求才有**
@@ -4071,6 +4072,14 @@ pub struct TurnView {
     /// **没有价格就是 None，不是 0**
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// 上游回的状态码，和 [`HistoryRow::status`] 同一个。没走到上游的没有：连不上、
+    /// 被规则拒绝、客户端在响应头到之前就走了
+    pub status: Option<u16>,
+    /// 这一轮为什么失败（见 [`HistoryRow::error`]）。没失败是 None。
+    ///
+    /// **上游回了错误、原样交给客户端的也在这里**：`status` 是那个状态码，这一句是
+    /// 上游在错误正文里说的话（`gw.upstream.status_message`，读不出来的是
+    /// `gw.upstream.status`）。网关自己没转发成的没有 `status`，原因只在这一句里
     pub error: Option<Msg>,
     /// 客户端没等到这一轮结束就走了（见 `HistoryRow::cancelled`）
     pub cancelled: bool,
@@ -4467,6 +4476,10 @@ pub struct ClientKey {
 }
 
 // ---------------------------------------------------------------- 安全
+//
+// 规则视图、「测试…」的请求和结果、档位和几个取值固定的词在 tw-guard 里（见文件头的
+// 重导出）：两个产品的管理接口返回同一份。这里是桌面版自己的：事件里、日志里、概览里的
+// 那几样，和改配置的几个请求。
 
 /// 出站脱敏找到的一项：哪条规则、哪个值（已打码）、在这个请求里出现了几次。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4480,54 +4493,10 @@ pub struct SecretItem {
     /// `internal` / `custom`
     pub kind: SecretKind,
     /// **已打码。**报出来的东西一律打码 —— 「发现了 sk-ant-xxx」这句话本身
-    /// 就是一次泄漏。内网地址和内部域名例外，它们不是凭据；身份证号和卡号只留
-    /// 最后四位（`…1234`）
+    /// 就是一次泄漏。内网地址和内部域名例外，它们不是凭据；身份证号、卡号、手机号
+    /// 只留最后四位（`…1234`），邮箱只留第一个字和域名（`z…@example.com`）
     pub masked: String,
     pub count: u64,
-}
-
-/// 藏匿字符的一种：哪一种、在哪儿、几处、第一个长什么样。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct HiddenItem {
-    /// `tag`（Unicode 标签字符）/ `bidi`（双向控制符）
-    pub kind: HiddenKind,
-    /// 在工具结果里，而不是调用方自己打的字
-    pub in_tool_result: bool,
-    pub count: u64,
-    /// 第一个的码位，写成 `U+E0049`
-    pub example: String,
-    /// 标签字符解出来的原文（最多 120 个字符）：**藏的是什么**。双向控制符是空的
-    pub revealed: String,
-}
-
-slug_enum! {
-    /// 哪一项防护。配置里 `security` 下的那个键，也是接口路径里的那一段。
-    pub enum Guard {
-        /// 出站脱敏
-        Redact = "redact",
-        /// 工具调用审查
-        InspectTools = "inspect_tools",
-        /// 藏匿字符
-        HiddenText = "hidden_text",
-        /// 内容过滤
-        Content = "content",
-        /// 输出长度
-        OutputLimit = "output_limit",
-    }
-}
-
-slug_enum! {
-    /// 一条规则在拦截档下做什么。工具调用审查是 `cut` / `record`，内容过滤是
-    /// `block` / `record`；别的防护命中之后做什么由档位决定，没有这一项。
-    pub enum RuleAction {
-        /// 切断这个工具调用所在的流（工具调用审查）
-        Cut = "cut",
-        /// 拒绝这个请求，不发出去（内容过滤）
-        Block = "block",
-        /// 只记录
-        Record = "record",
-    }
 }
 
 /// 各项防护在一段时间里各留下了几条记录。
@@ -4536,30 +4505,25 @@ slug_enum! {
 pub struct SecurityCounts {
     /// 出站脱敏找到的（每条 = 一个请求里的一个值）
     pub secrets: i64,
-    /// 其中已替换的（拦截档）
+    /// 其中已替换的（替换档）
     pub secrets_replaced: i64,
     /// 命中规则的工具调用
     pub tool_calls: i64,
     /// 其中被切断的
     pub tool_calls_cut: i64,
-    /// 藏匿字符（每条 = 一个请求里一种藏法在一个地方）
-    pub hidden_text: i64,
-    /// 其中请求被拒的
-    pub hidden_text_blocked: i64,
     /// 命中内容规则的（每条 = 一个请求命中一条规则）
     pub content: i64,
     /// 其中请求被拒的
     pub content_blocked: i64,
-    /// 回答超过输出长度的
-    pub output_limit: i64,
-    /// 其中被切断的
-    pub output_limit_cut: i64,
+    /// 其中命中的文字删掉之后发出的
+    pub content_stripped: i64,
 }
 
 /// 安全日志的一条。
 ///
 /// **一条是一次命中**：出站脱敏是「一个请求里的一个值」（出现几次合成
-/// 一条，`count` 说几次），工具调用审查是「一个工具调用命中一条规则」。
+/// 一条，`count` 说几次），工具调用审查是「一个工具调用命中一条规则」，内容过滤是
+/// 「一个请求命中一条规则」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityEventView {
@@ -4567,13 +4531,12 @@ pub struct SecurityEventView {
     pub at_ms: i64,
     pub request_id: i64,
     pub guard: Guard,
-    /// 内置规则的 id，或者自定义规则的名字。藏匿字符是那一种（`tag` / `bidi`），
-    /// 输出长度是 `max_chars`
+    /// 内置规则的 id，或者自定义规则的名字
     pub rule: String,
     #[serde(default)]
     pub custom: bool,
     /// 做了什么：`recorded`（只记录）/ `replaced`（已替换）/ `cut`（已切断）/
-    /// `blocked`（请求被拒，没有发出去）
+    /// `stripped`（命中的文字删掉之后发出）/ `blocked`（请求被拒，没有发出去）
     pub action: SecurityOutcome,
     /// 请求最终由哪个上游服务；还没结束的是当时的首选
     pub provider: String,
@@ -4582,15 +4545,23 @@ pub struct SecurityEventView {
     /// 请求的模型。还没落库的请求是空的
     #[serde(default)]
     pub model: String,
-    /// 工具调用审查：哪个工具。藏匿字符和内容过滤：在工具结果里时是 `tool_result`
+    /// 工具调用审查：哪个工具。内容过滤：第一处在工具结果里时是 `tool_result`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// 出站脱敏是打码后的值；工具调用审查、内容过滤是命中的那一小段（已截断）；
-    /// 藏匿字符是第一个的码位，标签字符后面跟一个空格和解出来的原文；输出长度是上限
+    /// 出站脱敏是打码后的值；工具调用审查是命中的那一小段（已截断、已打码）；内容过滤
+    /// 是第一处前后的一小段（已截断），码位规则命中的字符画成 `‹U+E0049›`，连成一串的
+    /// 写成 `‹U+E0049 ×12›`
     pub excerpt: String,
-    /// 出站脱敏：这个值在请求里出现了几次。藏匿字符：几个字符。输出长度：超的那一刻
-    /// 数到了多少个字符。其余是 1
+    /// 出站脱敏：这个值在请求里出现了几次。内容过滤：这条规则在请求里命中了几处，码位
+    /// 规则是几个字符。工具调用审查是 1
     pub count: i64,
+    /// 内容过滤：这条规则怎么认（`contains` / `regex` / `codepoints`）。别的防护没有
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matching: Option<ContentMatch>,
+    /// 内容过滤的码位规则命中了标签字符时，它们解出来的原文（最多 120 个字符）：**藏的
+    /// 是什么**。别的时候没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revealed: Option<String>,
     /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，
     /// 只用来显示；身份是 `client` 那把密钥
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4614,12 +4585,12 @@ pub struct SecurityEventsPage {
     /// `before` 是翻页的位置，不是筛选：翻到第几页，这个数都一样。页头的
     /// 「N 次命中」是它；拿读到的条数去数，读满一页就只能写「100+」
     pub total: i64,
-    /// `total` 里各做了什么。四项加起来就是 `total`
+    /// `total` 里各做了什么。五项加起来就是 `total`
     pub by_outcome: SecurityOutcomeCounts,
 }
 
 /// 一段安全日志里，每一种做法各几条（见 [`SecurityOutcome`]）。没有的是 0，
-/// 四项都在。
+/// 五项都在。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecurityOutcomeCounts {
@@ -4629,126 +4600,10 @@ pub struct SecurityOutcomeCounts {
     pub replaced: i64,
     /// 已切断
     pub cut: i64,
+    /// 命中的文字删掉之后发出
+    pub stripped: i64,
     /// 请求被拒，没有发出去
     pub blocked: i64,
-}
-
-/// 一条内置规则按什么认。**给界面说明用**，界面按类型写成自己的话。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum Matcher {
-    /// 以 `prefix` 开头，其后至少还有 `min_tail` 个字符
-    Prefix { prefix: String, min_tail: usize },
-    /// `sk-` 开头的 OpenAI 老式密钥：全长至少 `min_len`，字母和数字都有
-    OpenaiLegacy { min_len: usize },
-    /// PEM 私钥块，BEGIN 到对应的 END 整段
-    Pem,
-    /// 三段 base64url，首段解码后含 `"alg"`
-    Jwt,
-    /// `协议://用户:口令@主机` 里的口令
-    ConnString,
-    /// RFC1918 私有地址，不含回环
-    PrivateIp,
-    /// 以这几个后缀结尾的域名
-    DomainSuffix { suffixes: Vec<String> },
-    /// 18 位的中华人民共和国居民身份证号码：头两位是省级行政区划代码，第 7–14 位
-    /// 是 `born_since` 年 1 月 1 日到今天之间的真实日期，末位是对得上的
-    /// ISO 7064 MOD 11-2 校验码（`0`–`9` 或 `X`）。15 位的老号码不认
-    CnResidentId { born_since: u16 },
-    /// 卡号：开头和位数属于其中一家卡组织，并且通过 Luhn 校验。连着写的，或者
-    /// 四位一组、用一个空格或一个连字符隔开的（最后一组可以不足四位；American
-    /// Express 另有 4-6-5、Diners Club 另有 4-6-4）。公开的测试卡号不算
-    BankCard { networks: Vec<CardNetwork> },
-    /// 正则表达式：工具调用审查的全部规则，和各项防护的自定义规则
-    Regex { pattern: String },
-    /// 不分大小写的子串：内容过滤的关键词规则
-    Contains { text: String },
-    /// 这几段码位里的字符：藏匿字符的两种，写成 `U+E0000–U+E007F`
-    Codepoints { ranges: Vec<String> },
-}
-
-/// 一家卡组织认哪些卡号：以哪几段开头、一共几位。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct CardNetwork {
-    /// 英文名（`UnionPay`、`Visa` …）。界面按它查自己的名称表
-    pub name: String,
-    pub prefixes: Vec<CardPrefix>,
-    /// 一共几位
-    pub lengths: Vec<u8>,
-}
-
-/// 卡号开头的一段，含两头、两头位数相同：`51`–`55`。只有一个数时两头相同。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct CardPrefix {
-    pub from: u32,
-    pub to: u32,
-}
-
-/// 一条规则。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecurityRuleView {
-    /// 内置规则的 id，或者自定义规则的名字
-    pub id: String,
-    #[serde(default)]
-    pub custom: bool,
-    /// 英文名。界面按 id 查自己的名称表，查不到才用它；自定义规则就是名字
-    pub name: String,
-    /// 为什么值得看一眼（英文）。出站脱敏和自定义规则没有
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub why: String,
-    /// 类别。出站脱敏：`api-keys` … `custom`；工具调用审查：`command` / `custom`；
-    /// 内容过滤：`injection` / `persona` / `chinese` / `custom`；藏匿字符：`invisible`
-    pub kind: String,
-    pub matcher: Matcher,
-    pub enabled: bool,
-    /// 出厂时开不开。自定义规则是 `true`
-    pub on_by_default: bool,
-    /// 工具调用审查、内容过滤：拦截档下做什么
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<RuleAction>,
-    /// 内置规则出厂时拦截档下做什么。和 `action` 不一样就是改过
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_action: Option<RuleAction>,
-}
-
-/// 一项防护的档位和规则。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct GuardDetail {
-    /// `off` / `observe` / `enforce`
-    pub mode: GuardMode,
-    /// 按界面上的顺序：内置的在前，自定义的在后
-    pub rules: Vec<SecurityRuleView>,
-}
-
-/// 输出长度的档位和上限。它没有规则，只有一个数。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct OutputLimitDetail {
-    /// `off` / `observe` / `enforce`
-    pub mode: GuardMode,
-    /// 上限，按字符数
-    pub max_chars: u64,
-    /// 出厂的上限
-    pub default_max_chars: u64,
-    /// 最多能设多大
-    pub ceiling: u64,
-}
-
-/// 各项防护。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecurityDetail {
-    pub redact: GuardDetail,
-    pub inspect_tools: GuardDetail,
-    /// 规则就是那两种藏法，可以各自关掉
-    pub hidden_text: GuardDetail,
-    pub content: GuardDetail,
-    pub output_limit: OutputLimitDetail,
 }
 
 /// 改档位。
@@ -4770,12 +4625,12 @@ pub struct RuleToggle {
     pub base_version: Option<String>,
 }
 
-/// 改一条内置规则在拦截档下做什么。只有工具调用审查和内容过滤的规则有这一项 ——
-/// 别的防护命中之后做什么由档位决定。
+/// 改一条内置规则在第三档下做什么。只有工具调用审查和内容过滤的规则有这一项 ——
+/// 出站脱敏的规则命中就替换。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ActionSave {
-    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `record`
+    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `strip` / `record`
     pub action: RuleAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -4786,14 +4641,19 @@ pub struct ActionSave {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CustomRuleSave {
     pub name: String,
+    /// 正则；内容过滤按 `match`：要找的那段文字、正则，或者码位（`U+200B, U+E0000–U+E007F`）
     pub pattern: String,
-    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `record`。不给按 `record`
+    /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `strip` / `record`。不给按 `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RuleAction>,
-    /// 内容过滤才有：`contains`（不分大小写的子串）/ `regex`。不给按 `contains`。
-    /// 别的防护的自定义规则都是正则
+    /// 内容过滤才有：`contains`（不分大小写的子串）/ `regex` / `codepoints`。不给按
+    /// `contains`。别的防护的自定义规则都是正则
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub matching: Option<ContentMatch>,
+    /// 出站脱敏才有：占位符名称，`PROJECT` 换成 `<<TW_PROJECT_1>>`。大写字母开头，其余是
+    /// 大写字母、数字、下划线，最多 24 个字符。不给是 `SECRET`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4802,56 +4662,6 @@ pub struct CustomRuleSave {
 
 fn yes() -> bool {
     true
-}
-
-/// 改输出长度的上限。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct LimitSave {
-    /// 按字符数，1 到 [`OutputLimitDetail::ceiling`]
-    pub max_chars: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<String>,
-}
-
-/// 拿一段文本试一试。给了 `pattern` 就只试这一条正则，给了 `rule` 就只试
-/// 这一条内置规则（停用着的也能试），都不给就按现在启用的全部规则。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecurityTestRequest {
-    pub sample: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pattern: Option<String>,
-    /// 内容过滤试 `pattern` 时怎么认：`contains` / `regex`，不给按 `contains`
-    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
-    pub matching: Option<ContentMatch>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rule: Option<String>,
-}
-
-/// 试出来的一处。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecurityTestHit {
-    pub rule: String,
-    #[serde(default)]
-    pub custom: bool,
-    /// 在样本里的位置，**按 UTF-16 码元计** —— 界面是 JavaScript，按它的
-    /// 下标切就能标出来
-    pub start: usize,
-    pub end: usize,
-    /// 出站脱敏：打码后的值；工具调用审查、内容过滤：命中的那一小段；藏匿字符：
-    /// 那个字符的码位
-    pub excerpt: String,
-    /// 工具调用审查、内容过滤：拦截档下做什么
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<RuleAction>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SecurityTestResult {
-    pub hits: Vec<SecurityTestHit>,
 }
 
 // ---------------------------------------------------------------- 脚本插件
@@ -5279,6 +5089,42 @@ pub struct PluginRunView {
 mod tests {
     use super::*;
 
+    /// 版本号就是它上面的说明写到的最新一版（「N 起」）。两条分支各自加了一版、合到一起
+    /// 时，常量那一行两边都没动、不会冲突，很容易照旧留在合并之前的那个数上 —— 照着说明
+    /// 写的界面就按旧版去读新的协议了
+    #[test]
+    fn the_api_version_is_the_newest_one_its_notes_describe() {
+        let src = include_str!("lib.rs");
+        let at = src
+            .find("\npub const CONTROL_API_VERSION")
+            .expect("the constant is declared here");
+        let notes: Vec<&str> = src[..at]
+            .lines()
+            .rev()
+            .take_while(|l| l.starts_with("///"))
+            .collect();
+        let mut newest = 0;
+        for line in &notes {
+            for (i, _) in line.match_indices(" 起") {
+                let digits: String = line[..i]
+                    .chars()
+                    .rev()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    newest = newest.max(n);
+                }
+            }
+        }
+        assert_eq!(
+            newest, CONTROL_API_VERSION,
+            "the notes above CONTROL_API_VERSION describe version {newest}"
+        );
+    }
+
     /// 枚举化的字段在线上仍然是那个词，`slug()` 说的也是它。
     #[test]
     fn closed_sets_keep_their_words_on_the_wire() {
@@ -5328,7 +5174,11 @@ mod tests {
             ContentMatch::from_slug,
         );
         check(SecretKind::ALL, SecretKind::slug, SecretKind::from_slug);
-        check(HiddenKind::ALL, HiddenKind::slug, HiddenKind::from_slug);
+        check(
+            ContentOutcome::ALL,
+            ContentOutcome::slug,
+            ContentOutcome::from_slug,
+        );
         check(LoginStatus::ALL, LoginStatus::slug, LoginStatus::from_slug);
         check(
             ChatgptLoginMode::ALL,
@@ -5429,8 +5279,60 @@ mod tests {
         assert_eq!(v["model"], "claude-sonnet-5");
     }
 
+    /// 内容过滤的命中按结局说，带着匹配方式、几处和解出来的隐藏内容；没有的不写
+    #[test]
+    fn a_content_match_says_what_happened_to_it() {
+        let e = Event::ContentMatched {
+            id: 7,
+            provider: "p".into(),
+            rule: "unicode-tags".into(),
+            custom: false,
+            matching: ContentMatch::Codepoints,
+            action: RuleAction::Strip,
+            outcome: ContentOutcome::Stripped,
+            in_tool_result: true,
+            excerpt: "page‹U+E0069 ×9›".into(),
+            count: 9,
+            revealed: Some("ignore me".into()),
+            at_ms: 1,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "content_matched");
+        assert_eq!(
+            (&v["match"], &v["action"], &v["outcome"]),
+            (
+                &serde_json::json!("codepoints"),
+                &serde_json::json!("strip"),
+                &serde_json::json!("stripped")
+            )
+        );
+        assert_eq!(
+            (v["count"].as_u64(), v["revealed"].as_str()),
+            (Some(9), Some("ignore me"))
+        );
+        assert!(v.get("blocked").is_none());
+        let Event::ContentMatched { revealed, .. } = serde_json::from_value(serde_json::json!({
+            "kind": "content_matched", "id": 1, "provider": "p", "rule": "r", "custom": true,
+            "match": "contains", "action": "record", "outcome": "recorded", "in_tool_result": false,
+            "excerpt": "x", "count": 1, "at_ms": 1
+        }))
+        .unwrap() else {
+            panic!("not a content match");
+        };
+        assert!(revealed.is_none(), "没有隐藏内容时不写这一项");
+    }
+
     #[test]
     fn the_personal_number_matchers_say_what_they_check() {
+        // 邮箱和手机号没有参数：判据写在界面上
+        assert_eq!(
+            serde_json::to_value(Matcher::Email).unwrap(),
+            serde_json::json!({ "kind": "email" })
+        );
+        assert_eq!(
+            serde_json::to_value(Matcher::CnMobilePhone).unwrap(),
+            serde_json::json!({ "kind": "cn-mobile-phone" })
+        );
         // 界面按 `kind` 写成自己的话，号段和位数照着画
         let id = serde_json::to_value(Matcher::CnResidentId { born_since: 1900 }).unwrap();
         assert_eq!(

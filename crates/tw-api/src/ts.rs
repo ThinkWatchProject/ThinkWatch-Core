@@ -212,6 +212,20 @@ mod tests {
         assert!(!login.contains("plan"), "{login}");
     }
 
+    /// 会话里的一轮说得出上游回了什么：状态码和失败的原因都是必有的字段，没有时是 null
+    #[test]
+    fn a_turn_says_what_the_upstream_answered() {
+        let ts = typescript();
+        let turn = decl_of(&ts, "TurnView");
+        for field in [
+            "status: number | null",
+            "error: Msg | null",
+            "cancelled: boolean",
+        ] {
+            assert!(turn.contains(field), "{field}: {turn}");
+        }
+    }
+
     /// 命中数带着记录从哪一刻起是全的：必有的字段，没有记录时是 null，不是省掉。
     #[test]
     fn route_stats_say_where_their_history_starts() {
@@ -402,6 +416,89 @@ mod tests {
         assert!(ts.contains(
             "  Events: { method: \"GET\", path: \"/events\", params: [], format: \"events\" },"
         ));
+    }
+
+    /// 三项防护（类型在 tw-guard 里）：名字照旧，新的取值和字段都在
+    #[test]
+    fn the_guard_contract_exports_under_the_names_the_ui_knows() {
+        let ts = typescript();
+        assert_eq!(
+            decl_of(&ts, "GuardMode"),
+            "export type GuardMode = \"off\" | \"observe\" | \"enforce\""
+        );
+        assert_eq!(
+            decl_of(&ts, "Guard"),
+            "export type Guard = \"redact\" | \"inspect_tools\" | \"content\""
+        );
+        assert_eq!(
+            decl_of(&ts, "RuleAction"),
+            "export type RuleAction = \"cut\" | \"block\" | \"strip\" | \"record\""
+        );
+        assert_eq!(
+            decl_of(&ts, "ContentMatch"),
+            "export type ContentMatch = \"contains\" | \"regex\" | \"codepoints\""
+        );
+        assert_eq!(
+            decl_of(&ts, "ContentOutcome"),
+            "export type ContentOutcome = \"recorded\" | \"stripped\" | \"blocked\""
+        );
+        assert_eq!(
+            decl_of(&ts, "SecurityOutcome"),
+            "export type SecurityOutcome = \"recorded\" | \"replaced\" | \"cut\" | \"stripped\" | \"blocked\""
+        );
+        let detail = decl_of(&ts, "SecurityDetail");
+        assert!(detail.contains("content: GuardDetail"), "{detail}");
+        assert!(
+            !detail.contains("hidden_text") && !detail.contains("output_limit"),
+            "{detail}"
+        );
+        let rule = decl_of(&ts, "SecurityRuleView");
+        for field in [
+            "label?: string",
+            "why?: string",
+            "action?: RuleAction",
+            "matcher: Matcher",
+        ] {
+            assert!(rule.contains(field), "{field}: {rule}");
+        }
+        let matcher = decl_of(&ts, "Matcher");
+        for kind in [
+            "\"kind\": \"codepoints\", ranges: Array<string>",
+            "\"kind\": \"email\"",
+            "\"kind\": \"cn-mobile-phone\"",
+            "\"kind\": \"bank-card\", networks: Array<CardNetwork>",
+            // 代码实现的工具调用规则（凭据外传、上传本地文件）走这个 matcher
+            "\"kind\": \"builtin\", check: string",
+        ] {
+            assert!(matcher.contains(kind), "{kind}: {matcher}");
+        }
+        let req = decl_of(&ts, "SecurityTestRequest");
+        for field in [
+            "match?: ContentMatch",
+            "label?: string",
+            "action?: RuleAction",
+        ] {
+            assert!(req.contains(field), "{field}: {req}");
+        }
+        let res = decl_of(&ts, "SecurityTestResult");
+        for field in ["output: string | null", "refused: boolean"] {
+            assert!(res.contains(field), "{field}: {res}");
+        }
+        let log = decl_of(&ts, "SecurityEventView");
+        for field in ["match?: ContentMatch", "revealed?: string"] {
+            assert!(log.contains(field), "{field}: {log}");
+        }
+        let event = decl_of(&ts, "Event");
+        assert!(event.contains("outcome: ContentOutcome"), "{event}");
+        assert!(!event.contains("hidden_text_found") && !event.contains("output_limited"));
+        assert!(!ts.contains("SetSecurityLimit") && !ts.contains("OutputLimitDetail"));
+        assert!(!ts.contains("HiddenKind") && !ts.contains("HiddenItem"));
+        let counts = decl_of(&ts, "SecurityCounts");
+        assert!(counts.contains("content_stripped: number"), "{counts}");
+        assert!(
+            !counts.contains("hidden_text") && !counts.contains("output_limit"),
+            "{counts}"
+        );
     }
 
     #[test]

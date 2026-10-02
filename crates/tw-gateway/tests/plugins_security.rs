@@ -4,7 +4,7 @@
 //! - I3：两次请求之间什么都不留。
 //! - I5：插件只看到占位符，请求、回答、工具调用三处都是，和出站脱敏开在哪一档无关。
 //! - I6：插件只拿到授权的那几节；改了别的、改了不可改的，算出错。
-//! - I7：插件之后，出站脱敏、内容审查、工具调用审查、输出长度照常看插件改过的那一版。
+//! - I7：插件之后，出站脱敏、内容过滤、工具调用审查照常看插件改过的那一版。
 //! - I8（附录二之后）：请求钩子在路由之后、每次发往上游前跑一次。换到别的上游时从客户端的
 //!   原始请求重来，给上一个上游的改动到不了下一个；同一个上游重发（去封存）沿用结果。
 //! - I9：文件变了的插件不跑：`reject` 拒绝请求，`skip` 原样放行。
@@ -25,8 +25,8 @@ use std::time::Duration;
 use plugin_harness::*;
 use serde_json::{Value, json};
 use tw_config::{
-    ContentAction, ContentPolicy, CustomContentRule, HiddenPolicy, OutputLimitPolicy, RedactPolicy,
-    Security, SecurityMode, ToolPolicy,
+    ContentAction, ContentPolicy, CustomContentRule, RedactPolicy, Security, SecurityMode,
+    ToolPolicy,
 };
 
 /// 用户粘进对话里的那把 key（出站脱敏的 anthropic-api-key 规则认得它）
@@ -319,7 +319,8 @@ export function onRequest(req) {
     assert_eq!(r.source.as_deref(), Some("denied"), "{}", r.body);
     assert_eq!(up.hits(), 0, "the request reached the upstream");
 
-    // 藏匿字符：插件写进去的 Unicode 标签字符照样被查出来
+    // 看不见的字符：插件写进去的 Unicode 标签字符照样被查出来。出厂的「标签字符」规则在
+    // 处置档下是删除：删掉之后才发，上游一个都收不到，记一条「已删除」
     let adds_tags = r#"
 export const manifest = { name: "藏一句", api: 1, permissions: ["messages"] };
 export function onRequest(req) {
@@ -327,10 +328,46 @@ export function onRequest(req) {
   req.messages[0].parts[0].text += hidden;
   return req;
 }"#;
+    let tagged = |s: &str| s.chars().any(|c| ('\u{E0000}'..='\u{E007F}').contains(&c));
     let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
     let security = Security {
-        hidden_text: HiddenPolicy {
+        content: ContentPolicy {
             mode: SecurityMode::Enforce,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let gw = Gateway::start(config(&up, security), vec![Plug::new("tags", adds_tags)]).await;
+    let mut rx = gw.events();
+    let r = gw.ask(plain("你好", false)).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(up.hits(), 1);
+    let sent = up.body(0)["messages"][0]["content"].to_string();
+    assert!(
+        !tagged(&up.raw(0)),
+        "hidden characters reached the upstream: {sent}"
+    );
+    assert!(sent.contains("你好"), "{sent}");
+    let mut stripped = Vec::new();
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        match ev {
+            tw_api::Event::ContentMatched { rule, outcome, .. } => stripped.push((rule, outcome)),
+            tw_api::Event::RequestFinished { .. } | tw_api::Event::RequestFailed { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        stripped,
+        [("unicode-tags".to_string(), tw_api::ContentOutcome::Stripped)],
+        "what the plugin hid was not reported as stripped"
+    );
+
+    // 同一条规则改成拒绝：整个请求不发
+    let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
+    let security = Security {
+        content: ContentPolicy {
+            mode: SecurityMode::Enforce,
+            actions: [("unicode-tags".to_string(), ContentAction::Block)].into(),
             ..Default::default()
         },
         ..Default::default()
@@ -339,43 +376,6 @@ export function onRequest(req) {
     let r = gw.ask(plain("你好", false)).await;
     assert_eq!(r.source.as_deref(), Some("denied"), "{}", r.body);
     assert_eq!(up.hits(), 0);
-}
-
-#[tokio::test]
-async fn the_output_limit_counts_what_a_reply_plugin_wrote() {
-    let inflate = r#"
-export const manifest = { name: "放大", api: 1, permissions: ["reply.text"] };
-export function onReplyText(text) { return text.repeat(50); }"#;
-    let up = Upstream::start(vec![Answer::Text("一二三四五六七八九十".into())]).await;
-    let security = Security {
-        output_limit: OutputLimitPolicy {
-            mode: SecurityMode::Enforce,
-            max_chars: 100,
-        },
-        ..Default::default()
-    };
-    let gw = Gateway::start(config(&up, security), vec![Plug::new("inflate", inflate)]).await;
-    for stream in [true, false] {
-        let r = gw.ask(plain("你好", stream)).await;
-        let text = if stream {
-            sse_text(&r.body)
-        } else {
-            json_text(&r.body)
-        };
-        assert!(
-            text.chars().count() <= 100,
-            "{stream}: {} characters went out: {}",
-            text.chars().count(),
-            r.body
-        );
-        // 没有插件的话这段回答只有十个字，根本到不了上限：被切是因为插件写的那 500 个字
-        assert!(
-            r.body.contains("output limit"),
-            "{stream}: the answer was not cut by the output limit: {}",
-            r.body
-        );
-    }
-    assert_eq!(gw.outcomes("inflate"), ["changed", "changed"]);
 }
 
 #[tokio::test]

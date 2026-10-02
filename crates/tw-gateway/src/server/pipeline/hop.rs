@@ -37,6 +37,9 @@ pub(super) struct Served<'a> {
     /// 成功那一跳的转换。**必须是成功那一次的** —— 故障转移从 Anthropic 上游
     /// 切到 OpenAI 上游时，两跳转成的格式不一样；直通时是 None
     pub(super) session: Option<tw_dialect::convert::Session>,
+    /// 交出去的是网关替上游说的一句话，不是它的原话（Bedrock 拒绝凭证，见
+    /// [`bedrock_refusal`]）：这个请求失败的原因就是这一句。别的都是 None
+    pub(super) refusal: Option<tw_types::Msg>,
 }
 
 /// 这个请求的着落。
@@ -475,10 +478,11 @@ pub(super) async fn try_upstreams<'a>(
                         };
                         note_health(&state.bus, &state.health, &provider.name, change);
                         // Bedrock 拒绝凭证时的原话会点名账号和 IAM 身份：换成我们自己的话再交出去
-                        let r = if provider.is_bedrock() && matches!(status, 401 | 403) {
-                            bedrock_refusal(provider, r).await
+                        let (r, refusal) = if provider.is_bedrock() && matches!(status, 401 | 403) {
+                            let (r, ours) = bedrock_refusal(provider, r).await;
+                            (r, Some(ours))
                         } else {
-                            r
+                            (r, None)
                         };
                         chain.push(hop(
                             &provider.name,
@@ -495,6 +499,7 @@ pub(super) async fn try_upstreams<'a>(
                             bridge,
                             ledger,
                             session: out.session,
+                            refusal,
                         });
                         break;
                     }
@@ -594,6 +599,7 @@ pub(super) async fn try_upstreams<'a>(
                     bridge,
                     ledger,
                     session: out.session,
+                    refusal: None,
                 });
                 break;
             }
@@ -1270,6 +1276,7 @@ async fn send(
 }
 
 /// Bedrock 拒绝了凭证（401/403）：状态码和响应头照原样，正文换成我们自己的一句话。
+/// 交回换好的响应和那句话 —— 请求记录里失败的原因也是它。
 ///
 /// **AWS 的原话会点名账号 ID 和 IAM 身份**（`User: arn:aws:iam::…` is not authorized…），
 /// 那不能交给客户端，也不能进请求记录。能说的是异常名：凭证被拒、过期、没有权限，是
@@ -1277,7 +1284,7 @@ async fn send(
 async fn bedrock_refusal(
     provider: &tw_config::Provider,
     r: reqwest::Response,
-) -> reqwest::Response {
+) -> (reqwest::Response, tw_types::Msg) {
     let status = r.status();
     let mut headers = r.headers().clone();
     let named = headers
@@ -1292,35 +1299,37 @@ async fn bedrock_refusal(
         (Some("ExpiredTokenException"), Some(profile)) => msg!(
             "gw.upstream.aws_profile_expired",
             upstream = provider.name.clone(), profile = profile =>
-            "[ThinkWatch] The temporary AWS credential of upstream `{upstream}` has expired. \
-             Refresh AWS profile `{profile}`; the next request reads it again."
+            "The temporary AWS credential of upstream `{upstream}` has expired. Refresh AWS \
+             profile `{profile}`; the next request reads it again."
         ),
         (Some("ExpiredTokenException"), None) => msg!(
             "gw.upstream.aws_token_expired", upstream = provider.name.clone() =>
-            "[ThinkWatch] The temporary AWS credential of upstream `{upstream}` has expired. \
-             Replace its session token and the access keys that came with it."
+            "The temporary AWS credential of upstream `{upstream}` has expired. Replace its \
+             session token and the access keys that came with it."
         ),
         (Some(kind), _) => msg!(
             "gw.upstream.bedrock_refused",
             upstream = provider.name.clone(), status = status.as_u16(), kind = kind =>
-            "[ThinkWatch] AWS refused the credential of upstream `{upstream}` (HTTP {status}, \
-             {kind}). Check that the credential is valid and may use this model. AWS's own \
-             message names the account, so it is not passed on."
+            "AWS refused the credential of upstream `{upstream}` (HTTP {status}, {kind}). Check \
+             that the credential is valid and may use this model. AWS's own message names the \
+             account, so it is not passed on."
         ),
         // AWS 没说是哪种异常：另一句话，不拿一个英文词组去填 `{kind}` —— 那一格在译文里
         // 就是一段没翻译的英文
         (None, _) => msg!(
             "gw.upstream.bedrock_refused_unnamed",
             upstream = provider.name.clone(), status = status.as_u16() =>
-            "[ThinkWatch] AWS refused the credential of upstream `{upstream}` (HTTP {status}). \
-             Check that the credential is valid and may use this model. AWS's own message names \
-             the account, so it is not passed on."
+            "AWS refused the credential of upstream `{upstream}` (HTTP {status}). Check that the \
+             credential is valid and may use this model. AWS's own message names the account, \
+             so it is not passed on."
         ),
     };
     for h in ["content-length", "content-type", "transfer-encoding"] {
         headers.remove(h);
     }
-    let body = serde_json::json!({ "message": text.text }).to_string();
+    // 前缀只在交给客户端的这一份上（和网关自己的错误一样，见 `crate::error`）：记录里的
+    // 那一句是这次请求失败的原因，界面按码翻译
+    let body = serde_json::json!({ "message": format!("[ThinkWatch] {}", text.text) }).to_string();
     let mut resp = http::Response::new(body);
     *resp.status_mut() = status;
     *resp.headers_mut() = headers;
@@ -1328,7 +1337,7 @@ async fn bedrock_refusal(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
-    reqwest::Response::from(resp)
+    (reqwest::Response::from(resp), text)
 }
 
 /// 读错误响应的开头（最多 [`crate::failure::BODY_PEEK`]），交回读到的和一个照旧能从头
