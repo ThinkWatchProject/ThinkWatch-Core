@@ -689,7 +689,7 @@ async fn the_shipped_defaults_go_in_turned_off_without_starting_the_sandbox() {
     let again = b.restart(engine.clone());
     assert_eq!(Seeder::shipped().seed(&again.mgr).await, Seeded::default());
     let v = again.plugin("wsl-paths").await;
-    assert_eq!(v["name"], "WSL 路径转换");
+    assert_eq!(v["name"], "Convert WSL and Windows paths");
     assert_eq!(v["permissions"], json!(["messages", "reply_tool_calls"]));
     assert_eq!(engine.count(), 0);
 }

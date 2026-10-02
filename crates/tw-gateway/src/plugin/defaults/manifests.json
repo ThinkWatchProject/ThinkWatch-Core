@@ -2,14 +2,14 @@
   "deepseek-flags": {
     "manifest": {
       "api": 1,
-      "description": "DeepSeek 接口会拒收含特定地区旗帜表情的请求，含有它们的会话因此无法继续。请求发出前把这些表情换成 ASCII 占位文字，回答里再换回原样。默认对发往 deepseek 开头的模型的请求生效。",
+      "description": "DeepSeek's API rejects requests that contain a certain regional flag emoji with 400 Content Exists Risk, and the whole conversation then stays stuck. This plugin replaces such emoji with placeholder text before sending and puts them back in answers and tool calls.",
       "hooks": {
         "reply_text": true,
         "reply_text_end": true,
         "request": true,
         "tool_call": true
       },
-      "name": "DeepSeek：替换会被拒收的旗帜表情",
+      "name": "Avoid DeepSeek request rejections",
       "permissions": [
         "system",
         "messages",
@@ -26,19 +26,19 @@
       },
       "settings": []
     },
-    "sha256": "75012e294a8e019db17c88652bd291fa2f6c03a0f625bd097bac553b153fb450"
+    "sha256": "96a1069558726008bb19f39b09288585634570af55e02eec6194d4a50bee4327"
   },
   "reply-language": {
     "manifest": {
       "api": 1,
-      "description": "在系统提示词末尾要求模型用指定的语言回答。",
+      "description": "Adds a fixed line to the end of the system prompt that asks the model to answer in the language set here.",
       "hooks": {
         "reply_text": false,
         "reply_text_end": false,
         "request": true,
         "tool_call": false
       },
-      "name": "指定回答语言",
+      "name": "Answer in a chosen language",
       "permissions": [
         "system"
       ],
@@ -57,19 +57,19 @@
         }
       ]
     },
-    "sha256": "930de8249548edea683c7ce04970c592adb6c8d7d50eb1b72c8d5fb0609baede"
+    "sha256": "df13934d4b0d7875f3c6f6882105757b7c3b4eb0a1f12bc9f35fc12ec2c26f5f"
   },
   "wsl-paths": {
     "manifest": {
       "api": 1,
-      "description": "把工具调用参数里的盘符路径统一成客户端那一侧的写法（WSL 的 /mnt/c/… 或 Windows 的 C:\\…），回答和对话历史里的都改。",
+      "description": "Rewrites drive paths in tool-call arguments to the form the client can open (WSL /mnt/c/… or Windows C:\\…), in answers and in the conversation history.",
       "hooks": {
         "reply_text": false,
         "reply_text_end": false,
         "request": true,
         "tool_call": true
       },
-      "name": "WSL 路径转换",
+      "name": "Convert WSL and Windows paths",
       "permissions": [
         "messages",
         "reply_tool_calls"
@@ -89,6 +89,6 @@
         }
       ]
     },
-    "sha256": "83e1328d38fda8847a84f4a1791aaa84923da5b7dcfdf9b4f87e2b624ccf39e6"
+    "sha256": "92d7f7b897659b92b66f8b9c369dba60983398cfe50a06c7b994c73f087aec0e"
   }
 }

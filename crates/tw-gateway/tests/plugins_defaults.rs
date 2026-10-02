@@ -67,19 +67,19 @@ fn every_default_loads_with_its_fixed_permissions_and_settings() {
     let want: [Expected; 3] = [
         (
             "reply-language",
-            "指定回答语言",
+            "Answer in a chosen language",
             &[P::System],
             &[("language", K::String)],
         ),
         (
             "wsl-paths",
-            "WSL 路径转换",
+            "Convert WSL and Windows paths",
             &[P::Messages, P::ReplyToolCalls],
             &[("windows_client", K::Boolean)],
         ),
         (
             "deepseek-flags",
-            "DeepSeek：替换会被拒收的旗帜表情",
+            "Avoid DeepSeek request rejections",
             &[P::System, P::Messages, P::ReplyText, P::ReplyToolCalls],
             &[],
         ),
