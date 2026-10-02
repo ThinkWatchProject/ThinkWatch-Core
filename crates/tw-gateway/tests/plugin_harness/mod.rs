@@ -7,8 +7,13 @@
 
 #![allow(dead_code)]
 
+mod formats;
 mod ws;
 
+// 每个测试文件只用到其中一部分
+#[allow(unused_imports)]
+pub use formats::*;
+#[allow(unused_imports)]
 pub use ws::*;
 
 use std::collections::VecDeque;
@@ -411,6 +416,8 @@ pub struct Plug {
     source: String,
     on_error: OnError,
     settings: Value,
+    models: Vec<String>,
+    upstreams: Vec<String>,
 }
 
 impl Plug {
@@ -420,7 +427,21 @@ impl Plug {
             source: source.into(),
             on_error: OnError::Reject,
             settings: json!({}),
+            models: Vec::new(),
+            upstreams: Vec::new(),
         }
+    }
+
+    /// 适用范围里的上游
+    pub fn upstreams(mut self, upstreams: &[&str]) -> Plug {
+        self.upstreams = upstreams.iter().map(|u| u.to_string()).collect();
+        self
+    }
+
+    /// 适用范围里的模型（配置里那一份，装上时照 manifest 填的就是它）
+    pub fn models(mut self, models: &[&str]) -> Plug {
+        self.models = models.iter().map(|m| m.to_string()).collect();
+        self
     }
 
     pub fn settings(mut self, settings: Value) -> Plug {
@@ -460,7 +481,11 @@ impl Gateway {
                     OnError::Reject => tw_config::PluginOnError::Reject,
                     OnError::Skip => tw_config::PluginOnError::Skip,
                 },
-                scope: Default::default(),
+                scope: tw_config::PluginScope {
+                    models: p.models.clone(),
+                    upstreams: p.upstreams.clone(),
+                    ..Default::default()
+                },
                 settings: p
                     .settings
                     .as_object()
@@ -513,6 +538,7 @@ impl Gateway {
             .post(format!("http://{}{path}", self.addr))
             .header("x-api-key", KEY)
             .header("authorization", format!("Bearer {KEY}"))
+            .header("x-goog-api-key", KEY)
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
@@ -609,6 +635,17 @@ impl Gateway {
             .unwrap()
             .iter()
             .filter(|r| r.run.plugin_id == id)
+            .map(|r| r.run.outcome.slug().to_string())
+            .collect()
+    }
+
+    /// 这个插件在某一种钩子（`request` / `reply`）上每次运行的结局，按先后
+    pub fn outcomes_of(&self, id: &str, hook: &str) -> Vec<String> {
+        self.runs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.run.plugin_id == id && r.run.hook.slug() == hook)
             .map(|r| r.run.outcome.slug().to_string())
             .collect()
     }

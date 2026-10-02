@@ -3356,7 +3356,6 @@ dependencies = [
 name = "tw-plugin"
 version = "0.57.1"
 dependencies = [
- "chrono",
  "libc",
  "rand 0.10.2",
  "serde",
