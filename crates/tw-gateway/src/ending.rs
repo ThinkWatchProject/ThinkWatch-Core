@@ -1,8 +1,8 @@
 //! 一个请求怎么收场。
 //!
 //! 发出 `RequestStarted` 的那一刻起，这个请求就欠总线一个结局：跑完了是
-//! `RequestFinished`，出错了是 `RequestFailed`，客户端先走了是
-//! `RequestCancelled`。**恰好一个** —— 少一个，存储层永远等不到它：那一行
+//! `RequestFinished`，出错了是 `RequestFailed`（上游回的不是 2xx、原样交给客户端的
+//! 也是），客户端先走了是 `RequestCancelled`。**恰好一个** —— 少一个，存储层永远等不到它：那一行
 //! 不落库，上游已经计的费从账上消失，界面上那一行也永远停在「进行中」；
 //! 多一个，同一行会被写两遍。
 //!
@@ -69,11 +69,78 @@ pub struct Ending {
     /// 上游在流里报的错：哪一家、原话。**有它就不是成功** —— 响应头是 200，回答却断在了
     /// 半路
     upstream_error: Option<(String, String)>,
+    /// 上游回的不是 2xx、原样交给了客户端（见 [`Ending::refused`]）。**有它就不是成功**：
+    /// 客户端拿到的是上游的错误，不是回答
+    refusal: Option<Refusal>,
     /// 这段对话这一次由谁回答（见 [`crate::affinity`]）。**成功走完了才记**：失败的、
     /// 半路断了的不算回答过，下一次照常排序
     answer: Option<crate::affinity::Ticket>,
     /// 报过了。**只能报一次**
     told: bool,
+}
+
+/// 上游在错误正文里说的那句话，最多留多少个字。错误说明都很短，太长的多半是把请求
+/// 整段回显了出来
+const SAID_MAX: usize = 500;
+
+/// 上游回的不是 2xx（见 [`Ending::refused`]）：失败的原因从这里读。
+struct Refusal {
+    /// 哪一家。报出去的那句话要点名
+    provider: String,
+    /// 它说的格式：错误正文按它读
+    dialect: ir::Dialect,
+    /// 网关替它说的那句话。有它就不读正文
+    ours: Option<Msg>,
+    /// 错误正文的开头，最多 [`crate::failure::BODY_PEEK`]。**不管留不留档都攒**：没有它
+    /// 就说不出上游为什么拒绝
+    head: Vec<u8>,
+}
+
+impl Refusal {
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.ours.is_some() {
+            return;
+        }
+        let room = crate::failure::BODY_PEEK.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+
+    /// 这个请求为什么失败。上游的原话和存下来的正文同一套打码（`redaction`）：存下来的
+    /// 那份打了码，这里照原样留着就白打了
+    fn why(self, status: u16, redaction: Option<&Redaction>) -> Msg {
+        if let Some(ours) = self.ours {
+            return ours;
+        }
+        let said = said(self.dialect, &self.head).map(|s| match redaction {
+            Some(r) => r.apply(&s),
+            None => Redaction::default().apply(&s),
+        });
+        let upstream = self.provider;
+        match said {
+            Some(message) => msg!(
+                "gw.upstream.status_message",
+                upstream = upstream, status = status, message = message =>
+                "Upstream `{upstream}` answered {status}: {message}"
+            ),
+            None => msg!(
+                "gw.upstream.status", upstream = upstream, status = status =>
+                "Upstream `{upstream}` answered {status}."
+            ),
+        }
+    }
+}
+
+/// 上游在错误正文里说的那句话：按它的格式读出来的说明，读不出来的就是正文本身。**网页
+/// 不算**（代理、防火墙回的那种错误页）：一页 HTML 的开头说明不了什么。最多 [`SAID_MAX`]
+/// 个字。
+fn said(dialect: ir::Dialect, head: &[u8]) -> Option<String> {
+    let text = tw_dialect::convert::error_message(dialect, head)
+        .unwrap_or_else(|| String::from_utf8_lossy(head).into_owned());
+    let text = text.trim();
+    if text.is_empty() || text.starts_with('<') {
+        return None;
+    }
+    Some(text.chars().take(SAID_MAX).collect())
 }
 
 /// 盯着流里的错误帧。
@@ -137,6 +204,7 @@ impl Ending {
             opened: None,
             watch: None,
             upstream_error: None,
+            refusal: None,
             answer: None,
             told: false,
         }
@@ -160,6 +228,25 @@ impl Ending {
             provider: provider.to_string(),
             dialect: upstream,
             frames: Default::default(),
+        });
+    }
+
+    /// 上游 `provider` 回的不是 2xx，原样交给了客户端（4xx 是请求本身的问题，或者没有
+    /// 下一家可换了；3xx 交还客户端，由它决定跟不跟）。
+    ///
+    /// **这个请求是失败的。**客户端拿到的是上游的错误，不是回答：收尾时报失败（见
+    /// [`Ending::finished`]），原因是上游在错误正文里说的那句话，按它的格式 `upstream` 读。
+    /// 记成结束的话，流量、概览、会话里这一轮都像是成功的，对话里只剩用户的那句话，
+    /// 回答没有，原因也没有。`ours` 是网关替它说的那句（Bedrock 拒绝凭证时，AWS 的原话
+    /// 点名账号，交出去的是它），有它就不读正文。
+    ///
+    /// 客户端没等错误交完就走了的，照旧报取消（见 `Drop`）。
+    pub fn refused(&mut self, upstream: ir::Dialect, provider: &str, ours: Option<Msg>) {
+        self.refusal = Some(Refusal {
+            provider: provider.to_string(),
+            dialect: upstream,
+            ours,
+            head: Vec::new(),
         });
     }
 
@@ -189,6 +276,9 @@ impl Ending {
         // 没有去处（观测层没起来）就不攒：一个回答最多攒 4 MB，攒了也交不出去
         if self.sink.is_some() {
             self.tap.feed(chunk);
+        }
+        if let Some(r) = self.refusal.as_mut() {
+            r.feed(chunk);
         }
         self.spot(chunk);
         self.watch_for_errors(chunk);
@@ -248,9 +338,15 @@ impl Ending {
         self.bytes += bytes as u64;
     }
 
-    /// 走完了。上游在流里报过错的，报的是失败（见 [`Ending::streaming`]）。
+    /// 走完了。上游在流里报过错的、回的不是 2xx 的，报的是失败（见 [`Ending::streaming`]、
+    /// [`Ending::refused`]）。
     pub fn finished(mut self, status: u16) {
         self.status = Some(status);
+        if let Some(r) = self.refusal.take() {
+            let why = r.why(status, self.redaction.as_ref());
+            self.failed(tw_api::FailureSource::Upstream, why);
+            return;
+        }
         // 最后一帧后面不带空行的上游：收尾时再看一眼
         if let Some(mut w) = self.watch.take() {
             let frames = w.frames.flush();
@@ -577,6 +673,173 @@ mod tests {
         assert!(
             matches!(drain(&mut rx).as_slice(), [Event::RequestFailed { message, .. }]
                 if message.text.ends_with("Provider disconnected")),
+        );
+    }
+
+    /// 一个响应头已经到了、回的不是 2xx 的请求，原样交给客户端（见 `Ending::refused`）
+    fn refused(bus: &tw_observe::EventBus, status: u16, provider: &str) -> Ending {
+        let mut e = Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None);
+        e.responded(status);
+        e.refused(ir::Dialect::Anthropic, provider, None);
+        e
+    }
+
+    /// 那一条失败的原因
+    fn failure(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> Msg {
+        match drain(rx).as_slice() {
+            [
+                Event::RequestFailed {
+                    source: tw_api::FailureSource::Upstream,
+                    message,
+                    ..
+                },
+            ] => message.clone(),
+            other => panic!("该是一条来自上游的失败，实际 {other:?}"),
+        }
+    }
+
+    /// 上游回了 4xx、原样交给了客户端：**不是成功**。结局是一条失败，原因是上游在错误
+    /// 正文里说的那句话，点名是哪一家、回了什么。记成结束的话，这一轮在流量、概览、
+    /// 会话里都像是成功的，对话里只剩用户的那句话
+    #[test]
+    fn an_error_answer_passed_on_is_a_failure_in_the_upstreams_words() {
+        const TOO_LONG: &[u8] = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 212000 tokens > 200000 maximum"}}"#;
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = refused(&bus, 400, "官方");
+        // 错误正文分几块到
+        for part in TOO_LONG.chunks(7) {
+            e.feed(part);
+        }
+        e.finished(400);
+
+        match drain(&mut rx).as_slice() {
+            [
+                Event::RequestFailed {
+                    source,
+                    message,
+                    bytes: Some(bytes),
+                    duration_ms: Some(_),
+                    usage: None,
+                    ..
+                },
+            ] => {
+                assert_eq!(*source, tw_api::FailureSource::Upstream);
+                assert_eq!(message.code, "gw.upstream.status_message");
+                assert_eq!(message.arg("upstream"), "官方");
+                assert_eq!(message.arg("status"), "400");
+                assert_eq!(
+                    message.arg("message"),
+                    "prompt is too long: 212000 tokens > 200000 maximum"
+                );
+                assert_eq!(
+                    message.text,
+                    "Upstream `官方` answered 400: prompt is too long: 212000 tokens > 200000 maximum"
+                );
+                assert_eq!(*bytes, TOO_LONG.len() as u64);
+            }
+            other => panic!("该是一条失败，实际 {other:?}"),
+        }
+    }
+
+    /// 正文里读不出一句话的（空的、一页网页）只说状态码；不是 JSON 的纯文本、不认得的
+    /// JSON 照原样说
+    #[test]
+    fn an_error_answer_without_readable_words_says_its_status() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let said = |rx: &mut tokio::sync::broadcast::Receiver<Event>, body: &[u8]| {
+            let mut e = refused(&bus, 403, "中转");
+            e.feed(body);
+            e.finished(403);
+            failure(rx)
+        };
+
+        let nothing: [&[u8]; 3] = [
+            b"",
+            b"  \n",
+            b"<html><body><h1>403 Forbidden</h1></body></html>",
+        ];
+        for body in nothing {
+            let m = said(&mut rx, body);
+            assert_eq!(m.code, "gw.upstream.status", "{m:?}");
+            assert_eq!(m.text, "Upstream `中转` answered 403.");
+            assert_eq!(m.arg("status"), "403");
+        }
+        let m = said(&mut rx, b"Forbidden\n");
+        assert_eq!(
+            (m.code.as_str(), m.arg("message")),
+            ("gw.upstream.status_message", "Forbidden")
+        );
+        let m = said(&mut rx, br#"{"detail":"Not Found"}"#);
+        assert_eq!(m.arg("message"), r#"{"detail":"Not Found"}"#);
+        // 太长的只留开头
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "很".repeat(2_000));
+        assert_eq!(
+            said(&mut rx, long.as_bytes())
+                .arg("message")
+                .chars()
+                .count(),
+            SAID_MAX
+        );
+    }
+
+    /// 上游的原话和存下来的正文同一套打码：它回显了请求里的密钥，记录里那一句也不能有
+    #[test]
+    fn what_the_upstream_said_is_masked_like_the_stored_answer() {
+        const KEY: &str = "sk-ant-api03-USERSOWNKEYAAAAAAAAAAAAAA";
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = refused(&bus, 401, "中转");
+        e.feed(
+            format!(r#"{{"type":"error","error":{{"type":"authentication_error","message":"invalid x-api-key {KEY}"}}}}"#)
+                .as_bytes(),
+        );
+        e.finished(401);
+        let m = failure(&mut rx);
+        assert_eq!(m.code, "gw.upstream.status_message");
+        assert!(m.arg("message").starts_with("invalid x-api-key "), "{m:?}");
+        assert!(
+            !m.text.contains(KEY) && !m.arg("message").contains(KEY),
+            "{m:?}"
+        );
+    }
+
+    /// 网关替上游说了话的（Bedrock 拒绝凭证），原因就是那一句，不读正文
+    #[test]
+    fn when_the_gateway_spoke_for_the_upstream_its_words_are_the_reason() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let ours = msg!(
+            "gw.upstream.bedrock_refused_unnamed", upstream = "bedrock", status = 403u16 =>
+            "AWS refused the credential of upstream `{upstream}` (HTTP {status})."
+        );
+        let mut e = Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None);
+        e.responded(403);
+        e.refused(ir::Dialect::Bedrock, "bedrock", Some(ours.clone()));
+        e.feed(br#"{"message":"[ThinkWatch] AWS refused the credential"}"#);
+        e.finished(403);
+        assert_eq!(failure(&mut rx), ours);
+    }
+
+    /// 错误还没交完客户端就走了：**照旧是取消**，带着那个状态码 —— 取消怎么数不因为
+    /// 回的是错误而变
+    #[test]
+    fn a_client_that_leaves_during_an_error_answer_cancelled_it() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = refused(&bus, 400, "官方");
+        e.feed(br#"{"type":"error","#);
+        drop(e);
+        assert!(
+            matches!(
+                drain(&mut rx).as_slice(),
+                [Event::RequestCancelled {
+                    status: Some(400),
+                    ..
+                }]
+            ),
+            "取消被报成了别的"
         );
     }
 
