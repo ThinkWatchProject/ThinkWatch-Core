@@ -18,7 +18,7 @@ description = "Runs one script plugin's hooks inside a WebAssembly sandbox (Quic
 # **只有运行时**：没有 Cranelift，没有池分配器。沙箱的机器码在 build.rs 里预编译
 # 好、嵌进二进制。版本钉死，并且和下面构建依赖里的是同一个：预编译产物只肯在
 # 同一版本的 Wasmtime 里加载
-wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "std"] }
+wasmtime = { version = "=49.0.2", default-features = false, features = ["runtime", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -32,7 +32,7 @@ libc = { workspace = true }
 [build-dependencies]
 # 构建时的编译器：Cranelift 把快照编成目标平台的机器码；all-arch 让交叉编译
 # （比如在 x64 上编 aarch64 的 Windows）也能编
-wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "std", "cranelift", "all-arch", "parallel-compilation"] }
+wasmtime = { version = "=49.0.2", default-features = false, features = ["runtime", "std", "cranelift", "all-arch", "parallel-compilation"] }
 # 改写快照的数据段。和 Wasmtime 49 自己用的是同一版
 wasmparser = "0.258"
 wasm-encoder = "0.258"
