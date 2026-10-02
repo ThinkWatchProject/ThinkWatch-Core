@@ -328,25 +328,39 @@ async fn a_replaced_tool_call_is_written_whole_and_later_blocks_move_up() {
 #[tokio::test]
 async fn dropping_every_tool_call_ends_the_turn_instead_of_waiting_for_results() {
     let input = anthropic_stream();
-    let mut s = Stream::new(
-        chain_of(
-            Dialect::Anthropic,
-            vec![tools(|_| ToolCallOutcome::Drop)],
-            &json!({}),
-        )
-        .await,
-        Framing::Sse,
-    );
-    let (out, _) = run(&mut s, &input, 4096).await;
-    let blocks = anthropic_blocks(&out);
-    let idx: Vec<u64> = blocks.iter().map(|b| b.0).collect();
-    assert_eq!(idx, [0, 1, 2]);
-    assert_eq!(blocks[2], (2, "text".into(), "bye".into()));
-    let stop = frames(&out)
-        .into_iter()
-        .find(|(_, v)| v["type"] == "message_delta")
-        .unwrap();
-    assert_eq!(stop.1["delta"]["stop_reason"], "end_turn");
+    // 交回 null 和交回空数组是同一个意思
+    for drop in [
+        tools(|_| ToolCallOutcome::Drop),
+        tools(|_| ToolCallOutcome::Replace(Vec::new())),
+    ] {
+        let mut s = Stream::new(
+            chain_of(Dialect::Anthropic, vec![drop], &json!({})).await,
+            Framing::Sse,
+        );
+        let (out, _) = run(&mut s, &input, 4096).await;
+        let blocks = anthropic_blocks(&out);
+        let idx: Vec<u64> = blocks.iter().map(|b| b.0).collect();
+        assert_eq!(idx, [0, 1, 2]);
+        assert_eq!(blocks[2], (2, "text".into(), "bye".into()));
+        let stop = frames(&out)
+            .into_iter()
+            .find(|(_, v)| v["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(stop.1["delta"]["stop_reason"], "end_turn");
+    }
+}
+
+/// 进出一趟 JavaScript 的调用：`2.0` 回来是 `2`，超过 2^53 的整数丢了精度 —— 这还是
+/// 原来那个调用，不能算改过
+#[test]
+fn a_call_that_went_through_javascript_unchanged_is_the_same_call() {
+    let given = json!({"id": "t1", "name": "Read",
+                       "input": {"limit": 2.0, "seed": 12345678901234567890u64}});
+    let back = json!({"id": "t1", "name": "Read",
+                      "input": {"seed": 12345678901234567000u64, "limit": 2}});
+    assert!(same_call(&back, &given));
+    let other = json!({"id": "t1", "name": "Read", "input": {"limit": 3, "seed": 1}});
+    assert!(!same_call(&other, &given));
 }
 
 #[tokio::test]

@@ -35,8 +35,9 @@ pub struct Pool {
     tx: OnceLock<Result<Mutex<mpsc::Sender<Job>>, String>>,
 }
 
-/// 一根线程的栈。沙箱里的调用要比默认的 2 MiB 深一些
-const STACK: usize = 8 * 1024 * 1024;
+/// 一根线程的栈。**跑沙箱的线程至少要 2 MiB**（wasm 自己最多用 1 MiB，外面还有宿主
+/// 那一侧的调用），这里明着给足，不靠平台的默认值（Windows 上只有 1 MiB）
+pub(crate) const STACK: usize = 8 * 1024 * 1024;
 
 impl Pool {
     /// `threads` 根线程，最多 `queue` 个任务在跑或者排着。

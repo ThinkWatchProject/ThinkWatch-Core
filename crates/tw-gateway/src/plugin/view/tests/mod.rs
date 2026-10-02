@@ -147,6 +147,60 @@ fn returning_the_view_untouched_changes_nothing() {
     }
 }
 
+/// 一个值进出一趟 JavaScript 之后的样子：数字都是双精度浮点，整数值写成不带小数点的
+fn through_js(v: &Value) -> Value {
+    match v {
+        Value::Number(n) => {
+            let f = n.as_f64().unwrap();
+            if f.fract() == 0.0 && f.abs() < 1e21 {
+                serde_json::from_str(&format!("{f:.0}")).unwrap()
+            } else {
+                json!(f)
+            }
+        }
+        Value::Array(a) => Value::Array(a.iter().map(through_js).collect()),
+        Value::Object(o) => {
+            Value::Object(o.iter().map(|(k, v)| (k.clone(), through_js(v))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// 插件没碰的数字回来变了写法（`2.0` → `2`、大整数丢了精度）不算改：只读的不报越权，
+/// 能改的也不写回 —— 写回就丢了原来的写法，工具定义还会让缓存失效
+#[test]
+fn numbers_that_went_through_javascript_are_not_changes() {
+    let mut raw = anthropic();
+    raw["temperature"] = json!(1.0);
+    raw["messages"][1]["content"][2]["input"] =
+        json!({ "file_path": "/a.txt", "limit": 2.0, "seed": 12345678901234567890u64 });
+    raw["tools"][0]["input_schema"]["properties"]["limit"] =
+        json!({ "type": "number", "maximum": 2.0 });
+    let built = build(Dialect::Anthropic, &raw, MESSAGES).unwrap();
+    let input = trim(&built.view, &all());
+    let back = through_js(&input);
+    assert_ne!(
+        back, input,
+        "the round trip changed nothing, so this proves nothing"
+    );
+    let edits = check(&input, &back, &all(), built.src.hidden_tools()).unwrap();
+    assert!(edits.is_empty(), "{edits:?}");
+
+    // 只改了系统提示：别的照原样写回，一个字节都不动
+    let mut sys = back.clone();
+    sys["system"] = json!(format!(
+        "{} Today is Friday.",
+        sys["system"].as_str().unwrap()
+    ));
+    let edits = check(&input, &sys, &all(), built.src.hidden_tools()).unwrap();
+    let mut next = raw.clone();
+    apply(&mut next, &built.src, &edits, MESSAGES).unwrap();
+    assert_ne!(next["system"], raw["system"]);
+    for k in ["messages", "tools", "temperature"] {
+        assert_eq!(next[k].to_string(), raw[k].to_string(), "{k}");
+    }
+}
+
 #[test]
 fn appending_to_the_anthropic_system_prompt_adds_a_block_after_the_cached_one() {
     let (raw, _) = edit(Dialect::Anthropic, &anthropic(), MESSAGES, |v| {

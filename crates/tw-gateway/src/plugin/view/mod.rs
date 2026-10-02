@@ -337,6 +337,14 @@ impl ParamsEdit {
 
 // ───────────────────────────────────────────────────────── 核对
 
+/// 插件交回来的一项和它拿到的那一项是不是同一个值。**按 JavaScript 的眼光比**
+/// （[`tw_plugin::js_equal`]）：值进出一趟 JS，`1.0` 回来是 `1`，超过 2^53 的整数丢了
+/// 精度 —— 插件没碰的那一项不能因此算成改过（改过的要写回去，写回去就丢了原来的
+/// 写法，只读的那些更会被当成越权）
+fn same(a: &Value, b: &Value) -> bool {
+    tw_plugin::js_equal(a, b)
+}
+
 /// 把插件交回来的视图对着它拿到的那一份核一遍，得出改了什么。
 ///
 /// `input` 是插件拿到的那一份（裁过、占位符换过）；`hidden_tools` 是视图里看不到的
@@ -354,7 +362,7 @@ pub fn check(
     for (k, v) in out {
         match k.as_str() {
             "format" | "model" => {
-                if input.get(k) != Some(v) {
+                if !input.get(k).is_some_and(|i| same(i, v)) {
                     return Err(denied(if k == "model" {
                         "`model` is read-only; change `params.model` instead".to_string()
                     } else {
@@ -595,7 +603,8 @@ fn check_parts(
                         let Some(input) = o.get("input") else {
                             return Err(bad(format!("tool call `{key}` has no `input`")));
                         };
-                        (Some(input) != before.get("input")).then(|| Change::Input(input.clone()))
+                        (!before.get("input").is_some_and(|b| same(b, input)))
+                            .then(|| Change::Input(input.clone()))
                     }
                     "tool_result" => {
                         only_fields(
@@ -618,7 +627,7 @@ fn check_parts(
                     }
                     // 推理、图片、别的：整个只读
                     _ => {
-                        if p != before {
+                        if !same(p, before) {
                             return Err(denied(format!("part `{key}` ({kind}) is read-only")));
                         }
                         None
@@ -712,7 +721,8 @@ fn check_tools(
                 let description = (before.get("description").and_then(Value::as_str)
                     != Some(description))
                 .then(|| description.to_string());
-                let schema = (before.get("input_schema") != Some(schema)).then(|| schema.clone());
+                let schema = (!before.get("input_schema").is_some_and(|b| same(b, schema)))
+                    .then(|| schema.clone());
                 changed |= description.is_some() || schema.is_some();
                 edits.push(ToolEdit::Keep {
                     from: i,
