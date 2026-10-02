@@ -800,13 +800,14 @@ async fn test(
                 .rules
                 .iter()
                 .filter_map(|r| {
-                    let m = r.re.find(&req.sample)?;
+                    // `find` 认两种规则：正则规则和代码实现的（联网外传凭据、上传本地文件）
+                    let m = r.find(&req.sample)?;
                     Some(tw_api::SecurityTestHit {
                         rule: r.id.clone(),
                         custom: r.custom,
-                        start: utf16_at(&req.sample, m.start()),
-                        end: utf16_at(&req.sample, m.end()),
-                        excerpt: m.as_str().chars().take(120).collect(),
+                        start: utf16_at(&req.sample, m.start),
+                        end: utf16_at(&req.sample, m.end),
+                        excerpt: m.text.chars().take(120).collect(),
                         action: Some(if r.high {
                             RuleAction::Cut
                         } else {

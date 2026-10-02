@@ -439,6 +439,8 @@ mod tests {
             "\"kind\": \"email\"",
             "\"kind\": \"cn-mobile-phone\"",
             "\"kind\": \"bank-card\", networks: Array<CardNetwork>",
+            // 代码实现的工具调用规则（凭据外传、上传本地文件）走这个 matcher
+            "\"kind\": \"builtin\", check: string",
         ] {
             assert!(matcher.contains(kind), "{kind}: {matcher}");
         }
