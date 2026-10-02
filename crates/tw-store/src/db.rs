@@ -574,6 +574,16 @@ impl Db {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    /// 一次会话里的每一个请求，整行。**和 [`Db::turns`] 同样的筛法、同样的顺序**：对话记录
+    /// （[`crate::transcript`]）一轮对一轮地跟着会话详情走。
+    pub fn session_requests(&self, session: &str) -> Result<Vec<RequestRow>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT * FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
+        )?;
+        let rows = st.query_map([session], row_from)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 impl Db {

@@ -126,6 +126,14 @@ fn row(id: i64, provider: &str) -> tw_store::db::RequestRow {
 
 /// 一个记着一条请求（连同请求体）的控制面。
 fn app(config: &str) -> (tempfile::TempDir, axum::Router) {
+    app_with(
+        config,
+        br#"{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+}
+
+/// 同上，存着的请求体是 `body`。
+fn app_with(config: &str, body: &[u8]) -> (tempfile::TempDir, axum::Router) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
     std::fs::write(&p, config).unwrap();
@@ -133,7 +141,6 @@ fn app(config: &str) -> (tempfile::TempDir, axum::Router) {
     let r = row(1, "本机");
     db.insert(&r).unwrap();
     let blobs = tw_store::Blobs::new(d.path().join("blobs"));
-    let body = br#"{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
     assert!(blobs.put(r.at_ms, r.id, tw_store::Which::Request, body));
     let rec = tw_store::Recorder::new(
         db,
@@ -239,4 +246,57 @@ async fn a_bedrock_upstream_is_not_offered_a_replay_it_cannot_take() {
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["code"], "control.replay_bedrock", "{path}: {v}");
     }
+}
+
+/// 一个把收到的请求体原样回给你的上游，顺手记下收到了什么。
+async fn echoing() -> (SocketAddr, Arc<std::sync::Mutex<String>>) {
+    let seen: Arc<std::sync::Mutex<String>> = Arc::default();
+    let s = seen.clone();
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move |body: String| {
+            let s = s.clone();
+            async move {
+                *s.lock().unwrap() = body.clone();
+                body
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, seen)
+}
+
+/// 存下来的请求（拦截档下存的是换过的那一份）里写着 1 号；这一次又找到一把密钥（比如
+/// 那之后加了一条规则，或者观察档下存的）。**新找到的拿 2 号**：拿 1 号的话，回答里的
+/// 1 号会被还原成这把新的，而它原本指的是另一样。
+#[tokio::test]
+async fn a_replay_numbers_new_finds_after_the_placeholders_already_stored() {
+    const KEY: &str = "sk-ant-api03-REPLAYKEYAAAAAAAAAAAAAAAA";
+    let (upstream, seen) = echoing().await;
+    let stored = format!(
+        r#"{{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{{"role":"user","content":"旧的 <<TW_SECRET_1>>，新的 {KEY}"}}]}}"#
+    );
+    let (_d, app) = app_with(
+        &format!(
+            "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: 我\n    key: tw-一把钥匙就够\nproviders:\n  \
+             - name: 本机\n    base_url: http://{upstream}\n    key: sk-x\n    billing: free\n\
+             security:\n  redact:\n    mode: enforce\n"
+        ),
+        stored.as_bytes(),
+    );
+
+    let v = replay(&app, "本机").await;
+    let sent = seen.lock().unwrap().clone();
+    assert!(
+        sent.contains("旧的 <<TW_SECRET_1>>，新的 <<TW_SECRET_2>>"),
+        "{sent}"
+    );
+    // 1 号没有原值，原样留着；2 号还原成新找到的那把（给人看的打了码）
+    let body = v["body"].as_str().unwrap();
+    assert!(
+        body.contains("旧的 <<TW_SECRET_1>>，新的 sk-an…AAAA"),
+        "{v}"
+    );
 }

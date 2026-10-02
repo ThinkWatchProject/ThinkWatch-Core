@@ -1165,10 +1165,10 @@ pub fn sections() -> Vec<Section> {
                 row(
                     "body_max_bytes",
                     Kind::Int,
-                    Def::Is("2147483648"),
+                    Def::Is("5368709120"),
                     t(
-                        "Upper bound on the bytes bodies may take; beyond it the oldest days go first. The default is 2 GiB.",
-                        "正文最多占用的字节数，超出时从最早的日期开始删除。默认 2 GiB。",
+                        "Upper bound on the bytes bodies may take; beyond it the oldest days go first. The default is 5 GiB.",
+                        "正文最多占用的字节数，超出时从最早的日期开始删除。默认 5 GiB。",
                     ),
                 ),
             ],

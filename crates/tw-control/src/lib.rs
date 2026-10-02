@@ -131,6 +131,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::ReplayRun, replay::run)
         .at(ep::Sessions, sessions)
         .at(ep::SessionDetail, session_detail)
+        .at(ep::SessionTranscript, session_transcript)
         .at(ep::DryRun, dryrun::dry_run)
         // 为客户端发专用密钥。接管本身在桌面端做
         .at(ep::ClientKey, clients::client_key)
@@ -389,7 +390,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             body_days: cfg.retention.body_days,
             row_days: cfg.retention.row_days,
             body_max_bytes: cfg.retention.body_max_bytes,
-            // **现状和配置一起给。**「上限 2 GB」这个数字，用户没法
+            // **现状和配置一起给。**「上限 5 GB」这个数字，用户没法
             // 判断松还是紧，除非同时看得见现在占了多少
             body_bytes_now,
         },
@@ -1501,12 +1502,7 @@ async fn session_detail(
         .iter()
         .find(|x| x.id == id)
         .map(session_view)
-        .ok_or_else(|| {
-            fail(
-                StatusCode::NOT_FOUND,
-                msg!("control.session_not_found", id = id.clone() => "There is no session {id}."),
-            )
-        })?;
+        .ok_or_else(|| no_such_session(&id))?;
     let turns = g
         .db()
         .turns(&id)
@@ -1515,6 +1511,38 @@ async fn session_detail(
         .map(turn_view)
         .collect();
     Ok(Json(tw_api::SessionDetail { session, turns }))
+}
+
+fn no_such_session(id: &str) -> Fail {
+    fail(
+        StatusCode::NOT_FOUND,
+        msg!("control.session_not_found", id = id.to_string() => "There is no session {id}."),
+    )
+}
+
+/// 一次会话读成一段对话（见 `tw_store::transcript`）。
+///
+/// **放到阻塞线程上跑**，库只在取行的时候锁一下：几百轮的会话要读几百份正文、解析几百 MB
+/// 的 JSON，和按正文找是同一个道理（见 [`history_search`]）—— 记录和正文落盘走的是同一把锁。
+async fn session_transcript(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<tw_api::Transcript>, Fail> {
+    let store = need_store(&s)?;
+    let (rows, blobs) = {
+        let g = store.lock().await;
+        let rows = g.db().session_requests(&id).map_err(records)?;
+        // 正文目录只是一个路径，读它不需要锁
+        (rows, tw_store::Blobs::new(g.blobs().root().to_path_buf()))
+    };
+    if rows.is_empty() {
+        return Err(no_such_session(&id));
+    }
+    let transcript =
+        tokio::task::spawn_blocking(move || tw_store::transcript::build(&id, &rows, &blobs))
+            .await
+            .map_err(internal)?;
+    Ok(Json(transcript))
 }
 
 #[derive(Debug, thiserror::Error)]

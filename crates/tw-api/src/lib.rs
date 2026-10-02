@@ -672,9 +672,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `cn-resident-id` 和 `bank-card`（[`CardNetwork`]、[`CardPrefix`]），[`SecretKind`] 多了
 /// `personal`。照 30 写的界面说不出这两条规则按什么认。
 ///
-/// **32 起有脚本插件**：事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者文件变了、
-/// 加载不了而停用）。照 31 写的界面不认这个事件。
-pub const CONTROL_API_VERSION: u32 = 32;
+/// **32 起会话能读成一段对话**：新端点 `GET /sessions/{id}/transcript`（[`Transcript`]）
+/// 从存下来的正文里读出每一轮新说的话、回答、推理、工具调用和结果，读不到的地方逐轮说出来
+/// （[`TranscriptGap`]）。照 31 写的界面只有每一轮的用量和金额。
+///
+/// **33 起有脚本插件**：事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者文件变了、
+/// 加载不了而停用）。照 32 写的界面不认这个事件。
+pub const CONTROL_API_VERSION: u32 = 33;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1723,7 +1727,7 @@ pub struct RetentionView {
     /// 正文总共最多占多少字节
     pub body_max_bytes: u64,
     /// 正文现在实际占了多少。**不是配置，是现状** —— 没有它，
-    /// 「2 GB 上限」是个用户无从判断松紧的数字
+    /// 「5 GB 上限」是个用户无从判断松紧的数字
     pub body_bytes_now: u64,
 }
 
@@ -3693,14 +3697,23 @@ pub struct RequestDetail {
     pub in_flight: bool,
 }
 
+/// 一份正文最多存多少字节：请求和回答一样，4 MiB。更长的只存开头，[`BodyView::truncated`]
+/// 说出来。
+///
+/// **存储层按它截，网关攒回答也按它攒**（`tw_store::blobs::MAX_ONE`、
+/// `tw_gateway::bodies::RESPONSE_TAP_MAX`）。两个数放在一处：各写各的话，改了一个，
+/// 另一个还停在原地 —— 以前回答只攒 256 KB，比存储层肯收的少十几倍。
+pub const BODY_MAX: usize = 4 * 1024 * 1024;
+
 /// 一份存下来的 body。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BodyView {
-    /// **已脱敏**。这段文字会被复制到 issue 里
+    /// **已脱敏**。这段文字会被复制到 issue 里。落盘的那一份就是换过、打过码的（脱敏规则
+    /// 认得出的值不会原样写进磁盘），读出来再打一遍
     pub text: String,
     /// 原本多长。**截断了要能说出来** —— 不说的话用户会以为请求本身
-    /// 就长这样
+    /// 就长这样。没截断的就是存下来的这一份的长度：换掉、打码的那几处和原文差几个字节
     pub original_len: usize,
     pub truncated: bool,
 }
@@ -4045,6 +4058,123 @@ pub struct TurnView {
 pub struct SessionDetail {
     pub session: SessionView,
     pub turns: Vec<TurnView>,
+}
+
+/// 一次会话读成一段对话（`GET /sessions/{id}/transcript`）：每一轮新说的话、回答、推理、
+/// 工具调用和工具结果。
+///
+/// **从存下来的正文里读出来**，不是另记的一份：正文只留几天（`retention.body_days`），
+/// 太大的只留开头，没存下来的也有。读不到的地方，那一轮的 `gaps` 说出来。
+///
+/// **已脱敏**，和请求详情里的正文同一套打码。图片只说类型和大小，从不带数据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Transcript {
+    pub session: String,
+    /// 第一个读得懂的请求里的系统提示：Anthropic 的 `system`、Responses 的 `instructions`、
+    /// Gemini 的 `systemInstruction`，Chat 和 Responses 还有开头连着的 system、developer
+    /// 消息，几段之间空一行。没有是 null
+    pub system: Option<String>,
+    /// 和 [`SessionDetail::turns`] 同样的请求，同样的顺序
+    pub turns: Vec<TranscriptTurn>,
+}
+
+/// 对话里的一轮，就是会话里的一个请求。
+///
+/// 客户端每一轮都把整段历史发上来：请求 i 的消息 = 请求 i-1 的消息 + 上一轮的回答 + 新的
+/// 用户消息或工具结果。`input` 只放新的那几条；上一轮的回答已经在上一轮的 `output` 里。
+///
+/// **不生成回答的调用**（数 token、Responses 的压缩）也在这里占一轮，`input`、`output`
+/// 都是空的，也不和前后的请求比对：它们问的是这段对话，不是对话里的一句。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranscriptTurn {
+    /// 请求号，写成十进制的字符串。和 [`TurnView::id`] 是同一条请求
+    pub id: String,
+    /// 这个请求带的历史没有接着上一个读得懂的请求：压缩过、改过历史，或者它是一串读不懂
+    /// 的请求之后第一个读得懂的。这时 `input` 是它的整段历史
+    pub restart: bool,
+    /// 系统提示和上一个读得懂的请求不一样了：新的那一份（去掉了的是空串）。没变是 null
+    pub system_changed: Option<String>,
+    /// 这个请求里新的消息。上一轮的回答没有完整读出来时（那一轮的 `gaps` 里有 `response_*`），
+    /// 客户端记下的那条助手消息也在这里：它是那一轮说过什么的记录
+    pub input: Vec<TranscriptMessage>,
+    /// 回答，从存下来的响应里读出来的。失败的请求（上游回了错误）没有回答，也不算缺
+    pub output: Vec<TranscriptPart>,
+    /// 这一轮哪些地方读不出来
+    pub gaps: Vec<TranscriptGap>,
+}
+
+/// 请求里的一条消息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranscriptMessage {
+    pub role: TranscriptRole,
+    pub parts: Vec<TranscriptPart>,
+}
+
+slug_enum! {
+    /// 一条消息是谁说的。
+    pub enum TranscriptRole {
+        User = "user",
+        Assistant = "assistant",
+        /// 只装着工具结果的消息：Anthropic 全是 `tool_result` 的用户消息、Chat 的 `tool`
+        /// 消息、Responses 的 `function_call_output`
+        Tool = "tool",
+        /// 对话中途的 system、developer 消息
+        System = "system",
+    }
+}
+
+/// 消息或回答里的一块。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptPart {
+    Text {
+        text: String,
+    },
+    /// 推理。只有签名、或者被打码的推理，`text` 是空串
+    Thinking {
+        text: String,
+    },
+    /// `input` 是参数的 JSON 文本；自由格式的工具（Codex 的 `apply_patch`）是它的原文
+    ToolCall {
+        id: String,
+        name: String,
+        input: String,
+    },
+    /// `call_id` 和它回应的那个 `tool_call` 的 `id` 是同一个
+    ToolResult {
+        call_id: String,
+        text: String,
+        is_error: bool,
+    },
+    /// 图片。**只有类型和大小，从不带数据**；给的是地址的不知道大小
+    Image {
+        media_type: Option<String>,
+        bytes: Option<u64>,
+    },
+    /// 别的块：文件、音频、服务端工具的调用和结果……`label` 是它的类型名，原样
+    Other {
+        label: String,
+    },
+}
+
+slug_enum! {
+    /// 一轮里读不出来的地方。
+    pub enum TranscriptGap {
+        /// 请求体没有存下来，或者已经清掉了
+        RequestMissing = "request_missing",
+        /// 请求体只存了开头，或者解析不了
+        RequestTruncated = "request_truncated",
+        /// 回答没有存下来，或者已经清掉了
+        ResponseMissing = "response_missing",
+        /// 回答只存了开头：`output` 是读得出来的那一段
+        ResponseTruncated = "response_truncated",
+        /// 回答存下来了，但读不懂
+        ResponseUnreadable = "response_unreadable",
+    }
 }
 
 // ---------------------------------------------------------------- 请求重放
