@@ -186,7 +186,10 @@ impl Ending {
     pub fn feed(&mut self, chunk: &[u8]) {
         self.bytes += chunk.len() as u64;
         self.sniffer.feed(chunk);
-        self.tap.feed(chunk);
+        // 没有去处（观测层没起来）就不攒：一个回答最多攒 4 MB，攒了也交不出去
+        if self.sink.is_some() {
+            self.tap.feed(chunk);
+        }
         self.spot(chunk);
         self.watch_for_errors(chunk);
     }
@@ -719,6 +722,20 @@ mod tests {
         assert_eq!(body.kind, BodyKind::Response);
         assert_eq!(&body.body[..], MESSAGE_START);
         assert_eq!(body.at_ms, 1_000);
+    }
+
+    /// 观测层没起来（没有去处）的时候，回答一个字节都不攒
+    #[test]
+    fn with_nowhere_to_send_it_the_answer_is_not_kept() {
+        let bus = tw_observe::EventBus::new();
+        let mut e = Ending::new(bus, 7, MODEL.into(), Instant::now(), 1_000, None);
+        e.responded(200);
+        e.feed(MESSAGE_START);
+        let (kept, seen) = std::mem::take(&mut e.tap).finish();
+        assert!(kept.is_empty() && seen == 0, "{seen}");
+        // 数还是照数的
+        assert_eq!(e.bytes, MESSAGE_START.len() as u64);
+        e.finished(200);
     }
 
     /// 响应头还没到，客户端就走了。**没有状态码，也没有用量** —— 两个都是

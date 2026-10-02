@@ -47,7 +47,8 @@ pub const WINDOW: usize = tw_api::BODY_MAX + MARGIN;
 /// **内存**：每个在飞的回答一份，**按实际长度长**（见 [`ResponseTap::feed`]），攒到上限
 /// 为止。绝大多数回答几 KB 到几百 KB；攒得满 4 MB 的是很长的流 —— SSE 里每几个字就
 /// 包着一帧，几万 token 的回答就有几 MB。32 个同时在流、个个都过了 4 MB，是 130 MB 上下，
-/// 流一结束就还回去。交出去之后由 [`QUEUED_MAX`] 管着。
+/// 流一结束就还回去。观测层没起来时一个字节都不攒（`crate::ending::Ending::feed`）。交出去
+/// 之后由 [`QUEUED_MAX`] 管着。
 pub const RESPONSE_TAP_MAX: usize = WINDOW;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
