@@ -117,7 +117,7 @@ async fn gateway_pinging_for(p: Provider, ping_for: Duration) -> Gateway {
     state.ping_every = Duration::from_millis(100);
     state.ping_for = ping_for;
     let events = state.bus.subscribe();
-    let (tx, bodies) = tokio::sync::mpsc::channel(16);
+    let (tx, bodies) = tw_gateway::bodies::channel();
     state.set_body_sink(tx);
     let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
         .await

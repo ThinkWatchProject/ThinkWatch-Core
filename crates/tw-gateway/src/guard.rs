@@ -12,13 +12,40 @@
 //! 上游的类别替换，于是同一个请求观察时报「检测到」，切到拦截后一处不换 ——
 //! 用户看到的证据，和他切过去之后得到的保护，说的不是一件事。
 //!
-//! 两步分开：[`find`] 在尝试上游之前对客户端发来的原文看一遍，报出去的记录
+//! 两步分开：[`look`] 在尝试上游之前对客户端发来的原文看一遍，报出去的记录
 //! 只有这一份；[`replace`] 在每一跳发出去之前替换 —— 那一跳的请求体可能是
 //! 转换过格式的，要换的是真正发出去的那一份。
+//!
+//! # 一个值一个占位符，整个请求里都一样
+//!
+//! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换。
+//! 以前每一跳各起一本账，按那一跳发出去的那份的先后编号：转换过格式、字段换了顺序的
+//! 那一跳，同一把密钥可能是 2 号，而上一跳、存下来的那份请求里它是 1 号 —— 请求详情里
+//! 存的请求和回答对不上号。
 
 use tw_config::SecurityMode as Mode;
 use tw_guard::redact::replace::{Ledger, Scheme};
-use tw_guard::redact::rules::{Finding, RuleSet};
+use tw_guard::redact::rules::{Finding, Hit, RuleSet};
+
+/// 按规则找一遍，**不算我们自己的占位符**。
+///
+/// 连接串里写着 `postgres://app:<<TW_SECRET_2>>@db` 的那一段，在口令那条规则看来就是
+/// 一个口令 —— 可它是我们换上去的：存下来的请求拿去重放、用户把详情里看到的东西贴回
+/// 对话，都会带着它。当成凭据的话，它会被再换一次、在安全日志里报一次、落盘时被打成
+/// `<<TW_…_2>>`。压在一个占位符上的命中都不算。
+pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
+    let mut hits = tw_guard::redact::rules::scan(text, rules);
+    if hits.is_empty() || !text.contains(Scheme::SECRET.open) {
+        return hits;
+    }
+    let ours = Scheme::SECRET.find_in(text);
+    hits.retain(|h| {
+        !ours
+            .iter()
+            .any(|(at, _, _)| at.start < h.bytes.end && h.bytes.start < at.end)
+    });
+    hits
+}
 
 /// 找一遍。**观察档和拦截档都找**，关闭时不找。
 ///
@@ -30,26 +57,69 @@ pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
     let Ok(text) = std::str::from_utf8(body) else {
         return Vec::new();
     };
-    let hits = tw_guard::redact::rules::scan(text, rules);
-    tw_guard::redact::rules::findings(text, &hits)
+    tw_guard::redact::rules::findings(text, &hits(text, rules))
 }
 
-/// 拦截档下换掉要发出去的这一份。返回换过的体和还原用的账本；**不在拦截档、
-/// 或者没找到东西时与进来时逐字节相同**，账本是空的。
-pub fn replace(mode: Mode, rules: &RuleSet, body: bytes::Bytes) -> (bytes::Bytes, Ledger) {
+/// 一本新账，让开 `body` 里已经写着的占位符（见 [`Ledger::avoiding`]）。
+///
+/// 存下来的请求（拦截档下存的是换过的那一份）拿去重放时，里面写着的 1 号不能再发给
+/// 新找到的值 —— 回显里的 1 号会被还原成那个新值。
+pub fn ledger_for(body: &[u8]) -> Ledger {
+    let fresh = Ledger::new(Scheme::SECRET);
+    match std::str::from_utf8(body) {
+        Ok(text) => fresh.avoiding(text),
+        Err(_) => fresh,
+    }
+}
+
+/// 看一遍客户端发来的原文：报出去的记录（同 [`find`]），和这个请求的账本。
+///
+/// **拦截档下账本在这里就编好号**：原文里找到的每个值按出现的先后发号，让开原文里本来
+/// 就写着的占位符。之后每一跳都接着这本账换（[`replace`]），存下来的那份请求也照它换
+/// （[`crate::bodies::Redaction`]）。不在拦截档时账本是空的。
+pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) {
+    let empty = || Ledger::new(Scheme::SECRET);
+    if !mode.detects() || rules.is_empty() {
+        return (Vec::new(), empty());
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return (Vec::new(), empty());
+    };
+    let hits = hits(text, rules);
+    let found = tw_guard::redact::rules::findings(text, &hits);
+    if !mode.acts() {
+        return (found, empty());
+    }
+    let seed = empty().avoiding(text);
+    let ledger = if hits.is_empty() {
+        seed
+    } else {
+        tw_guard::redact::replace::apply(text, &hits, seed).ledger
+    };
+    (found, ledger)
+}
+
+/// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`look`]）。返回换过的体和
+/// 还原用的账本；**不在拦截档、或者没找到东西时与进来时逐字节相同**，账本就是交进来的那本。
+pub fn replace(
+    mode: Mode,
+    rules: &RuleSet,
+    body: bytes::Bytes,
+    ledger: &Ledger,
+) -> (bytes::Bytes, Ledger) {
     if !mode.acts() || rules.is_empty() {
-        return (body, Ledger::new(Scheme::SECRET));
+        return (body, ledger.clone());
     }
     // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求
     let Ok(text) = std::str::from_utf8(&body) else {
-        return (body, Ledger::new(Scheme::SECRET));
+        return (body, ledger.clone());
     };
-    let hits = tw_guard::redact::rules::scan(text, rules);
+    let hits = hits(text, rules);
     if hits.is_empty() {
         // 没命中就原样返回，连一次拷贝都不做
-        return (body, Ledger::new(Scheme::SECRET));
+        return (body, ledger.clone());
     }
-    let r = tw_guard::redact::replace::apply(text, &hits, Ledger::new(Scheme::SECRET));
+    let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
     (bytes::Bytes::from(r.text), r.ledger)
 }
 
@@ -292,9 +362,13 @@ mod tests {
         ))
     }
 
+    fn fresh() -> Ledger {
+        Ledger::new(Scheme::SECRET)
+    }
+
     #[test]
     fn enforce_replaces_with_a_placeholder_and_keeps_the_body_valid_json() {
-        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body());
+        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body(), &fresh());
         let text = String::from_utf8(out.to_vec()).unwrap();
         assert!(!text.contains(KEY), "{text}");
         assert!(text.contains("<<TW_SECRET_1>>"), "{text}");
@@ -316,7 +390,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(!seen[0].masked.contains("AAAAAAAAAAAA"));
         assert_eq!(seen, find(Mode::Enforce, &RuleSet::defaults(), &body()));
-        let (out, ledger) = replace(Mode::Observe, &RuleSet::defaults(), body());
+        let (out, ledger) = replace(Mode::Observe, &RuleSet::defaults(), body(), &fresh());
         assert_eq!(out, body());
         assert!(ledger.is_empty());
     }
@@ -324,7 +398,7 @@ mod tests {
     #[test]
     fn off_does_not_even_look() {
         assert!(find(Mode::Off, &RuleSet::defaults(), &body()).is_empty());
-        let (out, _) = replace(Mode::Off, &RuleSet::defaults(), body());
+        let (out, _) = replace(Mode::Off, &RuleSet::defaults(), body(), &fresh());
         assert_eq!(out, body());
     }
 
@@ -332,7 +406,7 @@ mod tests {
     fn a_binary_body_is_left_alone_instead_of_being_mangled() {
         // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求。
         let raw = bytes::Bytes::from(vec![0xff, 0xfe, 0x00, 0x01]);
-        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), raw.clone());
+        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), raw.clone(), &fresh());
         assert_eq!(out, raw);
         assert!(l.is_empty());
         assert!(find(Mode::Enforce, &RuleSet::defaults(), &raw).is_empty());
@@ -341,7 +415,7 @@ mod tests {
     #[test]
     fn a_body_with_nothing_to_redact_is_returned_untouched() {
         let plain = bytes::Bytes::from_static(b"{\"messages\":[]}");
-        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), plain.clone());
+        let (out, l) = replace(Mode::Enforce, &RuleSet::defaults(), plain.clone(), &fresh());
         assert_eq!(out, plain);
         assert!(l.is_empty());
     }
@@ -353,5 +427,95 @@ mod tests {
         assert_eq!(it[0].kind, tw_api::SecretKind::ApiKeys);
         assert!(!it[0].custom);
         assert!(!it[0].masked.contains("AAAAAAAAAAAA"), "{}", it[0].masked);
+    }
+
+    /// 每一跳接着原文那本账换：同一把密钥在每一跳都是同一个号，哪怕那一跳发出去的那份
+    /// 把字段换了顺序（转换过格式，或者改写参数时按键名重排过）。以前各起一本账，下面
+    /// 这一跳里 `system` 排到了 `messages` 后面，两把密钥的号就对调了
+    #[test]
+    fn every_hop_numbers_a_value_the_way_the_client_body_did() {
+        let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let client =
+            format!(r#"{{"system":"{KEY}","messages":[{{"role":"user","content":"{other}"}}]}}"#);
+        let (found, l0) = look(Mode::Enforce, &RuleSet::defaults(), client.as_bytes());
+        assert_eq!((found.len(), l0.len()), (2, 2));
+        let hop =
+            format!(r#"{{"messages":[{{"role":"user","content":"{other}"}}],"system":"{KEY}"}}"#);
+        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), hop.clone().into(), &l0);
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            r#"{"messages":[{"role":"user","content":"<<TW_SECRET_2>>"}],"system":"<<TW_SECRET_1>>"}"#
+        );
+        assert_eq!(ledger.len(), 2);
+        // 各起一本账的话号就对调了 —— 这条测试防的就是它
+        let (alone, _) = replace(Mode::Enforce, &RuleSet::defaults(), hop.into(), &fresh());
+        assert!(
+            String::from_utf8(alone.to_vec())
+                .unwrap()
+                .contains(r#""system":"<<TW_SECRET_2>>""#)
+        );
+    }
+
+    #[test]
+    fn look_numbers_only_under_enforce_and_reports_the_same_either_way() {
+        let (seen, l) = look(Mode::Observe, &RuleSet::defaults(), &body());
+        assert_eq!(seen, find(Mode::Observe, &RuleSet::defaults(), &body()));
+        assert!(l.is_empty(), "观察档不该编号");
+        let (acted, l) = look(Mode::Enforce, &RuleSet::defaults(), &body());
+        assert_eq!(acted, seen);
+        assert_eq!(l.len(), 1);
+        let (none, l) = look(Mode::Off, &RuleSet::defaults(), &body());
+        assert!(none.is_empty() && l.is_empty());
+    }
+
+    /// 连接串里的占位符长得像口令，可它不是凭据：不再换一次、不报、原样留着
+    #[test]
+    fn a_placeholder_where_a_password_would_be_is_not_a_password() {
+        let t =
+            format!("postgres://app:<<TW_SECRET_2>>@db/x 和 postgres://app:hunter2@db/y 和 {KEY}");
+        let found: Vec<String> = hits(&t, &RuleSet::defaults())
+            .iter()
+            .map(|h| t[h.bytes.clone()].to_string())
+            .collect();
+        assert_eq!(found, vec!["hunter2".to_string(), KEY.to_string()]);
+        let body = format!(r#"{{"content":"{t}"}}"#);
+        assert_eq!(
+            find(Mode::Observe, &RuleSet::defaults(), body.as_bytes()).len(),
+            2
+        );
+        let (out, _) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            body.clone().into(),
+            &ledger_for(body.as_bytes()),
+        );
+        let out = String::from_utf8(out.to_vec()).unwrap();
+        assert!(out.contains("postgres://app:<<TW_SECRET_2>>@db/x"), "{out}");
+        assert!(out.contains("postgres://app:<<TW_SECRET_3>>@db/y"), "{out}");
+    }
+
+    #[test]
+    fn a_placeholder_already_in_the_client_body_is_not_handed_out_again() {
+        // 用户把请求详情里看到的请求贴回了对话：里面写着 1 号
+        let pasted = format!(
+            r#"{{"messages":[{{"role":"user","content":"上次发的是 <<TW_SECRET_1>>，这次是 {KEY}"}}]}}"#
+        );
+        let (_, l0) = look(Mode::Enforce, &RuleSet::defaults(), pasted.as_bytes());
+        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), pasted.into(), &l0);
+        let out = String::from_utf8(out.to_vec()).unwrap();
+        assert!(out.contains("这次是 <<TW_SECRET_2>>"), "{out}");
+        assert_eq!(
+            tw_guard::redact::replace::restore("<<TW_SECRET_1>> / <<TW_SECRET_2>>", &ledger),
+            format!("<<TW_SECRET_1>> / {KEY}")
+        );
+        // 重放用的那本新账也让开它
+        let stored = format!("<<TW_SECRET_1>> {KEY}");
+        let (out, _) = replace(
+            Mode::Enforce,
+            &RuleSet::defaults(),
+            bytes::Bytes::from(stored.clone()),
+            &ledger_for(stored.as_bytes()),
+        );
+        assert_eq!(&out[..], b"<<TW_SECRET_1>> <<TW_SECRET_2>>");
     }
 }

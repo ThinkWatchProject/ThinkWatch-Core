@@ -6,16 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// body 默认留几天。
-pub const KEEP_DAYS: u64 = 7;
-/// 总量上限。超了从最旧的天目录开始删。
-pub const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// 单个 body 的上限。
+/// 单个 body 的上限（[`tw_api::BODY_MAX`]，4 MiB）。
 ///
 /// 超过就只留开头。**一个 200 MB 的请求体存下来对排查没有额外帮助** ——
 /// 而它会把当天的目录一次撑爆，把别的请求的 body 挤掉。
-pub const MAX_ONE: usize = 4 * 1024 * 1024;
+///
+/// 留几天、总共留多少不在这里定：那是配置里的 `retention`，回收按它来（见 [`Blobs::gc`]）。
+pub const MAX_ONE: usize = tw_api::BODY_MAX;
 
 pub struct Blobs {
     root: PathBuf,
@@ -83,6 +80,9 @@ impl Blobs {
     /// 而它们比 config.yaml 多得多。默认 umask 通常给 0644，那意味着
     /// 同一台机器上的别的用户能把它们全读走（那条「权限就是认证」
     /// 的同一个道理）。
+    ///
+    /// 交到这里的已经是换过、打过码的那一份（网关的 `bodies::BodyRecord::for_disk`）：
+    /// 脱敏规则认得出的值进不了磁盘。**规则认不全**，所以权限照样收紧。
     pub fn put(&self, at_ms: i64, id: i64, which: Which, body: &[u8]) -> bool {
         let p = self.path_for(at_ms, id, which);
         let Some(dir) = p.parent() else { return false };
@@ -125,8 +125,12 @@ impl Blobs {
         len > MAX_ONE
     }
 
-    /// 存了多少、原本多长。**两个数一起返回** —— 详情页要靠它说出
-    /// 「只存了开头 256 KB」。
+    /// 写一个 body，连同它原本多长。详情页要靠它说出「只存了开头 4 MB」，重放靠它
+    /// 拒绝一份截断过的请求。
+    ///
+    /// `original_len` 比**真正存下的**长时才另记一个 `.len` —— 截断可能发生在交来之前
+    /// （网关只攒了开头），也可能发生在这里（`body` 比 [`MAX_ONE`] 长）。以前只看前一种：
+    /// 一个 5 MB 的请求体存下 4 MB，却没有一处说它被截过，重放照样把半截 JSON 发了出去。
     pub fn put_with_len(
         &self,
         at_ms: i64,
@@ -138,7 +142,7 @@ impl Blobs {
         if !self.put(at_ms, id, which, body) {
             return false;
         }
-        if original_len > body.len() {
+        if original_len > body.len().min(MAX_ONE) {
             let p = self
                 .path_for(at_ms, id, which)
                 .with_extension(format!("{}.len", which.suffix()));
@@ -360,7 +364,7 @@ mod tests {
         // 用户自己放的目录不算一天
         std::fs::create_dir_all(b.root().join("0000-backup")).unwrap();
         assert_eq!(b.oldest_ms(), Some(10 * DAY));
-        b.gc(13 * DAY, 1, MAX_BYTES);
+        b.gc(13 * DAY, 1, u64::MAX);
         assert_eq!(b.oldest_ms(), Some(12 * DAY));
     }
 
@@ -392,6 +396,25 @@ mod tests {
         assert!(!Blobs::was_truncated(10));
     }
 
+    /// 截在这里的也要留下原本多长。以前只有「交来之前就截过」的才记：一个比上限长的
+    /// 请求体整份交进来、在这里被截，读回去的人看不出它少了一截 —— 重放照样把半截发出去
+    #[test]
+    fn a_body_cut_here_records_how_long_it_was() {
+        let (_d, b) = setup();
+        let huge = vec![b'x'; MAX_ONE + 1000];
+        assert!(b.put_with_len(0, 1, Which::Request, &huge, huge.len()));
+        assert_eq!(b.get(0, 1, Which::Request).unwrap().len(), MAX_ONE);
+        assert_eq!(b.original_len(0, 1, Which::Request), Some(MAX_ONE + 1000));
+
+        // 截在交来之前的：交来的是开头，原本的长度另给
+        assert!(b.put_with_len(0, 2, Which::Response, b"head", 9_999));
+        assert_eq!(b.original_len(0, 2, Which::Response), Some(9_999));
+
+        // 整份都存下了的不记：读的人拿存下的长度当原本的
+        assert!(b.put_with_len(0, 3, Which::Request, b"whole", 5));
+        assert_eq!(b.original_len(0, 3, Which::Request), None);
+    }
+
     #[test]
     fn gc_deletes_whole_days_older_than_the_cutoff() {
         let (_d, b) = setup();
@@ -400,7 +423,7 @@ mod tests {
             b.put(now - i * DAY, i, Which::Request, &vec![b'x'; 1000]);
         }
         assert_eq!(b.days().len(), 10);
-        let freed = b.gc(now, 3, MAX_BYTES);
+        let freed = b.gc(now, 3, u64::MAX);
         // 留 now、now-1、now-2、now-3 这四天（cutoff 是 now-3 那天）
         assert_eq!(b.days().len(), 4, "{:?}", b.days());
         assert_eq!(freed, 6000);
@@ -458,7 +481,7 @@ mod tests {
     #[test]
     fn gc_on_an_empty_or_missing_root_does_nothing_and_says_zero() {
         let (_d, b) = setup();
-        assert_eq!(b.gc(0, 7, MAX_BYTES), 0);
+        assert_eq!(b.gc(0, 7, u64::MAX), 0);
         assert_eq!(b.total_bytes(), 0);
     }
 }

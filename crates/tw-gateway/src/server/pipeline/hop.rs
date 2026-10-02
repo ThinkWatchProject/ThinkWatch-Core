@@ -20,8 +20,8 @@ use tw_types::msg;
 pub(super) struct Served<'a> {
     pub(super) upstream: reqwest::Response,
     pub(super) provider: &'a tw_config::Provider,
-    /// 成功那一次的脱敏账本。**必须是成功那一次的** —— 每一跳发出去的体可能
-    /// 转换过格式，占位符按那一份的顺序编号
+    /// 成功那一次的脱敏账本。**必须是成功那一次的** —— 每一跳都接着原文那本账换，
+    /// 而那一跳发出去的体（可能转换过格式）里还有原文没有的值时，号是那一跳新发的
     pub(super) ledger: tw_guard::redact::replace::Ledger,
     /// 成功那一跳的转换。**必须是成功那一次的** —— 故障转移从 Anthropic 上游
     /// 切到 OpenAI 上游时，两跳转成的格式不一样；直通时是 None
@@ -200,9 +200,14 @@ pub(super) async fn try_upstreams<'a>(
         // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
         let unsealed = unseal_upfront(state, req, started, provider, &out);
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
-        // 格式）。规则是全局的，每一跳换掉的是同一批东西
-        let (body, ledger) =
-            crate::guard::replace(rt.config.security.redact.mode, &rt.redact, unsealed);
+        // 格式）。规则是全局的，每一跳换掉的是同一批东西；**接着原文那本账换**，
+        // 同一个值在每一跳、在存下来的那份请求里都是同一个占位符
+        let (body, ledger) = crate::guard::replace(
+            rt.config.security.redact.mode,
+            &rt.redact,
+            unsealed,
+            &started.ledger,
+        );
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。

@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(back.retention.body_days, 3);
         // 没写的那两个仍然是默认值，不是 0 —— 0 会让 gc 把一切都删掉
         assert_eq!(back.retention.row_days, 90);
-        assert_eq!(back.retention.body_max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(back.retention.body_max_bytes, 5 * 1024 * 1024 * 1024);
         assert!(
             serde_yaml_ng::to_string(&back)
                 .unwrap()

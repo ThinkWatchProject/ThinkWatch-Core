@@ -52,6 +52,9 @@ struct Started {
     choice: Choice,
     /// 这是哪段对话（见 [`crate::affinity::identity`]）。认不出来是 None
     conversation: Option<String>,
+    /// 出站脱敏的账本：拦截档下按客户端原文编好了号，每一跳接着它换（见
+    /// [`crate::guard::look`]）。别的档位是空的
+    ledger: tw_guard::redact::replace::Ledger,
 }
 
 pub(super) async fn pipeline(
@@ -87,7 +90,19 @@ pub(super) async fn pipeline(
         // `passthrough` 按这个错误报 —— 不排队：它一个字节都不会发出去
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
-            let id = open(&state, &req, &reading, &choice, to, fp.as_deref(), ending);
+            // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
+            let (_, ledger) = look(&rt, &req);
+            let redaction = redaction(&rt, ledger);
+            let id = open(
+                &state,
+                &req,
+                &reading,
+                &choice,
+                to,
+                fp.as_deref(),
+                ending,
+                redaction,
+            );
             state.bus.emit(super::routed_nowhere(id, choice));
             return Err(why);
         }
@@ -523,7 +538,7 @@ fn route(
     Ok(Routed::Go(choice, decision))
 }
 
-/// 发出开始事件：熔断过滤、`RequestStarted`、结局、入站脱敏的记录、请求体留档。
+/// 发出开始事件：熔断过滤、出站脱敏看一遍、`RequestStarted`、结局、脱敏的记录、请求体留档。
 ///
 /// **发了开始，就欠一个结局。**从这里起，管线返回的错误由调用方报成
 /// 失败，这个 future 被丢掉由 Drop 报成取消（见 `passthrough`）。
@@ -559,6 +574,12 @@ fn start(
         .find(|p| p.name == first)
         .map(|p| p.billing)
         .unwrap_or_default();
+
+    // 出站脱敏：按全局的规则看一遍客户端发来的原文。**观察档和拦截档报的
+    // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
+    // 那一跳的请求体可能是转换过格式的。拦截档下账本在这里就编好号：每一跳、
+    // 存下来的那份请求都按它换，同一个值处处是同一个占位符
+    let (found, ledger) = look(rt, req);
     let id = open(
         state,
         req,
@@ -567,13 +588,9 @@ fn start(
         (first, billing.into()),
         fp,
         ending,
+        redaction(rt, ledger.clone()),
     );
-
-    // 出站脱敏：按全局的规则看一遍客户端发来的原文。**观察档和拦截档报的
-    // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
-    // 那一跳的请求体可能是转换过格式的。
     let redact_mode = rt.config.security.redact.mode;
-    let found = crate::guard::find(redact_mode, &rt.redact, &req.body);
     if !found.is_empty() {
         state.bus.emit(tw_api::Event::SecretsFound {
             id,
@@ -588,15 +605,36 @@ fn start(
         alive,
         choice,
         conversation: crate::affinity::identity(&req.headers, fp),
+        ledger,
+    }
+}
+
+/// 出站脱敏看一遍客户端发来的原文（见 [`crate::guard::look`]）。
+fn look(
+    rt: &Runtime,
+    req: &Inbound,
+) -> (
+    Vec<tw_guard::redact::rules::Finding>,
+    tw_guard::redact::replace::Ledger,
+) {
+    crate::guard::look(rt.config.security.redact.mode, &rt.redact, &req.body)
+}
+
+/// 这个请求的正文落盘之前怎么换、怎么打码：此刻生效的规则，和这个请求的账本。
+fn redaction(rt: &Runtime, ledger: tw_guard::redact::replace::Ledger) -> crate::bodies::Redaction {
+    crate::bodies::Redaction {
+        rules: rt.redact.clone(),
+        ledger,
     }
 }
 
 /// 发 `RequestStarted`、把这个请求欠着的结局放进 `ending`、把请求体交去留档，
 /// 交回这个请求的号。`to` 是要发往的那一家和它怎么收钱；一家都不会去的（被规则
-/// 拒绝了）是空的名字。
+/// 拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码。
 ///
 /// **会话在这里定**（见 [`crate::session::Sessions`]）：开始事件带着它，落库的
 /// 那一行记的也是它。
+#[allow(clippy::too_many_arguments)]
 fn open(
     state: &AppState,
     req: &Inbound,
@@ -605,6 +643,7 @@ fn open(
     to: (&str, tw_api::Billing),
     fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
+    redaction: crate::bodies::Redaction,
 ) -> u64 {
     let facts = &reading.facts;
     let id = state.bus.next_id();
@@ -636,27 +675,32 @@ fn open(
         at_ms,
     });
     let sink = state.body_sink();
-    *ending = Some(crate::ending::Ending::new(
+    let mut end = crate::ending::Ending::new(
         state.bus.clone(),
         id,
         facts.model.clone(),
         req.started,
         at_ms as i64,
         sink.clone(),
-    ));
+    );
+    end.redact_with(redaction.clone());
+    *ending = Some(end);
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
-    // 整个解析的，所以本来就在）。
+    // 整个解析的，所以本来就在）；比存得下的还长的，只拷开头那一段（见
+    // `bodies::offer`）。**交出去的是原文**：换掉、打码在落盘那一头做，不占
+    // 转发这条路（见 `crate::bodies`）
     crate::bodies::offer(
         &sink,
-        crate::bodies::BodyRecord {
+        crate::bodies::BodyRecord::new(
             id,
-            at_ms: at_ms as i64,
-            kind: crate::bodies::BodyKind::Request,
-            body: req.body.clone(),
-            original_len: req.body.len(),
-        },
+            at_ms as i64,
+            crate::bodies::BodyKind::Request,
+            req.body.clone(),
+            req.body.len(),
+            redaction,
+        ),
     );
     id
 }

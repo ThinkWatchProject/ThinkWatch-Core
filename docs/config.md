@@ -832,6 +832,13 @@ Two limits, because the two kinds of data differ in size by three orders
 of magnitude: request bodies are tens of kilobytes each, a request's record
 a few hundred bytes. The byte limit covers bursts.
 
+Each request and response body is kept up to 4 MiB; of a longer one, the
+beginning is kept. Bodies are written with credentials and personal numbers
+already taken out. A request stored under `enforce` carries the placeholders
+the upstream received; anything else the redaction rules
+([`security.redact`](#cfg-security-redact)) recognize is masked, in every
+mode, `off` included.
+
 <!-- generated: table retention -->
 <a id="cfg-retention"></a>
 
@@ -839,7 +846,7 @@ a few hundred bytes. The byte limit covers bursts.
 |---|---|---|---|
 | `body_days` | integer | `7` | Days to keep request and response bodies. |
 | `row_days` | integer | `90` | Days to keep the record of each request (time, model, usage, cost). |
-| `body_max_bytes` | integer | `2147483648` | Upper bound on the bytes bodies may take; beyond it the oldest days go first. The default is 2 GiB. |
+| `body_max_bytes` | integer | `5368709120` | Upper bound on the bytes bodies may take; beyond it the oldest days go first. The default is 5 GiB. |
 <!-- /generated -->
 
 ### `failover`

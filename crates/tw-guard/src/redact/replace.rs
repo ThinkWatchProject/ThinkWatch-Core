@@ -4,6 +4,7 @@
 //! 而「瞎猜」在一个正帮你调试 `.env` 的助手身上，比看不见更糟。
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::redact::rules::{Hit, RuleSet};
 
@@ -32,6 +33,38 @@ impl Scheme {
 
     pub fn placeholder(&self, label: &str, n: usize) -> String {
         format!("{}{label}_{n}{}", self.open, self.close)
+    }
+
+    /// `text` 里写着的每一个这种写法的占位符：在哪儿（字节区间）、标签、号码。
+    ///
+    /// **夹在别的字里的也算**（`<<<TW_SECRET_1>>`）：还原是按子串换的。号码大到装不下的
+    /// 不算 —— 那不可能是发出去的。
+    pub fn find_in<'a>(&self, text: &'a str) -> Vec<(Range<usize>, &'a str, usize)> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(i) = text[from..].find(self.open) {
+            let at = from + i;
+            let start = at + self.open.len();
+            // 下一处从这一处的下一个字节找起：`<<<TW_SECRET_1>>` 里的占位符从第二个 `<` 起。
+            // 开头那段是 ASCII，加一还落在字的边界上
+            from = at + 1;
+            let rest = &text[start..];
+            let len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if !rest[len..].starts_with(self.close) {
+                continue;
+            }
+            let Some((label, n)) = rest[..len].rsplit_once('_') else {
+                continue;
+            };
+            if label.is_empty() || n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(n) = n.parse::<usize>() else { continue };
+            out.push((at..start + len + self.close.len(), label, n));
+        }
+        out
     }
 }
 
@@ -83,6 +116,22 @@ impl Ledger {
     /// 请求上找，再换进原样转发的那一份）。
     pub fn replacements(&self) -> impl Iterator<Item = (&str, &str)> {
         self.seen.iter().map(|(o, p)| (o.as_str(), p.as_str()))
+    }
+
+    /// 让开 `text` 里已经写着的占位符：新发的号接在它们后面数。
+    ///
+    /// 一段文字里本来就可能写着占位符：存下来的请求（拦截档下存的是换过的那一份）拿去
+    /// 重放、导出成用例，用户把请求详情里看到的东西贴回对话。照常从 1 数的话，新找到的
+    /// 值会拿到一个已经写在那儿的号 —— 两样东西共用一个占位符，回显里的那一处被还原成
+    /// 新值，而它原本指的是另一样。
+    ///
+    /// **只让号，不记账**：写在那儿的占位符不知道原来是什么，还原时原样留着。
+    pub fn avoiding(mut self, text: &str) -> Self {
+        for (_, label, n) in self.scheme.find_in(text) {
+            let taken = self.issued.entry(label.to_string()).or_insert(0);
+            *taken = (*taken).max(n);
+        }
+        self
     }
 
     /// 这个值的占位符，头一次见就发一个新号。
@@ -371,6 +420,62 @@ mod tests {
         assert_eq!(restore(&r.text, &r.ledger), t);
         let pairs: std::collections::HashMap<_, _> = r.ledger.replacements().collect();
         assert_eq!(pairs["c@d.com"], "{{EMAIL_2}}");
+    }
+
+    #[test]
+    fn placeholders_already_in_the_text_keep_their_numbers_to_themselves() {
+        // 存下来的请求里写着 1 号（拦截档下换过），重放时又找到一把新的：它拿 1 号的话，
+        // 回显里的 1 号会被还原成这把新的，而那一处原本指的是另一样
+        let t = format!("旧的 <<TW_SECRET_1>>，身份证 <<TW_ID_NUMBER_2>>，新的 {KEY}");
+        let r = redact(&t, &all(), l().avoiding(&t));
+        assert!(r.text.contains("新的 <<TW_SECRET_2>>"), "{}", r.text);
+        assert!(r.text.contains("旧的 <<TW_SECRET_1>>"), "{}", r.text);
+        // 让开的号不记账：回显里的 1 号原样留着，不被还原成任何东西
+        assert_eq!(r.ledger.len(), 1);
+        assert_eq!(
+            restore("<<TW_SECRET_1>> 和 <<TW_SECRET_2>>", &r.ledger),
+            format!("<<TW_SECRET_1>> 和 {KEY}")
+        );
+    }
+
+    #[test]
+    fn placeholders_are_found_where_they_are_written() {
+        let t = "前 <<TW_SECRET_1>> 中 <<<TW_ID_NUMBER_12>>> 后 <<TW_x>> <<TW_SECRET_3";
+        let found: Vec<_> = Scheme::SECRET
+            .find_in(t)
+            .into_iter()
+            .map(|(at, label, n)| (&t[at], label, n))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("<<TW_SECRET_1>>", "TW_SECRET", 1),
+                ("<<TW_ID_NUMBER_12>>", "TW_ID_NUMBER", 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_whole_placeholders_of_this_scheme_are_set_aside() {
+        let taken = |t: &str| {
+            let r = redact(KEY, &all(), l().avoiding(t));
+            r.text
+        };
+        // 夹在别的字里的照样算：还原是按子串换的
+        assert_eq!(taken("<<<TW_SECRET_4>>>"), "<<TW_SECRET_5>>");
+        // 不是占位符的不让：没收尾的、号不是数字的、别的写法的、标签是空的
+        for t in [
+            "<<TW_SECRET_4",
+            "<<TW_SECRET_x>>",
+            "{{TW_SECRET_4}}",
+            "<<_4>>",
+            "<<TW SECRET_4>>",
+            "<<TW_SECRET_99999999999999999999999>>",
+        ] {
+            assert_eq!(taken(t), "<<TW_SECRET_1>>", "{t}");
+        }
+        // 别的标签只让它自己的号
+        assert_eq!(taken("<<TW_CARD_NUMBER_7>>"), "<<TW_SECRET_1>>");
     }
 
     #[test]

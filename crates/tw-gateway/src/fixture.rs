@@ -209,7 +209,11 @@ pub fn record(
 ) -> Fixture {
     let clean = |r: Recorded| -> Recorded {
         // 两道：先按凭据规则换成占位符（结构还在，值没了），再走一遍
-        // 通用打码兜住规则没认出来的
+        // 通用打码兜住规则没认出来的。
+        //
+        // 存下来的正文落盘前已经按用户的规则换过、打过码（见 `crate::bodies`），这里按全部
+        // 内置规则再来一遍：用户关掉的那几条、内网地址，到这里也换掉。新发的号让开存下来
+        // 的那份里已经写着的占位符，两样东西不共用一个号
         let all: Vec<&str> = tw_guard::redact::rules::BUILTINS
             .iter()
             .map(|b| b.id)
@@ -217,7 +221,8 @@ pub fn record(
         let redacted = tw_guard::redact::replace::redact(
             &r.body,
             &tw_guard::redact::rules::RuleSet::only(&all),
-            tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+            tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET)
+                .avoiding(&r.body),
         )
         .text;
         Recorded {

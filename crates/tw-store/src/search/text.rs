@@ -175,8 +175,8 @@ pub fn answer(body: &[u8], upstream: Dialect) -> Option<String> {
             text_of(events)
         }
         _ => {
-            // **一小块一小块地喂。**拆帧器从缓冲区头上一帧一帧地取，整份 256 KB 一次喂进去
-            // 的话，每取一帧都要把后面的字节往前挪一遍
+            // **一小块一小块地喂。**拆帧器从缓冲区头上一帧一帧地取，整份（最多 4 MB）一次喂
+            // 进去的话，每取一帧都要把后面的字节往前挪一遍
             let mut r = tw_dialect::convert::Reader::new(upstream);
             let mut events = Vec::new();
             for piece in body.chunks(16 * 1024) {
