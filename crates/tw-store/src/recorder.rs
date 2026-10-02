@@ -199,6 +199,13 @@ impl Recorder {
             .put_with_len(at_ms, id as i64, which, body, original_len);
     }
 
+    /// 记一次插件运行（`plugin_runs` 一行）。**写不进去只记一行日志**
+    pub fn record_plugin_run(&self, r: &crate::db::PluginRunRow) {
+        if let Err(e) = self.db.insert_plugin_run(r) {
+            tracing::debug!("the plugin run could not be recorded: {e}");
+        }
+    }
+
     /// 吃一个事件。
     pub fn on_event(&mut self, ev: &Event) {
         match ev {

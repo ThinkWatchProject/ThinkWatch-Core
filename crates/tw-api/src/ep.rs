@@ -129,6 +129,35 @@ endpoints! {
     DeleteCustomRule: DELETE "/security/{guard}/custom/{name}" [guard, name], api::BaseVersion => api::ConfigWritten;
     TestSecurity: POST "/security/{guard}/test" [guard], api::SecurityTestRequest => api::SecurityTestResult;
 
+    // ─────────────────────────────────────────────── 脚本插件
+    //
+    // **装、换源码、批准三个端点不给网页调**（桌面端的 `call` 白名单里没有它们）：
+    // 这三件事要在系统的确认框里点头，那一步在桌面端的 Rust 里 —— 它自己再编一遍
+    // 源码，把名字、权限和哈希摆给人看，点了头才发请求。网页里的脚本做不到这件事，
+    // 就做不成这三件事。
+    /// 全部插件，按运行的顺序：状态、计数
+    Plugins: GET "/plugins", () => Vec<api::PluginView>;
+    /// 编一份源码看看它是什么插件。**什么都不留下**
+    PluginInspect: POST "/plugins/inspect", api::PluginSource => api::PluginInspection;
+    /// 装一个：写插件文件和它的底稿，配置里加一条。**网页不能调**
+    CreatePlugin: POST "/plugins", api::PluginCreate => api::ConfigWritten;
+    /// 排顺序，也就是运行的顺序
+    ReorderPlugins: PUT "/plugins/order", api::PluginOrder => api::ConfigWritten;
+    /// 开关、出错时怎么办、范围、设置
+    UpdatePlugin: PUT "/plugins/{id}" [id], api::PluginUpdate => api::ConfigWritten;
+    /// 删掉：配置里那一条、插件文件和底稿
+    DeletePlugin: DELETE "/plugins/{id}" [id], api::BaseVersion => api::ConfigWritten;
+    /// 换一份源码，批准的就是新的这一份。**网页不能调**
+    ReplacePluginSource: PUT "/plugins/{id}/source" [id], api::PluginSourceReplace => api::ConfigWritten;
+    /// 批准过的那一份和磁盘上现在那一份
+    PluginSourceDiff: GET "/plugins/{id}/source" [id], () => api::PluginSourceView;
+    /// 批准磁盘上改过的那个文件。**网页不能调**
+    ApprovePluginFile: POST "/plugins/{id}/approve" [id], api::PluginApprove => api::ConfigWritten;
+    /// 拿一条记下的请求试跑。**不连上游**
+    TrialPlugin: POST "/plugins/{id}/trial" [id], api::PluginTrial => api::PluginTrialResult;
+    /// 最近的日志，老的在前
+    PluginLogs: GET "/plugins/{id}/logs" [id], () => Vec<api::PluginLogEntry>;
+
     // ─────────────────────────────────────────────── 账号登录
     StartChatgptLogin: POST "/chatgpt/login", api::ChatgptLoginStart => api::ChatgptLogin;
     ChatgptLoginStatus: GET "/chatgpt/login/{id}" [id], () => api::ChatgptLoginStatus;

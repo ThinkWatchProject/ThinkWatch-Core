@@ -55,6 +55,10 @@ pub const RESPONSE_TAP_MAX: usize = WINDOW;
 pub enum BodyKind {
     Request,
     Response,
+    /// 插件改过之后的请求体（`Request` 存的是客户端发来的那一份）。**只有插件真的改了
+    /// 才存**，挨着 `Request` 放。交来的是插件交回的那一份（占位符还没换回密钥），带着这个
+    /// 请求的 [`Redaction`]：落盘前和别的正文一样换掉、打码（[`BodyRecord::for_disk`]）
+    AfterPlugins,
 }
 
 /// 落盘之前怎么处理一份正文。
@@ -433,6 +437,26 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(&stored).expect("存下来的还是 JSON");
         // 读的时候再打一遍，什么都不变
         assert_eq!(tw_secret::mask_body(&stored), stored);
+    }
+
+    /// 插件改过的请求体走同一条路：插件交回的占位符原样留着（上游收到的就是它），插件
+    /// 自己写进去的、认得出的值打码
+    #[test]
+    fn the_request_after_plugins_is_stored_the_same_way() {
+        let request = format!(r#"{{"messages":[{{"role":"user","content":"{KEY}"}}]}}"#);
+        let r = enforced(&request);
+        let added = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let after = format!(
+            r#"{{"system":"today is Friday, {added}","messages":[{{"role":"user","content":"<<TW_SECRET_1>>"}}]}}"#
+        );
+        let stored = written(record(BodyKind::AfterPlugins, &after, r));
+        assert!(
+            stored.contains("\"content\":\"<<TW_SECRET_1>>\""),
+            "{stored}"
+        );
+        assert!(stored.contains("today is Friday"), "{stored}");
+        assert!(!stored.contains(added), "{stored}");
+        serde_json::from_str::<serde_json::Value>(&stored).expect("存下来的还是 JSON");
     }
 
     #[test]

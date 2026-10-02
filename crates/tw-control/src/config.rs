@@ -101,6 +101,8 @@ impl ApplyError {
 impl ConfigManager {
     pub fn new(path: PathBuf, gateway: tw_gateway::AppState, bus: tw_observe::EventBus) -> Self {
         let seen = store::read(&path).ok().map(|l| l.fingerprint);
+        // 插件文件的路径相对配置文件所在的目录：**知道配置在哪儿的是这里**，告诉网关一声
+        gateway.set_config_dir(crate::plugins::dir_of(&path));
         Self {
             path,
             gateway,

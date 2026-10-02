@@ -235,6 +235,78 @@ pub fn replace_item(
     Ok(out)
 }
 
+/// 把块式列表里的项重排：新的第 i 项是原来的第 `order[i]` 项。
+///
+/// **每一项整段搬**：连同它自己的缩进、里面的注释、行尾注释。项与项之间的那些行
+/// （空行、写在两项之间、和 `-` 对齐的注释）留在原地 —— 它们说的是那个位置，不是
+/// 哪一项。
+///
+/// 改完核对三件事：项数没变；每一项搬过去之后读回来和原来那一项一模一样；列表之外
+/// 一个节点都没动。
+pub fn reorder(text: &str, seq_path: &[Step], order: &[usize]) -> Result<String, PatchError> {
+    let before = nodes(text)?;
+    let count = count_items(&before, seq_path);
+    let mut seen = vec![false; count];
+    let permutation = order.len() == count
+        && order
+            .iter()
+            .all(|&i| i < count && !std::mem::replace(&mut seen[i], true));
+    if !permutation {
+        return Err(PatchError::SelfCheck(format!(
+            "the new order of {} does not name each of its {count} entries once",
+            show(seq_path)
+        )));
+    }
+    let spans = (0..count)
+        .map(|i| item_span(text, seq_path, i))
+        .collect::<Result<Vec<_>, _>>()?;
+    if spans.windows(2).any(|w| w[0].end > w[1].start) {
+        return Err(PatchError::NotFound(format!(
+            "{} (the entries overlap)",
+            show(seq_path)
+        )));
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (slot, span) in spans.iter().enumerate() {
+        out.push_str(&text[at..span.start]);
+        out.push_str(&text[spans[order[slot]].clone()]);
+        at = span.end;
+    }
+    out.push_str(&text[at..]);
+
+    let after = nodes(&out).map_err(|e| {
+        PatchError::SelfCheck(format!(
+            "the configuration could not be parsed after reordering {}: {e}",
+            show(seq_path)
+        ))
+    })?;
+    if count_items(&after, seq_path) != count {
+        return Err(PatchError::SelfCheck(format!(
+            "the number of entries under {} changed while reordering",
+            show(seq_path)
+        )));
+    }
+    fn item<'a>(all: &'a [Node], seq_path: &[Step], i: usize) -> Vec<(Vec<Step>, Shape<'a>)> {
+        let mut p = seq_path.to_vec();
+        p.push(Step::Index(i));
+        all.iter()
+            .filter(|n| n.path.starts_with(&p))
+            .map(|n| (n.path[p.len()..].to_vec(), shape(&n.kind)))
+            .collect()
+    }
+    for (slot, &from) in order.iter().enumerate() {
+        if item(&after, seq_path, slot) != item(&before, seq_path, from) {
+            return Err(PatchError::SelfCheck(format!(
+                "entry {from} of {} did not arrive intact at position {slot}",
+                show(seq_path)
+            )));
+        }
+    }
+    untouched_outside(&before, &after, seq_path)?;
+    Ok(out)
+}
+
 /// 这个位置上的容器是行内写法（`{…}` / `[…]`）吗。不存在或者不是容器
 /// 时是 `false`。
 ///
@@ -538,6 +610,48 @@ mod tests {
     }
 
     const CFG: &str = "version: 1\n# 两家上游\nproviders:\n  - name: 官方\n    base_url: https://api.anthropic.com  # 直连\n    key: sk-a\n  - name: relay\n    base_url: https://relay.example\n    key: sk-b\n    redact: [api_keys, jwt]\n    pricing:\n      sheet: 旧\nroutes: []\n";
+
+    const LIST: &str = "version: 1\nplugins:\n  # 第一个装的\n  - id: a\n    sha256: x  # 批准过\n\n  - id: b\n    scope:\n      models: [m]\n  - id: c\nafter: 1\n";
+
+    #[test]
+    fn reordering_moves_whole_entries_and_leaves_the_rest_alone() {
+        let out = reorder(LIST, &p(&["plugins"]), &[2, 0, 1]).unwrap();
+        let v = back(&out);
+        let ids: Vec<&str> = v["plugins"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["c", "a", "b"]);
+        // 每一项连同它里面的注释一起搬走
+        assert!(out.contains("  - id: a\n    sha256: x  # 批准过"), "{out}");
+        assert_eq!(v["plugins"][2]["scope"]["models"][0].as_str(), Some("m"));
+        // 列表之外不动，两项之间的注释留在原处
+        assert!(
+            out.starts_with("version: 1\nplugins:\n  # 第一个装的\n  - id: c\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("after: 1\n"), "{out}");
+    }
+
+    #[test]
+    fn the_same_order_changes_nothing() {
+        assert_eq!(reorder(LIST, &p(&["plugins"]), &[0, 1, 2]).unwrap(), LIST);
+    }
+
+    #[test]
+    fn an_order_that_is_not_a_permutation_is_refused() {
+        for bad in [&[0, 1][..], &[0, 1, 1], &[0, 1, 3], &[0, 1, 2, 3]] {
+            assert!(
+                matches!(
+                    reorder(LIST, &p(&["plugins"]), bad),
+                    Err(PatchError::SelfCheck(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_nested_value_is_written_under_a_key_that_did_not_exist() {

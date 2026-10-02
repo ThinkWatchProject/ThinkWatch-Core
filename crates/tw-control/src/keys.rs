@@ -42,6 +42,7 @@ pub fn router() -> axum::Router<ControlState> {
 pub(crate) const CLIENTS: edit::Section = edit::Section {
     path: &["clients"],
     what: "gateway key",
+    key: "name",
 };
 
 fn not_found(name: &str) -> ApplyError {

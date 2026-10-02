@@ -22,7 +22,9 @@ use tw_api::Msg;
 ///
 /// **一列 JSON 的样子变了也算**（比如 `routing` 多了必有的字段）：旧的那些行
 /// 读出来是坏的，而读的一方会把「解不开」当成「没有」。
-const SCHEMA: i64 = 23;
+///
+/// 24：插件在每个请求上的运行记录（`plugin_runs`）。
+const SCHEMA: i64 = 24;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -328,6 +330,30 @@ impl Db {
              );
              CREATE INDEX security_events_at ON security_events (at_ms DESC);
              CREATE INDEX security_events_request ON security_events (request_id);
+             -- 脚本插件在请求上的每一次运行：请求钩子一次一行，回答钩子一个回答一行。
+             -- **跑了没改、出错跳过的也记**：一个请求经过了哪些插件，要说得全
+             CREATE TABLE plugin_runs (
+                request_id  INTEGER NOT NULL,
+                -- 这个请求上的第几次，从 0 起，按记下的先后
+                seq         INTEGER NOT NULL,
+                at_ms       INTEGER NOT NULL,
+                plugin_id   TEXT    NOT NULL,
+                -- 当时的名字。插件之后改了名，这一行说的还是当时那个
+                plugin_name TEXT    NOT NULL,
+                -- request / reply
+                hook        TEXT    NOT NULL,
+                -- unchanged / changed / rejected / error / skipped
+                outcome     TEXT    NOT NULL,
+                -- 出错、拒绝的原因：正文、码、参数，和 `requests` 的三列一样
+                error       TEXT,
+                error_code  TEXT,
+                error_args  TEXT,
+                cpu_us      INTEGER NOT NULL,
+                -- 细节，JSON（回答钩子改了几处之类）
+                detail      TEXT,
+                PRIMARY KEY (request_id, seq)
+             );
+             CREATE INDEX plugin_runs_at ON plugin_runs (at_ms);
              PRAGMA user_version = {SCHEMA};
              COMMIT;"
         ))?;
@@ -1292,9 +1318,112 @@ impl Db {
         let _ = self
             .conn
             .execute("DELETE FROM security_events WHERE at_ms < ?1", [cutoff_ms]);
+        // 插件的运行记录同理
+        let _ = self
+            .conn
+            .execute("DELETE FROM plugin_runs WHERE at_ms < ?1", [cutoff_ms]);
         Ok(self
             .conn
             .execute("DELETE FROM requests WHERE at_ms < ?1", [cutoff_ms])?)
+    }
+}
+
+/// 一个插件在一个请求上的一次运行，落库的样子（`plugin_runs` 一行，少了 `seq`：
+/// 它在写入时按这个请求已有的行数定）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginRunRow {
+    pub request_id: i64,
+    pub at_ms: i64,
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub hook: tw_api::PluginHook,
+    pub outcome: tw_api::PluginOutcome,
+    pub error: Option<Msg>,
+    pub cpu_us: i64,
+    /// JSON
+    pub detail: Option<String>,
+}
+
+impl Db {
+    /// 记一次插件运行。**排在这个请求已有的那些后面**：先记下的先跑
+    pub fn insert_plugin_run(&self, r: &PluginRunRow) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO plugin_runs
+             (request_id, seq, at_ms, plugin_id, plugin_name, hook, outcome,
+              error, error_code, error_args, cpu_us, detail)
+             VALUES (?1,
+                     (SELECT COALESCE(MAX(seq) + 1, 0) FROM plugin_runs WHERE request_id = ?1),
+                     ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                r.request_id,
+                r.at_ms,
+                r.plugin_id,
+                r.plugin_name,
+                r.hook.slug(),
+                r.outcome.slug(),
+                r.error.as_ref().map(|e| e.text.as_str()),
+                r.error.as_ref().map(|e| e.code.as_str()),
+                r.error
+                    .as_ref()
+                    .filter(|e| !e.args.is_empty())
+                    .map(|e| serde_json::to_string(&e.args).unwrap_or_default()),
+                r.cpu_us,
+                r.detail,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 一个请求上的插件运行，按记下的先后。
+    pub fn plugin_runs(&self, request_id: i64) -> Result<Vec<PluginRunRow>, DbError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT * FROM plugin_runs WHERE request_id = ?1 ORDER BY seq")?;
+        let rows = st.query_map([request_id], |r| {
+            Ok(PluginRunRow {
+                request_id: r.get("request_id")?,
+                at_ms: r.get("at_ms")?,
+                plugin_id: r.get("plugin_id")?,
+                plugin_name: r.get("plugin_name")?,
+                hook: slug_col(r, "hook", tw_api::PluginHook::from_slug)?,
+                outcome: slug_col(r, "outcome", tw_api::PluginOutcome::from_slug)?,
+                error: error_from(r)?,
+                cpu_us: r.get("cpu_us")?,
+                detail: r.get("detail")?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 请求号落在 `[from, to]` 里、被插件改过的那些（流量页的徽标）。一段历史一次取完
+    pub fn changed_by_plugins_between(
+        &self,
+        from: i64,
+        to: i64,
+    ) -> Result<std::collections::HashSet<i64>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT request_id FROM plugin_runs
+             WHERE request_id >= ?1 AND request_id <= ?2 AND outcome = 'changed'",
+        )?;
+        let ids = st.query_map(params![from, to], |r| r.get(0))?;
+        Ok(ids.collect::<Result<_, _>>()?)
+    }
+
+    /// 这几条请求里被插件改过的。**按号点名**：搜索翻出来的一页散在整份记录里
+    pub fn changed_by_plugins(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashSet<i64>, DbError> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT request_id FROM plugin_runs
+             WHERE request_id IN (SELECT value FROM json_each(?1)) AND outcome = 'changed'",
+        )?;
+        let ids = serde_json::to_string(ids).unwrap_or_default();
+        let found = st.query_map([ids], |r| r.get(0))?;
+        Ok(found.collect::<Result<_, _>>()?)
     }
 }
 
@@ -2015,6 +2144,90 @@ pub(crate) mod tests {
         }
         assert_eq!(db.prune_before(500).unwrap(), 4);
         assert_eq!(db.count().unwrap(), 6);
+    }
+
+    fn plugin_run(request_id: i64, at_ms: i64, outcome: tw_api::PluginOutcome) -> PluginRunRow {
+        PluginRunRow {
+            request_id,
+            at_ms,
+            plugin_id: format!("p{at_ms}"),
+            plugin_name: "插件".into(),
+            hook: tw_api::PluginHook::Request,
+            outcome,
+            error: None,
+            cpu_us: 5,
+            detail: None,
+        }
+    }
+
+    /// 一个请求上的运行按记下的先后排；出错的原因带着码和参数读回来
+    #[test]
+    fn plugin_runs_come_back_in_the_order_they_were_recorded() {
+        let db = Db::in_memory().unwrap();
+        let mut failed = plugin_run(7, 30, tw_api::PluginOutcome::Error);
+        failed.hook = tw_api::PluginHook::Reply;
+        failed.error = Some(Msg {
+            code: "t.cpu".into(),
+            args: [("ms".to_string(), "200".to_string())].into(),
+            text: "over 200 ms".into(),
+        });
+        failed.detail = Some("{\"texts\":2}".into());
+        db.insert_plugin_run(&plugin_run(7, 10, tw_api::PluginOutcome::Changed))
+            .unwrap();
+        db.insert_plugin_run(&plugin_run(8, 15, tw_api::PluginOutcome::Unchanged))
+            .unwrap();
+        db.insert_plugin_run(&failed).unwrap();
+        db.insert_plugin_run(&plugin_run(7, 20, tw_api::PluginOutcome::Skipped))
+            .unwrap();
+        let runs = db.plugin_runs(7).unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.plugin_id.as_str()).collect();
+        assert_eq!(ids, ["p10", "p30", "p20"]);
+        assert_eq!(runs[1], failed);
+        assert_eq!(runs[1].error.as_ref().unwrap().arg("ms"), "200");
+        assert!(db.plugin_runs(9).unwrap().is_empty());
+    }
+
+    #[test]
+    fn requests_changed_by_plugins_are_found_by_range_and_by_id() {
+        let db = Db::in_memory().unwrap();
+        db.insert_plugin_run(&plugin_run(1, 10, tw_api::PluginOutcome::Changed))
+            .unwrap();
+        db.insert_plugin_run(&plugin_run(1, 11, tw_api::PluginOutcome::Error))
+            .unwrap();
+        db.insert_plugin_run(&plugin_run(2, 20, tw_api::PluginOutcome::Unchanged))
+            .unwrap();
+        db.insert_plugin_run(&plugin_run(3, 30, tw_api::PluginOutcome::Changed))
+            .unwrap();
+        let mut got: Vec<i64> = db
+            .changed_by_plugins_between(1, 2)
+            .unwrap()
+            .into_iter()
+            .collect();
+        got.sort();
+        assert_eq!(got, [1]);
+        let mut got: Vec<i64> = db
+            .changed_by_plugins(&[2, 3])
+            .unwrap()
+            .into_iter()
+            .collect();
+        got.sort();
+        assert_eq!(got, [3]);
+        assert!(db.changed_by_plugins(&[]).unwrap().is_empty());
+    }
+
+    /// 运行记录跟着请求一起过期
+    #[test]
+    fn plugin_runs_are_pruned_with_the_requests() {
+        let db = Db::in_memory().unwrap();
+        db.insert(&row(1, 100)).unwrap();
+        db.insert(&row(2, 900)).unwrap();
+        db.insert_plugin_run(&plugin_run(1, 100, tw_api::PluginOutcome::Changed))
+            .unwrap();
+        db.insert_plugin_run(&plugin_run(2, 900, tw_api::PluginOutcome::Changed))
+            .unwrap();
+        db.prune_before(500).unwrap();
+        assert!(db.plugin_runs(1).unwrap().is_empty());
+        assert_eq!(db.plugin_runs(2).unwrap().len(), 1);
     }
 
     #[test]

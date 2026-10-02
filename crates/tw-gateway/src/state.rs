@@ -8,7 +8,7 @@ use crate::auth::key_eq;
 use crate::error::GatewayError;
 use crate::health::Health;
 use crate::outbound::{base_client_builder, client_for_provider, proxy_shape};
-use tw_types::msg;
+use tw_types::{Msg, msg};
 
 mod credentials;
 mod glm;
@@ -55,9 +55,13 @@ impl Runtime {
     /// Client，等于把每个上游的连接池连同已经握好的 TLS 一起扔掉 ——
     /// 改一条路由规则不该让下一个请求多付一次完整的建连。只有代理相关
     /// 的字段变了才必须重建，因为代理是绑在 Client 上的。
+    ///
+    /// 插件最后建：**它不会失败**（哪个插件有问题只停它自己，见 [`crate::plugin::load`]），
+    /// 放在所有可能失败的步骤之后，建出来就一定换得进去。
     pub fn build(
         config: tw_config::Config,
         previous: Option<&Runtime>,
+        plugins: &crate::plugin::Plugins,
     ) -> Result<Self, GatewayError> {
         let mut clients = std::collections::HashMap::new();
         for p in &config.providers {
@@ -102,6 +106,7 @@ impl Runtime {
             GatewayError::config(msg!("gw.config.security_rules", detail = e => "{detail}"))
         })?;
         let hidden = sec.hidden_text.kinds();
+        let plugins = Arc::new(plugins.build(&config));
         Ok(Self {
             engine: Arc::new(config.engine()),
             config: Arc::new(config),
@@ -111,8 +116,23 @@ impl Runtime {
             tools: Arc::new(tools),
             content: Arc::new(content),
             hidden,
-            plugins: Default::default(),
+            plugins,
         })
+    }
+
+    /// 同一份配置、换一份插件。插件文件变了时走这条：配置没变，别的都不用重建
+    fn with_plugins(&self, plugins: crate::plugin::PluginSet) -> Self {
+        Self {
+            config: self.config.clone(),
+            engine: self.engine.clone(),
+            clients: self.clients.clone(),
+            allow: self.allow.clone(),
+            redact: self.redact.clone(),
+            tools: self.tools.clone(),
+            content: self.content.clone(),
+            hidden: self.hidden.clone(),
+            plugins: Arc::new(plugins),
+        }
     }
 }
 
@@ -215,6 +235,13 @@ pub struct AppState {
     pub affinity: Arc<crate::affinity::Affinity>,
     /// 每段对话里、每一家上游拒过的别家封存的推理（见 [`crate::seal`]）。**跨重载存活**
     pub seals: Arc<crate::seal::Refused>,
+    /// 脚本插件里跨重载存活的那一半：运行时、插件文件在哪儿、计数和日志、编译缓存
+    /// （见 [`crate::plugin::Plugins`]）。跟着配置换的那一半在 `Runtime::plugins`
+    pub plugins: Arc<crate::plugin::Plugins>,
+    /// 换运行时的那一下。**配置重载和插件重载都要换整份运行时**，各自读旧的、建新的、
+    /// 存回去 —— 不排队的话，插件那一路可能拿着换配置之前的那份配置，把刚换进去的
+    /// 新配置又换回去
+    swap: Arc<std::sync::Mutex<()>>,
     /// Anthropic 流里上游静默多久就补一个 `ping`（见 `relay`）。**测试会把它调短**，
     /// 否则一条心跳的测试要干等十五秒
     pub ping_every: std::time::Duration,
@@ -234,7 +261,8 @@ impl AppState {
         let price_assign = config.price_assign();
         let models = Arc::new(crate::models::Directory::default());
         models.reconcile(&config);
-        let rt = Runtime::build(config, None)?;
+        let plugins = Arc::new(crate::plugin::Plugins::new(crate::plugin::default_engine()));
+        let rt = Runtime::build(config, None, &plugins)?;
         let health = Arc::new(Health::new());
         health.configure(&rt.config.failover);
         let state = Self {
@@ -273,6 +301,8 @@ impl AppState {
             sessions: Default::default(),
             affinity: Default::default(),
             seals: Default::default(),
+            plugins,
+            swap: Default::default(),
             ping_every: crate::PING_EVERY,
             ping_for: crate::PING_FOR,
         };
@@ -378,8 +408,13 @@ impl AppState {
     /// 三遍了，但运行时对象仍然可能建不起来（比如代理地址 reqwest 不认），
     /// 而那时旧配置必须原样继续服务。
     pub fn reload(&self, config: tw_config::Config) -> Result<(), GatewayError> {
+        let _swap = self
+            .swap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = self.rt.load();
-        let next = Runtime::build(config, Some(&old))?;
+        let next = Runtime::build(config, Some(&old), &self.plugins)?;
+        let broken = crate::plugin::load::newly_broken(&old.plugins, &next.plugins);
         // 比的是写法不是解析出来的地址：网卡名要问系统，而那是监听那一边的事
         let (was, now) = (&old.config.listen.gateway, &next.config.listen.gateway);
         let relisten = was.bind != now.bind || was.port != now.port;
@@ -389,6 +424,7 @@ impl AppState {
             .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
         self.health.configure(&next.config.failover);
         self.rt.store(Arc::new(next));
+        self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表
         // 即承诺），改了范围的立刻生效。新加的、地址凭据变了的在后台补问
         if self.models.reconcile(&self.config()) {
@@ -401,6 +437,52 @@ impl AppState {
             self.relisten();
         }
         Ok(())
+    }
+
+    /// 配置没变、插件文件变了：照当前这份配置把插件重新读一遍（重读文件、重算哈希），
+    /// 换进去。**文件和批准的不一样了就停用它**（「文件变了」），并且说一声。
+    pub fn reload_plugins(&self) {
+        let _swap = self
+            .swap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = self.rt.load_full();
+        if old.config.plugins.is_empty() && old.plugins.is_empty() {
+            return;
+        }
+        let set = self.plugins.build(&old.config);
+        let broken = crate::plugin::load::newly_broken(&old.plugins, &set);
+        self.rt.store(Arc::new(old.with_plugins(set)));
+        self.announce_broken(broken);
+    }
+
+    /// 告诉网关配置文件在哪个目录：**插件文件的路径相对它**。控制面拿到配置文件的
+    /// 路径时调；目录变了就把插件重读一遍
+    pub fn set_config_dir(&self, dir: std::path::PathBuf) {
+        if self.plugins.set_dir(dir) {
+            self.reload_plugins();
+        }
+    }
+
+    /// 换一个插件运行时（测试接假的引擎），换完把插件重读一遍
+    pub fn set_plugin_engine(&self, engine: Arc<dyn crate::plugin::Engine>) {
+        self.plugins.set_engine(engine);
+        self.reload_plugins();
+    }
+
+    /// 启用着的插件刚变成跑不了：说一声（`plugin_failed`，不挂在请求上）
+    fn announce_broken(&self, list: Vec<(Arc<crate::plugin::Active>, Msg)>) {
+        for (p, message) in list {
+            tracing::warn!(plugin = %p.id, "a plugin no longer runs: {message}");
+            self.bus.emit(tw_api::Event::PluginFailed {
+                id: self.bus.next_id(),
+                plugin_id: p.id.clone(),
+                plugin_name: p.name.clone(),
+                request_id: None,
+                message,
+                at_ms: crate::plugin::now_ms(),
+            });
+        }
     }
 
     /// 密钥 → 客户端名字 + 方言。
