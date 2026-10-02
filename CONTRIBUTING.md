@@ -67,6 +67,12 @@ The toolchain is `stable`, so a newer stable than your local one can
 surface lints you cannot reproduce — `rustup update stable` before
 blaming CI.
 
+A change to a `Cargo.toml` or to `Cargo.lock` also runs the Audit
+workflow: `cargo deny check advisories`, configured in `deny.toml`, fails
+on any RustSec advisory against a crate in the lock file. It runs daily
+on `main` as well, so an advisory published against a dependency that is
+already shipped turns up without anyone touching the dependencies.
+
 `scripts/smoke.sh` runs the real binary against a real socket and a real
 data plane, talking to the control plane through `twcore call` (every
 control connection starts with a Noise handshake, so curl cannot). **It catches what unit tests structurally cannot** — file
