@@ -37,6 +37,7 @@ pub(super) fn respond(
         provider,
         ledger,
         session,
+        refusal,
     } = served;
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -113,6 +114,11 @@ pub(super) fn respond(
     // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
     if generates && plan.is_sse && status.is_success() {
         ending.streaming(upstream_dialect, &provider.name);
+    }
+    // 回的不是 2xx：原样交给客户端，**这个请求照样是失败的** —— 客户端拿到的是上游的
+    // 错误，不是回答。原因在错误正文里，交完时读（见 `Ending::refused`）
+    if !status.is_success() {
+        ending.refused(upstream_dialect, &provider.name, refusal);
     }
     let mut relay = Relay::new(
         state,

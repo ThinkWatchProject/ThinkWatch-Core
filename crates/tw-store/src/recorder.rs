@@ -2453,6 +2453,107 @@ mod failure_tests {
         assert_eq!(row.duration_ms, Some(20_000));
     }
 
+    /// 上游回了 4xx、原样交给了客户端（网关报的是失败，见 `tw_gateway::ending`）：这一行
+    /// 是失败，状态码是上游回的那个。**会话里那一轮也一样**：状态码和原因都在，数进会话和
+    /// 概览的失败，不数进「没有用量」（那种响应不计费）。同一次会话里成功的、取消的那两轮
+    /// 照旧
+    #[test]
+    fn an_error_answer_is_a_failed_turn_with_the_status_the_upstream_answered() {
+        let (_d, mut r) = rec();
+        let start = |id| {
+            let mut ev = started(id, "claude-sonnet-4-5");
+            if let Event::RequestStarted { session, .. } = &mut ev {
+                *session = Some("s".into());
+            }
+            ev
+        };
+        let headers = |id, status| Event::RequestHeaders {
+            id,
+            status,
+            ttfb_ms: 300,
+        };
+        r.on_event(&start(1));
+        r.on_event(&headers(1, 200));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                input: 1_000,
+                output: 10,
+                ..Default::default()
+            }),
+        ));
+        let said = tw_api::Msg {
+            code: "gw.upstream.status_message".into(),
+            args: [
+                ("upstream", "官方"),
+                ("status", "400"),
+                ("message", "prompt is too long"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            text: "Upstream `官方` answered 400: prompt is too long".into(),
+        };
+        r.on_event(&start(2));
+        r.on_event(&headers(2, 400));
+        r.on_event(&Event::RequestFailed {
+            id: 2,
+            model: String::new(),
+            source: tw_api::FailureSource::Upstream,
+            message: said.clone(),
+            bytes: Some(120),
+            duration_ms: Some(320),
+            usage: None,
+            answered_model: None,
+        });
+        r.on_event(&start(3));
+        r.on_event(&headers(3, 200));
+        r.on_event(&Event::RequestCancelled {
+            id: 3,
+            model: String::new(),
+            status: Some(200),
+            bytes: 40,
+            duration_ms: 900,
+            usage: None,
+            answered_model: None,
+        });
+
+        let row = r.db().get(2).unwrap().unwrap();
+        assert_eq!(row.status, Some(400), "状态码来自响应头那个事件");
+        assert_eq!(row.error.as_ref(), Some(&said));
+        assert!(!row.cancelled);
+        assert_eq!(row.cost_micros, None);
+
+        let turns = r.db().turns("s").unwrap();
+        let seen: Vec<_> = turns
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    t.status,
+                    t.error.as_ref().map(|e| e.code.as_str()),
+                    t.cancelled,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, Some(200), None, false),
+                (2, Some(400), Some("gw.upstream.status_message"), false),
+                (3, Some(200), None, true),
+            ]
+        );
+        let s = &r.db().sessions(None, 10).unwrap()[0];
+        assert_eq!((s.turns, s.errors, s.no_usage_turns), (3, 1, 1), "{s:?}");
+        let sum = r.db().summary(0, i64::MAX).unwrap();
+        assert_eq!(
+            (sum.requests, sum.failed, sum.no_usage_requests),
+            (3, 1, 1),
+            "{sum:?}"
+        );
+    }
+
     /// 算出来的价钱照样报回总线，**标着估算**。
     #[test]
     fn the_price_of_a_failure_goes_back_onto_the_bus_as_an_estimate() {

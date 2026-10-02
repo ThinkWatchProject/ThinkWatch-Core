@@ -675,6 +675,12 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **32 起会话能读成一段对话**：新端点 `GET /sessions/{id}/transcript`（[`Transcript`]）
 /// 从存下来的正文里读出每一轮新说的话、回答、推理、工具调用和结果，读不到的地方逐轮说出来
 /// （[`TranscriptGap`]）。照 31 写的界面只有每一轮的用量和金额。
+///
+/// 同一版起**上游回了错误、原样交给客户端的请求是失败的**：结局是 [`Event::RequestFailed`]
+/// （`upstream`，上游在错误正文里说的话是 `gw.upstream.status_message`），记录的 `error`
+/// 有值，概览、会话、上游体检都数它。以前它是 `RequestFinished`、`error` 为空，对话里那
+/// 一轮只剩用户的话，没有回答，也说不出为什么。[`TurnView`] 多了 `status`，说得出上游回了
+/// 什么。照 31 写的界面看不到那个状态码。
 pub const CONTROL_API_VERSION: u32 = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,7 +844,9 @@ pub enum Event {
     /// 只有成功的流式响应有。非流式的整段一起到，没有「第一个」；不带 `alt=sse` 的
     /// Gemini 流和 WebSocket 那条路不在这里解析，也没有。
     RequestFirstToken { id: u64, ttft_ms: u64 },
-    /// 结束了
+    /// 结束了：上游回的是成功的状态码（2xx；WebSocket 那条路是升级成功的 101），回答
+    /// 交完了。**上游回了别的、原样交给了客户端的不是这一条**，是 `RequestFailed` ——
+    /// 客户端拿到的是上游的错误，不是回答
     RequestFinished {
         id: u64,
         /// 客户端要的模型名，和 `RequestStarted` 里的是同一个。
@@ -877,6 +885,10 @@ pub enum Event {
     /// （`auth` / `config` / `upstream` / `request` / `rate_limited` /
     /// `denied`），另外多一个 `internal`：网关自己的代码
     /// 崩掉了。它只出现在这里 —— 那时往往已经没有一个 HTTP 响应能带上它。
+    ///
+    /// **上游回了错误（不是 2xx）、原样交给客户端的也是失败**（`upstream`）：先有那个
+    /// 状态码的 `RequestHeaders`，`message` 是上游在错误正文里说的话
+    /// （`gw.upstream.status_message`，读不出来的是 `gw.upstream.status`）。
     RequestFailed {
         id: u64,
         /// 模型名。理由见 `RequestFinished::model`
@@ -1323,7 +1335,8 @@ slug_enum! {
     /// 尝试链里一跳的结果。
     pub enum AttemptOutcome {
         /// 这一跳接下了请求，尝试链到此为止。上游回的是 4xx 也算 —— 请求本身有
-        /// 问题，换一个上游也一样被拒
+        /// 问题，换一个上游也一样被拒；那个错误原样交给客户端，**请求本身记成失败**
+        /// （见 [`Event::RequestFailed`]）
         Served = "served",
         /// 上游返回 5xx 或 429，换下一个上游
         Status = "status",
@@ -3274,6 +3287,8 @@ pub enum CostDim {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Summary {
     pub requests: i64,
+    /// 失败的请求（[`HistoryRow::error`] 有值的）：网关没转发成的，和上游回了错误、原样
+    /// 交给客户端的。客户端先走了的不算（见 [`HistoryRow::cancelled`]）
     pub failed: i64,
     /// 本地应答的次数。**是个正向数字**，单独显示
     pub locally_answered: i64,
@@ -3294,7 +3309,7 @@ pub struct Summary {
     ///
     /// 和 `unpriced_requests` 一样让金额合计偏低，但配价格解决不了它 ——
     /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
-    /// 取消的，失败的和上游回了 4xx 的不算。
+    /// 取消的，失败的不算（上游回了错误的也是失败，那种响应不计费）。
     pub no_usage_requests: i64,
     /// 用了缓存之后净省下多少微分。
     ///
@@ -3531,7 +3546,11 @@ pub struct HistoryRow {
     pub cost_micros: Option<i64>,
     /// 这个成本是估的吗。**界面上要标出来**
     pub cost_estimated: bool,
-    /// 失败的原因。**带着码** —— 翻历史时界面照样能说自己那句话；
+    /// 失败的原因。**带着码** —— 翻历史时界面照样能说自己那句话。
+    ///
+    /// **有它就是失败**，数失败的地方都按它数（概览、会话、上游体检、搜索的筛选）：网关
+    /// 没转发成的（连不上、被拒、断在半路），和上游回了错误（不是 2xx）、原样交给客户端
+    /// 的 —— 那时 `status` 是上游回的那个状态码，这一句是它在错误正文里说的话
     pub error: Option<Msg>,
     /// 本地应答的
     pub local: bool,
@@ -4021,6 +4040,14 @@ pub struct TurnView {
     /// **没有价格就是 None，不是 0**
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// 上游回的状态码，和 [`HistoryRow::status`] 同一个。没走到上游的没有：连不上、
+    /// 被规则拒绝、客户端在响应头到之前就走了
+    pub status: Option<u16>,
+    /// 这一轮为什么失败（见 [`HistoryRow::error`]）。没失败是 None。
+    ///
+    /// **上游回了错误、原样交给客户端的也在这里**：`status` 是那个状态码，这一句是
+    /// 上游在错误正文里说的话（`gw.upstream.status_message`，读不出来的是
+    /// `gw.upstream.status`）。网关自己没转发成的没有 `status`，原因只在这一句里
     pub error: Option<Msg>,
     /// 客户端没等到这一轮结束就走了（见 `HistoryRow::cancelled`）
     pub cancelled: bool,

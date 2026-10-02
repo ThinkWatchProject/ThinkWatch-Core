@@ -1455,6 +1455,7 @@ fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
         cache_read_tokens: t.cache_read_tokens,
         cost_micros: t.cost_micros,
         duration_ms: t.duration_ms,
+        status: t.status,
         error: t.error.clone(),
         cancelled: t.cancelled,
         cost_estimated: t.cost_estimated,
