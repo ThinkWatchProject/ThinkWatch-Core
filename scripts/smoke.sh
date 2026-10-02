@@ -524,6 +524,37 @@ else
   bad "按密钥里的字找到了东西（$C）" "$(head -c 400 "$TMP/out")"
 fi
 
+# 会话读成一段对话。**每一次会话都读得出来**，和会话详情一轮对一轮，密钥打了码。数据面
+# 那一节发过的请求都在里面：整包的、流式的、被切断的、中途走掉的、转去 Bedrock 的 ——
+# Bedrock 的二进制帧在网关进门时转成 SSE 存下来，这里要从存下的那一份里读回那句话
+SIDS=$(ctl /sessions | python3 -c 'import json,sys;print(" ".join(s["id"] for s in json.load(sys.stdin)))')
+TURNS=0; WRONG=""; ALL=""
+for SID in $SIDS; do
+  C=$(get "/sessions/$SID/transcript")
+  cp "$TMP/out" "$TMP/transcript.json"
+  ctl "/sessions/$SID" > "$TMP/detail.json"
+  GOT=$(python3 -c 'import json, sys
+raw = open(sys.argv[1]).read()
+t, d = json.loads(raw), json.load(open(sys.argv[2]))
+same = [x["id"] for x in t["turns"]] == [str(x["id"]) for x in d["turns"]]
+print(len(t["turns"]) if same and "SMOKEKEYAAAA" not in raw else raw[:400])' \
+    "$TMP/transcript.json" "$TMP/detail.json" 2>&1)
+  if [ "$C" = "200" ] && [[ "$GOT" =~ ^[0-9]+$ ]]; then
+    TURNS=$((TURNS + GOT)); ALL="$ALL$(cat "$TMP/transcript.json")"
+  else
+    WRONG="$WRONG $SID（$C）：$GOT"
+  fi
+done
+if [ -z "$SIDS" ]; then
+  bad "一次会话都没有，读不了对话记录"
+elif [ -n "$WRONG" ]; then
+  bad "GET /sessions/{id}/transcript 不对" "$WRONG"
+elif ! grep -q '"text":"bedrock-stream"' <<<"$ALL"; then
+  bad "对话记录里没读出 Bedrock 流式回答的那句话" "$(head -c 600 <<<"$ALL")"
+else
+  ok "GET /sessions/{id}/transcript：$(wc -w <<<"$SIDS" | tr -d ' ') 次会话、$TURNS 轮都读得出来，和会话详情一轮对一轮，密钥打了码"
+fi
+
 # ---------------------------------------------------------------- 诊断包
 step "诊断包不带密钥出门"
 get /diagnostics >/dev/null
