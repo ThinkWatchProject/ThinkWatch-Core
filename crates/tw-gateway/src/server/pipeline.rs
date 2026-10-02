@@ -41,6 +41,35 @@ pub(super) struct Inbound {
     pub(super) dialect: tw_dialect::ir::Dialect,
     pub(super) started: std::time::Instant,
     pub(super) from: Sender,
+    /// 插件改过这个请求时，客户端发来的原样（见 [`Before`]）。没改过是 None
+    pub(super) before: Option<Before>,
+}
+
+/// 插件改过的请求，客户端发来时的样子。
+///
+/// **请求记录存的是它**（客户端发了什么），插件改过的那一份另外交给插件的记录；
+/// 开始事件和结局里的模型名也是客户端要的那一个 —— 和路由规则改写模型时一样，
+/// 实际发出去的模型记在尝试链的每一跳上。
+pub(super) struct Before {
+    pub(super) body: Bytes,
+    pub(super) path: String,
+    pub(super) model: String,
+}
+
+impl Inbound {
+    /// 客户端要的模型
+    pub(super) fn asked_model<'a>(&'a self, reading: &'a crate::client_api::Reading) -> &'a str {
+        self.before
+            .as_ref()
+            .map_or(reading.facts.model.as_str(), |b| b.model.as_str())
+    }
+
+    /// 客户端调的路径
+    fn asked_path(&self) -> &str {
+        self.before
+            .as_ref()
+            .map_or(self.uri.path(), |b| b.path.as_str())
+    }
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -82,6 +111,38 @@ pub(super) async fn pipeline(
         )));
     }
 
+    // 管线第 1.5 步：插件的请求钩子。插件表跟着运行时走：**整个请求是同一份**，
+    // 回答钩子用的也是它
+    let plugin_set = rt.plugins.clone();
+    let (req, mut plugged) = match request_plugins(&state, &rt, &plugin_set, req).await {
+        Ok(done) => done,
+        // 插件拒了这个请求：**照样开始**，流量里要有这一行，插件的记录挂在它上面。
+        // 路由还没跑，没有路由事件
+        Err(refused) => {
+            let (req, refused) = *refused;
+            let (reading, fp) = read(&req, intent);
+            let choice = Choice {
+                route: rt.engine.route_of(&req.client_name).to_string(),
+                ..Default::default()
+            };
+            let to = ("", tw_api::Billing::PerToken);
+            let (_, ledger) = look(&rt, &req, &refused.plugged);
+            let redaction = redaction(&rt, ledger);
+            open(
+                &state,
+                &req,
+                &reading,
+                &choice,
+                to,
+                fp.as_deref(),
+                &refused.plugged,
+                ending,
+                redaction,
+            );
+            return Err(GatewayError::denied(refused.why));
+        }
+    };
+
     let (reading, fp) = read(&req, intent);
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
@@ -91,7 +152,7 @@ pub(super) async fn pipeline(
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
             // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
-            let (_, ledger) = look(&rt, &req);
+            let (_, ledger) = look(&rt, &req, &plugged);
             let redaction = redaction(&rt, ledger);
             let id = open(
                 &state,
@@ -100,6 +161,7 @@ pub(super) async fn pipeline(
                 &choice,
                 to,
                 fp.as_deref(),
+                &plugged,
                 ending,
                 redaction,
             );
@@ -126,20 +188,46 @@ pub(super) async fn pipeline(
         choice,
         &decision,
         fp.as_deref(),
+        &plugged,
         ending,
     );
     screen(&state, &rt, &reading, &started)?;
     let answer = hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started).await?;
-    let mut ending = ending
-        .take()
-        .expect("written when the start event was emitted");
     // 网关估的数不是哪一家回答的：不记这段对话留在哪一家
     let served = match answer {
         hop::Answer::Served(served) => *served,
         hop::Answer::Estimated(body) => {
+            let ending = ending
+                .take()
+                .expect("written when the start event was emitted");
             return Ok(estimated(&state, &req, started.id, body, ending));
         }
     };
+    // 回答钩子：上游回了成功的回答才有。**在交出结局之前起实例**：起不来而策略是拒绝时，
+    // 这个请求按返回的错误收场，客户端还一个字节都没收到
+    let reply_plugins = match plugged.bridge.take() {
+        Some(bridge) if reading.generates && served.upstream.status().is_success() => {
+            // 拦截档下回答里的占位符是这一跳编的（接着请求的账），换回占位符时用同一本
+            let bridge = if served.ledger.is_empty() {
+                bridge
+            } else {
+                bridge.with_ledger(served.ledger.clone())
+            };
+            let hint = crate::hint::client_hint(&req.headers);
+            let ctx = crate::plugin::reply::ReplyCtx {
+                dialect: req.dialect,
+                client: hint.as_deref(),
+                model: req.asked_model(&reading),
+                upstream: &served.provider.name,
+                request_id: started.id,
+            };
+            crate::plugin::reply::Chain::start(&state, &plugin_set, bridge, &ctx).await?
+        }
+        _ => None,
+    };
+    let mut ending = ending
+        .take()
+        .expect("written when the start event was emitted");
     // 记下实际回答的那一家：故障转移之后接下的备选，就是这段对话之后留下的那一家
     if let Some(c) = &conv {
         ending.answered_by(state.affinity.ticket(
@@ -157,6 +245,7 @@ pub(super) async fn pipeline(
         started.id,
         live,
         ending,
+        reply_plugins,
     ))
 }
 
@@ -551,6 +640,7 @@ fn start(
     choice: Choice,
     decision: &tw_engine::Decision,
     fp: Option<&str>,
+    plugged: &crate::plugin::request::Plugged,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Started {
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
@@ -579,7 +669,7 @@ fn start(
     // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
     // 那一跳的请求体可能是转换过格式的。拦截档下账本在这里就编好号：每一跳、
     // 存下来的那份请求都按它换，同一个值处处是同一个占位符
-    let (found, ledger) = look(rt, req);
+    let (found, ledger) = look(rt, req, plugged);
     let id = open(
         state,
         req,
@@ -587,6 +677,7 @@ fn start(
         &choice,
         (first, billing.into()),
         fp,
+        plugged,
         ending,
         redaction(rt, ledger.clone()),
     );
@@ -609,15 +700,25 @@ fn start(
     }
 }
 
-/// 出站脱敏看一遍客户端发来的原文（见 [`crate::guard::look`]）。
+/// 出站脱敏看一遍要发出去的请求（见 [`crate::guard::look`]）：插件改过的话就是改过的
+/// 那一份。
+///
+/// **插件看过这个请求的话，接着插件看到的那本账编号**：插件拿到的占位符是按客户端
+/// 原文编的（见 [`crate::plugin::bridge`]），同一个值在插件那儿、在每一跳、在存下来的
+/// 请求和回答里都是同一个号。
 fn look(
     rt: &Runtime,
     req: &Inbound,
+    plugged: &crate::plugin::request::Plugged,
 ) -> (
     Vec<tw_guard::redact::rules::Finding>,
     tw_guard::redact::replace::Ledger,
 ) {
-    crate::guard::look(rt.config.security.redact.mode, &rt.redact, &req.body)
+    let mode = rt.config.security.redact.mode;
+    match plugged.bridge.as_ref() {
+        Some(b) => crate::guard::look_from(mode, &rt.redact, &req.body, b.ledger().clone()),
+        None => crate::guard::look(mode, &rt.redact, &req.body),
+    }
 }
 
 /// 这个请求的正文落盘之前怎么换、怎么打码：此刻生效的规则，和这个请求的账本。
@@ -642,6 +743,7 @@ fn open(
     choice: &Choice,
     to: (&str, tw_api::Billing),
     fp: Option<&str>,
+    plugged: &crate::plugin::request::Plugged,
     ending: &mut Option<crate::ending::Ending>,
     redaction: crate::bodies::Redaction,
 ) -> u64 {
@@ -663,9 +765,9 @@ fn open(
         rewritten_by: choice.rewritten_by.clone(),
         provider: to.0.to_string(),
         billing: to.1,
-        model: facts.model.clone(),
+        model: req.asked_model(reading).to_string(),
         method: "POST".to_string(),
-        path: req.uri.path().to_string(),
+        path: req.asked_path().to_string(),
         // 路由已经估过的那个数，不再算一遍。**它也就是发给上游的那一份的估算**：之后每
         // 一跳只会改模型名、输出上限和推理开关（规则）、换一种写法（格式转换）、把几个值
         // 换成占位符（脱敏）—— 前两样不动这个数，脱敏差出的几个 token 在估算本身的误差
@@ -678,7 +780,7 @@ fn open(
     let mut end = crate::ending::Ending::new(
         state.bus.clone(),
         id,
-        facts.model.clone(),
+        req.asked_model(reading).to_string(),
         req.started,
         at_ms as i64,
         sink.clone(),
@@ -690,19 +792,99 @@ fn open(
     // 除了一次 `Bytes` 的引用计数之外没有别的成本（说过入站是要
     // 整个解析的，所以本来就在）；比存得下的还长的，只拷开头那一段（见
     // `bodies::offer`）。**交出去的是原文**：换掉、打码在落盘那一头做，不占
-    // 转发这条路（见 `crate::bodies`）
+    // 转发这条路（见 `crate::bodies`）。
+    //
+    // 存的是**客户端发来的那一份**；插件改过的话，改过之后的另存一份，换掉、打码的
+    // 规矩一样
+    let body = req.before.as_ref().map_or(&req.body, |b| &b.body);
     crate::bodies::offer(
         &sink,
         crate::bodies::BodyRecord::new(
             id,
             at_ms as i64,
             crate::bodies::BodyKind::Request,
-            req.body.clone(),
-            req.body.len(),
-            redaction,
+            body.clone(),
+            body.len(),
+            redaction.clone(),
         ),
     );
+    if let Some(after) = &plugged.body {
+        crate::bodies::offer(
+            &sink,
+            crate::bodies::BodyRecord::new(
+                id,
+                at_ms as i64,
+                crate::bodies::BodyKind::AfterPlugins,
+                after.clone(),
+                after.len(),
+                redaction,
+            ),
+        );
+    }
+    crate::plugin::request::record(state, id, plugged);
     id
+}
+
+/// 管线第 1.5 步：插件的请求钩子（见 [`crate::plugin::request`]）。
+///
+/// **只给生成回答的请求跑**：计 token、嵌入这些接口没有「一次回答」可言。插件改过
+/// 请求的话，交回的 `Inbound` 带着改过的请求体（Gemini 换了模型时还有新的路径），
+/// 客户端发来的原样留在 `before` 里。
+async fn request_plugins(
+    state: &AppState,
+    rt: &Runtime,
+    set: &crate::plugin::PluginSet,
+    mut req: Inbound,
+) -> Result<
+    (Inbound, crate::plugin::request::Plugged),
+    Box<(Inbound, crate::plugin::request::Refused)>,
+> {
+    let Some(api) = req
+        .api
+        .filter(|_| crate::client_api::ClientApi::generates(req.uri.path()))
+    else {
+        return Ok((req, Default::default()));
+    };
+    if set.is_empty() {
+        return Ok((req, Default::default()));
+    }
+    let hint = crate::hint::client_hint(&req.headers);
+    let path = req.uri.path().to_string();
+    let asked = crate::plugin::request::Asked {
+        dialect: api.dialect(),
+        path: &path,
+        client: hint.as_deref(),
+    };
+    match crate::plugin::request::run(&state.plugin_pool, set, &rt.redact, &asked, &req.body).await
+    {
+        Ok(plugged) => {
+            if let Some(body) = plugged.body.clone() {
+                let new_path = plugged.path.clone();
+                req.before = Some(Before {
+                    body: std::mem::replace(&mut req.body, body),
+                    path: path.clone(),
+                    model: plugged.model.clone(),
+                });
+                if let Some(p) = new_path {
+                    req.uri = with_path(&req.uri, &p);
+                }
+            }
+            Ok((req, plugged))
+        }
+        Err(refused) => Err(Box::new((req, *refused))),
+    }
+}
+
+/// 换掉路径，查询串照旧
+fn with_path(uri: &axum::http::Uri, path: &str) -> axum::http::Uri {
+    let pq = match uri.query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    };
+    axum::http::Uri::builder()
+        .path_and_query(pq)
+        .build()
+        .unwrap_or_else(|_| uri.clone())
 }
 
 /// 请求防护：调用方发来的正文里（连同工具结果）有没有藏起来的字符、有没有命中

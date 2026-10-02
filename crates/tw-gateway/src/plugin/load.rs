@@ -353,6 +353,15 @@ pub fn fits(kind: tw_api::SettingKind, v: &serde_json::Value) -> bool {
     )
 }
 
+/// 插件文件和批准过的那一份不一样了。通知里说它，跳过、拒掉的那一次运行上记的也是它
+pub fn file_changed(plugin: &str) -> Msg {
+    msg!(
+        "gw.plugin.file_changed", plugin = plugin =>
+        "The file of plugin `{plugin}` changed on disk, so it no longer runs. Review \
+         the change and approve it in the app."
+    )
+}
+
 /// 换了一份插件之后要说一声的：**启用着的插件刚变成跑不了**（文件变了、加载出错），
 /// 或者跑不了的原因变了。一直跑不了的不再说第二遍 —— 每改一次配置都重报一遍，用户
 /// 很快就学会了不看。
@@ -370,11 +379,7 @@ pub fn newly_broken(old: &PluginSet, new: &PluginSet) -> Vec<(Arc<Active>, Msg)>
                 return None;
             }
             let why = match b {
-                Broken::Changed => msg!(
-                    "gw.plugin.file_changed", plugin = &p.name =>
-                    "The file of plugin `{plugin}` changed on disk, so it no longer runs. Review \
-                     the change and approve it in the app."
-                ),
+                Broken::Changed => file_changed(&p.name),
                 Broken::Error(m) => m.clone(),
             };
             Some((p.clone(), why))

@@ -247,6 +247,8 @@ pub struct AppState {
     pub ping_every: std::time::Duration,
     /// 上游整个静默（连注释都没有）超过这么久，就不再补 `ping`（见 `relay`）。**测试会把它调短**
     pub ping_for: std::time::Duration,
+    /// 跑插件的线程池（见 [`crate::plugin::pool`]）。**跨重载存活**；线程第一次用到时才起
+    pub plugin_pool: Arc<crate::plugin::pool::Pool>,
 }
 
 impl AppState {
@@ -305,6 +307,7 @@ impl AppState {
             swap: Default::default(),
             ping_every: crate::PING_EVERY,
             ping_for: crate::PING_FOR,
+            plugin_pool: Arc::new(crate::plugin::pool::Pool::default_size()),
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();
@@ -336,6 +339,18 @@ impl AppState {
 
     pub fn config(&self) -> Arc<tw_config::Config> {
         self.rt.load().config.clone()
+    }
+
+    /// 直接换一份插件进去，配置照旧：正在跑的请求用完它们手上那一份，新请求看到的是
+    /// 新的。**测试装插件替身走这里**；生产上装哪些插件由配置和插件文件决定（见
+    /// [`Self::reload_plugins`]），下一次重载就照那个重建
+    pub fn swap_plugins(&self, set: crate::plugin::PluginSet) {
+        let _swap = self
+            .swap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = self.rt.load_full();
+        self.rt.store(Arc::new(old.with_plugins(set)));
     }
 
     pub(crate) fn relisten_signal(&self) -> &tokio::sync::Notify {

@@ -56,8 +56,9 @@ pub enum BodyKind {
     Request,
     Response,
     /// 插件改过之后的请求体（`Request` 存的是客户端发来的那一份）。**只有插件真的改了
-    /// 才存**，挨着 `Request` 放。交来的是插件交回的那一份（占位符还没换回密钥），带着这个
-    /// 请求的 [`Redaction`]：落盘前和别的正文一样换掉、打码（[`BodyRecord::for_disk`]）
+    /// 才存**，挨着 `Request` 放。交来的是要发出去的那一份（插件交回的占位符已经换回
+    /// 原值，见 [`crate::plugin::request`]），带着这个请求的 [`Redaction`]：落盘前和别的
+    /// 正文一样换掉、打码（[`BodyRecord::for_disk`]）
     AfterPlugins,
 }
 

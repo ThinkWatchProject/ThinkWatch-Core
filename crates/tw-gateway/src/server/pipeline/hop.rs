@@ -166,11 +166,15 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
-        // 这一跳要发的模型名：规则改写过、和客户端要的不一样的才记（见 `AttemptView::model`）
-        let model = effective_set
-            .model
-            .clone()
-            .filter(|m| *m != reading.facts.model);
+        // 这一跳要发的模型名：规则或者插件改写过、和客户端要的不一样的才记（见
+        // `AttemptView::model`）
+        let model = Some(
+            effective_set
+                .model
+                .clone()
+                .unwrap_or_else(|| reading.facts.model.clone()),
+        )
+        .filter(|m| m != req.asked_model(reading));
         // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数
         if counting {
             match &count_model {

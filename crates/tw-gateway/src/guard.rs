@@ -78,6 +78,13 @@ pub fn ledger_for(body: &[u8]) -> Ledger {
 /// 就写着的占位符。之后每一跳都接着这本账换（[`replace`]），存下来的那份请求也照它换
 /// （[`crate::bodies::Redaction`]）。不在拦截档时账本是空的。
 pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) {
+    look_from(mode, rules, body, Ledger::new(Scheme::SECRET))
+}
+
+/// [`look`]，**接着 `seed` 的账编号**：插件跑过的请求，插件看到的占位符是按客户端原文
+/// 编的（见 [`crate::plugin::bridge`]），改过之后的这一份接着那本账编，同一个值还是同一个
+/// 号；插件改出来的新值接着往后编。
+pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
     let empty = || Ledger::new(Scheme::SECRET);
     if !mode.detects() || rules.is_empty() {
         return (Vec::new(), empty());
@@ -90,7 +97,7 @@ pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) 
     if !mode.acts() {
         return (found, empty());
     }
-    let seed = empty().avoiding(text);
+    let seed = seed.avoiding(text);
     let ledger = if hits.is_empty() {
         seed
     } else {

@@ -859,17 +859,22 @@ async fn trial(
         (row, request, reply)
     };
     // 跑不了的插件不试：改过的代码不跑（I9），加载不了的也跑不了
-    if let Some(b) = active.broken() {
-        return Ok(Json(refused(match b {
-            Broken::Changed => msg!(
-                "control.plugin.trial_changed", plugin = &active.name =>
-                "The file of plugin `{plugin}` changed and has not been approved, so it cannot be \
-                 tried."
-            ),
-            Broken::Error(m) => m.clone(),
-        })));
-    }
-    Ok(Json(run_trial(&active, &row, request, reply)))
+    let host = match &active.state {
+        tw_gateway::plugin::State::Ready(h) => h.clone(),
+        tw_gateway::plugin::State::Broken(b) => {
+            return Ok(Json(refused(match b {
+                Broken::Changed => msg!(
+                    "control.plugin.trial_changed", plugin = &active.name =>
+                    "The file of plugin `{plugin}` changed and has not been approved, so it cannot \
+                     be tried."
+                ),
+                Broken::Error(m) => m.clone(),
+            })));
+        }
+    };
+    Ok(Json(
+        run_trial(&s, &active, host, &row, request, reply).await,
+    ))
 }
 
 fn refused(why: Msg) -> tw_api::PluginTrialResult {
@@ -881,17 +886,71 @@ fn refused(why: Msg) -> tw_api::PluginTrialResult {
     }
 }
 
-/// 试跑本身在数据面那一侧（视图、写回都在那里）。**还没接上**：在那之前说一句做不了
-fn run_trial(
-    _active: &Active,
-    _row: &tw_store::RequestRow,
-    _request: Option<Vec<u8>>,
-    _reply: Option<Vec<u8>>,
+/// 试跑本身在数据面那一侧（视图、写回、占位符都在 [`tw_gateway::plugin::trial`]）。
+///
+/// 存下来的回答是上游的原话：回答它的那一家说什么格式，看服务它的那一跳转换过没有，
+/// 和会话记录读回答是同一个办法
+async fn run_trial(
+    s: &ControlState,
+    active: &Active,
+    host: std::sync::Arc<dyn tw_gateway::plugin::PluginHost>,
+    row: &tw_store::RequestRow,
+    request: Option<Vec<u8>>,
+    reply: Option<Vec<u8>>,
 ) -> tw_api::PluginTrialResult {
-    refused(msg!(
-        "control.plugin.trial_unavailable" =>
-        "Trial runs are not available in this build yet."
-    ))
+    use tw_gateway::plugin::trial::{self, StoredReply, StoredRequest};
+    use tw_store::search::text::{client_dialect, dialect_of};
+    let upstream = row
+        .translated
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<tw_api::TranslatedView>(j).ok())
+        .map(|t| dialect_of(t.to))
+        .or_else(|| client_dialect(&row.path));
+    let t = trial::run(
+        s.gateway.plugin_pool.clone(),
+        host,
+        &active.settings,
+        s.gateway.runtime().redact.clone(),
+        request.as_deref().map(|body| StoredRequest {
+            path: &row.path,
+            query: None,
+            body,
+            client: row.client_hint.as_deref(),
+        }),
+        reply
+            .as_deref()
+            .zip(upstream)
+            .map(|(body, upstream)| StoredReply {
+                body,
+                upstream,
+                provider: &row.provider,
+            }),
+    )
+    .await;
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let side = |x: trial::Side| tw_api::TrialSide {
+        before: x.before,
+        after: x.after,
+        outcome: x.outcome,
+    };
+    tw_api::PluginTrialResult {
+        request: t.request.map(side),
+        reply: t.reply.map(side),
+        logs: t
+            .logs
+            .into_iter()
+            .map(|(hook, l)| tw_api::PluginLogEntry {
+                at_ms,
+                request_id: Some(row.id as u64),
+                hook,
+                level: l.level,
+                text: l.text,
+            })
+            .collect(),
+        error: t.error,
+    }
 }
 
 // ---------------------------------------------------------------- 监听

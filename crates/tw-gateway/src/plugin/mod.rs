@@ -10,19 +10,52 @@
 //!
 //! **顺序就是配置里的顺序**：`plugins` 那一节从上到下，就是请求上一个接一个跑的
 //! 顺序。
+//!
+//! 数据面跑插件的那几块：
+//!
+//! - [`view`]：把客户端那种格式的请求体读成插件看到的视图（每一项带一个网关发的
+//!   `key`），按权限裁掉没给的部分；插件交回来之后按改写规则逐条核对，再**只改
+//!   动过的那几项**写回原来的 JSON —— 缓存断点、签名、图片和不认识的字段原样留着，
+//!   什么都没改时一个字节都不动。
+//! - [`bridge`]：插件永远看不到真的密钥（不变式 I5）。进插件之前按出站脱敏的规则把
+//!   认得出的密钥换成占位符，出来之后换回去；**不看脱敏开在哪一档**。
+//! - [`request`]：请求钩子。一个客户端请求只跑一次（I8），排在内容审查和路由之前（I7）。
+//! - [`reply`]：回答钩子。排在格式转换之后、工具调用审查和输出长度之前（I7）——
+//!   这两道防护看的就是插件改过的那一版。
+//! - [`pool`]：插件调用都是阻塞的、吃 CPU 的，放在专用线程池上跑，不占 tokio 的线程。
+//! - [`trial`]：对着存下来的请求和回答试跑一个插件。
 
+pub mod bridge;
 pub mod engine;
 /// 测试用的假引擎（见里面的说明）。**不是给生产用的**
 #[doc(hidden)]
 pub mod fake;
 pub mod host;
 pub mod load;
+pub mod pool;
+pub mod reply;
+pub mod request;
 pub mod set;
+pub mod trial;
+pub mod view;
 
 pub use engine::{Engine, Hooks, LoadError, MAX_SOURCE, Manifest, SettingSpec, Unavailable};
-pub use host::PluginHost;
+pub use host::{Invocation, PluginHost, ReplyHost, RequestOutcome, RunError, ToolCallOutcome};
 pub use load::{Plugins, RUN_CHANNEL_CAP, RunRecord, RunSender};
 pub use set::{Active, Broken, LogLine, LogRing, PluginRun, PluginSet, Scope, State, Stats};
+
+/// 客户端格式在插件那一侧的写法（`ctx.format`、视图的 `format`）。
+pub fn format_name(d: tw_dialect::ir::Dialect) -> &'static str {
+    use tw_dialect::ir::Dialect;
+    match d {
+        Dialect::Anthropic => "anthropic",
+        Dialect::Chat => "openai_chat",
+        Dialect::Responses => "openai_responses",
+        Dialect::Gemini => "gemini",
+        // 客户端不会说这种格式（Bedrock 只是上游）
+        Dialect::Bedrock => "bedrock",
+    }
+}
 
 use tw_types::Msg;
 
