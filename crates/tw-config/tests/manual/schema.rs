@@ -58,6 +58,9 @@ fn content_matches() -> Vec<&'static str> {
 fn group_types() -> Vec<&'static str> {
     super::fields::<GroupType>()
 }
+fn plugin_on_error() -> Vec<&'static str> {
+    super::fields::<PluginOnError>()
+}
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
 const MODE_DOC: T2 = t(
@@ -214,6 +217,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "The gateway key for clients that were not given a key of their own. Unset: the key named `default`, or the first key. It cannot be disabled.",
                         "没有专用密钥的客户端使用哪一把。不写：名为 `default` 的那把，没有则取第一把。这把密钥不能停用。",
+                    ),
+                ),
+                row(
+                    "plugins",
+                    Kind::Objs("plugins[]"),
+                    Def::Is("[]"),
+                    t(
+                        "Script plugins, in the order they run. The app installs them; each one's code is a file next to this one.",
+                        "脚本插件，按运行的顺序。由应用安装，每个插件的代码是本文件旁边的一个文件。",
                     ),
                 ),
             ],
@@ -1449,6 +1461,112 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Apply only when a session starts. Recorded and shown; not in effect yet.",
                         "只在会话开始时应用。目前只记录和显示，尚未生效。",
+                    ),
+                ),
+            ],
+        },
+        // ── plugins ───────────────────────────────────────────
+        Section {
+            path: "plugins[]",
+            ty: checked!(
+                Plugin,
+                "{id: a, file: plugins/a.js, sha256: 0000000000000000000000000000000000000000000000000000000000000000}"
+            ),
+            rows: vec![
+                row(
+                    "id",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order` and `inspect` are taken by the control plane.",
+                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。`order` 和 `inspect` 被控制面占用。",
+                    ),
+                ),
+                row(
+                    "file",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The plugin's code, relative to this file's directory. It is always `plugins/<id>.js`; the app writes it.",
+                        "插件的代码，相对本文件所在的目录。只能是 `plugins/<id>.js`，由应用写入。",
+                    ),
+                ),
+                row(
+                    "sha256",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "SHA-256 of the approved code, 64 lowercase hexadecimal characters. When the file no longer has this hash, the plugin stops running until the change is approved in the app. The approved code is kept in `plugins/.approved/<id>.js`.",
+                        "批准过的代码的 SHA-256，64 个小写十六进制字符。文件的哈希与它不符时插件停止运行，直到在应用里批准这次改动。批准过的代码另存在 `plugins/.approved/<id>.js`。",
+                    ),
+                ),
+                row(
+                    "enabled",
+                    Kind::Bool,
+                    Def::Is("true"),
+                    t(
+                        "Run the plugin. `false` keeps it installed and out of every request.",
+                        "是否运行这个插件。`false`：插件保留，不参与任何请求。",
+                    ),
+                ),
+                row(
+                    "on_error",
+                    Kind::Enum(plugin_on_error),
+                    Def::Is("reject"),
+                    t(
+                        "When the plugin fails on a request, or cannot run because its file changed or does not load: `reject` refuses the requests it covers; `skip` lets them through without it.",
+                        "插件在请求上出错，或者因文件改动、加载失败而无法运行时：`reject` 拒绝它所覆盖的请求；`skip` 跳过这个插件，请求照常。",
+                    ),
+                ),
+                row(
+                    "scope",
+                    Kind::Obj("plugins[].scope"),
+                    Def::Section,
+                    t(
+                        "Which requests the plugin handles. Filled from the plugin's own suggestion when it is installed.",
+                        "插件处理哪些请求。安装时按插件自己的建议填写。",
+                    ),
+                ),
+                row(
+                    "settings",
+                    Kind::Settings,
+                    Def::Is("{}"),
+                    t(
+                        "Values for the settings the plugin declares. A setting left out takes the plugin's default; one the plugin does not declare, or of the wrong type, stops the plugin from loading.",
+                        "插件所声明设置项的值。未写的取插件的默认值；插件未声明的设置项或类型不符的值会使插件无法加载。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "plugins[].scope",
+            ty: checked!(PluginScope, "{}"),
+            rows: vec![
+                row(
+                    "clients",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Client apps (`claude-code`, `codex`, …), as names or globs. `[]`: every client, including requests whose app is not recognised.",
+                        "客户端应用（`claude-code`、`codex` 等），写名字或通配。`[]`：所有客户端，包括认不出应用的请求。",
+                    ),
+                ),
+                row(
+                    "models",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Models sent to the upstream, as model ids or globs (`claude-*`). When a routing rule renames the model, the new name is the one that matches. `[]`: every model.",
+                        "发给上游的模型，写模型 ID 或通配（`claude-*`）。路由规则改了模型名的，按改名之后的匹配。`[]`：所有模型。",
+                    ),
+                ),
+                row(
+                    "upstreams",
+                    Kind::Strs,
+                    Def::Is("[]"),
+                    t(
+                        "Upstreams the plugin handles, by name or glob, for requests and answers alike. `[]`: every upstream.",
+                        "插件处理哪些上游，写名字或通配，请求和回答都按它。`[]`：所有上游。",
                     ),
                 ),
             ],

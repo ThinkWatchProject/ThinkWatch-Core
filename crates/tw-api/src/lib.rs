@@ -356,6 +356,8 @@ slug_enum! {
         Rollback = "rollback",
         /// OAuth 凭据轮换之后写回
         Rotation = "rotation",
+        /// core 自己：装上它自带的默认插件，或者把没动过的默认插件换成新版
+        Defaults = "defaults",
     }
 }
 
@@ -675,7 +677,27 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （[`Matcher`] 的 `email`、`cn-mobile-phone`）。「测试…」可以带处置（`action`），结果
 /// 多了发出去的样子（`output`）和会不会被拒（`refused`）。规则视图、测试和这几个词的类型
 /// 在 tw-guard 里定义，企业版的管理接口返回同一份。照 32 写的界面读不懂这些。
-pub const CONTROL_API_VERSION: u32 = 33;
+///
+/// **34 起有脚本插件**：`/plugins` 一组端点（列表、试编、装、改、换源码、看改动、批准、
+/// 排顺序、删、试跑、日志），事件多了 [`Event::PluginFailed`]（插件在请求上出错，或者
+/// 文件变了、加载不了而停用），[`RequestDetail`] 多了 `plugins`（每一次运行，带着跑在
+/// 尝试链的第几跳）和 `request_after_plugins`（插件改过的请求体），[`HistoryRow`] 多了
+/// `plugin_changed`。装、换源码、批准三个端点不给网页调：要在系统的确认框里点头。照 33
+/// 写的界面看不到插件。
+///
+/// 34 起**改得了工具调用的插件要点过头才能打开**：`UpdatePlugin` 拒绝打开权限里有
+/// `reply_tool_calls` 的插件（读不出权限的也算）、改它的设置或范围（403，
+/// `control.plugin.needs_confirmation`），这几样走新端点 `PUT /plugins/{id}/confirmed`
+/// （`UpdatePluginConfirmed`，请求体同 [`PluginUpdate`]）—— 它和装、换源码、批准一样
+/// 不给网页调，桌面端在系统的确认框里点了头才发。同一版起 core 自带几个默认插件，第一次
+/// 见到时装上、停用着，写配置的这一版来源是 [`ConfigOrigin::Defaults`]。
+///
+/// 34 起**插件说得出自己处理哪几种请求**：[`ManifestView`] 和 [`PluginView`] 多了
+/// `requests`（[`RequestKind`]：对话、嵌入、旧版补全）。插件只处理声明了的那几种 ——
+/// 不写是只有对话；嵌入和旧版补全要插件自己声明 —— 别的种类的请求不过它、不记录，
+/// 它出错、文件变了也拦不着它们。嵌入和旧版补全的视图是一项输入一条消息，`ctx.format`
+/// 多了 `openai_embeddings`、`openai_completions`、`gemini_embed`。
+pub const CONTROL_API_VERSION: u32 = 34;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1253,7 +1275,7 @@ pub enum Event {
         id: u64,
         /// 内容版本号，和 `PATCH /config` 的 `base_version` 是同一个
         version: String,
-        /// `ui` / `cli` / `external` / `rollback` / `rotation`
+        /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
         origin: ConfigOrigin,
         at_ms: u64,
     },
@@ -1271,7 +1293,7 @@ pub enum Event {
         line: Option<usize>,
         /// 出错那一行的原文，**已脱敏**
         excerpt: Option<String>,
-        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation`。
+        /// 这一版是谁写的：`ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`。
         ///
         /// **界面靠它区分「用户在编辑器里写错了」和「界面自己刚写坏了」** ——
         /// 前者要提醒，后者是保存失败，那条路自己会报。
@@ -1302,6 +1324,23 @@ pub enum Event {
         /// 哪一类辅助请求，和 `ProbeView.id` 同一个词表。字段叫 `probe` 而
         /// 不是 `kind` —— 那个名字已经被枚举的 tag 占了
         probe: ProbeClass,
+        at_ms: u64,
+    },
+    /// 一个插件没能把事情做成：在一个请求上运行出错（超时、超内存、抛了异常、交回的
+    /// 东西不合规矩），或者它的文件变了、加载不了，从此不再运行。
+    ///
+    /// **给通知用。**请求上的每一次运行都记在那条请求上（`RequestDetail::plugins`），
+    /// 这条只说出了错的；停用那一种只在变成停用的那一刻说一次。`id` 和别的通知一样
+    /// 是新取的号，出错的那个请求是 `request_id`。
+    PluginFailed {
+        id: u64,
+        plugin_id: String,
+        /// 插件自己起的名字。**插件写的字**，界面当纯文本显示
+        plugin_name: String,
+        /// 在哪个请求上出的错。停用（文件变了、加载不了）不挂在请求上，没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+        message: Msg,
         at_ms: u64,
     },
     /// 这个订阅者跟不上，事件流丢了它 `count` 条事件。
@@ -1489,6 +1528,7 @@ impl Event {
             | Event::CredentialRotated { id, .. }
             | Event::CredentialExpired { id, .. }
             | Event::LoginFinished { id, .. }
+            | Event::PluginFailed { id, .. }
             | Event::RequestRouted { id, .. } => *id,
         }
     }
@@ -3094,7 +3134,7 @@ pub struct BaseVersion {
 pub struct ConfigVersion {
     pub version: String,
     pub at_ms: u64,
-    /// `ui` / `cli` / `external` / `rollback` / `rotation`
+    /// `ui` / `cli` / `external` / `rollback` / `rotation` / `defaults`
     pub origin: ConfigOrigin,
     pub bytes: u64,
     /// 这一版是现在跑着的那一版吗。
@@ -3585,6 +3625,9 @@ pub struct HistoryRow {
     /// 而那正是用户回头翻「那一条到底被换了什么」的时候。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<SecurityEventView>,
+    /// 插件改过这个请求或它的回答。**流量页的徽标靠它**；改了什么见详情里的
+    /// [`RequestDetail::plugins`]
+    pub plugin_changed: bool,
 }
 
 /// 搜索的一页（`POST /history/search`），新的在前。
@@ -3667,8 +3710,16 @@ pub struct TranslatedView {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RequestDetail {
     pub row: HistoryRow,
+    /// 客户端发来的那一份。内容过滤删过字的话是删过的样子：插件拿到的、没有插件时发往
+    /// 上游的都是它
     pub request_body: Option<BodyView>,
+    /// 插件改过之后、发往上游的那一份：最后发出去的那一跳收到的（回答的那一家收到的就是
+    /// 它）。**只有插件改了那一跳的请求才有**
+    pub request_after_plugins: Option<BodyView>,
     pub response_body: Option<BodyView>,
+    /// 插件在这个请求上的每一次运行，按先后：每一跳的请求钩子，回答那一跳的回答钩子。
+    /// 按 [`PluginRunView::attempt`] 对着尝试链分组
+    pub plugins: Vec<PluginRunView>,
     /// 这个请求还在跑。**记录在结局到了才落库**，这时的 `row` 是到目前为止
     /// 知道的那些：开始时的身份和上游，响应头到了就有状态码，路由走完就有
     /// 尝试链；耗时、用量、金额都还没有。请求体已经存下了，响应体要等结局。
@@ -4613,9 +4664,466 @@ fn yes() -> bool {
     true
 }
 
+// ---------------------------------------------------------------- 脚本插件
+
+slug_enum! {
+    /// 一个插件要的权限：它能看、能改请求和回答的哪一部分。
+    ///
+    /// **插件文件里写成 `reply.text`、`reply.tool_calls`**（作者写的那种），线上是下划线
+    pub enum Permission {
+        /// 开头的那段系统指令
+        System = "system",
+        /// 对话里的消息
+        Messages = "messages",
+        /// 工具定义
+        Tools = "tools",
+        /// 模型名、`max_tokens` 这类参数。改了模型名，路由按新的走
+        Params = "params",
+        /// 回答里的文字
+        ReplyText = "reply_text",
+        /// 回答里的工具调用。**高风险**：改出来的调用照样过工具调用审查
+        ReplyToolCalls = "reply_tool_calls",
+    }
+}
+
+slug_enum! {
+    /// 一种请求。插件**只处理它声明了的那几种**（插件文件里 manifest 的 `requests`，
+    /// 不写就是只有 `conversation`）：别的种类的请求原样过去，不记录，插件出了什么错也
+    /// 和它们无关。图片、音频这些别的接口不属于任何一种，所有插件都不管。
+    pub enum RequestKind {
+        /// 对话：Anthropic Messages、OpenAI Chat Completions、Responses、Gemini 的生成，
+        /// 连同它们的数 token 和压缩
+        Conversation = "conversation",
+        /// 嵌入：OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、
+        /// `:batchEmbedContents`。插件只改得了每项输入的文字，回答钩子不在它上面跑
+        Embeddings = "embeddings",
+        /// 旧版补全：OpenAI 的 `/v1/completions`。插件只改得了每段提示的文字和几个参数，
+        /// 回答钩子不在它上面跑
+        Completions = "completions",
+    }
+}
+
+slug_enum! {
+    /// 插件出错（运行出错、文件变了、加载不了）时这个请求怎么办。
+    pub enum OnError {
+        /// 拒绝这个请求。出厂就是它：插件管不了的请求不该悄悄照原样发出去
+        Reject = "reject",
+        /// 跳过这个插件，请求照常
+        Skip = "skip",
+    }
+}
+
+slug_enum! {
+    /// 改回答文字的插件怎么拿到文字。
+    pub enum ReplyMode {
+        /// 一段文字整段交给插件，改完才发给客户端
+        Block = "block",
+        /// 边到边交，插件可以先压着一部分
+        Stream = "stream",
+    }
+}
+
+slug_enum! {
+    /// 插件设置项的类型。
+    pub enum SettingKind {
+        String = "string",
+        Number = "number",
+        Boolean = "boolean",
+    }
+}
+
+slug_enum! {
+    /// 插件在一个请求的哪一段上跑。
+    pub enum PluginHook {
+        /// 请求发往上游之前
+        Request = "request",
+        /// 回答到达客户端之前
+        Reply = "reply",
+    }
+}
+
+slug_enum! {
+    /// 一个插件在一个请求上的结果。
+    pub enum PluginOutcome {
+        /// 跑了，没改
+        Unchanged = "unchanged",
+        /// 跑了，改了
+        Changed = "changed",
+        /// 插件拒绝了这个请求（`reject()`）
+        Rejected = "rejected",
+        /// 出错了：超时、超内存、抛了异常、交回的东西不合规矩，或者插件没加载起来
+        Error = "error",
+        /// 没跑：插件没加载起来（文件变了、加载出错），而它设的是出错时跳过
+        Skipped = "skipped",
+    }
+}
+
+slug_enum! {
+    /// 插件日志一行的级别，`console.log` / `info` / `warn` / `error` 各一个。
+    pub enum PluginLogLevel {
+        Log = "log",
+        Info = "info",
+        Warn = "warn",
+        Error = "error",
+    }
+}
+
+/// 插件日志的一行。**原样是插件写的**：界面一律当纯文本显示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginLogEntry {
+    pub at_ms: u64,
+    /// 哪个请求上写的。和请求记录的号是同一个
+    pub request_id: Option<u64>,
+    pub hook: PluginHook,
+    pub level: PluginLogLevel,
+    pub text: String,
+}
+
+/// 一个插件从 core 这次启动以来跑得怎么样。**只在内存里**：重启就从零数起。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginStats {
+    /// 真的跑了几次（没跑的「跳过」不算）。请求上一次、一个回答一次
+    pub calls: u64,
+    /// 其中改了东西的
+    pub changed: u64,
+    /// 其中插件拒绝了请求的
+    pub rejected: u64,
+    /// 其中出错的
+    pub errors: u64,
+    /// 平均每次用了多少 CPU，微秒。没跑过是 0
+    pub avg_cpu_us: u64,
+    /// 最近一次出错
+    pub last_error: Option<PluginLastError>,
+}
+
+/// 插件最近一次出错。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginLastError {
+    pub at_ms: u64,
+    pub message: Msg,
+}
+
+/// 一个设置的值：字符串、数字或 true/false。
+///
+/// **线上就是那个值本身**（不带类型标记）：`"今天"`、`3`、`true`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum SettingValue {
+    Bool(bool),
+    Number(f64),
+    String(String),
+}
+
+impl SettingValue {
+    /// 是不是这种设置的类型
+    pub fn kind(&self) -> SettingKind {
+        match self {
+            SettingValue::Bool(_) => SettingKind::Boolean,
+            SettingValue::Number(_) => SettingKind::Number,
+            SettingValue::String(_) => SettingKind::String,
+        }
+    }
+}
+
+/// 插件管哪些请求。**每张单子里都是 `*` 通配**（不分大小写），空着是「都管」。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginScope {
+    /// 客户端应用：`claude-code`、`codex`……（请求记录上的 `client_hint`）
+    pub clients: Vec<String>,
+    /// 发给上游的模型：路由规则改了名的，按改名之后的
+    pub models: Vec<String>,
+    /// 发往的上游。**请求和回答都按它**：请求钩子排在路由之后，每发往一个上游跑一次
+    pub upstreams: Vec<String>,
+}
+
+/// 插件声明的一个设置项。`label` 是**插件写的字**：界面当纯文本显示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SettingSpecView {
+    pub key: String,
+    pub kind: SettingKind,
+    pub label: String,
+    /// 和 `kind` 同一种类型
+    pub default: SettingValue,
+}
+
+/// 插件导出了哪些钩子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginHooks {
+    /// `onRequest`
+    pub request: bool,
+    /// `onReplyText`
+    pub reply_text: bool,
+    /// `onToolCall`
+    pub tool_call: bool,
+}
+
+/// 插件文件里的 manifest，加上它导出了哪些钩子。名字、说明、设置项的 `label`
+/// **都是插件写的字**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ManifestView {
+    pub name: String,
+    pub description: Option<String>,
+    pub permissions: Vec<Permission>,
+    /// 插件处理哪几种请求，按 [`RequestKind::ALL`] 的顺序。至少有一种；manifest 没写
+    /// `requests` 时是 `["conversation"]`
+    pub requests: Vec<RequestKind>,
+    /// 插件建议的范围。装上时照它填
+    pub scope: PluginScope,
+    pub reply_mode: ReplyMode,
+    pub settings_schema: Vec<SettingSpecView>,
+    pub hooks: PluginHooks,
+}
+
+/// 插件此刻能不能跑。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginStatus {
+    /// 在跑
+    Ok,
+    /// 停用着
+    Disabled,
+    /// 磁盘上的文件和批准过的不一样了（或者没了），**不跑**。看过改动、重新批准才
+    /// 回来（[`PluginSourceView`]、`ApprovePluginFile`）。停用着的插件文件变了也是它
+    Changed,
+    /// 加载不了：语法错、manifest 不合规矩、设置和 manifest 对不上……
+    Error { message: Msg },
+}
+
+/// 一个装上了的插件（`GET /plugins`），按运行的顺序。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginView {
+    pub id: String,
+    /// 插件自己起的名字。**插件写的字**。读不出 manifest 时是 id
+    pub name: String,
+    /// 插件写的字
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub on_error: OnError,
+    /// 读不出 manifest 时是空的
+    pub permissions: Vec<Permission>,
+    /// 插件处理哪几种请求，按 [`RequestKind::ALL`] 的顺序（见 [`ManifestView::requests`]）。
+    /// 读不出 manifest 时按出厂的算：`["conversation"]` —— 跑不了的插件拦的也就是这几种
+    pub requests: Vec<RequestKind>,
+    /// 生效的范围（配置里的）
+    pub scope: PluginScope,
+    pub reply_mode: ReplyMode,
+    pub settings_schema: Vec<SettingSpecView>,
+    /// 交给插件的值：配置里写的，没写的是默认值
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    /// 批准过的那一份的 SHA-256，小写十六进制
+    pub sha256: String,
+    pub status: PluginStatus,
+    pub stats: PluginStats,
+}
+
+/// 一份源码（`POST /plugins/inspect`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginSource {
+    pub source: String,
+}
+
+/// 编一份源码看到的东西。**什么都没留下**：不写文件、不改配置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginInspection {
+    /// 编得成才有
+    pub manifest: Option<ManifestView>,
+    /// 这份源码（UTF-8 字节）的 SHA-256。装、批准时核对的就是它
+    pub sha256: String,
+    /// 编不成的原因
+    pub error: Option<PluginLoadError>,
+}
+
+/// 编不成的原因。语法错带着行列（从 1 起）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginLoadError {
+    pub message: Msg,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+/// 装一个插件（`POST /plugins`）。
+///
+/// **网页不能调。**装插件要在系统的确认框里点头，那一步在桌面端的 Rust 里：它自己
+/// 再编一遍源码、把名字和权限摆给人看，点了头才发这个请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginCreate {
+    pub source: String,
+    /// 不给就从名字生成一个
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub enabled: bool,
+    pub on_error: OnError,
+    pub scope: PluginScope,
+    /// 没给的取默认值
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 改一个插件的开关、出错时怎么办、范围、设置（`PUT /plugins/{id}`）。**整份交**：
+/// 交上来的就是保存之后的样子。
+///
+/// 插件改得了回答里的工具调用（权限有 [`Permission::ReplyToolCalls`]，或者读不出它要
+/// 什么权限）时，打开它、改设置、改范围这条路不收（`control.plugin.needs_confirmation`），
+/// 同一份请求体交给 `PUT /plugins/{id}/confirmed`：那个端点网页调不了，桌面端在系统的
+/// 确认框里点了头才发。比的是生效的值：没写进配置的设置按默认值算，范围不看顺序。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginUpdate {
+    pub enabled: bool,
+    pub on_error: OnError,
+    pub scope: PluginScope,
+    /// 没给的取默认值
+    pub settings: std::collections::BTreeMap<String, SettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 换一份源码（`PUT /plugins/{id}/source`）。**网页不能调**，理由同 [`PluginCreate`]。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginSourceReplace {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 批准磁盘上改过的那个文件（`POST /plugins/{id}/approve`）。**网页不能调**，理由同
+/// [`PluginCreate`]。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginApprove {
+    /// 看过的那一份的哈希（[`PluginSourceView::current_sha256`]）。**磁盘上的文件得
+    /// 正好是它**：看完到点头之间又被改了的，不批
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 批准过的那一份和磁盘上现在那一份（`GET /plugins/{id}/source`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginSourceView {
+    /// 批准时存下的那一份。**底稿没了、或者也被改过（哈希对不上）时是空的**：
+    /// 说不出批准的是什么，就不拿别的冒充
+    pub approved: String,
+    /// 配置里批准的哈希
+    pub approved_sha256: String,
+    /// 磁盘上现在的那一份。文件没了是 None
+    pub current: Option<String>,
+    pub current_sha256: Option<String>,
+}
+
+/// 排顺序（`PUT /plugins/order`）：**全部 id**，按新的顺序。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginOrder {
+    pub ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 拿一条记下的请求试跑一个插件（`POST /plugins/{id}/trial`）。**不连上游**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginTrial {
+    /// 请求记录的号（[`HistoryRow::id`]）
+    pub request_id: i64,
+}
+
+/// 试跑的结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginTrialResult {
+    /// 请求钩子跑在记下的请求上。插件没有请求钩子、请求体没留下时没有
+    pub request: Option<TrialSide>,
+    /// 回答钩子跑在记下的回答上。插件没有回答钩子、回答没留下时没有
+    pub reply: Option<TrialSide>,
+    /// 这次试跑写的日志。**不进插件的日志**
+    pub logs: Vec<PluginLogEntry>,
+    /// 试不了的原因（插件没加载起来、记录里没有可试的东西……）
+    pub error: Option<Msg>,
+}
+
+/// 试跑的一边：前后两份，排好版的 JSON，**已打码**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TrialSide {
+    pub before: String,
+    pub after: String,
+    pub outcome: PluginOutcome,
+}
+
+/// 一个插件在一个请求上的一次运行（详情抽屉的时间线）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginRunView {
+    pub plugin_id: String,
+    /// 当时的名字。**插件写的字**
+    pub plugin_name: String,
+    pub hook: PluginHook,
+    /// 跑在尝试链上的第几跳（从 0 起，对着 [`RoutingView::attempts`]）。请求钩子每发往一个
+    /// 上游跑一次，故障转移换了上游就多一组；回答钩子跑在回答的那一跳上
+    pub attempt: u32,
+    pub outcome: PluginOutcome,
+    /// 出错、拒绝的原因
+    pub error: Option<Msg>,
+    pub cpu_us: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 版本号就是它上面的说明写到的最新一版（「N 起」）。两条分支各自加了一版、合到一起
+    /// 时，常量那一行两边都没动、不会冲突，很容易照旧留在合并之前的那个数上 —— 照着说明
+    /// 写的界面就按旧版去读新的协议了
+    #[test]
+    fn the_api_version_is_the_newest_one_its_notes_describe() {
+        let src = include_str!("lib.rs");
+        let at = src
+            .find("\npub const CONTROL_API_VERSION")
+            .expect("the constant is declared here");
+        let notes: Vec<&str> = src[..at]
+            .lines()
+            .rev()
+            .take_while(|l| l.starts_with("///"))
+            .collect();
+        let mut newest = 0;
+        for line in &notes {
+            for (i, _) in line.match_indices(" 起") {
+                let digits: String = line[..i]
+                    .chars()
+                    .rev()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    newest = newest.max(n);
+                }
+            }
+        }
+        assert_eq!(
+            newest, CONTROL_API_VERSION,
+            "the notes above CONTROL_API_VERSION describe version {newest}"
+        );
+    }
 
     /// 枚举化的字段在线上仍然是那个词，`slug()` 说的也是它。
     #[test]
@@ -4730,8 +5238,25 @@ mod tests {
         );
         check(Guard::ALL, Guard::slug, Guard::from_slug);
         check(RuleAction::ALL, RuleAction::slug, RuleAction::from_slug);
+        check(Permission::ALL, Permission::slug, Permission::from_slug);
+        check(RequestKind::ALL, RequestKind::slug, RequestKind::from_slug);
+        check(OnError::ALL, OnError::slug, OnError::from_slug);
+        check(ReplyMode::ALL, ReplyMode::slug, ReplyMode::from_slug);
+        check(SettingKind::ALL, SettingKind::slug, SettingKind::from_slug);
+        check(PluginHook::ALL, PluginHook::slug, PluginHook::from_slug);
+        check(
+            PluginOutcome::ALL,
+            PluginOutcome::slug,
+            PluginOutcome::from_slug,
+        );
+        check(
+            PluginLogLevel::ALL,
+            PluginLogLevel::slug,
+            PluginLogLevel::from_slug,
+        );
         assert_eq!(GroupKind::LoadBalance.slug(), "load-balance");
         assert_eq!(Guard::InspectTools.slug(), "inspect_tools");
+        assert_eq!(Permission::ReplyToolCalls.slug(), "reply_tool_calls");
     }
 
     #[test]

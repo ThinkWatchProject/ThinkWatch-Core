@@ -135,6 +135,17 @@ pub(super) async fn ws_upgrade(
         .await
         .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
     let (id, ending) = open(&choice, &name, provider.billing.into());
+    // 插件：升级那一刻的那一份表，一条连接用到底。**插件只管 Responses 的 WebSocket**（每个
+    // `response.create` 是一次对话请求）；别的路径上的连接（比如 Realtime 的 `/v1/realtime`）
+    // 不属于插件处理的任何一种请求，所有插件都不管：原样接上，什么都不记
+    let responses = crate::client_api::ClientApi::of_path(uri.path())
+        == Some(crate::client_api::ClientApi::OpenaiResponses)
+        && crate::client_api::ClientApi::generates(uri.path());
+    let plugins = (responses && !rt.plugins.is_empty()).then(|| crate::ws::Plugins {
+        pool: state.plugin_pool.clone(),
+        set: rt.plugins.clone(),
+        client: crate::hint::client_hint(&headers),
+    });
     let upstream = crate::ws::Upstream {
         url: crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref()),
         headers: upstream_headers,
@@ -155,6 +166,6 @@ pub(super) async fn ws_upgrade(
         let _live = live;
         let mut ending = ending;
         ending.responded(101);
-        crate::ws::proxy(state, sock, upstream, rules, id, ending).await;
+        crate::ws::proxy(state, sock, upstream, rules, id, ending, plugins).await;
     }))
 }

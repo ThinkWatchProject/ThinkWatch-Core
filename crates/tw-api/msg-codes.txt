@@ -61,6 +61,13 @@ config.empty_models_only
 config.failover_range
 config.name_collision
 config.no_clients
+config.plugin.bad_id
+config.plugin.blank_pattern
+config.plugin.duplicate
+config.plugin.file
+config.plugin.reserved_id
+config.plugin.setting_type
+config.plugin.sha256
 config.rejected
 config.rejected_at
 config.remote_port_is_gateway
@@ -137,6 +144,18 @@ control.no_such_version
 control.not_a_chatgpt_account
 control.patch.no_entry
 control.patch.not_an_entry
+control.plugin.bad_id
+control.plugin.blank_pattern
+control.plugin.file_missing
+control.plugin.file_moved_on
+control.plugin.id_taken
+control.plugin.needs_confirmation
+control.plugin.not_found
+control.plugin.order
+control.plugin.reserved_id
+control.plugin.trial_changed
+control.plugin.unreadable
+control.plugin.write_failed
 control.pricing.broke_off
 control.pricing.not_a_dataset
 control.pricing.save_failed
@@ -259,6 +278,39 @@ gw.oauth.rotation_no_manager
 gw.oauth.rotation_queue_full
 gw.oauth.status
 gw.oauth.unreachable
+gw.plugin.answer_unreadable
+gw.plugin.api
+gw.plugin.bad_output
+gw.plugin.cannot_read_body
+gw.plugin.changed
+gw.plugin.cpu_limit
+gw.plugin.engine
+gw.plugin.failed
+gw.plugin.file_changed
+gw.plugin.manifest
+gw.plugin.memory_limit
+gw.plugin.model_not_allowed
+gw.plugin.not_applicable
+gw.plugin.not_declared
+gw.plugin.not_located
+gw.plugin.nothing_to_try
+gw.plugin.output_limit
+gw.plugin.permission_violation
+gw.plugin.reason passthrough
+gw.plugin.rejected
+gw.plugin.reply_busy
+gw.plugin.reply_failed
+gw.plugin.request_failed
+gw.plugin.request_unreadable
+gw.plugin.setting_type
+gw.plugin.setting_unknown
+gw.plugin.syntax
+gw.plugin.syntax_at
+gw.plugin.threw
+gw.plugin.too_large
+gw.plugin.trap
+gw.plugin.unavailable
+gw.plugin.unreadable
 gw.probe.aws_token_expired
 gw.probe.bedrock_list_denied
 gw.probe.connect
@@ -377,8 +429,10 @@ security.unknown_action
 security.unknown_guard
 security.unknown_rule
 t.auth test
+t.boom test
 t.broke test
 t.limited test
+t.plugin_threw test
 t.upstream test
 t.x test
 yaml.anchor_or_alias

@@ -17,6 +17,19 @@
 //!   观察档记录，处置档拒绝、删除或替换；
 //! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
 //!
+//! 脚本插件也在这条路上跑（见 [`crate::plugin`]）：客户端发来的每个
+//! `response.create` 是一次请求。**这条路只有一跳**（升级时就连定了那一家，不换），
+//! 所以每个 `response.create` 过一遍请求钩子：上游是这条连接连的那一家，模型名是这一帧
+//! 写的（WebSocket 上没有规则改写）。位置和 HTTP 那条路的一跳一样 —— 内容过滤先查
+//! 客户端的原话（删过的话插件拿到的是删过的那一帧），插件改过的再查一遍、只报插件加进来
+//! 的，然后才脱敏、发出。上游每一次回答（`response.created` 到 `response.completed`）
+//! 起一组回答钩子的实例，排在占位符还原之后、工具墙之前。插件出错而策略是拒绝时，切掉的
+//! 是那一次回答，连接照常。
+//!
+//! **插件只管 Responses 的 WebSocket**（每个 `response.create` 是一次对话请求）。别的路径
+//! 上的连接（比如 Realtime 的 `/v1/realtime`）不属于插件处理的任何一种请求：所有插件都
+//! 不管，原样接上，什么都不记（见 `server::upgrade`）。
+//!
 //! # 两条明说的边界
 //!
 //! **一、走代理的上游不代理 WS。**代理是给 reqwest 配的，而这里
@@ -113,6 +126,14 @@ pub struct Rules {
     pub screen: crate::guard::Screen,
 }
 
+/// 这条连接上的插件：**升级那一刻取的那一份表**，一条连接活多久就用它多久。
+pub struct Plugins {
+    pub pool: Arc<crate::plugin::pool::Pool>,
+    pub set: Arc<crate::plugin::PluginSet>,
+    /// 客户端是哪个应用（范围和 `ctx.client` 看它）
+    pub client: Option<String>,
+}
+
 /// 一次连接里两个方向各自的状态。
 struct Pipes {
     /// **整条连接一本账。**每帧各起一本的话，第二帧的
@@ -120,9 +141,24 @@ struct Pipes {
     ledger: tw_guard::redact::replace::Ledger,
     /// 工具调用审查关着的时候没有它
     wall: Option<tw_guard::tools::wall::Wall>,
+    /// 正在跑的那次回答的 id（`response.created` 里的）。切掉这次回答时的
+    /// `response.failed` 要说是哪一次
+    response: Option<String>,
+    /// 这次回答被切掉了（回答钩子出错而策略是拒绝）、已经替它发过 `response.failed`：
+    /// 它剩下的帧（包括上游自己的收尾）一帧都不再发，下一次回答照常
+    dropping: bool,
     rules: Rules,
     provider: String,
     id: u64,
+    /// 范围里可能有插件时才有
+    plugins: Option<Plugins>,
+    /// 最近一次 `response.create`：客户端要的模型、发出去的模型（插件可能换了它）和
+    /// 它的密钥映射。回答钩子用
+    requested_model: String,
+    sent_model: String,
+    bridge: Option<crate::plugin::bridge::Bridge>,
+    /// 这一次回答的回答钩子
+    reply: Option<crate::plugin::reply::Stream>,
 }
 
 /// 接管一次升级。
@@ -141,6 +177,7 @@ pub async fn proxy(
     rules: Rules,
     id: u64,
     ending: crate::ending::Ending,
+    plugins: Option<Plugins>,
 ) {
     let hop_started = std::time::Instant::now();
     let connected = connect(&upstream).await;
@@ -187,9 +224,16 @@ pub async fn proxy(
             .inspect_mode
             .detects()
             .then(|| tw_guard::tools::wall::Wall::new(rules.tools.clone())),
+        response: None,
+        dropping: false,
         rules,
         provider: upstream.provider.name,
         id,
+        plugins,
+        requested_model: String::new(),
+        sent_model: String::new(),
+        bridge: None,
+        reply: None,
     };
     pump(state, client, up, &mut p, ending).await;
 }
@@ -330,8 +374,20 @@ async fn pump(
                 let Some(Ok(m)) = msg else { break End::Closed };
                 let out = match m {
                     Message::Text(t) => {
-                        // 内容过滤在脱敏之前：看的是客户端的原话。删过的话，后面用删过的那一帧
+                        // 内容过滤在插件和脱敏之前：看的是客户端的原话。删过的话，后面用删过的
+                        // 那一帧
                         let text = match screen_frame(&state, p, t.as_str()) {
+                            Ok(text) => text,
+                            Err(why) => {
+                                let _ = c_tx.send(Message::Text(
+                                    format!("[ThinkWatch] {}", why.text).into(),
+                                )).await;
+                                break End::Cut(why);
+                            }
+                        };
+                        // 插件的请求钩子拿到的是查过（删过）的那一帧。改过的那一版再查一遍内容
+                        // 过滤（只报插件加进来的），脱敏换的是改过的那一版
+                        let text = match plugin_request(&state, p, &text).await {
                             Ok(text) => text,
                             Err(why) => {
                                 let _ = c_tx.send(Message::Text(
@@ -399,53 +455,10 @@ async fn pump(
                 };
                 let out = match m {
                     UpMsg::Text(t) => {
-                        let restored = tw_guard::redact::replace::restore(t.as_str(), &p.ledger);
-                        let hits = match p.wall.as_mut() {
-                            Some(w) => w.feed(as_sse(&restored).as_bytes()),
-                            None => Vec::new(),
-                        };
-                        // **和主管线一模一样的判据**：规则是切断 + 拦截档
-                        let acts = p.rules.inspect_mode.acts();
-                        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句
-                        let mut refusal: Option<Msg> = None;
-                        for h in &hits {
-                            let blocked = h.cut && acts;
-                            if blocked && refusal.is_none() {
-                                // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）
-                                refusal = Some(msg!(
-                                    "gw.toolcall.connection_cut",
-                                    upstream = p.provider.clone(), tool = h.tool.clone(),
-                                    rule = h.rule.clone(), name = h.name.clone(),
-                                    why = h.why.clone() =>
-                                    "The answer contained a {tool} call that matched rule \
-                                     “{name}”{}, so the connection was cut.",
-                                    crate::server::because(&h.why)
-                                ));
-                            }
-                            // 命中的那一段是还原过的：报出去之前和留档一样打码
-                            let redaction = crate::bodies::Redaction {
-                                rules: p.rules.redact.clone(),
-                                ledger: p.ledger.clone(),
-                            };
-                            state.bus.emit(crate::server::flagged(
-                                p.id,
-                                &p.provider,
-                                h,
-                                blocked,
-                                &redaction,
-                            ));
+                        match upstream_text(&state, p, t.as_str(), &mut c_tx, &mut ending).await {
+                            Flow::Sent => continue,
+                            Flow::End(end) => break end,
                         }
-                        if let Some(why) = refusal {
-                            // **命中那一帧不发。**和 SSE 那条路同一条纪律：
-                            // 先判断再转发，而不是发完再说。告诉客户端的就是结局里
-                            // 那句带码的话，和内容过滤拒掉一帧时一样
-                            let _ = c_tx.send(Message::Text(
-                                format!("[ThinkWatch] {}", why.text).into(),
-                            )).await;
-                            break End::Cut(why);
-                        }
-                        ending.count(restored.len());
-                        Message::Text(restored.into())
                     }
                     UpMsg::Binary(b) => {
                         ending.count(b.len());
@@ -469,6 +482,291 @@ async fn pump(
     }
     let _ = c_tx.close().await;
     let _ = u_tx.close().await;
+}
+
+type ClientSink = futures::stream::SplitSink<WebSocket, Message>;
+
+/// 上游的一帧文本处理完之后怎么办。
+enum Flow {
+    /// 该发的都发了（或者扣下了），接着收
+    Sent,
+    End(End),
+}
+
+/// 上游的一帧文本：还原占位符、回答钩子、工具墙，然后发给客户端。
+async fn upstream_text(
+    state: &AppState,
+    p: &mut Pipes,
+    t: &str,
+    c_tx: &mut ClientSink,
+    ending: &mut crate::ending::Ending,
+) -> Flow {
+    let restored = tw_guard::redact::replace::restore(t, &p.ledger);
+    // 回答的边界：一次新的回答起一组回答钩子的实例；被切掉的那次剩下的帧不发
+    let kind = frame_kind(&restored);
+    let terminal = matches!(
+        kind.as_deref(),
+        Some("response.completed" | "response.failed" | "response.incomplete")
+    );
+    if kind.as_deref() == Some("response.created") {
+        p.response = response_id(&restored);
+        p.dropping = false;
+        // 回答钩子：这一次回答起一组实例
+        if let Err(why) = start_reply(state, p).await {
+            return fail_response(p, c_tx, why).await;
+        }
+    } else if p.dropping {
+        if terminal {
+            p.dropping = false;
+        }
+        return Flow::Sent;
+    }
+    // 回答钩子：一帧可能变成几帧，也可能先扣着
+    let (outgoing, failed) = match p.reply.as_mut() {
+        None => (vec![restored], None),
+        Some(s) => {
+            let (out, mut err) = s.feed(as_sse(&restored).as_bytes()).await;
+            let mut msgs = payloads(&out);
+            if err.is_none() && terminal {
+                let (more, e) = s.finish(false).await;
+                msgs.extend(payloads(&more));
+                err = e;
+            }
+            if terminal || err.is_some() {
+                // 这一次回答完了：实例扔掉，记录交出去
+                p.reply = None;
+            }
+            (msgs, err)
+        }
+    };
+    for msg in outgoing {
+        let hits = match p.wall.as_mut() {
+            Some(w) => w.feed(as_sse(&msg).as_bytes()),
+            None => Vec::new(),
+        };
+        // **和主管线一模一样的判据**：规则是切断 + 拦截档
+        let acts = p.rules.inspect_mode.acts();
+        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句
+        let mut refusal: Option<Msg> = None;
+        for h in &hits {
+            let blocked = h.cut && acts;
+            if blocked && refusal.is_none() {
+                // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）：回答钩子
+                // 也能造、能改这一帧里的调用
+                refusal = Some(msg!(
+                    "gw.toolcall.connection_cut",
+                    upstream = p.provider.clone(), tool = h.tool.clone(),
+                    rule = h.rule.clone(), name = h.name.clone(),
+                    why = h.why.clone() =>
+                    "The answer contained a {tool} call that matched rule \
+                     “{name}”{}, so the connection was cut.",
+                    crate::server::because(&h.why)
+                ));
+            }
+            // 命中的那一段是还原过的：报出去之前和留档一样打码
+            let redaction = crate::bodies::Redaction {
+                rules: p.rules.redact.clone(),
+                ledger: p.ledger.clone(),
+            };
+            state.bus.emit(crate::server::flagged(
+                p.id,
+                &p.provider,
+                h,
+                blocked,
+                &redaction,
+            ));
+        }
+        if let Some(why) = refusal {
+            // **命中那一帧不发。**和 SSE 那条路同一条纪律：
+            // 先判断再转发，而不是发完再说。告诉客户端的就是结局里
+            // 那句带码的话，和内容过滤拒掉一帧时一样
+            let _ = c_tx
+                .send(Message::Text(format!("[ThinkWatch] {}", why.text).into()))
+                .await;
+            return Flow::End(End::Cut(why));
+        }
+        ending.count(msg.len());
+        // 发不给客户端，就是客户端已经走了
+        if c_tx.send(Message::Text(msg.into())).await.is_err() {
+            return Flow::End(End::Closed);
+        }
+    }
+    if let Some(e) = failed {
+        // 插件出错而策略是拒绝：切掉这一次回答，连接照常
+        return fail_response(p, c_tx, e.detail).await;
+    }
+    Flow::Sent
+}
+
+/// 切掉这一次回答：替它发 `response.failed`，它剩下的帧不再发
+async fn fail_response(p: &mut Pipes, c_tx: &mut ClientSink, why: Msg) -> Flow {
+    let failed = failed_frame(why, p.response.as_deref());
+    p.dropping = true;
+    p.reply = None;
+    if c_tx.send(Message::Text(failed.into())).await.is_err() {
+        return Flow::End(End::Closed);
+    }
+    Flow::Sent
+}
+
+/// 一次 `response.create` 过插件的请求钩子。`text` 是查过内容过滤的那一帧（删过的话是
+/// 删过的样子）。返回要发给上游的那一帧（插件改过的话是改过的），被拒了返回告诉客户端的
+/// 那句话。别的帧原样。
+///
+/// 这条路只有一跳：上游是这条连接连的那一家，发给它的模型名就是这一帧写的，运行记在
+/// 第 0 跳上。插件改过的那一版**再查一遍内容过滤**，只报插件加进来的（客户端的原话已经
+/// 在 [`screen_frame`] 查过了，见 [`screen_changed`]）。
+async fn plugin_request(state: &AppState, p: &mut Pipes, text: &str) -> Result<String, Msg> {
+    let Some(pc) = p.plugins.as_ref() else {
+        return Ok(text.to_string());
+    };
+    let Some(frame) = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"))
+    else {
+        return Ok(text.to_string());
+    };
+    let requested = frame
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let body = bytes::Bytes::copy_from_slice(text.as_bytes());
+    let mut hook = crate::plugin::request::Hook::new(
+        &pc.set,
+        p.rules.redact.clone(),
+        tw_dialect::ir::Dialect::Responses,
+        "/responses",
+        pc.client.as_deref(),
+        &body,
+    );
+    let to = crate::plugin::request::Target {
+        upstream: &p.provider,
+        model: &requested,
+        requested_model: &requested,
+        attempt: 0,
+    };
+    let plugged = match hook.attempt(&pc.pool, &to).await {
+        Ok(plugged) => plugged,
+        Err(refused) => {
+            crate::plugin::request::record(state, p.id, &refused.runs);
+            return Err(refused.why);
+        }
+    };
+    crate::plugin::request::record(state, p.id, &plugged.runs);
+    let sent = plugged
+        .changed
+        .as_ref()
+        .and_then(|c| c.renamed.as_ref())
+        .map_or_else(|| requested.clone(), |r| r.model.clone());
+    p.bridge = plugged.bridge;
+    let out = match plugged.changed {
+        None => text.to_string(),
+        Some(c) => screen_changed(
+            state,
+            p,
+            text,
+            String::from_utf8_lossy(&c.body).into_owned(),
+        )?,
+    };
+    p.requested_model = requested;
+    p.sent_model = sent;
+    Ok(out)
+}
+
+/// 插件改过的那一帧再查一遍内容过滤：**只报插件加进来的**（见 [`crate::guard::rescreen`]）。
+/// `before` 是插件拿到的那一帧，`after` 是插件改过的。两份都是 `response.create`，按
+/// Responses 的消息结构查，和 [`screen_frame`] 一样。
+///
+/// 返回要发出去的那一帧：处置档下插件加进来的字命中了删除规则的，是删过的样子。要拒绝时
+/// 是告诉客户端的那句话
+fn screen_changed(state: &AppState, p: &Pipes, before: &str, after: String) -> Result<String, Msg> {
+    let s = &p.rules.screen;
+    if !s.mode.detects() {
+        return Ok(after);
+    }
+    let sc = crate::guard::rescreen(
+        s,
+        tw_dialect::ir::Dialect::Responses,
+        before.as_bytes(),
+        after.as_bytes(),
+    );
+    if let Some(why) = crate::guard::report(&state.bus, p.id, &p.provider, &sc) {
+        return Err(why);
+    }
+    Ok(match sc.body {
+        Some(b) => String::from_utf8(b.to_vec()).unwrap_or(after),
+        None => after,
+    })
+}
+
+/// 这一次回答起回答钩子的实例。范围里没有就什么都不做；起不来而策略是拒绝时是那句话
+async fn start_reply(state: &AppState, p: &mut Pipes) -> Result<(), Msg> {
+    p.reply = None;
+    let Some(pc) = p.plugins.as_ref() else {
+        return Ok(());
+    };
+    let bridge = p
+        .bridge
+        .clone()
+        .unwrap_or_else(|| crate::plugin::bridge::Bridge::new(p.rules.redact.clone()));
+    let ctx = crate::plugin::reply::ReplyCtx {
+        dialect: tw_dialect::ir::Dialect::Responses,
+        client: pc.client.as_deref(),
+        model: &p.sent_model,
+        requested_model: &p.requested_model,
+        upstream: &p.provider,
+        request_id: p.id,
+        attempt: 0,
+    };
+    match crate::plugin::reply::Chain::start(state, &pc.set, bridge, &ctx).await {
+        Ok(Some(chain)) => {
+            p.reply = Some(crate::plugin::reply::Stream::new(
+                chain,
+                crate::plugin::reply::Framing::Sse,
+            ));
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e.detail),
+    }
+}
+
+/// 回答钩子交回来的 SSE 拆回一帧一帧的消息
+fn payloads(out: &[u8]) -> Vec<String> {
+    let mut d = tw_dialect::frame::Decoder::default();
+    let mut frames = d.feed(out);
+    frames.extend(d.flush());
+    frames.into_iter().map(|f| f.data).collect()
+}
+
+/// 一帧的 `type`：Responses 的事件都带着它（`response.created` …）。不是 JSON 的是 None
+fn frame_kind(frame: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    v.get("type")?.as_str().map(str::to_string)
+}
+
+/// `response.created` 里那次回答的 id
+fn response_id(frame: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    v.pointer("/response/id")?.as_str().map(str::to_string)
+}
+
+/// 替被切掉的那次回答发的 `response.failed`：和 SSE 那条路同一个形状
+/// （`tw_dialect` 的错误帧），id 换成这次回答的
+fn failed_frame(why: Msg, response: Option<&str>) -> String {
+    let sse = crate::error::GatewayError::denied(why)
+        .in_dialect(tw_dialect::ir::Dialect::Responses)
+        .sse_frame();
+    let Some(mut v) = tw_dialect::frame::parse(sse.as_bytes())
+        .and_then(|f| serde_json::from_str::<serde_json::Value>(&f.data).ok())
+    else {
+        return sse;
+    };
+    if let Some(id) = response {
+        v["response"]["id"] = serde_json::Value::String(id.to_string());
+    }
+    v.to_string()
 }
 
 /// 客户端发来的一帧过一遍内容过滤：处置档下该拒的话是告诉客户端的那句话，否则是要发

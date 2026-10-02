@@ -40,6 +40,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tw-yaml = { workspace = true }
+# 盯着插件目录：插件文件一动就重读（和配置文件同一份去抖）
+tw-watch = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }

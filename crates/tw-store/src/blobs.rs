@@ -278,6 +278,8 @@ fn dir_size(p: &Path) -> u64 {
 pub enum Which {
     Request,
     Response,
+    /// 插件改过之后的请求体，挨着 `{id}.req` 放（`{id}.after-plugins`）
+    AfterPlugins,
 }
 
 impl Which {
@@ -285,6 +287,7 @@ impl Which {
         match self {
             Which::Request => "req",
             Which::Response => "res",
+            Which::AfterPlugins => "after-plugins",
         }
     }
 }

@@ -64,6 +64,21 @@ pub fn replace(
     flow::replace(mode, rules, body, ledger)
 }
 
+/// `after` 里 `before` 没有的那些值：插件写进请求里的（见 [`crate::plugin::request`]）。
+///
+/// 按规则和打过码的样子比：同一个值在两份里打出来的码一样。客户端原话里就有的值，开头
+/// 那一遍已经报过了，插件改过的那一份里再出现不再报一次。
+pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
+    after
+        .into_iter()
+        .filter(|f| {
+            !before
+                .iter()
+                .any(|b| b.rule == f.rule && b.masked == f.masked)
+        })
+        .collect()
+}
+
 /// 找到的东西写成事件里的样子。
 pub fn items(found: &[Finding]) -> Vec<tw_api::SecretItem> {
     found
@@ -146,6 +161,91 @@ pub fn report(
         "the request matched content rules"
     );
     sc.refusal().map(|r| refusal(&r.hit))
+}
+
+/// 插件改过的请求再查一遍：**只报插件加进来的，也只按插件加进来的拒绝**。`before` 是插件
+/// 拿到的那一份，`after` 是插件改过的那一份，都是 `dialect` 格式的原文。
+///
+/// 插件拿到的那一份在开头已经查过、报过了（[`screen`]、[`report`]）；改过的那一份整个再报
+/// 一遍的话，同一条命中会在安全日志里出现两次。所以两份都查，原来就在的命中减掉（见
+/// [`added`]）。
+///
+/// 处置档下，插件拿到的那一份一般不会命中拒绝规则 —— 命中了的请求在开头就拒了，走不到
+/// 插件这一步。嵌入、旧版补全例外：开头不查，客户端的原话里可以有。**拒绝的只是原来就在
+/// 的，不因为插件改了别处就拒**：那几条拒绝规则这一遍不算，再查一遍，插件加进来的字照样
+/// 删、照样报、照样能拒。
+pub fn rescreen(
+    s: &Screen,
+    dialect: tw_dialect::ir::Dialect,
+    before: &[u8],
+    after: &[u8],
+) -> Screening {
+    use tw_guard::content::Outcome;
+    let mut s = s.clone();
+    loop {
+        let was = screen(&s, dialect, before);
+        let now = screen(&s, dialect, after);
+        // 拒绝时，拒绝规则的每一条命中都是「已拒绝」：有一条是插件加进来的就拒
+        let blocking: Vec<&tw_guard::content::Hit> = now
+            .hits
+            .iter()
+            .filter(|h| h.outcome == Outcome::Blocked)
+            .map(|h| &h.hit)
+            .collect();
+        if now.refused.is_none() || blocking.iter().any(|h| !known(&was, h)) {
+            return added(&was, now);
+        }
+        // 拒绝它的全是原来就在的：这几条不算，再查一遍。每一轮至少少一条规则
+        let quiet: Vec<(String, bool)> = blocking
+            .iter()
+            .map(|h| (h.rule.clone(), h.custom))
+            .collect();
+        let rules = s
+            .rules
+            .rules
+            .iter()
+            .filter(|r| {
+                !quiet
+                    .iter()
+                    .any(|(id, custom)| r.id == *id && r.custom == *custom)
+            })
+            .cloned()
+            .collect();
+        s.rules = std::sync::Arc::new(tw_guard::content::Rules { rules });
+    }
+}
+
+/// 插件改过的那一份查下来的结论里，**只留插件加进来的**：`before` 里就有的命中减掉 ——
+/// 同一条规则、处数没有变多的，算原来就在的。插件让一条规则多命中了几处，**整条再报**
+/// （处数是改过之后的）。拒绝时说了算的是头一条插件加进来的「已拒绝」；删过的请求体
+/// （[`Screening::body`]）照 `after`，这一跳发出去的就是它。
+///
+/// 拒绝它的全是原来就在的那种情况由 [`rescreen`] 先排除掉。
+pub fn added(before: &Screening, after: Screening) -> Screening {
+    let mut hits = Vec::with_capacity(after.hits.len());
+    let mut refused = None;
+    for h in after.hits {
+        if known(before, &h.hit) {
+            continue;
+        }
+        if refused.is_none() && h.outcome == tw_guard::content::Outcome::Blocked {
+            refused = Some(hits.len());
+        }
+        hits.push(h);
+    }
+    Screening {
+        hits,
+        refused,
+        body: after.body,
+    }
+}
+
+/// 这一条命中在 `before` 里就有：同一条规则，处数没有变多
+fn known(before: &Screening, h: &tw_guard::content::Hit) -> bool {
+    before
+        .hits
+        .iter()
+        .any(|b| b.hit.rule == h.rule && b.hit.custom == h.custom && h.count <= b.hit.count)
 }
 
 /// 拒绝时告诉客户端的那句话。码位规则命中的是看不见的字符，引一段片段没有用，说几个；
@@ -364,5 +464,94 @@ mod tests {
             &ledger_for(stored.as_bytes()),
         );
         assert_eq!(&out[..], b"<<TW_SECRET_1>> <<TW_SECRET_2>>");
+    }
+
+    /// 内容过滤的几条规则：拒绝一个词、只记录一个词、删掉零宽字符
+    fn filter(mode: Mode) -> Screen {
+        use tw_guard::content::{Action, Match, RuleInput, Rules};
+        let rule = |id, pattern, matching, action| RuleInput {
+            id,
+            name: id,
+            custom: true,
+            pattern,
+            matching,
+            action,
+        };
+        Screen {
+            mode,
+            rules: std::sync::Arc::new(
+                Rules::build([
+                    rule("no plan", "forbidden-plan", Match::Contains, Action::Block),
+                    rule("falcon", "falcon", Match::Contains, Action::Record),
+                    rule("zero width", "U+200B", Match::Codepoints, Action::Strip),
+                ])
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn chat(text: &str) -> Vec<u8> {
+        serde_json::json!({ "messages": [{ "role": "user", "content": text }] })
+            .to_string()
+            .into_bytes()
+    }
+
+    fn rules_hit(sc: &Screening) -> Vec<(&str, tw_guard::content::Outcome)> {
+        sc.hits
+            .iter()
+            .map(|h| (h.hit.rule.as_str(), h.outcome))
+            .collect()
+    }
+
+    /// 插件拿到的那一份里本来就有的命中（嵌入、补全开头不查，原话里可以有拒绝规则的词）
+    /// 不再报、不拒；插件加进来的零宽字符照样删、照样报
+    #[test]
+    fn a_rewritten_request_is_judged_on_what_the_plugin_added() {
+        use tw_guard::content::Outcome;
+        let s = filter(Mode::Enforce);
+        let before = chat("the forbidden-plan, and falcon");
+        let after = chat("the forbidden-plan, and falcon, plus zero\u{200B}width");
+        let sc = rescreen(&s, tw_dialect::ir::Dialect::Chat, &before, &after);
+        assert_eq!(sc.refused, None);
+        assert_eq!(rules_hit(&sc), [("zero width", Outcome::Stripped)]);
+        let sent: serde_json::Value = serde_json::from_slice(sc.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sent["messages"][0]["content"],
+            "the forbidden-plan, and falcon, plus zerowidth"
+        );
+
+        // 插件又写了一处拒绝规则的词：拒，说了算的是那一条
+        let after = chat("the forbidden-plan, and falcon; also forbidden-plan");
+        let sc = rescreen(&s, tw_dialect::ir::Dialect::Chat, &before, &after);
+        assert_eq!(rules_hit(&sc), [("no plan", Outcome::Blocked)]);
+        assert_eq!(sc.refusal().map(|h| h.hit.count), Some(2));
+        assert!(sc.body.is_none());
+
+        // 什么都没加：什么都不报
+        let sc = rescreen(&s, tw_dialect::ir::Dialect::Chat, &before, &before);
+        assert!(sc.hits.is_empty() && sc.refused.is_none() && sc.body.is_none());
+    }
+
+    /// 观察档：插件让一条规则多命中了几处，整条再报（处数是改过之后的），请求原样
+    #[test]
+    fn under_observe_only_more_of_a_rule_is_reported_again() {
+        use tw_guard::content::Outcome;
+        let s = filter(Mode::Observe);
+        let before = chat("falcon");
+        let sc = rescreen(
+            &s,
+            tw_dialect::ir::Dialect::Chat,
+            &before,
+            &chat("falcon falcon forbidden-plan"),
+        );
+        assert_eq!(
+            rules_hit(&sc),
+            [
+                ("no plan", Outcome::Recorded),
+                ("falcon", Outcome::Recorded)
+            ]
+        );
+        assert_eq!(sc.hits[1].hit.count, 2);
+        assert!(sc.refused.is_none() && sc.body.is_none());
     }
 }

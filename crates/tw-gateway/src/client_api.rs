@@ -118,6 +118,41 @@ impl ClientApi {
             || (p.contains("/models/") && p.ends_with(":countTokens"))
     }
 
+    /// 请求体和生成回答**同一种形状**、回来的却不是一次回答的接口：数 token（见
+    /// [`ClientApi::counts_tokens`]），Responses 的压缩和数 token（`/responses/compact`、
+    /// `/responses/input_tokens`，Codex 后端的 `/backend-api/codex/responses/compact`）。
+    ///
+    /// 插件的请求钩子照样看得懂它们（见 [`crate::plugin::request::Shape`]）
+    pub fn like_generation(path: &str) -> bool {
+        if Self::counts_tokens(path) {
+            return true;
+        }
+        let p = path.trim_end_matches('/');
+        let tail = p.strip_prefix("/v1").unwrap_or(p);
+        matches!(tail, "/responses/compact" | "/responses/input_tokens")
+            || p == "/backend-api/codex/responses/compact"
+    }
+
+    /// 这个路径是不是嵌入：OpenAI 的 `/v1/embeddings`，Gemini 的 `:embedContent`、
+    /// `:batchEmbedContents`。
+    ///
+    /// 插件声明了 `embeddings` 才处理它们（见 [`crate::plugin::request::Shape`]）
+    pub fn embeds(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        p.strip_prefix("/v1").unwrap_or(p) == "/embeddings"
+            || (p.contains("/models/")
+                && (p.ends_with(":embedContent") || p.ends_with(":batchEmbedContents")))
+    }
+
+    /// 这个路径是不是 OpenAI 的旧版补全（`/v1/completions`）。Anthropic 的旧版补全
+    /// （`/v1/complete`）不算：插件不管它。
+    ///
+    /// 插件声明了 `completions` 才处理它（见 [`crate::plugin::request::Shape`]）
+    pub fn completes(path: &str) -> bool {
+        let p = path.trim_end_matches('/');
+        p.strip_prefix("/v1").unwrap_or(p) == "/completions"
+    }
+
     /// 转换库里对应的格式
     pub fn dialect(&self) -> Dialect {
         match self {
@@ -297,6 +332,56 @@ mod tests {
             ("/v1/files", false),
         ] {
             assert_eq!(ClientApi::screened(path), screened, "{path}");
+        }
+    }
+
+    #[test]
+    fn counting_and_compacting_take_a_generation_shaped_body() {
+        for (path, like) in [
+            ("/v1/messages/count_tokens", true),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", true),
+            ("/v1/responses/compact", true),
+            ("/responses/compact/", true),
+            ("/v1/responses/input_tokens", true),
+            ("/backend-api/codex/responses/compact", true),
+            // 生成回答本身不算：它是「生成」那一类
+            ("/v1/messages", false),
+            ("/v1/responses", false),
+            ("/v1/embeddings", false),
+            ("/v1/completions", false),
+            ("/v1/responses/resp_1/cancel", false),
+            ("/v1beta/models/gemini-embedding-001:embedContent", false),
+        ] {
+            assert_eq!(ClientApi::like_generation(path), like, "{path}");
+        }
+    }
+
+    /// 嵌入、旧版补全各是哪几个路径：生成回答、数 token、别家的旧版补全都不算
+    #[test]
+    fn embeddings_and_legacy_completions_are_told_apart_by_path() {
+        for (path, embeds, completes) in [
+            ("/v1/embeddings", true, false),
+            ("/embeddings/", true, false),
+            (
+                "/v1beta/models/gemini-embedding-001:embedContent",
+                true,
+                false,
+            ),
+            (
+                "/v1beta/models/text-embedding-004:batchEmbedContents",
+                true,
+                false,
+            ),
+            ("/v1/completions", false, true),
+            ("/completions", false, true),
+            ("/v1/chat/completions", false, false),
+            ("/v1/complete", false, false),
+            ("/v1/messages", false, false),
+            ("/v1beta/models/gemini-2.5-pro:countTokens", false, false),
+            ("/v1/images/generations", false, false),
+        ] {
+            assert_eq!(ClientApi::embeds(path), embeds, "{path}");
+            assert_eq!(ClientApi::completes(path), completes, "{path}");
         }
     }
 

@@ -1,0 +1,40 @@
+# 依赖有没有安全公告（RustSec）。配置在仓库根目录的 deny.toml。
+#
+# 插件跑在 Wasmtime 的沙箱里，沙箱的安全就是 Wasmtime 的安全，而它几乎每个
+# 大版本都有公告。别的依赖（rustls、hyper……）同理。
+#
+# **两条触发，各管一件事。**
+# - 改了依赖的 PR、推到 main：这次引入或升级的 crate 有没有公告。只在依赖
+#   文件变了的时候跑 —— 否则一条新公告发布出来，所有不相干的 PR 一起红，
+#   而和自己的改动无关的红，看几次就没人看了。
+# - 每天定时：依赖没动，公告库却在长。新公告落在已有的依赖上，在这里红，
+#   失败的通知照常发。
+name: Audit
+
+on:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 只查公告。许可证、重复版本这几项是另一回事，不在这里
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

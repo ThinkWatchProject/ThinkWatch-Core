@@ -1,2 +1,6 @@
 # 桌面端按行读消息码清单，换行不能随平台变
 crates/tw-api/msg-codes.txt text eol=lf
+# 默认插件随 core 一起发：源码按字节算哈希（装上、换新版都拿它比），预先算好的
+# manifest 也记着这份哈希。各平台检出、编进二进制的字节必须一样
+crates/tw-gateway/src/plugin/defaults/*.js text eol=lf
+crates/tw-gateway/src/plugin/defaults/manifests.json text eol=lf

@@ -23,18 +23,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # 插件沙箱里的 QuickJS 编成这个目标（crates/tw-plugin/build.rs）
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
+      # 编插件沙箱要一个能出 wasm 的 clang：这里是 Homebrew 的 llvm，由 build.rs
+      # 自己找到（顺便测了「装了 brew 的 llvm 就能编」这条路）
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
+
       - name: Format
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          # 沙箱里的那个小工程不在工作区里，上面一行管不到它
+          cargo fmt --manifest-path crates/tw-plugin/guest/Cargo.toml -- --check
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 沙箱里的胶水（编成 wasm32 的 no_std 小工程）。build.rs 编它时不带 -D warnings
+      # —— 那是给外层工作区的 —— 所以它的告警只在这一步当错误
+      - name: clippy (plugin sandbox guest)
+        run: |
+          LLVM="$(brew --prefix llvm)/bin"
+          CC_wasm32_unknown_unknown="$LLVM/clang" AR_wasm32_unknown_unknown="$LLVM/llvm-ar" \
+            cargo clippy --manifest-path crates/tw-plugin/guest/Cargo.toml --target wasm32-unknown-unknown --target-dir target/tw-plugin-guest -- -D warnings
 
       # 默认不跑打真实网络的那些（它们标了 #[ignore]）—— CI 上的网络
       # 抖动会变成一条和代码无关的红，而那种红看几次就没人看了。
       - name: Test
         run: cargo test --workspace
+
+      # 编进这一版的沙箱是哪个 clang 编的、wasm 的哈希
+      - name: Which compiler built the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh record target
 
       # 桌面端从 tw-api 导出前端类型（`ts` feature）。**默认关**，上面几步一行都
       # 不编它 —— 而它坏掉的表现是桌面端接下一个 tag 时才发现导不出来。导出来
@@ -158,16 +180,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           # 理由见下面 windows 那一段
           cache-on-failure: true
+
+      # 镜像预装的 clang-15，显式指定（见脚本）
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Which compiler built the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh record target
 
       # 真二进制、真 socket、真数据面，和 macOS 那一步是同一个脚本
       - name: Smoke (real binary, real socket, real data plane)
@@ -185,6 +215,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           # **失败也存。**这个 action 默认只在任务成功时保存缓存，而一个
@@ -196,11 +227,20 @@ jobs:
           # target 目录是安全的，它只是省掉那些与失败无关的部分。
           cache-on-failure: true
 
+      # 镜像预装的 LLVM（C:\Program Files\LLVM），由 build.rs 自己找到
+      - name: Toolchain for the plugin sandbox
+        shell: bash
+        run: bash scripts/wasm-toolchain.sh
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Which compiler built the plugin sandbox
+        shell: bash
+        run: bash scripts/wasm-toolchain.sh record target
 
       - name: Build
         run: cargo build --release -p twcore

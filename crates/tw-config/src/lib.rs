@@ -15,6 +15,7 @@ mod failover;
 pub mod history;
 mod init;
 pub mod nics;
+pub mod plugins;
 pub mod private_dir;
 mod probes;
 pub mod proxy;
@@ -30,6 +31,7 @@ mod wire;
 
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
+pub use plugins::{Plugin, PluginOnError, PluginScope};
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
 
@@ -113,6 +115,9 @@ pub struct Config {
     /// 说不清的时刻断掉。不写就是名字叫 `default` 的那把。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_key: Option<String>,
+    /// 脚本插件，**从上到下就是运行的顺序**。不写就没有
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<plugins::Plugin>,
 }
 
 /// 便于构造，**不代表一份可用的配置** —— `providers` 和 `clients` 都是
@@ -135,6 +140,7 @@ impl Default for Config {
             routes: Vec::new(),
             default_route: None,
             default_key: None,
+            plugins: Vec::new(),
         }
     }
 }

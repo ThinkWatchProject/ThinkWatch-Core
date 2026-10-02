@@ -19,7 +19,7 @@ use tw_types::{Msg, msg};
 
 mod edit;
 mod render;
-pub use edit::{Put, is_flow_at, put, remove_key, replace_item};
+pub use edit::{Put, is_flow_at, put, remove_key, reorder, replace_item};
 pub use render::{Scalar, render_scalar};
 
 /// 到某个节点的路径。`providers[1].base_url` 写成

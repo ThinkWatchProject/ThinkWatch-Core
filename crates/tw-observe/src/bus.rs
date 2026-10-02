@@ -76,6 +76,8 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::CredentialRotated { .. }
         | E::CredentialExpired { .. }
         | E::LoginFinished { .. }
+        // 插件出错是一条通知：它的号是新取的，出错的请求在 `request_id` 里
+        | E::PluginFailed { .. }
         | E::HealthChanged { .. }
         | E::ModelsChanged { .. }
         | E::ProxyChanged { .. }

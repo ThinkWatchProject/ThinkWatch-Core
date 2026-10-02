@@ -1,0 +1,18 @@
+# 依赖的安全公告（RustSec）。只用 cargo-deny 的 advisories 一项：
+# `.github/workflows/audit.yml` 跑 `cargo deny check advisories`。
+#
+# 插件沙箱（Wasmtime）是这棵依赖树里最要紧的一环：沙箱的安全就是它的
+# 安全，而它几乎每个大版本都有安全公告。
+
+[graph]
+# 带上所有 feature：tw-api 的 `ts` 之类默认不开的依赖也要查到
+all-features = true
+
+[advisories]
+version = 2
+# 漏洞类公告一律报错，不能整类关掉。确认不受影响的单条才写进这里，
+# 写明理由和复查的时间
+ignore = []
+# 「无人维护」只看我们直接依赖的 crate。传递依赖里的那些我们换不掉，
+# 每出一条就红一次只会让人学会忽略这一项
+unmaintained = "workspace"
