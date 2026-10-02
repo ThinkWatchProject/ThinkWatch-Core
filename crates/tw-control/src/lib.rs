@@ -390,7 +390,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
             body_days: cfg.retention.body_days,
             row_days: cfg.retention.row_days,
             body_max_bytes: cfg.retention.body_max_bytes,
-            // **现状和配置一起给。**「上限 2 GB」这个数字，用户没法
+            // **现状和配置一起给。**「上限 5 GB」这个数字，用户没法
             // 判断松还是紧，除非同时看得见现在占了多少
             body_bytes_now,
         },

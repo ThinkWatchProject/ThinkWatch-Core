@@ -22,7 +22,7 @@
 
 use std::time::Instant;
 
-use crate::bodies::{BodyKind, BodyRecord, BodySender, ResponseTap};
+use crate::bodies::{BodyKind, BodyRecord, BodySink, Redaction, ResponseTap};
 use tw_dialect::convert::Reader;
 use tw_dialect::ir;
 use tw_dialect::usage::{Sniffer, Usage};
@@ -47,7 +47,9 @@ pub struct Ending {
     started: Instant,
     /// 请求开始的时刻。响应体按它归档，和请求体那一份对得上
     at_ms: i64,
-    sink: Option<BodySender>,
+    sink: Option<BodySink>,
+    /// 响应体落盘之前怎么换、怎么打码：和请求体那一份是同一套（见 [`Ending::redact_with`]）
+    redaction: Option<Redaction>,
     /// 上游的响应头。**没到的时候客户端就走了的，没有状态码可报** —— 那时
     /// 报一个 0 或者 499，都是在编
     status: Option<u16>,
@@ -117,7 +119,7 @@ impl Ending {
         model: String,
         started: Instant,
         at_ms: i64,
-        sink: Option<BodySender>,
+        sink: Option<BodySink>,
     ) -> Self {
         Self {
             bus,
@@ -126,6 +128,7 @@ impl Ending {
             started,
             at_ms,
             sink,
+            redaction: None,
             status: None,
             bytes: 0,
             sniffer: Sniffer::new(),
@@ -160,6 +163,13 @@ impl Ending {
         });
     }
 
+    /// 响应体落盘之前按什么换、打码。**和请求体用同一套**：开始时生效的规则，拦截档下
+    /// 这个请求的账本 —— 上游回答里的占位符和存下来的请求对得上号。没交代的按出厂规则
+    /// 打码（见 [`Redaction::default`]）
+    pub fn redact_with(&mut self, r: Redaction) {
+        self.redaction = Some(r);
+    }
+
     /// 这一次由谁回答：成功走完时记下它和它读写了多少缓存。
     pub fn answered_by(&mut self, ticket: crate::affinity::Ticket) {
         self.answer = Some(ticket);
@@ -171,7 +181,8 @@ impl Ending {
     }
 
     /// 上游来了一块。**这里看的是上游原话**（带占位符的那一版）：usage
-    /// 数字不受影响，而请求详情里存的正是「发出去的和收回来的」。
+    /// 数字不受影响，而请求详情里存的正是「发出去的和收回来的」。原话里要是带着
+    /// 认得出的值（观察档下模型回显的密钥），落盘之前打码（见 [`crate::bodies`]）。
     pub fn feed(&mut self, chunk: &[u8]) {
         self.bytes += chunk.len() as u64;
         self.sniffer.feed(chunk);
@@ -299,13 +310,14 @@ impl Ending {
         if !recorded.is_empty() {
             crate::bodies::offer(
                 &self.sink,
-                BodyRecord {
-                    id: self.id,
-                    at_ms: self.at_ms,
-                    kind: BodyKind::Response,
-                    body: recorded,
+                BodyRecord::new(
+                    self.id,
+                    self.at_ms,
+                    BodyKind::Response,
+                    recorded,
                     original_len,
-                },
+                    self.redaction.take().unwrap_or_default(),
+                ),
             );
         }
         let sniffer = std::mem::take(&mut self.sniffer);
@@ -673,7 +685,7 @@ mod tests {
     fn dropped_mid_stream_it_reports_a_cancellation_with_what_it_saw() {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
-        let (tx, mut bodies) = tokio::sync::mpsc::channel(4);
+        let (tx, mut bodies) = crate::bodies::channel();
         let mut e = Ending::new(
             bus.clone(),
             7,

@@ -1706,7 +1706,7 @@ pub struct RetentionView {
     /// 正文总共最多占多少字节
     pub body_max_bytes: u64,
     /// 正文现在实际占了多少。**不是配置，是现状** —— 没有它，
-    /// 「2 GB 上限」是个用户无从判断松紧的数字
+    /// 「5 GB 上限」是个用户无从判断松紧的数字
     pub body_bytes_now: u64,
 }
 
@@ -3676,14 +3676,23 @@ pub struct RequestDetail {
     pub in_flight: bool,
 }
 
+/// 一份正文最多存多少字节：请求和回答一样，4 MiB。更长的只存开头，[`BodyView::truncated`]
+/// 说出来。
+///
+/// **存储层按它截，网关攒回答也按它攒**（`tw_store::blobs::MAX_ONE`、
+/// `tw_gateway::bodies::RESPONSE_TAP_MAX`）。两个数放在一处：各写各的话，改了一个，
+/// 另一个还停在原地 —— 以前回答只攒 256 KB，比存储层肯收的少十几倍。
+pub const BODY_MAX: usize = 4 * 1024 * 1024;
+
 /// 一份存下来的 body。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BodyView {
-    /// **已脱敏**。这段文字会被复制到 issue 里
+    /// **已脱敏**。这段文字会被复制到 issue 里。落盘的那一份就是换过、打过码的（脱敏规则
+    /// 认得出的值不会原样写进磁盘），读出来再打一遍
     pub text: String,
     /// 原本多长。**截断了要能说出来** —— 不说的话用户会以为请求本身
-    /// 就长这样
+    /// 就长这样。没截断的就是存下来的这一份的长度：换掉、打码的那几处和原文差几个字节
     pub original_len: usize,
     pub truncated: bool,
 }

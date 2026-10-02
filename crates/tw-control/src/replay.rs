@@ -20,6 +20,17 @@
 //! **三、脱敏照做。**重放走的是控制面，不经过数据面的管线，所以
 //! 脱敏那一层要在这里显式调一次。少了它，一条本来会被脱敏的请求，
 //! 会因为「重放」这个动作把密钥原样发给中转站。
+//!
+//! # 重放的是存下来的那一份
+//!
+//! 存下来的请求不是原文：脱敏规则认得出的值落盘之前就换掉了（见
+//! `tw_gateway::bodies`）—— 拦截档下是发给上游的占位符（`<<TW_SECRET_1>>`），别的档位
+//! 打了码（`sk-an…7f9c`）。所以重放发出去的就是这样一份：拦截档下它带着的正是原来那一次
+//! 发给上游的占位符，别的档位少了原值。**换不回来，也不该换回来**：真值从没进过磁盘。
+//!
+//! 那些占位符这一次没有对应的原值，回答里提到它们也原样留着。这一次重新找到的值从
+//! 存下来的那些号后面接着编（[`tw_gateway::guard::ledger_for`]），不会和它们撞号 ——
+//! 撞了的话，回答里的 1 号会被还原成这一次新找到的那个值，而它原本指的是另一样。
 
 use std::time::Instant;
 
@@ -34,10 +45,11 @@ fn fail(code: StatusCode, detail: tw_types::Msg) -> Fail {
     (code, axum::Json(detail))
 }
 
-/// 找到那条请求，把**原样的**请求体取出来。
+/// 找到那条请求，把存下来的请求体取出来。
 ///
-/// 注意不是 `request_detail` 里那份 —— 那一份是脱敏之后给人看的
-/// （它会被复制进 issue）。重放要的是原样。
+/// 注意不是 `request_detail` 里那份 —— 那一份读出来又打了一遍码，是给人看的
+/// （它会被复制进 issue）。重放要的是存下来的那一份：它落盘之前已经换过、打过码，
+/// 结构和原来的一样。
 fn stored_body(
     g: &tw_store::Recorder,
     id: i64,
@@ -206,12 +218,15 @@ pub async fn run(
     })?;
 
     // **脱敏照做。**重放不经过数据面的管线，少了这一行，一条本来会被
-    // 脱敏的请求会因为「重放」这个动作把密钥原样发出去
+    // 脱敏的请求会因为「重放」这个动作把密钥原样发出去。新找到的值让开存下来的那份
+    // 里已经写着的占位符（见模块说明）
     let rt = s.gateway.runtime();
+    let ledger = tw_gateway::guard::ledger_for(&raw);
     let (body, ledger) = tw_gateway::guard::replace(
         rt.config.security.redact.mode,
         &rt.redact,
         bytes::Bytes::from(raw),
+        &ledger,
     );
 
     let url = tw_gateway::forward::upstream_url(&provider.base_url, &row.path, None);

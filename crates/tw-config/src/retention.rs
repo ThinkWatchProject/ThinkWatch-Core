@@ -21,7 +21,7 @@ pub struct Retention {
     /// 一行记录留几天。它撑着「上个月花了多少」那类问题
     #[serde(default = "d_row_days")]
     pub row_days: u64,
-    /// 正文总共最多占多少字节。超了从最旧的整天开始删
+    /// 正文总共最多占多少字节。超了从最旧的整天开始删。出厂 5 GiB
     #[serde(default = "d_body_max_bytes")]
     pub body_max_bytes: u64,
 }
@@ -33,7 +33,7 @@ fn d_row_days() -> u64 {
     90
 }
 fn d_body_max_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
+    5 * 1024 * 1024 * 1024
 }
 
 impl Default for Retention {
