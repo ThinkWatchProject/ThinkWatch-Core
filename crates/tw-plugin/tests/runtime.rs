@@ -610,12 +610,29 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
     // 被打断过的实例不再用
     assert_eq!(r.on_text("0").result, Err(RunError::CpuLimit));
 
-    // 每次 15 ms，没超单次的预算，但加起来超过一个回答的总预算
+    // 每次都没超单次的预算，但加起来超过一个回答的总预算。单次预算放宽到
+    // 远大于每次的用量：Windows 上量的是墙上时间，被抢占一下就可能先撞单次上限
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    let rt = RT.get_or_init(|| {
+        Runtime::new(Limits {
+            reply_call_cpu: Duration::from_millis(500),
+            reply_total_cpu: Duration::from_secs(1),
+            ..Limits::default()
+        })
+        .expect("runtime")
+    });
+    let total = rt.limits().reply_total_cpu;
+    let p = rt
+        .load(
+            br#"export const manifest = { name: "busy", api: 1, permissions: ["reply.text"] };
+                export function onReplyText(t) { const end = Date.now() + Number(t); while (Date.now() < end) {} }"#,
+        )
+        .unwrap();
     let mut r = p.reply(ctx()).unwrap();
     let mut used = Duration::ZERO;
     let mut stopped = false;
-    for _ in 0..400 {
-        let inv = r.on_text("15");
+    for _ in 0..1000 {
+        let inv = r.on_text("10");
         used += inv.cpu;
         if inv.result == Err(RunError::CpuLimit) {
             stopped = true;
@@ -624,11 +641,8 @@ fn reply_calls_have_their_own_and_a_total_cpu_budget() {
         assert_eq!(inv.result, Ok(None));
     }
     assert!(stopped, "never stopped after {used:?}");
-    assert!(
-        used >= limits.reply_total_cpu - Duration::from_millis(20),
-        "{used:?}"
-    );
-    assert!(used < limits.reply_total_cpu + slack(), "{used:?}");
+    assert!(used >= total - Duration::from_millis(5), "{used:?}");
+    assert!(used < total + slack(), "{used:?}");
 }
 
 #[test]
