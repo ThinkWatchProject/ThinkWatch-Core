@@ -10,6 +10,9 @@
 //! **加一个就在 [`ALL`] 里加一行。id 一经发出就不再改**：用户删掉的默认插件按 id 记着，
 //! 改了 id 等于又塞给他一个删过的插件。
 //!
+//! **manifest 里给人看的字（名字、说明、设置项的标签）一律写英文**：桌面端按插件 id 和
+//! 设置项的键换成界面的语言，表里没有的照这里的英文显示。
+//!
 //! **装上它们不起运行时**：它们装上时都停用着，而沙箱一起来就是几 MB 常驻内存。装上要的
 //! 范围、设置的默认值，显示要的名字和权限，都从 `manifests.json` 里读 —— 那是测试照真的
 //! 沙箱把每一个编一遍生成的（[`manifest`]）。**改了哪个 `.js` 就重新生成一次**：
@@ -107,6 +110,29 @@ mod tests {
             assert_eq!(manifest(id), Some(m), "{id}");
         }
         assert_eq!(manifest("not-a-default"), None);
+    }
+
+    /// 给人看的那几样是英文（见模块说明）：名字、说明、每个设置项的标签都写了，一个汉字
+    /// 都没有。查的是装上和显示时用的那一份（预先算好的 manifest）
+    #[test]
+    fn what_a_default_shows_is_written_in_english() {
+        let cjk = |s: &str| {
+            s.chars().any(|c| {
+                matches!(c as u32,
+                    0x3000..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
+                        | 0xff00..=0xffef)
+            })
+        };
+        for (id, _) in ALL {
+            let m = manifest(id).unwrap_or_else(|| panic!("{id} has no precomputed manifest"));
+            let mut shown = vec![("name", m.name.clone())];
+            shown.extend(m.description.clone().map(|d| ("description", d)));
+            shown.extend(m.settings.iter().map(|s| ("label", s.label.clone())));
+            for (what, text) in shown {
+                assert!(!text.trim().is_empty(), "{id}: the {what} is empty");
+                assert!(!cjk(&text), "{id}: the {what} is not in English: {text:?}");
+            }
+        }
     }
 
     /// 每一个都在真的沙箱里编得成：装不上的默认插件只会在日志里留一行

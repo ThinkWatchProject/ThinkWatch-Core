@@ -8,6 +8,10 @@
 //
 // 权限：system，只读写系统提示词。
 // 设置：回答语言，默认简体中文。
+//
+// 给人看的文字（名字、说明、设置项的标签、抛出的错误）一律英文：界面按插件 id 和设置项
+// 的键换成用户的语言，换不了的（抛出的错误）英文也看得懂。默认值是语言自己的写法，
+// 那是值，不是界面上的字。
 
 export const manifest = {
   name: "Answer in a chosen language",
@@ -16,7 +20,7 @@ export const manifest = {
     "Adds a fixed line to the end of the system prompt that asks the model to answer in the language set here.",
   permissions: ["system"],
   settings: {
-    language: { type: "string", label: "回答语言", default: "简体中文" },
+    language: { type: "string", label: "Answer language", default: "简体中文" },
   },
 };
 
@@ -25,7 +29,9 @@ const NAME = /^[\p{L}\p{M}][\p{L}\p{M} ()\-]{0,39}$/u;
 export function onRequest(req, ctx) {
   const language = String(ctx.settings.language ?? "").trim();
   if (!NAME.test(language)) {
-    throw new Error("设置「回答语言」只能是语言的名称，例如 简体中文、English");
+    throw new Error(
+      "The answer language setting accepts only the name of a language, such as English or Deutsch.",
+    );
   }
   const line = `Always respond in ${language}, unless the user explicitly asks for another language.`;
   if (req.system.includes(line)) return undefined;
