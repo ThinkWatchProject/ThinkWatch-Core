@@ -274,8 +274,9 @@ gw.route.protocol_mismatch
 gw.route.rule_failed
 gw.route.selected_upstream_missing
 gw.route.upstream_missing
-gw.toolcall.blocked
-gw.toolcall.cut
+gw.toolcall.connection_cut
+gw.toolcall.response_cut
+gw.toolcall.response_withheld
 gw.upstream.aws_profile_expired
 gw.upstream.aws_token_expired
 gw.upstream.bedrock_refused
@@ -296,7 +297,6 @@ gw.ws.bad_url
 gw.ws.connect_failed
 gw.ws.proxy_unsupported
 gw.ws.send_failed
-gw.ws.toolcall_cut
 gw.ws.upstream_broke
 l1.config.bad_url
 l1.config.no_host

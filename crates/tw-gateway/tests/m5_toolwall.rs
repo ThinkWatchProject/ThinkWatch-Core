@@ -302,9 +302,13 @@ async fn a_custom_rule_that_says_cut_cuts() {
         !body.contains("namespace prod"),
         "自定义的切断规则没切：{body}"
     );
-    // 告诉客户端的那句话按规则名说；自定义规则没有「为什么」，不留一对空括号
+    // 告诉客户端的那句话按规则名说；自定义规则没有「为什么」，不留一对空括号。
+    // **不说这个调用出自谁**：审查看的是最后那一份回答，插件也能造工具调用
     assert!(
-        body.contains("matched rule “删除集群资源”, so the response was cut off"),
+        body.contains(
+            "[ThinkWatch] The answer contained a Bash call that matched rule “删除集群资源”, \
+             so the response was cut off."
+        ),
         "{body}"
     );
     let (cut, blocked, tool, rule) = flagged(&mut rx).await.expect("没发告警事件");
@@ -447,6 +451,26 @@ async fn enforce_withholds_the_whole_non_streaming_response() {
     let (cut, blocked, tool, _) = flagged(&mut rx).await.expect("没发告警事件");
     assert!(cut && blocked);
     assert_eq!(tool, "Bash");
+
+    // 结局里那句话：**不说这个调用出自谁**，上游另作一个参数留着
+    let message = loop {
+        match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Ok(tw_api::Event::RequestFailed { message, .. })) => break message,
+            Ok(Ok(_)) => continue,
+            other => panic!("没等到失败的结局：{other:?}"),
+        }
+    };
+    assert_eq!(message.code, "gw.toolcall.response_withheld", "{message}");
+    assert_eq!(message.arg("upstream"), "relay", "{message}");
+    let said = format!(
+        "The answer contained a Bash call that matched rule “{}” ({}), \
+         so the response was withheld.",
+        message.arg("name"),
+        message.arg("why")
+    );
+    assert!(message.text.ends_with(&said), "{message}");
+    // 换上去的错误体说的是同一句
+    assert!(body.contains(&format!("[ThinkWatch] {said}")), "{body}");
 }
 
 #[tokio::test]
