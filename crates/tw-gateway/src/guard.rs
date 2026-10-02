@@ -1,7 +1,7 @@
 //! 数据面守卫：出站脱敏、请求防护（藏匿字符、内容过滤）和输出长度的接线。
 //!
-//! 规则本身住在 [`tw_guard::redact`] 里，这个文件只回答一个问题：**一个请求体该
-//! 怎么处理。**
+//! 出站脱敏怎么找、怎么编号、每一跳怎么换在 [`tw_guard::redact::flow`]（两个网关共用）。
+//! 这里的几个函数是它们在桌面网关里的入口，档位用配置里的写法。
 //!
 //! # 全局的，对所有上游一视同仁
 //!
@@ -18,109 +18,48 @@
 //!
 //! # 一个值一个占位符，整个请求里都一样
 //!
-//! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换。
-//! 以前每一跳各起一本账，按那一跳发出去的那份的先后编号：转换过格式、字段换了顺序的
-//! 那一跳，同一把密钥可能是 2 号，而上一跳、存下来的那份请求里它是 1 号 —— 请求详情里
-//! 存的请求和回答对不上号。
+//! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换
+//! （见 [`tw_guard::redact::flow`]）。
 
 use tw_config::SecurityMode as Mode;
-use tw_guard::redact::replace::{Ledger, Scheme};
+use tw_guard::redact::flow;
+use tw_guard::redact::replace::Ledger;
 use tw_guard::redact::rules::{Finding, Hit, RuleSet};
 
-/// 按规则找一遍，**不算我们自己的占位符**。
-///
-/// 连接串里写着 `postgres://app:<<TW_SECRET_2>>@db` 的那一段，在口令那条规则看来就是
-/// 一个口令 —— 可它是我们换上去的：存下来的请求拿去重放、用户把详情里看到的东西贴回
-/// 对话，都会带着它。当成凭据的话，它会被再换一次、在安全日志里报一次、落盘时被打成
-/// `<<TW_…_2>>`。压在一个占位符上的命中都不算。
+/// 按规则找一遍，**不算我们自己的占位符，也不进 base64 载荷**（见 [`flow::hits`]）。
 pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
-    let mut hits = tw_guard::redact::rules::scan(text, rules);
-    if hits.is_empty() || !text.contains(Scheme::SECRET.open) {
-        return hits;
-    }
-    let ours = Scheme::SECRET.find_in(text);
-    hits.retain(|h| {
-        !ours
-            .iter()
-            .any(|(at, _, _)| at.start < h.bytes.end && h.bytes.start < at.end)
-    });
-    hits
+    flow::hits(text, rules)
 }
 
-/// 找一遍。**观察档和拦截档都找**，关闭时不找。
-///
-/// **不是 UTF-8 就不看。**图片之类的二进制体里不会有粘贴进来的 key。
+/// 找一遍。**观察档和拦截档都找**，关闭时不找（见 [`flow::find`]）。
 pub fn find(mode: Mode, rules: &RuleSet, body: &[u8]) -> Vec<Finding> {
-    if !mode.detects() || rules.is_empty() {
-        return Vec::new();
-    }
-    let Ok(text) = std::str::from_utf8(body) else {
-        return Vec::new();
-    };
-    tw_guard::redact::rules::findings(text, &hits(text, rules))
+    flow::find(mode.into(), rules, body)
 }
 
-/// 一本新账，让开 `body` 里已经写着的占位符（见 [`Ledger::avoiding`]）。
-///
-/// 存下来的请求（拦截档下存的是换过的那一份）拿去重放时，里面写着的 1 号不能再发给
-/// 新找到的值 —— 回显里的 1 号会被还原成那个新值。
+/// 一本新账，让开 `body` 里已经写着的占位符（见 [`flow::ledger_for`]）。
 pub fn ledger_for(body: &[u8]) -> Ledger {
-    let fresh = Ledger::new(Scheme::SECRET);
-    match std::str::from_utf8(body) {
-        Ok(text) => fresh.avoiding(text),
-        Err(_) => fresh,
-    }
+    flow::ledger_for(body)
 }
 
-/// 看一遍客户端发来的原文：报出去的记录（同 [`find`]），和这个请求的账本。
-///
-/// **拦截档下账本在这里就编好号**：原文里找到的每个值按出现的先后发号，让开原文里本来
-/// 就写着的占位符。之后每一跳都接着这本账换（[`replace`]），存下来的那份请求也照它换
-/// （[`crate::bodies::Redaction`]）。不在拦截档时账本是空的。
+/// 看一遍客户端发来的原文：报出去的记录，和这个请求的账本（见 [`flow::look`]）。存下来的
+/// 那份请求也照这本账换（[`crate::bodies::Redaction`]）。
 pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) {
-    let empty = || Ledger::new(Scheme::SECRET);
-    if !mode.detects() || rules.is_empty() {
-        return (Vec::new(), empty());
-    }
-    let Ok(text) = std::str::from_utf8(body) else {
-        return (Vec::new(), empty());
-    };
-    let hits = hits(text, rules);
-    let found = tw_guard::redact::rules::findings(text, &hits);
-    if !mode.acts() {
-        return (found, empty());
-    }
-    let seed = empty().avoiding(text);
-    let ledger = if hits.is_empty() {
-        seed
-    } else {
-        tw_guard::redact::replace::apply(text, &hits, seed).ledger
-    };
-    (found, ledger)
+    flow::look(mode.into(), rules, body)
 }
 
-/// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`look`]）。返回换过的体和
-/// 还原用的账本；**不在拦截档、或者没找到东西时与进来时逐字节相同**，账本就是交进来的那本。
+/// [`look`]，接着 `seed` 的账编号（见 [`flow::look_from`]）。
+pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
+    flow::look_from(mode.into(), rules, body, seed)
+}
+
+/// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`flow::replace`]）。
 pub fn replace(
     mode: Mode,
     rules: &RuleSet,
     body: bytes::Bytes,
     ledger: &Ledger,
 ) -> (bytes::Bytes, Ledger) {
-    if !mode.acts() || rules.is_empty() {
-        return (body, ledger.clone());
-    }
-    // 按字节乱切一个非 UTF-8 的体，得到的是一份坏掉的请求
-    let Ok(text) = std::str::from_utf8(&body) else {
-        return (body, ledger.clone());
-    };
-    let hits = hits(text, rules);
-    if hits.is_empty() {
-        // 没命中就原样返回，连一次拷贝都不做
-        return (body, ledger.clone());
-    }
-    let r = tw_guard::redact::replace::apply(text, &hits, ledger.clone());
-    (bytes::Bytes::from(r.text), r.ledger)
+    flow::replace(mode.into(), rules, body, ledger)
 }
 
 /// 找到的东西写成事件里的样子。
@@ -353,6 +292,7 @@ pub fn output_limited(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tw_guard::redact::replace::Scheme;
 
     const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
 

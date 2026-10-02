@@ -329,6 +329,8 @@ impl ContentMatch {
         match tw_guard::content::Match::from_slug(s)? {
             tw_guard::content::Match::Contains => Some(ContentMatch::Contains),
             tw_guard::content::Match::Regex => Some(ContentMatch::Regex),
+            // 码位匹配桌面版还没接上（见 [`interim`]）
+            tw_guard::content::Match::Codepoints => None,
         }
     }
     pub fn engine(self) -> tw_guard::content::Match {
@@ -393,9 +395,8 @@ impl ContentPolicy {
 
     /// 这一份配置下的规则：开着的内置规则按改过的处置走，再加上启用着的自定义规则。
     pub fn rules(&self) -> Result<tw_guard::content::Rules, tw_guard::content::BadRule> {
-        use tw_guard::content::{RuleInput, Rules, builtins};
-        let builtin = builtins()
-            .iter()
+        use tw_guard::content::{RuleInput, Rules};
+        let builtin = interim::content_builtins()
             .filter(|b| self.builtin_on(b))
             .map(|b| RuleInput {
                 action: self.builtin_action(b).engine(),
@@ -418,7 +419,7 @@ impl ContentPolicy {
 
     /// 只有一条内置规则，**不管它开没开**，处置按这份配置走。安全页上「试一条」用它
     pub fn one_builtin(&self, id: &str) -> Option<tw_guard::content::Rules> {
-        let b = tw_guard::content::builtin(id)?;
+        let b = interim::content_builtin(id)?;
         tw_guard::content::Rules::build([tw_guard::content::RuleInput {
             action: self.builtin_action(b).engine(),
             ..tw_guard::content::RuleInput::from(b)
@@ -508,7 +509,7 @@ impl Security {
         r.enable
             .iter()
             .chain(&r.disable)
-            .find(|id| tw_guard::redact::rules::builtin(id).is_none())
+            .find(|id| interim::redact_builtin(id).is_none())
             .map(|id| ("redact", id.as_str()))
             .or_else(|| {
                 t.enable
@@ -524,7 +525,7 @@ impl Security {
                     .iter()
                     .chain(&c.disable)
                     .chain(c.actions.keys())
-                    .find(|id| tw_guard::content::builtin(id).is_none())
+                    .find(|id| interim::content_builtin(id).is_none())
                     .map(|id| ("content", id.as_str()))
             })
             .or_else(|| {
@@ -560,6 +561,41 @@ fn is_false(b: &bool) -> bool {
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
+}
+
+/// 过渡：共享层（tw-guard）的内置规则目录里多了几条，桌面版还没接上。
+///
+/// 内容过滤多了「隐藏字符」一组码位规则（处置可以是删除），出站脱敏多了邮箱和手机号。
+/// 桌面版的网关还不会删、界面还说不出码位和这两种规则按什么认，所以这一段里它们**不
+/// 存在**：配置里写它们的 id 是未知规则，规则列表里没有，网关不用。藏匿字符照旧由
+/// `hidden_text` 那一项管。
+///
+/// 桌面版改用 `tw_guard::policy` 的那一步（同一个分支上的下一段）把这里整个删掉。
+pub mod interim {
+    use tw_guard::content::{Builtin as ContentBuiltin, Match};
+    use tw_guard::redact::rules::{BUILTINS, Builtin as RedactBuiltin, Matcher};
+
+    /// 桌面版现在用的内置内容规则：去掉码位规则
+    pub fn content_builtins() -> impl Iterator<Item = &'static ContentBuiltin> {
+        tw_guard::content::builtins()
+            .iter()
+            .filter(|b| b.matching != Match::Codepoints)
+    }
+
+    pub fn content_builtin(id: &str) -> Option<&'static ContentBuiltin> {
+        content_builtins().find(|b| b.id == id)
+    }
+
+    /// 桌面版现在用的内置脱敏规则：去掉邮箱和手机号
+    pub fn redact_builtins() -> impl Iterator<Item = &'static RedactBuiltin> {
+        BUILTINS
+            .iter()
+            .filter(|b| !matches!(b.matcher, Matcher::Email | Matcher::CnMobilePhone))
+    }
+
+    pub fn redact_builtin(id: &str) -> Option<&'static RedactBuiltin> {
+        redact_builtins().find(|b| b.id == id)
+    }
 }
 
 #[cfg(test)]

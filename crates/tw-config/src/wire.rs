@@ -97,6 +97,17 @@ impl From<SecurityMode> for tw_api::GuardMode {
     }
 }
 
+/// 共享层（tw-guard）的档位。两边是同一组词；数据面调 tw-guard 的引擎时要它
+impl From<SecurityMode> for tw_guard::policy::Mode {
+    fn from(m: SecurityMode) -> Self {
+        match m {
+            SecurityMode::Off => Self::Off,
+            SecurityMode::Observe => Self::Observe,
+            SecurityMode::Enforce => Self::Enforce,
+        }
+    }
+}
+
 impl From<tw_api::GuardMode> for SecurityMode {
     fn from(m: tw_api::GuardMode) -> Self {
         match m {

@@ -192,12 +192,17 @@ fn content_matcher(matching: tw_guard::content::Match, pattern: &str) -> tw_api:
         tw_guard::content::Match::Regex => tw_api::Matcher::Regex {
             pattern: pattern.to_string(),
         },
+        // 桌面版的配置里还写不出码位规则（见 `tw_config::security_interim`），列不到这里
+        tw_guard::content::Match::Codepoints => tw_api::Matcher::Codepoints {
+            ranges: tw_guard::content::Codepoints::parse(pattern)
+                .map(|c| c.canonical())
+                .unwrap_or_else(|_| vec![pattern.to_string()]),
+        },
     }
 }
 
 fn content_view(p: &tw_config::ContentPolicy) -> tw_api::GuardDetail {
-    let mut rules: Vec<tw_api::SecurityRuleView> = tw_guard::content::builtins()
-        .iter()
+    let mut rules: Vec<tw_api::SecurityRuleView> = tw_config::security_interim::content_builtins()
         .map(|b| tw_api::SecurityRuleView {
             id: b.id.clone(),
             custom: false,
@@ -229,9 +234,11 @@ fn content_view(p: &tw_config::ContentPolicy) -> tw_api::GuardDetail {
     }
 }
 
-fn matcher(m: &tw_guard::redact::rules::Matcher) -> tw_api::Matcher {
+/// 一条内置脱敏规则按什么认。邮箱和手机号桌面版还没接上（见
+/// `tw_config::security_interim`），契约里也还没有它们的写法：`None`
+fn matcher(m: &tw_guard::redact::rules::Matcher) -> Option<tw_api::Matcher> {
     use tw_guard::redact::rules::Matcher as M;
-    match *m {
+    Some(match *m {
         M::Prefix { prefix, min_tail } => tw_api::Matcher::Prefix {
             prefix: prefix.to_string(),
             min_tail,
@@ -259,30 +266,30 @@ fn matcher(m: &tw_guard::redact::rules::Matcher) -> tw_api::Matcher {
                 })
                 .collect(),
         },
-    }
+        M::Email | M::CnMobilePhone => return None,
+    })
 }
 
 fn redact_view(p: &tw_config::RedactPolicy) -> tw_api::GuardDetail {
-    let mut rules: Vec<tw_api::SecurityRuleView> = tw_guard::redact::rules::BUILTINS
-        .iter()
-        .map(|b| {
+    let mut rules: Vec<tw_api::SecurityRuleView> = tw_config::security_interim::redact_builtins()
+        .filter_map(|b| {
             let on = if b.on_by_default {
                 !p.disable.iter().any(|x| x == b.id)
             } else {
                 p.enable.iter().any(|x| x == b.id)
             };
-            tw_api::SecurityRuleView {
+            Some(tw_api::SecurityRuleView {
                 id: b.id.to_string(),
                 custom: false,
                 name: b.name.to_string(),
                 why: String::new(),
                 kind: b.kind.slug().to_string(),
-                matcher: matcher(&b.matcher),
+                matcher: matcher(&b.matcher)?,
                 enabled: on,
                 on_by_default: b.on_by_default,
                 action: None,
                 default_action: None,
-            }
+            })
         })
         .collect();
     rules.extend(p.custom.iter().map(|c| tw_api::SecurityRuleView {
@@ -409,13 +416,15 @@ async fn toggle_builtin(
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let guard = Guard::parse(&guard)?;
     let on_by_default = match guard {
-        Guard::Redact => tw_guard::redact::rules::builtin(&id).map(|b| b.on_by_default),
+        Guard::Redact => tw_config::security_interim::redact_builtin(&id).map(|b| b.on_by_default),
         Guard::InspectTools => tw_guard::tools::rules::builtin()
             .dangerous
             .iter()
             .any(|r| r.id == id)
             .then_some(true),
-        Guard::Content => tw_guard::content::builtin(&id).map(|b| b.on_by_default),
+        Guard::Content => {
+            tw_config::security_interim::content_builtin(&id).map(|b| b.on_by_default)
+        }
         Guard::HiddenText => tw_guard::hidden::SMUGGLING
             .iter()
             .any(|k| k.slug() == id)
@@ -483,7 +492,8 @@ async fn set_builtin_action(
             )
         }
         Guard::Content => {
-            let b = tw_guard::content::builtin(&id).ok_or_else(|| unknown_rule(&id))?;
+            let b = tw_config::security_interim::content_builtin(&id)
+                .ok_or_else(|| unknown_rule(&id))?;
             (
                 content_action_of(req.action)?.slug(),
                 ContentAction::factory(b).slug(),
@@ -733,7 +743,8 @@ async fn test(
                     &trial
                 }
                 (None, Some(id)) => {
-                    let b = tw_guard::redact::rules::builtin(id).ok_or_else(|| unknown_rule(id))?;
+                    let b = tw_config::security_interim::redact_builtin(id)
+                        .ok_or_else(|| unknown_rule(id))?;
                     trial = tw_guard::redact::rules::RuleSet::only(&[b.id]);
                     &trial
                 }
@@ -919,7 +930,10 @@ mod tests {
     #[test]
     fn every_builtin_redaction_rule_is_listed_with_its_default() {
         let v = redact_view(&Default::default());
-        assert_eq!(v.rules.len(), tw_guard::redact::rules::BUILTINS.len());
+        assert_eq!(
+            v.rules.len(),
+            tw_config::security_interim::redact_builtins().count()
+        );
         let ip = v.rules.iter().find(|r| r.id == "internal-ip").unwrap();
         assert!(!ip.enabled && !ip.on_by_default);
         let key = v

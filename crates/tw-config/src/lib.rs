@@ -1155,7 +1155,7 @@ pub use retention::Retention;
 pub use security::{
     ContentAction, ContentMatch, ContentPolicy, CustomContentRule, CustomRedactRule,
     CustomToolRule, DEFAULT_MAX_CHARS, HiddenPolicy, MAX_CHARS_CEILING, Mode as SecurityMode,
-    OutputLimitPolicy, RedactPolicy, Security, ToolAction, ToolPolicy,
+    OutputLimitPolicy, RedactPolicy, Security, ToolAction, ToolPolicy, interim as security_interim,
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};

@@ -8,16 +8,23 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
-description = "Guards shared by both gateways: outbound redaction and restoration, inspection of the tool calls an upstream returns, hidden characters, content filtering and an output length limit"
+description = "Guards shared by both gateways: the policy model, rule views and trials for outbound redaction, tool-call inspection and content filtering, and their engines"
 
 [dependencies]
 serde = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml_ng = { workspace = true }
 tw-dialect = { workspace = true }
+ts-rs = { workspace = true, optional = true }
+
+[features]
+# 规则视图、「测试…」的请求和结果导出成 TypeScript。**默认关** —— 只有桌面端生成前端
+# 类型时开（经由 tw-api 的 `ts`），企业版不背 ts-rs。
+ts = ["dep:ts-rs"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

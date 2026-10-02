@@ -17,6 +17,7 @@ pub use tw_types::Msg;
 
 mod endpoint;
 pub mod ep;
+pub mod guard;
 #[cfg(feature = "ts")]
 pub mod ts;
 pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};

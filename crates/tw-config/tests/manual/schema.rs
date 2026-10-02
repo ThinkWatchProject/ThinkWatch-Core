@@ -1518,7 +1518,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             } else {
                 "| id | Name | Out of the box |\n|---|---|---|\n"
             };
-            for b in tw_guard::redact::rules::BUILTINS {
+            for b in tw_config::security_interim::redact_builtins() {
                 let on = if b.on_by_default { yes } else { no };
                 out += &format!("| `{}` | {} | {on} |\n", b.id, b.name);
             }
@@ -1540,7 +1540,7 @@ pub fn rules(kind: &str, l: Lang) -> Option<String> {
             } else {
                 "| id | Name | Group | Out of the box | Under `enforce`, out of the box |\n|---|---|---|---|---|\n"
             };
-            for b in tw_guard::content::builtins() {
+            for b in tw_config::security_interim::content_builtins() {
                 let on = if b.on_by_default { yes } else { no };
                 let a = ContentAction::factory(b).slug();
                 out += &format!("| `{}` | {} | {} | {on} | `{a}` |\n", b.id, b.name, b.group);
