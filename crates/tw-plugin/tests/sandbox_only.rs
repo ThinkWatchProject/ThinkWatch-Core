@@ -5,7 +5,8 @@
 //! - I2：guest 的导入表里只有桥的日志和时钟，没有 WASI 的文件、套接字、环境变量、
 //!   命令行参数、进程。导入表就是插件够得着的全部宿主能力：插件的 JS 改不了它。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
@@ -28,9 +29,17 @@ const JS_ENGINES: &[&str] = &[
     "rusty_v8",
 ];
 
-fn metadata() -> Value {
+/// 工作区成员和它们声明的依赖。**只读工作区自己的清单**（`--no-deps`）：离线也拿得到，
+/// 不用为别的平台的依赖去下载
+fn members() -> Value {
     let out = Command::new(env!("CARGO"))
-        .args(["metadata", "--format-version", "1", "--offline", "--locked"])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo metadata");
@@ -42,72 +51,54 @@ fn metadata() -> Value {
     serde_json::from_slice(&out.stdout).expect("cargo metadata is JSON")
 }
 
+/// 工作区 `Cargo.lock` 里的全部包名。锁文件覆盖所有平台、所有种类的依赖（普通、构建、
+/// 测试），所以「不在锁文件里」比「不在某个平台的普通依赖里」更强
+fn locked_packages() -> BTreeSet<String> {
+    let lock = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let text = std::fs::read_to_string(&lock).expect("read Cargo.lock");
+    text.lines()
+        .filter_map(|l| l.strip_prefix("name = \""))
+        .filter_map(|l| l.strip_suffix('"'))
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn no_crate_of_core_compiles_a_javascript_engine_into_native_code() {
-    let meta = metadata();
-    let names: BTreeMap<&str, &str> = meta["packages"]
+    let meta = members();
+    let names: Vec<&str> = meta["packages"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| (p["id"].as_str().unwrap(), p["name"].as_str().unwrap()))
-        .collect();
-    let members: Vec<&str> = meta["workspace_members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m.as_str().unwrap())
+        .map(|p| p["name"].as_str().unwrap())
         .collect();
     assert!(
-        members.iter().any(|m| names[m] == "tw-plugin"),
+        names.contains(&"tw-plugin"),
         "tw-plugin is not a workspace member"
     );
     assert!(
-        !members.iter().any(|m| names[m] == "tw-plugin-guest"),
+        !names.contains(&"tw-plugin-guest"),
         "the guest became a workspace member: its JavaScript engine would be built natively"
     );
 
-    // 本机代码的依赖图：普通依赖（build 依赖在构建时跑，不执行插件；dev 依赖只在测试里）
-    let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for node in meta["resolve"]["nodes"].as_array().unwrap() {
-        let id = node["id"].as_str().unwrap();
-        let deps = node["deps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|d| {
-                d["dep_kinds"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|k| k["kind"].is_null())
-            })
-            .map(|d| d["pkg"].as_str().unwrap())
-            .collect();
-        edges.insert(id, deps);
-    }
-    let mut seen = BTreeSet::new();
-    let mut stack: Vec<&str> = members.clone();
-    let mut found = Vec::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let name = names[id];
-        if JS_ENGINES.contains(&name) {
-            found.push(name);
-        }
-        stack.extend(edges.get(id).into_iter().flatten().copied());
-    }
+    // 引擎只在 guest 自己的锁文件里（它编成 wasm）。工作区的锁文件里出现任何一个，
+    // 就是有 crate 把 JS 引擎编进了本机代码 —— 哪怕只是构建或测试时
+    let locked = locked_packages();
+    assert!(
+        locked.contains("wasmtime"),
+        "Cargo.lock has no wasmtime: {locked:?}"
+    );
+    let found: Vec<&&str> = JS_ENGINES.iter().filter(|e| locked.contains(**e)).collect();
     assert!(
         found.is_empty(),
-        "a JavaScript engine is compiled into core's native code: {found:?}"
+        "a JavaScript engine is in core's own dependency tree: {found:?}"
     );
 }
 
 #[test]
 fn the_plugin_runtime_does_not_depend_on_the_gateway() {
     // 契约 §5：tw-plugin 是第二层的叶子，网关依赖它，不是反过来
-    let meta = metadata();
+    let meta = members();
     let tw_plugin = meta["packages"]
         .as_array()
         .unwrap()

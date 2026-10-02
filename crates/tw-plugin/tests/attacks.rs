@@ -6,9 +6,11 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::*;
 use serde_json::{Value, json};
-use tw_plugin::{Limits, RequestOutcome, RunError, ToolCallOutcome};
+use tw_plugin::{Limits, RequestOutcome, RunError, Runtime, ToolCallOutcome};
 
 fn kind(k: &str) -> Value {
     json!({ "kind": k })
@@ -58,7 +60,7 @@ fn the_reported_cpu_time_stays_near_the_limit() {
 
 #[test]
 fn a_memory_bomb_hits_the_memory_limit() {
-    let p = load("mem-bomb");
+    let p = load_roomy("mem-bomb");
     let e = request_err(&p, kind("buffers"));
     assert!(matches!(e, RunError::MemoryLimit), "{e:?}");
     after_attack(&p, kind("buffers"), &e);
@@ -68,7 +70,7 @@ fn a_memory_bomb_hits_the_memory_limit() {
 fn a_memory_bomb_that_is_slow_to_grow_is_stopped_by_one_limit_or_the_other() {
     // 字符串翻倍：引擎可能用绳索串接，长度先撞上它自己的上限（string too long），
     // 也可能先用完内存或 CPU 时间。哪一道先到都行，不能是跑完
-    let p = load("mem-bomb");
+    let p = load_roomy("mem-bomb");
     let e = request_err(&p, kind("strings"));
     assert!(
         matches!(
@@ -85,7 +87,7 @@ fn one_huge_allocation_is_refused() {
     // 引擎可能在分配之前就拒绝（RangeError），也可能分配到一半撞上限 —— 两种都是
     // 干净的失败。不允许的是分配成功
     for k in ["arraybuffer", "array", "string"] {
-        let p = load("mem-single");
+        let p = load_roomy("mem-single");
         let e = request_err(&p, kind(k));
         // 填两亿个元素的数组可能先撞上 CPU 上限
         assert!(
@@ -116,7 +118,7 @@ fn endless_recursion_fails_without_taking_the_host_down() {
 fn deep_recursion_inside_the_engine_fails_without_taking_the_host_down() {
     // 耗尽的是 WebAssembly 的栈（引擎的 C 代码在递归），不是 JS 的调用栈
     for k in ["parse", "stringify"] {
-        let p = load("stack-native");
+        let p = load_roomy("stack-native");
         let e = request_err(&p, kind(k));
         assert!(
             matches!(
@@ -136,7 +138,7 @@ fn deep_recursion_inside_the_engine_fails_without_taking_the_host_down() {
 
 #[test]
 fn an_output_far_larger_than_the_input_hits_the_output_limit() {
-    let p = load("out-giant");
+    let p = load_roomy("out-giant");
     let e = request_err(&p, json!({}));
     assert!(matches!(e, RunError::OutputLimit), "{e:?}");
     after_attack(&p, json!({}), &e);
@@ -202,7 +204,7 @@ fn a_cyclic_value_is_bad_output() {
 fn a_deeply_nested_value_does_not_overflow_the_host_stack() {
     // 宿主解析一个嵌套五千层的 JSON：栈溢出就是整个 core 进程崩溃。要么序列化
     // 那一步在沙箱里失败，要么宿主的解析器拒绝它；成功也可以，但宿主得活着
-    let p = load("out-deep");
+    let p = load_roomy("out-deep");
     match request(&p, json!({})).result {
         Err(e) => assert!(
             matches!(
@@ -288,7 +290,7 @@ fn an_error_whose_message_never_finishes_is_still_bounded() {
 #[test]
 fn a_huge_error_message_is_cut_short() {
     // 错误信息会进请求记录、通知和给客户端的错误：16 MiB 的消息不能原样流出去
-    let p = load("throw-values");
+    let p = load_roomy("throw-values");
     match request_err(&p, kind("huge-message")) {
         RunError::Threw { message, stack } => {
             assert!(message.len() <= 64 * 1024, "{} bytes", message.len());
@@ -330,7 +332,12 @@ fn an_async_request_hook_is_awaited_or_refused() {
 fn a_log_flood_stays_within_the_log_limits() {
     let limits = Limits::default();
     for k in ["lines", "long-line", "cyclic", "getter-loop"] {
-        let p = load("log-flood");
+        // getter 死循环要靠 CPU 上限停下；另外三种测的是日志的上限
+        let p = if k == "getter-loop" {
+            load("log-flood")
+        } else {
+            load_roomy("log-flood")
+        };
         let inv = request(&p, kind(k));
         // 超出日志上限可以是错误（I4），也可以是截断；**不能**是原样收下
         assert!(
@@ -363,7 +370,7 @@ fn a_log_flood_stays_within_the_log_limits() {
 
 #[test]
 fn holding_back_a_reply_and_releasing_it_inflated_hits_the_output_limit() {
-    let p = load("reply-hoard");
+    let p = load_roomy("reply-hoard");
     let mut r = reply(&p, json!({}));
     for _ in 0..8 {
         match text(&mut r, "一段回答。").result {
@@ -386,21 +393,26 @@ fn a_reply_hook_over_its_per_call_cpu_limit_is_stopped() {
     let mut r = reply(&p, kind("over-call"));
     let e = text(&mut r, "一段")
         .result
-        .expect_err("60 ms per call passed");
+        .expect_err("an endless reply hook returned");
     assert!(matches!(e, RunError::CpuLimit), "{e:?}");
 }
 
 #[test]
 fn many_cheap_reply_calls_hit_the_limit_for_the_whole_reply() {
-    // 每次 8 毫秒，单次不超；整条回答累计 2 秒就该停。之前的调用照常。
-    // （Windows 上 CPU 时间按墙钟算，机器忙时单次也可能超，所以只要求先成功几次）
-    let limits = Limits::default();
-    let p = load("reply-slow");
+    // 单次的上限放宽到两秒、整条回答只给 300 毫秒：每段一份固定的计算，单次远远不到，
+    // 累计到了就该停，之前的调用照常。上限是另配的，测的是「累计」这一道本身，不受机器
+    // 快慢影响
+    let rt = Runtime::new(Limits {
+        reply_call_cpu: Duration::from_secs(2),
+        reply_total_cpu: Duration::from_millis(300),
+        ..Limits::default()
+    })
+    .unwrap();
+    let p = rt.load(&corpus("reply-slow")).unwrap();
     let mut r = reply(&p, kind("under-call"));
-    let most = (limits.reply_total_cpu.as_millis() / 8 + 100) as usize;
     let mut ok = 0;
     let mut stopped = None;
-    for _ in 0..most {
+    for _ in 0..2000 {
         match text(&mut r, "一段").result {
             Ok(_) => ok += 1,
             Err(e) => {
@@ -409,9 +421,9 @@ fn many_cheap_reply_calls_hit_the_limit_for_the_whole_reply() {
             }
         }
     }
-    let e = stopped.unwrap_or_else(|| panic!("{ok} calls of 8 ms each all passed"));
+    let e = stopped.unwrap_or_else(|| panic!("{ok} calls all passed"));
     assert!(matches!(e, RunError::CpuLimit), "{e:?}");
-    assert!(ok >= 5, "stopped after only {ok} calls");
+    assert!(ok >= 2, "stopped after only {ok} calls");
 }
 
 #[test]
@@ -428,7 +440,7 @@ fn a_reply_instance_that_failed_keeps_failing_instead_of_resuming() {
 
 #[test]
 fn replacing_one_tool_call_with_two_hundred_thousand_fails() {
-    let p = load("toolcall-flood");
+    let p = load_roomy("toolcall-flood");
     let mut r = reply(&p, json!({}));
     let inv = tool_call(
         &mut r,

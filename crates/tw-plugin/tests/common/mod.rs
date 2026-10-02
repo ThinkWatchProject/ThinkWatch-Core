@@ -22,6 +22,31 @@ pub fn rt() -> &'static Runtime {
     RT.get_or_init(|| Runtime::new(Limits::default()).expect("the plugin runtime starts"))
 }
 
+/// CPU 时间放宽到秒级、其余上限照旧的运行时。
+///
+/// 测内存、输出、日志这几道上限时用它：攻击本身要做几毫秒到几十毫秒的事（造一个
+/// 几 MiB 的字符串、填一个大数组），慢一点的 CI 机器上会先撞上 200 毫秒的 CPU 上限，
+/// 测到的就不是想测的那一道了。Windows 上 CPU 时间还是按墙钟算的
+pub fn rt_roomy() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        Runtime::new(Limits {
+            request_cpu: Duration::from_secs(10),
+            reply_call_cpu: Duration::from_secs(10),
+            reply_total_cpu: Duration::from_secs(10),
+            ..Limits::default()
+        })
+        .expect("the plugin runtime starts")
+    })
+}
+
+/// 加载到 [`rt_roomy`] 上
+pub fn load_roomy(name: &str) -> Plugin {
+    rt_roomy()
+        .load(&corpus(name))
+        .unwrap_or_else(|e| panic!("corpus/{name}.js failed to load: {e:?}"))
+}
+
 pub fn corpus_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/corpus")
