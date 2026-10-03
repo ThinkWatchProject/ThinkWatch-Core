@@ -4,7 +4,7 @@ export const manifest = {
   name: "改不可改的字段",
   api: 1,
   permissions: ["messages"],
-  settings: { kind: { type: "string", label: "改哪一项", default: "role" } },
+  settings: { kind: { type: "string", label: "改哪一项", value: "role" } },
 };
 
 function part(req, type) {

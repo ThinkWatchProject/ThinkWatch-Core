@@ -58,9 +58,6 @@ fn content_matches() -> Vec<&'static str> {
 fn group_types() -> Vec<&'static str> {
     super::fields::<GroupType>()
 }
-fn plugin_on_error() -> Vec<&'static str> {
-    super::fields::<PluginOnError>()
-}
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
 const MODE_DOC: T2 = t(
@@ -224,8 +221,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Objs("plugins[]"),
                     Def::Is("[]"),
                     t(
-                        "Script plugins, in the order they run. The app installs them; each one's code is a file next to this one.",
-                        "脚本插件，按运行的顺序。由应用安装，每个插件的代码是本文件旁边的一个文件。",
+                        "Script plugins, in the order they run. The app installs them; each one's code and settings are a file next to this one.",
+                        "脚本插件，按运行的顺序。由应用安装，每个插件的代码和设置是本文件旁边的一个文件。",
                     ),
                 ),
             ],
@@ -1478,8 +1475,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order` and `inspect` are taken by the control plane.",
-                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。`order` 和 `inspect` 被控制面占用。",
+                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order`, `inspect`, `rewrite` and `confirmed` are taken by the control plane.",
+                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。`order`、`inspect`、`rewrite` 和 `confirmed` 被控制面占用。",
                     ),
                 ),
                 row(
@@ -1507,66 +1504,6 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Run the plugin. `false` keeps it installed and out of every request.",
                         "是否运行这个插件。`false`：插件保留，不参与任何请求。",
-                    ),
-                ),
-                row(
-                    "on_error",
-                    Kind::Enum(plugin_on_error),
-                    Def::Is("reject"),
-                    t(
-                        "When the plugin fails on a request, or cannot run because its file changed or does not load: `reject` refuses the requests it covers; `skip` lets them through without it.",
-                        "插件在请求上出错，或者因文件改动、加载失败而无法运行时：`reject` 拒绝它所覆盖的请求；`skip` 跳过这个插件，请求照常。",
-                    ),
-                ),
-                row(
-                    "scope",
-                    Kind::Obj("plugins[].scope"),
-                    Def::Section,
-                    t(
-                        "Which requests the plugin handles. Filled from the plugin's own suggestion when it is installed.",
-                        "插件处理哪些请求。安装时按插件自己的建议填写。",
-                    ),
-                ),
-                row(
-                    "settings",
-                    Kind::Settings,
-                    Def::Is("{}"),
-                    t(
-                        "Values for the settings the plugin declares. A setting left out takes the plugin's default; one the plugin does not declare, or of the wrong type, stops the plugin from loading.",
-                        "插件所声明设置项的值。未写的取插件的默认值；插件未声明的设置项或类型不符的值会使插件无法加载。",
-                    ),
-                ),
-            ],
-        },
-        Section {
-            path: "plugins[].scope",
-            ty: checked!(PluginScope, "{}"),
-            rows: vec![
-                row(
-                    "clients",
-                    Kind::Strs,
-                    Def::Is("[]"),
-                    t(
-                        "Client apps (`claude-code`, `codex`, …), as names or globs. `[]`: every client, including requests whose app is not recognised.",
-                        "客户端应用（`claude-code`、`codex` 等），写名字或通配。`[]`：所有客户端，包括认不出应用的请求。",
-                    ),
-                ),
-                row(
-                    "models",
-                    Kind::Strs,
-                    Def::Is("[]"),
-                    t(
-                        "Models sent to the upstream, as model ids or globs (`claude-*`). When a routing rule renames the model, the new name is the one that matches. `[]`: every model.",
-                        "发给上游的模型，写模型 ID 或通配（`claude-*`）。路由规则改了模型名的，按改名之后的匹配。`[]`：所有模型。",
-                    ),
-                ),
-                row(
-                    "upstreams",
-                    Kind::Strs,
-                    Def::Is("[]"),
-                    t(
-                        "Upstreams the plugin handles, by name or glob, for requests and answers alike. `[]`: every upstream.",
-                        "插件处理哪些上游，写名字或通配，请求和回答都按它。`[]`：所有上游。",
                     ),
                 ),
             ],

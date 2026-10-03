@@ -17,13 +17,13 @@
 //! 列表上显示的 manifest 来自缓存（[`super::manifests`]，只拿来显示），缓存里没有就只有
 //! id。有一个插件开着，运行时反正要起，所有插件照常编，缓存跟着补齐。
 //!
-//! **一个插件都没打开时不起运行时**：沙箱一起来就是几 MB 常驻内存，而 core 自带的默认
-//! 插件装上时都停用着 —— 一个插件都没打开的用户不该为它付这个钱。这时停用的插件照样读
-//! 文件、算哈希，但不编：它们是「休眠」的（[`PluginHost::dormant`]，跑不了任何钩子），
-//! 列表上显示的 manifest 来自缓存（[`super::manifests`]，只拿来显示），缓存里没有就只有
-//! id。有一个插件开着，运行时反正要起，所有插件照常编，缓存跟着补齐。
+//! **出错时怎么办、范围、设置的值都在插件文件里**（契约附录四），配置里只有 id、文件、
+//! 哈希和开关。所以它们跟着 manifest 走：编得出来就是编出来的那一份；编不出来（运行时
+//! 起不来、新版 core 不认它的写法）就照批准的那份字节里写着的读（manifest 是纯数据，
+//! 不编也读得出来，见 [`super::source::declared`]）；连那也读不出来，才按出厂的：出错时
+//! 拒绝、什么请求都管。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -35,6 +35,7 @@ use crate::plugin::engine::{Engine, LoadError, MAX_SOURCE, Manifest};
 use crate::plugin::host::PluginHost;
 use crate::plugin::manifests;
 use crate::plugin::set::{Active, Broken, LogRing, PluginSet, Scope, State, Stats};
+use crate::plugin::source;
 
 /// 一份编译结果：编好的插件，或者编不成的原因
 type Compiled = Result<Arc<dyn PluginHost>, LoadError>;
@@ -175,34 +176,35 @@ impl Plugins {
         let awake = config.plugins.iter().any(|p| p.enabled);
         for p in &config.plugins {
             let track = self.track(&p.id);
-            let (state, manifest) = match dir.as_deref() {
+            let loaded = match dir.as_deref() {
                 Some(dir) if awake || p.enabled => {
-                    let (state, m) = self.load_one(dir, p, &*engine, &mut used);
+                    let loaded = self.load_one(dir, p, &*engine, &mut used);
                     // 编出来的记一笔：之后（比如下一次启动）它停用着、运行时没起时，列表
                     // 照样说得出它是什么
-                    if let Some(m) = &m {
+                    if let Some(m) = &loaded.manifest {
                         self.remember(&p.sha256, m);
                     }
-                    (state, m)
+                    loaded
                 }
                 Some(dir) => self.dormant_one(dir, p, &mut used),
-                None => (State::Broken(Broken::Error(not_located())), None),
+                None => Loaded::broken(Broken::Error(not_located())),
             };
-            let (state, settings) = match (state, &manifest) {
-                (state, None) => (state, serde_json::Map::new()),
-                (state, Some(m)) => match settings_of(m, &p.settings) {
-                    Ok(s) => (state, s),
-                    // 设置对不上：照样显示它（manifest 在），但不跑
-                    Err(why) => (State::Broken(Broken::Error(why)), serde_json::Map::new()),
-                },
+            let m = loaded.manifest.as_ref();
+            // 出错时怎么办、范围：manifest 里的；读不出 manifest 就照批准的那份字节里写着的，
+            // 再不行按出厂的（见模块说明）
+            let (on_error, scope) = match m {
+                Some(m) => (m.on_error, m.scope.clone()),
+                None => loaded
+                    .declared
+                    .clone()
+                    .unwrap_or((tw_api::OnError::Reject, Scope::default())),
             };
-            let m = manifest.as_ref();
             out.push(Arc::new(Active {
                 id: p.id.clone(),
                 name: m.map_or_else(|| p.id.clone(), |m| m.name.clone()),
                 enabled: p.enabled,
-                on_error: p.on_error.into(),
-                scope: scope_of(&p.scope),
+                on_error,
+                scope,
                 permissions: m.map(|m| m.permissions.clone()).unwrap_or_default(),
                 // 读不出 manifest 的按不写 `requests` 的算（见 `Active::requests`）
                 requests: m.map_or_else(
@@ -211,9 +213,9 @@ impl Plugins {
                 ),
                 reply_mode: m.map_or(tw_api::ReplyMode::Block, |m| m.reply_mode),
                 hooks: m.map(|m| m.hooks).unwrap_or_default(),
-                settings,
-                manifest,
-                state,
+                settings: m.map(values_of).unwrap_or_default(),
+                manifest: loaded.manifest,
+                state: loaded.state,
                 stats: track.stats,
                 logs: track.logs,
             }));
@@ -255,53 +257,56 @@ impl Plugins {
         p: &tw_config::Plugin,
         engine: &dyn Engine,
         used: &mut HashSet<[u8; 32]>,
-    ) -> (State, Option<Manifest>) {
+    ) -> Loaded {
         let path = p.path_in(dir);
         let bytes = match read_capped(&path) {
             Ok(b) => b,
             // 文件没了也是「变了」：批准过的那一份不在原处了
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (
-                    State::Broken(Broken::Changed),
-                    self.approved_manifest(dir, p, engine, used),
-                );
+                return self.approved(dir, p, engine, used, Broken::Changed);
             }
             Err(e) => {
-                return (
-                    State::Broken(Broken::Error(msg!(
+                return self.approved(
+                    dir,
+                    p,
+                    engine,
+                    used,
+                    Broken::Error(msg!(
                         "gw.plugin.unreadable", file = &p.file, detail = e =>
                         "The plugin file {file} cannot be read: {detail}"
-                    ))),
-                    self.approved_manifest(dir, p, engine, used),
+                    )),
                 );
             }
         };
         let sha: [u8; 32] = Sha256::digest(&bytes).into();
         if hex(&sha) != p.sha256 {
-            return (
-                State::Broken(Broken::Changed),
-                self.approved_manifest(dir, p, engine, used),
-            );
+            return self.approved(dir, p, engine, used, Broken::Changed);
         }
         used.insert(sha);
         match self.compile(engine, sha, &bytes) {
-            Ok(host) => {
-                let m = host.manifest().clone();
-                (State::Ready(host), Some(m))
-            }
-            Err(e) => (State::Broken(Broken::Error(e.msg())), None),
+            Ok(host) => Loaded {
+                manifest: Some(host.manifest().clone()),
+                state: State::Ready(host),
+                declared: None,
+            },
+            Err(e) => Loaded {
+                state: State::Broken(Broken::Error(e.msg())),
+                manifest: None,
+                // 编不出来：文件里写着的照样算数
+                declared: source::declared(&bytes),
+            },
         }
     }
 
     /// 停用着、运行时没起的一个插件：**不编**。文件照样读、哈希照样比（「文件变了」照样
     /// 查得出来）；这个进程里编过的直接拿来用，没编过的是休眠的，显示用的 manifest 从缓存
-    /// 里拿，缓存里没有就只有 id
+    /// 里拿，缓存里没有就只有 id（出错时怎么办和范围照文件里写着的）
     fn dormant_one(
         &self,
         dir: &Path,
         p: &tw_config::Plugin,
         used: &mut HashSet<[u8; 32]>,
-    ) -> (State, Option<Manifest>) {
+    ) -> Loaded {
         let approved = unhex(&p.sha256);
         let compiled = approved.and_then(|sha| {
             let cache = self.compiled.lock().unwrap_or_else(PoisonError::into_inner);
@@ -326,49 +331,78 @@ impl Plugins {
         let bytes = match read_capped(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (State::Broken(Broken::Changed), shown);
+                return Loaded::shown(Broken::Changed, shown);
             }
             Err(e) => {
-                return (
-                    State::Broken(Broken::Error(msg!(
+                return Loaded::shown(
+                    Broken::Error(msg!(
                         "gw.plugin.unreadable", file = &p.file, detail = e =>
                         "The plugin file {file} cannot be read: {detail}"
-                    ))),
+                    )),
                     shown,
                 );
             }
         };
         let sha: [u8; 32] = Sha256::digest(&bytes).into();
         if hex(&sha) != p.sha256 {
-            return (State::Broken(Broken::Changed), shown);
+            return Loaded::shown(Broken::Changed, shown);
         }
         if let Some((_, host)) = compiled {
-            return (State::Ready(host), shown);
+            return Loaded {
+                state: State::Ready(host),
+                manifest: shown,
+                declared: None,
+            };
         }
+        let declared = shown.is_none().then(|| source::declared(&bytes)).flatten();
         let host = Dormant {
             manifest: shown.clone().unwrap_or_else(|| placeholder(&p.id)),
             sha256: sha,
         };
-        (State::Ready(Arc::new(host)), shown)
+        Loaded {
+            state: State::Ready(Arc::new(host)),
+            manifest: shown,
+            declared,
+        }
     }
 
-    /// 文件变了时，批准过的那一份的 manifest —— **只拿来显示**（名字、权限、设置项），
-    /// 不跑。底稿也不是那一份了（被人动过、没了）就没有。
-    fn approved_manifest(
+    /// 文件变了（或者读不了）时，批准过的那一份：它的 manifest **只拿来显示**（名字、权限、
+    /// 设置项）和定它管哪些请求、出了错怎么办，不跑。底稿也不是那一份了（被人动过、没了）
+    /// 就什么都没有。
+    fn approved(
         &self,
         dir: &Path,
         p: &tw_config::Plugin,
         engine: &dyn Engine,
         used: &mut HashSet<[u8; 32]>,
-    ) -> Option<Manifest> {
-        let bytes = read_capped(&tw_config::plugins::approved_path(dir, &p.id)).ok()?;
+        why: Broken,
+    ) -> Loaded {
+        let state = State::Broken(why);
+        let Some(bytes) = read_capped(&tw_config::plugins::approved_path(dir, &p.id))
+            .ok()
+            .filter(|b| sha256_hex(b) == p.sha256)
+        else {
+            return Loaded {
+                state,
+                manifest: None,
+                declared: None,
+            };
+        };
         let sha: [u8; 32] = Sha256::digest(&bytes).into();
-        if hex(&sha) != p.sha256 {
-            return None;
-        }
         used.insert(sha);
-        let host = self.compile(engine, sha, &bytes).ok()?;
-        Some(host.manifest().clone())
+        let manifest = self
+            .compile(engine, sha, &bytes)
+            .ok()
+            .map(|host| host.manifest().clone());
+        let declared = manifest
+            .is_none()
+            .then(|| source::declared(&bytes))
+            .flatten();
+        Loaded {
+            state,
+            manifest,
+            declared,
+        }
     }
 
     fn compile(&self, engine: &dyn Engine, sha: [u8; 32], bytes: &[u8]) -> Compiled {
@@ -378,6 +412,41 @@ impl Plugins {
             .or_insert_with(|| engine.load(bytes))
             .clone()
     }
+}
+
+/// 一个插件读下来的样子（[`Plugins::build`] 用）
+struct Loaded {
+    state: State,
+    /// 编出来的（或者缓存里的）manifest
+    manifest: Option<Manifest>,
+    /// 读不出 manifest 时，批准的那份字节里写着的出错时怎么办和范围
+    declared: Option<(tw_api::OnError, Scope)>,
+}
+
+impl Loaded {
+    fn broken(why: Broken) -> Self {
+        Self {
+            state: State::Broken(why),
+            manifest: None,
+            declared: None,
+        }
+    }
+
+    fn shown(why: Broken, manifest: Option<Manifest>) -> Self {
+        Self {
+            state: State::Broken(why),
+            manifest,
+            declared: None,
+        }
+    }
+}
+
+/// 交给插件的设置：manifest 里每个设置此刻的值
+pub fn values_of(m: &Manifest) -> serde_json::Map<String, serde_json::Value> {
+    m.settings
+        .iter()
+        .map(|s| (s.key.clone(), s.value.clone()))
+        .collect()
 }
 
 /// 停用着、这个进程里还没编过的插件（见 [`Plugins::build`]）。**跑不了任何钩子**（
@@ -409,6 +478,7 @@ fn placeholder(id: &str) -> Manifest {
         permissions: Vec::new(),
         requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
         scope: Scope::default(),
+        on_error: tw_api::OnError::Reject,
         reply_mode: tw_api::ReplyMode::Block,
         settings: Vec::new(),
         hooks: Default::default(),
@@ -450,65 +520,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes).into())
 }
 
-fn scope_of(s: &tw_config::PluginScope) -> Scope {
-    Scope {
-        clients: s.clients.clone(),
-        models: s.models.clone(),
-        upstreams: s.upstreams.clone(),
-    }
-}
-
 fn not_located() -> Msg {
     msg!(
         "gw.plugin.not_located" =>
         "The plugin files cannot be found: the gateway has not been told where its configuration \
          lives."
-    )
-}
-
-/// 交给插件的设置：manifest 的默认值，配置里写了的盖上去。**键和类型都要对得上**：
-/// 插件没声明的键、类型不对的值，都是错 —— 悄悄丢掉的话，用户改的设置看着在，其实
-/// 不起作用。
-pub fn settings_of<V: serde::Serialize>(
-    m: &Manifest,
-    configured: &BTreeMap<String, V>,
-) -> Result<serde_json::Map<String, serde_json::Value>, Msg> {
-    if let Some(key) = configured
-        .keys()
-        .find(|k| !m.settings.iter().any(|s| &s.key == *k))
-    {
-        return Err(msg!(
-            "gw.plugin.setting_unknown", key = key =>
-            "Setting `{key}` is not one the plugin declares."
-        ));
-    }
-    let mut out = serde_json::Map::new();
-    for spec in &m.settings {
-        let value = match configured.get(&spec.key) {
-            None => spec.default.clone(),
-            Some(v) => {
-                let v = serde_json::to_value(v).unwrap_or(serde_json::Value::Null);
-                if !fits(spec.kind, &v) {
-                    return Err(msg!(
-                        "gw.plugin.setting_type", key = &spec.key, kind = spec.kind.slug() =>
-                        "Setting `{key}` has to be a {kind}."
-                    ));
-                }
-                v
-            }
-        };
-        out.insert(spec.key.clone(), value);
-    }
-    Ok(out)
-}
-
-/// 这个值是不是这种设置的类型
-pub fn fits(kind: tw_api::SettingKind, v: &serde_json::Value) -> bool {
-    matches!(
-        (kind, v),
-        (tw_api::SettingKind::String, serde_json::Value::String(_))
-            | (tw_api::SettingKind::Number, serde_json::Value::Number(_))
-            | (tw_api::SettingKind::Boolean, serde_json::Value::Bool(_))
     )
 }
 
@@ -555,8 +571,8 @@ mod tests {
     fn add_date() -> String {
         source(
             json!({"name": "附加日期", "api": 1, "permissions": ["system"],
-                   "settings": {"note": {"type": "string", "label": "附加内容", "default": "今天"},
-                                "days": {"type": "number", "label": "天数", "default": 1}}}),
+                   "settings": {"note": {"type": "string", "label": "附加内容", "value": "今天"},
+                                "days": {"type": "number", "label": "天数", "value": 1}}}),
             &["onRequest"],
         )
     }
@@ -586,9 +602,6 @@ mod tests {
                 file: tw_config::Plugin::file_for(id),
                 sha256: sha256_hex(src.as_bytes()),
                 enabled: true,
-                on_error: tw_config::PluginOnError::Reject,
-                scope: Default::default(),
-                settings: Default::default(),
             }
         }
         fn build(&self, plugins: Vec<tw_config::Plugin>) -> PluginSet {
@@ -697,9 +710,6 @@ mod tests {
                 file: "plugins/a.js".into(),
                 sha256: "0".repeat(64),
                 enabled: true,
-                on_error: Default::default(),
-                scope: Default::default(),
-                settings: Default::default(),
             }],
             ..Default::default()
         });
@@ -709,36 +719,74 @@ mod tests {
         assert_eq!(m.code, "gw.plugin.not_located");
     }
 
+    /// 出错时怎么办、范围、设置的值都是插件文件里写着的
     #[test]
-    fn settings_have_to_be_declared_and_of_their_type() {
+    fn on_error_scope_and_settings_come_from_the_file() {
         let bed = Bed::new();
-        let mut p = bed.install("add-date", &add_date());
-        p.settings.insert("note".into(), "明天".into());
-        p.settings.insert("days".into(), 3.into());
-        let set = bed.build(vec![p.clone()]);
+        let src = source(
+            json!({"name": "附加日期", "api": 1, "permissions": ["system"],
+                   "match": {"models": ["claude-*"], "upstreams": ["relay"]},
+                   "on_error": "skip",
+                   "settings": {"note": {"type": "string", "label": "附加内容", "value": "明天"},
+                                "days": {"type": "number", "label": "天数"}}}),
+            &["onRequest"],
+        );
+        let set = bed.build(vec![bed.install("add-date", &src)]);
         let a = set.get("add-date").unwrap();
         assert!(a.ready().is_some(), "{:?}", a.state);
+        assert_eq!(a.on_error, tw_api::OnError::Skip);
+        assert_eq!(a.scope.models, ["claude-*"]);
+        assert_eq!(a.scope.upstreams, ["relay"]);
         assert_eq!(a.settings["note"], json!("明天"));
-        assert_eq!(a.settings["days"], json!(3));
+        assert_eq!(a.settings["days"], json!(0));
+    }
 
-        let mut wrong = p.clone();
-        wrong.settings.insert("days".into(), "three".into());
-        let set = bed.build(vec![wrong]);
-        let Some(Broken::Error(m)) = set.get("add-date").unwrap().broken() else {
-            panic!("a string ran as a number");
-        };
-        assert_eq!(
-            (m.code.as_str(), m.arg("kind")),
-            ("gw.plugin.setting_type", "number")
+    /// 编不出来（运行时起不来）：出错时怎么办和范围照批准的那份字节里写着的读，不编也读得
+    /// 出来 —— 不因为编不了就变成「什么都管、一律拒绝」。文件变了时照底稿里的
+    #[test]
+    fn a_plugin_that_does_not_compile_keeps_the_on_error_and_scope_its_file_declares() {
+        let bed = Bed::new();
+        let src = source(
+            json!({"name": "x", "api": 1, "permissions": ["system"],
+                   "match": {"models": ["gpt-*"]}, "on_error": "skip"}),
+            &["onRequest"],
         );
+        let p = bed.install("x", &src);
+        bed.plugins
+            .set_engine(Arc::new(crate::plugin::Unavailable::default()));
+        let set = bed.build(vec![p.clone()]);
+        let a = set.get("x").unwrap();
+        assert!(
+            matches!(a.broken(), Some(Broken::Error(_))),
+            "{:?}",
+            a.state
+        );
+        assert!(a.manifest.is_none());
+        assert_eq!(a.on_error, tw_api::OnError::Skip);
+        assert_eq!(a.scope.models, ["gpt-*"]);
 
-        let mut unknown = p;
-        unknown.settings.insert("colour".into(), "red".into());
-        let set = bed.build(vec![unknown]);
-        let Some(Broken::Error(m)) = set.get("add-date").unwrap().broken() else {
-            panic!("an undeclared setting ran");
-        };
-        assert_eq!(m.code, "gw.plugin.setting_unknown");
+        // 文件被改了：照底稿（批准的那一份）
+        std::fs::write(
+            tw_config::plugins::file_path(bed.dir.path(), "x"),
+            "export const manifest = { on_error: \"reject\" };",
+        )
+        .unwrap();
+        let set = bed.build(vec![p.clone()]);
+        let a = set.get("x").unwrap();
+        assert_eq!(a.broken(), Some(&Broken::Changed));
+        assert_eq!(a.on_error, tw_api::OnError::Skip);
+        assert_eq!(a.scope.models, ["gpt-*"]);
+
+        // 底稿也对不上：说不出来，按出厂的
+        std::fs::write(
+            tw_config::plugins::approved_path(bed.dir.path(), "x"),
+            "export const manifest = { on_error: \"skip\" };",
+        )
+        .unwrap();
+        let set = bed.build(vec![p]);
+        let a = set.get("x").unwrap();
+        assert_eq!(a.on_error, tw_api::OnError::Reject);
+        assert_eq!(a.scope, Scope::default());
     }
 
     /// 计数和日志跨重载：改设置、批准文件不该把「跑了多少次」清零；删掉的插件跟着走
@@ -871,6 +919,26 @@ mod tests {
         assert_eq!(a.name, "附加日期");
         assert_eq!(a.permissions, [tw_api::Permission::System]);
         assert_eq!(a.settings["note"], json!("今天"));
+    }
+
+    /// 休眠的插件、缓存里没有：只有 id，可出错时怎么办和范围照文件里写着的说得出来
+    #[test]
+    fn a_dormant_plugin_without_a_cached_manifest_still_shows_its_on_error_and_scope() {
+        let bed = Bed::new();
+        let src = source(
+            json!({"name": "x", "api": 1, "permissions": ["system"],
+                   "match": {"clients": ["codex"]}, "on_error": "skip"}),
+            &["onRequest"],
+        );
+        let engine = Arc::new(Counting(Default::default()));
+        bed.plugins.set_engine(engine.clone());
+        let set = bed.build(vec![off(bed.install("x", &src))]);
+        assert_eq!(engine.count(), 0);
+        let a = set.get("x").unwrap();
+        assert!(a.ready().unwrap().dormant());
+        assert!(a.manifest.is_none());
+        assert_eq!(a.on_error, tw_api::OnError::Skip);
+        assert_eq!(a.scope.clients, ["codex"]);
     }
 
     /// 有一个开着，运行时反正要起：全都编，停用的也编（缓存跟着补齐）

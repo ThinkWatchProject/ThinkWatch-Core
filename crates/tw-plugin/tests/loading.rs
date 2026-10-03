@@ -171,7 +171,7 @@ fn manifests_that_break_the_rules_are_load_errors() {
                 &format!(
                     r#"{{ name: "x", api: 1, permissions: ["system"], settings: {{ {} }} }}"#,
                     (0..21)
-                        .map(|i| format!(r#"s{i}: {{ type: "string", label: "s", default: "" }}"#))
+                        .map(|i| format!(r#"s{i}: {{ type: "string", label: "s", value: "" }}"#))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -181,14 +181,21 @@ fn manifests_that_break_the_rules_are_load_errors() {
         (
             "a setting of an unknown type",
             plugin(
-                r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "file", label: "a", default: "" } } }"#,
+                r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "file", label: "a", value: "" } } }"#,
                 ON_REQUEST,
             ),
         ),
         (
-            "a default that does not match its type",
+            "a value that does not match its type",
             plugin(
-                r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "number", label: "a", default: "八" } } }"#,
+                r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "number", label: "a", value: "八" } } }"#,
+                ON_REQUEST,
+            ),
+        ),
+        (
+            "an unknown on_error",
+            plugin(
+                r#"{ name: "x", api: 1, permissions: ["system"], on_error: "retry" }"#,
                 ON_REQUEST,
             ),
         ),
@@ -224,6 +231,129 @@ fn manifests_that_break_the_rules_are_load_errors() {
         assert!(t.elapsed() < BOUND);
         assert!(r.is_err(), "{what}: loaded");
     }
+}
+
+// ── manifest 是纯数据（契约附录四）────────────────────────────────────
+
+/// 写成表达式、函数调用、引用的 manifest 加载不了，说得出在哪一行哪一列 —— 哪怕它求值
+/// 出来是一份合规矩的 manifest
+#[test]
+fn a_manifest_that_is_not_plain_data_does_not_load_and_says_where() {
+    let cases: &[(&str, &str, u32, u32)] = &[
+        (
+            "export const manifest = {\n  name: \"x\" + \"y\",\n  api: 1,\n  permissions: [\"system\"],\n};\n",
+            "expression",
+            2,
+            13,
+        ),
+        (
+            "const NAME = \"x\";\nexport const manifest = { name: NAME, api: 1, permissions: [\"system\"] };\n",
+            "refers to a variable",
+            2,
+            33,
+        ),
+        (
+            "export const manifest = { name: \"x\", api: 1, permissions: [\"system\"], description: `${1}` };\n",
+            "${",
+            1,
+            85,
+        ),
+        (
+            "export const manifest = { name: \"x\", api: 1, permissions: [\"system\"], get description() { return \"d\"; } };\n",
+            "getter",
+            1,
+            71,
+        ),
+        (
+            "export const manifest = { name: \"x\", api: 1, permissions: [\"system\"].concat([]) };\n",
+            "expression",
+            1,
+            69,
+        ),
+    ];
+    for (head, says, line, column) in cases {
+        let src = format!("{head}{ON_REQUEST}\n");
+        match load_err(src.as_bytes()) {
+            LoadError::NotData {
+                message,
+                line: l,
+                column: c,
+            } => {
+                assert!(message.contains(says), "{src}\n=> {message}");
+                assert_eq!((l, c), (Some(*line), Some(*column)), "{src}\n=> {message}");
+            }
+            e => panic!("{src}\n=> {e:?}"),
+        }
+    }
+    // 别的写法认不出来：说清该怎么写
+    let src = format!(
+        "const manifest = {{ name: \"x\", api: 1, permissions: [\"system\"] }};\nexport {{ manifest }};\n{ON_REQUEST}\n"
+    );
+    match load_err(src.as_bytes()) {
+        LoadError::NotData { message, line, .. } => {
+            assert!(message.contains("export const manifest"), "{message}");
+            assert_eq!(line, None);
+        }
+        e => panic!("{e:?}"),
+    }
+    still_fine();
+}
+
+/// 模块顶层改了 manifest（多要一个权限、换一个值）：求值出来的和写着的对不上，不认
+#[test]
+fn a_manifest_changed_by_the_module_after_declaring_it_does_not_load() {
+    for change in [
+        "manifest.permissions.push(\"params\");",
+        "manifest.name = \"other\";",
+        "Object.defineProperty(manifest, \"description\", { value: \"d\", enumerable: true });",
+        "manifest.settings.a.value = \"changed\";",
+    ] {
+        let src = format!(
+            "export const manifest = {{ name: \"x\", api: 1, permissions: [\"system\"], settings: {{ a: {{ type: \"string\", value: \"v\" }} }} }};\n{change}\n{ON_REQUEST}\n"
+        );
+        match rt().load(src.as_bytes()) {
+            Err(LoadError::NotData { message, line, .. }) => {
+                assert!(
+                    message.contains("changes the manifest"),
+                    "{change}: {message}"
+                );
+                assert_eq!(line, None);
+            }
+            Err(e) => panic!("{change}: {e:?}"),
+            Ok(_) => panic!("{change}: loaded"),
+        }
+    }
+    // 冻住它、读它都没关系
+    let p = load_source(&format!(
+        "export const manifest = {{ name: \"x\", api: 1, permissions: [\"system\"] }};\nObject.freeze(manifest);\nconst n = manifest.name;\n{ON_REQUEST}\n"
+    ));
+    assert_eq!(p.manifest().name, "x");
+}
+
+/// 读出来的值就是写着的：出错时怎么办、范围、设置的值
+#[test]
+fn on_error_scope_and_values_come_from_the_file() {
+    let p = load_source(&plugin(
+        r#"{
+  name: "x",
+  api: 1,
+  permissions: ["system"],
+  match: { clients: [], models: ["claude-*"], upstreams: ["relay"] },
+  on_error: "skip",
+  settings: {
+    note: { type: "string", label: "Note", value: "今天" },
+    days: { type: "number", label: "Days", value: 2.5 },
+    loud: { type: "boolean", label: "Loud" },
+  },
+}"#,
+        ON_REQUEST,
+    ));
+    let m = p.manifest();
+    assert_eq!(m.on_error, tw_plugin::OnError::Skip);
+    assert_eq!(m.scope.models, ["claude-*"]);
+    assert_eq!(m.scope.upstreams, ["relay"]);
+    let values: Vec<_> = m.settings.iter().map(|s| s.value.clone()).collect();
+    assert_eq!(values, [json!("今天"), json!(2.5), json!(false)]);
 }
 
 // ── 处理哪几种请求（`requests`）─────────────────────────────────────

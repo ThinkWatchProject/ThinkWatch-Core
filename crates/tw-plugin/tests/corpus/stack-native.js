@@ -5,7 +5,7 @@ export const manifest = {
   name: "引擎内部深递归",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "parse" } },
+  settings: { kind: { type: "string", label: "方式", value: "parse" } },
 };
 
 const DEPTH = 1000000;

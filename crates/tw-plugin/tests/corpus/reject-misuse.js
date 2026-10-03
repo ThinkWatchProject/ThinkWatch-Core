@@ -8,7 +8,7 @@ export const manifest = {
   name: "滥用 reject",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "huge" } },
+  settings: { kind: { type: "string", label: "方式", value: "huge" } },
 };
 
 export function onRequest(req, ctx) {

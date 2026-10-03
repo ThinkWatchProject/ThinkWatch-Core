@@ -13,8 +13,11 @@
 //! **manifest 里给人看的字（名字、说明、设置项的标签）一律写英文**：桌面端按插件 id 和
 //! 设置项的键换成界面的语言，表里没有的照这里的英文显示。
 //!
-//! **装上它们不起运行时**：它们装上时都停用着，而沙箱一起来就是几 MB 常驻内存。装上要的
-//! 范围、设置的默认值，显示要的名字和权限，都从 `manifests.json` 里读 —— 那是测试照真的
+//! **manifest 写成 core 改写它时的样子**（`tw_plugin::literal::write`）：出错时怎么办、范围、
+//! 设置的值都在文件里，用户在界面上改一个设置，文件里只有那一行变。
+//!
+//! **装上它们不起运行时**：它们装上时都停用着，而沙箱一起来就是几 MB 常驻内存。显示要的
+//! 名字、权限、范围和设置，都从 `manifests.json` 里读 —— 那是测试照真的
 //! 沙箱把每一个编一遍生成的（[`manifest`]）。**改了哪个 `.js` 就重新生成一次**：
 //! `UPDATE_DEFAULT_MANIFESTS=1 cargo test -p tw-gateway --lib plugin::defaults`，不然测试
 //! 不过；生成的那一份对不上源码时，管理面退回到真的编一遍。
@@ -132,6 +135,38 @@ mod tests {
                 assert!(!cjk(&text), "{id}: the {what} is not in English: {text:?}");
             }
         }
+    }
+
+    /// manifest 写成 core 改写它时的样子：改一个设置，文件里只有那一行变
+    #[test]
+    fn every_manifest_is_written_the_way_core_writes_it() {
+        for (id, source) in ALL {
+            let lit = tw_plugin::literal::find(source).unwrap_or_else(|e| panic!("{id}: {e}"));
+            let canonical = tw_plugin::literal::replace(source, &lit, &lit.data);
+            assert!(
+                canonical == *source,
+                "{id}: the manifest is not written the way core writes it:\n{canonical}"
+            );
+        }
+        let (_, src) = ALL.iter().find(|(id, _)| *id == "reply-language").unwrap();
+        let out = crate::plugin::source::rewrite(
+            src,
+            tw_api::OnError::Reject,
+            &tw_api::PluginScope::default(),
+            &std::collections::BTreeMap::from([(
+                "language".to_string(),
+                tw_api::SettingValue::String("English".into()),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(src.lines().count(), out.lines().count(), "{out}");
+        let changed: Vec<_> = src
+            .lines()
+            .zip(out.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert!(changed[0].1.contains("value: \"English\""), "{changed:?}");
     }
 
     /// 每一个都在真的沙箱里编得成：装不上的默认插件只会在日志里留一行

@@ -5,7 +5,7 @@ export const manifest = {
   name: "奇怪的异常",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "抛出什么", default: "string" } },
+  settings: { kind: { type: "string", label: "抛出什么", value: "string" } },
 };
 
 export function onRequest(req, ctx) {

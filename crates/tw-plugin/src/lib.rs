@@ -14,6 +14,8 @@
 //! 别放在异步运行时的工作线程上。线程栈要有 2 MiB 以上（wasm 自己最多用 1 MiB）。
 //!
 //! 这个 crate 只管「跑」：视图怎么构造、权限怎么裁、改动怎么写回，都在 tw-gateway。
+//! 另有一样和运行无关、但属于插件约定的：manifest 是插件文件里的一段**纯数据**字面量，
+//! 读它、改它（出错时怎么办、范围、设置的值）而文件别的字节一个不动，见 [`literal`]。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -26,6 +28,7 @@ use wasmtime::{Engine, InstancePre, Module};
 
 mod cpu;
 mod engine;
+pub mod literal;
 mod manifest;
 mod sandbox;
 mod ticker;
@@ -182,6 +185,14 @@ pub enum LoadError {
     Manifest(String),
     #[error("the plugin is written for plugin API {0}; this version supports API 1")]
     UnsupportedApi(u32),
+    /// manifest 不是纯数据（表达式、函数调用、getter……，见 [`literal`]），或者模块代码
+    /// 改了它、求值出来的和源码里写的对不上。说得出位置时带着行列（从 1 起）
+    #[error("{message}")]
+    NotData {
+        message: String,
+        line: Option<u32>,
+        column: Option<u32>,
+    },
     #[error("the sandbox failed: {0}")]
     Engine(String),
 }
@@ -202,6 +213,8 @@ pub struct Manifest {
     /// 插件处理哪几种请求（清单里的 `requests`）。没写是只有对话
     pub requests: BTreeSet<RequestKind>,
     pub scope: Scope,
+    /// 出错时（运行出错、文件变了、加载不了）它管的请求怎么办。没写是拒绝
+    pub on_error: OnError,
     pub reply_mode: ReplyMode,
     /// 按作者写的先后
     pub settings: Vec<SettingSpec>,
@@ -315,6 +328,35 @@ pub struct Scope {
     pub upstreams: Vec<String>,
 }
 
+/// 插件出错（运行出错、文件变了、加载不了）时，它管的请求怎么办（manifest 的 `on_error`）
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OnError {
+    /// 拒绝这个请求。不写就是它：插件管不了的请求不该悄悄照原样发出去
+    #[default]
+    Reject,
+    /// 跳过这个插件，请求照常
+    Skip,
+}
+
+impl OnError {
+    /// manifest 里的写法
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnError::Reject => "reject",
+            OnError::Skip => "skip",
+        }
+    }
+
+    pub fn from_manifest(s: &str) -> Option<OnError> {
+        [OnError::Reject, OnError::Skip]
+            .into_iter()
+            .find(|o| o.as_str() == s)
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -330,8 +372,8 @@ pub struct SettingSpec {
     pub key: String,
     pub kind: SettingKind,
     pub label: String,
-    /// 和 `kind` 同类型的值；清单没写就是 `""` / `0` / `false`
-    pub default: Value,
+    /// 此刻的值（清单里的 `value`），和 `kind` 同类型；没写就是 `""` / `0` / `false`
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -453,7 +495,7 @@ impl Runtime {
             Err(d) => return Err(syntax(d)),
         };
         drop(sb);
-        let manifest = manifest::parse(&info)?;
+        let manifest = manifest::parse(&info, |evaluated| same_as_written(text, evaluated))?;
 
         let plugin = Plugin {
             inner: Arc::new(PluginInner {
@@ -845,6 +887,26 @@ pub fn js_equal(a: &Value, b: &Value) -> bool {
 }
 
 // ── 杂项 ─────────────────────────────────────────────────────────
+
+/// manifest 得是源码里写着的那一段纯数据，沙箱求值出来的也得正好是它：模块顶层改了
+/// manifest（加一个权限、换一个值）的不认 —— 界面改的是写着的那一份，跑起来的就得是它
+fn same_as_written(text: &str, evaluated: &Value) -> Result<(), LoadError> {
+    let lit = literal::find(text).map_err(|e| LoadError::NotData {
+        message: e.message,
+        line: e.line,
+        column: e.column,
+    })?;
+    if !js_equal(&lit.data.to_json(), evaluated) {
+        return Err(LoadError::NotData {
+            message: "the module's code changes the manifest after declaring it; the manifest \
+                      has to stay exactly as it is written"
+                .into(),
+            line: None,
+            column: None,
+        });
+    }
+    Ok(())
+}
 
 fn to_json(v: &Value) -> Vec<u8> {
     // serde_json::Value 的键都是字符串，序列化不会失败

@@ -15,7 +15,10 @@
 //
 // 权限：messages（对话历史），reply.tool_calls（回答里的工具调用）。reply.tool_calls 是
 // 高风险权限：插件能改动模型要执行的操作；改过的工具调用照样经过 Lite 的工具调用审查。
-// 设置：客户端运行在 Windows 上（关闭时按客户端在 WSL 里处理）。
+// 设置：客户端运行在 Windows 上（关闭时按客户端在 WSL 里处理）。出错时拒绝这个请求。
+//
+// manifest 是纯数据，写成 core 改写它时的样子：界面改设置时只换这一段，改出来的和原来
+// 只差改了的那一行。
 //
 // 给人看的文字（名字、说明、设置项的标签）一律英文：界面按插件 id 和设置项的键换成用户
 // 的语言。
@@ -23,14 +26,14 @@
 export const manifest = {
   name: "Convert WSL and Windows paths",
   api: 1,
-  description:
-    "Rewrites drive paths in tool-call arguments to the form the client can open (WSL /mnt/c/… or Windows C:\\…), in answers and in the conversation history.",
+  description: "Rewrites drive paths in tool-call arguments to the form the client can open (WSL /mnt/c/… or Windows C:\\…), in answers and in the conversation history.",
   permissions: ["messages", "reply.tool_calls"],
+  on_error: "reject",
   settings: {
     windows_client: {
       type: "boolean",
       label: "The client runs on Windows (otherwise WSL)",
-      default: false,
+      value: false,
     },
   },
 };

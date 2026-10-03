@@ -62,11 +62,9 @@ config.failover_range
 config.name_collision
 config.no_clients
 config.plugin.bad_id
-config.plugin.blank_pattern
 config.plugin.duplicate
 config.plugin.file
 config.plugin.reserved_id
-config.plugin.setting_type
 config.plugin.sha256
 config.rejected
 config.rejected_at
@@ -288,6 +286,8 @@ gw.plugin.engine
 gw.plugin.failed
 gw.plugin.file_changed
 gw.plugin.manifest
+gw.plugin.manifest_not_data
+gw.plugin.manifest_not_data_at
 gw.plugin.memory_limit
 gw.plugin.model_not_allowed
 gw.plugin.not_applicable

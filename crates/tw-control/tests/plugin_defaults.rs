@@ -7,6 +7,9 @@
 //!
 //! 还有**不起运行时**这一条：装默认插件、列出停用的插件都不编（数着引擎编了几次），
 //! 显示用的 manifest 缓存被人改了也骗不过「打开工具调用插件要点头」那道关。
+//!
+//! 插件的配置（出错时怎么办、范围、设置的值）在插件文件里：用户在界面上改它们是只改数据，
+//! 默认插件照样算没动过代码，出了新版照样换，改过的数据带过去。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,18 +111,31 @@ impl Bed {
             .cloned()
             .unwrap_or_else(|| panic!("no plugin {id}: {v}"))
     }
-    /// 开着、出错时跳过、范围和设置都改过 —— 用户用过一阵子的样子
-    async fn customize(&self, id: &str, settings: Value) {
+    /// 开着、出错时跳过、范围和设置都改过 —— 用户用过一阵子的样子。都写在插件文件里：
+    /// 改写、点过头保存（打开它）
+    async fn customize(&self, id: &str, settings: Value) -> String {
+        let src = self.read(self.file(id));
+        let (st, v) = call(
+            &self.app,
+            "POST",
+            "/plugins/rewrite",
+            Some(json!({"source": src, "on_error": "skip",
+                        "scope": {"clients": [], "models": ["deepseek-chat"], "upstreams": []},
+                        "settings": settings})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let custom = v["source"].as_str().unwrap().to_string();
         let (st, v) = call(
             &self.app,
             "PUT",
             &format!("/plugins/{id}/confirmed"),
-            Some(json!({"enabled": true, "on_error": "skip",
-                        "scope": {"clients": [], "models": ["deepseek-chat"], "upstreams": []},
-                        "settings": settings, "base_version": self.version().await})),
+            Some(json!({"source": custom, "enabled": true,
+                        "base_version": self.version().await})),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
+        custom
     }
 }
 
@@ -202,13 +218,13 @@ fn sha(s: &str) -> String {
     tw_gateway::plugin::load::sha256_hex(s.as_bytes())
 }
 
-/// 第一版：改系统指令，两项设置，其中一项默认值有两行；只管 deepseek 开头的模型
+/// 第一版：改系统指令，两项设置，其中一项的值有两行；只管 deepseek 开头的模型
 fn alpha() -> String {
     source(
         json!({"name": "Alpha", "api": 1, "description": "first",
                "permissions": ["system"], "match": {"models": ["deepseek*"]},
-               "settings": {"lang": {"type": "string", "label": "语言", "default": "简体中文"},
-                            "terms": {"type": "string", "label": "对照表", "default": "登陆=登录\n帐号=账号"}}}),
+               "settings": {"lang": {"type": "string", "label": "语言", "value": "简体中文"},
+                            "terms": {"type": "string", "label": "对照表", "value": "登陆=登录\n帐号=账号"}}}),
         &["onRequest"],
     )
 }
@@ -218,8 +234,8 @@ fn alpha_v2() -> String {
     source(
         json!({"name": "Alpha", "api": 1, "description": "second",
                "permissions": ["system"], "match": {"models": ["deepseek*"]},
-               "settings": {"lang": {"type": "string", "label": "语言", "default": "English"},
-                            "count": {"type": "number", "label": "次数", "default": 3}}}),
+               "settings": {"lang": {"type": "string", "label": "语言", "value": "English"},
+                            "count": {"type": "number", "label": "次数", "value": 3}}}),
         &["onRequest"],
     )
 }
@@ -229,7 +245,7 @@ fn alpha_v3() -> String {
     source(
         json!({"name": "Alpha", "api": 1, "description": "third",
                "permissions": ["system", "messages"], "match": {"models": ["deepseek*"]},
-               "settings": {"lang": {"type": "string", "label": "语言", "default": "简体中文"}}}),
+               "settings": {"lang": {"type": "string", "label": "语言", "value": "简体中文"}}}),
         &["onRequest"],
     )
 }
@@ -249,8 +265,8 @@ fn ids(v: &[String]) -> Vec<&str> {
     v.iter().map(String::as_str).collect()
 }
 
-/// 第一次：文件、底稿、配置里一条（停用、出错时拒绝、范围照 manifest、设置都是默认值），
-/// 记录里记着给出去的哈希。再走一遍什么都不做
+/// 第一次：文件、底稿（出错时怎么办、范围、设置都是发出去的那份文件写的），配置里一条
+/// （停用，只有四样），记录里记着给出去的哈希。再走一遍什么都不做
 #[tokio::test]
 async fn the_first_run_adds_every_default_turned_off() {
     let b = bed();
@@ -273,21 +289,10 @@ async fn the_first_run_adds_every_default_turned_off() {
     }
     let p = b.entry("alpha").unwrap();
     assert!(!p.enabled);
-    assert_eq!(p.on_error, tw_config::PluginOnError::Reject);
-    assert_eq!(p.scope.models, ["deepseek*"]);
     assert_eq!(p.sha256, sha(&a));
-    assert_eq!(p.settings["lang"], serde_yaml_ng::Value::from("简体中文"));
-    // 两行的默认值照样写进去：一行双引号，读回来一字不差
-    assert_eq!(
-        p.settings["terms"],
-        serde_yaml_ng::Value::from("登陆=登录\n帐号=账号")
-    );
-    assert!(
-        b.config()
-            .contains("      terms: \"登陆=登录\\n帐号=账号\"\n"),
-        "{}",
-        b.config()
-    );
+    for gone in ["on_error:", "scope:", "settings:"] {
+        assert!(!b.config().contains(gone), "{gone}\n{}", b.config());
+    }
     assert!(b.config().contains("# 默认那把"), "{}", b.config());
     assert_eq!(b.offered(), json!({"alpha": sha(&a), "beta": sha(&c)}));
 
@@ -295,6 +300,11 @@ async fn the_first_run_adds_every_default_turned_off() {
     let v = b.plugin("alpha").await;
     assert_eq!(v["status"], json!({"kind": "disabled"}));
     assert_eq!(v["name"], "Alpha");
+    assert_eq!(v["on_error"], "reject");
+    assert_eq!(v["scope"]["models"], json!(["deepseek*"]));
+    assert_eq!(v["settings_schema"][0]["value"], "简体中文");
+    // 两行的值原样读得出来
+    assert_eq!(v["settings_schema"][1]["value"], "登陆=登录\n帐号=账号");
     assert!(
         b.gw.runtime()
             .plugins
@@ -372,7 +382,7 @@ async fn a_default_the_user_changed_is_left_alone() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    // gamma：换了一份源码
+    // gamma：换了一份源码（改了代码）
     let replaced = source(
         json!({"name": "Mine", "api": 1, "permissions": ["reply.text"]}),
         &["onReplyText"],
@@ -380,8 +390,8 @@ async fn a_default_the_user_changed_is_left_alone() {
     let (st, v) = call(
         &b.app,
         "PUT",
-        "/plugins/gamma/source",
-        Some(json!({"source": replaced})),
+        "/plugins/gamma",
+        Some(json!({"source": replaced, "enabled": false})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -413,15 +423,19 @@ async fn a_default_the_user_changed_is_left_alone() {
     );
 }
 
-/// 出了新版、用户没动过：文件、底稿、哈希换成新版；开关、出错时怎么办、范围、还声明着的
-/// 设置照旧，新声明的设置取默认值，不再声明的去掉
+/// 出了新版、用户只改过数据（出错时怎么办、范围、设置，都在插件文件里）：文件、底稿、哈希
+/// 换成新版的代码，用户写的数据带过去 —— 还声明着、类型没变的设置照旧，新声明的取新版写的值，
+/// 不再声明的去掉；开关照旧
 #[tokio::test]
 async fn a_new_version_replaces_an_untouched_default_and_keeps_its_settings() {
     let b = bed();
     let a = alpha();
     seeder(&[("alpha", &a)]).seed(&b.mgr).await;
-    b.customize("alpha", json!({"lang": "日本語", "terms": "a=b"}))
+    let custom = b
+        .customize("alpha", json!({"lang": "日本語", "terms": "a=b"}))
         .await;
+    // 只改了数据：记录跟着走，它照样是「没动过代码」的默认插件
+    assert_eq!(b.offered(), json!({"alpha": sha(&custom)}));
 
     let v2 = alpha_v2();
     let done = seeder(&[("alpha", &v2)]).seed(&b.mgr).await;
@@ -430,20 +444,39 @@ async fn a_new_version_replaces_an_untouched_default_and_keeps_its_settings() {
         done.disabled.is_empty() && done.failed.is_empty(),
         "{done:?}"
     );
-    assert_eq!(b.read(b.file("alpha")), v2);
-    assert_eq!(b.read(b.approved("alpha")), v2);
+    let file = b.read(b.file("alpha"));
+    assert!(
+        tw_gateway::plugin::source::same_code(file.as_bytes(), v2.as_bytes()),
+        "{file}"
+    );
+    assert_eq!(b.read(b.approved("alpha")), file);
     let p = b.entry("alpha").unwrap();
-    assert_eq!(p.sha256, sha(&v2));
+    assert_eq!(p.sha256, sha(&file));
     assert!(p.enabled);
-    assert_eq!(p.on_error, tw_config::PluginOnError::Skip);
-    assert_eq!(p.scope.models, ["deepseek-chat"]);
-    assert_eq!(p.settings["lang"], serde_yaml_ng::Value::from("日本語"));
-    assert_eq!(p.settings["count"], serde_yaml_ng::Value::from(3));
-    assert!(!p.settings.contains_key("terms"), "{:?}", p.settings);
-    assert_eq!(b.offered(), json!({"alpha": sha(&v2)}));
+    assert_eq!(b.offered(), json!({"alpha": sha(&file)}));
     let v = b.plugin("alpha").await;
     assert_eq!(v["status"], json!({"kind": "ok"}));
     assert_eq!(v["description"], "second");
+    assert_eq!(v["on_error"], "skip");
+    assert_eq!(v["scope"]["models"], json!(["deepseek-chat"]));
+    let values: Vec<(Value, Value)> = v["settings_schema"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["key"].clone(), s["value"].clone()))
+        .collect();
+    assert_eq!(
+        values,
+        [
+            (json!("count"), json!(3.0)),
+            (json!("lang"), json!("日本語"))
+        ]
+    );
+    // 再走一遍什么都不做
+    assert_eq!(
+        seeder(&[("alpha", &v2)]).seed(&b.mgr).await,
+        Seeded::default()
+    );
 }
 
 /// 新版已经换上了、记录却没写成（写记录那一步失败了）：补记一笔，别的什么都不动 ——
@@ -463,6 +496,7 @@ async fn a_lost_record_of_an_update_is_written_again_and_nothing_else_moves() {
     )
     .unwrap();
     let before = b.config();
+    let file = b.read(b.file("alpha"));
     let done = seeder(&[("alpha", &v2)]).seed(&b.mgr).await;
     assert_eq!(ids(&done.marked), ["alpha"], "{done:?}");
     assert!(
@@ -470,7 +504,8 @@ async fn a_lost_record_of_an_update_is_written_again_and_nothing_else_moves() {
         "{done:?}"
     );
     assert_eq!(b.config(), before);
-    assert_eq!(b.offered(), json!({"alpha": sha(&v2)}));
+    assert_eq!(b.read(b.file("alpha")), file);
+    assert_eq!(b.offered(), json!({"alpha": sha(&file)}));
     // 再出一版时照常更新
     let v4 = alpha_v2().replace("second", "fourth");
     let done = seeder(&[("alpha", &v4)]).seed(&b.mgr).await;
@@ -490,15 +525,16 @@ async fn a_new_version_that_wants_more_permissions_comes_back_turned_off() {
     let done = seeder(&[("alpha", &v3)]).seed(&b.mgr).await;
     assert_eq!(ids(&done.updated), ["alpha"], "{done:?}");
     assert_eq!(ids(&done.disabled), ["alpha"], "{done:?}");
+    let file = b.read(b.file("alpha"));
     let p = b.entry("alpha").unwrap();
-    assert_eq!(p.sha256, sha(&v3));
+    assert_eq!(p.sha256, sha(&file));
     assert!(!p.enabled);
-    assert_eq!(p.on_error, tw_config::PluginOnError::Skip);
-    assert_eq!(p.scope.models, ["deepseek-chat"]);
-    assert_eq!(p.settings["lang"], serde_yaml_ng::Value::from("日本語"));
     let v = b.plugin("alpha").await;
     assert_eq!(v["status"], json!({"kind": "disabled"}));
     assert_eq!(v["permissions"], json!(["system", "messages"]));
+    assert_eq!(v["on_error"], "skip");
+    assert_eq!(v["scope"]["models"], json!(["deepseek-chat"]));
+    assert_eq!(v["settings_schema"][0]["value"], "日本語");
 }
 
 /// 新版多处理了一种请求（`requests` 多了嵌入），权限一样：和多要一个权限一样，换上但
@@ -523,7 +559,7 @@ async fn a_new_version_that_handles_more_kinds_of_request_comes_back_turned_off(
     assert_eq!(ids(&done.updated), ["scrub"], "{done:?}");
     assert_eq!(ids(&done.disabled), ["scrub"], "{done:?}");
     let p = b.entry("scrub").unwrap();
-    assert_eq!(p.sha256, sha(&v2));
+    assert_eq!(p.sha256, sha(&b.read(b.file("scrub"))));
     assert!(!p.enabled);
     let v = b.plugin("scrub").await;
     assert_eq!(v["status"], json!({"kind": "disabled"}));
@@ -544,10 +580,7 @@ async fn a_user_plugin_that_has_a_default_id_is_untouched() {
         &b.app,
         "POST",
         "/plugins",
-        Some(
-            json!({"source": mine, "id": "alpha", "enabled": true, "on_error": "reject",
-                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}}),
-        ),
+        Some(json!({"source": mine, "id": "alpha", "enabled": true})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -704,8 +737,8 @@ async fn the_shipped_defaults_go_in_turned_off_without_starting_the_sandbox() {
         assert!(a.ready().unwrap().dormant(), "{id}");
     }
     assert_eq!(
-        b.plugin("reply-language").await["settings"],
-        json!({"language": "简体中文"})
+        b.plugin("reply-language").await["settings_schema"][0]["value"],
+        "简体中文"
     );
     assert_eq!(engine.count(), 0, "seeding or listing started the sandbox");
     assert_eq!(Seeder::shipped().seed(&b.mgr).await, Seeded::default());
@@ -727,13 +760,26 @@ async fn enabling_a_default_compiles_it_and_then_it_runs() {
     let b = bed_with("real", engine.clone());
     Seeder::shipped().seed(&b.mgr).await;
     assert_eq!(engine.count(), 0);
+    // 改写不起运行时：manifest 是纯数据
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/rewrite",
+        Some(
+            json!({"source": b.read(b.file("reply-language")), "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []},
+                    "settings": {"language": "English"}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(engine.count(), 0);
     let (st, v) = call(
         &b.app,
         "PUT",
         "/plugins/reply-language",
-        Some(json!({"enabled": true, "on_error": "reject",
-                    "scope": {"clients": [], "models": [], "upstreams": []},
-                    "settings": {"language": "English"}, "base_version": b.version().await})),
+        Some(json!({"source": v["source"], "enabled": true,
+                    "base_version": b.version().await})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -770,21 +816,18 @@ async fn enabling_a_default_compiles_it_and_then_it_runs() {
     }
 }
 
-/// 一个改得了工具调用的插件，装上时停用着
+/// 一个改得了工具调用的插件，装上时停用着（点过头的那条路）
 async fn install_calls(b: &Bed) -> String {
     let src = source(
         json!({"name": "改工具调用", "api": 1, "permissions": ["reply.tool_calls"],
-               "settings": {"mode": {"type": "string", "label": "方式", "default": "a"}}}),
+               "settings": {"mode": {"type": "string", "label": "方式", "value": "a"}}}),
         &["onToolCall"],
     );
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins",
-        Some(
-            json!({"source": src, "id": "calls", "enabled": false, "on_error": "reject",
-                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}}),
-        ),
+        "/plugins/confirmed",
+        Some(json!({"source": src, "id": "calls", "enabled": false})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -796,11 +839,11 @@ fn cache_file(b: &Bed) -> PathBuf {
 }
 
 /// 显示用的缓存被人改了（藏起了 reply_tool_calls）：列表上是改过的样子，可网页那条路照样
-/// 打不开它、改不了它的设置 —— 判断用的是真的编出来的 manifest
+/// 打不开它、改不了它的代码 —— 判断用的是真的编出来的 manifest
 #[tokio::test]
 async fn a_tampered_manifest_cache_cannot_hide_tool_calls_from_the_confirmation() {
     let b = bed();
-    install_calls(&b).await;
+    let src = install_calls(&b).await;
     let text = std::fs::read_to_string(cache_file(&b)).unwrap();
     assert!(text.contains("\"reply_tool_calls\""), "{text}");
     std::fs::write(
@@ -814,28 +857,28 @@ async fn a_tampered_manifest_cache_cannot_hide_tool_calls_from_the_confirmation(
     let v = again.plugin("calls").await;
     assert_eq!(v["permissions"], json!(["system"]), "{v}");
     assert_eq!(engine.count(), 0);
-    // 只改出错时怎么办：用不着判断，也就不编
-    let (st, v) = call(
-        &again.app,
-        "PUT",
-        "/plugins/calls",
-        Some(json!({"enabled": false, "on_error": "skip",
-                    "scope": {"clients": [], "models": [], "upstreams": []},
-                    "settings": {"mode": "a"}, "base_version": again.version().await})),
-    )
-    .await;
+    let save = |source: String, enabled: bool| {
+        let again = &again;
+        async move {
+            call(
+                &again.app,
+                "PUT",
+                "/plugins/calls",
+                Some(json!({"source": source, "enabled": enabled,
+                            "base_version": again.version().await})),
+            )
+            .await
+        }
+    };
+    // 只是停用（源码原样）：用不着判断，也就不编
+    let (st, v) = save(src.clone(), false).await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(engine.count(), 0, "an on_error change started the sandbox");
-    for (what, enabled, mode) in [("turning it on", true, "a"), ("a setting", false, "b")] {
-        let (st, v) = call(
-            &again.app,
-            "PUT",
-            "/plugins/calls",
-            Some(json!({"enabled": enabled, "on_error": "reject",
-                        "scope": {"clients": [], "models": [], "upstreams": []},
-                        "settings": {"mode": mode}, "base_version": again.version().await})),
-        )
-        .await;
+    assert_eq!(engine.count(), 0, "turning it off started the sandbox");
+    for (what, source, enabled) in [
+        ("turning it on", src.clone(), true),
+        ("a code change", format!("{src}// 多一行\n"), false),
+    ] {
+        let (st, v) = save(source, enabled).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {v}");
         assert_eq!(v["code"], "control.plugin.needs_confirmation", "{what}");
     }
@@ -845,14 +888,13 @@ async fn a_tampered_manifest_cache_cannot_hide_tool_calls_from_the_confirmation(
     );
     let p = again.entry("calls").unwrap();
     assert!(!p.enabled);
-    assert_eq!(p.settings["mode"], serde_yaml_ng::Value::from("a"));
+    assert_eq!(again.read(again.file("calls")), src);
     let (st, v) = call(
         &again.app,
         "PUT",
         "/plugins/calls/confirmed",
-        Some(json!({"enabled": true, "on_error": "reject",
-                    "scope": {"clients": [], "models": [], "upstreams": []},
-                    "settings": {"mode": "b"}, "base_version": again.version().await})),
+        Some(json!({"source": src, "enabled": true,
+                    "base_version": again.version().await})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -894,36 +936,117 @@ async fn a_cache_entry_that_does_not_match_is_ignored() {
     }
 }
 
-/// `wsl-paths` 改得了回答里的工具调用：网页那条路打不开它，确认过的那条打得开
+/// `wsl-paths` 改得了回答里的工具调用：网页那条路打不开它，确认过的那条打得开；改它的
+/// 设置是只改数据，网页那条路照收
 #[tokio::test]
 async fn wsl_paths_turns_on_only_with_a_confirmation() {
     let b = bed_in("real", false);
     Seeder::shipped().seed(&b.mgr).await;
-    // 只是打开：范围和设置都是装上时的那样
-    let body = |base: String| {
-        json!({"enabled": true, "on_error": "reject",
-               "scope": {"clients": [], "models": [], "upstreams": []},
-               "settings": {"windows_client": false}, "base_version": base})
-    };
+    let src = b.read(b.file("wsl-paths"));
+    let body = |source: &str, enabled: bool, base: String| json!({"source": source, "enabled": enabled, "base_version": base});
     let (st, v) = call(
         &b.app,
         "PUT",
         "/plugins/wsl-paths",
-        Some(body(b.version().await)),
+        Some(body(&src, true, b.version().await)),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["code"], "control.plugin.needs_confirmation");
     assert!(!b.entry("wsl-paths").unwrap().enabled);
 
+    // 停用着改设置：只改数据，照收；文件里只有那一行变了
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/rewrite",
+        Some(json!({"source": src, "on_error": "reject",
+                    "scope": {"clients": [], "models": [], "upstreams": []},
+                    "settings": {"windows_client": true}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let windows = v["source"].as_str().unwrap().to_string();
+    let changed: Vec<_> = src
+        .lines()
+        .zip(windows.lines())
+        .filter(|(a, b)| a != b)
+        .collect();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/plugins/wsl-paths",
+        Some(body(&windows, false, b.version().await)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.read(b.file("wsl-paths")), windows);
+    // 记录跟着走：它照样是没动过代码的默认插件
+    assert_eq!(b.offered()["wsl-paths"], sha(&windows));
+
     let (st, v) = call(
         &b.app,
         "PUT",
         "/plugins/wsl-paths/confirmed",
-        Some(body(b.version().await)),
+        Some(body(&windows, true, b.version().await)),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(b.entry("wsl-paths").unwrap().enabled);
-    assert_eq!(b.plugin("wsl-paths").await["status"], json!({"kind": "ok"}));
+    let v = b.plugin("wsl-paths").await;
+    assert_eq!(v["status"], json!({"kind": "ok"}));
+    assert_eq!(v["settings_schema"][0]["value"], true);
+}
+
+/// 0.58 装上的默认插件：文件是那时的写法（设置写的是 `default`），配置那一条还带着出错时
+/// 怎么办、范围和设置。新版来了照样换上：旧文件里没写明的数据不带过去（新版写的值留着，不会
+/// 变成空的）；开着的读不出旧版要什么权限，换上之后停用；配置那一条只剩四样
+#[tokio::test]
+async fn a_default_installed_by_0_58_is_updated_and_loses_its_old_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("old");
+    std::fs::create_dir_all(dir.join("plugins/.approved")).unwrap();
+    let old = "export const manifest = { name: \"Alpha\", api: 1, permissions: [\"system\"], settings: { lang: { type: \"string\", label: \"语言\", default: \"简体中文\" } } };\nexport function onRequest(x, ctx) {}\n";
+    std::fs::write(dir.join("plugins/alpha.js"), old).unwrap();
+    std::fs::write(dir.join("plugins/.approved/alpha.js"), old).unwrap();
+    std::fs::write(
+        record_path(&dir),
+        json!({"offered": {"alpha": sha(old)}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "{BASE}plugins:\n  - id: alpha\n    file: plugins/alpha.js\n    sha256: {}\n    enabled: true\n    on_error: skip\n    scope:\n      models: [\"gpt-*\"]\n    settings:\n      lang: 日本語\n",
+            sha(old)
+        ),
+    )
+    .unwrap();
+    let b = open(dir, Arc::new(FakeEngine));
+    // 旧的写法新版 core 编不了：照样列着，说为什么
+    let v = b.plugin("alpha").await;
+    assert_eq!(v["status"]["kind"], "error", "{v}");
+
+    let a = alpha();
+    let done = seeder(&[("alpha", &a)]).seed(&b.mgr).await;
+    assert_eq!(ids(&done.updated), ["alpha"], "{done:?}");
+    assert_eq!(ids(&done.disabled), ["alpha"], "{done:?}");
+    assert_eq!(b.read(b.file("alpha")), a);
+    assert_eq!(b.read(b.approved("alpha")), a);
+    let config = b.config();
+    for gone in ["on_error:", "scope:", "settings:"] {
+        assert!(!config.contains(gone), "{gone}\n{config}");
+    }
+    let p = b.entry("alpha").unwrap();
+    assert_eq!(p.sha256, sha(&a));
+    assert!(!p.enabled);
+    assert_eq!(b.offered(), json!({"alpha": sha(&a)}));
+    let v = b.plugin("alpha").await;
+    assert_eq!(v["status"], json!({"kind": "disabled"}));
+    assert_eq!(v["on_error"], "reject");
+    assert_eq!(v["scope"]["models"], json!(["deepseek*"]));
+    assert_eq!(v["settings_schema"][0]["value"], "简体中文");
+    drop(b);
+    drop(tmp);
 }

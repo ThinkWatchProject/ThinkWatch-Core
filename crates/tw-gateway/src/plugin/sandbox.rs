@@ -156,6 +156,15 @@ fn load_error(e: tw_plugin::LoadError) -> LoadError {
         },
         tw_plugin::LoadError::Manifest(d) => LoadError::Manifest(d),
         tw_plugin::LoadError::UnsupportedApi(api) => LoadError::UnsupportedApi(api),
+        tw_plugin::LoadError::NotData {
+            message,
+            line,
+            column,
+        } => LoadError::NotData {
+            message,
+            line,
+            column,
+        },
         tw_plugin::LoadError::Engine(d) => LoadError::Engine(d),
     }
 }
@@ -176,6 +185,13 @@ fn request_kind(k: tw_plugin::RequestKind) -> tw_api::RequestKind {
         tw_plugin::RequestKind::Conversation => tw_api::RequestKind::Conversation,
         tw_plugin::RequestKind::Embeddings => tw_api::RequestKind::Embeddings,
         tw_plugin::RequestKind::Completions => tw_api::RequestKind::Completions,
+    }
+}
+
+pub(crate) fn on_error(o: tw_plugin::OnError) -> tw_api::OnError {
+    match o {
+        tw_plugin::OnError::Reject => tw_api::OnError::Reject,
+        tw_plugin::OnError::Skip => tw_api::OnError::Skip,
     }
 }
 
@@ -202,6 +218,7 @@ fn manifest(m: &tw_plugin::Manifest) -> Manifest {
             models: m.scope.models.clone(),
             upstreams: m.scope.upstreams.clone(),
         },
+        on_error: on_error(m.on_error),
         reply_mode: match m.reply_mode {
             tw_plugin::ReplyMode::Block => tw_api::ReplyMode::Block,
             tw_plugin::ReplyMode::Stream => tw_api::ReplyMode::Stream,
@@ -217,7 +234,7 @@ fn manifest(m: &tw_plugin::Manifest) -> Manifest {
                     tw_plugin::SettingKind::Boolean => tw_api::SettingKind::Boolean,
                 },
                 label: s.label.clone(),
-                default: s.default.clone(),
+                value: s.value.clone(),
             })
             .collect(),
         hooks: Hooks {

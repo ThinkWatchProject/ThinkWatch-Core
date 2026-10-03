@@ -1,15 +1,18 @@
 //! **测试用的假引擎**：不跑 JavaScript，只照约定的写法读出 manifest 和导出了哪些钩子。
 //!
 //! 管理面的测试（装、换、批准、文件变了）要一个能「编译」的引擎，而真的沙箱编译慢、
-//! 还要 wasm 工具链。假引擎认的源码长这样 —— manifest 是**一行 JSON**：
+//! 还要 wasm 工具链。假引擎认的源码长这样：
 //!
 //! ```text
 //! export const manifest = {"name":"附加日期","api":1,"permissions":["system"]};
 //! export function onRequest(req, ctx) {}
 //! ```
 //!
-//! 校验照插件约定的那几条做（权限和钩子对得上、至少一个钩子、名字长度……），错了
-//! 给 [`LoadError::Manifest`]；有一行写着 `@@syntax@@` 的算语法错，行号就是那一行。
+//! manifest 照真的那一套读成纯数据（`tw_plugin::literal`，JSON 也是纯数据；改写过的、
+//! 排成多行的一样读得出来），不是纯数据就是 [`LoadError::NotData`]。导出了哪些钩子看有没有
+//! `export function 名字(` 这一段。校验照插件约定的那几条做（权限和钩子对得上、至少一个钩子、
+//! 名字长度……），错了给 [`LoadError::Manifest`]；有一行写着 `@@syntax@@` 的算语法错，行号
+//! 就是那一行。
 
 use std::sync::Arc;
 
@@ -68,7 +71,7 @@ impl Engine for FakeEngine {
     }
 }
 
-/// 一份假源码：manifest（一行 JSON）加上给定的钩子。
+/// 一份假源码：manifest（一行 JSON —— 也是纯数据）加上给定的钩子。
 pub fn source(manifest: serde_json::Value, hooks: &[&str]) -> String {
     let mut s = format!("export const manifest = {manifest};\n");
     for h in hooks {
@@ -82,14 +85,28 @@ fn bad(why: impl Into<String>) -> LoadError {
 }
 
 fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
-    const PREFIX: &str = "export const manifest = ";
-    let line = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix(PREFIX))
-        .ok_or_else(|| bad("the plugin does not export a manifest"))?;
-    let json = line.trim().trim_end_matches(';');
-    let m: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| bad(format!("the manifest is not valid: {e}")))?;
+    let lit = tw_plugin::literal::find(text).map_err(|e| LoadError::NotData {
+        message: e.message,
+        line: e.line,
+        column: e.column,
+    })?;
+    let m = lit.data.to_json();
+    for key in m.as_object().map(|o| o.keys()).into_iter().flatten() {
+        if !matches!(
+            key.as_str(),
+            "name"
+                | "api"
+                | "description"
+                | "permissions"
+                | "requests"
+                | "match"
+                | "on_error"
+                | "reply"
+                | "settings"
+        ) {
+            return Err(bad(format!("the manifest has an unknown field `{key}`")));
+        }
+    }
 
     let name = m["name"]
         .as_str()
@@ -137,6 +154,13 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
         return Err(bad("manifest.permissions cannot be empty"));
     }
     permissions.sort_by_key(|p| tw_api::Permission::ALL.iter().position(|x| x == p));
+
+    let on_error = match &m["on_error"] {
+        serde_json::Value::Null => tw_api::OnError::Reject,
+        serde_json::Value::String(s) if s == "reject" => tw_api::OnError::Reject,
+        serde_json::Value::String(s) if s == "skip" => tw_api::OnError::Skip,
+        _ => return Err(bad("`on_error` must be \"reject\" or \"skip\"")),
+    };
 
     let reply_mode = match m["reply"].as_str() {
         None | Some("block") => tw_api::ReplyMode::Block,
@@ -236,18 +260,31 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
     };
 
     let mut settings = Vec::new();
-    if let Some(obj) = m["settings"].as_object() {
+    if let tw_plugin::literal::Data::Object(obj) = lit
+        .data
+        .get("settings")
+        .unwrap_or(&tw_plugin::literal::Data::Null)
+    {
         if obj.len() > 20 {
             return Err(bad("a plugin has at most 20 settings"));
         }
+        // 按作者写的先后
         for (key, spec) in obj {
+            let spec = spec.to_json();
+            for f in spec.as_object().map(|o| o.keys()).into_iter().flatten() {
+                if !matches!(f.as_str(), "type" | "label" | "value") {
+                    return Err(bad(format!(
+                        "setting `{key}` has an unknown field `{f}`; it takes type, label and value"
+                    )));
+                }
+            }
             let kind = match spec["type"].as_str() {
                 Some("string") => tw_api::SettingKind::String,
                 Some("number") => tw_api::SettingKind::Number,
                 Some("boolean") => tw_api::SettingKind::Boolean,
                 _ => return Err(bad(format!("setting `{key}` has no valid type"))),
             };
-            let default = match (&kind, &spec["default"]) {
+            let value = match (&kind, &spec["value"]) {
                 (tw_api::SettingKind::String, serde_json::Value::Null) => "".into(),
                 (tw_api::SettingKind::Number, serde_json::Value::Null) => 0.into(),
                 (tw_api::SettingKind::Boolean, serde_json::Value::Null) => false.into(),
@@ -256,7 +293,8 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
                 | (tw_api::SettingKind::Boolean, v @ serde_json::Value::Bool(_)) => v.clone(),
                 _ => {
                     return Err(bad(format!(
-                        "the default of setting `{key}` is not of its type"
+                        "the value of setting `{key}` must be a {}",
+                        kind.slug()
                     )));
                 }
             };
@@ -264,7 +302,7 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
                 key: key.clone(),
                 kind,
                 label: spec["label"].as_str().unwrap_or(key).to_string(),
-                default,
+                value,
             });
         }
     }
@@ -276,6 +314,7 @@ fn manifest_of(text: &str) -> Result<Manifest, LoadError> {
         permissions,
         requests,
         scope,
+        on_error,
         reply_mode,
         settings,
         hooks,
@@ -292,7 +331,7 @@ mod tests {
         let src = source(
             json!({"name": "附加日期", "api": 1, "permissions": ["system"],
                    "match": {"models": ["claude-*"]},
-                   "settings": {"note": {"type": "string", "label": "附加内容", "default": "x"}}}),
+                   "settings": {"note": {"type": "string", "label": "附加内容", "value": "x"}}}),
             &["onRequest"],
         );
         let host = FakeEngine.load(src.as_bytes()).unwrap();
@@ -301,7 +340,8 @@ mod tests {
         assert_eq!(m.permissions, [tw_api::Permission::System]);
         assert!(m.hooks.request && !m.hooks.on_reply());
         assert_eq!(m.scope.models, ["claude-*"]);
-        assert_eq!(m.settings[0].default, json!("x"));
+        assert_eq!(m.settings[0].value, json!("x"));
+        assert_eq!(m.on_error, tw_api::OnError::Reject);
         let want: [u8; 32] = Sha256::digest(src.as_bytes()).into();
         assert_eq!(host.sha256(), want);
     }
