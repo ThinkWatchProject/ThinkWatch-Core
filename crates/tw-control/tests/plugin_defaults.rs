@@ -704,10 +704,6 @@ async fn the_shipped_defaults_go_in_turned_off_without_starting_the_sandbox() {
         assert!(a.ready().unwrap().dormant(), "{id}");
     }
     assert_eq!(
-        b.entry("deepseek-flags").unwrap().scope.models,
-        ["deepseek*"]
-    );
-    assert_eq!(
         b.plugin("reply-language").await["settings"],
         json!({"language": "简体中文"})
     );
@@ -898,38 +894,36 @@ async fn a_cache_entry_that_does_not_match_is_ignored() {
     }
 }
 
-/// `deepseek-flags` 改得了回答里的工具调用：网页那条路打不开它，确认过的那条打得开
+/// `wsl-paths` 改得了回答里的工具调用：网页那条路打不开它，确认过的那条打得开
 #[tokio::test]
-async fn deepseek_flags_turns_on_only_with_a_confirmation() {
+async fn wsl_paths_turns_on_only_with_a_confirmation() {
     let b = bed_in("real", false);
     Seeder::shipped().seed(&b.mgr).await;
+    // 只是打开：范围和设置都是装上时的那样
     let body = |base: String| {
         json!({"enabled": true, "on_error": "reject",
-               "scope": {"clients": [], "models": ["deepseek*"], "upstreams": []},
-               "settings": {}, "base_version": base})
+               "scope": {"clients": [], "models": [], "upstreams": []},
+               "settings": {"windows_client": false}, "base_version": base})
     };
     let (st, v) = call(
         &b.app,
         "PUT",
-        "/plugins/deepseek-flags",
+        "/plugins/wsl-paths",
         Some(body(b.version().await)),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["code"], "control.plugin.needs_confirmation");
-    assert!(!b.entry("deepseek-flags").unwrap().enabled);
+    assert!(!b.entry("wsl-paths").unwrap().enabled);
 
     let (st, v) = call(
         &b.app,
         "PUT",
-        "/plugins/deepseek-flags/confirmed",
+        "/plugins/wsl-paths/confirmed",
         Some(body(b.version().await)),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(b.entry("deepseek-flags").unwrap().enabled);
-    assert_eq!(
-        b.plugin("deepseek-flags").await["status"],
-        json!({"kind": "ok"})
-    );
+    assert!(b.entry("wsl-paths").unwrap().enabled);
+    assert_eq!(b.plugin("wsl-paths").await["status"], json!({"kind": "ok"}));
 }
