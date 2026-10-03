@@ -27,7 +27,8 @@
 //! 用户还可以写自己的规则（正则）。它们和内置规则在同一遍里找、同一本账
 //! 里换，于是「同一个值只占一个编号」这类纪律对它们同样成立。
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -1468,19 +1469,30 @@ pub struct Finding {
 
 /// 把命中合并成「哪条规则 × 哪个值 × 几次」。**同一个值只报一次**：
 /// 一把 key 在一个请求里出现三次，是一把 key，不是三把。
+///
+/// 按第一次出现的先后排，**一个不同的值一条、一条不少**：`len()` 就是这段文本里有几个
+/// 不同的值。逐条报出去的调用方自己定报几条（桌面网关一个请求报前 100 个，见
+/// `tw_gateway::guard::items`）；按规则聚合的（企业版的审计）拿得到全部。
+///
+/// **合并按「规则 × 值」查表**，不在已经合过的里面一条条找：一个请求里贴进来几万个不同
+/// 的值时（一份导出的凭据清单），后者是平方级的，几十万个值要几分钟。
 pub fn findings(text: &str, hits: &[Hit]) -> Vec<Finding> {
-    let mut out: Vec<(Rule, &str, u64)> = Vec::new();
+    let mut out: Vec<(&Rule, &str, u64)> = Vec::new();
+    let mut seen: HashMap<(&Rule, &str), usize> = HashMap::new();
     for h in hits {
         let value = &text[h.bytes.clone()];
-        match out.iter_mut().find(|(r, v, _)| *r == h.rule && *v == value) {
-            Some((_, _, n)) => *n += 1,
-            None => out.push((h.rule.clone(), value, 1)),
+        match seen.entry((&h.rule, value)) {
+            Entry::Occupied(at) => out[*at.get()].2 += 1,
+            Entry::Vacant(slot) => {
+                slot.insert(out.len());
+                out.push((&h.rule, value, 1));
+            }
         }
     }
     out.into_iter()
         .map(|(rule, value, count)| Finding {
-            masked: masked(&rule, value),
-            rule,
+            masked: masked(rule, value),
+            rule: rule.clone(),
             count,
         })
         .collect()
@@ -1820,6 +1832,64 @@ mod tests {
         assert!(!f[0].masked.contains("AAAAAAAAAAAA"), "{}", f[0].masked);
         // 内网地址不是凭据，打码之后反而认不出是哪台机器
         assert_eq!(f[1].masked, "10.0.0.1");
+    }
+
+    /// 查表合并和原来在合过的里面一条条找，合出来的一模一样：同样的条目、同样的先后、
+    /// 同样的次数。同一个值被两条规则认出来的，是两条
+    #[test]
+    fn findings_merge_exactly_as_the_one_by_one_search_did() {
+        fn one_by_one(text: &str, hits: &[Hit]) -> Vec<Finding> {
+            let mut out: Vec<(Rule, &str, u64)> = Vec::new();
+            for h in hits {
+                let value = &text[h.bytes.clone()];
+                match out.iter_mut().find(|(r, v, _)| *r == h.rule && *v == value) {
+                    Some((_, _, n)) => *n += 1,
+                    None => out.push((h.rule.clone(), value, 1)),
+                }
+            }
+            out.into_iter()
+                .map(|(rule, value, count)| Finding {
+                    masked: masked(&rule, value),
+                    rule,
+                    count,
+                })
+                .collect()
+        }
+        let pool = [
+            "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "AKIAQRSTUVWXYZ234567",
+            "10.0.0.1",
+            "10.0.0.2",
+            "db.internal",
+            "postgres://app:hunter2@db/x",
+            "PRJ-12",
+            "PRJ-7",
+        ];
+        let rules = all().with_custom("project", r"PRJ-\d+").unwrap();
+        // 一个确定的伪随机序列：值有重复、先后打乱
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut text = String::new();
+        for _ in 0..400 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            text.push_str(pool[(seed % pool.len() as u64) as usize]);
+            text.push_str(if seed % 3 == 0 { "，" } else { " " });
+        }
+        let mut hits = scan(&text, &rules);
+        // 同一个值换一条规则认：按「规则 × 值」合，两条
+        hits.extend(
+            scan(&text, &RuleSet::only(&["aws-access-key-id"]))
+                .into_iter()
+                .map(|h| Hit {
+                    rule: Rule::Custom(Arc::from("aws-again")),
+                    ..h
+                }),
+        );
+        let got = findings(&text, &hits);
+        assert_eq!(got, one_by_one(&text, &hits));
+        assert!(got.len() >= pool.len(), "{got:?}");
     }
 
     #[test]

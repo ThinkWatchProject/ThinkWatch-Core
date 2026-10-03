@@ -401,11 +401,13 @@ async fn pump(
                         if found.is_empty() {
                             UpMsg::Text(text.into())
                         } else {
+                            // 客户端发来的一帧是一次请求，各报各的（一次最多报几个见
+                            // `crate::guard::REPORTED_MAX`）
                             state.bus.emit(tw_api::Event::SecretsFound {
                                 id: p.id,
                                 provider: p.provider.clone(),
                                 replaced: mode.acts(),
-                                items: crate::guard::items(&found),
+                                items: crate::guard::items(&found, 0),
                                 at_ms: crate::server::now_ms(),
                             });
                             if mode.acts() {

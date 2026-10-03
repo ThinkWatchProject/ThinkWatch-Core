@@ -86,13 +86,95 @@ pub fn set_max_output_tokens(dialect: Dialect, body: &mut Value, n: u64) {
 }
 
 /// 把最大输出 token 数限制在 `cap` 以内：客户端写的比它大、或者没写，就写成 `cap`；
-/// 写的不比它大就不动。返回改没改。
-pub fn cap_max_output_tokens(dialect: Dialect, body: &mut Value, cap: u64) -> bool {
-    if !body.is_object() || max_output_tokens(dialect, body).is_some_and(|n| n <= cap) {
+/// 写的不比它大就不动。返回改没改。`official` 是这个请求要发往的是不是厂商官方的端点
+/// （[`crate::official::is_official_host`]，和转换时的 [`crate::ir::Target::official`]
+/// 一个意思）。
+///
+/// 和 [`set_max_output_tokens`] 不一样的几处，都是因为「限制」要对上游真的管用：
+///
+/// - **Chat 两个名字都写了的，各自压到 `cap` 以内。**只看解码器先认的那一个
+///   （`max_completion_tokens`）的话，`{"max_completion_tokens": 100, "max_tokens": 9999}`
+///   原样过去，只认 `max_tokens` 的上游等于没限。比 `cap` 小的那个不动，不替客户端放宽。
+///   值是 `null` 的算没写。
+/// - **Chat 两个都没写时，官方端点写 `max_completion_tokens`，别家写 `max_tokens`**：
+///   OpenAI 官方的推理模型不认 `max_tokens`，带着它整个请求 400；兼容实现大多只认
+///   `max_tokens`。和编码器选名字的办法一样。
+/// - **Anthropic 开了思考的**（`thinking.type` 是 `enabled`，带 `budget_tokens`）：思考
+///   用的 token 算在 `max_tokens` 里，所以 `budget_tokens` 必须小于 `max_tokens`，否则整个
+///   请求 400。把 `max_tokens` 压到不比预算大时，`cap` 大于 1024（预算的下限）就把预算一并
+///   压到 `cap - 1`；不大于 1024 的话预算没有合法的值可取，去掉 `thinking` —— 不思考地
+///   回答，总比整个请求被拒强。Converse（`additionalModelRequestFields.thinking`）背后的
+///   Claude 同理。预算本来就比限制小的不动；客户端自己写的 `max_tokens` 就不比预算大的，
+///   是它自己的请求不合法，也不动。
+pub fn cap_max_output_tokens(dialect: Dialect, body: &mut Value, cap: u64, official: bool) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    if dialect == Dialect::Chat {
+        return cap_chat(obj, cap, official);
+    }
+    if max_output_tokens(dialect, body).is_some_and(|n| n <= cap) {
         return false;
     }
     set_max_output_tokens(dialect, body, cap);
+    let thinking = match dialect {
+        Dialect::Anthropic => body.as_object_mut(),
+        Dialect::Bedrock => body
+            .get_mut("additionalModelRequestFields")
+            .and_then(Value::as_object_mut),
+        _ => None,
+    };
+    if let Some(holder) = thinking {
+        fit_thinking(holder, cap);
+    }
     true
+}
+
+/// Chat 的两个名字（见 [`cap_max_output_tokens`]）
+fn cap_chat(obj: &mut Map<String, Value>, cap: u64, official: bool) -> bool {
+    const NAMES: [&str; 2] = ["max_completion_tokens", "max_tokens"];
+    let written: Vec<&str> = NAMES
+        .into_iter()
+        .filter(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
+        .collect();
+    if written.is_empty() {
+        let name = if official { NAMES[0] } else { NAMES[1] };
+        obj.insert(name.into(), Value::from(cap));
+        return true;
+    }
+    let mut changed = false;
+    for k in written {
+        // 写的不是一个非负整数的，和比上限大的一样换成上限：上游读不懂它，就等于没限
+        if !obj.get(k).and_then(Value::as_u64).is_some_and(|n| n <= cap) {
+            obj.insert(k.into(), Value::from(cap));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// `max_tokens` 刚压到 `cap` 之后，让思考的预算还小于它（见 [`cap_max_output_tokens`]）。
+/// `holder` 是装着 `thinking` 的那个对象
+fn fit_thinking(holder: &mut Map<String, Value>, cap: u64) {
+    /// Anthropic 允许的最小思考预算
+    const BUDGET_MIN: u64 = 1024;
+    let Some(thinking) = holder.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if thinking.get("type").and_then(Value::as_str) != Some("enabled") {
+        return;
+    }
+    let Some(budget) = thinking.get("budget_tokens").and_then(Value::as_u64) else {
+        return;
+    };
+    if budget < cap {
+        return;
+    }
+    if cap > BUDGET_MIN {
+        thinking.insert("budget_tokens".into(), Value::from(cap - 1));
+    } else {
+        holder.remove("thinking");
+    }
 }
 
 /// 改要的模型。Gemini 和 Bedrock 的模型写在路径里，请求体里没有它，什么都不做（路径
@@ -275,20 +357,307 @@ mod tests {
 
     #[test]
     fn a_cap_lowers_or_fills_and_leaves_a_smaller_value_alone() {
-        for d in ALL {
-            let mut v = json!({});
-            assert!(cap_max_output_tokens(d, &mut v, 100), "{d:?}");
-            assert_eq!(max_output_tokens(d, &v), Some(100));
-            set_max_output_tokens(d, &mut v, 50);
-            assert!(!cap_max_output_tokens(d, &mut v, 100), "{d:?}");
-            assert_eq!(max_output_tokens(d, &v), Some(50));
-            set_max_output_tokens(d, &mut v, 500);
-            assert!(cap_max_output_tokens(d, &mut v, 100), "{d:?}");
-            assert_eq!(max_output_tokens(d, &v), Some(100));
+        for official in [false, true] {
+            for d in ALL {
+                let mut v = json!({});
+                assert!(cap_max_output_tokens(d, &mut v, 100, official), "{d:?}");
+                assert_eq!(max_output_tokens(d, &v), Some(100));
+                set_max_output_tokens(d, &mut v, 50);
+                assert!(!cap_max_output_tokens(d, &mut v, 100, official), "{d:?}");
+                assert_eq!(max_output_tokens(d, &v), Some(50));
+                set_max_output_tokens(d, &mut v, 500);
+                assert!(cap_max_output_tokens(d, &mut v, 100, official), "{d:?}");
+                assert_eq!(max_output_tokens(d, &v), Some(100));
+            }
         }
         let mut not_an_object = json!([1]);
-        assert!(!cap_max_output_tokens(Dialect::Chat, &mut not_an_object, 1));
+        assert!(!cap_max_output_tokens(
+            Dialect::Chat,
+            &mut not_an_object,
+            1,
+            false
+        ));
         assert_eq!(not_an_object, json!([1]));
+    }
+
+    /// 四种客户端格式（外加 Converse）各压一次：`(格式, 请求, 官方端点吗)` → 压完的样子
+    fn capped(d: Dialect, mut v: Value, cap: u64, official: bool) -> (bool, Value) {
+        let changed = cap_max_output_tokens(d, &mut v, cap, official);
+        (changed, v)
+    }
+
+    #[test]
+    fn a_chat_request_that_names_both_fields_is_capped_in_both() {
+        // 只看先认的那一个的话，`max_tokens` 原样过去，只认它的上游等于没限
+        let both = json!({"max_completion_tokens": 50, "max_tokens": 5000});
+        for official in [false, true] {
+            assert_eq!(
+                capped(Dialect::Chat, both.clone(), 100, official),
+                (
+                    true,
+                    json!({"max_completion_tokens": 50, "max_tokens": 100})
+                )
+            );
+            // 反过来也一样；比上限小的那个不替客户端放宽
+            assert_eq!(
+                capped(
+                    Dialect::Chat,
+                    json!({"max_completion_tokens": 5000, "max_tokens": 50}),
+                    100,
+                    official
+                ),
+                (
+                    true,
+                    json!({"max_completion_tokens": 100, "max_tokens": 50})
+                )
+            );
+            // 两个都不大：不动
+            let small = json!({"max_completion_tokens": 50, "max_tokens": 60});
+            assert_eq!(
+                capped(Dialect::Chat, small.clone(), 100, official),
+                (false, small)
+            );
+            // 读不懂的值等于没限，换成上限；`null` 算没写
+            assert_eq!(
+                capped(
+                    Dialect::Chat,
+                    json!({"max_completion_tokens": "lots", "max_tokens": 50}),
+                    100,
+                    official
+                ),
+                (
+                    true,
+                    json!({"max_completion_tokens": 100, "max_tokens": 50})
+                )
+            );
+            assert_eq!(
+                capped(
+                    Dialect::Chat,
+                    json!({"max_completion_tokens": null, "max_tokens": 50}),
+                    100,
+                    official
+                ),
+                (
+                    false,
+                    json!({"max_completion_tokens": null, "max_tokens": 50})
+                )
+            );
+        }
+        // 别的格式只有一个名字，照常压
+        for (d, v, want) in [
+            (
+                Dialect::Anthropic,
+                json!({"max_tokens": 5000}),
+                json!({"max_tokens": 100}),
+            ),
+            (
+                Dialect::Responses,
+                json!({"max_output_tokens": 5000}),
+                json!({"max_output_tokens": 100}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {"maxOutputTokens": 5000}}),
+                json!({"generationConfig": {"maxOutputTokens": 100}}),
+            ),
+            (
+                Dialect::Bedrock,
+                json!({"inferenceConfig": {"maxTokens": 5000}}),
+                json!({"inferenceConfig": {"maxTokens": 100}}),
+            ),
+        ] {
+            assert_eq!(capped(d, v, 100, false), (true, want), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn a_chat_request_with_no_limit_gets_the_field_its_upstream_reads() {
+        // OpenAI 官方的推理模型带着 `max_tokens` 整个请求 400；兼容实现大多只认 `max_tokens`
+        assert_eq!(
+            capped(Dialect::Chat, json!({"model": "o3"}), 100, true),
+            (true, json!({"model": "o3", "max_completion_tokens": 100}))
+        );
+        assert_eq!(
+            capped(Dialect::Chat, json!({"model": "o3"}), 100, false),
+            (true, json!({"model": "o3", "max_tokens": 100}))
+        );
+        // 写成 `null` 的等于没写
+        assert_eq!(
+            capped(Dialect::Chat, json!({"max_tokens": null}), 100, true),
+            (
+                true,
+                json!({"max_tokens": null, "max_completion_tokens": 100})
+            )
+        );
+        assert_eq!(
+            capped(Dialect::Chat, json!({"max_tokens": null}), 100, false),
+            (true, json!({"max_tokens": 100}))
+        );
+        // 别的格式只有一个名字，和发往哪儿无关
+        for official in [false, true] {
+            for (d, want) in [
+                (Dialect::Anthropic, json!({"max_tokens": 100})),
+                (Dialect::Responses, json!({"max_output_tokens": 100})),
+                (
+                    Dialect::Gemini,
+                    json!({"generationConfig": {"maxOutputTokens": 100}}),
+                ),
+                (
+                    Dialect::Bedrock,
+                    json!({"inferenceConfig": {"maxTokens": 100}}),
+                ),
+            ] {
+                assert_eq!(capped(d, json!({}), 100, official), (true, want), "{d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_still_fits_under_a_lowered_anthropic_limit() {
+        let thinking = |budget: u64| json!({"type": "enabled", "budget_tokens": budget});
+        // 预算不比新的上限小：压到上限减一
+        assert_eq!(
+            capped(
+                Dialect::Anthropic,
+                json!({"max_tokens": 32000, "thinking": thinking(16000)}),
+                8000,
+                true
+            ),
+            (
+                true,
+                json!({"max_tokens": 8000, "thinking": thinking(7999)})
+            )
+        );
+        // 没写 max_tokens 的，填上上限也一样
+        assert_eq!(
+            capped(
+                Dialect::Anthropic,
+                json!({"thinking": thinking(8000)}),
+                8000,
+                false
+            ),
+            (
+                true,
+                json!({"max_tokens": 8000, "thinking": thinking(7999)})
+            )
+        );
+        // 上限只比最小预算多一：预算正好是最小值
+        assert_eq!(
+            capped(
+                Dialect::Anthropic,
+                json!({"max_tokens": 4096, "thinking": thinking(2048)}),
+                1025,
+                false
+            ),
+            (
+                true,
+                json!({"max_tokens": 1025, "thinking": thinking(1024)})
+            )
+        );
+        // 上限不比最小预算大：开不了思考，去掉它，请求照样能答
+        for cap in [1024, 600] {
+            assert_eq!(
+                capped(
+                    Dialect::Anthropic,
+                    json!({"max_tokens": 4096, "thinking": thinking(2048), "x": 1}),
+                    cap,
+                    false
+                ),
+                (true, json!({"max_tokens": cap, "x": 1})),
+                "{cap}"
+            );
+        }
+        // 预算本来就小于上限的、没开思考的、自适应的：不动思考
+        for t in [
+            thinking(2000),
+            json!({"type": "disabled"}),
+            json!({"type": "adaptive"}),
+        ] {
+            assert_eq!(
+                capped(
+                    Dialect::Anthropic,
+                    json!({"max_tokens": 32000, "thinking": t.clone()}),
+                    8000,
+                    false
+                ),
+                (true, json!({"max_tokens": 8000, "thinking": t}))
+            );
+        }
+        // 客户端自己写的 max_tokens 没超上限：不是我们改出来的，不碰
+        let own = json!({"max_tokens": 2000, "thinking": thinking(4000)});
+        assert_eq!(
+            capped(Dialect::Anthropic, own.clone(), 8000, false),
+            (false, own)
+        );
+        // Converse 背后的 Claude 同理
+        assert_eq!(
+            capped(
+                Dialect::Bedrock,
+                json!({
+                    "inferenceConfig": {"maxTokens": 32000},
+                    "additionalModelRequestFields": {"thinking": thinking(16000)}
+                }),
+                8000,
+                false
+            ),
+            (
+                true,
+                json!({
+                    "inferenceConfig": {"maxTokens": 8000},
+                    "additionalModelRequestFields": {"thinking": thinking(7999)}
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn other_formats_keep_their_reasoning_settings_when_capped() {
+        // 思考的预算只有 Anthropic（和 Converse 上的 Claude）要小于输出上限；别的格式的
+        // 推理开关不归这个函数管
+        for (d, v, want) in [
+            (
+                Dialect::Chat,
+                json!({"max_tokens": 32000, "reasoning_effort": "high"}),
+                json!({"max_tokens": 8000, "reasoning_effort": "high"}),
+            ),
+            (
+                Dialect::Responses,
+                json!({"max_output_tokens": 32000, "reasoning": {"effort": "high"}}),
+                json!({"max_output_tokens": 8000, "reasoning": {"effort": "high"}}),
+            ),
+            (
+                Dialect::Gemini,
+                json!({"generationConfig": {
+                    "maxOutputTokens": 32000,
+                    "thinkingConfig": {"thinkingBudget": 16000}
+                }}),
+                json!({"generationConfig": {
+                    "maxOutputTokens": 8000,
+                    "thinkingConfig": {"thinkingBudget": 16000}
+                }}),
+            ),
+        ] {
+            assert_eq!(capped(d, v, 8000, true), (true, want), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn the_routing_rule_setter_is_not_the_cap() {
+        // 桌面版路由规则的 `set` 照旧：两个名字写了哪个改哪个（往大改也改），都没写写
+        // `max_tokens`，不碰思考
+        let mut v = json!({"max_completion_tokens": 50, "max_tokens": 5000});
+        set_max_output_tokens(Dialect::Chat, &mut v, 9000);
+        assert_eq!(
+            v,
+            json!({"max_completion_tokens": 9000, "max_tokens": 9000})
+        );
+        let mut v =
+            json!({"max_tokens": 32000, "thinking": {"type": "enabled", "budget_tokens": 16000}});
+        set_max_output_tokens(Dialect::Anthropic, &mut v, 8000);
+        assert_eq!(
+            v,
+            json!({"max_tokens": 8000, "thinking": {"type": "enabled", "budget_tokens": 16000}})
+        );
     }
 
     #[test]

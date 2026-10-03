@@ -138,7 +138,7 @@ struct Open {
 /// 一条流上、按帧的还原器。
 pub struct FrameRestorer {
     dialect: Dialect,
-    ledger: Ledger,
+    /// 整帧的一次性还原。各路的还原器从它分出去，共用一本账（见 [`Restorer::fresh`]）
     oneshot: Restorer,
     lanes: BTreeMap<Lane, Open>,
 }
@@ -149,7 +149,6 @@ impl FrameRestorer {
     pub fn new(ledger: &Ledger, dialect: Dialect) -> Self {
         Self {
             dialect,
-            ledger: ledger.clone(),
             oneshot: Restorer::new(ledger),
             lanes: BTreeMap::new(),
         }
@@ -157,7 +156,7 @@ impl FrameRestorer {
 
     /// 没东西要还原。**调用方据此整条短路。**
     pub fn is_noop(&self) -> bool {
-        self.ledger.is_empty()
+        self.oneshot.is_noop()
     }
 
     /// 改写一帧。帧本身就地改，返回要先于它发出去的补帧。
@@ -173,7 +172,7 @@ impl FrameRestorer {
         let fields = fields(self.dialect, v);
         for f in &fields {
             let open = self.lanes.entry(f.lane).or_insert_with(|| Open {
-                restorer: Restorer::new(&self.ledger),
+                restorer: self.oneshot.fresh(),
                 last: Value::Null,
             });
             open.last = v.clone();
