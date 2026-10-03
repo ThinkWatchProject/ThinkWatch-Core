@@ -1,17 +1,20 @@
 //! 写进配置的任意文字动不了文件的结构。
 //!
-//! 随机造字符串（换行、回车、制表符、引号、反斜杠、`#`、`: `、`---`、`...`、首尾空白、
-//! 控制字符、YAML 1.1 当换行的那几个字符、中文、emoji、组合字符……），经按名字编辑的
-//! 那一层（`tw_config::edit`）写进一份带注释的配置，断言：
+//! 随机造字符串（制表符、引号、反斜杠、`#`、`: `、`---`、`...`、首尾空白、控制字符、
+//! YAML 1.1 当换行的那几个字符、中文、emoji、组合字符……），经按名字编辑的那一层
+//! （`tw_config::edit`）写进一份带注释的配置，断言：
 //!
 //! - 读回来一字不差：serde 那条加载路径、整份配置的解析和校验、tw-yaml 的解析器，三处
 //!   读到的都是写进去的那个字符串；
 //! - 被改的那一行（新加的那几行）之外，**每个字节都没动**：别的键、注释原样。
 //!
+//! 配置里的字段一律单行：换行（`\n`、`\r`）在哪儿都写不进去（`config.edit.multiline`），
+//! 生成的字符串里去掉了它们，另有一条专门测它被拒。
+//!
 //! 生成器自己写，种子可复现（`TW_PROP_SEED`），和 tw-yaml 的 property test 同一个做法。
 
 use serde_yaml_ng::{Mapping, Value};
-use tw_config::edit::{self, PLUGINS};
+use tw_config::edit::{self, PLUGINS, Section};
 use tw_yaml::{NodeKind, Step};
 
 const HASH: &str = "6f1c000000000000000000000000000000000000000000000000000000000abc";
@@ -28,21 +31,19 @@ clients:
   - name: default
     key: tw-aaaa
     client: codex   # 给 Codex 用
+  - name: target
+    key: tw-bbbb
+    client: old
 plugins:
   # 第一个
   - id: first
     file: plugins/first.js
     sha256: {HASH}
-    enabled: false
-    settings:
-      note: plain   # 行尾注释
+    enabled: false   # 行尾注释
   - id: target
     file: plugins/target.js
     sha256: {HASH}
     enabled: false
-    settings:
-      note: old
-      keep: 1
 # 插件之后
 providers:
   - name: 官方
@@ -179,12 +180,22 @@ fn seed() -> u64 {
         .unwrap_or(0x5eed_1234_abcd_0001)
 }
 
+/// 去掉换行（`\n`、`\r`）的那些：配置里的字段一律单行
 fn cases() -> Vec<String> {
     let mut rng = Rng(seed() | 1);
     let mut out: Vec<String> = FIXED.iter().map(|s| s.to_string()).collect();
     out.extend((0..1500).map(|_| arbitrary(&mut rng)));
-    out
+    out.into_iter()
+        .map(|s| s.chars().filter(|c| !matches!(c, '\n' | '\r')).collect())
+        .collect()
 }
+
+/// 密钥那一段：按 `name` 认
+const CLIENTS: Section = Section {
+    path: &["clients"],
+    what: "key",
+    key: "name",
+};
 
 fn yaml_map(text: &str) -> Mapping {
     serde_yaml_ng::from_str(text).unwrap()
@@ -204,12 +215,11 @@ fn scalar_at(text: &str, path: &[Step]) -> String {
     }
 }
 
-fn note_path(index: usize, key: &str) -> Vec<Step> {
+fn client_path(index: usize) -> Vec<Step> {
     vec![
-        Step::key("plugins"),
+        Step::key("clients"),
         Step::Index(index),
-        Step::key("settings"),
-        Step::key(key),
+        Step::key("client"),
     ]
 }
 
@@ -244,29 +254,16 @@ fn reads_back(
     );
 }
 
-/// 改了一项里的一个设置：**只有那一行变了**，而且它还是一行
+/// 改了一项里的一个字段：**只有那一行变了**，而且它还是一行
 #[test]
-fn a_setting_written_over_an_old_one_changes_only_its_own_line() {
+fn a_field_written_over_an_old_one_changes_only_its_own_line() {
     let base = doc();
     for s in cases() {
-        let mut item = yaml_map(&format!(
-            "id: target\nfile: plugins/target.js\nsha256: {HASH}\nenabled: false\nsettings:\n  note: x\n  keep: 1\n"
-        ));
-        item["settings"]["note"] = Value::String(s.clone());
-        let out = edit::upsert(&base, PLUGINS, Some("target"), &item)
+        let mut item = yaml_map("name: target\nkey: tw-bbbb\nclient: x\n");
+        item["client"] = Value::String(s.clone());
+        let out = edit::upsert(&base, CLIENTS, Some("target"), &item)
             .unwrap_or_else(|e| panic!("{s:?}: {e}"));
-        reads_back(
-            &out,
-            &note_path(1, "note"),
-            |c| {
-                c.plugins[1]
-                    .settings
-                    .get("note")?
-                    .as_str()
-                    .map(str::to_string)
-            },
-            &s,
-        );
+        reads_back(&out, &client_path(1), |c| c.clients[1].client.clone(), &s);
         let before: Vec<&str> = base.lines().collect();
         let after: Vec<&str> = out.lines().collect();
         assert_eq!(
@@ -277,12 +274,12 @@ fn a_setting_written_over_an_old_one_changes_only_its_own_line() {
         let changed: Vec<usize> = (0..before.len())
             .filter(|&i| before[i] != after[i])
             .collect();
-        let line = before.iter().position(|l| *l == "      note: old").unwrap();
+        let line = before.iter().position(|l| *l == "    client: old").unwrap();
         assert!(
             changed.is_empty() || changed == [line],
             "{s:?}: other lines changed: {changed:?}\n{out}"
         );
-        assert!(after[line].starts_with("      note: "), "{s:?}\n{out}");
+        assert!(after[line].starts_with("    client: "), "{s:?}\n{out}");
         assert!(out.ends_with('\n') && base.ends_with('\n'));
     }
 }
@@ -291,40 +288,12 @@ fn a_setting_written_over_an_old_one_changes_only_its_own_line() {
 #[test]
 fn a_new_entry_is_one_insertion_of_whole_lines() {
     let base = doc();
-    let mut rng = Rng((seed() ^ 0xdead_beef) | 1);
     for s in cases() {
-        let t = arbitrary(&mut rng);
-        let mut item = yaml_map(&format!(
-            "id: added\nfile: plugins/added.js\nsha256: {HASH}\nenabled: false\nsettings:\n  note: x\n  other: y\n"
-        ));
-        item["settings"]["note"] = Value::String(s.clone());
-        item["settings"]["other"] = Value::String(t.clone());
+        let mut item = yaml_map("name: added\nkey: tw-cccc\nclient: x\n");
+        item["client"] = Value::String(s.clone());
         let out =
-            edit::upsert(&base, PLUGINS, None, &item).unwrap_or_else(|e| panic!("{s:?}: {e}"));
-        reads_back(
-            &out,
-            &note_path(2, "note"),
-            |c| {
-                c.plugins[2]
-                    .settings
-                    .get("note")?
-                    .as_str()
-                    .map(str::to_string)
-            },
-            &s,
-        );
-        reads_back(
-            &out,
-            &note_path(2, "other"),
-            |c| {
-                c.plugins[2]
-                    .settings
-                    .get("other")?
-                    .as_str()
-                    .map(str::to_string)
-            },
-            &t,
-        );
+            edit::upsert(&base, CLIENTS, None, &item).unwrap_or_else(|e| panic!("{s:?}: {e}"));
+        reads_back(&out, &client_path(2), |c| c.clients[2].client.clone(), &s);
         // 最长的公共前缀之后，剩下的原文得原样是结尾
         let common = base
             .bytes()
@@ -340,8 +309,8 @@ fn a_new_entry_is_one_insertion_of_whole_lines() {
         let inserted = &out[start..out.len() - rest.len()];
         assert_eq!(
             inserted.lines().count(),
-            7,
-            "{s:?}/{t:?}: the new entry is not seven lines\n{inserted}"
+            3,
+            "{s:?}: the new entry is not three lines\n{inserted}"
         );
     }
 }
@@ -381,20 +350,23 @@ fn a_single_line_field_takes_everything_but_a_line_break() {
     }
 }
 
-/// 换行进不了单行的字段；进得了的那一段（插件设置）之外的字段也不行
+/// 换行进不了任何字段：按路径设的、按名字改一项的（插件那一项也一样）
 #[test]
-fn a_line_break_stays_out_of_single_line_fields() {
+fn a_line_break_stays_out_of_every_field() {
     let base = doc();
     for s in ["a\nb", "a\rb", "\n"] {
         let path = [Step::key("clients"), Step::Index(0), Step::key("client")];
         let e = edit::set(&base, &path, Some(&Value::String(s.into()))).unwrap_err();
         assert_eq!(e.msg().code, "config.edit.multiline", "{s:?}");
         let mut item = yaml_map(&format!(
-            "id: target\nfile: plugins/target.js\nsha256: {HASH}\nenabled: false\nsettings:\n  note: old\n  keep: 1\n"
+            "id: target\nfile: plugins/target.js\nsha256: {HASH}\nenabled: false\n"
         ));
-        item.insert("scope".into(), Value::Mapping(yaml_map("models: [x]")));
-        item["scope"]["models"][0] = Value::String(s.into());
+        item["file"] = Value::String(format!("plugins/{s}.js"));
         let e = edit::upsert(&base, PLUGINS, Some("target"), &item).unwrap_err();
+        assert_eq!(e.msg().code, "config.edit.multiline", "{s:?}");
+        let mut item = yaml_map("name: target\nkey: tw-bbbb\nclient: x\n");
+        item["client"] = Value::String(s.into());
+        let e = edit::upsert(&base, CLIENTS, Some("target"), &item).unwrap_err();
         assert_eq!(e.msg().code, "config.edit.multiline", "{s:?}");
     }
 }

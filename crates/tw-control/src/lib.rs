@@ -1324,13 +1324,15 @@ async fn patch_config(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ConfigPatch>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let (cur, text) = s
+        .cfg
+        .patched(&req.ops, req.base_version.as_deref())
+        .map_err(apply_fail)?;
+    // 直接改原文也绕不过插件的确认
+    plugins::guard_raw_write(&s, &cur.text, &text).await?;
     let version = s
         .cfg
-        .patch(
-            &req.ops,
-            req.base_version.as_deref(),
-            tw_config::history::Origin::Ui,
-        )
+        .write(&text, Some(&cur.version()), tw_config::history::Origin::Ui)
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
@@ -1341,6 +1343,12 @@ async fn put_config(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::ConfigWrite>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let cur = s
+        .cfg
+        .current()
+        .map_err(|e| apply_fail(ApplyError::Store(e)))?;
+    // 直接写原文也绕不过插件的确认。版本对不上的话下面那一步本来就写不成
+    plugins::guard_raw_write(&s, &cur.text, &req.text).await?;
     let version = s
         .cfg
         .write(
@@ -1377,7 +1385,23 @@ async fn config_rollback(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::RollbackRequest>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let version = s.cfg.rollback(&req.version).await.map_err(apply_fail)?;
+    let cur = s
+        .cfg
+        .current()
+        .map_err(|e| apply_fail(ApplyError::Store(e)))?;
+    let text = s.cfg.rollback_text(&req.version).map_err(apply_fail)?;
+    // 回到一份打开着工具调用插件的旧配置，同样要点头
+    plugins::guard_raw_write(&s, &cur.text, &text).await?;
+    // 回滚也走同一条写入路径：校验、存历史、防回环
+    let version = s
+        .cfg
+        .write(
+            &text,
+            Some(&cur.version()),
+            tw_config::history::Origin::Rollback,
+        )
+        .await
+        .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 

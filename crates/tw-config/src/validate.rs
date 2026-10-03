@@ -84,10 +84,6 @@ pub enum ValidationError {
     PluginFile { id: String, file: String },
     #[error("{}", self.msg())]
     PluginSha256 { id: String },
-    #[error("{}", self.msg())]
-    BlankPluginPattern { id: String },
-    #[error("{}", self.msg())]
-    PluginSettingType { id: String, key: String },
 }
 
 impl ValidationError {
@@ -242,14 +238,6 @@ impl ValidationError {
             PluginSha256 { id } => msg!(
                 "config.plugin.sha256", plugin = id =>
                 "the sha256 of plugin `{plugin}` has to be 64 lowercase hexadecimal characters"
-            ),
-            BlankPluginPattern { id } => msg!(
-                "config.plugin.blank_pattern", plugin = id =>
-                "the scope of plugin `{plugin}` has an empty entry"
-            ),
-            PluginSettingType { id, key } => msg!(
-                "config.plugin.setting_type", plugin = id, key = key =>
-                "setting `{key}` of plugin `{plugin}` has to be a string, a number or true/false"
             ),
         }
     }

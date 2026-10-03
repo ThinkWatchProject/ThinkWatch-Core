@@ -4,8 +4,9 @@
 //! 双引号，配置读回来一字不差，只有那一行变了。以前它们原样写进文件，整份配置被拒，报的是
 //! 一个说不清的语法错误（或者值悄悄变了样：双引号里的 NEL 读回来是空格）。
 //!
-//! 换行只进得了能写多行的字段（插件的设置），和按名字改一项是同一份规矩；别处拒绝，
-//! 说的是 `config.edit.multiline`，文件不动。
+//! 配置里的字段一律单行，和按名字改一项是同一份规矩：换行在哪儿都拒绝，说的是
+//! `config.edit.multiline`，文件不动。下面那份配置里的插件还带着 0.58 写的 `settings`
+//! （不再起作用、照样加载）：往那里写换行一样拒绝。
 
 use std::sync::Arc;
 
@@ -151,6 +152,8 @@ async fn a_line_break_is_refused_in_a_single_line_field() {
             "/clients/default/client",
             // 插件按 `id` 认，路径里写下标
             "/plugins/0/file",
+            // 0.58 留下的设置：不再能写多行
+            "/plugins/0/settings/terms",
         ] {
             let (_d, mgr) = setup();
             let e = mgr
@@ -164,28 +167,5 @@ async fn a_line_break_is_refused_in_a_single_line_field() {
                 "{path} {s:?}"
             );
         }
-    }
-}
-
-/// 插件的设置能写多行（「一行一条」的对照表）：写得进去，读回来一字不差
-#[tokio::test]
-async fn a_plugin_setting_takes_line_breaks() {
-    for s in ["登陆=登录\n帐号=账号", "a=b\r\nc=d\n", "x\u{2028}y\nz"] {
-        let (_d, mgr) = setup();
-        mgr.patch(&replace("/plugins/0/settings/terms", s), None, Origin::Ui)
-            .await
-            .unwrap_or_else(|e| panic!("{s:?}: {e}"));
-        let after = std::fs::read_to_string(mgr.path()).unwrap();
-        let c = tw_config::try_parse(&after).unwrap_or_else(|r| panic!("{s:?}: {r}"));
-        assert_eq!(
-            c.plugins[0].settings["terms"].as_str(),
-            Some(s),
-            "{s:?}\n{after}"
-        );
-        assert_eq!(
-            after.lines().count(),
-            cfg().lines().count(),
-            "{s:?}: the value spans lines in the file\n{after}"
-        );
     }
 }

@@ -5,7 +5,7 @@ export const manifest = {
   name: "日志洪水",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "lines" } },
+  settings: { kind: { type: "string", label: "方式", value: "lines" } },
 };
 
 export function onRequest(req, ctx) {

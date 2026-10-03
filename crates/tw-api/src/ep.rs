@@ -129,39 +129,54 @@ endpoints! {
 
     // ─────────────────────────────────────────────── 脚本插件
     //
-    // **装、换源码、批准、确认过的改动四个端点不给网页调**（桌面端的 `call` 白名单里
-    // 没有它们）：这几件事要在系统的确认框里点头，那一步在桌面端的 Rust 里 —— 它自己
-    // 再编一遍源码（或者读一遍插件现在的样子），把名字、权限和要改的地方摆给人看，点了
-    // 头才发请求。网页里的脚本做不到这件事，就做不成这几件事。
-    /// 全部插件，按运行的顺序：状态、计数
+    // 插件的配置（出错时怎么办、范围、设置的值）**在插件文件自己的 manifest 里**，界面改它们
+    // 就是改源码（`PluginRewrite` 改写、`SavePlugin` 保存）。
+    //
+    // **要点头的只有一种插件**：权限有 `reply_tool_calls` 的（改得了客户端要执行的工具调用）。
+    // 装它、打开它、改它的代码、批准它磁盘上改过的文件，网页调得到的那条路一律拒绝（403，
+    // `control.plugin.needs_confirmation`），要走带 `confirmed` 的那一条：那几条**桌面端不放进
+    // 网页的 `call` 白名单**，它的 Rust 先自己再编一遍源码（或者读一遍插件现在的样子），在系统
+    // 的确认框里把名字、权限和要改的地方摆给人看，点了头才发。网页里注入的脚本调不到它们。
+    // 每个端点说明里写着桌面端能不能把它给网页。
+    /// 全部插件，按运行的顺序：状态、计数。**网页可以调**
     Plugins: GET "/plugins", () => Vec<api::PluginView>;
-    /// 编一份源码看看它是什么插件。**什么都不留下**
+    /// 编一份源码看看它是什么插件，**什么都不留下**。**网页可以调**
     PluginInspect: POST "/plugins/inspect", api::PluginSource => api::PluginInspection;
-    /// 装一个：写插件文件和它的底稿，配置里加一条。**网页不能调**
+    /// 改写一份源码里的数据（出错时怎么办、范围、设置的值），交回改写之后的源码：只换
+    /// manifest 那一段，别的字节一个不动。**没有副作用**，不读不写任何文件和配置。
+    /// 界面的设置表单靠它更新代码视图（反过来，代码 → 表单用 `PluginInspect`）。
+    /// **网页可以调**
+    PluginRewrite: POST "/plugins/rewrite", api::PluginRewriteRequest => api::PluginSource;
+    /// 装一个：写插件文件和它的底稿，配置里加一条。改得了工具调用的插件在这里拒绝（403，
+    /// `control.plugin.needs_confirmation`），要走 `CreatePluginConfirmed`。**网页可以调**
     CreatePlugin: POST "/plugins", api::PluginCreate => api::ConfigWritten;
-    /// 排顺序，也就是运行的顺序
+    /// 同一件事，在系统的确认框里点过头了：改得了工具调用的插件也装得上。**网页不能调，
+    /// 桌面端也不许把它放进网页的白名单**
+    CreatePluginConfirmed: POST "/plugins/confirmed", api::PluginCreate => api::ConfigWritten;
+    /// 排顺序，也就是运行的顺序。**网页可以调**
     ReorderPlugins: PUT "/plugins/order", api::PluginOrder => api::ConfigWritten;
-    /// 开关、出错时怎么办、范围、设置。**改得了回答里工具调用的插件**（权限有
-    /// `reply_tool_calls`，或者读不出它要什么权限），打开它、改它的设置或范围在这里一律
-    /// 拒绝（403，`control.plugin.needs_confirmation`），要走 `UpdatePluginConfirmed`；
-    /// 停用、改出错时怎么办照常
-    UpdatePlugin: PUT "/plugins/{id}" [id], api::PluginUpdate => api::ConfigWritten;
-    /// 同一件事，在系统的确认框里点过头了：工具调用插件的开关、设置、范围也改得了。
-    /// **网页不能调，桌面端也不许把它放进网页的白名单**：网页里注入的脚本调得到它，就能
-    /// 自己打开一个改工具调用的插件、改它的设置。桌面端的 Rust 先弹系统的确认框（插件
-    /// 的名字、它能做什么、这次改了什么），点了头再发
-    UpdatePluginConfirmed: PUT "/plugins/{id}/confirmed" [id], api::PluginUpdate => api::ConfigWritten;
-    /// 删掉：配置里那一条、插件文件和底稿
+    /// 保存：源码和开关。core 拿源码和批准的那一份比，分成「只改了数据」和「改了代码」
+    /// （见 `PluginSave`）；写文件、底稿和配置里的哈希是一件事，中间没有「文件变了」
+    /// 的那一刻。改得了工具调用的插件，改代码、打开它在这里拒绝（403，
+    /// `control.plugin.needs_confirmation`），要走 `SavePluginConfirmed`；只改数据、停用照常。
+    /// **网页可以调**
+    SavePlugin: PUT "/plugins/{id}" [id], api::PluginSave => api::ConfigWritten;
+    /// 同一件事，在系统的确认框里点过头了。**网页不能调，桌面端也不许把它放进网页的白名单**：
+    /// 网页里注入的脚本调得到它，就能自己打开一个改工具调用的插件、改它的代码。桌面端的 Rust
+    /// 先弹系统的确认框（插件的名字、它能做什么、这次改了什么），点了头再发
+    SavePluginConfirmed: PUT "/plugins/{id}/confirmed" [id], api::PluginSave => api::ConfigWritten;
+    /// 删掉：配置里那一条、插件文件和底稿。**网页可以调**
     DeletePlugin: DELETE "/plugins/{id}" [id], api::BaseVersion => api::ConfigWritten;
-    /// 换一份源码，批准的就是新的这一份。**网页不能调**
-    ReplacePluginSource: PUT "/plugins/{id}/source" [id], api::PluginSourceReplace => api::ConfigWritten;
-    /// 批准过的那一份和磁盘上现在那一份
+    /// 批准过的那一份和磁盘上现在那一份。**网页可以调**
     PluginSourceDiff: GET "/plugins/{id}/source" [id], () => api::PluginSourceView;
-    /// 批准磁盘上改过的那个文件。**网页不能调**
+    /// 批准磁盘上改过的那个文件。改得了工具调用的插件（新旧两份里有一份能）在这里拒绝（403，
+    /// `control.plugin.needs_confirmation`），要走 `ApprovePluginFileConfirmed`。**网页可以调**
     ApprovePluginFile: POST "/plugins/{id}/approve" [id], api::PluginApprove => api::ConfigWritten;
-    /// 拿一条记下的请求试跑。**不连上游**
+    /// 同一件事，在系统的确认框里点过头了。**网页不能调，桌面端也不许把它放进网页的白名单**
+    ApprovePluginFileConfirmed: POST "/plugins/{id}/approve/confirmed" [id], api::PluginApprove => api::ConfigWritten;
+    /// 拿一条记下的请求试跑。**不连上游**。**网页可以调**
     TrialPlugin: POST "/plugins/{id}/trial" [id], api::PluginTrial => api::PluginTrialResult;
-    /// 最近的日志，老的在前
+    /// 最近的日志，老的在前。**网页可以调**
     PluginLogs: GET "/plugins/{id}/logs" [id], () => Vec<api::PluginLogEntry>;
 
     // ─────────────────────────────────────────────── 账号登录

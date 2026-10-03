@@ -863,9 +863,9 @@ fn a_full_manifest_is_read() {
              match: { clients: ["claude-code"], models: ["claude-*"], upstreams: ["anthropic"] },
              reply: "block",
              settings: {
-               zeta: { type: "string", label: "附加内容", default: "x" },
+               zeta: { type: "string", label: "附加内容", value: "x" },
                alpha: { type: "number" },
-               mid: { type: "boolean", label: "On", default: true },
+               mid: { type: "boolean", label: "On", value: true },
              },
            };
            export function onRequest() {}
@@ -888,8 +888,11 @@ fn a_full_manifest_is_read() {
     assert_eq!(keys, vec!["zeta", "alpha", "mid"]);
     assert_eq!(m.settings[0].label, "附加内容");
     assert_eq!(m.settings[1].label, "alpha");
-    assert_eq!(m.settings[1].default, json!(0));
-    assert_eq!(m.settings[2].default, json!(true));
+    assert_eq!(m.settings[0].value, json!("x"));
+    assert_eq!(m.settings[1].value, json!(0));
+    assert_eq!(m.settings[2].value, json!(true));
+    // 没写 on_error 是拒绝
+    assert_eq!(m.on_error, tw_plugin::OnError::Reject);
     assert_eq!(
         m.hooks,
         Hooks {
@@ -910,7 +913,7 @@ fn manifest_errors_say_what_is_wrong() {
         (format!("export const manifest = 3;\n{hook}"), "must be an object"),
         (format!("export const manifest = {{ api: 1, permissions: ['system'] }};\n{hook}"), "needs a `name`"),
         (format!("export const manifest = {{ name: '', api: 1, permissions: ['system'] }};\n{hook}"), "must not be empty"),
-        (format!("export const manifest = {{ name: 'x'.repeat(65), api: 1, permissions: ['system'] }};\n{hook}"), "at most 64"),
+        (format!("export const manifest = {{ name: '{}', api: 1, permissions: ['system'] }};\n{hook}", "x".repeat(65)), "at most 64"),
         (format!("export const manifest = {{ name: 'x', permissions: ['system'] }};\n{hook}"), "api: 1"),
         (format!("export const manifest = {{ name: 'x', api: 1, permissions: [] }};\n{hook}"), "at least one"),
         (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['network'] }};\n{hook}"), "unknown permission \"network\""),
@@ -919,8 +922,12 @@ fn manifest_errors_say_what_is_wrong() {
         (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], reply: 'fast' }};\n{hook}"), "\"block\" or \"stream\""),
         (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], match: {{ hosts: [] }} }};\n{hook}"), "unknown field `hosts`"),
         (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: {{ a: {{ type: 'date' }} }} }};\n{hook}"), "needs a type"),
-        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: {{ a: {{ type: 'number', default: 'x' }} }} }};\n{hook}"), "must be a number"),
-        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: Object.fromEntries(Array.from({{length: 21}}, (_, i) => ['k' + i, {{ type: 'string' }}])) }};\n{hook}"), "at most 20"),
+        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: {{ a: {{ type: 'number', value: 'x' }} }} }};\n{hook}"), "must be a number"),
+        // `default` 换成了 `value`
+        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: {{ a: {{ type: 'number', default: 1 }} }} }};\n{hook}"), "unknown field `default`"),
+        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: {{ {} }} }};\n{hook}", (0..21).map(|i| format!("k{i}: {{ type: 'string' }}")).collect::<Vec<_>>().join(", ")), "at most 20"),
+        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], on_error: 'ignore' }};\n{hook}"), "\"reject\" or \"skip\""),
+        (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], on_error: true }};\n{hook}"), "\"reject\" or \"skip\""),
         (format!("export const manifest = {{ name: 'x', api: 1, permissions: ['system'], settings: {{ '1x': {{ type: 'string' }} }} }};\n{hook}"), "invalid name"),
         // 钩子和权限一一对应
         ("export const manifest = { name: 'x', api: 1, permissions: ['reply.text'] };\nexport function onRequest() {}".into(), "requests none of"),

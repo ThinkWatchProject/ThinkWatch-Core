@@ -4,7 +4,7 @@ export const manifest = {
   name: "越权改动",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "改哪一部分", default: "messages" } },
+  settings: { kind: { type: "string", label: "改哪一部分", value: "messages" } },
 };
 
 export function onRequest(req, ctx) {

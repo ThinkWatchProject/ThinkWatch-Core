@@ -10,6 +10,7 @@
         "tool_call": false
       },
       "name": "Answer in a chosen language",
+      "on_error": "reject",
       "permissions": [
         "system"
       ],
@@ -24,14 +25,14 @@
       },
       "settings": [
         {
-          "default": "简体中文",
           "key": "language",
           "kind": "string",
-          "label": "Answer language"
+          "label": "Answer language",
+          "value": "简体中文"
         }
       ]
     },
-    "sha256": "a519a1c406641a7f18e71f6cb522a586ef85ed096b05429969ed5fac1569edf1"
+    "sha256": "f34e95b9db72c98eadac320f7c3f7af9acb8beae9fa3acd8eda1d0459e18bb6e"
   },
   "wsl-paths": {
     "manifest": {
@@ -44,6 +45,7 @@
         "tool_call": true
       },
       "name": "Convert WSL and Windows paths",
+      "on_error": "reject",
       "permissions": [
         "messages",
         "reply_tool_calls"
@@ -59,13 +61,13 @@
       },
       "settings": [
         {
-          "default": false,
           "key": "windows_client",
           "kind": "boolean",
-          "label": "The client runs on Windows (otherwise WSL)"
+          "label": "The client runs on Windows (otherwise WSL)",
+          "value": false
         }
       ]
     },
-    "sha256": "6140347e0898d022dc3dd92d7f48b9a380b58e1c42e7fc001008591dde9f9edf"
+    "sha256": "6aaf3646438f024a6482413eca7fe9f17230d3f5177458476d070485cb333a99"
   }
 }

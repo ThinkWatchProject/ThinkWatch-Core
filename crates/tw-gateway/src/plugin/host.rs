@@ -180,6 +180,7 @@ pub mod double {
                     permissions: Vec::new(),
                     requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
                     scope: Scope::default(),
+                    on_error: tw_api::OnError::Reject,
                     reply_mode: tw_api::ReplyMode::Block,
                     settings: Vec::new(),
                     hooks: Hooks::default(),

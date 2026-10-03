@@ -1,8 +1,11 @@
-//! 脚本插件的管理面：装、改、换源码、文件被改了、批准、排顺序、删、日志、记录。
+//! 脚本插件的管理面：装、保存、改写、文件被改了、批准、排顺序、删、日志、记录，以及
+//! 什么时候要在系统的确认框里点头。
 //!
 //! 断言落在**磁盘上**：插件文件和底稿写没写、写的是不是那一份字节、配置里那一条长
-//! 什么样 —— 网关照着这些重读插件，哈希对不上就不跑（不变式 I9）。引擎是假的
-//! （`tw_gateway::plugin::fake`）：它照约定的写法读出 manifest，不跑 JavaScript。
+//! 什么样 —— 网关照着这些重读插件，哈希对不上就不跑（不变式 I9）。插件的配置（出错时
+//! 怎么办、范围、设置的值）在插件文件自己的 manifest 里，配置里只有 id、文件、哈希和
+//! 开关。引擎是假的（`tw_gateway::plugin::fake`）：它照真的那一套把 manifest 读成纯数据，
+//! 不跑 JavaScript。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +49,9 @@ impl Bed {
     fn approved(&self, id: &str) -> PathBuf {
         tw_config::plugins::approved_path(&self.dir, id)
     }
+    fn read(&self, path: PathBuf) -> String {
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
     async fn version(&self) -> String {
         let (_, v) = call(&self.app, "GET", "/overview", None).await;
         v["config_version"].as_str().unwrap().to_string()
@@ -62,23 +68,69 @@ impl Bed {
             .find(|p| p["id"] == id)
             .unwrap_or_else(|| panic!("no plugin {id}"))
     }
-    /// 装一个，返回 id
+    /// 装一个（网页那条路），返回 id
     async fn install(&self, src: &str, extra: Value) -> String {
+        self.install_at("/plugins", src, extra).await
+    }
+    /// 装一个（点过头的那条路），返回 id
+    async fn install_confirmed(&self, src: &str, extra: Value) -> String {
+        self.install_at("/plugins/confirmed", src, extra).await
+    }
+    async fn install_at(&self, path: &str, src: &str, extra: Value) -> String {
         let mut body = json!({
             "source": src,
             "enabled": true,
-            "on_error": "reject",
-            "scope": { "clients": [], "models": [], "upstreams": [] },
-            "settings": {},
             "base_version": self.version().await,
         });
         for (k, v) in extra.as_object().unwrap() {
             body[k] = v.clone();
         }
-        let (st, v) = call(&self.app, "POST", "/plugins", Some(body)).await;
+        let (st, v) = call(&self.app, "POST", path, Some(body)).await;
         assert_eq!(st, StatusCode::OK, "{v}");
         let cfg = self.parsed();
         cfg.plugins.last().unwrap().id.clone()
+    }
+    /// 保存：源码和开关
+    async fn save(&self, id: &str, src: &str, enabled: bool) -> (StatusCode, Value) {
+        self.save_at(&format!("/plugins/{id}"), src, enabled).await
+    }
+    async fn save_confirmed(&self, id: &str, src: &str, enabled: bool) -> (StatusCode, Value) {
+        self.save_at(&format!("/plugins/{id}/confirmed"), src, enabled)
+            .await
+    }
+    async fn save_at(&self, path: &str, src: &str, enabled: bool) -> (StatusCode, Value) {
+        call(
+            &self.app,
+            "PUT",
+            path,
+            Some(json!({"source": src, "enabled": enabled,
+                        "base_version": self.version().await})),
+        )
+        .await
+    }
+    /// 改写源码里的数据（`POST /plugins/rewrite`），交回改写之后的源码
+    async fn rewrite(&self, src: &str, on_error: &str, models: Value, settings: Value) -> String {
+        let (st, v) = call(
+            &self.app,
+            "POST",
+            "/plugins/rewrite",
+            Some(json!({"source": src, "on_error": on_error,
+                        "scope": {"clients": [], "models": models, "upstreams": []},
+                        "settings": settings})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["source"].as_str().unwrap().to_string()
+    }
+    /// 批准磁盘上那一份
+    async fn approve_at(&self, path: &str, src: &str) -> (StatusCode, Value) {
+        call(
+            &self.app,
+            "POST",
+            path,
+            Some(json!({"sha256": sha(src), "base_version": self.version().await})),
+        )
+        .await
     }
 }
 
@@ -156,8 +208,8 @@ fn add_date() -> String {
     source(
         json!({"name": "附加日期", "api": 1, "description": "在系统提示里写上今天的日期",
                "permissions": ["system"], "match": {"clients": ["claude-code"]},
-               "settings": {"note": {"type": "string", "label": "附加内容", "default": "今天"},
-                            "days": {"type": "number", "label": "天数", "default": 1}}}),
+               "settings": {"note": {"type": "string", "label": "附加内容", "value": "今天"},
+                            "days": {"type": "number", "label": "天数", "value": 1}}}),
         &["onRequest"],
     )
 }
@@ -185,6 +237,13 @@ fn files_in(dir: &Path) -> Vec<String> {
     out
 }
 
+/// 配置里那一条只有这四样：出错时怎么办、范围、设置都在插件文件里
+fn assert_four_fields(config: &str) {
+    for gone in ["on_error:", "scope:", "settings:"] {
+        assert!(!config.contains(gone), "{gone} in\n{config}");
+    }
+}
+
 #[tokio::test]
 async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
     let b = bed();
@@ -203,13 +262,17 @@ async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
     assert_eq!(m["name"], "附加日期");
     assert_eq!(m["permissions"], json!(["system"]));
     assert_eq!(m["scope"]["clients"], json!(["claude-code"]));
+    assert_eq!(m["on_error"], "reject");
     assert_eq!(
         m["hooks"],
         json!({"request": true, "reply_text": false, "tool_call": false})
     );
+    // 设置项按源码里写的先后（`source` 写出来的 JSON 键按字母排），带着此刻的值
     assert_eq!(m["settings_schema"][0]["key"], "days");
     assert_eq!(m["settings_schema"][0]["kind"], "number");
-    assert_eq!(m["settings_schema"][0]["default"], json!(1.0));
+    assert_eq!(m["settings_schema"][0]["value"], json!(1.0));
+    assert_eq!(m["settings_schema"][1]["key"], "note");
+    assert_eq!(m["settings_schema"][1]["value"], "今天");
 
     let bad = format!("{src}// @@syntax@@\n");
     let (st, v) = call(
@@ -225,6 +288,24 @@ async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
     assert_eq!(v["error"]["line"], 3);
     assert_eq!(v["error"]["column"], 1);
 
+    // 不是纯数据的 manifest：说得出在哪一行哪一列
+    let expr = "export const manifest = {\n  name: \"x\" + \"y\",\n  api: 1,\n  permissions: [\"system\"],\n};\nexport function onRequest(req, ctx) {}\n";
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": expr})),
+    )
+    .await;
+    assert_eq!(
+        v["error"]["message"]["code"], "gw.plugin.manifest_not_data_at",
+        "{v}"
+    );
+    assert_eq!(
+        (v["error"]["line"].clone(), v["error"]["column"].clone()),
+        (json!(2), json!(13))
+    );
+
     // 什么都没留下
     assert_eq!(b.config(), BASE);
     assert!(files_in(&b.dir.join("plugins")).is_empty());
@@ -234,17 +315,11 @@ async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
 async fn installing_writes_the_file_its_approved_copy_and_one_entry() {
     let b = bed();
     let src = add_date();
-    let id = b
-        .install(
-            &src,
-            json!({"scope": {"clients": ["claude-code"], "models": [], "upstreams": []},
-                              "settings": {"note": "明天"}}),
-        )
-        .await;
+    let id = b.install(&src, json!({})).await;
     // 名字里没有拉丁字母
     assert_eq!(id, "plugin");
-    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), src);
-    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), src);
+    assert_eq!(b.read(b.file(&id)), src);
+    assert_eq!(b.read(b.approved(&id)), src);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -260,30 +335,40 @@ async fn installing_writes_the_file_its_approved_copy_and_one_entry() {
         assert_eq!(mode, 0o700);
     }
 
+    // 配置里只有 id、文件、哈希和开关
     let cfg = b.parsed();
     let p = &cfg.plugins[0];
     assert_eq!(p.file, "plugins/plugin.js");
     assert_eq!(p.sha256, sha(&src));
     assert!(p.enabled);
-    assert_eq!(p.on_error, tw_config::PluginOnError::Reject);
-    assert_eq!(p.scope.clients, ["claude-code"]);
-    // 设置每一项都写明：给了的照写，没给的写默认值；整数写成整数
-    assert_eq!(p.settings["note"], serde_yaml_ng::Value::from("明天"));
-    assert_eq!(p.settings["days"], serde_yaml_ng::Value::from(1));
-    assert!(b.config().contains("    days: 1\n"), "{}", b.config());
+    assert!(
+        b.config().ends_with(&format!(
+            "plugins:\n  - id: plugin\n    file: plugins/plugin.js\n    sha256: {}\n    enabled: true\n",
+            sha(&src)
+        )),
+        "{}",
+        b.config()
+    );
     // 注释还在
     assert!(b.config().contains("# 默认那把"));
 
+    // 出错时怎么办、范围、设置的值都是文件里写的
     let v = b.plugin(&id).await;
     assert_eq!(v["status"], json!({"kind": "ok"}));
     assert_eq!(v["name"], "附加日期");
     assert_eq!(v["description"], "在系统提示里写上今天的日期");
     assert_eq!(v["sha256"], sha(&src));
-    assert_eq!(v["settings"], json!({"note": "明天", "days": 1.0}));
+    assert_eq!(v["on_error"], "reject");
+    assert_eq!(v["scope"]["clients"], json!(["claude-code"]));
+    assert_eq!(v["settings_schema"][0]["value"], json!(1.0));
+    assert_eq!(v["settings_schema"][1]["value"], "今天");
+    assert!(v.get("settings").is_none(), "{v}");
     assert_eq!(v["stats"]["calls"], 0);
     // 网关手里的那一份能跑
     let rt = b.gw.runtime();
-    assert!(rt.plugins.get(&id).unwrap().ready().is_some());
+    let a = rt.plugins.get(&id).unwrap();
+    assert!(a.ready().is_some());
+    assert_eq!(a.settings["note"], json!("今天"));
 }
 
 #[tokio::test]
@@ -296,16 +381,15 @@ async fn an_id_is_checked_and_a_second_plugin_of_the_same_name_gets_its_own() {
     for (id, code) in [
         ("Bad_Id", "control.plugin.bad_id"),
         ("order", "control.plugin.reserved_id"),
+        ("rewrite", "control.plugin.reserved_id"),
+        ("confirmed", "control.plugin.reserved_id"),
         ("shout", "control.plugin.id_taken"),
     ] {
         let (st, v) = call(
             &b.app,
             "POST",
             "/plugins",
-            Some(
-                json!({"source": shout(), "id": id, "enabled": true, "on_error": "skip",
-                        "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}}),
-            ),
+            Some(json!({"source": shout(), "id": id, "enabled": true})),
         )
         .await;
         assert!(st.is_client_error(), "{id}: {st} {v}");
@@ -317,8 +401,7 @@ async fn an_id_is_checked_and_a_second_plugin_of_the_same_name_gets_its_own() {
 #[tokio::test]
 async fn two_plugins_of_one_name_installed_at_once_get_their_own_ids() {
     let b = bed();
-    let body = json!({"source": shout(), "enabled": true, "on_error": "reject",
-                      "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}});
+    let body = json!({"source": shout(), "enabled": true});
     let (one, two) = tokio::join!(
         call(&b.app, "POST", "/plugins", Some(body.clone())),
         call(&b.app, "POST", "/plugins", Some(body)),
@@ -336,41 +419,38 @@ async fn two_plugins_of_one_name_installed_at_once_get_their_own_ids() {
     assert!(b.file("shout").exists() && b.file("shout-2").exists());
 }
 
-/// 装之前编一遍：编不成、设置不对的都不装，**一个文件都不写**
+/// 装之前编一遍：编不成、manifest 不是纯数据的都不装，**一个文件都不写**
 #[tokio::test]
-async fn a_plugin_that_does_not_load_or_has_wrong_settings_is_not_installed() {
+async fn a_plugin_that_does_not_load_is_not_installed() {
     let b = bed();
-    let body = |src: String, settings: Value| {
-        json!({"source": src, "enabled": true, "on_error": "reject",
-               "scope": {"clients": [], "models": [], "upstreams": []}, "settings": settings})
-    };
-    let (st, v) = call(
-        &b.app,
-        "POST",
-        "/plugins",
-        Some(body(format!("{}// @@syntax@@\n", add_date()), json!({}))),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "gw.plugin.syntax_at");
-    let (st, v) = call(
-        &b.app,
-        "POST",
-        "/plugins",
-        Some(body(add_date(), json!({"days": "x"}))),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "gw.plugin.setting_type");
-    let (st, v) = call(
-        &b.app,
-        "POST",
-        "/plugins",
-        Some(body(add_date(), json!({"colour": "red"}))),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "gw.plugin.setting_unknown");
+    for (src, code) in [
+        (
+            format!("{}// @@syntax@@\n", add_date()),
+            "gw.plugin.syntax_at",
+        ),
+        (
+            "export const manifest = { name: NAME, api: 1, permissions: [\"system\"] };\nexport function onRequest(req) {}\n".to_string(),
+            "gw.plugin.manifest_not_data_at",
+        ),
+        (
+            source(
+                json!({"name": "x", "api": 1, "permissions": ["system"],
+                       "settings": {"a": {"type": "number", "label": "A", "default": 1}}}),
+                &["onRequest"],
+            ),
+            "gw.plugin.manifest",
+        ),
+    ] {
+        let (st, v) = call(
+            &b.app,
+            "POST",
+            "/plugins",
+            Some(json!({"source": src, "enabled": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], code, "{src}");
+    }
     assert_eq!(b.config(), BASE);
     assert!(files_in(&b.dir.join("plugins")).is_empty());
 }
@@ -383,11 +463,7 @@ async fn a_stale_write_puts_the_files_back() {
         &b.app,
         "POST",
         "/plugins",
-        Some(
-            json!({"source": shout(), "enabled": true, "on_error": "reject",
-                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {},
-                    "base_version": "not-this-one"}),
-        ),
+        Some(json!({"source": shout(), "enabled": true, "base_version": "not-this-one"})),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
@@ -395,73 +471,218 @@ async fn a_stale_write_puts_the_files_back() {
     assert!(!b.file("shout").exists());
     assert!(!b.approved("shout").exists());
 
-    // 换源码同理：旧的那一份原样回来
+    // 保存同理：旧的那一份原样回来
     let id = b.install(&shout(), json!({})).await;
-    let newer = shout().replace("Shout", "Louder");
-    let (st, _) = call(
-        &b.app,
-        "PUT",
-        &format!("/plugins/{id}/source"),
-        Some(json!({"source": newer, "base_version": "not-this-one"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::CONFLICT);
-    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), shout());
-    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), shout());
-}
-
-#[tokio::test]
-async fn replacing_the_source_rewrites_the_file_the_copy_and_the_hash_and_keeps_fitting_settings() {
-    let b = bed();
-    let id = b
-        .install(
-            &add_date(),
-            json!({"settings": {"note": "明天", "days": 3}}),
+    for newer in [
+        shout().replace("Shout", "Louder"),
+        b.rewrite(&shout(), "skip", json!([]), json!({})).await,
+    ] {
+        let (st, v) = call(
+            &b.app,
+            "PUT",
+            &format!("/plugins/{id}"),
+            Some(json!({"source": newer, "enabled": true, "base_version": "not-this-one"})),
         )
         .await;
-    // 新的一版：`days` 改成了字符串，`note` 没变，多了一个 `loud`
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(b.read(b.file(&id)), shout());
+        assert_eq!(b.read(b.approved(&id)), shout());
+    }
+}
+
+/// 改代码：文件、底稿、哈希一起换成新的一份，开关照交来的
+#[tokio::test]
+async fn saving_new_code_rewrites_the_file_the_copy_and_the_hash() {
+    let b = bed();
+    let id = b.install(&add_date(), json!({})).await;
     let newer = source(
         json!({"name": "附加日期", "api": 1, "permissions": ["system"],
-               "settings": {"note": {"type": "string", "label": "附加内容", "default": ""},
-                            "days": {"type": "string", "label": "天数", "default": "1"},
-                            "loud": {"type": "boolean", "label": "大声", "default": true}}}),
+               "settings": {"note": {"type": "string", "label": "附加内容", "value": "后天"},
+                            "loud": {"type": "boolean", "label": "大声", "value": true}}}),
         &["onRequest"],
     );
+    let (st, v) = b.save(&id, &newer, false).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.read(b.file(&id)), newer);
+    assert_eq!(b.read(b.approved(&id)), newer);
+    let p = &b.parsed().plugins[0];
+    assert_eq!(p.sha256, sha(&newer));
+    assert!(!p.enabled);
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "disabled"}));
+    assert_eq!(v["settings_schema"][0]["key"], "loud");
+
+    // 编不成的不存，文件不动
+    let (st, v) = b.save(&id, &format!("{newer}// @@syntax@@\n"), true).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "gw.plugin.syntax_at");
+    assert_eq!(b.read(b.file(&id)), newer);
+
+    let (st, _) = b.save("nobody", &newer, true).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 只改了数据（出错时怎么办、范围、设置的值）：文件、底稿和哈希一次换掉，**中间没有
+/// 「文件变了」的那一刻** —— 目录监听开着也看不到，插件一直跑着
+#[tokio::test]
+async fn a_data_only_save_swaps_the_file_and_the_hash_without_a_changed_state() {
+    let b = bed();
+    let src = add_date();
+    let id = b.install(&src, json!({})).await;
+    let _w = tw_control::plugins::spawn_watcher(b.gw.clone(), &b.dir.join("config.yaml")).unwrap();
+    let mut events = b.gw.bus.subscribe();
+    let newer = b
+        .rewrite(
+            &src,
+            "skip",
+            json!(["claude-*"]),
+            json!({"note": "明天", "days": 3}),
+        )
+        .await;
+    assert_ne!(newer, src);
+    let (st, v) = b.save(&id, &newer, true).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.read(b.file(&id)), newer);
+    assert_eq!(b.read(b.approved(&id)), newer);
+    assert_eq!(b.parsed().plugins[0].sha256, sha(&newer));
+    // 监听等一等：它要是看到了「变了」，这里就是 changed
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "ok"}), "{v}");
+    assert_eq!(v["on_error"], "skip");
+    assert_eq!(v["scope"]["models"], json!(["claude-*"]));
+    // 范围是整份交的：交来的 clients 是空的
+    assert_eq!(v["scope"]["clients"], json!([]));
+    assert_eq!(v["settings_schema"][0]["value"], json!(3.0));
+    assert_eq!(v["settings_schema"][1]["value"], "明天");
+    let a = b.gw.runtime().plugins.get(&id).unwrap().clone();
+    assert!(a.ready().is_some());
+    assert_eq!(a.settings["days"], json!(3));
+    while let Ok(ev) = events.try_recv() {
+        assert!(
+            !matches!(ev, tw_api::Event::PluginFailed { .. }),
+            "a data-only save was announced as a failure: {ev:?}"
+        );
+    }
+}
+
+/// 源码和批准的一字不差：只改开关，**文件不动** —— 磁盘上被人改过、还没批准的那一份
+/// 照样留着待批
+#[tokio::test]
+async fn turning_a_plugin_off_and_on_leaves_the_files_alone() {
+    let b = bed();
+    let id = b.install(&add_date(), json!({})).await;
+    let edited = format!("{}// 还没批准的改动\n", add_date());
+    std::fs::write(b.file(&id), &edited).unwrap();
+    b.gw.reload_plugins();
+    for enabled in [false, true] {
+        let (st, v) = b.save(&id, &add_date(), enabled).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(b.parsed().plugins[0].enabled, enabled);
+        assert_eq!(b.read(b.file(&id)), edited);
+        assert_eq!(b.read(b.approved(&id)), add_date());
+        assert_eq!(b.parsed().plugins[0].sha256, sha(&add_date()));
+    }
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "changed"}));
+}
+
+/// 改写：只换 manifest 那一段，交回改写之后的源码；**什么都不写**
+#[tokio::test]
+async fn rewriting_returns_the_new_source_and_writes_nothing() {
+    let b = bed();
+    let src = format!("// 上面的注释\n{}// 下面的注释\n", add_date());
+    let out = b
+        .rewrite(
+            &src,
+            "skip",
+            json!([" gpt-* ", "claude-*"]),
+            json!({"days": 2.5}),
+        )
+        .await;
+    assert!(
+        out.starts_with("// 上面的注释\nexport const manifest = {\n"),
+        "{out}"
+    );
+    assert!(out.ends_with("// 下面的注释\n"), "{out}");
+    assert!(out.contains("  on_error: \"skip\",\n"), "{out}");
+    // 范围是整份交的：交来的 clients 是空的，就改成空的
+    assert!(
+        out.contains("match: { clients: [], models: [\"gpt-*\", \"claude-*\"] },"),
+        "{out}"
+    );
+    assert!(out.contains("value: 2.5 },"), "{out}");
+    // 改写的结果原样交给 inspect，读出来就是改成的那样
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/plugins/inspect",
+        Some(json!({"source": out})),
+    )
+    .await;
+    assert_eq!(v["manifest"]["on_error"], "skip");
+    assert_eq!(
+        v["manifest"]["scope"]["models"],
+        json!(["gpt-*", "claude-*"])
+    );
+    assert_eq!(v["manifest"]["settings_schema"][0]["value"], json!(2.5));
+    // 交来的就是原来的值：原样交回，一个字节不变
     let (st, v) = call(
         &b.app,
-        "PUT",
-        &format!("/plugins/{id}/source"),
-        Some(json!({"source": newer, "base_version": b.version().await})),
+        "POST",
+        "/plugins/rewrite",
+        Some(json!({"source": src, "on_error": "reject",
+                    "scope": {"clients": ["claude-code"], "models": [], "upstreams": []},
+                    "settings": {"note": "今天"}})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), newer);
-    assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), newer);
-    let cfg = b.parsed();
-    let p = &cfg.plugins[0];
-    assert_eq!(p.sha256, sha(&newer));
-    assert_eq!(p.settings["note"], serde_yaml_ng::Value::from("明天"));
-    assert_eq!(p.settings["days"], serde_yaml_ng::Value::from("1"));
-    assert_eq!(p.settings["loud"], serde_yaml_ng::Value::from(true));
-    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+    assert_eq!(v["source"], src);
 
-    let (st, _) = call(
-        &b.app,
-        "PUT",
-        "/plugins/nobody/source",
-        Some(json!({"source": newer})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
+    for (body, code) in [
+        (
+            json!({"source": src, "on_error": "reject",
+                   "scope": {"clients": [], "models": [], "upstreams": []},
+                   "settings": {"colour": "red"}}),
+            "gw.plugin.setting_unknown",
+        ),
+        (
+            json!({"source": src, "on_error": "reject",
+                   "scope": {"clients": [], "models": [], "upstreams": []},
+                   "settings": {"days": true}}),
+            "gw.plugin.setting_type",
+        ),
+        (
+            json!({"source": src, "on_error": "reject",
+                   "scope": {"clients": [" "], "models": [], "upstreams": []},
+                   "settings": {}}),
+            "control.plugin.blank_pattern",
+        ),
+        (
+            json!({"source": "export const manifest = make();", "on_error": "reject",
+                   "scope": {"clients": [], "models": [], "upstreams": []},
+                   "settings": {}}),
+            "gw.plugin.manifest_not_data_at",
+        ),
+        (
+            json!({"source": "const nothing = 1;", "on_error": "reject",
+                   "scope": {"clients": [], "models": [], "upstreams": []},
+                   "settings": {}}),
+            "gw.plugin.manifest_not_data",
+        ),
+    ] {
+        let (st, v) = call(&b.app, "POST", "/plugins/rewrite", Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], code);
+    }
+    assert_eq!(b.config(), BASE);
+    assert!(files_in(&b.dir.join("plugins")).is_empty());
 }
 
 /// I9：磁盘上的文件被改了，插件停用、说一声；看过改动、批准了才回来
 #[tokio::test]
 async fn a_file_edited_on_disk_stops_the_plugin_until_the_change_is_approved() {
     let b = bed();
-    let id = b
-        .install(&add_date(), json!({"settings": {"days": 2}}))
-        .await;
+    let id = b.install(&add_date(), json!({})).await;
     let mut events = b.gw.bus.subscribe();
 
     let edited = format!("{}// 加了一行\n", add_date());
@@ -517,12 +738,9 @@ async fn a_file_edited_on_disk_stops_the_plugin_until_the_change_is_approved() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(b.parsed().plugins[0].sha256, sha(&again));
     assert_eq!(std::fs::read_to_string(b.approved(&id)).unwrap(), again);
-    // 文件本身没被动过；设置照旧
+    // 文件本身没被动过
     assert_eq!(std::fs::read_to_string(b.file(&id)).unwrap(), again);
-    assert_eq!(
-        b.parsed().plugins[0].settings["days"],
-        serde_yaml_ng::Value::from(2)
-    );
+    assert_four_fields(&b.config());
     assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
 }
 
@@ -583,72 +801,6 @@ async fn the_watcher_notices_an_edited_plugin_within_seconds() {
 }
 
 #[tokio::test]
-async fn updating_changes_the_switches_scope_and_settings_and_nothing_else() {
-    let b = bed();
-    let id = b.install(&add_date(), json!({})).await;
-    let (st, v) = call(
-        &b.app,
-        "PUT",
-        &format!("/plugins/{id}"),
-        Some(json!({"enabled": false, "on_error": "skip",
-                    "scope": {"clients": [], "models": ["claude-*"], "upstreams": ["anthropic"]},
-                    "settings": {"note": "后天", "days": 2.5},
-                    "base_version": b.version().await})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let cfg = b.parsed();
-    let p = &cfg.plugins[0];
-    assert!(!p.enabled);
-    assert_eq!(p.on_error, tw_config::PluginOnError::Skip);
-    assert!(p.scope.clients.is_empty());
-    assert_eq!(p.scope.models, ["claude-*"]);
-    assert_eq!(p.settings["days"], serde_yaml_ng::Value::from(2.5));
-    assert_eq!(p.sha256, sha(&add_date()));
-    let v = b.plugin(&id).await;
-    assert_eq!(v["status"], json!({"kind": "disabled"}));
-    assert_eq!(v["on_error"], "skip");
-    assert_eq!(v["scope"]["upstreams"], json!(["anthropic"]));
-
-    for (settings, code) in [
-        (json!({"days": true}), "gw.plugin.setting_type"),
-        (json!({"nope": 1}), "gw.plugin.setting_unknown"),
-    ] {
-        let (st, v) = call(
-            &b.app,
-            "PUT",
-            &format!("/plugins/{id}"),
-            Some(json!({"enabled": true, "on_error": "reject",
-                        "scope": {"clients": [], "models": [], "upstreams": []},
-                        "settings": settings})),
-        )
-        .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-        assert_eq!(v["code"], code);
-    }
-    let (st, v) = call(
-        &b.app,
-        "PUT",
-        &format!("/plugins/{id}"),
-        Some(json!({"enabled": true, "on_error": "reject",
-                    "scope": {"clients": [" "], "models": [], "upstreams": []},
-                    "settings": {}})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert_eq!(v["code"], "control.plugin.blank_pattern");
-    let (st, _) = call(
-        &b.app,
-        "PUT",
-        "/plugins/nobody",
-        Some(json!({"enabled": true, "on_error": "reject",
-                    "scope": {"clients": [], "models": [], "upstreams": []}, "settings": {}})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
 async fn reordering_changes_the_run_order_and_needs_every_plugin_once() {
     let b = bed();
     let a = b.install(&shout(), json!({"id": "a"})).await;
@@ -672,7 +824,7 @@ async fn reordering_changes_the_run_order_and_needs_every_plugin_once() {
         .collect();
     assert_eq!(listed, ["d", "a", "c"]);
     // 每一项搬过去时整项都在
-    assert_eq!(b.parsed().plugins[0].settings.len(), 2);
+    assert_eq!(b.parsed().plugins[0].sha256, sha(&add_date()));
 
     for ids in [
         json!(["d", "a"]),
@@ -1113,234 +1265,203 @@ fn rewrite_calls() -> String {
     source(
         json!({"name": "改工具调用", "api": 1, "permissions": ["reply.tool_calls"],
                "match": {"models": ["claude-*", "gpt-*"]},
-               "settings": {"mode": {"type": "string", "label": "方式", "default": "a"},
-                            "depth": {"type": "number", "label": "层数", "default": 2}}}),
+               "settings": {"mode": {"type": "string", "label": "方式", "value": "a"},
+                            "depth": {"type": "number", "label": "层数", "value": 2}}}),
         &["onToolCall"],
     )
 }
 
-/// 一份 `PluginUpdate`：开关、出错时怎么办、模型范围、设置
-fn update_body(enabled: bool, on_error: &str, models: Value, settings: Value) -> Value {
-    json!({"enabled": enabled, "on_error": on_error,
-           "scope": {"clients": [], "models": models, "upstreams": []},
-           "settings": settings})
+fn refused(st: StatusCode, v: &Value, what: &str) {
+    assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {v}");
+    assert_eq!(
+        v["code"], "control.plugin.needs_confirmation",
+        "{what}: {v}"
+    );
 }
 
-async fn put(b: &Bed, path: &str, mut body: Value) -> (StatusCode, Value) {
-    body["base_version"] = json!(b.version().await);
-    call(&b.app, "PUT", path, Some(body)).await
-}
-
-/// 网页那条路改不了工具调用插件做什么：打开它、改设置、改范围都要点过头。停用、改出错时
-/// 怎么办、排顺序、删照常；确认过的那条路什么都改得了
+/// 确认的规则（契约附录四第 3 节），表里的每一行：网页调得到的那条路拒不拒，点过头的那条
+/// 路收不收。拒绝的那几次，配置和文件一个字节都不动
 #[tokio::test]
-async fn a_tool_call_plugin_is_turned_on_or_steered_only_after_a_confirmation() {
+async fn the_confirmation_rule_row_by_row() {
     let b = bed();
+    let calls = rewrite_calls();
+
+    // 装一个改得了工具调用的：网页那条路拒绝，点过头的那条收
+    let before = b.config();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(json!({"source": calls, "enabled": false})),
+    )
+    .await;
+    refused(st, &v, "installing a tool-call plugin");
+    assert_eq!(v["args"]["plugin"], "改工具调用");
+    assert_eq!(b.config(), before);
+    assert!(files_in(&b.dir.join("plugins")).is_empty());
     let id = b
-        .install(
-            &rewrite_calls(),
-            json!({"enabled": false,
-                   "scope": {"clients": [], "models": ["claude-*", "gpt-*"], "upstreams": []}}),
+        .install_confirmed(&calls, json!({"id": "calls", "enabled": false}))
+        .await;
+    assert_eq!(b.read(b.file(&id)), calls);
+
+    // 装一个改不了的：网页那条路照收，开着装也行
+    let plain = b.install(&add_date(), json!({"id": "plain"})).await;
+    assert!(b.parsed().plugins[1].enabled);
+
+    // 打开改得了工具调用的：拒绝；点过头的那条打得开
+    let before = b.config();
+    let (st, v) = b.save(&id, &calls, true).await;
+    refused(st, &v, "turning it on");
+    assert_eq!(b.config(), before);
+
+    // 只改数据：照收（停用着的、开着的都是）
+    let data = b
+        .rewrite(
+            &calls,
+            "skip",
+            json!(["claude-*"]),
+            json!({"mode": "b", "depth": 5}),
         )
         .await;
-    let other = b.install(&shout(), json!({})).await;
-    let at = format!("/plugins/{id}");
-    let before = b.config();
-    let as_is = || {
-        update_body(
-            false,
-            "reject",
-            json!(["claude-*", "gpt-*"]),
-            json!({"mode": "a", "depth": 2}),
-        )
-    };
+    let (st, v) = b.save(&id, &data, false).await;
+    assert_eq!(st, StatusCode::OK, "a data-only save: {v}");
+    assert_eq!(b.read(b.file(&id)), data);
+    let (st, v) = b.save_confirmed(&id, &data, true).await;
+    assert_eq!(st, StatusCode::OK, "turning it on, confirmed: {v}");
+    assert!(b.parsed().plugins[0].enabled);
+    let more = b
+        .rewrite(&data, "reject", json!(["*"]), json!({"mode": "c"}))
+        .await;
+    let (st, v) = b.save(&id, &more, true).await;
+    assert_eq!(st, StatusCode::OK, "a data-only save while it is on: {v}");
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "ok"}));
+    assert_eq!(v["scope"]["models"], json!(["*"]));
 
-    for (what, body) in [
+    // 改代码：拒绝（manifest 以外改了一个字节、manifest 里别的字段改了，都算）
+    for (what, code) in [
         (
-            "turning it on",
-            update_body(
-                true,
-                "reject",
-                json!(["claude-*", "gpt-*"]),
-                json!({"mode": "a", "depth": 2}),
-            ),
+            "a change outside the manifest",
+            format!("{more}// 多一行\n"),
         ),
         (
-            "a setting",
-            update_body(
-                false,
-                "reject",
-                json!(["claude-*", "gpt-*"]),
-                json!({"mode": "b", "depth": 2}),
-            ),
+            "a new label",
+            more.replace("label: \"方式\"", "label: \"Mode\""),
         ),
         (
-            "a number setting",
-            update_body(
-                false,
-                "reject",
-                json!(["claude-*", "gpt-*"]),
-                json!({"mode": "a", "depth": 3}),
-            ),
-        ),
-        (
-            "the scope",
-            update_body(
-                false,
-                "reject",
-                json!(["*"]),
-                json!({"mode": "a", "depth": 2}),
-            ),
-        ),
-        (
-            "the scope by removing an entry",
-            update_body(
-                false,
-                "reject",
-                json!(["claude-*"]),
-                json!({"mode": "a", "depth": 2}),
+            "dropping reply.tool_calls",
+            source(
+                json!({"name": "改工具调用", "api": 1, "permissions": ["reply.text"]}),
+                &["onReplyText"],
             ),
         ),
     ] {
-        let (st, v) = put(&b, &at, body).await;
-        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {v}");
-        assert_eq!(
-            v["code"], "control.plugin.needs_confirmation",
-            "{what}: {v}"
-        );
-        assert_eq!(v["args"]["plugin"], "改工具调用", "{what}: {v}");
+        assert_ne!(code, more, "{what}");
+        let before = b.config();
+        let (st, v) = b.save(&id, &code, true).await;
+        refused(st, &v, what);
         assert_eq!(b.config(), before, "{what}");
+        assert_eq!(b.read(b.file(&id)), more, "{what}");
     }
+    let code = format!("{more}// 多一行\n");
+    let (st, v) = b.save_confirmed(&id, &code, true).await;
+    assert_eq!(st, StatusCode::OK, "a code change, confirmed: {v}");
+    assert_eq!(b.read(b.file(&id)), code);
 
-    // 什么都没变、只是交回原样（顺序不同、没给的设置按默认值算）：照收
-    let (st, v) = put(&b, &at, as_is()).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = put(
-        &b,
-        &at,
-        update_body(false, "reject", json!(["gpt-*", "claude-*"]), json!({})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    // 出错时怎么办照改
-    let (st, v) = put(
-        &b,
-        &at,
-        update_body(
-            false,
-            "skip",
-            json!(["claude-*", "gpt-*"]),
-            json!({"mode": "a"}),
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(
-        b.parsed().plugins[0].on_error,
-        tw_config::PluginOnError::Skip
+    // 给一个改不了工具调用的插件加上 reply_tool_calls：拒绝
+    let adds = source(
+        json!({"name": "附加日期", "api": 1, "permissions": ["system", "reply.tool_calls"]}),
+        &["onRequest", "onToolCall"],
     );
+    let (st, v) = b.save(&plain, &adds, true).await;
+    refused(st, &v, "adding reply.tool_calls");
+    assert_eq!(v["args"]["plugin"], "附加日期");
+    assert_eq!(b.read(b.file(&plain)), add_date());
+    // 改不了工具调用的插件改代码：照收
+    let plain_code = format!("{}// 改了一行\n", add_date());
+    let (st, v) = b.save(&plain, &plain_code, true).await;
+    assert_eq!(st, StatusCode::OK, "a code change of a plain plugin: {v}");
 
-    // 确认过的那条路：打开、改设置、改范围一次改完
-    let (st, v) = put(
-        &b,
-        &format!("{at}/confirmed"),
-        update_body(
-            true,
-            "skip",
-            json!(["claude-*"]),
-            json!({"mode": "b", "depth": 5}),
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let p = b.parsed().plugins[0].clone();
-    assert!(p.enabled);
-    assert_eq!(p.scope.models, ["claude-*"]);
-    assert_eq!(p.settings["mode"], serde_yaml_ng::Value::from("b"));
-    assert_eq!(p.settings["depth"], serde_yaml_ng::Value::from(5));
+    // 批准磁盘上改过的文件：改得了工具调用的拒绝，改不了的照收
+    let on_disk = format!("{code}// 磁盘上改的\n");
+    std::fs::write(b.file(&id), &on_disk).unwrap();
+    let plain_disk = format!("{plain_code}// 磁盘上改的\n");
+    std::fs::write(b.file(&plain), &plain_disk).unwrap();
+    b.gw.reload_plugins();
+    let before = b.config();
+    let (st, v) = b
+        .approve_at(&format!("/plugins/{id}/approve"), &on_disk)
+        .await;
+    refused(st, &v, "approving a tool-call plugin's file");
+    assert_eq!(b.config(), before);
+    assert_eq!(b.read(b.approved(&id)), code);
+    let (st, v) = b
+        .approve_at(&format!("/plugins/{plain}/approve"), &plain_disk)
+        .await;
+    assert_eq!(st, StatusCode::OK, "approving a plain plugin's file: {v}");
+    let (st, v) = b
+        .approve_at(&format!("/plugins/{id}/approve/confirmed"), &on_disk)
+        .await;
+    assert_eq!(st, StatusCode::OK, "approving, confirmed: {v}");
+    assert_eq!(b.read(b.approved(&id)), on_disk);
     assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
 
-    // 开着的时候：改设置照样要点头；只改出错时怎么办不用
-    let (st, v) = put(
-        &b,
-        &at,
-        update_body(
-            true,
-            "skip",
-            json!(["claude-*"]),
-            json!({"mode": "c", "depth": 5}),
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    let (st, v) = put(
-        &b,
-        &at,
-        update_body(
-            true,
-            "reject",
-            json!(["claude-*"]),
-            json!({"mode": "b", "depth": 5}),
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    // 停用照常
-    let (st, v) = put(
-        &b,
-        &at,
-        update_body(
-            false,
-            "reject",
-            json!(["claude-*"]),
-            json!({"mode": "b", "depth": 5}),
-        ),
-    )
-    .await;
+    // 点过头的那几条也要插件在
+    let (st, _) = b.save_confirmed("nobody", &calls, true).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = b
+        .approve_at("/plugins/nobody/approve/confirmed", &calls)
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 只改数据的保存同时又要打开它：打开那一半要点头
+#[tokio::test]
+async fn a_data_only_save_that_also_turns_a_tool_call_plugin_on_needs_a_confirmation() {
+    let b = bed();
+    let id = b
+        .install_confirmed(&rewrite_calls(), json!({"enabled": false}))
+        .await;
+    let data = b
+        .rewrite(&rewrite_calls(), "skip", json!([]), json!({"mode": "z"}))
+        .await;
+    let (st, v) = b.save(&id, &data, true).await;
+    refused(st, &v, "a data-only save that turns it on");
+    assert!(!b.parsed().plugins[0].enabled);
+    assert_eq!(b.read(b.file(&id)), rewrite_calls());
+}
+
+/// 停用、删、排顺序：开着的工具调用插件也照常，网页那条路就行
+#[tokio::test]
+async fn disabling_deleting_and_reordering_never_need_a_confirmation() {
+    let b = bed();
+    let id = b.install_confirmed(&rewrite_calls(), json!({})).await;
+    let other = b.install(&shout(), json!({})).await;
+    assert!(b.parsed().plugins[0].enabled);
+    let (st, v) = b.save(&id, &rewrite_calls(), false).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(!b.parsed().plugins[0].enabled);
-
-    // 排顺序、删照常
-    let (st, v) = put(&b, "/plugins/order", json!({"ids": [other, id]})).await;
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/plugins/order",
+        Some(json!({"ids": [other, id], "base_version": b.version().await})),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let (st, v) = call(
         &b.app,
         "DELETE",
-        &format!("{at}?base_version={}", b.version().await),
+        &format!("/plugins/{id}?base_version={}", b.version().await),
         None,
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(b.parsed().plugins.iter().all(|p| p.id != id));
-
-    // 确认过的那条路也要插件在
-    let (st, _) = put(&b, "/plugins/nobody/confirmed", as_is()).await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-}
-
-/// 没有工具调用权限的插件：网页那条路照常打开、改设置、改范围
-#[tokio::test]
-async fn a_plugin_without_tool_calls_is_changed_without_a_confirmation() {
-    let b = bed();
-    let id = b.install(&add_date(), json!({"enabled": false})).await;
-    let (st, v) = put(
-        &b,
-        &format!("/plugins/{id}"),
-        update_body(
-            true,
-            "reject",
-            json!(["gpt-*"]),
-            json!({"note": "明天", "days": 4}),
-        ),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(b.parsed().plugins[0].enabled);
 }
 
 /// 批准的那份字节读不回来（文件和底稿都被动过）：真的权限编不出来，按改得了工具调用算
-/// —— 它此刻跑不了，可一旦又跑得了，网页替它打开的开关就生效了。列表上显示的是之前编过
-/// 的那一份（只拿来显示），判断不认它
+/// —— 它此刻跑不了，可一旦又跑得了，网页替它打开的开关就生效了。只停用照常
 #[tokio::test]
 async fn a_plugin_whose_permissions_cannot_be_read_needs_a_confirmation_too() {
     let b = bed();
@@ -1352,31 +1473,163 @@ async fn a_plugin_whose_permissions_cannot_be_read_needs_a_confirmation_too() {
         b.gw.runtime().plugins.get(&id).unwrap().broken(),
         Some(&tw_gateway::plugin::Broken::Changed)
     );
-    let (st, v) = put(
-        &b,
-        &format!("/plugins/{id}"),
-        update_body(true, "reject", json!([]), json!({})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    assert_eq!(v["code"], "control.plugin.needs_confirmation");
+    // 打开它（源码交的就是它装上时那一份，可那份字节已经找不到了：按改了代码算）
+    let (st, v) = b.save(&id, &shout(), true).await;
+    refused(st, &v, "turning on a plugin whose approved bytes are gone");
     assert_eq!(v["args"]["plugin"], "Shout");
-    // 改出错时怎么办照常
-    let (st, v) = put(
-        &b,
-        &format!("/plugins/{id}"),
-        update_body(false, "skip", json!([]), json!({})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = put(
-        &b,
-        &format!("/plugins/{id}/confirmed"),
-        update_body(true, "skip", json!([]), json!({})),
-    )
-    .await;
+    // 批准磁盘上那一份（新的一份读不出 manifest，编不成）：拒绝的是编不成
+    let (st, v) = b
+        .approve_at(&format!("/plugins/{id}/approve"), "tampered")
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // 点过头的那条路：打开、换成新的一份都行
+    let (st, v) = b.save_confirmed(&id, &shout(), true).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(b.parsed().plugins[0].enabled);
+    assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
+}
+
+/// 直接写配置原文的那几条路（整份写回、按路径改、回滚）也是网页调得到的：打开、批准、装上
+/// 一个改得了工具调用的插件，在那里同样要点头；改不了的照常
+#[tokio::test]
+async fn raw_configuration_writes_cannot_bypass_the_confirmation() {
+    let b = bed();
+    let id = b
+        .install_confirmed(&rewrite_calls(), json!({"id": "calls", "enabled": false}))
+        .await;
+    let plain = b.install(&shout(), json!({"enabled": false})).await;
+    let flip = |text: &str, which: &str| {
+        let at = text.find(&format!("  - id: {which}\n")).unwrap();
+        let end = text[at..].find("enabled: false").unwrap() + at;
+        format!(
+            "{}enabled: true{}",
+            &text[..end],
+            &text[end + "enabled: false".len()..]
+        )
+    };
+    let put = |text: String| {
+        let b = &b;
+        async move {
+            call(
+                &b.app,
+                "PUT",
+                "/config",
+                Some(json!({"text": text, "base_version": b.version().await})),
+            )
+            .await
+        }
+    };
+    // 界面手里的原文：控制面的钥匙是打码的
+    let shown = || {
+        let b = &b;
+        async move {
+            let (_, v) = call(&b.app, "GET", "/config", None).await;
+            let text = v["text"].as_str().unwrap().to_string();
+            assert!(!text.contains("c0ffee00c0ffee00"), "{text}");
+            text
+        }
+    };
+
+    // 整份写回：打开改得了工具调用的，拒绝；改不了的照常
+    let before = shown().await;
+    let on_disk = b.config();
+    let (st, v) = put(flip(&before, &id)).await;
+    refused(st, &v, "turning it on in the text");
+    assert_eq!(b.config(), on_disk);
+    let (st, v) = put(flip(&before, &plain)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.parsed().plugins[1].enabled);
+
+    // 按路径改：同样
+    let before = b.config();
+    let (st, v) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        Some(
+            json!({"ops": [{"op": "replace", "path": "/plugins/0/enabled", "value": true}],
+                    "base_version": b.version().await}),
+        ),
+    )
+    .await;
+    refused(st, &v, "turning it on by path");
+    assert_eq!(b.config(), before);
+
+    // 把批准的哈希换成磁盘上改过的那一份 = 批准它：拒绝
+    let edited = format!("{}// 磁盘上改的\n", rewrite_calls());
+    std::fs::write(b.file(&id), &edited).unwrap();
+    let (st, v) = put(shown().await.replace(&sha(&rewrite_calls()), &sha(&edited))).await;
+    refused(st, &v, "approving it in the text");
+    assert_eq!(b.config(), before);
+    std::fs::write(b.file(&id), rewrite_calls()).unwrap();
+
+    // 回滚到它开着的那一版：拒绝
+    let (st, v) = b.save_confirmed(&id, &rewrite_calls(), true).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let on = b.version().await;
+    let (st, v) = b.save(&id, &rewrite_calls(), false).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let before = b.config();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/config/rollback",
+        Some(json!({"version": on})),
+    )
+    .await;
+    refused(st, &v, "rolling back to a version where it was on");
+    assert_eq!(b.config(), before);
+
+    // 和插件无关的改动照常
+    let (st, v) = put(shown().await.replace("# 默认那把", "# 改了一个注释")).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+/// 0.58 写下的配置：插件那一条还带着出错时怎么办、范围、设置。照样加载（这几项不起作用，
+/// 插件按文件里写的跑），**下一次写插件那一节时整节都去掉**，别的字节不动
+#[tokio::test]
+async fn a_configuration_written_by_0_58_loads_and_loses_the_old_fields_on_the_next_write() {
+    let b = bed();
+    let a = b.install(&add_date(), json!({"id": "a"})).await;
+    let c = b.install(&shout(), json!({"id": "c"})).await;
+    let text = b
+        .config()
+        .replace(
+            &format!("  - id: {a}\n"),
+            &format!(
+                "  # 我的第一个插件\n  - id: {a}\n    on_error: skip\n    scope:\n      models: [\"gpt-*\"]\n    settings:\n      note: 旧的\n      days: [1, 2]\n"
+            ),
+        )
+        .replace(
+            &format!("  - id: {c}\n"),
+            &format!("  - id: {c}\n    settings: {{ unknown: yes }}\n"),
+        );
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/config",
+        Some(json!({"text": text, "base_version": b.version().await})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(b.config().contains("on_error: skip"));
+    // 不起作用：照文件里写的
+    let v = b.plugin(&a).await;
+    assert_eq!(v["status"], json!({"kind": "ok"}));
+    assert_eq!(v["on_error"], "reject");
+    assert_eq!(v["scope"]["models"], json!([]));
+    assert_eq!(v["settings_schema"][1]["value"], "今天");
+
+    // 下一次写插件那一节（这里是改另一个插件的开关）：两条里的旧字段都去掉
+    let (st, v) = b.save(&c, &shout(), false).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let after = b.config();
+    assert_four_fields(&after);
+    assert!(after.contains("  # 我的第一个插件\n  - id: a\n"), "{after}");
+    assert!(after.contains("# 默认那把"), "{after}");
+    let p = b.parsed();
+    assert_eq!(p.plugins.len(), 2);
+    assert!(p.plugins[0].enabled && !p.plugins[1].enabled);
 }
 
 /// 远程 core：配置不在默认的地方，插件文件就在那份配置旁边 —— 文件由 core 自己写
@@ -1423,7 +1676,7 @@ async fn a_real_plugin_goes_through_the_sandbox_from_source_to_approval() {
   api: 1,
   permissions: ["system"],
   match: { models: ["claude-*"] },
-  settings: { note: { type: "string", label: "Note", default: "today" } },
+  settings: { note: { type: "string", label: "Note", value: "today" } },
 };
 export function onRequest(req, ctx) {
   return { ...req, system: `${req.system} ${ctx.settings.note}` };
@@ -1452,12 +1705,7 @@ export function onRequest(req, ctx) {
     assert!(v["manifest"].is_null(), "{v}");
     assert!(v["error"]["line"].is_number(), "{v}");
 
-    let id = b
-        .install(
-            src,
-            json!({"scope": {"clients": [], "models": ["claude-*"], "upstreams": []}}),
-        )
-        .await;
+    let id = b.install(src, json!({})).await;
     assert_eq!(id, "add-date");
     assert_eq!(b.plugin(&id).await["status"], json!({"kind": "ok"}));
     assert!(b.gw.runtime().plugins.get(&id).unwrap().ready().is_some());
@@ -1476,7 +1724,28 @@ export function onRequest(req, ctx) {
     assert_eq!(st, StatusCode::OK, "{v}");
     let v = b.plugin(&id).await;
     assert_eq!(v["status"], json!({"kind": "ok"}));
-    assert_eq!(v["settings_schema"][0]["default"], "tomorrow");
+    assert_eq!(v["settings_schema"][0]["value"], "tomorrow");
+
+    // 在界面上改数据：改写、保存，真的沙箱编出来就是改成的那样
+    let data = b
+        .rewrite(
+            &edited,
+            "skip",
+            json!(["gpt-*"]),
+            json!({"note": "next week"}),
+        )
+        .await;
+    assert!(data.ends_with("export function onRequest(req, ctx) {\n  return { ...req, system: `${req.system} ${ctx.settings.note}` };\n}\n"), "{data}");
+    let (st, v) = b.save(&id, &data, true).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let v = b.plugin(&id).await;
+    assert_eq!(v["status"], json!({"kind": "ok"}));
+    assert_eq!(v["on_error"], "skip");
+    assert_eq!(v["scope"]["models"], json!(["gpt-*"]));
+    assert_eq!(v["settings_schema"][0]["value"], "next week");
+    let a = b.gw.runtime().plugins.get(&id).unwrap().clone();
+    assert!(a.ready().is_some_and(|h| !h.dormant()));
+    assert_eq!(a.settings["note"], json!("next week"));
 }
 
 /// 试跑记下的嵌入请求，从控制面一路到真的沙箱：声明了嵌入的插件跑在一项输入一条消息的

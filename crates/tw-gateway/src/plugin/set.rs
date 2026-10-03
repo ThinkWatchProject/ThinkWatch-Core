@@ -86,8 +86,10 @@ pub struct Active {
     /// 插件自己起的名字（manifest 的 `name`）。读不出 manifest 时是 id。**插件写的字**
     pub name: String,
     pub enabled: bool,
+    /// 出错时怎么办：插件文件里写的（manifest 的 `on_error`）。读不出 manifest 时照批准的那份
+    /// 字节里写着的，再读不出是拒绝（见 [`crate::plugin::load`]）
     pub on_error: OnError,
-    /// 生效的范围：配置里的，不是 manifest 建议的
+    /// 管哪些请求：插件文件里写的（manifest 的 `match`），读不出时同 `on_error`
     pub scope: Scope,
     /// 读不出 manifest 时是空的
     pub permissions: Vec<tw_api::Permission>,
@@ -97,7 +99,8 @@ pub struct Active {
     pub requests: Vec<tw_api::RequestKind>,
     pub reply_mode: ReplyMode,
     pub hooks: Hooks,
-    /// 交给插件的设置：配置里写的盖在 manifest 的默认值上，键和类型都对过
+    /// 交给插件的设置：manifest 里每个设置此刻的值（`value`），加载时核对过类型。读不出
+    /// manifest 时是空的
     pub settings: serde_json::Map<String, serde_json::Value>,
     /// 读出来的 manifest。文件变了时是批准过的那一份的（只拿来显示，不跑）；
     /// 哪一份都读不出来时是 None
@@ -351,6 +354,7 @@ mod tests {
             permissions: Vec::new(),
             requests: crate::plugin::engine::DEFAULT_REQUESTS.to_vec(),
             scope: Scope::default(),
+            on_error: OnError::Reject,
             reply_mode: ReplyMode::Block,
             settings: Vec::new(),
             hooks,
@@ -407,6 +411,60 @@ mod tests {
         assert!(!s.covers(Some("codex"), "claude-sonnet-4-5", "anthropic"));
         assert!(!s.covers(Some("claude-code"), "gpt-5", "anthropic"));
         assert!(!s.covers(Some("claude-code"), "claude-sonnet-4-5", "relay"));
+    }
+
+    /// `*` 写在哪儿都行（开头、中间、结尾、好几个），不分大小写；三张单子都一样
+    #[test]
+    fn a_star_matches_anywhere_in_every_list_regardless_of_case() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("*", "anything", true),
+            ("*", "", true),
+            ("claude-*", "claude-sonnet-4-5", true),
+            ("*-mini", "gpt-4o-mini", true),
+            ("*-mini", "gpt-4o-mini-2024", false),
+            ("gpt-*-mini", "gpt-4o-mini", true),
+            ("gpt-*-mini", "gpt-4o", false),
+            ("*sonnet*", "claude-sonnet-4-5", true),
+            ("*sonnet*", "claude-opus-4-5", false),
+            ("c*d*e", "claude-code-relay-cde", true),
+            ("a*b*c", "acb", false),
+            ("**", "x", true),
+            ("Claude-*", "CLAUDE-OPUS", true),
+            ("*-RELAY", "cn-relay", true),
+            ("exact", "exact", true),
+            ("exact", "exactly", false),
+            ("exact", "EXACT", true),
+            (" padded* ", "padded-up", true),
+        ];
+        for &(pattern, value, want) in cases {
+            for (what, s, client, model, upstream) in [
+                (
+                    "clients",
+                    scope(&[pattern], &[], &[]),
+                    Some(value),
+                    "m",
+                    "u",
+                ),
+                ("models", scope(&[], &[pattern], &[]), Some("c"), value, "u"),
+                (
+                    "upstreams",
+                    scope(&[], &[], &[pattern]),
+                    Some("c"),
+                    "m",
+                    value,
+                ),
+            ] {
+                assert_eq!(
+                    s.covers(client, model, upstream),
+                    want,
+                    "{what}: {pattern:?} on {value:?}"
+                );
+            }
+        }
+        // 一张单子里有一个对上就算
+        let s = scope(&[], &["gpt-*", "*sonnet*"], &[]);
+        assert!(s.covers(None, "claude-sonnet-4-5", "u"));
+        assert!(!s.covers(None, "claude-opus-4-5", "u"));
     }
 
     /// 认不出是哪个应用的请求，挑应用的插件不管它 —— 管了就等于对每个不认识的
