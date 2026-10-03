@@ -400,10 +400,8 @@ slug_enum! {
     pub enum ProbeMode {
         /// 网关自己答
         Intercept = "intercept",
-        /// 照常走路由
-        Route = "route",
-        /// 原样转发
-        Passthrough = "passthrough",
+        /// 照常走路由，带着类别标记
+        Forward = "forward",
     }
 }
 
@@ -717,7 +715,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 不给网页调的 `POST /plugins/confirmed`、`PUT /plugins/{id}/confirmed`、
 /// `POST /plugins/{id}/approve/confirmed`。只改数据、停用、删、排顺序，装、打开、改、批准不碰
 /// 工具调用的插件，都不用点头 —— `CreatePlugin` 和 `ApprovePluginFile` 因此给网页调了。
-pub const CONTROL_API_VERSION: u32 = 35;
+///
+/// **36 起辅助请求只有两档**：[`ProbeMode`] 是 `intercept` / `forward`，`route` 和
+/// `passthrough` 合成了 `forward`（照常走规则，带着类别标记，`when.intent` 能命中）。
+/// [`DryRunOutcome`] 删了 `passthrough`：转发的那几类照常求值规则。[`RouteSave`] 的
+/// `route_probes` 删了，消息码 `control.unknown_probe_class` 跟着删。配置里
+/// `client_probes` 的取值同样只剩 `intercept` / `forward`。
+pub const CONTROL_API_VERSION: u32 = 36;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1738,15 +1742,14 @@ pub struct ProxyFault {
 
 /// 一类客户端辅助请求的处置。
 ///
-/// **这一段以前在界面上完全不存在，而它的缺席是连锁的**：路由条件
-/// `when.intent` 只有在对应那一类被配成 `route` 时才可能命中，所以
-/// 界面上那些写了 `intent` 的规则永远不会生效，而用户无从知道为什么。
+/// 路由条件 `when.intent` 只对 `forward` 的类别命中 —— `intercept` 的一个字节都不出
+/// 本机，到不了规则那一层。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProbeView {
     /// `health_check` / `warmup` / `titling` / `topic_detect` / `suggestion`
     pub id: ProbeClass,
-    /// `intercept` / `route` / `passthrough`
+    /// `intercept` / `forward`
     pub mode: ProbeMode,
 }
 
@@ -2904,12 +2907,6 @@ pub struct RouteSave {
     /// 不给就不动密钥的选择
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
-    /// 和路由一起写入：把这几类客户端辅助请求设为「交给路由」。
-    ///
-    /// **规则里的辅助请求条件只对交给路由的类别生效** —— 其余类别的请求在
-    /// 进路由之前就被本地应答或原样放行，不带类别标记，那个条件永远不满足
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub route_probes: Vec<String>,
 }
 
 /// 删除一条路由。
@@ -4416,8 +4413,6 @@ slug_enum! {
         Unavailable = "unavailable",
         /// 客户端的辅助请求，网关自己答
         Intercepted = "intercepted",
-        /// 客户端的辅助请求，原样转发
-        Passthrough = "passthrough",
     }
 }
 
@@ -4434,11 +4429,11 @@ pub struct DryRunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<GroupKind>,
     /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，
-    /// 见 `skipped`）| `intercepted` | `passthrough`
+    /// 见 `skipped`）| `intercepted`
     ///
-    /// **后两个说的是这个请求压根没到规则那一层。**客户端自己发的辅助
-    /// 请求先过 `client_probes`：本地应答的一个字节都不出本机，原样放行的
-    /// 直接转发 —— 两种情况下 `trace` 都是空的，因为确实一条规则都没求值。
+    /// **`intercepted` 说的是这个请求压根没到规则那一层。**客户端自己发的辅助
+    /// 请求先过 `client_probes`：本地应答的一个字节都不出本机，`trace` 是空的，
+    /// 因为确实一条规则都没求值。转发的那几类照常走规则，和普通请求一样。
     pub outcome: DryRunOutcome,
     /// 命中的规则名
     pub rule: Option<String>,

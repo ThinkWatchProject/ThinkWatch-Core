@@ -889,29 +889,26 @@ pub fn sections() -> Vec<Section> {
                 row(
                     "titling",
                     Kind::Enum(probe_actions),
-                    Def::Is("passthrough"),
+                    Def::Is("forward"),
                     t(
-                        "Requests that name a session. Passed through by default: intercepting them gives every session the same title.",
-                        "为会话起标题的请求。默认放行：拦下后所有会话都会是同一个标题。",
+                        "Requests that name a session. Forwarded by default: intercepting them gives every session the same title.",
+                        "为会话起标题的请求。默认转发：拦下后所有会话都会是同一个标题。",
                     ),
                 ),
                 row(
                     "topic_detect",
                     Kind::Enum(probe_actions),
-                    Def::Is("passthrough"),
+                    Def::Is("forward"),
                     t(
-                        "Topic detection. Passed through by default.",
-                        "话题检测。默认放行。",
+                        "Topic detection. Forwarded by default.",
+                        "话题检测。默认转发。",
                     ),
                 ),
                 row(
                     "suggestion",
                     Kind::Enum(probe_actions),
-                    Def::Is("passthrough"),
-                    t(
-                        "Suggestions. Passed through by default.",
-                        "建议。默认放行。",
-                    ),
+                    Def::Is("forward"),
+                    t("Suggestions. Forwarded by default.", "建议。默认转发。"),
                 ),
             ],
         },
@@ -1411,8 +1408,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::OneOrMany,
                     Def::Unset,
                     t(
-                        "A client helper request: `assistant_internal` for any of them, or one class (`titling`). Only classes set to `route` in `client_probes` reach routing.",
-                        "客户端的辅助请求：`assistant_internal` 表示任意一类，也可以写具体的一类（`titling`）。只有在 `client_probes` 中设为 `route` 的类别才会进入路由。",
+                        "A client helper request: `assistant_internal` for any of them, or one class (`titling`). Classes set to `intercept` in `client_probes` are answered locally and never reach routing.",
+                        "客户端的辅助请求：`assistant_internal` 表示任意一类，也可以写具体的一类（`titling`）。在 `client_probes` 中设为 `intercept` 的类别由本地应答，不会进入路由。",
                     ),
                 ),
                 row(

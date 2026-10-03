@@ -439,18 +439,18 @@ pricing:
 
 ### `client_probes`
 
-客户端发出的请求中，有一部分并非出自使用者：连通性检查、预热、会话标题、话题检测、建议。每一类都可以在本地应答（`intercept`，不向上游发送任何内容）、原样放行（`passthrough`），或交给路由规则（`route`，由 `when.intent` 匹配）。默认只拦下拦了也不会少任何东西的那几类。
+客户端发出的请求中，有一部分并非出自使用者：连通性检查、预热、会话标题、话题检测、建议。每一类要么在本地应答（`intercept`，不向上游发送任何内容），要么转发（`forward`）。转发的请求和普通请求一样经过路由规则，并带着自己的类别，规则可以用 `when.intent` 匹配。默认只拦下拦了也不会少任何东西的那几类。
 
 <!-- generated: table client_probes -->
 <a id="cfg-client_probes"></a>
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `health_check` | `intercept` \| `passthrough` \| `route` | `intercept` | 连通性检查（`max_tokens: 1`）。默认在本地应答，不影响任何功能。 |
-| `warmup` | `intercept` \| `passthrough` \| `route` | `intercept` | 预热请求。默认在本地应答。 |
-| `titling` | `intercept` \| `passthrough` \| `route` | `passthrough` | 为会话起标题的请求。默认放行：拦下后所有会话都会是同一个标题。 |
-| `topic_detect` | `intercept` \| `passthrough` \| `route` | `passthrough` | 话题检测。默认放行。 |
-| `suggestion` | `intercept` \| `passthrough` \| `route` | `passthrough` | 建议。默认放行。 |
+| `health_check` | `intercept` \| `forward` | `intercept` | 连通性检查（`max_tokens: 1`）。默认在本地应答，不影响任何功能。 |
+| `warmup` | `intercept` \| `forward` | `intercept` | 预热请求。默认在本地应答。 |
+| `titling` | `intercept` \| `forward` | `forward` | 为会话起标题的请求。默认转发：拦下后所有会话都会是同一个标题。 |
+| `topic_detect` | `intercept` \| `forward` | `forward` | 话题检测。默认转发。 |
+| `suggestion` | `intercept` \| `forward` | `forward` | 建议。默认转发。 |
 <!-- /generated -->
 
 ### `security`
@@ -774,7 +774,7 @@ security:
 | `image` | 布尔 | — | 请求是否包含图片。 |
 | `thinking` | 布尔 | — | 是否开启扩展思考。 |
 | `stream` | 布尔 | — | 是否流式返回。 |
-| `intent` | 字符串或字符串列表 | — | 客户端的辅助请求：`assistant_internal` 表示任意一类，也可以写具体的一类（`titling`）。只有在 `client_probes` 中设为 `route` 的类别才会进入路由。 |
+| `intent` | 字符串或字符串列表 | — | 客户端的辅助请求：`assistant_internal` 表示任意一类，也可以写具体的一类（`titling`）。在 `client_probes` 中设为 `intercept` 的类别由本地应答，不会进入路由。 |
 | `provider_would_be` | 字符串或字符串列表 | — | 路由选中的上游。这类规则在路由完成后求值，只能 `set` 或 `deny`，不能写 `to`。 |
 <!-- /generated -->
 

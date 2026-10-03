@@ -262,7 +262,7 @@ fn estimated(
 enum Probe {
     /// 本地答了，不往下走
     Answered(Response),
-    /// 照常往下走。`route` 档打上的标记，其余是空串
+    /// 照常往下走。转发的辅助请求带着它的类别，普通请求是空串
     Intent(String),
 }
 
@@ -298,14 +298,9 @@ fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
             tracing::debug!(client = %req.client_name, kind = kind.slug(), "answered locally");
             Probe::Answered(local_answer(kind, &req.body))
         }
-        // `route` 交给规则处理：打一个标记让 `when: { intent: ... }`
-        // 能匹配到，然后照常往下走。
-        Route => Probe::Intent(kind.slug().to_string()),
-        // **`passthrough` 不打标记。**打了的话，一条
-        // `when: { intent: assistant_internal }` 的规则会在用户还
-        // 没把那类请求配成 route 的时候就开始生效 —— 而配置文件里
-        // 看不出任何线索。
-        Passthrough => Probe::Intent(String::new()),
+        // 打一个标记让 `when: { intent: ... }` 能匹配到，然后照常往下走。
+        // 规则里没写这个条件时，它和普通请求走同一条路
+        Forward => Probe::Intent(kind.slug().to_string()),
     }
 }
 

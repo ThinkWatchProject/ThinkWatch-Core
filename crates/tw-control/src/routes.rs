@@ -56,11 +56,11 @@ async fn create_route(
             if cfg.engine().routes().iter().any(|r| r.name == set.name) {
                 return Err(name_taken("route", &set.name));
             }
-            let mut out = edit::upsert(text, edit::ROUTES, None, &mapping(&set)?)?;
-            if let Some(keys) = &req.keys {
-                out = assign_keys(&out, cfg, None, &set.name, keys)?;
+            let out = edit::upsert(text, edit::ROUTES, None, &mapping(&set)?)?;
+            match &req.keys {
+                Some(keys) => assign_keys(&out, cfg, None, &set.name, keys),
+                None => Ok(out),
             }
-            route_probes(&out, &req.route_probes)
         })
         .await
         .map_err(apply_fail)?;
@@ -94,10 +94,10 @@ async fn update_route(
                 // 的密钥指向一条不存在的路由，会被校验拒掉
                 out = refs::rename_route(&out, cfg, &name, &set.name)?;
             }
-            if let Some(keys) = &req.keys {
-                out = assign_keys(&out, cfg, Some(&name), &set.name, keys)?;
+            match &req.keys {
+                Some(keys) => assign_keys(&out, cfg, Some(&name), &set.name, keys),
+                None => Ok(out),
             }
-            route_probes(&out, &req.route_probes)
         })
         .await
         .map_err(apply_fail)?;
@@ -220,26 +220,6 @@ fn assign_keys(
             (false, true) => out = edit::set(&out, &route_of(i), None)?,
             _ => {}
         }
-    }
-    Ok(out)
-}
-
-/// 把这几类辅助请求设为「交给路由」。
-fn route_probes(text: &str, probes: &[String]) -> Result<String, ApplyError> {
-    let mut out = text.to_string();
-    for p in probes {
-        // 总称不是一个可以单独设置的类别
-        if p == "assistant_internal" || !INTENTS.contains(&p.as_str()) {
-            return Err(invalid(msg!(
-                "control.unknown_probe_class", class = p =>
-                "there is no auxiliary-request class `{class}`"
-            )));
-        }
-        out = edit::set(
-            &out,
-            &[Step::key("client_probes"), Step::key(p.as_str())],
-            Some(&Value::String("route".to_string())),
-        )?;
     }
     Ok(out)
 }

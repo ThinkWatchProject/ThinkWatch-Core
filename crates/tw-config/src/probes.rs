@@ -12,6 +12,12 @@
 //!   省钱，那是把一个功能关掉了。
 //!
 //! 所以默认只拦 A 类。
+//!
+//! **只有两档：本地应答，或者转发。**转发的请求照常走路由规则，并且带着
+//! 它是哪一类的标记，所以规则里写了 `when.intent` 就生效。以前还有一档
+//! 「转发但不带标记」，和带标记的那档只差在 `intent` 条件能不能命中 ——
+//! 两档在界面上看着是两种去向，实际走的是同一套规则，只会让人以为其中
+//! 一档绕开了路由。
 
 use serde::{Deserialize, Serialize};
 
@@ -20,12 +26,9 @@ use serde::{Deserialize, Serialize};
 pub enum ProbeAction {
     /// 本地应答，一个字节都不发给上游
     Intercept,
-    /// 原样放行
-    Passthrough,
-    /// 交给路由规则。**前提是你手里真有一个更便宜的地方** ——
-    /// 这类请求本来就走客户端的小模型档，在同一个上游内部已经没有更
-    /// 便宜的可换了。
-    Route,
+    /// 照常走路由规则，带着类别标记让 `when.intent` 能命中。规则里没写
+    /// 这个条件时，它和一个普通请求走的是同一条路
+    Forward,
 }
 impl ProbeAction {
     /// 写进 YAML 的那个词。**界面写回的是它，不是中文标签** ——
@@ -33,8 +36,7 @@ impl ProbeAction {
     pub fn slug(&self) -> &'static str {
         match self {
             ProbeAction::Intercept => "intercept",
-            ProbeAction::Passthrough => "passthrough",
-            ProbeAction::Route => "route",
+            ProbeAction::Forward => "forward",
         }
     }
 }
@@ -59,7 +61,7 @@ impl ClientProbes {
 
 /// 五种辅助请求各自怎么处理。
 ///
-/// **默认值的分布本身就是那条判据**：A 类拦、B 类放行。改这个默认值
+/// **默认值的分布本身就是那条判据**：A 类拦、B 类转发。改这个默认值
 /// 之前先回答「拦掉之后用户会不会少一样东西」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,22 +72,22 @@ pub struct ClientProbes {
     /// A 类。正文恰好是 `Warmup`
     #[serde(default = "intercept")]
     pub warmup: ProbeAction,
-    /// **B 类，默认放行。**拦了的话每个会话都叫同一个名字。
-    #[serde(default = "passthrough")]
+    /// **B 类，默认转发。**拦了的话每个会话都叫同一个名字。
+    #[serde(default = "forward")]
     pub titling: ProbeAction,
     /// B 类
-    #[serde(default = "passthrough")]
+    #[serde(default = "forward")]
     pub topic_detect: ProbeAction,
     /// B 类
-    #[serde(default = "passthrough")]
+    #[serde(default = "forward")]
     pub suggestion: ProbeAction,
 }
 
 fn intercept() -> ProbeAction {
     ProbeAction::Intercept
 }
-fn passthrough() -> ProbeAction {
-    ProbeAction::Passthrough
+fn forward() -> ProbeAction {
+    ProbeAction::Forward
 }
 
 impl Default for ClientProbes {
@@ -93,9 +95,9 @@ impl Default for ClientProbes {
         Self {
             health_check: ProbeAction::Intercept,
             warmup: ProbeAction::Intercept,
-            titling: ProbeAction::Passthrough,
-            topic_detect: ProbeAction::Passthrough,
-            suggestion: ProbeAction::Passthrough,
+            titling: ProbeAction::Forward,
+            topic_detect: ProbeAction::Forward,
+            suggestion: ProbeAction::Forward,
         }
     }
 }
@@ -111,24 +113,24 @@ mod tests {
         let d = ClientProbes::default();
         assert_eq!(d.health_check, ProbeAction::Intercept);
         assert_eq!(d.warmup, ProbeAction::Intercept);
-        assert_eq!(d.titling, ProbeAction::Passthrough);
-        assert_eq!(d.topic_detect, ProbeAction::Passthrough);
-        assert_eq!(d.suggestion, ProbeAction::Passthrough);
+        assert_eq!(d.titling, ProbeAction::Forward);
+        assert_eq!(d.topic_detect, ProbeAction::Forward);
+        assert_eq!(d.suggestion, ProbeAction::Forward);
     }
 
     #[test]
     fn only_the_key_you_wrote_moves_the_rest_stay_default() {
         // 配置文件里写一行不该把另外四行也重置掉。
-        let c: ClientProbes = serde_yaml_ng::from_str("titling: route").unwrap();
-        assert_eq!(c.titling, ProbeAction::Route);
+        let c: ClientProbes = serde_yaml_ng::from_str("titling: intercept").unwrap();
+        assert_eq!(c.titling, ProbeAction::Intercept);
         assert_eq!(c.health_check, ProbeAction::Intercept);
-        assert_eq!(c.suggestion, ProbeAction::Passthrough);
+        assert_eq!(c.suggestion, ProbeAction::Forward);
     }
 
     #[test]
     fn a_misspelled_probe_name_is_an_error() {
         // `warmup` 写成 `warm_up` 被静默忽略的话，用户会以为预热请求
         // 已经被拦住了，而它一直在计费。
-        assert!(serde_yaml_ng::from_str::<ClientProbes>("warm_up: route").is_err());
+        assert!(serde_yaml_ng::from_str::<ClientProbes>("warm_up: forward").is_err());
     }
 }

@@ -1498,7 +1498,7 @@ async fn turning_off_the_interception_sends_the_health_check_upstream() {
         }],
         vec![],
     );
-    cfg.client_probes.health_check = tw_config::ProbeAction::Passthrough;
+    cfg.client_probes.health_check = tw_config::ProbeAction::Forward;
     let gw = serve_cfg(cfg).await;
     let r = reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
@@ -1513,72 +1513,9 @@ async fn turning_off_the_interception_sends_the_health_check_upstream() {
 }
 
 #[tokio::test]
-async fn a_probe_set_to_route_can_be_sent_somewhere_cheaper() {
-    // 第三个选项。**它成立的前提是你手里真有一个更便宜的地方** ——
-    // 所以这是高级用法，默认没人会走到这里。
-    let (cheap, seen_cheap) = start_upstream(false).await;
-    let (normal, seen_normal) = start_upstream(false).await;
-    let mut cfg = cfg_with(
-        vec![
-            Provider {
-                name: "便宜的".into(),
-                base_url: format!("http://{cheap}"),
-                key: Some("k".into()),
-                ..Default::default()
-            },
-            Provider {
-                name: "正常的".into(),
-                base_url: format!("http://{normal}"),
-                key: Some("k".into()),
-                ..Default::default()
-            },
-        ],
-        vec![
-            tw_engine::Rule {
-                name: "客户端辅助请求".into(),
-                when: serde_yaml_ng::from_str("{ intent: assistant_internal }").unwrap(),
-                to: Some("便宜的".into()),
-                set: None,
-                deny: None,
-            },
-            tw_engine::Rule {
-                name: "兜底".into(),
-                when: Default::default(),
-                to: Some("正常的".into()),
-                set: None,
-                deny: None,
-            },
-        ],
-    );
-    cfg.client_probes.titling = tw_config::ProbeAction::Route;
-    let gw = serve_cfg(cfg).await;
-
-    let send = |body: String| async move {
-        reqwest::Client::new()
-            .post(format!("http://{gw}/v1/messages"))
-            .header("x-api-key", "tw-k")
-            .header("user-agent", "claude-cli/1.0.0")
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-    };
-    send(r#"{"model":"m","messages":[{"role":"user","content":"Please write a 5-10 word title for the following conversation: x"}]}"#.into()).await;
-    assert!(
-        !seen_cheap.lock().unwrap().body.is_empty(),
-        "配成 route 的标题请求该走便宜的那家"
-    );
-    assert!(seen_normal.lock().unwrap().body.is_empty());
-
-    // 真实请求照旧走兜底
-    send(r#"{"model":"m","messages":[{"role":"user","content":"帮我改个 bug"}]}"#.into()).await;
-    assert!(!seen_normal.lock().unwrap().body.is_empty());
-}
-
-#[tokio::test]
-async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
-    // **passthrough 不打标记。**打了的话，一条 intent 规则会在用户还没
-    // 把那类请求配成 route 的时候就开始生效 —— 而配置文件里看不出线索。
+async fn a_forwarded_probe_can_be_sent_somewhere_cheaper() {
+    // 转发的辅助请求带着类别走规则，一条 intent 规则就能把它分走。
+    // 起标题出厂就是转发，不用另外设置
     let (cheap, seen_cheap) = start_upstream(false).await;
     let (normal, seen_normal) = start_upstream(false).await;
     let cfg = cfg_with(
@@ -1613,20 +1550,27 @@ async fn an_intent_rule_does_not_fire_while_the_probe_is_still_passthrough() {
             },
         ],
     );
-    // titling 保持默认的 passthrough
     let gw = serve_cfg(cfg).await;
-    reqwest::Client::new()
-        .post(format!("http://{gw}/v1/messages"))
-        .header("x-api-key", "tw-k")
-        .header("user-agent", "claude-cli/1.0.0")
-        .body(r#"{"model":"m","messages":[{"role":"user","content":"Please write a 5-10 word title for the following conversation: x"}]}"#)
-        .send()
-        .await
-        .unwrap();
+
+    let send = |body: String| async move {
+        reqwest::Client::new()
+            .post(format!("http://{gw}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .header("user-agent", "claude-cli/1.0.0")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    };
+    send(r#"{"model":"m","messages":[{"role":"user","content":"Please write a 5-10 word title for the following conversation: x"}]}"#.into()).await;
     assert!(
-        seen_cheap.lock().unwrap().body.is_empty(),
-        "还没配成 route，intent 规则就不该命中"
+        !seen_cheap.lock().unwrap().body.is_empty(),
+        "转发的标题请求该走便宜的那家"
     );
+    assert!(seen_normal.lock().unwrap().body.is_empty());
+
+    // 真实请求照旧走兜底
+    send(r#"{"model":"m","messages":[{"role":"user","content":"帮我改个 bug"}]}"#.into()).await;
     assert!(!seen_normal.lock().unwrap().body.is_empty());
 }
 
