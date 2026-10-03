@@ -657,7 +657,7 @@ fn start(
             id,
             provider: alive.first().cloned().unwrap_or_default(),
             replaced: redact_mode.acts(),
-            items: crate::guard::items(&found),
+            items: crate::guard::items(&found, 0),
             at_ms: now_ms(),
         });
     }

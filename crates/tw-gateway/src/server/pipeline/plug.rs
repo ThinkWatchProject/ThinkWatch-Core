@@ -110,12 +110,14 @@ pub(super) async fn attempt(
         .map_or_else(|| started.ledger.clone(), |b| b.ledger().clone());
     let (found, ledger) = crate::guard::look_from(mode, &rt.redact, &body, seed);
     let more = crate::guard::more_found(&started.found, found);
-    if !more.is_empty() {
+    // 和开头那一条加起来，一个请求报的有上限（见 `crate::guard::REPORTED_MAX`）
+    let items = crate::guard::items(&more, started.found.len());
+    if !items.is_empty() {
         state.bus.emit(tw_api::Event::SecretsFound {
             id: started.id,
             provider: provider.name.clone(),
             replaced: mode.acts(),
-            items: crate::guard::items(&more),
+            items,
             at_ms: crate::server::now_ms(),
         });
     }
