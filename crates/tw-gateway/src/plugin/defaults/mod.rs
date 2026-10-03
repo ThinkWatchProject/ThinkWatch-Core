@@ -23,7 +23,6 @@
 pub const ALL: &[(&str, &str)] = &[
     ("reply-language", include_str!("reply-language.js")),
     ("wsl-paths", include_str!("wsl-paths.js")),
-    ("deepseek-flags", include_str!("deepseek-flags.js")),
 ];
 
 /// 每个默认插件预先算好的 manifest：id → `{ sha256, manifest }`，`sha256` 是生成时那份
@@ -52,7 +51,7 @@ mod tests {
     #[test]
     fn the_list_is_the_agreed_set() {
         let ids: Vec<&str> = ALL.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, ["reply-language", "wsl-paths", "deepseek-flags"]);
+        assert_eq!(ids, ["reply-language", "wsl-paths"]);
     }
 
     /// 每个 id 都装得进配置：写法对、不是控制面占用的词、不重复

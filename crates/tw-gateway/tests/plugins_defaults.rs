@@ -7,31 +7,16 @@
 mod plugin_harness;
 
 use plugin_harness::*;
-use serde_json::{Value, json};
+use serde_json::json;
 use tw_config::Security;
 use tw_gateway::plugin::engine::Engine;
 
 const REPLY_LANGUAGE: &str = include_str!("../src/plugin/defaults/reply-language.js");
 const WSL_PATHS: &str = include_str!("../src/plugin/defaults/wsl-paths.js");
-const DEEPSEEK_FLAGS: &str = include_str!("../src/plugin/defaults/deepseek-flags.js");
 
-const DEFAULTS: [(&str, &str); 3] = [
-    ("reply-language", REPLY_LANGUAGE),
-    ("wsl-paths", WSL_PATHS),
-    ("deepseek-flags", DEEPSEEK_FLAGS),
-];
+const DEFAULTS: [(&str, &str); 2] = [("reply-language", REPLY_LANGUAGE), ("wsl-paths", WSL_PATHS)];
 
 const MODEL: &str = "claude-sonnet-4-5";
-
-/// DeepSeek 拒收的那一对区域指示符（U+1F1F9 U+1F1FC）
-fn flag() -> String {
-    [0x1F1F9u32, 0x1F1FC]
-        .iter()
-        .map(|c| char::from_u32(*c).unwrap())
-        .collect()
-}
-
-const FLAG_PLACEHOLDER: &str = "[[emoji:1F1F9-1F1FC]]";
 
 async fn ask(
     gw: &Gateway,
@@ -64,7 +49,7 @@ fn every_default_loads_with_its_fixed_permissions_and_settings() {
         &'static [P],
         &'static [(&'static str, K)],
     );
-    let want: [Expected; 3] = [
+    let want: [Expected; 2] = [
         (
             "reply-language",
             "Answer in a chosen language",
@@ -76,12 +61,6 @@ fn every_default_loads_with_its_fixed_permissions_and_settings() {
             "Convert WSL and Windows paths",
             &[P::Messages, P::ReplyToolCalls],
             &[("windows_client", K::Boolean)],
-        ),
-        (
-            "deepseek-flags",
-            "Avoid DeepSeek request rejections",
-            &[P::System, P::Messages, P::ReplyText, P::ReplyToolCalls],
-            &[],
         ),
     ];
     let engine = tw_gateway::plugin::sandbox::Sandbox;
@@ -111,8 +90,6 @@ fn every_default_loads_with_its_fixed_permissions_and_settings() {
             );
         }
     }
-    let ds = engine.load(DEEPSEEK_FLAGS.as_bytes()).unwrap();
-    assert_eq!(ds.manifest().scope.models, ["deepseek*"]);
 }
 
 #[test]
@@ -267,207 +244,4 @@ async fn wsl_paths_rewrites_earlier_tool_calls_but_not_tool_results_in_every_for
             "{fmt:?}: {sent}"
         );
     }
-}
-
-// ── DeepSeek 拒收的旗帜表情 ─────────────────────────────────────
-
-fn poisoned_history() -> Vec<Turn> {
-    let f = flag();
-    vec![
-        Turn::User(format!("这个网页上有 {f}，帮我看看")),
-        Turn::Call {
-            id: "call_1".into(),
-            name: "Fetch".into(),
-            input: json!({ "url": "https://example.com", "note": format!("找 {f}") }),
-        },
-        Turn::Result {
-            id: "call_1".into(),
-            name: "Fetch".into(),
-            text: format!("<html>旗帜 {f} 在页脚</html>"),
-        },
-        Turn::Assistant(format!("页脚里有一个 {f}。")),
-        Turn::User("继续".into()),
-    ]
-}
-
-#[tokio::test]
-async fn deepseek_flags_unsticks_a_poisoned_history_in_every_format() {
-    let f = flag();
-    for fmt in FORMATS {
-        let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
-        let gw = Gateway::start(
-            config(&up, Security::default()),
-            vec![Plug::new("deepseek-flags", DEEPSEEK_FLAGS).models(&["deepseek*"])],
-        )
-        .await;
-        ask(
-            &gw,
-            fmt,
-            "deepseek-chat",
-            &format!("系统 {f}"),
-            &poisoned_history(),
-            false,
-        )
-        .await;
-        let raw = up.raw(0);
-        assert!(
-            !raw.contains(&f),
-            "{fmt:?}: the pair reached DeepSeek: {raw}"
-        );
-        let sent = up.body(0);
-        assert!(
-            sent_system(&sent).contains(FLAG_PLACEHOLDER),
-            "{fmt:?}: {sent}"
-        );
-        let texts = sent_texts(&sent);
-        // 用户的话、工具结果、助手的话：三处都换了
-        assert_eq!(
-            texts.matches(FLAG_PLACEHOLDER).count(),
-            3,
-            "{fmt:?}: {texts}"
-        );
-        assert_eq!(
-            sent_tool_inputs(&sent)[0]["note"],
-            format!("找 {FLAG_PLACEHOLDER}"),
-            "{fmt:?}: {sent}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn deepseek_flags_restores_the_pair_in_text_and_tool_calls_in_every_format() {
-    let f = flag();
-    for fmt in FORMATS {
-        // 文字：占位文字一个字一帧地到
-        let up = Upstream::start(vec![Answer::Text(format!(
-            "页脚有 {FLAG_PLACEHOLDER}，已记下"
-        ))])
-        .await;
-        let gw = Gateway::start(
-            config(&up, Security::default()),
-            vec![Plug::new("deepseek-flags", DEEPSEEK_FLAGS).models(&["deepseek*"])],
-        )
-        .await;
-        let r = ask(
-            &gw,
-            fmt,
-            "deepseek-chat",
-            "你是助手。",
-            &[Turn::User("看看".into())],
-            true,
-        )
-        .await;
-        assert_eq!(
-            fmt.text(&r.body, true),
-            format!("页脚有 {f}，已记下"),
-            "{fmt:?}: {}",
-            r.body
-        );
-
-        // 工具调用：写出的文件里是原来的表情
-        let up = Upstream::start(vec![Answer::Tool {
-            name: "Write".into(),
-            input: json!({ "file_path": "/tmp/a.html", "content": format!("<p>{FLAG_PLACEHOLDER}</p>") }),
-        }])
-        .await;
-        let gw = Gateway::start(
-            config(&up, Security::default()),
-            vec![Plug::new("deepseek-flags", DEEPSEEK_FLAGS).models(&["deepseek*"])],
-        )
-        .await;
-        for stream in [true, false] {
-            let r = ask(
-                &gw,
-                fmt,
-                "deepseek-chat",
-                "你是助手。",
-                &[Turn::User("写文件".into())],
-                stream,
-            )
-            .await;
-            let calls = fmt.calls(&r.body, stream);
-            assert_eq!(calls.len(), 1, "{fmt:?} stream={stream}: {}", r.body);
-            assert_eq!(
-                calls[0].1["content"],
-                format!("<p>{f}</p>"),
-                "{fmt:?} stream={stream}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn deepseek_flags_leaves_a_request_without_the_pair_byte_for_byte() {
-    let raw = format!(
-        r#"{{"model":"deepseek-chat", "max_tokens":256, "temperature":1.0,
-  "system":"你是助手。","messages":[{{"role":"user","content":"别的旗帜 {}"}}]}}"#,
-        // 别的国家的旗帜照常通过，不该被换
-        [0x1F1EF_u32, 0x1F1F5]
-            .iter()
-            .map(|c| char::from_u32(*c).unwrap())
-            .collect::<String>()
-    );
-    let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
-    let gw = Gateway::start(config(&up, Security::default()), vec![]).await;
-    gw.post_raw("/v1/messages", &raw).await;
-    let baseline = up.raw(0);
-
-    let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
-    let gw = Gateway::start(
-        config(&up, Security::default()),
-        vec![Plug::new("deepseek-flags", DEEPSEEK_FLAGS).models(&["deepseek*"])],
-    )
-    .await;
-    gw.post_raw("/v1/messages", &raw).await;
-    assert_eq!(up.raw(0), baseline);
-    assert_eq!(gw.outcomes_of("deepseek-flags", "request"), ["unchanged"]);
-}
-
-#[tokio::test]
-async fn deepseek_flags_is_deterministic_and_stays_in_its_scope() {
-    let f = flag();
-    let up = Upstream::start(vec![Answer::Text("好的".into())]).await;
-    let gw = Gateway::start(
-        config(&up, Security::default()),
-        vec![Plug::new("deepseek-flags", DEEPSEEK_FLAGS).models(&["deepseek*"])],
-    )
-    .await;
-    // 同样的请求两次：上游收到的字节一样，提示词缓存照常命中
-    for _ in 0..2 {
-        ask(
-            &gw,
-            Fmt::Anthropic,
-            "deepseek-chat",
-            "你是助手。",
-            &poisoned_history(),
-            false,
-        )
-        .await;
-    }
-    assert_eq!(up.raw(0), up.raw(1));
-    assert!(!up.raw(0).contains(&f));
-
-    // 范围之外的模型：插件不跑，原样发出
-    ask(
-        &gw,
-        Fmt::Anthropic,
-        MODEL,
-        "你是助手。",
-        &poisoned_history(),
-        false,
-    )
-    .await;
-    assert!(up.raw(2).contains(&f), "{}", up.raw(2));
-    // 两次在范围里的请求各跑一次请求钩子；范围外的那一次一个钩子都没跑
-    assert_eq!(
-        gw.outcomes_of("deepseek-flags", "request"),
-        ["changed", "changed"]
-    );
-    assert_eq!(gw.outcomes_of("deepseek-flags", "reply").len(), 2);
-}
-
-/// 一个工具调用的参数里是不是还有占位文字（没换回去）
-#[allow(dead_code)]
-fn still_hidden(v: &Value) -> bool {
-    v.to_string().contains(FLAG_PLACEHOLDER)
 }

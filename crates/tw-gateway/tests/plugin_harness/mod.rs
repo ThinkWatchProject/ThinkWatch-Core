@@ -639,17 +639,6 @@ impl Gateway {
             .collect()
     }
 
-    /// 这个插件在某一种钩子（`request` / `reply`）上每次运行的结局，按先后
-    pub fn outcomes_of(&self, id: &str, hook: &str) -> Vec<String> {
-        self.runs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.run.plugin_id == id && r.run.hook.slug() == hook)
-            .map(|r| r.run.outcome.slug().to_string())
-            .collect()
-    }
-
     /// 这个插件每次出错、被拒时记下的消息码，按先后
     pub fn error_codes(&self, id: &str) -> Vec<String> {
         self.runs
