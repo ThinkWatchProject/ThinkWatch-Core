@@ -26,18 +26,22 @@ use std::path::Path;
 
 /// 打开数据目录里的请求库（`data.db`）和正文目录（`blobs/`）。
 ///
-/// **库是别的版本建的，就连同正文整个重建，不迁移。**项目还没有存量用户，
+/// **库是旧版本建的，就连同正文整个重建，不迁移。**项目还没有存量用户，
 /// 为旧库写迁移只是负担。正文必须一起清：新库的请求号从 1 重新数，留着的
 /// 旧正文会被当成新请求的正文显示出来。
+///
+/// **比自己新的库原样留着，返回错误**：这一次不记录历史，转发照常。那是更新的
+/// twcore 写的 —— 装回了旧版、或者同一台机器上另一份更新过的桌面端用过这个目录。
+/// 清掉它，换回新版时那份历史就没了；留着，新版下次打开原样读。
 pub fn open(dir: &Path) -> Result<(Db, Blobs), DbError> {
     let path = dir.join("data.db");
     let blobs = Blobs::new(dir.join("blobs"));
     match Db::open(&path) {
-        Err(DbError::OtherVersion { found, supported }) => {
+        Err(DbError::OtherVersion { found, supported }) if found < supported => {
             tracing::warn!(
                 found,
                 supported,
-                "the request history was written by another version; starting over with an empty one"
+                "the request history was written by an older version; starting over with an empty one"
             );
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
@@ -53,10 +57,10 @@ pub fn open(dir: &Path) -> Result<(Db, Blobs), DbError> {
 mod tests {
     use super::*;
 
-    /// 别的版本建的库连同正文一起清掉，换一个空的 —— 留着正文的话，新库里
+    /// 旧版本建的库连同正文一起清掉，换一个空的 —— 留着正文的话，新库里
     /// 的 1 号请求会显示旧库 1 号请求的正文。
     #[test]
-    fn a_database_from_another_version_starts_over_with_its_bodies() {
+    fn a_database_from_an_older_version_starts_over_with_its_bodies() {
         let d = tempfile::tempdir().unwrap();
         {
             let (db, blobs) = open(d.path()).unwrap();
@@ -74,6 +78,45 @@ mod tests {
         db.insert(&db::tests::row(1, 100)).unwrap();
         drop(db);
         assert_eq!(open(d.path()).unwrap().0.count().unwrap(), 1);
+    }
+
+    /// 更新的版本建的库不清：这一次打不开，库和正文都原样留给那个版本
+    #[test]
+    fn a_database_from_a_newer_version_is_left_alone() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let (db, blobs) = open(d.path()).unwrap();
+            db.insert(&db::tests::row(1, 100)).unwrap();
+            assert!(blobs.put(100, 1, Which::Request, b"newer"));
+        }
+        let newer = db::SCHEMA + 1;
+        {
+            let conn = rusqlite::Connection::open(d.path().join("data.db")).unwrap();
+            conn.pragma_update(None, "user_version", newer).unwrap();
+        }
+        let e = open(d.path())
+            .err()
+            .expect("a newer database must not open");
+        assert!(
+            matches!(e, DbError::OtherVersion { found, .. } if found == newer),
+            "{e:?}"
+        );
+        let conn = rusqlite::Connection::open(d.path().join("data.db")).unwrap();
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "那一行被清掉了");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "版本号被改了");
+        assert_eq!(
+            Blobs::new(d.path().join("blobs"))
+                .get(100, 1, Which::Request)
+                .as_deref(),
+            Some(&b"newer"[..]),
+            "正文被清掉了"
+        );
     }
 
     /// 24 版的库有两种：安全防护合成三项的那一版（安全日志多了 `matching`、`revealed` 两列）
