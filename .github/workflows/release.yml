@@ -185,6 +185,31 @@ jobs:
           }
           & $exe --help | Out-Null
 
+      # **不要用户另装 VC 运行库。**VC 运行库由 `.cargo/config.toml` 静态链接进来；
+      # 这里查两个 exe 的导入表，里面不许有 Windows 不自带的那几个 DLL。这台
+      # runner 上装着运行库，exe 照样跑得起来 —— 上一步看不出这件事，只有导入表看得出。
+      # 用的是链接它的那套 MSVC 里的 dumpbin，arm64 的 exe 一样读得了
+      - name: No Visual C++ runtime to install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          foreach ($t in @("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")) {
+            $exe = "target\$t\release\twcore.exe"
+            $deps = & $dumpbin /nologo /dependents $exe |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { $_ -match '\.dll$' }
+            if ($LASTEXITCODE -ne 0 -or -not $deps) { throw "could not read the imports of $exe" }
+            Write-Host "${exe}: $($deps -join ', ')"
+            $redist = @($deps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vccorlib|vcomp)\d' })
+            if ($redist.Count -gt 0) {
+              throw "$exe needs the Visual C++ runtime ($($redist -join ', ')) -- the static CRT in .cargo/config.toml did not apply"
+            }
+          }
+
       - name: Package
         shell: pwsh
         run: |
