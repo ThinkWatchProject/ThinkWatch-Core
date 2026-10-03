@@ -116,8 +116,7 @@ impl From<ProbeAction> for tw_api::ProbeMode {
     fn from(a: ProbeAction) -> Self {
         match a {
             ProbeAction::Intercept => Self::Intercept,
-            ProbeAction::Route => Self::Route,
-            ProbeAction::Passthrough => Self::Passthrough,
+            ProbeAction::Forward => Self::Forward,
         }
     }
 }

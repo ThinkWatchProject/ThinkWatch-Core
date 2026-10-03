@@ -556,21 +556,22 @@ pricing:
 ### `client_probes`
 
 Some requests clients send are not the user's: connectivity checks,
-warm-ups, session titles, topic detection, suggestions. Each class can be
-answered locally (`intercept`, nothing is sent upstream), passed through
-(`passthrough`), or handed to the routing rules (`route`, matched with
-`when.intent`). The defaults intercept only what nobody would miss.
+warm-ups, session titles, topic detection, suggestions. Each class is either
+answered locally (`intercept`, nothing is sent upstream) or forwarded
+(`forward`). Forwarded ones go through the routing rules like any other
+request and carry their class, so a rule can catch them with `when.intent`.
+The defaults intercept only what nobody would miss.
 
 <!-- generated: table client_probes -->
 <a id="cfg-client_probes"></a>
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `health_check` | `intercept` \| `passthrough` \| `route` | `intercept` | Connectivity checks (`max_tokens: 1`). Answered locally by default: nothing is lost. |
-| `warmup` | `intercept` \| `passthrough` \| `route` | `intercept` | Warm-up requests. Answered locally by default. |
-| `titling` | `intercept` \| `passthrough` \| `route` | `passthrough` | Requests that name a session. Passed through by default: intercepting them gives every session the same title. |
-| `topic_detect` | `intercept` \| `passthrough` \| `route` | `passthrough` | Topic detection. Passed through by default. |
-| `suggestion` | `intercept` \| `passthrough` \| `route` | `passthrough` | Suggestions. Passed through by default. |
+| `health_check` | `intercept` \| `forward` | `intercept` | Connectivity checks (`max_tokens: 1`). Answered locally by default: nothing is lost. |
+| `warmup` | `intercept` \| `forward` | `intercept` | Warm-up requests. Answered locally by default. |
+| `titling` | `intercept` \| `forward` | `forward` | Requests that name a session. Forwarded by default: intercepting them gives every session the same title. |
+| `topic_detect` | `intercept` \| `forward` | `forward` | Topic detection. Forwarded by default. |
+| `suggestion` | `intercept` \| `forward` | `forward` | Suggestions. Forwarded by default. |
 <!-- /generated -->
 
 ### `security`
@@ -964,7 +965,7 @@ order they are declared.
 | `image` | bool | — | Whether the request contains an image. |
 | `thinking` | bool | — | Whether extended thinking is on. |
 | `stream` | bool | — | Whether the response is streamed. |
-| `intent` | string or list of strings | — | A client helper request: `assistant_internal` for any of them, or one class (`titling`). Only classes set to `route` in `client_probes` reach routing. |
+| `intent` | string or list of strings | — | A client helper request: `assistant_internal` for any of them, or one class (`titling`). Classes set to `intercept` in `client_probes` are answered locally and never reach routing. |
 | `provider_would_be` | string or list of strings | — | The upstream routing chose. Such a rule is evaluated after routing, may only `set` or `deny`, and cannot have `to`. |
 <!-- /generated -->
 

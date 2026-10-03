@@ -199,7 +199,6 @@ control.signin_gone
 control.signin_response_unusable
 control.store_off
 control.store_unavailable
-control.unknown_probe_class
 control.upstream_in_use
 control.upstream_not_found
 control.user_empty
