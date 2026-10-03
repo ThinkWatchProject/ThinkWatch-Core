@@ -27,7 +27,7 @@ use tw_api::Msg;
 /// `matching`、`revealed`），结局多了「已删除」。
 ///
 /// 25：插件在每个请求上的运行记录（`plugin_runs`）。
-const SCHEMA: i64 = 25;
+pub(crate) const SCHEMA: i64 = 25;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -57,8 +57,8 @@ pub enum DbError {
         path: String,
         source: rusqlite::Error,
     },
-    /// 库是别的版本建的。**不迁移、也不硬读** —— [`crate::open`] 连同正文
-    /// 目录整个重建。
+    /// 库是别的版本建的。**不迁移、也不硬读** —— 旧版本建的由 [`crate::open`]
+    /// 连同正文目录整个重建，更新的版本建的原样留着。
     #[error("the database is schema version {found}; this twcore reads only {supported}")]
     OtherVersion { found: i64, supported: i64 },
     #[error(transparent)]
@@ -2348,7 +2348,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_database_from_another_version_is_refused_rather_than_read() {
-        // 不迁移，也不硬读：版本对不上就说出来，由 `crate::open` 整个重建
+        // 不迁移，也不硬读：版本对不上就说出来，怎么处理由 `crate::open` 定
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("data.db");
         for found in [SCHEMA - 1, SCHEMA + 1] {
