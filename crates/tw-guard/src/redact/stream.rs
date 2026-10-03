@@ -20,6 +20,8 @@
 //! 编出来的 `<<TW_SECRET_9>>` 也原样过去。扣住的长度因此天然封顶在最长的那个
 //! 占位符上 —— 几十个字节。
 
+use std::sync::Arc;
+
 use crate::redact::replace::Ledger;
 
 /// 一条流上的还原器。
@@ -27,23 +29,84 @@ use crate::redact::replace::Ledger;
 /// **`process()` 的输出拼起来再接上 `flush()`，等于把整段内容一次性
 /// 还原的结果。**顺序和内容都不变，唯一的差别是有些字节晚几毫秒发出去。
 pub struct Restorer {
-    table: std::collections::HashMap<String, String>,
+    book: Arc<Book>,
     /// 占位符开头的第一个字节。先按它筛，再比前缀
     lead: u8,
     open: &'static str,
+    buffer: String,
+}
+
+/// 还原要查的那本账，建一次、一条流里的几路共用（见 [`Restorer::fresh`]）。
+///
+/// **按占位符排好序**：一段尾巴是不是某个占位符的前缀、一个占位符的原值是什么，都是二分
+/// 查一次，不拿账里的每个占位符挨个比 —— 一个请求换了几万个值时，后者在每个 chunk 上
+/// 都要比几万次。
+struct Book {
+    /// (占位符, 原值)，按占位符的字节序排
+    entries: Vec<(String, String)>,
+    /// 占位符有哪几种长度，从短到长
+    lens: Vec<usize>,
     /// 最长的占位符有多长：扣住的永远不会比它更多
     longest: usize,
-    buffer: String,
+}
+
+impl Book {
+    fn of(ledger: &Ledger) -> Self {
+        let mut entries: Vec<(String, String)> = ledger
+            .table()
+            .iter()
+            .map(|(p, o)| (p.clone(), o.clone()))
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let lens = ledger.lens().to_vec();
+        Self {
+            longest: lens.last().copied().unwrap_or(0),
+            entries,
+            lens,
+        }
+    }
+
+    /// 第一个不小于 `s` 的占位符在哪儿
+    fn seek(&self, s: &[u8]) -> usize {
+        self.entries.partition_point(|(p, _)| p.as_bytes() < s)
+    }
+
+    fn original(&self, placeholder: &str) -> Option<&str> {
+        let (p, o) = self.entries.get(self.seek(placeholder.as_bytes()))?;
+        (p == placeholder).then_some(o.as_str())
+    }
+
+    /// `tail` 是不是某个占位符的**严格**前缀。
+    ///
+    /// 以 `tail` 开头的占位符在排好的序里连成一段，打头的就是第一个不小于 `tail` 的；
+    /// 它要是正好等于 `tail`（不是严格前缀），这一段里还有的话就是紧跟着的那个。所以
+    /// 看两个就够了。
+    fn viable(&self, tail: &[u8]) -> bool {
+        self.entries[self.seek(tail)..]
+            .iter()
+            .take(2)
+            .any(|(p, _)| p.len() > tail.len() && p.as_bytes().starts_with(tail))
+    }
 }
 
 impl Restorer {
     pub fn new(ledger: &Ledger) -> Self {
         let open = ledger.scheme().open;
         Self {
-            table: ledger.table().clone(),
+            book: Arc::new(Book::of(ledger)),
             lead: open.as_bytes()[0],
             open,
-            longest: ledger.table().keys().map(String::len).max().unwrap_or(0),
+            buffer: String::new(),
+        }
+    }
+
+    /// 同一本账、缓冲是空的另一个还原器。一条流里有好几路时各路一个，共用一份账
+    /// （不各抄一份、各排一次序）。
+    pub fn fresh(&self) -> Self {
+        Self {
+            book: Arc::clone(&self.book),
+            lead: self.lead,
+            open: self.open,
             buffer: String::new(),
         }
     }
@@ -51,7 +114,7 @@ impl Restorer {
     /// 没东西要还原。**调用方据此整条短路** —— 没脱敏的请求不该为这个
     /// 功能付任何延迟。
     pub fn is_noop(&self) -> bool {
-        self.table.is_empty()
+        self.book.entries.is_empty()
     }
 
     /// 喂下一段，返回现在可以安全发出去的部分。
@@ -95,17 +158,9 @@ impl Restorer {
     /// 切点总落在占位符开头那个 ASCII 字节上，所以一定是字符边界。
     fn hold_from(&self) -> usize {
         let buf = self.buffer.as_bytes();
-        let window = buf.len().saturating_sub(self.longest);
+        let window = buf.len().saturating_sub(self.book.longest);
         for p in window..buf.len() {
-            if buf[p] != self.lead {
-                continue;
-            }
-            let tail = &buf[p..];
-            if self
-                .table
-                .keys()
-                .any(|k| k.len() > tail.len() && k.as_bytes().starts_with(tail))
-            {
+            if buf[p] == self.lead && self.book.viable(&buf[p..]) {
                 return p;
             }
         }
@@ -113,16 +168,16 @@ impl Restorer {
     }
 
     fn restore(&self, s: &str) -> String {
-        if !s.contains(self.open) {
+        if self.is_noop() {
             return s.to_string();
         }
-        let mut out = s.to_string();
-        for (ph, original) in &self.table {
-            if out.contains(ph.as_str()) {
-                out = out.replace(ph.as_str(), original);
-            }
-        }
-        out
+        crate::redact::replace::swap_with(
+            s,
+            self.open,
+            &self.book.lens,
+            |ph| self.book.original(ph),
+            str::to_string,
+        )
     }
 }
 
@@ -353,6 +408,88 @@ mod tests {
             format!("错误里也有 {KEY}")
         );
         assert_eq!(r.process("1>> 后"), format!("{KEY} 后"));
+    }
+
+    /// 二分查排好序的账，和拿账里每个占位符挨个比，扣住的位置一模一样；切成多少段喂，
+    /// 拼起来都和一次性还原一样
+    #[test]
+    fn holding_back_agrees_with_checking_every_placeholder() {
+        use crate::redact::rules::{Hit, Rule};
+        // 一本几种标签、几种号长都有的账
+        let mut text = String::new();
+        let mut hits = Vec::new();
+        for i in 0..150 {
+            let value = format!("value-{i}");
+            hits.push(Hit {
+                bytes: text.len()..text.len() + value.len(),
+                rule: Rule::Builtin("aws-access-key-id"),
+                label: [None, Some("TW_ID_NUMBER"), Some("TW_EMAIL")][i % 3].map(Arc::from),
+            });
+            text.push_str(&value);
+            text.push(' ');
+        }
+        let l = crate::redact::replace::apply(&text, &hits, Ledger::new(Scheme::SECRET)).ledger;
+        let table = l.table();
+        let longest = table.keys().map(String::len).max().unwrap();
+        let every = |buf: &str| {
+            let buf = buf.as_bytes();
+            for p in buf.len().saturating_sub(longest)..buf.len() {
+                if buf[p] == b'<'
+                    && table
+                        .keys()
+                        .any(|k| k.len() > buf.len() - p && k.as_bytes().starts_with(&buf[p..]))
+                {
+                    return p;
+                }
+            }
+            buf.len()
+        };
+        let keys: Vec<&String> = table.keys().collect();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut r = Restorer::new(&l);
+        for _ in 0..2000 {
+            // 一段话，尾巴上是某个占位符（或者别的什么）的一截
+            let k = keys[next(keys.len())];
+            let mut buf = ["", "前面 ", "a << b ", "中文"][next(4)].to_string();
+            match next(4) {
+                0 => buf.push_str(&k[..1 + next(k.len())]),
+                1 => buf.push_str(&k[..next(k.len())]),
+                2 => {
+                    buf.push_str(["<<TW_SECRET_9999", "<<TW_x", "<<<", "<", "<<TW_EMAIL_"][next(5)])
+                }
+                _ => buf.push_str(&format!("{k}{}", &k[..next(k.len())])),
+            }
+            r.buffer = buf.clone();
+            assert_eq!(r.hold_from(), every(&buf), "{buf:?}");
+        }
+        // 整段切碎了喂，拼起来和一次性还原一样
+        let mut whole = String::new();
+        for _ in 0..300 {
+            whole.push_str(keys[next(keys.len())]);
+            whole.push_str(["", " ", "<<", "中", "<<TW_SECRET_"][next(5)]);
+        }
+        let want = crate::redact::replace::restore(&whole, &l);
+        for size in [1, 2, 3, 7, 16, 64] {
+            let mut r = Restorer::new(&l);
+            let mut out = String::new();
+            let mut at = 0;
+            while at < whole.len() {
+                let mut end = (at + size).min(whole.len());
+                while !whole.is_char_boundary(end) {
+                    end += 1;
+                }
+                out.push_str(&r.process(&whole[at..end]));
+                at = end;
+            }
+            out.push_str(&r.flush());
+            assert_eq!(out, want, "按 {size} 字节切的时候");
+        }
     }
 
     #[test]

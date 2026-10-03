@@ -340,6 +340,79 @@ async fn the_ui_is_told_what_was_replaced_without_being_told_the_value() {
 }
 
 #[tokio::test]
+async fn a_request_full_of_keys_is_reported_in_part_and_replaced_in_full() {
+    // 一份导出的凭据清单贴进了对话：150 把不同的 key。安全日志只记前 100 个（一个值一行，
+    // 不让一个请求刷满日志），可每一把都要换掉、回显里每一把都要还原
+    let (up, seen) = start_upstream(false).await;
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "claude-code".into(),
+            key: "tw-testkey".into(),
+            ..Default::default()
+        }],
+        providers: vec![provider("relay", up)],
+        security: Security {
+            redact: policy(SecurityMode::Enforce),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut rx = state.bus.subscribe();
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 第 i 把：AKIA 后面是 i 的 26 进制，两两不同
+    let keys: Vec<String> = (0..150)
+        .map(|i| {
+            let mut n = i;
+            let tail: String = (0..16)
+                .map(|_| {
+                    let c = char::from(b'A' + (n % 26) as u8);
+                    n /= 26;
+                    c
+                })
+                .collect();
+            format!("AKIA{tail}")
+        })
+        .collect();
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": keys.join(" ")}]
+    })
+    .to_string();
+    let got = ask(gw, &body, false).await;
+
+    let sent = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+    assert!(!sent.contains("AKIA"), "中转站看见了真 key：{sent}");
+    assert!(sent.contains("<<TW_SECRET_150>>"), "{sent}");
+    let echoed: serde_json::Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(echoed["text"], keys.join(" "), "回显没全部还原");
+
+    let mut items = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::SecretsFound { items: it, .. } = ev {
+            items = Some(it);
+            break;
+        }
+    }
+    let items = items.expect("没发脱敏事件");
+    assert_eq!(items.len(), tw_gateway::guard::REPORTED_MAX);
+    // 报的是先出现的那些
+    assert_eq!(items[0].masked, "AKIAA…AAAA");
+    assert!(
+        items
+            .iter()
+            .all(|i| i.count == 1 && i.rule == "aws-access-key-id")
+    );
+}
+
+#[tokio::test]
 async fn id_and_card_numbers_leave_as_named_placeholders_and_come_back_whole() {
     // 身份证号和卡号出厂就开着。占位符写明是哪一种；回显一个字符一帧，拼回来
     // 也得是原样的号码；报给界面的只有最后四位

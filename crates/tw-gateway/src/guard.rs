@@ -22,11 +22,13 @@
 //! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换
 //! （见 [`tw_guard::redact::flow`]）。
 
+use std::collections::HashSet;
+
 use tw_config::SecurityMode as Mode;
 use tw_guard::content::Screening;
 use tw_guard::redact::flow;
 use tw_guard::redact::replace::Ledger;
-use tw_guard::redact::rules::{Finding, Hit, RuleSet};
+use tw_guard::redact::rules::{Finding, Hit, Rule, RuleSet};
 
 /// 按规则找一遍，**不算我们自己的占位符，也不进 base64 载荷**（见 [`flow::hits`]）。
 pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
@@ -67,22 +69,37 @@ pub fn replace(
 /// `after` 里 `before` 没有的那些值：插件写进请求里的（见 [`crate::plugin::request`]）。
 ///
 /// 按规则和打过码的样子比：同一个值在两份里打出来的码一样。客户端原话里就有的值，开头
-/// 那一遍已经报过了，插件改过的那一份里再出现不再报一次。
+/// 那一遍已经报过了，插件改过的那一份里再出现不再报一次。**查表比**，不两两比：两份里
+/// 各有几万个值时，后者是平方级的。
 pub fn more_found(before: &[Finding], after: Vec<Finding>) -> Vec<Finding> {
+    let known: HashSet<(&Rule, &str)> = before
+        .iter()
+        .map(|b| (&b.rule, b.masked.as_str()))
+        .collect();
     after
         .into_iter()
-        .filter(|f| {
-            !before
-                .iter()
-                .any(|b| b.rule == f.rule && b.masked == f.masked)
-        })
+        .filter(|f| !known.contains(&(&f.rule, f.masked.as_str())))
         .collect()
 }
 
-/// 找到的东西写成事件里的样子。
-pub fn items(found: &[Finding]) -> Vec<tw_api::SecretItem> {
+/// 一个请求报出去的值最多几个。
+///
+/// 安全日志一个值一行（[`tw_api::Event::SecretsFound`] 的一项就是一行）。一个请求里贴进来
+/// 几万个不同的密钥时（一份导出的凭据清单、一段日志），逐个报就是几万行：日志被一个请求
+/// 刷满，真正要看的那几条反而淹没了，一条事件也有几 MB。前 100 个（按在请求里第一次出现
+/// 的先后）足够说明这个请求带了什么。
+///
+/// **只少报，不少换**：替换按的是账本（[`look`]），和报了几个无关 —— 超出的值照样换成
+/// 占位符、回答里照样换回来。
+pub const REPORTED_MAX: usize = 100;
+
+/// 找到的东西写成事件里的样子。`already` 是这个请求先前已经找到过几个（插件改写过的请求
+/// 只报插件写进来的那些，见 [`more_found`]）：**一个请求加起来最多报 [`REPORTED_MAX`] 个**，
+/// 先报先出现的。
+pub fn items(found: &[Finding], already: usize) -> Vec<tw_api::SecretItem> {
     found
         .iter()
+        .take(REPORTED_MAX.saturating_sub(already))
         .map(|f| tw_api::SecretItem {
             rule: f.rule.id().to_string(),
             custom: f.rule.custom(),
@@ -369,11 +386,81 @@ mod tests {
 
     #[test]
     fn the_event_items_name_the_rule_and_never_carry_the_value() {
-        let it = items(&find(Mode::Observe, &RuleSet::defaults(), &body()));
+        let it = items(&find(Mode::Observe, &RuleSet::defaults(), &body()), 0);
         assert_eq!(it[0].rule, "anthropic-api-key");
         assert_eq!(it[0].kind, tw_api::SecretKind::ApiKeys);
         assert!(!it[0].custom);
         assert!(!it[0].masked.contains("AAAAAAAAAAAA"), "{}", it[0].masked);
+    }
+
+    /// 第 `i` 个 AWS 访问密钥的样子，两两不同，打出来的码（头 5 尾 4）也两两不同
+    fn aws_key(i: usize) -> String {
+        let mut n = i;
+        let d: Vec<char> = (0..5)
+            .map(|_| {
+                let c = char::from(b'A' + (n % 26) as u8);
+                n /= 26;
+                c
+            })
+            .collect();
+        format!("AKIA{}QQQQQQQQQQQ{}{}{}{}", d[0], d[1], d[2], d[3], d[4])
+    }
+
+    #[test]
+    fn a_request_reports_its_first_hundred_values_and_still_replaces_every_one() {
+        let keys: Vec<String> = (0..150).map(aws_key).collect();
+        let body = serde_json::json!({"messages": [{"content": keys.join(" ")}]}).to_string();
+        let (found, ledger) = look(Mode::Enforce, &RuleSet::defaults(), body.as_bytes());
+        // 找到的一个不少：总共几个不同的值，`found.len()` 说得出来
+        assert_eq!(found.len(), 150);
+        let it = items(&found, 0);
+        assert_eq!(it.len(), REPORTED_MAX);
+        // 报的是先出现的那些，按出现的先后
+        let masked: Vec<String> = keys[..REPORTED_MAX]
+            .iter()
+            .map(|k| tw_guard::redact::rules::masked(&found[0].rule, k))
+            .collect();
+        assert_eq!(
+            it.iter().map(|i| i.masked.clone()).collect::<Vec<_>>(),
+            masked
+        );
+        // 插件改写过的请求再报一次（只报插件写进来的）：和开头那一条加起来不超过上限
+        assert_eq!(items(&found, 30).len(), REPORTED_MAX - 30);
+        assert!(items(&found, 150).is_empty());
+        // 没报的照样换掉
+        let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body.into(), &ledger);
+        let out = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!out.contains("AKIA"), "{out}");
+        assert!(out.contains("<<TW_SECRET_150>>"), "{out}");
+        assert_eq!(ledger.len(), 150);
+    }
+
+    /// 查表比和两两比，留下的一模一样：同一条规则下打码一样的算见过，换一条规则就不算
+    #[test]
+    fn more_found_keeps_exactly_what_comparing_every_pair_kept() {
+        let text = |range: std::ops::Range<usize>| {
+            let keys: Vec<String> = range.map(aws_key).collect();
+            serde_json::json!({ "content": keys.join(" ") }).to_string()
+        };
+        let mut before = find(Mode::Observe, &RuleSet::defaults(), text(0..60).as_bytes());
+        // 前 10 个当成是另一条规则认出来的：打码一样、规则不同，不算见过
+        for f in &mut before[..10] {
+            f.rule = Rule::Custom(std::sync::Arc::from("aws-again"));
+        }
+        let after_text = format!("{} {}", text(30..90), text(0..5));
+        let after = find(Mode::Observe, &RuleSet::defaults(), after_text.as_bytes());
+        let pairwise: Vec<Finding> = after
+            .iter()
+            .filter(|f| {
+                !before
+                    .iter()
+                    .any(|b| b.rule == f.rule && b.masked == f.masked)
+            })
+            .cloned()
+            .collect();
+        let got = more_found(&before, after);
+        assert_eq!(got, pairwise);
+        assert_eq!(got.len(), 35, "60..90 是新的，0..5 换了规则");
     }
 
     /// 每一跳接着原文那本账换：同一把密钥在每一跳都是同一个号，哪怕那一跳发出去的那份

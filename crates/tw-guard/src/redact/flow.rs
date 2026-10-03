@@ -40,18 +40,21 @@ pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
     if hits.is_empty() {
         return hits;
     }
-    if text.contains(Scheme::SECRET.open) {
-        let ours = Scheme::SECRET.find_in(text);
-        hits.retain(|h| !ours.iter().any(|(at, _, _)| overlaps(at, &h.bytes)));
-    }
+    off_placeholders(text, &mut hits);
     // 大多数请求一处都不命中：载荷在哪儿等有了命中再找
     if !hits.is_empty() {
-        let payloads = base64_payloads(text);
-        if !payloads.is_empty() {
-            hits.retain(|h| !payloads.iter().any(|p| overlaps(p, &h.bytes)));
-        }
+        outside(&mut hits, base64_payloads(text));
     }
     hits
+}
+
+/// 去掉压在我们自己的占位符上的命中（见 [`hits`]）。在解码过的正文上找的调用方（桌面版的
+/// 插件那一层）也用它。
+pub fn off_placeholders(text: &str, hits: &mut Vec<Hit>) {
+    if !hits.is_empty() && text.contains(Scheme::SECRET.open) {
+        let ours = Scheme::SECRET.find_in(text);
+        outside(hits, ours.into_iter().map(|(at, _, _)| at).collect());
+    }
 }
 
 /// 一段**纯文本**按它出现在请求体里时的样子找（同 [`hits`]），区间是原文里的。管理界面
@@ -60,8 +63,28 @@ pub fn hits_plain(text: &str, rules: &RuleSet) -> Vec<Hit> {
     crate::redact::rules::plain_with(text, |encoded| hits(encoded, rules))
 }
 
-fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start < b.end && b.start < a.end
+/// 只留和 `spans` 里哪一段都不重叠的命中。
+///
+/// **不拿每个命中去和每一段比**：一个请求里命中几万处、占位符或载荷又有几万段时（重放
+/// 一份换过的请求），那是平方级的。`spans` 按起点排好，起点在命中终点之前的是一个前缀，
+/// 前缀里最远的终点越过了命中的起点，就是有一段和它重叠 —— 每个命中二分查一次。
+fn outside(hits: &mut Vec<Hit>, mut spans: Vec<Range<usize>>) {
+    if spans.is_empty() {
+        return;
+    }
+    spans.sort_unstable_by_key(|s| s.start);
+    // reach[i]：前 i + 1 段里最远的终点
+    let reach: Vec<usize> = spans
+        .iter()
+        .scan(0, |far, s| {
+            *far = s.end.max(*far);
+            Some(*far)
+        })
+        .collect();
+    hits.retain(|h| {
+        let before = spans.partition_point(|s| s.start < h.bytes.end);
+        before == 0 || reach[before - 1] <= h.bytes.start
+    });
 }
 
 /// 找一遍。**观察档和替换档都找**，关闭时不找。
@@ -90,6 +113,9 @@ pub fn ledger_for(body: &[u8]) -> Ledger {
 }
 
 /// 看一遍客户端发来的原文：报出去的记录（同 [`find`]），和这个请求的账本。
+///
+/// 记录是**一个不同的值一条、一条不少**（见 [`crate::redact::rules::findings`]）：报几条、
+/// 怎么聚合由调用方定，总共有几个不同的值就是它的长度。
 ///
 /// **替换档下账本在这里就编好号**：原文里找到的每个值按出现的先后发号，让开原文里本来
 /// 就写着的占位符。之后每一跳都接着这本账换（[`replace`]），存下来的那份请求也照它换。
@@ -469,6 +495,50 @@ mod tests {
         let prose = format!("{} {KEY}", "word ".repeat(80));
         let body = serde_json::json!({ "data": prose }).to_string();
         assert_eq!(hits(&body, &RuleSet::defaults()).len(), 1);
+    }
+
+    /// 排序加二分，和拿每个命中去和每一段比，留下的一模一样：段可以乱序、套着、挨着、
+    /// 是空的
+    #[test]
+    fn keeping_hits_outside_the_spans_agrees_with_checking_every_pair() {
+        use crate::redact::rules::Rule;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..300 {
+            // 命中：排好序、互不重叠（scan 给的就是这样）
+            let mut hits = Vec::new();
+            let mut at = 0;
+            for _ in 0..next(40) {
+                let start = at + next(5);
+                let end = start + 1 + next(6);
+                hits.push(Hit {
+                    bytes: start..end,
+                    rule: Rule::Builtin("aws-access-key-id"),
+                    label: None,
+                });
+                at = end;
+            }
+            let spans: Vec<Range<usize>> = (0..next(30))
+                .map(|_| {
+                    let start = next(at + 5);
+                    start..start + next(12)
+                })
+                .collect();
+            let mut pairwise = hits.clone();
+            pairwise.retain(|h| {
+                !spans
+                    .iter()
+                    .any(|s| s.start < h.bytes.end && h.bytes.start < s.end)
+            });
+            let mut kept = hits;
+            outside(&mut kept, spans.clone());
+            assert_eq!(kept, pairwise, "{spans:?}");
+        }
     }
 
     #[test]
