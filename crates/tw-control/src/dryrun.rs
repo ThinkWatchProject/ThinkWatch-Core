@@ -131,9 +131,8 @@ pub async fn dry_run(
         .find(|(class, _)| class.slug() == f.intent)
         .and_then(|(_, action)| match action {
             tw_config::ProbeAction::Intercept => Some(DryRunOutcome::Intercepted),
-            tw_config::ProbeAction::Passthrough => Some(DryRunOutcome::Passthrough),
-            // 交给路由的那些照常往下走，和普通请求一样
-            tw_config::ProbeAction::Route => None,
+            // 转发的那些照常往下走，和普通请求一样
+            tw_config::ProbeAction::Forward => None,
         });
 
     // 每条规则的下场。**先走一遍这个，再问结果** —— 顺序反过来的话，

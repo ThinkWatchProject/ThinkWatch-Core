@@ -43,9 +43,9 @@ pub struct When {
     /// 客户端的辅助请求。`assistant_internal` 匹配全部五类，
     /// 也可以写具体的那一类，比如 `titling`。
     ///
-    /// **只有把那类请求配成 `route` 才会有值** —— `intercept` 的根本
-    /// 到不了路由，`passthrough` 也不打标记。所以这个条件写了却不生效
-    /// 时，要去看的是 `client_probes` 而不是规则本身。
+    /// **配成 `intercept` 的那几类永远不会命中** —— 它们在本地应答，根本
+    /// 到不了路由。所以这个条件写了却不生效时，要去看的是 `client_probes`
+    /// 而不是规则本身。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<OneOrMany>,
     /// **阶段二专用**：路由决定完之后，选中的是哪个 provider。

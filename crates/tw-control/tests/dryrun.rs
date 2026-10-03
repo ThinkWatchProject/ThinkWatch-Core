@@ -186,12 +186,9 @@ async fn the_mismatch_is_the_condition_that_really_failed() {
     assert_eq!((m.field.slug(), m.got.as_str()), ("max_tokens", ""));
 
     // `assistant_internal` 是五类里的任意一类：卡住的是模型，不是它。
-    //
-    // **起标题要先设成「交给路由」，这个场景才到得了规则** —— 出厂是
-    // 原样放行，那时试算在规则之前就短路了，一条都不求值
-    let (_d2, routed) = app_with(&format!("{CFG}client_probes:\n  titling: route\n"));
+    // 起标题出厂是转发，带着类别到得了规则
     let r = run(
-        &routed,
+        &app,
         r#"{"model":"m","intent":"titling","draft":{"name":"x","rules":[
             {"name":"辅助请求走中转","conditions":[
                 {"field":"intent","values":["assistant_internal"]},
@@ -347,25 +344,44 @@ async fn a_locally_answered_probe_never_reaches_the_rules() {
     assert!(r.trace.is_empty(), "不该列出没求过的规则：{r:?}");
 }
 
+/// 转发的那几类和普通请求一样走完规则。起标题出厂就是转发。
 #[tokio::test]
-async fn a_passed_through_probe_says_so_instead_of_naming_a_rule() {
+async fn a_forwarded_probe_is_evaluated_like_any_other_request() {
     let (_d, app) = app();
-    // 起标题出厂是原样放行：它转发，但不经过规则
     let r = run(&app, r#"{"model":"claude-sonnet-4-5","intent":"titling"}"#).await;
-    assert_eq!(r.outcome.slug(), "passthrough");
-    assert!(r.trace.is_empty());
-}
+    assert_eq!(r.outcome.slug(), "route");
+    assert_eq!(r.rule.as_deref(), Some("其余都试试"));
+    assert!(!r.trace.is_empty(), "转发的要走完规则：{r:?}");
 
-/// 设成「交给路由」的那些，和普通请求一样走完规则。
-#[tokio::test]
-async fn a_routed_probe_is_evaluated_like_any_other_request() {
-    let (_d, app) = app_with(&format!("{CFG}client_probes:\n  health_check: route\n"));
+    // 出厂本地应答的那几类，设成转发也一样
+    let (_d, app) = app_with(&format!("{CFG}client_probes:\n  health_check: forward\n"));
     let r = run(
         &app,
         r#"{"model":"claude-sonnet-4-5","intent":"health_check"}"#,
     )
     .await;
     assert_eq!(r.outcome.slug(), "route");
-    assert_eq!(r.rule.as_deref(), Some("其余都试试"));
-    assert!(!r.trace.is_empty(), "交给路由的要走完规则：{r:?}");
+    assert!(!r.trace.is_empty(), "{r:?}");
+}
+
+/// 规则里的辅助请求条件对转发的类别成立，不用再另外设置什么。
+#[tokio::test]
+async fn an_intent_rule_catches_a_forwarded_probe() {
+    let (_d, app) = app();
+    let draft = r#"{"name":"x","rules":[
+        {"name":"标题走中转","conditions":[{"field":"intent","values":["titling"]}],"to":"中转"},
+        {"name":"兜底","to":"官方"}]}"#;
+    let r = run(
+        &app,
+        &format!(r#"{{"model":"claude-sonnet-4-5","intent":"titling","draft":{draft}}}"#),
+    )
+    .await;
+    assert_eq!(r.rule.as_deref(), Some("标题走中转"), "{r:?}");
+    // 普通请求不带类别，同一条规则不命中
+    let r = run(
+        &app,
+        &format!(r#"{{"model":"claude-sonnet-4-5","draft":{draft}}}"#),
+    )
+    .await;
+    assert_eq!(r.rule.as_deref(), Some("兜底"), "{r:?}");
 }
