@@ -88,6 +88,9 @@ pub struct Ledger {
     seen: HashMap<String, String>,
     /// 每个标签发到几号了
     issued: HashMap<String, usize>,
+    /// 发出去的占位符有哪几种长度，从短到长。还原时在每个开头处按它们各查一次表（见
+    /// [`restore`]）；标签就那几个、号的位数也就几种，所以这里只有寥寥几个数
+    lens: Vec<usize>,
 }
 
 impl Ledger {
@@ -97,6 +100,7 @@ impl Ledger {
             back: HashMap::new(),
             seen: HashMap::new(),
             issued: HashMap::new(),
+            lens: Vec::new(),
         }
     }
     pub fn scheme(&self) -> Scheme {
@@ -111,6 +115,10 @@ impl Ledger {
     /// 占位符 → 原值。流式还原要拿它。
     pub fn table(&self) -> &HashMap<String, String> {
         &self.back
+    }
+    /// 发出去的占位符有哪几种长度，从短到长
+    pub(crate) fn lens(&self) -> &[usize] {
+        &self.lens
     }
     /// 原值 → 占位符。在一处找到的值要换到别处去时用它（企业版在解码后的
     /// 请求上找，再换进原样转发的那一份）。
@@ -142,6 +150,9 @@ impl Ledger {
         let n = self.issued.entry(label.to_string()).or_insert(0);
         *n += 1;
         let p = self.scheme.placeholder(label, *n);
+        if let Err(at) = self.lens.binary_search(&p.len()) {
+            self.lens.insert(at, p.len());
+        }
         self.back.insert(p.clone(), original.to_string());
         self.seen.insert(original.to_string(), p.clone());
         p
@@ -163,9 +174,11 @@ pub struct Redacted {
 /// 同一个占位符，还原时必然给错一个。**那不是会不会发生的问题，是第二段只要
 /// 命中一次就一定发生。**
 ///
-/// **从后往前替换。**从前往后的话，第一次替换就会让后面所有区间的偏移
-/// 失效 —— 而那种错不会立刻炸，它会安静地切错一个字节，然后你拿到一份
-/// 坏掉的 JSON。
+/// `hits` 要**按起点排好、互不重叠**（[`crate::redact::rules::scan`] 给的就是）：区间指的
+/// 都是 `text` 原文里的位置。
+///
+/// **一遍从前往后抄出新的一份**：原文的一段、一个占位符、原文的下一段……不在原文上就地
+/// 换 —— 就地换一处，后面整段都要挪一次，一个请求里换几万处时是平方级的。
 pub fn apply(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
     if hits.is_empty() {
         return Redacted {
@@ -173,21 +186,24 @@ pub fn apply(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
             ledger,
         };
     }
-    // 编号按出现的先后发：从后往前换，但先从前往后把号发完
+    debug_assert!(
+        hits.windows(2).all(|w| w[0].bytes.end <= w[1].bytes.start),
+        "hits must be sorted and disjoint"
+    );
+    // 编号按出现的先后发
     let default = ledger.scheme.label;
-    let placeholders: Vec<String> = hits
-        .iter()
-        .map(|h| {
-            ledger.issue(
-                &text[h.bytes.clone()],
-                h.label.as_deref().unwrap_or(default),
-            )
-        })
-        .collect();
-    let mut out = text.to_string();
-    for (h, ph) in hits.iter().zip(&placeholders).rev() {
-        out.replace_range(h.bytes.clone(), ph);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for h in hits {
+        let ph = ledger.issue(
+            &text[h.bytes.clone()],
+            h.label.as_deref().unwrap_or(default),
+        );
+        out.push_str(&text[at..h.bytes.start]);
+        out.push_str(&ph);
+        at = h.bytes.end;
     }
+    out.push_str(&text[at..]);
     Redacted { text: out, ledger }
 }
 
@@ -222,15 +238,55 @@ pub fn restore_json(text: &str, ledger: &Ledger) -> String {
 }
 
 fn swap(text: &str, ledger: &Ledger, put: impl Fn(&str) -> String) -> String {
-    if ledger.is_empty() || !text.contains(ledger.scheme.open) {
+    if ledger.is_empty() {
         return text.to_string();
     }
-    let mut out = text.to_string();
-    for (ph, original) in ledger.table() {
-        if out.contains(ph.as_str()) {
-            out = out.replace(ph.as_str(), &put(original));
+    let lookup = |ph: &str| ledger.back.get(ph).map(String::as_str);
+    swap_with(text, ledger.scheme.open, &ledger.lens, lookup, put)
+}
+
+/// 一遍扫过去，把 `text` 里写着的占位符换回原值。`lens` 是占位符有哪几种长度（从短到长），
+/// `lookup` 按占位符查原值。
+///
+/// **在每个占位符开头处按这几种长度各查一次表**，不拿账里的每个占位符去整段文字里找一遍：
+/// 后者是「占位符个数 × 文字长度」，一个请求换了几万个值、回答又把它们念了一遍时，光
+/// 还原就要几秒。换回来的原值不再参与匹配。
+pub(crate) fn swap_with<'a>(
+    text: &str,
+    open: &str,
+    lens: &[usize],
+    lookup: impl Fn(&str) -> Option<&'a str>,
+    put: impl Fn(&str) -> String,
+) -> String {
+    let mut out = String::new();
+    // 抄到了哪儿、从哪儿接着找下一个开头
+    let (mut done, mut from) = (0, 0);
+    while let Some(i) = text[from..].find(open) {
+        let at = from + i;
+        let found = lens.iter().find_map(|&n| {
+            let ph = text.get(at..at + n)?;
+            lookup(ph).map(|original| (n, original))
+        });
+        match found {
+            Some((n, original)) => {
+                // 头一处才备下整段的地方：满是 `<<` 却一个占位符都没有的（C++ 代码）原样抄一份
+                if done == 0 {
+                    out.reserve(text.len());
+                }
+                out.push_str(&text[done..at]);
+                out.push_str(&put(original));
+                done = at + n;
+                from = done;
+            }
+            // 开头那段是 ASCII，加一还落在字的边界上。`<<<TW_SECRET_1>>` 里的占位符从第二个
+            // `<` 起
+            None => from = at + 1,
         }
     }
+    if done == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[done..]);
     out
 }
 
@@ -476,6 +532,147 @@ mod tests {
         }
         // 别的标签只让它自己的号
         assert_eq!(taken("<<TW_CARD_NUMBER_7>>"), "<<TW_SECRET_1>>");
+    }
+
+    /// 一个确定的伪随机序列
+    fn rng(mut seed: u64) -> impl FnMut(usize) -> usize {
+        move |n| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        }
+    }
+
+    /// 原来的做法：先从前往后发号，再从后往前就地换
+    fn apply_in_place(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
+        let default = ledger.scheme.label;
+        let placeholders: Vec<String> = hits
+            .iter()
+            .map(|h| {
+                ledger.issue(
+                    &text[h.bytes.clone()],
+                    h.label.as_deref().unwrap_or(default),
+                )
+            })
+            .collect();
+        let mut out = text.to_string();
+        for (h, ph) in hits.iter().zip(&placeholders).rev() {
+            out.replace_range(h.bytes.clone(), ph);
+        }
+        Redacted { text: out, ledger }
+    }
+
+    /// 原来的做法：账里的每个占位符在整段里找一遍、换一遍
+    fn swap_each(text: &str, ledger: &Ledger) -> String {
+        if ledger.is_empty() || !text.contains(ledger.scheme.open) {
+            return text.to_string();
+        }
+        let mut out = text.to_string();
+        for (ph, original) in ledger.table() {
+            if out.contains(ph.as_str()) {
+                out = out.replace(ph.as_str(), original);
+            }
+        }
+        out
+    }
+
+    fn same_ledger(a: &Ledger, b: &Ledger) {
+        assert_eq!(a.back, b.back);
+        assert_eq!(a.seen, b.seen);
+        assert_eq!(a.issued, b.issued);
+    }
+
+    /// 一遍抄出新的一份，和原来就地换，换出来的文字、发的号一模一样：有重复的值、带
+    /// 自己标签的、接着一本已经发过号的账、多字节的字
+    #[test]
+    fn copying_once_writes_what_replacing_in_place_wrote() {
+        let rules = all()
+            .with_labeled("email", r"[a-z]+@[a-z]+\.com", Some("TW_EMAIL"))
+            .unwrap();
+        let pool = [
+            KEY,
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AKIAQRSTUVWXYZ234567",
+            "10.0.0.7",
+            "a@b.com",
+            "c@d.com",
+            "postgres://u:pw@h/db",
+            "很长的中文",
+            "plain",
+        ];
+        let mut next = rng(0x2545_f491_4f6c_dd1d);
+        for round in 0..50 {
+            let mut text = String::new();
+            for _ in 0..next(60) {
+                text.push_str(pool[next(pool.len())]);
+                text.push_str(["", " ", "，", "\n"][next(4)]);
+            }
+            let hits = crate::redact::rules::scan(&text, &rules);
+            let seed = if round % 2 == 0 {
+                l()
+            } else {
+                // 接着一本发过号的账：同一个值复用旧号，新值往后编
+                redact(&format!("{KEY} 10.0.0.9"), &all(), l()).ledger
+            };
+            let want = apply_in_place(&text, &hits, seed.clone());
+            let got = apply(&text, &hits, seed);
+            assert_eq!(got.text, want.text);
+            same_ledger(&got.ledger, &want.ledger);
+        }
+    }
+
+    /// 一遍扫过去，和账里的每个占位符各找一遍，换回来的一模一样：占位符挨着、夹在
+    /// `<` 里、只写了半截、模型自己编的、几种长度和标签混着
+    #[test]
+    fn restoring_in_one_pass_puts_back_what_swapping_each_placeholder_did() {
+        let mut ledger = l();
+        for i in 0..120 {
+            let label = ["TW_SECRET", "TW_ID_NUMBER", "TW_EMAIL"][i % 3];
+            ledger.issue(&format!("value-{i}-密"), label);
+        }
+        let known: Vec<String> = ledger.table().keys().cloned().collect();
+        let noise = [
+            "",
+            " ",
+            "中文",
+            "<",
+            "<<",
+            "<<<",
+            ">>",
+            "<<TW_SEC",
+            "<<TW_SECRET_",
+            "<<TW_SECRET_999>>",
+            "<<TW_x>>",
+            "std::cout << x << y;",
+            "{{TW_SECRET_1}}",
+        ];
+        let mut next = rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..300 {
+            let mut text = String::new();
+            for _ in 0..next(40) {
+                if next(2) == 0 {
+                    text.push_str(&known[next(known.len())]);
+                } else {
+                    text.push_str(noise[next(noise.len())]);
+                }
+            }
+            assert_eq!(restore(&text, &ledger), swap_each(&text, &ledger), "{text}");
+            // 整包 JSON 的还原走同一遍
+            let body = serde_json::json!({ "text": text }).to_string();
+            let escaped = |s: &str| {
+                let q = serde_json::to_string(s).unwrap();
+                q[1..q.len() - 1].to_string()
+            };
+            let mut want = body.clone();
+            for (ph, original) in ledger.table() {
+                want = want.replace(ph.as_str(), &escaped(original));
+            }
+            assert_eq!(restore_json(&body, &ledger), want);
+        }
+        // 账是空的、文字里没有开头的：原样
+        assert_eq!(restore("<<TW_SECRET_1>>", &l()), "<<TW_SECRET_1>>");
+        assert_eq!(restore("没有占位符", &ledger), "没有占位符");
     }
 
     #[test]
