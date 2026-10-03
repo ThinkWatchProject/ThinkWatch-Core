@@ -1,0 +1,14 @@
+# Windows 上把 VC 运行库静态链接进 twcore.exe。
+#
+# **不加这一条，twcore.exe 依赖 VCRUNTIME140.dll**，而这个文件不随 Windows
+# 自带：它来自「Visual C++ 可再发行组件包」，一般是别的软件顺手装上的。桌面版
+# 的安装程序只放 twcore.exe、不装运行库，于是在一台没装过它的机器上，网关
+# 根本起不来 —— CI 和多数真机上都装着它，所以看不出来。UCRT 是 Windows 10
+# 起系统自带的，静态链接只是顺带把它也带上。
+#
+# 写在这里而不是 release.yml 里：本机在 Windows 上编出来的和发出去的是同一种。
+# **`RUSTFLAGS` 环境变量会整个盖掉这里**（ci.yml 设了 `-D warnings`，所以 CI
+# 的测试仍是动态链接的），发版流水线不设它；release.yml 里有一步查 twcore.exe
+# 的导入表，这一条哪天没生效会在那里失败。
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
