@@ -97,50 +97,38 @@ pub struct Section {
     pub what: &'static str,
     /// 每一项靠哪个键认：几乎都是 `name`，插件是 `id`
     pub key: &'static str,
-    /// 每一项里**可以写多行文字**的那几个键：它们底下的字符串可以带换行（写出去是
-    /// 带转义的双引号，见 [`render`]）。**其余的一律单行** —— 名字、地址、密钥、请求头、
-    /// 模型和网段写成两行都不是原来那个东西，在这一层就拒绝（[`EditError::Multiline`]）
-    pub multiline: &'static [&'static str],
 }
 
 pub const PROVIDERS: Section = Section {
     path: &["providers"],
     what: "upstream",
     key: "name",
-    multiline: &[],
 };
 pub const PROXIES: Section = Section {
     path: &["proxies"],
     what: "proxy",
     key: "name",
-    multiline: &[],
 };
 pub const PRICE_SHEETS: Section = Section {
     path: &["pricing", "sheets"],
     what: "price sheet",
     key: "name",
-    multiline: &[],
 };
 pub const ROUTES: Section = Section {
     path: &["routes"],
     what: "route",
     key: "name",
-    multiline: &[],
 };
 pub const GROUPS: Section = Section {
     path: &["groups"],
     what: "group",
     key: "name",
-    multiline: &[],
 };
 
-/// 插件的设置是插件自己声明的文字，「一行一条」的写法很常见（统一用词的对照表、
-/// 打码的正则）。id、文件、哈希、范围照旧单行
 pub const PLUGINS: Section = Section {
     path: &["plugins"],
     what: "plugin",
     key: "id",
-    multiline: &["settings"],
 };
 
 impl Section {
@@ -198,7 +186,7 @@ pub fn upsert(
                     name,
                 });
             }
-            single_lines(section, item.iter())?;
+            single_lines(item.iter())?;
             let block = render_block(&Value::Mapping(item.clone()))?;
             let out = tw_yaml::append(text, &steps, &block)?;
             (out, section.items(&doc).len())
@@ -220,7 +208,7 @@ pub fn upsert(
             path.push(Step::Index(index));
             let out = if tw_yaml::is_flow_at(text, &path)? {
                 // 行内写法里的键删不了、嵌套值塞不进去 —— 整项换成块式
-                single_lines(section, item.iter())?;
+                single_lines(item.iter())?;
                 let block = render_block(&Value::Mapping(item.clone()))?;
                 tw_yaml::replace_item(text, &steps, index, &block)?
             } else {
@@ -228,7 +216,7 @@ pub fn upsert(
                     .as_mapping()
                     .cloned()
                     .unwrap_or_default();
-                sync_fields(text, &path, &old_item, item, section)?
+                sync_fields(text, &path, &old_item, item)?
             };
             (out, index)
         }
@@ -365,8 +353,8 @@ impl Rendered {
 /// 什么都动不了文件的结构。做法是先在 serde 渲染的那一份里放一个占位的词，渲染完再换成
 /// 双引号的写法：其余的写法（键、嵌套、别的标量的引号）照旧由 serde 决定。
 ///
-/// **这里只管写得对，不管该不该写**：哪些字段只能单行由调用方查（[`Section::multiline`]、
-/// [`set`]）。
+/// **这里只管写得对，不管该不该写**：字段只能单行由调用方查（[`upsert`]、[`set`]、
+/// [`check_line_breaks`]）。
 pub fn render(v: &Value) -> Result<Rendered, EditError> {
     let mut quoted = Vec::new();
     let mark = free_mark(v);
@@ -451,38 +439,18 @@ fn swap_escaped(v: &Value, mark: &str, quoted: &mut Vec<String>) -> Value {
     }
 }
 
-/// 有字段可以写多行的那几段（[`Section::multiline`] 不空的）。按路径写值时靠它认位置
-const MULTILINE_SECTIONS: &[Section] = &[PLUGINS];
-
-/// 按路径写一个字符串（`PATCH /config`、`twcore config set`）之前：**换行只进得了可以多行
-/// 的字段**。和按名字改一项是同一份规矩（各段的 [`Section::multiline`]，现在只有插件的
-/// 设置），别处带换行就拒绝（[`EditError::Multiline`]）。别的控制字符、LS、PS 不拦：写出去
-/// 是转义过的双引号（[`tw_yaml::double_quoted`]），读回来一字不差。
-///
-/// `path` 是解析好的路径（列表里的一项是下标）。
-pub fn check_line_breaks(path: &[Step], value: &str) -> Result<(), EditError> {
-    if !value.contains(['\n', '\r']) || multiline_at(path) {
-        return Ok(());
+/// 按路径写一个字符串（`PATCH /config`、`twcore config set`）之前：**配置里的字段一律
+/// 单行**，带换行（`\n`、`\r`）就拒绝（[`EditError::Multiline`]）—— 和按名字改一项是同一份
+/// 规矩。别的控制字符、LS、PS 不拦：写出去是转义过的双引号（[`tw_yaml::double_quoted`]），
+/// 读回来一字不差。
+pub fn check_line_breaks(value: &str) -> Result<(), EditError> {
+    if value.contains(['\n', '\r']) {
+        return Err(EditError::Multiline);
     }
-    Err(EditError::Multiline)
+    Ok(())
 }
 
-/// 这个位置在哪一段的哪一项底下、那个键可以多行（`plugins[i].settings…`）
-fn multiline_at(path: &[Step]) -> bool {
-    MULTILINE_SECTIONS.iter().any(|s| {
-        let n = s.path.len();
-        path.len() > n + 1
-            && s.path
-                .iter()
-                .zip(path)
-                .all(|(k, st)| matches!(st, Step::Key(x) if x == k))
-            && matches!(path[n], Step::Index(_))
-            && matches!(&path[n + 1], Step::Key(k) if s.multiline.contains(&k.as_str()))
-    })
-}
-
-/// **单行的字段里不许有换行**：名字、地址、密钥写成两行就不是原来那个东西了。
-/// 哪些字段可以多行由那一段自己说（[`Section::multiline`]）
+/// **单行的字段里不许有换行**：名字、地址、密钥写成两行就不是原来那个东西了
 fn reject_multiline(v: &Value) -> Result<(), EditError> {
     match v {
         Value::String(s) if s.contains('\n') || s.contains('\r') => Err(EditError::Multiline),
@@ -496,17 +464,11 @@ fn reject_multiline(v: &Value) -> Result<(), EditError> {
     }
 }
 
-/// 一项里要写的这些字段，除了这一段允许多行的，都得是单行
-fn single_lines<'a>(
-    section: Section,
-    fields: impl Iterator<Item = (&'a Value, &'a Value)>,
-) -> Result<(), EditError> {
+/// 一项里要写的这些字段都得是单行
+fn single_lines<'a>(fields: impl Iterator<Item = (&'a Value, &'a Value)>) -> Result<(), EditError> {
     for (k, v) in fields {
         reject_multiline(k)?;
-        let free = k.as_str().is_some_and(|k| section.multiline.contains(&k));
-        if !free {
-            reject_multiline(v)?;
-        }
+        reject_multiline(v)?;
     }
     Ok(())
 }
@@ -518,7 +480,6 @@ fn sync_fields(
     path: &[Step],
     old: &Mapping,
     new: &Mapping,
-    section: Section,
 ) -> Result<String, EditError> {
     let mut out = text.to_string();
     let key_of = |k: &Value| -> Result<String, EditError> {
@@ -530,7 +491,7 @@ fn sync_fields(
         .iter()
         .filter(|(k, v)| old.get(*k) != Some(*v))
         .collect();
-    single_lines(section, changed.iter().copied())?;
+    single_lines(changed.iter().copied())?;
     for (k, _) in old.iter().filter(|(k, _)| !new.contains_key(*k)) {
         let mut p = path.to_vec();
         p.push(Step::Key(key_of(k)?));
@@ -755,68 +716,20 @@ providers:
 
     const PLUGIN: &str = "  - id: p\n    file: plugins/p.js\n    sha256: 6f1c000000000000000000000000000000000000000000000000000000000abc\n";
 
-    fn plugin_item(settings: &str) -> Mapping {
-        map(&format!(
-            "id: p\nfile: plugins/p.js\nsha256: 6f1c000000000000000000000000000000000000000000000000000000000abc\nsettings:\n{settings}"
-        ))
-    }
-
-    /// 插件的设置可以多行：写成一行双引号，换行转义，读回来一字不差 —— 新加的和改的都是
-    #[test]
-    fn a_plugin_setting_may_span_lines_and_is_written_on_one_line() {
-        let terms = "登陆=登录\n帐号=账号\n";
-        let out = upsert(
-            CFG,
-            PLUGINS,
-            None,
-            &plugin_item("  terms: \"登陆=登录\\n帐号=账号\\n\"\n"),
+    fn plugin_item() -> Mapping {
+        map(
+            "id: p\nfile: plugins/p.js\nsha256: 6f1c000000000000000000000000000000000000000000000000000000000abc\n",
         )
-        .unwrap();
-        assert!(
-            out.contains("\n      terms: \"登陆=登录\\n帐号=账号\\n\"\n"),
-            "{out}"
-        );
-        assert_eq!(
-            parse(&out).unwrap()["plugins"][0]["settings"]["terms"],
-            terms
-        );
-        assert!(out.contains("# 两家上游"), "{out}");
-
-        let patterns = "\\bsk-[a-z]+\\b\n\"quoted\"\t#1: x\r\n---\n...";
-        let mut item = plugin_item("  terms: x\n");
-        item["settings"]["terms"] = Value::String(patterns.into());
-        let again = upsert(&out, PLUGINS, Some("p"), &item).unwrap();
-        assert_eq!(
-            parse(&again).unwrap()["plugins"][0]["settings"]["terms"],
-            patterns
-        );
-        // 只有那一行变了
-        let changed: Vec<_> = again
-            .lines()
-            .filter(|l| !out.lines().any(|o| o == *l))
-            .collect();
-        assert_eq!(changed.len(), 1, "{again}");
-        assert!(changed[0].starts_with("      terms: \""), "{again}");
     }
 
-    /// 按路径写（`PATCH /config`）：换行只进得了插件的设置，和按名字改一项同一份规矩；
-    /// 别的控制字符、LS、PS 不拦
+    /// 按路径写（`PATCH /config`）：配置里的字段一律单行，换行在哪儿都拒绝；别的控制字符、
+    /// LS、PS 不拦
     #[test]
-    fn a_line_break_written_by_path_goes_only_into_plugin_settings() {
-        use tw_yaml::path;
+    fn a_line_break_written_by_path_is_refused() {
         for s in ["a\nb", "a\rb", "\r\n"] {
-            for p in [
-                &path!["clients", 0, "name"][..],
-                &path!["providers", 0, "key"],
-                &path!["plugins", 0, "id"],
-                &path!["plugins", 0, "scope", "models", 0],
-                &path!["listen", "gateway", "bind"],
-            ] {
-                let e = check_line_breaks(p, s).unwrap_err();
-                assert!(matches!(e, EditError::Multiline), "{p:?} {s:?}");
-                assert_eq!(e.msg().code, "config.edit.multiline");
-            }
-            check_line_breaks(&path!["plugins", 1, "settings", "terms"], s).unwrap();
+            let e = check_line_breaks(s).unwrap_err();
+            assert!(matches!(e, EditError::Multiline), "{s:?}");
+            assert_eq!(e.msg().code, "config.edit.multiline");
         }
         for s in [
             "a\u{2028}b",
@@ -826,29 +739,15 @@ providers:
             "a\u{0}b",
             "plain",
         ] {
-            check_line_breaks(&path!["clients", 0, "name"], s).unwrap();
+            check_line_breaks(s).unwrap();
         }
     }
 
-    /// 有字段能多行的段都在 [`MULTILINE_SECTIONS`] 里：按路径写的时候认得出它们
+    /// 插件那一项和别的一样，一律单行
     #[test]
-    fn every_section_with_multiline_fields_is_known_to_path_writes() {
-        for s in [PROVIDERS, PROXIES, PRICE_SHEETS, ROUTES, GROUPS, PLUGINS] {
-            if !s.multiline.is_empty() {
-                assert!(
-                    MULTILINE_SECTIONS.iter().any(|m| m.path == s.path),
-                    "{}",
-                    s.what
-                );
-            }
-        }
-    }
-
-    /// 插件那一项里只有设置能多行：范围里的模式、id 照旧单行
-    #[test]
-    fn only_the_settings_of_a_plugin_may_span_lines() {
-        let mut item = plugin_item("  note: ok\n");
-        item.insert("scope".into(), map("models: [\"a\\nb\"]\n").into());
+    fn a_plugin_entry_is_single_line_throughout() {
+        let mut item = plugin_item();
+        item.insert("id".into(), "a\nb".into());
         let e = upsert(CFG, PLUGINS, None, &item).unwrap_err();
         assert!(matches!(e, EditError::Multiline), "{e}");
     }
@@ -903,9 +802,10 @@ providers:
         assert_eq!(parse(&out).unwrap()["providers"][0]["proxy"], "corp");
     }
 
-    /// 行内写法的插件列表重排：整段重写，多行的设置照样搬过去
+    /// 行内写法的插件列表重排：整段重写，文件里已有的值（连同 0.58 留下的、带换行的设置）
+    /// 照样搬过去，不查单行
     #[test]
-    fn reordering_a_flow_list_carries_multiline_settings_along() {
+    fn reordering_a_flow_list_carries_every_value_along() {
         let text = format!(
             "{CFG}plugins: [{{id: a, file: plugins/a.js, sha256: x, settings: {{t: \"1\\n2\"}}}}, {{id: b, file: plugins/b.js, sha256: y}}]\n"
         );
@@ -929,13 +829,8 @@ providers:
 
     #[test]
     fn a_plugin_entry_appended_to_a_config_without_plugins_starts_the_section() {
-        let out = upsert(CFG, PLUGINS, None, &plugin_item("  t: \"a\\nb\"\n")).unwrap();
-        assert!(
-            out.ends_with(&format!(
-                "plugins:\n{PLUGIN}    settings:\n      t: \"a\\nb\"\n"
-            )),
-            "{out}"
-        );
+        let out = upsert(CFG, PLUGINS, None, &plugin_item()).unwrap();
+        assert!(out.ends_with(&format!("plugins:\n{PLUGIN}")), "{out}");
     }
 
     #[test]

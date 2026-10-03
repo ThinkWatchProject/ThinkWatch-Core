@@ -4,7 +4,7 @@ export const manifest = {
   name: "错误的返回类型",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "类型", default: "number" } },
+  settings: { kind: { type: "string", label: "类型", value: "number" } },
 };
 
 export function onRequest(req, ctx) {

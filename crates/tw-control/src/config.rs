@@ -66,8 +66,9 @@ pub enum ApplyError {
     /// 从远程端口进来的写入改了 `listen.control` 这一节。
     #[error("{}", self.msg())]
     RemoteControlLocked,
-    /// 这条路上做不了、要在系统的确认框里点过头的改动（改得了工具调用的插件：打开它、
-    /// 改设置、改范围）。**和 `Invalid` 分开**：请求本身没写错，换那条确认过的路就做得成
+    /// 这条路上做不了、要在系统的确认框里点过头的改动（改得了工具调用的插件：装上、打开、
+    /// 改代码、批准磁盘上改过的文件）。**和 `Invalid` 分开**：请求本身没写错，换那条确认过的
+    /// 路就做得成
     #[error("{0}")]
     NeedsConfirmation(Msg),
 }
@@ -320,6 +321,20 @@ impl ConfigManager {
 
     /// 回到某一版。
     pub async fn rollback(&self, version: &str) -> Result<String, ApplyError> {
+        let text = self.rollback_text(version)?;
+        let cur = self.current().ok();
+        // 回滚也走同一条写入路径，所以它同样会：校验、存历史、防回环。
+        self.write(
+            &text,
+            cur.as_ref().map(|c| c.version()).as_deref(),
+            Origin::Rollback,
+        )
+        .await
+    }
+
+    /// 回滚要写回去的那一版原文。**不写**：控制面先看过它（插件那一节，见
+    /// `plugins::guard_raw_write`）再写
+    pub fn rollback_text(&self, version: &str) -> Result<String, ApplyError> {
         let all = tw_config::history::list(&self.path)?;
         let target = all
             .iter()
@@ -331,15 +346,7 @@ impl ConfigManager {
                     "the version history has no {version}"
                 ))
             })?;
-        let text = tw_config::history::read(target)?;
-        let cur = self.current().ok();
-        // 回滚也走同一条写入路径，所以它同样会：校验、存历史、防回环。
-        self.write(
-            &text,
-            cur.as_ref().map(|c| c.version()).as_deref(),
-            Origin::Rollback,
-        )
-        .await
+        Ok(tw_config::history::read(target)?)
     }
 
     /// 记下一个不是我们写的指纹。**首次运行生成配置之后要调它** ——
@@ -477,6 +484,18 @@ impl ConfigManager {
         base_version: Option<&str>,
         origin: Origin,
     ) -> Result<String, ApplyError> {
+        let (cur, text) = self.patched(ops, base_version)?;
+        self.write(&text, Some(&cur.version()), origin).await
+    }
+
+    /// [`Self::patch`] 的前一半：在磁盘上这一版上照 `ops` 改出新的原文。**不写**。返回读到的
+    /// 那一版和改出来的原文：控制面先看过改出来的样子（插件那一节，见
+    /// `plugins::guard_raw_write`），再照那一版写
+    pub fn patched(
+        &self,
+        ops: &[tw_api::PatchOp],
+        base_version: Option<&str>,
+    ) -> Result<(tw_config::Loaded, String), ApplyError> {
         let cur = self.current()?;
         if let Some(base) = base_version
             && cur.version() != base
@@ -493,9 +512,9 @@ impl ConfigManager {
                     let steps = resolve_path(&text, path).map_err(ApplyError::BadPath)?;
                     let scalar = match value {
                         tw_api::PatchValue::Str(v) => {
-                            // 换行只进得了可以多行的字段（插件的设置），和按名字改一项同一份
-                            // 规矩。别的控制字符写成转义过的双引号，见 `tw_yaml::double_quoted`
-                            tw_config::edit::check_line_breaks(&steps, v)?;
+                            // 配置里的字段一律单行，和按名字改一项同一份规矩。别的控制字符
+                            // 写成转义过的双引号，见 `tw_yaml::double_quoted`
+                            tw_config::edit::check_line_breaks(v)?;
                             tw_yaml::Scalar::Str(v.clone())
                         }
                         tw_api::PatchValue::Int(v) => tw_yaml::Scalar::Int(*v),
@@ -540,7 +559,7 @@ impl ConfigManager {
                 }
             };
         }
-        self.write(&text, Some(&cur.version()), origin).await
+        Ok((cur, text))
     }
 }
 

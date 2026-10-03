@@ -9,8 +9,9 @@
 //!   写坏了也一样当作没有。没有可用的那一条时，插件只按 id 和状态列出来，**不为了列个
 //!   名字去起运行时**。
 //! - 只有 core 写它，和插件文件一样只给自己（0600）。
-//! - **安全上的判断一律不用它**：打开插件、改改得了工具调用的插件的设置和范围、试跑之前，
-//!   都先真的编一遍、看编出来的 manifest。它是用户目录里的一个文件，被人改了只是显示不对。
+//! - **安全上的判断一律不用它**：打开插件、改改得了工具调用的插件的代码、批准它改过的文件、
+//!   试跑之前，都先真的编一遍、看编出来的 manifest。它是用户目录里的一个文件，被人改了只是
+//!   显示不对。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -23,8 +24,9 @@ use crate::plugin::set::Scope;
 /// 文件名，在插件目录里。点开头：它不是插件
 pub const FILE: &str = ".manifests.json";
 
-/// 这份格式自己的版本。**manifest 的读法或者这里的写法改了就加一**（2：多了 `requests`）
-const FORMAT: u32 = 2;
+/// 这份格式自己的版本。**manifest 的读法或者这里的写法改了就加一**（2：多了 `requests`；
+/// 3：多了 `on_error`，设置的 `default` 换成了 `value`）
+const FORMAT: u32 = 3;
 
 /// 缓存认的版本：core 的版本、沙箱的哈希、这份格式的版本，三样有一样不同就不认
 pub fn version() -> String {
@@ -60,6 +62,7 @@ pub(crate) struct Entry {
     permissions: Vec<tw_api::Permission>,
     requests: Vec<tw_api::RequestKind>,
     scope: ScopeEntry,
+    on_error: tw_api::OnError,
     reply_mode: tw_api::ReplyMode,
     settings: Vec<SettingEntry>,
     hooks: HooksEntry,
@@ -79,7 +82,7 @@ struct SettingEntry {
     key: String,
     kind: tw_api::SettingKind,
     label: String,
-    default: serde_json::Value,
+    value: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -104,6 +107,7 @@ impl From<&Manifest> for Entry {
                 models: m.scope.models.clone(),
                 upstreams: m.scope.upstreams.clone(),
             },
+            on_error: m.on_error,
             reply_mode: m.reply_mode,
             settings: m
                 .settings
@@ -112,7 +116,7 @@ impl From<&Manifest> for Entry {
                     key: s.key.clone(),
                     kind: s.kind,
                     label: s.label.clone(),
-                    default: s.default.clone(),
+                    value: s.value.clone(),
                 })
                 .collect(),
             hooks: HooksEntry {
@@ -138,6 +142,7 @@ impl From<&Entry> for Manifest {
                 models: e.scope.models.clone(),
                 upstreams: e.scope.upstreams.clone(),
             },
+            on_error: e.on_error,
             reply_mode: e.reply_mode,
             settings: e
                 .settings
@@ -146,7 +151,7 @@ impl From<&Entry> for Manifest {
                     key: s.key.clone(),
                     kind: s.kind,
                     label: s.label.clone(),
-                    default: s.default.clone(),
+                    value: s.value.clone(),
                 })
                 .collect(),
             hooks: Hooks {
@@ -295,12 +300,13 @@ mod tests {
                 models: vec!["deepseek*".into()],
                 upstreams: vec![],
             },
+            on_error: tw_api::OnError::Skip,
             reply_mode: tw_api::ReplyMode::Block,
             settings: vec![SettingSpec {
                 key: "note".into(),
                 kind: tw_api::SettingKind::String,
                 label: "附加内容".into(),
-                default: "第一行\n第二行".into(),
+                value: "第一行\n第二行".into(),
             }],
             hooks: Hooks {
                 request: true,

@@ -410,7 +410,9 @@ pub enum OnError {
     Skip,
 }
 
-/// 一个要装上的插件：写进 `plugins/<id>.js`，配置里记下它的哈希（就是批准过的那一份）
+/// 一个要装上的插件：出错时怎么办、范围和设置的值写进它的 manifest，再写进
+/// `plugins/<id>.js` 和底稿 `plugins/.approved/<id>.js`，配置里记下它的哈希（就是批准过的
+/// 那一份）—— 和 core 装插件时一样
 pub struct Plug {
     id: String,
     source: String,
@@ -438,7 +440,7 @@ impl Plug {
         self
     }
 
-    /// 适用范围里的模型（配置里那一份，装上时照 manifest 填的就是它）
+    /// 适用范围里的模型（写进插件文件的 `match`，替掉它原来写的）
     pub fn models(mut self, models: &[&str]) -> Plug {
         self.models = models.iter().map(|m| m.to_string()).collect();
         self
@@ -467,32 +469,51 @@ impl Gateway {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
         for p in &plugs {
+            // 出错时怎么办、范围、设置的值写进插件文件的 manifest（插件的配置就在文件里），
+            // 和界面改它们时是同一条路
+            let settings = p
+                .settings
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        Value::Bool(b) => tw_api::SettingValue::Bool(*b),
+                        Value::Number(n) => tw_api::SettingValue::Number(n.as_f64().unwrap()),
+                        Value::String(s) => tw_api::SettingValue::String(s.clone()),
+                        other => panic!("{}: a setting cannot be {other}", p.id),
+                    };
+                    (k.clone(), v)
+                })
+                .collect();
+            let source = tw_gateway::plugin::source::rewrite(
+                &p.source,
+                match p.on_error {
+                    OnError::Reject => tw_api::OnError::Reject,
+                    OnError::Skip => tw_api::OnError::Skip,
+                },
+                &tw_api::PluginScope {
+                    clients: Vec::new(),
+                    models: p.models.clone(),
+                    upstreams: p.upstreams.clone(),
+                },
+                &settings,
+            )
+            .unwrap_or_else(|e| panic!("{}: {}", p.id, e.text));
             std::fs::write(
                 dir.path().join("plugins").join(format!("{}.js", p.id)),
-                &p.source,
+                &source,
             )
             .unwrap();
+            // 批准时存下的那一份：文件被改了之后，出错时怎么办、管哪些请求照它说的
+            let approved = tw_config::plugins::approved_path(dir.path(), &p.id);
+            std::fs::create_dir_all(approved.parent().unwrap()).unwrap();
+            std::fs::write(&approved, &source).unwrap();
             cfg.plugins.push(tw_config::Plugin {
                 id: p.id.clone(),
                 file: format!("plugins/{}.js", p.id),
-                sha256: tw_gateway::plugin::load::sha256_hex(p.source.as_bytes()),
+                sha256: tw_gateway::plugin::load::sha256_hex(source.as_bytes()),
                 enabled: true,
-                on_error: match p.on_error {
-                    OnError::Reject => tw_config::PluginOnError::Reject,
-                    OnError::Skip => tw_config::PluginOnError::Skip,
-                },
-                scope: tw_config::PluginScope {
-                    models: p.models.clone(),
-                    upstreams: p.upstreams.clone(),
-                    ..Default::default()
-                },
-                settings: p
-                    .settings
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_yaml_ng::to_value(v).unwrap()))
-                    .collect(),
             });
         }
         // 引擎用网关默认的那一个（`tw-plugin` 的沙箱），和生产上一样

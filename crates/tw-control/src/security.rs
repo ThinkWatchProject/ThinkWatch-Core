@@ -80,19 +80,16 @@ impl GuardExt for Guard {
                 path: &["security", "redact", "custom"],
                 what: "redaction rule",
                 key: "name",
-                multiline: &[],
             },
             Guard::InspectTools => edit::Section {
                 path: &["security", "inspect_tools", "custom"],
                 what: "tool-call rule",
                 key: "name",
-                multiline: &[],
             },
             Guard::Content => edit::Section {
                 path: &["security", "content", "custom"],
                 what: "content rule",
                 key: "name",
-                multiline: &[],
             },
         }
     }

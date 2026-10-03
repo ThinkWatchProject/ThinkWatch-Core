@@ -6,7 +6,7 @@ export const manifest = {
   name: "异步钩子",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "async" } },
+  settings: { kind: { type: "string", label: "方式", value: "async" } },
 };
 
 export function onRequest(req, ctx) {

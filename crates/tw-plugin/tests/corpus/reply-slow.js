@@ -10,7 +10,7 @@ export const manifest = {
   api: 1,
   permissions: ["reply.text"],
   reply: "stream",
-  settings: { kind: { type: "string", label: "方式", default: "over-call" } },
+  settings: { kind: { type: "string", label: "方式", value: "over-call" } },
 };
 
 function work(n) {

@@ -1,4 +1,14 @@
-//! 脚本插件：装、改、换源码、批准、排顺序、删、试跑、日志。
+//! 脚本插件：装、保存、改写、批准、排顺序、删、试跑、日志。
+//!
+//! # 插件的配置在插件文件里
+//!
+//! 出错时怎么办、管哪些请求、设置的值都写在插件文件的 manifest 里（契约附录四）：文件就是
+//! 它的配置所在。配置里的那一条只有 id、文件、批准的哈希和开关。界面改这几样是改源码 ——
+//! `PluginRewrite` 只换 manifest 那一段字面量、交回改写之后的源码（什么都不写），
+//! `SavePlugin` 把源码和开关存下来。
+//!
+//! 保存时拿新源码和批准的那一份比：manifest 字面量以外一个字节不差、manifest 里只差出错时
+//! 怎么办、范围和设置的值，是**只改了数据**；别的都是**改了代码**。
 //!
 //! # 文件和配置是一件事的两半
 //!
@@ -6,34 +16,38 @@
 //! 批准的哈希在配置里。**先写文件、再写配置**：配置一落盘，网关就照它重读文件、比
 //! 哈希（不变式 I9）。配置没写成（版本对不上、校验没过），刚写的文件按写之前的样子
 //! 还原 —— 不留下一个和配置对不上的插件文件。整个过程攥着 `Plugins::edits`，目录
-//! 监听不会落在两半之间。
+//! 监听不会落在两半之间：保存（哪怕只改了数据）时，文件、底稿和哈希一起换，中间没有
+//! 「文件变了」的那一刻。
 //!
-//! # 四个端点网页调不了
+//! # 什么时候要在系统的确认框里点头
 //!
-//! 装（`CreatePlugin`）、换源码（`ReplacePluginSource`）、批准改过的文件
-//! （`ApprovePluginFile`）**不在桌面端网页的 `call` 白名单里**（不变式 I12）：这三件事
-//! 要在系统的确认框里点头，那一步在桌面端的 Rust 里，它自己再编一遍源码，把名字、
-//! 权限和哈希摆给人看。所以这里不假设调用方看过什么：源码在这里再编一遍，批准时
-//! 磁盘上的文件得正好是调用方看过的那一份（哈希核对）。
+//! **只有改得了回答里工具调用的插件**（权限有 `reply_tool_calls`）：它决定客户端执行什么，
+//! 网页里注入的脚本要是能装上它、打开它、改它的代码、批准它磁盘上改过的文件，就能借它改
+//! 客户端要跑的命令。这四件事，碰上这种插件（新旧两份里有一份有这个权限）时，网页调得到的
+//! 端点（`CreatePlugin`、`SavePlugin`、`ApprovePluginFile`）一律拒绝（403，
+//! `control.plugin.needs_confirmation`），要走带 `confirmed` 的那一条 —— 那几条不在桌面端
+//! 网页的 `call` 白名单里，桌面端的 Rust 自己再编一遍源码、在系统的确认框里把名字、权限和
+//! 要改的地方摆给人看，点了头才发。
 //!
-//! 第四个是**确认过的改动**（`UpdatePluginConfirmed`）。改得了回答里工具调用的插件
-//! （`reply_tool_calls`）决定客户端执行什么：网页里注入的脚本要是能打开它、改它的设置
-//! 或范围，就能借它改客户端要跑的命令。所以 `UpdatePlugin`（网页调得到）对这种插件只做
-//! 停用、改出错时怎么办，打开、改设置、改范围要走确认过的那一条。**读不出权限的插件按
-//! 改得了算**：它此刻跑不了，可一旦又跑得了（运行时恢复了），网页替它打开的开关就生效了。
+//! 别的都不用点头：只改数据（哪怕是工具调用插件的）、停用、删、排顺序，装、打开、改、批准
+//! 不碰工具调用的插件。
+//!
+//! **判断只认真的编出来的 manifest**，不认显示用的缓存（它是用户目录里的一个文件，被人改了
+//! 只是显示不对）；**读不出旧的那一份要什么权限的按改得了算**：它此刻跑不了，可一旦又跑得
+//! 了（运行时恢复了），网页替它做的事就生效了。所以这里也不假设调用方看过什么：源码在这里
+//! 再编一遍，批准时磁盘上的文件得正好是调用方看过的那一份（哈希核对）。
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
-use serde_yaml_ng::{Mapping, Value};
+use serde_yaml_ng::Mapping;
 use tw_api::{SettingValue, ep};
-use tw_config::edit::{self, EditError};
+use tw_config::edit;
 use tw_config::history::Origin;
 use tw_gateway::plugin::load::{read_capped, sha256_hex};
-use tw_gateway::plugin::{Active, Broken, LoadError, Manifest};
+use tw_gateway::plugin::{Active, Broken, LoadError, Manifest, source};
 use tw_types::{Msg, msg};
 
 use crate::contract::RouterExt;
@@ -45,14 +59,16 @@ pub fn router() -> axum::Router<ControlState> {
     axum::Router::new()
         .at(ep::Plugins, list)
         .at(ep::PluginInspect, inspect)
+        .at(ep::PluginRewrite, rewrite)
         .at(ep::CreatePlugin, create)
+        .at(ep::CreatePluginConfirmed, create_confirmed)
         .at(ep::ReorderPlugins, reorder)
-        .at(ep::UpdatePlugin, update)
-        .at(ep::UpdatePluginConfirmed, update_confirmed)
+        .at(ep::SavePlugin, save)
+        .at(ep::SavePluginConfirmed, save_confirmed)
         .at(ep::DeletePlugin, delete)
-        .at(ep::ReplacePluginSource, replace_source)
         .at(ep::PluginSourceDiff, source_diff)
         .at(ep::ApprovePluginFile, approve)
+        .at(ep::ApprovePluginFileConfirmed, approve_confirmed)
         .at(ep::TrialPlugin, trial)
         .at(ep::PluginLogs, logs)
 }
@@ -80,14 +96,6 @@ fn not_found(id: &str) -> Fail {
     )
 }
 
-/// 配置里没有这个插件（在 `transform` 里，配置是磁盘上那一份）
-fn missing(id: &str) -> ApplyError {
-    ApplyError::Edit(EditError::NotFound {
-        what: "plugin",
-        name: id.to_string(),
-    })
-}
-
 // ---------------------------------------------------------------- 读
 
 async fn list(State(s): State<ControlState>) -> Json<Vec<tw_api::PluginView>> {
@@ -106,19 +114,6 @@ async fn list(State(s): State<ControlState>) -> Json<Vec<tw_api::PluginView>> {
 
 fn view(a: &Active, entry: &tw_config::Plugin) -> tw_api::PluginView {
     let m = a.manifest.as_ref();
-    // 交给插件的那一份（默认值补齐了）；插件跑不了、没算出来时就照配置里写的说
-    let settings = if a.settings.is_empty() {
-        entry
-            .settings
-            .iter()
-            .filter_map(|(k, v)| Some((k.clone(), from_yaml(v)?)))
-            .collect()
-    } else {
-        a.settings
-            .iter()
-            .filter_map(|(k, v)| Some((k.clone(), from_json(v)?)))
-            .collect()
-    };
     tw_api::PluginView {
         id: a.id.clone(),
         name: a.name.clone(),
@@ -127,10 +122,9 @@ fn view(a: &Active, entry: &tw_config::Plugin) -> tw_api::PluginView {
         on_error: a.on_error,
         permissions: a.permissions.clone(),
         requests: a.requests.clone(),
-        scope: scope_view(&entry.scope),
+        scope: scope_view(&a.scope),
         reply_mode: a.reply_mode,
         settings_schema: m.map(schema).unwrap_or_default(),
-        settings,
         sha256: entry.sha256.clone(),
         status: status_of(a),
         stats: a.stats.view(),
@@ -147,7 +141,7 @@ fn status_of(a: &Active) -> tw_api::PluginStatus {
     }
 }
 
-fn scope_view(s: &tw_config::PluginScope) -> tw_api::PluginScope {
+fn scope_view(s: &tw_gateway::plugin::Scope) -> tw_api::PluginScope {
     tw_api::PluginScope {
         clients: s.clients.clone(),
         models: s.models.clone(),
@@ -162,7 +156,7 @@ fn schema(m: &Manifest) -> Vec<tw_api::SettingSpecView> {
             key: s.key.clone(),
             kind: s.kind,
             label: s.label.clone(),
-            default: from_json(&s.default).unwrap_or(SettingValue::String(String::new())),
+            value: from_json(&s.value).unwrap_or(SettingValue::String(String::new())),
         })
         .collect()
 }
@@ -173,11 +167,8 @@ fn manifest_view(m: &Manifest) -> tw_api::ManifestView {
         description: m.description.clone(),
         permissions: m.permissions.clone(),
         requests: m.requests.clone(),
-        scope: tw_api::PluginScope {
-            clients: m.scope.clients.clone(),
-            models: m.scope.models.clone(),
-            upstreams: m.scope.upstreams.clone(),
-        },
+        scope: scope_view(&m.scope),
+        on_error: m.on_error,
         reply_mode: m.reply_mode,
         settings_schema: schema(m),
         hooks: tw_api::PluginHooks {
@@ -194,27 +185,6 @@ fn from_json(v: &serde_json::Value) -> Option<SettingValue> {
         serde_json::Value::Number(n) => n.as_f64().map(SettingValue::Number),
         serde_json::Value::String(s) => Some(SettingValue::String(s.clone())),
         _ => None,
-    }
-}
-
-fn from_yaml(v: &Value) -> Option<SettingValue> {
-    match v {
-        Value::Bool(b) => Some(SettingValue::Bool(*b)),
-        Value::Number(n) => n.as_f64().map(SettingValue::Number),
-        Value::String(s) => Some(SettingValue::String(s.clone())),
-        _ => None,
-    }
-}
-
-/// 写进配置的样子。**整数写成整数**：界面交来的数字一律是 f64，`3` 不该变成 `3.0`
-fn to_yaml(v: &SettingValue) -> Value {
-    match v {
-        SettingValue::Bool(b) => Value::Bool(*b),
-        SettingValue::Number(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => {
-            Value::Number((*f as i64).into())
-        }
-        SettingValue::Number(f) => Value::Number((*f).into()),
-        SettingValue::String(s) => Value::String(s.clone()),
     }
 }
 
@@ -241,10 +211,7 @@ async fn inspect(
 }
 
 fn load_error(e: &LoadError) -> tw_api::PluginLoadError {
-    let (line, column) = match e {
-        LoadError::Syntax { line, column, .. } => (*line, *column),
-        _ => (None, None),
-    };
+    let (line, column) = e.location();
     tw_api::PluginLoadError {
         message: e.msg(),
         line,
@@ -272,7 +239,7 @@ async fn load(
     .map_err(internal)
 }
 
-/// 编一遍，编不成就拒绝这次写入（装、换源码、批准都要编得成）
+/// 编一遍，编不成就拒绝这次写入（装、保存新源码、批准都要编得成）
 async fn load_or_refuse(s: &ControlState, source: Vec<u8>) -> Result<Manifest, Fail> {
     load(s, source, true)
         .await?
@@ -334,52 +301,33 @@ async fn logs(
 
 // ---------------------------------------------------------------- 写
 
-/// 配置里的一条。字段的顺序就是写进文件的顺序
-fn entry(
-    id: &str,
-    sha256: &str,
-    enabled: bool,
-    on_error: tw_api::OnError,
-    scope: &tw_api::PluginScope,
-    settings: &BTreeMap<String, SettingValue>,
-) -> Mapping {
+/// 配置里的一条：**只有这四样**。出错时怎么办、范围、设置的值都在插件文件里
+fn entry(id: &str, sha256: &str, enabled: bool) -> Mapping {
     let mut m = Mapping::new();
     m.insert("id".into(), id.into());
     m.insert("file".into(), tw_config::Plugin::file_for(id).into());
     m.insert("sha256".into(), sha256.into());
     m.insert("enabled".into(), enabled.into());
-    m.insert("on_error".into(), on_error.slug().into());
-    let mut sc = Mapping::new();
-    for (key, list) in [
-        ("clients", &scope.clients),
-        ("models", &scope.models),
-        ("upstreams", &scope.upstreams),
-    ] {
-        if !list.is_empty() {
-            sc.insert(
-                key.into(),
-                Value::Sequence(list.iter().map(|x| Value::from(x.trim())).collect()),
-            );
-        }
-    }
-    if !sc.is_empty() {
-        m.insert("scope".into(), Value::Mapping(sc));
-    }
-    if !settings.is_empty() {
-        m.insert(
-            "settings".into(),
-            Value::Mapping(
-                settings
-                    .iter()
-                    .map(|(k, v)| (Value::from(k.as_str()), to_yaml(v)))
-                    .collect(),
-            ),
-        );
-    }
     m
 }
 
-/// 范围里不能有空着的一项（和配置校验同一条）。**写文件之前查**
+/// 写插件这一节之前：先去掉 0.58 留下的旧字段（出错时怎么办、范围、设置挪进了插件文件，
+/// 见 [`tw_config::plugins::drop_legacy`]）。插件这一节的每一次写都先过它
+fn current_shape(text: &str) -> Result<String, ApplyError> {
+    Ok(tw_config::plugins::drop_legacy(text)?)
+}
+
+/// 新建或者改写配置里的一条
+fn upsert(text: &str, current: Option<&str>, item: &Mapping) -> Result<String, ApplyError> {
+    Ok(edit::upsert(
+        &current_shape(text)?,
+        edit::PLUGINS,
+        current,
+        item,
+    )?)
+}
+
+/// 范围里不能有空着的一项。**改写之前查**，说的是这一句
 fn check_scope(scope: &tw_api::PluginScope) -> Result<(), Fail> {
     let blank = scope
         .clients
@@ -399,36 +347,15 @@ fn check_scope(scope: &tw_api::PluginScope) -> Result<(), Fail> {
     Ok(())
 }
 
-/// 交上来的设置对着 manifest 查：插件没声明的键、类型不对的值都拒绝；没给的补上默认
-/// 值 —— **配置里每个设置都写明**。和网关加载时同一套判据
-fn settings_for(
-    m: &Manifest,
-    given: &BTreeMap<String, SettingValue>,
-) -> Result<BTreeMap<String, SettingValue>, Fail> {
-    let all = tw_gateway::plugin::load::settings_of(m, given)
+/// 改写一份源码里的数据：出错时怎么办、范围、设置的值。**什么都不留下**，也用不着运行时
+/// —— manifest 是纯数据，照着源码就改得了
+async fn rewrite(
+    Json(req): Json<tw_api::PluginRewriteRequest>,
+) -> Result<Json<tw_api::PluginSource>, Fail> {
+    check_scope(&req.scope)?;
+    let source = source::rewrite(&req.source, req.on_error, &req.scope, &req.settings)
         .map_err(|why| fail(StatusCode::BAD_REQUEST, why))?;
-    Ok(all
-        .iter()
-        .filter_map(|(k, v)| Some((k.clone(), from_json(v)?)))
-        .collect())
-}
-
-/// 换了一份源码之后的设置：**还对得上的留着**（键还在、类型没变），对不上的丢掉，
-/// 新声明的补默认值。换源码、批准改过的文件都不该因为设置而让插件跑不了
-fn reconcile(m: &Manifest, old: &BTreeMap<String, Value>) -> BTreeMap<String, SettingValue> {
-    m.settings
-        .iter()
-        .map(|spec| {
-            let kept = old
-                .get(&spec.key)
-                .and_then(from_yaml)
-                .filter(|v| v.kind() == spec.kind);
-            let v = kept
-                .or_else(|| from_json(&spec.default))
-                .unwrap_or(SettingValue::String(String::new()));
-            (spec.key.clone(), v)
-        })
-        .collect()
+    Ok(Json(tw_api::PluginSource { source }))
 }
 
 /// 新插件的 id：给了就查写法和重名，没给就从名字生成一个不重的
@@ -599,13 +526,134 @@ where
     }
 }
 
+/// 磁盘上此刻的那一版配置（版本号），和它里面的这个插件。**判断照它做，写也照它写**：
+/// 写的时候版本对不上就是 409，不会照着一份过期的判断写下去
+fn on_disk(s: &ControlState, id: &str) -> Result<(String, tw_config::Plugin), Fail> {
+    let cur = s
+        .cfg
+        .current()
+        .map_err(|e| apply_fail(ApplyError::Store(e)))?;
+    let cfg = tw_config::try_parse(&cur.text).map_err(|r| apply_fail(ApplyError::Rejected(r)))?;
+    let p = cfg
+        .plugins
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| not_found(id))?;
+    Ok((cur.version(), p))
+}
+
+/// 改得了回答里的工具调用
+fn steers(m: &Manifest) -> bool {
+    m.permissions.contains(&tw_api::Permission::ReplyToolCalls)
+}
+
+/// 这件事要在系统的确认框里点头（见模块说明）
+fn needs_confirmation(name: &str) -> Fail {
+    apply_fail(ApplyError::NeedsConfirmation(msg!(
+        "control.plugin.needs_confirmation", plugin = name =>
+        "Plugin `{plugin}` can change the tool calls in replies, so installing it, turning it on, \
+         changing its code or approving a change to its file has to be confirmed in the app."
+    )))
+}
+
+/// 直接写配置原文的那几条路（整份写回 `PutConfig`、按路径改 `PatchConfig`、回滚
+/// `ConfigRollback`）**也是网页调得到的**，同样绕不过确认：照新旧两份配置比，装上（多了一条）、
+/// 打开（停用 → 开着）、批准（批准的哈希换了）一个改得了工具调用的插件，一律拒绝（403，
+/// `control.plugin.needs_confirmation`）。这几条路没有点过头的那一条：要做这几件事，去插件页。
+///
+/// 新的那一份磁盘上找不到（哈希对得上的字节没有，插件只会是「文件变了」、跑不起来）的不拦；
+/// 打开一个读不出权限的插件、换成一份编不成的，按改得了算。
+///
+/// **只读插件那一节**，不做整份配置的校验：界面交来的原文里控制面的钥匙是打码的（写的时候才
+/// 换回来），整份校验在这里过不去 —— 过不去就放行的话，这道关形同虚设。新的那一份插件那一节
+/// 读不成的不在这里管：写的时候整份配置会被拒
+pub(crate) async fn guard_raw_write(s: &ControlState, old: &str, new: &str) -> Result<(), Fail> {
+    let Some(new) = plugins_in(new) else {
+        return Ok(());
+    };
+    // 旧的那一份读不成（不该发生）：当它一个插件都没有，每一条都按新装的查
+    let old = plugins_in(old).unwrap_or_default();
+    for n in &new {
+        let o = old.iter().find(|p| p.id == n.id);
+        let same_code = o.is_some_and(|o| o.sha256 == n.sha256);
+        if same_code {
+            let turns_on = n.enabled && o.is_some_and(|o| !o.enabled);
+            if turns_on && let Some(name) = approved_steers(s, &n.id, &n.sha256).await {
+                return Err(needs_confirmation(&name));
+            }
+            continue;
+        }
+        // 新装的、批准的换了：磁盘上有这份字节才跑得起来
+        let Some(bytes) = approved_bytes(s, &n.id, &n.sha256) else {
+            continue;
+        };
+        match load(s, bytes, true).await? {
+            Ok(m) if steers(&m) => return Err(needs_confirmation(&m.name)),
+            Ok(_) => {}
+            Err(_) => return Err(needs_confirmation(&n.id)),
+        }
+        if let Some(o) = o
+            && let Some(name) = approved_steers(s, &o.id, &o.sha256).await
+        {
+            return Err(needs_confirmation(&name));
+        }
+    }
+    Ok(())
+}
+
+/// 一份配置原文里的插件那一节，别的不管。读不成是 None
+fn plugins_in(text: &str) -> Option<Vec<tw_config::Plugin>> {
+    #[derive(serde::Deserialize)]
+    struct Only {
+        #[serde(default)]
+        plugins: Vec<tw_config::Plugin>,
+    }
+    serde_yaml_ng::from_str::<Only>(text)
+        .ok()
+        .map(|o| o.plugins)
+}
+
+/// 批准的那一份改不改得了回答里的工具调用。改得了、**或者读不出来**（批准的那份字节没了、
+/// 编不成）就是 `Some(名字)` —— 读不出来按改得了算。真的编一遍，不认显示用的缓存
+async fn approved_steers(s: &ControlState, id: &str, sha256: &str) -> Option<String> {
+    match compiled_manifest(s, id, sha256).await {
+        Some(m) if !steers(&m) => None,
+        Some(m) => Some(m.name),
+        None => Some(
+            s.gateway
+                .runtime()
+                .plugins
+                .get(id)
+                .map_or_else(|| id.to_string(), |a| a.name.clone()),
+        ),
+    }
+}
+
 async fn create(
     State(s): State<ControlState>,
     Json(req): Json<tw_api::PluginCreate>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let m = load_or_refuse(&s, req.source.clone().into_bytes()).await?;
-    check_scope(&req.scope)?;
-    let settings = settings_for(&m, &req.settings)?;
+    install(&s, req, false).await
+}
+
+/// 同一件事，桌面端在系统的确认框里点过头了。**网页不能调**
+async fn create_confirmed(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::PluginCreate>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    install(&s, req, true).await
+}
+
+/// 装一个：写插件文件和底稿，配置里加一条。`confirmed`：点过头了
+async fn install(
+    s: &ControlState,
+    req: tw_api::PluginCreate,
+    confirmed: bool,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let m = load_or_refuse(s, req.source.clone().into_bytes()).await?;
+    if !confirmed && steers(&m) {
+        return Err(needs_confirmation(&m.name));
+    }
     // **id 在拿到写的那把锁之后再定**：两个同名的插件同时装，后一个看得见前一个
     let _edit = s.gateway.plugins.edits.lock().await;
     let id = {
@@ -614,106 +662,109 @@ async fn create(
         new_id(req.id.as_deref(), &m.name, &taken)?
     };
     let sha = sha256_hex(req.source.as_bytes());
-    let item = entry(&id, &sha, req.enabled, req.on_error, &req.scope, &settings);
-    let dir = config_dir(&s);
+    let item = entry(&id, &sha, req.enabled);
+    let dir = config_dir(s);
     let src = req.source.as_bytes();
     let version = with_files(
-        &s,
+        s,
         &[
             (tw_config::plugins::file_path(&dir, &id), src),
             (tw_config::plugins::approved_path(&dir, &id), src),
         ],
         req.base_version.as_deref(),
-        |text, _| Ok(edit::upsert(text, edit::PLUGINS, None, &item)?),
+        |text, _| upsert(text, None, &item),
     )
     .await?;
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
-/// 网页调得到的那一条：改得了工具调用的插件只能停用、改出错时怎么办（见模块说明）
-async fn update(
-    State(s): State<ControlState>,
-    UrlPath(id): UrlPath<String>,
-    Json(req): Json<tw_api::PluginUpdate>,
-) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    save(&s, &id, req, false).await
-}
-
-/// 同一件事，桌面端在系统的确认框里点过头了：工具调用插件的开关、设置、范围也改得了。
-/// **网页不能调**（不在桌面端网页的白名单里）
-async fn update_confirmed(
-    State(s): State<ControlState>,
-    UrlPath(id): UrlPath<String>,
-    Json(req): Json<tw_api::PluginUpdate>,
-) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    save(&s, &id, req, true).await
-}
-
-/// 改开关、出错时怎么办、范围、设置。`confirmed`：点过头了（[`update_confirmed`]）
+/// 网页调得到的那一条：改得了工具调用的插件只能改数据、停用（见模块说明）
 async fn save(
+    State(s): State<ControlState>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<tw_api::PluginSave>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    store(&s, &id, req, false).await
+}
+
+/// 同一件事，桌面端在系统的确认框里点过头了：工具调用插件也打开得了、改得了代码。
+/// **网页不能调**（不在桌面端网页的白名单里）
+async fn save_confirmed(
+    State(s): State<ControlState>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<tw_api::PluginSave>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    store(&s, &id, req, true).await
+}
+
+/// 保存源码和开关（见 [`tw_api::PluginSave`]）。`confirmed`：点过头了
+async fn store(
     s: &ControlState,
     id: &str,
-    req: tw_api::PluginUpdate,
+    req: tw_api::PluginSave,
     confirmed: bool,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    check_scope(&req.scope)?;
-    // **攥着写插件的那把锁**：读到的权限和写下去的配置说的是同一份插件 —— 换源码、
-    // 批准也攥着它，落不到两者之间
+    // **攥着写插件的那把锁**：判断时读到的批准的那一份，就是写的时候被换掉的那一份 ——
+    // 别的插件写入落不到两者之间；配置被别处改了，版本对不上，写不下去
     let _edit = s.gateway.plugins.edits.lock().await;
-    let (current, shown) = {
-        let rt = s.gateway.runtime();
-        let current = rt.config.plugins.iter().find(|p| p.id == id).cloned();
-        let shown = rt.plugins.get(id).map(|a| a.name.clone());
-        (current, shown)
-    };
-    // 打开它、改设置、改范围（照写的比）：要按它的权限判断、按它的设置项核对，就**真的
-    // 编一遍**（停用着的插件这时才起运行时），不认显示用的缓存。只是停用、改出错时怎么办
-    // 的不用编。编不成、读不到批准的那份字节就当读不出权限：网页这条路拒绝
-    let approved = current.as_ref().map(|p| p.sha256.clone());
-    let manifest = match &current {
-        Some(p) if changes_what_it_does(p, &req, None) => compiled_manifest(s, id, &p.sha256).await,
-        _ => None,
-    };
-    let name = manifest
-        .as_ref()
-        .map(|m| m.name.clone())
-        .or(shown)
-        .unwrap_or_else(|| id.to_string());
-    let settings = match &manifest {
-        Some(m) => settings_for(m, &req.settings)?,
-        None => req.settings.clone(),
-    };
-    let version = s
-        .cfg
-        .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
-            let p = cfg
-                .plugins
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| missing(id))?;
-            // manifest 得是配置里批准的那一份的；对不上（配置刚被别处改了）就是读不出
-            let known = manifest
-                .as_ref()
-                .filter(|_| approved.as_deref() == Some(p.sha256.as_str()));
-            if !confirmed && steers_tool_calls(known) && changes_what_it_does(p, &req, known) {
-                return Err(ApplyError::NeedsConfirmation(msg!(
-                    "control.plugin.needs_confirmation", plugin = &name =>
-                    "Turning on plugin `{plugin}`, or changing its settings or scope, has to be \
-                     confirmed in the app, because the plugin may change the tool calls in replies."
-                )));
+    let (version, p) = on_disk(s, id)?;
+    let base = req.base_version.clone().unwrap_or(version);
+    let new = req.source.into_bytes();
+    let approved = approved_bytes(s, id, &p.sha256);
+    let turns_on = req.enabled && !p.enabled;
+
+    // 源码和批准的一字不差：只是开关，文件不动（磁盘上被人改过的文件也照旧留着待批）
+    if approved.as_deref() == Some(new.as_slice()) {
+        if turns_on
+            && !confirmed
+            && let Some(name) = approved_steers(s, id, &p.sha256).await
+        {
+            return Err(needs_confirmation(&name));
+        }
+        let item = entry(id, &p.sha256, req.enabled);
+        let version = s
+            .cfg
+            .transform(Some(base.as_str()), Origin::Ui, |text, _| {
+                upsert(text, Some(id), &item)
+            })
+            .await
+            .map_err(apply_fail)?;
+        return Ok(Json(tw_api::ConfigWritten { version }));
+    }
+
+    let m = load_or_refuse(s, new.clone()).await?;
+    // 读不到批准的那份字节，说不出差在哪儿：按改了代码算
+    let data_only = approved
+        .as_deref()
+        .is_some_and(|old| source::same_code(old, &new));
+    if !confirmed {
+        if data_only {
+            // 只改了数据：权限和旧的一模一样，只有打开它要点头
+            if turns_on && steers(&m) {
+                return Err(needs_confirmation(&m.name));
             }
-            let item = entry(
-                id,
-                &p.sha256,
-                req.enabled,
-                req.on_error,
-                &req.scope,
-                &settings,
-            );
-            Ok(edit::upsert(text, edit::PLUGINS, Some(id), &item)?)
-        })
-        .await
-        .map_err(apply_fail)?;
+        } else if steers(&m) {
+            return Err(needs_confirmation(&m.name));
+        } else if let Some(name) = approved_steers(s, id, &p.sha256).await {
+            return Err(needs_confirmation(&name));
+        }
+    }
+    let sha = sha256_hex(&new);
+    let item = entry(id, &sha, req.enabled);
+    let dir = config_dir(s);
+    let version = with_files(
+        s,
+        &[
+            (tw_config::plugins::file_path(&dir, id), &new),
+            (tw_config::plugins::approved_path(&dir, id), &new),
+        ],
+        Some(base.as_str()),
+        |text, _| upsert(text, Some(id), &item),
+    )
+    .await?;
+    if data_only {
+        defaults::follow(&dir, id, &p.sha256, &sha);
+    }
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
@@ -750,122 +801,43 @@ fn approved_bytes(s: &ControlState, id: &str, sha256: &str) -> Option<Vec<u8>> {
     .find(|b| sha256_hex(b) == sha256)
 }
 
-/// 改得了回答里的工具调用：权限里有 `reply_tool_calls`，**或者读不出它要什么权限**
-fn steers_tool_calls(m: Option<&Manifest>) -> bool {
-    m.is_none_or(|m| m.permissions.contains(&tw_api::Permission::ReplyToolCalls))
-}
-
-/// 这次改动里有没有要点头的：打开它、改设置、改范围。停用、改出错时怎么办都不算。
-/// **比的是生效的样子**：配置里没写的设置按默认值算，范围不看顺序和重复
-fn changes_what_it_does(
-    p: &tw_config::Plugin,
-    req: &tw_api::PluginUpdate,
-    m: Option<&Manifest>,
-) -> bool {
-    let turns_on = req.enabled && !p.enabled;
-    let norm = |v: &[String]| {
-        let mut v: Vec<String> = v.iter().map(|x| x.trim().to_string()).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    let scope = norm(&p.scope.clients) != norm(&req.scope.clients)
-        || norm(&p.scope.models) != norm(&req.scope.models)
-        || norm(&p.scope.upstreams) != norm(&req.scope.upstreams);
-    let now: BTreeMap<String, SettingValue> = p
-        .settings
-        .iter()
-        .filter_map(|(k, v)| Some((k.clone(), from_yaml(v)?)))
-        .collect();
-    let effective = |given: &BTreeMap<String, SettingValue>| {
-        let all = tw_gateway::plugin::load::settings_of(m?, given).ok()?;
-        Some(
-            all.iter()
-                .filter_map(|(k, v)| Some((k.clone(), from_json(v)?)))
-                .collect::<BTreeMap<_, _>>(),
-        )
-    };
-    let settings = match (effective(&now), effective(&req.settings)) {
-        (Some(a), Some(b)) => a != b,
-        // 算不出生效的样子（读不出 manifest、配置里的设置本来就不对）：照写的比
-        _ => now != req.settings,
-    };
-    turns_on || scope || settings
-}
-
-async fn replace_source(
-    State(s): State<ControlState>,
-    UrlPath(id): UrlPath<String>,
-    Json(req): Json<tw_api::PluginSourceReplace>,
-) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    if !s
-        .gateway
-        .runtime()
-        .config
-        .plugins
-        .iter()
-        .any(|p| p.id == id)
-    {
-        return Err(not_found(&id));
-    }
-    let m = load_or_refuse(&s, req.source.clone().into_bytes()).await?;
-    let sha = sha256_hex(req.source.as_bytes());
-    let dir = config_dir(&s);
-    let _edit = s.gateway.plugins.edits.lock().await;
-    let src = req.source.as_bytes();
-    let version = with_files(
-        &s,
-        &[
-            (tw_config::plugins::file_path(&dir, &id), src),
-            (tw_config::plugins::approved_path(&dir, &id), src),
-        ],
-        req.base_version.as_deref(),
-        |text, cfg| {
-            let p = cfg
-                .plugins
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| missing(&id))?;
-            let item = entry(
-                &id,
-                &sha,
-                p.enabled,
-                p.on_error.into(),
-                &scope_view(&p.scope),
-                &reconcile(&m, &p.settings),
-            );
-            Ok(edit::upsert(text, edit::PLUGINS, Some(&id), &item)?)
-        },
-    )
-    .await?;
-    Ok(Json(tw_api::ConfigWritten { version }))
-}
-
-/// 批准磁盘上改过的文件。**批的是调用方看过的那一份**：读一次，哈希得和交来的一样，
-/// 编的、存进底稿的、写进配置的都是这一次读到的字节。
 async fn approve(
     State(s): State<ControlState>,
     UrlPath(id): UrlPath<String>,
     Json(req): Json<tw_api::PluginApprove>,
 ) -> Result<Json<tw_api::ConfigWritten>, Fail> {
-    let file = {
-        let rt = s.gateway.runtime();
-        let p = rt
-            .config
-            .plugins
-            .iter()
-            .find(|p| p.id == id)
-            .ok_or_else(|| not_found(&id))?;
-        p.path_in(&config_dir(&s))
-    };
+    approve_file(&s, &id, req, false).await
+}
+
+/// 同一件事，桌面端在系统的确认框里点过头了。**网页不能调**
+async fn approve_confirmed(
+    State(s): State<ControlState>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<tw_api::PluginApprove>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    approve_file(&s, &id, req, true).await
+}
+
+/// 批准磁盘上改过的文件。**批的是调用方看过的那一份**：读一次，哈希得和交来的一样，
+/// 编的、存进底稿的、写进配置的都是这一次读到的字节。`confirmed`：点过头了
+async fn approve_file(
+    s: &ControlState,
+    id: &str,
+    req: tw_api::PluginApprove,
+    confirmed: bool,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
     let _edit = s.gateway.plugins.edits.lock().await;
+    let (version, p) = on_disk(s, id)?;
+    let base = req.base_version.clone().unwrap_or(version);
+    let dir = config_dir(s);
+    let file = p.path_in(&dir);
     let bytes = match read_capped(&file) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(fail(
                 StatusCode::CONFLICT,
                 msg!(
-                    "control.plugin.file_missing", plugin = &id =>
+                    "control.plugin.file_missing", plugin = id =>
                     "The file of plugin `{plugin}` is gone, so there is nothing to approve. Replace \
                      its source or delete it."
                 ),
@@ -878,35 +850,35 @@ async fn approve(
         return Err(fail(
             StatusCode::CONFLICT,
             msg!(
-                "control.plugin.file_moved_on", plugin = &id =>
+                "control.plugin.file_moved_on", plugin = id =>
                 "The file of plugin `{plugin}` changed again after it was reviewed. Review it again."
             ),
         ));
     }
-    let m = load_or_refuse(&s, bytes.clone()).await?;
-    let dir = config_dir(&s);
+    let m = load_or_refuse(s, bytes.clone()).await?;
+    if !confirmed {
+        // 新的、旧的（批准过的那一份）有一份改得了工具调用，就要点头；旧的读不出来也算
+        if steers(&m) {
+            return Err(needs_confirmation(&m.name));
+        }
+        if let Some(name) = approved_steers(s, id, &p.sha256).await {
+            return Err(needs_confirmation(&name));
+        }
+    }
+    let data_only = approved_bytes(s, id, &p.sha256)
+        .as_deref()
+        .is_some_and(|old| source::same_code(old, &bytes));
+    let item = entry(id, &sha, p.enabled);
     let version = with_files(
-        &s,
-        &[(tw_config::plugins::approved_path(&dir, &id), &bytes)],
-        req.base_version.as_deref(),
-        |text, cfg| {
-            let p = cfg
-                .plugins
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| missing(&id))?;
-            let item = entry(
-                &id,
-                &sha,
-                p.enabled,
-                p.on_error.into(),
-                &scope_view(&p.scope),
-                &reconcile(&m, &p.settings),
-            );
-            Ok(edit::upsert(text, edit::PLUGINS, Some(&id), &item)?)
-        },
+        s,
+        &[(tw_config::plugins::approved_path(&dir, id), &bytes)],
+        Some(base.as_str()),
+        |text, _| upsert(text, Some(id), &item),
     )
     .await?;
+    if data_only {
+        defaults::follow(&dir, id, &p.sha256, &sha);
+    }
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
@@ -921,7 +893,7 @@ async fn delete(
     let version = s
         .cfg
         .transform(q.base_version.as_deref(), Origin::Ui, |text, _| {
-            Ok(edit::remove(text, edit::PLUGINS, &id)?)
+            Ok(edit::remove(&current_shape(text)?, edit::PLUGINS, &id)?)
         })
         .await
         .map_err(apply_fail)?;
@@ -956,7 +928,11 @@ async fn reorder(
                     "The new order has to name every plugin exactly once."
                 )));
             }
-            Ok(edit::reorder(text, edit::PLUGINS, &req.ids)?)
+            Ok(edit::reorder(
+                &current_shape(text)?,
+                edit::PLUGINS,
+                &req.ids,
+            )?)
         })
         .await
         .map_err(apply_fail)?;
@@ -1019,8 +995,8 @@ async fn trial(
     ))
 }
 
-/// 把一个休眠的插件真的编出来（试跑之前）：批准的那份字节编出来的宿主，设置按它的
-/// manifest 重新对过。读不到批准的那份字节、编不成、设置对不上就是试不了的原因
+/// 把一个休眠的插件真的编出来（试跑之前）：批准的那份字节编出来的宿主，出错时怎么办、
+/// 范围、设置都照它的 manifest。读不到批准的那份字节、编不成就是试不了的原因
 async fn awaken(s: &ControlState, a: &Active) -> Result<Active, Msg> {
     let entry = s
         .gateway
@@ -1044,18 +1020,17 @@ async fn awaken(s: &ControlState, a: &Active) -> Result<Active, Msg> {
         .map_err(|e| internal(e).1.0)?
         .map_err(|e| e.msg())?;
     let m = host.manifest().clone();
-    let settings = tw_gateway::plugin::load::settings_of(&m, &entry.settings)?;
     Ok(Active {
         id: a.id.clone(),
         name: m.name.clone(),
         enabled: a.enabled,
-        on_error: a.on_error,
-        scope: a.scope.clone(),
+        on_error: m.on_error,
+        scope: m.scope.clone(),
         permissions: m.permissions.clone(),
         requests: m.requests.clone(),
         reply_mode: m.reply_mode,
         hooks: m.hooks,
-        settings,
+        settings: tw_gateway::plugin::load::values_of(&m),
         manifest: Some(m),
         state: tw_gateway::plugin::State::Ready(host),
         stats: a.stats.clone(),
@@ -1192,11 +1167,5 @@ mod tests {
         let id = id_from_name(&long, &[&"x".repeat(40)]);
         assert!(id.len() <= 40 && id.ends_with("-2"), "{id}");
         assert!(tw_config::plugins::valid_id(&id));
-    }
-
-    #[test]
-    fn whole_numbers_stay_whole_in_the_file() {
-        assert_eq!(to_yaml(&SettingValue::Number(3.0)), Value::from(3));
-        assert_eq!(to_yaml(&SettingValue::Number(0.5)), Value::from(0.5));
     }
 }

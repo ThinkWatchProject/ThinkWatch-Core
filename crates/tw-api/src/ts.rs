@@ -348,7 +348,7 @@ mod tests {
         );
     }
 
-    /// 插件：设置值是那个值本身，状态按 `kind` 分派，四个要系统确认框的端点照样在表里
+    /// 插件：设置值是那个值本身，状态按 `kind` 分派，要系统确认框的那几个端点照样在表里
     /// （网页白名单在桌面端，不在这里）
     #[test]
     fn plugins_come_through() {
@@ -363,11 +363,14 @@ mod tests {
              { \"kind\": \"changed\" } | { \"kind\": \"error\", message: Msg, }"
         );
         let view = decl_of(&ts, "PluginView");
+        assert!(!view.contains("settings:"), "{view}");
         assert!(
-            view.contains("settings: { [key in string]: SettingValue }"),
+            view.contains("settings_schema: Array<SettingSpecView>"),
             "{view}"
         );
         assert!(view.contains("stats: PluginStats"), "{view}");
+        assert!(decl_of(&ts, "SettingSpecView").contains("value: SettingValue"));
+        assert!(decl_of(&ts, "ManifestView").contains("on_error: OnError"));
         let detail = decl_of(&ts, "RequestDetail");
         assert!(detail.contains("plugins: Array<PluginRunView>"), "{detail}");
         assert!(
@@ -380,14 +383,27 @@ mod tests {
         assert!(event.contains("request_id?: number"), "{event}");
         for line in [
             "  CreatePlugin: { req: PluginCreate; res: ConfigWritten };",
-            "  ReplacePluginSource: { req: PluginSourceReplace; res: ConfigWritten };",
+            "  CreatePluginConfirmed: { req: PluginCreate; res: ConfigWritten };",
+            "  CreatePluginConfirmed: { method: \"POST\", path: \"/plugins/confirmed\", params: [], format: \"json\" },",
+            "  SavePlugin: { req: PluginSave; res: ConfigWritten };",
+            "  SavePluginConfirmed: { req: PluginSave; res: ConfigWritten };",
+            "  SavePluginConfirmed: { method: \"PUT\", path: \"/plugins/{id}/confirmed\", params: [\"id\"], format: \"json\" },",
+            "  PluginRewrite: { req: PluginRewriteRequest; res: PluginSource };",
             "  ApprovePluginFile: { req: PluginApprove; res: ConfigWritten };",
-            "  UpdatePluginConfirmed: { req: PluginUpdate; res: ConfigWritten };",
-            "  UpdatePluginConfirmed: { method: \"PUT\", path: \"/plugins/{id}/confirmed\", params: [\"id\"], format: \"json\" },",
+            "  ApprovePluginFileConfirmed: { req: PluginApprove; res: ConfigWritten };",
+            "  ApprovePluginFileConfirmed: { method: \"POST\", path: \"/plugins/{id}/approve/confirmed\", params: [\"id\"], format: \"json\" },",
             "  DeletePlugin: { req: BaseVersion; res: ConfigWritten };",
             "  TrialPlugin: { req: PluginTrial; res: PluginTrialResult };",
         ] {
             assert!(ts.contains(line), "{line}");
+        }
+        for gone in [
+            "UpdatePlugin",
+            "ReplacePluginSource",
+            "PluginUpdate",
+            "PluginSourceReplace",
+        ] {
+            assert!(!ts.contains(gone), "{gone} is still exported");
         }
         // core 自己写配置（默认插件）的那一版有自己的来源
         assert_eq!(

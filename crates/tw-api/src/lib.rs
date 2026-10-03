@@ -688,7 +688,7 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 34 起**改得了工具调用的插件要点过头才能打开**：`UpdatePlugin` 拒绝打开权限里有
 /// `reply_tool_calls` 的插件（读不出权限的也算）、改它的设置或范围（403，
 /// `control.plugin.needs_confirmation`），这几样走新端点 `PUT /plugins/{id}/confirmed`
-/// （`UpdatePluginConfirmed`，请求体同 [`PluginUpdate`]）—— 它和装、换源码、批准一样
+/// （`UpdatePluginConfirmed`，请求体同 `PluginUpdate`）—— 它和装、换源码、批准一样
 /// 不给网页调，桌面端在系统的确认框里点了头才发。同一版起 core 自带几个默认插件，第一次
 /// 见到时装上、停用着，写配置的这一版来源是 [`ConfigOrigin::Defaults`]。
 ///
@@ -697,7 +697,27 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 不写是只有对话；嵌入和旧版补全要插件自己声明 —— 别的种类的请求不过它、不记录，
 /// 它出错、文件变了也拦不着它们。嵌入和旧版补全的视图是一项输入一条消息，`ctx.format`
 /// 多了 `openai_embeddings`、`openai_completions`、`gemini_embed`。
-pub const CONTROL_API_VERSION: u32 = 34;
+///
+/// **35 起插件的配置在插件自己的文件里**（契约附录四）：出错时怎么办（`on_error`）、范围
+/// （`match`）、设置的值（`settings.<键>.value`，替掉了 `default`）都写在文件的 manifest 里，
+/// manifest 必须是纯数据（不是的加载不了：`gw.plugin.manifest_not_data_at`、
+/// `gw.plugin.manifest_not_data`）。配置里的插件只剩 `id`、`file`、`sha256`、`enabled`，0.58
+/// 写下的 `on_error`、`scope`、`settings` 不再生效，下一次写插件时去掉。端点跟着换：
+/// `UpdatePlugin`、`UpdatePluginConfirmed`、`ReplacePluginSource` 删了，换成一个保存
+/// `PUT /plugins/{id}`（[`PluginSave`]：源码和开关，core 自己分「只改了数据」和「改了代码」）
+/// 和确认过的 `PUT /plugins/{id}/confirmed`；新端点 `POST /plugins/rewrite`
+/// （[`PluginRewriteRequest`] → [`PluginSource`]）只改写源码里的数据，什么都不留下。
+/// [`PluginCreate`] 只剩源码、id 和开关，[`SettingSpecView`] 的 `default` 换成 `value`，
+/// [`ManifestView`] 多了 `on_error`，[`PluginView`] 的 `settings` 删了（值在
+/// `settings_schema` 里）。照 34 写的界面调不到删掉的端点。
+///
+/// 35 起**只有改得了工具调用的插件要点头**：装上、打开、改代码、批准磁盘上改过的文件这四件事，
+/// 碰上权限有 `reply_tool_calls` 的插件（新旧两份里有一份有，或者读不出旧的那份要什么权限）
+/// 才在网页调得到的端点上拒绝（403，`control.plugin.needs_confirmation`，句子跟着改了），要走
+/// 不给网页调的 `POST /plugins/confirmed`、`PUT /plugins/{id}/confirmed`、
+/// `POST /plugins/{id}/approve/confirmed`。只改数据、停用、删、排顺序，装、打开、改、批准不碰
+/// 工具调用的插件，都不用点头 —— `CreatePlugin` 和 `ApprovePluginFile` 因此给网页调了。
+pub const CONTROL_API_VERSION: u32 = 35;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -4843,15 +4863,16 @@ pub struct PluginScope {
     pub upstreams: Vec<String>,
 }
 
-/// 插件声明的一个设置项。`label` 是**插件写的字**：界面当纯文本显示。
+/// 插件声明的一个设置项，连同它此刻的值。`label` 是**插件写的字**：界面当纯文本显示。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SettingSpecView {
     pub key: String,
     pub kind: SettingKind,
     pub label: String,
-    /// 和 `kind` 同一种类型
-    pub default: SettingValue,
+    /// 此刻的值：插件文件的 manifest 里 `value` 写的，没写是这种类型的空值（`""`、`0`、
+    /// `false`）。和 `kind` 同一种类型
+    pub value: SettingValue,
 }
 
 /// 插件导出了哪些钩子。
@@ -4868,6 +4889,9 @@ pub struct PluginHooks {
 
 /// 插件文件里的 manifest，加上它导出了哪些钩子。名字、说明、设置项的 `label`
 /// **都是插件写的字**。
+///
+/// 出错时怎么办、范围、设置的值**都在文件里**：这里读到的就是这份源码装上之后的样子。
+/// 要改它们，用 `POST /plugins/rewrite` 改写源码
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ManifestView {
@@ -4877,9 +4901,12 @@ pub struct ManifestView {
     /// 插件处理哪几种请求，按 [`RequestKind::ALL`] 的顺序。至少有一种；manifest 没写
     /// `requests` 时是 `["conversation"]`
     pub requests: Vec<RequestKind>,
-    /// 插件建议的范围。装上时照它填
+    /// 管哪些请求（manifest 的 `match`）
     pub scope: PluginScope,
+    /// 出错时怎么办（manifest 的 `on_error`）。没写是 `reject`
+    pub on_error: OnError,
     pub reply_mode: ReplyMode,
+    /// 设置项，按插件写的先后，带着此刻的值
     pub settings_schema: Vec<SettingSpecView>,
     pub hooks: PluginHooks,
 }
@@ -4910,18 +4937,20 @@ pub struct PluginView {
     /// 插件写的字
     pub description: Option<String>,
     pub enabled: bool,
+    /// 出错时怎么办：插件文件里写的。读不出 manifest 时照批准的那份文件里写着的，再读不出
+    /// 是 `reject`
     pub on_error: OnError,
     /// 读不出 manifest 时是空的
     pub permissions: Vec<Permission>,
     /// 插件处理哪几种请求，按 [`RequestKind::ALL`] 的顺序（见 [`ManifestView::requests`]）。
     /// 读不出 manifest 时按出厂的算：`["conversation"]` —— 跑不了的插件拦的也就是这几种
     pub requests: Vec<RequestKind>,
-    /// 生效的范围（配置里的）
+    /// 管哪些请求：插件文件里写的（同 `on_error`，读不出时是空的 —— 都管）
     pub scope: PluginScope,
     pub reply_mode: ReplyMode,
+    /// 设置项，按插件写的先后，带着交给插件的值（[`SettingSpecView::value`]）。读不出
+    /// manifest 时是空的
     pub settings_schema: Vec<SettingSpecView>,
-    /// 交给插件的值：配置里写的，没写的是默认值
-    pub settings: std::collections::BTreeMap<String, SettingValue>,
     /// 批准过的那一份的 SHA-256，小写十六进制
     pub sha256: String,
     pub status: PluginStatus,
@@ -4956,10 +4985,12 @@ pub struct PluginLoadError {
     pub column: Option<u32>,
 }
 
-/// 装一个插件（`POST /plugins`）。
+/// 装一个插件（`POST /plugins`、`POST /plugins/confirmed`）。出错时怎么办、范围、设置的值
+/// 都在源码里（`POST /plugins/rewrite` 改写）。
 ///
-/// **网页不能调。**装插件要在系统的确认框里点头，那一步在桌面端的 Rust 里：它自己
-/// 再编一遍源码、把名字和权限摆给人看，点了头才发这个请求。
+/// 插件改得了回答里的工具调用（权限有 [`Permission::ReplyToolCalls`]）时，`POST /plugins`
+/// 拒绝（403，`control.plugin.needs_confirmation`），要在系统的确认框里点过头、走
+/// `POST /plugins/confirmed`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginCreate {
@@ -4968,44 +4999,49 @@ pub struct PluginCreate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub enabled: bool,
-    pub on_error: OnError,
-    pub scope: PluginScope,
-    /// 没给的取默认值
-    pub settings: std::collections::BTreeMap<String, SettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
 }
 
-/// 改一个插件的开关、出错时怎么办、范围、设置（`PUT /plugins/{id}`）。**整份交**：
-/// 交上来的就是保存之后的样子。
+/// 保存一个插件（`PUT /plugins/{id}`、`PUT /plugins/{id}/confirmed`）：源码和开关，**整份交**
+/// —— 交上来的就是保存之后的样子。出错时怎么办、范围、设置的值都在源码里。
 ///
-/// 插件改得了回答里的工具调用（权限有 [`Permission::ReplyToolCalls`]，或者读不出它要
-/// 什么权限）时，打开它、改设置、改范围这条路不收（`control.plugin.needs_confirmation`），
-/// 同一份请求体交给 `PUT /plugins/{id}/confirmed`：那个端点网页调不了，桌面端在系统的
-/// 确认框里点了头才发。比的是生效的值：没写进配置的设置按默认值算，范围不看顺序。
+/// core 拿它和批准的那一份比：manifest 字面量以外一个字节不差、manifest 里只差出错时怎么办、
+/// 范围和设置的值，是**只改了数据**；别的都是**改了代码**。插件改得了回答里的工具调用
+/// （新旧两份里有一份的权限有 [`Permission::ReplyToolCalls`]，或者读不出旧的那份要什么
+/// 权限）时，改代码、打开它在 `PUT /plugins/{id}` 上拒绝（403，
+/// `control.plugin.needs_confirmation`），要在系统的确认框里点过头、走 `/confirmed` 那一条；
+/// 只改数据、停用照常。源码和批准的一字不差时只改开关，文件不动。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct PluginUpdate {
+pub struct PluginSave {
+    pub source: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 改写一份源码里的数据（`POST /plugins/rewrite`）：出错时怎么办、范围、设置的值。**什么都不
+/// 留下**，只交回改写之后的源码（[`PluginSource`]）—— 只换 manifest 字面量那一段，别的字节
+/// 一个不动；字面量里的注释不保留。
+///
+/// `on_error` 和 `scope` 是改完的样子；`settings` 只改给了的那几个，没给的照旧。插件没声明的
+/// 设置（`gw.plugin.setting_unknown`）、类型不对的值（`gw.plugin.setting_type`）、范围里空着
+/// 的一项（`control.plugin.blank_pattern`）、不是纯数据的 manifest
+/// （`gw.plugin.manifest_not_data_at` / `gw.plugin.manifest_not_data`）都是 400。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PluginRewriteRequest {
+    pub source: String,
     pub on_error: OnError,
     pub scope: PluginScope,
-    /// 没给的取默认值
     pub settings: std::collections::BTreeMap<String, SettingValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<String>,
 }
 
-/// 换一份源码（`PUT /plugins/{id}/source`）。**网页不能调**，理由同 [`PluginCreate`]。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct PluginSourceReplace {
-    pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_version: Option<String>,
-}
-
-/// 批准磁盘上改过的那个文件（`POST /plugins/{id}/approve`）。**网页不能调**，理由同
-/// [`PluginCreate`]。
+/// 批准磁盘上改过的那个文件（`POST /plugins/{id}/approve`、
+/// `POST /plugins/{id}/approve/confirmed`）。插件改得了回答里的工具调用（新旧两份里有一份的
+/// 权限有 [`Permission::ReplyToolCalls`]，或者读不出旧的那份要什么权限）时，前一条拒绝（403，
+/// `control.plugin.needs_confirmation`），要在系统的确认框里点过头、走后一条。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginApprove {

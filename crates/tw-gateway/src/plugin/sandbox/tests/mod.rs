@@ -38,10 +38,11 @@ export const manifest = {
   description: "adds a note and shouts",
   permissions: ["reply.text", "system", "reply.tool_calls"],
   match: { clients: ["claude-*"], models: [], upstreams: ["anthropic"] },
+  on_error: "skip",
   reply: "stream",
   settings: {
-    note: { type: "string", label: "Note", default: "today" },
-    loud: { type: "boolean", label: "Loud", default: true },
+    note: { type: "string", label: "Note", value: "today" },
+    loud: { type: "boolean", label: "Loud", value: true },
   },
 };
 export function onRequest(req, ctx) {
@@ -98,7 +99,9 @@ fn the_manifest_is_carried_over() {
         ]
     );
     assert_eq!(m.settings[0].label, "Note");
-    assert_eq!(m.settings[0].default, json!("today"));
+    assert_eq!(m.settings[0].value, json!("today"));
+    assert_eq!(m.settings[1].value, json!(true));
+    assert_eq!(m.on_error, tw_api::OnError::Skip);
     assert_eq!(
         m.hooks,
         Hooks {

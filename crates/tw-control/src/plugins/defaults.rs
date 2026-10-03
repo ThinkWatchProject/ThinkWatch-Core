@@ -1,22 +1,25 @@
 //! 默认插件（随 core 发的那几个，清单在 [`tw_gateway::plugin::defaults`]）：第一次见到时
-//! 装上，**停用着**；出了新版、而用户没动过它时，换成新版。
+//! 装上，**停用着**；出了新版、而用户没动过它的代码时，换成新版。
 //!
 //! # 给过什么记在哪儿
 //!
-//! 插件目录里的 `.defaults.json`：`{ "offered": { "<id>": "<给出去的那一版的 SHA-256>" } }`。
-//! 每一次（启动时、每换入一份配置之后）对着它和配置走一遍：
+//! 插件目录里的 `.defaults.json`：`{ "offered": { "<id>": "<SHA-256>" } }`，记的是**给出去
+//! 的那份代码此刻的样子**：装上时是发出去的那份字节；用户之后只改了数据（出错时怎么办、
+//! 范围、设置的值都在插件文件里，见 [`super`]），记录跟着它走（[`follow`]）—— 改了设置的
+//! 默认插件照样算没动过代码。每一次（启动时、每换入一份配置之后）对着它和配置走一遍：
 //!
 //! - **没给过的**：配置里已经有这个 id（用户自己的插件）就只记一笔「给过了」；否则写
-//!   插件文件和底稿，配置里加一条 —— 停用、出错时拒绝、范围照 manifest、设置都是默认值、
-//!   哈希是发出去的那份字节的 —— 再记下来；
-//! - **给过、配置里还在、文件和批准的都还是给出去的那一份，而 core 带的已经是新版**：
-//!   换文件、底稿和配置里的哈希；开关、出错时怎么办、范围和还声明着的设置照旧，新声明的
-//!   设置取默认值；**新版要了旧版没要的权限、或者多处理了一种请求（`requests`），就停用**；
-//!   记下新版；
+//!   插件文件和底稿（发出去的那份字节，出错时怎么办、范围、设置都是它写的），配置里加一条
+//!   —— 停用、哈希是那份字节的 —— 再记下来；
+//! - **给过、配置里还在、文件就是批准的那一份，而 core 带的已经是另一份代码**：
+//!   - 文件正是记着的那一份（没动过代码）：换成新版。用户写在旧文件里的出错时怎么办、范围
+//!     和还声明着、类型没变的设置的值搬到新版上（[`source::carry_over`]），开关照旧；**新版
+//!     要了旧版没要的权限、或者多处理了一种请求（`requests`），就停用**；记下写进去的那一份；
+//!   - 不是：用户改过代码，不动；
+//! - **给过、配置里还在、文件已经是这一版的代码**（只差数据）：只补记一笔（上次换完没来得及
+//!   记下来，或者用户自己改成了这一版）；
 //! - **给过、配置里没有了**：用户删的。**不再加回去**；
-//! - **给过、文件被用户改过**（或者批准的已经是别的一份）：不动。
-//!
-//! 文件和配置都已经是新版、只是上次没来得及记下来的（写记录那一步失败了），补记一笔。
+//! - **给过、文件变了还没批准**：用户在改它，不动。
 //!
 //! # 和别的写入怎么排
 //!
@@ -44,10 +47,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use tw_config::edit;
 use tw_config::history::Origin;
-use tw_gateway::plugin::Manifest;
 use tw_gateway::plugin::load::{read_capped, sha256_hex};
+use tw_gateway::plugin::{Manifest, source};
 use tw_types::Msg;
 
 use crate::{ApplyError, ConfigManager};
@@ -119,6 +121,10 @@ struct Told {
 struct Change {
     /// 在 `Seeder::shipped` 里的位置
     at: usize,
+    /// 写进插件文件和底稿的那份源码：新装的是发出去的那份字节，换新版的带着用户写的数据
+    source: String,
+    /// 它的 SHA-256
+    sha256: String,
     /// 配置里的那一条
     item: serde_yaml_ng::Mapping,
     /// 新加的是 None；换新版的是配置里批准的那个哈希（换之前的那一版）
@@ -217,14 +223,9 @@ impl Seeder {
                         names.insert(s.id.clone(), m.name.clone());
                         plan.push(Change {
                             at,
-                            item: super::entry(
-                                &s.id,
-                                &s.sha256,
-                                false,
-                                tw_api::OnError::Reject,
-                                &scope_of(&m),
-                                &super::reconcile(&m, &BTreeMap::new()),
-                            ),
+                            source: s.source.clone(),
+                            sha256: s.sha256.clone(),
+                            item: super::entry(&s.id, &s.sha256, false),
                             replaces: None,
                             disabled: false,
                         });
@@ -237,65 +238,75 @@ impl Seeder {
                 (Some(o), Some(p)) => {
                     let file = tw_config::plugins::file_path(&dir, &s.id);
                     let bytes = match read_capped(&file) {
-                        Ok(b) => Some(b),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Ok(b) => b,
+                        // 文件没了：等用户处理（批准不了，只能删或者换）
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                         Err(e) => {
                             out.failed
                                 .push((s.id.clone(), unreadable(&file.display().to_string(), e)));
                             continue;
                         }
                     };
-                    let on_disk = bytes.as_deref().map(sha256_hex);
-                    if on_disk.as_deref() == Some(o.as_str()) && p.sha256 == o {
-                        // 没动过：换成新版。**开着的新旧两版都真的编**，权限按编出来的比（运行时
-                        // 反正起着）；停用着的不编，换上之后照样停用着，用不着比
-                        let new = if p.enabled {
-                            compile(mgr, s.source.as_bytes(), true).await
-                        } else {
-                            self.shipped_manifest(mgr, s).await
-                        };
-                        let new = match new {
-                            Ok(m) => m,
-                            Err(why) => {
-                                out.failed.push((s.id.clone(), why));
-                                continue;
-                            }
-                        };
-                        // 旧版要过哪些权限、处理哪几种请求。读不出来就当新版多要了 —— 宁可停用。
-                        // 多处理一种请求和多要一个权限一样：插件看得到、改得了的东西变多了
-                        let more = if p.enabled {
-                            let old = match bytes {
-                                Some(b) => compile(mgr, &b, false).await.ok(),
-                                None => None,
-                            };
-                            old.as_ref().is_none_or(|old| {
-                                new.permissions.iter().any(|x| !old.permissions.contains(x))
-                                    || new.requests.iter().any(|k| !old.requests.contains(k))
-                            })
-                        } else {
-                            false
-                        };
-                        names.insert(s.id.clone(), new.name.clone());
-                        plan.push(Change {
-                            at,
-                            item: super::entry(
-                                &s.id,
-                                &s.sha256,
-                                p.enabled && !more,
-                                p.on_error.into(),
-                                &super::scope_view(&p.scope),
-                                &super::reconcile(&new, &p.settings),
-                            ),
-                            replaces: Some(o),
-                            disabled: p.enabled && more,
-                        });
-                    } else if on_disk.as_deref() == Some(s.sha256.as_str()) && p.sha256 == s.sha256
-                    {
-                        // 新版已经装上了，只是上次没记下来
-                        record.offered.insert(s.id.clone(), s.sha256.clone());
-                        out.marked.push(s.id.clone());
+                    let on_disk = sha256_hex(&bytes);
+                    // 文件变了、还没批准：用户在改它，不动
+                    if on_disk != p.sha256 {
+                        continue;
                     }
-                    // 否则是用户改过的：不动
+                    if source::same_code(&bytes, s.source.as_bytes()) {
+                        // 已经是这一版的代码（只差用户设的数据）：上次换完没来得及记下来，
+                        // 或者用户自己改成了这一版。补记一笔
+                        if o != on_disk {
+                            record.offered.insert(s.id.clone(), on_disk);
+                            out.marked.push(s.id.clone());
+                        }
+                        continue;
+                    }
+                    // 记着的不是这一份：用户改过代码，不动
+                    if o != on_disk {
+                        continue;
+                    }
+                    // 没动过代码：换成新版，用户写在文件里的数据带过去
+                    let written =
+                        source::carry_over(&bytes, &s.source).unwrap_or_else(|| s.source.clone());
+                    let sha = sha256_hex(written.as_bytes());
+                    // **开着的新旧两版都真的编**，权限按编出来的比（运行时反正起着）；停用着的
+                    // 不编，换上之后照样停用着，用不着比
+                    let new = if p.enabled {
+                        compile(mgr, written.as_bytes(), true).await
+                    } else {
+                        self.shipped_manifest(mgr, s).await.map(|m| {
+                            // 显示用的那一份照写进去的数据改过来，免得为了显示去编
+                            let shown = source::with_values(&m, &written).unwrap_or(m);
+                            mgr.gateway().plugins.remember(&sha, &shown);
+                            shown
+                        })
+                    };
+                    let new = match new {
+                        Ok(m) => m,
+                        Err(why) => {
+                            out.failed.push((s.id.clone(), why));
+                            continue;
+                        }
+                    };
+                    // 旧版要过哪些权限、处理哪几种请求。读不出来就当新版多要了 —— 宁可停用。
+                    // 多处理一种请求和多要一个权限一样：插件看得到、改得了的东西变多了
+                    let more = if p.enabled {
+                        compile(mgr, &bytes, false).await.ok().is_none_or(|old| {
+                            new.permissions.iter().any(|x| !old.permissions.contains(x))
+                                || new.requests.iter().any(|k| !old.requests.contains(k))
+                        })
+                    } else {
+                        false
+                    };
+                    names.insert(s.id.clone(), new.name.clone());
+                    plan.push(Change {
+                        at,
+                        item: super::entry(&s.id, &sha, p.enabled && !more),
+                        source: written,
+                        sha256: sha,
+                        replaces: Some(o),
+                        disabled: p.enabled && more,
+                    });
                 }
             }
         }
@@ -304,7 +315,7 @@ impl Seeder {
         // 只去掉那一项，不连累别的
         plan.retain(|c| {
             let current = c.replaces.as_ref().map(|_| self.shipped[c.at].id.as_str());
-            let tried = edit::upsert(&cur.text, edit::PLUGINS, current, &c.item)
+            let tried = super::upsert(&cur.text, current, &c.item)
                 .map_err(|e| e.msg())
                 .and_then(|t| tw_config::try_parse(&t).map(|_| ()).map_err(|r| r.msg()));
             match tried {
@@ -320,7 +331,7 @@ impl Seeder {
         let mut undo = Vec::new();
         plan.retain(|c| {
             let s = &self.shipped[c.at];
-            let src = s.source.as_bytes();
+            let src = c.source.as_bytes();
             let files = [
                 (tw_config::plugins::file_path(&dir, &s.id), src),
                 (tw_config::plugins::approved_path(&dir, &s.id), src),
@@ -346,7 +357,7 @@ impl Seeder {
                     let mut text = text.to_string();
                     for c in &plan {
                         let current = c.replaces.as_ref().map(|_| self.shipped[c.at].id.as_str());
-                        text = edit::upsert(&text, edit::PLUGINS, current, &c.item)?;
+                        text = super::upsert(&text, current, &c.item)?;
                     }
                     Ok(text)
                 })
@@ -355,7 +366,7 @@ impl Seeder {
                 Ok(_) => {
                     for c in &plan {
                         let s = &self.shipped[c.at];
-                        record.offered.insert(s.id.clone(), s.sha256.clone());
+                        record.offered.insert(s.id.clone(), c.sha256.clone());
                         if c.replaces.is_some() {
                             out.updated.push(s.id.clone());
                         } else {
@@ -449,14 +460,6 @@ pub fn spawn(seeder: Seeder, mgr: Arc<ConfigManager>) -> tokio::task::JoinHandle
     })
 }
 
-fn scope_of(m: &Manifest) -> tw_api::PluginScope {
-    tw_api::PluginScope {
-        clients: m.scope.clients.clone(),
-        models: m.scope.models.clone(),
-        upstreams: m.scope.upstreams.clone(),
-    }
-}
-
 /// 编一遍读出 manifest。**放到阻塞线程上**。`keep`：结果留进缓存（马上要装上的那一份，
 /// 紧接着的重载不再编），否则什么都不留
 async fn compile(mgr: &ConfigManager, source: &[u8], keep: bool) -> Result<Manifest, Msg> {
@@ -483,6 +486,24 @@ fn read_record(path: &Path) -> Result<Record, String> {
         Ok(b) => serde_json::from_slice(&b).map_err(|e| e.to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Record::default()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 一个插件只改了数据（保存了设置、批准了只改了数据的改动），批准的哈希从 `from` 换成了
+/// `to`：**记录跟着走** —— 记着的是给出去的那份代码此刻的样子（见模块说明）。只在记录里
+/// 记着的正是 `from` 时才改：用户改过代码的、不是默认插件的都不碰。写不成只记一行日志 ——
+/// 下一次走的时候它被当成「用户改过」，不再自动换新版，不会出别的事
+pub(crate) fn follow(dir: &Path, id: &str, from: &str, to: &str) {
+    let path = record_path(dir);
+    let Ok(mut record) = read_record(&path) else {
+        return;
+    };
+    if record.offered.get(id).map(String::as_str) != Some(from) {
+        return;
+    }
+    record.offered.insert(id.to_string(), to.to_string());
+    if let Err(e) = write_record(dir, &record) {
+        tracing::warn!(file = %path.display(), "the record of the default plugins could not be written: {e}");
     }
 }
 

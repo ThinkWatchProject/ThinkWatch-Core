@@ -5,7 +5,7 @@ export const manifest = {
   name: "伪造 key",
   api: 1,
   permissions: ["messages"],
-  settings: { kind: { type: "string", label: "方式", default: "message" } },
+  settings: { kind: { type: "string", label: "方式", value: "message" } },
 };
 
 export function onRequest(req, ctx) {

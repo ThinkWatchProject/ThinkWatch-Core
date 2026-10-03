@@ -5,7 +5,7 @@ export const manifest = {
   name: "Proxy 返回值",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "throw" } },
+  settings: { kind: { type: "string", label: "方式", value: "throw" } },
 };
 
 export function onRequest(req, ctx) {

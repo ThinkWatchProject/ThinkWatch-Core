@@ -6,7 +6,7 @@ export const manifest = {
   name: "内存炸弹",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "buffers" } },
+  settings: { kind: { type: "string", label: "方式", value: "buffers" } },
 };
 
 export function onRequest(req, ctx) {

@@ -12,7 +12,7 @@ use axum::Router;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tw_config::{Client, Config, Listen, Plugin, PluginOnError, Protocol, Provider};
+use tw_config::{Client, Config, Listen, Plugin, Protocol, Provider};
 
 const USER_KEY: &str = "sk-ant-api03-USERSOWNKEYAAAAAAAAAAAAAA";
 
@@ -21,7 +21,7 @@ export const manifest = {
   name: "Friday",
   api: 1,
   permissions: ["system", "messages", "reply.text", "reply.tool_calls"],
-  settings: { day: { type: "string", label: "Day", default: "Friday" } },
+  settings: { day: { type: "string", label: "Day", value: "Saturday" } },
 };
 
 export function onRequest(req, ctx) {
@@ -138,11 +138,6 @@ async fn a_javascript_plugin_rewrites_the_request_and_the_answer() {
             file: "plugins/friday.js".into(),
             sha256: sha256_hex(FRIDAY.as_bytes()),
             enabled: true,
-            on_error: PluginOnError::Reject,
-            scope: Default::default(),
-            settings: [("day".to_string(), serde_yaml_ng::Value::from("Saturday"))]
-                .into_iter()
-                .collect(),
         }],
         ..Default::default()
     };
@@ -259,9 +254,6 @@ export function onRequest(req) {
             file: "plugins/strict.js".into(),
             sha256: sha256_hex(src.as_bytes()),
             enabled: true,
-            on_error: PluginOnError::Reject,
-            scope: Default::default(),
-            settings: Default::default(),
         }],
         ..Default::default()
     };
@@ -335,9 +327,6 @@ export function onRequest(req) {
             file: "plugins/note.js".into(),
             sha256: sha256_hex(src.as_bytes()),
             enabled: true,
-            on_error: PluginOnError::Reject,
-            scope: Default::default(),
-            settings: Default::default(),
         }],
         ..Default::default()
     };
@@ -421,9 +410,6 @@ export function onRequest(req) {
         file: format!("plugins/{id}.js"),
         sha256: sha256_hex(src.as_bytes()),
         enabled: true,
-        on_error: PluginOnError::Reject,
-        scope: Default::default(),
-        settings: Default::default(),
     };
     let cfg = Config {
         version: 1,

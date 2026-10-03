@@ -5,7 +5,7 @@ export const manifest = {
   name: "重复 key",
   api: 1,
   permissions: ["messages"],
-  settings: { kind: { type: "string", label: "方式", default: "message" } },
+  settings: { kind: { type: "string", label: "方式", value: "message" } },
 };
 
 const copy = (v) => JSON.parse(JSON.stringify(v));

@@ -7,20 +7,23 @@
 // 这句要求是插件定好的，设置改不出别的指令。
 //
 // 权限：system，只读写系统提示词。
-// 设置：回答语言，默认简体中文。
+// 设置：回答语言，装上时是简体中文。出错时（比如语言名写得不对）拒绝这个请求。
+//
+// manifest 是纯数据，写成 core 改写它时的样子：界面改设置时只换这一段，改出来的和原来
+// 只差改了的那一行。
 //
 // 给人看的文字（名字、说明、设置项的标签、抛出的错误）一律英文：界面按插件 id 和设置项
-// 的键换成用户的语言，换不了的（抛出的错误）英文也看得懂。默认值是语言自己的写法，
+// 的键换成用户的语言，换不了的（抛出的错误）英文也看得懂。设置的值是语言自己的写法，
 // 那是值，不是界面上的字。
 
 export const manifest = {
   name: "Answer in a chosen language",
   api: 1,
-  description:
-    "Adds a fixed line to the end of the system prompt that asks the model to answer in the language set here.",
+  description: "Adds a fixed line to the end of the system prompt that asks the model to answer in the language set here.",
   permissions: ["system"],
+  on_error: "reject",
   settings: {
-    language: { type: "string", label: "Answer language", default: "简体中文" },
+    language: { type: "string", label: "Answer language", value: "简体中文" },
   },
 };
 

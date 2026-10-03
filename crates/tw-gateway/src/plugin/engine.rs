@@ -17,6 +17,10 @@ pub const MAX_SOURCE: usize = 1024 * 1024;
 
 /// 插件文件里 `manifest` 写的东西，加上它导出了哪些钩子。**由运行时读出来、校验过**：
 /// 权限和钩子对得上、设置项不超过上限，这里拿到的都是合规的。
+///
+/// **插件文件就是它的配置所在**（契约附录四）：出错时怎么办、范围、设置的值都写在 manifest
+/// 里，配置文件里只有 id、文件、批准的哈希和开关。界面改这几样是改文件里的 manifest
+/// 字面量（[`crate::plugin::source`]）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     /// 插件自己起的名字。**插件写的字**：界面当纯文本显示
@@ -30,8 +34,10 @@ pub struct Manifest {
     /// [`tw_api::RequestKind::ALL`] 的顺序，不重复、不空。**别的种类的请求不过它**（见
     /// [`crate::plugin::set::PluginSet::for_request`]）
     pub requests: Vec<tw_api::RequestKind>,
-    /// 插件建议的范围。装上时照它填进配置，之后以配置为准
+    /// 管哪些请求（manifest 的 `match`）
     pub scope: Scope,
+    /// 出错时（运行出错、文件变了、加载不了）它管的请求怎么办（manifest 的 `on_error`）
+    pub on_error: tw_api::OnError,
     pub reply_mode: tw_api::ReplyMode,
     /// 按插件写的顺序
     pub settings: Vec<SettingSpec>,
@@ -45,8 +51,8 @@ pub struct SettingSpec {
     pub kind: tw_api::SettingKind,
     /// 插件写的字
     pub label: String,
-    /// 和 `kind` 同一种类型
-    pub default: serde_json::Value,
+    /// 此刻的值（manifest 里的 `value`），和 `kind` 同一种类型。没写是这种类型的空值
+    pub value: serde_json::Value,
 }
 
 /// 插件导出了哪些钩子。
@@ -89,12 +95,29 @@ pub enum LoadError {
     Manifest(String),
     #[error("the plugin is written for plugin API {0}, and only API 1 is supported")]
     UnsupportedApi(u32),
+    /// manifest 不是纯数据，或者模块代码改了它（契约附录四）。行列从 1 起，说得出位置才有
+    #[error("{message}")]
+    NotData {
+        message: String,
+        line: Option<u32>,
+        column: Option<u32>,
+    },
     /// 运行时自己出了问题，或者根本没有运行时（见 [`Unavailable`]）
     #[error("{0}")]
     Engine(String),
 }
 
 impl LoadError {
+    /// 出错的位置（行、列，从 1 起）：语法错、不是纯数据的 manifest 说得出来
+    pub fn location(&self) -> (Option<u32>, Option<u32>) {
+        match self {
+            LoadError::Syntax { line, column, .. } | LoadError::NotData { line, column, .. } => {
+                (*line, *column)
+            }
+            _ => (None, None),
+        }
+    }
+
     /// 给人看的那句话，带码。语法错和 manifest 的原话是运行时的，放在 `detail` 里
     pub fn msg(&self) -> Msg {
         match self {
@@ -121,6 +144,19 @@ impl LoadError {
             LoadError::UnsupportedApi(api) => msg!(
                 "gw.plugin.api", api = api =>
                 "The plugin is written for plugin API {api}, and only API 1 is supported."
+            ),
+            LoadError::NotData {
+                message,
+                line: Some(line),
+                column,
+            } => msg!(
+                "gw.plugin.manifest_not_data_at", line = line, column = column.unwrap_or(1),
+                detail = message =>
+                "The plugin's manifest is not plain data at line {line}, column {column}: {detail}"
+            ),
+            LoadError::NotData { message, .. } => msg!(
+                "gw.plugin.manifest_not_data", detail = message =>
+                "The plugin's manifest is not plain data: {detail}"
             ),
             LoadError::Engine(d) => msg!(
                 "gw.plugin.engine", detail = d =>

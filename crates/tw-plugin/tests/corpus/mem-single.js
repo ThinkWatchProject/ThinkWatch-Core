@@ -5,7 +5,7 @@ export const manifest = {
   name: "一次申请大块内存",
   api: 1,
   permissions: ["system"],
-  settings: { kind: { type: "string", label: "方式", default: "arraybuffer" } },
+  settings: { kind: { type: "string", label: "方式", value: "arraybuffer" } },
 };
 
 export function onRequest(req, ctx) {

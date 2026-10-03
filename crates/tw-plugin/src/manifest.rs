@@ -2,13 +2,17 @@
 //!
 //! 桥（`bridge.js`）把模块的导出整理成一份 JSON 交过来；这里**不信**它，所有
 //! 规则都在这边重新判一遍。错误消息给插件作者看，说清楚哪一项、为什么。
+//!
+//! 核对之前先对一遍源码：manifest 得是纯数据，沙箱求值出来的得正好是源码里写的那一份
+//! （[`crate::literal`]，由调用方给的 `literal` 做）。
 
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
 use crate::{
-    Hooks, LoadError, Manifest, Permission, ReplyMode, RequestKind, Scope, SettingKind, SettingSpec,
+    Hooks, LoadError, Manifest, OnError, Permission, ReplyMode, RequestKind, Scope, SettingKind,
+    SettingSpec,
 };
 
 const MAX_NAME: usize = 64;
@@ -16,7 +20,8 @@ const MAX_DESCRIPTION: usize = 500;
 const MAX_SETTINGS: usize = 20;
 const MAX_SETTING_KEY: usize = 64;
 const MAX_LABEL: usize = 100;
-const MAX_STRING_DEFAULT: usize = 10_000;
+/// 字符串设置的值最多几个字符
+pub(crate) const MAX_STRING_VALUE: usize = 10_000;
 const MAX_GLOBS: usize = 100;
 const MAX_GLOB: usize = 200;
 
@@ -31,7 +36,13 @@ struct LoadInfo {
     has_default: bool,
 }
 
-pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
+/// 读出、核对一份 manifest。`literal` 拿到沙箱求值出来的那一份（JSON），核对它和源码里写的
+/// 是不是同一份：在别的规则之前做 —— 被模块代码改过的 manifest，按改过的样子报错只会让人
+/// 糊涂
+pub(crate) fn parse(
+    info: &[u8],
+    literal: impl FnOnce(&Value) -> Result<(), LoadError>,
+) -> Result<Manifest, LoadError> {
     let info: LoadInfo = serde_json::from_slice(info).map_err(|e| {
         LoadError::Engine(format!(
             "the sandbox returned an unreadable module description: {e}"
@@ -77,6 +88,7 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
     if let Some(e) = info.manifest_error {
         return Err(err(format!("the manifest cannot be read as JSON: {e}")));
     }
+    literal(&info.manifest)?;
     let Value::Object(m) = info.manifest else {
         return Err(err("the manifest must be an object"));
     };
@@ -105,6 +117,7 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
                 | "permissions"
                 | "requests"
                 | "match"
+                | "on_error"
                 | "reply"
                 | "settings"
         ) {
@@ -149,6 +162,12 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
     let permissions = permissions(m.get("permissions"))?;
     let requests = requests(m.get("requests"))?;
     let scope = scope(m.get("match"))?;
+    let on_error = match m.get("on_error") {
+        None | Some(Value::Null) => OnError::Reject,
+        Some(Value::String(s)) => OnError::from_manifest(s)
+            .ok_or_else(|| err("`on_error` must be \"reject\" or \"skip\""))?,
+        Some(_) => return Err(err("`on_error` must be \"reject\" or \"skip\"")),
+    };
     let reply_mode = match m.get("reply") {
         None | Some(Value::Null) => ReplyMode::Block,
         Some(Value::String(s)) if s == "block" => ReplyMode::Block,
@@ -167,6 +186,7 @@ pub(crate) fn parse(info: &[u8]) -> Result<Manifest, LoadError> {
         permissions,
         requests,
         scope,
+        on_error,
         reply_mode,
         settings,
         hooks,
@@ -268,6 +288,16 @@ fn check_requests(
     Ok(())
 }
 
+/// 一份 `match`（`{ clients, models, upstreams }`）合不合规矩，和加载时同一套判据。
+/// 改写 manifest 之前用（[`crate::literal::rewrite`]）
+pub(crate) fn check_scope(v: &Value) -> Result<(), String> {
+    match scope(Some(v)) {
+        Ok(_) => Ok(()),
+        Err(LoadError::Manifest(why)) => Err(why),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn scope(v: Option<&Value>) -> Result<Scope, LoadError> {
     let m = match v {
         None | Some(Value::Null) => return Ok(Scope::default()),
@@ -354,13 +384,13 @@ fn settings(v: Option<&Value>, order: Option<&[String]>) -> Result<Vec<SettingSp
         }
         let Some(Value::Object(spec)) = m.get(key) else {
             return Err(err(format!(
-                "setting `{key}` must be an object like {{ type: \"string\", label: \"…\" }}"
+                "setting `{key}` must be an object like {{ type: \"string\", label: \"…\", value: \"…\" }}"
             )));
         };
         for f in spec.keys() {
-            if !matches!(f.as_str(), "type" | "label" | "default") {
+            if !matches!(f.as_str(), "type" | "label" | "value") {
                 return Err(err(format!(
-                    "setting `{key}` has an unknown field `{f}`; it takes type, label and default"
+                    "setting `{key}` has an unknown field `{f}`; it takes type, label and value"
                 )));
             }
         }
@@ -394,13 +424,14 @@ fn settings(v: Option<&Value>, order: Option<&[String]>) -> Result<Vec<SettingSp
                 )));
             }
         };
-        let default = match (kind, spec.get("default")) {
+        // 设置此刻的值。没写就是这种类型的空值
+        let value = match (kind, spec.get("value")) {
             (SettingKind::String, None | Some(Value::Null)) => Value::String(String::new()),
             (SettingKind::Number, None | Some(Value::Null)) => Value::from(0),
             (SettingKind::Boolean, None | Some(Value::Null)) => Value::Bool(false),
             (SettingKind::String, Some(Value::String(s))) => {
-                if s.chars().count() > MAX_STRING_DEFAULT {
-                    return Err(err(format!("the default of setting `{key}` is too long")));
+                if s.chars().count() > MAX_STRING_VALUE {
+                    return Err(err(format!("the value of setting `{key}` is too long")));
                 }
                 Value::String(s.clone())
             }
@@ -408,7 +439,7 @@ fn settings(v: Option<&Value>, order: Option<&[String]>) -> Result<Vec<SettingSp
             (SettingKind::Boolean, Some(Value::Bool(b))) => Value::Bool(*b),
             (kind, Some(_)) => {
                 return Err(err(format!(
-                    "the default of setting `{key}` must be a {}",
+                    "the value of setting `{key}` must be a {}",
                     kind.as_str()
                 )));
             }
@@ -417,7 +448,7 @@ fn settings(v: Option<&Value>, order: Option<&[String]>) -> Result<Vec<SettingSp
             key: key.clone(),
             kind,
             label,
-            default,
+            value,
         });
     }
     Ok(out)

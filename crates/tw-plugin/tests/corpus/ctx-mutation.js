@@ -5,7 +5,7 @@ export const manifest = {
   name: "改 ctx",
   api: 1,
   permissions: ["system"],
-  settings: { note: { type: "string", label: "备注", default: "原值" } },
+  settings: { note: { type: "string", label: "备注", value: "原值" } },
 };
 
 function attempt(f, check) {
