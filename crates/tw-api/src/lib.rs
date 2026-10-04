@@ -406,6 +406,16 @@ slug_enum! {
 }
 
 slug_enum! {
+    /// 一键修复改的是哪一种错。
+    pub enum ConfigFixKind {
+        /// 取值不在可选范围里：删掉这一行，回到默认值
+        UnknownValue = "unknown_value",
+        /// 不认识的字段：删掉
+        UnknownField = "unknown_field",
+    }
+}
+
+slug_enum! {
     /// 路由规则 `when` 里的键。
     pub enum ConditionField {
         Model = "model",
@@ -721,7 +731,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`DryRunOutcome`] 删了 `passthrough`：转发的那几类照常求值规则。[`RouteSave`] 的
 /// `route_probes` 删了，消息码 `control.unknown_probe_class` 跟着删。配置里
 /// `client_probes` 的取值同样只剩 `intercept` / `forward`。
-pub const CONTROL_API_VERSION: u32 = 36;
+///
+/// **37 起配置读不进来时也有路可走**：安全模式下 core 读不了配置文件，照样起控制面（只用
+/// 文件里的控制面钥匙，其余是临时的空配置），`Status.config_rejected` 从一开始就说哪一行错了。
+/// 新端点 `GET /config/repair`（[`ConfigRepair`]）给出一键修复会改的几处，`POST /config/repair`
+/// （[`ConfigRepairRequest`] → [`ConfigWritten`]）照着修好写回。取值不在可选范围里、字段不认识
+/// 这两种字段错有了自己的码：`config.unknown_variant`、`config.unknown_field`（以前是
+/// `config.unparsable` 里的一句英文原话）；修不了时 `control.config_not_repairable`。
+pub const CONTROL_API_VERSION: u32 = 37;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2620,6 +2637,40 @@ pub struct ConfigWrite {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConfigWritten {
     pub version: String,
+}
+
+/// 配置读不进来时，一键修复会改哪几处（`GET /config/repair`）。
+///
+/// **只修两种，都是删掉一个键**：取值不在可选范围里的（回到默认值）、不认识的字段。修完
+/// 整份配置读得进来才给；修不了、或者本来就读得进来，`fixes` 是空的。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ConfigRepair {
+    /// 按磁盘上哪一版算的。修的时候带回来（`POST /config/repair`）：文件变了就不修
+    pub base_version: String,
+    pub fixes: Vec<ConfigFix>,
+}
+
+/// 一键修复要改的一处。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ConfigFix {
+    pub kind: ConfigFixKind,
+    /// 字段的路径：`client_probes.titling`、`providers[0].protocol`
+    pub field: String,
+    /// 修之前的原文里是第几行，1 起
+    pub line: Option<usize>,
+    /// 原来写着的值，**已脱敏**。不认识的字段的值不是一个标量时没有
+    pub value: Option<String>,
+    /// 修完之后的值，也就是默认值。不认识的字段、或者默认值写不成一个标量时没有
+    pub now: Option<String>,
+}
+
+/// 照 [`ConfigRepair`] 修好并写回。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ConfigRepairRequest {
+    pub base_version: String,
 }
 
 // ─────────────────────────────────────────────── 上游与代理的增删改
@@ -5237,6 +5288,11 @@ mod tests {
         );
         check(ProbeClass::ALL, ProbeClass::slug, ProbeClass::from_slug);
         check(ProbeMode::ALL, ProbeMode::slug, ProbeMode::from_slug);
+        check(
+            ConfigFixKind::ALL,
+            ConfigFixKind::slug,
+            ConfigFixKind::from_slug,
+        );
         check(
             ConditionField::ALL,
             ConditionField::slug,

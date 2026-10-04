@@ -35,6 +35,10 @@ endpoints! {
     ConfigHistory: GET "/config/history", () => Vec<api::ConfigVersion>;
     ConfigAt: GET "/config/at", api::ConfigAtQuery => api::ConfigAt;
     ConfigRollback: POST "/config/rollback", api::RollbackRequest => api::ConfigWritten;
+    /// 配置读不进来时，一键修复会改哪几处
+    ConfigRepairPlan: GET "/config/repair", () => api::ConfigRepair;
+    /// 照那几处修好写回：取值改回默认值、删掉不认识的字段
+    RepairConfig: POST "/config/repair", api::ConfigRepairRequest => api::ConfigWritten;
     SaveListen: PUT "/listen", api::ListenSave => api::ConfigWritten;
 
     // ─────────────────────────────────────────────── 用量与记录
