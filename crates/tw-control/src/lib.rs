@@ -105,6 +105,8 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::ConfigHistory, config_history)
         .at(ep::ConfigAt, config::path_at)
         .at(ep::ConfigRollback, config_rollback)
+        .at(ep::ConfigRepairPlan, config_repair_plan)
+        .at(ep::RepairConfig, repair_config)
         .at(ep::Summary, summary)
         .at(ep::CostBuckets, cost_buckets)
         .at(ep::CostBucketsBy, cost_buckets_by)
@@ -1403,6 +1405,74 @@ async fn config_rollback(
         .await
         .map_err(apply_fail)?;
     Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 一键修复会改哪几处。修不了、或者本来就读得进来，`fixes` 是空的
+async fn config_repair_plan(
+    State(s): State<ControlState>,
+) -> Result<Json<tw_api::ConfigRepair>, Fail> {
+    let cur = s.cfg.current().map_err(unreadable_config)?;
+    let fixes = tw_config::repair::repair(&cur.text)
+        .map(|r| r.fixes.into_iter().map(fix_view).collect())
+        .unwrap_or_default();
+    Ok(Json(tw_api::ConfigRepair {
+        base_version: cur.version(),
+        fixes,
+    }))
+}
+
+/// 照一键修复的那几处修好、写回。**按磁盘上现在那一份重新算**，不收界面交来的原文：
+/// 界面手里的钥匙是打码的，而修的只是删掉几个键，用不着它交什么
+async fn repair_config(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ConfigRepairRequest>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let cur = s
+        .cfg
+        .current()
+        .map_err(|e| apply_fail(ApplyError::Store(e)))?;
+    if cur.version() != req.base_version {
+        return Err(apply_fail(ApplyError::Stale {
+            base: req.base_version,
+            current: cur.version(),
+        }));
+    }
+    let Some(r) = tw_config::repair::repair(&cur.text) else {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            msg!(
+                "control.config_not_repairable" =>
+                "The configuration has no error that can be repaired automatically. Edit the \
+                 configuration file, or roll back to an earlier version"
+            ),
+        ));
+    };
+    // 修只删键，插件那一节不会变；照样过一遍，和别的整份写入一条路
+    plugins::guard_raw_write(&s, &cur.text, &r.text).await?;
+    let version = s
+        .cfg
+        .write(
+            &r.text,
+            Some(&cur.version()),
+            tw_config::history::Origin::Ui,
+        )
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+fn fix_view(f: tw_config::repair::Fix) -> tw_api::ConfigFix {
+    use tw_config::repair::FixKind;
+    tw_api::ConfigFix {
+        kind: match f.kind {
+            FixKind::UnknownValue => tw_api::ConfigFixKind::UnknownValue,
+            FixKind::UnknownField => tw_api::ConfigFixKind::UnknownField,
+        },
+        field: f.field,
+        line: f.line,
+        value: f.value,
+        now: f.now,
+    }
 }
 
 /// 控制面的错误响应。
