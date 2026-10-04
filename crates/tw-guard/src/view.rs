@@ -508,8 +508,8 @@ mod tests {
 
     #[test]
     fn the_code_backed_tool_rules_are_listed_with_a_builtin_matcher() {
-        // 代码实现的两条规则（凭据外传、上传本地文件）在规则表里照样列得出来：
-        // 带专门的 matcher（没有正则可展示），处置按出厂（A 切断、B 仅记录）
+        // 代码实现的规则（凭据外传、上传本地文件、读写数据目录）在规则表里照样列得出来：
+        // 带专门的 matcher（没有正则可展示），处置按出厂（A、C 切断，B 仅记录）
         let v = inspect_tools(&ToolPolicy::default());
         let a = v
             .rules
@@ -536,6 +536,18 @@ mod tests {
             }
         );
         assert_eq!(b.action, Some(RuleAction::Record), "出厂只记录");
+        let c = v
+            .rules
+            .iter()
+            .find(|r| r.id == "thinkwatch-data")
+            .expect("数据目录规则应当在表里");
+        assert_eq!(
+            c.matcher,
+            Matcher::Builtin {
+                check: "thinkwatch-data".into()
+            }
+        );
+        assert_eq!(c.action, Some(RuleAction::Cut), "高危，拦截档下切断");
         // 经过一趟 JSON 还认得回来
         let json = serde_json::to_value(&a.matcher).unwrap();
         assert_eq!(json["kind"], "builtin");

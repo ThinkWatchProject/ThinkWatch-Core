@@ -1,4 +1,4 @@
-//! 工具调用审查里两条**代码实现**的危险命令规则。
+//! 工具调用审查里**代码实现**的危险命令规则：这里的两条，和 [`super::own_data`] 那一条。
 //!
 //! 正则认不出这两件事，因为判断要跨工具调用的参数、把几样东西凑到一起看：
 //!
@@ -25,6 +25,8 @@ pub enum Check {
     CredentialToNetwork,
     /// 把本地文件的内容上传到外部主机
     FileToNetwork,
+    /// 读写 ThinkWatch 自己的数据目录（[`super::own_data`]）
+    OwnData,
 }
 
 impl Check {
@@ -33,12 +35,14 @@ impl Check {
         match self {
             Check::CredentialToNetwork => "credential-to-network",
             Check::FileToNetwork => "file-to-network",
+            Check::OwnData => "thinkwatch-data",
         }
     }
     pub fn from_slug(s: &str) -> Option<Self> {
         match s {
             "credential-to-network" => Some(Check::CredentialToNetwork),
             "file-to-network" => Some(Check::FileToNetwork),
+            "thinkwatch-data" => Some(Check::OwnData),
             _ => None,
         }
     }
@@ -51,6 +55,7 @@ impl Check {
         match self {
             Check::CredentialToNetwork => credential_to_network(args),
             Check::FileToNetwork => file_to_network(args),
+            Check::OwnData => super::own_data::find(args),
         }
     }
 }

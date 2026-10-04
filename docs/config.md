@@ -25,6 +25,25 @@ control socket (`twcore.sock`; on Windows a loopback port recorded in
 `control.port`). The directory is private to its owner (`0700`), the file is
 `0600`: it holds keys in plain text.
 
+These permissions are the file's only protection on this machine. They keep
+out other users, not programs running as the same user: such a program can
+read every key in the file, and with the control key it holds, change the
+configuration through the control plane. Outbound redaction does not change
+that; it protects what a request carries off the machine, not what is on disk.
+The control key is masked where the configuration is shown so that a write
+through the control plane cannot change it
+([`listen.control`](#cfg-listen-control)), not to keep it from local
+programs; upstream and gateway keys are shown as written.
+
+Tool-call inspection has a built-in rule for this directory,
+`thinkwatch-data`. A tool call whose path or command points into one of the
+default locations above, or into `/var/lib/thinkwatch` or `/etc/thinkwatch`
+on a server, is recorded, and under `enforce` the response is cut off, so a
+model cannot be steered into reading these keys or rewriting its own
+protections. Mentioning the path, as in a document being edited, does not
+count. With `THINKWATCH_HOME` elsewhere, a custom rule in
+[`security.inspect_tools`](#cfg-security-inspect_tools) can cover that path.
+
 `twcore serve` writes a starting configuration when there is none, and
 `twcore init` writes one on request. Both produce this:
 
@@ -736,6 +755,7 @@ Built-in rules:
 | `exfil-credentials-reversed` | Send out a credential file (verb first) | `cut` |
 | `ssh-key-read` | Read a private key or cloud credential | `cut` |
 | `secret-to-unknown-host` | Send a credential to an unknown host | `cut` |
+| `thinkwatch-data` | Read or change ThinkWatch's own data | `cut` |
 | `write-startup-item` | Write a startup item | `cut` |
 | `crontab-install` | Install a scheduled job | `cut` |
 | `rm-rf-root` | Delete home or root | `record` |
