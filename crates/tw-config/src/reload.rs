@@ -128,7 +128,10 @@ pub fn try_parse(text: &str) -> Result<Config, Rejected> {
                 } else {
                     Stage::Syntax
                 },
-                message: Box::new(msg!(UNPARSABLE, detail = e => "{detail}")),
+                message: Box::new(
+                    field_msg(&e.to_string())
+                        .unwrap_or_else(|| msg!(UNPARSABLE, detail = e => "{detail}")),
+                ),
                 line,
                 column: loc.as_ref().map(|l| l.column()),
                 excerpt: line.and_then(|l| excerpt_of(text, l)),
@@ -147,6 +150,76 @@ pub fn try_parse(text: &str) -> Result<Config, Rejected> {
         });
     }
     Ok(cfg)
+}
+
+/// 安全模式下磁盘上那份读不了时，core 临时顶上的配置，连同读不了的原因。
+///
+/// **只有控制面的钥匙取自原文**：桌面端从同一个文件读它来连控制面，两边对不上就连不上，
+/// 用户也就看不到错在哪一行。其余全是默认值 —— 安全模式不起数据面，用不着上游和密钥。
+/// 原文读得进来（不需要顶）、或者连钥匙都找不到（YAML 坏到解析不了，起了控制面也没人
+/// 进得来）都是 `None`
+pub fn stand_in(text: &str) -> Option<(Config, Rejected)> {
+    let r = try_parse(text).err()?;
+    let key = crate::control_key::raw_in(text).ok().flatten()?;
+    let cfg = Config {
+        listen: crate::Listen {
+            control: crate::ControlListen {
+                key: Some(key),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    Some((cfg, r))
+}
+
+/// serde 最常见的两种字段错，换成带码、带参数的一句话：取值不在可选范围里、字段名不认识。
+///
+/// **原话是英文，而这两种恰恰最常见**：手改配置写错一个取值、拼错一个字段名，界面上就只有
+/// 一句「unknown variant `passthrough`, expected `intercept` or `forward`」。拆出字段、写下的
+/// 值和可选的几个，界面就能说成自己的话。认不出的照旧走 [`UNPARSABLE`]。
+///
+/// serde_yaml 的原话形如 ``client_probes.titling: unknown variant `passthrough`, expected
+/// `intercept` or `forward` at line 48 column 12``：冒号前是字段的路径（顶层没有），末尾是
+/// 位置（行号另有字段，这里去掉）。
+fn field_msg(e: &str) -> Option<Msg> {
+    let e = e.split(" at line ").next()?;
+    let (path, rest) = match e.find(": unknown ") {
+        Some(i) => (&e[..i], &e[i + 2..]),
+        None => ("", e),
+    };
+    if let Some(r) = rest.strip_prefix("unknown variant `") {
+        let (value, after) = r.split_once('`')?;
+        let expected = quoted(after.split_once("expected ")?.1)?;
+        if path.is_empty() {
+            return None;
+        }
+        return Some(msg!(
+            "config.unknown_variant", field = path, value = value, expected = expected =>
+            "{field} cannot be {value}; expected one of: {expected}"
+        ));
+    }
+    if let Some(r) = rest.strip_prefix("unknown field `") {
+        let (name, after) = r.split_once('`')?;
+        let expected = quoted(after.split_once("expected ")?.1)?;
+        let field = if path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{path}.{name}")
+        };
+        return Some(msg!(
+            "config.unknown_field", field = field, expected = expected =>
+            "{field} is not a known field; known fields: {expected}"
+        ));
+    }
+    None
+}
+
+/// 「`a`, `b` or `c`」里反引号括起来的那几个，用逗号连起来。一个都没有是 `None`
+fn quoted(s: &str) -> Option<String> {
+    let all: Vec<&str> = s.split('`').skip(1).step_by(2).collect();
+    (!all.is_empty()).then(|| all.join(", "))
 }
 
 fn is_field_error(m: &str) -> bool {
@@ -235,6 +308,54 @@ mod tests {
         assert_eq!(r.stage, Stage::Schema, "{r:?}");
         assert!(r.message.text.contains("kye"), "{r:?}");
         assert_eq!(r.line, Some(4), "{r:?}");
+    }
+
+    #[test]
+    fn a_config_that_does_not_load_is_stood_in_for_with_its_own_control_key() {
+        let bad = format!("{GOOD}client_probes:\n  titling: passthrough\n");
+        let (cfg, r) = stand_in(&bad).expect("钥匙在，就该顶得上");
+        assert_eq!(
+            cfg.listen.control.key.as_deref(),
+            Some("c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00")
+        );
+        assert!(cfg.providers.is_empty() && cfg.clients.is_empty());
+        assert_eq!(r.line, Some(9));
+        // 读得进来的不用顶；连钥匙都找不到的顶了也没人进得来
+        assert!(stand_in(GOOD).is_none());
+        assert!(stand_in("version: 1\nclients: [\n").is_none());
+    }
+
+    #[test]
+    fn a_value_outside_its_choices_names_the_field_the_value_and_the_choices() {
+        // 手改配置最常见的一种错：写了一个已经不存在的取值。界面要能翻译这句话
+        let bad = format!("{GOOD}client_probes:\n  titling: passthrough\n");
+        let r = try_parse(&bad).unwrap_err();
+        assert_eq!(r.stage, Stage::Schema, "{r:?}");
+        assert_eq!(r.message.code, "config.unknown_variant", "{r:?}");
+        let args = &r.message.args;
+        assert_eq!(args["field"], "client_probes.titling");
+        assert_eq!(args["value"], "passthrough");
+        assert_eq!(args["expected"], "intercept, forward");
+        assert_eq!(r.line, Some(9), "{r:?}");
+        assert_eq!(r.excerpt.as_deref(), Some("  titling: passthrough"));
+    }
+
+    #[test]
+    fn a_misspelled_field_says_where_and_what_is_known() {
+        let r = try_parse("version: 1\nclients:\n  - name: c\n    kye: tw-k\n").unwrap_err();
+        assert_eq!(r.message.code, "config.unknown_field", "{r:?}");
+        let args = &r.message.args;
+        assert_eq!(args["field"], "clients[0].kye");
+        assert!(args["expected"].contains("key"), "{r:?}");
+        // 带码的这两种直接就是那句话，不再垫一句「第几行有字段错误」：行号在 `line` 里
+        assert_eq!(r.msg().code, "config.unknown_field");
+    }
+
+    #[test]
+    fn other_serde_errors_keep_the_original_sentence() {
+        assert!(field_msg("invalid type: string \"x\", expected u16 at line 3 column 9").is_none());
+        // 顶层没有路径的取值错，说不出是哪个字段，也不拆
+        assert!(field_msg("unknown variant `x`, expected `a` or `b`").is_none());
     }
 
     #[test]

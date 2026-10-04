@@ -86,8 +86,10 @@ config.secret.unterminated
 config.store.conflict
 config.store.missing
 config.store.read_failed
+config.unknown_field
 config.unknown_price_sheet
 config.unknown_rule
+config.unknown_variant
 config.unparsable passthrough
 config.zero_concurrency
 control.account_service_not_json
@@ -106,6 +108,7 @@ control.chatgpt_login.expired
 control.chatgpt_login.no_code
 control.chatgpt_login.page_error
 control.client_unknown
+control.config_not_repairable
 control.config_stale
 control.control_key_locked
 control.default_key_cannot_delete

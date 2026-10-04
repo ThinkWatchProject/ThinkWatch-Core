@@ -22,6 +22,7 @@ pub mod proxy;
 pub mod refs;
 pub mod reload;
 pub mod remote;
+pub mod repair;
 mod retention;
 mod security;
 pub mod store;
@@ -1156,7 +1157,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 
 pub use failover::{Failover, MAX_PAUSE_SECS, MAX_STREAM_START_WAIT_SECS};
 pub use probes::{ClientProbes, ProbeAction};
-pub use reload::{Rejected, Stage, try_parse};
+pub use reload::{Rejected, Stage, stand_in, try_parse};
 pub use retention::Retention;
 pub use security::{
     ContentAction, ContentMatch, ContentPolicy, CustomContentRule, CustomRedactRule,

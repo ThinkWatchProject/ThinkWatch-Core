@@ -121,6 +121,25 @@ impl ConfigManager {
         }
     }
 
+    /// 安全模式下磁盘上那份读不了，在服务的是 core 临时顶上的配置（[`tw_config::stand_in`]）。
+    ///
+    /// **被拒那件事从一开始就挂着**（`Status.config_rejected`）：界面连上来就说得出哪一行
+    /// 错了。`seen` 清掉：在服务的不是文件里那份 —— 不清的话，把同样的内容再存一次会被当成
+    /// 「改回了在服务的那一版」，被拒那件事就被抹掉了
+    pub fn standing_in(mut self, r: &tw_config::Rejected) -> Self {
+        *self.seen.get_mut() = None;
+        if let Ok(g) = self.rejected.get_mut() {
+            *g = Some(tw_api::ConfigRejection {
+                stage: r.stage.into(),
+                message: (*r.message).clone(),
+                line: r.line,
+                excerpt: r.excerpt.clone(),
+                at_ms: now_ms(),
+            });
+        }
+        self
+    }
+
     /// 数据面。管理面里要碰插件文件、编插件的那几处从这里拿
     pub fn gateway(&self) -> &tw_gateway::AppState {
         &self.gateway

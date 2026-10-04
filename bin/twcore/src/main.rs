@@ -749,7 +749,32 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             Err(e) => tracing::warn!("a control key could not be added to the configuration: {e}"),
         }
     }
-    let cfg = tw_config::load(path).with_context(|| format!("loading {}", path.display()))?;
+    // **安全模式下配置读不了也要起控制面。**安全模式就是给「配置出了问题」准备的：用户要能
+    // 看到哪一行错了、在界面里改、回滚、一键修复。以前这一步读不了就退出，安全模式也一样 ——
+    // 守护连败五次进安全模式，安全模式的 core 又退出，界面上只剩一句「已停止」，原因只在日志里。
+    //
+    // 顶上的是一份临时的空配置，只有控制面的钥匙取自原文（桌面端从同一个文件读它）。原文连
+    // 钥匙都找不到（YAML 坏到解析不了）就照旧退出：那时起了控制面也没人进得来
+    let (cfg, stood_in) = match tw_config::load(path) {
+        Ok(cfg) => (cfg, None),
+        Err(e) => {
+            let standin = safe
+                .then(|| std::fs::read_to_string(path).ok())
+                .flatten()
+                .and_then(|text| tw_config::stand_in(&text));
+            match standin {
+                Some((cfg, r)) => {
+                    tracing::error!(
+                        "safe mode: the configuration does not load ({r}); serving the control plane with a stand-in"
+                    );
+                    (cfg, Some(r))
+                }
+                None => {
+                    return Err(e).with_context(|| format!("loading {}", path.display()));
+                }
+            }
+        }
+    };
     // `--port` 是一个**显式的覆盖**，配置文件不该推翻它。所以给了它
     // 之后就不再跟着配置里的监听地址走（「温」那一级）。
     let overridden = port.is_some();
@@ -841,11 +866,11 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         }
 
         // 配置的唯一入口。UI、CLI、文件监听都从这里进。
-        let manager = std::sync::Arc::new(tw_control::ConfigManager::new(
-            config_path,
-            state.clone(),
-            state.bus.clone(),
-        ));
+        let manager = tw_control::ConfigManager::new(config_path, state.clone(), state.bus.clone());
+        let manager = std::sync::Arc::new(match &stood_in {
+            Some(r) => manager.standing_in(r),
+            None => manager,
+        });
         // 默认插件（随 core 发的那几个）：没给过的装上（停用着），没动过的换成新版。
         // 启动时在控制面起来之前走一遍，界面第一次取插件就看得到它们；之后每换入一份
         // 配置再走一遍。**不挡启动**：哪个没办成只记一行、说一声。安全模式不走 ——
