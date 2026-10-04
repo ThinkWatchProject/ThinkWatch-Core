@@ -44,8 +44,9 @@ Documentation: [configuration reference](docs/config.md) ·
 - **Malicious tool calls are cut off.** A relay can rewrite an answer and slip
   in a tool call for the client to run. Tool-call inspection can cut off an
   answer whose tool call downloads and runs code, sends out environment
-  variables or credential files, reads private keys, or installs a startup item
-  or scheduled job, before the client receives it whole.
+  variables or credential files, reads private keys, reads or changes
+  ThinkWatch's own configuration, or installs a startup item or scheduled job,
+  before the client receives it whole.
 - **Hidden instructions are removed.** Characters invisible on screen can carry
   instructions that a model reads; the content filter can delete them from user
   messages and tool results before a request leaves, or refuse a request that
@@ -110,7 +111,11 @@ each with a `.sha256` checksum; the Linux `.tar.gz` includes the systemd unit.
 
 `twcore` keeps its configuration and data in `~/.thinkwatch`
 (`%APPDATA%\ThinkWatch` on Windows), or in `THINKWATCH_HOME`. Every field is in
-the [configuration reference](docs/config.md).
+the [configuration reference](docs/config.md). The configuration holds keys in
+plain text and only its owner can read it, which keeps out other users but not
+programs running as the same user; outbound redaction protects what leaves the
+machine, not the file. [Where the file is](docs/config.md#where-the-file-is)
+describes what protects it.
 
 ## Control plane
 

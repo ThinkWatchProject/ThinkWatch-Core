@@ -835,6 +835,32 @@ mod tests {
     }
 
     #[test]
+    fn reading_the_gateways_own_config_is_cut_through_the_streaming_wall() {
+        // 路径分两片到：拼齐之前不认，拼齐的那一片不转发
+        let mut w = Wall::new(rules());
+        w.feed(start(0, "Bash").as_bytes());
+        assert!(
+            w.feed(arg(0, r#"{"command":"cat ~/.thi"#).as_bytes())
+                .is_empty()
+        );
+        let v = w.feed(arg(0, r#"nkwatch/config.yaml"}"#).as_bytes());
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].cut, "读写数据目录是高危，拦截档下切断");
+        assert_eq!(v[0].rule, "thinkwatch-data");
+        assert_eq!(v[0].excerpt, "~/.thinkwatch/config.yaml");
+    }
+
+    #[test]
+    fn editing_a_document_that_mentions_the_gateways_data_passes_the_wall() {
+        let mut w = Wall::new(rules());
+        w.feed(start(0, "Edit").as_bytes());
+        let args = r#"{"file_path":"README.md","old_string":"x","new_string":"Keys live in ~/.thinkwatch/config.yaml; cat it > /dev/null"}"#;
+        for part in [&args[..40], &args[40..80], &args[80..]] {
+            assert!(w.feed(arg(0, part).as_bytes()).is_empty(), "{part}");
+        }
+    }
+
+    #[test]
     fn a_credential_to_its_own_provider_passes_the_wall() {
         let mut w = Wall::new(rules());
         w.feed(start(0, "Bash").as_bytes());
