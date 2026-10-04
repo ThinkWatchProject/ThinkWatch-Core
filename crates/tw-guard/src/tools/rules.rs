@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn code_backed_rules_are_in_tool_inspection_but_not_in_the_config_scan() {
-        // 代码实现的规则（凭据外传、上传本地文件）是内置危险命令规则：工具调用审查要有，
+        // 代码实现的规则（凭据外传、上传本地文件、读写数据目录）是内置危险命令规则：工具调用审查要有，
         // 但客户端配置扫描不要（它只会直接读 `re`，而这些的 `re` 是永不匹配的）
         let tools = tool_rules(&[], |_| None, []).unwrap();
         let a = tools
@@ -585,9 +585,24 @@ mod tests {
         assert_eq!(b.check, Some(Check::FileToNetwork));
         assert!(!b.high, "上传文件出厂只记录");
 
-        // 配置扫描里两条都不在
+        // 读写自己的数据目录：一步拿走全部上游密钥，高危
+        let c = tools
+            .rules
+            .iter()
+            .find(|r| r.id == "thinkwatch-data")
+            .expect("数据目录规则应在工具调用审查里");
+        assert_eq!(c.check, Some(Check::OwnData));
+        assert!(c.high, "读写数据目录高危");
+        let args = r#"{"command":"cat ~/.thinkwatch/config.yaml"}"#;
+        assert_eq!(c.find(args).unwrap().text, "~/.thinkwatch/config.yaml");
+
+        // 配置扫描里都不在
         assert!(!scan_rules().rules.iter().any(|r| r.check.is_some()));
-        for id in ["secret-to-unknown-host", "upload-file-to-host"] {
+        for id in [
+            "secret-to-unknown-host",
+            "upload-file-to-host",
+            "thinkwatch-data",
+        ] {
             assert!(!scan_rules().rules.iter().any(|r| r.id == id), "{id}");
         }
         // 单独试一条也能编出来（走 one_builtin → compile）

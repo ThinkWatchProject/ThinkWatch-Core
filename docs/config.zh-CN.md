@@ -15,6 +15,10 @@ ThinkWatch Core 只读一个文件：`config.yaml`。本文逐项说明其中每
 
 `THINKWATCH_HOME` 替换整个目录；`--config <路径>` 为单条命令指定文件。core 的其余数据也在这个目录里：请求数据库（`data.db`）、配置历史（`history/`）、下载的价目表（`model_prices.json`），以及本地控制通道的 socket 文件（`twcore.sock`；Windows 上是回环端口，记录在 `control.port` 中）。目录只有所有者可访问（`0700`），配置文件权限为 `0600`：其中以明文保存密钥。
 
+这两项权限就是这份文件在本机上的全部保护：挡得住其他用户，挡不住以同一用户身份运行的程序。这样的程序能读到文件里的每一把密钥，也能用其中的控制通道密钥经控制通道修改配置。出站脱敏不改变这一点：它保护的是请求带出本机的内容，不是磁盘上的文件。显示配置时给控制通道密钥打码，是为了让经控制通道的写入改不了它（见 [`listen.control`](#cfg-listen-control)），而不是对本机程序隐藏它；上游密钥和网关密钥按原样显示。
+
+工具调用审查为这个目录内置了一条规则 `thinkwatch-data`：工具调用的路径或命令指向上述默认位置之一，或服务器上的 `/var/lib/thinkwatch`、`/etc/thinkwatch` 时记录下来，`enforce` 下切断响应。这样模型无法被诱导去读取这些密钥、改写约束它自己的防护。只是提到这个路径（例如在正在编辑的文档里）不算。`THINKWATCH_HOME` 指向别处时，可以在 [`security.inspect_tools`](#cfg-security-inspect_tools) 里为那个路径加一条自定义规则。
+
 没有配置文件时，`twcore serve` 会写入一份初始配置；`twcore init` 也可以按需生成。两者生成的内容如下：
 
 ```yaml
@@ -581,6 +585,7 @@ pricing:
 | `exfil-credentials-reversed` | Send out a credential file (verb first) | `cut` |
 | `ssh-key-read` | Read a private key or cloud credential | `cut` |
 | `secret-to-unknown-host` | Send a credential to an unknown host | `cut` |
+| `thinkwatch-data` | Read or change ThinkWatch's own data | `cut` |
 | `write-startup-item` | Write a startup item | `cut` |
 | `crontab-install` | Install a scheduled job | `cut` |
 | `rm-rf-root` | Delete home or root | `record` |

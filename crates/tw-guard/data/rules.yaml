@@ -110,6 +110,15 @@ dangerous:
     why: Sends a credential to a host that is neither local nor the credential's own provider
     level: high
     check: credential-to-network
+  # ThinkWatch 自己的数据目录：里面是明文的全部上游密钥和这几项防护的设置。读它一步就
+  # 拿走全部凭据，改它就能关掉管着自己的防护 —— 高危。**提到这个路径不算**（改文档、
+  # 回答「配置在哪」），只看路径和命令参数，所以由代码实现，见 src/tools/own_data.rs。
+  - id: thinkwatch-data
+    name: Read or change ThinkWatch's own data
+    pattern: ''
+    why: Reads or changes ThinkWatch's data directory, which holds every upstream key in plain text and the settings of these protections
+    level: high
+    check: thinkwatch-data
   # **写入启动项**：只要写进去了，下次开终端就执行 —— 而且是在你完全
   # 不知情的时候。它和「下载即执行」并列为高危，理由是一样的：
   # 一步就能拿到执行权。
