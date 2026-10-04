@@ -9,20 +9,35 @@
 /// 地址常常带着版本段（`https://api.openai.com/v1`），客户端发来的路径也带着
 /// （`/v1/chat/completions`）—— 照拼就是 `…/v1/v1/chat/completions`，一个 404。
 /// 只认版本段（`v1`、`v1beta`）：别的段恰好同名，说明不了它们是同一段。
+///
+/// **地址自带别的版本时，它替掉路径开头的 `v1`。**`/v1/…` 是 OpenAI 和 Anthropic
+/// 客户端的惯例前缀，而有的服务商把接口放在别的版本下，文档给的地址就带着它：
+/// 智谱 `…/api/paas/v4`、火山方舟 `…/api/v3`、百度千帆 `…/v2`。照拼是
+/// `…/v4/v1/chat/completions`，一个 404；要的是 `…/v4/chat/completions`。只替
+/// `v1`：路径里写明的别的版本（Gemini 的 `/v1beta/…`）是请求自己要的，照旧接在后面。
 pub fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
     let path = path.trim_start_matches('/');
     let path = match last_path_segment(base).filter(|s| is_version(s)) {
-        Some(v) => match path.strip_prefix(v) {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => rest.trim_start_matches('/'),
-            _ => path,
-        },
+        Some(v) => strip_segment(path, v)
+            .or_else(|| strip_segment(path, "v1"))
+            .unwrap_or(path),
         None => path,
     };
     let query = query.map(without_gateway_key);
     match query {
         Some(q) if !q.is_empty() => format!("{base}/{path}?{q}"),
         _ => format!("{base}/{path}"),
+    }
+}
+
+/// 路径开头是这一整段时，去掉它之后剩下的部分。
+fn strip_segment<'a>(path: &'a str, seg: &str) -> Option<&'a str> {
+    match path.strip_prefix(seg) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            Some(rest.trim_start_matches('/'))
+        }
+        _ => None,
     }
 }
 
@@ -101,6 +116,41 @@ mod tests {
         assert_eq!(
             upstream_url("https://relay.example/anthropic", "/v1/messages", None),
             "https://relay.example/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn a_base_url_with_its_own_version_takes_the_place_of_v1() {
+        // 智谱、火山方舟、百度千帆的 OpenAI 兼容接口
+        assert_eq!(
+            upstream_url(
+                "https://open.bigmodel.cn/api/paas/v4",
+                "/v1/chat/completions",
+                None
+            ),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            upstream_url(
+                "https://ark.cn-beijing.volces.com/api/v3/",
+                "/v1/chat/completions",
+                None
+            ),
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        );
+        assert_eq!(
+            upstream_url("https://qianfan.baidubce.com/v2", "/v1/models", None),
+            "https://qianfan.baidubce.com/v2/models"
+        );
+        // 路径就是 `/v1` 本身
+        assert_eq!(
+            upstream_url("https://api.z.ai/api/paas/v4", "/v1", None),
+            "https://api.z.ai/api/paas/v4/"
+        );
+        // `v1` 开头但不是整段：不替
+        assert_eq!(
+            upstream_url("https://x.example/v4", "/v1x/items", None),
+            "https://x.example/v4/v1x/items"
         );
     }
 
