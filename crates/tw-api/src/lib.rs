@@ -777,7 +777,24 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `preview` 的上游和叫 `test` 的代理改和删都是 405；插件 id 不再保留 `order`、`inspect`、
 /// `rewrite`、`confirmed` 这几个词，消息码 `config.plugin.reserved_id`、
 /// `control.plugin.reserved_id` 跟着删。
-pub const CONTROL_API_VERSION: u32 = 38;
+///
+/// **39 起路由看得到上游忙不忙、快不快、可不可靠，密钥有用量上限**。上游能设并发上限
+/// （[`ProviderView`]、[`ProviderInput`] 的 `max_concurrent`）；[`FailoverView`] 多了
+/// `slot_wait_secs`（一个请求合计最多等多久，等密钥的分钟、小时上限也算在里面）和
+/// `next_on_slow_start`（流开头太慢就换下一家）。尝试链（[`AttemptView`]）多了 `queued_ms`、
+/// `skipped`（[`ServeSkip`] 的 `busy`）和 `usage`（[`AttemptUsage`]：开头慢被放弃的那一跳上游
+/// 可能已经收了钱的输入），结果多了 `slow_start`（[`AttemptOutcome`]）。`load-balance` 组的
+/// 成员有权重、能按快慢和成败分（[`GroupView`]、[`GroupInput`] 的 `weights`、`balance_by`，
+/// [`BalanceBy`]），试算说得出每个成员的权重、快慢、成功率和系数（[`DryRunCandidate`]、
+/// [`DryRunResult::balance_by`]）。一家上游的模型规格可以手动设：新端点
+/// `PUT /provider-model-spec`（[`ModelSpecSave`] → [`ConfigWritten`]），[`ModelRow`] 多了
+/// `context_window_source`、`max_output_tokens`、`max_output_tokens_source`（[`SpecSource`]）。
+/// 密钥的用量上限：[`ClientView`] 多了 `limits`（[`KeyLimitView`]）和 `unpriced_models`，
+/// [`KeyInput`] 多了 `limits`（[`KeyLimitInput`]），事件多了 [`Event::KeyLimitAlert`]。
+/// Responses 的 WebSocket 连接上每个 `response.create` 是一行请求（带用量和费用，按轮算上限、
+/// 并发、快慢和成败），连接本身不留行；Realtime 和别的路径照旧整条连接一行。照 38 写的界面
+/// 保存组和密钥时会把权重、上限丢掉。
+pub const CONTROL_API_VERSION: u32 = 39;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
