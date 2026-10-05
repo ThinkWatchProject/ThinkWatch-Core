@@ -12,12 +12,12 @@ use axum::{Json, extract::State, http::StatusCode};
 ///
 /// 试算页存在的全部意义是「告诉你这条请求会走哪儿」，所以它**必须**用
 /// 同一个函数、同一份数字 —— 各算各的话，两边迟早会不一样，而那时
-/// 试算比没有更糟。
+/// 试算比没有更糟。`sent` 是每一家和发给它的模型名：比价按它算，和数据面一样。
 fn order_like_the_data_plane(
     s: &crate::ControlState,
     engine: &tw_engine::Engine,
     d: &tw_engine::Decision,
-    asked: &[(String, String)],
+    sent: &[(String, String)],
 ) -> Vec<String> {
     let Some(gname) = d.via_group.clone() else {
         return d.candidates.clone();
@@ -37,7 +37,7 @@ fn order_like_the_data_plane(
     let facts = tw_engine::Facts {
         seq: s.gateway.bus.peek_id(),
         ttfb_ms: s.gateway.latency.snapshot(&d.candidates),
-        price: s.gateway.unit_prices(&cfg.providers, asked, &d.candidates),
+        price: s.gateway.unit_prices(&cfg.providers, sent, &d.candidates),
     };
     engine.order(Some(&gname), &d.candidates, &facts)
 }
@@ -142,6 +142,8 @@ pub async fn dry_run(
     // 它们被跳过了，而实际上它们根本不在这条求值链上。
     let mut trace = Vec::new();
     let mut decided = false;
+    // 请求的是别名时它列的模型名：写上游模型名的条件也匹配它，和数据面一样
+    let aliased = engine.alias_models(&f.model);
     // 短路时一条都不求值 —— 空的 `trace` 说的就是这件事，
     // 而一份「全部未命中」的明细会读成「规则写错了」
     for r in rules.iter().filter(|_| short.is_none()) {
@@ -156,7 +158,7 @@ pub async fn dry_run(
             });
             continue;
         }
-        match r.when.matches(&f) {
+        match r.when.matches(&f, aliased) {
             Ok(true) => {
                 // 命中之后起了什么作用。**「命中了但没用上」要说出来** —— 兜底
                 // 规则在试算里命中，而去向早已由前面的规则决定
@@ -179,7 +181,7 @@ pub async fn dry_run(
             Ok(false) => trace.push(tw_api::RuleTrace {
                 name: r.name.clone(),
                 verdict: RuleVerdict::Skipped,
-                mismatch: unmatched(&r.when, &f),
+                mismatch: unmatched(&r.when, &f, aliased),
                 error: None,
                 effect: None,
             }),
@@ -200,6 +202,7 @@ pub async fn dry_run(
         rule: None,
         reason: None,
         candidates: Vec::new(),
+        candidate_models: Vec::new(),
         via_group: None,
         set: Vec::new(),
         trace,
@@ -227,10 +230,12 @@ pub async fn dry_run(
             // 清单里没有这个模型的）。**被跳过的要列出来** —— 「规则明明写的
             // 是 A」正是用户会来试算的原因
             //
-            // 每一家按它实际要的模型看：规则改写过的按改写后的算，和数据面一样
-            let asked = engine.models_asked(rules, &f, &d);
-            let serving =
-                tw_gateway::models::serving(&rt.config, &s.gateway.catalog.load(), &asked);
+            // 每一家按发给它的模型名看：规则改写过的按改写后的算，别名对到各家自己的
+            // 名称，和数据面同一个函数（`tw_gateway::sent`）
+            let asked = engine.asked(rules, &f, &d);
+            let catalog = s.gateway.catalog.load();
+            let sent = tw_gateway::sent::plan(&rt.config, &catalog, &f.model, &asked);
+            let serving = tw_gateway::sent::serving(&rt.config, &catalog, &sent);
             out.skipped = serving
                 .skipped
                 .iter()
@@ -262,7 +267,21 @@ pub async fn dry_run(
             // 而它属于哪次会话取决于请求正文，试算没有那个东西。
             // 于是它显示的是轮转序列里的当前位置 —— 而那正是一个没有
             // 会话指纹的请求真的会走的路。
-            out.candidates = order_like_the_data_plane(&s, engine, &d, &asked);
+            out.candidates =
+                order_like_the_data_plane(&s, engine, &d, &tw_gateway::sent::pairs(&sent));
+            // 每一家收到的模型名，和为什么不是请求里写的那个
+            out.candidate_models = out
+                .candidates
+                .iter()
+                .map(|name| {
+                    let one = sent.iter().find(|x| x.provider == *name);
+                    tw_api::DryRunCandidate {
+                        provider: name.clone(),
+                        sent_model: one.and_then(|x| x.model.clone()).filter(|m| !m.is_empty()),
+                        model_via: one.and_then(|x| x.via).map(|v| v.slug().to_string()),
+                    }
+                })
+                .collect();
             // 哪些候选要转换格式。**试算里要说出来**：转换可能丢掉请求里的字段，
             // 而「规则把我分到了一个别的格式的上游」本身就是用户来试算想知道的事。
             // 协议认不出来的上游直通，不算
@@ -322,12 +341,19 @@ fn describe(set: &tw_engine::SetAction) -> Vec<tw_api::SetView> {
 ///
 /// **逐条试，报第一个不满足的。**报「不匹配」等于什么都没说 —— 用户看
 /// 试算就是为了知道差在哪儿。
-fn unmatched(when: &tw_engine::rule::When, f: &RequestFacts) -> Option<tw_api::MismatchView> {
+///
+/// `aliased` 是请求的别名列的模型名（见 [`tw_engine::rule::When::matches`]）：模型这一条
+/// 对它们也算，和求值时一样。
+fn unmatched(
+    when: &tw_engine::rule::When,
+    f: &RequestFacts,
+    aliased: &[String],
+) -> Option<tw_api::MismatchView> {
     let miss = |field: ConditionField, want: Vec<String>, got: String| {
         Some(tw_api::MismatchView { field, want, got })
     };
     if let Some(w) = &when.model
-        && !tw_engine::rule::glob_match(w, &f.model)
+        && !when.model_matches(&f.model, aliased)
     {
         return miss(ConditionField::Model, vec![w.clone()], f.model.clone());
     }

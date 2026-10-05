@@ -489,6 +489,9 @@ pub enum Outcome2 {
         set: SetAction,
         /// 这一轮又附加了改写的规则（只有阶段二的），按求值的顺序
         rewritten_by: Vec<String>,
+        /// 阶段二的规则把模型改成了这个（`set` 里也是它）。**原样发出，不经过别名表**：
+        /// 阶段二已经知道是哪一家，写的就是那一家的名字
+        model: Option<String>,
     },
     Deny {
         rule: String,
@@ -617,6 +620,37 @@ impl RouteError {
 /// 规则的去向解出来的样子：候选、经过的策略组、指定的模型（见 [`Decision`]）。
 type Resolved = (Vec<String>, Option<String>, Vec<Pinned>);
 
+/// 一个候选要的模型（[`Engine::asked`]）：哪一家、要什么名字、这个名字从哪来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asked {
+    pub provider: String,
+    /// `origin` 是 [`Origin::Client`] 或 [`Origin::Rule`] 时是**客户端那一侧的名称**（可能
+    /// 是别名，发出去之前按别名表对到这一家）；另外两种是原样发出的名字
+    pub model: String,
+    pub origin: Origin,
+}
+
+/// 一个候选要的模型名从哪来。决定发给这一家时还要不要按别名表对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// 客户端写的那个
+    Client,
+    /// 阶段一的规则改写的（`set.model`）。**和客户端写的一样算客户端那一侧的名称**：可以
+    /// 写别名，按别名表对到每一家
+    Rule,
+    /// 阶段二的规则改写的：原样发出
+    PhaseTwo,
+    /// 规则指定的模型：原样发出
+    Pinned,
+}
+
+impl Origin {
+    /// 这个名字原样发出，不按别名表对到这一家
+    pub fn as_written(self) -> bool {
+        matches!(self, Origin::PhaseTwo | Origin::Pinned)
+    }
+}
+
 pub struct Engine {
     sets: Vec<RouteSet>,
     /// 没绑定时走哪条。
@@ -637,6 +671,8 @@ pub struct Engine {
     bound: std::collections::HashMap<String, String>,
     groups: Vec<Group>,
     providers: Vec<String>,
+    /// 别名 → 它列的模型名（[`Self::with_aliases`]）。`when.model` 的继承要它
+    aliases: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Engine {
@@ -699,7 +735,26 @@ impl Engine {
             bound,
             groups,
             providers,
+            aliases: Default::default(),
         }
+    }
+
+    /// 带上全局的别名表：别名 → 它列的模型名。
+    ///
+    /// 引擎只用它做一件事：**规则条件 `when.model` 的继承**（[`When::model_matches`]）——
+    /// 写上游模型名的条件也匹配列了它的别名。别名对到每一家发什么名字不归引擎管：那要
+    /// 知道每一家有什么模型，是网关的事。
+    pub fn with_aliases(
+        mut self,
+        aliases: impl IntoIterator<Item = (String, Vec<String>)>,
+    ) -> Self {
+        self.aliases = aliases.into_iter().collect();
+        self
+    }
+
+    /// `name` 是别名时它列的模型名，不是别名时是空的。名字要完全相等：别名没有通配
+    pub fn alias_models(&self, name: &str) -> &[String] {
+        self.aliases.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// 只有一条默认路由的引擎。
@@ -874,9 +929,10 @@ impl Engine {
         let mut rewritten_by = Vec::new();
         let mut chosen: Option<&Rule> = None;
 
+        let aliased = self.alias_models(&facts.model);
         for r in rules {
             // 阶段二的规则在这一轮完全跳过 —— 它们的条件还没法求值。
-            if r.when.is_phase_two() || !r.when.matches(facts)? {
+            if r.when.is_phase_two() || !r.when.matches(facts, aliased)? {
                 continue;
             }
             if let Some(s) = &r.set {
@@ -933,8 +989,10 @@ impl Engine {
     ) -> Result<Outcome2, RouteError> {
         let mut set = base.clone();
         let mut rewritten_by = Vec::new();
+        let mut model = None;
+        let aliased = self.alias_models(&facts.model);
         for r in rules {
-            if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider)? {
+            if !r.when.is_phase_two() || !r.when.matches_with_provider(facts, provider, aliased)? {
                 continue;
             }
             if let Some(reason) = &r.deny {
@@ -945,12 +1003,19 @@ impl Engine {
             }
             if let Some(s) = &r.set {
                 set.merge(s);
+                if s.model.is_some() {
+                    model = s.model.clone();
+                }
                 if r.adds() {
                     rewritten_by.push(r.name.clone());
                 }
             }
         }
-        Ok(Outcome2::Proceed { set, rewritten_by })
+        Ok(Outcome2::Proceed {
+            set,
+            rewritten_by,
+            model,
+        })
     }
 
     /// 每个候选实际会被要哪个模型，按候选的顺序。
@@ -959,6 +1024,10 @@ impl Engine {
     /// 请求里写的那个。准入、跳过服务不了的候选、比价，看的都得是发出去的那个
     /// 名字 —— 按客户端写的名字看，一条把 `claude-*` 改成 `glm-*` 的规则永远
     /// 用不上：智谱的清单里没有 `claude-*`。
+    ///
+    /// **给的是客户端那一侧的名称**：请求的是别名，这里就是别名；阶段一改写成别名，也是
+    /// 别名。每一家实际发什么由网关按别名表对（`tw_gateway::models::resolve`）。指定模型
+    /// 和阶段二改写的名字原样发出，这里给的就是发出的那个（来历见 [`Self::asked`]）。
     ///
     /// 阶段二拒绝或求不了值时按阶段一算：那一跳本来就发不出去，尝试那一步会
     /// 报出来。请求里读不出模型时一律是空的 —— 请求体都解不开，改写也写不进去。
@@ -970,23 +1039,58 @@ impl Engine {
         facts: &RequestFacts,
         d: &Decision,
     ) -> Vec<(String, String)> {
+        self.asked(rules, facts, d)
+            .into_iter()
+            .map(|a| (a.provider, a.model))
+            .collect()
+    }
+
+    /// [`Self::models_asked`]，带上每个名字的来历：要不要按别名表对到那一家，看它。
+    pub fn asked(&self, rules: &[Rule], facts: &RequestFacts, d: &Decision) -> Vec<Asked> {
         d.candidates
             .iter()
             .map(|c| {
-                let model = if facts.model.is_empty() {
-                    String::new()
-                } else if let Some(m) = d.pinned_model(c) {
-                    m.to_string()
-                } else {
-                    let set = match self.phase_two_with(rules, facts, c, &d.set) {
-                        Ok(Outcome2::Proceed { set, .. }) => set.model,
-                        _ => d.set.model.clone(),
+                if facts.model.is_empty() {
+                    return Asked {
+                        provider: c.clone(),
+                        model: String::new(),
+                        origin: Origin::Client,
                     };
-                    set.unwrap_or_else(|| facts.model.clone())
+                }
+                let renamed = match self.phase_two_with(rules, facts, c, &d.set) {
+                    Ok(Outcome2::Proceed { model, .. }) => model,
+                    _ => None,
                 };
-                (c.clone(), model)
+                self.asked_of(facts, d, c, renamed.as_deref())
             })
             .collect()
+    }
+
+    /// 候选 `provider` 要的模型。`renamed` 是阶段二对这一家改成的名字
+    /// （[`Outcome2::Proceed`] 的 `model`）：网关每一跳自己跑阶段二，拿它来问。
+    ///
+    /// 依次：指定的模型 → 阶段二改的 → 阶段一改的 → 客户端写的。
+    pub fn asked_of(
+        &self,
+        facts: &RequestFacts,
+        d: &Decision,
+        provider: &str,
+        renamed: Option<&str>,
+    ) -> Asked {
+        let (model, origin) = if let Some(m) = d.pinned_model(provider) {
+            (m.to_string(), Origin::Pinned)
+        } else if let Some(m) = renamed {
+            (m.to_string(), Origin::PhaseTwo)
+        } else if let Some(m) = &d.set.model {
+            (m.clone(), Origin::Rule)
+        } else {
+            (facts.model.clone(), Origin::Client)
+        };
+        Asked {
+            provider: provider.to_string(),
+            model,
+            origin,
+        }
     }
 
     /// 规则的去向 → 候选、经过的策略组、指定的模型。
@@ -2258,6 +2362,214 @@ to:
         assert!(
             check("{name: r, set: {max_tokens: 10}, to: [{provider: relay, model: m}]}").is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    fn rule(yaml: &str) -> Rule {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    /// `opus` 是别名：官方叫 `claude-opus-5`，Bedrock 叫 `us.anthropic.claude-opus-5-v1:0`
+    fn engine(rules: Vec<Rule>) -> Engine {
+        let e = Engine::with_default_rules(
+            vec!["bedrock".into(), "anthropic".into(), "relay".into()],
+            vec![],
+            rules,
+        )
+        .with_aliases([(
+            "opus".to_string(),
+            vec![
+                "claude-opus-5".to_string(),
+                "us.anthropic.claude-opus-5-v1:0".to_string(),
+            ],
+        )]);
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+        e
+    }
+
+    fn facts(model: &str) -> RequestFacts {
+        RequestFacts {
+            model: model.into(),
+            client: "claude-code".into(),
+            dialect: "anthropic".into(),
+            ..Default::default()
+        }
+    }
+
+    fn decision(e: &Engine, model: &str) -> Decision {
+        match e.route(&facts(model)).unwrap() {
+            Outcome::Route(d) => d,
+            other => panic!("该路由，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_alias_table_is_looked_up_by_the_exact_name() {
+        let e = engine(vec![]);
+        assert_eq!(e.alias_models("opus").len(), 2);
+        assert!(e.alias_models("Opus").is_empty());
+        assert!(e.alias_models("claude-opus-5").is_empty());
+    }
+
+    /// 条件写上游模型名（glob）：也匹配列了它的别名。写别名：只匹配请求这个别名本身
+    #[test]
+    fn a_condition_on_a_real_name_matches_the_aliases_that_list_it_and_not_back() {
+        let e = engine(vec![
+            rule("{name: Bedrock 上的 Opus, when: {model: 'us.anthropic.*'}, to: bedrock}"),
+            rule("{name: 别名本身, when: {model: opus}, to: anthropic}"),
+            rule("{name: 兜底, to: relay}"),
+        ]);
+        // 请求别名：它列的 `us.anthropic.claude-opus-5-v1:0` 对上了第一条
+        assert_eq!(decision(&e, "opus").matched_rule, "Bedrock 上的 Opus");
+        // 请求真名：第一条对不上，写别名的那条也不管它
+        assert_eq!(decision(&e, "claude-opus-5").matched_rule, "兜底");
+
+        let e = engine(vec![
+            rule("{name: 别名本身, when: {model: opus}, to: anthropic}"),
+            rule("{name: 兜底, to: relay}"),
+        ]);
+        assert_eq!(decision(&e, "opus").candidates, ["anthropic"]);
+        assert_eq!(decision(&e, "claude-opus-5").candidates, ["relay"]);
+    }
+
+    /// 阶段二的条件一样继承
+    #[test]
+    fn phase_two_conditions_inherit_too() {
+        let e = engine(vec![
+            rule(
+                "{name: 中转不给 Opus, when: {provider_would_be: relay, model: claude-opus-*}, deny: 不行}",
+            ),
+            rule("{name: 兜底, to: __all__}"),
+        ]);
+        let base = SetAction::default();
+        assert!(matches!(
+            e.phase_two(&facts("opus"), "relay", &base).unwrap(),
+            Outcome2::Deny { .. }
+        ));
+        assert!(matches!(
+            e.phase_two(&facts("opus"), "bedrock", &base).unwrap(),
+            Outcome2::Proceed { .. }
+        ));
+        assert!(matches!(
+            e.phase_two(&facts("sonnet"), "relay", &base).unwrap(),
+            Outcome2::Proceed { .. }
+        ));
+    }
+
+    /// 阶段一改写成的名字是客户端那一侧的（可以是别名）；阶段二改的、指定的原样发出
+    #[test]
+    fn each_candidate_says_where_its_name_came_from() {
+        let rules = vec![
+            rule("{name: 改成别名, set: {model: opus}}"),
+            rule(
+                "{name: 中转的叫法, when: {provider_would_be: relay}, set: {model: relay/opus, max_tokens: 100}}",
+            ),
+            rule("{name: 兜底, to: __all__}"),
+        ];
+        let e = engine(rules.clone());
+        let f = facts("claude-sonnet-5");
+        let d = decision(&e, "claude-sonnet-5");
+        let asked = e.asked(&rules, &f, &d);
+        let got: Vec<(&str, &str, Origin)> = asked
+            .iter()
+            .map(|a| (a.provider.as_str(), a.model.as_str(), a.origin))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("bedrock", "opus", Origin::Rule),
+                ("anthropic", "opus", Origin::Rule),
+                ("relay", "relay/opus", Origin::PhaseTwo),
+            ]
+        );
+        assert!(!Origin::Rule.as_written() && Origin::PhaseTwo.as_written());
+        // `models_asked` 是同一份，只是不带来历
+        assert_eq!(
+            e.models_asked(&rules, &f, &d),
+            asked
+                .iter()
+                .map(|a| (a.provider.clone(), a.model.clone()))
+                .collect::<Vec<_>>()
+        );
+        // 阶段二说出它改成了什么；没改的那一家是 None
+        match e.phase_two(&f, "relay", &d.set).unwrap() {
+            Outcome2::Proceed { model, set, .. } => {
+                assert_eq!(model.as_deref(), Some("relay/opus"));
+                assert_eq!(set.max_tokens, Some(100));
+            }
+            other => panic!("{other:?}"),
+        }
+        match e.phase_two(&f, "bedrock", &d.set).unwrap() {
+            Outcome2::Proceed { model, set, .. } => {
+                assert_eq!(model, None);
+                assert_eq!(set.model.as_deref(), Some("opus"), "阶段一的照常带着");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 没有任何改写：客户端写的那个
+        let plain = vec![rule("{name: 兜底, to: anthropic}")];
+        let e = engine(plain.clone());
+        let d = decision(&e, "opus");
+        assert_eq!(
+            e.asked(&plain, &facts("opus"), &d),
+            [Asked {
+                provider: "anthropic".into(),
+                model: "opus".into(),
+                origin: Origin::Client,
+            }]
+        );
+    }
+
+    /// 指定模型：按列表的顺序，每一家原样发它的名字；阶段二改名盖不过它，别的改写照常
+    #[test]
+    fn pinned_entries_keep_their_order_and_names_and_other_rewrites_still_apply() {
+        let rules = vec![
+            rule("{name: 降上限, set: {max_tokens: 10}}"),
+            rule(
+                "name: 指定
+when: {model: claude-opus-*}
+to:
+  - { provider: relay, model: opus }
+  - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+",
+            ),
+            rule(
+                "{name: 阶段二, when: {provider_would_be: relay}, set: {model: x, thinking: false}}",
+            ),
+            rule("{name: 兜底, to: __all__}"),
+        ];
+        let e = engine(rules.clone());
+        // 请求别名也命中写真名的指定规则（继承），候选就是列出来的两家，按列表顺序
+        let d = decision(&e, "opus");
+        assert_eq!(d.matched_rule, "指定");
+        assert_eq!(d.candidates, ["relay", "bedrock"]);
+        assert_eq!(d.via_group, None);
+        assert_eq!(d.set.max_tokens, Some(10), "别的规则的改写照常");
+        let asked = e.asked(&rules, &facts("opus"), &d);
+        assert_eq!(
+            asked
+                .iter()
+                .map(|a| (a.model.as_str(), a.origin))
+                .collect::<Vec<_>>(),
+            [
+                // 指定的名字恰好是别名也原样发：不经过别名表
+                ("opus", Origin::Pinned),
+                ("us.anthropic.claude-opus-5-v1:0", Origin::Pinned),
+            ]
+        );
+        // 阶段二照常跑：改名没用，别的改写照常
+        match e.phase_two(&facts("opus"), "relay", &d.set).unwrap() {
+            Outcome2::Proceed { model, set, .. } => {
+                let a = e.asked_of(&facts("opus"), &d, "relay", model.as_deref());
+                assert_eq!((a.model.as_str(), a.origin), ("opus", Origin::Pinned));
+                assert_eq!((set.thinking, set.max_tokens), (Some(false), Some(10)));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 

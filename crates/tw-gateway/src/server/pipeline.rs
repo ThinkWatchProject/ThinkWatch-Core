@@ -355,7 +355,8 @@ fn conversation(
 /// 输入超出了这个决定所选模型的上下文窗口：这一轮沿用的决定要重新求值。
 ///
 /// 按候选里最小的那个窗口算，留 5% 的余量（输入是估的）。**知道窗口的才算**：价目表
-/// 里没写的模型，说不出它装不装得下，照常沿用。
+/// 里没写的模型，说不出它装不装得下，照常沿用。窗口按每一家发出去的名字查：别名在各家
+/// 是各家的名字（见 [`crate::sent`]）。
 fn outgrown(
     state: &AppState,
     rt: &Runtime,
@@ -364,10 +365,16 @@ fn outgrown(
     d: &tw_engine::Decision,
 ) -> bool {
     let book = state.pricing.load();
-    rt.engine
-        .models_asked(rt.engine.rules_for_client(&req.client_name), facts, d)
+    let asked = rt
+        .engine
+        .asked(rt.engine.rules_for_client(&req.client_name), facts, d);
+    crate::sent::plan(&rt.config, &state.catalog.load(), &facts.model, &asked)
         .iter()
-        .filter_map(|(p, m)| book.resolve_for(p, m)?.price.max_input_tokens)
+        .filter_map(|s| {
+            book.resolve_for(&s.provider, s.model.as_deref()?)?
+                .price
+                .max_input_tokens
+        })
         .min()
         .is_some_and(|limit| facts.input_tokens.saturating_mul(100) >= limit.saturating_mul(95))
 }
@@ -523,19 +530,27 @@ fn route(
             stayed: None,
         }),
     };
-    // 每个候选实际要的模型：规则改写过的按改写后的算。准入、跳过、比价都看它
-    let asked = rt.engine.models_asked(
+    // 每个候选实际要的模型：规则改写过的按改写后的算，还是客户端那一侧的名称（可能是
+    // 别名）。准入看它
+    let asked = rt.engine.asked(
         rt.engine.rules_for_client(&req.client_name),
         facts,
         &decision,
     );
-    admit(state, rt, req, reading, &decision, &asked)?;
-    // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的。
+    let pairs: Vec<(String, String)> = asked
+        .iter()
+        .map(|a| (a.provider.clone(), a.model.clone()))
+        .collect();
+    admit(state, rt, req, reading, &decision, &pairs)?;
+    // 每一家发出去的名字：别名对到各家自己的名称。跳过、比价看它（见 `crate::sent`）
+    let catalog = state.catalog.load();
+    let sent = crate::sent::plan(&rt.config, &catalog, &facts.model, &asked);
+    // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的、别名对不到的。
     // **在排序之前** —— `cheapest` 和 `url-test` 要在能服务的上游里挑。
     //
     // 不跳过的话，一家没有这个模型的上游排在前面，它回的 404 不触发故障
     // 转移，请求就在一家能服务它的上游旁边失败了。
-    let serving = crate::models::serving(&rt.config, &state.catalog.load(), &asked);
+    let serving = crate::sent::serving(&rt.config, &catalog, &sent);
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
     if serving.usable.is_empty() {
         return Ok(Routed::Refused(choice, serving.explain(model)));
@@ -566,9 +581,12 @@ fn route(
                 _ => Default::default(),
             },
             price: match kind {
-                tw_engine::GroupType::Cheapest => {
-                    state.unit_prices(&rt.config.providers, &asked, &decision.candidates)
-                }
+                // 每一家按发给它的名字算价钱：同一个别名在各家是各家的模型名、各家的价目
+                tw_engine::GroupType::Cheapest => state.unit_prices(
+                    &rt.config.providers,
+                    &crate::sent::pairs(&sent),
+                    &decision.candidates,
+                ),
                 _ => Default::default(),
             },
         };

@@ -130,6 +130,8 @@ pub(super) async fn try_upstreams<'a>(
     // 最后发出去的那一跳，插件改过的话改过之后的请求和那一跳的账：存下来的「插件改过的
     // 请求」就是它 —— 回答的那一家收到的那一份
     let mut after_plugins: Option<(Bytes, tw_guard::redact::replace::Ledger)> = None;
+    // 别名对到每一家时看的清单：整个请求用同一份
+    let catalog = state.catalog.load();
 
     for (i, name) in started.alive.iter().enumerate() {
         // 后面没有别的候选了
@@ -173,7 +175,7 @@ pub(super) async fn try_upstreams<'a>(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let mut effective_set = match rt.engine.phase_two(
+        let (mut effective_set, renamed) = match rt.engine.phase_two(
             &reading.facts,
             &provider.name,
             &decision.set,
@@ -181,13 +183,14 @@ pub(super) async fn try_upstreams<'a>(
             Ok(tw_engine::Outcome2::Proceed {
                 set,
                 rewritten_by: more,
+                model,
             }) => {
                 for r in more {
                     if !rewritten_by.contains(&r) {
                         rewritten_by.push(r);
                     }
                 }
-                set
+                (set, model)
             }
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %provider.name, "a phase-two rule denied the request");
@@ -215,20 +218,40 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
-        // 指定模型：这一家要的名字原样发出，规则改写（两个阶段的 `set.model`）盖不过它
-        if let Some(m) = decision.pinned_model(&provider.name) {
-            effective_set.model = Some(m.to_string());
-        }
-        // 这一跳要发的模型名：规则改写过的是改写之后的
-        let sent = effective_set
-            .model
-            .clone()
-            .unwrap_or_else(|| reading.facts.model.clone());
+        // 这一家要的模型（见 `Engine::asked_of`）和发给它的名字：客户端那一侧的名称（客户端
+        // 写的、阶段一改写的）按别名表对到**这一家**自己的名称，故障转移换一家就重新对；
+        // 指定的模型、阶段二改的名字原样发出（见 `crate::sent`）
+        let asked_model =
+            rt.engine
+                .asked_of(&reading.facts, decision, &provider.name, renamed.as_deref());
+        let Some(sent) = crate::sent::name(&rt.config, &catalog, provider, &asked_model) else {
+            // 别名列的名字这一家一个都没有。路由时已经跳过了这样的候选，能到这儿说明它的
+            // 清单刚刚换过：**不把别名原样发给它**，换下一家
+            let err = GatewayError::new(
+                crate::error::Source::Request,
+                msg!(
+                    "gw.model.alias_not_served",
+                    upstream = provider.name.clone(), alias = asked_model.model.clone() =>
+                    "Upstream `{upstream}` offers none of the models that alias {alias} lists."
+                ),
+            );
+            chain.push(hop_failed(
+                &provider.name,
+                None,
+                err.detail.clone(),
+                hop_started,
+            ));
+            last_err = Some(err);
+            continue;
+        };
+        // 和客户端写的一样就不动请求体里的模型名（改写过又对回来的也一样）
+        effective_set.model = (sent != reading.facts.model).then(|| sent.clone());
         // 改写过、和客户端要的不一样的才记（见 `AttemptView::model`）
         let asked_other = |m: &String| *m != reading.facts.model;
-        // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数
+        // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数。**比的是要的模型**：
+        // 同一个别名在各家名字不同，是同一个模型
         if counting {
-            let model = Some(sent.clone()).filter(asked_other);
+            let model = Some(asked_model.model.clone()).filter(asked_other);
             match &count_model {
                 None => count_model = Some(model),
                 Some(first) if *first != model => {

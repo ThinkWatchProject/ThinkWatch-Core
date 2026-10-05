@@ -247,6 +247,12 @@ impl Config {
                 .filter_map(|c| c.route.clone().map(|r| (c.name.clone(), r)))
                 .collect(),
         )
+        // 规则条件 `when.model` 写上游模型名时也匹配列了它的别名
+        .with_aliases(
+            self.aliases
+                .iter()
+                .map(|a| (a.name.clone(), a.models.clone())),
+        )
     }
 }
 
