@@ -874,16 +874,20 @@ async fn speed_quote(
         targets(&cfg, &req.providers)?
             .into_iter()
             .map(|p| {
-                // 和记账同一个口径：按这家的计费方式和价目表。**协议也要给**：
-                // 输出上限报多少由它决定（见 `tw_gateway::l3::max_output_tokens`）
+                let (model, skip) = match speed_model(&cfg, &catalog, p, &req.model) {
+                    Ok(m) => (m, None),
+                    Err(skip) => (req.model.clone(), Some(skip)),
+                };
+                // 和记账同一个口径：按这家的计费方式和价目表、发给它的那个模型名。**协议
+                // 也要给**：输出上限报多少由它决定（见 `tw_gateway::l3::max_output_tokens`）
                 let e = tw_gateway::l3::estimate(
                     &book,
                     &p.name,
-                    &req.model,
+                    &model,
                     p.billing,
                     p.effective_protocol(),
                 );
-                (e, tw_gateway::models::fit(&catalog, p, &req.model))
+                (e, skip)
             })
             .collect();
     Ok(Json(tw_api::SpeedQuote {
@@ -915,9 +919,9 @@ async fn speed_run(
     for p in targets(&cfg, &req.providers)? {
         // 服务不了这个模型的不发：报价里已经说了它不会被测，发出去只会得到
         // 一个 4xx，还可能被计费
-        if tw_gateway::models::fit(&catalog, p, &req.model).is_some() {
+        let Ok(model) = speed_model(&cfg, &catalog, p, &req.model) else {
             continue;
-        }
+        };
         // OAuth 那类要联网换 token，所以走网关那条 async 的路。
         // **用这一家自己的 client** —— 换 token 要走它的代理。
         let pk_http = s.gateway.client_for(&p.name);
@@ -926,7 +930,7 @@ async fn speed_run(
             Err(e) => {
                 out.push(tw_api::SpeedResult {
                     provider: p.name.clone(),
-                    model: req.model.clone(),
+                    model,
                     ok: false,
                     connect_ms: 0,
                     ttft_ms: None,
@@ -947,10 +951,10 @@ async fn speed_run(
             &pk_http,
             p,
             &headers,
-            &req.model,
+            &model,
             tw_gateway::l3::max_output_tokens(
                 &s.gateway.pricing.load(),
-                &req.model,
+                &model,
                 p.effective_protocol(),
             ),
         )
@@ -968,6 +972,36 @@ async fn speed_run(
         });
     }
     Ok(Json(out))
+}
+
+/// 测速发给 `p` 的模型名，或者它测不了的原因。
+///
+/// 要测的是别名的话，和转发一样发这一家**自己的那个名字**（[`tw_gateway::models::resolve`]）：
+/// 别名本身它不认识。列表里的名字它一个都服务不了：一个都不在启用范围里是
+/// `out_of_scope`，在范围里、清单里没有是 `not_offered`。对上的名字再照常看这一家能不能
+/// 服务它（[`tw_gateway::models::fit`]）。
+fn speed_model(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    p: &tw_config::Provider,
+    model: &str,
+) -> Result<String, tw_gateway::models::Skip> {
+    use tw_gateway::models::Skip;
+    let Some(sent) = tw_gateway::models::resolve(cfg, catalog, p, model) else {
+        let scoped = cfg
+            .aliases
+            .find(model)
+            .is_some_and(|a| a.models.iter().any(|m| p.uses_model(m)));
+        return Err(if scoped {
+            Skip::NotOffered
+        } else {
+            Skip::OutOfScope
+        });
+    };
+    match tw_gateway::models::fit(catalog, p, &sent) {
+        Some(skip) => Err(skip),
+        None => Ok(sent),
+    }
 }
 
 fn quote_item(

@@ -181,6 +181,7 @@ control.redirect_must_be_app_scheme
 control.remote.control_section_locked
 control.remote.diagnostics_refused
 control.remote.shutdown_refused
+control.replay_alias_unserved
 control.replay_bedrock
 control.request_body_gone
 control.request_body_truncated
@@ -296,6 +297,7 @@ gw.oauth.rotation_no_manager
 gw.oauth.rotation_queue_full
 gw.oauth.status
 gw.oauth.unreachable
+gw.plugin.alias_unserved
 gw.plugin.answer_unreadable
 gw.plugin.api
 gw.plugin.bad_output

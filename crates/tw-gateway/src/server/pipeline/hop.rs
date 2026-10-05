@@ -254,7 +254,7 @@ pub(super) async fn try_upstreams<'a>(
         .await
         {
             Ok(p) => p,
-            Err(why) => {
+            Err(super::plug::Stop::Request(why)) => {
                 // 这一跳没有发出去。**它在尝试链上**，原因就是拒绝它的那句话
                 chain.push(hop_failed(
                     &provider.name,
@@ -264,6 +264,17 @@ pub(super) async fn try_upstreams<'a>(
                 ));
                 halt = Some(GatewayError::denied(why));
                 break;
+            }
+            // 插件换上的别名这一家服务不了：这一家不发，换下一家
+            Err(super::plug::Stop::Hop(why)) => {
+                chain.push(hop_failed(
+                    &provider.name,
+                    Some(sent.clone()).filter(asked_other),
+                    why.clone(),
+                    hop_started,
+                ));
+                last_err = Some(GatewayError::new(crate::error::Source::Request, why));
+                continue;
             }
         };
         // 插件换了发给这一家的模型名：和规则改写的一样，只是盖过它

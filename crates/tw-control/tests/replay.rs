@@ -98,11 +98,19 @@ fn app(config: &str) -> (tempfile::TempDir, axum::Router) {
 
 /// 同上，存着的请求体是 `body`。
 fn app_with(config: &str, body: &[u8]) -> (tempfile::TempDir, axum::Router) {
+    app_of(config, body, row(1, "本机"))
+}
+
+/// 同上，存着的那一行是 `r`。
+fn app_of(
+    config: &str,
+    body: &[u8],
+    r: tw_store::db::RequestRow,
+) -> (tempfile::TempDir, axum::Router) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
     std::fs::write(&p, config).unwrap();
     let db = tw_store::Db::open(&d.path().join("data.db")).unwrap();
-    let r = row(1, "本机");
     db.insert(&r).unwrap();
     let blobs = tw_store::Blobs::new(d.path().join("blobs"));
     assert!(blobs.put(r.at_ms, r.id, tw_store::Which::Request, body));
@@ -129,6 +137,13 @@ fn app_with(config: &str, body: &[u8]) -> (tempfile::TempDir, axum::Router) {
 }
 
 async fn replay(app: &axum::Router, provider: &str) -> serde_json::Value {
+    let (status, v) = ask(app, "/replay/run", provider).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v
+}
+
+/// 向 `path`（报价或重放）要第 1 条请求重放到 `provider`
+async fn ask(app: &axum::Router, path: &str, provider: &str) -> (StatusCode, serde_json::Value) {
     let req = tw_api::ReplayRequest {
         id: 1,
         provider: provider.into(),
@@ -136,7 +151,7 @@ async fn replay(app: &axum::Router, provider: &str) -> serde_json::Value {
     let r = app
         .clone()
         .oneshot(
-            Request::post("/replay/run")
+            Request::post(path)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&req).unwrap()))
                 .unwrap(),
@@ -145,9 +160,7 @@ async fn replay(app: &axum::Router, provider: &str) -> serde_json::Value {
         .unwrap();
     let status = r.status();
     let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
-    assert_eq!(status, StatusCode::OK, "{v}");
-    v
+    (status, serde_json::from_slice(&b).unwrap())
 }
 
 /// 系统代理开着的时候，重放照样直连、照样走上游自己的代理：两条都在一个子进程里跑，
@@ -269,20 +282,41 @@ async fn a_bedrock_upstream_is_not_offered_a_replay_it_cannot_take() {
     }
 }
 
-/// 一个把收到的请求体原样回给你的上游，顺手记下收到了什么。
-async fn echoing() -> (SocketAddr, Arc<std::sync::Mutex<String>>) {
-    let seen: Arc<std::sync::Mutex<String>> = Arc::default();
+/// 假上游收到的请求：路径和正文，按先后。
+#[derive(Clone, Default)]
+struct Seen(Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+impl Seen {
+    /// 最后收到的那一个
+    fn last(&self) -> (String, String) {
+        self.0
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("nothing was sent")
+    }
+
+    fn count(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+/// 一个把收到的请求体原样回给你的上游，顺手记下收到了什么：每一个请求的路径和正文。
+async fn echoing() -> (SocketAddr, Seen) {
+    let seen = Seen::default();
     let s = seen.clone();
-    let app = axum::Router::new().route(
-        "/v1/messages",
-        axum::routing::post(move |body: String| {
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |uri: axum::http::Uri, body: String| {
             let s = s.clone();
             async move {
-                *s.lock().unwrap() = body.clone();
+                s.0.lock()
+                    .unwrap()
+                    .push((uri.path().to_string(), body.clone()));
                 body
             }
-        }),
-    );
+        },
+    ));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -309,7 +343,7 @@ async fn a_replay_numbers_new_finds_after_the_placeholders_already_stored() {
     );
 
     let v = replay(&app, "本机").await;
-    let sent = seen.lock().unwrap().clone();
+    let (_, sent) = seen.last();
     assert!(
         sent.contains("旧的 <<TW_SECRET_1>>，新的 <<TW_SECRET_2>>"),
         "{sent}"
@@ -320,4 +354,155 @@ async fn a_replay_numbers_new_finds_after_the_placeholders_already_stored() {
         body.contains("旧的 <<TW_SECRET_1>>，新的 sk-an…AAAA"),
         "{v}"
     );
+}
+
+/// 一个别名表、几家上游（都指到同一个假上游），启用范围各不相同：
+/// - `本机` 只有 `claude-*`，`中转` 只有 `anthropic/*`：`sonnet` 在两家各叫各的；
+/// - `谷歌` 只有 `gemini-*`：`flash` 只有它服务得了；
+/// - `别家` 只有 `gpt-*`：两个别名它都服务不了。
+fn aliased(upstream: SocketAddr) -> String {
+    format!(
+        "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\n\
+         clients:\n  - name: 我\n    key: tw-一把钥匙就够\n\
+         aliases:\n  sonnet:\n    - claude-sonnet-4-5\n    - anthropic/claude-sonnet-4-5\n  \
+         flash: gemini-2.5-flash\n\
+         providers:\n  \
+         - name: 本机\n    base_url: http://{upstream}\n    key: sk-x\n    models_only: [\"claude-*\"]\n  \
+         - name: 中转\n    base_url: http://{upstream}\n    key: sk-x\n    models_only: [\"anthropic/*\"]\n  \
+         - name: 谷歌\n    base_url: http://{upstream}\n    key: sk-x\n    models_only: [\"gemini-*\"]\n  \
+         - name: 别家\n    base_url: http://{upstream}\n    key: sk-x\n    models_only: [\"gpt-*\"]\n"
+    )
+}
+
+/// 原来那一次的尝试链：每一跳是 `(上游, 发给它的、和客户端要的不一样的模型名)`
+fn routed(hops: &[(&str, Option<&str>)]) -> Option<String> {
+    let attempts = hops
+        .iter()
+        .map(|(p, m)| tw_api::AttemptView {
+            provider: p.to_string(),
+            model: m.map(String::from),
+            outcome: tw_api::AttemptOutcome::Served,
+            status: Some(200),
+            error: None,
+            ms: 100,
+        })
+        .collect();
+    Some(
+        serde_json::to_string(&tw_api::RoutingView {
+            route: "default".into(),
+            rule: "兜底".into(),
+            attempts,
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+}
+
+/// 发出去的那一份请求体里的模型名
+fn model_of(body: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["model"].as_str().unwrap_or_default().to_string()
+}
+
+/// 客户端要的是别名：重放到另一家，发的是**那一家自己的名字**，不是别名本身，也不是原来
+/// 那一家的名字。报价也按这个名字。重放回原来那一家，发的是记录里它收到的那个
+#[tokio::test]
+async fn an_alias_is_replayed_under_the_chosen_upstreams_own_name() {
+    let (upstream, seen) = echoing().await;
+    let mut r = row(1, "本机");
+    r.model = "sonnet".into();
+    r.sent_model = "claude-sonnet-4-5".into();
+    r.routing = routed(&[("本机", Some("claude-sonnet-4-5"))]);
+    let (_d, app) = app_of(
+        &aliased(upstream),
+        br#"{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r,
+    );
+
+    let (status, q) = ask(&app, "/replay/quote", "中转").await;
+    assert_eq!(status, StatusCode::OK, "{q}");
+    assert_eq!(q["model"], "anthropic/claude-sonnet-4-5", "{q}");
+
+    replay(&app, "中转").await;
+    let (path, sent) = seen.last();
+    assert_eq!(path, "/v1/messages");
+    assert_eq!(model_of(&sent), "anthropic/claude-sonnet-4-5", "{sent}");
+    // 只换了模型名
+    assert!(sent.contains(r#""content":"hi""#), "{sent}");
+
+    replay(&app, "本机").await;
+    assert_eq!(model_of(&seen.last().1), "claude-sonnet-4-5");
+}
+
+/// 规则把模型改写过：重放回原来那一家，发的是记录里它收到的那个名字（报价也按它）；重放到
+/// 别的一家，规则没有作用在它身上，发的是客户端要的那个，请求体一个字节都不动
+#[tokio::test]
+async fn a_rewritten_request_goes_back_to_its_upstream_under_the_recorded_name() {
+    let (upstream, seen) = echoing().await;
+    let stored: &[u8] =
+        br#"{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+    let mut r = row(1, "本机");
+    r.sent_model = "claude-haiku-4-5".into();
+    r.routing = routed(&[("别家", None), ("本机", Some("claude-haiku-4-5"))]);
+    let (_d, app) = app_of(&aliased(upstream), stored, r);
+
+    let (status, q) = ask(&app, "/replay/quote", "本机").await;
+    assert_eq!(status, StatusCode::OK, "{q}");
+    assert_eq!(q["model"], "claude-haiku-4-5", "{q}");
+    // 按发出去的那个模型报价：输入是记录里的 5，输出按上次的估、至少 256
+    let book = tw_pricing::PriceBook::builtin().unwrap();
+    let usage = tw_pricing::Usage {
+        input: 5,
+        output: 256,
+        ..Default::default()
+    };
+    let cost = |m: &str| match book.cost_for("本机", m, &usage, false) {
+        tw_pricing::Cost::Known(c) | tw_pricing::Cost::Estimated(c) => c,
+        other => panic!("{m} has no price: {other:?}"),
+    };
+    assert_ne!(cost("claude-haiku-4-5"), cost("claude-sonnet-4-5"));
+    assert_eq!(q["cost_micros"], cost("claude-haiku-4-5"), "{q}");
+
+    replay(&app, "本机").await;
+    assert_eq!(model_of(&seen.last().1), "claude-haiku-4-5");
+
+    replay(&app, "中转").await;
+    assert_eq!(seen.last().1.as_bytes(), stored);
+}
+
+/// 这一家服务不了这个别名（列表里的名字它一个都没有）：报价和重放都说清楚，什么都不发
+#[tokio::test]
+async fn an_alias_the_upstream_cannot_serve_is_not_replayed() {
+    let (upstream, seen) = echoing().await;
+    let mut r = row(1, "本机");
+    r.model = "sonnet".into();
+    r.sent_model = "claude-sonnet-4-5".into();
+    let (_d, app) = app_of(
+        &aliased(upstream),
+        br#"{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r,
+    );
+    for path in ["/replay/quote", "/replay/run"] {
+        let (status, v) = ask(&app, path, "别家").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {v}");
+        assert_eq!(v["code"], "control.replay_alias_unserved", "{path}: {v}");
+    }
+    assert_eq!(seen.count(), 0);
+}
+
+/// Gemini 的模型写在路径里：换的是路径里的那一段，请求体一个字节都不动
+#[tokio::test]
+async fn a_gemini_alias_is_renamed_in_the_path() {
+    let (upstream, seen) = echoing().await;
+    let stored: &[u8] = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+    let mut r = row(1, "谷歌");
+    r.model = "flash".into();
+    r.sent_model = "flash".into();
+    r.path = "/v1beta/models/flash:generateContent".into();
+    let (_d, app) = app_of(&aliased(upstream), stored, r);
+
+    replay(&app, "谷歌").await;
+    let (path, sent) = seen.last();
+    assert_eq!(path, "/v1beta/models/gemini-2.5-flash:generateContent");
+    assert_eq!(sent.as_bytes(), stored);
 }
