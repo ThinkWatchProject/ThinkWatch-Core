@@ -117,14 +117,17 @@ pub(super) async fn pipeline(
     };
 
     // 管线第 3 步：这把密钥自己的并发上限。**等，不拒绝** —— 理由在
-    // `crate::limits`。放在路由之后：被规则挡下的请求不用先等一轮
+    // `crate::limits`。放在路由之后：被规则挡下的请求不用先等一轮。
+    //
+    // **通行证交给回程，跟着响应体走**（见 `relay`）：放在这里的话它在响应头交出去的那一刻
+    // 就还了，一条还在流的回答不再算数，上限管的只是等响应头的那一段
     let limit = rt
         .config
         .clients
         .iter()
         .find(|c| c.name == req.client_name)
         .and_then(|c| c.max_concurrent);
-    let _pass = state.gate.acquire(&req.client_name, limit).await;
+    let pass = state.gate.acquire(&req.client_name, limit).await;
 
     // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
     let screening = screen(&rt, &mut req, &mut reading);
@@ -217,7 +220,7 @@ pub(super) async fn pipeline(
         &reading.facts.model,
         served,
         started.id,
-        live,
+        (live, pass),
         ending,
         reply_plugins,
     ))

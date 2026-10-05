@@ -23,7 +23,8 @@ use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
 /// `asked_model` 是客户端请求里写的模型名：发出去的不是它、上游答的又是发出去的那个
-/// 模型时，回答里的模型名写回它（见 [`crate::answer_model`]）。
+/// 模型时，回答里的模型名写回它（见 [`crate::answer_model`]）。`live` 和 `pass` 是这个
+/// 请求在服务中的那一笔和这把密钥的通行证：都跟着响应体走，回答交完或者客户端走掉才还。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn respond(
     state: &AppState,
@@ -33,7 +34,7 @@ pub(super) fn respond(
     asked_model: &str,
     served: Served<'_>,
     id: u64,
-    live: crate::live::Pass,
+    (live, pass): (crate::live::Pass, crate::limits::Pass),
     mut ending: crate::ending::Ending,
     plugins: Option<crate::plugin::reply::Chain>,
 ) -> Response {
@@ -161,7 +162,9 @@ pub(super) fn respond(
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
         // 都算这个请求结束了。
         let _live = live;
-        // 在这家占着的位置也一样（见 `crate::slots`）：回答交完、客户端走掉，才轮到下一个
+        // 这把密钥的通行证（见 `crate::limits`）、在这家占着的位置（见 `crate::slots`）也一样：
+        // 回答交完、客户端走掉，才轮到下一个
+        let _pass = pass;
         let _slot = slot;
         // 结局也一样：流被丢掉的时候，它替流报「客户端取消」。
         let mut ending = ending;

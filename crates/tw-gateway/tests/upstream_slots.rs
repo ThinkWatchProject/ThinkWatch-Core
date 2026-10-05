@@ -1,6 +1,9 @@
 //! 上游的并发上限（`providers[].max_concurrent`）：满着的上游，新的对话当场跳过，留在它
 //! 上面的对话等它空出来，都满着时等先空出来的那一家、等不到回 429 —— 走真实的管线，看
 //! 尝试链里说的和实际去的那一家。
+//!
+//! 每把密钥的上限（`clients[].max_concurrent`）也在这里：它和上游的位置一样，占到回答
+//! 交完为止。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -583,4 +586,33 @@ async fn counting_tokens_does_not_wait_for_a_slot() {
     assert_eq!(chain[0].outcome, AttemptOutcome::Estimated);
     assert_eq!(chain[0].status, Some(404), "该是发给了甲，而不是跳过");
     assert_eq!(chain[0].skipped, None);
+}
+
+/// 一把密钥的上限管的是整个回答：流还在走，它就还占着那一份。以前通行证在响应头交出去
+/// 时就还了，上限 1 的密钥照样能同时跑好几条流
+#[tokio::test]
+async fn a_keys_limit_holds_until_the_streamed_answer_ends() {
+    let (a, b) = (upstream().await, upstream().await);
+    let mut cfg = config(&a, &b, (None, None), 10);
+    cfg.clients[0].max_concurrent = Some(1);
+    let (gw, _state, log) = serve(cfg).await;
+    let held = hold(gw, &log, "占着").await;
+
+    // 同一把密钥的第二个请求：等前一条流走完
+    let r = ask(gw, "第二个", None, &format!("[{}]", user("你好")), false);
+    let waiting = tokio::spawn(async move { r.send().await.unwrap().status() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiting.is_finished(),
+        "前一条流还在走，这把密钥已经到上限了"
+    );
+    assert_eq!(a.hits() + b.hits(), 1, "第二个不该发出去");
+
+    a.release();
+    assert!(held.await.unwrap().contains("message_stop"));
+    let st = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("前一条流走完了，第二个还在等")
+        .unwrap();
+    assert_eq!(st, 200);
 }
