@@ -113,6 +113,26 @@ impl<'de> Deserialize<'de> for Models {
             fn visit_string<E: de::Error>(self, v: String) -> Result<Models, E> {
                 Ok(Models(vec![v]))
             }
+            // 没加引号、YAML 读成数或真假的模型名（`x: 1.5`）：照名字收下，见
+            // `tw_engine::scalar_name`。列表里的、别名的名字本身读的是字符串，本来就是原文
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Models, E> {
+                Ok(Models(vec![v.to_string()]))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Models, E> {
+                Ok(Models(vec![v.to_string()]))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Models, E> {
+                Ok(Models(vec![v.to_string()]))
+            }
+            fn visit_i128<E: de::Error>(self, v: i128) -> Result<Models, E> {
+                Ok(Models(vec![v.to_string()]))
+            }
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<Models, E> {
+                Ok(Models(vec![v.to_string()]))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Models, E> {
+                Ok(Models(vec![tw_engine::scalar_name(v)]))
+            }
             /// `x:` 后面什么都没写：读成空列表，让校验说「这个别名没有模型」，
             /// 比一句「类型不对」好懂
             fn visit_unit<E: de::Error>(self) -> Result<Models, E> {
@@ -190,6 +210,31 @@ a-model: [x]
         );
         let back: Aliases = serde_yaml_ng::from_str(&out).unwrap();
         assert_eq!(back, t);
+    }
+
+    /// 没加引号的数和真假是名字：别名的名字、列表里的模型名读的是原文，单个模型名照名字
+    /// 收下 —— 手写的配置不该因为 YAML 把 `1.5` 读成了数就读不进
+    #[test]
+    fn names_that_look_like_numbers_or_bools_read_as_names() {
+        let t: Aliases = serde_yaml_ng::from_str(
+            "x: 1.5\n2024: 7\ny: true\nz: [1.50, 0x1F, false]\nw: -3\nv: 4.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.0,
+            [
+                alias("x", &["1.5"]),
+                alias("2024", &["7"]),
+                alias("y", &["true"]),
+                alias("z", &["1.50", "0x1F", "false"]),
+                alias("w", &["-3"]),
+                alias("v", &["4.0"]),
+            ]
+        );
+        // 写回去是带引号的字符串，再读进来不变
+        let out = serde_yaml_ng::to_string(&t).unwrap();
+        let back: Aliases = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(back, t, "{out}");
     }
 
     #[test]

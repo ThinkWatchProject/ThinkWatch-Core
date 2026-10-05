@@ -366,14 +366,29 @@ fn sets_alias(rule: &tw_engine::Rule, name: &str) -> bool {
         && rule.set.as_ref().and_then(|s| s.model.as_deref()) == Some(name)
 }
 
-/// 把 `text` 里写着别名 `old` 的地方都改成 `new`（见 [`alias_refs`]）。`cfg` 是 `text`
-/// 解析出来的那一份 —— 下标要对得上。
+/// 别名 `old` 改名成 `renamed`（改名之后的那一项：新名字和它的模型列表）时，把 `text`
+/// 里跟着改的引用改成新名，返回改了哪些。`cfg` 是 `text` 解析出来的那一份 —— 下标要
+/// 对得上。
+///
+/// 一般就是写着旧名的那些（[`alias_refs`]）。**旧名也是改名后列表里的一个模型名时，
+/// 密钥的 `allow` 和规则的 `when.model` 不动**：改名之后旧名说的是那个真模型，而继承
+/// （真名 → 列着它的别名）照样放行、匹配改名后的别名；改成新名反而把直接用真名的客户端
+/// 挡在外面、让条件不再匹配它。`set.model` 照样改：它是要发的名称，不是在匹配，不继承
+/// —— 留着旧名就成了到处发那个真名，原来按别名对到别的名称的那几家就到不了了。
 ///
 /// **只换那一个值**（[`tw_yaml::set`]）：`allow` 里别的项、它们的写法和注释原样不动。
-pub fn rename_alias(text: &str, cfg: &Config, old: &str, new: &str) -> Result<String, EditError> {
+pub fn rename_alias(
+    text: &str,
+    cfg: &Config,
+    old: &str,
+    renamed: &crate::Alias,
+) -> Result<(String, AliasRefs), EditError> {
+    let matchers = !renamed.models.iter().any(|m| m == old);
     let mut out = text.to_string();
-    let to = tw_yaml::Scalar::s(new);
-    for (i, c) in cfg.clients.iter().enumerate() {
+    let mut done = AliasRefs::default();
+    let to = tw_yaml::Scalar::s(&renamed.name);
+    for (i, c) in cfg.clients.iter().enumerate().filter(|_| matchers) {
+        let mut hit = false;
         for (j, _) in c
             .allow
             .iter()
@@ -391,6 +406,10 @@ pub fn rename_alias(text: &str, cfg: &Config, old: &str, new: &str) -> Result<St
                 ],
                 &to,
             )?;
+            hit = true;
+        }
+        if hit {
+            done.keys.push(c.name.clone());
         }
     }
     for (r, route) in cfg.routes.iter().enumerate() {
@@ -405,15 +424,24 @@ pub fn rename_alias(text: &str, cfg: &Config, old: &str, new: &str) -> Result<St
                     Step::key(b),
                 ]
             };
-            if rule.when.model.as_deref() == Some(old) {
+            let mut push = |field| {
+                done.rules.push(AliasRuleRef {
+                    route: route.name.clone(),
+                    rule: rule.name.clone(),
+                    field,
+                })
+            };
+            if matchers && rule.when.model.as_deref() == Some(old) {
                 out = tw_yaml::set(&out, &at("when", "model"), &to)?;
+                push("when.model");
             }
             if sets_alias(rule, old) {
                 out = tw_yaml::set(&out, &at("set", "model"), &to)?;
+                push("set.model");
             }
         }
     }
-    Ok(out)
+    Ok((out, done))
 }
 
 /// 把 `text` 里用着代理 `old` 的上游都改成用 `new`。
@@ -743,16 +771,14 @@ routes:
     #[test]
     fn renaming_an_alias_rewrites_exactly_the_values_that_name_it() {
         let c = cfg(ALIASED);
-        let text = edit::upsert_alias(
-            ALIASED,
-            Some("sonnet"),
-            &crate::Alias {
-                name: "claude-sonnet".into(),
-                models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
-            },
-        )
-        .unwrap();
-        let out = rename_alias(&text, &c, "sonnet", "claude-sonnet").unwrap();
+        let renamed = crate::Alias {
+            name: "claude-sonnet".into(),
+            models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
+        };
+        let text = edit::upsert_alias(ALIASED, Some("sonnet"), &renamed).unwrap();
+        let (out, done) = rename_alias(&text, &c, "sonnet", &renamed).unwrap();
+        // 改了的就是写着旧名的那些
+        assert_eq!(done, alias_refs(&c, "sonnet"));
         assert!(
             out.contains("    allow: [claude-sonnet, 'claude-*', sonnet-x]  # 只给这几个\n"),
             "{out}"
@@ -773,5 +799,63 @@ routes:
         assert!(alias_refs(&after, "sonnet").is_empty());
         assert_eq!(alias_refs(&after, "claude-sonnet").keys, ["c"]);
         assert_eq!(after.aliases[0].name, "claude-sonnet");
+    }
+
+    /// 别名和它的一个模型同名（`claude-sonnet-5: [claude-sonnet-5, …]`），改名之后旧名
+    /// 还在列表里：旧名说的是那个真模型，继承照样放行、匹配改名后的别名。`allow` 和
+    /// `when.model` 改成新名的话，直接用真名的客户端就被挡在外面了 —— 不动，也不报。
+    /// `set.model` 是要发的名称、不继承，照样改
+    #[test]
+    fn renaming_an_alias_that_lists_its_own_name_leaves_the_matching_references() {
+        let text = ALIASED.replace(
+            "  sonnet: [claude-sonnet-5, anthropic/claude-sonnet-5]\n",
+            "  claude-sonnet-5: [claude-sonnet-5, anthropic/claude-sonnet-5]\n",
+        );
+        let text = text.replace("{ model: sonnet }", "{ model: claude-sonnet-5 }");
+        let text = text.replace("[sonnet, 'claude-*'", "[claude-sonnet-5, 'claude-*'");
+        let c = cfg(&text);
+        assert_eq!(alias_refs(&c, "claude-sonnet-5").keys, ["c"]);
+        let renamed = crate::Alias {
+            name: "sonnet".into(),
+            models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
+        };
+        let edited = edit::upsert_alias(&text, Some("claude-sonnet-5"), &renamed).unwrap();
+        let (out, done) = rename_alias(&edited, &c, "claude-sonnet-5", &renamed).unwrap();
+        assert!(done.keys.is_empty(), "{done:?}");
+        assert_eq!(
+            done.rules,
+            [AliasRuleRef {
+                route: "default".into(),
+                rule: "降级".into(),
+                field: "set.model"
+            }]
+        );
+        assert!(
+            out.contains("    allow: [claude-sonnet-5, 'claude-*', sonnet-x]  # 只给这几个\n"),
+            "{out}"
+        );
+        let after = cfg(&out);
+        let rules = &after.routes[0].rules;
+        assert_eq!(rules[0].when.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            rules[0].set.as_ref().unwrap().model.as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(after.aliases[0].name, "sonnet");
+
+        // 改名的同时把旧名从列表里拿掉了：旧名不再指向这个别名，跟着改
+        let narrowed = crate::Alias {
+            name: "sonnet".into(),
+            models: vec!["anthropic/claude-sonnet-5".into()],
+        };
+        let edited = edit::upsert_alias(&text, Some("claude-sonnet-5"), &narrowed).unwrap();
+        let (out, done) = rename_alias(&edited, &c, "claude-sonnet-5", &narrowed).unwrap();
+        assert_eq!(done, alias_refs(&c, "claude-sonnet-5"));
+        let after = cfg(&out);
+        assert_eq!(
+            after.routes[0].rules[0].when.model.as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(after.clients[0].allow.as_ref().unwrap()[0], "sonnet");
     }
 }

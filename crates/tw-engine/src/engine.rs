@@ -305,6 +305,25 @@ impl<'de> Deserialize<'de> for Target {
             fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Target, E> {
                 Ok(Target::Name(v))
             }
+            // 没加引号、YAML 读成数或真假的名字（`to: 2024`）：照名字收下，见 [`scalar_name`]
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Target, E> {
+                Ok(Target::Name(v.to_string()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Target, E> {
+                Ok(Target::Name(v.to_string()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Target, E> {
+                Ok(Target::Name(v.to_string()))
+            }
+            fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<Target, E> {
+                Ok(Target::Name(v.to_string()))
+            }
+            fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<Target, E> {
+                Ok(Target::Name(v.to_string()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Target, E> {
+                Ok(Target::Name(scalar_name(v)))
+            }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Target, A::Error> {
                 // 列表里每一项照 `Pinned` 自己的规矩读：写错的字段名由 serde 说出来
                 Vec::<Pinned>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
@@ -312,6 +331,25 @@ impl<'de> Deserialize<'de> for Target {
             }
         }
         d.deserialize_any(V)
+    }
+}
+
+/// 没加引号、被 YAML 读成了浮点数的名字，写回字符串：`1.5` 还是 `1.5`，`4.0` 还是
+/// `4.0`，`.inf`、`.nan` 照 YAML 的写法。整数和真假就是 `to_string()`。
+///
+/// 名字的字段（规则的 `to`、别名的模型）能写成字符串或列表，读的时候要按类型分支
+/// （`deserialize_any`），YAML 就先把没加引号的 `2024`、`1.5`、`true` 读成了数和真假。
+/// 0.61.0 的 `to` 只是字符串，serde_yaml 给的是原文 —— 不照名字收下的话，一份原来读得
+/// 进的配置就读不进了，网关进安全模式。十进制整数、`true`/`false`、`1.5` 这类和原文一样；
+/// 原文还原不了的写法（`0x1F`、`1.50`、`1e3`、`True`）给的是规范写法，要原样就加引号。
+pub fn scalar_name(v: f64) -> String {
+    if v.is_nan() {
+        ".nan".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 { ".inf" } else { "-.inf" }.to_string()
+    } else {
+        // `{:?}` 给整数值的浮点数留着 `.0`（`4.0`），`{}` 会写成 `4`
+        format!("{v:?}")
     }
 }
 
@@ -2268,6 +2306,45 @@ to:
                 {"provider": "anthropic", "model": "claude-opus-5"},
             ])
         );
+    }
+
+    /// 没加引号、YAML 读成数或真假的名字照名字收下：0.61.0 的 `to` 是字符串，这样的
+    /// 配置原来读得进
+    #[test]
+    fn a_target_written_as_a_number_or_a_bool_is_a_name() {
+        for (yaml, name) in [
+            ("2024", "2024"),
+            ("-7", "-7"),
+            ("1.5", "1.5"),
+            ("4.0", "4.0"),
+            ("true", "true"),
+            // 超出 u64 的整数
+            (
+                "340282366920938463463374607431768211455",
+                "340282366920938463463374607431768211455",
+            ),
+            // 前面是 0 的一串数字 YAML 本来就当字符串
+            ("007", "007"),
+            ("'1.50'", "1.50"),
+        ] {
+            let r = rule(&format!("{{name: r, to: {yaml}}}"));
+            assert_eq!(r.to, Some(Target::Name(name.to_string())), "{yaml}");
+        }
+        // 块式写法也一样
+        let r = rule("name: r\nto: 2024\n");
+        assert_eq!(r.to, Some(Target::Name("2024".into())));
+        // 写回去是带引号的字符串，再读进来不变
+        let yaml = serde_yaml_ng::to_string(&r).unwrap();
+        let back: Rule = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back.to, r.to, "{yaml}");
+        assert_eq!(scalar_name(f64::INFINITY), ".inf");
+        assert_eq!(scalar_name(f64::NEG_INFINITY), "-.inf");
+        assert_eq!(scalar_name(f64::NAN), ".nan");
+        // 对象不是名字：照样说要写什么
+        let e = serde_yaml_ng::from_str::<Rule>("{name: r, to: {a: b}}")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the name of an upstream or a group"), "{e}");
     }
 
     /// 拼错的字段要说出是哪个，而不是「哪一种都不像」

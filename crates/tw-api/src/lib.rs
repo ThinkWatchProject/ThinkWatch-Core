@@ -741,8 +741,9 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 ///
 /// **38 起有模型别名**：配置多了顶层的 `aliases`（一个名称 → 同一个模型在各家上游的名称，
 /// 有序），新端点 `GET /aliases`、`POST /aliases`、`PUT /aliases/{name}`（可改名，密钥范围和
-/// 规则里等于旧名的地方在同一个版本里一起改）、`DELETE /aliases/{name}`、
-/// `POST /aliases/preview`、`GET /aliases/{name}/usage`。`GET /models` 的列表含别名
+/// 规则里等于旧名的地方在同一个版本里一起改；旧名还在列表里时只改 `set.model`）、
+/// `DELETE /aliases/{name}`、`POST /alias-preview`、`GET /aliases/{name}/usage`（预览不在
+/// `/aliases/` 底下，免得盖住一个叫 `preview` 的别名）。`GET /models` 的列表含别名
 /// （[`KnownModel::alias`]；和真模型同名时只有别名那一项），真模型带着列出它的别名
 /// （[`KnownModel::aliases`]），上游模型清单的每一行也带（[`ModelRow::aliases`]）。规则的
 /// 去向可以是指定模型：[`RuleView::to`]、[`RuleInput::to`] 是 [`RuleTarget`]，字符串或
@@ -3004,7 +3005,9 @@ pub struct AliasView {
     /// 按书写顺序
     pub models: Vec<AliasModel>,
     /// 每家能服务它的上游实际发出的名称，按配置里的顺序。停用的上游不在里面；没有清单
-    /// 的上游当作能服务（取列表里第一个在它启用范围里的名称）
+    /// 的上游当作能服务（取列表里第一个在它启用范围里的名称）。**和网关一致**：有上游
+    /// 有清单、而有清单的上游谁都不提供列表里的名称时是空的 —— 请求在准入就被拒了，
+    /// 没有清单的上游也轮不到
     pub served_by: Vec<PinnedModel>,
     /// 清单里有一个和别名同名的真模型、而别名的列表里没有这个名称的上游：**这个名称
     /// 不会再发给它们**（别名优先）
@@ -3045,7 +3048,7 @@ pub struct AliasesView {
     pub suggestions: Vec<AliasSuggestion>,
 }
 
-/// 预览一个还没保存的别名（`POST /aliases/preview`）。
+/// 预览一个还没保存的别名（`POST /alias-preview`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AliasPreviewRequest {
@@ -3063,7 +3066,8 @@ pub struct AliasPreview {
     pub problems: Vec<Msg>,
     /// 存了之后每家上游发出的名称（同 [`AliasView::served_by`]）
     pub served_by: Vec<PinnedModel>,
-    /// 列表里没有哪家上游的清单里有的名称
+    /// 列表里没有哪家上游的清单里有的名称。准入会拒掉这个别名时（`served_by` 是空的）
+    /// 是列表里的全部名称
     pub unserved: Vec<String>,
     /// 同 [`AliasView::shadows`]
     pub shadows: Vec<String>,
@@ -3101,7 +3105,11 @@ pub struct AliasUsage {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AliasWritten {
     pub version: String,
-    /// 改名时在同一个版本里一起改掉的引用。没改名时是空的；`requests_24h` 总是 0
+    /// 改名时在同一个版本里一起改掉的引用。没改名时是空的；`requests_24h` 总是 0。
+    ///
+    /// **旧名也是改名后列表里的一个模型名时**，密钥的 `allow` 和规则的 `when.model`
+    /// 不改，也不在这里：改名之后旧名说的是那个真模型，写真名的放行和条件照样继承到
+    /// 改名后的别名。`set.model` 照样改（它是要发的名称，不继承）
     pub renamed_in: AliasUsage,
 }
 

@@ -284,6 +284,33 @@ mod tests {
         assert!(r.line.is_some(), "语法错必须给行号：{r:?}");
     }
 
+    /// 名字没加引号、YAML 读成了数：0.61.0 读得进（`to` 是字符串），现在也要读得进 ——
+    /// 读不进就是安全模式。上游叫 `2024`、规则转发给它，别名的模型叫 `1.5`
+    #[test]
+    fn names_written_as_bare_numbers_still_load() {
+        let text = format!(
+            "{GOOD}providers:
+  - name: 2024
+    base_url: https://a.example
+    key: sk
+aliases:
+  x: 1.5
+routes:
+  - name: default
+    rules:
+      - name: r
+        to: 2024
+"
+        );
+        let cfg = try_parse(&text).unwrap_or_else(|e| panic!("{e:?}\n{text}"));
+        assert_eq!(cfg.providers[0].name, "2024");
+        assert_eq!(cfg.aliases[0].models, ["1.5"]);
+        assert_eq!(
+            cfg.routes[0].rules[0].to,
+            Some(tw_engine::Target::Name("2024".into()))
+        );
+    }
+
     #[test]
     fn a_config_without_providers_still_loads() {
         // 零 provider 是首次运行的正常状态，而逼用户写一行 `providers: []`
