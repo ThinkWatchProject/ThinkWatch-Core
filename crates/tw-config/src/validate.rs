@@ -778,6 +778,37 @@ mod tests {
         assert!(e.to_string().contains("__all__"), "{e}");
     }
 
+    /// 手写的配置里一个组把同一家写了几遍：加载时就拒绝。控制面保存时本来就拦着，
+    /// 拦不着的是手改的文件 —— 那时候选不去重，故障转移会把同一家再试几遍
+    #[test]
+    fn a_group_that_lists_an_upstream_twice_is_refused_at_load_time() {
+        let text = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: a
+    base_url: https://a.example
+    key: sk-a
+  - name: b
+    base_url: https://b.example
+    key: sk-b
+groups:
+  - name: pool
+    type: load-balance
+    providers: [a, a, a, b]
+";
+        let m = crate::try_parse(text).unwrap_err().msg();
+        assert_eq!(m.code, "engine.group_upstream_twice", "{m:?}");
+        assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "a"));
+        // 每家写一次就收下
+        let once = text.replace("[a, a, a, b]", "[a, b]");
+        assert!(crate::try_parse(&once).is_ok(), "{once}");
+    }
+
     #[test]
     fn error_messages_say_what_to_do_next() {
         // 错误信息是降低使用难度最有效的杠杆。判据不是「说清

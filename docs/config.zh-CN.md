@@ -748,7 +748,7 @@ aliases:
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 策略组的名字，不能重复，也不能和上游同名。 |
 | `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。 |
-| `providers` | 字符串列表 | **必填** | 成员上游的名字。 |
+| `providers` | 字符串列表 | **必填** | 成员上游的名字。同一个上游在一个策略组中只出现一次。 |
 | `selected` | 字符串 | — | `select` 类型选中的成员。 |
 <!-- /generated -->
 

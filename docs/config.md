@@ -953,7 +953,7 @@ group with `to`.
 |---|---|---|---|
 | `name` | string | **required** | Name of the group; unique, and not the name of an upstream. |
 | `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
-| `providers` | list of strings | **required** | Member upstreams, by name. |
+| `providers` | list of strings | **required** | Member upstreams, by name. Each upstream appears once in a group. |
 | `selected` | string | — | For `select`: the chosen member. |
 <!-- /generated -->
 
