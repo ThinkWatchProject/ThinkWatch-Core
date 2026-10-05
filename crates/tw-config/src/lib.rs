@@ -15,6 +15,7 @@ pub mod edit;
 mod failover;
 pub mod history;
 mod init;
+pub mod model_specs;
 pub mod nics;
 pub mod plugins;
 pub mod private_dir;
@@ -34,6 +35,7 @@ mod wire;
 pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
+pub use model_specs::{ModelLimits, ModelSpec, Sourced, SpecSource};
 pub use plugins::Plugin;
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
@@ -186,6 +188,7 @@ impl Default for Provider {
             models_only: None,
             billing: Billing::PerToken,
             pricing: None,
+            model_specs: std::collections::BTreeMap::new(),
             disabled: false,
         }
     }
@@ -815,6 +818,10 @@ pub struct Provider {
     /// 按哪张价目表计价。不写就是默认价目表。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
+    /// 手写的模型规格：模型 ID（完全相等，没有通配）→ 上下文窗口、输出上限。写了就
+    /// 优先于价目表，见 [`model_specs`]。价目表不认识的中转站模型靠它说出上下文窗口
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_specs: std::collections::BTreeMap<String, ModelSpec>,
     /// 停用。**配置原样留着**：不参与路由，它的模型也不出现在
     /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
     #[serde(default, skip_serializing_if = "is_default")]
@@ -1181,7 +1188,7 @@ pub use security::{
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
-pub use validate::{check_aliases, validate};
+pub use validate::{check_aliases, check_model_spec, validate};
 
 pub fn default_path() -> PathBuf {
     tw_api::data::dir().join("config.yaml")

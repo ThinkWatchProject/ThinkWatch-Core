@@ -67,6 +67,10 @@ config.edit.unwritable
 config.empty_key
 config.empty_models_only
 config.failover_range
+config.model_spec_blank_model
+config.model_spec_empty
+config.model_spec_wildcard
+config.model_spec_zero
 config.name_collision
 config.no_clients
 config.plugin.bad_id

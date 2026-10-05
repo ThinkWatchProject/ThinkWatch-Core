@@ -344,6 +344,7 @@ Upstreams: the APIs requests are forwarded to.
 | `models_only` | list of strings | — | Use only these of the upstream's models, as ids or globs. Others are not listed and are not routed here. Unset: all of them. Empty is refused; use `disabled`. |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`: cost is usage times the price in the upstream's price sheet, subscription accounts included. `free`: cost is recorded as 0. |
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
+| `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 <!-- /generated -->
 
@@ -469,6 +470,40 @@ needs `bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles`;
 without them requests are still forwarded, and `models` can list the models by
 hand. For a VPC endpoint or a proxy, write its address in `base_url` and the
 region in `aws.region`; the model list is asked of that address too.
+
+#### `providers[].model_specs`
+
+A model's context window and output limit come from the price table. A relay's
+own models are often missing from it, and now and then it is wrong. Write the
+numbers here, for this upstream and by the exact id in its model list. A value
+written here takes precedence over the price table; one left out still comes
+from it. At least one of the two is written, and neither can be 0.
+
+The same numbers are used everywhere: in `/v1/models` for every client format,
+for an alias this upstream serves, when the gateway judges whether a
+conversation still fits the model it is on, and as the output limit of a
+request converted to Anthropic that does not set one. When several upstreams
+offer the same model, `/v1/models` describes it by the first of them in
+`providers`.
+
+<!-- generated: table providers[].model_specs.* -->
+<a id="cfg-providers-model_specs"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `context_window` | integer | — | Context window: the most tokens a request can take in. Unset: the price table's. |
+| `max_output_tokens` | integer | — | The most tokens an answer can have. Unset: the price table's. |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com/v1
+    protocol: openai-chat
+    model_specs:
+      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }
+      claude-sonnet-4-5: { context_window: 1000000 }
+```
 
 ### `proxies`
 

@@ -166,6 +166,16 @@ slug_enum! {
 }
 
 slug_enum! {
+    /// 上下文窗口、输出上限这样的模型规格从哪儿来。
+    pub enum SpecSource {
+        /// 价目表
+        PriceTable = "price_table",
+        /// 这一家上游手写的（配置里的 `model_specs`），优先于价目表
+        Manual = "manual",
+    }
+}
+
+slug_enum! {
     /// 一个上游现在能不能进候选链。
     pub enum Health {
         Ok = "ok",
@@ -2895,9 +2905,18 @@ pub struct ModelRow {
     pub id: String,
     /// 在启用范围里
     pub enabled: bool,
-    /// 上下文窗口，来自默认价目表
+    /// 上下文窗口：这一家手写的（`model_specs`），没写时来自价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// `context_window` 从哪儿来。不知道上下文窗口时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_source: Option<SpecSource>,
+    /// 一次最多输出多少 token：这一家手写的，没写时来自价目表
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// `max_output_tokens` 从哪儿来。不知道输出上限时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<SpecSource>,
     /// 按这个上游选的价目表查到的价格。空 = 无法计价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<PriceFields>,
@@ -2956,6 +2975,25 @@ pub enum OAuthChange {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderSave {
     pub provider: ProviderInput,
+    /// 你基于哪一版。**对不上就是 409**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 设一家上游的一个模型的规格（`PUT /provider-model-spec`）：价目表不认识这个模型、
+/// 或者写错了时手写。**两项都空就是删掉这一项**，回到价目表。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ModelSpecSave {
+    pub provider: String,
+    /// 模型 ID，和这家的清单里写的完全相等。去掉首尾空白
+    pub model: String,
+    /// 上下文窗口（token）。空 = 用价目表的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// 输出上限（token）。空 = 用价目表的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     /// 你基于哪一版。**对不上就是 409**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -3059,7 +3097,7 @@ pub struct AliasView {
     /// 清单里有一个和别名同名的真模型、而别名的列表里没有这个名称的上游：**这个名称
     /// 不会再发给它们**（别名优先）
     pub shadows: Vec<String>,
-    /// 上下文窗口，来自默认价目表：第一家能服务它的上游发出的那个模型的
+    /// 上下文窗口：第一家能服务它的上游发出的那个模型的，这一家手写的优先于价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// 最近 24 小时里客户端用这个名称发来的请求

@@ -356,8 +356,8 @@ fn conversation(
 /// 输入超出了这个决定所选模型的上下文窗口：这一轮沿用的决定要重新求值。
 ///
 /// 按候选里最小的那个窗口算，留 5% 的余量（输入是估的）。**知道窗口的才算**：价目表
-/// 里没写的模型，说不出它装不装得下，照常沿用。窗口按每一家发出去的名字查：别名在各家
-/// 是各家的名字（见 [`crate::sent`]）。
+/// 里没写、那一家也没手写（`model_specs`）的模型，说不出它装不装得下，照常沿用。窗口按
+/// 每一家发出去的名字查：别名在各家是各家的名字（见 [`crate::sent`]）。
 fn outgrown(
     state: &AppState,
     rt: &Runtime,
@@ -380,9 +380,9 @@ fn outgrown(
     )
     .iter()
     .filter_map(|s| {
-        book.resolve_for(&s.provider, s.model.as_deref().ok()?)?
-            .price
-            .max_input_tokens
+        rt.config
+            .model_limits(&book, &s.provider, s.model.as_deref().ok()?)
+            .context_window()
     })
     .min()
     .is_some_and(|limit| facts.input_tokens.saturating_mul(100) >= limit.saturating_mul(95))

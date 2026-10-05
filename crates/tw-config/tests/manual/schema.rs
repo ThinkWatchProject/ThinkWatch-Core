@@ -562,12 +562,46 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "model_specs",
+                    Kind::ObjMap(t("model id", "模型 ID"), "providers[].model_specs.*"),
+                    Def::Is("{}"),
+                    t(
+                        "Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong.",
+                        "手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。",
+                    ),
+                ),
+                row(
                     "disabled",
                     Kind::Bool,
                     Def::Is("false"),
                     t(
                         "Take the upstream out of routing and out of the model list, and keep its configuration.",
                         "不参与路由，模型也不出现在模型列表里；配置原样保留。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "providers[].model_specs.*",
+            // 两项都可选，至少写一项由校验管
+            ty: checked!(ModelSpec, "{}"),
+            rows: vec![
+                row(
+                    "context_window",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "Context window: the most tokens a request can take in. Unset: the price table's.",
+                        "上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。",
+                    ),
+                ),
+                row(
+                    "max_output_tokens",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "The most tokens an answer can have. Unset: the price table's.",
+                        "一次回答最多输出多少 token。不写：取价目表的。",
                     ),
                 ),
             ],

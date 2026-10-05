@@ -253,6 +253,7 @@ clients:
 | `models_only` | 字符串列表 | — | 只使用这家的这些模型，写 ID 或通配。范围外的模型不出现在模型列表里，也不会路由到这家。不写：全部。写空列表会被拒绝，暂停使用请用 `disabled`。 |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`：费用为用量乘以所选价目表中的单价，订阅账号同样如此。`free`：费用记为 0。 |
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
+| `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 <!-- /generated -->
 
@@ -346,6 +347,31 @@ providers:
 ```
 
 请求转换为 Converse 格式。模型清单取自所在区域的控制面：可按需调用的基础模型、AWS 预设的推理配置（`us.anthropic.claude-…`），以及账号自己创建的应用推理配置（按调用时使用的 ARN 列出）。列出清单需要 `bedrock:ListFoundationModels` 和 `bedrock:ListInferenceProfiles` 权限；没有这两项权限时请求照常转发，可以在 `models` 中手动列出模型。使用 VPC 端点或代理时，在 `base_url` 中写它的地址，在 `aws.region` 中写区域；模型清单也向该地址获取。
+
+#### `providers[].model_specs`
+
+模型的上下文窗口和输出上限取自价目表。中转站自有的模型常常不在价目表里，价目表偶尔也会写错。这时在这里按这家上游、按它模型清单里的 ID（完全匹配）手写。写了的一项优先于价目表，没写的一项仍取价目表。两项至少写一项，都不能是 0。
+
+各处用的是同一个数：各种客户端格式的 `/v1/models`、由这家上游服务的别名、网关判断一段对话是否还装得下当前模型，以及请求转换为 Anthropic 格式且没有写输出上限时补上的值。同一个模型由几家上游提供时，`/v1/models` 按 `providers` 中排在最前的那一家给出。
+
+<!-- generated: table providers[].model_specs.* -->
+<a id="cfg-providers-model_specs"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `context_window` | 整数 | — | 上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。 |
+| `max_output_tokens` | 整数 | — | 一次回答最多输出多少 token。不写：取价目表的。 |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com/v1
+    protocol: openai-chat
+    model_specs:
+      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }
+      claude-sonnet-4-5: { context_window: 1000000 }
+```
 
 ### `proxies`
 

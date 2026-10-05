@@ -1157,6 +1157,7 @@ fn prepare(
                 official: tw_dialect::official::is_official_host(&provider.base_url),
                 default_max_tokens: crate::translate::default_max_tokens(
                     &state.pricing.load(),
+                    provider,
                     &d.request.model,
                 ),
             });

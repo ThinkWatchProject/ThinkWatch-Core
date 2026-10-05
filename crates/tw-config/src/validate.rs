@@ -101,6 +101,19 @@ pub enum ValidationError {
     AliasChained { alias: String, model: String },
     #[error("{}", self.msg())]
     AliasOnlyItself { alias: String },
+    #[error("{}", self.msg())]
+    ModelSpecBlankModel { upstream: String },
+    #[error("{}", self.msg())]
+    ModelSpecWildcard { upstream: String, model: String },
+    #[error("{}", self.msg())]
+    ModelSpecEmpty { upstream: String, model: String },
+    /// `field` 是字段名本身（`context_window`、`max_output_tokens`），不翻
+    #[error("{}", self.msg())]
+    ModelSpecZero {
+        upstream: String,
+        model: String,
+        field: &'static str,
+    },
 }
 
 impl ValidationError {
@@ -295,6 +308,29 @@ impl ValidationError {
                 "alias `{alias}` lists only itself, so it changes nothing. List the names the \
                  upstreams use, or remove the alias"
             ),
+            ModelSpecBlankModel { upstream } => msg!(
+                "config.model_spec_blank_model", upstream = upstream =>
+                "upstream `{upstream}` has a model spec (model_specs) for an empty model id"
+            ),
+            ModelSpecWildcard { upstream, model } => msg!(
+                "config.model_spec_wildcard", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` contains * or ?. A model spec \
+                 is for one exact model id"
+            ),
+            ModelSpecEmpty { upstream, model } => msg!(
+                "config.model_spec_empty", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` sets neither context_window \
+                 nor max_output_tokens. Set at least one, or remove it"
+            ),
+            ModelSpecZero {
+                upstream,
+                model,
+                field,
+            } => msg!(
+                "config.model_spec_zero", upstream = upstream, model = model, field = field =>
+                "the model spec `{model}` of upstream `{upstream}` has {field}: 0; it has to be a \
+                 number of tokens above 0. Leave it out to use the price table"
+            ),
         }
     }
 }
@@ -351,6 +387,9 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                     name: p.name.clone(),
                 });
             }
+        }
+        for (model, spec) in &p.model_specs {
+            check_model_spec(&p.name, model, Some(spec))?;
         }
     }
 
@@ -566,6 +605,49 @@ pub fn check_aliases(aliases: &crate::Aliases) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// 一家上游的一项手写模型规格写得对不对，和整份配置的校验是同一套（控制面保存一项
+/// 之前也用它）。`spec` 是 `None` 时只查模型 ID：界面要删掉这一项。**模型在不在这家的
+/// 清单里不查**：清单是运行时问来的。
+pub fn check_model_spec(
+    upstream: &str,
+    model: &str,
+    spec: Option<&crate::ModelSpec>,
+) -> Result<(), ValidationError> {
+    if model.trim().is_empty() {
+        return Err(ValidationError::ModelSpecBlankModel {
+            upstream: upstream.to_string(),
+        });
+    }
+    let named = || (upstream.to_string(), model.to_string());
+    // 没有通配：`glm-*` 写在这里，读的人会以为一批模型都按它算
+    if model.contains(['*', '?']) {
+        let (upstream, model) = named();
+        return Err(ValidationError::ModelSpecWildcard { upstream, model });
+    }
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    if spec.is_empty() {
+        let (upstream, model) = named();
+        return Err(ValidationError::ModelSpecEmpty { upstream, model });
+    }
+    // 0 不是「不知道」：上下文窗口是 0 的模型什么都装不下，输出上限是 0 的什么都答不出
+    for (field, v) in [
+        ("context_window", spec.context_window),
+        ("max_output_tokens", spec.max_output_tokens),
+    ] {
+        if v == Some(0) {
+            let (upstream, model) = named();
+            return Err(ValidationError::ModelSpecZero {
+                upstream,
+                model,
+                field,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 最小的 CIDR 形状校验。**真正的匹配逻辑在 tw-gateway::access** ——
 /// 这里只是不想让 tw-config 依赖数据面，而「这条写法对不对」是配置层
 /// 该回答的问题。
@@ -654,6 +736,56 @@ mod tests {
     #[test]
     fn a_valid_minimal_config_passes() {
         assert!(validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")])).is_ok());
+    }
+
+    #[test]
+    fn model_specs_name_one_exact_model_and_set_a_positive_number() {
+        let parse = |specs: &str| {
+            crate::try_parse(&format!(
+                "version: 1\nlisten:\n  control:\n    key: {}\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: relay\n    base_url: https://relay.example.com/v1\n    model_specs:\n{specs}",
+                "c0".repeat(32)
+            ))
+        };
+        let ok = parse(
+            "      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }\n      \"us.anthropic.claude-fable-5-v1:0\": { max_output_tokens: 32000 }\n",
+        )
+        .unwrap();
+        let specs = &ok.providers[0].model_specs;
+        assert_eq!(specs["glm-5-air"].context_window, Some(128_000));
+        assert_eq!(
+            specs["us.anthropic.claude-fable-5-v1:0"].max_output_tokens,
+            Some(32_000)
+        );
+        for (specs, code) in [
+            (
+                "      \"\": { context_window: 1000 }\n",
+                "config.model_spec_blank_model",
+            ),
+            (
+                "      glm-*: { context_window: 1000 }\n",
+                "config.model_spec_wildcard",
+            ),
+            ("      glm-5-air: {}\n", "config.model_spec_empty"),
+            (
+                "      glm-5-air: { context_window: 0 }\n",
+                "config.model_spec_zero",
+            ),
+            (
+                "      glm-5-air: { context_window: 1000, max_output_tokens: 0 }\n",
+                "config.model_spec_zero",
+            ),
+        ] {
+            let m = parse(specs).unwrap_err().msg();
+            assert_eq!(m.code, code, "{specs}: {m:?}");
+        }
+        let m = parse("      glm-5-air: { max_output_tokens: 0 }\n")
+            .unwrap_err()
+            .msg();
+        assert_eq!(m.arg("field"), "max_output_tokens");
+        assert_eq!(m.arg("upstream"), "relay");
+        // 字段名写错、写成负数，serde 自己说
+        assert!(parse("      glm-5-air: { context: 1000 }\n").is_err());
+        assert!(parse("      glm-5-air: { context_window: -1 }\n").is_err());
     }
 
     #[test]
@@ -1373,6 +1505,22 @@ mod msg_codes {
                 model: "b".into(),
             },
             AliasOnlyItself { alias: "a".into() },
+            ModelSpecBlankModel {
+                upstream: "a".into(),
+            },
+            ModelSpecWildcard {
+                upstream: "a".into(),
+                model: "m*".into(),
+            },
+            ModelSpecEmpty {
+                upstream: "a".into(),
+                model: "m".into(),
+            },
+            ModelSpecZero {
+                upstream: "a".into(),
+                model: "m".into(),
+                field: "context_window",
+            },
         ];
         check(
             "config.",
