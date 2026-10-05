@@ -557,6 +557,8 @@ pub enum RouteError {
     #[error("{}", self.msg())]
     GroupUpstreamTwice { group: String, provider: String },
     #[error("{}", self.msg())]
+    GroupUnknownUpstream { group: String, provider: String },
+    #[error("{}", self.msg())]
     DuplicateRoute(String),
     #[error("{}", self.msg())]
     UnknownDefaultRoute(String),
@@ -612,6 +614,11 @@ impl RouteError {
                 "engine.group_upstream_twice", group = group, upstream = provider =>
                 "group `{group}` lists upstream `{upstream}` more than once. Each upstream appears \
                  once in a group"
+            ),
+            RouteError::GroupUnknownUpstream { group, provider } => msg!(
+                "engine.group_unknown_upstream", group = group, upstream = provider =>
+                "group `{group}` lists `{upstream}`, which is not an upstream. A group's members are \
+                 upstreams, by name"
             ),
             RouteError::DuplicateRoute(route) => msg!(
                 "engine.duplicate_route", route = route =>
@@ -888,6 +895,14 @@ impl Engine {
             // （`control.group.upstream_twice`），手写的配置在这里拦
             let mut members = std::collections::HashSet::new();
             for p in &g.providers {
+                // 不认识的名字（拼错了、或者写了另一个组）：候选里它对不上任何上游，
+                // 这一位就静默地没了。控制面保存时拦着（`control.group.no_such_upstream`）
+                if !self.providers.contains(p) {
+                    return Err(RouteError::GroupUnknownUpstream {
+                        group: g.name.clone(),
+                        provider: p.clone(),
+                    });
+                }
                 if !members.insert(p.as_str()) {
                     return Err(RouteError::GroupUpstreamTwice {
                         group: g.name.clone(),
@@ -2288,6 +2303,30 @@ mod builtin_tests {
             Err(RouteError::GroupUpstreamTwice { .. })
         ));
     }
+
+    /// 组里写了一个不是上游的名字（拼错了，或者写了另一个组）：拒绝，说出是哪个组、
+    /// 哪个名字。不拦的话候选里对不上它，组静默地少了一位
+    #[test]
+    fn a_group_member_that_is_not_an_upstream_is_rejected() {
+        let g: Group =
+            serde_yaml_ng::from_str("name: pool\ntype: fallback\nproviders: [a, typo]\n").unwrap();
+        let e = Engine::with_default_rules(
+            vec!["a".into(), "b".into()],
+            vec![g],
+            vec![rule("兜底", "{}", "pool")],
+        );
+        let err = e.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RouteError::GroupUnknownUpstream {
+                group: "pool".into(),
+                provider: "typo".into(),
+            }
+        );
+        let m = err.msg();
+        assert_eq!(m.code, "engine.group_unknown_upstream");
+        assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "typo"));
+    }
 }
 
 #[cfg(test)]
@@ -2734,6 +2773,10 @@ mod msg_codes {
             RouteError::EmptyGroup("g".into()),
             RouteError::DuplicateGroup("g".into()),
             RouteError::GroupUpstreamTwice {
+                group: "g".into(),
+                provider: "p".into(),
+            },
+            RouteError::GroupUnknownUpstream {
                 group: "g".into(),
                 provider: "p".into(),
             },

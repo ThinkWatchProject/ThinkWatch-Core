@@ -781,7 +781,7 @@ mod tests {
     /// 手写的配置里一个组把同一家写了几遍：加载时就拒绝。控制面保存时本来就拦着，
     /// 拦不着的是手改的文件 —— 那时候选不去重，故障转移会把同一家再试几遍
     #[test]
-    fn a_group_that_lists_an_upstream_twice_is_refused_at_load_time() {
+    fn a_group_member_written_twice_or_misspelled_is_refused_at_load_time() {
         let text = "version: 1
 listen:
   control:
@@ -807,6 +807,11 @@ groups:
         // 每家写一次就收下
         let once = text.replace("[a, a, a, b]", "[a, b]");
         assert!(crate::try_parse(&once).is_ok(), "{once}");
+        // 写了一个不是上游的名字也拒绝
+        let typo = text.replace("[a, a, a, b]", "[a, typo]");
+        let m = crate::try_parse(&typo).unwrap_err().msg();
+        assert_eq!(m.code, "engine.group_unknown_upstream", "{m:?}");
+        assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "typo"));
     }
 
     #[test]
