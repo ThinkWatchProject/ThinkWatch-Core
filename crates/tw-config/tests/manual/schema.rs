@@ -1505,8 +1505,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order`, `inspect`, `rewrite` and `confirmed` are taken by the control plane.",
-                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。`order`、`inspect`、`rewrite` 和 `confirmed` 被控制面占用。",
+                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique.",
+                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。",
                     ),
                 ),
                 row(
