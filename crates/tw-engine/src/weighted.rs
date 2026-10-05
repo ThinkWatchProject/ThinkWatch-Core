@@ -177,18 +177,23 @@ pub(crate) mod members {
 /// 越满越被记空账，拿到的比它的权重少。停着的、满着的加起来是全部时都算 —— 那时网关
 /// 照样一家家试（fail-open）、等先空出来的那一家，排头的还是按权重来。
 fn round<'a>(g: &Group, members: &'a [String], f: &Facts) -> Vec<(&'a str, i64)> {
-    let factors = balance_factors(g.balance_by, members, f);
-    let all: Vec<(&'a str, i64)> = members
-        .iter()
-        .zip(factors)
-        .map(|(m, x)| (m.as_str(), effective(g.weight(m), x)))
-        .collect();
+    let all = everyone(g, members, f);
     let up: Vec<(&'a str, i64)> = all
         .iter()
         .copied()
         .filter(|(m, _)| !f.paused.contains(*m) && !f.busy.contains(*m))
         .collect();
     if up.is_empty() { all } else { up }
+}
+
+/// 全部候选和它们的有效权重，停着的、满着的也在里面
+fn everyone<'a>(g: &Group, members: &'a [String], f: &Facts) -> Vec<(&'a str, i64)> {
+    let factors = balance_factors(g.balance_by, members, f);
+    members
+        .iter()
+        .zip(factors)
+        .map(|(m, x)| (m.as_str(), effective(g.weight(m), x)))
+        .collect()
 }
 
 /// 下一个排头：当前权重加上自己的有效权重，最大的那个；一样大取组里靠前的。
@@ -211,13 +216,18 @@ pub fn lead<'a>(g: &Group, members: &'a [String], f: &Facts) -> Option<&'a str> 
 ///
 /// `leader` 是**会话粘性之后实际排头的那一家**，不一定是 [`lead`] 挑的那个：一段对话
 /// 留在了上次回答它的那一家，这一次就记在那一家头上，之后的新对话把差的补回去。
+/// **它满着、停着也记**：满着、停着的不参加给新对话挑排头，可粘性留下的那一家是真要答的
+/// （满着的等到空位再答，见 `tw_gateway::slots`）—— 这一次它带着自己的权重加进这一轮。
 /// `members` 和 `f` 要和排序时的一样（同一轮；系数也就是排序时的那一份）。`leader`
-/// 不在这一轮里时什么都不记。
+/// 不在候选里时什么都不记。
 pub fn advance(g: &Group, members: &[String], f: &Facts, leader: &str) -> HashMap<String, i64> {
-    let round = round(g, members, f);
     let mut out = f.current_weight.clone();
-    if !round.iter().any(|(m, _)| *m == leader) {
+    let Some(&led) = everyone(g, members, f).iter().find(|(m, _)| *m == leader) else {
         return out;
+    };
+    let mut round = round(g, members, f);
+    if !round.iter().any(|(m, _)| *m == leader) {
+        round.push(led);
     }
     let total: i64 = round.iter().map(|(_, w)| w).sum();
     for (m, w) in &round {
@@ -385,6 +395,35 @@ mod tests {
         // 不在这一轮里的名字什么都不记
         let before = f.current_weight.clone();
         assert_eq!(advance(&g, &members, &f, "别家"), before);
+    }
+
+    /// 粘性留下的那一家此刻满着（或者停着）：它不参加给新对话挑排头，但这段对话真的由它答 ——
+    /// 等到空位之后答的 —— 账照样记在它头上。不记的话，它答得越多越满、越满越不记账，拿到的
+    /// 比它的权重多；记了，之后的新对话先去别家，把差的补回来
+    #[test]
+    fn a_member_that_leads_by_stickiness_is_charged_even_when_it_sits_out() {
+        let g = group(&[("甲", 1), ("乙", 1)]);
+        let members = names(&g);
+        for sitting_out in ["busy", "paused"] {
+            let mut f = Facts::default();
+            let set: std::collections::HashSet<String> = ["甲".to_string()].into_iter().collect();
+            match sitting_out {
+                "busy" => f.busy = set,
+                _ => f.paused = set,
+            }
+            // 新对话这一轮轮不到甲
+            assert_eq!(lead(&g, &members, &f), Some("乙"));
+            // 一段对话留在了甲：这一轮甲、乙都加上自己的，甲再减去两家之和
+            let next = advance(&g, &members, &f, "甲");
+            assert_eq!(next.get("甲"), Some(&-1000), "{sitting_out}: {next:?}");
+            assert_eq!(next.get("乙"), Some(&1000), "{sitting_out}: {next:?}");
+            // 甲回来之后，下一个新对话先去乙，然后接着挨个轮
+            f = Facts {
+                current_weight: next,
+                ..Default::default()
+            };
+            assert_eq!(run(&g, &members, &mut f, 4), ["乙", "甲", "乙", "甲"]);
+        }
     }
 
     /// 权重 1 写回去是名字，写了别的权重写回去是映射；数、真假照名字读
