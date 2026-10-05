@@ -580,7 +580,7 @@ async fn a_preview_says_where_a_draft_would_go_and_suggests_the_same_model_elsew
     let (st, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "opus", "models": ["claude-opus-4-1-20250805", "nope-model"] } }),
     )
     .await;
@@ -609,19 +609,13 @@ async fn a_preview_says_where_a_draft_would_go_and_suggests_the_same_model_elsew
 async fn editing_an_alias_is_not_a_duplicate_of_itself() {
     let b = bed(BASE, None);
     let draft = json!({ "name": "sonnet", "models": ["claude-sonnet-4-5"] });
-    let (_, v) = call(
-        &b.app,
-        "POST",
-        "/aliases/preview",
-        json!({ "alias": draft }),
-    )
-    .await;
+    let (_, v) = call(&b.app, "POST", "/alias-preview", json!({ "alias": draft })).await;
     assert_eq!(codes(&v), ["config.alias_duplicate"], "{v}");
 
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": draft, "original": "sonnet" }),
     )
     .await;
@@ -639,7 +633,7 @@ async fn editing_an_alias_is_not_a_duplicate_of_itself() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "sonnet-4.5", "models": ["claude-sonnet-4-5"] }, "original": "sonnet" }),
     )
     .await;
@@ -648,7 +642,7 @@ async fn editing_an_alias_is_not_a_duplicate_of_itself() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "sonnet", "models": ["sonnet", "claude-sonnet-4-5"] }, "original": "sonnet" }),
     )
     .await;
@@ -670,7 +664,7 @@ async fn a_preview_lists_what_would_stop_the_save() {
             None => json!({ "alias": alias }),
         };
         async move {
-            let (st, v) = call(&app, "POST", "/aliases/preview", body).await;
+            let (st, v) = call(&app, "POST", "/alias-preview", body).await;
             assert_eq!(st, StatusCode::OK, "{v}");
             codes(&v)
         }
@@ -699,7 +693,7 @@ async fn a_preview_lists_what_would_stop_the_save() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "", "models": ["claude-opus-4-1-20250805"] } }),
     )
     .await;

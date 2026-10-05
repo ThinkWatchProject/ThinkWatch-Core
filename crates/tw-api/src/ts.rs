@@ -384,7 +384,7 @@ mod tests {
         for line in [
             "  CreatePlugin: { req: PluginCreate; res: ConfigWritten };",
             "  CreatePluginConfirmed: { req: PluginCreate; res: ConfigWritten };",
-            "  CreatePluginConfirmed: { method: \"POST\", path: \"/plugins/confirmed\", params: [], format: \"json\" },",
+            "  CreatePluginConfirmed: { method: \"POST\", path: \"/plugin-confirmed\", params: [], format: \"json\" },",
             "  SavePlugin: { req: PluginSave; res: ConfigWritten };",
             "  SavePluginConfirmed: { req: PluginSave; res: ConfigWritten };",
             "  SavePluginConfirmed: { method: \"PUT\", path: \"/plugins/{id}/confirmed\", params: [\"id\"], format: \"json\" },",

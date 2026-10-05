@@ -57,13 +57,12 @@ mod tests {
         assert_eq!(ids, ["reply-language", "wsl-paths"]);
     }
 
-    /// 每个 id 都装得进配置：写法对、不是控制面占用的词、不重复
+    /// 每个 id 都装得进配置：写法对、不重复
     #[test]
     fn every_id_can_be_a_plugin_id() {
         let mut seen = std::collections::HashSet::new();
         for (id, _) in ALL {
             assert!(tw_config::plugins::valid_id(id), "{id}");
-            assert!(!tw_config::plugins::RESERVED_IDS.contains(id), "{id}");
             assert!(seen.insert(*id), "{id} is listed twice");
         }
     }

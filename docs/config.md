@@ -1149,7 +1149,7 @@ Requests of a kind a plugin does not handle pass without it, whatever its
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `id` | string | **required** | Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order`, `inspect`, `rewrite` and `confirmed` are taken by the control plane. |
+| `id` | string | **required** | Lowercase letters, digits and hyphens, 1 to 40 characters; unique. |
 | `file` | string | **required** | The plugin's code, relative to this file's directory. It is always `plugins/<id>.js`; the app writes it. |
 | `sha256` | string | **required** | SHA-256 of the approved code, 64 lowercase hexadecimal characters. When the file no longer has this hash, the plugin stops running until the change is approved in the app. The approved code is kept in `plugins/.approved/<id>.js`. |
 | `enabled` | bool | `true` | Run the plugin. `false` keeps it installed and out of every request. |

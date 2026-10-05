@@ -74,7 +74,7 @@ impl Bed {
     }
     /// 装一个（点过头的那条路），返回 id
     async fn install_confirmed(&self, src: &str, extra: Value) -> String {
-        self.install_at("/plugins/confirmed", src, extra).await
+        self.install_at("/plugin-confirmed", src, extra).await
     }
     async fn install_at(&self, path: &str, src: &str, extra: Value) -> String {
         let mut body = json!({
@@ -108,12 +108,12 @@ impl Bed {
         )
         .await
     }
-    /// 改写源码里的数据（`POST /plugins/rewrite`），交回改写之后的源码
+    /// 改写源码里的数据（`POST /plugin-rewrite`），交回改写之后的源码
     async fn rewrite(&self, src: &str, on_error: &str, models: Value, settings: Value) -> String {
         let (st, v) = call(
             &self.app,
             "POST",
-            "/plugins/rewrite",
+            "/plugin-rewrite",
             Some(json!({"source": src, "on_error": on_error,
                         "scope": {"clients": [], "models": models, "upstreams": []},
                         "settings": settings})),
@@ -251,7 +251,7 @@ async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": src})),
     )
     .await;
@@ -278,7 +278,7 @@ async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": bad})),
     )
     .await;
@@ -293,7 +293,7 @@ async fn inspecting_a_source_says_what_it_is_and_leaves_nothing_behind() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": expr})),
     )
     .await;
@@ -380,9 +380,6 @@ async fn an_id_is_checked_and_a_second_plugin_of_the_same_name_gets_its_own() {
 
     for (id, code) in [
         ("Bad_Id", "control.plugin.bad_id"),
-        ("order", "control.plugin.reserved_id"),
-        ("rewrite", "control.plugin.reserved_id"),
-        ("confirmed", "control.plugin.reserved_id"),
         ("shout", "control.plugin.id_taken"),
     ] {
         let (st, v) = call(
@@ -615,7 +612,7 @@ async fn rewriting_returns_the_new_source_and_writes_nothing() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": out})),
     )
     .await;
@@ -629,7 +626,7 @@ async fn rewriting_returns_the_new_source_and_writes_nothing() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/rewrite",
+        "/plugin-rewrite",
         Some(json!({"source": src, "on_error": "reject",
                     "scope": {"clients": ["claude-code"], "models": [], "upstreams": []},
                     "settings": {"note": "今天"}})),
@@ -670,7 +667,7 @@ async fn rewriting_returns_the_new_source_and_writes_nothing() {
             "gw.plugin.manifest_not_data",
         ),
     ] {
-        let (st, v) = call(&b.app, "POST", "/plugins/rewrite", Some(body)).await;
+        let (st, v) = call(&b.app, "POST", "/plugin-rewrite", Some(body)).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
         assert_eq!(v["code"], code);
     }
@@ -809,7 +806,7 @@ async fn reordering_changes_the_run_order_and_needs_every_plugin_once() {
     let (st, v) = call(
         &b.app,
         "PUT",
-        "/plugins/order",
+        "/plugin-order",
         Some(json!({"ids": [d, a, c], "base_version": b.version().await})),
     )
     .await;
@@ -831,7 +828,7 @@ async fn reordering_changes_the_run_order_and_needs_every_plugin_once() {
         json!(["d", "a", "a"]),
         json!(["d", "a", "x"]),
     ] {
-        let (st, v) = call(&b.app, "PUT", "/plugins/order", Some(json!({"ids": ids}))).await;
+        let (st, v) = call(&b.app, "PUT", "/plugin-order", Some(json!({"ids": ids}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
         assert_eq!(v["code"], "control.plugin.order");
     }
@@ -855,6 +852,32 @@ async fn deleting_removes_the_entry_and_both_files() {
     assert!(b.plugins().await.is_empty());
     let (st, _) = call(&b.app, "DELETE", &format!("/plugins/{id}"), None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// id 是用户起的，什么词都可能。试编、改写、点过头的装、排顺序以前在 `/plugins/inspect`、
+/// `/plugins/rewrite`、`/plugins/confirmed`、`/plugins/order` 上：axum 先认写死的那一段，
+/// 这几个 id 的插件保存和删都到不了它（`PUT /plugins/order` 还进了排顺序）
+#[tokio::test]
+async fn a_plugin_named_like_a_control_plane_word_can_be_saved_and_deleted() {
+    let b = bed();
+    for id in ["order", "inspect", "rewrite", "confirmed"] {
+        assert_eq!(b.install(&shout(), json!({"id": id})).await, id);
+        let (st, v) = b.save(id, &shout(), false).await;
+        assert_eq!(st, StatusCode::OK, "{id}: {v}");
+        let saved = b.parsed();
+        assert!(!saved.plugins.iter().find(|p| p.id == id).unwrap().enabled);
+
+        let (st, v) = call(
+            &b.app,
+            "DELETE",
+            &format!("/plugins/{id}?base_version={}", b.version().await),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{id}: {v}");
+        assert!(b.parsed().plugins.is_empty(), "{id}");
+        assert!(!b.file(id).exists() && !b.approved(id).exists(), "{id}");
+    }
 }
 
 /// 计数和日志：数据面每跑一次报一次，界面从这里取
@@ -1444,7 +1467,7 @@ async fn disabling_deleting_and_reordering_never_need_a_confirmation() {
     let (st, v) = call(
         &b.app,
         "PUT",
-        "/plugins/order",
+        "/plugin-order",
         Some(json!({"ids": [other, id], "base_version": b.version().await})),
     )
     .await;
@@ -1685,7 +1708,7 @@ export function onRequest(req, ctx) {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": src})),
     )
     .await;
@@ -1698,7 +1721,7 @@ export function onRequest(req, ctx) {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": broken})),
     )
     .await;
@@ -1773,7 +1796,7 @@ export function onRequest(req, ctx) {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/plugins/inspect",
+        "/plugin-inspect",
         Some(json!({"source": scrub})),
     )
     .await;
