@@ -67,6 +67,12 @@ config.edit.unwritable
 config.empty_key
 config.empty_models_only
 config.failover_range
+config.key_limit_cache_reads
+config.key_limit_duplicate
+config.key_limit_empty
+config.key_limit_month_retention
+config.key_limit_not_positive
+config.key_limit_two_measures
 config.model_spec_blank_model
 config.model_spec_empty
 config.model_spec_wildcard
@@ -281,6 +287,12 @@ gw.convert.tools_unsendable
 gw.count_tokens.bedrock_upstream
 gw.files.unsupported
 gw.internal
+gw.key_limit.cost_per_period
+gw.key_limit.cost_rolling
+gw.key_limit.requests_per_period
+gw.key_limit.requests_rolling
+gw.key_limit.tokens_per_period
+gw.key_limit.tokens_rolling
 gw.listen.addr_unavailable
 gw.listen.bind_failed
 gw.listen.denied

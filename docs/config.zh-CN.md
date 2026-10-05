@@ -217,6 +217,7 @@ listen:
 | `route` | 字符串 | — | 这把密钥的请求走哪条路由。不写：`default_route`。 |
 | `client` | 字符串 | — | 这把密钥是为哪个客户端生成的（`claude-code`、`codex` 等），由桌面应用接管客户端时写入。一个客户端最多一把。 |
 | `disabled` | 布尔 | `false` | 拒绝使用这把密钥的所有请求，密钥本身保留。 |
+| `limits` | 对象列表，见 [`clients[].limits[]`](#cfg-clients-limits) | — | 用量上限：每分钟、每小时、每天、每周或每月的请求数、token 数或费用。请求要通过每一条。不写：不限。 |
 <!-- /generated -->
 
 ```yaml
@@ -228,6 +229,44 @@ clients:
     max_concurrent: 4
     allow: [claude-sonnet-*]
     route: cheap
+```
+
+#### `clients[].limits`
+
+一把密钥的用量上限：每分钟、每小时、每天、每周或每月最多多少个请求、多少 token、多少美元。
+每一条只数其中一种；一把密钥可以有好几条，请求要通过每一条。
+
+`minute`、`hour` 是滚动的：最近 60 秒、最近 60 分钟。用满之后，下一个空位在
+`failover.slot_wait_secs`（默认 30 秒）之内空出来，请求就等它；等不到就拒绝。`day`、
+`week`、`month` 按 twcore 所在机器的本地时区算，在零点、周一零点、每月一号零点重新开始；
+用满之后，到重新开始之前的请求一律拒绝。
+
+被拒的请求收到 HTTP 429，错误格式和客户端自己的一致，写明是哪把密钥、哪一条上限、用了多少、
+什么时候重置；流量列表里也有这一条。费用按每个请求记下的费用算，所以没有价格的模型、
+`billing: free` 的上游算 0。还在进行的请求先按输入的估算计入，记下之后换成实际用量。
+重启之后，这一天、这一周、这个月的用量从请求记录里重新加起来，所以设了按月上限时
+`retention.row_days` 至少要 31；按分钟、按小时的上限从零开始。
+
+<!-- generated: table clients[].limits[] -->
+<a id="cfg-clients-limits"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **必填** | 按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。 |
+| `requests` | 整数 | — | 最多这么多个请求。数 token 的请求和网关自己答的不算。 |
+| `tokens` | 整数 | — | 最多这么多 token：未命中缓存的输入、写入缓存的和输出。 |
+| `cost` | 数字 | — | 最多花这么多美元，按每个请求记下的费用算。没有价格的模型、`billing: free` 的上游算 0。 |
+| `cache_reads` | 布尔 | `false` | 把读取缓存的 token 也算进去。只有 `tokens` 上限能写。 |
+<!-- /generated -->
+
+```yaml
+clients:
+  - name: build-server
+    key: tw-q8r2s4t6u8v2w4x6y8z2a4b6
+    limits:
+      - { per: minute, requests: 30 }
+      - { per: day, cost: 5 }
+      - { per: month, tokens: 20000000, cache_reads: true }
 ```
 
 ### `providers`

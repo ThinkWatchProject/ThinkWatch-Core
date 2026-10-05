@@ -15,6 +15,7 @@ pub mod edit;
 mod failover;
 pub mod history;
 mod init;
+pub mod limits;
 pub mod model_specs;
 pub mod nics;
 pub mod plugins;
@@ -35,6 +36,7 @@ mod wire;
 pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
+pub use limits::{KeyLimit, LimitMeasure, LimitPer};
 pub use model_specs::{ModelLimits, ModelSpec, Sourced, SpecSource};
 pub use plugins::Plugin;
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
@@ -166,6 +168,7 @@ impl Default for Client {
             route: None,
             client: None,
             disabled: false,
+            limits: Vec::new(),
         }
     }
 }
@@ -659,6 +662,10 @@ pub struct Client {
     /// 也能一键恢复的状态。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// 用量上限：每分钟、每小时、每天、每周、每月最多多少个请求、多少 token、花多少钱。
+    /// **每一条都要过**。不写就不限（见 [`limits`]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<KeyLimit>,
 }
 
 /// OAuth 凭据（第 3 类）。

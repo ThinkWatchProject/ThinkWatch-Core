@@ -820,10 +820,14 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             state.pricing.clone(),
             body_rx,
             run_rx,
+            tw_control::key_limits::settle_hook(&state),
         );
-        if store.is_some() {
+        if let Some(rec) = &store {
             state.set_body_sink(body_tx);
             state.set_plugin_sink(run_tx);
+            // 密钥的用量上限：这一天、这一周、这个月已经用了多少，从记录里加回来。**在第一个
+            // 请求之前**（网关还没开始听）
+            tw_control::key_limits::rebuild(&state, rec.lock().await.db());
         }
 
         /*
@@ -1004,6 +1008,8 @@ fn build_store(
     pricing: tw_pricing::Shared,
     bodies: tokio::sync::mpsc::Receiver<tw_gateway::bodies::BodyRecord>,
     runs: tokio::sync::mpsc::Receiver<tw_gateway::plugin::RunRecord>,
+    // 每记下一行请求，交给网关的密钥用量上限结算（见 `tw_control::key_limits`）
+    settled: tw_store::SettleHook,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
     let events = bus.subscribe();
     let (db, blobs) = match tw_store::open(dir) {
@@ -1078,7 +1084,9 @@ fn build_store(
     let recorder = tw_store::task::spawn(
         // 算完价钱往回报一条 —— 见 `Event::RequestPriced`。这里是唯一
         // 同时看得见总线和存储层的地方，所以接线在这儿完成。
-        tw_store::Recorder::new(db, blobs, pricing).reporting_to(bus),
+        tw_store::Recorder::new(db, blobs, pricing)
+            .reporting_to(bus)
+            .settling_to(settled),
         events,
         rx,
     );

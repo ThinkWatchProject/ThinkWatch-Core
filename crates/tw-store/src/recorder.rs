@@ -93,7 +93,41 @@ pub struct Recorder {
     ///
     /// `None` 表示没人要听（测试、以及不带总线的调用方）。
     bus: Option<tw_observe::EventBus>,
+    /// 每记下一行请求就交一份 [`Settled`] 出去：密钥的用量上限拿它把预留换成实数。
+    ///
+    /// **直接调，不走总线。**总线上丢了事件的话，这一行也就不在库里，重启之后从库里
+    /// 加回来的数和此刻内存里的数对得上；走总线再绕一圈，两边丢的不是同一批。
+    settled: Option<SettleHook>,
 }
+
+/// 记下的一行里，密钥的用量上限要的那几样（见 `tw_gateway::key_limits`）。
+///
+/// **和库里那一行是同一份数**：用量、费用就是写进去的那些，重启之后从库里加回来的和
+/// 此刻结算的一样多。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settled {
+    pub id: u64,
+    /// 请求开始的时刻，那一行的 `at_ms`。算在哪一天、哪一周看它
+    pub at_ms: i64,
+    /// 密钥的名字
+    pub client: String,
+    pub path: String,
+    /// 网关自己答的（本地估的 token 数）
+    pub local: bool,
+    /// 失败的原因的码。没失败的是 None
+    pub error_code: Option<String>,
+    /// 尝试链上有没有至少一跳。路由就拒绝了的、准入没过的没有
+    pub attempted: bool,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// 记下的费用，微分。算不出来的（没有价格、没有用量）是 None
+    pub cost_micros: Option<i64>,
+}
+
+/// 结算往哪儿交。由 twcore 接到网关的密钥用量上限上（`tw_control::key_limits`）
+pub type SettleHook = std::sync::Arc<dyn Fn(&Settled) + Send + Sync>;
 
 /// 一个价格的来源，给界面看的样子。`date`：当时默认价目表的数据日期。
 pub fn price_source(source: &tw_pricing::Source, date: &str) -> tw_api::PriceSourceView {
@@ -120,7 +154,14 @@ impl Recorder {
             pricing,
             inflight: HashMap::new(),
             bus: None,
+            settled: None,
         }
+    }
+
+    /// 每记下一行请求，交一份 [`Settled`] 给 `hook`。
+    pub fn settling_to(mut self, hook: SettleHook) -> Self {
+        self.settled = Some(hook);
+        self
     }
 
     /// 把算出来的价钱报回总线上。
@@ -580,6 +621,8 @@ impl Recorder {
             | Event::ConfigRejected { .. }
             | Event::QuotaSeen { .. }
             | Event::QuotaExhausted { .. }
+            // 密钥用量到了上限：说的是那把密钥现在的样子，它的用量就是这张表里的那些行
+            | Event::KeyLimitAlert { .. }
             // 凭据轮换说的是配置文件该改了，跟哪一次请求无关
             | Event::CredentialRotated { .. }
             | Event::CredentialExpired { .. }
@@ -691,6 +734,25 @@ impl Recorder {
                 cost_estimated: estimated,
                 cache_saved_micros,
                 at_ms: p.at_ms as u64,
+            });
+        }
+        if let Some(hook) = &self.settled {
+            hook(&Settled {
+                id,
+                at_ms: p.at_ms,
+                client: p.client.clone(),
+                path: p.path.clone(),
+                local,
+                error_code: match &how {
+                    Ending::Failed(message) => Some(message.code.clone()),
+                    _ => None,
+                },
+                attempted: !p.routing.attempts.is_empty(),
+                input: u.map_or(0, |u| u.input),
+                output: u.map_or(0, |u| u.output),
+                cache_read: u.map_or(0, |u| u.cache_read),
+                cache_write: u.map_or(0, |u| u.cache_write),
+                cost_micros,
             });
         }
         self.write(RequestRow {
@@ -2583,5 +2645,136 @@ mod failure_tests {
             _ => None,
         });
         assert_eq!(priced, Some((1, Some(300_015), true)));
+    }
+}
+
+#[cfg(test)]
+mod settle_hook_tests {
+    use super::tests::{finished, rec, started};
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tw_api::UsageView;
+
+    fn hooked() -> (tempfile::TempDir, Recorder, Arc<Mutex<Vec<Settled>>>) {
+        let (d, r) = rec();
+        let seen: Arc<Mutex<Vec<Settled>>> = Arc::default();
+        let into = seen.clone();
+        let r = r.settling_to(Arc::new(move |s: &Settled| {
+            into.lock().unwrap().push(s.clone())
+        }));
+        (d, r, seen)
+    }
+
+    fn usage() -> Option<UsageView> {
+        Some(UsageView {
+            input: 100_000,
+            output: 1,
+            cache_read: 40,
+            cache_write: 7,
+            cache_1h: false,
+        })
+    }
+
+    fn served(id: u64) -> Event {
+        Event::RequestRouted {
+            id,
+            route: "default".into(),
+            rule: "catch-all".into(),
+            group: None,
+            rewritten_by: vec![],
+            denied_by: None,
+            affinity: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "官方".into(),
+                model: None,
+                outcome: tw_api::AttemptOutcome::Served,
+                status: Some(200),
+                error: None,
+                ms: 5,
+                usage: None,
+                queued_ms: None,
+                skipped: None,
+            }],
+            billing: tw_api::Billing::PerToken,
+        }
+    }
+
+    /// 跑完的、客户端走掉的、断在半路的，**三种结局都交一份**，用量和费用就是写进库的
+    /// 那些：密钥的用量上限拿它把预留换成实数，重启之后从库里加回来的也是这些数。
+    #[test]
+    fn every_ending_hands_over_what_was_written() {
+        let (_d, mut r, seen) = hooked();
+        for id in 1..=3 {
+            r.on_event(&started(id, "claude-sonnet-4-5"));
+            r.on_event(&served(id));
+        }
+        r.on_event(&finished(1, usage()));
+        r.on_event(&Event::RequestCancelled {
+            id: 2,
+            model: String::new(),
+            status: Some(200),
+            bytes: 1,
+            duration_ms: 1,
+            usage: usage(),
+            answered_model: None,
+        });
+        r.on_event(&Event::RequestFailed {
+            id: 3,
+            model: String::new(),
+            source: tw_api::FailureSource::Upstream,
+            message: tw_api::Msg {
+                code: "t.broke".into(),
+                args: Default::default(),
+                text: "broke".into(),
+            },
+            bytes: None,
+            duration_ms: None,
+            usage: usage(),
+            answered_model: None,
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().map(|s| s.id).collect::<Vec<_>>(), [1, 2, 3]);
+        for s in seen.iter() {
+            let row = r.db().get(s.id as i64).unwrap().unwrap();
+            assert_eq!(s.cost_micros, row.cost_micros, "和库里那一行是同一个数");
+            assert!(s.cost_micros.is_some());
+            assert_eq!(
+                (s.input, s.output, s.cache_read, s.cache_write),
+                (100_000, 1, 40, 7)
+            );
+            assert_eq!(
+                (s.client.as_str(), s.path.as_str()),
+                ("claude-code", "/v1/messages")
+            );
+            assert_eq!(s.at_ms, 1_000_000);
+            assert!(s.attempted && !s.local);
+        }
+        assert_eq!(seen[2].error_code.as_deref(), Some("t.broke"));
+        assert_eq!(seen[0].error_code, None);
+    }
+
+    /// 路由就拒绝了的：没有一跳。没有用量的：费用是 None，不是 0
+    #[test]
+    fn a_request_refused_before_any_hop_says_so() {
+        let (_d, mut r, seen) = hooked();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&Event::RequestFailed {
+            id: 1,
+            model: String::new(),
+            source: tw_api::FailureSource::Denied,
+            message: tw_api::Msg {
+                code: "gw.route.denied".into(),
+                args: Default::default(),
+                text: "denied".into(),
+            },
+            bytes: None,
+            duration_ms: None,
+            usage: None,
+            answered_model: None,
+        });
+        let s = seen.lock().unwrap()[0].clone();
+        assert!(!s.attempted);
+        assert_eq!(s.cost_micros, None);
+        assert_eq!(s.error_code.as_deref(), Some("gw.route.denied"));
     }
 }

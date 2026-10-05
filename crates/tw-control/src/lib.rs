@@ -30,6 +30,7 @@ mod contract;
 pub mod diagnostics;
 pub mod dryrun;
 mod gate;
+pub mod key_limits;
 pub mod keys;
 pub mod listen;
 pub mod plugins;

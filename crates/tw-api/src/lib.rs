@@ -1332,6 +1332,28 @@ pub enum Event {
         resets_at_ms: Option<u64>,
         at_ms: u64,
     },
+    /// 一把网关密钥这一期（天、周、月）的用量到了一条上限的八成，或者到了上限。
+    ///
+    /// **每一期、每一档只报一次**：同一期里之后的请求照样被拒，同一句话说第二遍只会
+    /// 让人学会忽略通知。下一期重新算；上限改了也重新算。重启之后从请求记录里加回来
+    /// 时已经过了的档不再报。滚动的上限（分钟、小时）不报：它们几十秒就过去
+    KeyLimitAlert {
+        id: u64,
+        /// 密钥的名字
+        key: String,
+        per: LimitPer,
+        measure: LimitMeasure,
+        /// 上限，单位同 `KeyLimitView::max`
+        max: u64,
+        /// 报的时候用了多少，同上
+        used: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cache_reads: bool,
+        /// `true` = 到了上限，之后的请求被拒到 `resets_at_ms`；`false` = 到了八成
+        reached: bool,
+        resets_at_ms: u64,
+        at_ms: u64,
+    },
     /// 数据面换了监听地址，或者没换成（旧的还在服务）。
     ///
     /// **和 `ConfigReloaded` 是两件事。**配置换进去之后监听器才开始换，
@@ -1632,6 +1654,7 @@ impl Event {
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
+            | Event::KeyLimitAlert { id, .. }
             | Event::SecretsFound { id, .. }
             | Event::ContentMatched { id, .. }
             | Event::RequestPriced { id, .. }
@@ -2228,6 +2251,71 @@ pub struct ClientView {
     /// 那个可以伪造。从来没被用过时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    /// 用量上限，按配置里的顺序，各带此刻用了多少。没设的是空的
+    pub limits: Vec<KeyLimitView>,
+    /// 这把密钥用得到、却没有价格的模型。**只有设了费用上限的密钥才算**：这些模型的
+    /// 请求费用记 0，费用上限管不住它们，对话框里要提醒一句。没有就不带
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpriced_models: Vec<String>,
+}
+
+slug_enum! {
+    /// 用量上限按多长一段时间算。分钟、小时是**滚动的**（最近 60 秒、最近 60 分钟）；
+    /// 天、周、月是**自然的**，按 core 所在机器的本地时区：零点、周一零点、一号零点重新算。
+    pub enum LimitPer {
+        Minute = "minute",
+        Hour = "hour",
+        Day = "day",
+        Week = "week",
+        Month = "month",
+    }
+}
+
+slug_enum! {
+    /// 一条用量上限数的是什么。
+    pub enum LimitMeasure {
+        /// 请求数。数 token 的请求、网关自己答的不算
+        Requests = "requests",
+        /// token：没走缓存的输入 + 写进缓存的 + 输出，`cache_reads` 时再加上从缓存读的
+        Tokens = "tokens",
+        /// 费用，**微分**（百万分之一美元），和别处的费用同一个单位。没有价格的模型、
+        /// 不计费的上游算 0
+        Cost = "cost",
+    }
+}
+
+/// 一条用量上限，和它此刻用了多少。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct KeyLimitView {
+    pub per: LimitPer,
+    pub measure: LimitMeasure,
+    /// 上限：请求数、token 数，费用是微分
+    pub max: u64,
+    /// token 上限把从缓存读的也算进去
+    pub cache_reads: bool,
+    /// 用了多少，单位同 `max`。**在跑的请求也算**：按它们的输入估算占着，结束时换成
+    /// 记下的实数 —— 准入看的就是这个数。滚动的是最近那一段时间里的，重启之后从空的
+    /// 开始；自然的是这一期的，重启之后从请求记录里加回来
+    pub used: u64,
+    /// 这一期什么时候结束、重新算。只有天、周、月有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    /// 到了：`used` 不小于 `max`，新的请求此刻会被拒（滚动的会先等一会儿）
+    pub reached: bool,
+}
+
+/// 新建、保存密钥时的一条用量上限。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct KeyLimitInput {
+    pub per: LimitPer,
+    pub measure: LimitMeasure,
+    /// 上限：请求数、token 数，费用是微分。要大于 0
+    pub max: u64,
+    /// 只有 token 上限能开
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_reads: bool,
 }
 
 /// 新建或保存一把网关密钥（`POST /keys`、`PUT /keys/{name}`）。
@@ -2255,6 +2343,9 @@ pub struct KeyInput {
     pub allow: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// 用量上限，整份替换。不带 = 一条都没有
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<KeyLimitInput>,
 }
 
 /// 换哪把密钥（`POST /keys/{name}/rotate`）。

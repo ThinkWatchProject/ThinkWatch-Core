@@ -228,7 +228,38 @@ pub(super) async fn ws_upgrade(
         .headers_for(provider, http)
         .await
         .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
+    // 这把密钥的用量上限：**一条连接算一个请求**，连上之前看一遍，和 HTTP 那条路的准入
+    // 同一套（见 `crate::key_limits`）。连接上的每个 `response.create` 不再分开数：存储层给
+    // 整条连接记一行、不带用量，分开数的话，重启之后从记录里加回来的数就对不上了
+    let limits = rt
+        .config
+        .clients
+        .iter()
+        .find(|c| c.name == client_name)
+        .map(|c| c.limits.as_slice())
+        .unwrap_or_default();
+    let hold = match state
+        .key_limits
+        .admit(
+            &client_name,
+            limits,
+            Default::default(),
+            crate::key_limits::slot_wait(&rt.config),
+        )
+        .await
+    {
+        Ok(hold) => hold,
+        // 被拒的照样留一行，和规则拒绝的一样
+        Err(r) => {
+            let why = r.error();
+            let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
+            state.bus.emit(super::routed_nowhere(id, choice));
+            ending.failed(why.source.into(), why.detail.clone());
+            return Err(why);
+        }
+    };
     let (id, ending) = open(&choice, &name, provider.billing.into());
+    hold.bind(id);
     // 插件：升级那一刻的那一份表，一条连接用到底。**插件只管 Responses 的 WebSocket**（每个
     // `response.create` 是一次对话请求）；别的路径上的连接（比如 Realtime 的 `/v1/realtime`）
     // 不属于插件处理的任何一种请求，所有插件都不管：原样接上，什么都不记

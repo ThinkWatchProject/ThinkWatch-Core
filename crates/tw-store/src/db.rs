@@ -146,6 +146,26 @@ pub struct RequestRow {
     pub session_log_bytes: Option<i64>,
 }
 
+/// 一把密钥从某一刻起用了多少，按几样分开数（见 [`Db::key_usage_since`]）。
+///
+/// **分开的那几样就是「算不算」要看的**：数 token 的请求、准入之前就被拒的不算进密钥的
+/// 用量上限，判断在网关那边（`tw_gateway::key_limits`），和它结算一行时是同一个判断。
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyUsage {
+    pub client: String,
+    pub path: String,
+    pub error_code: Option<String>,
+    /// 尝试链上有没有至少一跳
+    pub attempted: bool,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 记下的费用合计，微分。算不出来的那几行算 0
+    pub cost_micros: i64,
+}
+
 #[derive(Debug)]
 pub struct Db {
     /// 上游体检的查询在 `crate::health`，和这里共用一个连接
@@ -1204,6 +1224,42 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 每把密钥从 `since_ms` 起用了多少：重启之后，密钥的用量上限按它把这一天、这一周、
+    /// 这个月的数加回来。
+    ///
+    /// 网关自己答的不在里面。**按「算不算」要看的几样分组**（路径、失败的码、有没有发往
+    /// 上游），组数和密钥、路径的个数相当，一把密钥一个月的记录也只有几十组。
+    pub fn key_usage_since(&self, since_ms: i64) -> Result<Vec<KeyUsage>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT client, path, error_code,
+                    (CASE WHEN json_valid(routing)
+                          THEN COALESCE(json_array_length(routing, '$.attempts'), 0)
+                          ELSE 0 END) > 0 AS attempted,
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_micros), 0)
+             FROM requests
+             WHERE at_ms >= ?1 AND local = 0
+             GROUP BY client, path, error_code, attempted",
+        )?;
+        let rows = st.query_map(params![since_ms], |r| {
+            Ok(KeyUsage {
+                client: r.get(0)?,
+                path: r.get(1)?,
+                error_code: r.get(2)?,
+                attempted: r.get(3)?,
+                requests: r.get(4)?,
+                input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
+                cache_read_tokens: r.get(7)?,
+                cache_write_tokens: r.get(8)?,
+                cost_micros: r.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 各条路由走了多少请求、各条规则命中了多少，以及记录从哪一刻起是全的（见
     /// [`tw_api::RouteStats`]）。
     pub fn route_stats(&self, since_ms: i64, until_ms: i64) -> Result<tw_api::RouteStats, DbError> {
@@ -1817,6 +1873,76 @@ pub(crate) mod tests {
             db.cost_by(tw_api::CostDim::Model, t0, t0 + 1000)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// 密钥用量上限重启之后加回来的数：按密钥、路径、失败的码、有没有发往上游分组，
+    /// 从那一刻起，网关自己答的不算。
+    #[test]
+    fn key_usage_adds_up_each_key_from_a_moment_on() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let attempt = r#"{"route":"default","rule":"r","rewritten_by":[],
+            "attempts":[{"provider":"官方","outcome":"served","status":200,"ms":5}]}"#;
+        let nowhere = r#"{"route":"default","rule":"r","rewritten_by":[],"attempts":[]}"#;
+        let mut early = row(1, t0 - 1);
+        early.routing = Some(attempt.into());
+        let mut a = row(2, t0);
+        a.routing = Some(attempt.into());
+        let mut b = row(3, t0 + 5);
+        b.routing = Some(attempt.into());
+        b.cost_micros = None;
+        b.cache_write_tokens = Some(7);
+        let mut refused = row(4, t0 + 6);
+        refused.routing = Some(nowhere.into());
+        refused.error = Some(Msg {
+            code: "gw.route.denied".into(),
+            args: Default::default(),
+            text: "x".into(),
+        });
+        refused.input_tokens = None;
+        refused.output_tokens = None;
+        refused.cache_read_tokens = None;
+        refused.cost_micros = None;
+        let mut local = row(5, t0 + 7);
+        local.local = true;
+        let mut other = row(6, t0 + 8);
+        other.client = "codex".into();
+        for r in [&early, &a, &b, &refused, &local, &other] {
+            db.insert(r).unwrap();
+        }
+        let mut got = db.key_usage_since(t0).unwrap();
+        got.sort_by(|x, y| (&x.client, x.attempted).cmp(&(&y.client, y.attempted)));
+        assert_eq!(got.len(), 3, "{got:?}");
+        let (refused_g, served, codex) = (&got[0], &got[1], &got[2]);
+        assert_eq!(
+            (served.client.as_str(), served.attempted, served.requests),
+            ("claude-code", true, 2),
+            "早于那一刻的、本地答的都不算"
+        );
+        assert_eq!(
+            (
+                served.input_tokens,
+                served.output_tokens,
+                served.cache_read_tokens,
+                served.cache_write_tokens,
+                served.cost_micros
+            ),
+            (2000, 1000, 400, 7, 12_000),
+            "算不出钱的那一行算 0"
+        );
+        assert_eq!(
+            (
+                refused_g.attempted,
+                refused_g.error_code.as_deref(),
+                refused_g.requests
+            ),
+            (false, Some("gw.route.denied"), 1)
+        );
+        assert_eq!(
+            (codex.client.as_str(), codex.attempted),
+            ("codex", false),
+            "没有路由那一列的当作没发往上游"
         );
     }
 

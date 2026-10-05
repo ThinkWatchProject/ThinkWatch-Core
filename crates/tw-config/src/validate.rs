@@ -116,6 +116,27 @@ pub enum ValidationError {
         model: String,
         field: &'static str,
     },
+    #[error("{}", self.msg())]
+    KeyLimitEmpty { key: String },
+    #[error("{}", self.msg())]
+    KeyLimitTwoMeasures { key: String, measures: String },
+    #[error("{}", self.msg())]
+    KeyLimitNotPositive {
+        key: String,
+        per: &'static str,
+        measure: &'static str,
+        value: String,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitDuplicate {
+        key: String,
+        per: &'static str,
+        measure: &'static str,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitCacheReads { key: String, measure: &'static str },
+    #[error("{}", self.msg())]
+    KeyLimitMonthRetention { key: String, days: u64 },
 }
 
 impl ValidationError {
@@ -339,6 +360,42 @@ impl ValidationError {
                 "the model spec `{model}` of upstream `{upstream}` has {field}: 0; it has to be a \
                  number of tokens above 0. Leave it out to use the price table"
             ),
+            KeyLimitEmpty { key } => msg!(
+                "config.key_limit_empty", key = key =>
+                "a limit of gateway key `{key}` names nothing to count. Each entry under limits \
+                 takes one of requests, tokens or cost"
+            ),
+            KeyLimitTwoMeasures { key, measures } => msg!(
+                "config.key_limit_two_measures", key = key, measures = measures =>
+                "a limit of gateway key `{key}` names {measures} together. Each entry takes one \
+                 of requests, tokens or cost; write one entry for each"
+            ),
+            KeyLimitNotPositive {
+                key,
+                per,
+                measure,
+                value,
+            } => msg!(
+                "config.key_limit_not_positive", key = key, per = per, measure = measure,
+                value = value =>
+                "the {measure} limit per {per} of gateway key `{key}` is {value}; it has to be \
+                 more than 0"
+            ),
+            KeyLimitDuplicate { key, per, measure } => msg!(
+                "config.key_limit_duplicate", key = key, per = per, measure = measure =>
+                "gateway key `{key}` has two {measure} limits per {per}. Keep one of them"
+            ),
+            KeyLimitCacheReads { key, measure } => msg!(
+                "config.key_limit_cache_reads", key = key, measure = measure =>
+                "the {measure} limit of gateway key `{key}` sets cache_reads, which only a \
+                 tokens limit takes"
+            ),
+            KeyLimitMonthRetention { key, days } => msg!(
+                "config.key_limit_month_retention", key = key, days = days =>
+                "gateway key `{key}` has a limit per month, and retention.row_days is {days}. \
+                 After a restart the month's total is added up again from the request records, \
+                 so row_days has to be at least 31"
+            ),
         }
     }
 }
@@ -430,6 +487,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 name: c.name.clone(),
             });
         }
+        check_limits(c, cfg.retention.row_days)?;
         if let Some(prev) = keys.insert(&c.key, &c.name) {
             return Err(ValidationError::DuplicateKey(
                 prev.to_string(),
@@ -573,6 +631,75 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                     entry: entry.clone(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// 一个月的记录最少要留几天：月度上限的用量在重启之后从请求记录里重新加起来，
+/// 留得比一个月短，月初那几天的就加不回来
+pub const MONTH_ROW_DAYS: u64 = 31;
+
+/// 一把密钥的用量上限写得对不对。
+///
+/// **每一条恰好数一种量**：一条里写两种，读的人分不清是「都要过」还是「过一个就行」。
+/// 同一段时间、同一种量写两条（缓存读算不算进去也一样）的，两条里总有一条不起作用，
+/// 而用户以为它在起作用。
+fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError> {
+    let key = || c.name.clone();
+    for (i, l) in c.limits.iter().enumerate() {
+        let measures = l.measures();
+        let measure = match measures.as_slice() {
+            [] => return Err(ValidationError::KeyLimitEmpty { key: key() }),
+            [one] => *one,
+            many => {
+                return Err(ValidationError::KeyLimitTwoMeasures {
+                    key: key(),
+                    measures: many
+                        .iter()
+                        .map(|m| m.word())
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                });
+            }
+        };
+        // 写了 `.nan`、`.inf` 的费用也在这里挡：前者比什么都不大，后者换不成微分
+        let positive = match measure {
+            crate::LimitMeasure::Requests => l.requests.is_some_and(|n| n > 0),
+            crate::LimitMeasure::Tokens => l.tokens.is_some_and(|n| n > 0),
+            crate::LimitMeasure::Cost => l.cost.is_some_and(|x| x.is_finite() && x > 0.0),
+        };
+        if !positive {
+            let value = match measure {
+                crate::LimitMeasure::Requests => l.requests.unwrap_or_default().to_string(),
+                crate::LimitMeasure::Tokens => l.tokens.unwrap_or_default().to_string(),
+                crate::LimitMeasure::Cost => l.cost.unwrap_or_default().to_string(),
+            };
+            return Err(ValidationError::KeyLimitNotPositive {
+                key: key(),
+                per: l.per.word(),
+                measure: measure.word(),
+                value,
+            });
+        }
+        if l.cache_reads && measure != crate::LimitMeasure::Tokens {
+            return Err(ValidationError::KeyLimitCacheReads {
+                key: key(),
+                measure: measure.word(),
+            });
+        }
+        if c.limits[..i].iter().any(|o| o.same_as(l)) {
+            return Err(ValidationError::KeyLimitDuplicate {
+                key: key(),
+                per: l.per.word(),
+                measure: measure.word(),
+            });
+        }
+        if l.per == crate::LimitPer::Month && row_days < MONTH_ROW_DAYS {
+            return Err(ValidationError::KeyLimitMonthRetention {
+                key: key(),
+                days: row_days,
+            });
         }
     }
     Ok(())
@@ -1360,6 +1487,78 @@ groups:
             );
         }
     }
+
+    /// 用量上限：每一条恰好一种量、大于 0、`cache_reads` 只给 token、不重复；月度上限要
+    /// 请求记录留够一个月。
+    #[test]
+    fn key_limits_are_checked_one_entry_at_a_time() {
+        let with = |limits: &str, row_days: u64| {
+            let mut key = c("k", "tw-1");
+            key.limits = serde_yaml_ng::from_str(limits).unwrap();
+            let mut cfg = cfg(vec![key], vec![]);
+            cfg.retention.row_days = row_days;
+            validate(&cfg).map_err(|e| e.msg())
+        };
+        let code = |limits: &str| with(limits, 90).unwrap_err().code;
+        assert!(
+            with(
+                "[{per: minute, requests: 30}, {per: day, cost: 5.5}, \
+                 {per: day, tokens: 100000}, {per: day, tokens: 900000, cache_reads: true}, \
+                 {per: month, cost: 100}]",
+                90
+            )
+            .is_ok(),
+            "缓存读算不算进去不一样，就是两条"
+        );
+        assert_eq!(code("[{per: day}]"), "config.key_limit_empty");
+        let m = with("[{per: day, requests: 3, cost: 1}]", 90).unwrap_err();
+        assert_eq!(m.code, "config.key_limit_two_measures");
+        assert_eq!(m.arg("measures"), "requests and cost");
+        for bad in [
+            "[{per: day, requests: 0}]",
+            "[{per: day, tokens: -5}]",
+            "[{per: day, cost: 0}]",
+            "[{per: day, cost: -1.5}]",
+            "[{per: day, cost: .nan}]",
+            "[{per: day, cost: .inf}]",
+        ] {
+            assert_eq!(code(bad), "config.key_limit_not_positive", "{bad}");
+        }
+        let m = with("[{per: hour, cost: -1.5}]", 90).unwrap_err();
+        assert_eq!(
+            (m.arg("per"), m.arg("measure"), m.arg("value")),
+            ("hour", "cost", "-1.5")
+        );
+        assert_eq!(
+            code("[{per: day, requests: 3, cache_reads: true}]"),
+            "config.key_limit_cache_reads"
+        );
+        assert_eq!(
+            code("[{per: day, cost: 3}, {per: day, cost: 5}]"),
+            "config.key_limit_duplicate"
+        );
+        assert_eq!(
+            code(
+                "[{per: week, tokens: 3, cache_reads: true}, {per: week, tokens: 5, cache_reads: true}]"
+            ),
+            "config.key_limit_duplicate"
+        );
+        // 月度上限：记录要留够 31 天，用量在重启之后从记录里加回来
+        let m = with("[{per: month, requests: 3}]", 30).unwrap_err();
+        assert_eq!(m.code, "config.key_limit_month_retention");
+        assert_eq!(m.arg("days"), "30");
+        assert!(with("[{per: month, requests: 3}]", 31).is_ok());
+        assert!(
+            with("[{per: week, requests: 3}]", 7).is_ok(),
+            "周以内的不受影响"
+        );
+    }
+
+    #[test]
+    fn a_key_without_limits_writes_nothing_back() {
+        let out = serde_yaml_ng::to_string(&c("k", "tw-1")).unwrap();
+        assert!(!out.contains("limits"), "{out}");
+    }
 }
 
 #[cfg(test)]
@@ -1566,6 +1765,30 @@ mod msg_codes {
                 upstream: "a".into(),
                 model: "m".into(),
                 field: "context_window",
+            },
+            KeyLimitEmpty { key: "k".into() },
+            KeyLimitTwoMeasures {
+                key: "k".into(),
+                measures: "requests and cost".into(),
+            },
+            KeyLimitNotPositive {
+                key: "k".into(),
+                per: "day",
+                measure: "cost",
+                value: "0".into(),
+            },
+            KeyLimitDuplicate {
+                key: "k".into(),
+                per: "day",
+                measure: "cost",
+            },
+            KeyLimitCacheReads {
+                key: "k".into(),
+                measure: "cost",
+            },
+            KeyLimitMonthRetention {
+                key: "k".into(),
+                days: 30,
             },
         ];
         check(

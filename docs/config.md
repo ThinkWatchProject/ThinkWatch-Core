@@ -308,6 +308,7 @@ gateway. A key is an identity. Limits, model scope and route are per key.
 | `route` | string | — | Name of the route requests with this key take. Unset: `default_route`. |
 | `client` | string | — | The client this key was made for (`claude-code`, `codex`, …), recorded when the desktop app points a client at the gateway. A client has at most one. |
 | `disabled` | bool | `false` | Refuse every request made with this key, and keep the key. |
+| `limits` | list of [`clients[].limits[]`](#cfg-clients-limits) | — | Usage limits: requests, tokens or cost per minute, hour, day, week or month. A request has to pass every one. Unset: no limit. |
 <!-- /generated -->
 
 ```yaml
@@ -319,6 +320,50 @@ clients:
     max_concurrent: 4
     allow: [claude-sonnet-*]
     route: cheap
+```
+
+#### `clients[].limits`
+
+Usage limits for a key: at most so many requests, tokens or dollars per
+minute, hour, day, week or month. Each entry counts one of the three; a key
+can have several, and a request has to pass every one.
+
+`minute` and `hour` are rolling: the last 60 seconds, the last 60 minutes.
+When one is used up, a request waits for the next free slot if it frees
+within `failover.slot_wait_secs` (30 seconds by default), and is refused
+otherwise. `day`, `week` and `month` follow the calendar in the time zone of
+the machine twcore runs on and start again at midnight, on Monday and on the
+1st. When one is used up, requests are refused until it starts again.
+
+A refused request gets HTTP 429 in the client's own error format, naming the
+key, the limit, the amount used and when it resets, and it shows in the
+traffic list. Cost is what is recorded for each request, so a model without a
+price and an upstream with `billing: free` count as $0. A request still
+running counts with an estimate of its input until it is recorded. After a
+restart, the day, week and month are added up again from the request records;
+a monthly limit therefore needs `retention.row_days` of at least 31. Minute
+and hour limits start empty.
+
+<!-- generated: table clients[].limits[] -->
+<a id="cfg-clients-limits"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
+| `requests` | integer | — | At most this many requests. Token counts and answers the gateway gives itself do not count. |
+| `tokens` | integer | — | At most this many tokens: uncached input, cache writes and output. |
+| `cost` | number | — | At most this much, in US dollars, as recorded for each request. Models without a price and upstreams with `billing: free` count as 0. |
+| `cache_reads` | bool | `false` | Count cache reads too. Only for a `tokens` limit. |
+<!-- /generated -->
+
+```yaml
+clients:
+  - name: build-server
+    key: tw-q8r2s4t6u8v2w4x6y8z2a4b6
+    limits:
+      - { per: minute, requests: 30 }
+      - { per: day, cost: 5 }
+      - { per: month, tokens: 20000000, cache_reads: true }
 ```
 
 ### `providers`

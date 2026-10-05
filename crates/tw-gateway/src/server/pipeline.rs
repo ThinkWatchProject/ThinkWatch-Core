@@ -20,6 +20,7 @@ use crate::forward;
 use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
+mod admission;
 mod hop;
 mod opening;
 mod plug;
@@ -116,18 +117,22 @@ pub(super) async fn pipeline(
         }
     };
 
-    // 管线第 3 步：这把密钥自己的并发上限。**等，不拒绝** —— 理由在
-    // `crate::limits`。放在路由之后：被规则挡下的请求不用先等一轮。
+    // 管线第 3 步：这把密钥的用量上限和并发上限（见 `admission`）。放在路由之后：被规则
+    // 挡下的请求不用先等一轮。被用量上限拒绝的照样留一行
     //
-    // **通行证交给回程，跟着响应体走**（见 `relay`）：放在这里的话它在响应头交出去的那一刻
-    // 就还了，一条还在流的回答不再算数，上限管的只是等响应头的那一段
-    let limit = rt
-        .config
-        .clients
-        .iter()
-        .find(|c| c.name == req.client_name)
-        .and_then(|c| c.max_concurrent);
-    let pass = state.gate.acquire(&req.client_name, limit).await;
+    // **并发的通行证交给回程，跟着响应体走**（见 `relay`）：放在这里的话它在响应头交出去的
+    // 那一刻就还了，一条还在流的回答不再算数，上限管的只是等响应头的那一段
+    let admission::Admitted { pass, hold } = admission::admit(
+        &state,
+        &rt,
+        &req,
+        &reading,
+        &choice,
+        &decision,
+        fp.as_deref(),
+        ending,
+    )
+    .await?;
 
     // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
     let screening = screen(&rt, &mut req, &mut reading);
@@ -141,6 +146,8 @@ pub(super) async fn pipeline(
         fp.as_deref(),
         ending,
     );
+    // 用量上限的预留跟着请求号走，等存储层记下这一行时换成实数
+    hold.bind(started.id);
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
     // 流量里照样留一行；一个字节都不发
     let provider = started.alive.first().map(String::as_str).unwrap_or("");

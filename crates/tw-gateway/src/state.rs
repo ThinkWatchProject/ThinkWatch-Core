@@ -139,6 +139,12 @@ pub struct AppState {
     /// 每家上游自己的并发上限（见 [`crate::slots`]）。**不在 Runtime 里**，理由和 `gate`
     /// 一样：它握着在跑的请求占着的位置。配置换了由 [`Self::reload`] 在原地改上限
     pub slots: Arc<crate::slots::Slots>,
+    /// 每把密钥的用量上限（见 [`crate::key_limits`]）：今天、这周、这个月用了多少，最近
+    /// 一分钟、一小时用了多少，在跑的请求占着多少。
+    ///
+    /// **跨重载存活**，理由和并发闸门一样：改一条路由规则不该让今天花的钱归零，在跑的
+    /// 请求的预留也不该变成孤儿。上限本身跟着配置换（[`crate::key_limits::KeyLimits::configure`]）
+    pub key_limits: Arc<crate::key_limits::KeyLimits>,
     /// 一家上游不在当前运行时里时顶上的 Client（直连，不读系统代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
@@ -261,12 +267,16 @@ impl AppState {
         health.configure(&rt.config.failover);
         let slots = Arc::new(crate::slots::Slots::default());
         slots.configure(&rt.config.providers);
+        let bus = tw_observe::EventBus::new();
+        let key_limits = Arc::new(crate::key_limits::KeyLimits::new(bus.clone()));
+        key_limits.configure(&rt.config);
         let state = Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Default::default(),
             slots,
+            key_limits,
             http,
-            bus: tw_observe::EventBus::new(),
+            bus,
             health,
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
             models,
@@ -335,6 +345,14 @@ impl AppState {
 
     pub fn config(&self) -> Arc<tw_config::Config> {
         self.rt.load().config.clone()
+    }
+
+    /// 换一个看用量上限的时钟（测试把时间拨到零点前后）。**账从空的开始**：只在测试里、
+    /// 第一个请求之前调
+    pub fn set_key_limits_clock(&mut self, clock: Arc<dyn crate::key_limits::Clock>) {
+        let limits = crate::key_limits::KeyLimits::with_clock(self.bus.clone(), clock);
+        limits.configure(&self.config());
+        self.key_limits = Arc::new(limits);
     }
 
     /// 直接换一份插件进去，配置照旧：正在跑的请求用完它们手上那一份，新请求看到的是
@@ -483,6 +501,7 @@ impl AppState {
             .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
         self.health.configure(&next.config.failover);
         self.slots.configure(&next.config.providers);
+        self.key_limits.configure(&next.config);
         self.rt.store(Arc::new(next));
         self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表

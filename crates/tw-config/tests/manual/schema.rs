@@ -61,6 +61,9 @@ fn group_types() -> Vec<&'static str> {
 fn balance_bys() -> Vec<&'static str> {
     super::fields::<BalanceBy>()
 }
+fn limit_pers() -> Vec<&'static str> {
+    super::fields::<LimitPer>()
+}
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
 const MODE_DOC: T2 = t(
@@ -426,6 +429,66 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Refuse every request made with this key, and keep the key.",
                         "拒绝使用这把密钥的所有请求，密钥本身保留。",
+                    ),
+                ),
+                row(
+                    "limits",
+                    Kind::Objs("clients[].limits[]"),
+                    Def::Unset,
+                    t(
+                        "Usage limits: requests, tokens or cost per minute, hour, day, week or month. A request has to pass every one. Unset: no limit.",
+                        "用量上限：每分钟、每小时、每天、每周或每月的请求数、token 数或费用。请求要通过每一条。不写：不限。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "clients[].limits[]",
+            ty: checked!(KeyLimit, "{per: day}"),
+            rows: vec![
+                row(
+                    "per",
+                    Kind::Enum(limit_pers),
+                    Def::Required,
+                    t(
+                        "The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st.",
+                        "按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。",
+                    ),
+                ),
+                row(
+                    "requests",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "At most this many requests. Token counts and answers the gateway gives itself do not count.",
+                        "最多这么多个请求。数 token 的请求和网关自己答的不算。",
+                    ),
+                ),
+                row(
+                    "tokens",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "At most this many tokens: uncached input, cache writes and output.",
+                        "最多这么多 token：未命中缓存的输入、写入缓存的和输出。",
+                    ),
+                ),
+                row(
+                    "cost",
+                    Kind::Num,
+                    Def::Unset,
+                    t(
+                        "At most this much, in US dollars, as recorded for each request. Models without a price and upstreams with `billing: free` count as 0.",
+                        "最多花这么多美元，按每个请求记下的费用算。没有价格的模型、`billing: free` 的上游算 0。",
+                    ),
+                ),
+                row(
+                    "cache_reads",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Count cache reads too. Only for a `tokens` limit.",
+                        "把读取缓存的 token 也算进去。只有 `tokens` 上限能写。",
                     ),
                 ),
             ],
