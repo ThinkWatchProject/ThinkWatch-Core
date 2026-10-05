@@ -77,8 +77,6 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     PluginId { id: String },
     #[error("{}", self.msg())]
-    PluginIdReserved { id: String },
-    #[error("{}", self.msg())]
     DuplicatePlugin { id: String },
     #[error("{}", self.msg())]
     PluginFile { id: String, file: String },
@@ -238,10 +236,6 @@ impl ValidationError {
                 "config.plugin.bad_id", plugin = id, max = crate::plugins::ID_MAX =>
                 "the plugin id `{plugin}` is written wrongly: lowercase letters, digits and \
                  hyphens, 1 to {max} characters"
-            ),
-            PluginIdReserved { id } => msg!(
-                "config.plugin.reserved_id", plugin = id =>
-                "`{plugin}` cannot be a plugin id: the control plane uses that word itself"
             ),
             DuplicatePlugin { id } => msg!(
                 "config.plugin.duplicate", plugin = id =>

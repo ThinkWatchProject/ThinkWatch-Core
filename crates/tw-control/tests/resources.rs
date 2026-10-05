@@ -551,6 +551,76 @@ async fn renaming_a_proxy_moves_the_upstreams_that_use_it_and_a_used_proxy_is_no
     );
 }
 
+/// 名字是用户起的，什么词都可能。检测和预览以前在 `/providers/test`、`/providers/preview`
+/// 上：axum 先认写死的那一段，叫 `test`、`preview` 的上游改和删都是 405
+#[tokio::test]
+async fn an_upstream_named_test_or_preview_can_be_edited_and_deleted() {
+    let b = bed(BASE);
+    for name in ["test", "preview"] {
+        let (st, body) = call(
+            &b.app,
+            "POST",
+            "/providers",
+            serde_json::json!({ "provider": relay(name) }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{name}: {body}");
+
+        let mut edited = relay(name);
+        edited["base_url"] = "https://relay2.example".into();
+        let (st, body) = call(
+            &b.app,
+            "PUT",
+            &format!("/providers/{name}"),
+            serde_json::json!({ "provider": edited }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{name}: {body}");
+        let cfg = b.parsed();
+        let p = cfg.providers.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(p.base_url, "https://relay2.example");
+
+        let (st, body) = call(
+            &b.app,
+            "DELETE",
+            &format!("/providers/{name}"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{name}: {body}");
+        assert!(b.parsed().providers.iter().all(|p| p.name != name));
+    }
+}
+
+/// 同上：检测代理以前在 `/proxies/test` 上
+#[tokio::test]
+async fn a_proxy_named_test_can_be_edited_and_deleted() {
+    let b = bed(BASE);
+    let proxy = |addr: &str| serde_json::json!({ "name": "test", "kind": "http", "addr": addr });
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/proxies",
+        serde_json::json!({ "proxy": proxy("10.0.0.1:8080") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let (st, body) = call(
+        &b.app,
+        "PUT",
+        "/proxies/test",
+        serde_json::json!({ "proxy": proxy("10.0.0.2:8080") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(b.parsed().proxies[0].addr, "10.0.0.2:8080");
+
+    let (st, body) = call(&b.app, "DELETE", "/proxies/test", serde_json::json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(b.parsed().proxies.is_empty());
+}
+
 // ─────────────────────────────────────────────────────────── 检测
 
 /// 一个假的上游：`/v1/models` 只认 `x-api-key: sk-good`。
@@ -580,7 +650,7 @@ async fn testing_an_unsaved_upstream_uses_the_protocol_and_lists_the_models() {
     let (st, body) = call(
         &b.app,
         "POST",
-        "/providers/test",
+        "/provider-test",
         serde_json::json!({ "provider": {
             "name": "relay",
             "base_url": format!("http://{up}"),
@@ -610,9 +680,9 @@ async fn testing_an_edited_upstream_checks_what_the_form_holds() {
             "current": "官方",
         })
     };
-    let (_, body) = call(&b.app, "POST", "/providers/test", test("sk-good")).await;
+    let (_, body) = call(&b.app, "POST", "/provider-test", test("sk-good")).await;
     assert_eq!(json(&body)["ok"], true, "{body}");
-    let (_, body) = call(&b.app, "POST", "/providers/test", test("sk-official")).await;
+    let (_, body) = call(&b.app, "POST", "/provider-test", test("sk-official")).await;
     assert_eq!(json(&body)["ok"], false, "{body}");
 }
 
@@ -623,7 +693,7 @@ async fn an_unsaved_oauth_credential_is_not_refreshed_just_to_test_it() {
     let (_, body) = call(
         &b.app,
         "POST",
-        "/providers/test",
+        "/provider-test",
         serde_json::json!({ "provider": {
             "name": "corp-llm",
             "base_url": "https://llm.corp.example",
@@ -681,7 +751,7 @@ async fn testing_a_proxy_checks_its_credentials() {
     let (_, body) = call(
         &b.app,
         "POST",
-        "/proxies/test",
+        "/proxy-test",
         serde_json::json!({ "proxy": with(serde_json::json!({ "user": "svc", "pass": "bad" })) }),
     )
     .await;
@@ -693,7 +763,7 @@ async fn testing_a_proxy_checks_its_credentials() {
     let (_, body) = call(
         &b.app,
         "POST",
-        "/proxies/test",
+        "/proxy-test",
         serde_json::json!({ "proxy": with(serde_json::json!({ "user": "svc", "pass": "good" })) }),
     )
     .await;

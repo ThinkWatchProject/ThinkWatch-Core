@@ -118,7 +118,7 @@ impl Bed {
         let (st, v) = call(
             &self.app,
             "POST",
-            "/plugins/rewrite",
+            "/plugin-rewrite",
             Some(json!({"source": src, "on_error": "skip",
                         "scope": {"clients": [], "models": ["deepseek-chat"], "upstreams": []},
                         "settings": settings})),
@@ -764,7 +764,7 @@ async fn enabling_a_default_compiles_it_and_then_it_runs() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/rewrite",
+        "/plugin-rewrite",
         Some(
             json!({"source": b.read(b.file("reply-language")), "on_error": "reject",
                     "scope": {"clients": [], "models": [], "upstreams": []},
@@ -826,7 +826,7 @@ async fn install_calls(b: &Bed) -> String {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/confirmed",
+        "/plugin-confirmed",
         Some(json!({"source": src, "id": "calls", "enabled": false})),
     )
     .await;
@@ -959,7 +959,7 @@ async fn wsl_paths_turns_on_only_with_a_confirmation() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/plugins/rewrite",
+        "/plugin-rewrite",
         Some(json!({"source": src, "on_error": "reject",
                     "scope": {"clients": [], "models": [], "upstreams": []},
                     "settings": {"windows_client": true}})),

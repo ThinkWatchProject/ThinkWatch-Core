@@ -755,6 +755,15 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 这把密钥不让用，那一家跳过（`skipped` 的 `not_allowed`）。发出的模型名和客户端写的不同、
 /// 上游答的又是同一个模型时，回答里的模型名（含 `openai-model`、`x-openai-model` 回应头）
 /// 写成客户端写的名称。照 37 写的界面读不懂列表形状的 `to`，保存规则时会把指定模型丢掉。
+/// 同一版起**写死的一段不再盖住用户起的名字**：`/providers/`、`/proxies/`、`/plugins/` 底下
+/// 不针对某一个的端点挪了出来（端点名不变）—— `POST /providers/test` → `POST /provider-test`、
+/// `POST /providers/preview` → `POST /provider-preview`、`POST /proxies/test` →
+/// `POST /proxy-test`、`POST /plugins/inspect` → `POST /plugin-inspect`、
+/// `POST /plugins/rewrite` → `POST /plugin-rewrite`、`POST /plugins/confirmed` →
+/// `POST /plugin-confirmed`、`PUT /plugins/order` → `PUT /plugin-order`。以前叫 `test`、
+/// `preview` 的上游和叫 `test` 的代理改和删都是 405；插件 id 不再保留 `order`、`inspect`、
+/// `rewrite`、`confirmed` 这几个词，消息码 `config.plugin.reserved_id`、
+/// `control.plugin.reserved_id` 跟着删。
 pub const CONTROL_API_VERSION: u32 = 38;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2296,7 +2305,7 @@ pub struct ProviderTestResult {
 /// L1 测速：只握手，不发业务请求。**零成本零副作用**。
 ///
 /// 给了名字就测那一家，不给就测所有上游。代理自己的检测走
-/// `/proxies/test`，还没保存的上游走 `/providers/test`。
+/// `/proxy-test`，还没保存的上游走 `/provider-test`。
 ///
 /// **不接受一个「候选 URL 列表」。** cc-switch 有那么一张表，测完还得手动
 /// 点一下填进去，运行时永远只认当前保存的那一个 —— 同一个概念在一个程序
@@ -5173,7 +5182,7 @@ pub struct PluginHooks {
 /// **都是插件写的字**。
 ///
 /// 出错时怎么办、范围、设置的值**都在文件里**：这里读到的就是这份源码装上之后的样子。
-/// 要改它们，用 `POST /plugins/rewrite` 改写源码
+/// 要改它们，用 `POST /plugin-rewrite` 改写源码
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ManifestView {
@@ -5239,7 +5248,7 @@ pub struct PluginView {
     pub stats: PluginStats,
 }
 
-/// 一份源码（`POST /plugins/inspect`）。
+/// 一份源码（`POST /plugin-inspect`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginSource {
@@ -5267,12 +5276,12 @@ pub struct PluginLoadError {
     pub column: Option<u32>,
 }
 
-/// 装一个插件（`POST /plugins`、`POST /plugins/confirmed`）。出错时怎么办、范围、设置的值
-/// 都在源码里（`POST /plugins/rewrite` 改写）。
+/// 装一个插件（`POST /plugins`、`POST /plugin-confirmed`）。出错时怎么办、范围、设置的值
+/// 都在源码里（`POST /plugin-rewrite` 改写）。
 ///
 /// 插件改得了回答里的工具调用（权限有 [`Permission::ReplyToolCalls`]）时，`POST /plugins`
 /// 拒绝（403，`control.plugin.needs_confirmation`），要在系统的确认框里点过头、走
-/// `POST /plugins/confirmed`。
+/// `POST /plugin-confirmed`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginCreate {
@@ -5303,7 +5312,7 @@ pub struct PluginSave {
     pub base_version: Option<String>,
 }
 
-/// 改写一份源码里的数据（`POST /plugins/rewrite`）：出错时怎么办、范围、设置的值。**什么都不
+/// 改写一份源码里的数据（`POST /plugin-rewrite`）：出错时怎么办、范围、设置的值。**什么都不
 /// 留下**，只交回改写之后的源码（[`PluginSource`]）—— 只换 manifest 字面量那一段，别的字节
 /// 一个不动；字面量里的注释不保留。
 ///
@@ -5348,7 +5357,7 @@ pub struct PluginSourceView {
     pub current_sha256: Option<String>,
 }
 
-/// 排顺序（`PUT /plugins/order`）：**全部 id**，按新的顺序。
+/// 排顺序（`PUT /plugin-order`）：**全部 id**，按新的顺序。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginOrder {

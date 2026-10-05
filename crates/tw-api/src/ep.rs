@@ -88,15 +88,17 @@ endpoints! {
 
     // ─────────────────────────────────────────────── 上游与代理
     CreateProvider: POST "/providers", api::ProviderSave => api::ConfigWritten;
-    TestProvider: POST "/providers/test", api::ProviderTest => api::ProviderTestResult;
-    PreviewProvider: POST "/providers/preview", api::ProviderPreviewRequest => api::ProviderPreview;
+    /// 检测和预览一家还没保存的上游。**不在 `/providers/` 底下**，代理的检测也一样：写死
+    /// 的一段会盖住 `/providers/{name}`，叫 `test` 的上游就改不了、删不掉了
+    TestProvider: POST "/provider-test", api::ProviderTest => api::ProviderTestResult;
+    PreviewProvider: POST "/provider-preview", api::ProviderPreviewRequest => api::ProviderPreview;
     UpdateProvider: PUT "/providers/{name}" [name], api::ProviderSave => api::ConfigWritten;
     DeleteProvider: DELETE "/providers/{name}" [name], api::BaseVersion => api::ConfigWritten;
     ProviderModels: GET "/providers/{name}/models" [name], () => api::ProviderModelsView;
     RefreshProviderModels: POST "/providers/{name}/models/refresh" [name], () => api::ProviderModelsView;
     RefreshStaleModels: POST "/models/refresh", () => api::ModelsRefreshing;
     CreateProxy: POST "/proxies", api::ProxySave => api::ConfigWritten;
-    TestProxy: POST "/proxies/test", api::ProxyTest => api::L1Result;
+    TestProxy: POST "/proxy-test", api::ProxyTest => api::L1Result;
     UpdateProxy: PUT "/proxies/{name}" [name], api::ProxySave => api::ConfigWritten;
     DeleteProxy: DELETE "/proxies/{name}" [name], api::BaseVersion => api::ConfigWritten;
 
@@ -160,23 +162,26 @@ endpoints! {
     // 网页的 `call` 白名单**，它的 Rust 先自己再编一遍源码（或者读一遍插件现在的样子），在系统
     // 的确认框里把名字、权限和要改的地方摆给人看，点了头才发。网页里注入的脚本调不到它们。
     // 每个端点说明里写着桌面端能不能把它给网页。
+    //
+    // 不针对某一个插件的那几个（试编、改写、点过头的装、排顺序）**不在 `/plugins/` 底下**：
+    // 插件的 id 是用户起的，写死的一段会盖住 `/plugins/{id}`。
     /// 全部插件，按运行的顺序：状态、计数。**网页可以调**
     Plugins: GET "/plugins", () => Vec<api::PluginView>;
     /// 编一份源码看看它是什么插件，**什么都不留下**。**网页可以调**
-    PluginInspect: POST "/plugins/inspect", api::PluginSource => api::PluginInspection;
+    PluginInspect: POST "/plugin-inspect", api::PluginSource => api::PluginInspection;
     /// 改写一份源码里的数据（出错时怎么办、范围、设置的值），交回改写之后的源码：只换
     /// manifest 那一段，别的字节一个不动。**没有副作用**，不读不写任何文件和配置。
     /// 界面的设置表单靠它更新代码视图（反过来，代码 → 表单用 `PluginInspect`）。
     /// **网页可以调**
-    PluginRewrite: POST "/plugins/rewrite", api::PluginRewriteRequest => api::PluginSource;
+    PluginRewrite: POST "/plugin-rewrite", api::PluginRewriteRequest => api::PluginSource;
     /// 装一个：写插件文件和它的底稿，配置里加一条。改得了工具调用的插件在这里拒绝（403，
     /// `control.plugin.needs_confirmation`），要走 `CreatePluginConfirmed`。**网页可以调**
     CreatePlugin: POST "/plugins", api::PluginCreate => api::ConfigWritten;
     /// 同一件事，在系统的确认框里点过头了：改得了工具调用的插件也装得上。**网页不能调，
     /// 桌面端也不许把它放进网页的白名单**
-    CreatePluginConfirmed: POST "/plugins/confirmed", api::PluginCreate => api::ConfigWritten;
+    CreatePluginConfirmed: POST "/plugin-confirmed", api::PluginCreate => api::ConfigWritten;
     /// 排顺序，也就是运行的顺序。**网页可以调**
-    ReorderPlugins: PUT "/plugins/order", api::PluginOrder => api::ConfigWritten;
+    ReorderPlugins: PUT "/plugin-order", api::PluginOrder => api::ConfigWritten;
     /// 保存：源码和开关。core 拿源码和批准的那一份比，分成「只改了数据」和「改了代码」
     /// （见 `PluginSave`）；写文件、底稿和配置里的哈希是一件事，中间没有「文件变了」
     /// 的那一刻。改得了工具调用的插件，改代码、打开它在这里拒绝（403，
@@ -230,6 +235,48 @@ mod tests {
                 .collect();
             assert_eq!(in_template, e.params, "{}: {}", e.name, e.path);
         }
+    }
+
+    /// 名字是用户起的，什么词都可能：一个端点的某一段是 `{参数}` 的话，前面几段相同的
+    /// 别的端点在这一段上不能写死一个词，不管方法是什么。写死了，axum 先认写死的那个，
+    /// 叫这个词的上游（代理、插件……）就只剩那一个端点的方法，改和删都是 405 ——
+    /// `PUT /plugins/order` 更是进了排顺序。
+    ///
+    /// 取值由 core 定死的参数（`{guard}`）除外，只要写死的词不是其中一个。
+    #[test]
+    fn no_fixed_segment_shadows_a_parameter() {
+        // 这个词能不能是这个参数的一个取值
+        let could_be = |param: &str, word: &str| match param {
+            "{guard}" => api::Guard::from_slug(word).is_some(),
+            _ => true,
+        };
+        let is_param = |s: &str| s.starts_with('{');
+        let segments = |p: &'static str| p.split('/').skip(1).collect::<Vec<_>>();
+        let mut shadowed = std::collections::BTreeSet::new();
+        for a in ALL {
+            let sa = segments(a.path);
+            for (i, param) in sa.iter().enumerate().filter(|(_, s)| is_param(s)) {
+                for b in ALL {
+                    let sb = segments(b.path);
+                    let Some(word) = sb.get(i).filter(|s| !is_param(s)) else {
+                        continue;
+                    };
+                    let same_prefix = sa[..i]
+                        .iter()
+                        .zip(&sb[..i])
+                        .all(|(x, y)| x == y || (is_param(x) && is_param(y)));
+                    if same_prefix && could_be(param, word) {
+                        shadowed.insert(format!(
+                            "{} {}: `{word}` where /{} takes any name",
+                            b.method.as_str(),
+                            b.path,
+                            sa[..=i].join("/")
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(shadowed.is_empty(), "{shadowed:#?}");
     }
 
     /// 同一个路径上同一个方法只能有一个端点，名字也不能重。

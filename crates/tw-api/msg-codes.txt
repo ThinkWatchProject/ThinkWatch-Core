@@ -72,7 +72,6 @@ config.no_clients
 config.plugin.bad_id
 config.plugin.duplicate
 config.plugin.file
-config.plugin.reserved_id
 config.plugin.sha256
 config.rejected
 config.rejected_at
@@ -161,7 +160,6 @@ control.plugin.id_taken
 control.plugin.needs_confirmation
 control.plugin.not_found
 control.plugin.order
-control.plugin.reserved_id
 control.plugin.trial_changed
 control.plugin.unreadable
 control.plugin.write_failed
