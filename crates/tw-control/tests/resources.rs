@@ -180,6 +180,7 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
     assert_eq!(f["failures_to_pause"], 3, "{body}");
     assert_eq!(f["pause_secs"], 60);
     assert_eq!(f["stream_start_wait_secs"], 15);
+    assert_eq!(f["slot_wait_secs"], 30);
 
     let (st, body) = call(
         &b.app,
@@ -209,6 +210,61 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("config.failover_range"), "{body}");
+
+    // 等空位写 0 是不等，存得进去
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/slot_wait_secs", "value": 0 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(b.parsed().failover.slot_wait_secs, 0);
+}
+
+/// 开头慢就换下一家：默认关；打开要等得够久，等得太短的被拒
+#[tokio::test]
+async fn switching_on_a_slow_start_is_shown_and_needs_a_long_enough_wait() {
+    let b = bed(BASE);
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(
+        json(&body)["failover"]["next_on_slow_start"],
+        false,
+        "{body}"
+    );
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/next_on_slow_start", "value": true }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(b.parsed().failover.next_on_slow_start);
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(
+        json(&body)["failover"]["next_on_slow_start"],
+        true,
+        "{body}"
+    );
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/stream_start_wait_secs", "value": 3 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("config.slow_start_too_short"), "{body}");
 }
 
 // ─────────────────────────────────────────────────────────── 上游
@@ -271,6 +327,48 @@ async fn saving_an_upstream_as_the_overview_shows_it_touches_only_what_changed()
     assert_eq!(p.billing, tw_config::Billing::Free);
 }
 
+/// 并发上限：存进去、概览原样给回来；去掉就是不限。0 和超过 1000 的存不进去
+#[tokio::test]
+async fn an_upstreams_concurrency_limit_is_saved_shown_and_checked() {
+    let b = bed(BASE);
+    let save = |n: serde_json::Value| {
+        let app = b.app.clone();
+        async move {
+            call(
+                &app,
+                "PUT",
+                "/providers/官方",
+                serde_json::json!({ "provider": official(serde_json::json!({ "max_concurrent": n })) }),
+            )
+            .await
+        }
+    };
+    let (st, body) = save(serde_json::json!(4)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(b.parsed().providers[0].max_concurrent, Some(4));
+    assert!(b.file().contains("max_concurrent: 4"), "{}", b.file());
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(json(&body)["providers"][0]["max_concurrent"], 4, "{body}");
+
+    let before = b.file();
+    for bad in [0, 1001] {
+        let (st, body) = save(serde_json::json!(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}：{body}");
+        assert!(body.contains("config.provider_concurrency_range"), "{body}");
+    }
+    assert_eq!(b.file(), before, "拒绝了的保存不该动配置");
+
+    // 不交就是不限：这一行从文件里去掉，概览里也没有
+    let (st, body) = save(serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(!b.file().contains("max_concurrent"), "{}", b.file());
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert!(
+        json(&body)["providers"][0].get("max_concurrent").is_none(),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn billing_is_per_token_or_free_and_nothing_else() {
     // 订阅账号也按价目表算费用：「订阅」「未知」不再是计费方式，存不进去
@@ -303,7 +401,7 @@ async fn renaming_an_upstream_moves_its_references_in_the_same_version() {
     assert_eq!(st, StatusCode::OK, "{body}");
     let cfg = b.parsed();
     assert_eq!(cfg.providers[0].name, "anthropic");
-    assert_eq!(cfg.groups[0].providers, ["anthropic"]);
+    assert_eq!(cfg.groups[0].names(), ["anthropic"]);
     // 一次保存一个版本：历史里只多了改之前的那一份
     let history = tw_config::history::list(&b.dir.path().join("config.yaml")).unwrap();
     assert_eq!(

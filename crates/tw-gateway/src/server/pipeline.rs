@@ -20,10 +20,14 @@ use crate::forward;
 use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
+mod admission;
 mod hop;
 mod opening;
 mod plug;
 mod relay;
+mod slow;
+
+pub(crate) use hop::stream_fault;
 
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
 /// 客户端打不爆内存。
@@ -60,6 +64,9 @@ struct Started {
     ledger: tw_guard::redact::replace::Ledger,
     /// 出站脱敏在客户端原文里找到的。插件改过的那一跳只再报插件写进来的（见 [`plug`]）
     found: Vec<tw_guard::redact::rules::Finding>,
+    /// 这个请求最多等到什么时候：准入时定下（见 [`admission`]），等密钥的分钟、小时上限和
+    /// 等上游的空位共用这一段（`failover.slot_wait_secs`）
+    wait_until: tokio::time::Instant,
 }
 
 pub(super) async fn pipeline(
@@ -115,15 +122,26 @@ pub(super) async fn pipeline(
         }
     };
 
-    // 管线第 3 步：这把密钥自己的并发上限。**等，不拒绝** —— 理由在
-    // `crate::limits`。放在路由之后：被规则挡下的请求不用先等一轮
-    let limit = rt
-        .config
-        .clients
-        .iter()
-        .find(|c| c.name == req.client_name)
-        .and_then(|c| c.max_concurrent);
-    let _pass = state.gate.acquire(&req.client_name, limit).await;
+    // 管线第 3 步：这把密钥的用量上限和并发上限（见 `admission`）。放在路由之后：被规则
+    // 挡下的请求不用先等一轮。被用量上限拒绝的照样留一行
+    //
+    // **并发的通行证交给回程，跟着响应体走**（见 `relay`）：放在这里的话它在响应头交出去的
+    // 那一刻就还了，一条还在流的回答不再算数，上限管的只是等响应头的那一段
+    let admission::Admitted {
+        pass,
+        hold,
+        wait_until,
+    } = admission::admit(
+        &state,
+        &rt,
+        &req,
+        &reading,
+        &choice,
+        &decision,
+        fp.as_deref(),
+        ending,
+    )
+    .await?;
 
     // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
     let screening = screen(&rt, &mut req, &mut reading);
@@ -133,10 +151,13 @@ pub(super) async fn pipeline(
         &req,
         &reading,
         choice,
+        wait_until,
         &decision,
         fp.as_deref(),
         ending,
     );
+    // 用量上限的预留跟着请求号走，等存储层记下这一行时换成实数
+    hold.bind(started.id);
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
     // 流量里照样留一行；一个字节都不发
     let provider = started.alive.first().map(String::as_str).unwrap_or("");
@@ -216,7 +237,7 @@ pub(super) async fn pipeline(
         &reading.facts.model,
         served,
         started.id,
-        live,
+        (live, pass),
         ending,
         reply_plugins,
     ))
@@ -224,7 +245,7 @@ pub(super) async fn pipeline(
 
 /// 数 token 由网关估了数（见 [`crate::count`]）：把它交给客户端，照常报响应头和结局。
 ///
-/// **不经过 `relay`**：那里按上游的回答记首字节时间、额度、凭据和代理的状态，而这个
+/// **不经过 `relay`**：那里按上游的回答记快慢样本、额度、凭据和代理的状态，而这个
 /// 回答不是上游给的 —— 记上去的话，一家从没被问过的上游会显示成「刚刚答得飞快」。
 /// 响应头上带 `x-thinkwatch-local`，和本地应答的一样。
 fn estimated(
@@ -355,8 +376,8 @@ fn conversation(
 /// 输入超出了这个决定所选模型的上下文窗口：这一轮沿用的决定要重新求值。
 ///
 /// 按候选里最小的那个窗口算，留 5% 的余量（输入是估的）。**知道窗口的才算**：价目表
-/// 里没写的模型，说不出它装不装得下，照常沿用。窗口按每一家发出去的名字查：别名在各家
-/// 是各家的名字（见 [`crate::sent`]）。
+/// 里没写、那一家也没手写（`model_specs`）的模型，说不出它装不装得下，照常沿用。窗口按
+/// 每一家发出去的名字查：别名在各家是各家的名字（见 [`crate::sent`]）。
 fn outgrown(
     state: &AppState,
     rt: &Runtime,
@@ -379,9 +400,9 @@ fn outgrown(
     )
     .iter()
     .filter_map(|s| {
-        book.resolve_for(&s.provider, s.model.as_deref().ok()?)?
-            .price
-            .max_input_tokens
+        rt.config
+            .model_limits(&book, &s.provider, s.model.as_deref().ok()?)
+            .context_window()
     })
     .min()
     .is_some_and(|limit| facts.input_tokens.saturating_mul(100) >= limit.saturating_mul(95))
@@ -612,6 +633,7 @@ fn route(
                     group: None,
                     rewritten_by: Vec::new(),
                     affinity: None,
+                    stayed_on: None,
                 };
                 return Ok(Routed::Refused(choice, why));
             }
@@ -626,6 +648,7 @@ fn route(
             held_route,
             stayed: None,
         }),
+        stayed_on: None,
     };
     // 每个候选实际要的模型和它的来历：规则改写过的按改写后的算；客户端写的、阶段一改写的
     // 是客户端那一侧的名称（可能是别名），指定的、阶段二改的原样发出。准入看它
@@ -655,58 +678,108 @@ fn route(
         tracing::debug!(skipped = ?serving.skipped, %model, "skipping the candidates that cannot serve this request");
     }
     decision.candidates = serving.usable;
+    let arranged = arrange(
+        state,
+        rt,
+        &mut decision,
+        &crate::sent::pairs(&sent),
+        conv,
+        now,
+    );
+    if let Some(why) = arranged.stayed {
+        choice.affinity = Some(tw_api::AffinityView {
+            held_route,
+            stayed: Some(why),
+        });
+        // 留下的那一家在头上。满着时等它，不当场跳过（见 `crate::slots`）
+        choice.stayed_on = decision.candidates.first().cloned();
+    }
+    // `load-balance` 记账：**记粘性之后排头的那一家**，不是按权重轮到的那一家。一段对话
+    // 留在了上次回答它的那一家，这一次就算那一家的；之后的新对话把差的补回去
+    if let Some(leader) = decision.candidates.first() {
+        arranged.charge(&decision.candidates, leader);
+    }
+    Ok(Routed::Go(choice, decision))
+}
+
+/// 排好了的候选（[`arrange`]）：会话粘性留下了哪一家的理由，和 `load-balance` 这一次还没记的账。
+pub(super) struct Arranged<'a> {
+    /// 排头的是上次回答这段对话的那一家：留下的理由。没留的是 None
+    pub(super) stayed: Option<tw_api::Stay>,
+    /// `load-balance` 这一轮（拿着它的锁）和排序时的那一份事实。别的组没有
+    ledger: Option<(crate::balance::Turn<'a>, tw_engine::Facts)>,
+}
+
+impl Arranged<'_> {
+    /// `load-balance` 记账：这一次排头的是 `leader`，`members` 是排好的那一份候选（粘性只换了
+    /// 次序，没换集合，还是同一轮）。HTTP 的请求记粘性之后排头的那一家，WebSocket 的升级记
+    /// 真连上的那一家。不经过 `load-balance` 的什么都不记
+    pub(super) fn charge(self, members: &[String], leader: &str) {
+        if let Some((turn, f)) = self.ledger {
+            turn.charge(members, &f, leader);
+        }
+    }
+}
+
+/// 管线第 2 步的最后：给候选排序、会话粘性。**HTTP 的请求和 WebSocket 的升级共用这一个**（见
+/// `super::upgrade`）：同一个组排出同一个顺序，`load-balance` 记同一本账，试算说的就是两条路
+/// 下一个新对话会去的那一家。
+///
+/// `decision.candidates` 进来时是能服务这个请求的那几家，出去时是排好的次序。`sent` 是每一家和
+/// 发给它的名字（比价按它算）；`conv` 是这段对话，认不出来的（WebSocket 的升级）没有粘性。
+/// 记账交给调用方（[`Arranged::charge`]）：从排序到记账一直拿着 `load-balance` 那一组的锁，
+/// 同时进来的几个一个接一个地排，后一个看到的是前一个记过的账
+pub(super) fn arrange<'a>(
+    state: &'a AppState,
+    rt: &'a Runtime,
+    decision: &mut tw_engine::Decision,
+    sent: &[(String, String)],
+    conv: Option<&crate::affinity::Conversation>,
+    now: u64,
+) -> Arranged<'a> {
+    let group = decision
+        .via_group
+        .as_deref()
+        .and_then(|n| rt.engine.groups().iter().find(|g| g.name == n));
+    // `load-balance` 这一次轮到谁（见 `crate::balance`）
+    let turn = group
+        .filter(|g| g.kind == tw_engine::GroupType::LoadBalance)
+        .map(|g| state.balance.turn(g));
     // 策略组排序。**引擎给的是集合，顺序在这儿定** ——
     // 因为 `load-balance` / `url-test` / `cheapest` 都要运行时的数字，
     // 而路由决策本身必须是纯的、可试算的。
     //
     // `fallback` 和 `select` 走不到这里面 —— 那是绝大多数人的配置，
     // 它们连一个 HashMap 都不用建。
-    if let Some(gname) = decision.via_group.clone()
-        && let Some(kind) = rt
-            .engine
-            .groups()
-            .iter()
-            .find(|g| g.name == gname)
-            .map(|g| g.kind)
-        && kind.needs_runtime()
+    let mut facts_rt = None;
+    if let Some(g) = group
+        && g.kind.needs_runtime()
     {
-        let facts_rt = tw_engine::Facts {
-            seq: state.bus.peek_id(),
-            ttfb_ms: match kind {
-                tw_engine::GroupType::UrlTest => state.latency.snapshot(&decision.candidates),
-                _ => Default::default(),
-            },
-            price: match kind {
-                // 每一家按发给它的名字算价钱：同一个别名在各家是各家的模型名、各家的价目
-                tw_engine::GroupType::Cheapest => state.unit_prices(
-                    &rt.config.providers,
-                    &crate::sent::pairs(&sent),
-                    &decision.candidates,
-                ),
-                _ => Default::default(),
-            },
-        };
-        decision.candidates = rt
-            .engine
-            .order(Some(&gname), &decision.candidates, &facts_rt);
+        let f = state.group_facts(
+            &rt.config.providers,
+            g,
+            &decision.candidates,
+            sent,
+            turn.as_ref().map(crate::balance::Turn::current),
+        );
+        decision.candidates = rt.engine.order(Some(&g.name), &decision.candidates, &f);
+        facts_rt = Some(f);
     }
     // 留在上次回答这段对话的那一家：同一轮里一律留，跨轮看缓存值不值得留。**排在
     // 策略组排序之后** —— 该留的时候盖过策略，放开的时候策略照常说了算
-    if let Some(c) = conv
-        && let Some(why) = state.affinity.stay(
+    let stayed = conv.and_then(|c| {
+        state.affinity.stay(
             c,
             decision.via_group.as_deref(),
             &mut decision.candidates,
             |p| state.health.is_available(p),
             now,
         )
-    {
-        choice.affinity = Some(tw_api::AffinityView {
-            held_route,
-            stayed: Some(why),
-        });
+    });
+    Arranged {
+        stayed,
+        ledger: turn.zip(facts_rt),
     }
-    Ok(Routed::Go(choice, decision))
 }
 
 /// 发出开始事件：熔断过滤、出站脱敏看一遍、`RequestStarted`、结局、脱敏的记录、请求体留档。
@@ -720,6 +793,7 @@ fn start(
     req: &Inbound,
     reading: &crate::client_api::Reading,
     choice: Choice,
+    wait_until: tokio::time::Instant,
     decision: &tw_engine::Decision,
     fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
@@ -779,6 +853,7 @@ fn start(
         conversation: crate::affinity::identity(&req.headers, fp),
         ledger,
         found,
+        wait_until,
     }
 }
 

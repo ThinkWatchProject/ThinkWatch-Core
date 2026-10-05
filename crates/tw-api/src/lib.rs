@@ -166,6 +166,16 @@ slug_enum! {
 }
 
 slug_enum! {
+    /// 上下文窗口、输出上限这样的模型规格从哪儿来。
+    pub enum SpecSource {
+        /// 价目表
+        PriceTable = "price_table",
+        /// 这一家上游手写的（配置里的 `model_specs`），优先于价目表
+        Manual = "manual",
+    }
+}
+
+slug_enum! {
     /// 一个上游现在能不能进候选链。
     pub enum Health {
         Ok = "ok",
@@ -458,6 +468,9 @@ slug_enum! {
         /// 发给它的名字这把密钥不让用（`allow`）：指定模型、阶段二改的名字一家一个，
         /// 只在试算给了密钥时出现
         NotAllowed = "not_allowed",
+        /// 它的并发数满了（`max_concurrent`）：这一跳没有发出去，换了下一家。只在尝试链里
+        /// 出现（[`AttemptView::skipped`]）
+        Busy = "busy",
     }
 }
 
@@ -764,7 +777,24 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `preview` 的上游和叫 `test` 的代理改和删都是 405；插件 id 不再保留 `order`、`inspect`、
 /// `rewrite`、`confirmed` 这几个词，消息码 `config.plugin.reserved_id`、
 /// `control.plugin.reserved_id` 跟着删。
-pub const CONTROL_API_VERSION: u32 = 38;
+///
+/// **39 起路由看得到上游忙不忙、快不快、可不可靠，密钥有用量上限**。上游能设并发上限
+/// （[`ProviderView`]、[`ProviderInput`] 的 `max_concurrent`）；[`FailoverView`] 多了
+/// `slot_wait_secs`（一个请求合计最多等多久，等密钥的分钟、小时上限也算在里面）和
+/// `next_on_slow_start`（流开头太慢就换下一家）。尝试链（[`AttemptView`]）多了 `queued_ms`、
+/// `skipped`（[`ServeSkip`] 的 `busy`）和 `usage`（[`AttemptUsage`]：开头慢被放弃的那一跳上游
+/// 可能已经收了钱的输入），结果多了 `slow_start`（[`AttemptOutcome`]）。`load-balance` 组的
+/// 成员有权重、能按快慢和成败分（[`GroupView`]、[`GroupInput`] 的 `weights`、`balance_by`，
+/// [`BalanceBy`]），试算说得出每个成员的权重、快慢、成功率和系数（[`DryRunCandidate`]、
+/// [`DryRunResult::balance_by`]）。一家上游的模型规格可以手动设：新端点
+/// `PUT /provider-model-spec`（[`ModelSpecSave`] → [`ConfigWritten`]），[`ModelRow`] 多了
+/// `context_window_source`、`max_output_tokens`、`max_output_tokens_source`（[`SpecSource`]）。
+/// 密钥的用量上限：[`ClientView`] 多了 `limits`（[`KeyLimitView`]）和 `unpriced_models`，
+/// [`KeyInput`] 多了 `limits`（[`KeyLimitInput`]），事件多了 [`Event::KeyLimitAlert`]。
+/// Responses 的 WebSocket 连接上每个 `response.create` 是一行请求（带用量和费用，按轮算上限、
+/// 并发、快慢和成败），连接本身不留行；Realtime 和别的路径照旧整条连接一行。照 38 写的界面
+/// 保存组和密钥时会把权重、上限丢掉。
+pub const CONTROL_API_VERSION: u32 = 39;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -854,7 +884,8 @@ pub enum Event {
         /// 的指纹）、离这段对话的上一个请求不超过半小时，就还是那一次；隔久了算
         /// 新的一次。**开始时就给出来**，界面才能把一个还在跑的请求放进它的会话、
         /// 把那次会话标成进行中。认不出会话的没有：正文里没有任何能认人的东西，
-        /// 或者是 WebSocket 升级（升级请求没有正文）
+        /// 或者是整条连接一行的 WebSocket（升级请求没有正文）。Responses 连接上的每一轮
+        /// 按那一帧认，和 HTTP 的请求一样
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
         /// 请求从哪台机器来：**这条连接对面的地址**，不可伪造。本机（回环）
@@ -925,9 +956,11 @@ pub enum Event {
     /// `response.created` 这类开场帧不算：那是上游收到请求就发的。
     ///
     /// 只有成功的流式响应有。非流式的整段一起到，没有「第一个」；不带 `alt=sse` 的
-    /// Gemini 流和 WebSocket 那条路不在这里解析，也没有。
+    /// Gemini 流和整条连接一行的 WebSocket 不在这里解析，也没有。Responses 连接上的每一轮
+    /// 有。
     RequestFirstToken { id: u64, ttft_ms: u64 },
-    /// 结束了：上游回的是成功的状态码（2xx；WebSocket 那条路是升级成功的 101），回答
+    /// 结束了：上游回的是成功的状态码（2xx；整条连接一行的 WebSocket 是升级成功的 101，
+    /// Responses 连接上的一轮是 200），回答
     /// 交完了。**上游回了别的、原样交给了客户端的不是这一条**，是 `RequestFailed` ——
     /// 客户端拿到的是上游的错误，不是回答
     RequestFinished {
@@ -939,7 +972,8 @@ pub enum Event {
         /// 在结局里才到的。模型名只在开始事件里的话，一个开始时没人在听、
         /// 结束时有人在听的请求，它的用量就不知道该记在哪个模型上。
         ///
-        /// WebSocket 那条路是空串：升级请求里没有模型名（和开始事件一样）。
+        /// 整条连接一行的 WebSocket 和开始事件一样：Realtime 是查询串里的那个，别的连接
+        /// 升级时还不知道，是空串。
         model: String,
         status: u16,
         bytes: u64,
@@ -959,7 +993,7 @@ pub enum Event {
         /// 上游在回答里写的模型名：Anthropic 和 Chat 的 `model`、Responses 的
         /// `response.model`、Gemini 的 `modelVersion`。**原样，不归一。**
         ///
-        /// 回答里没写的没有：Bedrock 的 Converse 不写，WebSocket 那条路不看。和
+        /// 回答里没写的没有：Bedrock 的 Converse 不写，整条连接一行的 WebSocket 不看。和
         /// `model` 不是一回事 —— 那是客户端要的，这是上游说它用的
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered_model: Option<String>,
@@ -1032,8 +1066,9 @@ pub enum Event {
     /// `RequestFinished` 上的话，失败的那条路就没有尝试链 —— 而那恰恰
     /// 是最需要看它的时候。
     ///
-    /// WebSocket 那条路也发：和上游的握手有了结果就发。那条路不做故障转移，
-    /// 尝试链只有一跳。
+    /// WebSocket 那条路也发，不做故障转移，尝试链只有一跳：整条连接一行的，和上游的
+    /// 握手有了结果就发；Responses 连接上的一轮，上游这一轮的第一帧到了就发（没等到就在
+    /// 结局之前），那一跳是这条连接连着的那一家。
     ///
     /// **规则做了决定、请求却一家上游都没到的也发**：规则拒绝了它（第一阶段），
     /// 或者规则选中的上游都服务不了这个模型 —— 那时尝试链是空的，紧跟着一条
@@ -1319,6 +1354,28 @@ pub enum Event {
         resets_at_ms: Option<u64>,
         at_ms: u64,
     },
+    /// 一把网关密钥这一期（天、周、月）的用量到了一条上限的八成，或者到了上限。
+    ///
+    /// **每一期、每一档只报一次**：同一期里之后的请求照样被拒，同一句话说第二遍只会
+    /// 让人学会忽略通知。下一期重新算；上限改了也重新算。重启之后从请求记录里加回来
+    /// 时已经过了的档不再报。滚动的上限（分钟、小时）不报：它们几十秒就过去
+    KeyLimitAlert {
+        id: u64,
+        /// 密钥的名字
+        key: String,
+        per: LimitPer,
+        measure: LimitMeasure,
+        /// 上限，单位同 `KeyLimitView::max`
+        max: u64,
+        /// 报的时候用了多少，同上
+        used: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cache_reads: bool,
+        /// `true` = 到了上限，之后的请求被拒到 `resets_at_ms`；`false` = 到了八成
+        reached: bool,
+        resets_at_ms: u64,
+        at_ms: u64,
+    },
     /// 数据面换了监听地址，或者没换成（旧的还在服务）。
     ///
     /// **和 `ConfigReloaded` 是两件事。**配置换进去之后监听器才开始换，
@@ -1438,6 +1495,11 @@ slug_enum! {
         /// （`status` 是它回的那个）。尝试链到此为止，这一行记成网关自己答的
         /// （[`HistoryRow::local`]），费用 0
         Estimated = "estimated",
+        /// 流式回答等了 `failover.stream_start_wait_secs` 还没有内容，开着
+        /// `failover.next_on_slow_start`，放弃这一家、换下一家（连接断开，上游不再生成）。
+        /// 响应头到了的有 `status`，没到的没有。**这一家不停用、不算失败**。上游可能已经按
+        /// 输入收了钱：知道多少的在 `usage` 里
+        SlowStart = "slow_start",
     }
 }
 
@@ -1456,16 +1518,93 @@ pub struct AttemptView {
     /// **费用按它算**：请求改写成另一个模型发出去，上游按那个模型收钱。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// WebSocket 的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
-    /// 状态码是 `status`，连不上是 `error`。
+    /// WebSocket 连接的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
+    /// 状态码是 `status`，连不上是 `error`。Responses 的连接上每一轮是一个请求，那一跳是这条
+    /// 已经接下的连接：发出去了是 `served`，状态码记 200。
     pub outcome: AttemptOutcome,
     /// 上游返回的状态码。`error` 时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句
+    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句。`slow_start` 时说等了多久
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Msg>,
     pub ms: u64,
+    /// 放弃了的这一跳（`slow_start`）上游可能已经收了钱的输入（见 [`AttemptUsage`]）。估不
+    /// 出来的（请求解不开）没有。别的结果都没有：接下请求的那一跳的用量在结局里
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AttemptUsage>,
+    /// 这一跳等了多少毫秒才轮到一个空位：这家设了 `max_concurrent` 而它满着。不算在 `ms`
+    /// 里。没等的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<u64>,
+    /// 这一跳为什么没发出去：`busy`（这家满着，换了下一家；等过它的话 `queued_ms` 是等了
+    /// 多久）。这时 `outcome` 是 `error`，`error` 是同一件事的那句话。发出去了的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<ServeSkip>,
+}
+
+/// 发出去之后才失败的一跳报的码（见 [`AttemptView::sent`]）：上游没在时限内回话、请求在路上
+/// 断了、流在第一段内容之前报了错。**上游可能已经收下了它、在算了**。
+///
+/// 别的 `error` 都没发出去：这家满着（`skipped`）、规则拒绝、格式对不上、发给它的名字对不上、
+/// 插件拒绝、转换不了、凭据取不到、签不了名，还有连不上（地址不通、握手失败）—— 那时上游
+/// 一个字节都没收到。
+pub const FAILED_AFTER_SENDING: &[&str] = &[
+    "gw.upstream.timeout",
+    "gw.upstream.forward_failed",
+    "gw.upstream.stream_opening_error",
+];
+
+impl AttemptView {
+    /// 这一跳发到了上游：上游回了话（`served`、`status`、`slow_start`，`estimated` 里带着
+    /// 状态码的），或者发出去之后才失败（[`FAILED_AFTER_SENDING`]）。
+    pub fn sent(&self) -> bool {
+        match self.outcome {
+            AttemptOutcome::Served | AttemptOutcome::Status | AttemptOutcome::SlowStart => true,
+            AttemptOutcome::Estimated => self.status.is_some(),
+            AttemptOutcome::Error => {
+                self.skipped.is_none()
+                    && self
+                        .error
+                        .as_ref()
+                        .is_some_and(|m| FAILED_AFTER_SENDING.contains(&m.code.as_str()))
+            }
+        }
+    }
+}
+
+impl RoutingView {
+    /// 这个请求可能发到了上游：尝试链上有一跳发出去了（[`AttemptView::sent`]）。**尝试链是空的
+    /// 时看它怎么收场**（`failed`）：失败的是网关在发往哪一家之前就拒了（规则、内容过滤、
+    /// 用量上限）；没失败的（客户端走了）是还没等到路由事件 —— 那时请求可能正在上游那里，
+    /// 算它发到了。
+    ///
+    /// 密钥的用量上限只数这样的请求（见 `tw_gateway::key_limits`）：上游都满着回的 429、
+    /// 被拒的请求不该用掉客户端的上限，它重试的时候什么都没花。
+    pub fn reached_upstream(&self, failed: bool) -> bool {
+        if self.attempts.is_empty() {
+            return !failed;
+        }
+        self.attempts.iter().any(AttemptView::sent)
+    }
+}
+
+/// 放弃了的一跳（[`AttemptOutcome::SlowStart`]）上游可能已经收了钱的输入。
+///
+/// 上游在流开头报了的（Anthropic 的 `message_start`）是它报的数；没报的只有 `input`，是网关
+/// 估的（`estimated`，和 [`Event::RequestStarted`] 的 `input_estimate` 同一个数）。**输出不知道**：
+/// 先想好再输出的模型，放弃之前可能已经想了一阵，上游不说就看不到。
+///
+/// **不算进这个请求的费用**：上游收没收、收了多少，网关看不到
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AttemptUsage {
+    /// 输入 token，不含缓存读写
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// `input` 是网关估的，上游什么都没报
+    pub estimated: bool,
 }
 
 /// 一次请求的路由决策。**详情抽屉的 Routing 那一页吃它。**
@@ -1584,6 +1723,7 @@ impl Event {
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
+            | Event::KeyLimitAlert { id, .. }
             | Event::SecretsFound { id, .. }
             | Event::ContentMatched { id, .. }
             | Event::RequestPriced { id, .. }
@@ -1832,6 +1972,11 @@ pub struct FailoverView {
     pub rate_limit_max_pause_secs: u64,
     /// 流式回答的开头最多等多少秒
     pub stream_start_wait_secs: u64,
+    /// 等过 `stream_start_wait_secs` 还没有内容就换下一家（最后一家照常等）
+    pub next_on_slow_start: bool,
+    /// 一个请求合计最多等多少秒：等密钥的分钟、小时上限空出名额，和等满着（`max_concurrent`）
+    /// 的上游空出位置，共用这一段。0 是不等
+    pub slot_wait_secs: u64,
 }
 
 /// 每项防护各在哪一档：`off` / `observe` / `enforce`。
@@ -1924,6 +2069,9 @@ pub struct ProviderView {
     pub references: Vec<ReferenceView>,
     /// 选的价目表。空 = 默认价目表
     pub pricing: Option<String>,
+    /// 同时最多发给这家几个请求。不限是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 /// 一行请求头，配置里写的原样。
@@ -2141,6 +2289,12 @@ pub struct GroupView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub providers: Vec<String>,
+    /// `load-balance` 组每个成员的权重，**每个成员都在**，没写权重的是 1：长期看各家分到的
+    /// 请求就是这个比例。进行中的对话留在回答它的那一家，那一轮记在那一家的份额里，新对话把
+    /// 差的补回去。别的类型不用权重，是空的
+    pub weights: std::collections::BTreeMap<String, u32>,
+    /// `load-balance` 按什么分请求。别的类型永远是 `weights`
+    pub balance_by: BalanceBy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2168,6 +2322,71 @@ pub struct ClientView {
     /// 那个可以伪造。从来没被用过时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    /// 用量上限，按配置里的顺序，各带此刻用了多少。没设的是空的
+    pub limits: Vec<KeyLimitView>,
+    /// 这把密钥用得到、却没有价格的模型。**只有设了费用上限的密钥才算**：这些模型的
+    /// 请求费用记 0，费用上限管不住它们，对话框里要提醒一句。没有就不带
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpriced_models: Vec<String>,
+}
+
+slug_enum! {
+    /// 用量上限按多长一段时间算。分钟、小时是**滚动的**（最近 60 秒、最近 60 分钟）；
+    /// 天、周、月是**自然的**，按 core 所在机器的本地时区：零点、周一零点、一号零点重新算。
+    pub enum LimitPer {
+        Minute = "minute",
+        Hour = "hour",
+        Day = "day",
+        Week = "week",
+        Month = "month",
+    }
+}
+
+slug_enum! {
+    /// 一条用量上限数的是什么。
+    pub enum LimitMeasure {
+        /// 请求数。数 token 的请求、网关自己答的不算
+        Requests = "requests",
+        /// token：没走缓存的输入 + 写进缓存的 + 输出，`cache_reads` 时再加上从缓存读的
+        Tokens = "tokens",
+        /// 费用，**微分**（百万分之一美元），和别处的费用同一个单位。没有价格的模型、
+        /// 不计费的上游算 0
+        Cost = "cost",
+    }
+}
+
+/// 一条用量上限，和它此刻用了多少。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct KeyLimitView {
+    pub per: LimitPer,
+    pub measure: LimitMeasure,
+    /// 上限：请求数、token 数，费用是微分
+    pub max: u64,
+    /// token 上限把从缓存读的也算进去
+    pub cache_reads: bool,
+    /// 用了多少，单位同 `max`。**在跑的请求也算**：按它们的输入估算占着，结束时换成
+    /// 记下的实数 —— 准入看的就是这个数。滚动的是最近那一段时间里的，重启之后从空的
+    /// 开始；自然的是这一期的，重启之后从请求记录里加回来
+    pub used: u64,
+    /// 这一期什么时候结束、重新算。只有天、周、月有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    /// 到了：`used` 不小于 `max`，新的请求此刻会被拒（滚动的会先等一会儿）
+    pub reached: bool,
+}
+
+/// 新建、保存密钥时的一条用量上限。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct KeyLimitInput {
+    pub per: LimitPer,
+    pub measure: LimitMeasure,
+    /// 上限：请求数、token 数，费用是微分。要大于 0
+    pub max: u64,
+    /// 只有 token 上限能开
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_reads: bool,
 }
 
 /// 新建或保存一把网关密钥（`POST /keys`、`PUT /keys/{name}`）。
@@ -2195,6 +2414,9 @@ pub struct KeyInput {
     pub allow: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// 用量上限，整份替换。不带 = 一条都没有
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<KeyLimitInput>,
 }
 
 /// 换哪把密钥（`POST /keys/{name}/rotate`）。
@@ -2782,6 +3004,9 @@ pub struct ProviderInput {
     /// 按哪张价目表计价。不给就是默认价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
+    /// 同时最多发给这家几个请求，1 到 1000。不给就是不限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
     /// 停用
     #[serde(default)]
     pub disabled: bool,
@@ -2861,9 +3086,18 @@ pub struct ModelRow {
     pub id: String,
     /// 在启用范围里
     pub enabled: bool,
-    /// 上下文窗口，来自默认价目表
+    /// 上下文窗口：这一家手写的（`model_specs`），没写时来自价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// `context_window` 从哪儿来。不知道上下文窗口时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_source: Option<SpecSource>,
+    /// 一次最多输出多少 token：这一家手写的，没写时来自价目表
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// `max_output_tokens` 从哪儿来。不知道输出上限时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens_source: Option<SpecSource>,
     /// 按这个上游选的价目表查到的价格。空 = 无法计价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<PriceFields>,
@@ -2922,6 +3156,25 @@ pub enum OAuthChange {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderSave {
     pub provider: ProviderInput,
+    /// 你基于哪一版。**对不上就是 409**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 设一家上游的一个模型的规格（`PUT /provider-model-spec`）：价目表不认识这个模型、
+/// 或者写错了时手写。**两项都空就是删掉这一项**，回到价目表。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ModelSpecSave {
+    pub provider: String,
+    /// 模型 ID，和这家的清单里写的完全相等。去掉首尾空白
+    pub model: String,
+    /// 上下文窗口（token）。空 = 用价目表的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// 输出上限（token）。空 = 用价目表的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     /// 你基于哪一版。**对不上就是 409**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
@@ -3025,7 +3278,7 @@ pub struct AliasView {
     /// 清单里有一个和别名同名的真模型、而别名的列表里没有这个名称的上游：**这个名称
     /// 不会再发给它们**（别名优先）
     pub shadows: Vec<String>,
-    /// 上下文窗口，来自默认价目表：第一家能服务它的上游发出的那个模型的
+    /// 上下文窗口：第一家能服务它的上游发出的那个模型的，这一家手写的优先于价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// 最近 24 小时里客户端用这个名称发来的请求
@@ -3198,12 +3451,30 @@ slug_enum! {
         Fallback = "fallback",
         /// 用选中的那一个，不可用时按顺序
         Select = "select",
-        /// 轮流
+        /// 按成员的权重轮流（[`GroupView::weights`]）
         LoadBalance = "load-balance",
         /// 选最快的
         UrlTest = "url-test",
         /// 选最便宜的
         Cheapest = "cheapest",
+    }
+}
+
+slug_enum! {
+    /// `load-balance` 组按什么分请求：配置里 `balance_by` 写的那个词。
+    ///
+    /// 成员的权重永远是底数，快慢、成败算出的系数乘在上面
+    /// （[`DryRunCandidate::balance_factor`]），长期看各家分到的请求是乘出来的比例；进行中的
+    /// 对话照旧留在回答它的那一家，记在那一家的份额里。没有测到的上游算中等。
+    pub enum BalanceBy {
+        /// 只按成员的权重
+        Weights = "weights",
+        /// 首字节越快，分得越多
+        Latency = "latency",
+        /// 最近失败越少，分得越多
+        Health = "health",
+        /// 两样一起看
+        LatencyHealth = "latency-health",
     }
 }
 
@@ -3218,6 +3489,13 @@ pub struct GroupInput {
     /// `select` 组优先使用的成员
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+    /// `load-balance` 组成员的权重，1 到 100。不给 = 都是 1；给了的话没写到的成员是 1。
+    /// 别的类型只能不给、或者都是 1
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<std::collections::BTreeMap<String, u32>>,
+    /// `load-balance` 组按什么分请求。不给 = `weights`；别的类型只能是 `weights`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_by: Option<BalanceBy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3616,7 +3894,7 @@ pub struct Summary {
     /// 失败的、没有用量的、不计费的都不在这里 —— 配价格对它们没用。
     pub unpriced_requests: i64,
     /// 有多少条请求**没有拿到用量**，所以同样算不出钱：上游没报，或者连接
-    /// 在它报之前就结束了（客户端取消、WebSocket 会话）。
+    /// 在它报之前就结束了（客户端取消、整条连接一行的 WebSocket 会话）。
     ///
     /// 和 `unpriced_requests` 一样让金额合计偏低，但配价格解决不了它 ——
     /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
@@ -3892,7 +4170,7 @@ pub struct HistoryRow {
     /// 任务；看着一次很贵的任务，也回不到具体是哪一条。库里这一列一直
     /// 都在（`requests.session`，还建了索引），只是没有交出来。
     ///
-    /// 认不出会话的请求（拼不出指纹的，比如 WebSocket、本地应答）是 `None`。
+    /// 认不出会话的请求（拼不出指纹的，比如整条连接一行的 WebSocket、本地应答）是 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，
@@ -4705,6 +4983,9 @@ pub struct DryRunResult {
     /// 写在第一个」。直指 provider 时是 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<GroupKind>,
+    /// 经过的是 `load-balance` 组时，它按什么分请求。别的时候没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_by: Option<BalanceBy>,
     /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，
     /// 见 `skipped`）| `intercepted`
     ///
@@ -4748,6 +5029,21 @@ pub struct DryRunCandidate {
     /// 改写了模型）、`pinned`（规则指定了这一家发什么模型）。一样时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_via: Option<String>,
+    /// 经过的是 `load-balance` 组时，它在组里的权重（没写权重的是 1）。别的时候没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// 它典型的快慢：从发出去到回答的第一段内容（最近样本的中位数），毫秒。只在顺序看它时
+    /// 有：`url-test`，按快慢分的 `load-balance`。样本不够时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u32>,
+    /// 它最近的成功率，0 到 1（最近 50 次、30 分钟以内）。只在按成败分的 `load-balance`
+    /// 里有；不到 5 次时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    /// 按快慢、成败算出的系数，乘在权重（[`Self::weight`]）上：大于 1 分得多，小于 1
+    /// 分得少，没有样本的那一项算 1。只在 `balance_by` 不是 `weights` 的 `load-balance` 里有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_factor: Option<f64>,
 }
 
 /// 一个要转换格式的候选上游。
@@ -5418,6 +5714,70 @@ pub struct PluginRunView {
 mod tests {
     use super::*;
 
+    fn attempt(outcome: AttemptOutcome, status: Option<u16>, code: Option<&str>) -> AttemptView {
+        AttemptView {
+            provider: "p".into(),
+            model: None,
+            outcome,
+            status,
+            error: code.map(|c| Msg {
+                code: c.into(),
+                args: Default::default(),
+                text: String::new(),
+            }),
+            ms: 0,
+            usage: None,
+            queued_ms: None,
+            skipped: None,
+        }
+    }
+
+    /// 发到了上游的一跳：上游回了话，或者发出去之后才失败。没发出去的（满着、被拒、连不上）
+    /// 不算。认的码都是 core 真发得出的
+    #[test]
+    fn an_attempt_was_sent_when_the_upstream_may_have_received_it() {
+        use AttemptOutcome::*;
+        for a in [
+            attempt(Served, Some(200), None),
+            attempt(Status, Some(503), None),
+            attempt(SlowStart, None, Some("gw.slow_start")),
+            attempt(Estimated, Some(404), None),
+            attempt(Error, None, Some("gw.upstream.timeout")),
+            attempt(Error, None, Some("gw.upstream.stream_opening_error")),
+        ] {
+            assert!(a.sent(), "{a:?}");
+        }
+        let mut busy = attempt(Error, None, Some("gw.busy_upstream"));
+        busy.skipped = Some(ServeSkip::Busy);
+        for a in [
+            busy,
+            attempt(Estimated, None, None),
+            attempt(Error, None, Some("gw.route.denied")),
+            attempt(Error, None, Some("gw.upstream.unreachable")),
+            attempt(Error, None, Some("gw.upstream.sign_failed")),
+            attempt(Error, None, None),
+        ] {
+            assert!(!a.sent(), "{a:?}");
+        }
+        for code in FAILED_AFTER_SENDING {
+            assert!(
+                MSG_CODES
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some(code)),
+                "{code} 不是 core 发得出的码"
+            );
+        }
+        // 尝试链是空的：失败的是网关先拒了，没失败的是还没等到路由事件
+        let none = RoutingView::default();
+        assert!(!none.reached_upstream(true));
+        assert!(none.reached_upstream(false));
+        let only_denied = RoutingView {
+            attempts: vec![attempt(Error, None, Some("gw.route.denied"))],
+            ..Default::default()
+        };
+        assert!(!only_denied.reached_upstream(false));
+    }
+
     /// 版本号就是它上面的说明写到的最新一版（「N 起」）。两条分支各自加了一版、合到一起
     /// 时，常量那一行两边都没动、不会冲突，很容易照旧留在合并之前的那个数上 —— 照着说明
     /// 写的界面就按旧版去读新的协议了
@@ -5563,6 +5923,7 @@ mod tests {
             ModelListStatus::from_slug,
         );
         check(GroupKind::ALL, GroupKind::slug, GroupKind::from_slug);
+        check(BalanceBy::ALL, BalanceBy::slug, BalanceBy::from_slug);
         check(RuleVerdict::ALL, RuleVerdict::slug, RuleVerdict::from_slug);
         check(RuleEffect::ALL, RuleEffect::slug, RuleEffect::from_slug);
         check(

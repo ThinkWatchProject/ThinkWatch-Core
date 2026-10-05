@@ -50,7 +50,7 @@ pub fn provider_refs(cfg: &Config, name: &str) -> Vec<ProviderRef> {
         }
     }
     for g in &cfg.groups {
-        if g.providers.iter().any(|p| p == name) || g.selected.as_deref() == Some(name) {
+        if g.has(name) || g.selected.as_deref() == Some(name) {
             out.push(ProviderRef::Group {
                 group: g.name.clone(),
             });
@@ -145,13 +145,18 @@ pub fn rename_provider(
     }
     for (g, group) in cfg.groups.iter().enumerate() {
         let base = [Step::key("groups"), Step::Index(g)];
-        if group.providers.iter().any(|p| p == old) {
+        if group.has(old) {
+            // 整个列表照写回的规矩重写：权重是 1 的写成名字，带权重的写成 `{name, weight}`
+            // —— 权重跟着成员走，不因改名丢掉
             let value = Value::Sequence(
                 group
                     .providers
                     .iter()
-                    .map(|x| s(if x == old { new } else { x }))
-                    .collect(),
+                    .map(|m| {
+                        let name = if m.name == old { new } else { &m.name };
+                        member_value(name, m.weight)
+                    })
+                    .collect::<Result<_, _>>()?,
             );
             let mut p = base.to_vec();
             p.push(Step::key("providers"));
@@ -164,6 +169,19 @@ pub fn rename_provider(
         }
     }
     Ok(out)
+}
+
+/// 策略组的一个成员写进配置的样子：权重是 1 的是名字，否则是 `{name, weight}`
+/// （和 [`tw_engine::Group`] 写回时一样）
+fn member_value(name: &str, weight: u32) -> Result<Value, EditError> {
+    if weight == 1 {
+        return Ok(Value::String(name.to_string()));
+    }
+    serde_yaml_ng::to_value(tw_engine::Member {
+        name: name.to_string(),
+        weight,
+    })
+    .map_err(|e| EditError::Unwritable(e.to_string()))
 }
 
 /// 一条规则：它在哪条路由里、叫什么。
@@ -545,7 +563,40 @@ routes:
         let after = cfg(&out);
         assert!(provider_refs(&after, "relay").is_empty());
         assert_eq!(provider_refs(&after, "relay-hk").len(), 3);
-        assert_eq!(after.groups[0].providers, ["relay-hk", "官方"]);
+        assert_eq!(after.groups[0].names(), ["relay-hk", "官方"]);
+    }
+
+    /// 改名的那一家带着权重：权重跟着走，别的成员照旧写成名字
+    #[test]
+    fn a_renamed_member_keeps_its_weight() {
+        let text = CFG.replace(
+            "    type: fallback\n    providers: [relay, 官方]\n",
+            "    type: load-balance\n    providers: [{ name: relay, weight: 3 }, 官方]\n",
+        );
+        let c = cfg(&text);
+        assert_eq!(c.groups[0].weight("relay"), 3);
+        let renamed = edit::upsert(
+            &text,
+            edit::PROVIDERS,
+            Some("relay"),
+            &serde_yaml_ng::from_str(
+                "name: relay-hk\nbase_url: https://relay.example\nkey: sk-a\nproxy: hk\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let out = rename_provider(&renamed, &c, "relay", "relay-hk").unwrap();
+        let after = cfg(&out);
+        assert_eq!(
+            after.groups[0].providers,
+            [
+                tw_engine::Member {
+                    name: "relay-hk".into(),
+                    weight: 3
+                },
+                tw_engine::Member::named("官方"),
+            ]
+        );
     }
 
     /// 指定模型里写着这一家，也是引用它：删之前要说，改名时只改那一项的 `provider`

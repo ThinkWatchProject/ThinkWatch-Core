@@ -180,6 +180,8 @@ pub enum Kind {
     OneOrManyMap(T2),
     /// 一个字符串，或者一组对象（见那一节）
     StrOrObjs(&'static str),
+    /// 一个列表，每一项是字符串或者对象（见那一节）
+    StrsOrObjs(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +315,11 @@ fn kind(k: &Kind, l: Lang) -> String {
             pick("string, or list of", "字符串，或对象列表，见"),
             link(p)
         ),
+        Kind::StrsOrObjs(p) => format!(
+            "{} {}",
+            pick("list of strings or", "列表，每项是字符串或对象，对象见"),
+            link(p)
+        ),
     }
 }
 
@@ -357,14 +364,20 @@ pub fn render_table(s: &Section, l: Lang) -> String {
 fn check_section(s: &Section, all: &[Section], errs: &mut Vec<String>) {
     for r in &s.rows {
         match r.kind {
-            Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) | Kind::StrOrObjs(p) => {
+            Kind::Obj(p)
+            | Kind::Objs(p)
+            | Kind::ObjMap(_, p)
+            | Kind::StrOrObjs(p)
+            | Kind::StrsOrObjs(p) => {
                 if !all.iter().any(|x| x.path == p) {
                     errs.push(format!(
                         "{}.{} points at section `{p}`, which is not declared",
                         s.path, r.name
                     ));
                 }
-                if !matches!(r.def, Def::Section | Def::Is(_) | Def::Unset) {
+                // 一个列表可以是必填的（策略组的成员）：它自己是值，不是一个有默认值的对象
+                let list = matches!(r.kind, Kind::StrsOrObjs(_)) && matches!(r.def, Def::Required);
+                if !list && !matches!(r.def, Def::Section | Def::Is(_) | Def::Unset) {
                     errs.push(format!(
                         "{}.{} is an object; its default is the section's own",
                         s.path, r.name
@@ -389,7 +402,11 @@ fn check_section(s: &Section, all: &[Section], errs: &mut Vec<String>) {
             // 指向一节还没进代码的对象的那一行，同样还没进代码：它由那一节的
             // `Ty::Pending` 看着，这里不数它
             let pending = |r: &Row| match r.kind {
-                Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) | Kind::StrOrObjs(p) => all
+                Kind::Obj(p)
+                | Kind::Objs(p)
+                | Kind::ObjMap(_, p)
+                | Kind::StrOrObjs(p)
+                | Kind::StrsOrObjs(p) => all
                     .iter()
                     .any(|x| x.path == p && matches!(x.ty, Ty::Pending { .. })),
                 _ => false,

@@ -79,6 +79,7 @@ fn cfg(providers: Vec<Provider>, rules: Vec<Rule>) -> Config {
             kind: tw_engine::GroupType::Fallback,
             providers: vec!["up".into()],
             selected: None,
+            balance_by: Default::default(),
         }],
         routes: vec![
             RouteSet {

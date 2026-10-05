@@ -2,7 +2,7 @@
 //! 对齐。多一个变体，这里编译不过。安全防护的档位、匹配方式两边是同一个类型
 //! （`tw_guard::policy`），不用对齐。
 
-use crate::{Billing, OnProxyFail, ProbeAction, Protocol, ProxyKind, Stage};
+use crate::{Billing, OnProxyFail, ProbeAction, Protocol, ProxyKind, SpecSource, Stage};
 
 impl From<Billing> for tw_api::Billing {
     fn from(b: Billing) -> Self {
@@ -18,6 +18,15 @@ impl From<tw_api::Billing> for Billing {
         match b {
             tw_api::Billing::PerToken => Self::PerToken,
             tw_api::Billing::Free => Self::Free,
+        }
+    }
+}
+
+impl From<SpecSource> for tw_api::SpecSource {
+    fn from(s: SpecSource) -> Self {
+        match s {
+            SpecSource::PriceTable => Self::PriceTable,
+            SpecSource::Manual => Self::Manual,
         }
     }
 }

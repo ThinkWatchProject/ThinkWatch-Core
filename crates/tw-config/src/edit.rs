@@ -620,6 +620,105 @@ pub fn remove_alias(text: &str, name: &str) -> Result<String, EditError> {
     Ok(out)
 }
 
+// ─────────────────────────────────────────────────────────── 上游的模型规格
+
+/// 上游 `provider` 的 `model_specs` 里，设（`spec` 是 `Some`）或者删掉（`None`）`model`
+/// 那一项。**这一家的其余字段一个字节都不动** —— 不走 [`upsert`]：那条路按读进来再写回去的
+/// 结构比，用户写成和默认值一样的字段（`proxy: direct`）会被顺手删掉。
+///
+/// - 删掉的是最后一项时，`model_specs` 整个删：默认值不写进文件
+/// - 要删的那一项本来就没有：原样返回
+/// - 那一家写成了行内（`- { name: a, … }`）：整项换成块式，位置不变（和 [`upsert`] 一样）；
+///   `model_specs` 写成了行内：整张换掉
+///
+/// 两项都空的 `spec` 交过来是调用方的错 —— 那是「删掉」，传 `None`。
+pub fn set_model_spec(
+    text: &str,
+    provider: &str,
+    model: &str,
+    spec: Option<&crate::ModelSpec>,
+) -> Result<String, EditError> {
+    reject_multiline(&Value::String(model.to_string()))?;
+    let doc = parse(text)?;
+    let index = PROVIDERS
+        .index_of(&doc, provider)
+        .ok_or_else(|| EditError::NotFound {
+            what: PROVIDERS.what,
+            name: provider.to_string(),
+        })?;
+    let item = PROVIDERS.items(&doc)[index]
+        .as_mapping()
+        .cloned()
+        .unwrap_or_default();
+    let mut specs = match item.get(MODEL_SPECS) {
+        Some(Value::Mapping(m)) => m.clone(),
+        _ => Mapping::new(),
+    };
+    let key = Value::String(model.to_string());
+    let had = specs.contains_key(&key);
+    let value = match spec {
+        Some(s) => {
+            Some(serde_yaml_ng::to_value(s).map_err(|e| EditError::Unwritable(e.to_string()))?)
+        }
+        None => None,
+    };
+    match &value {
+        Some(v) if specs.get(&key) == Some(v) => return Ok(text.to_string()),
+        Some(v) => {
+            specs.insert(key.clone(), v.clone());
+        }
+        None if !had => return Ok(text.to_string()),
+        None => {
+            specs.remove(&key);
+        }
+    }
+    let mut new_item = item.clone();
+    if specs.is_empty() {
+        new_item.remove(MODEL_SPECS);
+    } else {
+        new_item.insert(
+            Value::String(MODEL_SPECS.into()),
+            Value::Mapping(specs.clone()),
+        );
+    }
+
+    let steps = PROVIDERS.steps();
+    let mut at = steps.clone();
+    at.push(Step::Index(index));
+    let mut field = at.clone();
+    field.push(Step::key(MODEL_SPECS));
+    let mut entry = field.clone();
+    entry.push(Step::Key(model.to_string()));
+    let out = if tw_yaml::is_flow_at(text, &at)? {
+        let block = render_block(&Value::Mapping(new_item.clone()))?;
+        tw_yaml::replace_item(text, &steps, index, &block)?
+    } else if specs.is_empty() {
+        tw_yaml::remove_key(text, &field)?
+    } else if tw_yaml::is_flow_at(text, &field)? {
+        put_value(text, &field, &Value::Mapping(specs))?
+    } else {
+        match &value {
+            Some(v) => put_value(text, &entry, v)?,
+            None => tw_yaml::remove_key(text, &entry)?,
+        }
+    };
+
+    // ── 语义核对 ─────────────────────────────────────────────────────
+    let mut expected = doc;
+    put_item(&mut expected, PROVIDERS, index, Value::Mapping(new_item));
+    let got = parse(&out).map_err(|e| EditError::SelfCheck(e.to_string()))?;
+    if got != expected {
+        return Err(EditError::SelfCheck(format!(
+            "{} `{provider}` model_specs `{model}`",
+            PROVIDERS.what
+        )));
+    }
+    Ok(out)
+}
+
+/// 上游里手写的模型规格那一项的键
+const MODEL_SPECS: &str = "model_specs";
+
 /// 文件里的别名表，按书写顺序。键一律当字符串（配置读进来时就是这么读的）
 fn alias_table(doc: &Value) -> Vec<(String, Value)> {
     let Some(Value::Mapping(m)) = doc.get(ALIASES) else {
@@ -1207,5 +1306,123 @@ routes: []
             let out = upsert_alias(ALIASES_CFG, Some("opus"), &alias(name, &["m"])).unwrap();
             assert_eq!(aliases_of(&out)[2], alias(name, &["m"]), "{out}");
         }
+    }
+
+    // ── 模型规格 ─────────────────────────────────────────────────────
+
+    fn spec(context_window: Option<u32>, max_output_tokens: Option<u32>) -> crate::ModelSpec {
+        crate::ModelSpec {
+            context_window,
+            max_output_tokens,
+        }
+    }
+
+    fn specs_of(text: &str, provider: &str) -> Vec<(String, crate::ModelSpec)> {
+        let cfg: crate::Config = serde_yaml_ng::from_str(text).unwrap();
+        cfg.providers
+            .into_iter()
+            .find(|p| p.name == provider)
+            .unwrap()
+            .model_specs
+            .into_iter()
+            .collect()
+    }
+
+    /// 设一项、改一项、删到一项不剩：这一家的其余字段和旁边的注释原样
+    #[test]
+    fn a_model_spec_is_set_changed_and_removed_without_touching_the_rest() {
+        let out = set_model_spec(CFG, "官方", "glm-5", Some(&spec(Some(128_000), None))).unwrap();
+        assert!(
+            out.contains("base_url: https://api.anthropic.com  # 直连"),
+            "{out}"
+        );
+        assert!(out.contains("# 两家上游"), "{out}");
+        assert_eq!(
+            specs_of(&out, "官方"),
+            [("glm-5".to_string(), spec(Some(128_000), None))]
+        );
+        // 要加引号的模型 ID 读回来还是它
+        let odd = "us.anthropic.claude-fable-5-v1:0";
+        let out = set_model_spec(&out, "官方", odd, Some(&spec(None, Some(32_000)))).unwrap();
+        let out = set_model_spec(
+            &out,
+            "官方",
+            "glm-5",
+            Some(&spec(Some(200_000), Some(8_000))),
+        )
+        .unwrap();
+        assert_eq!(
+            specs_of(&out, "官方"),
+            [
+                ("glm-5".to_string(), spec(Some(200_000), Some(8_000))),
+                (odd.to_string(), spec(None, Some(32_000))),
+            ]
+        );
+        // 一样的值、删一项没有的：原样
+        assert_eq!(
+            set_model_spec(
+                &out,
+                "官方",
+                "glm-5",
+                Some(&spec(Some(200_000), Some(8_000)))
+            )
+            .unwrap(),
+            out
+        );
+        assert_eq!(set_model_spec(&out, "官方", "ghost", None).unwrap(), out);
+
+        let out = set_model_spec(&out, "官方", "glm-5", None).unwrap();
+        assert_eq!(
+            specs_of(&out, "官方"),
+            [(odd.to_string(), spec(None, Some(32_000)))]
+        );
+        // 最后一项删掉，`model_specs` 整个不写
+        let out = set_model_spec(&out, "官方", odd, None).unwrap();
+        assert_eq!(out, CFG);
+    }
+
+    /// 写成行内的上游整项换成块式；行内的 `model_specs` 整张换掉
+    #[test]
+    fn a_model_spec_goes_into_an_inline_upstream_or_table_too() {
+        let out = set_model_spec(CFG, "relay", "m", Some(&spec(Some(1_000), None))).unwrap();
+        assert_eq!(
+            specs_of(&out, "relay"),
+            [("m".to_string(), spec(Some(1_000), None))]
+        );
+        let cfg: crate::Config = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg.providers[1].base_url, "https://relay.example");
+        assert_eq!(cfg.providers[0].name, "官方", "位置变了：{out}");
+
+        let inline = CFG.replace(
+            "    key: sk-a\n",
+            "    key: sk-a\n    model_specs: { a: { context_window: 5 } }\n",
+        );
+        let out = set_model_spec(&inline, "官方", "b", Some(&spec(None, Some(7)))).unwrap();
+        assert_eq!(
+            specs_of(&out, "官方"),
+            [
+                ("a".to_string(), spec(Some(5), None)),
+                ("b".to_string(), spec(None, Some(7))),
+            ]
+        );
+        let out = set_model_spec(&inline, "官方", "a", None).unwrap();
+        assert!(!out.contains("model_specs"), "{out}");
+    }
+
+    #[test]
+    fn a_model_spec_for_a_missing_upstream_is_refused() {
+        let e = set_model_spec(CFG, "ghost", "m", Some(&spec(Some(1), None))).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                EditError::NotFound {
+                    what: "upstream",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        let e = set_model_spec(CFG, "官方", "a\nb", Some(&spec(Some(1), None))).unwrap_err();
+        assert!(matches!(e, EditError::Multiline), "{e}");
     }
 }

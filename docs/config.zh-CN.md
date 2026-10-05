@@ -217,6 +217,7 @@ listen:
 | `route` | 字符串 | — | 这把密钥的请求走哪条路由。不写：`default_route`。 |
 | `client` | 字符串 | — | 这把密钥是为哪个客户端生成的（`claude-code`、`codex` 等），由桌面应用接管客户端时写入。一个客户端最多一把。 |
 | `disabled` | 布尔 | `false` | 拒绝使用这把密钥的所有请求，密钥本身保留。 |
+| `limits` | 对象列表，见 [`clients[].limits[]`](#cfg-clients-limits) | — | 用量上限：每分钟、每小时、每天、每周或每月的请求数、token 数或费用。请求要通过每一条。不写：不限。 |
 <!-- /generated -->
 
 ```yaml
@@ -228,6 +229,52 @@ clients:
     max_concurrent: 4
     allow: [claude-sonnet-*]
     route: cheap
+```
+
+#### `clients[].limits`
+
+一把密钥的用量上限：每分钟、每小时、每天、每周或每月最多多少个请求、多少 token、多少美元。
+每一条只数其中一种；一把密钥可以有好几条，请求要通过每一条。
+
+`minute`、`hour` 是滚动的：最近 60 秒、最近 60 分钟。用满之后，下一个空位在
+`failover.slot_wait_secs`（默认 30 秒）之内空出来，请求就等它；等不到就拒绝。之后若还要等
+上游空出位置，用的是同一段时间里剩下的部分。`day`、`week`、`month` 按 twcore 所在机器的
+本地时区算，在零点、周一零点、每月一号零点重新开始；用满之后，到重新开始之前的请求一律拒绝。
+机器换了时区时，当前这一天、这一周、这个月的用量按新的时区从请求记录里重新加起来。
+
+被拒的请求收到 HTTP 429，错误格式和客户端自己的一致，写明是哪把密钥、哪一条上限、用了多少、
+什么时候重置；流量列表里也有这一条。没有发到上游的请求不计入任何上限：被规则、内容过滤或
+上限拒绝的，以及因为上游都已达到 `max_concurrent` 而被退回的。费用按每个请求记下的费用算，所以没有价格的模型、
+`billing: free` 的上游算 0。还在进行的请求先按输入的估算计入，记下之后换成实际用量。
+重启之后，这一天、这一周、这个月的用量从请求记录里重新加起来，所以请求记录要留够那一期：
+设了按天的上限时 `retention.row_days` 至少 1，按周至少 7，按月至少 31；按分钟、按小时的
+上限从零开始。
+
+Responses 的 WebSocket 连接上，每个 `response.create` 各算一个请求：带着各自的用量和费用记下，
+按这些上限检查；被拒的那一个收到 `response.failed`，连接保持不断。Realtime 的连接
+（`/v1/realtime`）整条算一个请求：连上时按这些上限检查，这条连接上所有回答的 token 和费用在
+断开时计入。
+
+<!-- generated: table clients[].limits[] -->
+<a id="cfg-clients-limits"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **必填** | 按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。 |
+| `requests` | 整数 | — | 最多这么多个请求。数 token 的请求、网关自己答的、没有发到上游的不算。 |
+| `tokens` | 整数 | — | 最多这么多 token：未命中缓存的输入、写入缓存的和输出。 |
+| `cost` | 数字 | — | 最多花这么多美元，按每个请求记下的费用算；至少 0.01。没有价格的模型、`billing: free` 的上游算 0。 |
+| `cache_reads` | 布尔 | `false` | 把读取缓存的 token 也算进去。只有 `tokens` 上限能写。 |
+<!-- /generated -->
+
+```yaml
+clients:
+  - name: build-server
+    key: tw-q8r2s4t6u8v2w4x6y8z2a4b6
+    limits:
+      - { per: minute, requests: 30 }
+      - { per: day, cost: 5 }
+      - { per: month, tokens: 20000000, cache_reads: true }
 ```
 
 ### `providers`
@@ -253,6 +300,8 @@ clients:
 | `models_only` | 字符串列表 | — | 只使用这家的这些模型，写 ID 或通配。范围外的模型不出现在模型列表里，也不会路由到这家。不写：全部。写空列表会被拒绝，暂停使用请用 `disabled`。 |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`：费用为用量乘以所选价目表中的单价，订阅账号同样如此。`free`：费用记为 0。 |
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
+| `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
+| `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 <!-- /generated -->
 
@@ -272,6 +321,7 @@ providers:
     proxy: office
     models_only: [gpt-4.1*, o3]
     pricing: relay-discount
+    max_concurrent: 4
 
   - name: local
     base_url: http://127.0.0.1:11434/v1
@@ -282,6 +332,8 @@ providers:
 每个请求只带请求本身和上游需要的请求头，客户端的其他信息一律不发：凭据和 `headers` 中写的请求头、ThinkWatch 自己的 `User-Agent`，以及客户端请求中该上游协议使用的请求头（Anthropic 为 `anthropic-*`，OpenAI 为 `Idempotency-Key` 和 `X-Client-Request-Id`，Gemini 没有）。客户端自动填写的身份字段（如 Claude Code 的 `metadata.user_id`）从请求体中去掉。只接受特定客户端的上游，打开 `forward_client_identity`。
 
 ChatGPT 账号上游（`protocol: chatgpt`）只接受桌面应用登录得到的凭据，不能手写。不支持 Claude 和 Google 的订阅登录，请使用 API 密钥。
+
+有的中转站和账号同时只接受几个请求，多出来的直接拒绝。`max_concurrent` 让网关守住这个数：请求发出时占用这家的一个位置，回答完整交给客户端、或者客户端断开时归还。这家满了的时候，为复用提示缓存而留在这家的对话等空位，别的请求直接换下一家。最多等多久由 `failover.slot_wait_secs` 决定。等待不算失败，这家不会因此停用。只计算 token 数的请求不占位置。Responses 的 WebSocket 连接上，每个 `response.create` 从发出起占一个位置，直到它的回答结束，密钥的 `max_concurrent` 也一样；空闲的连接不占位置。
 
 #### `providers[].oauth`
 
@@ -346,6 +398,31 @@ providers:
 ```
 
 请求转换为 Converse 格式。模型清单取自所在区域的控制面：可按需调用的基础模型、AWS 预设的推理配置（`us.anthropic.claude-…`），以及账号自己创建的应用推理配置（按调用时使用的 ARN 列出）。列出清单需要 `bedrock:ListFoundationModels` 和 `bedrock:ListInferenceProfiles` 权限；没有这两项权限时请求照常转发，可以在 `models` 中手动列出模型。使用 VPC 端点或代理时，在 `base_url` 中写它的地址，在 `aws.region` 中写区域；模型清单也向该地址获取。
+
+#### `providers[].model_specs`
+
+模型的上下文窗口和输出上限取自价目表。中转站自有的模型常常不在价目表里，价目表偶尔也会写错。这时在这里按这家上游、按它模型清单里的 ID（完全匹配）手写。写了的一项优先于价目表，没写的一项仍取价目表。两项至少写一项，都不能是 0。
+
+各处用的是同一个数：各种客户端格式的 `/v1/models`、由这家上游服务的别名、网关判断一段对话是否还装得下当前模型，以及请求转换为 Anthropic 格式且没有写输出上限时补上的值。同一个模型由几家上游提供时，`/v1/models` 按 `providers` 中排在最前的那一家给出。
+
+<!-- generated: table providers[].model_specs.* -->
+<a id="cfg-providers-model_specs"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `context_window` | 整数 | — | 上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。 |
+| `max_output_tokens` | 整数 | — | 一次回答最多输出多少 token。不写：取价目表的。 |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com/v1
+    protocol: openai-chat
+    model_specs:
+      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }
+      claude-sonnet-4-5: { context_window: 1000000 }
+```
 
 ### `proxies`
 
@@ -697,10 +774,31 @@ security:
 
 上游失败后会停用一段时间，接下来的请求直接交给下一个候选。停用多久取决于上游
 给出的原因：余额不足要等充值，额度用完要等到上游说的重置时刻，限流通常几秒钟就
-过去。只有一个候选的请求不受影响。
+过去。只有一个候选的请求不受影响。Responses 的 WebSocket 连接上，每个 `response.create`
+在这里和一个请求一样算：第一段内容到达之前因为上游出错而失败的，算作一次失败；上游
+拒绝或连不上的连接也一样。
 
 流式回答在第一段内容交给客户端之前，上游在流里报的错误和错误状态码一样，会把
 请求换到下一个候选。
+
+上游也可能开头很慢：收下请求之后很久都不发内容。开启 `next_on_slow_start` 后，请求
+发出 `stream_start_wait_secs` 秒仍没有内容，就换到下一个候选。默认关闭，因为先思考
+再输出的模型本来就可能很久才开始；开启时建议等 30 秒以上。最后一个候选总是等下去，
+被放弃的上游不会停用。到点那一刻并发数已满（`max_concurrent`）的候选不算下一个：请求
+留在慢的那一家。
+
+```yaml
+failover:
+  stream_start_wait_secs: 30
+  next_on_slow_start: true
+```
+
+上游的并发数满了（`max_concurrent`）时，一个请求等空位合计最多 `slot_wait_secs`
+秒。等密钥的 `minute`、`hour` 上限也算在这段时间里，两样加起来不超过 `slot_wait_secs`。
+进行中的对话等它留在的那一家，到时还没有空位就换下一家，缓存在那边从头建；
+新的对话遇到满着的上游直接跳过。候选全满时，请求等先空出来的那一家；都没有空出来，
+客户端收到 429 和 `Retry-After`，说明上游都忙。如果有上游收到过这个请求并且失败了，
+客户端收到的是那次失败。
 
 <!-- generated: table failover -->
 <a id="cfg-failover"></a>
@@ -714,6 +812,8 @@ security:
 | `quota_pause_secs` | 整数 | `3600` | 上游报告额度用完、但没有给出重置时间时停用的秒数。给出了重置时间的，停用到那一刻。 |
 | `rate_limit_max_pause_secs` | 整数 | `3600` | 被限流的上游按它给的 `Retry-After` 停用，最多这么多秒。没有 `Retry-After` 的按没有说明原因的失败计。 |
 | `stream_start_wait_secs` | 整数 | `15` | 流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。 |
+| `next_on_slow_start` | 布尔 | `false` | 流式回答在请求发出 `stream_start_wait_secs` 秒后仍没有内容时，放弃这家上游，把请求交给下一家。最后一家总是等下去。被放弃的上游不会停用。开启时 `stream_start_wait_secs` 至少为 5。 |
+| `slot_wait_secs` | 整数 | `30` | 一个请求合计最多等的秒数，从过了密钥自己的 `max_concurrent` 时算起：等密钥的 `minute`、`hour` 上限空出名额，和等并发数满了（`max_concurrent`）的上游空出位置，都算在里面。密钥的上限到时空不出来就拒绝；等不到上游的空位就换下一家，候选全满时回 429。`0`：不等。取值 0 到 300。 |
 <!-- /generated -->
 
 ### `aliases`
@@ -747,14 +847,56 @@ aliases:
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 策略组的名字，不能重复，也不能和上游同名。 |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。 |
-| `providers` | 字符串列表 | **必填** | 成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。 |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：请求按成员的权重分；进行中的对话留在原来那一家。`url-test`：按实测从发出请求到回答第一段内容的时间取最快的。`cheapest`：取输入单价最低的。 |
+| `providers` | 列表，每项是字符串或对象，对象见 [`groups[].providers[]`](#cfg-groups-providers) | **必填** | 成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。`load-balance` 组的成员可以写成 `{name, weight}`。 |
 | `selected` | 字符串 | — | `select` 类型选中的成员。 |
+| `balance_by` | `weights` \| `latency` \| `health` \| `latency-health` | `weights` | `load-balance` 类型用：成员的权重再乘上什么。`weights`：不乘，只按权重。`latency`：越快的上游分得越多。`health`：越少失败的上游分得越多。`latency-health`：两者都看。其他类型只能是 `weights`。 |
 <!-- /generated -->
 
 默认类型为 `fallback`：单个使用者的机器上没有需要分散的负载。
 
-无论哪种类型，一段对话都留在上次回答它的那一家上游，让上游缓存着的那部分被再次读取，而不是换一家全价重算。同一轮之内（客户端正在回传工具结果）一律不换；跨轮时，上一次回答读或写了至少 1024 个 token 的 prompt cache、且距今不到五分钟，才继续留下。上游因失败进入冷却时，对话随之放开；故障转移之后接下回答的那一家，就是之后留下的那一家。一轮开始时命中的规则也沿用到这一轮结束：按输入大小或图片分流的规则不会让一轮半路换家，除非输入已经超出规则所指模型的上下文窗口。因此 `load-balance` 轮流的是新对话。
+`load-balance` 组的成员可以带权重，取值 1 到 100；只写名字的成员权重为 1。权重决定组内请求怎么分：写成 `{ name: anthropic, weight: 7 }` 和 `relay` 时，每十个请求有七个由官方 API 服务。进行中的对话留在回答它的那一家（见下文），也算进那一家的份额，因此份额靠新对话从哪一家开始来补齐。因失败处于冷却、并发数已满（`max_concurrent`）、或服务不了某个请求的上游不参与这一次分配，其余成员按各自的权重分。新的 WebSocket 连接也这样分配，算作一个请求；之后在这条连接上发的都交给它连上的那一家。其他类型的策略组不用权重。
+
+<!-- generated: table groups[].providers[] -->
+<a id="cfg-groups-providers"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `name` | 字符串 | **必填** | 上游的名字。只写名字的成员权重为 1。 |
+| `weight` | 整数 | `1` | 成员在 `load-balance` 组中分到的请求份额，与其他成员的权重成比例。取值 1 到 100。其他类型的策略组只能写 1。 |
+<!-- /generated -->
+
+```yaml
+groups:
+  - name: pool
+    type: load-balance
+    providers:
+      - { name: anthropic, weight: 7 }
+      - relay
+```
+
+无论哪种类型，一段对话都留在上次回答它的那一家上游，让上游缓存着的那部分被再次读取，而不是换一家全价重算。同一轮之内（客户端正在回传工具结果）一律不换；跨轮时，上一次回答读或写了至少 1024 个 token 的 prompt cache、且距今不到五分钟，才继续留下。上游因失败进入冷却时，对话随之放开；故障转移之后接下回答的那一家，就是之后留下的那一家。一轮开始时命中的规则也沿用到这一轮结束：按输入大小或图片分流的规则不会让一轮半路换家，除非输入已经超出规则所指模型的上下文窗口。因此 `load-balance` 的权重是长期看各家分到的请求的比例：进行中的对话留在原来的上游，也算进那一家的份额。
+
+`balance_by` 让 `load-balance` 组再看各上游最近的表现：每个成员的权重乘上一个系数，组内请求按乘出来的结果照上文的方式分。
+
+- `weights`（默认）：只按权重。
+- `latency`：越快的上游分得越多。快慢看典型的从发出请求到回答第一段内容的时间，与 `url-test` 使用同一份测量。比组内居中者快一倍的上游，权重乘以四；最多乘以十，最少乘以十分之一。
+- `health`：越少失败的上游分得越多。依据是最近 30 分钟内的最近 50 次请求：服务器错误、限流、额度或余额用尽、凭据被拒、超时和连接失败算作失败；请求本身导致的错误不算，客户端取消、因开头太慢而换走、因并发数满了（`max_concurrent`）而跳过也不算。经常失败的上游至少保留权重的二十分之一，仍会偶尔分到请求，以便发现它已经恢复；完全失败的上游照旧由 [`failover`](#cfg-failover) 暂停。
+- `latency-health`：两个系数相乘。
+
+快慢只在流式回答上测，从请求发给这家上游的那一刻算起：之前的等待、之前失败的上游都不算在内。因开头太慢而被放弃的上游（`failover.next_on_slow_start`），按等满的那段时间计。Responses 的 WebSocket 连接上，每个 `response.create` 在快慢和成败上都算一个请求，快慢从上游开始回答它的那一刻算起。
+
+测量还不够的上游按中等对待。与只按权重时一样，进行中的对话留在原来的上游，差额由新对话补齐。
+
+```yaml
+groups:
+  - name: 均摊
+    type: load-balance
+    balance_by: latency-health
+    providers:
+      - { name: 官方, weight: 3 }
+      - 中转
+```
 
 ### `routes`
 

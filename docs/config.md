@@ -308,6 +308,7 @@ gateway. A key is an identity. Limits, model scope and route are per key.
 | `route` | string | — | Name of the route requests with this key take. Unset: `default_route`. |
 | `client` | string | — | The client this key was made for (`claude-code`, `codex`, …), recorded when the desktop app points a client at the gateway. A client has at most one. |
 | `disabled` | bool | `false` | Refuse every request made with this key, and keep the key. |
+| `limits` | list of [`clients[].limits[]`](#cfg-clients-limits) | — | Usage limits: requests, tokens or cost per minute, hour, day, week or month. A request has to pass every one. Unset: no limit. |
 <!-- /generated -->
 
 ```yaml
@@ -319,6 +320,63 @@ clients:
     max_concurrent: 4
     allow: [claude-sonnet-*]
     route: cheap
+```
+
+#### `clients[].limits`
+
+Usage limits for a key: at most so many requests, tokens or dollars per
+minute, hour, day, week or month. Each entry counts one of the three; a key
+can have several, and a request has to pass every one.
+
+`minute` and `hour` are rolling: the last 60 seconds, the last 60 minutes.
+When one is used up, a request waits for the next free slot if it frees
+within `failover.slot_wait_secs` (30 seconds by default), and is refused
+otherwise. Any later wait for a busy upstream comes out of the same time.
+`day`, `week` and `month` follow the calendar in the time zone of the machine
+twcore runs on and start again at midnight, on Monday and on the 1st. When one is used up, requests are refused until it starts again. If the
+machine's time zone changes, the current day, week and month are added up
+again from the request records.
+
+A refused request gets HTTP 429 in the client's own error format, naming the
+key, the limit, the amount used and when it resets, and it shows in the
+traffic list. A request that never reaches an upstream counts toward no
+limit: one refused by a rule, the content filter or a limit, or turned away
+because every upstream was at its `max_concurrent`. Cost is what is recorded
+for each request, so a model without a price and an upstream with
+`billing: free` count as $0. A request still
+running counts with an estimate of its input until it is recorded. After a
+restart, the day, week and month are added up again from the request records,
+so the records have to cover the period: `retention.row_days` of at least 1
+for a daily limit, 7 for a weekly one and 31 for a monthly one. Minute and
+hour limits start empty.
+
+On a Responses WebSocket connection, each `response.create` is a request of
+its own: it is recorded with its usage and cost and checked against these
+limits, and a refused one is answered with `response.failed` while the
+connection stays open. A Realtime connection (`/v1/realtime`) is one request:
+it is checked against the limits when it opens, and the tokens and cost of
+all its answers count when it closes.
+
+<!-- generated: table clients[].limits[] -->
+<a id="cfg-clients-limits"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
+| `requests` | integer | — | At most this many requests. Token counts, answers the gateway gives itself and requests that never reach an upstream do not count. |
+| `tokens` | integer | — | At most this many tokens: uncached input, cache writes and output. |
+| `cost` | number | — | At most this much, in US dollars, as recorded for each request; at least 0.01. Models without a price and upstreams with `billing: free` count as 0. |
+| `cache_reads` | bool | `false` | Count cache reads too. Only for a `tokens` limit. |
+<!-- /generated -->
+
+```yaml
+clients:
+  - name: build-server
+    key: tw-q8r2s4t6u8v2w4x6y8z2a4b6
+    limits:
+      - { per: minute, requests: 30 }
+      - { per: day, cost: 5 }
+      - { per: month, tokens: 20000000, cache_reads: true }
 ```
 
 ### `providers`
@@ -344,6 +402,8 @@ Upstreams: the APIs requests are forwarded to.
 | `models_only` | list of strings | — | Use only these of the upstream's models, as ids or globs. Others are not listed and are not routed here. Unset: all of them. Empty is refused; use `disabled`. |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`: cost is usage times the price in the upstream's price sheet, subscription accounts included. `free`: cost is recorded as 0. |
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
+| `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
+| `max_concurrent` | integer | — | Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 <!-- /generated -->
 
@@ -367,6 +427,7 @@ providers:
     proxy: office
     models_only: [gpt-4.1*, o3]
     pricing: relay-discount
+    max_concurrent: 4
 
   - name: local
     base_url: http://127.0.0.1:11434/v1
@@ -386,6 +447,18 @@ certain clients, turn on `forward_client_identity`.
 A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude
 and Google subscription sign-ins are not supported; use an API key.
+
+Some relays and accounts accept only a few requests at a time and refuse the
+rest. `max_concurrent` keeps the gateway within that number: a request takes a
+slot on the upstream when it is sent, and gives it back when the answer has
+been passed on in full or the client has gone. When the upstream is full, a
+conversation that stays on it to reuse its prompt cache waits for a slot;
+any other request goes straight to the next upstream. How long a request
+waits is `failover.slot_wait_secs`. Waiting is not a failure: the upstream is
+not set aside. Requests that only count tokens do not take a slot. On a
+Responses WebSocket connection, each `response.create` takes a slot from when
+it is sent until its answer ends, and so does a key's `max_concurrent`; an
+idle connection takes none.
 
 #### `providers[].oauth`
 
@@ -469,6 +542,40 @@ needs `bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles`;
 without them requests are still forwarded, and `models` can list the models by
 hand. For a VPC endpoint or a proxy, write its address in `base_url` and the
 region in `aws.region`; the model list is asked of that address too.
+
+#### `providers[].model_specs`
+
+A model's context window and output limit come from the price table. A relay's
+own models are often missing from it, and now and then it is wrong. Write the
+numbers here, for this upstream and by the exact id in its model list. A value
+written here takes precedence over the price table; one left out still comes
+from it. At least one of the two is written, and neither can be 0.
+
+The same numbers are used everywhere: in `/v1/models` for every client format,
+for an alias this upstream serves, when the gateway judges whether a
+conversation still fits the model it is on, and as the output limit of a
+request converted to Anthropic that does not set one. When several upstreams
+offer the same model, `/v1/models` describes it by the first of them in
+`providers`.
+
+<!-- generated: table providers[].model_specs.* -->
+<a id="cfg-providers-model_specs"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `context_window` | integer | — | Context window: the most tokens a request can take in. Unset: the price table's. |
+| `max_output_tokens` | integer | — | The most tokens an answer can have. Unset: the price table's. |
+<!-- /generated -->
+
+```yaml
+providers:
+  - name: relay
+    base_url: https://relay.example.com/v1
+    protocol: openai-chat
+    model_specs:
+      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }
+      claude-sonnet-4-5: { context_window: 1000000 }
+```
 
 ### `proxies`
 
@@ -888,10 +995,40 @@ go straight to the next candidate. How long depends on the reason the
 upstream gives: an insufficient balance waits for a top-up, a used-up quota
 waits until the moment the upstream says it resets, and a rate limit usually
 passes within seconds. A request with a single candidate is never affected.
+On a Responses WebSocket connection, each `response.create` counts here like
+a request: one that fails because of the upstream before any content arrives
+counts as a failure, and so does a connection the upstream refuses or that
+cannot be made.
 
 Before the first content of a streamed answer reaches the client, an error
 the upstream sends in the stream moves the request to the next candidate,
 the same as an error status would.
+
+An upstream can also be slow to start: it accepts the request and then sends
+nothing for a long time. With `next_on_slow_start`, the request moves on to the
+next candidate when no content has arrived `stream_start_wait_secs` after it
+was sent. It is off by default, because models that think before they write
+can take long to start; with it on, wait 30 seconds or more. The last
+candidate always waits, and the upstream given up on is not set aside. A
+candidate that is at its `max_concurrent` at that moment does not count as a
+next one: the slow upstream keeps the request.
+
+```yaml
+failover:
+  stream_start_wait_secs: 30
+  next_on_slow_start: true
+```
+
+When upstreams are at their `max_concurrent`, a request waits for a free slot
+for at most `slot_wait_secs` in all. The same time also covers waiting for a
+key's `minute` or `hour` limit, so a request never waits longer than
+`slot_wait_secs` for the two together. An ongoing conversation waits for the
+upstream it stays on and, if no slot frees in time, moves on to the next one,
+where its cache starts over. A new conversation skips a full upstream at once.
+When every candidate is full, the request waits for whichever frees first; if
+none does, the client gets a 429 with `Retry-After` saying the upstreams are
+busy. If an upstream did receive the request and failed, the client gets that
+failure instead.
 
 <!-- generated: table failover -->
 <a id="cfg-failover"></a>
@@ -905,6 +1042,8 @@ the same as an error status would.
 | `quota_pause_secs` | integer | `3600` | Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then. |
 | `rate_limit_max_pause_secs` | integer | `3600` | A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason. |
 | `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
+| `next_on_slow_start` | bool | `false` | When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5. |
+| `slot_wait_secs` | integer | `30` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for a free slot on upstreams at their `max_concurrent`. A key limit that does not free up in time refuses the request; without an upstream slot in time it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300. |
 <!-- /generated -->
 
 ### `aliases`
@@ -952,13 +1091,44 @@ group with `to`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the group; unique, and not the name of an upstream. |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
-| `providers` | list of strings | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: requests are shared out in proportion to the members' weights; a conversation in progress stays where it is. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price. |
+| `providers` | list of strings or [`groups[].providers[]`](#cfg-groups-providers) | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`. |
 | `selected` | string | — | For `select`: the chosen member. |
+| `balance_by` | `weights` \| `latency` \| `health` \| `latency-health` | `weights` | For `load-balance`: what the members' weights are multiplied by. `weights`: nothing; the weights alone. `latency`: faster upstreams get more. `health`: upstreams that fail less get more. `latency-health`: both. Other group types take only `weights`. |
 <!-- /generated -->
 
 `fallback` is the default because a single user's machine has no load to
 spread.
+
+In a `load-balance` group, a member can carry a weight, from 1 to 100; a
+member written as just its name has weight 1. Weights set how the group's
+requests are shared out: with `{ name: anthropic, weight: 7 }` and `relay`,
+the official API serves seven requests in ten. Conversations in progress
+stay on the upstream that answers them (see below) and count toward its
+share, so the balance is kept by where new conversations start. An upstream
+that is cooling down after failures, is at its `max_concurrent`, or cannot
+serve a request, sits that request out, and the others share it by their
+weights. A new WebSocket connection is placed the same way and counts as one
+request; everything sent on it then goes to the upstream it connected to.
+Other group types take no weights.
+
+<!-- generated: table groups[].providers[] -->
+<a id="cfg-groups-providers"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | **required** | The upstream, by name. A member written as just its name has weight 1. |
+| `weight` | integer | `1` | The member's share of a `load-balance` group's requests, in proportion to the other members' weights. From 1 to 100. Other group types take no weight other than 1. |
+<!-- /generated -->
+
+```yaml
+groups:
+  - name: pool
+    type: load-balance
+    providers:
+      - { name: anthropic, weight: 7 }
+      - relay
+```
 
 Whatever the type, a conversation stays on the upstream that last answered
 it, so that what the upstream holds of it in its prompt cache is read again
@@ -970,7 +1140,53 @@ the conversation, and whichever upstream answered after a failover is the one
 it stays on. The rule a turn matched at its start also holds for the rest of
 that turn: rules keyed on input size or images do not move a turn halfway,
 unless its input no longer fits the context window of a model the rule sends
-it to. `load-balance` therefore takes turns between new conversations.
+it to. A `load-balance` weight is therefore the long-run share of requests:
+conversations in progress stay where they are and count toward that
+upstream's share.
+
+`balance_by` lets a `load-balance` group also look at how each upstream has
+been doing lately. Each member's weight is multiplied by a factor, and the
+group shares out requests by the result in the same way as above.
+
+- `weights` (the default): the weights alone.
+- `latency`: faster upstreams get a larger share. Speed is the typical time
+  from sending a request to the first content of the answer, the same
+  measurement `url-test` uses. An upstream twice as fast as the middle of the
+  group has its weight multiplied by four, by at most ten and at least a
+  tenth.
+- `health`: upstreams that fail less get a larger share. It looks at the
+  last 50 requests within the past 30 minutes. Server errors, rate limits,
+  used-up quota or balance, rejected credentials, timeouts and connection
+  errors count as failures; errors caused by the request itself do not, and
+  neither does a client that cancels, a switch away from a stream that is
+  slow to start, or an upstream skipped because it is at its
+  `max_concurrent`. An upstream that keeps failing keeps a twentieth of its
+  weight, so it still gets the occasional request and its recovery
+  is noticed; one that fails outright is set aside by
+  [`failover`](#cfg-failover) as before.
+- `latency-health`: both factors, multiplied.
+
+Speed is measured on streamed answers only, from the moment the request is
+sent to that upstream, so waiting and upstreams that failed before it do not
+count. An upstream given up on because its stream was slow to start
+(`failover.next_on_slow_start`) counts as taking the whole wait. On a
+Responses WebSocket connection, each `response.create` counts as one request
+for both speed and failures, its speed measured from the moment the upstream
+starts answering it.
+
+An upstream without enough measurements yet counts as average. As with
+weights alone, conversations in progress stay where they are, and new
+conversations make up the difference.
+
+```yaml
+groups:
+  - name: pool
+    type: load-balance
+    balance_by: latency-health
+    providers:
+      - { name: official, weight: 3 }
+      - relay
+```
 
 ### `routes`
 

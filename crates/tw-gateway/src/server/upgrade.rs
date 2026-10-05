@@ -13,9 +13,15 @@ use tw_types::msg;
 /// 接管一次 WebSocket 升级。
 ///
 /// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、熔断对它一样
-/// 有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
-/// 每一帧上重新点一遍管线的保护。路由事件也由那边发：选中的那一家接没
+/// 有效，候选的次序和 HTTP 那条路是同一段（[`super::pipeline::arrange`]）：`load-balance`
+/// 按权重轮、记同一本账，`url-test`、`cheapest` 同样排。之后把连接交给 [`crate::ws::proxy`]，
+/// 那里会在每一帧上重新点一遍管线的保护。路由事件也由那边发：选中的那一家接没
 /// 接下，要和它握完手才知道。
+///
+/// **Responses 的连接上每个 `response.create` 是一个请求**（见 `crate::ws::turn`）：连接
+/// 本身不留行，密钥的用量上限、并发上限按轮算，升级时不看。Realtime 和别的路径的连接照旧
+/// 整条连接一行，升级时过一遍用量上限；Realtime 的连接用了多少 token、花了多少，断开时
+/// 那一行记下来才算进去（见 `crate::ws`）。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn ws_upgrade(
     state: AppState,
@@ -45,48 +51,34 @@ pub(super) async fn ws_upgrade(
         ..Default::default()
     };
     let route = rt.engine.route_of(&client_name).to_string();
+    // 这条连接上开始的请求都一样的那几项：整条连接一行的那一行，Responses 的连接上的每一轮
+    let opener = crate::ws::turn::Opener {
+        bus: state.bus.clone(),
+        client: client_name.clone(),
+        client_hint: crate::hint::client_hint(&headers),
+        peer: from.peer.clone(),
+        key_masked: from.key.clone(),
+        path: uri.path().to_string(),
+    };
     // 开始事件。**被规则拒绝的升级也发**（和 HTTP 那条路一样，见
     // `super::routed_nowhere`）：流量里要有这一行，规则的命中也要数得到它
+    //
+    // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成就被丢掉的 ——
+    // 客户端没等到 101 就走了 —— 由 Drop 报成取消
     let open = |choice: &Choice, provider: &str, billing: tw_api::Billing| {
-        let id = state.bus.next_id();
-        let at_ms = now_ms();
-        state.bus.emit(tw_api::Event::RequestStarted {
-            id,
-            client: client_name.clone(),
-            client_hint: crate::hint::client_hint(&headers),
-            // 升级请求没有正文，认不出是哪段对话
-            session: None,
-            peer: from.peer.clone(),
-            key_masked: from.key.clone(),
-            route: choice.route.clone(),
-            rule: choice.rule.clone(),
-            group: choice.group.clone(),
-            rewritten_by: choice.rewritten_by.clone(),
-            provider: provider.to_string(),
-            billing,
+        opener.open(crate::ws::turn::Opening {
+            choice,
+            to: (provider, billing),
             // 客户端写的模型名：Realtime 的连接写在查询串里，别的连接升级时还不知道
             model: facts.model.clone(),
-            method: "WS".to_string(),
-            path: uri.path().to_string(),
-            // 升级请求没有正文，没有可估的
+            // 升级请求没有正文，认不出是哪段对话，也没有可估的
+            session: None,
             input_estimate: None,
-            session_log_bytes: None,
-            at_ms,
-        });
-        // 这条连接怎么断的，就是这个请求的结局。**跟着连接走**：升级没完成
-        // 就被丢掉的 —— 客户端没等到 101 就走了 —— 由 Drop 报成取消。WS 帧
-        // 不留档，所以没有 body 的去处
-        let ending = crate::ending::Ending::new(
-            state.bus.clone(),
-            id,
-            String::new(),
             started,
-            at_ms as i64,
-            None,
-        );
-        (id, ending)
+            at_ms: now_ms(),
+        })
     };
-    let decision = match rt.engine.route(&facts).map_err(|e| {
+    let mut decision = match rt.engine.route(&facts).map_err(|e| {
         GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
     })? {
         tw_engine::Outcome::Route(d) => d,
@@ -102,6 +94,7 @@ pub(super) async fn ws_upgrade(
                 group: None,
                 rewritten_by: Vec::new(),
                 affinity: None,
+                stayed_on: None,
             };
             let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
             state.bus.emit(super::routed_nowhere(id, choice));
@@ -109,6 +102,28 @@ pub(super) async fn ws_upgrade(
             return Err(err);
         }
     };
+    // 候选的次序：**和 HTTP 那条路同一段**（见 `super::pipeline::arrange`）。先去掉服务不了的
+    // （停用的；Realtime 的连接写了模型，还有别名对不上、密钥不让用的），再按组排 ——
+    // `load-balance` 照权重轮到谁就是谁，不是一律连头一家。升级请求没有正文，认不出是哪段
+    // 对话，没有粘性。一家都服务不了的照旧交给下面一家家看，说得出为什么
+    let catalog = state.catalog.load();
+    let allow = crate::models::key_allow(&rt.config, &client_name);
+    let asked = rt
+        .engine
+        .asked(rt.engine.rules_for_client(&client_name), &facts, &decision);
+    let sent = crate::sent::plan(&rt.config, &catalog, &decision, &facts.model, &asked, allow);
+    let serving = crate::sent::serving(&rt.config, &catalog, &decision, &asked, allow);
+    if !serving.usable.is_empty() {
+        decision.candidates = serving.usable;
+    }
+    let arranged = super::pipeline::arrange(
+        &state,
+        &rt,
+        &mut decision,
+        &crate::sent::pairs(&sent),
+        None,
+        now_ms(),
+    );
     // 发给哪一家、每个 `response.create` 发出去的模型名怎么定：和 HTTP 那条路的一跳同一套，
     // 按这次的决定定（指定模型、阶段一的改写），别名对到这一家（见 `crate::ws::Naming`）
     let naming_for = |provider: &tw_config::Provider| crate::ws::Naming {
@@ -125,7 +140,6 @@ pub(super) async fn ws_upgrade(
     let picked = if facts.model.is_empty() {
         alive.first().map(|s| (s.to_string(), None))
     } else {
-        let catalog = state.catalog.load();
         let mut unserved = None;
         let mut barred = None;
         let mut picked = None;
@@ -156,6 +170,7 @@ pub(super) async fn ws_upgrade(
                         group: decision.via_group.clone(),
                         rewritten_by: decision.rewritten_by.clone(),
                         affinity: None,
+                        stayed_on: None,
                     };
                     let Some(rule) = rule else { return Err(why) };
                     tracing::info!(%rule, provider = %c, "a phase-two rule denied the WebSocket upgrade");
@@ -184,6 +199,9 @@ pub(super) async fn ws_upgrade(
             "gw.route.no_upstream_alive" => "No upstream is available."
         )));
     };
+    // `load-balance` 记账：记在真连的那一家头上（排在它前面的服务不了这个模型时，不是排头的
+    // 那一家）
+    arranged.charge(&decision.candidates, &name);
     let Some(provider) = rt.config.providers.iter().find(|p| p.name == name) else {
         return Err(GatewayError::config(msg!(
             "gw.route.upstream_missing", upstream = name.clone() =>
@@ -210,6 +228,7 @@ pub(super) async fn ws_upgrade(
         rewritten_by,
         // WebSocket 那条路一条连接跑好几轮，不按对话记
         affinity: None,
+        stayed_on: None,
     };
     // **走代理的上游不代理 WS**，而且要明说。悄悄绕过用户配的代理，
     // 等于把他以为在代理后面的流量直接发出去
@@ -221,17 +240,75 @@ pub(super) async fn ws_upgrade(
         )));
     }
     let http = rt.clients.get(&name).unwrap_or(&state.http);
-    let upstream_headers = state
-        .headers_for(provider, http)
-        .await
-        .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
-    let (id, ending) = open(&choice, &name, provider.billing.into());
-    // 插件：升级那一刻的那一份表，一条连接用到底。**插件只管 Responses 的 WebSocket**（每个
-    // `response.create` 是一次对话请求）；别的路径上的连接（比如 Realtime 的 `/v1/realtime`）
-    // 不属于插件处理的任何一种请求，所有插件都不管：原样接上，什么都不记
+    // 凭据取不到是这一家的问题，和 HTTP 那条路一样记一次失败（见 `crate::health`）
+    let upstream_headers = match state.headers_for(provider, http).await {
+        Ok(h) => h,
+        Err(e) => {
+            let change = state.health.record_failure(&name);
+            super::note_health(&state.bus, &state.health, &name, change);
+            return Err(GatewayError::config(crate::state::credential_failed(
+                e, &name,
+            )));
+        }
+    };
+    // Responses 的连接：每个 `response.create` 是一个请求（见 `crate::ws::turn`）
     let responses = crate::client_api::ClientApi::of_path(uri.path())
         == Some(crate::client_api::ClientApi::OpenaiResponses)
         && crate::client_api::ClientApi::generates(uri.path());
+    let rows = if responses {
+        // 连接本身不留行，上限按轮看。连不上上游时按升级的这一刻补上这一行
+        crate::ws::Rows::Turns {
+            line: std::sync::Arc::new(crate::ws::turn::Line {
+                opener: opener.clone(),
+                choice: choice.clone(),
+                provider: name.clone(),
+                billing: provider.billing,
+            }),
+            upgraded: (started, now_ms()),
+        }
+    } else {
+        // 这把密钥的用量上限：**整条连接算一个请求**，连上之前看一遍，和 HTTP 那条路的准入
+        // 同一套（见 `crate::key_limits`）。Realtime 的连接用了多少 token、花了多少，断开时这
+        // 一行记下来才算进去（每一次回答的用量加起来，见 `crate::ws`）：连着的时候不占预留 ——
+        // 一条语音连接用多少，开头估不出来。别的路径的连接不带用量，只数得到它的请求数
+        let limits = rt
+            .config
+            .clients
+            .iter()
+            .find(|c| c.name == client_name)
+            .map(|c| c.limits.as_slice())
+            .unwrap_or_default();
+        let hold = match state
+            .key_limits
+            .admit(
+                &client_name,
+                limits,
+                Default::default(),
+                crate::key_limits::slot_wait(&rt.config),
+            )
+            .await
+        {
+            Ok(hold) => hold,
+            // 被拒的照样留一行，和规则拒绝的一样
+            Err(r) => {
+                let why = r.error();
+                let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
+                state.bus.emit(super::routed_nowhere(id, choice));
+                ending.failed(why.source.into(), why.detail.clone());
+                return Err(why);
+            }
+        };
+        let (id, ending) = open(&choice, &name, provider.billing.into());
+        hold.bind(id);
+        crate::ws::Rows::Connection {
+            id,
+            ending: Box::new(ending),
+            realtime,
+        }
+    };
+    // 插件：升级那一刻的那一份表，一条连接用到底。**插件只管 Responses 的 WebSocket**（每个
+    // `response.create` 是一次对话请求）；别的路径上的连接（比如 Realtime 的 `/v1/realtime`）
+    // 不属于插件处理的任何一种请求，所有插件都不管：原样接上，什么都不记
     let plugins = (responses && !rt.plugins.is_empty()).then(|| crate::ws::Plugins {
         pool: state.plugin_pool.clone(),
         set: rt.plugins.clone(),
@@ -265,8 +342,6 @@ pub(super) async fn ws_upgrade(
     Ok(ws.on_upgrade(move |sock| async move {
         // 一条 WS 连接活多久，这个请求就算在服务中多久
         let _live = live;
-        let mut ending = ending;
-        ending.responded(101);
-        crate::ws::proxy(state, sock, upstream, rules, id, ending, plugins, naming).await;
+        crate::ws::proxy(state, sock, upstream, rules, rows, plugins, naming).await;
     }))
 }

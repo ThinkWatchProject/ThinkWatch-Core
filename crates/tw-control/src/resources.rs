@@ -35,6 +35,7 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::UpdateProvider, update_provider)
         .at(ep::DeleteProvider, delete_provider)
         .at(ep::ProviderModels, provider_models)
+        .at(ep::SetModelSpec, set_model_spec)
         .at(ep::RefreshProviderModels, refresh_models)
         .at(ep::RefreshStaleModels, refresh_stale_models)
         .at(ep::CreateProxy, create_proxy)
@@ -142,6 +143,42 @@ fn chatgpt_login(cfg: &tw_config::Config, name: &str, token_endpoint: &str) -> O
     (ours && !shared).then(|| o.refresh.clone())
 }
 
+/// 手写一家上游的一个模型的上下文窗口、输出上限；两项都空就删掉那一项，回到价目表。
+///
+/// **只动这一家 `model_specs` 里的这一项**（[`edit::set_model_spec`]），不走编辑上游那条
+/// 路：那条路按读进来的结构把整项写回去，用户写成和默认值一样的字段会被顺手删掉。
+/// 模型 ID 和数值的毛病由整份配置的校验说（[`tw_config::check_model_spec`]），先查一遍，
+/// 好让它说的是这一项，而不是写进去之后被拒。
+async fn set_model_spec(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ModelSpecSave>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let model = req.model.trim();
+    let spec = tw_config::ModelSpec {
+        context_window: req.context_window,
+        max_output_tokens: req.max_output_tokens,
+    };
+    let spec = (!spec.is_empty()).then_some(spec);
+    let version = s
+        .cfg
+        .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
+            if !cfg.providers.iter().any(|p| p.name == req.provider) {
+                return Err(not_found("upstream", &req.provider));
+            }
+            tw_config::check_model_spec(&req.provider, model, spec.as_ref())
+                .map_err(|e| invalid(e.msg()))?;
+            Ok(edit::set_model_spec(
+                text,
+                &req.provider,
+                model,
+                spec.as_ref(),
+            )?)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
 /// 按接口地址自动识别会得到什么：协议、是不是官方端点、默认脱敏哪几类。
 ///
 /// **不联网，只看地址。**编辑对话框在用户输入地址时调它，好让「自动识别」
@@ -246,8 +283,8 @@ async fn test_provider(
     }))
 }
 
-/// 一个上游的模型清单：每个模型在不在启用范围里、上下文窗口多大、按它选的
-/// 价目表怎么计价。
+/// 一个上游的模型清单：每个模型在不在启用范围里、上下文窗口和输出上限多大（手写的
+/// 还是价目表的）、按它选的价目表怎么计价。
 async fn provider_models(
     State(s): State<ControlState>,
     Path(name): Path<String>,
@@ -306,9 +343,14 @@ fn models_view(
             .into_iter()
             .map(|id| {
                 let r = book.resolve_for(&p.name, &id);
+                // 上下文窗口、输出上限和 `/v1/models` 给客户端的是同一个查法
+                let limits = p.model_limits(&book, &id);
                 tw_api::ModelRow {
                     enabled: p.uses_model(&id),
-                    context_window: r.as_ref().and_then(|r| r.price.max_input_tokens),
+                    context_window: limits.context_window(),
+                    context_window_source: limits.context_window.map(|s| s.source.into()),
+                    max_output_tokens: limits.max_output_tokens(),
+                    max_output_tokens_source: limits.max_output_tokens.map(|s| s.source.into()),
                     price: r.as_ref().map(|r| {
                         crate::pricing::price_fields(&tw_pricing::PerMillion::of(&r.price))
                     }),
@@ -426,6 +468,10 @@ fn to_provider(
             .as_ref()
             .map(|ms| ms.iter().map(|m| m.trim().to_string()).collect::<Vec<_>>()),
         pricing: input.pricing.clone(),
+        // 手写的模型规格不在这个表单里（上游页的模型清单一行一行改，见 `set_model_spec`）：
+        // 沿用原来的，改名时跟着这一项走
+        model_specs: existing.map(|e| e.model_specs.clone()).unwrap_or_default(),
+        max_concurrent: input.max_concurrent,
         disabled: input.disabled,
     };
     // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时

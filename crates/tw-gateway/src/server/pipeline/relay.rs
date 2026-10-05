@@ -23,7 +23,8 @@ use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
 /// `asked_model` 是客户端请求里写的模型名：发出去的不是它、上游答的又是发出去的那个
-/// 模型时，回答里的模型名写回它（见 [`crate::answer_model`]）。
+/// 模型时，回答里的模型名写回它（见 [`crate::answer_model`]）。`live` 和 `pass` 是这个
+/// 请求在服务中的那一笔和这把密钥的通行证：都跟着响应体走，回答交完或者客户端走掉才还。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn respond(
     state: &AppState,
@@ -33,7 +34,7 @@ pub(super) fn respond(
     asked_model: &str,
     served: Served<'_>,
     id: u64,
-    live: crate::live::Pass,
+    (live, pass): (crate::live::Pass, crate::limits::Pass),
     mut ending: crate::ending::Ending,
     plugins: Option<crate::plugin::reply::Chain>,
 ) -> Response {
@@ -44,6 +45,8 @@ pub(super) fn respond(
         ledger,
         session,
         refusal,
+        slot,
+        sent_at,
         ..
     } = served;
     let status =
@@ -52,13 +55,6 @@ pub(super) fn respond(
     // 到结束可能还有好几分钟，UI 要能在这个点就把行画出来并标「进行中」，
     // 而不是等它结束才出现。
     let ttfb_ms = req.started.elapsed().as_millis() as u64;
-    // `url-test` 的判据。**只记成功的那些** —— 一个 500 在
-    // 十毫秒内返回，会让最坏的上游看起来最快
-    if status.is_success() {
-        state
-            .latency
-            .record(&provider.name, ttfb_ms.min(u32::MAX as u64) as u32);
-    }
     state.bus.emit(tw_api::Event::RequestHeaders {
         id,
         status: status.as_u16(),
@@ -128,6 +124,14 @@ pub(super) fn respond(
     // 成功的流才有「第一个 token」：整包的一起到，错误不是回答
     if generates && plan.is_sse && status.is_success() {
         ending.streaming(upstream_dialect, &provider.name);
+        // `url-test` 和按快慢分的 `load-balance` 的判据：从这一跳发出去到第一个 token（见
+        // `crate::latency`）。**只有成功的流有**：一个 500 在十毫秒内返回，会让最坏的上游
+        // 看起来最快；整包的回答分不出排队和说话
+        ending.timed(crate::ending::Lap {
+            latency: state.latency.clone(),
+            provider: provider.name.clone(),
+            sent: sent_at,
+        });
     }
     // 回的不是 2xx：原样交给客户端，**这个请求照样是失败的** —— 客户端拿到的是上游的
     // 错误，不是回答。原因在错误正文里，交完时读（见 `Ending::refused`）
@@ -160,6 +164,10 @@ pub(super) fn respond(
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
         // 都算这个请求结束了。
         let _live = live;
+        // 这把密钥的通行证（见 `crate::limits`）、在这家占着的位置（见 `crate::slots`）也一样：
+        // 回答交完、客户端走掉，才轮到下一个
+        let _pass = pass;
+        let _slot = slot;
         // 结局也一样：流被丢掉的时候，它替流报「客户端取消」。
         let mut ending = ending;
         let mut chunks = std::pin::pin!(chunks);

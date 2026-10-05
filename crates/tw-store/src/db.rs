@@ -146,6 +146,47 @@ pub struct RequestRow {
     pub session_log_bytes: Option<i64>,
 }
 
+/// 一把密钥从某一刻起用了多少，按几样分开数（见 [`Db::key_usage_since`]）。
+///
+/// **分开的那几样就是「算不算」要看的**：数 token 的请求、没发到上游的不算进密钥的
+/// 用量上限，判断在网关那边（`tw_gateway::key_limits`），和它结算一行时是同一个判断。
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyUsage {
+    pub client: String,
+    pub path: String,
+    /// 这些请求可能发到了上游（[`tw_api::RoutingView::reached_upstream`]）
+    pub reached: bool,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 记下的费用合计，微分。算不出来的那几行算 0
+    pub cost_micros: i64,
+}
+
+/// 装上 `tw_reached(路由那一列, 失败没有)`：这一行的请求可能发到了上游
+/// （[`tw_api::RoutingView::reached_upstream`]）。**判断写在 tw-api 那一处**，记下一行时交给
+/// 网关的（[`crate::Settled::reached`]）和从库里加回来的是同一个。路由那一列读不出来的当作
+/// 尝试链是空的
+fn register_reached(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::types::ValueRef;
+    conn.create_scalar_function(
+        "tw_reached",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let failed = matches!(ctx.get_raw(1), ValueRef::Integer(n) if n != 0);
+            let routing = match ctx.get_raw(0) {
+                ValueRef::Text(t) => serde_json::from_slice::<tw_api::RoutingView>(t).ok(),
+                _ => None,
+            };
+            Ok(routing.unwrap_or_default().reached_upstream(failed))
+        },
+    )
+}
+
 #[derive(Debug)]
 pub struct Db {
     /// 上游体检的查询在 `crate::health`，和这里共用一个连接
@@ -219,6 +260,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // 搜索用的 SQL 函数。装在连接上，不进库文件：每次打开都要装
         crate::search::register(&conn)?;
+        register_reached(&conn)?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if found != 0 && found != SCHEMA {
             return Err(DbError::OtherVersion {
@@ -1204,6 +1246,39 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 每把密钥从 `since_ms` 起用了多少：重启之后（和一期的开头变了的时候），密钥的用量
+    /// 上限按它把这一天、这一周、这个月的数加回来。
+    ///
+    /// 网关自己答的不在里面。**按「算不算」要看的几样分组**（路径、有没有发到上游），组数和
+    /// 密钥、路径的个数相当，一把密钥一个月的记录也只有几十组。有没有发到上游按路由那一列
+    /// 和这一行失败没有判断（`tw_reached`，和记下这一行时交给网关的是同一个判断）
+    pub fn key_usage_since(&self, since_ms: i64) -> Result<Vec<KeyUsage>, DbError> {
+        let mut st = self.conn.prepare(
+            "SELECT client, path, tw_reached(routing, error IS NOT NULL) AS reached,
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_micros), 0)
+             FROM requests
+             WHERE at_ms >= ?1 AND local = 0
+             GROUP BY client, path, reached",
+        )?;
+        let rows = st.query_map(params![since_ms], |r| {
+            Ok(KeyUsage {
+                client: r.get(0)?,
+                path: r.get(1)?,
+                reached: r.get(2)?,
+                requests: r.get(3)?,
+                input_tokens: r.get(4)?,
+                output_tokens: r.get(5)?,
+                cache_read_tokens: r.get(6)?,
+                cache_write_tokens: r.get(7)?,
+                cost_micros: r.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 各条路由走了多少请求、各条规则命中了多少，以及记录从哪一刻起是全的（见
     /// [`tw_api::RouteStats`]）。
     pub fn route_stats(&self, since_ms: i64, until_ms: i64) -> Result<tw_api::RouteStats, DbError> {
@@ -1817,6 +1892,82 @@ pub(crate) mod tests {
             db.cost_by(tw_api::CostDim::Model, t0, t0 + 1000)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// 密钥用量上限重启之后加回来的数：按密钥、路径、有没有发到上游分组，从那一刻起，网关
+    /// 自己答的不算。
+    #[test]
+    fn key_usage_adds_up_each_key_from_a_moment_on() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let attempt = r#"{"route":"default","rule":"r","rewritten_by":[],
+            "attempts":[{"provider":"官方","outcome":"served","status":200,"ms":5}]}"#;
+        let nowhere = r#"{"route":"default","rule":"r","rewritten_by":[],"attempts":[]}"#;
+        let mut early = row(1, t0 - 1);
+        early.routing = Some(attempt.into());
+        let mut a = row(2, t0);
+        a.routing = Some(attempt.into());
+        let mut b = row(3, t0 + 5);
+        b.routing = Some(attempt.into());
+        b.cost_micros = None;
+        b.cache_write_tokens = Some(7);
+        let mut refused = row(4, t0 + 6);
+        refused.routing = Some(nowhere.into());
+        refused.error = Some(Msg {
+            code: "gw.route.denied".into(),
+            args: Default::default(),
+            text: "x".into(),
+        });
+        refused.input_tokens = None;
+        refused.output_tokens = None;
+        refused.cache_read_tokens = None;
+        refused.cost_micros = None;
+        // 上游都满着：尝试链上只有跳过的那一跳
+        let mut busy = refused.clone();
+        busy.id = 7;
+        busy.routing = Some(
+            r#"{"route":"default","rule":"r","rewritten_by":[],"attempts":[{"provider":"官方",
+                "outcome":"error","error":{"code":"gw.busy_upstream","args":{},"text":"x"},
+                "ms":0,"skipped":"busy"}]}"#
+                .into(),
+        );
+        let mut local = row(5, t0 + 7);
+        local.local = true;
+        let mut other = row(6, t0 + 8);
+        other.client = "codex".into();
+        for r in [&early, &a, &b, &refused, &busy, &local, &other] {
+            db.insert(r).unwrap();
+        }
+        let mut got = db.key_usage_since(t0).unwrap();
+        got.sort_by(|x, y| (&x.client, x.reached).cmp(&(&y.client, y.reached)));
+        assert_eq!(got.len(), 3, "{got:?}");
+        let (refused_g, served, codex) = (&got[0], &got[1], &got[2]);
+        assert_eq!(
+            (served.client.as_str(), served.reached, served.requests),
+            ("claude-code", true, 2),
+            "早于那一刻的、本地答的都不算"
+        );
+        assert_eq!(
+            (
+                served.input_tokens,
+                served.output_tokens,
+                served.cache_read_tokens,
+                served.cache_write_tokens,
+                served.cost_micros
+            ),
+            (2000, 1000, 400, 7, 12_000),
+            "算不出钱的那一行算 0"
+        );
+        assert_eq!(
+            (refused_g.reached, refused_g.requests),
+            (false, 2),
+            "被拒的、都满着的没发到上游"
+        );
+        assert_eq!(
+            (codex.client.as_str(), codex.reached),
+            ("codex", true),
+            "没有路由那一列、也没失败的：客户端在等上游时走了，可能发到了"
         );
     }
 
@@ -2730,6 +2881,9 @@ mod cost_state_tests {
                     status: Some(200),
                     error: None,
                     ms: 1,
+                    usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 }],
                 ..Default::default()
             })

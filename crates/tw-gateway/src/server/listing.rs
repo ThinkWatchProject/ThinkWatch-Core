@@ -63,7 +63,8 @@ impl ListingShape {
 
 /// 列表里一个模型带给客户端的元数据。
 ///
-/// 来自价目表，和上游页模型一格的「上下文」（`ModelRow.context_window`）是同一个数。
+/// 这一家手写的（`model_specs`）优先，没写的来自价目表（见 [`tw_config::model_specs`]），
+/// 和上游页模型一格的「上下文」（`ModelRow.context_window`）是同一个数。
 /// **查不到就是 `None`，对应的字段整个不出现** —— 客户端读不到会用自己的默认值，
 /// 一个编出来的数它却会照着截断对话。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,31 +77,31 @@ pub(crate) struct ModelMeta {
 
 /// 查一个模型的元数据。
 ///
-/// `provider`：知道这个名称发给哪家上游时给上，按它选的价目表查，和上游页那一格是
-/// 同一个查法；不给就查默认价目表。自定义价目表只改单价，上下文窗口照样取自默认
-/// 价目表，所以两种查法给出的通常是同一个数。
+/// `provider`：知道这个名称发给哪家上游时给上，先看这一家手写的，再按它选的价目表查，
+/// 和上游页那一格是同一个查法（[`tw_config::Config::model_limits`]）；不给就只查默认
+/// 价目表。自定义价目表只改单价，上下文窗口照样取自默认价目表。
 pub(crate) fn model_meta(
+    cfg: &tw_config::Config,
     book: &tw_pricing::PriceBook,
     provider: Option<&str>,
     model: &str,
 ) -> ModelMeta {
-    let resolved = match provider {
-        Some(p) => book.resolve_for(p, model),
-        None => book.resolve(None, model),
+    let limits = match provider {
+        Some(p) => cfg.model_limits(book, p, model),
+        None => tw_config::ModelLimits::priced(book, model),
     };
-    resolved
-        .map(|r| ModelMeta {
-            max_input_tokens: r.price.max_input_tokens,
-            max_output_tokens: r.price.max_output_tokens,
-        })
-        .unwrap_or_default()
+    ModelMeta {
+        max_input_tokens: limits.context_window(),
+        max_output_tokens: limits.max_output_tokens(),
+    }
 }
 
 /// 列表里一个名称的元数据。
 ///
 /// 别名用它第一个有上游提供的模型的（按列表顺序），按提供它的头一家查（见
-/// [`tw_engine::Catalog::first_served`]）。目录空着、列表里谁都不提供时（这时单点
-/// 查询不拦），按它列表里的头一个查默认价目表。
+/// [`tw_engine::Catalog::first_served`]）；真模型也按提供它的头一家（配置里的顺序）查
+/// —— 那一家手写的规格才对得上。目录空着、谁都不提供时（这时单点查询不拦），别名按
+/// 它列表里的头一个、真模型按它自己查默认价目表。
 fn listed_meta(
     book: &tw_pricing::PriceBook,
     catalog: &tw_engine::Catalog,
@@ -108,11 +109,16 @@ fn listed_meta(
     name: &str,
 ) -> ModelMeta {
     if let Some((provider, model)) = catalog.first_served(name) {
-        return model_meta(book, Some(provider), model);
+        return model_meta(cfg, book, Some(provider), model);
+    }
+    if !cfg.aliases.contains(name)
+        && let Some(provider) = catalog.providers_for(name).first()
+    {
+        return model_meta(cfg, book, Some(provider), name);
     }
     match cfg.aliases.find(name).and_then(|a| a.models.first()) {
-        Some(model) => model_meta(book, None, model),
-        None => model_meta(book, None, name),
+        Some(model) => model_meta(cfg, book, None, model),
+        None => model_meta(cfg, book, None, name),
     }
 }
 
@@ -464,19 +470,53 @@ mod tests {
     #[test]
     fn metadata_comes_from_the_price_table() {
         let book = tw_pricing::PriceBook::builtin().unwrap();
-        let sonnet = model_meta(&book, None, "claude-sonnet-4-5-20250929");
+        let cfg = tw_config::Config::default();
+        let sonnet = model_meta(&cfg, &book, None, "claude-sonnet-4-5-20250929");
         assert_eq!(sonnet.max_input_tokens, Some(200_000));
         assert_eq!(sonnet.max_output_tokens, Some(64_000));
         // 给了上游就按它选的价目表查；没选价目表的上游和默认价目表一样
-        assert_eq!(model_meta(&book, Some("up"), "claude-sonnet-4-5"), sonnet);
+        assert_eq!(
+            model_meta(&cfg, &book, Some("up"), "claude-sonnet-4-5"),
+            sonnet
+        );
         // Bedrock 的名字也查得到
         assert_eq!(
-            model_meta(&book, Some("bedrock"), "us.anthropic.claude-fable-5").max_input_tokens,
+            model_meta(&cfg, &book, Some("bedrock"), "us.anthropic.claude-fable-5")
+                .max_input_tokens,
             Some(1_000_000)
         );
         assert_eq!(
-            model_meta(&book, None, "no-such-model-anywhere"),
+            model_meta(&cfg, &book, None, "no-such-model-anywhere"),
             ModelMeta::default()
+        );
+    }
+
+    #[test]
+    fn a_spec_written_for_the_upstream_wins_over_the_price_table() {
+        let book = tw_pricing::PriceBook::builtin().unwrap();
+        let cfg = tw_config::Config {
+            providers: vec![tw_config::Provider {
+                name: "up".into(),
+                base_url: "https://relay.example.com".into(),
+                model_specs: [(
+                    "claude-sonnet-4-5".to_string(),
+                    tw_config::ModelSpec {
+                        context_window: Some(1_000_000),
+                        max_output_tokens: None,
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let m = model_meta(&cfg, &book, Some("up"), "claude-sonnet-4-5");
+        assert_eq!(m.max_input_tokens, Some(1_000_000));
+        assert_eq!(m.max_output_tokens, Some(64_000), "没写的照样取价目表");
+        // 不知道是哪一家时没有手写的可看
+        assert_eq!(
+            model_meta(&cfg, &book, None, "claude-sonnet-4-5").max_input_tokens,
+            Some(200_000)
         );
     }
 }

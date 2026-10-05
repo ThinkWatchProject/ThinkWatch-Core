@@ -68,9 +68,10 @@ async fn list(State(s): State<ControlState>) -> Json<tw_api::AliasesView> {
                     })
                     .collect(),
                 shadows: shadows(&lists, a),
+                // 和 `/v1/models` 列别名时同一个查法：那一家手写的优先
                 context_window: served_by.first().and_then(|first| {
-                    book.resolve_for(&first.provider, &first.model)
-                        .and_then(|r| r.price.max_input_tokens)
+                    cfg.model_limits(&book, &first.provider, &first.model)
+                        .context_window()
                 }),
                 served_by,
                 requests_24h,
