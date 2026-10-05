@@ -251,7 +251,9 @@ clients:
 上限从零开始。
 
 Responses 的 WebSocket 连接上，每个 `response.create` 各算一个请求：带着各自的用量和费用记下，
-按这些上限检查；被拒的那一个收到 `response.failed`，连接保持不断。
+按这些上限检查；被拒的那一个收到 `response.failed`，连接保持不断。Realtime 的连接
+（`/v1/realtime`）整条算一个请求：连上时按这些上限检查，这条连接上所有回答的 token 和费用在
+断开时计入。
 
 <!-- generated: table clients[].limits[] -->
 <a id="cfg-clients-limits"></a>

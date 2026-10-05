@@ -170,3 +170,140 @@ providers:
     );
     drop(c);
 }
+
+/// Realtime 的每一次回答的用量：`response.done` 里的 `usage`。输入 1200（其中 1000 走了缓存，
+/// 细分叫 `input_token_details`）、输出 30
+const REALTIME_USAGE: &str = r#"{"total_tokens":1230,"input_tokens":1200,"output_tokens":30,"input_token_details":{"text_tokens":1200,"audio_tokens":0,"cached_tokens":1000,"cached_tokens_details":{"text_tokens":1000,"audio_tokens":0}},"output_token_details":{"text_tokens":30,"audio_tokens":0}}"#;
+
+/// 像 Realtime 那样回答的上游：每个 `response.create` 回 created、done（带用量）
+async fn realtime_upstream() -> SocketAddr {
+    let app = axum::Router::new().route(
+        "/v1/realtime",
+        axum::routing::any(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut sock| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(_) = m else { continue };
+                    n += 1;
+                    let usage: serde_json::Value = serde_json::from_str(REALTIME_USAGE).unwrap();
+                    let id = format!("resp_{n}");
+                    let frames = [
+                        serde_json::json!({"type":"response.created","event_id":"e1","response":{"id":id,"object":"realtime.response","status":"in_progress","output":[]}}),
+                        serde_json::json!({"type":"response.done","event_id":"e2","response":{"id":id,"object":"realtime.response","status":"completed","output":[],"usage":usage}}),
+                    ];
+                    for f in frames {
+                        if sock.send(Message::Text(f.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// Realtime 的连接**整条连接一行**：连上之前看一遍上限，这条连接上每一次回答的用量（上游的
+/// `response.done`）加起来记在这一行上，照 HTTP 那条路查价，**断开时**算进密钥的 token 和费用。
+/// 费用按 gpt-realtime 的价（$4/M 输入、$0.4/M 缓存读、$16/M 输出）：两次回答，每次
+/// 200 × 4 + 1000 × 0.4 + 30 × 16 = 1680 微美元
+#[tokio::test]
+async fn a_realtime_connection_counts_its_usage_when_it_closes() {
+    let up = realtime_upstream().await;
+    let d = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: voice
+    key: tw-k
+    limits:
+      - {{ per: day, tokens: 100000 }}
+      - {{ per: day, cost: 5 }}
+providers:
+  - name: openai
+    base_url: http://{up}
+    key: sk-x
+    protocol: openai-responses
+"
+    );
+    let cfg = tw_config::try_parse(&yaml).unwrap();
+    let limits = cfg.clients[0].limits.clone();
+    let gw = tw_gateway::AppState::new(cfg).unwrap();
+    let (_bodies, rx) = tokio::sync::mpsc::channel(1);
+    let store = tw_store::task::spawn(
+        tw_store::Recorder::new(
+            tw_store::Db::open(&d.path().join("data.db")).unwrap(),
+            tw_store::Blobs::new(d.path().join("blobs")),
+            gw.pricing.clone(),
+        )
+        .settling_to(tw_control::key_limits::settle_hook(&gw)),
+        gw.bus.subscribe(),
+        rx,
+    );
+    let addr = tw_gateway::serve(gw.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/v1/realtime?model=gpt-realtime")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer tw-k".parse().unwrap());
+    let (mut c, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    for _ in 0..2 {
+        let frame = serde_json::json!({"type": "response.create", "response": {}});
+        c.send(tokio_tungstenite::tungstenite::Message::Text(
+            frame.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+                .await
+                .expect("the answer did not end")
+                .unwrap()
+                .unwrap();
+            if m.into_text().unwrap().contains("response.done") {
+                break;
+            }
+        }
+    }
+    // 连着的时候还没有这一行，用量也还没算进去
+    let used = || {
+        gw.key_limits
+            .view("voice", &limits)
+            .iter()
+            .map(|v| v.used)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(used(), [0, 0]);
+    c.close(None).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let rows = loop {
+        let rows = store.lock().await.db().recent(None, 10).unwrap();
+        if !rows.is_empty() {
+            break rows;
+        }
+        assert!(std::time::Instant::now() < deadline, "the row never came");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r.path, "/v1/realtime");
+    assert_eq!(
+        (r.input_tokens, r.cache_read_tokens, r.output_tokens),
+        (Some(400), Some(2000), Some(60)),
+        "{r:?}"
+    );
+    assert_eq!(r.cost_micros, Some(3360), "{r:?}");
+    assert_eq!(used(), [2 * (200 + 30), 3360]);
+}

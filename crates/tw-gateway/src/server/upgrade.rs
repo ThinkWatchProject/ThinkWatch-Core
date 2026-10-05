@@ -20,7 +20,8 @@ use tw_types::msg;
 ///
 /// **Responses 的连接上每个 `response.create` 是一个请求**（见 `crate::ws::turn`）：连接
 /// 本身不留行，密钥的用量上限、并发上限按轮算，升级时不看。Realtime 和别的路径的连接照旧
-/// 整条连接一行，升级时过一遍用量上限。
+/// 整条连接一行，升级时过一遍用量上限；Realtime 的连接用了多少 token、花了多少，断开时
+/// 那一行记下来才算进去（见 `crate::ws`）。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn ws_upgrade(
     state: AppState,
@@ -267,7 +268,9 @@ pub(super) async fn ws_upgrade(
         }
     } else {
         // 这把密钥的用量上限：**整条连接算一个请求**，连上之前看一遍，和 HTTP 那条路的准入
-        // 同一套（见 `crate::key_limits`）。这一行不带用量，用量的上限只数得到它的请求数
+        // 同一套（见 `crate::key_limits`）。Realtime 的连接用了多少 token、花了多少，断开时这
+        // 一行记下来才算进去（每一次回答的用量加起来，见 `crate::ws`）：连着的时候不占预留 ——
+        // 一条语音连接用多少，开头估不出来。别的路径的连接不带用量，只数得到它的请求数
         let limits = rt
             .config
             .clients
@@ -300,6 +303,7 @@ pub(super) async fn ws_upgrade(
         crate::ws::Rows::Connection {
             id,
             ending: Box::new(ending),
+            realtime,
         }
     };
     // 插件：升级那一刻的那一份表，一条连接用到底。**插件只管 Responses 的 WebSocket**（每个

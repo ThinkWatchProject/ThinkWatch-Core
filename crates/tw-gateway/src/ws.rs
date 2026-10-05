@@ -32,8 +32,10 @@
 //! **Responses 的连接上每个 `response.create` 是一个请求**（见 [`turn`]）：从这一帧到这一次
 //! 回答完，开始、路由、结局三条事件，存储层记一行，带着这一次回答的用量，照 HTTP 那条路查价；
 //! 密钥的用量上限、并发上限、这一家的位置（`max_concurrent`）都按轮算，闲着的连接什么都不占。
-//! 连接本身不留行，连不上上游的除外。Realtime 和别的路径的连接照旧**整条连接一行**、不带
-//! 用量：它们的回答不按 Responses 的事件收尾，分不出一轮一轮。
+//! 连接本身不留行，连不上上游的除外。Realtime 和别的路径的连接照旧**整条连接一行**：它们的
+//! 回答不按 Responses 的事件收尾，分不出一轮一轮。Realtime 的每一次回答在 `response.done` 里
+//! 报用量，这一行带着它们加起来的数（[`realtime_usage`]），断开时照 HTTP 那条路查价、算进密钥
+//! 的用量；别的路径的连接不知道用量的写法，不带。
 //!
 //! 脚本插件也在这条路上跑（见 [`crate::plugin`]）：客户端发来的每个
 //! `response.create` 是一次请求。**这条路只有一跳**（升级时就连定了那一家，不换），
@@ -631,6 +633,8 @@ struct Pipes {
     id: u64,
     /// Responses 的连接上在跑的几轮（见 [`turn`]）。别的连接没有
     turns: Option<turn::Turns>,
+    /// 整条连接一行的 Realtime 连接：每一次回答的用量（`response.done`）加到这一行上
+    realtime: bool,
     /// 范围里可能有插件时才有
     plugins: Option<Plugins>,
     /// 每个 `response.create` 发出去的模型名怎么定。Responses 的连接才有
@@ -660,10 +664,12 @@ impl Pipes {
 
 /// 这条连接在流量里怎么记（见 [`turn`]）。
 pub(crate) enum Rows {
-    /// 整条连接一行：Realtime 和别的路径的连接。升级时已经开始了，`ending` 是它欠着的结局
+    /// 整条连接一行：Realtime 和别的路径的连接。升级时已经开始了，`ending` 是它欠着的结局。
+    /// `realtime`：是 Realtime 的连接，这一行带着每一次回答的用量加起来的数
     Connection {
         id: u64,
         ending: Box<crate::ending::Ending>,
+        realtime: bool,
     },
     /// 每一轮一行：Responses 的连接。连接本身不留行 —— 连不上上游的除外，那时按升级的那一刻
     /// （`upgraded`：用时从哪一刻算起、那一刻的 Unix 毫秒）补上这一行
@@ -697,14 +703,24 @@ pub(crate) async fn proxy(
     let name = &upstream.provider.name;
     // 每一轮一行的连接连上了：连接本身不留行，每一轮各有各的号（见 `turn`）。连不上的补上
     // 这一行，和整条连接一行的一样报
-    let (id, ending, turns) = match (rows, &connected) {
-        (Rows::Connection { id, mut ending }, _) => {
+    let (id, ending, turns, realtime) = match (rows, &connected) {
+        (
+            Rows::Connection {
+                id,
+                mut ending,
+                realtime,
+            },
+            _,
+        ) => {
             ending.responded(101);
-            (id, Some(*ending), None)
+            (id, Some(*ending), None, realtime)
         }
-        (Rows::Turns { line, .. }, Ok(_)) => {
-            (state.bus.next_id(), None, Some(turn::Turns::new(line)))
-        }
+        (Rows::Turns { line, .. }, Ok(_)) => (
+            state.bus.next_id(),
+            None,
+            Some(turn::Turns::new(line)),
+            false,
+        ),
         (Rows::Turns { line, upgraded }, Err(_)) => {
             let (id, mut ending) = line.opener.open(turn::Opening {
                 choice: &line.choice,
@@ -716,7 +732,7 @@ pub(crate) async fn proxy(
                 at_ms: upgraded.1,
             });
             ending.responded(101);
-            (id, Some(ending), None)
+            (id, Some(ending), None, false)
         }
     };
     // 这一家接没接下这条连接，和 HTTP 那条路一跳的成败记在同一笔账上（见 `crate::health`）：
@@ -806,6 +822,7 @@ pub(crate) async fn proxy(
         provider: upstream.provider.name,
         id,
         turns,
+        realtime,
         plugins,
         naming,
         requested_model: String::new(),
@@ -1340,6 +1357,14 @@ async fn upstream_text(
     ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
     let kind = frame_kind(t);
+    // Realtime 的一次回答收了尾：它的用量加到这条连接的那一行上。**看的是上游原话**，和
+    // 别的路一样（占位符不影响数字）
+    if p.realtime
+        && kind.as_deref() == Some("response.done")
+        && let (Some(e), Some(u)) = (ending.as_mut(), realtime_usage(t))
+    {
+        e.add_usage(&u);
+    }
     // 一次回答从开始到收尾的那几帧带着它的 id。只有它们要解第二遍
     let response = kind
         .as_deref()
@@ -1370,6 +1395,26 @@ async fn upstream_text(
         }
     }
     flow
+}
+
+/// Realtime 的 `response.done` 里这一次回答的用量（`response.usage`）。和 Responses 一样，
+/// `input_tokens` 里含着从缓存读的（`cached_tokens`），只是细分叫 `input_token_details`。
+/// 语音、图片的 token 不分开：查价和别的请求一样按 token 的单价算。没有 `usage` 的是 None
+fn realtime_usage(frame: &str) -> Option<tw_dialect::usage::Usage> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    let u = v.get("response")?.get("usage")?;
+    let n = |p: &str| {
+        u.pointer(p)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cached = n("/input_token_details/cached_tokens");
+    Some(tw_dialect::usage::Usage {
+        input: n("/input_tokens").saturating_sub(cached),
+        cache_read: cached,
+        output: n("/output_tokens"),
+        ..Default::default()
+    })
 }
 
 /// 上游的这一帧（`type` 是 `kind`）是不是一次回答的结尾：完成、失败、没答完，或者一个错误
@@ -1874,6 +1919,17 @@ mod tests {
         );
         // 空 query 不该留一个光秃秃的问号
         assert_eq!(upstream_url("http://h", "/x", Some("")), "ws://h/x");
+    }
+
+    #[test]
+    fn a_realtime_answer_reports_its_usage_with_the_cache_read_split_out() {
+        let done = r#"{"type":"response.done","response":{"id":"r","status":"completed","usage":{"total_tokens":253,"input_tokens":132,"output_tokens":121,"input_token_details":{"text_tokens":119,"audio_tokens":13,"cached_tokens":64},"output_token_details":{"text_tokens":30,"audio_tokens":91}}}}"#;
+        let u = realtime_usage(done).unwrap();
+        assert_eq!((u.input, u.cache_read, u.output), (68, 64, 121));
+        assert_eq!(
+            realtime_usage(r#"{"type":"response.done","response":{"id":"r"}}"#),
+            None
+        );
     }
 
     #[test]

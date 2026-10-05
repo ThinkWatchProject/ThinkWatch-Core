@@ -57,6 +57,8 @@ pub struct Ending {
     bytes: u64,
     /// 旁路嗅探。客户端走掉那一刻手里有多少用量，靠的就是它
     sniffer: Sniffer,
+    /// 一条连接上每一次回答报的用量加起来（[`Ending::add_usage`]）。有它就不看嗅探器
+    total: Option<Usage>,
     tap: ResponseTap,
     /// 认第一个 token 的。**只在上游回的是成功的流时才有**（见 [`Ending::streaming`]），
     /// 认出来就扔掉 —— 之后的字节不必再解析
@@ -211,6 +213,7 @@ impl Ending {
             status: None,
             bytes: 0,
             sniffer: Sniffer::new(),
+            total: None,
             tap: ResponseTap::new(),
             first: None,
             opened: None,
@@ -363,10 +366,23 @@ impl Ending {
     ///
     /// 整条连接一行的 WebSocket 用它（Realtime 和别的路径，见 [`crate::ws`]）。一条连接上
     /// 跑着好几轮回答，每轮各报一次用量，而嗅探器是「每个字段取最大值」—— 喂给它，得到的
-    /// 是其中某一轮的数，看起来却像整条连接的。**与其报一个错的数，不如说没有。**
+    /// 是其中某一轮的数，看起来却像整条连接的。**与其报一个错的数，不如说没有**：认得出
+    /// 每一轮用量的（Realtime 的 `response.done`）由调用方一轮一轮加上（[`Ending::add_usage`]）。
     /// Responses 的连接每一轮各是一个请求，用的是 [`Ending::frame`]。
     pub fn count(&mut self, bytes: usize) {
         self.bytes += bytes as u64;
+    }
+
+    /// 一条连接上又一次回答的用量：加到这一行上（Realtime 的连接，见 [`crate::ws`]）。结局
+    /// 报的是加起来的数，存储层照它查价、算进密钥的用量
+    pub fn add_usage(&mut self, u: &Usage) {
+        let t = self.total.get_or_insert_with(Usage::default);
+        t.input = t.input.saturating_add(u.input);
+        t.cache_read = t.cache_read.saturating_add(u.cache_read);
+        t.cache_write = t.cache_write.saturating_add(u.cache_write);
+        t.cache_1h |= u.cache_1h;
+        t.output = t.output.saturating_add(u.output);
+        t.reasoning = t.reasoning.saturating_add(u.reasoning);
     }
 
     /// WebSocket 上上游的一帧文本：Responses 连接上的一轮（见 `crate::ws::turn`）。一条消息
@@ -465,7 +481,8 @@ impl Ending {
         }
         let sniffer = std::mem::take(&mut self.sniffer);
         let model = sniffer.model().map(str::to_string);
-        (sniffer.finish(), model)
+        let usage = self.total.take().or_else(|| sniffer.finish());
+        (usage, model)
     }
 
     fn duration_ms(&self) -> u64 {

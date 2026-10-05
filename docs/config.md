@@ -353,7 +353,9 @@ hour limits start empty.
 On a Responses WebSocket connection, each `response.create` is a request of
 its own: it is recorded with its usage and cost and checked against these
 limits, and a refused one is answered with `response.failed` while the
-connection stays open.
+connection stays open. A Realtime connection (`/v1/realtime`) is one request:
+it is checked against the limits when it opens, and the tokens and cost of
+all its answers count when it closes.
 
 <!-- generated: table clients[].limits[] -->
 <a id="cfg-clients-limits"></a>
