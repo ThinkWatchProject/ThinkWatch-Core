@@ -2,13 +2,15 @@
 //!
 //! 路由给出的是每个候选**要**的名字（[`tw_engine::Engine::asked`]）：客户端写的、阶段一
 //! 改写的，都还是客户端那一侧的名称，可能是别名 —— 发给每一家之前按别名表对到那一家
-//! 自己的名称（[`crate::models::resolve`]），故障转移换一家就重新对一次。规则指定的模型、
+//! 自己的名称（[`crate::models::sent_to`]），故障转移换一家就重新对一次。规则指定的模型、
 //! 阶段二改的名字原样发出：写下它们的时候已经知道是哪一家。
 //!
-//! **路由（跳过服务不了的、按价钱排序）、每一跳、试算用的是同一个函数**：试算说发给
-//! Bedrock 的是哪个名字，真实转发发的就是那个。
+//! **路由（跳过服务不了的、按价钱排序、看上下文窗口）、每一跳、试算用的是同一份**：试算
+//! 说发给 Bedrock 的是哪个名字，真实转发发的就是那个。
 
-use tw_engine::{Asked, Catalog, Origin};
+use tw_engine::{Asked, Catalog, Decision, Origin, Pinned};
+
+use crate::models::{Serving, Skip};
 
 /// 一个候选发出去的模型名。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,9 +18,9 @@ pub struct Sent {
     pub provider: String,
     /// 它要的名字（[`Asked::model`]）
     pub asked: String,
-    /// 发给它的名字。`None` = 这家服务不了这个别名：别名列的名字它一个都没有
-    pub model: Option<String>,
-    /// 发出的名字为什么和客户端写的不一样。一样时是 `None`
+    /// 发给它的名字；这家服务不了时是为什么（见 [`name`]）
+    pub model: Result<String, Skip>,
+    /// 发出的名字为什么和客户端写的不一样。一样、或者这家服务不了时是 `None`
     pub via: Option<Via>,
 }
 
@@ -44,18 +46,27 @@ impl Via {
     }
 }
 
-/// 发给 `p` 的名字：原样发出的照写，客户端那一侧的名称按别名表对到这一家。
-/// `None` = 这家服务不了这个别名。
+/// 发给 `p` 的名字；这家服务不了时是为什么。
+///
+/// 客户端那一侧的名称和指定模型交给 [`crate::models::sent_to`]：别名对到这一家，指定的原样，
+/// 再看这一家有没有。**阶段二改的名字原样看**，和指定模型一样 —— `sent_to` 只认得
+/// 指定模型。要的是空的（请求体解不开）：什么都不改，不判断。
 pub fn name(
     cfg: &tw_config::Config,
     catalog: &Catalog,
+    decision: &Decision,
     p: &tw_config::Provider,
     asked: &Asked,
-) -> Option<String> {
-    if asked.origin.as_written() {
-        Some(asked.model.clone())
-    } else {
-        crate::models::resolve(cfg, catalog, p, &asked.model)
+) -> Result<String, Skip> {
+    if asked.model.is_empty() {
+        return Ok(String::new());
+    }
+    match asked.origin {
+        Origin::PhaseTwo => match crate::models::fit(catalog, p, &asked.model) {
+            Some(skip) => Err(skip),
+            None => Ok(asked.model.clone()),
+        },
+        _ => crate::models::sent_to(cfg, catalog, decision, p, &asked.model),
     }
 }
 
@@ -78,6 +89,7 @@ pub fn via(client: &str, asked: &Asked, sent: &str) -> Option<Via> {
 pub fn plan(
     cfg: &tw_config::Config,
     catalog: &Catalog,
+    decision: &Decision,
     client: &str,
     asked: &[Asked],
 ) -> Vec<Sent> {
@@ -85,10 +97,10 @@ pub fn plan(
         .iter()
         .map(|a| {
             let model = match cfg.providers.iter().find(|p| p.name == a.provider) {
-                Some(p) => name(cfg, catalog, p, a),
-                None => Some(a.model.clone()),
+                Some(p) => name(cfg, catalog, decision, p, a),
+                None => Ok(a.model.clone()),
             };
-            let via = model.as_deref().and_then(|m| via(client, a, m));
+            let via = model.as_deref().ok().and_then(|m| via(client, a, m));
             Sent {
                 provider: a.provider.clone(),
                 asked: a.model.clone(),
@@ -100,7 +112,7 @@ pub fn plan(
 }
 
 /// 每个候选和发给它的名字：按价钱排序（[`crate::AppState::unit_prices`]）、看上下文窗口用。
-/// 服务不了这个别名的那一家给它要的名字 —— 它会被 [`serving`] 跳过，排不排都一样。
+/// 服务不了的那一家给它要的名字 —— 它会被 [`serving`] 跳过，排不排都一样。
 pub fn pairs(sent: &[Sent]) -> Vec<(String, String)> {
     sent.iter()
         .map(|s| {
@@ -110,25 +122,34 @@ pub fn pairs(sent: &[Sent]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// 去掉服务不了这个请求的候选（[`crate::models::serving`]），**按发出去的名字看**：一家
-/// 有没有这个模型，问的是它会收到的那个名字。
+/// 去掉服务不了这个请求的候选（[`crate::models::serving`]），**按发出去的名字看**：别名按
+/// 这一家对到的那个名字，指定模型和阶段二改的名字原样。
 ///
-/// 服务不了这个别名的那一家（别名列的名字它一个都没有）记成「没有这个模型」；它停用了
-/// 的话照常记成停用。
+/// 阶段二改的名字当成指定给这一家的模型交给它：两者都是写给这一家、原样发出的名字。
 pub fn serving(
     cfg: &tw_config::Config,
     catalog: &Catalog,
-    sent: &[Sent],
-) -> crate::models::Serving {
-    let mut out = crate::models::serving(cfg, catalog, &pairs(sent));
-    for s in sent.iter().filter(|s| s.model.is_none()) {
-        if let Some(i) = out.usable.iter().position(|p| *p == s.provider) {
-            out.usable.remove(i);
-            out.skipped
-                .push((s.provider.clone(), crate::models::Skip::NotOffered));
-        }
+    decision: &Decision,
+    asked: &[Asked],
+) -> Serving {
+    let pairs: Vec<(String, String)> = asked
+        .iter()
+        .map(|a| (a.provider.clone(), a.model.clone()))
+        .collect();
+    if !asked.iter().any(|a| a.origin == Origin::PhaseTwo) {
+        return crate::models::serving(cfg, catalog, decision, &pairs);
     }
-    out
+    let mut d = decision.clone();
+    d.pinned.extend(
+        asked
+            .iter()
+            .filter(|a| a.origin == Origin::PhaseTwo)
+            .map(|a| Pinned {
+                provider: a.provider.clone(),
+                model: a.model.clone(),
+            }),
+    );
+    crate::models::serving(cfg, catalog, &d, &pairs)
 }
 
 #[cfg(test)]
@@ -153,10 +174,28 @@ mod tests {
                 provider("zhipu", &["glm-*"]),
             ],
             aliases: serde_yaml_ng::from_str(
-                "opus: [claude-opus-5, us.anthropic.claude-opus-5-v1:0]\n",
+                "opus: [claude-opus-5, us.anthropic.claude-opus-5-v1:0]\nglm-air: glm-5-air-0414\n",
             )
             .unwrap(),
             ..Default::default()
+        }
+    }
+
+    /// 路由的决定：`pinned` 是指定模型的那几项（上游、模型），空的就是按名称要
+    fn decided(pinned: &[(&str, &str)]) -> Decision {
+        Decision {
+            candidates: Vec::new(),
+            matched_rule: "r".into(),
+            via_group: None,
+            set: Default::default(),
+            rewritten_by: Vec::new(),
+            pinned: pinned
+                .iter()
+                .map(|(p, m)| Pinned {
+                    provider: p.to_string(),
+                    model: m.to_string(),
+                })
+                .collect(),
         }
     }
 
@@ -168,67 +207,39 @@ mod tests {
         }
     }
 
-    /// 别名对到每一家自己的名称；原样发出的不对；对不到的那一家是 None，被跳过
+    /// 别名对到每一家自己的名称；对不到的那一家说得出为什么，被跳过
     #[test]
     fn each_upstream_gets_its_own_name_and_one_that_has_none_is_skipped() {
         let c = cfg();
         let catalog = Catalog::default();
-        let sent = plan(
-            &c,
-            &catalog,
-            "opus",
-            &[
-                asked("bedrock", "opus", Origin::Client),
-                asked("official", "opus", Origin::Client),
-                asked("zhipu", "opus", Origin::Client),
-            ],
-        );
-        let got: Vec<_> = sent.iter().map(|s| (s.model.as_deref(), s.via)).collect();
+        let d = decided(&[]);
+        let asks = [
+            asked("bedrock", "opus", Origin::Client),
+            asked("official", "opus", Origin::Client),
+            asked("zhipu", "opus", Origin::Client),
+        ];
+        let sent = plan(&c, &catalog, &d, "opus", &asks);
+        let got: Vec<_> = sent
+            .iter()
+            .map(|s| (s.model.as_deref().map_err(|e| *e), s.via))
+            .collect();
         assert_eq!(
             got,
             [
-                (Some("us.anthropic.claude-opus-5-v1:0"), Some(Via::Alias)),
-                (Some("claude-opus-5"), Some(Via::Alias)),
-                (None, None),
+                (Ok("us.anthropic.claude-opus-5-v1:0"), Some(Via::Alias)),
+                (Ok("claude-opus-5"), Some(Via::Alias)),
+                // 智谱：别名列的名字一个都不在它的启用范围里
+                (Err(Skip::OutOfScope), None),
             ]
         );
         // 排价钱时给它要的名字：反正会被跳过
         assert_eq!(pairs(&sent)[2], ("zhipu".to_string(), "opus".to_string()));
-        // 智谱：别名列的名字一个都不在它的启用范围里
-        let s = serving(&c, &catalog, &sent);
+        let s = serving(&c, &catalog, &d, &asks);
         assert_eq!(s.usable, ["bedrock", "official"]);
-        assert_eq!(
-            s.skipped,
-            [("zhipu".to_string(), crate::models::Skip::OutOfScope)]
-        );
-        // 没有启用范围、也没有清单的一家什么都当作有：对到第一个
-        let mut open = c.clone();
-        open.providers[2].models_only = None;
-        let sent = plan(
-            &open,
-            &catalog,
-            "opus",
-            &[asked("zhipu", "opus", Origin::Client)],
-        );
-        assert_eq!(sent[0].model.as_deref(), Some("claude-opus-5"));
-        // 有清单、清单里一个都没有：没有这个模型
-        let listed = Catalog::build(&[tw_engine::ProviderModels {
-            provider: "zhipu".into(),
-            protocol: "anthropic".into(),
-            known: true,
-            models: vec!["glm-5".into()],
-        }]);
-        let sent = plan(
-            &open,
-            &listed,
-            "opus",
-            &[asked("zhipu", "opus", Origin::Client)],
-        );
-        assert_eq!(sent[0].model, None);
-        assert_eq!(
-            serving(&open, &listed, &sent).skipped,
-            [("zhipu".to_string(), crate::models::Skip::NotOffered)]
-        );
+        assert_eq!(s.skipped, [("zhipu".to_string(), Skip::OutOfScope)]);
+        // 要的是空的（请求体解不开）：不改，也不判断
+        let blank = plan(&c, &catalog, &d, "", &[asked("zhipu", "", Origin::Client)]);
+        assert_eq!(blank[0].model, Ok(String::new()));
     }
 
     /// 指定的、阶段二改的原样发（名字恰好是别名也一样）；阶段一改写成别名的照常对
@@ -236,35 +247,92 @@ mod tests {
     fn names_written_for_an_upstream_go_out_as_written() {
         let c = cfg();
         let catalog = Catalog::default();
+        let d = decided(&[("bedrock", "us.anthropic.claude-opus-5-v1:0")]);
         let sent = plan(
             &c,
             &catalog,
+            &d,
             "claude-sonnet-5",
             &[
-                asked("bedrock", "opus", Origin::Pinned),
+                asked("bedrock", "us.anthropic.claude-opus-5-v1:0", Origin::Pinned),
                 asked("official", "opus", Origin::Rule),
-                asked("zhipu", "opus", Origin::PhaseTwo),
+                asked("zhipu", "glm-air", Origin::PhaseTwo),
+                asked("zhipu", "glm-air", Origin::Rule),
             ],
         );
         let got: Vec<_> = sent
             .iter()
-            .map(|s| (s.model.as_deref(), s.via.map(Via::slug)))
+            .map(|s| (s.model.clone().ok(), s.via.map(Via::slug)))
             .collect();
+        let some = |m: &str| Some(m.to_string());
         assert_eq!(
             got,
             [
-                (Some("opus"), Some("pinned")),
-                (Some("claude-opus-5"), Some("rule")),
-                (Some("opus"), Some("rule")),
+                (some("us.anthropic.claude-opus-5-v1:0"), Some("pinned")),
+                (some("claude-opus-5"), Some("rule")),
+                (some("glm-air"), Some("rule")),
+                (some("glm-5-air-0414"), Some("rule")),
             ]
         );
+        // 指定的名字恰好是别名：原样
+        let d = decided(&[("zhipu", "glm-air")]);
+        let one = plan(
+            &c,
+            &catalog,
+            &d,
+            "x",
+            &[asked("zhipu", "glm-air", Origin::Pinned)],
+        );
+        assert_eq!(one[0].model.as_deref(), Ok("glm-air"));
         // 发出的和客户端写的一样：没有来历可说
         let same = plan(
             &c,
             &catalog,
+            &decided(&[]),
             "claude-opus-5",
             &[asked("official", "claude-opus-5", Origin::Rule)],
         );
         assert_eq!(same[0].via, None);
+    }
+
+    /// 跳过候选时，阶段二改的名字也原样看：智谱有个叫 `glm-air` 的真模型，阶段二写的就是它；
+    /// 按名称要 `glm-air` 的是别名，智谱的清单里没有它列的名字
+    #[test]
+    fn serving_judges_a_phase_two_name_as_written() {
+        let c = cfg();
+        let listed = Catalog::build(&[tw_engine::ProviderModels {
+            provider: "zhipu".into(),
+            protocol: "anthropic".into(),
+            known: true,
+            models: vec!["glm-air".into()],
+        }])
+        .with_aliases(
+            c.aliases
+                .iter()
+                .map(|a| (a.name.as_str(), a.models.as_slice())),
+        );
+        let d = decided(&[]);
+        let s = serving(
+            &c,
+            &listed,
+            &d,
+            &[asked("zhipu", "glm-air", Origin::PhaseTwo)],
+        );
+        assert_eq!(s.usable, ["zhipu"]);
+        let s = serving(
+            &c,
+            &listed,
+            &d,
+            &[asked("zhipu", "glm-air", Origin::Client)],
+        );
+        assert_eq!(s.skipped, [("zhipu".to_string(), Skip::NotOffered)]);
+        let sent = plan(
+            &c,
+            &listed,
+            &d,
+            "x",
+            &[asked("zhipu", "glm-air", Origin::PhaseTwo)],
+        );
+        assert_eq!(sent[0].model.as_deref(), Ok("glm-air"));
     }
 }

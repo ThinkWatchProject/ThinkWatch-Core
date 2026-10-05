@@ -231,11 +231,11 @@ pub async fn dry_run(
             // 是 A」正是用户会来试算的原因
             //
             // 每一家按发给它的模型名看：规则改写过的按改写后的算，别名对到各家自己的
-            // 名称，和数据面同一个函数（`tw_gateway::sent`）
+            // 名称，指定的原样，和数据面同一个函数（`tw_gateway::sent`）
             let asked = engine.asked(rules, &f, &d);
             let catalog = s.gateway.catalog.load();
-            let sent = tw_gateway::sent::plan(&rt.config, &catalog, &f.model, &asked);
-            let serving = tw_gateway::sent::serving(&rt.config, &catalog, &sent);
+            let sent = tw_gateway::sent::plan(&rt.config, &catalog, &d, &f.model, &asked);
+            let serving = tw_gateway::sent::serving(&rt.config, &catalog, &d, &asked);
             out.skipped = serving
                 .skipped
                 .iter()
@@ -277,7 +277,9 @@ pub async fn dry_run(
                     let one = sent.iter().find(|x| x.provider == *name);
                     tw_api::DryRunCandidate {
                         provider: name.clone(),
-                        sent_model: one.and_then(|x| x.model.clone()).filter(|m| !m.is_empty()),
+                        sent_model: one
+                            .and_then(|x| x.model.clone().ok())
+                            .filter(|m| !m.is_empty()),
                         model_via: one.and_then(|x| x.via).map(|v| v.slug().to_string()),
                     }
                 })

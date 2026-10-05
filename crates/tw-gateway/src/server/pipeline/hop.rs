@@ -224,25 +224,23 @@ pub(super) async fn try_upstreams<'a>(
         let asked_model =
             rt.engine
                 .asked_of(&reading.facts, decision, &provider.name, renamed.as_deref());
-        let Some(sent) = crate::sent::name(&rt.config, &catalog, provider, &asked_model) else {
-            // 别名列的名字这一家一个都没有。路由时已经跳过了这样的候选，能到这儿说明它的
-            // 清单刚刚换过：**不把别名原样发给它**，换下一家
-            let err = GatewayError::new(
-                crate::error::Source::Request,
-                msg!(
-                    "gw.model.alias_not_served",
-                    upstream = provider.name.clone(), alias = asked_model.model.clone() =>
-                    "Upstream `{upstream}` offers none of the models that alias {alias} lists."
-                ),
-            );
-            chain.push(hop_failed(
-                &provider.name,
-                None,
-                err.detail.clone(),
-                hop_started,
-            ));
-            last_err = Some(err);
-            continue;
+        let sent = match crate::sent::name(&rt.config, &catalog, decision, provider, &asked_model) {
+            Ok(sent) => sent,
+            // 这一家服务不了（别名列的名字它一个都没有，或者清单里没有这个名字）。路由时已经
+            // 跳过了这样的候选，能到这儿说明它的清单刚刚换过：**不把别名原样发给它**，换下一家
+            Err(skip) => {
+                let mut serving = crate::models::Serving::default();
+                serving.skipped.push((provider.name.clone(), skip));
+                let err = serving.explain(&asked_model.model);
+                chain.push(hop_failed(
+                    &provider.name,
+                    None,
+                    err.detail.clone(),
+                    hop_started,
+                ));
+                last_err = Some(err);
+                continue;
+            }
         };
         // 和客户端写的一样就不动请求体里的模型名（改写过又对回来的也一样）
         effective_set.model = (sent != reading.facts.model).then(|| sent.clone());

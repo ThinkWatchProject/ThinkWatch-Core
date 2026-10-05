@@ -368,10 +368,10 @@ fn outgrown(
     let asked = rt
         .engine
         .asked(rt.engine.rules_for_client(&req.client_name), facts, d);
-    crate::sent::plan(&rt.config, &state.catalog.load(), &facts.model, &asked)
+    crate::sent::plan(&rt.config, &state.catalog.load(), d, &facts.model, &asked)
         .iter()
         .filter_map(|s| {
-            book.resolve_for(&s.provider, s.model.as_deref()?)?
+            book.resolve_for(&s.provider, s.model.as_deref().ok()?)?
                 .price
                 .max_input_tokens
         })
@@ -382,10 +382,15 @@ fn outgrown(
 /// 管线第 2 步的中段：模型准入。**和 `GET /v1/models` 共用同一个函数**
 /// —— 列出来的一定能用。
 ///
-/// **看的是发出去的模型，不是客户端写的那个**，所以放在规则做完决定之后：
+/// **看的是每个候选实际要的模型，不是客户端写的那个**，所以放在规则做完决定之后：
 /// 一条把 `claude-*` 改成 `glm-*` 的规则，请求里的名字哪一家的清单里都没有，
 /// 改写后的才有。`asked` 里有一个过得去就放行 —— 哪一家服务不了，由下一步
 /// 把它跳过。
+///
+/// - 要的是别名：按别名在目录里的样子看 —— 有清单的上游里有谁服务它，`allow` 写它
+///   的名称、或者写它列表里任一模型名都算放行（继承只从真名到别名）。
+/// - 指定模型的候选：看这一家有没有指定的那个名字（没有清单的当作有，和挑候选时
+///   一样），`allow` 按这个名字看。
 ///
 /// 目录空着时不拦：那说明探测还没回来或者上游都不给列表，这时候拦
 /// 等于把整个网关关掉。
@@ -415,42 +420,100 @@ fn admit(
         .map(|a| crate::client_api::slugs(a.servable_by(any)));
     // 阶段一之后要的模型。规则一家候选都没给时就看它
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
-    let mut models: Vec<&str> = asked.iter().map(|(_, m)| m.as_str()).collect();
-    if models.is_empty() {
-        models.push(model);
+    // 按名称要的（别名还是别名），和指定模型的（哪一家、哪个名字）分开看
+    let mut named: Vec<&str> = Vec::new();
+    let mut pinned: Vec<(&str, &str)> = Vec::new();
+    for (c, m) in asked {
+        match decision.pinned_model(c) {
+            Some(p) => pinned.push((c, p)),
+            None => named.push(m),
+        }
     }
-    if models
+    if named.is_empty() && pinned.is_empty() {
+        named.push(model);
+    }
+    let allowed = |m: &str| {
+        allow
+            .as_deref()
+            .is_none_or(|ps| ps.iter().any(|p| tw_engine::rule::glob_match(p, m)))
+    };
+    // 这一家有没有指定的名字。配置里没有这一家的留给尝试那一步报出来
+    let offered_at = |p: &str, m: &str| {
+        rt.config
+            .providers
+            .iter()
+            .find(|x| x.name == p)
+            .is_none_or(|x| crate::models::fit(&catalog, x, m).is_none())
+    };
+    if named
         .iter()
         .any(|m| catalog.admits(m, servable.as_deref(), allow.as_deref()))
+        || pinned.iter().any(|(p, m)| offered_at(p, m) && allowed(m))
     {
         return Ok(());
     }
     // 错误信息要说清是哪一种：没有上游提供它，和这个客户端不让用它，
     // 该去改的地方不一样。**改写过的两个名字都要说**：客户端写的是一个，
     // 报错里说的是另一个，不说清楚像是网关认错了模型
-    let offered = models.iter().any(|m| !catalog.providers_for(m).is_empty());
-    let why = match (offered, model != facts.model) {
-        (false, false) => msg!(
-            "gw.model.no_upstream", model = facts.model.clone() =>
-            "No upstream serves model {model}. GET /v1/models lists the models that \
-             are available."
-        ),
-        (true, false) => msg!(
-            "gw.model.not_allowed", key = req.client_name.clone(), model = facts.model.clone() =>
-            "Gateway key `{key}` may not use model {model}. GET /v1/models lists the \
-             models that are available."
-        ),
-        (false, true) => msg!(
-            "gw.model.no_upstream_rewritten", from = facts.model.clone(), model = model =>
-            "A routing rule rewrote model {from} to {model}, and no upstream serves {model}. \
-             GET /v1/models lists the models that are available."
-        ),
-        (true, true) => msg!(
-            "gw.model.not_allowed_rewritten", from = facts.model.clone(), model = model,
-            key = req.client_name.clone() =>
-            "A routing rule rewrote model {from} to {model}, which gateway key `{key}` may not \
-             use. GET /v1/models lists the models that are available."
-        ),
+    let key = req.client_name.clone();
+    let why = if named.is_empty() {
+        // 去向是指定模型：说出是哪条规则指定的、指定在哪一家
+        let rule = decision.matched_rule.clone();
+        match pinned.iter().find(|(p, m)| offered_at(p, m)) {
+            Some((p, m)) => msg!(
+                "gw.model.pinned_not_allowed", rule = rule, model = m, upstream = p, key = key =>
+                "Rule `{rule}` pins model {model} on `{upstream}`, which gateway key `{key}` may \
+                 not use."
+            ),
+            None => {
+                let detail = pinned
+                    .iter()
+                    .map(|(p, m)| format!("{p} ({m})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                msg!(
+                    "gw.model.pinned_not_offered", rule = rule, detail = detail =>
+                    "Rule `{rule}` pins models that their upstreams do not offer: {detail}."
+                )
+            }
+        }
+    } else {
+        let offered = named.iter().any(|m| !catalog.providers_for(m).is_empty());
+        let alias = catalog.alias(model).map(|ms| ms.join(", "));
+        match (offered, model != facts.model, alias) {
+            (false, false, Some(models)) => msg!(
+                "gw.model.alias_unserved", model = facts.model.clone(), models = models =>
+                "No upstream serves alias {model}: none offers any of {models}. GET /v1/models \
+                 lists the models that are available."
+            ),
+            (false, true, Some(models)) => msg!(
+                "gw.model.alias_unserved_rewritten", from = facts.model.clone(), model = model,
+                models = models =>
+                "A routing rule rewrote model {from} to alias {model}, and no upstream offers any \
+                 of {models}. GET /v1/models lists the models that are available."
+            ),
+            (false, false, None) => msg!(
+                "gw.model.no_upstream", model = facts.model.clone() =>
+                "No upstream serves model {model}. GET /v1/models lists the models that \
+                 are available."
+            ),
+            (true, false, _) => msg!(
+                "gw.model.not_allowed", key = key, model = facts.model.clone() =>
+                "Gateway key `{key}` may not use model {model}. GET /v1/models lists the \
+                 models that are available."
+            ),
+            (false, true, None) => msg!(
+                "gw.model.no_upstream_rewritten", from = facts.model.clone(), model = model =>
+                "A routing rule rewrote model {from} to {model}, and no upstream serves {model}. \
+                 GET /v1/models lists the models that are available."
+            ),
+            (true, true, _) => msg!(
+                "gw.model.not_allowed_rewritten", from = facts.model.clone(), model = model,
+                key = key =>
+                "A routing rule rewrote model {from} to {model}, which gateway key `{key}` may not \
+                 use. GET /v1/models lists the models that are available."
+            ),
+        }
     };
     Err(GatewayError::new(crate::error::Source::Request, why))
 }
@@ -544,13 +607,13 @@ fn route(
     admit(state, rt, req, reading, &decision, &pairs)?;
     // 每一家发出去的名字：别名对到各家自己的名称。跳过、比价看它（见 `crate::sent`）
     let catalog = state.catalog.load();
-    let sent = crate::sent::plan(&rt.config, &catalog, &facts.model, &asked);
+    let sent = crate::sent::plan(&rt.config, &catalog, &decision, &facts.model, &asked);
     // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的、别名对不到的。
     // **在排序之前** —— `cheapest` 和 `url-test` 要在能服务的上游里挑。
     //
     // 不跳过的话，一家没有这个模型的上游排在前面，它回的 404 不触发故障
     // 转移，请求就在一家能服务它的上游旁边失败了。
-    let serving = crate::sent::serving(&rt.config, &catalog, &sent);
+    let serving = crate::sent::serving(&rt.config, &catalog, &decision, &asked);
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
     if serving.usable.is_empty() {
         return Ok(Routed::Refused(choice, serving.explain(model)));
