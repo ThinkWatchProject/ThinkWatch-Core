@@ -3,7 +3,8 @@
 //! 别名是什么见 `tw_config::aliases`；请求里的别名怎么对到各家上游见
 //! `tw_gateway::models::resolve`。这里回答的是界面要问的几件事：
 //!
-//! - **它现在发往哪儿**（`served_by`）：每家启用的上游按 `resolve` 取名。
+//! - **它现在发往哪儿**（`served_by`）：每家启用的上游按 `resolve` 取名；准入就会拒掉
+//!   的别名（有清单的上游谁都不提供它）一家都不算，和网关一样。
 //! - **它挡住了谁**（`shadows`）：别名优先，某家清单里有一个同名的真模型、而别名的
 //!   列表里没有这个名称，这个名称就不会再发给那一家。
 //! - **还有谁有同一个模型**（建议、`same_model`）：只认 Claude，见 [`claude_key`]。
@@ -50,7 +51,7 @@ async fn list(State(s): State<ControlState>) -> Json<tw_api::AliasesView> {
         .aliases
         .iter()
         .map(|a| {
-            let served_by = served_by(&cfg, &catalog, &a.name);
+            let served_by = served_by(&cfg, &catalog, a);
             let (requests_24h, cost_micros_24h) = used
                 .iter()
                 .find(|u| u.name == a.name)
@@ -164,13 +165,16 @@ async fn preview(
                 })
         })
         .collect();
+    // 准入就会拒掉的话，列表里的每个名称都算没有上游提供：没有清单的上游当作有，也
+    // 轮不到它（见 `served_by`）
+    let admitted = admitted(&with, &catalog, &draft);
     Json(tw_api::AliasPreview {
         problems,
-        served_by: served_by(&with, &catalog, &draft.name),
+        served_by: served_by(&with, &catalog, &draft),
         unserved: draft
             .models
             .iter()
-            .filter(|m| !m.trim().is_empty() && offering(&lists, m).is_empty())
+            .filter(|m| !m.trim().is_empty() && (!admitted || offering(&lists, m).is_empty()))
             .cloned()
             .collect(),
         shadows: shadows(&lists, &draft),
@@ -208,13 +212,15 @@ async fn update(
                 return Err(not_found(&name));
             }
             let a = to_alias(&req.alias)?;
-            let mut out = edit::upsert_alias(text, Some(&name), &a)?;
-            if a.name != name {
-                // **和别名在同一个版本里改**：分两次写的话，中间那一版里密钥放行的、
-                // 规则匹配的是一个已经不存在的名字 —— 配置照样通过校验，请求却悄悄变了
-                renamed = refs::alias_refs(cfg, &name);
-                out = refs::rename_alias(&out, cfg, &name, &a.name)?;
+            let out = edit::upsert_alias(text, Some(&name), &a)?;
+            if a.name == name {
+                return Ok(out);
             }
+            // **和别名在同一个版本里改**：分两次写的话，中间那一版里密钥放行的、
+            // 规则匹配的是一个已经不存在的名字 —— 配置照样通过校验，请求却悄悄变了。
+            // 旧名还在列表里时哪些不改，见 `rename_alias`
+            let (out, done) = refs::rename_alias(&out, cfg, &name, &a)?;
+            renamed = done;
             Ok(out)
         })
         .await
@@ -309,22 +315,48 @@ fn offering(lists: &[(String, Vec<String>)], model: &str) -> Vec<String> {
         .collect()
 }
 
-/// 每家启用的上游发出的名称（`resolve`）。服务不了的不在里面
+/// 每家启用的上游发出的名称，**和网关实际做的一样**。服务不了的不在里面。
+///
+/// 一家一家按 `resolve` 取名，没有清单的上游当作能服务。但请求先过准入，准入看的是
+/// 目录：目录里有清单、而有清单的上游没有一家提供列表里的任一名称时，这个别名在准入
+/// 就被拒了（[`admitted`]），没有清单的上游也轮不到 —— 这时一家都不算。
+///
+/// `alias` 要在 `cfg.aliases` 里（`resolve` 按名字查它）。
 fn served_by(
     cfg: &tw_config::Config,
     catalog: &tw_engine::Catalog,
-    name: &str,
+    alias: &tw_config::Alias,
 ) -> Vec<PinnedModel> {
+    if !admitted(cfg, catalog, alias) {
+        return Vec::new();
+    }
     cfg.providers
         .iter()
         .filter(|p| !p.disabled)
         .filter_map(|p| {
-            tw_gateway::models::resolve(cfg, catalog, p, name).map(|model| PinnedModel {
+            tw_gateway::models::resolve(cfg, catalog, p, &alias.name).map(|model| PinnedModel {
                 provider: p.name.clone(),
                 model,
             })
         })
         .collect()
+}
+
+/// 准入放不放这个别名进来（不看密钥）：和真模型同一条规矩 —— 目录里一张清单都没有时
+/// 不拦（探测还没回来，或者上游都不给清单）；有清单时，要有一家有清单的上游提供它
+/// 列表里的一个名称。目录里的清单已经去掉了停用的上游、按启用范围过滤过
+fn admitted(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    alias: &tw_config::Alias,
+) -> bool {
+    catalog.is_empty()
+        || cfg.providers.iter().any(|p| {
+            alias
+                .models
+                .iter()
+                .any(|m| catalog.offers(&p.name, m) == Some(true))
+        })
 }
 
 /// 清单里有一个和别名同名的真模型、别名却没列这个名称的上游

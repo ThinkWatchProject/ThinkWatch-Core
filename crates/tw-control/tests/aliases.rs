@@ -295,6 +295,81 @@ async fn the_list_opens_without_request_records() {
     assert!(v["aliases"][0].get("cost_micros_24h").is_none(), "{v}");
 }
 
+/// 有清单的上游谁都不提供它列的名称：准入就拒了（真模型也是这条规矩），没有清单的
+/// 上游（blind）也轮不到 —— 不能说它发往 blind
+#[tokio::test]
+async fn an_alias_that_admission_refuses_is_served_by_nobody() {
+    let yaml = BASE.replace(
+        "routes:\n",
+        "  ghost: [claude-ghost-1, claude-ghost-1-v2]\nroutes:\n",
+    );
+    let b = bed(&yaml, None);
+    let (st, v) = call(&b.app, "GET", "/aliases", Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ghost = &v["aliases"][1];
+    assert_eq!(ghost["name"], "ghost");
+    assert_eq!(ghost["served_by"], json!([]), "{v}");
+    assert!(ghost.get("context_window").is_none(), "{v}");
+    // 有一家有清单的提供它，blind 照样算（准入放进来了，挑候选时它当作能服务）
+    assert!(
+        pinned(&v["aliases"][0]["served_by"])
+            .contains(&("blind".into(), "claude-sonnet-4-5".into())),
+        "{v}"
+    );
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/alias-preview",
+        json!({ "alias": { "name": "ghost-2", "models": ["claude-ghost-1", "nope"] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["served_by"], json!([]), "{v}");
+    assert_eq!(v["unserved"], json!(["claude-ghost-1", "nope"]), "{v}");
+}
+
+/// 一张清单都没有时准入不拦（探测还没回来，或者上游都不给清单）：没有清单的上游照样
+/// 当作能服务
+#[tokio::test]
+async fn without_any_model_list_an_alias_goes_where_it_resolves() {
+    let yaml = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: default
+    key: tw-aaaa
+providers:
+  - name: blind
+    base_url: https://blind.example
+    key: sk-e
+    protocol: anthropic
+    models_only: ['claude-*']
+aliases:
+  ghost: [gpt-ghost, claude-ghost-1]
+";
+    let b = bed(yaml, None);
+    let (_, v) = call(&b.app, "GET", "/aliases", Value::Null).await;
+    assert_eq!(
+        pinned(&v["aliases"][0]["served_by"]),
+        pairs(&[("blind", "claude-ghost-1")]),
+        "{v}"
+    );
+    let (_, v) = call(
+        &b.app,
+        "POST",
+        "/alias-preview",
+        json!({ "alias": { "name": "ghost-2", "models": ["claude-ghost-1"] } }),
+    )
+    .await;
+    assert_eq!(
+        pinned(&v["served_by"]),
+        pairs(&[("blind", "claude-ghost-1")]),
+        "{v}"
+    );
+}
+
 /// 别名替一组里的每一家都列了一种写法：这一组的建议不再出
 #[tokio::test]
 async fn a_group_every_upstream_of_which_an_alias_reaches_is_not_suggested() {
@@ -547,6 +622,73 @@ async fn renaming_an_alias_carries_its_references_in_the_same_version() {
     assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
 }
 
+/// 别名和它的一个模型同名、改名后还列着那个名称：旧名说的是那个真模型，写着它的
+/// `allow` 和 `when.model` 照样继承到改名后的别名 —— 不改、不报；改成新名的话，直接用
+/// 真名的客户端就被挡在外面了。`set.model` 是要发的名称、不继承，照样改
+#[tokio::test]
+async fn renaming_an_alias_that_lists_its_own_name_keeps_the_keys_and_conditions() {
+    let yaml = BASE
+        .replace("  sonnet:  # Bedrock", "  claude-sonnet-4-5:  # Bedrock")
+        .replace("[sonnet, 'claude-*']", "[claude-sonnet-4-5, 'claude-*']")
+        .replace("{ model: sonnet }", "{ model: claude-sonnet-4-5 }");
+    let b = bed(&yaml, None);
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/aliases/claude-sonnet-4-5",
+        json!({ "alias": { "name": "sonnet-4.5", "models": [
+            "claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5-v1:0"
+        ] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["renamed_in"]["keys"], json!([]), "{v}");
+    assert_eq!(
+        v["renamed_in"]["rules"],
+        json!([{ "route": "default", "rule": "降级", "field": "set.model" }]),
+        "{v}"
+    );
+    let f = b.file();
+    assert!(
+        f.contains("    allow: [claude-sonnet-4-5, 'claude-*']  # 只给 Claude\n"),
+        "{f}"
+    );
+    assert!(
+        f.contains("        when: { model: claude-sonnet-4-5 }\n"),
+        "{f}"
+    );
+    assert!(f.contains("        set: { model: sonnet-4.5 }\n"), "{f}");
+    assert_eq!(b.parsed().aliases[0].name, "sonnet-4.5");
+}
+
+/// 别名的名字是用户起的：叫 `preview` 也改得了、删得掉（预览不在 `/aliases/` 底下）
+#[tokio::test]
+async fn an_alias_named_preview_can_be_edited_and_deleted() {
+    let b = bed(BASE, None);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/aliases",
+        json!({ "alias": { "name": "preview", "models": ["claude-opus-4-1-20250805"] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/aliases/preview",
+        json!({ "alias": { "name": "preview", "models": ["claude-sonnet-4-5"] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.parsed().aliases[1].models, ["claude-sonnet-4-5"]);
+    let (st, v) = call(&b.app, "GET", "/aliases/preview/usage", Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(&b.app, "DELETE", "/aliases/preview", Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!b.parsed().aliases.contains("preview"));
+}
+
 /// 删掉；引用它的地方不拦（那是一个上游模型名，配置照样成立）；删到最后一个，整张表
 /// 一起没了
 #[tokio::test]
@@ -580,7 +722,7 @@ async fn a_preview_says_where_a_draft_would_go_and_suggests_the_same_model_elsew
     let (st, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "opus", "models": ["claude-opus-4-1-20250805", "nope-model"] } }),
     )
     .await;
@@ -609,19 +751,13 @@ async fn a_preview_says_where_a_draft_would_go_and_suggests_the_same_model_elsew
 async fn editing_an_alias_is_not_a_duplicate_of_itself() {
     let b = bed(BASE, None);
     let draft = json!({ "name": "sonnet", "models": ["claude-sonnet-4-5"] });
-    let (_, v) = call(
-        &b.app,
-        "POST",
-        "/aliases/preview",
-        json!({ "alias": draft }),
-    )
-    .await;
+    let (_, v) = call(&b.app, "POST", "/alias-preview", json!({ "alias": draft })).await;
     assert_eq!(codes(&v), ["config.alias_duplicate"], "{v}");
 
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": draft, "original": "sonnet" }),
     )
     .await;
@@ -639,7 +775,7 @@ async fn editing_an_alias_is_not_a_duplicate_of_itself() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "sonnet-4.5", "models": ["claude-sonnet-4-5"] }, "original": "sonnet" }),
     )
     .await;
@@ -648,7 +784,7 @@ async fn editing_an_alias_is_not_a_duplicate_of_itself() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "sonnet", "models": ["sonnet", "claude-sonnet-4-5"] }, "original": "sonnet" }),
     )
     .await;
@@ -670,7 +806,7 @@ async fn a_preview_lists_what_would_stop_the_save() {
             None => json!({ "alias": alias }),
         };
         async move {
-            let (st, v) = call(&app, "POST", "/aliases/preview", body).await;
+            let (st, v) = call(&app, "POST", "/alias-preview", body).await;
             assert_eq!(st, StatusCode::OK, "{v}");
             codes(&v)
         }
@@ -699,7 +835,7 @@ async fn a_preview_lists_what_would_stop_the_save() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/aliases/preview",
+        "/alias-preview",
         json!({ "alias": { "name": "", "models": ["claude-opus-4-1-20250805"] } }),
     )
     .await;

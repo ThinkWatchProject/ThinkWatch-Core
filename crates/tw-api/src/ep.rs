@@ -105,10 +105,13 @@ endpoints! {
     /// 模型在各家叫不同名称的建议（只认 Claude）
     Aliases: GET "/aliases", () => api::AliasesView;
     CreateAlias: POST "/aliases", api::AliasSave => api::ConfigWritten;
-    /// 预览一个还没保存的别名：挡着保存的问题、发往各家的名称、别家上的同一个模型
-    PreviewAlias: POST "/aliases/preview", api::AliasPreviewRequest => api::AliasPreview;
+    /// 预览一个还没保存的别名：挡着保存的问题、发往各家的名称、别家上的同一个模型。
+    /// **不在 `/aliases/` 底下**：`/aliases/preview` 会盖住 `/aliases/{name}`，一个叫
+    /// `preview` 的别名就改不了、删不掉了
+    PreviewAlias: POST "/alias-preview", api::AliasPreviewRequest => api::AliasPreview;
     /// 保存，可以改名：引用旧名的密钥（`allow` 里的整项）和规则（`when.model`、
-    /// `set.model`）在同一个版本里跟着改
+    /// `set.model`）在同一个版本里跟着改。旧名还在改名后的列表里时，`allow` 和
+    /// `when.model` 不改（见 [`api::AliasWritten::renamed_in`]）
     UpdateAlias: PUT "/aliases/{name}" [name], api::AliasSave => api::AliasWritten;
     /// 删掉。**引用它的密钥和规则不拦**：删之前先看 `AliasUsage`
     DeleteAlias: DELETE "/aliases/{name}" [name], api::BaseVersion => api::ConfigWritten;
@@ -242,6 +245,19 @@ mod tests {
                 e.path
             );
             assert!(names.insert(e.name), "{}", e.name);
+        }
+    }
+
+    /// 别名的名字是用户起的，什么词都可能：`/aliases/` 下面的第二段只能是 `{name}`。
+    /// 写死一个词（`/aliases/preview`）的话，axum 先认写死的那个，叫这个词的别名就只剩
+    /// 那一个方法，改和删都是 405
+    #[test]
+    fn no_fixed_path_under_aliases_shadows_an_alias_name() {
+        for e in ALL {
+            let segments: Vec<&str> = e.path.split('/').skip(1).collect();
+            if segments.first() == Some(&"aliases") && segments.len() > 1 {
+                assert_eq!(segments[1], "{name}", "{}: {}", e.name, e.path);
+            }
         }
     }
 
