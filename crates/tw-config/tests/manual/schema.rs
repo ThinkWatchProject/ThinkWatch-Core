@@ -478,8 +478,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Num,
                     Def::Unset,
                     t(
-                        "At most this much, in US dollars, as recorded for each request. Models without a price and upstreams with `billing: free` count as 0.",
-                        "最多花这么多美元，按每个请求记下的费用算。没有价格的模型、`billing: free` 的上游算 0。",
+                        "At most this much, in US dollars, as recorded for each request; at least 0.01. Models without a price and upstreams with `billing: free` count as 0.",
+                        "最多花这么多美元，按每个请求记下的费用算；至少 0.01。没有价格的模型、`billing: free` 的上游算 0。",
                     ),
                 ),
                 row(

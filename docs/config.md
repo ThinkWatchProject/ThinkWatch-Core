@@ -340,9 +340,10 @@ key, the limit, the amount used and when it resets, and it shows in the
 traffic list. Cost is what is recorded for each request, so a model without a
 price and an upstream with `billing: free` count as $0. A request still
 running counts with an estimate of its input until it is recorded. After a
-restart, the day, week and month are added up again from the request records;
-a monthly limit therefore needs `retention.row_days` of at least 31. Minute
-and hour limits start empty.
+restart, the day, week and month are added up again from the request records,
+so the records have to cover the period: `retention.row_days` of at least 1
+for a daily limit, 7 for a weekly one and 31 for a monthly one. Minute and
+hour limits start empty.
 
 On a Responses WebSocket connection, each `response.create` is a request of
 its own: it is recorded with its usage and cost and checked against these
@@ -357,7 +358,7 @@ connection stays open.
 | `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
 | `requests` | integer | — | At most this many requests. Token counts and answers the gateway gives itself do not count. |
 | `tokens` | integer | — | At most this many tokens: uncached input, cache writes and output. |
-| `cost` | number | — | At most this much, in US dollars, as recorded for each request. Models without a price and upstreams with `billing: free` count as 0. |
+| `cost` | number | — | At most this much, in US dollars, as recorded for each request; at least 0.01. Models without a price and upstreams with `billing: free` count as 0. |
 | `cache_reads` | bool | `false` | Count cache reads too. Only for a `tokens` limit. |
 <!-- /generated -->
 

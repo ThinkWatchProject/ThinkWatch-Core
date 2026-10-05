@@ -68,10 +68,11 @@ config.empty_key
 config.empty_models_only
 config.failover_range
 config.key_limit_cache_reads
+config.key_limit_cost_too_small
 config.key_limit_duplicate
 config.key_limit_empty
-config.key_limit_month_retention
 config.key_limit_not_positive
+config.key_limit_retention
 config.key_limit_two_measures
 config.model_spec_blank_model
 config.model_spec_empty

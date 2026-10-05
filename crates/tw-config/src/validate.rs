@@ -136,7 +136,18 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     KeyLimitCacheReads { key: String, measure: &'static str },
     #[error("{}", self.msg())]
-    KeyLimitMonthRetention { key: String, days: u64 },
+    KeyLimitCostTooSmall {
+        key: String,
+        per: &'static str,
+        value: String,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitRetention {
+        key: String,
+        per: &'static str,
+        days: u64,
+        min: u64,
+    },
 }
 
 impl ValidationError {
@@ -390,11 +401,21 @@ impl ValidationError {
                 "the {measure} limit of gateway key `{key}` sets cache_reads, which only a \
                  tokens limit takes"
             ),
-            KeyLimitMonthRetention { key, days } => msg!(
-                "config.key_limit_month_retention", key = key, days = days =>
-                "gateway key `{key}` has a limit per month, and retention.row_days is {days}. \
-                 After a restart the month's total is added up again from the request records, \
-                 so row_days has to be at least 31"
+            KeyLimitCostTooSmall { key, per, value } => msg!(
+                "config.key_limit_cost_too_small", key = key, per = per, value = value =>
+                "the cost limit per {per} of gateway key `{key}` is {value}; it has to be at \
+                 least 0.01"
+            ),
+            KeyLimitRetention {
+                key,
+                per,
+                days,
+                min,
+            } => msg!(
+                "config.key_limit_retention", key = key, per = per, days = days, min = min =>
+                "gateway key `{key}` has a limit per {per}, and retention.row_days is {days}. \
+                 After a restart the total for the {per} is added up again from the request \
+                 records, so row_days has to be at least {min}"
             ),
         }
     }
@@ -636,9 +657,20 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// 一个月的记录最少要留几天：月度上限的用量在重启之后从请求记录里重新加起来，
-/// 留得比一个月短，月初那几天的就加不回来
-pub const MONTH_ROW_DAYS: u64 = 31;
+/// 天、周、月的上限要请求记录最少留几天：这一期的用量在重启之后（和这一期的开头变了的
+/// 时候，比如时区改了）从请求记录里重新加起来，留得比一期短，这一期开头那几天的就加不回来。
+/// 分钟、小时从空的开始，不要记录
+fn row_days_needed(per: crate::LimitPer) -> Option<u64> {
+    match per {
+        crate::LimitPer::Day => Some(1),
+        crate::LimitPer::Week => Some(7),
+        crate::LimitPer::Month => Some(31),
+        crate::LimitPer::Minute | crate::LimitPer::Hour => None,
+    }
+}
+
+/// 费用上限最小是多少美元：再小的话换成微分是 0（不到一微分），或者小到一个请求就用完
+const COST_MIN: f64 = 0.01;
 
 /// 一把密钥的用量上限写得对不对。
 ///
@@ -682,6 +714,13 @@ fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError>
                 value,
             });
         }
+        if let Some(x) = l.cost.filter(|x| *x < COST_MIN) {
+            return Err(ValidationError::KeyLimitCostTooSmall {
+                key: key(),
+                per: l.per.word(),
+                value: x.to_string(),
+            });
+        }
         if l.cache_reads && measure != crate::LimitMeasure::Tokens {
             return Err(ValidationError::KeyLimitCacheReads {
                 key: key(),
@@ -695,10 +734,12 @@ fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError>
                 measure: measure.word(),
             });
         }
-        if l.per == crate::LimitPer::Month && row_days < MONTH_ROW_DAYS {
-            return Err(ValidationError::KeyLimitMonthRetention {
+        if let Some(min) = row_days_needed(l.per).filter(|min| row_days < *min) {
+            return Err(ValidationError::KeyLimitRetention {
                 key: key(),
+                per: l.per.word(),
                 days: row_days,
+                min,
             });
         }
     }
@@ -1488,8 +1529,8 @@ groups:
         }
     }
 
-    /// 用量上限：每一条恰好一种量、大于 0、`cache_reads` 只给 token、不重复；月度上限要
-    /// 请求记录留够一个月。
+    /// 用量上限：每一条恰好一种量、大于 0、费用至少一分、`cache_reads` 只给 token、不重复；
+    /// 天、周、月的上限要请求记录留够那一期。
     #[test]
     fn key_limits_are_checked_one_entry_at_a_time() {
         let with = |limits: &str, row_days: u64| {
@@ -1543,15 +1584,37 @@ groups:
             ),
             "config.key_limit_duplicate"
         );
-        // 月度上限：记录要留够 31 天，用量在重启之后从记录里加回来
-        let m = with("[{per: month, requests: 3}]", 30).unwrap_err();
-        assert_eq!(m.code, "config.key_limit_month_retention");
-        assert_eq!(m.arg("days"), "30");
-        assert!(with("[{per: month, requests: 3}]", 31).is_ok());
-        assert!(
-            with("[{per: week, requests: 3}]", 7).is_ok(),
-            "周以内的不受影响"
+        // 天、周、月的用量在重启之后从记录里加回来：记录要留够那一期 —— 月 31 天、周 7 天、
+        // 天 1 天。分钟、小时从空的开始，不看
+        for (per, need) in [("month", 31), ("week", 7), ("day", 1)] {
+            let limits = format!("[{{per: {per}, requests: 3}}]");
+            let m = with(&limits, need - 1).unwrap_err();
+            assert_eq!(m.code, "config.key_limit_retention", "{per}");
+            assert_eq!(
+                (m.arg("per"), m.arg("days"), m.arg("min")),
+                (
+                    per,
+                    (need - 1).to_string().as_str(),
+                    need.to_string().as_str()
+                )
+            );
+            assert!(with(&limits, need).is_ok(), "{per}");
+        }
+        assert!(with("[{per: hour, requests: 3}, {per: minute, cost: 1}]", 0).is_ok());
+        // 费用不到一分：换成微分是 0，或者小到没有意义
+        for bad in [
+            "[{per: day, cost: 0.009}]",
+            "[{per: hour, cost: 0.0000001}]",
+        ] {
+            let m = with(bad, 90).unwrap_err();
+            assert_eq!(m.code, "config.key_limit_cost_too_small", "{bad}");
+        }
+        let m = with("[{per: day, cost: 0.005}]", 90).unwrap_err();
+        assert_eq!(
+            (m.arg("key"), m.arg("per"), m.arg("value")),
+            ("k", "day", "0.005")
         );
+        assert!(with("[{per: day, cost: 0.01}]", 90).is_ok());
     }
 
     #[test]
@@ -1786,9 +1849,16 @@ mod msg_codes {
                 key: "k".into(),
                 measure: "cost",
             },
-            KeyLimitMonthRetention {
+            KeyLimitCostTooSmall {
                 key: "k".into(),
+                per: "day",
+                value: "0.005".into(),
+            },
+            KeyLimitRetention {
+                key: "k".into(),
+                per: "month",
                 days: 30,
+                min: 31,
             },
         ];
         check(
