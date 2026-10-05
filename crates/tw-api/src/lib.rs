@@ -738,7 +738,19 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （[`ConfigRepairRequest`] → [`ConfigWritten`]）照着修好写回。取值不在可选范围里、字段不认识
 /// 这两种字段错有了自己的码：`config.unknown_variant`、`config.unknown_field`（以前是
 /// `config.unparsable` 里的一句英文原话）；修不了时 `control.config_not_repairable`。
-pub const CONTROL_API_VERSION: u32 = 37;
+///
+/// **38 起有模型别名**：配置多了顶层的 `aliases`（一个名称 → 同一个模型在各家上游的名称，
+/// 有序），新端点 `GET /aliases`、`POST /aliases`、`PUT /aliases/{name}`（可改名，密钥范围和
+/// 规则里等于旧名的地方在同一个版本里一起改）、`DELETE /aliases/{name}`、
+/// `POST /aliases/preview`、`GET /aliases/{name}/usage`。`GET /models` 的列表含别名
+/// （[`KnownModel::alias`]；和真模型同名时只有别名那一项），真模型带着列出它的别名
+/// （[`KnownModel::aliases`]），上游模型清单的每一行也带（[`ModelRow::aliases`]）。规则的
+/// 去向可以是指定模型：[`RuleView::to`]、[`RuleInput::to`] 是 [`RuleTarget`]，字符串或
+/// `[{provider, model}]` 的列表，和配置里的 `to` 一个写法。试算多了 `candidate_models`：每个
+/// 候选发出的模型名，以及它是别名、规则改写还是指定模型来的。发出的模型名和客户端写的不同、
+/// 上游答的又是同一个模型时，回答里的模型名（含 `openai-model`、`x-openai-model` 回应头）
+/// 写成客户端写的名称。照 37 写的界面读不懂列表形状的 `to`，保存规则时会把指定模型丢掉。
+pub const CONTROL_API_VERSION: u32 = 38;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2005,6 +2017,27 @@ pub struct PinnedModel {
     pub model: String,
 }
 
+/// 规则转发到哪里（[`RuleView::to`]、[`RuleInput::to`]）。
+///
+/// **线上和配置里的 `to` 一个写法**：一个字符串是上游或策略组的名字（`__all__` 是全部
+/// 上游），一个列表是指定模型 —— 「上游 + 模型」，按顺序备用，模型名原样发出。前端的
+/// 类型是 `string | Array<PinnedModel>`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum RuleTarget {
+    /// 上游或策略组的名字
+    Name(String),
+    /// 指定模型，按顺序备用
+    Models(Vec<PinnedModel>),
+}
+
+impl From<&str> for RuleTarget {
+    fn from(name: &str) -> Self {
+        RuleTarget::Name(name.to_string())
+    }
+}
+
 /// 一条规则。
 ///
 /// **是全文，不是摘要** —— 编辑对话框靠它回填：条件、去向、拒绝原因、
@@ -2015,9 +2048,9 @@ pub struct RuleView {
     pub name: String,
     /// `when` 里写了的条件，按固定顺序。空 = 兜底
     pub conditions: Vec<ConditionView>,
-    /// 去向：上游名或组名。拒绝的规则和只附加改写的规则没有
+    /// 去向：上游名或组名，或者指定模型的列表。拒绝的规则和只附加改写的规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+    pub to: Option<RuleTarget>,
     /// 命中就拒绝。值是返回给客户端的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
@@ -2823,6 +2856,9 @@ pub struct ModelRow {
     pub price_source: Option<PriceSourceView>,
     /// 价格是从别的平台借来的。**按它算出来的钱是估算**
     pub estimated: bool,
+    /// 列出了这个模型名的别名，按别名表的顺序。**不论这家发不发它**：别名在这家按列表
+    /// 顺序取它有的第一个，排在后面的名字也算列进了这个别名
+    pub aliases: Vec<String>,
 }
 
 fn direct() -> String {
@@ -2948,8 +2984,9 @@ pub struct RuleInput {
     /// 空 = 兜底，匹配全部请求
     #[serde(default)]
     pub conditions: Vec<ConditionView>,
+    /// 去向，和 [`RuleView::to`] 同一个写法。指定模型的列表原样写进配置，交空列表会被拒
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+    pub to: Option<RuleTarget>,
     /// 拒绝，以及返回给客户端的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
@@ -3028,11 +3065,22 @@ pub struct GroupSave {
 }
 
 /// 网关知道的一个模型，以及能提供它的上游（已按启用范围与停用过滤）。
+///
+/// **别名也是一项**：`id` 是别名的名称，`alias` 是它的模型列表。别名和某个真模型同名
+/// 时只有一项，就是别名 —— 请求这个名称按别名处理。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KnownModel {
     pub id: String,
+    /// 有模型清单的上游里提供它的那几家，按配置里上游的顺序。别名是能服务它的那几家：
+    /// 它的模型列表里至少有一个名称在这家的清单里、也在启用范围里。没有清单的上游
+    /// 不在这里（不知道它有什么），但照样收这个名称的请求
     pub providers: Vec<String>,
+    /// 这一项是别名：它的模型列表，按顺序
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<Vec<String>>,
+    /// 列出了这个模型名的别名，按别名表的顺序。别名自己这一项是空的
+    pub aliases: Vec<String>,
 }
 
 /// 聚合类端点的时间窗（`GET /summary`、`/latency`）。**缺省是「今天」而不是
@@ -5686,6 +5734,50 @@ mod tests {
         );
         let v = serde_json::to_value(started(None)).unwrap();
         assert!(v.get("input_estimate").is_none(), "{v}");
+    }
+
+    /// 规则的去向和配置里的 `to` 一个写法：字符串是名字，列表是指定模型。
+    #[test]
+    fn a_rule_target_is_a_name_or_a_list_of_pinned_models() {
+        let name: RuleTarget = serde_json::from_str(r#""__all__""#).unwrap();
+        assert_eq!(name, RuleTarget::from("__all__"));
+        assert_eq!(serde_json::to_string(&name).unwrap(), r#""__all__""#);
+
+        let text = r#"[{"provider":"bedrock","model":"us.anthropic.claude-opus-5-v1:0"},{"provider":"anthropic","model":"claude-opus-5"}]"#;
+        let pinned: RuleTarget = serde_json::from_str(text).unwrap();
+        let pin = |provider: &str, model: &str| PinnedModel {
+            provider: provider.into(),
+            model: model.into(),
+        };
+        assert_eq!(
+            pinned,
+            RuleTarget::Models(vec![
+                pin("bedrock", "us.anthropic.claude-opus-5-v1:0"),
+                pin("anthropic", "claude-opus-5"),
+            ])
+        );
+        assert_eq!(serde_json::to_string(&pinned).unwrap(), text, "顺序不变");
+
+        // 一项不是列表，哪一种都不是
+        assert!(serde_json::from_str::<RuleTarget>(r#"{"provider":"a","model":"m"}"#).is_err());
+
+        // 规则视图里没有去向就不带这个字段
+        let view = RuleView {
+            name: "r".into(),
+            conditions: vec![],
+            to: Some(pinned),
+            deny: None,
+            set: None,
+            catch_all: true,
+            phase_two: false,
+            shadowed: false,
+        };
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["to"][1]["model"], "claude-opus-5");
+        let back: RuleInput = serde_json::from_value(v).unwrap();
+        assert_eq!(back.to, view.to, "视图交回来就是同一个去向");
+        let none = RuleView { to: None, ..view };
+        assert!(serde_json::to_value(&none).unwrap().get("to").is_none());
     }
 
     #[test]
