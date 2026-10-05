@@ -156,6 +156,9 @@ pub(super) async fn try_upstreams<'a>(
     let mut queued: Option<(usize, u64)> = None;
     // 等到最后，剩下的候选还都满着
     let mut stalled = false;
+    // 有一跳真的发到了上游、失败了（回了错误、流在内容之前断了、连不上、开头慢被放弃）。
+    // 等满着的那几家等到最后的话，交出去的是这一家的错，不是「都满着」（见下面的 `stalled`）
+    let mut reached = false;
 
     loop {
         stamp_queued(&mut chain, queued.take());
@@ -505,10 +508,15 @@ pub(super) async fn try_upstreams<'a>(
             .clone()
             .unwrap_or_else(|| reading.facts.model.clone());
         let (attempt, bridge) = (chain.len(), plugged.bridge);
-        // 后面还有没有接得下这个请求的（见 `successor`）。开头慢了才问。后面的是还没看的
-        // 候选，加上满着、跳过了的那几家：它们还可能空出来（见 `crate::slots`）
+        // 后面还有没有此刻接得下这个请求的（见 `successor`）。开头慢了才问。后面的是还没看的
+        // 候选，加上满着、跳过了的那几家：**此刻有空位的才算**（见 `crate::slots`）—— 满着的
+        // 那一家要等，而这个请求能等的多半已经等完了，放弃了这一家，换来的是一个 429
         let others = || {
-            let rest = queue.iter().chain(busy.iter()).copied();
+            let rest = queue
+                .iter()
+                .chain(busy.iter())
+                .copied()
+                .filter(|n| !state.slots.is_full(n));
             successor(state, rt, req, reading, decision, &catalog, allow, rest)
         };
         // 这一跳发出去的那一刻：这一家的快慢样本从这里算起（见 `crate::latency`）
@@ -557,6 +565,7 @@ pub(super) async fn try_upstreams<'a>(
                     // 响应头都还没来，后面又有接得下的：放弃这一家。不停用、不算失败（见
                     // `super::slow`）
                     Err(_) if others() => {
+                        reached = true;
                         let waited = slow_wait.unwrap_or_default();
                         super::slow::timed_out(state, &provider.name, waited);
                         chain.push(super::slow::abandoned(
@@ -616,7 +625,9 @@ pub(super) async fn try_upstreams<'a>(
                 match verdict {
                     Verdict::Failed(cause) if !hand_on => {
                         // 5xx、限流、没钱了、额度用完、凭据被拒、没有这个模型：换一家有
-                        // 意义，那边是另一把密钥、另一个账户。停用多久看原因。
+                        // 意义，那边是另一把密钥、另一个账户。停用多久看原因。后面只剩满着
+                        // 的那几家也一样等它们：空出来的那一家可能答得上
+                        reached = true;
                         //
                         // 交给客户端的那一跳，下面这几样由回程（`relay`）去记
                         //
@@ -719,6 +730,7 @@ pub(super) async fn try_upstreams<'a>(
                             {
                                 let status = response.status().as_u16();
                                 drop(response);
+                                reached = true;
                                 // 上游回了话，说明代理是通的
                                 state.note_proxy_ok(&provider.proxy);
                                 let waited = slow_wait.unwrap_or_default();
@@ -751,6 +763,7 @@ pub(super) async fn try_upstreams<'a>(
                                 match crate::failure::classify(status, &headers, &body, now_ms()) {
                                     Verdict::ClientError => response,
                                     Verdict::Failed(cause) => {
+                                        reached = true;
                                         state.note_quota(id, &provider.name, &headers);
                                         state.note_proxy_ok(&provider.proxy);
                                         let cause = known_reset(state, &provider.name, cause);
@@ -783,6 +796,7 @@ pub(super) async fn try_upstreams<'a>(
                                 }
                             }
                             super::opening::Opening::Broken(err) => {
+                                reached = true;
                                 note_health(
                                     &state.bus,
                                     &state.health,
@@ -837,6 +851,7 @@ pub(super) async fn try_upstreams<'a>(
                 );
                 let err = match e {
                     SendError::Http(e) => {
+                        reached = true;
                         // 连不上的可能是代理而不是上游 —— 检一次那个代理，说清是哪一件事
                         state.check_proxy(&provider.proxy);
                         forward::map_reqwest_error(e)
@@ -918,9 +933,13 @@ pub(super) async fn try_upstreams<'a>(
         ))));
     }
 
-    // 剩下的候选等过了还都满着：**429，带 `Retry-After`**。请求本身没问题，过一会儿再来就
-    // 发得出去；报成哪一家的失败都不对，它们一个字节都没收到
-    if stalled {
+    // 剩下的候选等过了还都满着，**一家都没发到过**：429，带 `Retry-After`。请求本身没问题，
+    // 过一会儿再来就发得出去；报成哪一家的失败都不对，它们一个字节都没收到。
+    //
+    // 发到过的话，交出去的是最后那一家失败的原因，和没有满着的上游时一样：乙回了 401、甲一直
+    // 满着，客户端该看到的是乙的错 —— 一个「都满着」的 429 会让它退避了再试，而该修的是乙的
+    // 密钥
+    if stalled && !reached {
         let upstreams = busy
             .iter()
             .map(|n| format!("`{n}`"))
@@ -1092,9 +1111,10 @@ fn unsendable_tool(
 /// 没有的话，慢了的这一家就是最后一家**，照常等下去 —— 放弃了它，换来的是一个注定失败的
 /// 请求。
 ///
-/// **满着的算接得下**（`max_concurrent`，见 [`crate::slots`]）：满着只是此刻，等空位的
-/// 那一段（`failover.slot_wait_secs`）里它可能空出来。于是放弃了慢的这一家之后，请求可能
-/// 去等一家满着的、等不到时回 429 —— 不在这里猜它空不空得出来，「最后一家」只看接不接得下。
+/// **满着的不算**（`max_concurrent`，见 [`crate::slots`]），调用方先把它们滤掉：到点的这一刻
+/// 有空位的（没设上限的、跳过时满着、此刻空出来了的）才接得下。满着的那一家要等，而一个请求
+/// 只有一段等待期限（`failover.slot_wait_secs`），开头慢的这一段多半已经把它用完了：放弃了
+/// 一家正在答的，换来的是去等一家满着的、等不到回 429。
 ///
 /// **只看不跑**：看的是客户端的原话，不跑插件、不取密钥（那两样在真发的那一跳才知道拒
 /// 不拒），不发转换事件

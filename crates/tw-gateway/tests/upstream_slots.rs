@@ -18,7 +18,8 @@ use tokio::sync::Semaphore;
 use tw_api::{AttemptOutcome, AttemptView, Event, FailureSource, ServeSkip, Stay};
 
 /// 一家假的 Anthropic 上游。请求里写着 `HOLD` 的：先吐开头和一段内容，然后一直等到测试
-/// 放行（[`Up::release`]）才说完 —— 一个正在长篇作答的模型，占着一个位置。别的当场答完
+/// 放行（[`Up::release`]）才说完 —— 一个正在长篇作答的模型，占着一个位置。写着 `REFUSE401`、
+/// `REFUSE400` 的回那个状态码的错误。别的当场答完
 struct Up {
     addr: SocketAddr,
     /// 收到的生成请求数
@@ -54,7 +55,23 @@ async fn upstream() -> Up {
             let (hits, release) = (h.clone(), r.clone());
             async move {
                 hits.fetch_add(1, Ordering::SeqCst);
-                if String::from_utf8_lossy(&body).contains("HOLD") {
+                let text = String::from_utf8_lossy(&body);
+                // 上游拒绝：凭据不对（换一家有意义），或者请求本身写错了（换一家也一样）
+                for (marker, status, kind) in [
+                    ("REFUSE401", 401, "authentication_error"),
+                    ("REFUSE400", 400, "invalid_request_error"),
+                ] {
+                    if text.contains(marker) {
+                        return axum::response::Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(format!(
+                                r#"{{"type":"error","error":{{"type":"{kind}","message":"upstream says {marker}"}}}}"#
+                            )))
+                            .unwrap();
+                    }
+                }
+                if text.contains("HOLD") {
                     let stream = async_stream::stream! {
                         yield Ok::<_, std::io::Error>(Bytes::from_static(OPENING));
                         if let Ok(p) = release.acquire().await {
@@ -731,5 +748,80 @@ async fn the_key_limit_wait_and_the_slot_wait_share_one_budget() {
     assert!(
         took >= Duration::from_millis(1_800) && took < Duration::from_millis(2_500),
         "等了 {took:?}：两段该共用 2 秒"
+    );
+}
+
+/// 满着的那一家等到最后也没空出来，而另一家真的收到了请求、回了错：交出去的是那一家的错
+/// （和没有满着的上游时最后一家失败一样），**不是「都满着」的 429** —— 那会让客户端退避了
+/// 再试，而该修的是乙的密钥
+#[tokio::test]
+async fn a_real_failure_is_not_hidden_behind_a_full_upstream() {
+    let (a, b) = (upstream().await, upstream().await);
+    let (gw, _state, log) = serve(config(&a, &b, (Some(1), None), 1)).await;
+    let _held = hold(gw, &log, "占着").await;
+
+    let t = std::time::Instant::now();
+    let r = ask(gw, "被拒", None, &format!("[{}]", user("REFUSE401")), false)
+        .send()
+        .await
+        .unwrap();
+    // 凭据被拒换一家有意义：等过满着的甲
+    assert!(t.elapsed() >= Duration::from_millis(900), "没等甲就交了");
+    assert_eq!(r.status(), 502);
+    assert_eq!(r.headers()["x-thinkwatch-error"], "upstream");
+    assert!(r.headers().get("retry-after").is_none());
+    let json: serde_json::Value = r.json().await.unwrap();
+    let text = json["error"]["message"].as_str().unwrap();
+    assert!(text.contains("`乙` answered 401"), "{text}");
+
+    let id = log.id("被拒").await;
+    let code = log
+        .until("失败", |evs| {
+            evs.iter().find_map(|e| match e {
+                Event::RequestFailed { id: i, message, .. } if *i == id => {
+                    Some(message.code.clone())
+                }
+                _ => None,
+            })
+        })
+        .await;
+    assert_eq!(code, "gw.upstream.status");
+    let (chain, _) = log.routed("被拒").await;
+    assert_eq!(chain.len(), 2, "{chain:#?}");
+    assert!(busy(&chain[0]), "{chain:#?}");
+    assert_eq!(
+        (
+            chain[1].provider.as_str(),
+            chain[1].outcome,
+            chain[1].status
+        ),
+        ("乙", AttemptOutcome::Status, Some(401))
+    );
+}
+
+/// 请求本身的问题（换一家也一样被拒）：当场原样交出去，不为满着的那一家等
+#[tokio::test]
+async fn a_request_error_is_handed_on_without_waiting_for_a_full_upstream() {
+    let (a, b) = (upstream().await, upstream().await);
+    let (gw, _state, log) = serve(config(&a, &b, (Some(1), None), 5)).await;
+    let _held = hold(gw, &log, "占着").await;
+
+    let t = std::time::Instant::now();
+    let r = ask(
+        gw,
+        "写错了",
+        None,
+        &format!("[{}]", user("REFUSE400")),
+        false,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(t.elapsed() < Duration::from_secs(2), "为满着的甲等了");
+    assert_eq!(r.status(), 400);
+    let text = r.text().await.unwrap();
+    assert!(
+        text.contains("upstream says REFUSE400"),
+        "上游的原话：{text}"
     );
 }

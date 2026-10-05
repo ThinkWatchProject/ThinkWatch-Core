@@ -1001,7 +1001,9 @@ nothing for a long time. With `next_on_slow_start`, the request moves on to the
 next candidate when no content has arrived `stream_start_wait_secs` after it
 was sent. It is off by default, because models that think before they write
 can take long to start; with it on, wait 30 seconds or more. The last
-candidate always waits, and the upstream given up on is not set aside.
+candidate always waits, and the upstream given up on is not set aside. A
+candidate that is at its `max_concurrent` at that moment does not count as a
+next one: the slow upstream keeps the request.
 
 ```yaml
 failover:
@@ -1017,7 +1019,8 @@ upstream it stays on and, if no slot frees in time, moves on to the next one,
 where its cache starts over. A new conversation skips a full upstream at once.
 When every candidate is full, the request waits for whichever frees first; if
 none does, the client gets a 429 with `Retry-After` saying the upstreams are
-busy.
+busy. If an upstream did receive the request and failed, the client gets that
+failure instead.
 
 <!-- generated: table failover -->
 <a id="cfg-failover"></a>

@@ -604,3 +604,127 @@ async fn the_slot_of_an_upstream_given_up_on_is_free_at_once() {
     assert_eq!(status, 200, "{text}");
     assert!(text.contains("hello"), "{text}");
 }
+
+/// 起网关，交回数据面的状态（要占住某一家的位置）。`slot_wait_secs` 是等空位的期限
+async fn gateway_with_state(
+    providers: Vec<Provider>,
+    slot_wait_secs: u64,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Receiver<tw_api::Event>,
+    tw_gateway::AppState,
+) {
+    let cfg = Config {
+        version: 1,
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+            ..Default::default()
+        }],
+        providers,
+        failover: Failover {
+            stream_start_wait_secs: 1,
+            next_on_slow_start: true,
+            slot_wait_secs,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let rx = state.bus.subscribe();
+    let addr = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, rx, state)
+}
+
+/// 并发数满着的那一家（`max_concurrent`）
+fn full(name: &str, up: &Upstream) -> Provider {
+    Provider {
+        max_concurrent: Some(1),
+        ..provider(name, up, Protocol::Anthropic)
+    }
+}
+
+/// 后面只剩一家满着的（`max_concurrent`）：到点时它接不下，慢的这一家就是最后一家，照常等它。
+/// 放弃了它，换来的是去等那一家空出来、等不到回 429 —— 一个本来答得上的请求就这样丢了
+#[tokio::test]
+async fn a_next_upstream_that_is_full_at_the_deadline_does_not_count() {
+    let busy = upstream(prompt("busy")).await;
+    let slow = upstream(late(2_500, "patience")).await;
+    let (gw, mut rx, state) = gateway_with_state(
+        vec![
+            full("busy", &busy),
+            provider("slow", &slow, Protocol::Anthropic),
+        ],
+        3,
+    )
+    .await;
+    // 满着的那一家排在前面：它被当场跳过，慢的那一家发出去时后面还「有」它
+    let _held = state.slots.try_take("busy").expect("一个空位");
+    let (status, text) = post(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("patience"), "{text}");
+    assert_eq!(busy.hits.load(Ordering::SeqCst), 0);
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    use tw_api::AttemptOutcome::{Error, Served};
+    assert_eq!(outcomes(&attempts), [("busy", Error), ("slow", Served)]);
+    assert_eq!(attempts[0].skipped, Some(tw_api::ServeSkip::Busy));
+}
+
+/// 后面有一家此刻接得下：照常换过去，排在前面满着的那一家不挡它
+#[tokio::test]
+async fn a_next_upstream_with_a_free_slot_still_takes_over() {
+    let busy = upstream(prompt("busy")).await;
+    let slow = upstream(stalled()).await;
+    let good = upstream(prompt("good")).await;
+    let (gw, mut rx, state) = gateway_with_state(
+        vec![
+            full("busy", &busy),
+            provider("slow", &slow, Protocol::Anthropic),
+            provider("good", &good, Protocol::Anthropic),
+        ],
+        3,
+    )
+    .await;
+    let _held = state.slots.try_take("busy").expect("一个空位");
+    let (status, text) = post(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("good"), "{text}");
+    assert_eq!(busy.hits.load(Ordering::SeqCst), 0);
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    use tw_api::AttemptOutcome::{Error, Served, SlowStart};
+    assert_eq!(
+        outcomes(&attempts),
+        [("busy", Error), ("slow", SlowStart), ("good", Served)]
+    );
+}
+
+/// 跳过时满着的那一家，到点之前空出来了：它此刻接得下，换到它
+#[tokio::test]
+async fn an_upstream_that_frees_before_the_deadline_takes_over() {
+    let busy = upstream(prompt("freed")).await;
+    let slow = upstream(stalled()).await;
+    let (gw, mut rx, state) = gateway_with_state(
+        vec![
+            full("busy", &busy),
+            provider("slow", &slow, Protocol::Anthropic),
+        ],
+        3,
+    )
+    .await;
+    let held = state.slots.try_take("busy").expect("一个空位");
+    let asking = tokio::spawn(async move { post(gw, "/v1/messages", &messages(true)).await });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(held);
+    let (status, text) = asking.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("freed"), "{text}");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    use tw_api::AttemptOutcome::{Error, Served, SlowStart};
+    assert_eq!(
+        outcomes(&attempts),
+        [("busy", Error), ("slow", SlowStart), ("busy", Served)]
+    );
+}
