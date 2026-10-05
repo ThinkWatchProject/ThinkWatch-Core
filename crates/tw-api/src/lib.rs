@@ -1435,8 +1435,9 @@ slug_enum! {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AttemptView {
     pub provider: String,
-    /// 规则改写了模型名：这一跳发给（没发出去的，要发给）上游的是哪个。没改写的
-    /// 没有 —— 发出去的就是客户端要的那个（`RequestStarted::model`）。
+    /// 这一跳发给（没发出去的，要发给）上游的模型名，和客户端要的不一样时才有：别名对到
+    /// 这一家的名称、规则改写、规则指定的模型、插件改名。一样的没有 —— 发出去的就是客户端
+    /// 要的那个（`RequestStarted::model`）。
     ///
     /// **费用按它算**：请求改写成另一个模型发出去，上游按那个模型收钱。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4696,6 +4697,8 @@ pub struct DryRunResult {
     pub reason: Option<String>,
     /// 候选链，第一个是首选，后面是故障转移的备选
     pub candidates: Vec<String>,
+    /// 每个候选发出去的模型名，和 `candidates` 一一对应
+    pub candidate_models: Vec<DryRunCandidate>,
     /// 经过了哪个组
     pub via_group: Option<String>,
     /// 累积起来的参数改写
@@ -4707,6 +4710,23 @@ pub struct DryRunResult {
     pub skipped: Vec<SkippedView>,
     /// 候选链里要转换格式的上游：客户端的格式和上游的协议不同
     pub converted: Vec<ConvertedView>,
+}
+
+/// 试算里一个候选上游收到的模型名。
+///
+/// **同一个请求在各家可能是不同的名字**：别名对到每一家自己的名称，规则改写、规则指定的
+/// 模型也会换掉它。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DryRunCandidate {
+    pub provider: String,
+    /// 发给它的模型名。试算没写模型时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_model: Option<String>,
+    /// 发出的名字为什么和请求里写的不一样：`alias`（别名对到这一家的名称）、`rule`（规则
+    /// 改写了模型）、`pinned`（规则指定了这一家发什么模型）。一样时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_via: Option<String>,
 }
 
 /// 一个要转换格式的候选上游。

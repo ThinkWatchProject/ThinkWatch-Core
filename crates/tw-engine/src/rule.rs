@@ -99,18 +99,31 @@ impl When {
         self.provider_would_be.is_some()
     }
 
-    /// 阶段二的匹配：在阶段一的条件之上，再看选中的是谁。
+    /// 阶段二的匹配：在阶段一的条件之上，再看选中的是谁。`aliased` 见 [`Self::matches`]。
     pub fn matches_with_provider(
         &self,
         f: &RequestFacts,
         provider: &str,
+        aliased: &[String],
     ) -> Result<bool, MatchError> {
         if let Some(p) = &self.provider_would_be
             && !p.contains(provider)
         {
             return Ok(false);
         }
-        self.matches(f)
+        self.matches(f, aliased)
+    }
+
+    /// `model` 这一条对请求的模型名 `model` 成立吗。没写这一条时成立。
+    ///
+    /// **继承只从真名到别名**：请求的名称是别名时，`aliased` 是它列的那些模型名，glob 匹配
+    /// 其中任一个也算 —— 写 `claude-opus-*` 的规则照样管到指向 Opus 的别名。反过来不成立：
+    /// 条件写的是别名，只匹配请求这个别名本身，请求真名时它不管。
+    pub fn model_matches(&self, model: &str, aliased: &[String]) -> bool {
+        match &self.model {
+            None => true,
+            Some(pat) => glob_match(pat, model) || aliased.iter().any(|m| glob_match(pat, m)),
+        }
     }
 
     /// 写死的条件语法对吗。**在加载配置时查，不要等到请求进来**
@@ -129,10 +142,12 @@ impl When {
         Ok(())
     }
 
-    pub fn matches(&self, f: &RequestFacts) -> Result<bool, MatchError> {
-        if let Some(pat) = &self.model
-            && !glob_match(pat, &f.model)
-        {
+    /// 这些条件对这个请求都成立吗。
+    ///
+    /// `aliased`：请求的模型名是别名时它列的模型名（[`crate::Engine::alias_models`]），不是
+    /// 别名时是空的。`model` 这一条按 [`Self::model_matches`] 继承到别名。
+    pub fn matches(&self, f: &RequestFacts, aliased: &[String]) -> Result<bool, MatchError> {
+        if !self.model_matches(&f.model, aliased) {
             return Ok(false);
         }
         // client 和 dialect 是精确匹配：它们的取值是我们自己定义的一个
@@ -385,15 +400,15 @@ mod tests {
         // 「同一个 when 里多个条件默认 AND」覆盖九成需求，于是 AND
         // 关键字和括号嵌套直接消失。
         let w = when("{ model: claude-sonnet-*, stream: true }");
-        assert!(w.matches(&f()).unwrap());
+        assert!(w.matches(&f(), &[]).unwrap());
         let w = when("{ model: claude-sonnet-*, stream: false }");
-        assert!(!w.matches(&f()).unwrap(), "有一个不满足就整条不命中");
+        assert!(!w.matches(&f(), &[]).unwrap(), "有一个不满足就整条不命中");
     }
 
     #[test]
     fn an_empty_when_is_the_catch_all() {
         assert!(When::default().is_catch_all());
-        assert!(When::default().matches(&f()).unwrap());
+        assert!(When::default().matches(&f(), &[]).unwrap());
         assert!(!when("{ model: x }").is_catch_all());
         // 只写了辅助请求类别的规则不是兜底：它只匹配那一类请求
         assert!(!when("{ intent: titling }").is_catch_all());
@@ -401,9 +416,21 @@ mod tests {
 
     #[test]
     fn numeric_conditions_compare() {
-        assert!(when(r#"{ input_tokens: "<200k" }"#).matches(&f()).unwrap());
-        assert!(!when(r#"{ input_tokens: ">200k" }"#).matches(&f()).unwrap());
-        assert!(when(r#"{ max_tokens: ">=4k" }"#).matches(&f()).unwrap());
+        assert!(
+            when(r#"{ input_tokens: "<200k" }"#)
+                .matches(&f(), &[])
+                .unwrap()
+        );
+        assert!(
+            !when(r#"{ input_tokens: ">200k" }"#)
+                .matches(&f(), &[])
+                .unwrap()
+        );
+        assert!(
+            when(r#"{ max_tokens: ">=4k" }"#)
+                .matches(&f(), &[])
+                .unwrap()
+        );
     }
 
     #[test]
@@ -412,17 +439,17 @@ mod tests {
         // 的请求 —— 而那和用户的意思正好相反。
         let mut x = f();
         x.max_tokens = None;
-        assert!(!when(r#"{ max_tokens: "<4k" }"#).matches(&x).unwrap());
-        assert!(!when(r#"{ max_tokens: ">4k" }"#).matches(&x).unwrap());
+        assert!(!when(r#"{ max_tokens: "<4k" }"#).matches(&x, &[]).unwrap());
+        assert!(!when(r#"{ max_tokens: ">4k" }"#).matches(&x, &[]).unwrap());
     }
 
     #[test]
     fn boolean_conditions_match_both_ways() {
         let mut x = f();
         x.cache = true;
-        assert!(when("{ cache: true }").matches(&x).unwrap());
-        assert!(!when("{ cache: false }").matches(&x).unwrap());
-        assert!(when("{ cache: false }").matches(&f()).unwrap());
+        assert!(when("{ cache: true }").matches(&x, &[]).unwrap());
+        assert!(!when("{ cache: false }").matches(&x, &[]).unwrap());
+        assert!(when("{ cache: false }").matches(&f(), &[]).unwrap());
     }
 
     #[test]
@@ -445,8 +472,40 @@ mod tests {
     #[test]
     fn client_and_dialect_are_exact_not_globbed() {
         // 它们的取值是我们自己定义的小集合，通配符只会掩盖打错的名字。
-        assert!(when("{ client: claude-code }").matches(&f()).unwrap());
-        assert!(!when("{ client: claude-* }").matches(&f()).unwrap());
+        assert!(when("{ client: claude-code }").matches(&f(), &[]).unwrap());
+        assert!(!when("{ client: claude-* }").matches(&f(), &[]).unwrap());
+    }
+
+    /// 写真名（glob）的条件也管到列了它的别名；写别名的条件只管别名本身
+    #[test]
+    fn a_model_condition_on_a_real_name_also_matches_an_alias_that_lists_it() {
+        let opus = vec![
+            "claude-opus-5".to_string(),
+            "us.anthropic.claude-opus-5-v1:0".to_string(),
+        ];
+        let mut x = f();
+        x.model = "opus".into();
+        assert!(when("{ model: claude-opus-* }").matches(&x, &opus).unwrap());
+        assert!(
+            when("{ model: '*.claude-opus-5-v1:0' }")
+                .matches(&x, &opus)
+                .unwrap()
+        );
+        assert!(when("{ model: opus }").matches(&x, &opus).unwrap());
+        assert!(
+            !when("{ model: claude-sonnet-* }")
+                .matches(&x, &opus)
+                .unwrap()
+        );
+        // 请求的是真名：写别名的条件不管它
+        let mut real = f();
+        real.model = "claude-opus-5".into();
+        assert!(!when("{ model: opus }").matches(&real, &[]).unwrap());
+        assert!(
+            when("{ model: claude-opus-5 }")
+                .matches(&real, &[])
+                .unwrap()
+        );
     }
 }
 
@@ -475,7 +534,7 @@ mod intent_tests {
             "topic_detect",
             "suggestion",
         ] {
-            assert!(r.matches(&probe(k)).unwrap(), "{k}");
+            assert!(r.matches(&probe(k), &[]).unwrap(), "{k}");
         }
     }
 
@@ -483,16 +542,16 @@ mod intent_tests {
     fn a_specific_intent_matches_only_itself() {
         // 「所有辅助请求走便宜的那家」和「只有标题走」是两个都合理的需求。
         let r = w("{ intent: titling }");
-        assert!(r.matches(&probe("titling")).unwrap());
-        assert!(!r.matches(&probe("warmup")).unwrap());
+        assert!(r.matches(&probe("titling"), &[]).unwrap());
+        assert!(!r.matches(&probe("warmup"), &[]).unwrap());
     }
 
     #[test]
     fn a_list_of_intents_works_like_anywhere_else() {
         let r = w("{ intent: [titling, topic_detect] }");
-        assert!(r.matches(&probe("titling")).unwrap());
-        assert!(r.matches(&probe("topic_detect")).unwrap());
-        assert!(!r.matches(&probe("warmup")).unwrap());
+        assert!(r.matches(&probe("titling"), &[]).unwrap());
+        assert!(r.matches(&probe("topic_detect"), &[]).unwrap());
+        assert!(!r.matches(&probe("warmup"), &[]).unwrap());
     }
 
     #[test]
@@ -500,7 +559,7 @@ mod intent_tests {
         // **这条是安全边界。**真实请求被一条 intent 规则捞走的话，用户的
         // 活会被送去一个他为「省钱」准备的地方。
         let r = w("{ intent: assistant_internal }");
-        assert!(!r.matches(&probe("")).unwrap());
+        assert!(!r.matches(&probe(""), &[]).unwrap());
     }
 
     #[test]
