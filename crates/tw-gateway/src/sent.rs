@@ -7,6 +7,10 @@
 //!
 //! **路由（跳过服务不了的、按价钱排序、看上下文窗口）、每一跳、试算用的是同一份**：试算
 //! 说发给 Bedrock 的是哪个名字，真实转发发的就是那个。
+//!
+//! 密钥的模型范围（`allow`）也在这里一家一家地看（[`crate::models::allowed`]）：指定模型、
+//! 阶段二改的名字一家一个，准入只要有一家过得去就放行，不让用的那几家要在这里跳过 ——
+//! 故障转移到不了它们。
 
 use tw_engine::{Asked, Catalog, Decision, Origin, Pinned};
 
@@ -48,18 +52,24 @@ impl Via {
 
 /// 发给 `p` 的名字；这家服务不了时是为什么。
 ///
-/// 客户端那一侧的名称和指定模型交给 [`crate::models::sent_to`]：别名对到这一家，指定的原样，
-/// 再看这一家有没有。**阶段二改的名字原样看**，和指定模型一样 —— `sent_to` 只认得
-/// 指定模型。要的是空的（请求体解不开）：什么都不改，不判断。
+/// 先看密钥让不让用它要的名字（`allow`，见 [`crate::models::allowed`]）：客户端那一侧的
+/// 名称按目录的规矩继承，指定的、阶段二改的按名字本身。再把客户端那一侧的名称和指定模型
+/// 交给 [`crate::models::sent_to`]：别名对到这一家，指定的原样，再看这一家有没有。**阶段二
+/// 改的名字原样看**，和指定模型一样 —— `sent_to` 只认得指定模型。要的是空的（请求体解
+/// 不开）：什么都不改，不判断。
 pub fn name(
     cfg: &tw_config::Config,
     catalog: &Catalog,
     decision: &Decision,
     p: &tw_config::Provider,
     asked: &Asked,
+    allow: Option<&[String]>,
 ) -> Result<String, Skip> {
     if asked.model.is_empty() {
         return Ok(String::new());
+    }
+    if !crate::models::allowed(catalog, allow, &asked.model, asked.origin.as_written()) {
+        return Err(Skip::NotAllowed);
     }
     match asked.origin {
         Origin::PhaseTwo => match crate::models::fit(catalog, p, &asked.model) {
@@ -83,7 +93,8 @@ pub fn via(client: &str, asked: &Asked, sent: &str) -> Option<Via> {
     })
 }
 
-/// 每个候选发出去的名字，和 `asked` 一一对应。`client` 是客户端写的模型名。
+/// 每个候选发出去的名字，和 `asked` 一一对应。`client` 是客户端写的模型名，`allow` 是
+/// 这把密钥的模型范围（[`crate::models::key_allow`]）。
 ///
 /// 配置里没有的候选按要的名字算：尝试那一步会报出它不在配置里。
 pub fn plan(
@@ -92,12 +103,13 @@ pub fn plan(
     decision: &Decision,
     client: &str,
     asked: &[Asked],
+    allow: Option<&[String]>,
 ) -> Vec<Sent> {
     asked
         .iter()
         .map(|a| {
             let model = match cfg.providers.iter().find(|p| p.name == a.provider) {
-                Some(p) => name(cfg, catalog, decision, p, a),
+                Some(p) => name(cfg, catalog, decision, p, a, allow),
                 None => Ok(a.model.clone()),
             };
             let via = model.as_deref().ok().and_then(|m| via(client, a, m));
@@ -123,7 +135,8 @@ pub fn pairs(sent: &[Sent]) -> Vec<(String, String)> {
 }
 
 /// 去掉服务不了这个请求的候选（[`crate::models::serving`]），**按发出去的名字看**：别名按
-/// 这一家对到的那个名字，指定模型和阶段二改的名字原样。
+/// 这一家对到的那个名字，指定模型和阶段二改的名字原样。密钥不让用的也去掉（`allow`，和
+/// [`name`] 同一套）。
 ///
 /// 阶段二改的名字当成指定给这一家的模型交给它：两者都是写给这一家、原样发出的名字。
 pub fn serving(
@@ -131,13 +144,14 @@ pub fn serving(
     catalog: &Catalog,
     decision: &Decision,
     asked: &[Asked],
+    allow: Option<&[String]>,
 ) -> Serving {
     let pairs: Vec<(String, String)> = asked
         .iter()
         .map(|a| (a.provider.clone(), a.model.clone()))
         .collect();
     if !asked.iter().any(|a| a.origin == Origin::PhaseTwo) {
-        return crate::models::serving(cfg, catalog, decision, &pairs);
+        return crate::models::serving(cfg, catalog, decision, &pairs, allow);
     }
     let mut d = decision.clone();
     d.pinned.extend(
@@ -149,7 +163,7 @@ pub fn serving(
                 model: a.model.clone(),
             }),
     );
-    crate::models::serving(cfg, catalog, &d, &pairs)
+    crate::models::serving(cfg, catalog, &d, &pairs, allow)
 }
 
 #[cfg(test)]
@@ -218,7 +232,7 @@ mod tests {
             asked("official", "opus", Origin::Client),
             asked("zhipu", "opus", Origin::Client),
         ];
-        let sent = plan(&c, &catalog, &d, "opus", &asks);
+        let sent = plan(&c, &catalog, &d, "opus", &asks, None);
         let got: Vec<_> = sent
             .iter()
             .map(|s| (s.model.as_deref().map_err(|e| *e), s.via))
@@ -234,11 +248,18 @@ mod tests {
         );
         // 排价钱时给它要的名字：反正会被跳过
         assert_eq!(pairs(&sent)[2], ("zhipu".to_string(), "opus".to_string()));
-        let s = serving(&c, &catalog, &d, &asks);
+        let s = serving(&c, &catalog, &d, &asks, None);
         assert_eq!(s.usable, ["bedrock", "official"]);
         assert_eq!(s.skipped, [("zhipu".to_string(), Skip::OutOfScope)]);
         // 要的是空的（请求体解不开）：不改，也不判断
-        let blank = plan(&c, &catalog, &d, "", &[asked("zhipu", "", Origin::Client)]);
+        let blank = plan(
+            &c,
+            &catalog,
+            &d,
+            "",
+            &[asked("zhipu", "", Origin::Client)],
+            None,
+        );
         assert_eq!(blank[0].model, Ok(String::new()));
     }
 
@@ -259,6 +280,7 @@ mod tests {
                 asked("zhipu", "glm-air", Origin::PhaseTwo),
                 asked("zhipu", "glm-air", Origin::Rule),
             ],
+            None,
         );
         let got: Vec<_> = sent
             .iter()
@@ -282,6 +304,7 @@ mod tests {
             &d,
             "x",
             &[asked("zhipu", "glm-air", Origin::Pinned)],
+            None,
         );
         assert_eq!(one[0].model.as_deref(), Ok("glm-air"));
         // 发出的和客户端写的一样：没有来历可说
@@ -291,6 +314,7 @@ mod tests {
             &decided(&[]),
             "claude-opus-5",
             &[asked("official", "claude-opus-5", Origin::Rule)],
+            None,
         );
         assert_eq!(same[0].via, None);
     }
@@ -317,6 +341,7 @@ mod tests {
             &listed,
             &d,
             &[asked("zhipu", "glm-air", Origin::PhaseTwo)],
+            None,
         );
         assert_eq!(s.usable, ["zhipu"]);
         let s = serving(
@@ -324,6 +349,7 @@ mod tests {
             &listed,
             &d,
             &[asked("zhipu", "glm-air", Origin::Client)],
+            None,
         );
         assert_eq!(s.skipped, [("zhipu".to_string(), Skip::NotOffered)]);
         let sent = plan(
@@ -332,7 +358,90 @@ mod tests {
             &d,
             "x",
             &[asked("zhipu", "glm-air", Origin::PhaseTwo)],
+            None,
         );
         assert_eq!(sent[0].model.as_deref(), Ok("glm-air"));
+    }
+
+    /// 密钥的 allow 一家一家地看，和准入同一套：客户端那一侧的名称继承（写上游模型名的放行
+    /// 列了它的别名），原样发出的名字（指定的、阶段二改的）按名字本身对 glob
+    #[test]
+    fn the_keys_allow_is_judged_per_candidate_by_the_name_it_asks_for() {
+        let c = cfg();
+        let catalog = Catalog::default().with_aliases(
+            c.aliases
+                .iter()
+                .map(|a| (a.name.as_str(), a.models.as_slice())),
+        );
+        let d = decided(&[("bedrock", "us.anthropic.claude-opus-5-v1:0")]);
+        let glm5 = ["glm-5-*".to_string()];
+        let skipped = |a: Asked, allow: &[String]| {
+            let p = c.providers.iter().find(|p| p.name == a.provider).unwrap();
+            name(&c, &catalog, &d, p, &a, Some(allow)).err()
+        };
+        // 别名 glm-air 列了 glm-5-air-0414：写 glm-5-* 的密钥按名称要它放行
+        assert_eq!(
+            skipped(asked("zhipu", "glm-air", Origin::Client), &glm5),
+            None
+        );
+        assert_eq!(
+            skipped(asked("zhipu", "glm-air", Origin::Rule), &glm5),
+            None
+        );
+        // 阶段二写的 glm-air 原样发出、不是别名，不继承
+        assert_eq!(
+            skipped(asked("zhipu", "glm-air", Origin::PhaseTwo), &glm5),
+            Some(Skip::NotAllowed)
+        );
+        assert_eq!(
+            skipped(
+                asked("zhipu", "glm-air", Origin::PhaseTwo),
+                &["glm-air".to_string()]
+            ),
+            None
+        );
+        // 指定的名字按它本身看
+        let pinned = asked("bedrock", "us.anthropic.claude-opus-5-v1:0", Origin::Pinned);
+        assert_eq!(
+            skipped(pinned.clone(), &["claude-*".to_string()]),
+            Some(Skip::NotAllowed)
+        );
+        assert_eq!(skipped(pinned, &["us.anthropic.*".to_string()]), None);
+
+        // 试算、比价用的那一份：不让用的那一家说得出为什么，没有来历
+        let sent = plan(
+            &c,
+            &catalog,
+            &d,
+            "claude-opus-5",
+            &[
+                asked("bedrock", "us.anthropic.claude-opus-5-v1:0", Origin::Pinned),
+                asked("official", "opus", Origin::Client),
+            ],
+            Some(&["claude-*".to_string()]),
+        );
+        assert_eq!(sent[0].model, Err(Skip::NotAllowed));
+        assert_eq!(sent[0].via, None);
+        // 别名 opus 列了 claude-opus-5：继承
+        assert_eq!(sent[1].model.as_deref(), Ok("claude-opus-5"));
+        let s = serving(
+            &c,
+            &catalog,
+            &d,
+            &[
+                asked("bedrock", "us.anthropic.claude-opus-5-v1:0", Origin::Pinned),
+                asked("zhipu", "glm-air", Origin::PhaseTwo),
+                asked("official", "opus", Origin::Client),
+            ],
+            Some(&["claude-*".to_string()]),
+        );
+        assert_eq!(s.usable, ["official"]);
+        assert_eq!(
+            s.skipped,
+            [
+                ("bedrock".to_string(), Skip::NotAllowed),
+                ("zhipu".to_string(), Skip::NotAllowed),
+            ]
+        );
     }
 }

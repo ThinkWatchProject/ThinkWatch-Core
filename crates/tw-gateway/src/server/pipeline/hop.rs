@@ -132,6 +132,8 @@ pub(super) async fn try_upstreams<'a>(
     let mut after_plugins: Option<(Bytes, tw_guard::redact::replace::Ledger)> = None;
     // 别名对到每一家时看的清单：整个请求用同一份
     let catalog = state.catalog.load();
+    // 这把密钥的模型范围：每一跳发出的名字都要过它（见 `crate::sent::name`）
+    let allow = crate::models::key_allow(&rt.config, &req.client_name);
 
     for (i, name) in started.alive.iter().enumerate() {
         // 后面没有别的候选了
@@ -224,10 +226,18 @@ pub(super) async fn try_upstreams<'a>(
         let asked_model =
             rt.engine
                 .asked_of(&reading.facts, decision, &provider.name, renamed.as_deref());
-        let sent = match crate::sent::name(&rt.config, &catalog, decision, provider, &asked_model) {
+        let sent = match crate::sent::name(
+            &rt.config,
+            &catalog,
+            decision,
+            provider,
+            &asked_model,
+            allow,
+        ) {
             Ok(sent) => sent,
             // 这一家服务不了（别名列的名字它一个都没有，或者清单里没有这个名字）。路由时已经
-            // 跳过了这样的候选，能到这儿说明它的清单刚刚换过：**不把别名原样发给它**，换下一家
+            // 跳过了这样的候选，能到这儿说明它的清单刚刚换过：**不把别名原样发给它**，换下一家。
+            // 发给它的名字密钥不让用的，路由时也跳过了；这里再看一遍，哪一跳都发不出它
             Err(skip) => {
                 let mut serving = crate::models::Serving::default();
                 serving.skipped.push((provider.name.clone(), skip));

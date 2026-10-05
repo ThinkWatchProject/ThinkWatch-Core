@@ -61,6 +61,7 @@ impl From<crate::models::Skip> for tw_api::ServeSkip {
             Skip::Disabled => Self::Disabled,
             Skip::OutOfScope => Self::OutOfScope,
             Skip::NotOffered => Self::NotOffered,
+            Skip::NotAllowed => Self::NotAllowed,
         }
     }
 }

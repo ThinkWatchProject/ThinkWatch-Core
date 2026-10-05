@@ -304,3 +304,47 @@ async fn a_pinned_model_is_judged_at_its_own_upstream_and_as_written() {
         "{body}"
     );
 }
+
+/// 阶段二给中转站改的名字恰好和一个别名同名：准入看这一家自己的清单里有没有这个名字本身
+/// （中转站列着 glm-air），不按别名看（别名 glm-air 列的 glm-5-air-0414 谁都没有）—— 和
+/// 发出去的一样。密钥的 `allow` 也按名字本身看：写 glm-5-* 的不因为别名列了 glm-5-air-0414
+/// 就放行它
+#[tokio::test]
+async fn a_phase_two_rename_is_admitted_as_written_even_when_an_alias_has_its_name() {
+    let relay = upstream("relay", &["glm-air"]).await;
+    let mut cfg = Config {
+        clients: vec![
+            client("tw-k", None, None),
+            client("narrow", Some(&["glm-5-*"]), None),
+            client("exact", Some(&["glm-air"]), None),
+        ],
+        providers: vec![provider("relay", relay)],
+        ..Default::default()
+    };
+    cfg.aliases = serde_yaml_ng::from_str("glm-air: glm-5-air-0414\n").unwrap();
+    cfg.routes = serde_yaml_ng::from_str(
+        "- name: default
+  rules:
+    - { name: 中转的叫法, when: { provider_would_be: relay }, set: { model: glm-air } }
+    - { name: 兜底, to: relay }
+",
+    )
+    .unwrap();
+    let gw = serve(cfg).await;
+
+    let (status, body) = ask(gw, "tw-k", "glm-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sent"], "glm-air");
+    let (status, body) = ask(gw, "exact", "glm-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sent"], "glm-air");
+
+    let (status, body) = ask(gw, "narrow", "glm-5").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        message(&body).contains(
+            "A routing rule rewrote model glm-5 to glm-air, which gateway key `narrow` may not use"
+        ),
+        "{body}"
+    );
+}

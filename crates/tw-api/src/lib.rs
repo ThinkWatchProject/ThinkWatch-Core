@@ -455,6 +455,9 @@ slug_enum! {
         OutOfScope = "out_of_scope",
         /// 模型清单里没有
         NotOffered = "not_offered",
+        /// 发给它的名字这把密钥不让用（`allow`）：指定模型、阶段二改的名字一家一个，
+        /// 只在试算给了密钥时出现
+        NotAllowed = "not_allowed",
     }
 }
 
@@ -747,7 +750,8 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （[`KnownModel::aliases`]），上游模型清单的每一行也带（[`ModelRow::aliases`]）。规则的
 /// 去向可以是指定模型：[`RuleView::to`]、[`RuleInput::to`] 是 [`RuleTarget`]，字符串或
 /// `[{provider, model}]` 的列表，和配置里的 `to` 一个写法。试算多了 `candidate_models`：每个
-/// 候选发出的模型名，以及它是别名、规则改写还是指定模型来的。发出的模型名和客户端写的不同、
+/// 候选发出的模型名，以及它是别名、规则改写还是指定模型来的；给了密钥时，发给哪一家的名字
+/// 这把密钥不让用，那一家跳过（`skipped` 的 `not_allowed`）。发出的模型名和客户端写的不同、
 /// 上游答的又是同一个模型时，回答里的模型名（含 `openai-model`、`x-openai-model` 回应头）
 /// 写成客户端写的名称。照 37 写的界面读不懂列表形状的 `to`，保存规则时会把指定模型丢掉。
 pub const CONTROL_API_VERSION: u32 = 38;
@@ -4745,7 +4749,7 @@ pub struct ConvertedView {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SkippedView {
     pub provider: String,
-    /// `disabled` / `out_of_scope` / `not_offered`
+    /// `disabled` / `out_of_scope` / `not_offered` / `not_allowed`
     pub reason: ServeSkip,
 }
 

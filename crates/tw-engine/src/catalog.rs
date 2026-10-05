@@ -179,7 +179,10 @@ impl Catalog {
     ///
     /// **继承只从真名到别名**：写上游的模型名（glob）时，指向它的别名也放行 —— 别名
     /// 列表里任一名称匹配就算；写别名时只管别名本身，它列表里的模型不跟着放出来。
-    fn allows(&self, name: &str, patterns: &[String]) -> bool {
+    ///
+    /// `name` 是**客户端那一侧的名称**：客户端写的、规则改写的、插件改的。原样发出的名字
+    /// （指定模型、阶段二改的）不经过别名表，按名字本身对 glob 就是了。
+    pub fn allows(&self, name: &str, patterns: &[String]) -> bool {
         let hit = |m: &str| patterns.iter().any(|p| glob_match(p, m));
         hit(name)
             || self

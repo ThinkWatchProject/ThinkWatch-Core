@@ -546,6 +546,53 @@ async fn a_plugin_renaming_to_an_alias_sends_each_upstream_its_own_name() {
     );
 }
 
+/// 插件换上的别名，密钥的范围按客户端那一侧的规矩看：只许 `claude-sonnet-*` 的密钥，插件
+/// 换成列了 `claude-sonnet-5` 的别名 `sonnet` 照常发（和客户端直接要 `sonnet` 一样放行）；
+/// 换成只列了 `claude-opus-5` 的 `opus` 不发
+#[tokio::test]
+async fn a_plugin_renaming_to_an_alias_inherits_the_keys_allow_like_a_request_for_it() {
+    for (alias, allowed) in [("sonnet", true), ("opus", false)] {
+        let up = Upstream::default();
+        let base = start_upstream(up.clone()).await;
+        let rename = Double::new("rename")
+            .permit(&[Permission::Params])
+            .on_request(move |mut view, _| {
+                view["params"]["model"] = json!(alias);
+                Invocation::ok(RequestOutcome::Changed(view))
+            });
+        let mut cfg = Config {
+            providers: vec![provider("a", base, Protocol::Anthropic)],
+            aliases: tw_config::Aliases(vec![
+                tw_config::Alias {
+                    name: "sonnet".into(),
+                    models: vec!["claude-sonnet-5".into()],
+                },
+                tw_config::Alias {
+                    name: "opus".into(),
+                    models: vec!["claude-opus-5".into()],
+                },
+            ]),
+            ..config()
+        };
+        cfg.clients[0].allow = Some(vec!["claude-sonnet-*".into()]);
+        let gw = gateway_of(cfg, vec![entry("rename", rename)]).await;
+        let (status, body) = post(&gw, "/v1/messages", &anthropic_body()).await;
+        if allowed {
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(up.seen.lock().unwrap()[0].1["model"], "claude-sonnet-5");
+        } else {
+            assert_eq!(status, 403, "{body}");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains(
+                    "changed the model to opus, which gateway key `claude-code` may not use"
+                ),
+                "{body}"
+            );
+            assert_eq!(up.hits(), 0);
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_rejection_is_answered_in_the_clients_format_and_nothing_goes_upstream() {
     let up = Upstream::default();

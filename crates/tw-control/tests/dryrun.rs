@@ -561,3 +561,43 @@ routes:
         ]
     );
 }
+
+/// 给了密钥：发给哪一家的名字这把密钥不让用，那一家跳过，说是密钥的事 —— 和数据面一样，
+/// 故障转移到不了它。指定的、阶段二改的名字按名字本身看
+#[tokio::test]
+async fn a_candidate_whose_model_the_key_may_not_use_is_skipped() {
+    let cfg = ALIASED.replace(
+        "clients:\n  - name: 我\n    key: tw-k\n",
+        "clients:\n  - name: 我\n    key: tw-k\n  - name: 只用智谱\n    key: tw-z\n    allow: [glm-*]\n  - name: 只用 glm-5\n    key: tw-5\n    allow: [glm-5]\n",
+    );
+    let (_d, app) = app_with(&cfg);
+    let skipped = |r: &tw_api::DryRunResult| {
+        r.skipped
+            .iter()
+            .map(|s| (s.provider.clone(), s.reason))
+            .collect::<Vec<_>>()
+    };
+
+    // 指定模型：官方的 claude-opus-5 这把密钥不让用
+    let r = run(&app, r#"{"model":"pinned","client":"只用智谱"}"#).await;
+    assert_eq!(sent(&r), [("智谱", Some("glm-5"), Some("pinned"))]);
+    assert_eq!(
+        skipped(&r),
+        [("官方".to_string(), tw_api::ServeSkip::NotAllowed)]
+    );
+
+    // 阶段二给智谱改的 glm-air 原样看：只许 glm-5 的密钥不让用它，别的两家本来就不在范围里
+    let r = run(&app, r#"{"model":"glm-5","client":"只用 glm-5"}"#).await;
+    assert_eq!(r.outcome, tw_api::DryRunOutcome::Unavailable, "{r:?}");
+    assert_eq!(
+        skipped(&r),
+        [
+            ("官方".to_string(), tw_api::ServeSkip::OutOfScope),
+            ("中转".to_string(), tw_api::ServeSkip::OutOfScope),
+            ("智谱".to_string(), tw_api::ServeSkip::NotAllowed),
+        ]
+    );
+    // 不给密钥（按路由试算）不看范围
+    let r = run(&app, r#"{"model":"glm-5","route":"default"}"#).await;
+    assert_eq!(sent(&r), [("智谱", Some("glm-air"), Some("rule"))]);
+}

@@ -232,10 +232,13 @@ pub async fn dry_run(
             //
             // 每一家按发给它的模型名看：规则改写过的按改写后的算，别名对到各家自己的
             // 名称，指定的原样，和数据面同一个函数（`tw_gateway::sent`）
+            //
+            // 给了密钥的话，发给哪一家的名字这把密钥不让用，那一家也跳过（和数据面一样）
             let asked = engine.asked(rules, &f, &d);
             let catalog = s.gateway.catalog.load();
-            let sent = tw_gateway::sent::plan(&rt.config, &catalog, &d, &f.model, &asked);
-            let serving = tw_gateway::sent::serving(&rt.config, &catalog, &d, &asked);
+            let allow = tw_gateway::models::key_allow(&rt.config, &f.client);
+            let sent = tw_gateway::sent::plan(&rt.config, &catalog, &d, &f.model, &asked, allow);
+            let serving = tw_gateway::sent::serving(&rt.config, &catalog, &d, &asked, allow);
             out.skipped = serving
                 .skipped
                 .iter()
