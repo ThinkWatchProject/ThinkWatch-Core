@@ -2926,6 +2926,148 @@ pub struct ProxyTest {
     pub current: Option<String>,
 }
 
+// ─────────────────────────────────────────────── 模型别名
+
+/// 一个别名上用户能改的东西：名字，和它在各家上游叫什么（有序）。
+///
+/// 和配置里 `aliases` 的一项是同一件事：哪家上游提供列表里的任一名称，就能服务这个
+/// 别名，发过去用它自己的那个名称（按列表顺序取它有的第一个）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasInput {
+    pub name: String,
+    pub models: Vec<String>,
+}
+
+/// 新建或保存一个别名（`POST /aliases`、`PUT /aliases/{name}`）。保存时名字可以改：
+/// 引用它的密钥和规则在同一个版本里跟着改（见 [`AliasWritten`]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasSave {
+    pub alias: AliasInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 别名列表里的一个名称，以及哪些上游的模型清单里有它。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasModel {
+    pub model: String,
+    /// 清单里有这个名称、而且它在启用范围里的上游，按配置里的顺序。**没有清单的上游不在
+    /// 这里**：不知道它有什么
+    pub providers: Vec<String>,
+}
+
+/// 别名页的一行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasView {
+    pub name: String,
+    /// 按书写顺序
+    pub models: Vec<AliasModel>,
+    /// 每家能服务它的上游实际发出的名称，按配置里的顺序。停用的上游不在里面；没有清单
+    /// 的上游当作能服务（取列表里第一个在它启用范围里的名称）
+    pub served_by: Vec<PinnedModel>,
+    /// 清单里有一个和别名同名的真模型、而别名的列表里没有这个名称的上游：**这个名称
+    /// 不会再发给它们**（别名优先）
+    pub shadows: Vec<String>,
+    /// 上下文窗口，来自默认价目表：第一家能服务它的上游发出的那个模型的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// 最近 24 小时里客户端用这个名称发来的请求
+    pub requests_24h: u64,
+    /// 那些请求的费用（百万分之一美元）。没有请求、或者一条都算不出钱时是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros_24h: Option<i64>,
+}
+
+/// 一条建议：几家上游上名称不同、其实是同一个模型。**只认 Claude**（见
+/// [`AliasesView::suggestions`]）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasSuggestion {
+    /// 给人看的名字：`Claude Opus 5`；带日期的快照后面跟着日期：
+    /// `Claude Sonnet 4.5 (2025-09-29)`
+    pub label: String,
+    /// 每家上游上的名称，按配置里上游的顺序
+    pub models: Vec<PinnedModel>,
+}
+
+/// 别名页（`GET /aliases`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasesView {
+    /// 按书写顺序
+    pub aliases: Vec<AliasView>,
+    /// 同一个模型在不同上游上叫不同名称的几组。**只认 Claude**：各家清单里的名称归一之后
+    /// 完全相等才算同一个 —— 去掉路径前缀（`anthropic/`）、Bedrock 的地域前缀、
+    /// `anthropic.` 和 `-v1:0`，Vertex 的 `@日期` 写成 `-日期`，版本号里的点写成横线；
+    /// **日期保留**，带日期和不带日期的不算同一个。至少两家上游、至少两种写法才成组；
+    /// 已经被某一个别名全部列进去的组不出
+    pub suggestions: Vec<AliasSuggestion>,
+}
+
+/// 预览一个还没保存的别名（`POST /aliases/preview`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasPreviewRequest {
+    pub alias: AliasInput,
+    /// 正在编辑的那个别名原来的名字。新建时不给。**给了才不会把改名当成和自己重名**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+}
+
+/// 预览的结果：存得存不了，存了之后发往哪儿。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasPreview {
+    /// 挡着保存的问题，和保存时配置校验说的是同一句。空 = 存得了
+    pub problems: Vec<Msg>,
+    /// 存了之后每家上游发出的名称（同 [`AliasView::served_by`]）
+    pub served_by: Vec<PinnedModel>,
+    /// 列表里没有哪家上游的清单里有的名称
+    pub unserved: Vec<String>,
+    /// 同 [`AliasView::shadows`]
+    pub shadows: Vec<String>,
+    /// 别的上游上的同一个模型（建议勾选）：清单里的名称和列表里某个名称归一之后相等，
+    /// 规则同 [`AliasesView::suggestions`]。列表里已经有的名称、已经有列表里某个名称的
+    /// 上游不在里面
+    pub same_model: Vec<PinnedModel>,
+}
+
+/// 一条写着这个名称的规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasRuleRef {
+    pub route: String,
+    pub rule: String,
+    /// `when.model` 或 `set.model`
+    pub field: String,
+}
+
+/// 谁在用这个别名（`GET /aliases/{name}/usage`）：删除、改名之前摆给人看。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasUsage {
+    /// 最近 24 小时里客户端用这个名称发来的请求
+    pub requests_24h: u64,
+    /// 可见模型（`allow`）里有一项正是这个名称的密钥。**按整项比**，通配不算
+    pub keys: Vec<String>,
+    /// 条件（`when.model`）或改写（`set.model`）正是这个名称的规则。阶段二规则的
+    /// `set.model` 不算：它原样发出，不经过别名表
+    pub rules: Vec<AliasRuleRef>,
+}
+
+/// 保存了一个别名（`PUT /aliases/{name}`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasWritten {
+    pub version: String,
+    /// 改名时在同一个版本里一起改掉的引用。没改名时是空的；`requests_24h` 总是 0
+    pub renamed_in: AliasUsage,
+}
+
 // ─────────────────────────────────────────────── 路由与策略组的增删改
 
 /// 新建或修改一条路由时交过来的定义。**规则的顺序就是数组的顺序。**

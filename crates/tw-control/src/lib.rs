@@ -22,6 +22,7 @@ use tw_types::{Msg, msg};
 
 use contract::RouterExt;
 
+pub mod aliases;
 pub mod chatgpt;
 pub mod clients;
 pub mod config;
@@ -139,6 +140,7 @@ pub fn router(state: ControlState) -> Router {
         // 为客户端发专用密钥。接管本身在桌面端做
         .at(ep::ClientKey, clients::client_key)
         .merge(resources::router())
+        .merge(aliases::router())
         .merge(routes::router())
         .merge(security::router())
         .merge(plugins::router())

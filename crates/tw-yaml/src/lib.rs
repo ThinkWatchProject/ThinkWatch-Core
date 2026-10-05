@@ -19,7 +19,7 @@ use tw_types::{Msg, msg};
 
 mod edit;
 mod render;
-pub use edit::{Put, is_flow_at, put, remove_key, reorder, replace_item};
+pub use edit::{Put, is_flow_at, put, remove_key, rename_key, reorder, replace_item};
 pub use render::{Scalar, double_quoted, must_escape, render_scalar};
 
 /// 到某个节点的路径。`providers[1].base_url` 写成
@@ -289,6 +289,22 @@ pub fn path_at(text: &str, offset: usize) -> Option<Vec<Step>> {
 /// 走一遍就把所有位置算出来，比「每改一个字段解析一遍」省事，也让
 /// 「这份配置里有哪些字段」成为一个能回答的问题（表单模式要用）。
 pub fn nodes(text: &str) -> Result<Vec<Node>, PatchError> {
+    walk(text, |_| {})
+}
+
+/// 映射里的一个键在原文里的位置。**键不是节点**（[`nodes`] 只列值）：只有给键改名
+/// 时才要知道它在哪儿。
+pub(crate) struct KeyNode {
+    /// 这个键的值的路径（就是键本身的路径）
+    pub path: Vec<Step>,
+    /// 字节区间，和标量节点一样收到了真正的最后一个字节
+    pub bytes: Range<usize>,
+    pub style: ScalarStyle,
+    pub anchored: bool,
+}
+
+/// 走一遍文档：值的节点按顺序交回来，每个键交给 `on_key`。
+pub(crate) fn walk(text: &str, mut on_key: impl FnMut(KeyNode)) -> Result<Vec<Node>, PatchError> {
     let c2b = CharToByte::new(text);
     let mut out = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
@@ -300,7 +316,15 @@ pub fn nodes(text: &str) -> Result<Vec<Node>, PatchError> {
         match ev {
             Event::Scalar(v, style, anchor_id, _) => {
                 if matches!(stack.last(), Some(Frame::Map { expect_key: true })) {
+                    let mut bytes = c2b.range(sp);
+                    bytes.end = bytes.start + tighten(&text[bytes.clone()], style);
                     pending = Some(Step::Key(v.to_string()));
+                    on_key(KeyNode {
+                        path: node_path(&pending, &cur),
+                        bytes,
+                        style,
+                        anchored: anchor_id != 0,
+                    });
                     if let Some(Frame::Map { expect_key }) = stack.last_mut() {
                         *expect_key = false;
                     }
