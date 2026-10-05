@@ -30,7 +30,8 @@ pub(super) async fn ws_upgrade(
     from: Sender,
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
-    // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道
+    // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道。这次的决定
+    // 里定下的指定模型、模型改写照样作用在之后每一帧上（见 `crate::ws::Naming`）
     let facts = tw_engine::RequestFacts {
         client: client_name.clone(),
         ..Default::default()
@@ -146,6 +147,17 @@ pub(super) async fn ws_upgrade(
         set: rt.plugins.clone(),
         client: crate::hint::client_hint(&headers),
     });
+    // 每个 `response.create` 发出去的模型名：和 HTTP 那条路的一跳同一套，按这次的决定定
+    // （指定模型、阶段一的改写），别名对到这一家（见 `crate::ws::Naming`）。和插件一样只有
+    // Responses 的连接有
+    let naming = responses.then(|| crate::ws::Naming {
+        config: rt.config.clone(),
+        engine: rt.engine.clone(),
+        decision: decision.clone(),
+        provider: provider.clone(),
+        client: client_name.clone(),
+        path: uri.path().to_string(),
+    });
     let upstream = crate::ws::Upstream {
         url: crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref()),
         headers: upstream_headers,
@@ -166,6 +178,6 @@ pub(super) async fn ws_upgrade(
         let _live = live;
         let mut ending = ending;
         ending.responded(101);
-        crate::ws::proxy(state, sock, upstream, rules, id, ending, plugins).await;
+        crate::ws::proxy(state, sock, upstream, rules, id, ending, plugins, naming).await;
     }))
 }

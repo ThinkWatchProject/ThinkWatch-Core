@@ -366,6 +366,8 @@ gw.upstream.stream_exception
 gw.upstream.stream_opening_error
 gw.upstream.timeout
 gw.upstream.unreachable
+gw.ws.alias_unserved
+gw.ws.alias_unserved_rewritten
 gw.ws.bad_header
 gw.ws.bad_url
 gw.ws.connect_failed

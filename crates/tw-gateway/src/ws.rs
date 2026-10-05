@@ -17,10 +17,15 @@
 //!   观察档记录，处置档拒绝、删除或替换；
 //! - 上游 → 客户端：先把占位符换回去，再喂给工具调用审查。
 //!
+//! 每个 `response.create` 发出去的模型名**和 HTTP 那条路的一跳同一套**（见 [`Naming`]）：
+//! 规则给这一家指定的模型原样发，阶段二改的名字原样发，别的 —— 这一帧写的、阶段一改写成的、
+//! 插件改成的 —— 按别名表对到这一家自己的名称。这一家服务不了要的别名，这一帧不发，替它回
+//! 一个 `response.failed`，连接照常。回答里的模型名写回客户端用的那个（[`crate::answer_model`]）。
+//!
 //! 脚本插件也在这条路上跑（见 [`crate::plugin`]）：客户端发来的每个
 //! `response.create` 是一次请求。**这条路只有一跳**（升级时就连定了那一家，不换），
-//! 所以每个 `response.create` 过一遍请求钩子：上游是这条连接连的那一家，模型名是这一帧
-//! 写的（WebSocket 上没有规则改写）。位置和 HTTP 那条路的一跳一样 —— 内容过滤先查
+//! 所以每个 `response.create` 过一遍请求钩子：上游是这条连接连的那一家，模型名是发给它的
+//! 那个（上面那一套定的）。位置和 HTTP 那条路的一跳一样 —— 内容过滤先查
 //! 客户端的原话（删过的话插件拿到的是删过的那一帧），插件改过的再查一遍、只报插件加进来
 //! 的，然后才脱敏、发出。上游每一次回答（`response.created` 到 `response.completed`）
 //! 起一组回答钩子的实例，排在占位符还原之后、工具墙之前。插件出错而策略是拒绝时，切掉的
@@ -45,6 +50,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::protocol::Message as UpMsg;
 
+use crate::error::GatewayError;
 use crate::state::AppState;
 use tw_types::{Msg, msg};
 
@@ -134,6 +140,125 @@ pub struct Plugins {
     pub client: Option<String>,
 }
 
+/// 这条连接上每个 `response.create` 发给上游的模型名怎么定：**和 HTTP 那条路的一跳同一套**
+/// （见 [`crate::sent`]）。依次：
+///
+/// - 规则给这一家指定了模型：原样发指定的那个；
+/// - 阶段二的规则改了名字：原样发（写的时候已经知道是哪一家）；
+/// - 别的是客户端那一侧的名称 —— 这一帧写的，或者阶段一改写成的 —— 按别名表对到这一家自己的
+///   名称（[`crate::models::resolve`]）。插件再改名的，改出来的名字一样对。
+///
+/// 路由在升级时就做完了：升级请求没有正文，按模型路由的规则对它不适用（见 `server::upgrade`），
+/// 指定模型和阶段一的改写都在那次的决定里。**阶段二每一帧跑一遍**：到那时才知道这一帧要的
+/// 模型，和 HTTP 那条路每一跳跑一遍是同一个道理。
+///
+/// 这一家服务不了要的别名时**这一帧不发**：不把别名本身发给一个不认识它的上游。不是别名的
+/// 名字照旧原样发，这一家有没有它由它自己回答。只有 Responses 的连接有这一步：别的连接上
+/// 没有 `response.create` 这种请求。
+pub struct Naming {
+    /// 升级那一刻的配置和路由引擎：一条连接活多久就用它多久，和 [`Rules`] 一样
+    pub config: Arc<tw_config::Config>,
+    pub engine: Arc<tw_engine::Engine>,
+    /// 升级时路由的决定
+    pub decision: tw_engine::Decision,
+    /// 这条连接连的那一家
+    pub provider: tw_config::Provider,
+    /// 网关密钥的名字：规则按它认客户端
+    pub client: String,
+    /// 升级的路径。一帧按这条路径上的一次请求读（[`crate::client_api::read`]）
+    pub path: String,
+}
+
+impl Naming {
+    /// 客户端那一侧的名称发给这一家时叫什么（[`crate::models::resolve`]）。`None` = 这一家
+    /// 服务不了这个别名
+    fn resolve(&self, catalog: &tw_engine::Catalog, name: &str) -> Option<String> {
+        crate::models::resolve(&self.config, catalog, &self.provider, name)
+    }
+
+    /// 每一帧都发的那个名字，升级时就定了的话：规则给这一家指定了模型，或者阶段一把模型
+    /// 改写了（按别名表对到这一家）。**尝试链上记它**，和 HTTP 那条路每一跳记发出去的名字
+    /// 一样；要看每一帧写的是什么的（别名、阶段二、插件改名）升级时说不上来，是 None
+    fn fixed(&self, catalog: &tw_engine::Catalog) -> Option<String> {
+        let facts = tw_engine::RequestFacts {
+            client: self.client.clone(),
+            ..Default::default()
+        };
+        let asked = self
+            .engine
+            .asked_of(&facts, &self.decision, &self.provider.name, None);
+        match asked.origin {
+            tw_engine::Origin::Pinned => Some(asked.model),
+            tw_engine::Origin::Rule => self.resolve(catalog, &asked.model),
+            _ => None,
+        }
+    }
+
+    /// 一帧 `response.create`（`frame`）发给这一家的模型名。这一帧发不出去时是告诉客户端的
+    /// 那个错误：阶段二的规则拒绝了它、规则求不了值，或者这一家服务不了要的别名。
+    fn sent(
+        &self,
+        catalog: &tw_engine::Catalog,
+        frame: &serde_json::Value,
+    ) -> Result<String, GatewayError> {
+        // 一帧的其余字段就是一个 Responses 请求：阶段二的条件按它读出的性质求值
+        let mut facts = crate::client_api::read(&self.path, None, Some(frame)).facts;
+        facts.client = self.client.clone();
+        let p = &self.provider;
+        let renamed = match self.engine.phase_two(&facts, &p.name, &self.decision.set) {
+            Ok(tw_engine::Outcome2::Proceed { model, .. }) => model,
+            Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
+                tracing::info!(%rule, provider = %p.name, "a phase-two rule denied a WebSocket request");
+                return Err(GatewayError::denied(msg!(
+                    "gw.route.denied", rule = rule.clone(), reason = reason =>
+                    "Rule `{rule}` denied this request: {reason}"
+                )));
+            }
+            Err(e) => {
+                return Err(GatewayError::config(msg!(
+                    "gw.route.rule_failed", detail = e => "A rule could not be evaluated: {detail}"
+                )));
+            }
+        };
+        let asked = self
+            .engine
+            .asked_of(&facts, &self.decision, &p.name, renamed.as_deref());
+        // 指定的、阶段二改的原样发；要的是空的（这一帧没写模型名）什么都不改
+        if asked.model.is_empty() || asked.origin.as_written() {
+            return Ok(asked.model);
+        }
+        self.resolve(catalog, &asked.model)
+            .ok_or_else(|| self.unserved(&facts.model, &asked.model))
+    }
+
+    /// 这一家服务不了别名 `alias`。`client` 是这一帧写的：和别名不一样就是阶段一的规则改写的
+    fn unserved(&self, client: &str, alias: &str) -> GatewayError {
+        let models = self
+            .config
+            .aliases
+            .find(alias)
+            .map(|a| a.models.join(", "))
+            .unwrap_or_default();
+        let upstream = self.provider.name.clone();
+        let why = if client == alias {
+            msg!(
+                "gw.ws.alias_unserved", model = alias, upstream = upstream, models = models =>
+                "This WebSocket connection goes to upstream `{upstream}`, which offers none of the \
+                 models of alias {model} ({models}), so the request was not sent."
+            )
+        } else {
+            msg!(
+                "gw.ws.alias_unserved_rewritten",
+                from = client, model = alias, upstream = upstream, models = models =>
+                "A routing rule rewrote model {from} to alias {model}. This WebSocket connection \
+                 goes to upstream `{upstream}`, which offers none of its models ({models}), so the \
+                 request was not sent."
+            )
+        };
+        GatewayError::request(why)
+    }
+}
+
 /// 一次连接里两个方向各自的状态。
 struct Pipes {
     /// **整条连接一本账。**每帧各起一本的话，第二帧的
@@ -152,14 +277,17 @@ struct Pipes {
     id: u64,
     /// 范围里可能有插件时才有
     plugins: Option<Plugins>,
-    /// 最近一次 `response.create`：客户端要的模型、发出去的模型（插件可能换了它）和
-    /// 它的密钥映射。回答钩子用
+    /// 每个 `response.create` 发出去的模型名怎么定。Responses 的连接才有
+    naming: Option<Naming>,
+    /// 最近一次 `response.create`：客户端要的模型、发出去的模型（别名对过、规则或插件
+    /// 换过的那个）和它的密钥映射。回答钩子用
     requested_model: String,
     sent_model: String,
     bridge: Option<crate::plugin::bridge::Bridge>,
     /// 这一次回答的回答钩子
     reply: Option<crate::plugin::reply::Stream>,
-    /// 插件换了发出去的模型名时，回答里的模型名换回客户端用的（见 [`crate::answer_model`]）
+    /// 发出去的模型名和客户端要的不一样时，回答里的模型名换回客户端用的（见
+    /// [`crate::answer_model`]）
     rename: Option<crate::answer_model::Body>,
 }
 
@@ -172,6 +300,7 @@ struct Pipes {
 ///
 /// **这条连接怎么断的，就是这个请求的结局**（`ending`）。每一条收场的
 /// 路径都先报结局、再去关连接：关连接要等对面，而对面可能已经不在了。
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy(
     state: AppState,
     client: WebSocket,
@@ -180,19 +309,29 @@ pub async fn proxy(
     id: u64,
     ending: crate::ending::Ending,
     plugins: Option<Plugins>,
+    naming: Option<Naming>,
 ) {
     let hop_started = std::time::Instant::now();
     let connected = connect(&upstream).await;
     // **连不上也要报。**和 HTTP 那条路一样，失败的时候恰恰最需要看这一跳；
     // 报在结局之前，存储层落库时手上才有它
     let name = &upstream.provider.name;
+    // 这一跳记发出去的模型名，和 HTTP 那条路一样。一条连接跑好几轮、每一帧写的模型可能
+    // 不一样，升级时定得下来的只有每一帧都发的那个（指定模型、阶段一的改写，见
+    // [`Naming::fixed`]）
+    let model = naming.as_ref().and_then(|n| n.fixed(&state.catalog.load()));
     let attempt = match &connected {
-        // WebSocket 不改写模型名：升级请求没有正文可改
-        Ok(_) => crate::server::hop(name, None, tw_api::AttemptOutcome::Served, 101, hop_started),
+        Ok(_) => crate::server::hop(
+            name,
+            model,
+            tw_api::AttemptOutcome::Served,
+            101,
+            hop_started,
+        ),
         Err(NotConnected {
             status: Some(s), ..
-        }) => crate::server::hop(name, None, tw_api::AttemptOutcome::Status, *s, hop_started),
-        Err(e) => crate::server::hop_failed(name, None, e.why.clone(), hop_started),
+        }) => crate::server::hop(name, model, tw_api::AttemptOutcome::Status, *s, hop_started),
+        Err(e) => crate::server::hop_failed(name, model, e.why.clone(), hop_started),
     };
     // 和 HTTP 那条路同一个规矩：没接下的不按那一家记账
     let billing = match &connected {
@@ -204,7 +343,8 @@ pub async fn proxy(
         route: upstream.route,
         rule: upstream.rule,
         group: upstream.group,
-        // 升级请求没有正文，没有什么可改写的；第二阶段也不在这条路上跑
+        // 升级请求没有正文，规则附加的参数改写不作用在这条路上（只有模型名，见 [`Naming`]）；
+        // 阶段二每一帧才跑，那时路由事件早就发了
         rewritten_by: Vec::new(),
         denied_by: None,
         affinity: None,
@@ -232,6 +372,7 @@ pub async fn proxy(
         provider: upstream.provider.name,
         id,
         plugins,
+        naming,
         requested_model: String::new(),
         sent_model: String::new(),
         bridge: None,
@@ -388,15 +529,25 @@ async fn pump(
                                 break End::Cut(why);
                             }
                         };
-                        // 插件的请求钩子拿到的是查过（删过）的那一帧。改过的那一版再查一遍内容
-                        // 过滤（只报插件加进来的），脱敏换的是改过的那一版
-                        let text = match plugin_request(&state, p, &text).await {
+                        // 发出去的模型名和插件的请求钩子：钩子拿到的是查过（删过）的那一帧。改过
+                        // 的那一版再查一遍内容过滤（只报插件加进来的），脱敏换的是改过的那一版
+                        let text = match request(&state, p, &text).await {
                             Ok(text) => text,
-                            Err(why) => {
+                            Err(Refusal::Cut(why)) => {
                                 let _ = c_tx.send(Message::Text(
                                     format!("[ThinkWatch] {}", why.text).into(),
                                 )).await;
                                 break End::Cut(why);
+                            }
+                            // 只是这一帧不发：替它回一个 `response.failed`，连接照常
+                            Err(Refusal::Frame(err)) => {
+                                tracing::info!(provider = %p.provider, why = %err.detail.text,
+                                    "a WebSocket request was not sent");
+                                let failed = failed_frame(err, None);
+                                if c_tx.send(Message::Text(failed.into())).await.is_err() {
+                                    break End::Closed;
+                                }
+                                continue;
                             }
                         };
                         let mode = p.rules.redact_mode;
@@ -615,7 +766,7 @@ async fn upstream_text(
 
 /// 切掉这一次回答：替它发 `response.failed`，它剩下的帧不再发
 async fn fail_response(p: &mut Pipes, c_tx: &mut ClientSink, why: Msg) -> Flow {
-    let failed = failed_frame(why, p.response.as_deref());
+    let failed = failed_frame(GatewayError::denied(why), p.response.as_deref());
     p.dropping = true;
     p.reply = None;
     if c_tx.send(Message::Text(failed.into())).await.is_err() {
@@ -624,15 +775,24 @@ async fn fail_response(p: &mut Pipes, c_tx: &mut ClientSink, why: Msg) -> Flow {
     Flow::Sent
 }
 
-/// 一次 `response.create` 过插件的请求钩子。`text` 是查过内容过滤的那一帧（删过的话是
-/// 删过的样子）。返回要发给上游的那一帧（插件改过的话是改过的），被拒了返回告诉客户端的
-/// 那句话。别的帧原样。
+/// 客户端发来的一帧为什么不发。
+enum Refusal {
+    /// 切断这条连接，告诉客户端的是这句话：插件拒绝了这个请求，和内容过滤拒掉一帧一样
+    Cut(Msg),
+    /// 只是这一帧不发，替它回一个 `response.failed`（见 [`failed_frame`]），连接照常：要的
+    /// 别名这一家服务不了、阶段二的规则拒绝了它。下一帧要的可能就是这一家有的
+    Frame(GatewayError),
+}
+
+/// 一次 `response.create`：定发给这一家的模型名（[`Naming`]），过插件的请求钩子。`text` 是
+/// 查过内容过滤的那一帧（删过的话是删过的样子）。返回要发给上游的那一帧：插件改过的话是
+/// 改过的，模型名写成发给这一家的那个。别的帧原样。
 ///
-/// 这条路只有一跳：上游是这条连接连的那一家，发给它的模型名就是这一帧写的，运行记在
-/// 第 0 跳上。插件改过的那一版**再查一遍内容过滤**，只报插件加进来的（客户端的原话已经
-/// 在 [`screen_frame`] 查过了，见 [`screen_changed`]）。
-async fn plugin_request(state: &AppState, p: &mut Pipes, text: &str) -> Result<String, Msg> {
-    let Some(pc) = p.plugins.as_ref() else {
+/// 这条路只有一跳：上游是这条连接连的那一家，插件的运行记在第 0 跳上。插件改过的那一版
+/// **再查一遍内容过滤**，只报插件加进来的（客户端的原话已经在 [`screen_frame`] 查过了，见
+/// [`screen_changed`]）。
+async fn request(state: &AppState, p: &mut Pipes, text: &str) -> Result<String, Refusal> {
+    let Some(naming) = p.naming.as_ref() else {
         return Ok(text.to_string());
     };
     let Some(frame) = serde_json::from_str::<serde_json::Value>(text)
@@ -646,6 +806,39 @@ async fn plugin_request(state: &AppState, p: &mut Pipes, text: &str) -> Result<S
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .to_string();
+    // 别名对到这一家时看的清单：这一帧（一次请求）用同一份
+    let catalog = state.catalog.load();
+    let sent = naming.sent(&catalog, &frame).map_err(Refusal::Frame)?;
+    let (out, sent) = if p.plugins.is_some() {
+        plugin_request(state, p, &catalog, text, &requested, sent).await?
+    } else {
+        (text.to_string(), sent)
+    };
+    let out = with_model(out, &sent);
+    p.rename =
+        crate::answer_model::Rename::new(&requested, &sent).map(crate::answer_model::Rename::body);
+    p.requested_model = requested;
+    p.sent_model = sent;
+    Ok(out)
+}
+
+/// 一次 `response.create` 过插件的请求钩子。`requested` 是这一帧写的模型名，`sent` 是发给
+/// 这一家的（[`Naming::sent`]），插件的 `ctx.model` 就是它。返回要发出去的那一帧（插件改过
+/// 的话是改过的）和发给这一家的模型名。
+///
+/// 插件换了模型名：插件写的是客户端那一侧的名字，**可以是别名**，和 HTTP 那条路一样按别名表
+/// 对到这一家（`server::pipeline::plug`）；这一家服务不了这个别名的，这一帧不发。
+async fn plugin_request(
+    state: &AppState,
+    p: &mut Pipes,
+    catalog: &tw_engine::Catalog,
+    text: &str,
+    requested: &str,
+    sent: String,
+) -> Result<(String, String), Refusal> {
+    let Some(pc) = p.plugins.as_ref() else {
+        return Ok((text.to_string(), sent));
+    };
     let body = bytes::Bytes::copy_from_slice(text.as_bytes());
     let mut hook = crate::plugin::request::Hook::new(
         &pc.set,
@@ -657,38 +850,62 @@ async fn plugin_request(state: &AppState, p: &mut Pipes, text: &str) -> Result<S
     );
     let to = crate::plugin::request::Target {
         upstream: &p.provider,
-        model: &requested,
-        requested_model: &requested,
+        model: &sent,
+        requested_model: requested,
         attempt: 0,
     };
     let plugged = match hook.attempt(&pc.pool, &to).await {
         Ok(plugged) => plugged,
         Err(refused) => {
             crate::plugin::request::record(state, p.id, &refused.runs);
-            return Err(refused.why);
+            return Err(Refusal::Cut(refused.why));
         }
     };
     crate::plugin::request::record(state, p.id, &plugged.runs);
-    let sent = plugged
-        .changed
-        .as_ref()
-        .and_then(|c| c.renamed.as_ref())
-        .map_or_else(|| requested.clone(), |r| r.model.clone());
     p.bridge = plugged.bridge;
-    let out = match plugged.changed {
-        None => text.to_string(),
-        Some(c) => screen_changed(
-            state,
-            p,
-            text,
-            String::from_utf8_lossy(&c.body).into_owned(),
-        )?,
+    let Some(c) = plugged.changed else {
+        return Ok((text.to_string(), sent));
     };
-    p.rename =
-        crate::answer_model::Rename::new(&requested, &sent).map(crate::answer_model::Rename::body);
-    p.requested_model = requested;
-    p.sent_model = sent;
-    Ok(out)
+    let sent = match &c.renamed {
+        None => sent,
+        Some(r) => p
+            .naming
+            .as_ref()
+            .and_then(|n| n.resolve(catalog, &r.model))
+            .ok_or_else(|| {
+                // 和 HTTP 那条路同一句（`server::pipeline::plug` 的 `sent_name`）：这条路只有
+                // 一跳，「不发往那一家」就是这一帧不发
+                Refusal::Frame(GatewayError::request(msg!(
+                    "gw.plugin.alias_unserved",
+                    plugin = r.by.clone(), model = r.model.clone(), upstream = p.provider.clone() =>
+                    "Plugin `{plugin}` changed the model to the alias {model}, and upstream \
+                     `{upstream}` offers none of its models, so the request was not sent there."
+                )))
+            })?,
+    };
+    let out = screen_changed(
+        state,
+        p,
+        text,
+        String::from_utf8_lossy(&c.body).into_owned(),
+    )
+    .map_err(Refusal::Cut)?;
+    Ok((out, sent))
+}
+
+/// 这一帧的模型名写成 `model`。已经是它（或者 `model` 是空的）就一个字节都不动
+fn with_model(text: String, model: &str) -> String {
+    if model.is_empty() {
+        return text;
+    }
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return text;
+    };
+    if v.get("model").and_then(|m| m.as_str()) == Some(model) {
+        return text;
+    }
+    tw_dialect::params::set_model(tw_dialect::ir::Dialect::Responses, &mut v, model);
+    v.to_string()
 }
 
 /// 插件改过的那一帧再查一遍内容过滤：**只报插件加进来的**（见 [`crate::guard::rescreen`]）。
@@ -769,10 +986,10 @@ fn response_id(frame: &str) -> Option<String> {
     v.pointer("/response/id")?.as_str().map(str::to_string)
 }
 
-/// 替被切掉的那次回答发的 `response.failed`：和 SSE 那条路同一个形状
-/// （`tw_dialect` 的错误帧），id 换成这次回答的
-fn failed_frame(why: Msg, response: Option<&str>) -> String {
-    let sse = crate::error::GatewayError::denied(why)
+/// 替被切掉的那次回答（或者没发出去的那一帧）发的 `response.failed`：和 SSE 那条路同一个
+/// 形状（`tw_dialect` 的错误帧），id 换成这次回答的。没发出去的那一帧没有回答，id 是新的
+fn failed_frame(err: GatewayError, response: Option<&str>) -> String {
+    let sse = err
         .in_dialect(tw_dialect::ir::Dialect::Responses)
         .sse_frame();
     let Some(mut v) = tw_dialect::frame::parse(sse.as_bytes())
