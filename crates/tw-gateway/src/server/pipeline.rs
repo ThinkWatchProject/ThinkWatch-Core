@@ -62,6 +62,9 @@ struct Started {
     ledger: tw_guard::redact::replace::Ledger,
     /// 出站脱敏在客户端原文里找到的。插件改过的那一跳只再报插件写进来的（见 [`plug`]）
     found: Vec<tw_guard::redact::rules::Finding>,
+    /// 这个请求最多等到什么时候：准入时定下（见 [`admission`]），等密钥的分钟、小时上限和
+    /// 等上游的空位共用这一段（`failover.slot_wait_secs`）
+    wait_until: tokio::time::Instant,
 }
 
 pub(super) async fn pipeline(
@@ -122,7 +125,11 @@ pub(super) async fn pipeline(
     //
     // **并发的通行证交给回程，跟着响应体走**（见 `relay`）：放在这里的话它在响应头交出去的
     // 那一刻就还了，一条还在流的回答不再算数，上限管的只是等响应头的那一段
-    let admission::Admitted { pass, hold } = admission::admit(
+    let admission::Admitted {
+        pass,
+        hold,
+        wait_until,
+    } = admission::admit(
         &state,
         &rt,
         &req,
@@ -142,6 +149,7 @@ pub(super) async fn pipeline(
         &req,
         &reading,
         choice,
+        wait_until,
         &decision,
         fp.as_deref(),
         ending,
@@ -235,7 +243,7 @@ pub(super) async fn pipeline(
 
 /// 数 token 由网关估了数（见 [`crate::count`]）：把它交给客户端，照常报响应头和结局。
 ///
-/// **不经过 `relay`**：那里按上游的回答记首字节时间、额度、凭据和代理的状态，而这个
+/// **不经过 `relay`**：那里按上游的回答记快慢样本、额度、凭据和代理的状态，而这个
 /// 回答不是上游给的 —— 记上去的话，一家从没被问过的上游会显示成「刚刚答得飞快」。
 /// 响应头上带 `x-thinkwatch-local`，和本地应答的一样。
 fn estimated(
@@ -736,6 +744,7 @@ fn start(
     req: &Inbound,
     reading: &crate::client_api::Reading,
     choice: Choice,
+    wait_until: tokio::time::Instant,
     decision: &tw_engine::Decision,
     fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
@@ -795,6 +804,7 @@ fn start(
         conversation: crate::affinity::identity(&req.headers, fp),
         ledger,
         found,
+        wait_until,
     }
 }
 

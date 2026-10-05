@@ -30,8 +30,8 @@ pub enum GroupType {
     /// `balance_by` 还可以按快慢、成败给权重乘一个系数（[`BalanceBy`]）。
     /// **轮的是新对话**：已经有人回答过、缓存还热着的对话留在那一家
     LoadBalance,
-    /// 选最快的。判据是**真实流量测出来的 TTFB**，样本不够时用启动时
-    /// 那次零成本的 L1 握手计时补。
+    /// 选最快的。判据是**真实流量测出来的快慢**：从发出去到回答的第一段内容（流式回答才有），
+    /// 样本不够时用启动时那次零成本的 L1 握手计时补。
     ///
     /// **测不到的那些排最后，而不是排最前。**「没测到」不等于「慢」，
     /// 但把它排前面就等于放弃了「选最快的」这个承诺；排最后它仍然是
@@ -78,7 +78,7 @@ pub enum BalanceBy {
     /// 只按成员的权重
     #[default]
     Weights,
-    /// 越快的分得越多：看首字节时间，和 `url-test` 同一份样本
+    /// 越快的分得越多：看从发出去到回答的第一段内容用了多久，和 `url-test` 同一份样本
     Latency,
     /// 越少失败的分得越多：看最近的成功率
     Health,
@@ -102,7 +102,7 @@ impl BalanceBy {
         *self == BalanceBy::Weights
     }
 
-    /// 要不要每家的首字节时间（[`Facts::ttfb_ms`]）
+    /// 要不要每家的快慢（[`Facts::ttfb_ms`]）
     pub fn uses_latency(&self) -> bool {
         matches!(self, BalanceBy::Latency | BalanceBy::LatencyHealth)
     }
@@ -125,7 +125,7 @@ const HEALTH_FACTOR_FLOOR: f64 = 0.05;
 /// `load-balance` 每一家的系数，和 `members` 一一对应：**成员的权重乘上它**，就是这一家
 /// 这一轮的有效权重（[`crate::weighted`] 按它轮）。`weights` 全是 1。
 ///
-/// - 快慢：(测到的那几家首字节时间的中位数 ÷ 这一家的)²，夹在 0.1 到 10 之间。平方让差别
+/// - 快慢：(测到的那几家典型快慢的中位数 ÷ 这一家的)²，夹在 0.1 到 10 之间。平方让差别
 ///   看得出来：快一倍的分到四倍。
 /// - 成败：成功率²，最低 0.05。
 /// - **没有样本的那一项算 1，就是「中等」**：新加的上游会被试到，但不会一上来就被灌满。
@@ -156,7 +156,7 @@ pub fn balance_factors(by: BalanceBy, members: &[String], f: &Facts) -> Vec<f64>
         .collect()
 }
 
-/// 测到了的那几家首字节时间的中位数，毫秒。一家都没测到是 `None`。
+/// 测到了的那几家典型快慢（[`Facts::ttfb_ms`]）的中位数，毫秒。一家都没测到是 `None`。
 ///
 /// 偶数家时取中间两家的平均：系数围着它往两头夹，取其中一家的话，夹的那一刀会偏向一边
 fn median_ttfb(members: &[String], f: &Facts) -> Option<f64> {
@@ -202,7 +202,10 @@ pub struct Facts {
     /// 此刻停着的上游：熔断着、失败之后冷却着。`load-balance` 这一轮不算它们 ——
     /// 网关反正会跳过它们，轮到它们的那一次会落到组里排在后面的那一家头上
     pub paused: std::collections::HashSet<String>,
-    /// 每家的典型 TTFB（毫秒）。**缺席 = 样本不够**，不是「很快」
+    /// 此刻并发数满着的上游（`providers[].max_concurrent`）。`load-balance` 这一轮也不算它们，
+    /// 和停着的一样：网关会当场跳过它们，轮到它们的那一次记了账却没答
+    pub busy: std::collections::HashSet<String>,
+    /// 每家典型的快慢：从发出去到回答的第一段内容，毫秒。**缺席 = 样本不够**，不是「很快」
     pub ttfb_ms: std::collections::HashMap<String, u32>,
     /// 每家跑这个模型的单价，(输入, 输出)，微分/百万 token。
     /// **缺席 = 算不出价钱**，不是「免费」
@@ -263,7 +266,7 @@ pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
         GroupType::Fallback | GroupType::Select => members.to_vec(),
         GroupType::LoadBalance => balance(g, members, f),
         GroupType::UrlTest => {
-            // 有样本的按 TTFB 升序；没样本的保持原有相对次序排在后面。
+            // 有样本的按快慢升序；没样本的保持原有相对次序排在后面。
             // **`sort_by_key` 是稳定排序**，所以同速的两家不会每次换位
             // —— 那会让 prompt cache 白白多断一次
             let mut out = members.to_vec();

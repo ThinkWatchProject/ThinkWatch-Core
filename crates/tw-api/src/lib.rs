@@ -1905,7 +1905,8 @@ pub struct FailoverView {
     pub stream_start_wait_secs: u64,
     /// 等过 `stream_start_wait_secs` 还没有内容就换下一家（最后一家照常等）
     pub next_on_slow_start: bool,
-    /// 上游满着（`max_concurrent`）时，一个请求合计最多等多少秒空位。0 是不等
+    /// 一个请求合计最多等多少秒：等密钥的分钟、小时上限空出名额，和等满着（`max_concurrent`）
+    /// 的上游空出位置，共用这一段。0 是不等
     pub slot_wait_secs: u64,
 }
 
@@ -4961,8 +4962,8 @@ pub struct DryRunCandidate {
     /// 经过的是 `load-balance` 组时，它在组里的权重（没写权重的是 1）。别的时候没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
-    /// 它的典型首字节时间（最近样本的中位数），毫秒。只在顺序看它时有：`url-test`，
-    /// 按快慢分的 `load-balance`。样本不够时没有
+    /// 它典型的快慢：从发出去到回答的第一段内容（最近样本的中位数），毫秒。只在顺序看它时
+    /// 有：`url-test`，按快慢分的 `load-balance`。样本不够时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<u32>,
     /// 它最近的成功率，0 到 1（最近 50 次、30 分钟以内）。只在按成败分的 `load-balance`

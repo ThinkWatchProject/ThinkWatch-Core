@@ -189,7 +189,8 @@ pub struct AppState {
     /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
     /// 得出来（指纹对不上就重换）。
     pub oauth: Arc<crate::oauth::Cache>,
-    /// 每家的典型首字节时间。`url-test` 策略靠它排序。
+    /// 每家典型的快慢：从发出去到回答的第一段内容（见 [`crate::latency`]）。`url-test` 靠它
+    /// 排序，按快慢分的 `load-balance` 靠它算系数。
     ///
     /// **跨重载存活**：改一条规则不该让所有上游回到「没测过」。
     pub latency: Arc<crate::latency::Latency>,
@@ -410,6 +411,16 @@ impl AppState {
                 candidates
                     .iter()
                     .filter(|p| !self.health.is_available(p))
+                    .cloned()
+                    .collect()
+            } else {
+                Default::default()
+            },
+            // 并发数满着的也不参加这一轮：它们会被当场跳过（见 `crate::slots`）
+            busy: if balanced {
+                candidates
+                    .iter()
+                    .filter(|p| self.slots.is_full(p))
                     .cloned()
                     .collect()
             } else {

@@ -255,6 +255,32 @@ async fn a_rolling_minute_waits_for_its_next_slot_or_refuses() {
     assert_eq!(b.limits.clock.now_ms(), t0 + 60_000, "等到第一个滑出窗口");
 }
 
+/// 等待期限是整个请求的那一个（见 [`slot_wait`]），调用方给的是那一刻，不是从此刻起再给
+/// 一整段：期限之前空不出来的就拒
+#[tokio::test(start_paused = true)]
+async fn a_rolling_wait_ends_at_the_requests_own_deadline() {
+    let b = bed("2026-10-05T10:00:00+08:00", "[{per: minute, requests: 1}]");
+    b.run(1, Ask::default()).await.unwrap();
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    // 35 秒之后，空位还要 25 秒才出来：期限已经过了，拒
+    tokio::time::advance(Duration::from_secs(35)).await;
+    let r = b
+        .limits
+        .admit_by("k", &b.set, Ask::default(), until)
+        .await
+        .unwrap_err();
+    assert_eq!(r.retry_after_ms, 25_000);
+    // 从此刻算起的一整段（`admit`）就等得到
+    let t = b.now();
+    let hold = b
+        .limits
+        .admit("k", &b.set, Ask::default(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    drop(hold);
+    assert_eq!(b.now(), t + 25_000);
+}
+
 #[tokio::test(start_paused = true)]
 async fn tokens_in_a_rolling_hour_count_when_they_are_settled() {
     let b = bed("2026-10-05T10:00:00+08:00", "[{per: hour, tokens: 1000}]");

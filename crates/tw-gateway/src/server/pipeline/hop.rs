@@ -46,6 +46,8 @@ pub(super) struct Served<'a> {
     /// 这一跳在这家占着的位置（见 [`crate::slots`]）。**跟着回答走**：交完、或者客户端
     /// 走掉，响应体被丢掉时才还回去
     pub(super) slot: crate::slots::Slot,
+    /// 这一跳发出去的那一刻。这一家的快慢样本从这里算起（见 [`crate::latency`]）
+    pub(super) sent_at: std::time::Instant,
 }
 
 /// 这个请求的着落。
@@ -146,10 +148,10 @@ pub(super) async fn try_upstreams<'a>(
     // 满着没发的那几家（见 `crate::slots`），按候选的顺序。候选都看过一遍还没有着落时，
     // 在它们里面等先空出来的那一家
     let mut busy: Vec<&String> = Vec::new();
-    // 等空位等到什么时候：头一次要等时定下，**整个请求共用这一段** —— 等的时候客户端
-    // 一个字节都收不到
-    let wait = std::time::Duration::from_secs(rt.config.failover.slot_wait_secs);
-    let mut deadline: Option<tokio::time::Instant> = None;
+    // 等空位等到什么时候：准入时定下的那一刻（见 `super::admission`），**整个请求共用**
+    // —— 等密钥的分钟、小时上限已经用掉的，这里就少等那么久。等的时候客户端一个字节都
+    // 收不到
+    let until = started.wait_until;
     // 等过空位的那一跳在尝试链上的位置和等了多久。那一跳怎么收场都只进一行，进了之后补上
     let mut queued: Option<(usize, u64)> = None;
     // 等到最后，剩下的候选还都满着
@@ -162,7 +164,6 @@ pub(super) async fn try_upstreams<'a>(
             Some(name) => (name, None),
             None if busy.is_empty() => break,
             None => {
-                let until = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
                 let t = std::time::Instant::now();
                 match state.slots.first_free(&busy, until).await {
                     Some((k, slot)) => (busy.remove(k), Some((slot, t.elapsed()))),
@@ -325,7 +326,6 @@ pub(super) async fn try_upstreams<'a>(
                 // 这段对话留在这家是为了它的缓存：等它空出来，等不到再换下一家（缓存就丢在
                 // 这家了）。别的候选满着当场跳过
                 if slot.is_none() && started.choice.stayed_on.as_ref() == Some(name) {
-                    let until = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
                     // 这个请求能等的已经等完了（或者配置的是不等）：不再等
                     if tokio::time::Instant::now() < until {
                         let t = std::time::Instant::now();
@@ -511,11 +511,13 @@ pub(super) async fn try_upstreams<'a>(
             let rest = queue.iter().chain(busy.iter()).copied();
             successor(state, rt, req, reading, decision, &catalog, allow, rest)
         };
+        // 这一跳发出去的那一刻：这一家的快慢样本从这里算起（见 `crate::latency`）
+        let sent_at = std::time::Instant::now();
         // 开头慢就换下一家：等到什么时候，从这一刻（请求发出去）算起。最后一家不换。到点时
         // 问过、后面没有接得下的，清掉它：这一跳从此和不开时一样
         let mut slow_deadline = slow_wait
             .filter(|_| !last)
-            .map(|w| tokio::time::Instant::now() + w);
+            .map(|w| tokio::time::Instant::from_std(sent_at) + w);
 
         // 发出去、等响应头。**等着的这个 future 只活在这一块里**：放弃这一家时它跟着丢掉，
         // 连接随之断开
@@ -556,6 +558,7 @@ pub(super) async fn try_upstreams<'a>(
                     // `super::slow`）
                     Err(_) if others() => {
                         let waited = slow_wait.unwrap_or_default();
+                        super::slow::timed_out(state, &provider.name, waited);
                         chain.push(super::slow::abandoned(
                             &provider.name,
                             model.clone(),
@@ -687,6 +690,7 @@ pub(super) async fn try_upstreams<'a>(
                             session: out.session,
                             refusal,
                             slot,
+                            sent_at,
                         });
                         break;
                     }
@@ -718,6 +722,7 @@ pub(super) async fn try_upstreams<'a>(
                                 // 上游回了话，说明代理是通的
                                 state.note_proxy_ok(&provider.proxy);
                                 let waited = slow_wait.unwrap_or_default();
+                                super::slow::timed_out(state, &provider.name, waited);
                                 chain.push(super::slow::abandoned(
                                     &provider.name,
                                     model.clone(),
@@ -819,6 +824,7 @@ pub(super) async fn try_upstreams<'a>(
                     session: out.session,
                     refusal: None,
                     slot,
+                    sent_at,
                 });
                 break;
             }

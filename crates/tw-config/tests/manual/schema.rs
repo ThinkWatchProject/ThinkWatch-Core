@@ -1330,8 +1330,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Int,
                     Def::Is("30"),
                     t(
-                        "Seconds a request waits in total for a free slot on upstreams that are at their `max_concurrent`. After that it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300.",
-                        "上游的并发数满了（`max_concurrent`）时，一个请求等空位合计最多等的秒数。等不到就换下一家；候选全满时回 429。`0`：不等。取值 0 到 300。",
+                        "Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for a free slot on upstreams at their `max_concurrent`. A key limit that does not free up in time refuses the request; without an upstream slot in time it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300.",
+                        "一个请求合计最多等的秒数，从过了密钥自己的 `max_concurrent` 时算起：等密钥的 `minute`、`hour` 上限空出名额，和等并发数满了（`max_concurrent`）的上游空出位置，都算在里面。密钥的上限到时空不出来就拒绝；等不到上游的空位就换下一家，候选全满时回 429。`0`：不等。取值 0 到 300。",
                     ),
                 ),
             ],
@@ -1355,8 +1355,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(group_types),
                     Def::Is("fallback"),
                     t(
-                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price.",
-                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话按成员的权重轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。",
+                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price.",
+                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话按成员的权重轮流。`url-test`：按实测从发出请求到回答第一段内容的时间取最快的。`cheapest`：取输入单价最低的。",
                     ),
                 ),
                 row(

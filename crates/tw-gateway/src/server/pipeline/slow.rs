@@ -11,6 +11,8 @@
 //!   `hop::successor`）：停用着的、这一跳发不出去的不算 —— 否则放弃了一个慢的，换来的是
 //!   一个注定失败的。
 //! - **这一家不停用、不算失败**：慢不是坏，下一个请求它可能就快了。
+//! - **它的快慢样本记它被给的那段时间**（见 [`timed_out`]）：`url-test` 和按快慢分的
+//!   `load-balance` 照这个把它往后排。
 //! - **尝试链上记一跳 `slow_start`**，带着上游可能已经收了钱的输入（见
 //!   [`tw_api::AttemptUsage`]）。
 //! - 只管客户端要流式的请求：整包的请求本来就要等全部生成完，开头慢说明不了什么。
@@ -31,6 +33,15 @@ pub(super) fn wait(rt: &Runtime, reading: &crate::client_api::Reading) -> Option
     let f = &rt.config.failover;
     let streams = matches!(&reading.decoded, Some(Ok(d)) if d.request.stream);
     (f.next_on_slow_start && streams).then(|| Duration::from_secs(f.stream_start_wait_secs))
+}
+
+/// 放弃了这一家：给它记一个快慢样本，就是它被给的那段时间（见 [`crate::latency`]）。
+///
+/// **它至少这么慢**，这是个下限：记成这个数，`url-test` 和按快慢分的 `load-balance` 就把它
+/// 排到慢的那一头。什么都不记的话，它留着的还是从前快的样本，下一个请求照样先发给它，
+/// 而等它的这段时间算到了接下来那一家头上。
+pub(super) fn timed_out(state: &crate::state::AppState, provider: &str, waited: Duration) {
+    state.latency.record(provider, crate::latency::ms(waited));
 }
 
 /// 放弃了的那一跳：尝试链上的一行。`status` 是上游回的（响应头没到的没有），`seen` 是流

@@ -63,6 +63,8 @@ pub struct Ending {
     first: Option<FirstToken>,
     /// 第一个 token 是什么时候、以什么开的头
     opened: Option<Opened>,
+    /// 第一个 token 到的时候给回答的这一家记一个快慢样本（见 [`Ending::timed`]）
+    lap: Option<Lap>,
     /// 看上游有没有在流里报错。**只在上游回的是成功的流时才有**（见 [`Ending::streaming`]），
     /// 认出来就扔掉
     watch: Option<Watch>,
@@ -168,6 +170,16 @@ struct FirstToken {
     hidden_thought: bool,
 }
 
+/// 回答的这一家的快慢样本记到哪儿、从什么时候算起（见 [`crate::latency`]）。
+pub struct Lap {
+    pub latency: std::sync::Arc<crate::latency::Latency>,
+    /// 回答的那一家
+    pub provider: String,
+    /// 这一跳发出去的那一刻。**不是请求进来的那一刻**：之前的等待、插件、失败了的几跳
+    /// 都不是这一家慢
+    pub sent: Instant,
+}
+
 /// 第一个 token 到的那一刻。
 #[derive(Debug, Clone, Copy)]
 struct Opened {
@@ -202,6 +214,7 @@ impl Ending {
             tap: ResponseTap::new(),
             first: None,
             opened: None,
+            lap: None,
             watch: None,
             upstream_error: None,
             refusal: None,
@@ -229,6 +242,14 @@ impl Ending {
             dialect: upstream,
             frames: Default::default(),
         });
+    }
+
+    /// 第一个 token 到的时候，给回答的这一家记一个快慢样本：从这一跳发出去到这一刻（见
+    /// [`crate::latency`]）。**认第一个 token 的是同一个**（[`Ending::streaming`] 之后才有，
+    /// 没调过它的什么都不记）：样本、请求列表里的首 token、开头慢不慢，说的是同一件事。
+    /// 一个 token 都没等到的（流断了、上游只报了错），不记。
+    pub fn timed(&mut self, lap: Lap) {
+        self.lap = Some(lap);
     }
 
     /// 上游 `provider` 回的不是 2xx，原样交给了客户端（4xx 是请求本身的问题，或者没有
@@ -316,6 +337,10 @@ impl Ending {
             return;
         };
         self.first = None;
+        if let Some(lap) = self.lap.take() {
+            lap.latency
+                .record(&lap.provider, crate::latency::ms(lap.sent.elapsed()));
+        }
         let ms = self.duration_ms();
         self.opened = Some(Opened {
             ms,
@@ -1060,6 +1085,61 @@ mod tests {
         assert_eq!(first_tokens(&got).len(), 1, "{got:?}");
         e.finished(200);
         assert!(first_tokens(&drain(&mut rx)).is_empty());
+    }
+
+    fn lap(latency: &std::sync::Arc<crate::latency::Latency>, sent: Instant) -> Lap {
+        Lap {
+            latency: latency.clone(),
+            provider: "up".into(),
+            sent,
+        }
+    }
+
+    /// 快慢样本记在第一个 token 到的那一刻，从这一跳发出去算起 —— 不是从请求进来、也不是
+    /// 从响应头到的那一刻。一个请求只记一个
+    #[test]
+    fn the_sample_runs_from_sending_the_hop_to_the_first_token() {
+        let bus = tw_observe::EventBus::new();
+        let latency = std::sync::Arc::new(crate::latency::Latency::new());
+        // 请求进来之后过了好一阵才发出去（等空位、前面的几跳失败）
+        let arrived = Instant::now() - std::time::Duration::from_secs(5);
+        for _ in 0..3 {
+            let mut e = Ending::new(bus.clone(), 7, MODEL.into(), arrived, 1_000, None);
+            e.responded(200);
+            e.streaming(ir::Dialect::Anthropic, "up");
+            let sent = Instant::now() - std::time::Duration::from_millis(300);
+            e.timed(lap(&latency, sent));
+            e.feed(MESSAGE_START);
+            e.feed(TEXT_BLOCK);
+            assert_eq!(latency.typical("up"), None, "开场帧被当成了内容");
+            e.feed(TEXT_DELTA);
+            e.feed(TEXT_DELTA);
+            e.finished(200);
+        }
+        let t = latency.typical("up").expect("三次都该记");
+        assert!((300..2_000).contains(&t), "{t} 毫秒");
+    }
+
+    /// 没有内容的（流里只报了错、流断了）、不是流的，都不记
+    #[test]
+    fn no_first_token_no_sample() {
+        let bus = tw_observe::EventBus::new();
+        let latency = std::sync::Arc::new(crate::latency::Latency::new());
+        for _ in 0..3 {
+            let mut e = responding(&bus);
+            e.streaming(ir::Dialect::Anthropic, "up");
+            e.timed(lap(&latency, Instant::now()));
+            e.feed(MESSAGE_START);
+            e.feed(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n");
+            e.finished(200);
+            // 整包的回答：没说是流，内容到了也不算
+            let mut e = responding(&bus);
+            e.timed(lap(&latency, Instant::now()));
+            e.feed(TEXT_DELTA);
+            e.finished(200);
+        }
+        assert_eq!(latency.snapshot(&["up".to_string()]).len(), 0);
+        assert_eq!(latency.typical("up"), None);
     }
 
     /// 工具调用一开头就算：块开头就带着工具名，参数的第一段常常是空的

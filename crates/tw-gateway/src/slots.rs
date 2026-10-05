@@ -9,8 +9,9 @@
 //! - 别的候选满着：当场跳过，试下一家；
 //! - 候选都满着：在它们里面等先空出来的那一家，等不到就回 429。
 //!
-//! 等多久是 `failover.slot_wait_secs`，**一个请求合起来算**：等的时候客户端一个字节都
-//! 收不到。**等不是失败**：满着的上游不停用、不进熔断的账。
+//! 等多久是 `failover.slot_wait_secs`，**一个请求合起来算**，准入时等密钥的分钟、小时上限
+//! 用掉的也算在里面（见 `crate::key_limits::slot_wait`）：等的时候客户端一个字节都收不到。
+//! **等不是失败**：满着的上游不停用、不进熔断的账。
 //!
 //! 一个位置从发出请求占到回答交完、或者客户端走掉，由 [`Slot`] 的 Drop 还回去。和每把
 //! 密钥的闸（[`crate::limits`]）一样，**跨重载存活**，上限改了在原来那个信号量上加减：
@@ -129,6 +130,14 @@ impl Slots {
         let pool = self.pool(name)?;
         let books = pool.books.lock().unwrap_or_else(|p| p.into_inner());
         Some(books.limit)
+    }
+
+    /// 这家此刻满着：设了上限、一个空位都没有。`load-balance` 排这一轮时看它（满着的不
+    /// 参加，见 `tw_engine::weighted`）。**只是此刻的样子**：真要发的时候还是 [`Self::try_take`]
+    /// 说了算
+    pub fn is_full(&self, name: &str) -> bool {
+        self.pool(name)
+            .is_some_and(|pool| !pool.sem.is_closed() && pool.sem.available_permits() == 0)
     }
 
     /// 不等：有空位就占一个，这家满着是 `None`。不限并发的上游一律给一个空的。

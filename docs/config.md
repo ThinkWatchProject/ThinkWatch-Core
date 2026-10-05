@@ -331,9 +331,9 @@ can have several, and a request has to pass every one.
 `minute` and `hour` are rolling: the last 60 seconds, the last 60 minutes.
 When one is used up, a request waits for the next free slot if it frees
 within `failover.slot_wait_secs` (30 seconds by default), and is refused
-otherwise. `day`, `week` and `month` follow the calendar in the time zone of
-the machine twcore runs on and start again at midnight, on Monday and on the
-1st. When one is used up, requests are refused until it starts again.
+otherwise. Any later wait for a busy upstream comes out of the same time.
+`day`, `week` and `month` follow the calendar in the time zone of the machine
+twcore runs on and start again at midnight, on Monday and on the 1st. When one is used up, requests are refused until it starts again.
 
 A refused request gets HTTP 429 in the client's own error format, naming the
 key, the limit, the amount used and when it resets, and it shows in the
@@ -998,7 +998,9 @@ failover:
 ```
 
 When upstreams are at their `max_concurrent`, a request waits for a free slot
-for at most `slot_wait_secs` in all. An ongoing conversation waits for the
+for at most `slot_wait_secs` in all. The same time also covers waiting for a
+key's `minute` or `hour` limit, so a request never waits longer than
+`slot_wait_secs` for the two together. An ongoing conversation waits for the
 upstream it stays on and, if no slot frees in time, moves on to the next one,
 where its cache starts over. A new conversation skips a full upstream at once.
 When every candidate is full, the request waits for whichever frees first; if
@@ -1018,7 +1020,7 @@ busy.
 | `rate_limit_max_pause_secs` | integer | `3600` | A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason. |
 | `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
 | `next_on_slow_start` | bool | `false` | When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5. |
-| `slot_wait_secs` | integer | `30` | Seconds a request waits in total for a free slot on upstreams that are at their `max_concurrent`. After that it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300. |
+| `slot_wait_secs` | integer | `30` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for a free slot on upstreams at their `max_concurrent`. A key limit that does not free up in time refuses the request; without an upstream slot in time it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300. |
 <!-- /generated -->
 
 ### `aliases`
@@ -1066,7 +1068,7 @@ group with `to`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the group; unique, and not the name of an upstream. |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price. |
 | `providers` | list of strings or [`groups[].providers[]`](#cfg-groups-providers) | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`. |
 | `selected` | string | — | For `select`: the chosen member. |
 | `balance_by` | `weights` \| `latency` \| `health` \| `latency-health` | `weights` | For `load-balance`: what the members' weights are multiplied by. `weights`: nothing; the weights alone. `latency`: faster upstreams get more. `health`: upstreams that fail less get more. `latency-health`: both. Other group types take only `weights`. |
@@ -1081,9 +1083,9 @@ requests are shared out: with `{ name: anthropic, weight: 7 }` and `relay`,
 the official API serves seven requests in ten. Conversations in progress
 stay on the upstream that answers them (see below) and count toward its
 share, so the balance is kept by where new conversations start. An upstream
-that is cooling down after failures, or cannot serve a request, sits that
-request out, and the others share it by their weights. Other group types take
-no weights.
+that is cooling down after failures, is at its `max_concurrent`, or cannot
+serve a request, sits that request out, and the others share it by their
+weights. Other group types take no weights.
 
 <!-- generated: table groups[].providers[] -->
 <a id="cfg-groups-providers"></a>
@@ -1122,9 +1124,10 @@ group shares out requests by the result in the same way as above.
 
 - `weights` (the default): the weights alone.
 - `latency`: faster upstreams get a larger share. Speed is the typical time
-  to first byte, the same measurement `url-test` uses. An upstream twice as
-  fast as the middle of the group has its weight multiplied by four, by at
-  most ten and at least a tenth.
+  from sending a request to the first content of the answer, the same
+  measurement `url-test` uses. An upstream twice as fast as the middle of the
+  group has its weight multiplied by four, by at most ten and at least a
+  tenth.
 - `health`: upstreams that fail less get a larger share. It looks at the
   last 50 requests within the past 30 minutes. Server errors, rate limits,
   used-up quota or balance, rejected credentials, timeouts and connection
@@ -1136,6 +1139,11 @@ group shares out requests by the result in the same way as above.
   is noticed; one that fails outright is set aside by
   [`failover`](#cfg-failover) as before.
 - `latency-health`: both factors, multiplied.
+
+Speed is measured on streamed answers only, from the moment the request is
+sent to that upstream, so waiting and upstreams that failed before it do not
+count. An upstream given up on because its stream was slow to start
+(`failover.next_on_slow_start`) counts as taking the whole wait.
 
 An upstream without enough measurements yet counts as average. As with
 weights alone, conversations in progress stay where they are, and new

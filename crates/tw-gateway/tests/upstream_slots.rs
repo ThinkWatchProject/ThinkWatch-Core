@@ -190,7 +190,10 @@ impl Log {
 }
 
 async fn serve(cfg: tw_config::Config) -> (SocketAddr, tw_gateway::AppState, Log) {
-    let state = tw_gateway::AppState::new(cfg).unwrap();
+    serve_state(tw_gateway::AppState::new(cfg).unwrap()).await
+}
+
+async fn serve_state(state: tw_gateway::AppState) -> (SocketAddr, tw_gateway::AppState, Log) {
     let mut rx = state.bus.subscribe();
     let log = Log(Arc::default());
     let into = log.0.clone();
@@ -615,4 +618,99 @@ async fn a_keys_limit_holds_until_the_streamed_answer_ends() {
         .expect("前一条流走完了，第二个还在等")
         .unwrap();
     assert_eq!(st, 200);
+}
+
+/// `load-balance` 组里满着的那一家不参加这一轮：轮到它的话它被当场跳过，这一份却记在它头上，
+/// 它答得越多越满、越满越被记空账，拿到的比它的权重少
+#[tokio::test]
+async fn a_full_member_of_a_load_balance_group_sits_its_turns_out() {
+    let (a, b) = (upstream().await, upstream().await);
+    let mut cfg = config(&a, &b, (Some(1), None), 5);
+    cfg.groups[0].kind = tw_engine::GroupType::LoadBalance;
+    cfg.default_route = Some("默认".into());
+    let (gw, state, log) = serve(cfg).await;
+    let group = state.runtime().engine.groups()[0].clone();
+    // 头一个轮到甲，占着它的那个位置
+    let held = hold(gw, &log, "占着").await;
+    assert_eq!(a.hits(), 1);
+    let before = state.balance.peek(&group);
+
+    // 甲满着的时候，每个新对话都排给乙：没有一个先轮到甲、再被跳过
+    for i in 0..4 {
+        let model = format!("新的{i}");
+        let st = ask(gw, &model, None, &format!("[{}]", user(&model)), false)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(st, 200);
+        let (chain, _) = log.routed(&model).await;
+        assert_eq!(chain.len(), 1, "轮到了满着的甲：{chain:#?}");
+        assert_eq!(chain[0].provider, "乙");
+    }
+    assert_eq!(
+        state.balance.peek(&group).get("甲"),
+        before.get("甲"),
+        "满着的甲被记了账"
+    );
+    a.release();
+    held.await.unwrap();
+}
+
+/// 用量上限看的时钟：跟着真实时间走，还能往后拨
+struct Ahead(std::sync::atomic::AtomicI64);
+
+impl tw_gateway::key_limits::Clock for Ahead {
+    fn now_ms(&self) -> i64 {
+        tw_gateway::key_limits::SystemClock.now_ms() + self.0.load(Ordering::SeqCst)
+    }
+    fn period(&self, per: tw_config::LimitPer, at_ms: i64) -> (i64, i64) {
+        tw_gateway::key_limits::SystemClock.period(per, at_ms)
+    }
+    fn show(&self, at_ms: i64) -> String {
+        tw_gateway::key_limits::SystemClock.show(at_ms)
+    }
+}
+
+/// 一个请求只有一段可等的时间：等密钥的分钟上限用掉的，等上游空位时就少等那么久。两段各给
+/// 一份的话，这个请求要等两倍那么久才收到 429
+#[tokio::test]
+async fn the_key_limit_wait_and_the_slot_wait_share_one_budget() {
+    use tw_gateway::key_limits::Clock as _;
+    let (a, b) = (upstream().await, upstream().await);
+    let mut cfg = config(&a, &b, (Some(1), Some(1)), 2);
+    cfg.clients[0].limits = serde_yaml_ng::from_str("[{per: minute, requests: 2}]").unwrap();
+    let mut state = tw_gateway::AppState::new(cfg).unwrap();
+    let clock = Arc::new(Ahead(Default::default()));
+    state.set_key_limits_clock(clock.clone());
+    let (gw, _state, log) = serve_state(state).await;
+    let _on_a = hold(gw, &log, "占着甲").await;
+    let _on_b = hold(gw, &log, "占着乙").await;
+    // 拨到第一个请求之后 59 秒：这一分钟的两个用满了，第一个再过不到一秒滑出去
+    clock.0.store(59_000, Ordering::SeqCst);
+    assert!(clock.now_ms() > 0);
+
+    let t = std::time::Instant::now();
+    let r = ask(gw, "挤不进", None, &format!("[{}]", user("你好")), false)
+        .send()
+        .await
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(r.status(), 429);
+    let id = log.id("挤不进").await;
+    let code = log
+        .until("失败", |evs| {
+            evs.iter().find_map(|e| match e {
+                Event::RequestFailed { id: i, message, .. } if *i == id => {
+                    Some(message.code.clone())
+                }
+                _ => None,
+            })
+        })
+        .await;
+    assert_eq!(code, "gw.busy_all", "该是等过了分钟上限、再等上游的空位");
+    assert!(
+        took >= Duration::from_millis(1_800) && took < Duration::from_millis(2_500),
+        "等了 {took:?}：两段该共用 2 秒"
+    );
 }

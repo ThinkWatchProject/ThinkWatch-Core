@@ -9,9 +9,9 @@
 //! 此刻内存里的是同一份数。
 //!
 //! **怎么拒、怎么等。**天、周、月是自然周期：用满了就拒，到下一期之前重试也没用。分钟、
-//! 小时是滚动窗口：用满了先看下一个空位多久之后空出来，等得到（不超过 `slot_wait_secs`）
-//! 就等，等不到就拒，并说清楚多久之后再来。顺序见 [`crate::server`] 的管线第 3 步：自然
-//! 周期 → 并发上限 → 滚动窗口。
+//! 小时是滚动窗口：用满了先看下一个空位多久之后空出来，等得到（在这个请求的等待期限之前，
+//! 期限见 [`slot_wait`]）就等，等不到就拒，并说清楚多久之后再来。顺序见 [`crate::server`]
+//! 的管线第 3 步：自然周期 → 并发上限 → 滚动窗口。
 //!
 //! **在跑的怎么算。**准入时按输入估一个数占着（预留：输入 token 的估算，和按头一个候选算
 //! 的输入费用），存储层记下那一行时换成实数。几个请求同时进来时，超出上限的最多是在跑的
@@ -59,11 +59,11 @@ const NOT_ADMITTED: &[&str] = &[
 /// 一次，窗口就往后推一次，永远等不到空位
 const REFUSED: &str = "gw.key_limit.";
 
-/// 等滚动窗口空位最多等多久：`failover.slot_wait_secs`，和等上游空位（`crate::slots`）
-/// 同一个设置，0 是不等。
+/// 一个请求最多等多久：`failover.slot_wait_secs`，0 是不等。
 ///
-/// **两段各算各的**：这一段在准入时、发给哪一家之前，等上游空位在之后的那几跳里。一个请求
-/// 两样都碰上的话，最多等两倍
+/// **一个请求合起来算**：等滚动窗口的空位在准入时、发给哪一家之前，等上游空位
+/// （`crate::slots`）在之后的那几跳里，两段共用准入时定下的同一个期限（见
+/// `server::pipeline::admission`）。各给一份的话，两样都碰上的请求能等两倍那么久
 pub fn slot_wait(cfg: &tw_config::Config) -> Duration {
     Duration::from_secs(cfg.failover.slot_wait_secs)
 }
@@ -468,10 +468,8 @@ impl KeyLimits {
         out
     }
 
-    /// 准入第三步：分钟、小时的上限。用满了先等下一个空位，最多等 `wait`；等不到就拒，
-    /// 带着多久之后能再来。**过了就记上**：这个请求算进滚动窗口，输入的估算占上预留。
-    ///
-    /// 天、周、月在这里再看一遍：等并发名额、等空位的那一阵，别的请求可能把它用满了。
+    /// 准入第三步，从此刻起最多等 `wait`（见 [`Self::admit_by`]）。WebSocket 的连接用它：
+    /// 那条路之后不再等上游的空位，这一段就是全部
     pub async fn admit(
         self: &Arc<Self>,
         key: &str,
@@ -479,10 +477,25 @@ impl KeyLimits {
         ask: Ask,
         wait: Duration,
     ) -> Result<Hold, Box<Refusal>> {
+        self.admit_by(key, limits, ask, tokio::time::Instant::now() + wait)
+            .await
+    }
+
+    /// 准入第三步：分钟、小时的上限。用满了先等下一个空位，最多等到 `until`（这个请求的
+    /// 等待期限，见 [`slot_wait`]）；等不到就拒，带着多久之后能再来。**过了就记上**：这个
+    /// 请求算进滚动窗口，输入的估算占上预留。
+    ///
+    /// 天、周、月在这里再看一遍：等并发名额、等空位的那一阵，别的请求可能把它用满了。
+    pub async fn admit_by(
+        self: &Arc<Self>,
+        key: &str,
+        limits: &[KeyLimit],
+        ask: Ask,
+        until: tokio::time::Instant,
+    ) -> Result<Hold, Box<Refusal>> {
         if limits.is_empty() {
             return Ok(Hold::none());
         }
-        let deadline = self.clock.now_ms() + wait.as_millis() as i64;
         loop {
             let now = self.clock.now_ms();
             let step = {
@@ -511,8 +524,9 @@ impl KeyLimits {
                     r
                 }
             };
-            // 滚动窗口：空位在等得到的时候空出来就等，等不到就拒
-            if refusal.resets.is_some() || now + refusal.retry_after_ms as i64 > deadline {
+            // 滚动窗口：空位在期限之前空出来就等，等不到就拒
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            if refusal.resets.is_some() || u128::from(refusal.retry_after_ms) > left.as_millis() {
                 return Err(refusal);
             }
             tokio::time::sleep(Duration::from_millis(refusal.retry_after_ms)).await;

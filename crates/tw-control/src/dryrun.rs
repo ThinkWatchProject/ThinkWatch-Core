@@ -50,8 +50,8 @@ fn order_like_the_data_plane(
     }
 }
 
-/// 一家候选的排序依据：典型首字节时间、最近的成功率、按它们算出的系数。**只给顺序
-/// 真用到的那几样**（[`runtime_facts`] 只取用得上的）—— `url-test` 看首字节时间；
+/// 一家候选的排序依据：典型的快慢（从发出去到回答的第一段内容）、最近的成功率、按它们算出
+/// 的系数。**只给顺序真用到的那几样**（[`runtime_facts`] 只取用得上的）—— `url-test` 看快慢；
 /// `load-balance` 按 `balance_by` 看快慢、成败，系数乘在权重上。用不着的、没有样本的
 /// 是 None。
 struct Basis {
@@ -325,7 +325,7 @@ pub async fn dry_run(
             // `load-balance` 的候选带上各自的权重：排头的为什么是它，一半在这个数里
             let balanced = group.filter(|g| g.kind == tw_engine::GroupType::LoadBalance);
             // 每一家收到的模型名，和为什么不是请求里写的那个；顺序看运行时数字的，再加上
-            // 每一家的那几个数字（权重、首字节时间、成功率、系数）—— 「为什么轮到它」
+            // 每一家的那几个数字（权重、快慢、成功率、系数）—— 「为什么轮到它」
             // 要能从这里看出来
             let mut basis_of = bases(&d, runtime.as_ref());
             out.candidate_models = out

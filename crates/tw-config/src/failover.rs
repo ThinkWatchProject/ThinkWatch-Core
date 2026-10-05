@@ -43,9 +43,10 @@ pub struct Failover {
     /// 输出的模型开头本来就慢，开着时要把等待调长
     #[serde(default)]
     pub next_on_slow_start: bool,
-    /// 上游的并发数满了（`providers[].max_concurrent`）时，一个请求最多等多少秒空位，
-    /// **整个请求合起来算**。留在那一家的对话等它空出来，候选都满了时等先空出来的那一家；
-    /// 等不到的换下一家，或者回 429。0 是不等
+    /// 一个请求最多等多少秒，**整个请求合起来算**：准入时等密钥的分钟、小时上限空出名额，
+    /// 之后上游的并发数满了（`providers[].max_concurrent`）时等空位，共用这一段。留在那一家
+    /// 的对话等它空出来，候选都满了时等先空出来的那一家；等不到的换下一家，或者回 429。
+    /// 0 是不等
     #[serde(default = "d_slot_wait_secs")]
     pub slot_wait_secs: u64,
 }

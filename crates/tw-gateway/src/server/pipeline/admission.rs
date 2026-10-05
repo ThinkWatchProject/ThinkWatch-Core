@@ -5,9 +5,14 @@
 //! 1. 天、周、月的上限（[`crate::key_limits`]）—— 这一期用满了直接拒：到下一期之前等多久
 //!    都一样，不用先排一轮并发的队；
 //! 2. 并发上限（[`crate::limits`]）—— 等，不拒，理由在那儿；
-//! 3. 分钟、小时的上限 —— 下一个空位在 `slot_wait_secs` 之内空出来就等，等不到就拒，并说清
-//!    多久之后再来。过了就把这个请求记上，按输入估一个数占着，等存储层记下它那一行时换成
-//!    实数。
+//! 3. 分钟、小时的上限 —— 下一个空位在这个请求的等待期限之前空出来就等，等不到就拒，并
+//!    说清多久之后再来。过了就把这个请求记上，按输入估一个数占着，等存储层记下它那一行时
+//!    换成实数。
+//!
+//! **等待期限一个请求只有一个**：过了并发上限那一刻起算 `failover.slot_wait_secs`，这里等
+//! 滚动窗口的空位、之后等上游的空位（见 `hop`）都算在里面 —— 两段各给一份的话，一个请求能
+//! 等两倍那么久，而等的时候客户端一个字节都收不到。并发上限那一段不算：它等前面的请求结束，
+//! 不拒绝，等多久由客户端决定（见 [`crate::limits`]）。
 //!
 //! 被上限拒绝的请求**照样开始、照样留一行**（和路由拒绝的一样，见
 //! [`crate::server::routed_nowhere`]）：流量里看得见它被哪一条上限拒了。数 token 的请求
@@ -25,6 +30,8 @@ pub(super) struct Admitted {
     pub(super) pass: crate::limits::Pass,
     /// 用量上限的预留。开始事件之后交给请求号（[`Hold::bind`]），丢掉就放掉
     pub(super) hold: Hold,
+    /// 这个请求最多等到什么时候。这一步等滚动窗口用掉的，之后等上游空位就少等那么久
+    pub(super) wait_until: tokio::time::Instant,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48,18 +55,23 @@ pub(super) async fn admit(
         return Err(refused(state, rt, req, reading, choice, fp, ending, &r));
     }
     let pass = state.gate.acquire(&req.client_name, max_concurrent).await;
+    // 等待期限从这里起算：之后的两段等待共用它
+    let wait_until = tokio::time::Instant::now() + crate::key_limits::slot_wait(&rt.config);
     let ask = if limits.is_empty() {
         Ask::default()
     } else {
         ask(state, rt, reading, decision, limits)
     };
-    let wait = crate::key_limits::slot_wait(&rt.config);
     match state
         .key_limits
-        .admit(&req.client_name, limits, ask, wait)
+        .admit_by(&req.client_name, limits, ask, wait_until)
         .await
     {
-        Ok(hold) => Ok(Admitted { pass, hold }),
+        Ok(hold) => Ok(Admitted {
+            pass,
+            hold,
+            wait_until,
+        }),
         Err(r) => Err(refused(state, rt, req, reading, choice, fp, ending, &r)),
     }
 }

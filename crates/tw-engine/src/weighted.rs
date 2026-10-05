@@ -172,8 +172,10 @@ pub(crate) mod members {
 /// 和试算列出来的那一份一样；算完再去掉停着的。
 ///
 /// **停着的不算**（[`Facts::paused`]）：熔断、冷却着的那一家这一次本来就会被跳过，
-/// 轮到它的那一次落到组里排在它后面的那一家，那一家就平白多拿一份。全都停着时都算
-/// —— 那时网关照样一家家试（fail-open），排头的还是按权重来。
+/// 轮到它的那一次落到组里排在它后面的那一家，那一家就平白多拿一份。**并发数满着的也
+/// 不算**（[`Facts::busy`]）：网关当场跳过它，这一份记在它头上的话，它答得越多越满、
+/// 越满越被记空账，拿到的比它的权重少。停着的、满着的加起来是全部时都算 —— 那时网关
+/// 照样一家家试（fail-open）、等先空出来的那一家，排头的还是按权重来。
 fn round<'a>(g: &Group, members: &'a [String], f: &Facts) -> Vec<(&'a str, i64)> {
     let factors = balance_factors(g.balance_by, members, f);
     let all: Vec<(&'a str, i64)> = members
@@ -184,7 +186,7 @@ fn round<'a>(g: &Group, members: &'a [String], f: &Facts) -> Vec<(&'a str, i64)>
     let up: Vec<(&'a str, i64)> = all
         .iter()
         .copied()
-        .filter(|(m, _)| !f.paused.contains(*m))
+        .filter(|(m, _)| !f.paused.contains(*m) && !f.busy.contains(*m))
         .collect();
     if up.is_empty() { all } else { up }
 }
@@ -319,6 +321,34 @@ mod tests {
         assert_eq!(f.current_weight.get("乙").copied(), before);
     }
 
+    /// 并发数满着的同样不参加，当前权重也不动：空出来之后接着按权重轮，不欠也不多。
+    /// 满着的和停着的加起来是全部时都参加
+    #[test]
+    fn busy_members_sit_out_unless_every_member_is_busy_or_paused() {
+        let g = group(&[("甲", 1), ("乙", 1), ("丙", 1)]);
+        let mut f = Facts {
+            busy: ["甲".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run(&g, &names(&g), &mut f, 4),
+            ["乙", "丙", "乙", "丙"],
+            "满着的那一家轮不到，没答的不记在它头上"
+        );
+        assert_eq!(f.current_weight.get("甲"), None, "满着的不记账");
+        // 空出来了：从它没欠账的样子接着轮
+        f.busy.clear();
+        let got = run(&g, &names(&g), &mut f, 30);
+        assert_eq!(got.iter().filter(|m| *m == "甲").count(), 10, "{got:?}");
+
+        let mut f = Facts {
+            busy: ["甲".to_string(), "乙".to_string()].into_iter().collect(),
+            paused: ["丙".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(run(&g, &names(&g), &mut f, 3), ["甲", "乙", "丙"]);
+    }
+
     /// 停着的（熔断、冷却）同样不参加；全都停着时都参加
     #[test]
     fn paused_members_sit_out_unless_every_member_is_paused() {
@@ -431,7 +461,7 @@ mod tests {
         assert_eq!(effective(1, 1e-9), 1);
     }
 
-    /// 按快慢分：首字节快的那一家分到的新对话多。一整圈（有效权重之和那么多次）下来，
+    /// 按快慢分：第一段内容来得快的那一家分到的新对话多。一整圈（有效权重之和那么多次）下来，
     /// 各家排头的次数正好是各自的有效权重，当前权重回到零
     #[test]
     fn latency_gives_the_faster_member_more_new_conversations() {
@@ -498,7 +528,7 @@ mod tests {
     fn equal_factors_keep_the_exact_interleaving() {
         let want = ["甲", "乙", "甲", "甲", "甲", "乙", "甲", "甲", "乙", "甲"];
         let cases = [
-            // 首字节一样：系数都是 1
+            // 一样快：系数都是 1
             Facts {
                 ttfb_ms: ttfb(&[("甲", 200), ("乙", 200)]),
                 ..Default::default()
