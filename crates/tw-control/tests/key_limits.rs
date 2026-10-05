@@ -57,15 +57,20 @@ struct Bed {
 
 /// `db`：上一次运行留下的请求记录（重启）；没有就是一个空库
 fn bed(db: Option<tw_store::Db>) -> Bed {
+    bed_with(
+        db,
+        Arc::new(tw_gateway::key_limits::TestClock::new(ms(NOON), 8 * 3600)),
+    )
+}
+
+/// [`bed`]，用量上限看的是 `clock`
+fn bed_with(db: Option<tw_store::Db>, clock: Arc<dyn tw_gateway::key_limits::Clock>) -> Bed {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
     std::fs::write(&p, CONFIG).unwrap();
     let cfg = tw_config::try_parse(CONFIG).unwrap();
     let mut gw = tw_gateway::AppState::new(cfg).unwrap();
-    gw.set_key_limits_clock(Arc::new(tw_gateway::key_limits::TestClock::new(
-        ms(NOON),
-        8 * 3600,
-    )));
+    gw.set_key_limits_clock(clock);
     let db = db.unwrap_or_else(|| tw_store::Db::in_memory().unwrap());
     // 重启：第一个请求之前把这一期加回来，和 twcore 起来时一样
     tw_control::key_limits::rebuild(&gw, &db);
@@ -504,4 +509,81 @@ async fn a_request_that_never_reached_an_upstream_does_not_count() {
     let b = bed(Some(tw_store::Db::open(&file).unwrap()));
     let list = keys(&b).await;
     assert_eq!(key(&list, "plain")["limits"][0]["used"], 2);
+}
+
+/// 换得了时区的时钟：东八区和西五区各一只测试时钟，按开关取一只。此刻是同一刻
+struct Moving {
+    east: tw_gateway::key_limits::TestClock,
+    west: tw_gateway::key_limits::TestClock,
+    moved: std::sync::atomic::AtomicBool,
+}
+
+impl Moving {
+    fn now(&self) -> &tw_gateway::key_limits::TestClock {
+        if self.moved.load(std::sync::atomic::Ordering::SeqCst) {
+            &self.west
+        } else {
+            &self.east
+        }
+    }
+}
+
+impl tw_gateway::key_limits::Clock for Moving {
+    fn now_ms(&self) -> i64 {
+        self.now().now_ms()
+    }
+    fn period(&self, per: tw_config::LimitPer, at_ms: i64) -> (i64, i64) {
+        self.now().period(per, at_ms)
+    }
+    fn show(&self, at_ms: i64) -> String {
+        self.now().show(at_ms)
+    }
+}
+
+/// 机器换了时区：这一天的开头跟着变了。**这一天的数从请求记录里重新加起来**，不是从 0 起 ——
+/// 从 0 起的话，换一次时区就能把今天花掉的钱一笔勾销。东八区的 10 月 5 日上午换到西五区，
+/// 「今天」成了 10 月 4 日（西五区），从东八区 10 月 4 日 13:00 起：前一晚那一个请求也在里面
+#[tokio::test]
+async fn a_time_zone_change_adds_the_new_day_up_again_from_the_records() {
+    use tw_gateway::key_limits::Clock as _;
+    let clock = Arc::new(Moving {
+        east: tw_gateway::key_limits::TestClock::new(ms(NOON), 8 * 3600),
+        west: tw_gateway::key_limits::TestClock::new(ms(NOON), -5 * 3600),
+        moved: Default::default(),
+    });
+    let b = bed_with(None, clock.clone());
+    tw_control::key_limits::follow(&b.gw, b.rec.clone());
+    let events = [
+        request(1, "plain", ms("2026-10-04T23:00:00+08:00"), 10),
+        request(2, "plain", ms("2026-10-05T09:00:00+08:00"), 10),
+        request(3, "plain", ms("2026-10-05T10:00:00+08:00"), 10),
+    ];
+    for e in events.iter().flatten() {
+        b.rec.lock().await.on_event(e);
+    }
+    let limits: Vec<tw_config::KeyLimit> =
+        serde_yaml_ng::from_str("[{per: day, requests: 100}]").unwrap();
+    let used = |b: &Bed| b.gw.key_limits.view("plain", &limits)[0].used;
+    assert_eq!(used(&b), 2, "东八区的今天");
+    clock.moved.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        clock.period(tw_config::LimitPer::Day, clock.now_ms()).0,
+        ms("2026-10-04T00:00:00-05:00")
+    );
+    // 第一次看到这一期变了就去读；读回来之前可能还是 0
+    let _ = used(&b);
+    let mut seen = 0;
+    for _ in 0..100 {
+        seen = used(&b);
+        if seen == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen, 3, "西五区的今天：三个请求都在里面");
+    // 之后照常结算
+    for e in request(4, "plain", ms(NOON), 10) {
+        b.rec.lock().await.on_event(&e);
+    }
+    assert_eq!(used(&b), 4);
 }

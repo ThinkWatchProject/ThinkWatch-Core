@@ -828,6 +828,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
             // 密钥的用量上限：这一天、这一周、这个月已经用了多少，从记录里加回来。**在第一个
             // 请求之前**（网关还没开始听）
             tw_control::key_limits::rebuild(&state, rec.lock().await.db());
+            // 之后一期的开头变了（到了下一期、换了时区），从记录里把新的那一期加起来
+            tw_control::key_limits::follow(&state, rec.clone());
         }
 
         /*

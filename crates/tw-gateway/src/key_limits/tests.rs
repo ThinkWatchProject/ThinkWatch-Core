@@ -494,6 +494,110 @@ async fn a_restart_adds_the_periods_back_from_the_store() {
     assert_eq!(b.alerts(), [(150_000, true)]);
 }
 
+/// 换得了时区的时钟：东八区和西五区各一只，按开关取一只。此刻是同一刻
+struct Moving {
+    east: TestClock,
+    west: TestClock,
+    moved: std::sync::atomic::AtomicBool,
+}
+
+impl Moving {
+    fn now(&self) -> &TestClock {
+        if self.moved.load(std::sync::atomic::Ordering::SeqCst) {
+            &self.west
+        } else {
+            &self.east
+        }
+    }
+}
+
+impl Clock for Moving {
+    fn now_ms(&self) -> i64 {
+        self.now().now_ms()
+    }
+    fn period(&self, per: LimitPer, at_ms: i64) -> (i64, i64) {
+        self.now().period(per, at_ms)
+    }
+    fn show(&self, at_ms: i64) -> String {
+        self.now().show(at_ms)
+    }
+}
+
+/// 一期的开头变了（机器换了时区）：去请求记录里把新的这一期重新加起来，**一期只要一次** ——
+/// 读回来之前来的请求看到的都是同一个开头，不该每个都去库里查一遍。读回来的数换上去；读回来
+/// 时这一期的开头又变了的，不换
+#[tokio::test(start_paused = true)]
+async fn a_period_whose_start_moved_is_read_back_once() {
+    let now = at("2026-10-05T10:00:00+08:00");
+    let clock = Arc::new(Moving {
+        east: TestClock::new(now, CST),
+        west: TestClock::new(now, -5 * 3600),
+        moved: Default::default(),
+    });
+    let limits = Arc::new(KeyLimits::with_clock(
+        tw_observe::EventBus::new(),
+        clock.clone(),
+    ));
+    let set = parse("[{per: day, requests: 100}]");
+    limits.configure(&tw_config::Config {
+        clients: vec![tw_config::Client {
+            name: "k".into(),
+            key: "tw-k".into(),
+            limits: set.clone(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let asked: Arc<Mutex<Vec<Moved>>> = Arc::default();
+    let into = asked.clone();
+    limits.reread_with(Arc::new(move |m| into.lock().unwrap().push(m)));
+    let used = || limits.view("k", &set)[0].used;
+    for id in 1..=2 {
+        limits.settle(id, now, &row(1, 1, 0, 0));
+    }
+    assert_eq!(used(), 2);
+    assert!(asked.lock().unwrap().is_empty(), "开头没变，不读");
+
+    clock.moved.store(true, std::sync::atomic::Ordering::SeqCst);
+    let west_day = at("2026-10-04T00:00:00-05:00");
+    for _ in 0..3 {
+        used();
+        limits.calendar("k", &set).unwrap();
+    }
+    limits.settle(3, now, &row(1, 1, 0, 0));
+    // 天、周、月的开头都跟着时区变了：各要一次
+    let moved = asked.lock().unwrap().clone();
+    let starts: Vec<(LimitPer, i64)> = moved.iter().map(|m| (m.per, m.start)).collect();
+    assert_eq!(
+        starts,
+        [
+            (LimitPer::Day, west_day),
+            (LimitPer::Week, at("2026-09-28T00:00:00-05:00")),
+            (LimitPer::Month, at("2026-10-01T00:00:00-05:00")),
+        ],
+        "一期只要一次"
+    );
+    assert!(moved.iter().all(|m| m.key == "k"));
+    // 读回来之前：从 0 起，之后结算的照记
+    assert_eq!(used(), 1);
+    // 读回来了：西五区的今天有五个（刚结算的那一个已经在库里），别的密钥的不算
+    let mut rows: Vec<Recorded> = (0..5).map(|_| row(1, 1, 0, 0)).collect();
+    let mut other = row(1, 1, 0, 0);
+    other.client = "别的".into();
+    rows.push(other);
+    limits.reread(&moved[0], &rows);
+    assert_eq!(used(), 5);
+    // 读回来的时候开头又变了：那是另一期，不换
+    clock
+        .moved
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let before = used();
+    limits.reread(&moved[0], &rows[..1]);
+    assert_eq!(used(), before, "旧的那一期读回来的数换到了新的这一期上");
+    // 换回来：看过的这一期（天）又是新的开头，再要一次。周、月等下一次结算碰到时再要
+    assert_eq!(asked.lock().unwrap().len(), 4);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_renamed_key_keeps_what_it_used() {
     let b = bed("2026-10-05T10:00:00+08:00", "[{per: day, requests: 3}]");

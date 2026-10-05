@@ -333,7 +333,9 @@ When one is used up, a request waits for the next free slot if it frees
 within `failover.slot_wait_secs` (30 seconds by default), and is refused
 otherwise. Any later wait for a busy upstream comes out of the same time.
 `day`, `week` and `month` follow the calendar in the time zone of the machine
-twcore runs on and start again at midnight, on Monday and on the 1st. When one is used up, requests are refused until it starts again.
+twcore runs on and start again at midnight, on Monday and on the 1st. When one is used up, requests are refused until it starts again. If the
+machine's time zone changes, the current day, week and month are added up
+again from the request records.
 
 A refused request gets HTTP 429 in the client's own error format, naming the
 key, the limit, the amount used and when it resets, and it shows in the

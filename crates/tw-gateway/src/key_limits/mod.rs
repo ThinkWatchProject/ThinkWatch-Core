@@ -20,7 +20,9 @@
 //! 那些。
 //!
 //! **什么时候算到哪一期。**天、周、月按请求开始的时刻（那一行的 `at_ms`）归期，和从库里
-//! 加回来时同一个口径。滚动窗口里请求数记在准入的那一刻，token 和费用记在结算的那一刻：
+//! 加回来时同一个口径。**一期的开头变了**（到了下一期，或者机器换了时区）就从请求记录里把
+//! 新的这一期重新加起来（[`KeyLimits::reread_with`]），不从 0 起 —— 从 0 起的话，换一次时区
+//! 就把今天花掉的一笔勾销。滚动窗口里请求数记在准入的那一刻，token 和费用记在结算的那一刻：
 //! 一个跑了三分钟的请求，它的输出要等它跑完才知道，按开始的时刻记的话，「每分钟多少
 //! token」永远数不到它。
 
@@ -109,16 +111,24 @@ struct Books {
     /// 滚动窗口用：最近的每一笔（请求数在准入时，token 和费用在结算时），按记下的先后。
     /// **只有设了分钟、小时上限的密钥才记**，留到最长的那个窗口为止
     recent: VecDeque<(i64, Amount)>,
+    /// 开头变了、换了一本新的那几期（哪一种、新的开头），等着从请求记录里重新加（见
+    /// [`KeyLimits::reread_with`]）
+    moved: Vec<(LimitPer, i64)>,
 }
 
 impl Books {
-    /// `now` 所在的那一期。到了下一期就从 0 起
+    /// `now` 所在的那一期。开头和记着的不一样（到了下一期、换了时区）就换一本新的，记下它
+    /// 要从请求记录里重新加；加回来之前先从 0 起。这把密钥从没记过这一种的，从 0 起就是对的
+    /// —— 启动时从库里加回来过（[`KeyLimits::rebuild`]），之后的每一行都结算过
     fn period(&mut self, clock: &dyn Clock, per: LimitPer, now: i64) -> &mut Period {
         let (start, end) = clock.period(per, now);
         let slot = &mut self.periods[calendar_index(per)];
         match slot {
             Some(p) if p.start == start => {}
             _ => {
+                if slot.is_some() {
+                    self.moved.push((per, start));
+                }
                 *slot = Some(Period {
                     start,
                     end,
@@ -129,6 +139,19 @@ impl Books {
         slot.as_mut().expect("set just above")
     }
 }
+
+/// 开头变了的一期：哪把密钥、哪一种、新的开头。从请求记录里重新加它（[`KeyLimits::reread_with`]）
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Moved {
+    pub key: String,
+    pub per: LimitPer,
+    /// 这一期的开头，Unix 毫秒：从这一刻起记下的都算进来
+    pub start: i64,
+}
+
+/// 从请求记录里重新加一期的办法（[`KeyLimits::reread_with`]）。拿到要加的那一期，读完了交给
+/// [`KeyLimits::reread`]
+pub type Reread = Arc<dyn Fn(Moved) + Send + Sync>;
 
 fn calendar_index(per: LimitPer) -> usize {
     CALENDAR.iter().position(|p| *p == per).unwrap_or(0)
@@ -174,6 +197,9 @@ struct Inner {
     /// 此刻配置里每把密钥的上限。结算时用：要不要记滚动窗口、报不报到了八成
     limits: HashMap<String, Vec<KeyLimit>>,
     told: HashSet<Told>,
+    /// 已经要过、还没读回来的几期。**一期只要一次**：读回来之前每个请求都会看到同一个开头，
+    /// 不该每个请求去库里查一遍
+    asked: HashSet<Moved>,
 }
 
 /// 准入时一个请求要占的：输入 token 的估算，和按头一个候选算的输入费用。
@@ -366,6 +392,9 @@ impl Drop for Hold {
 pub struct KeyLimits {
     inner: Mutex<Inner>,
     clock: Arc<dyn Clock>,
+    /// 一期的开头变了时从请求记录里重新加（[`Self::reread_with`]）。没接上（没有存储层）是 None：
+    /// 那时从 0 起
+    reread: Mutex<Option<Reread>>,
     /// 报「到了八成、到了上限」，和认请求有没有结束（见 [`GRACE_MS`]）
     bus: tw_observe::EventBus,
 }
@@ -379,7 +408,80 @@ impl KeyLimits {
         Self {
             inner: Mutex::default(),
             clock,
+            reread: Mutex::default(),
             bus,
+        }
+    }
+
+    /// 接上请求记录：一期的开头变了（到了下一期、机器换了时区）时，用 `f` 把新的这一期
+    /// 从记录里重新加起来，加好了交回 [`Self::reread`]。
+    ///
+    /// **`f` 在锁外面调，不该等**：它去读库，读完了再交回来（`tw_control::key_limits::follow`
+    /// 起一个任务做这件事）。读回来之前这一期先从 0 起，同一期只要一次
+    pub fn reread_with(&self, f: Reread) {
+        *self.reread.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// 读回来了：`rows` 是从 `m.start` 起记下的那些（存储层的 `key_usage_since`，各把密钥的都
+    /// 在里面），这一期的数换成它们加起来的。**这一期的开头又变了的话不换**：那是另一期了，
+    /// 它自己会再要一次。
+    ///
+    /// 调用方要保证读的时候没有结算在进行（存储层在同一把锁里记下一行、结算、读库）：读到的
+    /// 就是此刻结算过的全部，换上去一行不多、一行不少。到了八成、到了顶不报，和启动时加回来
+    /// 一样 —— 前一期多半报过同一件事
+    pub fn reread(&self, m: &Moved, rows: &[Recorded]) {
+        let now = self.clock.now_ms();
+        let mut sum = Amount::default();
+        for r in rows.iter().filter(|r| r.client == m.key && r.counts()) {
+            sum.add(&r.amount());
+        }
+        let mut g = self.lock();
+        g.asked.remove(m);
+        let Some(p) = g
+            .books
+            .get_mut(&m.key)
+            .and_then(|b| b.periods[calendar_index(m.per)].as_mut())
+            .filter(|p| p.start == m.start)
+        else {
+            return;
+        };
+        p.sum = sum;
+        let _ = self.alerts(&mut g, &m.key, now);
+    }
+
+    /// 这把密钥刚换了新的那几期（[`Books::moved`]）里还没要过的：记下要过了，交回去，**在锁外面**
+    /// 交给 [`Self::ask_reread`]
+    fn moved(&self, g: &mut Inner, key: &str) -> Vec<Moved> {
+        let Some(b) = g.books.get_mut(key) else {
+            return Vec::new();
+        };
+        let moved: Vec<Moved> = std::mem::take(&mut b.moved)
+            .into_iter()
+            .map(|(per, start)| Moved {
+                key: key.to_string(),
+                per,
+                start,
+            })
+            .collect();
+        moved
+            .into_iter()
+            .filter(|m| g.asked.insert(m.clone()))
+            .collect()
+    }
+
+    /// 去请求记录里重新加这几期。没接上记录的，从 0 起
+    fn ask_reread(&self, moved: Vec<Moved>) {
+        if moved.is_empty() {
+            return;
+        }
+        let f = self
+            .reread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match f {
+            Some(f) => moved.into_iter().for_each(|m| f(m)),
+            None => self.lock().asked.clear(),
         }
     }
 
@@ -436,7 +538,7 @@ impl KeyLimits {
             return Ok(());
         }
         let now = self.clock.now_ms();
-        let (out, events) = {
+        let (out, events, moved) = {
             let mut g = self.lock();
             self.sweep(&mut g, now);
             let out = self.calendar_locked(&mut g, key, limits, now);
@@ -444,9 +546,10 @@ impl KeyLimits {
                 Err(r) => self.refused_alert(&mut g, r, now),
                 Ok(()) => Vec::new(),
             };
-            (out, events)
+            (out, events, self.moved(&mut g, key))
         };
         self.emit(events);
+        self.ask_reread(moved);
         out
     }
 
@@ -481,10 +584,10 @@ impl KeyLimits {
         }
         loop {
             let now = self.clock.now_ms();
-            let step = {
+            let (step, moved) = {
                 let mut g = self.lock();
                 self.sweep(&mut g, now);
-                match self.calendar_locked(&mut g, key, limits, now) {
+                let step = match self.calendar_locked(&mut g, key, limits, now) {
                     Err(r) => {
                         let events = self.refused_alert(&mut g, &r, now);
                         Err((r, events))
@@ -493,8 +596,10 @@ impl KeyLimits {
                         None => Ok(self.reserve(&mut g, key, limits, ask, now)),
                         Some(w) => Err((Box::new(w), Vec::new())),
                     },
-                }
+                };
+                (step, self.moved(&mut g, key))
             };
+            self.ask_reread(moved);
             let refusal = match step {
                 Ok(seq) => {
                     return Ok(Hold {
@@ -522,7 +627,7 @@ impl KeyLimits {
     /// 一个请求 —— 上游都满着回了 429 的请求，客户端过几秒重试，窗口里不该还留着它
     pub fn settle(&self, id: u64, at_ms: i64, rec: &Recorded) {
         let now = self.clock.now_ms();
-        let events = {
+        let (events, moved) = {
             let mut g = self.lock();
             let held = g.by_request.remove(&id).and_then(|s| g.held.remove(&s));
             if !rec.counts() {
@@ -556,9 +661,10 @@ impl KeyLimits {
                     },
                 ));
             }
-            self.alerts(&mut g, &key, now)
+            (self.alerts(&mut g, &key, now), self.moved(&mut g, &key))
         };
         self.emit(events);
+        self.ask_reread(moved);
     }
 
     /// 重启之后把天、周、月的数从请求记录里加回来。`since(t)` 给出从 `t` 起每把密钥
@@ -606,7 +712,7 @@ impl KeyLimits {
         let now = self.clock.now_ms();
         let mut g = self.lock();
         self.sweep(&mut g, now);
-        limits
+        let view = limits
             .iter()
             .map(|l| {
                 let used = self.used(&mut g, key, l, now);
@@ -625,7 +731,11 @@ impl KeyLimits {
                     reached: used >= max,
                 }
             })
-            .collect()
+            .collect();
+        let moved = self.moved(&mut g, key);
+        drop(g);
+        self.ask_reread(moved);
+        view
     }
 
     // ------------------------------------------------------------ 锁里面的
