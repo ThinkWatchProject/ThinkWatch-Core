@@ -344,6 +344,11 @@ restart, the day, week and month are added up again from the request records;
 a monthly limit therefore needs `retention.row_days` of at least 31. Minute
 and hour limits start empty.
 
+On a Responses WebSocket connection, each `response.create` is a request of
+its own: it is recorded with its usage and cost and checked against these
+limits, and a refused one is answered with `response.failed` while the
+connection stays open.
+
 <!-- generated: table clients[].limits[] -->
 <a id="cfg-clients-limits"></a>
 
@@ -442,7 +447,10 @@ been passed on in full or the client has gone. When the upstream is full, a
 conversation that stays on it to reuse its prompt cache waits for a slot;
 any other request goes straight to the next upstream. How long a request
 waits is `failover.slot_wait_secs`. Waiting is not a failure: the upstream is
-not set aside. Requests that only count tokens do not take a slot.
+not set aside. Requests that only count tokens do not take a slot. On a
+Responses WebSocket connection, each `response.create` takes a slot from when
+it is sent until its answer ends, and so does a key's `max_concurrent`; an
+idle connection takes none.
 
 #### `providers[].oauth`
 

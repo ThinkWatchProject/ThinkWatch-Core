@@ -867,7 +867,8 @@ pub enum Event {
         /// 的指纹）、离这段对话的上一个请求不超过半小时，就还是那一次；隔久了算
         /// 新的一次。**开始时就给出来**，界面才能把一个还在跑的请求放进它的会话、
         /// 把那次会话标成进行中。认不出会话的没有：正文里没有任何能认人的东西，
-        /// 或者是 WebSocket 升级（升级请求没有正文）
+        /// 或者是整条连接一行的 WebSocket（升级请求没有正文）。Responses 连接上的每一轮
+        /// 按那一帧认，和 HTTP 的请求一样
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
         /// 请求从哪台机器来：**这条连接对面的地址**，不可伪造。本机（回环）
@@ -938,9 +939,11 @@ pub enum Event {
     /// `response.created` 这类开场帧不算：那是上游收到请求就发的。
     ///
     /// 只有成功的流式响应有。非流式的整段一起到，没有「第一个」；不带 `alt=sse` 的
-    /// Gemini 流和 WebSocket 那条路不在这里解析，也没有。
+    /// Gemini 流和整条连接一行的 WebSocket 不在这里解析，也没有。Responses 连接上的每一轮
+    /// 有。
     RequestFirstToken { id: u64, ttft_ms: u64 },
-    /// 结束了：上游回的是成功的状态码（2xx；WebSocket 那条路是升级成功的 101），回答
+    /// 结束了：上游回的是成功的状态码（2xx；整条连接一行的 WebSocket 是升级成功的 101，
+    /// Responses 连接上的一轮是 200），回答
     /// 交完了。**上游回了别的、原样交给了客户端的不是这一条**，是 `RequestFailed` ——
     /// 客户端拿到的是上游的错误，不是回答
     RequestFinished {
@@ -952,7 +955,8 @@ pub enum Event {
         /// 在结局里才到的。模型名只在开始事件里的话，一个开始时没人在听、
         /// 结束时有人在听的请求，它的用量就不知道该记在哪个模型上。
         ///
-        /// WebSocket 那条路是空串：升级请求里没有模型名（和开始事件一样）。
+        /// 整条连接一行的 WebSocket 和开始事件一样：Realtime 是查询串里的那个，别的连接
+        /// 升级时还不知道，是空串。
         model: String,
         status: u16,
         bytes: u64,
@@ -972,7 +976,7 @@ pub enum Event {
         /// 上游在回答里写的模型名：Anthropic 和 Chat 的 `model`、Responses 的
         /// `response.model`、Gemini 的 `modelVersion`。**原样，不归一。**
         ///
-        /// 回答里没写的没有：Bedrock 的 Converse 不写，WebSocket 那条路不看。和
+        /// 回答里没写的没有：Bedrock 的 Converse 不写，整条连接一行的 WebSocket 不看。和
         /// `model` 不是一回事 —— 那是客户端要的，这是上游说它用的
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered_model: Option<String>,
@@ -1045,8 +1049,9 @@ pub enum Event {
     /// `RequestFinished` 上的话，失败的那条路就没有尝试链 —— 而那恰恰
     /// 是最需要看它的时候。
     ///
-    /// WebSocket 那条路也发：和上游的握手有了结果就发。那条路不做故障转移，
-    /// 尝试链只有一跳。
+    /// WebSocket 那条路也发，不做故障转移，尝试链只有一跳：整条连接一行的，和上游的
+    /// 握手有了结果就发；Responses 连接上的一轮，上游这一轮的第一帧到了就发（没等到就在
+    /// 结局之前），那一跳是这条连接连着的那一家。
     ///
     /// **规则做了决定、请求却一家上游都没到的也发**：规则拒绝了它（第一阶段），
     /// 或者规则选中的上游都服务不了这个模型 —— 那时尝试链是空的，紧跟着一条
@@ -1496,8 +1501,9 @@ pub struct AttemptView {
     /// **费用按它算**：请求改写成另一个模型发出去，上游按那个模型收钱。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// WebSocket 的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
-    /// 状态码是 `status`，连不上是 `error`。
+    /// WebSocket 连接的那一跳是一次握手：上游同意升级（101）是 `served`，回了别的
+    /// 状态码是 `status`，连不上是 `error`。Responses 的连接上每一轮是一个请求，那一跳是这条
+    /// 已经接下的连接：发出去了是 `served`，状态码记 200。
     pub outcome: AttemptOutcome,
     /// 上游返回的状态码。`error` 时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3824,7 +3830,7 @@ pub struct Summary {
     /// 失败的、没有用量的、不计费的都不在这里 —— 配价格对它们没用。
     pub unpriced_requests: i64,
     /// 有多少条请求**没有拿到用量**，所以同样算不出钱：上游没报，或者连接
-    /// 在它报之前就结束了（客户端取消、WebSocket 会话）。
+    /// 在它报之前就结束了（客户端取消、整条连接一行的 WebSocket 会话）。
     ///
     /// 和 `unpriced_requests` 一样让金额合计偏低，但配价格解决不了它 ——
     /// 界面上是两句不同的话。上游确实接下了的才算：成功的响应和客户端
@@ -4100,7 +4106,7 @@ pub struct HistoryRow {
     /// 任务；看着一次很贵的任务，也回不到具体是哪一条。库里这一列一直
     /// 都在（`requests.session`，还建了索引），只是没有交出来。
     ///
-    /// 认不出会话的请求（拼不出指纹的，比如 WebSocket、本地应答）是 `None`。
+    /// 认不出会话的请求（拼不出指纹的，比如整条连接一行的 WebSocket、本地应答）是 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// 按请求头推测是哪个应用发的（`claude-code`、`codex`…）。**可以伪造**，

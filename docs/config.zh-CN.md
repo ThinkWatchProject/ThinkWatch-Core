@@ -247,6 +247,9 @@ clients:
 重启之后，这一天、这一周、这个月的用量从请求记录里重新加起来，所以设了按月上限时
 `retention.row_days` 至少要 31；按分钟、按小时的上限从零开始。
 
+Responses 的 WebSocket 连接上，每个 `response.create` 各算一个请求：带着各自的用量和费用记下，
+按这些上限检查；被拒的那一个收到 `response.failed`，连接保持不断。
+
 <!-- generated: table clients[].limits[] -->
 <a id="cfg-clients-limits"></a>
 
@@ -325,7 +328,7 @@ providers:
 
 ChatGPT 账号上游（`protocol: chatgpt`）只接受桌面应用登录得到的凭据，不能手写。不支持 Claude 和 Google 的订阅登录，请使用 API 密钥。
 
-有的中转站和账号同时只接受几个请求，多出来的直接拒绝。`max_concurrent` 让网关守住这个数：请求发出时占用这家的一个位置，回答完整交给客户端、或者客户端断开时归还。这家满了的时候，为复用提示缓存而留在这家的对话等空位，别的请求直接换下一家。最多等多久由 `failover.slot_wait_secs` 决定。等待不算失败，这家不会因此停用。只计算 token 数的请求不占位置。
+有的中转站和账号同时只接受几个请求，多出来的直接拒绝。`max_concurrent` 让网关守住这个数：请求发出时占用这家的一个位置，回答完整交给客户端、或者客户端断开时归还。这家满了的时候，为复用提示缓存而留在这家的对话等空位，别的请求直接换下一家。最多等多久由 `failover.slot_wait_secs` 决定。等待不算失败，这家不会因此停用。只计算 token 数的请求不占位置。Responses 的 WebSocket 连接上，每个 `response.create` 从发出起占一个位置，直到它的回答结束，密钥的 `max_concurrent` 也一样；空闲的连接不占位置。
 
 #### `providers[].oauth`
 

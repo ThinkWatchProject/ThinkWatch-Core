@@ -364,38 +364,27 @@ fn the_route(evs: &[Event]) -> (String, Option<String>, tw_api::AttemptView, Str
     )
 }
 
-/// **一次升级也报路由**：命中了哪条规则、经过哪个组、那一家接没接下、按什么
-/// 记账 —— 和 HTTP 那条路同一个形状。以前 WS 这条路只有开始和结局，详情里说
-/// 「没有路由信息」，上游的计费方式也没跟着报。
+/// **每一轮都报路由**：命中了哪条规则、经过哪个组、发给了哪一家、按什么记账 —— 和 HTTP
+/// 那条路同一个形状。一轮是一个请求（见 `tw_gateway::ws::turn`），连接本身不留行
 #[tokio::test]
-async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
-    let (up, _seen) = start_upstream("echo").await;
+async fn a_websocket_turn_reports_its_route_and_its_upstreams_billing() {
+    let (up, _seen) = responder(None).await;
     let (gw, mut events) = serve(routed_to_an_account(up)).await;
     let mut c = connect(gw).await;
-    c.send(tokio_tungstenite::tungstenite::Message::Text("hi".into()))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), c.next())
-        .await
-        .expect("等回帧超时")
-        .unwrap()
-        .unwrap();
+    c.send(create("hi")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
     c.close(None).await.unwrap();
 
     let evs = until_the_ending(&mut events).await;
-    // 开始事件就说清按什么记账：升级没完成客户端就走了的，只有这一个
     assert!(
-        matches!(&evs[0], Event::RequestStarted { billing, .. } if billing == "free"),
+        matches!(&evs[0], Event::RequestStarted { billing, route, method, model, session: Some(_), .. }
+            if billing == "free" && route == "default" && method == "WS" && model == "gpt-5"),
         "{evs:?}"
     );
     let (rule, group, hop, billing) = the_route(&evs);
     assert_eq!(rule, "Codex 走账号");
     assert_eq!(group.as_deref(), Some("账号池"));
-    // 走的哪条路由，开始和路由两条事件都说；升级请求没有正文，认不出会话
-    assert!(
-        matches!(&evs[0], Event::RequestStarted { route, session: None, .. } if route == "default"),
-        "{evs:?}"
-    );
     assert!(
         evs.iter()
             .any(|e| matches!(e, Event::RequestRouted { route, .. } if route == "default")),
@@ -403,13 +392,30 @@ async fn a_websocket_session_reports_its_route_and_its_upstreams_billing() {
     );
     assert_eq!(
         (hop.provider.as_str(), hop.outcome.slug(), hop.status),
-        ("订阅账号", "served", Some(101))
+        ("订阅账号", "served", Some(200))
     );
     assert_eq!(billing, "free");
     assert!(
-        matches!(evs.last(), Some(Event::RequestFinished { status: 101, .. })),
+        matches!(
+            evs.last(),
+            Some(Event::RequestFinished {
+                status: 200,
+                usage: Some(_),
+                ..
+            })
+        ),
         "{evs:?}"
     );
+    // 关掉连接不再多出一行
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
+        assert!(
+            !matches!(
+                ev,
+                Event::RequestStarted { .. } | Event::RequestFinished { .. }
+            ),
+            "{ev:?}"
+        );
+    }
 }
 
 /// 规则拒绝了这次升级：**和 HTTP 那条路一样留一行** —— 开始、空尝试链的路由、
@@ -698,4 +704,601 @@ async fn a_secret_restored_into_a_flagged_call_is_masked_in_the_event() {
     for (_, e) in &excerpts {
         assert!(!e.contains("USERSOWNKEY"), "**事件里是明文的密钥**：{e}");
     }
+}
+
+// ---------------------------------------------------------------- 一轮一个请求
+
+/// 这一轮回答的用量：输入 1200（其中 1000 走了缓存）、输出 30。Responses 的输入数包含缓存读
+const USAGE: &str = r#"{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1000},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1230}"#;
+
+/// 像 Responses 的 WebSocket 那样回答的上游：每个 `response.create` 回 created、一段文字，
+/// 然后 completed（带用量）。`hold` 给了的话，回完那段文字之后等它变成 true 再收尾。记下收到的
+/// 每一帧
+async fn responder(
+    hold: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s = seen.clone();
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| {
+            let (seen, hold) = (s.clone(), hold.clone());
+            async move { ws.on_upgrade(move |sock| answer(sock, seen, hold)) }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, seen)
+}
+
+async fn answer(
+    mut sock: WebSocket,
+    seen: Arc<Mutex<Vec<String>>>,
+    mut hold: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    while let Some(Ok(m)) = sock.recv().await {
+        let Message::Text(t) = m else { continue };
+        let n = {
+            let mut s = seen.lock().unwrap();
+            s.push(t.to_string());
+            s.len()
+        };
+        let id = format!("resp_{n}");
+        let head = [
+            serde_json::json!({"type":"response.created","response":{"id":id,"status":"in_progress","model":"gpt-5","output":[]}}),
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg","role":"assistant","content":[]}}),
+            serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":"hello"}),
+        ];
+        for f in head {
+            if sock
+                .send(Message::Text(f.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        if let Some(rx) = hold.as_mut() {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+        let usage: serde_json::Value = serde_json::from_str(USAGE).unwrap();
+        let done = serde_json::json!({"type":"response.completed","response":{"id":id,"status":"completed","model":"gpt-5","output":[],"usage":usage}});
+        if sock
+            .send(Message::Text(done.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// 用量上限看的时钟：跟着真的时间走（东八区，从中午起），测试可以把它往后拨
+struct JumpClock {
+    base: tw_gateway::key_limits::TestClock,
+    extra: std::sync::atomic::AtomicI64,
+}
+
+impl JumpClock {
+    fn new() -> Arc<Self> {
+        let noon = chrono::DateTime::parse_from_rfc3339("2026-10-05T12:00:00+08:00")
+            .unwrap()
+            .timestamp_millis();
+        Arc::new(Self {
+            base: tw_gateway::key_limits::TestClock::new(noon, 8 * 3600),
+            extra: Default::default(),
+        })
+    }
+    fn jump(&self, ms: i64) {
+        self.extra
+            .fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tw_gateway::key_limits::Clock for JumpClock {
+    fn now_ms(&self) -> i64 {
+        self.base.now_ms() + self.extra.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn period(&self, per: tw_config::LimitPer, at_ms: i64) -> (i64, i64) {
+        self.base.period(per, at_ms)
+    }
+    fn show(&self, at_ms: i64) -> String {
+        self.base.show(at_ms)
+    }
+}
+
+/// 一家 Responses 上游 `up`、一把密钥 `codex`；`tweak` 改配置。交回网关的状态：测试要看这一家
+/// 此刻占着几个位置。**先订阅事件再起服务**
+async fn turns_gateway(
+    up: SocketAddr,
+    tweak: impl FnOnce(&mut Config),
+    clock: Option<Arc<JumpClock>>,
+) -> (SocketAddr, Receiver<Event>, tw_gateway::AppState) {
+    let mut cfg = Config {
+        version: 1,
+        clients: vec![Client {
+            name: "codex".into(),
+            key: "tw-wskey".into(),
+            ..Default::default()
+        }],
+        providers: vec![Provider {
+            name: "up".into(),
+            base_url: format!("http://{up}"),
+            key: Some("sk-upstream".into()),
+            protocol: Some(tw_config::Protocol::OpenaiResponses),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    tweak(&mut cfg);
+    let mut state = tw_gateway::AppState::new(cfg).unwrap();
+    if let Some(c) = clock {
+        state.set_key_limits_clock(c);
+    }
+    let events = state.bus.subscribe();
+    let addr = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    (addr, events, state)
+}
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// 收到这一次回答的结尾为止的每一帧（解成 JSON）
+async fn one_answer(c: &mut Socket) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+            .await
+            .unwrap_or_else(|_| panic!("the answer did not end: {out:?}"))
+            .expect("the connection closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+            continue;
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&t).unwrap_or_else(|_| serde_json::json!({ "raw": t.as_str() }));
+        let end = matches!(
+            v["type"].as_str(),
+            Some("response.completed" | "response.failed")
+        );
+        out.push(v);
+        if end {
+            return out;
+        }
+    }
+}
+
+/// 读到这一轮的第一段文字为止：上游已经在回答这一轮了
+async fn until_text(c: &mut Socket) {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+            .await
+            .expect("no text")
+            .unwrap()
+            .unwrap();
+        if m.into_text().unwrap().contains("output_text.delta") {
+            return;
+        }
+    }
+}
+
+fn id_of(e: &Event) -> Option<u64> {
+    match e {
+        Event::RequestStarted { id, .. }
+        | Event::RequestHeaders { id, .. }
+        | Event::RequestRouted { id, .. }
+        | Event::RequestFirstToken { id, .. }
+        | Event::RequestFinished { id, .. }
+        | Event::RequestFailed { id, .. }
+        | Event::RequestCancelled { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
+fn is_ending(e: &Event) -> bool {
+    matches!(
+        e,
+        Event::RequestFinished { .. }
+            | Event::RequestFailed { .. }
+            | Event::RequestCancelled { .. }
+    )
+}
+
+/// 请求的事件，按到达的顺序，到第 `n` 个结局为止
+async fn requests(rx: &mut Receiver<Event>, n: usize) -> Vec<Event> {
+    let mut got = Vec::new();
+    let mut ended = 0;
+    while ended < n {
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("only {ended} of {n} endings: {got:?}"))
+            .unwrap();
+        if id_of(&ev).is_none() {
+            continue;
+        }
+        ended += usize::from(is_ending(&ev));
+        got.push(ev);
+    }
+    got
+}
+
+/// 一个请求的那几条事件，按到达的顺序
+fn of(evs: &[Event], id: u64) -> Vec<&Event> {
+    evs.iter().filter(|e| id_of(e) == Some(id)).collect()
+}
+
+fn started_ids(evs: &[Event]) -> Vec<u64> {
+    evs.iter()
+        .filter_map(|e| match e {
+            Event::RequestStarted { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **每个 `response.create` 是一个请求**：开始、响应头、路由、第一个 token、结局，结局带着
+/// 这一轮回答的用量 —— 存储层按它查价、密钥的用量按它结算。两轮是两行，各有各的号；连接
+/// 本身不留行
+#[tokio::test]
+async fn each_response_create_is_its_own_request_with_its_usage() {
+    let (up, _seen) = responder(None).await;
+    let (gw, mut rx, _state) = turns_gateway(up, |_| {}, None).await;
+    let mut c = connect(gw).await;
+    for text in ["one", "two"] {
+        c.send(create(text)).await.unwrap();
+        let frames = one_answer(&mut c).await;
+        assert_eq!(frames.last().unwrap()["type"], "response.completed");
+    }
+    c.close(None).await.unwrap();
+
+    let evs = requests(&mut rx, 2).await;
+    let ids = started_ids(&evs);
+    assert_eq!(ids.len(), 2, "{evs:?}");
+    assert_ne!(ids[0], ids[1]);
+    for id in ids {
+        let mine = of(&evs, id);
+        assert!(
+            matches!(mine[0], Event::RequestStarted { method, model, provider, session: Some(_), input_estimate: Some(n), .. }
+                if method == "WS" && model == "gpt-5" && provider == "up" && *n > 0),
+            "{mine:?}"
+        );
+        assert!(
+            mine.iter()
+                .any(|e| matches!(e, Event::RequestHeaders { status: 200, .. })),
+            "{mine:?}"
+        );
+        assert!(
+            mine.iter()
+                .any(|e| matches!(e, Event::RequestFirstToken { .. })),
+            "第一个 token 没认出来：{mine:?}"
+        );
+        let routed = mine
+            .iter()
+            .position(|e| matches!(e, Event::RequestRouted { .. }))
+            .unwrap_or_else(|| panic!("{mine:?}"));
+        assert!(routed < mine.len() - 1, "路由事件到在了结局之后：{mine:?}");
+        let Event::RequestRouted { attempts, .. } = mine[routed] else {
+            unreachable!()
+        };
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(
+            (
+                attempts[0].provider.as_str(),
+                attempts[0].outcome.slug(),
+                attempts[0].status
+            ),
+            ("up", "served", Some(200))
+        );
+        assert_eq!(attempts[0].model, None, "发出去的就是客户端要的那个");
+        match mine.last().unwrap() {
+            Event::RequestFinished {
+                status: 200,
+                model,
+                usage: Some(u),
+                answered_model,
+                ..
+            } => {
+                assert_eq!(model, "gpt-5");
+                assert_eq!((u.input, u.cache_read, u.output), (200, 1000, 30));
+                assert_eq!(answered_model.as_deref(), Some("gpt-5"));
+            }
+            other => panic!("该是一次带着用量的结束：{other:?}"),
+        }
+    }
+    // 关掉连接不再多出一行
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+        assert!(id_of(&ev).is_none(), "{ev:?}");
+    }
+}
+
+/// 一轮没答完客户端就关了连接：这一轮记成取消，路由事件照样在结局之前到
+#[tokio::test]
+async fn a_turn_the_connection_closes_on_is_cancelled() {
+    let (_release, hold) = tokio::sync::watch::channel(false);
+    let (up, _seen) = responder(Some(hold)).await;
+    let (gw, mut rx, _state) = turns_gateway(up, |_| {}, None).await;
+    let mut c = connect(gw).await;
+    c.send(create("hi")).await.unwrap();
+    until_text(&mut c).await;
+    drop(c);
+
+    let evs = requests(&mut rx, 1).await;
+    let kinds: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::RequestStarted { .. } => Some("started"),
+            Event::RequestRouted { .. } => Some("routed"),
+            Event::RequestCancelled { .. } => Some("cancelled"),
+            Event::RequestFinished { .. } | Event::RequestFailed { .. } => Some("other"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["started", "routed", "cancelled"], "{evs:?}");
+}
+
+/// 密钥这一天的上限用完了：**这一轮替它回一个 `response.failed`**，带着上限的那句话、写成
+/// 额度用完（Codex 认这个码，不再重试），连接照常；流量里照样有这一行。到了第二天，同一条
+/// 连接上的下一轮照常发出
+#[tokio::test]
+async fn a_used_up_key_limit_fails_the_turn_and_the_connection_stays_usable() {
+    let (up, seen) = responder(None).await;
+    let clock = JumpClock::new();
+    let (gw, mut rx, _state) = turns_gateway(
+        up,
+        |c| c.clients[0].limits = serde_yaml_ng::from_str("[{per: day, requests: 1}]").unwrap(),
+        Some(clock.clone()),
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    one_answer(&mut c).await;
+    requests(&mut rx, 1).await;
+
+    c.send(create("two")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    let failed = frames.last().unwrap();
+    assert_eq!(failed["type"], "response.failed", "{frames:?}");
+    assert_eq!(
+        failed["response"]["error"]["message"],
+        "[ThinkWatch] Gateway key `codex` has reached its limit of 1 requests per day: 1 so far. \
+         It resets at 2026-10-06 00:00 +08:00."
+    );
+    assert_eq!(failed["response"]["error"]["code"], "insufficient_quota");
+    assert_eq!(seen.lock().unwrap().len(), 1, "被拒的这一轮到了上游");
+    let evs = requests(&mut rx, 1).await;
+    assert!(
+        matches!(&evs[0], Event::RequestStarted { provider, .. } if provider.is_empty()),
+        "{evs:?}"
+    );
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, Event::RequestRouted { attempts, .. } if attempts.is_empty())),
+        "{evs:?}"
+    );
+    match evs.last().unwrap() {
+        Event::RequestFailed {
+            source, message, ..
+        } => {
+            assert_eq!(source.slug(), "rate_limited");
+            assert_eq!(message.code, "gw.key_limit.requests_per_period");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // 第二天：同一条连接，照常发出
+    clock.jump(13 * 3600 * 1000);
+    c.send(create("three")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+/// 每分钟的上限：下一个空位在等得到的时候空出来，这一轮**等它**，然后照常发出；等不到的
+/// （`slot_wait_secs: 0`）当场替它回 `response.failed`，说清多久之后再来
+#[tokio::test]
+async fn a_rolling_key_limit_waits_within_the_turn_or_refuses_it() {
+    let (up, seen) = responder(None).await;
+    let clock = JumpClock::new();
+    let (gw, _rx, _state) = turns_gateway(
+        up,
+        |c| c.clients[0].limits = serde_yaml_ng::from_str("[{per: minute, requests: 1}]").unwrap(),
+        Some(clock.clone()),
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    one_answer(&mut c).await;
+    // 一分钟差 600 毫秒：下一个空位 600 毫秒后空出来
+    clock.jump(59_400);
+    let t = std::time::Instant::now();
+    c.send(create("two")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
+    assert!(
+        t.elapsed() >= Duration::from_millis(500),
+        "没等空位就发了：{:?}",
+        t.elapsed()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // 不等的配置：当场拒，连接照常
+    let (up, seen) = responder(None).await;
+    let (gw, _rx, _state) = turns_gateway(
+        up,
+        |c| {
+            c.clients[0].limits = serde_yaml_ng::from_str("[{per: minute, requests: 1}]").unwrap();
+            c.failover.slot_wait_secs = 0;
+        },
+        Some(JumpClock::new()),
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    one_answer(&mut c).await;
+    c.send(create("two")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    let failed = frames.last().unwrap();
+    assert_eq!(failed["type"], "response.failed", "{frames:?}");
+    let said = failed["response"]["error"]["message"].as_str().unwrap();
+    assert!(
+        said.starts_with(
+            "[ThinkWatch] Gateway key `codex` has reached its limit of 1 requests per minute: 1 in \
+             the last minute. Try again in "
+        ),
+        "{said}"
+    );
+    // 滚动窗口过一会儿就空出来：可以重试
+    assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// 这一家的并发上限（`max_concurrent`）**按轮占**：闲着的连接什么都不占，一轮从发出去占到
+/// 这一次回答完
+#[tokio::test]
+async fn an_upstream_slot_is_held_for_a_turn_and_not_by_an_idle_connection() {
+    let (release, hold) = tokio::sync::watch::channel(false);
+    let (up, _seen) = responder(Some(hold)).await;
+    let (gw, mut rx, state) =
+        turns_gateway(up, |c| c.providers[0].max_concurrent = Some(1), None).await;
+    let mut c = connect(gw).await;
+    // 连着、闲着：位置是空的
+    drop(
+        state
+            .slots
+            .try_take("up")
+            .expect("an idle connection holds a slot"),
+    );
+
+    c.send(create("hi")).await.unwrap();
+    until_text(&mut c).await;
+    assert!(
+        state.slots.try_take("up").is_none(),
+        "回答着的这一轮没占位置"
+    );
+
+    release.send_replace(true);
+    one_answer(&mut c).await;
+    requests(&mut rx, 1).await;
+    // 答完了：还回来了，连接还开着
+    assert!(state.slots.try_take("up").is_some(), "答完的这一轮没还位置");
+    drop(c);
+}
+
+/// 密钥的并发上限（`max_concurrent`）也**按轮占**：一条连接上的一轮在答，同一把密钥另一条
+/// 连接上的一轮等它答完再发；答完之后闲着的那条连接不挡别人
+#[tokio::test]
+async fn a_keys_max_concurrent_is_held_per_turn() {
+    let (release, hold) = tokio::sync::watch::channel(false);
+    let (up, seen) = responder(Some(hold)).await;
+    let (gw, _rx, _state) =
+        turns_gateway(up, |c| c.clients[0].max_concurrent = Some(1), None).await;
+    let mut a = connect(gw).await;
+    let mut b = connect(gw).await;
+    a.send(create("a")).await.unwrap();
+    until_text(&mut a).await;
+
+    b.send(create("b")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(seen.lock().unwrap().len(), 1, "密钥的并发上限没挡住第二轮");
+
+    release.send_replace(true);
+    one_answer(&mut a).await;
+    let frames = one_answer(&mut b).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // a 连着、闲着：b 的下一轮当场就发
+    b.send(create("b again")).await.unwrap();
+    let frames = one_answer(&mut b).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
+}
+
+/// 这一家满着：这一轮**等它空出位置**（最多 `slot_wait_secs`），空出来了照常发，尝试链上记着
+/// 等了多久；等不到替它回 `response.failed`（忙，可以重试），流量里留一行，连接照常
+#[tokio::test]
+async fn a_turn_waits_for_a_full_upstream_and_fails_as_busy_when_none_frees() {
+    let (up, seen) = responder(None).await;
+    let (gw, mut rx, state) = turns_gateway(
+        up,
+        |c| {
+            c.providers[0].max_concurrent = Some(1);
+            c.failover.slot_wait_secs = 1;
+        },
+        None,
+    )
+    .await;
+    let mut c = connect(gw).await;
+
+    // 别的请求占着，300 毫秒后还回来：这一轮等到了
+    let other = state.slots.try_take("up").unwrap();
+    c.send(create("one")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(seen.lock().unwrap().is_empty(), "满着就发了");
+    drop(other);
+    let frames = one_answer(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
+    let evs = requests(&mut rx, 1).await;
+    let queued = evs.iter().find_map(|e| match e {
+        Event::RequestRouted { attempts, .. } => attempts[0].queued_ms,
+        _ => None,
+    });
+    assert!(
+        queued.is_some_and(|ms| ms >= 250),
+        "尝试链上没记等了多久：{evs:?}"
+    );
+
+    // 一直占着：等满一秒，这一轮是忙
+    let other = state.slots.try_take("up").unwrap();
+    let t = std::time::Instant::now();
+    c.send(create("two")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert!(
+        t.elapsed() >= Duration::from_millis(900),
+        "{:?}",
+        t.elapsed()
+    );
+    let failed = frames.last().unwrap();
+    assert_eq!(failed["type"], "response.failed", "{frames:?}");
+    assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
+    assert!(
+        failed["response"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("(max_concurrent): `up`"),
+        "{failed}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let evs = requests(&mut rx, 1).await;
+    let hop = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::RequestRouted { attempts, .. } => Some(attempts[0].clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert_eq!(hop.skipped, Some(tw_api::ServeSkip::Busy));
+    assert!(hop.queued_ms.is_some_and(|ms| ms >= 900), "{hop:?}");
+    match evs.last().unwrap() {
+        Event::RequestFailed {
+            source, message, ..
+        } => {
+            assert_eq!(source.slug(), "rate_limited");
+            assert_eq!(message.code, "gw.busy_all");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // 空出来了：同一条连接，照常
+    drop(other);
+    c.send(create("three")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(frames.last().unwrap()["type"], "response.completed");
 }

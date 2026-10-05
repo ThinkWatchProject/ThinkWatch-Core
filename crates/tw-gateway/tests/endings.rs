@@ -666,40 +666,44 @@ async fn an_error_answer_passed_on_to_the_client_is_failed_once_in_the_upstreams
 
 // ---------------------------------------------------------------- WebSocket
 
-/// 一次 Codex 会话结束了。**以前 WS 这条路只有开始、没有结局**，每一条连接
-/// 在界面上都永远是「进行中」。
+/// 一帧 `response.create`：Responses 的连接上它是一轮的开头，**一轮是一个请求**
+fn create() -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"response.create","model":"gpt-5","input":"hi"}"#.into(),
+    )
+}
+
+/// 一轮没答完客户端就关了连接：**这一轮记成取消，恰好一条**。连接本身不留行（一轮一个
+/// 请求，见 `tw_gateway::ws::turn`）：关连接不再多出一条结局。
 ///
-/// 用量是 None：一条连接上跑着好几轮回答，而且升级请求里没有模型名 ——
-/// 报一个数就是在编。
+/// 回显的上游把这一帧原样回过来，那不是一次回答的结尾：这一轮一直没答完。用量是 None，
+/// 上游什么都没报
 #[tokio::test]
-async fn a_websocket_session_the_client_closes_is_finished() {
+async fn a_websocket_turn_the_client_walks_away_from_is_cancelled() {
     let (gw, mut events) = serve(cfg(provider(ws_upstream("echo").await))).await;
     let mut c = ws_connect(gw).await;
-    c.send(tokio_tungstenite::tungstenite::Message::Text("hi".into()))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), c.next())
+    c.send(create()).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(3), c.next())
         .await
         .expect("等回帧超时")
         .unwrap()
+        .unwrap()
+        .into_text()
         .unwrap();
     c.close(None).await.unwrap();
 
     let got = endings(&mut events).await;
     assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
-    assert!(
-        matches!(
-            &got[0],
-            Event::RequestFinished {
-                status: 101,
-                bytes: 2,
-                usage: None,
-                ..
-            }
-        ),
-        "该是一次带着回帧字节数、没有用量的结束：{got:?}"
-    );
-    assert_eq!(model_of(&got[0]), "", "升级请求里没有模型名，不该编一个");
+    match &got[0] {
+        Event::RequestCancelled {
+            status: Some(200),
+            bytes,
+            usage: None,
+            ..
+        } => assert_eq!(*bytes, echoed.len() as u64),
+        other => panic!("该是一次带着回帧字节数、没有用量的取消：{other:?}"),
+    }
+    assert_eq!(model_of(&got[0]), "gpt-5", "这一轮要的模型名");
 }
 
 #[tokio::test]
@@ -739,12 +743,8 @@ async fn a_websocket_cut_for_a_dangerous_tool_call_is_failed_as_denied() {
     };
     let (gw, mut events) = serve(c).await;
     let mut client = ws_connect(gw).await;
-    client
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            "随便问一句".into(),
-        ))
-        .await
-        .unwrap();
+    // 被切断的是这一轮：一轮是一个请求
+    client.send(create()).await.unwrap();
 
     let said = tokio::time::timeout(Duration::from_secs(3), client.next())
         .await

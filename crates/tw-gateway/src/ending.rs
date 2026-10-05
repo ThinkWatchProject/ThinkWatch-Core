@@ -355,12 +355,25 @@ impl Ending {
 
     /// 只数字节，不嗅用量、不留档。
     ///
-    /// WebSocket 那条路用它。一条连接上跑着好几轮回答，每轮各报一次用量，
-    /// 而嗅探器是「每个字段取最大值」—— 喂给它，得到的是其中某一轮的数，
-    /// 看起来却像整条连接的；模型名也不知道（升级请求里没有），算不了钱。
-    /// **与其报一个错的数，不如说没有。**
+    /// 整条连接一行的 WebSocket 用它（Realtime 和别的路径，见 [`crate::ws`]）。一条连接上
+    /// 跑着好几轮回答，每轮各报一次用量，而嗅探器是「每个字段取最大值」—— 喂给它，得到的
+    /// 是其中某一轮的数，看起来却像整条连接的。**与其报一个错的数，不如说没有。**
+    /// Responses 的连接每一轮各是一个请求，用的是 [`Ending::frame`]。
     pub fn count(&mut self, bytes: usize) {
         self.bytes += bytes as u64;
+    }
+
+    /// WebSocket 上上游的一帧文本：Responses 连接上的一轮（见 `crate::ws::turn`）。一条消息
+    /// 就是一个事件，**按 SSE 的一帧喂**给认第一个 token、嗅用量、看错误的那几样 —— 它们
+    /// 读的是 SSE；字节只数消息本身。已经是 SSE 形状的（桥接过来的）原样喂
+    pub fn frame(&mut self, text: &str) {
+        let sse = if text.lines().any(|l| l.starts_with("data: ")) {
+            std::borrow::Cow::Borrowed(text)
+        } else {
+            std::borrow::Cow::Owned(format!("data: {text}\n\n"))
+        };
+        self.feed(sse.as_bytes());
+        self.bytes = self.bytes - sse.len() as u64 + text.len() as u64;
     }
 
     /// 走完了。上游在流里报过错的、回的不是 2xx 的，报的是失败（见 [`Ending::streaming`]、
@@ -1267,6 +1280,45 @@ mod tests {
             ),
             "{got:?}"
         );
+    }
+
+    /// Responses 连接上的一轮（见 `crate::ws::turn`）：一条消息按 SSE 的一帧喂，第一个 token、
+    /// 用量照认，**字节只数消息本身**
+    #[test]
+    fn a_websocket_frame_is_read_as_one_event_and_counted_as_itself() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.streaming(ir::Dialect::Responses, "up");
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"r","status":"in_progress","model":"gpt-5","output":[]}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"m","delta":"hi"}"#,
+            r#"{"type":"response.completed","response":{"id":"r","status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":20},"output_tokens":5,"total_tokens":55}}}"#,
+        ];
+        for f in frames {
+            e.frame(f);
+        }
+        e.finished(200);
+
+        let got = drain(&mut rx);
+        assert!(
+            matches!(got.first(), Some(Event::RequestFirstToken { id: 7, .. })),
+            "{got:?}"
+        );
+        match got.last() {
+            Some(Event::RequestFinished {
+                bytes,
+                usage: Some(u),
+                answered_model,
+                ..
+            }) => {
+                assert_eq!(*bytes, frames.iter().map(|f| f.len() as u64).sum::<u64>());
+                assert_eq!((u.input, u.cache_read, u.output), (30, 20, 5));
+                assert_eq!(answered_model.as_deref(), Some("gpt-5"));
+            }
+            other => panic!("该是一次带着用量的结束，实际 {other:?}"),
+        }
     }
 
     /// 流在网关自己的代码里崩掉了。**Drop 同样会跑**（unwind 会丢掉流里的

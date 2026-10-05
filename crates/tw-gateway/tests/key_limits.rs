@@ -1,5 +1,5 @@
 //! 密钥的用量上限，走真的网关：被拒的请求在每一种客户端格式里长什么样、带什么响应头，
-//! 流量里有没有它那一行，数 token 的请求和 WebSocket 连接怎么算。
+//! 流量里有没有它那一行，数 token 的请求怎么算。WebSocket 上每一轮怎么算在 `ws.rs`。
 //!
 //! 数和等的细节在 `tw_gateway::key_limits` 的单元测试里；这里看的是它接在管线上的样子。
 
@@ -235,14 +235,15 @@ async fn counting_tokens_is_not_counted_and_not_refused() {
     );
 }
 
-/// WebSocket 一条连接算一个请求，**连上之前**看：用满了，升级就是一个 429。
+/// Realtime 的连接**整条连接算一个请求**，连上之前看：用满了，升级就是一个 429。
+/// （Responses 的连接每一轮各算一个，见 `ws.rs`）
 #[tokio::test]
-async fn a_websocket_connection_is_admitted_when_it_opens() {
+async fn a_realtime_connection_is_admitted_when_it_opens() {
     let (up, _hits) = upstream().await;
     let (gw, _rx) = gateway(up, "[{per: day, requests: 1}]").await;
     assert_eq!(anthropic(gw, "/v1/messages").await.status(), 200);
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = format!("ws://{gw}/v1/responses")
+    let mut req = format!("ws://{gw}/v1/realtime?model=gpt-realtime")
         .into_client_request()
         .unwrap();
     req.headers_mut()

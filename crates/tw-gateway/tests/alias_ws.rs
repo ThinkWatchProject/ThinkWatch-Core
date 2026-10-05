@@ -188,7 +188,8 @@ fn refusal(frames: &[Value]) -> String {
         .to_string()
 }
 
-/// 握手后发的路由事件里那一跳记下的模型名
+/// 下一轮的路由事件里那一跳记下的模型名：发给这一家的那个，和这一帧写的不一样时才有。
+/// **一轮是一个请求**（见 `tw_gateway::ws::turn`），尝试链按轮记
 async fn attempt_model(rx: &mut Receiver<Event>) -> Option<String> {
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -215,11 +216,12 @@ async fn an_alias_goes_out_as_the_upstreams_own_name_and_the_answer_shows_the_al
     let (up, seen) = upstream().await;
     let (gw, mut events) = gateway(config(provider(up, SCOPE), FAST, ""), vec![]).await;
     let mut c = connect(gw).await;
-    // 别名要看每一帧写的是什么：升级时说不上来
-    assert_eq!(attempt_model(&mut events).await, None);
-
     c.send(create("codex-fast")).await.unwrap();
     let frames = one_answer(&mut c).await;
+    assert_eq!(
+        attempt_model(&mut events).await.as_deref(),
+        Some("gpt-5.1-codex-mini")
+    );
     let sent = seen.lock().unwrap()[0].clone();
     assert_eq!(sent["model"], "gpt-5.1-codex-mini");
     // 别的字段原样
@@ -233,6 +235,7 @@ async fn an_alias_goes_out_as_the_upstreams_own_name_and_the_answer_shows_the_al
 
     c.send(create("gpt-5.1-codex")).await.unwrap();
     let frames = one_answer(&mut c).await;
+    assert_eq!(attempt_model(&mut events).await, None, "原样发的不记");
     assert_eq!(seen.lock().unwrap()[1]["model"], "gpt-5.1-codex");
     assert_eq!(
         answered(&frames),
@@ -251,14 +254,14 @@ async fn a_rule_that_pins_a_model_for_the_client_sends_the_pinned_name() {
 ";
     let (gw, mut events) = gateway(config(provider(up, &[]), FAST, rules), vec![]).await;
     let mut c = connect(gw).await;
-    assert_eq!(
-        attempt_model(&mut events).await.as_deref(),
-        Some("gpt-5.1-codex-max")
-    );
     // 指定的原样发，写的是别名也不对
     for asked in ["gpt-5.1-codex", "codex-fast"] {
         c.send(create(asked)).await.unwrap();
         let frames = one_answer(&mut c).await;
+        assert_eq!(
+            attempt_model(&mut events).await.as_deref(),
+            Some("gpt-5.1-codex-max")
+        );
         assert_eq!(
             seen.lock().unwrap().last().unwrap()["model"],
             "gpt-5.1-codex-max"
@@ -280,13 +283,12 @@ async fn a_rule_rewrite_to_an_alias_is_resolved_and_a_phase_two_name_goes_out_as
 ";
     let (gw, mut events) = gateway(config(provider(up, SCOPE), FAST, rules), vec![]).await;
     let mut c = connect(gw).await;
+    c.send(create("gpt-5.1-codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
     assert_eq!(
         attempt_model(&mut events).await.as_deref(),
         Some("gpt-5.1-codex-mini")
     );
-
-    c.send(create("gpt-5.1-codex")).await.unwrap();
-    let frames = one_answer(&mut c).await;
     assert_eq!(seen.lock().unwrap()[0]["model"], "gpt-5.1-codex-mini");
     assert_eq!(answered(&frames), ["gpt-5.1-codex", "gpt-5.1-codex"]);
 
@@ -302,6 +304,24 @@ async fn a_rule_rewrite_to_an_alias_is_resolved_and_a_phase_two_name_goes_out_as
         "[ThinkWatch] Rule `不给` denied this request: 这个模型不走这里"
     );
     assert_eq!(seen.lock().unwrap().len(), 2);
+    // 被规则拒绝的这一轮**照样留一行**，和 HTTP 那条路一样：空的尝试链，阶段二拒绝它的是
+    // 哪条规则
+    let (denied_by, attempts) = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("no routing event for the denied request")
+            .unwrap();
+        if let Event::RequestRouted {
+            denied_by: Some(rule),
+            attempts,
+            ..
+        } = ev
+        {
+            break (rule, attempts);
+        }
+    };
+    assert_eq!(denied_by, "不给");
+    assert!(attempts.is_empty(), "{attempts:?}");
 
     c.send(create("gpt-5.1-codex")).await.unwrap();
     let frames = one_answer(&mut c).await;
@@ -344,7 +364,6 @@ async fn an_alias_the_upstream_cannot_serve_fails_that_request_and_the_connectio
 ";
     let (gw, mut events) = gateway(config(provider(up, SCOPE), &aliases, rules), vec![]).await;
     let mut c = connect(gw).await;
-    assert_eq!(attempt_model(&mut events).await, None);
     c.send(create("gpt-5.1-codex")).await.unwrap();
     let frames = one_answer(&mut c).await;
     assert_eq!(
@@ -354,6 +373,16 @@ async fn an_alias_the_upstream_cannot_serve_fails_that_request_and_the_connectio
          (claude-sonnet-5, us.anthropic.claude-sonnet-5-v1:0), so the request was not sent."
     );
     assert!(seen.lock().unwrap().is_empty());
+    // 这一家服务不了要的别名：**不留这一行**，和 HTTP 那条路准入没过一样
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+        assert!(
+            !matches!(
+                ev,
+                Event::RequestStarted { .. } | Event::RequestRouted { .. }
+            ),
+            "{ev:?}"
+        );
+    }
 }
 
 /// 插件把模型名换成别名：发给这一家的是它自己的名称，回答里写回客户端要的。插件的
