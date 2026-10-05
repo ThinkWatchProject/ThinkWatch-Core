@@ -100,6 +100,21 @@ endpoints! {
     UpdateProxy: PUT "/proxies/{name}" [name], api::ProxySave => api::ConfigWritten;
     DeleteProxy: DELETE "/proxies/{name}" [name], api::BaseVersion => api::ConfigWritten;
 
+    // ─────────────────────────────────────────────── 模型别名
+    /// 全部别名，按书写顺序：各家发出的名称、同名被挡住的上游、24 小时用量；以及同一个
+    /// 模型在各家叫不同名称的建议（只认 Claude）
+    Aliases: GET "/aliases", () => api::AliasesView;
+    CreateAlias: POST "/aliases", api::AliasSave => api::ConfigWritten;
+    /// 预览一个还没保存的别名：挡着保存的问题、发往各家的名称、别家上的同一个模型
+    PreviewAlias: POST "/aliases/preview", api::AliasPreviewRequest => api::AliasPreview;
+    /// 保存，可以改名：引用旧名的密钥（`allow` 里的整项）和规则（`when.model`、
+    /// `set.model`）在同一个版本里跟着改
+    UpdateAlias: PUT "/aliases/{name}" [name], api::AliasSave => api::AliasWritten;
+    /// 删掉。**引用它的密钥和规则不拦**：删之前先看 `AliasUsage`
+    DeleteAlias: DELETE "/aliases/{name}" [name], api::BaseVersion => api::ConfigWritten;
+    /// 谁在用它：24 小时的请求、密钥、规则
+    AliasUsage: GET "/aliases/{name}/usage" [name], () => api::AliasUsage;
+
     // ─────────────────────────────────────────────── 路由
     CreateRoute: POST "/routes", api::RouteSave => api::ConfigWritten;
     UpdateRoute: PUT "/routes/{name}" [name], api::RouteSave => api::ConfigWritten;

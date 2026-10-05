@@ -506,6 +506,196 @@ fn sync_fields(
     Ok(out)
 }
 
+// ─────────────────────────────────────────────────────────── 别名表
+
+/// 别名表在错误信息里叫什么。
+pub const ALIAS: &str = "alias";
+
+/// 别名表的键。**它是一张映射**（名字 → 模型），不是按 `name` 认的列表，所以不走
+/// [`Section`]：新加的接在表的末尾，改名在原位换键（[`tw_yaml::rename_key`]），表的
+/// 顺序是用户定的。
+const ALIASES: &str = "aliases";
+
+/// 新建一个别名（`current` 为 `None`），或者把叫 `current` 的那一个改成 `alias`
+/// —— 名字可以不同，那是改名，**位置不变**；引用它的地方由调用方跟着改
+/// （[`crate::refs::rename_alias`]）。
+///
+/// 一个模型写成字符串，几个写成列表。模型没变就不碰它的值（原来写成 `[a]` 的照旧）。
+/// 表是块式的时候只动这一项；表写成了行内（`aliases: {a: b}`）、或者空着，整张表换成
+/// 块式。
+pub fn upsert_alias(
+    text: &str,
+    current: Option<&str>,
+    alias: &crate::Alias,
+) -> Result<String, EditError> {
+    reject_multiline(&Value::String(alias.name.clone()))?;
+    alias
+        .models
+        .iter()
+        .try_for_each(|m| reject_multiline(&Value::String(m.clone())))?;
+    let doc = parse(text)?;
+    let mut table = alias_table(&doc);
+    let taken = table.iter().position(|(k, _)| *k == alias.name);
+    let value = alias_value(&alias.models);
+    let (index, changed) = match current {
+        None => {
+            if taken.is_some() {
+                return Err(EditError::NameTaken {
+                    what: ALIAS,
+                    name: alias.name.clone(),
+                });
+            }
+            table.push((alias.name.clone(), value.clone()));
+            (table.len() - 1, true)
+        }
+        Some(old) => {
+            let index =
+                table
+                    .iter()
+                    .position(|(k, _)| k == old)
+                    .ok_or_else(|| EditError::NotFound {
+                        what: ALIAS,
+                        name: old.to_string(),
+                    })?;
+            if taken.is_some_and(|i| i != index) {
+                return Err(EditError::NameTaken {
+                    what: ALIAS,
+                    name: alias.name.clone(),
+                });
+            }
+            let changed = models_of(&table[index].1).as_deref() != Some(alias.models.as_slice());
+            table[index].0 = alias.name.clone();
+            if changed {
+                table[index].1 = value.clone();
+            }
+            (index, changed)
+        }
+    };
+    let out = if block_table(text, &doc)? {
+        let mut out = text.to_string();
+        if let Some(old) = current
+            && old != alias.name
+        {
+            out = tw_yaml::rename_key(&out, &[Step::key(ALIASES), Step::key(old)], &alias.name)?;
+        }
+        if changed {
+            out = put_value(
+                &out,
+                &[Step::key(ALIASES), Step::key(&table[index].0)],
+                &value,
+            )?;
+        }
+        out
+    } else if doc.get(ALIASES).is_none() {
+        // 第一个别名：表和这一项一起补出来，缩进和按项加的一样
+        put_value(text, &[Step::key(ALIASES), Step::key(&alias.name)], &value)?
+    } else {
+        put_value(text, &[Step::key(ALIASES)], &table_value(&table))?
+    };
+    check_table(&doc, &out, &table, &alias.name)?;
+    Ok(out)
+}
+
+/// 删掉叫 `name` 的别名。**删掉的是最后一个时，整张表一起删** —— 不写和空表是一回事，
+/// 默认值不写进文件。引用它的地方由调用方决定要不要管。
+pub fn remove_alias(text: &str, name: &str) -> Result<String, EditError> {
+    let doc = parse(text)?;
+    let mut table = alias_table(&doc);
+    let index = table
+        .iter()
+        .position(|(k, _)| k == name)
+        .ok_or_else(|| EditError::NotFound {
+            what: ALIAS,
+            name: name.to_string(),
+        })?;
+    table.remove(index);
+    let out = if table.is_empty() {
+        tw_yaml::remove_key(text, &[Step::key(ALIASES)])?
+    } else if block_table(text, &doc)? {
+        tw_yaml::remove_key(text, &[Step::key(ALIASES), Step::key(name)])?
+    } else {
+        put_value(text, &[Step::key(ALIASES)], &table_value(&table))?
+    };
+    check_table(&doc, &out, &table, name)?;
+    Ok(out)
+}
+
+/// 文件里的别名表，按书写顺序。键一律当字符串（配置读进来时就是这么读的）
+fn alias_table(doc: &Value) -> Vec<(String, Value)> {
+    let Some(Value::Mapping(m)) = doc.get(ALIASES) else {
+        return Vec::new();
+    };
+    m.iter()
+        .filter_map(|(k, v)| Some((key_string(k)?, v.clone())))
+        .collect()
+}
+
+fn key_string(k: &Value) -> Option<String> {
+    match k {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// 一个模型写成字符串，几个写成列表 —— 和 `Aliases` 写回去的样子一样
+fn alias_value(models: &[String]) -> Value {
+    match models {
+        [one] => Value::String(one.clone()),
+        many => Value::Sequence(many.iter().cloned().map(Value::String).collect()),
+    }
+}
+
+/// 文件里一个别名的值读成模型列表。读不成（写成了别的类型）就是 `None`，当作变了
+fn models_of(v: &Value) -> Option<Vec<String>> {
+    match v {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Sequence(xs) => xs.iter().map(|x| x.as_str().map(str::to_string)).collect(),
+        Value::Null => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+fn table_value(table: &[(String, Value)]) -> Value {
+    Value::Mapping(
+        table
+            .iter()
+            .map(|(k, v)| (Value::String(k.clone()), v.clone()))
+            .collect(),
+    )
+}
+
+/// 别名表是不是一张有内容的块式映射：是的话按项改，不是（没有、空着、行内）就整张换
+fn block_table(text: &str, doc: &Value) -> Result<bool, EditError> {
+    let non_empty = matches!(doc.get(ALIASES), Some(Value::Mapping(m)) if !m.is_empty());
+    Ok(non_empty && !tw_yaml::is_flow_at(text, &[Step::key(ALIASES)])?)
+}
+
+/// 语义核对：别名表读回来正是 `table`（**顺序也对**），其余部分和写之前一样。
+fn check_table(
+    before: &Value,
+    out: &str,
+    table: &[(String, Value)],
+    name: &str,
+) -> Result<(), EditError> {
+    let mut expected = before.clone();
+    if let Value::Mapping(m) = &mut expected {
+        if table.is_empty() {
+            m.remove(ALIASES);
+        } else {
+            m.insert(Value::String(ALIASES.into()), table_value(table));
+        }
+    }
+    let got = parse(out).map_err(|e| EditError::SelfCheck(e.to_string()))?;
+    let order = |t: &[(String, Value)]| t.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+    // `Mapping` 比相等不看顺序，顺序单独比
+    if got != expected || order(&alias_table(&got)) != order(table) {
+        return Err(EditError::SelfCheck(format!("{ALIAS} `{name}`")));
+    }
+    Ok(())
+}
+
 fn lookup<'a>(doc: &'a Value, path: &[Step]) -> Option<&'a Value> {
     let mut cur = doc;
     for st in path {
@@ -864,5 +1054,158 @@ providers:
         let v = parse(&out).unwrap();
         assert_eq!(v["pricing"]["auto_update"], false);
         assert!(v["pricing"].get("sheets").is_none(), "{out}");
+    }
+
+    fn alias(name: &str, models: &[&str]) -> crate::Alias {
+        crate::Alias {
+            name: name.into(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    const ALIASES_CFG: &str = "version: 1
+# 别名，顺序是我排的
+aliases:
+  deepseek: DeepSeek-v4  # 只有一家
+  sonnet:
+    - claude-sonnet-5
+    # Bedrock 上叫这个
+    - us.anthropic.claude-sonnet-5-v1:0
+  opus: [claude-opus-5]
+routes: []
+";
+
+    fn aliases_of(text: &str) -> Vec<crate::Alias> {
+        crate::try_parse(&format!("{text}listen:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: default\n    key: tw-a\n"))
+            .unwrap_or_else(|e| panic!("{e}\n{text}"))
+            .aliases
+            .0
+    }
+
+    /// 第一个别名：表和它一起补出来；一个模型写成字符串，几个写成缩进的列表
+    #[test]
+    fn the_first_alias_starts_the_table() {
+        let out = upsert_alias(CFG, None, &alias("x", &["a"])).unwrap();
+        assert!(out.ends_with("aliases:\n  x: a\n"), "{out}");
+        let out = upsert_alias(CFG, None, &alias("z", &["a", "b"])).unwrap();
+        assert!(out.ends_with("aliases:\n  z:\n    - a\n    - b\n"), "{out}");
+        assert!(out.contains("# 两家上游"), "{out}");
+    }
+
+    /// 新的接在末尾；改一个只改它的值，别的项和注释原样；模型没变就不碰值
+    #[test]
+    fn an_alias_is_appended_or_changed_in_place() {
+        let out = upsert_alias(ALIASES_CFG, None, &alias("haiku", &["claude-haiku-5"])).unwrap();
+        assert!(
+            out.contains("  opus: [claude-opus-5]\n  haiku: claude-haiku-5\n"),
+            "{out}"
+        );
+        let names: Vec<_> = aliases_of(&out).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["deepseek", "sonnet", "opus", "haiku"]);
+
+        let out = upsert_alias(
+            ALIASES_CFG,
+            Some("deepseek"),
+            &alias("deepseek", &["DeepSeek-v4", "deepseek-v4"]),
+        )
+        .unwrap();
+        assert!(out.contains("# Bedrock 上叫这个"), "{out}");
+        assert_eq!(
+            aliases_of(&out)[0],
+            alias("deepseek", &["DeepSeek-v4", "deepseek-v4"])
+        );
+        // 没变：一个字节都不动
+        let same = upsert_alias(
+            ALIASES_CFG,
+            Some("opus"),
+            &alias("opus", &["claude-opus-5"]),
+        )
+        .unwrap();
+        assert_eq!(same, ALIASES_CFG);
+    }
+
+    /// 改名在原位：位置、值、注释都不动
+    #[test]
+    fn renaming_an_alias_keeps_its_place() {
+        let out = upsert_alias(
+            ALIASES_CFG,
+            Some("sonnet"),
+            &alias(
+                "claude-sonnet-5",
+                &["claude-sonnet-5", "us.anthropic.claude-sonnet-5-v1:0"],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            ALIASES_CFG.replace("  sonnet:\n", "  claude-sonnet-5:\n")
+        );
+        // 改名同时改模型
+        let out = upsert_alias(ALIASES_CFG, Some("deepseek"), &alias("ds", &["a", "b"])).unwrap();
+        let all = aliases_of(&out);
+        assert_eq!(all[0], alias("ds", &["a", "b"]));
+        assert_eq!(all[1].name, "sonnet");
+        assert!(out.contains("# 别名，顺序是我排的"), "{out}");
+    }
+
+    #[test]
+    fn an_alias_name_that_is_taken_or_missing_is_refused() {
+        let e = upsert_alias(ALIASES_CFG, None, &alias("opus", &["x"])).unwrap_err();
+        assert!(
+            matches!(e, EditError::NameTaken { what: "alias", .. }),
+            "{e}"
+        );
+        let e = upsert_alias(ALIASES_CFG, Some("deepseek"), &alias("opus", &["x"])).unwrap_err();
+        assert!(matches!(e, EditError::NameTaken { .. }), "{e}");
+        let e = upsert_alias(ALIASES_CFG, Some("nope"), &alias("nope", &["x"])).unwrap_err();
+        assert!(
+            matches!(e, EditError::NotFound { what: "alias", .. }),
+            "{e}"
+        );
+        let e = remove_alias(ALIASES_CFG, "nope").unwrap_err();
+        assert!(matches!(e, EditError::NotFound { .. }), "{e}");
+        let e = upsert_alias(ALIASES_CFG, None, &alias("a\nb", &["x"])).unwrap_err();
+        assert!(matches!(e, EditError::Multiline), "{e}");
+    }
+
+    /// 删到最后一个，整张表一起没了
+    #[test]
+    fn removing_aliases_down_to_none_removes_the_table() {
+        let out = remove_alias(ALIASES_CFG, "sonnet").unwrap();
+        assert!(
+            out.contains("  deepseek: DeepSeek-v4  # 只有一家\n  opus:"),
+            "{out}"
+        );
+        let out = remove_alias(&out, "deepseek").unwrap();
+        let out = remove_alias(&out, "opus").unwrap();
+        assert!(!out.contains("aliases"), "{out}");
+        assert!(out.ends_with("routes: []\n"), "{out}");
+    }
+
+    /// 写成行内的表、空着的表：整张换成块式，顺序照旧
+    #[test]
+    fn an_inline_or_empty_table_is_rewritten_as_a_block() {
+        let inline = "version: 1\naliases: {b: x, a: [y, z]}\n";
+        let out = upsert_alias(inline, Some("b"), &alias("c", &["x"])).unwrap();
+        let names: Vec<_> = aliases_of(&out).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["c", "a"], "{out}");
+        let out = remove_alias(inline, "b").unwrap();
+        assert_eq!(aliases_of(&out), [alias("a", &["y", "z"])], "{out}");
+        let out = remove_alias(&out, "a").unwrap();
+        assert_eq!(out, "version: 1\n");
+        let empty = "version: 1\naliases: {}\n";
+        let out = upsert_alias(empty, None, &alias("x", &["y"])).unwrap();
+        assert_eq!(aliases_of(&out), [alias("x", &["y"])], "{out}");
+    }
+
+    /// 要加引号的名字加上引号，读回来还是它
+    #[test]
+    fn an_alias_name_that_needs_quotes_reads_back_as_written() {
+        for name in ["yes", "1.5", "a: b", "x #y"] {
+            let out = upsert_alias(ALIASES_CFG, None, &alias(name, &["m"])).unwrap();
+            assert_eq!(aliases_of(&out)[3], alias(name, &["m"]), "{out}");
+            let out = upsert_alias(ALIASES_CFG, Some("opus"), &alias(name, &["m"])).unwrap();
+            assert_eq!(aliases_of(&out)[2], alias(name, &["m"]), "{out}");
+        }
     }
 }
