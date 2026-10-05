@@ -866,6 +866,55 @@ groups:
         assert_eq!(m.arg("field"), "groups[0].providers[1].wieght", "{m:?}");
     }
 
+    /// `balance_by` 写在不是负载均衡的组上：加载时就拒绝，它在那里什么都不做。写在负载
+    /// 均衡组上的照收，写回时原样；默认的不写进去
+    #[test]
+    fn balance_by_belongs_to_load_balance_groups_and_round_trips() {
+        let text = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: a
+    base_url: https://a.example
+    key: sk-a
+  - name: b
+    base_url: https://b.example
+    key: sk-b
+groups:
+  - name: pool
+    type: load-balance
+    providers: [a, b]
+    balance_by: latency-health
+";
+        let cfg = crate::try_parse(text).unwrap();
+        assert_eq!(
+            cfg.groups[0].balance_by,
+            tw_engine::BalanceBy::LatencyHealth
+        );
+        let back = serde_yaml_ng::to_string(&cfg.groups).unwrap();
+        assert!(back.contains("balance_by: latency-health"), "{back}");
+
+        let fallback = text.replace("type: load-balance", "type: fallback");
+        let m = crate::try_parse(&fallback).unwrap_err().msg();
+        assert_eq!(m.code, "engine.group_balance_not_load_balance", "{m:?}");
+        assert_eq!(
+            (m.arg("group"), m.arg("balance_by")),
+            ("pool", "latency-health")
+        );
+        // 写明默认值的照收：它本来就什么都不做
+        let weights = fallback.replace("latency-health", "weights");
+        assert!(crate::try_parse(&weights).is_ok(), "{weights}");
+
+        let plain = text.replace("    balance_by: latency-health\n", "");
+        let cfg = crate::try_parse(&plain).unwrap();
+        let back = serde_yaml_ng::to_string(&cfg.groups).unwrap();
+        assert!(!back.contains("balance_by"), "{back}");
+    }
+
     #[test]
     fn error_messages_say_what_to_do_next() {
         // 错误信息是降低使用难度最有效的杠杆。判据不是「说清

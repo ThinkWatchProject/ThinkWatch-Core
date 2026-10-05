@@ -955,6 +955,7 @@ group with `to`.
 | `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
 | `providers` | list of strings or [`groups[].providers[]`](#cfg-groups-providers) | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`. |
 | `selected` | string | — | For `select`: the chosen member. |
+| `balance_by` | `weights` \| `latency` \| `health` \| `latency-health` | `weights` | For `load-balance`: what the members' weights are multiplied by. `weights`: nothing; the weights alone. `latency`: faster upstreams get more. `health`: upstreams that fail less get more. `latency-health`: both. Other group types take only `weights`. |
 <!-- /generated -->
 
 `fallback` is the default because a single user's machine has no load to
@@ -1000,6 +1001,39 @@ that turn: rules keyed on input size or images do not move a turn halfway,
 unless its input no longer fits the context window of a model the rule sends
 it to. `load-balance` therefore takes turns between new conversations, by
 weight.
+
+`balance_by` lets a `load-balance` group also look at how each upstream has
+been doing lately. Each member's weight is multiplied by a factor, and the
+group shares out requests by the result in the same way as above.
+
+- `weights` (the default): the weights alone.
+- `latency`: faster upstreams get a larger share. Speed is the typical time
+  to first byte, the same measurement `url-test` uses. An upstream twice as
+  fast as the middle of the group has its weight multiplied by four, by at
+  most ten and at least a tenth.
+- `health`: upstreams that fail less get a larger share. It looks at the
+  last 50 requests within the past 30 minutes. Server errors, rate limits,
+  used-up quota or balance, rejected credentials, timeouts and connection
+  errors count as failures; errors caused by the request itself do not, and
+  neither does a client that cancels. An upstream that keeps failing keeps a
+  twentieth of its weight, so it still gets the occasional new conversation
+  and its recovery is noticed; one that fails outright is set aside by
+  [`failover`](#cfg-failover) as before.
+- `latency-health`: both factors, multiplied.
+
+An upstream without enough measurements yet counts as average. As with
+weights alone, conversations in progress stay where they are, and new
+conversations make up the difference.
+
+```yaml
+groups:
+  - name: pool
+    type: load-balance
+    balance_by: latency-health
+    providers:
+      - { name: official, weight: 3 }
+      - relay
+```
 
 ### `routes`
 

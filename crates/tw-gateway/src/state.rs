@@ -363,7 +363,7 @@ impl AppState {
         self.pricing.rcu(|book| book.with_table(table.clone()));
     }
 
-    /// 策略组排序要的运行时数字（[`tw_engine::Facts`]），只取 `kind` 用得上的那几样。
+    /// 策略组排序要的运行时数字（[`tw_engine::Facts`]），只取组 `g` 用得上的那几样。
     ///
     /// **数据面和试算共用这一个**，喂给同一个 `order`：试算说会排给谁，数据面就排给谁。
     /// `sent` 是每一家和发给它的模型名（比价按它算）；`current_weight` 是 `load-balance`
@@ -372,28 +372,38 @@ impl AppState {
     pub fn group_facts(
         &self,
         providers: &[tw_config::Provider],
-        kind: tw_engine::GroupType,
+        g: &tw_engine::Group,
         candidates: &[String],
         sent: &[(String, String)],
         current_weight: Option<std::collections::HashMap<String, i64>>,
     ) -> tw_engine::Facts {
         use tw_engine::GroupType;
+        let balanced = g.kind == GroupType::LoadBalance;
         tw_engine::Facts {
             current_weight: current_weight.unwrap_or_default(),
             // 熔断着、冷却着的不参加这一轮：它们反正会被跳过
-            paused: match kind {
-                GroupType::LoadBalance => candidates
+            paused: if balanced {
+                candidates
                     .iter()
                     .filter(|p| !self.health.is_available(p))
                     .cloned()
-                    .collect(),
-                _ => Default::default(),
+                    .collect()
+            } else {
+                Default::default()
             },
-            ttfb_ms: match kind {
-                GroupType::UrlTest => self.latency.snapshot(candidates),
-                _ => Default::default(),
+            // `url-test` 选最快的；`load-balance` 按快慢分的也看它
+            ttfb_ms: if g.kind == GroupType::UrlTest || (balanced && g.balance_by.uses_latency()) {
+                self.latency.snapshot(candidates)
+            } else {
+                Default::default()
             },
-            price: match kind {
+            // `load-balance` 按成败分时看每家最近的成功率
+            success: if balanced && g.balance_by.uses_health() {
+                self.health.success_rates(candidates)
+            } else {
+                Default::default()
+            },
+            price: match g.kind {
                 // 每一家按发给它的名字算价钱：同一个别名在各家是各家的模型名、各家的价目
                 GroupType::Cheapest => self.unit_prices(providers, sent, candidates),
                 _ => Default::default(),

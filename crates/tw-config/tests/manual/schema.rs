@@ -11,7 +11,7 @@ use super::{Def, Kind, Lang, Row, Section, T2};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
-use tw_engine::{Group, GroupType, Member, Pinned, RouteSet, Rule, SetAction};
+use tw_engine::{BalanceBy, Group, GroupType, Member, Pinned, RouteSet, Rule, SetAction};
 use tw_pricing::{PerMillion, PricingConfig, SheetDef};
 
 const fn t(en: &'static str, zh: &'static str) -> T2 {
@@ -57,6 +57,9 @@ fn content_matches() -> Vec<&'static str> {
 }
 fn group_types() -> Vec<&'static str> {
     super::fields::<GroupType>()
+}
+fn balance_bys() -> Vec<&'static str> {
+    super::fields::<BalanceBy>()
 }
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
@@ -1248,6 +1251,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "For `select`: the chosen member.",
                         "`select` 类型选中的成员。",
+                    ),
+                ),
+                row(
+                    "balance_by",
+                    Kind::Enum(balance_bys),
+                    Def::Is("weights"),
+                    t(
+                        "For `load-balance`: what the members' weights are multiplied by. `weights`: nothing; the weights alone. `latency`: faster upstreams get more. `health`: upstreams that fail less get more. `latency-health`: both. Other group types take only `weights`.",
+                        "`load-balance` 类型用：成员的权重再乘上什么。`weights`：不乘，只按权重。`latency`：越快的上游分得越多。`health`：越少失败的上游分得越多。`latency-health`：两者都看。其他类型只能是 `weights`。",
                     ),
                 ),
             ],

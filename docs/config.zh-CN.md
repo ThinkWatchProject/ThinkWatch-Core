@@ -750,6 +750,7 @@ aliases:
 | `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话按成员的权重轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。 |
 | `providers` | 列表，每项是字符串或对象，对象见 [`groups[].providers[]`](#cfg-groups-providers) | **必填** | 成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。`load-balance` 组的成员可以写成 `{name, weight}`。 |
 | `selected` | 字符串 | — | `select` 类型选中的成员。 |
+| `balance_by` | `weights` \| `latency` \| `health` \| `latency-health` | `weights` | `load-balance` 类型用：成员的权重再乘上什么。`weights`：不乘，只按权重。`latency`：越快的上游分得越多。`health`：越少失败的上游分得越多。`latency-health`：两者都看。其他类型只能是 `weights`。 |
 <!-- /generated -->
 
 默认类型为 `fallback`：单个使用者的机器上没有需要分散的负载。
@@ -775,6 +776,25 @@ groups:
 ```
 
 无论哪种类型，一段对话都留在上次回答它的那一家上游，让上游缓存着的那部分被再次读取，而不是换一家全价重算。同一轮之内（客户端正在回传工具结果）一律不换；跨轮时，上一次回答读或写了至少 1024 个 token 的 prompt cache、且距今不到五分钟，才继续留下。上游因失败进入冷却时，对话随之放开；故障转移之后接下回答的那一家，就是之后留下的那一家。一轮开始时命中的规则也沿用到这一轮结束：按输入大小或图片分流的规则不会让一轮半路换家，除非输入已经超出规则所指模型的上下文窗口。因此 `load-balance` 按权重轮流的是新对话。
+
+`balance_by` 让 `load-balance` 组再看各上游最近的表现：每个成员的权重乘上一个系数，组内请求按乘出来的结果照上文的方式分。
+
+- `weights`（默认）：只按权重。
+- `latency`：越快的上游分得越多。快慢看典型的首字节时间，与 `url-test` 使用同一份测量。比组内居中者快一倍的上游，权重乘以四；最多乘以十，最少乘以十分之一。
+- `health`：越少失败的上游分得越多。依据是最近 30 分钟内的最近 50 次请求：服务器错误、限流、额度或余额用尽、凭据被拒、超时和连接失败算作失败；请求本身导致的错误不算，客户端取消也不算。经常失败的上游至少保留权重的二十分之一，仍会偶尔分到新对话，以便发现它已经恢复；完全失败的上游照旧由 [`failover`](#cfg-failover) 暂停。
+- `latency-health`：两个系数相乘。
+
+测量还不够的上游按中等对待。与只按权重时一样，进行中的对话留在原来的上游，差额由新对话补齐。
+
+```yaml
+groups:
+  - name: 均摊
+    type: load-balance
+    balance_by: latency-health
+    providers:
+      - { name: 官方, weight: 3 }
+      - 中转
+```
 
 ### `routes`
 

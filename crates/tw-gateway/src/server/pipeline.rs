@@ -676,7 +676,7 @@ fn route(
     {
         let f = state.group_facts(
             &rt.config.providers,
-            g.kind,
+            g,
             &decision.candidates,
             &crate::sent::pairs(&sent),
             turn.as_ref().map(crate::balance::Turn::current),

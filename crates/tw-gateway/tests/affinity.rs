@@ -61,6 +61,7 @@ fn cfg(up: SocketAddr) -> Config {
             kind: tw_engine::GroupType::LoadBalance,
             providers: vec!["甲".into(), "乙".into()],
             selected: None,
+            balance_by: Default::default(),
         }],
         routes: vec![RouteSet::default_with(vec![
             rule("大输入", "{ input_tokens: \">2000\" }", "乙"),

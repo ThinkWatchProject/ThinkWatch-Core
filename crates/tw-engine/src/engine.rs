@@ -26,7 +26,8 @@ pub enum GroupType {
     Fallback,
     /// 手动指定一个。缓存友好
     Select,
-    /// 按成员的权重轮流（平滑加权轮询，见 [`crate::weighted`]），权重都是 1 就是挨个轮。
+    /// 按成员的权重轮流（平滑加权轮询，见 [`crate::weighted`]），权重都是 1 就是挨个轮；
+    /// `balance_by` 还可以按快慢、成败给权重乘一个系数（[`BalanceBy`]）。
     /// **轮的是新对话**：已经有人回答过、缓存还热着的对话留在那一家
     LoadBalance,
     /// 选最快的。判据是**真实流量测出来的 TTFB**，样本不够时用启动时
@@ -66,6 +67,130 @@ impl GroupType {
     }
 }
 
+/// `load-balance` 按什么分新对话（[`Group::balance_by`]）。
+///
+/// **成员的权重永远是底数**：快慢、成败算出一个系数（[`balance_factors`]），乘在每一家
+/// 的权重上，平滑加权轮询按乘出来的数轮（[`crate::weighted`]）。分的只是新对话 ——
+/// 进行中的对话照旧留在回答它的那一家（`tw_gateway::affinity`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BalanceBy {
+    /// 只按成员的权重
+    #[default]
+    Weights,
+    /// 越快的分得越多：看首字节时间，和 `url-test` 同一份样本
+    Latency,
+    /// 越少失败的分得越多：看最近的成功率
+    Health,
+    /// 两样一起看：两个系数相乘
+    LatencyHealth,
+}
+
+impl BalanceBy {
+    /// 配置里写的那个词，也是控制面发给界面的值
+    pub fn slug(&self) -> &'static str {
+        match self {
+            BalanceBy::Weights => "weights",
+            BalanceBy::Latency => "latency",
+            BalanceBy::Health => "health",
+            BalanceBy::LatencyHealth => "latency-health",
+        }
+    }
+
+    /// 是不是默认的「只按成员的权重」。**写回配置时默认值不写**，老配置原样往返
+    pub fn is_weights(&self) -> bool {
+        *self == BalanceBy::Weights
+    }
+
+    /// 要不要每家的首字节时间（[`Facts::ttfb_ms`]）
+    pub fn uses_latency(&self) -> bool {
+        matches!(self, BalanceBy::Latency | BalanceBy::LatencyHealth)
+    }
+
+    /// 要不要每家的成功率（[`Facts::success`]）
+    pub fn uses_health(&self) -> bool {
+        matches!(self, BalanceBy::Health | BalanceBy::LatencyHealth)
+    }
+}
+
+/// 快慢系数的范围。**两头都要夹**：快十倍的一家不该把别家饿死（它们还要被测到、还要
+/// 做故障转移的备选），慢的那家也还该偶尔被试到，否则它变快了没人知道
+const LATENCY_FACTOR_MIN: f64 = 0.1;
+const LATENCY_FACTOR_MAX: f64 = 10.0;
+
+/// 成败系数的下限。**不是 0**：常失败的那家照样偶尔分到一个新对话，它恢复了才看得出来。
+/// 一直失败的由熔断停用（`tw_gateway::health`），不归这里管
+const HEALTH_FACTOR_FLOOR: f64 = 0.05;
+
+/// `load-balance` 每一家的系数，和 `members` 一一对应：**成员的权重乘上它**，就是这一家
+/// 这一轮的有效权重（[`crate::weighted`] 按它轮）。`weights` 全是 1。
+///
+/// - 快慢：(测到的那几家首字节时间的中位数 ÷ 这一家的)²，夹在 0.1 到 10 之间。平方让差别
+///   看得出来：快一倍的分到四倍。
+/// - 成败：成功率²，最低 0.05。
+/// - **没有样本的那一项算 1，就是「中等」**：新加的上游会被试到，但不会一上来就被灌满。
+///
+/// **纯函数**，和 [`order_by`] 一样：数据面和试算页喂的是同一份数字。
+pub fn balance_factors(by: BalanceBy, members: &[String], f: &Facts) -> Vec<f64> {
+    let typical = if by.uses_latency() {
+        median_ttfb(members, f)
+    } else {
+        None
+    };
+    members
+        .iter()
+        .map(|m| {
+            let mut x = 1.0;
+            if let Some(mid) = typical
+                && let Some(t) = f.ttfb_ms.get(m)
+            {
+                x *= latency_factor(mid, *t);
+            }
+            if by.uses_health()
+                && let Some(s) = f.success.get(m)
+            {
+                x *= health_factor(*s);
+            }
+            x
+        })
+        .collect()
+}
+
+/// 测到了的那几家首字节时间的中位数，毫秒。一家都没测到是 `None`。
+///
+/// 偶数家时取中间两家的平均：系数围着它往两头夹，取其中一家的话，夹的那一刀会偏向一边
+fn median_ttfb(members: &[String], f: &Facts) -> Option<f64> {
+    let mut v: Vec<u32> = members
+        .iter()
+        .filter_map(|m| f.ttfb_ms.get(m).copied())
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let n = v.len();
+    Some(if n % 2 == 1 {
+        f64::from(v[n / 2])
+    } else {
+        (f64::from(v[n / 2 - 1]) + f64::from(v[n / 2])) / 2.0
+    })
+}
+
+/// 快慢系数。**不到 1 毫秒的按 1 毫秒算**：本机的假上游、或者垫底的握手计时可能是 0
+fn latency_factor(median_ms: f64, ttfb_ms: u32) -> f64 {
+    let ratio = median_ms.max(1.0) / f64::from(ttfb_ms.max(1));
+    (ratio * ratio).clamp(LATENCY_FACTOR_MIN, LATENCY_FACTOR_MAX)
+}
+
+/// 成败系数。不是一个数（NaN）的当作没有样本
+fn health_factor(success: f64) -> f64 {
+    if success.is_nan() {
+        return 1.0;
+    }
+    let s = success.clamp(0.0, 1.0);
+    (s * s).max(HEALTH_FACTOR_FLOOR)
+}
+
 /// 排顺序时才知道的那些数字。**引擎是纯函数，这些从外面传进来** ——
 /// 于是数据面和试算页走的是同一段逻辑，试算不会「算出一个
 /// 和真实转发不一样的结果」。
@@ -82,6 +207,9 @@ pub struct Facts {
     /// 每家跑这个模型的单价，(输入, 输出)，微分/百万 token。
     /// **缺席 = 算不出价钱**，不是「免费」
     pub price: std::collections::HashMap<String, (i64, i64)>,
+    /// 每家最近的成功率，0 到 1（`load-balance` 按成败分时用）。**缺席 = 样本不够**，
+    /// 不是「从不失败」
+    pub success: std::collections::HashMap<String, f64>,
 }
 
 /// 一组上游，以及从里面挑一个的策略。
@@ -102,6 +230,9 @@ pub struct Group {
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+    /// `load-balance` 用：按什么分新对话（见 [`BalanceBy`]）。默认只按成员的权重，不写回配置
+    #[serde(default, skip_serializing_if = "BalanceBy::is_weights")]
+    pub balance_by: BalanceBy,
 }
 
 impl Group {
@@ -597,6 +728,8 @@ pub enum RouteError {
         weight: u32,
     },
     #[error("{}", self.msg())]
+    GroupBalanceNotLoadBalance { group: String, by: BalanceBy },
+    #[error("{}", self.msg())]
     DuplicateRoute(String),
     #[error("{}", self.msg())]
     UnknownDefaultRoute(String),
@@ -677,6 +810,11 @@ impl RouteError {
                 weight = weight =>
                 "group `{group}` gives upstream `{upstream}` a weight of {weight}. A weight is a \
                  whole number from 1 to 100"
+            ),
+            RouteError::GroupBalanceNotLoadBalance { group, by } => msg!(
+                "engine.group_balance_not_load_balance", group = group, balance_by = by.slug() =>
+                "group `{group}` sets balance_by `{balance_by}`, which only a load-balance group \
+                 uses. Remove it, or make the group load-balance"
             ),
             RouteError::DuplicateRoute(route) => msg!(
                 "engine.duplicate_route", route = route =>
@@ -812,6 +950,7 @@ impl Engine {
                 kind: GroupType::Fallback,
                 providers: providers.iter().map(Member::named).collect(),
                 selected: None,
+                balance_by: Default::default(),
             });
         }
         // **默认路由必须永远存在。**判据是「有没有叫这个名字的路由」，
@@ -984,6 +1123,14 @@ impl Engine {
                         weight: m.weight,
                     });
                 }
+            }
+            // 按快慢、成败分只有 `load-balance` 用得上：别的类型写了也不起作用，而写的人
+            // 以为它在起作用。控制面保存时就拦着（`control.group.balance_not_load_balance`）
+            if g.kind != GroupType::LoadBalance && !g.balance_by.is_weights() {
+                return Err(RouteError::GroupBalanceNotLoadBalance {
+                    group: g.name.clone(),
+                    by: g.balance_by,
+                });
             }
         }
         for set in &self.sets {
@@ -1626,6 +1773,7 @@ mod tests {
             kind: GroupType::Fallback,
             providers: vec!["official".into(), "relay".into()],
             selected: None,
+            balance_by: Default::default(),
         };
         let e = Engine::with_default_rules(
             vec!["official".into(), "relay".into()],
@@ -1646,6 +1794,7 @@ mod tests {
             kind: GroupType::Select,
             providers: vec!["a".into(), "b".into(), "c".into()],
             selected: Some("b".into()),
+            balance_by: Default::default(),
         };
         let e = Engine::with_default_rules(
             vec!["a".into(), "b".into(), "c".into()],
@@ -1683,6 +1832,7 @@ mod tests {
             kind: GroupType::Fallback,
             providers: vec![],
             selected: None,
+            balance_by: Default::default(),
         };
         let e =
             Engine::with_default_rules(vec!["a".into()], vec![g], vec![route("x", "{}", "empty")]);
@@ -2053,6 +2203,7 @@ mod tests {
             kind,
             providers: vec!["甲".into(), "乙".into(), "丙".into()],
             selected: None,
+            balance_by: Default::default(),
         }
     }
 
@@ -2323,6 +2474,7 @@ mod builtin_tests {
             kind: GroupType::Fallback,
             providers: vec!["a".into()],
             selected: None,
+            balance_by: Default::default(),
         };
         let e = Engine::with_default_rules(
             vec!["a".into()],
@@ -2361,6 +2513,7 @@ mod builtin_tests {
             kind: GroupType::Fallback,
             providers: vec!["a".into(), "b".into(), "a".into()],
             selected: None,
+            balance_by: Default::default(),
         };
         let e = Engine::with_default_rules(
             vec!["a".into(), "b".into()],
@@ -2460,6 +2613,7 @@ mod pinned_tests {
                 kind: GroupType::LoadBalance,
                 providers: vec!["relay".into(), "anthropic".into()],
                 selected: None,
+                balance_by: Default::default(),
             }],
             rules,
         )
@@ -2864,6 +3018,234 @@ to:
     }
 }
 
+/// `load-balance` 按快慢、成败分：系数怎么算、写在哪种组上算错。
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn ttfb(v: &[(&str, u32)]) -> HashMap<String, u32> {
+        v.iter().map(|(n, t)| (n.to_string(), *t)).collect()
+    }
+
+    fn success(v: &[(&str, f64)]) -> HashMap<String, f64> {
+        v.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    fn close(got: &[f64], want: &[f64]) {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-9, "{got:?} ≠ {want:?}");
+        }
+    }
+
+    #[test]
+    fn weights_alone_leaves_every_member_at_one_whatever_was_measured() {
+        let f = Facts {
+            ttfb_ms: ttfb(&[("甲", 100), ("乙", 900)]),
+            success: success(&[("甲", 0.1)]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(BalanceBy::Weights, &names(&["甲", "乙", "丙"]), &f),
+            &[1.0, 1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn latency_compares_each_member_with_the_median_squared() {
+        // 中位数 200：快一倍的分到四倍，慢一倍的四分之一
+        let f = Facts {
+            ttfb_ms: ttfb(&[("甲", 100), ("乙", 200), ("丙", 400)]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(BalanceBy::Latency, &names(&["甲", "乙", "丙"]), &f),
+            &[4.0, 1.0, 0.25],
+        );
+    }
+
+    #[test]
+    fn an_even_count_takes_the_middle_two_and_the_order_of_members_does_not_matter() {
+        // 中位数 (100 + 400) / 2 = 250
+        let f = Facts {
+            ttfb_ms: ttfb(&[("甲", 400), ("乙", 100)]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(BalanceBy::Latency, &names(&["甲", "乙"]), &f),
+            &[0.390625, 6.25],
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_member_counts_as_average_and_does_not_move_the_median() {
+        // 新加的上游被试到，但不一上来就被灌满。**中位数只看测到了的成员**：组外那一家
+        // 的数字也不算
+        let f = Facts {
+            ttfb_ms: ttfb(&[("甲", 100), ("乙", 400), ("组外", 5)]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(BalanceBy::Latency, &names(&["甲", "新来的", "乙"]), &f),
+            &[6.25, 1.0, 0.390625],
+        );
+        // 一家都没测到：全是 1
+        close(
+            &balance_factors(BalanceBy::Latency, &names(&["甲", "乙"]), &Facts::default()),
+            &[1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn the_latency_factor_is_clamped_between_a_tenth_and_ten() {
+        // 中位数 1000：快一百倍的本该是一万倍，慢一百倍的本该是万分之一
+        let f = Facts {
+            ttfb_ms: ttfb(&[("快", 10), ("中", 1000), ("慢", 100_000)]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(BalanceBy::Latency, &names(&["快", "中", "慢"]), &f),
+            &[10.0, 1.0, 0.1],
+        );
+        // 0 毫秒按 1 毫秒算，不除以零
+        let f = Facts {
+            ttfb_ms: ttfb(&[("零", 0), ("一", 1)]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(BalanceBy::Latency, &names(&["零", "一"]), &f),
+            &[1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn health_squares_the_success_rate_and_keeps_a_floor() {
+        let f = Facts {
+            success: success(&[
+                ("全成", 1.0),
+                ("一半", 0.5),
+                ("偶尔成", 0.2),
+                ("全败", 0.0),
+                ("坏数", f64::NAN),
+            ]),
+            ..Default::default()
+        };
+        close(
+            &balance_factors(
+                BalanceBy::Health,
+                &names(&["全成", "一半", "偶尔成", "全败", "坏数", "没样本"]),
+                &f,
+            ),
+            // 0.2² = 0.04 也抬到下限：常失败的那家照样偶尔分到一个，恢复了才看得出来
+            &[1.0, 0.25, 0.05, 0.05, 1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn latency_and_health_multiply() {
+        let f = Facts {
+            ttfb_ms: ttfb(&[("甲", 100), ("乙", 200), ("丙", 400)]),
+            success: success(&[("甲", 0.5), ("丙", 1.0)]),
+            ..Default::default()
+        };
+        let members = names(&["甲", "乙", "丙"]);
+        close(
+            &balance_factors(BalanceBy::LatencyHealth, &members, &f),
+            &[1.0, 1.0, 0.25],
+        );
+        // 单看一样时另一样不算进去
+        close(
+            &balance_factors(BalanceBy::Health, &members, &f),
+            &[0.25, 1.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn balance_by_reads_writes_and_is_left_out_when_it_is_the_default() {
+        let g: Group = serde_yaml_ng::from_str(
+            "name: g\ntype: load-balance\nproviders: [a, b]\nbalance_by: latency-health\n",
+        )
+        .unwrap();
+        assert_eq!(g.balance_by, BalanceBy::LatencyHealth);
+        let back = serde_yaml_ng::to_string(&g).unwrap();
+        assert!(back.contains("balance_by: latency-health"), "{back}");
+        for by in [
+            BalanceBy::Weights,
+            BalanceBy::Latency,
+            BalanceBy::Health,
+            BalanceBy::LatencyHealth,
+        ] {
+            let text = format!(
+                "name: g\ntype: load-balance\nproviders: [a]\nbalance_by: {}\n",
+                by.slug()
+            );
+            let g: Group = serde_yaml_ng::from_str(&text).unwrap();
+            assert_eq!(g.balance_by, by);
+        }
+
+        // 不写就是只按比例，写回时也不写：老配置原样往返
+        let g: Group =
+            serde_yaml_ng::from_str("name: g\ntype: load-balance\nproviders: [a]\n").unwrap();
+        assert_eq!(g.balance_by, BalanceBy::Weights);
+        let back = serde_yaml_ng::to_string(&g).unwrap();
+        assert!(!back.contains("balance_by"), "{back}");
+
+        let e = serde_yaml_ng::from_str::<Group>(
+            "name: g\ntype: load-balance\nproviders: [a]\nbalance_by: speed\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("speed"), "{e}");
+    }
+
+    fn engine_with(kind: GroupType, by: BalanceBy) -> Engine {
+        Engine::with_default_rules(
+            vec!["a".into(), "b".into()],
+            vec![Group {
+                name: "pool".into(),
+                kind,
+                providers: vec!["a".into(), "b".into()],
+                selected: None,
+                balance_by: by,
+            }],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn only_a_load_balance_group_may_balance_by_latency_or_health() {
+        assert_eq!(
+            engine_with(GroupType::LoadBalance, BalanceBy::LatencyHealth).validate(),
+            Ok(())
+        );
+        for kind in [
+            GroupType::Fallback,
+            GroupType::Select,
+            GroupType::UrlTest,
+            GroupType::Cheapest,
+        ] {
+            // 写明默认值不算错：它本来就什么都不做
+            assert_eq!(engine_with(kind, BalanceBy::Weights).validate(), Ok(()));
+            let e = engine_with(kind, BalanceBy::Health).validate().unwrap_err();
+            assert_eq!(
+                e,
+                RouteError::GroupBalanceNotLoadBalance {
+                    group: "pool".into(),
+                    by: BalanceBy::Health,
+                },
+                "{kind:?}"
+            );
+            let m = e.msg();
+            assert_eq!(m.code, "engine.group_balance_not_load_balance");
+            assert_eq!((m.arg("group"), m.arg("balance_by")), ("pool", "health"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod msg_codes {
     use super::*;
@@ -2894,6 +3276,10 @@ mod msg_codes {
             RouteError::GroupUnknownUpstream {
                 group: "g".into(),
                 provider: "p".into(),
+            },
+            RouteError::GroupBalanceNotLoadBalance {
+                group: "g".into(),
+                by: BalanceBy::Latency,
             },
             RouteError::DuplicateRoute("x".into()),
             RouteError::UnknownDefaultRoute("x".into()),

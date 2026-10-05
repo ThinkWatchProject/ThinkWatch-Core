@@ -8,37 +8,84 @@
 
 use axum::{Json, extract::State, http::StatusCode};
 
-/// 和数据面同一段排序。
+/// 经过的组，和给它排序要的那些数字：和数据面同一份延迟表、成功率、价目表、轮询状态。
+/// 没经过组、或者组的顺序用不着运行时的数字（`fallback`、`select`）时是 None。
 ///
 /// 试算页存在的全部意义是「告诉你这条请求会走哪儿」，所以它**必须**用
 /// 同一个函数、同一份数字 —— 各算各的话，两边迟早会不一样，而那时
-/// 试算比没有更糟。`sent` 是每一家和发给它的模型名：比价按它算，和数据面一样。
+/// 试算比没有更糟。数字由 [`tw_gateway::AppState::group_facts`] 取，数据面也调它。
+/// `sent` 是每一家和发给它的模型名：比价按它算，和数据面一样。
 ///
 /// `load-balance` 读的是数据面记着的那一份轮询状态，**只读不记**
 /// （[`tw_gateway::balance::Balance::peek`]）：试算说的是下一个新对话会排给谁，
 /// 试算了几次都不该改变这个答案，也不该让数据面跳过谁。
-fn order_like_the_data_plane(
+fn runtime_facts<'e>(
     s: &crate::ControlState,
-    engine: &tw_engine::Engine,
+    engine: &'e tw_engine::Engine,
     d: &tw_engine::Decision,
     sent: &[(String, String)],
-) -> Vec<String> {
-    let Some(g) = d
-        .via_group
-        .as_deref()
-        .and_then(|n| engine.groups().iter().find(|g| g.name == n))
-    else {
-        return d.candidates.clone();
-    };
+) -> Option<(&'e tw_engine::Group, tw_engine::Facts)> {
+    let gname = d.via_group.as_deref()?;
+    let g = engine.groups().iter().find(|g| g.name == gname)?;
     if !g.kind.needs_runtime() {
-        return d.candidates.clone();
+        return None;
     }
     let cfg = s.config();
     let current = (g.kind == tw_engine::GroupType::LoadBalance).then(|| s.gateway.balance.peek(g));
     let facts = s
         .gateway
-        .group_facts(&cfg.providers, g.kind, &d.candidates, sent, current);
-    engine.order(Some(&g.name), &d.candidates, &facts)
+        .group_facts(&cfg.providers, g, &d.candidates, sent, current);
+    Some((g, facts))
+}
+
+/// 和数据面同一段排序（见 [`runtime_facts`]）。
+fn order_like_the_data_plane(
+    engine: &tw_engine::Engine,
+    d: &tw_engine::Decision,
+    runtime: Option<&(&tw_engine::Group, tw_engine::Facts)>,
+) -> Vec<String> {
+    match runtime {
+        Some((g, facts)) => engine.order(Some(&g.name), &d.candidates, facts),
+        None => d.candidates.clone(),
+    }
+}
+
+/// 一家候选的排序依据：典型首字节时间、最近的成功率、按它们算出的系数。**只给顺序
+/// 真用到的那几样**（[`runtime_facts`] 只取用得上的）—— `url-test` 看首字节时间；
+/// `load-balance` 按 `balance_by` 看快慢、成败，系数乘在权重上。用不着的、没有样本的
+/// 是 None。
+struct Basis {
+    ttfb_ms: Option<u32>,
+    success_rate: Option<f64>,
+    balance_factor: Option<f64>,
+}
+
+/// 每一家候选的排序依据，按 `d.candidates` 的名字查。系数和数据面一样按这份候选、
+/// 这份数字算（`tw_engine::balance_factors`）
+fn bases(
+    d: &tw_engine::Decision,
+    runtime: Option<&(&tw_engine::Group, tw_engine::Facts)>,
+) -> std::collections::HashMap<String, Basis> {
+    let Some((g, f)) = runtime else {
+        return Default::default();
+    };
+    let factors = if g.kind == tw_engine::GroupType::LoadBalance && !g.balance_by.is_weights() {
+        tw_engine::balance_factors(g.balance_by, &d.candidates, f)
+    } else {
+        Vec::new()
+    };
+    d.candidates
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let basis = Basis {
+                ttfb_ms: f.ttfb_ms.get(name).copied(),
+                success_rate: f.success.get(name).copied(),
+                balance_factor: factors.get(i).copied(),
+            };
+            (name.clone(), basis)
+        })
+        .collect()
 }
 use tw_engine::{Outcome, RequestFacts, RouteError};
 
@@ -198,6 +245,7 @@ pub async fn dry_run(
         route,
         outcome: short.unwrap_or(DryRunOutcome::NoMatch),
         strategy: None,
+        balance_by: None,
         rule: None,
         reason: None,
         candidates: Vec::new(),
@@ -220,11 +268,14 @@ pub async fn dry_run(
             out.rule = Some(d.matched_rule.clone());
             out.via_group = d.via_group.clone();
             out.set = describe(&d.set);
-            out.strategy = d
+            let group = d
                 .via_group
                 .as_deref()
-                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .map(|g| crate::routes::group_kind(g.kind));
+                .and_then(|g| engine.groups().iter().find(|x| x.name == g));
+            out.strategy = group.map(|g| crate::routes::group_kind(g.kind));
+            out.balance_by = group
+                .filter(|g| g.kind == tw_engine::GroupType::LoadBalance)
+                .map(|g| crate::routes::balance_by_view(g.balance_by));
             // 和数据面同一步：去掉服务不了这个请求的候选（停用的、范围外的、
             // 清单里没有这个模型的）。**被跳过的要列出来** —— 「规则明明写的
             // 是 A」正是用户会来试算的原因
@@ -269,20 +320,20 @@ pub async fn dry_run(
             // 而它属于哪次会话取决于请求正文，试算没有那个东西。
             // 于是它显示的是轮询此刻轮到的位置 —— 而那正是一个新对话
             // 真的会走的路。
-            out.candidates =
-                order_like_the_data_plane(&s, engine, &d, &tw_gateway::sent::pairs(&sent));
+            let runtime = runtime_facts(&s, engine, &d, &tw_gateway::sent::pairs(&sent));
+            out.candidates = order_like_the_data_plane(engine, &d, runtime.as_ref());
             // `load-balance` 的候选带上各自的权重：排头的为什么是它，一半在这个数里
-            let balanced = d
-                .via_group
-                .as_deref()
-                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
-                .filter(|g| g.kind == tw_engine::GroupType::LoadBalance);
-            // 每一家收到的模型名，和为什么不是请求里写的那个
+            let balanced = group.filter(|g| g.kind == tw_engine::GroupType::LoadBalance);
+            // 每一家收到的模型名，和为什么不是请求里写的那个；顺序看运行时数字的，再加上
+            // 每一家的那几个数字（权重、首字节时间、成功率、系数）—— 「为什么轮到它」
+            // 要能从这里看出来
+            let mut basis_of = bases(&d, runtime.as_ref());
             out.candidate_models = out
                 .candidates
                 .iter()
                 .map(|name| {
                     let one = sent.iter().find(|x| x.provider == *name);
+                    let basis = basis_of.remove(name);
                     tw_api::DryRunCandidate {
                         provider: name.clone(),
                         sent_model: one
@@ -290,6 +341,9 @@ pub async fn dry_run(
                             .filter(|m| !m.is_empty()),
                         model_via: one.and_then(|x| x.via).map(|v| v.slug().to_string()),
                         weight: balanced.map(|g| g.weight(name)),
+                        ttfb_ms: basis.as_ref().and_then(|b| b.ttfb_ms),
+                        success_rate: basis.as_ref().and_then(|b| b.success_rate),
+                        balance_factor: basis.as_ref().and_then(|b| b.balance_factor),
                     }
                 })
                 .collect();

@@ -292,6 +292,7 @@ fn routed_to_an_account(up: SocketAddr) -> Config {
             kind: tw_engine::GroupType::Fallback,
             providers: vec!["订阅账号".into()],
             selected: None,
+            balance_by: Default::default(),
         }],
         routes: vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
             name: "Codex 走账号".into(),

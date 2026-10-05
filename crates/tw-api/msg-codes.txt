@@ -126,6 +126,7 @@ control.device_code_unavailable
 control.device_code_unreadable
 control.disabled_key_cannot_be_default
 control.dryrun_needs_target
+control.group.balance_not_load_balance
 control.group.empty
 control.group.name_is_upstream
 control.group.no_such_upstream
@@ -231,6 +232,7 @@ engine.compare.no_operator
 engine.duplicate_group
 engine.duplicate_route
 engine.empty_group
+engine.group_balance_not_load_balance
 engine.group_unknown_upstream
 engine.group_upstream_twice
 engine.group_weight_not_load_balance

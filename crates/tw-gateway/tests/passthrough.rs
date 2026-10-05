@@ -1197,6 +1197,7 @@ async fn a_phase_two_rule_is_recomputed_after_failover() {
         kind: tw_engine::GroupType::Fallback,
         providers: vec!["official".into(), "relay".into()],
         selected: None,
+        balance_by: Default::default(),
     }];
     cfg.routes[0].rules.last_mut().unwrap().to = Some("全部".into());
 
@@ -1334,6 +1335,7 @@ async fn a_phase_one_set_applies_on_every_attempt_including_after_failover() {
         kind: tw_engine::GroupType::Fallback,
         providers: vec!["dead".into(), "good".into()],
         selected: None,
+        balance_by: Default::default(),
     }];
     let gw = serve_cfg(cfg).await;
     let r = reqwest::Client::new()
@@ -2088,6 +2090,7 @@ async fn the_attempt_chain_records_every_hop_and_why_each_one_failed() {
         kind: tw_engine::GroupType::Fallback,
         providers: vec!["挂了的".into(), "限流的".into(), "好的".into()],
         selected: None,
+        balance_by: Default::default(),
     }];
     cfg.routes = vec![tw_engine::RouteSet::default_with(vec![tw_engine::Rule {
         name: "都走这一组".into(),

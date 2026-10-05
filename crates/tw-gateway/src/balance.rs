@@ -105,6 +105,7 @@ mod tests {
                 })
                 .collect(),
             selected: None,
+            balance_by: Default::default(),
         }
     }
 

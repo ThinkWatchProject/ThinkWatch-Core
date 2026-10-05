@@ -21,7 +21,7 @@ use tw_config::edit::{self, EditError};
 use tw_config::history::Origin;
 use tw_config::refs;
 use tw_engine::rule::{OneOrMany, When};
-use tw_engine::{Group, GroupType, RouteSet, Rule, SetAction};
+use tw_engine::{BalanceBy, Group, GroupType, RouteSet, Rule, SetAction};
 use tw_types::{Msg, msg};
 use tw_yaml::Step;
 
@@ -587,6 +587,25 @@ pub(crate) fn group_weights(g: &Group) -> std::collections::BTreeMap<String, u32
     }
 }
 
+/// `balance_by` 的两份词表，和 [`group_kind`] 同一个理由。
+pub(crate) fn balance_by_view(b: BalanceBy) -> tw_api::BalanceBy {
+    match b {
+        BalanceBy::Weights => tw_api::BalanceBy::Weights,
+        BalanceBy::Latency => tw_api::BalanceBy::Latency,
+        BalanceBy::Health => tw_api::BalanceBy::Health,
+        BalanceBy::LatencyHealth => tw_api::BalanceBy::LatencyHealth,
+    }
+}
+
+fn balance_by_of(b: tw_api::BalanceBy) -> BalanceBy {
+    match b {
+        tw_api::BalanceBy::Weights => BalanceBy::Weights,
+        tw_api::BalanceBy::Latency => BalanceBy::Latency,
+        tw_api::BalanceBy::Health => BalanceBy::Health,
+        tw_api::BalanceBy::LatencyHealth => BalanceBy::LatencyHealth,
+    }
+}
+
 fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group, Msg> {
     let name = checked_name(&input.name, "group")?;
     reserved(&name, "group")?;
@@ -668,6 +687,15 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
         }
         _ => None,
     };
+    // 按快慢、成败分只有负载均衡用得上：别的类型写了也不起作用（引擎校验也拦，
+    // `engine.group_balance_not_load_balance`）
+    let balance_by = input.balance_by.map(balance_by_of).unwrap_or_default();
+    if kind != GroupType::LoadBalance && !balance_by.is_weights() {
+        return Err(msg!(
+            "control.group.balance_not_load_balance", balance_by = balance_by.slug() =>
+            "balance_by `{balance_by}` applies only to a load-balance group"
+        ));
+    }
     Ok(Group {
         name,
         kind,
@@ -679,6 +707,7 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
             })
             .collect(),
         selected,
+        balance_by,
     })
 }
 
@@ -974,6 +1003,7 @@ mod msg_codes {
             providers: providers.iter().map(|p| p.to_string()).collect(),
             selected: None,
             weights: None,
+            balance_by: None,
         };
         let code = |i: tw_api::GroupInput| to_group(&i, &c).unwrap_err().code;
         assert_eq!(
@@ -990,6 +1020,21 @@ mod msg_codes {
             "control.group.upstream_twice"
         );
         assert_eq!(code(g("g", "fallback", &[])), "control.group.empty");
+        // 按快慢、成败分只给负载均衡；写明默认值的照收
+        for kind in ["fallback", "select", "url-test", "cheapest"] {
+            let mut i = g("g", kind, &["a"]);
+            i.balance_by = Some(tw_api::BalanceBy::Latency);
+            assert_eq!(code(i), "control.group.balance_not_load_balance", "{kind}");
+            let mut i = g("g", kind, &["a"]);
+            i.balance_by = Some(tw_api::BalanceBy::Weights);
+            assert!(to_group(&i, &c).is_ok(), "{kind}");
+        }
+        let mut i = g("g", "load-balance", &["a"]);
+        i.balance_by = Some(tw_api::BalanceBy::LatencyHealth);
+        assert_eq!(
+            to_group(&i, &c).unwrap().balance_by,
+            BalanceBy::LatencyHealth
+        );
         let weighted = |kind: &str, w: &[(&str, u32)]| tw_api::GroupInput {
             weights: Some(w.iter().map(|(p, w)| (p.to_string(), *w)).collect()),
             ..g("g", kind, &["a"])
@@ -1024,6 +1069,7 @@ mod msg_codes {
             providers: vec!["a".into(), "b".into()],
             selected: None,
             weights: w.map(|w| w.iter().map(|(p, w)| (p.to_string(), *w)).collect()),
+            balance_by: None,
         };
         let g = to_group(&input("load-balance", Some(&[("b", 7)])), &c).unwrap();
         assert_eq!((g.weight("a"), g.weight("b")), (1, 7));

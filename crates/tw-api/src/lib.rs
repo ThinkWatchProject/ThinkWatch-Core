@@ -2144,6 +2144,8 @@ pub struct GroupView {
     /// `load-balance` 组每个成员的权重，**每个成员都在**，没写权重的是 1：新对话按这个
     /// 比例分。别的类型不用权重，是空的
     pub weights: std::collections::BTreeMap<String, u32>,
+    /// `load-balance` 按什么分新对话。别的类型永远是 `weights`
+    pub balance_by: BalanceBy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3210,6 +3212,24 @@ slug_enum! {
     }
 }
 
+slug_enum! {
+    /// `load-balance` 组按什么分新对话：配置里 `balance_by` 写的那个词。
+    ///
+    /// 成员的权重永远是底数，快慢、成败算出的系数乘在上面
+    /// （[`DryRunCandidate::balance_factor`]）；进行中的对话照旧留在回答它的那一家。
+    /// 没有测到的上游算中等。
+    pub enum BalanceBy {
+        /// 只按成员的权重
+        Weights = "weights",
+        /// 首字节越快，分得越多
+        Latency = "latency",
+        /// 最近失败越少，分得越多
+        Health = "health",
+        /// 两样一起看
+        LatencyHealth = "latency-health",
+    }
+}
+
 /// 新建或修改一个策略组时交过来的定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3225,6 +3245,9 @@ pub struct GroupInput {
     /// 别的类型只能不给、或者都是 1
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weights: Option<std::collections::BTreeMap<String, u32>>,
+    /// `load-balance` 组按什么分新对话。不给 = `weights`；别的类型只能是 `weights`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_by: Option<BalanceBy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4712,6 +4735,9 @@ pub struct DryRunResult {
     /// 写在第一个」。直指 provider 时是 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<GroupKind>,
+    /// 经过的是 `load-balance` 组时，它按什么分新对话。别的时候没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_by: Option<BalanceBy>,
     /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，
     /// 见 `skipped`）| `intercepted`
     ///
@@ -4758,6 +4784,18 @@ pub struct DryRunCandidate {
     /// 经过的是 `load-balance` 组时，它在组里的权重（没写权重的是 1）。别的时候没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
+    /// 它的典型首字节时间（最近样本的中位数），毫秒。只在顺序看它时有：`url-test`，
+    /// 按快慢分的 `load-balance`。样本不够时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<u32>,
+    /// 它最近的成功率，0 到 1（最近 50 次、30 分钟以内）。只在按成败分的 `load-balance`
+    /// 里有；不到 5 次时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    /// 按快慢、成败算出的系数，乘在权重（[`Self::weight`]）上：大于 1 分得多，小于 1
+    /// 分得少，没有样本的那一项算 1。只在 `balance_by` 不是 `weights` 的 `load-balance` 里有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_factor: Option<f64>,
 }
 
 /// 一个要转换格式的候选上游。
@@ -5573,6 +5611,7 @@ mod tests {
             ModelListStatus::from_slug,
         );
         check(GroupKind::ALL, GroupKind::slug, GroupKind::from_slug);
+        check(BalanceBy::ALL, BalanceBy::slug, BalanceBy::from_slug);
         check(RuleVerdict::ALL, RuleVerdict::slug, RuleVerdict::from_slug);
         check(RuleEffect::ALL, RuleEffect::slug, RuleEffect::from_slug);
         check(

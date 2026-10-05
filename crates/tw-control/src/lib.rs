@@ -369,6 +369,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 selected: g.selected.clone(),
                 providers: g.names(),
                 weights: routes::group_weights(g),
+                balance_by: routes::balance_by_view(g.balance_by),
             })
             .collect(),
         // 和 `GET /keys` 同一份视图：概览里少一个字段的话，两处会各自

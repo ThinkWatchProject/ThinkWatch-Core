@@ -741,6 +741,57 @@ async fn the_built_in_group_and_reserved_names_are_refused() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "和上游同名：{v}");
 }
 
+/// 负载均衡按快慢、成败分：写进配置、在概览里读得回来；默认的只按比例不写进文件；
+/// 别的类型写了要拒
+#[tokio::test]
+async fn a_load_balance_group_balances_by_what_it_is_told_and_others_refuse() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/groups",
+        json!({ "group": { "name": "均摊", "kind": "load-balance",
+                           "providers": ["官方", "中转"], "balance_by": "latency-health" } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let file = b.file();
+    assert!(file.contains("balance_by: latency-health"), "{file}");
+    let g = find(&b.overview().await["groups"], "均摊").clone();
+    assert_eq!(g["balance_by"], "latency-health", "{g}");
+
+    // 改回只按比例：这一项从文件里消失，概览照样说出来
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/groups/{}", enc("均摊")),
+        json!({ "group": { "name": "均摊", "kind": "load-balance",
+                           "providers": ["官方", "中转"] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!b.file().contains("balance_by"), "{}", b.file());
+    assert_eq!(
+        find(&b.overview().await["groups"], "均摊")["balance_by"],
+        "weights"
+    );
+    assert_eq!(
+        find(&b.overview().await["groups"], "主力")["balance_by"],
+        "weights"
+    );
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/groups",
+        json!({ "group": { "name": "按顺序", "kind": "fallback",
+                           "providers": ["官方"], "balance_by": "health" } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "control.group.balance_not_load_balance", "{v}");
+}
+
 // ─────────────────────────────────────────────────────────── 已知模型
 
 #[tokio::test]
