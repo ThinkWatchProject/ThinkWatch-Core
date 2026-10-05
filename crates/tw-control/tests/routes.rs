@@ -645,7 +645,86 @@ async fn a_new_group_writes_no_defaults() {
         .into_iter()
         .find(|g| g.name == "便宜优先")
         .unwrap();
-    assert_eq!(g.providers, ["中转", "官方"]);
+    assert_eq!(g.names(), ["中转", "官方"]);
+    assert!(!file.contains("weight"), "{file}");
+}
+
+/// 概览给的组原样存回去：文件一个字节都不变 —— 没写过权重的组不会因为多了权重这一项
+/// 被改写
+#[tokio::test]
+async fn saving_a_group_as_the_overview_gave_it_changes_nothing() {
+    for kind in ["select", "load-balance"] {
+        let yaml = BASE.replace("    type: select\n", &format!("    type: {kind}\n"));
+        let yaml = if kind == "select" {
+            yaml
+        } else {
+            yaml.replace("    selected: 官方\n", "")
+        };
+        let b = bed(&yaml);
+        let group = find(&b.overview().await["groups"], "主力").clone();
+        if kind == "load-balance" {
+            assert_eq!(group["weights"], json!({ "官方": 1, "中转": 1 }), "{group}");
+        } else {
+            assert_eq!(group["weights"], json!({}), "{group}");
+        }
+        let (st, v) = call(
+            &b.app,
+            "PUT",
+            &format!("/groups/{}", enc("主力")),
+            json!({ "group": group }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(b.file(), yaml, "{kind}");
+    }
+}
+
+/// 给 `load-balance` 的成员设权重：写成 `{name, weight}`，权重 1 的照旧是名字；概览把
+/// 每个成员的权重都给回来，原样存回去不再改文件
+#[tokio::test]
+async fn weights_are_written_on_the_members_that_have_them() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/groups/{}", enc("主力")),
+        json!({ "group": { "name": "主力", "kind": "load-balance",
+                           "providers": ["官方", "中转"], "weights": { "中转": 3 } } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let g = b.parsed().groups.remove(0);
+    assert_eq!((g.weight("官方"), g.weight("中转")), (1, 3));
+    let file = b.file();
+    assert!(file.contains("- 官方\n"), "{file}");
+    assert!(
+        file.contains("name: 中转") && file.contains("weight: 3"),
+        "{file}"
+    );
+    let group = find(&b.overview().await["groups"], "主力").clone();
+    assert_eq!(group["weights"], json!({ "官方": 1, "中转": 3 }));
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/groups/{}", enc("主力")),
+        json!({ "group": group }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(b.file(), file);
+
+    // 别的类型不收权重，写错了说出是哪一条
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/groups/{}", enc("主力")),
+        json!({ "group": { "name": "主力", "kind": "fallback",
+                           "providers": ["官方", "中转"], "weights": { "中转": 3 } } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "control.group.weight_not_load_balance", "{v}");
+    assert_eq!(b.file(), file, "拒绝了就什么都没写");
 }
 
 #[tokio::test]
@@ -660,6 +739,57 @@ async fn the_built_in_group_and_reserved_names_are_refused() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     let (st, v) = call(&b.app, "POST", "/groups", group("官方")).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "和上游同名：{v}");
+}
+
+/// 负载均衡按快慢、成败分：写进配置、在概览里读得回来；默认的只按比例不写进文件；
+/// 别的类型写了要拒
+#[tokio::test]
+async fn a_load_balance_group_balances_by_what_it_is_told_and_others_refuse() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/groups",
+        json!({ "group": { "name": "均摊", "kind": "load-balance",
+                           "providers": ["官方", "中转"], "balance_by": "latency-health" } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let file = b.file();
+    assert!(file.contains("balance_by: latency-health"), "{file}");
+    let g = find(&b.overview().await["groups"], "均摊").clone();
+    assert_eq!(g["balance_by"], "latency-health", "{g}");
+
+    // 改回只按比例：这一项从文件里消失，概览照样说出来
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/groups/{}", enc("均摊")),
+        json!({ "group": { "name": "均摊", "kind": "load-balance",
+                           "providers": ["官方", "中转"] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!b.file().contains("balance_by"), "{}", b.file());
+    assert_eq!(
+        find(&b.overview().await["groups"], "均摊")["balance_by"],
+        "weights"
+    );
+    assert_eq!(
+        find(&b.overview().await["groups"], "主力")["balance_by"],
+        "weights"
+    );
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/groups",
+        json!({ "group": { "name": "按顺序", "kind": "fallback",
+                           "providers": ["官方"], "balance_by": "health" } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "control.group.balance_not_load_balance", "{v}");
 }
 
 // ─────────────────────────────────────────────────────────── 已知模型

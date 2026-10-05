@@ -136,6 +136,15 @@ pub struct AppState {
     /// 换的话，每改一次配置，排着的请求就会失去位置，而已经在跑的那些的
     /// 通行证会变成孤儿。上限改了由它自己在原地加减（见 `limits`）。
     pub(crate) gate: Arc<crate::limits::Gate>,
+    /// 每家上游自己的并发上限（见 [`crate::slots`]）。**不在 Runtime 里**，理由和 `gate`
+    /// 一样：它握着在跑的请求占着的位置。配置换了由 [`Self::reload`] 在原地改上限
+    pub slots: Arc<crate::slots::Slots>,
+    /// 每把密钥的用量上限（见 [`crate::key_limits`]）：今天、这周、这个月用了多少，最近
+    /// 一分钟、一小时用了多少，在跑的请求占着多少。
+    ///
+    /// **跨重载存活**，理由和并发闸门一样：改一条路由规则不该让今天花的钱归零，在跑的
+    /// 请求的预留也不该变成孤儿。上限本身跟着配置换（[`crate::key_limits::KeyLimits::configure`]）
+    pub key_limits: Arc<crate::key_limits::KeyLimits>,
     /// 一家上游不在当前运行时里时顶上的 Client（直连，不读系统代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
@@ -180,7 +189,8 @@ pub struct AppState {
     /// 上游各自多打一次往返。用户真的改了 refresh token 时，缓存自己认
     /// 得出来（指纹对不上就重换）。
     pub oauth: Arc<crate::oauth::Cache>,
-    /// 每家的典型首字节时间。`url-test` 策略靠它排序。
+    /// 每家典型的快慢：从发出去到回答的第一段内容（见 [`crate::latency`]）。`url-test` 靠它
+    /// 排序，按快慢分的 `load-balance` 靠它算系数。
     ///
     /// **跨重载存活**：改一条规则不该让所有上游回到「没测过」。
     pub latency: Arc<crate::latency::Latency>,
@@ -220,6 +230,8 @@ pub struct AppState {
     pub sessions: Arc<crate::session::Sessions>,
     /// 每段对话这一轮的路由决定、上次回答它的那一家（见 [`crate::affinity`]）。**跨重载存活**
     pub affinity: Arc<crate::affinity::Affinity>,
+    /// 每个 `load-balance` 组轮到了谁（见 [`crate::balance`]）。**跨重载存活**，改了的组从头轮
+    pub balance: Arc<crate::balance::Balance>,
     /// 每段对话里、每一家上游拒过的别家封存的推理（见 [`crate::seal`]）。**跨重载存活**
     pub seals: Arc<crate::seal::Refused>,
     /// 脚本插件里跨重载存活的那一半：运行时、插件文件在哪儿、计数和日志、编译缓存
@@ -254,11 +266,18 @@ impl AppState {
         let rt = Runtime::build(config, None, &plugins)?;
         let health = Arc::new(Health::new());
         health.configure(&rt.config.failover);
+        let slots = Arc::new(crate::slots::Slots::default());
+        slots.configure(&rt.config.providers);
+        let bus = tw_observe::EventBus::new();
+        let key_limits = Arc::new(crate::key_limits::KeyLimits::new(bus.clone()));
+        key_limits.configure(&rt.config);
         let state = Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Default::default(),
+            slots,
+            key_limits,
             http,
-            bus: tw_observe::EventBus::new(),
+            bus,
             health,
             catalog: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
             models,
@@ -289,6 +308,7 @@ impl AppState {
             live: crate::live::Live::default(),
             sessions: Default::default(),
             affinity: Default::default(),
+            balance: Default::default(),
             seals: Default::default(),
             plugins,
             swap: Default::default(),
@@ -328,6 +348,14 @@ impl AppState {
         self.rt.load().config.clone()
     }
 
+    /// 换一个看用量上限的时钟（测试把时间拨到零点前后）。**账从空的开始**：只在测试里、
+    /// 第一个请求之前调
+    pub fn set_key_limits_clock(&mut self, clock: Arc<dyn crate::key_limits::Clock>) {
+        let limits = crate::key_limits::KeyLimits::with_clock(self.bus.clone(), clock);
+        limits.configure(&self.config());
+        self.key_limits = Arc::new(limits);
+    }
+
     /// 直接换一份插件进去，配置照旧：正在跑的请求用完它们手上那一份，新请求看到的是
     /// 新的。**测试装插件替身走这里**；生产上装哪些插件由配置和插件文件决定（见
     /// [`Self::reload_plugins`]），下一次重载就照那个重建
@@ -358,6 +386,67 @@ impl AppState {
         // **rcu，不是 load 再 store。**刷新和配置重载可能同时发生，后者
         // 换的是自定义价目表 —— 先读后写会把对方刚换进去的那一半覆盖掉
         self.pricing.rcu(|book| book.with_table(table.clone()));
+    }
+
+    /// 策略组排序要的运行时数字（[`tw_engine::Facts`]），只取组 `g` 用得上的那几样。
+    ///
+    /// **数据面和试算共用这一个**，喂给同一个 `order`：试算说会排给谁，数据面就排给谁。
+    /// `sent` 是每一家和发给它的模型名（比价按它算）；`current_weight` 是 `load-balance`
+    /// 组此刻的轮询状态（见 [`crate::balance`]）：数据面在 [`crate::balance::Turn`] 里读，
+    /// 试算用 [`crate::balance::Balance::peek`] 只读不记。
+    pub fn group_facts(
+        &self,
+        providers: &[tw_config::Provider],
+        g: &tw_engine::Group,
+        candidates: &[String],
+        sent: &[(String, String)],
+        current_weight: Option<std::collections::HashMap<String, i64>>,
+    ) -> tw_engine::Facts {
+        use tw_engine::GroupType;
+        let balanced = g.kind == GroupType::LoadBalance;
+        tw_engine::Facts {
+            current_weight: current_weight.unwrap_or_default(),
+            // 熔断着、冷却着的不参加这一轮：它们反正会被跳过
+            paused: if balanced {
+                candidates
+                    .iter()
+                    .filter(|p| !self.health.is_available(p))
+                    .cloned()
+                    .collect()
+            } else {
+                Default::default()
+            },
+            // 并发数满着的也不参加这一轮：它们会被当场跳过（见 `crate::slots`）
+            busy: if balanced {
+                candidates
+                    .iter()
+                    .filter(|p| self.slots.is_full(p))
+                    .cloned()
+                    .collect()
+            } else {
+                Default::default()
+            },
+            // `url-test` 选最快的，握手垫的底也算；`load-balance` 按快慢分的也看它，只认真实
+            // 样本（见 `Latency::measured`）
+            ttfb_ms: if g.kind == GroupType::UrlTest {
+                self.latency.snapshot(candidates)
+            } else if balanced && g.balance_by.uses_latency() {
+                self.latency.measured(candidates)
+            } else {
+                Default::default()
+            },
+            // `load-balance` 按成败分时看每家最近的成功率
+            success: if balanced && g.balance_by.uses_health() {
+                self.health.success_rates(candidates)
+            } else {
+                Default::default()
+            },
+            price: match g.kind {
+                // 每一家按发给它的名字算价钱：同一个别名在各家是各家的模型名、各家的价目
+                GroupType::Cheapest => self.unit_prices(providers, sent, candidates),
+                _ => Default::default(),
+            },
+        }
     }
 
     /// `cheapest` 排序用的单价：每家跑这个模型的 (输入, 输出)，微分/百万 token。
@@ -425,6 +514,8 @@ impl AppState {
         self.pricing
             .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
         self.health.configure(&next.config.failover);
+        self.slots.configure(&next.config.providers);
+        self.key_limits.configure(&next.config);
         self.rt.store(Arc::new(next));
         self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表

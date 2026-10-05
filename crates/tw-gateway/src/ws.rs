@@ -27,6 +27,16 @@
 //! Realtime 的连接（`/v1/realtime`）模型写在升级请求的查询串里：升级时按它路由、过密钥的
 //! 模型范围、对别名（[`Naming::connect`]），发给上游的查询串写这一家自己的名称。
 //!
+//! # 一轮一个请求
+//!
+//! **Responses 的连接上每个 `response.create` 是一个请求**（见 [`turn`]）：从这一帧到这一次
+//! 回答完，开始、路由、结局三条事件，存储层记一行，带着这一次回答的用量，照 HTTP 那条路查价；
+//! 密钥的用量上限、并发上限、这一家的位置（`max_concurrent`）都按轮算，闲着的连接什么都不占。
+//! 连接本身不留行，连不上上游的除外。Realtime 和别的路径的连接照旧**整条连接一行**：它们的
+//! 回答不按 Responses 的事件收尾，分不出一轮一轮。Realtime 的每一次回答在 `response.done` 里
+//! 报用量，这一行带着它们加起来的数（[`realtime_usage`]），断开时照 HTTP 那条路查价、算进密钥
+//! 的用量；别的路径的连接不知道用量的写法，不带。
+//!
 //! 脚本插件也在这条路上跑（见 [`crate::plugin`]）：客户端发来的每个
 //! `response.create` 是一次请求。**这条路只有一跳**（升级时就连定了那一家，不换），
 //! 所以每个 `response.create` 过一遍请求钩子：上游是这条连接连的那一家，模型名是发给它的
@@ -58,6 +68,8 @@ use tokio_tungstenite::tungstenite::protocol::Message as UpMsg;
 use crate::error::GatewayError;
 use crate::state::AppState;
 use tw_types::{Msg, msg};
+
+pub(crate) mod turn;
 
 /// `Option<WebSocketUpgrade>` 的替身。
 ///
@@ -261,6 +273,31 @@ struct Outgoing {
     model: String,
     /// 规则的参数改写：阶段一（按这一帧求）和阶段二累积的。模型名不看这里，看 `model`
     set: tw_engine::SetAction,
+    /// 附加了参数改写的规则：阶段一的，加上阶段二的。这一轮的开始和路由事件里报
+    rewritten_by: Vec<String>,
+}
+
+/// 一帧为什么没发出去（[`Naming::frame`]）。
+struct NotSent {
+    why: GatewayError,
+    /// 规则拒绝了它：**这一帧照样留一行**，和 HTTP 那条路被规则拒绝的请求一样（见
+    /// [`turn::denied`]）。别的 —— 密钥不让用要发的模型、这一家服务不了要的别名、规则求不了
+    /// 值 —— 不留，和 HTTP 那条路准入没过一样
+    denied: Option<Denied>,
+}
+
+impl NotSent {
+    fn plain(why: GatewayError) -> Box<Self> {
+        Box::new(Self { why, denied: None })
+    }
+}
+
+/// 拒绝了一帧的那条规则，在哪个阶段。
+pub(crate) enum Denied {
+    /// 阶段一：它就是决定这一帧去向的那条
+    PhaseOne(String),
+    /// 阶段二：记在路由事件的 `denied_by` 上
+    PhaseTwo(String),
 }
 
 /// 要发的名字为什么发不出去（[`Naming::name`]）。
@@ -376,37 +413,60 @@ impl Naming {
             .ok_or_else(|| Unsent::Unserved(self.unserved(client, &asked.model)))
     }
 
-    /// 一帧 `response.create`（`frame`）发给这一家的样子。这一帧发不出去时是告诉客户端的那个
-    /// 错误：规则拒绝了它、规则求不了值、密钥不让用要发的模型，或者这一家服务不了要的别名。
+    /// 一帧按这条路径上的一次请求读出的样子：规则的条件按它求值，开始事件里的模型名、输入的
+    /// 估算也从它来
+    fn read(&self, frame: &serde_json::Value) -> crate::client_api::Reading {
+        let mut reading = crate::client_api::read(&self.path, None, Some(frame));
+        reading.facts.client = self.client.clone();
+        reading
+    }
+
+    /// 一帧 `response.create`（读出的性质是 `facts`，见 [`Self::read`]）发给这一家的样子。这一帧
+    /// 发不出去时是告诉客户端的那个错误：规则拒绝了它、规则求不了值、密钥不让用要发的模型，
+    /// 或者这一家服务不了要的别名。
     fn frame(
         &self,
         catalog: &tw_engine::Catalog,
-        frame: &serde_json::Value,
-    ) -> Result<Outgoing, GatewayError> {
-        // 一帧的其余字段就是一个 Responses 请求：规则的条件按它读出的性质求值
-        let mut facts = crate::client_api::read(&self.path, None, Some(frame)).facts;
-        facts.client = self.client.clone();
-        let decision = self.this_frame(&facts)?;
+        facts: &tw_engine::RequestFacts,
+    ) -> Result<Outgoing, Box<NotSent>> {
+        let decision = self.this_frame(facts)?;
         let p = &self.provider;
-        let (mut set, renamed) = match self.engine.phase_two(&facts, &p.name, &decision.set) {
-            Ok(tw_engine::Outcome2::Proceed { set, model, .. }) => (set, model),
+        let (mut set, renamed, two) = match self.engine.phase_two(facts, &p.name, &decision.set) {
+            Ok(tw_engine::Outcome2::Proceed {
+                set,
+                model,
+                rewritten_by,
+            }) => (set, model, rewritten_by),
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %p.name, "a phase-two rule denied a WebSocket request");
-                return Err(denied(rule, reason));
+                return Err(Box::new(NotSent {
+                    why: denied(rule.clone(), reason),
+                    denied: Some(Denied::PhaseTwo(rule)),
+                }));
             }
-            Err(e) => return Err(rule_failed(e)),
+            Err(e) => return Err(NotSent::plain(rule_failed(e))),
         };
         let asked = self
             .engine
-            .asked_of(&facts, &decision, &p.name, renamed.as_deref());
+            .asked_of(facts, &decision, &p.name, renamed.as_deref());
         let model = self
             .name(catalog, &decision, &facts.model, &asked)
-            .map_err(Unsent::into_error)?;
+            .map_err(|u| NotSent::plain(u.into_error()))?;
         // Codex 后端不认最大输出：HTTP 那条路发给它之前也会删掉（`crate::chatgpt::shape_passthrough`）
         if p.effective_protocol() == Some(tw_config::Protocol::Chatgpt) {
             set.max_tokens = None;
         }
-        Ok(Outgoing { model, set })
+        let mut rewritten_by = decision.rewritten_by;
+        for r in two {
+            if !rewritten_by.contains(&r) {
+                rewritten_by.push(r);
+            }
+        }
+        Ok(Outgoing {
+            model,
+            set,
+            rewritten_by,
+        })
     }
 
     /// 这一帧的决定。**去向是升级时的**（候选、经过的组、指定的模型），参数改写按这一帧重新
@@ -417,7 +477,7 @@ impl Naming {
     fn this_frame(
         &self,
         facts: &tw_engine::RequestFacts,
-    ) -> Result<tw_engine::Decision, GatewayError> {
+    ) -> Result<tw_engine::Decision, Box<NotSent>> {
         match self.engine.route(facts) {
             Ok(tw_engine::Outcome::Route(d)) => Ok(tw_engine::Decision {
                 set: d.set,
@@ -426,11 +486,14 @@ impl Naming {
             }),
             Ok(tw_engine::Outcome::Deny { rule, reason }) => {
                 tracing::info!(%rule, "a rule denied a WebSocket request");
-                Err(denied(rule, reason))
+                Err(Box::new(NotSent {
+                    why: denied(rule.clone(), reason),
+                    denied: Some(Denied::PhaseOne(rule)),
+                }))
             }
-            Err(e) => Err(GatewayError::config(msg!(
+            Err(e) => Err(NotSent::plain(GatewayError::config(msg!(
                 "gw.route.failed", detail = e => "Routing failed: {detail}"
-            ))),
+            )))),
         }
     }
 
@@ -565,7 +628,13 @@ struct Pipes {
     dropping: bool,
     rules: Rules,
     provider: String,
+    /// 这条连接的号。整条连接一行的（Realtime 和别的路径）是那一行的；Responses 的连接自己
+    /// 不留行，不在哪一轮里的帧（上游的、客户端的）报出去的事件挂在它上面（见 [`Self::event_id`]）
     id: u64,
+    /// Responses 的连接上在跑的几轮（见 [`turn`]）。别的连接没有
+    turns: Option<turn::Turns>,
+    /// 整条连接一行的 Realtime 连接：每一次回答的用量（`response.done`）加到这一行上
+    realtime: bool,
     /// 范围里可能有插件时才有
     plugins: Option<Plugins>,
     /// 每个 `response.create` 发出去的模型名怎么定。Responses 的连接才有
@@ -582,23 +651,48 @@ struct Pipes {
     rename: Option<crate::answer_model::Body>,
 }
 
+impl Pipes {
+    /// 这一帧报出去的事件（脱敏、内容过滤、工具调用审查、插件的运行）挂在哪个请求上：上游
+    /// 此刻在回答的那一轮，没有就是这条连接
+    fn event_id(&self) -> u64 {
+        self.turns
+            .as_ref()
+            .and_then(turn::Turns::front_id)
+            .unwrap_or(self.id)
+    }
+}
+
+/// 这条连接在流量里怎么记（见 [`turn`]）。
+pub(crate) enum Rows {
+    /// 整条连接一行：Realtime 和别的路径的连接。升级时已经开始了，`ending` 是它欠着的结局。
+    /// `realtime`：是 Realtime 的连接，这一行带着每一次回答的用量加起来的数
+    Connection {
+        id: u64,
+        ending: Box<crate::ending::Ending>,
+        realtime: bool,
+    },
+    /// 每一轮一行：Responses 的连接。连接本身不留行 —— 连不上上游的除外，那时按升级的那一刻
+    /// （`upgraded`：用时从哪一刻算起、那一刻的 Unix 毫秒）补上这一行
+    Turns {
+        line: Arc<turn::Line>,
+        upgraded: (std::time::Instant, u64),
+    },
+}
+
 /// 接管一次升级。
 ///
 /// 路由、鉴权都在调用方做完了 —— 这里把两条流接起来，并且**在每一帧
 /// 上重新点一遍管线的保护**。
 ///
-/// 路由事件也在这里发：选中的那一家接没接下，要等和它握完手才知道。
-///
-/// **这条连接怎么断的，就是这个请求的结局**（`ending`）。每一条收场的
-/// 路径都先报结局、再去关连接：关连接要等对面，而对面可能已经不在了。
-#[allow(clippy::too_many_arguments)]
-pub async fn proxy(
+/// 整条连接一行的，路由事件在这里发：选中的那一家接没接下，要等和它握完手才知道。
+/// **这条连接怎么断的，就是这个请求的结局**。每一条收场的路径都先报结局、再去关连接：关连接
+/// 要等对面，而对面可能已经不在了。每一轮一行的（Responses），每一轮各报各的（见 [`turn`]）。
+pub(crate) async fn proxy(
     state: AppState,
     client: WebSocket,
     upstream: Upstream,
     rules: Rules,
-    id: u64,
-    ending: crate::ending::Ending,
+    rows: Rows,
     plugins: Option<Plugins>,
     naming: Option<Naming>,
 ) {
@@ -607,49 +701,111 @@ pub async fn proxy(
     // **连不上也要报。**和 HTTP 那条路一样，失败的时候恰恰最需要看这一跳；
     // 报在结局之前，存储层落库时手上才有它
     let name = &upstream.provider.name;
-    // 这一跳记发出去的模型名，和 HTTP 那条路一样。一条连接跑好几轮、每一帧写的模型可能
-    // 不一样，升级时定得下来的只有每一帧都发的那个（指定模型、阶段一的改写，见
-    // [`Naming::fixed`]）；Realtime 的连接是查询串里的模型对过的名字
-    let model = upstream
-        .model
-        .clone()
-        .or_else(|| naming.as_ref().and_then(|n| n.fixed(&state.catalog.load())));
-    let attempt = match &connected {
-        Ok(_) => crate::server::hop(
-            name,
-            model,
-            tw_api::AttemptOutcome::Served,
-            101,
-            hop_started,
+    // 每一轮一行的连接连上了：连接本身不留行，每一轮各有各的号（见 `turn`）。连不上的补上
+    // 这一行，和整条连接一行的一样报
+    let (id, ending, turns, realtime) = match (rows, &connected) {
+        (
+            Rows::Connection {
+                id,
+                mut ending,
+                realtime,
+            },
+            _,
+        ) => {
+            ending.responded(101);
+            (id, Some(*ending), None, realtime)
+        }
+        (Rows::Turns { line, .. }, Ok(_)) => (
+            state.bus.next_id(),
+            None,
+            Some(turn::Turns::new(line)),
+            false,
         ),
+        (Rows::Turns { line, upgraded }, Err(_)) => {
+            let (id, mut ending) = line.opener.open(turn::Opening {
+                choice: &line.choice,
+                to: (&line.provider, line.billing.into()),
+                model: String::new(),
+                session: None,
+                input_estimate: None,
+                started: upgraded.0,
+                at_ms: upgraded.1,
+            });
+            ending.responded(101);
+            (id, Some(ending), None, false)
+        }
+    };
+    // 这一家接没接下这条连接，和 HTTP 那条路一跳的成败记在同一笔账上（见 `crate::health`）：
+    // 连不上、回了 5xx 是失败，凭据被拒、限流按原因停用，请求本身的问题算这一家答上了。每一轮
+    // 一行的连接接下了不记 —— 它的每一轮各记各的（见 `turn`）
+    let change = match &connected {
+        Ok(_) if turns.is_some() => None,
+        Ok(_) => state.health.record_success(name),
         Err(NotConnected {
             status: Some(s), ..
-        }) => crate::server::hop(name, model, tw_api::AttemptOutcome::Status, *s, hop_started),
-        Err(e) => crate::server::hop_failed(name, model, e.why.clone(), hop_started),
+        }) => match crate::failure::classify(
+            *s,
+            &axum::http::HeaderMap::new(),
+            &[],
+            crate::server::now_ms(),
+        ) {
+            crate::failure::Verdict::Failed(cause) => state.health.record_cause(name, cause),
+            crate::failure::Verdict::ClientError => state.health.record_success(name),
+        },
+        // 地址、请求头写坏了：配置的事，不是这一家的
+        Err(NotConnected {
+            source: tw_api::FailureSource::Config,
+            ..
+        }) => None,
+        Err(_) => state.health.record_failure(name),
     };
-    // 和 HTTP 那条路同一个规矩：没接下的不按那一家记账
-    let billing = match &connected {
-        Ok(_) => upstream.provider.billing,
-        Err(_) => tw_config::Billing::PerToken,
-    };
-    state.bus.emit(tw_api::Event::RequestRouted {
-        id,
-        route: upstream.route,
-        rule: upstream.rule,
-        group: upstream.group,
-        // 升级时就作用上的那几条（Realtime 的连接改写了查询串里的模型）。Responses 的连接上
-        // 参数改写每一帧按这一帧求（见 [`Naming`]），那时路由事件早就发了
-        rewritten_by: upstream.rewritten_by,
-        denied_by: None,
-        affinity: None,
-        attempts: vec![attempt],
-        billing: billing.into(),
-    });
+    crate::server::note_health(&state.bus, &state.health, name, change);
+    if ending.is_some() {
+        // 这一跳记发出去的模型名，和 HTTP 那条路一样。一条连接跑好几轮、每一帧写的模型可能
+        // 不一样，升级时定得下来的只有每一帧都发的那个（指定模型、阶段一的改写，见
+        // [`Naming::fixed`]）；Realtime 的连接是查询串里的模型对过的名字
+        let model = upstream
+            .model
+            .clone()
+            .or_else(|| naming.as_ref().and_then(|n| n.fixed(&state.catalog.load())));
+        let attempt = match &connected {
+            Ok(_) => crate::server::hop(
+                name,
+                model,
+                tw_api::AttemptOutcome::Served,
+                101,
+                hop_started,
+            ),
+            Err(NotConnected {
+                status: Some(s), ..
+            }) => crate::server::hop(name, model, tw_api::AttemptOutcome::Status, *s, hop_started),
+            Err(e) => crate::server::hop_failed(name, model, e.why.clone(), hop_started),
+        };
+        // 和 HTTP 那条路同一个规矩：没接下的不按那一家记账
+        let billing = match &connected {
+            Ok(_) => upstream.provider.billing,
+            Err(_) => tw_config::Billing::PerToken,
+        };
+        state.bus.emit(tw_api::Event::RequestRouted {
+            id,
+            route: upstream.route,
+            rule: upstream.rule,
+            group: upstream.group,
+            // 升级时就作用上的那几条（Realtime 的连接改写了查询串里的模型）
+            rewritten_by: upstream.rewritten_by,
+            denied_by: None,
+            affinity: None,
+            attempts: vec![attempt],
+            billing: billing.into(),
+        });
+    }
     let up = match connected {
         Ok(up) => up,
         Err(e) => {
             let text = e.why.text.clone();
-            ending.failed(e.source, e.why);
+            if let Some(ending) = ending {
+                ending.failed(e.source, e.why);
+            }
             close_with(client, &text).await;
             return;
         }
@@ -665,6 +821,8 @@ pub async fn proxy(
         rules,
         provider: upstream.provider.name,
         id,
+        turns,
+        realtime,
         plugins,
         naming,
         requested_model: String::new(),
@@ -787,13 +945,36 @@ type Stream = tokio_tungstenite::WebSocketStream<Box<dyn Io>>;
 
 /// 一条连接是怎么断的。
 enum End {
-    /// 有一边收场了：发了关闭帧，或者把连接收掉了。**客户端那一边怎么走
+    /// 客户端那一边收场了：发了关闭帧，或者走了（连接收掉了、写不过去了）。**客户端怎么走
     /// 都算这一种** —— 一次会话就是由客户端结束的，那是正常收场
     Closed,
+    /// 上游收了连接：发了关闭帧，或者没有关闭帧就断开了。整条连接一行的，这也是收场；
+    /// Responses 的连接上还没答完的那几轮是**失败**，上游没答完就走了 —— 记成客户端取消的话，
+    /// 这一家内容之前断掉的那一轮不算它的失败，界面上也像是用户自己停下的
+    UpstreamClosed,
     /// 上游那边出错断了，或者写不过去了
     Broke(Msg),
     /// 被防护切断了：回答里的工具调用命中了切断规则，或者客户端发来的一帧被内容过滤拒了
     Cut(Msg),
+}
+
+/// 在等准入的那一轮（见 [`turn::admit`]）：等到了交回这一轮和这一帧接下来要用的。
+type Waiting = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Result<turn::Turn, turn::NotAdmitted>, Next)> + Send>,
+>;
+
+/// 一帧 `response.create` 过了准入之后要用的：查过内容过滤的那一帧（删过的话是删过的样子）、
+/// 客户端要的模型名、发给这一家的样子。
+struct Next {
+    text: String,
+    requested: String,
+    out: Outgoing,
+}
+
+/// 客户端的一帧处理完之后怎么办。
+enum Step {
+    Go,
+    End(End),
 }
 
 async fn pump(
@@ -801,101 +982,50 @@ async fn pump(
     client: WebSocket,
     up: Stream,
     p: &mut Pipes,
-    mut ending: crate::ending::Ending,
+    mut ending: Option<crate::ending::Ending>,
 ) {
     let (mut c_tx, mut c_rx) = client.split();
     let (mut u_tx, mut u_rx) = up.split();
-    let end = loop {
+    // 一轮在等准入（上限、并发、这一家的位置）。**等的时候上游那一边照常转发**：前一轮的
+    // 回答要接着交给客户端，它答完了，这一轮等的位置才空得出来
+    let mut waiting: Option<Waiting> = None;
+    // 等的时候客户端接着发来的帧：排在那一轮后面，轮到了按顺序处理
+    let mut held: std::collections::VecDeque<Message> = Default::default();
+    let end = 'pump: loop {
+        while waiting.is_none()
+            && let Some(m) = held.pop_front()
+        {
+            if let Step::End(end) =
+                client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting).await
+            {
+                break 'pump end;
+            }
+        }
         tokio::select! {
-            // 客户端 → 上游：**和普通请求同一个脱敏函数**
             msg = c_rx.next() => {
                 let Some(Ok(m)) = msg else { break End::Closed };
-                let out = match m {
-                    Message::Text(t) => {
-                        // 内容过滤在插件和脱敏之前：看的是客户端的原话。删过的话，后面用删过的
-                        // 那一帧
-                        let text = match screen_frame(&state, p, t.as_str()) {
-                            Ok(text) => text,
-                            Err(why) => {
-                                let _ = c_tx.send(Message::Text(
-                                    format!("[ThinkWatch] {}", why.text).into(),
-                                )).await;
-                                break End::Cut(why);
-                            }
-                        };
-                        // 发出去的模型名和插件的请求钩子：钩子拿到的是查过（删过）的那一帧。改过
-                        // 的那一版再查一遍内容过滤（只报插件加进来的），脱敏换的是改过的那一版
-                        let text = match request(&state, p, &text).await {
-                            Ok(text) => text,
-                            Err(Refusal::Cut(why)) => {
-                                let _ = c_tx.send(Message::Text(
-                                    format!("[ThinkWatch] {}", why.text).into(),
-                                )).await;
-                                break End::Cut(why);
-                            }
-                            // 只是这一帧不发：替它回一个 `response.failed`，连接照常
-                            Err(Refusal::Frame(err)) => {
-                                tracing::info!(provider = %p.provider, why = %err.detail.text,
-                                    "a WebSocket request was not sent");
-                                let failed = failed_frame(err, None);
-                                if c_tx.send(Message::Text(failed.into())).await.is_err() {
-                                    break End::Closed;
-                                }
-                                continue;
-                            }
-                        };
-                        let mode = p.rules.redact_mode;
-                        let found = crate::guard::find(mode, &p.rules.redact, text.as_bytes());
-                        if found.is_empty() {
-                            UpMsg::Text(text.into())
-                        } else {
-                            // 客户端发来的一帧是一次请求，各报各的（一次最多报几个见
-                            // `crate::guard::REPORTED_MAX`）
-                            state.bus.emit(tw_api::Event::SecretsFound {
-                                id: p.id,
-                                provider: p.provider.clone(),
-                                replaced: mode.acts(),
-                                items: crate::guard::items(&found, 0),
-                                at_ms: crate::server::now_ms(),
-                            });
-                            if mode.acts() {
-                                // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不换
-                                let hits = crate::guard::hits(&text, &p.rules.redact);
-                                let r = tw_guard::redact::replace::apply(
-                                    &text,
-                                    &hits,
-                                    std::mem::replace(
-                                        &mut p.ledger,
-                                        tw_guard::redact::replace::Ledger::new(
-                                            tw_guard::redact::replace::Scheme::SECRET,
-                                        ),
-                                    ),
-                                );
-                                p.ledger = r.ledger;
-                                UpMsg::Text(r.text.into())
-                            } else {
-                                UpMsg::Text(text.into())
-                            }
-                        }
-                    }
-                    // 二进制不检查，也不假装检查过
-                    Message::Binary(b) => UpMsg::Binary(b),
-                    Message::Ping(b) => UpMsg::Ping(b),
-                    Message::Pong(b) => UpMsg::Pong(b),
-                    Message::Close(_) => break End::Closed,
-                };
-                if let Err(e) = u_tx.send(out).await {
-                    break End::Broke(msg!(
-                "gw.ws.send_failed", detail = e => "Sending to the upstream failed: {detail}"
-            ));
+                if waiting.is_some() {
+                    if matches!(m, Message::Close(_)) { break End::Closed }
+                    held.push_back(m);
+                    continue;
+                }
+                if let Step::End(end) = client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting).await {
+                    break end;
+                }
+            }
+            got = async { waiting.as_mut().expect("polled only while one is waiting").await },
+                if waiting.is_some() => {
+                waiting = None;
+                if let Step::End(end) = admitted(&state, p, got, &mut c_tx, &mut u_tx).await {
+                    break end;
                 }
             }
             // 上游 → 客户端：先还原占位符，再过工具墙
             msg = u_rx.next() => {
                 let m = match msg {
                     Some(Ok(m)) => m,
-                    // 上游把连接收掉了，没有关闭帧也算收场
-                    None => break End::Closed,
+                    // 上游把连接收掉了，没有关闭帧也算它收了
+                    None => break End::UpstreamClosed,
                     Some(Err(e)) => {
                     break End::Broke(msg!(
                         "gw.ws.upstream_broke", detail = e =>
@@ -911,12 +1041,14 @@ async fn pump(
                         }
                     }
                     UpMsg::Binary(b) => {
-                        ending.count(b.len());
+                        if let Some(e) = ending.as_mut() {
+                            e.count(b.len());
+                        }
                         Message::Binary(b)
                     }
                     UpMsg::Ping(b) => Message::Ping(b),
                     UpMsg::Pong(b) => Message::Pong(b),
-                    UpMsg::Close(_) => break End::Closed,
+                    UpMsg::Close(_) => break End::UpstreamClosed,
                     UpMsg::Frame(_) => continue,
                 };
                 // 发不给客户端，就是客户端已经走了
@@ -924,14 +1056,279 @@ async fn pump(
             }
         }
     };
-    // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了
-    match end {
-        End::Closed => ending.finished(101),
-        End::Broke(why) => ending.failed(tw_api::FailureSource::Upstream, why),
-        End::Cut(why) => ending.failed(tw_api::FailureSource::Denied, why),
+    // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了。在等准入的那一轮
+    // 开始了的话记成取消；在跑的几轮，上游断了、收了连接的是失败，客户端走了的是取消
+    drop(waiting);
+    if let Some(t) = p.turns.as_mut() {
+        match &end {
+            End::Broke(why) => t.fail_all(tw_api::FailureSource::Upstream, why.clone()),
+            End::UpstreamClosed => t.fail_all(
+                tw_api::FailureSource::Upstream,
+                msg!(
+                    "gw.ws.upstream_closed" =>
+                    "The upstream closed the connection before the answer was complete."
+                ),
+            ),
+            _ => t.clear(),
+        }
+    }
+    if let Some(ending) = ending {
+        match end {
+            End::Closed | End::UpstreamClosed => ending.finished(101),
+            End::Broke(why) => ending.failed(tw_api::FailureSource::Upstream, why),
+            End::Cut(why) => ending.failed(tw_api::FailureSource::Denied, why),
+        }
     }
     let _ = c_tx.close().await;
     let _ = u_tx.close().await;
+}
+
+type UpstreamSink = futures::stream::SplitSink<Stream, UpMsg>;
+
+/// 客户端 → 上游的一帧：**和普通请求同一个脱敏函数**。Responses 的连接上，一帧
+/// `response.create` 是一轮的开头（[`begin_turn`]），要过准入时放进 `waiting`。
+async fn client_frame(
+    state: &AppState,
+    p: &mut Pipes,
+    m: Message,
+    c_tx: &mut ClientSink,
+    u_tx: &mut UpstreamSink,
+    waiting: &mut Option<Waiting>,
+) -> Step {
+    let out = match m {
+        Message::Text(t) => {
+            if p.turns.is_some()
+                && let Some(frame) = create_frame(t.as_str())
+            {
+                return begin_turn(state, p, t.as_str(), frame, c_tx, waiting).await;
+            }
+            // 内容过滤在脱敏之前：看的是客户端的原话。删过的话，后面用删过的那一帧
+            let text = match screen_frame(state, p, t.as_str()) {
+                Ok(text) => text,
+                Err(why) => {
+                    let _ = c_tx
+                        .send(Message::Text(format!("[ThinkWatch] {}", why.text).into()))
+                        .await;
+                    return Step::End(End::Cut(why));
+                }
+            };
+            outbound(state, p, p.event_id(), text)
+        }
+        // 二进制不检查，也不假装检查过
+        Message::Binary(b) => UpMsg::Binary(b),
+        Message::Ping(b) => UpMsg::Ping(b),
+        Message::Pong(b) => UpMsg::Pong(b),
+        Message::Close(_) => return Step::End(End::Closed),
+    };
+    match u_tx.send(out).await {
+        Ok(()) => Step::Go,
+        Err(e) => Step::End(End::Broke(send_failed(e))),
+    }
+}
+
+fn send_failed(e: impl std::fmt::Display) -> Msg {
+    msg!(
+        "gw.ws.send_failed", detail = e => "Sending to the upstream failed: {detail}"
+    )
+}
+
+/// 是一帧 `response.create` 的话，解出来的样子
+fn create_frame(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"))
+}
+
+/// 一轮的开头：一帧 `response.create`（`raw` 是客户端的原话，`frame` 是它解出来的样子）。
+///
+/// 位置和 HTTP 那条路一样：内容过滤先下结论（不报：结论挂在这一轮的号上报），定发给这一家的
+/// 模型名和参数改写（[`Naming`]：规则拒绝了的照样留一行），然后交去准入（[`turn::admit`]）。
+/// 插件的请求钩子、脱敏、发出在过了准入之后（[`admitted`]）。
+async fn begin_turn(
+    state: &AppState,
+    p: &mut Pipes,
+    raw: &str,
+    frame: serde_json::Value,
+    c_tx: &mut ClientSink,
+    waiting: &mut Option<Waiting>,
+) -> Step {
+    let arrived = std::time::Instant::now();
+    let at_ms = crate::server::now_ms();
+    let (Some(naming), Some(turns)) = (p.naming.as_ref(), p.turns.as_ref()) else {
+        return Step::Go;
+    };
+    let screening = {
+        let s = &p.rules.screen;
+        if s.mode.detects() {
+            crate::guard::screen(s, tw_dialect::ir::Dialect::Responses, raw.as_bytes())
+        } else {
+            Default::default()
+        }
+    };
+    // 删过的话，后面一律用删过的那一帧
+    let (text, frame) = match &screening.body {
+        Some(b) => {
+            let text = String::from_utf8_lossy(b).into_owned();
+            let frame = serde_json::from_str(&text).unwrap_or(frame);
+            (text, frame)
+        }
+        None => (raw.to_string(), frame),
+    };
+    let reading = naming.read(&frame);
+    let requested = reading.facts.model.clone();
+    let input_estimate =
+        matches!(reading.decoded, Some(Ok(_))).then_some(reading.facts.input_tokens);
+    let fingerprint = crate::session::fingerprint(&frame);
+    let line = turns.line.clone();
+    // 别名对到这一家、密钥的模型范围继承时看的清单：这一帧（一次请求）用同一份
+    let catalog = state.catalog.load();
+    let out = match naming.frame(&catalog, &reading.facts) {
+        Ok(out) => out,
+        // 只是这一帧不发：替它回一个 `response.failed`，连接照常
+        Err(no) => {
+            tracing::info!(provider = %p.provider, why = %no.why.detail.text,
+                "a WebSocket request was not sent");
+            if let Some(by) = no.denied {
+                turn::denied(
+                    state,
+                    &line,
+                    by,
+                    &no.why,
+                    requested,
+                    fingerprint.as_deref(),
+                    input_estimate,
+                    arrived,
+                    at_ms,
+                );
+            }
+            return reply_failed(c_tx, no.why).await;
+        }
+    };
+    let admit = turn::Admit {
+        state: state.clone(),
+        line,
+        rewritten_by: out.rewritten_by.clone(),
+        requested: requested.clone(),
+        sent: out.model.clone(),
+        fingerprint,
+        input_estimate,
+        screening,
+        arrived,
+        at_ms,
+    };
+    let next = Next {
+        text,
+        requested,
+        out,
+    };
+    *waiting = Some(Box::pin(async move { (turn::admit(admit).await, next) }));
+    Step::Go
+}
+
+/// 一轮过了准入（或者没过）：过插件的请求钩子、脱敏，发给上游，排进在跑的那几轮里。没过的、
+/// 插件拒绝的替它回一个 `response.failed`（被内容过滤、插件拒绝而切断的除外）。
+async fn admitted(
+    state: &AppState,
+    p: &mut Pipes,
+    (got, next): (Result<turn::Turn, turn::NotAdmitted>, Next),
+    c_tx: &mut ClientSink,
+    u_tx: &mut UpstreamSink,
+) -> Step {
+    let mut turn = match got {
+        Ok(turn) => turn,
+        Err(turn::NotAdmitted::Failed(err)) => {
+            tracing::info!(provider = %p.provider, why = %err.detail.text,
+                "a WebSocket request was not admitted");
+            return reply_failed(c_tx, err).await;
+        }
+        Err(turn::NotAdmitted::Cut(why)) => {
+            let _ = c_tx
+                .send(Message::Text(format!("[ThinkWatch] {}", why.text).into()))
+                .await;
+            return Step::End(End::Cut(why));
+        }
+    };
+    let text = match request(state, p, turn.id, next).await {
+        Ok(text) => text,
+        Err(Refusal::Cut(why)) => {
+            turn.unsent(Vec::new(), tw_api::FailureSource::Denied, why.clone());
+            let _ = c_tx
+                .send(Message::Text(format!("[ThinkWatch] {}", why.text).into()))
+                .await;
+            return Step::End(End::Cut(why));
+        }
+        // 只是这一帧不发：替它回一个 `response.failed`，连接照常
+        Err(Refusal::Frame(err)) => {
+            tracing::info!(provider = %p.provider, why = %err.detail.text,
+                "a WebSocket request was not sent");
+            turn.unsent(Vec::new(), err.source.into(), err.detail.clone());
+            return reply_failed(c_tx, err).await;
+        }
+    };
+    let model = Some(p.sent_model.clone()).filter(|m| !m.is_empty() && *m != p.requested_model);
+    let out = outbound(state, p, turn.id, text);
+    turn.sent(model.clone());
+    match u_tx.send(out).await {
+        Ok(()) => {
+            if let Some(t) = p.turns.as_mut() {
+                t.push(turn);
+            }
+            Step::Go
+        }
+        Err(e) => {
+            let why = send_failed(e);
+            let hop = crate::server::hop_failed(
+                &p.provider,
+                model,
+                why.clone(),
+                std::time::Instant::now(),
+            );
+            turn.unsent(vec![hop], tw_api::FailureSource::Upstream, why.clone());
+            Step::End(End::Broke(why))
+        }
+    }
+}
+
+/// 替没发出去的那一帧回一个 `response.failed`（见 [`failed_frame`]），连接照常
+async fn reply_failed(c_tx: &mut ClientSink, err: GatewayError) -> Step {
+    let failed = failed_frame(err, None);
+    if c_tx.send(Message::Text(failed.into())).await.is_err() {
+        return Step::End(End::Closed);
+    }
+    Step::Go
+}
+
+/// 发给上游之前的最后一步：出站脱敏，**和普通请求同一个函数、同一份全局规则**。客户端发来
+/// 的一帧是一次请求，找到的挂在请求 `id` 上各报各的（一次最多报几个见
+/// `crate::guard::REPORTED_MAX`）
+fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
+    let mode = p.rules.redact_mode;
+    let found = crate::guard::find(mode, &p.rules.redact, text.as_bytes());
+    if found.is_empty() {
+        return UpMsg::Text(text.into());
+    }
+    state.bus.emit(tw_api::Event::SecretsFound {
+        id,
+        provider: p.provider.clone(),
+        replaced: mode.acts(),
+        items: crate::guard::items(&found, 0),
+        at_ms: crate::server::now_ms(),
+    });
+    if !mode.acts() {
+        return UpMsg::Text(text.into());
+    }
+    // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不换
+    let hits = crate::guard::hits(&text, &p.rules.redact);
+    let r = tw_guard::redact::replace::apply(
+        &text,
+        &hits,
+        std::mem::replace(
+            &mut p.ledger,
+            tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+        ),
+    );
+    p.ledger = r.ledger;
+    UpMsg::Text(r.text.into())
 }
 
 type ClientSink = futures::stream::SplitSink<WebSocket, Message>;
@@ -944,12 +1341,115 @@ enum Flow {
 }
 
 /// 上游的一帧文本：还原占位符、回答钩子、工具墙，然后发给客户端。
+///
+/// Responses 的连接上它属于上游此刻在回答的那一轮（见 [`turn`]）：这一轮的结局按上游原话认
+/// （用量、第一个 token、上游报的错），回答完了的那一帧交给客户端之后，这一轮收场、放掉它
+/// 占着的。被工具墙切断的，这一轮记成拒绝。
+///
+/// **收了尾的那一轮又来的帧不算任何一轮的**（见 [`turn::Turns::late`]）：上游先报 `error`、
+/// 再为同一次回答补一个 `response.failed` 时，后一帧照原样交给客户端，不让排在后面的那一轮
+/// 背上它的失败。被切掉的那一轮已经替它发过 `response.failed`，它补发的不再发。
 async fn upstream_text(
     state: &AppState,
     p: &mut Pipes,
     t: &str,
     c_tx: &mut ClientSink,
-    ending: &mut crate::ending::Ending,
+    ending: &mut Option<crate::ending::Ending>,
+) -> Flow {
+    let kind = frame_kind(t);
+    // Realtime 的一次回答收了尾：它的用量加到这条连接的那一行上。**看的是上游原话**，和
+    // 别的路一样（占位符不影响数字）
+    if p.realtime
+        && kind.as_deref() == Some("response.done")
+        && let (Some(e), Some(u)) = (ending.as_mut(), realtime_usage(t))
+    {
+        e.add_usage(&u);
+    }
+    // 一次回答从开始到收尾的那几帧带着它的 id。只有它们要解第二遍
+    let response = kind
+        .as_deref()
+        .filter(|k| lifecycle(k))
+        .and_then(|_| response_id(t));
+    let late = p
+        .turns
+        .as_mut()
+        .zip(response.as_deref().zip(kind.as_deref()))
+        .and_then(|(turns, (id, kind))| turns.late(id, kind));
+    match late {
+        Some(true) => return Flow::Sent,
+        Some(false) => {}
+        None => {
+            if let Some(turn) = p.turns.as_mut().and_then(turn::Turns::front) {
+                turn.upstream(t, kind.as_deref(), response.as_deref());
+            }
+        }
+    }
+    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx, ending).await;
+    if let Some(turns) = p.turns.as_mut() {
+        match &flow {
+            Flow::Sent if late.is_none() && ends_turn(kind.as_deref()) => turns.finish_front(),
+            Flow::End(End::Cut(why)) => {
+                turns.fail_front(tw_api::FailureSource::Denied, why.clone())
+            }
+            _ => {}
+        }
+    }
+    flow
+}
+
+/// Realtime 的 `response.done` 里这一次回答的用量（`response.usage`）。和 Responses 一样，
+/// `input_tokens` 里含着从缓存读的（`cached_tokens`），只是细分叫 `input_token_details`。
+/// 语音、图片的 token 不分开：查价和别的请求一样按 token 的单价算。没有 `usage` 的是 None
+fn realtime_usage(frame: &str) -> Option<tw_dialect::usage::Usage> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    let u = v.get("response")?.get("usage")?;
+    let n = |p: &str| {
+        u.pointer(p)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cached = n("/input_token_details/cached_tokens");
+    Some(tw_dialect::usage::Usage {
+        input: n("/input_tokens").saturating_sub(cached),
+        cache_read: cached,
+        output: n("/output_tokens"),
+        ..Default::default()
+    })
+}
+
+/// 上游的这一帧（`type` 是 `kind`）是不是一次回答的结尾：完成、失败、没答完，或者一个错误
+/// （没开始回答就出错的，上游只回一个 `error`）
+fn ends_turn(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some("response.completed" | "response.failed" | "response.incomplete" | "error")
+    )
+}
+
+/// 一次回答从开始到收尾的那几帧（`type` 是 `kind`）：它们带着这次回答（`response.id`）
+fn lifecycle(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.created"
+            | "response.queued"
+            | "response.in_progress"
+            | "response.completed"
+            | "response.failed"
+            | "response.incomplete"
+    )
+}
+
+/// [`upstream_text`] 的转发那一半。`kind` 是这一帧的 `type`。`late` 是收了尾的那一次回答又来
+/// 的一帧（见 [`turn::Turns::late`]）：照原样交给客户端（占位符照样还原、工具墙照样看），
+/// 不碰此刻那一次回答的回答钩子和切掉的状态
+async fn relay(
+    state: &AppState,
+    p: &mut Pipes,
+    t: &str,
+    kind: Option<&str>,
+    late: bool,
+    c_tx: &mut ClientSink,
+    ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
     let restored = tw_guard::redact::replace::restore(t, &p.ledger);
     // 模型名换回客户端用的名称：一条消息是一个完整的 JSON，整条过一遍。排在回答钩子之前，
@@ -963,12 +1463,14 @@ async fn upstream_text(
         None => restored,
     };
     // 回答的边界：一次新的回答起一组回答钩子的实例；被切掉的那次剩下的帧不发
-    let kind = frame_kind(&restored);
     let terminal = matches!(
-        kind.as_deref(),
+        kind,
         Some("response.completed" | "response.failed" | "response.incomplete")
     );
-    if kind.as_deref() == Some("response.created") {
+    // 收了尾的那一次回答又来的一帧不是此刻这一次的边界
+    if late {
+        // 原样往下走
+    } else if kind == Some("response.created") {
         p.response = response_id(&restored);
         p.dropping = false;
         // 回答钩子：这一次回答起一组实例
@@ -982,7 +1484,7 @@ async fn upstream_text(
         return Flow::Sent;
     }
     // 回答钩子：一帧可能变成几帧，也可能先扣着
-    let (outgoing, failed) = match p.reply.as_mut() {
+    let (outgoing, failed) = match p.reply.as_mut().filter(|_| !late) {
         None => (vec![restored], None),
         Some(s) => {
             let (out, mut err) = s.feed(as_sse(&restored).as_bytes()).await;
@@ -1029,7 +1531,7 @@ async fn upstream_text(
                 ledger: p.ledger.clone(),
             };
             state.bus.emit(crate::server::flagged(
-                p.id,
+                p.event_id(),
                 &p.provider,
                 h,
                 blocked,
@@ -1045,7 +1547,9 @@ async fn upstream_text(
                 .await;
             return Flow::End(End::Cut(why));
         }
-        ending.count(msg.len());
+        if let Some(e) = ending.as_mut() {
+            e.count(msg.len());
+        }
         // 发不给客户端，就是客户端已经走了
         if c_tx.send(Message::Text(msg.into())).await.is_err() {
             return Flow::End(End::Closed);
@@ -1058,8 +1562,11 @@ async fn upstream_text(
     Flow::Sent
 }
 
-/// 切掉这一次回答：替它发 `response.failed`，它剩下的帧不再发
+/// 切掉这一次回答：替它发 `response.failed`，它剩下的帧不再发。这一轮的结局记成拒绝
 async fn fail_response(p: &mut Pipes, c_tx: &mut ClientSink, why: Msg) -> Flow {
+    if let Some(t) = p.turns.as_mut() {
+        t.cut_front(why.clone());
+    }
     let failed = failed_frame(GatewayError::denied(why), p.response.as_deref());
     p.dropping = true;
     p.reply = None;
@@ -1069,44 +1576,35 @@ async fn fail_response(p: &mut Pipes, c_tx: &mut ClientSink, why: Msg) -> Flow {
     Flow::Sent
 }
 
-/// 客户端发来的一帧为什么不发。
+/// 过了准入的一帧为什么还是不发（插件的请求钩子，见 [`plugin_request`]）。
 enum Refusal {
     /// 切断这条连接，告诉客户端的是这句话：插件拒绝了这个请求，和内容过滤拒掉一帧一样
     Cut(Msg),
-    /// 只是这一帧不发，替它回一个 `response.failed`（见 [`failed_frame`]），连接照常：要的
-    /// 别名这一家服务不了、密钥不让用要发的模型、规则拒绝了它。下一帧要的可能就是能发的
+    /// 只是这一帧不发，替它回一个 `response.failed`（见 [`failed_frame`]），连接照常：插件换上的
+    /// 别名这一家服务不了、密钥不让用插件换上的模型。下一帧要的可能就是能发的
     Frame(GatewayError),
 }
 
-/// 一次 `response.create`：定发给这一家的模型名和参数改写（[`Naming`]），过插件的请求钩子。
-/// `text` 是查过内容过滤的那一帧（删过的话是删过的样子）。返回要发给上游的那一帧：插件改过
-/// 的话是改过的，模型名写成发给这一家的那个，规则的参数改写写进去。别的帧原样。
+/// 过了准入的一帧 `response.create`：过插件的请求钩子，写上发给这一家的模型名和规则的参数
+/// 改写（[`Naming`] 在准入之前定好的，见 [`begin_turn`]）。返回要发给上游的那一帧：插件改过的
+/// 话是改过的。`id` 是这一轮的号。
 ///
 /// 这条路只有一跳：上游是这条连接连的那一家，插件的运行记在第 0 跳上。插件改过的那一版
-/// **再查一遍内容过滤**，只报插件加进来的（客户端的原话已经在 [`screen_frame`] 查过了，见
+/// **再查一遍内容过滤**，只报插件加进来的（客户端的原话在 [`begin_turn`] 查过了，见
 /// [`screen_changed`]）。
-async fn request(state: &AppState, p: &mut Pipes, text: &str) -> Result<String, Refusal> {
-    let Some(naming) = p.naming.as_ref() else {
-        return Ok(text.to_string());
-    };
-    let Some(frame) = serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"))
-    else {
-        return Ok(text.to_string());
-    };
-    let requested = frame
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or_default()
-        .to_string();
-    // 别名对到这一家、密钥的模型范围继承时看的清单：这一帧（一次请求）用同一份
+async fn request(state: &AppState, p: &mut Pipes, id: u64, next: Next) -> Result<String, Refusal> {
+    let Next {
+        text,
+        requested,
+        out: Outgoing {
+            model: sent, set, ..
+        },
+    } = next;
     let catalog = state.catalog.load();
-    let Outgoing { model: sent, set } = naming.frame(&catalog, &frame).map_err(Refusal::Frame)?;
     let (out, sent) = if p.plugins.is_some() {
-        plugin_request(state, p, &catalog, text, &requested, sent).await?
+        plugin_request(state, p, id, &catalog, &text, &requested, sent).await?
     } else {
-        (text.to_string(), sent)
+        (text, sent)
     };
     // 和 HTTP 那条路一样，参数改写作用在插件改过的那一版上
     let out = rewrite(out, &sent, &set);
@@ -1127,6 +1625,7 @@ async fn request(state: &AppState, p: &mut Pipes, text: &str) -> Result<String, 
 async fn plugin_request(
     state: &AppState,
     p: &mut Pipes,
+    id: u64,
     catalog: &tw_engine::Catalog,
     text: &str,
     requested: &str,
@@ -1153,11 +1652,11 @@ async fn plugin_request(
     let plugged = match hook.attempt(&pc.pool, &to).await {
         Ok(plugged) => plugged,
         Err(refused) => {
-            crate::plugin::request::record(state, p.id, &refused.runs);
+            crate::plugin::request::record(state, id, &refused.runs);
             return Err(Refusal::Cut(refused.why));
         }
     };
-    crate::plugin::request::record(state, p.id, &plugged.runs);
+    crate::plugin::request::record(state, id, &plugged.runs);
     p.bridge = plugged.bridge;
     let Some(c) = plugged.changed else {
         return Ok((text.to_string(), sent));
@@ -1190,6 +1689,7 @@ async fn plugin_request(
     let out = screen_changed(
         state,
         p,
+        id,
         text,
         String::from_utf8_lossy(&c.body).into_owned(),
     )
@@ -1229,7 +1729,13 @@ fn rewrite(text: String, model: &str, set: &tw_engine::SetAction) -> String {
 ///
 /// 返回要发出去的那一帧：处置档下插件加进来的字命中了删除规则的，是删过的样子。要拒绝时
 /// 是告诉客户端的那句话
-fn screen_changed(state: &AppState, p: &Pipes, before: &str, after: String) -> Result<String, Msg> {
+fn screen_changed(
+    state: &AppState,
+    p: &Pipes,
+    id: u64,
+    before: &str,
+    after: String,
+) -> Result<String, Msg> {
     let s = &p.rules.screen;
     if !s.mode.detects() {
         return Ok(after);
@@ -1240,7 +1746,7 @@ fn screen_changed(state: &AppState, p: &Pipes, before: &str, after: String) -> R
         before.as_bytes(),
         after.as_bytes(),
     );
-    if let Some(why) = crate::guard::report(&state.bus, p.id, &p.provider, &sc) {
+    if let Some(why) = crate::guard::report(&state.bus, id, &p.provider, &sc) {
         return Err(why);
     }
     Ok(match sc.body {
@@ -1265,7 +1771,7 @@ async fn start_reply(state: &AppState, p: &mut Pipes) -> Result<(), Msg> {
         model: &p.sent_model,
         requested_model: &p.requested_model,
         upstream: &p.provider,
-        request_id: p.id,
+        request_id: p.event_id(),
         attempt: 0,
     };
     match crate::plugin::reply::Chain::start(state, &pc.set, bridge, &ctx).await {
@@ -1304,6 +1810,7 @@ fn response_id(frame: &str) -> Option<String> {
 /// 替被切掉的那次回答（或者没发出去的那一帧）发的 `response.failed`：和 SSE 那条路同一个
 /// 形状（`tw_dialect` 的错误帧），id 换成这次回答的。没发出去的那一帧没有回答，id 是新的
 fn failed_frame(err: GatewayError, response: Option<&str>) -> String {
+    let until_reset = err.retry.is_some_and(|r| r.until_reset);
     let sse = err
         .in_dialect(tw_dialect::ir::Dialect::Responses)
         .sse_frame();
@@ -1315,16 +1822,22 @@ fn failed_frame(err: GatewayError, response: Option<&str>) -> String {
     if let Some(id) = response {
         v["response"]["id"] = serde_json::Value::String(id.to_string());
     }
+    // 密钥这一期的上限用完了：和 HTTP 那条路的 OpenAI 格式一样写成额度用完（见
+    // `crate::error::Retry`）。Codex 按 `code` 决定退不退避，认这个码的直接停下来告诉用户
+    if until_reset {
+        v["response"]["error"]["code"] = serde_json::Value::String("insufficient_quota".into());
+    }
     v.to_string()
 }
 
 /// 客户端发来的一帧过一遍内容过滤：处置档下该拒的话是告诉客户端的那句话，否则是要发
-/// 出去的那一帧（删过的话是删过的样子）。
+/// 出去的那一帧（删过的话是删过的样子）。命中的挂在 [`Pipes::event_id`] 上报。
 ///
 /// Codex 在 WS 上发的是 `{"type":"response.create", …}`，其余字段就是一个 Responses
 /// 请求：**按消息结构看**，和 HTTP 那条路一样只看调用方的消息、删也只删那里（见
 /// [`crate::guard::screen`]）。别的帧只用码位规则查整段原文（见
-/// [`crate::guard::screen_raw`]）。
+/// [`crate::guard::screen_raw`]）。Responses 的连接上一帧 `response.create` 是一轮的开头，
+/// 在 [`begin_turn`] 里查，结论挂在那一轮上报。
 fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Result<String, Msg> {
     let s = &p.rules.screen;
     if !s.mode.detects() {
@@ -1338,7 +1851,7 @@ fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Result<String, Msg> 
     } else {
         crate::guard::screen_raw(s, text)
     };
-    if let Some(why) = crate::guard::report(&state.bus, p.id, &p.provider, &sc) {
+    if let Some(why) = crate::guard::report(&state.bus, p.event_id(), &p.provider, &sc) {
         return Err(why);
     }
     Ok(match sc.body {
@@ -1406,6 +1919,17 @@ mod tests {
         );
         // 空 query 不该留一个光秃秃的问号
         assert_eq!(upstream_url("http://h", "/x", Some("")), "ws://h/x");
+    }
+
+    #[test]
+    fn a_realtime_answer_reports_its_usage_with_the_cache_read_split_out() {
+        let done = r#"{"type":"response.done","response":{"id":"r","status":"completed","usage":{"total_tokens":253,"input_tokens":132,"output_tokens":121,"input_token_details":{"text_tokens":119,"audio_tokens":13,"cached_tokens":64},"output_token_details":{"text_tokens":30,"audio_tokens":91}}}}"#;
+        let u = realtime_usage(done).unwrap();
+        assert_eq!((u.input, u.cache_read, u.output), (68, 64, 121));
+        assert_eq!(
+            realtime_usage(r#"{"type":"response.done","response":{"id":"r"}}"#),
+            None
+        );
     }
 
     #[test]

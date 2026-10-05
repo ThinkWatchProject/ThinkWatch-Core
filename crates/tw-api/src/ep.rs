@@ -95,6 +95,9 @@ endpoints! {
     UpdateProvider: PUT "/providers/{name}" [name], api::ProviderSave => api::ConfigWritten;
     DeleteProvider: DELETE "/providers/{name}" [name], api::BaseVersion => api::ConfigWritten;
     ProviderModels: GET "/providers/{name}/models" [name], () => api::ProviderModelsView;
+    /// 手写一家上游的一个模型的上下文窗口、输出上限，优先于价目表；两项都空就删掉。
+    /// **不在 `/providers/` 底下**：写死的一段会盖住 `/providers/{name}`
+    SetModelSpec: PUT "/provider-model-spec", api::ModelSpecSave => api::ConfigWritten;
     RefreshProviderModels: POST "/providers/{name}/models/refresh" [name], () => api::ProviderModelsView;
     RefreshStaleModels: POST "/models/refresh", () => api::ModelsRefreshing;
     CreateProxy: POST "/proxies", api::ProxySave => api::ConfigWritten;

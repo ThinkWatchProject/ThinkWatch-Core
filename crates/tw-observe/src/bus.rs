@@ -72,6 +72,8 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::RequestPriced { .. }
         | E::QuotaSeen { .. }
         | E::QuotaExhausted { .. }
+        // 一把密钥的用量到了上限：说的是那把密钥，不是哪一个请求
+        | E::KeyLimitAlert { .. }
         | E::LocallyAnswered { .. }
         | E::CredentialRotated { .. }
         | E::CredentialExpired { .. }
@@ -126,15 +128,6 @@ impl EventBus {
     }
 
     /// 拿一个请求 id。同一个请求的四个事件共用它。
-    /// 现在发到第几号了，**不占号**。
-    ///
-    /// 给 `load-balance` 当轮转的种子用：它要一个单调、便宜、
-    /// 每个请求都不同的数，而事件序号正好是。**不能用 `next_id`** ——
-    /// 那会凭空占掉一个号，让事件流里出现一个不存在的 id。
-    pub fn peek_id(&self) -> u64 {
-        self.next_id.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -251,6 +244,16 @@ impl EventBus {
                 })
                 .collect(),
         }
+    }
+
+    /// 这个请求还在跑吗：发过开始事件、还没有结局。**只看一个号，不拷事件** ——
+    /// [`EventBus::in_flight`] 要把整张表连事件一起拷出来。
+    ///
+    /// 给密钥用量上限的预留用（见 `tw_gateway::key_limits`）：一个请求的预留要等存储层
+    /// 记下它那一行才换成实数，存储层落后丢了那一行时，靠它认出这个请求早已结束
+    pub fn is_open(&self, id: u64) -> bool {
+        let t = self.tally.lock().unwrap_or_else(|p| p.into_inner());
+        t.open.contains_key(&id)
     }
 
     /// 此刻的实时读数：在跑的请求（和 [`EventBus::in_flight`] 同一批），和最近
@@ -409,6 +412,9 @@ mod tests {
 
         let open = b.in_flight().requests;
         assert_eq!(open.iter().map(|r| r.id).collect::<Vec<_>>(), [4]);
+        // 只问一个号的那一问，和快照说的是同一件事
+        assert!(b.is_open(4));
+        assert!(!b.is_open(1) && !b.is_open(2) && !b.is_open(3) && !b.is_open(99));
         // **原样**：听的人拿它当补发的事件，字段一个都不能少
         assert!(
             matches!(&open[0].events[0], tw_api::Event::RequestStarted { model, at_ms: 1004, .. } if model == "m"),
@@ -433,6 +439,9 @@ mod tests {
                     status: Some(503),
                     error: None,
                     ms: 10,
+                    usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 },
                 tw_api::AttemptView {
                     provider: served_by.into(),
@@ -441,6 +450,9 @@ mod tests {
                     status: Some(200),
                     error: None,
                     ms: 20,
+                    usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,

@@ -11,7 +11,7 @@ impl From<crate::error::Source> for FailureSource {
             Source::Config => Self::Config,
             Source::Upstream => Self::Upstream,
             Source::Request => Self::Request,
-            Source::RateLimited => Self::RateLimited,
+            Source::RateLimited | Source::Busy => Self::RateLimited,
             Source::Denied => Self::Denied,
             Source::NotSupported => Self::Request,
         }

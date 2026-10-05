@@ -65,12 +65,17 @@ pub fn apply_set(r: &mut Request, set: &tw_engine::SetAction) {
 
 /// 客户端没写最大输出、目标格式又必须写（Anthropic）时用多少。
 ///
-/// **价目表里有这个模型的输出上限就用它**：写大了上游拒绝，写小了回答被截断。
-/// 查不到时按模型名兜底（[`tw_dialect::official::fallback_max_output_tokens`]）。
-pub fn default_max_tokens(book: &tw_pricing::PriceBook, model: &str) -> u64 {
-    book.table()
-        .get(model)
-        .and_then(|p| p.max_output_tokens)
+/// **知道这一家的这个模型的输出上限就用它**（手写的优先，再看价目表，见
+/// [`tw_config::model_specs`]）：写大了上游拒绝，写小了回答被截断。都查不到时按模型名
+/// 兜底（[`tw_dialect::official::fallback_max_output_tokens`]）。
+pub fn default_max_tokens(
+    book: &tw_pricing::PriceBook,
+    provider: &tw_config::Provider,
+    model: &str,
+) -> u64 {
+    provider
+        .model_limits(book, model)
+        .max_output_tokens()
         .unwrap_or_else(|| tw_dialect::official::fallback_max_output_tokens(model))
 }
 
@@ -125,11 +130,37 @@ mod tests {
             Default::default(),
             [],
         );
-        assert_eq!(default_max_tokens(&book, "claude-sonnet-4-5"), 64000);
-        assert_eq!(default_max_tokens(&book, "deepseek-chat"), 8000);
+        let up = tw_config::Provider {
+            name: "up".into(),
+            ..Default::default()
+        };
+        assert_eq!(default_max_tokens(&book, &up, "claude-sonnet-4-5"), 64000);
+        assert_eq!(default_max_tokens(&book, &up, "deepseek-chat"), 8000);
         // 表里没有的按名字兜底
-        assert_eq!(default_max_tokens(&book, "claude-mythos-5-1"), 32000);
-        assert_eq!(default_max_tokens(&book, "some-relay-model"), 8192);
+        assert_eq!(default_max_tokens(&book, &up, "claude-mythos-5-1"), 32000);
+        assert_eq!(default_max_tokens(&book, &up, "some-relay-model"), 8192);
+        // 这一家手写的优先
+        let relay = tw_config::Provider {
+            model_specs: [("some-relay-model", 4096), ("claude-sonnet-4-5", 32000)]
+                .into_iter()
+                .map(|(m, n)| {
+                    (
+                        m.to_string(),
+                        tw_config::ModelSpec {
+                            context_window: None,
+                            max_output_tokens: Some(n),
+                        },
+                    )
+                })
+                .collect(),
+            ..up
+        };
+        assert_eq!(default_max_tokens(&book, &relay, "some-relay-model"), 4096);
+        assert_eq!(
+            default_max_tokens(&book, &relay, "claude-sonnet-4-5"),
+            32000
+        );
+        assert_eq!(default_max_tokens(&book, &relay, "deepseek-chat"), 8000);
     }
 
     #[test]

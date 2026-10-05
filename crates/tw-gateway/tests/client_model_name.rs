@@ -735,6 +735,7 @@ async fn after_failover_the_name_the_answering_hop_sent_decides() {
             kind: tw_engine::GroupType::Fallback,
             providers: vec!["official".into(), "relay".into()],
             selected: None,
+            balance_by: Default::default(),
         }],
         routes,
     )

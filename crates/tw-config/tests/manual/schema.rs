@@ -11,7 +11,7 @@ use super::{Def, Kind, Lang, Row, Section, T2};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
-use tw_engine::{Group, GroupType, Pinned, RouteSet, Rule, SetAction};
+use tw_engine::{BalanceBy, Group, GroupType, Member, Pinned, RouteSet, Rule, SetAction};
 use tw_pricing::{PerMillion, PricingConfig, SheetDef};
 
 const fn t(en: &'static str, zh: &'static str) -> T2 {
@@ -57,6 +57,12 @@ fn content_matches() -> Vec<&'static str> {
 }
 fn group_types() -> Vec<&'static str> {
     super::fields::<GroupType>()
+}
+fn balance_bys() -> Vec<&'static str> {
+    super::fields::<BalanceBy>()
+}
+fn limit_pers() -> Vec<&'static str> {
+    super::fields::<LimitPer>()
 }
 
 const RULE_ID: T2 = t("built-in rule id", "内置规则 id");
@@ -425,6 +431,66 @@ pub fn sections() -> Vec<Section> {
                         "拒绝使用这把密钥的所有请求，密钥本身保留。",
                     ),
                 ),
+                row(
+                    "limits",
+                    Kind::Objs("clients[].limits[]"),
+                    Def::Unset,
+                    t(
+                        "Usage limits: requests, tokens or cost per minute, hour, day, week or month. A request has to pass every one. Unset: no limit.",
+                        "用量上限：每分钟、每小时、每天、每周或每月的请求数、token 数或费用。请求要通过每一条。不写：不限。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "clients[].limits[]",
+            ty: checked!(KeyLimit, "{per: day}"),
+            rows: vec![
+                row(
+                    "per",
+                    Kind::Enum(limit_pers),
+                    Def::Required,
+                    t(
+                        "The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st.",
+                        "按多长一段时间算。`minute`、`hour` 是滚动的（最近 60 秒、最近 60 分钟）；`day`、`week`、`month` 在本地时间的零点、周一零点、每月一号零点重新算。",
+                    ),
+                ),
+                row(
+                    "requests",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "At most this many requests. Token counts, answers the gateway gives itself and requests that never reach an upstream do not count.",
+                        "最多这么多个请求。数 token 的请求、网关自己答的、没有发到上游的不算。",
+                    ),
+                ),
+                row(
+                    "tokens",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "At most this many tokens: uncached input, cache writes and output.",
+                        "最多这么多 token：未命中缓存的输入、写入缓存的和输出。",
+                    ),
+                ),
+                row(
+                    "cost",
+                    Kind::Num,
+                    Def::Unset,
+                    t(
+                        "At most this much, in US dollars, as recorded for each request; at least 0.01. Models without a price and upstreams with `billing: free` count as 0.",
+                        "最多花这么多美元，按每个请求记下的费用算；至少 0.01。没有价格的模型、`billing: free` 的上游算 0。",
+                    ),
+                ),
+                row(
+                    "cache_reads",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Count cache reads too. Only for a `tokens` limit.",
+                        "把读取缓存的 token 也算进去。只有 `tokens` 上限能写。",
+                    ),
+                ),
             ],
         },
         // ── providers ─────────────────────────────────────────
@@ -559,12 +625,55 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "model_specs",
+                    Kind::ObjMap(t("model id", "模型 ID"), "providers[].model_specs.*"),
+                    Def::Is("{}"),
+                    t(
+                        "Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong.",
+                        "手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。",
+                    ),
+                ),
+                row(
+                    "max_concurrent",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit.",
+                        "同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。",
+                    ),
+                ),
+                row(
                     "disabled",
                     Kind::Bool,
                     Def::Is("false"),
                     t(
                         "Take the upstream out of routing and out of the model list, and keep its configuration.",
                         "不参与路由，模型也不出现在模型列表里；配置原样保留。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "providers[].model_specs.*",
+            // 两项都可选，至少写一项由校验管
+            ty: checked!(ModelSpec, "{}"),
+            rows: vec![
+                row(
+                    "context_window",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "Context window: the most tokens a request can take in. Unset: the price table's.",
+                        "上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。",
+                    ),
+                ),
+                row(
+                    "max_output_tokens",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "The most tokens an answer can have. Unset: the price table's.",
+                        "一次回答最多输出多少 token。不写：取价目表的。",
                     ),
                 ),
             ],
@@ -1207,6 +1316,24 @@ pub fn sections() -> Vec<Section> {
                         "流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。",
                     ),
                 ),
+                row(
+                    "next_on_slow_start",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5.",
+                        "流式回答在请求发出 `stream_start_wait_secs` 秒后仍没有内容时，放弃这家上游，把请求交给下一家。最后一家总是等下去。被放弃的上游不会停用。开启时 `stream_start_wait_secs` 至少为 5。",
+                    ),
+                ),
+                row(
+                    "slot_wait_secs",
+                    Kind::Int,
+                    Def::Is("30"),
+                    t(
+                        "Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for a free slot on upstreams at their `max_concurrent`. A key limit that does not free up in time refuses the request; without an upstream slot in time it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300.",
+                        "一个请求合计最多等的秒数，从过了密钥自己的 `max_concurrent` 时算起：等密钥的 `minute`、`hour` 上限空出名额，和等并发数满了（`max_concurrent`）的上游空出位置，都算在里面。密钥的上限到时空不出来就拒绝；等不到上游的空位就换下一家，候选全满时回 429。`0`：不等。取值 0 到 300。",
+                    ),
+                ),
             ],
         },
         // ── groups / routes ───────────────────────────────────
@@ -1228,17 +1355,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(group_types),
                     Def::Is("fallback"),
                     t(
-                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price.",
-                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。",
+                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: requests are shared out in proportion to the members' weights; a conversation in progress stays where it is. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price.",
+                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：请求按成员的权重分；进行中的对话留在原来那一家。`url-test`：按实测从发出请求到回答第一段内容的时间取最快的。`cheapest`：取输入单价最低的。",
                     ),
                 ),
                 row(
                     "providers",
-                    Kind::Strs,
+                    Kind::StrsOrObjs("groups[].providers[]"),
                     Def::Required,
                     t(
-                        "Member upstreams, by name; not groups. Each upstream appears once in a group.",
-                        "成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。",
+                        "Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`.",
+                        "成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。`load-balance` 组的成员可以写成 `{name, weight}`。",
                     ),
                 ),
                 row(
@@ -1248,6 +1375,39 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "For `select`: the chosen member.",
                         "`select` 类型选中的成员。",
+                    ),
+                ),
+                row(
+                    "balance_by",
+                    Kind::Enum(balance_bys),
+                    Def::Is("weights"),
+                    t(
+                        "For `load-balance`: what the members' weights are multiplied by. `weights`: nothing; the weights alone. `latency`: faster upstreams get more. `health`: upstreams that fail less get more. `latency-health`: both. Other group types take only `weights`.",
+                        "`load-balance` 类型用：成员的权重再乘上什么。`weights`：不乘，只按权重。`latency`：越快的上游分得越多。`health`：越少失败的上游分得越多。`latency-health`：两者都看。其他类型只能是 `weights`。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "groups[].providers[]",
+            ty: checked!(Member, "{name: a}"),
+            rows: vec![
+                row(
+                    "name",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The upstream, by name. A member written as just its name has weight 1.",
+                        "上游的名字。只写名字的成员权重为 1。",
+                    ),
+                ),
+                row(
+                    "weight",
+                    Kind::Int,
+                    Def::Is("1"),
+                    t(
+                        "The member's share of a `load-balance` group's requests, in proportion to the other members' weights. From 1 to 100. Other group types take no weight other than 1.",
+                        "成员在 `load-balance` 组中分到的请求份额，与其他成员的权重成比例。取值 1 到 100。其他类型的策略组只能写 1。",
                     ),
                 ),
             ],

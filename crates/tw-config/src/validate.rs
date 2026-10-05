@@ -33,6 +33,8 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     ZeroConcurrency { name: String },
     #[error("{}", self.msg())]
+    ProviderConcurrency { name: String, value: u32 },
+    #[error("{}", self.msg())]
     Routing(#[from] tw_engine::RouteError),
     #[error("{}", self.msg())]
     NameCollision(String),
@@ -64,6 +66,9 @@ pub enum ValidationError {
         min: u64,
         max: u64,
     },
+    /// 开着「开头慢就换下一家」，流开头的等待却短于 [`crate::MIN_SLOW_START_WAIT_SECS`]
+    #[error("{}", self.msg())]
+    SlowStartTooShort { secs: u64 },
     #[error("{}", self.msg())]
     ControlKeyMissing,
     #[error("{}", self.msg())]
@@ -98,6 +103,51 @@ pub enum ValidationError {
     AliasChained { alias: String, model: String },
     #[error("{}", self.msg())]
     AliasOnlyItself { alias: String },
+    #[error("{}", self.msg())]
+    ModelSpecBlankModel { upstream: String },
+    #[error("{}", self.msg())]
+    ModelSpecWildcard { upstream: String, model: String },
+    #[error("{}", self.msg())]
+    ModelSpecEmpty { upstream: String, model: String },
+    /// `field` 是字段名本身（`context_window`、`max_output_tokens`），不翻
+    #[error("{}", self.msg())]
+    ModelSpecZero {
+        upstream: String,
+        model: String,
+        field: &'static str,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitEmpty { key: String },
+    #[error("{}", self.msg())]
+    KeyLimitTwoMeasures { key: String, measures: String },
+    #[error("{}", self.msg())]
+    KeyLimitNotPositive {
+        key: String,
+        per: &'static str,
+        measure: &'static str,
+        value: String,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitDuplicate {
+        key: String,
+        per: &'static str,
+        measure: &'static str,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitCacheReads { key: String, measure: &'static str },
+    #[error("{}", self.msg())]
+    KeyLimitCostTooSmall {
+        key: String,
+        per: &'static str,
+        value: String,
+    },
+    #[error("{}", self.msg())]
+    KeyLimitRetention {
+        key: String,
+        per: &'static str,
+        days: u64,
+        min: u64,
+    },
 }
 
 impl ValidationError {
@@ -156,6 +206,12 @@ impl ValidationError {
                 "gateway key `{key}` has max_concurrent: 0, so every request made with it would \
                  wait forever. Leave max_concurrent out for no limit"
             ),
+            ProviderConcurrency { name, value } => msg!(
+                "config.provider_concurrency_range", upstream = name, value = value,
+                max = crate::MAX_PROVIDER_CONCURRENCY =>
+                "upstream `{upstream}` has max_concurrent: {value}; it has to be between 1 and \
+                 {max}. Leave max_concurrent out for no limit"
+            ),
             // 路由那几句本身就说清了是哪条规则、哪个组，前面不用再垫一句
             Routing(e) => e.msg(),
             NameCollision(name) => msg!(
@@ -205,6 +261,12 @@ impl ValidationError {
             } => msg!(
                 "config.failover_range", field = field, value = value, min = min, max = max =>
                 "failover.{field} is {value}; it has to be between {min} and {max}"
+            ),
+            SlowStartTooShort { secs } => msg!(
+                "config.slow_start_too_short",
+                secs = secs, min = crate::MIN_SLOW_START_WAIT_SECS =>
+                "failover.stream_start_wait_secs is {secs} while failover.next_on_slow_start is on; \
+                 it has to be at least {min}, or ordinary answers are cut off before they start"
             ),
             ControlKeyMissing => msg!(
                 "config.control_key_missing" =>
@@ -286,6 +348,75 @@ impl ValidationError {
                 "alias `{alias}` lists only itself, so it changes nothing. List the names the \
                  upstreams use, or remove the alias"
             ),
+            ModelSpecBlankModel { upstream } => msg!(
+                "config.model_spec_blank_model", upstream = upstream =>
+                "upstream `{upstream}` has a model spec (model_specs) for an empty model id"
+            ),
+            ModelSpecWildcard { upstream, model } => msg!(
+                "config.model_spec_wildcard", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` contains * or ?. A model spec \
+                 is for one exact model id"
+            ),
+            ModelSpecEmpty { upstream, model } => msg!(
+                "config.model_spec_empty", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` sets neither context_window \
+                 nor max_output_tokens. Set at least one, or remove it"
+            ),
+            ModelSpecZero {
+                upstream,
+                model,
+                field,
+            } => msg!(
+                "config.model_spec_zero", upstream = upstream, model = model, field = field =>
+                "the model spec `{model}` of upstream `{upstream}` has {field}: 0; it has to be a \
+                 number of tokens above 0. Leave it out to use the price table"
+            ),
+            KeyLimitEmpty { key } => msg!(
+                "config.key_limit_empty", key = key =>
+                "a limit of gateway key `{key}` names nothing to count. Each entry under limits \
+                 takes one of requests, tokens or cost"
+            ),
+            KeyLimitTwoMeasures { key, measures } => msg!(
+                "config.key_limit_two_measures", key = key, measures = measures =>
+                "a limit of gateway key `{key}` names {measures} together. Each entry takes one \
+                 of requests, tokens or cost; write one entry for each"
+            ),
+            KeyLimitNotPositive {
+                key,
+                per,
+                measure,
+                value,
+            } => msg!(
+                "config.key_limit_not_positive", key = key, per = per, measure = measure,
+                value = value =>
+                "the {measure} limit per {per} of gateway key `{key}` is {value}; it has to be \
+                 more than 0"
+            ),
+            KeyLimitDuplicate { key, per, measure } => msg!(
+                "config.key_limit_duplicate", key = key, per = per, measure = measure =>
+                "gateway key `{key}` has two {measure} limits per {per}. Keep one of them"
+            ),
+            KeyLimitCacheReads { key, measure } => msg!(
+                "config.key_limit_cache_reads", key = key, measure = measure =>
+                "the {measure} limit of gateway key `{key}` sets cache_reads, which only a \
+                 tokens limit takes"
+            ),
+            KeyLimitCostTooSmall { key, per, value } => msg!(
+                "config.key_limit_cost_too_small", key = key, per = per, value = value =>
+                "the cost limit per {per} of gateway key `{key}` is {value}; it has to be at \
+                 least 0.01"
+            ),
+            KeyLimitRetention {
+                key,
+                per,
+                days,
+                min,
+            } => msg!(
+                "config.key_limit_retention", key = key, per = per, days = days, min = min =>
+                "gateway key `{key}` has a limit per {per}, and retention.row_days is {days}. \
+                 After a restart the total for the {per} is added up again from the request \
+                 records, so row_days has to be at least {min}"
+            ),
         }
     }
 }
@@ -329,6 +460,16 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 name: p.name.clone(),
                 source,
             })?;
+        // 0 的话发给这家的请求一个都发不出去：留在它上面的对话每次都白等一场，别的请求
+        // 每次都跳过它。不想用它是停用
+        if let Some(n) = p.max_concurrent
+            && !(1..=crate::MAX_PROVIDER_CONCURRENCY).contains(&n)
+        {
+            return Err(ValidationError::ProviderConcurrency {
+                name: p.name.clone(),
+                value: n,
+            });
+        }
         // **空范围不是「全部」，也不是一个合理的「停用」。**两种读法各有
         // 人会当真，而停用有自己的开关
         if let Some(only) = &p.models_only {
@@ -342,6 +483,9 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                     name: p.name.clone(),
                 });
             }
+        }
+        for (model, spec) in &p.model_specs {
+            check_model_spec(&p.name, model, Some(spec))?;
         }
     }
 
@@ -364,6 +508,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 name: c.name.clone(),
             });
         }
+        check_limits(c, cfg.retention.row_days)?;
         if let Some(prev) = keys.insert(&c.key, &c.name) {
             return Err(ValidationError::DuplicateKey(
                 prev.to_string(),
@@ -475,6 +620,10 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             max,
         });
     }
+    // 开头慢就换下一家：等得太短的话，平常的回答还没开口就被切到下一家
+    if let Some(secs) = cfg.failover.slow_start_too_short() {
+        return Err(ValidationError::SlowStartTooShort { secs });
+    }
     // 控制面的钥匙。**缺了、短了、不是十六进制，整份配置都不收**，旧的继续
     // 服务：一份没有钥匙的配置换进来，下一条连接谁都进不来 —— 包括要把它
     // 改回去的那个界面；一把好猜的短钥匙和没有差不多
@@ -503,6 +652,95 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                     entry: entry.clone(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// 天、周、月的上限要请求记录最少留几天：这一期的用量在重启之后（和这一期的开头变了的
+/// 时候，比如时区改了）从请求记录里重新加起来，留得比一期短，这一期开头那几天的就加不回来。
+/// 分钟、小时从空的开始，不要记录
+fn row_days_needed(per: crate::LimitPer) -> Option<u64> {
+    match per {
+        crate::LimitPer::Day => Some(1),
+        crate::LimitPer::Week => Some(7),
+        crate::LimitPer::Month => Some(31),
+        crate::LimitPer::Minute | crate::LimitPer::Hour => None,
+    }
+}
+
+/// 费用上限最小是多少美元：再小的话换成微分是 0（不到一微分），或者小到一个请求就用完
+const COST_MIN: f64 = 0.01;
+
+/// 一把密钥的用量上限写得对不对。
+///
+/// **每一条恰好数一种量**：一条里写两种，读的人分不清是「都要过」还是「过一个就行」。
+/// 同一段时间、同一种量写两条（缓存读算不算进去也一样）的，两条里总有一条不起作用，
+/// 而用户以为它在起作用。
+fn check_limits(c: &crate::Client, row_days: u64) -> Result<(), ValidationError> {
+    let key = || c.name.clone();
+    for (i, l) in c.limits.iter().enumerate() {
+        let measures = l.measures();
+        let measure = match measures.as_slice() {
+            [] => return Err(ValidationError::KeyLimitEmpty { key: key() }),
+            [one] => *one,
+            many => {
+                return Err(ValidationError::KeyLimitTwoMeasures {
+                    key: key(),
+                    measures: many
+                        .iter()
+                        .map(|m| m.word())
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                });
+            }
+        };
+        // 写了 `.nan`、`.inf` 的费用也在这里挡：前者比什么都不大，后者换不成微分
+        let positive = match measure {
+            crate::LimitMeasure::Requests => l.requests.is_some_and(|n| n > 0),
+            crate::LimitMeasure::Tokens => l.tokens.is_some_and(|n| n > 0),
+            crate::LimitMeasure::Cost => l.cost.is_some_and(|x| x.is_finite() && x > 0.0),
+        };
+        if !positive {
+            let value = match measure {
+                crate::LimitMeasure::Requests => l.requests.unwrap_or_default().to_string(),
+                crate::LimitMeasure::Tokens => l.tokens.unwrap_or_default().to_string(),
+                crate::LimitMeasure::Cost => l.cost.unwrap_or_default().to_string(),
+            };
+            return Err(ValidationError::KeyLimitNotPositive {
+                key: key(),
+                per: l.per.word(),
+                measure: measure.word(),
+                value,
+            });
+        }
+        if let Some(x) = l.cost.filter(|x| *x < COST_MIN) {
+            return Err(ValidationError::KeyLimitCostTooSmall {
+                key: key(),
+                per: l.per.word(),
+                value: x.to_string(),
+            });
+        }
+        if l.cache_reads && measure != crate::LimitMeasure::Tokens {
+            return Err(ValidationError::KeyLimitCacheReads {
+                key: key(),
+                measure: measure.word(),
+            });
+        }
+        if c.limits[..i].iter().any(|o| o.same_as(l)) {
+            return Err(ValidationError::KeyLimitDuplicate {
+                key: key(),
+                per: l.per.word(),
+                measure: measure.word(),
+            });
+        }
+        if let Some(min) = row_days_needed(l.per).filter(|min| row_days < *min) {
+            return Err(ValidationError::KeyLimitRetention {
+                key: key(),
+                per: l.per.word(),
+                days: row_days,
+                min,
+            });
         }
     }
     Ok(())
@@ -548,6 +786,49 @@ pub fn check_aliases(aliases: &crate::Aliases) -> Result<(), ValidationError> {
         }
         if a.models.iter().all(|m| *m == a.name) {
             return Err(ValidationError::AliasOnlyItself { alias: alias() });
+        }
+    }
+    Ok(())
+}
+
+/// 一家上游的一项手写模型规格写得对不对，和整份配置的校验是同一套（控制面保存一项
+/// 之前也用它）。`spec` 是 `None` 时只查模型 ID：界面要删掉这一项。**模型在不在这家的
+/// 清单里不查**：清单是运行时问来的。
+pub fn check_model_spec(
+    upstream: &str,
+    model: &str,
+    spec: Option<&crate::ModelSpec>,
+) -> Result<(), ValidationError> {
+    if model.trim().is_empty() {
+        return Err(ValidationError::ModelSpecBlankModel {
+            upstream: upstream.to_string(),
+        });
+    }
+    let named = || (upstream.to_string(), model.to_string());
+    // 没有通配：`glm-*` 写在这里，读的人会以为一批模型都按它算
+    if model.contains(['*', '?']) {
+        let (upstream, model) = named();
+        return Err(ValidationError::ModelSpecWildcard { upstream, model });
+    }
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    if spec.is_empty() {
+        let (upstream, model) = named();
+        return Err(ValidationError::ModelSpecEmpty { upstream, model });
+    }
+    // 0 不是「不知道」：上下文窗口是 0 的模型什么都装不下，输出上限是 0 的什么都答不出
+    for (field, v) in [
+        ("context_window", spec.context_window),
+        ("max_output_tokens", spec.max_output_tokens),
+    ] {
+        if v == Some(0) {
+            let (upstream, model) = named();
+            return Err(ValidationError::ModelSpecZero {
+                upstream,
+                model,
+                field,
+            });
         }
     }
     Ok(())
@@ -641,6 +922,56 @@ mod tests {
     #[test]
     fn a_valid_minimal_config_passes() {
         assert!(validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")])).is_ok());
+    }
+
+    #[test]
+    fn model_specs_name_one_exact_model_and_set_a_positive_number() {
+        let parse = |specs: &str| {
+            crate::try_parse(&format!(
+                "version: 1\nlisten:\n  control:\n    key: {}\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: relay\n    base_url: https://relay.example.com/v1\n    model_specs:\n{specs}",
+                "c0".repeat(32)
+            ))
+        };
+        let ok = parse(
+            "      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }\n      \"us.anthropic.claude-fable-5-v1:0\": { max_output_tokens: 32000 }\n",
+        )
+        .unwrap();
+        let specs = &ok.providers[0].model_specs;
+        assert_eq!(specs["glm-5-air"].context_window, Some(128_000));
+        assert_eq!(
+            specs["us.anthropic.claude-fable-5-v1:0"].max_output_tokens,
+            Some(32_000)
+        );
+        for (specs, code) in [
+            (
+                "      \"\": { context_window: 1000 }\n",
+                "config.model_spec_blank_model",
+            ),
+            (
+                "      glm-*: { context_window: 1000 }\n",
+                "config.model_spec_wildcard",
+            ),
+            ("      glm-5-air: {}\n", "config.model_spec_empty"),
+            (
+                "      glm-5-air: { context_window: 0 }\n",
+                "config.model_spec_zero",
+            ),
+            (
+                "      glm-5-air: { context_window: 1000, max_output_tokens: 0 }\n",
+                "config.model_spec_zero",
+            ),
+        ] {
+            let m = parse(specs).unwrap_err().msg();
+            assert_eq!(m.code, code, "{specs}: {m:?}");
+        }
+        let m = parse("      glm-5-air: { max_output_tokens: 0 }\n")
+            .unwrap_err()
+            .msg();
+        assert_eq!(m.arg("field"), "max_output_tokens");
+        assert_eq!(m.arg("upstream"), "relay");
+        // 字段名写错、写成负数，serde 自己说
+        assert!(parse("      glm-5-air: { context: 1000 }\n").is_err());
+        assert!(parse("      glm-5-air: { context_window: -1 }\n").is_err());
     }
 
     #[test]
@@ -747,6 +1078,23 @@ mod tests {
     }
 
     #[test]
+    fn an_upstreams_concurrency_limit_is_between_1_and_1000() {
+        let with = |n: Option<u32>| {
+            let mut prov = p("relay", "https://relay.example");
+            prov.max_concurrent = n;
+            validate(&cfg(vec![c("a", "tw-a")], vec![prov]))
+        };
+        assert!(with(None).is_ok(), "不写是不限");
+        assert!(with(Some(1)).is_ok());
+        assert!(with(Some(crate::MAX_PROVIDER_CONCURRENCY)).is_ok());
+        for bad in [0, crate::MAX_PROVIDER_CONCURRENCY + 1] {
+            let e = with(Some(bad)).unwrap_err();
+            assert_eq!(e.msg().code, "config.provider_concurrency_range", "{e}");
+            assert!(e.to_string().contains("relay"), "{e}");
+        }
+    }
+
+    #[test]
     fn an_empty_model_scope_is_refused_and_points_at_disabling_instead() {
         let mut prov = p("relay", "https://relay.example");
         prov.models_only = Some(vec![]);
@@ -812,6 +1160,107 @@ groups:
         let m = crate::try_parse(&typo).unwrap_err().msg();
         assert_eq!(m.code, "engine.group_unknown_upstream", "{m:?}");
         assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "typo"));
+    }
+
+    /// 手写的权重：`load-balance` 收 1 到 100，别的类型写了不是 1 的权重、或者超出范围，
+    /// 加载时就拒绝
+    #[test]
+    fn a_weight_is_checked_at_load_time() {
+        let text = |kind: &str, b: &str| {
+            format!(
+                "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: a
+    base_url: https://a.example
+    key: sk-a
+  - name: b
+    base_url: https://b.example
+    key: sk-b
+groups:
+  - name: pool
+    type: {kind}
+    providers:
+      - a
+      - {b}
+"
+            )
+        };
+        let ok = crate::try_parse(&text("load-balance", "{ name: b, weight: 7 }")).unwrap();
+        assert_eq!(ok.groups[0].weight("b"), 7);
+        let code = |kind: &str, b: &str| crate::try_parse(&text(kind, b)).unwrap_err().msg().code;
+        assert_eq!(
+            code("fallback", "{ name: b, weight: 7 }"),
+            "engine.group_weight_not_load_balance"
+        );
+        assert_eq!(
+            code("load-balance", "{ name: b, weight: 0 }"),
+            "engine.group_weight_out_of_range"
+        );
+        assert_eq!(
+            code("load-balance", "{ name: b, weight: 101 }"),
+            "engine.group_weight_out_of_range"
+        );
+        // 拼错的字段照常说是哪一个
+        let m = crate::try_parse(&text("load-balance", "{ name: b, wieght: 7 }"))
+            .unwrap_err()
+            .msg();
+        assert_eq!(m.code, "config.unknown_field", "{m:?}");
+        assert_eq!(m.arg("field"), "groups[0].providers[1].wieght", "{m:?}");
+    }
+
+    /// `balance_by` 写在不是负载均衡的组上：加载时就拒绝，它在那里什么都不做。写在负载
+    /// 均衡组上的照收，写回时原样；默认的不写进去
+    #[test]
+    fn balance_by_belongs_to_load_balance_groups_and_round_trips() {
+        let text = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: a
+    base_url: https://a.example
+    key: sk-a
+  - name: b
+    base_url: https://b.example
+    key: sk-b
+groups:
+  - name: pool
+    type: load-balance
+    providers: [a, b]
+    balance_by: latency-health
+";
+        let cfg = crate::try_parse(text).unwrap();
+        assert_eq!(
+            cfg.groups[0].balance_by,
+            tw_engine::BalanceBy::LatencyHealth
+        );
+        let back = serde_yaml_ng::to_string(&cfg.groups).unwrap();
+        assert!(back.contains("balance_by: latency-health"), "{back}");
+
+        let fallback = text.replace("type: load-balance", "type: fallback");
+        let m = crate::try_parse(&fallback).unwrap_err().msg();
+        assert_eq!(m.code, "engine.group_balance_not_load_balance", "{m:?}");
+        assert_eq!(
+            (m.arg("group"), m.arg("balance_by")),
+            ("pool", "latency-health")
+        );
+        // 写明默认值的照收：它本来就什么都不做
+        let weights = fallback.replace("latency-health", "weights");
+        assert!(crate::try_parse(&weights).is_ok(), "{weights}");
+
+        let plain = text.replace("    balance_by: latency-health\n", "");
+        let cfg = crate::try_parse(&plain).unwrap();
+        let back = serde_yaml_ng::to_string(&cfg.groups).unwrap();
+        assert!(!back.contains("balance_by"), "{back}");
     }
 
     #[test]
@@ -937,7 +1386,7 @@ groups:
         let base = with_rules(&[], &[]);
         assert!(validate(&base).is_ok());
         type Bend = fn(&mut crate::Failover);
-        let cases: [(&str, Bend); 4] = [
+        let cases: [(&str, Bend); 5] = [
             ("failures_to_pause", |f| f.failures_to_pause = 0),
             ("pause_secs", |f| f.pause_secs = 0),
             ("max_pause_secs", |f| {
@@ -946,6 +1395,9 @@ groups:
             }),
             ("stream_start_wait_secs", |f| {
                 f.stream_start_wait_secs = crate::MAX_STREAM_START_WAIT_SECS + 1
+            }),
+            ("slot_wait_secs", |f| {
+                f.slot_wait_secs = crate::MAX_SLOT_WAIT_SECS + 1
             }),
         ];
         for (want, bend) in cases {
@@ -956,6 +1408,27 @@ groups:
                 other => panic!("{want} 该被拒，实际 {other:?}"),
             }
         }
+        // 等空位写 0 是不等，不是写错
+        let mut x = base.clone();
+        x.failover.slot_wait_secs = 0;
+        assert!(validate(&x).is_ok());
+    }
+
+    /// 开头慢就换下一家：开着时等待至少 5 秒，关着时 1 秒也照收（只是交得早）
+    #[test]
+    fn switching_on_a_slow_start_needs_a_long_enough_wait() {
+        let mut x = with_rules(&[], &[]);
+        x.failover.stream_start_wait_secs = 3;
+        assert!(validate(&x).is_ok(), "关着时不管");
+        x.failover.next_on_slow_start = true;
+        let e = validate(&x).unwrap_err();
+        assert!(
+            matches!(e, ValidationError::SlowStartTooShort { secs: 3 }),
+            "{e:?}"
+        );
+        assert_eq!(e.msg().code, "config.slow_start_too_short");
+        x.failover.stream_start_wait_secs = crate::MIN_SLOW_START_WAIT_SECS;
+        assert!(validate(&x).is_ok());
     }
 
     /// 别名表：名字一个一个、不带通配、不撞内置前缀，每个别名列着别的名称，
@@ -1054,6 +1527,100 @@ groups:
                 validate(&bad)
             );
         }
+    }
+
+    /// 用量上限：每一条恰好一种量、大于 0、费用至少一分、`cache_reads` 只给 token、不重复；
+    /// 天、周、月的上限要请求记录留够那一期。
+    #[test]
+    fn key_limits_are_checked_one_entry_at_a_time() {
+        let with = |limits: &str, row_days: u64| {
+            let mut key = c("k", "tw-1");
+            key.limits = serde_yaml_ng::from_str(limits).unwrap();
+            let mut cfg = cfg(vec![key], vec![]);
+            cfg.retention.row_days = row_days;
+            validate(&cfg).map_err(|e| e.msg())
+        };
+        let code = |limits: &str| with(limits, 90).unwrap_err().code;
+        assert!(
+            with(
+                "[{per: minute, requests: 30}, {per: day, cost: 5.5}, \
+                 {per: day, tokens: 100000}, {per: day, tokens: 900000, cache_reads: true}, \
+                 {per: month, cost: 100}]",
+                90
+            )
+            .is_ok(),
+            "缓存读算不算进去不一样，就是两条"
+        );
+        assert_eq!(code("[{per: day}]"), "config.key_limit_empty");
+        let m = with("[{per: day, requests: 3, cost: 1}]", 90).unwrap_err();
+        assert_eq!(m.code, "config.key_limit_two_measures");
+        assert_eq!(m.arg("measures"), "requests and cost");
+        for bad in [
+            "[{per: day, requests: 0}]",
+            "[{per: day, tokens: -5}]",
+            "[{per: day, cost: 0}]",
+            "[{per: day, cost: -1.5}]",
+            "[{per: day, cost: .nan}]",
+            "[{per: day, cost: .inf}]",
+        ] {
+            assert_eq!(code(bad), "config.key_limit_not_positive", "{bad}");
+        }
+        let m = with("[{per: hour, cost: -1.5}]", 90).unwrap_err();
+        assert_eq!(
+            (m.arg("per"), m.arg("measure"), m.arg("value")),
+            ("hour", "cost", "-1.5")
+        );
+        assert_eq!(
+            code("[{per: day, requests: 3, cache_reads: true}]"),
+            "config.key_limit_cache_reads"
+        );
+        assert_eq!(
+            code("[{per: day, cost: 3}, {per: day, cost: 5}]"),
+            "config.key_limit_duplicate"
+        );
+        assert_eq!(
+            code(
+                "[{per: week, tokens: 3, cache_reads: true}, {per: week, tokens: 5, cache_reads: true}]"
+            ),
+            "config.key_limit_duplicate"
+        );
+        // 天、周、月的用量在重启之后从记录里加回来：记录要留够那一期 —— 月 31 天、周 7 天、
+        // 天 1 天。分钟、小时从空的开始，不看
+        for (per, need) in [("month", 31), ("week", 7), ("day", 1)] {
+            let limits = format!("[{{per: {per}, requests: 3}}]");
+            let m = with(&limits, need - 1).unwrap_err();
+            assert_eq!(m.code, "config.key_limit_retention", "{per}");
+            assert_eq!(
+                (m.arg("per"), m.arg("days"), m.arg("min")),
+                (
+                    per,
+                    (need - 1).to_string().as_str(),
+                    need.to_string().as_str()
+                )
+            );
+            assert!(with(&limits, need).is_ok(), "{per}");
+        }
+        assert!(with("[{per: hour, requests: 3}, {per: minute, cost: 1}]", 0).is_ok());
+        // 费用不到一分：换成微分是 0，或者小到没有意义
+        for bad in [
+            "[{per: day, cost: 0.009}]",
+            "[{per: hour, cost: 0.0000001}]",
+        ] {
+            let m = with(bad, 90).unwrap_err();
+            assert_eq!(m.code, "config.key_limit_cost_too_small", "{bad}");
+        }
+        let m = with("[{per: day, cost: 0.005}]", 90).unwrap_err();
+        assert_eq!(
+            (m.arg("key"), m.arg("per"), m.arg("value")),
+            ("k", "day", "0.005")
+        );
+        assert!(with("[{per: day, cost: 0.01}]", 90).is_ok());
+    }
+
+    #[test]
+    fn a_key_without_limits_writes_nothing_back() {
+        let out = serde_yaml_ng::to_string(&c("k", "tw-1")).unwrap();
+        assert!(!out.contains("limits"), "{out}");
     }
 }
 
@@ -1191,6 +1758,10 @@ mod msg_codes {
             },
             EmptyKey { name: "k".into() },
             ZeroConcurrency { name: "k".into() },
+            ProviderConcurrency {
+                name: "a".into(),
+                value: 0,
+            },
             NameCollision("a".into()),
             BadCidr { entry: "x".into() },
             UnknownPriceSheet {
@@ -1242,6 +1813,53 @@ mod msg_codes {
                 model: "b".into(),
             },
             AliasOnlyItself { alias: "a".into() },
+            ModelSpecBlankModel {
+                upstream: "a".into(),
+            },
+            ModelSpecWildcard {
+                upstream: "a".into(),
+                model: "m*".into(),
+            },
+            ModelSpecEmpty {
+                upstream: "a".into(),
+                model: "m".into(),
+            },
+            ModelSpecZero {
+                upstream: "a".into(),
+                model: "m".into(),
+                field: "context_window",
+            },
+            KeyLimitEmpty { key: "k".into() },
+            KeyLimitTwoMeasures {
+                key: "k".into(),
+                measures: "requests and cost".into(),
+            },
+            KeyLimitNotPositive {
+                key: "k".into(),
+                per: "day",
+                measure: "cost",
+                value: "0".into(),
+            },
+            KeyLimitDuplicate {
+                key: "k".into(),
+                per: "day",
+                measure: "cost",
+            },
+            KeyLimitCacheReads {
+                key: "k".into(),
+                measure: "cost",
+            },
+            KeyLimitCostTooSmall {
+                key: "k".into(),
+                per: "day",
+                value: "0.005".into(),
+            },
+            KeyLimitRetention {
+                key: "k".into(),
+                per: "month",
+                days: 30,
+                min: 31,
+            },
         ];
         check(
             "config.",

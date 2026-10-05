@@ -81,6 +81,7 @@ pub async fn views(s: &ControlState, reveal: Reveal) -> Vec<tw_api::ClientView> 
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    let usage = &s.gateway.key_limits;
     cfg.clients
         .iter()
         .map(|c| tw_api::ClientView {
@@ -99,6 +100,17 @@ pub async fn views(s: &ControlState, reveal: Reveal) -> Vec<tw_api::ClientView> 
                 .iter()
                 .find(|(k, _)| *k == c.name)
                 .map(|(_, at)| *at as u64),
+            limits: usage.view(&c.name, &c.limits),
+            // 只有设了费用上限的才要提醒：这些模型的费用记 0，费用上限管不住它们
+            unpriced_models: if c
+                .limits
+                .iter()
+                .any(|l| l.measure() == tw_config::LimitMeasure::Cost)
+            {
+                tw_gateway::key_limits::unpriced_models(&s.gateway, &cfg, &c.name)
+            } else {
+                Vec::new()
+            },
         })
         .collect()
 }
@@ -181,6 +193,11 @@ async fn update(
         })
         .await
         .map_err(apply_fail)?;
+    // 改了名：用量上限的账跟着走（今天、这周、这个月用了多少，在跑的请求的预留）。
+    // 存储层那些行记的是旧名字，重启之后加回来的只认新名字下的
+    if req.key.name != name {
+        s.gateway.key_limits.rename(&name, &req.key.name);
+    }
     Ok(Json(tw_api::ConfigWritten { version }))
 }
 
@@ -326,5 +343,20 @@ fn to_client(
         // 绑定由接管写，用户改不了 —— 它记的是「这把钥匙是为谁生成的」
         client: existing.and_then(|c| c.client.clone()),
         disabled: input.disabled,
+        // 写得对不对（大于 0、不重复、缓存读只给 token）由配置校验说，和手写的同一套
+        limits: input.limits.iter().map(limit).collect(),
     })
+}
+
+/// 界面上的一条上限 → 配置里的写法。费用在界面上是微分，配置里写美元
+fn limit(l: &tw_api::KeyLimitInput) -> tw_config::KeyLimit {
+    let max = l.max.min(i64::MAX as u64) as i64;
+    let is = |m: tw_api::LimitMeasure| l.measure == m;
+    tw_config::KeyLimit {
+        per: l.per.into(),
+        requests: is(tw_api::LimitMeasure::Requests).then_some(max),
+        tokens: is(tw_api::LimitMeasure::Tokens).then_some(max),
+        cost: is(tw_api::LimitMeasure::Cost).then(|| max as f64 / 1_000_000.0),
+        cache_reads: l.cache_reads,
+    }
 }

@@ -30,6 +30,7 @@ mod contract;
 pub mod diagnostics;
 pub mod dryrun;
 mod gate;
+pub mod key_limits;
 pub mod keys;
 pub mod listen;
 pub mod plugins;
@@ -367,7 +368,9 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 builtin: tw_engine::is_builtin_group(&g.name),
                 kind: routes::group_kind(g.kind),
                 selected: g.selected.clone(),
-                providers: g.providers.clone(),
+                providers: g.names(),
+                weights: routes::group_weights(g),
+                balance_by: routes::balance_by_view(g.balance_by),
             })
             .collect(),
         // 和 `GET /keys` 同一份视图：概览里少一个字段的话，两处会各自
@@ -408,6 +411,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 quota_pause_secs: f.quota_pause_secs,
                 rate_limit_max_pause_secs: f.rate_limit_max_pause_secs,
                 stream_start_wait_secs: f.stream_start_wait_secs,
+                next_on_slow_start: f.next_on_slow_start,
+                slot_wait_secs: f.slot_wait_secs,
             }
         },
         listen: tw_api::ListenView {
@@ -499,6 +504,7 @@ fn provider_view(
             .map(resources::reference_view)
             .collect(),
         pricing: p.pricing.clone(),
+        max_concurrent: p.max_concurrent,
     }
 }
 

@@ -15,6 +15,8 @@ pub mod edit;
 mod failover;
 pub mod history;
 mod init;
+pub mod limits;
+pub mod model_specs;
 pub mod nics;
 pub mod plugins;
 pub mod private_dir;
@@ -34,6 +36,8 @@ mod wire;
 pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
+pub use limits::{KeyLimit, LimitMeasure, LimitPer};
+pub use model_specs::{ModelLimits, ModelSpec, Sourced, SpecSource};
 pub use plugins::Plugin;
 pub use proxy::{DIRECT, OnProxyFail, Proxy, ProxyKind, SYSTEM};
 pub use validate::ValidationError;
@@ -164,6 +168,7 @@ impl Default for Client {
             route: None,
             client: None,
             disabled: false,
+            limits: Vec::new(),
         }
     }
 }
@@ -186,6 +191,8 @@ impl Default for Provider {
             models_only: None,
             billing: Billing::PerToken,
             pricing: None,
+            model_specs: std::collections::BTreeMap::new(),
+            max_concurrent: None,
             disabled: false,
         }
     }
@@ -655,6 +662,10 @@ pub struct Client {
     /// 也能一键恢复的状态。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// 用量上限：每分钟、每小时、每天、每周、每月最多多少个请求、多少 token、花多少钱。
+    /// **每一条都要过**。不写就不限（见 [`limits`]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<KeyLimit>,
 }
 
 /// OAuth 凭据（第 3 类）。
@@ -815,11 +826,24 @@ pub struct Provider {
     /// 按哪张价目表计价。不写就是默认价目表。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
+    /// 手写的模型规格：模型 ID（完全相等，没有通配）→ 上下文窗口、输出上限。写了就
+    /// 优先于价目表，见 [`model_specs`]。价目表不认识的中转站模型靠它说出上下文窗口
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_specs: std::collections::BTreeMap<String, ModelSpec>,
+    /// 同时最多发给这家几个请求，1 到 [`MAX_PROVIDER_CONCURRENCY`]。不写就是不限。
+    ///
+    /// **给限制并发的中转站和账号用**：超出的那个请求到了上游只会被拒。满着的时候，留在
+    /// 这家的对话等它空出来，别的请求换下一家（见 `tw_gateway::slots`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
     /// 停用。**配置原样留着**：不参与路由，它的模型也不出现在
     /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
     #[serde(default, skip_serializing_if = "is_default")]
     pub disabled: bool,
 }
+
+/// 一家上游的并发上限最多写多少
+pub const MAX_PROVIDER_CONCURRENCY: u32 = 1000;
 
 impl Provider {
     /// 这家的这个模型在不在启用范围里（`models_only`）。**不管这家到底
@@ -1168,7 +1192,10 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
     Ok(())
 }
 
-pub use failover::{Failover, MAX_PAUSE_SECS, MAX_STREAM_START_WAIT_SECS};
+pub use failover::{
+    Failover, MAX_PAUSE_SECS, MAX_SLOT_WAIT_SECS, MAX_STREAM_START_WAIT_SECS,
+    MIN_SLOW_START_WAIT_SECS,
+};
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, stand_in, try_parse};
 pub use retention::Retention;
@@ -1179,7 +1206,7 @@ pub use security::{
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
-pub use validate::{check_aliases, validate};
+pub use validate::{check_aliases, check_model_spec, validate};
 
 pub fn default_path() -> PathBuf {
     tw_api::data::dir().join("config.yaml")

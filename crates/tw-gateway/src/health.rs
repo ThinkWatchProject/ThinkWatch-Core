@@ -15,8 +15,11 @@
 //!    看见真实错误，也不要返回一个我们自己编的「无可用上游」。
 //! 2. **只有一个候选时完全旁路熔断器。**否则唯一的上游一旦被自己熔断，
 //!    就把用户锁死了，熔断纯粹是自伤。
+//!
+//! 同一批成败还记成每家最近的成功率（[`Health::success_rates`]），`load-balance`
+//! 按成败分新对话时看它。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,13 +42,58 @@ struct Entry {
     held_until_ms: Option<i64>,
 }
 
+/// 成功率看最近多少次。
+const RECENT_MAX: usize = 50;
+/// 也只看最近这么久（毫秒）：**一家恢复了，半小时前的失败不该还压着它的份额**。
+/// 请求稀疏的时候，按次数的窗口会把很久以前的事一直留着
+const RECENT_MAX_AGE_MS: i64 = 30 * 60 * 1000;
+/// 少于这么多次就说不出成功率。头一两次失败可能是碰巧，不该就此少分到新对话
+const RECENT_MIN_SAMPLES: u32 = 5;
+
+/// 每家最近的成败：最近 [`RECENT_MAX`] 次、[`RECENT_MAX_AGE_MS`] 以内。
+///
+/// **判据就是熔断的判据**：`record_*` 记一次，这里也记一次（见 [`Health::success_rates`]）。
+#[derive(Default)]
+struct Recent(HashMap<String, VecDeque<(i64, bool)>>);
+
+impl Recent {
+    fn record(&mut self, name: &str, ok: bool, now: i64) {
+        let w = self.0.entry(name.to_string()).or_default();
+        if w.len() == RECENT_MAX {
+            w.pop_front();
+        }
+        w.push_back((now, ok));
+    }
+
+    /// 窗口里的统计。过了时的不算
+    fn tally(&self, name: &str, now: i64) -> Tally {
+        self.0
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(at, _)| now.saturating_sub(*at) < RECENT_MAX_AGE_MS)
+            .fold(Tally::default(), |t, (_, ok)| Tally {
+                total: t.total + 1,
+                errors: t.errors + u32::from(!ok),
+            })
+    }
+
+    /// 成功率，0 到 1。样本不够是 `None`
+    fn rate(&self, name: &str, now: i64) -> Option<f64> {
+        let t = self.tally(name, now);
+        (t.total >= RECENT_MIN_SAMPLES).then(|| f64::from(t.total - t.errors) / f64::from(t.total))
+    }
+}
+
 /// 每个 provider 的健康状态。
 ///
 /// **不持久化**。桌面应用重启频繁，把「这家挂了」的判断带过重启
 /// 意味着用户重启后第一个请求还在被上一次的故障惩罚 —— 而重启本身往往
-/// 就是他为了解决问题做的事。
+/// 就是他为了解决问题做的事。最近的成功率也一样：重启之后从头攒。
 pub struct Health {
     map: Mutex<HashMap<String, Entry>>,
+    /// 每家最近的成败（[`Self::success_rates`]）
+    recent: Mutex<Recent>,
     /// 配置里的 `failover`。**跟着配置换**（[`Self::configure`]），状态不丢
     settings: Mutex<tw_config::Failover>,
     clock: Clock,
@@ -65,6 +113,7 @@ impl Health {
     fn with_clock(clock: Clock) -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            recent: Mutex::new(Recent::default()),
             settings: Mutex::new(tw_config::Failover::default()),
             clock,
         }
@@ -141,6 +190,7 @@ impl Health {
     /// 调用方要拿它去发事件：熔断开合是界面上看得见的状态，而看得见的
     /// 状态必须能被推出去 —— 否则界面只能轮询。
     pub fn record_success(&self, name: &str) -> Option<State> {
+        self.note(name, true);
         self.update(name, |e, s, now| {
             e.breaker
                 .record(true, Tally::default(), &Self::policy(s, e.trips), now);
@@ -151,6 +201,7 @@ impl Health {
 
     /// 记一次说不出原因的失败，同样返回状态变化。
     pub fn record_failure(&self, name: &str) -> Option<State> {
+        self.note(name, false);
         self.update(name, |e, s, now| {
             let policy = Self::policy(s, e.trips);
             let before = e.breaker.state_at(&policy, now);
@@ -183,9 +234,40 @@ impl Health {
                 return self.record_failure(name);
             }
         };
+        self.note(name, false);
         self.update(name, |e, _, _| {
             e.held_until_ms = Some(e.held_until_ms.map_or(until, |t| t.max(until)));
         })
+    }
+
+    /// 记进最近的成败
+    fn note(&self, name: &str, ok: bool) {
+        let now = (self.clock)();
+        if let Ok(mut r) = self.recent.lock() {
+            r.record(name, ok, now);
+        }
+    }
+
+    /// 这几家最近的成功率，0 到 1：最近 50 次、30 分钟以内，至少 5 次才算。**样本不够的
+    /// 不在里面**，不是「从不失败」。`load-balance` 按成败分新对话时用它
+    /// （`tw_engine::balance_factors`）。
+    ///
+    /// 成败的判据就是熔断的判据，不另起一套：上面几个 `record_*` 记一次，这里就记一次。
+    /// 于是 5xx、连不上、超时、限流、额度用完、没钱了、凭据被拒或取不到、流在第一段内容
+    /// 之前断了都算失败；请求本身的问题（别的 4xx）算这家答上了；这家没有这个模型不记 ——
+    /// 它对别的模型照样好好的。客户端中途走了的不经过这里，也不记。
+    ///
+    /// **换下一家、却不是这家的错的**（它只是慢，或者正忙）不该调 `record_*`：调了，它在
+    /// 熔断和这里都会被算成一次失败。
+    pub fn success_rates(&self, names: &[String]) -> HashMap<String, f64> {
+        let now = (self.clock)();
+        let Ok(r) = self.recent.lock() else {
+            return HashMap::new();
+        };
+        names
+            .iter()
+            .filter_map(|n| r.rate(n, now).map(|s| (n.clone(), s)))
+            .collect()
     }
 
     /// 这家还要等多久才轮到探测。
@@ -504,5 +586,92 @@ mod tests {
         assert_eq!(h.cooldown_left("a"), Some(Duration::from_secs(5)));
         h.record_cause("b", Cause::NoBalance);
         assert_eq!(h.cooldown_left("b"), Some(Duration::from_secs(7)));
+    }
+
+    fn rate(h: &Health, name: &str) -> Option<f64> {
+        h.success_rates(&names(&[name])).get(name).copied()
+    }
+
+    #[test]
+    fn a_success_rate_needs_five_outcomes_and_looks_at_the_last_fifty() {
+        let (h, _) = clocked();
+        for _ in 0..4 {
+            h.record_failure("a");
+        }
+        assert_eq!(rate(&h, "a"), None, "四次还说不出成功率");
+        h.record_success("a");
+        assert_eq!(rate(&h, "a"), Some(0.2));
+        // 攒满 50 次：四次失败还在窗口里
+        for _ in 0..45 {
+            h.record_success("a");
+        }
+        assert_eq!(rate(&h, "a"), Some(46.0 / 50.0));
+        // 再来四次成功，最早那四次失败被挤出窗口
+        for _ in 0..4 {
+            h.record_success("a");
+        }
+        assert_eq!(rate(&h, "a"), Some(1.0));
+    }
+
+    #[test]
+    fn outcomes_older_than_half_an_hour_drop_out_so_a_recovered_upstream_regains_its_share() {
+        let (h, now) = clocked();
+        for _ in 0..10 {
+            h.record_failure("a");
+        }
+        assert_eq!(rate(&h, "a"), Some(0.0));
+        advance(&now, 29 * 60 * 1000);
+        for _ in 0..5 {
+            h.record_success("a");
+        }
+        assert_eq!(rate(&h, "a"), Some(5.0 / 15.0));
+        // 那十次失败满半小时了：只剩后来的五次成功
+        advance(&now, 60 * 1000);
+        assert_eq!(rate(&h, "a"), Some(1.0));
+        advance(&now, 30 * 60 * 1000);
+        assert_eq!(rate(&h, "a"), None, "全都过了时，等于没有样本");
+    }
+
+    #[test]
+    fn the_success_rate_counts_what_the_breaker_counts() {
+        let (h, _) = clocked();
+        // 上游的问题：说了原因的、没说原因的，都算失败
+        for cause in [
+            Cause::NoBalance,
+            Cause::QuotaUsedUp { resets_at_ms: None },
+            Cause::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            Cause::RateLimited { retry_after: None },
+            Cause::AuthRejected,
+            Cause::Unexplained,
+        ] {
+            h.record_cause("a", cause);
+        }
+        h.record_failure("a");
+        assert_eq!(rate(&h, "a"), Some(0.0), "七次失败");
+        // 这家没有这个模型：不算它坏了，也不算它答上了
+        for _ in 0..10 {
+            h.record_cause("b", Cause::ModelUnavailable);
+        }
+        assert_eq!(rate(&h, "b"), None);
+        for _ in 0..3 {
+            h.record_success("a");
+        }
+        assert_eq!(rate(&h, "a"), Some(0.3));
+    }
+
+    #[test]
+    fn success_rates_lists_only_the_asked_ones_with_enough_samples() {
+        let (h, _) = clocked();
+        for _ in 0..5 {
+            h.record_success("a");
+            h.record_failure("b");
+            h.record_success("组外");
+        }
+        h.record_success("c");
+        let got = h.success_rates(&names(&["a", "b", "c", "d"]));
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!((got["a"], got["b"]), (1.0, 0.0));
     }
 }

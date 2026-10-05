@@ -49,11 +49,19 @@ fn app() -> (tempfile::TempDir, axum::Router) {
 }
 
 fn app_with(text: &str) -> (tempfile::TempDir, axum::Router) {
+    let (d, app, _) = app_and_gateway(text);
+    (d, app)
+}
+
+/// [`app_with`]，连同它的数据面：要看试算和数据面是不是读的同一份状态，或者先往延迟表、
+/// 成功率里放数字
+fn app_and_gateway(text: &str) -> (tempfile::TempDir, axum::Router, tw_gateway::AppState) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
     std::fs::write(&p, text).unwrap();
     let cfg: tw_config::Config = serde_yaml_ng::from_str(text).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
+    let gw_for_test = gw.clone();
     let bus = gw.bus.clone();
     let state = ControlState {
         shutdown: Default::default(),
@@ -66,7 +74,7 @@ fn app_with(text: &str) -> (tempfile::TempDir, axum::Router) {
         chatgpt: Default::default(),
         zai: Default::default(),
     };
-    (d, tw_control::router(state))
+    (d, tw_control::router(state), gw_for_test)
 }
 
 /// 试算要说清按哪条路由算。没指定密钥、路由、草稿时，用唯一那把密钥
@@ -288,6 +296,59 @@ async fn the_dry_run_changes_nothing_and_sends_nothing() {
         std::fs::read_to_string(d.path().join("config.yaml")).unwrap(),
         before
     );
+}
+
+/// `load-balance` 的试算读数据面记着的那一份轮询状态，**只读不记**：试算几次都还是同一家
+/// 排头；数据面排过之后，试算跟着变。每个候选带着它的权重
+#[tokio::test]
+async fn a_weighted_group_is_tried_from_the_data_planes_state_without_moving_it() {
+    let text = CFG.replace(
+        "    providers: [官方, 中转]\n",
+        "    providers: [{ name: 官方, weight: 3 }, 中转]\n",
+    );
+    let (_d, app, gw) = app_and_gateway(&text);
+    let weights = |r: &tw_api::DryRunResult| {
+        r.candidate_models
+            .iter()
+            .map(|c| (c.provider.clone(), c.weight))
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..5 {
+        let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+        assert_eq!(r.candidates, ["官方", "中转"]);
+        assert_eq!(
+            weights(&r),
+            [("官方".to_string(), Some(3)), ("中转".to_string(), Some(1))]
+        );
+    }
+    // 数据面排了两次，都排给了官方：3:1 的下一个是中转
+    let rt = gw.runtime();
+    let g = rt
+        .engine
+        .groups()
+        .iter()
+        .find(|g| g.name == "都试试")
+        .unwrap();
+    let members = g.names();
+    for _ in 0..2 {
+        let turn = gw.balance.turn(g);
+        let f = tw_engine::Facts {
+            current_weight: turn.current(),
+            ..Default::default()
+        };
+        assert_eq!(rt.engine.order(Some(&g.name), &members, &f)[0], "官方");
+        turn.charge(&members, &f, "官方");
+    }
+    let before = gw.balance.peek(g);
+    for _ in 0..3 {
+        let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+        assert_eq!(r.candidates, ["中转", "官方"], "排头的之后其余按组里的顺序");
+    }
+    assert_eq!(gw.balance.peek(g), before, "试算不记账");
+
+    // 不经过 `load-balance` 的候选不带权重
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5","cache":true}"#).await;
+    assert_eq!(weights(&r), [("官方".to_string(), None)]);
 }
 
 #[tokio::test]
@@ -600,4 +661,342 @@ async fn a_candidate_whose_model_the_key_may_not_use_is_skipped() {
     // 不给密钥（按路由试算）不看范围
     let r = run(&app, r#"{"model":"glm-5","route":"default"}"#).await;
     assert_eq!(sent(&r), [("智谱", Some("glm-air"), Some("rule"))]);
+}
+
+fn candidate<'r>(r: &'r tw_api::DryRunResult, name: &str) -> &'r tw_api::DryRunCandidate {
+    r.candidate_models
+        .iter()
+        .find(|c| c.provider == name)
+        .unwrap_or_else(|| panic!("{name} 不在候选里：{r:?}"))
+}
+
+/// 按快慢、成败分的负载均衡：每一家的首字节时间、成功率和算出的系数都写在候选上，
+/// 用的是数据面同一份数字。「为什么这家分得多」要能从试算里看出来
+#[tokio::test]
+async fn a_balancing_group_shows_what_each_member_is_weighed_by() {
+    let cfg = CFG.replace(
+        "    type: load-balance\n",
+        "    type: load-balance\n    balance_by: latency-health\n",
+    );
+    let (_d, app, gw) = app_and_gateway(&cfg);
+    // 官方快、没有成败的样本；中转慢一倍，最近五次失败了一次
+    for _ in 0..3 {
+        gw.latency.record("官方", 100);
+        gw.latency.record("中转", 200);
+    }
+    for _ in 0..4 {
+        gw.health.record_success("中转");
+    }
+    gw.health.record_failure("中转");
+
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(r.balance_by, Some(tw_api::BalanceBy::LatencyHealth));
+    let official = candidate(&r, "官方");
+    assert_eq!(official.ttfb_ms, Some(100));
+    assert_eq!(official.success_rate, None, "样本不够，不说成功率");
+    // 中位数 150：(150 / 100)² = 2.25，没有成败的样本算 1
+    assert!(
+        (official.balance_factor.unwrap() - 2.25).abs() < 1e-9,
+        "{official:?}"
+    );
+    let relay = candidate(&r, "中转");
+    assert_eq!(relay.ttfb_ms, Some(200));
+    assert!(
+        (relay.success_rate.unwrap() - 0.8).abs() < 1e-9,
+        "{relay:?}"
+    );
+    // (150 / 200)² × 0.8² = 0.5625 × 0.64
+    assert!(
+        (relay.balance_factor.unwrap() - 0.36).abs() < 1e-9,
+        "{relay:?}"
+    );
+
+    // 只按快慢：成功率不说，系数里也没有它
+    let (_d, app, gw) = app_and_gateway(&cfg.replace("latency-health", "latency"));
+    for _ in 0..3 {
+        gw.latency.record("官方", 100);
+        gw.latency.record("中转", 200);
+    }
+    for _ in 0..5 {
+        gw.health.record_failure("中转");
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let relay = candidate(&r, "中转");
+    assert_eq!((relay.ttfb_ms, relay.success_rate), (Some(200), None));
+    assert!(
+        (relay.balance_factor.unwrap() - 0.5625).abs() < 1e-9,
+        "{relay:?}"
+    );
+}
+
+/// 启动时握手垫的底（`url-test` 用的，见 `tw_gateway::latency`）**不是按快慢分的速度**：握手
+/// 量的是建连，几十毫秒；真实样本是从发出去到第一段内容，几秒。拿它们比，只垫过底的那一家
+/// 会被算成快十倍、拿走十倍的份额。只垫过底的算没测过：系数 1，不带首字节时间。`url-test`
+/// 照旧用它（不然刚起来时它和 `fallback` 一样）
+#[tokio::test]
+async fn a_link_test_seed_is_no_speed_for_load_balance() {
+    let cfg = CFG.replace(
+        "    type: load-balance\n",
+        "    type: load-balance\n    balance_by: latency\n",
+    );
+    let (_d, app, gw) = app_and_gateway(&cfg);
+    gw.latency.seed("官方", 30);
+    for _ in 0..3 {
+        gw.latency.record("中转", 3_000);
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let official = candidate(&r, "官方");
+    assert_eq!(
+        (official.ttfb_ms, official.balance_factor),
+        (None, Some(1.0)),
+        "{official:?}"
+    );
+    let relay = candidate(&r, "中转");
+    assert_eq!(
+        (relay.ttfb_ms, relay.balance_factor),
+        (Some(3_000), Some(1.0)),
+        "{relay:?}"
+    );
+
+    let (_d, app, gw) = app_and_gateway(&CFG.replace("type: load-balance", "type: url-test"));
+    gw.latency.seed("官方", 30);
+    for _ in 0..3 {
+        gw.latency.record("中转", 3_000);
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(r.candidates, ["官方", "中转"], "url-test 照旧用垫的底");
+    assert_eq!(candidate(&r, "官方").ttfb_ms, Some(30));
+}
+
+/// 只按权重分时没有系数可说；`url-test` 只说首字节时间 —— 它就按这个排
+#[tokio::test]
+async fn only_the_numbers_the_order_uses_are_shown() {
+    let (_d, app, gw) = app_and_gateway(CFG);
+    for _ in 0..3 {
+        gw.latency.record("官方", 100);
+    }
+    for _ in 0..5 {
+        gw.health.record_success("官方");
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(r.balance_by, Some(tw_api::BalanceBy::Weights));
+    let official = candidate(&r, "官方");
+    assert_eq!(
+        (
+            official.ttfb_ms,
+            official.success_rate,
+            official.balance_factor
+        ),
+        (None, None, None)
+    );
+
+    let (_d, app, gw) = app_and_gateway(&CFG.replace("type: load-balance", "type: url-test"));
+    for _ in 0..3 {
+        gw.latency.record("中转", 80);
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(r.balance_by, None, "不是负载均衡");
+    assert_eq!(r.candidates, ["中转", "官方"], "测到的排前面");
+    let relay = candidate(&r, "中转");
+    assert_eq!(
+        (relay.ttfb_ms, relay.success_rate, relay.balance_factor),
+        (Some(80), None, None)
+    );
+}
+
+/// 按快慢、成败分时，试算说的排头就是数据面下一个新对话真的去的那一家：同一份延迟表、
+/// 成功率、轮询状态，同一个有效权重。起真网关、真上游，每发一个新对话之前先试算一次，
+/// 一次都不能对不上 —— 真请求会添新的首字节样本和成败，系数一直在变，对得上才说明两边
+/// 每一次读的都是同一份
+#[tokio::test]
+async fn with_factors_the_dry_run_names_the_upstream_the_next_new_conversation_takes() {
+    let up = {
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            axum::response::Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"message","content":[],"usage":{"input_tokens":3,"output_tokens":1}}"#,
+                ))
+                .unwrap()
+        }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    };
+    let text = format!(
+        r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: 我
+    key: tw-k
+providers:
+  - {{ name: 甲, base_url: "http://{up}", key: sk-a, protocol: anthropic }}
+  - {{ name: 乙, base_url: "http://{up}", key: sk-b, protocol: anthropic }}
+  - {{ name: 丙, base_url: "http://{up}", key: sk-c, protocol: anthropic }}
+groups:
+  - name: 池
+    type: load-balance
+    balance_by: latency-health
+    providers: [{{ name: 甲, weight: 2 }}, 乙, 丙]
+routes:
+  - name: default
+    rules:
+      - name: 都去池子
+        to: 池
+"#
+    );
+    let (_d, app, gw) = app_and_gateway(&text);
+    let mut events = gw.bus.subscribe();
+    // 甲慢、乙快但最近一半失败、丙居中：有效权重 2×0.25 : 1×4×0.25 : 1×1 = 500 : 1000 : 1000
+    for _ in 0..32 {
+        gw.latency.record("甲", 400);
+        gw.latency.record("乙", 100);
+        gw.latency.record("丙", 200);
+    }
+    for _ in 0..5 {
+        gw.health.record_success("乙");
+        gw.health.record_failure("乙");
+    }
+    let addr = tw_gateway::serve(gw.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let first = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let factor = |name: &str| candidate(&first, name).balance_factor.unwrap();
+    assert!((factor("甲") - 0.25).abs() < 1e-9, "{first:?}");
+    assert!((factor("乙") - 1.0).abs() < 1e-9, "{first:?}");
+    assert!((factor("丙") - 1.0).abs() < 1e-9, "{first:?}");
+    assert_eq!(candidate(&first, "甲").weight, Some(2));
+
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for i in 0..30 {
+        let predicted = run(&app, r#"{"model":"claude-sonnet-4-5"}"#)
+            .await
+            .candidates[0]
+            .clone();
+        // 每次一段新对话：没有粘性，排头的就是轮到的那一家
+        let st = http
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "tw-k")
+            .header("x-claude-code-session-id", format!("新对话-{i}"))
+            .body(format!(
+                r#"{{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{{"role":"user","content":"第 {i} 个"}}]}}"#
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(st, 200);
+        let mut went = None;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("5 秒内没等到结局")
+                .expect("事件流断了");
+            match ev {
+                tw_api::Event::RequestRouted { attempts, .. } => {
+                    went = attempts.first().map(|a| a.provider.clone())
+                }
+                tw_api::Event::RequestFinished { .. } => break,
+                tw_api::Event::RequestFailed { message, .. } => panic!("失败了：{message:?}"),
+                _ => {}
+            }
+        }
+        let went = went.expect("没有路由事件");
+        assert_eq!(went, predicted, "第 {i} 个新对话");
+        *seen.entry(went).or_default() += 1;
+    }
+    // 三家都轮到过，慢的那一家（权重 2）分得最少
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(seen["甲"] < seen["丙"], "{seen:?}");
+}
+
+/// WebSocket 的连接和 HTTP 的请求**按同一个组的顺序走**：3:1 的 `load-balance` 组，新连接照着
+/// 权重轮到两家（甲甲乙甲），不是都连头一家；每连一次之前试算一次，试算说的排头就是这一次
+/// 真连上的那一家 —— 两条路记的是同一本账
+#[tokio::test]
+async fn websocket_connections_take_turns_like_requests_and_the_dry_run_agrees() {
+    use futures::StreamExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// 一家只接 WebSocket 的 Responses 上游：数它接了几条连接
+    async fn upstream() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::any(move |ws: axum::extract::WebSocketUpgrade| {
+                let m = m.clone();
+                async move {
+                    m.fetch_add(1, Ordering::SeqCst);
+                    ws.on_upgrade(|mut sock| async move { while sock.next().await.is_some() {} })
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (a, n)
+    }
+    let (a, hits_a) = upstream().await;
+    let (b, hits_b) = upstream().await;
+    let text = format!(
+        r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: 我
+    key: tw-k
+providers:
+  - {{ name: 甲, base_url: "http://{a}", key: sk-a, protocol: openai-responses }}
+  - {{ name: 乙, base_url: "http://{b}", key: sk-b, protocol: openai-responses }}
+groups:
+  - name: 池
+    type: load-balance
+    providers: [{{ name: 甲, weight: 3 }}, 乙]
+routes:
+  - name: default
+    rules:
+      - name: 都去池子
+        to: 池
+"#
+    );
+    let (_d, app, gw) = app_and_gateway(&text);
+    let addr = tw_gateway::serve(gw.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    let mut went = Vec::new();
+    for i in 0..8 {
+        let predicted = run(&app, r#"{"model":"gpt-5"}"#).await.candidates[0].clone();
+        let before = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/v1/responses")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer tw-k".parse().unwrap());
+        let (c, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        // 网关在升级之后才去连上游
+        let mut now = before;
+        for _ in 0..100 {
+            now = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+            if now != before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let to = match (now.0 - before.0, now.1 - before.1) {
+            (1, 0) => "甲",
+            (0, 1) => "乙",
+            other => panic!("第 {i} 条连接：{other:?}"),
+        };
+        assert_eq!(to, predicted, "第 {i} 条连接");
+        went.push(to);
+        drop(c);
+    }
+    assert_eq!(went, ["甲", "甲", "乙", "甲", "甲", "甲", "乙", "甲"]);
 }
