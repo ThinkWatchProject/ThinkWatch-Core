@@ -7,6 +7,7 @@
 
 pub mod access;
 pub mod affinity;
+pub mod answer_model;
 pub mod auth;
 pub mod bedrock;
 pub mod bodies;

@@ -213,6 +213,7 @@ pub(super) async fn pipeline(
         &rt,
         &req,
         reading.generates,
+        &reading.facts.model,
         served,
         started.id,
         live,
