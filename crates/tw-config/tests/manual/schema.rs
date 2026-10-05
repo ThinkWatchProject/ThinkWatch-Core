@@ -460,8 +460,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Int,
                     Def::Unset,
                     t(
-                        "At most this many requests. Token counts and answers the gateway gives itself do not count.",
-                        "最多这么多个请求。数 token 的请求和网关自己答的不算。",
+                        "At most this many requests. Token counts, answers the gateway gives itself and requests that never reach an upstream do not count.",
+                        "最多这么多个请求。数 token 的请求、网关自己答的、没有发到上游的不算。",
                     ),
                 ),
                 row(

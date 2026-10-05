@@ -129,8 +129,7 @@ fn row(input: u64, output: u64, cache_read: u64, cost: i64) -> Recorded {
         client: "k".into(),
         path: "/v1/messages".into(),
         local: false,
-        error_code: None,
-        attempted: true,
+        reached: true,
         requests: 1,
         input,
         output,
@@ -363,37 +362,47 @@ async fn what_does_not_count_does_not_count() {
         not(&|r| r.path = "/v1/messages/count_tokens".into()),
         not(&|r| r.path = "/v1beta/models/gemini-2.5-pro:countTokens".into()),
         not(&|r| r.path = "/v1/responses/input_tokens".into()),
-        // 上限自己拒的
-        not(&|r| {
-            r.attempted = false;
-            r.error_code = Some("gw.key_limit.requests_per_period".into());
-        }),
-        // 路由就拒了，一跳都没有
-        not(&|r| {
-            r.attempted = false;
-            r.error_code = Some("gw.route.denied".into());
-        }),
-        not(&|r| {
-            r.attempted = false;
-            r.error_code = Some("gw.model.no_upstream_available".into());
-        }),
+        // 没发到上游的：上限自己拒的、路由拒的、内容过滤拒的、上游都满着回了 429 的
+        not(&|r| r.reached = false),
     ];
     for (i, r) in cases.iter().enumerate() {
         assert!(!r.counts(), "{r:?}");
         b.limits.settle(100 + i as u64, b.now(), r);
     }
     assert_eq!(b.used(), [0]);
-    // 准入过了、在某一跳上被阶段二的规则拒了：算
-    let mut hop_denied = row(0, 0, 0, 0);
-    hop_denied.error_code = Some("gw.route.denied".into());
-    // 准入过了、第一跳还没回话客户端就走了：一跳都没记下，也算
-    let mut gone = row(0, 0, 0, 0);
-    gone.attempted = false;
-    for r in [hop_denied, gone] {
-        assert!(r.counts(), "{r:?}");
-        b.limits.settle(200, b.now(), &r);
-    }
-    assert_eq!(b.used(), [2]);
+    // 发到了上游，失败了、或者客户端走了：算
+    let r = row(0, 0, 0, 0);
+    assert!(r.counts(), "{r:?}");
+    b.limits.settle(200, b.now(), &r);
+    assert_eq!(b.used(), [1]);
+}
+
+/// 准入过了、却没发到上游的请求（上游都满着回了 429、内容过滤拒了）：结算时把准入时记上的
+/// 都还回去 —— 预留，和滚动窗口里的那一个请求。客户端照着 `Retry-After` 过几秒重试，窗口里
+/// 不该还留着上一次
+#[tokio::test(start_paused = true)]
+async fn a_request_that_never_reached_an_upstream_gives_back_what_it_took() {
+    let b = bed(
+        "2026-10-05T10:00:00+08:00",
+        "[{per: minute, requests: 1}, {per: day, requests: 5}, {per: day, tokens: 1000}]",
+    );
+    b.run(1, ask(600, 0)).await.unwrap();
+    assert_eq!(b.used(), [1, 1, 600]);
+    assert!(b.try_admit(Ask::default()).await.is_err(), "这一分钟用满了");
+    let mut busy = row(0, 0, 0, 0);
+    busy.reached = false;
+    b.done(1, busy);
+    assert_eq!(b.used(), [0, 0, 0]);
+    // 马上就能再来
+    b.run(2, ask(600, 0)).await.unwrap();
+    assert_eq!(b.used(), [1, 1, 600]);
+    // 开始之前就被丢掉的（准入之后出了岔子）：一样都还回去
+    b.done(2, row(1, 0, 0, 0));
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let hold = b.try_admit(ask(100, 0)).await.unwrap();
+    assert_eq!(b.used(), [1, 2, 101]);
+    drop(hold);
+    assert_eq!(b.used(), [0, 1, 1]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -468,8 +477,7 @@ async fn a_restart_adds_the_periods_back_from_the_store() {
         }
         // 不算的那几种，加回来时一样不算
         let mut refused = row(0, 0, 0, 999_000);
-        refused.attempted = false;
-        refused.error_code = Some("gw.route.denied".into());
+        refused.reached = false;
         rows.push(refused);
         rows
     });

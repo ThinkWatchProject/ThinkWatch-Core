@@ -114,10 +114,9 @@ pub struct Settled {
     pub path: String,
     /// 网关自己答的（本地估的 token 数）
     pub local: bool,
-    /// 失败的原因的码。没失败的是 None
-    pub error_code: Option<String>,
-    /// 尝试链上有没有至少一跳。路由就拒绝了的、准入没过的没有
-    pub attempted: bool,
+    /// 这个请求可能发到了上游（[`tw_api::RoutingView::reached_upstream`]）。都满着回的 429、
+    /// 被规则、内容过滤、用量上限拒的没有
+    pub reached: bool,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -743,11 +742,7 @@ impl Recorder {
                 client: p.client.clone(),
                 path: p.path.clone(),
                 local,
-                error_code: match &how {
-                    Ending::Failed(message) => Some(message.code.clone()),
-                    _ => None,
-                },
-                attempted: !p.routing.attempts.is_empty(),
+                reached: p.routing.reached_upstream(matches!(how, Ending::Failed(_))),
                 input: u.map_or(0, |u| u.input),
                 output: u.map_or(0, |u| u.output),
                 cache_read: u.map_or(0, |u| u.cache_read),
@@ -2747,10 +2742,8 @@ mod settle_hook_tests {
                 ("claude-code", "/v1/messages")
             );
             assert_eq!(s.at_ms, 1_000_000);
-            assert!(s.attempted && !s.local);
+            assert!(s.reached && !s.local);
         }
-        assert_eq!(seen[2].error_code.as_deref(), Some("t.broke"));
-        assert_eq!(seen[0].error_code, None);
     }
 
     /// 路由就拒绝了的：没有一跳。没有用量的：费用是 None，不是 0
@@ -2773,8 +2766,7 @@ mod settle_hook_tests {
             answered_model: None,
         });
         let s = seen.lock().unwrap()[0].clone();
-        assert!(!s.attempted);
+        assert!(!s.reached, "网关在发往哪一家之前就拒了");
         assert_eq!(s.cost_micros, None);
-        assert_eq!(s.error_code.as_deref(), Some("gw.route.denied"));
     }
 }

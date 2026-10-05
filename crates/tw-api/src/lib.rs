@@ -1543,6 +1543,52 @@ pub struct AttemptView {
     pub skipped: Option<ServeSkip>,
 }
 
+/// 发出去之后才失败的一跳报的码（见 [`AttemptView::sent`]）：上游没在时限内回话、请求在路上
+/// 断了、流在第一段内容之前报了错。**上游可能已经收下了它、在算了**。
+///
+/// 别的 `error` 都没发出去：这家满着（`skipped`）、规则拒绝、格式对不上、发给它的名字对不上、
+/// 插件拒绝、转换不了、凭据取不到、签不了名，还有连不上（地址不通、握手失败）—— 那时上游
+/// 一个字节都没收到。
+pub const FAILED_AFTER_SENDING: &[&str] = &[
+    "gw.upstream.timeout",
+    "gw.upstream.forward_failed",
+    "gw.upstream.stream_opening_error",
+];
+
+impl AttemptView {
+    /// 这一跳发到了上游：上游回了话（`served`、`status`、`slow_start`，`estimated` 里带着
+    /// 状态码的），或者发出去之后才失败（[`FAILED_AFTER_SENDING`]）。
+    pub fn sent(&self) -> bool {
+        match self.outcome {
+            AttemptOutcome::Served | AttemptOutcome::Status | AttemptOutcome::SlowStart => true,
+            AttemptOutcome::Estimated => self.status.is_some(),
+            AttemptOutcome::Error => {
+                self.skipped.is_none()
+                    && self
+                        .error
+                        .as_ref()
+                        .is_some_and(|m| FAILED_AFTER_SENDING.contains(&m.code.as_str()))
+            }
+        }
+    }
+}
+
+impl RoutingView {
+    /// 这个请求可能发到了上游：尝试链上有一跳发出去了（[`AttemptView::sent`]）。**尝试链是空的
+    /// 时看它怎么收场**（`failed`）：失败的是网关在发往哪一家之前就拒了（规则、内容过滤、
+    /// 用量上限）；没失败的（客户端走了）是还没等到路由事件 —— 那时请求可能正在上游那里，
+    /// 算它发到了。
+    ///
+    /// 密钥的用量上限只数这样的请求（见 `tw_gateway::key_limits`）：上游都满着回的 429、
+    /// 被拒的请求不该用掉客户端的上限，它重试的时候什么都没花。
+    pub fn reached_upstream(&self, failed: bool) -> bool {
+        if self.attempts.is_empty() {
+            return !failed;
+        }
+        self.attempts.iter().any(AttemptView::sent)
+    }
+}
+
 /// 放弃了的一跳（[`AttemptOutcome::SlowStart`]）上游可能已经收了钱的输入。
 ///
 /// 上游在流开头报了的（Anthropic 的 `message_start`）是它报的数；没报的只有 `input`，是网关
@@ -5667,6 +5713,70 @@ pub struct PluginRunView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attempt(outcome: AttemptOutcome, status: Option<u16>, code: Option<&str>) -> AttemptView {
+        AttemptView {
+            provider: "p".into(),
+            model: None,
+            outcome,
+            status,
+            error: code.map(|c| Msg {
+                code: c.into(),
+                args: Default::default(),
+                text: String::new(),
+            }),
+            ms: 0,
+            usage: None,
+            queued_ms: None,
+            skipped: None,
+        }
+    }
+
+    /// 发到了上游的一跳：上游回了话，或者发出去之后才失败。没发出去的（满着、被拒、连不上）
+    /// 不算。认的码都是 core 真发得出的
+    #[test]
+    fn an_attempt_was_sent_when_the_upstream_may_have_received_it() {
+        use AttemptOutcome::*;
+        for a in [
+            attempt(Served, Some(200), None),
+            attempt(Status, Some(503), None),
+            attempt(SlowStart, None, Some("gw.slow_start")),
+            attempt(Estimated, Some(404), None),
+            attempt(Error, None, Some("gw.upstream.timeout")),
+            attempt(Error, None, Some("gw.upstream.stream_opening_error")),
+        ] {
+            assert!(a.sent(), "{a:?}");
+        }
+        let mut busy = attempt(Error, None, Some("gw.busy_upstream"));
+        busy.skipped = Some(ServeSkip::Busy);
+        for a in [
+            busy,
+            attempt(Estimated, None, None),
+            attempt(Error, None, Some("gw.route.denied")),
+            attempt(Error, None, Some("gw.upstream.unreachable")),
+            attempt(Error, None, Some("gw.upstream.sign_failed")),
+            attempt(Error, None, None),
+        ] {
+            assert!(!a.sent(), "{a:?}");
+        }
+        for code in FAILED_AFTER_SENDING {
+            assert!(
+                MSG_CODES
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some(code)),
+                "{code} 不是 core 发得出的码"
+            );
+        }
+        // 尝试链是空的：失败的是网关先拒了，没失败的是还没等到路由事件
+        let none = RoutingView::default();
+        assert!(!none.reached_upstream(true));
+        assert!(none.reached_upstream(false));
+        let only_denied = RoutingView {
+            attempts: vec![attempt(Error, None, Some("gw.route.denied"))],
+            ..Default::default()
+        };
+        assert!(!only_denied.reached_upstream(false));
+    }
 
     /// 版本号就是它上面的说明写到的最新一版（「N 起」）。两条分支各自加了一版、合到一起
     /// 时，常量那一行两边都没动、不会冲突，很容易照旧留在合并之前的那个数上 —— 照着说明

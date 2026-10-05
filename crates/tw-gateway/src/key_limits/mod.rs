@@ -2,7 +2,9 @@
 //!
 //! 写法在 `tw_config::limits`。这里回答四件事。
 //!
-//! **数什么。**请求数：一个准入的请求算一个，数 token 的请求、网关自己答的不算。token：
+//! **数什么。**请求数：一个发到了上游的请求算一个（[`Recorded::counts`]）—— 数 token 的请求、
+//! 网关自己答的不算，没发到上游的也不算：上游都满着回的 429、被规则、内容过滤拒掉的，客户端
+//! 照着重试，不该把自己的上限用光。token：
 //! 没走缓存的输入 + 写进缓存的 + 输出，那一条开了 `cache_reads` 再加上从缓存读的。费用：
 //! 记下的费用（实测的、估算的都算），没有价格的模型、不计费的上游算 0。**都按存储层记下的
 //! 那一行算**（[`KeyLimits::settle`]）：重启之后从库里加回来的（[`KeyLimits::rebuild`]）和
@@ -43,21 +45,6 @@ const CALENDAR: [LimitPer; 3] = [LimitPer::Day, LimitPer::Week, LimitPer::Month]
 /// 存储层落后、丢了事件时那一行永远不会来：不放掉的话，那份预留一直占着这把密钥的
 /// 额度。存储层正常时几毫秒就到
 const GRACE_MS: i64 = 60_000;
-
-/// 准入之前就被拒的请求那一行的失败码：**路由**拒绝了它（规则拒绝、选中的上游都服务不了），
-/// 一跳都没有。这样的请求没有经过准入，不算进请求数（[`Recorded::counts`]）。
-///
-/// 只看码不够：同样的码在尝试链的某一跳上也会出现（阶段二的规则拒绝），那时请求已经准入
-/// 过了 —— 所以还要看有没有一跳。
-const NOT_ADMITTED: &[&str] = &[
-    "gw.route.denied",
-    "gw.route.all_selected_disabled",
-    "gw.model.no_upstream_available",
-];
-
-/// 上限本身拒绝的请求那一行的失败码前缀。它们也不算进请求数：不然一个被拒的客户端每重试
-/// 一次，窗口就往后推一次，永远等不到空位
-const REFUSED: &str = "gw.key_limit.";
 
 /// 一个请求最多等多久：`failover.slot_wait_secs`，0 是不等。
 ///
@@ -204,9 +191,9 @@ pub struct Recorded {
     pub path: String,
     /// 网关自己答的
     pub local: bool,
-    pub error_code: Option<String>,
-    /// 尝试链上有没有至少一跳
-    pub attempted: bool,
+    /// 这个请求可能发到了上游（`tw_api::RoutingView::reached_upstream`）：尝试链上有一跳发
+    /// 出去了，或者客户端在路由事件之前就走了
+    pub reached: bool,
     /// 几个请求：结算时是 1，重建时是这一组的行数
     pub requests: u64,
     pub input: u64,
@@ -218,19 +205,14 @@ pub struct Recorded {
 }
 
 impl Recorded {
-    /// 算不算进密钥的用量：**准入过的才算**。
+    /// 算不算进密钥的用量：**发到了上游的才算**。
     ///
-    /// 网关自己答的、数 token 的不经过准入；上限本身拒绝的、路由就拒绝了的没有准入。
-    /// 结算一行和从库里加回来用的是这同一个判断，两边的数才对得上。
+    /// 网关自己答的、数 token 的不算；一个字节都没发到上游的也不算 —— 上限本身拒绝的、路由
+    /// 就拒绝了的、内容过滤拒掉的、上游都满着回了 429 的、每一跳都没发出去的。它们什么都没
+    /// 花，客户端照着 `Retry-After` 重试时，不该一次次把自己的上限用掉。结算一行和从库里
+    /// 加回来用的是这同一个判断，两边的数才对得上。
     pub fn counts(&self) -> bool {
-        if self.local || uncounted(&self.path) {
-            return false;
-        }
-        match self.error_code.as_deref() {
-            Some(code) if code.starts_with(REFUSED) => false,
-            Some(code) if !self.attempted && NOT_ADMITTED.contains(&code) => false,
-            _ => true,
-        }
+        self.reached && !self.local && !uncounted(&self.path)
     }
 
     fn amount(&self) -> Amount {
@@ -534,18 +516,22 @@ impl KeyLimits {
         }
     }
 
-    /// 存储层记下了一行：预留换成实数。`at_ms` 是请求开始的时刻，算在哪一期看它
+    /// 存储层记下了一行：预留换成实数。`at_ms` 是请求开始的时刻，算在哪一期看它。
+    ///
+    /// **不算的那一行把准入时记上的也还回去**（[`Recorded::counts`]）：预留，和滚动窗口里的那
+    /// 一个请求 —— 上游都满着回了 429 的请求，客户端过几秒重试，窗口里不该还留着它
     pub fn settle(&self, id: u64, at_ms: i64, rec: &Recorded) {
         let now = self.clock.now_ms();
         let events = {
             let mut g = self.lock();
-            let key = match g.by_request.remove(&id).and_then(|s| g.held.remove(&s)) {
-                Some(r) => r.key,
-                None => rec.client.clone(),
-            };
+            let held = g.by_request.remove(&id).and_then(|s| g.held.remove(&s));
             if !rec.counts() {
+                if let Some(r) = held {
+                    unrecord(&mut g, &r);
+                }
                 return;
             }
+            let key = held.map_or_else(|| rec.client.clone(), |r| r.key);
             let amount = rec.amount();
             let rolling = g
                 .limits
@@ -828,12 +814,15 @@ impl KeyLimits {
         }
     }
 
+    /// 准入之后、开始之前就被丢掉的请求（[`Hold`] 的 Drop）：它一个字节都没发出去，预留和
+    /// 滚动窗口里的那一个请求都还回去
     fn release(&self, seq: u64) {
         let mut g = self.lock();
-        if let Some(r) = g.held.remove(&seq)
-            && let Some(id) = r.request
-        {
-            g.by_request.remove(&id);
+        if let Some(r) = g.held.remove(&seq) {
+            if let Some(id) = r.request {
+                g.by_request.remove(&id);
+            }
+            unrecord(&mut g, &r);
         }
     }
 
@@ -962,6 +951,24 @@ impl KeyLimits {
     fn emit(&self, events: Vec<tw_api::Event>) {
         for e in events {
             self.bus.emit(e);
+        }
+    }
+}
+
+/// 撤掉准入时给这个请求在滚动窗口里记的那一个请求（[`KeyLimits::reserve`] 记在准入的那一刻，
+/// 和预留的 `at_ms` 是同一个数）。请求数一个一个都一样，撤哪一个都行。已经滑出窗口的不用撤
+fn unrecord(g: &mut Inner, r: &Reservation) {
+    let Some(b) = g.books.get_mut(&r.key) else {
+        return;
+    };
+    if let Some(i) = b
+        .recent
+        .iter()
+        .position(|(t, a)| *t == r.at_ms && a.requests > 0)
+    {
+        b.recent[i].1.requests -= 1;
+        if b.recent[i].1 == Amount::default() {
+            b.recent.remove(i);
         }
     }
 }

@@ -337,8 +337,11 @@ twcore runs on and start again at midnight, on Monday and on the 1st. When one i
 
 A refused request gets HTTP 429 in the client's own error format, naming the
 key, the limit, the amount used and when it resets, and it shows in the
-traffic list. Cost is what is recorded for each request, so a model without a
-price and an upstream with `billing: free` count as $0. A request still
+traffic list. A request that never reaches an upstream counts toward no
+limit: one refused by a rule, the content filter or a limit, or turned away
+because every upstream was at its `max_concurrent`. Cost is what is recorded
+for each request, so a model without a price and an upstream with
+`billing: free` count as $0. A request still
 running counts with an estimate of its input until it is recorded. After a
 restart, the day, week and month are added up again from the request records,
 so the records have to cover the period: `retention.row_days` of at least 1
@@ -356,7 +359,7 @@ connection stays open.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `per` | `minute` \| `hour` \| `day` \| `week` \| `month` | **required** | The period. `minute` and `hour` are rolling (the last 60 seconds, the last 60 minutes); `day`, `week` and `month` start again at local midnight, on Monday and on the 1st. |
-| `requests` | integer | — | At most this many requests. Token counts and answers the gateway gives itself do not count. |
+| `requests` | integer | — | At most this many requests. Token counts, answers the gateway gives itself and requests that never reach an upstream do not count. |
 | `tokens` | integer | — | At most this many tokens: uncached input, cache writes and output. |
 | `cost` | number | — | At most this much, in US dollars, as recorded for each request; at least 0.01. Models without a price and upstreams with `billing: free` count as 0. |
 | `cache_reads` | bool | `false` | Count cache reads too. Only for a `tokens` limit. |

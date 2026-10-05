@@ -383,3 +383,125 @@ async fn reaching_a_limit_is_told_on_the_bus() {
         ]
     );
 }
+
+/// 一个没发到上游的请求的几条事件：密钥 `key`，开始于 `at`。`attempts` 是尝试链（`None` 是
+/// 一直没有路由事件 —— 内容过滤在发往哪一家之前就拒了），最后是网关自己的一句拒绝
+fn refused(
+    id: u64,
+    key: &str,
+    at: i64,
+    attempts: Option<Vec<tw_api::AttemptView>>,
+    code: &str,
+    source: tw_api::FailureSource,
+) -> Vec<Event> {
+    let mut evs = request(id, key, at, 0);
+    evs.pop();
+    match attempts {
+        Some(a) => {
+            if let Event::RequestRouted { attempts, .. } = &mut evs[1] {
+                *attempts = a;
+            }
+        }
+        None => {
+            evs.remove(1);
+        }
+    }
+    evs.push(Event::RequestFailed {
+        id,
+        model: String::new(),
+        source,
+        message: tw_api::Msg {
+            code: code.into(),
+            args: Default::default(),
+            text: "refused".into(),
+        },
+        bytes: None,
+        duration_ms: Some(1),
+        usage: None,
+        answered_model: None,
+    });
+    evs
+}
+
+fn hop(outcome: tw_api::AttemptOutcome, code: &str, busy: bool) -> tw_api::AttemptView {
+    tw_api::AttemptView {
+        provider: "中转".into(),
+        model: None,
+        outcome,
+        status: None,
+        error: Some(tw_api::Msg {
+            code: code.into(),
+            args: Default::default(),
+            text: "x".into(),
+        }),
+        ms: 1,
+        usage: None,
+        queued_ms: None,
+        skipped: busy.then_some(tw_api::ServeSkip::Busy),
+    }
+}
+
+/// 没发到上游的请求**不算进用量**：上游都满着回的 429（尝试链上只有跳过的）、被内容过滤拒掉
+/// 的（一跳都没有）、在那一跳上被阶段二的规则拒了的、凭据取不到的。客户端照着 `Retry-After`
+/// 重试，不该把自己的上限用光。发出去之后才失败的（超时）照样算；重启之后从记录里加回来时
+/// 是同一个判断
+#[tokio::test]
+async fn a_request_that_never_reached_an_upstream_does_not_count() {
+    use tw_api::AttemptOutcome::Error;
+    use tw_api::FailureSource::{Config, Denied, RateLimited, Upstream};
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("data.db");
+    let b = bed(Some(tw_store::Db::open(&file).unwrap()));
+    let at = ms(NOON);
+    let events = [
+        refused(
+            1,
+            "plain",
+            at,
+            Some(vec![hop(Error, "gw.busy_upstream", true)]),
+            "gw.busy_all",
+            RateLimited,
+        ),
+        refused(2, "plain", at, None, "gw.content.denied", Denied),
+        refused(
+            3,
+            "plain",
+            at,
+            Some(vec![hop(Error, "gw.route.denied", false)]),
+            "gw.route.denied",
+            Denied,
+        ),
+        refused(
+            4,
+            "plain",
+            at,
+            Some(vec![hop(Error, "gw.upstream.credential_failed", false)]),
+            "gw.upstream.credential_failed",
+            Config,
+        ),
+        // 发出去了、上游没在时限内回话：它可能已经在算了
+        refused(
+            5,
+            "plain",
+            at,
+            Some(vec![hop(Error, "gw.upstream.timeout", false)]),
+            "gw.upstream.timeout",
+            Upstream,
+        ),
+        request(6, "plain", at, 10),
+    ];
+    for e in events.iter().flatten() {
+        b.rec.lock().await.on_event(e);
+    }
+    let list = keys(&b).await;
+    assert_eq!(
+        key(&list, "plain")["limits"][0]["used"],
+        2,
+        "只有超时的和答上了的算"
+    );
+    drop(b);
+    // 重启：从记录里加回来，同一个判断
+    let b = bed(Some(tw_store::Db::open(&file).unwrap()));
+    let list = keys(&b).await;
+    assert_eq!(key(&list, "plain")["limits"][0]["used"], 2);
+}
