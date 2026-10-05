@@ -1236,7 +1236,10 @@ pub fn sections() -> Vec<Section> {
                     "providers",
                     Kind::Strs,
                     Def::Required,
-                    t("Member upstreams, by name.", "成员上游的名字。"),
+                    t(
+                        "Member upstreams, by name; not groups. Each upstream appears once in a group.",
+                        "成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。",
+                    ),
                 ),
                 row(
                     "selected",
