@@ -414,3 +414,394 @@ async fn a_plugin_renaming_to_an_alias_sends_the_upstreams_own_name() {
         ["codex", "sonnet-please", "gpt-5.1-codex-mini"]
     );
 }
+
+// ---------------------------------------------------------------- 密钥的模型范围与参数改写
+
+/// 只许用 `allow` 里那几个模型的配置
+fn scoped(p: Provider, aliases: &str, rules: &str, allow: &[&str]) -> Config {
+    let mut c = config(p, aliases, rules);
+    c.clients[0].allow = Some(allow.iter().map(|s| s.to_string()).collect());
+    c
+}
+
+/// 密钥的 `allow` 每一帧都看：范围外的模型这一帧不发，替它回一个说清楚的 `response.failed`，
+/// 连接照常 —— 下一帧要的是范围里的就照发。和 HTTP 那条路同一句话
+#[tokio::test]
+async fn a_frame_asking_for_a_model_outside_the_keys_allow_is_refused_and_the_connection_stays() {
+    let (up, seen) = upstream().await;
+    let (gw, _) = gateway(scoped(provider(up, &[]), "", "", &["gpt-5*"]), vec![]).await;
+    let mut c = connect(gw).await;
+
+    c.send(create("other-model")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] Gateway key `codex` may not use model other-model. GET /v1/models lists the \
+         models that are available."
+    );
+    assert!(seen.lock().unwrap().is_empty());
+
+    c.send(create("gpt-5.1-codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(answered(&frames), ["gpt-5.1-codex-2026-09-30"; 2]);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(seen.lock().unwrap()[0]["model"], "gpt-5.1-codex");
+}
+
+/// 和 HTTP 那条路同一套继承：写上游模型名的 `allow` 也放行列了它的别名，写别名的只管别名
+/// 本身。原样发出的名字（阶段二改的、指定的）按名字本身看，没有别名可继承；阶段一改写成的
+/// 是客户端那一侧的名称，照样继承
+#[tokio::test]
+async fn the_keys_allow_is_inherited_by_aliases_over_websocket_like_over_http() {
+    let aliases = format!("{FAST}{SONNET}");
+    let rules = "
+- { name: 阶段一改别名, when: { model: fast-please }, set: { model: codex-fast } }
+- { name: 阶段二改名, when: { provider_would_be: up, model: special }, set: { model: codex-fast } }
+- { name: 兜底, to: __all__ }
+";
+    let (up, seen) = upstream().await;
+    let (gw, _) = gateway(
+        scoped(provider(up, SCOPE), &aliases, rules, &["gpt-5.1-*"]),
+        vec![],
+    )
+    .await;
+    let mut c = connect(gw).await;
+
+    // codex-fast 列了 gpt-5.1-codex-mini：放行，发这一家的名字
+    c.send(create("codex-fast")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        answered(&frames),
+        ["codex-fast", "codex-fast"],
+        "{frames:?}"
+    );
+    assert_eq!(seen.lock().unwrap()[0]["model"], "gpt-5.1-codex-mini");
+
+    // claude-sonnet 列的名字一个都不在范围里
+    c.send(create("claude-sonnet")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] Gateway key `codex` may not use model claude-sonnet. GET /v1/models lists \
+         the models that are available."
+    );
+
+    // 阶段一改写成别名：客户端那一侧的名称，照样继承
+    c.send(create("fast-please")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        answered(&frames),
+        ["fast-please", "fast-please"],
+        "{frames:?}"
+    );
+    assert_eq!(seen.lock().unwrap()[1]["model"], "gpt-5.1-codex-mini");
+
+    // 阶段二改的名字原样发：按 codex-fast 这个名字本身看，不在范围里
+    c.send(create("special")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] A routing rule rewrote model special to codex-fast, which gateway key \
+         `codex` may not use. GET /v1/models lists the models that are available."
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // 写别名的只管别名本身：它列的模型不跟着放出来
+    let (up, seen) = upstream().await;
+    let (gw, _) = gateway(
+        scoped(provider(up, SCOPE), FAST, "", &["codex-fast"]),
+        vec![],
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("gpt-5.1-codex-mini")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] Gateway key `codex` may not use model gpt-5.1-codex-mini. GET /v1/models \
+         lists the models that are available."
+    );
+    c.send(create("codex-fast")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(answered(&frames), ["codex-fast", "codex-fast"]);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// 规则指定的模型密钥不让用：每一帧都不发，说出是哪条规则指定在哪一家。插件换上范围外的
+/// 名字：那一帧不发，和 HTTP 那条路同一句
+#[tokio::test]
+async fn a_pinned_model_or_a_plugin_rename_outside_the_keys_allow_is_refused_per_frame() {
+    let (up, seen) = upstream().await;
+    let rules = "
+- { name: Codex 指定模型, when: { client: codex }, to: [{ provider: up, model: o3-pro }] }
+- { name: 兜底, to: __all__ }
+";
+    let (gw, _) = gateway(scoped(provider(up, &[]), "", rules, &["gpt-5*"]), vec![]).await;
+    let mut c = connect(gw).await;
+    c.send(create("gpt-5.1-codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] Rule `Codex 指定模型` pins model o3-pro on `up`, which gateway key `codex` \
+         may not use."
+    );
+    assert!(seen.lock().unwrap().is_empty());
+
+    let swap = Double::new("swap")
+        .permit(&[Permission::Params])
+        .on_request(|mut view, ctx| {
+            if ctx["requested_model"] == "swap-me" {
+                view["params"]["model"] = json!("o3-pro");
+            }
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let mut a = double::active("swap", swap);
+    a.name = "Plugin swap".into();
+    let (up, seen) = upstream().await;
+    let (gw, _) = gateway(
+        scoped(provider(up, &[]), "", "", &["gpt-5*", "swap-me"]),
+        vec![Arc::new(a)],
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("swap-me")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] Plugin `Plugin swap` changed the model to o3-pro, which gateway key `codex` \
+         may not use, so the request was not sent."
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    c.send(create("gpt-5.1-codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(answered(&frames), ["gpt-5.1-codex-2026-09-30"; 2]);
+}
+
+/// 一帧 `response.create`，要的是 `model`，开着推理
+fn create_reasoning(model: &str) -> WsMsg {
+    let WsMsg::Text(t) = create(model) else {
+        unreachable!()
+    };
+    let mut v: Value = serde_json::from_str(&t).unwrap();
+    v["reasoning"] = json!({ "effort": "high" });
+    WsMsg::Text(v.to_string().into())
+}
+
+/// 规则的参数改写每一帧照 HTTP 那条路改（Responses 的字段名）：`set.max_tokens` 写成
+/// `max_output_tokens`，`set.thinking: false` 去掉 `reasoning`。条件按这一帧求 —— 按模型附加的
+/// 改写、按模型拒绝的规则，升级时还不知道模型，每一帧照样生效
+#[tokio::test]
+async fn rule_parameter_rewrites_and_model_conditions_apply_to_each_frame() {
+    let (up, seen) = upstream().await;
+    let rules = "
+- { name: Codex 限长, when: { client: codex }, set: { max_tokens: 1234 } }
+- { name: Max 不思考, when: { model: gpt-5.1-codex-max }, set: { thinking: false, max_tokens: 99 } }
+- { name: 不给, when: { model: banned }, deny: 这个模型不走这里 }
+- { name: 兜底, to: __all__ }
+";
+    let (gw, _) = gateway(config(provider(up, &[]), "", rules), vec![]).await;
+    let mut c = connect(gw).await;
+
+    c.send(create_reasoning("gpt-5.1-codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(answered(&frames), ["gpt-5.1-codex-2026-09-30"; 2]);
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["max_output_tokens"], 1234, "{:?}", seen[0]);
+        assert_eq!(seen[0]["reasoning"]["effort"], "high");
+        // 别的字段原样
+        assert_eq!(seen[0]["instructions"], "You are Codex.");
+        assert_eq!(seen[0]["type"], "response.create");
+    }
+
+    c.send(create_reasoning("gpt-5.1-codex-max")).await.unwrap();
+    one_answer(&mut c).await;
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1]["max_output_tokens"], 99, "{:?}", seen[1]);
+        assert!(seen[1].get("reasoning").is_none(), "{:?}", seen[1]);
+        assert_eq!(seen[1]["model"], "gpt-5.1-codex-max");
+    }
+
+    c.send(create("banned")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        refusal(&frames),
+        "[ThinkWatch] Rule `不给` denied this request: 这个模型不走这里"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // 没有改写的帧一个字节都不动
+    let (up, seen) = upstream().await;
+    let (gw, _) = gateway(config(provider(up, &[]), "", ""), vec![]).await;
+    let mut c = connect(gw).await;
+    c.send(create_reasoning("gpt-5.1-codex")).await.unwrap();
+    one_answer(&mut c).await;
+    let WsMsg::Text(t) = create_reasoning("gpt-5.1-codex") else {
+        unreachable!()
+    };
+    assert_eq!(
+        seen.lock().unwrap()[0],
+        serde_json::from_str::<Value>(&t).unwrap()
+    );
+}
+
+// ---------------------------------------------------------------- Realtime
+
+/// Realtime 那样的上游：记下升级请求的查询串，回一帧 `session.created`
+async fn realtime_upstream() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let queries: Arc<Mutex<Vec<String>>> = Arc::default();
+    let app = Router::new()
+        .route(
+            "/v1/realtime",
+            axum::routing::any(
+                |State(q): State<Arc<Mutex<Vec<String>>>>,
+                 axum::extract::RawQuery(query): axum::extract::RawQuery,
+                 ws: WebSocketUpgrade| async move {
+                    q.lock().unwrap().push(query.unwrap_or_default());
+                    ws.on_upgrade(|mut sock: WebSocket| async move {
+                        let created = json!({ "type": "session.created" }).to_string();
+                        let _ = sock.send(Message::Text(created.into())).await;
+                        while let Some(Ok(_)) = sock.recv().await {}
+                    })
+                },
+            ),
+        )
+        .with_state(queries.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, queries)
+}
+
+/// 连 Realtime：`query` 是网关这边的查询串
+async fn realtime(
+    gw: SocketAddr,
+    query: &str,
+) -> Result<Socket, tokio_tungstenite::tungstenite::Error> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{gw}/v1/realtime?{query}")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("x-api-key", "tw-wskey".parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.map(|(s, _)| s)
+}
+
+/// 升级被拒时回的那句话
+fn upgrade_refusal(e: tokio_tungstenite::tungstenite::Error) -> (u16, String) {
+    let tokio_tungstenite::tungstenite::Error::Http(r) = e else {
+        panic!("the upgrade failed without an answer: {e}");
+    };
+    let body = String::from_utf8_lossy(r.body().as_deref().unwrap_or_default()).into_owned();
+    (r.status().as_u16(), body)
+}
+
+/// Realtime 的模型写在查询串里：别名对到这一家自己的名称再发（别的项原样），尝试链上记它，
+/// 流量里记客户端写的那个
+#[tokio::test]
+async fn a_realtime_alias_in_the_query_connects_with_the_upstreams_own_name() {
+    let (up, queries) = realtime_upstream().await;
+    let aliases = "voice: [gpt-realtime-2, gpt-realtime]\n";
+    let (gw, mut events) =
+        gateway(config(provider(up, &["gpt-realtime"]), aliases, ""), vec![]).await;
+    let mut c = realtime(gw, "model=voice&intent=chat").await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), c.next())
+        .await
+        .expect("no frame")
+        .unwrap()
+        .unwrap();
+    assert!(first.into_text().unwrap().contains("session.created"));
+    assert_eq!(
+        queries.lock().unwrap().as_slice(),
+        ["model=gpt-realtime&intent=chat"]
+    );
+    let mut started = None;
+    let attempt = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("no routing event")
+            .unwrap();
+        match ev {
+            Event::RequestStarted { model, .. } => started = Some(model),
+            Event::RequestRouted { attempts, .. } => break attempts[0].model.clone(),
+            _ => {}
+        }
+    };
+    assert_eq!(started.as_deref(), Some("voice"));
+    assert_eq!(attempt.as_deref(), Some("gpt-realtime"));
+
+    // 不是别名的照旧原样，查询串一个字节都不动
+    let mut c = realtime(gw, "model=gpt-realtime%2Bx&intent=chat")
+        .await
+        .unwrap();
+    c.next().await;
+    assert_eq!(
+        queries.lock().unwrap()[1],
+        "model=gpt-realtime%2Bx&intent=chat"
+    );
+
+    // 规则指定的模型原样发
+    let (up, queries) = realtime_upstream().await;
+    let rules = "
+- { name: 语音指定, when: { model: voice }, to: [{ provider: up, model: gpt-realtime-pinned }] }
+- { name: 兜底, to: __all__ }
+";
+    let (gw, _) = gateway(
+        config(provider(up, &["gpt-realtime"]), aliases, rules),
+        vec![],
+    )
+    .await;
+    let mut c = realtime(gw, "model=voice").await.unwrap();
+    c.next().await;
+    assert_eq!(
+        queries.lock().unwrap().as_slice(),
+        ["model=gpt-realtime-pinned"]
+    );
+}
+
+/// Realtime 的模型密钥不让用：升级本身被拒，和 HTTP 那条路同一句话；上游连都没连。别名照样
+/// 继承写上游模型名的 `allow`。这一家服务不了要的别名：也不连
+#[tokio::test]
+async fn a_realtime_model_outside_the_keys_allow_refuses_the_upgrade() {
+    let (up, queries) = realtime_upstream().await;
+    let aliases = format!("voice: [gpt-realtime-2, gpt-realtime]\n{SONNET}");
+    let (gw, _) = gateway(
+        scoped(
+            provider(up, &["gpt-realtime", "other-model"]),
+            &aliases,
+            "",
+            &["gpt-realtime*"],
+        ),
+        vec![],
+    )
+    .await;
+
+    let (status, body) = upgrade_refusal(realtime(gw, "model=other-model").await.err().unwrap());
+    assert_eq!(status, 400);
+    assert!(
+        body.contains(
+            "Gateway key `codex` may not use model other-model. GET /v1/models lists the models \
+             that are available."
+        ),
+        "{body}"
+    );
+    assert!(queries.lock().unwrap().is_empty());
+
+    let mut c = realtime(gw, "model=voice").await.unwrap();
+    c.next().await;
+    assert_eq!(queries.lock().unwrap().as_slice(), ["model=gpt-realtime"]);
+
+    let (gw, _) = gateway(
+        config(provider(up, &["gpt-realtime"]), &aliases, ""),
+        vec![],
+    )
+    .await;
+    let (status, body) = upgrade_refusal(realtime(gw, "model=claude-sonnet").await.err().unwrap());
+    assert_eq!(status, 400);
+    assert!(
+        body.contains("which offers none of the models of alias claude-sonnet"),
+        "{body}"
+    );
+    assert_eq!(queries.lock().unwrap().len(), 1);
+}

@@ -31,9 +31,17 @@ pub(super) async fn ws_upgrade(
 ) -> Result<Response, GatewayError> {
     // 升级请求没有体，所以性质里只有客户端名字 —— 按模型路由的规则
     // 对它不适用，而那是对的：这条连接上会跑什么模型，现在还不知道。这次的决定
-    // 里定下的指定模型、模型改写照样作用在之后每一帧上（见 `crate::ws::Naming`）
+    // 里定下的指定模型、模型改写照样作用在之后每一帧上（见 `crate::ws::Naming`）。
+    //
+    // **Realtime 的连接例外**：它的模型写在查询串里（`?model=gpt-realtime`），一条连接只用
+    // 这一个。和 HTTP 那条路按请求体里的模型一样，路由、密钥的模型范围、别名都按它来
+    let realtime = crate::ws::realtime(uri.path());
     let facts = tw_engine::RequestFacts {
         client: client_name.clone(),
+        model: realtime
+            .then(|| crate::ws::query_model(query.as_deref()))
+            .flatten()
+            .unwrap_or_default(),
         ..Default::default()
     };
     let route = rt.engine.route_of(&client_name).to_string();
@@ -56,7 +64,8 @@ pub(super) async fn ws_upgrade(
             rewritten_by: choice.rewritten_by.clone(),
             provider: provider.to_string(),
             billing,
-            model: String::new(),
+            // 客户端写的模型名：Realtime 的连接写在查询串里，别的连接升级时还不知道
+            model: facts.model.clone(),
             method: "WS".to_string(),
             path: uri.path().to_string(),
             // 升级请求没有正文，没有可估的
@@ -100,17 +109,77 @@ pub(super) async fn ws_upgrade(
             return Err(err);
         }
     };
-    // 升级请求没有正文，规则附加的改写无从谈起
-    let choice = Choice {
-        route,
-        rule: decision.matched_rule.clone(),
-        group: decision.via_group.clone(),
-        rewritten_by: Vec::new(),
-        // WebSocket 那条路一条连接跑好几轮，不按对话记
-        affinity: None,
+    // 发给哪一家、每个 `response.create` 发出去的模型名怎么定：和 HTTP 那条路的一跳同一套，
+    // 按这次的决定定（指定模型、阶段一的改写），别名对到这一家（见 `crate::ws::Naming`）
+    let naming_for = |provider: &tw_config::Provider| crate::ws::Naming {
+        config: rt.config.clone(),
+        engine: rt.engine.clone(),
+        decision: decision.clone(),
+        provider: provider.clone(),
+        client: client_name.clone(),
+        path: uri.path().to_string(),
     };
     let (alive, _) = state.health.filter(&decision.candidates);
-    let Some(name) = alive.first().map(|s| s.to_string()) else {
+    // 升级请求带着模型的（Realtime）：挑头一家连得上的 —— 别名对得上、要发给它的名字密钥
+    // 让用，和 HTTP 那条路挑候选时一样。别的连接升级时不知道模型，连头一家活着的
+    let picked = if facts.model.is_empty() {
+        alive.first().map(|s| (s.to_string(), None))
+    } else {
+        let catalog = state.catalog.load();
+        let mut unserved = None;
+        let mut barred = None;
+        let mut picked = None;
+        for c in &alive {
+            let Some(p) = rt.config.providers.iter().find(|p| p.name == **c) else {
+                continue;
+            };
+            match naming_for(p).connect(&catalog, &facts) {
+                crate::ws::Connect::To {
+                    model,
+                    rewritten_by,
+                } => {
+                    picked = Some((c.to_string(), Some((model, rewritten_by))));
+                    break;
+                }
+                crate::ws::Connect::Skip { barred: true, why } => {
+                    barred.get_or_insert(why);
+                }
+                crate::ws::Connect::Skip { barred: false, why } => {
+                    unserved.get_or_insert(why);
+                }
+                // 阶段二的规则拒绝了：**和规则在阶段一拒绝一样留一行**，拒绝它的是哪条规则
+                // 写进路由事件
+                crate::ws::Connect::Refused { rule, why } => {
+                    let choice = Choice {
+                        route,
+                        rule: decision.matched_rule.clone(),
+                        group: decision.via_group.clone(),
+                        rewritten_by: decision.rewritten_by.clone(),
+                        affinity: None,
+                    };
+                    let Some(rule) = rule else { return Err(why) };
+                    tracing::info!(%rule, provider = %c, "a phase-two rule denied the WebSocket upgrade");
+                    let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
+                    let mut routed = super::routed_nowhere(id, choice);
+                    if let tw_api::Event::RequestRouted { denied_by, .. } = &mut routed {
+                        *denied_by = Some(rule);
+                    }
+                    state.bus.emit(routed);
+                    ending.failed(why.source.into(), why.detail.clone());
+                    return Err(why);
+                }
+            }
+        }
+        // 一家都连不上。每一家要发的名字密钥都不让用的，说是密钥的事（和 HTTP 那条路的准入
+        // 一样）；有让用的，说它为什么连不上（别名对不上）。**不留这一行**，和 HTTP 那条路
+        // 准入没过一样
+        match (picked, unserved, barred) {
+            (Some(p), _, _) => Some(p),
+            (None, Some(why), _) | (None, None, Some(why)) => return Err(why),
+            (None, None, None) => None,
+        }
+    };
+    let Some((name, realtime_model)) = picked else {
         return Err(GatewayError::config(msg!(
             "gw.route.no_upstream_alive" => "No upstream is available."
         )));
@@ -120,6 +189,27 @@ pub(super) async fn ws_upgrade(
             "gw.route.upstream_missing", upstream = name.clone() =>
             "`{upstream}` is not in the configuration."
         )));
+    };
+    // 附加了参数改写的规则：Realtime 的连接升级时就作用上了（查询串里的模型），和 HTTP 那条路
+    // 一样报阶段一、阶段二的。Responses 的连接上参数改写每一帧按这一帧求，那时没有事件可报
+    let (sent_model, rewritten_by) = match realtime_model {
+        Some((model, more)) => {
+            let mut by = decision.rewritten_by.clone();
+            by.extend(
+                more.into_iter()
+                    .filter(|r| !decision.rewritten_by.contains(r)),
+            );
+            (Some(model), by)
+        }
+        None => (None, Vec::new()),
+    };
+    let choice = Choice {
+        route,
+        rule: decision.matched_rule.clone(),
+        group: decision.via_group.clone(),
+        rewritten_by,
+        // WebSocket 那条路一条连接跑好几轮，不按对话记
+        affinity: None,
     };
     // **走代理的上游不代理 WS**，而且要明说。悄悄绕过用户配的代理，
     // 等于把他以为在代理后面的流量直接发出去
@@ -147,17 +237,14 @@ pub(super) async fn ws_upgrade(
         set: rt.plugins.clone(),
         client: crate::hint::client_hint(&headers),
     });
-    // 每个 `response.create` 发出去的模型名：和 HTTP 那条路的一跳同一套，按这次的决定定
-    // （指定模型、阶段一的改写），别名对到这一家（见 `crate::ws::Naming`）。和插件一样只有
-    // Responses 的连接有
-    let naming = responses.then(|| crate::ws::Naming {
-        config: rt.config.clone(),
-        engine: rt.engine.clone(),
-        decision: decision.clone(),
-        provider: provider.clone(),
-        client: client_name.clone(),
-        path: uri.path().to_string(),
-    });
+    // 每个 `response.create` 发出去的模型名和参数改写（见 `crate::ws::Naming`）。和插件一样
+    // 只有 Responses 的连接有
+    let naming = responses.then(|| naming_for(provider));
+    // Realtime 的连接：查询串里的模型写成发给这一家的名字，别的项原样
+    let query = match (&sent_model, query) {
+        (Some(m), Some(q)) if *m != facts.model => Some(crate::ws::with_query_model(&q, m)),
+        (_, q) => q,
+    };
     let upstream = crate::ws::Upstream {
         url: crate::ws::upstream_url(&provider.base_url, uri.path(), query.as_deref()),
         headers: upstream_headers,
@@ -165,6 +252,8 @@ pub(super) async fn ws_upgrade(
         route: choice.route,
         rule: choice.rule,
         group: choice.group,
+        rewritten_by: choice.rewritten_by,
+        model: sent_model.filter(|m| *m != facts.model),
     };
     let rules = crate::ws::Rules {
         redact_mode: rt.config.security.redact.mode,
