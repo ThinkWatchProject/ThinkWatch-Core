@@ -555,6 +555,10 @@ pub enum RouteError {
     #[error("{}", self.msg())]
     DuplicateGroup(String),
     #[error("{}", self.msg())]
+    GroupUpstreamTwice { group: String, provider: String },
+    #[error("{}", self.msg())]
+    GroupUnknownUpstream { group: String, provider: String },
+    #[error("{}", self.msg())]
     DuplicateRoute(String),
     #[error("{}", self.msg())]
     UnknownDefaultRoute(String),
@@ -605,6 +609,16 @@ impl RouteError {
                 "engine.duplicate_group", group = group =>
                 "there is more than one group named `{group}`. Rules refer to a group by name, so \
                  names have to be unique"
+            ),
+            RouteError::GroupUpstreamTwice { group, provider } => msg!(
+                "engine.group_upstream_twice", group = group, upstream = provider =>
+                "group `{group}` lists upstream `{upstream}` more than once. Each upstream appears \
+                 once in a group"
+            ),
+            RouteError::GroupUnknownUpstream { group, provider } => msg!(
+                "engine.group_unknown_upstream", group = group, upstream = provider =>
+                "group `{group}` lists `{upstream}`, which is not an upstream. A group's members are \
+                 upstreams, by name"
             ),
             RouteError::DuplicateRoute(route) => msg!(
                 "engine.duplicate_route", route = route =>
@@ -875,6 +889,26 @@ impl Engine {
             }
             if g.providers.is_empty() {
                 return Err(RouteError::EmptyGroup(g.name.clone()));
+            }
+            // 同一家写两次：候选不去重，那一家失败之后故障转移会再试它一遍；`load-balance`
+            // 还会多轮到它几次 —— 一个没人写下、也看不出来的权重。控制面保存时就拦着
+            // （`control.group.upstream_twice`），手写的配置在这里拦
+            let mut members = std::collections::HashSet::new();
+            for p in &g.providers {
+                // 不认识的名字（拼错了、或者写了另一个组）：候选里它对不上任何上游，
+                // 这一位就静默地没了。控制面保存时拦着（`control.group.no_such_upstream`）
+                if !self.providers.contains(p) {
+                    return Err(RouteError::GroupUnknownUpstream {
+                        group: g.name.clone(),
+                        provider: p.clone(),
+                    });
+                }
+                if !members.insert(p.as_str()) {
+                    return Err(RouteError::GroupUpstreamTwice {
+                        group: g.name.clone(),
+                        provider: p.clone(),
+                    });
+                }
             }
         }
         for set in &self.sets {
@@ -2228,6 +2262,71 @@ mod builtin_tests {
         );
         assert_eq!(e.validate(), Err(RouteError::DuplicateGroup("pool".into())));
     }
+
+    /// 手写的配置里同一家写了几遍：拒绝，说出是哪个组、哪一家。不拦的话候选里它出现
+    /// 几次，故障转移就试它几次，`load-balance` 也多轮到它几次
+    #[test]
+    fn a_group_that_lists_an_upstream_twice_is_rejected() {
+        let g: Group =
+            serde_yaml_ng::from_str("name: pool\ntype: load-balance\nproviders: [a, a, a, b]\n")
+                .unwrap();
+        let e = Engine::with_default_rules(
+            vec!["a".into(), "b".into()],
+            vec![g],
+            vec![rule("兜底", "{}", "pool")],
+        );
+        let err = e.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RouteError::GroupUpstreamTwice {
+                group: "pool".into(),
+                provider: "a".into(),
+            }
+        );
+        let m = err.msg();
+        assert_eq!(m.code, "engine.group_upstream_twice");
+        assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "a"));
+        // 每种类型都一样：不只是 `load-balance` 会多轮到它，故障转移也会再试它
+        let g = Group {
+            name: "pool".into(),
+            kind: GroupType::Fallback,
+            providers: vec!["a".into(), "b".into(), "a".into()],
+            selected: None,
+        };
+        let e = Engine::with_default_rules(
+            vec!["a".into(), "b".into()],
+            vec![g],
+            vec![rule("兜底", "{}", "pool")],
+        );
+        assert!(matches!(
+            e.validate(),
+            Err(RouteError::GroupUpstreamTwice { .. })
+        ));
+    }
+
+    /// 组里写了一个不是上游的名字（拼错了，或者写了另一个组）：拒绝，说出是哪个组、
+    /// 哪个名字。不拦的话候选里对不上它，组静默地少了一位
+    #[test]
+    fn a_group_member_that_is_not_an_upstream_is_rejected() {
+        let g: Group =
+            serde_yaml_ng::from_str("name: pool\ntype: fallback\nproviders: [a, typo]\n").unwrap();
+        let e = Engine::with_default_rules(
+            vec!["a".into(), "b".into()],
+            vec![g],
+            vec![rule("兜底", "{}", "pool")],
+        );
+        let err = e.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RouteError::GroupUnknownUpstream {
+                group: "pool".into(),
+                provider: "typo".into(),
+            }
+        );
+        let m = err.msg();
+        assert_eq!(m.code, "engine.group_unknown_upstream");
+        assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "typo"));
+    }
 }
 
 #[cfg(test)]
@@ -2673,6 +2772,14 @@ mod msg_codes {
             },
             RouteError::EmptyGroup("g".into()),
             RouteError::DuplicateGroup("g".into()),
+            RouteError::GroupUpstreamTwice {
+                group: "g".into(),
+                provider: "p".into(),
+            },
+            RouteError::GroupUnknownUpstream {
+                group: "g".into(),
+                provider: "p".into(),
+            },
             RouteError::DuplicateRoute("x".into()),
             RouteError::UnknownDefaultRoute("x".into()),
             RouteError::UnknownRoute {

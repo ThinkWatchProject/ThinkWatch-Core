@@ -228,6 +228,8 @@ engine.compare.no_operator
 engine.duplicate_group
 engine.duplicate_route
 engine.empty_group
+engine.group_unknown_upstream
+engine.group_upstream_twice
 engine.no_action
 engine.no_match
 engine.phase_two_with_to
