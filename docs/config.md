@@ -304,7 +304,7 @@ gateway. A key is an identity. Limits, model scope and route are per key.
 | `name` | string | **required** | Name of the key; unique. Routing rules match it with `when.client`. |
 | `key` | string | **required** | The key clients send (as `x-api-key` or `Authorization: Bearer`). Generated keys start with `tw-` so they are not mistaken for an upstream's key. Unique. |
 | `max_concurrent` | integer | — | Requests with this key that may run at once; the rest wait. Unset: no limit. `0` is refused. |
-| `allow` | list of strings | — | Models this key may use, as model ids or globs (`claude-*`). Unset: every model. `[]`: none at all. |
+| `allow` | list of strings | — | Models this key may use, as model ids or globs (`claude-*`). An upstream model name also allows the aliases that list it; an alias allows only the alias. Unset: every model. `[]`: none at all. |
 | `route` | string | — | Name of the route requests with this key take. Unset: `default_route`. |
 | `client` | string | — | The client this key was made for (`claude-code`, `codex`, …), recorded when the desktop app points a client at the gateway. A client has at most one. |
 | `disabled` | bool | `false` | Refuse every request made with this key, and keep the key. |
@@ -1036,7 +1036,7 @@ routes:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | — | Requested model, glob (`claude-opus-*`). |
+| `model` | string | — | Requested model, glob (`claude-opus-*`). An upstream model name also matches requests for the aliases that list it; an alias matches only requests for the alias. |
 | `client` | string | — | Name of the gateway key the request used, exactly. |
 | `dialect` | string | — | API format the client spoke: `anthropic`, `openai-chat`, `openai-responses`, `gemini`. |
 | `input_tokens` | comparison (`>200k`, `<=4k`, `==3`) | — | Estimated input tokens. |

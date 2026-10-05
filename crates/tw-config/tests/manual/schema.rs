@@ -394,8 +394,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Unset,
                     t(
-                        "Models this key may use, as model ids or globs (`claude-*`). Unset: every model. `[]`: none at all.",
-                        "这把密钥可用的模型，写模型 ID 或通配（`claude-*`）。不写：全部模型。`[]`：一个都不给。",
+                        "Models this key may use, as model ids or globs (`claude-*`). An upstream model name also allows the aliases that list it; an alias allows only the alias. Unset: every model. `[]`: none at all.",
+                        "这把密钥可用的模型，写模型 ID 或通配（`claude-*`）。写上游模型名，列有它的别名一并可用；写别名只放行别名。不写：全部模型。`[]`：一个都不给。",
                     ),
                 ),
                 row(
@@ -1357,8 +1357,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Unset,
                     t(
-                        "Requested model, glob (`claude-opus-*`).",
-                        "请求的模型，可用通配（`claude-opus-*`）。",
+                        "Requested model, glob (`claude-opus-*`). An upstream model name also matches requests for the aliases that list it; an alias matches only requests for the alias.",
+                        "请求的模型，可用通配（`claude-opus-*`）。写上游模型名，也匹配请求列有它的别名的请求；写别名只匹配请求这个别名的。",
                     ),
                 ),
                 row(
