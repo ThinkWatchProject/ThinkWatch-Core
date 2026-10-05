@@ -716,6 +716,27 @@ security:
 | `stream_start_wait_secs` | 整数 | `15` | 流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。 |
 <!-- /generated -->
 
+### `aliases`
+
+模型别名是同一个模型的另一个名称。客户端像请求其他模型一样请求它，每家上游收到的是自己对这个模型的叫法。
+
+```yaml
+aliases:
+  deepseek-v4.1: DeepSeek-v4.1-flash
+  claude-sonnet-5:
+    - claude-sonnet-5
+    - us.anthropic.claude-sonnet-5-v1:0
+    - anthropic/claude-sonnet-5
+```
+
+- 上游在 `models_only` 范围内提供列出的任一名称，就能服务这个别名，收到的是列表里它提供的第一个名称。能服务同一别名的上游互为备用。
+- `GET /v1/models` 在上游模型旁一并列出别名，原来的名称照常可用。
+- 别名优先于同名的上游模型：上例中请求 `claude-sonnet-5` 只会发给提供这三个名称之一的上游。要让某家上游继续用自己的同名模型提供服务，把它的名称列进去。
+- 密钥的 `allow` 和规则的 `when.model` 写上游模型名时，对列有这个名称的别名同样有效；写别名时只对别名有效。
+- 上游答的是发给它的那个模型时，回答里的模型名写成客户端请求的名称；答的是别的模型，原样转发。
+- 计价和上游体检按发给上游的名称；请求记录保留客户端请求的名称，每次尝试记录实际发出的名称。
+- 要把某把密钥的请求发到某家上游的某个模型，用带指定模型的规则（[`routes[].rules[].to`](#cfg-routes-rules-to)），不要用别名：别名会改变这个名称对所有客户端的含义。
+
 ### `groups`
 
 策略组让多个上游合用一个名字。规则用 `to` 把请求交给策略组。
@@ -764,7 +785,18 @@ security:
 
 #### `routes[].rules[].to`
 
-`to` 指定模型时，每一项是一个上游和发给它的模型，按顺序备用。
+`to` 写上游或策略组的名称，或者指定模型：一组上游，每家写明发给它的模型，按顺序备用。指定模型原样发出，不经过别名，也不受 `set.model` 影响；所以即使同名别名指向别处，规则仍能把某把密钥的请求发到某家上游的这个模型。
+
+```yaml
+routes:
+  - name: default
+    rules:
+      - name: Opus 走 Bedrock
+        when: { model: claude-opus-5 }
+        to:
+          - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+          - { provider: anthropic, model: claude-opus-5 }
+```
 
 <!-- generated: table routes[].rules[].to[] -->
 <a id="cfg-routes-rules-to"></a>
@@ -800,6 +832,8 @@ security:
 比较式以 `>`、`>=`、`<`、`<=` 或 `==` 开头，数字可以带 `k` 或 `m` 后缀：`">200k"`、`"<=4k"`。不带运算符是错误，不当作相等：单写 `"200k"` 会被拒绝。
 
 #### `routes[].rules[].set`
+
+`set.model` 可以写别名，每家上游收到各自对它的叫法。和别名一样，回答里的模型名写成客户端请求的名称。
 
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>

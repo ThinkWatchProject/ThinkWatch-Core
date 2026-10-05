@@ -907,6 +907,40 @@ the same as an error status would.
 | `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
 <!-- /generated -->
 
+### `aliases`
+
+A model alias is another name for the same model. Clients request it like any
+model; each upstream receives the name it uses for that model.
+
+```yaml
+aliases:
+  deepseek-v4.1: DeepSeek-v4.1-flash
+  claude-sonnet-5:
+    - claude-sonnet-5
+    - us.anthropic.claude-sonnet-5-v1:0
+    - anthropic/claude-sonnet-5
+```
+
+- An upstream serves an alias when it offers one of the listed names within
+  its `models_only`, and receives the first such name in the list. Every
+  upstream that serves an alias takes part in failover for it.
+- `GET /v1/models` lists aliases next to the upstream models, and the
+  original names stay available.
+- An alias takes precedence over an upstream model of the same name: a
+  request for `claude-sonnet-5` above goes only to upstreams offering one of
+  the three names. List an upstream's own name when it should keep serving it.
+- A key's `allow` and a rule's `when.model` written for an upstream model name
+  also cover the aliases that list it; written for an alias, they cover only
+  the alias.
+- When the upstream answers with the model it was sent, the answer carries the
+  name the client asked for. An answer naming a different model is passed on
+  as it is.
+- Prices and the upstream check-up use the name sent upstream. The request log
+  keeps the name the client asked for, and each attempt the name it sent.
+- To send one key's requests to a particular upstream model, use a rule with
+  pinned models ([`routes[].rules[].to`](#cfg-routes-rules-to)) rather than an
+  alias: an alias changes what the name means for every client.
+
 ### `groups`
 
 A group puts several upstreams behind one name. Rules send requests to a
@@ -970,7 +1004,21 @@ order they are declared.
 
 #### `routes[].rules[].to`
 
-Pinned models in `to`: each entry is an upstream and the model sent to it, tried in order.
+`to` names an upstream or a group, or pins models: a list of upstreams, each
+with the model sent to it, tried in order. A pinned model is sent as written,
+without aliases or `set.model`, so a rule can send a key's requests to one
+upstream's model even when an alias of the same name points elsewhere.
+
+```yaml
+routes:
+  - name: default
+    rules:
+      - name: Opus on Bedrock
+        when: { model: claude-opus-5 }
+        to:
+          - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+          - { provider: anthropic, model: claude-opus-5 }
+```
 
 <!-- generated: table routes[].rules[].to[] -->
 <a id="cfg-routes-rules-to"></a>
@@ -1008,6 +1056,9 @@ end in `k` or `m`: `">200k"`, `"<=4k"`. Without an operator it is an error,
 not an equality: `"200k"` alone is refused.
 
 #### `routes[].rules[].set`
+
+`set.model` may name an alias; each upstream then receives its own name for
+it. Answers carry the name the client asked for, as with aliases.
 
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
