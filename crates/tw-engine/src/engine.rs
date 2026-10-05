@@ -176,7 +176,7 @@ fn median_ttfb(members: &[String], f: &Facts) -> Option<f64> {
     })
 }
 
-/// 快慢系数。**不到 1 毫秒的按 1 毫秒算**：本机的假上游、或者垫底的握手计时可能是 0
+/// 快慢系数。**不到 1 毫秒的按 1 毫秒算**：本机的假上游可能是 0
 fn latency_factor(median_ms: f64, ttfb_ms: u32) -> f64 {
     let ratio = median_ms.max(1.0) / f64::from(ttfb_ms.max(1));
     (ratio * ratio).clamp(LATENCY_FACTOR_MIN, LATENCY_FACTOR_MAX)
@@ -205,7 +205,8 @@ pub struct Facts {
     /// 此刻并发数满着的上游（`providers[].max_concurrent`）。`load-balance` 这一轮也不算它们，
     /// 和停着的一样：网关会当场跳过它们，轮到它们的那一次记了账却没答
     pub busy: std::collections::HashSet<String>,
-    /// 每家典型的快慢：从发出去到回答的第一段内容，毫秒。**缺席 = 样本不够**，不是「很快」
+    /// 每家典型的快慢：从发出去到回答的第一段内容，毫秒。**缺席 = 样本不够**，不是「很快」。
+    /// `url-test` 拿到的里面有启动时握手垫的底；`load-balance` 拿到的只有真实样本
     pub ttfb_ms: std::collections::HashMap<String, u32>,
     /// 每家跑这个模型的单价，(输入, 输出)，微分/百万 token。
     /// **缺席 = 算不出价钱**，不是「免费」

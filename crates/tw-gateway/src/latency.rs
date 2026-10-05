@@ -1,5 +1,6 @@
 //! 每家上游典型的快慢：**从这一跳发出去，到回答的第一段内容**。`url-test` 按它挑最快的，
-//! `load-balance` 按快慢分时（`balance_by: latency`）按它算系数。
+//! `load-balance` 按快慢分时（`balance_by: latency`）按它算系数 —— **只认真实样本**（见
+//! [`Latency::measured`]）。
 //!
 //! # 量的是哪一段
 //!
@@ -57,12 +58,17 @@ struct Window {
 impl Window {
     /// 这家的典型值：真实样本够数就是它们的中位数，不够时有垫底的用垫底的，都没有是 `None`
     fn typical(&self) -> Option<u32> {
-        if self.real.len() >= MIN_SAMPLES {
-            let mut v: Vec<u32> = self.real.iter().copied().collect();
-            v.sort_unstable();
-            return Some(v[v.len() / 2]);
+        self.measured().or(self.seed)
+    }
+
+    /// 真实样本够数时它们的中位数。垫的底不算
+    fn measured(&self) -> Option<u32> {
+        if self.real.len() < MIN_SAMPLES {
+            return None;
         }
-        self.seed
+        let mut v: Vec<u32> = self.real.iter().copied().collect();
+        v.sort_unstable();
+        Some(v[v.len() / 2])
     }
 }
 
@@ -117,12 +123,24 @@ impl Latency {
         g.get(provider)?.typical()
     }
 
-    /// 一次取一批 —— 排序时要用到，逐个取会连着锁好几次。
+    /// 一次取一批 —— 排序时要用到，逐个取会连着锁好几次。`url-test` 用：垫过底的算测过
     pub fn snapshot(&self, names: &[String]) -> HashMap<String, u32> {
+        self.batch(names, Window::typical)
+    }
+
+    /// 一批里**真实样本够数的**那几家，`load-balance` 按快慢分时用。**垫的底不算**：L1 握手
+    /// 量的是建连（几十毫秒），真实样本量到第一段内容（几秒），两样一比，只垫过底的那一家
+    /// 被算成快几十倍、拿到十倍的份额。没测过的不在里面，系数算 1（中等）—— 和 `url-test`
+    /// 不同，这里没测过的照样分到请求，攒得到真实样本
+    pub fn measured(&self, names: &[String]) -> HashMap<String, u32> {
+        self.batch(names, Window::measured)
+    }
+
+    fn batch(&self, names: &[String], of: fn(&Window) -> Option<u32>) -> HashMap<String, u32> {
         let g = self.inner.lock().expect("lock not poisoned");
         names
             .iter()
-            .filter_map(|n| Some((n.clone(), g.get(n)?.typical()?)))
+            .filter_map(|n| Some((n.clone(), of(g.get(n)?)?)))
             .collect()
     }
 }
@@ -287,9 +305,14 @@ mod tests {
             "丙".to_string(),
             "丁".to_string(),
         ];
+        // `url-test` 看的那一份：垫过底的算测过
         let s = l.snapshot(&names);
         assert_eq!(s.len(), 2, "{s:?}");
         assert_eq!(s.get("乙"), Some(&200));
         assert_eq!(s.get("丁"), Some(&30), "垫过底的算测过");
+        // 按快慢分的 `load-balance` 看的那一份：只有真实样本够数的
+        let m = l.measured(&names);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m.get("乙"), Some(&200));
     }
 }

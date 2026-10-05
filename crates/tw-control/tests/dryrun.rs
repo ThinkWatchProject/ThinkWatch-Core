@@ -729,6 +729,45 @@ async fn a_balancing_group_shows_what_each_member_is_weighed_by() {
     );
 }
 
+/// 启动时握手垫的底（`url-test` 用的，见 `tw_gateway::latency`）**不是按快慢分的速度**：握手
+/// 量的是建连，几十毫秒；真实样本是从发出去到第一段内容，几秒。拿它们比，只垫过底的那一家
+/// 会被算成快十倍、拿走十倍的份额。只垫过底的算没测过：系数 1，不带首字节时间。`url-test`
+/// 照旧用它（不然刚起来时它和 `fallback` 一样）
+#[tokio::test]
+async fn a_link_test_seed_is_no_speed_for_load_balance() {
+    let cfg = CFG.replace(
+        "    type: load-balance\n",
+        "    type: load-balance\n    balance_by: latency\n",
+    );
+    let (_d, app, gw) = app_and_gateway(&cfg);
+    gw.latency.seed("官方", 30);
+    for _ in 0..3 {
+        gw.latency.record("中转", 3_000);
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let official = candidate(&r, "官方");
+    assert_eq!(
+        (official.ttfb_ms, official.balance_factor),
+        (None, Some(1.0)),
+        "{official:?}"
+    );
+    let relay = candidate(&r, "中转");
+    assert_eq!(
+        (relay.ttfb_ms, relay.balance_factor),
+        (Some(3_000), Some(1.0)),
+        "{relay:?}"
+    );
+
+    let (_d, app, gw) = app_and_gateway(&CFG.replace("type: load-balance", "type: url-test"));
+    gw.latency.seed("官方", 30);
+    for _ in 0..3 {
+        gw.latency.record("中转", 3_000);
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(r.candidates, ["官方", "中转"], "url-test 照旧用垫的底");
+    assert_eq!(candidate(&r, "官方").ttfb_ms, Some(30));
+}
+
 /// 只按权重分时没有系数可说；`url-test` 只说首字节时间 —— 它就按这个排
 #[tokio::test]
 async fn only_the_numbers_the_order_uses_are_shown() {

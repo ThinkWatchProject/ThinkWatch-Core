@@ -426,9 +426,12 @@ impl AppState {
             } else {
                 Default::default()
             },
-            // `url-test` 选最快的；`load-balance` 按快慢分的也看它
-            ttfb_ms: if g.kind == GroupType::UrlTest || (balanced && g.balance_by.uses_latency()) {
+            // `url-test` 选最快的，握手垫的底也算；`load-balance` 按快慢分的也看它，只认真实
+            // 样本（见 `Latency::measured`）
+            ttfb_ms: if g.kind == GroupType::UrlTest {
                 self.latency.snapshot(candidates)
+            } else if balanced && g.balance_by.uses_latency() {
+                self.latency.measured(candidates)
             } else {
                 Default::default()
             },
