@@ -4021,6 +4021,7 @@ pub struct ZaiLoginStatus {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedEstimate {
     pub provider: String,
+    /// 发给这一家的模型名，按它报价：要测的是别名时是这一家自己的那个名字
     pub model: String,
     /// 输入 token。**精确值** —— 请求是固定的
     pub input_tokens: u64,
@@ -4067,6 +4068,7 @@ pub struct SpeedRunRequest {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedResult {
     pub provider: String,
+    /// 发给这一家的模型名（别名对到这一家的那个名字）
     pub model: String,
     pub ok: bool,
     pub connect_ms: u64,
@@ -4308,6 +4310,8 @@ pub struct ReplayRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReplayQuote {
+    /// 重放发给这一家的模型名，**按它报价**：客户端要的是别名时是这一家自己的那个名字，
+    /// 原来那一次发给这一家的名字改写过的是改写后的那个
     pub model: String,
     pub provider: String,
     pub body_bytes: i64,

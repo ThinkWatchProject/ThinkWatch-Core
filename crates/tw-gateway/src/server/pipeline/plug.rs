@@ -9,12 +9,14 @@
 //!   过了，见 [`crate::guard::rescreen`]）。拒绝的话拒绝整个请求，不换下一家 —— 和开头
 //!   那一遍一样；处置档下插件加进来的字命中了删除规则的，删掉之后再发；
 //! - 插件换了发出去的模型名：**密钥的模型范围照样管**。规则改写的模型名要过这一关，插件
-//!   改的也要；上游的模型清单不再对（契约附录二）；
+//!   改的也要；上游的模型清单不再对（契约附录二）。插件写的是客户端那一侧的名字，**可以是
+//!   别名**：和客户端要的一样，按这一家对上它自己的那个名字（[`crate::models::resolve`]）
+//!   再发；这一家服务不了这个别名的，这一跳不发、换下一家（[`Stop::Hop`]）；
 //! - 出站脱敏接着插件那本账编号：插件写进来的新值拿到新的号，报一条记录；
 //! - 重新解码：格式转换用改过的这一份。
 //!
-//! 插件拒绝了、出错而策略是拒绝、或者上面哪一道没过，**整个请求被拒**，不换下一家：
-//! 换一家，管它的还是这些插件。
+//! 插件拒绝了、出错而策略是拒绝、或者上面哪一道没过（别名对不上除外），**整个请求被拒**，
+//! 不换下一家：换一家，管它的还是这些插件。
 //!
 //! **发往上游的每一跳都过这一步**，不只生成回答的：数 token、Responses 的压缩一样过插件
 //! （插件删掉的东西不能从这些接口漏出去），嵌入和旧版补全过声明了它们的插件，别的接口
@@ -53,10 +55,22 @@ pub(super) struct Plugged {
     pub(super) bridge: Option<crate::plugin::bridge::Bridge>,
 }
 
+/// 这一跳过不了插件这一步：说给客户端（和尝试链）的那句话，和接下来怎么办。
+pub(super) enum Stop {
+    /// 拒绝整个请求，不换下一家
+    Request(Msg),
+    /// 只是这一家不发，换下一家：插件换上的别名这一家服务不了，后面的上游可能可以
+    Hop(Msg),
+}
+
+impl From<Msg> for Stop {
+    fn from(why: Msg) -> Self {
+        Stop::Request(why)
+    }
+}
+
 /// 发往 `provider` 之前跑一遍管这一跳的插件。`model` 是发给它的模型名（路由规则改写
 /// 之后的），`attempt` 是这一跳在尝试链上的位置。每一次运行当场记到请求上。
-///
-/// `Err` 是拒绝整个请求时告诉客户端的那句话。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn attempt(
     state: &AppState,
@@ -68,7 +82,7 @@ pub(super) async fn attempt(
     provider: &tw_config::Provider,
     model: &str,
     attempt: usize,
-) -> Result<Plugged, Msg> {
+) -> Result<Plugged, Stop> {
     let to = crate::plugin::request::Target {
         upstream: &provider.name,
         model,
@@ -79,7 +93,7 @@ pub(super) async fn attempt(
         Ok(p) => p,
         Err(refused) => {
             crate::plugin::request::record(state, started.id, &refused.runs);
-            return Err(refused.why);
+            return Err(Stop::Request(refused.why));
         }
     };
     crate::plugin::request::record(state, started.id, &p.runs);
@@ -90,9 +104,14 @@ pub(super) async fn attempt(
     let Some(c) = p.changed else {
         return Ok(out);
     };
-    if let Some(r) = &c.renamed {
-        allowed(rt, req, r)?;
-    }
+    // 插件换上的名字发给这一家时叫什么：别名对到这一家自己的那个名字
+    let renamed = match &c.renamed {
+        Some(r) => {
+            allowed(rt, req, r)?;
+            Some(sent_name(state, rt, provider, r)?)
+        }
+        None => None,
+    };
     // 内容过滤：只报插件加进来的。处置档下删过的话，后面一律用删过的那一份
     let (body, value) = rescreen(state, rt, req, started, &provider.name, &c)?;
     // 生成回答的请求重新解码：格式转换用改过的这一份。数 token、压缩这些不转换（只发给
@@ -121,7 +140,7 @@ pub(super) async fn attempt(
             at_ms: crate::server::now_ms(),
         });
     }
-    out.model = c.renamed.map(|r| r.model);
+    out.model = renamed;
     out.rewritten = Some(Rewritten {
         body,
         path: c.path,
@@ -260,6 +279,27 @@ fn rescreen_inputs(
 /// 插件改过的请求删不干净（不该发生：删除只改字）。拒绝，不发没删的那一份
 fn request_unscreenable() -> Msg {
     msg!("gw.internal" => "The request was interrupted by an error inside the gateway.")
+}
+
+/// 插件换上的模型名发给 `provider` 时叫什么（[`crate::models::resolve`]）。插件写的是客户端
+/// 那一侧的名字：是别名的话，发这一家自己的那个，不是别名本身。这一家服务不了这个别名
+/// 是 [`Stop::Hop`]：这一跳不发，后面的上游可能可以。
+///
+/// 不是别名的照旧原样发：插件改的名字不对上游的模型清单（见模块说明）。
+fn sent_name(
+    state: &AppState,
+    rt: &Runtime,
+    provider: &tw_config::Provider,
+    r: &crate::plugin::request::Renamed,
+) -> Result<String, Stop> {
+    crate::models::resolve(&rt.config, &state.catalog.load(), provider, &r.model).ok_or_else(|| {
+        Stop::Hop(msg!(
+            "gw.plugin.alias_unserved",
+            plugin = r.by.clone(), model = r.model.clone(), upstream = provider.name.clone() =>
+            "Plugin `{plugin}` changed the model to the alias {model}, and upstream `{upstream}` \
+             offers none of its models, so the request was not sent there."
+        ))
+    })
 }
 
 /// 插件换上的模型名，这把密钥用不用得了。**和路由规则改写的模型名过同一关**（见
