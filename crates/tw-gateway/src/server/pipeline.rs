@@ -27,6 +27,8 @@ mod plug;
 mod relay;
 mod slow;
 
+pub(crate) use hop::stream_fault;
+
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
 /// 客户端打不爆内存。
 const MAX_BODY: usize = 256 * 1024 * 1024;

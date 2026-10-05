@@ -719,6 +719,31 @@ pub(crate) async fn proxy(
             (id, Some(ending), None)
         }
     };
+    // 这一家接没接下这条连接，和 HTTP 那条路一跳的成败记在同一笔账上（见 `crate::health`）：
+    // 连不上、回了 5xx 是失败，凭据被拒、限流按原因停用，请求本身的问题算这一家答上了。每一轮
+    // 一行的连接接下了不记 —— 它的每一轮各记各的（见 `turn`）
+    let change = match &connected {
+        Ok(_) if turns.is_some() => None,
+        Ok(_) => state.health.record_success(name),
+        Err(NotConnected {
+            status: Some(s), ..
+        }) => match crate::failure::classify(
+            *s,
+            &axum::http::HeaderMap::new(),
+            &[],
+            crate::server::now_ms(),
+        ) {
+            crate::failure::Verdict::Failed(cause) => state.health.record_cause(name, cause),
+            crate::failure::Verdict::ClientError => state.health.record_success(name),
+        },
+        // 地址、请求头写坏了：配置的事，不是这一家的
+        Err(NotConnected {
+            source: tw_api::FailureSource::Config,
+            ..
+        }) => None,
+        Err(_) => state.health.record_failure(name),
+    };
+    crate::server::note_health(&state.bus, &state.health, name, change);
     if ending.is_some() {
         // 这一跳记发出去的模型名，和 HTTP 那条路一样。一条连接跑好几轮、每一帧写的模型可能
         // 不一样，升级时定得下来的只有每一帧都发的那个（指定模型、阶段一的改写，见
@@ -1292,6 +1317,10 @@ enum Flow {
 /// Responses 的连接上它属于上游此刻在回答的那一轮（见 [`turn`]）：这一轮的结局按上游原话认
 /// （用量、第一个 token、上游报的错），回答完了的那一帧交给客户端之后，这一轮收场、放掉它
 /// 占着的。被工具墙切断的，这一轮记成拒绝。
+///
+/// **收了尾的那一轮又来的帧不算任何一轮的**（见 [`turn::Turns::late`]）：上游先报 `error`、
+/// 再为同一次回答补一个 `response.failed` 时，后一帧照原样交给客户端，不让排在后面的那一轮
+/// 背上它的失败。被切掉的那一轮已经替它发过 `response.failed`，它补发的不再发。
 async fn upstream_text(
     state: &AppState,
     p: &mut Pipes,
@@ -1300,13 +1329,29 @@ async fn upstream_text(
     ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
     let kind = frame_kind(t);
-    if let Some(turn) = p.turns.as_mut().and_then(turn::Turns::front) {
-        turn.upstream(t);
+    // 一次回答从开始到收尾的那几帧带着它的 id。只有它们要解第二遍
+    let response = kind
+        .as_deref()
+        .filter(|k| lifecycle(k))
+        .and_then(|_| response_id(t));
+    let late = p
+        .turns
+        .as_mut()
+        .zip(response.as_deref().zip(kind.as_deref()))
+        .and_then(|(turns, (id, kind))| turns.late(id, kind));
+    match late {
+        Some(true) => return Flow::Sent,
+        Some(false) => {}
+        None => {
+            if let Some(turn) = p.turns.as_mut().and_then(turn::Turns::front) {
+                turn.upstream(t, kind.as_deref(), response.as_deref());
+            }
+        }
     }
-    let flow = relay(state, p, t, kind.as_deref(), c_tx, ending).await;
+    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx, ending).await;
     if let Some(turns) = p.turns.as_mut() {
         match &flow {
-            Flow::Sent if ends_turn(kind.as_deref()) => turns.finish_front(),
+            Flow::Sent if late.is_none() && ends_turn(kind.as_deref()) => turns.finish_front(),
             Flow::End(End::Cut(why)) => {
                 turns.fail_front(tw_api::FailureSource::Denied, why.clone())
             }
@@ -1325,12 +1370,28 @@ fn ends_turn(kind: Option<&str>) -> bool {
     )
 }
 
-/// [`upstream_text`] 的转发那一半。`kind` 是这一帧的 `type`
+/// 一次回答从开始到收尾的那几帧（`type` 是 `kind`）：它们带着这次回答（`response.id`）
+fn lifecycle(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.created"
+            | "response.queued"
+            | "response.in_progress"
+            | "response.completed"
+            | "response.failed"
+            | "response.incomplete"
+    )
+}
+
+/// [`upstream_text`] 的转发那一半。`kind` 是这一帧的 `type`。`late` 是收了尾的那一次回答又来
+/// 的一帧（见 [`turn::Turns::late`]）：照原样交给客户端（占位符照样还原、工具墙照样看），
+/// 不碰此刻那一次回答的回答钩子和切掉的状态
 async fn relay(
     state: &AppState,
     p: &mut Pipes,
     t: &str,
     kind: Option<&str>,
+    late: bool,
     c_tx: &mut ClientSink,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
@@ -1350,7 +1411,10 @@ async fn relay(
         kind,
         Some("response.completed" | "response.failed" | "response.incomplete")
     );
-    if kind == Some("response.created") {
+    // 收了尾的那一次回答又来的一帧不是此刻这一次的边界
+    if late {
+        // 原样往下走
+    } else if kind == Some("response.created") {
         p.response = response_id(&restored);
         p.dropping = false;
         // 回答钩子：这一次回答起一组实例
@@ -1364,7 +1428,7 @@ async fn relay(
         return Flow::Sent;
     }
     // 回答钩子：一帧可能变成几帧，也可能先扣着
-    let (outgoing, failed) = match p.reply.as_mut() {
+    let (outgoing, failed) = match p.reply.as_mut().filter(|_| !late) {
         None => (vec![restored], None),
         Some(s) => {
             let (out, mut err) = s.feed(as_sse(&restored).as_bytes()).await;

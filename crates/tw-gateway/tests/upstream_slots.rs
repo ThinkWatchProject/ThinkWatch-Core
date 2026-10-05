@@ -87,7 +87,11 @@ async fn upstream() -> Up {
     }
 }
 
-/// 甲、乙两家按顺序（`fallback`）。`limits` 是两家各自的上限
+/// 甲、乙两家按顺序（`fallback`）的组「池」，默认路由「默认」把请求都交给它。`limits` 是两家
+/// 各自的上限。
+///
+/// **`default_route` 要写**：不写的话默认路由叫 `default`，「默认」这条路由谁也不走，请求走的
+/// 是内置的「全部上游」组 —— 测的就不是这个组了（[`Log::routed`] 会说出来）
 fn config(a: &Up, b: &Up, limits: (Option<u32>, Option<u32>), wait_secs: u64) -> tw_config::Config {
     let limit = |n: Option<u32>| {
         n.map(|n| format!("    max_concurrent: {n}\n"))
@@ -95,6 +99,7 @@ fn config(a: &Up, b: &Up, limits: (Option<u32>, Option<u32>), wait_secs: u64) ->
     };
     let yaml = format!(
         "version: 1
+default_route: 默认
 clients:
   - name: me
     key: tw-k
@@ -153,21 +158,36 @@ impl Log {
         .await
     }
 
-    /// 那个请求的尝试链和对话留在哪一家的说明
+    /// 那个请求的尝试链和对话留在哪一家的说明。**它走的是「默认」路由上的组「池」**（见
+    /// [`config`]）：走到内置的「全部上游」组上的话，测的就不是这个组了
     async fn routed(&self, model: &str) -> (Vec<AttemptView>, Option<Stay>) {
         let id = self.id(model).await;
-        self.until(&format!(" {model} 的路由"), |evs| {
-            evs.iter().find_map(|e| match e {
-                Event::RequestRouted {
-                    id: i,
-                    attempts,
-                    affinity,
-                    ..
-                } if *i == id => Some((attempts.clone(), affinity.as_ref().and_then(|a| a.stayed))),
-                _ => None,
+        let (route, group, attempts, stayed) = self
+            .until(&format!(" {model} 的路由"), |evs| {
+                evs.iter().find_map(|e| match e {
+                    Event::RequestRouted {
+                        id: i,
+                        route,
+                        group,
+                        attempts,
+                        affinity,
+                        ..
+                    } if *i == id => Some((
+                        route.clone(),
+                        group.clone(),
+                        attempts.clone(),
+                        affinity.as_ref().and_then(|a| a.stayed),
+                    )),
+                    _ => None,
+                })
             })
-        })
-        .await
+            .await;
+        assert_eq!(
+            (route.as_str(), group.as_deref()),
+            ("默认", Some("池")),
+            "{model} 没走配置里的那个组"
+        );
+        (attempts, stayed)
     }
 
     async fn finished(&self, model: &str) {
@@ -627,7 +647,6 @@ async fn a_full_member_of_a_load_balance_group_sits_its_turns_out() {
     let (a, b) = (upstream().await, upstream().await);
     let mut cfg = config(&a, &b, (Some(1), None), 5);
     cfg.groups[0].kind = tw_engine::GroupType::LoadBalance;
-    cfg.default_route = Some("默认".into());
     let (gw, state, log) = serve(cfg).await;
     let group = state.runtime().engine.groups()[0].clone();
     // 头一个轮到甲，占着它的那个位置

@@ -16,9 +16,16 @@
 //! **上限和并发按轮算，和 HTTP 那条路的一个请求同一套**（[`admit`]）：天、周、月用满了就拒，
 //! 密钥的并发上限等前面的结束，分钟、小时等得到就等；然后占这一家的一个位置
 //! （`max_concurrent`）—— 这条连接只连着这一家，没有下一家可换：满着就等，等不到回
-//! `response.failed`。被拒的这一轮替它回一个 `response.failed`，连接照常。占着的（密钥的
+//! `response.failed`。等分钟、小时的空位和等这一家的位置**共用这一轮的一个期限**，和 HTTP
+//! 那条路一样。被拒的这一轮替它回一个 `response.failed`，连接照常。占着的（密钥的
 //! 并发通行证、这一家的位置）从发出去占到这一次回答完、或者连接断了；**闲着的连接什么都
 //! 不占**。
+//!
+//! **快慢和成败也按轮记，和 HTTP 那条路的一跳同一笔账**：这一家的快慢样本从上游开始答这一轮
+//! 量到第一段内容（[`crate::latency`]，认第一段内容的是同一个），成败一轮记一次（熔断和
+//! `load-balance` 按成败分的成功率，[`crate::health`]）—— 第一段内容到了是答上了；内容之前就
+//! 收了尾的，按上游最后那一帧报的错判断，和 HTTP 那条路开头报错的一跳同一个判据；上游断了是
+//! 失败。等位置等不到、被上限拒的、客户端走了的、被防护切断的不记：那不是这一家的错。
 //!
 //! 上限看的是这一轮开始那一刻的配置，和 HTTP 那条路每个请求一样：去向和防护按升级时的走
 //! 到底，上限改了，下一轮就照新的数。
@@ -109,11 +116,16 @@ pub(crate) struct Line {
     pub(crate) billing: tw_config::Billing,
 }
 
+/// 在 `error` 那一帧收尾的几轮，最多记住多少个回答的 id（[`Turns::late`]）
+const ENDED_MAX: usize = 8;
+
 /// 这条连接上在跑的几轮，按发出去的先后。**上游按顺序回答**：上游来的帧都算头一轮的，头一轮
 /// 回答完了，下一轮接上。
 pub(crate) struct Turns {
     pub(crate) line: Arc<Line>,
     queue: VecDeque<Turn>,
+    /// 最近在 `error` 那一帧收尾的几轮的回答 id，和那一轮是不是被切掉了（见 [`Self::late`]）
+    ended: VecDeque<(String, bool)>,
 }
 
 impl Turns {
@@ -121,7 +133,50 @@ impl Turns {
         Self {
             line,
             queue: VecDeque::new(),
+            ended: VecDeque::new(),
         }
+    }
+
+    /// 上游的这一帧（`type` 是 `kind`、带着回答 `response`）是不是**已经收了尾的那一轮补发
+    /// 的**，是的话那一轮是不是被切掉了。
+    ///
+    /// 一轮在上游的 `error` 那一帧收尾，上游之后还可能为**同一次回答**补发一个
+    /// `response.failed`。按「上游来的帧都算头一轮的」，那一帧会落到排在后面的那一轮头上：
+    /// 那一轮的结局成了上一轮的失败，它自己的回答再落到下一轮头上，一路错下去。所以带着回答
+    /// id 的帧先对一下 id。认得保守 —— 认错了的那一轮等不到收尾，比记错一行更糟：
+    ///
+    /// - 只记在 `error` 那一帧收尾的几轮：在完成、失败、没答完那一帧收尾的，上游不会再补；
+    /// - 一次回答只补一个收尾帧，补过就忘掉它；
+    /// - `response.created` 和头一轮自己的回答 id 一律算头一轮的：有的上游每次回答都用同一个 id
+    pub(crate) fn late(&mut self, response: &str, kind: &str) -> Option<bool> {
+        let own = self.queue.front().and_then(|t| t.response.as_deref()) == Some(response);
+        if own || kind == "response.created" {
+            return None;
+        }
+        let at = self.ended.iter().position(|(id, _)| id == response)?;
+        let cut = self.ended[at].1;
+        if matches!(
+            kind,
+            "response.completed" | "response.failed" | "response.incomplete"
+        ) {
+            self.ended.remove(at);
+        }
+        Some(cut)
+    }
+
+    /// 头一轮收尾了，下一轮接上。在 `error` 那一帧收尾的记下它的回答 id（见 [`Self::late`]）
+    fn pop_front(&mut self) -> Option<Turn> {
+        let t = self.queue.pop_front()?;
+        if let (true, Some(id)) = (t.errored, t.response.clone()) {
+            if self.ended.len() == ENDED_MAX {
+                self.ended.pop_front();
+            }
+            self.ended.push_back((id, t.cut.is_some()));
+        }
+        if let Some(next) = self.queue.front_mut() {
+            next.begin();
+        }
+        Some(t)
     }
 
     /// 上游此刻在回答的那一轮
@@ -133,21 +188,24 @@ impl Turns {
         self.queue.front().map(|t| t.id)
     }
 
-    /// 发出去了：排在后面等上游回答
-    pub(crate) fn push(&mut self, t: Turn) {
+    /// 发出去了：排在后面等上游回答。前面没有在答的，上游这就开始答它
+    pub(crate) fn push(&mut self, mut t: Turn) {
+        if self.queue.is_empty() {
+            t.begin();
+        }
         self.queue.push_back(t);
     }
 
     /// 头一轮回答完了：报结局，放掉它占着的
     pub(crate) fn finish_front(&mut self) {
-        if let Some(t) = self.queue.pop_front() {
+        if let Some(t) = self.pop_front() {
             t.finish();
         }
     }
 
     /// 头一轮失败了：被防护切断了
     pub(crate) fn fail_front(&mut self, source: tw_api::FailureSource, why: Msg) {
-        if let Some(t) = self.queue.pop_front() {
+        if let Some(t) = self.pop_front() {
             t.fail(source, why);
         }
     }
@@ -187,7 +245,17 @@ pub(crate) struct Turn {
     pub(crate) id: u64,
     /// 报了就没有了
     ending: Option<Ending>,
-    bus: tw_observe::EventBus,
+    state: AppState,
+    /// 这条连接连着的那一家：快慢和成败记在它头上
+    provider: String,
+    /// 上游这一次回答的 id（`response.created` 里的）。收尾之后靠它认出上游补发的帧（见
+    /// [`Turns::late`]）
+    response: Option<String>,
+    /// 上游这一轮来过一个 `error`：在它那一帧收尾的，上游之后还可能为同一次回答补一个收尾帧
+    errored: bool,
+    /// 这一轮的成败给这一家记过了（见 [`Self::judge`]）。**一轮只记一次**，和 HTTP 那条路一跳
+    /// 只记一次一样
+    judged: bool,
     /// 这一帧到的那一刻：首字节时间从它算，和 HTTP 那条路从请求进来算一样
     started: Instant,
     /// 上游这一轮的第一帧到了没有。到了报响应头
@@ -210,13 +278,31 @@ impl Turn {
         }
     }
 
-    /// 上游这一轮来了一帧，**上游原话**（带占位符的那一版）：头一帧报响应头，每一帧喂给结局
-    /// 认用量、第一个 token、上游报的错
-    pub(crate) fn upstream(&mut self, text: &str) {
+    /// 上游开始答这一轮了：发出去时前面没有在答的，或者前面那一轮刚收尾。这一家的快慢样本
+    /// 从这一刻量到第一段内容（见 [`crate::latency`]）—— 前一轮还在答的时候，这一轮排在后面
+    /// 等，那一段不是这一家慢
+    fn begin(&mut self) {
+        if let Some(e) = self.ending.as_mut() {
+            e.timed(crate::ending::Lap {
+                latency: self.state.latency.clone(),
+                provider: self.provider.clone(),
+                sent: Instant::now(),
+            });
+        }
+    }
+
+    /// 上游这一轮来了一帧，**上游原话**（带占位符的那一版），`type` 是 `kind`、带着的回答 id
+    /// 是 `response`：头一帧报响应头，每一帧喂给结局认用量、第一个 token、上游报的错。成败
+    /// 在这里记：第一段内容到了是答上了；内容之前就收了尾的，看收尾的这一帧报没报错
+    pub(crate) fn upstream(&mut self, text: &str, kind: Option<&str>, response: Option<&str>) {
+        if self.response.is_none() {
+            self.response = response.map(str::to_string);
+        }
+        self.errored |= kind == Some("error");
         if !self.responded {
             self.responded = true;
             self.routed();
-            self.bus.emit(tw_api::Event::RequestHeaders {
+            self.state.bus.emit(tw_api::Event::RequestHeaders {
                 id: self.id,
                 status: 200,
                 ttfb_ms: self.started.elapsed().as_millis() as u64,
@@ -228,13 +314,43 @@ impl Turn {
         if let Some(e) = self.ending.as_mut() {
             e.frame(text);
         }
+        if self.judged {
+            return;
+        }
+        if self.ending.as_ref().is_some_and(Ending::has_content) {
+            // 内容到了：这一家答上了。之后流里再报错也不改 —— HTTP 那条路的一跳也是开头
+            // 一过就记成功
+            self.judge(|h, p| h.record_success(p));
+        } else if super::ends_turn(kind) {
+            // 一段内容都没有就收了尾：和 HTTP 那条路开头报错的一跳同一个判据
+            let dialect = tw_dialect::ir::Dialect::Responses;
+            match crate::server::stream_fault(&self.state, &self.provider, dialect, text) {
+                Some(cause) => self.judge(|h, p| h.record_cause(p, cause)),
+                None => self.judge(|h, p| h.record_success(p)),
+            }
+        }
+    }
+
+    /// 给这一家记这一轮的成败（见 [`crate::health`]）：熔断和按成败分的 `load-balance` 看的是
+    /// 同一笔账，状态变了照常报。**一轮只记一次**
+    fn judge(
+        &mut self,
+        record: impl FnOnce(&crate::health::Health, &str) -> Option<crate::health::State>,
+    ) {
+        if std::mem::replace(&mut self.judged, true) {
+            return;
+        }
+        let health = &self.state.health;
+        let change = record(health, &self.provider);
+        crate::server::note_health(&self.state.bus, health, &self.provider, change);
     }
 
     fn routed(&mut self) {
         let Some(r) = self.route.take() else { return };
         let mut attempt = r.attempt;
         attempt.ms = r.since.elapsed().as_millis() as u64;
-        self.bus
+        self.state
+            .bus
             .emit(routed(self.id, r.choice, vec![attempt], r.billing));
     }
 
@@ -249,8 +365,12 @@ impl Turn {
         }
     }
 
-    /// 失败了：上游断了、被防护切断了。用量照样带着（上游已经计了费）
+    /// 失败了：上游断了、被防护切断了。用量照样带着（上游已经计了费）。上游断了的，没答上
+    /// 之前断的给这一家记一次失败，和 HTTP 那条路流在第一段内容之前断了一样
     pub(crate) fn fail(mut self, source: tw_api::FailureSource, why: Msg) {
+        if source == tw_api::FailureSource::Upstream {
+            self.judge(|h, p| h.record_failure(p));
+        }
         self.routed();
         if let Some(e) = self.ending.take() {
             e.failed(source, why);
@@ -258,15 +378,19 @@ impl Turn {
     }
 
     /// 准入过了、这一帧却没发出去：插件拒绝了它，或者写不过去。尝试链上是 `attempts`（写不
-    /// 过去的那一跳；插件拒绝的没有），没接下的不按那一家记账
+    /// 过去的那一跳；插件拒绝的没有），没接下的不按那一家记账。写不过去是上游断了，给这一家
+    /// 记一次失败，和 HTTP 那条路发不出去一样
     pub(crate) fn unsent(
         mut self,
         attempts: Vec<tw_api::AttemptView>,
         source: tw_api::FailureSource,
         why: Msg,
     ) {
+        if source == tw_api::FailureSource::Upstream {
+            self.judge(|h, p| h.record_failure(p));
+        }
         if let Some(r) = self.route.take() {
-            self.bus.emit(routed(
+            self.state.bus.emit(routed(
                 self.id,
                 r.choice,
                 attempts,
@@ -340,11 +464,14 @@ pub(crate) enum NotAdmitted {
 ///
 /// 1. 天、周、月的上限 —— 用满了就拒；
 /// 2. 密钥的并发上限 —— 等前面的结束；
-/// 3. 分钟、小时的上限 —— 下一个空位在 `slot_wait_secs` 之内空出来就等，等不到就拒；过了
+/// 3. 分钟、小时的上限 —— 下一个空位在这一轮的等待期限之前空出来就等，等不到就拒；过了
 ///    就按输入的估算占着，存储层记下这一行时换成实数；
 /// 4. 开始：发开始事件，内容过滤的结论挂在这一轮上报（拒绝的切断连接）；
-/// 5. 这一家的位置（`max_concurrent`）—— 满着就等，最多 `slot_wait_secs`；这条连接只连着
+/// 5. 这一家的位置（`max_concurrent`）—— 满着就等，等到同一个期限；这条连接只连着
 ///    这一家，等不到就是这一家忙，回 429 那句话。
+///
+/// **等待期限一轮只有一个**：过了密钥的并发上限那一刻起算 `failover.slot_wait_secs`，第 3 步、
+/// 第 5 步的等待都算在里面，和 HTTP 那条路一样（见 `server::pipeline::admission`）。
 ///
 /// 被上限拒的、等不到位置的**照样留一行**，流量里看得见它为什么没发出去。拿到的通行证和
 /// 位置交给这一轮（[`Turn`]），跟着它走。
@@ -356,8 +483,6 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
     let key = rt.config.clients.iter().find(|c| c.name == key_name);
     let max_concurrent = key.and_then(|c| c.max_concurrent);
     let limits: &[tw_config::KeyLimit] = key.map(|c| c.limits.as_slice()).unwrap_or_default();
-    // 等滚动窗口的空位、等这一家的位置，各等最多这么久（见 `crate::key_limits::slot_wait`）
-    let wait = crate::key_limits::slot_wait(&rt.config);
     let choice = Choice {
         rewritten_by: a.rewritten_by.clone(),
         ..line.choice.clone()
@@ -366,8 +491,15 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
         return Err(refused(&a, &choice, r.error()));
     }
     let pass = state.gate.acquire(key_name, max_concurrent).await;
+    // 等待期限从这里起算：等滚动窗口的空位、等这一家的位置共用它（见
+    // `crate::key_limits::slot_wait`）
+    let wait_until = tokio::time::Instant::now() + crate::key_limits::slot_wait(&rt.config);
     let ask = ask(state, &a, limits);
-    let hold = match state.key_limits.admit(key_name, limits, ask, wait).await {
+    let hold = match state
+        .key_limits
+        .admit_by(key_name, limits, ask, wait_until)
+        .await
+    {
         Ok(hold) => hold,
         Err(r) => return Err(refused(&a, &choice, r.error())),
     };
@@ -394,11 +526,9 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
         None => {
             let mut waited = None;
             let mut slot = None;
-            if !wait.is_zero() {
-                slot = state
-                    .slots
-                    .take_by(&line.provider, tokio::time::Instant::now() + wait)
-                    .await;
+            // 这一轮能等的已经等完了（或者配置的是不等）：不再等
+            if tokio::time::Instant::now() < wait_until {
+                slot = state.slots.take_by(&line.provider, wait_until).await;
                 waited = Some(hop_started.elapsed().as_millis() as u64);
             }
             match slot {
@@ -433,7 +563,11 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
     Ok(Turn {
         id,
         ending: Some(ending),
-        bus: state.bus.clone(),
+        state: state.clone(),
+        provider: line.provider.clone(),
+        response: None,
+        errored: false,
+        judged: false,
         started: a.arrived,
         responded: false,
         route: Some(Route {

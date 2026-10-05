@@ -251,6 +251,16 @@ fn judge(dialect: Dialect, event: Option<&str>, data: &str) -> Judge {
     }
 }
 
+/// 流里的一个事件（`data`）是不是上游报的错：是的话，那个错误对应的状态码和上游的原话，交给
+/// [`crate::failure::classify`]。**和开头报错是同一个判据**（[`judge`]）：WebSocket 上 Responses
+/// 的一轮在第一段内容之前收尾时按它给这一家记成败（见 `hop::stream_fault`）
+pub(super) fn stream_error(dialect: Dialect, data: &str) -> Option<(u16, Bytes)> {
+    match judge(dialect, None, data) {
+        Judge::Error { status, body, .. } => Some((status, body)),
+        Judge::Preamble | Judge::Content => None,
+    }
+}
+
 fn error(status: u16, data: &str, kind: String, message: String) -> Judge {
     Judge::Error {
         status,

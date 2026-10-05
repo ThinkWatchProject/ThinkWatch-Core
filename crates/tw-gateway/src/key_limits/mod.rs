@@ -468,8 +468,9 @@ impl KeyLimits {
         out
     }
 
-    /// 准入第三步，从此刻起最多等 `wait`（见 [`Self::admit_by`]）。WebSocket 的连接用它：
-    /// 那条路之后不再等上游的空位，这一段就是全部
+    /// 准入第三步，从此刻起最多等 `wait`（见 [`Self::admit_by`]）。整条连接一行的 WebSocket
+    /// 连接（Realtime 和别的路径）用它：那条路不等上游的空位，这一段就是全部。Responses 连接
+    /// 上的每一轮和 HTTP 的请求一样用 [`Self::admit_by`]
     pub async fn admit(
         self: &Arc<Self>,
         key: &str,

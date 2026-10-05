@@ -252,6 +252,12 @@ impl Ending {
         self.lap = Some(lap);
     }
 
+    /// 第一段内容到了没有：认第一个 token 的那一个认出来了（[`Ending::streaming`] 之后才
+    /// 认）。WebSocket 上 Responses 的一轮靠它判断这一家答上了没有（见 `crate::ws::turn`）
+    pub fn has_content(&self) -> bool {
+        self.opened.is_some()
+    }
+
     /// 上游 `provider` 回的不是 2xx，原样交给了客户端（4xx 是请求本身的问题，或者没有
     /// 下一家可换了；3xx 交还客户端，由它决定跟不跟）。
     ///

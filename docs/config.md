@@ -987,6 +987,10 @@ go straight to the next candidate. How long depends on the reason the
 upstream gives: an insufficient balance waits for a top-up, a used-up quota
 waits until the moment the upstream says it resets, and a rate limit usually
 passes within seconds. A request with a single candidate is never affected.
+On a Responses WebSocket connection, each `response.create` counts here like
+a request: one that fails because of the upstream before any content arrives
+counts as a failure, and so does a connection the upstream refuses or that
+cannot be made.
 
 Before the first content of a streamed answer reaches the client, an error
 the upstream sends in the stream moves the request to the next candidate,
@@ -1151,7 +1155,10 @@ group shares out requests by the result in the same way as above.
 Speed is measured on streamed answers only, from the moment the request is
 sent to that upstream, so waiting and upstreams that failed before it do not
 count. An upstream given up on because its stream was slow to start
-(`failover.next_on_slow_start`) counts as taking the whole wait.
+(`failover.next_on_slow_start`) counts as taking the whole wait. On a
+Responses WebSocket connection, each `response.create` counts as one request
+for both speed and failures, its speed measured from the moment the upstream
+starts answering it.
 
 An upstream without enough measurements yet counts as average. As with
 weights alone, conversations in progress stay where they are, and new

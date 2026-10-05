@@ -1706,6 +1706,24 @@ fn known_reset(state: &AppState, provider: &str, cause: Cause) -> Cause {
     Cause::QuotaUsedUp { resets_at_ms }
 }
 
+/// 一个流式回答在第一段内容之前就收了尾，收尾的那个事件是 `data`：这算不算 `provider` 的错、
+/// 按什么原因停用。**和这里开头报错的一跳同一个判据**（[`super::opening`] 读出状态码，
+/// [`crate::failure::classify`] 判断）：5xx、限流、额度用完、凭据被拒是 `Some`；请求本身的
+/// 问题、不是错误的是 `None` —— 那是这一家答上了。WebSocket 上 Responses 的一轮用它（见
+/// `crate::ws::turn`）
+pub(crate) fn stream_fault(
+    state: &AppState,
+    provider: &str,
+    dialect: tw_dialect::ir::Dialect,
+    data: &str,
+) -> Option<Cause> {
+    let (status, body) = super::opening::stream_error(dialect, data)?;
+    match crate::failure::classify(status, &http::HeaderMap::new(), &body, now_ms()) {
+        Verdict::Failed(cause) => Some(known_reset(state, provider, cause)),
+        Verdict::ClientError => None,
+    }
+}
+
 /// 这个回答要不要等开头：生成回答的流式响应才等。等的话，上游说的是哪种格式、
 /// 是不是 Bedrock 的二进制帧
 fn opening_of(

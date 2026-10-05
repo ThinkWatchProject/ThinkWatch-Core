@@ -214,10 +214,17 @@ pub(super) async fn ws_upgrade(
         )));
     }
     let http = rt.clients.get(&name).unwrap_or(&state.http);
-    let upstream_headers = state
-        .headers_for(provider, http)
-        .await
-        .map_err(|e| GatewayError::config(crate::state::credential_failed(e, &name)))?;
+    // 凭据取不到是这一家的问题，和 HTTP 那条路一样记一次失败（见 `crate::health`）
+    let upstream_headers = match state.headers_for(provider, http).await {
+        Ok(h) => h,
+        Err(e) => {
+            let change = state.health.record_failure(&name);
+            super::note_health(&state.bus, &state.health, &name, change);
+            return Err(GatewayError::config(crate::state::credential_failed(
+                e, &name,
+            )));
+        }
+    };
     // Responses 的连接：每个 `response.create` 是一个请求（见 `crate::ws::turn`）
     let responses = crate::client_api::ClientApi::of_path(uri.path())
         == Some(crate::client_api::ClientApi::OpenaiResponses)

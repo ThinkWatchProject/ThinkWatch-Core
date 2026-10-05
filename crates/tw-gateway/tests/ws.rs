@@ -1302,3 +1302,295 @@ async fn a_turn_waits_for_a_full_upstream_and_fails_as_busy_when_none_frees() {
     let frames = one_answer(&mut c).await;
     assert_eq!(frames.last().unwrap()["type"], "response.completed");
 }
+
+// ---------------------------------------------------------------- 快慢和成败
+
+/// 一轮的剧本：收到第 n 个 `response.create`（从 1 数）时回的每一帧，和发它之前先等的毫秒数
+type Script = fn(usize) -> Vec<(u64, serde_json::Value)>;
+
+/// 照剧本回答的 Responses 上游
+async fn scripted(script: Script) -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(move |mut sock| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    if !matches!(m, Message::Text(_)) {
+                        continue;
+                    }
+                    n += 1;
+                    for (wait, f) in script(n) {
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        if sock
+                            .send(Message::Text(f.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+fn created(id: &str) -> serde_json::Value {
+    serde_json::json!({"type":"response.created","response":{"id":id,"status":"in_progress","model":"gpt-5","output":[]}})
+}
+
+fn delta() -> serde_json::Value {
+    serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":"hello"})
+}
+
+fn completed(id: &str) -> serde_json::Value {
+    let usage: serde_json::Value = serde_json::from_str(USAGE).unwrap();
+    serde_json::json!({"type":"response.completed","response":{"id":id,"status":"completed","model":"gpt-5","output":[],"usage":usage}})
+}
+
+fn failed(id: &str, code: &str) -> serde_json::Value {
+    serde_json::json!({"type":"response.failed","response":{"id":id,"status":"failed","model":"gpt-5","output":[],"error":{"code":code,"message":"boom"}}})
+}
+
+fn error(code: &str) -> serde_json::Value {
+    serde_json::json!({"type":"error","error":{"type":code,"code":code,"message":"boom"}})
+}
+
+/// 收到这一轮收尾的那一帧为止（完成、失败、没答完，或者一个 `error`）
+async fn until_end(c: &mut Socket) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+            .await
+            .unwrap_or_else(|_| panic!("the answer did not end: {out:?}"))
+            .expect("the connection closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        let end = matches!(
+            v["type"].as_str(),
+            Some("response.completed" | "response.failed" | "response.incomplete" | "error")
+        );
+        out.push(v);
+        if end {
+            return out;
+        }
+    }
+}
+
+/// **每一轮和 HTTP 那条路的一跳记同一笔账**：快慢样本从上游开始答这一轮量到第一段内容；成败
+/// 一轮记一次 —— 内容到了是答上了（之后流里再报错也是），内容之前就收了尾的看收尾那一帧报的
+/// 错（上游的错是失败，请求本身的问题算答上了），客户端没等到内容就走了的不记
+#[tokio::test]
+async fn each_turn_feeds_the_upstreams_speed_and_success_like_an_http_hop() {
+    fn script(n: usize) -> Vec<(u64, serde_json::Value)> {
+        let id = format!("resp_{n}");
+        match n {
+            // 头三轮的第一段内容 200 毫秒之后才到
+            1..=3 => vec![(0, created(&id)), (200, delta()), (0, completed(&id))],
+            4 | 5 => vec![(0, created(&id)), (0, delta()), (0, completed(&id))],
+            // 内容之前就失败了：这一家的错
+            6 => vec![(0, created(&id)), (0, failed(&id, "server_error"))],
+            // 内容到了之后才失败：和 HTTP 那条路一样算答上了
+            7 => vec![
+                (0, created(&id)),
+                (0, delta()),
+                (0, failed(&id, "server_error")),
+            ],
+            // 请求本身的问题
+            8 => vec![(0, error("invalid_request_error"))],
+            // 客户端等不到内容就走了
+            _ => vec![(0, created(&id)), (5_000, delta())],
+        }
+    }
+    let up = scripted(script).await;
+    let (gw, mut rx, state) = turns_gateway(up, |_| {}, None).await;
+    let rate = || {
+        state
+            .health
+            .success_rates(&["up".to_string()])
+            .get("up")
+            .copied()
+    };
+    let mut c = connect(gw).await;
+    for _ in 1..=5 {
+        c.send(create("hi")).await.unwrap();
+        assert_eq!(
+            until_end(&mut c).await.last().unwrap()["type"],
+            "response.completed"
+        );
+    }
+    let typical = state.latency.typical("up").expect("每一轮都该量到");
+    assert!(
+        (200..2_000).contains(&typical),
+        "从这一轮开始到第一段内容是 200 多毫秒，量到的是 {typical}"
+    );
+    assert_eq!(rate(), Some(1.0));
+
+    c.send(create("hi")).await.unwrap();
+    until_end(&mut c).await;
+    assert_eq!(
+        rate(),
+        Some(5.0 / 6.0),
+        "内容之前的 server_error 是这一家的错"
+    );
+    c.send(create("hi")).await.unwrap();
+    until_end(&mut c).await;
+    assert_eq!(rate(), Some(6.0 / 7.0), "内容到了之后的失败不算");
+    c.send(create("hi")).await.unwrap();
+    until_end(&mut c).await;
+    assert_eq!(rate(), Some(7.0 / 8.0), "请求本身的问题算这一家答上了");
+
+    // 客户端没等到内容就走了：这一轮取消，不记
+    c.send(create("hi")).await.unwrap();
+    loop {
+        let m = c.next().await.unwrap().unwrap();
+        if m.into_text().unwrap().contains("response.created") {
+            break;
+        }
+    }
+    drop(c);
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the turn was not cancelled")
+            .unwrap();
+        if matches!(ev, Event::RequestCancelled { .. }) {
+            break;
+        }
+    }
+    assert_eq!(rate(), Some(7.0 / 8.0), "客户端走了被算进了成败");
+}
+
+/// 一轮在上游的 `error` 那一帧收尾，上游又为**同一次回答**补发一个 `response.failed`：那一帧
+/// 照原样交给客户端，**不算排在后面的那一轮的** —— 下一轮照样有自己的回答、用量和成败。
+/// 每次回答都用同一个 id 的上游也照常：下一轮自己的回答不会被当成补发的
+#[tokio::test]
+async fn a_late_frame_for_an_answer_that_ended_is_not_the_next_turns() {
+    fn script(n: usize) -> Vec<(u64, serde_json::Value)> {
+        match n {
+            1 => vec![(0, created("resp_1")), (0, error("server_error"))],
+            2 => vec![
+                (0, failed("resp_1", "server_error")),
+                (0, created("resp_2")),
+                (0, delta()),
+                (0, completed("resp_2")),
+            ],
+            3 => vec![(0, created("same")), (0, error("server_error"))],
+            _ => vec![(0, created("same")), (0, delta()), (0, completed("same"))],
+        }
+    }
+    let up = scripted(script).await;
+    let (gw, mut rx, state) = turns_gateway(up, |c| c.failover.failures_to_pause = 1, None).await;
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    assert_eq!(until_end(&mut c).await.last().unwrap()["type"], "error");
+    assert_eq!(
+        state.health.state("up"),
+        tw_gateway::health::State::Open,
+        "内容之前的 server_error 是这一家的错"
+    );
+
+    c.send(create("two")).await.unwrap();
+    // 补发的那一帧照原样到了客户端，然后是第二轮自己的回答
+    let late = until_end(&mut c).await;
+    assert_eq!(late.last().unwrap()["response"]["id"], "resp_1", "{late:?}");
+    let second = until_end(&mut c).await;
+    assert_eq!(second.last().unwrap()["type"], "response.completed");
+
+    let evs = requests(&mut rx, 2).await;
+    let ids = started_ids(&evs);
+    assert_eq!(ids.len(), 2, "{evs:?}");
+    assert!(
+        matches!(of(&evs, ids[0]).last(), Some(Event::RequestFailed { source, .. }) if source.slug() == "upstream"),
+        "{evs:?}"
+    );
+    match of(&evs, ids[1]).last() {
+        Some(Event::RequestFinished { usage: Some(u), .. }) => {
+            assert_eq!((u.input, u.cache_read, u.output), (200, 1000, 30));
+        }
+        other => panic!("第二轮背上了第一轮的失败：{other:?}"),
+    }
+    assert_eq!(
+        state.health.state("up"),
+        tw_gateway::health::State::Closed,
+        "第二轮答上了，补发的那一帧不该记到它头上"
+    );
+
+    // 第三轮在 `error` 收尾，第四轮的回答用的还是那个 id：它是第四轮自己的
+    c.send(create("three")).await.unwrap();
+    assert_eq!(until_end(&mut c).await.last().unwrap()["type"], "error");
+    c.send(create("four")).await.unwrap();
+    let fourth = until_end(&mut c).await;
+    assert_eq!(
+        fourth.last().unwrap()["type"],
+        "response.completed",
+        "{fourth:?}"
+    );
+    let evs = requests(&mut rx, 2).await;
+    let ids = started_ids(&evs);
+    assert!(
+        matches!(
+            of(&evs, ids[1]).last(),
+            Some(Event::RequestFinished { usage: Some(_), .. })
+        ),
+        "{evs:?}"
+    );
+    assert_eq!(state.health.state("up"), tw_gateway::health::State::Closed);
+}
+
+/// 一轮只有一段可等的时间，和 HTTP 那条路的一个请求一样：等密钥的分钟上限用掉的，等这一家的
+/// 位置时就少等那么久。两段各给一份的话，这一轮要等两倍那么久才收到「忙」
+#[tokio::test]
+async fn a_turns_key_limit_wait_and_slot_wait_share_one_budget() {
+    let (up, _seen) = responder(None).await;
+    let clock = JumpClock::new();
+    let (gw, mut rx, state) = turns_gateway(
+        up,
+        |c| {
+            c.clients[0].limits = serde_yaml_ng::from_str("[{per: minute, requests: 1}]").unwrap();
+            c.providers[0].max_concurrent = Some(1);
+            c.failover.slot_wait_secs = 2;
+        },
+        Some(clock.clone()),
+    )
+    .await;
+    let mut c = connect(gw).await;
+    c.send(create("one")).await.unwrap();
+    one_answer(&mut c).await;
+    requests(&mut rx, 1).await;
+    // 这一分钟的一个用掉了，再过 1 秒滑出去；这一家的位置一直有人占着
+    clock.jump(59_000);
+    let _other = state.slots.try_take("up").unwrap();
+
+    let t = std::time::Instant::now();
+    c.send(create("two")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    let took = t.elapsed();
+    assert_eq!(
+        frames.last().unwrap()["type"],
+        "response.failed",
+        "{frames:?}"
+    );
+    let evs = requests(&mut rx, 1).await;
+    match evs.last().unwrap() {
+        Event::RequestFailed { message, .. } => {
+            assert_eq!(
+                message.code, "gw.busy_all",
+                "该是等过了分钟上限、再等这一家的位置"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        took >= Duration::from_millis(1_800) && took < Duration::from_millis(2_600),
+        "等了 {took:?}：两段该共用 2 秒"
+    );
+}
