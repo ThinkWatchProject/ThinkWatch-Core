@@ -318,3 +318,84 @@ async fn a_condition_on_a_real_name_routes_its_alias() {
     assert_eq!(body["by"], "official");
     assert_eq!(models(&official_seen), ["claude-opus-5"]);
 }
+
+/// 错误信息里的那句话
+fn message(body: &serde_json::Value) -> &str {
+    body["error"]["message"].as_str().unwrap_or_default()
+}
+
+/// 密钥的 `allow` 一家一家地管：指定模型列了两家，密钥只让用 a 的那个名字 —— a 失败了，
+/// 故障转移也不去 b，b 什么都收不到。两个都不让用的，准入就拒了，说出是哪条规则指定的
+/// 哪个名字。这些上游都不给清单，密钥照样管
+#[tokio::test]
+async fn failover_never_reaches_a_pinned_model_the_key_may_not_use() {
+    let rules = "
+- name: 指定
+  to:
+    - { provider: a, model: m-a }
+    - { provider: b, model: m-b }
+";
+    let gateway = |allow: &[&str]| {
+        let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
+        async move {
+            let (a, a_seen) = upstream("a", 500).await;
+            let (b, b_seen) = upstream("b", 200).await;
+            let mut cfg = config(
+                vec![provider("a", a, &[]), provider("b", b, &[])],
+                "{}",
+                rules,
+            );
+            cfg.clients[0].allow = Some(allow);
+            let (gw, rx) = serve(cfg).await;
+            (gw, rx, a_seen, b_seen)
+        }
+    };
+
+    let (gw, mut rx, a_seen, b_seen) = gateway(&["m-a"]).await;
+    let (status, body) = ask(gw, "anything").await;
+    assert_ne!(status, 200, "{body}");
+    assert_eq!(models(&a_seen), ["m-a"]);
+    assert!(models(&b_seen).is_empty(), "密钥不让用 m-b，却发给了 b");
+    assert_eq!(attempts(&mut rx).await, [("a".to_string(), some("m-a"))]);
+
+    // 两个都让用：照常转到 b
+    let (gw, _rx, _, b_seen) = gateway(&["m-*"]).await;
+    let (status, body) = ask(gw, "anything").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(models(&b_seen), ["m-b"]);
+
+    // 一个都不让用：准入就拒，哪一家都不发
+    let (gw, _rx, a_seen, b_seen) = gateway(&["m-x"]).await;
+    let (status, body) = ask(gw, "anything").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        message(&body)
+            .contains("Rule `指定` pins model m-a on `a`, which gateway key `c` may not use"),
+        "{body}"
+    );
+    assert!(models(&a_seen).is_empty() && models(&b_seen).is_empty());
+}
+
+/// 阶段二给某一家改的名字也一家一家地按密钥管，按名字本身对 glob：只许 `m-a` 的密钥，b 被
+/// 改成 `m-b`，a 失败了不转到 b
+#[tokio::test]
+async fn failover_never_reaches_a_phase_two_rename_the_key_may_not_use() {
+    let (a, a_seen) = upstream("a", 500).await;
+    let (b, b_seen) = upstream("b", 200).await;
+    let mut cfg = config(
+        vec![provider("a", a, &[]), provider("b", b, &[])],
+        "{}",
+        "
+- { name: b 的叫法, when: { provider_would_be: b }, set: { model: m-b } }
+- { name: 兜底, to: __all__ }
+",
+    );
+    cfg.clients[0].allow = Some(vec!["m-a".into()]);
+    let (gw, mut rx) = serve(cfg).await;
+
+    let (status, body) = ask(gw, "m-a").await;
+    assert_ne!(status, 200, "{body}");
+    assert_eq!(models(&a_seen), ["m-a"]);
+    assert!(models(&b_seen).is_empty(), "密钥不让用 m-b，却发给了 b");
+    assert_eq!(attempts(&mut rx).await, [("a".to_string(), None)]);
+}

@@ -10,7 +10,8 @@
 //!   那一遍一样；处置档下插件加进来的字命中了删除规则的，删掉之后再发；
 //! - 插件换了发出去的模型名：**密钥的模型范围照样管**。规则改写的模型名要过这一关，插件
 //!   改的也要；上游的模型清单不再对（契约附录二）。插件写的是客户端那一侧的名字，**可以是
-//!   别名**：和客户端要的一样，按这一家对上它自己的那个名字（[`crate::models::resolve`]）
+//!   别名**：和客户端要的一样，范围按目录的规矩看（写上游模型名的密钥也放行列了它的别名，
+//!   [`crate::models::allowed`]），按这一家对上它自己的那个名字（[`crate::models::resolve`]）
 //!   再发；这一家服务不了这个别名的，这一跳不发、换下一家（[`Stop::Hop`]）；
 //! - 出站脱敏接着插件那本账编号：插件写进来的新值拿到新的号，报一条记录；
 //! - 重新解码：格式转换用改过的这一份。
@@ -107,7 +108,7 @@ pub(super) async fn attempt(
     // 插件换上的名字发给这一家时叫什么：别名对到这一家自己的那个名字
     let renamed = match &c.renamed {
         Some(r) => {
-            allowed(rt, req, r)?;
+            allowed(state, rt, req, r)?;
             Some(sent_name(state, rt, provider, r)?)
         }
         None => None,
@@ -304,26 +305,24 @@ fn sent_name(
 
 /// 插件换上的模型名，这把密钥用不用得了。**和路由规则改写的模型名过同一关**（见
 /// `super::admit` 里的说法）：密钥的模型范围管的是发出去的模型，谁改的都一样。
-fn allowed(rt: &Runtime, req: &Inbound, r: &crate::plugin::request::Renamed) -> Result<(), Msg> {
-    let allow = rt
-        .config
-        .clients
-        .iter()
-        .find(|c| c.name == req.client_name)
-        .and_then(|c| c.allow.as_deref());
-    match allow {
-        Some(patterns)
-            if !patterns
-                .iter()
-                .any(|p| tw_engine::rule::glob_match(p, &r.model)) =>
-        {
-            Err(msg!(
-                "gw.plugin.model_not_allowed",
-                plugin = r.by.clone(), model = r.model.clone(), key = req.client_name.clone() =>
-                "Plugin `{plugin}` changed the model to {model}, which gateway key `{key}` may not \
-                 use, so the request was not sent."
-            ))
-        }
-        _ => Ok(()),
+///
+/// 插件写的是客户端那一侧的名字，范围也按那一侧的规矩看（[`crate::models::allowed`]）：
+/// 写 `claude-sonnet-*` 的密钥放行列了 `claude-sonnet-5` 的别名 `sonnet`，和客户端直接要
+/// `sonnet` 时一样。
+fn allowed(
+    state: &AppState,
+    rt: &Runtime,
+    req: &Inbound,
+    r: &crate::plugin::request::Renamed,
+) -> Result<(), Msg> {
+    let allow = crate::models::key_allow(&rt.config, &req.client_name);
+    if crate::models::allowed(&state.catalog.load(), allow, &r.model, false) {
+        return Ok(());
     }
+    Err(msg!(
+        "gw.plugin.model_not_allowed",
+        plugin = r.by.clone(), model = r.model.clone(), key = req.client_name.clone() =>
+        "Plugin `{plugin}` changed the model to {model}, which gateway key `{key}` may not \
+         use, so the request was not sent."
+    ))
 }

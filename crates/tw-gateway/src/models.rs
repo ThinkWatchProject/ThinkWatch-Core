@@ -564,6 +564,9 @@ pub enum Skip {
     OutOfScope,
     /// 它的模型清单里没有这个模型
     NotOffered,
+    /// 发给它的名字这把密钥不让用（`allow`）：指定模型、阶段二改的名字一家一个，
+    /// 准入放行了别的那几家，故障转移也到不了这一家
+    NotAllowed,
 }
 
 impl Skip {
@@ -572,6 +575,7 @@ impl Skip {
             Skip::Disabled => "disabled",
             Skip::OutOfScope => "out_of_scope",
             Skip::NotOffered => "not_offered",
+            Skip::NotAllowed => "not_allowed",
         }
     }
     /// 进给客户端的那句话里。**界面不用它** —— 界面按 `slug` 自己说。
@@ -580,6 +584,7 @@ impl Skip {
             Skip::Disabled => "disabled",
             Skip::OutOfScope => "out of scope",
             Skip::NotOffered => "does not offer this model",
+            Skip::NotAllowed => "not allowed for this key",
         }
     }
 }
@@ -639,6 +644,41 @@ pub fn fit(catalog: &tw_engine::Catalog, p: &tw_config::Provider, model: &str) -
     } else {
         None
     }
+}
+
+/// 密钥 `key` 的模型范围（`allow`）。没有这把密钥、或者它没写 `allow` 时是 `None`：什么都放行。
+pub fn key_allow<'a>(cfg: &'a tw_config::Config, key: &str) -> Option<&'a [String]> {
+    cfg.clients
+        .iter()
+        .find(|c| c.name == key)
+        .and_then(|c| c.allow.as_deref())
+}
+
+/// 密钥的 `allow` 放不放行要发给一家的名字 `model`。`allow` 是 `None`（不写）时什么都放行。
+///
+/// - **客户端那一侧的名称**（客户端写的、阶段一改写的、插件改的，可能是别名）按目录的规矩
+///   看（[`tw_engine::Catalog::allows`]）：写上游的模型名也放行列了它的别名，和准入、
+///   `/v1/models` 是同一套。
+/// - **原样发出的名字**（`as_written`：指定模型、阶段二改的）按这个名字本身对 glob：它不经过
+///   别名表，也就没有别名可继承。
+///
+/// **每个候选各看各的**：指定模型、阶段二改的名字一家一个，准入只要有一家过得去就放行，
+/// 剩下那几家要在这里拦住 —— 不然故障转移会把请求带到密钥不让用的模型上。
+pub fn allowed(
+    catalog: &tw_engine::Catalog,
+    allow: Option<&[String]>,
+    model: &str,
+    as_written: bool,
+) -> bool {
+    allow.is_none_or(|patterns| {
+        if as_written {
+            patterns
+                .iter()
+                .any(|p| tw_engine::rule::glob_match(p, model))
+        } else {
+            catalog.allows(model, patterns)
+        }
+    })
 }
 
 /// 发给上游 `p` 时，客户端说的 `name` 叫什么。`None` = 这家服务不了这个别名。
@@ -714,6 +754,9 @@ pub fn sent_to(
 /// **每一家按它实际要的那个模型看**，规则改写过的就是改写后的；别名按这家能不能
 /// 服务它看，指定模型按指定的那个名字看（见 [`sent_to`]）。
 ///
+/// 密钥的 `allow`（[`key_allow`]）也一家一家地看（[`allowed`]）：指定模型按指定的名字，
+/// 别的按它要的、客户端那一侧的名称。不让用的跳过（[`Skip::NotAllowed`]）。
+///
 /// **没有模型清单的上游不跳过**：不知道它有什么，不等于它没有。模型是空的
 /// （请求体解析不了）时只看停用。
 pub fn serving(
@@ -721,6 +764,7 @@ pub fn serving(
     catalog: &tw_engine::Catalog,
     decision: &tw_engine::Decision,
     asked: &[(String, String)],
+    allow: Option<&[String]>,
 ) -> Serving {
     let mut out = Serving {
         asked: asked.to_vec(),
@@ -732,10 +776,13 @@ pub fn serving(
             out.usable.push(name.clone());
             continue;
         };
+        let pinned = decision.pinned_model(name);
         let skip = if p.disabled {
             Some(Skip::Disabled)
         } else if model.is_empty() {
             None
+        } else if !allowed(catalog, allow, pinned.unwrap_or(model), pinned.is_some()) {
+            Some(Skip::NotAllowed)
         } else {
             sent_to(cfg, catalog, decision, p, model).err()
         };
@@ -941,7 +988,7 @@ mod tests {
         assert_eq!(cat.offers("relay", "gpt-x"), Some(true));
 
         let all = ["bedrock", "relay", "openai", "no-list", "scoped"];
-        let s = serving(&c, &cat, &decided(&[]), &asked(&all, "gpt-x"));
+        let s = serving(&c, &cat, &decided(&[]), &asked(&all, "gpt-x"), None);
         // relay 只有同名的真模型：别名优先，到不了它。没有清单的照样能
         assert_eq!(s.usable, ["openai", "no-list"]);
         assert_eq!(
@@ -975,12 +1022,57 @@ mod tests {
                 ("relay".into(), "gpt-x".into()),
                 ("bedrock".into(), "claude-sonnet-5".into()),
             ],
+            None,
         );
         assert_eq!(s.usable, ["relay"]);
         assert_eq!(s.skipped, [("bedrock".to_string(), Skip::NotOffered)]);
         assert_eq!(
             sent_to(&c, &cat, &pinned, &c.providers[1], "gpt-x"),
             Ok("gpt-x".into())
+        );
+
+        // 密钥的 allow 一家一家地看。指定的名字原样对 glob：只许 gpt-x-* 的密钥，relay 的
+        // gpt-x 不让用，跳过；openai 的 gpt-x-2026 照常
+        let narrow = ["gpt-x-*".to_string()];
+        let pinned = decided(&[("relay", "gpt-x"), ("openai", "gpt-x-2026")]);
+        let both: [(String, String); 2] = [
+            ("relay".into(), "gpt-x".into()),
+            ("openai".into(), "gpt-x-2026".into()),
+        ];
+        let s = serving(&c, &cat, &pinned, &both, Some(&narrow));
+        assert_eq!(s.usable, ["openai"]);
+        assert_eq!(s.skipped, [("relay".to_string(), Skip::NotAllowed)]);
+        // 写别名的密钥只管别名本身：指定的名字恰好和别名同名，不算
+        let s = serving(&c, &cat, &pinned, &both, Some(&["gpt-x".to_string()]));
+        assert_eq!(s.usable, ["relay"]);
+        assert_eq!(s.skipped, [("openai".to_string(), Skip::NotAllowed)]);
+        // 按名称要别名：写上游模型名的密钥继承到别名（gpt-x 列了 gpt-x-2026）
+        let s = serving(
+            &c,
+            &cat,
+            &decided(&[]),
+            &asked(&["openai"], "gpt-x"),
+            Some(&narrow),
+        );
+        assert_eq!(s.usable, ["openai"]);
+        let s = serving(
+            &c,
+            &cat,
+            &decided(&[]),
+            &asked(&["openai"], "gpt-x"),
+            Some(&["claude-*".to_string()]),
+        );
+        assert_eq!(s.skipped, [("openai".to_string(), Skip::NotAllowed)]);
+        // 停用的照旧说停用：那一条更要紧
+        let mut off = c.clone();
+        off.providers[2].disabled = true;
+        let s = serving(&off, &cat, &pinned, &both, Some(&["claude-*".to_string()]));
+        assert_eq!(
+            s.skipped,
+            [
+                ("relay".to_string(), Skip::NotAllowed),
+                ("openai".to_string(), Skip::Disabled),
+            ]
         );
     }
 
@@ -1022,7 +1114,13 @@ mod tests {
         c.providers[2].models_only = Some(vec!["c-1".into()]);
         let cat = published(&d, &c);
         assert_eq!(cat.all(), ["a-1", "a-2", "c-1"]);
-        let s = serving(&c, &cat, &decided(&[]), &asked(&["a", "b", "c"], "c-2"));
+        let s = serving(
+            &c,
+            &cat,
+            &decided(&[]),
+            &asked(&["a", "b", "c"], "c-2"),
+            None,
+        );
         assert_eq!(
             s.skipped,
             [
@@ -1053,7 +1151,7 @@ mod tests {
         );
         let cat = published(&d, &c);
         // 不知道它们有什么：不跳过
-        let s = serving(&c, &cat, &decided(&[]), &asked(&["a", "b"], "m"));
+        let s = serving(&c, &cat, &decided(&[]), &asked(&["a", "b"], "m"), None);
         assert_eq!(s.usable, ["a", "b"]);
         // 失败的一小时后重问，没有接口的一天后
         let hour = RETRY_AFTER.as_millis() as u64;

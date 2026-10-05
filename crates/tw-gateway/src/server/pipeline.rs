@@ -368,15 +368,23 @@ fn outgrown(
     let asked = rt
         .engine
         .asked(rt.engine.rules_for_client(&req.client_name), facts, d);
-    crate::sent::plan(&rt.config, &state.catalog.load(), d, &facts.model, &asked)
-        .iter()
-        .filter_map(|s| {
-            book.resolve_for(&s.provider, s.model.as_deref().ok()?)?
-                .price
-                .max_input_tokens
-        })
-        .min()
-        .is_some_and(|limit| facts.input_tokens.saturating_mul(100) >= limit.saturating_mul(95))
+    let allow = crate::models::key_allow(&rt.config, &req.client_name);
+    crate::sent::plan(
+        &rt.config,
+        &state.catalog.load(),
+        d,
+        &facts.model,
+        &asked,
+        allow,
+    )
+    .iter()
+    .filter_map(|s| {
+        book.resolve_for(&s.provider, s.model.as_deref().ok()?)?
+            .price
+            .max_input_tokens
+    })
+    .min()
+    .is_some_and(|limit| facts.input_tokens.saturating_mul(100) >= limit.saturating_mul(95))
 }
 
 /// 管线第 2 步的中段：模型准入。**和 `GET /v1/models` 共用同一个函数**
@@ -384,35 +392,37 @@ fn outgrown(
 ///
 /// **看的是每个候选实际要的模型，不是客户端写的那个**，所以放在规则做完决定之后：
 /// 一条把 `claude-*` 改成 `glm-*` 的规则，请求里的名字哪一家的清单里都没有，
-/// 改写后的才有。`asked` 里有一个过得去就放行 —— 哪一家服务不了，由下一步
-/// 把它跳过。
+/// 改写后的才有。`asked` 里有一个过得去就放行 —— 哪一家服务不了、哪一家要的名字
+/// 密钥不让用，由下一步把它跳过（见 [`crate::sent::serving`]）。
 ///
-/// - 要的是别名：按别名在目录里的样子看 —— 有清单的上游里有谁服务它，`allow` 写它
-///   的名称、或者写它列表里任一模型名都算放行（继承只从真名到别名）。
-/// - 指定模型的候选：看这一家有没有指定的那个名字（没有清单的当作有，和挑候选时
-///   一样），`allow` 按这个名字看。
+/// 每个候选要的名字按它的来历看（[`tw_engine::Origin`]）：
 ///
-/// 目录空着时不拦：那说明探测还没回来或者上游都不给列表，这时候拦
-/// 等于把整个网关关掉。
+/// - 客户端那一侧的名称（客户端写的、阶段一改写的，可能是别名）：按目录看 —— 有清单的
+///   上游里有谁服务它，`allow` 写它的名称、或者写它列表里任一模型名都算放行（继承只从
+///   真名到别名）。
+/// - 原样发出的名字（指定模型、阶段二改的）：看这一家自己的清单里有没有这个名字（没有
+///   清单的当作有，和挑候选时一样），`allow` 按这个名字本身看。**不经过别名表**：阶段二
+///   给中转站写的 `glm-air` 恰好和一个别名同名，发出去的也是 `glm-air` 本身，按别名看
+///   就会拿别名的模型列表去问这一家。
+///
+/// 目录空着时不看清单：那说明探测还没回来或者上游都不给列表，这时候拦等于把整个网关
+/// 关掉。**密钥的 `allow` 照样看**：它写在配置里，和清单问没问到无关 —— 不看的话，
+/// 下一步按密钥跳过候选时，请求会以「没有上游可用」被拒，说不清是密钥的事。
 fn admit(
     state: &AppState,
     rt: &Runtime,
     req: &Inbound,
     reading: &crate::client_api::Reading,
     decision: &tw_engine::Decision,
-    asked: &[(String, String)],
+    asked: &[tw_engine::Asked],
 ) -> Result<(), GatewayError> {
     let facts = &reading.facts;
-    let catalog = state.catalog.load();
-    if catalog.is_empty() || facts.model.is_empty() {
+    if facts.model.is_empty() {
         return Ok(());
     }
-    let allow = rt
-        .config
-        .clients
-        .iter()
-        .find(|c| c.name == req.client_name)
-        .and_then(|c| c.allow.clone());
+    let catalog = state.catalog.load();
+    let listed = !catalog.is_empty();
+    let allow = crate::models::key_allow(&rt.config, &req.client_name);
     // 数 token 也不挑格式：别的格式的上游由网关本地估算（见 `crate::count`）
     let any = reading.generates || crate::client_api::ClientApi::counts_tokens(req.uri.path());
     let servable = req
@@ -420,35 +430,41 @@ fn admit(
         .map(|a| crate::client_api::slugs(a.servable_by(any)));
     // 阶段一之后要的模型。规则一家候选都没给时就看它
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
-    // 按名称要的（别名还是别名），和指定模型的（哪一家、哪个名字）分开看
+    // 按名称要的（客户端那一侧，别名还是别名），和原样发出的（指定模型、阶段二改的：
+    // 哪一家、哪个名字）分开看
     let mut named: Vec<&str> = Vec::new();
-    let mut pinned: Vec<(&str, &str)> = Vec::new();
-    for (c, m) in asked {
-        match decision.pinned_model(c) {
-            Some(p) => pinned.push((c, p)),
-            None => named.push(m),
+    let mut written: Vec<&tw_engine::Asked> = Vec::new();
+    for a in asked {
+        if a.origin.as_written() {
+            written.push(a);
+        } else {
+            named.push(&a.model);
         }
     }
-    if named.is_empty() && pinned.is_empty() {
+    if named.is_empty() && written.is_empty() {
         named.push(model);
     }
-    let allowed = |m: &str| {
-        allow
-            .as_deref()
-            .is_none_or(|ps| ps.iter().any(|p| tw_engine::rule::glob_match(p, m)))
+    let named_ok = |m: &str| {
+        if listed {
+            catalog.admits(m, servable.as_deref(), allow)
+        } else {
+            crate::models::allowed(&catalog, allow, m, false)
+        }
     };
-    // 这一家有没有指定的名字。配置里没有这一家的留给尝试那一步报出来
-    let offered_at = |p: &str, m: &str| {
-        rt.config
-            .providers
+    // 这一家有没有这个名字。配置里没有这一家的留给尝试那一步报出来
+    let offered_at = |a: &tw_engine::Asked| {
+        !listed
+            || rt
+                .config
+                .providers
+                .iter()
+                .find(|x| x.name == a.provider)
+                .is_none_or(|x| crate::models::fit(&catalog, x, &a.model).is_none())
+    };
+    if named.iter().any(|m| named_ok(m))
+        || written
             .iter()
-            .find(|x| x.name == p)
-            .is_none_or(|x| crate::models::fit(&catalog, x, m).is_none())
-    };
-    if named
-        .iter()
-        .any(|m| catalog.admits(m, servable.as_deref(), allow.as_deref()))
-        || pinned.iter().any(|(p, m)| offered_at(p, m) && allowed(m))
+            .any(|a| offered_at(a) && crate::models::allowed(&catalog, allow, &a.model, true))
     {
         return Ok(());
     }
@@ -456,19 +472,26 @@ fn admit(
     // 该去改的地方不一样。**改写过的两个名字都要说**：客户端写的是一个，
     // 报错里说的是另一个，不说清楚像是网关认错了模型
     let key = req.client_name.clone();
-    let why = if named.is_empty() {
+    // 原样发出的名字里有上游提供、只是密钥不让用的：要改的是密钥
+    let barred = written.iter().find(|a| offered_at(a));
+    let why = if named.is_empty()
+        && written
+            .iter()
+            .all(|a| a.origin == tw_engine::Origin::Pinned)
+    {
         // 去向是指定模型：说出是哪条规则指定的、指定在哪一家
         let rule = decision.matched_rule.clone();
-        match pinned.iter().find(|(p, m)| offered_at(p, m)) {
-            Some((p, m)) => msg!(
-                "gw.model.pinned_not_allowed", rule = rule, model = m, upstream = p, key = key =>
+        match barred {
+            Some(a) => msg!(
+                "gw.model.pinned_not_allowed", rule = rule, model = a.model.clone(),
+                upstream = a.provider.clone(), key = key =>
                 "Rule `{rule}` pins model {model} on `{upstream}`, which gateway key `{key}` may \
                  not use."
             ),
             None => {
-                let detail = pinned
+                let detail = written
                     .iter()
-                    .map(|(p, m)| format!("{p} ({m})"))
+                    .map(|a| format!("{} ({})", a.provider, a.model))
                     .collect::<Vec<_>>()
                     .join(", ");
                 msg!(
@@ -478,16 +501,27 @@ fn admit(
             }
         }
     } else {
-        let offered = named.iter().any(|m| !catalog.providers_for(m).is_empty());
-        let alias = catalog.alias(model).map(|ms| ms.join(", "));
-        match (offered, model != facts.model, alias) {
+        // 按名称要的有上游提供（目录空着时当作有），那就是密钥不让用
+        let named_offered = named
+            .iter()
+            .any(|m| !listed || !catalog.providers_for(m).is_empty());
+        // 说哪个名字、有没有上游提供它、它是不是别名。按名称要的说不出什么（谁都不提供）时，
+        // 说阶段二给某一家改的那个：先说有上游提供、密钥不让用的
+        let (shown, offered, alias) = match (named_offered, barred, named.is_empty()) {
+            (true, _, _) => (model, true, catalog.alias(model)),
+            (false, Some(a), _) => (a.model.as_str(), true, None),
+            (false, None, false) => (model, false, catalog.alias(model)),
+            (false, None, true) => (written[0].model.as_str(), false, None),
+        };
+        let alias = alias.map(|ms| ms.join(", "));
+        match (offered, shown != facts.model, alias) {
             (false, false, Some(models)) => msg!(
                 "gw.model.alias_unserved", model = facts.model.clone(), models = models =>
                 "No upstream serves alias {model}: none offers any of {models}. GET /v1/models \
                  lists the models that are available."
             ),
             (false, true, Some(models)) => msg!(
-                "gw.model.alias_unserved_rewritten", from = facts.model.clone(), model = model,
+                "gw.model.alias_unserved_rewritten", from = facts.model.clone(), model = shown,
                 models = models =>
                 "A routing rule rewrote model {from} to alias {model}, and no upstream offers any \
                  of {models}. GET /v1/models lists the models that are available."
@@ -503,12 +537,12 @@ fn admit(
                  models that are available."
             ),
             (false, true, None) => msg!(
-                "gw.model.no_upstream_rewritten", from = facts.model.clone(), model = model =>
+                "gw.model.no_upstream_rewritten", from = facts.model.clone(), model = shown =>
                 "A routing rule rewrote model {from} to {model}, and no upstream serves {model}. \
                  GET /v1/models lists the models that are available."
             ),
             (true, true, _) => msg!(
-                "gw.model.not_allowed_rewritten", from = facts.model.clone(), model = model,
+                "gw.model.not_allowed_rewritten", from = facts.model.clone(), model = shown,
                 key = key =>
                 "A routing rule rewrote model {from} to {model}, which gateway key `{key}` may not \
                  use. GET /v1/models lists the models that are available."
@@ -593,27 +627,26 @@ fn route(
             stayed: None,
         }),
     };
-    // 每个候选实际要的模型：规则改写过的按改写后的算，还是客户端那一侧的名称（可能是
-    // 别名）。准入看它
+    // 每个候选实际要的模型和它的来历：规则改写过的按改写后的算；客户端写的、阶段一改写的
+    // 是客户端那一侧的名称（可能是别名），指定的、阶段二改的原样发出。准入看它
     let asked = rt.engine.asked(
         rt.engine.rules_for_client(&req.client_name),
         facts,
         &decision,
     );
-    let pairs: Vec<(String, String)> = asked
-        .iter()
-        .map(|a| (a.provider.clone(), a.model.clone()))
-        .collect();
-    admit(state, rt, req, reading, &decision, &pairs)?;
+    admit(state, rt, req, reading, &decision, &asked)?;
     // 每一家发出去的名字：别名对到各家自己的名称。跳过、比价看它（见 `crate::sent`）
     let catalog = state.catalog.load();
-    let sent = crate::sent::plan(&rt.config, &catalog, &decision, &facts.model, &asked);
-    // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的、别名对不到的。
-    // **在排序之前** —— `cheapest` 和 `url-test` 要在能服务的上游里挑。
+    let allow = crate::models::key_allow(&rt.config, &req.client_name);
+    let sent = crate::sent::plan(&rt.config, &catalog, &decision, &facts.model, &asked, allow);
+    // 去掉服务不了这个请求的候选：停用的、范围外的、清单里没有这个模型的、别名对不到的，
+    // 和发给它的名字密钥不让用的。**在排序之前** —— `cheapest` 和 `url-test` 要在能服务的
+    // 上游里挑。
     //
     // 不跳过的话，一家没有这个模型的上游排在前面，它回的 404 不触发故障
-    // 转移，请求就在一家能服务它的上游旁边失败了。
-    let serving = crate::sent::serving(&rt.config, &catalog, &decision, &asked);
+    // 转移，请求就在一家能服务它的上游旁边失败了；一家指定了密钥不让用的模型的上游
+    // 排在后面，前一家失败时请求就被转到了它那里。
+    let serving = crate::sent::serving(&rt.config, &catalog, &decision, &asked, allow);
     let model = decision.set.model.as_deref().unwrap_or(&facts.model);
     if serving.usable.is_empty() {
         return Ok(Routed::Refused(choice, serving.explain(model)));
