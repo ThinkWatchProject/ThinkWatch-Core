@@ -326,7 +326,7 @@ async fn saving_a_key_writes_its_limits_and_a_rename_keeps_what_it_used() {
         "PUT",
         "/keys/k2",
         serde_json::json!({ "key": { "name": "k2", "limits": [
-            { "per": "day", "measure": "cost", "max": 1, "cache_reads": true },
+            { "per": "day", "measure": "cost", "max": 1_000_000, "cache_reads": true },
         ] } }),
     )
     .await;
