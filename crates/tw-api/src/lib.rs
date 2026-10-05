@@ -1995,6 +1995,16 @@ pub enum ReferenceView {
     Group { group: String },
 }
 
+/// 规则「指定模型」里的一项，也是别名在某家上游实际发出的名称：哪家上游、发什么模型名。
+///
+/// **模型名原样发出**，不经过别名表 —— 和配置里 `to: [{provider, model}]` 同一个形状。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PinnedModel {
+    pub provider: String,
+    pub model: String,
+}
+
 /// 一条规则。
 ///
 /// **是全文，不是摘要** —— 编辑对话框靠它回填：条件、去向、拒绝原因、
