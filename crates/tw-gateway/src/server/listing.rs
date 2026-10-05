@@ -96,6 +96,26 @@ pub(crate) fn model_meta(
         .unwrap_or_default()
 }
 
+/// 列表里一个名称的元数据。
+///
+/// 别名用它第一个有上游提供的模型的（按列表顺序），按提供它的头一家查（见
+/// [`tw_engine::Catalog::first_served`]）。目录空着、列表里谁都不提供时（这时单点
+/// 查询不拦），按它列表里的头一个查默认价目表。
+fn listed_meta(
+    book: &tw_pricing::PriceBook,
+    catalog: &tw_engine::Catalog,
+    cfg: &tw_config::Config,
+    name: &str,
+) -> ModelMeta {
+    if let Some((provider, model)) = catalog.first_served(name) {
+        return model_meta(book, Some(provider), model);
+    }
+    match cfg.aliases.find(name).and_then(|a| a.models.first()) {
+        Some(model) => model_meta(book, None, model),
+        None => model_meta(book, None, name),
+    }
+}
+
 /// `GET /v1/models`。
 ///
 /// 三种方言的响应结构不同，但**列表内容来自同一个函数** —— 差别只在
@@ -122,15 +142,13 @@ pub(super) async fn list_models(
         .find(|c| c.name == client)
         .and_then(|c| c.allow.clone());
     let shape = ListingShape::of(uri.path(), &headers, position);
-    let models = state
-        .catalog
-        .load()
-        .resolve_allowed(Some(&shape.protocols()), allow.as_deref());
+    let catalog = state.catalog.load();
+    let models = catalog.resolve_allowed(Some(&shape.protocols()), allow.as_deref());
 
     let book = state.pricing.load();
     let objects: Vec<_> = models
         .iter()
-        .map(|m| shape.object(m, &model_meta(&book, None, m)))
+        .map(|m| shape.object(m, &listed_meta(&book, &catalog, &rt.config, m)))
         .collect();
 
     let body = match shape {
@@ -309,7 +327,7 @@ pub(super) async fn get_model(
             ),
         ));
     }
-    let meta = model_meta(&state.pricing.load(), None, &model);
+    let meta = listed_meta(&state.pricing.load(), &catalog, &rt.config, &model);
     Ok(axum::Json(shape.object(&model, &meta)).into_response())
 }
 

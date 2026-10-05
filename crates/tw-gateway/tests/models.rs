@@ -419,7 +419,7 @@ to:
     let (status, body) = ask(gw, "claude-opus-5").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["by"], "bedrock");
-    assert_eq!(body["model"], "us.anthropic.claude-opus-5-v1:0");
+    assert_eq!(body["sent"], "us.anthropic.claude-opus-5-v1:0");
 
     // 第一家停用了：下一家，用它自己的名字
     cfg.providers[0].disabled = true;
@@ -428,5 +428,5 @@ to:
     let (status, body) = ask(gw, "claude-opus-5").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["by"], "official");
-    assert_eq!(body["model"], "claude-opus-5");
+    assert_eq!(body["sent"], "claude-opus-5");
 }
