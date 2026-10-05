@@ -27,9 +27,11 @@ async fn upstream(name: &'static str, models: &'static [&'static str]) -> Socket
                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                 let model = v["model"].as_str().unwrap_or_default().to_string();
                 if models.contains(&model.as_str()) {
+                    // 收到的模型名放在 `sent` 里：回答里的 `model` 会被网关写回客户端用的名称
+                    // （见 `tw_gateway::answer_model`），看不出发出去的是哪个
                     (
                         axum::http::StatusCode::OK,
-                        axum::Json(serde_json::json!({ "by": name, "model": model })),
+                        axum::Json(serde_json::json!({ "by": name, "sent": model })),
                     )
                 } else {
                     // 中转站对它没有的模型就是这么回的：一个 4xx，不会触发故障转移
@@ -319,7 +321,7 @@ async fn a_rule_that_renames_the_model_is_judged_by_the_name_it_sends() {
     let (status, body) = ask(gw, "claude-sonnet-4-5").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["by"], "zhipu");
-    assert_eq!(body["model"], "glm-5");
+    assert_eq!(body["sent"], "glm-5");
 }
 
 #[tokio::test]
@@ -356,7 +358,7 @@ async fn a_rename_for_one_upstream_counts_for_that_upstream_only() {
     let (status, body) = ask(gw, "claude-sonnet-4-5").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["by"], "zhipu");
-    assert_eq!(body["model"], "glm-5");
+    assert_eq!(body["sent"], "glm-5");
 
     // 官方回来了：它有这个名字，排在前面，照旧先给它，名字不改
     cfg.providers[0].disabled = false;
@@ -365,7 +367,7 @@ async fn a_rename_for_one_upstream_counts_for_that_upstream_only() {
     let (status, body) = ask(gw, "claude-sonnet-4-5").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["by"], "official");
-    assert_eq!(body["model"], "claude-sonnet-4-5");
+    assert_eq!(body["sent"], "claude-sonnet-4-5");
 }
 
 #[tokio::test]

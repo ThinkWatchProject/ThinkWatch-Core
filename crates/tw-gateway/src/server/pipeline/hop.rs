@@ -24,7 +24,8 @@ use tw_types::msg;
 pub(super) struct Served<'a> {
     pub(super) upstream: reqwest::Response,
     pub(super) provider: &'a tw_config::Provider,
-    /// 发给它的模型名：路由规则、插件改过的是改过之后的。回答钩子的 `ctx.model` 和范围看它
+    /// 发给它的模型名：路由规则、插件改过的是改过之后的。回答钩子的 `ctx.model` 和范围看它；
+    /// 和客户端要的不一样时，回答里的模型名按它认、换回客户端的（见 [`crate::answer_model`]）
     pub(super) model: String,
     /// 它是尝试链上的第几跳。回答钩子的运行记录按它分组
     pub(super) attempt: usize,

@@ -159,6 +159,8 @@ struct Pipes {
     bridge: Option<crate::plugin::bridge::Bridge>,
     /// 这一次回答的回答钩子
     reply: Option<crate::plugin::reply::Stream>,
+    /// 插件换了发出去的模型名时，回答里的模型名换回客户端用的（见 [`crate::answer_model`]）
+    rename: Option<crate::answer_model::Body>,
 }
 
 /// 接管一次升级。
@@ -234,6 +236,7 @@ pub async fn proxy(
         sent_model: String::new(),
         bridge: None,
         reply: None,
+        rename: None,
     };
     pump(state, client, up, &mut p, ending).await;
 }
@@ -504,6 +507,16 @@ async fn upstream_text(
     ending: &mut crate::ending::Ending,
 ) -> Flow {
     let restored = tw_guard::redact::replace::restore(t, &p.ledger);
+    // 模型名换回客户端用的名称：一条消息是一个完整的 JSON，整条过一遍。排在回答钩子之前，
+    // 和 HTTP 那条路一样
+    let restored = match p.rename.as_mut() {
+        Some(r) => {
+            let mut out = r.feed(restored.as_bytes());
+            out.extend(r.flush());
+            String::from_utf8(out).unwrap_or(restored)
+        }
+        None => restored,
+    };
     // 回答的边界：一次新的回答起一组回答钩子的实例；被切掉的那次剩下的帧不发
     let kind = frame_kind(&restored);
     let terminal = matches!(
@@ -671,6 +684,8 @@ async fn plugin_request(state: &AppState, p: &mut Pipes, text: &str) -> Result<S
             String::from_utf8_lossy(&c.body).into_owned(),
         )?,
     };
+    p.rename =
+        crate::answer_model::Rename::new(&requested, &sent).map(crate::answer_model::Rename::body);
     p.requested_model = requested;
     p.sent_model = sent;
     Ok(out)

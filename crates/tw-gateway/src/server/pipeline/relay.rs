@@ -2,7 +2,8 @@
 //!
 //! 流式：**不缓冲**。整块缓冲会把 SSE 变成一次性交付，客户端那边看起来
 //! 就是「卡住很久然后一下全出来」。每一块依次经过：留档与嗅探 → 回显
-//! 还原 → 格式转换 → 工具调用审查，然后才写给客户端。
+//! 还原 → 格式转换 → 模型名换回客户端用的名称 → 回答钩子 → 工具调用审查，然后才写给
+//! 客户端。
 //!
 //! 这些步骤要不要做、怎么做，在响应头到手的那一刻就全定了（[`Plan`]）；
 //! 流里每一块怎么处理在 [`Relay`] 上，`respond` 里的流只剩一个循环。
@@ -21,12 +22,15 @@ use crate::server::{because, flagged};
 use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
+/// `asked_model` 是客户端请求里写的模型名：发出去的不是它、上游答的又是发出去的那个
+/// 模型时，回答里的模型名写回它（见 [`crate::answer_model`]）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn respond(
     state: &AppState,
     rt: &Runtime,
     req: &Inbound,
     generates: bool,
+    asked_model: &str,
     served: Served<'_>,
     id: u64,
     live: crate::live::Pass,
@@ -36,6 +40,7 @@ pub(super) fn respond(
     let Served {
         upstream,
         provider,
+        model: sent_model,
         ledger,
         session,
         refusal,
@@ -75,6 +80,13 @@ pub(super) fn respond(
     // 他会去查错的那一把。改 body 是越界，加一个头不是。
     if let Ok(v) = axum::http::HeaderValue::from_str(&provider.name) {
         out_headers.insert("x-thinkwatch-upstream", v);
+    }
+    // 回答里的模型名写成客户端用的名称：**只改成功的回答**，上游的错误是它的原话。
+    // 请求记录和上游体检看的是上游原话（`ending.feed` 在改写之前），不受影响
+    let rename =
+        crate::answer_model::Rename::new(asked_model, &sent_model).filter(|_| status.is_success());
+    if let Some(r) = &rename {
+        r.headers(&mut out_headers);
     }
 
     // **Bedrock 的流不是 SSE**，是 AWS eventstream 的二进制帧。在字节进门的地方就转成
@@ -132,6 +144,7 @@ pub(super) fn respond(
         id,
         upstream_dialect,
         plugins,
+        rename,
     );
     let chunks = upstream.bytes_stream();
     let dialect = req.dialect;
@@ -434,6 +447,10 @@ struct Relay {
     /// 回答钩子（见 [`crate::plugin::reply`]）。**排在转换之后、工具调用审查之前**：审查
     /// 看的是插件改过的那一版。范围内没有插件时是 None，整段零成本
     plugins: Option<ReplyStage>,
+    /// 回答里的模型名换回客户端用的名称（见 [`crate::answer_model`]）。**排在转换之后、
+    /// 回答钩子之前**：改的是客户端那种格式的字段，插件补出来的帧抄到的已经是换过的。
+    /// 发出去的就是客户端要的那个名称（绝大多数请求）时是 None，整段零成本
+    rename: Option<crate::answer_model::Body>,
 }
 
 /// 回答钩子在这条中继上怎么跑。
@@ -458,6 +475,7 @@ impl Relay {
         id: u64,
         upstream_dialect: tw_dialect::ir::Dialect,
         plugins: Option<crate::plugin::reply::Chain>,
+        rename: Option<crate::answer_model::Rename>,
     ) -> Self {
         // 还原看的是**上游的原话**（转换之前），所以按上游的格式认帧
         let restorer = tw_guard::redact::sse::Body::new(ledger, plan.is_sse, upstream_dialect);
@@ -532,6 +550,7 @@ impl Relay {
             id,
             provider: provider.name.clone(),
             plugins,
+            rename: rename.map(crate::answer_model::Rename::body),
         }
     }
 
@@ -556,6 +575,11 @@ impl Relay {
             c.process(&out);
             return (Vec::new(), None);
         }
+        // 模型名换回客户端用的名称：只扣住读到一半的那个名字，别的照发
+        let out = match self.rename.as_mut() {
+            Some(r) => r.feed(&out),
+            None => out,
+        };
         // 回答钩子：插件改过的才是客户端将要看到的那一版
         let (out, failed) = match self.plugins.as_mut() {
             Some(ReplyStage::Stream(s)) => s.feed(&out).await,
@@ -676,6 +700,8 @@ impl Relay {
             }
             _ => tail,
         };
+        // 模型名：整包的这时才见到，流的补上扣着的那半个名字
+        let tail = self.renamed(tail);
         // 回答钩子的收尾：流的补上扣着的，整包的这时才改
         let tail = match self.plugins.as_mut() {
             None => tail,
@@ -833,8 +859,26 @@ impl Relay {
         self.at_boundary
     }
 
-    /// 流断了之后还能对客户端说的最后一句：按它收到的格式收尾。
+    /// 收尾的一段过一遍模型名的改写，扣着的一起交出去
+    fn renamed(&mut self, tail: Vec<u8>) -> Vec<u8> {
+        match self.rename.as_mut() {
+            Some(r) => {
+                let mut out = r.feed(&tail);
+                out.extend(r.flush());
+                out
+            }
+            None => tail,
+        }
+    }
+
+    /// 流断了之后还能对客户端说的最后一句：按它收到的格式收尾。转换过的流收尾时写的
+    /// 外壳（Responses 的 `response.failed`）带着模型名，和前面的帧一样换过
     fn error_tail(&mut self, err: &GatewayError) -> Option<Vec<u8>> {
+        let frame = self.error_frame(err)?;
+        Some(self.renamed(frame))
+    }
+
+    fn error_frame(&mut self, err: &GatewayError) -> Option<Vec<u8>> {
         if let Some(c) = self.back.as_mut() {
             // 转换过的流按客户端的格式收尾
             Some(c.fail(&format!("[ThinkWatch] {}", err.message())))

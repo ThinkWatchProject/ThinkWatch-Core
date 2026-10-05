@@ -21,7 +21,8 @@ use tw_gateway::plugin::{
     State as PluginState, ToolCallOutcome,
 };
 
-/// 假上游：记下收到的每一帧，每个 `response.create` 回一次完整的回答
+/// 假上游：记下收到的每一帧，每个 `response.create` 回一次完整的回答。回答里的模型名是
+/// 请求里那个的带日期快照（上游常这么写）
 async fn upstream() -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
     let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
     let app = Router::new()
@@ -44,6 +45,7 @@ async fn answer(mut sock: WebSocket, seen: Arc<Mutex<Vec<Value>>>) {
     while let Some(Ok(m)) = sock.recv().await {
         let Message::Text(t) = m else { continue };
         let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+        let model = format!("{}-2026-09-30", v["model"].as_str().unwrap_or_default());
         let n = {
             let mut s = seen.lock().unwrap();
             s.push(v);
@@ -60,7 +62,7 @@ async fn answer(mut sock: WebSocket, seen: Arc<Mutex<Vec<Value>>>) {
         let frames = vec![
             ev(
                 "response.created",
-                json!({"response":{"id":id,"status":"in_progress","output":[]}}),
+                json!({"response":{"id":id,"status":"in_progress","model":model,"output":[]}}),
             ),
             ev(
                 "response.output_item.added",
@@ -84,7 +86,7 @@ async fn answer(mut sock: WebSocket, seen: Arc<Mutex<Vec<Value>>>) {
             ),
             ev(
                 "response.completed",
-                json!({"response":{"id":id,"status":"completed","output":[{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}),
+                json!({"response":{"id":id,"status":"completed","model":model,"output":[{"type":"message","id":"msg","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}),
             ),
         ];
         for f in frames {
@@ -237,6 +239,50 @@ async fn each_response_create_goes_through_the_request_hook_and_each_answer_thro
         // 不是插件改的字段原样
         assert_eq!(sent["type"], "response.create");
     }
+}
+
+/// 插件换了发出去的模型名：回答里写着的、和发出去的是同一个模型的名称写回客户端要的那个
+/// （见 `tw_gateway::answer_model`）。没换的那一轮原样
+#[tokio::test]
+async fn a_model_a_plugin_renamed_is_written_back_in_the_answer() {
+    let (up, seen) = upstream().await;
+    let swap = Double::new("swap")
+        .permit(&[Permission::Params])
+        .on_request(|mut view, ctx| {
+            if ctx["requested_model"] == "codex" {
+                view["params"]["model"] = json!("gpt-5.1-codex");
+            }
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let gw = gateway(up, vec![entry("swap", swap)]).await;
+    let mut c = connect(gw).await;
+    let models = |frames: &[String]| -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .filter_map(|v| v["response"]["model"].as_str().map(str::to_string))
+            .collect()
+    };
+    let ask = |model: &str| {
+        let mut v: Value = match create("hi") {
+            WsMsg::Text(t) => serde_json::from_str(&t).unwrap(),
+            _ => unreachable!(),
+        };
+        v["model"] = json!(model);
+        WsMsg::Text(v.to_string().into())
+    };
+    c.send(ask("codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(seen.lock().unwrap()[0]["model"], "gpt-5.1-codex");
+    assert_eq!(models(&frames), ["codex", "codex"], "{frames:?}");
+
+    c.send(ask("gpt-5.1-codex")).await.unwrap();
+    let frames = one_answer(&mut c).await;
+    assert_eq!(
+        models(&frames),
+        ["gpt-5.1-codex-2026-09-30", "gpt-5.1-codex-2026-09-30"],
+        "{frames:?}"
+    );
 }
 
 #[tokio::test]
