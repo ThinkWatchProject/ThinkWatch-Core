@@ -43,6 +43,9 @@ pub(super) struct Served<'a> {
     /// 交出去的是网关替上游说的一句话，不是它的原话（Bedrock 拒绝凭证，见
     /// [`bedrock_refusal`]）：这个请求失败的原因就是这一句。别的都是 None
     pub(super) refusal: Option<tw_types::Msg>,
+    /// 这一跳在这家占着的位置（见 [`crate::slots`]）。**跟着回答走**：交完、或者客户端
+    /// 走掉，响应体被丢掉时才还回去
+    pub(super) slot: crate::slots::Slot,
 }
 
 /// 这个请求的着落。
@@ -138,10 +141,40 @@ pub(super) async fn try_upstreams<'a>(
     let allow = crate::models::key_allow(&rt.config, &req.client_name);
     // 开头慢就换下一家：开着、客户端要的是流时，等多久（见 `super::slow`）
     let slow_wait = super::slow::wait(rt, reading);
+    // 还没看的候选，按顺序
+    let mut queue: std::collections::VecDeque<&String> = started.alive.iter().collect();
+    // 满着没发的那几家（见 `crate::slots`），按候选的顺序。候选都看过一遍还没有着落时，
+    // 在它们里面等先空出来的那一家
+    let mut busy: Vec<&String> = Vec::new();
+    // 等空位等到什么时候：头一次要等时定下，**整个请求共用这一段** —— 等的时候客户端
+    // 一个字节都收不到
+    let wait = std::time::Duration::from_secs(rt.config.failover.slot_wait_secs);
+    let mut deadline: Option<tokio::time::Instant> = None;
+    // 等过空位的那一跳在尝试链上的位置和等了多久。那一跳怎么收场都只进一行，进了之后补上
+    let mut queued: Option<(usize, u64)> = None;
+    // 等到最后，剩下的候选还都满着
+    let mut stalled = false;
 
-    for (i, name) in started.alive.iter().enumerate() {
-        // 后面没有别的候选了
-        let last = i + 1 == started.alive.len();
+    loop {
+        stamp_queued(&mut chain, queued.take());
+        // 下一个候选。都看过了，就在满着的那几家里等先空出来的：等到的那一家带着占到的位置
+        let (name, mut granted) = match queue.pop_front() {
+            Some(name) => (name, None),
+            None if busy.is_empty() => break,
+            None => {
+                let until = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
+                let t = std::time::Instant::now();
+                match state.slots.first_free(&busy, until).await {
+                    Some((k, slot)) => (busy.remove(k), Some((slot, t.elapsed()))),
+                    None => {
+                        stalled = true;
+                        break;
+                    }
+                }
+            }
+        };
+        // 后面没有别的候选了。满着、还等得到的那几家也算在后面
+        let last = queue.is_empty() && busy.is_empty();
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
             // 校验时挡过一次，能到这儿说明配置在运行中被换过。
             last_err = Some(GatewayError::config(msg!(
@@ -157,7 +190,7 @@ pub(super) async fn try_upstreams<'a>(
             continue;
         }
         attempts.push(provider.name.clone());
-        let hop_started = std::time::Instant::now();
+        let mut hop_started = std::time::Instant::now();
 
         // 数 token 选中的是别的格式的上游：不发，网关自己估
         if counting && attempts.len() == 1 && estimates(req, provider) {
@@ -273,6 +306,53 @@ pub(super) async fn try_upstreams<'a>(
                 Some(_) => {}
             }
         }
+
+        // 并发上限：这一跳要发出去了，先占这家一个位置（见 `crate::slots`）。**在插件和
+        // 转换之前**：满着没发的一跳不跑插件、不报转换。等不是失败：不停用、不进熔断的账。
+        //
+        // 数 token 不占位置：它不跑模型，一眨眼就回来；为它排在几个长回答后面等上半分钟、
+        // 最后回一个 429，客户端连上下文还剩多少都看不到
+        let slot = match granted.take() {
+            Some((slot, waited)) => {
+                queued = Some((chain.len(), waited.as_millis() as u64));
+                hop_started = std::time::Instant::now();
+                slot
+            }
+            None if counting => crate::slots::Slot::free(),
+            None => {
+                let mut waited = None;
+                let mut slot = state.slots.try_take(&provider.name);
+                // 这段对话留在这家是为了它的缓存：等它空出来，等不到再换下一家（缓存就丢在
+                // 这家了）。别的候选满着当场跳过
+                if slot.is_none() && started.choice.stayed_on.as_ref() == Some(name) {
+                    let until = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + wait);
+                    // 这个请求能等的已经等完了（或者配置的是不等）：不再等
+                    if tokio::time::Instant::now() < until {
+                        let t = std::time::Instant::now();
+                        slot = state.slots.take_by(&provider.name, until).await;
+                        waited = Some(t.elapsed().as_millis() as u64);
+                        hop_started = std::time::Instant::now();
+                    }
+                }
+                match slot {
+                    Some(slot) => {
+                        queued = waited.map(|ms| (chain.len(), ms));
+                        slot
+                    }
+                    None => {
+                        chain.push(crate::server::hop_busy(
+                            &provider.name,
+                            Some(sent.clone()).filter(asked_other),
+                            state.slots.limit(&provider.name).unwrap_or_default(),
+                            waited,
+                            hop_started,
+                        ));
+                        busy.push(name);
+                        continue;
+                    }
+                }
+            }
+        };
 
         // 插件的请求钩子：管这一跳的从客户端的原话起改。**拒绝的是整个请求**，不换下一家
         let plugged = match super::plug::attempt(
@@ -425,9 +505,12 @@ pub(super) async fn try_upstreams<'a>(
             .clone()
             .unwrap_or_else(|| reading.facts.model.clone());
         let (attempt, bridge) = (chain.len(), plugged.bridge);
-        // 后面还有没有接得下这个请求的（见 `successor`）。开头慢了才问
-        let rest = &started.alive[i + 1..];
-        let others = || successor(state, rt, req, reading, decision, &catalog, allow, rest);
+        // 后面还有没有接得下这个请求的（见 `successor`）。开头慢了才问。后面的是还没看的
+        // 候选，加上满着、跳过了的那几家：它们还可能空出来（见 `crate::slots`）
+        let others = || {
+            let rest = queue.iter().chain(busy.iter()).copied();
+            successor(state, rt, req, reading, decision, &catalog, allow, rest)
+        };
         // 开头慢就换下一家：等到什么时候，从这一刻（请求发出去）算起。最后一家不换。到点时
         // 问过、后面没有接得下的，清掉它：这一跳从此和不开时一样
         let mut slow_deadline = slow_wait
@@ -603,6 +686,7 @@ pub(super) async fn try_upstreams<'a>(
                             ledger,
                             session: out.session,
                             refusal,
+                            slot,
                         });
                         break;
                     }
@@ -734,6 +818,7 @@ pub(super) async fn try_upstreams<'a>(
                     ledger,
                     session: out.session,
                     refusal: None,
+                    slot,
                 });
                 break;
             }
@@ -769,6 +854,7 @@ pub(super) async fn try_upstreams<'a>(
         }
     }
 
+    stamp_queued(&mut chain, queued.take());
     // 尝试链走完了，两条路都要发 —— 挂在 RequestFinished 上的话，
     // 失败那条路就没有尝试链，而那恰恰是最需要看它的时候。
     // 最终服务的那家怎么收钱。**跟着请求走，不能事后查配置** ——
@@ -826,6 +912,20 @@ pub(super) async fn try_upstreams<'a>(
         ))));
     }
 
+    // 剩下的候选等过了还都满着：**429，带 `Retry-After`**。请求本身没问题，过一会儿再来就
+    // 发得出去；报成哪一家的失败都不对，它们一个字节都没收到
+    if stalled {
+        let upstreams = busy
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(GatewayError::busy(msg!(
+            "gw.busy_all", upstreams = upstreams =>
+            "Every upstream that can serve this request is at its concurrency limit \
+             (max_concurrent): {upstreams}. None had a free slot in time; try again shortly."
+        )));
+    }
     let Some(served) = served else {
         let mut err = last_err.unwrap_or_else(|| {
             GatewayError::config(msg!("gw.route.no_upstream_alive" => "No upstream is available."))
@@ -851,6 +951,16 @@ pub(super) async fn try_upstreams<'a>(
         );
     }
     Ok(Answer::Served(Box::new(served)))
+}
+
+/// 等过空位的那一跳：在尝试链上补上它等了多久。`at` 是它那一行的位置 —— 等到之后，
+/// 这一跳不管怎么收场都只进一行
+fn stamp_queued(chain: &mut [tw_api::AttemptView], queued: Option<(usize, u64)>) {
+    if let Some((at, ms)) = queued
+        && let Some(a) = chain.get_mut(at)
+    {
+        a.queued_ms = Some(ms);
+    }
 }
 
 /// 这一家和客户端是同一种格式（配置里没写格式的也算：照原样发过去）
@@ -886,6 +996,8 @@ fn estimated_hop(
         error: None,
         ms: started.elapsed().as_millis() as u64,
         usage: None,
+        queued_ms: None,
+        skipped: None,
     }
 }
 
@@ -974,10 +1086,14 @@ fn unsendable_tool(
 /// 没有的话，慢了的这一家就是最后一家**，照常等下去 —— 放弃了它，换来的是一个注定失败的
 /// 请求。
 ///
+/// **满着的算接得下**（`max_concurrent`，见 [`crate::slots`]）：满着只是此刻，等空位的
+/// 那一段（`failover.slot_wait_secs`）里它可能空出来。于是放弃了慢的这一家之后，请求可能
+/// 去等一家满着的、等不到时回 429 —— 不在这里猜它空不空得出来，「最后一家」只看接不接得下。
+///
 /// **只看不跑**：看的是客户端的原话，不跑插件、不取密钥（那两样在真发的那一跳才知道拒
 /// 不拒），不发转换事件
 #[allow(clippy::too_many_arguments)]
-fn successor(
+fn successor<'r>(
     state: &AppState,
     rt: &Runtime,
     req: &Inbound,
@@ -985,14 +1101,14 @@ fn successor(
     decision: &tw_engine::Decision,
     catalog: &tw_engine::Catalog,
     allow: Option<&[String]>,
-    rest: &[String],
+    mut rest: impl Iterator<Item = &'r String>,
 ) -> bool {
     let asked = Asked {
         body: &req.body,
         path: req.uri.path(),
         decoded: reading.decoded.as_ref(),
     };
-    rest.iter().any(|name| {
+    rest.any(|name| {
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
             return false;
         };

@@ -411,6 +411,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 rate_limit_max_pause_secs: f.rate_limit_max_pause_secs,
                 stream_start_wait_secs: f.stream_start_wait_secs,
                 next_on_slow_start: f.next_on_slow_start,
+                slot_wait_secs: f.slot_wait_secs,
             }
         },
         listen: tw_api::ListenView {
@@ -502,6 +503,7 @@ fn provider_view(
             .map(resources::reference_view)
             .collect(),
         pricing: p.pricing.clone(),
+        max_concurrent: p.max_concurrent,
     }
 }
 

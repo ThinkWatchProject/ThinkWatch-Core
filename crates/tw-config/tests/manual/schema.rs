@@ -571,6 +571,15 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "max_concurrent",
+                    Kind::Int,
+                    Def::Unset,
+                    t(
+                        "Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit.",
+                        "同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。",
+                    ),
+                ),
+                row(
                     "disabled",
                     Kind::Bool,
                     Def::Is("false"),
@@ -1251,6 +1260,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5.",
                         "流式回答在请求发出 `stream_start_wait_secs` 秒后仍没有内容时，放弃这家上游，把请求交给下一家。最后一家总是等下去。被放弃的上游不会停用。开启时 `stream_start_wait_secs` 至少为 5。",
+                    ),
+                ),
+                row(
+                    "slot_wait_secs",
+                    Kind::Int,
+                    Def::Is("30"),
+                    t(
+                        "Seconds a request waits in total for a free slot on upstreams that are at their `max_concurrent`. After that it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300.",
+                        "上游的并发数满了（`max_concurrent`）时，一个请求等空位合计最多等的秒数。等不到就换下一家；候选全满时回 429。`0`：不等。取值 0 到 300。",
                     ),
                 ),
             ],

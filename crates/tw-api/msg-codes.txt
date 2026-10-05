@@ -77,6 +77,7 @@ config.plugin.bad_id
 config.plugin.duplicate
 config.plugin.file
 config.plugin.sha256
+config.provider_concurrency_range
 config.rejected
 config.rejected_at
 config.remote_port_is_gateway
@@ -259,6 +260,8 @@ gw.auth.key_invalid
 gw.auth.no_key
 gw.auth.source_not_allowed
 gw.auth.source_not_allowed_hint
+gw.busy_all
+gw.busy_upstream
 gw.chatgpt.token_missing
 gw.chatgpt.token_not_json
 gw.chatgpt.token_status

@@ -52,6 +52,9 @@ pub(super) fn abandoned(
         error: Some(said(provider, waited)),
         ms: started.elapsed().as_millis() as u64,
         usage: usage(seen, reading),
+        // 等过空位的话，等了多久由尝试链补上（`stamp_queued`）
+        queued_ms: None,
+        skipped: None,
     }
 }
 

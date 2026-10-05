@@ -43,6 +43,7 @@ pub mod seal;
 pub mod sent;
 pub mod server;
 pub mod session;
+pub mod slots;
 pub mod state;
 pub mod translate;
 pub mod wire;

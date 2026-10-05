@@ -2731,6 +2731,8 @@ mod cost_state_tests {
                     error: None,
                     ms: 1,
                     usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 }],
                 ..Default::default()
             })

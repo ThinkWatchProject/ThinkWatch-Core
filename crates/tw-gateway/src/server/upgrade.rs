@@ -102,6 +102,7 @@ pub(super) async fn ws_upgrade(
                 group: None,
                 rewritten_by: Vec::new(),
                 affinity: None,
+                stayed_on: None,
             };
             let (id, ending) = open(&choice, "", tw_api::Billing::PerToken);
             state.bus.emit(super::routed_nowhere(id, choice));
@@ -156,6 +157,7 @@ pub(super) async fn ws_upgrade(
                         group: decision.via_group.clone(),
                         rewritten_by: decision.rewritten_by.clone(),
                         affinity: None,
+                        stayed_on: None,
                     };
                     let Some(rule) = rule else { return Err(why) };
                     tracing::info!(%rule, provider = %c, "a phase-two rule denied the WebSocket upgrade");
@@ -210,6 +212,7 @@ pub(super) async fn ws_upgrade(
         rewritten_by,
         // WebSocket 那条路一条连接跑好几轮，不按对话记
         affinity: None,
+        stayed_on: None,
     };
     // **走代理的上游不代理 WS**，而且要明说。悄悄绕过用户配的代理，
     // 等于把他以为在代理后面的流量直接发出去

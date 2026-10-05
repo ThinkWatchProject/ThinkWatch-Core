@@ -155,6 +155,8 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
                 error: None,
                 ms: 900,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing: tw_api::Billing::PerToken,
         });

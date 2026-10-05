@@ -468,6 +468,9 @@ slug_enum! {
         /// 发给它的名字这把密钥不让用（`allow`）：指定模型、阶段二改的名字一家一个，
         /// 只在试算给了密钥时出现
         NotAllowed = "not_allowed",
+        /// 它的并发数满了（`max_concurrent`）：这一跳没有发出去，换了下一家。只在尝试链里
+        /// 出现（[`AttemptView::skipped`]）
+        Busy = "busy",
     }
 }
 
@@ -1485,6 +1488,14 @@ pub struct AttemptView {
     /// 出来的（请求解不开）没有。别的结果都没有：接下请求的那一跳的用量在结局里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AttemptUsage>,
+    /// 这一跳等了多少毫秒才轮到一个空位：这家设了 `max_concurrent` 而它满着。不算在 `ms`
+    /// 里。没等的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<u64>,
+    /// 这一跳为什么没发出去：`busy`（这家满着，换了下一家；等过它的话 `queued_ms` 是等了
+    /// 多久）。这时 `outcome` 是 `error`，`error` 是同一件事的那句话。发出去了的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<ServeSkip>,
 }
 
 /// 放弃了的一跳（[`AttemptOutcome::SlowStart`]）上游可能已经收了钱的输入。
@@ -1871,6 +1882,8 @@ pub struct FailoverView {
     pub stream_start_wait_secs: u64,
     /// 等过 `stream_start_wait_secs` 还没有内容就换下一家（最后一家照常等）
     pub next_on_slow_start: bool,
+    /// 上游满着（`max_concurrent`）时，一个请求合计最多等多少秒空位。0 是不等
+    pub slot_wait_secs: u64,
 }
 
 /// 每项防护各在哪一档：`off` / `observe` / `enforce`。
@@ -1963,6 +1976,9 @@ pub struct ProviderView {
     pub references: Vec<ReferenceView>,
     /// 选的价目表。空 = 默认价目表
     pub pricing: Option<String>,
+    /// 同时最多发给这家几个请求。不限是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 /// 一行请求头，配置里写的原样。
@@ -2826,6 +2842,9 @@ pub struct ProviderInput {
     /// 按哪张价目表计价。不给就是默认价目表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
+    /// 同时最多发给这家几个请求，1 到 1000。不给就是不限
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
     /// 停用
     #[serde(default)]
     pub disabled: bool,

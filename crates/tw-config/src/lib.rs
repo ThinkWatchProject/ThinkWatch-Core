@@ -189,6 +189,7 @@ impl Default for Provider {
             billing: Billing::PerToken,
             pricing: None,
             model_specs: std::collections::BTreeMap::new(),
+            max_concurrent: None,
             disabled: false,
         }
     }
@@ -822,11 +823,20 @@ pub struct Provider {
     /// 优先于价目表，见 [`model_specs`]。价目表不认识的中转站模型靠它说出上下文窗口
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub model_specs: std::collections::BTreeMap<String, ModelSpec>,
+    /// 同时最多发给这家几个请求，1 到 [`MAX_PROVIDER_CONCURRENCY`]。不写就是不限。
+    ///
+    /// **给限制并发的中转站和账号用**：超出的那个请求到了上游只会被拒。满着的时候，留在
+    /// 这家的对话等它空出来，别的请求换下一家（见 `tw_gateway::slots`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
     /// 停用。**配置原样留着**：不参与路由，它的模型也不出现在
     /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
     #[serde(default, skip_serializing_if = "is_default")]
     pub disabled: bool,
 }
+
+/// 一家上游的并发上限最多写多少
+pub const MAX_PROVIDER_CONCURRENCY: u32 = 1000;
 
 impl Provider {
     /// 这家的这个模型在不在启用范围里（`models_only`）。**不管这家到底
@@ -1176,7 +1186,8 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 }
 
 pub use failover::{
-    Failover, MAX_PAUSE_SECS, MAX_STREAM_START_WAIT_SECS, MIN_SLOW_START_WAIT_SECS,
+    Failover, MAX_PAUSE_SECS, MAX_SLOT_WAIT_SECS, MAX_STREAM_START_WAIT_SECS,
+    MIN_SLOW_START_WAIT_SECS,
 };
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, stand_in, try_parse};

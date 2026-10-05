@@ -308,6 +308,10 @@ pub(crate) struct Choice {
     pub(crate) rewritten_by: Vec<String>,
     /// 这段对话之前的去向起的作用（见 [`crate::affinity`]）
     pub(crate) affinity: Option<tw_api::AffinityView>,
+    /// 这段对话留在的那一家：[`crate::affinity::Affinity::stay`] 把它挪到了候选的头上。
+    /// **它满着时等它空出来**，不像别的候选那样当场跳过 —— 留下就是为了它的缓存（见
+    /// [`crate::slots`]）。没留的是 None
+    pub(crate) stayed_on: Option<String>,
 }
 
 /// 规则做了决定、这个请求却一家上游都不会去时的路由事件：尝试链是空的。
@@ -347,6 +351,34 @@ pub(crate) fn hop(
         error: None,
         ms: started.elapsed().as_millis() as u64,
         usage: None,
+        queued_ms: None,
+        skipped: None,
+    }
+}
+
+/// 这家满着、没发出去的一跳（见 [`crate::slots`]）。`queued_ms`：等过它的话等了多久。
+///
+/// **不是失败**：上游什么都没说，不停用、不进熔断的账，这一行只说明请求为什么去了下一家。
+pub(crate) fn hop_busy(
+    provider: &str,
+    model: Option<String>,
+    limit: usize,
+    queued_ms: Option<u64>,
+    started: std::time::Instant,
+) -> tw_api::AttemptView {
+    tw_api::AttemptView {
+        provider: provider.to_string(),
+        model,
+        outcome: tw_api::AttemptOutcome::Error,
+        status: None,
+        error: Some(msg!(
+            "gw.busy_upstream", upstream = provider, limit = limit =>
+            "Upstream `{upstream}` already has {limit} requests in progress, its max_concurrent."
+        )),
+        ms: started.elapsed().as_millis() as u64,
+        usage: None,
+        queued_ms,
+        skipped: Some(tw_api::ServeSkip::Busy),
     }
 }
 
@@ -365,6 +397,8 @@ pub(crate) fn hop_failed(
         error: Some(error),
         ms: started.elapsed().as_millis() as u64,
         usage: None,
+        queued_ms: None,
+        skipped: None,
     }
 }
 

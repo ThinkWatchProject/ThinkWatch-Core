@@ -345,6 +345,7 @@ Upstreams: the APIs requests are forwarded to.
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`: cost is usage times the price in the upstream's price sheet, subscription accounts included. `free`: cost is recorded as 0. |
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
 | `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
+| `max_concurrent` | integer | — | Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 <!-- /generated -->
 
@@ -368,6 +369,7 @@ providers:
     proxy: office
     models_only: [gpt-4.1*, o3]
     pricing: relay-discount
+    max_concurrent: 4
 
   - name: local
     base_url: http://127.0.0.1:11434/v1
@@ -387,6 +389,15 @@ certain clients, turn on `forward_client_identity`.
 A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude
 and Google subscription sign-ins are not supported; use an API key.
+
+Some relays and accounts accept only a few requests at a time and refuse the
+rest. `max_concurrent` keeps the gateway within that number: a request takes a
+slot on the upstream when it is sent, and gives it back when the answer has
+been passed on in full or the client has gone. When the upstream is full, a
+conversation that stays on it to reuse its prompt cache waits for a slot;
+any other request goes straight to the next upstream. How long a request
+waits is `failover.slot_wait_secs`. Waiting is not a failure: the upstream is
+not set aside. Requests that only count tokens do not take a slot.
 
 #### `providers[].oauth`
 
@@ -941,6 +952,14 @@ failover:
   next_on_slow_start: true
 ```
 
+When upstreams are at their `max_concurrent`, a request waits for a free slot
+for at most `slot_wait_secs` in all. An ongoing conversation waits for the
+upstream it stays on and, if no slot frees in time, moves on to the next one,
+where its cache starts over. A new conversation skips a full upstream at once.
+When every candidate is full, the request waits for whichever frees first; if
+none does, the client gets a 429 with `Retry-After` saying the upstreams are
+busy.
+
 <!-- generated: table failover -->
 <a id="cfg-failover"></a>
 
@@ -954,6 +973,7 @@ failover:
 | `rate_limit_max_pause_secs` | integer | `3600` | A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason. |
 | `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
 | `next_on_slow_start` | bool | `false` | When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5. |
+| `slot_wait_secs` | integer | `30` | Seconds a request waits in total for a free slot on upstreams that are at their `max_concurrent`. After that it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300. |
 <!-- /generated -->
 
 ### `aliases`
@@ -1064,8 +1084,9 @@ group shares out requests by the result in the same way as above.
   last 50 requests within the past 30 minutes. Server errors, rate limits,
   used-up quota or balance, rejected credentials, timeouts and connection
   errors count as failures; errors caused by the request itself do not, and
-  neither does a client that cancels or a switch away from a stream that is
-  slow to start. An upstream that keeps failing keeps a twentieth of its
+  neither does a client that cancels, a switch away from a stream that is
+  slow to start, or an upstream skipped because it is at its
+  `max_concurrent`. An upstream that keeps failing keeps a twentieth of its
   weight, so it still gets the occasional new conversation and its recovery
   is noticed; one that fails outright is set aside by
   [`failover`](#cfg-failover) as before.

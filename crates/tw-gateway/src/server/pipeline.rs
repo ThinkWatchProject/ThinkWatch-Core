@@ -613,6 +613,7 @@ fn route(
                     group: None,
                     rewritten_by: Vec::new(),
                     affinity: None,
+                    stayed_on: None,
                 };
                 return Ok(Routed::Refused(choice, why));
             }
@@ -627,6 +628,7 @@ fn route(
             held_route,
             stayed: None,
         }),
+        stayed_on: None,
     };
     // 每个候选实际要的模型和它的来历：规则改写过的按改写后的算；客户端写的、阶段一改写的
     // 是客户端那一侧的名称（可能是别名），指定的、阶段二改的原样发出。准入看它
@@ -700,6 +702,8 @@ fn route(
             held_route,
             stayed: Some(why),
         });
+        // 留下的那一家在头上。满着时等它，不当场跳过（见 `crate::slots`）
+        choice.stayed_on = decision.candidates.first().cloned();
     }
     // `load-balance` 记账：**记粘性之后排头的那一家**，不是按权重轮到的那一家。一段对话
     // 留在了上次回答它的那一家，这一次就算那一家的；之后的新对话把差的补回去

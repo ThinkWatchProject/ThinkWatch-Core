@@ -33,6 +33,8 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     ZeroConcurrency { name: String },
     #[error("{}", self.msg())]
+    ProviderConcurrency { name: String, value: u32 },
+    #[error("{}", self.msg())]
     Routing(#[from] tw_engine::RouteError),
     #[error("{}", self.msg())]
     NameCollision(String),
@@ -171,6 +173,12 @@ impl ValidationError {
                 "config.zero_concurrency", key = name =>
                 "gateway key `{key}` has max_concurrent: 0, so every request made with it would \
                  wait forever. Leave max_concurrent out for no limit"
+            ),
+            ProviderConcurrency { name, value } => msg!(
+                "config.provider_concurrency_range", upstream = name, value = value,
+                max = crate::MAX_PROVIDER_CONCURRENCY =>
+                "upstream `{upstream}` has max_concurrent: {value}; it has to be between 1 and \
+                 {max}. Leave max_concurrent out for no limit"
             ),
             // 路由那几句本身就说清了是哪条规则、哪个组，前面不用再垫一句
             Routing(e) => e.msg(),
@@ -374,6 +382,16 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 name: p.name.clone(),
                 source,
             })?;
+        // 0 的话发给这家的请求一个都发不出去：留在它上面的对话每次都白等一场，别的请求
+        // 每次都跳过它。不想用它是停用
+        if let Some(n) = p.max_concurrent
+            && !(1..=crate::MAX_PROVIDER_CONCURRENCY).contains(&n)
+        {
+            return Err(ValidationError::ProviderConcurrency {
+                name: p.name.clone(),
+                value: n,
+            });
+        }
         // **空范围不是「全部」，也不是一个合理的「停用」。**两种读法各有
         // 人会当真，而停用有自己的开关
         if let Some(only) = &p.models_only {
@@ -892,6 +910,23 @@ mod tests {
     }
 
     #[test]
+    fn an_upstreams_concurrency_limit_is_between_1_and_1000() {
+        let with = |n: Option<u32>| {
+            let mut prov = p("relay", "https://relay.example");
+            prov.max_concurrent = n;
+            validate(&cfg(vec![c("a", "tw-a")], vec![prov]))
+        };
+        assert!(with(None).is_ok(), "不写是不限");
+        assert!(with(Some(1)).is_ok());
+        assert!(with(Some(crate::MAX_PROVIDER_CONCURRENCY)).is_ok());
+        for bad in [0, crate::MAX_PROVIDER_CONCURRENCY + 1] {
+            let e = with(Some(bad)).unwrap_err();
+            assert_eq!(e.msg().code, "config.provider_concurrency_range", "{e}");
+            assert!(e.to_string().contains("relay"), "{e}");
+        }
+    }
+
+    #[test]
     fn an_empty_model_scope_is_refused_and_points_at_disabling_instead() {
         let mut prov = p("relay", "https://relay.example");
         prov.models_only = Some(vec![]);
@@ -1183,7 +1218,7 @@ groups:
         let base = with_rules(&[], &[]);
         assert!(validate(&base).is_ok());
         type Bend = fn(&mut crate::Failover);
-        let cases: [(&str, Bend); 4] = [
+        let cases: [(&str, Bend); 5] = [
             ("failures_to_pause", |f| f.failures_to_pause = 0),
             ("pause_secs", |f| f.pause_secs = 0),
             ("max_pause_secs", |f| {
@@ -1192,6 +1227,9 @@ groups:
             }),
             ("stream_start_wait_secs", |f| {
                 f.stream_start_wait_secs = crate::MAX_STREAM_START_WAIT_SECS + 1
+            }),
+            ("slot_wait_secs", |f| {
+                f.slot_wait_secs = crate::MAX_SLOT_WAIT_SECS + 1
             }),
         ];
         for (want, bend) in cases {
@@ -1202,6 +1240,10 @@ groups:
                 other => panic!("{want} 该被拒，实际 {other:?}"),
             }
         }
+        // 等空位写 0 是不等，不是写错
+        let mut x = base.clone();
+        x.failover.slot_wait_secs = 0;
+        assert!(validate(&x).is_ok());
     }
 
     /// 开头慢就换下一家：开着时等待至少 5 秒，关着时 1 秒也照收（只是交得早）
@@ -1454,6 +1496,10 @@ mod msg_codes {
             },
             EmptyKey { name: "k".into() },
             ZeroConcurrency { name: "k".into() },
+            ProviderConcurrency {
+                name: "a".into(),
+                value: 0,
+            },
             NameCollision("a".into()),
             BadCidr { entry: "x".into() },
             UnknownPriceSheet {

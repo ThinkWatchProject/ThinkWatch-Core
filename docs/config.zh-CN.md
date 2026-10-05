@@ -254,6 +254,7 @@ clients:
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`：费用为用量乘以所选价目表中的单价，订阅账号同样如此。`free`：费用记为 0。 |
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
 | `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
+| `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 <!-- /generated -->
 
@@ -273,6 +274,7 @@ providers:
     proxy: office
     models_only: [gpt-4.1*, o3]
     pricing: relay-discount
+    max_concurrent: 4
 
   - name: local
     base_url: http://127.0.0.1:11434/v1
@@ -283,6 +285,8 @@ providers:
 每个请求只带请求本身和上游需要的请求头，客户端的其他信息一律不发：凭据和 `headers` 中写的请求头、ThinkWatch 自己的 `User-Agent`，以及客户端请求中该上游协议使用的请求头（Anthropic 为 `anthropic-*`，OpenAI 为 `Idempotency-Key` 和 `X-Client-Request-Id`，Gemini 没有）。客户端自动填写的身份字段（如 Claude Code 的 `metadata.user_id`）从请求体中去掉。只接受特定客户端的上游，打开 `forward_client_identity`。
 
 ChatGPT 账号上游（`protocol: chatgpt`）只接受桌面应用登录得到的凭据，不能手写。不支持 Claude 和 Google 的订阅登录，请使用 API 密钥。
+
+有的中转站和账号同时只接受几个请求，多出来的直接拒绝。`max_concurrent` 让网关守住这个数：请求发出时占用这家的一个位置，回答完整交给客户端、或者客户端断开时归还。这家满了的时候，为复用提示缓存而留在这家的对话等空位，别的请求直接换下一家。最多等多久由 `failover.slot_wait_secs` 决定。等待不算失败，这家不会因此停用。只计算 token 数的请求不占位置。
 
 #### `providers[].oauth`
 
@@ -739,6 +743,11 @@ failover:
   next_on_slow_start: true
 ```
 
+上游的并发数满了（`max_concurrent`）时，一个请求等空位合计最多 `slot_wait_secs`
+秒。进行中的对话等它留在的那一家，到时还没有空位就换下一家，缓存在那边从头建；
+新的对话遇到满着的上游直接跳过。候选全满时，请求等先空出来的那一家；都没有空出来，
+客户端收到 429 和 `Retry-After`，说明上游都忙。
+
 <!-- generated: table failover -->
 <a id="cfg-failover"></a>
 
@@ -752,6 +761,7 @@ failover:
 | `rate_limit_max_pause_secs` | 整数 | `3600` | 被限流的上游按它给的 `Retry-After` 停用，最多这么多秒。没有 `Retry-After` 的按没有说明原因的失败计。 |
 | `stream_start_wait_secs` | 整数 | `15` | 流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。 |
 | `next_on_slow_start` | 布尔 | `false` | 流式回答在请求发出 `stream_start_wait_secs` 秒后仍没有内容时，放弃这家上游，把请求交给下一家。最后一家总是等下去。被放弃的上游不会停用。开启时 `stream_start_wait_secs` 至少为 5。 |
+| `slot_wait_secs` | 整数 | `30` | 上游的并发数满了（`max_concurrent`）时，一个请求等空位合计最多等的秒数。等不到就换下一家；候选全满时回 429。`0`：不等。取值 0 到 300。 |
 <!-- /generated -->
 
 ### `aliases`
@@ -819,7 +829,7 @@ groups:
 
 - `weights`（默认）：只按权重。
 - `latency`：越快的上游分得越多。快慢看典型的首字节时间，与 `url-test` 使用同一份测量。比组内居中者快一倍的上游，权重乘以四；最多乘以十，最少乘以十分之一。
-- `health`：越少失败的上游分得越多。依据是最近 30 分钟内的最近 50 次请求：服务器错误、限流、额度或余额用尽、凭据被拒、超时和连接失败算作失败；请求本身导致的错误不算，客户端取消、因开头太慢而换走也不算。经常失败的上游至少保留权重的二十分之一，仍会偶尔分到新对话，以便发现它已经恢复；完全失败的上游照旧由 [`failover`](#cfg-failover) 暂停。
+- `health`：越少失败的上游分得越多。依据是最近 30 分钟内的最近 50 次请求：服务器错误、限流、额度或余额用尽、凭据被拒、超时和连接失败算作失败；请求本身导致的错误不算，客户端取消、因开头太慢而换走、因并发数满了（`max_concurrent`）而跳过也不算。经常失败的上游至少保留权重的二十分之一，仍会偶尔分到新对话，以便发现它已经恢复；完全失败的上游照旧由 [`failover`](#cfg-failover) 暂停。
 - `latency-health`：两个系数相乘。
 
 测量还不够的上游按中等对待。与只按权重时一样，进行中的对话留在原来的上游，差额由新对话补齐。

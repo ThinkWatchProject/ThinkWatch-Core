@@ -540,3 +540,67 @@ async fn a_request_that_does_not_stream_is_not_switched() {
         [("slow", tw_api::AttemptOutcome::Served)]
     );
 }
+
+/// 放弃的那一家占着的位置（`max_concurrent`，见 `tw_gateway::slots`）**当场**还回去：接下
+/// 请求的那一家还在答，慢的那一家已经空出来了，不等这个请求结束
+#[tokio::test]
+async fn the_slot_of_an_upstream_given_up_on_is_free_at_once() {
+    const CONTENT: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
+    const STOP: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    let slow = upstream(stalled()).await;
+    // 先答上，隔两秒才说完：这两秒里请求还没结束
+    let good = upstream(Script {
+        header_delay_ms: 0,
+        steps: vec![(0, MESSAGE_START), (0, CONTENT), (2_000, STOP)],
+        hang: false,
+    })
+    .await;
+    let cfg = Config {
+        version: 1,
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+            ..Default::default()
+        }],
+        providers: vec![
+            Provider {
+                max_concurrent: Some(1),
+                ..provider("slow", &slow, Protocol::Anthropic)
+            },
+            provider("good", &good, Protocol::Anthropic),
+        ],
+        failover: Failover {
+            stream_start_wait_secs: 1,
+            next_on_slow_start: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let gw = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let asking = tokio::spawn(async move { post(gw, "/v1/messages", &messages(true)).await });
+    // 还在等慢的那一家：它的位置占着
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(slow.hits.load(Ordering::SeqCst), 1);
+    assert!(state.slots.try_take("slow").is_none(), "等着的时候占着位置");
+    // 换到了好的那一家：慢的那一家的位置已经还回来了，这个请求还没结束
+    for _ in 0..60 {
+        if good.hits.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(good.hits.load(Ordering::SeqCst), 1);
+    assert!(!asking.is_finished(), "测的是请求还在进行时");
+    assert!(
+        state.slots.try_take("slow").is_some(),
+        "放弃的那一家的位置要当场还回去"
+    );
+    let (status, text) = asking.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("hello"), "{text}");
+}

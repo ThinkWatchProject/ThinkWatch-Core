@@ -386,6 +386,8 @@ fn routed(hops: &[(&str, Option<&str>)]) -> Option<String> {
             error: None,
             ms: 100,
             usage: None,
+            queued_ms: None,
+            skipped: None,
         })
         .collect();
     Some(

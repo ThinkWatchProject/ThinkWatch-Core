@@ -44,6 +44,7 @@ pub(super) fn respond(
         ledger,
         session,
         refusal,
+        slot,
         ..
     } = served;
     let status =
@@ -160,6 +161,8 @@ pub(super) fn respond(
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
         // 都算这个请求结束了。
         let _live = live;
+        // 在这家占着的位置也一样（见 `crate::slots`）：回答交完、客户端走掉，才轮到下一个
+        let _slot = slot;
         // 结局也一样：流被丢掉的时候，它替流报「客户端取消」。
         let mut ending = ending;
         let mut chunks = std::pin::pin!(chunks);

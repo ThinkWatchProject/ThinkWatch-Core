@@ -471,6 +471,7 @@ fn to_provider(
         // 手写的模型规格不在这个表单里（上游页的模型清单一行一行改，见 `set_model_spec`）：
         // 沿用原来的，改名时跟着这一项走
         model_specs: existing.map(|e| e.model_specs.clone()).unwrap_or_default(),
+        max_concurrent: input.max_concurrent,
         disabled: input.disabled,
     };
     // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时

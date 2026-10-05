@@ -1,4 +1,5 @@
-//! 故障转移：一家上游失败之后停用多久、流开头最多等多久、等不到内容换不换下一家。
+//! 故障转移：一家上游失败之后停用多久、流开头最多等多久、等不到内容换不换下一家、上游
+//! 满着时最多等多久。
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,11 @@ pub struct Failover {
     /// 输出的模型开头本来就慢，开着时要把等待调长
     #[serde(default)]
     pub next_on_slow_start: bool,
+    /// 上游的并发数满了（`providers[].max_concurrent`）时，一个请求最多等多少秒空位，
+    /// **整个请求合起来算**。留在那一家的对话等它空出来，候选都满了时等先空出来的那一家；
+    /// 等不到的换下一家，或者回 429。0 是不等
+    #[serde(default = "d_slot_wait_secs")]
+    pub slot_wait_secs: u64,
 }
 
 fn d_failures_to_pause() -> u32 {
@@ -65,6 +71,9 @@ fn d_rate_limit_max_pause_secs() -> u64 {
 fn d_stream_start_wait_secs() -> u64 {
     15
 }
+fn d_slot_wait_secs() -> u64 {
+    30
+}
 
 impl Default for Failover {
     fn default() -> Self {
@@ -77,6 +86,7 @@ impl Default for Failover {
             rate_limit_max_pause_secs: d_rate_limit_max_pause_secs(),
             stream_start_wait_secs: d_stream_start_wait_secs(),
             next_on_slow_start: false,
+            slot_wait_secs: d_slot_wait_secs(),
         }
     }
 }
@@ -92,10 +102,13 @@ pub const MAX_STREAM_START_WAIT_SECS: u64 = 120;
 /// 切掉了
 pub const MIN_SLOW_START_WAIT_SECS: u64 = 5;
 
+/// 等空位最多写多少秒。等的时候客户端一个字节都收不到，再长的话它先超时了
+pub const MAX_SLOT_WAIT_SECS: u64 = 300;
+
 impl Failover {
     /// 不在允许范围里的第一项：字段名、写的值、下限、上限。
     pub(crate) fn out_of_range(&self) -> Option<(&'static str, u64, u64, u64)> {
-        let fields: [(&'static str, u64, u64, u64); 7] = [
+        let fields: [(&'static str, u64, u64, u64); 8] = [
             (
                 "failures_to_pause",
                 u64::from(self.failures_to_pause),
@@ -128,6 +141,7 @@ impl Failover {
                 1,
                 MAX_STREAM_START_WAIT_SECS,
             ),
+            ("slot_wait_secs", self.slot_wait_secs, 0, MAX_SLOT_WAIT_SECS),
         ];
         fields
             .into_iter()

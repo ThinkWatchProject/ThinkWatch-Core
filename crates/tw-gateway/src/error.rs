@@ -40,7 +40,17 @@ pub enum Source {
     /// 400 的话它当成请求写错了。对外的词表（`x-thinkwatch-error`、`RequestFailed.source`）
     /// 里算 `request`：服务不了的是这个请求要的接口
     NotSupported,
+    /// 能服务这个请求的上游都满着（各自的 `max_concurrent`，见 [`crate::slots`]），等过了
+    /// 也没空出来。**和上游限流一样回 429，另外带 `Retry-After`**：请求本身没问题，过一会儿
+    /// 再来就能发出去 —— 客户端该退避再试，不是放弃。对外的词表里算 `rate_limited`
+    Busy,
 }
+
+/// 上游都满着时告诉客户端过几秒再来（`Retry-After`）。
+///
+/// **不按 `slot_wait_secs` 算**：那么久已经在网关里等过了，再让客户端干等同样久没有意义。
+/// 重试进来照样排队等空位，所以这个数只管客户端别立刻打回来
+pub const BUSY_RETRY_AFTER_SECS: u64 = 5;
 
 impl Source {
     /// `x-thinkwatch-error` 头和 `RequestFailed.source` 共用的词表。
@@ -50,7 +60,7 @@ impl Source {
             Source::Config => "config",
             Source::Upstream => "upstream",
             Source::Request => "request",
-            Source::RateLimited => "rate_limited",
+            Source::RateLimited | Source::Busy => "rate_limited",
             Source::Denied => "denied",
             Source::NotSupported => "request",
         }
@@ -62,7 +72,7 @@ impl Source {
             Source::Upstream => StatusCode::BAD_GATEWAY,
             Source::Request => StatusCode::BAD_REQUEST,
             // 429 而不是 503：客户端至少知道这是限流，可以退避。
-            Source::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Source::RateLimited | Source::Busy => StatusCode::TOO_MANY_REQUESTS,
             Source::Denied => StatusCode::FORBIDDEN,
             Source::NotSupported => StatusCode::NOT_IMPLEMENTED,
         }
@@ -116,6 +126,9 @@ impl GatewayError {
     }
     pub fn rate_limited(detail: Msg) -> Self {
         Self::new(Source::RateLimited, detail)
+    }
+    pub fn busy(detail: Msg) -> Self {
+        Self::new(Source::Busy, detail)
     }
     pub fn denied(detail: Msg) -> Self {
         Self::new(Source::Denied, detail)
@@ -181,6 +194,12 @@ impl IntoResponse for GatewayError {
             "x-thinkwatch-error",
             HeaderValue::from_static(self.source.slug()),
         );
+        if self.source == Source::Busy {
+            h.insert(
+                header::RETRY_AFTER,
+                HeaderValue::from(BUSY_RETRY_AFTER_SECS),
+            );
+        }
         resp
     }
 }
@@ -265,6 +284,22 @@ mod tests {
         let (_, _, json) =
             body_of(GatewayError::upstream(msg!("t.x" => "x")).in_dialect(Dialect::Gemini)).await;
         assert_eq!(json["error"]["status"], "UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn busy_upstreams_are_a_429_that_says_when_to_come_back() {
+        let r = GatewayError::busy(msg!("t.x" => "all busy"))
+            .in_dialect(Dialect::Chat)
+            .into_response();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r.headers()["retry-after"], "5");
+        assert_eq!(r.headers()["x-thinkwatch-error"], "rate_limited");
+        let b = to_bytes(r.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        // 上游自己的限流不带：要等多久由上游说，网关不替它编一个数
+        let r = GatewayError::rate_limited(msg!("t.x" => "slow down")).into_response();
+        assert!(!r.headers().contains_key("retry-after"));
     }
 
     #[test]

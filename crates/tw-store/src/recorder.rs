@@ -848,6 +848,8 @@ mod tests {
                     }),
                     ms: 10_003,
                     usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -857,6 +859,8 @@ mod tests {
                     error: None,
                     ms: 5_042,
                     usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
@@ -902,6 +906,8 @@ mod tests {
                 error: None,
                 ms: 300,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing: tw_api::Billing::PerToken,
         });
@@ -932,6 +938,8 @@ mod tests {
                     error: None,
                     ms: 100,
                     usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -941,6 +949,8 @@ mod tests {
                     error: None,
                     ms: 300,
                     usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
@@ -990,6 +1000,8 @@ mod tests {
                 error: None,
                 ms: 300,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing: tw_api::Billing::PerToken,
         });
@@ -1111,6 +1123,8 @@ mod tests {
                 error: None,
                 ms: 0,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing: tw_api::Billing::PerToken,
         });
@@ -1424,6 +1438,8 @@ mod tests {
                 error: None,
                 ms: 80,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing: tw_api::Billing::Free,
             affinity: None,
@@ -1498,6 +1514,8 @@ mod billing_tests {
                 error: None,
                 ms: 5,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing,
         }
@@ -1586,6 +1604,8 @@ mod billing_tests {
                 error: None,
                 ms: 40,
                 usage: None,
+                queued_ms: None,
+                skipped: None,
             }],
             billing,
         }
@@ -1975,6 +1995,8 @@ mod translation_tests {
                     error: None,
                     ms: 1,
                     usage: None,
+                    queued_ms: None,
+                    skipped: None,
                 })
                 .collect(),
             billing: tw_api::Billing::PerToken,

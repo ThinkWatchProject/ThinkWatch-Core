@@ -136,6 +136,9 @@ pub struct AppState {
     /// 换的话，每改一次配置，排着的请求就会失去位置，而已经在跑的那些的
     /// 通行证会变成孤儿。上限改了由它自己在原地加减（见 `limits`）。
     pub(crate) gate: Arc<crate::limits::Gate>,
+    /// 每家上游自己的并发上限（见 [`crate::slots`]）。**不在 Runtime 里**，理由和 `gate`
+    /// 一样：它握着在跑的请求占着的位置。配置换了由 [`Self::reload`] 在原地改上限
+    pub slots: Arc<crate::slots::Slots>,
     /// 一家上游不在当前运行时里时顶上的 Client（直连，不读系统代理）
     pub http: reqwest::Client,
     /// 观测事件往这里丢。没有订阅者时是零成本的 —— 数据面不该知道有
@@ -256,9 +259,12 @@ impl AppState {
         let rt = Runtime::build(config, None, &plugins)?;
         let health = Arc::new(Health::new());
         health.configure(&rt.config.failover);
+        let slots = Arc::new(crate::slots::Slots::default());
+        slots.configure(&rt.config.providers);
         let state = Self {
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Default::default(),
+            slots,
             http,
             bus: tw_observe::EventBus::new(),
             health,
@@ -476,6 +482,7 @@ impl AppState {
         self.pricing
             .rcu(|book| book.with_config(sheets.clone(), assign.clone()));
         self.health.configure(&next.config.failover);
+        self.slots.configure(&next.config.providers);
         self.rt.store(Arc::new(next));
         self.announce_broken(broken);
         // 模型汇总马上按新配置重算：删掉、停用的上游的模型必须立刻消失（列表
