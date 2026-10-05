@@ -172,6 +172,7 @@ means.
 | `security` | object, [`security`](#cfg-security) | — | The three guards. All of them start in `observe`, so out of the box nothing is changed or refused. |
 | `retention` | object, [`retention`](#cfg-retention) | — | How long request logs are kept. |
 | `failover` | object, [`failover`](#cfg-failover) | — | How long an upstream is set aside after it fails, and how long the start of a stream is awaited. |
+| `aliases` | map of alias → string or list of strings | `{}` | Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias. |
 | `groups` | list of [`groups[]`](#cfg-groups) | `[]` | Strategy groups: several upstreams behind one name, with a way to pick among them. |
 | `routes` | list of [`routes[]`](#cfg-routes) | `[]` | Routes. Without any, requests fail over across all upstreams in the order they are declared. |
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
@@ -962,9 +963,22 @@ order they are declared.
 |---|---|---|---|
 | `name` | string | **required** | Name shown in logs and in the traffic view. |
 | `when` | object, [`routes[].rules[].when`](#cfg-routes-rules-when) | — | Conditions, all of which have to hold. Unset: matches every request. |
-| `to` | string | — | An upstream or a group, by name; `__all__` is every upstream in declared order. Not allowed together with `when.provider_would_be`. |
+| `to` | string, or list of [`routes[].rules[].to[]`](#cfg-routes-rules-to) | — | An upstream or a group, by name; `__all__` is every upstream in declared order. Or pinned models: a list of upstreams with the model to send to each, tried in order. Not allowed together with `when.provider_would_be`. |
 | `set` | object, [`routes[].rules[].set`](#cfg-routes-rules-set) | — | Parameters to rewrite. Collected from every matching rule, not only the first. |
 | `deny` | string | — | Refuse the request with this reason. |
+<!-- /generated -->
+
+#### `routes[].rules[].to`
+
+Pinned models in `to`: each entry is an upstream and the model sent to it, tried in order.
+
+<!-- generated: table routes[].rules[].to[] -->
+<a id="cfg-routes-rules-to"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `provider` | string | **required** | An upstream, by name; not a group. Each upstream appears once in the list. |
+| `model` | string | **required** | The model name sent to that upstream, as written: aliases do not apply, and no `set.model` changes it. Not allowed together with `set.model` in the same rule. |
 <!-- /generated -->
 
 #### `routes[].rules[].when`

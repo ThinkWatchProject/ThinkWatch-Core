@@ -214,6 +214,10 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
+        // 指定模型：这一家要的名字原样发出，规则改写（两个阶段的 `set.model`）盖不过它
+        if let Some(m) = decision.pinned_model(&provider.name) {
+            effective_set.model = Some(m.to_string());
+        }
         // 这一跳要发的模型名：规则改写过的是改写之后的
         let sent = effective_set
             .model

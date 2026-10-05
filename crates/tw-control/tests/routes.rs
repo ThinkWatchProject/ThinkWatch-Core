@@ -457,7 +457,7 @@ async fn changing_the_default_keeps_the_synthesised_one_as_an_ordinary_route() {
         .iter()
         .find(|r| r.name == "default")
         .expect("「默认」留下来");
-    assert_eq!(kept.rules[0].to.as_deref(), Some("__all__"));
+    assert_eq!(kept.rules[0].to, Some("__all__".into()));
 
     // 换回来：默认值不写进文件
     let (st, v) = call(
@@ -503,7 +503,7 @@ async fn renaming_a_group_moves_the_rules_that_forward_to_it() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let cfg = b.parsed();
-    assert_eq!(cfg.routes[0].rules[1].to.as_deref(), Some("主力组"));
+    assert_eq!(cfg.routes[0].rules[1].to, Some("主力组".into()));
     assert_eq!(cfg.groups[0].selected.as_deref(), Some("中转"));
 }
 

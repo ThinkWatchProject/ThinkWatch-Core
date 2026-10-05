@@ -106,6 +106,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `security` | 对象，见 [`security`](#cfg-security) | — | 三项防护。出厂时都处在 `observe`，不改变、不拒绝任何请求。 |
 | `retention` | 对象，见 [`retention`](#cfg-retention) | — | 请求日志保留多久。 |
 | `failover` | 对象，见 [`failover`](#cfg-failover) | — | 上游失败后停用多久，以及流式回答的开头最多等多久。 |
+| `aliases` | 映射： 别名 → 字符串或字符串列表 | `{}` | 模型别名：同一个模型在各上游的名称合用一个名字，按顺序列出各上游的名称。请求别名时，提供其中任一名称的上游都能服务，发给它的是列表中它提供的第一个名称。别名不能列出别的别名。 |
 | `groups` | 对象列表，见 [`groups[]`](#cfg-groups) | `[]` | 策略组：多个上游合用一个名字，并规定如何在其中选择。 |
 | `routes` | 对象列表，见 [`routes[]`](#cfg-routes) | `[]` | 路由。一条都不写时，请求按上游的声明顺序故障转移。 |
 | `default_route` | 字符串 | — | 未指定路由的密钥走哪条路由。不写：名为 `default` 的路由；没有这条路由时走内置的故障转移。 |
@@ -756,9 +757,22 @@ security:
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和流量详情中显示的名字。 |
 | `when` | 对象，见 [`routes[].rules[].when`](#cfg-routes-rules-when) | — | 条件，须全部满足。不写：匹配所有请求。 |
-| `to` | 字符串 | — | 上游或策略组的名字；`__all__` 表示按声明顺序的全部上游。不能与 `when.provider_would_be` 同时写。 |
+| `to` | 字符串，或对象列表，见 [`routes[].rules[].to[]`](#cfg-routes-rules-to) | — | 上游或策略组的名字；`__all__` 表示按声明顺序的全部上游。也可以指定模型：列出上游及发给它的模型，按顺序备用。不能与 `when.provider_would_be` 同时写。 |
 | `set` | 对象，见 [`routes[].rules[].set`](#cfg-routes-rules-set) | — | 改写请求参数。从所有匹配的规则累积，不只第一条。 |
 | `deny` | 字符串 | — | 以这句原因拒绝请求。 |
+<!-- /generated -->
+
+#### `routes[].rules[].to`
+
+`to` 指定模型时，每一项是一个上游和发给它的模型，按顺序备用。
+
+<!-- generated: table routes[].rules[].to[] -->
+<a id="cfg-routes-rules-to"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `provider` | 字符串 | **必填** | 上游的名字，不能是策略组。同一个上游在列表中只出现一次。 |
+| `model` | 字符串 | **必填** | 发给这个上游的模型名，原样发出：不经过别名，也不受 `set.model` 改写。同一条规则里不能再写 `set.model`。 |
 <!-- /generated -->
 
 #### `routes[].rules[].when`

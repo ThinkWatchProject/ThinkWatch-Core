@@ -204,17 +204,115 @@ pub struct Rule {
     #[serde(default, skip_serializing_if = "When::is_catch_all")]
     pub when: When,
     /// **可以直接指 provider，不需要先建组**（层 1）。大多数分流
-    /// 需求到这一层就解决了，不必引入策略组这个概念。
+    /// 需求到这一层就解决了，不必引入策略组这个概念。也可以指定模型：
+    /// 「上游 + 模型」的列表，见 [`Target`]。
     ///
     /// 阶段二的规则（含 `provider_would_be`）**不允许写它** —— 那会成环。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+    pub to: Option<Target>,
     /// 改写请求参数。**从所有命中的规则累积**，不只是第一条。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<SetAction>,
     /// 直接拒绝，带一句给客户端看的原因。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
+}
+
+/// 规则转发到哪里。
+///
+/// ```yaml
+/// to: 官方                      # 上游或策略组的名字；__all__ 是全部上游
+/// to:                           # 指定模型：按顺序备用
+///   - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+///   - { provider: anthropic, model: claude-opus-5 }
+/// ```
+///
+/// **指定模型的模型名原样发出**：不经过别名表，阶段二的改写和 `set.model` 都改不动它
+/// —— 写下的就是那一家收到的。候选就是列出来的上游，按列表顺序故障转移，不经过策略组
+/// 排序。
+///
+/// 读的时候一个字符串是名字、一个列表是指定模型（和 serde 的 untagged 同一种写法），
+/// 只是手写了反序列化：untagged 对写错的地方只会说「哪一种都不像」，而 `modle` 这种
+/// 拼错要说出是哪个字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Target {
+    /// 上游或策略组的名字
+    Name(String),
+    /// 指定模型：「上游 + 模型」，按顺序备用
+    Models(Vec<Pinned>),
+}
+
+/// 指定模型里的一项：发给哪一家、发什么模型名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pinned {
+    pub provider: String,
+    pub model: String,
+}
+
+impl Target {
+    /// 上游或策略组的名字。指定模型时是 `None`
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Target::Name(n) => Some(n),
+            Target::Models(_) => None,
+        }
+    }
+
+    /// 指定的模型。去向是名字时是 `None`
+    pub fn pinned(&self) -> Option<&[Pinned]> {
+        match self {
+            Target::Name(_) => None,
+            Target::Models(m) => Some(m),
+        }
+    }
+
+    /// 这个去向用到了上游 `provider`：就是它的名字，或者指定模型里有它
+    pub fn mentions_provider(&self, provider: &str) -> bool {
+        match self {
+            Target::Name(n) => n == provider,
+            Target::Models(m) => m.iter().any(|p| p.provider == provider),
+        }
+    }
+}
+
+impl From<&str> for Target {
+    fn from(name: &str) -> Self {
+        Target::Name(name.to_string())
+    }
+}
+
+impl From<String> for Target {
+    fn from(name: String) -> Self {
+        Target::Name(name)
+    }
+}
+
+impl<'de> Deserialize<'de> for Target {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Target;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "the name of an upstream or a group, or a list of {provider, model} entries",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Target, E> {
+                Ok(Target::Name(v.to_string()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Target, E> {
+                Ok(Target::Name(v))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Target, A::Error> {
+                // 列表里每一项照 `Pinned` 自己的规矩读：写错的字段名由 serde 说出来
+                Vec::<Pinned>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(Target::Models)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 impl Rule {
@@ -353,6 +451,22 @@ pub struct Decision {
     /// 用户头一个要问的就是哪条规则干的；一条改写规则从来没命中过（条件写错了），
     /// 也只有这样数得出来
     pub rewritten_by: Vec<String>,
+    /// 指定模型：每个候选要的模型，按规则里列的顺序（就是 `candidates` 起初的顺序）。
+    /// 去向是上游或策略组的名字时是空的。
+    ///
+    /// **按上游名查，不按下标对**（[`Decision::pinned_model`]）：候选之后会被筛掉、
+    /// 被会话粘性挪到前面，和这张表的下标早就对不上了。
+    pub pinned: Vec<Pinned>,
+}
+
+impl Decision {
+    /// 指定模型时这一家要发的模型名，原样发出。不是指定模型、或者没有这一家时是 `None`
+    pub fn pinned_model(&self, provider: &str) -> Option<&str> {
+        self.pinned
+            .iter()
+            .find(|p| p.provider == provider)
+            .map(|p| p.model.as_str())
+    }
 }
 
 /// 阶段一结束时可能是「不让干」。
@@ -405,6 +519,18 @@ pub enum RouteError {
     UnknownDefaultRoute(String),
     #[error("{}", self.msg())]
     UnknownRoute { client: String, route: String },
+    #[error("{}", self.msg())]
+    PinnedEmpty(String),
+    #[error("{}", self.msg())]
+    PinnedUnknownProvider { rule: String, provider: String },
+    #[error("{}", self.msg())]
+    PinnedDuplicateProvider { rule: String, provider: String },
+    #[error("{}", self.msg())]
+    PinnedBlankModel { rule: String, provider: String },
+    #[error("{}", self.msg())]
+    PinnedWithProviderWouldBe(String),
+    #[error("{}", self.msg())]
+    PinnedWithSetModel(String),
     #[error(transparent)]
     Match(#[from] MatchError),
 }
@@ -453,10 +579,43 @@ impl RouteError {
                 "engine.unknown_route", key = client, route = route =>
                 "gateway key `{key}` binds to route `{route}`, which does not exist"
             ),
+            RouteError::PinnedEmpty(rule) => msg!(
+                "engine.pinned_empty", rule = rule =>
+                "rule `{rule}` pins models, and the list is empty. List at least one upstream \
+                 and model, or forward to an upstream or a group"
+            ),
+            RouteError::PinnedUnknownProvider { rule, provider } => msg!(
+                "engine.pinned_unknown_provider", rule = rule, upstream = provider =>
+                "rule `{rule}` pins a model on `{upstream}`, which is not an upstream. A pinned \
+                 model names an upstream, not a group"
+            ),
+            RouteError::PinnedDuplicateProvider { rule, provider } => msg!(
+                "engine.pinned_duplicate_provider", rule = rule, upstream = provider =>
+                "rule `{rule}` pins models on upstream `{upstream}` twice. Each upstream appears \
+                 once in the list"
+            ),
+            RouteError::PinnedBlankModel { rule, provider } => msg!(
+                "engine.pinned_blank_model", rule = rule, upstream = provider =>
+                "rule `{rule}` pins an empty model name on upstream `{upstream}`"
+            ),
+            RouteError::PinnedWithProviderWouldBe(rule) => msg!(
+                "engine.pinned_with_provider_would_be", rule = rule =>
+                "rule `{rule}` pins models and also tests provider_would_be. provider_would_be is \
+                 evaluated once an upstream is chosen, and the pinned list already chooses the \
+                 upstreams"
+            ),
+            RouteError::PinnedWithSetModel(rule) => msg!(
+                "engine.pinned_with_set_model", rule = rule =>
+                "rule `{rule}` pins models and also sets the model. A pinned model is sent as \
+                 written, so set.model would do nothing; remove one of them"
+            ),
             RouteError::Match(e) => e.msg(),
         }
     }
 }
+
+/// 规则的去向解出来的样子：候选、经过的策略组、指定的模型（见 [`Decision`]）。
+type Resolved = (Vec<String>, Option<String>, Vec<Pinned>);
 
 pub struct Engine {
     sets: Vec<RouteSet>,
@@ -523,7 +682,7 @@ impl Engine {
             let fallback = Rule {
                 name: CATCH_ALL_RULE.to_string(),
                 when: When::default(),
-                to: Some(ALL_UPSTREAMS.to_string()),
+                to: Some(Target::Name(ALL_UPSTREAMS.to_string())),
                 set: None,
                 deny: None,
             };
@@ -638,6 +797,11 @@ impl Engine {
     pub fn check_rules(&self, rules: &[Rule]) -> Result<(), RouteError> {
         for r in rules {
             r.when.validate()?;
+            // 指定模型的几条单独说：它和阶段二、和 `set.model` 同用时，泛泛的那句
+            // 说不清为什么不行
+            if let Some(pinned) = r.to.as_ref().and_then(Target::pinned) {
+                self.check_pinned(r, pinned)?;
+            }
             // **这条禁令是必需的**：允许阶段二的规则写 `to`，求值就直接
             // 成环了。在校验阶段挡下来，而不是在运行时。
             if r.when.is_phase_two() && r.to.is_some() {
@@ -648,6 +812,45 @@ impl Engine {
             }
             if r.to.is_some() {
                 self.resolve_target(r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 指定模型写得对不对：不空、每一家是存在的上游且只出现一次、模型名不空；
+    /// 不和 `provider_would_be`、`set.model` 同用。
+    fn check_pinned(&self, r: &Rule, pinned: &[Pinned]) -> Result<(), RouteError> {
+        if r.when.is_phase_two() {
+            return Err(RouteError::PinnedWithProviderWouldBe(r.name.clone()));
+        }
+        if r.set.as_ref().is_some_and(|s| s.model.is_some()) {
+            return Err(RouteError::PinnedWithSetModel(r.name.clone()));
+        }
+        if pinned.is_empty() {
+            return Err(RouteError::PinnedEmpty(r.name.clone()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for p in pinned {
+            // **只认上游，不认策略组**：组里挑哪一家由策略定，而指定模型说的是
+            // 「这一家发这个名字」
+            if !self.providers.contains(&p.provider) {
+                return Err(RouteError::PinnedUnknownProvider {
+                    rule: r.name.clone(),
+                    provider: p.provider.clone(),
+                });
+            }
+            // 同一家写两次：候选按上游名排，第二次永远轮不到
+            if !seen.insert(p.provider.as_str()) {
+                return Err(RouteError::PinnedDuplicateProvider {
+                    rule: r.name.clone(),
+                    provider: p.provider.clone(),
+                });
+            }
+            if p.model.trim().is_empty() {
+                return Err(RouteError::PinnedBlankModel {
+                    rule: r.name.clone(),
+                    provider: p.provider.clone(),
+                });
             }
         }
         Ok(())
@@ -696,13 +899,14 @@ impl Engine {
                 reason: reason.clone(),
             });
         }
-        let (candidates, via_group) = self.resolve_target(r)?;
+        let (candidates, via_group, pinned) = self.resolve_target(r)?;
         Ok(Outcome::Route(Decision {
             candidates,
             matched_rule: r.name.clone(),
             via_group,
             set,
             rewritten_by,
+            pinned,
         }))
     }
 
@@ -758,6 +962,8 @@ impl Engine {
     ///
     /// 阶段二拒绝或求不了值时按阶段一算：那一跳本来就发不出去，尝试那一步会
     /// 报出来。请求里读不出模型时一律是空的 —— 请求体都解不开，改写也写不进去。
+    ///
+    /// **指定模型的候选要的就是指定的那个**，规则改写盖不过它。
     pub fn models_asked(
         &self,
         rules: &[Rule],
@@ -769,6 +975,8 @@ impl Engine {
             .map(|c| {
                 let model = if facts.model.is_empty() {
                     String::new()
+                } else if let Some(m) = d.pinned_model(c) {
+                    m.to_string()
                 } else {
                     let set = match self.phase_two_with(rules, facts, c, &d.set) {
                         Ok(Outcome2::Proceed { set, .. }) => set.model,
@@ -781,17 +989,25 @@ impl Engine {
             .collect()
     }
 
-    fn resolve_target(&self, r: &Rule) -> Result<(Vec<String>, Option<String>), RouteError> {
-        let Some(to) = &r.to else {
-            return Ok((Vec::new(), None));
+    /// 规则的去向 → 候选、经过的策略组、指定的模型。
+    fn resolve_target(&self, r: &Rule) -> Result<Resolved, RouteError> {
+        let to = match &r.to {
+            None => return Ok((Vec::new(), None, Vec::new())),
+            // 指定模型：候选就是列出来的上游，按列表的顺序。**不经过策略组**，
+            // 所以也不按策略排序
+            Some(Target::Models(pinned)) => {
+                let candidates = pinned.iter().map(|p| p.provider.clone()).collect();
+                return Ok((candidates, None, pinned.clone()));
+            }
+            Some(Target::Name(to)) => to,
         };
         // provider 优先于组。同名时按 provider 解释 —— 而校验会挡住
         // 同名的情况，所以这个优先级实际上不会被用到。
         if self.providers.iter().any(|p| p == to) {
-            return Ok((vec![to.clone()], None));
+            return Ok((vec![to.clone()], None, Vec::new()));
         }
         if let Some(g) = self.groups.iter().find(|g| g.name == *to) {
-            return Ok((self.expand_group(g), Some(g.name.clone())));
+            return Ok((self.expand_group(g), Some(g.name.clone()), Vec::new()));
         }
         Err(RouteError::UnknownTarget {
             rule: r.name.clone(),
@@ -1234,7 +1450,7 @@ mod tests {
         Rule {
             name: name.into(),
             when: serde_yaml_ng::from_str(when_yaml).unwrap(),
-            to: to.map(String::from),
+            to: to.map(Target::from),
             set,
             deny: deny.map(String::from),
         }
@@ -1873,6 +2089,179 @@ mod builtin_tests {
 }
 
 #[cfg(test)]
+mod pinned_tests {
+    use super::*;
+
+    fn rule(yaml: &str) -> Rule {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    fn engine(rules: Vec<Rule>) -> Engine {
+        Engine::with_default_rules(
+            vec!["bedrock".into(), "anthropic".into(), "relay".into()],
+            vec![Group {
+                name: "pool".into(),
+                kind: GroupType::LoadBalance,
+                providers: vec!["relay".into(), "anthropic".into()],
+                selected: None,
+            }],
+            rules,
+        )
+    }
+
+    fn facts(model: &str) -> RequestFacts {
+        RequestFacts {
+            model: model.into(),
+            client: "claude-code".into(),
+            dialect: "anthropic".into(),
+            ..Default::default()
+        }
+    }
+
+    const PINNED: &str = "name: Opus 走 Bedrock
+when: { model: claude-opus-5 }
+to:
+  - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+  - { provider: anthropic, model: claude-opus-5 }
+";
+
+    /// 一个字符串是名字，一个列表是指定模型；写回去还是原来的样子
+    #[test]
+    fn a_target_reads_and_writes_both_forms() {
+        let named = rule("{name: r, to: __all__}");
+        assert_eq!(named.to, Some(Target::Name("__all__".into())));
+        let pinned = rule(PINNED);
+        assert_eq!(
+            pinned.to,
+            Some(Target::Models(vec![
+                Pinned {
+                    provider: "bedrock".into(),
+                    model: "us.anthropic.claude-opus-5-v1:0".into(),
+                },
+                Pinned {
+                    provider: "anthropic".into(),
+                    model: "claude-opus-5".into(),
+                },
+            ]))
+        );
+        for r in [named, pinned] {
+            let yaml = serde_yaml_ng::to_string(&r).unwrap();
+            let back: Rule = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(back.to, r.to, "{yaml}");
+            // 界面那边是 JSON，同一种写法
+            let json = serde_json::to_value(&r.to).unwrap();
+            let back: Option<Target> = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back, r.to, "{json}");
+        }
+        assert_eq!(
+            serde_json::to_value(Target::from("官方")).unwrap(),
+            serde_json::json!("官方")
+        );
+        assert_eq!(
+            serde_json::to_value(&rule(PINNED).to).unwrap(),
+            serde_json::json!([
+                {"provider": "bedrock", "model": "us.anthropic.claude-opus-5-v1:0"},
+                {"provider": "anthropic", "model": "claude-opus-5"},
+            ])
+        );
+    }
+
+    /// 拼错的字段要说出是哪个，而不是「哪一种都不像」
+    #[test]
+    fn a_typo_in_a_pinned_entry_names_the_field() {
+        let e =
+            serde_yaml_ng::from_str::<Rule>("name: r\nto:\n  - { provider: bedrock, modle: x }\n")
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("modle"), "{e}");
+        assert!(e.contains("model"), "没说对的写法：{e}");
+        let e = serde_yaml_ng::from_str::<Rule>("name: r\nto: { provider: a, model: m }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("list of {provider, model}"), "{e}");
+    }
+
+    /// 候选就是列出来的上游，按列表顺序；每一家要的就是指定的那个，规则改写盖不过它
+    #[test]
+    fn pinned_models_are_the_candidates_in_order_and_are_asked_as_written() {
+        let rewrite = rule("{name: 改名, set: {model: claude-sonnet-5}}");
+        let later = rule("{name: 阶段二, when: {provider_would_be: anthropic}, set: {model: x}}");
+        let rules = vec![rewrite, rule(PINNED), rule("{name: 兜底, to: pool}"), later];
+        let e = engine(rules.clone());
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+        let Outcome::Route(d) = e.route(&facts("claude-opus-5")).unwrap() else {
+            panic!("该路由");
+        };
+        assert_eq!(d.candidates, ["bedrock", "anthropic"]);
+        assert_eq!(d.via_group, None, "指定模型不经过策略组");
+        assert_eq!(
+            d.pinned_model("bedrock"),
+            Some("us.anthropic.claude-opus-5-v1:0")
+        );
+        assert_eq!(d.pinned_model("relay"), None);
+        assert_eq!(
+            e.models_asked(&rules, &facts("claude-opus-5"), &d),
+            [
+                (
+                    "bedrock".to_string(),
+                    "us.anthropic.claude-opus-5-v1:0".to_string()
+                ),
+                ("anthropic".to_string(), "claude-opus-5".to_string()),
+            ]
+        );
+        // 别的模型照旧走组
+        let Outcome::Route(d) = e.route(&facts("claude-sonnet-5")).unwrap() else {
+            panic!("该路由");
+        };
+        assert!(d.pinned.is_empty());
+        assert_eq!(d.via_group.as_deref(), Some("pool"));
+        assert_eq!(d.pinned_model("relay"), None);
+    }
+
+    #[test]
+    fn a_pinned_list_is_checked_where_it_is_written() {
+        let check = |yaml: &str| engine(vec![rule(yaml)]).validate();
+        assert_eq!(
+            check("{name: r, to: []}"),
+            Err(RouteError::PinnedEmpty("r".into()))
+        );
+        assert_eq!(
+            check("{name: r, to: [{provider: pool, model: m}]}"),
+            Err(RouteError::PinnedUnknownProvider {
+                rule: "r".into(),
+                provider: "pool".into()
+            }),
+            "组不是上游"
+        );
+        assert_eq!(
+            check("{name: r, to: [{provider: relay, model: a}, {provider: relay, model: b}]}"),
+            Err(RouteError::PinnedDuplicateProvider {
+                rule: "r".into(),
+                provider: "relay".into()
+            })
+        );
+        assert_eq!(
+            check("{name: r, to: [{provider: relay, model: ' '}]}"),
+            Err(RouteError::PinnedBlankModel {
+                rule: "r".into(),
+                provider: "relay".into()
+            })
+        );
+        assert_eq!(
+            check("{name: r, when: {provider_would_be: relay}, to: [{provider: relay, model: m}]}"),
+            Err(RouteError::PinnedWithProviderWouldBe("r".into()))
+        );
+        assert_eq!(
+            check("{name: r, set: {model: x}, to: [{provider: relay, model: m}]}"),
+            Err(RouteError::PinnedWithSetModel("r".into()))
+        );
+        assert!(
+            check("{name: r, set: {max_tokens: 10}, to: [{provider: relay, model: m}]}").is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
 mod msg_codes {
     use super::*;
     use crate::num::ParseError;
@@ -1901,6 +2290,21 @@ mod msg_codes {
                 client: "k".into(),
                 route: "x".into(),
             },
+            RouteError::PinnedEmpty("r".into()),
+            RouteError::PinnedUnknownProvider {
+                rule: "r".into(),
+                provider: "p".into(),
+            },
+            RouteError::PinnedDuplicateProvider {
+                rule: "r".into(),
+                provider: "p".into(),
+            },
+            RouteError::PinnedBlankModel {
+                rule: "r".into(),
+                provider: "p".into(),
+            },
+            RouteError::PinnedWithProviderWouldBe("r".into()),
+            RouteError::PinnedWithSetModel("r".into()),
             bad(ParseError::Empty),
             bad(ParseError::NoOperator("200k".into())),
             bad(ParseError::BadNumber(">x".into())),

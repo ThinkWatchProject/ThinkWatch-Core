@@ -262,7 +262,7 @@ pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Res
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .map(str::to_string);
+        .map(tw_engine::Target::from);
     let deny = match input.deny.as_deref().map(str::trim) {
         Some("") => {
             return Err(msg!(
@@ -635,7 +635,8 @@ pub(crate) fn rule_view(r: &Rule, n: tw_engine::RuleNotes) -> tw_api::RuleView {
     tw_api::RuleView {
         name: r.name.clone(),
         conditions: crate::describe_when(&r.when),
-        to: r.to.clone(),
+        // 指定模型在这一版的视图里还没有写法（协议 38 起 `to` 才能是列表），先不给
+        to: r.to.as_ref().and_then(|t| t.name()).map(str::to_string),
         deny: r.deny.clone(),
         set: r
             .set

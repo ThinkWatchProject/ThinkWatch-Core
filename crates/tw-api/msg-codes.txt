@@ -3,6 +3,14 @@
 # A second column marks codes a UI does not translate:
 #   passthrough  the sentence is only placeholders (system or upstream text); show `text`
 #   test         only produced by tests; never reaches a UI
+config.alias_blank_model
+config.alias_chained
+config.alias_duplicate
+config.alias_empty_name
+config.alias_no_models
+config.alias_only_itself
+config.alias_reserved
+config.alias_wildcard
 config.aws_profile.no_home
 config.aws_profile.no_keys
 config.aws_profile.not_found
@@ -224,6 +232,12 @@ engine.empty_group
 engine.no_action
 engine.no_match
 engine.phase_two_with_to
+engine.pinned_blank_model
+engine.pinned_duplicate_provider
+engine.pinned_empty
+engine.pinned_unknown_provider
+engine.pinned_with_provider_would_be
+engine.pinned_with_set_model
 engine.unknown_default_route
 engine.unknown_route
 engine.unknown_target

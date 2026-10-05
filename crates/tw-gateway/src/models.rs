@@ -632,6 +632,34 @@ pub fn fit(catalog: &tw_engine::Catalog, p: &tw_config::Provider, model: &str) -
     }
 }
 
+/// 发给上游 `p` 时，客户端说的 `name` 叫什么。`None` = 这家服务不了这个别名。
+///
+/// - `name` 是别名：按列表顺序取第一个**这家能服务**的名称 —— 在它的启用范围里
+///   （`models_only`），清单里也没说没有（没有清单的上游当作有，取第一个在启用
+///   范围里的）。一个都没有就是 `None`。
+/// - 不是别名：就是 `name` 本身。这家有没有它不在这里判断，那是 [`fit`] 的事。
+///
+/// **别名优先**：`name` 是别名时，这家恰好有一个同名的真模型、却没列进别名，
+/// 也不发这个名字给它。
+///
+/// **不看停用**，和 [`fit`] 一样：停用是路由的事。指定模型（规则的 `to` 列出的
+/// 「上游 + 模型」）不经过这里，那个名字原样发出。
+pub fn resolve(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    p: &tw_config::Provider,
+    name: &str,
+) -> Option<String> {
+    let Some(alias) = cfg.aliases.find(name) else {
+        return Some(name.to_string());
+    };
+    alias
+        .models
+        .iter()
+        .find(|m| p.uses_model(m) && catalog.offers(&p.name, m) != Some(false))
+        .cloned()
+}
+
 /// 在路由选出的候选里去掉服务不了这个请求的上游。
 ///
 /// `asked` 是每个候选和它要的模型（[`tw_engine::Engine::models_asked`]）：
@@ -741,6 +769,75 @@ mod tests {
         c.providers.remove(0);
         d.reconcile(&c);
         assert!(d.lock().get("a").is_none());
+    }
+
+    /// 别名对到每一家：按列表顺序取它能服务的第一个名称；范围外的、清单里没有的跳过；
+    /// 没有清单的当作有。不是别名的就是它自己
+    #[test]
+    fn an_alias_resolves_to_the_first_listed_name_each_upstream_can_serve() {
+        let mut c = cfg(vec![
+            provider("bedrock"),
+            provider("anthropic"),
+            provider("relay"),
+            provider("no-list"),
+            provider("scoped"),
+        ]);
+        c.providers[4].models_only = Some(vec!["anthropic/*".into()]);
+        c.aliases = serde_yaml_ng::from_str(
+            "claude-sonnet-5: [claude-sonnet-5, us.anthropic.claude-sonnet-5-v1:0, anthropic/claude-sonnet-5]\n\
+             gpt-x: gpt-x-2026\n",
+        )
+        .unwrap();
+        let catalog = tw_engine::Catalog::build(&[
+            listed(
+                "bedrock",
+                &["us.anthropic.claude-sonnet-5-v1:0", "claude-sonnet-5"],
+            ),
+            listed("anthropic", &["claude-sonnet-5"]),
+            // 有同名的真模型，但只有它没列进别名的那个名字
+            listed("relay", &["gpt-x", "anthropic/claude-sonnet-5"]),
+            tw_engine::ProviderModels {
+                provider: "no-list".into(),
+                protocol: "anthropic".into(),
+                known: false,
+                models: Vec::new(),
+            },
+            tw_engine::ProviderModels {
+                provider: "scoped".into(),
+                protocol: "anthropic".into(),
+                known: false,
+                models: Vec::new(),
+            },
+        ]);
+        let r = |p: usize, name: &str| resolve(&c, &catalog, &c.providers[p], name);
+        // 按列表顺序：bedrock 两个都有，取排在前面的那个
+        assert_eq!(r(0, "claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(r(1, "claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            r(2, "claude-sonnet-5").as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        // 没有清单：当作有，取第一个
+        assert_eq!(r(3, "claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        // 没有清单、有启用范围：取第一个在范围里的
+        assert_eq!(
+            r(4, "claude-sonnet-5").as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        // 别名优先：relay 有个叫 gpt-x 的真模型，没列进别名，不发给它
+        assert_eq!(r(2, "gpt-x"), None);
+        assert_eq!(r(1, "gpt-x"), None);
+        // 不是别名：原样，有没有交给 `fit`
+        assert_eq!(r(1, "claude-opus-5").as_deref(), Some("claude-opus-5"));
+    }
+
+    fn listed(p: &str, models: &[&str]) -> tw_engine::ProviderModels {
+        tw_engine::ProviderModels {
+            provider: p.into(),
+            protocol: "anthropic".into(),
+            known: true,
+            models: models.iter().map(|m| m.to_string()).collect(),
+        }
     }
 
     #[test]

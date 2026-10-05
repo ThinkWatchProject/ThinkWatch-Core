@@ -6,6 +6,7 @@
 //! 所有引用它的地方在同一个版本里一起变。
 
 use serde_yaml_ng::Value;
+use tw_engine::Target;
 use tw_engine::rule::OneOrMany;
 use tw_yaml::Step;
 
@@ -28,7 +29,8 @@ pub fn provider_refs(cfg: &Config, name: &str) -> Vec<ProviderRef> {
     let mut out = Vec::new();
     for route in &cfg.routes {
         for rule in &route.rules {
-            if rule.to.as_deref() == Some(name) {
+            // 转发给它，或者指定了它的模型
+            if rule.to.as_ref().is_some_and(|t| t.mentions_provider(name)) {
                 out.push(ProviderRef::RuleTarget {
                     route: route.name.clone(),
                     rule: rule.name.clone(),
@@ -108,10 +110,21 @@ pub fn rename_provider(
                 Step::key("rules"),
                 Step::Index(i),
             ];
-            if rule.to.as_deref() == Some(old) {
-                let mut p = base.to_vec();
-                p.push(Step::key("to"));
-                out = edit::set(&out, &p, Some(&s(new)))?;
+            match &rule.to {
+                Some(Target::Name(to)) if to == old => {
+                    let mut p = base.to_vec();
+                    p.push(Step::key("to"));
+                    out = edit::set(&out, &p, Some(&s(new)))?;
+                }
+                // 指定模型：只改那一项的 `provider`，模型名和别的项原样不动
+                Some(Target::Models(pinned)) => {
+                    for (k, _) in pinned.iter().enumerate().filter(|(_, x)| x.provider == old) {
+                        let mut p = base.to_vec();
+                        p.extend([Step::key("to"), Step::Index(k), Step::key("provider")]);
+                        out = edit::set(&out, &p, Some(&s(new)))?;
+                    }
+                }
+                _ => {}
             }
             if let Some(pw) = &rule.when.provider_would_be
                 && pw.contains(old)
@@ -168,7 +181,7 @@ pub fn group_refs(cfg: &Config, name: &str) -> Vec<RuleRef> {
             route
                 .rules
                 .iter()
-                .filter(|rule| rule.to.as_deref() == Some(name))
+                .filter(|rule| rule.to.as_ref().and_then(Target::name) == Some(name))
                 .map(|rule| RuleRef {
                     route: route.name.clone(),
                     rule: rule.name.clone(),
@@ -274,7 +287,7 @@ pub fn rename_group(text: &str, cfg: &Config, old: &str, new: &str) -> Result<St
     let mut out = text.to_string();
     for (r, route) in cfg.routes.iter().enumerate() {
         for (i, rule) in route.rules.iter().enumerate() {
-            if rule.to.as_deref() == Some(old) {
+            if rule.to.as_ref().and_then(Target::name) == Some(old) {
                 out = edit::set(
                     &out,
                     &[
@@ -394,6 +407,54 @@ routes:
         assert!(provider_refs(&after, "relay").is_empty());
         assert_eq!(provider_refs(&after, "relay-hk").len(), 3);
         assert_eq!(after.groups[0].providers, ["relay-hk", "官方"]);
+    }
+
+    /// 指定模型里写着这一家，也是引用它：删之前要说，改名时只改那一项的 `provider`
+    #[test]
+    fn a_pinned_model_refers_to_its_upstream_and_follows_a_rename() {
+        let text = CFG.replace(
+            "        to: relay\n",
+            "        to:\n          - { provider: relay, model: m-relay }\n          - { provider: 官方, model: m }\n",
+        );
+        let c = cfg(&text);
+        assert_eq!(
+            provider_refs(&c, "官方"),
+            vec![
+                ProviderRef::RuleTarget {
+                    route: "default".into(),
+                    rule: "长上下文".into()
+                },
+                ProviderRef::Group {
+                    group: "pool".into()
+                }
+            ]
+        );
+        let renamed = edit::upsert(
+            &text,
+            edit::PROVIDERS,
+            Some("relay"),
+            &serde_yaml_ng::from_str(
+                "name: relay-hk\nbase_url: https://relay.example\nkey: sk-a\nproxy: hk\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let out = rename_provider(&renamed, &c, "relay", "relay-hk").unwrap();
+        let after = cfg(&out);
+        assert_eq!(
+            after.routes[0].rules[0].to,
+            Some(Target::Models(vec![
+                tw_engine::Pinned {
+                    provider: "relay-hk".into(),
+                    model: "m-relay".into()
+                },
+                tw_engine::Pinned {
+                    provider: "官方".into(),
+                    model: "m".into()
+                },
+            ]))
+        );
+        assert!(provider_refs(&after, "relay").is_empty());
     }
 
     #[test]
