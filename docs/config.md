@@ -1084,7 +1084,7 @@ group with `to`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the group; unique, and not the name of an upstream. |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price. |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: requests are shared out in proportion to the members' weights; a conversation in progress stays where it is. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price. |
 | `providers` | list of strings or [`groups[].providers[]`](#cfg-groups-providers) | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`. |
 | `selected` | string | — | For `select`: the chosen member. |
 | `balance_by` | `weights` \| `latency` \| `health` \| `latency-health` | `weights` | For `load-balance`: what the members' weights are multiplied by. `weights`: nothing; the weights alone. `latency`: faster upstreams get more. `health`: upstreams that fail less get more. `latency-health`: both. Other group types take only `weights`. |
@@ -1131,8 +1131,9 @@ the conversation, and whichever upstream answered after a failover is the one
 it stays on. The rule a turn matched at its start also holds for the rest of
 that turn: rules keyed on input size or images do not move a turn halfway,
 unless its input no longer fits the context window of a model the rule sends
-it to. `load-balance` therefore takes turns between new conversations, by
-weight.
+it to. A `load-balance` weight is therefore the long-run share of requests:
+conversations in progress stay where they are and count toward that
+upstream's share.
 
 `balance_by` lets a `load-balance` group also look at how each upstream has
 been doing lately. Each member's weight is multiplied by a factor, and the
@@ -1151,7 +1152,7 @@ group shares out requests by the result in the same way as above.
   neither does a client that cancels, a switch away from a stream that is
   slow to start, or an upstream skipped because it is at its
   `max_concurrent`. An upstream that keeps failing keeps a twentieth of its
-  weight, so it still gets the occasional new conversation and its recovery
+  weight, so it still gets the occasional request and its recovery
   is noticed; one that fails outright is set aside by
   [`failover`](#cfg-failover) as before.
 - `latency-health`: both factors, multiplied.

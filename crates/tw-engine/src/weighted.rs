@@ -50,7 +50,8 @@ pub fn effective(weight: u32, factor: f64) -> i64 {
 pub struct Member {
     /// 上游的名字
     pub name: String,
-    /// 新对话按权重的比例分给各个成员。不写是 1
+    /// 长期看，各个成员分到的请求是权重的比例（进行中的对话留在原来那一家，也记在它的
+    /// 份额里）。不写是 1
     #[serde(default = "one")]
     pub weight: u32,
 }

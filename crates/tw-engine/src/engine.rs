@@ -28,7 +28,8 @@ pub enum GroupType {
     Select,
     /// 按成员的权重轮流（平滑加权轮询，见 [`crate::weighted`]），权重都是 1 就是挨个轮；
     /// `balance_by` 还可以按快慢、成败给权重乘一个系数（[`BalanceBy`]）。
-    /// **轮的是新对话**：已经有人回答过、缓存还热着的对话留在那一家
+    /// **权重是长期看各家分到的请求的比例**：已经有人回答过、缓存还热着的对话留在那一家，
+    /// 那一轮记在那一家的份额里，新对话把差的补回去
     LoadBalance,
     /// 选最快的。判据是**真实流量测出来的快慢**：从发出去到回答的第一段内容（流式回答才有），
     /// 样本不够时用启动时那次零成本的 L1 握手计时补。
@@ -67,11 +68,11 @@ impl GroupType {
     }
 }
 
-/// `load-balance` 按什么分新对话（[`Group::balance_by`]）。
+/// `load-balance` 按什么分请求（[`Group::balance_by`]）。
 ///
 /// **成员的权重永远是底数**：快慢、成败算出一个系数（[`balance_factors`]），乘在每一家
-/// 的权重上，平滑加权轮询按乘出来的数轮（[`crate::weighted`]）。分的只是新对话 ——
-/// 进行中的对话照旧留在回答它的那一家（`tw_gateway::affinity`）。
+/// 的权重上，平滑加权轮询按乘出来的数轮（[`crate::weighted`]）。进行中的对话照旧留在
+/// 回答它的那一家（`tw_gateway::affinity`），记在那一家的份额里，新对话把差的补回去。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum BalanceBy {
@@ -234,7 +235,7 @@ pub struct Group {
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
-    /// `load-balance` 用：按什么分新对话（见 [`BalanceBy`]）。默认只按成员的权重，不写回配置
+    /// `load-balance` 用：按什么分请求（见 [`BalanceBy`]）。默认只按成员的权重，不写回配置
     #[serde(default, skip_serializing_if = "BalanceBy::is_weights")]
     pub balance_by: BalanceBy,
 }

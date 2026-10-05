@@ -2243,10 +2243,11 @@ pub struct GroupView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub providers: Vec<String>,
-    /// `load-balance` 组每个成员的权重，**每个成员都在**，没写权重的是 1：新对话按这个
-    /// 比例分。别的类型不用权重，是空的
+    /// `load-balance` 组每个成员的权重，**每个成员都在**，没写权重的是 1：长期看各家分到的
+    /// 请求就是这个比例。进行中的对话留在回答它的那一家，那一轮记在那一家的份额里，新对话把
+    /// 差的补回去。别的类型不用权重，是空的
     pub weights: std::collections::BTreeMap<String, u32>,
-    /// `load-balance` 按什么分新对话。别的类型永远是 `weights`
+    /// `load-balance` 按什么分请求。别的类型永远是 `weights`
     pub balance_by: BalanceBy,
 }
 
@@ -3414,11 +3415,11 @@ slug_enum! {
 }
 
 slug_enum! {
-    /// `load-balance` 组按什么分新对话：配置里 `balance_by` 写的那个词。
+    /// `load-balance` 组按什么分请求：配置里 `balance_by` 写的那个词。
     ///
     /// 成员的权重永远是底数，快慢、成败算出的系数乘在上面
-    /// （[`DryRunCandidate::balance_factor`]）；进行中的对话照旧留在回答它的那一家。
-    /// 没有测到的上游算中等。
+    /// （[`DryRunCandidate::balance_factor`]），长期看各家分到的请求是乘出来的比例；进行中的
+    /// 对话照旧留在回答它的那一家，记在那一家的份额里。没有测到的上游算中等。
     pub enum BalanceBy {
         /// 只按成员的权重
         Weights = "weights",
@@ -3446,7 +3447,7 @@ pub struct GroupInput {
     /// 别的类型只能不给、或者都是 1
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weights: Option<std::collections::BTreeMap<String, u32>>,
-    /// `load-balance` 组按什么分新对话。不给 = `weights`；别的类型只能是 `weights`
+    /// `load-balance` 组按什么分请求。不给 = `weights`；别的类型只能是 `weights`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_by: Option<BalanceBy>,
 }
@@ -4936,7 +4937,7 @@ pub struct DryRunResult {
     /// 写在第一个」。直指 provider 时是 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<GroupKind>,
-    /// 经过的是 `load-balance` 组时，它按什么分新对话。别的时候没有
+    /// 经过的是 `load-balance` 组时，它按什么分请求。别的时候没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_by: Option<BalanceBy>,
     /// `route` | `deny` | `no_match` | `unavailable`（选中的上游都服务不了，

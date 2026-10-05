@@ -1355,8 +1355,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(group_types),
                     Def::Is("fallback"),
                     t(
-                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price.",
-                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话按成员的权重轮流。`url-test`：按实测从发出请求到回答第一段内容的时间取最快的。`cheapest`：取输入单价最低的。",
+                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: requests are shared out in proportion to the members' weights; a conversation in progress stays where it is. `url-test`: the fastest by measured time from sending a request to the first content of the answer. `cheapest`: the lowest input price.",
+                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：请求按成员的权重分；进行中的对话留在原来那一家。`url-test`：按实测从发出请求到回答第一段内容的时间取最快的。`cheapest`：取输入单价最低的。",
                     ),
                 ),
                 row(
