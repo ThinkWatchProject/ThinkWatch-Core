@@ -385,3 +385,219 @@ async fn an_intent_rule_catches_a_forwarded_probe() {
     .await;
     assert_eq!(r.rule.as_deref(), Some("兜底"), "{r:?}");
 }
+
+// ─────────────────────────────────────────────────────────── 别名与指定模型
+
+/// 三家上游各用各的写法：官方 `claude-*`、中转 `anthropic/*`、智谱 `glm-*`
+const ALIASED: &str = r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: 我
+    key: tw-k
+providers:
+  - name: 官方
+    base_url: https://api.anthropic.com
+    key: sk-a
+    models_only: ["claude-*"]
+  - name: 中转
+    base_url: https://relay.example.com
+    key: sk-b
+    models_only: ["anthropic/*"]
+  - name: 智谱
+    base_url: https://zhipu.example.com
+    key: sk-c
+    models_only: ["glm-*"]
+aliases:
+  opus: [claude-opus-5, anthropic/claude-opus-5]
+  glm-air: glm-5-air-0414
+routes:
+  - name: default
+    rules:
+      - name: 指定
+        when: { model: pinned }
+        to:
+          - { provider: 智谱, model: glm-5 }
+          - { provider: 官方, model: claude-opus-5 }
+      - name: 中转写法的 Opus
+        when: { model: "anthropic/*" }
+        to: 中转
+      - name: Sonnet 换成 Opus
+        when: { model: claude-sonnet-* }
+        set: { model: opus }
+      - name: 智谱的叫法
+        when: { provider_would_be: 智谱, model: glm-* }
+        set: { model: glm-air }
+      - name: 其余
+        to: __all__
+"#;
+
+/// 每个候选：（上游，发给它的名字，来历）
+fn sent(r: &tw_api::DryRunResult) -> Vec<(&str, Option<&str>, Option<&str>)> {
+    assert_eq!(
+        r.candidate_models
+            .iter()
+            .map(|c| c.provider.as_str())
+            .collect::<Vec<_>>(),
+        r.candidates,
+        "和候选一一对应"
+    );
+    r.candidate_models
+        .iter()
+        .map(|c| {
+            (
+                c.provider.as_str(),
+                c.sent_model.as_deref(),
+                c.model_via.as_deref(),
+            )
+        })
+        .collect()
+}
+
+/// 每个候选发出去的名字和来历：别名对到各家、规则改写（改成别名也照常对）、指定模型、
+/// 阶段二原样；和客户端写的一样时没有来历
+#[tokio::test]
+async fn each_candidate_shows_the_name_it_is_sent_and_why() {
+    let (_d, app) = app_with(ALIASED);
+
+    // 请求别名：写中转写法（真名）的那条规则也管到它
+    let r = run(&app, r#"{"model":"opus"}"#).await;
+    assert_eq!(r.rule.as_deref(), Some("中转写法的 Opus"), "{r:?}");
+    assert_eq!(
+        sent(&r),
+        [("中转", Some("anthropic/claude-opus-5"), Some("alias"))]
+    );
+    let t = r
+        .trace
+        .iter()
+        .find(|t| t.name == "中转写法的 Opus")
+        .unwrap();
+    assert_eq!(t.verdict, tw_api::RuleVerdict::Matched);
+
+    // 请求真名：那条规则不管它，没对上的条件照实说
+    let r = run(&app, r#"{"model":"claude-opus-5"}"#).await;
+    assert_eq!(r.rule.as_deref(), Some("其余"), "{r:?}");
+    assert_eq!(sent(&r), [("官方", Some("claude-opus-5"), None)]);
+    let t = r
+        .trace
+        .iter()
+        .find(|t| t.name == "中转写法的 Opus")
+        .unwrap();
+    assert_eq!(t.mismatch.as_ref().unwrap().got, "claude-opus-5");
+
+    // 规则改写成别名：照常对到各家；对不到的那一家跳过
+    let r = run(&app, r#"{"model":"claude-sonnet-5"}"#).await;
+    assert_eq!(
+        sent(&r),
+        [
+            ("官方", Some("claude-opus-5"), Some("rule")),
+            ("中转", Some("anthropic/claude-opus-5"), Some("rule")),
+        ]
+    );
+    assert_eq!(
+        r.skipped
+            .iter()
+            .map(|s| s.provider.as_str())
+            .collect::<Vec<_>>(),
+        ["智谱"]
+    );
+
+    // 指定模型：按列表的顺序，原样
+    let r = run(&app, r#"{"model":"pinned"}"#).await;
+    assert_eq!(
+        sent(&r),
+        [
+            ("智谱", Some("glm-5"), Some("pinned")),
+            ("官方", Some("claude-opus-5"), Some("pinned")),
+        ]
+    );
+
+    // 阶段二改的名字原样发：`glm-air` 是别名也不对到 `glm-5-air-0414`
+    let r = run(&app, r#"{"model":"glm-5"}"#).await;
+    assert_eq!(sent(&r), [("智谱", Some("glm-air"), Some("rule"))]);
+}
+
+/// `cheapest` 按每一家发出去的名字比价：同一个别名在两家是两个模型、两个价
+#[tokio::test]
+async fn cheapest_prices_each_upstream_by_the_name_it_is_sent() {
+    let (_d, app) = app_with(
+        r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: 我
+    key: tw-k
+providers:
+  - name: 贵的
+    base_url: https://a.example.com
+    key: sk-a
+    models_only: ["claude-opus-*"]
+  - name: 便宜的
+    base_url: https://b.example.com
+    key: sk-b
+    models_only: ["claude-haiku-*"]
+aliases:
+  快: [claude-opus-4-1, claude-haiku-4-5]
+groups:
+  - name: 省钱
+    type: cheapest
+    providers: [贵的, 便宜的]
+routes:
+  - name: default
+    rules:
+      - name: 省钱
+        to: 省钱
+"#,
+    );
+    let r = run(&app, r#"{"model":"快"}"#).await;
+    // 按别名本身比的话两家都算不出价钱，次序不变
+    assert_eq!(
+        sent(&r),
+        [
+            ("便宜的", Some("claude-haiku-4-5"), Some("alias")),
+            ("贵的", Some("claude-opus-4-1"), Some("alias")),
+        ]
+    );
+}
+
+/// 给了密钥：发给哪一家的名字这把密钥不让用，那一家跳过，说是密钥的事 —— 和数据面一样，
+/// 故障转移到不了它。指定的、阶段二改的名字按名字本身看
+#[tokio::test]
+async fn a_candidate_whose_model_the_key_may_not_use_is_skipped() {
+    let cfg = ALIASED.replace(
+        "clients:\n  - name: 我\n    key: tw-k\n",
+        "clients:\n  - name: 我\n    key: tw-k\n  - name: 只用智谱\n    key: tw-z\n    allow: [glm-*]\n  - name: 只用 glm-5\n    key: tw-5\n    allow: [glm-5]\n",
+    );
+    let (_d, app) = app_with(&cfg);
+    let skipped = |r: &tw_api::DryRunResult| {
+        r.skipped
+            .iter()
+            .map(|s| (s.provider.clone(), s.reason))
+            .collect::<Vec<_>>()
+    };
+
+    // 指定模型：官方的 claude-opus-5 这把密钥不让用
+    let r = run(&app, r#"{"model":"pinned","client":"只用智谱"}"#).await;
+    assert_eq!(sent(&r), [("智谱", Some("glm-5"), Some("pinned"))]);
+    assert_eq!(
+        skipped(&r),
+        [("官方".to_string(), tw_api::ServeSkip::NotAllowed)]
+    );
+
+    // 阶段二给智谱改的 glm-air 原样看：只许 glm-5 的密钥不让用它，别的两家本来就不在范围里
+    let r = run(&app, r#"{"model":"glm-5","client":"只用 glm-5"}"#).await;
+    assert_eq!(r.outcome, tw_api::DryRunOutcome::Unavailable, "{r:?}");
+    assert_eq!(
+        skipped(&r),
+        [
+            ("官方".to_string(), tw_api::ServeSkip::OutOfScope),
+            ("中转".to_string(), tw_api::ServeSkip::OutOfScope),
+            ("智谱".to_string(), tw_api::ServeSkip::NotAllowed),
+        ]
+    );
+    // 不给密钥（按路由试算）不看范围
+    let r = run(&app, r#"{"model":"glm-5","route":"default"}"#).await;
+    assert_eq!(sent(&r), [("智谱", Some("glm-air"), Some("rule"))]);
+}

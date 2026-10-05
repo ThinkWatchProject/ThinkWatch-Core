@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod aliases;
 pub mod aws_profile;
 pub mod chatgpt;
 pub mod control_key;
@@ -30,6 +31,7 @@ mod validate;
 pub mod watch;
 mod wire;
 
+pub use aliases::{Alias, Aliases};
 pub use credential::{CredentialError, Header, Headers, Secret, SecretResolveError, auth_header};
 pub use init::{generate_control_key, generate_initial, generate_key};
 pub use plugins::Plugin;
@@ -95,6 +97,10 @@ pub struct Config {
     /// 一家上游失败之后停用多久、流开头最多等多久。不写就是默认值。
     #[serde(default, skip_serializing_if = "is_default")]
     pub failover: Failover,
+    /// 模型别名：一个名字 = 同一个模型在各家上游的名称，按书写顺序。不写就没有。
+    /// 见 [`aliases`]
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub aliases: Aliases,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<tw_engine::Group>,
     /// 路由。一条路由是一组按顺序求值的规则。
@@ -137,6 +143,7 @@ impl Default for Config {
             security: Security::default(),
             retention: Retention::default(),
             failover: Failover::default(),
+            aliases: Aliases::default(),
             groups: Vec::new(),
             routes: Vec::new(),
             default_route: None,
@@ -239,6 +246,12 @@ impl Config {
                 .iter()
                 .filter_map(|c| c.route.clone().map(|r| (c.name.clone(), r)))
                 .collect(),
+        )
+        // 规则条件 `when.model` 写上游模型名时也匹配列了它的别名
+        .with_aliases(
+            self.aliases
+                .iter()
+                .map(|a| (a.name.clone(), a.models.clone())),
         )
     }
 }
@@ -1166,7 +1179,7 @@ pub use security::{
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
-pub use validate::validate;
+pub use validate::{check_aliases, validate};
 
 pub fn default_path() -> PathBuf {
     tw_api::data::dir().join("config.yaml")

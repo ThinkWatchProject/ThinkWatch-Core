@@ -257,12 +257,7 @@ fn to_route(input: &tw_api::RouteInput, cfg: &tw_config::Config) -> Result<Route
 pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Result<Rule, Msg> {
     let name = checked_name(&input.name, "rule")?;
     let when = when_from(&name, &input.conditions, cfg)?;
-    let to = input
-        .to
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string);
+    let to = input.to.as_ref().and_then(target_from);
     let deny = match input.deny.as_deref().map(str::trim) {
         Some("") => {
             return Err(msg!(
@@ -299,6 +294,40 @@ pub(crate) fn to_rule(input: &tw_api::RuleInput, cfg: &tw_config::Config) -> Res
         set,
         deny,
     })
+}
+
+/// 界面交过来的去向 → 配置里的 `to`。名字是空的就是没有去向；**指定模型的列表原样
+/// 交给引擎校验**，空列表、不存在的上游、空的模型名都由它说出是哪条规则的哪一项。
+fn target_from(t: &tw_api::RuleTarget) -> Option<tw_engine::Target> {
+    match t {
+        tw_api::RuleTarget::Name(n) => {
+            let n = n.trim();
+            (!n.is_empty()).then(|| tw_engine::Target::from(n))
+        }
+        tw_api::RuleTarget::Models(list) => Some(tw_engine::Target::Models(
+            list.iter()
+                .map(|p| tw_engine::Pinned {
+                    provider: p.provider.trim().to_string(),
+                    model: p.model.trim().to_string(),
+                })
+                .collect(),
+        )),
+    }
+}
+
+/// 配置里的 `to` → 视图。和 [`target_from`] 互逆。
+fn target_view(t: &tw_engine::Target) -> tw_api::RuleTarget {
+    match t {
+        tw_engine::Target::Name(n) => tw_api::RuleTarget::Name(n.clone()),
+        tw_engine::Target::Models(list) => tw_api::RuleTarget::Models(
+            list.iter()
+                .map(|p| tw_api::PinnedModel {
+                    provider: p.provider.clone(),
+                    model: p.model.clone(),
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// 客户端格式，和请求路径判出来的那一套一致。
@@ -612,20 +641,62 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
 
 /// 网关知道的全部模型，以及能提供它们的上游。
 ///
-/// **和 `/v1/models` 同一份目录**：停用的上游、启用范围外的模型都不在里面。
-/// 规则条件和试算的模型建议用它。
+/// **和 `/v1/models` 同一份目录**：停用的上游、启用范围外的模型都不在里面。另加
+/// 别名表里的每个别名，见 [`known`]。规则条件和试算的模型建议用它。
 async fn known_models(State(s): State<ControlState>) -> Json<Vec<tw_api::KnownModel>> {
-    let catalog = s.gateway.catalog.load();
-    Json(
-        catalog
-            .all()
-            .into_iter()
-            .map(|id| tw_api::KnownModel {
-                id: id.to_string(),
-                providers: catalog.providers_for(id).to_vec(),
-            })
-            .collect(),
-    )
+    Json(known(&s.config(), &s.gateway.catalog.load()))
+}
+
+/// 目录里的真模型加上别名表里的每个别名，按名称排。
+///
+/// - 真模型：提供它的上游照目录，带着列出它的别名。和某个别名同名的真模型不单列 ——
+///   请求这个名称按别名处理（别名优先）。
+/// - 别名：**每一个都列出来**，哪家都服务不了的也列：它是配置里写下的名称，规则条件
+///   要能选到它。上游是有清单、`resolve` 在这家有结果的那几家 —— 和真模型一样只算
+///   有清单的；没有清单的上游照样收它的请求，只是不知道它有什么。
+fn known(cfg: &tw_config::Config, catalog: &tw_engine::Catalog) -> Vec<tw_api::KnownModel> {
+    let mut out: Vec<tw_api::KnownModel> = catalog
+        .all()
+        .into_iter()
+        .filter(|id| !cfg.aliases.contains(id))
+        .map(|id| tw_api::KnownModel {
+            id: id.to_string(),
+            providers: catalog.providers_for(id).to_vec(),
+            alias: None,
+            aliases: aliases_listing(cfg, id),
+        })
+        .collect();
+    out.extend(cfg.aliases.iter().map(|a| tw_api::KnownModel {
+        id: a.name.clone(),
+        providers: serving_alias(cfg, catalog, &a.name),
+        alias: Some(a.models.clone()),
+        aliases: Vec::new(),
+    }));
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// 能服务别名 `name` 的上游，按配置里的顺序：没停用、有清单，`resolve` 在这家取得到
+/// 名称（清单里有，也在启用范围里）。
+fn serving_alias(cfg: &tw_config::Config, catalog: &tw_engine::Catalog, name: &str) -> Vec<String> {
+    cfg.providers
+        .iter()
+        .filter(|p| !p.disabled)
+        .filter(|p| {
+            tw_gateway::models::resolve(cfg, catalog, p, name)
+                .is_some_and(|m| catalog.offers(&p.name, &m) == Some(true))
+        })
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// 列出了模型名 `model` 的别名，按别名表的顺序。
+pub(crate) fn aliases_listing(cfg: &tw_config::Config, model: &str) -> Vec<String> {
+    cfg.aliases
+        .iter()
+        .filter(|a| a.models.iter().any(|m| m == model))
+        .map(|a| a.name.clone())
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────── 视图
@@ -635,7 +706,7 @@ pub(crate) fn rule_view(r: &Rule, n: tw_engine::RuleNotes) -> tw_api::RuleView {
     tw_api::RuleView {
         name: r.name.clone(),
         conditions: crate::describe_when(&r.when),
-        to: r.to.clone(),
+        to: r.to.as_ref().map(target_view),
         deny: r.deny.clone(),
         set: r
             .set
@@ -676,6 +747,97 @@ fn name_taken(what: &'static str, name: &str) -> ApplyError {
         what,
         name: name.to_string(),
     })
+}
+
+#[cfg(test)]
+mod targets {
+    use super::*;
+
+    fn cfg() -> tw_config::Config {
+        tw_config::try_parse(
+            "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\n  - name: b\n    base_url: https://y\n    key: k\n",
+        )
+        .unwrap()
+    }
+
+    fn input(to: Option<tw_api::RuleTarget>) -> tw_api::RuleInput {
+        tw_api::RuleInput {
+            name: "r".into(),
+            conditions: vec![],
+            to,
+            deny: None,
+            set: None,
+        }
+    }
+
+    fn pin(provider: &str, model: &str) -> tw_api::PinnedModel {
+        tw_api::PinnedModel {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    /// 指定模型交进来、写进配置、再读成视图，还是那个列表、那个顺序。以前视图把它说成
+    /// 没有去向，界面原样交回来就把它丢了
+    #[test]
+    fn a_pinned_target_comes_back_from_the_view_as_it_went_in() {
+        let c = cfg();
+        let to = tw_api::RuleTarget::Models(vec![pin("b", "m-2"), pin("a", " m-1 ")]);
+        let rule = to_rule(&input(Some(to)), &c).unwrap();
+        assert_eq!(
+            rule.to,
+            Some(tw_engine::Target::Models(vec![
+                tw_engine::Pinned {
+                    provider: "b".into(),
+                    model: "m-2".into(),
+                },
+                tw_engine::Pinned {
+                    provider: "a".into(),
+                    model: "m-1".into(),
+                },
+            ]))
+        );
+        let view = rule_view(&rule, Default::default());
+        assert_eq!(
+            view.to,
+            Some(tw_api::RuleTarget::Models(vec![
+                pin("b", "m-2"),
+                pin("a", "m-1")
+            ]))
+        );
+        let again = tw_api::RuleInput {
+            name: view.name.clone(),
+            conditions: view.conditions.clone(),
+            to: view.to.clone(),
+            deny: view.deny.clone(),
+            set: view.set.clone(),
+        };
+        assert_eq!(to_rule(&again, &c).unwrap().to, rule.to);
+    }
+
+    #[test]
+    fn a_named_target_is_trimmed_and_a_blank_one_is_none() {
+        let c = cfg();
+        let rule = to_rule(&input(Some(" a ".into())), &c).unwrap();
+        assert_eq!(rule.to, Some("a".into()));
+        assert_eq!(
+            rule_view(&rule, Default::default()).to,
+            Some(tw_api::RuleTarget::from("a"))
+        );
+        let mut blank = input(Some("  ".into()));
+        blank.deny = Some("不行".into());
+        assert_eq!(to_rule(&blank, &c).unwrap().to, None);
+    }
+
+    /// 空列表不悄悄当成没有去向：交给引擎，它说出是哪条规则
+    #[test]
+    fn an_empty_pinned_list_is_refused_by_the_engine() {
+        let c = cfg();
+        let rule = to_rule(&input(Some(tw_api::RuleTarget::Models(vec![]))), &c).unwrap();
+        let err = c.engine().check_rules(&[rule]).unwrap_err().msg();
+        assert_eq!(err.code, "engine.pinned_empty");
+        assert_eq!(err.arg("rule"), "r");
+    }
 }
 
 #[cfg(test)]

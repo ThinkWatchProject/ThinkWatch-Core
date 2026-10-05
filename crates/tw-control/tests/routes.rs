@@ -457,7 +457,7 @@ async fn changing_the_default_keeps_the_synthesised_one_as_an_ordinary_route() {
         .iter()
         .find(|r| r.name == "default")
         .expect("「默认」留下来");
-    assert_eq!(kept.rules[0].to.as_deref(), Some("__all__"));
+    assert_eq!(kept.rules[0].to, Some("__all__".into()));
 
     // 换回来：默认值不写进文件
     let (st, v) = call(
@@ -469,6 +469,124 @@ async fn changing_the_default_keeps_the_synthesised_one_as_an_ordinary_route() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(!b.file().contains("default_route"), "{}", b.file());
+}
+
+// ─────────────────────────────────────────────────────────── 指定模型
+
+/// 规则的去向可以是指定模型：交进来原样写进文件，概览给回同一个列表；界面把概览里的
+/// 规则原样交回来（只改了别的地方），指定模型还在。以前概览把它说成没有去向，界面
+/// 一保存就丢了
+#[tokio::test]
+async fn pinned_models_survive_a_save_and_a_save_of_what_the_overview_gave_back() {
+    let b = bed(BASE);
+    let pinned = json!([
+        { "provider": "中转", "model": "anthropic/claude-opus-5" },
+        { "provider": "官方", "model": "claude-opus-5" },
+    ]);
+    let opus = json!({
+        "name": "Opus 走中转",
+        "conditions": [{ "field": "model", "values": ["claude-opus-5"] }],
+        "to": pinned,
+    });
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/routes",
+        json!({ "route": { "name": "指定", "rules": [opus, catch_all("__all__")] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let expected = Some(tw_engine::Target::Models(vec![
+        tw_engine::Pinned {
+            provider: "中转".into(),
+            model: "anthropic/claude-opus-5".into(),
+        },
+        tw_engine::Pinned {
+            provider: "官方".into(),
+            model: "claude-opus-5".into(),
+        },
+    ]));
+    let written = |b: &Bed, route: &str| {
+        b.parsed()
+            .routes
+            .into_iter()
+            .find(|r| r.name == route)
+            .unwrap_or_else(|| panic!("没有「{route}」：{}", b.file()))
+            .rules
+    };
+    assert_eq!(written(&b, "指定")[0].to, expected);
+
+    let ov = b.overview().await;
+    let rules = find(&ov["routes"], "指定")["rules"].clone();
+    assert_eq!(rules[0]["to"], pinned, "{rules}");
+    assert_eq!(rules[1]["to"], "__all__");
+
+    // 编辑对话框回填的就是概览里的规则；改了名字，别的原样交回
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        &format!("/routes/{}", enc("指定")),
+        json!({ "route": { "name": "指定模型", "rules": rules } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let rules = written(&b, "指定模型");
+    assert_eq!(rules[0].to, expected, "{}", b.file());
+    assert_eq!(rules[1].to, Some("__all__".into()));
+}
+
+/// 试算未保存的草稿：指定模型照写的读，候选就是列出来的上游、按列表顺序（中转的
+/// 清单里有它指定的那个名称，官方没有清单）
+#[tokio::test]
+async fn a_draft_with_pinned_models_can_be_tried_before_it_is_saved() {
+    let b = bed(BASE);
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/dryrun",
+        json!({ "model": "claude-opus-5", "draft": { "name": "草稿", "rules": [
+            { "name": "指定", "to": [
+                { "provider": "中转", "model": "中转自有模型" },
+                { "provider": "官方", "model": "claude-opus-5" },
+            ] },
+        ] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rule"], "指定", "{v}");
+    assert_eq!(v["candidates"], json!(["中转", "官方"]), "{v}");
+
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/dryrun",
+        json!({ "model": "m", "draft": { "name": "草稿", "rules": [
+            { "name": "空的", "to": [] },
+        ] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "engine.pinned_empty", "{v}");
+}
+
+#[tokio::test]
+async fn an_empty_pinned_list_is_refused_and_says_which_rule() {
+    let b = bed(BASE);
+    let before = b.file();
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/routes",
+        json!({ "route": { "name": "指定", "rules": [
+            { "name": "空的", "to": [] },
+            catch_all("__all__"),
+        ] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "engine.pinned_empty", "{v}");
+    assert_eq!(v["args"]["rule"], "空的", "{v}");
+    assert_eq!(b.file(), before);
 }
 
 // ─────────────────────────────────────────────────────────── 策略组
@@ -503,7 +621,7 @@ async fn renaming_a_group_moves_the_rules_that_forward_to_it() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let cfg = b.parsed();
-    assert_eq!(cfg.routes[0].rules[1].to.as_deref(), Some("主力组"));
+    assert_eq!(cfg.routes[0].rules[1].to, Some("主力组".into()));
     assert_eq!(cfg.groups[0].selected.as_deref(), Some("中转"));
 }
 
@@ -561,6 +679,115 @@ async fn known_models_come_from_the_same_catalog_as_the_model_list() {
             .any(|m| m["id"] == "中转自有模型"),
         "{v}"
     );
+}
+
+/// 别名：`sonnet` 两家都有（各叫各的），和中转上一个同名的真模型撞名；`opus` 只有
+/// 官方有；`nobody` 哪家都没有；没有清单的上游和停用的上游不算提供。
+const ALIASED: &str = "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-a
+providers:
+  - name: 官方
+    base_url: https://api.anthropic.com
+    key: sk-a
+    models: [claude-sonnet-5, claude-opus-5]
+  - name: 中转
+    base_url: https://relay.example.com
+    key: sk-b
+    models: [anthropic/claude-sonnet-5, sonnet]
+  - name: 没有清单
+    base_url: https://other.example.com
+    key: sk-c
+  - name: 停用
+    base_url: https://off.example.com
+    key: sk-d
+    models: [claude-sonnet-5]
+    disabled: true
+aliases:
+  sonnet: [claude-sonnet-5, anthropic/claude-sonnet-5]
+  opus: claude-opus-5
+  nobody: no-such-model
+";
+
+#[tokio::test]
+async fn known_models_list_each_alias_once_and_say_which_aliases_list_a_model() {
+    let b = bed(ALIASED);
+    let (st, v) = call(&b.app, "GET", "/models", json!(null)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    // 按名称排；`sonnet` 只有一项，就是别名
+    assert_eq!(
+        ids,
+        [
+            "anthropic/claude-sonnet-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "nobody",
+            "opus",
+            "sonnet"
+        ],
+        "{v}"
+    );
+
+    let sonnet = find_id(&v, "sonnet");
+    assert_eq!(
+        sonnet["alias"],
+        json!(["claude-sonnet-5", "anthropic/claude-sonnet-5"])
+    );
+    assert_eq!(sonnet["providers"], json!(["官方", "中转"]), "{sonnet}");
+    assert_eq!(sonnet["aliases"], json!([]));
+    assert_eq!(find_id(&v, "opus")["providers"], json!(["官方"]));
+    // 哪家都没有的别名也列出来，规则条件要能选到它
+    let nobody = find_id(&v, "nobody");
+    assert_eq!(nobody["providers"], json!([]));
+    assert_eq!(nobody["alias"], json!(["no-such-model"]));
+
+    let real = find_id(&v, "claude-sonnet-5");
+    assert!(real.get("alias").is_none(), "{real}");
+    assert_eq!(real["aliases"], json!(["sonnet"]));
+    assert_eq!(real["providers"], json!(["官方"]), "停用的不算：{real}");
+    assert_eq!(
+        find_id(&v, "anthropic/claude-sonnet-5")["aliases"],
+        json!(["sonnet"])
+    );
+    assert_eq!(find_id(&v, "claude-opus-5")["aliases"], json!(["opus"]));
+}
+
+#[tokio::test]
+async fn an_upstreams_model_rows_say_which_aliases_list_them() {
+    let b = bed(ALIASED);
+    let (st, v) = call(
+        &b.app,
+        "GET",
+        &format!("/providers/{}/models", enc("中转")),
+        json!(null),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row = |id: &str| {
+        v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("没有「{id}」：{v}"))
+            .clone()
+    };
+    assert_eq!(
+        row("anthropic/claude-sonnet-5")["aliases"],
+        json!(["sonnet"])
+    );
+    // 和别名同名、却没列进别名的真模型不算
+    assert_eq!(row("sonnet")["aliases"], json!([]));
 }
 
 fn find_id<'a>(list: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {

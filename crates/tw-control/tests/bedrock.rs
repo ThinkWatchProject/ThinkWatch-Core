@@ -81,7 +81,7 @@ async fn a_bedrock_address_is_previewed_with_its_protocol_and_region() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/providers/preview",
+        "/provider-preview",
         json!({"base_url": "https://bedrock-runtime.eu-west-3.amazonaws.com"}),
     )
     .await;
@@ -93,7 +93,7 @@ async fn a_bedrock_address_is_previewed_with_its_protocol_and_region() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/providers/preview",
+        "/provider-preview",
         json!({"base_url": "https://api.anthropic.com"}),
     )
     .await;
@@ -240,7 +240,7 @@ async fn test_with(b: &Bed, up: std::net::SocketAddr) -> Value {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/providers/test",
+        "/provider-test",
         json!({"provider": {
             "name": "b",
             "base_url": format!("http://{up}"),

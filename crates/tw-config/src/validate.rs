@@ -77,13 +77,27 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     PluginId { id: String },
     #[error("{}", self.msg())]
-    PluginIdReserved { id: String },
-    #[error("{}", self.msg())]
     DuplicatePlugin { id: String },
     #[error("{}", self.msg())]
     PluginFile { id: String, file: String },
     #[error("{}", self.msg())]
     PluginSha256 { id: String },
+    #[error("{}", self.msg())]
+    AliasEmptyName,
+    #[error("{}", self.msg())]
+    AliasWildcard { alias: String },
+    #[error("{}", self.msg())]
+    AliasReserved { alias: String },
+    #[error("{}", self.msg())]
+    AliasDuplicate { alias: String },
+    #[error("{}", self.msg())]
+    AliasNoModels { alias: String },
+    #[error("{}", self.msg())]
+    AliasBlankModel { alias: String },
+    #[error("{}", self.msg())]
+    AliasChained { alias: String, model: String },
+    #[error("{}", self.msg())]
+    AliasOnlyItself { alias: String },
 }
 
 impl ValidationError {
@@ -223,10 +237,6 @@ impl ValidationError {
                 "the plugin id `{plugin}` is written wrongly: lowercase letters, digits and \
                  hyphens, 1 to {max} characters"
             ),
-            PluginIdReserved { id } => msg!(
-                "config.plugin.reserved_id", plugin = id =>
-                "`{plugin}` cannot be a plugin id: the control plane uses that word itself"
-            ),
             DuplicatePlugin { id } => msg!(
                 "config.plugin.duplicate", plugin = id =>
                 "the plugin id `{plugin}` appears twice"
@@ -238,6 +248,43 @@ impl ValidationError {
             PluginSha256 { id } => msg!(
                 "config.plugin.sha256", plugin = id =>
                 "the sha256 of plugin `{plugin}` has to be 64 lowercase hexadecimal characters"
+            ),
+            AliasEmptyName => msg!(
+                "config.alias_empty_name" =>
+                "an alias under `aliases` has an empty name"
+            ),
+            AliasWildcard { alias } => msg!(
+                "config.alias_wildcard", alias = alias =>
+                "the alias name `{alias}` contains * or ?. An alias is one exact name; to match \
+                 several models, write the pattern in a key's allow or a rule's when.model"
+            ),
+            AliasReserved { alias } => msg!(
+                "config.alias_reserved", alias = alias =>
+                "the alias name `{alias}` starts with __, which is reserved for built-ins. Use a \
+                 different name"
+            ),
+            AliasDuplicate { alias } => msg!(
+                "config.alias_duplicate", alias = alias =>
+                "the alias `{alias}` appears twice"
+            ),
+            AliasNoModels { alias } => msg!(
+                "config.alias_no_models", alias = alias =>
+                "alias `{alias}` lists no model. List the name each upstream uses for the model, \
+                 or remove the alias"
+            ),
+            AliasBlankModel { alias } => msg!(
+                "config.alias_blank_model", alias = alias =>
+                "alias `{alias}` lists an empty model name"
+            ),
+            AliasChained { alias, model } => msg!(
+                "config.alias_chained", alias = alias, model = model =>
+                "alias `{alias}` lists `{model}`, which is itself an alias. An alias lists the \
+                 names upstreams use, not other aliases"
+            ),
+            AliasOnlyItself { alias } => msg!(
+                "config.alias_only_itself", alias = alias =>
+                "alias `{alias}` lists only itself, so it changes nothing. List the names the \
+                 upstreams use, or remove the alias"
             ),
         }
     }
@@ -370,6 +417,8 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
         }
     }
 
+    check_aliases(&cfg.aliases)?;
+
     // provider 和组不能同名。`to: x` 指向哪个会变成一个靠实现顺序决定
     // 的问题 —— 而那种问题在换一个人读代码的时候就会变成 bug。
     let group_names: std::collections::HashSet<&str> =
@@ -454,6 +503,51 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                     entry: entry.clone(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// 别名表写得对不对，和整份配置的校验是同一套（界面预览一个别名时也用它）。
+/// **模型名在不在上游清单里不在这里查**：清单是运行时问来的，
+/// 上游一时没列出来不该让整份配置不收。
+pub fn check_aliases(aliases: &crate::Aliases) -> Result<(), ValidationError> {
+    let mut seen = std::collections::HashSet::new();
+    for a in aliases.iter() {
+        let alias = || a.name.clone();
+        if a.name.trim().is_empty() {
+            return Err(ValidationError::AliasEmptyName);
+        }
+        // 别名没有通配：`claude-*` 写成别名，读的人会以为它匹配一批模型
+        if a.name.contains(['*', '?']) {
+            return Err(ValidationError::AliasWildcard { alias: alias() });
+        }
+        if a.name.starts_with(tw_engine::RESERVED_PREFIX) {
+            return Err(ValidationError::AliasReserved { alias: alias() });
+        }
+        if !seen.insert(a.name.as_str()) {
+            return Err(ValidationError::AliasDuplicate { alias: alias() });
+        }
+        if a.models.is_empty() {
+            return Err(ValidationError::AliasNoModels { alias: alias() });
+        }
+        if a.models.iter().any(|m| m.trim().is_empty()) {
+            return Err(ValidationError::AliasBlankModel { alias: alias() });
+        }
+        // **别名不能指向别名**：指向了，那个名字在请求里是别名、在这里却要当上游的
+        // 名称发出去，两种读法只能有一种。列着自己的名字可以 —— 那是某家上游的真名
+        if let Some(m) = a
+            .models
+            .iter()
+            .find(|m| **m != a.name && aliases.contains(m))
+        {
+            return Err(ValidationError::AliasChained {
+                alias: alias(),
+                model: m.clone(),
+            });
+        }
+        if a.models.iter().all(|m| *m == a.name) {
+            return Err(ValidationError::AliasOnlyItself { alias: alias() });
         }
     }
     Ok(())
@@ -828,6 +922,50 @@ mod tests {
         }
     }
 
+    /// 别名表：名字一个一个、不带通配、不撞内置前缀，每个别名列着别的名称，
+    /// 不指向别的别名。
+    #[test]
+    fn aliases_are_checked_one_rule_at_a_time() {
+        let with = |yaml: &str| {
+            let mut x = cfg(vec![c("d", "tw-1")], vec![]);
+            x.aliases = serde_yaml_ng::from_str(yaml).unwrap();
+            validate(&x)
+        };
+        let ok = "deepseek-v4.1: DeepSeek-v4.1-flash\nclaude-sonnet-5: [claude-sonnet-5, us.anthropic.claude-sonnet-5-v1:0]\n";
+        assert!(with(ok).is_ok(), "{:?}", with(ok));
+        let code = |yaml: &str| with(yaml).unwrap_err().msg().code;
+        assert_eq!(code("'': x\n"), "config.alias_empty_name");
+        assert_eq!(code("'claude-*': x\n"), "config.alias_wildcard");
+        assert_eq!(code("gpt-?: x\n"), "config.alias_wildcard");
+        assert_eq!(code("__x: y\n"), "config.alias_reserved");
+        assert_eq!(code("x: []\n"), "config.alias_no_models");
+        assert_eq!(code("x:\n"), "config.alias_no_models");
+        assert_eq!(code("x: [a, '']\n"), "config.alias_blank_model");
+        assert_eq!(code("x: [a, y]\ny: b\n"), "config.alias_chained");
+        assert_eq!(code("x: x\n"), "config.alias_only_itself");
+        let e = with("x: [a, y]\ny: b\n").unwrap_err();
+        assert!(e.to_string().contains("`y`"), "{e}");
+        // 重名：YAML 读得进来的话（界面交来的、或者解析器不拦）也要拒
+        let mut x = cfg(vec![c("d", "tw-1")], vec![]);
+        x.aliases = crate::Aliases(vec![
+            crate::Alias {
+                name: "x".into(),
+                models: vec!["a".into()],
+            },
+            crate::Alias {
+                name: "x".into(),
+                models: vec!["b".into()],
+            },
+        ]);
+        assert_eq!(
+            validate(&x).unwrap_err().msg().code,
+            "config.alias_duplicate"
+        );
+        // 文件里写了两遍同一个别名
+        let text = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\naliases:\n  x: a\n  x: b\n";
+        assert!(crate::try_parse(text).is_err());
+    }
+
     /// 按 id 写到的内置规则得真的存在：写错的 id 和写错的字段名一样拒绝，
     /// 说出是哪一项下的哪个 id。
     #[test]
@@ -1057,6 +1195,17 @@ mod msg_codes {
                 guard: Guard::Redact,
                 id: "x".into(),
             }),
+            AliasEmptyName,
+            AliasWildcard { alias: "a".into() },
+            AliasReserved { alias: "a".into() },
+            AliasDuplicate { alias: "a".into() },
+            AliasNoModels { alias: "a".into() },
+            AliasBlankModel { alias: "a".into() },
+            AliasChained {
+                alias: "a".into(),
+                model: "b".into(),
+            },
+            AliasOnlyItself { alias: "a".into() },
         ];
         check(
             "config.",

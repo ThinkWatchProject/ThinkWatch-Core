@@ -31,6 +31,12 @@
 //! 那些占位符这一次没有对应的原值，回答里提到它们也原样留着。这一次重新找到的值从
 //! 存下来的那些号后面接着编（[`tw_gateway::guard::ledger_for`]），不会和它们撞号 ——
 //! 撞了的话，回答里的 1 号会被还原成这一次新找到的那个值，而它原本指的是另一样。
+//!
+//! # 发给这一家的模型名
+//!
+//! 存下来的请求体里写的是客户端要的名字。它是别名的话，原样发出去，上游不认识；规则改写过
+//! 的，原样发出去就成了另一个请求。所以重放和转发一样，发给这一家**它自己的那个名字**（见
+//! [`sent_model`]），请求体和 Gemini 的路径里改的只有这一处，报价也按它算。
 
 use std::time::Instant;
 
@@ -111,6 +117,87 @@ fn replayable_to(provider: &tw_config::Provider) -> Result<(), Fail> {
     Ok(())
 }
 
+/// 重放到 `provider` 时发出去的模型名。
+///
+/// - 原来那一次发给过这一家、发的不是客户端要的那个名字（规则改写、指定模型、插件改名、
+///   别名）：照尝试链上记的发。重放要比的是**同一个请求**，这一家上一次收到的就是它；
+/// - 否则按别名表对到这一家（[`tw_gateway::models::resolve`]）：客户端要的是别名时发这一家
+///   自己的那个名字，不是别名本身；不是别名就是客户端要的那个。
+///
+/// 这一家服务不了这个别名（列表里的名字它一个都没有）：不发，说清楚 —— 发过去只会换来
+/// 一个「没有这个模型」。
+fn sent_model(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    provider: &tw_config::Provider,
+    row: &tw_store::db::RequestRow,
+) -> Result<String, Fail> {
+    if let Some(m) = recorded_model(row, &provider.name) {
+        return Ok(m);
+    }
+    tw_gateway::models::resolve(cfg, catalog, provider, &row.model).ok_or_else(|| {
+        fail(
+            StatusCode::CONFLICT,
+            msg!(
+                "control.replay_alias_unserved",
+                model = row.model.clone(), upstream = provider.name.clone() =>
+                "`{model}` is an alias, and upstream `{upstream}` offers none of its models, so \
+                 the request cannot be replayed there."
+            ),
+        )
+    })
+}
+
+/// 原来那一次发给 `provider` 的、和客户端要的不一样的模型名。尝试链上每一跳只在两者不同时
+/// 记它（`AttemptView::model`）；没有尝试链的老记录，看服务它的那一家发出的名字
+fn recorded_model(row: &tw_store::db::RequestRow, provider: &str) -> Option<String> {
+    let routing = row
+        .routing
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<tw_api::RoutingView>(r).ok());
+    if let Some(routing) = routing
+        && routing.attempts.iter().any(|a| a.provider == provider)
+    {
+        return routing
+            .attempts
+            .iter()
+            .rev()
+            .filter(|a| a.provider == provider)
+            .find_map(|a| a.model.clone())
+            .filter(|m| !m.is_empty() && *m != row.model);
+    }
+    (row.provider == provider && !row.sent_model.is_empty() && row.sent_model != row.model)
+        .then(|| row.sent_model.clone())
+}
+
+/// 存下来的请求换成发给这一家的模型名：请求体里的 `model`，Gemini 是路径里的那一段。
+/// **名字没变时一个字节都不动** —— 和转发一样，改写请求体可能是缓存杀手。
+fn renamed(row: &tw_store::db::RequestRow, raw: Vec<u8>, model: &str) -> (bytes::Bytes, String) {
+    let raw = bytes::Bytes::from(raw);
+    if row.model.is_empty() || model == row.model {
+        return (raw, row.path.clone());
+    }
+    use tw_gateway::client_api::ClientApi;
+    match ClientApi::of_path(&row.path) {
+        Some(ClientApi::Gemini) => (
+            raw,
+            tw_gateway::forward::gemini_path_with_model(&row.path, model),
+        ),
+        // 认不出格式的不动：不知道模型名写在哪儿
+        None => (raw, row.path.clone()),
+        Some(api) => {
+            let set = tw_engine::SetAction {
+                model: Some(model.to_string()),
+                ..Default::default()
+            };
+            (
+                tw_gateway::forward::apply_set(&raw, &set, Some(api.dialect())),
+                row.path.clone(),
+            )
+        }
+    }
+}
+
 /// 报价。**不发任何请求。**
 pub async fn quote(
     State(s): State<ControlState>,
@@ -141,6 +228,7 @@ pub async fn quote(
             )
         })?;
     replayable_to(provider)?;
+    let model = sent_model(&cfg, &s.gateway.catalog.load(), provider, &row)?;
 
     // 输入 token 用记录里的真值 —— 那是上游报回来的，比任何估算都准。
     // 没有的话按字节粗估（和路由用的是同一个系数）
@@ -154,11 +242,11 @@ pub async fn quote(
         output: output.max(256),
         ..Default::default()
     };
-    // **按要重放到的那个上游报价**，不是原来那条走的上游。计费方式和记账
-    let quote =
-        tw_gateway::quote::quote(&book, &provider.name, &row.model, &usage, provider.billing);
+    // **按要重放到的那个上游、发给它的那个模型名报价**，不是原来那条走的上游、也不是客户端
+    // 要的名字（别名、规则改写过的）。计费方式和记账
+    let quote = tw_gateway::quote::quote(&book, &provider.name, &model, &usage, provider.billing);
     Ok(Json(tw_api::ReplayQuote {
-        model: row.model.clone(),
+        model,
         provider: provider.name.clone(),
         body_bytes: raw.len() as i64,
         input_tokens: input as i64,
@@ -205,6 +293,7 @@ pub async fn run(
             )
         })?;
     replayable_to(provider)?;
+    let model = sent_model(&cfg, &s.gateway.catalog.load(), provider, &row)?;
     // **这一家自己的 client，和数据面转发用的是同一个**：它带着这家该走的
     // 代理（`direct` 就是不走任何代理，连系统代理也不读）。换 token 和发请求
     // 都用它 —— 用别的 client，重放就会走一条和原请求不同的出站路径：本机
@@ -222,14 +311,11 @@ pub async fn run(
     // 里已经写着的占位符（见模块说明）
     let rt = s.gateway.runtime();
     let ledger = tw_gateway::guard::ledger_for(&raw);
-    let (body, ledger) = tw_gateway::guard::replace(
-        rt.config.security.redact.mode,
-        &rt.redact,
-        bytes::Bytes::from(raw),
-        &ledger,
-    );
+    let (body, path) = renamed(&row, raw, &model);
+    let (body, ledger) =
+        tw_gateway::guard::replace(rt.config.security.redact.mode, &rt.redact, body, &ledger);
 
-    let url = tw_gateway::forward::upstream_url(&provider.base_url, &row.path, None);
+    let url = tw_gateway::forward::upstream_url(&provider.base_url, &path, None);
     let started = Instant::now();
     let mut r = http.post(&url).header("content-type", "application/json");
     r = tw_gateway::forward::apply_headers(r, &headers);

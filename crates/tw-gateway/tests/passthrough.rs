@@ -68,6 +68,7 @@ async fn start_gateway(upstream: SocketAddr) -> SocketAddr {
     let cfg = Config {
         retention: Default::default(),
         failover: Default::default(),
+        aliases: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -240,6 +241,7 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     let cfg = Config {
         retention: Default::default(),
         failover: Default::default(),
+        aliases: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -346,6 +348,7 @@ async fn an_unreachable_upstream_emits_a_failure_event_and_a_502() {
     let cfg = Config {
         retention: Default::default(),
         failover: Default::default(),
+        aliases: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,
@@ -411,6 +414,7 @@ async fn a_rule_sends_opus_to_one_upstream_and_everything_else_to_another() {
     let cfg = Config {
         retention: Default::default(),
         failover: Default::default(),
+        aliases: Default::default(),
         default_route: None,
         default_key: None,
         plugins: Vec::new(),
@@ -515,6 +519,7 @@ async fn with_no_routes_at_all_requests_still_go_somewhere() {
     let cfg = Config {
         retention: Default::default(),
         failover: Default::default(),
+        aliases: Default::default(),
         default_route: None,
         default_key: None,
         version: 1,

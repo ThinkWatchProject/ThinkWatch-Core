@@ -49,6 +49,71 @@ impl ListingShape {
         };
         slugs(api.servable_by(true))
     }
+
+    /// 这种客户端要的一个模型对象。**列表和单点查询都从这里出** —— 同一个模型在
+    /// 两处必须是同一个对象。
+    fn object(&self, id: &str, meta: &ModelMeta) -> serde_json::Value {
+        match self {
+            ListingShape::Gemini => gemini_model(id, meta),
+            ListingShape::Anthropic => anthropic_model(id, meta),
+            ListingShape::Openai => openai_model(id, meta),
+        }
+    }
+}
+
+/// 列表里一个模型带给客户端的元数据。
+///
+/// 来自价目表，和上游页模型一格的「上下文」（`ModelRow.context_window`）是同一个数。
+/// **查不到就是 `None`，对应的字段整个不出现** —— 客户端读不到会用自己的默认值，
+/// 一个编出来的数它却会照着截断对话。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ModelMeta {
+    /// 一次最多输入多少 token，也就是上下文窗口
+    pub max_input_tokens: Option<u64>,
+    /// 一次最多输出多少 token。只有 Gemini 的模型对象有这一项
+    pub max_output_tokens: Option<u64>,
+}
+
+/// 查一个模型的元数据。
+///
+/// `provider`：知道这个名称发给哪家上游时给上，按它选的价目表查，和上游页那一格是
+/// 同一个查法；不给就查默认价目表。自定义价目表只改单价，上下文窗口照样取自默认
+/// 价目表，所以两种查法给出的通常是同一个数。
+pub(crate) fn model_meta(
+    book: &tw_pricing::PriceBook,
+    provider: Option<&str>,
+    model: &str,
+) -> ModelMeta {
+    let resolved = match provider {
+        Some(p) => book.resolve_for(p, model),
+        None => book.resolve(None, model),
+    };
+    resolved
+        .map(|r| ModelMeta {
+            max_input_tokens: r.price.max_input_tokens,
+            max_output_tokens: r.price.max_output_tokens,
+        })
+        .unwrap_or_default()
+}
+
+/// 列表里一个名称的元数据。
+///
+/// 别名用它第一个有上游提供的模型的（按列表顺序），按提供它的头一家查（见
+/// [`tw_engine::Catalog::first_served`]）。目录空着、列表里谁都不提供时（这时单点
+/// 查询不拦），按它列表里的头一个查默认价目表。
+fn listed_meta(
+    book: &tw_pricing::PriceBook,
+    catalog: &tw_engine::Catalog,
+    cfg: &tw_config::Config,
+    name: &str,
+) -> ModelMeta {
+    if let Some((provider, model)) = catalog.first_served(name) {
+        return model_meta(book, Some(provider), model);
+    }
+    match cfg.aliases.find(name).and_then(|a| a.models.first()) {
+        Some(model) => model_meta(book, None, model),
+        None => model_meta(book, None, name),
+    }
 }
 
 /// `GET /v1/models`。
@@ -77,29 +142,27 @@ pub(super) async fn list_models(
         .find(|c| c.name == client)
         .and_then(|c| c.allow.clone());
     let shape = ListingShape::of(uri.path(), &headers, position);
-    let models = state
-        .catalog
-        .load()
-        .resolve_allowed(Some(&shape.protocols()), allow.as_deref());
+    let catalog = state.catalog.load();
+    let models = catalog.resolve_allowed(Some(&shape.protocols()), allow.as_deref());
+
+    let book = state.pricing.load();
+    let objects: Vec<_> = models
+        .iter()
+        .map(|m| shape.object(m, &listed_meta(&book, &catalog, &rt.config, m)))
+        .collect();
 
     let body = match shape {
-        ListingShape::Gemini => serde_json::json!({
-            "models": models.iter().map(|m| serde_json::json!({
-                "name": format!("models/{m}"),
-            })).collect::<Vec<_>>()
-        }),
+        ListingShape::Gemini => serde_json::json!({ "models": objects }),
         ListingShape::Anthropic => serde_json::json!({
             "object": "list",
-            "data": models.iter().map(|m| anthropic_model(m)).collect::<Vec<_>>(),
+            "data": objects,
             "has_more": false,
             "first_id": models.first(),
             "last_id": models.last(),
         }),
         ListingShape::Openai => serde_json::json!({
             "object": "list",
-            "data": models.iter().map(|m| serde_json::json!({
-                "id": m, "object": "model", "created": RELEASED_AT,
-            })).collect::<Vec<_>>()
+            "data": objects,
         }),
     };
     Ok(axum::Json(body).into_response())
@@ -112,29 +175,58 @@ pub(super) async fn list_models(
 /// 模型每秒换一个发布时间，列表和单点查询跨过整秒就对不上。
 const RELEASED_AT: i64 = 0;
 
+/// OpenAI 格式的一个模型对象。
+///
+/// 知道上下文窗口时，同一个数写成三个字段：各家客户端读的不是同一个名字 ——
+/// Grok Build 读 `context_window`，oh-my-pi 读 `context_length`，Hermes 三个依次试。
+fn openai_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
+    let mut m = serde_json::json!({ "id": id, "object": "model", "created": RELEASED_AT });
+    if let Some(n) = meta.max_input_tokens {
+        m["context_window"] = n.into();
+        m["context_length"] = n.into();
+        m["max_input_tokens"] = n.into();
+    }
+    m
+}
+
 /// Anthropic 格式的一个模型对象。
 ///
 /// **是 OpenAI 那个对象的超集**：Anthropic 的字段（`type`、`display_name`、
-/// `created_at`）之外，`object` 和 `created` 照样在。只放 `x-api-key` 的客户端也被
-/// 认成 Anthropic，其中有按 OpenAI 的形状读列表的，不能让它们读不出来。
+/// `created_at`）之外，`object`、`created` 和上下文窗口那几个字段照样在。只放
+/// `x-api-key` 的客户端也被认成 Anthropic，其中有按 OpenAI 的形状读列表的，不能让
+/// 它们读不出来。
 ///
-/// Claude 的模型再带上 `anthropic_family_tier`：Claude Desktop 按它把模型归到
-/// opus / sonnet / haiku，配置里写的 `sonnet` 这样的简称靠它解析。**只看模型名**，
+/// Claude Desktop 读其中的 `max_input_tokens`，另外读 `supports_1m`：上下文窗口到
+/// 1,000,000 时是 `true`。上下文窗口不知道时这两项都不给。
+///
+/// Claude 的模型再带上 `anthropic_family_tier`：Claude Desktop 按它把模型归档（见
+/// [`family_tier`]），配置里写的 `sonnet` 这样的简称靠它解析。**只看模型名**，
 /// 名字里看不出是 Claude 的一律不标 —— 把别家的模型标成 Claude 是在替客户端撒谎。
-fn anthropic_model(id: &str) -> serde_json::Value {
+fn anthropic_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
     let created_at = chrono::DateTime::from_timestamp(RELEASED_AT, 0)
         .unwrap_or_default()
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let mut m = serde_json::json!({
-        "type": "model",
-        "id": id,
-        "display_name": display_name(id).unwrap_or_else(|| id.to_string()),
-        "created_at": created_at,
-        "object": "model",
-        "created": RELEASED_AT,
-    });
+    let mut m = openai_model(id, meta);
+    m["type"] = "model".into();
+    m["display_name"] = display_name(id).unwrap_or_else(|| id.to_string()).into();
+    m["created_at"] = created_at.into();
+    if let Some(n) = meta.max_input_tokens {
+        m["supports_1m"] = (n >= 1_000_000).into();
+    }
     if let Some(tier) = family_tier(id) {
         m["anthropic_family_tier"] = tier.into();
+    }
+    m
+}
+
+/// Gemini 格式的一个模型对象。上下文窗口和输出上限用 Gemini 自己的字段名。
+fn gemini_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
+    let mut m = serde_json::json!({ "name": format!("models/{id}") });
+    if let Some(n) = meta.max_input_tokens {
+        m["inputTokenLimit"] = n.into();
+    }
+    if let Some(n) = meta.max_output_tokens {
+        m["outputTokenLimit"] = n.into();
     }
     m
 }
@@ -178,13 +270,14 @@ fn display_name(id: &str) -> Option<String> {
     (words.len() > 1).then(|| words.join(" "))
 }
 
-/// 名字里看得出是哪一档的 Claude 模型：`opus`、`sonnet` 或 `haiku`。
+/// 名字里看得出是哪一档的 Claude 模型：`opus`、`sonnet`、`haiku`、`fable` 或
+/// `mythos`（Claude Desktop 认的就是这五档）。
 fn family_tier(id: &str) -> Option<&'static str> {
     let lower = id.to_ascii_lowercase();
     if !lower.contains("claude") && !lower.contains("anthropic") {
         return None;
     }
-    let mut tiers = ["opus", "sonnet", "haiku"]
+    let mut tiers = ["opus", "sonnet", "haiku", "fable", "mythos"]
         .into_iter()
         .filter(|t| lower.contains(t));
     // 名字里同时出现两档的（一个路由别名）不猜
@@ -234,16 +327,8 @@ pub(super) async fn get_model(
             ),
         ));
     }
-    let body = match shape {
-        ListingShape::Gemini => {
-            serde_json::json!({ "name": format!("models/{model}") })
-        }
-        ListingShape::Anthropic => anthropic_model(&model),
-        ListingShape::Openai => {
-            serde_json::json!({ "id": model, "object": "model", "created": RELEASED_AT })
-        }
-    };
-    Ok(axum::Json(body).into_response())
+    let meta = listed_meta(&state.pricing.load(), &catalog, &rt.config, &model);
+    Ok(axum::Json(shape.object(&model, &meta)).into_response())
 }
 
 #[cfg(test)]
@@ -285,9 +370,113 @@ mod tests {
             family_tier("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
             Some("sonnet")
         );
-        assert_eq!(family_tier("claude-fable-5-1"), None);
         // 名字里有 sonnet，但看不出是 Claude
         assert_eq!(family_tier("my-sonnet-alias"), None);
         assert_eq!(family_tier("claude-opus-or-sonnet"), None);
+    }
+
+    #[test]
+    fn fable_and_mythos_are_tiers_too() {
+        assert_eq!(family_tier("claude-fable-5-1"), Some("fable"));
+        assert_eq!(
+            family_tier("global.anthropic.claude-fable-5"),
+            Some("fable")
+        );
+        assert_eq!(family_tier("claude-mythos-preview"), Some("mythos"));
+        assert_eq!(
+            family_tier("anthropic.claude-mythos-preview"),
+            Some("mythos")
+        );
+        assert_eq!(family_tier("claude-fable-or-opus"), None);
+        assert_eq!(family_tier("fable-mini"), None);
+    }
+
+    const KNOWN: ModelMeta = ModelMeta {
+        max_input_tokens: Some(200_000),
+        max_output_tokens: Some(64_000),
+    };
+
+    #[test]
+    fn an_openai_model_carries_its_context_window_under_each_name_clients_read() {
+        let m = openai_model("claude-sonnet-4-5", &KNOWN);
+        assert_eq!(m["id"], "claude-sonnet-4-5");
+        assert_eq!(m["context_window"], 200_000);
+        assert_eq!(m["context_length"], 200_000);
+        assert_eq!(m["max_input_tokens"], 200_000);
+        // 输出上限 OpenAI 的模型对象里没有人读
+        assert!(m.get("max_output_tokens").is_none(), "{m}");
+    }
+
+    #[test]
+    fn an_anthropic_model_says_whether_it_takes_a_million_tokens() {
+        let m = anthropic_model("claude-sonnet-4-5", &KNOWN);
+        assert_eq!(m["max_input_tokens"], 200_000);
+        assert_eq!(m["supports_1m"], false);
+        assert_eq!(m["anthropic_family_tier"], "sonnet");
+        // 仍是 OpenAI 那个对象的超集
+        let openai = openai_model("claude-sonnet-4-5", &KNOWN);
+        for (k, v) in openai.as_object().unwrap() {
+            assert_eq!(&m[k], v, "{k}");
+        }
+
+        for n in [1_000_000, 1_048_576] {
+            let big = ModelMeta {
+                max_input_tokens: Some(n),
+                ..KNOWN
+            };
+            let m = anthropic_model("claude-fable-5", &big);
+            assert_eq!(m["supports_1m"], true, "{n}");
+            assert_eq!(m["max_input_tokens"], n);
+            assert_eq!(m["anthropic_family_tier"], "fable");
+        }
+    }
+
+    #[test]
+    fn a_gemini_model_uses_geminis_field_names() {
+        let m = gemini_model("gemini-2.5-pro", &KNOWN);
+        assert_eq!(m["name"], "models/gemini-2.5-pro");
+        assert_eq!(m["inputTokenLimit"], 200_000);
+        assert_eq!(m["outputTokenLimit"], 64_000);
+    }
+
+    #[test]
+    fn an_unknown_context_window_leaves_the_fields_out() {
+        let unknown = ModelMeta::default();
+        let fields = [
+            "context_window",
+            "context_length",
+            "max_input_tokens",
+            "supports_1m",
+            "inputTokenLimit",
+            "outputTokenLimit",
+        ];
+        for m in [
+            openai_model("my-model", &unknown),
+            anthropic_model("my-model", &unknown),
+            gemini_model("my-model", &unknown),
+        ] {
+            for f in fields {
+                assert!(m.get(f).is_none(), "{f}: {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_comes_from_the_price_table() {
+        let book = tw_pricing::PriceBook::builtin().unwrap();
+        let sonnet = model_meta(&book, None, "claude-sonnet-4-5-20250929");
+        assert_eq!(sonnet.max_input_tokens, Some(200_000));
+        assert_eq!(sonnet.max_output_tokens, Some(64_000));
+        // 给了上游就按它选的价目表查；没选价目表的上游和默认价目表一样
+        assert_eq!(model_meta(&book, Some("up"), "claude-sonnet-4-5"), sonnet);
+        // Bedrock 的名字也查得到
+        assert_eq!(
+            model_meta(&book, Some("bedrock"), "us.anthropic.claude-fable-5").max_input_tokens,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            model_meta(&book, None, "no-such-model-anywhere"),
+            ModelMeta::default()
+        );
     }
 }

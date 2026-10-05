@@ -3,6 +3,14 @@
 # A second column marks codes a UI does not translate:
 #   passthrough  the sentence is only placeholders (system or upstream text); show `text`
 #   test         only produced by tests; never reaches a UI
+config.alias_blank_model
+config.alias_chained
+config.alias_duplicate
+config.alias_empty_name
+config.alias_no_models
+config.alias_only_itself
+config.alias_reserved
+config.alias_wildcard
 config.aws_profile.no_home
 config.aws_profile.no_keys
 config.aws_profile.not_found
@@ -64,7 +72,6 @@ config.no_clients
 config.plugin.bad_id
 config.plugin.duplicate
 config.plugin.file
-config.plugin.reserved_id
 config.plugin.sha256
 config.rejected
 config.rejected_at
@@ -153,7 +160,6 @@ control.plugin.id_taken
 control.plugin.needs_confirmation
 control.plugin.not_found
 control.plugin.order
-control.plugin.reserved_id
 control.plugin.trial_changed
 control.plugin.unreadable
 control.plugin.write_failed
@@ -173,6 +179,7 @@ control.redirect_must_be_app_scheme
 control.remote.control_section_locked
 control.remote.diagnostics_refused
 control.remote.shutdown_refused
+control.replay_alias_unserved
 control.replay_bedrock
 control.request_body_gone
 control.request_body_truncated
@@ -224,6 +231,12 @@ engine.empty_group
 engine.no_action
 engine.no_match
 engine.phase_two_with_to
+engine.pinned_blank_model
+engine.pinned_duplicate_provider
+engine.pinned_empty
+engine.pinned_unknown_provider
+engine.pinned_with_provider_would_be
+engine.pinned_with_set_model
 engine.unknown_default_route
 engine.unknown_route
 engine.unknown_target
@@ -258,11 +271,15 @@ gw.listen.nic_offline
 gw.listen.no_such_nic
 gw.listen.port_taken
 gw.method.not_forwarded
+gw.model.alias_unserved
+gw.model.alias_unserved_rewritten
 gw.model.no_upstream
 gw.model.no_upstream_available
 gw.model.no_upstream_rewritten
 gw.model.not_allowed
 gw.model.not_allowed_rewritten
+gw.model.pinned_not_allowed
+gw.model.pinned_not_offered
 gw.model.unknown
 gw.models.check_failed
 gw.models.empty
@@ -278,6 +295,7 @@ gw.oauth.rotation_no_manager
 gw.oauth.rotation_queue_full
 gw.oauth.status
 gw.oauth.unreachable
+gw.plugin.alias_unserved
 gw.plugin.answer_unreadable
 gw.plugin.api
 gw.plugin.bad_output
@@ -346,6 +364,8 @@ gw.upstream.stream_exception
 gw.upstream.stream_opening_error
 gw.upstream.timeout
 gw.upstream.unreachable
+gw.ws.alias_unserved
+gw.ws.alias_unserved_rewritten
 gw.ws.bad_header
 gw.ws.bad_url
 gw.ws.connect_failed

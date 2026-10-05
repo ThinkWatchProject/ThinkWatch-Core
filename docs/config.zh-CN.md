@@ -106,6 +106,7 @@ twcore config set /listen/gateway/port 8790 --int
 | `security` | 对象，见 [`security`](#cfg-security) | — | 三项防护。出厂时都处在 `observe`，不改变、不拒绝任何请求。 |
 | `retention` | 对象，见 [`retention`](#cfg-retention) | — | 请求日志保留多久。 |
 | `failover` | 对象，见 [`failover`](#cfg-failover) | — | 上游失败后停用多久，以及流式回答的开头最多等多久。 |
+| `aliases` | 映射： 别名 → 字符串或字符串列表 | `{}` | 模型别名：同一个模型在各上游的名称合用一个名字，按顺序列出各上游的名称。请求别名时，提供其中任一名称的上游都能服务，发给它的是列表中它提供的第一个名称。别名不能列出别的别名。 |
 | `groups` | 对象列表，见 [`groups[]`](#cfg-groups) | `[]` | 策略组：多个上游合用一个名字，并规定如何在其中选择。 |
 | `routes` | 对象列表，见 [`routes[]`](#cfg-routes) | `[]` | 路由。一条都不写时，请求按上游的声明顺序故障转移。 |
 | `default_route` | 字符串 | — | 未指定路由的密钥走哪条路由。不写：名为 `default` 的路由；没有这条路由时走内置的故障转移。 |
@@ -212,7 +213,7 @@ listen:
 | `name` | 字符串 | **必填** | 密钥的名字，不能重复。路由规则用 `when.client` 匹配它。 |
 | `key` | 字符串 | **必填** | 客户端发送的密钥（放在 `x-api-key` 或 `Authorization: Bearer` 中）。生成的密钥以 `tw-` 开头，以免被误认作上游的密钥。不能重复。 |
 | `max_concurrent` | 整数 | — | 用这把密钥同时进行的请求数上限，超出的排队等待。不写：不限。`0` 会被拒绝。 |
-| `allow` | 字符串列表 | — | 这把密钥可用的模型，写模型 ID 或通配（`claude-*`）。不写：全部模型。`[]`：一个都不给。 |
+| `allow` | 字符串列表 | — | 这把密钥可用的模型，写模型 ID 或通配（`claude-*`）。写上游模型名，列有它的别名一并可用；写别名只放行别名。不写：全部模型。`[]`：一个都不给。 |
 | `route` | 字符串 | — | 这把密钥的请求走哪条路由。不写：`default_route`。 |
 | `client` | 字符串 | — | 这把密钥是为哪个客户端生成的（`claude-code`、`codex` 等），由桌面应用接管客户端时写入。一个客户端最多一把。 |
 | `disabled` | 布尔 | `false` | 拒绝使用这把密钥的所有请求，密钥本身保留。 |
@@ -715,6 +716,27 @@ security:
 | `stream_start_wait_secs` | 整数 | `15` | 流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。 |
 <!-- /generated -->
 
+### `aliases`
+
+模型别名是同一个模型的另一个名称。客户端像请求其他模型一样请求它，每家上游收到的是自己对这个模型的叫法。
+
+```yaml
+aliases:
+  deepseek-v4.1: DeepSeek-v4.1-flash
+  claude-sonnet-5:
+    - claude-sonnet-5
+    - us.anthropic.claude-sonnet-5-v1:0
+    - anthropic/claude-sonnet-5
+```
+
+- 上游在 `models_only` 范围内提供列出的任一名称，就能服务这个别名，收到的是列表里它提供的第一个名称。能服务同一别名的上游互为备用。
+- `GET /v1/models` 在上游模型旁一并列出别名，原来的名称照常可用。
+- 别名优先于同名的上游模型：上例中请求 `claude-sonnet-5` 只会发给提供这三个名称之一的上游。要让某家上游继续用自己的同名模型提供服务，把它的名称列进去。
+- 密钥的 `allow` 和规则的 `when.model` 写上游模型名时，对列有这个名称的别名同样有效；写别名时只对别名有效。
+- 上游答的是发给它的那个模型时，回答里的模型名写成客户端请求的名称；答的是别的模型，原样转发。
+- 计价和上游体检按发给上游的名称；请求记录保留客户端请求的名称，每次尝试记录实际发出的名称。
+- 要把某把密钥的请求发到某家上游的某个模型，用带指定模型的规则（[`routes[].rules[].to`](#cfg-routes-rules-to)），不要用别名：别名会改变这个名称对所有客户端的含义。
+
 ### `groups`
 
 策略组让多个上游合用一个名字。规则用 `to` 把请求交给策略组。
@@ -756,9 +778,33 @@ security:
 |---|---|---|---|
 | `name` | 字符串 | **必填** | 日志和流量详情中显示的名字。 |
 | `when` | 对象，见 [`routes[].rules[].when`](#cfg-routes-rules-when) | — | 条件，须全部满足。不写：匹配所有请求。 |
-| `to` | 字符串 | — | 上游或策略组的名字；`__all__` 表示按声明顺序的全部上游。不能与 `when.provider_would_be` 同时写。 |
+| `to` | 字符串，或对象列表，见 [`routes[].rules[].to[]`](#cfg-routes-rules-to) | — | 上游或策略组的名字；`__all__` 表示按声明顺序的全部上游。也可以指定模型：列出上游及发给它的模型，按顺序备用。不能与 `when.provider_would_be` 同时写。 |
 | `set` | 对象，见 [`routes[].rules[].set`](#cfg-routes-rules-set) | — | 改写请求参数。从所有匹配的规则累积，不只第一条。 |
 | `deny` | 字符串 | — | 以这句原因拒绝请求。 |
+<!-- /generated -->
+
+#### `routes[].rules[].to`
+
+`to` 写上游或策略组的名称，或者指定模型：一组上游，每家写明发给它的模型，按顺序备用。指定模型原样发出，不经过别名，也不受 `set.model` 影响；所以即使同名别名指向别处，规则仍能把某把密钥的请求发到某家上游的这个模型。
+
+```yaml
+routes:
+  - name: default
+    rules:
+      - name: Opus 走 Bedrock
+        when: { model: claude-opus-5 }
+        to:
+          - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+          - { provider: anthropic, model: claude-opus-5 }
+```
+
+<!-- generated: table routes[].rules[].to[] -->
+<a id="cfg-routes-rules-to"></a>
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `provider` | 字符串 | **必填** | 上游的名字，不能是策略组。同一个上游在列表中只出现一次。 |
+| `model` | 字符串 | **必填** | 发给这个上游的模型名，原样发出：不经过别名，也不受 `set.model` 改写。同一条规则里不能再写 `set.model`。 |
 <!-- /generated -->
 
 #### `routes[].rules[].when`
@@ -768,7 +814,7 @@ security:
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `model` | 字符串 | — | 请求的模型，可用通配（`claude-opus-*`）。 |
+| `model` | 字符串 | — | 请求的模型，可用通配（`claude-opus-*`）。写上游模型名，也匹配请求列有它的别名的请求；写别名只匹配请求这个别名的。 |
 | `client` | 字符串 | — | 请求所用网关密钥的名字，精确匹配。 |
 | `dialect` | 字符串 | — | 客户端使用的接口格式：`anthropic`、`openai-chat`、`openai-responses`、`gemini`。 |
 | `input_tokens` | 比较式（`>200k`、`<=4k`、`==3`） | — | 估算的输入 token 数。 |
@@ -786,6 +832,8 @@ security:
 比较式以 `>`、`>=`、`<`、`<=` 或 `==` 开头，数字可以带 `k` 或 `m` 后缀：`">200k"`、`"<=4k"`。不带运算符是错误，不当作相等：单写 `"200k"` 会被拒绝。
 
 #### `routes[].rules[].set`
+
+`set.model` 可以写别名，每家上游收到各自对它的叫法。和别名一样，回答里的模型名写成客户端请求的名称。
 
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
@@ -839,7 +887,7 @@ default_route: default
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `id` | 字符串 | **必填** | 小写字母、数字和连字符，1 到 40 个字符，不能重复。`order`、`inspect`、`rewrite` 和 `confirmed` 被控制面占用。 |
+| `id` | 字符串 | **必填** | 小写字母、数字和连字符，1 到 40 个字符，不能重复。 |
 | `file` | 字符串 | **必填** | 插件的代码，相对本文件所在的目录。只能是 `plugins/<id>.js`，由应用写入。 |
 | `sha256` | 字符串 | **必填** | 批准过的代码的 SHA-256，64 个小写十六进制字符。文件的哈希与它不符时插件停止运行，直到在应用里批准这次改动。批准过的代码另存在 `plugins/.approved/<id>.js`。 |
 | `enabled` | 布尔 | `true` | 是否运行这个插件。`false`：插件保留，不参与任何请求。 |

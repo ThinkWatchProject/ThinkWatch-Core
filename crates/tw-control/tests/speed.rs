@@ -67,6 +67,8 @@ struct Seen {
     path: String,
     host: String,
     anthropic_version: Option<String>,
+    /// 请求体里的模型名
+    model: String,
 }
 
 /// 一个假的 HTTP 代理，同时扮演上游。
@@ -74,9 +76,10 @@ struct Seen {
 /// **上游地址故意写成解析不了的域名**：请求只有真的经过代理才能到达这里。
 /// 走默认 client 的话，它会在 DNS 那一步失败 —— 测试要抓的正是这个。
 async fn proxy_that_answers(seen: Arc<Mutex<Option<Seen>>>) -> std::net::SocketAddr {
-    let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
+    let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: String| {
         let seen = seen.clone();
         async move {
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             *seen.lock().unwrap() = Some(Seen {
                 path: uri.path().to_string(),
                 host: headers
@@ -88,6 +91,7 @@ async fn proxy_that_answers(seen: Arc<Mutex<Option<Seen>>>) -> std::net::SocketA
                     .get("anthropic-version")
                     .and_then(|v| v.to_str().ok())
                     .map(String::from),
+                model: body["model"].as_str().unwrap_or_default().to_string(),
             });
             let sse = concat!(
                 "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
@@ -250,4 +254,75 @@ providers:
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 测的是别名：每一家发的是**它自己的那个名字**，报价也按它；列表里的名字一家一个都服务不了
+/// 的，和服务不了一个真名一样跳过（不在启用范围里 / 清单里没有）
+#[tokio::test]
+async fn an_alias_is_tested_under_each_upstreams_own_name() {
+    let seen = Arc::new(Mutex::new(None));
+    let proxy = proxy_that_answers(seen.clone()).await;
+    let yaml = format!(
+        "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+aliases:
+  sonnet:
+    - claude-sonnet-4-5
+    - anthropic/claude-sonnet-4-5
+proxies:
+  - name: corp
+    type: http
+    addr: {proxy}
+providers:
+  - name: official
+    base_url: https://api.anthropic.com
+    key: sk-x
+  - name: relay
+    base_url: http://relay.speed-test.invalid
+    key: sk-y
+    protocol: anthropic
+    proxy: corp
+    models_only: [\"anthropic/*\"]
+  - name: haiku-only
+    base_url: https://relay.example
+    key: sk-z
+    models_only: [claude-haiku-*]
+"
+    );
+    let b = bed(&yaml);
+    let (st, v) = post(&b.app, "/speed/quote", r#"{"model":"sonnet"}"#).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let items = v["items"].as_array().unwrap();
+    let pick = |name: &str| items.iter().find(|i| i["provider"] == name).unwrap();
+    let (official, relay, scoped) = (pick("official"), pick("relay"), pick("haiku-only"));
+    assert_eq!(official["model"], "claude-sonnet-4-5", "{v}");
+    assert_eq!(relay["model"], "anthropic/claude-sonnet-4-5", "{v}");
+    assert!(official.get("skipped").is_none(), "{v}");
+    assert!(relay.get("skipped").is_none(), "{v}");
+    assert_eq!(scoped["skipped"], "out_of_scope", "{v}");
+    // 按发出去的名字报价：它在价目表里有价，别名本身没有
+    assert!(
+        official["cost_micros"].as_i64().is_some_and(|c| c > 0),
+        "{v}"
+    );
+
+    let (st, v) = post(
+        &b.app,
+        "/speed/run",
+        r#"{"providers":["relay","haiku-only"],"model":"sonnet"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let results = v.as_array().unwrap();
+    assert_eq!(results.len(), 1, "服务不了的那一家不测：{v}");
+    assert_eq!(results[0]["provider"], "relay", "{v}");
+    assert_eq!(results[0]["ok"], true, "{v}");
+    assert_eq!(results[0]["model"], "anthropic/claude-sonnet-4-5", "{v}");
+    let seen = seen.lock().unwrap().clone().expect("代理没收到请求");
+    assert_eq!(seen.model, "anthropic/claude-sonnet-4-5");
 }

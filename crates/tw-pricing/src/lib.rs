@@ -18,6 +18,7 @@
 //! 记成 0 —— 那是在撒谎，而一个会撒谎的成本面板不如没有。
 
 mod book;
+pub mod model_name;
 pub mod name;
 mod sheet;
 mod table;

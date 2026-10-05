@@ -1,11 +1,12 @@
 //! 两个模型名说的是不是同一个模型。
 //!
-//! 上游体检拿发出去的模型名和上游在回答里写的比（见 [`crate::health`]）。**两边写法
+//! 上游体检拿发出去的模型名和上游在回答里写的比（见 `tw_store::health`），网关把回答里的
+//! 模型名换回客户端用的名称之前也拿它比（见 `tw_gateway::answer_model`）。**两边写法
 //! 不一样是常态**：请求里写别名、回答里写带日期的快照（`claude-sonnet-4-5` →
 //! `claude-sonnet-4-5-20250929`），中转站带着厂商前缀（`anthropic/claude-sonnet-4.5`），
 //! Bedrock 有它自己的一套（`us.anthropic.claude-sonnet-4-5-20250929-v1:0`）。
 //!
-//! **方向和价目表那边（`tw_pricing::name`）相反。**查价宁可查不到，也不能把一个模型
+//! **方向和价目表那边（[`crate::name`]）相反。**查价宁可查不到，也不能把一个模型
 //! 猜成另一个、给出一个自信的错数字；这里宁可把两个名字认成同一个，也不能错判一次
 //! 「对不上」—— 那是在冤枉一家诚实的上游。所以这里抹掉的是**一切不是换了模型的
 //! 差别**，但模型本身的身份（家族、大小、代数、变体）一个字都不动：`opus` 和 `sonnet`、
@@ -127,11 +128,7 @@ const BEDROCK_VENDORS: &[&str] = &[
 fn bedrock(id: &str) -> &str {
     // 地域前缀：和价目表认的是同一张清单。后面得还是一个 `厂商.模型` 的 id
     let id = match id.split_once('.') {
-        Some((geo, rest))
-            if tw_pricing::name::BEDROCK_GEOS.contains(&geo) && rest.contains('.') =>
-        {
-            rest
-        }
+        Some((geo, rest)) if crate::name::BEDROCK_GEOS.contains(&geo) && rest.contains('.') => rest,
         _ => id,
     };
     let Some(name) = id

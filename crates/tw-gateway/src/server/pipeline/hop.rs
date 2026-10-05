@@ -24,7 +24,8 @@ use tw_types::msg;
 pub(super) struct Served<'a> {
     pub(super) upstream: reqwest::Response,
     pub(super) provider: &'a tw_config::Provider,
-    /// 发给它的模型名：路由规则、插件改过的是改过之后的。回答钩子的 `ctx.model` 和范围看它
+    /// 发给它的模型名：路由规则、插件改过的是改过之后的。回答钩子的 `ctx.model` 和范围看它；
+    /// 和客户端要的不一样时，回答里的模型名按它认、换回客户端的（见 [`crate::answer_model`]）
     pub(super) model: String,
     /// 它是尝试链上的第几跳。回答钩子的运行记录按它分组
     pub(super) attempt: usize,
@@ -129,6 +130,10 @@ pub(super) async fn try_upstreams<'a>(
     // 最后发出去的那一跳，插件改过的话改过之后的请求和那一跳的账：存下来的「插件改过的
     // 请求」就是它 —— 回答的那一家收到的那一份
     let mut after_plugins: Option<(Bytes, tw_guard::redact::replace::Ledger)> = None;
+    // 别名对到每一家时看的清单：整个请求用同一份
+    let catalog = state.catalog.load();
+    // 这把密钥的模型范围：每一跳发出的名字都要过它（见 `crate::sent::name`）
+    let allow = crate::models::key_allow(&rt.config, &req.client_name);
 
     for (i, name) in started.alive.iter().enumerate() {
         // 后面没有别的候选了
@@ -172,7 +177,7 @@ pub(super) async fn try_upstreams<'a>(
         // **在循环里面，因为故障转移换了 provider 之后必须重算**。
         // 否则「走中转的一律脱敏」这条规则，在从官方转移到中转时会漏掉
         // —— 而那正是最需要它的时刻。
-        let mut effective_set = match rt.engine.phase_two(
+        let (mut effective_set, renamed) = match rt.engine.phase_two(
             &reading.facts,
             &provider.name,
             &decision.set,
@@ -180,13 +185,14 @@ pub(super) async fn try_upstreams<'a>(
             Ok(tw_engine::Outcome2::Proceed {
                 set,
                 rewritten_by: more,
+                model,
             }) => {
                 for r in more {
                     if !rewritten_by.contains(&r) {
                         rewritten_by.push(r);
                     }
                 }
-                set
+                (set, model)
             }
             Ok(tw_engine::Outcome2::Deny { rule, reason }) => {
                 tracing::info!(%rule, provider = %provider.name, "a phase-two rule denied the request");
@@ -214,16 +220,46 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
-        // 这一跳要发的模型名：规则改写过的是改写之后的
-        let sent = effective_set
-            .model
-            .clone()
-            .unwrap_or_else(|| reading.facts.model.clone());
+        // 这一家要的模型（见 `Engine::asked_of`）和发给它的名字：客户端那一侧的名称（客户端
+        // 写的、阶段一改写的）按别名表对到**这一家**自己的名称，故障转移换一家就重新对；
+        // 指定的模型、阶段二改的名字原样发出（见 `crate::sent`）
+        let asked_model =
+            rt.engine
+                .asked_of(&reading.facts, decision, &provider.name, renamed.as_deref());
+        let sent = match crate::sent::name(
+            &rt.config,
+            &catalog,
+            decision,
+            provider,
+            &asked_model,
+            allow,
+        ) {
+            Ok(sent) => sent,
+            // 这一家服务不了（别名列的名字它一个都没有，或者清单里没有这个名字）。路由时已经
+            // 跳过了这样的候选，能到这儿说明它的清单刚刚换过：**不把别名原样发给它**，换下一家。
+            // 发给它的名字密钥不让用的，路由时也跳过了；这里再看一遍，哪一跳都发不出它
+            Err(skip) => {
+                let mut serving = crate::models::Serving::default();
+                serving.skipped.push((provider.name.clone(), skip));
+                let err = serving.explain(&asked_model.model);
+                chain.push(hop_failed(
+                    &provider.name,
+                    None,
+                    err.detail.clone(),
+                    hop_started,
+                ));
+                last_err = Some(err);
+                continue;
+            }
+        };
+        // 和客户端写的一样就不动请求体里的模型名（改写过又对回来的也一样）
+        effective_set.model = (sent != reading.facts.model).then(|| sent.clone());
         // 改写过、和客户端要的不一样的才记（见 `AttemptView::model`）
         let asked_other = |m: &String| *m != reading.facts.model;
-        // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数
+        // 数 token 不换模型：另一个模型的 tokenizer 数出来的不是这个数。**比的是要的模型**：
+        // 同一个别名在各家名字不同，是同一个模型
         if counting {
-            let model = Some(sent.clone()).filter(asked_other);
+            let model = Some(asked_model.model.clone()).filter(asked_other);
             match &count_model {
                 None => count_model = Some(model),
                 Some(first) if *first != model => {
@@ -249,7 +285,7 @@ pub(super) async fn try_upstreams<'a>(
         .await
         {
             Ok(p) => p,
-            Err(why) => {
+            Err(super::plug::Stop::Request(why)) => {
                 // 这一跳没有发出去。**它在尝试链上**，原因就是拒绝它的那句话
                 chain.push(hop_failed(
                     &provider.name,
@@ -259,6 +295,17 @@ pub(super) async fn try_upstreams<'a>(
                 ));
                 halt = Some(GatewayError::denied(why));
                 break;
+            }
+            // 插件换上的别名这一家服务不了：这一家不发，换下一家
+            Err(super::plug::Stop::Hop(why)) => {
+                chain.push(hop_failed(
+                    &provider.name,
+                    Some(sent.clone()).filter(asked_other),
+                    why.clone(),
+                    hop_started,
+                ));
+                last_err = Some(GatewayError::new(crate::error::Source::Request, why));
+                continue;
             }
         };
         // 插件换了发给这一家的模型名：和规则改写的一样，只是盖过它

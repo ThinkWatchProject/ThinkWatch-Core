@@ -492,6 +492,107 @@ async fn the_hook_sees_the_upstream_the_sent_model_and_the_asked_one() {
     assert_eq!(up.seen.lock().unwrap()[0].1["model"], "glm-5");
 }
 
+/// 插件换上的是别名：和客户端要的别名一样，每一家发的是**它自己的那个名字**（a 只有
+/// `claude-*`，b 只有 `anthropic/*`），尝试链上记的也是它。列表里的名字一个都服务不了的那
+/// 一家（c）这一跳不发、换下一家：后面的上游服务得了
+#[tokio::test]
+async fn a_plugin_renaming_to_an_alias_sends_each_upstream_its_own_name() {
+    let (a, b, mut providers) = a_fails_then_b().await;
+    providers[0].models_only = Some(vec!["claude-*".into()]);
+    providers[1].models_only = Some(vec!["anthropic/*".into(), "claude-sonnet-4-5".into()]);
+    let c = Upstream::default();
+    let mut only_asked = provider("c", start_upstream(c.clone()).await, Protocol::Anthropic);
+    only_asked.models_only = Some(vec!["claude-sonnet-4-5".into()]);
+    providers.insert(0, only_asked);
+    let to_alias = Double::new("to alias")
+        .permit(&[Permission::Params])
+        .on_request(|mut view, _| {
+            view["params"]["model"] = json!("sonnet");
+            Invocation::ok(RequestOutcome::Changed(view))
+        });
+    let gw = gateway_of(
+        Config {
+            providers,
+            aliases: tw_config::Aliases(vec![tw_config::Alias {
+                name: "sonnet".into(),
+                models: vec!["claude-sonnet-5".into(), "anthropic/claude-sonnet-5".into()],
+            }]),
+            ..config()
+        },
+        vec![entry("alias", to_alias)],
+    )
+    .await;
+    let rx = gw.state.bus.subscribe();
+    let (status, _) = post(&gw, "/v1/messages", &anthropic_body()).await;
+    assert_eq!(status, 200);
+    assert_eq!((c.hits(), a.hits(), b.hits()), (0, 1, 1));
+    assert_eq!(a.seen.lock().unwrap()[0].1["model"], "claude-sonnet-5");
+    assert_eq!(
+        b.seen.lock().unwrap()[0].1["model"],
+        "anthropic/claude-sonnet-5"
+    );
+    let chain: Vec<(String, Option<String>, Option<String>)> = routed(rx)
+        .await
+        .into_iter()
+        .map(|h| (h.provider, h.model, h.error.map(|e| e.code)))
+        .collect();
+    assert_eq!(
+        chain,
+        [
+            ("c".into(), None, Some("gw.plugin.alias_unserved".into())),
+            ("a".into(), Some("claude-sonnet-5".into()), None),
+            ("b".into(), Some("anthropic/claude-sonnet-5".into()), None),
+        ]
+    );
+}
+
+/// 插件换上的别名，密钥的范围按客户端那一侧的规矩看：只许 `claude-sonnet-*` 的密钥，插件
+/// 换成列了 `claude-sonnet-5` 的别名 `sonnet` 照常发（和客户端直接要 `sonnet` 一样放行）；
+/// 换成只列了 `claude-opus-5` 的 `opus` 不发
+#[tokio::test]
+async fn a_plugin_renaming_to_an_alias_inherits_the_keys_allow_like_a_request_for_it() {
+    for (alias, allowed) in [("sonnet", true), ("opus", false)] {
+        let up = Upstream::default();
+        let base = start_upstream(up.clone()).await;
+        let rename = Double::new("rename")
+            .permit(&[Permission::Params])
+            .on_request(move |mut view, _| {
+                view["params"]["model"] = json!(alias);
+                Invocation::ok(RequestOutcome::Changed(view))
+            });
+        let mut cfg = Config {
+            providers: vec![provider("a", base, Protocol::Anthropic)],
+            aliases: tw_config::Aliases(vec![
+                tw_config::Alias {
+                    name: "sonnet".into(),
+                    models: vec!["claude-sonnet-5".into()],
+                },
+                tw_config::Alias {
+                    name: "opus".into(),
+                    models: vec!["claude-opus-5".into()],
+                },
+            ]),
+            ..config()
+        };
+        cfg.clients[0].allow = Some(vec!["claude-sonnet-*".into()]);
+        let gw = gateway_of(cfg, vec![entry("rename", rename)]).await;
+        let (status, body) = post(&gw, "/v1/messages", &anthropic_body()).await;
+        if allowed {
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(up.seen.lock().unwrap()[0].1["model"], "claude-sonnet-5");
+        } else {
+            assert_eq!(status, 403, "{body}");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains(
+                    "changed the model to opus, which gateway key `claude-code` may not use"
+                ),
+                "{body}"
+            );
+            assert_eq!(up.hits(), 0);
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_rejection_is_answered_in_the_clients_format_and_nothing_goes_upstream() {
     let up = Upstream::default();

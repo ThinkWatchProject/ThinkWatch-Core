@@ -455,6 +455,9 @@ slug_enum! {
         OutOfScope = "out_of_scope",
         /// 模型清单里没有
         NotOffered = "not_offered",
+        /// 发给它的名字这把密钥不让用（`allow`）：指定模型、阶段二改的名字一家一个，
+        /// 只在试算给了密钥时出现
+        NotAllowed = "not_allowed",
     }
 }
 
@@ -738,7 +741,30 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// （[`ConfigRepairRequest`] → [`ConfigWritten`]）照着修好写回。取值不在可选范围里、字段不认识
 /// 这两种字段错有了自己的码：`config.unknown_variant`、`config.unknown_field`（以前是
 /// `config.unparsable` 里的一句英文原话）；修不了时 `control.config_not_repairable`。
-pub const CONTROL_API_VERSION: u32 = 37;
+///
+/// **38 起有模型别名**：配置多了顶层的 `aliases`（一个名称 → 同一个模型在各家上游的名称，
+/// 有序），新端点 `GET /aliases`、`POST /aliases`、`PUT /aliases/{name}`（可改名，密钥范围和
+/// 规则里等于旧名的地方在同一个版本里一起改；旧名还在列表里时只改 `set.model`）、
+/// `DELETE /aliases/{name}`、`POST /alias-preview`、`GET /aliases/{name}/usage`（预览不在
+/// `/aliases/` 底下，免得盖住一个叫 `preview` 的别名）。`GET /models` 的列表含别名
+/// （[`KnownModel::alias`]；和真模型同名时只有别名那一项），真模型带着列出它的别名
+/// （[`KnownModel::aliases`]），上游模型清单的每一行也带（[`ModelRow::aliases`]）。规则的
+/// 去向可以是指定模型：[`RuleView::to`]、[`RuleInput::to`] 是 [`RuleTarget`]，字符串或
+/// `[{provider, model}]` 的列表，和配置里的 `to` 一个写法。试算多了 `candidate_models`：每个
+/// 候选发出的模型名，以及它是别名、规则改写还是指定模型来的；给了密钥时，发给哪一家的名字
+/// 这把密钥不让用，那一家跳过（`skipped` 的 `not_allowed`）。发出的模型名和客户端写的不同、
+/// 上游答的又是同一个模型时，回答里的模型名（含 `openai-model`、`x-openai-model` 回应头）
+/// 写成客户端写的名称。照 37 写的界面读不懂列表形状的 `to`，保存规则时会把指定模型丢掉。
+/// 同一版起**写死的一段不再盖住用户起的名字**：`/providers/`、`/proxies/`、`/plugins/` 底下
+/// 不针对某一个的端点挪了出来（端点名不变）—— `POST /providers/test` → `POST /provider-test`、
+/// `POST /providers/preview` → `POST /provider-preview`、`POST /proxies/test` →
+/// `POST /proxy-test`、`POST /plugins/inspect` → `POST /plugin-inspect`、
+/// `POST /plugins/rewrite` → `POST /plugin-rewrite`、`POST /plugins/confirmed` →
+/// `POST /plugin-confirmed`、`PUT /plugins/order` → `PUT /plugin-order`。以前叫 `test`、
+/// `preview` 的上游和叫 `test` 的代理改和删都是 405；插件 id 不再保留 `order`、`inspect`、
+/// `rewrite`、`confirmed` 这几个词，消息码 `config.plugin.reserved_id`、
+/// `control.plugin.reserved_id` 跟着删。
+pub const CONTROL_API_VERSION: u32 = 38;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1423,8 +1449,9 @@ slug_enum! {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AttemptView {
     pub provider: String,
-    /// 规则改写了模型名：这一跳发给（没发出去的，要发给）上游的是哪个。没改写的
-    /// 没有 —— 发出去的就是客户端要的那个（`RequestStarted::model`）。
+    /// 这一跳发给（没发出去的，要发给）上游的模型名，和客户端要的不一样时才有：别名对到
+    /// 这一家的名称、规则改写、规则指定的模型、插件改名。一样的没有 —— 发出去的就是客户端
+    /// 要的那个（`RequestStarted::model`）。
     ///
     /// **费用按它算**：请求改写成另一个模型发出去，上游按那个模型收钱。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1995,6 +2022,37 @@ pub enum ReferenceView {
     Group { group: String },
 }
 
+/// 规则「指定模型」里的一项，也是别名在某家上游实际发出的名称：哪家上游、发什么模型名。
+///
+/// **模型名原样发出**，不经过别名表 —— 和配置里 `to: [{provider, model}]` 同一个形状。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PinnedModel {
+    pub provider: String,
+    pub model: String,
+}
+
+/// 规则转发到哪里（[`RuleView::to`]、[`RuleInput::to`]）。
+///
+/// **线上和配置里的 `to` 一个写法**：一个字符串是上游或策略组的名字（`__all__` 是全部
+/// 上游），一个列表是指定模型 —— 「上游 + 模型」，按顺序备用，模型名原样发出。前端的
+/// 类型是 `string | Array<PinnedModel>`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum RuleTarget {
+    /// 上游或策略组的名字
+    Name(String),
+    /// 指定模型，按顺序备用
+    Models(Vec<PinnedModel>),
+}
+
+impl From<&str> for RuleTarget {
+    fn from(name: &str) -> Self {
+        RuleTarget::Name(name.to_string())
+    }
+}
+
 /// 一条规则。
 ///
 /// **是全文，不是摘要** —— 编辑对话框靠它回填：条件、去向、拒绝原因、
@@ -2005,9 +2063,9 @@ pub struct RuleView {
     pub name: String,
     /// `when` 里写了的条件，按固定顺序。空 = 兜底
     pub conditions: Vec<ConditionView>,
-    /// 去向：上游名或组名。拒绝的规则和只附加改写的规则没有
+    /// 去向：上游名或组名，或者指定模型的列表。拒绝的规则和只附加改写的规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+    pub to: Option<RuleTarget>,
     /// 命中就拒绝。值是返回给客户端的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
@@ -2247,7 +2305,7 @@ pub struct ProviderTestResult {
 /// L1 测速：只握手，不发业务请求。**零成本零副作用**。
 ///
 /// 给了名字就测那一家，不给就测所有上游。代理自己的检测走
-/// `/proxies/test`，还没保存的上游走 `/providers/test`。
+/// `/proxy-test`，还没保存的上游走 `/provider-test`。
 ///
 /// **不接受一个「候选 URL 列表」。** cc-switch 有那么一张表，测完还得手动
 /// 点一下填进去，运行时永远只认当前保存的那一个 —— 同一个概念在一个程序
@@ -2813,6 +2871,9 @@ pub struct ModelRow {
     pub price_source: Option<PriceSourceView>,
     /// 价格是从别的平台借来的。**按它算出来的钱是估算**
     pub estimated: bool,
+    /// 列出了这个模型名的别名，按别名表的顺序。**不论这家发不发它**：别名在这家按列表
+    /// 顺序取它有的第一个，排在后面的名字也算列进了这个别名
+    pub aliases: Vec<String>,
 }
 
 fn direct() -> String {
@@ -2916,6 +2977,155 @@ pub struct ProxyTest {
     pub current: Option<String>,
 }
 
+// ─────────────────────────────────────────────── 模型别名
+
+/// 一个别名上用户能改的东西：名字，和它在各家上游叫什么（有序）。
+///
+/// 和配置里 `aliases` 的一项是同一件事：哪家上游提供列表里的任一名称，就能服务这个
+/// 别名，发过去用它自己的那个名称（按列表顺序取它有的第一个）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasInput {
+    pub name: String,
+    pub models: Vec<String>,
+}
+
+/// 新建或保存一个别名（`POST /aliases`、`PUT /aliases/{name}`）。保存时名字可以改：
+/// 引用它的密钥和规则在同一个版本里跟着改（见 [`AliasWritten`]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasSave {
+    pub alias: AliasInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 别名列表里的一个名称，以及哪些上游的模型清单里有它。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasModel {
+    pub model: String,
+    /// 清单里有这个名称、而且它在启用范围里的上游，按配置里的顺序。**没有清单的上游不在
+    /// 这里**：不知道它有什么
+    pub providers: Vec<String>,
+}
+
+/// 别名页的一行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasView {
+    pub name: String,
+    /// 按书写顺序
+    pub models: Vec<AliasModel>,
+    /// 每家能服务它的上游实际发出的名称，按配置里的顺序。停用的上游不在里面；没有清单
+    /// 的上游当作能服务（取列表里第一个在它启用范围里的名称）。**和网关一致**：有上游
+    /// 有清单、而有清单的上游谁都不提供列表里的名称时是空的 —— 请求在准入就被拒了，
+    /// 没有清单的上游也轮不到
+    pub served_by: Vec<PinnedModel>,
+    /// 清单里有一个和别名同名的真模型、而别名的列表里没有这个名称的上游：**这个名称
+    /// 不会再发给它们**（别名优先）
+    pub shadows: Vec<String>,
+    /// 上下文窗口，来自默认价目表：第一家能服务它的上游发出的那个模型的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// 最近 24 小时里客户端用这个名称发来的请求
+    pub requests_24h: u64,
+    /// 那些请求的费用（百万分之一美元）。没有请求、或者一条都算不出钱时是空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros_24h: Option<i64>,
+}
+
+/// 一条建议：几家上游上名称不同、其实是同一个模型。**只认 Claude**（见
+/// [`AliasesView::suggestions`]）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasSuggestion {
+    /// 给人看的名字：`Claude Opus 5`；带日期的快照后面跟着日期：
+    /// `Claude Sonnet 4.5 (2025-09-29)`
+    pub label: String,
+    /// 每家上游上的名称，按配置里上游的顺序
+    pub models: Vec<PinnedModel>,
+}
+
+/// 别名页（`GET /aliases`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasesView {
+    /// 按书写顺序
+    pub aliases: Vec<AliasView>,
+    /// 同一个模型在不同上游上叫不同名称的几组。**只认 Claude**：各家清单里的名称归一之后
+    /// 完全相等才算同一个 —— 去掉路径前缀（`anthropic/`）、Bedrock 的地域前缀、
+    /// `anthropic.` 和 `-v1:0`，Vertex 的 `@日期` 写成 `-日期`，版本号里的点写成横线；
+    /// **日期保留**，带日期和不带日期的不算同一个。至少两家上游、至少两种写法才成组；
+    /// 已经被某一个别名全部列进去的组不出
+    pub suggestions: Vec<AliasSuggestion>,
+}
+
+/// 预览一个还没保存的别名（`POST /alias-preview`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasPreviewRequest {
+    pub alias: AliasInput,
+    /// 正在编辑的那个别名原来的名字。新建时不给。**给了才不会把改名当成和自己重名**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+}
+
+/// 预览的结果：存得存不了，存了之后发往哪儿。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasPreview {
+    /// 挡着保存的问题，和保存时配置校验说的是同一句。空 = 存得了
+    pub problems: Vec<Msg>,
+    /// 存了之后每家上游发出的名称（同 [`AliasView::served_by`]）
+    pub served_by: Vec<PinnedModel>,
+    /// 列表里没有哪家上游的清单里有的名称。准入会拒掉这个别名时（`served_by` 是空的）
+    /// 是列表里的全部名称
+    pub unserved: Vec<String>,
+    /// 同 [`AliasView::shadows`]
+    pub shadows: Vec<String>,
+    /// 别的上游上的同一个模型（建议勾选）：清单里的名称和列表里某个名称归一之后相等，
+    /// 规则同 [`AliasesView::suggestions`]。列表里已经有的名称、已经有列表里某个名称的
+    /// 上游不在里面
+    pub same_model: Vec<PinnedModel>,
+}
+
+/// 一条写着这个名称的规则。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasRuleRef {
+    pub route: String,
+    pub rule: String,
+    /// `when.model` 或 `set.model`
+    pub field: String,
+}
+
+/// 谁在用这个别名（`GET /aliases/{name}/usage`）：删除、改名之前摆给人看。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasUsage {
+    /// 最近 24 小时里客户端用这个名称发来的请求
+    pub requests_24h: u64,
+    /// 可见模型（`allow`）里有一项正是这个名称的密钥。**按整项比**，通配不算
+    pub keys: Vec<String>,
+    /// 条件（`when.model`）或改写（`set.model`）正是这个名称的规则。阶段二规则的
+    /// `set.model` 不算：它原样发出，不经过别名表
+    pub rules: Vec<AliasRuleRef>,
+}
+
+/// 保存了一个别名（`PUT /aliases/{name}`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AliasWritten {
+    pub version: String,
+    /// 改名时在同一个版本里一起改掉的引用。没改名时是空的；`requests_24h` 总是 0。
+    ///
+    /// **旧名也是改名后列表里的一个模型名时**，密钥的 `allow` 和规则的 `when.model`
+    /// 不改，也不在这里：改名之后旧名说的是那个真模型，写真名的放行和条件照样继承到
+    /// 改名后的别名。`set.model` 照样改（它是要发的名称，不继承）
+    pub renamed_in: AliasUsage,
+}
+
 // ─────────────────────────────────────────────── 路由与策略组的增删改
 
 /// 新建或修改一条路由时交过来的定义。**规则的顺序就是数组的顺序。**
@@ -2938,8 +3148,9 @@ pub struct RuleInput {
     /// 空 = 兜底，匹配全部请求
     #[serde(default)]
     pub conditions: Vec<ConditionView>,
+    /// 去向，和 [`RuleView::to`] 同一个写法。指定模型的列表原样写进配置，交空列表会被拒
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
+    pub to: Option<RuleTarget>,
     /// 拒绝，以及返回给客户端的原因
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<String>,
@@ -3018,11 +3229,22 @@ pub struct GroupSave {
 }
 
 /// 网关知道的一个模型，以及能提供它的上游（已按启用范围与停用过滤）。
+///
+/// **别名也是一项**：`id` 是别名的名称，`alias` 是它的模型列表。别名和某个真模型同名
+/// 时只有一项，就是别名 —— 请求这个名称按别名处理。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct KnownModel {
     pub id: String,
+    /// 有模型清单的上游里提供它的那几家，按配置里上游的顺序。别名是能服务它的那几家：
+    /// 它的模型列表里至少有一个名称在这家的清单里、也在启用范围里。没有清单的上游
+    /// 不在这里（不知道它有什么），但照样收这个名称的请求
     pub providers: Vec<String>,
+    /// 这一项是别名：它的模型列表，按顺序
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<Vec<String>>,
+    /// 列出了这个模型名的别名，按别名表的顺序。别名自己这一项是空的
+    pub aliases: Vec<String>,
 }
 
 /// 聚合类端点的时间窗（`GET /summary`、`/latency`）。**缺省是「今天」而不是
@@ -4010,6 +4232,7 @@ pub struct ZaiLoginStatus {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedEstimate {
     pub provider: String,
+    /// 发给这一家的模型名，按它报价：要测的是别名时是这一家自己的那个名字
     pub model: String,
     /// 输入 token。**精确值** —— 请求是固定的
     pub input_tokens: u64,
@@ -4056,6 +4279,7 @@ pub struct SpeedRunRequest {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SpeedResult {
     pub provider: String,
+    /// 发给这一家的模型名（别名对到这一家的那个名字）
     pub model: String,
     pub ok: bool,
     pub connect_ms: u64,
@@ -4297,6 +4521,8 @@ pub struct ReplayRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ReplayQuote {
+    /// 重放发给这一家的模型名，**按它报价**：客户端要的是别名时是这一家自己的那个名字，
+    /// 原来那一次发给这一家的名字改写过的是改写后的那个
     pub model: String,
     pub provider: String,
     pub body_bytes: i64,
@@ -4492,6 +4718,8 @@ pub struct DryRunResult {
     pub reason: Option<String>,
     /// 候选链，第一个是首选，后面是故障转移的备选
     pub candidates: Vec<String>,
+    /// 每个候选发出去的模型名，和 `candidates` 一一对应
+    pub candidate_models: Vec<DryRunCandidate>,
     /// 经过了哪个组
     pub via_group: Option<String>,
     /// 累积起来的参数改写
@@ -4503,6 +4731,23 @@ pub struct DryRunResult {
     pub skipped: Vec<SkippedView>,
     /// 候选链里要转换格式的上游：客户端的格式和上游的协议不同
     pub converted: Vec<ConvertedView>,
+}
+
+/// 试算里一个候选上游收到的模型名。
+///
+/// **同一个请求在各家可能是不同的名字**：别名对到每一家自己的名称，规则改写、规则指定的
+/// 模型也会换掉它。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DryRunCandidate {
+    pub provider: String,
+    /// 发给它的模型名。试算没写模型时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_model: Option<String>,
+    /// 发出的名字为什么和请求里写的不一样：`alias`（别名对到这一家的名称）、`rule`（规则
+    /// 改写了模型）、`pinned`（规则指定了这一家发什么模型）。一样时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_via: Option<String>,
 }
 
 /// 一个要转换格式的候选上游。
@@ -4521,7 +4766,7 @@ pub struct ConvertedView {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SkippedView {
     pub provider: String,
-    /// `disabled` / `out_of_scope` / `not_offered`
+    /// `disabled` / `out_of_scope` / `not_offered` / `not_allowed`
     pub reason: ServeSkip,
 }
 
@@ -4937,7 +5182,7 @@ pub struct PluginHooks {
 /// **都是插件写的字**。
 ///
 /// 出错时怎么办、范围、设置的值**都在文件里**：这里读到的就是这份源码装上之后的样子。
-/// 要改它们，用 `POST /plugins/rewrite` 改写源码
+/// 要改它们，用 `POST /plugin-rewrite` 改写源码
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ManifestView {
@@ -5003,7 +5248,7 @@ pub struct PluginView {
     pub stats: PluginStats,
 }
 
-/// 一份源码（`POST /plugins/inspect`）。
+/// 一份源码（`POST /plugin-inspect`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginSource {
@@ -5031,12 +5276,12 @@ pub struct PluginLoadError {
     pub column: Option<u32>,
 }
 
-/// 装一个插件（`POST /plugins`、`POST /plugins/confirmed`）。出错时怎么办、范围、设置的值
-/// 都在源码里（`POST /plugins/rewrite` 改写）。
+/// 装一个插件（`POST /plugins`、`POST /plugin-confirmed`）。出错时怎么办、范围、设置的值
+/// 都在源码里（`POST /plugin-rewrite` 改写）。
 ///
 /// 插件改得了回答里的工具调用（权限有 [`Permission::ReplyToolCalls`]）时，`POST /plugins`
 /// 拒绝（403，`control.plugin.needs_confirmation`），要在系统的确认框里点过头、走
-/// `POST /plugins/confirmed`。
+/// `POST /plugin-confirmed`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginCreate {
@@ -5067,7 +5312,7 @@ pub struct PluginSave {
     pub base_version: Option<String>,
 }
 
-/// 改写一份源码里的数据（`POST /plugins/rewrite`）：出错时怎么办、范围、设置的值。**什么都不
+/// 改写一份源码里的数据（`POST /plugin-rewrite`）：出错时怎么办、范围、设置的值。**什么都不
 /// 留下**，只交回改写之后的源码（[`PluginSource`]）—— 只换 manifest 字面量那一段，别的字节
 /// 一个不动；字面量里的注释不保留。
 ///
@@ -5112,7 +5357,7 @@ pub struct PluginSourceView {
     pub current_sha256: Option<String>,
 }
 
-/// 排顺序（`PUT /plugins/order`）：**全部 id**，按新的顺序。
+/// 排顺序（`PUT /plugin-order`）：**全部 id**，按新的顺序。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PluginOrder {
@@ -5676,6 +5921,50 @@ mod tests {
         );
         let v = serde_json::to_value(started(None)).unwrap();
         assert!(v.get("input_estimate").is_none(), "{v}");
+    }
+
+    /// 规则的去向和配置里的 `to` 一个写法：字符串是名字，列表是指定模型。
+    #[test]
+    fn a_rule_target_is_a_name_or_a_list_of_pinned_models() {
+        let name: RuleTarget = serde_json::from_str(r#""__all__""#).unwrap();
+        assert_eq!(name, RuleTarget::from("__all__"));
+        assert_eq!(serde_json::to_string(&name).unwrap(), r#""__all__""#);
+
+        let text = r#"[{"provider":"bedrock","model":"us.anthropic.claude-opus-5-v1:0"},{"provider":"anthropic","model":"claude-opus-5"}]"#;
+        let pinned: RuleTarget = serde_json::from_str(text).unwrap();
+        let pin = |provider: &str, model: &str| PinnedModel {
+            provider: provider.into(),
+            model: model.into(),
+        };
+        assert_eq!(
+            pinned,
+            RuleTarget::Models(vec![
+                pin("bedrock", "us.anthropic.claude-opus-5-v1:0"),
+                pin("anthropic", "claude-opus-5"),
+            ])
+        );
+        assert_eq!(serde_json::to_string(&pinned).unwrap(), text, "顺序不变");
+
+        // 一项不是列表，哪一种都不是
+        assert!(serde_json::from_str::<RuleTarget>(r#"{"provider":"a","model":"m"}"#).is_err());
+
+        // 规则视图里没有去向就不带这个字段
+        let view = RuleView {
+            name: "r".into(),
+            conditions: vec![],
+            to: Some(pinned),
+            deny: None,
+            set: None,
+            catch_all: true,
+            phase_two: false,
+            shadowed: false,
+        };
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["to"][1]["model"], "claude-opus-5");
+        let back: RuleInput = serde_json::from_value(v).unwrap();
+        assert_eq!(back.to, view.to, "视图交回来就是同一个去向");
+        let none = RuleView { to: None, ..view };
+        assert!(serde_json::to_value(&none).unwrap().get("to").is_none());
     }
 
     #[test]

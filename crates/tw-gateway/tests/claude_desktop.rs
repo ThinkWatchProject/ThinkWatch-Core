@@ -3,7 +3,7 @@
 //! - 启动时的 `HEAD /api/hello` 预热：不要密钥，不打上游
 //! - 推理请求打到 `/v1/messages?beta=true`，`anthropic-beta` 和 `cache_control` 原样到上游
 //! - `/v1/messages/count_tokens` 照样转给 Anthropic 上游
-//! - `/v1/models` 回 Anthropic 的列表格式，Claude 模型带上名字和档位
+//! - `/v1/models` 回 Anthropic 的列表格式，Claude 模型带上名字、档位和上下文窗口
 //! - 上游静默时，Anthropic 流里补 `ping`：客户端按字节计时，五分钟没有字节就放弃
 
 use std::net::SocketAddr;
@@ -247,10 +247,15 @@ async fn models_are_listed_in_the_anthropic_shape() {
     // OpenAI 那几个字段照样在
     assert_eq!(claude["object"], "model");
     assert_eq!(claude["created"], 0);
-    // 看不出是 Claude 的：名字就是 ID，也不标档位
+    // 上下文窗口来自价目表；不到一百万
+    assert_eq!(claude["max_input_tokens"], 200_000);
+    assert_eq!(claude["supports_1m"], false);
+    // 看不出是 Claude 的：名字就是 ID，也不标档位；价目表里没有，就不给上下文
     let alias = &data[1];
     assert_eq!(alias["display_name"], "my-alias");
     assert!(alias.get("anthropic_family_tier").is_none(), "{alias}");
+    assert!(alias.get("max_input_tokens").is_none(), "{alias}");
+    assert!(alias.get("supports_1m").is_none(), "{alias}");
 
     let one: Value = get("/v1/models/claude-sonnet-4-5-20250929")
         .await
@@ -278,8 +283,66 @@ async fn an_openai_client_still_gets_the_openai_listing() {
     let m = &list["data"][0];
     assert_eq!(m["id"], "claude-sonnet-4-5");
     assert_eq!(m["created"], 0);
+    assert_eq!(m["context_window"], 200_000);
+    assert_eq!(m["context_length"], 200_000);
+    assert_eq!(m["max_input_tokens"], 200_000);
     assert!(m.get("type").is_none(), "{m}");
+    assert!(m.get("supports_1m").is_none(), "{m}");
     assert!(list.get("has_more").is_none(), "{list}");
+}
+
+#[tokio::test]
+async fn a_million_token_model_is_listed_as_such_with_its_tier() {
+    let (up, _) = recording_upstream().await;
+    let gw = gateway(provider(
+        up,
+        Protocol::Anthropic,
+        &["claude-fable-5", "claude-mythos-preview"],
+    ))
+    .await;
+    let list: Value = reqwest::Client::new()
+        .get(format!("http://{}/v1/models", gw.addr))
+        .header("x-api-key", "tw-k")
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = list["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{list}");
+    for (m, tier) in data.iter().zip(["fable", "mythos"]) {
+        assert_eq!(m["anthropic_family_tier"], tier, "{m}");
+        assert_eq!(m["max_input_tokens"], 1_000_000, "{m}");
+        assert_eq!(m["supports_1m"], true, "{m}");
+    }
+}
+
+#[tokio::test]
+async fn a_gemini_client_gets_the_token_limits_in_geminis_fields() {
+    let (up, _) = recording_upstream().await;
+    let gw = gateway(provider(up, Protocol::Gemini, &["gemini-2.5-pro"])).await;
+    let get = |path: &'static str| {
+        reqwest::Client::new()
+            .get(format!("http://{}{path}", gw.addr))
+            .header("x-goog-api-key", "tw-k")
+            .send()
+    };
+    let list: Value = get("/v1beta/models").await.unwrap().json().await.unwrap();
+    let m = &list["models"][0];
+    assert_eq!(m["name"], "models/gemini-2.5-pro");
+    assert_eq!(m["inputTokenLimit"], 1_048_576);
+    assert_eq!(m["outputTokenLimit"], 65_535);
+    assert!(m.get("context_window").is_none(), "{m}");
+
+    let one: Value = get("/v1beta/models/gemini-2.5-pro")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one, *m, "单点查询和列表里的应该是同一个对象");
 }
 
 const CHAT_FIRST: &str = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"}}]}\n\n";

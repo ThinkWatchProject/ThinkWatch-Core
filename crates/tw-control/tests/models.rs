@@ -407,7 +407,7 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/providers/preview",
+        "/provider-preview",
         serde_json::json!({ "base_url": "https://api.anthropic.com" }),
     )
     .await;
@@ -424,7 +424,7 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     let (st, v) = call(
         &b.app,
         "POST",
-        "/providers/preview",
+        "/provider-preview",
         serde_json::json!({ "base_url": "https://api.anthropic.com", "protocol": "openai-chat" }),
     )
     .await;
@@ -435,7 +435,7 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     let (st, _) = call(
         &b.app,
         "POST",
-        "/providers/preview",
+        "/provider-preview",
         serde_json::json!({ "base_url": "https://api.anthropic.com", "protocol": "grpc" }),
     )
     .await;
@@ -445,7 +445,7 @@ async fn an_address_being_typed_previews_what_automatic_detection_will_pick() {
     let (_, v) = call(
         &b.app,
         "POST",
-        "/providers/preview",
+        "/provider-preview",
         serde_json::json!({ "base_url": "https://relay.example/v1" }),
     )
     .await;
