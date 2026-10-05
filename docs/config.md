@@ -172,6 +172,7 @@ means.
 | `security` | object, [`security`](#cfg-security) | — | The three guards. All of them start in `observe`, so out of the box nothing is changed or refused. |
 | `retention` | object, [`retention`](#cfg-retention) | — | How long request logs are kept. |
 | `failover` | object, [`failover`](#cfg-failover) | — | How long an upstream is set aside after it fails, and how long the start of a stream is awaited. |
+| `aliases` | map of alias → string or list of strings | `{}` | Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias. |
 | `groups` | list of [`groups[]`](#cfg-groups) | `[]` | Strategy groups: several upstreams behind one name, with a way to pick among them. |
 | `routes` | list of [`routes[]`](#cfg-routes) | `[]` | Routes. Without any, requests fail over across all upstreams in the order they are declared. |
 | `default_route` | string | — | The route for keys that do not name one. Unset: the route named `default`, or the built-in failover when there is none. |
@@ -303,7 +304,7 @@ gateway. A key is an identity. Limits, model scope and route are per key.
 | `name` | string | **required** | Name of the key; unique. Routing rules match it with `when.client`. |
 | `key` | string | **required** | The key clients send (as `x-api-key` or `Authorization: Bearer`). Generated keys start with `tw-` so they are not mistaken for an upstream's key. Unique. |
 | `max_concurrent` | integer | — | Requests with this key that may run at once; the rest wait. Unset: no limit. `0` is refused. |
-| `allow` | list of strings | — | Models this key may use, as model ids or globs (`claude-*`). Unset: every model. `[]`: none at all. |
+| `allow` | list of strings | — | Models this key may use, as model ids or globs (`claude-*`). An upstream model name also allows the aliases that list it; an alias allows only the alias. Unset: every model. `[]`: none at all. |
 | `route` | string | — | Name of the route requests with this key take. Unset: `default_route`. |
 | `client` | string | — | The client this key was made for (`claude-code`, `codex`, …), recorded when the desktop app points a client at the gateway. A client has at most one. |
 | `disabled` | bool | `false` | Refuse every request made with this key, and keep the key. |
@@ -906,6 +907,40 @@ the same as an error status would.
 | `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
 <!-- /generated -->
 
+### `aliases`
+
+A model alias is another name for the same model. Clients request it like any
+model; each upstream receives the name it uses for that model.
+
+```yaml
+aliases:
+  deepseek-v4.1: DeepSeek-v4.1-flash
+  claude-sonnet-5:
+    - claude-sonnet-5
+    - us.anthropic.claude-sonnet-5-v1:0
+    - anthropic/claude-sonnet-5
+```
+
+- An upstream serves an alias when it offers one of the listed names within
+  its `models_only`, and receives the first such name in the list. Every
+  upstream that serves an alias takes part in failover for it.
+- `GET /v1/models` lists aliases next to the upstream models, and the
+  original names stay available.
+- An alias takes precedence over an upstream model of the same name: a
+  request for `claude-sonnet-5` above goes only to upstreams offering one of
+  the three names. List an upstream's own name when it should keep serving it.
+- A key's `allow` and a rule's `when.model` written for an upstream model name
+  also cover the aliases that list it; written for an alias, they cover only
+  the alias.
+- When the upstream answers with the model it was sent, the answer carries the
+  name the client asked for. An answer naming a different model is passed on
+  as it is.
+- Prices and the upstream check-up use the name sent upstream. The request log
+  keeps the name the client asked for, and each attempt the name it sent.
+- To send one key's requests to a particular upstream model, use a rule with
+  pinned models ([`routes[].rules[].to`](#cfg-routes-rules-to)) rather than an
+  alias: an alias changes what the name means for every client.
+
 ### `groups`
 
 A group puts several upstreams behind one name. Rules send requests to a
@@ -962,9 +997,36 @@ order they are declared.
 |---|---|---|---|
 | `name` | string | **required** | Name shown in logs and in the traffic view. |
 | `when` | object, [`routes[].rules[].when`](#cfg-routes-rules-when) | — | Conditions, all of which have to hold. Unset: matches every request. |
-| `to` | string | — | An upstream or a group, by name; `__all__` is every upstream in declared order. Not allowed together with `when.provider_would_be`. |
+| `to` | string, or list of [`routes[].rules[].to[]`](#cfg-routes-rules-to) | — | An upstream or a group, by name; `__all__` is every upstream in declared order. Or pinned models: a list of upstreams with the model to send to each, tried in order. Not allowed together with `when.provider_would_be`. |
 | `set` | object, [`routes[].rules[].set`](#cfg-routes-rules-set) | — | Parameters to rewrite. Collected from every matching rule, not only the first. |
 | `deny` | string | — | Refuse the request with this reason. |
+<!-- /generated -->
+
+#### `routes[].rules[].to`
+
+`to` names an upstream or a group, or pins models: a list of upstreams, each
+with the model sent to it, tried in order. A pinned model is sent as written,
+without aliases or `set.model`, so a rule can send a key's requests to one
+upstream's model even when an alias of the same name points elsewhere.
+
+```yaml
+routes:
+  - name: default
+    rules:
+      - name: Opus on Bedrock
+        when: { model: claude-opus-5 }
+        to:
+          - { provider: bedrock, model: us.anthropic.claude-opus-5-v1:0 }
+          - { provider: anthropic, model: claude-opus-5 }
+```
+
+<!-- generated: table routes[].rules[].to[] -->
+<a id="cfg-routes-rules-to"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `provider` | string | **required** | An upstream, by name; not a group. Each upstream appears once in the list. |
+| `model` | string | **required** | The model name sent to that upstream, as written: aliases do not apply, and no `set.model` changes it. Not allowed together with `set.model` in the same rule. |
 <!-- /generated -->
 
 #### `routes[].rules[].when`
@@ -974,7 +1036,7 @@ order they are declared.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | — | Requested model, glob (`claude-opus-*`). |
+| `model` | string | — | Requested model, glob (`claude-opus-*`). An upstream model name also matches requests for the aliases that list it; an alias matches only requests for the alias. |
 | `client` | string | — | Name of the gateway key the request used, exactly. |
 | `dialect` | string | — | API format the client spoke: `anthropic`, `openai-chat`, `openai-responses`, `gemini`. |
 | `input_tokens` | comparison (`>200k`, `<=4k`, `==3`) | — | Estimated input tokens. |
@@ -994,6 +1056,9 @@ end in `k` or `m`: `">200k"`, `"<=4k"`. Without an operator it is an error,
 not an equality: `"200k"` alone is refused.
 
 #### `routes[].rules[].set`
+
+`set.model` may name an alias; each upstream then receives its own name for
+it. Answers carry the name the client asked for, as with aliases.
 
 <!-- generated: table routes[].rules[].set -->
 <a id="cfg-routes-rules-set"></a>
@@ -1084,7 +1149,7 @@ Requests of a kind a plugin does not handle pass without it, whatever its
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `id` | string | **required** | Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order`, `inspect`, `rewrite` and `confirmed` are taken by the control plane. |
+| `id` | string | **required** | Lowercase letters, digits and hyphens, 1 to 40 characters; unique. |
 | `file` | string | **required** | The plugin's code, relative to this file's directory. It is always `plugins/<id>.js`; the app writes it. |
 | `sha256` | string | **required** | SHA-256 of the approved code, 64 lowercase hexadecimal characters. When the file no longer has this hash, the plugin stops running until the change is approved in the app. The approved code is kept in `plugins/.approved/<id>.js`. |
 | `enabled` | bool | `true` | Run the plugin. `false` keeps it installed and out of every request. |

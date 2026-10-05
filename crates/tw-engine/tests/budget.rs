@@ -23,7 +23,7 @@ fn heavy() -> Engine {
             model,
             ..Default::default()
         },
-        to: Some(to),
+        to: Some(to.into()),
         set: None,
         deny: None,
     };

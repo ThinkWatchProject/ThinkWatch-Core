@@ -226,7 +226,13 @@ impl Directory {
                 }
             })
             .collect();
-        into.store(std::sync::Arc::new(tw_engine::Catalog::build(&sources)));
+        // 别名跟着同一份配置登记：列表、准入看到的别名表和挑候选时的是同一张
+        let catalog = tw_engine::Catalog::build(&sources).with_aliases(
+            cfg.aliases
+                .iter()
+                .map(|a| (a.name.as_str(), a.models.as_slice())),
+        );
+        into.store(std::sync::Arc::new(catalog));
     }
 
     /// 到时间该去问的上游。
@@ -558,6 +564,9 @@ pub enum Skip {
     OutOfScope,
     /// 它的模型清单里没有这个模型
     NotOffered,
+    /// 发给它的名字这把密钥不让用（`allow`）：指定模型、阶段二改的名字一家一个，
+    /// 准入放行了别的那几家，故障转移也到不了这一家
+    NotAllowed,
 }
 
 impl Skip {
@@ -566,6 +575,7 @@ impl Skip {
             Skip::Disabled => "disabled",
             Skip::OutOfScope => "out_of_scope",
             Skip::NotOffered => "not_offered",
+            Skip::NotAllowed => "not_allowed",
         }
     }
     /// 进给客户端的那句话里。**界面不用它** —— 界面按 `slug` 自己说。
@@ -574,6 +584,7 @@ impl Skip {
             Skip::Disabled => "disabled",
             Skip::OutOfScope => "out of scope",
             Skip::NotOffered => "does not offer this model",
+            Skip::NotAllowed => "not allowed for this key",
         }
     }
 }
@@ -620,8 +631,11 @@ impl Serving {
     }
 }
 
-/// 这家能不能服务这个模型：不在启用范围里、清单里没有，都不能。**不看
+/// 这家能不能服务这个模型名：不在启用范围里、清单里没有，都不能。**不看
 /// 停用** —— 停用是路由的事，测速一家停用的上游是合理的。
+///
+/// **`model` 是发出去的名字，原样看，不经过别名表。**客户端说的名称（可能是别名）
+/// 先用 [`resolve`] 对到这家，或者直接用 [`sent_to`]。
 pub fn fit(catalog: &tw_engine::Catalog, p: &tw_config::Provider, model: &str) -> Option<Skip> {
     if !p.uses_model(model) {
         Some(Skip::OutOfScope)
@@ -632,17 +646,125 @@ pub fn fit(catalog: &tw_engine::Catalog, p: &tw_config::Provider, model: &str) -
     }
 }
 
+/// 密钥 `key` 的模型范围（`allow`）。没有这把密钥、或者它没写 `allow` 时是 `None`：什么都放行。
+pub fn key_allow<'a>(cfg: &'a tw_config::Config, key: &str) -> Option<&'a [String]> {
+    cfg.clients
+        .iter()
+        .find(|c| c.name == key)
+        .and_then(|c| c.allow.as_deref())
+}
+
+/// 密钥的 `allow` 放不放行要发给一家的名字 `model`。`allow` 是 `None`（不写）时什么都放行。
+///
+/// - **客户端那一侧的名称**（客户端写的、阶段一改写的、插件改的，可能是别名）按目录的规矩
+///   看（[`tw_engine::Catalog::allows`]）：写上游的模型名也放行列了它的别名，和准入、
+///   `/v1/models` 是同一套。
+/// - **原样发出的名字**（`as_written`：指定模型、阶段二改的）按这个名字本身对 glob：它不经过
+///   别名表，也就没有别名可继承。
+///
+/// **每个候选各看各的**：指定模型、阶段二改的名字一家一个，准入只要有一家过得去就放行，
+/// 剩下那几家要在这里拦住 —— 不然故障转移会把请求带到密钥不让用的模型上。
+pub fn allowed(
+    catalog: &tw_engine::Catalog,
+    allow: Option<&[String]>,
+    model: &str,
+    as_written: bool,
+) -> bool {
+    allow.is_none_or(|patterns| {
+        if as_written {
+            patterns
+                .iter()
+                .any(|p| tw_engine::rule::glob_match(p, model))
+        } else {
+            catalog.allows(model, patterns)
+        }
+    })
+}
+
+/// 发给上游 `p` 时，客户端说的 `name` 叫什么。`None` = 这家服务不了这个别名。
+///
+/// - `name` 是别名：按列表顺序取第一个**这家能服务**的名称 —— 在它的启用范围里
+///   （`models_only`），清单里也没说没有（没有清单的上游当作有，取第一个在启用
+///   范围里的）。一个都没有就是 `None`。
+/// - 不是别名：就是 `name` 本身。这家有没有它不在这里判断，那是 [`fit`] 的事。
+///
+/// **别名优先**：`name` 是别名时，这家恰好有一个同名的真模型、却没列进别名，
+/// 也不发这个名字给它。
+///
+/// **不看停用**，和 [`fit`] 一样：停用是路由的事。指定模型（规则的 `to` 列出的
+/// 「上游 + 模型」）不经过这里，那个名字原样发出。
+pub fn resolve(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    p: &tw_config::Provider,
+    name: &str,
+) -> Option<String> {
+    let Some(alias) = cfg.aliases.find(name) else {
+        return Some(name.to_string());
+    };
+    alias
+        .models
+        .iter()
+        .find(|m| p.uses_model(m) && catalog.offers(&p.name, m) != Some(false))
+        .cloned()
+}
+
+/// 发给候选 `p` 的模型名；这家服务不了时是为什么。
+///
+/// `asked` 是这一家被要的名称（[`tw_engine::Engine::models_asked`]），在客户端那一侧：
+/// 别名还是别名名称。
+///
+/// - **指定模型**（[`tw_engine::Decision::pinned_model`]）：原样发出，不经过别名表，
+///   就看这家有没有这个名字。
+/// - 别的按 [`resolve`] 对到这家：别名取它列表里这家能服务的第一个，一个都没有就
+///   服务不了 —— 都不在启用范围里算范围外，否则算清单里没有。
+pub fn sent_to(
+    cfg: &tw_config::Config,
+    catalog: &tw_engine::Catalog,
+    decision: &tw_engine::Decision,
+    p: &tw_config::Provider,
+    asked: &str,
+) -> Result<String, Skip> {
+    let sent = match decision.pinned_model(&p.name) {
+        Some(m) => m.to_string(),
+        None => match resolve(cfg, catalog, p, asked) {
+            Some(m) => m,
+            None => {
+                let in_scope = cfg
+                    .aliases
+                    .find(asked)
+                    .is_some_and(|a| a.models.iter().any(|m| p.uses_model(m)));
+                return Err(if in_scope {
+                    Skip::NotOffered
+                } else {
+                    Skip::OutOfScope
+                });
+            }
+        },
+    };
+    match fit(catalog, p, &sent) {
+        Some(skip) => Err(skip),
+        None => Ok(sent),
+    }
+}
+
 /// 在路由选出的候选里去掉服务不了这个请求的上游。
 ///
 /// `asked` 是每个候选和它要的模型（[`tw_engine::Engine::models_asked`]）：
-/// **每一家按它实际要的那个模型看**，规则改写过的就是改写后的。
+/// **每一家按它实际要的那个模型看**，规则改写过的就是改写后的；别名按这家能不能
+/// 服务它看，指定模型按指定的那个名字看（见 [`sent_to`]）。
+///
+/// 密钥的 `allow`（[`key_allow`]）也一家一家地看（[`allowed`]）：指定模型按指定的名字，
+/// 别的按它要的、客户端那一侧的名称。不让用的跳过（[`Skip::NotAllowed`]）。
 ///
 /// **没有模型清单的上游不跳过**：不知道它有什么，不等于它没有。模型是空的
 /// （请求体解析不了）时只看停用。
 pub fn serving(
     cfg: &tw_config::Config,
     catalog: &tw_engine::Catalog,
+    decision: &tw_engine::Decision,
     asked: &[(String, String)],
+    allow: Option<&[String]>,
 ) -> Serving {
     let mut out = Serving {
         asked: asked.to_vec(),
@@ -654,12 +776,15 @@ pub fn serving(
             out.usable.push(name.clone());
             continue;
         };
+        let pinned = decision.pinned_model(name);
         let skip = if p.disabled {
             Some(Skip::Disabled)
         } else if model.is_empty() {
             None
+        } else if !allowed(catalog, allow, pinned.unwrap_or(model), pinned.is_some()) {
+            Some(Skip::NotAllowed)
         } else {
-            fit(catalog, p, model)
+            sent_to(cfg, catalog, decision, p, model).err()
         };
         match skip {
             Some(s) => out.skipped.push((name.clone(), s)),
@@ -697,6 +822,24 @@ mod tests {
             .iter()
             .map(|c| (c.to_string(), model.to_string()))
             .collect()
+    }
+
+    /// 路由的决定。`pinned` 是指定模型的那几项（上游、模型），空的就是按名称要
+    fn decided(pinned: &[(&str, &str)]) -> tw_engine::Decision {
+        tw_engine::Decision {
+            candidates: pinned.iter().map(|(p, _)| p.to_string()).collect(),
+            matched_rule: "r".into(),
+            via_group: None,
+            set: Default::default(),
+            rewritten_by: Vec::new(),
+            pinned: pinned
+                .iter()
+                .map(|(p, m)| tw_engine::Pinned {
+                    provider: p.to_string(),
+                    model: m.to_string(),
+                })
+                .collect(),
+        }
     }
 
     fn cfg(providers: Vec<tw_config::Provider>) -> tw_config::Config {
@@ -743,6 +886,205 @@ mod tests {
         assert!(d.lock().get("a").is_none());
     }
 
+    /// 别名对到每一家：按列表顺序取它能服务的第一个名称；范围外的、清单里没有的跳过；
+    /// 没有清单的当作有。不是别名的就是它自己
+    #[test]
+    fn an_alias_resolves_to_the_first_listed_name_each_upstream_can_serve() {
+        let mut c = cfg(vec![
+            provider("bedrock"),
+            provider("anthropic"),
+            provider("relay"),
+            provider("no-list"),
+            provider("scoped"),
+        ]);
+        c.providers[4].models_only = Some(vec!["anthropic/*".into()]);
+        c.aliases = serde_yaml_ng::from_str(
+            "claude-sonnet-5: [claude-sonnet-5, us.anthropic.claude-sonnet-5-v1:0, anthropic/claude-sonnet-5]\n\
+             gpt-x: gpt-x-2026\n",
+        )
+        .unwrap();
+        let catalog = tw_engine::Catalog::build(&[
+            listed(
+                "bedrock",
+                &["us.anthropic.claude-sonnet-5-v1:0", "claude-sonnet-5"],
+            ),
+            listed("anthropic", &["claude-sonnet-5"]),
+            // 有同名的真模型，但只有它没列进别名的那个名字
+            listed("relay", &["gpt-x", "anthropic/claude-sonnet-5"]),
+            tw_engine::ProviderModels {
+                provider: "no-list".into(),
+                protocol: "anthropic".into(),
+                known: false,
+                models: Vec::new(),
+            },
+            tw_engine::ProviderModels {
+                provider: "scoped".into(),
+                protocol: "anthropic".into(),
+                known: false,
+                models: Vec::new(),
+            },
+        ]);
+        let r = |p: usize, name: &str| resolve(&c, &catalog, &c.providers[p], name);
+        // 按列表顺序：bedrock 两个都有，取排在前面的那个
+        assert_eq!(r(0, "claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(r(1, "claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            r(2, "claude-sonnet-5").as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        // 没有清单：当作有，取第一个
+        assert_eq!(r(3, "claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        // 没有清单、有启用范围：取第一个在范围里的
+        assert_eq!(
+            r(4, "claude-sonnet-5").as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        // 别名优先：relay 有个叫 gpt-x 的真模型，没列进别名，不发给它
+        assert_eq!(r(2, "gpt-x"), None);
+        assert_eq!(r(1, "gpt-x"), None);
+        // 不是别名：原样，有没有交给 `fit`
+        assert_eq!(r(1, "claude-opus-5").as_deref(), Some("claude-opus-5"));
+    }
+
+    /// 别名登记进汇总；挑候选时别名按每家能不能服务它看，指定模型按写的那个名字看
+    #[test]
+    fn candidates_are_judged_by_the_alias_each_can_serve_and_pinned_models_as_written() {
+        let d = Directory::default();
+        let mut c = cfg(vec![
+            provider("bedrock"),
+            provider("relay"),
+            provider("openai"),
+            provider("no-list"),
+            provider("scoped"),
+        ]);
+        c.providers[4].models_only = Some(vec!["gemini-*".into()]);
+        c.aliases = serde_yaml_ng::from_str(
+            "claude-sonnet-5: [claude-sonnet-5, us.anthropic.claude-sonnet-5-v1:0]\n\
+             gpt-x: gpt-x-2026\n",
+        )
+        .unwrap();
+        d.reconcile(&c);
+        for (p, models) in [
+            ("bedrock", vec!["us.anthropic.claude-sonnet-5-v1:0"]),
+            // 有一个叫 gpt-x 的真模型，别名 gpt-x 没列它
+            ("relay", vec!["gpt-x", "claude-sonnet-5"]),
+            ("openai", vec!["gpt-x-2026"]),
+            ("scoped", vec!["gemini-3"]),
+        ] {
+            let i = c.providers.iter().position(|x| x.name == p).unwrap();
+            let models = models.into_iter().map(String::from).collect();
+            d.record(p, &identity(&c, &c.providers[i]), Answer::Listed(models), 1);
+        }
+        d.record(
+            "no-list",
+            &identity(&c, &c.providers[3]),
+            Answer::NoList(why("没有接口")),
+            1,
+        );
+        let cat = published(&d, &c);
+        // 别名登记在有清单、能服务它的上游名下；同名的真模型让给别名
+        assert_eq!(cat.providers_for("claude-sonnet-5"), ["bedrock", "relay"]);
+        assert_eq!(cat.providers_for("gpt-x"), ["openai"]);
+        assert_eq!(cat.offers("relay", "gpt-x"), Some(true));
+
+        let all = ["bedrock", "relay", "openai", "no-list", "scoped"];
+        let s = serving(&c, &cat, &decided(&[]), &asked(&all, "gpt-x"), None);
+        // relay 只有同名的真模型：别名优先，到不了它。没有清单的照样能
+        assert_eq!(s.usable, ["openai", "no-list"]);
+        assert_eq!(
+            s.skipped,
+            [
+                ("bedrock".to_string(), Skip::NotOffered),
+                ("relay".to_string(), Skip::NotOffered),
+                ("scoped".to_string(), Skip::OutOfScope),
+            ]
+        );
+        let unpinned = decided(&[]);
+        let sent = |p: usize, name: &str| sent_to(&c, &cat, &unpinned, &c.providers[p], name);
+        assert_eq!(
+            sent(0, "claude-sonnet-5"),
+            Ok("us.anthropic.claude-sonnet-5-v1:0".into())
+        );
+        assert_eq!(sent(1, "claude-sonnet-5"), Ok("claude-sonnet-5".into()));
+        assert_eq!(sent(3, "gpt-x"), Ok("gpt-x-2026".into()));
+        // 不是别名的照旧按清单看
+        assert_eq!(sent(2, "gpt-x-2026"), Ok("gpt-x-2026".into()));
+        assert_eq!(sent(2, "gpt-9"), Err(Skip::NotOffered));
+
+        // 指定模型原样看，不经过别名表：relay 的 gpt-x 就是它自己的那个；bedrock 没有
+        // 叫 claude-sonnet-5 的（虽然它能服务这个别名）
+        let pinned = decided(&[("relay", "gpt-x"), ("bedrock", "claude-sonnet-5")]);
+        let s = serving(
+            &c,
+            &cat,
+            &pinned,
+            &[
+                ("relay".into(), "gpt-x".into()),
+                ("bedrock".into(), "claude-sonnet-5".into()),
+            ],
+            None,
+        );
+        assert_eq!(s.usable, ["relay"]);
+        assert_eq!(s.skipped, [("bedrock".to_string(), Skip::NotOffered)]);
+        assert_eq!(
+            sent_to(&c, &cat, &pinned, &c.providers[1], "gpt-x"),
+            Ok("gpt-x".into())
+        );
+
+        // 密钥的 allow 一家一家地看。指定的名字原样对 glob：只许 gpt-x-* 的密钥，relay 的
+        // gpt-x 不让用，跳过；openai 的 gpt-x-2026 照常
+        let narrow = ["gpt-x-*".to_string()];
+        let pinned = decided(&[("relay", "gpt-x"), ("openai", "gpt-x-2026")]);
+        let both: [(String, String); 2] = [
+            ("relay".into(), "gpt-x".into()),
+            ("openai".into(), "gpt-x-2026".into()),
+        ];
+        let s = serving(&c, &cat, &pinned, &both, Some(&narrow));
+        assert_eq!(s.usable, ["openai"]);
+        assert_eq!(s.skipped, [("relay".to_string(), Skip::NotAllowed)]);
+        // 写别名的密钥只管别名本身：指定的名字恰好和别名同名，不算
+        let s = serving(&c, &cat, &pinned, &both, Some(&["gpt-x".to_string()]));
+        assert_eq!(s.usable, ["relay"]);
+        assert_eq!(s.skipped, [("openai".to_string(), Skip::NotAllowed)]);
+        // 按名称要别名：写上游模型名的密钥继承到别名（gpt-x 列了 gpt-x-2026）
+        let s = serving(
+            &c,
+            &cat,
+            &decided(&[]),
+            &asked(&["openai"], "gpt-x"),
+            Some(&narrow),
+        );
+        assert_eq!(s.usable, ["openai"]);
+        let s = serving(
+            &c,
+            &cat,
+            &decided(&[]),
+            &asked(&["openai"], "gpt-x"),
+            Some(&["claude-*".to_string()]),
+        );
+        assert_eq!(s.skipped, [("openai".to_string(), Skip::NotAllowed)]);
+        // 停用的照旧说停用：那一条更要紧
+        let mut off = c.clone();
+        off.providers[2].disabled = true;
+        let s = serving(&off, &cat, &pinned, &both, Some(&["claude-*".to_string()]));
+        assert_eq!(
+            s.skipped,
+            [
+                ("relay".to_string(), Skip::NotAllowed),
+                ("openai".to_string(), Skip::Disabled),
+            ]
+        );
+    }
+
+    fn listed(p: &str, models: &[&str]) -> tw_engine::ProviderModels {
+        tw_engine::ProviderModels {
+            provider: p.into(),
+            protocol: "anthropic".into(),
+            known: true,
+            models: models.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn an_answer_for_an_upstream_that_changed_meanwhile_is_dropped() {
         let d = Directory::default();
@@ -772,7 +1114,13 @@ mod tests {
         c.providers[2].models_only = Some(vec!["c-1".into()]);
         let cat = published(&d, &c);
         assert_eq!(cat.all(), ["a-1", "a-2", "c-1"]);
-        let s = serving(&c, &cat, &asked(&["a", "b", "c"], "c-2"));
+        let s = serving(
+            &c,
+            &cat,
+            &decided(&[]),
+            &asked(&["a", "b", "c"], "c-2"),
+            None,
+        );
         assert_eq!(
             s.skipped,
             [
@@ -803,7 +1151,7 @@ mod tests {
         );
         let cat = published(&d, &c);
         // 不知道它们有什么：不跳过
-        let s = serving(&c, &cat, &asked(&["a", "b"], "m"));
+        let s = serving(&c, &cat, &decided(&[]), &asked(&["a", "b"], "m"), None);
         assert_eq!(s.usable, ["a", "b"]);
         // 失败的一小时后重问，没有接口的一天后
         let hour = RETRY_AFTER.as_millis() as u64;

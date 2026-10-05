@@ -11,7 +11,7 @@ use super::{Def, Kind, Lang, Row, Section, T2};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
-use tw_engine::{Group, GroupType, RouteSet, Rule, SetAction};
+use tw_engine::{Group, GroupType, Pinned, RouteSet, Rule, SetAction};
 use tw_pricing::{PerMillion, PricingConfig, SheetDef};
 
 const fn t(en: &'static str, zh: &'static str) -> T2 {
@@ -178,6 +178,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "How long an upstream is set aside after it fails, and how long the start of a stream is awaited.",
                         "上游失败后停用多久，以及流式回答的开头最多等多久。",
+                    ),
+                ),
+                row(
+                    "aliases",
+                    Kind::OneOrManyMap(t("alias", "别名")),
+                    Def::Is("{}"),
+                    t(
+                        "Model aliases: one name for the same model across upstreams, mapped to the name each upstream uses, in order. A request for an alias goes to any upstream offering one of the listed names, under the first of them it offers. An alias cannot list another alias.",
+                        "模型别名：同一个模型在各上游的名称合用一个名字，按顺序列出各上游的名称。请求别名时，提供其中任一名称的上游都能服务，发给它的是列表中它提供的第一个名称。别名不能列出别的别名。",
                     ),
                 ),
                 row(
@@ -385,8 +394,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Unset,
                     t(
-                        "Models this key may use, as model ids or globs (`claude-*`). Unset: every model. `[]`: none at all.",
-                        "这把密钥可用的模型，写模型 ID 或通配（`claude-*`）。不写：全部模型。`[]`：一个都不给。",
+                        "Models this key may use, as model ids or globs (`claude-*`). An upstream model name also allows the aliases that list it; an alias allows only the alias. Unset: every model. `[]`: none at all.",
+                        "这把密钥可用的模型，写模型 ID 或通配（`claude-*`）。写上游模型名，列有它的别名一并可用；写别名只放行别名。不写：全部模型。`[]`：一个都不给。",
                     ),
                 ),
                 row(
@@ -1288,11 +1297,11 @@ pub fn sections() -> Vec<Section> {
                 ),
                 row(
                     "to",
-                    Kind::Str,
+                    Kind::StrOrObjs("routes[].rules[].to[]"),
                     Def::Unset,
                     t(
-                        "An upstream or a group, by name; `__all__` is every upstream in declared order. Not allowed together with `when.provider_would_be`.",
-                        "上游或策略组的名字；`__all__` 表示按声明顺序的全部上游。不能与 `when.provider_would_be` 同时写。",
+                        "An upstream or a group, by name; `__all__` is every upstream in declared order. Or pinned models: a list of upstreams with the model to send to each, tried in order. Not allowed together with `when.provider_would_be`.",
+                        "上游或策略组的名字；`__all__` 表示按声明顺序的全部上游。也可以指定模型：列出上游及发给它的模型，按顺序备用。不能与 `when.provider_would_be` 同时写。",
                     ),
                 ),
                 row(
@@ -1316,6 +1325,30 @@ pub fn sections() -> Vec<Section> {
             ],
         },
         Section {
+            path: "routes[].rules[].to[]",
+            ty: checked!(Pinned, "{provider: a, model: m}"),
+            rows: vec![
+                row(
+                    "provider",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "An upstream, by name; not a group. Each upstream appears once in the list.",
+                        "上游的名字，不能是策略组。同一个上游在列表中只出现一次。",
+                    ),
+                ),
+                row(
+                    "model",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The model name sent to that upstream, as written: aliases do not apply, and no `set.model` changes it. Not allowed together with `set.model` in the same rule.",
+                        "发给这个上游的模型名，原样发出：不经过别名，也不受 `set.model` 改写。同一条规则里不能再写 `set.model`。",
+                    ),
+                ),
+            ],
+        },
+        Section {
             path: "routes[].rules[].when",
             ty: checked!(When, "{}"),
             rows: vec![
@@ -1324,8 +1357,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Unset,
                     t(
-                        "Requested model, glob (`claude-opus-*`).",
-                        "请求的模型，可用通配（`claude-opus-*`）。",
+                        "Requested model, glob (`claude-opus-*`). An upstream model name also matches requests for the aliases that list it; an alias matches only requests for the alias.",
+                        "请求的模型，可用通配（`claude-opus-*`）。写上游模型名，也匹配请求列有它的别名的请求；写别名只匹配请求这个别名的。",
                     ),
                 ),
                 row(
@@ -1472,8 +1505,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Str,
                     Def::Required,
                     t(
-                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique. `order`, `inspect`, `rewrite` and `confirmed` are taken by the control plane.",
-                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。`order`、`inspect`、`rewrite` 和 `confirmed` 被控制面占用。",
+                        "Lowercase letters, digits and hyphens, 1 to 40 characters; unique.",
+                        "小写字母、数字和连字符，1 到 40 个字符，不能重复。",
                     ),
                 ),
                 row(

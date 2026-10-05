@@ -11,7 +11,9 @@
 pub mod blobs;
 pub mod db;
 pub mod health;
-pub mod model_name;
+/// 两个模型名是不是同一个模型。网关也要用（把回答里的模型名换回客户端用的名称），
+/// 所以放在两边都依赖的价目表那一层
+pub use tw_pricing::model_name;
 pub mod recorder;
 pub mod search;
 pub mod task;

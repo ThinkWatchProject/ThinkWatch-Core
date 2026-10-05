@@ -179,6 +179,78 @@ pub fn remove_key(text: &str, path: &[Step]) -> Result<String, PatchError> {
     Ok(out)
 }
 
+/// 给映射里的一个键改名，**位置不变**：只换键本身那几个字节，它的值、值里的注释、
+/// 前后的键原样不动。
+///
+/// 给「按名字认的映射」用（别名表 `aliases: { 名字: 模型 }`）：删掉再加一个会把它挪到
+/// 末尾，而那张表的顺序是用户定的。
+///
+/// 新名字按纯量的规矩写（[`render_scalar`]）：原来加了引号的沿用那种引号，原来没加、
+/// 新名字又非加不可的（`a: b`、`yes`、`1.5`）加双引号。同一层已经有这个名字时拒绝
+/// （[`PatchError::Duplicate`]）。改完核对：每个节点的路径只是把这个键换成了新名字，
+/// 顺序和形状一个不变。
+pub fn rename_key(text: &str, path: &[Step], new: &str) -> Result<String, PatchError> {
+    let Some((Step::Key(_), parent)) = path.split_last() else {
+        return Err(PatchError::NotFound(show(path)));
+    };
+    let mut keys = Vec::new();
+    let before = walk(text, |k| keys.push(k))?;
+    let mut hits = keys.iter().filter(|k| k.path == path);
+    let Some(key) = hits.next() else {
+        return Err(PatchError::NotFound(show(path)));
+    };
+    if hits.next().is_some() {
+        return Err(PatchError::Duplicate(show(path)));
+    }
+    if key.anchored {
+        return Err(PatchError::AnchorOrAlias(show(path)));
+    }
+    let mut to = parent.to_vec();
+    to.push(Step::key(new));
+    if to == path {
+        return Ok(text.to_string());
+    }
+    if keys.iter().any(|k| k.path == to) {
+        return Err(PatchError::Duplicate(show(&to)));
+    }
+    let rendered = render_scalar(&Scalar::s(new), key.style);
+    let mut out = String::with_capacity(text.len() + rendered.len());
+    out.push_str(&text[..key.bytes.start]);
+    out.push_str(&rendered);
+    out.push_str(&text[key.bytes.end..]);
+
+    let after = nodes(&out).map_err(|e| {
+        PatchError::SelfCheck(format!(
+            "the configuration could not be parsed after renaming {}: {e}",
+            show(path)
+        ))
+    })?;
+    let moved = |p: &[Step]| -> Vec<Step> {
+        if p.starts_with(path) {
+            let mut q = to.clone();
+            q.extend_from_slice(&p[path.len()..]);
+            q
+        } else {
+            p.to_vec()
+        }
+    };
+    let want: Vec<_> = before
+        .iter()
+        .map(|n| (moved(&n.path), shape(&n.kind)))
+        .collect();
+    let got: Vec<_> = after
+        .iter()
+        .map(|n| (n.path.clone(), shape(&n.kind)))
+        .collect();
+    if want != got {
+        return Err(PatchError::SelfCheck(format!(
+            "renaming {} to `{new}` changed something else as well",
+            show(path)
+        )));
+    }
+    Ok(out)
+}
+
 /// 原地换掉列表的第 `index` 项。**位置不变**，缩进抄原来那一项的。
 ///
 /// 给「这一项原来是行内写法」那种情况用：`- { name: a, key: b }` 里的键
@@ -427,7 +499,7 @@ fn add_key(text: &str, all: &[Node], path: &[Step], value: Put<'_>) -> Result<St
                 show(path)
             )));
         };
-        let key = keys[0];
+        let key = key_text(keys[0]);
         let close = flow_end(text, a.bytes.start).ok_or_else(|| {
             PatchError::NotFound(format!(
                 "{} (the inline mapping is not closed)",
@@ -463,7 +535,7 @@ fn add_key(text: &str, all: &[Node], path: &[Step], value: Put<'_>) -> Result<St
         for _ in 0..i {
             piece.push_str("  ");
         }
-        piece.push_str(k);
+        piece.push_str(&key_text(k));
         piece.push(':');
     }
     match value {
@@ -481,6 +553,13 @@ fn add_key(text: &str, all: &[Node], path: &[Step], value: Put<'_>) -> Result<St
     out.push_str(&piece);
     out.push_str(&text[end..]);
     Ok(out)
+}
+
+/// 新写进去的键。**和值一样按纯量的规矩写**：配置里固定的字段名（`base_url`）原样，
+/// 用户起的名字（别名表的键）里有 `: `、像布尔或数字的，加引号 —— 原样写出去的话，
+/// 读回来是另一个键，或者整份文件读不了。
+fn key_text(k: &str) -> String {
+    render_scalar(&Scalar::s(k), ScalarStyle::Plain)
 }
 
 /// 把一段零缩进的块逐行缩进后接在 `out` 后面，每行前面换行。
@@ -815,5 +894,79 @@ mod tests {
             v["pricing"]["sheets"][0]["models"]["anthropic.claude-3-5-haiku-20241022-v1:0"]["input"],
             0.8
         );
+    }
+
+    const TABLE: &str = "version: 1\n# 别名\naliases:\n  # 第一个\n  deepseek: DeepSeek-v4  # 只有一家\n  sonnet:\n    - claude-sonnet-5\n    - us.anthropic.claude-sonnet-5-v1:0\n  'quoted': x\n  flow: {a: [b]}\nafter: 1\n";
+
+    /// 改名只换键那几个字节：位置、值、注释原样
+    #[test]
+    fn renaming_a_key_keeps_its_place_its_value_and_the_comments() {
+        let out = rename_key(TABLE, &p(&["aliases", "deepseek"]), "deepseek-v4").unwrap();
+        assert_eq!(
+            out,
+            TABLE.replace("  deepseek: DeepSeek", "  deepseek-v4: DeepSeek")
+        );
+        let out = rename_key(TABLE, &p(&["aliases", "sonnet"]), "claude-sonnet-5").unwrap();
+        assert!(
+            out.contains(
+                "  deepseek: DeepSeek-v4  # 只有一家\n  claude-sonnet-5:\n    - claude-sonnet-5\n"
+            ),
+            "{out}"
+        );
+        // 原来加了引号的沿用引号
+        let out = rename_key(TABLE, &p(&["aliases", "quoted"]), "it's").unwrap();
+        assert!(out.contains("  'it''s': x\n"), "{out}");
+        // 行内映射里的键也能改
+        let out = rename_key(TABLE, &p(&["aliases", "flow", "a"]), "c").unwrap();
+        assert!(out.contains("  flow: {c: [b]}\n"), "{out}");
+        assert_eq!(back(&out)["aliases"]["flow"]["c"][0], "b");
+    }
+
+    /// 新名字非加引号不可的，加上；读回来就是那个名字
+    #[test]
+    fn a_new_name_that_needs_quotes_gets_them() {
+        for name in ["a: b", "yes", "1.5", "#x", "-x", "a\tb", "x [1m]"] {
+            let out = rename_key(TABLE, &p(&["aliases", "deepseek"]), name)
+                .unwrap_or_else(|e| panic!("{name:?}: {e}"));
+            let v = back(&out);
+            let keys: Vec<String> = v["aliases"]
+                .as_mapping()
+                .unwrap()
+                .keys()
+                .map(|k| serde_yaml_ng::from_value::<String>(k.clone()).unwrap())
+                .collect();
+            assert_eq!(keys[0], name, "{out}");
+            assert_eq!(v["aliases"][name], "DeepSeek-v4", "{out}");
+        }
+    }
+
+    #[test]
+    fn renaming_onto_a_sibling_or_a_missing_key_is_refused() {
+        let e = rename_key(TABLE, &p(&["aliases", "deepseek"]), "sonnet").unwrap_err();
+        assert!(matches!(e, PatchError::Duplicate(_)), "{e}");
+        let e = rename_key(TABLE, &p(&["aliases", "nope"]), "x").unwrap_err();
+        assert!(matches!(e, PatchError::NotFound(_)), "{e}");
+        // 同名：什么都不改
+        assert_eq!(
+            rename_key(TABLE, &p(&["aliases", "sonnet"]), "sonnet").unwrap(),
+            TABLE
+        );
+    }
+
+    /// 新加的键也按纯量的规矩写：用户起的名字原样写出去，读回来可能是另一个键
+    #[test]
+    fn a_new_key_is_quoted_when_it_has_to_be() {
+        for name in ["a: b", "yes", "1.5", "#x"] {
+            let out = put(TABLE, &p(&["aliases", name]), Put::Inline("m"))
+                .unwrap_or_else(|e| panic!("{name:?}: {e}"));
+            let v = back(&out);
+            assert_eq!(v["aliases"][name], "m", "{out}");
+            let flow = put(TABLE, &p(&["aliases", "flow", name]), Put::Inline("m"))
+                .unwrap_or_else(|e| panic!("{name:?}: {e}"));
+            assert_eq!(back(&flow)["aliases"]["flow"][name], "m", "{flow}");
+        }
+        // 固定的字段名照旧不加
+        let out = put(TABLE, &p(&["aliases", "claude-opus-5"]), Put::Inline("m")).unwrap();
+        assert!(out.contains("\n  claude-opus-5: m\n"), "{out}");
     }
 }

@@ -51,7 +51,7 @@ fn rule(
     Rule {
         name: name.into(),
         when: serde_yaml_ng::from_str(when).unwrap(),
-        to: to.map(str::to_string),
+        to: to.map(Into::into),
         set,
         deny: deny.map(str::to_string),
     }

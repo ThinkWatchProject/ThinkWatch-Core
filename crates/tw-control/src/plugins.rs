@@ -371,15 +371,6 @@ fn new_id(given: Option<&str>, name: &str, taken: &[&str]) -> Result<String, Fai
                 ),
             ));
         }
-        if tw_config::plugins::RESERVED_IDS.contains(&id) {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                msg!(
-                    "control.plugin.reserved_id", plugin = id =>
-                    "`{plugin}` cannot be a plugin id: the control plane uses that word itself."
-                ),
-            ));
-        }
         if taken.contains(&id) {
             return Err(fail(
                 StatusCode::CONFLICT,
@@ -407,12 +398,8 @@ fn id_from_name(name: &str, taken: &[&str]) -> String {
     }
     base.truncate(tw_config::plugins::ID_MAX);
     let mut base = base.trim_end_matches('-').to_string();
-    if base.is_empty() || tw_config::plugins::RESERVED_IDS.contains(&base.as_str()) {
-        base = if base.is_empty() {
-            "plugin".into()
-        } else {
-            format!("{base}-plugin")
-        };
+    if base.is_empty() {
+        base = "plugin".into();
     }
     let free = |id: &str| !taken.contains(&id);
     if free(&base) {
@@ -1162,7 +1149,7 @@ mod tests {
             id_from_name("附加日期", &["plugin", "plugin-2"]),
             "plugin-3"
         );
-        assert_eq!(id_from_name("Order", &[]), "order-plugin");
+        assert_eq!(id_from_name("Order", &[]), "order");
         let long = "x".repeat(60);
         let id = id_from_name(&long, &[&"x".repeat(40)]);
         assert!(id.len() <= 40 && id.ends_with("-2"), "{id}");

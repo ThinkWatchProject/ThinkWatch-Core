@@ -176,6 +176,10 @@ pub enum Kind {
     Objs(&'static str),
     /// 键 → 对象，见那一节
     ObjMap(T2, &'static str),
+    /// 键 → 一个字符串或一组字符串
+    OneOrManyMap(T2),
+    /// 一个字符串，或者一组对象（见那一节）
+    StrOrObjs(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -298,6 +302,17 @@ fn kind(k: &Kind, l: Lang) -> String {
         Kind::ObjMap(key, p) => {
             format!("{} {} → {}", pick("map of", "映射："), key.get(l), link(p))
         }
+        Kind::OneOrManyMap(key) => format!(
+            "{} {} → {}",
+            pick("map of", "映射："),
+            key.get(l),
+            pick("string or list of strings", "字符串或字符串列表")
+        ),
+        Kind::StrOrObjs(p) => format!(
+            "{} {}",
+            pick("string, or list of", "字符串，或对象列表，见"),
+            link(p)
+        ),
     }
 }
 
@@ -342,7 +357,7 @@ pub fn render_table(s: &Section, l: Lang) -> String {
 fn check_section(s: &Section, all: &[Section], errs: &mut Vec<String>) {
     for r in &s.rows {
         match r.kind {
-            Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) => {
+            Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) | Kind::StrOrObjs(p) => {
                 if !all.iter().any(|x| x.path == p) {
                     errs.push(format!(
                         "{}.{} points at section `{p}`, which is not declared",
@@ -374,7 +389,7 @@ fn check_section(s: &Section, all: &[Section], errs: &mut Vec<String>) {
             // 指向一节还没进代码的对象的那一行，同样还没进代码：它由那一节的
             // `Ty::Pending` 看着，这里不数它
             let pending = |r: &Row| match r.kind {
-                Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) => all
+                Kind::Obj(p) | Kind::Objs(p) | Kind::ObjMap(_, p) | Kind::StrOrObjs(p) => all
                     .iter()
                     .any(|x| x.path == p && matches!(x.ty, Ty::Pending { .. })),
                 _ => false,

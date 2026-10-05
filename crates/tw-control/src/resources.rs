@@ -293,6 +293,7 @@ fn models_view(
 ) -> tw_api::ProviderModelsView {
     let book = s.gateway.pricing.load();
     let date = &book.table().date;
+    let cfg = s.config();
     tw_api::ProviderModelsView {
         provider: p.name.clone(),
         source: listing.source.into(),
@@ -313,6 +314,7 @@ fn models_view(
                     }),
                     price_source: r.as_ref().map(|r| tw_store::price_source(&r.source, date)),
                     estimated: r.as_ref().is_some_and(|r| r.cross_platform),
+                    aliases: crate::routes::aliases_listing(&cfg, &id),
                     id,
                 }
             })

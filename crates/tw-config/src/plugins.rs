@@ -26,10 +26,6 @@ pub const APPROVED_DIR: &str = ".approved";
 /// id 最长多少个字符
 pub const ID_MAX: usize = 40;
 
-/// 不能当 id 的词：控制面上 `/plugins/` 底下这几个是固定的端点（排顺序、试编、改写、
-/// 确认过的装），叫这几个名字的插件会和它们撞在同一个路径上
-pub const RESERVED_IDS: &[&str] = &["order", "inspect", "rewrite", "confirmed"];
-
 /// 0.58.0 写在这里、现在挪进了插件文件的字段。读到了不认，写插件这一节时去掉
 pub const LEGACY_FIELDS: &[&str] = &["on_error", "scope", "settings"];
 
@@ -152,9 +148,6 @@ pub(crate) fn check(plugins: &[Plugin]) -> Result<(), crate::ValidationError> {
         if !valid_id(&p.id) {
             return Err(E::PluginId { id: p.id.clone() });
         }
-        if RESERVED_IDS.contains(&p.id.as_str()) {
-            return Err(E::PluginIdReserved { id: p.id.clone() });
-        }
         if !seen.insert(p.id.as_str()) {
             return Err(E::DuplicatePlugin { id: p.id.clone() });
         }
@@ -272,31 +265,13 @@ mod tests {
         assert!(parse(&entry("a-1-b")).is_ok());
     }
 
-    /// `/plugins/order`、`/plugins/inspect`、`/plugins/rewrite`、`/plugins/confirmed` 是控制面上
-    /// 几个固定的端点
+    /// 没有不能当 id 的词：控制面上 `/plugins/` 底下只有 `{id}`（见 `tw_api::ep` 的
+    /// `no_fixed_segment_shadows_a_parameter`），以前写死在那儿的几个词也是普通的 id
     #[test]
-    fn the_words_the_control_plane_uses_are_not_ids() {
-        for id in RESERVED_IDS {
-            let e = parse(&entry(id)).unwrap_err();
-            assert!(e.starts_with("config.plugin.reserved_id"), "{id}: {e}");
+    fn the_words_the_control_plane_once_used_are_ids_too() {
+        for id in ["order", "inspect", "rewrite", "confirmed"] {
+            assert!(parse(&entry(id)).is_ok(), "{id}");
         }
-    }
-
-    /// 控制面上 `/plugins/` 底下每一个固定的词都不能当 id：不然那个插件的
-    /// `/plugins/{id}` 和固定的端点落在同一个路径上
-    #[test]
-    fn every_fixed_word_under_plugins_on_the_control_plane_is_reserved() {
-        let fixed: std::collections::BTreeSet<&str> = tw_api::ep::ALL
-            .iter()
-            .filter_map(|e| e.path.strip_prefix("/plugins/"))
-            .map(|rest| rest.split('/').next().unwrap_or_default())
-            .filter(|seg| !seg.starts_with('{'))
-            .collect();
-        assert_eq!(
-            fixed,
-            RESERVED_IDS.iter().copied().collect(),
-            "the reserved ids and the control plane disagree"
-        );
     }
 
     #[test]

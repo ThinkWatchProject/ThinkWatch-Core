@@ -110,7 +110,7 @@ pub fn cross_platform(model: &str) -> Vec<String> {
 /// 之间调度。
 ///
 /// **只认这几个**，取自价格数据集里 Bedrock 的键。认不出的前缀不剥 —— 查不到价
-/// 就说查不到。上游体检比模型名时认的也是这一张（`tw_store::model_name`）
+/// 就说查不到。上游体检比模型名时认的也是这一张（[`crate::model_name`]）
 pub const BEDROCK_GEOS: &[&str] = &["us", "eu", "apac", "jp", "au", "us-gov", "global"];
 
 /// 剥掉推理配置文件的地域前缀，剩下的是模型 id。不是配置文件的 `None`。

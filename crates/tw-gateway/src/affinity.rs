@@ -343,6 +343,7 @@ mod tests {
             via_group: Some("池子".into()),
             set: Default::default(),
             rewritten_by: vec![],
+            pinned: vec![],
         }
     }
 

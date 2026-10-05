@@ -133,6 +133,7 @@ fn section(cfg: &Config, name: &str) -> Option<serde_yaml_ng::Value> {
         "security" => to_value(&cfg.security),
         "retention" => to_value(&cfg.retention),
         "failover" => to_value(&cfg.failover),
+        "aliases" => to_value(&cfg.aliases),
         "groups" => to_value(&cfg.groups),
         "routes" => to_value(&cfg.routes),
         "plugins" => to_value(&cfg.plugins),

@@ -384,7 +384,7 @@ mod tests {
         for line in [
             "  CreatePlugin: { req: PluginCreate; res: ConfigWritten };",
             "  CreatePluginConfirmed: { req: PluginCreate; res: ConfigWritten };",
-            "  CreatePluginConfirmed: { method: \"POST\", path: \"/plugins/confirmed\", params: [], format: \"json\" },",
+            "  CreatePluginConfirmed: { method: \"POST\", path: \"/plugin-confirmed\", params: [], format: \"json\" },",
             "  SavePlugin: { req: PluginSave; res: ConfigWritten };",
             "  SavePluginConfirmed: { req: PluginSave; res: ConfigWritten };",
             "  SavePluginConfirmed: { method: \"PUT\", path: \"/plugins/{id}/confirmed\", params: [\"id\"], format: \"json\" },",
@@ -515,6 +515,24 @@ mod tests {
             !counts.contains("hidden_text") && !counts.contains("output_limit"),
             "{counts}"
         );
+    }
+
+    /// 规则的去向和配置里一个写法；已知模型和上游模型清单说得出别名。
+    #[test]
+    fn rule_targets_and_model_entries_carry_the_alias_shapes() {
+        let ts = typescript();
+        assert_eq!(
+            decl_of(&ts, "RuleTarget"),
+            "export type RuleTarget = string | Array<PinnedModel>"
+        );
+        assert!(decl_of(&ts, "RuleView").contains("to?: RuleTarget"));
+        assert!(decl_of(&ts, "RuleInput").contains("to?: RuleTarget"));
+        let known = decl_of(&ts, "KnownModel");
+        for field in ["alias?: Array<string>", "aliases: Array<string>"] {
+            assert!(known.contains(field), "{field}: {known}");
+        }
+        let row = decl_of(&ts, "ModelRow");
+        assert!(row.contains("aliases: Array<string>"), "{row}");
     }
 
     #[test]
