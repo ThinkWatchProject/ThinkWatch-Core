@@ -1106,7 +1106,9 @@ stay on the upstream that answers them (see below) and count toward its
 share, so the balance is kept by where new conversations start. An upstream
 that is cooling down after failures, is at its `max_concurrent`, or cannot
 serve a request, sits that request out, and the others share it by their
-weights. Other group types take no weights.
+weights. A new WebSocket connection is placed the same way and counts as one
+request; everything sent on it then goes to the upstream it connected to.
+Other group types take no weights.
 
 <!-- generated: table groups[].providers[] -->
 <a id="cfg-groups-providers"></a>

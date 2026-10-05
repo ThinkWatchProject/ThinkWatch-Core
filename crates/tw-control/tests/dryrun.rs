@@ -914,3 +914,89 @@ routes:
     assert_eq!(seen.len(), 3, "{seen:?}");
     assert!(seen["甲"] < seen["丙"], "{seen:?}");
 }
+
+/// WebSocket 的连接和 HTTP 的请求**按同一个组的顺序走**：3:1 的 `load-balance` 组，新连接照着
+/// 权重轮到两家（甲甲乙甲），不是都连头一家；每连一次之前试算一次，试算说的排头就是这一次
+/// 真连上的那一家 —— 两条路记的是同一本账
+#[tokio::test]
+async fn websocket_connections_take_turns_like_requests_and_the_dry_run_agrees() {
+    use futures::StreamExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// 一家只接 WebSocket 的 Responses 上游：数它接了几条连接
+    async fn upstream() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::any(move |ws: axum::extract::WebSocketUpgrade| {
+                let m = m.clone();
+                async move {
+                    m.fetch_add(1, Ordering::SeqCst);
+                    ws.on_upgrade(|mut sock| async move { while sock.next().await.is_some() {} })
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (a, n)
+    }
+    let (a, hits_a) = upstream().await;
+    let (b, hits_b) = upstream().await;
+    let text = format!(
+        r#"version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: 我
+    key: tw-k
+providers:
+  - {{ name: 甲, base_url: "http://{a}", key: sk-a, protocol: openai-responses }}
+  - {{ name: 乙, base_url: "http://{b}", key: sk-b, protocol: openai-responses }}
+groups:
+  - name: 池
+    type: load-balance
+    providers: [{{ name: 甲, weight: 3 }}, 乙]
+routes:
+  - name: default
+    rules:
+      - name: 都去池子
+        to: 池
+"#
+    );
+    let (_d, app, gw) = app_and_gateway(&text);
+    let addr = tw_gateway::serve(gw.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    let mut went = Vec::new();
+    for i in 0..8 {
+        let predicted = run(&app, r#"{"model":"gpt-5"}"#).await.candidates[0].clone();
+        let before = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/v1/responses")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer tw-k".parse().unwrap());
+        let (c, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        // 网关在升级之后才去连上游
+        let mut now = before;
+        for _ in 0..100 {
+            now = (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+            if now != before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let to = match (now.0 - before.0, now.1 - before.1) {
+            (1, 0) => "甲",
+            (0, 1) => "乙",
+            other => panic!("第 {i} 条连接：{other:?}"),
+        };
+        assert_eq!(to, predicted, "第 {i} 条连接");
+        went.push(to);
+        drop(c);
+    }
+    assert_eq!(went, ["甲", "甲", "乙", "甲", "甲", "甲", "乙", "甲"]);
+}

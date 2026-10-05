@@ -13,8 +13,9 @@ use tw_types::msg;
 /// 接管一次 WebSocket 升级。
 ///
 /// 路由照走一遍 —— **一次升级也是一次请求**，`deny` 规则、熔断对它一样
-/// 有效。之后把连接交给 [`crate::ws::proxy`]，那里会在
-/// 每一帧上重新点一遍管线的保护。路由事件也由那边发：选中的那一家接没
+/// 有效，候选的次序和 HTTP 那条路是同一段（[`super::pipeline::arrange`]）：`load-balance`
+/// 按权重轮、记同一本账，`url-test`、`cheapest` 同样排。之后把连接交给 [`crate::ws::proxy`]，
+/// 那里会在每一帧上重新点一遍管线的保护。路由事件也由那边发：选中的那一家接没
 /// 接下，要和它握完手才知道。
 ///
 /// **Responses 的连接上每个 `response.create` 是一个请求**（见 `crate::ws::turn`）：连接
@@ -76,7 +77,7 @@ pub(super) async fn ws_upgrade(
             at_ms: now_ms(),
         })
     };
-    let decision = match rt.engine.route(&facts).map_err(|e| {
+    let mut decision = match rt.engine.route(&facts).map_err(|e| {
         GatewayError::config(msg!("gw.route.failed", detail = e => "Routing failed: {detail}"))
     })? {
         tw_engine::Outcome::Route(d) => d,
@@ -100,6 +101,28 @@ pub(super) async fn ws_upgrade(
             return Err(err);
         }
     };
+    // 候选的次序：**和 HTTP 那条路同一段**（见 `super::pipeline::arrange`）。先去掉服务不了的
+    // （停用的；Realtime 的连接写了模型，还有别名对不上、密钥不让用的），再按组排 ——
+    // `load-balance` 照权重轮到谁就是谁，不是一律连头一家。升级请求没有正文，认不出是哪段
+    // 对话，没有粘性。一家都服务不了的照旧交给下面一家家看，说得出为什么
+    let catalog = state.catalog.load();
+    let allow = crate::models::key_allow(&rt.config, &client_name);
+    let asked = rt
+        .engine
+        .asked(rt.engine.rules_for_client(&client_name), &facts, &decision);
+    let sent = crate::sent::plan(&rt.config, &catalog, &decision, &facts.model, &asked, allow);
+    let serving = crate::sent::serving(&rt.config, &catalog, &decision, &asked, allow);
+    if !serving.usable.is_empty() {
+        decision.candidates = serving.usable;
+    }
+    let arranged = super::pipeline::arrange(
+        &state,
+        &rt,
+        &mut decision,
+        &crate::sent::pairs(&sent),
+        None,
+        now_ms(),
+    );
     // 发给哪一家、每个 `response.create` 发出去的模型名怎么定：和 HTTP 那条路的一跳同一套，
     // 按这次的决定定（指定模型、阶段一的改写），别名对到这一家（见 `crate::ws::Naming`）
     let naming_for = |provider: &tw_config::Provider| crate::ws::Naming {
@@ -116,7 +139,6 @@ pub(super) async fn ws_upgrade(
     let picked = if facts.model.is_empty() {
         alive.first().map(|s| (s.to_string(), None))
     } else {
-        let catalog = state.catalog.load();
         let mut unserved = None;
         let mut barred = None;
         let mut picked = None;
@@ -176,6 +198,9 @@ pub(super) async fn ws_upgrade(
             "gw.route.no_upstream_alive" => "No upstream is available."
         )));
     };
+    // `load-balance` 记账：记在真连的那一家头上（排在它前面的服务不了这个模型时，不是排头的
+    // 那一家）
+    arranged.charge(&decision.candidates, &name);
     let Some(provider) = rt.config.providers.iter().find(|p| p.name == name) else {
         return Err(GatewayError::config(msg!(
             "gw.route.upstream_missing", upstream = name.clone() =>

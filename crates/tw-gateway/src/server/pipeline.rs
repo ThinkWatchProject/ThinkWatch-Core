@@ -678,12 +678,70 @@ fn route(
         tracing::debug!(skipped = ?serving.skipped, %model, "skipping the candidates that cannot serve this request");
     }
     decision.candidates = serving.usable;
+    let arranged = arrange(
+        state,
+        rt,
+        &mut decision,
+        &crate::sent::pairs(&sent),
+        conv,
+        now,
+    );
+    if let Some(why) = arranged.stayed {
+        choice.affinity = Some(tw_api::AffinityView {
+            held_route,
+            stayed: Some(why),
+        });
+        // 留下的那一家在头上。满着时等它，不当场跳过（见 `crate::slots`）
+        choice.stayed_on = decision.candidates.first().cloned();
+    }
+    // `load-balance` 记账：**记粘性之后排头的那一家**，不是按权重轮到的那一家。一段对话
+    // 留在了上次回答它的那一家，这一次就算那一家的；之后的新对话把差的补回去
+    if let Some(leader) = decision.candidates.first() {
+        arranged.charge(&decision.candidates, leader);
+    }
+    Ok(Routed::Go(choice, decision))
+}
+
+/// 排好了的候选（[`arrange`]）：会话粘性留下了哪一家的理由，和 `load-balance` 这一次还没记的账。
+pub(super) struct Arranged<'a> {
+    /// 排头的是上次回答这段对话的那一家：留下的理由。没留的是 None
+    pub(super) stayed: Option<tw_api::Stay>,
+    /// `load-balance` 这一轮（拿着它的锁）和排序时的那一份事实。别的组没有
+    ledger: Option<(crate::balance::Turn<'a>, tw_engine::Facts)>,
+}
+
+impl Arranged<'_> {
+    /// `load-balance` 记账：这一次排头的是 `leader`，`members` 是排好的那一份候选（粘性只换了
+    /// 次序，没换集合，还是同一轮）。HTTP 的请求记粘性之后排头的那一家，WebSocket 的升级记
+    /// 真连上的那一家。不经过 `load-balance` 的什么都不记
+    pub(super) fn charge(self, members: &[String], leader: &str) {
+        if let Some((turn, f)) = self.ledger {
+            turn.charge(members, &f, leader);
+        }
+    }
+}
+
+/// 管线第 2 步的最后：给候选排序、会话粘性。**HTTP 的请求和 WebSocket 的升级共用这一个**（见
+/// `super::upgrade`）：同一个组排出同一个顺序，`load-balance` 记同一本账，试算说的就是两条路
+/// 下一个新对话会去的那一家。
+///
+/// `decision.candidates` 进来时是能服务这个请求的那几家，出去时是排好的次序。`sent` 是每一家和
+/// 发给它的名字（比价按它算）；`conv` 是这段对话，认不出来的（WebSocket 的升级）没有粘性。
+/// 记账交给调用方（[`Arranged::charge`]）：从排序到记账一直拿着 `load-balance` 那一组的锁，
+/// 同时进来的几个一个接一个地排，后一个看到的是前一个记过的账
+pub(super) fn arrange<'a>(
+    state: &'a AppState,
+    rt: &'a Runtime,
+    decision: &mut tw_engine::Decision,
+    sent: &[(String, String)],
+    conv: Option<&crate::affinity::Conversation>,
+    now: u64,
+) -> Arranged<'a> {
     let group = decision
         .via_group
         .as_deref()
         .and_then(|n| rt.engine.groups().iter().find(|g| g.name == n));
-    // `load-balance` 这一次轮到谁（见 `crate::balance`）。**从排序到记账一直拿着锁**：
-    // 同时进来的几个请求一个接一个地排，后一个看到的是前一个记过的账
+    // `load-balance` 这一次轮到谁（见 `crate::balance`）
     let turn = group
         .filter(|g| g.kind == tw_engine::GroupType::LoadBalance)
         .map(|g| state.balance.turn(g));
@@ -701,7 +759,7 @@ fn route(
             &rt.config.providers,
             g,
             &decision.candidates,
-            &crate::sent::pairs(&sent),
+            sent,
             turn.as_ref().map(crate::balance::Turn::current),
         );
         decision.candidates = rt.engine.order(Some(&g.name), &decision.candidates, &f);
@@ -709,30 +767,19 @@ fn route(
     }
     // 留在上次回答这段对话的那一家：同一轮里一律留，跨轮看缓存值不值得留。**排在
     // 策略组排序之后** —— 该留的时候盖过策略，放开的时候策略照常说了算
-    if let Some(c) = conv
-        && let Some(why) = state.affinity.stay(
+    let stayed = conv.and_then(|c| {
+        state.affinity.stay(
             c,
             decision.via_group.as_deref(),
             &mut decision.candidates,
             |p| state.health.is_available(p),
             now,
         )
-    {
-        choice.affinity = Some(tw_api::AffinityView {
-            held_route,
-            stayed: Some(why),
-        });
-        // 留下的那一家在头上。满着时等它，不当场跳过（见 `crate::slots`）
-        choice.stayed_on = decision.candidates.first().cloned();
+    });
+    Arranged {
+        stayed,
+        ledger: turn.zip(facts_rt),
     }
-    // `load-balance` 记账：**记粘性之后排头的那一家**，不是按权重轮到的那一家。一段对话
-    // 留在了上次回答它的那一家，这一次就算那一家的；之后的新对话把差的补回去
-    if let (Some(turn), Some(f), Some(leader)) =
-        (turn, facts_rt.as_ref(), decision.candidates.first())
-    {
-        turn.charge(&decision.candidates, f, leader);
-    }
-    Ok(Routed::Go(choice, decision))
 }
 
 /// 发出开始事件：熔断过滤、出站脱敏看一遍、`RequestStarted`、结局、脱敏的记录、请求体留档。
