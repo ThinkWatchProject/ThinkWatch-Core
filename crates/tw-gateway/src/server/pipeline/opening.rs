@@ -10,9 +10,9 @@
 //! 客户端收到的和直接转发一个字节都不差。
 //!
 //! 等待有上限（配置的 `failover.stream_start_wait_secs`，以及 [`HOLD_LIMIT`]）：
-//! 上游迟迟不出内容时不能一直压着，那样客户端看到的就是一个卡住的请求。
-
-use std::time::Duration;
+//! 上游迟迟不出内容时不能一直压着，那样客户端看到的就是一个卡住的请求。等到点了是
+//! [`Opening::Slow`]：开着 `failover.next_on_slow_start` 时由调用方放弃这一家、换下一家，
+//! 不开就和内容来了一样交出去。
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -25,8 +25,15 @@ pub(super) const HOLD_LIMIT: usize = 1024 * 1024;
 
 /// 流开头的结论。
 pub(super) enum Opening {
-    /// 内容来了（或者等够了、流结束了）：交给客户端。读过的字节已经接回去了
+    /// 内容来了（或者流结束了、开头压得太多了）：交给客户端。读过的字节已经接回去了
     Go(reqwest::Response),
+    /// 等到点了还没有内容。`response` 和 [`Opening::Go`] 的一样，照旧交出去就是不换家；
+    /// **丢掉它就断开了和上游的连接**，上游不再接着生成。`usage` 是开头里上游报了的用量
+    /// （Anthropic 的 `message_start` 带着输入），没报是 None
+    Slow {
+        response: reqwest::Response,
+        usage: Option<tw_dialect::usage::Usage>,
+    },
     /// 第一段内容之前上游报了错。`status` 是这个错误对应的状态码，`body` 是
     /// 上游的原话，交给 [`crate::failure::classify`] 判断换不换。
     ///
@@ -44,13 +51,13 @@ pub(super) enum Opening {
     Broken(GatewayError),
 }
 
-/// 读到第一段内容为止。`dialect` 是上游说的格式，`eventstream` 表示流是 Bedrock
-/// 的二进制帧。
+/// 读到第一段内容为止，最多等到 `deadline`。`dialect` 是上游说的格式，`eventstream`
+/// 表示流是 Bedrock 的二进制帧。
 pub(super) async fn watch(
     r: reqwest::Response,
     dialect: Dialect,
     eventstream: bool,
-    wait: Duration,
+    deadline: tokio::time::Instant,
 ) -> Opening {
     let status = r.status();
     let headers = r.headers().clone();
@@ -59,12 +66,17 @@ pub(super) async fn watch(
     let mut size = 0usize;
     let mut sse = Sse::default();
     let mut unframe = eventstream.then(tw_bedrock::eventstream::Transcoder::new);
-    let deadline = tokio::time::Instant::now() + wait;
+    // 开头里上游报的用量：放弃这一家时，它可能已经按这些收了钱
+    let mut usage = tw_dialect::usage::Sniffer::new();
+    let mut slow = false;
 
     let verdict = loop {
         let next = match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(next) => next,
-            Err(_) => break Judge::Content,
+            Err(_) => {
+                slow = true;
+                break Judge::Content;
+            }
         };
         let chunk = match next {
             None => break Judge::Content,
@@ -86,6 +98,7 @@ pub(super) async fn watch(
                 Err(_) => break Judge::Content,
             },
         };
+        usage.feed(&text);
         let judged = sse
             .feed(&text)
             .into_iter()
@@ -118,6 +131,10 @@ pub(super) async fn watch(
             kind,
             message,
             response,
+        },
+        Judge::Content | Judge::Preamble if slow => Opening::Slow {
+            response,
+            usage: usage.finish(),
         },
         Judge::Content | Judge::Preamble => Opening::Go(response),
     }
@@ -332,6 +349,8 @@ impl Sse {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn events(text: &str) -> Vec<(Option<String>, String)> {
@@ -446,7 +465,7 @@ mod tests {
                     event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n\
                     event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let r = served(body).await;
-        match watch(r, Dialect::Anthropic, false, Duration::from_secs(5)).await {
+        match watch(r, Dialect::Anthropic, false, soon(5)).await {
             Opening::Go(r) => {
                 assert_eq!(r.headers()[http::header::CONTENT_TYPE], "text/event-stream");
                 assert_eq!(r.text().await.unwrap(), body);
@@ -458,16 +477,60 @@ mod tests {
     #[tokio::test]
     async fn an_error_before_content_is_reported_not_handed_on() {
         let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow\"}}\n\n";
-        match watch(
-            served(body).await,
-            Dialect::Anthropic,
-            false,
-            Duration::from_secs(5),
-        )
-        .await
-        {
+        match watch(served(body).await, Dialect::Anthropic, false, soon(5)).await {
             Opening::Failed { status, .. } => assert_eq!(status, 429),
             _ => panic!("该报失败"),
         }
+    }
+
+    fn soon(secs: u64) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(secs)
+    }
+
+    /// 发完开头就不说话的上游：响应头和 `head` 先到，之后流一直开着
+    fn stalled(head: &'static str) -> reqwest::Response {
+        let first =
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(head.as_bytes()))]);
+        let body = reqwest::Body::wrap_stream(first.chain(futures::stream::pending()));
+        let mut resp = http::Response::new(body);
+        resp.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        reqwest::Response::from(resp)
+    }
+
+    #[tokio::test]
+    async fn no_content_by_the_deadline_is_slow_and_keeps_what_the_upstream_reported() {
+        let head = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":800,\"output_tokens\":1}}}\n\n\
+                    event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        match watch(stalled(head), Dialect::Anthropic, false, deadline).await {
+            Opening::Slow { usage, .. } => {
+                let u = usage.expect("message_start 报了输入");
+                assert_eq!((u.input, u.cache_read), (1200, 800));
+            }
+            _ => panic!("到点没有内容该是 Slow"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_thinking_delta_is_content_not_a_slow_start() {
+        // Chat 格式的推理字（DeepSeek、Qwen 的 `reasoning_content`）也是模型开口了
+        let head = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\n";
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        assert!(matches!(
+            watch(stalled(head), Dialect::Chat, false, deadline).await,
+            Opening::Go(_)
+        ));
+        // 只来了角色的那一块不算
+        let role =
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n";
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        assert!(matches!(
+            watch(stalled(role), Dialect::Chat, false, deadline).await,
+            Opening::Slow { usage: None, .. }
+        ));
     }
 }

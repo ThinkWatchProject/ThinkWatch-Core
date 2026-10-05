@@ -1168,7 +1168,9 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
     Ok(())
 }
 
-pub use failover::{Failover, MAX_PAUSE_SECS, MAX_STREAM_START_WAIT_SECS};
+pub use failover::{
+    Failover, MAX_PAUSE_SECS, MAX_STREAM_START_WAIT_SECS, MIN_SLOW_START_WAIT_SECS,
+};
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, stand_in, try_parse};
 pub use retention::Retention;

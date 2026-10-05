@@ -2730,6 +2730,7 @@ mod cost_state_tests {
                     status: Some(200),
                     error: None,
                     ms: 1,
+                    usage: None,
                 }],
                 ..Default::default()
             })

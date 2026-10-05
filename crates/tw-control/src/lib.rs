@@ -410,6 +410,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 quota_pause_secs: f.quota_pause_secs,
                 rate_limit_max_pause_secs: f.rate_limit_max_pause_secs,
                 stream_start_wait_secs: f.stream_start_wait_secs,
+                next_on_slow_start: f.next_on_slow_start,
             }
         },
         listen: tw_api::ListenView {

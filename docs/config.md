@@ -893,6 +893,19 @@ Before the first content of a streamed answer reaches the client, an error
 the upstream sends in the stream moves the request to the next candidate,
 the same as an error status would.
 
+An upstream can also be slow to start: it accepts the request and then sends
+nothing for a long time. With `next_on_slow_start`, the request moves on to the
+next candidate when no content has arrived `stream_start_wait_secs` after it
+was sent. It is off by default, because models that think before they write
+can take long to start; with it on, wait 30 seconds or more. The last
+candidate always waits, and the upstream given up on is not set aside.
+
+```yaml
+failover:
+  stream_start_wait_secs: 30
+  next_on_slow_start: true
+```
+
 <!-- generated: table failover -->
 <a id="cfg-failover"></a>
 
@@ -905,6 +918,7 @@ the same as an error status would.
 | `quota_pause_secs` | integer | `3600` | Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then. |
 | `rate_limit_max_pause_secs` | integer | `3600` | A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason. |
 | `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
+| `next_on_slow_start` | bool | `false` | When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5. |
 <!-- /generated -->
 
 ### `aliases`
@@ -1015,9 +1029,10 @@ group shares out requests by the result in the same way as above.
   last 50 requests within the past 30 minutes. Server errors, rate limits,
   used-up quota or balance, rejected credentials, timeouts and connection
   errors count as failures; errors caused by the request itself do not, and
-  neither does a client that cancels. An upstream that keeps failing keeps a
-  twentieth of its weight, so it still gets the occasional new conversation
-  and its recovery is noticed; one that fails outright is set aside by
+  neither does a client that cancels or a switch away from a stream that is
+  slow to start. An upstream that keeps failing keeps a twentieth of its
+  weight, so it still gets the occasional new conversation and its recovery
+  is noticed; one that fails outright is set aside by
   [`failover`](#cfg-failover) as before.
 - `latency-health`: both factors, multiplied.
 

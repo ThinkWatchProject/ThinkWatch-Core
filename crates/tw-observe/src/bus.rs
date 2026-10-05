@@ -424,6 +424,7 @@ mod tests {
                     status: Some(503),
                     error: None,
                     ms: 10,
+                    usage: None,
                 },
                 tw_api::AttemptView {
                     provider: served_by.into(),
@@ -432,6 +433,7 @@ mod tests {
                     status: Some(200),
                     error: None,
                     ms: 20,
+                    usage: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,

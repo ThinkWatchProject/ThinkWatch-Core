@@ -211,6 +211,48 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
     assert!(body.contains("config.failover_range"), "{body}");
 }
 
+/// 开头慢就换下一家：默认关；打开要等得够久，等得太短的被拒
+#[tokio::test]
+async fn switching_on_a_slow_start_is_shown_and_needs_a_long_enough_wait() {
+    let b = bed(BASE);
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(
+        json(&body)["failover"]["next_on_slow_start"],
+        false,
+        "{body}"
+    );
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/next_on_slow_start", "value": true }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(b.parsed().failover.next_on_slow_start);
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    assert_eq!(
+        json(&body)["failover"]["next_on_slow_start"],
+        true,
+        "{body}"
+    );
+
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/stream_start_wait_secs", "value": 3 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("config.slow_start_too_short"), "{body}");
+}
+
 // ─────────────────────────────────────────────────────────── 上游
 
 #[tokio::test]

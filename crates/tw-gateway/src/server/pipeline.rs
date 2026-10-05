@@ -24,6 +24,7 @@ mod hop;
 mod opening;
 mod plug;
 mod relay;
+mod slow;
 
 /// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
 /// 客户端打不爆内存。

@@ -1,4 +1,4 @@
-//! 故障转移：一家上游失败之后停用多久、流开头最多等多久。
+//! 故障转移：一家上游失败之后停用多久、流开头最多等多久、等不到内容换不换下一家。
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,11 @@ pub struct Failover {
     /// 等过这么久还没有内容，就不再等，把已经收到的交给客户端
     #[serde(default = "d_stream_start_wait_secs")]
     pub stream_start_wait_secs: u64,
+    /// 流式回答等过 [`Self::stream_start_wait_secs`] 还没有内容时，放弃这一家、换下一家。
+    /// **最后一家不换**，照常等下去；这一家不停用，也不算一次失败。默认关：先想好再
+    /// 输出的模型开头本来就慢，开着时要把等待调长
+    #[serde(default)]
+    pub next_on_slow_start: bool,
 }
 
 fn d_failures_to_pause() -> u32 {
@@ -71,6 +76,7 @@ impl Default for Failover {
             quota_pause_secs: d_quota_pause_secs(),
             rate_limit_max_pause_secs: d_rate_limit_max_pause_secs(),
             stream_start_wait_secs: d_stream_start_wait_secs(),
+            next_on_slow_start: false,
         }
     }
 }
@@ -81,6 +87,10 @@ pub const MAX_PAUSE_SECS: u64 = 7 * 24 * 3600;
 
 /// 流开头最多等多少秒。再长的话，一家卡在半路的上游会让客户端先超时
 pub const MAX_STREAM_START_WAIT_SECS: u64 = 120;
+
+/// 开着「开头慢就换下一家」时，流开头至少等多少秒。再短的话，平常的请求还没开口就被
+/// 切掉了
+pub const MIN_SLOW_START_WAIT_SECS: u64 = 5;
 
 impl Failover {
     /// 不在允许范围里的第一项：字段名、写的值、下限、上限。
@@ -122,5 +132,11 @@ impl Failover {
         fields
             .into_iter()
             .find(|(_, v, min, max)| v < min || v > max)
+    }
+
+    /// 开着「开头慢就换下一家」、等待却短于 [`MIN_SLOW_START_WAIT_SECS`]：写的等待秒数。
+    pub(crate) fn slow_start_too_short(&self) -> Option<u64> {
+        (self.next_on_slow_start && self.stream_start_wait_secs < MIN_SLOW_START_WAIT_SECS)
+            .then_some(self.stream_start_wait_secs)
     }
 }

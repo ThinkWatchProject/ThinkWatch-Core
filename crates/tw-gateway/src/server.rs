@@ -346,6 +346,7 @@ pub(crate) fn hop(
         status: Some(status),
         error: None,
         ms: started.elapsed().as_millis() as u64,
+        usage: None,
     }
 }
 
@@ -363,6 +364,7 @@ pub(crate) fn hop_failed(
         status: None,
         error: Some(error),
         ms: started.elapsed().as_millis() as u64,
+        usage: None,
     }
 }
 

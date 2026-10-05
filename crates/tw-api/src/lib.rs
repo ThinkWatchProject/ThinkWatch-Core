@@ -1438,6 +1438,11 @@ slug_enum! {
         /// （`status` 是它回的那个）。尝试链到此为止，这一行记成网关自己答的
         /// （[`HistoryRow::local`]），费用 0
         Estimated = "estimated",
+        /// 流式回答等了 `failover.stream_start_wait_secs` 还没有内容，开着
+        /// `failover.next_on_slow_start`，放弃这一家、换下一家（连接断开，上游不再生成）。
+        /// 响应头到了的有 `status`，没到的没有。**这一家不停用、不算失败**。上游可能已经按
+        /// 输入收了钱：知道多少的在 `usage` 里
+        SlowStart = "slow_start",
     }
 }
 
@@ -1462,10 +1467,32 @@ pub struct AttemptView {
     /// 上游返回的状态码。`error` 时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句
+    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句。`slow_start` 时说等了多久
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Msg>,
     pub ms: u64,
+    /// 放弃了的这一跳（`slow_start`）上游可能已经收了钱的输入（见 [`AttemptUsage`]）。估不
+    /// 出来的（请求解不开）没有。别的结果都没有：接下请求的那一跳的用量在结局里
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AttemptUsage>,
+}
+
+/// 放弃了的一跳（[`AttemptOutcome::SlowStart`]）上游可能已经收了钱的输入。
+///
+/// 上游在流开头报了的（Anthropic 的 `message_start`）是它报的数；没报的只有 `input`，是网关
+/// 估的（`estimated`，和 [`Event::RequestStarted`] 的 `input_estimate` 同一个数）。**输出不知道**：
+/// 先想好再输出的模型，放弃之前可能已经想了一阵，上游不说就看不到。
+///
+/// **不算进这个请求的费用**：上游收没收、收了多少，网关看不到
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AttemptUsage {
+    /// 输入 token，不含缓存读写
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// `input` 是网关估的，上游什么都没报
+    pub estimated: bool,
 }
 
 /// 一次请求的路由决策。**详情抽屉的 Routing 那一页吃它。**
@@ -1832,6 +1859,8 @@ pub struct FailoverView {
     pub rate_limit_max_pause_secs: u64,
     /// 流式回答的开头最多等多少秒
     pub stream_start_wait_secs: u64,
+    /// 等过 `stream_start_wait_secs` 还没有内容就换下一家（最后一家照常等）
+    pub next_on_slow_start: bool,
 }
 
 /// 每项防护各在哪一档：`off` / `observe` / `enforce`。

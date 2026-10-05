@@ -64,6 +64,9 @@ pub enum ValidationError {
         min: u64,
         max: u64,
     },
+    /// 开着「开头慢就换下一家」，流开头的等待却短于 [`crate::MIN_SLOW_START_WAIT_SECS`]
+    #[error("{}", self.msg())]
+    SlowStartTooShort { secs: u64 },
     #[error("{}", self.msg())]
     ControlKeyMissing,
     #[error("{}", self.msg())]
@@ -205,6 +208,12 @@ impl ValidationError {
             } => msg!(
                 "config.failover_range", field = field, value = value, min = min, max = max =>
                 "failover.{field} is {value}; it has to be between {min} and {max}"
+            ),
+            SlowStartTooShort { secs } => msg!(
+                "config.slow_start_too_short",
+                secs = secs, min = crate::MIN_SLOW_START_WAIT_SECS =>
+                "failover.stream_start_wait_secs is {secs} while failover.next_on_slow_start is on; \
+                 it has to be at least {min}, or ordinary answers are cut off before they start"
             ),
             ControlKeyMissing => msg!(
                 "config.control_key_missing" =>
@@ -474,6 +483,10 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
             min,
             max,
         });
+    }
+    // 开头慢就换下一家：等得太短的话，平常的回答还没开口就被切到下一家
+    if let Some(secs) = cfg.failover.slow_start_too_short() {
+        return Err(ValidationError::SlowStartTooShort { secs });
     }
     // 控制面的钥匙。**缺了、短了、不是十六进制，整份配置都不收**，旧的继续
     // 服务：一份没有钥匙的配置换进来，下一条连接谁都进不来 —— 包括要把它
@@ -1057,6 +1070,23 @@ groups:
                 other => panic!("{want} 该被拒，实际 {other:?}"),
             }
         }
+    }
+
+    /// 开头慢就换下一家：开着时等待至少 5 秒，关着时 1 秒也照收（只是交得早）
+    #[test]
+    fn switching_on_a_slow_start_needs_a_long_enough_wait() {
+        let mut x = with_rules(&[], &[]);
+        x.failover.stream_start_wait_secs = 3;
+        assert!(validate(&x).is_ok(), "关着时不管");
+        x.failover.next_on_slow_start = true;
+        let e = validate(&x).unwrap_err();
+        assert!(
+            matches!(e, ValidationError::SlowStartTooShort { secs: 3 }),
+            "{e:?}"
+        );
+        assert_eq!(e.msg().code, "config.slow_start_too_short");
+        x.failover.stream_start_wait_secs = crate::MIN_SLOW_START_WAIT_SECS;
+        assert!(validate(&x).is_ok());
     }
 
     /// 别名表：名字一个一个、不带通配、不撞内置前缀，每个别名列着别的名称，

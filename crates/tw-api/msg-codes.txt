@@ -90,6 +90,7 @@ config.schema_too_new
 config.secret.empty_name
 config.secret.env_missing
 config.secret.unterminated
+config.slow_start_too_short
 config.store.conflict
 config.store.missing
 config.store.read_failed
@@ -355,6 +356,7 @@ gw.route.protocol_mismatch
 gw.route.rule_failed
 gw.route.selected_upstream_missing
 gw.route.upstream_missing
+gw.slow_start
 gw.toolcall.connection_cut
 gw.toolcall.response_cut
 gw.toolcall.response_withheld

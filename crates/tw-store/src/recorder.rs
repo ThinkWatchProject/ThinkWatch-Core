@@ -847,6 +847,7 @@ mod tests {
                         text: "上游响应超时".into(),
                     }),
                     ms: 10_003,
+                    usage: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -855,6 +856,7 @@ mod tests {
                     status: Some(200),
                     error: None,
                     ms: 5_042,
+                    usage: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
@@ -899,6 +901,7 @@ mod tests {
                 status: Some(200),
                 error: None,
                 ms: 300,
+                usage: None,
             }],
             billing: tw_api::Billing::PerToken,
         });
@@ -928,6 +931,7 @@ mod tests {
                     status: Some(529),
                     error: None,
                     ms: 100,
+                    usage: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -936,6 +940,7 @@ mod tests {
                     status: Some(200),
                     error: None,
                     ms: 300,
+                    usage: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
@@ -984,6 +989,7 @@ mod tests {
                 status: Some(200),
                 error: None,
                 ms: 300,
+                usage: None,
             }],
             billing: tw_api::Billing::PerToken,
         });
@@ -1104,6 +1110,7 @@ mod tests {
                 status: None,
                 error: None,
                 ms: 0,
+                usage: None,
             }],
             billing: tw_api::Billing::PerToken,
         });
@@ -1416,6 +1423,7 @@ mod tests {
                 status: Some(404),
                 error: None,
                 ms: 80,
+                usage: None,
             }],
             billing: tw_api::Billing::Free,
             affinity: None,
@@ -1489,6 +1497,7 @@ mod billing_tests {
                 status: Some(200),
                 error: None,
                 ms: 5,
+                usage: None,
             }],
             billing,
         }
@@ -1576,6 +1585,7 @@ mod billing_tests {
                 status: Some(101),
                 error: None,
                 ms: 40,
+                usage: None,
             }],
             billing,
         }
@@ -1964,6 +1974,7 @@ mod translation_tests {
                     status: Some(200),
                     error: None,
                     ms: 1,
+                    usage: None,
                 })
                 .collect(),
             billing: tw_api::Billing::PerToken,
