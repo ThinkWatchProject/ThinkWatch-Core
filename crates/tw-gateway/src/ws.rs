@@ -928,9 +928,13 @@ type Stream = tokio_tungstenite::WebSocketStream<Box<dyn Io>>;
 
 /// 一条连接是怎么断的。
 enum End {
-    /// 有一边收场了：发了关闭帧，或者把连接收掉了。**客户端那一边怎么走
+    /// 客户端那一边收场了：发了关闭帧，或者走了（连接收掉了、写不过去了）。**客户端怎么走
     /// 都算这一种** —— 一次会话就是由客户端结束的，那是正常收场
     Closed,
+    /// 上游收了连接：发了关闭帧，或者没有关闭帧就断开了。整条连接一行的，这也是收场；
+    /// Responses 的连接上还没答完的那几轮是**失败**，上游没答完就走了 —— 记成客户端取消的话，
+    /// 这一家内容之前断掉的那一轮不算它的失败，界面上也像是用户自己停下的
+    UpstreamClosed,
     /// 上游那边出错断了，或者写不过去了
     Broke(Msg),
     /// 被防护切断了：回答里的工具调用命中了切断规则，或者客户端发来的一帧被内容过滤拒了
@@ -1003,8 +1007,8 @@ async fn pump(
             msg = u_rx.next() => {
                 let m = match msg {
                     Some(Ok(m)) => m,
-                    // 上游把连接收掉了，没有关闭帧也算收场
-                    None => break End::Closed,
+                    // 上游把连接收掉了，没有关闭帧也算它收了
+                    None => break End::UpstreamClosed,
                     Some(Err(e)) => {
                     break End::Broke(msg!(
                         "gw.ws.upstream_broke", detail = e =>
@@ -1027,7 +1031,7 @@ async fn pump(
                     }
                     UpMsg::Ping(b) => Message::Ping(b),
                     UpMsg::Pong(b) => Message::Pong(b),
-                    UpMsg::Close(_) => break End::Closed,
+                    UpMsg::Close(_) => break End::UpstreamClosed,
                     UpMsg::Frame(_) => continue,
                 };
                 // 发不给客户端，就是客户端已经走了
@@ -1036,17 +1040,24 @@ async fn pump(
         }
     };
     // **先报结局，再关连接。**关连接要等对面回话，而对面可能早就不在了。在等准入的那一轮
-    // 开始了的话记成取消；在跑的几轮，上游断了的是失败，别的是取消
+    // 开始了的话记成取消；在跑的几轮，上游断了、收了连接的是失败，客户端走了的是取消
     drop(waiting);
     if let Some(t) = p.turns.as_mut() {
         match &end {
             End::Broke(why) => t.fail_all(tw_api::FailureSource::Upstream, why.clone()),
+            End::UpstreamClosed => t.fail_all(
+                tw_api::FailureSource::Upstream,
+                msg!(
+                    "gw.ws.upstream_closed" =>
+                    "The upstream closed the connection before the answer was complete."
+                ),
+            ),
             _ => t.clear(),
         }
     }
     if let Some(ending) = ending {
         match end {
-            End::Closed => ending.finished(101),
+            End::Closed | End::UpstreamClosed => ending.finished(101),
             End::Broke(why) => ending.failed(tw_api::FailureSource::Upstream, why),
             End::Cut(why) => ending.failed(tw_api::FailureSource::Denied, why),
         }

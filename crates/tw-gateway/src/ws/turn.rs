@@ -5,8 +5,8 @@
 //! 结局三条事件，存储层记一行。用量是这一次回答里的 `usage`（输入含缓存读、输出），结局事件
 //! 交给同一个记录器，按发给这一家的模型名、照 HTTP 那条路同一套查价：费用、密钥的用量、
 //! 体检、流量看到的都是它。第一个 token 什么时候到、回答里写的是哪个模型，也和 HTTP 那条路
-//! 一样认（见 [`Ending::frame`]）。连接半路断了，这一轮记成取消；上游断了，记成失败。尝试链
-//! 只有一跳：这条连接连着的那一家。
+//! 一样认（见 [`Ending::frame`]）。客户端半路走了，这一轮记成取消；上游断了、收了连接，记成
+//! 失败。尝试链只有一跳：这条连接连着的那一家。
 //!
 //! **连接本身不留行**：一条连接跑好几轮、中间可以闲着很久，流量里该看的是每一轮。会话照
 //! HTTP 那条路按每一帧认（Codex 每段对话带着 `prompt_cache_key`），同一段对话的几轮归到同一
@@ -210,7 +210,7 @@ impl Turns {
         }
     }
 
-    /// 上游断了：在跑的几轮都没答完，一样失败
+    /// 上游断了、收了连接：在跑的几轮都没答完，一样失败
     pub(crate) fn fail_all(&mut self, source: tw_api::FailureSource, why: Msg) {
         while let Some(t) = self.queue.pop_front() {
             t.fail(source, why.clone());
@@ -224,7 +224,7 @@ impl Turns {
         }
     }
 
-    /// 连接断了：没答完的几轮记成取消（结局的 Drop）
+    /// 客户端走了：没答完的几轮记成取消（结局的 Drop）
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
     }
@@ -365,8 +365,8 @@ impl Turn {
         }
     }
 
-    /// 失败了：上游断了、被防护切断了。用量照样带着（上游已经计了费）。上游断了的，没答上
-    /// 之前断的给这一家记一次失败，和 HTTP 那条路流在第一段内容之前断了一样
+    /// 失败了：上游断了、收了连接，被防护切断了。用量照样带着（上游已经计了费）。上游那边的，
+    /// 没答上之前断的给这一家记一次失败，和 HTTP 那条路流在第一段内容之前断了一样
     pub(crate) fn fail(mut self, source: tw_api::FailureSource, why: Msg) {
         if source == tw_api::FailureSource::Upstream {
             self.judge(|h, p| h.record_failure(p));

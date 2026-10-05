@@ -1469,6 +1469,110 @@ async fn each_turn_feeds_the_upstreams_speed_and_success_like_an_http_hop() {
     assert_eq!(rate(), Some(7.0 / 8.0), "客户端走了被算进了成败");
 }
 
+/// 一轮回到一半上游就收了连接：帧里写着 `CLOSE` 的，回了开头之后发关闭帧；写着 `DROP` 的，
+/// 回了开头之后直接断开（没有关闭帧）；写着 `HOLD` 的，回了开头之后一直不说完。别的照常答完
+async fn closing() -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut sock| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(t) = m else { continue };
+                    n += 1;
+                    let id = format!("resp_{n}");
+                    let frames = if ["CLOSE", "DROP", "HOLD"].iter().any(|w| t.contains(w)) {
+                        vec![created(&id)]
+                    } else {
+                        vec![created(&id), delta(), completed(&id)]
+                    };
+                    for f in frames {
+                        if sock
+                            .send(Message::Text(f.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if t.contains("CLOSE") {
+                        let _ = sock.send(Message::Close(None)).await;
+                        return;
+                    }
+                    if t.contains("DROP") {
+                        return;
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// 一轮还没答完上游就收了连接（关闭帧，或者直接断开）：**这一轮失败了，是上游的事**，不是
+/// 客户端取消 —— 内容之前就断的给这一家记一次失败，和 HTTP 那条路流在第一段内容之前断了
+/// 一样。客户端自己走的才是取消，不记成败
+#[tokio::test]
+async fn an_upstream_that_closes_mid_turn_fails_the_turn() {
+    let up = closing().await;
+    let (gw, mut rx, state) = turns_gateway(up, |_| {}, None).await;
+    let rate = || {
+        state
+            .health
+            .success_rates(&["up".to_string()])
+            .get("up")
+            .copied()
+    };
+    let mut c = connect(gw).await;
+    for _ in 0..4 {
+        c.send(create("hi")).await.unwrap();
+        until_end(&mut c).await;
+    }
+    requests(&mut rx, 4).await;
+    for (i, how) in ["CLOSE", "DROP"].into_iter().enumerate() {
+        if i > 0 {
+            c = connect(gw).await;
+        }
+        c.send(create(how)).await.unwrap();
+        let evs = requests(&mut rx, 1).await;
+        match evs.last().unwrap() {
+            Event::RequestFailed {
+                source, message, ..
+            } => {
+                assert_eq!(*source, tw_api::FailureSource::Upstream, "{how}");
+                // 没有关闭帧就断开的，有的时候读到的是一个读错误（连接被重置）
+                let codes: &[&str] = match how {
+                    "CLOSE" => &["gw.ws.upstream_closed"],
+                    _ => &["gw.ws.upstream_closed", "gw.ws.upstream_broke"],
+                };
+                assert!(codes.contains(&message.code.as_str()), "{how}: {message:?}");
+            }
+            other => panic!("{how}：该是一次上游的失败：{other:?}"),
+        }
+    }
+    assert_eq!(rate(), Some(4.0 / 6.0), "内容之前断的是这一家的失败");
+
+    // 客户端自己走的：取消，不记成败
+    let mut c = connect(gw).await;
+    c.send(create("HOLD")).await.unwrap();
+    loop {
+        let m = c.next().await.unwrap().unwrap();
+        if m.into_text().unwrap().contains("response.created") {
+            break;
+        }
+    }
+    drop(c);
+    let evs = requests(&mut rx, 1).await;
+    assert!(
+        matches!(evs.last().unwrap(), Event::RequestCancelled { .. }),
+        "{evs:?}"
+    );
+    assert_eq!(rate(), Some(4.0 / 6.0), "客户端走了被算进了成败");
+}
+
 /// 一轮在上游的 `error` 那一帧收尾，上游又为**同一次回答**补发一个 `response.failed`：那一帧
 /// 照原样交给客户端，**不算排在后面的那一轮的** —— 下一轮照样有自己的回答、用量和成败。
 /// 每次回答都用同一个 id 的上游也照常：下一轮自己的回答不会被当成补发的

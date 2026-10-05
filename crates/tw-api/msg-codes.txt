@@ -403,6 +403,7 @@ gw.ws.connect_failed
 gw.ws.proxy_unsupported
 gw.ws.send_failed
 gw.ws.upstream_broke
+gw.ws.upstream_closed
 l1.config.bad_url
 l1.config.no_host
 l1.config.proxy_addr_form
