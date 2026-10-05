@@ -230,7 +230,7 @@ pub async fn dry_run(
             // 每一家按它实际要的模型看：规则改写过的按改写后的算，和数据面一样
             let asked = engine.models_asked(rules, &f, &d);
             let serving =
-                tw_gateway::models::serving(&rt.config, &s.gateway.catalog.load(), &asked);
+                tw_gateway::models::serving(&rt.config, &s.gateway.catalog.load(), &d, &asked);
             out.skipped = serving
                 .skipped
                 .iter()
