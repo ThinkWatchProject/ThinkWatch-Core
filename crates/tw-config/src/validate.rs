@@ -814,6 +814,58 @@ groups:
         assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "typo"));
     }
 
+    /// 手写的权重：`load-balance` 收 1 到 100，别的类型写了不是 1 的权重、或者超出范围，
+    /// 加载时就拒绝
+    #[test]
+    fn a_weight_is_checked_at_load_time() {
+        let text = |kind: &str, b: &str| {
+            format!(
+                "version: 1
+listen:
+  control:
+    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00
+clients:
+  - name: c
+    key: tw-k
+providers:
+  - name: a
+    base_url: https://a.example
+    key: sk-a
+  - name: b
+    base_url: https://b.example
+    key: sk-b
+groups:
+  - name: pool
+    type: {kind}
+    providers:
+      - a
+      - {b}
+"
+            )
+        };
+        let ok = crate::try_parse(&text("load-balance", "{ name: b, weight: 7 }")).unwrap();
+        assert_eq!(ok.groups[0].weight("b"), 7);
+        let code = |kind: &str, b: &str| crate::try_parse(&text(kind, b)).unwrap_err().msg().code;
+        assert_eq!(
+            code("fallback", "{ name: b, weight: 7 }"),
+            "engine.group_weight_not_load_balance"
+        );
+        assert_eq!(
+            code("load-balance", "{ name: b, weight: 0 }"),
+            "engine.group_weight_out_of_range"
+        );
+        assert_eq!(
+            code("load-balance", "{ name: b, weight: 101 }"),
+            "engine.group_weight_out_of_range"
+        );
+        // 拼错的字段照常说是哪一个
+        let m = crate::try_parse(&text("load-balance", "{ name: b, wieght: 7 }"))
+            .unwrap_err()
+            .msg();
+        assert_eq!(m.code, "config.unknown_field", "{m:?}");
+        assert_eq!(m.arg("field"), "groups[0].providers[1].wieght", "{m:?}");
+    }
+
     #[test]
     fn error_messages_say_what_to_do_next() {
         // 错误信息是降低使用难度最有效的杠杆。判据不是「说清

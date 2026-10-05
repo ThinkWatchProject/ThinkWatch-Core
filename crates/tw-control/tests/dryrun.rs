@@ -49,11 +49,18 @@ fn app() -> (tempfile::TempDir, axum::Router) {
 }
 
 fn app_with(text: &str) -> (tempfile::TempDir, axum::Router) {
+    let (d, app, _) = app_and_gateway(text);
+    (d, app)
+}
+
+/// [`app_with`]，连同它的数据面：要看试算和数据面是不是读的同一份状态
+fn app_and_gateway(text: &str) -> (tempfile::TempDir, axum::Router, tw_gateway::AppState) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yaml");
     std::fs::write(&p, text).unwrap();
     let cfg: tw_config::Config = serde_yaml_ng::from_str(text).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
+    let gw_for_test = gw.clone();
     let bus = gw.bus.clone();
     let state = ControlState {
         shutdown: Default::default(),
@@ -66,7 +73,7 @@ fn app_with(text: &str) -> (tempfile::TempDir, axum::Router) {
         chatgpt: Default::default(),
         zai: Default::default(),
     };
-    (d, tw_control::router(state))
+    (d, tw_control::router(state), gw_for_test)
 }
 
 /// 试算要说清按哪条路由算。没指定密钥、路由、草稿时，用唯一那把密钥
@@ -288,6 +295,59 @@ async fn the_dry_run_changes_nothing_and_sends_nothing() {
         std::fs::read_to_string(d.path().join("config.yaml")).unwrap(),
         before
     );
+}
+
+/// `load-balance` 的试算读数据面记着的那一份轮询状态，**只读不记**：试算几次都还是同一家
+/// 排头；数据面排过之后，试算跟着变。每个候选带着它的权重
+#[tokio::test]
+async fn a_weighted_group_is_tried_from_the_data_planes_state_without_moving_it() {
+    let text = CFG.replace(
+        "    providers: [官方, 中转]\n",
+        "    providers: [{ name: 官方, weight: 3 }, 中转]\n",
+    );
+    let (_d, app, gw) = app_and_gateway(&text);
+    let weights = |r: &tw_api::DryRunResult| {
+        r.candidate_models
+            .iter()
+            .map(|c| (c.provider.clone(), c.weight))
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..5 {
+        let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+        assert_eq!(r.candidates, ["官方", "中转"]);
+        assert_eq!(
+            weights(&r),
+            [("官方".to_string(), Some(3)), ("中转".to_string(), Some(1))]
+        );
+    }
+    // 数据面排了两次，都排给了官方：3:1 的下一个是中转
+    let rt = gw.runtime();
+    let g = rt
+        .engine
+        .groups()
+        .iter()
+        .find(|g| g.name == "都试试")
+        .unwrap();
+    let members = g.names();
+    for _ in 0..2 {
+        let turn = gw.balance.turn(g);
+        let f = tw_engine::Facts {
+            current_weight: turn.current(),
+            ..Default::default()
+        };
+        assert_eq!(rt.engine.order(Some(&g.name), &members, &f)[0], "官方");
+        turn.charge(&members, &f, "官方");
+    }
+    let before = gw.balance.peek(g);
+    for _ in 0..3 {
+        let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+        assert_eq!(r.candidates, ["中转", "官方"], "排头的之后其余按组里的顺序");
+    }
+    assert_eq!(gw.balance.peek(g), before, "试算不记账");
+
+    // 不经过 `load-balance` 的候选不带权重
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5","cache":true}"#).await;
+    assert_eq!(weights(&r), [("官方".to_string(), None)]);
 }
 
 #[tokio::test]

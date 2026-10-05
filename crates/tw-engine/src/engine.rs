@@ -9,6 +9,7 @@ use tw_types::{Msg, msg};
 
 use crate::facts::RequestFacts;
 use crate::rule::{MatchError, When};
+use crate::weighted::{Member, WEIGHT_MAX, WEIGHT_MIN};
 
 /// 策略组类型。
 ///
@@ -25,7 +26,8 @@ pub enum GroupType {
     Fallback,
     /// 手动指定一个。缓存友好
     Select,
-    /// 轮流。**轮的是新对话**：已经有人回答过、缓存还热着的对话留在那一家
+    /// 按成员的权重轮流（平滑加权轮询，见 [`crate::weighted`]），权重都是 1 就是挨个轮。
+    /// **轮的是新对话**：已经有人回答过、缓存还热着的对话留在那一家
     LoadBalance,
     /// 选最快的。判据是**真实流量测出来的 TTFB**，样本不够时用启动时
     /// 那次零成本的 L1 握手计时补。
@@ -69,8 +71,12 @@ impl GroupType {
 /// 和真实转发不一样的结果」。
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
-    /// 轮转的种子 —— 通常是请求序号
-    pub seq: u64,
+    /// `load-balance` 每个成员此刻的「当前权重」：平滑加权轮询攒下的那个数（见
+    /// [`crate::weighted`]）。网关按组记着，排一次记一次账；试算只读不记。**缺席 = 0**
+    pub current_weight: std::collections::HashMap<String, i64>,
+    /// 此刻停着的上游：熔断着、失败之后冷却着。`load-balance` 这一轮不算它们 ——
+    /// 网关反正会跳过它们，轮到它们的那一次会落到组里排在后面的那一家头上
+    pub paused: std::collections::HashSet<String>,
     /// 每家的典型 TTFB（毫秒）。**缺席 = 样本不够**，不是「很快」
     pub ttfb_ms: std::collections::HashMap<String, u32>,
     /// 每家跑这个模型的单价，(输入, 输出)，微分/百万 token。
@@ -90,10 +96,32 @@ pub struct Group {
     pub name: String,
     #[serde(default, rename = "type")]
     pub kind: GroupType,
-    pub providers: Vec<String>,
+    /// 成员：上游的名字，`load-balance` 还可以带权重（见 [`Member`]）。权重是 1 的写成名字
+    #[serde(with = "crate::weighted::members")]
+    pub providers: Vec<Member>,
     /// `select` 用：当前选中的那个
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+}
+
+impl Group {
+    /// 成员的名字，按组里的顺序
+    pub fn names(&self) -> Vec<String> {
+        self.providers.iter().map(|m| m.name.clone()).collect()
+    }
+
+    /// `name` 是不是这个组的成员
+    pub fn has(&self, name: &str) -> bool {
+        self.providers.iter().any(|m| m.name == name)
+    }
+
+    /// 成员 `name` 的权重。不是成员的按 1 算
+    pub fn weight(&self, name: &str) -> u32 {
+        self.providers
+            .iter()
+            .find(|m| m.name == name)
+            .map_or(1, |m| m.weight)
+    }
 }
 
 /// 按策略排序。**纯函数** —— 同样的输入永远给同样的顺序，试算页因此
@@ -102,7 +130,7 @@ pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
     match g.kind {
         // 这两种的顺序在 `expand_group` 里就定好了
         GroupType::Fallback | GroupType::Select => members.to_vec(),
-        GroupType::LoadBalance => rotate(members, f),
+        GroupType::LoadBalance => balance(g, members, f),
         GroupType::UrlTest => {
             // 有样本的按 TTFB 升序；没样本的保持原有相对次序排在后面。
             // **`sort_by_key` 是稳定排序**，所以同速的两家不会每次换位
@@ -124,20 +152,18 @@ pub fn order_by(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
     }
 }
 
-/// `load-balance` 的轮转：按 `seq` 轮到谁，谁排头。
+/// `load-balance`：按权重轮到的那一家排头（平滑加权轮询，见 [`crate::weighted`]）。
 ///
-/// **选中的那一家排头，其余顺次跟上**，一个都不少 —— 故障转移还要用它们。
+/// **排头的之后，其余的按组里的顺序跟上**，一个都不少 —— 故障转移还要用它们。
 /// 同一段对话不在这里粘：留在上次回答它的那一家由网关按对话记着，这里只管
 /// 还没人回答过的。
-fn rotate(members: &[String], f: &Facts) -> Vec<String> {
-    if members.is_empty() {
-        return Vec::new();
-    }
-    let start = (f.seq % members.len() as u64) as usize;
-    let mut out = Vec::with_capacity(members.len());
-    out.extend_from_slice(&members[start..]);
-    out.extend_from_slice(&members[..start]);
-    out
+fn balance(g: &Group, members: &[String], f: &Facts) -> Vec<String> {
+    let Some(first) = crate::weighted::lead(g, members, f) else {
+        return members.to_vec();
+    };
+    std::iter::once(first.to_string())
+        .chain(members.iter().filter(|m| *m != first).cloned())
+        .collect()
 }
 
 /// 改写请求参数。
@@ -559,6 +585,18 @@ pub enum RouteError {
     #[error("{}", self.msg())]
     GroupUnknownUpstream { group: String, provider: String },
     #[error("{}", self.msg())]
+    GroupWeightNotLoadBalance {
+        group: String,
+        provider: String,
+        weight: u32,
+    },
+    #[error("{}", self.msg())]
+    GroupWeightOutOfRange {
+        group: String,
+        provider: String,
+        weight: u32,
+    },
+    #[error("{}", self.msg())]
     DuplicateRoute(String),
     #[error("{}", self.msg())]
     UnknownDefaultRoute(String),
@@ -619,6 +657,26 @@ impl RouteError {
                 "engine.group_unknown_upstream", group = group, upstream = provider =>
                 "group `{group}` lists `{upstream}`, which is not an upstream. A group's members are \
                  upstreams, by name"
+            ),
+            RouteError::GroupWeightNotLoadBalance {
+                group,
+                provider,
+                weight,
+            } => msg!(
+                "engine.group_weight_not_load_balance", group = group, upstream = provider,
+                weight = weight =>
+                "group `{group}` gives upstream `{upstream}` a weight of {weight}, and only a \
+                 load-balance group uses weights. Remove the weight, or make the group load-balance"
+            ),
+            RouteError::GroupWeightOutOfRange {
+                group,
+                provider,
+                weight,
+            } => msg!(
+                "engine.group_weight_out_of_range", group = group, upstream = provider,
+                weight = weight =>
+                "group `{group}` gives upstream `{upstream}` a weight of {weight}. A weight is a \
+                 whole number from 1 to 100"
             ),
             RouteError::DuplicateRoute(route) => msg!(
                 "engine.duplicate_route", route = route =>
@@ -752,7 +810,7 @@ impl Engine {
             groups.push(Group {
                 name: ALL_UPSTREAMS.to_string(),
                 kind: GroupType::Fallback,
-                providers: providers.clone(),
+                providers: providers.iter().map(Member::named).collect(),
                 selected: None,
             });
         }
@@ -894,7 +952,8 @@ impl Engine {
             // 还会多轮到它几次 —— 一个没人写下、也看不出来的权重。控制面保存时就拦着
             // （`control.group.upstream_twice`），手写的配置在这里拦
             let mut members = std::collections::HashSet::new();
-            for p in &g.providers {
+            for m in &g.providers {
+                let p = &m.name;
                 // 不认识的名字（拼错了、或者写了另一个组）：候选里它对不上任何上游，
                 // 这一位就静默地没了。控制面保存时拦着（`control.group.no_such_upstream`）
                 if !self.providers.contains(p) {
@@ -907,6 +966,22 @@ impl Engine {
                     return Err(RouteError::GroupUpstreamTwice {
                         group: g.name.clone(),
                         provider: p.clone(),
+                    });
+                }
+                // 权重只有 `load-balance` 用：别的类型写了也不起作用，而写的人以为它起了。
+                // 控制面保存时同样拦着（`control.group.weight_*`）
+                if m.weight != 1 && g.kind != GroupType::LoadBalance {
+                    return Err(RouteError::GroupWeightNotLoadBalance {
+                        group: g.name.clone(),
+                        provider: p.clone(),
+                        weight: m.weight,
+                    });
+                }
+                if !(WEIGHT_MIN..=WEIGHT_MAX).contains(&m.weight) {
+                    return Err(RouteError::GroupWeightOutOfRange {
+                        group: g.name.clone(),
+                        provider: p.clone(),
+                        weight: m.weight,
                     });
                 }
             }
@@ -1194,29 +1269,27 @@ impl Engine {
     fn expand_group(&self, g: &Group) -> Vec<String> {
         match g.kind {
             // 顺序就是优先级。第一个健康的就用，缓存持续命中。
-            GroupType::Fallback => g.providers.clone(),
+            GroupType::Fallback => g.names(),
             GroupType::Select => {
                 // 选中的排头，其余仍然留着做故障转移 —— **手动选一家不
                 // 等于放弃容错**，那家挂了照样该切。
                 let mut out = Vec::with_capacity(g.providers.len());
                 if let Some(sel) = &g.selected
-                    && g.providers.contains(sel)
+                    && g.has(sel)
                 {
                     out.push(sel.clone());
                 }
                 out.extend(
                     g.providers
                         .iter()
-                        .filter(|p| Some(*p) != g.selected.as_ref())
-                        .cloned(),
+                        .filter(|p| Some(&p.name) != g.selected.as_ref())
+                        .map(|p| p.name.clone()),
                 );
                 out
             }
             // 这三种要运行时的数字才排得出来。**这里只给集合，
             // 顺序由 `order` 定** —— 它是纯函数，数据面和试算页都调它。
-            GroupType::LoadBalance | GroupType::UrlTest | GroupType::Cheapest => {
-                g.providers.clone()
-            }
+            GroupType::LoadBalance | GroupType::UrlTest | GroupType::Cheapest => g.names(),
         }
     }
 
@@ -1989,13 +2062,13 @@ mod tests {
         // 一样：引擎给出集合，而没有任何一层去转它，于是 6 个请求 6 次
         // 落在第一家 —— 一个宣称做完了、实际什么都没做的功能。
         let g = grp(GroupType::LoadBalance);
+        let members = g.names();
+        let mut f = Facts::default();
         let firsts: Vec<String> = (0..6)
-            .map(|seq| {
-                let f = Facts {
-                    seq,
-                    ..Default::default()
-                };
-                order_by(&g, &g.providers, &f)[0].clone()
+            .map(|_| {
+                let first = order_by(&g, &members, &f)[0].clone();
+                f.current_weight = crate::weighted::advance(&g, &members, &f, &first);
+                first
             })
             .collect();
         assert_eq!(firsts, vec!["甲", "乙", "丙", "甲", "乙", "丙"]);
@@ -2006,10 +2079,10 @@ mod tests {
         // 「轮到乙」不等于「甲和丙不要了」——那一家挂了还要能切
         let g = grp(GroupType::LoadBalance);
         let f = Facts {
-            seq: 1,
+            current_weight: [("乙".to_string(), 1)].into_iter().collect(),
             ..Default::default()
         };
-        assert_eq!(order_by(&g, &g.providers, &f), vec!["乙", "丙", "甲"]);
+        assert_eq!(order_by(&g, &g.names(), &f), vec!["乙", "甲", "丙"]);
     }
 
     #[test]
@@ -2024,7 +2097,7 @@ mod tests {
             ttfb_ms: ttfb,
             ..Default::default()
         };
-        assert_eq!(order_by(&g, &g.providers, &f), vec!["丙", "甲", "乙"]);
+        assert_eq!(order_by(&g, &g.names(), &f), vec!["丙", "甲", "乙"]);
     }
 
     #[test]
@@ -2043,7 +2116,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..5 {
-            assert_eq!(order_by(&g, &g.providers, &f), vec!["甲", "乙", "丙"]);
+            assert_eq!(order_by(&g, &g.names(), &f), vec!["甲", "乙", "丙"]);
         }
     }
 
@@ -2062,7 +2135,7 @@ mod tests {
             price,
             ..Default::default()
         };
-        assert_eq!(order_by(&g, &g.providers, &f), vec!["丙", "甲", "乙"]);
+        assert_eq!(order_by(&g, &g.names(), &f), vec!["丙", "甲", "乙"]);
     }
 
     #[test]
@@ -2081,7 +2154,7 @@ mod tests {
             price,
             ..Default::default()
         };
-        assert_eq!(order_by(&g, &g.providers, &f), vec!["乙", "甲"]);
+        assert_eq!(order_by(&g, &g.names(), &f), vec!["乙", "甲"]);
     }
 
     #[test]
@@ -2089,15 +2162,11 @@ mod tests {
         for kind in [GroupType::Fallback, GroupType::Select] {
             let g = grp(kind);
             let f = Facts {
-                seq: 7,
+                current_weight: [("丙".to_string(), 7)].into_iter().collect(),
                 ttfb_ms: [("丙".to_string(), 1u32)].into_iter().collect(),
                 ..Default::default()
             };
-            assert_eq!(
-                order_by(&g, &g.providers, &f),
-                g.providers,
-                "{kind:?} 被重排了"
-            );
+            assert_eq!(order_by(&g, &g.names(), &f), g.names(), "{kind:?} 被重排了");
             assert!(!kind.needs_runtime());
         }
     }
@@ -2326,6 +2395,52 @@ mod builtin_tests {
         let m = err.msg();
         assert_eq!(m.code, "engine.group_unknown_upstream");
         assert_eq!((m.arg("group"), m.arg("upstream")), ("pool", "typo"));
+    }
+
+    /// 权重只给 `load-balance`、只能是 1 到 100：写错了说出是哪个组、哪一家、写了多少
+    #[test]
+    fn a_weight_outside_load_balance_or_out_of_range_is_rejected() {
+        let check = |yaml: &str| {
+            let g: Group = serde_yaml_ng::from_str(yaml).unwrap();
+            Engine::with_default_rules(
+                vec!["a".into(), "b".into()],
+                vec![g],
+                vec![rule("兜底", "{}", "pool")],
+            )
+            .validate()
+        };
+        let lb = |a: u32| {
+            format!("name: pool\ntype: load-balance\nproviders: [{{name: a, weight: {a}}}, b]\n")
+        };
+        assert_eq!(check(&lb(1)), Ok(()));
+        assert_eq!(check(&lb(100)), Ok(()));
+        for bad in [0, 101] {
+            let err = check(&lb(bad)).unwrap_err();
+            assert_eq!(
+                err,
+                RouteError::GroupWeightOutOfRange {
+                    group: "pool".into(),
+                    provider: "a".into(),
+                    weight: bad,
+                }
+            );
+            let m = err.msg();
+            assert_eq!(m.code, "engine.group_weight_out_of_range");
+            assert_eq!(m.arg("weight"), bad.to_string());
+        }
+        for kind in ["fallback", "select", "url-test", "cheapest"] {
+            let yaml =
+                format!("name: pool\ntype: {kind}\nproviders: [a, {{name: b, weight: 3}}]\n");
+            let m = check(&yaml).unwrap_err().msg();
+            assert_eq!(m.code, "engine.group_weight_not_load_balance", "{kind}");
+            assert_eq!(
+                (m.arg("group"), m.arg("upstream"), m.arg("weight")),
+                ("pool", "b", "3")
+            );
+            // 写成 1 的不算写了权重
+            let one = format!("name: pool\ntype: {kind}\nproviders: [a, {{name: b, weight: 1}}]\n");
+            assert_eq!(check(&one), Ok(()), "{kind}");
+        }
     }
 }
 

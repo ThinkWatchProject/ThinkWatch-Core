@@ -3,6 +3,7 @@ pub mod engine;
 pub mod facts;
 pub mod num;
 pub mod rule;
+pub mod weighted;
 
 pub use catalog::{Catalog, ProviderModels};
 pub use engine::{
@@ -11,3 +12,4 @@ pub use engine::{
     SetAction, Target, has_catch_all, is_builtin_group, notes, order_by, scalar_name,
 };
 pub use facts::{RequestFacts, estimate_strings, estimate_tokens};
+pub use weighted::Member;

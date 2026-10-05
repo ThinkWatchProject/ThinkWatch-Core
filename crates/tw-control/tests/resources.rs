@@ -303,7 +303,7 @@ async fn renaming_an_upstream_moves_its_references_in_the_same_version() {
     assert_eq!(st, StatusCode::OK, "{body}");
     let cfg = b.parsed();
     assert_eq!(cfg.providers[0].name, "anthropic");
-    assert_eq!(cfg.groups[0].providers, ["anthropic"]);
+    assert_eq!(cfg.groups[0].names(), ["anthropic"]);
     // 一次保存一个版本：历史里只多了改之前的那一份
     let history = tw_config::history::list(&b.dir.path().join("config.yaml")).unwrap();
     assert_eq!(

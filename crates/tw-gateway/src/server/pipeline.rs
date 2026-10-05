@@ -655,40 +655,34 @@ fn route(
         tracing::debug!(skipped = ?serving.skipped, %model, "skipping the candidates that cannot serve this request");
     }
     decision.candidates = serving.usable;
+    let group = decision
+        .via_group
+        .as_deref()
+        .and_then(|n| rt.engine.groups().iter().find(|g| g.name == n));
+    // `load-balance` 这一次轮到谁（见 `crate::balance`）。**从排序到记账一直拿着锁**：
+    // 同时进来的几个请求一个接一个地排，后一个看到的是前一个记过的账
+    let turn = group
+        .filter(|g| g.kind == tw_engine::GroupType::LoadBalance)
+        .map(|g| state.balance.turn(g));
     // 策略组排序。**引擎给的是集合，顺序在这儿定** ——
     // 因为 `load-balance` / `url-test` / `cheapest` 都要运行时的数字，
     // 而路由决策本身必须是纯的、可试算的。
     //
     // `fallback` 和 `select` 走不到这里面 —— 那是绝大多数人的配置，
     // 它们连一个 HashMap 都不用建。
-    if let Some(gname) = decision.via_group.clone()
-        && let Some(kind) = rt
-            .engine
-            .groups()
-            .iter()
-            .find(|g| g.name == gname)
-            .map(|g| g.kind)
-        && kind.needs_runtime()
+    let mut facts_rt = None;
+    if let Some(g) = group
+        && g.kind.needs_runtime()
     {
-        let facts_rt = tw_engine::Facts {
-            seq: state.bus.peek_id(),
-            ttfb_ms: match kind {
-                tw_engine::GroupType::UrlTest => state.latency.snapshot(&decision.candidates),
-                _ => Default::default(),
-            },
-            price: match kind {
-                // 每一家按发给它的名字算价钱：同一个别名在各家是各家的模型名、各家的价目
-                tw_engine::GroupType::Cheapest => state.unit_prices(
-                    &rt.config.providers,
-                    &crate::sent::pairs(&sent),
-                    &decision.candidates,
-                ),
-                _ => Default::default(),
-            },
-        };
-        decision.candidates = rt
-            .engine
-            .order(Some(&gname), &decision.candidates, &facts_rt);
+        let f = state.group_facts(
+            &rt.config.providers,
+            g.kind,
+            &decision.candidates,
+            &crate::sent::pairs(&sent),
+            turn.as_ref().map(crate::balance::Turn::current),
+        );
+        decision.candidates = rt.engine.order(Some(&g.name), &decision.candidates, &f);
+        facts_rt = Some(f);
     }
     // 留在上次回答这段对话的那一家：同一轮里一律留，跨轮看缓存值不值得留。**排在
     // 策略组排序之后** —— 该留的时候盖过策略，放开的时候策略照常说了算
@@ -705,6 +699,13 @@ fn route(
             held_route,
             stayed: Some(why),
         });
+    }
+    // `load-balance` 记账：**记粘性之后排头的那一家**，不是按权重轮到的那一家。一段对话
+    // 留在了上次回答它的那一家，这一次就算那一家的；之后的新对话把差的补回去
+    if let (Some(turn), Some(f), Some(leader)) =
+        (turn, facts_rt.as_ref(), decision.candidates.first())
+    {
+        turn.charge(&decision.candidates, f, leader);
     }
     Ok(Routed::Go(choice, decision))
 }

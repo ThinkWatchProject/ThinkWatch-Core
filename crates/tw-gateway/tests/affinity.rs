@@ -86,6 +86,16 @@ async fn ask(
     rx: &mut Receiver<Event>,
     messages: &str,
 ) -> (String, String, Option<AffinityView>) {
+    ask_in(gw, rx, "会话-1", messages).await
+}
+
+/// [`ask`]，在会话 `session` 里
+async fn ask_in(
+    gw: SocketAddr,
+    rx: &mut Receiver<Event>,
+    session: &str,
+    messages: &str,
+) -> (String, String, Option<AffinityView>) {
     let body = format!(
         r#"{{"model":"claude-sonnet-4-5","max_tokens":16,"system":"你是一个助手","messages":{messages}}}"#
     );
@@ -95,7 +105,7 @@ async fn ask(
         .unwrap()
         .post(format!("http://{gw}/v1/messages"))
         .header("x-api-key", "tw-k")
-        .header("x-claude-code-session-id", "会话-1")
+        .header("x-claude-code-session-id", session)
         .body(body)
         .send()
         .await
@@ -179,4 +189,35 @@ async fn a_turn_keeps_its_route_and_upstream_and_a_warm_cache_keeps_the_next_tur
     let (rule, to, _) = ask(gw, &mut rx, &format!("[{history},{}]", user(&big))).await;
     assert_eq!(rule, "大输入");
     assert_eq!(to, "乙");
+}
+
+/// `load-balance` 记在实际排头的那一家头上：一段对话的新一轮留在了甲（缓存热着），按
+/// 权重本该轮到乙 —— 这一次算甲的，之后的两个新对话都去乙，把差的补回来
+#[tokio::test]
+async fn the_upstream_a_conversation_stays_on_is_charged_and_new_conversations_make_up_for_it() {
+    let up = upstream().await;
+    let (gw, mut rx) = serve(cfg(up)).await;
+    let first = user("帮我重构");
+    // 会话一的第一轮：从头轮，甲
+    let (_, to, _) = ask_in(gw, &mut rx, "会话-1", &format!("[{first}]")).await;
+    assert_eq!(to, "甲");
+    // 会话一的第二轮：缓存热着，留在甲
+    let history = format!("{first},{{\"role\":\"assistant\",\"content\":\"好了\"}}");
+    let (_, to, affinity) = ask_in(
+        gw,
+        &mut rx,
+        "会话-1",
+        &format!("[{history},{}]", user("再加个测试")),
+    )
+    .await;
+    assert_eq!(to, "甲");
+    assert_eq!(affinity.and_then(|a| a.stayed), Some(Stay::Cache));
+    // 新对话：都去乙
+    for s in ["会话-2", "会话-3"] {
+        let (_, to, _) = ask_in(gw, &mut rx, s, &format!("[{}]", user(s))).await;
+        assert_eq!(to, "乙", "{s}");
+    }
+    // 补齐了，接着挨个轮
+    let (_, to, _) = ask_in(gw, &mut rx, "会话-4", &format!("[{}]", user("会话-4"))).await;
+    assert_eq!(to, "甲");
 }

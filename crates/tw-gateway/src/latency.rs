@@ -110,7 +110,7 @@ pub async fn seed_url_test(state: &crate::state::AppState) {
     let mut want: Vec<String> = Vec::new();
     for g in rt.engine.groups() {
         if g.kind == tw_engine::GroupType::UrlTest {
-            want.extend(g.providers.iter().cloned());
+            want.extend(g.names());
         }
     }
     want.sort();

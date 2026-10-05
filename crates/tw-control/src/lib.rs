@@ -367,7 +367,8 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 builtin: tw_engine::is_builtin_group(&g.name),
                 kind: routes::group_kind(g.kind),
                 selected: g.selected.clone(),
-                providers: g.providers.clone(),
+                providers: g.names(),
+                weights: routes::group_weights(g),
             })
             .collect(),
         // 和 `GET /keys` 同一份视图：概览里少一个字段的话，两处会各自

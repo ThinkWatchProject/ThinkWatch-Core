@@ -575,6 +575,18 @@ fn group_type(k: tw_api::GroupKind) -> GroupType {
     }
 }
 
+/// 界面看到的权重：`load-balance` 组每个成员都在（没写的是 1），别的类型是空的
+pub(crate) fn group_weights(g: &Group) -> std::collections::BTreeMap<String, u32> {
+    match g.kind {
+        GroupType::LoadBalance => g
+            .providers
+            .iter()
+            .map(|m| (m.name.clone(), m.weight))
+            .collect(),
+        _ => Default::default(),
+    }
+}
+
 fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group, Msg> {
     let name = checked_name(&input.name, "group")?;
     reserved(&name, "group")?;
@@ -609,6 +621,33 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
             "a group needs at least one upstream"
         ));
     }
+    // 权重：只有 `load-balance` 用，1 到 100，没给的成员是 1。和引擎的校验同样的规矩
+    // （`engine.group_weight_*`），这里先说，说的是界面上那一格
+    let mut weights = std::collections::HashMap::new();
+    for (p, w) in input.weights.iter().flatten() {
+        let p = p.trim();
+        if !providers.iter().any(|x| x == p) {
+            return Err(msg!(
+                "control.group.weight_not_member", upstream = p =>
+                "a weight is given for `{upstream}`, which is not a member"
+            ));
+        }
+        if *w != 1 && kind != GroupType::LoadBalance {
+            return Err(msg!(
+                "control.group.weight_not_load_balance", upstream = p, weight = w =>
+                "upstream `{upstream}` has a weight of {weight}; only a load-balance group uses \
+                 weights"
+            ));
+        }
+        if !(tw_engine::weighted::WEIGHT_MIN..=tw_engine::weighted::WEIGHT_MAX).contains(w) {
+            return Err(msg!(
+                "control.group.weight_out_of_range", upstream = p, weight = w =>
+                "upstream `{upstream}` has a weight of {weight}; a weight is a whole number from \
+                 1 to 100"
+            ));
+        }
+        weights.insert(p.to_string(), *w);
+    }
     // 手动选择要有一个优先使用的成员；没选就是第一个。其余策略不写这一项
     let selected = match kind {
         GroupType::Select => {
@@ -632,7 +671,13 @@ fn to_group(input: &tw_api::GroupInput, cfg: &tw_config::Config) -> Result<Group
     Ok(Group {
         name,
         kind,
-        providers,
+        providers: providers
+            .into_iter()
+            .map(|p| tw_engine::Member {
+                weight: weights.get(&p).copied().unwrap_or(1),
+                name: p,
+            })
+            .collect(),
         selected,
     })
 }
@@ -928,6 +973,7 @@ mod msg_codes {
             kind: tw_api::GroupKind::from_slug(kind).unwrap(),
             providers: providers.iter().map(|p| p.to_string()).collect(),
             selected: None,
+            weights: None,
         };
         let code = |i: tw_api::GroupInput| to_group(&i, &c).unwrap_err().code;
         assert_eq!(
@@ -944,5 +990,53 @@ mod msg_codes {
             "control.group.upstream_twice"
         );
         assert_eq!(code(g("g", "fallback", &[])), "control.group.empty");
+        let weighted = |kind: &str, w: &[(&str, u32)]| tw_api::GroupInput {
+            weights: Some(w.iter().map(|(p, w)| (p.to_string(), *w)).collect()),
+            ..g("g", kind, &["a"])
+        };
+        assert_eq!(
+            code(weighted("load-balance", &[("b", 2)])),
+            "control.group.weight_not_member"
+        );
+        assert_eq!(
+            code(weighted("fallback", &[("a", 2)])),
+            "control.group.weight_not_load_balance"
+        );
+        for w in [0, 101] {
+            assert_eq!(
+                code(weighted("load-balance", &[("a", w)])),
+                "control.group.weight_out_of_range"
+            );
+        }
+    }
+
+    /// 权重写进成员：`load-balance` 给了的照给的，没给的是 1；别的类型给 1 等于没给
+    #[test]
+    fn weights_become_the_members_weights() {
+        let mut c = cfg();
+        c.providers.push(tw_config::Provider {
+            name: "b".into(),
+            ..c.providers[0].clone()
+        });
+        let input = |kind: &str, w: Option<&[(&str, u32)]>| tw_api::GroupInput {
+            name: "g".into(),
+            kind: tw_api::GroupKind::from_slug(kind).unwrap(),
+            providers: vec!["a".into(), "b".into()],
+            selected: None,
+            weights: w.map(|w| w.iter().map(|(p, w)| (p.to_string(), *w)).collect()),
+        };
+        let g = to_group(&input("load-balance", Some(&[("b", 7)])), &c).unwrap();
+        assert_eq!((g.weight("a"), g.weight("b")), (1, 7));
+        assert_eq!(
+            group_weights(&g),
+            [("a".to_string(), 1), ("b".to_string(), 7)]
+                .into_iter()
+                .collect()
+        );
+        let g = to_group(&input("load-balance", None), &c).unwrap();
+        assert!(g.providers.iter().all(|m| m.weight == 1));
+        let g = to_group(&input("fallback", Some(&[("a", 1)])), &c).unwrap();
+        assert!(g.providers.iter().all(|m| m.weight == 1));
+        assert!(group_weights(&g).is_empty(), "别的类型不给权重");
     }
 }

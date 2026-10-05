@@ -2141,6 +2141,9 @@ pub struct GroupView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
     pub providers: Vec<String>,
+    /// `load-balance` 组每个成员的权重，**每个成员都在**，没写权重的是 1：新对话按这个
+    /// 比例分。别的类型不用权重，是空的
+    pub weights: std::collections::BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3198,7 +3201,7 @@ slug_enum! {
         Fallback = "fallback",
         /// 用选中的那一个，不可用时按顺序
         Select = "select",
-        /// 轮流
+        /// 按成员的权重轮流（[`GroupView::weights`]）
         LoadBalance = "load-balance",
         /// 选最快的
         UrlTest = "url-test",
@@ -3218,6 +3221,10 @@ pub struct GroupInput {
     /// `select` 组优先使用的成员
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+    /// `load-balance` 组成员的权重，1 到 100。不给 = 都是 1；给了的话没写到的成员是 1。
+    /// 别的类型只能不给、或者都是 1
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<std::collections::BTreeMap<String, u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4748,6 +4755,9 @@ pub struct DryRunCandidate {
     /// 改写了模型）、`pinned`（规则指定了这一家发什么模型）。一样时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_via: Option<String>,
+    /// 经过的是 `load-balance` 组时，它在组里的权重（没写权重的是 1）。别的时候没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
 }
 
 /// 一个要转换格式的候选上游。

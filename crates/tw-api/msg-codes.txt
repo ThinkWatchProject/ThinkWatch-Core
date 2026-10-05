@@ -131,6 +131,9 @@ control.group.name_is_upstream
 control.group.no_such_upstream
 control.group.preferred_not_member
 control.group.upstream_twice
+control.group.weight_not_load_balance
+control.group.weight_not_member
+control.group.weight_out_of_range
 control.group_in_use
 control.header_no_value
 control.internal_error
@@ -230,6 +233,8 @@ engine.duplicate_route
 engine.empty_group
 engine.group_unknown_upstream
 engine.group_upstream_twice
+engine.group_weight_not_load_balance
+engine.group_weight_out_of_range
 engine.no_action
 engine.no_match
 engine.phase_two_with_to

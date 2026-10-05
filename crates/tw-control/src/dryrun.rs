@@ -13,33 +13,32 @@ use axum::{Json, extract::State, http::StatusCode};
 /// 试算页存在的全部意义是「告诉你这条请求会走哪儿」，所以它**必须**用
 /// 同一个函数、同一份数字 —— 各算各的话，两边迟早会不一样，而那时
 /// 试算比没有更糟。`sent` 是每一家和发给它的模型名：比价按它算，和数据面一样。
+///
+/// `load-balance` 读的是数据面记着的那一份轮询状态，**只读不记**
+/// （[`tw_gateway::balance::Balance::peek`]）：试算说的是下一个新对话会排给谁，
+/// 试算了几次都不该改变这个答案，也不该让数据面跳过谁。
 fn order_like_the_data_plane(
     s: &crate::ControlState,
     engine: &tw_engine::Engine,
     d: &tw_engine::Decision,
     sent: &[(String, String)],
 ) -> Vec<String> {
-    let Some(gname) = d.via_group.clone() else {
-        return d.candidates.clone();
-    };
-    let Some(kind) = engine
-        .groups()
-        .iter()
-        .find(|g| g.name == gname)
-        .map(|g| g.kind)
+    let Some(g) = d
+        .via_group
+        .as_deref()
+        .and_then(|n| engine.groups().iter().find(|g| g.name == n))
     else {
         return d.candidates.clone();
     };
-    if !kind.needs_runtime() {
+    if !g.kind.needs_runtime() {
         return d.candidates.clone();
     }
     let cfg = s.config();
-    let facts = tw_engine::Facts {
-        seq: s.gateway.bus.peek_id(),
-        ttfb_ms: s.gateway.latency.snapshot(&d.candidates),
-        price: s.gateway.unit_prices(&cfg.providers, sent, &d.candidates),
-    };
-    engine.order(Some(&gname), &d.candidates, &facts)
+    let current = (g.kind == tw_engine::GroupType::LoadBalance).then(|| s.gateway.balance.peek(g));
+    let facts = s
+        .gateway
+        .group_facts(&cfg.providers, g.kind, &d.candidates, sent, current);
+    engine.order(Some(&g.name), &d.candidates, &facts)
 }
 use tw_engine::{Outcome, RequestFacts, RouteError};
 
@@ -264,14 +263,20 @@ pub async fn dry_run(
                 .collect();
             // **顺序要和数据面一样，否则试算就是在撒谎。**`load-balance`
             // / `url-test` / `cheapest` 的次序由运行时的数字定，
-            // 这里走的是同一个 `order`，喂的是同一份延迟表和价目表。
+            // 这里走的是同一个 `order`，喂的是同一份延迟表、价目表和轮询状态。
             //
             // 会话那一维**故意留空**：试算是「假设现在来一个请求」，
             // 而它属于哪次会话取决于请求正文，试算没有那个东西。
-            // 于是它显示的是轮转序列里的当前位置 —— 而那正是一个没有
-            // 会话指纹的请求真的会走的路。
+            // 于是它显示的是轮询此刻轮到的位置 —— 而那正是一个新对话
+            // 真的会走的路。
             out.candidates =
                 order_like_the_data_plane(&s, engine, &d, &tw_gateway::sent::pairs(&sent));
+            // `load-balance` 的候选带上各自的权重：排头的为什么是它，一半在这个数里
+            let balanced = d
+                .via_group
+                .as_deref()
+                .and_then(|g| engine.groups().iter().find(|x| x.name == g))
+                .filter(|g| g.kind == tw_engine::GroupType::LoadBalance);
             // 每一家收到的模型名，和为什么不是请求里写的那个
             out.candidate_models = out
                 .candidates
@@ -284,6 +289,7 @@ pub async fn dry_run(
                             .and_then(|x| x.model.clone().ok())
                             .filter(|m| !m.is_empty()),
                         model_via: one.and_then(|x| x.via).map(|v| v.slug().to_string()),
+                        weight: balanced.map(|g| g.weight(name)),
                     }
                 })
                 .collect();

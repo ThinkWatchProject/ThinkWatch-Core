@@ -952,13 +952,41 @@ group with `to`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | **required** | Name of the group; unique, and not the name of an upstream. |
-| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
-| `providers` | list of strings | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. |
+| `type` | `fallback` \| `select` \| `load-balance` \| `url-test` \| `cheapest` | `fallback` | `fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price. |
+| `providers` | list of strings or [`groups[].providers[]`](#cfg-groups-providers) | **required** | Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`. |
 | `selected` | string | — | For `select`: the chosen member. |
 <!-- /generated -->
 
 `fallback` is the default because a single user's machine has no load to
 spread.
+
+In a `load-balance` group, a member can carry a weight, from 1 to 100; a
+member written as just its name has weight 1. Weights set how the group's
+requests are shared out: with `{ name: anthropic, weight: 7 }` and `relay`,
+the official API serves seven requests in ten. Conversations in progress
+stay on the upstream that answers them (see below) and count toward its
+share, so the balance is kept by where new conversations start. An upstream
+that is cooling down after failures, or cannot serve a request, sits that
+request out, and the others share it by their weights. Other group types take
+no weights.
+
+<!-- generated: table groups[].providers[] -->
+<a id="cfg-groups-providers"></a>
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | **required** | The upstream, by name. A member written as just its name has weight 1. |
+| `weight` | integer | `1` | The member's share of a `load-balance` group's requests, in proportion to the other members' weights. From 1 to 100. Other group types take no weight other than 1. |
+<!-- /generated -->
+
+```yaml
+groups:
+  - name: pool
+    type: load-balance
+    providers:
+      - { name: anthropic, weight: 7 }
+      - relay
+```
 
 Whatever the type, a conversation stays on the upstream that last answered
 it, so that what the upstream holds of it in its prompt cache is read again
@@ -970,7 +998,8 @@ the conversation, and whichever upstream answered after a failover is the one
 it stays on. The rule a turn matched at its start also holds for the rest of
 that turn: rules keyed on input size or images do not move a turn halfway,
 unless its input no longer fits the context window of a model the rule sends
-it to. `load-balance` therefore takes turns between new conversations.
+it to. `load-balance` therefore takes turns between new conversations, by
+weight.
 
 ### `routes`
 

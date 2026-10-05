@@ -11,7 +11,7 @@ use super::{Def, Kind, Lang, Row, Section, T2};
 use tw_config::proxy::ProxyAuth;
 use tw_config::*;
 use tw_engine::rule::When;
-use tw_engine::{Group, GroupType, Pinned, RouteSet, Rule, SetAction};
+use tw_engine::{Group, GroupType, Member, Pinned, RouteSet, Rule, SetAction};
 use tw_pricing::{PerMillion, PricingConfig, SheetDef};
 
 const fn t(en: &'static str, zh: &'static str) -> T2 {
@@ -1228,17 +1228,17 @@ pub fn sections() -> Vec<Section> {
                     Kind::Enum(group_types),
                     Def::Is("fallback"),
                     t(
-                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: take turns between new conversations. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price.",
-                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。",
+                        "`fallback`: the first healthy member, in order. `select`: the member named in `selected`. `load-balance`: new conversations take turns, in proportion to the members' weights. `url-test`: the fastest by measured time to first byte. `cheapest`: the lowest input price.",
+                        "`fallback`：按顺序取第一个健康的。`select`：取 `selected` 指定的那个。`load-balance`：新对话按成员的权重轮流。`url-test`：按实测首字节时间取最快的。`cheapest`：取输入单价最低的。",
                     ),
                 ),
                 row(
                     "providers",
-                    Kind::Strs,
+                    Kind::StrsOrObjs("groups[].providers[]"),
                     Def::Required,
                     t(
-                        "Member upstreams, by name; not groups. Each upstream appears once in a group.",
-                        "成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。",
+                        "Member upstreams, by name; not groups. Each upstream appears once in a group. In a `load-balance` group, a member can be written as `{name, weight}`.",
+                        "成员上游的名字，不能是策略组。同一个上游在一个策略组中只出现一次。`load-balance` 组的成员可以写成 `{name, weight}`。",
                     ),
                 ),
                 row(
@@ -1248,6 +1248,30 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "For `select`: the chosen member.",
                         "`select` 类型选中的成员。",
+                    ),
+                ),
+            ],
+        },
+        Section {
+            path: "groups[].providers[]",
+            ty: checked!(Member, "{name: a}"),
+            rows: vec![
+                row(
+                    "name",
+                    Kind::Str,
+                    Def::Required,
+                    t(
+                        "The upstream, by name. A member written as just its name has weight 1.",
+                        "上游的名字。只写名字的成员权重为 1。",
+                    ),
+                ),
+                row(
+                    "weight",
+                    Kind::Int,
+                    Def::Is("1"),
+                    t(
+                        "The member's share of a `load-balance` group's requests, in proportion to the other members' weights. From 1 to 100. Other group types take no weight other than 1.",
+                        "成员在 `load-balance` 组中分到的请求份额，与其他成员的权重成比例。取值 1 到 100。其他类型的策略组只能写 1。",
                     ),
                 ),
             ],
