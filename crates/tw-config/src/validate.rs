@@ -358,9 +358,9 @@ impl ValidationError {
                  is for one exact model id"
             ),
             ModelSpecEmpty { upstream, model } => msg!(
-                "config.model_spec_empty", upstream = upstream, model = model =>
-                "the model spec `{model}` of upstream `{upstream}` sets neither context_window \
-                 nor max_output_tokens. Set at least one, or remove it"
+                "config.model_spec_nothing_set", upstream = upstream, model = model =>
+                "the model spec `{model}` of upstream `{upstream}` sets none of context_window, \
+                 max_output_tokens, reasoning and image_input. Set at least one, or remove it"
             ),
             ModelSpecZero {
                 upstream,
@@ -933,10 +933,13 @@ mod tests {
             ))
         };
         let ok = parse(
-            "      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }\n      \"us.anthropic.claude-fable-5-v1:0\": { max_output_tokens: 32000 }\n",
+            "      glm-5-air: { context_window: 128000, max_output_tokens: 16384 }\n      \"us.anthropic.claude-fable-5-v1:0\": { max_output_tokens: 32000 }\n      kimi-k3: { reasoning: true, image_input: false }\n",
         )
         .unwrap();
         let specs = &ok.providers[0].model_specs;
+        // 只写会不会推理、收不收图也算写了
+        assert_eq!(specs["kimi-k3"].reasoning, Some(true));
+        assert_eq!(specs["kimi-k3"].image_input, Some(false));
         assert_eq!(specs["glm-5-air"].context_window, Some(128_000));
         assert_eq!(
             specs["us.anthropic.claude-fable-5-v1:0"].max_output_tokens,
@@ -951,7 +954,7 @@ mod tests {
                 "      glm-*: { context_window: 1000 }\n",
                 "config.model_spec_wildcard",
             ),
-            ("      glm-5-air: {}\n", "config.model_spec_empty"),
+            ("      glm-5-air: {}\n", "config.model_spec_nothing_set"),
             (
                 "      glm-5-air: { context_window: 0 }\n",
                 "config.model_spec_zero",

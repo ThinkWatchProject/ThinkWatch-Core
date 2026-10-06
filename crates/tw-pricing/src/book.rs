@@ -241,6 +241,7 @@ impl ModelPrice {
             max_input_tokens: self.max_input_tokens,
             max_output_tokens: self.max_output_tokens,
             reasoning: self.reasoning,
+            image_input: self.image_input,
         }
     }
 

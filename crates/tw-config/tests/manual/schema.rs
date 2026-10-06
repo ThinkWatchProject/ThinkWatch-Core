@@ -629,8 +629,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::ObjMap(t("model id", "模型 ID"), "providers[].model_specs.*"),
                     Def::Is("{}"),
                     t(
-                        "Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong.",
-                        "手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。",
+                        "Context window, output limit, reasoning and image input of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong.",
+                        "手写这家上游某些模型的上下文窗口、输出上限、会不会推理、收不收图，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。",
                     ),
                 ),
                 row(
@@ -655,7 +655,7 @@ pub fn sections() -> Vec<Section> {
         },
         Section {
             path: "providers[].model_specs.*",
-            // 两项都可选，至少写一项由校验管
+            // 每项都可选，至少写一项由校验管
             ty: checked!(ModelSpec, "{}"),
             rows: vec![
                 row(
@@ -674,6 +674,24 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "The most tokens an answer can have. Unset: the price table's.",
                         "一次回答最多输出多少 token。不写：取价目表的。",
+                    ),
+                ),
+                row(
+                    "reasoning",
+                    Kind::Bool,
+                    Def::Unset,
+                    t(
+                        "Whether the model reasons. The model list (`GET /v1/models`) carries it, so clients offer reasoning levels for it. Unset: the price table's; the list leaves it out when the price table does not say.",
+                        "这个模型会不会推理。模型列表（`GET /v1/models`）带着它，客户端据此给出推理档位。不写：取价目表的；价目表也没写时，列表里不给这一项。",
+                    ),
+                ),
+                row(
+                    "image_input",
+                    Kind::Bool,
+                    Def::Unset,
+                    t(
+                        "Whether the model takes images as input. The model list carries it, as `input_modalities`. Unset: the price table's; the list leaves it out when the price table does not say.",
+                        "这个模型收不收图。模型列表里以 `input_modalities` 给出。不写：取价目表的；价目表也没写时，列表里不给这一项。",
                     ),
                 ),
             ],
