@@ -402,7 +402,7 @@ Upstreams: the APIs requests are forwarded to.
 | `models_only` | list of strings | — | Use only these of the upstream's models, as ids or globs. Others are not listed and are not routed here. Unset: all of them. Empty is refused; use `disabled`. |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`: cost is usage times the price in the upstream's price sheet, subscription accounts included. `free`: cost is recorded as 0. |
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
-| `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window and output limit of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
+| `model_specs` | map of model id → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | Context window, output limit, reasoning and image input of single models of this upstream, written by hand, by exact model id. They take precedence over the price table: for models it does not know, or gets wrong. |
 | `max_concurrent` | integer | — | Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 <!-- /generated -->
@@ -565,6 +565,8 @@ offer the same model, `/v1/models` describes it by the first of them in
 |---|---|---|---|
 | `context_window` | integer | — | Context window: the most tokens a request can take in. Unset: the price table's. |
 | `max_output_tokens` | integer | — | The most tokens an answer can have. Unset: the price table's. |
+| `reasoning` | bool | — | Whether the model reasons. The model list (`GET /v1/models`) carries it, so clients offer reasoning levels for it. Unset: the price table's; the list leaves it out when the price table does not say. |
+| `image_input` | bool | — | Whether the model takes images as input. The model list carries it, as `input_modalities`. Unset: the price table's; the list leaves it out when the price table does not say. |
 <!-- /generated -->
 
 ```yaml

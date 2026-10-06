@@ -67,16 +67,18 @@ pub fn probe_input_tokens() -> u64 {
 /// 三种情况：
 /// - ChatGPT 账号：Codex 后端不认 `max_output_tokens`，带上去是 400（见
 ///   [`crate::chatgpt`]）。上限报不出来，费用也就报不出来
-/// - 会推理的模型：留出推理的量，见 [`REASONING_MAX_TOKENS`]
-/// - 其余：一句话的长度就够
+/// - 会推理的模型：留出推理的量，见 [`REASONING_MAX_TOKENS`]。会不会推理按这一家的
+///   规格算（[`Provider::model_spec`]）：手写的优先，再看价目表
+/// - 其余（包括不知道会不会推理的）：一句话的长度就够
 ///
 /// Anthropic 那边不看模型会不会推理：**要推理得在请求里写**，而探测请求不写，
 /// 所以它不会花额度在推理上。Bedrock 上的 Claude 也一样。
 pub fn max_output_tokens(
     book: &tw_pricing::PriceBook,
+    provider: &Provider,
     model: &str,
-    protocol: Option<Protocol>,
 ) -> Option<u64> {
+    let protocol = provider.effective_protocol();
     if protocol == Some(Protocol::Chatgpt) {
         return None;
     }
@@ -85,7 +87,7 @@ pub fn max_output_tokens(
         Dialect::Bedrock => model.to_ascii_lowercase().contains("anthropic.claude"),
         _ => false,
     };
-    let reasons = !asks_to_think && book.table().get(model).is_some_and(|p| p.reasoning);
+    let reasons = !asks_to_think && provider.model_spec(book, model).reasoning() == Some(true);
     Some(if reasons {
         REASONING_MAX_TOKENS
     } else {
@@ -381,29 +383,24 @@ pub async fn run(
     }
 }
 
-/// 算一次测速要花多少。
-pub fn estimate(
-    book: &tw_pricing::PriceBook,
-    provider: &str,
-    model: &str,
-    billing: Billing,
-    protocol: Option<Protocol>,
-) -> Estimate {
+/// 算一次测速要花多少：按这一家的计费方式和价目表、发给它的那个模型名，和记账同一个口径。
+pub fn estimate(book: &tw_pricing::PriceBook, provider: &Provider, model: &str) -> Estimate {
+    let billing = provider.billing;
     let input = probe_input_tokens();
-    let cap = max_output_tokens(book, model, protocol);
+    let cap = max_output_tokens(book, provider, model);
     let usage = tw_pricing::Usage {
         input,
         output: cap.unwrap_or_default(),
         ..Default::default()
     };
-    let mut quote = crate::quote::quote(book, provider, model, &usage, billing);
+    let mut quote = crate::quote::quote(book, &provider.name, model, &usage, billing);
     // 上限报不出来时，按量计费这次要花多少就是**不知道**，不是 0 —— 回答有多长
     // 由模型决定。不计费的那档照样是 0
     if cap.is_none() && billing == Billing::PerToken {
         quote.cost_micros = None;
     }
     Estimate {
-        provider: provider.to_string(),
+        provider: provider.name.clone(),
         model: model.to_string(),
         input_tokens: input,
         max_output_tokens: cap,
@@ -523,7 +520,7 @@ mod tests {
         let r = probe_request(
             &p,
             "gpt-5.5",
-            max_output_tokens(&prices(), "gpt-5.5", p.effective_protocol()),
+            max_output_tokens(&prices(), &p, "gpt-5.5"),
             &[],
         );
         assert_eq!(r.path, "/responses");
@@ -543,7 +540,8 @@ mod tests {
     fn a_model_that_reasons_gets_room_to_reason() {
         // 推理 token 也算输出：上限按一句话给，模型一个可见的 token 都不吐
         let book = prices();
-        let cap = |model, protocol| max_output_tokens(&book, model, protocol);
+        let cap =
+            |model, protocol| max_output_tokens(&book, &provider(protocol, "https://x"), model);
         assert_eq!(
             cap("gpt-5", Some(Protocol::OpenaiResponses)),
             Some(REASONING_MAX_TOKENS)
@@ -559,6 +557,22 @@ mod tests {
             cap("中转站自己起的名字", Some(Protocol::OpenaiChat)),
             Some(MAX_TOKENS)
         );
+        // 手写成会推理的，照样留出推理的量
+        let relay = Provider {
+            model_specs: [(
+                "中转站自己起的名字".to_string(),
+                tw_config::ModelSpec {
+                    reasoning: Some(true),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..provider(Some(Protocol::OpenaiChat), "https://x")
+        };
+        assert_eq!(
+            max_output_tokens(&book, &relay, "中转站自己起的名字"),
+            Some(REASONING_MAX_TOKENS)
+        );
         // Codex 后端不接受上限
         assert_eq!(cap("gpt-5.5", Some(Protocol::Chatgpt)), None);
     }
@@ -569,20 +583,24 @@ mod tests {
         // 对话框里是两种可信度。
         let e = estimate(
             &prices(),
-            "官方",
+            &Provider {
+                name: "官方".into(),
+                billing: Billing::PerToken,
+                ..provider(Some(Protocol::Anthropic), "https://x")
+            },
             "claude-sonnet-4-5",
-            Billing::PerToken,
-            Some(Protocol::Anthropic),
         );
         assert_eq!(e.input_tokens, probe_input_tokens());
         assert_eq!(e.max_output_tokens, Some(MAX_TOKENS));
         assert!(e.quote.cost_micros.is_some());
         let e = estimate(
             &prices(),
-            "本地",
+            &Provider {
+                name: "本地".into(),
+                billing: Billing::Free,
+                ..provider(Some(Protocol::Anthropic), "https://x")
+            },
             "claude-sonnet-4-5",
-            Billing::Free,
-            Some(Protocol::Anthropic),
         );
         assert_eq!(e.quote.cost_micros, Some(0));
         assert_eq!(e.input_tokens, probe_input_tokens());
@@ -593,20 +611,24 @@ mod tests {
         // 回答有多长由模型决定：报一个看起来确定的数字，那是编的
         let e = estimate(
             &prices(),
-            "chatgpt",
+            &Provider {
+                name: "chatgpt".into(),
+                billing: Billing::PerToken,
+                ..provider(Some(Protocol::Chatgpt), "https://x")
+            },
             "gpt-5.5",
-            Billing::PerToken,
-            Some(Protocol::Chatgpt),
         );
         assert_eq!(e.max_output_tokens, None);
         assert_eq!(e.quote.cost_micros, None);
         // 不计费的那档照样是 0
         let free = estimate(
             &prices(),
-            "chatgpt",
+            &Provider {
+                name: "chatgpt".into(),
+                billing: Billing::Free,
+                ..provider(Some(Protocol::Chatgpt), "https://x")
+            },
             "gpt-5.5",
-            Billing::Free,
-            Some(Protocol::Chatgpt),
         );
         assert_eq!(free.quote.cost_micros, Some(0));
     }

@@ -70,7 +70,7 @@ async fn list(State(s): State<ControlState>) -> Json<tw_api::AliasesView> {
                 shadows: shadows(&lists, a),
                 // 和 `/v1/models` 列别名时同一个查法：那一家手写的优先
                 context_window: served_by.first().and_then(|first| {
-                    cfg.model_limits(&book, &first.provider, &first.model)
+                    cfg.model_spec(&book, &first.provider, &first.model)
                         .context_window()
                 }),
                 served_by,

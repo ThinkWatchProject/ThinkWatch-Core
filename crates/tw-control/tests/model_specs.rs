@@ -121,8 +121,8 @@ async fn each_row_says_whether_its_numbers_were_written_by_hand() {
     let b = bed(&config(
         up,
         "    model_specs:
-      claude-sonnet-4-5: { max_output_tokens: 8000 }
-      中转自有模型: { context_window: 32000 }
+      claude-sonnet-4-5: { max_output_tokens: 8000, reasoning: false }
+      中转自有模型: { context_window: 32000, image_input: true }
 ",
         "",
     ));
@@ -133,6 +133,10 @@ async fn each_row_says_whether_its_numbers_were_written_by_hand() {
     assert_eq!(sonnet["context_window_source"], "price_table");
     assert_eq!(sonnet["max_output_tokens"], 8_000);
     assert_eq!(sonnet["max_output_tokens_source"], "manual");
+    assert_eq!(sonnet["reasoning"], false);
+    assert_eq!(sonnet["reasoning_source"], "manual");
+    assert_eq!(sonnet["image_input"], true);
+    assert_eq!(sonnet["image_input_source"], "price_table");
 
     let own = row(&rows, "中转自有模型");
     assert_eq!(own["context_window"], 32_000, "{own}");
@@ -140,6 +144,10 @@ async fn each_row_says_whether_its_numbers_were_written_by_hand() {
     // 不知道就整个不出现，来源也没有
     assert!(own.get("max_output_tokens").is_none(), "{own}");
     assert!(own.get("max_output_tokens_source").is_none(), "{own}");
+    assert!(own.get("reasoning").is_none(), "{own}");
+    assert!(own.get("reasoning_source").is_none(), "{own}");
+    assert_eq!(own["image_input"], true);
+    assert_eq!(own["image_input_source"], "manual");
 
     let haiku = row(&rows, "claude-haiku-4-5");
     assert_eq!(haiku["context_window_source"], "price_table", "{haiku}");
@@ -174,7 +182,7 @@ async fn a_spec_is_set_changed_and_cleared_through_the_endpoint() {
         cfg.providers[0].model_specs["中转自有模型"],
         tw_config::ModelSpec {
             context_window: Some(64_000),
-            max_output_tokens: None,
+            ..Default::default()
         },
         "模型 ID 去掉首尾空白：{}",
         b.file()
@@ -196,7 +204,21 @@ async fn a_spec_is_set_changed_and_cleared_through_the_endpoint() {
     assert_eq!(own["max_output_tokens"], 4_096);
     assert_eq!(own["max_output_tokens_source"], "manual");
 
-    // 两项都空：删掉，回到价目表（它不认识这个模型），文件回到原样
+    // 只写会不会推理也是一项规格
+    let (st, v) = call(
+        &b.app,
+        "PUT",
+        "/provider-model-spec",
+        json!({ "provider": "relay", "model": "中转自有模型", "reasoning": true }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let own = row(&rows(&b).await, "中转自有模型").clone();
+    assert_eq!(own["reasoning"], true);
+    assert_eq!(own["reasoning_source"], "manual");
+    assert!(own.get("context_window").is_none(), "整项换掉：{own}");
+
+    // 四项都空：删掉，回到价目表（它不认识这个模型），文件回到原样
     let (st, v) = call(
         &b.app,
         "PUT",

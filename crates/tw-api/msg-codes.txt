@@ -75,7 +75,7 @@ config.key_limit_not_positive
 config.key_limit_retention
 config.key_limit_two_measures
 config.model_spec_blank_model
-config.model_spec_empty
+config.model_spec_nothing_set
 config.model_spec_wildcard
 config.model_spec_zero
 config.name_collision

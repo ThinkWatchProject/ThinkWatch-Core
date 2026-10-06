@@ -401,7 +401,7 @@ fn outgrown(
     .iter()
     .filter_map(|s| {
         rt.config
-            .model_limits(&book, &s.provider, s.model.as_deref().ok()?)
+            .model_spec(&book, &s.provider, s.model.as_deref().ok()?)
             .context_window()
     })
     .min()

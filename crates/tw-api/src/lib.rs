@@ -794,7 +794,11 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// Responses 的 WebSocket 连接上每个 `response.create` 是一行请求（带用量和费用，按轮算上限、
 /// 并发、快慢和成败），连接本身不留行；Realtime 和别的路径照旧整条连接一行。照 38 写的界面
 /// 保存组和密钥时会把权重、上限丢掉。
-pub const CONTROL_API_VERSION: u32 = 39;
+///
+/// **40 起模型规格多了会不会推理、收不收图**：[`ModelRow`] 多了 `reasoning`、`image_input`
+/// 和它们的来源，[`ModelSpecSave`] 多了 `reasoning`、`image_input`（四项都空才是删掉）。
+/// 照 39 写的界面保存规格时会把这两项丢掉。
+pub const CONTROL_API_VERSION: u32 = 40;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3098,6 +3102,18 @@ pub struct ModelRow {
     /// `max_output_tokens` 从哪儿来。不知道输出上限时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens_source: Option<SpecSource>,
+    /// 会不会推理：这一家手写的，没写时来自价目表。不知道时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// `reasoning` 从哪儿来。不知道时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_source: Option<SpecSource>,
+    /// 收不收图：这一家手写的，没写时来自价目表。不知道时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
+    /// `image_input` 从哪儿来。不知道时没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input_source: Option<SpecSource>,
     /// 按这个上游选的价目表查到的价格。空 = 无法计价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<PriceFields>,
@@ -3162,7 +3178,7 @@ pub struct ProviderSave {
 }
 
 /// 设一家上游的一个模型的规格（`PUT /provider-model-spec`）：价目表不认识这个模型、
-/// 或者写错了时手写。**两项都空就是删掉这一项**，回到价目表。
+/// 或者写错了时手写。**四项都空就是删掉这一项**，回到价目表。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModelSpecSave {
@@ -3175,6 +3191,12 @@ pub struct ModelSpecSave {
     /// 输出上限（token）。空 = 用价目表的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// 会不会推理。空 = 用价目表的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// 收不收图。空 = 用价目表的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
     /// 你基于哪一版。**对不上就是 409**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,

@@ -631,7 +631,7 @@ pub fn remove_alias(text: &str, name: &str) -> Result<String, EditError> {
 /// - 那一家写成了行内（`- { name: a, … }`）：整项换成块式，位置不变（和 [`upsert`] 一样）；
 ///   `model_specs` 写成了行内：整张换掉
 ///
-/// 两项都空的 `spec` 交过来是调用方的错 —— 那是「删掉」，传 `None`。
+/// 全空的 `spec` 交过来是调用方的错 —— 那是「删掉」，传 `None`。
 pub fn set_model_spec(
     text: &str,
     provider: &str,
@@ -1314,6 +1314,7 @@ routes: []
         crate::ModelSpec {
             context_window,
             max_output_tokens,
+            ..Default::default()
         }
     }
 

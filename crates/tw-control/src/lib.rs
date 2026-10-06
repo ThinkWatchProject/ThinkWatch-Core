@@ -884,15 +884,9 @@ async fn speed_quote(
                     Ok(m) => (m, None),
                     Err(skip) => (req.model.clone(), Some(skip)),
                 };
-                // 和记账同一个口径：按这家的计费方式和价目表、发给它的那个模型名。**协议
-                // 也要给**：输出上限报多少由它决定（见 `tw_gateway::l3::max_output_tokens`）
-                let e = tw_gateway::l3::estimate(
-                    &book,
-                    &p.name,
-                    &model,
-                    p.billing,
-                    p.effective_protocol(),
-                );
+                // 和记账同一个口径：按这家的计费方式和价目表、发给它的那个模型名。输出上限
+                // 报多少由这一家的协议和规格决定（见 `tw_gateway::l3::max_output_tokens`）
+                let e = tw_gateway::l3::estimate(&book, p, &model);
                 (e, skip)
             })
             .collect();
@@ -958,11 +952,7 @@ async fn speed_run(
             p,
             &headers,
             &model,
-            tw_gateway::l3::max_output_tokens(
-                &s.gateway.pricing.load(),
-                &model,
-                p.effective_protocol(),
-            ),
+            tw_gateway::l3::max_output_tokens(&s.gateway.pricing.load(), p, &model),
         )
         .await;
         out.push(tw_api::SpeedResult {

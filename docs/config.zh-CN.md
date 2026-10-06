@@ -300,7 +300,7 @@ clients:
 | `models_only` | 字符串列表 | — | 只使用这家的这些模型，写 ID 或通配。范围外的模型不出现在模型列表里，也不会路由到这家。不写：全部。写空列表会被拒绝，暂停使用请用 `disabled`。 |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`：费用为用量乘以所选价目表中的单价，订阅账号同样如此。`free`：费用记为 0。 |
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
-| `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口和输出上限，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
+| `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口、输出上限、会不会推理、收不收图，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
 | `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
 <!-- /generated -->
@@ -412,6 +412,8 @@ providers:
 |---|---|---|---|
 | `context_window` | 整数 | — | 上下文窗口，即一次请求最多输入多少 token。不写：取价目表的。 |
 | `max_output_tokens` | 整数 | — | 一次回答最多输出多少 token。不写：取价目表的。 |
+| `reasoning` | 布尔 | — | 这个模型会不会推理。模型列表（`GET /v1/models`）带着它，客户端据此给出推理档位。不写：取价目表的；价目表也没写时，列表里不给这一项。 |
+| `image_input` | 布尔 | — | 这个模型收不收图。模型列表里以 `input_modalities` 给出。不写：取价目表的；价目表也没写时，列表里不给这一项。 |
 <!-- /generated -->
 
 ```yaml

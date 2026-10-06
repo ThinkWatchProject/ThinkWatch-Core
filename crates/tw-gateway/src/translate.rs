@@ -74,7 +74,7 @@ pub fn default_max_tokens(
     model: &str,
 ) -> u64 {
     provider
-        .model_limits(book, model)
+        .model_spec(book, model)
         .max_output_tokens()
         .unwrap_or_else(|| tw_dialect::official::fallback_max_output_tokens(model))
 }
@@ -147,8 +147,8 @@ mod tests {
                     (
                         m.to_string(),
                         tw_config::ModelSpec {
-                            context_window: None,
                             max_output_tokens: Some(n),
+                            ..Default::default()
                         },
                     )
                 })
