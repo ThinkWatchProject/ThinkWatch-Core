@@ -143,7 +143,8 @@ fn chatgpt_login(cfg: &tw_config::Config, name: &str, token_endpoint: &str) -> O
     (ours && !shared).then(|| o.refresh.clone())
 }
 
-/// 手写一家上游的一个模型的上下文窗口、输出上限；两项都空就删掉那一项，回到价目表。
+/// 手写一家上游的一个模型的上下文窗口、输出上限、会不会推理、收不收图；四项都空就删掉
+/// 那一项，回到价目表。
 ///
 /// **只动这一家 `model_specs` 里的这一项**（[`edit::set_model_spec`]），不走编辑上游那条
 /// 路：那条路按读进来的结构把整项写回去，用户写成和默认值一样的字段会被顺手删掉。
@@ -157,6 +158,8 @@ async fn set_model_spec(
     let spec = tw_config::ModelSpec {
         context_window: req.context_window,
         max_output_tokens: req.max_output_tokens,
+        reasoning: req.reasoning,
+        image_input: req.image_input,
     };
     let spec = (!spec.is_empty()).then_some(spec);
     let version = s
@@ -343,14 +346,18 @@ fn models_view(
             .into_iter()
             .map(|id| {
                 let r = book.resolve_for(&p.name, &id);
-                // 上下文窗口、输出上限和 `/v1/models` 给客户端的是同一个查法
-                let limits = p.model_limits(&book, &id);
+                // 规格和 `/v1/models` 给客户端的是同一个查法
+                let spec = p.model_spec(&book, &id);
                 tw_api::ModelRow {
                     enabled: p.uses_model(&id),
-                    context_window: limits.context_window(),
-                    context_window_source: limits.context_window.map(|s| s.source.into()),
-                    max_output_tokens: limits.max_output_tokens(),
-                    max_output_tokens_source: limits.max_output_tokens.map(|s| s.source.into()),
+                    context_window: spec.context_window(),
+                    context_window_source: spec.context_window.map(|s| s.source.into()),
+                    max_output_tokens: spec.max_output_tokens(),
+                    max_output_tokens_source: spec.max_output_tokens.map(|s| s.source.into()),
+                    reasoning: spec.reasoning(),
+                    reasoning_source: spec.reasoning.map(|s| s.source.into()),
+                    image_input: spec.image_input(),
+                    image_input_source: spec.image_input.map(|s| s.source.into()),
                     price: r.as_ref().map(|r| {
                         crate::pricing::price_fields(&tw_pricing::PerMillion::of(&r.price))
                     }),

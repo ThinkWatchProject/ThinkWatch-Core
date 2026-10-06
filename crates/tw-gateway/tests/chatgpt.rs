@@ -761,11 +761,7 @@ async fn an_inference_test_reaches_the_codex_backend_and_times_the_first_token()
     .unwrap();
 
     // 上限：Codex 后端不接受，所以报价里是空的，发出去的请求里也不该有
-    let cap = tw_gateway::l3::max_output_tokens(
-        &state.pricing.load(),
-        "gpt-5.5",
-        Some(Protocol::Chatgpt),
-    );
+    let cap = tw_gateway::l3::max_output_tokens(&state.pricing.load(), &p, "gpt-5.5");
     assert_eq!(cap, None);
 
     let http = state.client_for(&p.name);

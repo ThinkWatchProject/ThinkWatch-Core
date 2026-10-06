@@ -279,8 +279,9 @@ impl PerMillion {
                 }),
             max_input_tokens: base.and_then(|b| b.max_input_tokens),
             max_output_tokens: base.and_then(|b| b.max_output_tokens),
-            // 覆盖价只改单价：模型会不会推理不是价格的一部分
-            reasoning: base.is_some_and(|b| b.reasoning),
+            // 覆盖价只改单价：模型会不会推理、收不收图不是价格的一部分
+            reasoning: base.and_then(|b| b.reasoning),
+            image_input: base.and_then(|b| b.image_input),
         }
     }
 

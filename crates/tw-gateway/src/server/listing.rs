@@ -64,21 +64,25 @@ impl ListingShape {
 /// 列表里一个模型带给客户端的元数据。
 ///
 /// 这一家手写的（`model_specs`）优先，没写的来自价目表（见 [`tw_config::model_specs`]），
-/// 和上游页模型一格的「上下文」（`ModelRow.context_window`）是同一个数。
+/// 和上游页模型一格的「上下文」（`ModelRow.context_window`）是同一个值。
 /// **查不到就是 `None`，对应的字段整个不出现** —— 客户端读不到会用自己的默认值，
-/// 一个编出来的数它却会照着截断对话。
+/// 一个编出来的数它却会照着截断对话，编出来的「不会推理」它会照着不让选推理档。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ModelMeta {
     /// 一次最多输入多少 token，也就是上下文窗口
     pub max_input_tokens: Option<u64>,
-    /// 一次最多输出多少 token。只有 Gemini 的模型对象有这一项
+    /// 一次最多输出多少 token
     pub max_output_tokens: Option<u64>,
+    /// 会不会推理
+    pub reasoning: Option<bool>,
+    /// 收不收图
+    pub image_input: Option<bool>,
 }
 
 /// 查一个模型的元数据。
 ///
 /// `provider`：知道这个名称发给哪家上游时给上，先看这一家手写的，再按它选的价目表查，
-/// 和上游页那一格是同一个查法（[`tw_config::Config::model_limits`]）；不给就只查默认
+/// 和上游页那一格是同一个查法（[`tw_config::Config::model_spec`]）；不给就只查默认
 /// 价目表。自定义价目表只改单价，上下文窗口照样取自默认价目表。
 pub(crate) fn model_meta(
     cfg: &tw_config::Config,
@@ -86,13 +90,15 @@ pub(crate) fn model_meta(
     provider: Option<&str>,
     model: &str,
 ) -> ModelMeta {
-    let limits = match provider {
-        Some(p) => cfg.model_limits(book, p, model),
-        None => tw_config::ModelLimits::priced(book, model),
+    let spec = match provider {
+        Some(p) => cfg.model_spec(book, p, model),
+        None => tw_config::ResolvedSpec::priced(book, model),
     };
     ModelMeta {
-        max_input_tokens: limits.context_window(),
-        max_output_tokens: limits.max_output_tokens(),
+        max_input_tokens: spec.context_window(),
+        max_output_tokens: spec.max_output_tokens(),
+        reasoning: spec.reasoning(),
+        image_input: spec.image_input(),
     }
 }
 
@@ -185,12 +191,29 @@ const RELEASED_AT: i64 = 0;
 ///
 /// 知道上下文窗口时，同一个数写成三个字段：各家客户端读的不是同一个名字 ——
 /// Grok Build 读 `context_window`，oh-my-pi 读 `context_length`，Hermes 三个依次试。
+///
+/// 另外三项各写一个字段，知道才写：输出上限 `max_output_tokens`、会不会推理
+/// `supports_reasoning`、收不收图 `input_modalities`（`["text", "image"]` 或 `["text"]`，
+/// 和 OpenRouter 的写法一样）。桌面端接管客户端时照着它们写进客户端的配置。
 fn openai_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
     let mut m = serde_json::json!({ "id": id, "object": "model", "created": RELEASED_AT });
     if let Some(n) = meta.max_input_tokens {
         m["context_window"] = n.into();
         m["context_length"] = n.into();
         m["max_input_tokens"] = n.into();
+    }
+    if let Some(n) = meta.max_output_tokens {
+        m["max_output_tokens"] = n.into();
+    }
+    if let Some(r) = meta.reasoning {
+        m["supports_reasoning"] = r.into();
+    }
+    if let Some(image) = meta.image_input {
+        m["input_modalities"] = if image {
+            serde_json::json!(["text", "image"])
+        } else {
+            serde_json::json!(["text"])
+        };
     }
     m
 }
@@ -225,7 +248,8 @@ fn anthropic_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
     m
 }
 
-/// Gemini 格式的一个模型对象。上下文窗口和输出上限用 Gemini 自己的字段名。
+/// Gemini 格式的一个模型对象。上下文窗口、输出上限、会不会推理用 Gemini 自己的字段名
+/// （`thinking`）；收不收图 Gemini 的模型对象里没有这一项。
 fn gemini_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
     let mut m = serde_json::json!({ "name": format!("models/{id}") });
     if let Some(n) = meta.max_input_tokens {
@@ -233,6 +257,9 @@ fn gemini_model(id: &str, meta: &ModelMeta) -> serde_json::Value {
     }
     if let Some(n) = meta.max_output_tokens {
         m["outputTokenLimit"] = n.into();
+    }
+    if let Some(r) = meta.reasoning {
+        m["thinking"] = r.into();
     }
     m
 }
@@ -400,6 +427,8 @@ mod tests {
     const KNOWN: ModelMeta = ModelMeta {
         max_input_tokens: Some(200_000),
         max_output_tokens: Some(64_000),
+        reasoning: Some(true),
+        image_input: Some(true),
     };
 
     #[test]
@@ -409,8 +438,18 @@ mod tests {
         assert_eq!(m["context_window"], 200_000);
         assert_eq!(m["context_length"], 200_000);
         assert_eq!(m["max_input_tokens"], 200_000);
-        // 输出上限 OpenAI 的模型对象里没有人读
-        assert!(m.get("max_output_tokens").is_none(), "{m}");
+        assert_eq!(m["max_output_tokens"], 64_000);
+        assert_eq!(m["supports_reasoning"], true);
+        assert_eq!(m["input_modalities"], serde_json::json!(["text", "image"]));
+        // 「不会」和「不收图」照样说出来：那和不知道是两回事
+        let plain = ModelMeta {
+            reasoning: Some(false),
+            image_input: Some(false),
+            ..KNOWN
+        };
+        let m = openai_model("deepseek-chat", &plain);
+        assert_eq!(m["supports_reasoning"], false);
+        assert_eq!(m["input_modalities"], serde_json::json!(["text"]));
     }
 
     #[test]
@@ -443,6 +482,7 @@ mod tests {
         assert_eq!(m["name"], "models/gemini-2.5-pro");
         assert_eq!(m["inputTokenLimit"], 200_000);
         assert_eq!(m["outputTokenLimit"], 64_000);
+        assert_eq!(m["thinking"], true);
     }
 
     #[test]
@@ -453,8 +493,12 @@ mod tests {
             "context_length",
             "max_input_tokens",
             "supports_1m",
+            "max_output_tokens",
+            "supports_reasoning",
+            "input_modalities",
             "inputTokenLimit",
             "outputTokenLimit",
+            "thinking",
         ];
         for m in [
             openai_model("my-model", &unknown),
@@ -502,7 +546,8 @@ mod tests {
                     "claude-sonnet-4-5".to_string(),
                     tw_config::ModelSpec {
                         context_window: Some(1_000_000),
-                        max_output_tokens: None,
+                        reasoning: Some(false),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -513,6 +558,8 @@ mod tests {
         let m = model_meta(&cfg, &book, Some("up"), "claude-sonnet-4-5");
         assert_eq!(m.max_input_tokens, Some(1_000_000));
         assert_eq!(m.max_output_tokens, Some(64_000), "没写的照样取价目表");
+        assert_eq!(m.reasoning, Some(false), "手写的「不会」盖过价目表");
+        assert_eq!(m.image_input, Some(true));
         // 不知道是哪一家时没有手写的可看
         assert_eq!(
             model_meta(&cfg, &book, None, "claude-sonnet-4-5").max_input_tokens,

@@ -176,10 +176,8 @@ fn price_from(v: &serde_json::Value) -> Option<ModelPrice> {
         long: long_tier(v, output),
         max_input_tokens: v.get("max_input_tokens").and_then(|x| x.as_u64()),
         max_output_tokens: v.get("max_output_tokens").and_then(|x| x.as_u64()),
-        reasoning: v
-            .get("supports_reasoning")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false),
+        reasoning: v.get("supports_reasoning").and_then(|x| x.as_bool()),
+        image_input: v.get("supports_vision").and_then(|x| x.as_bool()),
     })
 }
 
@@ -239,8 +237,15 @@ mod tests {
                 .is_some_and(|n| n >= 32_000)
         );
         // 会不会推理也要读进来：测速的探测请求按它决定留多少输出额度
-        assert!(t.get("gpt-5").is_some_and(|p| p.reasoning));
-        assert!(t.get("gpt-4o").is_some_and(|p| !p.reasoning));
+        assert_eq!(t.get("gpt-5").and_then(|p| p.reasoning), Some(true));
+        // 数据集没写的是「不知道」，不是「不会」
+        assert_eq!(t.get("gpt-4o").and_then(|p| p.reasoning), None);
+        // 收不收图也是，写了「不收」的照样读进来
+        assert_eq!(t.get("gpt-4o").and_then(|p| p.image_input), Some(true));
+        assert_eq!(
+            t.get("deepseek-v4-flash").and_then(|p| p.image_input),
+            Some(false)
+        );
     }
 
     #[test]
