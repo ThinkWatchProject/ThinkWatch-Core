@@ -22,9 +22,9 @@ on:
   # 运行的产物（Artifacts）里，`publish` 照样把它们逐个核对，只是不写 Release。
   #
   # 理由是这条流水线唯一一个「发现了也没法在本次补救」的性质：tag 一旦
-  # 推上去，流水线错了就得把它撤回来。而这里新增的那条 Windows 支线要靠
-  # 交叉编译到 arm64，那件事成不成只有真跑一次才知道 —— 用一个 tag 去
-  # 问这个问题太贵了。
+  # 推上去，流水线错了就得把它撤回来。改了这条流水线（换 runner、加平台），
+  # 成不成只有真跑一次才知道 —— 用一个 tag 去问这个问题太贵了。
+  # `gh workflow run release.yml --ref <分支>` 跑的是那个分支上的这份文件。
   workflow_dispatch:
 
 permissions:
@@ -46,7 +46,12 @@ jobs:
         with:
           # wasm32：插件沙箱里的 QuickJS（crates/tw-plugin/build.rs）
           targets: aarch64-apple-darwin, wasm32-unknown-unknown
+      # **只读不存。**tag 上的运行读得到的缓存只有两处：这个 tag 自己的、默认分支
+      # （main）的。存下来的缓存挂在这个 tag 名下，下一个 tag 读不到，等于白占仓库
+      # 10 GB 的缓存额度 —— 还会把 main 上 CI 天天在用的缓存挤掉
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
 
       # 编插件沙箱要一个能出 wasm 的 clang：Homebrew 的 llvm
       - name: Toolchain for the plugin sandbox
@@ -103,131 +108,134 @@ jobs:
           if-no-files-found: error
 
   twcore-windows:
-    name: twcore (Windows x64 + arm64)
-    # **两个架构都发**（x64 和 arm64）。x64 原生编，arm64 在同一台 x64
-    # runner 上交叉编 —— MSVC 的 ARM64 工具链在这个镜像里，而起一台
-    # arm64 runner 只为编一个二进制不划算。
-    #
-    # 交叉编译成不成，靠上面那个排练模式先问清楚，而不是拿一个 tag 去问。
-    runs-on: windows-latest
+    name: twcore (${{ matrix.target }})
+    # **两个架构各在自己架构的 runner 上原生编**，和 Linux 一样。以前 arm64 在 x64
+    # 的 runner 上接着 x64 交叉编，两遍串行，这个 job 一个人就比别的平台多花一倍
+    # 时间、拖住整个发版；拆开之后两个并行跑。原生编还能把 arm64 的产物真跑一遍，
+    # 交叉编的只能读 PE 头看它是不是 arm64。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            machine: "0x8664"
+            host: x64
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            machine: "0xAA64"
+            host: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc, wasm32-unknown-unknown
+          targets: ${{ matrix.target }}, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          # 见 twcore 那一段
+          save-if: false
 
       # 镜像预装的 LLVM（C:\Program Files\LLVM）；没有就装官方发行版
       - name: Toolchain for the plugin sandbox
         shell: bash
         run: bash scripts/wasm-toolchain.sh
 
-      # arm64 的沙箱机器码在 x64 上交叉编：build.rs 里的 Cranelift 直接编给目标平台
       - name: Build
-        run: |
-          cargo build --release -p twcore -p tw-plugin --target x86_64-pc-windows-msvc
-          cargo build --release -p twcore -p tw-plugin --target aarch64-pc-windows-msvc
+        run: cargo build --release -p twcore -p tw-plugin --target ${{ matrix.target }}
 
       - name: Which compiler built the plugin sandbox
         shell: bash
-        run: |
-          for t in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-            bash scripts/wasm-toolchain.sh record "target/$t/release" "guest-build/$t.txt"
-          done
+        run: bash scripts/wasm-toolchain.sh record "target/${{ matrix.target }}/release" "guest-build/${{ matrix.target }}.txt"
       - uses: actions/upload-artifact@v4
         with:
-          name: guest-build-windows
+          name: guest-build-${{ matrix.target }}
           path: guest-build/
           if-no-files-found: error
 
       # **产物自检。**一个编得过但起不来的二进制，从文件列表上看不出任何
       # 问题 —— 而它会一路发到用户手里。
       #
-      # arm64 那个在这台机器上跑不起来（x64 runner），所以只能查它到底是不是
-      # arm64 —— 读 PE 头里的 machine 字段，等价于 macOS 那边的 `file | grep
-      # arm64`。**这一条不是走过场**：交叉编译配错目标的表现正是产出一个
-      # 名字叫 arm64 的 x64 二进制。
-      - name: They are what they claim to be, and the x64 one runs
+      # PE 头里的 machine 字段，等价于 macOS 那边的 `file | grep arm64`：目标配错
+      # 的表现正是产出一个名字叫 arm64 的 x64 二进制，而 arm64 的 Windows 能模拟
+      # 跑 x64 —— 光是跑得起来证明不了它是哪个架构
+      - name: It is what it claims to be, it runs, and it is the version on the tag
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          MACHINE: ${{ matrix.machine }}
         run: |
           $ErrorActionPreference = "Stop"
-          function Get-PeMachine([string]$path) {
-            $fs = [System.IO.File]::OpenRead($path)
-            try {
-              $br = New-Object System.IO.BinaryReader($fs)
-              $fs.Position = 0x3C
-              $fs.Position = $br.ReadInt32()
-              if ($br.ReadUInt32() -ne 0x00004550) { throw "$path is not a PE file" }
-              return $br.ReadUInt16()
-            } finally { $fs.Dispose() }
+          $exe = "target\$env:TARGET\release\twcore.exe"
+          $fs = [System.IO.File]::OpenRead($exe)
+          try {
+            $br = New-Object System.IO.BinaryReader($fs)
+            $fs.Position = 0x3C
+            $fs.Position = $br.ReadInt32()
+            if ($br.ReadUInt32() -ne 0x00004550) { throw "$exe is not a PE file" }
+            $got = $br.ReadUInt16()
+          } finally { $fs.Dispose() }
+          if ($got -ne [Convert]::ToUInt16($env:MACHINE, 16)) {
+            throw ("{0} is machine 0x{1:X4}, expected {2}" -f $exe, $got, $env:MACHINE)
           }
-          $want = @{
-            "target\x86_64-pc-windows-msvc\release\twcore.exe"  = 0x8664
-            "target\aarch64-pc-windows-msvc\release\twcore.exe" = 0xAA64
-          }
-          foreach ($p in $want.Keys) {
-            $got = Get-PeMachine $p
-            if ($got -ne $want[$p]) {
-              throw ("{0} is machine 0x{1:X4}, expected 0x{2:X4}" -f $p, $got, $want[$p])
-            }
-            Write-Host ("{0}: 0x{1:X4}" -f $p, $got)
-          }
+          Write-Host ("{0}: 0x{1:X4}" -f $exe, $got)
 
-          $exe = "target\x86_64-pc-windows-msvc\release\twcore.exe"
-          $got = (& $exe --version).Split(" ")[1]
+          $ver = (& $exe --version).Split(" ")[1]
           if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $wantVer = $env:GITHUB_REF_NAME.TrimStart("v")
-            if ($got -ne $wantVer) {
-              throw "the tag says $wantVer but the binary reports $got -- Cargo.toml did not keep up"
+            $want = $env:GITHUB_REF_NAME.TrimStart("v")
+            if ($ver -ne $want) {
+              throw "the tag says $want but the binary reports $ver -- Cargo.toml did not keep up"
             }
           } else {
-            Write-Host "rehearsal: the binary reports $got"
+            Write-Host "rehearsal: the binary reports $ver"
           }
           & $exe --help | Out-Null
 
       # **不要用户另装 VC 运行库。**VC 运行库由 `.cargo/config.toml` 静态链接进来；
-      # 这里查两个 exe 的导入表，里面不许有 Windows 不自带的那几个 DLL。这台
-      # runner 上装着运行库，exe 照样跑得起来 —— 上一步看不出这件事，只有导入表看得出。
-      # 用的是链接它的那套 MSVC 里的 dumpbin，arm64 的 exe 一样读得了
+      # 这里查 exe 的导入表，里面不许有 Windows 不自带的那几个 DLL。runner 上装着
+      # 运行库，exe 照样跑得起来 —— 上一步看不出这件事，只有导入表看得出。
+      # 用的是这台 runner 自己架构的那套 MSVC 里的 dumpbin
       - name: No Visual C++ runtime to install
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          HOST: ${{ matrix.host }}
         run: |
           $ErrorActionPreference = "Stop"
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" |
+          $dumpbin = & $vswhere -latest -products * -find "VC\Tools\MSVC\**\bin\Host$env:HOST\$env:HOST\dumpbin.exe" |
             Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found" }
-          foreach ($t in @("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")) {
-            $exe = "target\$t\release\twcore.exe"
-            $deps = & $dumpbin /nologo /dependents $exe |
-              ForEach-Object { $_.Trim() } |
-              Where-Object { $_ -match '\.dll$' }
-            if ($LASTEXITCODE -ne 0 -or -not $deps) { throw "could not read the imports of $exe" }
-            Write-Host "${exe}: $($deps -join ', ')"
-            $redist = @($deps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vccorlib|vcomp)\d' })
-            if ($redist.Count -gt 0) {
-              throw "$exe needs the Visual C++ runtime ($($redist -join ', ')) -- the static CRT in .cargo/config.toml did not apply"
-            }
+          $exe = "target\$env:TARGET\release\twcore.exe"
+          $deps = & $dumpbin /nologo /dependents $exe |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '\.dll$' }
+          if ($LASTEXITCODE -ne 0 -or -not $deps) { throw "could not read the imports of $exe" }
+          Write-Host "${exe}: $($deps -join ', ')"
+          $redist = @($deps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vccorlib|vcomp)\d' })
+          if ($redist.Count -gt 0) {
+            throw "$exe needs the Visual C++ runtime ($($redist -join ', ')) -- the static CRT in .cargo/config.toml did not apply"
           }
 
       - name: Package
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          foreach ($t in @("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")) {
-            $out = "dist\twcore-$t.exe"
-            Copy-Item "target\$t\release\twcore.exe" $out
-            # **和 macOS 那边同一种校验文件**：`<sha>  <文件名>`，两列，
-            # 两个空格 —— 下载的人用同一条 shasum -c 就能核。
-            $h = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
-            "$h  twcore-$t.exe" | Set-Content -NoNewline -Encoding ascii "$out.sha256"
-            Get-Content "$out.sha256"
-          }
+          $out = "dist\twcore-$env:TARGET.exe"
+          Copy-Item "target\$env:TARGET\release\twcore.exe" $out
+          # **和 macOS 那边同一种校验文件**：`<sha>  <文件名>`，两列，
+          # 两个空格 —— 下载的人用同一条 shasum -c 就能核。
+          $h = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          "$h  twcore-$env:TARGET.exe" | Set-Content -NoNewline -Encoding ascii "$out.sha256"
+          Get-Content "$out.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: twcore-windows
+          name: twcore-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
@@ -265,6 +273,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # 见 twcore 那一段
+          save-if: false
 
       # 两种 runner 都预装 clang-15，两个架构用同一个版本（见脚本）
       - name: Toolchain for the plugin sandbox
