@@ -44,6 +44,9 @@ pub enum Source {
     /// 也没空出来。**和上游限流一样回 429，另外带 `Retry-After`**：请求本身没问题，过一会儿
     /// 再来就能发出去 —— 客户端该退避再试，不是放弃。对外的词表里算 `rate_limited`
     Busy,
+    /// 请求体超过网关的上限（见 `server::intake`）。**413，不是 400**：Anthropic 的格式里
+    /// 它是 `request_too_large`，和 Anthropic 自己嫌请求太大时一样。对外的词表里算 `request`
+    TooLarge,
 }
 
 /// 上游都满着时告诉客户端过几秒再来（`Retry-After`）。
@@ -62,7 +65,7 @@ impl Source {
             Source::Request => "request",
             Source::RateLimited | Source::Busy => "rate_limited",
             Source::Denied => "denied",
-            Source::NotSupported => "request",
+            Source::NotSupported | Source::TooLarge => "request",
         }
     }
     fn status(&self) -> StatusCode {
@@ -75,6 +78,7 @@ impl Source {
             Source::RateLimited | Source::Busy => StatusCode::TOO_MANY_REQUESTS,
             Source::Denied => StatusCode::FORBIDDEN,
             Source::NotSupported => StatusCode::NOT_IMPLEMENTED,
+            Source::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 }
@@ -172,6 +176,9 @@ impl GatewayError {
     }
     pub fn request(detail: Msg) -> Self {
         Self::new(Source::Request, detail)
+    }
+    pub fn too_large(detail: Msg) -> Self {
+        Self::new(Source::TooLarge, detail)
     }
 }
 

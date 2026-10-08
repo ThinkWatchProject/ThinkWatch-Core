@@ -16,7 +16,6 @@ use bytes::Bytes;
 
 use super::{Choice, Sender, now_ms};
 use crate::error::GatewayError;
-use crate::forward;
 use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
@@ -28,10 +27,6 @@ mod relay;
 mod slow;
 
 pub(crate) use hop::stream_fault;
-
-/// 256 MiB。大到能装下几张 4K 图的 base64（膨胀 33%），小到失控的
-/// 客户端打不爆内存。
-const MAX_BODY: usize = 256 * 1024 * 1024;
 
 /// 进管线时就定了的东西：身份识别之后，每一步都只读不改。
 pub(super) struct Inbound {
@@ -76,8 +71,6 @@ pub(super) async fn pipeline(
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
-    forward::check_body_size(&req.body, MAX_BODY)?;
-
     let intent = match probe(&state, &rt, &req) {
         Probe::Answered(resp) => return Ok(resp),
         Probe::Intent(intent) => intent,

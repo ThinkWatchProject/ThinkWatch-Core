@@ -7,7 +7,6 @@ use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
-use bytes::Bytes;
 
 use crate::error::GatewayError;
 use crate::health::Health;
@@ -16,6 +15,7 @@ use listing::{get_model, list_models};
 pub(crate) use pipeline::stream_fault;
 use tw_types::msg;
 
+mod intake;
 mod listing;
 mod pipeline;
 mod upgrade;
@@ -98,11 +98,11 @@ async fn passthrough(
     method: axum::http::Method,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
-    // **必须排在 `body` 前面。**提取器按顺序跑，而 `Bytes` 会把体吃掉
-    // —— 一次升级要的是那条连接本身，体被读走之后就没得升了
+    // **必须排在 `body` 前面。**`body` 拿走的是整个请求
     crate::ws::MaybeUpgrade(upgrade): crate::ws::MaybeUpgrade,
     headers: HeaderMap,
-    body: Bytes,
+    // **这里还没读。**过完来源和密钥检查才读（见 `intake`）
+    body: axum::body::Body,
 ) -> Result<Response, GatewayError> {
     let started = std::time::Instant::now();
     // 从这一刻起它就算「在服务中」。**排队等并发名额的也算** —— 那时客户
@@ -135,9 +135,7 @@ async fn passthrough(
             .find(|c| c.name == client_name)
             .map(|c| tw_secret::mask_secret(&c.key)),
     };
-    // WebSocket 升级。**在鉴权之后、解体之前分叉** —— 鉴权
-    // 在前是因为一个不该连过来的地址不该有机会升级；解体之前是因为
-    // 升级要的是那条连接，而 `Bytes` 会把它读干净。
+    // WebSocket 升级。**在鉴权之后分叉** —— 一个不该连过来的地址不该有机会升级。
     if let Some(ws) = upgrade.filter(|_| crate::ws::is_upgrade(&headers)) {
         return upgrade::ws_upgrade(
             state,
@@ -189,6 +187,10 @@ async fn passthrough(
     // 交给管线里每一条 `return Err` 各自去报的话，漏掉一条的后果不是没报，
     // 而是被 Drop 报成「客户端取消」—— 一次策略拒绝会记到客户端头上。
     let mut ending: Option<crate::ending::Ending> = None;
+    // **到这里才读体**：来源、密钥、方法都过了。超了上限的还没有开始事件，不记一行
+    let body = intake::read(&headers, body, intake::MAX_BODY)
+        .await
+        .map_err(|e| e.in_dialect(dialect))?;
     let req = pipeline::Inbound {
         uri,
         query,

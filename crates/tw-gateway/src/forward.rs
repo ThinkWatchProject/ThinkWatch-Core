@@ -140,17 +140,6 @@ pub fn map_reqwest_error(e: reqwest::Error) -> GatewayError {
     }
 }
 
-/// 请求体原样转发，只在这里做一次大小检查。
-pub fn check_body_size(body: &Bytes, max: usize) -> Result<(), GatewayError> {
-    if body.len() > max {
-        return Err(GatewayError::request(msg!(
-            "gw.request.body_too_large", size = body.len(), max = max =>
-            "The request body is {size} bytes, over the {max}-byte limit."
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,12 +271,5 @@ mod tests {
             gemini_path_with_model("/v1beta/models/big:streamGenerateContent", "small"),
             "/v1beta/models/small:streamGenerateContent"
         );
-    }
-
-    #[test]
-    fn body_size_limit_reports_both_numbers() {
-        let e = check_body_size(&Bytes::from(vec![0u8; 10]), 5).unwrap_err();
-        assert!(e.message().contains("10") && e.message().contains('5'));
-        assert!(check_body_size(&Bytes::from(vec![0u8; 5]), 5).is_ok());
     }
 }
