@@ -62,7 +62,7 @@ const WARMUP_BODY: &str = "Warmup";
 /// `is_claude_code` 由调用方判断。`max_tokens: 1` 那条**必须**同时要求
 /// 它，否则会误伤别人真实的 `max_tokens: 1` 请求。
 pub fn classify(body: &Bytes, is_claude_code: bool) -> Option<ProbeKind> {
-    let has = |m: &str| memfind(body, m.as_bytes());
+    let has = |m: &str| memchr::memmem::find(body, m.as_bytes()).is_some();
 
     // 快速排除。四个 B 类标记各有一句独特的原文；A 类里 warmup 也有，
     // 而 health check 只能靠 `max_tokens` 这个字段名先粗筛。
@@ -105,14 +105,6 @@ pub fn classify(body: &Bytes, is_claude_code: bool) -> Option<ProbeKind> {
         return Some(ProbeKind::HealthCheck);
     }
     None
-}
-
-/// 朴素子串查找。请求体是几十 KB 的量级，不值得为它引一个 SIMD 库。
-fn memfind(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return false;
-    }
-    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// 把 system 和所有消息里的文本摊平了看。

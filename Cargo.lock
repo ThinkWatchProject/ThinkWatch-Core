@@ -3252,6 +3252,7 @@ dependencies = [
 name = "tw-dialect"
 version = "0.64.1"
 dependencies = [
+ "memchr",
  "serde",
  "serde_json",
 ]
@@ -3287,6 +3288,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "memchr",
  "rand 0.10.2",
  "reqwest",
  "rustls",
