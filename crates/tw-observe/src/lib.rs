@@ -6,4 +6,4 @@
 
 pub mod bus;
 
-pub use bus::EventBus;
+pub use bus::{EventBus, RecordFeed};
