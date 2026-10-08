@@ -76,8 +76,12 @@ pub(super) async fn pipeline(
 ) -> Result<Response, GatewayError> {
     // 请求体**只解析一次**：本地应答的判定、路由事实、对话的指纹、内容过滤都用这一份（见
     // `read`）。解不开是 None —— 照样往下走，同格式直通照样发
-    let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
-    let intent = match probe(&state, &rt, &req, parsed.as_ref()) {
+    let (parsed, probed) = heavy(&req.body, || {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
+        let probed = probe(&state, &rt, &req, parsed.as_ref());
+        (parsed, probed)
+    });
+    let intent = match probed {
         Probe::Answered(resp) => return Ok(resp),
         Probe::Intent(intent) => intent,
     };
@@ -95,7 +99,7 @@ pub(super) async fn pipeline(
 
     // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
-    let (mut reading, fp) = read(&req, intent, parsed.as_ref());
+    let (mut reading, fp) = heavy(&req.body, || read(&req, intent, parsed.as_ref()));
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
         Routed::Go(choice, decision) => (choice, decision),
@@ -104,7 +108,7 @@ pub(super) async fn pipeline(
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
             // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
-            let seen = look(&rt, &req);
+            let seen = heavy(&req.body, || look(&rt, &req));
             let redaction = redaction(&rt, seen.ledger);
             let (id, _) = open(
                 &state,
@@ -143,18 +147,24 @@ pub(super) async fn pipeline(
     .await?;
 
     // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
-    let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
-    let started = start(
-        &state,
-        &rt,
-        &req,
-        &reading,
-        choice,
-        wait_until,
-        &decision,
-        fp.as_deref(),
-        ending,
-    );
+    let size = req.body.len();
+    let (screening, started) = heavy_for(size, || {
+        let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
+        // 解析出来的那一份到这里就用完了：删过字的话它也不再是请求体的样子
+        drop(parsed);
+        let started = start(
+            &state,
+            &rt,
+            &req,
+            &reading,
+            choice,
+            wait_until,
+            &decision,
+            fp.as_deref(),
+            ending,
+        );
+        (screening, started)
+    });
     // 用量上限的预留跟着请求号走，等存储层记下这一行时换成实数
     hold.bind(started.id);
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
@@ -1021,6 +1031,32 @@ fn screen(
         }
     }
     sc
+}
+
+/// 请求体到这么大，管线上整份解它、扫它的那几步挪出异步线程（见 [`heavy`]）。
+const HEAVY_BODY: usize = 1024 * 1024;
+
+/// 在整个请求体上做的 CPU 活：解析、本地应答的判定、内容过滤、出站脱敏、每一跳改写请求体。
+///
+/// **大的请求体挪出异步线程做**（`block_in_place`）：一个 8 MB 的请求要算几十毫秒，就地算的话，
+/// 同一个线程上别的连接 —— 正在流的回答 —— 跟着停住这么久。挪出去时这个线程上排着的活交给
+/// 别的线程接着干。小的就地做：挪一次的开销比它本身还大。
+///
+/// 只在多线程的运行时上挪：单线程的运行时（测试用的就是它）里 `block_in_place` 会 panic。
+pub(super) fn heavy<T>(body: &[u8], f: impl FnOnce() -> T) -> T {
+    heavy_for(body.len(), f)
+}
+
+/// [`heavy`]，按请求体的长度：要在 `f` 里改请求体的调用方先量好长度
+pub(super) fn heavy_for<T>(size: usize, f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    let threads =
+        Handle::try_current().is_ok_and(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread);
+    if size >= HEAVY_BODY && threads {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
 }
 
 /// 这个请求是 Claude Code 发的吗。

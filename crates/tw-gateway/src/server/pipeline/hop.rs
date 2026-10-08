@@ -407,15 +407,17 @@ pub(super) async fn try_upstreams<'a>(
         let model = Some(plugged.model.clone().unwrap_or(sent)).filter(asked_other);
 
         let asked = Asked::of(req, reading, &plugged);
-        let out = match prepare(
-            state,
-            req,
-            reading,
-            &asked,
-            provider,
-            &effective_set,
-            Some(id),
-        ) {
+        let out = match super::heavy(asked.body, || {
+            prepare(
+                state,
+                req,
+                reading,
+                &asked,
+                provider,
+                &effective_set,
+                Some(id),
+            )
+        }) {
             Ok(out) => out,
             Err(err) => {
                 chain.push(hop_failed(
@@ -429,8 +431,6 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
-        // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
-        let unsealed = unseal_upfront(state, req, started, provider, &out);
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
         // 格式）。规则是全局的，每一跳换掉的是同一批东西；**接着原文那本账换**，
         // 同一个值在每一跳、在存下来的那份请求里都是同一个占位符。插件改过的一跳接着
@@ -439,15 +439,19 @@ pub(super) async fn try_upstreams<'a>(
             .rewritten
             .as_ref()
             .map_or(&started.ledger, |r| &r.ledger);
-        // 发出去的就是客户端原文的那些字节（同格式直通、一个字节都没改）：开头那一遍在
-        // 它上面找到的就是这一跳要换的，不再找一遍
-        let known = started.hits.as_deref().filter(|_| {
-            plugged.rewritten.is_none()
-                && unsealed.as_ptr() == req.body.as_ptr()
-                && unsealed.len() == req.body.len()
+        let (body, ledger) = super::heavy(&out.body, || {
+            // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
+            let unsealed = unseal_upfront(state, req, started, provider, &out);
+            // 发出去的就是客户端原文的那些字节（同格式直通、一个字节都没改）：开头那一遍在
+            // 它上面找到的就是这一跳要换的，不再找一遍
+            let known = started.hits.as_deref().filter(|_| {
+                plugged.rewritten.is_none()
+                    && unsealed.as_ptr() == req.body.as_ptr()
+                    && unsealed.len() == req.body.len()
+            });
+            let mode = rt.config.security.redact.mode;
+            crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known)
         });
-        let mode = rt.config.security.redact.mode;
-        let (body, ledger) = crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known);
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
