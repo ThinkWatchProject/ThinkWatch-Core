@@ -3326,6 +3326,7 @@ version = "0.64.1"
 dependencies = [
  "base64",
  "bytes",
+ "memchr",
  "regex",
  "serde",
  "serde_json",
