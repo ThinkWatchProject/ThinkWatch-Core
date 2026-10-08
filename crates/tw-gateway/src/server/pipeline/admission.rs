@@ -140,7 +140,7 @@ fn refused(
     tracing::info!(key = %req.client_name, per = r.limit.per.word(), "a usage limit of the key refused the request");
     let why = r.error();
     // 一个字节都没发出去；存下来的请求照样按这一档换、打码
-    let (_, ledger) = look(rt, req);
+    let seen = look(rt, req);
     let (id, _) = open(
         state,
         req,
@@ -149,7 +149,7 @@ fn refused(
         ("", tw_api::Billing::PerToken),
         fp,
         ending,
-        redaction(rt, ledger),
+        (redaction(rt, seen.ledger), seen.hits.map(Into::into)),
     );
     state
         .bus

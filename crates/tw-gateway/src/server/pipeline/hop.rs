@@ -439,8 +439,15 @@ pub(super) async fn try_upstreams<'a>(
             .rewritten
             .as_ref()
             .map_or(&started.ledger, |r| &r.ledger);
-        let (body, ledger) =
-            crate::guard::replace(rt.config.security.redact.mode, &rt.redact, unsealed, seed);
+        // 发出去的就是客户端原文的那些字节（同格式直通、一个字节都没改）：开头那一遍在
+        // 它上面找到的就是这一跳要换的，不再找一遍
+        let known = started.hits.as_deref().filter(|_| {
+            plugged.rewritten.is_none()
+                && unsealed.as_ptr() == req.body.as_ptr()
+                && unsealed.len() == req.body.len()
+        });
+        let mode = rt.config.security.redact.mode;
+        let (body, ledger) = crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known);
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。

@@ -59,6 +59,9 @@ struct Started {
     ledger: tw_guard::redact::replace::Ledger,
     /// 出站脱敏在客户端原文里找到的。插件改过的那一跳只再报插件写进来的（见 [`plug`]）
     found: Vec<tw_guard::redact::rules::Finding>,
+    /// 拦截档下，出站脱敏在客户端原文（`req.body`）里找到的命中。一跳发出去的就是原文的
+    /// 那些字节时（同格式直通、一个字节都没改），换的时候照它换，不再找一遍（见 [`hop`]）
+    hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>>,
     /// 这个请求最多等到什么时候：准入时定下（见 [`admission`]），等密钥的分钟、小时上限和
     /// 等上游的空位共用这一段（`failover.slot_wait_secs`）
     wait_until: tokio::time::Instant,
@@ -101,8 +104,8 @@ pub(super) async fn pipeline(
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
             // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
-            let (_, ledger) = look(&rt, &req);
-            let redaction = redaction(&rt, ledger);
+            let seen = look(&rt, &req);
+            let redaction = redaction(&rt, seen.ledger);
             let (id, _) = open(
                 &state,
                 &req,
@@ -111,7 +114,7 @@ pub(super) async fn pipeline(
                 to,
                 fp.as_deref(),
                 ending,
-                redaction,
+                (redaction, seen.hits.map(Into::into)),
             );
             state.bus.emit(super::routed_nowhere(id, choice));
             return Err(why);
@@ -830,7 +833,9 @@ fn start(
     // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
     // 那一跳的请求体可能是转换过格式的。拦截档下账本在这里就编好号：每一跳、
     // 存下来的那份请求都按它换，同一个值处处是同一个占位符
-    let (found, ledger) = look(rt, req);
+    let seen = look(rt, req);
+    let (found, ledger) = (seen.found, seen.ledger);
+    let hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>> = seen.hits.map(Into::into);
     let (id, at_ms) = open(
         state,
         req,
@@ -839,7 +844,7 @@ fn start(
         (first, billing.into()),
         fp,
         ending,
-        redaction(rt, ledger.clone()),
+        (redaction(rt, ledger.clone()), hits.clone()),
     );
     let redact_mode = rt.config.security.redact.mode;
     if !found.is_empty() {
@@ -859,6 +864,7 @@ fn start(
         conversation: crate::affinity::identity(&req.headers, fp),
         ledger,
         found,
+        hits: hits.filter(|_| redact_mode.acts()),
         wait_until,
     }
 }
@@ -867,14 +873,11 @@ fn start(
 ///
 /// 插件的密钥映射按同一份原文、同一个找法编号（见 [`crate::plugin::bridge`]）：插件看到的
 /// 占位符和这本账里的是同一个号。插件往某一跳写进新的值，那一跳接着编（见 [`plug`]）。
-fn look(
-    rt: &Runtime,
-    req: &Inbound,
-) -> (
-    Vec<tw_guard::redact::rules::Finding>,
-    tw_guard::redact::replace::Ledger,
-) {
-    crate::guard::look(rt.config.security.redact.mode, &rt.redact, &req.body)
+///
+/// 找到的命中跟着请求体交去留档：落盘前打码不再把同一份正文找一遍（见
+/// [`crate::bodies::BodyRecord::found`]）。
+fn look(rt: &Runtime, req: &Inbound) -> tw_guard::redact::flow::Look {
+    crate::guard::look_hits(rt.config.security.redact.mode, &rt.redact, &req.body)
 }
 
 /// 这个请求的正文落盘之前怎么换、怎么打码：此刻生效的规则，和这个请求的账本。
@@ -887,7 +890,8 @@ fn redaction(rt: &Runtime, ledger: tw_guard::redact::replace::Ledger) -> crate::
 
 /// 发 `RequestStarted`、把这个请求欠着的结局放进 `ending`、把请求体交去留档，
 /// 交回这个请求的号和开始的时刻。`to` 是要发往的那一家和它怎么收钱；一家都不会去的
-/// （被规则拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码。
+/// （被规则拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码，和出站
+/// 脱敏在请求体上已经找到的命中（见 [`look`]）。
 ///
 /// **会话在这里定**（见 [`crate::session::Sessions`]）：开始事件带着它，落库的
 /// 那一行记的也是它。
@@ -900,7 +904,10 @@ fn open(
     to: (&str, tw_api::Billing),
     fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
-    redaction: crate::bodies::Redaction,
+    (redaction, found): (
+        crate::bodies::Redaction,
+        Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>>,
+    ),
 ) -> (u64, u64) {
     let facts = &reading.facts;
     let id = state.bus.next_id();
@@ -961,7 +968,8 @@ fn open(
             req.body.clone(),
             req.body.len(),
             redaction,
-        ),
+        )
+        .found(found),
     );
     (id, at_ms)
 }
