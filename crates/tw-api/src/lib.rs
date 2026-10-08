@@ -798,7 +798,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **40 起模型规格多了会不会推理、收不收图**：[`ModelRow`] 多了 `reasoning`、`image_input`
 /// 和它们的来源，[`ModelSpecSave`] 多了 `reasoning`、`image_input`（四项都空才是删掉）。
 /// 照 39 写的界面保存规格时会把这两项丢掉。
-pub const CONTROL_API_VERSION: u32 = 40;
+///
+/// **41 起会话的对话视图可以只取新的轮次，试算给出每家分到的份额**：
+/// `GET /sessions/{id}/transcript` 的请求从 `()` 变成 [`TranscriptQuery`]（`from_turn`，
+/// 不带就是整份），[`Transcript`] 多了 `total_turns` 和 `settled_turns`（前面这么多轮
+/// 不会再变，下次从这里取）；[`DryRunCandidate`] 多了 `share`（负载均衡组里这一家按
+/// 当前权重和系数分到的份额，别的组和这一轮不参与的是 None）。照 40 写的界面取对话视图
+/// 时传 `null` 会被拒。
+pub const CONTROL_API_VERSION: u32 = 41;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -4697,6 +4704,9 @@ pub struct SessionDetail {
 /// 太大的只留开头，没存下来的也有。读不到的地方，那一轮的 `gaps` 说出来。
 ///
 /// **已脱敏**，和请求详情里的正文同一套打码。图片只说类型和大小，从不带数据。
+///
+/// **可以只要后面的几轮**（[`TranscriptQuery::from_turn`]）：会话开着时每来一轮重读一次，
+/// 前面不会再变的那些（`settled_turns`）不必再传一遍。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Transcript {
@@ -4705,8 +4715,29 @@ pub struct Transcript {
     /// Gemini 的 `systemInstruction`，Chat 和 Responses 还有开头连着的 system、developer
     /// 消息，几段之间空一行。没有是 null
     pub system: Option<String>,
-    /// 和 [`SessionDetail::turns`] 同样的请求，同样的顺序
+    /// 这次会话一共几轮，就是 [`SessionDetail::turns`] 有几条。给了
+    /// [`TranscriptQuery::from_turn`] 时，`turns` 是其中从那一轮起的那些
+    pub total_turns: u32,
+    /// 开头这么多轮不会再变了：它们的正文都落了盘（或者不会再来），后面的请求不会再改写
+    /// 它们，这次会话里还在跑的请求落库时也不会排到它们前面。**下一次从这里要起**
+    /// （`from_turn = settled_turns`），留着手上的前这么多轮，换掉后面的。
+    ///
+    /// 后面那几轮还会变：最后一轮的回答可能还没落盘、工具调用的号会被下一轮换成客户端
+    /// 记下的那个、一个开始得早结束得晚的请求会插到它们中间
+    pub settled_turns: u32,
+    /// 和 [`SessionDetail::turns`] 同样的请求，同样的顺序。给了
+    /// [`TranscriptQuery::from_turn`] 的，只有从那一轮起的那些
     pub turns: Vec<TranscriptTurn>,
+}
+
+/// `GET /sessions/{id}/transcript` 的查询串。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranscriptQuery {
+    /// 只要从这一轮起的那些（从 0 数，[`Transcript::turns`] 里的第几条）。不给是整段；
+    /// 比总轮数还大的，`turns` 是空的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_turn: Option<u32>,
 }
 
 /// 对话里的一轮，就是会话里的一个请求。
@@ -5066,6 +5097,12 @@ pub struct DryRunCandidate {
     /// 分得少，没有样本的那一项算 1。只在 `balance_by` 不是 `weights` 的 `load-balance` 里有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_factor: Option<f64>,
+    /// 照此刻的数字轮下去，它分到的新对话占这个组的多少，0 到 1：有效权重（权重 × 系数）
+    /// 除以这一轮参加的各家之和，和数据面挑排头是同一份数字。只在 `load-balance` 里有，
+    /// 同一个组里有份额的各家加起来是 1。熔断着、冷却着、并发数满着的这一轮不参加，没有
+    /// 份额 —— 全都这样时都参加
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<f64>,
 }
 
 /// 一个要转换格式的候选上游。

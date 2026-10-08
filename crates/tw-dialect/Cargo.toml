@@ -13,3 +13,4 @@ description = "Request, response and stream conversion between Anthropic Message
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+memchr = { workspace = true }

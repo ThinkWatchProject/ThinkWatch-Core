@@ -131,7 +131,7 @@ async fn world() -> World {
             tw_store::Blobs::new(blobs.clone()),
             tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
         ),
-        gw.bus.subscribe(),
+        gw.bus.record_feed().unwrap(),
         rx,
     );
     let state = ControlState {

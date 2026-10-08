@@ -59,6 +59,9 @@ struct Started {
     ledger: tw_guard::redact::replace::Ledger,
     /// 出站脱敏在客户端原文里找到的。插件改过的那一跳只再报插件写进来的（见 [`plug`]）
     found: Vec<tw_guard::redact::rules::Finding>,
+    /// 拦截档下，出站脱敏在客户端原文（`req.body`）里找到的命中。一跳发出去的就是原文的
+    /// 那些字节时（同格式直通、一个字节都没改），换的时候照它换，不再找一遍（见 [`hop`]）
+    hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>>,
     /// 这个请求最多等到什么时候：准入时定下（见 [`admission`]），等密钥的分钟、小时上限和
     /// 等上游的空位共用这一段（`failover.slot_wait_secs`）
     wait_until: tokio::time::Instant,
@@ -71,7 +74,14 @@ pub(super) async fn pipeline(
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
-    let intent = match probe(&state, &rt, &req) {
+    // 请求体**只解析一次**：本地应答的判定、路由事实、对话的指纹、内容过滤都用这一份（见
+    // `read`）。解不开是 None —— 照样往下走，同格式直通照样发
+    let (parsed, probed) = heavy(&req.body, || {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
+        let probed = probe(&state, &rt, &req, parsed.as_ref());
+        (parsed, probed)
+    });
+    let intent = match probed {
         Probe::Answered(resp) => return Ok(resp),
         Probe::Intent(intent) => intent,
     };
@@ -89,7 +99,7 @@ pub(super) async fn pipeline(
 
     // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
-    let (mut reading, fp) = read(&req, intent);
+    let (mut reading, fp) = heavy(&req.body, || read(&req, intent, parsed.as_ref()));
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
         Routed::Go(choice, decision) => (choice, decision),
@@ -98,8 +108,8 @@ pub(super) async fn pipeline(
         Routed::Refused(choice, why) => {
             let to = ("", tw_api::Billing::PerToken);
             // 一个字节都没发出去，也没什么可报的；存下来的请求照样按这一档换、打码
-            let (_, ledger) = look(&rt, &req);
-            let redaction = redaction(&rt, ledger);
+            let seen = heavy(&req.body, || look(&rt, &req));
+            let redaction = redaction(&rt, seen.ledger);
             let (id, _) = open(
                 &state,
                 &req,
@@ -108,7 +118,7 @@ pub(super) async fn pipeline(
                 to,
                 fp.as_deref(),
                 ending,
-                redaction,
+                (redaction, seen.hits.map(Into::into)),
             );
             state.bus.emit(super::routed_nowhere(id, choice));
             return Err(why);
@@ -137,18 +147,24 @@ pub(super) async fn pipeline(
     .await?;
 
     // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
-    let screening = screen(&rt, &mut req, &mut reading);
-    let started = start(
-        &state,
-        &rt,
-        &req,
-        &reading,
-        choice,
-        wait_until,
-        &decision,
-        fp.as_deref(),
-        ending,
-    );
+    let size = req.body.len();
+    let (screening, started) = heavy_for(size, || {
+        let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
+        // 解析出来的那一份到这里就用完了：删过字的话它也不再是请求体的样子
+        drop(parsed);
+        let started = start(
+            &state,
+            &rt,
+            &req,
+            &reading,
+            choice,
+            wait_until,
+            &decision,
+            fp.as_deref(),
+            ending,
+        );
+        (screening, started)
+    });
     // 用量上限的预留跟着请求号走，等存储层记下这一行时换成实数
     hold.bind(started.id);
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
@@ -291,10 +307,17 @@ enum Probe {
 /// 于是断网时健康检查照样失败，白白丢掉这个功能最有价值的场景。
 /// 同样的理由让它排在「一个 provider 都没有」那一条之前：那一条也是
 /// 一种「没有可用上游」，而本地应答本来就不需要上游。
-fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
-    let Some(kind) =
-        crate::clientprobe::classify(&req.body, is_claude_code(&req.client_name, &req.headers))
-    else {
+fn probe(
+    state: &AppState,
+    rt: &Runtime,
+    req: &Inbound,
+    parsed: Option<&serde_json::Value>,
+) -> Probe {
+    let Some(kind) = crate::clientprobe::classify(
+        &req.body,
+        parsed,
+        is_claude_code(&req.client_name, &req.headers),
+    ) else {
         return Probe::Intent(String::new());
     };
     use tw_config::ProbeAction::*;
@@ -321,27 +344,30 @@ fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
 
 /// 管线第 2 步的前半：读出路由事实，和这段对话的指纹。
 ///
-/// **只解析一次，指纹也只算一次。**路由要它，认对话（见 `crate::affinity`）要指纹，
-/// 开始事件归会话也要指纹，而 body 可能有几百 KB —— 解两遍、哈希两遍是白付一份钱。
+/// **只解析一次，指纹也只算一次。**`parsed` 是管线开头解出来的那一份（本地应答的判定、
+/// 内容过滤用的也是它）。路由要它，认对话（见 `crate::affinity`）要指纹，开始事件归会话
+/// 也要指纹，而 body 可能有几 MB —— 解两遍、哈希两遍是白付一份钱。
 ///
 /// 生成回答的请求解码成中间表示，**四种格式的客户端读出同一份路由事实**。
 /// body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** —— 我们的解析器
 /// 不认识的东西，上游可能完全认识（只有需要转换时才用得上解码结果）
-fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<String>) {
-    let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
-    let mut reading =
-        crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed.as_ref());
+fn read(
+    req: &Inbound,
+    intent: String,
+    parsed: Option<&serde_json::Value>,
+) -> (crate::client_api::Reading, Option<String>) {
+    let mut reading = crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed);
     reading.facts.client = req.client_name.clone();
     reading.facts.intent = intent;
     reading.harness = tw_dialect::harness::detect(
         req.headers
             .get(axum::http::header::USER_AGENT)
             .and_then(|v| v.to_str().ok()),
-        parsed.as_ref(),
+        parsed,
     );
     // 认出「这几十个请求是同一次任务」。**认不出来就是 None** —— 硬凑一个会把
     // 互不相干的请求并成一个「会话」
-    let fp = parsed.as_ref().and_then(crate::session::fingerprint);
+    let fp = parsed.and_then(crate::session::fingerprint);
     (reading, fp)
 }
 
@@ -817,7 +843,9 @@ fn start(
     // 是同一条记录**，差别只在换没换 —— 真正的替换在每一跳发出去之前做，
     // 那一跳的请求体可能是转换过格式的。拦截档下账本在这里就编好号：每一跳、
     // 存下来的那份请求都按它换，同一个值处处是同一个占位符
-    let (found, ledger) = look(rt, req);
+    let seen = look(rt, req);
+    let (found, ledger) = (seen.found, seen.ledger);
+    let hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>> = seen.hits.map(Into::into);
     let (id, at_ms) = open(
         state,
         req,
@@ -826,7 +854,7 @@ fn start(
         (first, billing.into()),
         fp,
         ending,
-        redaction(rt, ledger.clone()),
+        (redaction(rt, ledger.clone()), hits.clone()),
     );
     let redact_mode = rt.config.security.redact.mode;
     if !found.is_empty() {
@@ -846,6 +874,7 @@ fn start(
         conversation: crate::affinity::identity(&req.headers, fp),
         ledger,
         found,
+        hits: hits.filter(|_| redact_mode.acts()),
         wait_until,
     }
 }
@@ -854,14 +883,11 @@ fn start(
 ///
 /// 插件的密钥映射按同一份原文、同一个找法编号（见 [`crate::plugin::bridge`]）：插件看到的
 /// 占位符和这本账里的是同一个号。插件往某一跳写进新的值，那一跳接着编（见 [`plug`]）。
-fn look(
-    rt: &Runtime,
-    req: &Inbound,
-) -> (
-    Vec<tw_guard::redact::rules::Finding>,
-    tw_guard::redact::replace::Ledger,
-) {
-    crate::guard::look(rt.config.security.redact.mode, &rt.redact, &req.body)
+///
+/// 找到的命中跟着请求体交去留档：落盘前打码不再把同一份正文找一遍（见
+/// [`crate::bodies::BodyRecord::found`]）。
+fn look(rt: &Runtime, req: &Inbound) -> tw_guard::redact::flow::Look {
+    crate::guard::look_hits(rt.config.security.redact.mode, &rt.redact, &req.body)
 }
 
 /// 这个请求的正文落盘之前怎么换、怎么打码：此刻生效的规则，和这个请求的账本。
@@ -874,7 +900,8 @@ fn redaction(rt: &Runtime, ledger: tw_guard::redact::replace::Ledger) -> crate::
 
 /// 发 `RequestStarted`、把这个请求欠着的结局放进 `ending`、把请求体交去留档，
 /// 交回这个请求的号和开始的时刻。`to` 是要发往的那一家和它怎么收钱；一家都不会去的
-/// （被规则拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码。
+/// （被规则拒绝了）是空的名字。`redaction` 是请求体、响应体落盘之前怎么换、打码，和出站
+/// 脱敏在请求体上已经找到的命中（见 [`look`]）。
 ///
 /// **会话在这里定**（见 [`crate::session::Sessions`]）：开始事件带着它，落库的
 /// 那一行记的也是它。
@@ -887,7 +914,10 @@ fn open(
     to: (&str, tw_api::Billing),
     fp: Option<&str>,
     ending: &mut Option<crate::ending::Ending>,
-    redaction: crate::bodies::Redaction,
+    (redaction, found): (
+        crate::bodies::Redaction,
+        Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>>,
+    ),
 ) -> (u64, u64) {
     let facts = &reading.facts;
     let id = state.bus.next_id();
@@ -948,7 +978,8 @@ fn open(
             req.body.clone(),
             req.body.len(),
             redaction,
-        ),
+        )
+        .found(found),
     );
     (id, at_ms)
 }
@@ -965,17 +996,21 @@ fn open(
 /// 模型，查了只会在真正的请求之前把同一处命中多记一遍、还可能把计数请求拒掉（理由见
 /// [`crate::client_api::ClientApi::screened`]）。在原文上查，中间表示解不开的请求照样查
 /// （同格式直通照样发，上游可能认得它）。
+///
+/// `parsed` 是请求体解析出来的样子（管线开头解的那一份），解不开的是 None：解不开的请求体
+/// 没有调用方的正文可言，什么都不报。
 fn screen(
     rt: &Runtime,
     req: &mut Inbound,
     reading: &mut crate::client_api::Reading,
+    parsed: Option<&serde_json::Value>,
 ) -> tw_guard::content::Screening {
     let screened = crate::client_api::ClientApi::screened(req.uri.path());
-    let Some(api) = req.api.filter(|_| screened) else {
+    let (Some(api), Some(parsed)) = (req.api.filter(|_| screened), parsed) else {
         return Default::default();
     };
     let dialect = api.dialect();
-    let sc = crate::guard::screen(&crate::guard::Screen::of(rt), dialect, &req.body);
+    let sc = crate::guard::screen_value(&crate::guard::Screen::of(rt), dialect, parsed);
     if let Some(body) = &sc.body {
         req.body = body.clone();
         if reading.decoded.is_some() {
@@ -996,6 +1031,32 @@ fn screen(
         }
     }
     sc
+}
+
+/// 请求体到这么大，管线上整份解它、扫它的那几步挪出异步线程（见 [`heavy`]）。
+const HEAVY_BODY: usize = 1024 * 1024;
+
+/// 在整个请求体上做的 CPU 活：解析、本地应答的判定、内容过滤、出站脱敏、每一跳改写请求体。
+///
+/// **大的请求体挪出异步线程做**（`block_in_place`）：一个 8 MB 的请求要算几十毫秒，就地算的话，
+/// 同一个线程上别的连接 —— 正在流的回答 —— 跟着停住这么久。挪出去时这个线程上排着的活交给
+/// 别的线程接着干。小的就地做：挪一次的开销比它本身还大。
+///
+/// 只在多线程的运行时上挪：单线程的运行时（测试用的就是它）里 `block_in_place` 会 panic。
+pub(super) fn heavy<T>(body: &[u8], f: impl FnOnce() -> T) -> T {
+    heavy_for(body.len(), f)
+}
+
+/// [`heavy`]，按请求体的长度：要在 `f` 里改请求体的调用方先量好长度
+pub(super) fn heavy_for<T>(size: usize, f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    let threads =
+        Handle::try_current().is_ok_and(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread);
+    if size >= HEAVY_BODY && threads {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
 }
 
 /// 这个请求是 Claude Code 发的吗。

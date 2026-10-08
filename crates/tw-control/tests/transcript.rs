@@ -148,6 +148,9 @@ async fn the_transcript_is_the_shape_the_desktop_app_reads() {
         json!({
             "session": "s1",
             "system": "sys",
+            "total_turns": 2,
+            // 第二轮没有回答（不会再被改写），两轮都早就结束了
+            "settled_turns": 2,
             "turns": [
                 {
                     "id": "1",
@@ -219,4 +222,44 @@ async fn a_session_whose_bodies_are_gone_still_lists_its_turns() {
         );
         assert_eq!(x["input"], json!([]));
     }
+}
+
+/// `from_turn`：只要从那一轮起的那些，形状不变，`total_turns` 说一共几轮。比总轮数还大的
+/// 是空的。不给和给 0 一样，是整段
+#[tokio::test]
+async fn from_turn_gives_the_turns_from_there_on() {
+    let first =
+        json!({"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "一"}]});
+    let answer = json!({"type": "message", "content": [{"type": "text", "text": "回一"}]});
+    let second = json!({"model": "claude-sonnet-4-5", "messages": [
+        {"role": "user", "content": "一"},
+        {"role": "assistant", "content": "回一"},
+        {"role": "user", "content": "二"}
+    ]});
+    let (_d, app) = app(
+        &[turn(1), turn(2)],
+        &[(1, Some(first), Some(answer)), (2, Some(second), None)],
+    );
+
+    let (st, all) = get(&app, "/sessions/s1/transcript").await;
+    assert_eq!(st, StatusCode::OK, "{all}");
+    let (_, zero) = get(&app, "/sessions/s1/transcript?from_turn=0").await;
+    assert_eq!(zero, all);
+
+    let (st, tail) = get(&app, "/sessions/s1/transcript?from_turn=1").await;
+    assert_eq!(st, StatusCode::OK, "{tail}");
+    assert_eq!(tail["total_turns"], 2);
+    assert_eq!(tail["settled_turns"], all["settled_turns"]);
+    assert_eq!(tail["system"], all["system"]);
+    assert_eq!(tail["turns"], json!([all["turns"][1]]));
+    assert_eq!(tail["turns"][0]["id"], "2");
+
+    let (st, none) = get(&app, "/sessions/s1/transcript?from_turn=9").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(none["total_turns"], 2);
+    assert_eq!(none["turns"], json!([]));
+
+    // 不是数的 `from_turn` 是请求写错了
+    let (st, body) = get(&app, "/sessions/s1/transcript?from_turn=x").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
 }

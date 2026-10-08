@@ -587,3 +587,49 @@ async fn a_time_zone_change_adds_the_new_day_up_again_from_the_records() {
     }
     assert_eq!(used(&b), 4);
 }
+
+/// 同上，只是**发现这一期变了的是一次结算**，而结算在存储层自己的记录线程上 —— 那条线程
+/// 不在异步运行时里。以前读回新一期的任务要在「当前的运行时」上起，在那儿起不来，这一天
+/// 就从 0 起了
+#[tokio::test]
+async fn a_period_change_found_while_settling_on_the_recorder_thread_is_read_back() {
+    let clock = Arc::new(Moving {
+        east: tw_gateway::key_limits::TestClock::new(ms(NOON), 8 * 3600),
+        west: tw_gateway::key_limits::TestClock::new(ms(NOON), -5 * 3600),
+        moved: Default::default(),
+    });
+    let b = bed_with(None, clock.clone());
+    tw_control::key_limits::follow(&b.gw, b.rec.clone());
+    for e in [
+        request(1, "plain", ms("2026-10-04T23:00:00+08:00"), 10),
+        request(2, "plain", ms("2026-10-05T09:00:00+08:00"), 10),
+    ]
+    .iter()
+    .flatten()
+    {
+        b.rec.lock().await.on_event(e);
+    }
+    let limits: Vec<tw_config::KeyLimit> =
+        serde_yaml_ng::from_str("[{per: day, requests: 100}]").unwrap();
+    let used = |b: &Bed| b.gw.key_limits.view("plain", &limits)[0].used;
+    assert_eq!(used(&b), 1, "东八区的今天");
+    clock.moved.store(true, std::sync::atomic::Ordering::SeqCst);
+    // 换了时区之后第一件事是结算一个请求，在一条不属于运行时的线程上
+    let rec = b.rec.clone();
+    std::thread::spawn(move || {
+        for e in request(3, "plain", ms(NOON), 10) {
+            rec.blocking_lock().on_event(&e);
+        }
+    })
+    .join()
+    .unwrap();
+    let mut seen = 0;
+    for _ in 0..100 {
+        seen = used(&b);
+        if seen == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen, 3, "西五区的今天：三个请求都在里面");
+}

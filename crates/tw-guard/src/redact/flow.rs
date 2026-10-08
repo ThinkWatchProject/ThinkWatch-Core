@@ -128,25 +128,51 @@ pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) 
 /// 请求），改过的这一份接着原文那本账编，同一个值还是同一个号，新出现的值接着往后编。
 /// 不在替换档时账本是空的，`seed` 用不上。
 pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
-    let empty = || Ledger::new(Scheme::SECRET);
+    let l = look_hits(mode, rules, body, seed);
+    (l.found, l.ledger)
+}
+
+/// [`look_from`] 的结果，连同找到的那些命中。
+#[derive(Debug, Clone)]
+pub struct Look {
+    /// 报出去的记录（见 [`look`]）
+    pub found: Vec<Finding>,
+    /// 这个请求的账本。不在替换档时是空的
+    pub ledger: Ledger,
+    /// 这一遍在 `body` 上找到的命中（同 [`hits`]，区间是 `body` 里的）。没找的是 `None`：
+    /// 关着、一条规则都没开、不是 UTF-8。
+    ///
+    /// 同一份正文之后还要再找一遍的调用方（桌面版落盘前打码）拿它省掉那一遍：规则一样、
+    /// 正文一样，找出来的就一样
+    pub hits: Option<Vec<Hit>>,
+}
+
+/// [`look_from`]，把找到的命中一起交回去（见 [`Look::hits`]）。
+pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> Look {
+    let empty = || Look {
+        found: Vec::new(),
+        ledger: Ledger::new(Scheme::SECRET),
+        hits: None,
+    };
     if !mode.detects() || rules.is_empty() {
-        return (Vec::new(), empty());
+        return empty();
     }
     let Ok(text) = std::str::from_utf8(body) else {
-        return (Vec::new(), empty());
+        return empty();
     };
     let hits = hits(text, rules);
     let found = crate::redact::rules::findings(text, &hits);
-    if !mode.acts() {
-        return (found, empty());
-    }
-    let seed = seed.avoiding(text);
-    let ledger = if hits.is_empty() {
-        seed
+    let ledger = if !mode.acts() {
+        Ledger::new(Scheme::SECRET)
     } else {
-        crate::redact::replace::apply(text, &hits, seed).ledger
+        // 只要账本：换过的那一份在每一跳发出去之前才写（见 `replace`），这里不抄一份
+        crate::redact::replace::number(text, &hits, seed.avoiding(text))
     };
-    (found, ledger)
+    Look {
+        found,
+        ledger,
+        hits: Some(hits),
+    }
 }
 
 /// 替换档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`look`]）。返回换过的体和
@@ -396,6 +422,43 @@ mod tests {
         // 观察档不编号，种子也用不上
         let (_, l) = look_from(Mode::Observe, &RuleSet::defaults(), &body(), seed);
         assert!(l.is_empty());
+    }
+
+    /// 看一遍只编号、不抄一份：账本和真换一遍得到的一样（让开原文里写着的占位符、同一个值
+    /// 一个号），交回的命中就是 [`hits`] 找到的
+    #[test]
+    fn looking_numbers_like_replacing_and_hands_back_its_hits() {
+        let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let body = format!(
+            r#"{{"system":"<<TW_SECRET_1>> {KEY}","messages":[{{"content":"{other} {KEY}"}}]}}"#
+        );
+        let rules = RuleSet::defaults();
+        let l = look_hits(Mode::Enforce, &rules, body.as_bytes(), fresh());
+        let found = hits(&body, &rules);
+        assert_eq!(found.len(), 3);
+        assert_eq!(l.hits.as_deref(), Some(&found[..]));
+        let replaced = crate::redact::replace::apply(&body, &found, fresh().avoiding(&body));
+        assert_eq!(l.ledger.table(), replaced.ledger.table());
+        assert_eq!(l.ledger.len(), 2);
+        assert_eq!((l.found.clone(), l.ledger.table().clone()), {
+            let (f, ledger) = look(Mode::Enforce, &rules, body.as_bytes());
+            (f, ledger.table().clone())
+        });
+        // 观察档照样找、照样交回命中，只是不编号
+        let o = look_hits(Mode::Observe, &rules, body.as_bytes(), fresh());
+        assert_eq!((o.found, o.hits), (l.found, l.hits));
+        assert!(o.ledger.is_empty());
+        // 关着的、不是 UTF-8 的不找
+        assert!(
+            look_hits(Mode::Off, &rules, body.as_bytes(), fresh())
+                .hits
+                .is_none()
+        );
+        assert!(
+            look_hits(Mode::Enforce, &rules, &[0xff, 0xfe], fresh())
+                .hits
+                .is_none()
+        );
     }
 
     /// 连接串里的占位符长得像口令，可它不是凭据：不再换一次、不报、原样留着

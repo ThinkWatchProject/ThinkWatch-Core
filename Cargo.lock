@@ -3252,6 +3252,7 @@ dependencies = [
 name = "tw-dialect"
 version = "0.64.1"
 dependencies = [
+ "memchr",
  "serde",
  "serde_json",
 ]
@@ -3287,6 +3288,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "memchr",
  "rand 0.10.2",
  "reqwest",
  "rustls",
@@ -3324,6 +3326,7 @@ version = "0.64.1"
 dependencies = [
  "base64",
  "bytes",
+ "memchr",
  "regex",
  "serde",
  "serde_json",
@@ -3424,6 +3427,7 @@ dependencies = [
 name = "tw-watch"
 version = "0.64.1"
 dependencies = [
+ "libc",
  "notify",
  "tempfile",
  "thiserror",

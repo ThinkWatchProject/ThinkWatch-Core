@@ -64,6 +64,9 @@ struct Asked<'r> {
     body: &'r Bytes,
     path: &'r str,
     decoded: Option<&'r Result<tw_dialect::convert::Decoded, tw_dialect::ir::Rejection>>,
+    /// `body` 解得开（是 JSON）：客户端的原话照管线开头解的那一遍，插件改过的那一份是
+    /// 网关自己写出来的，一定解得开
+    json: bool,
 }
 
 impl<'r> Asked<'r> {
@@ -77,11 +80,13 @@ impl<'r> Asked<'r> {
                 body: &r.body,
                 path: &r.path,
                 decoded: r.decoded.as_ref(),
+                json: true,
             },
             None => Asked {
                 body: &req.body,
                 path: req.uri.path(),
                 decoded: reading.decoded.as_ref(),
+                json: reading.json,
             },
         }
     }
@@ -402,15 +407,17 @@ pub(super) async fn try_upstreams<'a>(
         let model = Some(plugged.model.clone().unwrap_or(sent)).filter(asked_other);
 
         let asked = Asked::of(req, reading, &plugged);
-        let out = match prepare(
-            state,
-            req,
-            reading,
-            &asked,
-            provider,
-            &effective_set,
-            Some(id),
-        ) {
+        let out = match super::heavy(asked.body, || {
+            prepare(
+                state,
+                req,
+                reading,
+                &asked,
+                provider,
+                &effective_set,
+                Some(id),
+            )
+        }) {
             Ok(out) => out,
             Err(err) => {
                 chain.push(hop_failed(
@@ -424,8 +431,6 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
 
-        // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
-        let unsealed = unseal_upfront(state, req, started, provider, &out);
         // 出站脱敏的拦截档：换掉**这一跳真正发出去的那一份**（可能转换过
         // 格式）。规则是全局的，每一跳换掉的是同一批东西；**接着原文那本账换**，
         // 同一个值在每一跳、在存下来的那份请求里都是同一个占位符。插件改过的一跳接着
@@ -434,8 +439,19 @@ pub(super) async fn try_upstreams<'a>(
             .rewritten
             .as_ref()
             .map_or(&started.ledger, |r| &r.ledger);
-        let (body, ledger) =
-            crate::guard::replace(rt.config.security.redact.mode, &rt.redact, unsealed, seed);
+        let (body, ledger) = super::heavy(&out.body, || {
+            // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
+            let unsealed = unseal_upfront(state, req, started, provider, &out);
+            // 发出去的就是客户端原文的那些字节（同格式直通、一个字节都没改）：开头那一遍在
+            // 它上面找到的就是这一跳要换的，不再找一遍
+            let known = started.hits.as_deref().filter(|_| {
+                plugged.rewritten.is_none()
+                    && unsealed.as_ptr() == req.body.as_ptr()
+                    && unsealed.len() == req.body.len()
+            });
+            let mode = rt.config.security.redact.mode;
+            crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known)
+        });
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
         // 之前拿到**：OAuth 换 token 也要走这条代理。
@@ -1133,6 +1149,7 @@ fn successor<'r>(
         body: &req.body,
         path: req.uri.path(),
         decoded: reading.decoded.as_ref(),
+        json: reading.json,
     };
     rest.any(|name| {
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
@@ -1232,8 +1249,11 @@ fn prepare(
             } else if provider.forward_client_identity {
                 out
             } else {
-                // 客户端自动填的身份字段不发（见 `egress` 模块）。**不算丢弃的字段**
+                // 客户端自动填的身份字段不发（见 `egress` 模块）。**不算丢弃的字段**。按字节
+                // 剪，要请求体解得开：上面几步要么原样交回、要么照解出来的写回，解不开的照旧
+                // 解不开、原样发
                 client_dialect
+                    .filter(|_| asked.json)
                     .and_then(|d| crate::egress::strip_body_identity(d, &out))
                     .unwrap_or(out)
             };

@@ -125,7 +125,7 @@ async fn world(mode: &str) -> World {
             tw_store::Blobs::new(blobs.clone()),
             tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
         ),
-        gw.bus.subscribe(),
+        gw.bus.record_feed().unwrap(),
         rx,
     );
     let state = ControlState {
@@ -212,8 +212,15 @@ fn files(root: &std::path::Path) -> Vec<(String, String)> {
             .flatten()
             .flatten()
         {
-            let text = String::from_utf8_lossy(&std::fs::read(f.path()).unwrap()).to_string();
-            out.push((f.file_name().to_string_lossy().to_string(), text));
+            let name = f.file_name().to_string_lossy().to_string();
+            // 正文先写进 `.tmp` 再改名：还在写的那份不算，列目录之后才改名走的也跳过
+            if name.ends_with(".tmp") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(f.path()) else {
+                continue;
+            };
+            out.push((name, String::from_utf8_lossy(&bytes).to_string()));
         }
     }
     out

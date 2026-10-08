@@ -87,7 +87,7 @@ async fn every_route_and_rule_counts_what_went_through_it_including_denials() {
     std::fs::write(&p, &text).unwrap();
     let cfg: tw_config::Config = serde_yaml_ng::from_str(&text).unwrap();
     let gw = tw_gateway::AppState::new(cfg).unwrap();
-    // 和 twcore 一样：存储层订阅总线，事件落库
+    // 和 twcore 一样：存储层从总线给它的那条通道收事件，落库
     let (_bodies, rx) = tokio::sync::mpsc::channel(8);
     let store = tw_store::task::spawn(
         tw_store::Recorder::new(
@@ -95,7 +95,7 @@ async fn every_route_and_rule_counts_what_went_through_it_including_denials() {
             tw_store::Blobs::new(d.path().join("blobs")),
             tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
         ),
-        gw.bus.subscribe(),
+        gw.bus.record_feed().unwrap(),
         rx,
     );
     let state = ControlState {
@@ -187,7 +187,7 @@ async fn a_store_with_no_history_yet_says_nothing_is_covered() {
             tw_store::Blobs::new(d.path().join("blobs")),
             tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
         ),
-        gw.bus.subscribe(),
+        gw.bus.record_feed().unwrap(),
         rx,
     );
     let state = ControlState {

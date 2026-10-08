@@ -18,11 +18,16 @@
 //!
 //! 几百轮的会话，每个请求几 MB。每份正文读一次、解析一次，读完这一轮就丢；从一个请求留到
 //! 下一个的只有每条消息 16 字节的指纹和系统提示。
+//!
+//! **读过的不再读**（[`Cache`]）：界面开着一次会话时，每来一轮就要一次，从头读的话，两百轮
+//! 的会话每来一轮就要读、解析几百 MB。记着最近几次会话读到了哪儿（读完时的 [`Chain`] 和读出
+//! 来的几轮），下一次只读新来的请求。只记定下来的那一截：正文还可能变的那几轮每次都重读。
 
 mod answer;
 mod read;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tw_api::{TranscriptGap, TranscriptMessage, TranscriptPart, TranscriptRole, TranscriptTurn};
@@ -33,29 +38,207 @@ use crate::db::RequestRow;
 use crate::search::text::{client_dialect, dialect_of};
 use read::{Input, Piece, Role};
 
-/// 读成一段对话。`rows` 是这次会话的请求，和会话详情同样的顺序
+/// 一轮结束这么久之后就定下来了：它的正文要么已经在盘上，要么不会再来。正文和那一行各走
+/// 各的路落盘（见 `crate::task`），先后差不了几毫秒，排队排得再久也到不了这么久
+const SETTLE_MS: i64 = 120_000;
+
+/// 记着最近几次会话读到了哪儿。一次几百轮的会话记下的是几 MB 的文字
+const CACHED: usize = 4;
+
+/// 整段读一遍，不记。`rows` 是这次会话的请求，和会话详情同样的顺序
 /// （[`crate::Db::session_requests`]）。
 ///
 /// **已脱敏**，和请求详情里的正文同一套打码（`tw_secret::mask_body`）。
 pub fn build(session: &str, rows: &[RequestRow], blobs: &Blobs) -> tw_api::Transcript {
-    let mut t = tw_api::Transcript {
-        session: session.to_string(),
-        system: None,
-        turns: Vec::with_capacity(rows.len()),
-    };
-    let mut chain = Chain::default();
-    for row in rows {
-        chain.turn(row, blobs, &mut t);
+    Cache::default().read(
+        blobs,
+        &Ask {
+            session,
+            rows,
+            from_turn: 0,
+            running: None,
+            now_ms: i64::MAX,
+        },
+    )
+}
+
+/// 要读哪一次会话、交出去哪几轮（见 [`Cache::read`]）。
+pub struct Ask<'a> {
+    pub session: &'a str,
+    /// 这次会话的请求，和会话详情同样的顺序（[`crate::Db::session_requests`]）
+    pub rows: &'a [RequestRow],
+    /// 只交出从这一轮起的那些（从 0 数）。0 是整段
+    pub from_turn: usize,
+    /// 这次会话里还在跑的请求里最早开始的那个：（开始的时刻，请求号）。它落库时排在开始的
+    /// 那一刻，不一定排在最后：排在它后面的几轮还没定下来（见
+    /// [`tw_api::Transcript::settled_turns`]）
+    pub running: Option<(i64, i64)>,
+    /// 此刻，Unix 毫秒
+    pub now_ms: i64,
+}
+
+/// 最近几次会话读到了哪儿（见 [`Cache::read`]）。存储层一份（[`crate::Recorder::transcripts`]）。
+#[derive(Default)]
+pub struct Cache {
+    kept: std::sync::Mutex<Kept>,
+}
+
+#[derive(Default)]
+struct Kept {
+    /// 正文回收每删掉一次东西就加一。读到一半它变了的，读出来的就不记
+    generation: u64,
+    /// 最近用过的在最后
+    sessions: Vec<(String, Arc<Progress>)>,
+}
+
+/// 一次会话读到了哪儿：读过的那几个请求，读完它们时的 [`Chain`]，读出来的几轮（没打码）。
+#[derive(Clone, Default)]
+struct Progress {
+    ids: Vec<i64>,
+    chain: Chain,
+    doc: Doc,
+}
+
+/// 读出来的东西：系统提示和每一轮。**没打码**：前后比对、换工具调用的号都要原文
+#[derive(Clone, Default)]
+struct Doc {
+    system: Option<String>,
+    turns: Vec<TranscriptTurn>,
+}
+
+impl Cache {
+    /// 正文回收删掉了东西：记着的都不作数了
+    pub fn invalidate(&self) {
+        let mut k = self.kept();
+        k.generation += 1;
+        k.sessions.clear();
     }
-    mask(&mut t);
-    t
+
+    /// 锁中毒了照样用里面的：记着的东西坏不了谁，最多重读一遍
+    fn kept(&self) -> std::sync::MutexGuard<'_, Kept> {
+        self.kept.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 读成一段对话。**已脱敏**，和请求详情里的正文同一套打码（`tw_secret::mask_body`）。
+    ///
+    /// **接着上次读到的地方往下读**：记着的那几个请求还是这次会话开头的那几个，就只读后面
+    /// 新来的；中间插进来一个（开始得早、结束得晚的请求）、开头的过期删掉了，都从头读。
+    /// 记下的是定下来的那一截：最后几轮的正文可能还在路上，它们下一次还要重读。
+    pub fn read(&self, blobs: &Blobs, ask: &Ask) -> tw_api::Transcript {
+        let (generation, kept) = {
+            let mut k = self.kept();
+            let kept = k
+                .sessions
+                .iter()
+                .position(|(s, _)| s == ask.session)
+                .map(|i| {
+                    let hit = k.sessions.remove(i);
+                    let p = hit.1.clone();
+                    k.sessions.push(hit);
+                    p
+                });
+            (k.generation, kept)
+        };
+        let base = kept
+            .filter(|p| {
+                p.ids.len() <= ask.rows.len()
+                    && p.ids.iter().zip(ask.rows).all(|(id, row)| *id == row.id)
+            })
+            .unwrap_or_default();
+        let fresh = &ask.rows[base.ids.len()..];
+        // 定下来的那一截有多长。记着的那一截本来就是定下来的
+        let (whole, settled) = if fresh.is_empty() {
+            let n = base.ids.len();
+            (base, n)
+        } else {
+            let (whole, keep) = continue_reading(&base, fresh, blobs, ask.now_ms);
+            let n = keep.ids.len();
+            self.keep(ask.session, generation, keep);
+            (whole, n)
+        };
+
+        let total = whole.doc.turns.len();
+        // 后面的请求还会改写的那一轮：最后一个读得懂的请求的回答（见 `same_calls`）
+        let rewritable = match whole.chain.last {
+            Some((at, true)) => at,
+            _ => total,
+        };
+        let before_running = ask.running.map_or(total, |r| {
+            ask.rows.partition_point(|row| (row.at_ms, row.id) < r)
+        });
+        let from = ask.from_turn.min(total);
+        let mut t = tw_api::Transcript {
+            session: ask.session.to_string(),
+            system: whole.doc.system.clone(),
+            total_turns: total as u32,
+            settled_turns: settled.min(rewritable).min(before_running) as u32,
+            turns: whole.doc.turns[from..].to_vec(),
+        };
+        mask(&mut t);
+        t
+    }
+
+    /// 记下一次会话读到的地方。正文回收在这期间删过东西的不记：读的时候它们可能还在
+    fn keep(&self, session: &str, generation: u64, p: Arc<Progress>) {
+        let mut k = self.kept();
+        if k.generation != generation {
+            return;
+        }
+        k.sessions.retain(|(s, _)| s != session);
+        k.sessions.push((session.to_string(), p));
+        if k.sessions.len() > CACHED {
+            k.sessions.remove(0);
+        }
+    }
+}
+
+/// 从 `base` 读到的地方接着读 `fresh`。返回读完的样子，和其中定下来的那一截（要记下的）。
+///
+/// 一轮定下来了：它结束得够久（[`SETTLE_MS`]），或者它什么都不缺。还缺着正文、又刚结束的
+/// 那一轮，正文可能还在路上；从它起都不算定下来。
+fn continue_reading(
+    base: &Progress,
+    fresh: &[RequestRow],
+    blobs: &Blobs,
+    now_ms: i64,
+) -> (Arc<Progress>, Arc<Progress>) {
+    let mut p = base.clone();
+    let mut settled: Option<Progress> = None;
+    for row in fresh {
+        let ended = row.at_ms.saturating_add(row.duration_ms.unwrap_or(0));
+        let recent = now_ms.saturating_sub(ended) < SETTLE_MS;
+        // 这一个可能定不下来：先留着读它之前的样子。读它只会改它自己和上一个读得懂的那一轮
+        let before = (settled.is_none() && recent).then(|| {
+            let last = p.chain.last.map(|(at, _)| (at, p.doc.turns[at].clone()));
+            (p.chain.clone(), p.doc.system.clone(), last)
+        });
+        p.chain.turn(row, blobs, &mut p.doc);
+        p.ids.push(row.id);
+        if let Some((chain, system, last)) = before
+            && p.doc.turns.last().is_some_and(|t| !t.gaps.is_empty())
+        {
+            let n = p.ids.len() - 1;
+            let mut turns = p.doc.turns[..n].to_vec();
+            if let Some((at, turn)) = last {
+                turns[at] = turn;
+            }
+            settled = Some(Progress {
+                ids: p.ids[..n].to_vec(),
+                chain,
+                doc: Doc { system, turns },
+            });
+        }
+    }
+    let p = Arc::new(p);
+    let settled = settled.map_or_else(|| p.clone(), Arc::new);
+    (p, settled)
 }
 
 /// 一条消息比对用的指纹
 type Fp = [u8; 16];
 
 /// 读到哪儿了：上一个读得懂的请求留下来的东西。
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Chain {
     /// 它的每条消息的指纹（只有推理的消息不比，不在里面）。还没有读得懂的请求是 None
     prev: Option<Vec<Fp>>,
@@ -68,7 +251,7 @@ struct Chain {
 }
 
 impl Chain {
-    fn turn(&mut self, row: &RequestRow, blobs: &Blobs, t: &mut tw_api::Transcript) {
+    fn turn(&mut self, row: &RequestRow, blobs: &Blobs, t: &mut Doc) {
         let mut turn = TranscriptTurn {
             id: row.id.to_string(),
             restart: false,
@@ -119,7 +302,7 @@ impl Chain {
         client: Dialect,
         v: &Value,
         turn: &mut TranscriptTurn,
-        t: &mut tw_api::Transcript,
+        t: &mut Doc,
         freeform: &mut HashSet<String>,
     ) {
         let read::Body {
@@ -1844,6 +2027,239 @@ mod tests {
         assert!(t.turns[0].output.is_empty() && t.turns[0].gaps.is_empty());
     }
 
+    // ───────────────────────────────────────────────── 读过的不再读
+
+    /// 很久以后的此刻：每一轮都早就结束了
+    const LATER: i64 = NOW + 86_400_000;
+
+    impl Disk {
+        /// 用 `cache` 读：从 `from_turn` 起，此刻是 `now_ms`
+        fn read(&self, cache: &Cache, from_turn: usize, now_ms: i64) -> Transcript {
+            self.read_running(cache, from_turn, None, now_ms)
+        }
+
+        fn read_running(
+            &self,
+            cache: &Cache,
+            from_turn: usize,
+            running: Option<(i64, i64)>,
+            now_ms: i64,
+        ) -> Transcript {
+            let rows = self.db.session_requests("s").unwrap();
+            cache.read(
+                &self.blobs,
+                &Ask {
+                    session: "s",
+                    rows: &rows,
+                    from_turn,
+                    running,
+                    now_ms,
+                },
+            )
+        }
+
+        /// 第 `id` 轮结束之后过了 `ms` 毫秒（`row` 给的每一轮都跑了 4 秒）
+        fn after(&self, id: i64, ms: i64) -> i64 {
+            NOW + id * 1000 + 4000 + ms
+        }
+    }
+
+    /// 一段带工具调用的对话：第 `k` 轮的请求和回答。回答里工具调用的号和客户端记下的不一样
+    /// （转换过格式的上游就是这样）：读下一轮时，上一轮回答里的号换成客户端的那个
+    fn claude_turn(k: usize) -> (Value, Vec<u8>) {
+        let mut messages = vec![user("把 bug 修了")];
+        for i in 0..k {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "text", "text": format!("读 {i}")},
+                {"type": "tool_use", "id": format!("t{i}"), "name": "Read", "input": {"n": i}}]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("t{i}"), "content": format!("文件 {i}")}]}));
+        }
+        let answer = anthropic_stream(&[
+            json!({"type": "text", "text": format!("读 {k}")}),
+            json!({"type": "tool_use", "id": format!("up{k}"), "name": "Read", "input": {"n": k}}),
+        ]);
+        (anthropic(&messages), answer)
+    }
+
+    /// **接着读和从头读是同一段对话**：每来一轮读一次，每一次都和整段从头读的一样；只要
+    /// 后面几轮的，就是整段的那一截。中间夹着一个数 token 的调用
+    #[test]
+    fn reading_on_from_where_it_stopped_gives_what_reading_it_all_gives() {
+        let mut d = Disk::new();
+        let cache = Cache::default();
+        for k in 0..8 {
+            let (request, answer) = claude_turn(k);
+            d.turn("/v1/messages", &request, &answer);
+            if k == 3 {
+                d.turn("/v1/messages/count_tokens", &request, b"{}");
+            }
+            let full = d.transcript();
+            let got = d.read(&cache, 0, LATER);
+            assert_eq!(got.turns, full.turns, "第 {k} 轮");
+            assert_eq!(got.system, full.system);
+            assert_eq!(got.total_turns as usize, full.turns.len());
+            assert!(got.turns.iter().skip(1).all(|t| !t.restart), "{got:?}");
+            // 上一轮回答里的号换成了客户端记下的，最后一轮的还是上游给的
+            if k > 0 {
+                let ids = |t: &TranscriptTurn| -> Vec<String> {
+                    t.output
+                        .iter()
+                        .filter_map(|p| match p {
+                            P::ToolCall { id, .. } => Some(id.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let answered: Vec<Vec<String>> = got
+                    .turns
+                    .iter()
+                    .map(ids)
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                assert_eq!(answered[k - 1], [format!("t{}", k - 1)]);
+                assert_eq!(answered[k], [format!("up{k}")]);
+            }
+            for from in [0, 1, full.turns.len() - 1, full.turns.len(), 99] {
+                let part = d.read(&cache, from, LATER);
+                assert_eq!(
+                    part.turns,
+                    full.turns[from.min(full.turns.len())..],
+                    "{from}"
+                );
+                assert_eq!(part.total_turns, got.total_turns);
+            }
+        }
+    }
+
+    /// **读过的不再读，正文回收之后才重读。**读过一遍之后正文没了（这里直接删掉），记着的
+    /// 照样交出去 —— 说明它真的没再去读；作废之后重读，那几轮说出缺了什么
+    #[test]
+    fn what_was_read_is_not_read_again_until_bodies_are_reclaimed() {
+        let mut d = Disk::new();
+        let cache = Cache::default();
+        for k in 0..2 {
+            let (request, answer) = claude_turn(k);
+            d.turn("/v1/messages", &request, &answer);
+        }
+        let first = d.read(&cache, 0, LATER);
+        assert!(first.turns.iter().all(|t| t.gaps.is_empty()), "{first:?}");
+        // 整天的正文都删掉：两天之后、只留一天
+        d.blobs.gc(NOW + 2 * 86_400_000, 1, u64::MAX);
+        assert!(d.blobs.get(NOW + 1000, 1, Which::Request).is_none());
+        assert_eq!(d.read(&cache, 0, LATER), first, "记着的没用上");
+
+        cache.invalidate();
+        let again = d.read(&cache, 0, LATER);
+        for t in &again.turns {
+            assert_eq!(
+                t.gaps,
+                [Gap::RequestMissing, Gap::ResponseMissing],
+                "{again:?}"
+            );
+        }
+    }
+
+    /// 刚结束、回答还没落盘的那一轮**不记下**：回答一落盘，下一次就读得到，后面那一轮跟着
+    /// 对得上（上一轮的回答交出去了，它的输入里不再重复那条助手消息）。结束得够久还缺着的，
+    /// 就是真的缺了
+    #[test]
+    fn a_turn_whose_answer_is_still_on_its_way_is_read_again() {
+        let mut d = Disk::new();
+        let cache = Cache::default();
+        let (r0, a0) = claude_turn(0);
+        d.turn("/v1/messages", &r0, &a0);
+        let (r1, a1) = claude_turn(1);
+        let id = d.put(
+            "/v1/messages",
+            Some(r1.to_string().as_bytes()),
+            None,
+            |_| {},
+        );
+        let now = d.after(id, 500);
+
+        let t = d.read(&cache, 0, now);
+        assert_eq!(t.turns[1].gaps, [Gap::ResponseMissing]);
+        assert_eq!(t.settled_turns, 1, "回答还在路上的那一轮算定下来了");
+        // 下一轮来了，回答还没到
+        let (r2, a2) = claude_turn(2);
+        d.turn("/v1/messages", &r2, &a2);
+        let t = d.read(&cache, 0, d.after(id + 1, 500));
+        assert_eq!(t.turns[1].gaps, [Gap::ResponseMissing]);
+        assert_eq!(t.settled_turns, 1);
+
+        // 回答落盘了：重读那一轮，和从头读的一样
+        assert!(d.blobs.put(NOW + id * 1000, id, Which::Response, &a1));
+        let t = d.read(&cache, 0, d.after(id + 1, 600));
+        assert_eq!(t.turns, d.transcript().turns);
+        assert!(t.turns.iter().all(|x| x.gaps.is_empty()), "{t:?}");
+        assert_eq!(t.total_turns, 3);
+        // 最后一轮的回答下一轮还会改写（工具调用的号），它还不算定下来
+        assert_eq!(t.settled_turns, 2);
+
+        // 回答一直没来：结束得够久之后它就是缺了，算定下来
+        let (r3, _) = claude_turn(3);
+        let late = d.put(
+            "/v1/messages",
+            Some(r3.to_string().as_bytes()),
+            None,
+            |_| {},
+        );
+        let t = d.read(&cache, 0, d.after(late, 1000));
+        assert_eq!(t.settled_turns, 3);
+        let t = d.read(&cache, 0, d.after(late, SETTLE_MS));
+        assert_eq!(t.turns[3].gaps, [Gap::ResponseMissing]);
+        assert_eq!(t.settled_turns, 4, "缺着回答的最后一轮不会再被改写");
+    }
+
+    /// 定下来的几轮也要排在还在跑的请求前面：一个开始得早、结束得晚的请求落库时插在它开始的
+    /// 那一刻，它后面的几轮都要往后挪一格
+    #[test]
+    fn turns_after_a_request_still_running_are_not_settled() {
+        let mut d = Disk::new();
+        let cache = Cache::default();
+        for k in 0..3 {
+            let (request, answer) = claude_turn(k);
+            d.turn("/v1/messages", &request, &answer);
+        }
+        let t = d.read(&cache, 0, LATER);
+        assert_eq!((t.total_turns, t.settled_turns), (3, 2));
+        // 第二轮之前开始的一个请求还在跑
+        let t = d.read_running(&cache, 0, Some((NOW + 2 * 1000 - 1, 99)), LATER);
+        assert_eq!(t.settled_turns, 1);
+        // 在最后一轮之后开始的不碍事
+        let t = d.read_running(&cache, 0, Some((NOW + 10_000, 99)), LATER);
+        assert_eq!(t.settled_turns, 2);
+    }
+
+    /// 一个请求插进了读过的几轮中间（开始得早、结束得晚）：记着的那一截对不上了，从头读
+    #[test]
+    fn a_request_landing_between_turns_already_read_is_read_from_the_start() {
+        let mut d = Disk::new();
+        let cache = Cache::default();
+        let (r0, a0) = claude_turn(0);
+        let (r1, a1) = claude_turn(1);
+        let (r2, a2) = claude_turn(2);
+        d.turn("/v1/messages", &r0, &a0);
+        d.turn("/v1/messages", &r2, &a2);
+        d.read(&cache, 0, LATER);
+        // 第二轮开始在前两轮之间，结束在它们之后
+        d.put(
+            "/v1/messages",
+            Some(r1.to_string().as_bytes()),
+            Some(&a1),
+            |r| r.at_ms = NOW + 1500,
+        );
+        let got = d.read(&cache, 0, LATER);
+        let full = d.transcript();
+        assert_eq!(got.turns, full.turns);
+        assert_eq!(
+            got.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["1", "3", "2"]
+        );
+        assert!(got.turns.iter().all(|t| !t.restart), "{got:?}");
+    }
+
     // ───────────────────────────────────────────────── 量一量
 
     /// 读一次几百轮的会话要多久：照 Claude Code 的样子造一段 300 轮的对话，每一轮的请求带着
@@ -1928,5 +2344,34 @@ mod tests {
                     .all(|x| x.gaps.is_empty() && x.output.len() == 3)
             );
         }
+
+        // 界面开着这次会话：读过前 299 轮，第 300 轮来了
+        let cache = Cache::default();
+        let read = |rows: &[RequestRow], from_turn| {
+            let t0 = std::time::Instant::now();
+            let t = cache.read(
+                &d.blobs,
+                &Ask {
+                    session: "s",
+                    rows,
+                    from_turn,
+                    running: None,
+                    now_ms: i64::MAX,
+                },
+            );
+            (t0.elapsed(), t)
+        };
+        let (took, before) = read(&rows[..rows.len() - 1], 0);
+        eprintln!("first read of {} turns: {took:?}", before.total_turns);
+        let (took, whole) = read(&rows, 0);
+        eprintln!("one more turn, whole transcript again: {took:?}");
+        assert_eq!(whole.turns, build("s", &rows, &d.blobs).turns);
+        let (took, tail) = read(&rows, before.settled_turns as usize);
+        eprintln!(
+            "one more turn, from settled_turns ({}): {took:?}, {} turns, {} KB of JSON",
+            before.settled_turns,
+            tail.turns.len(),
+            serde_json::to_string(&tail).unwrap().len() / 1000
+        );
     }
 }

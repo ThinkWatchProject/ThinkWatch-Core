@@ -207,6 +207,20 @@ pub fn apply(text: &str, hits: &[Hit], mut ledger: Ledger) -> Redacted {
     Redacted { text: out, ledger }
 }
 
+/// 只编号、不抄：[`apply`] 会给 `hits` 发的那些号，不写出换过的那一份。只要账本时用它
+/// （拦截档下看一遍客户端原文，见 [`crate::redact::flow::look`]）—— 换过的那一份在每一跳
+/// 发出去之前才写。
+pub(crate) fn number(text: &str, hits: &[Hit], mut ledger: Ledger) -> Ledger {
+    let default = ledger.scheme.label;
+    for h in hits {
+        ledger.issue(
+            &text[h.bytes.clone()],
+            h.label.as_deref().unwrap_or(default),
+        );
+    }
+    ledger
+}
+
 /// 扫 + 换，一步到位。`text` 是 JSON 请求体（见 [`crate::redact::rules::scan`]）。
 pub fn redact(text: &str, rules: &RuleSet, ledger: Ledger) -> Redacted {
     let hits = crate::redact::rules::scan(text, rules);
