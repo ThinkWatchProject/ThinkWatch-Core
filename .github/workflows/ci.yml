@@ -74,12 +74,9 @@ jobs:
           cargo run -p tw-api --features ts --example export_ts -- "$RUNNER_TEMP/tw-api-ts"
           npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 "$RUNNER_TEMP/tw-api-ts/tw-api.ts"
 
-      - name: Build
-        run: cargo build --release -p twcore
-
       # **接缝上的失败模式单元测试看不见**：文件权限、socket、某个端点
       # 在真二进制上根本没注册。这个项目的前四个真 bug 都是这么被逮到的。
-      # 脚本自己会 build，这一步只是跑它。
+      # 脚本自己会 build（debug 版，见脚本），这一步只是跑它。
       - name: Smoke (real binary, real socket, real data plane)
         run: ./scripts/smoke.sh
 
@@ -254,10 +251,9 @@ jobs:
         shell: bash
         run: bash scripts/wasm-toolchain.sh record target
 
-      # **debug 版就够了。**这一步证明的是它起得来、握手是唯一的门，和优化级别
-      # 无关；release 版每次 PR 都要多编四分钟，这个任务本来就是最慢的那个。
-      # 内存、延迟这些资源目标要 release 版才量得准，那在 macOS 和 Linux 的
-      # smoke 里量；发出去的 release 版由 release.yml 在发版时自己跑一遍
+      # **debug 版就够了**，和 macOS、Linux 的 smoke 一样：这一步证明的是它起得来、
+      # 握手是唯一的门，和优化级别无关；release 版每次 PR 都要多编四分钟。发出去的
+      # release 版由 release.yml 在发版时自己跑一遍
       - name: Build
         run: cargo build -p twcore
 
