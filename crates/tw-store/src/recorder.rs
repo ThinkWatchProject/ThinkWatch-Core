@@ -808,16 +808,15 @@ impl Recorder {
         }
     }
 
-    /// 定期回收。**返回删了多少字节**，调用方记一行日志就够了。
-    pub fn gc(&self, now_ms: i64, keep_days: u64, metadata_keep_days: u64, max_bytes: u64) -> u64 {
-        let freed = self.blobs.gc(now_ms, keep_days, max_bytes);
-        let cutoff = now_ms - (metadata_keep_days as i64) * 86_400_000;
+    /// 删掉过期的记录行（`keep_days` 天以前的）。正文的回收不在这里：它不需要这把锁，见
+    /// [`crate::task::gc`]。
+    pub fn prune(&self, now_ms: i64, keep_days: u64) {
+        let cutoff = now_ms - (keep_days as i64) * 86_400_000;
         match self.db.prune_before(cutoff) {
             Ok(n) if n > 0 => tracing::info!(rows = n, "cleaned up expired request rows"),
             Err(e) => tracing::debug!("the request rows could not be cleaned up: {e}"),
             _ => {}
         }
-        freed
     }
 }
 
@@ -2327,8 +2326,13 @@ mod cancellation_tests {
         r.db().insert(&crate::db::tests::row(1, old)).unwrap();
         r.record_body(old, 1, Which::Request, b"an old body", 11);
 
+        let shared = tokio::sync::Mutex::new(r);
+        let gc = |keep_days, metadata_keep_days| {
+            crate::task::gc(&shared, now, keep_days, metadata_keep_days, u64::MAX)
+        };
         // 正文留 7 天、记录留 90 天：正文该没了，记录还在
-        r.gc(now, 7, 90, u64::MAX);
+        gc(7, 90);
+        let r = shared.blocking_lock();
         assert_eq!(
             r.db().recent(None, 10).unwrap().len(),
             1,
@@ -2339,9 +2343,17 @@ mod cancellation_tests {
             "正文过了它自己的期限却还在"
         );
 
+        drop(r);
         // 记录的期限也到了才删行
-        r.gc(now, 7, 7, u64::MAX);
-        assert!(r.db().recent(None, 10).unwrap().is_empty());
+        gc(7, 7);
+        assert!(
+            shared
+                .blocking_lock()
+                .db()
+                .recent(None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// 总量上限是给突发准备的：按天算出来的占用取决于用量，而用量会有
@@ -2358,9 +2370,10 @@ mod cancellation_tests {
         let before = r.blobs().total_bytes();
         assert!(before > 0);
         // 一天都没过期，但总量超了 —— 从最旧的整天开始删
-        let freed = r.gc(now, 30, 30, 4096);
+        let shared = tokio::sync::Mutex::new(r);
+        let freed = crate::task::gc(&shared, now, 30, 30, 4096);
         assert!(freed > 0, "总量超了却什么都没删");
-        assert!(r.blobs().total_bytes() < before);
+        assert!(shared.blocking_lock().blobs().total_bytes() < before);
     }
 
     /// 会话里的那一轮也要看得出是取消的。否则在每轮花费里，它就是一轮

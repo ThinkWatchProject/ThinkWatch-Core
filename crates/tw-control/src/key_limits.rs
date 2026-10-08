@@ -57,10 +57,16 @@ pub fn rebuild(gw: &tw_gateway::AppState, db: &tw_store::Db) {
 pub fn follow(gw: &tw_gateway::AppState, store: Arc<tokio::sync::Mutex<tw_store::Recorder>>) {
     // 弱引用：网关的账拿着这个办法，办法再拿着账就是一个圈，谁都放不掉
     let limits = Arc::downgrade(&gw.key_limits);
+    // **接上时的运行时，记在这里**：结算在存储层自己的记录线程上，那条线程不在运行时里，在
+    // 那儿问「当前的运行时」问不到，新的一期就永远不会从记录里加回来
+    let here = tokio::runtime::Handle::try_current().ok();
     gw.key_limits
         .reread_with(Arc::new(move |m: tw_gateway::key_limits::Moved| {
             let (limits, store) = (limits.clone(), store.clone());
-            let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            let Some(rt) = here
+                .clone()
+                .or_else(|| tokio::runtime::Handle::try_current().ok())
+            else {
                 return;
             };
             rt.spawn(async move {
