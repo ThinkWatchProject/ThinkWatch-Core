@@ -93,6 +93,9 @@ pub struct Recorder {
     ///
     /// `None` 表示没人要听（测试、以及不带总线的调用方）。
     bus: Option<tw_observe::EventBus>,
+    /// 最近几次会话读成对话读到了哪儿（见 [`crate::transcript::Cache`]）。正文回收删了东西
+    /// 就作废（[`crate::task::gc`]）
+    transcripts: std::sync::Arc<crate::transcript::Cache>,
     /// 每记下一行请求就交一份 [`Settled`] 出去：密钥的用量上限拿它把预留换成实数。
     ///
     /// **直接调，不走总线。**总线上丢了事件的话，这一行也就不在库里，重启之后从库里
@@ -153,6 +156,7 @@ impl Recorder {
             pricing,
             inflight: HashMap::new(),
             bus: None,
+            transcripts: Default::default(),
             settled: None,
         }
     }
@@ -228,6 +232,12 @@ impl Recorder {
 
     pub fn blobs(&self) -> &Blobs {
         &self.blobs
+    }
+
+    /// 读对话记录用的那一份记忆（见 [`crate::transcript::Cache`]）。读的时候不拿这把锁：
+    /// 几百轮的会话要读几百份正文
+    pub fn transcripts(&self) -> std::sync::Arc<crate::transcript::Cache> {
+        self.transcripts.clone()
     }
 
     /// 记一次请求体或响应体。

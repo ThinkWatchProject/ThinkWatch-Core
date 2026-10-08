@@ -1720,28 +1720,53 @@ fn no_such_session(id: &str) -> Fail {
     )
 }
 
-/// 一次会话读成一段对话（见 `tw_store::transcript`）。
+/// 一次会话读成一段对话（见 `tw_store::transcript`）。给了 `from_turn` 的只交出从那一轮起的
+/// 那些（见 [`tw_api::Transcript::settled_turns`]）。
 ///
 /// **放到阻塞线程上跑**，库只在取行的时候锁一下：几百轮的会话要读几百份正文、解析几百 MB
-/// 的 JSON，和按正文找是同一个道理（见 [`history_search`]）—— 记录和正文落盘走的是同一把锁。
+/// 的 JSON，和按正文找是同一个道理（见 [`history_search`]）—— 记录落库走的是同一把锁。读过
+/// 的记着（`Recorder::transcripts`），下一次只读新来的那几轮。
 async fn session_transcript(
     State(s): State<ControlState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::TranscriptQuery>,
 ) -> Result<Json<tw_api::Transcript>, Fail> {
-    let store = need_store(&s)?;
-    let (rows, blobs) = {
-        let g = store.lock().await;
-        let rows = g.db().session_requests(&id).map_err(records)?;
-        // 正文目录只是一个路径，读它不需要锁
-        (rows, tw_store::Blobs::new(g.blobs().root().to_path_buf()))
-    };
-    if rows.is_empty() {
-        return Err(no_such_session(&id));
-    }
-    let transcript =
-        tokio::task::spawn_blocking(move || tw_store::transcript::build(&id, &rows, &blobs))
-            .await
-            .map_err(internal)?;
+    let store = need_store(&s)?.clone();
+    // 这次会话里还在跑的请求：落库时排在它开始的那一刻，不一定排在最后
+    let running = s
+        .gateway
+        .bus
+        .live()
+        .running
+        .into_iter()
+        .filter(|r| r.session.as_deref() == Some(id.as_str()))
+        .map(|r| (r.at_ms as i64, r.id as i64))
+        .min();
+    let from_turn = q.from_turn.unwrap_or(0) as usize;
+    let transcript = tokio::task::spawn_blocking(move || {
+        let (rows, blobs, transcripts) = {
+            let g = store.blocking_lock();
+            let rows = g.db().session_requests(&id).map_err(records)?;
+            // 正文目录只是一个路径，读它不需要锁
+            let blobs = tw_store::Blobs::new(g.blobs().root().to_path_buf());
+            (rows, blobs, g.transcripts())
+        };
+        if rows.is_empty() {
+            return Err(no_such_session(&id));
+        }
+        Ok(transcripts.read(
+            &blobs,
+            &tw_store::transcript::Ask {
+                session: &id,
+                rows: &rows,
+                from_turn,
+                running,
+                now_ms: now_ms(),
+            },
+        ))
+    })
+    .await
+    .map_err(internal)??;
     Ok(Json(transcript))
 }
 

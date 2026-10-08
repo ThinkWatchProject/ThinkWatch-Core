@@ -109,8 +109,15 @@ pub fn gc(
     metadata_keep_days: u64,
     max_bytes: u64,
 ) -> u64 {
-    let blobs = Blobs::new(shared.blocking_lock().blobs().root().to_path_buf());
+    let (blobs, transcripts) = {
+        let g = shared.blocking_lock();
+        (Blobs::new(g.blobs().root().to_path_buf()), g.transcripts())
+    };
     let freed = blobs.gc(now_ms, keep_days, max_bytes);
+    // 删掉的正文可能在记着的对话里：记着的那些作废，下次重读
+    if freed > 0 {
+        transcripts.invalidate();
+    }
     shared.blocking_lock().prune(now_ms, metadata_keep_days);
     freed
 }
@@ -119,5 +126,68 @@ pub fn gc(
 fn thread(name: &str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
         tracing::warn!("the {name} thread could not start, so it records nothing this run: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::Ask;
+
+    const NOW: i64 = 1_790_000_000_000;
+    const DAY: i64 = 86_400_000;
+
+    /// 回收删了正文，记着的对话跟着作废：之后读出来的那一轮说出缺了什么，而不是删掉之前的
+    /// 样子
+    #[test]
+    fn reclaiming_bodies_forgets_the_transcripts_read_from_them() {
+        let d = tempfile::tempdir().unwrap();
+        let rec = Recorder::new(
+            crate::Db::in_memory().unwrap(),
+            Blobs::new(d.path().join("blobs")),
+            tw_pricing::shared(tw_pricing::PriceBook::builtin().unwrap()),
+        );
+        let mut row = crate::db::tests::row(1, NOW);
+        row.session = Some("s".into());
+        rec.db().insert(&row).unwrap();
+        let request =
+            br#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#;
+        let answer = br#"{"type":"message","content":[{"type":"text","text":"hello"}]}"#;
+        rec.record_body(NOW, 1, Which::Request, request, request.len());
+        rec.record_body(NOW, 1, Which::Response, answer, answer.len());
+        let shared = Mutex::new(rec);
+        let read = || {
+            let (rows, blobs, transcripts) = {
+                let g = shared.blocking_lock();
+                (
+                    g.db().session_requests("s").unwrap(),
+                    Blobs::new(g.blobs().root().to_path_buf()),
+                    g.transcripts(),
+                )
+            };
+            transcripts.read(
+                &blobs,
+                &Ask {
+                    session: "s",
+                    rows: &rows,
+                    from_turn: 0,
+                    running: None,
+                    now_ms: NOW + 3 * DAY,
+                },
+            )
+        };
+        let first = read();
+        assert!(first.turns[0].gaps.is_empty(), "{first:?}");
+        assert!(!first.turns[0].output.is_empty());
+
+        assert!(gc(&shared, NOW + 3 * DAY, 1, 90, u64::MAX) > 0);
+        let again = read();
+        assert_eq!(
+            again.turns[0].gaps,
+            [
+                tw_api::TranscriptGap::RequestMissing,
+                tw_api::TranscriptGap::ResponseMissing
+            ]
+        );
     }
 }

@@ -4697,6 +4697,9 @@ pub struct SessionDetail {
 /// 太大的只留开头，没存下来的也有。读不到的地方，那一轮的 `gaps` 说出来。
 ///
 /// **已脱敏**，和请求详情里的正文同一套打码。图片只说类型和大小，从不带数据。
+///
+/// **可以只要后面的几轮**（[`TranscriptQuery::from_turn`]）：会话开着时每来一轮重读一次，
+/// 前面不会再变的那些（`settled_turns`）不必再传一遍。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Transcript {
@@ -4705,8 +4708,29 @@ pub struct Transcript {
     /// Gemini 的 `systemInstruction`，Chat 和 Responses 还有开头连着的 system、developer
     /// 消息，几段之间空一行。没有是 null
     pub system: Option<String>,
-    /// 和 [`SessionDetail::turns`] 同样的请求，同样的顺序
+    /// 这次会话一共几轮，就是 [`SessionDetail::turns`] 有几条。给了
+    /// [`TranscriptQuery::from_turn`] 时，`turns` 是其中从那一轮起的那些
+    pub total_turns: u32,
+    /// 开头这么多轮不会再变了：它们的正文都落了盘（或者不会再来），后面的请求不会再改写
+    /// 它们，这次会话里还在跑的请求落库时也不会排到它们前面。**下一次从这里要起**
+    /// （`from_turn = settled_turns`），留着手上的前这么多轮，换掉后面的。
+    ///
+    /// 后面那几轮还会变：最后一轮的回答可能还没落盘、工具调用的号会被下一轮换成客户端
+    /// 记下的那个、一个开始得早结束得晚的请求会插到它们中间
+    pub settled_turns: u32,
+    /// 和 [`SessionDetail::turns`] 同样的请求，同样的顺序。给了
+    /// [`TranscriptQuery::from_turn`] 的，只有从那一轮起的那些
     pub turns: Vec<TranscriptTurn>,
+}
+
+/// `GET /sessions/{id}/transcript` 的查询串。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranscriptQuery {
+    /// 只要从这一轮起的那些（从 0 数，[`Transcript::turns`] 里的第几条）。不给是整段；
+    /// 比总轮数还大的，`turns` 是空的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_turn: Option<u32>,
 }
 
 /// 对话里的一轮，就是会话里的一个请求。
