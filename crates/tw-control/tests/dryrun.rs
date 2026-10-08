@@ -804,6 +804,88 @@ async fn only_the_numbers_the_order_uses_are_shown() {
     );
 }
 
+/// 每一家的份额：`load-balance` 组里各家照此刻的数字分到的新对话的比例，加起来是 1。
+/// 界面不再自己拿权重和系数去乘 —— 那是数据面的算法，各算各的迟早对不上（停着的、满着的
+/// 哪些不参加，系数取整之后是多少）
+#[tokio::test]
+async fn each_balanced_candidate_carries_the_share_the_data_plane_gives_it() {
+    let shares = |r: &tw_api::DryRunResult| {
+        r.candidate_models
+            .iter()
+            .map(|c| (c.provider.clone(), c.share))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let weighted = CFG.replace(
+        "    providers: [官方, 中转]\n",
+        "    providers: [{ name: 官方, weight: 3 }, 中转]\n",
+    );
+
+    // 只按权重分：份额就是权重的比例
+    let (_d, app, gw) = app_and_gateway(&weighted);
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let s = shares(&r);
+    assert_eq!((s["官方"], s["中转"]), (Some(0.75), Some(0.25)), "{r:?}");
+
+    // 熔断着的这一轮不参加：没有份额，剩下的那一家拿全部
+    while gw.health.is_available("中转") {
+        gw.health.record_failure("中转");
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(r.circuit_open, ["中转"]);
+    let s = shares(&r);
+    assert_eq!((s["官方"], s["中转"]), (Some(1.0), None), "{r:?}");
+    // 全都熔断着：都参加，照权重分（数据面照样一家家试）
+    while gw.health.is_available("官方") {
+        gw.health.record_failure("官方");
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let s = shares(&r);
+    assert_eq!((s["官方"], s["中转"]), (Some(0.75), Some(0.25)), "{r:?}");
+
+    // 并发数满着的同样不参加
+    let busy = weighted.replace(
+        "    base_url: https://relay.example.com\n",
+        "    base_url: https://relay.example.com\n    max_concurrent: 1\n",
+    );
+    let (_d, app, gw) = app_and_gateway(&busy);
+    let held = gw.slots.try_take("中转").expect("中转有空位");
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    let s = shares(&r);
+    assert_eq!((s["官方"], s["中转"]), (Some(1.0), None), "{r:?}");
+    drop(held);
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    assert_eq!(shares(&r)["中转"], Some(0.25), "空出来之后回到轮里");
+
+    // 按快慢、成败分：有效权重是权重 × 系数放大一千倍取整，份额按它算
+    let (_d, app, gw) = app_and_gateway(&weighted.replace(
+        "    type: load-balance\n",
+        "    type: load-balance\n    balance_by: latency\n",
+    ));
+    for _ in 0..3 {
+        gw.latency.record("官方", 400);
+        gw.latency.record("中转", 100);
+    }
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+    // 中位数 250：官方 3 × (250/400)² → 1172，中转 1 × (250/100)² → 6250
+    let s = shares(&r);
+    let (a, b) = (s["官方"].unwrap(), s["中转"].unwrap());
+    assert!((a - 1172.0 / 7422.0).abs() < 1e-12, "{r:?}");
+    assert!((b - 6250.0 / 7422.0).abs() < 1e-12, "{r:?}");
+    assert!((a + b - 1.0).abs() < 1e-12);
+
+    // 不经过 `load-balance` 的没有份额：指定的上游、按顺序的组
+    let r = run(&app, r#"{"model":"claude-sonnet-4-5","cache":true}"#).await;
+    assert_eq!(shares(&r)["官方"], None);
+    for kind in ["fallback", "url-test", "cheapest"] {
+        let (_d, app) = app_with(&CFG.replace("type: load-balance", &format!("type: {kind}")));
+        let r = run(&app, r#"{"model":"claude-sonnet-4-5"}"#).await;
+        assert!(
+            r.candidate_models.iter().all(|c| c.share.is_none()),
+            "{kind}: {r:?}"
+        );
+    }
+}
+
 /// 按快慢、成败分时，试算说的排头就是数据面下一个新对话真的去的那一家：同一份延迟表、
 /// 成功率、轮询状态，同一个有效权重。起真网关、真上游，每发一个新对话之前先试算一次，
 /// 一次都不能对不上 —— 真请求会添新的首字节样本和成败，系数一直在变，对得上才说明两边
