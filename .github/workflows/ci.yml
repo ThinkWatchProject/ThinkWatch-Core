@@ -16,21 +16,31 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # **和平台无关的几关**：格式、沙箱胶水的 clippy、前端类型导出、发布页正文。放在
+  # Linux 上一次跑完，不占 macOS 的机器，也不拖慢 macOS 那一档。
   check:
-    runs-on: macos-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # 发布页的正文只在推 tag 时才写（release.yml 的 publish）。脚本和
+      # `release-notes/` 下的说明在改它们的那个 PR 上就核对：链接对不对得上
+      # 发出去的文件、说明里有没有混进中文。只要 Python，放在编译之前
+      - name: Release page text
+        run: python3 scripts/release_notes_test.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          # 插件沙箱里的 QuickJS 编成这个目标（crates/tw-plugin/build.rs）
+          # 沙箱胶水编成这个目标（crates/tw-plugin/guest）
           targets: wasm32-unknown-unknown
+      # **只在 main 上存。**一个 PR 读得到的缓存只有三处：它自己的、目标分支的、
+      # 默认分支的，读不到别的 PR 存的。PR 上存的那份只有同一个 PR 再推一次才
+      # 用得上，却和 main 的一样大，挤占仓库 10 GB 的缓存额度、把 main 的挤掉。
+      # main 每次推送都存一份，之后每个 PR 从它起步，只重编自己改到的部分
       - uses: Swatinem/rust-cache@v2
-
-      # 编插件沙箱要一个能出 wasm 的 clang：这里是 Homebrew 的 llvm，由 build.rs
-      # 自己找到（顺便测了「装了 brew 的 llvm 就能编」这条路）
-      - name: Toolchain for the plugin sandbox
-        run: bash scripts/wasm-toolchain.sh
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: |
@@ -38,16 +48,49 @@ jobs:
           # 沙箱里的那个小工程不在工作区里，上面一行管不到它
           cargo fmt --manifest-path crates/tw-plugin/guest/Cargo.toml -- --check
 
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # 镜像预装的 clang-15，脚本把它写进 TW_WASM_CLANG / TW_WASM_AR
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
 
       # 沙箱里的胶水（编成 wasm32 的 no_std 小工程）。build.rs 编它时不带 -D warnings
       # —— 那是给外层工作区的 —— 所以它的告警只在这一步当错误
       - name: clippy (plugin sandbox guest)
         run: |
-          LLVM="$(brew --prefix llvm)/bin"
-          CC_wasm32_unknown_unknown="$LLVM/clang" AR_wasm32_unknown_unknown="$LLVM/llvm-ar" \
+          CC_wasm32_unknown_unknown="$TW_WASM_CLANG" AR_wasm32_unknown_unknown="$TW_WASM_AR" \
             cargo clippy --manifest-path crates/tw-plugin/guest/Cargo.toml --target wasm32-unknown-unknown --target-dir target/tw-plugin-guest -- -D warnings
+
+      # 桌面端从 tw-api 导出前端类型（`ts` feature）。**默认关**，别的任务一行都
+      # 不编它 —— 而它坏掉的表现是桌面端接下一个 tag 时才发现导不出来。导出来
+      # 的文件再过一遍 tsc：ts-rs 生成的东西本身也可能不是合法的 TypeScript
+      - name: TypeScript bindings (tw-api, ts)
+        run: |
+          cargo clippy -p tw-api --all-targets --features ts -- -D warnings
+          cargo test -p tw-api --features ts
+          cargo run -p tw-api --features ts --example export_ts -- "$RUNNER_TEMP/tw-api-ts"
+          npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 "$RUNNER_TEMP/tw-api-ts/tw-api.ts"
+
+  # **桌面版的主平台。**和 Linux、Windows 两档一样：clippy、测试、真二进制。
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # 插件沙箱里的 QuickJS 编成这个目标（crates/tw-plugin/build.rs）
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 见 check 那一段
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # 编插件沙箱要一个能出 wasm 的 clang：这里是 Homebrew 的 llvm，由 build.rs
+      # 自己找到（顺便测了「装了 brew 的 llvm 就能编」这条路）
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # 默认不跑打真实网络的那些（它们标了 #[ignore]）—— CI 上的网络
       # 抖动会变成一条和代码无关的红，而那种红看几次就没人看了。
@@ -58,22 +101,9 @@ jobs:
       - name: Which compiler built the plugin sandbox
         run: bash scripts/wasm-toolchain.sh record target
 
-      # 桌面端从 tw-api 导出前端类型（`ts` feature）。**默认关**，上面几步一行都
-      # 不编它 —— 而它坏掉的表现是桌面端接下一个 tag 时才发现导不出来。导出来
-      # 的文件再过一遍 tsc：ts-rs 生成的东西本身也可能不是合法的 TypeScript
-      - name: TypeScript bindings (tw-api, ts)
-        run: |
-          cargo clippy -p tw-api --all-targets --features ts -- -D warnings
-          cargo test -p tw-api --features ts
-          cargo run -p tw-api --features ts --example export_ts -- "$RUNNER_TEMP/tw-api-ts"
-          npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 "$RUNNER_TEMP/tw-api-ts/tw-api.ts"
-
-      - name: Build
-        run: cargo build --release -p twcore
-
       # **接缝上的失败模式单元测试看不见**：文件权限、socket、某个端点
       # 在真二进制上根本没注册。这个项目的前四个真 bug 都是这么被逮到的。
-      # 脚本自己会 build，这一步只是跑它。
+      # 脚本自己会 build（debug 版，见脚本），这一步只是跑它。
       - name: Smoke (real binary, real socket, real data plane)
         run: ./scripts/smoke.sh
 
@@ -155,6 +185,8 @@ jobs:
         if: steps.changed.outputs.layer1 == 'true'
         with:
           workspaces: enterprise -> target
+          # 见 check 那一段
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check (enterprise)
         if: steps.changed.outputs.layer1 == 'true'
@@ -171,12 +203,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 发布页的正文只在推 tag 时才写（release.yml 的 publish）。脚本和
-      # `release-notes/` 下的说明在改它们的那个 PR 上就核对：链接对不对得上
-      # 发出去的文件、说明里有没有混进中文。只要 Python，放在编译之前
-      - name: Release page text
-        run: python3 scripts/release_notes_test.py
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -185,6 +211,8 @@ jobs:
         with:
           # 理由见下面 windows 那一段
           cache-on-failure: true
+          # 见 check 那一段
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # 镜像预装的 clang-15，显式指定（见脚本）
       - name: Toolchain for the plugin sandbox
@@ -226,6 +254,8 @@ jobs:
           # cargo 自己按指纹判断哪些要重编，所以缓存下一个失败构建的
           # target 目录是安全的，它只是省掉那些与失败无关的部分。
           cache-on-failure: true
+          # 见 check 那一段。PR 上不存，所以上面那条只对 main 起作用
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # 镜像预装的 LLVM（C:\Program Files\LLVM），由 build.rs 自己找到
       - name: Toolchain for the plugin sandbox
@@ -242,8 +272,11 @@ jobs:
         shell: bash
         run: bash scripts/wasm-toolchain.sh record target
 
+      # **debug 版就够了**，和 macOS、Linux 的 smoke 一样：这一步证明的是它起得来、
+      # 握手是唯一的门，和优化级别无关；release 版每次 PR 都要多编四分钟。发出去的
+      # release 版由 release.yml 在发版时自己跑一遍
       - name: Build
-        run: cargo build --release -p twcore
+        run: cargo build -p twcore
 
       # macOS 那边的 smoke 脚本在这里跑不了（`stat -f`、一堆 BSD 的写法），
       # 移植它是另一件事。但**至少要证明这个二进制真的起得来、控制面真的应答**
@@ -260,7 +293,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $home_ | Out-Null
           $env:THINKWATCH_HOME = $home_
           $cfg = Join-Path $home_ "config.yaml"
-          $bin = "target\release\twcore.exe"
+          $bin = "target\debug\twcore.exe"
           $proc = Start-Process -FilePath $bin `
             -ArgumentList "serve","--config",$cfg,"--port","18999" `
             -PassThru -NoNewWindow `
