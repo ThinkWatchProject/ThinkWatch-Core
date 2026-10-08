@@ -226,7 +226,7 @@ enum Cut {
 /// 只走顶层和 `parent` 这两层：别的值整个跳过，字符串里按字节找下一个引号或反斜杠。键里
 /// 写了转义的（`"user\u005fid"`）照解析出来的样子比，和 serde_json 认的一样。
 fn cut_members(body: &[u8], parent: &str, keys: &[&str], drop_empty: bool) -> Cut {
-    let Some(top) = json::object(body, json::ws(body, 0)) else {
+    let Some(top) = crate::splice::object(body, crate::splice::ws(body, 0)) else {
         return Cut::Unusual;
     };
     let mut parents = top.iter().filter(|m| m.is(body, parent));
@@ -241,7 +241,7 @@ fn cut_members(body: &[u8], parent: &str, keys: &[&str], drop_empty: bool) -> Cu
     if body[p.value.start] != b'{' {
         return Cut::Nothing;
     }
-    let Some(inner) = json::object(body, p.value.start) else {
+    let Some(inner) = crate::splice::object(body, p.value.start) else {
         return Cut::Unusual;
     };
     let gone: Vec<usize> = (0..inner.len())
@@ -262,9 +262,9 @@ fn cut_members(body: &[u8], parent: &str, keys: &[&str], drop_empty: bool) -> Cu
             .iter()
             .position(|m| m.key.start == p.key.start)
             .unwrap_or_default();
-        json::cuts(&top, &[at])
+        crate::splice::cuts(&top, &[at])
     } else {
-        json::cuts(&inner, &gone)
+        crate::splice::cuts(&inner, &gone)
     };
     let mut out = Vec::with_capacity(body.len());
     let mut at = 0;
@@ -274,142 +274,6 @@ fn cut_members(body: &[u8], parent: &str, keys: &[&str], drop_empty: bool) -> Cu
     }
     out.extend_from_slice(&body[at..]);
     Cut::Done(out)
-}
-
-/// 在 JSON 原文上认出一个对象的成员，好按字节剪。**只给解得开的 JSON 用**：写坏了的地方
-/// 不报错，只保证不越界。
-mod json {
-    use std::ops::Range;
-
-    /// 对象里的一个成员：键（连同引号）和值在原文里的区间
-    #[derive(Debug, Clone)]
-    pub(super) struct Member {
-        pub(super) key: Range<usize>,
-        pub(super) value: Range<usize>,
-    }
-
-    impl Member {
-        /// 键解出来是不是 `name`
-        pub(super) fn is(&self, b: &[u8], name: &str) -> bool {
-            let raw = &b[self.key.start + 1..self.key.end - 1];
-            if !raw.contains(&b'\\') {
-                return raw == name.as_bytes();
-            }
-            serde_json::from_slice::<String>(&b[self.key.clone()]).is_ok_and(|k| k == name)
-        }
-    }
-
-    /// 从 `i` 起跳过空白
-    pub(super) fn ws(b: &[u8], mut i: usize) -> usize {
-        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
-            i += 1;
-        }
-        i
-    }
-
-    /// `b[i]` 是一个字符串的开头引号：返回结尾引号之后的位置
-    fn string_end(b: &[u8], i: usize) -> Option<usize> {
-        if b.get(i) != Some(&b'"') {
-            return None;
-        }
-        let mut j = i + 1;
-        loop {
-            j += memchr::memchr2(b'"', b'\\', b.get(j..)?)?;
-            if b[j] == b'"' {
-                return Some(j + 1);
-            }
-            j += 2;
-        }
-    }
-
-    /// `b[i]` 起的一个值：返回它之后的位置
-    fn value_end(b: &[u8], i: usize) -> Option<usize> {
-        match *b.get(i)? {
-            b'"' => string_end(b, i),
-            b'{' | b'[' => {
-                let mut depth = 0usize;
-                let mut j = i;
-                loop {
-                    match *b.get(j)? {
-                        b'"' => {
-                            j = string_end(b, j)?;
-                            continue;
-                        }
-                        b'{' | b'[' => depth += 1,
-                        b'}' | b']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                return Some(j + 1);
-                            }
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
-            }
-            // 数、true、false、null：到下一个分隔为止
-            _ => {
-                let end = b[i..]
-                    .iter()
-                    .position(|c| matches!(c, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
-                    .map_or(b.len(), |n| i + n);
-                (end > i).then_some(end)
-            }
-        }
-    }
-
-    /// `b[open]` 是一个对象的 `{`：它的成员，按先后
-    pub(super) fn object(b: &[u8], open: usize) -> Option<Vec<Member>> {
-        if b.get(open) != Some(&b'{') {
-            return None;
-        }
-        let mut out = Vec::new();
-        let mut i = ws(b, open + 1);
-        if b.get(i) == Some(&b'}') {
-            return Some(out);
-        }
-        loop {
-            let key = i..string_end(b, i)?;
-            let colon = ws(b, key.end);
-            if b.get(colon) != Some(&b':') {
-                return None;
-            }
-            let v = ws(b, colon + 1);
-            let value = v..value_end(b, v)?;
-            let next = ws(b, value.end);
-            out.push(Member { key, value });
-            match *b.get(next)? {
-                b',' => i = ws(b, next + 1),
-                b'}' => return Some(out),
-                _ => return None,
-            }
-        }
-    }
-
-    /// 剪掉 `members` 里第 `gone` 几个（按先后）要剪的区间，按先后、互不重叠。剪完还是
-    /// 合法的 JSON：剪掉一个成员连同它后面的逗号；排在最后的，连同它前面的逗号
-    pub(super) fn cuts(members: &[Member], gone: &[usize]) -> Vec<Range<usize>> {
-        let mut out = Vec::new();
-        let mut k = 0;
-        while k < gone.len() {
-            // 连着要剪的一串
-            let first = gone[k];
-            let mut last = first;
-            while k + 1 < gone.len() && gone[k + 1] == last + 1 {
-                k += 1;
-                last += 1;
-            }
-            k += 1;
-            out.push(if last + 1 < members.len() {
-                members[first].key.start..members[last + 1].key.start
-            } else if first > 0 {
-                members[first - 1].value.end..members[last].value.end
-            } else {
-                members[first].key.start..members[last].value.end
-            });
-        }
-        out
-    }
 }
 
 #[cfg(test)]
