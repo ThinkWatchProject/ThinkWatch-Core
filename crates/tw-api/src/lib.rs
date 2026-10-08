@@ -798,7 +798,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **40 起模型规格多了会不会推理、收不收图**：[`ModelRow`] 多了 `reasoning`、`image_input`
 /// 和它们的来源，[`ModelSpecSave`] 多了 `reasoning`、`image_input`（四项都空才是删掉）。
 /// 照 39 写的界面保存规格时会把这两项丢掉。
-pub const CONTROL_API_VERSION: u32 = 40;
+///
+/// **41 起会话的对话视图可以只取新的轮次，试算给出每家分到的份额**：
+/// `GET /sessions/{id}/transcript` 的请求从 `()` 变成 [`TranscriptQuery`]（`from_turn`，
+/// 不带就是整份），[`Transcript`] 多了 `total_turns` 和 `settled_turns`（前面这么多轮
+/// 不会再变，下次从这里取）；[`DryRunCandidate`] 多了 `share`（负载均衡组里这一家按
+/// 当前权重和系数分到的份额，别的组和这一轮不参与的是 None）。照 40 写的界面取对话视图
+/// 时传 `null` 会被拒。
+pub const CONTROL_API_VERSION: u32 = 41;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
