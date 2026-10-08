@@ -5066,6 +5066,12 @@ pub struct DryRunCandidate {
     /// 分得少，没有样本的那一项算 1。只在 `balance_by` 不是 `weights` 的 `load-balance` 里有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_factor: Option<f64>,
+    /// 照此刻的数字轮下去，它分到的新对话占这个组的多少，0 到 1：有效权重（权重 × 系数）
+    /// 除以这一轮参加的各家之和，和数据面挑排头是同一份数字。只在 `load-balance` 里有，
+    /// 同一个组里有份额的各家加起来是 1。熔断着、冷却着、并发数满着的这一轮不参加，没有
+    /// 份额 —— 全都这样时都参加
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<f64>,
 }
 
 /// 一个要转换格式的候选上游。

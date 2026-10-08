@@ -51,17 +51,18 @@ fn order_like_the_data_plane(
 }
 
 /// 一家候选的排序依据：典型的快慢（从发出去到回答的第一段内容）、最近的成功率、按它们算出
-/// 的系数。**只给顺序真用到的那几样**（[`runtime_facts`] 只取用得上的）—— `url-test` 看快慢；
-/// `load-balance` 按 `balance_by` 看快慢、成败，系数乘在权重上。用不着的、没有样本的
-/// 是 None。
+/// 的系数，和 `load-balance` 照这些数字分给它的份额。**只给顺序真用到的那几样**
+/// （[`runtime_facts`] 只取用得上的）—— `url-test` 看快慢；`load-balance` 按 `balance_by`
+/// 看快慢、成败，系数乘在权重上。用不着的、没有样本的是 None。
 struct Basis {
     ttfb_ms: Option<u32>,
     success_rate: Option<f64>,
     balance_factor: Option<f64>,
+    share: Option<f64>,
 }
 
-/// 每一家候选的排序依据，按 `d.candidates` 的名字查。系数和数据面一样按这份候选、
-/// 这份数字算（`tw_engine::balance_factors`）
+/// 每一家候选的排序依据，按 `d.candidates` 的名字查。系数、份额和数据面一样按这份候选、
+/// 这份数字算（`tw_engine::balance_factors`、`tw_engine::weighted::shares`）
 fn bases(
     d: &tw_engine::Decision,
     runtime: Option<&(&tw_engine::Group, tw_engine::Facts)>,
@@ -69,8 +70,15 @@ fn bases(
     let Some((g, f)) = runtime else {
         return Default::default();
     };
-    let factors = if g.kind == tw_engine::GroupType::LoadBalance && !g.balance_by.is_weights() {
+    let balanced = g.kind == tw_engine::GroupType::LoadBalance;
+    let factors = if balanced && !g.balance_by.is_weights() {
         tw_engine::balance_factors(g.balance_by, &d.candidates, f)
+    } else {
+        Vec::new()
+    };
+    // 份额只按权重分时也有：权重本身就是比例
+    let shares = if balanced {
+        tw_engine::weighted::shares(g, &d.candidates, f)
     } else {
         Vec::new()
     };
@@ -82,6 +90,7 @@ fn bases(
                 ttfb_ms: f.ttfb_ms.get(name).copied(),
                 success_rate: f.success.get(name).copied(),
                 balance_factor: factors.get(i).copied(),
+                share: shares.get(i).copied().flatten(),
             };
             (name.clone(), basis)
         })
@@ -325,7 +334,7 @@ pub async fn dry_run(
             // `load-balance` 的候选带上各自的权重：排头的为什么是它，一半在这个数里
             let balanced = group.filter(|g| g.kind == tw_engine::GroupType::LoadBalance);
             // 每一家收到的模型名，和为什么不是请求里写的那个；顺序看运行时数字的，再加上
-            // 每一家的那几个数字（权重、快慢、成功率、系数）—— 「为什么轮到它」
+            // 每一家的那几个数字（权重、快慢、成功率、系数、份额）—— 「为什么轮到它」
             // 要能从这里看出来
             let mut basis_of = bases(&d, runtime.as_ref());
             out.candidate_models = out
@@ -344,6 +353,7 @@ pub async fn dry_run(
                         ttfb_ms: basis.as_ref().and_then(|b| b.ttfb_ms),
                         success_rate: basis.as_ref().and_then(|b| b.success_rate),
                         balance_factor: basis.as_ref().and_then(|b| b.balance_factor),
+                        share: basis.as_ref().and_then(|b| b.share),
                     }
                 })
                 .collect();
