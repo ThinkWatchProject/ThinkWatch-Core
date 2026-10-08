@@ -16,14 +16,23 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # **和平台无关的几关**：格式、沙箱胶水的 clippy、前端类型导出、发布页正文。放在
+  # Linux 上一次跑完，不占 macOS 的机器，也不拖慢 macOS 那一档。
   check:
-    runs-on: macos-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # 发布页的正文只在推 tag 时才写（release.yml 的 publish）。脚本和
+      # `release-notes/` 下的说明在改它们的那个 PR 上就核对：链接对不对得上
+      # 发出去的文件、说明里有没有混进中文。只要 Python，放在编译之前
+      - name: Release page text
+        run: python3 scripts/release_notes_test.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          # 插件沙箱里的 QuickJS 编成这个目标（crates/tw-plugin/build.rs）
+          # 沙箱胶水编成这个目标（crates/tw-plugin/guest）
           targets: wasm32-unknown-unknown
       # **只在 main 上存。**一个 PR 读得到的缓存只有三处：它自己的、目标分支的、
       # 默认分支的，读不到别的 PR 存的。PR 上存的那份只有同一个 PR 再推一次才
@@ -33,27 +42,55 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # 编插件沙箱要一个能出 wasm 的 clang：这里是 Homebrew 的 llvm，由 build.rs
-      # 自己找到（顺便测了「装了 brew 的 llvm 就能编」这条路）
-      - name: Toolchain for the plugin sandbox
-        run: bash scripts/wasm-toolchain.sh
-
       - name: Format
         run: |
           cargo fmt --all -- --check
           # 沙箱里的那个小工程不在工作区里，上面一行管不到它
           cargo fmt --manifest-path crates/tw-plugin/guest/Cargo.toml -- --check
 
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # 镜像预装的 clang-15，脚本把它写进 TW_WASM_CLANG / TW_WASM_AR
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
 
       # 沙箱里的胶水（编成 wasm32 的 no_std 小工程）。build.rs 编它时不带 -D warnings
       # —— 那是给外层工作区的 —— 所以它的告警只在这一步当错误
       - name: clippy (plugin sandbox guest)
         run: |
-          LLVM="$(brew --prefix llvm)/bin"
-          CC_wasm32_unknown_unknown="$LLVM/clang" AR_wasm32_unknown_unknown="$LLVM/llvm-ar" \
+          CC_wasm32_unknown_unknown="$TW_WASM_CLANG" AR_wasm32_unknown_unknown="$TW_WASM_AR" \
             cargo clippy --manifest-path crates/tw-plugin/guest/Cargo.toml --target wasm32-unknown-unknown --target-dir target/tw-plugin-guest -- -D warnings
+
+      # 桌面端从 tw-api 导出前端类型（`ts` feature）。**默认关**，别的任务一行都
+      # 不编它 —— 而它坏掉的表现是桌面端接下一个 tag 时才发现导不出来。导出来
+      # 的文件再过一遍 tsc：ts-rs 生成的东西本身也可能不是合法的 TypeScript
+      - name: TypeScript bindings (tw-api, ts)
+        run: |
+          cargo clippy -p tw-api --all-targets --features ts -- -D warnings
+          cargo test -p tw-api --features ts
+          cargo run -p tw-api --features ts --example export_ts -- "$RUNNER_TEMP/tw-api-ts"
+          npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 "$RUNNER_TEMP/tw-api-ts/tw-api.ts"
+
+  # **桌面版的主平台。**和 Linux、Windows 两档一样：clippy、测试、真二进制。
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # 插件沙箱里的 QuickJS 编成这个目标（crates/tw-plugin/build.rs）
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 见 check 那一段
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # 编插件沙箱要一个能出 wasm 的 clang：这里是 Homebrew 的 llvm，由 build.rs
+      # 自己找到（顺便测了「装了 brew 的 llvm 就能编」这条路）
+      - name: Toolchain for the plugin sandbox
+        run: bash scripts/wasm-toolchain.sh
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # 默认不跑打真实网络的那些（它们标了 #[ignore]）—— CI 上的网络
       # 抖动会变成一条和代码无关的红，而那种红看几次就没人看了。
@@ -63,16 +100,6 @@ jobs:
       # 编进这一版的沙箱是哪个 clang 编的、wasm 的哈希
       - name: Which compiler built the plugin sandbox
         run: bash scripts/wasm-toolchain.sh record target
-
-      # 桌面端从 tw-api 导出前端类型（`ts` feature）。**默认关**，上面几步一行都
-      # 不编它 —— 而它坏掉的表现是桌面端接下一个 tag 时才发现导不出来。导出来
-      # 的文件再过一遍 tsc：ts-rs 生成的东西本身也可能不是合法的 TypeScript
-      - name: TypeScript bindings (tw-api, ts)
-        run: |
-          cargo clippy -p tw-api --all-targets --features ts -- -D warnings
-          cargo test -p tw-api --features ts
-          cargo run -p tw-api --features ts --example export_ts -- "$RUNNER_TEMP/tw-api-ts"
-          npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 "$RUNNER_TEMP/tw-api-ts/tw-api.ts"
 
       # **接缝上的失败模式单元测试看不见**：文件权限、socket、某个端点
       # 在真二进制上根本没注册。这个项目的前四个真 bug 都是这么被逮到的。
@@ -175,12 +202,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      # 发布页的正文只在推 tag 时才写（release.yml 的 publish）。脚本和
-      # `release-notes/` 下的说明在改它们的那个 PR 上就核对：链接对不对得上
-      # 发出去的文件、说明里有没有混进中文。只要 Python，放在编译之前
-      - name: Release page text
-        run: python3 scripts/release_notes_test.py
 
       - uses: dtolnay/rust-toolchain@stable
         with:
