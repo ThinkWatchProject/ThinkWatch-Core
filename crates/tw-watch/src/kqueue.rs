@@ -87,11 +87,16 @@ struct Held(OwnedFd);
 impl Held {
     /// 打开 `path`。名额用完了是 `Ok(None)`。
     fn open(path: &Path) -> io::Result<Option<Held>> {
-        let reserved = HELD.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < budget()).then_some(n + 1)
-        });
-        if reserved.is_err() {
-            return Ok(None);
+        // 先占名额再开 fd。手写比较交换：`fetch_update` 在新版标准库里改了名
+        let mut n = HELD.load(Ordering::Acquire);
+        loop {
+            if n >= budget() {
+                return Ok(None);
+            }
+            match HELD.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
         }
         let release = || HELD.fetch_sub(1, Ordering::AcqRel);
         let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
