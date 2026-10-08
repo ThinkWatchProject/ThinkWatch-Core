@@ -25,7 +25,13 @@ jobs:
           components: rustfmt, clippy
           # 插件沙箱里的 QuickJS 编成这个目标（crates/tw-plugin/build.rs）
           targets: wasm32-unknown-unknown
+      # **只在 main 上存。**一个 PR 读得到的缓存只有三处：它自己的、目标分支的、
+      # 默认分支的，读不到别的 PR 存的。PR 上存的那份只有同一个 PR 再推一次才
+      # 用得上，却和 main 的一样大，挤占仓库 10 GB 的缓存额度、把 main 的挤掉。
+      # main 每次推送都存一份，之后每个 PR 从它起步，只重编自己改到的部分
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # 编插件沙箱要一个能出 wasm 的 clang：这里是 Homebrew 的 llvm，由 build.rs
       # 自己找到（顺便测了「装了 brew 的 llvm 就能编」这条路）
@@ -155,6 +161,8 @@ jobs:
         if: steps.changed.outputs.layer1 == 'true'
         with:
           workspaces: enterprise -> target
+          # 见 check 那一段
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check (enterprise)
         if: steps.changed.outputs.layer1 == 'true'
@@ -185,6 +193,8 @@ jobs:
         with:
           # 理由见下面 windows 那一段
           cache-on-failure: true
+          # 见 check 那一段
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # 镜像预装的 clang-15，显式指定（见脚本）
       - name: Toolchain for the plugin sandbox
@@ -226,6 +236,8 @@ jobs:
           # cargo 自己按指纹判断哪些要重编，所以缓存下一个失败构建的
           # target 目录是安全的，它只是省掉那些与失败无关的部分。
           cache-on-failure: true
+          # 见 check 那一段。PR 上不存，所以上面那条只对 main 起作用
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # 镜像预装的 LLVM（C:\Program Files\LLVM），由 build.rs 自己找到
       - name: Toolchain for the plugin sandbox
@@ -242,8 +254,12 @@ jobs:
         shell: bash
         run: bash scripts/wasm-toolchain.sh record target
 
+      # **debug 版就够了。**这一步证明的是它起得来、握手是唯一的门，和优化级别
+      # 无关；release 版每次 PR 都要多编四分钟，这个任务本来就是最慢的那个。
+      # 内存、延迟这些资源目标要 release 版才量得准，那在 macOS 和 Linux 的
+      # smoke 里量；发出去的 release 版由 release.yml 在发版时自己跑一遍
       - name: Build
-        run: cargo build --release -p twcore
+        run: cargo build -p twcore
 
       # macOS 那边的 smoke 脚本在这里跑不了（`stat -f`、一堆 BSD 的写法），
       # 移植它是另一件事。但**至少要证明这个二进制真的起得来、控制面真的应答**
@@ -260,7 +276,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $home_ | Out-Null
           $env:THINKWATCH_HOME = $home_
           $cfg = Join-Path $home_ "config.yaml"
-          $bin = "target\release\twcore.exe"
+          $bin = "target\debug\twcore.exe"
           $proc = Start-Process -FilePath $bin `
             -ArgumentList "serve","--config",$cfg,"--port","18999" `
             -PassThru -NoNewWindow `
