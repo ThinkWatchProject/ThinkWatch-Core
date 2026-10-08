@@ -3424,6 +3424,7 @@ dependencies = [
 name = "tw-watch"
 version = "0.64.1"
 dependencies = [
+ "libc",
  "notify",
  "tempfile",
  "thiserror",
