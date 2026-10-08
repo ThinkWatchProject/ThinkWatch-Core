@@ -440,6 +440,34 @@ async fn an_anthropic_upstream_gets_the_request_and_nothing_about_the_client() {
     assert_eq!(v["messages"][0]["content"], "hi");
 }
 
+/// 去掉 `user_id` 之后，上游收到的就是客户端发的那些字节：键的先后（工具定义、工具参数、
+/// 整个请求）、空白、转义一个都没动。以前解析再写回，每个对象的键都按字母重排了 —— 而
+/// Claude Code 的请求每一个都带着 `user_id`。
+///
+/// 体过了 1 MiB、跑在多线程的运行时上：这么大的请求体，管线上那几步是挪出异步线程算的
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_upstream_gets_the_client_body_byte_for_byte_less_the_identity() {
+    let (up, seen) = start_upstream().await;
+    let gw = start_gateway(anthropic(up)).await;
+    let file = "fn main() {\n    println!(\"读了 \\\"一个\\\" 文件\");\n}\n".repeat(20_000);
+    let file = serde_json::to_string(&file).unwrap();
+    let head = format!(
+        r#"{{"model":"claude-sonnet-4-5","messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_01","content":{file}}}]}},{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_02","name":"Read","input":{{"zeta":1,"alpha":[2,{{"b":3,"a":4}}]}}}}]}}], "tools":[{{"name":"Read","input_schema":{{"type":"object","properties":{{"file_path":{{"type":"string"}},"limit":{{"type":"number"}}}},"required":["file_path"],"$schema":"http://json-schema.org/draft-07/schema#"}}}}],"#
+    );
+    let identity = r#""metadata":{"user_id":"user_abc_account_123_session_456"},"#;
+    let tail = r#""max_tokens":16,"stream":false}"#;
+    let body = format!("{head}{identity}{tail}");
+    assert!(body.len() > 1024 * 1024, "{}", body.len());
+    post(gw, "/v1/messages", CLAUDE_CODE, &body).await;
+
+    let g = seen.lock().unwrap();
+    assert!(
+        g.body == format!("{head}{tail}").as_bytes(),
+        "the upstream got a different body: {}",
+        String::from_utf8_lossy(&g.body[g.body.len().saturating_sub(300)..])
+    );
+}
+
 #[tokio::test]
 async fn an_upstream_that_asks_for_it_gets_the_clients_own_identity() {
     let (up, seen) = start_upstream().await;

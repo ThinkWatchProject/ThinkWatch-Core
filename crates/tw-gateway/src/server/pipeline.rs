@@ -71,7 +71,10 @@ pub(super) async fn pipeline(
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
-    let intent = match probe(&state, &rt, &req) {
+    // 请求体**只解析一次**：本地应答的判定、路由事实、对话的指纹、内容过滤都用这一份（见
+    // `read`）。解不开是 None —— 照样往下走，同格式直通照样发
+    let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
+    let intent = match probe(&state, &rt, &req, parsed.as_ref()) {
         Probe::Answered(resp) => return Ok(resp),
         Probe::Intent(intent) => intent,
     };
@@ -89,7 +92,7 @@ pub(super) async fn pipeline(
 
     // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
-    let (mut reading, fp) = read(&req, intent);
+    let (mut reading, fp) = read(&req, intent, parsed.as_ref());
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
         Routed::Go(choice, decision) => (choice, decision),
@@ -137,7 +140,7 @@ pub(super) async fn pipeline(
     .await?;
 
     // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
-    let screening = screen(&rt, &mut req, &mut reading);
+    let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
     let started = start(
         &state,
         &rt,
@@ -291,10 +294,17 @@ enum Probe {
 /// 于是断网时健康检查照样失败，白白丢掉这个功能最有价值的场景。
 /// 同样的理由让它排在「一个 provider 都没有」那一条之前：那一条也是
 /// 一种「没有可用上游」，而本地应答本来就不需要上游。
-fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
-    let Some(kind) =
-        crate::clientprobe::classify(&req.body, is_claude_code(&req.client_name, &req.headers))
-    else {
+fn probe(
+    state: &AppState,
+    rt: &Runtime,
+    req: &Inbound,
+    parsed: Option<&serde_json::Value>,
+) -> Probe {
+    let Some(kind) = crate::clientprobe::classify(
+        &req.body,
+        parsed,
+        is_claude_code(&req.client_name, &req.headers),
+    ) else {
         return Probe::Intent(String::new());
     };
     use tw_config::ProbeAction::*;
@@ -321,27 +331,30 @@ fn probe(state: &AppState, rt: &Runtime, req: &Inbound) -> Probe {
 
 /// 管线第 2 步的前半：读出路由事实，和这段对话的指纹。
 ///
-/// **只解析一次，指纹也只算一次。**路由要它，认对话（见 `crate::affinity`）要指纹，
-/// 开始事件归会话也要指纹，而 body 可能有几百 KB —— 解两遍、哈希两遍是白付一份钱。
+/// **只解析一次，指纹也只算一次。**`parsed` 是管线开头解出来的那一份（本地应答的判定、
+/// 内容过滤用的也是它）。路由要它，认对话（见 `crate::affinity`）要指纹，开始事件归会话
+/// 也要指纹，而 body 可能有几 MB —— 解两遍、哈希两遍是白付一份钱。
 ///
 /// 生成回答的请求解码成中间表示，**四种格式的客户端读出同一份路由事实**。
 /// body 解不开时用空的性质走兜底规则。**不要因此拒绝请求** —— 我们的解析器
 /// 不认识的东西，上游可能完全认识（只有需要转换时才用得上解码结果）
-fn read(req: &Inbound, intent: String) -> (crate::client_api::Reading, Option<String>) {
-    let parsed = serde_json::from_slice::<serde_json::Value>(&req.body).ok();
-    let mut reading =
-        crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed.as_ref());
+fn read(
+    req: &Inbound,
+    intent: String,
+    parsed: Option<&serde_json::Value>,
+) -> (crate::client_api::Reading, Option<String>) {
+    let mut reading = crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed);
     reading.facts.client = req.client_name.clone();
     reading.facts.intent = intent;
     reading.harness = tw_dialect::harness::detect(
         req.headers
             .get(axum::http::header::USER_AGENT)
             .and_then(|v| v.to_str().ok()),
-        parsed.as_ref(),
+        parsed,
     );
     // 认出「这几十个请求是同一次任务」。**认不出来就是 None** —— 硬凑一个会把
     // 互不相干的请求并成一个「会话」
-    let fp = parsed.as_ref().and_then(crate::session::fingerprint);
+    let fp = parsed.and_then(crate::session::fingerprint);
     (reading, fp)
 }
 
@@ -965,17 +978,21 @@ fn open(
 /// 模型，查了只会在真正的请求之前把同一处命中多记一遍、还可能把计数请求拒掉（理由见
 /// [`crate::client_api::ClientApi::screened`]）。在原文上查，中间表示解不开的请求照样查
 /// （同格式直通照样发，上游可能认得它）。
+///
+/// `parsed` 是请求体解析出来的样子（管线开头解的那一份），解不开的是 None：解不开的请求体
+/// 没有调用方的正文可言，什么都不报。
 fn screen(
     rt: &Runtime,
     req: &mut Inbound,
     reading: &mut crate::client_api::Reading,
+    parsed: Option<&serde_json::Value>,
 ) -> tw_guard::content::Screening {
     let screened = crate::client_api::ClientApi::screened(req.uri.path());
-    let Some(api) = req.api.filter(|_| screened) else {
+    let (Some(api), Some(parsed)) = (req.api.filter(|_| screened), parsed) else {
         return Default::default();
     };
     let dialect = api.dialect();
-    let sc = crate::guard::screen(&crate::guard::Screen::of(rt), dialect, &req.body);
+    let sc = crate::guard::screen_value(&crate::guard::Screen::of(rt), dialect, parsed);
     if let Some(body) = &sc.body {
         req.body = body.clone();
         if reading.decoded.is_some() {

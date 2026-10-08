@@ -88,17 +88,26 @@ pub fn screen(mode: Mode, rules: &Rules, dialect: Dialect, body: &[u8]) -> Scree
     if !mode.detects() || rules.is_empty() {
         return Screening::default();
     }
-    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Screening::default();
     };
-    let spots = tw_dialect::caller::spots(dialect, &v);
+    screen_value(mode, rules, dialect, &v)
+}
+
+/// [`screen`]，请求体已经解析好了（调用方为别的事解过一遍）：`v` 是它解出来的样子，不再
+/// 解一遍。删过的请求体照它写出来，和 [`screen`] 写的一样。
+pub fn screen_value(mode: Mode, rules: &Rules, dialect: Dialect, v: &Value) -> Screening {
+    if !mode.detects() || rules.is_empty() {
+        return Screening::default();
+    }
+    let spots = tw_dialect::caller::spots(dialect, v);
     if spots.is_empty() {
         return Screening::default();
     }
     let e = {
         let segments: Vec<(&str, bool)> = spots
             .iter()
-            .map(|s| (s.get(&v).unwrap_or_default(), s.in_tool_result))
+            .map(|s| (s.get(v).unwrap_or_default(), s.in_tool_result))
             .collect();
         evaluate(rules, &segments, Scope::default())
     };
@@ -107,6 +116,8 @@ pub fn screen(mode: Mode, rules: &Rules, dialect: Dialect, body: &[u8]) -> Scree
         && out.refused.is_none()
         && let Some(texts) = e.texts
     {
+        // 要删的时候才抄一份来改
+        let mut v = v.clone();
         for (s, t) in spots.iter().zip(texts) {
             if let Some(x) = s.get_mut(&mut v) {
                 *x = t;

@@ -64,6 +64,9 @@ struct Asked<'r> {
     body: &'r Bytes,
     path: &'r str,
     decoded: Option<&'r Result<tw_dialect::convert::Decoded, tw_dialect::ir::Rejection>>,
+    /// `body` 解得开（是 JSON）：客户端的原话照管线开头解的那一遍，插件改过的那一份是
+    /// 网关自己写出来的，一定解得开
+    json: bool,
 }
 
 impl<'r> Asked<'r> {
@@ -77,11 +80,13 @@ impl<'r> Asked<'r> {
                 body: &r.body,
                 path: &r.path,
                 decoded: r.decoded.as_ref(),
+                json: true,
             },
             None => Asked {
                 body: &req.body,
                 path: req.uri.path(),
                 decoded: reading.decoded.as_ref(),
+                json: reading.json,
             },
         }
     }
@@ -1133,6 +1138,7 @@ fn successor<'r>(
         body: &req.body,
         path: req.uri.path(),
         decoded: reading.decoded.as_ref(),
+        json: reading.json,
     };
     rest.any(|name| {
         let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
@@ -1232,8 +1238,11 @@ fn prepare(
             } else if provider.forward_client_identity {
                 out
             } else {
-                // 客户端自动填的身份字段不发（见 `egress` 模块）。**不算丢弃的字段**
+                // 客户端自动填的身份字段不发（见 `egress` 模块）。**不算丢弃的字段**。按字节
+                // 剪，要请求体解得开：上面几步要么原样交回、要么照解出来的写回，解不开的照旧
+                // 解不开、原样发
                 client_dialect
+                    .filter(|_| asked.json)
                     .and_then(|d| crate::egress::strip_body_identity(d, &out))
                     .unwrap_or(out)
             };

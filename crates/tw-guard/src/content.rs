@@ -34,7 +34,7 @@ mod screen;
 pub(crate) use codepoints::visible as codepoints_visible;
 pub use codepoints::{CodepointError, Codepoints, MAX_ITEMS as MAX_CODEPOINT_ITEMS};
 pub(crate) use screen::evaluate;
-pub use screen::{Outcome, ScreenHit, Screening, screen, screen_text};
+pub use screen::{Outcome, ScreenHit, Screening, screen, screen_text, screen_value};
 
 /// 一条规则怎么认。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]

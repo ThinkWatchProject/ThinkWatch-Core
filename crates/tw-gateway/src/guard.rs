@@ -140,6 +140,16 @@ pub fn screen(s: &Screen, dialect: tw_dialect::ir::Dialect, body: &[u8]) -> Scre
     tw_guard::content::screen(s.mode, &s.rules, dialect, body)
 }
 
+/// [`screen`]，请求体已经解析好了：`v` 是它解出来的样子（见
+/// [`tw_guard::content::screen_value`]）。
+pub fn screen_value(
+    s: &Screen,
+    dialect: tw_dialect::ir::Dialect,
+    v: &serde_json::Value,
+) -> Screening {
+    tw_guard::content::screen_value(s.mode, &s.rules, dialect, v)
+}
+
 /// 把一次查下来的结论报出去：每条命中的规则一条 [`tw_api::Event::ContentMatched`]，挂在
 /// 请求 `id` 上。要拒绝时返回告诉客户端的那句话。
 pub fn report(
