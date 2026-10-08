@@ -852,9 +852,8 @@ impl Collector {
 /// `tw1.` 前缀的签名不是这个上游签发的：Anthropic 会以签名无效拒绝整个请求，
 /// 对话从此卡死。所以直通前把它们去掉 —— 那段推理本来就不是这个上游产生的。
 pub fn strip_carried(client: Dialect, body: &[u8]) -> Option<Vec<u8>> {
-    if !body.windows(CARRIED.len()).any(|w| w == CARRIED.as_bytes()) {
-        return None;
-    }
+    // 每一跳同格式直通都要看一眼整个请求体：按字节找（SIMD），绝大多数请求在这里就回去了
+    memchr::memmem::find(body, CARRIED.as_bytes())?;
     let mut v: Value = serde_json::from_slice(body).ok()?;
     let carried = |x: Option<&Value>| {
         x.and_then(Value::as_str)

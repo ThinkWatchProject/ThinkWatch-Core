@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tw_guard::redact::replace::{Ledger, Scheme};
-use tw_guard::redact::rules::{Kind, Rule, RuleSet};
+use tw_guard::redact::rules::{Hit, Kind, Rule, RuleSet};
 
 /// 打码要多看的那一截。
 ///
@@ -101,12 +101,25 @@ impl Redaction {
     ///
     /// **读的时候还会再打一遍**，打第二遍不再改动什么（`mask_body` 认得自己打过的码）。
     pub fn apply(&self, text: &str) -> String {
+        self.apply_found(text, None)
+    }
+
+    /// [`apply`](Self::apply)，`found` 是按这套规则在 `text` 上已经找过的命中（[`crate::guard::hits`]
+    /// 的结果）：不再找一遍。没找过的是 `None`
+    fn apply_found(&self, text: &str, found: Option<&[Hit]>) -> String {
         // 我们自己的占位符不算（见 `crate::guard::hits`）：回答里回显的、重放过来的，原样存
-        let hits = crate::guard::hits(text, &self.rules);
+        let fresh;
+        let hits = match found {
+            Some(hits) => hits,
+            None => {
+                fresh = crate::guard::hits(text, &self.rules);
+                &fresh[..]
+            }
+        };
         let sent: HashMap<&str, &str> = self.ledger.replacements().collect();
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
-        for h in &hits {
+        for h in hits {
             out.push_str(&text[at..h.bytes.start]);
             let value = &text[h.bytes.clone()];
             match sent.get(value) {
@@ -148,6 +161,8 @@ pub struct BodyRecord {
     pub original_len: usize,
     /// 落盘之前怎么换、怎么打码
     pub redaction: Redaction,
+    /// 请求路上按 `redaction` 的规则在这份正文上已经找过的命中（见 [`Self::found`]）
+    found: Option<Arc<[Hit]>>,
     /// 占着的那份额度（见 [`QUEUED_MAX`]）
     held: Option<Held>,
 }
@@ -168,8 +183,19 @@ impl BodyRecord {
             body,
             original_len,
             redaction,
+            found: None,
             held: None,
         }
+    }
+
+    /// 请求路上出站脱敏已经按 `redaction` 的规则在 `body` 上找过一遍（见
+    /// [`crate::guard::look_hits`]）：落盘前打码用它找到的，不再把整份正文扫一遍。
+    ///
+    /// 只在交来的是整份正文、它又是 UTF-8 时用得上 —— 那时落盘前看的文字就是请求路上看的
+    /// 那一份；截过的、不是 UTF-8 的照旧再找（[`Self::for_disk`]）。
+    pub fn found(mut self, hits: Option<Arc<[Hit]>>) -> Self {
+        self.found = hits;
+        self
     }
 
     /// 落盘的那一份：换过、打过码（[`Redaction::apply`]），和要记下的原本长度。
@@ -180,7 +206,13 @@ impl BodyRecord {
     /// 那样，而二进制的正文里没有能看的东西。
     pub fn for_disk(self) -> ForDisk {
         let window = &self.body[..self.body.len().min(WINDOW)];
-        let body = self.redaction.apply(&String::from_utf8_lossy(window));
+        let text = String::from_utf8_lossy(window);
+        // 请求路上找过的那一遍看的就是这些字：整份都在窗口里，原文就是 UTF-8
+        let entire = window.len() == self.body.len() && self.original_len <= self.body.len();
+        let found = self
+            .found
+            .filter(|_| entire && matches!(text, std::borrow::Cow::Borrowed(_)));
+        let body = self.redaction.apply_found(&text, found.as_deref());
         // 截过的（交来的只是开头）报原本的长度。没截过的就是换过、打过码的这一份的长度：
         // 比存储层的上限还长的，由存储层截、由它记下（`tw_store::Blobs::put_with_len`）
         let whole = self.original_len.max(self.body.len());
@@ -266,6 +298,8 @@ pub fn offer(sink: &Option<BodySink>, mut rec: BodyRecord) {
     let Some(s) = sink else { return };
     if rec.body.len() > WINDOW {
         rec.body = Bytes::copy_from_slice(&rec.body[..WINDOW]);
+        // 找过的是整份；落盘前看的只是开头这一截，要重新找（见 `BodyRecord::found`）
+        rec.found = None;
     }
     let n = rec.body.len();
     // 先占额度，占不下就丢
@@ -459,6 +493,44 @@ mod tests {
         assert!(stored.contains("today is Friday"), "{stored}");
         assert!(!stored.contains(added), "{stored}");
         serde_json::from_str::<serde_json::Value>(&stored).expect("存下来的还是 JSON");
+    }
+
+    /// 请求路上找过的命中拿来打码，落盘的和自己再找一遍的一字不差；交来的只是开头一截时
+    /// 不用它（它说的是整份），照旧自己找
+    #[test]
+    fn the_hits_found_on_the_way_in_are_used_only_for_the_whole_body() {
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"key {KEY} 库 postgres://app:hunter2hunter2@db/x"}}]}}"#
+        );
+        for mode in [
+            tw_config::SecurityMode::Observe,
+            tw_config::SecurityMode::Enforce,
+        ] {
+            let rules = RuleSet::defaults();
+            let seen = crate::guard::look_hits(mode, &rules, body.as_bytes());
+            assert_eq!(seen.hits.as_ref().map(Vec::len), Some(2));
+            let r = Redaction {
+                rules: Arc::new(rules),
+                ledger: seen.ledger,
+            };
+            let again = written(record(BodyKind::Request, &body, r.clone()));
+            let reused =
+                written(record(BodyKind::Request, &body, r).found(seen.hits.map(Arc::from)));
+            assert_eq!(reused, again);
+            assert!(!reused.contains(KEY), "{reused}");
+        }
+        // 说「什么都没找到」的命中：整份交来时照它（证明真的用上了），截过的不照它
+        let lie = || Some(Arc::from(Vec::new()));
+        let whole = written(record(BodyKind::Request, &body, Redaction::default()).found(lie()));
+        assert!(whole.contains("sk-an…AAAA"), "{whole}");
+        assert!(
+            whole.contains("hunter2hunter2"),
+            "规则那一道真的没再找：{whole}"
+        );
+        let mut cut = record(BodyKind::Request, &body, Redaction::default()).found(lie());
+        cut.original_len = body.len() + 1;
+        let cut = written(cut);
+        assert!(!cut.contains("hunter2hunter2"), "{cut}");
     }
 
     #[test]
