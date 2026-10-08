@@ -523,12 +523,68 @@ impl RuleSet {
     }
 }
 
-fn is_tok(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+/// 一个字节是不是 token 的一部分。**token 只由 ASCII 组成**，所以按字节切和按字符切切出来的
+/// 一样：多字节字符的每个字节都不小于 0x80，既落不进 token，也不是反斜杠和引号。
+const fn is_tok(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
 }
 
-/// 一段 token 是哪种 API 密钥。**只看开着的那几条。**
-fn classify_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
+/// [`is_tok`] 查表：每个请求体的每个字节都要问一次
+const TOK: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        t[b] = is_tok(b as u8);
+        b += 1;
+    }
+    t
+};
+
+/// 一把密钥最短有多长：前缀规则里最短的那一种（前缀加上至少要有的尾巴），和 OpenAI 老式
+/// 密钥的下限，取小的。比它短的 token 哪一种都不是 —— 一段正文里绝大多数 token 在这里就
+/// 回去了
+const KEY_MIN: usize = {
+    let mut min = OPENAI_MIN;
+    let mut i = 0;
+    while i < BUILTINS.len() {
+        if let Matcher::Prefix { prefix, min_tail } = BUILTINS[i].matcher
+            && prefix.len() + min_tail < min
+        {
+            min = prefix.len() + min_tail;
+        }
+        i += 1;
+    }
+    min
+};
+
+/// 一把密钥能以哪些字节开头：每条前缀规则的头一个字节，和 OpenAI 老式密钥的 `s`
+const KEY_FIRST: [bool; 256] = {
+    let mut t = [false; 256];
+    t[b's' as usize] = true;
+    let mut i = 0;
+    while i < BUILTINS.len() {
+        if let Matcher::Prefix { prefix, .. } = BUILTINS[i].matcher {
+            t[prefix.as_bytes()[0] as usize] = true;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// 一段 token 是哪种 API 密钥。**只看开着的那几条。**`openai`：OpenAI 老式密钥那条开着
+/// （扫之前问一次，不在每个 token 上查一遍表）。
+///
+/// 太短的、开头哪条前缀都对不上的直接回去：[`classify_prefixed`] 认得出的 token 都过得了
+/// 这两关（[`KEY_MIN`]、[`KEY_FIRST`]）。
+fn classify_token(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
+    if tok.len() < KEY_MIN || !KEY_FIRST[usize::from(tok.as_bytes()[0])] {
+        return None;
+    }
+    classify_prefixed(tok, set, openai)
+}
+
+/// [`classify_token`] 的判据本身。
+fn classify_prefixed(tok: &str, set: &RuleSet, openai: bool) -> Option<&'static str> {
     for b in BUILTINS {
         if let Matcher::Prefix { prefix, min_tail } = b.matcher
             && let Some(tail) = tok.strip_prefix(prefix)
@@ -539,7 +595,7 @@ fn classify_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
             return set.is_on(b.id).then_some(b.id);
         }
     }
-    if set.is_on("openai-api-key")
+    if openai
         && let Some(tail) = tok.strip_prefix("sk-")
         && tok.len() >= OPENAI_MIN
         && !tail.starts_with("ant-")
@@ -569,34 +625,43 @@ fn classify_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
 ///
 /// 回调的第三个参数说这个 token 在不在一个 JSON 字符串里面（数没转义的引号；
 /// 文本是 JSON 时才有意义）。
+///
+/// **按字节走，不按字符解码**：token、反斜杠、引号都是 ASCII（见 [`is_tok`]），多字节字符
+/// 的字节在这里只是分隔。反斜杠后面跟着的是一个多字节字符时，跳过的只是它的头一个字节，
+/// 剩下的几个照样只是分隔 —— 切出来的和按字符切的一样（测试拿两种切法对过）。token 的两头
+/// 都落在 ASCII 字节上，切片一定在字符边界上。
 fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
+    let b = text.as_bytes();
     let mut start: Option<usize> = None;
     let mut quoted = false;
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\\' {
-            if let Some(s) = start.take() {
-                f(&text[s..i], s..i, quoted);
-            }
-            // 反斜杠后面那个字符是转义的一部分；`\u` 再带四位十六进制
-            if let Some((_, 'u')) = chars.next() {
-                for _ in 0..4 {
-                    if chars.next_if(|(_, h)| h.is_ascii_hexdigit()).is_none() {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if is_tok(c) {
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if TOK[usize::from(c)] {
             start.get_or_insert(i);
+            i += 1;
             continue;
         }
         if let Some(s) = start.take() {
             f(&text[s..i], s..i, quoted);
         }
-        if c == '"' {
-            quoted = !quoted;
+        i += 1;
+        match c {
+            // 反斜杠后面那个字符是转义的一部分；`\u` 再带四位十六进制
+            b'\\' => {
+                if b.get(i) == Some(&b'u') {
+                    i += 1;
+                    let mut n = 0;
+                    while n < 4 && b.get(i).is_some_and(u8::is_ascii_hexdigit) {
+                        i += 1;
+                        n += 1;
+                    }
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            b'"' => quoted = !quoted,
+            _ => {}
         }
     }
     if let Some(s) = start {
@@ -615,7 +680,8 @@ const PEM_KEY: &str = "PRIVATE KEY-----";
 /// 空壳 PEM，它会以为文件坏了然后建议你重新生成一把 —— 那是在帮倒忙。
 fn private_keys(text: &str, out: &mut Vec<Hit>) {
     let mut from = 0;
-    while let Some(b) = text[from..].find(PEM_BEGIN) {
+    // 按字节找（SIMD）：整个请求体都要过一遍，而它几乎从来不在里面
+    while let Some(b) = memchr::memmem::find(&text.as_bytes()[from..], PEM_BEGIN.as_bytes()) {
         let begin = from + b;
         // **不能按换行找那一行的结尾。**请求体是 JSON，里面的换行是
         // `\n` 两个字符，不是一个换行符 —— 按换行找的话整个 PEM 会落在
@@ -663,6 +729,10 @@ fn is_b64url(s: &str) -> bool {
 /// 那个解码是必需的：光看「三段用点分开的 base64」会把版本号、文件路径、
 /// 甚至 `a.b.c` 这种普通标识符全算上。
 fn looks_like_jwt(tok: &str) -> bool {
+    // 首段至少 8 个字符，后两段各至少一个，加两个点：短于 12 的不可能是
+    if tok.len() < 12 {
+        return false;
+    }
     // 先数点，不把三段收集起来：每个 token 都要过这一关，绝大多数在这里就回去了
     if tok.bytes().filter(|&b| b == b'.').count() != 2 || !tok.split('.').all(is_b64url) {
         return false;
@@ -695,7 +765,7 @@ fn looks_like_jwt(tok: &str) -> bool {
 fn conn_strings(text: &str, out: &mut Vec<Hit>) {
     let bytes = text.as_bytes();
     let mut from = 0;
-    while let Some(i) = text[from..].find("://") {
+    while let Some(i) = memchr::memmem::find(&bytes[from..], b"://") {
         let sep = from + i;
         let after = sep + 3;
         // userinfo 到 `@` 为止；`@` 必须在同一段里（不能跨空白或斜杠）
@@ -752,14 +822,16 @@ fn is_rfc1918(tok: &str) -> bool {
 /// **不含回环。**`127.0.0.1` 和 `localhost` 是这台机器自己 —— 而用户问
 /// 的很可能正是「我本地这个服务为什么连不上」，把它换成占位符等于把问题
 /// 本身藏起来了。何况我们的网关自己就住在那儿。
-fn internal_token(tok: &str, set: &RuleSet) -> Option<&'static str> {
-    if set.is_on("internal-ip") && is_rfc1918(tok) {
+///
+/// `ip`、`domain`：那两条开没开（扫之前问一次，不在每个 token 上查一遍表）。
+fn internal_token(tok: &str, ip: bool, domain: bool) -> Option<&'static str> {
+    if ip && is_rfc1918(tok) {
         return Some("internal-ip");
     }
     // 后缀不分大小写地比，**不先转成小写**：每个 token 都要过这一关，转一次就是
     // 一次分配
     let t = tok.as_bytes();
-    if set.is_on("internal-domain")
+    if domain
         && t.len() > 7
         && t.contains(&b'.')
         && INTERNAL_SUFFIXES.iter().any(|s| {
@@ -1264,6 +1336,11 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_on("email") {
         emails(text, &mut out);
     }
+    // 每个 token 都要问的几条开没开，扫之前问一次：在每个 token 上查一遍表，光哈希就占了
+    // 整遍扫描的两成
+    let want_openai = set.is_on("openai-api-key");
+    let want_ip = set.is_on("internal-ip");
+    let want_domain = set.is_on("internal-domain");
     let want_jwt = set.is_on("jwt");
     let want_id = set.is_on("cn-resident-id");
     let want_card = set.is_on("bank-card");
@@ -1291,7 +1368,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             // 字符串外面的东西把在接的那一串截断
             spaced.finish(text, &mut out);
         }
-        if let Some(id) = classify_token(tok, set) {
+        if let Some(id) = classify_token(tok, set, want_openai) {
             out.push(builtin_hit(id, span));
             return;
         }
@@ -1299,7 +1376,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
             out.push(builtin_hit("jwt", span));
             return;
         }
-        if let Some(id) = internal_token(tok, set) {
+        if let Some(id) = internal_token(tok, want_ip, want_domain) {
             out.push(builtin_hit(id, span));
         }
     });
@@ -2671,5 +2748,188 @@ mod tests {
             "张三 <<TW_EMAIL_1>> <<TW_PHONE_1>>，李四 <<TW_EMAIL_2>>"
         );
         assert_eq!(crate::redact::replace::restore(&r.text, &r.ledger), body);
+    }
+
+    /// 以前的切法：按字符解码着走。按字节走的 [`for_each_token`] 切出来的要和它一模一样
+    fn tokens_by_char(text: &str) -> Vec<(String, Range<usize>, bool)> {
+        let mut out = Vec::new();
+        let mut f = |t: &str, r: Range<usize>, q: bool| out.push((t.to_string(), r, q));
+        let mut start: Option<usize> = None;
+        let mut quoted = false;
+        let mut chars = text.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                if let Some(s) = start.take() {
+                    f(&text[s..i], s..i, quoted);
+                }
+                if let Some((_, 'u')) = chars.next() {
+                    for _ in 0..4 {
+                        if chars.next_if(|(_, h)| h.is_ascii_hexdigit()).is_none() {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                start.get_or_insert(i);
+                continue;
+            }
+            if let Some(s) = start.take() {
+                f(&text[s..i], s..i, quoted);
+            }
+            if c == '"' {
+                quoted = !quoted;
+            }
+        }
+        if let Some(s) = start {
+            f(&text[s..], s..text.len(), quoted);
+        }
+        out
+    }
+
+    fn tokens_by_byte(text: &str) -> Vec<(String, Range<usize>, bool)> {
+        let mut out = Vec::new();
+        for_each_token(text, |t, r, q| out.push((t.to_string(), r, q)));
+        out
+    }
+
+    /// 随机拼出来的一段：ASCII 的字母数字和标点、引号、反斜杠和各种转义（含不完整的
+    /// `\u`、反斜杠后面跟着中文和 emoji、结尾一个落单的反斜杠）、中文、emoji、组合字符
+    fn random_text(next: &mut impl FnMut(usize) -> usize) -> String {
+        const PIECES: &[&str] = &[
+            "a",
+            "Z",
+            "9",
+            "-",
+            "_",
+            ".",
+            " ",
+            ",",
+            ":",
+            "{",
+            "}",
+            "[",
+            "]",
+            "\"",
+            "\\",
+            "\\\\",
+            "\\n",
+            "\\t",
+            "\\\"",
+            "\\u",
+            "\\u00e9",
+            "\\u5bc6",
+            "\\uD83D\\uDE00",
+            "\\u12",
+            "\\uzz",
+            "\\é",
+            "\\密",
+            "\\😀",
+            "u",
+            "00e9",
+            "sk-ant-",
+            "AKIA",
+            "eyJ",
+            "密钥",
+            "：",
+            "😀",
+            "👩‍💻",
+            "e\u{301}",
+            "\u{200B}",
+            "\u{7f}",
+            "\t",
+            "\n",
+            "é",
+            "→",
+            "ghp_",
+            "@",
+            "/",
+            "+",
+            "=",
+        ];
+        let n = next(40);
+        (0..n).map(|_| PIECES[next(PIECES.len())]).collect()
+    }
+
+    #[test]
+    fn cutting_by_byte_cuts_exactly_where_cutting_by_char_did() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let t = random_text(&mut next);
+            assert_eq!(tokens_by_byte(&t), tokens_by_char(&t), "{t:?}");
+        }
+        for t in [
+            "",
+            "\\",
+            "a\\",
+            "\\u",
+            "\\u0",
+            "\\😀x",
+            "\"a\\\"b\"c",
+            "密\\钥sk",
+            "x\u{1F600}",
+        ] {
+            assert_eq!(tokens_by_byte(t), tokens_by_char(t), "{t:?}");
+        }
+    }
+
+    /// 太短的、开头哪条前缀都对不上的 token 直接回去：哪一条规则开着、关着，结论都和逐条
+    /// 比前缀的一样
+    #[test]
+    fn the_quick_rejections_never_drop_a_key() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        const TAIL: &[u8] = b"abcXYZ0189-_.";
+        let mut heads: Vec<&str> = BUILTINS
+            .iter()
+            .filter_map(|b| match b.matcher {
+                Matcher::Prefix { prefix, .. } => Some(prefix),
+                _ => None,
+            })
+            .collect();
+        heads.extend(["sk-", "s", "x", "", "Sk-", "ak"]);
+        let sets = [
+            all(),
+            RuleSet::defaults(),
+            RuleSet::none(),
+            RuleSet::only(&["openai-api-key"]),
+            RuleSet::only(&["anthropic-api-key", "aws-access-key-id"]),
+        ];
+        for _ in 0..20_000 {
+            let mut tok = heads[next(heads.len())].to_string();
+            for _ in 0..next(50) {
+                tok.push(TAIL[next(TAIL.len())] as char);
+            }
+            if tok.is_empty() {
+                continue;
+            }
+            for set in &sets {
+                for openai in [true, false] {
+                    assert_eq!(
+                        classify_token(&tok, set, openai),
+                        classify_prefixed(&tok, set, openai),
+                        "{tok}"
+                    );
+                }
+            }
+        }
+        // 最短的那种刚好够长时认得出
+        assert_eq!(KEY_MIN, "AKIA".len() + 12);
+        assert_eq!(
+            classify_token("AKIAABCDEFGHIJKL", &all(), true),
+            Some("aws-access-key-id")
+        );
     }
 }

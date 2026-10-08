@@ -492,10 +492,7 @@ fn find_at(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if from >= hay.len() || needle.len() > hay.len() - from {
         return None;
     }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|i| i + from)
+    memchr::memmem::find(&hay[from..], needle).map(|i| i + from)
 }
 
 /// 从 `open`（一个 `{`）开始配对，返回对应 `}` 的下标。

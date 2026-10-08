@@ -79,7 +79,7 @@ providers:
             gw.pricing.clone(),
         )
         .settling_to(tw_control::key_limits::settle_hook(&gw)),
-        gw.bus.subscribe(),
+        gw.bus.record_feed().unwrap(),
         rx,
     );
     let addr = tw_gateway::serve(gw.clone(), ([127, 0, 0, 1], 0).into())
@@ -243,7 +243,7 @@ providers:
             gw.pricing.clone(),
         )
         .settling_to(tw_control::key_limits::settle_hook(&gw)),
-        gw.bus.subscribe(),
+        gw.bus.record_feed().unwrap(),
         rx,
     );
     let addr = tw_gateway::serve(gw.clone(), ([127, 0, 0, 1], 0).into())

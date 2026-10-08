@@ -51,6 +51,17 @@ pub fn look(mode: Mode, rules: &RuleSet, body: &[u8]) -> (Vec<Finding>, Ledger) 
     flow::look(mode, rules, body)
 }
 
+/// [`look`]，连同找到的命中（见 [`flow::Look::hits`]）：同一份正文落盘前打码时不再找一遍
+/// （[`crate::bodies::BodyRecord::found`]）。
+pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8]) -> flow::Look {
+    flow::look_hits(
+        mode,
+        rules,
+        body,
+        Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+    )
+}
+
 /// [`look`]，接着 `seed` 的账编号（见 [`flow::look_from`]）。
 pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
     flow::look_from(mode, rules, body, seed)
@@ -64,6 +75,30 @@ pub fn replace(
     ledger: &Ledger,
 ) -> (bytes::Bytes, Ledger) {
     flow::replace(mode, rules, body, ledger)
+}
+
+/// [`replace`]，`found` 是按这套规则在 `body` 上已经找过的命中（[`look_hits`] 在同一份字节上
+/// 找的）：照它换，不再找一遍。没找过的是 `None`，和 [`replace`] 一样。
+pub fn replace_found(
+    mode: Mode,
+    rules: &RuleSet,
+    body: bytes::Bytes,
+    ledger: &Ledger,
+    found: Option<&[Hit]>,
+) -> (bytes::Bytes, Ledger) {
+    let Some(hits) = found.filter(|_| mode.acts() && !rules.is_empty()) else {
+        return replace(mode, rules, body, ledger);
+    };
+    // 没命中就原样返回，连一次拷贝都不做
+    if hits.is_empty() {
+        return (body, ledger.clone());
+    }
+    // 找得到命中的一定是 UTF-8（见 `flow::look_hits`）
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return replace(mode, rules, body, ledger);
+    };
+    let r = tw_guard::redact::replace::apply(text, hits, ledger.clone());
+    (bytes::Bytes::from(r.text), r.ledger)
 }
 
 /// `after` 里 `before` 没有的那些值：插件写进请求里的（见 [`crate::plugin::request`]）。
@@ -138,6 +173,16 @@ impl Screen {
 /// 用的也是它。
 pub fn screen(s: &Screen, dialect: tw_dialect::ir::Dialect, body: &[u8]) -> Screening {
     tw_guard::content::screen(s.mode, &s.rules, dialect, body)
+}
+
+/// [`screen`]，请求体已经解析好了：`v` 是它解出来的样子（见
+/// [`tw_guard::content::screen_value`]）。
+pub fn screen_value(
+    s: &Screen,
+    dialect: tw_dialect::ir::Dialect,
+    v: &serde_json::Value,
+) -> Screening {
+    tw_guard::content::screen_value(s.mode, &s.rules, dialect, v)
 }
 
 /// 把一次查下来的结论报出去：每条命中的规则一条 [`tw_api::Event::ContentMatched`]，挂在
@@ -433,6 +478,37 @@ mod tests {
         assert!(!out.contains("AKIA"), "{out}");
         assert!(out.contains("<<TW_SECRET_150>>"), "{out}");
         assert_eq!(ledger.len(), 150);
+    }
+
+    /// 照开头那一遍找到的命中换，和自己再找一遍换的一字不差、账本一样
+    #[test]
+    fn replacing_with_the_hits_already_found_is_replacing() {
+        let other = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let body = bytes::Bytes::from(format!(
+            r#"{{"system":"<<TW_SECRET_1>> {KEY}","messages":[{{"content":"{other} {KEY}"}}]}}"#
+        ));
+        let rules = RuleSet::defaults();
+        let seen = look_hits(Mode::Enforce, &rules, &body);
+        let hits = seen.hits.unwrap();
+        let again = replace(Mode::Enforce, &rules, body.clone(), &seen.ledger);
+        let known = replace_found(
+            Mode::Enforce,
+            &rules,
+            body.clone(),
+            &seen.ledger,
+            Some(&hits),
+        );
+        assert_eq!(known.0, again.0);
+        assert_eq!(known.1.table(), again.1.table());
+        assert!(!String::from_utf8_lossy(&known.0).contains(KEY));
+        // 观察档不换，找过也不换
+        let (out, _) = replace_found(Mode::Observe, &rules, body.clone(), &fresh(), Some(&hits));
+        assert_eq!(out, body);
+        // 什么都没找到：原样，不拷贝
+        let plain = bytes::Bytes::from_static(b"{\"messages\":[]}");
+        let (out, l) = replace_found(Mode::Enforce, &rules, plain.clone(), &fresh(), Some(&[]));
+        assert_eq!(out.as_ptr(), plain.as_ptr());
+        assert!(l.is_empty());
     }
 
     /// 查表比和两两比，留下的一模一样：同一条规则下打码一样的算见过，换一条规则就不算

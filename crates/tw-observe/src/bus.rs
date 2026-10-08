@@ -7,15 +7,22 @@
 //!
 //! 注意这条豁免**不适用于成本记账**：那类数据丢了账单永久对不
 //! 上，必须走别的路径。这里只走「丢了只是图上少个点」的东西。
+//!
+//! **存储层不订阅广播**，它有自己的一条有界通道（[`EventBus::record_feed`]）：广播上
+//! 掉队丢掉的是界面上的几个点，记录丢掉的是那几个请求，永远不在库里了。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 const CAPACITY: usize = 1024;
+
+/// 存储层那条通道有多少格（见 [`EventBus::record_feed`]）。一个请求五六条事件，这么多格
+/// 够存储层落后两千多个请求
+pub const RECORD_CAPACITY: usize = 16 * 1024;
 
 /// 生成速率看最近这么久里跑完的请求
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -26,6 +33,39 @@ pub struct EventBus {
     next_id: Arc<AtomicU64>,
     /// 在跑的和最近跑完的。见 [`EventBus::in_flight`]、[`EventBus::live`]
     tally: Arc<Mutex<Tally>>,
+    /// 存储层自己的那条通道，接上了才有。见 [`EventBus::record_feed`]
+    record: Arc<OnceLock<RecordSink>>,
+}
+
+/// 往存储层那条通道里送的一头。
+struct RecordSink {
+    tx: mpsc::Sender<tw_api::Event>,
+    /// 通道满着、没送进去的条数，存储层拿去记一行日志
+    dropped: Arc<AtomicU64>,
+}
+
+/// 存储层收事件的那一头（[`EventBus::record_feed`]）。
+pub struct RecordFeed {
+    rx: mpsc::Receiver<tw_api::Event>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl RecordFeed {
+    /// 等下一条。总线没了是 None。**会挡住当前线程**：给存储层自己的记录线程用，不在
+    /// 异步线程上调
+    pub fn blocking_recv(&mut self) -> Option<tw_api::Event> {
+        self.rx.blocking_recv()
+    }
+
+    /// 已经到了的下一条，不等
+    pub fn try_recv(&mut self) -> Option<tw_api::Event> {
+        self.rx.try_recv().ok()
+    }
+
+    /// 上次问到现在，通道满着丢掉了几条
+    pub fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
 }
 
 /// 按事件数出来的现状。
@@ -124,6 +164,7 @@ impl EventBus {
             tx,
             next_id: Arc::new(AtomicU64::new(1)),
             tally: Arc::default(),
+            record: Arc::default(),
         }
     }
 
@@ -149,9 +190,36 @@ impl EventBus {
     ///
     /// **先记账再发**（见 [`EventBus::in_flight`]）：订阅者收到一个结局的
     /// 时候，快照里已经没有它了。
+    ///
+    /// 存储层那条通道满着时**丢，不等**：转发不等观测。
     pub fn emit(&self, ev: tw_api::Event) {
         self.track(&ev);
+        if let Some(sink) = self.record.get()
+            && let Err(mpsc::error::TrySendError::Full(_)) = sink.tx.try_send(ev.clone())
+        {
+            sink.dropped.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = self.tx.send(ev);
+    }
+
+    /// 存储层收事件的那条通道：**有界，和界面的广播分开**，之后发的每一条都进来。
+    ///
+    /// 广播满了丢最老的，掉队的订阅者跳过一截。对界面那是少画几个点，它还会收到
+    /// `EventsDropped` 自己对账；对记录那是几个请求永远不在库里。以前存储层就订阅广播，
+    /// 和界面挤同一个 [`CAPACITY`] 格的环。走自己这条的话，[`RECORD_CAPACITY`] 格平常
+    /// 一条都不丢；真满了照样丢（转发不等观测），存储层说一声丢了几条。
+    ///
+    /// **只给一次**，第二次是 None：两个记录器各分到一半事件，两边都缺。
+    pub fn record_feed(&self) -> Option<RecordFeed> {
+        let (tx, rx) = mpsc::channel(RECORD_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        self.record
+            .set(RecordSink {
+                tx,
+                dropped: dropped.clone(),
+            })
+            .ok()?;
+        Some(RecordFeed { rx, dropped })
     }
 
     /// 开始的记下，有了结局的划掉。
@@ -751,6 +819,41 @@ mod tests {
         let a = b.next_id();
         let c = b.next_id();
         assert!(c > a);
+    }
+
+    /// **存储层不和界面挤一个环。**界面那个订阅者落后到被跳过一截时，存储层那条通道里
+    /// 一条不少、顺序不乱 —— 以前它也订阅广播，界面落后的时候它多半也落后，丢掉的那几个
+    /// 请求永远不在库里
+    #[test]
+    fn the_store_gets_every_event_while_a_lagging_subscriber_skips_some() {
+        let b = EventBus::new();
+        let mut ui = b.subscribe();
+        let mut feed = b.record_feed().unwrap();
+        let n = CAPACITY as u64 * 4;
+        for id in 0..n {
+            b.emit(finished(id, 0, None));
+        }
+        assert!(matches!(
+            ui.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let got: Vec<u64> = std::iter::from_fn(|| feed.try_recv().map(|e| e.id())).collect();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+        assert_eq!(feed.take_dropped(), 0);
+    }
+
+    /// 存储层那条通道满了：**丢，不挡**，丢了几条说得出来。只给一次
+    #[test]
+    fn a_full_store_feed_drops_and_counts_rather_than_blocking() {
+        let b = EventBus::new();
+        let mut feed = b.record_feed().unwrap();
+        assert!(b.record_feed().is_none(), "给了第二个记录器");
+        for id in 0..(RECORD_CAPACITY as u64 + 10) {
+            b.emit(finished(id, 0, None));
+        }
+        assert_eq!(feed.take_dropped(), 10);
+        assert_eq!(feed.take_dropped(), 0, "问过一次就清零");
+        assert_eq!(feed.try_recv().map(|e| e.id()), Some(0));
     }
 
     #[tokio::test]

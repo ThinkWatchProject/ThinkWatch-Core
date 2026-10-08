@@ -50,6 +50,20 @@ const NO_PRICE: &str = "(cost_micros IS NULL AND input_tokens IS NOT NULL \
 const NO_USAGE: &str = "(cost_micros IS NULL AND input_tokens IS NULL AND error IS NULL \
                          AND billing = 'per-token' AND (cancelled = 1 OR status < 300))";
 
+/// 数路由命中要的那几项，从路由那一列（`tw_api::RoutingView` 的 JSON）里取（见
+/// [`Db::route_hits`]）。**建索引的和查询的是同一串**：表达式一字不差，SQLite 才用索引里
+/// 存好的值，不回表去解 JSON。
+///
+/// 用 `json_extract` 不用 `->>`：索引写在库文件里，读这个库的 SQLite 都得认得它。
+const ROUTE: &str = "json_extract(routing, '$.route')";
+const RULE: &str = "json_extract(routing, '$.rule')";
+/// 一个 JSON 数组的原文（`[]`、`["关思考"]`）
+const REWRITTEN_BY: &str = "json_extract(routing, '$.rewritten_by')";
+const DENIED_BY: &str = "json_extract(routing, '$.denied_by')";
+/// 经过路由、路由那一列解得开的行。**解不开的不进索引**：一行坏掉的记录不该让整张表出不来，
+/// 也不该让它自己写不进去
+const ROUTED: &str = "local = 0 AND json_valid(routing)";
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("{path} could not be opened: {source}")]
@@ -272,7 +286,40 @@ impl Db {
         if found == 0 {
             db.create()?;
         }
+        db.indexes();
         Ok(db)
+    }
+
+    /// 表之外另加的索引，**每次打开都走一遍**（`IF NOT EXISTS`，建过了就是空操作）。
+    ///
+    /// **它们不算 schema，加它们不加 [`SCHEMA`]**：索引不改变一行长什么样，少了它查询照样
+    /// 对、只是慢，多了它别的版本照样读写（SQLite 自己维护）。加 [`SCHEMA`] 却要清掉每个人
+    /// 的请求历史 —— 为了快一点不值得。已有的库第一次打开时要建一遍（二十七万行一秒上下）。
+    ///
+    /// **建不成只记一行日志**：那时查询照样对，只是慢。
+    fn indexes(&self) {
+        // - `requests_client`：每把密钥最后一次用在什么时候，一把一把地跳着取（见
+        //   `last_seen_by_client`）。**只给那一条查询用**：条件里要写上 `client > ''` 才用得上
+        //   它。按时间窗、按密钥分组的那些（密钥的用量、按密钥的费用）用了它，会把整个索引按
+        //   密钥扫一遍，比沿着时刻走慢得多
+        // - `requests_session_at`：最近活动过的会话，按时间倒着走，只读索引（见 `sessions`）
+        // - `requests_routed`：各条路由、规则命中了多少要的那几项，落库时从路由那一列里取出来
+        //   存在索引里。数的时候只读索引，不再把一周几 MB 的 JSON 读出来解一遍（见
+        //   `route_hits`）
+        let sql = format!(
+            "CREATE INDEX IF NOT EXISTS requests_client ON requests (client, at_ms)
+                WHERE client > '';
+             CREATE INDEX IF NOT EXISTS requests_session_at ON requests (at_ms, session)
+                WHERE session IS NOT NULL AND local = 0;
+             CREATE INDEX IF NOT EXISTS requests_routed
+                ON requests (at_ms, {ROUTE}, {RULE}, {REWRITTEN_BY}, {DENIED_BY}, error IS NOT NULL)
+                WHERE {ROUTED};"
+        );
+        if let Err(e) = self.conn.execute_batch(&sql) {
+            tracing::warn!(
+                "the request history could not be indexed, so some views load slowly: {e}"
+            );
+        }
     }
 
     /// 建表。**只有这一份，没有迁移**：表的样子一变，改这里、[`SCHEMA`] 加一，
@@ -535,6 +582,52 @@ pub struct SessionRow {
     pub errors: i64,
 }
 
+/// 一次会话汇总的那几列，和 [`session_row`] 一列对一列。`GROUP BY session` 之后用
+fn session_columns() -> String {
+    format!(
+        "session,
+         client,
+         MIN(at_ms), MAX(at_ms), COUNT(*),
+         COALESCE(SUM(cost_micros), 0),
+         COALESCE(SUM({NO_PRICE}), 0),
+         COALESCE(SUM(input_tokens), 0),
+         COALESCE(SUM(output_tokens), 0),
+         COALESCE(SUM(cache_read_tokens), 0),
+         COALESCE(SUM(cache_write_tokens), 0),
+         COALESCE(SUM(cache_saved_micros), 0),
+         COALESCE(MAX(input_tokens), 0),
+         GROUP_CONCAT(DISTINCT model),
+         SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
+         COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
+         COUNT(cost_micros),
+         COALESCE(SUM({NO_USAGE}), 0)"
+    )
+}
+
+/// 读出 [`session_columns`] 的一行
+fn session_row(r: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        id: r.get(0)?,
+        client: r.get(1)?,
+        started_ms: r.get(2)?,
+        ended_ms: r.get(3)?,
+        turns: r.get(4)?,
+        cost_micros: r.get(5)?,
+        unpriced_turns: r.get(6)?,
+        input_tokens: r.get(7)?,
+        output_tokens: r.get(8)?,
+        cache_read_tokens: r.get(9)?,
+        cache_write_tokens: r.get(10)?,
+        cache_saved_micros: r.get(11)?,
+        peak_input_tokens: r.get(12)?,
+        models: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        errors: r.get(14)?,
+        cost_micros_estimated: r.get(15)?,
+        priced_turns: r.get(16)?,
+        no_usage_turns: r.get(17)?,
+    })
+}
+
 /// 会话里的一轮。上下文增长曲线和成本瀑布画的就是它。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnRow {
@@ -568,61 +661,91 @@ impl Db {
     ///
     /// **筛的是会话，不是轮次。**把轮次按时间筛掉再聚合的话，一次跨过
     /// 窗口边界的任务会少算几轮、少算一截钱 —— 而「那次重构花了多少」
-    /// 问的是整次任务，不是它落在某个窗口里的那一段。所以先整体聚合，
-    /// 再按「有没有任何一轮落在窗口里」留下整条。
+    /// 问的是整次任务，不是它落在某个窗口里的那一段。所以留下的会话整条聚合，
+    /// 按「首尾之间和窗口有没有重叠」留。
+    ///
+    /// **先挑会话，再聚合挑中的那几次**（[`Db::recent_sessions`]）。以前把三个月里每一行按
+    /// 会话分组、排序之后再截前几百条：二十七万行要两百毫秒，而界面每结束一个请求就来要一次。
     pub fn sessions(
         &self,
         within: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<SessionRow>, DbError> {
+        let picked = self.recent_sessions(within, limit)?;
+        if picked.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 挑中的会话号作为一个 JSON 数组交进去：几百个占位符拼不出一条好读的 SQL
+        let picked = serde_json::Value::from(picked).to_string();
         let mut st = self.conn.prepare(&format!(
-            "SELECT session,
-                    client,
-                    MIN(at_ms), MAX(at_ms), COUNT(*),
-                    COALESCE(SUM(cost_micros), 0),
-                    COALESCE(SUM({NO_PRICE}), 0),
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_write_tokens), 0),
-                    COALESCE(SUM(cache_saved_micros), 0),
-                    COALESCE(MAX(input_tokens), 0),
-                    GROUP_CONCAT(DISTINCT model),
-                    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END),
-                    COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
-                    COUNT(cost_micros),
-                    COALESCE(SUM({NO_USAGE}), 0)
-             FROM requests
-             WHERE session IS NOT NULL AND local = 0
+            "SELECT {} FROM requests
+             WHERE session IN (SELECT value FROM json_each(?1)) AND local = 0
              GROUP BY session
-             HAVING MAX(at_ms) >= ?1 AND MIN(at_ms) <= ?2
-             ORDER BY MAX(at_ms) DESC
-             LIMIT ?3"
+             ORDER BY MAX(at_ms) DESC, session DESC",
+            session_columns()
         ))?;
-        let (from, to) = within.unwrap_or((i64::MIN, i64::MAX));
-        let rows = st.query_map([from, to, limit as i64], |r| {
-            Ok(SessionRow {
-                id: r.get(0)?,
-                client: r.get(1)?,
-                started_ms: r.get(2)?,
-                ended_ms: r.get(3)?,
-                turns: r.get(4)?,
-                cost_micros: r.get(5)?,
-                unpriced_turns: r.get(6)?,
-                input_tokens: r.get(7)?,
-                output_tokens: r.get(8)?,
-                cache_read_tokens: r.get(9)?,
-                cache_write_tokens: r.get(10)?,
-                cache_saved_micros: r.get(11)?,
-                peak_input_tokens: r.get(12)?,
-                models: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                errors: r.get(14)?,
-                cost_micros_estimated: r.get(15)?,
-                priced_turns: r.get(16)?,
-                no_usage_turns: r.get(17)?,
-            })
-        })?;
+        let rows = st.query_map([picked], session_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 一次会话的汇总。没有这次会话（或者它的每一轮都是本地应答的）是 None。
+    ///
+    /// **按会话号直接取**，不从列表里找：以前取最近五百次会话再从里面挑，更早的会话点开是 404。
+    pub fn session(&self, id: &str) -> Result<Option<SessionRow>, DbError> {
+        Ok(self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM requests WHERE session = ?1 AND local = 0 GROUP BY session",
+                session_columns()
+            ))?
+            .query_row([id], session_row)
+            .optional()?)
+    }
+
+    /// 最近活动过的 `limit` 次会话，最后一次活动最近的在前；`within` 给了就只要首尾之间和它
+    /// 重叠的。
+    ///
+    /// **只走索引，不按会话分组整张表**：按时间倒着走（`requests_session_at`，只有带会话、
+    /// 不是本地应答的行），一次会话第一次碰到的那一行就是它最后一次活动，碰够了就停。窗口的
+    /// 起点之前不必再走：最后一次活动比它早的会话不和窗口重叠。最后一次活动在窗口终点之后的，
+    /// 再按会话号取它的第一轮（`requests_session`）看是不是不晚于终点。
+    fn recent_sessions(
+        &self,
+        within: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<String>, DbError> {
+        let (from, to) = within.unwrap_or((i64::MIN, i64::MAX));
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let mut walk = self.conn.prepare(
+            "SELECT session, at_ms FROM requests
+             WHERE session IS NOT NULL AND local = 0 AND at_ms >= ?1
+             ORDER BY at_ms DESC, session DESC",
+        )?;
+        let mut first = self.conn.prepare(
+            "SELECT at_ms FROM requests WHERE session = ?1 AND local = 0
+             ORDER BY at_ms LIMIT 1",
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = walk.query([from])?;
+        while let Some(r) = rows.next()? {
+            let session = r.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+            if seen.contains(session) {
+                continue;
+            }
+            let last: i64 = r.get(1)?;
+            let overlaps = last <= to || first.query_row([session], |r| r.get::<_, i64>(0))? <= to;
+            seen.insert(session.to_string());
+            if overlaps {
+                out.push(session.to_string());
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// 一次会话里的每一轮，**按时间正序** —— 曲线是从左往右画的。
@@ -672,10 +795,22 @@ impl Db {
     /// 只有带着为那个客户端生成的密钥的请求能证明。按请求头里自报的客户端
     /// 标识分组的话，那个标识谁都能写 —— 「这把钥匙还有没有人在用」「接好了
     /// 没有」都只能按密钥问。
+    ///
+    /// **一把一把地跳着取**（`requests_client`）：取下一把比上一把大的密钥名，再取它最大的
+    /// 时刻，各是一次索引查找。按密钥分组的话要把三个月里每一行过一遍，而密钥只有几把。
+    /// 每个子查询都写着 `client > ''`：那个索引只收这些行，条件里没有它就用不上。
     pub fn last_seen_by_client(&self) -> Result<Vec<(String, i64)>, DbError> {
         let mut st = self.conn.prepare(
-            "SELECT client, MAX(at_ms) FROM requests
-             WHERE client <> '' GROUP BY client",
+            "WITH RECURSIVE keys(client) AS (
+                SELECT MIN(client) FROM requests WHERE client > ''
+                UNION ALL
+                SELECT (SELECT MIN(client) FROM requests WHERE client > keys.client AND client > '')
+                FROM keys WHERE keys.client IS NOT NULL
+             )
+             SELECT client,
+                    (SELECT MAX(at_ms) FROM requests
+                     WHERE requests.client = keys.client AND client > '')
+             FROM keys WHERE client IS NOT NULL",
         )?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1311,15 +1446,10 @@ impl Db {
     /// **按每一行记下的路由算**，不按现在的配置推：请求走的是它那一刻的路由和
     /// 规则。一个请求算在这几条规则上，每条只算一次：决定去向的那一条、附加了
     /// 改写的每一条、选定上游之后拒绝了它的那一条。本地应答的没有路由，不算。
+    ///
+    /// **只读索引**（`requests_routed`）：要的那几项落库时就从路由那一列里取出来存在索引里，
+    /// 路由图开着时每十秒来一次，不再把一周几 MB 的 JSON 读出来一行一行地解。
     fn route_hits(&self, since_ms: i64, until_ms: i64) -> Result<Vec<tw_api::RouteHits>, DbError> {
-        /// 数命中要的那几项。尝试链不用解
-        #[derive(serde::Deserialize)]
-        struct Routed {
-            route: String,
-            rule: String,
-            rewritten_by: Vec<String>,
-            denied_by: Option<String>,
-        }
         #[derive(Default)]
         struct Tally {
             requests: i64,
@@ -1334,44 +1464,52 @@ impl Db {
                 self.last_ms = self.last_ms.max(at_ms);
             }
         }
-        let mut st = self.conn.prepare(
-            "SELECT at_ms, error IS NOT NULL, routing FROM requests
-             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND routing IS NOT NULL",
-        )?;
-        let rows = st.query_map(params![since_ms, until_ms], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut routes: std::collections::BTreeMap<
-            String,
-            (Tally, std::collections::BTreeMap<String, Tally>),
-        > = Default::default();
-        for row in rows {
-            let (at_ms, failed, json) = row?;
-            // 解不开的那一行不算。**一条坏掉的记录不该让整张表出不来**
-            let Ok(r) = serde_json::from_str::<Routed>(&json) else {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT at_ms, error IS NOT NULL, {ROUTE}, {RULE}, {REWRITTEN_BY}, {DENIED_BY}
+             FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND {ROUTED}"
+        ))?;
+        let mut routes: Named<(Tally, Named<Tally>)> = Named::default();
+        let mut rows = st.query(params![since_ms, until_ms])?;
+        while let Some(r) = rows.next()? {
+            let at_ms: i64 = r.get(0)?;
+            let failed: bool = r.get(1)?;
+            // 缺了哪一项的那一行不算。**一条坏掉的记录不该让整张表出不来**
+            let (Ok(route), Ok(rule), Ok(rewritten_by), Ok(denied_by)) = (
+                r.get_ref(2)?.as_str(),
+                r.get_ref(3)?.as_str(),
+                r.get_ref(4)?.as_str(),
+                r.get_ref(5)?.as_str_or_null(),
+            ) else {
                 continue;
             };
-            let (total, rules) = routes.entry(r.route).or_default();
+            // 绝大多数请求没有附加改写，不必解
+            let rewritten_by: Vec<String> = match rewritten_by {
+                "[]" => Vec::new(),
+                j => match serde_json::from_str(j) {
+                    Ok(names) => names,
+                    Err(_) => continue,
+                },
+            };
+            let (total, rules) = routes.get(route);
             total.add(at_ms, failed);
-            let decider = rules.entry(r.rule.clone()).or_default();
+            let decider = rules.get(rule);
             decider.add(at_ms, failed);
             decider.decided += 1;
-            let mut counted = vec![r.rule];
-            for name in r.rewritten_by.into_iter().chain(r.denied_by) {
+            let mut counted = vec![rule];
+            for name in rewritten_by.iter().map(String::as_str).chain(denied_by) {
                 if !counted.contains(&name) {
-                    rules.entry(name.clone()).or_default().add(at_ms, failed);
+                    rules.get(name).add(at_ms, failed);
                     counted.push(name);
                 }
             }
         }
         let mut out: Vec<tw_api::RouteHits> = routes
+            .items
             .into_iter()
             .map(|(route, (total, rules))| {
                 let mut rules: Vec<tw_api::RuleHits> = rules
+                    .items
                     .into_iter()
                     .map(|(rule, t)| tw_api::RuleHits {
                         rule,
@@ -1409,6 +1547,36 @@ impl Db {
         Ok(self
             .conn
             .execute("DELETE FROM requests WHERE at_ms < ?1", [cutoff_ms])?)
+    }
+}
+
+/// 按名字数的一组东西。**名字只在第一次见到时拷一份**：数路由命中时一周两万行，每行都按
+/// 名字找一遍（见 [`Db::route_hits`]）
+struct Named<T> {
+    at: std::collections::HashMap<String, usize>,
+    items: Vec<(String, T)>,
+}
+
+impl<T> Default for Named<T> {
+    fn default() -> Self {
+        Self {
+            at: Default::default(),
+            items: Vec::new(),
+        }
+    }
+}
+
+impl<T: Default> Named<T> {
+    fn get(&mut self, name: &str) -> &mut T {
+        let i = match self.at.get(name) {
+            Some(&i) => i,
+            None => {
+                self.at.insert(name.to_string(), self.items.len());
+                self.items.push((name.to_string(), T::default()));
+                self.items.len() - 1
+            }
+        };
+        &mut self.items[i].1
     }
 }
 
@@ -2014,6 +2182,87 @@ pub(crate) mod tests {
         assert!(db.sessions(Some((20_000, 30_000)), 10).unwrap().is_empty());
     }
 
+    /// 列表是最后一次活动最近的那几次会话，每一次都整条聚合 —— 挑会话时只看了最近的那几行，
+    /// 聚合的却是它的每一轮。窗口按首尾和它重叠不重叠留：最后一次活动在窗口之后、开始在窗口
+    /// 之内的留，整个在窗口之后、之前的不留
+    #[test]
+    fn the_list_is_the_most_recently_active_sessions_each_counted_whole() {
+        let db = Db::in_memory().unwrap();
+        // （会话，时刻）：a 最早开始、最后结束；b 整个在中间；c 在 a 的两头之间断断续续
+        for (id, (session, at)) in [
+            ("a", 1_000),
+            ("c", 2_000),
+            ("b", 3_000),
+            ("b", 4_000),
+            ("c", 5_000),
+            ("c", 6_000),
+            ("a", 9_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = row(id as i64 + 1, at);
+            r.session = Some(session.into());
+            db.insert(&r).unwrap();
+        }
+        // 本地应答的不算，哪怕它最新
+        let mut probe = row(99, 99_000);
+        probe.session = Some("b".into());
+        probe.local = true;
+        db.insert(&probe).unwrap();
+
+        let ids = |got: Vec<SessionRow>| got.into_iter().map(|s| s.id).collect::<Vec<_>>();
+        let two = db.sessions(None, 2).unwrap();
+        assert_eq!(
+            two.iter()
+                .map(|s| (s.id.as_str(), s.turns))
+                .collect::<Vec<_>>(),
+            [("a", 2), ("c", 3)]
+        );
+        assert_eq!(two[0].started_ms, 1_000);
+        assert_eq!(ids(db.sessions(None, 10).unwrap()), ["a", "c", "b"]);
+        assert!(db.sessions(None, 0).unwrap().is_empty());
+
+        // 窗口 [3500, 4500]：三次都和它重叠（a、c 跨过它，b 在里面）
+        assert_eq!(
+            ids(db.sessions(Some((3_500, 4_500)), 10).unwrap()),
+            ["a", "c", "b"]
+        );
+        // [0, 1500]：只有 a 开始得那么早
+        assert_eq!(ids(db.sessions(Some((0, 1_500)), 10).unwrap()), ["a"]);
+        // [6500, 8000]：b、c 那时都结束了，a 还没结束
+        assert_eq!(ids(db.sessions(Some((6_500, 8_000)), 10).unwrap()), ["a"]);
+        // 窗口在所有会话之后
+        assert!(db.sessions(Some((10_000, 20_000)), 10).unwrap().is_empty());
+    }
+
+    /// 会话详情按会话号直接取：多老、前面压着多少次会话都取得到。以前从最近五百次里找，
+    /// 更早的点开是 404
+    #[test]
+    fn one_session_is_found_by_its_id_however_old() {
+        let db = Db::in_memory().unwrap();
+        for i in 0..600i64 {
+            let mut r = row(i + 1, 1_000 + i);
+            r.session = Some(format!("s{i}"));
+            db.insert(&r).unwrap();
+        }
+        let mut second = row(1_000, 5_000);
+        second.session = Some("s0".into());
+        db.insert(&second).unwrap();
+
+        let s0 = db.session("s0").unwrap().unwrap();
+        assert_eq!((s0.turns, s0.started_ms, s0.ended_ms), (2, 1_000, 5_000));
+        assert_eq!(db.session("s599").unwrap().unwrap().turns, 1);
+        assert_eq!(db.session("nope").unwrap(), None);
+
+        // 只有本地应答的不算一次会话，和列表一样
+        let mut probe = row(2_000, 6_000);
+        probe.session = Some("probes".into());
+        probe.local = true;
+        db.insert(&probe).unwrap();
+        assert_eq!(db.session("probes").unwrap(), None);
+    }
+
     #[test]
     fn the_last_request_id_is_where_the_next_run_has_to_start() {
         let db = Db::in_memory().unwrap();
@@ -2489,12 +2738,47 @@ pub(crate) mod tests {
             r.client_hint = hint.map(|s| s.to_string());
             db.insert(&r).unwrap();
         }
+        // 没有密钥的（本地来的、旧记录）不算一把
+        let mut keyless = row(9, 900);
+        keyless.client = String::new();
+        db.insert(&keyless).unwrap();
         let mut got = db.last_seen_by_client().unwrap();
         got.sort();
         assert_eq!(
             got,
             vec![("codex".to_string(), 300), ("default".to_string(), 200)]
         );
+    }
+
+    /// 另加的索引不算 schema：同一版本、还没有这些索引的库照样打开，行都在，缺的索引补上
+    /// —— 加 SCHEMA 的话，每个人的请求历史都要清掉
+    #[test]
+    fn a_database_without_the_extra_indexes_keeps_its_rows_and_gains_them() {
+        const EXTRA: [&str; 3] = ["requests_client", "requests_session_at", "requests_routed"];
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("data.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.insert(&row(1, 100)).unwrap();
+            for name in EXTRA {
+                db.conn.execute(&format!("DROP INDEX {name}"), []).unwrap();
+            }
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.count().unwrap(), 1);
+        let names: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'requests'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for name in EXTRA {
+            assert!(names.iter().any(|n| n == name), "{name}: {names:?}");
+        }
     }
 
     #[test]
@@ -3193,6 +3477,27 @@ mod route_stats_tests {
     }
 
     /// 窗口外的、本地应答的、没有路由的不算；**一条解不开的记录不挡住别的**
+    /// 路由那一列解不开的那一行照样写得进去（索引不收它），数命中时不算。**一条坏掉的记录
+    /// 不该让整张表出不来，也不该让它自己写不进去**
+    #[test]
+    fn a_row_whose_routing_does_not_parse_is_kept_and_left_out_of_the_count() {
+        let db = Db::in_memory().unwrap();
+        let mut broken = row(1, 100);
+        broken.routing = Some("{\"route\": ".into());
+        db.insert(&broken).unwrap();
+        // 解得开、却缺了必有的一项的也不算
+        let mut partial = row(2, 150);
+        partial.routing = Some(r#"{"route":"默认"}"#.into());
+        db.insert(&partial).unwrap();
+        db.insert(&routed(3, 200, "默认", "兜底", &[], None))
+            .unwrap();
+        assert_eq!(db.count().unwrap(), 3);
+        let got = db.route_stats(0, 1_000).unwrap();
+        assert_eq!(got.routes.len(), 1, "{got:?}");
+        assert_eq!(got.routes[0].requests, 1);
+        assert_eq!(hits(&got.routes[0], "兜底").decided, 1);
+    }
+
     #[test]
     fn only_routed_requests_inside_the_window_count() {
         let db = Db::in_memory().unwrap();
@@ -3284,5 +3589,258 @@ mod route_stats_tests {
         assert_eq!(db.route_stats(0, 500).unwrap().covered_since_ms, None);
         assert_eq!(db.route_stats(0, 501).unwrap().covered_since_ms, Some(500));
         assert_eq!(db.route_stats(700, 700).unwrap().covered_since_ms, None);
+    }
+}
+
+/// 一份和真实库一样大的请求库上，界面常问的那几条查询各花多久。
+///
+/// 默认不跑：要先写二十七万行。发布构建下跑（`TW_BENCH_DB` 给一个路径的话库留在那里，
+/// 下次接着用）：
+/// `cargo test --release -p tw-store history_cost -- --ignored --nocapture`
+#[cfg(test)]
+mod cost {
+    use super::tests::row;
+    use super::*;
+
+    /// 九十天、每天三千条，和留得最久的记录一样长
+    const ROWS: i64 = 270_000;
+    const NOW: i64 = 1_790_000_000_000;
+    const DAY: i64 = 86_400_000;
+
+    /// 不引随机数的库：一个线性同余就够造数据
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const CLIENTS: &[&str] = &["claude-code", "codex", "cursor", "opencode", "gemini", "pi"];
+    const ROUTES: &[&str] = &["默认", "工作", "便宜"];
+    const RULES: &[&str] = &[
+        "兜底",
+        "opus 走中转",
+        "haiku 本地",
+        "长上下文",
+        "关思考",
+        "拒绝 gpt-4",
+    ];
+    const PROVIDERS: &[&str] = &["官方", "中转 A", "中转 B", "OpenRouter", "Bedrock"];
+    const MODELS: &[&str] = &[
+        "claude-sonnet-4-5",
+        "claude-opus-4-1",
+        "gpt-5-codex",
+        "gemini-2.5-pro",
+    ];
+
+    fn routing(g: &mut Lcg) -> String {
+        let hops = if g.below(10) < 4 { 2 + g.below(2) } else { 1 };
+        let attempts = (0..hops)
+            .map(|i| {
+                let last = i + 1 == hops;
+                tw_api::AttemptView {
+                    provider: PROVIDERS[g.below(PROVIDERS.len() as u64) as usize].into(),
+                    model: (g.below(4) == 0).then(|| "claude-sonnet-4-5-20250929".into()),
+                    outcome: if last {
+                        tw_api::AttemptOutcome::Served
+                    } else {
+                        tw_api::AttemptOutcome::Error
+                    },
+                    status: last.then_some(200),
+                    error: (!last).then(|| Msg {
+                        code: "gw.upstream.timeout".into(),
+                        args: Default::default(),
+                        text: "The upstream answered 529 Overloaded: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"},\"request_id\":\"req_011CTxxxxxxxxxxxxxxxxxxx\"}; trying the next one."
+                            .into(),
+                    }),
+                    ms: 200 + g.below(30_000),
+                    usage: None,
+                    queued_ms: None,
+                    skipped: None,
+                }
+            })
+            .collect();
+        serde_json::to_string(&tw_api::RoutingView {
+            route: ROUTES[g.below(ROUTES.len() as u64) as usize].into(),
+            rule: RULES[g.below(RULES.len() as u64) as usize].into(),
+            group: Some("__all__".into()),
+            rewritten_by: (0..g.below(3))
+                .map(|_| RULES[g.below(RULES.len() as u64) as usize].to_string())
+                .collect(),
+            denied_by: (g.below(50) == 0).then(|| RULES[5].into()),
+            affinity: Some(tw_api::AffinityView {
+                held_route: g.below(2) == 0,
+                stayed: None,
+            }),
+            attempts,
+        })
+        .unwrap()
+    }
+
+    /// 造一份：会话两三个交错着进行，一次几轮到几百轮；少数请求认不出会话（WebSocket）
+    /// 或者是网关自己答的
+    fn fill(db: &Db, rows: i64) {
+        let mut g = Lcg(7);
+        // （会话号，密钥，还剩几轮）
+        let mut open: Vec<(String, &str, u64)> = Vec::new();
+        db.conn.execute_batch("BEGIN").unwrap();
+        for id in 1..=rows {
+            let at = NOW - 90 * DAY + id * (90 * DAY / rows);
+            let mut r = row(id, at);
+            r.price_source = Some(r#"{"kind":"default","date":"2026-09-30"}"#.into());
+            r.model = MODELS[g.below(MODELS.len() as u64) as usize].into();
+            r.sent_model = r.model.clone();
+            r.provider = PROVIDERS[g.below(PROVIDERS.len() as u64) as usize].into();
+            match g.below(100) {
+                0..=2 => {
+                    r.local = true;
+                    r.path = "count_tokens".into();
+                    r.client = CLIENTS[g.below(CLIENTS.len() as u64) as usize].into();
+                }
+                3..=9 => {
+                    r.client = CLIENTS[g.below(CLIENTS.len() as u64) as usize].into();
+                    r.routing = Some(routing(&mut g));
+                }
+                _ => {
+                    while open.len() < 3 {
+                        let len = if g.below(20) == 0 {
+                            300 + g.below(400)
+                        } else {
+                            1 + g.below(120)
+                        };
+                        open.push((
+                            format!("{:012x}-{at}", g.next()),
+                            CLIENTS[g.below(CLIENTS.len() as u64) as usize],
+                            len,
+                        ));
+                    }
+                    let i = g.below(open.len() as u64) as usize;
+                    r.session = Some(open[i].0.clone());
+                    r.client = open[i].1.into();
+                    r.routing = Some(routing(&mut g));
+                    open[i].2 -= 1;
+                    if open[i].2 == 0 {
+                        open.swap_remove(i);
+                    }
+                }
+            }
+            if g.below(30) == 0 {
+                r.error = Some(super::tests::upstream_failed("upstream returned 529"));
+            }
+            db.insert(&r).unwrap();
+        }
+        db.conn.execute_batch("COMMIT").unwrap();
+    }
+
+    /// 以前的会话列表：整张表按会话分组，排序之后截前几条。新的那条要和它一模一样
+    fn grouping_everything(db: &Db, within: Option<(i64, i64)>, limit: usize) -> Vec<SessionRow> {
+        let (from, to) = within.unwrap_or((i64::MIN, i64::MAX));
+        db.conn
+            .prepare(&format!(
+                "SELECT {} FROM requests
+                 WHERE session IS NOT NULL AND local = 0
+                 GROUP BY session
+                 HAVING MAX(at_ms) >= ?1 AND MIN(at_ms) <= ?2
+                 ORDER BY MAX(at_ms) DESC, session DESC
+                 LIMIT ?3",
+                session_columns()
+            ))
+            .unwrap()
+            .query_map([from, to, limit as i64], session_row)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// 挑会话再聚合，和整张表分组再截前几条，在各种窗口、各种条数下给的是同一张表
+    #[test]
+    fn the_list_is_what_grouping_every_row_gives() {
+        let db = Db::in_memory().unwrap();
+        fill(&db, 6_000);
+        for limit in [1, 7, 50, 2_000] {
+            for within in [
+                None,
+                Some((NOW - 7 * DAY, NOW)),
+                Some((NOW - 31 * DAY, NOW - 30 * DAY)),
+                Some((NOW - 60 * DAY, NOW - 59 * DAY + 1)),
+                Some((NOW + DAY, NOW + 2 * DAY)),
+                Some((i64::MIN, NOW - 89 * DAY)),
+            ] {
+                assert_eq!(
+                    db.sessions(within, limit).unwrap(),
+                    grouping_everything(&db, within, limit),
+                    "{within:?} {limit}"
+                );
+            }
+        }
+    }
+
+    fn time<T>(what: &str, mut f: impl FnMut() -> T) -> T {
+        let mut out = f();
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            out = f();
+            best = best.min(t0.elapsed());
+        }
+        eprintln!("{what:<48} {best:>12.2?}");
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn history_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var_os("TW_BENCH_DB")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| dir.path().join("data.db"));
+        let t0 = std::time::Instant::now();
+        let db = Db::open(&path).unwrap();
+        eprintln!(
+            "{:<48} {:>12.2?}",
+            "open (builds missing indexes)",
+            t0.elapsed()
+        );
+        if db.count().unwrap() < ROWS {
+            fill(&db, ROWS);
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "{} rows, {} MB on disk",
+            db.count().unwrap(),
+            size / 1_000_000
+        );
+        for (what, within) in [
+            ("sessions (no window, 200)", None),
+            ("sessions (last 7 days, 200)", Some((NOW - 7 * DAY, NOW))),
+            (
+                "sessions (a day a month ago, 200)",
+                Some((NOW - 31 * DAY, NOW - 30 * DAY)),
+            ),
+        ] {
+            let got = time(what, || db.sessions(within, 200).unwrap());
+            let grouped = time("  the same by grouping every row", || {
+                grouping_everything(&db, within, 200)
+            });
+            assert_eq!(got, grouped, "{what}");
+        }
+        // 会话详情要的那一次：最老的一次会话
+        let oldest = db.sessions(None, 2000).unwrap().pop().unwrap();
+        let one = time("one session (oldest of 2000)", || {
+            db.session(&oldest.id).unwrap()
+        });
+        assert_eq!(one, Some(oldest.clone()));
+        time("one session's turns", || db.turns(&oldest.id).unwrap());
+        time("last_seen_by_client", || db.last_seen_by_client().unwrap());
+        time("route_stats (last 7 days)", || {
+            db.route_stats(NOW - 7 * DAY, NOW).unwrap()
+        });
     }
 }

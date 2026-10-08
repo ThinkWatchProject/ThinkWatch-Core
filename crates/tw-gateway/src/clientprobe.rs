@@ -54,15 +54,16 @@ const TOPIC_MARK: &str = "Analyze if this message indicates a new conversation t
 const SUGGEST_MARK: &str = "[SUGGESTION MODE:";
 const WARMUP_BODY: &str = "Warmup";
 
-/// 认一认这是不是客户端自己的辅助请求。
+/// 认一认这是不是客户端自己的辅助请求。`parsed` 是 `body` 解析出来的 JSON（解不开是
+/// `None`）：管线为路由本来就要解析一遍，这里不再解一遍。
 ///
-/// **先做整包字节扫描快速排除**，不命中就直接返回，连 JSON 都不解析。
+/// **先做整包字节扫描快速排除**，不命中就直接返回，连解析出来的 JSON 都不看。
 /// 绝大多数请求会在这一步出去 —— 而这段代码跑在每一个请求的关键路径上。
 ///
 /// `is_claude_code` 由调用方判断。`max_tokens: 1` 那条**必须**同时要求
 /// 它，否则会误伤别人真实的 `max_tokens: 1` 请求。
-pub fn classify(body: &Bytes, is_claude_code: bool) -> Option<ProbeKind> {
-    let has = |m: &str| memfind(body, m.as_bytes());
+pub fn classify(body: &[u8], parsed: Option<&Value>, is_claude_code: bool) -> Option<ProbeKind> {
+    let has = |m: &str| memchr::memmem::find(body, m.as_bytes()).is_some();
 
     // 快速排除。四个 B 类标记各有一句独特的原文；A 类里 warmup 也有，
     // 而 health check 只能靠 `max_tokens` 这个字段名先粗筛。
@@ -75,8 +76,7 @@ pub fn classify(body: &Bytes, is_claude_code: bool) -> Option<ProbeKind> {
         return None;
     }
 
-    let v: Value = serde_json::from_slice(body).ok()?;
-    let obj = v.as_object()?;
+    let obj = parsed?.as_object()?;
 
     // B 类的三条：标记出现在 system 或者第一个 user 消息里就算。
     // **先判 B 类** —— 一个带标记的请求即使 max_tokens 是 1，它也是
@@ -105,14 +105,6 @@ pub fn classify(body: &Bytes, is_claude_code: bool) -> Option<ProbeKind> {
         return Some(ProbeKind::HealthCheck);
     }
     None
-}
-
-/// 朴素子串查找。请求体是几十 KB 的量级，不值得为它引一个 SIMD 库。
-fn memfind(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return false;
-    }
-    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// 把 system 和所有消息里的文本摊平了看。
@@ -339,6 +331,12 @@ mod tests {
         Bytes::from(s.to_string())
     }
 
+    /// 和管线一样：先解析一遍，再认
+    fn classify(body: &Bytes, is_claude_code: bool) -> Option<ProbeKind> {
+        let parsed = serde_json::from_slice::<Value>(body).ok();
+        super::classify(body, parsed.as_ref(), is_claude_code)
+    }
+
     // ── 该认出来的 ──────────────────────────────────────────────────
     #[test]
     fn a_health_check_is_recognised() {
@@ -449,10 +447,14 @@ mod tests {
 
     #[test]
     fn an_ordinary_request_does_not_even_get_parsed() {
-        // 快速排除跑在每个请求的关键路径上。这条测的是它确实先排除了。
+        // 快速排除跑在每个请求的关键路径上。这条测的是它确实先排除了：原文里一个标记都
+        // 没有，解析出来的 JSON 就不看（这里故意交一份「是预热」的进去）
         let body = b(r#"{"model":"claude-sonnet-4-5","max_tokens":8000,
             "messages":[{"role":"user","content":"帮我看看这段代码"}]}"#);
         assert_eq!(classify(&body, true), None);
+        let warmup: Value =
+            serde_json::json!({"messages": [{"role": "user", "content": "Warmup"}]});
+        assert_eq!(super::classify(&body, Some(&warmup), true), None);
     }
 
     #[test]

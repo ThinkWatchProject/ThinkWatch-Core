@@ -224,6 +224,9 @@ pub struct Reading {
     pub facts: tw_engine::RequestFacts,
     /// DeepSeek Harness 发的请求（见 [`tw_dialect::harness`]）。要看请求头，由管线填
     pub harness: Option<tw_dialect::harness::Harness>,
+    /// 请求体解得开（是 JSON）。之后每一跳按字节改它的地方（见 [`crate::egress`]）凭这个
+    /// 知道不用再解一遍
+    pub json: bool,
 }
 
 pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -> Reading {
@@ -259,6 +262,7 @@ pub fn read(path: &str, query: Option<&str>, body: Option<&serde_json::Value>) -
         decoded,
         facts,
         harness: None,
+        json: body.is_some(),
     }
 }
 

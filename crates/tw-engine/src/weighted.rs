@@ -238,6 +238,28 @@ pub fn advance(g: &Group, members: &[String], f: &Facts, leader: &str) -> HashMa
     out
 }
 
+/// 长期看每一家排头的份额，0 到 1，和 `members` 一一对应：**这一轮参加的**（[`round`]，
+/// 停着的、满着的不算，全不能参加时都算）按各自的有效权重（[`effective`]）分，加起来是 1；
+/// 不参加的是 `None`。
+///
+/// 平滑加权轮询每排有效权重之和那么多次，各家正好各排头自己的有效权重那么多次，所以份额
+/// 就是有效权重 ÷ 这一轮的总和。和 [`lead`] 读的是同一份 [`round`]：试算说的份额，就是
+/// 数据面照此刻的数字轮下去各家分到的新对话的比例（进行中的对话留在原来那一家，那一份
+/// 由之后的新对话补回来，见 [`advance`]）。
+pub fn shares(g: &Group, members: &[String], f: &Facts) -> Vec<Option<f64>> {
+    let round = round(g, members, f);
+    let total: i64 = round.iter().map(|(_, w)| w).sum();
+    members
+        .iter()
+        .map(|m| {
+            round
+                .iter()
+                .find(|(r, _)| *r == m.as_str())
+                .map(|(_, w)| *w as f64 / total as f64)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +583,46 @@ mod tests {
         };
         let got = count(&g, &mut f, 1172 + 1563);
         assert_eq!((got["慢"], got["快"]), (1172, 1563));
+    }
+
+    /// 份额就是一整圈里各家排头的比例：轮一整圈数出来的次数 ÷ 圈长，和 [`shares`] 给的一样。
+    /// 停着的、满着的不参加，份额是空的，剩下的加起来还是 1；全都不能参加时都算
+    #[test]
+    fn the_share_is_how_often_each_member_leads_over_a_full_round() {
+        let g = balanced(&[("慢", 3), ("快", 1), ("停", 2)], BalanceBy::Latency);
+        let members = names(&g);
+        let mut f = Facts {
+            ttfb_ms: ttfb(&[("慢", 400), ("快", 100)]),
+            paused: ["停".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let got = shares(&g, &members, &f);
+        assert_eq!(got[2], None, "停着的不参加");
+        // 中位数 250：慢 3 × 0.390625 → 1172，快 1 × 6.25 → 6250
+        let n = 1172 + 6250;
+        let led = count(&g, &mut f, n);
+        for (i, m) in members.iter().take(2).enumerate() {
+            let want = led[m] as f64 / n as f64;
+            assert!((got[i].unwrap() - want).abs() < 1e-12, "{m}: {got:?}");
+        }
+        assert!((got[0].unwrap() + got[1].unwrap() - 1.0).abs() < 1e-12);
+
+        // 满着的同样不参加
+        let f = Facts {
+            busy: ["快".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(shares(&g, &members, &f), [Some(0.6), None, Some(0.4)]);
+        // 全都停着、满着：都参加，按权重分
+        let f = Facts {
+            paused: ["慢".to_string(), "停".to_string()].into_iter().collect(),
+            busy: ["快".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            shares(&g, &members, &f),
+            [Some(0.5), Some(1.0 / 6.0), Some(1.0 / 3.0)]
+        );
     }
 
     /// 各家系数一样时，次序和只按权重分一模一样：7:3 照样穿插着来，不是先七后三

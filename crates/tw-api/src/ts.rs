@@ -301,7 +301,12 @@ mod tests {
     #[test]
     fn a_transcript_is_turns_of_messages_and_parts() {
         let ts = typescript();
-        assert!(ts.contains("  SessionTranscript: { req: null; res: Transcript };"));
+        assert!(ts.contains("  SessionTranscript: { req: TranscriptQuery; res: Transcript };"));
+        assert!(
+            decl_of(&ts, "TranscriptQuery").contains("from_turn?: number"),
+            "{}",
+            decl_of(&ts, "TranscriptQuery")
+        );
         assert!(ts.contains(
             "  SessionTranscript: { method: \"GET\", path: \"/sessions/{id}/transcript\", params: [\"id\"], format: \"json\" },"
         ));
@@ -309,6 +314,8 @@ mod tests {
         for field in [
             "session: string",
             "system: string | null",
+            "total_turns: number",
+            "settled_turns: number",
             "turns: Array<TranscriptTurn>",
         ] {
             assert!(transcript.contains(field), "{field}: {transcript}");

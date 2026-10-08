@@ -150,19 +150,41 @@ pub fn gateway_headers(hop: &Hop, client: &HeaderMap) -> Vec<(String, String)> {
 ///   （[`crate::chatgpt::IDENTITY_METADATA`]）；会话、线程这些照发
 ///
 /// 返回去掉之后的请求体；没有可去的是 `None`，请求体一个字节都不动。这不是为了兼容去掉
-/// 请求的内容，所以不算丢弃的字段
+/// 请求的内容，所以不算丢弃的字段。
+///
+/// **只剪掉那几个成员，别的字节一个不动**（见 [`cut_members`]）：解析再写回去的话，没开
+/// `preserve_order` 的 serde_json 会把每个对象的键按字母重排 —— 工具定义、工具参数、整个
+/// 请求都变了样（上游的提示缓存按字节认），而 Claude Code 的请求每一个都带着 `user_id`。
+/// 剪不了的怪样子（同一个键写了两遍）才照旧解析、去掉、写回。
+///
+/// `body` 要是解得开的 JSON：调用方解过它（见管线的 `read`），这里不再解一遍
 pub fn strip_body_identity(dialect: Dialect, body: &Bytes) -> Option<Bytes> {
-    // 大多数请求没有这些字段：先便宜地看一眼，免得每个请求都解析、重写一遍请求体
-    let text = std::str::from_utf8(body).ok()?;
-    let marks: &[&str] = match dialect {
-        Dialect::Anthropic => &["\"user_id\""],
-        Dialect::Responses => &crate::chatgpt::IDENTITY_METADATA,
+    // 大多数请求没有这些字段：先便宜地看一眼，免得每个请求都把整个请求体走一遍
+    let (parent, keys, drop_empty): (&str, &[&str], bool) = match dialect {
+        Dialect::Anthropic => ("metadata", &["user_id"], true),
+        Dialect::Responses => ("client_metadata", &crate::chatgpt::IDENTITY_METADATA, false),
         _ => return None,
     };
-    if !marks.iter().any(|m| text.contains(m)) {
+    let marks: &[&str] = match dialect {
+        Dialect::Anthropic => &["\"user_id\""],
+        _ => keys,
+    };
+    if !marks
+        .iter()
+        .any(|m| memchr::memmem::find(body, m.as_bytes()).is_some())
+    {
         return None;
     }
-    let mut v: Value = serde_json::from_str(text).ok()?;
+    match cut_members(body, parent, keys, drop_empty) {
+        Cut::Done(out) => Some(Bytes::from(out)),
+        Cut::Nothing => None,
+        Cut::Unusual => reserialize(dialect, body),
+    }
+}
+
+/// 解析、去掉、写回：[`strip_body_identity`] 剪不了的时候走这条（键会按字母重排）。
+fn reserialize(dialect: Dialect, body: &Bytes) -> Option<Bytes> {
+    let mut v: Value = serde_json::from_slice(body).ok()?;
     let obj = v.as_object_mut()?;
     let removed = match dialect {
         Dialect::Anthropic => {
@@ -184,6 +206,74 @@ pub fn strip_body_identity(dialect: Dialect, body: &Bytes) -> Option<Bytes> {
         return None;
     }
     serde_json::to_vec(&v).ok().map(Bytes::from)
+}
+
+/// [`cut_members`] 的结果。
+#[derive(Debug, PartialEq)]
+enum Cut {
+    /// 剪过的请求体
+    Done(Vec<u8>),
+    /// 没有要剪的
+    Nothing,
+    /// 同一个键写了两遍，或者不像 JSON 对象：剪的结果说不准和解析出来的一样，交给
+    /// [`reserialize`]
+    Unusual,
+}
+
+/// 顶层对象里 `parent` 那个对象，剪掉它的 `keys` 成员（连同分隔它的逗号）；剪空了而
+/// `drop_empty` 的话，`parent` 整个剪掉。别的字节原样留着。
+///
+/// 只走顶层和 `parent` 这两层：别的值整个跳过，字符串里按字节找下一个引号或反斜杠。键里
+/// 写了转义的（`"user\u005fid"`）照解析出来的样子比，和 serde_json 认的一样。
+fn cut_members(body: &[u8], parent: &str, keys: &[&str], drop_empty: bool) -> Cut {
+    let Some(top) = crate::splice::object(body, crate::splice::ws(body, 0)) else {
+        return Cut::Unusual;
+    };
+    let mut parents = top.iter().filter(|m| m.is(body, parent));
+    let (Some(p), None) = (parents.next(), parents.next()) else {
+        // 一个都没有就没得剪；有两个的话 serde_json 留后一个，交给它
+        return if top.iter().any(|m| m.is(body, parent)) {
+            Cut::Unusual
+        } else {
+            Cut::Nothing
+        };
+    };
+    if body[p.value.start] != b'{' {
+        return Cut::Nothing;
+    }
+    let Some(inner) = crate::splice::object(body, p.value.start) else {
+        return Cut::Unusual;
+    };
+    let gone: Vec<usize> = (0..inner.len())
+        .filter(|&i| keys.iter().any(|k| inner[i].is(body, k)))
+        .collect();
+    if gone.is_empty() {
+        return Cut::Nothing;
+    }
+    // 同一个键写了两遍
+    if keys
+        .iter()
+        .any(|k| gone.iter().filter(|&&i| inner[i].is(body, k)).count() > 1)
+    {
+        return Cut::Unusual;
+    }
+    let cuts = if drop_empty && gone.len() == inner.len() {
+        let at = top
+            .iter()
+            .position(|m| m.key.start == p.key.start)
+            .unwrap_or_default();
+        crate::splice::cuts(&top, &[at])
+    } else {
+        crate::splice::cuts(&inner, &gone)
+    };
+    let mut out = Vec::with_capacity(body.len());
+    let mut at = 0;
+    for c in cuts {
+        out.extend_from_slice(&body[at..c.start]);
+        at = c.end;
+    }
+    out.extend_from_slice(&body[at..]);
+    Cut::Done(out)
 }
 
 #[cfg(test)]
@@ -436,5 +526,221 @@ mod tests {
             serde_json::json!({"session_id": "conv-1"})
         );
         assert_eq!(strip_body_identity(Dialect::Chat, &body), None);
+    }
+
+    /// 去掉 `user_id` 之后，请求体别的字节一个不动：键的先后（工具定义、工具参数、整个请求）、
+    /// 空白、转义都照客户端写的。以前解析再写回，每个对象的键都按字母重排了
+    #[test]
+    fn the_forwarded_body_is_the_client_body_less_the_identity() {
+        let tools = r#""tools":[{"name":"Read","description":"读文件 \"quoted\" \\ path","input_schema":{"type":"object","properties":{"file_path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["file_path"],"additionalProperties":false,"$schema":"http://json-schema.org/draft-07/schema#"}}]"#;
+        let messages = r#""messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"{\"user_id\":\"not this one\"} }]"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Read","input":{"zeta":1,"alpha":[2,{"b":3,"a":4}]}}]}]"#;
+        let identity = r#""metadata":{"user_id":"user_abc_account_123_session_456"}"#;
+        for (before, after) in [
+            // Claude Code 的顺序：metadata 在工具定义后面
+            (
+                format!(
+                    r#"{{"model":"claude-sonnet-5",{messages},"system":"s",{tools},{identity},"max_tokens":32000,"stream":true}}"#
+                ),
+                format!(
+                    r#"{{"model":"claude-sonnet-5",{messages},"system":"s",{tools},"max_tokens":32000,"stream":true}}"#
+                ),
+            ),
+            // 排在最前、最后
+            (
+                format!(r#"{{{identity},{messages}}}"#),
+                format!(r#"{{{messages}}}"#),
+            ),
+            (
+                format!(r#"{{{messages},{identity}}}"#),
+                format!(r#"{{{messages}}}"#),
+            ),
+            // 带空白、换行的
+            (
+                format!("{{\n  {messages},\n  {identity} ,\n  \"stream\": true\n}}"),
+                format!("{{\n  {messages},\n  \"stream\": true\n}}"),
+            ),
+            // metadata 里还有别的：只剪 user_id
+            (
+                r#"{"metadata":{"user_id":"u","note":"x"},"messages":[]}"#.to_string(),
+                r#"{"metadata":{"note":"x"},"messages":[]}"#.to_string(),
+            ),
+            (
+                r#"{"metadata": {"note": "x", "user_id": "u"}, "messages": []}"#.to_string(),
+                r#"{"metadata": {"note": "x"}, "messages": []}"#.to_string(),
+            ),
+            (
+                r#"{"metadata":{"a":1,"user_id":{"nested":["}"]},"b":2}}"#.to_string(),
+                r#"{"metadata":{"a":1,"b":2}}"#.to_string(),
+            ),
+            // 键写成转义的：serde_json 认它是 user_id，这里也认（原文里别处得写着 `"user_id"`，
+            // 先看的那一眼才放它过去，和以前一样）。反斜杠由 `char::from(92)` 拼：测试里直接
+            // 写出来的转义，经过某些编辑工具会变成真字符
+            (
+                format!(
+                    r#"{{"metadata":{{"user{b}u005fid":"u"}},"user_id":1}}"#,
+                    b = char::from(92)
+                ),
+                r#"{"user_id":1}"#.to_string(),
+            ),
+        ] {
+            let out = strip_body_identity(Dialect::Anthropic, &Bytes::from(before.clone()))
+                .unwrap_or_else(|| panic!("nothing stripped from {before}"));
+            assert_eq!(std::str::from_utf8(&out).unwrap(), after);
+            // 和解析、去掉、写回的意思一样
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out).unwrap(),
+                serde_json::from_slice::<Value>(
+                    &reserialize(Dialect::Anthropic, &Bytes::from(before)).unwrap()
+                )
+                .unwrap()
+            );
+        }
+
+        let codex = r#"{"model":"gpt-5.5","input":[],"client_metadata":{"x-codex-turn-metadata":"{}","session_id":"conv-1","x-codex-installation-id":"inst-1"},"stream":true}"#;
+        let out = strip_body_identity(Dialect::Responses, &Bytes::from(codex)).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{"model":"gpt-5.5","input":[],"client_metadata":{"session_id":"conv-1"},"stream":true}"#
+        );
+        // 剪空了也留着这个对象，和以前一样
+        let codex = r#"{"client_metadata":{"x-codex-installation-id":"inst-1","x-codex-turn-metadata":"{}"}}"#;
+        let out = strip_body_identity(Dialect::Responses, &Bytes::from(codex)).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            r#"{"client_metadata":{}}"#
+        );
+    }
+
+    /// 同一个键写了两遍：剪的结果说不准和 serde_json 认的一样（它留后一个），照旧解析、
+    /// 去掉、写回
+    #[test]
+    fn a_key_written_twice_falls_back_to_reserializing() {
+        for body in [
+            r#"{"metadata":{"user_id":"a"},"x":1,"metadata":{"user_id":"b","n":1}}"#,
+            r#"{"metadata":{"user_id":"a","user_id":"b"},"x":1}"#,
+        ] {
+            let body = Bytes::from(body);
+            assert_eq!(
+                strip_body_identity(Dialect::Anthropic, &body),
+                reserialize(Dialect::Anthropic, &body)
+            );
+        }
+        assert_eq!(
+            cut_members(
+                br#"{"metadata":1,"metadata":{"user_id":"b"}}"#,
+                "metadata",
+                &["user_id"],
+                true
+            ),
+            Cut::Unusual
+        );
+    }
+
+    /// 随机拼出来的请求：剪出来的和解析、去掉、写回的意思一样，剪没剪也一样；剪过的那一份
+    /// 只少了几段，别的字节按原样、原来的先后都在
+    #[test]
+    fn cutting_means_what_reserializing_meant() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+            fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+                xs[self.below(xs.len())]
+            }
+        }
+        let mut r = Rng(0x51_7cc1_b727_220a);
+        const KEYS: &[&str] = &[
+            "\"user_id\"",
+            "\"user\\u005fid\"",
+            "\"note\"",
+            "\"a\"",
+            "\"x-codex-installation-id\"",
+            "\"x-codex-turn-metadata\"",
+            "\"session_id\"",
+        ];
+        const VALUES: &[&str] = &[
+            "1",
+            "-2.5e3",
+            "true",
+            "null",
+            "\"s\"",
+            "\"q\\\"}]{[,\\\\\"",
+            "\"\\\"user_id\\\"\"",
+            "[]",
+            "{}",
+            "[1,{\"user_id\":\"deep\"},\"]\"]",
+            "{\"metadata\":{\"user_id\":\"deep\"}}",
+        ];
+        const WS: &[&str] = &["", " ", "\n  ", "\t"];
+        let inner = |r: &mut Rng| {
+            let members: Vec<String> = (0..r.below(4))
+                .map(|_| {
+                    let (k, a, b, v) = (r.pick(KEYS), r.pick(WS), r.pick(WS), r.pick(VALUES));
+                    format!("{k}{a}:{b}{v}")
+                })
+                .collect();
+            format!("{{{}}}", members.join(","))
+        };
+        for _ in 0..5_000 {
+            let mut top = Vec::new();
+            for _ in 0..r.below(5) {
+                let (k, v) = match r.below(4) {
+                    0 => ("\"metadata\"", inner(&mut r)),
+                    1 => ("\"client_metadata\"", inner(&mut r)),
+                    2 => ("\"messages\"", r.pick(VALUES).to_string()),
+                    _ => (r.pick(KEYS), r.pick(VALUES).to_string()),
+                };
+                let (a, b, c, d) = (r.pick(WS), r.pick(WS), r.pick(WS), r.pick(WS));
+                top.push(format!("{a}{k}{b}:{c}{v}{d}"));
+            }
+            let (a, b) = (r.pick(WS), r.pick(WS));
+            let body = Bytes::from(format!("{a}{{{}}}{b}", top.join(",")));
+            if serde_json::from_slice::<Value>(&body).is_err() {
+                continue;
+            }
+            for d in [Dialect::Anthropic, Dialect::Responses] {
+                let cut = strip_body_identity(d, &body);
+                let old = reserialize(d, &body);
+                // 旧的写法先看一眼原文里有没有那几个字：没有就不解析
+                let marked = match d {
+                    Dialect::Anthropic => memchr::memmem::find(&body, b"\"user_id\"").is_some(),
+                    _ => crate::chatgpt::IDENTITY_METADATA
+                        .iter()
+                        .any(|m| memchr::memmem::find(&body, m.as_bytes()).is_some()),
+                };
+                let old = old.filter(|_| marked);
+                let value = |b: &Option<Bytes>| {
+                    b.as_ref()
+                        .map(|b| serde_json::from_slice::<Value>(b).unwrap())
+                };
+                assert_eq!(
+                    value(&cut),
+                    value(&old),
+                    "{d:?} {}",
+                    String::from_utf8_lossy(&body)
+                );
+                // 剪过的那一份是原文的一个子序列：别的字节原样、按原来的先后
+                if let Some(cut) = &cut
+                    && cut_members(&body, "metadata", &["user_id"], true) != Cut::Unusual
+                    && cut_members(
+                        &body,
+                        "client_metadata",
+                        &crate::chatgpt::IDENTITY_METADATA,
+                        false,
+                    ) != Cut::Unusual
+                {
+                    let mut rest = body.iter();
+                    assert!(
+                        cut.iter().all(|c| rest.any(|b| b == c)),
+                        "{}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+            }
+        }
     }
 }

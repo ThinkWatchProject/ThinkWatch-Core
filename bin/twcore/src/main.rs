@@ -840,6 +840,9 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
 
           每一轮都重新读配置，所以改完期限不用重启 —— 下一轮就按新的算。
           扫的是目录和一条 DELETE，空跑一次的代价可以忽略。
+
+          **在阻塞线程上跑，删正文时不拿记录库的锁**（见 `tw_store::task::gc`）：一次删几个
+          GB 可以要好几秒，以前那期间这把锁一直攥着，记录和查询都在等。
         */
         if let Some(rec) = store.clone() {
             let gw = state.clone();
@@ -847,16 +850,18 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
                 loop {
                     let r = gw.config().retention.clone();
                     let freed = {
-                        let g = rec.lock().await;
-                        g.gc(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0),
-                            r.body_days,
-                            r.row_days,
-                            r.body_max_bytes,
-                        )
+                        let rec = rec.clone();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let (body_days, row_days, max) =
+                            (r.body_days, r.row_days, r.body_max_bytes);
+                        tokio::task::spawn_blocking(move || {
+                            tw_store::task::gc(&rec, now, body_days, row_days, max)
+                        })
+                        .await
+                        .unwrap_or(0)
                     };
                     if freed > 0 {
                         tracing::info!(
@@ -1013,7 +1018,14 @@ fn build_store(
     // 每记下一行请求，交给网关的密钥用量上限结算（见 `tw_control::key_limits`）
     settled: tw_store::SettleHook,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<tw_store::Recorder>>> {
-    let events = bus.subscribe();
+    // **存储层自己的那条通道，不订阅界面的广播**（见 `EventBus::record_feed`）：广播上
+    // 掉队丢的是界面上的几个点，记录丢的是那几个请求
+    let Some(events) = bus.record_feed() else {
+        tracing::warn!(
+            "request recording is already attached to the event bus; not starting a second one"
+        );
+        return None;
+    };
     let (db, blobs) = match tw_store::open(dir) {
         Ok(opened) => opened,
         Err(e) => {

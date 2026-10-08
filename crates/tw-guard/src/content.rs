@@ -34,7 +34,7 @@ mod screen;
 pub(crate) use codepoints::visible as codepoints_visible;
 pub use codepoints::{CodepointError, Codepoints, MAX_ITEMS as MAX_CODEPOINT_ITEMS};
 pub(crate) use screen::evaluate;
-pub use screen::{Outcome, ScreenHit, Screening, screen, screen_text};
+pub use screen::{Outcome, ScreenHit, Screening, screen, screen_text, screen_value};
 
 /// 一条规则怎么认。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -259,8 +259,52 @@ impl<'a> Lower<'a> {
         Lower { text, lower: None }
     }
     fn get(&mut self) -> &str {
-        self.lower.get_or_insert_with(|| self.text.to_lowercase())
+        self.lower.get_or_insert_with(|| lowercase(self.text))
     }
+}
+
+/// 和 `text.to_lowercase()` 一样的结果，快一些：ASCII 的一段整段转，别的字符逐个转（标准库
+/// 碰到头一个 ASCII 以外的字符之后就逐个字符地转了，夹着中文、`→` 的正文几乎整段都是）。
+///
+/// 按上下文转的只有 `Σ`（在词尾是 `ς`）：正文里有它就整段交给标准库。
+fn lowercase(text: &str) -> String {
+    if memchr::memmem::find(text.as_bytes(), "Σ".as_bytes()).is_some() {
+        return text.to_lowercase();
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        i = ascii_end(b, i);
+        if i > start {
+            let at = out.len();
+            out.push_str(&text[start..i]);
+            out[at..].make_ascii_lowercase();
+        }
+        // 停在一个多字节字符的头一个字节上：字符边界
+        if let Some(c) = text.get(i..).and_then(|rest| rest.chars().next()) {
+            out.extend(c.to_lowercase());
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// 从 `i` 起连着的 ASCII 字节到哪儿为止。八个一组地看
+fn ascii_end(b: &[u8], mut i: usize) -> usize {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    while let Some(word) = b.get(i..i + 8) {
+        let word = u64::from_ne_bytes(word.try_into().unwrap_or_default());
+        if word & HIGH != 0 {
+            break;
+        }
+        i += 8;
+    }
+    while i < b.len() && b[i].is_ascii() {
+        i += 1;
+    }
+    i
 }
 
 /// 一条规则在一段正文里的全部命中
@@ -289,7 +333,9 @@ fn find_contains(text: &str, lower: &str, needle: &str) -> Vec<Range<usize>> {
         return out;
     }
     if lower.len() == text.len() {
-        for (at, _) in lower.match_indices(needle) {
+        // 按字节找（SIMD）：每段正文、每条规则都要从头找到尾。和 `match_indices` 一样是
+        // 一个接一个、互不重叠的
+        for at in memchr::memmem::find_iter(lower.as_bytes(), needle.as_bytes()) {
             // 区间落回原文要对齐到字符边界
             let start = floor(text, at);
             let end = ceil(text, at + needle.len());
@@ -373,17 +419,44 @@ fn find_points(p: &Codepoints, text: &str, escapes: bool) -> Found {
     if p.min() > 0x7F && text.is_ascii() && (!escapes || !text.contains("\\u")) {
         return out;
     }
-    for (r, c) in chars(text, escapes) {
-        if !p.contains(c) {
-            continue;
-        }
+    let mut hit = |r: Range<usize>| {
         out.count += 1;
         match out.ranges.last_mut() {
             Some(last) if last.end == r.start => last.end = r.end,
             _ => out.ranges.push(r),
         }
+    };
+    // 码位都在 ASCII 以外、又不认转义：ASCII 的字节一个都命中不了，跳过去，只解码别的
+    // 字符。夹着中文、`→` 的正文（工具读回来的代码）就不再逐个字符地解一遍
+    if p.min() > 0x7F && !escapes {
+        for (r, c) in non_ascii(text) {
+            if p.contains(c) {
+                hit(r);
+            }
+        }
+    } else {
+        for (r, c) in chars(text, escapes) {
+            if p.contains(c) {
+                hit(r);
+            }
+        }
     }
     out
+}
+
+/// 一段正文里 ASCII 以外的每一个字符和它的字节区间，按出现的先后。ASCII 的字节八个一组
+/// 地跳过（[`ascii_end`]）。
+fn non_ascii(text: &str) -> impl Iterator<Item = (Range<usize>, char)> + '_ {
+    let b = text.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        i = ascii_end(b, i);
+        // 停在一个多字节字符的头一个字节上：字符边界
+        let c = text.get(i..)?.chars().next()?;
+        let at = i;
+        i += c.len_utf8();
+        Some((at..i, c))
+    })
 }
 
 /// 一处命中。
@@ -977,5 +1050,109 @@ mod tests {
         assert_eq!(text[f.ranges[1].clone()], format!("{b}udb40{b}udc49"));
         assert_eq!(find_points(&p, &text, false).count, 0);
         assert!(text.is_ascii(), "例子里不该有真的不可见字符");
+    }
+
+    /// 码位都在 ASCII 以外时只解码 ASCII 以外的字符：找到的和逐个字符看的一样 —— 几段、
+    /// 每段从哪到哪、一共几个
+    #[test]
+    fn skipping_ascii_finds_what_looking_at_every_character_found() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        // 码位用 `char::from_u32` 拼：测试里直接写出来的转义，经过某些编辑工具会变成真字符
+        let ch = |n: u32| char::from_u32(n).unwrap().to_string();
+        let pieces: Vec<String> = [
+            "a",
+            "Z",
+            " ",
+            "0",
+            "\"",
+            "{",
+            "→",
+            "密钥",
+            "é",
+            "😀",
+            "abcdefghijklmnop",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            [
+                0x200B, 0x202E, 0x2066, 0xE0041, 0xE007F, 0xE0000, 0x7F, 0x80, 0xFEFF,
+            ]
+            .into_iter()
+            .map(ch),
+        )
+        .collect();
+        let sets = [
+            "U+E0000–U+E007F",
+            "U+202A–U+202E, U+2066–U+2069",
+            "U+200B, U+FEFF",
+            "U+0080–U+10FFFF",
+        ]
+        .map(|p| Codepoints::parse(p).unwrap());
+        for _ in 0..5_000 {
+            let text: String = (0..next(60))
+                .map(|_| pieces[next(pieces.len())].as_str())
+                .collect();
+            for p in &sets {
+                assert!(p.min() > 0x7F);
+                let fast = find_points(p, &text, false);
+                let mut slow = Found::default();
+                for (r, c) in chars(&text, false) {
+                    if p.contains(c) {
+                        slow.count += 1;
+                        match slow.ranges.last_mut() {
+                            Some(last) if last.end == r.start => last.end = r.end,
+                            _ => slow.ranges.push(r),
+                        }
+                    }
+                }
+                assert_eq!(
+                    (fast.count, fast.ranges),
+                    (slow.count, slow.ranges),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    /// 快一些的小写和标准库的一字不差：`Σ` 在词尾、词中，会变长的（`İ`）、四个字节的、
+    /// 组合字符、开尔文符号这类转成 ASCII 的
+    #[test]
+    fn lowercasing_by_runs_gives_what_the_standard_library_gives() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        // 码位用 `char::from_u32` 拼：测试里直接写出来的转义，经过某些编辑工具会变成真字符
+        let ch = |n: u32| char::from_u32(n).unwrap().to_string();
+        let pieces: Vec<String> = ["A", "z", " ", "IGNORE", "Previous", ".", "→", "密钥", "😀"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(
+                [
+                    0x03A3, 0x0391, 0x0130, 0x212A, 0x1E9E, 0x00DF, 0x01C5, 0xFB00, 0x0301, 0x2167,
+                    0x10400, 0x00C9, 0x0049, 0x0131, 0x03C2,
+                ]
+                .into_iter()
+                .map(ch),
+            )
+            .collect();
+        for _ in 0..20_000 {
+            let text: String = (0..next(30))
+                .map(|_| pieces[next(pieces.len())].as_str())
+                .collect();
+            assert_eq!(lowercase(&text), text.to_lowercase(), "{text:?}");
+        }
+        let long = format!("{}{}", "Ignore Previous ".repeat(10), ch(0x212A));
+        assert_eq!(lowercase(&long), long.to_lowercase());
     }
 }

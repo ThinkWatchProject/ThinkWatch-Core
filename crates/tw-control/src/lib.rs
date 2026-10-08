@@ -305,10 +305,15 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
     let cfg = s.config();
     let cfg = &*cfg;
     let engine = cfg.engine();
-    // 正文现在占了多少。**扫的是目录，所以放在这儿算一次**，不塞进
-    // 下面那个视图表达式里
+    // 正文现在占了多少。**扫的是目录**：每份正文问一次大小，几万份要几十毫秒，所以在阻塞
+    // 线程上扫，也不拿着记录库的锁扫 —— 正文目录只是一个路径
     let body_bytes_now = match &s.store {
-        Some(st) => st.lock().await.blobs().total_bytes(),
+        Some(st) => {
+            let root = st.lock().await.blobs().root().to_path_buf();
+            tokio::task::spawn_blocking(move || tw_store::Blobs::new(root).total_bytes())
+                .await
+                .unwrap_or(0)
+        }
         None => 0,
     };
     Json(tw_api::Overview {
@@ -724,8 +729,8 @@ async fn route_stats(
 ) -> Result<Json<tw_api::RouteStats>, Fail> {
     let (from, to) = range(q.from_ms, q.to_ms);
     let store = need_store(&s)?;
-    let g = store.lock().await;
-    Ok(Json(g.db().route_stats(from, to).map_err(records)?))
+    let stats = on_store(store, move |g| g.db().route_stats(from, to)).await?;
+    Ok(Json(stats.map_err(records)?))
 }
 
 /// 一段时间的汇总。不给参数就是「今天」。
@@ -1226,11 +1231,17 @@ async fn storage(State(s): State<ControlState>) -> Json<tw_api::StorageStatus> {
             forwarding_affected: false,
         });
     };
-    let g = store.lock().await;
+    let root = store.lock().await.blobs().root().to_path_buf();
+    let rows = on_store(store, |g| g.db().count().unwrap_or(0))
+        .await
+        .unwrap_or(0);
+    let blob_bytes = tokio::task::spawn_blocking(move || tw_store::Blobs::new(root).total_bytes())
+        .await
+        .unwrap_or(0);
     Json(tw_api::StorageStatus {
         recording: true,
-        rows: g.db().count().unwrap_or(0),
-        blob_bytes: g.blobs().total_bytes(),
+        rows,
+        blob_bytes,
         // **永远是 false。**观测挂了，代理照跑。哪天有人想改成
         // true，先回去读那一节。
         forwarding_affected: false,
@@ -1250,6 +1261,21 @@ pub(crate) fn need_store(
             ),
         )
     })
+}
+
+/// 在阻塞线程上拿着记录库做 `f`。
+///
+/// **查库、扫正文目录都不占异步线程**：一条聚合几毫秒到几十毫秒，同一个线程上的别的请求
+/// （控制面的、转发的）都得等它。锁也在那个线程上等：记录器正拿着它写一批行时，等的是那个
+/// 阻塞线程，不是异步线程。
+pub(crate) async fn on_store<T: Send + 'static>(
+    store: &Arc<tokio::sync::Mutex<tw_store::Recorder>>,
+    f: impl FnOnce(&tw_store::Recorder) -> T + Send + 'static,
+) -> Result<T, Fail> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || f(&store.blocking_lock()))
+        .await
+        .map_err(internal)
 }
 
 fn history_row(
@@ -1652,15 +1678,13 @@ async fn sessions(
     let Some(store) = &s.store else {
         return Json(Vec::new());
     };
-    let g = store.lock().await;
-    Json(
-        g.db()
-            .sessions(within(&q), list_limit(&q))
-            .unwrap_or_default()
-            .iter()
-            .map(session_view)
-            .collect(),
-    )
+    let (within, limit) = (within(&q), list_limit(&q));
+    let rows = on_store(store, move |g| g.db().sessions(within, limit))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    Json(rows.iter().map(session_view).collect())
 }
 
 async fn session_detail(
@@ -1673,23 +1697,20 @@ async fn session_detail(
             msg!("control.store_off" => "Request recording is not running."),
         ));
     };
-    let g = store.lock().await;
-    let session = g
-        .db()
-        .sessions(None, 500)
-        .unwrap_or_default()
-        .iter()
-        .find(|x| x.id == id)
-        .map(session_view)
-        .ok_or_else(|| no_such_session(&id))?;
-    let turns = g
-        .db()
-        .turns(&id)
-        .unwrap_or_default()
-        .iter()
-        .map(turn_view)
-        .collect();
-    Ok(Json(tw_api::SessionDetail { session, turns }))
+    // **按会话号直接取**：以前取最近五百次会话再从里面找，更早的会话点开是 404
+    let (session, turns) = {
+        let id = id.clone();
+        on_store(store, move |g| {
+            Ok::<_, tw_store::DbError>((g.db().session(&id)?, g.db().turns(&id)?))
+        })
+        .await?
+        .map_err(records)?
+    };
+    let session = session.ok_or_else(|| no_such_session(&id))?;
+    Ok(Json(tw_api::SessionDetail {
+        session: session_view(&session),
+        turns: turns.iter().map(turn_view).collect(),
+    }))
 }
 
 fn no_such_session(id: &str) -> Fail {
@@ -1699,28 +1720,53 @@ fn no_such_session(id: &str) -> Fail {
     )
 }
 
-/// 一次会话读成一段对话（见 `tw_store::transcript`）。
+/// 一次会话读成一段对话（见 `tw_store::transcript`）。给了 `from_turn` 的只交出从那一轮起的
+/// 那些（见 [`tw_api::Transcript::settled_turns`]）。
 ///
 /// **放到阻塞线程上跑**，库只在取行的时候锁一下：几百轮的会话要读几百份正文、解析几百 MB
-/// 的 JSON，和按正文找是同一个道理（见 [`history_search`]）—— 记录和正文落盘走的是同一把锁。
+/// 的 JSON，和按正文找是同一个道理（见 [`history_search`]）—— 记录落库走的是同一把锁。读过
+/// 的记着（`Recorder::transcripts`），下一次只读新来的那几轮。
 async fn session_transcript(
     State(s): State<ControlState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::TranscriptQuery>,
 ) -> Result<Json<tw_api::Transcript>, Fail> {
-    let store = need_store(&s)?;
-    let (rows, blobs) = {
-        let g = store.lock().await;
-        let rows = g.db().session_requests(&id).map_err(records)?;
-        // 正文目录只是一个路径，读它不需要锁
-        (rows, tw_store::Blobs::new(g.blobs().root().to_path_buf()))
-    };
-    if rows.is_empty() {
-        return Err(no_such_session(&id));
-    }
-    let transcript =
-        tokio::task::spawn_blocking(move || tw_store::transcript::build(&id, &rows, &blobs))
-            .await
-            .map_err(internal)?;
+    let store = need_store(&s)?.clone();
+    // 这次会话里还在跑的请求：落库时排在它开始的那一刻，不一定排在最后
+    let running = s
+        .gateway
+        .bus
+        .live()
+        .running
+        .into_iter()
+        .filter(|r| r.session.as_deref() == Some(id.as_str()))
+        .map(|r| (r.at_ms as i64, r.id as i64))
+        .min();
+    let from_turn = q.from_turn.unwrap_or(0) as usize;
+    let transcript = tokio::task::spawn_blocking(move || {
+        let (rows, blobs, transcripts) = {
+            let g = store.blocking_lock();
+            let rows = g.db().session_requests(&id).map_err(records)?;
+            // 正文目录只是一个路径，读它不需要锁
+            let blobs = tw_store::Blobs::new(g.blobs().root().to_path_buf());
+            (rows, blobs, g.transcripts())
+        };
+        if rows.is_empty() {
+            return Err(no_such_session(&id));
+        }
+        Ok(transcripts.read(
+            &blobs,
+            &tw_store::transcript::Ask {
+                session: &id,
+                rows: &rows,
+                from_turn,
+                running,
+                now_ms: now_ms(),
+            },
+        ))
+    })
+    .await
+    .map_err(internal)??;
     Ok(Json(transcript))
 }
 

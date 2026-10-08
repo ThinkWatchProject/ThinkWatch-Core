@@ -194,3 +194,34 @@ async fn the_endpoints_take_a_time_window_off_the_query_string() {
     let none = get(&app, "/sessions?from_ms=9000&to_ms=9999").await;
     assert!(none.as_array().unwrap().is_empty(), "{none}");
 }
+
+/// **会话详情按会话号取，多老都取得到。**以前它取最近五百次会话再从里面找：更早的会话
+/// 在列表里点得到（翻到那么远的话），点开却是 404
+#[tokio::test]
+async fn a_session_behind_the_newest_five_hundred_still_opens() {
+    let mut rows = vec![turn(1, "per-token"), turn(2, "per-token")];
+    for i in 0..600 {
+        let mut r = turn(100 + i, "per-token");
+        r.session = Some(format!("later-{i}"));
+        rows.push(r);
+    }
+    let (_d, app) = app(&rows);
+
+    let detail = get(&app, "/sessions/s1").await;
+    assert_eq!(detail["session"]["id"], "s1");
+    assert_eq!(detail["session"]["turns"], 2, "{detail}");
+    assert_eq!(detail["turns"].as_array().unwrap().len(), 2);
+
+    // 没有的照样是 404
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/sessions/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}

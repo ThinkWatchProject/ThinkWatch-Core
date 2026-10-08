@@ -15,6 +15,10 @@ notify = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 
+# macOS 上不递归的监听自己用 kqueue 写（见 src/kqueue.rs）
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
