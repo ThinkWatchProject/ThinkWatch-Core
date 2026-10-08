@@ -3,6 +3,10 @@
 //! **不进 SQLite。**body 可能几百 KB（长上下文），塞进库里会让它膨胀到
 //! GB 级 —— VACUUM 慢、备份慢、回收难。存文件系统按天分目录，过期直接
 //! 删掉整个目录，**回收成本 O(1)**。
+//!
+//! **一份正文要么整个在、要么不在**：先写到旁边一个临时文件，写完再换上去（见
+//! [`Blobs::put`]）。读的一方（详情、对话记录、按正文找）和写的一方不排队，以前读到一半
+//! 写着的文件会当成一份读不懂的正文。
 
 use std::path::{Path, PathBuf};
 
@@ -99,15 +103,8 @@ impl Blobs {
         // 截断而不是跳过：**开头那几 KB 是最有用的部分**（模型名、system
         // prompt、工具定义都在前面），而完整存下来会挤掉别人的。
         let slice = &body[..body.len().min(MAX_ONE)];
-        match write_private(&p, slice) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-                }
-                true
-            }
+        match replace_private(&p, slice) {
+            Ok(()) => true,
             Err(e) => {
                 tracing::debug!(path = %p.display(), "the request body could not be written: {e}");
                 false
@@ -131,6 +128,9 @@ impl Blobs {
     /// `original_len` 比**真正存下的**长时才另记一个 `.len` —— 截断可能发生在交来之前
     /// （网关只攒了开头），也可能发生在这里（`body` 比 [`MAX_ONE`] 长）。以前只看前一种：
     /// 一个 5 MB 的请求体存下 4 MB，却没有一处说它被截过，重放照样把半截 JSON 发了出去。
+    ///
+    /// **`.len` 先写**：正文一出现，读的一方就该知道它是不是截过的。反过来的话，中间有一刻
+    /// 读到的是一份看起来完整的半截正文。
     pub fn put_with_len(
         &self,
         at_ms: i64,
@@ -139,22 +139,17 @@ impl Blobs {
         body: &[u8],
         original_len: usize,
     ) -> bool {
-        if !self.put(at_ms, id, which, body) {
-            return false;
-        }
         if original_len > body.len().min(MAX_ONE) {
             let p = self
                 .path_for(at_ms, id, which)
                 .with_extension(format!("{}.len", which.suffix()));
-            if write_private(&p, original_len.to_string().as_bytes()).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-                }
+            if let Some(dir) = p.parent()
+                && create_private_dirs(dir).is_ok()
+            {
+                let _ = replace_private(&p, original_len.to_string().as_bytes());
             }
         }
-        true
+        self.put(at_ms, id, which, body)
     }
 
     /// 原始长度。**没有这个文件说明没截断** —— 那时 body 自己的长度
@@ -186,13 +181,18 @@ impl Blobs {
     /// 盘上最老的那一天从哪一刻起（那天零点，UTC）。一天都没有是 `None`。
     ///
     /// **按正文找时用它划界**：比它早的请求一份正文都不会有，不必一条一条去盘上问 ——
-    /// 三个月的记录里，正文只占最近几天。回收是整天整天地删（先删最老的），所以划在
-    /// 最老的那一天上是准的。
+    /// 三个月的记录里，正文只占最近几天。回收先删最老的，整天整天地删；只剩最新的一天时
+    /// 才从那一天里最早的请求删起。所以比它早的一份都没有，它之后的照样要去盘上问。
     pub fn oldest_ms(&self) -> Option<i64> {
         self.days().first().and_then(|(name, _)| start_of_day(name))
     }
 
     /// 回收：先按天数删，再按总量删。返回删掉的字节数。
+    ///
+    /// **按总量删时，最新的那一天不整个删。**从最老的那天整天整天地删；删到只剩最新的一天
+    /// 还超，就在这一天里从最早的请求删起（[`trim_oldest`]）。以前它也整个删：一天的正文就
+    /// 超过上限时（一个请求最多存 8 MB 多），每小时的回收都把当天的目录清空一次，连同正在
+    /// 看的那次会话。
     pub fn gc(&self, now_ms: i64, keep_days: u64, max_bytes: u64) -> u64 {
         let cutoff = day_of(now_ms - (keep_days as i64) * 86_400_000);
         let mut freed = 0;
@@ -207,10 +207,13 @@ impl Blobs {
                 remaining.push((name, path, size));
             }
         }
-        // 还超总量的话，继续从最旧的开始删。**整目录删，不删单个文件** ——
-        // 半天的记录比没有记录更难解释（「为什么上午的请求点开是空的」）。
         let mut total: u64 = remaining.iter().map(|(_, _, s)| *s).sum();
-        for (_, path, size) in &remaining {
+        let Some(((_, newest, _), older)) = remaining.split_last() else {
+            return freed;
+        };
+        // 还超总量的话，继续从最旧的开始删。**旧的整目录删，不删单个文件** ——
+        // 半天的记录比没有记录更难解释（「为什么上午的请求点开是空的」）。
+        for (_, path, size) in older {
             if total <= max_bytes {
                 break;
             }
@@ -218,6 +221,9 @@ impl Blobs {
                 total -= size;
                 freed += size;
             }
+        }
+        if total > max_bytes {
+            freed += trim_oldest(newest, total - max_bytes);
         }
         freed
     }
@@ -252,6 +258,60 @@ fn write_private(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     opts.open(p)?.write_all(bytes)
+}
+
+/// 换上一份只给自己看的文件：**先写到旁边的临时文件，写完再改名换上去**。改名是一步完成
+/// 的，读的一方要么读到旧的（或者没有），要么读到写完的那一份，不会读到一半。
+fn replace_private(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = p.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let done = write_private(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, p));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    #[cfg(unix)]
+    if done.is_ok() {
+        // 临时文件早就在（上次写到一半断了）的话，新建时给的 0600 不生效，这里补上
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    }
+    done
+}
+
+/// 在一天的目录里从最早的请求删起，删够 `excess` 字节为止。返回删掉的字节数。
+///
+/// **一个请求的几份一起删**（请求体、回答、插件改过的、`.len`）：按文件名开头的请求号归在
+/// 一起，号小的先删 —— 号是按请求开始的先后发的。认不出请求号的文件不动。
+fn trim_oldest(day: &Path, excess: u64) -> u64 {
+    let Ok(rd) = std::fs::read_dir(day) else {
+        return 0;
+    };
+    let mut by_id: std::collections::BTreeMap<u64, Vec<(PathBuf, u64)>> = Default::default();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.split_once('.'))
+            .and_then(|(id, _)| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        by_id.entry(id).or_default().push((e.path(), size));
+    }
+    let mut freed = 0;
+    for files in by_id.into_values() {
+        if freed >= excess {
+            break;
+        }
+        for (path, size) in files {
+            if std::fs::remove_file(&path).is_ok() {
+                freed += size;
+            }
+        }
+    }
+    freed
 }
 
 fn looks_like_a_day(n: &str) -> bool {
@@ -461,6 +521,58 @@ mod tests {
         let left = b.days();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, day_of(now));
+    }
+
+    /// **一天的正文就超过上限时，那一天不整个删。**以前每小时的回收都把当天的目录清空：
+    /// 正在看的那次会话、刚结束的那个请求，点开都是空的。现在删到只剩最新的一天，就在这一天
+    /// 里从最早的请求删起，一个请求的几份一起删
+    #[test]
+    fn gc_trims_the_newest_day_from_its_oldest_requests_instead_of_emptying_it() {
+        let (_d, b) = setup();
+        let now = 100 * DAY;
+        // 前一天的整个删
+        b.put(now - DAY, 1, Which::Request, &vec![b'x'; 1000]);
+        // 当天五个请求，各有请求体和回答，2000 字节一个；第 10 个还记着原本多长
+        for id in 10..15 {
+            b.put(now + id, id, Which::Request, &vec![b'x'; 1000]);
+            b.put(now + id, id, Which::Response, &vec![b'x'; 1000]);
+        }
+        b.put_with_len(now, 10, Which::Request, &vec![b'x'; 1000], 9999);
+        let today = b.root().join(day_of(now));
+        let before = b.total_bytes();
+
+        let freed = b.gc(now, 30, 3500);
+
+        assert_eq!(b.days().len(), 1, "{:?}", b.days());
+        assert!(today.is_dir(), "当天的目录被整个删了");
+        assert!(b.total_bytes() <= 3500, "{}", b.total_bytes());
+        assert_eq!(freed, before - b.total_bytes());
+        // 最早的四个连同 `.len` 一起没了，最新的那个还在
+        for id in 10..14 {
+            assert!(b.get(now, id, Which::Request).is_none(), "{id}");
+            assert!(b.get(now, id, Which::Response).is_none(), "{id}");
+        }
+        assert_eq!(b.original_len(now, 10, Which::Request), None);
+        assert!(b.get(now, 14, Which::Request).is_some());
+        assert!(b.get(now, 14, Which::Response).is_some());
+
+        // 下一小时没有新写入：已经在上限之内，什么都不再删
+        assert_eq!(b.gc(now + 3_600_000, 30, 3500), 0);
+        assert!(b.get(now, 14, Which::Response).is_some());
+    }
+
+    /// 写到一半的正文读不到：先写临时文件再换上去，换完不留临时文件
+    #[test]
+    fn a_body_is_swapped_in_whole_and_leaves_no_temporary_file_behind() {
+        let (_d, b) = setup();
+        assert!(b.put(0, 1, Which::Response, b"first"));
+        assert!(b.put(0, 1, Which::Response, b"second, longer"));
+        assert_eq!(b.get(0, 1, Which::Response).unwrap(), b"second, longer");
+        let names: Vec<String> = std::fs::read_dir(b.root().join(day_of(0)))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["1.res"]);
     }
 
     #[test]
