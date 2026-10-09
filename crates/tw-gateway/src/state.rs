@@ -234,6 +234,9 @@ pub struct AppState {
     pub balance: Arc<crate::balance::Balance>,
     /// 每段对话里、每一家上游拒过的别家封存的推理（见 [`crate::seal`]）。**跨重载存活**
     pub seals: Arc<crate::seal::Refused>,
+    /// 哪些（上游，模型）拒过转换时自动标的提示缓存断点（见 [`crate::cache_marks`]）。
+    /// **跨重载存活**
+    pub cache_marks: Arc<crate::cache_marks::Refused>,
     /// 脚本插件里跨重载存活的那一半：运行时、插件文件在哪儿、计数和日志、编译缓存
     /// （见 [`crate::plugin::Plugins`]）。跟着配置换的那一半在 `Runtime::plugins`
     pub plugins: Arc<crate::plugin::Plugins>,
@@ -319,6 +322,7 @@ impl AppState {
             affinity: Default::default(),
             balance: Default::default(),
             seals: Default::default(),
+            cache_marks: Default::default(),
             plugins,
             swap: Default::default(),
             ping_every: crate::PING_EVERY,

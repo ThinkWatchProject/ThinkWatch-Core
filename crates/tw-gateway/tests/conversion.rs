@@ -878,3 +878,123 @@ async fn a_claude_request_without_breakpoints_passes_straight_through_unchanged(
     assert_eq!(status, 200, "{body}");
     assert_eq!(seen.lock().unwrap().body, sent.to_string().into_bytes());
 }
+
+/// 自称 Anthropic 格式、却不收 `cache_control` 的兼容接口：带着它就回 400
+async fn refuses_cache_control() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let app = Router::new()
+        .fallback(
+            move |State(s): State<Arc<Mutex<Vec<Vec<u8>>>>>, body: bytes::Bytes| async move {
+                let refused = String::from_utf8_lossy(&body).contains("cache_control");
+                s.lock().unwrap().push(body.to_vec());
+                let (status, ct, reply) = if refused {
+                    (
+                        400,
+                        "application/json",
+                        json!({"type": "error", "error": {"type": "invalid_request_error",
+                            "message": "messages.0.content.0.cache_control: Extra inputs are not permitted"}})
+                        .to_string(),
+                    )
+                } else {
+                    (200, "text/event-stream", ANTHROPIC_STREAM.to_string())
+                };
+                axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", ct)
+                    .body(axum::body::Body::from(reply))
+                    .unwrap()
+            },
+        )
+        .with_state(seen.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn automatic_breakpoints_an_upstream_refuses_are_dropped_and_not_sent_again() {
+    let (up, seen) = refuses_cache_control().await;
+    let (gw, _) = gateway(provider(up, Protocol::Anthropic), SecurityMode::Observe).await;
+    let ask = || {
+        post(
+            gw,
+            "/v1/responses",
+            &[("authorization", "Bearer tw-k")],
+            codex_lite_request(),
+        )
+    };
+    // 自动标了断点、被拒：去掉，同一家再发一次，客户端照常拿到回答
+    let (status, _, body) = ask().await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("你好"), "{body}");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(String::from_utf8_lossy(&seen[0]).contains("cache_control"));
+        let again: Value = serde_json::from_slice(&seen[1]).unwrap();
+        assert!(!again.to_string().contains("cache_control"), "{again}");
+        // 别的一个字都没动
+        assert_eq!(again["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(again["messages"][0]["content"][0]["text"], "list the files");
+    }
+    // 记住了：这一家的这个模型往后直接不标，不再先被拒一次
+    let (status, _, body) = ask().await;
+    assert_eq!(status, 200, "{body}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(!String::from_utf8_lossy(&seen[2]).contains("cache_control"));
+}
+
+#[tokio::test]
+async fn a_secret_in_a_carried_summary_does_not_reach_the_disk() {
+    // 之前转换时压缩出的摘要里提到了一把钥匙，Codex 这一轮把它带回来了
+    const KEY: &str = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (up, _) = upstream(200, "text/event-stream", ANTHROPIC_STREAM.into()).await;
+    let cfg = Config {
+        version: 1,
+        listen: Listen::default(),
+        clients: vec![Client {
+            name: "c".into(),
+            key: "tw-k".into(),
+            ..Default::default()
+        }],
+        providers: vec![provider(up, Protocol::Anthropic)],
+        ..Default::default()
+    };
+    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let (tx, mut bodies) = tw_gateway::bodies::channel();
+    state.set_body_sink(tx);
+    let gw = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
+    let mut req = codex_lite_request();
+    req["input"].as_array_mut().unwrap().insert(
+        3,
+        json!({"type": "compaction", "encrypted_content":
+            tw_dialect::compaction::carry(&format!("Exported ANTHROPIC_API_KEY={KEY}; tests pass."))}),
+    );
+    let (status, _, body) = post(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        req,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let rec = tokio::time::timeout(Duration::from_secs(3), bodies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.kind, tw_gateway::bodies::BodyKind::Request);
+    let stored = String::from_utf8(rec.for_disk().body.to_vec()).unwrap();
+    let v: Value = serde_json::from_str(&stored).unwrap();
+    let carried = v["input"][3]["encrypted_content"].as_str().unwrap();
+    let summary = tw_dialect::compaction::read(carried).expect("摘要还解得开");
+    assert!(!summary.contains(KEY), "{summary}");
+    assert!(
+        summary.contains("ANTHROPIC_API_KEY=sk-an…AAAA; tests pass."),
+        "{summary}"
+    );
+}

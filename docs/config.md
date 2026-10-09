@@ -467,6 +467,13 @@ writes and reads are charged at the price table's cache prices. A request
 that carries its own marks, as Claude Code's do, keeps exactly those, and a
 request sent on in the upstream's own format is not changed.
 
+On Bedrock, marks are added only for the Claude models AWS lists as
+supporting prompt caching: Claude 3.7 Sonnet, Claude 3.5 Sonnet v2, and every
+Claude from version 4.5 on, including newer ones not yet listed. Older models,
+such as Claude 3 Haiku, Sonnet 4 and Opus 4.1, get none. An upstream that
+refuses the marks is sent the request once more without them, and that
+upstream is not sent marks for that model again until the core restarts.
+
 A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude
 and Google subscription sign-ins are not supported; use an API key.

@@ -13,6 +13,7 @@ pub mod auth;
 pub mod balance;
 pub mod bedrock;
 pub mod bodies;
+pub mod cache_marks;
 pub mod chatgpt;
 pub mod client_api;
 pub mod clientprobe;
