@@ -8,11 +8,12 @@
 //! 同样两边都用的还有：从响应里旁路嗅出用量（[`usage`]，换算和转换共用各家的
 //! `usage()`），拼上游地址（[`url`]），去掉 DeepSeek Harness 只发给 DeepSeek 的
 //! 扩展（[`harness`]），在原文上找调用方的正文（[`caller`]，内容过滤读它、删它），
-//! 读写各格式里名字不同的请求参数（[`params`]），以及 Codex 的远程压缩转给别家时怎么做
-//! （[`compaction`]）。
+//! 读写各格式里名字不同的请求参数（[`params`]），Codex 的远程压缩转给别家时怎么做
+//! （[`compaction`]），以及请求体上的提示缓存断点（[`cache`]）。
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod cache;
 pub mod caller;
 pub mod chat;
 pub mod compaction;

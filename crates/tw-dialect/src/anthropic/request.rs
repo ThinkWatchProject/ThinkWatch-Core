@@ -222,7 +222,9 @@ fn cache_ttl(b: &Value) -> Option<CacheTtl> {
 ///
 /// 断点不算内容：上一轮标在更早位置的那个这一轮挪走了，缓存照样命中（Anthropic 文档里多轮
 /// 对话就是这么标的）。太短（不到模型的最小缓存长度）的断点上游直接忽略，不报错，所以不估
-/// 长度。思考块不能标，标在它前面的那块上
+/// 长度。思考块不能标，标在它前面的那块上。
+///
+/// 不收 `cache_control` 的兼容接口回 400 时，网关去掉这些断点再发一次（[`crate::cache`]）
 fn auto_cache(out: &mut Map<String, Value>) {
     fn mark(blocks: Option<&mut Value>) {
         let Some(Value::Array(blocks)) = blocks else {
