@@ -37,9 +37,13 @@ routes:
 struct Bed {
     dir: tempfile::TempDir,
     app: axum::Router,
+    gateway: tw_gateway::AppState,
 }
 
 impl Bed {
+    fn gateway(&self) -> &tw_gateway::AppState {
+        &self.gateway
+    }
     fn file(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("config.yaml")).unwrap()
     }
@@ -59,7 +63,7 @@ fn bed(yaml: &str) -> Bed {
         shutdown: Default::default(),
         remote: Default::default(),
         cfg: Arc::new(ConfigManager::new(p, gw.clone(), bus)),
-        gateway: gw,
+        gateway: gw.clone(),
         store: None,
         started: std::time::Instant::now(),
         price_updater: Default::default(),
@@ -69,6 +73,7 @@ fn bed(yaml: &str) -> Bed {
     Bed {
         app: tw_control::router(state),
         dir: d,
+        gateway: gw,
     }
 }
 
@@ -179,8 +184,10 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
     let f = &json(&body)["failover"];
     assert_eq!(f["failures_to_pause"], 3, "{body}");
     assert_eq!(f["pause_secs"], 60);
-    assert_eq!(f["stream_start_wait_secs"], 15);
+    assert_eq!(f["idle_timeout_secs"], 300);
     assert_eq!(f["slot_wait_secs"], 30);
+    assert!(f.get("stream_start_wait_secs").is_none(), "{body}");
+    assert!(f.get("next_on_slow_start").is_none(), "{body}");
 
     let (st, body) = call(
         &b.app,
@@ -204,7 +211,7 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
         "PATCH",
         "/config",
         serde_json::json!({
-            "ops": [{ "op": "replace", "path": "/failover/stream_start_wait_secs", "value": 0 }],
+            "ops": [{ "op": "replace", "path": "/failover/idle_timeout_secs", "value": 10 }],
         }),
     )
     .await;
@@ -225,16 +232,23 @@ async fn failover_settings_show_their_defaults_and_take_an_edit() {
     assert_eq!(b.parsed().failover.slot_wait_secs, 0);
 }
 
-/// 开头慢就换下一家：默认关；打开要等得够久，等得太短的被拒
+/// 无响应超时：概览给出真在用的数，改了就生效；删掉的两项写不进去
 #[tokio::test]
-async fn switching_on_a_slow_start_is_shown_and_needs_a_long_enough_wait() {
+async fn the_idle_timeout_is_shown_and_takes_an_edit() {
     let b = bed(BASE);
+    let (st, body) = call(
+        &b.app,
+        "PATCH",
+        "/config",
+        serde_json::json!({
+            "ops": [{ "op": "replace", "path": "/failover/idle_timeout_secs", "value": 600 }],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(b.parsed().failover.idle_timeout_secs, 600);
     let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
-    assert_eq!(
-        json(&body)["failover"]["next_on_slow_start"],
-        false,
-        "{body}"
-    );
+    assert_eq!(json(&body)["failover"]["idle_timeout_secs"], 600, "{body}");
 
     let (st, body) = call(
         &b.app,
@@ -245,26 +259,53 @@ async fn switching_on_a_slow_start_is_shown_and_needs_a_long_enough_wait() {
         }),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "{body}");
-    assert!(b.parsed().failover.next_on_slow_start);
-    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
-    assert_eq!(
-        json(&body)["failover"]["next_on_slow_start"],
-        true,
-        "{body}"
-    );
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("config.unknown_field"), "{body}");
+}
 
+/// 中止：没有在跑的请求、会话，是 404，各有各的码
+#[tokio::test]
+async fn aborting_what_is_not_running_is_a_404() {
+    let b = bed(BASE);
+    let (st, body) = call(&b.app, "POST", "/request/42/abort", serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("control.request_not_running"), "{body}");
     let (st, body) = call(
         &b.app,
-        "PATCH",
-        "/config",
-        serde_json::json!({
-            "ops": [{ "op": "replace", "path": "/failover/stream_start_wait_secs", "value": 3 }],
-        }),
+        "POST",
+        "/sessions/abc-1/abort",
+        serde_json::Value::Null,
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("config.slow_start_too_short"), "{body}");
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert!(body.contains("control.session_not_running"), "{body}");
+}
+
+/// 中止在跑的：叫停，交回叫停了哪几个
+#[tokio::test]
+async fn aborting_a_running_request_or_session_says_which_were_stopped() {
+    let b = bed(BASE);
+    let gateway = b.gateway();
+    let (one, two) = (
+        tw_gateway::abort::Switch::default(),
+        tw_gateway::abort::Switch::default(),
+    );
+    let _a = gateway.aborts.enter(7, Some("s-1".into()), one.clone());
+    let _b = gateway.aborts.enter(9, Some("s-1".into()), two.clone());
+    let (st, body) = call(&b.app, "POST", "/request/7/abort", serde_json::Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["requests"], serde_json::json!([7]));
+    assert!(one.thrown() && !two.thrown());
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/sessions/s-1/abort",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["requests"], serde_json::json!([7, 9]));
+    assert!(two.thrown());
 }
 
 // ─────────────────────────────────────────────────────────── 上游

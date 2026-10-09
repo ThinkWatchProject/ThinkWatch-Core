@@ -3,7 +3,8 @@
 //! **只摆事实和参照，不下结论**（见 [`tw_api::UpstreamHealth`]）。这里的每一个数都要
 //! 说得清是从哪些请求里数出来的、数了几条：
 //!
-//! - 失败：口径和概览一样（`error IS NOT NULL`），客户端取消的不算失败，单独数；
+//! - 失败：口径和概览一样（`error IS NOT NULL`），客户端取消的不算失败，单独数；在界面上
+//!   手动中止的（[`tw_api::ABORTED`]）也不是上游的错，和取消的一起数；
 //! - 模型名：回答里写了的，归一之后和发出去的比（[`crate::model_name`]）；
 //! - 输入之比：上游报的输入（三项加起来）÷ 本地估算，取中位数，再拿别家服务同一个模型
 //!   时的中位数作参照 —— 估算只准到两三成，参照才让这个数有意义；
@@ -58,15 +59,21 @@ impl Db {
         to_ms: i64,
     ) -> Result<tw_api::UpstreamHealth, DbError> {
         let mut st = self.conn.prepare(
-            "SELECT at_ms, provider, sent_model, answered_model, session, cancelled,
-                    error IS NOT NULL, input_tokens, COALESCE(cache_read_tokens, 0),
+            "SELECT at_ms, provider, sent_model, answered_model, session,
+                    cancelled OR COALESCE(error_code = ?3, 0),
+                    error IS NOT NULL AND NOT COALESCE(error_code = ?3, 0),
+                    input_tokens, COALESCE(cache_read_tokens, 0),
                     COALESCE(cache_write_tokens, 0), input_estimate, ttft_ms, tokens_per_sec
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
              ORDER BY at_ms, id",
         )?;
         let mut tally = Tally::default();
-        let mut rows = st.query(params![from_ms.saturating_sub(CACHE_WARM_MS), to_ms])?;
+        let mut rows = st.query(params![
+            from_ms.saturating_sub(CACHE_WARM_MS),
+            to_ms,
+            tw_api::ABORTED
+        ])?;
         while let Some(r) = rows.next()? {
             tally.add(&Line::read(r)?, from_ms);
         }
@@ -525,13 +532,19 @@ mod tests {
         );
     }
 
-    /// **本地应答、规则拒绝了的不归哪一家**；取消的不算失败，也不在请求数里
+    /// **本地应答、规则拒绝了的不归哪一家**；取消的、手动中止的不算失败，也不在请求数里
     #[test]
     fn requests_failures_and_cancellations_are_counted_apart() {
         let mut failed = on(2, T0 + 2, "中转", "claude-sonnet-4-5");
         failed.error = Some(upstream_failed("502"));
         let mut cancelled = on(3, T0 + 3, "中转", "claude-sonnet-4-5");
         cancelled.cancelled = true;
+        let mut aborted = on(9, T0 + 9, "中转", "claude-sonnet-4-5");
+        aborted.error = Some(tw_api::Msg {
+            code: tw_api::ABORTED.into(),
+            args: Default::default(),
+            text: "The request was aborted by the user.".into(),
+        });
         let mut local = on(4, T0 + 4, "中转", "claude-sonnet-4-5");
         local.local = true;
         let mut refused = on(5, T0 + 5, "", "claude-sonnet-4-5");
@@ -545,6 +558,7 @@ mod tests {
             on(6, T0 + 6, "官方", "claude-sonnet-4-5"),
             on(7, T0 + 7, "官方", "claude-sonnet-4-5"),
             on(8, T0 + 8, "官方", "claude-sonnet-4-5"),
+            aborted,
         ]);
         assert_eq!(
             h.upstreams
@@ -557,7 +571,7 @@ mod tests {
         let relay = checkup(&h, "中转");
         assert_eq!(
             (relay.requests, relay.failed, relay.cancelled),
-            (2, 1, 1),
+            (2, 1, 2),
             "{relay:?}"
         );
         let official = checkup(&h, "官方");

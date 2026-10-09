@@ -116,6 +116,22 @@ class H(http.server.BaseHTTPRequestHandler):
                 "stopReason": "end_turn",
                 "usage": {"inputTokens": 30, "outputTokens": 2, "totalTokens": 32}}).encode())
         saw = "yes" if b"sk-ant-api03-SMOKEKEY" in body else "no"
+        if b"QUIETSTART" in body:
+            # 开了流、报了输入，17 秒不出内容，然后答完：比网关压着响应头的 15 秒长
+            self.send_response(200); self.send_header('content-type','text/event-stream')
+            self.send_header('connection','close'); self.end_headers()
+            self.wfile.write(b'event: message_start\ndata: {"type":"message_start",'
+                             b'"message":{"usage":{"input_tokens":12,"output_tokens":1}}}\n\n')
+            self.wfile.flush()
+            time.sleep(17)
+            self.wfile.write(b'event: content_block_start\ndata: {"type":"content_block_start",'
+                             b'"index":0,"content_block":{"type":"text","text":""}}\n\n'
+                             b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                             b'"index":0,"delta":{"type":"text_delta","text":"quiet-done"}}\n\n'
+                             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                             b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+            self.wfile.flush()
+            return
         if b"SLOWSTREAM" in body:
             # 先吐开头（输入用量在 message_start 里），然后长时间「思考」—— 客户端
             # 会在这期间走掉。不给 content-length，读到连接关闭为止。
@@ -199,6 +215,10 @@ listen:
 clients:
   - name: claude-code
     key: tw-smoketestkey0123456789
+  # 走两家候选的那把：流开头压不住时响应头先交出去，只在有下一家可换时才压
+  - name: quiet
+    key: tw-smokequietkey0123456789
+    route: 两家
 providers:
   - name: relay
     base_url: http://127.0.0.1:{upport}
@@ -225,6 +245,9 @@ groups:
   - name: 只走中转
     type: fallback
     providers: [relay]
+  - name: 两家
+    type: fallback
+    providers: [relay, official]
 routes:
   - name: 默认
     rules:
@@ -234,6 +257,10 @@ routes:
         to: bedrock
       - name: 冒烟：这条必须走 relay，不许转移
         to: 只走中转
+  - name: 两家
+    rules:
+      - name: 先中转再官方
+        to: 两家
 security:
   redact:
     mode: enforce
@@ -400,6 +427,26 @@ print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/d
     || bad "客户端中途走掉的请求没有按取消落库" "$GOT"
 fi
 
+# ---------------------------------------------------------------- 流开头压不住
+step "流开头压不住：响应头先交出去"
+# 两家候选，第一家开了流、17 秒不出内容。网关最多压 15 秒（tw_gateway::OPENING_HOLD）：
+# 到点先交 200 和流的响应头、发一行保活注释，内容到了接在后面交出去。单元测试里的时限是
+# 调短的，这里看真二进制上那个 15 秒和 hyper 真的把响应头先送出去
+T=$(curl -s -N -m 40 -o "$TMP/quiet.out" -w '%{http_code} %{time_starttransfer} %{time_total}' \
+  -XPOST "http://127.0.0.1:$PORT/v1/messages" -H 'x-api-key: tw-smokequietkey0123456789' \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"QUIETSTART"}]}' 2>/dev/null)
+C=$(python3 -c 'import sys
+code, first, total = sys.argv[1].split()
+print("ok" if code == "200" and 14.0 <= float(first) < 16.9 and float(total) >= 16.9 else sys.argv[1])' "$T")
+[ "$C" = "ok" ] && ok "压了 15 秒先交出响应头（${T}）" || bad "响应头不是在 15 秒时先交出去的" "$C"
+if head -c 13 "$TMP/quiet.out" | grep -q '^: keep-alive' && grep -q 'quiet-done' "$TMP/quiet.out" \
+   && [ "$(grep -c 'event: message_start' "$TMP/quiet.out")" = 1 ]; then
+  ok "先是保活注释，然后是那一家的回答，开头只有一份"
+else
+  bad "响应体不对" "$(head -c 400 "$TMP/quiet.out")"
+fi
+
 # ---------------------------------------------------------------- Bedrock
 step "Bedrock"
 # 转成 Converse、访问密钥签名（假 Bedrock 核对签名覆盖的请求体哈希）、
@@ -510,6 +557,13 @@ if [ "$ID" != "0" ]; then
   C=$(get "/request/$ID"); [ "$C" = "200" ] && ok "GET /request/{id}" || bad "返回 $C"
   C=$(post /replay/quote "{\"id\":$ID,\"provider\":\"official\"}")
   [ "$C" = "200" ] && ok "POST /replay/quote" || bad "返回 $C"
+  # 中止：注册着、认得出跑完了的请求（404 带着自己的码），不是 405 或者没有这个端点
+  C=$(post "/request/$ID/abort" '{}')
+  [ "$C" = "404" ] && grep -q 'control.request_not_running' "$TMP/out" \
+    && ok "POST /request/{id}/abort 说跑完了的请求不在跑" || bad "返回 $C" "$(head -c 200 "$TMP/out")"
+  C=$(post "/sessions/no-such-session/abort" '{}')
+  [ "$C" = "404" ] && grep -q 'control.session_not_running' "$TMP/out" \
+    && ok "POST /sessions/{id}/abort 说没有在跑的" || bad "返回 $C" "$(head -c 200 "$TMP/out")"
 else
   bad "历史里一条记录都没有"
 fi

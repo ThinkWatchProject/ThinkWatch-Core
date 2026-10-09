@@ -126,6 +126,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::SpeedQuote, speed_quote)
         .at(ep::SpeedRun, speed_run)
         .at(ep::RequestDetail, request_detail)
+        .at(ep::AbortRequest, abort_request)
         // 诊断包（脱敏纪律）。**只读，不写任何文件**
         .at(ep::Diagnostics, diagnostics::bundle)
         // 把一条真实请求变成回放用例。**录制不是新功能** ——
@@ -137,6 +138,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::Sessions, sessions)
         .at(ep::SessionDetail, session_detail)
         .at(ep::SessionTranscript, session_transcript)
+        .at(ep::AbortSession, abort_session)
         .at(ep::DryRun, dryrun::dry_run)
         // 为客户端发专用密钥。接管本身在桌面端做
         .at(ep::ClientKey, clients::client_key)
@@ -415,8 +417,7 @@ async fn overview(State(s): State<ControlState>) -> Json<tw_api::Overview> {
                 no_balance_pause_secs: f.no_balance_pause_secs,
                 quota_pause_secs: f.quota_pause_secs,
                 rate_limit_max_pause_secs: f.rate_limit_max_pause_secs,
-                stream_start_wait_secs: f.stream_start_wait_secs,
-                next_on_slow_start: f.next_on_slow_start,
+                idle_timeout_secs: f.idle_timeout_secs,
                 slot_wait_secs: f.slot_wait_secs,
             }
         },
@@ -1711,6 +1712,42 @@ async fn session_detail(
         session: session_view(&session),
         turns: turns.iter().map(turn_view).collect(),
     }))
+}
+
+/// 中止一个在跑的请求（见 `tw_gateway::abort`）。**叫停是立刻的**：和上游的连接在请求自己
+/// 那边断开，结局（`RequestFailed`，来源 `aborted`）随后从事件流上到。已经结束了的、从来
+/// 没有过的、跑在 WebSocket 连接上的，都是不在跑：404
+async fn abort_request(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Json<tw_api::Aborted>, Fail> {
+    s.gateway.aborts.request(id).map_err(|_| {
+        fail(
+            StatusCode::NOT_FOUND,
+            msg!("control.request_not_running", id = id => "Request {id} is not in progress."),
+        )
+    })?;
+    tracing::info!(id, "aborted a request over the control plane");
+    Ok(Json(tw_api::Aborted { requests: vec![id] }))
+}
+
+/// 中止一次会话里所有在跑的请求。一个都没有是 404
+async fn abort_session(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<tw_api::Aborted>, Fail> {
+    let requests = s.gateway.aborts.session(&id);
+    if requests.is_empty() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            msg!(
+                "control.session_not_running", id = id =>
+                "Session {id} has no request in progress."
+            ),
+        ));
+    }
+    tracing::info!(session = %id, count = requests.len(), "aborted a session's requests over the control plane");
+    Ok(Json(tw_api::Aborted { requests }))
 }
 
 fn no_such_session(id: &str) -> Fail {

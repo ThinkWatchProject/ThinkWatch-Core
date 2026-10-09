@@ -1016,19 +1016,43 @@ Before the first content of a streamed answer reaches the client, an error
 the upstream sends in the stream moves the request to the next candidate,
 the same as an error status would.
 
-An upstream can also be slow to start: it accepts the request and then sends
-nothing for a long time. With `next_on_slow_start`, the request moves on to the
-next candidate when no content has arrived `stream_start_wait_secs` after it
-was sent. It is off by default, because models that think before they write
-can take long to start; with it on, wait 30 seconds or more. The last
-candidate always waits, and the upstream given up on is not set aside. A
-candidate that is at its `max_concurrent` at that moment does not count as a
-next one: the slow upstream keeps the request.
+An upstream can also go quiet: it accepts the request and then sends nothing,
+or stops partway through. After `idle_timeout_secs` (300 by default) without
+content, the gateway stops waiting for it. The time counts from the moment the
+request is sent to that upstream, so waiting for a free slot does not count,
+and starts again with every piece of content: text, reasoning and tool calls
+count; keep-alives (SSE comments, Anthropic's `ping`, empty chunks, Responses'
+`response.in_progress`) do not, so an upstream that only keeps the connection
+alive still runs out of time. A whole, non-streamed answer counts from sending
+to the complete answer.
+
+- When no content has reached the client yet, the upstream counts as failed
+  (towards `failures_to_pause`, like a 5xx), the attempt appears with the
+  outcome `idle_timeout`, and the request moves to the next candidate. Until
+  then an upstream's answer is held back from the client, so the next upstream
+  starts it afresh. With no candidate left, the client gets a timeout error
+  (504) in its own format. The last candidate's stream is passed on as it
+  arrives, so once its response has started, a timeout there ends it with an
+  error event instead.
+- A streamed answer is held for at most 15 seconds. If no content has
+  arrived by then, the client receives `200` and the streaming headers, so
+  that its own wait for headers does not run out, followed by an SSE comment
+  (`: keep-alive`) every 15 seconds; Gemini clients get no comments. The
+  upstream's events stay held until its first content, and failover continues
+  as before under the same `200`: the next upstream's stream starts cleanly,
+  and when no candidate is left, the stream ends with an error event in the
+  client's format instead of a 504. The comments do not count as content.
+- When content has already reached the client, the request cannot move on
+  without repeating it: the answer ends with an error event in the client's
+  format, and the request is recorded as failed.
+
+The conversation then no longer stays on that upstream for the rest of its turn.
+Models that think for a long time before they write anything need a longer
+timeout.
 
 ```yaml
 failover:
-  stream_start_wait_secs: 30
-  next_on_slow_start: true
+  idle_timeout_secs: 600
 ```
 
 When upstreams are at their `max_concurrent`, a request waits for a free slot
@@ -1053,8 +1077,7 @@ failure instead.
 | `no_balance_pause_secs` | integer | `1800` | Seconds to set aside an upstream that reports an insufficient balance. |
 | `quota_pause_secs` | integer | `3600` | Seconds to set aside an upstream whose quota is used up when it does not say when the quota resets. When it does, the upstream is set aside until then. |
 | `rate_limit_max_pause_secs` | integer | `3600` | A rate-limited upstream is set aside for the time its `Retry-After` gives, at most this many seconds. Without `Retry-After` it counts as a failure without a stated reason. |
-| `stream_start_wait_secs` | integer | `15` | Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120. |
-| `next_on_slow_start` | bool | `false` | When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5. |
+| `idle_timeout_secs` | integer | `300` | Seconds an upstream may go without sending content before the gateway stops waiting for it. Counted from the moment the request is sent and started again by every piece of content: text, reasoning and tool calls count, keep-alives do not. A whole (non-streamed) answer counts from sending to the complete answer. Before any content has reached the client, the upstream counts as failed and the request moves to the next one; with none left, the client gets a timeout error. After content has reached the client, the answer ends with an error. From 30 to 3600. |
 | `slot_wait_secs` | integer | `30` | Seconds a request waits in all, counted once the key's own `max_concurrent` lets it in: for a key's `minute` or `hour` limit to free up, and for a free slot on upstreams at their `max_concurrent`. A key limit that does not free up in time refuses the request; without an upstream slot in time it goes to the next upstream, or, when every candidate is full, is answered with 429. `0`: never wait. From 0 to 300. |
 <!-- /generated -->
 
@@ -1168,11 +1191,11 @@ group shares out requests by the result in the same way as above.
   tenth.
 - `health`: upstreams that fail less get a larger share. It looks at the
   last 50 requests within the past 30 minutes. Server errors, rate limits,
-  used-up quota or balance, rejected credentials, timeouts and connection
-  errors count as failures; errors caused by the request itself do not, and
-  neither does a client that cancels, a switch away from a stream that is
-  slow to start, or an upstream skipped because it is at its
-  `max_concurrent`. An upstream that keeps failing keeps a twentieth of its
+  used-up quota or balance, rejected credentials, timeouts (including
+  `failover.idle_timeout_secs` before any content) and connection errors
+  count as failures; errors caused by the request itself do not, and neither
+  does a client that cancels, a request aborted by hand, or an upstream
+  skipped because it is at its `max_concurrent`. An upstream that keeps failing keeps a twentieth of its
   weight, so it still gets the occasional request and its recovery
   is noticed; one that fails outright is set aside by
   [`failover`](#cfg-failover) as before.
@@ -1180,8 +1203,8 @@ group shares out requests by the result in the same way as above.
 
 Speed is measured on streamed answers only, from the moment the request is
 sent to that upstream, so waiting and upstreams that failed before it do not
-count. An upstream given up on because its stream was slow to start
-(`failover.next_on_slow_start`) counts as taking the whole wait. On a
+count. An upstream given up on because it sent no content within
+`failover.idle_timeout_secs` counts as taking the whole wait. On a
 Responses WebSocket connection, each `response.create` counts as one request
 for both speed and failures, its speed measured from the moment the upstream
 starts answering it.

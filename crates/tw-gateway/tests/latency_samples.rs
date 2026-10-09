@@ -1,6 +1,6 @@
 //! 快慢样本（`url-test` 和按快慢分的 `load-balance` 看的那个数）量的是哪一段，端到端：从
 //! 这一跳发出去到回答的第一段内容 —— 不含之前失败了的几跳，不是响应头，和这一跳排在第几家
-//! 无关；整包的回答不记；开头慢被放弃的那一家记它被给的那段时间。
+//! 无关；整包的回答不记；没有内容超时被放弃的那一家记它被给的那段时间。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -93,9 +93,9 @@ fn provider(name: &str, at: SocketAddr) -> Provider {
     }
 }
 
-/// 起网关，按声明的顺序故障转移。开头最多等 1 秒（测试里图快；配置校验要求换家时至少
-/// 5 秒，网关自己不查）
-async fn gateway(providers: Vec<Provider>, switch: bool) -> (SocketAddr, Arc<Latency>) {
+/// 起网关，按声明的顺序故障转移。无响应超时 1 秒：配置写最短的 30 秒，测试把一秒调成
+/// 三十分之一秒
+async fn gateway(providers: Vec<Provider>) -> (SocketAddr, Arc<Latency>) {
     let cfg = Config {
         version: 1,
         clients: vec![Client {
@@ -105,13 +105,13 @@ async fn gateway(providers: Vec<Provider>, switch: bool) -> (SocketAddr, Arc<Lat
         }],
         providers,
         failover: Failover {
-            stream_start_wait_secs: 1,
-            next_on_slow_start: switch,
+            idle_timeout_secs: 30,
             ..Default::default()
         },
         ..Default::default()
     };
-    let state = tw_gateway::AppState::new(cfg).unwrap();
+    let mut state = tw_gateway::AppState::new(cfg).unwrap();
+    state.idle_tick = Duration::from_micros(33_334);
     let latency = state.latency.clone();
     let addr = tw_gateway::serve(state, ([127, 0, 0, 1], 0).into())
         .await
@@ -150,7 +150,7 @@ async fn the_sample_runs_to_the_first_content_not_to_the_response_headers() {
         ..Default::default()
     })
     .await;
-    let (gw, latency) = gateway(vec![provider("排队", up)], false).await;
+    let (gw, latency) = gateway(vec![provider("排队", up)]).await;
     ask(gw, true, 3).await;
     let t = latency.typical("排队").expect("三个流式回答该有三个样本");
     assert!((400..1_500).contains(&t), "{t} 毫秒");
@@ -170,7 +170,7 @@ async fn earlier_hops_are_not_charged_to_the_upstream_that_answers() {
         ..Default::default()
     })
     .await;
-    let (gw, latency) = gateway(vec![provider("坏", bad), provider("好", good)], false).await;
+    let (gw, latency) = gateway(vec![provider("坏", bad), provider("好", good)]).await;
     ask(gw, true, 3).await;
     let t = latency.typical("好").expect("三个样本");
     assert!(
@@ -189,7 +189,7 @@ async fn the_position_of_the_hop_does_not_change_what_is_measured() {
     })
     .await;
     let spare = upstream(Script::default()).await;
-    let (gw, latency) = gateway(vec![provider("先", first), provider("备", spare)], false).await;
+    let (gw, latency) = gateway(vec![provider("先", first), provider("备", spare)]).await;
     ask(gw, true, 3).await;
     let t = latency.typical("先").expect("三个样本");
     assert!((300..1_200).contains(&t), "{t} 毫秒");
@@ -204,14 +204,15 @@ async fn an_answer_that_is_not_streamed_leaves_no_sample() {
         ..Default::default()
     })
     .await;
-    let (gw, latency) = gateway(vec![provider("整包", up)], false).await;
+    let (gw, latency) = gateway(vec![provider("整包", up)]).await;
     ask(gw, false, 3).await;
     assert_eq!(latency.typical("整包"), None);
 }
 
 #[tokio::test]
 async fn an_upstream_given_up_on_is_charged_the_time_it_was_given() {
-    // 慢的那一家以前很快（留着三个快的样本），现在开了流就不出内容：每次等满 1 秒被放弃。
+    // 慢的那一家以前很快（留着三个快的样本），现在开了流就不出内容：每次等满 1 秒（无响应
+    // 超时）被放弃。
     // 它记 1 秒，中位数就落到慢的那一头；接下来答的那一家不替它背这 1 秒
     let slow = upstream(Script {
         stall: true,
@@ -219,7 +220,7 @@ async fn an_upstream_given_up_on_is_charged_the_time_it_was_given() {
     })
     .await;
     let quick = upstream(Script::default()).await;
-    let (gw, latency) = gateway(vec![provider("慢", slow), provider("快", quick)], true).await;
+    let (gw, latency) = gateway(vec![provider("慢", slow), provider("快", quick)]).await;
     for _ in 0..3 {
         latency.record("慢", 50);
     }
@@ -237,7 +238,7 @@ async fn an_upstream_whose_headers_never_come_is_charged_the_time_it_was_given()
     })
     .await;
     let quick = upstream(Script::default()).await;
-    let (gw, latency) = gateway(vec![provider("无声", mute), provider("快", quick)], true).await;
+    let (gw, latency) = gateway(vec![provider("无声", mute), provider("快", quick)]).await;
     ask(gw, true, 3).await;
     assert_eq!(latency.typical("无声"), Some(1_000));
     assert!(latency.typical("快").is_some_and(|t| t < 800));

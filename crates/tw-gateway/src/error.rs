@@ -47,6 +47,14 @@ pub enum Source {
     /// 请求体超过网关的上限（见 `server::intake`）。**413，不是 400**：Anthropic 的格式里
     /// 它是 `request_too_large`，和 Anthropic 自己嫌请求太大时一样。对外的词表里算 `request`
     TooLarge,
+    /// 上游在 `failover.idle_timeout_secs` 里一直没有内容，候选也用完了。**504，不是 502**：
+    /// 上游没坏，是没在时限里回话 —— Anthropic 的格式里它是 `timeout_error`，Gemini 是
+    /// `DEADLINE_EXCEEDED`。对外的词表里算 `upstream`
+    Timeout,
+    /// 在界面上手动中止的（见 [`crate::abort`]）。**499**：客户端的 SDK 不重试 4xx
+    /// （408、409、429 除外），不会把用户叫停的请求自己再发一遍；Google 的接口给「操作被
+    /// 取消」用的也是它。对外的词表里是 `aborted`
+    Aborted,
 }
 
 /// 上游都满着时告诉客户端过几秒再来（`Retry-After`）。
@@ -66,6 +74,8 @@ impl Source {
             Source::RateLimited | Source::Busy => "rate_limited",
             Source::Denied => "denied",
             Source::NotSupported | Source::TooLarge => "request",
+            Source::Timeout => "upstream",
+            Source::Aborted => "aborted",
         }
     }
     fn status(&self) -> StatusCode {
@@ -79,6 +89,8 @@ impl Source {
             Source::Denied => StatusCode::FORBIDDEN,
             Source::NotSupported => StatusCode::NOT_IMPLEMENTED,
             Source::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Source::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Source::Aborted => StatusCode::from_u16(499).expect("499 is a valid status code"),
         }
     }
 }
@@ -179,6 +191,16 @@ impl GatewayError {
     }
     pub fn too_large(detail: Msg) -> Self {
         Self::new(Source::TooLarge, detail)
+    }
+    pub fn timeout(detail: Msg) -> Self {
+        Self::new(Source::Timeout, detail)
+    }
+    /// 手动中止（见 [`crate::abort`]）。句子只有一句，码是 [`tw_api::ABORTED`]
+    pub fn aborted() -> Self {
+        Self::new(
+            Source::Aborted,
+            tw_types::msg!("gw.request.aborted" => "The request was aborted by the user."),
+        )
     }
 }
 
@@ -407,6 +429,30 @@ mod tests {
         let r = e().into_response();
         assert_eq!(head(&r, "retry-after"), None);
         assert_eq!(head(&r, "x-should-retry"), None);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_504_and_an_abort_is_499() {
+        let (status, slug, json) =
+            body_of(GatewayError::timeout(msg!("t.x" => "quiet")).in_dialect(Dialect::Gemini))
+                .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(slug, "upstream");
+        assert_eq!(json["error"]["status"], "DEADLINE_EXCEEDED");
+        let (_, _, json) = body_of(GatewayError::timeout(msg!("t.x" => "quiet"))).await;
+        assert_eq!(json["error"]["type"], "timeout_error");
+        let (status, slug, json) = body_of(GatewayError::aborted()).await;
+        assert_eq!(status.as_u16(), 499);
+        assert_eq!(slug, "aborted");
+        assert_eq!(GatewayError::aborted().detail.code, tw_api::ABORTED);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("[ThinkWatch]")
+        );
+        let (_, _, json) = body_of(GatewayError::aborted().in_dialect(Dialect::Gemini)).await;
+        assert_eq!(json["error"]["status"], "CANCELLED");
     }
 
     #[test]

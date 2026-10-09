@@ -27,7 +27,10 @@ use tw_api::Msg;
 /// `matching`、`revealed`），结局多了「已删除」。
 ///
 /// 25：插件在每个请求上的运行记录（`plugin_runs`）。
-pub(crate) const SCHEMA: i64 = 25;
+///
+/// 26：尝试链的结果（`routing` 里的 `outcome`）没有了 `slow_start`，多了 `idle_timeout` 和
+/// `aborted`。
+pub(crate) const SCHEMA: i64 = 26;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
