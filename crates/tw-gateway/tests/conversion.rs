@@ -809,3 +809,72 @@ async fn a_summary_written_on_a_claude_route_reaches_openai_as_a_message() {
     );
     assert!(!got.to_string().contains("tw1.c."));
 }
+
+#[tokio::test]
+async fn a_codex_request_on_a_claude_route_marks_cache_breakpoints_and_records_cache_usage() {
+    // Claude 报了这一次写进缓存多少、从缓存读了多少
+    let stream = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":30,\"cache_creation_input_tokens\":2000,\"cache_read_input_tokens\":9000,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let (up, seen) = upstream(200, "text/event-stream", stream).await;
+    let (gw, mut rx) = gateway(provider(up, Protocol::Anthropic), SecurityMode::Observe).await;
+    let (status, _, body) = post(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        codex_lite_request(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Codex 不标断点：转给 Claude 时替它标在工具末尾、系统提示末尾、最后一条用户消息末尾
+    let sent: Value = serde_json::from_slice(&seen.lock().unwrap().body).unwrap();
+    let ephemeral = json!({"type": "ephemeral"});
+    assert_eq!(sent["tools"][2]["cache_control"], ephemeral);
+    assert_eq!(
+        sent["system"].as_array().unwrap().last().unwrap()["cache_control"],
+        ephemeral
+    );
+    assert_eq!(
+        sent["messages"][0]["content"][0]["cache_control"],
+        ephemeral
+    );
+    assert_eq!(sent.to_string().matches("cache_control").count(), 3);
+
+    // 缓存读写照上游报的记下，计费按价目表的缓存单价算
+    let mut finished = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::RequestFinished { usage, .. } = ev {
+            finished = usage;
+            break;
+        }
+    }
+    let u = finished.expect("没有用量");
+    assert_eq!(
+        (u.input, u.cache_write, u.cache_read, u.output),
+        (30, 2000, 9000, 12)
+    );
+    assert!(!u.cache_1h);
+}
+
+#[tokio::test]
+async fn a_claude_request_without_breakpoints_passes_straight_through_unchanged() {
+    // 同格式直通一个字节都不改：自动标断点只在转换时
+    let (up, seen) = upstream(200, "text/event-stream", ANTHROPIC_STREAM.into()).await;
+    let (gw, _) = gateway(provider(up, Protocol::Anthropic), SecurityMode::Observe).await;
+    let sent = json!({
+        "model": "claude-opus-4-7", "max_tokens": 100, "stream": true,
+        "system": "Be brief.",
+        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (status, _, body) = post(gw, "/v1/messages", &[("x-api-key", "tw-k")], sent.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(seen.lock().unwrap().body, sent.to_string().into_bytes());
+}

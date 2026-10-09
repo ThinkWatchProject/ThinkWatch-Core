@@ -80,6 +80,30 @@ fn caches(model: &str) -> bool {
     m.contains("anthropic.claude") || m.contains("amazon.nova") || m.starts_with("arn:")
 }
 
+/// 客户端没标断点时自动标的，和转给 Anthropic 时同样的四处：工具的末尾、系统提示的末尾、
+/// 最后两条用户消息的末尾，各跟一个 5 分钟的 `cachePoint`（Converse 也最多四个）
+fn auto_cache(out: &mut Map<String, Value>) {
+    fn mark(blocks: Option<&mut Value>) {
+        if let Some(Value::Array(blocks)) = blocks
+            && !blocks.is_empty()
+        {
+            blocks.push(cache_point(CacheTtl::Short));
+        }
+    }
+    mark(out.get_mut("toolConfig").and_then(|c| c.get_mut("tools")));
+    mark(out.get_mut("system"));
+    if let Some(Value::Array(messages)) = out.get_mut("messages") {
+        for m in messages
+            .iter_mut()
+            .rev()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .take(2)
+        {
+            mark(m.get_mut("content"));
+        }
+    }
+}
+
 /// 一个缓存断点块。`ttl` 缺省是 5 分钟
 fn cache_point(ttl: CacheTtl) -> Value {
     match ttl {
@@ -206,6 +230,12 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
         out.insert("toolConfig".into(), config);
     } else if r.tool_choice.is_some() {
         dropped.path("tool_choice");
+    }
+    // 客户端自己一个断点都没标，模型又是 Claude：替它标（见 `anthropic::request` 的
+    // `auto_cache`）。Nova 和看不出是谁的推理配置 ARN 不自动标：不认的模型收到
+    // `cachePoint` 会拒掉整个请求
+    if r.cache.is_empty() && is_claude(&r.model) {
+        auto_cache(&mut out);
     }
 
     // Converse 自己没有的旋钮

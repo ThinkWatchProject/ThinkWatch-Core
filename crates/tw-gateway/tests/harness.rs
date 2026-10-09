@@ -532,12 +532,17 @@ async fn chat_to_an_anthropic_upstream_is_cleaned_by_the_conversion() {
     assert_eq!(system, ["You are DeepSeek Harness."]);
     let messages = v["messages"].as_array().unwrap();
     assert!(messages.iter().all(|m| m["role"] != "system"));
+    // 客户端没标缓存断点：最后两条用户消息的末尾各标一个
     assert_eq!(
         messages[2]["content"],
         json!([
             {"type": "text", "text": "<system-reminder>\nThe project root is /work.\n</system-reminder>"},
-            {"type": "text", "text": "search it"}
+            {"type": "text", "text": "search it", "cache_control": {"type": "ephemeral"}}
         ])
+    );
+    assert_eq!(
+        messages[0]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"})
     );
     assert_eq!(v["thinking"]["type"], "enabled");
 

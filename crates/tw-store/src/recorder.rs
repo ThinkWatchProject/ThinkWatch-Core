@@ -2126,6 +2126,31 @@ mod cache_saving_tests {
         );
     }
 
+    /// 缓存写和缓存读按价目表的缓存单价算，不按输入价：转给 Claude 时自动标的断点让
+    /// Codex 这类客户端的请求也有了这两项
+    #[test]
+    fn cache_writes_and_reads_are_charged_at_the_cache_prices() {
+        let (_d, mut r) = rec();
+        r.on_event(&started(1, "claude-sonnet-4-5"));
+        r.on_event(&finished(
+            1,
+            Some(UsageView {
+                input: 1000,
+                output: 500,
+                cache_read: 100_000,
+                cache_write: 10_000,
+                ..Default::default()
+            }),
+        ));
+        let row = r.db().get(1).unwrap().unwrap();
+        // Sonnet 4.5：输入 $3、输出 $15、缓存读 $0.30、5 分钟缓存写 $3.75（每百万 token）
+        // 0.003 + 0.0075 + 0.03 + 0.0375
+        assert_eq!(row.cost_micros, Some(78_000));
+        assert!(!row.cost_estimated);
+        // 读省下 10 万 × $2.70，写多花 1 万 × $0.75
+        assert_eq!(row.cache_saved_micros, Some(270_000 - 7_500));
+    }
+
     #[test]
     fn a_request_with_no_cache_hit_saved_a_real_zero() {
         let (_d, mut r) = rec();

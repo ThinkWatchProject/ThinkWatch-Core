@@ -454,6 +454,19 @@ Identity fields that clients fill in themselves, such as Claude Code's
 `metadata.user_id`, are removed from the body. For an upstream that admits only
 certain clients, turn on `forward_client_identity`.
 
+A request converted to Anthropic, or to Claude on Bedrock, marks where the
+upstream may cache the prompt when the client marked nothing itself. Clients
+in OpenAI or Gemini formats such as Codex cannot mark anything: those
+providers cache a repeated prompt on their own, while Anthropic caches only
+what is marked. The marks go at the end of the tools, at the end of the
+system prompt and at the end of the last two user turns, at most four, each
+kept for the default five minutes. The earlier of the two user marks is where
+the previous request ended, so each turn reads back what the turn before
+wrote and pays the cache price for it instead of the full input price. Cache
+writes and reads are charged at the price table's cache prices. A request
+that carries its own marks, as Claude Code's do, keeps exactly those, and a
+request sent on in the upstream's own format is not changed.
+
 A ChatGPT account upstream (`protocol: chatgpt`) takes only the credential
 the desktop app obtains by signing in; it cannot be written by hand. Claude
 and Google subscription sign-ins are not supported; use an API key.
