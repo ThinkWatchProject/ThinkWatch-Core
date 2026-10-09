@@ -16,10 +16,15 @@
 //! - 别的一律打码，和安全日志里报的是同一种写法
 //! - 最后整段再按形状打一遍码，和读的时候是同一个函数（[`tw_secret::mask_body`]），
 //!   兜住规则没认出来的
+//! - **转换时压缩出的前文摘要**（`compaction` 项里 `tw1.c.` 开头的那串，见
+//!   [`tw_dialect::compaction`]）是 base64 包着的一段文字，上面两道都看不见里面：解开，
+//!   照同样的规矩换、打码，再包回原位（[`carried_summaries`]）。Codex 每一轮都把它带回来，
+//!   摘要里提到过的密钥否则每一轮都原样落一次盘
 //!
 //! 以前存的是客户端发来的原文，密钥只在读出来的时候才打码：磁盘上躺着的一直是真值。
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -117,9 +122,33 @@ impl Redaction {
             }
         };
         let sent: HashMap<&str, &str> = self.ledger.replacements().collect();
+        // 摘要以外的各段照常（找过的命中照用）；摘要解开了重新找、换、打码，再包回去
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
-        for h in hits {
+        for (span, summary) in carried_summaries(text) {
+            out.push_str(&self.span(text, at..span.start, hits, &sent));
+            out.push_str(&tw_dialect::compaction::carry(&self.apply(&summary)));
+            at = span.end;
+        }
+        out.push_str(&self.span(text, at..text.len(), hits, &sent));
+        out
+    }
+
+    /// `text` 里的一段：落在这一段里的命中换掉或打码，再按形状打一遍。各段在 token 的边界上
+    /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的
+    fn span(
+        &self,
+        text: &str,
+        range: Range<usize>,
+        hits: &[Hit],
+        sent: &HashMap<&str, &str>,
+    ) -> String {
+        let mut out = String::with_capacity(range.len());
+        let mut at = range.start;
+        for h in hits
+            .iter()
+            .filter(|h| h.bytes.start >= range.start && h.bytes.end <= range.end)
+        {
             out.push_str(&text[at..h.bytes.start]);
             let value = &text[h.bytes.clone()];
             match sent.get(value) {
@@ -128,9 +157,41 @@ impl Redaction {
             }
             at = h.bytes.end;
         }
-        out.push_str(&text[at..]);
+        out.push_str(&text[at..range.end]);
         tw_secret::mask_body(&out)
     }
+}
+
+/// 正文里转换时压缩出的前文摘要：`tw1.c.` 开头、解得开的那串（[`tw_dialect::compaction`]），
+/// 在正文里的位置和解开的摘要，按出现的顺序。
+///
+/// 一串按 [`tw_secret::mask_body`] 认 token 的办法划边界（字母、数字、`-`、`_`、`.`），
+/// 所以把它挖出去之后，剩下的各段打码和整段打码一样。**解不开的（截断了的、坏了的）
+/// 不算**：它照别的字一样打码 —— 一长串不透明的字符，按形状整串打掉
+fn carried_summaries(text: &str) -> Vec<(Range<usize>, String)> {
+    fn is_tok(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+    }
+    let bytes = text.as_bytes();
+    let prefix = tw_dialect::compaction::CARRIED_PREFIX.as_bytes();
+    let mut out: Vec<(Range<usize>, String)> = Vec::new();
+    for start in memchr::memmem::find_iter(bytes, prefix) {
+        // 一串的开头，不是别的字中间
+        if start > 0 && is_tok(bytes[start - 1]) {
+            continue;
+        }
+        if out.last().is_some_and(|(r, _)| start < r.end) {
+            continue;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| !is_tok(b))
+            .map_or(bytes.len(), |n| start + n);
+        if let Some(summary) = tw_dialect::compaction::read(&text[start..end]) {
+            out.push((start..end, summary));
+        }
+    }
+    out
 }
 
 /// 一个认出来、没换成占位符的值存成什么样。
@@ -531,6 +592,132 @@ mod tests {
         cut.original_len = body.len() + 1;
         let cut = written(cut);
         assert!(!cut.contains("hunter2hunter2"), "{cut}");
+    }
+
+    const AWS: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    /// 摘要里提到过的密钥：一个规则认得出（Anthropic 的钥匙），一个只认得出形状（AWS 的
+    /// 访问密钥 ID）
+    fn summary() -> String {
+        format!("Set ANTHROPIC_API_KEY={KEY} and aws key {AWS} in .env; tests pass.")
+    }
+
+    /// 存下来的那份里每一个转换时写的摘要，解开
+    fn summaries_in(stored: &str) -> Vec<String> {
+        carried_summaries(stored)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// 转换时压缩出的摘要（`tw1.c.` + base64）里的密钥：解开、照样打码、包回原位。Codex
+    /// 每一轮的请求都把它带回来；直通 OpenAI 时上游的回答里没有它，转换时客户端收到的那份
+    /// 不落盘 —— 但正文里凡是出现了，一样处理
+    #[test]
+    fn a_secret_inside_a_carried_summary_is_masked_before_it_is_written() {
+        let item = tw_dialect::compaction::carry(&summary());
+        let request = format!(
+            r#"{{"model":"gpt-5.4","input":[{{"type":"message","role":"user","content":"fix it"}},{{"type":"compaction","encrypted_content":"{item}"}},{{"type":"message","role":"user","content":"next {KEY}"}}]}}"#
+        );
+        let streamed = format!(
+            "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"{item}\"}}}}\n\n"
+        );
+        let whole =
+            format!(r#"{{"output":[{{"type":"compaction","encrypted_content":"{item}"}}]}}"#);
+        for (kind, body) in [
+            (BodyKind::Request, &request),
+            (BodyKind::Response, &streamed),
+            (BodyKind::Response, &whole),
+        ] {
+            let stored = written(record(kind, body, Redaction::default()));
+            let inside = summaries_in(&stored);
+            assert_eq!(inside.len(), 1, "{stored}");
+            let s = &inside[0];
+            for secret in [KEY, AWS] {
+                assert!(!s.contains(secret), "{secret} 原样进了磁盘：{s}");
+                assert!(!stored.contains(secret), "{stored}");
+            }
+            assert!(s.contains("ANTHROPIC_API_KEY=sk-an…AAAA"), "{s}");
+            assert!(s.contains("tests pass."), "摘要的其余部分要留着：{s}");
+            // 摘要外面的照常打码
+            if kind == BodyKind::Request {
+                assert!(stored.contains("next sk-an…AAAA"), "{stored}");
+                serde_json::from_str::<serde_json::Value>(&stored).expect("存下来的还是 JSON");
+            }
+        }
+    }
+
+    /// 请求路上找过的命中照用（找过的是摘要外面的那些），摘要里面另外找；拦截档下摘要里
+    /// 的值换成发给上游的那个占位符
+    #[test]
+    fn the_hits_found_on_the_way_in_still_cover_the_rest_and_the_ledger_reaches_inside() {
+        let item = tw_dialect::compaction::carry(&summary());
+        let body = format!(
+            r#"{{"input":[{{"type":"compaction","encrypted_content":"{item}"}},{{"role":"user","content":"key {KEY} 库 postgres://app:hunter2hunter2@db/x"}}]}}"#
+        );
+        for mode in [
+            tw_config::SecurityMode::Observe,
+            tw_config::SecurityMode::Enforce,
+        ] {
+            let rules = RuleSet::defaults();
+            let seen = crate::guard::look_hits(mode, &rules, body.as_bytes());
+            let r = Redaction {
+                rules: Arc::new(rules),
+                ledger: seen.ledger,
+            };
+            let again = written(record(BodyKind::Request, &body, r.clone()));
+            let reused =
+                written(record(BodyKind::Request, &body, r).found(seen.hits.map(Arc::from)));
+            assert_eq!(reused, again, "{mode:?}");
+            assert!(!reused.contains("hunter2hunter2"), "{reused}");
+            let inside = summaries_in(&reused);
+            assert!(!inside[0].contains(KEY), "{mode:?}: {inside:?}");
+            if mode == tw_config::SecurityMode::Enforce {
+                // 上游收到的是占位符，摘要里存的也是它
+                assert!(inside[0].contains("<<TW_SECRET_1>>"), "{inside:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_damaged_carried_summary_is_masked_as_text_and_never_panics() {
+        for bad in [
+            // 一个字符凑不出一个字节
+            "tw1.c.a".to_string(),
+            // 不是 base64url
+            "tw1.c.!!!!".to_string(),
+            // 截断在半个 UTF-8 字符上
+            format!(
+                "tw1.c.{}",
+                &tw_dialect::compaction::carry("密钥")["tw1.c.".len()..][..3]
+            ),
+            // 一长串解不开的（base64 的标准字母表）
+            format!("tw1.c.{}+/=", "QUtJQUlPU0ZPRE5ON0VYQU1QTEU".repeat(3)),
+            // 前缀之后什么都没有
+            "tw1.c.".to_string(),
+        ] {
+            let body =
+                format!(r#"{{"input":[{{"type":"compaction","encrypted_content":"{bad}"}}]}}"#);
+            let stored = written(record(BodyKind::Request, &body, Redaction::default()));
+            // 和没有这回事时一样：按形状打码（只剩前缀的那个解出来是空摘要，原样）
+            assert_eq!(stored, tw_secret::mask_body(&body), "{bad}");
+            assert!(summaries_in(&stored).iter().all(String::is_empty), "{bad}");
+        }
+        // 正文被截断在一个摘要中间（存下来的只有开头 4 MB）：解得开的那半截照样在里面打码，
+        // 解不开的整串打掉。哪一种都不会留下原值
+        let item = tw_dialect::compaction::carry(&summary());
+        for drop in 1..=8 {
+            let cut = &item[..item.len() - drop];
+            let body = format!(r#"{{"encrypted_content":"{cut}"#);
+            let stored = written(record(BodyKind::Request, &body, Redaction::default()));
+            let inside = summaries_in(&stored);
+            for s in &inside {
+                assert!(!s.contains(KEY) && !s.contains(AWS), "{drop}: {s}");
+            }
+            if inside.is_empty() {
+                assert!(!stored.contains(&cut[10..40]), "{drop}: {stored}");
+            }
+        }
     }
 
     #[test]

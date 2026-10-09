@@ -162,10 +162,13 @@ pub fn probe_request(
             upstream_headers,
         ));
     }
+    // 编码器给转成 Claude 的请求自动标缓存断点；测速的请求短得缓存不了，标了反而可能被不认
+    // 的上游整个拒掉、被当成测速失败（见 `crate::cache_marks`）
+    let body = tw_dialect::cache::strip_marks(dialect, &prepared.body).unwrap_or(prepared.body);
     ProbeRequest {
         path,
         query,
-        body: prepared.body,
+        body,
         headers,
     }
 }

@@ -692,3 +692,84 @@ async fn counting_tokens_is_not_supported_the_way_claude_code_expects() {
         "counting tokens reached AWS"
     );
 }
+
+/// 不认 `cachePoint` 的 Bedrock：请求里带着它就回 400 ValidationException
+fn refuses_cache_points() -> Answer {
+    Arc::new(|s: &Seen| {
+        if String::from_utf8_lossy(&s.body).contains("cachePoint") {
+            axum::response::Response::builder()
+                .status(400)
+                .header("content-type", "application/json")
+                .header(
+                    "x-amzn-errortype",
+                    "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/",
+                )
+                .body(axum::body::Body::from(
+                    json!({"message": "The model returned the following errors: cachePoint is not supported for this model."}).to_string(),
+                ))
+                .unwrap()
+        } else {
+            json_answer(200, converse_reply("ok"))
+        }
+    })
+}
+
+#[tokio::test]
+async fn automatic_cache_points_a_model_refuses_are_dropped_and_not_sent_again() {
+    let (up, seen) = bedrock(refuses_cache_points()).await;
+    let (gw, _, mut rx) = gateway(with_keys(up)).await;
+    let ask = || {
+        post(
+            gw,
+            "/v1/chat/completions",
+            &[("authorization", "Bearer tw-k")],
+            json!({"model": MODEL, "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"}
+            ]}),
+        )
+    };
+    // Chat 客户端不标断点：转给 Claude 时自动标，被拒了就去掉、同一家再发一次
+    let (status, body) = ask().await;
+    assert_eq!(status, 200, "{body}");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(String::from_utf8_lossy(&seen[0].body).contains("cachePoint"));
+        assert!(!String::from_utf8_lossy(&seen[1].body).contains("cachePoint"));
+        // 再发的那一份按它自己的内容重新签名
+        assert_signed_as_sent(&seen[1]);
+    }
+    assert!(matches!(
+        ending(&mut rx).await,
+        tw_api::Event::RequestFinished { .. }
+    ));
+    // 记住了：这一家的这个模型往后直接不标
+    let (status, body) = ask().await;
+    assert_eq!(status, 200, "{body}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(!String::from_utf8_lossy(&seen[2].body).contains("cachePoint"));
+}
+
+#[tokio::test]
+async fn cache_points_the_client_set_itself_are_never_dropped() {
+    // Claude Code 自己标的断点：被拒了原样交回去，不替它去掉
+    let (up, seen) = bedrock(refuses_cache_points()).await;
+    let (gw, _, _) = gateway(with_keys(up)).await;
+    let (status, body) = post(
+        gw,
+        "/v1/messages",
+        &[("x-api-key", "tw-k")],
+        json!({
+            "model": MODEL,
+            "max_tokens": 16,
+            "system": [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("cachePoint"), "{body}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}

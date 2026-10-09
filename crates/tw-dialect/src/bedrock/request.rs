@@ -80,6 +80,67 @@ fn caches(model: &str) -> bool {
     m.contains("anthropic.claude") || m.contains("amazon.nova") || m.starts_with("arn:")
 }
 
+/// 客户端没标断点时，替它标不标：**只给 AWS 列出支持显式提示缓存的 Claude**。
+///
+/// 依据是 AWS 的「Supported models, Regions, and explicit caching limits」表
+/// （<https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>，2026-10-09
+/// 读的）：Claude 4.5 起的每一个（Haiku 4.5、Sonnet 4.5 / 4.6 / 5 / 5.5、Opus 4.5 ~ 4.8 / 5 /
+/// 5.5、Fable、Mythos），加上更早的 Claude 3.7 Sonnet 和 Claude 3.5 Sonnet v2（`20241022`）。
+/// 表里没有的 —— Claude 3 Haiku / Sonnet / Opus、3.5 Sonnet v1、3.5 Haiku、Sonnet 4、
+/// Opus 4 / 4.1 —— 不自动标：不认的模型收到 `cachePoint` 会拒掉整个请求。
+///
+/// **按 id 里的家族和版本认**，不按完整的 id：跨区域推理配置的前缀（`us.`、`eu.`、
+/// `apac.`、`global.`……）、日期和 `-v1:0` 这些尾巴都不影响。表里还没有的新 id 按版本
+/// 判：4.5 起的家族都支持，以后的也算。看不出背后是谁的应用推理配置 ARN 不标。
+///
+/// 客户端自己标的断点不受这条管（见 [`caches`]）：那是客户端的决定
+fn caches_automatically(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // ARN 的最后一段才是模型（推理配置 ARN 里写着 `us.anthropic.claude-…`）
+    let tail = m.rsplit('/').next().unwrap_or(&m);
+    let Some(at) = tail.find("anthropic.claude-") else {
+        return false;
+    };
+    let parts: Vec<&str> = tail[at + "anthropic.claude-".len()..]
+        .split(['-', ':'])
+        .collect();
+    // 版本号是一两位的数；八位的是日期
+    let num = |s: Option<&&str>| {
+        s.filter(|s| (1..=2).contains(&s.len()))
+            .and_then(|s| s.parse::<u32>().ok())
+    };
+    let (family, major, minor, rest) = match parts.first() {
+        // 新的写法：`claude-sonnet-4-5-20250929-v1:0`、`claude-opus-5`
+        Some(f) if f.chars().all(|c| c.is_ascii_alphabetic()) => {
+            let Some(major) = num(parts.get(1)) else {
+                return false;
+            };
+            match num(parts.get(2)) {
+                Some(minor) => (*f, major, minor, &parts[3..]),
+                None => (*f, major, 0, &parts[2..]),
+            }
+        }
+        // 老的写法：`claude-3-7-sonnet-20250219-v1:0`、`claude-3-haiku-20240307-v1:0`
+        Some(_) => {
+            let Some(major) = num(parts.first()) else {
+                return false;
+            };
+            let (minor, at) = match num(parts.get(1)) {
+                Some(minor) => (minor, 2),
+                None => (0, 1),
+            };
+            let Some(family) = parts.get(at) else {
+                return false;
+            };
+            (*family, major, minor, &parts[at + 1..])
+        }
+        None => return false,
+    };
+    (major, minor) >= (4, 5)
+        || (family == "sonnet" && (major, minor) == (3, 7))
+        || (family == "sonnet" && (major, minor) == (3, 5) && rest.contains(&"20241022"))
+}
+
 /// 客户端没标断点时自动标的，和转给 Anthropic 时同样的四处：工具的末尾、系统提示的末尾、
 /// 最后两条用户消息的末尾，各跟一个 5 分钟的 `cachePoint`（Converse 也最多四个）
 fn auto_cache(out: &mut Map<String, Value>) {
@@ -231,10 +292,10 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
     } else if r.tool_choice.is_some() {
         dropped.path("tool_choice");
     }
-    // 客户端自己一个断点都没标，模型又是 Claude：替它标（见 `anthropic::request` 的
-    // `auto_cache`）。Nova 和看不出是谁的推理配置 ARN 不自动标：不认的模型收到
-    // `cachePoint` 会拒掉整个请求
-    if r.cache.is_empty() && is_claude(&r.model) {
+    // 客户端自己一个断点都没标，模型又是 AWS 列出支持缓存的 Claude：替它标（见
+    // `anthropic::request` 的 `auto_cache`、[`caches_automatically`]）。Nova 和看不出是谁的
+    // 推理配置 ARN 不自动标：不认的模型收到 `cachePoint` 会拒掉整个请求
+    if r.cache.is_empty() && caches_automatically(&r.model) {
         auto_cache(&mut out);
     }
 
@@ -1022,6 +1083,59 @@ mod tests {
         let mut d = Dropped::new(Dialect::Anthropic);
         let v = encode_request(r, &target(), &mut d);
         (v, d.into_vec())
+    }
+
+    #[test]
+    fn only_the_claude_models_aws_lists_get_automatic_cache_points() {
+        for (model, yes) in [
+            // AWS 的表里有的
+            ("anthropic.claude-haiku-5-5", true),
+            ("anthropic.claude-sonnet-5-5", true),
+            ("anthropic.claude-opus-5-5", true),
+            ("anthropic.claude-fable-5-1", true),
+            ("anthropic.claude-mythos-5", true),
+            ("anthropic.claude-opus-5", true),
+            ("anthropic.claude-opus-4-8", true),
+            ("anthropic.claude-opus-4-7", true),
+            ("anthropic.claude-opus-4-6-v1", true),
+            ("anthropic.claude-opus-4-5-20251101-v1:0", true),
+            ("anthropic.claude-sonnet-5", true),
+            ("anthropic.claude-sonnet-4-6", true),
+            ("anthropic.claude-sonnet-4-5-20250929-v1:0", true),
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", true),
+            ("anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+            ("anthropic.claude-3-5-sonnet-20241022-v2:0", true),
+            // 跨区域推理配置，和指着它的 ARN
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", true),
+            ("global.anthropic.claude-opus-4-7", true),
+            ("apac.anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+            (
+                "arn:aws:bedrock:us-east-1:123456789012:inference-profile/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+                true,
+            ),
+            // 表里还没有的新 id：按版本
+            ("anthropic.claude-opus-6", true),
+            ("us.anthropic.claude-sonnet-5-7-20270101-v1:0", true),
+            // 表里没有的
+            ("anthropic.claude-sonnet-4-20250514-v1:0", false),
+            ("us.anthropic.claude-opus-4-1-20250805-v1:0", false),
+            ("anthropic.claude-opus-4-20250514-v1:0", false),
+            ("anthropic.claude-3-5-sonnet-20240620-v1:0", false),
+            ("anthropic.claude-3-5-haiku-20241022-v1:0", false),
+            ("anthropic.claude-3-haiku-20240307-v1:0", false),
+            ("anthropic.claude-3-opus-20240229-v1:0", false),
+            ("anthropic.claude-v2:1", false),
+            ("anthropic.claude-instant-v1", false),
+            // 别家的模型、看不出是谁的 ARN
+            ("amazon.nova-pro-v1:0", false),
+            ("meta.llama3-70b-instruct-v1:0", false),
+            (
+                "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3",
+                false,
+            ),
+        ] {
+            assert_eq!(caches_automatically(model), yes, "{model}");
+        }
     }
 
     #[test]

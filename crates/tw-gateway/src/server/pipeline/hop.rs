@@ -110,6 +110,9 @@ struct Outbound {
     /// 回程要用的转换会话：转换过的，或者直通到 Codex 后端、客户端却要整包时
     /// 收齐流要用的
     session: Option<tw_dialect::convert::Session>,
+    /// 请求体里的提示缓存断点是转换时自动标的（客户端一个都没标）：发给的是这个模型。
+    /// 上游拒了这些断点就去掉再发一次（见 [`crate::cache_marks`]）
+    auto_cache: Option<String>,
 }
 
 /// 这一跳没发出去的原因。尝试链里记的和报给客户端的是同一句。
@@ -556,12 +559,21 @@ pub(super) async fn try_upstreams<'a>(
                     aws.as_ref(),
                 )
                 .await;
-                // 上游拒绝了别家封存的推理：去掉它们，同一家再发一次
+                // 上游拒绝了自动标的缓存断点、别家封存的推理：去掉它们，同一家再发一次
                 match sent {
                     Ok(r) => {
                         let resend = Resend {
                             out: &out,
                             body: &body,
+                            headers: &upstream_headers,
+                            aws: aws.as_ref(),
+                            conversation: started.conversation.as_deref(),
+                        };
+                        let (r, uncached) =
+                            resend_uncached(state, req, provider, http, resend, r).await?;
+                        let resend = Resend {
+                            out: &out,
+                            body: uncached.as_ref().unwrap_or(&body),
                             headers: &upstream_headers,
                             aws: aws.as_ref(),
                             conversation: started.conversation.as_deref(),
@@ -1168,6 +1180,7 @@ fn prepare(
     let mut path = asked.path.to_string();
     let mut query = req.query.clone();
     let mut session: Option<tw_dialect::convert::Session> = None;
+    let mut auto_cache: Option<String> = None;
     let body = match target {
         None => {
             // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
@@ -1301,6 +1314,22 @@ fn prepare(
             });
             path = p.path.clone();
             query = p.query.clone();
+            // 客户端一个断点都没标：请求体里的断点是编码器自动标的。这一家的这个模型拒过的话
+            // 先去掉，不用再被拒一次（见 `crate::cache_marks`）
+            let mut encoded = p.body.clone();
+            if d.request.cache.is_empty() && tw_dialect::cache::may_have_marks(dialect, &encoded) {
+                let model = &d.request.model;
+                if !state.cache_marks.refused(&provider.name, model) {
+                    auto_cache = Some(model.clone());
+                } else if let Some(stripped) = tw_dialect::cache::strip_marks(dialect, &encoded) {
+                    tracing::debug!(
+                        provider = %provider.name,
+                        model = %model,
+                        "left out the cache breakpoints this upstream refused before"
+                    );
+                    encoded = stripped;
+                }
+            }
             // Bedrock 上的 Claude：客户端 `anthropic-beta` 里 Bedrock 认的那几个放进请求体
             let claude_on_bedrock = dialect == tw_dialect::ir::Dialect::Bedrock
                 && d.client == tw_dialect::ir::Dialect::Anthropic
@@ -1320,16 +1349,14 @@ fn prepare(
             };
             // **客户端要不要流由会话记着**，发给 Codex 后端的这一份一律是流式
             let body = if chatgpt {
-                Bytes::from(crate::chatgpt::force_stream(p.body.clone()))
-            } else if let Some(b) = tw_bedrock::beta::with_betas(&p.body, &betas) {
+                Bytes::from(crate::chatgpt::force_stream(encoded))
+            } else if let Some(b) = tw_bedrock::beta::with_betas(&encoded, &betas) {
                 Bytes::from(b)
             } else if harness && to_deepseek {
                 // 转换成另一种格式发给 DeepSeek 官方：直连时它收得到的扩展照样带上
-                Bytes::from(
-                    tw_dialect::harness::carry(asked.body, &p.body).unwrap_or(p.body.clone()),
-                )
+                Bytes::from(tw_dialect::harness::carry(asked.body, &encoded).unwrap_or(encoded))
             } else {
-                Bytes::from(p.body.clone())
+                Bytes::from(encoded)
             };
             session = Some(p.session);
             body
@@ -1356,6 +1383,7 @@ fn prepare(
         chatgpt,
         hop,
         session,
+        auto_cache,
     })
 }
 
@@ -1399,6 +1427,61 @@ struct Resend<'a> {
     headers: &'a [(String, String)],
     aws: Option<&'a tw_bedrock::Credentials>,
     conversation: Option<&'a str>,
+}
+
+/// 上游回 400、拒绝了转换时自动标的提示缓存断点（见 [`crate::cache_marks`]）：去掉，同一家
+/// 再发一次，只一次。记下这一家的这个模型不认，往后发给它之前先去掉。
+///
+/// 客户端自己标了断点的不管（[`Outbound::auto_cache`] 是 None）：那是它的决定，被拒了原样
+/// 交回去。不是这种 400 的也原样交回去。返回再发时用的请求体，没再发是 None
+async fn resend_uncached(
+    state: &AppState,
+    req: &Inbound,
+    provider: &tw_config::Provider,
+    http: &reqwest::Client,
+    resend: Resend<'_>,
+    r: reqwest::Response,
+) -> Result<(reqwest::Response, Option<Bytes>), SendError> {
+    let (Some(model), Some(wire)) = (resend.out.auto_cache.as_deref(), wire(req, resend.out))
+    else {
+        return Ok((r, None));
+    };
+    if r.status() != 400 {
+        return Ok((r, None));
+    }
+    let Some(stripped) = tw_dialect::cache::strip_marks(wire, resend.body) else {
+        return Ok((r, None));
+    };
+    let status = r.status();
+    let headers = r.headers().clone();
+    let said = r.bytes().await.map_err(SendError::Http)?;
+    if !crate::cache_marks::refusal(&said) {
+        let mut back = http::Response::new(said);
+        *back.status_mut() = status;
+        *back.headers_mut() = headers;
+        return Ok((reqwest::Response::from(back), None));
+    }
+    state
+        .cache_marks
+        .note(&provider.name, model, crate::server::now_ms());
+    tracing::info!(
+        provider = %provider.name,
+        model = %model,
+        "the upstream refused the cache breakpoints added on conversion; sending again without them"
+    );
+    let stripped = Bytes::from(stripped);
+    let r = send(
+        state,
+        req,
+        provider,
+        http,
+        resend.out,
+        stripped.clone(),
+        resend.headers.to_vec(),
+        resend.aws,
+    )
+    .await?;
+    Ok((r, Some(stripped)))
 }
 
 /// 上游回 400、拒绝了请求里别家封存的推理（见 [`crate::seal`]）：去掉**全部**封存的
