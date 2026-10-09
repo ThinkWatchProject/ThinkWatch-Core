@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use super::response::{
-    envelope, incomplete, item, item_id, reasoning_signature, reasoning_text, response_id, status,
-    usage, usage_json,
+    NO_SUMMARY, compaction_item, envelope, incomplete, item, item_id, reasoning_signature,
+    reasoning_text, response_id, status, usage, usage_json,
 };
 use crate::convert::Session;
 use crate::frame::{self, Frame};
@@ -342,7 +342,16 @@ pub struct Writer {
     order: Vec<usize>,
     usage: Option<Usage>,
     stop: Option<StopReason>,
+    /// 压缩请求（见 [`crate::compaction`]）：上游写的文字收在这里，结束时作为一个
+    /// `compaction` 项交回。Codex 只认那一个项，中间的文字不往外写
+    summary: Option<String>,
+    /// 压缩请求：上一次报「还在写」之后又收到了几个增量
+    quiet: u32,
 }
+
+/// 压缩请求收着摘要不往外写，每收到这么多个增量报一次 `response.in_progress`：Codex 的流
+/// 五分钟没有事件就当断了，而一份长摘要加上前面的思考写得比这久
+const KEEPALIVE_DELTAS: u32 = 32;
 
 impl Writer {
     pub fn new(s: &Session) -> Writer {
@@ -358,7 +367,41 @@ impl Writer {
             order: Vec::new(),
             usage: None,
             stop: None,
+            summary: s.is_compaction().then(String::new),
+            quiet: 0,
         }
+    }
+
+    /// 压缩请求里的块和增量：文字收进摘要，别的只当作「还在写」。不是压缩请求、或者不是
+    /// 块和增量的返回 false，照常写
+    fn collect_summary(&mut self, e: &Event, out: &mut String) -> bool {
+        let Some(summary) = self.summary.as_mut() else {
+            return false;
+        };
+        match e {
+            // 几段文字之间空一行
+            Event::BlockStart {
+                kind: BlockKind::Text,
+                ..
+            } if !summary.trim_end().is_empty() => summary.push_str("\n\n"),
+            Event::BlockStart { .. } | Event::BlockStop { .. } => {}
+            Event::Delta { delta, .. } => {
+                if let Delta::Text(t) = delta {
+                    summary.push_str(t);
+                }
+                self.quiet += 1;
+                if self.quiet >= KEEPALIVE_DELTAS {
+                    self.quiet = 0;
+                    self.start(out);
+                    let r = envelope(&self.id, self.created, &self.model, "in_progress");
+                    self.emit("response.in_progress", json!({ "response": r }), out);
+                }
+                return true;
+            }
+            _ => return false,
+        }
+        self.start(out);
+        true
     }
 
     fn emit(&mut self, kind: &str, mut body: Value, out: &mut String) {
@@ -381,7 +424,7 @@ impl Writer {
 
     pub fn event(&mut self, e: &Event) -> String {
         let mut out = String::new();
-        if self.finished {
+        if self.finished || self.collect_summary(e, &mut out) {
             return out;
         }
         match e {
@@ -597,6 +640,10 @@ impl Writer {
         }
         self.start(&mut out);
         self.finished = true;
+        if let Some(summary) = self.summary.take() {
+            self.finish_compaction(summary.trim(), &mut out);
+            return out;
+        }
         for index in self.order.clone() {
             self.stop_item(index, &mut out);
         }
@@ -620,6 +667,44 @@ impl Writer {
         };
         self.emit(kind, json!({ "response": r }), &mut out);
         out
+    }
+}
+
+impl Writer {
+    /// 压缩请求的结尾：恰好一个 `compaction` 项，然后 `response.completed`。没写出摘要就是
+    /// `response.failed` —— 交回一个空摘要，Codex 会当它压缩成功、把前文全扔掉
+    fn finish_compaction(&mut self, summary: &str, out: &mut String) {
+        if summary.is_empty() {
+            let mut r = envelope(&self.id, self.created, &self.model, "failed");
+            r["error"] = failure(500, NO_SUMMARY);
+            self.emit("response.failed", json!({ "response": r }), out);
+            return;
+        }
+        let id = new_id("cmp_");
+        self.emit(
+            "response.output_item.added",
+            json!({ "output_index": 0, "item": compaction_item(&id, None) }),
+            out,
+        );
+        let done = compaction_item(&id, Some(summary));
+        self.emit(
+            "response.output_item.done",
+            json!({ "output_index": 0, "item": done }),
+            out,
+        );
+        let (state, details) = status(self.stop.as_ref());
+        let mut r = envelope(&self.id, self.created, &self.model, state);
+        r["incomplete_details"] = details;
+        r["output"] = json!([done]);
+        if let Some(u) = &self.usage {
+            r["usage"] = usage_json(u);
+        }
+        let kind = if state == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        self.emit(kind, json!({ "response": r }), out);
     }
 }
 

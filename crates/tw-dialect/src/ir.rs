@@ -14,6 +14,7 @@
 //! `stop`），编码时记。两处记的都是**客户端请求里的字段路径**：用户对照的是自己
 //! 发出去的请求，不是我们转成的那一份。
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
@@ -152,12 +153,21 @@ pub struct ClientShape {
     /// Responses 客户端自己执行的工具搜索（Codex 的 `tool_search`，`execution: client`）
     /// 转成的函数工具叫什么。上游调用它时，写回去的是 `tool_search_call`，不是函数调用
     pub tool_search: Option<String>,
+    /// Responses 客户端要的是一次压缩（Codex 的 `compaction_trigger`）：上游写的摘要要作为
+    /// 一个 `compaction` 项交回去（见 [`crate::compaction`]）
+    pub compaction: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
+    /// 对话中途的系统消息：Responses 的 `developer`、Chat 和 Anthropic 消息里的 `system`。
+    ///
+    /// **开头连着的那几条进 [`Request::system`]，之后的留在原位。**都并进系统提示的话，
+    /// 对话里每多一条这样的消息，系统提示就变一次 —— 从系统提示算起的提示缓存跟着全部
+    /// 作废。没有这种写法的格式写成一条带标记的用户消息（[`fold_system_turns`]）
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -811,6 +821,75 @@ pub(crate) fn text_of(v: &Value) -> String {
     }
 }
 
+/// 解码时读到一条系统消息：对话还没开始就是系统提示的一段，开始了就是对话里的一条
+/// （[`Role::System`]）
+pub fn system_turn(r: &mut Request, text: String) {
+    if r.messages.is_empty() {
+        r.system.push(text);
+    } else {
+        r.messages.push(Message {
+            role: Role::System,
+            parts: vec![Part::Text(text)],
+        });
+    }
+}
+
+/// 对话中途的系统消息在没有这种写法的格式里怎么写：包在 `<system-reminder>` 里的一段
+/// 用户的话。
+///
+/// Claude Code 就是这么在对话里插系统消息的，Claude 认得这是系统说的、不是用户说的；
+/// 别家的模型看到成对的标签也分得清
+pub fn system_reminder(text: &str) -> String {
+    format!("<system-reminder>\n{text}\n</system-reminder>")
+}
+
+/// 对话中途的系统消息换成用户消息（正文见 [`system_reminder`]）。**消息的条数和位置不变**，
+/// 缓存断点按位置记的，照样对得上。
+///
+/// Anthropic、Gemini、Bedrock 的消息里没有系统角色；Chat 有，可很多别家模型的对话模板只
+/// 认开头那一条系统消息，后面的直接报错，所以 Chat 也这么写。没有这种消息的请求原样借出去。
+///
+/// **夹在工具调用和它的结果中间的，挪到结果后面**（并进带着结果的那条用户消息的末尾，原位
+/// 留一条空消息）：Chat 要求调用之后紧跟着结果，Anthropic 和 Bedrock 要求结果排在用户消息
+/// 最前面 —— 留在原位就是一个 400
+pub fn fold_system_turns(r: &Request) -> Cow<'_, Request> {
+    if !r.messages.iter().any(|m| m.role == Role::System) {
+        return Cow::Borrowed(r);
+    }
+    let has = |m: &Message, f: fn(&Part) -> bool| m.parts.iter().any(f);
+    let mut out = r.clone();
+    for i in 0..r.messages.len() {
+        if r.messages[i].role != Role::System {
+            continue;
+        }
+        let parts: Vec<Part> = std::mem::take(&mut out.messages[i].parts)
+            .into_iter()
+            .map(|p| match p {
+                Part::Text(t) => Part::Text(system_reminder(&t)),
+                other => other,
+            })
+            .collect();
+        out.messages[i].role = Role::User;
+        let prev = r.messages[..i]
+            .iter()
+            .rev()
+            .find(|m| m.role != Role::System);
+        let next = (i + 1..r.messages.len()).find(|&j| r.messages[j].role != Role::System);
+        match next {
+            Some(j)
+                if prev.is_some_and(|p| {
+                    p.role == Role::Assistant && has(p, |x| matches!(x, Part::ToolCall(_)))
+                }) && r.messages[j].role == Role::User
+                    && has(&r.messages[j], |x| matches!(x, Part::ToolResult(_))) =>
+            {
+                out.messages[j].parts.extend(parts);
+            }
+            _ => out.messages[i].parts = parts,
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// 同一角色的相邻消息并成一条：Anthropic 和 Gemini 都要求角色交替。
 pub fn merge_roles(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
@@ -932,6 +1011,80 @@ mod tests {
         ]);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn a_system_turn_becomes_a_marked_user_turn_in_its_place() {
+        let text = |role, t: &str| Message {
+            role,
+            parts: vec![Part::Text(t.into())],
+        };
+        let r = Request {
+            messages: vec![
+                text(Role::User, "hi"),
+                text(Role::Assistant, "hello"),
+                text(Role::System, "be brief"),
+                text(Role::User, "and?"),
+            ],
+            ..Default::default()
+        };
+        let f = fold_system_turns(&r);
+        assert_eq!(f.messages.len(), 4);
+        assert_eq!(
+            f.messages[2],
+            text(
+                Role::User,
+                "<system-reminder>\nbe brief\n</system-reminder>"
+            )
+        );
+        // 没有系统消息的不复制
+        let plain = Request {
+            messages: vec![text(Role::User, "hi")],
+            ..Default::default()
+        };
+        assert!(matches!(fold_system_turns(&plain), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_system_turn_between_a_call_and_its_result_moves_after_the_result() {
+        let call = Message {
+            role: Role::Assistant,
+            parts: vec![Part::ToolCall(ToolCall {
+                id: "c".into(),
+                name: "f".into(),
+                input: ToolInput::Json(serde_json::json!({})),
+            })],
+        };
+        let result = Part::ToolResult(ToolResult {
+            id: "c".into(),
+            content: vec![Part::Text("ok".into())],
+            is_error: false,
+        });
+        let r = Request {
+            messages: vec![
+                call,
+                Message {
+                    role: Role::System,
+                    parts: vec![Part::Text("note".into())],
+                },
+                Message {
+                    role: Role::User,
+                    parts: vec![result.clone()],
+                },
+            ],
+            ..Default::default()
+        };
+        let f = fold_system_turns(&r);
+        // 位置还在，空了；提示跟在结果后面
+        assert_eq!(f.messages.len(), 3);
+        assert!(f.messages[1].parts.is_empty());
+        assert_eq!(
+            f.messages[2].parts,
+            [
+                result,
+                Part::Text("<system-reminder>\nnote\n</system-reminder>".into())
+            ]
+        );
     }
 
     #[test]

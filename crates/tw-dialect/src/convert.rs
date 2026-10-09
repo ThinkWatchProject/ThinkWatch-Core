@@ -251,6 +251,11 @@ impl Session {
         self.shape.tool_search.as_deref() == Some(name)
     }
 
+    /// 这是一次压缩：上游写的文字作为一个 `compaction` 项交回（见 [`crate::compaction`]）
+    pub fn is_compaction(&self) -> bool {
+        self.shape.compaction
+    }
+
     /// 上游的整包响应 → 客户端的整包响应。上游返回的不是 JSON 时是 `None`
     pub fn response(&self, body: &[u8]) -> Option<Vec<u8>> {
         let v: Value = serde_json::from_slice(body).ok()?;
@@ -373,6 +378,7 @@ impl Session {
                 include_usage: false,
                 gemini_sse: true,
                 tool_search: None,
+                compaction: false,
             },
         }
     }
@@ -851,7 +857,8 @@ impl Collector {
 
 // ───────────────────────────────────────────────────────── 直通时的清理
 
-/// 直通请求里去掉转换写出去的推理签名。**没有需要去掉的就返回 `None`，请求一个字节都不改。**
+/// 直通请求里去掉转换写出去的推理签名，转换写出去的压缩项换回摘要。**没有需要改的就返回
+/// `None`，请求一个字节都不改。**
 ///
 /// 客户端把转换写出去的推理内容原样带回来（这正是签名存在的意义）。之后如果这段对话
 /// 换到了和客户端同格式的上游（故障转移、改了路由），请求会直通过去，而那些带
@@ -908,6 +915,28 @@ pub fn strip_carried(client: Dialect, body: &[u8]) -> Option<Vec<u8>> {
                     && carried(i.get("encrypted_content")))
             });
             changed = input.len() != before;
+            // 转换写出去的压缩项：OpenAI 读不了我们写的「密文」，可那是前文仅剩的东西，
+            // 不能扔 —— 原位换成一条写着摘要的 developer 消息，和转给别家时一样
+            for i in input.iter_mut() {
+                let summary = matches!(
+                    i.get("type").and_then(Value::as_str),
+                    Some("compaction" | "context_compaction")
+                )
+                .then(|| i.get("encrypted_content").and_then(Value::as_str))
+                .flatten()
+                .and_then(crate::compaction::read);
+                if let Some(summary) = summary {
+                    *i = serde_json::json!({
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": crate::compaction::restored(&summary),
+                        }],
+                    });
+                    changed = true;
+                }
+            }
         }
         Dialect::Gemini => {
             let contents = v.get_mut("contents")?.as_array_mut()?;

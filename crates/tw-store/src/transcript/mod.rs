@@ -2063,6 +2063,24 @@ mod tests {
             ]
         );
         assert!(t.turns[0].output.is_empty() && t.turns[0].gaps.is_empty());
+
+        // 转换时压缩出的前文：摘要是上游写的，读得出来
+        let mut d = Disk::new();
+        d.turn(
+            "/v1/responses",
+            &json!({"model": "m", "input": [
+                {"type": "compaction", "encrypted_content": tw_dialect::compaction::carry("改过 src/a.rs")},
+                {"role": "user", "content": "接着来"}
+            ]}),
+            br#"{"output":[]}"#,
+        );
+        assert_eq!(
+            d.transcript().turns[0].input[0],
+            msg(
+                R::System,
+                vec![text(&tw_dialect::compaction::restored("改过 src/a.rs"))]
+            )
+        );
     }
 
     // ───────────────────────────────────────────────── 读过的不再读

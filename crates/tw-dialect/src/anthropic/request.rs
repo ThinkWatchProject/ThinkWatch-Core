@@ -48,14 +48,14 @@ pub fn decode_request(v: &Value, dropped: &mut Dropped) -> Result<Request, Rejec
     for m in arr_of(v, "messages") {
         let role = match str_of(m, "role") {
             Some("assistant") => Role::Assistant,
-            // 消息里的 system 角色：并进系统提示，位置信息丢失但内容保留。DeepSeek
+            // 消息里的 system 角色：开头的并进系统提示，对话中途的留在原位。DeepSeek
             // Harness 在这里放改过的系统提示，还有对话中途增删工具的 `tool_addition` /
             // `tool_removal`：别家没有这种写法
             Some("system") => {
                 let content = m.get("content").unwrap_or(&Value::Null);
                 let t = text_of(content);
                 if !t.is_empty() {
-                    r.system.push(t);
+                    system_turn(&mut r, t);
                 }
                 for b in content.as_array().into_iter().flatten() {
                     match str_of(b, "type") {
@@ -336,6 +336,9 @@ fn result_content(c: Option<&Value>, dropped: &mut Dropped) -> Vec<Part> {
 
 /// 中间表示 → 发给 Anthropic 上游的请求。
 pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
+    // 对话中途的系统消息写成带标记的用户消息（见 `fold_system_turns`）
+    let folded = fold_system_turns(r);
+    let r = folded.as_ref();
     let mut out = Map::new();
     out.insert("model".into(), json!(r.model));
     let max_tokens = r.max_tokens.unwrap_or(t.default_max_tokens);

@@ -124,7 +124,8 @@ fn trim_for_reading(v: &mut Value, dialect: Dialect) {
         items.retain(|it| {
             !matches!(
                 it.get("type").and_then(Value::as_str),
-                Some("item_reference" | "compaction")
+                // `compaction_trigger`：解码会在末尾加一条请上游写摘要的话，那不是用户说的
+                Some("item_reference" | "compaction" | "compaction_trigger")
             )
         });
     }
@@ -426,6 +427,17 @@ mod tests {
             turn(gemini, "/v1beta/models/gemini-2.5-pro:generateContent").unwrap(),
             "缓存之后"
         );
+    }
+
+    /// Codex 要压缩前文的请求：末尾的 `compaction_trigger` 在转换时变成一句请上游写摘要的话，
+    /// 那不是用户说的。这一轮读到的是用户最后说的那句
+    #[test]
+    fn a_compaction_request_reads_the_users_last_words_not_the_gateways() {
+        let body = json!({"input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "改完了吗"}]},
+            {"type": "compaction_trigger"}
+        ]});
+        assert_eq!(turn(body, "/v1/responses").unwrap(), "改完了吗");
     }
 
     /// Python 客户端把 ASCII 以外的字全写成 `\uXXXX`：按 JSON 解开之后就是原字

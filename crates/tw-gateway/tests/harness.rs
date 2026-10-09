@@ -425,22 +425,19 @@ async fn messages_to_an_openai_upstream_are_cleaned_by_the_conversion() {
     assert_clean(&s);
     assert!(s.headers.get("anthropic-beta").is_none());
     let v: Value = serde_json::from_slice(&s.body).unwrap();
-    // 中途的系统提示并进了开头的那一条
-    let system: Vec<&str> = v["messages"]
-        .as_array()
-        .unwrap()
+    // 开头的系统提示一条；中途的留在原位，写成标明是系统说的一段（系统提示不跟着变，
+    // 提示缓存接得上）
+    let messages = v["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
         .iter()
-        .filter(|m| m["role"] == "system")
-        .map(|m| m["content"].as_str().unwrap())
+        .map(|m| m["role"].as_str().unwrap())
         .collect();
+    assert_eq!(roles, ["system", "user", "user", "assistant", "user"]);
+    assert_eq!(messages[0]["content"], "You are DeepSeek Harness.");
     assert_eq!(
-        system
-            .concat()
-            .matches("The project root is /work.")
-            .count(),
-        1
+        messages[2]["content"],
+        "<system-reminder>\nThe project root is /work.\n</system-reminder>"
     );
-    assert!(system.concat().starts_with("You are DeepSeek Harness."));
     assert_eq!(v["tools"].as_array().unwrap().len(), 2);
 
     let (bytes, translated) = events(&mut rx).await;
@@ -530,16 +527,17 @@ async fn chat_to_an_anthropic_upstream_is_cleaned_by_the_conversion() {
         .iter()
         .map(|b| b["text"].as_str().unwrap())
         .collect();
+    // 开头的进系统提示；中途的留在原位，写成标明是系统说的一段（Anthropic 的消息里没有
+    // 系统角色）
+    assert_eq!(system, ["You are DeepSeek Harness."]);
+    let messages = v["messages"].as_array().unwrap();
+    assert!(messages.iter().all(|m| m["role"] != "system"));
     assert_eq!(
-        system,
-        ["You are DeepSeek Harness.", "The project root is /work."]
-    );
-    assert!(
-        v["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|m| m["role"] != "system")
+        messages[2]["content"],
+        json!([
+            {"type": "text", "text": "<system-reminder>\nThe project root is /work.\n</system-reminder>"},
+            {"type": "text", "text": "search it"}
+        ])
     );
     assert_eq!(v["thinking"]["type"], "enabled");
 
