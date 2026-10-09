@@ -30,6 +30,7 @@ pub mod key_limits;
 pub mod l1;
 pub mod l3;
 pub mod latency;
+pub mod lenient;
 pub mod limits;
 pub mod listen;
 pub mod live;

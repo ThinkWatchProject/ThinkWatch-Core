@@ -421,7 +421,7 @@ pub async fn exchange_code(
         id_token: field("id_token").ok_or_else(|| missing("id_token"))?,
         access: field("access_token").ok_or_else(|| missing("access_token"))?,
         refresh: field("refresh_token").ok_or_else(|| missing("refresh_token"))?,
-        expires_in: v.get("expires_in").and_then(|x| x.as_u64()),
+        expires_in: v.get("expires_in").and_then(crate::lenient::seconds),
     })
 }
 

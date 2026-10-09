@@ -397,8 +397,9 @@ struct DeviceCode {
     device_auth_id: String,
     /// 给用户看、让他输进去的码
     user_code: String,
-    /// 服务端让我们隔多少秒问一次
-    #[serde(default)]
+    /// 服务端让我们隔多少秒问一次。**数字和数字字符串都认**：2026-10 起它答的是 `"5"`；
+    /// 认不出来是 0，轮询时按下限来
+    #[serde(default, deserialize_with = "tw_gateway::lenient::seconds_or_zero")]
     interval: u64,
 }
 
@@ -1109,6 +1110,25 @@ async fn use_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10 起设备码接口把 `interval` 答成字符串（`"interval": "5"`），按数字读的话
+    /// 整个登录停在「无法识别设备码请求的响应」
+    #[test]
+    fn the_device_code_interval_is_read_as_a_number_or_a_numeric_string() {
+        let read = |interval: &str| {
+            let text = format!(
+                r#"{{"device_auth_id": "deviceauth_1", "user_code": "ABCD-1234"{interval}}}"#
+            );
+            serde_json::from_str::<DeviceCode>(&text)
+                .expect("the device code is readable")
+                .interval
+        };
+        assert_eq!(read(r#", "interval": "5""#), 5);
+        assert_eq!(read(r#", "interval": 5"#), 5);
+        // 没给、写成别的样子：0，轮询按下限来
+        assert_eq!(read(""), 0);
+        assert_eq!(read(r#", "interval": "soon""#), 0);
+    }
 
     #[test]
     fn only_app_links_are_accepted_as_the_return_address() {
