@@ -209,6 +209,47 @@ fn cache_ttl(b: &Value) -> Option<CacheTtl> {
     })
 }
 
+/// 客户端没标断点时自动标的：**工具的末尾、系统提示的末尾、最后两条用户消息的末尾**，
+/// 最多四个（Anthropic 的上限），5 分钟的默认 TTL。
+///
+/// 别的格式的客户端（Codex、Chat、Gemini 的客户端）没有这个写法：OpenAI 和 Gemini 自己
+/// 缓存开头相同的部分，转给 Anthropic 时不标就一点都不缓存，每一轮整段对话全价重算。
+///
+/// - 工具和系统提示：一段对话里几乎不变，各标一个，系统提示变了工具那段照样命中
+/// - 最后一条用户消息：这一轮写进缓存
+/// - 倒数第二条用户消息：**正是上一轮请求的最后一个断点**，这一轮从它读回上一轮写的缓存。
+///   Anthropic 只往回找约 20 块，一轮里工具调用多的时候光靠最后一个断点找不回去
+///
+/// 断点不算内容：上一轮标在更早位置的那个这一轮挪走了，缓存照样命中（Anthropic 文档里多轮
+/// 对话就是这么标的）。太短（不到模型的最小缓存长度）的断点上游直接忽略，不报错，所以不估
+/// 长度。思考块不能标，标在它前面的那块上
+fn auto_cache(out: &mut Map<String, Value>) {
+    fn mark(blocks: Option<&mut Value>) {
+        let Some(Value::Array(blocks)) = blocks else {
+            return;
+        };
+        if let Some(b) = blocks
+            .iter_mut()
+            .rev()
+            .find(|b| !matches!(str_of(b, "type"), Some("thinking" | "redacted_thinking")))
+        {
+            b["cache_control"] = cache_control(CacheTtl::Short);
+        }
+    }
+    mark(out.get_mut("tools"));
+    mark(out.get_mut("system"));
+    if let Some(Value::Array(messages)) = out.get_mut("messages") {
+        for m in messages
+            .iter_mut()
+            .rev()
+            .filter(|m| str_of(m, "role") == Some("user"))
+            .take(2)
+        {
+            mark(m.get_mut("content"));
+        }
+    }
+}
+
 /// 中间表示的断点 → `cache_control`
 fn cache_control(ttl: CacheTtl) -> Value {
     match ttl {
@@ -395,6 +436,10 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
             })
             .collect();
         out.insert("tools".into(), Value::Array(tools));
+    }
+    // 客户端自己一个断点都没标：替它标（Claude Code 这类标了的原样不动）
+    if r.cache.is_empty() {
+        auto_cache(&mut out);
     }
 
     let serial = r.parallel_tool_calls == Some(false);

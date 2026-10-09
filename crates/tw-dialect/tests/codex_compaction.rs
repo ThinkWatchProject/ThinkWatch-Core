@@ -145,6 +145,26 @@ fn parts_of(d: Dialect, v: &Value) -> (Value, Value, Vec<Value>) {
 
 // ───────────────────────────────────────────────────────── 对话中途的 developer 消息
 
+/// 去掉缓存断点：Anthropic 的 `cache_control`、Converse 的 `cachePoint` 块
+fn unmarked(messages: &[Value]) -> Vec<Value> {
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(o) => {
+                o.remove("cache_control");
+                o.values_mut().for_each(strip);
+            }
+            Value::Array(a) => {
+                a.retain(|x| x.get("cachePoint").is_none());
+                a.iter_mut().for_each(strip);
+            }
+            _ => {}
+        }
+    }
+    let mut out = messages.to_vec();
+    out.iter_mut().for_each(strip);
+    out
+}
+
 #[test]
 fn a_developer_message_mid_conversation_leaves_the_prefix_alone() {
     // 这一轮：历史 + 新的一句
@@ -173,8 +193,13 @@ fn a_developer_message_mid_conversation_leaves_the_prefix_alone() {
         );
         assert!(!sys.contains("collaboration_mode"), "{upstream:?}: {sys}");
         assert!(!sys.contains("approval: never"), "{upstream:?}: {sys}");
-        // 前一个请求的对话是后一个的开头
-        assert_eq!(msgs_a[..], msgs_b[..msgs_a.len()], "{upstream:?}");
+        // 前一个请求的对话是后一个的开头。缓存断点不算内容：自动标的那几个每一轮往后挪
+        // （见 tests/auto_cache.rs）
+        assert_eq!(
+            unmarked(&msgs_a),
+            unmarked(&msgs_b[..msgs_a.len()]),
+            "{upstream:?}"
+        );
         // 中途的 developer 消息在它原来的位置，标明是系统说的
         let later = Value::Array(msgs_b[msgs_a.len()..].to_vec()).to_string();
         assert!(
