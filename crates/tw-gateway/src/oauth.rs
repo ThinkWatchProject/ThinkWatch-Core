@@ -602,7 +602,7 @@ async fn exchange(cfg: &OAuth, refresh: &str, http: &reqwest::Client) -> Result<
         .to_string();
     Ok(Fresh {
         access,
-        expires_in: v.get("expires_in").and_then(|x| x.as_u64()),
+        expires_in: v.get("expires_in").and_then(crate::lenient::seconds),
         refresh: v
             .get("refresh_token")
             .and_then(|x| x.as_str())

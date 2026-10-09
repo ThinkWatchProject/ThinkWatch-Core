@@ -325,14 +325,14 @@ async fn init(s: &ControlState, want: &Want, http: &reqwest::Client) -> Result<F
     }
     let every = d
         .get("poll_interval_sec")
-        .and_then(|v| v.as_u64())
+        .and_then(tw_gateway::lenient::seconds)
         .map(Duration::from_secs)
         .unwrap_or(POLL_MIN)
         .max(POLL_MIN);
     // 平台给的是绝对时刻（秒）。给得比我们的上限还长时按我们的来
     let ttl = d
         .get("expires_at")
-        .and_then(|v| v.as_u64())
+        .and_then(tw_gateway::lenient::seconds)
         .map(|at| Duration::from_secs(at.saturating_sub(now_secs())))
         .filter(|d| !d.is_zero())
         .map_or(LOGIN_TTL, |d| d.min(LOGIN_TTL));
