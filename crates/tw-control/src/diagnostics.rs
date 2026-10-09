@@ -138,12 +138,20 @@ pub async fn bundle(State(s): State<ControlState>) -> Result<String, crate::Fail
                 } else {
                     ""
                 };
+                let added = l.models.len() - l.listed.len();
                 match l.source {
+                    tw_gateway::models::Source::Discovered if added > 0 => format!(
+                        "{served} (upstream offers {}, {added} added by hand{scope})",
+                        l.listed.len()
+                    ),
                     tw_gateway::models::Source::Discovered => {
                         format!("{served} (upstream offers {}{scope})", l.models.len())
                     }
                     tw_gateway::models::Source::Manual => {
-                        format!("{served} (manual list of {}{scope})", l.models.len())
+                        format!(
+                            "{served} ({} added by hand, no list from the upstream{scope})",
+                            l.models.len()
+                        )
                     }
                     tw_gateway::models::Source::None => match &l.error {
                         Some(why) => format!("unknown: {why}"),

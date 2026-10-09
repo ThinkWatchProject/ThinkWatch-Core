@@ -12,6 +12,16 @@ use tw_config::{Client, Config, Provider};
 
 /// 一个假上游：列出 `models`，只接受这些模型的请求，其余回 404。
 async fn upstream(name: &'static str, models: &'static [&'static str]) -> SocketAddr {
+    hiding(name, models, &[]).await
+}
+
+/// 一个清单不全的假上游：列出 `models`，`hidden` 不列，却照样服务 —— ChatGPT 账号的后端
+/// 对旧版本的客户端就是这样藏起新模型的。
+async fn hiding(
+    name: &'static str,
+    models: &'static [&'static str],
+    hidden: &'static [&'static str],
+) -> SocketAddr {
     let app = Router::new()
         .route(
             "/v1/models",
@@ -26,7 +36,7 @@ async fn upstream(name: &'static str, models: &'static [&'static str]) -> Socket
             post(move |body: axum::body::Bytes| async move {
                 let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                 let model = v["model"].as_str().unwrap_or_default().to_string();
-                if models.contains(&model.as_str()) {
+                if models.contains(&model.as_str()) || hidden.contains(&model.as_str()) {
                     // 收到的模型名放在 `sent` 里：回答里的 `model` 会被网关写回客户端用的名称
                     // （见 `tw_gateway::answer_model`），看不出发出去的是哪个
                     (
@@ -288,6 +298,74 @@ async fn when_no_candidate_serves_the_model_the_error_names_each_one_and_why() {
     assert_eq!(status, 400, "{body}");
     let msg = body["error"]["message"].as_str().unwrap();
     assert!(msg.contains("No upstream serves model"), "{msg}");
+}
+
+// ─────────────────────────────────────────────────────────── 手动添加的模型
+
+/// 上游的清单里没有、手动添加了的模型：列进 `/v1/models`，按名称要、经过别名、规则指定都
+/// 送到这家（排在前面、清单里也没有它的那一家跳过）；拿掉之后回到只认清单
+#[tokio::test]
+async fn a_model_added_by_hand_is_listed_and_routed_like_a_listed_one() {
+    let relay = upstream("relay", &["gpt-5"]).await;
+    let account = hiding("account", &["gpt-5"], &["gpt-6-luna"]).await;
+    let mut cfg = grouped(
+        config(vec![provider("relay", relay), provider("account", account)]),
+        &["relay", "account"],
+    );
+    cfg.providers[1].models = vec!["gpt-6-luna".into()];
+    cfg.aliases = serde_yaml_ng::from_str("luna: gpt-6-luna\n").unwrap();
+    let state = tw_gateway::AppState::new(cfg.clone()).unwrap();
+    tw_gateway::models::refresh_all(&state).await;
+    let gw = serve(state.clone()).await;
+
+    assert_eq!(listed(gw).await, ["gpt-5", "gpt-6-luna", "luna"]);
+    let (status, body) = ask(gw, "gpt-6-luna").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["by"], "account");
+    let (status, body) = ask(gw, "luna").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (&body["by"], &body["sent"]),
+        (&"account".into(), &"gpt-6-luna".into())
+    );
+    // 列出的照旧按组里的顺序
+    let (_, body) = ask(gw, "gpt-5").await;
+    assert_eq!(body["by"], "relay");
+
+    // 规则指定这家的这个模型
+    let mut pinned = cfg.clone();
+    let rule: tw_engine::Rule =
+        serde_yaml_ng::from_str("name: 指定\nto:\n  - { provider: account, model: gpt-6-luna }\n")
+            .unwrap();
+    pinned.routes = vec![tw_engine::RouteSet::default_with(vec![rule])];
+    state.reload(pinned.clone()).unwrap();
+    let (status, body) = ask(gw, "gpt-5").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (&body["by"], &body["sent"]),
+        (&"account".into(), &"gpt-6-luna".into())
+    );
+
+    // 启用范围照样管着它
+    let mut scoped = cfg.clone();
+    scoped.providers[1].models_only = Some(vec!["gpt-5".into()]);
+    state.reload(scoped).unwrap();
+    assert_eq!(listed(gw).await, ["gpt-5"]);
+    let (status, body) = ask(gw, "gpt-6-luna").await;
+    assert_eq!(status, 400, "{body}");
+
+    // 拿掉：清单里没有，就到不了这家。不用重新向上游问
+    let mut removed = pinned;
+    removed.providers[1].models.clear();
+    state.reload(removed).unwrap();
+    assert_eq!(listed(gw).await, ["gpt-5"]);
+    let (status, body) = ask(gw, "gpt-5").await;
+    assert_eq!(status, 400, "{body}");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("do not offer") && msg.contains("account (gpt-6-luna)"),
+        "{msg}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────── 改写模型

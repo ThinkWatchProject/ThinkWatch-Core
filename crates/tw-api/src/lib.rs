@@ -156,9 +156,9 @@ slug_enum! {
 slug_enum! {
     /// 一个上游的模型清单从哪儿来。
     pub enum ModelSource {
-        /// 上游列出的
+        /// 上游列出的（手动添加的接在后面）
         Discovered = "discovered",
-        /// 配置里手写的
+        /// 上游没给出清单，只有手动添加的
         Manual = "manual",
         /// 都没有：不知道它有什么
         None = "none",
@@ -805,7 +805,16 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 不会再变，下次从这里取）；[`DryRunCandidate`] 多了 `share`（负载均衡组里这一家按
 /// 当前权重和系数分到的份额，别的组和这一轮不参与的是 None）。照 40 写的界面取对话视图
 /// 时传 `null` 会被拒。
-pub const CONTROL_API_VERSION: u32 = 41;
+///
+/// **42 起上游的模型可以手动添加**：配置里一家上游的 `models` 不再只是取不到清单时的
+/// 兜底，而是一律算这家提供、和上游列出的合在一起（上游不提供清单时就是全部），列表、
+/// 准入、别名、指定模型、密钥范围、试算都把它当作列出的模型。[`ModelRow`] 多了 `manual`
+/// （手动添加的）和 `listed`（上游自己的清单里有）；新端点 `PUT /provider-manual-models`
+/// （[`ManualModelsSave`] → [`ConfigWritten`]）交一家的整份手动清单，写法不对时是
+/// `config.manual_model_blank`、`_padded`、`_wildcard`、`_duplicate`、`_too_long`（400），
+/// 整份配置的校验也查这几条。`source` 是 `discovered` 时 `models` 里也有手动添加的那些。
+/// 照 41 写的界面分不出哪些模型是手动添加的。
+pub const CONTROL_API_VERSION: u32 = 42;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2039,13 +2048,14 @@ pub struct ProviderView {
     pub proxy: String,
     /// `fail` / `direct`
     pub on_proxy_fail: OnProxyFail,
-    /// 服务不提供模型列表时用的手动清单
+    /// 手动添加的模型，按写的顺序：和上游列出的一起算这家提供（上游不提供清单时就是
+    /// 全部）
     pub models: Vec<String>,
     /// 启用范围：只用这些模型（ID 或 glob）。空 = 它提供的全部
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_only: Option<Vec<String>>,
-    /// 模型清单从哪儿来：`discovered`（上游列出的）/ `manual`（手动清单）/
-    /// `none`（不知道它有什么）
+    /// 模型清单从哪儿来：`discovered`（上游列出的，手动添加的接在后面）/ `manual`（上游
+    /// 没给出清单，只有手动添加的）/ `none`（不知道它有什么）
     pub model_source: ModelSource,
     /// 最近一次向上游获取清单的结果
     pub model_status: ModelListStatus,
@@ -3003,7 +3013,9 @@ pub struct ProviderInput {
     /// `fail` / `direct`
     #[serde(default = "fail_closed")]
     pub on_proxy_fail: OnProxyFail,
-    /// 服务不提供模型列表时的手动清单
+    /// 手动添加的模型：和上游列出的一起算这家提供（上游不提供清单时就是全部）。
+    /// **编辑对话框保存时原样交回**，不然手动添加的模型会被清掉；单改这份清单用
+    /// `PUT /provider-manual-models`（[`ManualModelsSave`]）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
     /// 启用范围：只用这些模型（ID 或 glob）。不给就是它提供的全部
@@ -3068,7 +3080,8 @@ slug_enum! {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ProviderModelsView {
     pub provider: String,
-    /// `discovered`（上游列出的）/ `manual`（手动清单）/ `none`
+    /// `discovered`（上游列出的，手动添加的接在后面）/ `manual`（上游没给出清单，只有
+    /// 手动添加的）/ `none`
     pub source: ModelSource,
     /// 最近一次获取的结果，同 [`ProviderView::model_status`]
     pub status: ModelListStatus,
@@ -3131,6 +3144,12 @@ pub struct ModelRow {
     /// 列出了这个模型名的别名，按别名表的顺序。**不论这家发不发它**：别名在这家按列表
     /// 顺序取它有的第一个，排在后面的名字也算列进了这个别名
     pub aliases: Vec<String>,
+    /// 手动添加的（配置里这一家的 `models`）。和上游列出的一样算这家提供；删得掉的只有
+    /// 这些（`PUT /provider-manual-models`）
+    pub manual: bool,
+    /// 上游自己的清单里有它。手动添加的模型上游也列了时两项都是 true；上游没给出清单时
+    /// 一律是 false
+    pub listed: bool,
 }
 
 fn direct() -> String {
@@ -3204,6 +3223,21 @@ pub struct ModelSpecSave {
     /// 收不收图。空 = 用价目表的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_input: Option<bool>,
+    /// 你基于哪一版。**对不上就是 409**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<String>,
+}
+
+/// 设一家上游手动添加的模型（`PUT /provider-manual-models`）：上游能服务、却没列进
+/// 清单的模型。**交的是整份清单**，按给的顺序换掉原来的；空的就是一个都不留。
+///
+/// 每一项去掉首尾空白之后是一个确切的模型 ID：不空、不带 `*` `?`、不超过 256 个字符，
+/// 而且不重复（`config.manual_model_*`）。上游也列了的模型可以加，不算重复。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ManualModelsSave {
+    pub provider: String,
+    pub models: Vec<String>,
     /// 你基于哪一版。**对不上就是 409**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<String>,
