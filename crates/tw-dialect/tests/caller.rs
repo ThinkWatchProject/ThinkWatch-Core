@@ -58,14 +58,14 @@ fn decoded(d: Dialect, v: &Value) -> Marks {
     out
 }
 
-/// 中间表示里系统提示和模型的话带着的记号
+/// 中间表示里系统提示（连同对话中途的系统消息）和模型的话带着的记号
 fn not_callers(d: Dialect, v: &Value) -> BTreeSet<String> {
     let r = decode(d, v, path(d), None).expect("decodes").request;
     let mut out = Marks::new();
     for s in &r.system {
         marks_in(s, false, &mut out);
     }
-    for m in r.messages.iter().filter(|m| m.role == Role::Assistant) {
+    for m in r.messages.iter().filter(|m| m.role != Role::User) {
         for p in &m.parts {
             match p {
                 Part::Text(t) => marks_in(t, false, &mut out),
@@ -178,6 +178,8 @@ fn chat_completions() {
                 {"type": "text", "text": "«t3»"},
             ]},
             {"role": "function", "content": "«x4»"},
+            // 对话中途的系统消息留在原位，但不是调用方的话
+            {"role": "system", "content": "«s3» mid-conversation"},
         ],
         "tools": [{"type": "function", "function": {"name": "f", "description": "«x5»", "parameters": {}}}],
     });
@@ -201,6 +203,8 @@ fn responses() {
             ]},
             {"content": "«u5» neither a type nor a role"},
             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "«a1»"}]},
+            // 对话中途的 developer 消息留在原位，但不是调用方的话
+            {"type": "message", "role": "developer", "content": "«s5» mid-conversation"},
             {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{\"q\":\"«x2»\"}"},
             {"type": "function_call_output", "call_id": "c1", "output": "«t1»"},
             {"type": "custom_tool_call", "call_id": "c2", "name": "g", "input": "«x3»"},
@@ -229,6 +233,8 @@ fn responses() {
                 {"type": "encrypted_content", "encrypted_content": "«x11»"},
             ]},
             {"type": "configuration_update", "reasoning": {"effort": "high"}},
+            // 转换时压缩出的摘要：上游写的，不是调用方的话
+            {"type": "compaction", "encrypted_content": tw_dialect::compaction::carry("«s6» summary")},
         ],
         "tools": [
             {"type": "function", "name": "f", "description": "«x5»", "parameters": {}},

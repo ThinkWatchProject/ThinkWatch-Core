@@ -303,6 +303,9 @@ fn openapi_to_json_schema(v: &Value) -> Value {
 
 /// 中间表示 → 发给 Gemini 上游的请求体。路径由调用方按模型和是否流式拼。
 pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value {
+    // 对话中途的系统消息写成带标记的用户消息（见 `fold_system_turns`）
+    let folded = fold_system_turns(r);
+    let r = folded.as_ref();
     let mut out = Map::new();
     if !r.system.is_empty() {
         out.insert(

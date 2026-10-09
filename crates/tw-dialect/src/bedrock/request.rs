@@ -89,6 +89,9 @@ fn cache_point(ttl: CacheTtl) -> Value {
 }
 
 pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
+    // 对话中途的系统消息写成带标记的用户消息（见 `fold_system_turns`）
+    let folded = fold_system_turns(r);
+    let r = folded.as_ref();
     let mut out = Map::new();
     // 断点放不放：模型不认就一个都不放，报出来
     let cache: &[CachePoint] = if caches(&r.model) { &r.cache } else { &[] };

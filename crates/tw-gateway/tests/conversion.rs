@@ -700,3 +700,112 @@ async fn a_codex_responses_lite_request_to_openai_goes_byte_for_byte() {
         "同格式直通改了请求体"
     );
 }
+
+/// Codex 压缩前文：历史末尾加 `compaction_trigger`（`codex-rs/core/src/compact_remote_v2.rs`）
+fn codex_compaction_request() -> Value {
+    let mut v = codex_lite_request();
+    let input = v["input"].as_array_mut().unwrap();
+    input.extend([
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "src/ main.rs"}]}),
+        json!({"type": "compaction_trigger"}),
+    ]);
+    v
+}
+
+#[tokio::test]
+async fn a_codex_compaction_on_a_claude_route_comes_back_as_one_compaction_item() {
+    let stream = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"The user asked to list files; \"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"they are src/ and main.rs.\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":17}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let (up, seen) = upstream(200, "text/event-stream", stream).await;
+    let (gw, mut rx) = gateway(provider(up, Protocol::Anthropic), SecurityMode::Observe).await;
+    let (status, ct, body) = post(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        codex_compaction_request(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ct, "text/event-stream");
+
+    // 发给 Claude 的：同样的历史和工具，末尾请它写摘要
+    let sent: Value = serde_json::from_slice(&seen.lock().unwrap().body).unwrap();
+    assert_eq!(sent["tools"].as_array().unwrap().len(), 3);
+    let last = sent["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["role"], "user");
+    assert!(
+        last.to_string().contains("Write that summary now"),
+        "{last}"
+    );
+
+    // Codex 收到的：恰好一个 compaction 项，摘要在里面
+    let frames = data_frames(&body);
+    let done: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["type"] == "response.output_item.done")
+        .map(|f| &f["item"])
+        .collect();
+    assert_eq!(done.len(), 1, "{body}");
+    assert_eq!(done[0]["type"], "compaction");
+    assert_eq!(
+        tw_dialect::compaction::read(done[0]["encrypted_content"].as_str().unwrap()).as_deref(),
+        Some("The user asked to list files; they are src/ and main.rs.")
+    );
+    assert!(
+        frames.iter().any(|f| f["type"] == "response.completed"),
+        "{body}"
+    );
+
+    // 写摘要这一次和别的请求一样记用量
+    let mut finished = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::RequestFinished { usage, .. } = ev {
+            finished = usage;
+            break;
+        }
+    }
+    assert_eq!(finished.map(|u| (u.input, u.output)), Some((40, 17)));
+}
+
+#[tokio::test]
+async fn a_summary_written_on_a_claude_route_reaches_openai_as_a_message() {
+    // 这段对话之前在别家的上游上压缩过，现在这一跳直通 OpenAI：它读不了我们写的「密文」
+    let reply = concat!(
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",",
+        "\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+    );
+    let (up, seen) = upstream(200, "text/event-stream", reply.into()).await;
+    let (gw, _) = gateway(
+        provider(up, Protocol::OpenaiResponses),
+        SecurityMode::Observe,
+    )
+    .await;
+    let mut sent = codex_lite_request();
+    sent["input"].as_array_mut().unwrap().insert(
+        3,
+        json!({"type": "compaction", "encrypted_content": tw_dialect::compaction::carry("Listed the files.")}),
+    );
+    let (status, _, body) = post(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        sent,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let got: Value = serde_json::from_slice(&seen.lock().unwrap().body).unwrap();
+    assert_eq!(got["input"][3]["role"], "developer");
+    assert_eq!(
+        got["input"][3]["content"][0]["text"],
+        tw_dialect::compaction::restored("Listed the files.").as_str()
+    );
+    assert!(!got.to_string().contains("tw1.c."));
+}

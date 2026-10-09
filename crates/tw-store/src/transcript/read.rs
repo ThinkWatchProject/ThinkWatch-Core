@@ -611,8 +611,17 @@ pub(super) fn responses_item(it: &Value) -> Item<'_> {
                 pieces,
             }
         }
-        // 压缩过的前文：只有 OpenAI 读得懂的一段密文，在对话里的位置像一条系统消息
-        "compaction" => one(Role::System, Piece::Other(kind)),
+        // 压缩过的前文：在对话里的位置像一条系统消息。转换时写的是上游写的摘要，读得出来；
+        // OpenAI 的是只有它读得懂的一段密文
+        "compaction" => {
+            match str_of(it, "encrypted_content").and_then(tw_dialect::compaction::read) {
+                Some(summary) => one(
+                    Role::System,
+                    Piece::Text(Cow::Owned(tw_dialect::compaction::restored(&summary))),
+                ),
+                None => one(Role::System, Piece::Other(kind)),
+            }
+        }
         // 别的工具结果（computer_call_output……）
         k if k.ends_with("_output") => one(Role::Tool, Piece::Other(k)),
         // 托管工具的调用（web_search_call、image_generation_call、mcp_call、local_shell_call……）

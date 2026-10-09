@@ -40,7 +40,7 @@ pub fn decode_request(
             "system" | "developer" => {
                 let t = text_of(content);
                 if !t.is_empty() {
-                    r.system.push(t);
+                    system_turn(&mut r, t);
                 }
             }
             "user" => r.messages.push(Message {
@@ -298,6 +298,9 @@ fn assistant_parts(m: &Value, dropped: &mut Dropped) -> Vec<Part> {
 
 /// 中间表示 → 发给 Chat 上游的请求。
 pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
+    // 对话中途的系统消息写成带标记的用户消息（见 `fold_system_turns`）
+    let folded = fold_system_turns(r);
+    let r = folded.as_ref();
     let mut out = Map::new();
     out.insert("model".into(), json!(r.model));
 
@@ -307,7 +310,7 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
     }
     for m in &r.messages {
         match m.role {
-            Role::User => user_messages(m, dropped, &mut messages),
+            Role::User | Role::System => user_messages(m, dropped, &mut messages),
             Role::Assistant => {
                 if let Some(a) = assistant_message(m, dropped) {
                     messages.push(a);
