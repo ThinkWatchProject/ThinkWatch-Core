@@ -36,6 +36,7 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::DeleteProvider, delete_provider)
         .at(ep::ProviderModels, provider_models)
         .at(ep::SetModelSpec, set_model_spec)
+        .at(ep::SetManualModels, set_manual_models)
         .at(ep::RefreshProviderModels, refresh_models)
         .at(ep::RefreshStaleModels, refresh_stale_models)
         .at(ep::CreateProxy, create_proxy)
@@ -176,6 +177,31 @@ async fn set_model_spec(
                 model,
                 spec.as_ref(),
             )?)
+        })
+        .await
+        .map_err(apply_fail)?;
+    Ok(Json(tw_api::ConfigWritten { version }))
+}
+
+/// 换掉一家上游手动添加的模型：整份清单，按给的顺序；空的就是清掉。
+///
+/// **只动这一家的 `models`**（[`edit::set_models`]），理由同 [`set_model_spec`]。每一项先
+/// 去掉首尾空白，再按整份配置的校验查一遍（[`tw_config::check_manual_models`]），好让它说的
+/// 是这一项，而不是写进去之后被拒。写完由重载重算模型汇总：新加的马上出现在列表里、
+/// 路由得到，不用重新向上游问。
+async fn set_manual_models(
+    State(s): State<ControlState>,
+    Json(req): Json<tw_api::ManualModelsSave>,
+) -> Result<Json<tw_api::ConfigWritten>, Fail> {
+    let models: Vec<String> = req.models.iter().map(|m| m.trim().to_string()).collect();
+    let version = s
+        .cfg
+        .transform(req.base_version.as_deref(), Origin::Ui, |text, cfg| {
+            if !cfg.providers.iter().any(|p| p.name == req.provider) {
+                return Err(not_found("upstream", &req.provider));
+            }
+            tw_config::check_manual_models(&req.provider, &models).map_err(|e| invalid(e.msg()))?;
+            Ok(edit::set_models(text, &req.provider, &models)?)
         })
         .await
         .map_err(apply_fail)?;
@@ -334,6 +360,8 @@ fn models_view(
     let book = s.gateway.pricing.load();
     let date = &book.table().date;
     let cfg = s.config();
+    let listed: std::collections::HashSet<&str> =
+        listing.listed.iter().map(String::as_str).collect();
     tw_api::ProviderModelsView {
         provider: p.name.clone(),
         source: listing.source.into(),
@@ -364,6 +392,8 @@ fn models_view(
                     price_source: r.as_ref().map(|r| tw_store::price_source(&r.source, date)),
                     estimated: r.as_ref().is_some_and(|r| r.cross_platform),
                     aliases: crate::routes::aliases_listing(&cfg, &id),
+                    manual: p.models.contains(&id),
+                    listed: listed.contains(id.as_str()),
                     id,
                 }
             })

@@ -74,6 +74,11 @@ config.key_limit_empty
 config.key_limit_not_positive
 config.key_limit_retention
 config.key_limit_two_measures
+config.manual_model_blank
+config.manual_model_duplicate
+config.manual_model_padded
+config.manual_model_too_long
+config.manual_model_wildcard
 config.model_spec_blank_model
 config.model_spec_nothing_set
 config.model_spec_wildcard

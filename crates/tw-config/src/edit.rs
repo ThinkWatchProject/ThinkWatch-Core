@@ -719,6 +719,71 @@ pub fn set_model_spec(
 /// 上游里手写的模型规格那一项的键
 const MODEL_SPECS: &str = "model_specs";
 
+/// 上游里手动添加的模型那一项的键
+const MODELS: &str = "models";
+
+/// 把一家上游手动添加的模型（`models`）换成 `models`，按给的顺序。**空的就删掉这个键**
+/// —— 默认值不写进文件。
+///
+/// **只动这一家的 `models`**，和 [`set_model_spec`] 一样不走编辑上游那条路：那条路按读进来
+/// 的结构把整项写回去。模型 ID 的毛病由调用方先查（[`crate::check_manual_models`]），这里
+/// 只拦换行。
+pub fn set_models(text: &str, provider: &str, models: &[String]) -> Result<String, EditError> {
+    let value = Value::Sequence(models.iter().cloned().map(Value::String).collect());
+    reject_multiline(&value)?;
+    let doc = parse(text)?;
+    let index = PROVIDERS
+        .index_of(&doc, provider)
+        .ok_or_else(|| EditError::NotFound {
+            what: PROVIDERS.what,
+            name: provider.to_string(),
+        })?;
+    let item = PROVIDERS.items(&doc)[index]
+        .as_mapping()
+        .cloned()
+        .unwrap_or_default();
+    let key = Value::String(MODELS.into());
+    let mut new_item = item.clone();
+    if models.is_empty() {
+        if !item.contains_key(&key) {
+            return Ok(text.to_string());
+        }
+        new_item.remove(&key);
+    } else {
+        if item.get(&key) == Some(&value) {
+            return Ok(text.to_string());
+        }
+        new_item.insert(key, value.clone());
+    }
+
+    let steps = PROVIDERS.steps();
+    let mut at = steps.clone();
+    at.push(Step::Index(index));
+    let mut field = at.clone();
+    field.push(Step::key(MODELS));
+    let out = if tw_yaml::is_flow_at(text, &at)? {
+        // 行内写法里的键删不了、嵌套值塞不进去 —— 整项换成块式
+        let block = render_block(&Value::Mapping(new_item.clone()))?;
+        tw_yaml::replace_item(text, &steps, index, &block)?
+    } else if models.is_empty() {
+        tw_yaml::remove_key(text, &field)?
+    } else {
+        put_value(text, &field, &value)?
+    };
+
+    // ── 语义核对 ─────────────────────────────────────────────────────
+    let mut expected = doc;
+    put_item(&mut expected, PROVIDERS, index, Value::Mapping(new_item));
+    let got = parse(&out).map_err(|e| EditError::SelfCheck(e.to_string()))?;
+    if got != expected {
+        return Err(EditError::SelfCheck(format!(
+            "{} `{provider}` models",
+            PROVIDERS.what
+        )));
+    }
+    Ok(out)
+}
+
 /// 文件里的别名表，按书写顺序。键一律当字符串（配置读进来时就是这么读的）
 fn alias_table(doc: &Value) -> Vec<(String, Value)> {
     let Some(Value::Mapping(m)) = doc.get(ALIASES) else {
@@ -1424,6 +1489,84 @@ routes: []
             "{e}"
         );
         let e = set_model_spec(CFG, "官方", "a\nb", Some(&spec(Some(1), None))).unwrap_err();
+        assert!(matches!(e, EditError::Multiline), "{e}");
+    }
+
+    // ── 手动添加的模型 ───────────────────────────────────────────────
+
+    fn models_of(text: &str, provider: &str) -> Vec<String> {
+        let cfg: crate::Config = serde_yaml_ng::from_str(text).unwrap();
+        cfg.providers
+            .into_iter()
+            .find(|p| p.name == provider)
+            .unwrap()
+            .models
+    }
+
+    fn owned(models: &[&str]) -> Vec<String> {
+        models.iter().map(|m| m.to_string()).collect()
+    }
+
+    /// 设、换、清空：这一家的其余字段和旁边的注释原样，清空之后文件回到原样
+    #[test]
+    fn manual_models_are_set_replaced_and_cleared_without_touching_the_rest() {
+        // 要加引号的模型 ID 读回来还是它
+        let odd = "us.anthropic.claude-fable-5-v1:0";
+        let out = set_models(CFG, "官方", &owned(&["gpt-6-luna", odd])).unwrap();
+        assert!(
+            out.contains("base_url: https://api.anthropic.com  # 直连"),
+            "{out}"
+        );
+        assert!(out.contains("# 两家上游"), "{out}");
+        assert_eq!(
+            models_of(&out, "官方"),
+            [String::from("gpt-6-luna"), odd.into()]
+        );
+        // 一样的清单：原样
+        assert_eq!(
+            set_models(&out, "官方", &owned(&["gpt-6-luna", odd])).unwrap(),
+            out
+        );
+        let out = set_models(&out, "官方", &owned(&[odd])).unwrap();
+        assert_eq!(models_of(&out, "官方"), [odd]);
+        // 清空：`models` 整个不写；本来就没有的清空是原样
+        let out = set_models(&out, "官方", &[]).unwrap();
+        assert_eq!(out, CFG);
+        assert_eq!(set_models(CFG, "官方", &[]).unwrap(), CFG);
+    }
+
+    /// 写成行内的上游整项换成块式，位置不变；行内的清单整个换掉
+    #[test]
+    fn manual_models_go_into_an_inline_upstream_or_list_too() {
+        let out = set_models(CFG, "relay", &owned(&["m"])).unwrap();
+        assert_eq!(models_of(&out, "relay"), ["m"]);
+        let cfg: crate::Config = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(cfg.providers[1].base_url, "https://relay.example");
+        assert_eq!(cfg.providers[0].name, "官方", "位置变了：{out}");
+        let out = set_models(&out, "relay", &[]).unwrap();
+        assert!(!out.contains("models"), "{out}");
+
+        let inline = CFG.replace("    key: sk-a\n", "    key: sk-a\n    models: [a, b]\n");
+        let out = set_models(&inline, "官方", &owned(&["b", "c"])).unwrap();
+        assert_eq!(models_of(&out, "官方"), ["b", "c"]);
+        let out = set_models(&inline, "官方", &[]).unwrap();
+        assert_eq!(out, CFG);
+    }
+
+    #[test]
+    fn manual_models_for_a_missing_upstream_or_with_a_line_break_are_refused() {
+        let e = set_models(CFG, "ghost", &owned(&["m"])).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                EditError::NotFound {
+                    what: "upstream",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        let e = set_models(CFG, "官方", &owned(&["a\nb"])).unwrap_err();
         assert!(matches!(e, EditError::Multiline), "{e}");
     }
 }
