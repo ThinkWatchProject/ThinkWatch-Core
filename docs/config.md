@@ -1029,11 +1029,19 @@ to the complete answer.
 - When no content has reached the client yet, the upstream counts as failed
   (towards `failures_to_pause`, like a 5xx), the attempt appears with the
   outcome `idle_timeout`, and the request moves to the next candidate. Until
-  then a streamed answer is held back from the client, so the next upstream
+  then an upstream's answer is held back from the client, so the next upstream
   starts it afresh. With no candidate left, the client gets a timeout error
   (504) in its own format. The last candidate's stream is passed on as it
   arrives, so once its response has started, a timeout there ends it with an
   error event instead.
+- A streamed answer is held for at most 15 seconds. If no content has
+  arrived by then, the client receives `200` and the streaming headers, so
+  that its own wait for headers does not run out, followed by an SSE comment
+  (`: keep-alive`) every 15 seconds; Gemini clients get no comments. The
+  upstream's events stay held until its first content, and failover continues
+  as before under the same `200`: the next upstream's stream starts cleanly,
+  and when no candidate is left, the stream ends with an error event in the
+  client's format instead of a 504. The comments do not count as content.
 - When content has already reached the client, the request cannot move on
   without repeating it: the answer ends with an error event in the client's
   format, and the request is recorded as failed.

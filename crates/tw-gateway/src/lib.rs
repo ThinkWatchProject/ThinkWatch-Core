@@ -87,6 +87,16 @@ pub const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 /// 自己的静默计时会断开它。正常在排队的上游会发 `: keep-alive` 这样的注释，不受影响
 pub const PING_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// 流式回答第一段内容到达之前，最多压多久不给客户端响应头（见 `server::pipeline::commit`）。
+///
+/// 压着的时候还能换一家上游、上游开头报的错也还能换成一个像样的状态码；压得太久，客户端
+/// 自己等响应头的计时先到了。过了这么久就先交出 `200` 和流的响应头，故障转移在响应体里
+/// 接着做。**不可配置**：它不是给用户调的取舍，是客户端那一侧的限制
+pub const OPENING_HOLD: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 响应头先交出去之后，等回答的时候隔多久给客户端发一行 SSE 注释（`: keep-alive`）
+pub const KEEPALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 请求来自谁。**如实写 ThinkWatch** —— 我们从不把自己报成别的客户端。
 pub const ORIGINATOR: &str = "thinkwatch";
 

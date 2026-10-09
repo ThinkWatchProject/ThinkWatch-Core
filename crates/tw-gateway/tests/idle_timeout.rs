@@ -4,6 +4,8 @@
 //! 它记下自己的响应被丢掉了没有 —— 网关放弃它、中止它时，连接要真的断开，上游才会停下。
 //!
 //! 超时写最短的 30 秒，测试把一秒调成三十分之一秒（`AppState::idle_tick`）：等的是 1 秒。
+//! 流式回答压着不给响应头的时限（`AppState::opening_hold`）默认调到 10 秒，比这里的场景都长 ——
+//! 响应头先交出去的那几条（见 `tw_gateway::OPENING_HOLD`）另调成 300 毫秒。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,6 +33,7 @@ struct Script {
     /// 挂着时发的心跳
     beat: &'static str,
     content_type: &'static str,
+    status: u16,
 }
 
 impl Default for Script {
@@ -39,8 +42,9 @@ impl Default for Script {
             header_delay_ms: 0,
             steps: Vec::new(),
             hang: false,
-            beat: ": keep-alive\n\n",
+            beat: ": ping\n\n",
             content_type: "text/event-stream",
+            status: 200,
         }
     }
 }
@@ -91,6 +95,7 @@ async fn upstream(script: Script) -> Upstream {
                 x
             });
             axum::response::Response::builder()
+                .status(script.status)
                 .header("content-type", script.content_type)
                 .body(axum::body::Body::from_stream(body))
                 .unwrap()
@@ -157,10 +162,27 @@ fn provider(name: &str, up: &Upstream, protocol: Protocol) -> Provider {
     }
 }
 
+/// 响应头先交出去的那几条测试里，流式回答最多压多久、隔多久发一行保活
+const HOLD: Duration = Duration::from_millis(300);
+const KEEPALIVE_EVERY: Duration = Duration::from_millis(150);
+
 /// 起网关，交回数据面的状态。`slot_wait_secs` 是等空位的期限
 async fn gateway_with(
     providers: Vec<Provider>,
     slot_wait_secs: u64,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Receiver<Event>,
+    tw_gateway::AppState,
+) {
+    gateway_held(providers, slot_wait_secs, Duration::from_secs(10)).await
+}
+
+/// 起网关，流式回答最多压 `hold` 不给响应头
+async fn gateway_held(
+    providers: Vec<Provider>,
+    slot_wait_secs: u64,
+    hold: Duration,
 ) -> (
     SocketAddr,
     tokio::sync::broadcast::Receiver<Event>,
@@ -183,6 +205,8 @@ async fn gateway_with(
     };
     let mut state = tw_gateway::AppState::new(cfg).unwrap();
     state.idle_tick = WINDOW / 30;
+    state.opening_hold = hold;
+    state.keepalive_every = KEEPALIVE_EVERY;
     let rx = state.bus.subscribe();
     let addr = tw_gateway::serve(state.clone(), ([127, 0, 0, 1], 0).into())
         .await
@@ -227,6 +251,27 @@ async fn send(gw: SocketAddr, path: &str, body: &Value) -> (u16, Option<String>,
         .get("x-thinkwatch-error")
         .map(|v| v.to_str().unwrap().to_string());
     (status, source, resp.text().await.unwrap())
+}
+
+/// 发出去，交回状态码、响应头到的那一刻（从发出算起）和整个正文
+async fn timed(gw: SocketAddr, path: &str, body: &Value) -> (u16, Duration, String) {
+    let t = Instant::now();
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{gw}{path}"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "tw-k")
+        .header("x-goog-api-key", "tw-k")
+        .header("authorization", "Bearer tw-k")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let headers_at = t.elapsed();
+    let status = resp.status().as_u16();
+    (status, headers_at, resp.text().await.unwrap())
 }
 
 async fn post(gw: SocketAddr, path: &str, body: &Value) -> (u16, String) {
@@ -1004,4 +1049,267 @@ async fn aborting_a_session_stops_every_request_of_it_and_nothing_else() {
     state.aborts.request(third).expect("另一段对话还在跑");
     let (_, text) = c.await.unwrap();
     assert!(text.contains("event: error"), "{text}");
+}
+
+// ───────────────────────────────────────────── 压不住了：响应头先交出去
+
+/// 一行保活
+const KA: &str = ": keep-alive\n\n";
+
+#[tokio::test]
+async fn past_the_hold_the_headers_go_out_with_keepalives_and_failover_carries_on() {
+    let slow = upstream(stalled()).await;
+    let good = upstream(prompt("hello")).await;
+    let (gw, mut rx, _) = gateway_held(
+        vec![
+            provider("slow", &slow, Protocol::Anthropic),
+            provider("good", &good, Protocol::Anthropic),
+        ],
+        30,
+        HOLD,
+    )
+    .await;
+    let (status, headers_at, text) = timed(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        headers_at >= HOLD && headers_at < WINDOW,
+        "响应头在压满之后、超时之前交出：{headers_at:?}"
+    );
+    // 先是几行保活（压满之后一行，之后每隔一阵一行），然后是下一家从头开始的回答
+    let answer = text.find("event: message_start").expect("下一家的回答");
+    assert!(text[..answer].matches(KA).count() >= 3, "{text}");
+    assert!(
+        text[..answer].trim_start().starts_with(": keep-alive"),
+        "{text}"
+    );
+    assert_eq!(text.matches("event: message_start").count(), 1, "{text}");
+    assert!(
+        !text.contains("event: ping"),
+        "放弃的那一家一个字节都不交出去：{text}"
+    );
+    assert!(text[answer..].contains("hello"), "{text}");
+    assert!(
+        !text[answer..].contains("keep-alive"),
+        "回答开始之后不再插保活：{text}"
+    );
+    assert!(eventually(&slow.dropped).await);
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(
+        outcomes(&attempts),
+        [("slow", IdleTimeout), ("good", Served)]
+    );
+    assert_eq!(outcome(&mut rx).await, Ok(200));
+}
+
+#[tokio::test]
+async fn an_error_before_content_after_the_headers_still_fails_over() {
+    // 开了流，压满之后才报过载：响应头已经交出去了，照样换下一家，错误不到客户端
+    let overloaded = upstream(Script {
+        steps: vec![
+            (0, MESSAGE_START),
+            (
+                600,
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            ),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let good = upstream(prompt("hello")).await;
+    let (gw, mut rx, _) = gateway_held(
+        vec![
+            provider("busy", &overloaded, Protocol::Anthropic),
+            provider("good", &good, Protocol::Anthropic),
+        ],
+        30,
+        HOLD,
+    )
+    .await;
+    let (status, headers_at, text) = timed(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(headers_at < Duration::from_millis(550), "{headers_at:?}");
+    assert!(text.starts_with(": keep-alive"), "{text}");
+    assert!(!text.contains("Overloaded"), "{text}");
+    assert!(text.contains("hello"), "{text}");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(outcomes(&attempts), [("busy", Error), ("good", Served)]);
+    assert_eq!(
+        attempts[0].error.as_ref().map(|m| m.code.as_str()),
+        Some("gw.upstream.stream_opening_error")
+    );
+}
+
+#[tokio::test]
+async fn when_every_upstream_stays_silent_after_the_headers_the_stream_ends_with_an_error() {
+    let a = upstream(stalled()).await;
+    let b = upstream(Script {
+        header_delay_ms: 60_000,
+        ..prompt("never")
+    })
+    .await;
+    let (gw, mut rx, _) = gateway_held(
+        vec![
+            provider("a", &a, Protocol::Anthropic),
+            provider("b", &b, Protocol::Anthropic),
+        ],
+        30,
+        HOLD,
+    )
+    .await;
+    let (status, headers_at, text) = timed(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "状态码已经交出去了：{text}");
+    assert!(headers_at < WINDOW, "{headers_at:?}");
+    let error = text.find("event: error").expect("流里的错误");
+    assert!(text[..error].matches(KA).count() >= 3, "{text}");
+    assert!(!text.contains("event: ping"), "{text}");
+    assert!(text[error..].contains("timeout_error"), "{text}");
+    assert!(text[error..].contains("[ThinkWatch]"), "{text}");
+    assert!(text[error..].contains("tried: a → b"), "{text}");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(
+        outcomes(&attempts),
+        [("a", IdleTimeout), ("b", IdleTimeout)]
+    );
+    assert_eq!(
+        outcome(&mut rx).await,
+        Err((
+            tw_api::FailureSource::Upstream,
+            "gw.upstream.idle_timeout".into()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_from_the_last_upstream_after_the_headers_is_told_in_the_stream() {
+    // 第一家不出声、压满之后放弃；最后一家回 400：状态码交不出去了，它说的话写成流里的错误
+    let slow = upstream(stalled()).await;
+    let refusing = upstream(Script {
+        status: 400,
+        content_type: "application/json",
+        steps: vec![(
+            0,
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long\"}}",
+        )],
+        ..Default::default()
+    })
+    .await;
+    let (gw, mut rx, _) = gateway_held(
+        vec![
+            provider("slow", &slow, Protocol::Anthropic),
+            provider("strict", &refusing, Protocol::Anthropic),
+        ],
+        30,
+        HOLD,
+    )
+    .await;
+    let (status, _, text) = timed(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.starts_with(": keep-alive"), "{text}");
+    let error = text.find("event: error").expect("流里的错误");
+    assert!(text[error..].contains("prompt is too long"), "{text}");
+    assert!(text[error..].contains("invalid_request_error"), "{text}");
+    assert_eq!(
+        outcome(&mut rx).await,
+        Err((
+            tw_api::FailureSource::Upstream,
+            "gw.upstream.status_message".into()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn aborting_after_the_headers_went_out_ends_the_stream_with_the_abort() {
+    let slow = upstream(stalled()).await;
+    let other = upstream(prompt("other")).await;
+    let (gw, mut rx, state) = gateway_held(
+        vec![
+            provider("slow", &slow, Protocol::Anthropic),
+            provider("other", &other, Protocol::Anthropic),
+        ],
+        30,
+        HOLD,
+    )
+    .await;
+    let asking = tokio::spawn(async move { timed(gw, "/v1/messages", &messages(true)).await });
+    let (id, _) = started(&mut rx).await;
+    tokio::time::sleep(HOLD + Duration::from_millis(250)).await;
+    state.aborts.request(id).expect("还在跑");
+    let (status, _, text) = asking.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(text.starts_with(": keep-alive"), "{text}");
+    let error = text.find("event: error").expect("流里的错误");
+    assert!(text[error..].contains("aborted by the user"), "{text}");
+    assert!(eventually(&slow.dropped).await, "和上游的连接要断开");
+    assert_eq!(other.hits.load(Ordering::SeqCst), 0, "不换下一家");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(outcomes(&attempts), [("slow", Aborted)]);
+    assert_eq!(
+        outcome(&mut rx).await,
+        Err((tw_api::FailureSource::Aborted, tw_api::ABORTED.into()))
+    );
+}
+
+#[tokio::test]
+async fn gemini_clients_get_the_headers_early_but_no_comments() {
+    // Gemini 官方的 Python SDK 把注释行当成 JSON 去解析：响应头照样先交，流里不插注释
+    let silent = upstream(Script {
+        steps: vec![(
+            0,
+            "data: {\"usageMetadata\":{\"promptTokenCount\":10}}\r\n\r\n",
+        )],
+        hang: true,
+        ..Default::default()
+    })
+    .await;
+    let good = upstream(Script {
+        steps: vec![(
+            0,
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}]}\r\n\r\n",
+        )],
+        ..Default::default()
+    })
+    .await;
+    let (gw, mut rx, _) = gateway_held(
+        vec![
+            provider("silent", &silent, Protocol::Gemini),
+            provider("good", &good, Protocol::Gemini),
+        ],
+        30,
+        HOLD,
+    )
+    .await;
+    let path = "/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse";
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+    let (status, headers_at, text) = timed(gw, path, &body).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(headers_at < WINDOW, "{headers_at:?}");
+    assert!(
+        !text.lines().any(|l| l.starts_with(':')),
+        "没有注释行：{text}"
+    );
+    assert!(text.trim_start().starts_with("data: "), "{text}");
+    assert!(text.contains("hello"), "{text}");
+    assert!(!text.contains("promptTokenCount\":10}}"), "{text}");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(
+        outcomes(&attempts),
+        [("silent", IdleTimeout), ("good", Served)]
+    );
+}
+
+#[tokio::test]
+async fn a_whole_answer_is_never_answered_early() {
+    // 整包的请求照旧压到回答为止：压满之后也不先交响应头，候选用完了是 504
+    let only = upstream(Script {
+        header_delay_ms: 60_000,
+        steps: vec![(0, whole("never"))],
+        content_type: "application/json",
+        ..Default::default()
+    })
+    .await;
+    let (gw, _, _) =
+        gateway_held(vec![provider("only", &only, Protocol::Anthropic)], 30, HOLD).await;
+    let (status, headers_at, text) = timed(gw, "/v1/messages", &messages(false)).await;
+    assert_eq!(status, 504, "{text}");
+    assert!(headers_at >= WINDOW, "{headers_at:?}");
 }

@@ -9,7 +9,8 @@
 //!
 //! 登记跟着请求的结局走（挂在 [`crate::ending::Ending`] 上）：结局报了、或者被丢掉了，登记
 //! 就没了。所以「在不在这张表里」就是「这个请求还在不在跑」，叫停一个已经结束的请求得到
-//! 的是「没有在跑」，而不是一次什么都没发生的成功。
+//! 的是「没有在跑」，而不是一次什么都没发生的成功。**扳过开关之后被丢掉的结局报手动中止**，
+//! 不报客户端取消：停在看不着开关的地方（取凭据、跑插件）时，是外面那一层把整个请求丢掉的。
 //!
 //! WebSocket 那条路不登记：一轮回答跑在一条长连接上，叫停一轮要连带处置整条连接，这一版
 //! 不做。
@@ -76,6 +77,14 @@ pub struct Aborts {
 pub struct Registered {
     aborts: Arc<Aborts>,
     id: u64,
+    switch: Switch,
+}
+
+impl Registered {
+    /// 这个请求被叫停了没有
+    pub fn thrown(&self) -> bool {
+        self.switch.thrown()
+    }
 }
 
 impl Drop for Registered {
@@ -96,10 +105,17 @@ impl Aborts {
 
     /// 请求 `id`（会话 `session`）开始了，用 `switch` 叫停它。
     pub fn enter(self: &Arc<Self>, id: u64, session: Option<String>, switch: Switch) -> Registered {
-        self.lock().insert(id, Entry { session, switch });
+        self.lock().insert(
+            id,
+            Entry {
+                session,
+                switch: switch.clone(),
+            },
+        );
         Registered {
             aborts: Arc::clone(self),
             id,
+            switch,
         }
     }
 

@@ -822,8 +822,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 ///
 /// **43 起上游不出声有了上限，请求能手动中止**：[`FailoverView`] 的 `stream_start_wait_secs`
 /// 和 `next_on_slow_start` 删了，换成 `idle_timeout_secs`（无响应超时，默认 300 秒，30 到
-/// 3600）：从请求发出去起算，每来一段内容重新计时，心跳不算。客户端还什么都没收到时，这一家
+/// 3600）：从请求发出去起算，每来一段内容重新计时，心跳不算。还没有内容交给客户端时，这一家
 /// 记一次失败、换下一家，没有下一家了回 504；已经收到一部分的，回答按客户端的格式以错误收尾。
+/// 流式的回答压着第一段内容最多 15 秒，过了就先交出 `200` 和流的响应头、隔一阵发一行 SSE
+/// 注释（`: keep-alive`，Gemini 的客户端不发），故障转移照旧，候选用完了在流里报错，不再是 504。
 /// 配置里写 `stream_start_wait_secs`、`next_on_slow_start` 加载不了（不认识的字段，一键修复删掉
 /// 它们），消息码 `config.slow_start_too_short`、`gw.slow_start` 跟着删。尝试链的结果
 /// （[`AttemptOutcome`]）删了 `slow_start`，多了 `idle_timeout`（说等了多少秒的

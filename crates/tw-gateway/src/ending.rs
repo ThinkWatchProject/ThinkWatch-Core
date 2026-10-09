@@ -523,6 +523,20 @@ impl Drop for Ending {
         // 往通道里 try_send、往广播里 send、读一下时钟。
         let (usage, answered_model) = self.settle();
         let usage = usage.map(view);
+        // 在界面上叫停之后被丢掉的（见 `crate::abort`）：是手动中止，不是客户端走了
+        if self.abort.as_ref().is_some_and(|r| r.thrown()) {
+            self.bus.emit(tw_api::Event::RequestFailed {
+                id: self.id,
+                model: std::mem::take(&mut self.model),
+                source: tw_api::FailureSource::Aborted,
+                message: crate::error::GatewayError::aborted().detail,
+                bytes: self.received(),
+                duration_ms: Some(self.duration_ms()),
+                usage,
+                answered_model,
+            });
+            return;
+        }
         // 是网关自己的代码崩掉了。**记成取消会冤枉客户端** —— 排查的人
         // 会去问一个根本没做过这件事的客户端。
         if std::thread::panicking() {

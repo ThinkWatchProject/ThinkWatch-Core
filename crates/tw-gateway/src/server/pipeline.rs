@@ -20,6 +20,7 @@ use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
 mod admission;
+mod commit;
 mod hop;
 mod idle;
 mod opening;
@@ -178,6 +179,73 @@ pub(super) async fn pipeline(
     if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &screening) {
         return Err(GatewayError::denied(why));
     }
+    // 管线第 5 步：试上游、交回答（见 `answer`）。它拿走这个请求要的一切：流式的回答等不到
+    // 内容时，响应头先交给客户端，它在响应体里接着跑（见 `commit`）
+    let early = commit::early(&state, &req, &reading);
+    let abort = req.abort.clone();
+    let dialect = req.dialect;
+    let run = answer(
+        state,
+        rt,
+        req,
+        Tail {
+            reading,
+            decision,
+            started,
+            conv,
+            passes: (live, pass),
+        },
+        ending.take(),
+    );
+    match early {
+        None => run.await,
+        Some(e) => commit::hold(run, dialect, e, abort).await,
+    }
+}
+
+/// 发出开始事件之后，回答那一段要的：路由事实、决定、开始时定下的、这段对话这一轮，和两张
+/// 通行证（在服务中、这把密钥的并发）。
+struct Tail {
+    reading: crate::client_api::Reading,
+    decision: tw_engine::Decision,
+    started: Started,
+    conv: Option<crate::affinity::Conversation>,
+    passes: (crate::live::Pass, crate::limits::Pass),
+}
+
+/// 管线第 5 步：依次试候选上游（见 [`hop`]），把接下的那一家的回答交给客户端（见 [`relay`]）。
+///
+/// **拥有它要的一切**（不借管线的东西）：流式的回答等过一阵还没有内容时，响应头先交出去，
+/// 它挪进响应体里接着跑（见 [`commit`]）。结局也在它手上：返回错误之前自己报失败，被丢掉
+/// 由结局的 Drop 报（客户端走了是取消，叫停了是手动中止）。
+async fn answer(
+    state: AppState,
+    rt: Arc<Runtime>,
+    req: Inbound,
+    tail: Tail,
+    mut ending: Option<crate::ending::Ending>,
+) -> Result<Response, GatewayError> {
+    let r = answer_with(&state, &rt, &req, tail, &mut ending).await;
+    if let (Err(e), Some(end)) = (&r, ending.take()) {
+        end.failed(e.source.into(), e.detail.clone());
+    }
+    r
+}
+
+async fn answer_with(
+    state: &AppState,
+    rt: &Arc<Runtime>,
+    req: &Inbound,
+    tail: Tail,
+    ending: &mut Option<crate::ending::Ending>,
+) -> Result<Response, GatewayError> {
+    let Tail {
+        reading,
+        decision,
+        started,
+        conv,
+        passes: (live, pass),
+    } = tail;
     // 插件的请求钩子在每一跳里跑（见 `plug`）：从客户端的原话起改 —— 内容过滤删过的话是
     // 删过的那一份 —— 几跳共用原文的解析和密钥的编号。插件表跟着运行时走：**整个请求是
     // 同一份**，回答钩子用的也是它
@@ -191,7 +259,7 @@ pub(super) async fn pipeline(
         &req.body,
     );
     let answer =
-        hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started, &mut hook).await?;
+        hop::try_upstreams(state, rt, req, &reading, &decision, &started, &mut hook).await?;
     // 网关估的数不是哪一家回答的：不记这段对话留在哪一家
     let mut served = match answer {
         hop::Answer::Served(served) => *served,
@@ -199,7 +267,7 @@ pub(super) async fn pipeline(
             let ending = ending
                 .take()
                 .expect("written when the start event was emitted");
-            return Ok(estimated(&state, &req, started.id, body, ending));
+            return Ok(estimated(state, req, started.id, body, ending));
         }
     };
     // 这一跳的账比开头那本多了号（插件往请求里写了新的值，拦截档下接着编了号）：回答
@@ -207,7 +275,7 @@ pub(super) async fn pipeline(
     if served.ledger.len() != started.ledger.len()
         && let Some(e) = ending.as_mut()
     {
-        e.redact_with(redaction(&rt, served.ledger.clone()));
+        e.redact_with(redaction(rt, served.ledger.clone()));
     }
     // 回答钩子：上游回了成功的回答才有。**在交出结局之前起实例**：起不来而策略是拒绝时，
     // 这个请求按返回的错误收场，客户端还一个字节都没收到
@@ -228,7 +296,7 @@ pub(super) async fn pipeline(
                 request_id: started.id,
                 attempt: served.attempt,
             };
-            crate::plugin::reply::Chain::start(&state, &rt.plugins, bridge, &ctx).await?
+            crate::plugin::reply::Chain::start(state, &rt.plugins, bridge, &ctx).await?
         }
         _ => None,
     };
@@ -244,9 +312,9 @@ pub(super) async fn pipeline(
         ));
     }
     Ok(relay::respond(
-        &state,
-        &rt,
-        &req,
+        state,
+        rt,
+        req,
         reading.generates,
         &reading.facts.model,
         served,

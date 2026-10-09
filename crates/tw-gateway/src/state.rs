@@ -253,6 +253,10 @@ pub struct AppState {
     /// `failover.idle_timeout_secs` 的一秒有多长（见 `server::pipeline::idle`）。**测试会把它
     /// 调短**，否则一条无响应超时的测试至少要干等三十秒
     pub idle_tick: std::time::Duration,
+    /// 流式回答最多压多久不给响应头（[`crate::OPENING_HOLD`]）。**测试会把它调短**
+    pub opening_hold: std::time::Duration,
+    /// 响应头先交出去之后隔多久发一行保活（[`crate::KEEPALIVE_EVERY`]）。**测试会把它调短**
+    pub keepalive_every: std::time::Duration,
 }
 
 impl AppState {
@@ -322,6 +326,8 @@ impl AppState {
             plugin_pool: Arc::new(crate::plugin::pool::Pool::default_size()),
             aborts: Default::default(),
             idle_tick: std::time::Duration::from_secs(1),
+            opening_hold: crate::OPENING_HOLD,
+            keepalive_every: crate::KEEPALIVE_EVERY,
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();
