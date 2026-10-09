@@ -492,6 +492,8 @@ impl Writer {
             }
             (Block::Thinking(th), Delta::Signature(s)) => th.signature = Some(s.clone()),
             (Block::ToolCall(c), Delta::ToolInput(d)) => {
+                // `tool_search_call` 没有参数的增量事件：参数整个在 output_item.done 里
+                let quiet = self.session.is_tool_search(&c.name);
                 let kind = match &mut c.input {
                     ToolInput::Text(t) => {
                         t.push_str(d);
@@ -506,11 +508,13 @@ impl Writer {
                         "response.function_call_arguments.delta"
                     }
                 };
-                self.emit(
-                    kind,
-                    json!({ "item_id": id, "output_index": oi, "delta": d }),
-                    out,
-                );
+                if !quiet {
+                    self.emit(
+                        kind,
+                        json!({ "item_id": id, "output_index": oi, "delta": d }),
+                        out,
+                    );
+                }
             }
             _ => {}
         }
@@ -563,6 +567,7 @@ impl Writer {
                 );
             }
             Block::Thinking(_) => {}
+            Block::ToolCall(c) if self.session.is_tool_search(&c.name) => {}
             Block::ToolCall(c) => match &c.input {
                 ToolInput::Text(t) => self.emit(
                     "response.custom_tool_call_input.done",

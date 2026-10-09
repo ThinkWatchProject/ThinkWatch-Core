@@ -164,6 +164,15 @@ pub(crate) fn item(b: &Block, id: &str, done: bool, s: &Session) -> Value {
             }
             o
         }
+        // 客户端自己执行的工具搜索：参数是对象，不是 JSON 文本
+        Block::ToolCall(c) if s.is_tool_search(&c.name) => json!({
+            "id": id,
+            "type": "tool_search_call",
+            "call_id": c.id,
+            "execution": "client",
+            "status": status,
+            "arguments": if done { c.input.to_object() } else { json!({}) },
+        }),
         Block::ToolCall(c) => {
             let (name, namespace) = match s.namespaced(&c.name) {
                 Some((ns, n)) => (n.as_str(), Some(ns.as_str())),
@@ -198,6 +207,7 @@ pub(crate) fn item_id(b: &Block, s: &Session) -> String {
     new_id(match b {
         Block::Text(_) => "msg_",
         Block::Thinking(_) => "rs_",
+        Block::ToolCall(c) if s.is_tool_search(&c.name) => "tsc_",
         Block::ToolCall(c) if s.is_freeform(&c.name) => "ctc_",
         Block::ToolCall(_) => "fc_",
     })

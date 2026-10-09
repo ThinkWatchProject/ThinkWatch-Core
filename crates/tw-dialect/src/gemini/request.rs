@@ -472,6 +472,9 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
         Some(_) => dropped.feature(Feature::Reasoning),
         None => {}
     }
+    if r.verbosity.is_some() {
+        dropped.feature(Feature::Verbosity);
+    }
     if !g.is_empty() {
         out.insert("generationConfig".into(), Value::Object(g));
     }

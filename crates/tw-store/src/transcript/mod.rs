@@ -1778,6 +1778,44 @@ mod tests {
         assert_eq!(t.turns[0].output, [call("toolu_1", "apply_patch", patch)]);
     }
 
+    /// Codex 的 Responses Lite：工具声明在 `input` 的 `additional_tools` 里，自由格式工具在
+    /// `functions` 这个 namespace 里。声明不算对话；转给别家时 `apply_patch` 还叫这个名字，
+    /// 包着的原文照样拆回来
+    #[test]
+    fn a_responses_lite_request_reads_its_tools_from_input() {
+        let mut d = Disk::new();
+        let patch = "*** Begin Patch\n*** End Patch";
+        d.put(
+            "/v1/responses",
+            Some(
+                json!({"model": "claude-sonnet-4-5", "input": [
+                    {"type": "additional_tools", "role": "developer", "tools": [
+                        {"type": "namespace", "name": "functions", "tools": [
+                            {"type": "custom", "name": "apply_patch"},
+                            {"type": "function", "name": "exec_command", "parameters": {}}
+                        ]}
+                    ]},
+                    {"type": "message", "role": "developer", "content": "You are Codex."},
+                    {"type": "message", "role": "user", "content": "改一下"}
+                ]})
+                .to_string()
+                .as_bytes(),
+            ),
+            Some(&anthropic_stream(&[json!({"type": "tool_use", "id": "toolu_1",
+                "name": "apply_patch", "input": {"input": patch}})])),
+            |r| {
+                r.translated = Some(
+                    json!({"provider": "anthropic", "from": "openai-responses", "to": "anthropic", "dropped": []})
+                        .to_string(),
+                )
+            },
+        );
+        let t = d.transcript();
+        assert_eq!(t.system.as_deref(), Some("You are Codex."));
+        assert_eq!(t.turns[0].input, [msg(R::User, vec![text("改一下")])]);
+        assert_eq!(t.turns[0].output, [call("toolu_1", "apply_patch", patch)]);
+    }
+
     /// Bedrock 的二进制帧在网关进门时转成了 SSE；整包的 Converse 也读得出来
     #[test]
     fn a_bedrock_answer_is_read_streamed_or_whole() {

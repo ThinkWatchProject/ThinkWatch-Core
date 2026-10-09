@@ -221,6 +221,9 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
     if r.format.is_some() {
         dropped.feature(Feature::Format);
     }
+    if r.verbosity.is_some() {
+        dropped.feature(Feature::Verbosity);
+    }
 
     Value::Object(out)
 }

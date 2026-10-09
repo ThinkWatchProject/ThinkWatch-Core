@@ -81,6 +81,8 @@ pub struct Request {
     pub frequency_penalty: Option<f64>,
     pub reasoning: Option<Reasoning>,
     pub format: Option<Format>,
+    /// 回答写多写少（OpenAI GPT-5 系列的 `verbosity`）
+    pub verbosity: Option<Verbosity>,
     pub stream: bool,
     /// 提示缓存的断点，按出现顺序
     pub cache: Vec<CachePoint>,
@@ -147,6 +149,9 @@ pub struct ClientShape {
     pub include_usage: bool,
     /// Gemini 客户端要 SSE（`alt=sse`）；否则流是一个逐步写出的 JSON 数组
     pub gemini_sse: bool,
+    /// Responses 客户端自己执行的工具搜索（Codex 的 `tool_search`，`execution: client`）
+    /// 转成的函数工具叫什么。上游调用它时，写回去的是 `tool_search_call`，不是函数调用
+    pub tool_search: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +342,47 @@ pub enum Effort {
     High,
     XHigh,
     Max,
+}
+
+/// 回答写多写少。**只有 OpenAI 的 GPT-5 系列认**：Chat 的 `verbosity`、Responses 的
+/// `text.verbosity`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verbosity {
+    Low,
+    Medium,
+    High,
+}
+
+impl Verbosity {
+    pub fn parse(s: &str) -> Option<Verbosity> {
+        Some(match s {
+            "low" => Verbosity::Low,
+            "medium" => Verbosity::Medium,
+            "high" => Verbosity::High,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verbosity::Low => "low",
+            Verbosity::Medium => "medium",
+            Verbosity::High => "high",
+        }
+    }
+
+    /// 上游的这个模型认不认 `verbosity`：OpenAI 的 GPT-5 及以后（`gpt-5.4`、`openai/gpt-5`）。
+    ///
+    /// **按模型名判断，不按格式**：说 Chat 格式的绝大多数是别家的模型，不认的参数有的
+    /// 忽略、有的直接 400；GPT-4.1 这种 OpenAI 自己的老模型也是 400
+    pub fn understood_by(model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        let Some((_, rest)) = model.split_once("gpt-") else {
+            return false;
+        };
+        let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        major.parse::<u32>().is_ok_and(|m| m >= 5)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -585,6 +631,8 @@ pub enum Feature {
     FreeformFormat,
     /// 提示缓存的断点，目标模型不认
     Cache,
+    /// 回答写多写少，目标模型不认（见 [`Verbosity::understood_by`]）
+    Verbosity,
 }
 
 impl Feature {
@@ -643,6 +691,8 @@ impl Feature {
             (FreeformFormat, _) => "tools.custom.format",
             (Cache, Bedrock) => "cachePoint",
             (Cache, _) => "cache_control",
+            (Feature::Verbosity, Responses) => "text.verbosity",
+            (Feature::Verbosity, _) => "verbosity",
         }
     }
 }
