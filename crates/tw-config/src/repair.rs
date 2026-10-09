@@ -243,6 +243,42 @@ mod tests {
         assert!(try_parse(&r.text).is_ok());
     }
 
+    /// 0.67 删掉的两项故障转移设置（「开头慢就换下一家」和流开头的等待，并进了无响应超时）：
+    /// 写着它们的老配置读不进来，一键修复删掉它们，故障转移照默认值走
+    #[test]
+    fn the_removed_slow_start_settings_are_offered_for_deletion() {
+        let bad = format!(
+            "{GOOD}failover:\n  pause_secs: 90\n  stream_start_wait_secs: 30\n  next_on_slow_start: true\n"
+        );
+        let r = repair(&bad).expect("该修得了");
+        let got: Vec<_> = r
+            .fixes
+            .iter()
+            .map(|f| (f.kind, f.field.as_str(), f.value.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    FixKind::UnknownField,
+                    "failover.stream_start_wait_secs",
+                    Some("30")
+                ),
+                (
+                    FixKind::UnknownField,
+                    "failover.next_on_slow_start",
+                    Some("true")
+                ),
+            ]
+        );
+        assert_eq!(r.text, format!("{GOOD}failover:\n  pause_secs: 90\n"));
+        let cfg = try_parse(&r.text).unwrap();
+        assert_eq!(cfg.failover.idle_timeout_secs, 300);
+        // 只写了这两项的，删完连 `failover:` 一起去掉
+        let only = format!("{GOOD}failover:\n  next_on_slow_start: false\n");
+        assert_eq!(repair(&only).unwrap().text, GOOD);
+    }
+
     #[test]
     fn a_misspelled_field_in_a_list_item_is_removed() {
         let bad = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\n    colour: red\n";

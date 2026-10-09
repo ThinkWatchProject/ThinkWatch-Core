@@ -263,6 +263,22 @@ impl Affinity {
         self.upsert(&t.key, now_ms, |e| e.answer = Some(answer));
     }
 
+    /// `provider` 在这段对话上没了声音（无响应超时，见 `server::pipeline::idle`）：上次回答它
+    /// 的要是这一家，就不再记着 —— 这一轮接下来的请求照常排序，不会因为「上次回答的就是它」
+    /// 又被送回去。这一轮的路由决定照旧沿用
+    pub fn left(&self, c: &Conversation, provider: &str) {
+        self.forget(&c.key, provider);
+    }
+
+    fn forget(&self, key: &str, provider: &str) {
+        let mut map = self.lock();
+        if let Some(e) = map.get_mut(key)
+            && e.answer.as_ref().is_some_and(|a| a.provider == provider)
+        {
+            e.answer = None;
+        }
+    }
+
     fn upsert(&self, key: &str, now_ms: u64, f: impl FnOnce(&mut Entry)) {
         let mut map = self.lock();
         if !map.contains_key(key) && map.len() >= CAP {
@@ -315,6 +331,11 @@ impl Ticket {
     pub fn answered(self, cache: u64) {
         self.store.answered(&self, cache, crate::server::now_ms());
     }
+
+    /// 这一家答到一半没了声音：上次回答这段对话的要是它，不再记着（见 [`Affinity::left`]）
+    pub fn left(self) {
+        self.store.forget(&self.key, &self.provider);
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +347,28 @@ mod tests {
 
     fn conv(number: u32, within: bool) -> Conversation {
         Conversation::new("default", "对话", Turn { number, within })
+    }
+
+    /// 没了声音的那一家：这一轮不再留在它那儿，别家的回答不受影响
+    #[test]
+    fn a_provider_that_went_quiet_is_not_stayed_on() {
+        let a = Arc::new(Affinity::default());
+        let c = conv(1, true);
+        a.ticket(&c, None, "甲").answered(5000);
+        let stay = |a: &Affinity| {
+            let mut cands = vec!["乙".to_string(), "甲".to_string()];
+            a.stay(&c, None, &mut cands, |_| true, crate::server::now_ms())
+                .map(|_| cands[0].clone())
+        };
+        assert_eq!(stay(&a).as_deref(), Some("甲"));
+        a.left(&c, "乙");
+        assert_eq!(stay(&a).as_deref(), Some("甲"), "说的不是它，照旧");
+        a.left(&c, "甲");
+        assert_eq!(stay(&a), None);
+        // 通过回答的票据放开也一样
+        a.ticket(&c, None, "甲").answered(5000);
+        a.ticket(&c, None, "甲").left();
+        assert_eq!(stay(&a), None);
     }
 
     fn engine() -> Arc<Engine> {

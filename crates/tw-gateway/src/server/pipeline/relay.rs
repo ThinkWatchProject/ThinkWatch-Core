@@ -7,6 +7,10 @@
 //!
 //! 这些步骤要不要做、怎么做，在响应头到手的那一刻就全定了（[`Plan`]）；
 //! 流里每一块怎么处理在 [`Relay`] 上，`respond` 里的流只剩一个循环。
+//!
+//! 那个循环还看着两件事：上游多久没有内容（无响应超时，见 [`super::idle`]），和这个请求有
+//! 没有被手动中止（见 [`crate::abort`]）。哪一件到了都丢掉上游的流，按客户端的格式补一条
+//! 错误收尾。
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -47,6 +51,7 @@ pub(super) fn respond(
         refusal,
         slot,
         sent_at,
+        unconfirmed,
         ..
     } = served;
     let status =
@@ -159,6 +164,12 @@ pub(super) fn respond(
         && status.is_success())
     .then_some(state.ping_every);
     let ping_for = state.ping_for;
+    // 无响应超时：从这一跳发出去算起，每来一段真内容重新计时（见 `super::idle`）。真内容按
+    // 上游的格式认；不是流的回答，有一个不是空白的字节就算
+    let quiet = super::idle::Quiet::of(state, rt);
+    let mut pulse = crate::pulse::Pulse::new(plan.is_sse.then_some(upstream_dialect));
+    let abort = req.abort.clone();
+    let (bus, health) = (state.bus.clone(), state.health.clone());
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
@@ -180,24 +191,54 @@ pub(super) fn respond(
         // 半开的连接永远等不到下一个字节，一直补心跳的话客户端也永远不会放弃，这个
         // 请求就挂在那儿了。停下之后由客户端自己的静默计时来断
         let mut upstream_since = tokio::time::Instant::now();
+        // 到这一刻还没有真内容就不再等（见 `super::idle`）
+        let mut quiet_by = quiet.after(sent_at);
+        // 上游给过真内容了没有：没给过的超时还是这一家的失败，给过的是答到一半停住了
+        let mut said = false;
+        // 被手动中止了（结局报手动中止，不说「流断了」）
+        let mut aborted = false;
+        // 这一家的成败还没记（最后一家不压开头，见 `hop`）：第一段真内容到了记成功
+        let mut unconfirmed = unconfirmed;
         loop {
-            let next = match ping_every {
-                None => chunks.next().await,
-                // `next()` 被超时丢掉不丢数据：它只是去问一次流，没拿走任何东西
-                Some(every) => match tokio::time::timeout_at(quiet_since + every, chunks.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        // 停在一帧中间时这一轮不补，也要重新计时，否则会原地空转
-                        quiet_since = tokio::time::Instant::now();
-                        // **不经过留档、计量和审查**：心跳不是上游说的话，不进请求记录，
-                        // 也不算输出。**只在帧的边界上插**，上游停在一帧中间时插进去
-                        // 会把那一帧拆坏 —— 那时宁可不补
-                        if relay.between_frames() && upstream_since.elapsed() < ping_for {
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(PING));
-                        }
-                        continue;
+            // 补心跳的那一刻。不补的格式给一个不会用到的时刻，那一支不参与
+            let ping_at = ping_every.map_or(quiet_by, |every| quiet_since + every);
+            let next = tokio::select! {
+                // 先看上游：已经到了的那一块不因为同时到点而丢掉
+                biased;
+                next = chunks.next() => next,
+                _ = abort.wait() => {
+                    aborted = true;
+                    broke = Some(GatewayError::aborted().in_dialect(dialect));
+                    break;
+                }
+                _ = tokio::time::sleep_until(quiet_by) => {
+                    let why = if said {
+                        super::idle::stalled(&upstream_name, quiet.secs)
+                    } else {
+                        // 一个字都没给：和压着开头时超时一样，这一家记一次失败
+                        crate::server::note_health(
+                            &bus,
+                            &health,
+                            &upstream_name,
+                            health.record_failure(&upstream_name),
+                        );
+                        super::idle::said(&upstream_name, quiet.secs)
+                    };
+                    ending.went_quiet();
+                    broke = Some(GatewayError::timeout(why).in_dialect(dialect));
+                    break;
+                }
+                _ = tokio::time::sleep_until(ping_at), if ping_every.is_some() => {
+                    // 停在一帧中间时这一轮不补，也要重新计时，否则会原地空转
+                    quiet_since = tokio::time::Instant::now();
+                    // **不经过留档、计量和审查**：心跳不是上游说的话，不进请求记录，
+                    // 也不算输出。**只在帧的边界上插**，上游停在一帧中间时插进去
+                    // 会把那一帧拆坏 —— 那时宁可不补
+                    if relay.between_frames() && upstream_since.elapsed() < ping_for {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(PING));
                     }
-                },
+                    continue;
+                }
             };
             let Some(item) = next else { break };
             // eventstream 拆成 SSE。一帧没收齐时这一块什么都转不出来，等下一块
@@ -218,6 +259,19 @@ pub(super) fn respond(
             match item {
                 Ok(chunk) => {
                     upstream_since = tokio::time::Instant::now();
+                    // 真内容才重新计时：心跳、开头的例行事件不算
+                    if pulse.feed(&chunk) {
+                        said = true;
+                        quiet_by = quiet.after(std::time::Instant::now());
+                        if std::mem::take(&mut unconfirmed) {
+                            crate::server::note_health(
+                                &bus,
+                                &health,
+                                &upstream_name,
+                                health.record_success(&upstream_name),
+                            );
+                        }
+                    }
                     // **旁路嗅探和留档，不缓冲**：字节照常流向客户端，同时
                     // 喂它一份。上游返回的 usage 是真相，而拿不到它就只能估。
                     //
@@ -252,6 +306,15 @@ pub(super) fn respond(
         }
         // 响应体留档和结束事件都在 `ending` 里：三种结局要交出去的是同一份
         // 东西，分开写就会有一种漏掉
+        // 一段真内容都没有就好好收了尾：也是答上了
+        if unconfirmed && broke.is_none() {
+            crate::server::note_health(
+                &bus,
+                &health,
+                &upstream_name,
+                health.record_success(&upstream_name),
+            );
+        }
         match broke {
             None => ending.finished(status.as_u16()),
             Some(err) => {
@@ -264,8 +327,11 @@ pub(super) fn respond(
                 // `source` 用这个错误自己的：上游断了是 `upstream`，被
                 // 防火墙切断是 `denied` —— 后者不是上游坏了，是策略拦的。
                 // 码保持不变，只在句子前面点明它断在流里 —— 界面认的是码
+                // 手动中止的不是流断了：原句照报，记录里是那个码
                 let mut why = err.detail.clone();
-                why.text = format!("the response stream broke: {}", why.text);
+                if !aborted {
+                    why.text = format!("the response stream broke: {}", why.text);
+                }
                 ending.failed(err.source.into(), why);
                 if let Some(frame) = relay.error_tail(&err) {
                     yield Ok(Bytes::from(relay.plugins_tail(&frame)));

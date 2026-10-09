@@ -510,6 +510,13 @@ if [ "$ID" != "0" ]; then
   C=$(get "/request/$ID"); [ "$C" = "200" ] && ok "GET /request/{id}" || bad "返回 $C"
   C=$(post /replay/quote "{\"id\":$ID,\"provider\":\"official\"}")
   [ "$C" = "200" ] && ok "POST /replay/quote" || bad "返回 $C"
+  # 中止：注册着、认得出跑完了的请求（404 带着自己的码），不是 405 或者没有这个端点
+  C=$(post "/request/$ID/abort" '{}')
+  [ "$C" = "404" ] && grep -q 'control.request_not_running' "$TMP/out" \
+    && ok "POST /request/{id}/abort 说跑完了的请求不在跑" || bad "返回 $C" "$(head -c 200 "$TMP/out")"
+  C=$(post "/sessions/no-such-session/abort" '{}')
+  [ "$C" = "404" ] && grep -q 'control.session_not_running' "$TMP/out" \
+    && ok "POST /sessions/{id}/abort 说没有在跑的" || bad "返回 $C" "$(head -c 200 "$TMP/out")"
 else
   bad "历史里一条记录都没有"
 fi

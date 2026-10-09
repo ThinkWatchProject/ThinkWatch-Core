@@ -1201,8 +1201,7 @@ pub fn write(path: &Path, cfg: &Config) -> Result<(), WriteError> {
 }
 
 pub use failover::{
-    Failover, MAX_PAUSE_SECS, MAX_SLOT_WAIT_SECS, MAX_STREAM_START_WAIT_SECS,
-    MIN_SLOW_START_WAIT_SECS,
+    Failover, MAX_IDLE_TIMEOUT_SECS, MAX_PAUSE_SECS, MAX_SLOT_WAIT_SECS, MIN_IDLE_TIMEOUT_SECS,
 };
 pub use probes::{ClientProbes, ProbeAction};
 pub use reload::{Rejected, Stage, stand_in, try_parse};

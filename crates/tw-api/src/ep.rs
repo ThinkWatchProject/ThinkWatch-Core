@@ -60,6 +60,9 @@ endpoints! {
     /// 延迟与速度，各带样本数和别家的参照。不给时间窗是最近 7 天
     UpstreamHealth: GET "/upstreams/health", api::Window => api::UpstreamHealth;
     RequestDetail: GET "/request/{id}" [id], () => api::RequestDetail;
+    /// 中止一个在跑的请求：和上游的连接断开，客户端收到错误，请求记成手动中止。已经
+    /// 结束了的是 404
+    AbortRequest: POST "/request/{id}/abort" [id], () => api::Aborted;
     /// 把一条记录变成回放用例（YAML）
     Fixture: GET "/request/{id}/fixture" [id], () => String, text;
     Sessions: GET "/sessions", api::ListQuery => Vec<api::SessionView>;
@@ -67,6 +70,8 @@ endpoints! {
     /// 一次会话读成一段对话：每一轮新说的话、回答、工具调用和结果（已脱敏）。可以只要
     /// 从某一轮起的那些
     SessionTranscript: GET "/sessions/{id}/transcript" [id], api::TranscriptQuery => api::Transcript;
+    /// 中止一次会话里所有在跑的请求。一个都没有是 404
+    AbortSession: POST "/sessions/{id}/abort" [id], () => api::Aborted;
 
     // ─────────────────────────────────────────────── 测速、回放、试路由
     SpeedQuote: POST "/speed/quote", api::SpeedRunRequest => api::SpeedQuote;

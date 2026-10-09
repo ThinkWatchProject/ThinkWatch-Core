@@ -248,6 +248,11 @@ pub struct AppState {
     pub ping_for: std::time::Duration,
     /// 跑插件的线程池（见 [`crate::plugin::pool`]）。**跨重载存活**；线程第一次用到时才起
     pub plugin_pool: Arc<crate::plugin::pool::Pool>,
+    /// 此刻在跑、可以手动中止的请求（见 [`crate::abort`]）。**跨重载存活**
+    pub aborts: Arc<crate::abort::Aborts>,
+    /// `failover.idle_timeout_secs` 的一秒有多长（见 `server::pipeline::idle`）。**测试会把它
+    /// 调短**，否则一条无响应超时的测试至少要干等三十秒
+    pub idle_tick: std::time::Duration,
 }
 
 impl AppState {
@@ -315,6 +320,8 @@ impl AppState {
             ping_every: crate::PING_EVERY,
             ping_for: crate::PING_FOR,
             plugin_pool: Arc::new(crate::plugin::pool::Pool::default_size()),
+            aborts: Default::default(),
+            idle_tick: std::time::Duration::from_secs(1),
         };
         // 手写的清单马上可用；向上游问是后台的事，不挡启动
         state.publish_catalog();

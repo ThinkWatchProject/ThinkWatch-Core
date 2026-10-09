@@ -5,6 +5,7 @@
 //! 就把接缝留对**：`forward` 已经按「选中的 provider」取参数，M1 加路由
 //! 时只需要换掉挑选逻辑。
 
+pub mod abort;
 pub mod access;
 pub mod affinity;
 pub mod answer_model;
@@ -39,6 +40,7 @@ pub mod oauth;
 pub mod outbound;
 pub mod plugin;
 pub mod probe;
+mod pulse;
 pub mod quota;
 pub mod quote;
 pub mod seal;

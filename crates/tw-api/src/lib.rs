@@ -224,6 +224,11 @@ slug_enum! {
         Request = "request",
         RateLimited = "rate_limited",
         Denied = "denied",
+        /// 在界面上手动中止的（`POST /request/{id}/abort`、`POST /sessions/{id}/abort`）。
+        /// **不是上游的错**：那一家不停用、不算失败；和客户端自己走掉（`RequestCancelled`）
+        /// 也不是一回事。`message` 是 [`ABORTED`] 那个码。还没开始回答的，客户端收到 499；
+        /// 回答到一半的，按它的格式以一条错误收尾
+        Aborted = "aborted",
         /// 网关自己的代码崩掉了
         Internal = "internal",
     }
@@ -814,7 +819,22 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `config.manual_model_blank`、`_padded`、`_wildcard`、`_duplicate`、`_too_long`（400），
 /// 整份配置的校验也查这几条。`source` 是 `discovered` 时 `models` 里也有手动添加的那些。
 /// 照 41 写的界面分不出哪些模型是手动添加的。
-pub const CONTROL_API_VERSION: u32 = 42;
+///
+/// **43 起上游不出声有了上限，请求能手动中止**：[`FailoverView`] 的 `stream_start_wait_secs`
+/// 和 `next_on_slow_start` 删了，换成 `idle_timeout_secs`（无响应超时，默认 300 秒，30 到
+/// 3600）：从请求发出去起算，每来一段内容重新计时，心跳不算。客户端还什么都没收到时，这一家
+/// 记一次失败、换下一家，没有下一家了回 504；已经收到一部分的，回答按客户端的格式以错误收尾。
+/// 配置里写 `stream_start_wait_secs`、`next_on_slow_start` 加载不了（不认识的字段，一键修复删掉
+/// 它们），消息码 `config.slow_start_too_short`、`gw.slow_start` 跟着删。尝试链的结果
+/// （[`AttemptOutcome`]）删了 `slow_start`，多了 `idle_timeout`（说等了多少秒的
+/// `gw.upstream.idle_timeout`）和 `aborted`。新端点 `POST /request/{id}/abort` 和
+/// `POST /sessions/{id}/abort`（→ [`Aborted`]）叫停一个在跑的请求、一次会话里所有在跑的请求：
+/// 和上游的连接立刻断开，客户端收到它自己格式的错误（还没开始回答的是 499），请求照常报
+/// [`Event::RequestFailed`]，`source` 是新的 [`FailureSource::Aborted`]、`message` 是
+/// [`ABORTED`]，上游不停用。已经结束了的回 404（`control.request_not_running`、
+/// `control.session_not_running`）。流中途停了的另有 `gw.upstream.idle_timeout_mid_stream`。
+/// 照 42 写的界面读不到 `idle_timeout_secs`，不认 `aborted` 这个来源。
+pub const CONTROL_API_VERSION: u32 = 43;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1515,11 +1535,17 @@ slug_enum! {
         /// （`status` 是它回的那个）。尝试链到此为止，这一行记成网关自己答的
         /// （[`HistoryRow::local`]），费用 0
         Estimated = "estimated",
-        /// 流式回答等了 `failover.stream_start_wait_secs` 还没有内容，开着
-        /// `failover.next_on_slow_start`，放弃这一家、换下一家（连接断开，上游不再生成）。
-        /// 响应头到了的有 `status`，没到的没有。**这一家不停用、不算失败**。上游可能已经按
-        /// 输入收了钱：知道多少的在 `usage` 里
-        SlowStart = "slow_start",
+        /// 从请求发出去起 `failover.idle_timeout_secs` 秒没有内容（无响应超时），客户端也还
+        /// 什么都没收到：放弃这一家（连接断开，上游不再生成），换下一家，没有下一家了就回
+        /// 超时错误。响应头到了的有 `status`，没到的没有。`error` 是 `gw.upstream.idle_timeout`，
+        /// 说等了多少秒。**这一家记一次失败**（和 5xx 一样算进停用的账）。上游可能已经按输入
+        /// 收了钱：知道多少的在 `usage` 里
+        IdleTimeout = "idle_timeout",
+        /// 这一跳在等上游时被手动中止（`POST /request/{id}/abort`、`POST /sessions/{id}/abort`）：
+        /// 连接断开，上游不再生成，尝试链到此为止。**这一家不停用、不算失败**。已经接下、
+        /// 在交回答的那一跳不改成它（还是 `served`），请求本身记成手动中止（见
+        /// [`FailureSource::Aborted`]）
+        Aborted = "aborted",
     }
 }
 
@@ -1545,11 +1571,12 @@ pub struct AttemptView {
     /// 上游返回的状态码。`error` 时没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句。`slow_start` 时说等了多久
+    /// `error` 时的说明。和这一跳报给客户端的那条错误是同一句。`idle_timeout` 时说等了多久，
+    /// `aborted` 时是 `gw.request.aborted`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Msg>,
     pub ms: u64,
-    /// 放弃了的这一跳（`slow_start`）上游可能已经收了钱的输入（见 [`AttemptUsage`]）。估不
+    /// 放弃了的这一跳（`idle_timeout`）上游可能已经收了钱的输入（见 [`AttemptUsage`]）。估不
     /// 出来的（请求解不开）没有。别的结果都没有：接下请求的那一跳的用量在结局里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AttemptUsage>,
@@ -1575,12 +1602,19 @@ pub const FAILED_AFTER_SENDING: &[&str] = &[
     "gw.upstream.stream_opening_error",
 ];
 
+/// 手动中止的请求报的码（[`FailureSource::Aborted`] 的 `message`，尝试链上 `aborted` 那一跳的
+/// `error`）。记录里只存码，上游体检按它把手动中止的和客户端取消的一样数，不算上游失败
+pub const ABORTED: &str = "gw.request.aborted";
+
 impl AttemptView {
-    /// 这一跳发到了上游：上游回了话（`served`、`status`、`slow_start`，`estimated` 里带着
+    /// 这一跳发到了上游：上游回了话（`served`、`status`、`idle_timeout`、`aborted`，`estimated` 里带着
     /// 状态码的），或者发出去之后才失败（[`FAILED_AFTER_SENDING`]）。
     pub fn sent(&self) -> bool {
         match self.outcome {
-            AttemptOutcome::Served | AttemptOutcome::Status | AttemptOutcome::SlowStart => true,
+            AttemptOutcome::Served
+            | AttemptOutcome::Status
+            | AttemptOutcome::IdleTimeout
+            | AttemptOutcome::Aborted => true,
             AttemptOutcome::Estimated => self.status.is_some(),
             AttemptOutcome::Error => {
                 self.skipped.is_none()
@@ -1609,7 +1643,7 @@ impl RoutingView {
     }
 }
 
-/// 放弃了的一跳（[`AttemptOutcome::SlowStart`]）上游可能已经收了钱的输入。
+/// 放弃了的一跳（[`AttemptOutcome::IdleTimeout`]）上游可能已经收了钱的输入。
 ///
 /// 上游在流开头报了的（Anthropic 的 `message_start`）是它报的数；没报的只有 `input`，是网关
 /// 估的（`estimated`，和 [`Event::RequestStarted`] 的 `input_estimate` 同一个数）。**输出不知道**：
@@ -1841,6 +1875,17 @@ pub struct InFlightRequest {
     pub events: Vec<Event>,
 }
 
+/// 手动中止（`POST /request/{id}/abort`、`POST /sessions/{id}/abort`）叫停了哪几个请求。
+///
+/// **叫停是立刻的，结局随后到**：每个请求照常报一条 [`Event::RequestFailed`]（`source` 是
+/// [`FailureSource::Aborted`]），通常在这条响应之前或紧跟着。叫停之后才跑完的不改。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Aborted {
+    /// 叫停的请求号，开始得早的在前
+    pub requests: Vec<u64>,
+}
+
 /// 配置文件没通过校验的那一次。字段和 [`Event::ConfigRejected`] 一样。
 ///
 /// **只记外部改动**（在编辑器里改的、命令行写的）：界面自己写坏的根本没落盘，
@@ -1973,7 +2018,7 @@ pub struct RetentionView {
     pub body_bytes_now: u64,
 }
 
-/// 上游失败之后停用多久、流开头最多等多久。和配置的 `failover` 一一对应，
+/// 上游失败之后停用多久、多久没有内容就不再等。和配置的 `failover` 一一对应，
 /// 没写的是默认值 —— **界面显示的就是真在用的数**，不是「空 = 默认」。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1990,10 +2035,9 @@ pub struct FailoverView {
     pub quota_pause_secs: u64,
     /// 限流时按 `Retry-After` 停用，最多多少秒
     pub rate_limit_max_pause_secs: u64,
-    /// 流式回答的开头最多等多少秒
-    pub stream_start_wait_secs: u64,
-    /// 等过 `stream_start_wait_secs` 还没有内容就换下一家（最后一家照常等）
-    pub next_on_slow_start: bool,
+    /// 上游多少秒没有内容就不再等它（无响应超时）：从请求发出去起算，每来一段内容重新
+    /// 计时。客户端还什么都没收到时换下一家，已经收到一部分的报错收尾
+    pub idle_timeout_secs: u64,
     /// 一个请求合计最多等多少秒：等密钥的分钟、小时上限空出名额，和等满着（`max_concurrent`）
     /// 的上游空出位置，共用这一段。0 是不等
     pub slot_wait_secs: u64,
@@ -5833,7 +5877,9 @@ mod tests {
         for a in [
             attempt(Served, Some(200), None),
             attempt(Status, Some(503), None),
-            attempt(SlowStart, None, Some("gw.slow_start")),
+            attempt(IdleTimeout, None, Some("gw.upstream.idle_timeout")),
+            attempt(IdleTimeout, Some(200), Some("gw.upstream.idle_timeout")),
+            attempt(Aborted, None, Some("gw.request.aborted")),
             attempt(Estimated, Some(404), None),
             attempt(Error, None, Some("gw.upstream.timeout")),
             attempt(Error, None, Some("gw.upstream.stream_opening_error")),

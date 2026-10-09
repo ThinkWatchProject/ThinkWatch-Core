@@ -21,10 +21,10 @@ use tw_types::msg;
 
 mod admission;
 mod hop;
+mod idle;
 mod opening;
 mod plug;
 mod relay;
-mod slow;
 
 pub(crate) use hop::stream_fault;
 
@@ -41,6 +41,8 @@ pub(super) struct Inbound {
     pub(super) dialect: tw_dialect::ir::Dialect,
     pub(super) started: std::time::Instant,
     pub(super) from: Sender,
+    /// 手动中止的开关（见 [`crate::abort`]）：开始之后登记上，等上游、交回答时看着它
+    pub(super) abort: crate::abort::Switch,
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -54,6 +56,9 @@ struct Started {
     choice: Choice,
     /// 这是哪段对话（见 [`crate::affinity::identity`]）。认不出来是 None
     conversation: Option<String>,
+    /// 这段对话的这一轮（见 [`crate::affinity`]）：一家没有内容超时了，这一轮就不再留在它
+    /// 那儿。数不出轮次的没有
+    turn: Option<crate::affinity::Conversation>,
     /// 出站脱敏的账本：拦截档下按客户端原文编好了号，每一跳接着它换（见
     /// [`crate::guard::look`]）。别的档位是空的
     ledger: tw_guard::redact::replace::Ledger,
@@ -160,7 +165,7 @@ pub(super) async fn pipeline(
             choice,
             wait_until,
             &decision,
-            fp.as_deref(),
+            (fp.as_deref(), conv.clone()),
             ending,
         );
         (screening, started)
@@ -814,7 +819,7 @@ fn start(
     choice: Choice,
     wait_until: tokio::time::Instant,
     decision: &tw_engine::Decision,
-    fp: Option<&str>,
+    (fp, turn): (Option<&str>, Option<crate::affinity::Conversation>),
     ending: &mut Option<crate::ending::Ending>,
 ) -> Started {
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
@@ -872,6 +877,7 @@ fn start(
         alive,
         choice,
         conversation: crate::affinity::identity(&req.headers, fp),
+        turn,
         ledger,
         found,
         hits: hits.filter(|_| redact_mode.acts()),
@@ -922,13 +928,14 @@ fn open(
     let facts = &reading.facts;
     let id = state.bus.next_id();
     let at_ms = now_ms();
+    let session = fp.map(|fp| state.sessions.assign(fp, at_ms));
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
         client: req.client_name.clone(),
         // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
         // 不参与鉴权、路由、配额（见 crate::hint）。
         client_hint: crate::hint::client_hint(&req.headers),
-        session: fp.map(|fp| state.sessions.assign(fp, at_ms)),
+        session: session.clone(),
         peer: req.from.peer.clone(),
         key_masked: req.from.key.clone(),
         route: choice.route.clone(),
@@ -958,6 +965,8 @@ fn open(
         sink.clone(),
     );
     end.redact_with(redaction.clone());
+    // 从这一刻起可以手动中止：登记跟着结局走，结局报了就不在跑了（见 `crate::abort`）
+    end.abortable(state.aborts.enter(id, session, req.abort.clone()));
     *ending = Some(end);
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步

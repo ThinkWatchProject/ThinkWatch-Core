@@ -1,4 +1,4 @@
-//! 流式回答的开头：**第一段内容到达之前，上游在流里报的错误照样换下一家。**
+//! 回答的开头：**第一段内容到达之前，上游在流里报的错误照样换下一家；一直没有内容，也换。**
 //!
 //! 上游回了 200、流也开了，之后第一个事件却是错误 —— Anthropic 过载时的
 //! `overloaded_error`、Codex 额度用完时的 `response.failed`、Bedrock 的
@@ -7,12 +7,16 @@
 //!
 //! 所以响应头到手之后先不转发：把流读到第一段内容为止，读到的字节原样留着。
 //! 期间是错误就换下一家；是内容，就把留着的字节和后面的流接在一起交出去 ——
-//! 客户端收到的和直接转发一个字节都不差。
+//! 客户端收到的和直接转发一个字节都不差。什么是内容、什么是开头的例行事件和心跳，
+//! 和无响应超时是同一个判据（见 [`crate::pulse`]）。
 //!
-//! 等待有上限（配置的 `failover.stream_start_wait_secs`，以及 [`HOLD_LIMIT`]）：
-//! 上游迟迟不出内容时不能一直压着，那样客户端看到的就是一个卡住的请求。等到点了是
-//! [`Opening::Slow`]：开着 `failover.next_on_slow_start` 时由调用方放弃这一家、换下一家，
-//! 不开就和内容来了一样交出去。
+//! 等到无响应超时那一刻（`failover.idle_timeout_secs`，从请求发出去算起）还没有内容是
+//! [`Opening::Slow`]：调用方放弃这一家、换下一家。**最后一家不在这里等**（见 `hop`）：没有
+//! 下一家可换，压着它只会让客户端晚一点看到同样的东西。开头压得太多（[`HOLD_LIMIT`]）也不
+//! 再压，交出去由回程照常计时。
+//!
+//! 整包的回答（不是流）也一样等：响应头先到、正文迟迟不来的上游，等到点了换下一家（见
+//! [`first_bytes`]）。
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -27,9 +31,9 @@ pub(super) const HOLD_LIMIT: usize = 1024 * 1024;
 pub(super) enum Opening {
     /// 内容来了（或者流结束了、开头压得太多了）：交给客户端。读过的字节已经接回去了
     Go(reqwest::Response),
-    /// 等到点了还没有内容。`response` 和 [`Opening::Go`] 的一样，照旧交出去就是不换家；
-    /// **丢掉它就断开了和上游的连接**，上游不再接着生成。`usage` 是开头里上游报了的用量
-    /// （Anthropic 的 `message_start` 带着输入），没报是 None
+    /// 等到无响应超时那一刻还没有内容。**丢掉 `response` 就断开了和上游的连接**，上游不再
+    /// 接着生成。`usage` 是开头里上游报了的用量（Anthropic 的 `message_start` 带着输入），
+    /// 没报是 None
     Slow {
         response: reqwest::Response,
         usage: Option<tw_dialect::usage::Usage>,
@@ -51,8 +55,8 @@ pub(super) enum Opening {
     Broken(GatewayError),
 }
 
-/// 读到第一段内容为止，最多等到 `deadline`。`dialect` 是上游说的格式，`eventstream`
-/// 表示流是 Bedrock 的二进制帧。
+/// 读到第一段内容为止，最多等到 `deadline`（无响应超时的那一刻）。`dialect` 是上游说的
+/// 格式，`eventstream` 表示流是 Bedrock 的二进制帧。
 pub(super) async fn watch(
     r: reqwest::Response,
     dialect: Dialect,
@@ -140,6 +144,48 @@ pub(super) async fn watch(
     }
 }
 
+/// 整包的回答（不是流）：等到正文的第一个不是空白的字节，最多等到 `deadline`（无响应超时
+/// 的那一刻）。到了是 [`Opening::Go`]，读过的字节接回去；到点了还没有是 [`Opening::Slow`]。
+///
+/// 只发空格保活的中转站，空格不算（见 [`crate::pulse`]）。整包的回答不会在正文里报一个
+/// 「开头的错误」，所以这里没有 [`Opening::Failed`]。
+pub(super) async fn first_bytes(r: reqwest::Response, deadline: tokio::time::Instant) -> Opening {
+    let status = r.status();
+    let headers = r.headers().clone();
+    let mut stream = r.bytes_stream();
+    let mut held: Vec<Bytes> = Vec::new();
+    let mut size = 0usize;
+    let mut pulse = crate::pulse::Pulse::new(None);
+    let slow = loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => break true,
+            Ok(None) => break false,
+            Ok(Some(Err(e))) => return Opening::Broken(crate::forward::map_reqwest_error(e)),
+            Ok(Some(Ok(chunk))) => {
+                size += chunk.len();
+                let said = pulse.feed(&chunk);
+                held.push(chunk);
+                if said || size >= HOLD_LIMIT {
+                    break false;
+                }
+            }
+        }
+    };
+    let replay = futures::stream::iter(held.into_iter().map(Ok::<_, reqwest::Error>));
+    let mut resp = http::Response::new(reqwest::Body::wrap_stream(replay.chain(stream)));
+    *resp.status_mut() = status;
+    *resp.headers_mut() = headers;
+    let response = reqwest::Response::from(resp);
+    if slow {
+        Opening::Slow {
+            response,
+            usage: None,
+        }
+    } else {
+        Opening::Go(response)
+    }
+}
+
 /// 一个事件是什么。
 #[derive(Debug, PartialEq)]
 enum Judge {
@@ -156,7 +202,8 @@ enum Judge {
     },
 }
 
-/// 看一个 SSE 事件。
+/// 看一个 SSE 事件：上游报的错，内容，还是开头的例行事件和心跳（后两样的判据在
+/// [`crate::pulse::advances`]，和无响应超时同一个）。
 fn judge(dialect: Dialect, event: Option<&str>, data: &str) -> Judge {
     let data = data.trim();
     if data.is_empty() {
@@ -172,82 +219,70 @@ fn judge(dialect: Dialect, event: Option<&str>, data: &str) -> Judge {
         .map(str::to_string)
         .or_else(|| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
         .unwrap_or_default();
+    if let Some(e) = error_in(dialect, &ty, &v, data) {
+        return e;
+    }
+    if crate::pulse::advances(dialect, &ty, &v) {
+        Judge::Content
+    } else {
+        Judge::Preamble
+    }
+}
+
+/// 这个事件是不是上游报的错：是的话，那个错误对应的状态码和上游的原话
+fn error_in(dialect: Dialect, ty: &str, v: &serde_json::Value, data: &str) -> Option<Judge> {
     match dialect {
-        Dialect::Anthropic => match ty.as_str() {
-            "message_start" | "ping" => Judge::Preamble,
-            "error" => {
-                let e = v.get("error").unwrap_or(&v);
-                let kind = text_of(e, "type");
-                error(anthropic_status(&kind), data, kind, text_of(e, "message"))
-            }
-            _ => Judge::Content,
-        },
-        Dialect::Responses => match ty.as_str() {
-            "response.created" | "response.in_progress" | "response.queued" => Judge::Preamble,
-            // Codex 后端在开头报一次额度，不是回答
-            t if t.starts_with("codex.") => Judge::Preamble,
+        Dialect::Anthropic => (ty == "error").then(|| {
+            let e = v.get("error").unwrap_or(v);
+            let kind = text_of(e, "type");
+            error(anthropic_status(&kind), data, kind, text_of(e, "message"))
+        }),
+        Dialect::Responses => match ty {
             "response.failed" => {
-                let e = v.pointer("/response/error").unwrap_or(&v);
+                let e = v.pointer("/response/error").unwrap_or(v);
                 let kind = text_of(e, "code");
-                error(openai_status(&kind), data, kind, text_of(e, "message"))
+                Some(error(
+                    openai_status(&kind),
+                    data,
+                    kind,
+                    text_of(e, "message"),
+                ))
             }
             "error" => {
-                let e = v.get("error").unwrap_or(&v);
+                let e = v.get("error").unwrap_or(v);
                 let kind = Some(text_of(e, "code"))
                     .filter(|c| !c.is_empty())
                     .unwrap_or_else(|| text_of(e, "type"));
-                error(openai_status(&kind), data, kind, text_of(e, "message"))
+                Some(error(
+                    openai_status(&kind),
+                    data,
+                    kind,
+                    text_of(e, "message"),
+                ))
             }
-            _ => Judge::Content,
+            _ => None,
         },
-        Dialect::Chat => {
-            if let Some(e) = v.get("error") {
-                let kind = Some(text_of(e, "code"))
-                    .filter(|c| !c.is_empty())
-                    .unwrap_or_else(|| text_of(e, "type"));
-                let status = e
-                    .get("code")
-                    .and_then(|c| c.as_u64())
-                    .and_then(|c| u16::try_from(c).ok())
-                    .filter(|c| (400..600).contains(c))
-                    .unwrap_or_else(|| openai_status(&kind));
-                return error(status, data, kind, text_of(e, "message"));
-            }
-            // 只有角色、没有内容的第一块（多数兼容接口都先发这么一块）还不算内容
-            let delta = v.pointer("/choices/0/delta");
-            let finished = v
-                .pointer("/choices/0/finish_reason")
-                .is_some_and(|f| !f.is_null());
-            let said = delta.is_some_and(|d| {
-                ["content", "reasoning_content", "reasoning", "tool_calls"]
-                    .iter()
-                    .any(|k| d.get(*k).is_some_and(|x| !x.is_null() && x != ""))
-            });
-            let usage_only = v.get("usage").is_some_and(|u| !u.is_null())
-                && v.get("choices")
-                    .and_then(|c| c.as_array())
-                    .is_none_or(|c| c.is_empty());
-            if said || finished || usage_only {
-                Judge::Content
-            } else {
-                Judge::Preamble
-            }
-        }
-        Dialect::Gemini => match v.get("error") {
-            Some(e) => {
-                let status = e
-                    .get("code")
-                    .and_then(|c| c.as_u64())
-                    .and_then(|c| u16::try_from(c).ok())
-                    .unwrap_or(500);
-                error(status, data, text_of(e, "status"), text_of(e, "message"))
-            }
-            None => Judge::Content,
-        },
-        Dialect::Bedrock => match ty.as_str() {
-            "messageStart" => Judge::Preamble,
-            _ => Judge::Content,
-        },
+        Dialect::Chat => v.get("error").map(|e| {
+            let kind = Some(text_of(e, "code"))
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| text_of(e, "type"));
+            let status = e
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .filter(|c| (400..600).contains(c))
+                .unwrap_or_else(|| openai_status(&kind));
+            error(status, data, kind, text_of(e, "message"))
+        }),
+        Dialect::Gemini => v.get("error").map(|e| {
+            let status = e
+                .get("code")
+                .and_then(|c| c.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .unwrap_or(500);
+            error(status, data, text_of(e, "status"), text_of(e, "message"))
+        }),
+        Dialect::Bedrock => None,
     }
 }
 
@@ -524,8 +559,39 @@ mod tests {
         }
     }
 
+    /// 整包的回答：先到的空格不算，到点了没有正文是 Slow；正文来了照原样交出去
     #[tokio::test]
-    async fn a_thinking_delta_is_content_not_a_slow_start() {
+    async fn a_whole_answer_waits_for_its_first_real_byte() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        assert!(matches!(
+            first_bytes(stalled("  \n"), deadline).await,
+            Opening::Slow { usage: None, .. }
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        match first_bytes(served("  {\"id\":1}").await, deadline).await {
+            Opening::Go(r) => assert_eq!(r.text().await.unwrap(), "  {\"id\":1}"),
+            _ => panic!("该放行"),
+        }
+        // 空的正文也放行：交出去由回程照常收尾
+        assert!(matches!(
+            first_bytes(served("").await, deadline).await,
+            Opening::Go(_)
+        ));
+    }
+
+    /// Gemini 只带用量的块不算开口（和无响应超时同一个判据）
+    #[tokio::test]
+    async fn a_gemini_usage_only_chunk_is_not_the_first_content() {
+        let head = "data: {\"usageMetadata\":{\"promptTokenCount\":10}}\r\n\r\n";
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        assert!(matches!(
+            watch(stalled(head), Dialect::Gemini, false, deadline).await,
+            Opening::Slow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_thinking_delta_is_content_and_a_role_chunk_is_not() {
         // Chat 格式的推理字（DeepSeek、Qwen 的 `reasoning_content`）也是模型开口了
         let head = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
                     data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\n";
