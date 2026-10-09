@@ -9,7 +9,7 @@
 //! | 输入项 | 转成 |
 //! |---|---|
 //! | `additional_tools` | 里面的工具和顶层 `tools` 一样解码。Responses Lite 只在这里声明工具，顶层没有 `tools`；对话里可以有好几个（增量声明） |
-//! | `message` | `system`、`developer` 并进系统提示，别的是一轮对话。`phase`（commentary、final_answer）别家没有，文字照留 |
+//! | `message` | 开头连着的 `system`、`developer` 并进系统提示，对话中途的留在原位（[`Role::System`]），别的是一轮对话。`phase`（commentary、final_answer）别家没有，文字照留 |
 //! | `agent_message` | 别的代理发来的话（发信人和任务名写在正文里），当用户的一轮。只有 OpenAI 读得懂的 `encrypted_content` 记丢弃 |
 //! | `reasoning` | 推理，签名照规矩带着 |
 //! | `function_call`、`custom_tool_call` 和各自的 `_output` | 工具调用和结果 |
@@ -17,7 +17,9 @@
 //! | `tool_search_call`、`tool_search_output` | 一次 `tool_search` 调用和结果。搜到的工具从此可以调用，加进工具列表 |
 //! | `configuration_update` | 对话中途改的推理强度。最后一个说了算，盖过顶层的 `reasoning.effort` —— Codex 为了保住提示缓存，顶层一直写开头那一档 |
 //! | `web_search_call`、`image_generation_call` | 丢弃并记下：OpenAI 服务端工具的执行记录，搜到的、画出的写在后面的回答里 |
-//! | `compaction`、`context_compaction`、`compaction_trigger`、`item_reference` | 拒绝：内容在 OpenAI 服务端，或者是只有 OpenAI 读得懂的密文 |
+//! | `compaction_trigger` | 要压缩前文：历史照转，末尾请上游写一份交接摘要，回答作为一个 `compaction` 项交回（见 [`crate::compaction`]） |
+//! | `compaction`、`context_compaction` | 转换写出去的（`tw1.c.`）解回摘要，留在原位；OpenAI 自己的密文拒绝，只有 OpenAI 读得懂 |
+//! | `item_reference` | 拒绝：内容在 OpenAI 服务端 |
 //!
 //! 顶层字段：`text.verbosity` 写给认它的模型（[`Verbosity::understood_by`]），别处记丢弃；
 //! `service_tier` 别家没有同样的档位，记丢弃。`store`、`include`（转换写出的推理项总是带着
@@ -101,6 +103,7 @@ pub fn decode_request(
         shape,
         tools: ToolSet::default(),
         effort: None,
+        compaction: false,
     };
     for t in arr_of(v, "tools") {
         cx.tool(t, None, "tools");
@@ -119,11 +122,21 @@ pub fn decode_request(
     }
     let Ctx {
         dropped,
+        shape,
         tools,
         effort,
-        ..
+        compaction,
     } = cx;
     r.tools = tools.tools;
+    // 要压缩前文：历史、工具、推理设置都不动（和上一轮同一个开头，提示缓存照样命中），
+    // 末尾请上游写摘要
+    if compaction {
+        shape.compaction = true;
+        r.messages.push(Message {
+            role: Role::User,
+            parts: vec![Part::Text(crate::compaction::INSTRUCTION.to_string())],
+        });
+    }
     // namespace 的说明（MCP 服务器的使用说明就写在这里）：别家的工具没有 namespace，
     // 写进系统提示，模型照样看得到
     for (ns, note) in tools.notes {
@@ -341,6 +354,8 @@ struct Ctx<'a> {
     tools: ToolSet,
     /// 最后一个 `configuration_update` 里的推理强度
     effort: Option<String>,
+    /// 有 `compaction_trigger`：这一次要的是压缩
+    compaction: bool,
 }
 
 impl Ctx<'_> {
@@ -413,7 +428,7 @@ impl Ctx<'_> {
                     "system" | "developer" => {
                         let t = text_of(content);
                         if !t.is_empty() {
-                            r.system.push(t);
+                            system_turn(r, t);
                         }
                     }
                     role => {
@@ -592,29 +607,33 @@ impl Ctx<'_> {
                         .into(),
                 ));
             }
-            "compaction" => {
-                return Err(Rejection(
-                    "A compaction in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
-                        .into(),
-                ));
-            }
-            "context_compaction" => {
-                if str_of(item, "encrypted_content").is_some_and(|e| !e.is_empty()) {
-                    return Err(Rejection(
-                        "A context_compaction in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
-                            .into(),
-                    ));
+            "compaction" | "context_compaction" => {
+                match str_of(item, "encrypted_content").filter(|e| !e.is_empty()) {
+                    // 转换写出去的：解回摘要，留在原位。摘要是上游写的、不是调用方说的话，
+                    // 和对话中途的系统消息一样放（内容过滤、脱敏只看调用方的话）
+                    Some(enc) if crate::compaction::is_carried(enc) => {
+                        let summary = crate::compaction::read(enc).ok_or_else(|| {
+                            Rejection(format!(
+                                "A {kind} in input carries a summary written during an earlier conversion, but it is damaged, so the request cannot be converted for an upstream of another format."
+                            ))
+                        })?;
+                        push(
+                            r,
+                            Role::System,
+                            Part::Text(crate::compaction::restored(&summary)),
+                        );
+                    }
+                    Some(_) => {
+                        return Err(Rejection(format!(
+                            "A {kind} in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
+                        )));
+                    }
+                    // 没有内容的只是一个记号
+                    None => self.dropped.path(format!("input.{kind}")),
                 }
-                self.dropped.path("input.context_compaction");
             }
-            // 别家上游答不出 Codex 要的那个加密的 compaction 项：转过去只会白答一轮，
-            // Codex 再报「没有收到 compaction」
-            "compaction_trigger" => {
-                return Err(Rejection(
-                    "A compaction_trigger in input asks OpenAI's servers to compact the conversation into an encrypted item only OpenAI can read, so the request cannot be converted for an upstream of another format."
-                        .into(),
-                ));
-            }
+            // 要压缩前文：历史照转，最后由 `decode_request` 加上写摘要的请求
+            "compaction_trigger" => self.compaction = true,
             // web_search_call、image_generation_call……：服务端工具的执行记录
             other => self.dropped.path(format!("input.{other}")),
         }
@@ -702,6 +721,24 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
     let mut input = Vec::new();
     for m in &r.messages {
         match m.role {
+            // Responses 有对话中途的 developer 消息，原样放在原位
+            Role::System => {
+                let content: Vec<Value> = m
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::Text(t) if !t.is_empty() => {
+                            Some(json!({ "type": "input_text", "text": t }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    input.push(
+                        json!({ "type": "message", "role": "developer", "content": content }),
+                    );
+                }
+            }
             Role::User => {
                 let mut content = Vec::new();
                 for p in &m.parts {
@@ -1047,8 +1084,8 @@ mod tests {
             r#"{"model":"m","input":[{"type":"item_reference","id":"msg_1"}]}"#,
             r#"{"model":"m","input":[{"type":"compaction","encrypted_content":"x"}]}"#,
             r#"{"model":"m","input":[{"type":"context_compaction","encrypted_content":"x"}]}"#,
-            // Codex 的 Responses Lite 要压缩前文时发的：要的是一个只有 OpenAI 写得出的加密项
-            r#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"},{"type":"compaction_trigger"}]}"#,
+            // 前缀是转换写出去的，内容坏了
+            r#"{"model":"m","input":[{"type":"compaction","encrypted_content":"tw1.c.a"}]}"#,
             r#"{"model":"m","background":true,"input":"hi"}"#,
         ] {
             let e = decode(body).unwrap_err();
@@ -1061,6 +1098,60 @@ mod tests {
             decode(r#"{"model":"m","input":[{"type":"context_compaction"},{"role":"user","content":"hi"}]}"#)
                 .unwrap();
         assert_eq!(dropped, ["input.context_compaction"]);
+    }
+
+    #[test]
+    fn a_compaction_trigger_asks_the_upstream_for_a_summary_at_the_end() {
+        let (r, dropped, shape) = decode(
+            r#"{"model": "m", "input": [
+                {"type": "message", "role": "developer", "content": "You are Codex."},
+                {"type": "message", "role": "user", "content": "fix it"},
+                {"type": "message", "role": "assistant", "content": "done"},
+                {"type": "compaction_trigger"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(shape.compaction);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(r.system, ["You are Codex."]);
+        let last = r.messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(
+            last.parts,
+            [Part::Text(crate::compaction::INSTRUCTION.into())]
+        );
+        // 没有它就是普通的一轮
+        let (r, _, shape) =
+            decode(r#"{"model": "m", "input": [{"role": "user", "content": "hi"}]}"#).unwrap();
+        assert!(!shape.compaction);
+        assert_eq!(r.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_summary_written_during_conversion_comes_back_in_its_place() {
+        let body = json!({"model": "m", "input": [
+            {"type": "message", "role": "developer", "content": "You are Codex."},
+            {"type": "message", "role": "user", "content": "fix it"},
+            {"type": "compaction", "encrypted_content": crate::compaction::carry("Edited src/a.rs; tests pass.")},
+            {"type": "message", "role": "developer", "content": "<permissions instructions>"},
+            {"type": "message", "role": "user", "content": "now the docs"}
+        ]})
+        .to_string();
+        let (r, dropped, _) = decode(&body).unwrap();
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(r.system, ["You are Codex."]);
+        let roles: Vec<Role> = r.messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, [Role::User, Role::System, Role::System, Role::User]);
+        assert_eq!(
+            r.messages[1].parts,
+            [Part::Text(crate::compaction::restored(
+                "Edited src/a.rs; tests pass."
+            ))]
+        );
+        assert_eq!(
+            r.messages[2].parts,
+            [Part::Text("<permissions instructions>".into())]
+        );
     }
 
     /// Codex 的 Responses Lite（`use_responses_lite`）：顶层没有 `tools`，所有工具装在

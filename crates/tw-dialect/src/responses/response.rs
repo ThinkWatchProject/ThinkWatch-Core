@@ -240,6 +240,20 @@ pub(crate) fn response_id(upstream: Option<&str>) -> String {
     }
 }
 
+/// 压缩请求的回答（见 [`crate::compaction`]）：一个 `compaction` 项，`encrypted_content` 是
+/// 转换写出去的摘要。`summary` 为 `None` 是刚开始的空项
+pub(crate) fn compaction_item(id: &str, summary: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "type": "compaction",
+        "encrypted_content": summary.map(crate::compaction::carry).unwrap_or_default(),
+    })
+}
+
+/// 压缩请求的回答里没有文字时怎么说。Codex 收到失败会重试
+pub(crate) const NO_SUMMARY: &str =
+    "The upstream answered the compaction request without writing a summary.";
+
 /// 中间表示 → 给 Responses 客户端的整包响应。
 pub fn encode_response(r: &Response, s: &Session) -> Value {
     let (state, details) = status(r.stop.as_ref());
@@ -249,12 +263,31 @@ pub fn encode_response(r: &Response, s: &Session) -> Value {
         r.model.as_deref().unwrap_or(&s.model),
         state,
     );
-    out["output"] = Value::Array(
-        r.blocks
+    out["output"] = if s.is_compaction() {
+        // 上游写的文字就是摘要；思考和（不该有的）工具调用都不算
+        let texts: Vec<&str> = r
+            .blocks
             .iter()
-            .map(|b| item(b, &item_id(b, s), true, s))
-            .collect(),
-    );
+            .filter_map(|b| match b {
+                Block::Text(t) if !t.trim().is_empty() => Some(t.trim()),
+                _ => None,
+            })
+            .collect();
+        if texts.is_empty() {
+            out["status"] = json!("failed");
+            out["error"] = json!({ "code": "server_error", "message": NO_SUMMARY });
+            json!([])
+        } else {
+            json!([compaction_item(&new_id("cmp_"), Some(&texts.join("\n\n")))])
+        }
+    } else {
+        Value::Array(
+            r.blocks
+                .iter()
+                .map(|b| item(b, &item_id(b, s), true, s))
+                .collect(),
+        )
+    };
     out["incomplete_details"] = details;
     if let Some(u) = &r.usage {
         out["usage"] = usage_json(u);
