@@ -246,6 +246,11 @@ impl Session {
         self.shape.namespaced.get(name)
     }
 
+    /// 这个工具是 Responses 客户端自己执行的工具搜索：调用写回 `tool_search_call`
+    pub(crate) fn is_tool_search(&self, name: &str) -> bool {
+        self.shape.tool_search.as_deref() == Some(name)
+    }
+
     /// 上游的整包响应 → 客户端的整包响应。上游返回的不是 JSON 时是 `None`
     pub fn response(&self, body: &[u8]) -> Option<Vec<u8>> {
         let v: Value = serde_json::from_slice(body).ok()?;
@@ -367,6 +372,7 @@ impl Session {
                 namespaced: HashMap::new(),
                 include_usage: false,
                 gemini_sse: true,
+                tool_search: None,
             },
         }
     }

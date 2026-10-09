@@ -209,6 +209,26 @@ fn responses() {
                 {"type": "input_image", "image_url": "data:image/png;base64,«x4»"},
             ]},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "«a2»"}]},
+            // Codex 的 Responses Lite：工具声明在 input 里，namespace 的说明进系统提示
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "namespace", "name": "mcp__x", "description": "«s4»", "tools": [
+                    {"type": "function", "name": "h", "description": "«x6»", "parameters": {}},
+                ]},
+                {"type": "tool_search", "execution": "client", "description": "«x7»", "parameters": {}},
+            ]},
+            {"type": "local_shell_call", "call_id": "c3", "status": "completed",
+                "action": {"type": "exec", "command": ["echo", "«x8»"]}},
+            {"type": "function_call_output", "call_id": "c3", "output": "«t3»"},
+            {"type": "tool_search_call", "call_id": "c4", "execution": "client", "arguments": {"query": "«x9»"}},
+            {"type": "tool_search_output", "call_id": "c4", "status": "completed", "execution": "client", "tools": [
+                {"type": "function", "name": "k", "description": "«x10»", "parameters": {}},
+            ]},
+            // 别的代理发来的话：读得懂的那段是调用方的话
+            {"type": "agent_message", "author": "/root", "recipient": "/root/w", "content": [
+                {"type": "input_text", "text": "«u6»"},
+                {"type": "encrypted_content", "encrypted_content": "«x11»"},
+            ]},
+            {"type": "configuration_update", "reasoning": {"effort": "high"}},
         ],
         "tools": [
             {"type": "function", "name": "f", "description": "«x5»", "parameters": {}},
@@ -218,8 +238,8 @@ fn responses() {
     check(
         Dialect::Responses,
         v,
-        &["u1", "u2", "u3", "u4", "u5"],
-        &["t1", "t2"],
+        &["u1", "u2", "u3", "u4", "u5", "u6"],
+        &["t1", "t2", "t3"],
     );
 }
 

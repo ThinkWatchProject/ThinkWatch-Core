@@ -481,6 +481,10 @@ fn responses(v: &Value) -> Body<'_> {
             // 开头连着的 system、developer 消息算系统提示，和 Chat 一样
             let mut leading = true;
             for it in input {
+                // 工具声明（Responses Lite 写在 input 里），和顶层的 `tools` 一样不算对话
+                if str_of(it, "type") == Some("additional_tools") {
+                    continue;
+                }
                 if leading
                     && str_of(it, "type").unwrap_or("message") == "message"
                     && matches!(str_of(it, "role"), Some("system" | "developer"))
@@ -494,34 +498,22 @@ fn responses(v: &Value) -> Body<'_> {
         }
         _ => {}
     }
-    let mut freeform = Vec::new();
-    for t in arr_of(v, "tools") {
-        match str_of(t, "type") {
-            Some("custom") => freeform.extend(str_of(t, "name").map(str::to_string)),
-            Some("namespace") => {
-                let ns = str_of(t, "name");
-                freeform.extend(
-                    arr_of(t, "tools")
-                        .iter()
-                        .filter(|x| str_of(x, "type") == Some("custom"))
-                        .filter_map(|x| str_of(x, "name"))
-                        .map(|n| flat_name(ns, n).into_owned()),
-                );
-            }
-            _ => {}
-        }
-    }
     Body {
         system,
         items,
-        freeform,
+        // 顶层 `tools`、`additional_tools`、`tool_search_output` 里的都算，名字和转给别家时一样
+        freeform: tw_dialect::responses::request::freeform_tools(v),
     }
 }
 
-/// namespace 里的工具展开成 `namespace__名字`，和转换给别家时的名字一样
+/// namespace 里的工具展开成一个名字，和转换给别家时的名字一样
+/// （[`tw_dialect::responses::request::flat_tool_name`]）
 fn flat_name<'a>(namespace: Option<&str>, name: &'a str) -> Cow<'a, str> {
     match namespace {
-        Some(ns) if !ns.is_empty() => Cow::Owned(format!("{ns}__{name}")),
+        Some(ns) if !ns.is_empty() => Cow::Owned(tw_dialect::responses::request::flat_tool_name(
+            Some(ns),
+            name,
+        )),
         _ => Cow::Borrowed(name),
     }
 }

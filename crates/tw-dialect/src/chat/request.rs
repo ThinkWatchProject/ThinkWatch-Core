@@ -176,6 +176,13 @@ pub fn decode_request(
         _ => None,
     };
 
+    if has(v, "verbosity") {
+        r.verbosity = str_of(v, "verbosity").and_then(Verbosity::parse);
+        if r.verbosity.is_none() {
+            dropped.path("verbosity");
+        }
+    }
+
     if u64_of(v, "n").is_some_and(|n| n > 1) {
         dropped.path("n");
     }
@@ -194,7 +201,6 @@ pub fn decode_request(
         "prediction",
         "audio",
         "web_search_options",
-        "verbosity",
         "moderation",
         "functions",
         "function_call",
@@ -394,6 +400,14 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
         }
         // 「关掉推理」在不支持推理的模型上会被拒绝，发不出去
         Some(_) => dropped.feature(Feature::Reasoning),
+        None => {}
+    }
+
+    match r.verbosity {
+        Some(x) if Verbosity::understood_by(&r.model) => {
+            out.insert("verbosity".into(), json!(x.as_str()));
+        }
+        Some(_) => dropped.feature(Feature::Verbosity),
         None => {}
     }
 
