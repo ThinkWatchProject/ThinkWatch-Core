@@ -10,7 +10,8 @@
 //! 管这一跳的插件从客户端的原话起改，这一跳的转换、脱敏、发送用改过的那一份。换到下一
 //! 家时从原话重来；同一家重发（OAuth 换 token、去封存）用这一跳定好的请求体，不重跑。
 //!
-//! 开着 `failover.next_on_slow_start` 时，开头迟迟没有内容的一家也换掉（见 [`super::slow`]）。
+//! 发出去之后 `failover.idle_timeout_secs` 还没有内容的一家也换掉（见 [`super::idle`]）；在等
+//! 上游的时候被手动中止的，丢掉这一跳、不再换（见 [`crate::abort`]）。
 
 use bytes::Bytes;
 
@@ -48,6 +49,9 @@ pub(super) struct Served<'a> {
     pub(super) slot: crate::slots::Slot,
     /// 这一跳发出去的那一刻。这一家的快慢样本从这里算起（见 [`crate::latency`]）
     pub(super) sent_at: std::time::Instant,
+    /// 这一家答没答上还不知道：最后一家的开头不压，成败的账等回程看到第一段内容才记（见
+    /// `relay`）。没有内容就超时了记失败，和压着开头时一样
+    pub(super) unconfirmed: bool,
 }
 
 /// 这个请求的着落。
@@ -146,8 +150,8 @@ pub(super) async fn try_upstreams<'a>(
     let catalog = state.catalog.load();
     // 这把密钥的模型范围：每一跳发出的名字都要过它（见 `crate::sent::name`）
     let allow = crate::models::key_allow(&rt.config, &req.client_name);
-    // 开头慢就换下一家：开着、客户端要的是流时，等多久（见 `super::slow`）
-    let slow_wait = super::slow::wait(rt, reading);
+    // 无响应超时：每一跳从发出去算起，等多久（见 `super::idle`）
+    let quiet = super::idle::Quiet::of(state, rt);
     // 还没看的候选，按顺序
     let mut queue: std::collections::VecDeque<&String> = started.alive.iter().collect();
     // 满着没发的那几家（见 `crate::slots`），按候选的顺序。候选都看过一遍还没有着落时，
@@ -161,7 +165,7 @@ pub(super) async fn try_upstreams<'a>(
     let mut queued: Option<(usize, u64)> = None;
     // 等到最后，剩下的候选还都满着
     let mut stalled = false;
-    // 有一跳真的发到了上游、失败了（回了错误、流在内容之前断了、连不上、开头慢被放弃）。
+    // 有一跳真的发到了上游、失败了（回了错误、流在内容之前断了、连不上、没有内容超时了）。
     // 等满着的那几家等到最后的话，交出去的是这一家的错，不是「都满着」（见下面的 `stalled`）
     let mut reached = false;
 
@@ -173,7 +177,16 @@ pub(super) async fn try_upstreams<'a>(
             None if busy.is_empty() => break,
             None => {
                 let t = std::time::Instant::now();
-                match state.slots.first_free(&busy, until).await {
+                let freed = tokio::select! {
+                    biased;
+                    freed = state.slots.first_free(&busy, until) => freed,
+                    // 等空位的时候被手动中止：一个字节都还没发出去，尝试链上不多一跳
+                    _ = req.abort.wait() => {
+                        halt = Some(GatewayError::aborted());
+                        break;
+                    }
+                };
+                match freed {
                     Some((k, slot)) => (busy.remove(k), Some((slot, t.elapsed()))),
                     None => {
                         stalled = true;
@@ -337,7 +350,14 @@ pub(super) async fn try_upstreams<'a>(
                     // 这个请求能等的已经等完了（或者配置的是不等）：不再等
                     if tokio::time::Instant::now() < until {
                         let t = std::time::Instant::now();
-                        slot = state.slots.take_by(&provider.name, until).await;
+                        slot = tokio::select! {
+                            biased;
+                            slot = state.slots.take_by(&provider.name, until) => slot,
+                            _ = req.abort.wait() => {
+                                halt = Some(GatewayError::aborted());
+                                break;
+                            }
+                        };
                         waited = Some(t.elapsed().as_millis() as u64);
                         hop_started = std::time::Instant::now();
                     }
@@ -408,15 +428,7 @@ pub(super) async fn try_upstreams<'a>(
 
         let asked = Asked::of(req, reading, &plugged);
         let out = match super::heavy(asked.body, || {
-            prepare(
-                state,
-                req,
-                reading,
-                &asked,
-                provider,
-                &effective_set,
-                Some(id),
-            )
+            prepare(state, req, reading, &asked, provider, &effective_set, id)
         }) {
             Ok(out) => out,
             Err(err) => {
@@ -524,28 +536,14 @@ pub(super) async fn try_upstreams<'a>(
             .clone()
             .unwrap_or_else(|| reading.facts.model.clone());
         let (attempt, bridge) = (chain.len(), plugged.bridge);
-        // 后面还有没有此刻接得下这个请求的（见 `successor`）。开头慢了才问。后面的是还没看的
-        // 候选，加上满着、跳过了的那几家：**此刻有空位的才算**（见 `crate::slots`）—— 满着的
-        // 那一家要等，而这个请求能等的多半已经等完了，放弃了这一家，换来的是一个 429
-        let others = || {
-            let rest = queue
-                .iter()
-                .chain(busy.iter())
-                .copied()
-                .filter(|n| !state.slots.is_full(n));
-            successor(state, rt, req, reading, decision, &catalog, allow, rest)
-        };
-        // 这一跳发出去的那一刻：这一家的快慢样本从这里算起（见 `crate::latency`）
+        // 这一跳发出去的那一刻：这一家的快慢样本、无响应超时都从这里算起（见 `crate::latency`、
+        // `super::idle`）。之前等空位、跑插件的时间都不算
         let sent_at = std::time::Instant::now();
-        // 开头慢就换下一家：等到什么时候，从这一刻（请求发出去）算起。最后一家不换。到点时
-        // 问过、后面没有接得下的，清掉它：这一跳从此和不开时一样
-        let mut slow_deadline = slow_wait
-            .filter(|_| !last)
-            .map(|w| tokio::time::Instant::from_std(sent_at) + w);
+        let quiet_by = quiet.after(sent_at);
 
-        // 发出去、等响应头。**等着的这个 future 只活在这一块里**：放弃这一家时它跟着丢掉，
-        // 连接随之断开
-        let sent = {
+        // 发出去、等响应头。**等着的这个 future 只活在这一块里**：放弃这一家、被中止时它跟着
+        // 丢掉，连接随之断开
+        let waited = {
             let sending = async {
                 let sent = send(
                     state,
@@ -573,37 +571,44 @@ pub(super) async fn try_upstreams<'a>(
                     Err(e) => Err(e),
                 }
             };
-            let mut sending = std::pin::pin!(sending);
-            match slow_deadline {
-                None => sending.await,
-                Some(deadline) => match tokio::time::timeout_at(deadline, sending.as_mut()).await {
-                    Ok(sent) => sent,
-                    // 响应头都还没来，后面又有接得下的：放弃这一家。不停用、不算失败（见
-                    // `super::slow`）
-                    Err(_) if others() => {
-                        reached = true;
-                        let waited = slow_wait.unwrap_or_default();
-                        super::slow::timed_out(state, &provider.name, waited);
-                        chain.push(super::slow::abandoned(
-                            &provider.name,
-                            model.clone(),
-                            None,
-                            None,
-                            reading,
-                            waited,
-                            hop_started,
-                        ));
-                        last_err = Some(GatewayError::upstream(super::slow::said(
-                            &provider.name,
-                            waited,
-                        )));
-                        continue;
-                    }
-                    Err(_) => {
-                        slow_deadline = None;
-                        sending.await
-                    }
-                },
+            tokio::select! {
+                biased;
+                sent = sending => Waited::Done(sent),
+                _ = req.abort.wait() => Waited::Aborted,
+                _ = tokio::time::sleep_until(quiet_by) => Waited::Quiet,
+            }
+        };
+        let sent = match waited {
+            Waited::Done(sent) => sent,
+            // 被手动中止：这一跳到此为止，不再换下一家。不停用、不算失败
+            Waited::Aborted => {
+                chain.push(super::idle::aborted_hop(
+                    &provider.name,
+                    model.clone(),
+                    None,
+                    hop_started,
+                ));
+                halt = Some(GatewayError::aborted());
+                break;
+            }
+            // 响应头都没等到：放弃这一家，换下一家；没有下一家了，交出去的就是这个超时
+            Waited::Quiet => {
+                reached = true;
+                last_err = Some(gave_up(
+                    state,
+                    started,
+                    reading,
+                    Abandoned {
+                        provider,
+                        model: model.clone(),
+                        status: None,
+                        usage: None,
+                        quiet,
+                        hop_started,
+                    },
+                    &mut chain,
+                ));
+                continue;
             }
         };
         match sent {
@@ -718,100 +723,116 @@ pub(super) async fn try_upstreams<'a>(
                             refusal,
                             slot,
                             sent_at,
+                            unconfirmed: false,
                         });
                         break;
                     }
                 }
             }
             Ok(r) => {
-                // 流式回答：**第一段内容到之前**上游在流里报的错，照样换下一家（见
-                // `opening`）。最后一家不等 —— 没有下一家可换，等只会让客户端晚一点
-                // 看到同一个错误
-                let r = match opening_of(req, provider, &out, &r).filter(|_| !last) {
+                // 回答的开头：**第一段内容到之前**上游在流里报的错照样换下一家，一直没有内容
+                // 也换（见 `opening`）。最后一家不压 —— 没有下一家可换，压着只会让客户端晚
+                // 一点看到同样的东西；它不出声由回程按无响应超时收尾（见 `relay`）
+                let hold = hold_of(req, reading, provider, &out, &r);
+                // 最后一家不压开头：它答没答上（成败的账）要等回程看到第一段内容才知道
+                let unconfirmed = last && hold.is_some();
+                let r = match hold.filter(|_| !last) {
                     None => r,
-                    Some((dialect, eventstream)) => {
-                        // 开头慢就换下一家的，等到发出请求之后的那一刻；别的从响应头到了算起
-                        let deadline = slow_deadline.unwrap_or_else(|| {
-                            tokio::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    rt.config.failover.stream_start_wait_secs,
-                                )
-                        });
-                        match super::opening::watch(r, dialect, eventstream, deadline).await {
-                            super::opening::Opening::Go(r) => r,
-                            // 到点了还没有内容，后面又有接得下的：放弃这一家。**响应跟着这一轮
-                            // 循环丢掉**，和上游的连接随之断开，它不再接着生成。不停用、不算失败
-                            super::opening::Opening::Slow { response, usage }
-                                if slow_deadline.is_some() && others() =>
-                            {
+                    Some(hold) => {
+                        let status = r.status().as_u16();
+                        let watching = async move {
+                            match hold {
+                                Hold::Stream(dialect, eventstream) => {
+                                    super::opening::watch(r, dialect, eventstream, quiet_by).await
+                                }
+                                Hold::Body => super::opening::first_bytes(r, quiet_by).await,
+                            }
+                        };
+                        let opened = tokio::select! {
+                            biased;
+                            o = watching => Some(o),
+                            // 压着开头的时候被中止：响应跟着丢掉，连接断开
+                            _ = req.abort.wait() => None,
+                        };
+                        match opened {
+                            None => {
+                                chain.push(super::idle::aborted_hop(
+                                    &provider.name,
+                                    model.clone(),
+                                    Some(status),
+                                    hop_started,
+                                ));
+                                halt = Some(GatewayError::aborted());
+                                break;
+                            }
+                            Some(super::opening::Opening::Go(r)) => r,
+                            // 到点了还没有内容：放弃这一家。**响应跟着这一轮循环丢掉**，和上游的连接
+                            // 随之断开，它不再接着生成
+                            Some(super::opening::Opening::Slow { response, usage }) => {
                                 let status = response.status().as_u16();
                                 drop(response);
                                 reached = true;
                                 // 上游回了话，说明代理是通的
                                 state.note_proxy_ok(&provider.proxy);
-                                let waited = slow_wait.unwrap_or_default();
-                                super::slow::timed_out(state, &provider.name, waited);
-                                chain.push(super::slow::abandoned(
-                                    &provider.name,
-                                    model.clone(),
-                                    Some(status),
-                                    usage,
+                                last_err = Some(gave_up(
+                                    state,
+                                    started,
                                     reading,
-                                    waited,
-                                    hop_started,
+                                    Abandoned {
+                                        provider,
+                                        model: model.clone(),
+                                        status: Some(status),
+                                        usage,
+                                        quiet,
+                                        hop_started,
+                                    },
+                                    &mut chain,
                                 ));
-                                last_err = Some(GatewayError::upstream(super::slow::said(
-                                    &provider.name,
-                                    waited,
-                                )));
                                 continue;
                             }
-                            // 不换（没开、或者后面没有接得下的）：和内容来了一样交出去
-                            super::opening::Opening::Slow { response, .. } => response,
-                            super::opening::Opening::Failed {
+                            Some(super::opening::Opening::Failed {
                                 status,
                                 headers,
                                 body,
                                 kind,
                                 message,
                                 response,
-                            } => {
-                                match crate::failure::classify(status, &headers, &body, now_ms()) {
-                                    Verdict::ClientError => response,
-                                    Verdict::Failed(cause) => {
-                                        reached = true;
-                                        state.note_quota(id, &provider.name, &headers);
-                                        state.note_proxy_ok(&provider.proxy);
-                                        let cause = known_reset(state, &provider.name, cause);
-                                        note_health(
-                                            &state.bus,
-                                            &state.health,
-                                            &provider.name,
-                                            state.health.record_cause(&provider.name, cause),
-                                        );
-                                        let said = msg!(
-                                            "gw.upstream.stream_opening_error",
-                                            upstream = provider.name.clone(), kind = kind, message = message =>
-                                            "Upstream `{upstream}` started the answer and reported an error \
-                                             before any content ({kind}): {message}"
-                                        );
-                                        let err = if status == 429 {
-                                            GatewayError::rate_limited(said)
-                                        } else {
-                                            GatewayError::upstream(said)
-                                        };
-                                        chain.push(hop_failed(
-                                            &provider.name,
-                                            model.clone(),
-                                            err.detail.clone(),
-                                            hop_started,
-                                        ));
-                                        last_err = Some(err);
-                                        continue;
-                                    }
+                            }) => match crate::failure::classify(status, &headers, &body, now_ms())
+                            {
+                                Verdict::ClientError => response,
+                                Verdict::Failed(cause) => {
+                                    reached = true;
+                                    state.note_quota(id, &provider.name, &headers);
+                                    state.note_proxy_ok(&provider.proxy);
+                                    let cause = known_reset(state, &provider.name, cause);
+                                    note_health(
+                                        &state.bus,
+                                        &state.health,
+                                        &provider.name,
+                                        state.health.record_cause(&provider.name, cause),
+                                    );
+                                    let said = msg!(
+                                        "gw.upstream.stream_opening_error",
+                                        upstream = provider.name.clone(), kind = kind, message = message =>
+                                        "Upstream `{upstream}` started the answer and reported an error \
+                                         before any content ({kind}): {message}"
+                                    );
+                                    let err = if status == 429 {
+                                        GatewayError::rate_limited(said)
+                                    } else {
+                                        GatewayError::upstream(said)
+                                    };
+                                    chain.push(hop_failed(
+                                        &provider.name,
+                                        model.clone(),
+                                        err.detail.clone(),
+                                        hop_started,
+                                    ));
+                                    last_err = Some(err);
+                                    continue;
                                 }
-                            }
-                            super::opening::Opening::Broken(err) => {
+                            },
+                            Some(super::opening::Opening::Broken(err)) => {
                                 reached = true;
                                 note_health(
                                     &state.bus,
@@ -831,12 +852,14 @@ pub(super) async fn try_upstreams<'a>(
                         }
                     }
                 };
-                note_health(
-                    &state.bus,
-                    &state.health,
-                    &provider.name,
-                    state.health.record_success(&provider.name),
-                );
+                if !unconfirmed {
+                    note_health(
+                        &state.bus,
+                        &state.health,
+                        &provider.name,
+                        state.health.record_success(&provider.name),
+                    );
+                }
                 chain.push(hop(
                     &provider.name,
                     model.clone(),
@@ -855,6 +878,7 @@ pub(super) async fn try_upstreams<'a>(
                     refusal: None,
                     slot,
                     sent_at,
+                    unconfirmed,
                 });
                 break;
             }
@@ -1120,73 +1144,9 @@ fn unsendable_tool(
     Some(GatewayError::new(crate::error::Source::Request, msg))
 }
 
-/// 慢了的那一家后面，`rest` 里还有没有接得下这个请求的（见 [`super::slow`]）。
-///
-/// 停用着的不算，这一跳发不出去的也不算：配置里没有了、格式对不上、阶段二的规则拒绝、
-/// 发给它的名字对不上（别名、清单、密钥范围）、转换不了、强制要用的工具发不过去。**一个都
-/// 没有的话，慢了的这一家就是最后一家**，照常等下去 —— 放弃了它，换来的是一个注定失败的
-/// 请求。
-///
-/// **满着的不算**（`max_concurrent`，见 [`crate::slots`]），调用方先把它们滤掉：到点的这一刻
-/// 有空位的（没设上限的、跳过时满着、此刻空出来了的）才接得下。满着的那一家要等，而一个请求
-/// 只有一段等待期限（`failover.slot_wait_secs`），开头慢的这一段多半已经把它用完了：放弃了
-/// 一家正在答的，换来的是去等一家满着的、等不到回 429。
-///
-/// **只看不跑**：看的是客户端的原话，不跑插件、不取密钥（那两样在真发的那一跳才知道拒
-/// 不拒），不发转换事件
-#[allow(clippy::too_many_arguments)]
-fn successor<'r>(
-    state: &AppState,
-    rt: &Runtime,
-    req: &Inbound,
-    reading: &crate::client_api::Reading,
-    decision: &tw_engine::Decision,
-    catalog: &tw_engine::Catalog,
-    allow: Option<&[String]>,
-    mut rest: impl Iterator<Item = &'r String>,
-) -> bool {
-    let asked = Asked {
-        body: &req.body,
-        path: req.uri.path(),
-        decoded: reading.decoded.as_ref(),
-        json: reading.json,
-    };
-    rest.any(|name| {
-        let Some(provider) = rt.config.providers.iter().find(|p| &p.name == name) else {
-            return false;
-        };
-        if !state.health.is_available(name)
-            || protocol_mismatch(req, reading.generates, provider).is_some()
-        {
-            return false;
-        }
-        let Ok(tw_engine::Outcome2::Proceed {
-            mut set,
-            model: renamed,
-            ..
-        }) = rt
-            .engine
-            .phase_two(&reading.facts, &provider.name, &decision.set)
-        else {
-            return false;
-        };
-        let asked_model =
-            rt.engine
-                .asked_of(&reading.facts, decision, &provider.name, renamed.as_deref());
-        let Ok(sent) =
-            crate::sent::name(&rt.config, catalog, decision, provider, &asked_model, allow)
-        else {
-            return false;
-        };
-        set.model = (sent != reading.facts.model).then_some(sent);
-        prepare(state, req, reading, &asked, provider, &set, None).is_ok()
-    })
-}
-
 /// 把这一跳的请求（客户端那种格式，插件改过的话是改过的，见 [`Asked`]）改成要发的
 /// 样子：同格式时只做参数改写，跨格式时转换。转换不了就换下一家：同格式的上游可能
-/// 还在后面。`id` 是这个请求的号，做了转换、丢了字段要报在它上面；只看发不发得出去时
-/// （见 [`successor`]）是 None，什么都不报。
+/// 还在后面。`id` 是这个请求的号，做了转换、丢了字段要报在它上面。
 fn prepare(
     state: &AppState,
     req: &Inbound,
@@ -1194,7 +1154,7 @@ fn prepare(
     asked: &Asked<'_>,
     provider: &tw_config::Provider,
     effective_set: &tw_engine::SetAction,
-    id: Option<u64>,
+    id: u64,
 ) -> Result<Outbound, Skip> {
     let generates = reading.generates;
     // 方言互转。**同格式时是 None，这一整段零成本**
@@ -1257,7 +1217,7 @@ fn prepare(
                     .and_then(|d| crate::egress::strip_body_identity(d, &out))
                     .unwrap_or(out)
             };
-            if let Some((d, id)) = client_dialect.filter(|_| !dropped.is_empty()).zip(id) {
+            if let Some(d) = client_dialect.filter(|_| !dropped.is_empty()) {
                 let same = crate::wire::dialect(d);
                 state.bus.emit(tw_api::Event::Translated {
                     id,
@@ -1331,16 +1291,14 @@ fn prepare(
             // 却没生效」而完全不知道从哪儿查起
             let mut dropped = p.dropped.clone();
             dropped.extend(limit);
-            if let Some(id) = id {
-                state.bus.emit(tw_api::Event::Translated {
-                    id,
-                    provider: provider.name.clone(),
-                    from: crate::wire::dialect(d.client),
-                    to: crate::wire::dialect(dialect),
-                    dropped,
-                    at_ms: crate::server::now_ms(),
-                });
-            }
+            state.bus.emit(tw_api::Event::Translated {
+                id,
+                provider: provider.name.clone(),
+                from: crate::wire::dialect(d.client),
+                to: crate::wire::dialect(dialect),
+                dropped,
+                at_ms: crate::server::now_ms(),
+            });
             path = p.path.clone();
             query = p.query.clone();
             // Bedrock 上的 Claude：客户端 `anthropic-beta` 里 Bedrock 认的那几个放进请求体
@@ -1764,15 +1722,23 @@ pub(crate) fn stream_fault(
     }
 }
 
-/// 这个回答要不要等开头：生成回答的流式响应才等。等的话，上游说的是哪种格式、
-/// 是不是 Bedrock 的二进制帧
-fn opening_of(
+/// 一跳的响应头到了之后怎么等开头（见 [`super::opening`]）。
+enum Hold {
+    /// 流式：等第一段内容。上游说的是哪种格式、是不是 Bedrock 的二进制帧
+    Stream(tw_dialect::ir::Dialect, bool),
+    /// 整包：等正文的第一个字节
+    Body,
+}
+
+/// 这个回答要不要等开头：生成回答的成功响应才等。流式的等第一段内容，整包的等正文开头
+fn hold_of(
     req: &Inbound,
+    reading: &crate::client_api::Reading,
     provider: &tw_config::Provider,
     out: &Outbound,
     r: &reqwest::Response,
-) -> Option<(tw_dialect::ir::Dialect, bool)> {
-    if !r.status().is_success() {
+) -> Option<Hold> {
+    if !r.status().is_success() || !reading.generates {
         return None;
     }
     let ct = r
@@ -1782,11 +1748,66 @@ fn opening_of(
         .unwrap_or_default();
     let eventstream =
         provider.is_bedrock() && ct.starts_with(tw_bedrock::eventstream::CONTENT_TYPE);
-    if !(eventstream || ct.starts_with("text/event-stream")) {
-        return None;
+    // Codex 后端的流式响应没有 Content-Type（发给它的一律是流，见 `relay::Plan`）
+    let sse = ct.starts_with("text/event-stream") || (out.chatgpt && ct.is_empty());
+    if !(eventstream || sse) {
+        return Some(Hold::Body);
     }
     let dialect = out.target.or_else(|| req.api.map(|a| a.dialect()))?;
-    Some((dialect, eventstream))
+    Some(Hold::Stream(dialect, eventstream))
+}
+
+/// 发出去、等响应头的结局
+enum Waited<T> {
+    Done(T),
+    /// 被手动中止了
+    Aborted,
+    /// 无响应超时到了
+    Quiet,
+}
+
+/// 无响应超时之前一个字都没给的那一跳
+struct Abandoned<'p> {
+    provider: &'p tw_config::Provider,
+    model: Option<String>,
+    /// 上游回的状态码，响应头没到的没有
+    status: Option<u16>,
+    /// 流开头里上游报的用量
+    usage: Option<tw_dialect::usage::Usage>,
+    quiet: super::idle::Quiet,
+    hop_started: std::time::Instant,
+}
+
+/// 放弃这一家（见 [`super::idle`]）：记一次失败、记它被给的那段时间、这段对话这一轮不再留在
+/// 它那儿，尝试链上记一跳 `idle_timeout`。交回候选用完时交给客户端的那条错误（504）
+fn gave_up(
+    state: &AppState,
+    started: &Started,
+    reading: &crate::client_api::Reading,
+    a: Abandoned<'_>,
+    chain: &mut Vec<tw_api::AttemptView>,
+) -> GatewayError {
+    let name = &a.provider.name;
+    note_health(
+        &state.bus,
+        &state.health,
+        name,
+        state.health.record_failure(name),
+    );
+    super::idle::timed_out(state, name, a.quiet.window);
+    if let Some(c) = &started.turn {
+        state.affinity.left(c, name);
+    }
+    chain.push(super::idle::abandoned(
+        name,
+        a.model,
+        a.status,
+        a.usage,
+        reading,
+        a.quiet,
+        a.hop_started,
+    ));
+    GatewayError::timeout(super::idle::said(name, a.quiet.secs))
 }
 
 fn now_ms() -> u64 {

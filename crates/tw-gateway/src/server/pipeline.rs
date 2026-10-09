@@ -20,11 +20,12 @@ use crate::state::{AppState, Runtime};
 use tw_types::msg;
 
 mod admission;
+mod commit;
 mod hop;
+mod idle;
 mod opening;
 mod plug;
 mod relay;
-mod slow;
 
 pub(crate) use hop::stream_fault;
 
@@ -41,6 +42,8 @@ pub(super) struct Inbound {
     pub(super) dialect: tw_dialect::ir::Dialect,
     pub(super) started: std::time::Instant,
     pub(super) from: Sender,
+    /// 手动中止的开关（见 [`crate::abort`]）：开始之后登记上，等上游、交回答时看着它
+    pub(super) abort: crate::abort::Switch,
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -54,6 +57,9 @@ struct Started {
     choice: Choice,
     /// 这是哪段对话（见 [`crate::affinity::identity`]）。认不出来是 None
     conversation: Option<String>,
+    /// 这段对话的这一轮（见 [`crate::affinity`]）：一家没有内容超时了，这一轮就不再留在它
+    /// 那儿。数不出轮次的没有
+    turn: Option<crate::affinity::Conversation>,
     /// 出站脱敏的账本：拦截档下按客户端原文编好了号，每一跳接着它换（见
     /// [`crate::guard::look`]）。别的档位是空的
     ledger: tw_guard::redact::replace::Ledger,
@@ -160,7 +166,7 @@ pub(super) async fn pipeline(
             choice,
             wait_until,
             &decision,
-            fp.as_deref(),
+            (fp.as_deref(), conv.clone()),
             ending,
         );
         (screening, started)
@@ -173,6 +179,73 @@ pub(super) async fn pipeline(
     if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &screening) {
         return Err(GatewayError::denied(why));
     }
+    // 管线第 5 步：试上游、交回答（见 `answer`）。它拿走这个请求要的一切：流式的回答等不到
+    // 内容时，响应头先交给客户端，它在响应体里接着跑（见 `commit`）
+    let early = commit::early(&state, &req, &reading);
+    let abort = req.abort.clone();
+    let dialect = req.dialect;
+    let run = answer(
+        state,
+        rt,
+        req,
+        Tail {
+            reading,
+            decision,
+            started,
+            conv,
+            passes: (live, pass),
+        },
+        ending.take(),
+    );
+    match early {
+        None => run.await,
+        Some(e) => commit::hold(run, dialect, e, abort).await,
+    }
+}
+
+/// 发出开始事件之后，回答那一段要的：路由事实、决定、开始时定下的、这段对话这一轮，和两张
+/// 通行证（在服务中、这把密钥的并发）。
+struct Tail {
+    reading: crate::client_api::Reading,
+    decision: tw_engine::Decision,
+    started: Started,
+    conv: Option<crate::affinity::Conversation>,
+    passes: (crate::live::Pass, crate::limits::Pass),
+}
+
+/// 管线第 5 步：依次试候选上游（见 [`hop`]），把接下的那一家的回答交给客户端（见 [`relay`]）。
+///
+/// **拥有它要的一切**（不借管线的东西）：流式的回答等过一阵还没有内容时，响应头先交出去，
+/// 它挪进响应体里接着跑（见 [`commit`]）。结局也在它手上：返回错误之前自己报失败，被丢掉
+/// 由结局的 Drop 报（客户端走了是取消，叫停了是手动中止）。
+async fn answer(
+    state: AppState,
+    rt: Arc<Runtime>,
+    req: Inbound,
+    tail: Tail,
+    mut ending: Option<crate::ending::Ending>,
+) -> Result<Response, GatewayError> {
+    let r = answer_with(&state, &rt, &req, tail, &mut ending).await;
+    if let (Err(e), Some(end)) = (&r, ending.take()) {
+        end.failed(e.source.into(), e.detail.clone());
+    }
+    r
+}
+
+async fn answer_with(
+    state: &AppState,
+    rt: &Arc<Runtime>,
+    req: &Inbound,
+    tail: Tail,
+    ending: &mut Option<crate::ending::Ending>,
+) -> Result<Response, GatewayError> {
+    let Tail {
+        reading,
+        decision,
+        started,
+        conv,
+        passes: (live, pass),
+    } = tail;
     // 插件的请求钩子在每一跳里跑（见 `plug`）：从客户端的原话起改 —— 内容过滤删过的话是
     // 删过的那一份 —— 几跳共用原文的解析和密钥的编号。插件表跟着运行时走：**整个请求是
     // 同一份**，回答钩子用的也是它
@@ -186,7 +259,7 @@ pub(super) async fn pipeline(
         &req.body,
     );
     let answer =
-        hop::try_upstreams(&state, &rt, &req, &reading, &decision, &started, &mut hook).await?;
+        hop::try_upstreams(state, rt, req, &reading, &decision, &started, &mut hook).await?;
     // 网关估的数不是哪一家回答的：不记这段对话留在哪一家
     let mut served = match answer {
         hop::Answer::Served(served) => *served,
@@ -194,7 +267,7 @@ pub(super) async fn pipeline(
             let ending = ending
                 .take()
                 .expect("written when the start event was emitted");
-            return Ok(estimated(&state, &req, started.id, body, ending));
+            return Ok(estimated(state, req, started.id, body, ending));
         }
     };
     // 这一跳的账比开头那本多了号（插件往请求里写了新的值，拦截档下接着编了号）：回答
@@ -202,7 +275,7 @@ pub(super) async fn pipeline(
     if served.ledger.len() != started.ledger.len()
         && let Some(e) = ending.as_mut()
     {
-        e.redact_with(redaction(&rt, served.ledger.clone()));
+        e.redact_with(redaction(rt, served.ledger.clone()));
     }
     // 回答钩子：上游回了成功的回答才有。**在交出结局之前起实例**：起不来而策略是拒绝时，
     // 这个请求按返回的错误收场，客户端还一个字节都没收到
@@ -223,7 +296,7 @@ pub(super) async fn pipeline(
                 request_id: started.id,
                 attempt: served.attempt,
             };
-            crate::plugin::reply::Chain::start(&state, &rt.plugins, bridge, &ctx).await?
+            crate::plugin::reply::Chain::start(state, &rt.plugins, bridge, &ctx).await?
         }
         _ => None,
     };
@@ -239,9 +312,9 @@ pub(super) async fn pipeline(
         ));
     }
     Ok(relay::respond(
-        &state,
-        &rt,
-        &req,
+        state,
+        rt,
+        req,
         reading.generates,
         &reading.facts.model,
         served,
@@ -814,7 +887,7 @@ fn start(
     choice: Choice,
     wait_until: tokio::time::Instant,
     decision: &tw_engine::Decision,
-    fp: Option<&str>,
+    (fp, turn): (Option<&str>, Option<crate::affinity::Conversation>),
     ending: &mut Option<crate::ending::Ending>,
 ) -> Started {
     // 熔断过滤。**只有一个候选时完全旁路**，全都熔断时 fail-open ——
@@ -872,6 +945,7 @@ fn start(
         alive,
         choice,
         conversation: crate::affinity::identity(&req.headers, fp),
+        turn,
         ledger,
         found,
         hits: hits.filter(|_| redact_mode.acts()),
@@ -922,13 +996,14 @@ fn open(
     let facts = &reading.facts;
     let id = state.bus.next_id();
     let at_ms = now_ms();
+    let session = fp.map(|fp| state.sessions.assign(fp, at_ms));
     state.bus.emit(tw_api::Event::RequestStarted {
         id,
         client: req.client_name.clone(),
         // **旁证，不是身份。**只用来显示和判断「接管生效了吗」，
         // 不参与鉴权、路由、配额（见 crate::hint）。
         client_hint: crate::hint::client_hint(&req.headers),
-        session: fp.map(|fp| state.sessions.assign(fp, at_ms)),
+        session: session.clone(),
         peer: req.from.peer.clone(),
         key_masked: req.from.key.clone(),
         route: choice.route.clone(),
@@ -958,6 +1033,8 @@ fn open(
         sink.clone(),
     );
     end.redact_with(redaction.clone());
+    // 从这一刻起可以手动中止：登记跟着结局走，结局报了就不在跑了（见 `crate::abort`）
+    end.abortable(state.aborts.enter(id, session, req.abort.clone()));
     *ending = Some(end);
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步

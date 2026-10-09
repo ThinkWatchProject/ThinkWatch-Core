@@ -79,6 +79,9 @@ pub struct Ending {
     /// 这段对话这一次由谁回答（见 [`crate::affinity`]）。**成功走完了才记**：失败的、
     /// 半路断了的不算回答过，下一次照常排序
     answer: Option<crate::affinity::Ticket>,
+    /// 手动中止的登记（见 [`crate::abort`]）。**跟着结局走**：结局报了、或者被丢掉了，它跟着
+    /// 没了，这个请求就不再算在跑
+    abort: Option<crate::abort::Registered>,
     /// 报过了。**只能报一次**
     told: bool,
 }
@@ -222,6 +225,7 @@ impl Ending {
             upstream_error: None,
             refusal: None,
             answer: None,
+            abort: None,
             told: false,
         }
     }
@@ -290,6 +294,19 @@ impl Ending {
     /// 这一次由谁回答：成功走完时记下它和它读写了多少缓存。
     pub fn answered_by(&mut self, ticket: crate::affinity::Ticket) {
         self.answer = Some(ticket);
+    }
+
+    /// 这个请求可以手动中止了：登记交给结局保管（见 [`crate::abort`]）。
+    pub fn abortable(&mut self, r: crate::abort::Registered) {
+        self.abort = Some(r);
+    }
+
+    /// 回答的那一家答到一半没了声音（无响应超时，见 `server::pipeline::idle`）：这段对话这一轮
+    /// 不再留在它那儿
+    pub fn went_quiet(&mut self) {
+        if let Some(t) = self.answer.take() {
+            t.left();
+        }
     }
 
     /// 上游的响应头到了。从这里起，客户端再走掉，报出去的取消带着状态码。
@@ -506,6 +523,20 @@ impl Drop for Ending {
         // 往通道里 try_send、往广播里 send、读一下时钟。
         let (usage, answered_model) = self.settle();
         let usage = usage.map(view);
+        // 在界面上叫停之后被丢掉的（见 `crate::abort`）：是手动中止，不是客户端走了
+        if self.abort.as_ref().is_some_and(|r| r.thrown()) {
+            self.bus.emit(tw_api::Event::RequestFailed {
+                id: self.id,
+                model: std::mem::take(&mut self.model),
+                source: tw_api::FailureSource::Aborted,
+                message: crate::error::GatewayError::aborted().detail,
+                bytes: self.received(),
+                duration_ms: Some(self.duration_ms()),
+                usage,
+                answered_model,
+            });
+            return;
+        }
         // 是网关自己的代码崩掉了。**记成取消会冤枉客户端** —— 排查的人
         // 会去问一个根本没做过这件事的客户端。
         if std::thread::panicking() {

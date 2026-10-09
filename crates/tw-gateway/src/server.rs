@@ -191,6 +191,8 @@ async fn passthrough(
     let body = intake::read(&headers, body, intake::MAX_BODY)
         .await
         .map_err(|e| e.in_dialect(dialect))?;
+    // 手动中止的开关（见 `crate::abort`）。管线发出开始事件时登记上它
+    let abort = crate::abort::Switch::default();
     let req = pipeline::Inbound {
         uri,
         query,
@@ -201,8 +203,16 @@ async fn passthrough(
         dialect,
         started,
         from,
+        abort: abort.clone(),
     };
-    let result = pipeline::pipeline(state, rt, req, live, &mut ending).await;
+    // 被手动中止时，**管线先自己收场**（`biased`）：在等上游的那几处它看着开关，丢掉那一跳、
+    // 报完尝试链再返回。停在别处（等密钥的上限、取凭据）的，由这里整个丢掉，结局照样按
+    // 手动中止报
+    let result = tokio::select! {
+        biased;
+        r = pipeline::pipeline(state, rt, req, live, &mut ending) => r,
+        _ = abort.wait() => Err(GatewayError::aborted()),
+    };
     if let Some(end) = ending.take() {
         match &result {
             Err(e) => end.failed(e.source.into(), e.detail.clone()),

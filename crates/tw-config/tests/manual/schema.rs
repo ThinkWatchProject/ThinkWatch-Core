@@ -1326,21 +1326,12 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
-                    "stream_start_wait_secs",
+                    "idle_timeout_secs",
                     Kind::Int,
-                    Def::Is("15"),
+                    Def::Is("300"),
                     t(
-                        "Seconds to hold a streamed answer until its first content arrives. An error before then moves the request to the next upstream; after this long, what has arrived is passed on. From 1 to 120.",
-                        "流式回答在第一段内容到达前最多暂存的秒数。在此之前上游报错，请求换到下一家；超过这个时间，已收到的部分照常交给客户端。取值 1 到 120。",
-                    ),
-                ),
-                row(
-                    "next_on_slow_start",
-                    Kind::Bool,
-                    Def::Is("false"),
-                    t(
-                        "When a streamed answer still has no content `stream_start_wait_secs` after the request was sent, give up on that upstream and send the request to the next one. The last upstream always waits. The upstream given up on is not set aside. Needs `stream_start_wait_secs` of at least 5.",
-                        "流式回答在请求发出 `stream_start_wait_secs` 秒后仍没有内容时，放弃这家上游，把请求交给下一家。最后一家总是等下去。被放弃的上游不会停用。开启时 `stream_start_wait_secs` 至少为 5。",
+                        "Seconds an upstream may go without sending content before the gateway stops waiting for it. Counted from the moment the request is sent and started again by every piece of content: text, reasoning and tool calls count, keep-alives do not. A whole (non-streamed) answer counts from sending to the complete answer. Before any content has reached the client, the upstream counts as failed and the request moves to the next one; with none left, the client gets a timeout error. After content has reached the client, the answer ends with an error. From 30 to 3600.",
+                        "上游多少秒没有发出内容，网关就不再等它。从请求发出的那一刻算起，每来一段内容重新计时：正文、推理、工具调用都算，心跳不算。整包（非流式）的回答从发出算到整份回来。还没有内容交给客户端时，这家上游记一次失败，请求换到下一家；没有下一家了，客户端收到超时错误。已经有内容交给客户端的，回答以一条错误收尾。取值 30 到 3600。",
                     ),
                 ),
                 row(

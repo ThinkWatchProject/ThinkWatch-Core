@@ -107,7 +107,6 @@ config.schema_too_new
 config.secret.empty_name
 config.secret.env_missing
 config.secret.unterminated
-config.slow_start_too_short
 config.store.conflict
 config.store.missing
 config.store.read_failed
@@ -206,6 +205,7 @@ control.replay_bedrock
 control.request_body_gone
 control.request_body_truncated
 control.request_not_found
+control.request_not_running
 control.request_rejected
 control.reset_card_result_unreadable
 control.reset_cards_unreadable
@@ -224,6 +224,7 @@ control.rule.no_such_probe_class
 control.rule.no_such_upstream
 control.rule.unknown_dialect
 control.session_not_found
+control.session_not_running
 control.sheet_in_use
 control.sheet_not_found
 control.shutdown
@@ -372,6 +373,7 @@ gw.probe.connect
 gw.probe.key_rejected
 gw.probe.request_failed
 gw.probe.timeout
+gw.request.aborted
 gw.request.body_declared_too_large
 gw.request.body_over_limit
 gw.request.body_unreadable
@@ -383,7 +385,6 @@ gw.route.protocol_mismatch
 gw.route.rule_failed
 gw.route.selected_upstream_missing
 gw.route.upstream_missing
-gw.slow_start
 gw.toolcall.connection_cut
 gw.toolcall.response_cut
 gw.toolcall.response_withheld
@@ -393,6 +394,8 @@ gw.upstream.bedrock_refused
 gw.upstream.bedrock_refused_unnamed
 gw.upstream.eventstream_broken
 gw.upstream.forward_failed
+gw.upstream.idle_timeout
+gw.upstream.idle_timeout_mid_stream
 gw.upstream.rate_limited
 gw.upstream.sign_failed
 gw.upstream.status
