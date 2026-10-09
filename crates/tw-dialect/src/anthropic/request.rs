@@ -430,6 +430,7 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
         (r.seed.is_some(), Feature::Seed),
         (r.presence_penalty.is_some(), Feature::PresencePenalty),
         (r.frequency_penalty.is_some(), Feature::FrequencyPenalty),
+        (r.verbosity.is_some(), Feature::Verbosity),
     ] {
         if present {
             dropped.feature(f);

@@ -1,4 +1,31 @@
 //! OpenAI Responses 请求 ⇄ 中间表示。
+//!
+//! # 输入项转给别家时怎么办
+//!
+//! 照 Codex 往 `input` 里放的每一种项写（`codex-rs/protocol/src/models.rs` 的
+//! `ResponseItem`）。**丢弃只在别家确实没有对应物、模型也不缺什么的时候**，丢了的记进
+//! [`Dropped`]：
+//!
+//! | 输入项 | 转成 |
+//! |---|---|
+//! | `additional_tools` | 里面的工具和顶层 `tools` 一样解码。Responses Lite 只在这里声明工具，顶层没有 `tools`；对话里可以有好几个（增量声明） |
+//! | `message` | `system`、`developer` 并进系统提示，别的是一轮对话。`phase`（commentary、final_answer）别家没有，文字照留 |
+//! | `agent_message` | 别的代理发来的话（发信人和任务名写在正文里），当用户的一轮。只有 OpenAI 读得懂的 `encrypted_content` 记丢弃 |
+//! | `reasoning` | 推理，签名照规矩带着 |
+//! | `function_call`、`custom_tool_call` 和各自的 `_output` | 工具调用和结果 |
+//! | `local_shell_call` | 老历史里的命令调用：叫 `local_shell` 的工具调用，参数是它的 `action`。结果是同一个 `call_id` 的 `function_call_output`，丢了调用、留着结果，Anthropic 会拒绝整个请求 |
+//! | `tool_search_call`、`tool_search_output` | 一次 `tool_search` 调用和结果。搜到的工具从此可以调用，加进工具列表 |
+//! | `configuration_update` | 对话中途改的推理强度。最后一个说了算，盖过顶层的 `reasoning.effort` —— Codex 为了保住提示缓存，顶层一直写开头那一档 |
+//! | `web_search_call`、`image_generation_call` | 丢弃并记下：OpenAI 服务端工具的执行记录，搜到的、画出的写在后面的回答里 |
+//! | `compaction`、`context_compaction`、`compaction_trigger`、`item_reference` | 拒绝：内容在 OpenAI 服务端，或者是只有 OpenAI 读得懂的密文 |
+//!
+//! 顶层字段：`text.verbosity` 写给认它的模型（[`Verbosity::understood_by`]），别处记丢弃；
+//! `service_tier` 别家没有同样的档位，记丢弃。`store`、`include`（转换写出的推理项总是带着
+//! `encrypted_content`）、`prompt_cache_key`、`client_metadata`、`stream_options`、
+//! `reasoning.context` 是给 OpenAI 服务端的存储和传输参数，模型看不到，不记 ——
+//! `client_metadata` 里是 Codex 的会话信息，本来就不该交给别家。
+
+use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
@@ -6,6 +33,21 @@ use crate::ir::*;
 use crate::think;
 
 // ───────────────────────────────────────────────────────── 解码
+
+/// Codex 的默认 namespace。Responses Lite 把顶层的函数和自由格式工具都装在它里面，而
+/// Codex 认 `functions` 里的 `shell` 和不带 namespace 的 `shell` 是同一个工具
+/// （`codex-rs/protocol/src/tool_name.rs`），所以展开时不加前缀
+const DEFAULT_NAMESPACE: &str = "functions";
+
+/// Codex 的工具搜索（`{"type": "tool_search", "execution": "client"}`）没有名字，转给别家时
+/// 写成叫这个名字的函数工具
+pub const TOOL_SEARCH: &str = "tool_search";
+
+/// `local_shell_call` 转成的工具调用叫什么。Codex 已经不再声明这个工具，它只出现在老历史里
+const LOCAL_SHELL: &str = "local_shell";
+
+/// 别家工具名的长度上限：OpenAI Chat、Gemini、Bedrock 都是 64
+const NAME_LIMIT: usize = 64;
 
 /// 客户端发来的 Responses 请求 → 中间表示。
 ///
@@ -54,10 +96,15 @@ pub fn decode_request(
         r.system.push(i.to_string());
     }
 
+    let mut cx = Ctx {
+        dropped,
+        shape,
+        tools: ToolSet::default(),
+        effort: None,
+    };
     for t in arr_of(v, "tools") {
-        decode_tool(t, None, dropped, shape, &mut r.tools);
+        cx.tool(t, None, "tools");
     }
-
     match v.get("input") {
         Some(Value::String(s)) if !s.is_empty() => r.messages.push(Message {
             role: Role::User,
@@ -65,10 +112,26 @@ pub fn decode_request(
         }),
         Some(Value::Array(items)) => {
             for item in items {
-                decode_item(item, dropped, &mut r)?;
+                cx.item(item, &mut r)?;
             }
         }
         _ => {}
+    }
+    let Ctx {
+        dropped,
+        tools,
+        effort,
+        ..
+    } = cx;
+    r.tools = tools.tools;
+    // namespace 的说明（MCP 服务器的使用说明就写在这里）：别家的工具没有 namespace，
+    // 写进系统提示，模型照样看得到
+    for (ns, note) in tools.notes {
+        r.system.push(if ns == DEFAULT_NAMESPACE {
+            note
+        } else {
+            format!("Tools whose names start with {ns} belong to the {ns} namespace:\n{note}")
+        });
     }
 
     r.tool_choice = match v.get("tool_choice") {
@@ -79,9 +142,8 @@ pub fn decode_request(
             _ => None,
         },
         Some(o @ Value::Object(_)) => match str_of(o, "type") {
-            Some("function" | "custom") => {
-                str_of(o, "name").map(|n| ToolChoice::Named(n.to_string()))
-            }
+            Some("function" | "custom") => str_of(o, "name")
+                .map(|n| ToolChoice::Named(flat_tool_name(str_of(o, "namespace"), n))),
             Some("allowed_tools") => {
                 dropped.path("tool_choice.allowed_tools");
                 match str_of(o, "mode") {
@@ -106,6 +168,23 @@ pub fn decode_request(
             summary: has(re, "summary") || has(re, "generate_summary"),
         });
     }
+    // 对话中途改过推理强度：以最后一次为准
+    if let Some(e) = effort {
+        match think::parse_openai(&e) {
+            Some(effort) => {
+                let re = r.reasoning.get_or_insert(Reasoning {
+                    enabled: true,
+                    effort: None,
+                    budget: None,
+                    summary: false,
+                });
+                re.enabled = effort.is_some();
+                re.effort = effort;
+            }
+            // 模型自己定义的强度，别家没有对应
+            None => dropped.path("input.configuration_update.reasoning.effort"),
+        }
+    }
 
     if let Some(text) = v.get("text") {
         r.format = match text.get("format").and_then(|f| str_of(f, "type")) {
@@ -121,7 +200,10 @@ pub fn decode_request(
             _ => None,
         };
         if has(text, "verbosity") {
-            dropped.path("text.verbosity");
+            r.verbosity = str_of(text, "verbosity").and_then(Verbosity::parse);
+            if r.verbosity.is_none() {
+                dropped.path("text.verbosity");
+            }
         }
     }
 
@@ -135,175 +217,421 @@ pub fn decode_request(
             dropped.path(k);
         }
     }
+    // `priority`、`flex` 是 OpenAI 的计费和排队档位，别家没有同样的东西
+    if str_of(v, "service_tier").is_some_and(|t| !matches!(t, "auto" | "default")) {
+        dropped.path("service_tier");
+    }
     Ok(r)
 }
 
-/// namespace 里的工具展开成 `namespace__名字`，写响应时再拆回来
-fn flat_name(namespace: Option<&str>, name: &str) -> String {
-    match namespace {
-        Some(ns) if !ns.is_empty() => format!("{ns}__{name}"),
-        _ => name.to_string(),
+/// namespace 里的工具展开成一个名字，写响应时再按 [`ClientShape::namespaced`] 拆回来。
+///
+/// - 默认 namespace（`functions`）不加前缀
+/// - 别的照 Codex 自己拼名字的写法：分界处已经有 `_` 的直接接上
+///   （`mcp__codex_apps__calendar` + `_create_event`），否则中间加 `__`（`mcp_fs__read`）
+/// - **超过 64 个字符的截短，末尾换成哈希**：别家的工具名都限 64 个字符，namespace 再加
+///   名字很容易超，超了整个请求被拒。哈希按 namespace 和名字算，同一个工具每次都是同一个名字
+///
+/// 工具定义和历史里的调用用的是同一个函数，所以对得上。会话记录读 Responses 请求时也用它，
+/// 和转给别家时的名字一样
+pub fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
+    let ns = match namespace {
+        Some(ns) if !ns.is_empty() && ns != DEFAULT_NAMESPACE => ns,
+        _ => return name.to_string(),
+    };
+    let flat = if ns.ends_with('_') || name.starts_with('_') {
+        format!("{ns}{name}")
+    } else {
+        format!("{ns}__{name}")
+    };
+    if flat.len() <= NAME_LIMIT {
+        return flat;
     }
+    let suffix = format!("_{:012x}", fnv1a(ns, name) & 0xffff_ffff_ffff);
+    let mut cut = NAME_LIMIT - suffix.len();
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &flat[..cut])
 }
 
-fn decode_tool(
-    t: &Value,
-    namespace: Option<&str>,
-    dropped: &mut Dropped,
-    shape: &mut ClientShape,
-    tools: &mut Vec<Tool>,
-) {
-    let name = str_of(t, "name").unwrap_or_default();
-    let flat = flat_name(namespace, name);
-    let kind = match str_of(t, "type") {
-        Some("function") => ToolKind::Function {
-            schema: t
-                .get("parameters")
-                .filter(|p| !p.is_null())
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
-            strict: t.get("strict").and_then(Value::as_bool),
-        },
-        Some("custom") => ToolKind::Freeform {
-            format: t.get("format").cloned(),
-        },
-        Some("namespace") if namespace.is_none() => {
-            for inner in arr_of(t, "tools") {
-                decode_tool(inner, Some(name), dropped, shape, tools);
-            }
-            return;
-        }
-        // 托管工具（web_search、file_search、shell、apply_patch、mcp……）只有 OpenAI 能执行
-        other => {
-            dropped.path(format!("tools.{}", other.unwrap_or("unknown")));
-            return;
-        }
-    };
-    if let Some(ns) = namespace {
-        shape
-            .namespaced
-            .insert(flat.clone(), (ns.to_string(), name.to_string()));
+/// FNV-1a，64 位。不用标准库的哈希：它不保证换个版本还是同一个值
+fn fnv1a(ns: &str, name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in ns.bytes().chain([0]).chain(name.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    tools.push(Tool {
-        name: flat,
-        description: str_of(t, "description").map(str::to_string),
-        kind,
+    h
+}
+
+/// 请求里定义成自由格式的工具，展开后的名字：顶层 `tools`、`additional_tools` 和
+/// `tool_search_output` 里的都算。
+///
+/// 会话记录读上游的回答时要它：别家上游把自由格式工具的原文包在 `{"input": …}` 里，
+/// 按这份名单拆回来
+pub fn freeform_tools(v: &Value) -> Vec<String> {
+    fn walk(t: &Value, namespace: Option<&str>, out: &mut Vec<String>) {
+        match str_of(t, "type") {
+            Some("custom") => out.push(flat_tool_name(
+                namespace,
+                str_of(t, "name").unwrap_or_default(),
+            )),
+            Some("namespace") if namespace.is_none() => {
+                let ns = str_of(t, "name");
+                for inner in arr_of(t, "tools") {
+                    walk(inner, ns, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let declared = arr_of(v, "input").iter().filter(|i| {
+        matches!(
+            str_of(i, "type"),
+            Some("additional_tools" | "tool_search_output")
+        )
     });
+    for t in arr_of(v, "tools")
+        .iter()
+        .chain(declared.flat_map(|i| arr_of(i, "tools")))
+    {
+        walk(t, None, &mut out);
+    }
+    out
 }
 
-fn decode_item(item: &Value, dropped: &mut Dropped, r: &mut Request) -> Result<(), Rejection> {
-    let kind = str_of(item, "type").unwrap_or("message");
-    let push = |r: &mut Request, role, part| {
-        r.messages.push(Message {
-            role,
-            parts: vec![part],
-        })
-    };
-    match kind {
-        "message" => {
-            let content = item.get("content").unwrap_or(&Value::Null);
-            match str_of(item, "role").unwrap_or("user") {
-                "system" | "developer" => {
-                    let t = text_of(content);
-                    if !t.is_empty() {
-                        r.system.push(t);
-                    }
-                }
-                role => {
-                    let role = if role == "assistant" {
-                        Role::Assistant
-                    } else {
-                        Role::User
-                    };
-                    let parts = content_parts(content, "input.content", dropped);
-                    r.messages.push(Message { role, parts });
-                }
+/// 解码出的工具。
+///
+/// **同名的后来者替换先前的，位置不变**：顶层 `tools` 在前，`input` 里的 `additional_tools`、
+/// `tool_search_output` 按出现顺序在后。Codex 的增量声明就是这么说的（「重新定义的工具以
+/// 最新的定义为准」）；位置不变，工具列表的开头就尽量稳定 —— 提示缓存从工具列表算起
+#[derive(Default)]
+struct ToolSet {
+    tools: Vec<Tool>,
+    at: HashMap<String, usize>,
+    /// namespace 的说明，按第一次出现的顺序；后来的替换先前的
+    notes: Vec<(String, String)>,
+}
+
+impl ToolSet {
+    fn add(&mut self, t: Tool) {
+        match self.at.get(&t.name) {
+            Some(&i) => self.tools[i] = t,
+            None => {
+                self.at.insert(t.name.clone(), self.tools.len());
+                self.tools.push(t);
             }
         }
-        "function_call" | "custom_tool_call" => {
-            let name = flat_name(
-                str_of(item, "namespace"),
-                str_of(item, "name").unwrap_or_default(),
-            );
-            let input = if kind == "custom_tool_call" {
-                ToolInput::Text(str_of(item, "input").unwrap_or_default().to_string())
-            } else {
-                ToolInput::from_json_text(str_of(item, "arguments").unwrap_or_default())
-            };
-            push(
-                r,
-                Role::Assistant,
-                Part::ToolCall(ToolCall {
-                    id: str_of(item, "call_id").unwrap_or_default().to_string(),
-                    name,
-                    input,
-                }),
-            );
-        }
-        "function_call_output" | "custom_tool_call_output" => {
-            let content = match item.get("output") {
-                Some(Value::String(s)) if !s.is_empty() => vec![Part::Text(s.clone())],
-                Some(o @ Value::Array(_)) => {
-                    content_parts(o, &format!("input.{kind}.output"), dropped)
-                        .into_iter()
-                        .filter(|p| matches!(p, Part::Text(_) | Part::Image(_)))
-                        .collect()
-                }
-                _ => Vec::new(),
-            };
-            push(
-                r,
-                Role::User,
-                Part::ToolResult(ToolResult {
-                    id: str_of(item, "call_id").unwrap_or_default().to_string(),
-                    content,
-                    is_error: false,
-                }),
-            );
-        }
-        "reasoning" => {
-            let texts = |key: &str| {
-                arr_of(item, key)
-                    .iter()
-                    .filter_map(|x| str_of(x, "text"))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-            };
-            let text = match texts("content") {
-                t if t.is_empty() => texts("summary"),
-                t => t,
-            };
-            let signature = str_of(item, "encrypted_content")
-                .filter(|e| !e.is_empty())
-                .and_then(|enc| {
-                    if enc.starts_with(CARRIED) {
-                        Signature::read(enc, Vendor::OpenAi)
-                    } else {
-                        let id = str_of(item, "id").unwrap_or_default();
-                        Some(Signature::new(Vendor::OpenAi, format!("{id}:{enc}")))
-                    }
-                });
-            push(
-                r,
-                Role::Assistant,
-                Part::Thinking(Thinking { text, signature }),
-            );
-        }
-        "item_reference" => {
-            return Err(Rejection(
-                "An item_reference in input points at something kept on OpenAI's servers, so the request cannot be converted for an upstream of another format."
-                    .into(),
-            ));
-        }
-        "compaction" => {
-            return Err(Rejection(
-                "A compaction in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
-                    .into(),
-            ));
-        }
-        other => dropped.path(format!("input.{other}")),
     }
-    Ok(())
+
+    fn note(&mut self, namespace: &str, note: &str) {
+        match self.notes.iter_mut().find(|(ns, _)| ns == namespace) {
+            Some((_, n)) => *n = note.to_string(),
+            None => self.notes.push((namespace.to_string(), note.to_string())),
+        }
+    }
+}
+
+/// 解码时一路带着的东西
+struct Ctx<'a> {
+    dropped: &'a mut Dropped,
+    shape: &'a mut ClientShape,
+    tools: ToolSet,
+    /// 最后一个 `configuration_update` 里的推理强度
+    effort: Option<String>,
+}
+
+impl Ctx<'_> {
+    /// 一个工具定义。返回加进去的工具名，namespace 展开成里面的每一个。`at` 是它在客户端
+    /// 请求里的位置，记丢弃用
+    fn tool(&mut self, t: &Value, namespace: Option<&str>, at: &str) -> Vec<String> {
+        let name = str_of(t, "name").unwrap_or_default();
+        let (flat, kind) = match str_of(t, "type") {
+            Some("function") => (flat_tool_name(namespace, name), function_kind(t)),
+            Some("custom") => (
+                flat_tool_name(namespace, name),
+                ToolKind::Freeform {
+                    format: t.get("format").cloned(),
+                },
+            ),
+            Some("namespace") if namespace.is_none() => {
+                // Codex 给没写说明的 namespace 填的是这句套话，不值得写进系统提示
+                let filler = format!("Tools in the {name} namespace.");
+                if let Some(note) = str_of(t, "description")
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty() && *d != filler)
+                {
+                    self.tools.note(name, note);
+                }
+                return arr_of(t, "tools")
+                    .iter()
+                    .flat_map(|inner| self.tool(inner, Some(name), at))
+                    .collect();
+            }
+            // 客户端自己执行的工具搜索：上游调用它时写回 `tool_search_call`，由客户端去搜
+            Some("tool_search")
+                if namespace.is_none() && str_of(t, "execution") == Some("client") =>
+            {
+                self.shape.tool_search = Some(TOOL_SEARCH.to_string());
+                (TOOL_SEARCH.to_string(), function_kind(t))
+            }
+            // 托管工具（web_search、file_search、OpenAI 执行的 tool_search、shell、mcp……）
+            // 只有 OpenAI 能执行
+            other => {
+                self.dropped
+                    .path(format!("{at}.{}", other.unwrap_or("unknown")));
+                return Vec::new();
+            }
+        };
+        if let Some(ns) = namespace {
+            self.shape
+                .namespaced
+                .insert(flat.clone(), (ns.to_string(), name.to_string()));
+        }
+        self.tools.add(Tool {
+            name: flat.clone(),
+            description: str_of(t, "description").map(str::to_string),
+            kind,
+        });
+        vec![flat]
+    }
+
+    fn item(&mut self, item: &Value, r: &mut Request) -> Result<(), Rejection> {
+        let kind = str_of(item, "type").unwrap_or("message");
+        let push = |r: &mut Request, role, part| {
+            r.messages.push(Message {
+                role,
+                parts: vec![part],
+            })
+        };
+        match kind {
+            "message" => {
+                let content = item.get("content").unwrap_or(&Value::Null);
+                match str_of(item, "role").unwrap_or("user") {
+                    "system" | "developer" => {
+                        let t = text_of(content);
+                        if !t.is_empty() {
+                            r.system.push(t);
+                        }
+                    }
+                    role => {
+                        let role = if role == "assistant" {
+                            Role::Assistant
+                        } else {
+                            Role::User
+                        };
+                        let parts = content_parts(content, "input.content", self.dropped);
+                        r.messages.push(Message { role, parts });
+                    }
+                }
+            }
+            "additional_tools" => {
+                for t in arr_of(item, "tools") {
+                    self.tool(t, None, "input.additional_tools.tools");
+                }
+            }
+            "agent_message" => {
+                let mut parts = Vec::new();
+                for p in arr_of(item, "content") {
+                    match str_of(p, "type").unwrap_or("") {
+                        "input_text" => {
+                            if let Some(t) = str_of(p, "text").filter(|t| !t.is_empty()) {
+                                parts.push(Part::Text(t.to_string()));
+                            }
+                        }
+                        other => self
+                            .dropped
+                            .path(format!("input.agent_message.content.{other}")),
+                    }
+                }
+                if !parts.is_empty() {
+                    r.messages.push(Message {
+                        role: Role::User,
+                        parts,
+                    });
+                }
+            }
+            "function_call" | "custom_tool_call" => {
+                let name = flat_tool_name(
+                    str_of(item, "namespace"),
+                    str_of(item, "name").unwrap_or_default(),
+                );
+                let input = if kind == "custom_tool_call" {
+                    ToolInput::Text(str_of(item, "input").unwrap_or_default().to_string())
+                } else {
+                    ToolInput::from_json_text(str_of(item, "arguments").unwrap_or_default())
+                };
+                push(
+                    r,
+                    Role::Assistant,
+                    Part::ToolCall(ToolCall {
+                        id: str_of(item, "call_id").unwrap_or_default().to_string(),
+                        name,
+                        input,
+                    }),
+                );
+            }
+            // 结果是同一个 call_id 的 function_call_output。没有 call_id 的（更早的写法）
+            // 配不上结果，留着反而是一个没有结果的调用
+            "local_shell_call" => match str_of(item, "call_id") {
+                Some(id) => push(
+                    r,
+                    Role::Assistant,
+                    Part::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: LOCAL_SHELL.to_string(),
+                        input: ToolInput::Json(
+                            item.get("action")
+                                .filter(|a| a.is_object())
+                                .cloned()
+                                .unwrap_or_else(|| json!({})),
+                        ),
+                    }),
+                ),
+                None => self.dropped.path("input.local_shell_call"),
+            },
+            "function_call_output" | "custom_tool_call_output" => {
+                let content = match item.get("output") {
+                    Some(Value::String(s)) if !s.is_empty() => vec![Part::Text(s.clone())],
+                    Some(o @ Value::Array(_)) => {
+                        content_parts(o, &format!("input.{kind}.output"), self.dropped)
+                            .into_iter()
+                            .filter(|p| matches!(p, Part::Text(_) | Part::Image(_)))
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                push(
+                    r,
+                    Role::User,
+                    Part::ToolResult(ToolResult {
+                        id: str_of(item, "call_id").unwrap_or_default().to_string(),
+                        content,
+                        is_error: false,
+                    }),
+                );
+            }
+            "tool_search_call" => match str_of(item, "call_id") {
+                Some(id) => push(
+                    r,
+                    Role::Assistant,
+                    Part::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: TOOL_SEARCH.to_string(),
+                        input: match item.get("arguments") {
+                            Some(Value::String(s)) => ToolInput::from_json_text(s),
+                            Some(a @ Value::Object(_)) => ToolInput::Json(a.clone()),
+                            _ => ToolInput::Json(json!({})),
+                        },
+                    }),
+                ),
+                None => self.dropped.path("input.tool_search_call"),
+            },
+            // 搜到的工具从此可以调用：加进工具列表。结果里写上它们在上游那边叫什么
+            "tool_search_output" => {
+                let names: Vec<String> = arr_of(item, "tools")
+                    .iter()
+                    .flat_map(|t| self.tool(t, None, "input.tool_search_output.tools"))
+                    .collect();
+                if let Some(id) = str_of(item, "call_id") {
+                    let text = if names.is_empty() {
+                        "No matching tools were found.".to_string()
+                    } else {
+                        format!("These tools are now available: {}", names.join(", "))
+                    };
+                    push(
+                        r,
+                        Role::User,
+                        Part::ToolResult(ToolResult {
+                            id: id.to_string(),
+                            content: vec![Part::Text(text)],
+                            is_error: false,
+                        }),
+                    );
+                }
+            }
+            "configuration_update" => {
+                match item.get("reasoning").and_then(|re| str_of(re, "effort")) {
+                    Some(e) => self.effort = Some(e.to_string()),
+                    None => self.dropped.path("input.configuration_update"),
+                }
+            }
+            "reasoning" => {
+                let texts = |key: &str| {
+                    arr_of(item, key)
+                        .iter()
+                        .filter_map(|x| str_of(x, "text"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+                let text = match texts("content") {
+                    t if t.is_empty() => texts("summary"),
+                    t => t,
+                };
+                let signature = str_of(item, "encrypted_content")
+                    .filter(|e| !e.is_empty())
+                    .and_then(|enc| {
+                        if enc.starts_with(CARRIED) {
+                            Signature::read(enc, Vendor::OpenAi)
+                        } else {
+                            let id = str_of(item, "id").unwrap_or_default();
+                            Some(Signature::new(Vendor::OpenAi, format!("{id}:{enc}")))
+                        }
+                    });
+                push(
+                    r,
+                    Role::Assistant,
+                    Part::Thinking(Thinking { text, signature }),
+                );
+            }
+            "item_reference" => {
+                return Err(Rejection(
+                    "An item_reference in input points at something kept on OpenAI's servers, so the request cannot be converted for an upstream of another format."
+                        .into(),
+                ));
+            }
+            "compaction" => {
+                return Err(Rejection(
+                    "A compaction in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
+                        .into(),
+                ));
+            }
+            "context_compaction" => {
+                if str_of(item, "encrypted_content").is_some_and(|e| !e.is_empty()) {
+                    return Err(Rejection(
+                        "A context_compaction in input is an encrypted, compacted conversation only OpenAI can read, so the request cannot be converted for an upstream of another format."
+                            .into(),
+                    ));
+                }
+                self.dropped.path("input.context_compaction");
+            }
+            // 别家上游答不出 Codex 要的那个加密的 compaction 项：转过去只会白答一轮，
+            // Codex 再报「没有收到 compaction」
+            "compaction_trigger" => {
+                return Err(Rejection(
+                    "A compaction_trigger in input asks OpenAI's servers to compact the conversation into an encrypted item only OpenAI can read, so the request cannot be converted for an upstream of another format."
+                        .into(),
+                ));
+            }
+            // web_search_call、image_generation_call……：服务端工具的执行记录
+            other => self.dropped.path(format!("input.{other}")),
+        }
+        Ok(())
+    }
+}
+
+/// 函数工具（还有客户端执行的工具搜索）的参数定义
+fn function_kind(t: &Value) -> ToolKind {
+    ToolKind::Function {
+        schema: t
+            .get("parameters")
+            .filter(|p| !p.is_null())
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+        strict: t.get("strict").and_then(Value::as_bool),
+    }
 }
 
 fn content_parts(content: &Value, prefix: &str, dropped: &mut Dropped) -> Vec<Part> {
@@ -557,12 +885,10 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
         None => {}
     }
 
+    let mut text = Map::new();
     match &r.format {
         Some(Format::JsonObject) => {
-            out.insert(
-                "text".into(),
-                json!({ "format": { "type": "json_object" } }),
-            );
+            text.insert("format".into(), json!({ "type": "json_object" }));
         }
         Some(Format::JsonSchema {
             name,
@@ -577,9 +903,19 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
             if let Some(s) = strict {
                 f["strict"] = json!(s);
             }
-            out.insert("text".into(), json!({ "format": f }));
+            text.insert("format".into(), f);
         }
         None => {}
+    }
+    match r.verbosity {
+        Some(x) if Verbosity::understood_by(&r.model) => {
+            text.insert("verbosity".into(), json!(x.as_str()));
+        }
+        Some(_) => dropped.feature(Feature::Verbosity),
+        None => {}
+    }
+    if !text.is_empty() {
+        out.insert("text".into(), Value::Object(text));
     }
 
     // 不让 OpenAI 保存这次对话：转换过来的请求本来就带着完整的上下文
@@ -672,7 +1008,15 @@ mod tests {
     #[test]
     fn a_codex_request_decodes_into_turns_tools_and_reasoning() {
         let (r, dropped, shape) = decode(CODEX).unwrap();
-        assert_eq!(r.system, ["You are Codex.", "sandbox: workspace-write"]);
+        // namespace 的说明进系统提示
+        assert_eq!(
+            r.system,
+            [
+                "You are Codex.",
+                "sandbox: workspace-write",
+                "Tools whose names start with mcp_fs belong to the mcp_fs namespace:\nfiles"
+            ]
+        );
         let Part::Thinking(th) = &r.messages[1].parts[0] else {
             panic!("{:?}", r.messages[1]);
         };
@@ -702,6 +1046,9 @@ mod tests {
             r#"{"model":"m","previous_response_id":"resp_1","input":"hi"}"#,
             r#"{"model":"m","input":[{"type":"item_reference","id":"msg_1"}]}"#,
             r#"{"model":"m","input":[{"type":"compaction","encrypted_content":"x"}]}"#,
+            r#"{"model":"m","input":[{"type":"context_compaction","encrypted_content":"x"}]}"#,
+            // Codex 的 Responses Lite 要压缩前文时发的：要的是一个只有 OpenAI 写得出的加密项
+            r#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"},{"type":"compaction_trigger"}]}"#,
             r#"{"model":"m","background":true,"input":"hi"}"#,
         ] {
             let e = decode(body).unwrap_err();
@@ -709,6 +1056,255 @@ mod tests {
         }
         // null 不算用了
         assert!(decode(r#"{"model":"m","previous_response_id":null,"input":"hi"}"#).is_ok());
+        // 没有密文的 context_compaction 只是一个记号
+        let (_, dropped, _) =
+            decode(r#"{"model":"m","input":[{"type":"context_compaction"},{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        assert_eq!(dropped, ["input.context_compaction"]);
+    }
+
+    /// Codex 的 Responses Lite（`use_responses_lite`）：顶层没有 `tools`，所有工具装在
+    /// `input` 开头的 `additional_tools` 里，函数和自由格式工具在 `functions` 这个
+    /// namespace 里（`codex-rs/core/src/client.rs`、`codex-rs/tools/src/tool_spec.rs`）
+    const LITE: &str = r#"{
+        "model": "gpt-5.4",
+        "stream": true,
+        "input": [
+            {"id": "at_1", "type": "additional_tools", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "", "tools": [
+                    {"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": false,
+                     "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"], "additionalProperties": false}},
+                    {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+                     "format": {"type": "grammar", "syntax": "lark", "definition": "start: begin_patch hunk+ end_patch"}}
+                ]},
+                {"type": "namespace", "name": "mcp__codex_apps__calendar", "description": "Plan events.", "tools": [
+                    {"type": "function", "name": "_create_event", "description": "Create a calendar event.", "strict": false,
+                     "parameters": {"type": "object", "properties": {"title": {"type": "string"}}}}
+                ]},
+                {"type": "namespace", "name": "web", "description": "Tools in the web namespace.", "tools": [
+                    {"type": "function", "name": "run", "description": "Search the web.", "strict": false, "parameters": {"type": "object"}}
+                ]},
+                {"type": "tool_search", "execution": "client", "description": "Search deferred tools.",
+                 "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "number"}}, "required": ["query"]}}
+            ]},
+            {"id": "msg_1", "type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex."}],
+             "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["model.base_instructions"]}},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the test"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Looking."}], "phase": "commentary"},
+            {"type": "function_call", "name": "exec_command", "namespace": "functions", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_1"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "src"},
+            {"type": "local_shell_call", "id": "lsh_1", "call_id": "call_2", "status": "completed",
+             "action": {"type": "exec", "command": ["echo", "hi"], "timeout_ms": null, "working_directory": null, "env": null, "user": null}},
+            {"type": "function_call_output", "call_id": "call_2", "output": "hi"},
+            {"type": "tool_search_call", "call_id": "call_3", "execution": "client", "status": "completed", "arguments": {"query": "drive", "limit": 8}},
+            {"type": "tool_search_output", "call_id": "call_3", "status": "completed", "execution": "client", "tools": [
+                {"type": "namespace", "name": "mcp__codex_apps__drive", "description": "Files in Drive.", "tools": [
+                    {"type": "function", "name": "_search", "description": "Search files.", "strict": false, "defer_loading": true, "parameters": {"type": "object"}}
+                ]}
+            ]},
+            {"type": "configuration_update", "reasoning": {"effort": "high"}},
+            {"type": "agent_message", "author": "/root", "recipient": "/root/worker", "content": [
+                {"type": "input_text", "text": "Message Type: MESSAGE\nPayload:\nrun it"},
+                {"type": "encrypted_content", "encrypted_content": "gAAA"}
+            ]},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "x"}}
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {"effort": "medium", "summary": "auto", "context": "all_turns"},
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "019a",
+        "text": {"verbosity": "low"},
+        "client_metadata": {"x-codex-turn-metadata": "{}"}
+    }"#;
+
+    #[test]
+    fn a_responses_lite_request_keeps_the_tools_it_declares_in_input() {
+        let (r, dropped, shape) = decode(LITE).unwrap();
+        let names: Vec<&str> = r.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "exec_command",
+                "apply_patch",
+                "mcp__codex_apps__calendar_create_event",
+                "web__run",
+                "tool_search",
+                // tool_search 搜到的，从此可以调用
+                "mcp__codex_apps__drive_search",
+            ]
+        );
+        assert!(matches!(r.tools[1].kind, ToolKind::Freeform { .. }));
+        assert_eq!(
+            shape.namespaced.get("exec_command"),
+            Some(&("functions".to_string(), "exec_command".to_string()))
+        );
+        assert_eq!(
+            shape
+                .namespaced
+                .get("mcp__codex_apps__calendar_create_event"),
+            Some(&(
+                "mcp__codex_apps__calendar".to_string(),
+                "_create_event".to_string()
+            ))
+        );
+        assert_eq!(shape.tool_search.as_deref(), Some("tool_search"));
+        // MCP 服务器的说明进系统提示；Codex 自己填的套话不进
+        assert_eq!(
+            r.system,
+            [
+                "You are Codex.",
+                "Tools whose names start with mcp__codex_apps__calendar belong to the mcp__codex_apps__calendar namespace:\nPlan events.",
+                "Tools whose names start with mcp__codex_apps__drive belong to the mcp__codex_apps__drive namespace:\nFiles in Drive."
+            ]
+        );
+        // 对话中途改成了 high：盖过顶层开头那一档
+        assert_eq!(r.reasoning.as_ref().unwrap().effort, Some(Effort::High));
+        assert_eq!(r.verbosity, Some(Verbosity::Low));
+        assert_eq!(
+            dropped,
+            [
+                "input.agent_message.content.encrypted_content",
+                "input.web_search_call"
+            ]
+        );
+
+        let parts: Vec<&Part> = r.messages.iter().flat_map(|m| &m.parts).collect();
+        // 历史里默认 namespace 的调用和工具同名
+        assert!(
+            matches!(parts[2], Part::ToolCall(c) if c.name == "exec_command" && c.input == ToolInput::Json(json!({"cmd": "ls"})))
+        );
+        // local_shell_call 和它的结果成对留着
+        let Part::ToolCall(shell) = parts[4] else {
+            panic!("{:?}", parts[4]);
+        };
+        assert_eq!(
+            (shell.id.as_str(), shell.name.as_str()),
+            ("call_2", "local_shell")
+        );
+        let ToolInput::Json(action) = &shell.input else {
+            panic!("{shell:?}");
+        };
+        assert_eq!(action["command"], json!(["echo", "hi"]));
+        assert!(
+            matches!(parts[5], Part::ToolResult(res) if res.id == "call_2" && res.text() == "hi")
+        );
+        // 工具搜索的调用和结果
+        assert!(
+            matches!(parts[6], Part::ToolCall(c) if c.name == "tool_search" && c.input == ToolInput::Json(json!({"query": "drive", "limit": 8})))
+        );
+        assert!(
+            matches!(parts[7], Part::ToolResult(res) if res.id == "call_3" && res.text() == "These tools are now available: mcp__codex_apps__drive_search")
+        );
+        // 别的代理发来的话是用户的一轮
+        let last = r.messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(
+            last.parts,
+            [Part::Text("Message Type: MESSAGE\nPayload:\nrun it".into())]
+        );
+    }
+
+    #[test]
+    fn a_later_declaration_replaces_an_earlier_one_in_place() {
+        // 顶层 tools 和 additional_tools 一起来，还有 Codex 的增量声明：同名的以最后一次为准，
+        // 位置是第一次出现的位置
+        let (r, dropped, _) = decode(
+            r#"{"model": "m",
+                "tools": [
+                    {"type": "function", "name": "shell", "description": "old", "parameters": {"type": "object"}},
+                    {"type": "function", "name": "plan", "parameters": {"type": "object"}}
+                ],
+                "input": [
+                    {"type": "additional_tools", "role": "developer", "tools": [
+                        {"type": "namespace", "name": "functions", "tools": [
+                            {"type": "function", "name": "shell", "description": "new", "parameters": {"type": "object"}},
+                            {"type": "custom", "name": "apply_patch"}
+                        ]},
+                        {"type": "web_search"}
+                    ]},
+                    {"role": "user", "content": "hi"},
+                    {"type": "additional_tools", "role": "developer", "tools": [
+                        {"type": "namespace", "name": "functions", "tools": [
+                            {"type": "custom", "name": "plan", "description": "now freeform"}
+                        ]}
+                    ]}
+                ]}"#,
+        )
+        .unwrap();
+        let tools: Vec<(&str, Option<&str>, bool)> = r
+            .tools
+            .iter()
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    t.description.as_deref(),
+                    matches!(t.kind, ToolKind::Freeform { .. }),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                ("shell", Some("new"), false),
+                ("plan", Some("now freeform"), true),
+                ("apply_patch", None, true),
+            ]
+        );
+        assert_eq!(dropped, ["input.additional_tools.tools.web_search"]);
+    }
+
+    #[test]
+    fn a_long_namespaced_name_is_cut_to_64_with_a_stable_hash() {
+        assert_eq!(flat_tool_name(None, "shell"), "shell");
+        assert_eq!(flat_tool_name(Some("functions"), "shell"), "shell");
+        assert_eq!(flat_tool_name(Some("mcp_fs"), "read"), "mcp_fs__read");
+        assert_eq!(
+            flat_tool_name(Some("mcp__codex_apps__calendar"), "_create_event"),
+            "mcp__codex_apps__calendar_create_event"
+        );
+        let ns = "mcp__a_rather_long_server_name_from_some_connector";
+        let a = flat_tool_name(Some(ns), "create_a_very_descriptive_thing");
+        assert_eq!(a.len(), 64);
+        assert!(a.starts_with(ns), "{a}");
+        // 同一个工具每次同一个名字，不同的工具不撞
+        assert_eq!(
+            a,
+            flat_tool_name(Some(ns), "create_a_very_descriptive_thing")
+        );
+        assert_ne!(
+            a,
+            flat_tool_name(Some(ns), "create_a_very_descriptive_thinG")
+        );
+    }
+
+    #[test]
+    fn freeform_tools_are_found_wherever_they_are_declared() {
+        let v: Value = serde_json::from_str(LITE).unwrap();
+        assert_eq!(freeform_tools(&v), ["apply_patch"]);
+    }
+
+    #[test]
+    fn verbosity_goes_only_to_models_that_understand_it() {
+        let (mut r, _, _) = decode(LITE).unwrap();
+        let (v, dropped) = encode(&r, Dialect::Responses);
+        assert_eq!(v["text"], json!({"verbosity": "low"}));
+        assert!(!dropped.contains(&"text.verbosity".to_string()));
+        r.model = "gpt-4.1".into();
+        let (v, dropped) = encode(&r, Dialect::Responses);
+        assert!(v.get("text").is_none());
+        assert!(dropped.contains(&"text.verbosity".to_string()));
+        for (model, ok) in [
+            ("gpt-5", true),
+            ("gpt-5.4-mini", true),
+            ("openai/gpt-6-luna", true),
+            ("gpt-4o", false),
+            ("gpt-oss-120b", false),
+            ("claude-opus-4-7", false),
+        ] {
+            assert_eq!(Verbosity::understood_by(model), ok, "{model}");
+        }
     }
 
     #[test]
@@ -733,7 +1329,7 @@ mod tests {
         assert_eq!(items[1]["encrypted_content"], "gAAAAB");
         assert_eq!(
             v["instructions"],
-            "You are Codex.\n\nsandbox: workspace-write"
+            "You are Codex.\n\nsandbox: workspace-write\n\nTools whose names start with mcp_fs belong to the mcp_fs namespace:\nfiles"
         );
         assert_eq!(v["tools"][0]["strict"], false);
         assert_eq!(v["tools"][1]["type"], "custom");

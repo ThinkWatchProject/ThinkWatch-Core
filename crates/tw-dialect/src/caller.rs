@@ -322,7 +322,7 @@ fn chat(c: &mut Collect, v: &Value) {
 
 /// 见 `responses::request::decode_request`：`input` 是一个字符串时整个是用户的话；
 /// 是数组时看 `message`（`system`、`developer`、`assistant` 之外的角色，没写的算
-/// `user`）和两种工具结果
+/// `user`）、别的代理发来的 `agent_message` 和两种工具结果
 fn responses(c: &mut Collect, v: &Value) {
     let Some(input) = v.get("input") else {
         return;
@@ -349,6 +349,18 @@ fn responses_item(c: &mut Collect, item: &Value) {
             }
             if let Some(content) = item.get("content") {
                 c.key("content", |c| responses_content(c, content, false));
+            }
+        }
+        // 只认 `input_text`：`encrypted_content` 只有 OpenAI 读得懂，解码时丢掉了
+        "agent_message" => {
+            if let Some(Value::Array(parts)) = item.get("content") {
+                c.key("content", |c| {
+                    for (i, p) in parts.iter().enumerate() {
+                        if str_of(p, "type") == Some("input_text") {
+                            c.index(i, |c| c.field(p, "text", false));
+                        }
+                    }
+                });
             }
         }
         "function_call_output" | "custom_tool_call_output" => {

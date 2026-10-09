@@ -566,3 +566,137 @@ async fn a_dangerous_call_is_cut_in_a_converted_gemini_json_array_stream() {
     // 转换出来的数组由转换器收尾，一样是完整的
     assert_array_ends_in_error(&body, "我来装一下依赖。");
 }
+
+/// Codex 用 Responses Lite 时的请求：顶层没有 `tools`，工具全在 `input` 开头的
+/// `additional_tools` 里（`functions` 这个 namespace 装着函数和自由格式工具）
+fn codex_lite_request() -> Value {
+    json!({
+        "model": "claude-opus-4-7",
+        "stream": true,
+        "input": [
+            {"id": "at_1", "type": "additional_tools", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "", "tools": [
+                    {"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": false,
+                     "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
+                    {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+                     "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}}
+                ]},
+                {"type": "namespace", "name": "mcp__codex_apps__calendar", "description": "Plan events.", "tools": [
+                    {"type": "function", "name": "_create_event", "description": "Create an event.", "strict": false,
+                     "parameters": {"type": "object"}}
+                ]}
+            ]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list the files"}]}
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {"effort": "medium", "summary": "auto", "context": "all_turns"},
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "019a",
+        "text": {"verbosity": "low"}
+    })
+}
+
+#[tokio::test]
+async fn a_codex_responses_lite_request_reaches_claude_with_every_tool() {
+    // 上游调用 Codex 默认 namespace 里的两个工具：一个函数、一个自由格式
+    let stream = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"exec_command\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"apply_patch\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"*** Begin Patch\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":12}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let (up, seen) = upstream(200, "text/event-stream", stream).await;
+    let (gw, mut rx) = gateway(provider(up, Protocol::Anthropic), SecurityMode::Observe).await;
+    let (status, ct, body) = post(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        codex_lite_request(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ct, "text/event-stream");
+
+    // 发给 Claude 的请求里工具一个不少
+    let sent: Value = serde_json::from_slice(&seen.lock().unwrap().body).unwrap();
+    let names: Vec<&str> = sent["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("没有工具：{sent}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "exec_command",
+            "apply_patch",
+            "mcp__codex_apps__calendar_create_event"
+        ]
+    );
+
+    // Codex 收到的调用用的是它自己的写法
+    let done: Vec<Value> = data_frames(&body)
+        .into_iter()
+        .filter(|f| f["type"] == "response.output_item.done")
+        .map(|f| f["item"].clone())
+        .collect();
+    assert_eq!(done.len(), 2, "{body}");
+    assert_eq!(done[0]["type"], "function_call");
+    assert_eq!(done[0]["namespace"], "functions");
+    assert_eq!(done[0]["name"], "exec_command");
+    assert_eq!(done[0]["arguments"], "{\"cmd\":\"ls\"}");
+    assert_eq!(done[1]["type"], "custom_tool_call");
+    assert_eq!(done[1]["namespace"], "functions");
+    assert_eq!(done[1]["name"], "apply_patch");
+    assert_eq!(done[1]["input"], "*** Begin Patch");
+
+    // 说出来的丢弃字段里没有工具声明
+    let mut dropped = None;
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::Translated { dropped: d, .. } = ev {
+            dropped = Some(d);
+            break;
+        }
+    }
+    assert_eq!(
+        dropped.expect("没发翻译事件"),
+        ["tools.custom.format", "text.verbosity"]
+    );
+}
+
+#[tokio::test]
+async fn a_codex_responses_lite_request_to_openai_goes_byte_for_byte() {
+    let reply = concat!(
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",",
+        "\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+    );
+    let (up, seen) = upstream(200, "text/event-stream", reply.into()).await;
+    let (gw, _) = gateway(
+        provider(up, Protocol::OpenaiResponses),
+        SecurityMode::Observe,
+    )
+    .await;
+    let sent = codex_lite_request();
+    let (status, _, body) = post(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        sent.clone(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        seen.lock().unwrap().body,
+        sent.to_string().into_bytes(),
+        "同格式直通改了请求体"
+    );
+}
