@@ -398,7 +398,7 @@ Upstreams: the APIs requests are forwarded to.
 | `forward_client_identity` | bool | `false` | Also send the client's own identity: its `User-Agent`, identity headers such as `x-app` and `originator`, and identity fields in the request body such as `metadata.user_id`. Values are the client's, never made up. Off: requests carry ThinkWatch's `User-Agent` and no client identity. For upstreams that admit only certain clients (Kimi For Coding, Bailian Coding Plan, relays restricted to official clients). Not available for `chatgpt`. |
 | `proxy` | string | `direct` | `direct`; `system`, the proxy in the core process's `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` environment variables; or the name of an entry in `proxies`. |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | When the proxy cannot be reached: `fail` the request, or go `direct`. |
-| `models` | list of strings | `[]` | Models to assume when the upstream does not answer `/v1/models`. |
+| `models` | list of strings | `[]` | Models added by hand, by exact id, for those the upstream serves but leaves out of its list. They count as offered together with the models the upstream lists, or are the whole list when it lists none: they appear in `/v1/models` and requests for them are routed here. `models_only` still applies. No wildcards, no duplicates, at most 256 characters each. |
 | `models_only` | list of strings | — | Use only these of the upstream's models, as ids or globs. Others are not listed and are not routed here. Unset: all of them. Empty is refused; use `disabled`. |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`: cost is usage times the price in the upstream's price sheet, subscription accounts included. `free`: cost is recorded as 0. |
 | `pricing` | string | — | Name of a price sheet under `pricing.sheets`. Unset: the default price table. |
@@ -434,6 +434,16 @@ providers:
     protocol: openai-chat
     billing: free
 ```
+
+An upstream's models are the ones it lists on `/v1/models` (for Bedrock, the
+region's model list) and the ones written in `models`. Upstreams often leave
+models out of their list: a relay lists only some of what it serves, an
+account backend hides new models from older clients. A model added in `models`
+is listed in `/v1/models`, can be named by an alias, pinned in a rule and
+allowed for a key, and is routed to this upstream like a listed one;
+`models_only` applies to both. An upstream that lists nothing has exactly the
+models in `models`; one with neither lists no model and is still sent requests
+for any model.
 
 A request carries the request itself and the headers its upstream needs,
 and nothing else from the client: the credential and the headers written in

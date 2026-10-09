@@ -803,10 +803,14 @@ pub struct Provider {
     pub proxy: String,
     #[serde(default, skip_serializing_if = "is_default_on_proxy_fail")]
     pub on_proxy_fail: OnProxyFail,
-    /// 探测不到时的兜底清单。
+    /// 手动添加的模型：**一律算这家提供**，和上游自己列出的合在一起（上游没给出清单时
+    /// 就是全部）。
     ///
-    /// 有些中转站没实现 `/v1/models`。**这是 provider 级的「这家有什么」，
-    /// 不是全局的「我们对外暴露什么」** —— 那个由汇总推导出来。
+    /// 上游的清单不全是常事：ChatGPT 账号的后端对旧版本的客户端藏起新模型，中转站只列
+    /// 一部分，有的中转站根本没实现 `/v1/models`。清单里没有、这里写了的模型照样列进
+    /// `/v1/models`、照样路由到这家。**这是 provider 级的「这家有什么」，不是全局的
+    /// 「我们对外暴露什么」** —— 那个由汇总推导出来；启用范围（`models_only`）照样管着
+    /// 它们。每一项是一个确切的模型 ID，见 [`check_manual_models`]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
     /// 只用这家的这些模型：模型 ID 或 glob。不写就是它提供的全部。
@@ -844,6 +848,10 @@ pub struct Provider {
 
 /// 一家上游的并发上限最多写多少
 pub const MAX_PROVIDER_CONCURRENCY: u32 = 1000;
+
+/// 手动添加的一个模型 ID 最多多少个字符。最长的真名字是 Bedrock 应用推理配置的 ARN，
+/// 一百来个字符
+pub const MANUAL_MODEL_MAX: usize = 256;
 
 impl Provider {
     /// 这家的这个模型在不在启用范围里（`models_only`）。**不管这家到底
@@ -1206,7 +1214,7 @@ pub use security::{
 };
 // Billing 在本文件里定义，这里不必再导出
 pub use store::{Fingerprint, Loaded, StoreError, version_of};
-pub use validate::{check_aliases, check_model_spec, validate};
+pub use validate::{check_aliases, check_manual_models, check_model_spec, validate};
 
 pub fn default_path() -> PathBuf {
     tw_api::data::dir().join("config.yaml")

@@ -296,7 +296,7 @@ clients:
 | `forward_client_identity` | 布尔 | `false` | 同时发送客户端自己的身份：它的 `User-Agent`、`x-app` 和 `originator` 等身份请求头，以及请求体中的身份字段（如 `metadata.user_id`）。发送的都是客户端的原值，不做伪造。关闭时请求使用 ThinkWatch 的 `User-Agent`，不带客户端身份。用于只接受特定客户端的上游（Kimi For Coding、百炼 Coding Plan、只允许官方客户端的中转站）。`chatgpt` 不可用。 |
 | `proxy` | 字符串 | `direct` | `direct`；`system`，即 core 进程环境变量 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 中的代理；或 `proxies` 中某一项的名字。 |
 | `on_proxy_fail` | `fail` \| `direct` | `fail` | 代理不可用时：请求失败（`fail`），或改为直连（`direct`）。 |
-| `models` | 字符串列表 | `[]` | 上游不支持 `/v1/models` 时，按这份清单认定它提供的模型。 |
+| `models` | 字符串列表 | `[]` | 手动添加的模型，写确切的 ID：上游能服务、却没有列进清单的模型。它们和上游列出的模型一起算作这家提供的模型，上游不提供清单时就是全部：出现在 `/v1/models` 里，相应的请求也会路由到这家。`models_only` 照样适用。不支持通配，不能重复，每项最多 256 个字符。 |
 | `models_only` | 字符串列表 | — | 只使用这家的这些模型，写 ID 或通配。范围外的模型不出现在模型列表里，也不会路由到这家。不写：全部。写空列表会被拒绝，暂停使用请用 `disabled`。 |
 | `billing` | `per-token` \| `free` | `per-token` | `per-token`：费用为用量乘以所选价目表中的单价，订阅账号同样如此。`free`：费用记为 0。 |
 | `pricing` | 字符串 | — | `pricing.sheets` 中某张价目表的名字。不写：默认价目表。 |
@@ -328,6 +328,8 @@ providers:
     protocol: openai-chat
     billing: free
 ```
+
+一家上游提供的模型，是它在 `/v1/models` 列出的模型（Bedrock 为所在区域的模型清单），加上 `models` 中手动添加的模型。上游的清单常常不全：中转站只列出一部分，账号类的后端对旧版本客户端隐藏新模型。写进 `models` 的模型出现在 `/v1/models` 里，可以写进别名、在规则中指定、在密钥的 `allow` 中放行，也和列出的模型一样路由到这家；`models_only` 对两者同样适用。上游不提供清单时，`models` 就是它的全部模型；两者都没有时，它不列出任何模型，但任何模型的请求仍可能路由到这家。
 
 每个请求只带请求本身和上游需要的请求头，客户端的其他信息一律不发：凭据和 `headers` 中写的请求头、ThinkWatch 自己的 `User-Agent`，以及客户端请求中该上游协议使用的请求头（Anthropic 为 `anthropic-*`，OpenAI 为 `Idempotency-Key` 和 `X-Client-Request-Id`，Gemini 没有）。客户端自动填写的身份字段（如 Claude Code 的 `metadata.user_id`）从请求体中去掉。只接受特定客户端的上游，打开 `forward_client_identity`。
 

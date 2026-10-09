@@ -1,5 +1,10 @@
-//! 每个上游提供哪些模型：向上游要来的、配置里手写的，以及它们是什么时候、
+//! 每个上游提供哪些模型：向上游要来的、配置里手动添加的，以及它们是什么时候、
 //! 怎么来的。
+//!
+//! **手动添加的模型（配置里的 `models`）一律算这家提供**，和上游列出的合在一起；
+//! 上游没给出清单时它们就是全部。上游的清单不全是常事 —— ChatGPT 账号的后端对旧版本
+//! 的客户端藏起新模型，中转站只列一部分 —— 而清单是准入和挑候选的依据：只认清单的话，
+//! 清单里漏掉的模型就到不了一家明明能服务它的上游。
 //!
 //! # 两份东西
 //!
@@ -47,7 +52,7 @@ const TICK: Duration = Duration::from_secs(10 * 60);
 pub enum Source {
     /// 上游自己列出来的
     Discovered,
-    /// 上游没给出清单，用配置里手写的 `models`
+    /// 上游没给出清单，用配置里手动添加的 `models`
     Manual,
     /// 都没有。**不知道它有什么**，不是它什么都没有
     None,
@@ -64,7 +69,7 @@ impl Source {
 }
 
 /// 最近一次向上游问的结果。**和 [`Source`] 不是一回事**：没问到时清单可能
-/// 来自手写的兜底（`Manual`），而界面要说的是「问了，没问到，为什么」。
+/// 来自手动添加的那些（`Manual`），而界面要说的是「问了，没问到，为什么」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     /// 还没问过：刚启动、刚加的、刚改了地址或凭据。停用的上游一直是这样 ——
@@ -98,8 +103,11 @@ pub struct Listing {
     /// 正在向上游问。**和 `status` 同时成立**：上一次的答案照常可用，
     /// 新答案回来之前不作废
     pub fetching: bool,
-    /// 清单本身。**还没按启用范围过滤**
+    /// 清单本身：上游列出的，后面接上手动添加的（上游也列了的不重复）。**还没按启用
+    /// 范围过滤**
     pub models: Vec<String>,
+    /// 其中上游自己列出的。上游没给出清单时是空的
+    pub listed: Vec<String>,
     /// 最近一次向上游问的时间。还没问过是空
     pub checked_at_ms: Option<u64>,
     /// 没从上游拿到清单的原因
@@ -345,21 +353,24 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
         Some(Answer::Failed(_)) => Status::Failed,
     };
     match entry.map(|e| &e.answer) {
-        Some(Answer::Listed(models)) => Listing {
+        // 上游列出的在前，手动添加的接在后面。**删得掉的只有手动添加的那些**：上游列出
+        // 的模型不该用的话，用启用范围把它排除在外
+        Some(Answer::Listed(listed)) => Listing {
             source: Source::Discovered,
             status,
             fetching,
-            models: models.clone(),
+            models: with_manual(listed, &p.models),
+            listed: listed.clone(),
             checked_at_ms,
             error: None,
         },
-        // 问不到就用手写的兜底。**两者不合并** —— 合并的话，用户删掉一个
-        // 上游不再提供的模型时会发现它删不掉
+        // 问不到：手动添加的就是全部
         _ if !p.models.is_empty() => Listing {
             source: Source::Manual,
             status,
             fetching,
-            models: p.models.clone(),
+            models: with_manual(&[], &p.models),
+            listed: Vec::new(),
             checked_at_ms,
             error,
         },
@@ -368,10 +379,23 @@ fn listing_of(entry: Option<&Entry>, p: &tw_config::Provider) -> Listing {
             status,
             fetching,
             models: Vec::new(),
+            listed: Vec::new(),
             checked_at_ms,
             error,
         },
     }
+}
+
+/// 上游列出的 `listed`，后面接上手动添加的 `manual` 里它没列的，各自的顺序不变。
+fn with_manual(listed: &[String], manual: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = listed.iter().map(String::as_str).collect();
+    let mut out = listed.to_vec();
+    for m in manual {
+        if seen.insert(m.as_str()) {
+            out.push(m.clone());
+        }
+    }
+    out
 }
 
 /// 问一家上游有哪些模型。
@@ -1271,6 +1295,81 @@ mod tests {
         assert_eq!(d.listing(&fresh).status, Status::Listed);
     }
 
+    /// 手动添加的模型和上游列出的合在一起：上游列出的在前，都有的只算一次；汇总里它和
+    /// 列出的一样算这家提供 —— 按名称要、经过别名、规则指定都到得了这家。启用范围照样管着
+    /// 它；从配置里拿掉之后回到只认上游的清单
+    #[test]
+    fn models_added_by_hand_join_the_listed_ones_and_count_as_offered() {
+        let d = Directory::default();
+        let mut c = cfg(vec![provider("chatgpt"), provider("relay")]);
+        c.providers[0].models = vec!["gpt-6-luna".into(), "gpt-5".into()];
+        c.aliases = serde_yaml_ng::from_str("luna: [gpt-6-luna]\n").unwrap();
+        d.reconcile(&c);
+        for p in &c.providers {
+            d.record(
+                &p.name,
+                &identity(&c, p),
+                Answer::Listed(vec!["gpt-5".into(), "gpt-5-mini".into()]),
+                1,
+            );
+        }
+        let l = d.listing(&c.providers[0]);
+        assert_eq!(l.source, Source::Discovered);
+        assert_eq!(l.models, ["gpt-5", "gpt-5-mini", "gpt-6-luna"]);
+        assert_eq!(l.listed, ["gpt-5", "gpt-5-mini"]);
+
+        let cat = published(&d, &c);
+        assert_eq!(cat.offers("chatgpt", "gpt-6-luna"), Some(true));
+        assert_eq!(cat.offers("relay", "gpt-6-luna"), Some(false));
+        assert_eq!(cat.providers_for("gpt-6-luna"), ["chatgpt"]);
+        assert_eq!(cat.providers_for("luna"), ["chatgpt"]);
+        assert_eq!(cat.count_for("chatgpt"), 3);
+        let both = ["chatgpt", "relay"];
+        // 按名称要
+        let s = serving(&c, &cat, &decided(&[]), &asked(&both, "gpt-6-luna"), None);
+        assert_eq!(s.usable, ["chatgpt"]);
+        assert_eq!(s.skipped, [("relay".to_string(), Skip::NotOffered)]);
+        // 经过别名
+        let s = serving(&c, &cat, &decided(&[]), &asked(&both, "luna"), None);
+        assert_eq!(s.usable, ["chatgpt"]);
+        assert_eq!(
+            sent_to(&c, &cat, &decided(&[]), &c.providers[0], "luna"),
+            Ok("gpt-6-luna".into())
+        );
+        // 规则指定
+        let pinned = decided(&[("chatgpt", "gpt-6-luna")]);
+        let s = serving(
+            &c,
+            &cat,
+            &pinned,
+            &[("chatgpt".into(), "gpt-6-luna".into())],
+            None,
+        );
+        assert_eq!(s.usable, ["chatgpt"]);
+
+        // 启用范围照样管着手动添加的
+        let mut scoped = c.clone();
+        scoped.providers[0].models_only = Some(vec!["gpt-5*".into()]);
+        let cat = published(&d, &scoped);
+        assert_eq!(cat.offers("chatgpt", "gpt-6-luna"), Some(false));
+        assert_eq!(
+            fit(&cat, &scoped.providers[0], "gpt-6-luna"),
+            Some(Skip::OutOfScope)
+        );
+
+        // 拿掉：只认上游的清单，不用重问
+        c.providers[0].models.clear();
+        assert!(!d.reconcile(&c));
+        let cat = published(&d, &c);
+        assert_eq!(d.listing(&c.providers[0]).models, ["gpt-5", "gpt-5-mini"]);
+        assert_eq!(cat.offers("chatgpt", "gpt-6-luna"), Some(false));
+        assert!(cat.providers_for("luna").is_empty());
+        assert_eq!(
+            fit(&cat, &c.providers[0], "gpt-6-luna"),
+            Some(Skip::NotOffered)
+        );
+    }
+
     #[test]
     fn a_failure_with_a_manual_list_says_both() {
         let d = Directory::default();
@@ -1287,6 +1386,7 @@ mod tests {
         // 清单来自手写的兜底，但「问了、没问到、为什么」一样要说
         assert_eq!((l.source, l.status), (Source::Manual, Status::Failed));
         assert_eq!(l.models, ["手写"]);
+        assert!(l.listed.is_empty());
         assert_eq!(l.error.as_ref().map(|m| m.text.as_str()), Some("密钥被拒"));
     }
 }

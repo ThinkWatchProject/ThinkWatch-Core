@@ -593,8 +593,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Strs,
                     Def::Is("[]"),
                     t(
-                        "Models to assume when the upstream does not answer `/v1/models`.",
-                        "上游不支持 `/v1/models` 时，按这份清单认定它提供的模型。",
+                        "Models added by hand, by exact id, for those the upstream serves but leaves out of its list. They count as offered together with the models the upstream lists, or are the whole list when it lists none: they appear in `/v1/models` and requests for them are routed here. `models_only` still applies. No wildcards, no duplicates, at most 256 characters each.",
+                        "手动添加的模型，写确切的 ID：上游能服务、却没有列进清单的模型。它们和上游列出的模型一起算作这家提供的模型，上游不提供清单时就是全部：出现在 `/v1/models` 里，相应的请求也会路由到这家。`models_only` 照样适用。不支持通配，不能重复，每项最多 256 个字符。",
                     ),
                 ),
                 row(

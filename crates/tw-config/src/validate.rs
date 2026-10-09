@@ -104,6 +104,17 @@ pub enum ValidationError {
     #[error("{}", self.msg())]
     AliasOnlyItself { alias: String },
     #[error("{}", self.msg())]
+    ManualModelBlank { upstream: String },
+    #[error("{}", self.msg())]
+    ManualModelPadded { upstream: String, model: String },
+    #[error("{}", self.msg())]
+    ManualModelWildcard { upstream: String, model: String },
+    #[error("{}", self.msg())]
+    ManualModelDuplicate { upstream: String, model: String },
+    /// 太长的那个 ID 不进句子：几百个字符的一串放进提示里，比说「太长」更看不清
+    #[error("{}", self.msg())]
+    ManualModelTooLong { upstream: String },
+    #[error("{}", self.msg())]
     ModelSpecBlankModel { upstream: String },
     #[error("{}", self.msg())]
     ModelSpecWildcard { upstream: String, model: String },
@@ -348,6 +359,30 @@ impl ValidationError {
                 "alias `{alias}` lists only itself, so it changes nothing. List the names the \
                  upstreams use, or remove the alias"
             ),
+            ManualModelBlank { upstream } => msg!(
+                "config.manual_model_blank", upstream = upstream =>
+                "upstream `{upstream}` has an empty entry among the models added by hand (models)"
+            ),
+            ManualModelPadded { upstream, model } => msg!(
+                "config.manual_model_padded", upstream = upstream, model = model =>
+                "the model `{model}` added by hand to upstream `{upstream}` begins or ends with \
+                 whitespace. Write the model id without it"
+            ),
+            ManualModelWildcard { upstream, model } => msg!(
+                "config.manual_model_wildcard", upstream = upstream, model = model =>
+                "the model `{model}` added by hand to upstream `{upstream}` contains * or ?. A \
+                 model added by hand is one exact model id; to use only some of an upstream's \
+                 models, set its scope (models_only)"
+            ),
+            ManualModelDuplicate { upstream, model } => msg!(
+                "config.manual_model_duplicate", upstream = upstream, model = model =>
+                "the model `{model}` is added by hand to upstream `{upstream}` more than once"
+            ),
+            ManualModelTooLong { upstream } => msg!(
+                "config.manual_model_too_long", upstream = upstream,
+                max = crate::MANUAL_MODEL_MAX =>
+                "a model added by hand to upstream `{upstream}` is longer than {max} characters"
+            ),
             ModelSpecBlankModel { upstream } => msg!(
                 "config.model_spec_blank_model", upstream = upstream =>
                 "upstream `{upstream}` has a model spec (model_specs) for an empty model id"
@@ -484,6 +519,7 @@ pub fn validate(cfg: &Config) -> Result<(), ValidationError> {
                 });
             }
         }
+        check_manual_models(&p.name, &p.models)?;
         for (model, spec) in &p.model_specs {
             check_model_spec(&p.name, model, Some(spec))?;
         }
@@ -794,6 +830,41 @@ pub fn check_aliases(aliases: &crate::Aliases) -> Result<(), ValidationError> {
 /// 一家上游的一项手写模型规格写得对不对，和整份配置的校验是同一套（控制面保存一项
 /// 之前也用它）。`spec` 是 `None` 时只查模型 ID：界面要删掉这一项。**模型在不在这家的
 /// 清单里不查**：清单是运行时问来的。
+/// 一家上游手动添加的模型（`models`）写得对不对：每一项是一个确切的模型 ID —— 不空、
+/// 首尾没有空白、不带通配、不超过 [`crate::MANUAL_MODEL_MAX`] 个字符 —— 而且不重复。
+///
+/// 配置的校验和控制面设清单的端点用的是同一份：端点先去掉首尾空白再交过来。
+pub fn check_manual_models(upstream: &str, models: &[String]) -> Result<(), ValidationError> {
+    let named = |model: &str| (upstream.to_string(), model.to_string());
+    let mut seen = std::collections::HashSet::new();
+    for model in models {
+        if model.trim().is_empty() {
+            return Err(ValidationError::ManualModelBlank {
+                upstream: upstream.to_string(),
+            });
+        }
+        if model.trim() != model {
+            let (upstream, model) = named(model);
+            return Err(ValidationError::ManualModelPadded { upstream, model });
+        }
+        if model.chars().count() > crate::MANUAL_MODEL_MAX {
+            return Err(ValidationError::ManualModelTooLong {
+                upstream: upstream.to_string(),
+            });
+        }
+        // `gpt-*` 写在这里，读的人会以为一批模型都加上了 —— 而它只是一个叫 `gpt-*` 的名字
+        if model.contains(['*', '?']) {
+            let (upstream, model) = named(model);
+            return Err(ValidationError::ManualModelWildcard { upstream, model });
+        }
+        if !seen.insert(model.as_str()) {
+            let (upstream, model) = named(model);
+            return Err(ValidationError::ManualModelDuplicate { upstream, model });
+        }
+    }
+    Ok(())
+}
+
 pub fn check_model_spec(
     upstream: &str,
     model: &str,
@@ -922,6 +993,44 @@ mod tests {
     #[test]
     fn a_valid_minimal_config_passes() {
         assert!(validate(&cfg(vec![c("d", "tw-1")], vec![p("r", "https://x.com")])).is_ok());
+    }
+
+    #[test]
+    fn models_added_by_hand_are_exact_ids_written_once() {
+        let parse = |models: &str| {
+            crate::try_parse(&format!(
+                "version: 1\nlisten:\n  control:\n    key: {}\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: relay\n    base_url: https://relay.example.com/v1\n    models: {models}\n",
+                "c0".repeat(32)
+            ))
+        };
+        let ok = parse("[gpt-6-luna, \"us.anthropic.claude-fable-5-v1:0\"]").unwrap();
+        assert_eq!(
+            ok.providers[0].models,
+            ["gpt-6-luna", "us.anthropic.claude-fable-5-v1:0"]
+        );
+        let long = "m".repeat(crate::MANUAL_MODEL_MAX + 1);
+        for (models, code) in [
+            ("[\"\"]", "config.manual_model_blank"),
+            ("[\"  \"]", "config.manual_model_blank"),
+            ("[\" gpt-6\"]", "config.manual_model_padded"),
+            ("[gpt-*]", "config.manual_model_wildcard"),
+            ("[gpt-6, gpt-6]", "config.manual_model_duplicate"),
+            (long.as_str(), "config.manual_model_too_long"),
+        ] {
+            let models = if models.starts_with('[') {
+                models.to_string()
+            } else {
+                format!("[{models}]")
+            };
+            let m = parse(&models).unwrap_err().msg();
+            assert_eq!(m.code, code, "{models}: {m:?}");
+            assert_eq!(m.arg("upstream"), "relay", "{m:?}");
+        }
+        // 正好那么长的可以
+        let longest = "m".repeat(crate::MANUAL_MODEL_MAX);
+        assert!(parse(&format!("[{longest}]")).is_ok());
+        let m = parse("[gpt-6, gpt-6]").unwrap_err().msg();
+        assert_eq!(m.arg("model"), "gpt-6");
     }
 
     #[test]
