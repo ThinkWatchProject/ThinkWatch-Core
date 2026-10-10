@@ -41,7 +41,8 @@ impl Parser {
     }
 
     pub fn chunk(&mut self, v: &Value, out: &mut Vec<Event>) {
-        if let Some(e) = v.get("error") {
+        // `"error": null` 不是错误
+        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
             out.push(Event::Error {
                 message: str_of(e, "message")
                     .unwrap_or("the upstream returned an error")

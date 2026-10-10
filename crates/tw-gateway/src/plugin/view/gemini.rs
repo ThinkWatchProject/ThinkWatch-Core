@@ -272,7 +272,7 @@ fn part(
             key,
             &id,
             &response_text(body),
-            body.get("error").is_some() && body.get("output").is_none(),
+            body.get("error").is_some_and(|e| !e.is_null()) && body.get("output").is_none(),
         );
     }
     let label = p

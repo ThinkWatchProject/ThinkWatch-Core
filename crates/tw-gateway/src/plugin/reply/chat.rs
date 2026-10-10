@@ -152,7 +152,7 @@ impl Codec {
             out.push(Out::Keep(f));
             return Ok(());
         };
-        if data.get("error").is_some() {
+        if data.get("error").is_some_and(|e| !e.is_null()) {
             self.close_lane(chain, out).await?;
             self.settle(chain, out).await?;
             out.push(Out::Keep(f));

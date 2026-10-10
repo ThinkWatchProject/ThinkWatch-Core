@@ -42,9 +42,14 @@ impl Parser {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return;
         };
-        if let Some(e) = v.get("error") {
+        // 有的中转每一块都带着 `"error": null`：那不是错误
+        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+            // 没写说明的不拿整块凑：那一块里可能是回答的正文
             out.push(Event::Error {
-                message: str_of(e, "message").unwrap_or(data).to_string(),
+                message: str_of(e, "message")
+                    .or_else(|| e.as_str())
+                    .unwrap_or("the upstream returned an error")
+                    .to_string(),
             });
             return;
         }
@@ -301,6 +306,34 @@ mod tests {
         }
         p.finish(&mut out);
         out
+    }
+
+    /// 有的中转每一块都带着 `"error": null`：照常读内容。真的错误没写说明时，不拿那一块凑
+    #[test]
+    fn a_null_error_is_read_as_content_and_a_bare_error_has_no_chunk_for_a_message() {
+        let ev = parse(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"secret answer\"}}],\"error\":null}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert!(
+            !ev.iter().any(|e| matches!(e, Event::Error { .. })),
+            "{ev:#?}"
+        );
+        assert!(
+            ev.iter().any(
+                |e| matches!(e, Event::Delta { delta: Delta::Text(t), .. } if t == "secret answer")
+            ),
+            "{ev:#?}"
+        );
+        let ev = parse(&[
+            "data: {\"error\":{\"code\":\"server_error\"},\"note\":\"secret answer\"}\n\n",
+        ]);
+        assert_eq!(
+            ev,
+            vec![Event::Error {
+                message: "the upstream returned an error".into()
+            }]
+        );
     }
 
     #[test]
