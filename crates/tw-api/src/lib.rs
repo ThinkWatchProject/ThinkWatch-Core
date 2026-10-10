@@ -885,7 +885,17 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 请求体没存下来、已经清掉、只存了开头或读不懂的，`kept` 是 false、`parts` 是 null。
 /// 会话不存在是 404（`control.session_not_found`），那一轮不在这次会话里也是 404
 /// （`control.request_not_found`）。照 44 写的界面读不到 `context_window`。
-pub const CONTROL_API_VERSION: u32 = 45;
+///
+/// **46 起上游有余额**：[`ProviderView`] 多了 `balance`（[`Balance`]：钱包余额、总额度、
+/// 时间窗口额度（企业网关的带着管的是密钥还是用户）、到期时刻、花了多少，和最近一次没读成
+/// 的原因；没有余额可读是 null）
+/// 和 `balance_setting`（配置里的 `balance:`，[`BalanceSetting`]）；[`ProviderInput`] 多了
+/// `balance`（不给是 `auto`），[`ProviderTestResult`] 多了 `balance`（检测时顺带读一次）。
+/// 新事件 [`Event::BalanceUpdated`]：一家的余额读过了，重读它的视图。新端点
+/// `POST /providers/{name}/balance/refresh`（→ [`Balance`]）马上读一次；没有余额可读是 404
+/// （`control.balance_none`）。读失败的原因是 `gw.balance.*`。配置里的 `balance:` 写了不认识的
+/// 取值时加载不了（`config.unknown_variant`，一键修复改回 `auto`）。照 45 写的界面不认这个事件。
+pub const CONTROL_API_VERSION: u32 = 46;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1479,6 +1489,14 @@ pub enum Event {
         resets_at_ms: Option<u64>,
         at_ms: u64,
     },
+    /// 一家上游的余额读过了一次：读到了、读失败了，或者不再有余额可读。
+    ///
+    /// **不带余额本身**：现状在 [`ProviderView::balance`] 里，收到它就重读那一家。
+    BalanceUpdated {
+        id: u64,
+        provider: String,
+        at_ms: u64,
+    },
     /// 一把网关密钥这一期（天、周、月）的用量到了一条上限的八成，或者到了上限。
     ///
     /// **每一期、每一档只报一次**：同一期里之后的请求照样被拒，同一句话说第二遍只会
@@ -1867,6 +1885,7 @@ impl Event {
             | Event::ConfigRejected { id, .. }
             | Event::QuotaSeen { id, .. }
             | Event::QuotaExhausted { id, .. }
+            | Event::BalanceUpdated { id, .. }
             | Event::KeyLimitAlert { id, .. }
             | Event::SecretsFound { id, .. }
             | Event::ContentMatched { id, .. }
@@ -2231,6 +2250,12 @@ pub struct ProviderView {
     /// 同时最多发给这家几个请求。不限是空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// 配置里的 `balance:`，原样：编辑对话框保存时交回去（[`ProviderInput::balance`]）
+    pub balance_setting: BalanceSetting,
+    /// 最近一次读到的余额。**是空的：这家没有余额可读**（关掉了、账号上游和 Bedrock、
+    /// 认不出是哪一种中转站），或者还没读完第一次。读到了、读失败了都报
+    /// [`Event::BalanceUpdated`]
+    pub balance: Option<Balance>,
 }
 
 /// 一行请求头，配置里写的原样。
@@ -2684,6 +2709,9 @@ pub struct ProviderTestResult {
     pub via: Option<String>,
     /// 失败的原因，和下一步该查什么
     pub error: Option<Msg>,
+    /// 顺带读到的余额（`balance` 是 `auto` 时先认出是哪一种中转站）。没有余额可读、
+    /// 检测没通过时是空
+    pub balance: Option<Balance>,
 }
 
 /// L1 测速：只握手，不发业务请求。**零成本零副作用**。
@@ -3174,6 +3202,9 @@ pub struct ProviderInput {
     /// 停用
     #[serde(default)]
     pub disabled: bool,
+    /// 余额从哪儿读。不给就是 `auto`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceSetting>,
 }
 
 /// 按接口地址自动识别的结果。给编辑中、还没保存的上游显示「自动识别」
@@ -4702,6 +4733,148 @@ pub struct BodyView {
 pub struct ProviderQuota {
     pub provider: String,
     pub windows: Vec<QuotaWindow>,
+}
+
+// ---------------------------------------------------------------- 余额
+
+slug_enum! {
+    /// 上游的余额从哪个接口读。每一种都用这家上游自己的密钥、走它自己的出站设置。
+    pub enum BalanceSource {
+        /// OpenRouter：这把密钥的额度（`/api/v1/key`），没有额度时是账户余额（`/api/v1/credits`）
+        Openrouter = "openrouter",
+        /// DeepSeek 开放平台的账户余额（`/user/balance`）
+        Deepseek = "deepseek",
+        /// Moonshot（Kimi）开放平台的可用余额（`/v1/users/me/balance`）
+        Moonshot = "moonshot",
+        /// Sub2API 中转站的用量接口（`/v1/usage`）
+        Sub2api = "sub2api",
+        /// New API / One API 中转站的账单接口（`/v1/dashboard/billing/...`）
+        Newapi = "newapi",
+        /// ThinkWatch 企业网关的密钥用量接口（`/v1/usage`）
+        Thinkwatch = "thinkwatch",
+    }
+}
+
+slug_enum! {
+    /// 一家上游的 `balance:` 写的是什么。
+    pub enum BalanceSetting {
+        /// 默认：官方地址按主机认，别的地址问一次它是哪一种中转站（结果只在内存里）
+        Auto = "auto",
+        /// 不读余额
+        Off = "off",
+        Openrouter = "openrouter",
+        Deepseek = "deepseek",
+        Moonshot = "moonshot",
+        Sub2api = "sub2api",
+        Newapi = "newapi",
+        Thinkwatch = "thinkwatch",
+    }
+}
+
+impl BalanceSetting {
+    /// 写明了的来源。`auto` 和 `off` 没有
+    pub fn source(self) -> Option<BalanceSource> {
+        match self {
+            Self::Auto | Self::Off => None,
+            Self::Openrouter => Some(BalanceSource::Openrouter),
+            Self::Deepseek => Some(BalanceSource::Deepseek),
+            Self::Moonshot => Some(BalanceSource::Moonshot),
+            Self::Sub2api => Some(BalanceSource::Sub2api),
+            Self::Newapi => Some(BalanceSource::Newapi),
+            Self::Thinkwatch => Some(BalanceSource::Thinkwatch),
+        }
+    }
+}
+
+/// 一家上游的余额：最近一次从它的余额接口读到的。**每个数都是上游给的**，没有一个是
+/// 我们按请求记录推算的。
+///
+/// 读失败了 `error` 是原因，**其余字段留着上一次读到的**（从没读到过就是空的），
+/// `read_at_ms` 也还是那一次的。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Balance {
+    pub source: BalanceSource,
+    /// 这些数是什么时候读到的，Unix 毫秒。从没读到过时是最近一次去读的时刻
+    pub read_at_ms: u64,
+    /// 还能花的钱：账户余额、钱包余额
+    pub wallet: Option<Money>,
+    /// 一笔总的额度和用了多少：密钥的额度、套餐的总额
+    pub quota: Option<BalanceQuota>,
+    /// 按时间窗口算的额度，每个窗口一项。没有是空的
+    pub windows: Vec<BalanceWindow>,
+    /// 密钥或套餐什么时候到期，Unix 毫秒。不会到期、上游没说都是空
+    pub expires_at_ms: Option<u64>,
+    /// 已经花了多少，和算的是哪一段时间：没有上限可比时说得出的就是它（New API 不限
+    /// 额度的密钥、Sub2API 今天的花费、企业网关这个月的花费）
+    pub spent: Option<Spent>,
+    /// 最近一次没读成的原因。读成了是空
+    pub error: Option<Msg>,
+}
+
+/// 一笔钱。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Money {
+    pub amount: f64,
+    /// `USD`、`CNY` 这样的货币代码，上游怎么写就是什么
+    pub currency: String,
+}
+
+slug_enum! {
+    /// 花费算的是哪一段时间。
+    pub enum SpentPeriod {
+        Today = "today",
+        Month = "month",
+        /// 从来一共
+        Total = "total",
+    }
+}
+
+/// 已经花掉的一笔钱。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Spent {
+    pub amount: f64,
+    pub currency: String,
+    pub period: SpentPeriod,
+}
+
+slug_enum! {
+    /// 企业网关的一条限额管的是谁。
+    pub enum BalanceScope {
+        /// 这把密钥自己的
+        Key = "key",
+        /// 密钥所属的用户的：同一个用户的几把密钥合在一起算
+        User = "user",
+    }
+}
+
+/// 一笔总的额度。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct BalanceQuota {
+    pub limit: f64,
+    pub used: f64,
+    /// `USD` / `CNY` / `tokens` / `requests`
+    pub unit: String,
+}
+
+/// 一个时间窗口里的额度。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct BalanceWindow {
+    /// `5h` / `1d` / `7d` / `30d` / `daily` / `weekly` / `monthly`（企业网关还有 `1m`、`5m`、
+    /// `1h`、`1w`），上游怎么叫就是什么
+    pub window: String,
+    pub limit: f64,
+    pub used: f64,
+    /// `USD` / `CNY` / `tokens` / `requests`
+    pub unit: String,
+    /// 什么时候重置，Unix 毫秒。上游没说是空
+    pub resets_at_ms: Option<u64>,
+    /// 管的是谁：这把密钥，还是它所属的用户。只有企业网关说，别的来源是空
+    pub scope: Option<BalanceScope>,
 }
 
 // ---------------------------------------------------------------- ChatGPT 账号
@@ -6427,6 +6600,22 @@ mod tests {
             assert!(from("no-such-word").is_none());
         }
         check(Billing::ALL, Billing::slug, Billing::from_slug);
+        check(
+            BalanceSource::ALL,
+            BalanceSource::slug,
+            BalanceSource::from_slug,
+        );
+        check(
+            BalanceSetting::ALL,
+            BalanceSetting::slug,
+            BalanceSetting::from_slug,
+        );
+        check(SpentPeriod::ALL, SpentPeriod::slug, SpentPeriod::from_slug);
+        check(
+            BalanceScope::ALL,
+            BalanceScope::slug,
+            BalanceScope::from_slug,
+        );
         check(Protocol::ALL, Protocol::slug, Protocol::from_slug);
         check(Dialect::ALL, Dialect::slug, Dialect::from_slug);
         check(ProxyKind::ALL, ProxyKind::slug, ProxyKind::from_slug);

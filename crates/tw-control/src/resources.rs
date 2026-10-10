@@ -39,6 +39,7 @@ pub fn router() -> axum::Router<ControlState> {
         .at(ep::SetManualModels, set_manual_models)
         .at(ep::RefreshProviderModels, refresh_models)
         .at(ep::RefreshStaleModels, refresh_stale_models)
+        .at(ep::RefreshBalance, refresh_balance)
         .at(ep::CreateProxy, create_proxy)
         .at(ep::TestProxy, test_proxy)
         .at(ep::UpdateProxy, update_proxy)
@@ -259,6 +260,7 @@ async fn test_provider(
         models: tw_api::ModelList::Empty,
         via: via.clone(),
         error: Some(error),
+        balance: None,
     };
     let http = match tw_gateway::client_for_provider(&cfg, &p) {
         Ok(h) => h,
@@ -302,6 +304,13 @@ async fn test_provider(
     } else {
         tw_gateway::probe(&http, &p.base_url, &headers, protocol).await
     };
+    // 通了就顺带读一次余额（`auto` 的先认是哪一种）。不通的不读：地址或凭据不对，
+    // 余额也读不到，只是多等一会儿
+    let balance = if r.ok {
+        s.gateway.check_balance(&http, &p).await
+    } else {
+        None
+    };
     Ok(Json(tw_api::ProviderTestResult {
         ok: r.ok,
         protocol: protocol.map(Into::into),
@@ -309,7 +318,29 @@ async fn test_provider(
         models: crate::model_list(r.models),
         via,
         error: r.error,
+        balance,
     }))
+}
+
+/// 马上读一次这家的余额。没有这一家是 404（`control.upstream_not_found`），它没有余额
+/// 可读也是 404（`control.balance_none`）
+async fn refresh_balance(
+    State(s): State<ControlState>,
+    Path(name): Path<String>,
+) -> Result<Json<tw_api::Balance>, Fail> {
+    if !s.config().providers.iter().any(|p| p.name == name) {
+        return Err(crate::no_such_upstream(&name));
+    }
+    match s.gateway.refresh_balance(&name).await {
+        Some(b) => Ok(Json(b)),
+        None => Err(fail(
+            StatusCode::NOT_FOUND,
+            msg!(
+                "control.balance_none", upstream = &name =>
+                "Upstream `{upstream}` has no balance to read."
+            ),
+        )),
+    }
 }
 
 /// 一个上游的模型清单：每个模型在不在启用范围里、上下文窗口和输出上限多大（手写的
@@ -510,6 +541,7 @@ fn to_provider(
         model_specs: existing.map(|e| e.model_specs.clone()).unwrap_or_default(),
         max_concurrent: input.max_concurrent,
         disabled: input.disabled,
+        balance: input.balance.map(Into::into).unwrap_or_default(),
     };
     // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时
     // 报一条指着 YAML 的错误

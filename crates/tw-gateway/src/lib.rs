@@ -11,6 +11,7 @@ pub mod affinity;
 pub mod answer_model;
 pub mod auth;
 pub mod balance;
+pub mod balances;
 pub mod bedrock;
 pub mod bodies;
 pub mod cache_marks;

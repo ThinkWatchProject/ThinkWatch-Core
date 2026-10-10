@@ -266,6 +266,8 @@ pub(crate) struct Turn {
     /// 密钥的并发通行证和这一家的位置：**跟着这一轮走**，回答完了、连接断了就还
     _pass: crate::limits::Pass,
     _slot: crate::slots::Slot,
+    /// 这一轮结束时记一笔，到了时候重读这一家的余额（见 [`crate::balances`]）
+    _passing: crate::balances::Passing,
 }
 
 impl Turn {
@@ -594,6 +596,7 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
         cut: None,
         _pass: pass,
         _slot: slot,
+        _passing: state.balance_passing(&line.provider),
     })
 }
 

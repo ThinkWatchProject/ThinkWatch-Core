@@ -121,6 +121,7 @@ control.account_service_refused
 control.account_service_status
 control.api_key_empty
 control.bad_idempotency_key
+control.balance_none
 control.base_url_empty
 control.builtin_group_fixed
 control.callback_ports_busy
@@ -275,6 +276,12 @@ gw.auth.key_invalid
 gw.auth.no_key
 gw.auth.source_not_allowed
 gw.auth.source_not_allowed_hint
+gw.balance.connect
+gw.balance.rejected
+gw.balance.request_failed
+gw.balance.status
+gw.balance.timeout
+gw.balance.unrecognized
 gw.busy_all
 gw.busy_upstream
 gw.chatgpt.token_missing
