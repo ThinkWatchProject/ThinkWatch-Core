@@ -48,6 +48,7 @@ pub(super) async fn ws_upgrade(
             .then(|| crate::ws::query_model(query.as_deref()))
             .flatten()
             .unwrap_or_default(),
+        time: Some((state.local_time)()),
         ..Default::default()
     };
     let route = rt.engine.route_of(&client_name).to_string();
@@ -133,6 +134,7 @@ pub(super) async fn ws_upgrade(
         provider: provider.clone(),
         client: client_name.clone(),
         path: uri.path().to_string(),
+        local_time: state.local_time.clone(),
     };
     let (alive, _) = state.health.filter(&decision.candidates);
     // 升级请求带着模型的（Realtime）：挑头一家连得上的 —— 别名对得上、要发给它的名字密钥

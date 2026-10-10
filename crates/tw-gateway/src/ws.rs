@@ -265,6 +265,8 @@ pub struct Naming {
     pub client: String,
     /// 升级的路径。一帧按这条路径上的一次请求读（[`crate::client_api::read`]）
     pub path: String,
+    /// 一帧路由这一刻的本地时间从哪儿来（规则的 `time` 条件）
+    pub local_time: crate::state::LocalClock,
 }
 
 /// 一帧 `response.create` 发出去的样子（[`Naming::frame`]）。
@@ -418,6 +420,7 @@ impl Naming {
     fn read(&self, frame: &serde_json::Value) -> crate::client_api::Reading {
         let mut reading = crate::client_api::read(&self.path, None, Some(frame));
         reading.facts.client = self.client.clone();
+        reading.facts.time = Some((self.local_time)());
         reading
     }
 

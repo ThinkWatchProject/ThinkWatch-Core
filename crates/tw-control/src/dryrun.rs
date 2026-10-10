@@ -118,6 +118,8 @@ fn facts(req: &tw_api::DryRunRequest) -> RequestFacts {
         thinking: req.thinking,
         stream: req.stream,
         intent: req.intent.clone(),
+        // 试算按当下：问的是「现在发这个请求会怎么走」
+        time: Some(tw_engine::LocalTime::now()),
     }
 }
 
@@ -452,6 +454,17 @@ fn unmatched(
             ConditionField::Intent,
             crate::one_or_many(w),
             f.intent.clone(),
+        );
+    }
+    // 和 `When::matches` 一样按窗口看；实际的值写成 `fri 17:30`，和条件的写法对得上。
+    // 写错的窗口在这之前就被 `check_rules` 拦下了，这里只会是 `Ok`
+    if let Some(w) = &when.time
+        && !when.time_matches(f.time).unwrap_or(false)
+    {
+        return miss(
+            ConditionField::Time,
+            crate::one_or_many(w),
+            f.time.map(|t| t.to_string()).unwrap_or_default(),
         );
     }
     for (want, got, field) in [

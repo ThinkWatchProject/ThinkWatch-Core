@@ -1981,6 +1981,22 @@ mod msg_codes {
         assert!(m.text.contains("官方"), "{m:?}");
     }
 
+    /// 规则的时间窗口写错了，配置读不进来，而且那句话说的是哪条规则、哪个值
+    #[test]
+    fn a_rule_with_a_malformed_time_window_is_refused_at_load_with_rule_and_value() {
+        let text = "version: 1\nlisten:\n  control:\n    key: c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00\nclients:\n  - name: c\n    key: tw-k\nproviders:\n  - name: a\n    base_url: https://x\n    key: k\nroutes:\n  - name: default\n    rules:\n      - name: 白天\n        when: { time: ['mon-fri 09:00-18:00', '9-5'] }\n        to: a\n      - name: 其余\n        to: a\n";
+        let m = crate::try_parse(text).unwrap_err().msg();
+        assert_eq!(m.code, "engine.rule_time_syntax", "{m:?}");
+        assert_eq!((m.arg("rule"), m.arg("value")), ("白天", "9-5"));
+        // 写对了就读得进来，而且原样保留
+        let ok = crate::try_parse(&text.replace("'9-5'", "'sat,sun 00:00-24:00'")).unwrap();
+        let w = &ok.routes[0].rules[0].when;
+        assert_eq!(
+            w.time.as_ref().map(|t| t.iter().collect::<Vec<_>>()),
+            Some(vec!["mon-fri 09:00-18:00", "sat,sun 00:00-24:00"])
+        );
+    }
+
     #[test]
     fn a_rejected_config_says_which_stage_and_line_around_serdes_words() {
         // 语法错：serde 的原话翻不了，外面那一层（哪一关、第几行）带码

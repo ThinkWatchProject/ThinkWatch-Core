@@ -752,11 +752,27 @@ pub enum RouteError {
     PinnedWithProviderWouldBe(String),
     #[error("{}", self.msg())]
     PinnedWithSetModel(String),
+    /// 规则的 `time` 条件有一个值不合写法。**带规则名**：配置里有好几条规则时，只说
+    /// 值的话用户得一条条找（[`MatchError::BadTime`] 本身不认识规则名）
+    #[error("{}", self.msg())]
+    TimeSyntax { rule: String, value: String },
     #[error(transparent)]
     Match(#[from] MatchError),
 }
 
 impl RouteError {
+    /// 规则 `rule` 的条件写错了。时间条件的那一句带上规则名（[`RouteError::TimeSyntax`]）；
+    /// 比较式的照旧是引擎的那几句（码不变，控制面在前面补规则名）
+    pub fn for_rule(rule: &str, e: MatchError) -> Self {
+        match e {
+            MatchError::BadTime { value, .. } => RouteError::TimeSyntax {
+                rule: rule.to_string(),
+                value,
+            },
+            other => RouteError::Match(other),
+        }
+    }
+
     /// 给人看的那句话，带码。
     pub fn msg(&self) -> Msg {
         match self {
@@ -859,6 +875,12 @@ impl RouteError {
                 "rule `{rule}` pins models and also tests provider_would_be. provider_would_be is \
                  evaluated once an upstream is chosen, and the pinned list already chooses the \
                  upstreams"
+            ),
+            RouteError::TimeSyntax { rule, value } => msg!(
+                "engine.rule_time_syntax", rule = rule, value = value =>
+                "rule `{rule}`: time condition `{value}` is not written as `[days ]HH:MM-HH:MM`: \
+                 days are mon, tue, wed, thu, fri, sat, sun or a range like mon-fri, the hours run \
+                 from 00:00 to 24:00, as in \"mon-fri 09:00-18:00\""
             ),
             RouteError::PinnedWithSetModel(rule) => msg!(
                 "engine.pinned_with_set_model", rule = rule =>
@@ -1150,7 +1172,9 @@ impl Engine {
     /// **还没保存的规则也用它查** —— 试算一份草稿之前，先说清楚哪条写错了。
     pub fn check_rules(&self, rules: &[Rule]) -> Result<(), RouteError> {
         for r in rules {
-            r.when.validate()?;
+            r.when
+                .validate()
+                .map_err(|e| RouteError::for_rule(&r.name, e))?;
             // 指定模型的几条单独说：它和阶段二、和 `set.model` 同用时，泛泛的那句
             // 说不清为什么不行
             if let Some(pinned) = r.to.as_ref().and_then(Target::pinned) {
@@ -3307,6 +3331,14 @@ mod msg_codes {
             },
             RouteError::PinnedWithProviderWouldBe("r".into()),
             RouteError::PinnedWithSetModel("r".into()),
+            RouteError::TimeSyntax {
+                rule: "r".into(),
+                value: "9-5".into(),
+            },
+            RouteError::Match(MatchError::BadTime {
+                value: "9-5".into(),
+                source: crate::time::TimeError::BadTimeRange("9-5".into()),
+            }),
             bad(ParseError::Empty),
             bad(ParseError::NoOperator("200k".into())),
             bad(ParseError::BadNumber(">x".into())),

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use tw_dialect::ir::{Part, Request, Role, ToolInput, ToolKind};
 
+use crate::time::LocalTime;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestFacts {
     /// 客户端要的模型名（**不是我们要发给上游的那个**）
@@ -33,6 +35,13 @@ pub struct RequestFacts {
     /// `from_request` 不会填它，网关在识别之后单独设。空字符串
     /// 表示这是一个真实的用户请求。
     pub intent: String,
+    /// 路由这一刻的本地时间（core 所在机器的时区）。
+    ///
+    /// **从请求体里读不出来，由网关在路由时填**，试算填当下；测试和试算可以塞一个定死的
+    /// 时刻。没填（`None`）时，带 `time` 条件的规则不命中 —— 当成某个固定时刻会让
+    /// 规则悄悄在错的时候命中。
+    #[serde(default)]
+    pub time: Option<LocalTime>,
 }
 
 impl RequestFacts {
@@ -61,6 +70,7 @@ impl RequestFacts {
             }),
             thinking: r.reasoning.as_ref().is_some_and(|x| x.enabled),
             stream: r.stream,
+            time: None,
         }
     }
 }

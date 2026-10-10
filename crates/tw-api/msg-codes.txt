@@ -265,6 +265,8 @@ engine.pinned_empty
 engine.pinned_unknown_provider
 engine.pinned_with_provider_would_be
 engine.pinned_with_set_model
+engine.rule_time_syntax
+engine.time_syntax
 engine.unknown_default_route
 engine.unknown_route
 engine.unknown_target
