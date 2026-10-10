@@ -66,6 +66,14 @@ pub enum BodyKind {
     /// 已经换回原值，见 [`crate::plugin::request`]），带着那一跳的 [`Redaction`]：落盘前和
     /// 别的正文一样换掉、打码（[`BodyRecord::for_disk`]）
     AfterPlugins,
+    /// 回答那一跳发给上游的请求体，**和客户端那一边（插件改过的话是改过的那一份）不是一回事
+    /// 时才存**（见 [`crate::content`]）。带着那一跳的 [`Redaction`]
+    UpstreamRequest,
+    /// 交给客户端的回答，**和上游的原话（`Response`）不是一回事时才存**（见 [`crate::content`]）
+    ClientResponse,
+    /// 这个请求的报文头：一个 `tw_api::HeadView` 的 JSON 数组。**交来时已经打过码**（打码的
+    /// 那一刻实时内容也在发它，见 [`crate::content`]），落盘前不再动它
+    Heads,
 }
 
 /// 落盘之前怎么处理一份正文。
@@ -121,22 +129,31 @@ impl Redaction {
                 &fresh[..]
             }
         };
-        let sent: HashMap<&str, &str> = self.ledger.replacements().collect();
+        let sent = self.sent();
         // 摘要以外的各段照常（找过的命中照用）；摘要解开了重新找、换、打码，再包回去
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         for (span, summary) in carried_summaries(text) {
-            out.push_str(&self.span(text, at..span.start, hits, &sent));
+            out.push_str(&self.piece(text, at..span.start, hits, &sent));
             out.push_str(&tw_dialect::compaction::carry(&self.apply(&summary)));
             at = span.end;
         }
-        out.push_str(&self.span(text, at..text.len(), hits, &sent));
+        out.push_str(&self.piece(text, at..text.len(), hits, &sent));
         out
     }
 
+    /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表）
+    pub(crate) fn sent(&self) -> HashMap<&str, &str> {
+        self.ledger.replacements().collect()
+    }
+
     /// `text` 里的一段：落在这一段里的命中换掉或打码，再按形状打一遍。各段在 token 的边界上
-    /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的
-    fn span(
+    /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的。
+    ///
+    /// `hits` 是 [`crate::guard::hits`] 在 `text` 上找到的，按起点排好、互不重叠：整个落在这一段
+    /// 里的才算，按起点二分找到头一个。安全日志的前后文（[`crate::guard::detail`]）也走这里：
+    /// 和存下来的正文是同一个打码的办法
+    pub(crate) fn piece(
         &self,
         text: &str,
         range: Range<usize>,
@@ -145,9 +162,11 @@ impl Redaction {
     ) -> String {
         let mut out = String::with_capacity(range.len());
         let mut at = range.start;
-        for h in hits
+        let first = hits.partition_point(|h| h.bytes.start < range.start);
+        for h in hits[first..]
             .iter()
-            .filter(|h| h.bytes.start >= range.start && h.bytes.end <= range.end)
+            .take_while(|h| h.bytes.start < range.end)
+            .filter(|h| h.bytes.end <= range.end)
         {
             out.push_str(&text[at..h.bytes.start]);
             let value = &text[h.bytes.clone()];
@@ -273,7 +292,12 @@ impl BodyRecord {
         let found = self
             .found
             .filter(|_| entire && matches!(text, std::borrow::Cow::Borrowed(_)));
-        let body = self.redaction.apply_found(&text, found.as_deref());
+        // 报文头交来时已经换过、打过码：实时内容发出去的和落盘的是同一份
+        let body = if self.kind == BodyKind::Heads {
+            text.into_owned()
+        } else {
+            self.redaction.apply_found(&text, found.as_deref())
+        };
         // 截过的（交来的只是开头）报原本的长度。没截过的就是换过、打过码的这一份的长度：
         // 比存储层的上限还长的，由存储层截、由它记下（`tw_store::Blobs::put_with_len`）
         let whole = self.original_len.max(self.body.len());
@@ -411,6 +435,21 @@ impl ResponseTap {
     /// 攒到的那部分，以及**原始的总长度**。
     pub fn finish(self) -> (Bytes, usize) {
         (Bytes::from(self.buf), self.total)
+    }
+
+    /// 到目前为止攒到的那部分
+    pub fn kept(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// 攒满了：之后来的不再留
+    pub fn full(&self) -> bool {
+        self.buf.len() >= RESPONSE_TAP_MAX
+    }
+
+    /// 有没攒下的：攒满之后又来过
+    pub fn cut(&self) -> bool {
+        self.total > self.buf.len()
     }
 }
 

@@ -39,7 +39,9 @@ fn req(id: i64, client: &str) -> tw_store::db::RequestRow {
         ttft_ms: Some(300),
         duration_ms: Some(2000),
         tokens_per_sec: Some(80),
-        bytes: Some(10),
+        sent_bytes: Some(10),
+        received_bytes: Some(10),
+        egress: None,
         input_tokens: Some(50),
         output_tokens: Some(20),
         cache_read_tokens: None,
@@ -87,6 +89,9 @@ fn app(
         count: 1,
         matching: None,
         revealed: None,
+        session: None,
+        sent_model: None,
+        detail: Default::default(),
     })
     .unwrap();
     let rec = tw_store::Recorder::new(

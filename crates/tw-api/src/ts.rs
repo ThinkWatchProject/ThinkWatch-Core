@@ -508,8 +508,38 @@ mod tests {
             assert!(res.contains(field), "{field}: {res}");
         }
         let log = decl_of(&ts, "SecurityEventView");
-        for field in ["match?: ContentMatch", "revealed?: string"] {
+        for field in [
+            "match?: ContentMatch",
+            "revealed?: string",
+            "session?: string",
+            "sent_model?: string",
+            "direction: SecurityDirection",
+            "locations: Array<HitLocation>",
+            "more_locations: number",
+            "rule_snapshot: RuleSnapshot",
+            "outcome_detail: OutcomeDetail",
+        ] {
             assert!(log.contains(field), "{field}: {log}");
+        }
+        assert_eq!(
+            decl_of(&ts, "HitPart"),
+            "export type HitPart = \"system\" | \"message\" | \"tool_result\" | \"tool_call\" | \"response_text\""
+        );
+        assert_eq!(
+            decl_of(&ts, "SecurityDirection"),
+            "export type SecurityDirection = \"request\" | \"response\""
+        );
+        let outcome = decl_of(&ts, "OutcomeDetail");
+        for shape in [
+            "{ \"action\": \"recorded\", }",
+            "{ \"action\": \"replaced\", placeholders: Array<string>, }",
+            "{ \"action\": \"stripped\", segments: number, }",
+        ] {
+            assert!(outcome.contains(shape), "{shape}: {outcome}");
+        }
+        let at = decl_of(&ts, "HitLocation");
+        for field in ["part: HitPart", "message_index?: number", "path: string"] {
+            assert!(at.contains(field), "{field}: {at}");
         }
         let event = decl_of(&ts, "Event");
         assert!(event.contains("outcome: ContentOutcome"), "{event}");

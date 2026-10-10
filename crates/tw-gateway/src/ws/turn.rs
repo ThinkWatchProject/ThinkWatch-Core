@@ -278,6 +278,14 @@ impl Turn {
         }
     }
 
+    /// 这一轮发给上游的一帧，载荷 `bytes` 字节：`response.create` 那一帧，和它在答的时候客户端
+    /// 接着发来的帧。记进这一轮的流量
+    pub(crate) fn sending(&mut self, bytes: usize) {
+        if let Some(e) = self.ending.as_mut() {
+            e.sending(bytes);
+        }
+    }
+
     /// 上游开始答这一轮了：发出去时前面没有在答的，或者前面那一轮刚收尾。这一家的快慢样本
     /// 从这一刻量到第一段内容（见 [`crate::latency`]）—— 前一轮还在答的时候，这一轮排在后面
     /// 等，那一段不是这一家慢
@@ -427,6 +435,8 @@ fn routed(
         affinity: None,
         attempts,
         billing,
+        // WebSocket 只连直连的上游（走代理的升级时就拒了，见 `server::upgrade`）
+        egress: None,
     }
 }
 
@@ -446,6 +456,8 @@ pub(crate) struct Admit {
     pub(crate) input_estimate: Option<u64>,
     /// 内容过滤的结论：开始之后挂在这一轮的号上报
     pub(crate) screening: tw_guard::content::Screening,
+    /// 每条命中的细节，和 `screening.hits` 一一对应（见 [`crate::guard::detail::content`]）
+    pub(crate) screened: Vec<tw_api::SecurityHitDetail>,
     /// 这一帧到的那一刻
     pub(crate) arrived: Instant,
     pub(crate) at_ms: u64,
@@ -515,7 +527,10 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
     hold.bind(id);
     ending.streaming(tw_dialect::ir::Dialect::Responses, &line.provider);
     // 拒绝的也在开始之后：被拒是一次来源为 `denied` 的失败，一个字节都不发
-    if let Some(why) = crate::guard::report(&state.bus, id, &line.provider, &a.screening) {
+    let details = a.screened.clone();
+    if let Some(why) =
+        crate::guard::report_with(&state.bus, id, &line.provider, &a.screening, details)
+    {
         ending.failed(tw_api::FailureSource::Denied, why.clone());
         return Err(NotAdmitted::Cut(why));
     }

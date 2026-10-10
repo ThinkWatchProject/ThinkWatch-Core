@@ -327,7 +327,10 @@ pub async fn run(
 
     let status = resp.status().as_u16();
     let ttfb_ms = started.elapsed().as_millis() as i64;
-    let text = resp.text().await.unwrap_or_default();
+    // 字节数照线上的数（HTTP 客户端不解压，见 `tw_gateway::traffic`），和原来那一次的
+    // `received_bytes` 同一个口径
+    let raw = resp.bytes().await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&raw).into_owned();
     let duration_ms = started.elapsed().as_millis() as i64;
 
     // 回显还原之后再脱敏给人看。**两步都要**：还原是为了让内容和原来
@@ -338,7 +341,7 @@ pub async fn run(
         status,
         ttfb_ms,
         duration_ms,
-        bytes: text.len() as i64,
+        bytes: raw.len() as i64,
         body: tw_secret::mask_body(&restored.chars().take(20_000).collect::<String>()),
         // 和原来那次并排比 —— 这是重放存在的理由
         original: tw_api::ReplayOriginal {
@@ -346,7 +349,7 @@ pub async fn run(
             status: row.status,
             ttfb_ms: row.ttfb_ms,
             duration_ms: row.duration_ms,
-            bytes: row.bytes,
+            received_bytes: row.received_bytes,
         },
     }))
 }

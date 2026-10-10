@@ -160,6 +160,80 @@ pub fn screen_text(mode: Mode, rules: &Rules, text: &str) -> Screening {
     out
 }
 
+/// 一条命中的规则在查过的正文里的每一处（见 [`places`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulePlaces {
+    /// 出厂规则的 id，或者自定义规则的名字
+    pub rule: String,
+    pub custom: bool,
+    /// 每一处：在第几段正文里、在那一段里的字节区间，按先后。删过一遍之后才冒出来的换算
+    /// 回删之前的原文；码位规则连在一起的几个字符是一处
+    pub at: Vec<(usize, Range<usize>)>,
+}
+
+/// 照 [`screen_value`] 的查法查一遍 —— 查、删、再查，**不看档位** —— 交回每条命中的规则的
+/// 每一处。段是调用方正文的那几个字符串（[`tw_dialect::caller::spots`]，一起交回去），下标
+/// 对得上。
+///
+/// 安全日志说得出一条规则在请求里命中了哪几处、各在哪儿；[`screen_value`] 的结论只留每条
+/// 规则的第一处。只在有命中的请求上再查这一遍。
+pub fn places(
+    rules: &Rules,
+    dialect: Dialect,
+    v: &Value,
+) -> (Vec<tw_dialect::caller::Spot>, Vec<RulePlaces>) {
+    let spots = tw_dialect::caller::spots(dialect, v);
+    if spots.is_empty() || rules.is_empty() {
+        return (spots, Vec::new());
+    }
+    let segments: Vec<(&str, bool)> = spots
+        .iter()
+        .map(|s| (s.get(v).unwrap_or_default(), s.in_tool_result))
+        .collect();
+    let scope = Scope {
+        keep_all: true,
+        ..Scope::default()
+    };
+    let e = evaluate(rules, &segments, scope);
+    (spots, gather(e))
+}
+
+/// [`places`]，查的是一段没法按消息结构读的文字（同 [`screen_text`]：只用码位规则，认得
+/// JSON 的 `\uXXXX` 写法）。只有一段，下标都是 0，区间是原文里的（转义序列整个算）。
+pub fn places_text(rules: &Rules, text: &str) -> Vec<RulePlaces> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    let scope = Scope {
+        keep_all: true,
+        escapes: true,
+        codepoints_only: true,
+    };
+    gather(evaluate(rules, &[(text, false)], scope))
+}
+
+fn gather(e: Evaluation) -> Vec<RulePlaces> {
+    let mut out: Vec<RulePlaces> = e
+        .hits
+        .iter()
+        .map(|h| RulePlaces {
+            rule: h.rule.clone(),
+            custom: h.custom,
+            at: Vec::new(),
+        })
+        .collect();
+    for (h, s, r) in e.all {
+        if let Some(p) = out.get_mut(h) {
+            p.at.push((s, r));
+        }
+    }
+    for p in &mut out {
+        p.at.sort_by_key(|(s, r)| (*s, r.start, r.end));
+        p.at.dedup();
+    }
+    out
+}
+
 /// 按档位定每条命中的结局。
 fn conclude(mode: Mode, hits: Vec<Hit>, refused: Option<usize>) -> Screening {
     let enforce = mode.acts();
@@ -556,5 +630,52 @@ mod tests {
         // 两遍：先删了 1..2，再删了 0..1
         let once = |r: Range<usize>| std::iter::once(r).collect::<Vec<_>>();
         assert_eq!(back(&[once(1..2), once(0..1)], 0..1), 2..3);
+    }
+
+    /// 每条命中的规则的每一处：哪个字符串、在它里面的哪一段。删过一遍之后才拼出来的也在，
+    /// 换算回删之前的原文
+    #[test]
+    fn places_name_every_spot_a_rule_matched() {
+        let rs = rules(&[
+            ("j", "jailbreak", Contains, Block),
+            ("zw", ZW, Points, Strip),
+            ("hi", "hello", Contains, Record),
+        ]);
+        let v = json!({"messages": [
+            {"role": "user", "content": "hello, hello"},
+            {"role": "assistant", "content": "hello from the model"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "jail\u{200B}break"}
+            ]}
+        ]});
+        let (spots, places) = super::places(&rs, Dialect::Anthropic, &v);
+        let of = |id: &str| places.iter().find(|p| p.rule == id).unwrap().at.clone();
+        // 模型自己的话不查
+        assert_eq!(of("hi"), [(0, 0..5), (0, 7..12)]);
+        assert_eq!(spots[0].get(&v), Some("hello, hello"));
+        // 删掉零宽字符才拼出来的那个词：区间是删之前的，连同零宽字符
+        let text = spots[1].get(&v).unwrap();
+        let [(s, r)] = &of("j")[..] else {
+            panic!("{places:?}")
+        };
+        assert_eq!((*s, &text[r.clone()]), (1, "jail\u{200B}break"));
+        assert_eq!(of("zw").len(), 1);
+        assert!(spots[1].in_tool_result);
+
+        // 没法按结构读的一段：区间是原文里的，转义序列整个算
+        let raw = format!("{{\"x\":\"a{}u200bb\"}}", '\\');
+        let places = super::places_text(&rs, &raw);
+        let [p] = &places[..] else {
+            panic!("{places:?}")
+        };
+        let (s, r) = &p.at[0];
+        assert_eq!(*s, 0);
+        assert_eq!(&raw[r.clone()], format!("{}u200b", '\\'));
+        // 画出来是那个字符
+        let zw = rs.rules.iter().find(|r| r.id == "zw").unwrap();
+        assert_eq!(zw.draw(&raw[r.clone()], true), "‹U+200B›");
+        assert_eq!(zw.draw("a\u{200B}\u{200B}b", false), "a‹U+200B ×2›b");
+        let hi = rs.rules.iter().find(|r| r.id == "hi").unwrap();
+        assert_eq!(hi.draw("a\u{200B}b", false), "a\u{200B}b", "别的规则原样");
     }
 }

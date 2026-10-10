@@ -118,6 +118,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::HistorySearch, history_search)
         .at(ep::Latency, latency)
         .at(ep::LatencyByProvider, latency_by_provider)
+        .at(ep::LatencyByClient, latency_by_client)
         .at(ep::TokenRate, token_rate)
         .at(ep::TokenRateByProvider, token_rate_by_provider)
         .at(ep::UpstreamHealth, upstream_health)
@@ -127,6 +128,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::SpeedRun, speed_run)
         .at(ep::RequestDetail, request_detail)
         .at(ep::AbortRequest, abort_request)
+        .at(ep::RequestLive, request_live)
         // 诊断包（脱敏纪律）。**只读，不写任何文件**
         .at(ep::Diagnostics, diagnostics::bundle)
         // 把一条真实请求变成回放用例。**录制不是新功能** ——
@@ -751,6 +753,8 @@ async fn summary(
         output_tokens: x.output_tokens,
         cache_read_tokens: x.cache_read_tokens,
         cache_write_tokens: x.cache_write_tokens,
+        sent_bytes: x.sent_bytes,
+        received_bytes: x.received_bytes,
         cost_micros_exact: x.cost_micros_exact,
         cost_micros_estimated: x.cost_micros_estimated,
         unpriced_requests: x.unpriced_requests,
@@ -1112,15 +1116,74 @@ async fn request_detail(
     let by_plugins = plugins
         .iter()
         .any(|p| p.outcome == tw_api::PluginOutcome::Changed);
+    // 回答：交给客户端的和上游的原话不一样时各存了一份（`.client-res` 和 `.res`），一样的只有
+    // 上游那一份 —— 那就是客户端收到的
+    let (response_body, upstream_response_body) = match body(tw_store::Which::ClientResponse) {
+        Some(client) => (Some(client), body(tw_store::Which::Response)),
+        None => (body(tw_store::Which::Response), None),
+    };
     let detail = tw_api::RequestDetail {
         request_body: body(tw_store::Which::Request),
         request_after_plugins: body(tw_store::Which::AfterPlugins),
-        response_body: body(tw_store::Which::Response),
+        response_body,
+        upstream_request_body: body(tw_store::Which::UpstreamRequest),
+        upstream_response_body,
+        heads: heads(g.blobs().get(at, id, tw_store::Which::Heads)),
         plugins,
         row: history_row(row, security, by_plugins),
         in_flight,
     };
     Ok(Json(detail))
+}
+
+/// 存下来的报文头。落盘的那一份已经打过码，读出来再打一遍（和正文一样）。没有、读不懂的
+/// 是空的
+fn heads(raw: Option<Vec<u8>>) -> Vec<tw_api::HeadView> {
+    let Some(heads) = raw.and_then(|r| serde_json::from_slice::<Vec<tw_api::HeadView>>(&r).ok())
+    else {
+        return Vec::new();
+    };
+    heads
+        .into_iter()
+        .map(|h| tw_api::HeadView {
+            line: tw_secret::mask_body(&h.line),
+            headers: h
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k, tw_secret::mask_body(&v)))
+                .collect(),
+            ..h
+        })
+        .collect()
+}
+
+/// 一个在跑的请求的实时内容（见 `tw_gateway::content`）：报文头和正文，先补发到目前为止
+/// 有的，再接着发，`end` 之后关闭。**和别的端点同一道门**：本机的 socket、远程的控制端口都
+/// 握过手才到这里。不在跑的（结束了、从没有过、跑在 WebSocket 上的）是 404
+async fn request_live(
+    State(s): State<ControlState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>>, Fail> {
+    let watch = s
+        .gateway
+        .contents
+        .watch(id)
+        .ok_or_else(|| not_running(id))?;
+    let stream = futures::stream::unfold(watch, |mut w| async move {
+        let ev = w.next().await?;
+        let data = serde_json::to_string(&ev).unwrap_or_default();
+        Some((Ok(SseEvent::default().event(ev.event()).data(data)), w))
+    });
+    // 心跳和事件流一样：一个等着上游的长请求，几分钟里可能一个字都没有
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
+}
+
+/// 请求 `id` 不在跑：结束了、从没有过，或者跑在 WebSocket 连接上
+fn not_running(id: u64) -> Fail {
+    fail(
+        StatusCode::NOT_FOUND,
+        msg!("control.request_not_running", id = id => "Request {id} is not in progress."),
+    )
 }
 
 /// 订阅额度。**每个上游最近一次报的**。
@@ -1161,6 +1224,27 @@ async fn latency_by_provider(
     let xs = g.db().latency_by_provider(from, to).map_err(records)?;
     Ok(Json(
         xs.into_iter()
+            .map(|l| tw_api::LatencyView {
+                model: l.model,
+                p50: l.p50,
+                p95: l.p95,
+                samples: l.samples,
+            })
+            .collect(),
+    ))
+}
+
+/// 按密钥分的延迟：**谁在用、谁等得久**（概览上每把密钥一行）。样本的规矩和按模型分的一样
+async fn latency_by_client(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
+) -> Result<Json<Vec<tw_api::LatencyView>>, Fail> {
+    let (from, to) = range(q.from_ms, q.to_ms);
+    let store = need_store(&s)?;
+    let xs = on_store(store, move |g| g.db().latency_by_client(from, to)).await?;
+    Ok(Json(
+        xs.map_err(records)?
+            .into_iter()
             .map(|l| tw_api::LatencyView {
                 model: l.model,
                 p50: l.p50,
@@ -1296,7 +1380,9 @@ fn history_row(
         ttft_ms: r.ttft_ms,
         duration_ms: r.duration_ms,
         tokens_per_sec: r.tokens_per_sec,
-        bytes: r.bytes,
+        sent_bytes: r.sent_bytes,
+        received_bytes: r.received_bytes,
+        egress: r.egress,
         input_tokens: r.input_tokens,
         output_tokens: r.output_tokens,
         cache_read_tokens: r.cache_read_tokens,
@@ -1721,12 +1807,7 @@ async fn abort_request(
     State(s): State<ControlState>,
     axum::extract::Path(id): axum::extract::Path<u64>,
 ) -> Result<Json<tw_api::Aborted>, Fail> {
-    s.gateway.aborts.request(id).map_err(|_| {
-        fail(
-            StatusCode::NOT_FOUND,
-            msg!("control.request_not_running", id = id => "Request {id} is not in progress."),
-        )
-    })?;
+    s.gateway.aborts.request(id).map_err(|_| not_running(id))?;
     tracing::info!(id, "aborted a request over the control plane");
     Ok(Json(tw_api::Aborted { requests: vec![id] }))
 }

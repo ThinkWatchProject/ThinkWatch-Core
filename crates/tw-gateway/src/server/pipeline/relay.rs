@@ -52,6 +52,7 @@ pub(super) fn respond(
         slot,
         sent_at,
         unconfirmed,
+        attempt,
         ..
     } = served;
     let status =
@@ -89,6 +90,11 @@ pub(super) fn respond(
     if let Some(r) = &rename {
         r.headers(&mut out_headers);
     }
+    // 报文记录（见 `crate::content`）：从这里起喂进结局的是这一跳的回答。客户端收到的和它的
+    // 原话是一回事时（同格式、没有回答钩子），客户端那一边不另攒。**只差模型名不算**：为它
+    // 另存一整份回答不值，模型名在尝试链上
+    let transforms = session.is_some() || plugins.is_some();
+    ending.serving(attempt as u32 + 1, !transforms);
 
     // **Bedrock 的流不是 SSE**，是 AWS eventstream 的二进制帧。在字节进门的地方就转成
     // SSE（`event:` 是事件名，`data:` 是载荷），后面的一切 —— 用量、首 token、留档、
@@ -361,8 +367,8 @@ fn upstream_dialect(
         .unwrap_or(tw_dialect::ir::Dialect::Anthropic)
 }
 
-/// Anthropic 的心跳帧，和它自己的 API 发的一样。
-const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
+/// Anthropic 的心跳帧，和它自己的 API 发的一样。报文记录认得它，不记（见 [`crate::content`]）
+pub(crate) const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
 
 /// 响应头到手时就定下的处理方式。
 #[derive(Clone, Copy)]
@@ -695,29 +701,32 @@ impl Relay {
         for v in w.feed(out) {
             // 规则是切断 + 拦截档 = 切断
             let blocked = v.cut && self.inspect.acts();
-            self.bus.emit(flagged(
-                self.id,
-                &self.provider,
-                &v,
-                blocked,
-                &self.redaction,
-            ));
-            if blocked {
-                tracing::warn!(
-                    provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                    "cut the response stream: a tool call in the answer matched a cut rule"
-                );
-                // **句子不说这个调用出自谁。**审查看的是最后交给客户端的那一份回答，
-                // 里面的工具调用不一定是上游给的 —— 有工具调用权限的插件也能造、能改。
-                // 上游照样在 `upstream` 参数和事件里，只是不当成调用的出处
-                let err = GatewayError::denied(msg!(
+            // **句子不说这个调用出自谁。**审查看的是最后交给客户端的那一份回答，
+            // 里面的工具调用不一定是上游给的 —— 有工具调用权限的插件也能造、能改。
+            // 上游照样在 `upstream` 参数和事件里，只是不当成调用的出处
+            let err = blocked.then(|| {
+                GatewayError::denied(msg!(
                     "gw.toolcall.response_cut",
                     upstream = self.provider.clone(), tool = v.tool.clone(),
                     rule = v.rule.clone(), name = v.name.clone(), why = v.why.clone() =>
                     "The answer contained a {tool} call that matched rule “{name}”{}, \
                      so the response was cut off.",
                     because(&v.why)
-                ));
+                ))
+            });
+            self.bus.emit(flagged(
+                self.id,
+                &self.provider,
+                &v,
+                blocked,
+                &self.redaction,
+                err.as_ref().map(|e| &e.detail),
+            ));
+            if let Some(err) = err {
+                tracing::warn!(
+                    provider = %self.provider, tool = %v.tool, rule = %v.rule,
+                    "cut the response stream: a tool call in the answer matched a cut rule"
+                );
                 // **命中那一帧之前的内容照常发。**模型在动手之前
                 // 通常先说了几句正常的话，一起吞掉的话用户看到的
                 // 是「什么都没发生然后报错了」。而从那一帧起一个
@@ -865,20 +874,8 @@ impl Relay {
                 tw_guard::tools::wall::Wall::json_array(self.tools.clone())
             };
             for v in w.feed(&tail) {
-                let blocked = v.cut && self.inspect.acts();
-                self.bus.emit(flagged(
-                    self.id,
-                    &self.provider,
-                    &v,
-                    blocked,
-                    &self.redaction,
-                ));
-                if blocked {
-                    tracing::warn!(
-                        provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                        "withheld the response: a tool call in the answer matched a cut rule"
-                    );
-                    return (Vec::new(), Some(withheld(&self.provider, &v)));
+                if let Some(err) = self.flag(&v) {
+                    return (Vec::new(), Some(err));
                 }
             }
         } else if self.plan.whole_body()
@@ -887,24 +884,34 @@ impl Relay {
             && let Some(w) = self.wall.as_mut()
         {
             for v in w.whole(&tail) {
-                let blocked = v.cut && self.inspect.acts();
-                self.bus.emit(flagged(
-                    self.id,
-                    &self.provider,
-                    &v,
-                    blocked,
-                    &self.redaction,
-                ));
-                if blocked {
-                    tracing::warn!(
-                        provider = %self.provider, tool = %v.tool, rule = %v.rule,
-                        "withheld the response: a tool call in the answer matched a cut rule"
-                    );
-                    return (Vec::new(), Some(withheld(&self.provider, &v)));
+                if let Some(err) = self.flag(&v) {
+                    return (Vec::new(), Some(err));
                 }
             }
         }
         (tail, None)
+    }
+
+    /// 整份扣着的回答里一个命中规则的工具调用：报出去，要切断的话交回告诉客户端的那个错误
+    /// （整份不发，见 [`withheld`]）
+    fn flag(&self, v: &tw_guard::tools::wall::Verdict) -> Option<GatewayError> {
+        let blocked = v.cut && self.inspect.acts();
+        let err = blocked.then(|| withheld(&self.provider, v));
+        self.bus.emit(flagged(
+            self.id,
+            &self.provider,
+            v,
+            blocked,
+            &self.redaction,
+            err.as_ref().map(|e| &e.detail),
+        ));
+        if err.is_some() {
+            tracing::warn!(
+                provider = %self.provider, tool = %v.tool, rule = %v.rule,
+                "withheld the response: a tool call in the answer matched a cut rule"
+            );
+        }
+        err
     }
 
     /// 插件在收尾时出错：出错之前能发的过一遍审查，再报这个错

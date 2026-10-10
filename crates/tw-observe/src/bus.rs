@@ -309,6 +309,7 @@ impl EventBus {
                 .map(|(id, o)| tw_api::InFlightRequest {
                     id: *id,
                     events: o.events.clone(),
+                    egress: egress(o),
                 })
                 .collect(),
         }
@@ -361,6 +362,15 @@ impl EventBus {
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
     }
+}
+
+/// 一个在跑的请求从哪个出口出去的：路由事件报的那个（`RequestRouted::egress`）。路由事件到
+/// 之前、直连的，都没有
+fn egress(o: &Open) -> Option<String> {
+    o.events.iter().find_map(|e| match e {
+        tw_api::Event::RequestRouted { egress, .. } => egress.clone(),
+        _ => None,
+    })
 }
 
 /// 一个在跑的请求此刻的样子：开始事件里的，加上路由报出来的那家上游。
@@ -443,7 +453,8 @@ mod tests {
             id: 1,
             model: "m".into(),
             status: 200,
-            bytes: 0,
+            sent_bytes: 0,
+            received_bytes: 0,
             duration_ms: 0,
             usage: None,
             tokens_per_sec: None,
@@ -458,7 +469,8 @@ mod tests {
                 args: Default::default(),
                 text: "x".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: None,
             answered_model: None,
@@ -467,7 +479,8 @@ mod tests {
             id: 3,
             model: "m".into(),
             status: None,
-            bytes: 0,
+            sent_bytes: Some(0),
+            received_bytes: Some(0),
             duration_ms: 0,
             usage: None,
             answered_model: None,
@@ -510,6 +523,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
                 tw_api::AttemptView {
                     provider: served_by.into(),
@@ -521,9 +535,11 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         }
     }
 
@@ -620,7 +636,8 @@ mod tests {
             id,
             model: "m".into(),
             status: 200,
-            bytes: 1,
+            sent_bytes: 0,
+            received_bytes: 1,
             duration_ms,
             usage: Some(tw_api::UsageView {
                 input: 10,
@@ -686,7 +703,8 @@ mod tests {
                 id: 2,
                 model: "m".into(),
                 status: Some(200),
-                bytes: 1,
+                sent_bytes: Some(0),
+                received_bytes: Some(1),
                 duration_ms: 2_000,
                 usage: Some(tw_api::UsageView {
                     output: 100,
@@ -758,6 +776,24 @@ mod tests {
         assert_eq!(live.running[0].upstream.as_deref(), Some("q"));
     }
 
+    /// 在跑的请求从哪个出口出去：路由事件报了才有，照它原样；还没路由的、直连的没有
+    #[test]
+    fn a_running_request_says_its_egress_once_routed() {
+        let b = EventBus::new();
+        b.emit(started(1));
+        b.emit(started(2));
+        b.emit(started(3));
+        let mut via = routed(1, "q");
+        if let tw_api::Event::RequestRouted { egress, .. } = &mut via {
+            *egress = Some("机场".into());
+        }
+        b.emit(via);
+        b.emit(routed(2, "q"));
+        let snap = b.in_flight().requests;
+        let egress: Vec<_> = snap.iter().map(|r| r.egress.as_deref()).collect();
+        assert_eq!(egress, [Some("机场"), None, None]);
+    }
+
     #[test]
     fn ids_resume_after_the_number_the_store_already_has() {
         let b = EventBus::new();
@@ -787,7 +823,8 @@ mod tests {
             id: 1,
             model: String::new(),
             status: 200,
-            bytes: 0,
+            sent_bytes: 0,
+            received_bytes: 0,
             duration_ms: 0,
             usage: None,
             tokens_per_sec: None,
@@ -804,7 +841,8 @@ mod tests {
             id: 42,
             model: String::new(),
             status: 200,
-            bytes: 1,
+            sent_bytes: 0,
+            received_bytes: 1,
             duration_ms: 2,
             usage: None,
             tokens_per_sec: None,
@@ -866,7 +904,8 @@ mod tests {
                 id: i,
                 model: String::new(),
                 status: 200,
-                bytes: 0,
+                sent_bytes: 0,
+                received_bytes: 0,
                 duration_ms: 0,
                 usage: None,
                 tokens_per_sec: None,
@@ -890,7 +929,8 @@ mod tests {
             id: 9,
             model: String::new(),
             status: 200,
-            bytes: 0,
+            sent_bytes: 0,
+            received_bytes: 0,
             duration_ms: 0,
             usage: None,
             tokens_per_sec: None,

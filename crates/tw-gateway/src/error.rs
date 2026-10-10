@@ -95,6 +95,12 @@ impl Source {
     }
 }
 
+/// 一句话发给 AI 客户端时的样子：错误体、错误帧、WebSocket 上替被拦下的那一帧发的都是它。
+/// 安全日志记的「客户端收到的那句话」也照它写（[`crate::guard::detail`]），两边对得上。
+pub fn client_notice(detail: &Msg) -> String {
+    format!("[ThinkWatch] {}", detail.text)
+}
+
 #[derive(Debug)]
 pub struct GatewayError {
     pub source: Source,
@@ -208,7 +214,7 @@ impl GatewayError {
     /// 发给客户端的那句话。`[ThinkWatch]` 前缀不是装饰：没有它，用户看到
     /// 一个 401 会先去查上游的密钥 —— 而问题在中间这一层。
     fn client_message(&self) -> String {
-        format!("[ThinkWatch] {}", self.detail.text)
+        client_notice(&self.detail)
     }
 
     /// 流中途断掉时，唯一还能说话的地方是流本身。

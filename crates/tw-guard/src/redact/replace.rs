@@ -125,6 +125,10 @@ impl Ledger {
     pub fn replacements(&self) -> impl Iterator<Item = (&str, &str)> {
         self.seen.iter().map(|(o, p)| (o.as_str(), p.as_str()))
     }
+    /// 换掉 `value` 的那个占位符。没换过的是 `None`
+    pub fn placeholder_of(&self, value: &str) -> Option<&str> {
+        self.seen.get(value).map(String::as_str)
+    }
 
     /// 让开 `text` 里已经写着的占位符：新发的号接在它们后面数。
     ///

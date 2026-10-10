@@ -21,6 +21,11 @@
 //!
 //! 拦截档下 [`look`] 按客户端原文里出现的先后给找到的值编好号，每一跳都接着这本账换
 //! （见 [`tw_guard::redact::flow`]）。
+//!
+//! # 每一条记录带着细节
+//!
+//! 报出去的每一条都说得出每一处在哪儿、前后是什么（打过码）、当时的规则、具体做了什么
+//! （[`detail`]）：命中的那一刻算好，跟着事件走。
 
 use std::collections::HashSet;
 
@@ -29,6 +34,8 @@ use tw_guard::content::Screening;
 use tw_guard::redact::flow;
 use tw_guard::redact::replace::Ledger;
 use tw_guard::redact::rules::{Finding, Hit, Rule, RuleSet};
+
+pub mod detail;
 
 /// 按规则找一遍，**不算我们自己的占位符，也不进 base64 载荷**（见 [`flow::hits`]）。
 pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
@@ -65,6 +72,12 @@ pub fn look_hits(mode: Mode, rules: &RuleSet, body: &[u8]) -> flow::Look {
 /// [`look`]，接着 `seed` 的账编号（见 [`flow::look_from`]）。
 pub fn look_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> (Vec<Finding>, Ledger) {
     flow::look_from(mode, rules, body, seed)
+}
+
+/// [`look_from`]，连同找到的命中（见 [`flow::Look::hits`]）：报出去的每一项要说得出在哪儿
+/// （[`detail::secrets`]）。
+pub fn look_hits_from(mode: Mode, rules: &RuleSet, body: &[u8], seed: Ledger) -> flow::Look {
+    flow::look_hits(mode, rules, body, seed)
 }
 
 /// 拦截档下换掉要发出去的这一份，**接着 `ledger` 的账**（见 [`flow::replace`]）。
@@ -130,17 +143,24 @@ pub const REPORTED_MAX: usize = 100;
 
 /// 找到的东西写成事件里的样子。`already` 是这个请求先前已经找到过几个（插件改写过的请求
 /// 只报插件写进来的那些，见 [`more_found`]）：**一个请求加起来最多报 [`REPORTED_MAX`] 个**，
-/// 先报先出现的。
-pub fn items(found: &[Finding], already: usize) -> Vec<tw_api::SecretItem> {
-    found
+/// 先报先出现的。每一项带着细节（[`detail::secrets`]）：`seen` 是找的那一遍。
+pub fn items(
+    found: &[Finding],
+    already: usize,
+    seen: &detail::Seen<'_>,
+) -> Vec<tw_api::SecretItem> {
+    let reported = &found[..found.len().min(REPORTED_MAX.saturating_sub(already))];
+    let details = detail::secrets(seen, reported);
+    reported
         .iter()
-        .take(REPORTED_MAX.saturating_sub(already))
-        .map(|f| tw_api::SecretItem {
+        .zip(details)
+        .map(|(f, detail)| tw_api::SecretItem {
             rule: f.rule.id().to_string(),
             custom: f.rule.custom(),
             kind: crate::wire::secret_kind(f.rule.kind()),
             masked: f.masked.clone(),
             count: f.count,
+            detail,
         })
         .collect()
 }
@@ -186,17 +206,35 @@ pub fn screen_value(
 }
 
 /// 把一次查下来的结论报出去：每条命中的规则一条 [`tw_api::Event::ContentMatched`]，挂在
-/// 请求 `id` 上。要拒绝时返回告诉客户端的那句话。
+/// 请求 `id` 上，细节是 `src` 那一份上算的（[`detail::content`]）。要拒绝时返回告诉客户端的
+/// 那句话。
 pub fn report(
     bus: &tw_observe::EventBus,
     id: u64,
     provider: &str,
     sc: &Screening,
+    src: &detail::Screened<'_>,
+) -> Option<tw_types::Msg> {
+    if sc.hits.is_empty() {
+        return None;
+    }
+    report_with(bus, id, provider, sc, detail::content(src, sc))
+}
+
+/// [`report`]，细节已经算好了（和 `sc.hits` 一一对应）：WebSocket 上查的那一刻和报的那一刻
+/// 隔着准入，查的那一帧那时已经换成了删过的样子
+pub fn report_with(
+    bus: &tw_observe::EventBus,
+    id: u64,
+    provider: &str,
+    sc: &Screening,
+    details: Vec<tw_api::SecurityHitDetail>,
 ) -> Option<tw_types::Msg> {
     if sc.hits.is_empty() {
         return None;
     }
     let at_ms = crate::server::now_ms();
+    let mut details = details.into_iter();
     for h in &sc.hits {
         let hit = &h.hit;
         bus.emit(tw_api::Event::ContentMatched {
@@ -211,6 +249,7 @@ pub fn report(
             excerpt: hit.snippet.clone(),
             count: hit.count as u64,
             revealed: (!hit.revealed.is_empty()).then(|| hit.revealed.clone()),
+            detail: details.next().unwrap_or_default(),
             at_ms,
         });
     }
@@ -337,18 +376,6 @@ fn refusal(h: &tw_guard::content::Hit) -> tw_types::Msg {
     }
 }
 
-/// 没法按消息结构读的正文（解不开的 WebSocket 帧）：只用码位规则，查完就报（见
-/// [`screen_raw`]）。拒绝时返回告诉客户端的那句话。
-pub fn screen_text(
-    bus: &tw_observe::EventBus,
-    id: u64,
-    provider: &str,
-    s: &Screen,
-    text: &str,
-) -> Option<tw_types::Msg> {
-    report(bus, id, provider, &screen_raw(s, text))
-}
-
 /// [`screen_text`] 的结论本身，不发事件：只用码位规则查整段原文，认得 JSON 的 `\uXXXX`
 /// 写法（见 [`tw_guard::content::screen_text`]）。删过之后的文字在 [`Screening::body`] 里。
 ///
@@ -429,9 +456,28 @@ mod tests {
         assert!(l.is_empty());
     }
 
+    /// 报出去的那几项，细节按 `body` 上找的那一遍算（出厂的规则、空账本）
+    fn items_of(found: &[Finding], already: usize, body: &[u8]) -> Vec<tw_api::SecretItem> {
+        let rules = RuleSet::defaults();
+        let hits = hits(std::str::from_utf8(body).unwrap(), &rules);
+        let redaction = crate::bodies::Redaction::default();
+        let seen = detail::Seen {
+            body,
+            dialect: Some(tw_dialect::ir::Dialect::Chat),
+            hits: &hits,
+            redaction: &redaction,
+            replaced: false,
+        };
+        items(found, already, &seen)
+    }
+
     #[test]
     fn the_event_items_name_the_rule_and_never_carry_the_value() {
-        let it = items(&find(Mode::Observe, &RuleSet::defaults(), &body()), 0);
+        let it = items_of(
+            &find(Mode::Observe, &RuleSet::defaults(), &body()),
+            0,
+            &body(),
+        );
         assert_eq!(it[0].rule, "anthropic-api-key");
         assert_eq!(it[0].kind, tw_api::SecretKind::ApiKeys);
         assert!(!it[0].custom);
@@ -458,7 +504,7 @@ mod tests {
         let (found, ledger) = look(Mode::Enforce, &RuleSet::defaults(), body.as_bytes());
         // 找到的一个不少：总共几个不同的值，`found.len()` 说得出来
         assert_eq!(found.len(), 150);
-        let it = items(&found, 0);
+        let it = items_of(&found, 0, body.as_bytes());
         assert_eq!(it.len(), REPORTED_MAX);
         // 报的是先出现的那些，按出现的先后
         let masked: Vec<String> = keys[..REPORTED_MAX]
@@ -470,8 +516,11 @@ mod tests {
             masked
         );
         // 插件改写过的请求再报一次（只报插件写进来的）：和开头那一条加起来不超过上限
-        assert_eq!(items(&found, 30).len(), REPORTED_MAX - 30);
-        assert!(items(&found, 150).is_empty());
+        assert_eq!(
+            items_of(&found, 30, body.as_bytes()).len(),
+            REPORTED_MAX - 30
+        );
+        assert!(items_of(&found, 150, body.as_bytes()).is_empty());
         // 没报的照样换掉
         let (out, ledger) = replace(Mode::Enforce, &RuleSet::defaults(), body.into(), &ledger);
         let out = String::from_utf8(out.to_vec()).unwrap();
