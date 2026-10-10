@@ -694,6 +694,35 @@ pub fn stream_error(upstream: Dialect, f: &Frame) -> Option<String> {
     })
 }
 
+/// 这一帧是不是一次回答的最后一帧：这种格式说完它，这次回答就不再有下文。
+///
+/// - Responses：`response.completed`、`response.incomplete`、`response.failed`
+/// - Anthropic：`message_stop`
+/// - OpenAI Chat：`data: [DONE]`
+/// - Gemini、Bedrock 没有这样一帧，流结束了才算说完
+///
+/// 有 `event:` 的看事件名；没有的看载荷里的 `type`，**先看像不像，像了才解析**。
+pub fn ends_answer(dialect: Dialect, f: &Frame) -> bool {
+    let last: &[&str] = match dialect {
+        Dialect::Responses => &[
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        ],
+        Dialect::Anthropic => &["message_stop"],
+        Dialect::Chat => return f.data.trim() == "[DONE]",
+        Dialect::Gemini | Dialect::Bedrock => return false,
+    };
+    if let Some(event) = &f.event {
+        return last.contains(&event.as_str());
+    }
+    last.iter().any(|k| f.data.contains(k))
+        && serde_json::from_str::<Value>(&f.data)
+            .ok()
+            .and_then(|v| v.get("type")?.as_str().map(|t| last.contains(&t)))
+            .unwrap_or(false)
+}
+
 /// 上游的流 → 客户端的流。**边收边转**，不整块缓冲。
 pub struct StreamConverter {
     decoder: frame::Decoder,
@@ -1038,6 +1067,64 @@ mod stream_error_tests {
             r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
         );
         assert_eq!(stream_error(Dialect::Chat, &delta), None);
+    }
+
+    #[test]
+    fn each_format_knows_the_last_frame_of_an_answer() {
+        for (dialect, f) in [
+            (
+                Dialect::Responses,
+                frame(
+                    Some("response.completed"),
+                    r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+                ),
+            ),
+            // 只有 `data:` 的 Responses 流看载荷里的 `type`
+            (
+                Dialect::Responses,
+                frame(
+                    None,
+                    r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#,
+                ),
+            ),
+            (
+                Dialect::Responses,
+                frame(
+                    Some("response.failed"),
+                    r#"{"type":"response.failed","response":{"status":"failed"}}"#,
+                ),
+            ),
+            (
+                Dialect::Anthropic,
+                frame(Some("message_stop"), r#"{"type":"message_stop"}"#),
+            ),
+            (Dialect::Chat, frame(None, "[DONE]")),
+        ] {
+            assert!(ends_answer(dialect, &f), "{dialect:?} {f:?}");
+        }
+    }
+
+    #[test]
+    fn a_frame_in_the_middle_of_an_answer_is_not_its_last() {
+        // 模型写的字里提到了它：在 `data:` 里，不是这一帧的 `type`
+        let text = frame(
+            None,
+            r#"{"type":"response.output_text.delta","delta":"wait for response.completed"}"#,
+        );
+        assert!(!ends_answer(Dialect::Responses, &text));
+        let delta = frame(
+            Some("message_delta"),
+            r#"{"type":"message_delta","usage":{"output_tokens":7}}"#,
+        );
+        assert!(!ends_answer(Dialect::Anthropic, &delta));
+        let chunk = frame(None, r#"{"choices":[],"usage":{"prompt_tokens":1}}"#);
+        assert!(!ends_answer(Dialect::Chat, &chunk));
+        // Gemini 没有最后一帧：流结束了才算说完
+        let last = frame(
+            None,
+            r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1}}"#,
+        );
+        assert!(!ends_answer(Dialect::Gemini, &last));
     }
 }
 
