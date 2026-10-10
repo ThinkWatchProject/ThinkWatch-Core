@@ -135,7 +135,7 @@ pub struct AppState {
     /// **不在 Runtime 里，因为它握着正在跑的请求的通行证。**跟着配置一起
     /// 换的话，每改一次配置，排着的请求就会失去位置，而已经在跑的那些的
     /// 通行证会变成孤儿。上限改了由它自己在原地加减（见 `limits`）。
-    pub(crate) gate: Arc<crate::limits::Gate>,
+    pub gate: Arc<crate::limits::Gate>,
     /// 每家上游自己的并发上限（见 [`crate::slots`]）。**不在 Runtime 里**，理由和 `gate`
     /// 一样：它握着在跑的请求占着的位置。配置换了由 [`Self::reload`] 在原地改上限
     pub slots: Arc<crate::slots::Slots>,

@@ -188,13 +188,28 @@ async fn gateway_held(
     tokio::sync::broadcast::Receiver<Event>,
     tw_gateway::AppState,
 ) {
+    let client = Client {
+        name: "c".into(),
+        key: "tw-k".into(),
+        ..Default::default()
+    };
+    gateway_as(client, providers, slot_wait_secs, hold).await
+}
+
+/// 起网关，密钥是 `client`，流式回答最多压 `hold` 不给响应头
+async fn gateway_as(
+    client: Client,
+    providers: Vec<Provider>,
+    slot_wait_secs: u64,
+    hold: Duration,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Receiver<Event>,
+    tw_gateway::AppState,
+) {
     let cfg = Config {
         version: 1,
-        clients: vec![Client {
-            name: "c".into(),
-            key: "tw-k".into(),
-            ..Default::default()
-        }],
+        clients: vec![client],
         providers,
         failover: Failover {
             idle_timeout_secs: 30,
@@ -1312,4 +1327,141 @@ async fn a_whole_answer_is_never_answered_early() {
     let (status, headers_at, text) = timed(gw, "/v1/messages", &messages(false)).await;
     assert_eq!(status, 504, "{text}");
     assert!(headers_at >= WINDOW, "{headers_at:?}");
+}
+
+// ───────────────────────────────────────────── 排在准入后面的也等得到响应头
+
+/// 密钥 `c`：同时只跑一个请求（`max_concurrent`），带着这几条用量上限
+fn key(limits: &str) -> Client {
+    Client {
+        name: "c".into(),
+        key: "tw-k".into(),
+        max_concurrent: Some(1),
+        limits: serde_yaml_ng::from_str(limits).unwrap(),
+        ..Default::default()
+    }
+}
+
+/// 密钥的并发闸门占多久才空出来：比压着的时限长、比无响应超时短
+const QUEUED: Duration = Duration::from_millis(900);
+
+#[tokio::test]
+async fn a_request_queued_on_the_keys_gate_gets_the_headers_and_keepalives_before_a_slot_frees() {
+    // 这把密钥的并发闸门满着，900 毫秒才空出来；之后上游 600 毫秒才出内容。压满之后先交响应
+    // 头、发保活，空位空出来之前一个字节都不发给上游；排队的那段不算无响应超时（1 秒），照常答上
+    let late = upstream(Script {
+        steps: vec![(0, MESSAGE_START), (600, answer("patience"))],
+        ..Default::default()
+    })
+    .await;
+    let (gw, mut rx, state) = gateway_as(
+        key("[]"),
+        vec![provider("late", &late, Protocol::Anthropic)],
+        30,
+        HOLD,
+    )
+    .await;
+    let held = state.gate.acquire("c", Some(1)).await;
+    let asking = tokio::spawn(async move { timed(gw, "/v1/messages", &messages(true)).await });
+    tokio::time::sleep(QUEUED).await;
+    assert_eq!(late.hits.load(Ordering::SeqCst), 0, "空位还没空出来");
+    drop(held);
+    let (status, headers_at, text) = asking.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        headers_at >= HOLD && headers_at < QUEUED,
+        "响应头在压满之后、空位空出来之前交出：{headers_at:?}"
+    );
+    let answer = text.find("event: message_start").expect("回答");
+    assert!(
+        text[..answer].trim_start().starts_with(": keep-alive"),
+        "{text}"
+    );
+    assert!(text[..answer].matches(KA).count() >= 3, "{text}");
+    assert!(text[answer..].contains("patience"), "{text}");
+    assert!(!text.contains("event: error"), "{text}");
+    assert!(
+        !text[answer..].contains("keep-alive"),
+        "回答开始之后不再插保活：{text}"
+    );
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(outcomes(&attempts), [("late", Served)]);
+    assert_eq!(outcome(&mut rx).await, Ok(200));
+}
+
+#[tokio::test]
+async fn a_refusal_after_the_headers_went_out_is_told_in_the_stream() {
+    // 一分钟一个请求、不等空位：第一个答完了，第二个排在并发闸门后面，压满之后先拿到响应头；
+    // 空位空出来之后用量窗口把它拒了 —— 429 交不出去了，同一句话写进流里，流量里照样是被拒
+    // 的那一行（开始了、尝试链是空的、按用量上限记失败）
+    let good = upstream(prompt("hello")).await;
+    let (gw, mut rx, state) = gateway_as(
+        key("[{per: minute, requests: 1}]"),
+        vec![provider("good", &good, Protocol::Anthropic)],
+        0,
+        HOLD,
+    )
+    .await;
+    let (status, text) = post(gw, "/v1/messages", &messages(true)).await;
+    assert_eq!(status, 200, "{text}");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(outcomes(&attempts), [("good", Served)]);
+    assert_eq!(outcome(&mut rx).await, Ok(200));
+
+    let held = state.gate.acquire("c", Some(1)).await;
+    let asking = tokio::spawn(async move { timed(gw, "/v1/messages", &messages(true)).await });
+    tokio::time::sleep(QUEUED).await;
+    drop(held);
+    let (status, headers_at, text) = asking.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(headers_at >= HOLD && headers_at < QUEUED, "{headers_at:?}");
+    assert!(text.trim_start().starts_with(": keep-alive"), "{text}");
+    let error = text.find("event: error").expect("流里的错误");
+    assert!(text[error..].contains("rate_limit_error"), "{text}");
+    assert!(text[error..].contains("1 requests per minute"), "{text}");
+    assert_eq!(
+        good.hits.load(Ordering::SeqCst),
+        1,
+        "被拒的一个字节都不发给上游"
+    );
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert!(attempts.is_empty(), "{attempts:?}");
+    assert_eq!(
+        outcome(&mut rx).await,
+        Err((
+            tw_api::FailureSource::RateLimited,
+            "gw.key_limit.requests_rolling".into()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_whole_answer_queued_on_the_keys_gate_still_waits_for_the_answer() {
+    // 整包的请求排在并发闸门后面：照旧压到回答为止，不先交响应头、不插保活
+    let only = upstream(Script {
+        steps: vec![(0, whole("patience"))],
+        content_type: "application/json",
+        ..Default::default()
+    })
+    .await;
+    let (gw, mut rx, state) = gateway_as(
+        key("[]"),
+        vec![provider("only", &only, Protocol::Anthropic)],
+        30,
+        HOLD,
+    )
+    .await;
+    let held = state.gate.acquire("c", Some(1)).await;
+    let asking = tokio::spawn(async move { timed(gw, "/v1/messages", &messages(false)).await });
+    tokio::time::sleep(QUEUED).await;
+    drop(held);
+    let (status, headers_at, text) = asking.await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    assert!(headers_at >= QUEUED, "{headers_at:?}");
+    assert!(!text.contains("keep-alive"), "{text}");
+    assert!(text.trim_start().starts_with('{'), "{text}");
+    assert!(text.contains("patience"), "{text}");
+    let (_, attempts) = estimate_and_attempts(&mut rx).await;
+    assert_eq!(outcomes(&attempts), [("only", Served)]);
+    assert_eq!(outcome(&mut rx).await, Ok(200));
 }
