@@ -5,7 +5,9 @@
 //! **登录的终点是账号下一把普通 API key**，不是一对会过期的 OAuth 令牌。Coding Plan
 //! 的额度跟着 key 走 —— Z.ai 自己的客户端就是这么用的：套餐的每个请求只带这把 key，
 //! 没有第二种凭据。所以写进 config.yaml 的是 `key`，不是 `oauth`：不需要刷新、不需要
-//! refresh token 轮换，[`tw_gateway::oauth`] 那一层完全不参与。
+//! refresh token 轮换，[`tw_gateway::oauth`] 那一层完全不参与。这把 key 和手填的没有
+//! 区别，所以同时写下 `signed_in: zai | bigmodel`，界面才认得出这条上游是账号登录
+//! （[`tw_config::SignedIn`]）。
 //!
 //! # 授权页上显示的是 Z.ai 自己的客户端
 //!
@@ -86,6 +88,13 @@ impl Family {
     /// 不指定名字时，上游叫这个
     fn default_name(&self) -> &'static str {
         self.slug()
+    }
+    /// 写进上游的 `signed_in:`
+    fn signed_in(self) -> tw_config::SignedIn {
+        match self {
+            Self::Zai => tw_config::SignedIn::Zai,
+            Self::Bigmodel => tw_config::SignedIn::Bigmodel,
+        }
     }
 }
 
@@ -603,8 +612,8 @@ fn pick_place(info: &Value) -> Option<(String, String)> {
 
 /// 把登录得来的密钥写进 config.yaml。
 ///
-/// **重新登录只换密钥**，出站方式、模型范围、停用状态这些都不动 —— 用户在上游页上
-/// 调过的东西不该因为换一次密钥就回到默认值。
+/// **重新登录只换密钥**（连同它来自哪一家的 `signed_in`），出站方式、模型范围、停用
+/// 状态这些都不动 —— 用户在上游页上调过的东西不该因为换一次密钥就回到默认值。
 async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Msg> {
     let name = want.name.clone();
     let proxy = want.proxy.clone();
@@ -631,6 +640,9 @@ async fn save(s: &ControlState, want: &Want, key: String) -> Result<String, Msg>
                 ..Default::default()
             });
             p.key = Some(tw_config::Secret::new(key.clone()));
+            // 记下密钥是登录换来的、哪一家的：和手填的 key 一模一样，不记的话界面说不出
+            // 这条上游是账号登录
+            p.signed_in = Some(want.family.signed_in());
             // 这类上游从不用 OAuth。上一次登录留下的（不该有）也一并清掉
             p.oauth = None;
             p.check_credential()

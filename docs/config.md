@@ -406,6 +406,7 @@ Upstreams: the APIs requests are forwarded to.
 | `max_concurrent` | integer | — | Most requests sent to this upstream at the same time, from 1 to 1000. When it is full, a conversation that stays on it waits for a free slot and other requests go to the next upstream; see `failover.slot_wait_secs`. Unset: no limit. |
 | `disabled` | bool | `false` | Take the upstream out of routing and out of the model list, and keep its configuration. |
 | `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | Where the upstream's balance is read from, with its own key and proxy: `openrouter`, `deepseek`, `moonshot`, `sub2api`, `newapi` (New API and One API) or `thinkwatch` (a ThinkWatch Enterprise gateway). `auto`: recognized from `base_url` for OpenRouter, DeepSeek and Moonshot; any other address, except Anthropic's, OpenAI's and Gemini's own, is asked once whether it is a Sub2API, ThinkWatch Enterprise or New API relay, and the answer is kept in memory only. `off`: no balance. ChatGPT and Z.ai accounts and Bedrock have no balance whatever is written here. |
+| `signed_in` | `zai` \| `bigmodel` | — | Which account sign-in the `key` came from: `zai` (Z.ai) or `bigmodel` (BigModel). Signing in to the account in the desktop app writes it; replacing the key there removes it. It does not change how requests are sent. Unset: the key was written by hand. |
 <!-- /generated -->
 
 A credential is one of four things: `key`, which goes in the header the

@@ -500,6 +500,53 @@ routes:
         );
     }
 
+    /// 一家上游的 `signed_in:`：`zai`、`bigmodel` 读得进、原样写回去；不写（这一项出现之前
+    /// 的配置、手填的密钥）就是没有，写回去时也不写出来
+    #[test]
+    fn the_sign_in_mark_loads_and_round_trips() {
+        use crate::SignedIn as S;
+        let with = |extra: &str| {
+            format!(
+                "{GOOD}providers:\n  - name: glm\n    base_url: https://api.z.ai/api/anthropic\n    protocol: anthropic\n    key: id.secret\n{extra}"
+            )
+        };
+        for (value, want) in [("zai", S::Zai), ("bigmodel", S::Bigmodel)] {
+            let cfg = try_parse(&with(&format!("    signed_in: {value}\n")))
+                .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(cfg.providers[0].signed_in, Some(want), "{value}");
+            // 和契约里的那个词一一对应
+            assert_eq!(tw_api::ZaiFamily::from(want).slug(), value);
+            assert_eq!(S::from(tw_api::ZaiFamily::from(want)), want);
+            let written = serde_yaml_ng::to_string(&cfg.providers[0]).unwrap();
+            assert!(
+                written.contains(&format!("signed_in: {value}")),
+                "{written}"
+            );
+            let back: crate::Provider = serde_yaml_ng::from_str(&written).unwrap();
+            assert_eq!(back.signed_in, Some(want));
+        }
+        let cfg = try_parse(&with("")).unwrap();
+        assert_eq!(cfg.providers[0].signed_in, None);
+        let written = serde_yaml_ng::to_string(&cfg.providers[0]).unwrap();
+        assert!(!written.contains("signed_in"), "{written}");
+    }
+
+    /// 不认识的取值：加载不了，说清楚写了什么、能写哪几个；一键修复删掉这一行
+    #[test]
+    fn an_unknown_sign_in_mark_is_refused_and_repaired_away() {
+        let text = format!(
+            "{GOOD}providers:\n  - name: glm\n    base_url: https://api.z.ai/api/anthropic\n    key: id.secret\n    signed_in: chatgpt\n"
+        );
+        let r = try_parse(&text).unwrap_err();
+        assert_eq!(r.message.code, "config.unknown_variant", "{r:?}");
+        assert_eq!(r.message.arg("field"), "providers[0].signed_in");
+        assert_eq!(r.message.arg("value"), "chatgpt");
+        assert_eq!(r.message.arg("expected"), "zai, bigmodel");
+        let fix = crate::repair::repair(&text).expect("一键修复改得了");
+        assert_eq!(fix.fixes[0].field, "providers[0].signed_in");
+        assert_eq!(try_parse(&fix.text).unwrap().providers[0].signed_in, None);
+    }
+
     #[test]
     fn the_display_form_reads_like_a_sentence_a_person_can_act_on() {
         let bad = "version: 1\nclients:\n  - name: c\n    kye: tw-k\n";

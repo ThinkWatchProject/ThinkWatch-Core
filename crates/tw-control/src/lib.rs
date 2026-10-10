@@ -516,6 +516,7 @@ fn provider_view(
         max_concurrent: p.max_concurrent,
         balance_setting: p.balance.into(),
         balance: s.gateway.balance_of(p),
+        signed_in: p.signed_in.map(Into::into),
     }
 }
 

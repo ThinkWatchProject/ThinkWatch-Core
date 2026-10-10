@@ -37,6 +37,9 @@ fn billings() -> Vec<&'static str> {
 fn balance_settings() -> Vec<&'static str> {
     super::fields::<BalanceSetting>()
 }
+fn signed_in() -> Vec<&'static str> {
+    super::fields::<SignedIn>()
+}
 fn proxy_kinds() -> Vec<&'static str> {
     super::fields::<ProxyKind>()
 }
@@ -661,6 +664,15 @@ pub fn sections() -> Vec<Section> {
                     t(
                         "Where the upstream's balance is read from, with its own key and proxy: `openrouter`, `deepseek`, `moonshot`, `sub2api`, `newapi` (New API and One API) or `thinkwatch` (a ThinkWatch Enterprise gateway). `auto`: recognized from `base_url` for OpenRouter, DeepSeek and Moonshot; any other address, except Anthropic's, OpenAI's and Gemini's own, is asked once whether it is a Sub2API, ThinkWatch Enterprise or New API relay, and the answer is kept in memory only. `off`: no balance. ChatGPT and Z.ai accounts and Bedrock have no balance whatever is written here.",
                         "从哪里读这家上游的余额，用它自己的密钥、走它自己的代理：`openrouter`、`deepseek`、`moonshot`、`sub2api`、`newapi`（New API 和 One API）或 `thinkwatch`（ThinkWatch 企业网关）。`auto`：OpenRouter、DeepSeek、Moonshot 按 `base_url` 识别；其他地址（Anthropic、OpenAI、Gemini 的官方地址除外）询问一次它是不是 Sub2API、ThinkWatch 企业网关或 New API 中转站，结果只保存在内存中。`off`：不读余额。ChatGPT、Z.ai 账号和 Bedrock 不读余额，与这里写什么无关。",
+                    ),
+                ),
+                row(
+                    "signed_in",
+                    Kind::Enum(signed_in),
+                    Def::Unset,
+                    t(
+                        "Which account sign-in the `key` came from: `zai` (Z.ai) or `bigmodel` (BigModel). Signing in to the account in the desktop app writes it; replacing the key there removes it. It does not change how requests are sent. Unset: the key was written by hand.",
+                        "`key` 来自哪一家的账号登录：`zai`（Z.ai）或 `bigmodel`（BigModel）。在桌面端登录账号时写入，在桌面端更换密钥时删除。不影响请求的发送方式。不写：密钥是手动填写的。",
                     ),
                 ),
             ],

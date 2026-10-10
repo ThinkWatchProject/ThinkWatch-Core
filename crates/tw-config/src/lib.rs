@@ -195,6 +195,7 @@ impl Default for Provider {
             max_concurrent: None,
             disabled: false,
             balance: BalanceSetting::Auto,
+            signed_in: None,
         }
     }
 }
@@ -848,6 +849,43 @@ pub struct Provider {
     /// 余额从哪儿读，见 [`BalanceSetting`]。不写就是 `auto`
     #[serde(default, skip_serializing_if = "is_default")]
     pub balance: BalanceSetting,
+    /// `key` 是用哪一家的账号登录换来的，见 [`SignedIn`]。只有账号登录写它，别的上游
+    /// 没有这一项
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_in: Option<SignedIn>,
+}
+
+/// 一家上游的 `key` 是用 Z.ai 还是 BigModel 的账号登录换来的。
+///
+/// **它只说密钥的来历，不改变任何行为**：转发、额度、余额都不看它。那类登录的终点是一把
+/// 普通 API key，和手填的一模一样，不记下来的话，界面编辑这条上游时说不出它是「账号登录」
+/// 得来的。重新登录照旧写上；在界面里手动换掉密钥时去掉 —— 那时的密钥已经不是登录得来的
+/// 了。这一项出现之前写下的配置没有它
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignedIn {
+    /// Z.ai（api.z.ai）
+    Zai,
+    /// BigModel（open.bigmodel.cn）
+    Bigmodel,
+}
+
+impl From<SignedIn> for tw_api::ZaiFamily {
+    fn from(s: SignedIn) -> Self {
+        match s {
+            SignedIn::Zai => Self::Zai,
+            SignedIn::Bigmodel => Self::Bigmodel,
+        }
+    }
+}
+
+impl From<tw_api::ZaiFamily> for SignedIn {
+    fn from(f: tw_api::ZaiFamily) -> Self {
+        match f {
+            tw_api::ZaiFamily::Zai => Self::Zai,
+            tw_api::ZaiFamily::Bigmodel => Self::Bigmodel,
+        }
+    }
 }
 
 /// 一家上游的余额从哪儿读。
