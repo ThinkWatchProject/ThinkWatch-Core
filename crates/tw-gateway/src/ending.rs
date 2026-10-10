@@ -1187,7 +1187,7 @@ mod tests {
         );
         e.responded(200);
         e.streaming(ir::Dialect::Responses, "chatgpt");
-        e.feed(COMPLETED);
+        wire(&mut e, COMPLETED);
         e.delivered();
         drop(e);
 
@@ -1197,12 +1197,12 @@ mod tests {
                 Event::RequestFinished {
                     id: 7,
                     status: 200,
-                    bytes,
+                    received_bytes,
                     usage: Some(u),
                     ..
                 },
             ] => {
-                assert_eq!(*bytes, COMPLETED.len() as u64);
+                assert_eq!(*received_bytes, COMPLETED.len() as u64);
                 assert_eq!((u.input, u.cache_read, u.output), (1000, 4000, 300));
             }
             other => panic!("该是一条结束，实际 {other:?}"),

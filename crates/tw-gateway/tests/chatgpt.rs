@@ -614,7 +614,7 @@ async fn a_401_gets_one_fresh_token_and_one_retry() {
         .expect("没有结束事件");
     assert_eq!(
         finished,
-        ((wire[0] + wire[1]) as u64, stream_body().len() as u64)
+        ((wire[0] + wire[1]) as u64, stream_body(0).len() as u64)
     );
 }
 
