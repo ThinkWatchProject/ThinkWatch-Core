@@ -34,8 +34,8 @@ use crate::error::GatewayError;
 use crate::state::AppState;
 use tw_dialect::ir::Dialect;
 
-/// 保活那一行：一行 SSE 注释
-const KEEPALIVE: &[u8] = b": keep-alive\n\n";
+/// 保活那一行：一行 SSE 注释。报文记录认得它，不记（见 [`crate::content`]）
+pub(crate) const KEEPALIVE: &[u8] = b": keep-alive\n\n";
 
 /// 先交响应头的话怎么交。
 #[derive(Debug, Clone, Copy)]

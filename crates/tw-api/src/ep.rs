@@ -65,6 +65,10 @@ endpoints! {
     /// 中止一个在跑的请求：和上游的连接断开，客户端收到错误，请求记成手动中止。已经
     /// 结束了的是 404
     AbortRequest: POST "/request/{id}/abort" [id], () => api::Aborted;
+    /// 一个在跑的请求的实时内容：报文头和正文，客户端那一边和每一跳上游那一边，先补发到
+    /// 目前为止有的，再接着发新来的，`end` 之后关闭（见 [`api::LiveContent`]）。已经结束了的、
+    /// 从来没有过的、跑在 WebSocket 连接上的都是 404（`control.request_not_running`）
+    RequestLive: GET "/request/{id}/live" [id], () => api::LiveContent, events;
     /// 把一条记录变成回放用例（YAML）
     Fixture: GET "/request/{id}/fixture" [id], () => String, text;
     Sessions: GET "/sessions", api::ListQuery => Vec<api::SessionView>;

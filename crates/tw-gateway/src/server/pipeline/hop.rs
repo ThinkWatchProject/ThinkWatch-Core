@@ -113,6 +113,10 @@ struct Outbound {
     /// 请求体里的提示缓存断点是转换时自动标的（客户端一个都没标）：发给的是这个模型。
     /// 上游拒了这些断点就去掉再发一次（见 [`crate::cache_marks`]）
     auto_cache: Option<String>,
+    /// 发出去的和客户端那一份（插件改过的话是改过的）说的不是一回事了：转换过格式，或者
+    /// 去掉了上游不认的字段。报文记录照它决定另不另存（见 [`crate::content`]）。只改了模型名、
+    /// 去掉了客户端的身份字段不算：模型名在尝试链上，为它另存一整份不值
+    reshaped: bool,
 }
 
 /// 这一跳没发出去的原因。尝试链里记的和报给客户端的是同一句。
@@ -454,7 +458,7 @@ pub(super) async fn try_upstreams<'a>(
             .rewritten
             .as_ref()
             .map_or(&started.ledger, |r| &r.ledger);
-        let (body, ledger) = super::heavy(&out.body, || {
+        let (body, ledger, differs) = super::heavy(&out.body, || {
             // 这一家在这段对话里拒过的别家封存的推理：发之前先去掉（见 `crate::seal`）
             let unsealed = unseal_upfront(state, req, started, provider, &out);
             // 发出去的就是客户端原文的那些字节（同格式直通、一个字节都没改）：开头那一遍在
@@ -464,8 +468,14 @@ pub(super) async fn try_upstreams<'a>(
                     && unsealed.as_ptr() == req.body.as_ptr()
                     && unsealed.len() == req.body.len()
             });
+            // 发出去的和这一跳客户端那一边（插件改过的话是改过的那一份）不是一回事了：转换过、
+            // 去掉过字段（上游不认的、它拒过的封存推理）。报文记录另存它（见 `crate::content`）。
+            // 换成占位符不算：落盘时两边换的是同一个
+            let differs = out.reshaped || unsealed.as_ptr() != out.body.as_ptr();
             let mode = rt.config.security.redact.mode;
-            crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known)
+            let (body, ledger) =
+                crate::guard::replace_found(mode, &rt.redact, unsealed, seed, known);
+            (body, ledger, differs)
         });
 
         // 用这个 provider 自己的 Client —— 它带着该走的代理。**在取密钥
@@ -539,6 +549,16 @@ pub(super) async fn try_upstreams<'a>(
             .clone()
             .unwrap_or_else(|| reading.facts.model.clone());
         let (attempt, bridge) = (chain.len(), plugged.bridge);
+        // 这一跳在报文记录里记到哪儿（见 `crate::content`）：尝试链上的第几跳，从 1 数
+        let tap = crate::content::Tap::new(
+            req.seat.get(),
+            chain.len() as u32 + 1,
+            crate::bodies::Redaction {
+                rules: rt.redact.clone(),
+                ledger: ledger.clone(),
+            },
+            differs,
+        );
         // 这一跳发出去的那一刻：这一家的快慢样本、无响应超时都从这里算起（见 `crate::latency`、
         // `super::idle`）。之前等空位、跑插件的时间都不算
         let sent_at = std::time::Instant::now();
@@ -557,6 +577,7 @@ pub(super) async fn try_upstreams<'a>(
                     body.clone(),
                     upstream_headers.clone(),
                     aws.as_ref(),
+                    &tap,
                 )
                 .await;
                 // 上游拒绝了自动标的缓存断点、别家封存的推理：去掉它们，同一家再发一次
@@ -568,6 +589,7 @@ pub(super) async fn try_upstreams<'a>(
                             headers: &upstream_headers,
                             aws: aws.as_ref(),
                             conversation: started.conversation.as_deref(),
+                            tap: &tap,
                         };
                         let (r, uncached) =
                             resend_uncached(state, req, provider, http, resend, r).await?;
@@ -577,6 +599,7 @@ pub(super) async fn try_upstreams<'a>(
                             headers: &upstream_headers,
                             aws: aws.as_ref(),
                             conversation: started.conversation.as_deref(),
+                            tap: &tap,
                         };
                         resend_unsealed(state, req, provider, http, resend, r).await
                     }
@@ -591,7 +614,13 @@ pub(super) async fn try_upstreams<'a>(
             }
         };
         let sent = match waited {
-            Waited::Done(sent) => sent,
+            Waited::Done(sent) => {
+                // 上游的响应头（重发过的是最后那一遍的）
+                if let Ok(r) = &sent {
+                    tap.answered(r);
+                }
+                sent
+            }
             // 被手动中止：这一跳到此为止，不再换下一家。不停用、不算失败
             Waited::Aborted => {
                 chain.push(super::idle::aborted_hop(
@@ -657,6 +686,8 @@ pub(super) async fn try_upstreams<'a>(
                 let hand_on = last && status < 500 && status != 429;
                 match verdict {
                     Verdict::Failed(cause) if !hand_on => {
+                        // 换下一家：这一跳的回答就是读来认原因的那一截
+                        tap.said(&head);
                         // 5xx、限流、没钱了、额度用完、凭据被拒、没有这个模型：换一家有
                         // 意义，那边是另一把密钥、另一个账户。停用多久看原因。后面只剩满着
                         // 的那几家也一样等它们：空出来的那一家可能答得上
@@ -814,6 +845,8 @@ pub(super) async fn try_upstreams<'a>(
                                 Verdict::ClientError => response,
                                 Verdict::Failed(cause) => {
                                     reached = true;
+                                    // 换下一家：这一跳的回答就是上游在开头报的那个错
+                                    tap.said(&body);
                                     state.note_quota(id, &provider.name, &headers);
                                     state.note_proxy_ok(&provider.proxy);
                                     let cause = known_reset(state, &provider.name, cause);
@@ -1206,6 +1239,8 @@ fn prepare(
     let mut query = req.query.clone();
     let mut session: Option<tw_dialect::convert::Session> = None;
     let mut auto_cache: Option<String> = None;
+    // 转换过格式就是；同格式直通时看有没有去掉字段
+    let mut reshaped = target.is_some();
     let body = match target {
         None => {
             // 参数改写。**只在这里动 body，而且只动被点名的那几个字段** ——
@@ -1255,6 +1290,7 @@ fn prepare(
                     .and_then(|d| crate::egress::strip_body_identity(d, &out))
                     .unwrap_or(out)
             };
+            reshaped = !dropped.is_empty();
             if let Some(d) = client_dialect.filter(|_| !dropped.is_empty()) {
                 let same = crate::wire::dialect(d);
                 state.bus.emit(tw_api::Event::Translated {
@@ -1409,6 +1445,7 @@ fn prepare(
         hop,
         session,
         auto_cache,
+        reshaped,
     })
 }
 
@@ -1452,6 +1489,8 @@ struct Resend<'a> {
     headers: &'a [(String, String)],
     aws: Option<&'a tw_bedrock::Credentials>,
     conversation: Option<&'a str>,
+    /// 这一跳在报文记录里记到哪儿。再发的那一遍不再是客户端那一份（[`crate::content::Tap::resent`]）
+    tap: &'a crate::content::Tap,
 }
 
 /// 上游回 400、拒绝了转换时自动标的提示缓存断点（见 [`crate::cache_marks`]）：去掉，同一家
@@ -1504,6 +1543,7 @@ async fn resend_uncached(
         stripped.clone(),
         resend.headers.to_vec(),
         resend.aws,
+        &resend.tap.resent(),
     )
     .await?;
     Ok((r, Some(stripped)))
@@ -1559,6 +1599,7 @@ async fn resend_unsealed(
         Bytes::from(stripped),
         resend.headers.to_vec(),
         resend.aws,
+        &resend.tap.resent(),
     )
     .await
 }
@@ -1597,6 +1638,7 @@ async fn send(
     body: Bytes,
     upstream_headers: Vec<(String, String)>,
     aws: Option<&tw_bedrock::Credentials>,
+    tap: &crate::content::Tap,
 ) -> Result<reqwest::Response, SendError> {
     let url = hop_url(provider, out);
     let method = reqwest::Method::from_bytes(b"POST").expect("POST is a valid method");
@@ -1622,7 +1664,8 @@ async fn send(
         && !headers.contains_key("anthropic-version"))
     .then_some(("anthropic-version", tw_dialect::official::ANTHROPIC_VERSION));
     let gateway = crate::egress::gateway_headers(&hop, headers);
-    // Codex 后端收 zstd 压缩的请求体（见 `chatgpt::compress`）
+    // Codex 后端收 zstd 压缩的请求体（见 `chatgpt::compress`）。报文记录记压缩之前的
+    let plain = body.clone();
     let (body, encoding) = match chatgpt.then(|| crate::chatgpt::compress(&body)).flatten() {
         Some(z) => (z, Some("zstd")),
         None => (body, None),
@@ -1680,25 +1723,31 @@ async fn send(
             .build()
             .map_err(SendError::Http)?;
         crate::bedrock::sign_request(&mut request, credentials, region).map_err(SendError::Sign)?;
+        tap.sending(&request, &plain, &upstream_headers);
         return dispatch(traffic, size, http.execute(request))
             .await
             .map_err(SendError::Http);
     }
-    let mut sent = dispatch(
-        traffic,
-        size,
-        build(&upstream_headers).body(body.clone()).send(),
-    )
-    .await;
+    // 定稿了再发：报文记录记下真正发出去的请求头
+    let request = build(&upstream_headers)
+        .body(body.clone())
+        .build()
+        .map_err(SendError::Http)?;
+    tap.sending(&request, &plain, &upstream_headers);
+    let mut sent = dispatch(traffic, size, http.execute(request)).await;
     // **OAuth 上游回 401：换一个 access token 再发一次，只一次。**token 可能在别处被
     // 吊销了、提前失效了；不重试的话，这个请求连同之后每一个请求都会原样失败，直到
     // 缓存里那个 token 按时间过期。换回来的还是 401，说明问题不在 token
     if provider.oauth.is_some() && matches!(&sent, Ok(r) if r.status() == 401) {
         match state.headers_after_401(provider, http, sent_at).await {
             // 换回来的还是同一个（刚换过不久）：再发一次也是 401
-            Ok(fresh) if fresh != upstream_headers => {
-                sent = dispatch(traffic, size, build(&fresh).body(body).send()).await;
-            }
+            Ok(fresh) if fresh != upstream_headers => match build(&fresh).body(body).build() {
+                Ok(request) => {
+                    tap.sending(&request, &plain, &fresh);
+                    sent = dispatch(traffic, size, http.execute(request)).await;
+                }
+                Err(e) => sent = Err(e),
+            },
             Ok(_) => {}
             Err(e) => {
                 tracing::debug!(provider = %provider.name, "the upstream answered 401 and the token could not be renewed: {e}")

@@ -12,7 +12,7 @@ use crate::error::GatewayError;
 use crate::health::Health;
 use crate::state::AppState;
 use listing::{get_model, list_models};
-pub(crate) use pipeline::stream_fault;
+pub(crate) use pipeline::{KEEPALIVE, PING, stream_fault};
 use tw_types::msg;
 
 mod intake;
@@ -96,6 +96,7 @@ async fn passthrough(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     method: axum::http::Method,
+    version: axum::http::Version,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
     // **必须排在 `body` 前面。**`body` 拿走的是整个请求
@@ -193,11 +194,15 @@ async fn passthrough(
         .map_err(|e| e.in_dialect(dialect))?;
     // 手动中止的开关（见 `crate::abort`）。管线发出开始事件时登记上它
     let abort = crate::abort::Switch::default();
+    // 这个请求的报文记录（见 `crate::content`）：管线发出开始事件时放进来，交给客户端的
+    // 响应在这里包一层
+    let seat = crate::content::Seat::default();
     let req = pipeline::Inbound {
         uri,
         query,
         headers,
         body,
+        version,
         client_name,
         api,
         dialect,
@@ -205,6 +210,7 @@ async fn passthrough(
         from,
         abort: abort.clone(),
         traffic: crate::traffic::Traffic::new(),
+        seat: seat.clone(),
     };
     // 被手动中止时，**管线先自己收场**（`biased`）：在等上游的那几处它看着开关，丢掉那一跳、
     // 报完尝试链再返回。停在别处（等密钥的上限、取凭据）的，由这里整个丢掉，结局照样按
@@ -225,7 +231,16 @@ async fn passthrough(
     // **在一个地方给方言，而不是在每个 return 点。**后者只要漏一处，
     // 那条路径上的客户端就会收到一个它解析不了的 body，而那个失败看
     // 起来和真实原因毫无关系。
-    result.map_err(|e| e.in_dialect(dialect))
+    let result = result.map_err(|e| e.in_dialect(dialect));
+    // 开始了的请求：交给客户端的状态行、响应头和每一个字节记进报文（见 `crate::content`）。
+    // 错误也在这里变成响应 —— 客户端收到的错误一样是这个请求的回答
+    match seat.get() {
+        Some(capture) => {
+            let resp = result.unwrap_or_else(IntoResponse::into_response);
+            Ok(capture.client_answer(version, resp))
+        }
+        None => result,
+    }
 }
 
 /// 熔断状态变了就报一条，没变什么都不做。

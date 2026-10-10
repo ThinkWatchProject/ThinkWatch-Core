@@ -66,6 +66,14 @@ pub enum BodyKind {
     /// 已经换回原值，见 [`crate::plugin::request`]），带着那一跳的 [`Redaction`]：落盘前和
     /// 别的正文一样换掉、打码（[`BodyRecord::for_disk`]）
     AfterPlugins,
+    /// 回答那一跳发给上游的请求体，**和客户端那一边（插件改过的话是改过的那一份）不是一回事
+    /// 时才存**（见 [`crate::content`]）。带着那一跳的 [`Redaction`]
+    UpstreamRequest,
+    /// 交给客户端的回答，**和上游的原话（`Response`）不是一回事时才存**（见 [`crate::content`]）
+    ClientResponse,
+    /// 这个请求的报文头：一个 `tw_api::HeadView` 的 JSON 数组。**交来时已经打过码**（打码的
+    /// 那一刻实时内容也在发它，见 [`crate::content`]），落盘前不再动它
+    Heads,
 }
 
 /// 落盘之前怎么处理一份正文。
@@ -273,7 +281,12 @@ impl BodyRecord {
         let found = self
             .found
             .filter(|_| entire && matches!(text, std::borrow::Cow::Borrowed(_)));
-        let body = self.redaction.apply_found(&text, found.as_deref());
+        // 报文头交来时已经换过、打过码：实时内容发出去的和落盘的是同一份
+        let body = if self.kind == BodyKind::Heads {
+            text.into_owned()
+        } else {
+            self.redaction.apply_found(&text, found.as_deref())
+        };
         // 截过的（交来的只是开头）报原本的长度。没截过的就是换过、打过码的这一份的长度：
         // 比存储层的上限还长的，由存储层截、由它记下（`tw_store::Blobs::put_with_len`）
         let whole = self.original_len.max(self.body.len());
@@ -411,6 +424,21 @@ impl ResponseTap {
     /// 攒到的那部分，以及**原始的总长度**。
     pub fn finish(self) -> (Bytes, usize) {
         (Bytes::from(self.buf), self.total)
+    }
+
+    /// 到目前为止攒到的那部分
+    pub fn kept(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// 攒满了：之后来的不再留
+    pub fn full(&self) -> bool {
+        self.buf.len() >= RESPONSE_TAP_MAX
+    }
+
+    /// 有没攒下的：攒满之后又来过
+    pub fn cut(&self) -> bool {
+        self.total > self.buf.len()
     }
 }
 

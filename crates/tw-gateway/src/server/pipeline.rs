@@ -27,7 +27,9 @@ mod opening;
 mod plug;
 mod relay;
 
+pub(crate) use commit::KEEPALIVE;
 pub(crate) use hop::stream_fault;
+pub(crate) use relay::PING;
 
 /// 进管线时就定了的东西：身份识别之后，每一步都只读不改。
 pub(super) struct Inbound {
@@ -35,6 +37,8 @@ pub(super) struct Inbound {
     pub(super) query: Option<String>,
     pub(super) headers: HeaderMap,
     pub(super) body: Bytes,
+    /// 客户端用的协议版本：报文里的请求行、状态行照它写（见 [`crate::content`]）
+    pub(super) version: axum::http::Version,
     pub(super) client_name: String,
     /// 客户端调的是哪种 API（看路径，见 `client_api`）。认不出的路径是 None
     pub(super) api: Option<crate::client_api::ClientApi>,
@@ -47,6 +51,8 @@ pub(super) struct Inbound {
     /// 这个请求和上游之间走了多少流量（见 [`crate::traffic`]）：每一跳发的时候记、收的时候记，
     /// 结局报出去的是它
     pub(super) traffic: std::sync::Arc<crate::traffic::Traffic>,
+    /// 这个请求的报文记录（见 [`crate::content`]）：开始时放进去，每一跳从这里拿
+    pub(super) seat: crate::content::Seat,
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -1040,6 +1046,22 @@ fn open(
     end.metered_by(req.traffic.clone());
     // 从这一刻起可以手动中止：登记跟着结局走，结局报了就不在跑了（见 `crate::abort`）
     end.abortable(state.aborts.enter(id, session, req.abort.clone()));
+    // 从这一刻起看得到它的报文（见 `crate::content`）：客户端的请求先记下
+    let capture = crate::content::Capture::open(
+        &state.contents,
+        id,
+        at_ms as i64,
+        sink.clone(),
+        redaction.clone(),
+    );
+    // 比窗口长的请求体只拷一次开头：留档和报文记录用同一份（见 `bodies::offer`）
+    let kept = match &sink {
+        Some(_) => crate::content::prefix(&req.body),
+        None => req.body.clone(),
+    };
+    capture.client_request(req.version, &req.uri, &req.headers, &kept, req.body.len());
+    end.capture(capture.clone());
+    req.seat.put(capture);
     *ending = Some(end);
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
@@ -1057,7 +1079,7 @@ fn open(
             id,
             at_ms as i64,
             crate::bodies::BodyKind::Request,
-            req.body.clone(),
+            kept,
             req.body.len(),
             redaction,
         )

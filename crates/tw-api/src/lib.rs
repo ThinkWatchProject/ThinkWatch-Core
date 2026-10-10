@@ -850,6 +850,14 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `ttft_samples`）；[`CostDim`] 多了 `egress`（直连那一组的名字是空串）。新端点
 /// `GET /latency/client`：按密钥分的首 token 分位数。请求记录的库换了版本，升级时清空。
 /// 照 43 写的界面读不到 `bytes`，按出口分组会被拒。
+///
+/// 44 起**还看得到在跑的请求的报文**：新端点 `GET /request/{id}/live`（`RequestLive`，事件流），
+/// 每条 SSE 带着 `event:`（`head` / `body` / `end`），`data:` 是 [`HeadView`] / [`LiveBody`] /
+/// [`LiveEnd`]（[`LiveContent`]，不带种类的字段）：先补发到目前为止有的，再接着发，`end` 之后
+/// 关闭；不在跑的是 404（`control.request_not_running`）。[`RequestDetail`] 多了 `heads`（客户端
+/// 两边、每一跳的请求行或状态行和头，凭据打码）、`upstream_request_body` 和
+/// `upstream_response_body`（和客户端那一边不是一回事时才有）；`response_body` 是客户端收到的
+/// 那一份 —— 转换过格式的请求以前在这里的是上游的原话，现在它在 `upstream_response_body`。
 pub const CONTROL_API_VERSION: u32 = 44;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4483,7 +4491,23 @@ pub struct RequestDetail {
     /// 插件改过之后、发往上游的那一份：最后发出去的那一跳收到的（回答的那一家收到的就是
     /// 它）。**只有插件改了那一跳的请求才有**
     pub request_after_plugins: Option<BodyView>,
+    /// 客户端收到的回答。网关转交上游的回答时没改内容（同格式、没有回答钩子），它就是
+    /// 上游的原话（模型名换回客户端用的名称不算改，那一处照上游的写）；改过的（格式转换、
+    /// 回答钩子）是改过之后交给客户端的那一份，上游的原话在 `upstream_response_body`。网关
+    /// 本地估算的 token 数是估出来的那一份
     pub response_body: Option<BodyView>,
+    /// 回答的那一跳发给上游的请求体，**和客户端那一边不是一回事时才有**：转换过格式、去掉过
+    /// 上游不认的字段、去掉上游拒绝的部分再发过。只差模型名、只去掉了客户端身份字段的不另存
+    /// （发出去的模型名在尝试链上）。插件改过的那一份在 `request_after_plugins`，比的是它。
+    /// 拦截档下占位符是发出去的那个
+    pub upstream_request_body: Option<BodyView>,
+    /// 回答的那一跳上游的原话（解压过的文字），**和客户端收到的不是一回事时才有**（见
+    /// `response_body`）
+    pub upstream_response_body: Option<BodyView>,
+    /// 这个请求的报文头：客户端那一边的请求和回答，每一跳发出去的请求和上游的回答，按
+    /// 发生的先后。凭据打了码，别的值和正文同一套脱敏。同一跳发了两遍的（换了 token、去掉
+    /// 上游拒绝的部分再发）只留最后一遍
+    pub heads: Vec<HeadView>,
     /// 插件在这个请求上的每一次运行，按先后：每一跳的请求钩子，回答那一跳的回答钩子。
     /// 按 [`PluginRunView::attempt`] 对着尝试链分组
     pub plugins: Vec<PluginRunView>,
@@ -4492,6 +4516,129 @@ pub struct RequestDetail {
     /// 尝试链；耗时、用量、金额都还没有。请求体已经存下了，响应体要等结局。
     /// 结局到了再取一次，就是完整的那一份
     pub in_flight: bool,
+}
+
+slug_enum! {
+    /// 报文属于哪一段：客户端和网关之间，还是网关和上游之间。
+    pub enum WireSide {
+        Client = "client",
+        Upstream = "upstream",
+    }
+}
+
+slug_enum! {
+    /// 报文的方向。
+    pub enum WireDir {
+        Request = "request",
+        Response = "response",
+    }
+}
+
+/// 一个报文头：请求行或状态行，和头（[`RequestDetail::heads`]，也是实时内容里的
+/// `head`，见 [`LiveContent`]）。
+///
+/// **凭据一律打码**，写法和 `key_masked` 一样（`Bearer sk-an…AAAA`）：`authorization`、
+/// `x-api-key`、`proxy-authorization`、`cookie`、上游配置里写的头……别的值、请求行里的
+/// 路径和查询串和正文同一套脱敏（拦截档下换成发给上游的那个占位符，认得出的打码）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HeadView {
+    pub side: WireSide,
+    pub dir: WireDir,
+    /// 客户端那一边是 0；上游那一边是尝试链上的第几跳，从 1 数（`RoutingView.attempts` 里
+    /// 的第 `attempt - 1` 个）
+    pub attempt: u32,
+    /// 请求行或状态行。客户端的请求是 `POST /v1/messages HTTP/1.1`；发给上游的请求写完整的
+    /// 地址、不写协议版本（`POST https://api.anthropic.com/v1/messages`）—— 走 HTTP/1.1 还是
+    /// HTTP/2 要连上之后才定，看上游回答的状态行（`HTTP/2 200`）
+    pub line: String,
+    /// 头的名字和值，按出现的顺序，同名的各占一行。发给上游的是网关写进请求的那些：HTTP
+    /// 库自己补的（`host`、`content-length`）不在里面
+    pub headers: Vec<(String, String)>,
+}
+
+/// 实时内容里的一段正文（`body`）：这一段报文到上一段 `body` 之后新来的文字。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LiveBody {
+    pub side: WireSide,
+    pub dir: WireDir,
+    /// 同 [`HeadView::attempt`]
+    pub attempt: u32,
+    /// 新来的文字（UTF-8，坏字节换成 U+FFFD），**和落盘的那一份同一套脱敏**。客户端的
+    /// 请求体一次给全；回答按 SSE 的事件边界一段一段给，不是流的回答收齐了一次给
+    pub text: String,
+    /// 这一段报文到了上限（[`BODY_MAX`]）：之后不再有它的 `body`
+    pub truncated: bool,
+}
+
+slug_enum! {
+    /// 请求怎么收的场（实时内容的 `end`）。
+    pub enum LiveOutcome {
+        Finished = "finished",
+        /// 上游出错、被策略拒绝、流断了、超时……
+        Failed = "failed",
+        /// 客户端先走了
+        Cancelled = "cancelled",
+        /// 在界面上叫停的（`POST /request/{id}/abort`）
+        Aborted = "aborted",
+    }
+}
+
+/// 实时内容的最后一条（`end`），之后流就关了。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LiveEnd {
+    /// 客户端收到的状态码。响应头还没交出去客户端就走了的是 None
+    pub status: Option<u16>,
+    pub outcome: LiveOutcome,
+}
+
+/// 一个在跑的请求的实时内容（`GET /request/{id}/live`）里的一条。
+///
+/// 每条是一个 SSE 消息：`event:` 是 [`LiveContent::event`]（`head` / `body` / `end`），
+/// `data:` 是对应那个类型的 JSON，**不带种类的字段** —— 按 `event:` 分（[`LiveContent::parse`]）。
+/// 订阅时先把到目前为止有的都补发一遍，再接着发新来的；收到 `end` 之后流关闭。
+///
+/// - 一段报文（`side`、`dir`、`attempt` 三样定一段）先有 `head` 再有 `body`。同一段又来了
+///   一个 `head`：这一跳又发了一遍（换了 token、去掉上游拒绝的部分），之后的 `body` 从头算
+/// - 客户端那一边的回答：网关转交上游的回答时没改内容（同格式、没有回答钩子；模型名换回
+///   客户端用的名称不算），就是回答那一跳上游的那一段 —— 两段的 `body` 一字不差，各发一次。
+///   网关插的心跳（`: keep-alive`、Anthropic 的 `ping`）不算
+/// - **补发的只有落盘要留的**，没人在看时不为实时内容多留一个字节：报文头都在；正文是
+///   客户端的请求、客户端收到的回答、回答那一跳上游的回答，和回答那一跳发出去的请求体
+///   ——只在它要另存时（[`RequestDetail::upstream_request_body`]）。失败了的那几跳只有报文头
+///   （它们的请求体、回的错误不落盘）。订阅着的时候发生的，照样一条不少地发
+/// - 请求记录没有起来（磁盘起不来）时正文一份都不留，只发订阅之后来的
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum LiveContent {
+    Head(HeadView),
+    Body(LiveBody),
+    End(LiveEnd),
+}
+
+impl LiveContent {
+    /// SSE 的 `event:` 那一行写什么
+    pub fn event(&self) -> &'static str {
+        match self {
+            LiveContent::Head(_) => "head",
+            LiveContent::Body(_) => "body",
+            LiveContent::End(_) => "end",
+        }
+    }
+
+    /// 一条 SSE 消息读回来：`event` 是 `event:` 那一行，`data` 是 `data:` 那一行。认不出的
+    /// 是 None
+    pub fn parse(event: &str, data: &str) -> Option<Self> {
+        match event {
+            "head" => serde_json::from_str(data).ok().map(LiveContent::Head),
+            "body" => serde_json::from_str(data).ok().map(LiveContent::Body),
+            "end" => serde_json::from_str(data).ok().map(LiveContent::End),
+            _ => None,
+        }
+    }
 }
 
 /// 一份正文最多存多少字节：请求和回答一样，4 MiB。更长的只存开头，[`BodyView::truncated`]

@@ -87,6 +87,9 @@ pub struct Ending {
     abort: Option<crate::abort::Registered>,
     /// 回答的最后一帧已经交给了客户端（见 [`Ending::delivered`]）
     delivered: bool,
+    /// 这个请求的报文记录（见 [`crate::content`]）。有它时，回答那一跳的回答攒在它身上
+    /// （`tap` 不用）：实时内容和落盘看的是同一份
+    capture: Option<crate::content::Capture>,
     /// 报过了。**只能报一次**
     told: bool,
 }
@@ -232,6 +235,7 @@ impl Ending {
             answer: None,
             abort: None,
             delivered: false,
+            capture: None,
             told: false,
         }
     }
@@ -312,6 +316,19 @@ impl Ending {
         self.abort = Some(r);
     }
 
+    /// 这个请求的报文记录（见 [`crate::content`]）：结局报了告诉它怎么收的场
+    pub fn capture(&mut self, c: crate::content::Capture) {
+        self.capture = Some(c);
+    }
+
+    /// 尝试链上的第 `attempt` 跳（从 1 数）接下了这个请求，从这里起喂进来的是它的回答。
+    /// `mirror` 说客户端收到的就是它的原话（见 [`crate::content::Capture::serving`]）
+    pub fn serving(&mut self, attempt: u32, mirror: bool) {
+        if let Some(c) = &self.capture {
+            c.serving(attempt, self.redaction.clone().unwrap_or_default(), mirror);
+        }
+    }
+
     /// 回答的那一家答到一半没了声音（无响应超时，见 `server::pipeline::idle`）：这段对话这一轮
     /// 不再留在它那儿
     pub fn went_quiet(&mut self) {
@@ -344,8 +361,11 @@ impl Ending {
     /// 的那一处（见 [`crate::traffic`]）。
     pub fn feed(&mut self, chunk: &[u8]) {
         self.sniffer.feed(chunk);
-        // 没有去处（观测层没起来）就不攒：一个回答最多攒 4 MB，攒了也交不出去
-        if self.sink.is_some() {
+        // 有报文记录、有一跳接下了：攒在记录上（它自己知道攒不攒）。没有的（WebSocket、网关
+        // 自己估的数）照旧攒在这里；没有去处（观测层没起来）就不攒：一个回答最多攒 4 MB，
+        // 攒了也交不出去
+        let captured = self.capture.as_ref().is_some_and(|c| c.answer(chunk));
+        if !captured && self.sink.is_some() {
             self.tap.feed(chunk);
         }
         if let Some(r) = self.refusal.as_mut() {
@@ -490,6 +510,7 @@ impl Ending {
         let duration_ms = self.duration_ms();
         let tokens_per_sec = rate(self.opened, usage.as_ref(), duration_ms);
         let (sent_bytes, received_bytes) = self.traffic.totals();
+        self.close(tw_api::LiveOutcome::Finished);
         self.bus.emit(tw_api::Event::RequestFinished {
             id: self.id,
             model: std::mem::take(&mut self.model),
@@ -514,6 +535,11 @@ impl Ending {
     fn fail(&mut self, source: tw_api::FailureSource, message: Msg) {
         let (usage, answered_model) = self.settle();
         let (sent_bytes, received_bytes) = self.traffic_seen();
+        self.close(if source == tw_api::FailureSource::Aborted {
+            tw_api::LiveOutcome::Aborted
+        } else {
+            tw_api::LiveOutcome::Failed
+        });
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
             model: std::mem::take(&mut self.model),
@@ -531,7 +557,10 @@ impl Ending {
     /// 认的）。三种结局共用，只走一次。
     fn settle(&mut self) -> (Option<Usage>, Option<String>) {
         self.told = true;
-        let (recorded, original_len) = std::mem::take(&mut self.tap).finish();
+        let (recorded, original_len) = match self.capture.as_ref().and_then(|c| c.freeze_answer()) {
+            Some(kept) => kept,
+            None => std::mem::take(&mut self.tap).finish(),
+        };
         if !recorded.is_empty() {
             crate::bodies::offer(
                 &self.sink,
@@ -549,6 +578,13 @@ impl Ending {
         let model = sniffer.model().map(str::to_string);
         let usage = self.total.take().or_else(|| sniffer.finish());
         (usage, model)
+    }
+
+    /// 告诉报文记录这个请求怎么收的场（实时内容的 `end`，见 [`crate::content`]）
+    fn close(&self, outcome: tw_api::LiveOutcome) {
+        if let Some(c) = &self.capture {
+            c.settled(outcome);
+        }
     }
 
     fn duration_ms(&self) -> u64 {
@@ -590,6 +626,7 @@ impl Drop for Ending {
         let (sent_bytes, received_bytes) = self.traffic_seen();
         // 在界面上叫停之后被丢掉的（见 `crate::abort`）：是手动中止，不是客户端走了
         if self.abort.as_ref().is_some_and(|r| r.thrown()) {
+            self.close(tw_api::LiveOutcome::Aborted);
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
                 model: std::mem::take(&mut self.model),
@@ -606,6 +643,7 @@ impl Drop for Ending {
         // 是网关自己的代码崩掉了。**记成取消会冤枉客户端** —— 排查的人
         // 会去问一个根本没做过这件事的客户端。
         if std::thread::panicking() {
+            self.close(tw_api::LiveOutcome::Failed);
             self.bus.emit(tw_api::Event::RequestFailed {
                 id: self.id,
                 model: std::mem::take(&mut self.model),
@@ -621,6 +659,7 @@ impl Drop for Ending {
             });
             return;
         }
+        self.close(tw_api::LiveOutcome::Cancelled);
         self.bus.emit(tw_api::Event::RequestCancelled {
             id: self.id,
             model: std::mem::take(&mut self.model),

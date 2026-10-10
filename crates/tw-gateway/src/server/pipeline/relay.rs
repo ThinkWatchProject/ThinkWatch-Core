@@ -52,6 +52,7 @@ pub(super) fn respond(
         slot,
         sent_at,
         unconfirmed,
+        attempt,
         ..
     } = served;
     let status =
@@ -89,6 +90,11 @@ pub(super) fn respond(
     if let Some(r) = &rename {
         r.headers(&mut out_headers);
     }
+    // 报文记录（见 `crate::content`）：从这里起喂进结局的是这一跳的回答。客户端收到的和它的
+    // 原话是一回事时（同格式、没有回答钩子），客户端那一边不另攒。**只差模型名不算**：为它
+    // 另存一整份回答不值，模型名在尝试链上
+    let transforms = session.is_some() || plugins.is_some();
+    ending.serving(attempt as u32 + 1, !transforms);
 
     // **Bedrock 的流不是 SSE**，是 AWS eventstream 的二进制帧。在字节进门的地方就转成
     // SSE（`event:` 是事件名，`data:` 是载荷），后面的一切 —— 用量、首 token、留档、
@@ -361,8 +367,8 @@ fn upstream_dialect(
         .unwrap_or(tw_dialect::ir::Dialect::Anthropic)
 }
 
-/// Anthropic 的心跳帧，和它自己的 API 发的一样。
-const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
+/// Anthropic 的心跳帧，和它自己的 API 发的一样。报文记录认得它，不记（见 [`crate::content`]）
+pub(crate) const PING: &[u8] = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
 
 /// 响应头到手时就定下的处理方式。
 #[derive(Clone, Copy)]
