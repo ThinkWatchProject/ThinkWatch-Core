@@ -1067,6 +1067,17 @@ mod stream_error_tests {
             r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
         );
         assert_eq!(stream_error(Dialect::Chat, &delta), None);
+        // 有的中转每一块都带着 `"error": null`
+        let relayed = frame(
+            None,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}],"error":null}"#,
+        );
+        assert_eq!(stream_error(Dialect::Chat, &relayed), None);
+        let gemini = frame(
+            None,
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"error":null}"#,
+        );
+        assert_eq!(stream_error(Dialect::Gemini, &gemini), None);
     }
 
     #[test]

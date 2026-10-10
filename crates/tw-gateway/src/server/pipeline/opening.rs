@@ -264,7 +264,8 @@ fn error_in(dialect: Dialect, ty: &str, v: &serde_json::Value, data: &str) -> Op
             }
             _ => None,
         },
-        Dialect::Chat => v.get("error").map(|e| {
+        // 有的中转每一块都带着 `"error": null`：那不是错误
+        Dialect::Chat => v.get("error").filter(|e| !e.is_null()).map(|e| {
             let kind = Some(text_of(e, "code"))
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| text_of(e, "type"));
@@ -276,7 +277,7 @@ fn error_in(dialect: Dialect, ty: &str, v: &serde_json::Value, data: &str) -> Op
                 .unwrap_or_else(|| openai_status(&kind));
             error(status, data, kind, text_of(e, "message"))
         }),
-        Dialect::Gemini => v.get("error").map(|e| {
+        Dialect::Gemini => v.get("error").filter(|e| !e.is_null()).map(|e| {
             let status = e
                 .get("code")
                 .and_then(|c| c.as_u64())
@@ -478,6 +479,15 @@ mod tests {
             first_verdict(Dialect::Chat, err),
             Some(Judge::Error { status: 429, .. })
         ));
+    }
+
+    /// 有的中转每一块都带着 `"error": null`：那是内容，不是上游报错
+    #[test]
+    fn a_null_error_is_no_error() {
+        let chat = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}],\"error\":null}\n\n";
+        assert_eq!(first_verdict(Dialect::Chat, chat), Some(Judge::Content));
+        let gemini = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}],\"error\":null}\n\n";
+        assert_eq!(first_verdict(Dialect::Gemini, gemini), Some(Judge::Content));
     }
 
     #[test]
