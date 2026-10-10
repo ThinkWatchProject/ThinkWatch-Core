@@ -123,8 +123,14 @@ impl Runtime {
     }
 }
 
+/// 路由这一刻的本地时间从哪儿来：规则的 `time` 条件按它求值。
+pub type LocalClock = Arc<dyn Fn() -> tw_engine::LocalTime + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
+    /// 路由这一刻的本地时间（规则的 `time` 条件按它求值）。默认是系统时钟、本机时区；
+    /// 测试把它定死（[`Self::set_local_time`]）。**跨重载存活**：它不属于配置
+    pub(crate) local_time: LocalClock,
     /// 配置换入时整块换掉的那部分（第 ⑤ 步）。
     ///
     /// **一次 `store` 就是一次生效**：正在跑的请求持有旧的 `Arc`，跑完
@@ -286,6 +292,7 @@ impl AppState {
         let key_limits = Arc::new(crate::key_limits::KeyLimits::new(bus.clone()));
         key_limits.configure(&rt.config);
         let state = Self {
+            local_time: Arc::new(tw_engine::LocalTime::now),
             rt: Arc::new(arc_swap::ArcSwap::from_pointee(rt)),
             gate: Default::default(),
             slots,
@@ -366,6 +373,12 @@ impl AppState {
 
     pub fn config(&self) -> Arc<tw_config::Config> {
         self.rt.load().config.clone()
+    }
+
+    /// 换一个路由看的本地时钟（测试把时间定在某个工作日的上午、某个周末）。只在测试里、
+    /// 第一个请求之前调
+    pub fn set_local_time(&mut self, clock: LocalClock) {
+        self.local_time = clock;
     }
 
     /// 换一个看用量上限的时钟（测试把时间拨到零点前后）。**账从空的开始**：只在测试里、

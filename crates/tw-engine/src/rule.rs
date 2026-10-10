@@ -12,6 +12,7 @@ use tw_types::{Msg, msg};
 
 use crate::facts::RequestFacts;
 use crate::num::Compare;
+use crate::time::{LocalTime, TimeError, Window};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +49,11 @@ pub struct When {
     /// 而不是规则本身。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<OneOrMany>,
+    /// 路由这一刻的本地时间落在哪个窗口里：`[<days> ]<HH:MM>-<HH:MM>`
+    /// （`mon-fri 09:00-18:00`、`sat,sun 00:00-24:00`、`22:00-06:00`，见
+    /// [`crate::time`]）。写几个窗口满足其一即可。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<OneOrMany>,
     /// **阶段二专用**：路由决定完之后，选中的是哪个 provider。
     ///
     /// 它是个循环依赖 —— 规则的去向要在请求发出去之前定下来，而这个值要
@@ -74,6 +80,15 @@ impl OneOrMany {
             OneOrMany::Many(v) => v.iter().any(|x| x == s),
         }
     }
+
+    /// 逐个值
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        match self {
+            OneOrMany::One(x) => std::slice::from_ref(x).iter(),
+            OneOrMany::Many(v) => v.iter(),
+        }
+        .map(String::as_str)
+    }
 }
 
 impl When {
@@ -91,6 +106,7 @@ impl When {
             && self.thinking.is_none()
             && self.stream.is_none()
             && self.intent.is_none()
+            && self.time.is_none()
             && self.provider_would_be.is_none()
     }
 
@@ -139,7 +155,32 @@ impl When {
                     .map_err(|e| MatchError::BadCompare { field, source: e })?;
             }
         }
+        self.windows()?;
         Ok(())
+    }
+
+    /// `time` 这一条写的那几个窗口。写错了说是哪个值
+    fn windows(&self) -> Result<Vec<Window>, MatchError> {
+        self.time
+            .iter()
+            .flat_map(OneOrMany::iter)
+            .map(|v| {
+                crate::time::parse(v).map_err(|source| MatchError::BadTime {
+                    value: v.to_string(),
+                    source,
+                })
+            })
+            .collect()
+    }
+
+    /// `time` 这一条对这一刻成立吗。没写这一条时成立；写了而这一刻不知道（`None`）
+    /// 时不成立。
+    pub fn time_matches(&self, now: Option<LocalTime>) -> Result<bool, MatchError> {
+        if self.time.is_none() {
+            return Ok(true);
+        }
+        let windows = self.windows()?;
+        Ok(now.is_some_and(|t| windows.iter().any(|w| w.contains(t))))
     }
 
     /// 这些条件对这个请求都成立吗。
@@ -172,6 +213,9 @@ impl When {
             if !(want.contains(&f.intent) || want.contains("assistant_internal")) {
                 return Ok(false);
             }
+        }
+        if !self.time_matches(f.time)? {
+            return Ok(false);
         }
         for (field, spec, value) in [
             ("input_tokens", &self.input_tokens, f.input_tokens as f64),
@@ -217,6 +261,10 @@ pub enum MatchError {
         field: &'static str,
         source: crate::num::ParseError,
     },
+    /// `time` 的一个值不合写法。`source` 说是哪儿错了，给日志和测试看；用户看到的
+    /// 那句话把写法整个说一遍（见 [`crate::RouteError::TimeSyntax`]，那一句带规则名）
+    #[error("{}", self.msg())]
+    BadTime { value: String, source: TimeError },
 }
 
 impl MatchError {
@@ -228,7 +276,17 @@ impl MatchError {
     /// 读配置文件时的报错走的是那一条。
     pub fn msg(&self) -> Msg {
         use crate::num::ParseError;
-        let MatchError::BadCompare { field, source } = self;
+        let (field, source) = match self {
+            MatchError::BadCompare { field, source } => (field, source),
+            MatchError::BadTime { value, .. } => {
+                return msg!(
+                    "engine.time_syntax", value = value =>
+                    "time condition `{value}` is not written as `[days ]HH:MM-HH:MM`: days are \
+                     mon, tue, wed, thu, fri, sat, sun or a range like mon-fri, the hours run from \
+                     00:00 to 24:00, as in \"mon-fri 09:00-18:00\""
+                );
+            }
+        };
         match source {
             ParseError::Empty => msg!(
                 "engine.compare.empty", field = field =>
@@ -304,6 +362,7 @@ mod tests {
             image: false,
             thinking: false,
             stream: true,
+            time: None,
         }
     }
 
@@ -506,6 +565,89 @@ mod tests {
                 .matches(&real, &[])
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    fn at(weekday: u8, hour: u16, minute: u16) -> RequestFacts {
+        RequestFacts {
+            time: Some(LocalTime::at(weekday, hour, minute)),
+            ..Default::default()
+        }
+    }
+
+    fn w(y: &str) -> When {
+        serde_yaml_ng::from_str(y).unwrap()
+    }
+
+    #[test]
+    fn office_hours_match_on_a_weekday_morning_and_not_on_a_weekend() {
+        let r = w("{ time: 'mon-fri 09:00-18:00' }");
+        assert!(r.matches(&at(2, 10, 0), &[]).unwrap(), "周三上午十点");
+        assert!(!r.matches(&at(5, 10, 0), &[]).unwrap(), "周六上午十点");
+        assert!(!r.matches(&at(2, 18, 0), &[]).unwrap(), "终点不含");
+        assert!(r.matches(&at(2, 9, 0), &[]).unwrap(), "起点含");
+    }
+
+    #[test]
+    fn several_windows_are_or_like_intent() {
+        let r = w("{ time: ['mon-fri 09:00-12:00', 'mon-fri 14:00-18:00'] }");
+        assert!(r.matches(&at(0, 10, 0), &[]).unwrap());
+        assert!(r.matches(&at(0, 15, 0), &[]).unwrap());
+        assert!(
+            !r.matches(&at(0, 13, 0), &[]).unwrap(),
+            "午休不在任一窗口里"
+        );
+    }
+
+    #[test]
+    fn an_overnight_window_is_matched_on_the_next_morning() {
+        let r = w("{ time: 'fri 22:00-06:00' }");
+        assert!(r.matches(&at(4, 23, 0), &[]).unwrap());
+        assert!(
+            r.matches(&at(5, 5, 59), &[]).unwrap(),
+            "周六凌晨属于周五的窗口"
+        );
+        assert!(!r.matches(&at(5, 6, 0), &[]).unwrap());
+    }
+
+    #[test]
+    fn an_unknown_time_never_matches_a_time_rule() {
+        // 网关没填这一刻的话，当成某个固定时刻会让规则在错的时候命中
+        let r = w("{ time: '00:00-24:00' }");
+        assert!(!r.matches(&RequestFacts::default(), &[]).unwrap());
+        // 没写这一条的规则不在乎时间
+        assert!(
+            When::default()
+                .matches(&RequestFacts::default(), &[])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_time_only_rule_is_not_a_catch_all() {
+        assert!(!w("{ time: '09:00-18:00' }").is_catch_all());
+    }
+
+    #[test]
+    fn a_malformed_window_is_caught_at_load_time_and_names_the_value() {
+        let r = w("{ time: ['mon-fri 09:00-18:00', '9-5'] }");
+        let e = r.validate().unwrap_err();
+        assert_eq!(
+            e,
+            MatchError::BadTime {
+                value: "9-5".into(),
+                source: TimeError::BadTime("9".into()),
+            }
+        );
+        let m = e.msg();
+        assert_eq!(m.code, "engine.time_syntax");
+        assert_eq!(m.arg("value"), "9-5");
+        // 求值时同样不会悄悄当成不命中
+        assert!(r.matches(&at(0, 10, 0), &[]).is_err());
     }
 }
 

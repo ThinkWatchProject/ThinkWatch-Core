@@ -441,6 +441,8 @@ slug_enum! {
         MaxTokens = "max_tokens",
         ToolCount = "tool_count",
         Intent = "intent",
+        /// 本地时间窗口：`[days ]HH:MM-HH:MM`，可以写几个
+        Time = "time",
         ProviderWouldBe = "provider_would_be",
         Cache = "cache",
         Tools = "tools",
@@ -868,7 +870,13 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 客户端收到的话、删掉了几段，[`OutcomeDetail`]）。[`RequestDetail`] 的 `security` 是同一个
 /// 类型。事件跟着改：[`SecretItem`]、[`Event::ContentMatched`]、[`Event::ToolCallFlagged`]
 /// 多了 `detail`（[`SecurityHitDetail`]）。细节存在请求记录的库里，和请求一起过期。
-pub const CONTROL_API_VERSION: u32 = 44;
+///
+/// **45 起规则能按时间分流**：[`ConditionField`] 多了 `time`，值是 `[days ]HH:MM-HH:MM`
+/// 的本地时间窗口（见 [`ConditionView::values`]），可以写几个，满足其一即可；路由、试算
+/// 按 core 所在机器那一刻的本地时间求值，试算的 [`MismatchView::got`] 写成 `fri 17:30`。
+/// 写错的值配置加载不了、保存时被拒（`engine.rule_time_syntax`，带规则名和那个值）。
+/// 照 44 写的界面不认这个条件。
+pub const CONTROL_API_VERSION: u32 = 45;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2390,11 +2398,14 @@ pub struct RuleRewrite {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ConditionView {
     /// `when` 里的键：`model` / `client` / `dialect` / `input_tokens` /
-    /// `max_tokens` / `tool_count` / `intent` / `provider_would_be` /
+    /// `max_tokens` / `tool_count` / `intent` / `time` / `provider_would_be` /
     /// `cache` / `tools` / `image` / `thinking` / `stream`
     pub field: ConditionField,
-    /// 写的值。`intent` 和 `provider_would_be` 可以写多个，满足其一即可；
-    /// 布尔条件是 `true` / `false`；数量条件是比较式（`>200k`）
+    /// 写的值。`intent`、`time` 和 `provider_would_be` 可以写多个，满足其一即可；
+    /// 布尔条件是 `true` / `false`；数量条件是比较式（`>200k`）；`time` 是
+    /// `[days ]HH:MM-HH:MM`（`mon-fri 09:00-18:00`、`sat,sun 00:00-24:00`、`22:00-06:00`：
+    /// 天用逗号列、`mon-fri` 是一段、不写是每天；起点含、终点不含、终点可以是 `24:00`、
+    /// 终点早于起点的是过夜的窗口，天指窗口开始的那一天），按 core 所在机器的本地时间
     pub values: Vec<String>,
 }
 
@@ -5325,9 +5336,10 @@ pub struct RuleTrace {
 pub struct MismatchView {
     /// 和 `ConditionView.field` 同一个词表
     pub field: ConditionField,
-    /// 规则里写的值。`intent` 写了多个时逐个列出
+    /// 规则里写的值。`intent`、`time` 写了多个时逐个列出
     pub want: Vec<String>,
-    /// 这个请求实际的值。`intent` 为空表示真实的用户请求
+    /// 这个请求实际的值。`intent` 为空表示真实的用户请求；`time` 是试算那一刻 core 的
+    /// 本地时间，写成 `fri 17:30`
     pub got: String,
 }
 

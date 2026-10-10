@@ -3,6 +3,7 @@ pub mod engine;
 pub mod facts;
 pub mod num;
 pub mod rule;
+pub mod time;
 pub mod weighted;
 
 pub use catalog::{Catalog, ProviderModels};
@@ -13,4 +14,5 @@ pub use engine::{
     order_by, scalar_name,
 };
 pub use facts::{RequestFacts, estimate_strings, estimate_tokens};
+pub use time::{LocalTime, Window};
 pub use weighted::Member;

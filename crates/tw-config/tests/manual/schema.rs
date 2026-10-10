@@ -1618,6 +1618,15 @@ pub fn sections() -> Vec<Section> {
                     ),
                 ),
                 row(
+                    "time",
+                    Kind::OneOrMany,
+                    Def::Unset,
+                    t(
+                        "Local time of the machine core runs on, as a window `[days ]HH:MM-HH:MM`: `mon-fri 09:00-18:00`, `sat,sun 00:00-24:00`, `22:00-06:00`. Several windows: any of them. See below.",
+                        "core 所在机器的本地时间落在窗口 `[days ]HH:MM-HH:MM` 里：`mon-fri 09:00-18:00`、`sat,sun 00:00-24:00`、`22:00-06:00`。写几个窗口满足其一即可。见下文。",
+                    ),
+                ),
+                row(
                     "provider_would_be",
                     Kind::OneOrMany,
                     Def::Unset,
