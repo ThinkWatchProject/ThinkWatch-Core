@@ -100,14 +100,17 @@ async fn it_gives_every_running_request_with_what_has_happened_to_it_so_far() {
             usage: None,
             queued_ms: None,
             skipped: None,
+            proxy: None,
         }],
         billing: tw_api::Billing::PerToken,
+        egress: None,
     });
     bus.emit(tw_api::Event::RequestFinished {
         id: 1,
         model: "claude-sonnet-5".into(),
         status: 200,
-        bytes: 10,
+        sent_bytes: 0,
+        received_bytes: 10,
         duration_ms: 5,
         usage: None,
         tokens_per_sec: None,
@@ -185,7 +188,8 @@ async fn live_gives_the_running_requests_and_the_generation_rate() {
         id: 1,
         model: "claude-sonnet-5".into(),
         status: 200,
-        bytes: 10,
+        sent_bytes: 0,
+        received_bytes: 10,
         duration_ms: 3_000,
         usage: Some(tw_api::UsageView {
             output: 100,

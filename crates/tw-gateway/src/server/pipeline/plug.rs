@@ -128,10 +128,20 @@ pub(super) async fn attempt(
         .bridge
         .as_ref()
         .map_or_else(|| started.ledger.clone(), |b| b.ledger().clone());
-    let (found, ledger) = crate::guard::look_from(mode, &rt.redact, &body, seed);
+    let look = crate::guard::look_hits_from(mode, &rt.redact, &body, seed);
+    let (found, ledger) = (look.found, look.ledger);
     let more = crate::guard::more_found(&started.found, found);
-    // 和开头那一条加起来，一个请求报的有上限（见 `crate::guard::REPORTED_MAX`）
-    let items = crate::guard::items(&more, started.found.len());
+    // 和开头那一条加起来，一个请求报的有上限（见 `crate::guard::REPORTED_MAX`）。位置是插件
+    // 改过的这一份里的
+    let redaction = super::redaction(rt, ledger.clone());
+    let seen = crate::guard::detail::Seen {
+        body: &body,
+        dialect: req.api.map(|a| a.dialect()),
+        hits: look.hits.as_deref().unwrap_or_default(),
+        redaction: &redaction,
+        replaced: mode.acts(),
+    };
+    let items = crate::guard::items(&more, started.found.len(), &seen);
     if !items.is_empty() {
         state.bus.emit(tw_api::Event::SecretsFound {
             id: started.id,
@@ -176,14 +186,21 @@ fn rescreen(
         return unchanged();
     }
     if let Some(inputs) = &c.inputs {
-        return rescreen_inputs(state, &screen, started, provider, c, inputs);
+        return rescreen_inputs(state, rt, &screen, started, provider, c, inputs);
     }
     let screened = crate::client_api::ClientApi::screened(req.uri.path());
     let Some(api) = req.api.filter(|_| screened) else {
         return unchanged();
     };
     let sc = crate::guard::rescreen(&screen, api.dialect(), &req.body, &c.body);
-    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &sc) {
+    let redaction = super::redaction(rt, started.ledger.clone());
+    let src = crate::guard::detail::Screened {
+        body: &c.body,
+        dialect: Some(api.dialect()),
+        rules: &screen.rules,
+        redaction: &redaction,
+    };
+    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &sc, &src) {
         return Err(why);
     }
     Ok(match sc.body {
@@ -204,6 +221,7 @@ fn rescreen(
 /// 只按插件加进来的拒绝；删过的话，删过的文字写回原文的那几项
 fn rescreen_inputs(
     state: &AppState,
+    rt: &Runtime,
     screen: &crate::guard::Screen,
     started: &Started,
     provider: &str,
@@ -236,13 +254,37 @@ fn rescreen_inputs(
         .collect();
     let now: Vec<&String> = changed.iter().map(|&i| &after[i]).collect();
     let chat = tw_dialect::ir::Dialect::Chat;
-    let sc = crate::guard::rescreen(
-        screen,
-        chat,
-        as_chat(&was).as_bytes(),
-        as_chat(&now).as_bytes(),
-    );
-    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &sc) {
+    let now_chat = as_chat(&now);
+    let sc = crate::guard::rescreen(screen, chat, as_chat(&was).as_bytes(), now_chat.as_bytes());
+    let redaction = super::redaction(rt, started.ledger.clone());
+    let src = crate::guard::detail::Screened {
+        body: now_chat.as_bytes(),
+        dialect: Some(chat),
+        rules: &screen.rules,
+        redaction: &redaction,
+    };
+    let mut details = crate::guard::detail::content(&src, &sc);
+    // 位置写回原文：查的那段对话里第 k 条是改过的第 k 项，在原文的 `input`（嵌入）或者
+    // `prompt`（旧版补全）里是第 `changed[k]` 项
+    let key = if c.path.ends_with("embeddings") {
+        "input"
+    } else {
+        "prompt"
+    };
+    let listed = c.value.get(key).is_some_and(Value::is_array);
+    for at in details.iter_mut().flat_map(|d| d.locations.iter_mut()) {
+        let i = at
+            .message_index
+            .and_then(|k| changed.get(k as usize))
+            .copied();
+        at.role = None;
+        at.message_index = i.and_then(|i| u32::try_from(i).ok());
+        at.path = match (i, listed) {
+            (Some(i), true) => format!("{key}[{i}]"),
+            _ => key.to_string(),
+        };
+    }
+    if let Some(why) = crate::guard::report_with(&state.bus, started.id, provider, &sc, details) {
         return Err(why);
     }
     let Some(stripped) = sc.body else {

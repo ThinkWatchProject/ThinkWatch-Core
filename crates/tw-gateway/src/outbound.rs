@@ -108,6 +108,12 @@ pub fn client_for_provider(
     b.build().map_err(|e| client_error(&e))
 }
 
+/// 这家上游的请求从哪个出口出去：它配置的代理名（跟随系统的是 `system`），直连是 None。
+/// 尝试链的每一跳、请求记录的出口记的都是它（见 `tw_api::AttemptView::proxy`）
+pub fn egress(p: &tw_config::Provider) -> Option<String> {
+    (p.proxy != tw_config::DIRECT).then(|| p.proxy.clone())
+}
+
 /// 建不起 HTTP 客户端。
 ///
 /// **原因要一层层展开。**reqwest 自己只说最外面一层（「builder error」），

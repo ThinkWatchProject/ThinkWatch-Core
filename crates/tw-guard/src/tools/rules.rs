@@ -133,6 +133,22 @@ impl Rule {
     }
 }
 
+impl Rule {
+    /// 这条规则在 `args` 里的每一处，按先后：正则规则是每一个不空的匹配，代码规则只有
+    /// [`Rule::find`] 找到的那一处。第一处和 [`Rule::find`] 的一样。
+    pub fn find_all(&self, args: &str) -> Vec<std::ops::Range<usize>> {
+        match self.check {
+            None => self
+                .re
+                .find_iter(args)
+                .filter(|m| !m.is_empty())
+                .map(|m| m.range())
+                .collect(),
+            Some(check) => check.find(args).into_iter().collect(),
+        }
+    }
+}
+
 /// 一条永不匹配任何输入的正则。代码规则的 `re` 用它。
 fn never_match() -> Regex {
     // `[^\s\S]` 是「既不是空白、也不是非空白」的字符类，即空集：永远匹配不到

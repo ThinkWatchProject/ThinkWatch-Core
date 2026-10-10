@@ -386,8 +386,9 @@ fn output(
     // 上游接下了、回了 2xx 的才有回答可读
     let answered = row.status.is_some_and(|s| (200..300).contains(&s));
     let Some(body) = blobs.get(row.at_ms, row.id, Which::Response) else {
-        // 没走到上游的、上游回了错误的，本来就没有回答；一个字节都没收到客户端就走了的也是
-        let missing = answered && row.bytes != Some(0);
+        // 没走到上游的、上游回了错误的，本来就没有回答；一个字节都没从上游收到客户端就走了的
+        // 也是
+        let missing = answered && row.received_bytes != Some(0);
         return (
             Vec::new(),
             missing.then_some(TranscriptGap::ResponseMissing),
@@ -1603,7 +1604,7 @@ mod tests {
             None,
             |r| {
                 r.cancelled = true;
-                r.bytes = Some(0);
+                r.received_bytes = Some(0);
             },
         );
 

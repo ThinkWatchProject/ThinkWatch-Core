@@ -389,12 +389,13 @@ for _ in $(seq 1 20); do
 rows = json.load(sys.stdin)
 r = rows[0] if rows else {}
 good = ("was cut off" in ((r.get("error") or {}).get("text") or "") and r.get("input_tokens") == 2345
-        and r.get("cost_micros") is not None and r.get("cost_estimated") is True)
+        and r.get("cost_micros") is not None and r.get("cost_estimated") is True
+        and (r.get("sent_bytes") or 0) > 0 and (r.get("received_bytes") or 0) > 0)
 print("ok" if good else json.dumps(r, ensure_ascii=False, sort_keys=True))' 2>/dev/null)
   [ "$GOT" = "ok" ] && break
   sleep 0.25
 done
-[ "$GOT" = "ok" ] && ok "被切断的请求落了库：带着切断之前的输入用量和估算金额" \
+[ "$GOT" = "ok" ] && ok "被切断的请求落了库：带着切断之前的输入用量、估算金额和流量" \
   || bad "被切断的请求没有带着用量落库" "$GOT"
 
 # 客户端中途走掉（Claude Code 里按 Esc）。
@@ -522,7 +523,7 @@ for ep in "/summary?from_ms=$DAY" "/summary/buckets?from_ms=$DAY&bucket_ms=36000
   [ "$C" = "200" ] && ok "GET ${ep%%\?*}（带时间窗）" || bad "GET $ep 返回 $C" "$(cat "$TMP/out" 2>/dev/null | head -c 200)"
 done
 
-for ep in /status /overview /summary /history /latency /latency/provider /storage /quota /security \
+for ep in /status /overview /summary /history /latency /latency/provider /latency/client /storage /quota /security \
           /security/events /sessions /diagnostics /config /config/history /models /in-flight /live \
           /upstreams/health /plugins; do
   C=$(get "$ep")

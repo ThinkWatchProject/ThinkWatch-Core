@@ -77,6 +77,7 @@ impl<E: Endpoint> Answer<E> for (StatusCode, Json<E::Res>) {}
 impl<E: Endpoint<Res = String>> Answer<E> for String {}
 impl<E: Endpoint<Res = String>> Answer<E> for Result<String, Fail> {}
 impl<E: Endpoint<Res = tw_api::Event>, S> Answer<E> for Sse<S> {}
+impl<E: Endpoint<Res = tw_api::LiveContent>, S> Answer<E> for Result<Sse<S>, Fail> {}
 
 macro_rules! serves {
     ($($a:ident),*) => {

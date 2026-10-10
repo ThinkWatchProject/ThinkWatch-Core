@@ -253,6 +253,8 @@ pub struct AppState {
     pub plugin_pool: Arc<crate::plugin::pool::Pool>,
     /// 此刻在跑、可以手动中止的请求（见 [`crate::abort`]）。**跨重载存活**
     pub aborts: Arc<crate::abort::Aborts>,
+    /// 此刻在跑的请求的报文（见 [`crate::content`]）：控制面的实时内容从这里订阅。**跨重载存活**
+    pub contents: Arc<crate::content::Contents>,
     /// `failover.idle_timeout_secs` 的一秒有多长（见 `server::pipeline::idle`）。**测试会把它
     /// 调短**，否则一条无响应超时的测试至少要干等三十秒
     pub idle_tick: std::time::Duration,
@@ -329,6 +331,7 @@ impl AppState {
             ping_for: crate::PING_FOR,
             plugin_pool: Arc::new(crate::plugin::pool::Pool::default_size()),
             aborts: Default::default(),
+            contents: Default::default(),
             idle_tick: std::time::Duration::from_secs(1),
             opening_hold: crate::OPENING_HOLD,
             keepalive_every: crate::KEEPALIVE_EVERY,

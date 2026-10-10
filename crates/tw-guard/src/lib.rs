@@ -7,7 +7,8 @@
 //!
 //! 引擎也在这里：「怎么找、怎么换、怎么在流里换回来」（[`redact`]），「怎么审查一个工具
 //! 调用」（[`tools`]），「查调用方的哪些正文、怎么匹配、怎么删」（[`content`]）。扫客户端
-//! 配置文件用的隐藏字符检测在 [`hidden`]（桌面版的配置扫描用它）。
+//! 配置文件用的隐藏字符检测在 [`hidden`]（桌面版的配置扫描用它）。命中在请求里的哪儿（哪一部分、
+//! 第几条消息、JSON 路径）在 [`locate`]。
 
 /// 取值是一个固定集合的枚举：配置里、线上写的就是那个词。和桌面版控制面契约里
 /// `slug_enum!` 给的是同一套：全部取值、词、从词读回、写出来就是词、和词比
@@ -50,6 +51,7 @@ macro_rules! words {
 
 pub mod content;
 pub mod hidden;
+pub mod locate;
 pub mod policy;
 pub mod redact;
 pub mod tools;

@@ -289,10 +289,16 @@ async fn a_request_emits_the_four_lifecycle_events_in_order() {
     }
     let finished = next_lifecycle(&mut rx).await;
     match finished {
-        tw_api::Event::RequestFinished { status, bytes, .. } => {
+        tw_api::Event::RequestFinished {
+            status,
+            sent_bytes,
+            received_bytes,
+            ..
+        } => {
             assert_eq!(status, 200);
             // 字节数是流真正流过的量，不是 content-length
-            assert!(bytes > 0, "应该数到流过的字节");
+            assert!(sent_bytes > 0, "应该数到发出去的请求体");
+            assert!(received_bytes > 0, "应该数到流过的字节");
         }
         ref other => panic!("最后一条该是 finished，实际 {other:?}"),
     }

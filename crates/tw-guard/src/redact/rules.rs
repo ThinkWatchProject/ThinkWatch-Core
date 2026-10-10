@@ -517,6 +517,15 @@ impl RuleSet {
         self.on.contains(id)
     }
 
+    /// 名字是 `name` 的自定义规则的正则，**写的原样**（编译时没改过它）。没有这条规则是
+    /// `None`。安全日志记下命中那一刻的规则：之后改了、删了，那一条说的还是当时那一版
+    pub fn custom_pattern(&self, name: &str) -> Option<&str> {
+        self.custom
+            .iter()
+            .find(|c| &*c.name == name)
+            .map(|c| c.re.as_str())
+    }
+
     /// 一条都没开。**调用方据此整条短路** —— 没有规则的话，找都不用找。
     pub fn is_empty(&self) -> bool {
         self.on.is_empty() && self.custom.is_empty()

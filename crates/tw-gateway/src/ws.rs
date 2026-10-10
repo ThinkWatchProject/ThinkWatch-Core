@@ -660,6 +660,14 @@ impl Pipes {
             .and_then(turn::Turns::front_id)
             .unwrap_or(self.id)
     }
+
+    /// 这条连接此刻的脱敏规则和账本：安全记录的前后文按它打码，和留档一样
+    fn redaction(&self) -> crate::bodies::Redaction {
+        crate::bodies::Redaction {
+            rules: self.rules.redact.clone(),
+            ledger: self.ledger.clone(),
+        }
+    }
 }
 
 /// 这条连接在流量里怎么记（见 [`turn`]）。
@@ -703,7 +711,7 @@ pub(crate) async fn proxy(
     let name = &upstream.provider.name;
     // 每一轮一行的连接连上了：连接本身不留行，每一轮各有各的号（见 `turn`）。连不上的补上
     // 这一行，和整条连接一行的一样报
-    let (id, ending, turns, realtime) = match (rows, &connected) {
+    let (id, mut ending, turns, realtime) = match (rows, &connected) {
         (
             Rows::Connection {
                 id,
@@ -760,6 +768,12 @@ pub(crate) async fn proxy(
         Err(_) => state.health.record_failure(name),
     };
     crate::server::note_health(&state.bus, &state.health, name, change);
+    // 整条连接一行的：连上了，从这一刻起有流量可说（之后两个方向的帧各自记上，见 `pump`）
+    if connected.is_ok()
+        && let Some(e) = ending.as_mut()
+    {
+        e.connected();
+    }
     if ending.is_some() {
         // 这一跳记发出去的模型名，和 HTTP 那条路一样。一条连接跑好几轮、每一帧写的模型可能
         // 不一样，升级时定得下来的只有每一帧都发的那个（指定模型、阶段一的改写，见
@@ -797,6 +811,8 @@ pub(crate) async fn proxy(
             affinity: None,
             attempts: vec![attempt],
             billing: billing.into(),
+            // WebSocket 只连直连的上游（走代理的升级时就拒了，见 `server::upgrade`）
+            egress: None,
         });
     }
     let up = match connected {
@@ -995,8 +1011,16 @@ async fn pump(
         while waiting.is_none()
             && let Some(m) = held.pop_front()
         {
-            if let Step::End(end) =
-                client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting).await
+            if let Step::End(end) = client_frame(
+                &state,
+                p,
+                m,
+                &mut c_tx,
+                &mut u_tx,
+                &mut waiting,
+                &mut ending,
+            )
+            .await
             {
                 break 'pump end;
             }
@@ -1009,7 +1033,7 @@ async fn pump(
                     held.push_back(m);
                     continue;
                 }
-                if let Step::End(end) = client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting).await {
+                if let Step::End(end) = client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting, &mut ending).await {
                     break end;
                 }
             }
@@ -1087,6 +1111,10 @@ type UpstreamSink = futures::stream::SplitSink<Stream, UpMsg>;
 
 /// 客户端 → 上游的一帧：**和普通请求同一个脱敏函数**。Responses 的连接上，一帧
 /// `response.create` 是一轮的开头（[`begin_turn`]），要过准入时放进 `waiting`。
+///
+/// 发出去的帧记进流量（[`payload`]）：整条连接一行的记在那一行上（`ending`），Responses 的连接上
+/// 记在上游此刻在回答的那一轮上 —— 没有在答的，这一帧不归哪一行
+#[allow(clippy::too_many_arguments)]
 async fn client_frame(
     state: &AppState,
     p: &mut Pipes,
@@ -1094,6 +1122,7 @@ async fn client_frame(
     c_tx: &mut ClientSink,
     u_tx: &mut UpstreamSink,
     waiting: &mut Option<Waiting>,
+    ending: &mut Option<crate::ending::Ending>,
 ) -> Step {
     let out = match m {
         Message::Text(t) => {
@@ -1120,9 +1149,30 @@ async fn client_frame(
         Message::Pong(b) => UpMsg::Pong(b),
         Message::Close(_) => return Step::End(End::Closed),
     };
+    let size = payload(&out);
     match u_tx.send(out).await {
-        Ok(()) => Step::Go,
+        Ok(()) => {
+            match ending.as_mut() {
+                Some(e) => e.sending(size),
+                None => {
+                    if let Some(t) = p.turns.as_mut().and_then(turn::Turns::front) {
+                        t.sending(size);
+                    }
+                }
+            }
+            Step::Go
+        }
         Err(e) => Step::End(End::Broke(send_failed(e))),
+    }
+}
+
+/// 一帧发给上游的载荷有多少字节，记进流量的就是它。**只数数据帧**（文本、二进制）：ping、
+/// pong、关闭是连接自己的事，不是这个请求发的内容
+fn payload(m: &UpMsg) -> usize {
+    match m {
+        UpMsg::Text(t) => t.len(),
+        UpMsg::Binary(b) => b.len(),
+        UpMsg::Ping(_) | UpMsg::Pong(_) | UpMsg::Close(_) | UpMsg::Frame(_) => 0,
     }
 }
 
@@ -1164,6 +1214,17 @@ async fn begin_turn(
         } else {
             Default::default()
         }
+    };
+    // 细节在删之前的这一帧上算：报的时候（过了准入）这一帧已经换成删过的样子
+    let screened = {
+        let redaction = p.redaction();
+        let src = crate::guard::detail::Screened {
+            body: raw.as_bytes(),
+            dialect: Some(tw_dialect::ir::Dialect::Responses),
+            rules: &p.rules.screen.rules,
+            redaction: &redaction,
+        };
+        crate::guard::detail::content(&src, &screening)
     };
     // 删过的话，后面一律用删过的那一帧
     let (text, frame) = match &screening.body {
@@ -1213,6 +1274,7 @@ async fn begin_turn(
         fingerprint,
         input_estimate,
         screening,
+        screened,
         arrived,
         at_ms,
     };
@@ -1268,8 +1330,10 @@ async fn admitted(
     let model = Some(p.sent_model.clone()).filter(|m| !m.is_empty() && *m != p.requested_model);
     let out = outbound(state, p, turn.id, text);
     turn.sent(model.clone());
+    let size = payload(&out);
     match u_tx.send(out).await {
         Ok(()) => {
+            turn.sending(size);
             if let Some(t) = p.turns.as_mut() {
                 t.push(turn);
             }
@@ -1303,32 +1367,47 @@ async fn reply_failed(c_tx: &mut ClientSink, err: GatewayError) -> Step {
 /// `crate::guard::REPORTED_MAX`）
 fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     let mode = p.rules.redact_mode;
-    let found = crate::guard::find(mode, &p.rules.redact, text.as_bytes());
-    if found.is_empty() {
+    if !mode.detects() || p.rules.redact.is_empty() {
         return UpMsg::Text(text.into());
     }
+    // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不算（见 `crate::guard::find`）
+    let hits = crate::guard::hits(&text, &p.rules.redact);
+    if hits.is_empty() {
+        return UpMsg::Text(text.into());
+    }
+    let found = tw_guard::redact::rules::findings(&text, &hits);
+    let replaced = mode.acts().then(|| {
+        let r = tw_guard::redact::replace::apply(
+            &text,
+            &hits,
+            std::mem::replace(
+                &mut p.ledger,
+                tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+            ),
+        );
+        p.ledger = r.ledger;
+        r.text
+    });
+    // 换过之后再报：拦截档下每个值换成的占位符这时才记在账本上
+    let redaction = crate::bodies::Redaction {
+        rules: p.rules.redact.clone(),
+        ledger: p.ledger.clone(),
+    };
+    let seen = crate::guard::detail::Seen {
+        body: text.as_bytes(),
+        dialect: Some(tw_dialect::ir::Dialect::Responses),
+        hits: &hits,
+        redaction: &redaction,
+        replaced: mode.acts(),
+    };
     state.bus.emit(tw_api::Event::SecretsFound {
         id,
         provider: p.provider.clone(),
         replaced: mode.acts(),
-        items: crate::guard::items(&found, 0),
+        items: crate::guard::items(&found, 0, &seen),
         at_ms: crate::server::now_ms(),
     });
-    if !mode.acts() {
-        return UpMsg::Text(text.into());
-    }
-    // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不换
-    let hits = crate::guard::hits(&text, &p.rules.redact);
-    let r = tw_guard::redact::replace::apply(
-        &text,
-        &hits,
-        std::mem::replace(
-            &mut p.ledger,
-            tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
-        ),
-    );
-    p.ledger = r.ledger;
-    UpMsg::Text(r.text.into())
+    UpMsg::Text(replaced.unwrap_or(text).into())
 }
 
 type ClientSink = futures::stream::SplitSink<WebSocket, Message>;
@@ -1356,6 +1435,11 @@ async fn upstream_text(
     c_tx: &mut ClientSink,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
+    // 整条连接一行的：收到的流量数**上游原话**（还原占位符之前）。Responses 的连接上由那一轮
+    // 自己数（`Turn::upstream`）
+    if let Some(e) = ending.as_mut() {
+        e.count(t.len());
+    }
     let kind = frame_kind(t);
     // Realtime 的一次回答收了尾：它的用量加到这条连接的那一行上。**看的是上游原话**，和
     // 别的路一样（占位符不影响数字）
@@ -1384,7 +1468,7 @@ async fn upstream_text(
             }
         }
     }
-    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx, ending).await;
+    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx).await;
     if let Some(turns) = p.turns.as_mut() {
         match &flow {
             Flow::Sent if late.is_none() && ends_turn(kind.as_deref()) => turns.finish_front(),
@@ -1449,7 +1533,6 @@ async fn relay(
     kind: Option<&str>,
     late: bool,
     c_tx: &mut ClientSink,
-    ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
     let restored = tw_guard::redact::replace::restore(t, &p.ledger);
     // 模型名换回客户端用的名称：一条消息是一个完整的 JSON，整条过一遍。排在回答钩子之前，
@@ -1508,23 +1591,23 @@ async fn relay(
         };
         // **和主管线一模一样的判据**：规则是切断 + 拦截档
         let acts = p.rules.inspect_mode.acts();
-        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句
-        let mut refusal: Option<Msg> = None;
+        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句。这一帧里别的要切的调用
+        // 也是被这一句切掉的
+        let refusal: Option<Msg> = hits.iter().find(|h| h.cut && acts).map(|h| {
+            // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）：回答钩子
+            // 也能造、能改这一帧里的调用
+            msg!(
+                "gw.toolcall.connection_cut",
+                upstream = p.provider.clone(), tool = h.tool.clone(),
+                rule = h.rule.clone(), name = h.name.clone(),
+                why = h.why.clone() =>
+                "The answer contained a {tool} call that matched rule \
+                 “{name}”{}, so the connection was cut.",
+                crate::server::because(&h.why)
+            )
+        });
         for h in &hits {
             let blocked = h.cut && acts;
-            if blocked && refusal.is_none() {
-                // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）：回答钩子
-                // 也能造、能改这一帧里的调用
-                refusal = Some(msg!(
-                    "gw.toolcall.connection_cut",
-                    upstream = p.provider.clone(), tool = h.tool.clone(),
-                    rule = h.rule.clone(), name = h.name.clone(),
-                    why = h.why.clone() =>
-                    "The answer contained a {tool} call that matched rule \
-                     “{name}”{}, so the connection was cut.",
-                    crate::server::because(&h.why)
-                ));
-            }
             // 命中的那一段是还原过的：报出去之前和留档一样打码
             let redaction = crate::bodies::Redaction {
                 rules: p.rules.redact.clone(),
@@ -1536,6 +1619,7 @@ async fn relay(
                 h,
                 blocked,
                 &redaction,
+                refusal.as_ref().filter(|_| blocked),
             ));
         }
         if let Some(why) = refusal {
@@ -1546,9 +1630,6 @@ async fn relay(
                 .send(Message::Text(format!("[ThinkWatch] {}", why.text).into()))
                 .await;
             return Flow::End(End::Cut(why));
-        }
-        if let Some(e) = ending.as_mut() {
-            e.count(msg.len());
         }
         // 发不给客户端，就是客户端已经走了
         if c_tx.send(Message::Text(msg.into())).await.is_err() {
@@ -1746,7 +1827,14 @@ fn screen_changed(
         before.as_bytes(),
         after.as_bytes(),
     );
-    if let Some(why) = crate::guard::report(&state.bus, id, &p.provider, &sc) {
+    let redaction = p.redaction();
+    let src = crate::guard::detail::Screened {
+        body: after.as_bytes(),
+        dialect: Some(tw_dialect::ir::Dialect::Responses),
+        rules: &s.rules,
+        redaction: &redaction,
+    };
+    if let Some(why) = crate::guard::report(&state.bus, id, &p.provider, &sc, &src) {
         return Err(why);
     }
     Ok(match sc.body {
@@ -1846,12 +1934,20 @@ fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Result<String, Msg> 
     let request = serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"));
-    let sc = if request {
-        crate::guard::screen(s, tw_dialect::ir::Dialect::Responses, text.as_bytes())
+    let (sc, dialect) = if request {
+        let d = tw_dialect::ir::Dialect::Responses;
+        (crate::guard::screen(s, d, text.as_bytes()), Some(d))
     } else {
-        crate::guard::screen_raw(s, text)
+        (crate::guard::screen_raw(s, text), None)
     };
-    if let Some(why) = crate::guard::report(&state.bus, p.event_id(), &p.provider, &sc) {
+    let redaction = p.redaction();
+    let src = crate::guard::detail::Screened {
+        body: text.as_bytes(),
+        dialect,
+        rules: &s.rules,
+        redaction: &redaction,
+    };
+    if let Some(why) = crate::guard::report(&state.bus, p.event_id(), &p.provider, &sc, &src) {
         return Err(why);
     }
     Ok(match sc.body {

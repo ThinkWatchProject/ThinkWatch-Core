@@ -336,10 +336,20 @@ fn dir_size(p: &Path) -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Which {
+    /// 客户端发来的请求体
     Request,
+    /// 回答那一跳上游的原话。对话记录、按正文找、重放读的都是它（按上游的格式读）
     Response,
     /// 插件改过之后的请求体，挨着 `{id}.req` 放（`{id}.after-plugins`）
     AfterPlugins,
+    /// 回答那一跳发给上游的请求体（`{id}.up-req`）。**和客户端那一边（插件改过的话是改过的
+    /// 那一份）不是一回事时才有**：转换过格式、去掉过上游不认的字段……
+    UpstreamRequest,
+    /// 交给客户端的回答（`{id}.client-res`）。**和上游的原话（`{id}.res`）不是一回事时才有**：
+    /// 转换过格式、回答钩子改过
+    ClientResponse,
+    /// 这个请求的报文头（`{id}.heads`）：一个 `tw_api::HeadView` 的 JSON 数组，打过码
+    Heads,
 }
 
 impl Which {
@@ -348,6 +358,9 @@ impl Which {
             Which::Request => "req",
             Which::Response => "res",
             Which::AfterPlugins => "after-plugins",
+            Which::UpstreamRequest => "up-req",
+            Which::ClientResponse => "client-res",
+            Which::Heads => "heads",
         }
     }
 }
@@ -379,6 +392,28 @@ mod tests {
         b.put(0, 1, Which::Response, b"out");
         assert_eq!(b.get(0, 1, Which::Request).unwrap(), b"in");
         assert_eq!(b.get(0, 1, Which::Response).unwrap(), b"out");
+    }
+
+    /// 报文头、发给上游的请求体、交给客户端的回答各是一个文件，和请求体、回答并排放，
+    /// 截过的各有各的 `.len`
+    #[test]
+    fn every_kind_of_body_has_its_own_file() {
+        let (_d, b) = setup();
+        let kinds = [
+            Which::Request,
+            Which::Response,
+            Which::AfterPlugins,
+            Which::UpstreamRequest,
+            Which::ClientResponse,
+            Which::Heads,
+        ];
+        for (i, w) in kinds.iter().enumerate() {
+            assert!(b.put_with_len(0, 9, *w, format!("{i}").as_bytes(), 100 + i));
+        }
+        for (i, w) in kinds.iter().enumerate() {
+            assert_eq!(b.get(0, 9, *w).unwrap(), format!("{i}").as_bytes());
+            assert_eq!(b.original_len(0, 9, *w), Some(100 + i));
+        }
     }
 
     #[test]

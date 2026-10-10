@@ -54,7 +54,8 @@ pub enum Format {
     Json,
     /// 一段纯文本，`Res` 是 `String`（诊断包、回放用例）
     Text,
-    /// Server-Sent Events，每条 `data:` 是一个 `Res` 的 JSON。连着不断
+    /// Server-Sent Events，每条 `data:` 是一个 `Res` 的 JSON。连着不断。`Res` 是几种之一的
+    /// （[`LiveContent`](crate::LiveContent)）每条另带 `event:`，说是哪一种
     Events,
 }
 

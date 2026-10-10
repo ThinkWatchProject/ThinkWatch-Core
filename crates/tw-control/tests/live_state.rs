@@ -157,8 +157,10 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
     }
 
@@ -190,7 +192,8 @@ async fn a_request_still_running_can_be_opened_and_becomes_whole_when_it_ends() 
             id: 7,
             model: "claude-sonnet-4-5".into(),
             status: 200,
-            bytes: 120,
+            sent_bytes: 0,
+            received_bytes: 120,
             duration_ms: 4_000,
             usage: None,
             tokens_per_sec: None,

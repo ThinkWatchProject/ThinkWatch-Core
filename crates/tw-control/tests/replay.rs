@@ -69,7 +69,9 @@ fn row(id: i64, provider: &str) -> tw_store::db::RequestRow {
         ttft_ms: None,
         duration_ms: Some(200),
         tokens_per_sec: None,
-        bytes: Some(10),
+        sent_bytes: Some(10),
+        received_bytes: Some(10),
+        egress: None,
         input_tokens: Some(5),
         output_tokens: Some(2),
         cache_read_tokens: None,
@@ -388,6 +390,7 @@ fn routed(hops: &[(&str, Option<&str>)]) -> Option<String> {
             usage: None,
             queued_ms: None,
             skipped: None,
+            proxy: None,
         })
         .collect();
     Some(

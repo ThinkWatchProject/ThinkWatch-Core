@@ -27,7 +27,9 @@ mod opening;
 mod plug;
 mod relay;
 
+pub(crate) use commit::KEEPALIVE;
 pub(crate) use hop::stream_fault;
+pub(crate) use relay::PING;
 
 /// 进管线时就定了的东西：身份识别之后，每一步都只读不改。
 pub(super) struct Inbound {
@@ -35,6 +37,8 @@ pub(super) struct Inbound {
     pub(super) query: Option<String>,
     pub(super) headers: HeaderMap,
     pub(super) body: Bytes,
+    /// 客户端用的协议版本：报文里的请求行、状态行照它写（见 [`crate::content`]）
+    pub(super) version: axum::http::Version,
     pub(super) client_name: String,
     /// 客户端调的是哪种 API（看路径，见 `client_api`）。认不出的路径是 None
     pub(super) api: Option<crate::client_api::ClientApi>,
@@ -44,6 +48,11 @@ pub(super) struct Inbound {
     pub(super) from: Sender,
     /// 手动中止的开关（见 [`crate::abort`]）：开始之后登记上，等上游、交回答时看着它
     pub(super) abort: crate::abort::Switch,
+    /// 这个请求和上游之间走了多少流量（见 [`crate::traffic`]）：每一跳发的时候记、收的时候记，
+    /// 结局报出去的是它
+    pub(super) traffic: std::sync::Arc<crate::traffic::Traffic>,
+    /// 这个请求的报文记录（见 [`crate::content`]）：开始时放进去，每一跳从这里拿
+    pub(super) seat: crate::content::Seat,
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -152,8 +161,10 @@ pub(super) async fn pipeline(
     )
     .await?;
 
-    // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
+    // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份。查的那一份
+    // 留着：每条命中的细节（在哪儿、前后是什么）在它上面算
     let size = req.body.len();
+    let screened = req.body.clone();
     let (screening, started) = heavy_for(size, || {
         let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
         // 解析出来的那一份到这里就用完了：删过字的话它也不再是请求体的样子
@@ -176,7 +187,23 @@ pub(super) async fn pipeline(
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
     // 流量里照样留一行；一个字节都不发
     let provider = started.alive.first().map(String::as_str).unwrap_or("");
-    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &screening) {
+    let refused = (!screening.hits.is_empty())
+        .then(|| {
+            // 前后文和存下来的正文一样换、打码：同一套规则、同一本账
+            let redaction = redaction(&rt, started.ledger.clone());
+            let src = crate::guard::detail::Screened {
+                body: &screened,
+                dialect: req.api.map(|a| a.dialect()),
+                rules: &rt.content,
+                redaction: &redaction,
+            };
+            heavy(&screened, || {
+                crate::guard::report(&state.bus, started.id, provider, &screening, &src)
+            })
+        })
+        .flatten();
+    drop(screened);
+    if let Some(why) = refused {
         return Err(GatewayError::denied(why));
     }
     // 管线第 5 步：试上游、交回答（见 `answer`）。它拿走这个请求要的一切：流式的回答等不到
@@ -919,6 +946,7 @@ fn start(
     let seen = look(rt, req);
     let (found, ledger) = (seen.found, seen.ledger);
     let hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>> = seen.hits.map(Into::into);
+    let redacting = redaction(rt, ledger.clone());
     let (id, at_ms) = open(
         state,
         req,
@@ -927,15 +955,24 @@ fn start(
         (first, billing.into()),
         fp,
         ending,
-        (redaction(rt, ledger.clone()), hits.clone()),
+        (redacting.clone(), hits.clone()),
     );
     let redact_mode = rt.config.security.redact.mode;
     if !found.is_empty() {
+        // 每一项说得出在哪儿：在客户端的原文上找的那一遍（见 `crate::guard::detail::secrets`）
+        let seen = crate::guard::detail::Seen {
+            body: &req.body,
+            dialect: req.api.map(|a| a.dialect()),
+            hits: hits.as_deref().unwrap_or_default(),
+            redaction: &redacting,
+            replaced: redact_mode.acts(),
+        };
+        let items = heavy(&req.body, || crate::guard::items(&found, 0, &seen));
         state.bus.emit(tw_api::Event::SecretsFound {
             id,
             provider: alive.first().cloned().unwrap_or_default(),
             replaced: redact_mode.acts(),
-            items: crate::guard::items(&found, 0),
+            items,
             at_ms: now_ms(),
         });
     }
@@ -1033,8 +1070,26 @@ fn open(
         sink.clone(),
     );
     end.redact_with(redaction.clone());
+    // 流量记在请求身上（每一跳发、收的时候记，见 `hop`），结局报的是同一个数
+    end.metered_by(req.traffic.clone());
     // 从这一刻起可以手动中止：登记跟着结局走，结局报了就不在跑了（见 `crate::abort`）
     end.abortable(state.aborts.enter(id, session, req.abort.clone()));
+    // 从这一刻起看得到它的报文（见 `crate::content`）：客户端的请求先记下
+    let capture = crate::content::Capture::open(
+        &state.contents,
+        id,
+        at_ms as i64,
+        sink.clone(),
+        redaction.clone(),
+    );
+    // 比窗口长的请求体只拷一次开头：留档和报文记录用同一份（见 `bodies::offer`）
+    let kept = match &sink {
+        Some(_) => crate::content::prefix(&req.body),
+        None => req.body.clone(),
+    };
+    capture.client_request(req.version, &req.uri, &req.headers, &kept, req.body.len());
+    end.capture(capture.clone());
+    req.seat.put(capture);
     *ending = Some(end);
 
     // 请求体交给观测层。**这时候它已经完整在内存里了**，所以这一步
@@ -1052,7 +1107,7 @@ fn open(
             id,
             at_ms as i64,
             crate::bodies::BodyKind::Request,
-            req.body.clone(),
+            kept,
             req.body.len(),
             redaction,
         )

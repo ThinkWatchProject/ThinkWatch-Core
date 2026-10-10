@@ -105,6 +105,9 @@ async fn world(mode: &str) -> World {
                 tw_gateway::bodies::BodyKind::Request => tw_store::Which::Request,
                 tw_gateway::bodies::BodyKind::Response => tw_store::Which::Response,
                 tw_gateway::bodies::BodyKind::AfterPlugins => tw_store::Which::AfterPlugins,
+                tw_gateway::bodies::BodyKind::UpstreamRequest => tw_store::Which::UpstreamRequest,
+                tw_gateway::bodies::BodyKind::ClientResponse => tw_store::Which::ClientResponse,
+                tw_gateway::bodies::BodyKind::Heads => tw_store::Which::Heads,
             };
             let stored = tw_store::StoredBody {
                 id: disk.id,

@@ -236,13 +236,17 @@ async fn serve_with_bus(cfg: Config) -> (SocketAddr, Receiver<Event>, tw_observe
     (addr, events, bus)
 }
 
+/// 客户端发的请求体。同格式直通、一个字节都不改，发给上游的就是它：结局里的
+/// `sent_bytes` 是它的长度
+fn asked() -> String {
+    format!(r#"{{"model":"{MODEL}","stream":true,"messages":[]}}"#)
+}
+
 fn post(gw: SocketAddr) -> reqwest::RequestBuilder {
     reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
         .header("x-api-key", "tw-k")
-        .body(format!(
-            r#"{{"model":"{MODEL}","stream":true,"messages":[]}}"#
-        ))
+        .body(asked())
 }
 
 async fn ws_connect(
@@ -332,14 +336,16 @@ async fn a_client_that_walks_away_mid_stream_is_reported_once_as_cancelled() {
     match &got[0] {
         Event::RequestCancelled {
             status,
-            bytes,
+            sent_bytes,
+            received_bytes,
             usage,
             ..
         } => {
             assert_eq!(*status, Some(200));
+            assert_eq!(*sent_bytes, Some(asked().len() as u64));
             assert_eq!(
-                *bytes,
-                MESSAGE_START.len() as u64,
+                *received_bytes,
+                Some(MESSAGE_START.len() as u64),
                 "断开之前从上游收到的就是第一帧"
             );
             let u = usage.expect("第一帧里的用量没有带上");
@@ -413,12 +419,14 @@ async fn a_stream_the_upstream_breaks_is_failed_and_not_also_cancelled() {
     match &got[0] {
         Event::RequestFailed {
             source,
-            bytes,
+            sent_bytes,
+            received_bytes,
             usage,
             ..
         } => {
             assert_eq!(source, "upstream");
-            assert_eq!(*bytes, Some(MESSAGE_START.len() as u64));
+            assert_eq!(*sent_bytes, Some(asked().len() as u64));
+            assert_eq!(*received_bytes, Some(MESSAGE_START.len() as u64));
             // **上游已经为输入计了费** —— 断在中间的失败要带着它
             let u = usage.expect("断流之前的用量没有带上");
             assert_eq!((u.input, u.cache_read), (5000, 4000));
@@ -483,6 +491,7 @@ async fn a_stream_the_tool_firewall_cuts_is_denied_and_keeps_its_usage() {
 ///
 /// **这时候丢掉的不是响应体，是整个 handler** —— 它停在等上游的那个 await
 /// 上，后面的代码一行都不会执行。没有状态码，也没有用量，但这一行照样要有。
+/// 请求体是发出去了的（上游已经读走了），什么都没收回来：流量是有的，收到的是 0
 #[tokio::test]
 async fn a_client_that_leaves_before_the_response_headers_is_reported_once_as_cancelled() {
     let (gw, mut events) = serve(cfg(provider(silent_upstream().await))).await;
@@ -498,10 +507,11 @@ async fn a_client_that_leaves_before_the_response_headers_is_reported_once_as_ca
             &got[0],
             Event::RequestCancelled {
                 status: None,
-                bytes: 0,
+                sent_bytes: Some(sent),
+                received_bytes: Some(0),
                 usage: None,
                 ..
-            }
+            } if *sent == asked().len() as u64
         ),
         "该是一次没有状态码、没有用量的取消：{got:?}"
     );
@@ -599,14 +609,20 @@ async fn a_request_every_upstream_refused_is_failed_once_for_the_reason_it_was_r
     match &got[0] {
         Event::RequestFailed {
             source,
-            bytes,
+            sent_bytes,
+            received_bytes,
             duration_ms,
             usage,
             ..
         } => {
             assert_eq!(source, "rate_limited");
-            // 响应头之前就失败了：没有字节、没有用量，耗时是有的
-            assert_eq!((*bytes, *usage), (None, None));
+            // 交给客户端的是网关的话：没有用量，耗时是有的。请求体发给了上游、它回的 429
+            // 没有正文 —— 流量照样记着
+            assert_eq!(*usage, None);
+            assert_eq!(
+                (*sent_bytes, *received_bytes),
+                (Some(asked().len() as u64), Some(0))
+            );
             assert!(duration_ms.is_some());
             assert_eq!(
                 header.as_ref().map(|h| h.to_str().unwrap()),
@@ -645,7 +661,7 @@ async fn an_error_answer_passed_on_to_the_client_is_failed_once_in_the_upstreams
         Event::RequestFailed {
             source,
             message,
-            bytes,
+            received_bytes,
             ..
         } => {
             assert_eq!(source, "upstream");
@@ -656,8 +672,8 @@ async fn an_error_answer_passed_on_to_the_client_is_failed_once_in_the_upstreams
                 message.arg("message"),
                 "prompt is too long: 212000 tokens > 200000 maximum"
             );
-            // 响应头到了：收到的字节是有的
-            assert_eq!(*bytes, Some(SAID.len() as u64));
+            // 上游的错误正文：收到的字节是有的
+            assert_eq!(*received_bytes, Some(SAID.len() as u64));
         }
         other => panic!("该是一次失败，实际 {other:?}"),
     }
@@ -697,10 +713,15 @@ async fn a_websocket_turn_the_client_walks_away_from_is_cancelled() {
     match &got[0] {
         Event::RequestCancelled {
             status: Some(200),
-            bytes,
+            sent_bytes,
+            received_bytes,
             usage: None,
             ..
-        } => assert_eq!(*bytes, echoed.len() as u64),
+        } => {
+            // 发出去的是那一帧 `response.create`，收回来的是上游回的那一帧
+            assert_eq!(*sent_bytes, Some(create().len() as u64));
+            assert_eq!(*received_bytes, Some(echoed.len() as u64));
+        }
         other => panic!("该是一次带着回帧字节数、没有用量的取消：{other:?}"),
     }
     assert_eq!(model_of(&got[0]), "gpt-5", "这一轮要的模型名");
