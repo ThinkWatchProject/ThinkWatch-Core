@@ -163,7 +163,8 @@ async fn auto_finds_a_sub2api_relay_and_reads_its_wallet_from_the_same_answer() 
         Some(Spent {
             amount: 0.12,
             currency: "USD".into(),
-            period: SpentPeriod::Today
+            period: SpentPeriod::Today,
+            scope: None,
         })
     );
     assert_eq!(b.error, None);
