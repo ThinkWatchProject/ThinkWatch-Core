@@ -1319,12 +1319,24 @@ routes:
 | `thinking` | bool | — | Whether extended thinking is on. |
 | `stream` | bool | — | Whether the response is streamed. |
 | `intent` | string or list of strings | — | A client helper request: `assistant_internal` for any of them, or one class (`titling`). Classes set to `intercept` in `client_probes` are answered locally and never reach routing. |
+| `time` | string or list of strings | — | Local time of the machine core runs on, as a window `[days ]HH:MM-HH:MM`: `mon-fri 09:00-18:00`, `sat,sun 00:00-24:00`, `22:00-06:00`. Several windows: any of them. See below. |
 | `provider_would_be` | string or list of strings | — | The upstream routing chose. Such a rule is evaluated after routing, may only `set` or `deny`, and cannot have `to`. |
 <!-- /generated -->
 
 A comparison starts with `>`, `>=`, `<`, `<=` or `==`, and the number may
 end in `k` or `m`: `">200k"`, `"<=4k"`. Without an operator it is an error,
 not an equality: `"200k"` alone is refused.
+
+A time window is `[<days> ]<HH:MM>-<HH:MM>`, evaluated against the local
+wall-clock time of the machine core runs on, at the moment the request is
+routed. `<days>` is a comma-separated list of `mon`, `tue`, `wed`, `thu`,
+`fri`, `sat`, `sun` and ranges such as `mon-fri` or `fri-mon` (which wraps
+past Sunday); leave it out for every day. Case does not matter. The hours are
+24-hour: the start is included, the end is not, and the end may be `24:00`.
+An end earlier than the start is an overnight window, and its days are the
+days it starts on: `fri 22:00-06:00` runs from Friday 22:00 to Saturday 05:59.
+A value that does not fit this shape is refused when the configuration is
+read, naming the rule and the value.
 
 #### `routes[].rules[].set`
 

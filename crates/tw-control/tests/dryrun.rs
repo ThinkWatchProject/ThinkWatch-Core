@@ -207,6 +207,53 @@ async fn the_mismatch_is_the_condition_that_really_failed() {
     assert_eq!(r.trace[0].mismatch.as_ref().unwrap().field.slug(), "model");
 }
 
+/// 时间条件按试算那一刻的本地时间看：没对上的说出条件写的窗口和此刻几点
+#[tokio::test]
+async fn a_time_window_is_tried_against_now_and_the_mismatch_says_what_time_it_is() {
+    let (_d, app) = app();
+    // 一个从现在起两小时后开始、三小时后结束的窗口：此刻一定不在里面（终点绕过午夜的
+    // 是过夜的窗口，照样不含此刻）
+    let now = tw_engine::LocalTime::now();
+    let days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let hhmm = |m: u16| format!("{:02}:{:02}", m / 60 % 24, m % 60);
+    let later = format!(
+        "{} {}-{}",
+        days[now.weekday as usize],
+        hhmm((now.minute + 120) % 1440),
+        hhmm((now.minute + 180) % 1440)
+    );
+    let draft = |window: &str| {
+        format!(
+            r#"{{"model":"m","draft":{{"name":"x","rules":[
+                {{"name":"窗口","conditions":[{{"field":"time","values":["{window}"]}}],"to":"中转"}},
+                {{"name":"兜底","to":"官方"}}]}}}}"#
+        )
+    };
+    let r = run(&app, &draft(&later)).await;
+    assert_eq!(r.trace[0].verdict.slug(), "skipped", "{:?}", r.trace[0]);
+    let m = r.trace[0].mismatch.as_ref().unwrap();
+    assert_eq!(m.field.slug(), "time");
+    assert_eq!(m.want, std::slice::from_ref(&later));
+    // 实际的值是此刻，写成 `fri 17:30`
+    let (day, clock) = m.got.split_once(' ').unwrap();
+    assert!(days.contains(&day), "{}", m.got);
+    assert_eq!((clock.len(), &clock[2..3]), (5, ":"), "{}", m.got);
+    assert_eq!(r.rule.as_deref(), Some("兜底"));
+
+    // 全天的窗口此刻一定在里面
+    let r = run(&app, &draft("00:00-24:00")).await;
+    assert_eq!(r.rule.as_deref(), Some("窗口"));
+    assert_eq!(r.candidates, ["中转"]);
+
+    // 写错的窗口在求值之前就说出来，带规则名和那个值
+    let (st, body) = send(&app, &draft("9-5")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["code"], "engine.rule_time_syntax", "{body}");
+    assert_eq!(v["args"]["rule"], "窗口", "{body}");
+    assert_eq!(v["args"]["value"], "9-5", "{body}");
+}
+
 #[tokio::test]
 async fn a_cached_request_is_pinned_to_the_official_upstream() {
     let (_d, app) = app();

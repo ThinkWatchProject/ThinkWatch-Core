@@ -543,6 +543,9 @@ pub(crate) fn describe_when(w: &tw_engine::rule::When) -> Vec<tw_api::ConditionV
     if let Some(i) = &w.intent {
         push(ConditionField::Intent, one_or_many(i));
     }
+    if let Some(t) = &w.time {
+        push(ConditionField::Time, one_or_many(t));
+    }
     // **不写出来的话，一条只有 provider_would_be 的规则在界面上会显示成
     // 「兜底」**（条件为空就是兜底的标记）—— 那是个会让人查半天的假象。
     if let Some(p) = &w.provider_would_be {
@@ -2296,7 +2299,7 @@ mod describe_tests {
             "{ model: a*, client: c, dialect: anthropic, input_tokens: '>1k',
                max_tokens: '<4k', tool_count: '>2', cache: true, tools: false,
                image: true, thinking: false, stream: true,
-               intent: titling, provider_would_be: [a, b] }",
+               intent: titling, time: 'mon-fri 09:00-18:00', provider_would_be: [a, b] }",
         )
         .unwrap();
         let fields = match serde_json::to_value(&full).unwrap() {

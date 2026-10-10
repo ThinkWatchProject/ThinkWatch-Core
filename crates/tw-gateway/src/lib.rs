@@ -74,7 +74,7 @@ pub use probe::{ModelList, ProbeResult, probe, probe_bedrock};
 pub use quote::Quote;
 pub use server::{router, serve};
 pub use state::credential_failed;
-pub use state::{AppState, Runtime};
+pub use state::{AppState, LocalClock, Runtime};
 
 /// Anthropic 流里上游静默多久补一个 `ping`。
 ///

@@ -448,6 +448,22 @@ fn when_from(
                     )
                 })?)
             }
+            F::Time => {
+                // 大小写不论，存小写：界面回填时按一种写法读
+                let lower: Vec<String> = vals.iter().map(|v| v.to_ascii_lowercase()).collect();
+                if let Some(bad) = lower.iter().find(|v| tw_engine::time::parse(v).is_err()) {
+                    return Err(tw_engine::RouteError::TimeSyntax {
+                        rule: rule.to_string(),
+                        value: bad.clone(),
+                    }
+                    .msg());
+                }
+                w.time = Some(match lower.as_slice() {
+                    [] => return Err(no_value()),
+                    [v] => OneOrMany::One(v.clone()),
+                    vs => OneOrMany::Many(vs.to_vec()),
+                });
+            }
             F::ProviderWouldBe => {
                 w.provider_would_be = Some(many(
                     &|v| cfg.providers.iter().any(|p| p.name == v),
@@ -466,11 +482,17 @@ fn when_from(
     // 那句话是引擎的（`engine.compare.*`），不认识规则名。**码不变，多带一个
     // `rule`**，英文前面补上是哪条规则 —— 为此再给每一种写法错误造一个「带
     // 规则名」的码，码表就翻了一倍
-    w.validate().map_err(|e| {
-        let mut m = e.msg();
-        m.text = format!("rule `{rule}`: {}", m.text);
-        m.args.insert("rule".into(), rule.to_string());
-        m
+    w.validate().map_err(|e| match e {
+        // 时间窗口的那一句自己带规则名（上面已经逐个查过，这里只是兜底）
+        e @ tw_engine::rule::MatchError::BadTime { .. } => {
+            tw_engine::RouteError::for_rule(rule, e).msg()
+        }
+        e => {
+            let mut m = e.msg();
+            m.text = format!("rule `{rule}`: {}", m.text);
+            m.args.insert("rule".into(), rule.to_string());
+            m
+        }
     })?;
     Ok(w)
 }
@@ -988,6 +1010,14 @@ mod msg_codes {
         assert_eq!(
             code(rule(&[("input_tokens", &["200k"])])),
             "engine.compare.no_operator"
+        );
+        // 时间窗口写错是引擎带规则名的那一句，说的是哪个值
+        let m = to_rule(&rule(&[("time", &["mon-fri 09:00-18:00", "9-5"])]), &c).unwrap_err();
+        assert_eq!(m.code, "engine.rule_time_syntax");
+        assert_eq!((m.arg("rule"), m.arg("value")), ("长上下文", "9-5"));
+        assert_eq!(
+            code(rule(&[("time", &[])])),
+            "control.rule.condition_no_value"
         );
         let mut r = rule(&[]);
         r.deny = Some("no".into());

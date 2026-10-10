@@ -116,7 +116,9 @@ pub(super) async fn pipeline(
 
     // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
-    let (reading, fp) = heavy(&req.body, || read(&req, intent, parsed.as_ref()));
+    let (reading, fp) = heavy(&req.body, || {
+        read(&req, intent, parsed.as_ref(), (state.local_time)())
+    });
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
     let (choice, decision) = match route(&state, &rt, &req, &reading, conv.as_ref())? {
         Routed::Go(choice, decision) => (choice, decision),
@@ -506,10 +508,13 @@ fn read(
     req: &Inbound,
     intent: String,
     parsed: Option<&serde_json::Value>,
+    now: tw_engine::LocalTime,
 ) -> (crate::client_api::Reading, Option<String>) {
     let mut reading = crate::client_api::read(req.uri.path(), req.query.as_deref(), parsed);
     reading.facts.client = req.client_name.clone();
     reading.facts.intent = intent;
+    // 规则的 `time` 条件按路由这一刻看，不是请求体里的东西
+    reading.facts.time = Some(now);
     reading.harness = tw_dialect::harness::detect(
         req.headers
             .get(axum::http::header::USER_AGENT)
