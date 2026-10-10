@@ -80,7 +80,7 @@ impl Codec {
                 self.envelope.insert(k.into(), v.clone());
             }
         }
-        if data.get("error").is_some() {
+        if data.get("error").is_some_and(|e| !e.is_null()) {
             let end = self.end(chain).await?;
             if !end.is_empty() {
                 out.push(self.chunk(end));

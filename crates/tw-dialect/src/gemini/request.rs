@@ -128,7 +128,8 @@ pub fn decode_request(
                 parts.push(Part::ToolResult(ToolResult {
                     id,
                     content: vec![Part::Text(response_text(body))],
-                    is_error: body.get("error").is_some() && body.get("output").is_none(),
+                    is_error: body.get("error").is_some_and(|e| !e.is_null())
+                        && body.get("output").is_none(),
                 }));
             } else if let Some(key) = ["fileData", "executableCode", "codeExecutionResult"]
                 .into_iter()

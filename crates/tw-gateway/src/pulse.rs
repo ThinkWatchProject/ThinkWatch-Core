@@ -53,7 +53,7 @@ pub(crate) fn advances(dialect: Dialect, ty: &str, v: &serde_json::Value) -> boo
 
 /// Chat Completions 的一块：有错误、有内容、有结束原因，或者是收尾的那块用量
 fn chat_advances(v: &serde_json::Value) -> bool {
-    if v.get("error").is_some() {
+    if v.get("error").is_some_and(|e| !e.is_null()) {
         return true;
     }
     let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
@@ -84,7 +84,7 @@ fn chat_advances(v: &serde_json::Value) -> bool {
 
 /// Gemini 的一块：有错误、被拦下，或者某个候选有内容、有结束原因
 fn gemini_advances(v: &serde_json::Value) -> bool {
-    if v.get("error").is_some() || v.get("promptFeedback").is_some() {
+    if v.get("error").is_some_and(|e| !e.is_null()) || v.get("promptFeedback").is_some() {
         return true;
     }
     let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) else {
