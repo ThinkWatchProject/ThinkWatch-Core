@@ -727,6 +727,8 @@ async fn exchange_and_save(
             });
             // 重新登录：换掉凭据和账户 ID，其余设置（出站方式、模型范围、停用…）不动
             p.key = None;
+            // 那是说 `key` 从 Z.ai 登录得来的记号，ChatGPT 账号没有 `key`
+            p.signed_in = None;
             p.oauth = Some(oauth.clone());
             let mut headers: Vec<tw_config::Header> = p
                 .headers
