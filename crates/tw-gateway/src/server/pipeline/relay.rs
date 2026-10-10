@@ -284,6 +284,11 @@ pub(super) fn respond(
                     if !out.is_empty() {
                         quiet_since = tokio::time::Instant::now();
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+                        // 回答的最后一帧交出去了：客户端这之后再走，是收完了才走的（见
+                        // `Ending::delivered`）。上游的流还没走到末尾，结局照旧在那时报
+                        if relay.said_all {
+                            ending.delivered();
+                        }
                     }
                     if let Some(err) = cut {
                         broke = Some(err.in_dialect(dialect));
@@ -515,6 +520,11 @@ struct Relay {
     array_element: bool,
     /// 发给客户端的最后一段停在帧的边界上（或者还什么都没发）。心跳只能插在这里
     at_boundary: bool,
+    /// 认回答的最后一帧（见 `tw_dialect::convert::ends_answer`）：客户端收到的是成功的流时
+    /// 按它收到的格式拆帧。认出来就扔掉
+    last: Option<(tw_dialect::ir::Dialect, tw_dialect::frame::Decoder)>,
+    /// 回答的最后一帧已经在发给客户端的字节里了
+    said_all: bool,
     bus: tw_observe::EventBus,
     id: u64,
     provider: String,
@@ -602,6 +612,10 @@ impl Relay {
             && plan.whole_body()
             && !plan.convert_whole
             && !plan.collect;
+        // 客户端收到的格式：转换过的是会话里客户端那一种，直通的就是上游那一种
+        let client = session.as_ref().map_or(upstream_dialect, |s| s.client);
+        let last =
+            (plan.client_sse && plan.status.is_success()).then(|| (client, Default::default()));
         Self {
             plan,
             session,
@@ -620,6 +634,8 @@ impl Relay {
             array_opened: false,
             array_element: false,
             at_boundary: true,
+            last,
+            said_all: false,
             bus: state.bus.clone(),
             id,
             provider: provider.name.clone(),
@@ -906,12 +922,21 @@ impl Relay {
         }
     }
 
-    /// 记下发给客户端的这一段：停没停在帧的边界上（心跳要看）。直通的 JSON 数组流
-    /// 还要记数组发到哪儿了：切断的位置总在元素边界上（分隔符算在后面那个元素上），
-    /// 所以只要知道 `[` 之后有没有过 `{`
+    /// 记下发给客户端的这一段：停没停在帧的边界上（心跳要看），回答的最后一帧在不在里面
+    /// （结局要看，见 `Ending::delivered`）。直通的 JSON 数组流还要记数组发到哪儿了：切断的
+    /// 位置总在元素边界上（分隔符算在后面那个元素上），所以只要知道 `[` 之后有没有过 `{`
     fn sent(&mut self, out: &[u8]) {
         if !out.is_empty() {
             self.at_boundary = out.ends_with(b"\n\n") || out.ends_with(b"\r\n\r\n");
+        }
+        if let Some((client, frames)) = self.last.as_mut()
+            && frames
+                .feed(out)
+                .iter()
+                .any(|f| tw_dialect::convert::ends_answer(*client, f))
+        {
+            self.last = None;
+            self.said_all = true;
         }
         if !self.plan.client_json_stream || self.session.is_some() {
             return;

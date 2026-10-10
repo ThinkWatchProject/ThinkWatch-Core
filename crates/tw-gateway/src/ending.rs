@@ -13,8 +13,9 @@
 //!
 //! 所以结局挂在一个跟着请求走的对象上（和 [`crate::live::Pass`] 同一个
 //! 做法）：正常收尾时显式地报，没报就被丢掉的，由 Drop 替它报「客户端
-//! 取消」。它先待在 handler 里（等响应头的那一段），拿到响应头之后交给
-//! 响应体；WebSocket 那条路上交给升级之后的连接。
+//! 取消」—— 回答的最后一帧已经交给客户端的除外，那是收完了才走的，报结束
+//! （见 [`Ending::delivered`]）。它先待在 handler 里（等响应头的那一段），
+//! 拿到响应头之后交给响应体；WebSocket 那条路上交给升级之后的连接。
 //!
 //! **Drop 只能代表「被丢掉」。**所以 handler 里返回错误的路径一条都不能
 //! 让它自己掉在地上 —— 那由 `server::passthrough` 统一按返回的错误报成
@@ -82,6 +83,8 @@ pub struct Ending {
     /// 手动中止的登记（见 [`crate::abort`]）。**跟着结局走**：结局报了、或者被丢掉了，它跟着
     /// 没了，这个请求就不再算在跑
     abort: Option<crate::abort::Registered>,
+    /// 回答的最后一帧已经交给了客户端（见 [`Ending::delivered`]）
+    delivered: bool,
     /// 报过了。**只能报一次**
     told: bool,
 }
@@ -226,6 +229,7 @@ impl Ending {
             refusal: None,
             answer: None,
             abort: None,
+            delivered: false,
             told: false,
         }
     }
@@ -307,6 +311,17 @@ impl Ending {
         if let Some(t) = self.answer.take() {
             t.left();
         }
+    }
+
+    /// 回答的最后一帧（Responses 的 `response.completed`、Anthropic 的 `message_stop`、Chat 的
+    /// `[DONE]`，见 `tw_dialect::convert::ends_answer`）已经交给了客户端。
+    ///
+    /// **从这一刻起客户端再走，是收完了才走的，这个请求跑完了。**结局照旧等上游的流走到
+    /// 末尾再报；在那之前就被丢掉的，Drop 报结束，不报取消。Codex 就是这样：读到
+    /// `response.completed` 当场关连接，不等上游把流收尾，而 ChatGPT 账号的流常常晚一点才
+    /// 收尾 —— 以前它的一轮轮几乎都记成了取消。
+    pub fn delivered(&mut self) {
+        self.delivered = true;
     }
 
     /// 上游的响应头到了。从这里起，客户端再走掉，报出去的取消带着状态码。
@@ -418,10 +433,15 @@ impl Ending {
     /// 走完了。上游在流里报过错的、回的不是 2xx 的，报的是失败（见 [`Ending::streaming`]、
     /// [`Ending::refused`]）。
     pub fn finished(mut self, status: u16) {
+        self.finish(status);
+    }
+
+    /// [`Ending::finished`] 的身子：回答交完之后才被丢掉的，Drop 也走它（见 [`Ending::delivered`]）
+    fn finish(&mut self, status: u16) {
         self.status = Some(status);
         if let Some(r) = self.refusal.take() {
             let why = r.why(status, self.redaction.as_ref());
-            self.failed(tw_api::FailureSource::Upstream, why);
+            self.fail(tw_api::FailureSource::Upstream, why);
             return;
         }
         // 最后一帧后面不带空行的上游：收尾时再看一眼
@@ -431,7 +451,7 @@ impl Ending {
         }
         if let Some((upstream, message)) = self.upstream_error.take() {
             let message: String = message.chars().take(500).collect();
-            self.failed(
+            self.fail(
                 tw_api::FailureSource::Upstream,
                 msg!(
                     "gw.upstream.stream_error", upstream = upstream, message = message =>
@@ -465,6 +485,10 @@ impl Ending {
     ///
     /// **断在流中间的失败也带着用量** —— 上游已经为它计了费。
     pub fn failed(mut self, source: tw_api::FailureSource, message: Msg) {
+        self.fail(source, message);
+    }
+
+    fn fail(&mut self, source: tw_api::FailureSource, message: Msg) {
         let (usage, answered_model) = self.settle();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
@@ -521,6 +545,17 @@ impl Drop for Ending {
         // **这里什么都不能 panic。**Drop 可能正跑在一次 unwind 里，那时
         // 再 panic 一次，整个进程就没了。下面每一步都是不会失败的那种：
         // 往通道里 try_send、往广播里 send、读一下时钟。
+        //
+        // 回答的最后一帧已经交出去了（见 [`Ending::delivered`]）：客户端是收完了才走的，
+        // 这个请求跑完了。网关自己崩掉的、在界面上叫停的照下面报
+        if self.delivered
+            && !std::thread::panicking()
+            && !self.abort.as_ref().is_some_and(|r| r.thrown())
+        {
+            let status = self.status.unwrap_or(200);
+            self.finish(status);
+            return;
+        }
         let (usage, answered_model) = self.settle();
         let usage = usage.map(view);
         // 在界面上叫停之后被丢掉的（见 `crate::abort`）：是手动中止，不是客户端走了
@@ -1077,6 +1112,71 @@ mod tests {
         assert_eq!(body.kind, BodyKind::Response);
         assert_eq!(&body.body[..], MESSAGE_START);
         assert_eq!(body.at_ms, 1_000);
+    }
+
+    /// 回答的最后一帧交给了客户端，客户端随后才走（Codex 读到 `response.completed` 就关
+    /// 连接）：**这个请求跑完了**，报一条带着用量的结束，不是取消。留档照样有
+    #[test]
+    fn dropped_after_the_last_frame_was_delivered_it_is_finished() {
+        const COMPLETED: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5000,\"input_tokens_details\":{\"cached_tokens\":4000},\"output_tokens\":300,\"total_tokens\":5300}}}\n\n";
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let (tx, mut bodies) = crate::bodies::channel();
+        let mut e = Ending::new(
+            bus.clone(),
+            7,
+            MODEL.into(),
+            Instant::now(),
+            1_000,
+            Some(tx),
+        );
+        e.responded(200);
+        e.streaming(ir::Dialect::Responses, "chatgpt");
+        e.feed(COMPLETED);
+        e.delivered();
+        drop(e);
+
+        let got = drain(&mut rx);
+        match got.as_slice() {
+            [
+                Event::RequestFinished {
+                    id: 7,
+                    status: 200,
+                    bytes,
+                    usage: Some(u),
+                    ..
+                },
+            ] => {
+                assert_eq!(*bytes, COMPLETED.len() as u64);
+                assert_eq!((u.input, u.cache_read, u.output), (1000, 4000, 300));
+            }
+            other => panic!("该是一条结束，实际 {other:?}"),
+        }
+        assert_eq!(&bodies.try_recv().unwrap().body[..], COMPLETED);
+    }
+
+    /// 交完的回答里上游报了错（`response.failed`）：客户端随后走了，照样是**上游的失败**，
+    /// 不是取消，也不是成功
+    #[test]
+    fn dropped_after_a_delivered_failure_it_is_the_upstreams_failure() {
+        let bus = tw_observe::EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut e = responding(&bus);
+        e.streaming(ir::Dialect::Responses, "chatgpt");
+        e.feed(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n");
+        e.delivered();
+        drop(e);
+        match drain(&mut rx).as_slice() {
+            [
+                Event::RequestFailed {
+                    source, message, ..
+                },
+            ] => {
+                assert_eq!(*source, tw_api::FailureSource::Upstream);
+                assert!(message.text.ends_with("boom"), "{}", message.text);
+            }
+            other => panic!("该是一条上游的失败，实际 {other:?}"),
+        }
     }
 
     /// 观测层没起来（没有去处）的时候，回答一个字节都不攒

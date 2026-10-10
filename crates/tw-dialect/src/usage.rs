@@ -35,19 +35,25 @@ use crate::{anthropic, bedrock, chat, gemini, responses};
 
 /// 跨 chunk 的接续窗口。
 ///
-/// 一个 usage 对象几百字节，而 chunk 边界可能正好切在中间。留这么多
-/// 是为了让「上一块的尾巴 + 这一块」总能装下一个完整的 usage 对象。
+/// chunk 边界可能正好切在 `"usage"` 这个键上，或者切在键和它的 `{` 之间。留这么多
+/// 是为了让「上一块的尾巴 + 这一块」总能接上那个键。**对象本身切在中间的不靠它**：
+/// 起了头的对象接着收（见 [`Open`]）。
 const CARRY: usize = 4096;
 
-/// 单次扫描里最多解析多长的一段。usage 对象是小东西，一个几 KB 的
-/// 上限足以装下任何真实的，同时挡住「响应体里恰好有个叫 usage 的巨大
-/// 字段」那种情况。
-const MAX_OBJECT: usize = 8192;
+/// 一个 usage 对象最长多少字节。再长的不当它是 usage：挡住「响应体里恰好有个叫 usage
+/// 的巨大字段」那种情况。
+///
+/// **不能按那几个数字的长度定。**ChatGPT 账号（Codex 后端）的 usage 另带一个按条目拆
+/// token 归属的 `attribution`，对话越长它越大，几十 KB 是常事。以前这里是 8 KB：长一点
+/// 的 Codex 对话，一个 token、一分钱都记不上。
+const MAX_OBJECT: usize = 1024 * 1024;
 
 /// 一边流一边嗅。
 #[derive(Debug, Default)]
 pub struct Sniffer {
     carry: Vec<u8>,
+    /// 起了头、还没收完的那个 usage 对象。有它的时候接续窗口是空的：要接上的就是它
+    open: Option<Open>,
     seen: Usage,
     /// 总共喂进来多少字节。**超过一定量就不再嗅** —— 一个几十 MB 的
     /// 响应体里，usage 要么早就出现过，要么这家上游根本不给。
@@ -75,6 +81,14 @@ impl Sniffer {
         }
         self.fed += chunk.len();
         self.model.feed(chunk);
+        // 上一块里起了头的 usage 对象：先把它接完，这一块剩下的照常找
+        let chunk = match self.open.take() {
+            None => chunk,
+            Some(open) => match self.resume(open, chunk) {
+                Some(rest) => rest,
+                None => return,
+            },
+        };
 
         // 快速排除。**边界要单独看**：`"usage"` 七个字节完全可能被
         // chunk 切成两半，那时它在两边各自都找不到。这条是那个逐字节
@@ -89,16 +103,40 @@ impl Sniffer {
             memfind(&e, NEEDLE)
         };
         if !memfind(chunk, NEEDLE) && !memfind(&self.carry, NEEDLE) && !straddling {
-            self.remember_tail(chunk);
+            self.slide(chunk);
             return;
         }
 
         let mut buf = Vec::with_capacity(self.carry.len() + chunk.len());
         buf.extend_from_slice(&self.carry);
         buf.extend_from_slice(chunk);
-        self.scan(&buf);
+        let read = self.scan(&buf);
         self.carry.clear();
-        self.remember_tail(&buf);
+        if self.open.is_none() {
+            // 读过的对象不留在窗口里：下一块再扫一遍，扫到的会是它里面套着的东西
+            self.remember_tail(&buf[read..]);
+        }
+    }
+
+    /// 接着收那个没收完的对象。收完了就解析，交回这一块剩下的；还没收完的留着等下一块，
+    /// 超过 [`MAX_OBJECT`] 的扔掉（那不是 usage）。这一块整个都在对象里时是 None
+    fn resume<'a>(&mut self, mut open: Open, chunk: &'a [u8]) -> Option<&'a [u8]> {
+        match open.braces.feed(chunk) {
+            Some(end) => {
+                open.bytes.extend_from_slice(&chunk[..=end]);
+                if open.bytes.len() <= MAX_OBJECT {
+                    self.parse(&open.bytes, open.gemini);
+                }
+                Some(&chunk[end + 1..])
+            }
+            None => {
+                open.bytes.extend_from_slice(chunk);
+                if open.bytes.len() <= MAX_OBJECT {
+                    self.open = Some(open);
+                }
+                None
+            }
+        }
     }
 
     fn remember_tail(&mut self, buf: &[u8]) {
@@ -107,14 +145,32 @@ impl Sniffer {
         self.carry.extend_from_slice(&buf[start..]);
     }
 
-    /// 找出这一段里所有完整的 usage 对象并合并。
-    fn scan(&mut self, buf: &[u8]) {
-        self.scan_key(buf, b"\"usage\"", false);
-        self.scan_key(buf, b"\"usageMetadata\"", true);
+    /// 窗口接着往后挪一块。**比键还短的块要接在窗口后面**，不能拿它换掉窗口：一块只有
+    /// 几个字节时，`"usage` 会跨好几块，只留最后一块就永远凑不齐它
+    fn slide(&mut self, chunk: &[u8]) {
+        if chunk.len() >= CARRY {
+            self.remember_tail(chunk);
+            return;
+        }
+        self.carry.extend_from_slice(chunk);
+        let over = self.carry.len().saturating_sub(CARRY);
+        self.carry.drain(..over);
     }
 
-    fn scan_key(&mut self, buf: &[u8], key: &[u8], gemini: bool) {
+    /// 找出这一段里所有完整的 usage 对象并合并；收到一半的那个记下来接着收（[`Open`]）。
+    /// 返回读到了哪儿：最后一个读出来的对象的末尾
+    fn scan(&mut self, buf: &[u8]) -> usize {
+        let read = self.scan_key(buf, b"\"usage\"", false);
+        // 起了头的对象一直延伸到这一段的末尾，后面找到的都在它里面
+        if self.open.is_some() {
+            return read;
+        }
+        read.max(self.scan_key(buf, b"\"usageMetadata\"", true))
+    }
+
+    fn scan_key(&mut self, buf: &[u8], key: &[u8], gemini: bool) -> usize {
         let mut from = 0;
+        let mut read = 0;
         while let Some(i) = find_at(buf, key, from) {
             from = i + key.len();
             let Some(open) = buf[from..]
@@ -127,18 +183,44 @@ impl Sniffer {
             if buf.get(open) != Some(&b'{') {
                 continue;
             }
-            let Some(end) = match_braces(buf, open) else {
-                // 对象还没收完 —— 留给下一块。**不要在这里猜**
-                continue;
-            };
-            if let Ok(v) = serde_json::from_slice::<Value>(&buf[open..=end]) {
-                self.merge(if gemini {
-                    gemini::response::usage(&v)
-                } else {
-                    read(&v)
-                });
+            let rest = &buf[open..];
+            let mut braces = Braces::default();
+            match braces.feed(&rest[..rest.len().min(MAX_OBJECT + 1)]) {
+                Some(end) => {
+                    // 读出来了就跳过整个对象：长的 usage 里套着的条目（`attribution`）
+                    // 不是另一份用量
+                    if self.parse(&rest[..=end], gemini) {
+                        from = open + end + 1;
+                        read = from;
+                    }
+                }
+                // 太长了：不是 usage
+                None if rest.len() > MAX_OBJECT => {}
+                // 对象还没收完：接着收，下一块从配到的地方往下配。**不要在这里猜**
+                None => {
+                    self.open = Some(Open {
+                        bytes: rest.to_vec(),
+                        braces,
+                        gemini,
+                    });
+                    break;
+                }
             }
         }
+        read
+    }
+
+    /// 解析一个完整的 usage 对象并合并。不是 JSON 的返回 false
+    fn parse(&mut self, object: &[u8], gemini: bool) -> bool {
+        let Ok(v) = serde_json::from_slice::<Value>(object) else {
+            return false;
+        };
+        self.merge(if gemini {
+            gemini::response::usage(&v)
+        } else {
+            read(&v)
+        });
+        true
     }
 
     /// 合并一个 usage 对象。
@@ -495,40 +577,56 @@ fn find_at(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     memchr::memmem::find(&hay[from..], needle).map(|i| i + from)
 }
 
-/// 从 `open`（一个 `{`）开始配对，返回对应 `}` 的下标。
+/// 起了头、还没收完的 usage 对象：从 `{` 起收到的字节，和括号配到了哪儿。
+///
+/// **接着配，不从头再扫。**一个几百 KB 的对象被切成几十块时，每来一块都把收到的从头扫
+/// 一遍，就是平方的开销。
+#[derive(Debug)]
+struct Open {
+    bytes: Vec<u8>,
+    braces: Braces,
+    /// 是 Gemini 的 `usageMetadata`
+    gemini: bool,
+}
+
+/// 从一个 `{` 开始配括号，配到了哪儿。
 ///
 /// **要认字符串里的花括号。**`{"note":"}"}`  会让一个朴素的计数器提前
 /// 收尾，然后解析出一个残缺的对象。
-fn match_braces(buf: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for (i, &c) in buf.iter().enumerate().skip(open) {
-        if i - open > MAX_OBJECT {
-            return None;
-        }
-        if in_str {
+#[derive(Debug, Default, Clone, Copy)]
+struct Braces {
+    depth: usize,
+    in_str: bool,
+    escaped: bool,
+}
+
+impl Braces {
+    /// 接着往下配，返回对象收尾的那个 `}` 在 `more` 里的下标。还没收尾是 None
+    fn feed(&mut self, more: &[u8]) -> Option<usize> {
+        for (i, &c) in more.iter().enumerate() {
+            if self.in_str {
+                match c {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => self.in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
             match c {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_str = false,
+                b'"' => self.in_str = true,
+                b'{' => self.depth += 1,
+                b'}' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        return Some(i);
+                    }
+                }
                 _ => {}
             }
-            continue;
         }
-        match c {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
+        None
     }
-    None
 }
 
 #[cfg(test)]
@@ -769,6 +867,68 @@ mod tests {
             assert_eq!(sniffed, parsed, "{v}");
         }
         assert!(read(&anthropic).cache_1h);
+    }
+
+    /// Codex 后端 `response.completed` 的样子：usage 带着按条目拆的 `attribution`
+    fn completed_with_attribution(items: usize) -> String {
+        let attribution: Vec<String> = (0..items)
+            .map(|i| format!(r#"{{"item_id":"fc_{i:06}","input_tokens":{}}}"#, 1 + i % 50))
+            .collect();
+        format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{{\"input_tokens\":5000,\"input_tokens_details\":{{\"cached_tokens\":4000,\"cache_write_tokens\":0}},\"output_tokens\":300,\"output_tokens_details\":{{\"reasoning_tokens\":200}},\"total_tokens\":5300,\"attribution\":[{}]}},\"user\":null,\"metadata\":{{}}}}}}\n\n",
+            attribution.join(",")
+        )
+    }
+
+    /// ChatGPT 账号的 usage 动辄几十 KB（`attribution` 跟着对话变长）。**整块到、切成几十块
+    /// 到、一个字节一个字节到，读出来的都是同一组数** —— 以前超过 8 KB 的一个都不认，
+    /// 切开的超过 4 KB 也接不上
+    #[test]
+    fn a_usage_object_with_a_long_attribution_is_read_however_it_arrives() {
+        let frame = completed_with_attribution(3000);
+        assert!(frame.len() > 100 * 1024, "{}", frame.len());
+        for size in [frame.len(), 16 * 1024, 1000, 7] {
+            let chunks: Vec<&str> = frame
+                .as_bytes()
+                .chunks(size)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect();
+            let u = sniff(&chunks).unwrap_or_else(|| panic!("切成 {size} 字节一块就嗅不到了"));
+            assert_eq!(
+                (u.input, u.cache_read, u.output, u.reasoning),
+                (1000, 4000, 300, 200),
+                "切成 {size} 字节一块"
+            );
+        }
+        let mut s = Sniffer::new();
+        for b in completed_with_attribution(400).as_bytes() {
+            s.feed(std::slice::from_ref(b));
+        }
+        assert_eq!(s.finish().map(|u| u.output), Some(300), "逐字节喂");
+    }
+
+    /// 读出来的 usage 里面套着的不是另一份用量：**整个对象跳过去**，不拿里面的条目再合并一遍
+    #[test]
+    fn what_is_nested_inside_a_usage_object_is_not_merged_again() {
+        let u = sniff(&[r#"{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,
+            "attribution":[{"usage":{"input_tokens":5,"input_tokens_details":{"cache_write_tokens":999}}}]}}"#])
+        .unwrap();
+        assert_eq!((u.input, u.output, u.cache_write), (100, 10, 0));
+    }
+
+    /// 一个一直收不完的对象：攒到上限就扔掉，**内存不跟着涨**，后面来的 usage 照样认
+    #[test]
+    fn an_object_that_never_closes_is_dropped_at_the_limit() {
+        let mut s = Sniffer::new();
+        s.feed(br#"data: {"usage":{"note":""#);
+        let junk = vec![b'x'; 64 * 1024];
+        for _ in 0..(MAX_OBJECT / junk.len() + 2) {
+            s.feed(&junk);
+        }
+        assert!(s.open.is_none(), "超过上限还在攒");
+        assert!(s.carry.len() <= CARRY, "接续窗口涨到了 {}", s.carry.len());
+        s.feed(b"\"}}\n\ndata: {\"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n\n");
+        assert_eq!(s.finish().map(|u| (u.input, u.output)), Some((11, 22)));
     }
 
     #[test]

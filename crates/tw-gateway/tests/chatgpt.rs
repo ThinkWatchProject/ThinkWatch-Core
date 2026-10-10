@@ -10,6 +10,8 @@
 //! - 没有 Content-Type 的流照样按流处理；客户端要整包时由网关收齐
 //! - 401 换一次 token 重发；并发请求只刷新一次；refresh token 作废只报一次
 //! - 额度用完只报一次
+//! - Codex 读到 `response.completed` 就关连接：这一轮照样是跑完了的，带着用量（usage 里
+//!   按条目拆的 `attribution` 再长也认）
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -95,14 +97,28 @@ struct Backend {
     reject_all: bool,
     /// 额度用完：回 429
     exhausted: bool,
+    /// 发完 `response.completed` 之后，流还开着这么久才收尾：流的结尾比最后一帧晚到的那种
+    linger_ms: u64,
+    /// `usage.attribution` 里有多少条（见 [`stream_body`]）
+    items: usize,
 }
 
-/// 实测的事件顺序：一条消息，回复 "ok"
-fn stream_body() -> String {
+/// 实测的事件顺序：一条消息，回复 "ok"。
+///
+/// 实测的 `usage` 比 OpenAI 文档里的多一个 `attribution`，按条目拆 token 的归属：对话越长、
+/// 条目越多，它越大。`items` 是这一轮有多少条目（0 就不带它）；每一条长什么样没实测过，
+/// 这里只照「一个条目一项」造
+fn stream_body(items: usize) -> String {
     let ev = |kind: &str, mut v: Value| {
         v["type"] = json!(kind);
         format!("event: {kind}\ndata: {v}\n\n")
     };
+    let mut usage = json!({"input_tokens": 23, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}, "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 28});
+    if items > 0 {
+        usage["attribution"] = (0..items)
+            .map(|i| json!({"item_id": format!("fc_{i:06}"), "input_tokens": 1 + i % 50}))
+            .collect();
+    }
     [
         ev("response.created", json!({"response": {"id": "resp_1", "model": "gpt-5.5", "status": "in_progress"}})),
         ev("response.in_progress", json!({"response": {"id": "resp_1", "status": "in_progress"}})),
@@ -112,7 +128,7 @@ fn stream_body() -> String {
         ev("response.output_text.done", json!({"output_index": 0, "content_index": 0, "text": "ok"})),
         ev("response.content_part.done", json!({"output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "ok"}})),
         ev("response.output_item.done", json!({"output_index": 0, "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}})),
-        ev("response.completed", json!({"response": {"id": "resp_1", "status": "completed", "usage": {"input_tokens": 23, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}, "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 28}}})),
+        ev("response.completed", json!({"response": {"id": "resp_1", "status": "completed", "usage": usage}})),
     ]
     .concat()
 }
@@ -166,6 +182,16 @@ async fn start_backend(b: Arc<Backend>) -> String {
                 ))
                 .unwrap();
         }
+        let frames = stream_body(b.items);
+        let linger = Duration::from_millis(b.linger_ms);
+        let body = if linger.is_zero() {
+            axum::body::Body::from(frames)
+        } else {
+            axum::body::Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from(frames));
+                tokio::time::sleep(linger).await;
+            })
+        };
         // **不带 Content-Type**：实测的 Codex 后端就是这样
         builder
             .status(200)
@@ -174,7 +200,7 @@ async fn start_backend(b: Arc<Backend>) -> String {
             .header("x-codex-primary-reset-after-seconds", "410912")
             .header("x-codex-secondary-used-percent", "0")
             .header("x-codex-secondary-window-minutes", "0")
-            .body(axum::body::Body::from(stream_body()))
+            .body(body)
             .unwrap()
     }
     async fn models(
@@ -813,4 +839,128 @@ async fn a_refused_inference_test_carries_what_the_backend_said() {
     assert_eq!(e.code, "l3.refused");
     assert_eq!(e.arg("status"), "429");
     assert!(e.arg("detail").contains("usage limit"), "{}", e.text);
+}
+
+// ---------------------------------------------------------------- 像 Codex 那样收尾
+
+/// 这个网关报出来的结局（结束、失败、取消）。等到第一条之后再多等一会儿：要验的是恰好一条
+async fn endings(rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>) -> Vec<tw_api::Event> {
+    let mut got = Vec::new();
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if matches!(
+            ev,
+            tw_api::Event::RequestFinished { .. }
+                | tw_api::Event::RequestFailed { .. }
+                | tw_api::Event::RequestCancelled { .. }
+        ) {
+            if got.is_empty() {
+                deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+            }
+            got.push(ev);
+        }
+    }
+    got
+}
+
+/// 像 Codex 那样读一条流：**读到一整个 `response.completed` 就不再读，丢掉响应体**。
+///
+/// openai/codex 的 `codex-api/src/sse/responses.rs`（`process_sse_with_treatment`）交出
+/// `Completed` 就返回，字节流随之丢掉，连接关上 —— 不等上游把流收尾。它的测试
+/// `emits_completed_without_stream_end` 守的就是这一条。返回读到的字节
+async fn read_like_codex(resp: reqwest::Response) -> String {
+    use futures::StreamExt;
+    let mut body = resp.bytes_stream();
+    let mut got = Vec::new();
+    while let Some(chunk) = body.next().await {
+        got.extend_from_slice(&chunk.unwrap());
+        let text = String::from_utf8_lossy(&got);
+        if let Some(at) = text.find("event: response.completed\n")
+            && text[at..].contains("\n\n")
+        {
+            break;
+        }
+    }
+    drop(body);
+    String::from_utf8(got).unwrap()
+}
+
+/// 用 Codex 接 ChatGPT 账号，流量里每一轮都是「取消」，任务却照常完成了。
+///
+/// 后端发完 `response.completed` 之后，流的结尾常常晚一点才到；Codex 读到那一帧当场关
+/// 连接。以前结局只在上游的流走到末尾时报，客户端先走了就由 Drop 报成取消 —— 一个答完了
+/// 的请求记成了取消。**回答的最后一帧交给了客户端，这个请求就是跑完了**：结束、200、
+/// 带着用量，按跑完的查价
+#[tokio::test]
+async fn codex_closing_right_after_response_completed_is_a_finished_request() {
+    let tokens = Arc::new(TokenServer::default());
+    let token_url = start_token_server(tokens.clone()).await;
+    let backend = Arc::new(Backend {
+        linger_ms: 3_000,
+        // 长一点的对话：usage 里的 attribution 有几十 KB
+        items: 600,
+        ..Default::default()
+    });
+    let base = start_backend(backend.clone()).await;
+    let (gw, _, mut rx) = start_gateway(chatgpt_provider(&base, &token_url)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{gw}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tw-k")
+        .body(codex_request(true).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = read_like_codex(resp).await;
+    assert!(text.contains("\"ok\""), "{text}");
+
+    let got = endings(&mut rx).await;
+    assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
+    match &got[0] {
+        tw_api::Event::RequestFinished { status, usage, .. } => {
+            assert_eq!(*status, 200);
+            let u = usage.expect("response.completed 里的用量没有带上");
+            assert_eq!((u.input, u.output), (23, 5));
+        }
+        other => panic!("该是一次结束，实际 {other:?}"),
+    }
+}
+
+/// 流照常走到末尾的那一轮（偶尔显示 200 的那些）也要有用量。
+///
+/// 实测的 usage 带着按条目拆的 `attribution`，长一点的对话里它有几十 KB。以前嗅探器只认
+/// 8 KB 以内的 usage 对象，这些请求一个 token 都没记上，费用也就没有
+#[tokio::test]
+async fn a_long_attribution_in_the_usage_does_not_hide_the_tokens() {
+    let tokens = Arc::new(TokenServer::default());
+    let token_url = start_token_server(tokens.clone()).await;
+    let backend = Arc::new(Backend {
+        items: 2_000,
+        ..Default::default()
+    });
+    let base = start_backend(backend.clone()).await;
+    let (gw, _, mut rx) = start_gateway(chatgpt_provider(&base, &token_url)).await;
+
+    let (status, _, body) = post_json(
+        gw,
+        "/v1/responses",
+        &[("authorization", "Bearer tw-k")],
+        codex_request(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.len() > 64 * 1024, "这一帧该比以前认得的大得多");
+
+    let got = endings(&mut rx).await;
+    assert_eq!(got.len(), 1, "该恰好有一个结局：{got:?}");
+    match &got[0] {
+        tw_api::Event::RequestFinished {
+            status: 200,
+            usage: Some(u),
+            ..
+        } => assert_eq!((u.input, u.output), (23, 5)),
+        other => panic!("该是一次带着用量的结束，实际 {other:?}"),
+    }
 }
