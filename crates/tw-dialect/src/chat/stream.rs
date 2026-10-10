@@ -143,7 +143,14 @@ impl Parser {
     }
 
     fn close(&mut self, out: &mut Vec<Event>) {
-        if let Some((index, _)) = self.open.take() {
+        if let Some((index, o)) = self.open.take() {
+            // 推理块结束时打上 Chat 的厂商：下一轮认得出该原样写回 reasoning_content
+            if o == Open::Thinking {
+                out.push(Event::Delta {
+                    index,
+                    delta: Delta::Signature(Signature::new(Vendor::Chat, "")),
+                });
+            }
             out.push(Event::BlockStop { index });
         }
     }
@@ -367,6 +374,11 @@ mod tests {
             .filter(|e| matches!(e, Event::BlockStop { .. }))
             .count();
         assert_eq!(stops, 4);
+        // 推理块带着 Chat 的厂商结束：客户端带回来时认得出该写回 reasoning_content
+        assert!(ev.contains(&Event::Delta {
+            index: 0,
+            delta: Delta::Signature(Signature::new(Vendor::Chat, "")),
+        }));
         assert!(ev.contains(&Event::Stop(StopReason::ToolUse)));
         assert!(ev.contains(&Event::Usage(Usage {
             input: 40,
