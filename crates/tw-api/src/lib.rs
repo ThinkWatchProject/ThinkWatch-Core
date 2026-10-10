@@ -4838,6 +4838,9 @@ pub struct Spent {
     pub amount: f64,
     pub currency: String,
     pub period: SpentPeriod,
+    /// 花的是谁的：这把密钥自己的，还是它所属的用户整体的（几把密钥合计）。只有企业网关
+    /// 说 —— 密钥自己设了限额时说的是密钥，没设时说的是用户整体；别的来源是空
+    pub scope: Option<BalanceScope>,
 }
 
 slug_enum! {
