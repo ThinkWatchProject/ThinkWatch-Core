@@ -63,10 +63,14 @@ pub fn decode_response(v: &Value) -> Response {
         .unwrap_or(&Value::Null);
     let msg = choice.get("message").unwrap_or(&Value::Null);
     let mut blocks = Vec::new();
-    if let Some(t) = str_of(msg, "reasoning_content").filter(|t| !t.is_empty()) {
+    // DeepSeek 叫 reasoning_content，OpenRouter、vLLM 叫 reasoning
+    if let Some(t) = str_of(msg, "reasoning_content")
+        .or_else(|| str_of(msg, "reasoning"))
+        .filter(|t| !t.is_empty())
+    {
         blocks.push(Block::Thinking(Thinking {
             text: t.to_string(),
-            signature: None,
+            signature: Some(Signature::new(Vendor::Chat, "")),
         }));
     }
     for key in ["content", "refusal"] {
@@ -212,7 +216,13 @@ mod tests {
                 "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": ""}}]},
                 "finish_reason": "tool_calls"}]
         }));
-        assert!(matches!(&r.blocks[0], Block::Thinking(t) if t.text == "推理"));
+        assert_eq!(
+            r.blocks[0],
+            Block::Thinking(Thinking {
+                text: "推理".into(),
+                signature: Some(Signature::new(Vendor::Chat, "")),
+            })
+        );
         assert!(
             matches!(&r.blocks[2], Block::ToolCall(c) if c.input == ToolInput::Json(json!({})))
         );

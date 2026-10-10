@@ -428,6 +428,10 @@ pub enum Vendor {
     Anthropic,
     OpenAi,
     Google,
+    /// Chat 格式的上游（DeepSeek 等）的 `reasoning_content`。它们不签名，`value` 为空；
+    /// 打上厂商只为了下一轮认得出这段推理该原样写回 `reasoning_content` —— DeepSeek
+    /// 在工具调用的那几轮要求带回来，而 OpenAI 自己的 Chat 接口不认这个字段
+    Chat,
 }
 
 /// 转换写出去的签名的前缀。**直通时看到它就知道这段推理不是那个上游签发的**
@@ -448,6 +452,8 @@ impl Signature {
             (Vendor::Anthropic, true) => "ar",
             (Vendor::OpenAi, _) => "o",
             (Vendor::Google, _) => "g",
+            // `c` 是压缩项的（见 [`crate::compaction::CARRIED_PREFIX`]）
+            (Vendor::Chat, _) => "ch",
         }
     }
 
@@ -471,7 +477,8 @@ impl Signature {
             "ar" => (Vendor::Anthropic, true),
             "o" => (Vendor::OpenAi, false),
             "g" => (Vendor::Google, false),
-            // `n`：没有签名的推理（比如 DeepSeek 的 reasoning_content）
+            "ch" => (Vendor::Chat, false),
+            // `n`：没有签名的推理
             _ => return None,
         };
         Some(Signature {
