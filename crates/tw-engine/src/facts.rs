@@ -6,7 +6,7 @@
 //! 下面这些维度，没有一个在网络代理里有对应物。
 
 use serde::{Deserialize, Serialize};
-use tw_dialect::ir::{Part, Request, ToolInput, ToolKind};
+use tw_dialect::ir::{Part, Request, Role, ToolInput, ToolKind};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestFacts {
@@ -116,6 +116,76 @@ pub fn estimate_tokens(r: &Request) -> u64 {
         }
     }
     text.tokens() + fixed
+}
+
+/// 一个请求的输入 token 分成几块各是多少（估算，同 [`estimate_tokens`] 的算法）。
+///
+/// 会话里看一轮的上下文由什么占着：系统提示、工具定义、前面的历史、最后一条用户消息。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenParts {
+    /// 系统提示：开头的那些（[`Request::system`]）加上对话中途的系统消息
+    pub system: u64,
+    /// 工具定义
+    pub tools: u64,
+    /// 最后一条用户消息之前的每一条消息（上游回过的话、更早的用户消息和工具结果）
+    pub history: u64,
+    /// 最后一条用户消息，连同它带着的工具结果。一条用户消息都没有是 0
+    pub last_user: u64,
+}
+
+impl TokenParts {
+    /// 四块加起来
+    pub fn total(&self) -> u64 {
+        self.system + self.tools + self.history + self.last_user
+    }
+}
+
+/// 估一个请求的输入 token 数，按块分开。
+///
+/// 算法和 [`estimate_tokens`] 一样，一遍走完；每一块各自取整，所以四块之和和整体估的数
+/// 最多差几个 token。
+///
+/// 「最后一条用户消息」是角色为用户的最后一条：Chat、Responses 里只装着工具结果的消息
+/// 解码后也是用户角色，所以紧跟在工具调用之后的那一轮，这一块就是那些工具结果。排在它
+/// 后面的（助手的预填）算进历史。
+pub fn estimate_parts(r: &Request) -> TokenParts {
+    let mut system = Text::default();
+    let mut tools = Text::default();
+    let mut history = Text::default();
+    let mut last_user = Text::default();
+    let mut fixed = TokenParts::default();
+    for s in &r.system {
+        system.add(s);
+    }
+    for t in &r.tools {
+        tools.add(&t.name);
+        if let Some(d) = &t.description {
+            tools.add(d);
+        }
+        if let ToolKind::Function { schema, .. } = &t.kind {
+            tools.add_json(schema);
+        }
+    }
+    let last = r.messages.iter().rposition(|m| m.role == Role::User);
+    for (i, m) in r.messages.iter().enumerate() {
+        let (text, count) = if m.role == Role::System {
+            (&mut system, &mut fixed.system)
+        } else if Some(i) == last {
+            (&mut last_user, &mut fixed.last_user)
+        } else {
+            (&mut history, &mut fixed.history)
+        };
+        *count += PER_MESSAGE;
+        for p in &m.parts {
+            *count += part(text, p);
+        }
+    }
+    TokenParts {
+        system: system.tokens() + fixed.system,
+        tools: tools.tokens() + fixed.tools,
+        history: history.tokens() + fixed.history,
+        last_user: last_user.tokens() + fixed.last_user,
+    }
 }
 
 /// 一段 JSON 里所有字符串值，按 [`estimate_tokens`] 的算法估成 token。
@@ -442,6 +512,35 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    /// 按块分：系统提示、工具、历史、最后一条用户消息各归各的，最后一条用户消息带着的
+    /// 工具结果算它的；四块之和和整体估的数只差取整
+    #[test]
+    fn parts_split_the_body_at_the_last_user_message() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"model":"m","max_tokens":1,"system":"abcdefgh",
+                "tools":[{"name":"Read","description":"abcd","input_schema":{"type":"object"}}],
+                "messages":[
+                  {"role":"user","content":"first question"},
+                  {"role":"assistant","content":[{"type":"text","text":"ok"},
+                     {"type":"tool_use","id":"t1","name":"Read","input":{"p":"a.rs"}}]},
+                  {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"the file 的内容"}]}
+                ]}"#,
+        )
+        .unwrap();
+        let r = tw_dialect::anthropic::decode_request(&v, &mut Dropped::new(Dialect::Anthropic))
+            .unwrap();
+        let p = estimate_parts(&r);
+        assert_eq!(p.system, 2);
+        // Read + abcd + {"type":"object"} = 4 + 4 + 17
+        assert_eq!(p.tools, 25_u64.div_ceil(4));
+        // 两条消息各 3 的开销；"first question" 14 + "ok" 2 + Read 4 + {"p":"a.rs"} 12
+        assert_eq!(p.history, 6 + 32_u64.div_ceil(4));
+        // "the file " 9 + 3 个汉字 = 3 + 3 + 3
+        assert_eq!(p.last_user, 3 + 3 + 3);
+        let whole = estimate_tokens(&r);
+        assert!(p.total().abs_diff(whole) <= 3, "{p:?} vs {whole}");
     }
 
     /// 解不开的请求体：按里面所有字符串估，不是 0

@@ -23,6 +23,8 @@ tw-config = { workspace = true }
 tw-guard = { workspace = true }
 bytes = { workspace = true }
 tw-engine = { workspace = true }
+# 一轮的上下文按块估：存下来的请求体按客户端的格式解码
+tw-dialect = { workspace = true }
 tw-gateway = { workspace = true }
 # 重放发给 Bedrock 的请求要签名、拆帧
 tw-bedrock = { workspace = true }
