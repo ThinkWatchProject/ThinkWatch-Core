@@ -116,7 +116,7 @@ pub(super) async fn pipeline(
 
     // 管线第 2 步：读出路由事实，路由。**看的是客户端的原话**：插件的请求钩子排在路由
     // 之后（每发往一个上游跑一次，见 `plug`），左右不了请求去哪一家
-    let (mut reading, fp) = heavy(&req.body, || {
+    let (reading, fp) = heavy(&req.body, || {
         read(&req, intent, parsed.as_ref(), (state.local_time)())
     });
     let conv = conversation(&rt, &req, &reading, fp.as_deref());
