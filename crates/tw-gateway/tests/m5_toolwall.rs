@@ -159,10 +159,58 @@ async fn enforce_cuts_the_stream_and_the_tool_call_is_left_unusable() {
         "没有告诉客户端流是被切断的：{body}"
     );
 
-    let (cut, blocked, tool, rule) = flagged(&mut rx).await.expect("没发告警事件");
+    let (cut, blocked, tool, rule, detail) = flagged_with(&mut rx).await.expect("没发告警事件");
     assert!(cut && blocked);
     assert_eq!(tool, "Bash");
     assert_eq!(rule, "curl-pipe-sh");
+    // 细节：切断的是哪个调用（流里攒到命中那一刻的参数）、客户端在它的位置上收到的那句话
+    let tw_api::OutcomeDetail::Cut {
+        tool,
+        arguments,
+        client_notice,
+        ..
+    } = &detail.outcome_detail
+    else {
+        panic!("{:?}", detail.outcome_detail)
+    };
+    assert_eq!(tool, "Bash");
+    assert!(arguments.contains("| sh"), "{arguments}");
+    assert!(
+        client_notice.starts_with("[ThinkWatch] "),
+        "{client_notice}"
+    );
+    assert!(
+        body.contains(client_notice.as_str()),
+        "{body} / {client_notice}"
+    );
+    assert_eq!(detail.locations[0].path, "content[1].input");
+    assert_eq!(detail.direction, tw_api::SecurityDirection::Response);
+}
+
+/// 同 [`flagged`]，连同细节
+async fn flagged_with(
+    rx: &mut tokio::sync::broadcast::Receiver<tw_api::Event>,
+) -> Option<(bool, bool, String, String, tw_api::SecurityHitDetail)> {
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+        if let tw_api::Event::ToolCallFlagged {
+            action,
+            blocked,
+            tool,
+            rule,
+            detail,
+            ..
+        } = ev
+        {
+            return Some((
+                action == tw_api::RuleAction::Cut,
+                blocked,
+                tool,
+                rule,
+                detail,
+            ));
+        }
+    }
+    None
 }
 
 #[tokio::test]

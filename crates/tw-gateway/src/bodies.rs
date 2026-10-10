@@ -129,22 +129,31 @@ impl Redaction {
                 &fresh[..]
             }
         };
-        let sent: HashMap<&str, &str> = self.ledger.replacements().collect();
+        let sent = self.sent();
         // 摘要以外的各段照常（找过的命中照用）；摘要解开了重新找、换、打码，再包回去
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         for (span, summary) in carried_summaries(text) {
-            out.push_str(&self.span(text, at..span.start, hits, &sent));
+            out.push_str(&self.piece(text, at..span.start, hits, &sent));
             out.push_str(&tw_dialect::compaction::carry(&self.apply(&summary)));
             at = span.end;
         }
-        out.push_str(&self.span(text, at..text.len(), hits, &sent));
+        out.push_str(&self.piece(text, at..text.len(), hits, &sent));
         out
     }
 
+    /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表）
+    pub(crate) fn sent(&self) -> HashMap<&str, &str> {
+        self.ledger.replacements().collect()
+    }
+
     /// `text` 里的一段：落在这一段里的命中换掉或打码，再按形状打一遍。各段在 token 的边界上
-    /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的
-    fn span(
+    /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的。
+    ///
+    /// `hits` 是 [`crate::guard::hits`] 在 `text` 上找到的，按起点排好、互不重叠：整个落在这一段
+    /// 里的才算，按起点二分找到头一个。安全日志的前后文（[`crate::guard::detail`]）也走这里：
+    /// 和存下来的正文是同一个打码的办法
+    pub(crate) fn piece(
         &self,
         text: &str,
         range: Range<usize>,
@@ -153,9 +162,11 @@ impl Redaction {
     ) -> String {
         let mut out = String::with_capacity(range.len());
         let mut at = range.start;
-        for h in hits
+        let first = hits.partition_point(|h| h.bytes.start < range.start);
+        for h in hits[first..]
             .iter()
-            .filter(|h| h.bytes.start >= range.start && h.bytes.end <= range.end)
+            .take_while(|h| h.bytes.start < range.end)
+            .filter(|h| h.bytes.end <= range.end)
         {
             out.push_str(&text[at..h.bytes.start]);
             let value = &text[h.bytes.clone()];

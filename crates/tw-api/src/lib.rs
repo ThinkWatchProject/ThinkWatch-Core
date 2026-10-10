@@ -25,6 +25,7 @@ pub use endpoint::{Endpoint, ErrorBody, Format, Info, Method, fill};
 // 管理接口返回同一份 JSON。导出成 TypeScript 时名字照旧（`GuardMode`、`SecurityRuleView`、
 // `SecurityTestRequest`……）
 pub use tw_guard::content::Outcome as ContentOutcome;
+pub use tw_guard::locate::{Direction as SecurityDirection, Part as HitPart};
 pub use tw_guard::policy::{ContentMatch, Guard, Mode as GuardMode};
 pub use tw_guard::trial::{
     TrialHit as SecurityTestHit, TrialRequest as SecurityTestRequest,
@@ -858,6 +859,15 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 两边、每一跳的请求行或状态行和头，凭据打码）、`upstream_request_body` 和
 /// `upstream_response_body`（和客户端那一边不是一回事时才有）；`response_body` 是客户端收到的
 /// 那一份 —— 转换过格式的请求以前在这里的是上游的原话，现在它在 `upstream_response_body`。
+///
+/// 44 起**安全日志的每一条说得出细节**：[`SecurityEventView`] 多了 `session`、`sent_model`、
+/// `direction`（[`SecurityDirection`]）、`locations`（每一处在请求的哪一部分、第几条消息、
+/// 谁说的、哪个工具、JSON 路径和打过码的前后文，[`HitLocation`]，最多
+/// [`HIT_LOCATIONS_MAX`] 处）和 `more_locations`、`rule_snapshot`（命中那一刻的规则，
+/// [`RuleSnapshot`]）、`outcome_detail`（换成的占位符、切断的调用和客户端收到的话、拒绝时
+/// 客户端收到的话、删掉了几段，[`OutcomeDetail`]）。[`RequestDetail`] 的 `security` 是同一个
+/// 类型。事件跟着改：[`SecretItem`]、[`Event::ContentMatched`]、[`Event::ToolCallFlagged`]
+/// 多了 `detail`（[`SecurityHitDetail`]）。细节存在请求记录的库里，和请求一起过期。
 pub const CONTROL_API_VERSION: u32 = 44;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1233,6 +1243,8 @@ pub enum Event {
         /// 没有
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revealed: Option<String>,
+        /// 每一处在哪儿、当时的规则、具体做了什么（见 [`SecurityHitDetail`]）
+        detail: SecurityHitDetail,
         at_ms: u64,
     },
     /// 一个请求发出前，按出站脱敏的规则找到了东西。
@@ -1338,6 +1350,8 @@ pub enum Event {
         action: RuleAction,
         /// 真的切断了流吗。**拦截档 + 规则是切断**两者同时成立才会
         blocked: bool,
+        /// 每一处在哪儿、当时的规则、具体做了什么（见 [`SecurityHitDetail`]）
+        detail: SecurityHitDetail,
         at_ms: u64,
     },
     /// 这次请求花了多少钱 —— **在它跑完之后一小会儿才知道**。
@@ -5482,6 +5496,8 @@ pub struct SecretItem {
     /// 只留最后四位（`…1234`），邮箱只留第一个字和域名（`z…@example.com`）
     pub masked: String,
     pub count: u64,
+    /// 每一处在哪儿、当时的规则、具体做了什么（见 [`SecurityHitDetail`]）
+    pub detail: SecurityHitDetail,
 }
 
 /// 各项防护在一段时间里各留下了几条记录。
@@ -5557,6 +5573,140 @@ pub struct SecurityEventView {
     /// 请求带的那把网关密钥打码后的样子（`tw-re…wb4e`），请求那一刻的
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_masked: Option<String>,
+    /// 请求属于哪一次会话（[`HistoryRow`] 的 `session`）。认不出会话的请求没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// 实际发给服务它的那家上游的模型名（规则改写、别名对过之后的）。一跳都没发出去的
+    /// （被拒、被规则挡下）没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_model: Option<String>,
+    /// 查的是请求（出站脱敏、内容过滤）还是回答（工具调用审查）
+    pub direction: SecurityDirection,
+    /// 这条规则在这个请求里命中的每一处，按先后，**最多 [`HIT_LOCATIONS_MAX`] 处**。出站
+    /// 脱敏是这个值出现的每一处，内容过滤是这条规则的每一处，工具调用审查是这个调用的参数里
+    /// 的每一处
+    pub locations: Vec<HitLocation>,
+    /// 超出上限、没列出来的还有几处
+    pub more_locations: u32,
+    /// 命中那一刻的规则。之后改了、删了，这里说的还是当时那一版
+    pub rule_snapshot: RuleSnapshot,
+    /// 具体做了什么：换成了哪个占位符、切断的是哪个调用、客户端收到了什么
+    pub outcome_detail: OutcomeDetail,
+}
+
+/// 一条安全记录最多列几处命中（[`SecurityEventView::locations`]）。再多的只数个数
+/// （`more_locations`）：一份几千行的日志里同一个词出现上千次，列出前几十处足够看清
+pub const HIT_LOCATIONS_MAX: usize = 50;
+
+/// 一处命中：在请求（或者回答）的哪儿，前后是什么。
+///
+/// **前后文和命中的那一段都打过码**，和存下来的正文是同一套（同样的规则、同样的账本）：
+/// 出站脱敏命中的值写成打码后的样子，前后文里别的密钥也一样打掉，拦截档下换成了占位符的
+/// 写成那个占位符。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HitLocation {
+    pub part: HitPart,
+    /// 在客户端的消息数组（`messages`、`input`、`contents`）里的下标。系统提示字段、工具
+    /// 定义和回答里的没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_index: Option<u32>,
+    /// 那条消息的角色，客户端写的原样（`user`、`assistant`、`tool`、`developer`、`model`……）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// 工具调用、工具结果是哪个工具（知道的话）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// 在客户端发来的那一份请求体里的 JSON 路径（`messages[3].content[0].text`、
+    /// `input[7].output`），按客户端的格式、转换之前。工具调用审查是这个调用的参数在客户端
+    /// 收到的回答里的位置，按整包的形状写（`content[1].input`、
+    /// `choices[0].message.tool_calls[0].function.arguments`）。没法按结构读的正文是空串
+    pub path: String,
+    /// 命中之前最多 80 个字符（码位规则认的字符按画出来之前数，画出来的样子同 `matched`）
+    pub before: String,
+    /// 命中的那一段：出站脱敏是打码后的值，别的是命中的文字（最多 200 个字符），码位规则
+    /// 命中的字符画成 `‹U+E0049›`，连成一串的写成 `‹U+E0049 ×12›`
+    pub matched: String,
+    /// 命中之后最多 80 个字符（同 `before`）
+    pub after: String,
+}
+
+/// 命中那一刻的规则（[`SecurityEventView::rule_snapshot`]）。**跟着记录存**：规则之后改了、
+/// 删了，这一条说的还是当时按什么认出来的。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct RuleSnapshot {
+    /// 内置规则。内置规则怎么认由那一版 core 定（`core_version`）
+    pub builtin: bool,
+    /// 内置规则的 id，或者自定义规则的名字
+    pub id: String,
+    /// 显示的名字：内置规则的英文名（界面按 id 查自己的名称表），自定义规则就是它的名字
+    pub name: String,
+    /// 自定义规则写的样子，原样（正则、关键词、码位）。内置规则没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// 内容过滤：这条规则怎么认（`contains` / `regex` / `codepoints`）。别的防护没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching: Option<ContentMatch>,
+    /// 认出它的 core 的版本
+    pub core_version: String,
+}
+
+/// 具体做了什么（[`SecurityEventView::outcome_detail`]），按 `action` 分，和
+/// [`SecurityOutcome`] 一一对应。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum OutcomeDetail {
+    /// 只记录，什么都没动
+    Recorded {},
+    /// 换成了占位符：发出去的、存下来的那一份里写的就是它们
+    Replaced { placeholders: Vec<String> },
+    /// 切断了这个工具调用。`arguments` 是它的参数（打过码，最多 4 KiB，`truncated` 说截没
+    /// 截过），`client_notice` 是客户端在它的位置上收到的那句话
+    Cut {
+        tool: String,
+        arguments: String,
+        truncated: bool,
+        client_notice: String,
+    },
+    /// 请求被拒：客户端收到的那句话
+    Blocked { client_notice: String },
+    /// 命中的文字删掉了几段之后发出（码位规则连在一起的几个字符是一段）
+    Stripped { segments: u32 },
+}
+
+impl Default for OutcomeDetail {
+    fn default() -> Self {
+        OutcomeDetail::Recorded {}
+    }
+}
+
+/// 一条安全记录的细节：在哪儿、按什么规则、具体做了什么。**命中的那一刻定下**，跟着事件
+/// 走（[`Event::SecretsFound`] 的每一项、[`Event::ContentMatched`]、[`Event::ToolCallFlagged`]），
+/// 和记录一起存，和请求记录一起过期。安全日志里摊开成 [`SecurityEventView`] 的那几个字段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SecurityHitDetail {
+    pub direction: SecurityDirection,
+    /// 每一处，按先后，最多 [`HIT_LOCATIONS_MAX`] 处
+    pub locations: Vec<HitLocation>,
+    /// 超出上限、没列出来的还有几处
+    pub more_locations: u32,
+    pub rule_snapshot: RuleSnapshot,
+    pub outcome_detail: OutcomeDetail,
+}
+
+impl Default for SecurityHitDetail {
+    fn default() -> Self {
+        SecurityHitDetail {
+            direction: SecurityDirection::Request,
+            locations: Vec::new(),
+            more_locations: 0,
+            rule_snapshot: RuleSnapshot::default(),
+            outcome_detail: OutcomeDetail::default(),
+        }
+    }
 }
 
 /// 安全日志的一页。**按时间倒序**，`more` 说后面还有没有。
@@ -6371,6 +6521,7 @@ mod tests {
             excerpt: "page‹U+E0069 ×9›".into(),
             count: 9,
             revealed: Some("ignore me".into()),
+            detail: SecurityHitDetail::default(),
             at_ms: 1,
         };
         let v = serde_json::to_value(&e).unwrap();
@@ -6391,12 +6542,94 @@ mod tests {
         let Event::ContentMatched { revealed, .. } = serde_json::from_value(serde_json::json!({
             "kind": "content_matched", "id": 1, "provider": "p", "rule": "r", "custom": true,
             "match": "contains", "action": "record", "outcome": "recorded", "in_tool_result": false,
-            "excerpt": "x", "count": 1, "at_ms": 1
+            "excerpt": "x", "count": 1, "at_ms": 1,
+            "detail": {
+                "direction": "request", "locations": [], "more_locations": 0,
+                "rule_snapshot": {"builtin": false, "id": "r", "name": "r", "core_version": "0"},
+                "outcome_detail": {"action": "recorded"}
+            }
         }))
         .unwrap() else {
             panic!("not a content match");
         };
         assert!(revealed.is_none(), "没有隐藏内容时不写这一项");
+    }
+
+    /// 安全记录的细节在线上的样子：结局按 `action` 分，和 [`SecurityOutcome`] 同一套词；
+    /// 一处命中没有的可选项不写
+    #[test]
+    fn the_security_detail_reads_on_the_wire_as_the_contract_says() {
+        let outcomes = [
+            (
+                OutcomeDetail::Recorded {},
+                serde_json::json!({"action": "recorded"}),
+            ),
+            (
+                OutcomeDetail::Replaced {
+                    placeholders: vec!["<<TW_SECRET_1>>".into()],
+                },
+                serde_json::json!({"action": "replaced", "placeholders": ["<<TW_SECRET_1>>"]}),
+            ),
+            (
+                OutcomeDetail::Cut {
+                    tool: "bash".into(),
+                    arguments: "{}".into(),
+                    truncated: false,
+                    client_notice: "[ThinkWatch] cut".into(),
+                },
+                serde_json::json!({"action": "cut", "tool": "bash", "arguments": "{}",
+                    "truncated": false, "client_notice": "[ThinkWatch] cut"}),
+            ),
+            (
+                OutcomeDetail::Blocked {
+                    client_notice: "[ThinkWatch] no".into(),
+                },
+                serde_json::json!({"action": "blocked", "client_notice": "[ThinkWatch] no"}),
+            ),
+            (
+                OutcomeDetail::Stripped { segments: 3 },
+                serde_json::json!({"action": "stripped", "segments": 3}),
+            ),
+        ];
+        for (o, wire) in outcomes {
+            let v = serde_json::to_value(&o).unwrap();
+            assert_eq!(v, wire);
+            // 和安全日志的做法是同一个词
+            assert!(SecurityOutcome::from_slug(v["action"].as_str().unwrap()).is_some());
+            assert_eq!(serde_json::from_value::<OutcomeDetail>(wire).unwrap(), o);
+        }
+        let at = HitLocation {
+            part: HitPart::ToolResult,
+            message_index: Some(7),
+            role: Some("tool".into()),
+            tool: None,
+            path: "input[7].output".into(),
+            before: "b".into(),
+            matched: "m".into(),
+            after: "a".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&at).unwrap(),
+            serde_json::json!({"part": "tool_result", "message_index": 7, "role": "tool",
+                "path": "input[7].output", "before": "b", "matched": "m", "after": "a"})
+        );
+        let rule = RuleSnapshot {
+            builtin: false,
+            id: "plan".into(),
+            name: "plan".into(),
+            pattern: Some("forbidden-plan".into()),
+            matching: Some(ContentMatch::Contains),
+            core_version: "0.67.1".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap(),
+            serde_json::json!({"builtin": false, "id": "plan", "name": "plan",
+                "pattern": "forbidden-plan", "matching": "contains", "core_version": "0.67.1"})
+        );
+        assert_eq!(
+            serde_json::to_value(SecurityDirection::Response).unwrap(),
+            "response"
+        );
     }
 
     #[test]

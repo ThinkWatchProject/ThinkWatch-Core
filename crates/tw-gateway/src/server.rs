@@ -458,13 +458,17 @@ pub(crate) fn because(why: &str) -> String {
 ///
 /// **命中的那一段先打码**（`redaction`：和留档同一套，这个请求的规则和账本）。审查看的
 /// 是还原过占位符的回答，`curl … -H "Authorization: <<TW_SECRET_1>>"` 到这里已经是那把
-/// 真的密钥；原样写进事件，它就跟着进了安全日志、系统通知和界面。
+/// 真的密钥；原样写进事件，它就跟着进了安全日志、系统通知和界面。细节（每一处的前后文、
+/// 切断的调用）也一样打码（见 [`crate::guard::detail::tool_call`]）。
+///
+/// `notice`：切断了的话，客户端在这个调用的位置上收到的那句话。
 pub(crate) fn flagged(
     id: u64,
     provider: &str,
     v: &tw_guard::tools::wall::Verdict,
     blocked: bool,
     redaction: &crate::bodies::Redaction,
+    notice: Option<&tw_types::Msg>,
 ) -> tw_api::Event {
     tw_api::Event::ToolCallFlagged {
         id,
@@ -480,6 +484,7 @@ pub(crate) fn flagged(
             tw_api::RuleAction::Record
         },
         blocked,
+        detail: crate::guard::detail::tool_call(v, blocked, redaction, notice),
         at_ms: now_ms(),
     }
 }

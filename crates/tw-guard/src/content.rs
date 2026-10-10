@@ -34,7 +34,10 @@ mod screen;
 pub(crate) use codepoints::visible as codepoints_visible;
 pub use codepoints::{CodepointError, Codepoints, MAX_ITEMS as MAX_CODEPOINT_ITEMS};
 pub(crate) use screen::evaluate;
-pub use screen::{Outcome, ScreenHit, Screening, screen, screen_text, screen_value};
+pub use screen::{
+    Outcome, RulePlaces, ScreenHit, Screening, places, places_text, screen, screen_text,
+    screen_value,
+};
 
 /// 一条规则怎么认。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -225,6 +228,35 @@ impl Rule {
     /// 码位规则的那一组码位
     pub fn codepoints(&self) -> Option<&Codepoints> {
         self.points.as_ref()
+    }
+
+    /// `text` 给人看的样子：码位规则认的字符画出来（`‹U+200B›`，连成一串的写成
+    /// `‹U+E0049 ×12›`，和 [`Hit::snippet`] 一样），别的规则原样。`escapes`：JSON 的
+    /// `\uXXXX` 写法也算它写的那个字符（[`screen_text`] 查的是原文）。
+    pub fn draw(&self, text: &str, escapes: bool) -> String {
+        let Some(p) = &self.points else {
+            return text.to_string();
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut run: Option<(char, usize)> = None;
+        let flush = |run: &mut Option<(char, usize)>, out: &mut String| match run.take() {
+            Some((c, 1)) => out.push_str(&codepoints::visible(c)),
+            Some((c, n)) => out.push_str(&format!("‹U+{:04X} ×{n}›", c as u32)),
+            None => {}
+        };
+        for (_, c) in chars(text, escapes) {
+            if p.contains(c) {
+                match &mut run {
+                    Some((_, n)) => *n += 1,
+                    None => run = Some((c, 1)),
+                }
+                continue;
+            }
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+        flush(&mut run, &mut out);
+        out
     }
 
     /// 在 `text` 里的全部命中：按先后、互不重叠的字节区间，和一共几处（码位规则是

@@ -105,6 +105,9 @@ fn event(
         count: 1,
         matching: None,
         revealed: None,
+        session: None,
+        sent_model: None,
+        detail: Default::default(),
     }
 }
 

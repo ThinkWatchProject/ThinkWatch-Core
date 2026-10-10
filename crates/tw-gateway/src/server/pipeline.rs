@@ -161,8 +161,10 @@ pub(super) async fn pipeline(
     )
     .await?;
 
-    // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份
+    // 管线第 4 步：内容过滤先下结论，不发事件。删过的话，后面一律用删过的那一份。查的那一份
+    // 留着：每条命中的细节（在哪儿、前后是什么）在它上面算
     let size = req.body.len();
+    let screened = req.body.clone();
     let (screening, started) = heavy_for(size, || {
         let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
         // 解析出来的那一份到这里就用完了：删过字的话它也不再是请求体的样子
@@ -185,7 +187,23 @@ pub(super) async fn pipeline(
     // 结论挂在请求号上报。**拒绝的也在开始之后**：被拒是一次来源为 `denied` 的失败，
     // 流量里照样留一行；一个字节都不发
     let provider = started.alive.first().map(String::as_str).unwrap_or("");
-    if let Some(why) = crate::guard::report(&state.bus, started.id, provider, &screening) {
+    let refused = (!screening.hits.is_empty())
+        .then(|| {
+            // 前后文和存下来的正文一样换、打码：同一套规则、同一本账
+            let redaction = redaction(&rt, started.ledger.clone());
+            let src = crate::guard::detail::Screened {
+                body: &screened,
+                dialect: req.api.map(|a| a.dialect()),
+                rules: &rt.content,
+                redaction: &redaction,
+            };
+            heavy(&screened, || {
+                crate::guard::report(&state.bus, started.id, provider, &screening, &src)
+            })
+        })
+        .flatten();
+    drop(screened);
+    if let Some(why) = refused {
         return Err(GatewayError::denied(why));
     }
     // 管线第 5 步：试上游、交回答（见 `answer`）。它拿走这个请求要的一切：流式的回答等不到
@@ -928,6 +946,7 @@ fn start(
     let seen = look(rt, req);
     let (found, ledger) = (seen.found, seen.ledger);
     let hits: Option<std::sync::Arc<[tw_guard::redact::rules::Hit]>> = seen.hits.map(Into::into);
+    let redacting = redaction(rt, ledger.clone());
     let (id, at_ms) = open(
         state,
         req,
@@ -936,15 +955,24 @@ fn start(
         (first, billing.into()),
         fp,
         ending,
-        (redaction(rt, ledger.clone()), hits.clone()),
+        (redacting.clone(), hits.clone()),
     );
     let redact_mode = rt.config.security.redact.mode;
     if !found.is_empty() {
+        // 每一项说得出在哪儿：在客户端的原文上找的那一遍（见 `crate::guard::detail::secrets`）
+        let seen = crate::guard::detail::Seen {
+            body: &req.body,
+            dialect: req.api.map(|a| a.dialect()),
+            hits: hits.as_deref().unwrap_or_default(),
+            redaction: &redacting,
+            replaced: redact_mode.acts(),
+        };
+        let items = heavy(&req.body, || crate::guard::items(&found, 0, &seen));
         state.bus.emit(tw_api::Event::SecretsFound {
             id,
             provider: alive.first().cloned().unwrap_or_default(),
             replaced: redact_mode.acts(),
-            items: crate::guard::items(&found, 0),
+            items,
             at_ms: now_ms(),
         });
     }

@@ -660,6 +660,14 @@ impl Pipes {
             .and_then(turn::Turns::front_id)
             .unwrap_or(self.id)
     }
+
+    /// 这条连接此刻的脱敏规则和账本：安全记录的前后文按它打码，和留档一样
+    fn redaction(&self) -> crate::bodies::Redaction {
+        crate::bodies::Redaction {
+            rules: self.rules.redact.clone(),
+            ledger: self.ledger.clone(),
+        }
+    }
 }
 
 /// 这条连接在流量里怎么记（见 [`turn`]）。
@@ -1207,6 +1215,17 @@ async fn begin_turn(
             Default::default()
         }
     };
+    // 细节在删之前的这一帧上算：报的时候（过了准入）这一帧已经换成删过的样子
+    let screened = {
+        let redaction = p.redaction();
+        let src = crate::guard::detail::Screened {
+            body: raw.as_bytes(),
+            dialect: Some(tw_dialect::ir::Dialect::Responses),
+            rules: &p.rules.screen.rules,
+            redaction: &redaction,
+        };
+        crate::guard::detail::content(&src, &screening)
+    };
     // 删过的话，后面一律用删过的那一帧
     let (text, frame) = match &screening.body {
         Some(b) => {
@@ -1255,6 +1274,7 @@ async fn begin_turn(
         fingerprint,
         input_estimate,
         screening,
+        screened,
         arrived,
         at_ms,
     };
@@ -1347,32 +1367,47 @@ async fn reply_failed(c_tx: &mut ClientSink, err: GatewayError) -> Step {
 /// `crate::guard::REPORTED_MAX`）
 fn outbound(state: &AppState, p: &mut Pipes, id: u64, text: String) -> UpMsg {
     let mode = p.rules.redact_mode;
-    let found = crate::guard::find(mode, &p.rules.redact, text.as_bytes());
-    if found.is_empty() {
+    if !mode.detects() || p.rules.redact.is_empty() {
         return UpMsg::Text(text.into());
     }
+    // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不算（见 `crate::guard::find`）
+    let hits = crate::guard::hits(&text, &p.rules.redact);
+    if hits.is_empty() {
+        return UpMsg::Text(text.into());
+    }
+    let found = tw_guard::redact::rules::findings(&text, &hits);
+    let replaced = mode.acts().then(|| {
+        let r = tw_guard::redact::replace::apply(
+            &text,
+            &hits,
+            std::mem::replace(
+                &mut p.ledger,
+                tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
+            ),
+        );
+        p.ledger = r.ledger;
+        r.text
+    });
+    // 换过之后再报：拦截档下每个值换成的占位符这时才记在账本上
+    let redaction = crate::bodies::Redaction {
+        rules: p.rules.redact.clone(),
+        ledger: p.ledger.clone(),
+    };
+    let seen = crate::guard::detail::Seen {
+        body: text.as_bytes(),
+        dialect: Some(tw_dialect::ir::Dialect::Responses),
+        hits: &hits,
+        redaction: &redaction,
+        replaced: mode.acts(),
+    };
     state.bus.emit(tw_api::Event::SecretsFound {
         id,
         provider: p.provider.clone(),
         replaced: mode.acts(),
-        items: crate::guard::items(&found, 0),
+        items: crate::guard::items(&found, 0, &seen),
         at_ms: crate::server::now_ms(),
     });
-    if !mode.acts() {
-        return UpMsg::Text(text.into());
-    }
-    // 换的和报出去的是同一批：我们自己的占位符、base64 载荷不换
-    let hits = crate::guard::hits(&text, &p.rules.redact);
-    let r = tw_guard::redact::replace::apply(
-        &text,
-        &hits,
-        std::mem::replace(
-            &mut p.ledger,
-            tw_guard::redact::replace::Ledger::new(tw_guard::redact::replace::Scheme::SECRET),
-        ),
-    );
-    p.ledger = r.ledger;
-    UpMsg::Text(r.text.into())
+    UpMsg::Text(replaced.unwrap_or(text).into())
 }
 
 type ClientSink = futures::stream::SplitSink<WebSocket, Message>;
@@ -1556,23 +1591,23 @@ async fn relay(
         };
         // **和主管线一模一样的判据**：规则是切断 + 拦截档
         let acts = p.rules.inspect_mode.acts();
-        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句
-        let mut refusal: Option<Msg> = None;
+        // 头一个真要切的命中：告诉客户端的、结局里记的都是这一句。这一帧里别的要切的调用
+        // 也是被这一句切掉的
+        let refusal: Option<Msg> = hits.iter().find(|h| h.cut && acts).map(|h| {
+            // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）：回答钩子
+            // 也能造、能改这一帧里的调用
+            msg!(
+                "gw.toolcall.connection_cut",
+                upstream = p.provider.clone(), tool = h.tool.clone(),
+                rule = h.rule.clone(), name = h.name.clone(),
+                why = h.why.clone() =>
+                "The answer contained a {tool} call that matched rule \
+                 “{name}”{}, so the connection was cut.",
+                crate::server::because(&h.why)
+            )
+        });
         for h in &hits {
             let blocked = h.cut && acts;
-            if blocked && refusal.is_none() {
-                // 和 HTTP 那条路一样不说调用出自谁（见 relay 的 `wall_cut`）：回答钩子
-                // 也能造、能改这一帧里的调用
-                refusal = Some(msg!(
-                    "gw.toolcall.connection_cut",
-                    upstream = p.provider.clone(), tool = h.tool.clone(),
-                    rule = h.rule.clone(), name = h.name.clone(),
-                    why = h.why.clone() =>
-                    "The answer contained a {tool} call that matched rule \
-                     “{name}”{}, so the connection was cut.",
-                    crate::server::because(&h.why)
-                ));
-            }
             // 命中的那一段是还原过的：报出去之前和留档一样打码
             let redaction = crate::bodies::Redaction {
                 rules: p.rules.redact.clone(),
@@ -1584,6 +1619,7 @@ async fn relay(
                 h,
                 blocked,
                 &redaction,
+                refusal.as_ref().filter(|_| blocked),
             ));
         }
         if let Some(why) = refusal {
@@ -1791,7 +1827,14 @@ fn screen_changed(
         before.as_bytes(),
         after.as_bytes(),
     );
-    if let Some(why) = crate::guard::report(&state.bus, id, &p.provider, &sc) {
+    let redaction = p.redaction();
+    let src = crate::guard::detail::Screened {
+        body: after.as_bytes(),
+        dialect: Some(tw_dialect::ir::Dialect::Responses),
+        rules: &s.rules,
+        redaction: &redaction,
+    };
+    if let Some(why) = crate::guard::report(&state.bus, id, &p.provider, &sc, &src) {
         return Err(why);
     }
     Ok(match sc.body {
@@ -1891,12 +1934,20 @@ fn screen_frame(state: &AppState, p: &Pipes, text: &str) -> Result<String, Msg> 
     let request = serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("response.create"));
-    let sc = if request {
-        crate::guard::screen(s, tw_dialect::ir::Dialect::Responses, text.as_bytes())
+    let (sc, dialect) = if request {
+        let d = tw_dialect::ir::Dialect::Responses;
+        (crate::guard::screen(s, d, text.as_bytes()), Some(d))
     } else {
-        crate::guard::screen_raw(s, text)
+        (crate::guard::screen_raw(s, text), None)
     };
-    if let Some(why) = crate::guard::report(&state.bus, p.event_id(), &p.provider, &sc) {
+    let redaction = p.redaction();
+    let src = crate::guard::detail::Screened {
+        body: text.as_bytes(),
+        dialect,
+        rules: &s.rules,
+        redaction: &redaction,
+    };
+    if let Some(why) = crate::guard::report(&state.bus, p.event_id(), &p.provider, &sc, &src) {
         return Err(why);
     }
     Ok(match sc.body {

@@ -595,8 +595,9 @@ async fn hidden_characters_in_a_frame_refuse_it_before_the_upstream() {
                 rule,
                 outcome,
                 revealed,
+                detail,
                 ..
-            } => found = Some((rule, outcome, revealed)),
+            } => found = Some((rule, outcome, revealed, detail)),
             Event::RequestFailed { source: s, .. } => {
                 source = Some(s);
                 break;
@@ -604,11 +605,28 @@ async fn hidden_characters_in_a_frame_refuse_it_before_the_upstream() {
             _ => {}
         }
     }
-    let (rule, outcome, revealed) = found.expect("没有记录");
+    let (rule, outcome, revealed, detail) = found.expect("没有记录");
     assert_eq!(rule, "unicode-tags");
     assert_eq!(outcome, tw_api::ContentOutcome::Blocked);
     assert_eq!(revealed.as_deref(), Some("rm -rf ~"));
     assert_eq!(source.map(|s| s.slug()), Some("denied"));
+    // 细节：在这一帧的哪儿（按 Responses 的结构），客户端收到的那句话原样记下
+    let at = &detail.locations[0];
+    assert_eq!(at.path, "input[0].content[0].text");
+    assert_eq!(at.part, tw_api::HitPart::Message);
+    assert_eq!((at.before.as_str(), at.after.as_str()), ("hi", ""));
+    assert!(at.matched.starts_with("‹U+E0072 ×"), "{}", at.matched);
+    let tw_api::OutcomeDetail::Blocked { client_notice } = &detail.outcome_detail else {
+        panic!("{:?}", detail.outcome_detail)
+    };
+    assert!(
+        client_notice.starts_with("[ThinkWatch] "),
+        "{client_notice}"
+    );
+    assert!(
+        first.contains(client_notice.as_str()),
+        "{first} / {client_notice}"
+    );
 }
 
 /// 出厂的处置是删除：删过的那一帧照发，连接照常
@@ -691,11 +709,31 @@ async fn a_secret_restored_into_a_flagged_call_is_masked_in_the_event() {
     // 观察档照发：客户端拿到的是还原过的调用，审查看的也是这一份
     assert!(back.contains(USER_KEY), "{back}");
     let mut excerpts = Vec::new();
+    let mut details = Vec::new();
     while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
-        if let Event::ToolCallFlagged { rule, excerpt, .. } = ev {
+        if let Event::ToolCallFlagged {
+            rule,
+            excerpt,
+            detail,
+            ..
+        } = ev
+        {
             excerpts.push((rule, excerpt));
+            details.push(detail);
         }
     }
+    // 细节里每一处的前后文也是打过码的
+    let all = serde_json::to_string(&details).unwrap();
+    assert!(
+        !all.contains("USERSOWNKEY"),
+        "**细节里是明文的密钥**：{all}"
+    );
+    assert!(details.iter().all(|d| {
+        !d.locations.is_empty()
+            && d.locations
+                .iter()
+                .all(|l| l.part == tw_api::HitPart::ToolCall)
+    }));
     let curl = excerpts
         .iter()
         .find(|(r, _)| r == "curl-pipe-sh")

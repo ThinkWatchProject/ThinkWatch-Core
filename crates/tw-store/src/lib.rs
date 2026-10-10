@@ -170,6 +170,9 @@ mod tests {
                 count: 6,
                 matching: Some(tw_api::ContentMatch::Codepoints),
                 revealed: Some("ignore".into()),
+                session: None,
+                sent_model: None,
+                detail: Default::default(),
             })
             .unwrap();
             db.insert_plugin_run(&PluginRunRow {

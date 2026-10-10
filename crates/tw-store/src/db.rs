@@ -32,7 +32,8 @@ use tw_api::Msg;
 /// `aborted`。
 ///
 /// 27：`bytes`（解码之后的回答有多少字节）换成网关和上游之间的流量 —— `sent_bytes`、
-/// `received_bytes` —— 和出口 `egress`；尝试链的每一跳（`routing`）多了 `proxy`。
+/// `received_bytes` —— 和出口 `egress`；尝试链的每一跳（`routing`）多了 `proxy`。安全日志
+/// 多了细节（`security_events` 的 `session`、`sent_model`、`detail`）。
 pub(crate) const SCHEMA: i64 = 27;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
@@ -440,7 +441,16 @@ impl Db {
                 -- 内容过滤：规则怎么认（contains / regex / codepoints）。别的防护是 NULL
                 matching   TEXT,
                 -- 内容过滤的码位规则命中标签字符时解出来的原文。别的时候是 NULL
-                revealed   TEXT
+                revealed   TEXT,
+                -- 请求属于哪一次会话，记下时知道的。请求那一行在的话以那一行为准
+                session    TEXT,
+                -- 记下时已经知道的、发给上游的模型名（工具调用审查：回答已经在路上了）。
+                -- 请求那一行在的话以那一行为准
+                sent_model TEXT,
+                -- 细节，JSON（`tw_api::SecurityHitDetail`）：每一处在哪儿、打过码的前后文、
+                -- 当时的规则、具体做了什么。**命中那一刻定下**：规则之后改了，这一条不变。
+                -- 存在这一行上，和请求记录一起过期
+                detail     TEXT    NOT NULL
              );
              CREATE INDEX security_events_at ON security_events (at_ms DESC);
              CREATE INDEX security_events_request ON security_events (request_id);
@@ -1026,8 +1036,8 @@ impl Db {
         self.conn.execute(
             "INSERT INTO security_events
              (at_ms, request_id, guard, rule, custom, action, provider, client, tool, excerpt, count,
-              matching, revealed)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              matching, revealed, session, sent_model, detail)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 e.at_ms,
                 e.request_id,
@@ -1042,6 +1052,9 @@ impl Db {
                 e.count,
                 e.matching.map(tw_api::ContentMatch::slug),
                 e.revealed,
+                e.session,
+                e.sent_model,
+                serde_json::to_string(&e.detail).unwrap_or_default(),
             ],
         )?;
         Ok(())
@@ -1910,9 +1923,19 @@ pub struct SecurityEvent {
     pub matching: Option<tw_api::ContentMatch>,
     /// 内容过滤的码位规则解出来的隐藏内容
     pub revealed: Option<String>,
+    /// 请求属于哪一次会话，记下时知道的
+    pub session: Option<String>,
+    /// 记下时已经知道的、发给上游的模型名
+    pub sent_model: Option<String>,
+    /// 细节：每一处在哪儿、当时的规则、具体做了什么。**已打码**
+    pub detail: tw_api::SecurityHitDetail,
 }
 
-/// 读安全日志时的那段 SELECT。**上游、密钥、模型优先取请求那一行的。**
+/// 读安全日志时的那段 SELECT。**上游、密钥、模型、会话优先取请求那一行的。**
+///
+/// 发给上游的模型名也取请求那一行的，**只在它可能发到了上游时**（`tw_reached`，和密钥的
+/// 用量上限同一个判断）：被拒的、被规则挡下的一个字节都没发出去，那一行记着的名字是它
+/// 要发的，不是发了的。请求还没落库时退回记录自己的。
 const SECURITY_SELECT: &str =
     "SELECT e.id, e.at_ms, e.request_id, e.guard, e.rule, e.custom, e.action,
         COALESCE(NULLIF(r.provider, ''), e.provider),
@@ -1920,7 +1943,13 @@ const SECURITY_SELECT: &str =
         COALESCE(r.model, ''),
         e.tool, e.excerpt, e.count,
         r.client_hint, r.peer, r.key_masked,
-        e.matching, e.revealed
+        e.matching, e.revealed,
+        COALESCE(r.session, e.session),
+        CASE
+            WHEN r.id IS NULL THEN e.sent_model
+            WHEN tw_reached(r.routing, r.error IS NOT NULL) THEN NULLIF(r.sent_model, '')
+        END,
+        e.detail
      FROM security_events e LEFT JOIN requests r ON r.id = e.request_id";
 
 /// 安全日志按什么筛：`?1`–`?2` 这一段时间，`?3` 这一项（NULL 是全部）。
@@ -1947,6 +1976,11 @@ fn slug_col<T, I: rusqlite::RowIndex>(
 }
 
 fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventView> {
+    // 细节解不开是这一行坏了：表的样子变了要加 SCHEMA，不会读到别的样子
+    let detail: String = r.get(20)?;
+    let detail: tw_api::SecurityHitDetail = serde_json::from_str(&detail).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(20, rusqlite::types::Type::Text, e.into())
+    })?;
     Ok(tw_api::SecurityEventView {
         id: r.get(0)?,
         at_ms: r.get(1)?,
@@ -1969,6 +2003,13 @@ fn security_view(r: &rusqlite::Row) -> rusqlite::Result<tw_api::SecurityEventVie
         client_hint: r.get(13)?,
         peer: r.get(14)?,
         key_masked: r.get(15)?,
+        session: r.get(18)?,
+        sent_model: r.get(19)?,
+        direction: detail.direction,
+        locations: detail.locations,
+        more_locations: detail.more_locations,
+        rule_snapshot: detail.rule_snapshot,
+        outcome_detail: detail.outcome_detail,
     })
 }
 
@@ -3536,6 +3577,9 @@ mod security_log_tests {
             count: 1,
             matching: (guard == Guard::Content).then_some(tw_api::ContentMatch::Contains),
             revealed: None,
+            session: None,
+            sent_model: None,
+            detail: Default::default(),
         }
     }
 

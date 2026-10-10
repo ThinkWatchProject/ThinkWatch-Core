@@ -456,6 +456,8 @@ pub(crate) struct Admit {
     pub(crate) input_estimate: Option<u64>,
     /// 内容过滤的结论：开始之后挂在这一轮的号上报
     pub(crate) screening: tw_guard::content::Screening,
+    /// 每条命中的细节，和 `screening.hits` 一一对应（见 [`crate::guard::detail::content`]）
+    pub(crate) screened: Vec<tw_api::SecurityHitDetail>,
     /// 这一帧到的那一刻
     pub(crate) arrived: Instant,
     pub(crate) at_ms: u64,
@@ -525,7 +527,10 @@ pub(crate) async fn admit(a: Admit) -> Result<Turn, NotAdmitted> {
     hold.bind(id);
     ending.streaming(tw_dialect::ir::Dialect::Responses, &line.provider);
     // 拒绝的也在开始之后：被拒是一次来源为 `denied` 的失败，一个字节都不发
-    if let Some(why) = crate::guard::report(&state.bus, id, &line.provider, &a.screening) {
+    let details = a.screened.clone();
+    if let Some(why) =
+        crate::guard::report_with(&state.bus, id, &line.provider, &a.screening, details)
+    {
         ending.failed(tw_api::FailureSource::Denied, why.clone());
         return Err(NotAdmitted::Cut(why));
     }
