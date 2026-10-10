@@ -981,6 +981,60 @@ async fn checking_an_upstream_also_reads_its_balance() {
     assert_eq!(json(&body)["balance"], serde_json::Value::Null, "{body}");
 }
 
+/// 余额读得慢的中转站：模型清单马上回，用量接口一直不回
+async fn fake_relay_with_a_slow_balance() -> std::net::SocketAddr {
+    let app = axum::Router::new()
+        .route(
+            "/anthropic/v1/models",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::OK,
+                    r#"{"data":[{"id":"claude-sonnet-4-5"}]}"#.to_string(),
+                )
+            }),
+        )
+        .route(
+            "/v1/usage",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                (StatusCode::OK, "{}".to_string())
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    a
+}
+
+/// 余额读得慢：「检测连接」**最多等五秒**，到时候先交回检测结果，不带余额
+#[tokio::test]
+async fn checking_an_upstream_does_not_wait_long_for_its_balance() {
+    let b = bed(BASE);
+    let up = fake_relay_with_a_slow_balance().await;
+    let started = std::time::Instant::now();
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/provider-test",
+        serde_json::json!({ "provider": {
+            "name": "relay",
+            "base_url": format!("http://{up}/anthropic"),
+            "key": "sk-good",
+            "protocol": "anthropic",
+        }}),
+    )
+    .await;
+    let took = started.elapsed();
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["ok"], true, "{body}");
+    assert_eq!(v["balance"], serde_json::Value::Null, "{body}");
+    assert!(
+        took >= std::time::Duration::from_secs(5) && took < std::time::Duration::from_secs(8),
+        "{took:?}"
+    );
+}
+
 /// `balance` 写进配置；`auto` 不写。概览原样给回 `balance_setting`
 #[tokio::test]
 async fn the_balance_setting_is_saved_and_shown() {
@@ -1067,6 +1121,35 @@ async fn refreshing_a_balance_reads_it_now_and_the_overview_shows_it() {
         |e| matches!(e, tw_api::Event::BalanceUpdated { provider, .. } if provider == "relay"),
     );
     assert!(updated);
+}
+
+/// `auto` 的中转站没问成是哪一种（对方出错）：502，带着原因，不说「没有余额」
+#[tokio::test]
+async fn refreshing_an_upstream_that_could_not_be_asked_says_why() {
+    let app = axum::Router::new().route(
+        "/v1/usage",
+        axum::routing::get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "{}") }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let b = bed(&BASE.replace(
+        "    key: sk-official\n",
+        &format!(
+            "    key: sk-official\n  - name: relay\n    base_url: http://{up}/anthropic\n    key: sk-good\n    protocol: anthropic\n"
+        ),
+    ));
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/providers/relay/balance/refresh",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
+    let v = json(&body);
+    assert_eq!(v["code"], "gw.balance.status", "{body}");
+    assert_eq!(v["args"]["status"], "503", "{body}");
 }
 
 #[tokio::test]

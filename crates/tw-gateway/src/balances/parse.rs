@@ -55,54 +55,53 @@ fn stamp(n: f64) -> Option<u64> {
 
 // ---------------------------------------------------------------- OpenRouter
 
-/// `GET /api/v1/key` 的回答。
-#[derive(Debug, Clone, PartialEq)]
-pub enum OpenRouterKey {
-    /// 这把密钥设了额度：额度和用了多少
-    Limited(Reading),
-    /// 没设额度：要看账户的余额（`/api/v1/credits`）
-    Unlimited,
-}
-
-/// `{"data":{"limit":10,"limit_remaining":7.5,"usage":2.5,…}}`，美元。
+/// `GET /api/v1/key`：`{"data":{"limit":10,"limit_remaining":7.5,"limit_reset":"monthly",
+/// "usage":42.25,"usage_daily":0.5,"usage_monthly":2.5,"expires_at":null,…}}`，美元。
 ///
-/// **已用按额度减剩余算**：设了按天、按月重置的额度时，`usage` 是这把密钥从来用过的
-/// 总数，`limit_remaining` 才是这一期还剩多少。没给剩余时才用 `usage`
-pub fn openrouter_key(v: &Value) -> Option<OpenRouterKey> {
+/// - 设了额度（`limit` 不是 null）是总额度。**已用按额度减剩余算**：设了按天、按月重置的
+///   额度时，`usage` 是这把密钥从来用过的总数，`limit_remaining` 才是这一期还剩多少。没给
+///   剩余时才用 `usage`；
+/// - 花了多少：这个月的（`usage_monthly`），没给就是从来一共的（`usage`）；
+/// - `expires_at` 是到期时刻。
+///
+/// **没有钱包**：账户余额只有管理密钥问得到，能转发请求的密钥看不到
+pub fn openrouter(v: &Value) -> Option<Reading> {
     let data = v.get("data")?.as_object()?;
-    let limit = match data.get("limit") {
-        None | Some(Value::Null) => return Some(OpenRouterKey::Unlimited),
-        Some(l) => number(l)?,
+    let usage = data.get("usage").and_then(number);
+    let quota = match data.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(l) => {
+            let limit = number(l)?;
+            let used = match (data.get("limit_remaining").and_then(number), usage) {
+                (Some(remaining), _) => (limit - remaining).max(0.0),
+                (None, Some(usage)) => usage,
+                (None, None) => return None,
+            };
+            Some(BalanceQuota {
+                limit,
+                used,
+                unit: USD.to_string(),
+            })
+        }
     };
-    let used = match (
-        data.get("limit_remaining").and_then(number),
-        data.get("usage").and_then(number),
-    ) {
-        (Some(remaining), _) => (limit - remaining).max(0.0),
-        (None, Some(usage)) => usage,
-        (None, None) => return None,
-    };
-    Some(OpenRouterKey::Limited(Reading {
-        quota: Some(BalanceQuota {
-            limit,
-            used,
-            unit: USD.to_string(),
-        }),
-        ..Default::default()
-    }))
-}
-
-/// `GET /api/v1/credits`：`{"data":{"total_credits":20,"total_usage":12.5}}`，美元。
-/// 钱包是买过的减用掉的
-pub fn openrouter_credits(v: &Value) -> Option<Reading> {
-    let data = v.get("data")?;
-    let credits = number(data.get("total_credits")?)?;
-    let usage = number(data.get("total_usage")?)?;
+    let spent = match data.get("usage_monthly").and_then(number) {
+        Some(month) => Some((month, SpentPeriod::Month)),
+        None => usage.map(|total| (total, SpentPeriod::Total)),
+    }
+    .map(|(amount, period)| Spent {
+        amount,
+        currency: USD.to_string(),
+        period,
+        scope: None,
+    });
+    // 额度和花费都说不出来的，不是这个接口的回答
+    if quota.is_none() && spent.is_none() {
+        return None;
+    }
     Some(Reading {
-        wallet: Some(Money {
-            amount: credits - usage,
-            currency: USD.to_string(),
-        }),
+        quota,
+        spent,
+        expires_at_ms: data.get("expires_at").and_then(moment),
         ..Default::default()
     })
 }
@@ -170,7 +169,8 @@ pub fn is_sub2api(v: &Value) -> bool {
 ///   或者钱包余额（`balance`）。
 ///
 /// 金额的单位看顶层的 `unit`，没写是美元。`expires_at` 是到期时刻。用量明细里只取今天
-/// 花了多少（`usage.today.cost`），别的（`daily_usage`、`model_stats`）不要
+/// 花了多少：**实际扣的**（`usage.today.actual_cost`，按分组倍率算过的），没给才用按标价
+/// 算的 `cost`；别的（`daily_usage`、`model_stats`）不要
 pub fn sub2api(v: &Value) -> Option<Reading> {
     let mode = v.get("mode")?.as_str()?;
     let unit = v
@@ -187,8 +187,12 @@ pub fn sub2api(v: &Value) -> Option<Reading> {
             .or_else(|| v.get("subscription")?.get("expires_at").and_then(moment)),
         spent: v
             .get("usage")
-            .and_then(|u| u.get("today")?.get("cost"))
-            .and_then(number)
+            .and_then(|u| u.get("today"))
+            .and_then(|t| {
+                t.get("actual_cost")
+                    .and_then(number)
+                    .or_else(|| t.get("cost").and_then(number))
+            })
             .map(|amount| Spent {
                 amount,
                 currency: unit.clone(),
@@ -256,8 +260,13 @@ pub fn sub2api(v: &Value) -> Option<Reading> {
 
 // ---------------------------------------------------------------- New API / One API
 
-/// 「不限额度」的密钥报的总额度就是这个数（或者更大）
+/// 「不限额度」的密钥报的总额度就是这个数（New API 和 One API 都写死成它）
 const UNLIMITED: f64 = 100_000_000.0;
+
+/// 数是按 token 计的（New API 站点的额度按 token 显示）
+pub const TOKENS: &str = "tokens";
+/// 说不清数是按什么计的：站点没说它的额度怎么显示
+pub const UNKNOWN: &str = "unknown";
 
 /// 这是 New API / One API 的账单接口吗：有 `hard_limit_usd` 或 `system_hard_limit_usd`
 pub fn is_newapi(v: &Value) -> bool {
@@ -270,22 +279,59 @@ fn hard_limit(v: &Value) -> Option<f64> {
         .or_else(|| v.get("system_hard_limit_usd").and_then(number))
 }
 
-/// `GET /v1/dashboard/billing/subscription`（总额度 `hard_limit_usd`，美元；到期
-/// `access_until`，Unix 秒，0 是不到期）加 `GET /v1/dashboard/billing/usage`（已用
-/// `total_usage`，**美分**）。
+/// New API / One API 账单接口里的数是按什么计的，看站点的状态接口（`GET /api/status`，
+/// 公开的）：`{"success":true,"data":{"quota_display_type":"CNY","display_in_currency":true,…}}`。
 ///
-/// 不限额度的密钥（总额度 ≥ 1 亿）没有额度可言，只说得出花了多少
-pub fn newapi(subscription: &Value, usage: &Value) -> Option<Reading> {
+/// 账单接口**按站点的额度显示方式折算**，字段名里的 `usd` 不作数：
+/// - `quota_display_type`（New API 新版）：`USD` 是美元；`CNY` 是人民币；`TOKENS` 是 token；
+///   `CUSTOM`（自定义货币）在账单接口里仍按美元折算，是美元；
+/// - 没有它的（New API 旧版、One API）看 `display_in_currency`：是 true 按美元折算，
+///   false 是 token；
+/// - 都说不出来的是 [`UNKNOWN`]，**不当作美元**：猜错了，一个 token 数就成了一笔钱
+pub fn newapi_unit(status: &Value) -> &'static str {
+    let Some(data) = status.get("data") else {
+        return UNKNOWN;
+    };
+    let in_currency = data.get("display_in_currency").and_then(Value::as_bool);
+    match data.get("quota_display_type").and_then(Value::as_str) {
+        Some("USD" | "CUSTOM") => USD,
+        Some("CNY") => "CNY",
+        Some("TOKENS") => TOKENS,
+        // 不认识的显示方式：只说得出是不是 token
+        Some(_) => match in_currency {
+            Some(false) => TOKENS,
+            _ => UNKNOWN,
+        },
+        None => match in_currency {
+            Some(true) => USD,
+            Some(false) => TOKENS,
+            None => UNKNOWN,
+        },
+    }
+}
+
+/// `GET /v1/dashboard/billing/subscription`（总额度 `hard_limit_usd`；到期 `access_until`，
+/// Unix 秒，0 是不到期）加 `GET /v1/dashboard/billing/usage`（已用 `total_usage`，**乘过
+/// 100**，美元时是美分）。单位 `unit` 是 [`newapi_unit`] 问出来的，两个接口一样。
+///
+/// 不限额度的密钥报的总额度是 1 亿，没有额度可言，只说得出花了多少。按钱计的，1 亿以上
+/// 都不会是真的额度；**按 token 计（或者不知道按什么计）的只认正好 1 亿**：比它大的
+/// token 额度是真的
+pub fn newapi(subscription: &Value, usage: &Value, unit: &str) -> Option<Reading> {
     let limit = hard_limit(subscription)?;
     let used = number(usage.get("total_usage")?)? / 100.0;
     let mut r = Reading {
         expires_at_ms: subscription.get("access_until").and_then(moment),
         ..Default::default()
     };
-    if limit >= UNLIMITED {
+    let unlimited = match unit {
+        TOKENS | UNKNOWN => limit == UNLIMITED,
+        _ => limit >= UNLIMITED,
+    };
+    if unlimited {
         r.spent = Some(Spent {
             amount: used,
-            currency: USD.to_string(),
+            currency: unit.to_string(),
             period: SpentPeriod::Total,
             scope: None,
         });
@@ -293,7 +339,7 @@ pub fn newapi(subscription: &Value, usage: &Value) -> Option<Reading> {
         r.quota = Some(BalanceQuota {
             limit,
             used,
-            unit: USD.to_string(),
+            unit: unit.to_string(),
         });
     }
     Some(r)
@@ -390,51 +436,76 @@ mod tests {
 
     // ------------------------------------------------------------ OpenRouter
 
-    #[test]
-    fn an_openrouter_key_with_a_limit_reads_as_a_quota() {
-        let r = openrouter_key(&json(
-            r#"{"data":{"label":"sk-or-v1-abc...xyz","limit":10,"limit_remaining":7.5,"limit_reset":"monthly","usage":42.25,"is_free_tier":false}}"#,
-        ));
-        // **已用是这一期的**：额度 10、剩 7.5，用了 2.5；42.25 是这把密钥从来用过的
-        assert_eq!(
-            r,
-            Some(OpenRouterKey::Limited(Reading {
-                quota: Some(BalanceQuota {
-                    limit: 10.0,
-                    used: 2.5,
-                    unit: "USD".into()
-                }),
-                ..Default::default()
-            }))
-        );
-        // 没给剩余就用 usage
-        let r = openrouter_key(&json(r#"{"data":{"limit":10,"usage":4}}"#));
-        let Some(OpenRouterKey::Limited(r)) = r else {
-            panic!("{r:?}")
-        };
-        assert_eq!(r.quota.unwrap().used, 4.0);
+    /// 设了额度的密钥，照 `/api/v1/key` 真实回答的字段写
+    const OPENROUTER_LIMITED: &str = r#"{"data":{"label":"sk-or-v1-abc...xyz","limit":10,"limit_remaining":7.5,"limit_reset":"monthly","include_byok_in_limit":false,
+        "usage":42.25,"usage_daily":0.5,"usage_weekly":1.75,"usage_monthly":2.5,
+        "byok_usage":0,"byok_usage_daily":0,"byok_usage_weekly":0,"byok_usage_monthly":0,
+        "is_free_tier":false,"is_management_key":false,"is_provisioning_key":false,
+        "expires_at":"2027-01-01T00:00:00Z","creator_user_id":"user_x","organization_id":null,"workspace_id":null,
+        "allowed_data_regions":["global"],"free_model_daily_requests":{"limit":1000,"used":0,"remaining":1000},
+        "rate_limit":{"requests":-1,"interval":"10s","note":"deprecated"}}}"#;
+
+    /// 没设额度的密钥：大多数密钥都是这样
+    const OPENROUTER_UNLIMITED: &str = r#"{"data":{"label":"sk-or-v1-def...uvw","limit":null,"limit_remaining":null,"limit_reset":null,"include_byok_in_limit":false,
+        "usage":3.1,"usage_daily":0.2,"usage_weekly":0.9,"usage_monthly":1.4,
+        "byok_usage":0,"byok_usage_daily":0,"byok_usage_weekly":0,"byok_usage_monthly":0,
+        "is_free_tier":false,"is_management_key":false,"is_provisioning_key":false,
+        "creator_user_id":"user_x","organization_id":null,"workspace_id":null,
+        "allowed_data_regions":["global"],"free_model_daily_requests":{"limit":1000,"used":3,"remaining":997},
+        "rate_limit":{"requests":-1,"interval":"10s","note":"deprecated"}}}"#;
+
+    fn spent_usd(amount: f64, period: SpentPeriod) -> Option<Spent> {
+        Some(Spent {
+            amount,
+            currency: "USD".into(),
+            period,
+            scope: None,
+        })
     }
 
     #[test]
-    fn an_openrouter_key_without_a_limit_needs_the_account_credits() {
+    fn an_openrouter_key_with_a_limit_reads_as_a_quota() {
+        let r = openrouter(&json(OPENROUTER_LIMITED)).unwrap();
+        // **已用是这一期的**：额度 10、剩 7.5，用了 2.5；42.25 是这把密钥从来用过的
         assert_eq!(
-            openrouter_key(&json(
-                r#"{"data":{"label":"x","limit":null,"limit_remaining":null,"usage":3.1}}"#
-            )),
-            Some(OpenRouterKey::Unlimited)
+            r.quota,
+            Some(BalanceQuota {
+                limit: 10.0,
+                used: 2.5,
+                unit: "USD".into()
+            })
         );
-        let r = openrouter_credits(&json(r#"{"data":{"total_credits":20,"total_usage":12.5}}"#))
-            .unwrap();
-        assert_eq!(r.wallet, usd(7.5));
+        assert_eq!(r.spent, spent_usd(2.5, SpentPeriod::Month));
+        assert_eq!(r.expires_at_ms, Some(ms("2027-01-01T00:00:00Z")));
+        assert_eq!(r.wallet, None);
+        // 没给剩余就用 usage；没给这个月的，花费是从来一共的
+        let r = openrouter(&json(r#"{"data":{"limit":10,"usage":4}}"#)).unwrap();
+        assert_eq!(r.quota.unwrap().used, 4.0);
+        assert_eq!(r.spent, spent_usd(4.0, SpentPeriod::Total));
+    }
+
+    /// 没设额度：**只说得出花了多少**，没有钱包 —— 账户余额这把密钥问不到
+    #[test]
+    fn an_openrouter_key_without_a_limit_says_what_it_spent() {
+        let r = openrouter(&json(OPENROUTER_UNLIMITED)).unwrap();
+        assert_eq!(
+            r,
+            Reading {
+                spent: spent_usd(1.4, SpentPeriod::Month),
+                ..Default::default()
+            }
+        );
+        let r = openrouter(&json(r#"{"data":{"limit":null,"usage":3.1}}"#)).unwrap();
+        assert_eq!(r.spent, spent_usd(3.1, SpentPeriod::Total));
         assert_eq!(r.quota, None);
     }
 
     #[test]
     fn an_openrouter_answer_it_cannot_read_is_none() {
-        assert_eq!(openrouter_key(&json(r#"{"error":"nope"}"#)), None);
-        assert_eq!(openrouter_key(&json(r#"{"data":{"limit":"ten"}}"#)), None);
-        assert_eq!(openrouter_key(&json(r#"{"data":{"limit":10}}"#)), None);
-        assert_eq!(openrouter_credits(&json(r#"{"data":{}}"#)), None);
+        assert_eq!(openrouter(&json(r#"{"error":"nope"}"#)), None);
+        assert_eq!(openrouter(&json(r#"{"data":{"limit":"ten"}}"#)), None);
+        assert_eq!(openrouter(&json(r#"{"data":{"limit":10}}"#)), None);
+        assert_eq!(openrouter(&json(r#"{"data":{"limit":null}}"#)), None);
     }
 
     // ------------------------------------------------------------ DeepSeek
@@ -511,7 +582,7 @@ mod tests {
     fn a_sub2api_wallet_reads_as_a_wallet() {
         let v = json(
             r#"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","unit":"USD","balance":12.3456,"remaining":12.3456,
-                "usage":{"today":{"requests":3,"cost":0.12},"total":{"requests":90,"cost":7.65}},
+                "usage":{"today":{"requests":3,"cost":0.12,"actual_cost":0.096},"total":{"requests":90,"cost":7.65,"actual_cost":6.12}},
                 "daily_usage":[{"date":"2026-10-10","cost":0.12}],
                 "model_stats":[{"model":"claude-sonnet-4-5","requests":3}]}"#,
         );
@@ -522,16 +593,22 @@ mod tests {
         assert_eq!(r.quota, None);
         assert!(r.windows.is_empty());
         assert_eq!(r.expires_at_ms, None);
-        // 今天花了多少
+        // 今天花了多少：**实际扣的**，不是按标价算的 0.12
         assert_eq!(
             r.spent,
             Some(Spent {
-                amount: 0.12,
+                amount: 0.096,
                 currency: "USD".into(),
                 period: SpentPeriod::Today,
                 scope: None,
             })
         );
+        // 没给实际扣的：按标价算的
+        let r = sub2api(&json(
+            r#"{"mode":"unrestricted","balance":1,"usage":{"today":{"requests":3,"cost":0.12}}}"#,
+        ))
+        .unwrap();
+        assert_eq!(r.spent.unwrap().amount, 0.12);
     }
 
     #[test]
@@ -614,7 +691,12 @@ mod tests {
             r#"{"object":"billing_subscription","has_payment_method":true,"soft_limit_usd":25,"hard_limit_usd":25,"system_hard_limit_usd":25,"access_until":1798675200}"#,
         );
         assert!(is_newapi(&sub));
-        let r = newapi(&sub, &json(r#"{"object":"list","total_usage":1234.5}"#)).unwrap();
+        let r = newapi(
+            &sub,
+            &json(r#"{"object":"list","total_usage":1234.5}"#),
+            "USD",
+        )
+        .unwrap();
         // 已用是美分
         assert_eq!(
             r.quota,
@@ -633,17 +715,9 @@ mod tests {
         let sub = json(
             r#"{"object":"billing_subscription","hard_limit_usd":100000000,"system_hard_limit_usd":100000000,"access_until":0}"#,
         );
-        let r = newapi(&sub, &json(r#"{"total_usage":500}"#)).unwrap();
+        let r = newapi(&sub, &json(r#"{"total_usage":500}"#), "USD").unwrap();
         assert_eq!(r.quota, None, "1 亿美元不是一个额度");
-        assert_eq!(
-            r.spent,
-            Some(Spent {
-                amount: 5.0,
-                currency: "USD".into(),
-                period: SpentPeriod::Total,
-                scope: None,
-            })
-        );
+        assert_eq!(r.spent, spent_usd(5.0, SpentPeriod::Total));
         assert_eq!(r.expires_at_ms, None, "0 是不到期");
     }
 
@@ -651,10 +725,119 @@ mod tests {
     fn the_system_hard_limit_is_enough_to_recognize_newapi() {
         let sub = json(r#"{"system_hard_limit_usd":7}"#);
         assert!(is_newapi(&sub));
-        let r = newapi(&sub, &json(r#"{"total_usage":100}"#)).unwrap();
+        let r = newapi(&sub, &json(r#"{"total_usage":100}"#), "USD").unwrap();
         assert_eq!(r.quota.unwrap().limit, 7.0);
         assert!(!is_newapi(&json(r#"{"object":"billing_subscription"}"#)));
-        assert_eq!(newapi(&sub, &json(r#"{"object":"list"}"#)), None);
+        assert_eq!(newapi(&sub, &json(r#"{"object":"list"}"#), "USD"), None);
+    }
+
+    /// 站点的状态接口：照 New API 新版、旧版和 One API 回答里的那两个字段写
+    fn status(data: &str) -> Value {
+        json(&format!(
+            r#"{{"success":true,"message":"","data":{{"version":"v0.9.0","system_name":"New API",{data}"quota_per_unit":500000}}}}"#
+        ))
+    }
+
+    #[test]
+    fn the_newapi_unit_is_the_display_type_of_the_site() {
+        let unit = |data: &str| newapi_unit(&status(data));
+        assert_eq!(
+            unit(r#""quota_display_type":"USD","display_in_currency":true,"#),
+            "USD"
+        );
+        assert_eq!(
+            unit(
+                r#""quota_display_type":"CNY","display_in_currency":true,"usd_exchange_rate":7.3,"#
+            ),
+            "CNY"
+        );
+        assert_eq!(
+            unit(r#""quota_display_type":"TOKENS","display_in_currency":false,"#),
+            "tokens"
+        );
+        // 自定义货币只在网页上换算，账单接口仍按美元折算
+        assert_eq!(
+            unit(
+                r#""quota_display_type":"CUSTOM","display_in_currency":true,"custom_currency_symbol":"€","#
+            ),
+            "USD"
+        );
+        // 旧版和 One API 只有 display_in_currency
+        assert_eq!(unit(r#""display_in_currency":true,"#), "USD");
+        assert_eq!(unit(r#""display_in_currency":false,"#), "tokens");
+        // 说不出来的：不知道，**不当作美元**
+        assert_eq!(unit(""), "unknown");
+        assert_eq!(
+            unit(r#""quota_display_type":"POINTS","display_in_currency":true,"#),
+            "unknown"
+        );
+        assert_eq!(
+            unit(r#""quota_display_type":"POINTS","display_in_currency":false,"#),
+            "tokens"
+        );
+        assert_eq!(newapi_unit(&json(r#"{"error":"not found"}"#)), "unknown");
+    }
+
+    #[test]
+    fn a_newapi_site_in_yuan_reads_in_yuan() {
+        let sub = json(r#"{"hard_limit_usd":73,"access_until":0}"#);
+        let r = newapi(&sub, &json(r#"{"total_usage":1460}"#), "CNY").unwrap();
+        assert_eq!(
+            r.quota,
+            Some(BalanceQuota {
+                limit: 73.0,
+                used: 14.6,
+                unit: "CNY".into()
+            })
+        );
+    }
+
+    /// 按 token 计：数是 token；**只有正好 1 亿是不限额度**，比它大的 token 额度是真的
+    #[test]
+    fn a_newapi_site_in_tokens_reads_in_tokens() {
+        let r = newapi(
+            &json(r#"{"hard_limit_usd":500000000}"#),
+            &json(r#"{"total_usage":12000000000}"#),
+            "tokens",
+        )
+        .unwrap();
+        assert_eq!(
+            r.quota,
+            Some(BalanceQuota {
+                limit: 500_000_000.0,
+                used: 120_000_000.0,
+                unit: "tokens".into()
+            })
+        );
+        let r = newapi(
+            &json(r#"{"hard_limit_usd":100000000}"#),
+            &json(r#"{"total_usage":250000}"#),
+            "tokens",
+        )
+        .unwrap();
+        assert_eq!(r.quota, None);
+        assert_eq!(
+            r.spent,
+            Some(Spent {
+                amount: 2500.0,
+                currency: "tokens".into(),
+                period: SpentPeriod::Total,
+                scope: None,
+            })
+        );
+    }
+
+    /// 不知道按什么计：单位照实说不知道，数照给
+    #[test]
+    fn a_newapi_site_that_does_not_say_has_an_unknown_unit() {
+        let r = newapi(
+            &json(r#"{"hard_limit_usd":300000000}"#),
+            &json(r#"{"total_usage":100}"#),
+            "unknown",
+        )
+        .unwrap();
+        let q = r.quota.unwrap();
+        assert_eq!((q.limit, q.unit.as_str()), (300_000_000.0, "unknown"));
     }
 
     // ------------------------------------------------------------ ThinkWatch

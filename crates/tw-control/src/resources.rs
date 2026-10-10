@@ -232,6 +232,9 @@ async fn preview_provider(
     }))
 }
 
+/// 「检测连接」顺带读余额最多等多久
+const CHECK_BALANCE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 检测一个上游，**不保存**。
 ///
 /// 走的出站路径和转发完全一样：同一个构造 client 的函数、同一套凭据取法。
@@ -305,9 +308,14 @@ async fn test_provider(
         tw_gateway::probe(&http, &p.base_url, &headers, protocol).await
     };
     // 通了就顺带读一次余额（`auto` 的先认是哪一种）。不通的不读：地址或凭据不对，
-    // 余额也读不到，只是多等一会儿
+    // 余额也读不到，只是多等一会儿。**最多等 [`CHECK_BALANCE_WAIT`]**：认来源加读最多三个
+    // 请求、每个最多等十秒，检测结果不该陪着等半分钟；没读完的就不带余额，保存下来的上游
+    // 由后台照常读（读到了报 `balance_updated`）
     let balance = if r.ok {
-        s.gateway.check_balance(&http, &p).await
+        tokio::time::timeout(CHECK_BALANCE_WAIT, s.gateway.check_balance(&http, &p))
+            .await
+            .ok()
+            .flatten()
     } else {
         None
     };
@@ -323,7 +331,8 @@ async fn test_provider(
 }
 
 /// 马上读一次这家的余额。没有这一家是 404（`control.upstream_not_found`），它没有余额
-/// 可读也是 404（`control.balance_none`）
+/// 可读也是 404（`control.balance_none`）。`auto` 的这一家没问成是哪一种中转站（连不上、
+/// 超时、对方出错）是 502，带着没问成的原因（`gw.balance.*`）：那不是「没有余额」
 async fn refresh_balance(
     State(s): State<ControlState>,
     Path(name): Path<String>,
@@ -332,8 +341,9 @@ async fn refresh_balance(
         return Err(crate::no_such_upstream(&name));
     }
     match s.gateway.refresh_balance(&name).await {
-        Some(b) => Ok(Json(b)),
-        None => Err(fail(
+        Ok(Some(b)) => Ok(Json(b)),
+        Err(why) => Err(fail(StatusCode::BAD_GATEWAY, why)),
+        Ok(None) => Err(fail(
             StatusCode::NOT_FOUND,
             msg!(
                 "control.balance_none", upstream = &name =>
