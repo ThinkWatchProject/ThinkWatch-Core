@@ -29,6 +29,7 @@ pub mod glm;
 pub mod guard;
 pub mod health;
 pub mod hint;
+pub mod inflate;
 pub mod key_limits;
 pub mod l1;
 pub mod l3;

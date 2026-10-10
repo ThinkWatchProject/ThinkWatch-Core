@@ -101,7 +101,7 @@ async fn passthrough(
     RawQuery(query): RawQuery,
     // **必须排在 `body` 前面。**`body` 拿走的是整个请求
     crate::ws::MaybeUpgrade(upgrade): crate::ws::MaybeUpgrade,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     // **这里还没读。**过完来源和密钥检查才读（见 `intake`）
     body: axum::body::Body,
 ) -> Result<Response, GatewayError> {
@@ -188,8 +188,9 @@ async fn passthrough(
     // 交给管线里每一条 `return Err` 各自去报的话，漏掉一条的后果不是没报，
     // 而是被 Drop 报成「客户端取消」—— 一次策略拒绝会记到客户端头上。
     let mut ending: Option<crate::ending::Ending> = None;
-    // **到这里才读体**：来源、密钥、方法都过了。超了上限的还没有开始事件，不记一行
-    let body = intake::read(&headers, body, intake::MAX_BODY)
+    // **到这里才读体**：来源、密钥、方法都过了。超了上限的还没有开始事件，不记一行。
+    // 压缩过的在这里解开（`Content-Encoding` 一并摘掉），往下就是一个没压缩的请求
+    let body = intake::read(&mut headers, body, intake::MAX_BODY)
         .await
         .map_err(|e| e.in_dialect(dialect))?;
     // 手动中止的开关（见 `crate::abort`）。管线发出开始事件时登记上它

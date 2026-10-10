@@ -374,9 +374,12 @@ gw.probe.key_rejected
 gw.probe.request_failed
 gw.probe.timeout
 gw.request.aborted
+gw.request.bad_encoding
 gw.request.body_declared_too_large
 gw.request.body_over_limit
 gw.request.body_unreadable
+gw.request.decoded_body_over_limit
+gw.request.unsupported_encoding
 gw.route.all_selected_disabled
 gw.route.denied
 gw.route.failed

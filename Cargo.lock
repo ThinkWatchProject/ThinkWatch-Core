@@ -3283,6 +3283,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "flate2",
  "futures",
  "http",
  "http-body-util",
