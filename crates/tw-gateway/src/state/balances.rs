@@ -1,7 +1,7 @@
 //! 上游的余额：读谁、什么时候读、读到的怎么告诉界面（见 [`crate::balances`]）。
 
 use super::AppState;
-use crate::balances::{self, Plan, Step, Why};
+use crate::balances::{self, Claim, Detection, Plan, Step, Why};
 use crate::server::now_ms;
 
 /// 一家要读余额的上游：怎么读、凭什么读。
@@ -57,65 +57,109 @@ impl AppState {
     }
 
     /// 到了时候的都去读，每家一个任务（见 [`crate::balances::tracker`]）。后台不等它们；
-    /// 测试等
+    /// 测试等。
+    ///
+    /// **配置和 client 取自同一份运行时**：分两次取，中间换了配置，就可能拿着这一份的密钥
+    /// 配上另一份的 client（没有这一家的 client 时退回的默认 client 不走它的代理）
     pub fn start_due_balances(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        let cfg = self.config();
+        let rt = self.runtime();
         self.balances
-            .retain(|name| cfg.providers.iter().any(|p| p.name == name));
-        cfg.providers
+            .retain(|name| rt.config.providers.iter().any(|p| p.name == name));
+        rt.config
+            .providers
             .iter()
             .filter_map(|p| {
                 let t = self.saved_target(p)?;
-                let step = self
+                let http = rt.clients.get(&p.name)?.clone();
+                let claim = self
                     .balances
                     .claim(&p.name, &t.ident, t.plan, Why::Due, now_ms())?;
                 let state = self.clone();
-                let (name, base_url) = (p.name.clone(), p.base_url.clone());
+                let base_url = p.base_url.clone();
                 Some(tokio::spawn(async move {
-                    state.run_balance(&name, &base_url, t, step).await;
+                    let _ = state.run_balance(http, base_url, t.auth, claim).await;
                 }))
             })
             .collect()
     }
 
-    /// 界面要：马上读这一家，`auto` 而没认出来的再问一次。`None`：没有这一家，或者它
-    /// 没有余额可读
-    pub async fn refresh_balance(&self, name: &str) -> Option<tw_api::Balance> {
-        let cfg = self.config();
-        let p = cfg.providers.iter().find(|p| p.name == name)?;
-        let t = self.saved_target(p)?;
-        let step = self
-            .balances
-            .claim(name, &t.ident, t.plan, Why::Demand, now_ms())?;
-        self.run_balance(name, &p.base_url, t, step).await.flatten()
-    }
-
-    /// 做一步、记下来；读过了就报一条 `balance_updated`。交回这一家现在的余额；凭据在这
-    /// 中间换了的话是 `None`
-    async fn run_balance(
+    /// 界面要：马上读这一家，`auto` 而没认出来的再问一次。
+    ///
+    /// - `Ok(Some)`：读到的（没读成的话带着原因，留着上一次读到的）；
+    /// - `Ok(None)`：没有这一家，或者它没有余额可读（两种中转站都不是）；
+    /// - `Err`：`auto` 的这一家**没问成**是哪一种（连不上、超时、对方出错），没问成的原因。
+    ///
+    /// **读在自己的任务里**：界面那头断开了（这个 future 被丢掉），这一次照样读完、记下、
+    /// 报 `balance_updated`，这一家也不会一直算作「正在读」
+    pub async fn refresh_balance(
         &self,
         name: &str,
-        base_url: &str,
-        t: Target,
-        step: Step,
-    ) -> Option<Option<tw_api::Balance>> {
-        // 这一家自己的 client：走它该走的代理
-        let http = self.client_for(name);
-        let outcome = balances::run(&http, step, base_url, &t.auth).await;
+    ) -> Result<Option<tw_api::Balance>, tw_types::Msg> {
+        let rt = self.runtime();
+        let Some(p) = rt.config.providers.iter().find(|p| p.name == name) else {
+            return Ok(None);
+        };
+        let Some(t) = self.saved_target(p) else {
+            return Ok(None);
+        };
+        let Some(http) = rt.clients.get(name).cloned() else {
+            return Ok(None);
+        };
+        let Some(claim) = self
+            .balances
+            .claim(name, &t.ident, t.plan, Why::Demand, now_ms())
+        else {
+            return Ok(None);
+        };
+        let state = self.clone();
+        let base_url = p.base_url.clone();
+        let read =
+            tokio::spawn(async move { state.run_balance(http, base_url, t.auth, claim).await });
+        match read.await {
+            Ok(r) => r,
+            // 读的代码 panic 了：照原样抛出去，和在这里直接读一样
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// 做一步、记下来；读过了就报一条 `balance_updated`。交回同 [`Self::refresh_balance`]；
+    /// 凭据在这中间换了的话是 `Ok(None)`
+    async fn run_balance(
+        &self,
+        http: reqwest::Client,
+        base_url: String,
+        auth: String,
+        claim: Claim,
+    ) -> Result<Option<tw_api::Balance>, tw_types::Msg> {
+        let name = claim.provider().to_string();
+        let outcome = balances::run(&http, claim.step(), &base_url, &auth).await;
         let read = outcome.read.is_some();
         if let Some((_, Err(why))) = &outcome.read {
             tracing::debug!(provider = name, "the balance could not be read: {why}");
         }
+        let undecided = match &outcome.detection {
+            Some(Detection::Undecided(why)) => {
+                tracing::debug!(provider = name, "the balance source is undecided: {why}");
+                Some(why.clone())
+            }
+            _ => None,
+        };
         let now = now_ms();
-        let left = self.balances.settle(name, &t.ident, outcome, now)?;
+        let Some(left) = claim.settle(outcome, now) else {
+            return Ok(None);
+        };
         if read {
             self.bus.emit(tw_api::Event::BalanceUpdated {
                 id: self.bus.next_id(),
-                provider: name.to_string(),
+                provider: name,
                 at_ms: now,
             });
         }
-        Some(left)
+        match undecided {
+            Some(why) => Err(why),
+            None => Ok(left),
+        }
     }
 
     /// 检测一家（可能还没保存的）上游时顺带读一次余额，`auto` 的先认是哪一种。**不记**：

@@ -893,7 +893,8 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `balance`（不给是 `auto`），[`ProviderTestResult`] 多了 `balance`（检测时顺带读一次）。
 /// 新事件 [`Event::BalanceUpdated`]：一家的余额读过了，重读它的视图。新端点
 /// `POST /providers/{name}/balance/refresh`（→ [`Balance`]）马上读一次；没有余额可读是 404
-/// （`control.balance_none`）。读失败的原因是 `gw.balance.*`。配置里的 `balance:` 写了不认识的
+/// （`control.balance_none`），`auto` 的没问成是哪一种中转站是 502（原因是 `gw.balance.*`）。
+/// 读失败的原因是 `gw.balance.*`。配置里的 `balance:` 写了不认识的
 /// 取值时加载不了（`config.unknown_variant`，一键修复改回 `auto`）。照 45 写的界面不认这个事件。
 pub const CONTROL_API_VERSION: u32 = 46;
 
@@ -4740,7 +4741,7 @@ pub struct ProviderQuota {
 slug_enum! {
     /// 上游的余额从哪个接口读。每一种都用这家上游自己的密钥、走它自己的出站设置。
     pub enum BalanceSource {
-        /// OpenRouter：这把密钥的额度（`/api/v1/key`），没有额度时是账户余额（`/api/v1/credits`）
+        /// OpenRouter：这把密钥的额度和花费（`/api/v1/key`）。账户余额只有管理密钥问得到，不读
         Openrouter = "openrouter",
         /// DeepSeek 开放平台的账户余额（`/user/balance`）
         Deepseek = "deepseek",
@@ -4748,7 +4749,8 @@ slug_enum! {
         Moonshot = "moonshot",
         /// Sub2API 中转站的用量接口（`/v1/usage`）
         Sub2api = "sub2api",
-        /// New API / One API 中转站的账单接口（`/v1/dashboard/billing/...`）
+        /// New API / One API 中转站的账单接口（`/v1/dashboard/billing/...`），单位看站点的
+        /// 状态接口（`/api/status`）
         Newapi = "newapi",
         /// ThinkWatch 企业网关的密钥用量接口（`/v1/usage`）
         Thinkwatch = "thinkwatch",
@@ -4806,7 +4808,8 @@ pub struct Balance {
     /// 密钥或套餐什么时候到期，Unix 毫秒。不会到期、上游没说都是空
     pub expires_at_ms: Option<u64>,
     /// 已经花了多少，和算的是哪一段时间：没有上限可比时说得出的就是它（New API 不限
-    /// 额度的密钥、Sub2API 今天的花费、企业网关这个月的花费）
+    /// 额度的密钥、OpenRouter 这把密钥这个月的花费、Sub2API 今天实际扣的、企业网关这个月的
+    /// 花费）
     pub spent: Option<Spent>,
     /// 最近一次没读成的原因。读成了是空
     pub error: Option<Msg>,
@@ -4836,6 +4839,8 @@ slug_enum! {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Spent {
     pub amount: f64,
+    /// `USD`、`CNY` 这样的货币代码。New API 站点的额度按 token 显示时是 `tokens`（花掉的是
+    /// token，不是钱），站点没说怎么显示时是 `unknown`（只是一个数）
     pub currency: String,
     pub period: SpentPeriod,
     /// 花的是谁的：这把密钥自己的，还是它所属的用户整体的（几把密钥合计）。只有企业网关
@@ -4859,7 +4864,8 @@ slug_enum! {
 pub struct BalanceQuota {
     pub limit: f64,
     pub used: f64,
-    /// `USD` / `CNY` / `tokens` / `requests`
+    /// `USD` / `CNY` / `tokens` / `requests`，或者 `unknown`：上游没说数是按什么计的
+    /// （New API 站点的状态接口说不出它的额度怎么显示），只是一个数，**不是美元**
     pub unit: String,
 }
 

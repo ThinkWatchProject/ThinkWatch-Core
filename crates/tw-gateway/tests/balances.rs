@@ -25,11 +25,12 @@ struct Seen {
     accept: String,
 }
 
-/// 一台假服务器：每个路径回什么（没写的是 404），收到过什么
+/// 一台假服务器：每个路径回什么（没写的是 404），收到过什么；扣着的路径等放行了才回
 #[derive(Default)]
 struct Fake {
     answers: Mutex<HashMap<String, (u16, String)>>,
     seen: Mutex<Vec<Seen>>,
+    holds: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Fake {
@@ -38,6 +39,15 @@ impl Fake {
             .lock()
             .unwrap()
             .insert(path.to_string(), (status, body.to_string()));
+    }
+    /// 这个路径的请求收下、先不回，等放行（`add_permits`）
+    fn hold(&self, path: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        self.holds
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), gate.clone());
+        gate
     }
     fn paths(&self) -> Vec<String> {
         self.seen
@@ -71,6 +81,10 @@ async fn handle(State(f): State<Arc<Fake>>, uri: Uri, h: HeaderMap) -> axum::res
         user_agent: header("user-agent"),
         accept: header("accept"),
     });
+    let gate = f.holds.lock().unwrap().get(uri.path()).cloned();
+    if let Some(gate) = gate {
+        gate.acquire().await.unwrap().forget();
+    }
     let (status, body) = f
         .answers
         .lock()
@@ -129,6 +143,26 @@ fn balance(state: &tw_gateway::AppState) -> Option<tw_api::Balance> {
     state.balance_of(&state.config().providers[0])
 }
 
+/// 马上读一次，读到的余额。没有余额可读、没问成是哪一种的，测试失败
+async fn refresh(state: &tw_gateway::AppState) -> tw_api::Balance {
+    state
+        .refresh_balance("relay")
+        .await
+        .expect("decided")
+        .expect("a balance")
+}
+
+/// 等到 `cond` 成立，最多五秒
+async fn until(cond: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting");
+}
+
 /// 总线上已经有的 `balance_updated`
 fn updates(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> usize {
     std::iter::from_fn(|| rx.try_recv().ok())
@@ -137,7 +171,7 @@ fn updates(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> usize {
 }
 
 const SUB2API_WALLET: &str = r#"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","unit":"USD","balance":12.3456,"remaining":12.3456,
-    "usage":{"today":{"requests":3,"input_tokens":1200,"output_tokens":300,"cost":0.12},"total":{"requests":90,"cost":7.65}},
+    "usage":{"today":{"requests":3,"input_tokens":1200,"output_tokens":300,"cost":0.12,"actual_cost":0.096},"total":{"requests":90,"cost":7.65,"actual_cost":6.12}},
     "daily_usage":[{"date":"2026-10-10","requests":3,"cost":0.12}],
     "model_stats":[{"model":"claude-sonnet-4-5","requests":3,"cost":0.12}]}"#;
 
@@ -158,10 +192,11 @@ async fn auto_finds_a_sub2api_relay_and_reads_its_wallet_from_the_same_answer() 
             currency: "USD".into()
         })
     );
+    // 今天实际扣的
     assert_eq!(
         b.spent,
         Some(Spent {
-            amount: 0.12,
+            amount: 0.096,
             currency: "USD".into(),
             period: SpentPeriod::Today,
             scope: None,
@@ -184,19 +219,27 @@ async fn auto_finds_a_sub2api_relay_and_reads_its_wallet_from_the_same_answer() 
     assert_eq!(f.paths().len(), 1);
 }
 
+const NEWAPI_SUBSCRIPTION: &str = r#"{"object":"billing_subscription","has_payment_method":true,"soft_limit_usd":25,"hard_limit_usd":25,"system_hard_limit_usd":25,"access_until":0}"#;
+const NEWAPI_USAGE: &str = r#"{"object":"list","total_usage":1234.5}"#;
+
+/// New API 站点的状态接口，额度按 `display` 显示
+fn newapi_status(display: &str) -> String {
+    format!(
+        r#"{{"success":true,"message":"","data":{{"version":"v0.9.0","system_name":"New API","quota_per_unit":500000,"display_in_currency":{},"quota_display_type":"{display}","usd_exchange_rate":7.3}}}}"#,
+        display != "TOKENS"
+    )
+}
+
 #[tokio::test]
 async fn auto_finds_a_new_api_relay_and_reads_its_quota() {
     let f = Arc::new(Fake::default());
     f.answer(
         "/v1/dashboard/billing/subscription",
         200,
-        r#"{"object":"billing_subscription","has_payment_method":true,"soft_limit_usd":25,"hard_limit_usd":25,"system_hard_limit_usd":25,"access_until":0}"#,
+        NEWAPI_SUBSCRIPTION,
     );
-    f.answer(
-        "/v1/dashboard/billing/usage",
-        200,
-        r#"{"object":"list","total_usage":1234.5}"#,
-    );
+    f.answer("/v1/dashboard/billing/usage", 200, NEWAPI_USAGE);
+    f.answer("/api/status", 200, &newapi_status("USD"));
     let state = state_for(start(f.clone()).await, BalanceSetting::Auto);
 
     read_due(&state).await;
@@ -210,14 +253,51 @@ async fn auto_finds_a_new_api_relay_and_reads_its_quota() {
         [
             "/v1/usage",
             "/v1/dashboard/billing/subscription",
-            "/v1/dashboard/billing/usage"
+            "/v1/dashboard/billing/usage",
+            "/api/status"
         ]
     );
-    let usage = f.seen.lock().unwrap()[2].query.clone().unwrap_or_default();
+    let seen = f.seen.lock().unwrap().clone();
+    let usage = seen[2].query.clone().unwrap_or_default();
     assert!(
         usage.contains("start_date=") && usage.contains("end_date="),
         "{usage}"
     );
+    // 状态接口是公开的：不带密钥
+    assert_eq!(seen[3].auth, "", "{seen:?}");
+    assert_eq!(seen[2].auth, "Bearer sk-relay-fake");
+}
+
+/// 账单接口的数按站点的额度显示方式折算：人民币、token；站点说不出来的，单位是「不知道」
+#[tokio::test]
+async fn a_new_api_relay_reads_in_the_unit_its_site_displays() {
+    let f = Arc::new(Fake::default());
+    f.answer(
+        "/v1/dashboard/billing/subscription",
+        200,
+        NEWAPI_SUBSCRIPTION,
+    );
+    f.answer("/v1/dashboard/billing/usage", 200, NEWAPI_USAGE);
+    let state = state_for(start(f.clone()).await, BalanceSetting::Newapi);
+    let unit = |b: tw_api::Balance| b.quota.unwrap().unit;
+
+    f.answer("/api/status", 200, &newapi_status("CNY"));
+    assert_eq!(unit(refresh(&state).await), "CNY");
+    f.answer("/api/status", 200, &newapi_status("TOKENS"));
+    assert_eq!(unit(refresh(&state).await), "tokens");
+    // 没有这个接口（或者回的不是它）：不知道，不当作美元
+    f.answer("/api/status", 404, r#"{"error":"not found"}"#);
+    assert_eq!(unit(refresh(&state).await), "unknown");
+    f.answer("/api/status", 200, r#"{"success":true,"data":{}}"#);
+    assert_eq!(unit(refresh(&state).await), "unknown");
+
+    // 没问成（对方出错）：这一次没读成，**留着上一次读到的**
+    f.answer("/api/status", 200, &newapi_status("CNY"));
+    let good = refresh(&state).await;
+    f.answer("/api/status", 503, r#"{"error":"busy"}"#);
+    let failed = refresh(&state).await;
+    assert_eq!(failed.error.unwrap().arg("status"), "503");
+    assert_eq!(failed.quota, good.quota);
 }
 
 /// 两种都不是：没有余额，**不再问**，请求结束了也不问。只有界面要的时候再问一次
@@ -237,8 +317,48 @@ async fn a_host_that_is_neither_has_no_balance_and_is_not_asked_again() {
     assert_eq!(f.paths().len(), 2, "又去问了：{:?}", f.paths());
     assert_eq!(updates(&mut rx), 0, "没有余额，不用报");
 
-    assert_eq!(state.refresh_balance("relay").await, None);
+    assert_eq!(state.refresh_balance("relay").await, Ok(None));
     assert_eq!(f.paths().len(), 4, "界面要的时候再问一次");
+}
+
+/// 跳转也是回答：出站不跟跳转，跳去登录页、首页的地址没有这个接口，两种都不是
+#[tokio::test]
+async fn a_redirect_is_an_answer() {
+    let f = Arc::new(Fake::default());
+    f.answer("/v1/usage", 302, "");
+    f.answer("/v1/dashboard/billing/subscription", 301, "");
+    let state = state_for(start(f.clone()).await, BalanceSetting::Auto);
+
+    read_due(&state).await;
+    assert_eq!(balance(&state), None);
+    for _ in 0..3 {
+        state.balances.note_request("relay");
+        read_due(&state).await;
+    }
+    assert_eq!(
+        f.paths().len(),
+        2,
+        "认定了两种都不是，不再问：{:?}",
+        f.paths()
+    );
+    assert_eq!(state.refresh_balance("relay").await, Ok(None));
+}
+
+/// 没问成是哪一种（对方出错）：界面要的时候说没问成的原因，不说「没有余额」
+#[tokio::test]
+async fn an_undecided_refresh_says_why() {
+    let f = Arc::new(Fake::default());
+    f.answer("/v1/usage", 503, r#"{"error":"busy"}"#);
+    let state = state_for(start(f.clone()).await, BalanceSetting::Auto);
+
+    let why = state.refresh_balance("relay").await.unwrap_err();
+    assert_eq!(why.code, "gw.balance.status");
+    assert_eq!(why.arg("status"), "503");
+    assert_eq!(balance(&state), None);
+
+    // 问成了：两种都不是，就是没有余额
+    f.answer("/v1/usage", 404, r#"{"error":"not found"}"#);
+    assert_eq!(state.refresh_balance("relay").await, Ok(None));
 }
 
 #[tokio::test]
@@ -264,24 +384,55 @@ async fn an_explicit_source_reads_on_the_origin_not_on_the_base_path() {
     );
 }
 
+/// OpenRouter 只问这把密钥自己的接口：**不问账户余额**（`/api/v1/credits` 只有管理密钥
+/// 问得到，能转发请求的密钥问它是 403）
 #[tokio::test]
-async fn openrouter_without_a_key_limit_reads_the_account_credits() {
+async fn openrouter_reads_only_the_key_itself() {
     let f = Arc::new(Fake::default());
     f.answer(
-        "/api/v1/key",
-        200,
-        r#"{"data":{"label":"sk-or-v1-fak...e","limit":null,"limit_remaining":null,"usage":3.1}}"#,
-    );
-    f.answer(
         "/api/v1/credits",
-        200,
-        r#"{"data":{"total_credits":20,"total_usage":12.5}}"#,
+        403,
+        r#"{"error":{"code":403,"message":"Only management keys can perform this operation"}}"#,
     );
     let state = state_for(start(f.clone()).await, BalanceSetting::Openrouter);
 
-    read_due(&state).await;
-    assert_eq!(f.paths(), ["/api/v1/key", "/api/v1/credits"]);
-    assert_eq!(balance(&state).unwrap().wallet.unwrap().amount, 7.5);
+    // 没设额度：这个月花了多少
+    f.answer(
+        "/api/v1/key",
+        200,
+        r#"{"data":{"label":"sk-or-v1-fak...e","limit":null,"limit_remaining":null,"limit_reset":null,"include_byok_in_limit":false,
+            "usage":3.1,"usage_daily":0.2,"usage_weekly":0.9,"usage_monthly":1.4,"is_free_tier":false,"is_management_key":false,
+            "free_model_daily_requests":{"limit":1000,"used":3,"remaining":997}}}"#,
+    );
+    let b = refresh(&state).await;
+    assert_eq!(b.error, None, "{b:?}");
+    assert_eq!(b.wallet, None);
+    assert_eq!(b.quota, None);
+    assert_eq!(
+        b.spent,
+        Some(Spent {
+            amount: 1.4,
+            currency: "USD".into(),
+            period: SpentPeriod::Month,
+            scope: None,
+        })
+    );
+
+    // 设了额度：额度和这一期用了多少，到期时刻
+    f.answer(
+        "/api/v1/key",
+        200,
+        r#"{"data":{"label":"sk-or-v1-fak...e","limit":20,"limit_remaining":12.5,"limit_reset":"monthly","include_byok_in_limit":false,
+            "usage":30,"usage_daily":1,"usage_weekly":4,"usage_monthly":7.5,"is_free_tier":false,"is_management_key":false,
+            "expires_at":"2027-01-01T00:00:00Z"}}"#,
+    );
+    let b = refresh(&state).await;
+    let q = b.quota.unwrap();
+    assert_eq!((q.limit, q.used, q.unit.as_str()), (20.0, 7.5, "USD"));
+    assert_eq!(b.spent.unwrap().amount, 7.5);
+    assert!(b.expires_at_ms.is_some());
+
+    assert_eq!(f.paths(), ["/api/v1/key", "/api/v1/key"]);
 }
 
 const ENTERPRISE: &str = r#"{"usage":{"requests_today":3,"tokens_today":9000,"requests_month":80,"tokens_month":400000,"cost_usd_month":12.5},
@@ -297,14 +448,14 @@ async fn a_failing_read_keeps_the_last_good_reading_and_says_why() {
     let state = state_for(start(f.clone()).await, BalanceSetting::Thinkwatch);
     let mut rx = state.bus.subscribe();
 
-    let first = state.refresh_balance("relay").await.unwrap();
+    let first = refresh(&state).await;
     assert_eq!(first.source, BalanceSource::Thinkwatch);
     assert_eq!(first.windows.len(), 2);
     assert_eq!(first.windows[1].scope, Some(BalanceScope::User));
     assert_eq!(first.spent.as_ref().unwrap().period, SpentPeriod::Month);
 
     f.answer("/v1/usage", 503, r#"{"error":"busy"}"#);
-    let failed = state.refresh_balance("relay").await.unwrap();
+    let failed = refresh(&state).await;
     let why = failed.error.clone().expect("the reason");
     assert_eq!(why.code, "gw.balance.status");
     assert_eq!(why.arg("status"), "503");
@@ -314,7 +465,7 @@ async fn a_failing_read_keeps_the_last_good_reading_and_says_why() {
     assert_eq!(balance(&state), Some(failed));
 
     f.answer("/v1/usage", 200, ENTERPRISE);
-    let again = state.refresh_balance("relay").await.unwrap();
+    let again = refresh(&state).await;
     assert_eq!(again.error, None);
     assert_eq!(updates(&mut rx), 3, "每读一次报一次");
 }
@@ -325,12 +476,12 @@ async fn the_reason_says_what_went_wrong() {
     let f = Arc::new(Fake::default());
     f.answer("/user/balance", 200, r#"<html>maintenance</html>"#);
     let state = state_for(start(f.clone()).await, BalanceSetting::Deepseek);
-    let b = state.refresh_balance("relay").await.unwrap();
+    let b = refresh(&state).await;
     assert_eq!(b.error.unwrap().code, "gw.balance.unrecognized");
     assert_eq!(b.wallet, None);
 
     f.answer("/user/balance", 401, r#"{"error":"bad key"}"#);
-    let b = state.refresh_balance("relay").await.unwrap();
+    let b = refresh(&state).await;
     let why = b.error.unwrap();
     assert_eq!(why.code, "gw.balance.rejected");
     assert!(!why.text.contains("sk-relay-fake"));
@@ -381,4 +532,59 @@ async fn a_request_through_the_upstream_wakes_the_balance_reader() {
     // 刚读过：一分钟之内不因为这个请求再读
     read_due(&state).await;
     assert_eq!(f.paths(), ["/v1/usage"]);
+}
+
+/// 界面要读，读到一半界面那头走了（这个 future 被丢掉）：**这一次照样读完、记下、报事件**；
+/// 读着的时候后台不另读
+#[tokio::test]
+async fn a_refresh_whose_caller_goes_away_still_reads() {
+    let f = Arc::new(Fake::default());
+    f.answer("/v1/usage", 200, SUB2API_WALLET);
+    let gate = f.hold("/v1/usage");
+    let state = state_for(start(f.clone()).await, BalanceSetting::Sub2api);
+    let mut rx = state.bus.subscribe();
+
+    let caller = tokio::spawn({
+        let state = state.clone();
+        async move { state.refresh_balance("relay").await }
+    });
+    until(|| f.paths().len() == 1).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    assert!(state.start_due_balances().is_empty(), "正在读：不另读");
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while updates(&mut rx) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the read did not finish");
+    assert_eq!(balance(&state).unwrap().wallet.unwrap().amount, 12.3456);
+    assert_eq!(f.paths().len(), 1);
+}
+
+/// 读到一半任务被取消了：这一家**不会一直算作「正在读」**，后台照样按节奏读它
+#[tokio::test]
+async fn a_read_cancelled_mid_way_leaves_the_upstream_to_the_timer() {
+    let f = Arc::new(Fake::default());
+    f.answer("/v1/usage", 200, SUB2API_WALLET);
+    let gate = f.hold("/v1/usage");
+    let state = state_for(start(f.clone()).await, BalanceSetting::Sub2api);
+
+    let reads = state.start_due_balances();
+    assert_eq!(reads.len(), 1);
+    until(|| f.paths().len() == 1).await;
+    for r in reads {
+        r.abort();
+        assert!(r.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(balance(&state), None, "没读成");
+
+    // 从没读成过：马上该读
+    gate.add_permits(2);
+    read_due(&state).await;
+    assert_eq!(f.paths().len(), 2, "{:?}", f.paths());
+    assert_eq!(balance(&state).unwrap().wallet.unwrap().amount, 12.3456);
 }

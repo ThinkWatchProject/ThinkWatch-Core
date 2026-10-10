@@ -24,7 +24,7 @@ use tw_api::BalanceSource;
 use tw_types::{Msg, msg};
 
 pub use parse::Reading;
-pub use tracker::{Detection, Outcome, Plan, Step, Tracker, Why};
+pub use tracker::{Claim, Detection, Outcome, Plan, Step, Tracker, Why};
 
 /// 跟着一个经过这一家的请求走：请求结束时（它被丢掉时，正常交完、客户端走掉都一样）
 /// 记一笔，到了时候就重读这一家的余额（见 [`tracker`]）。**只做个记号，不联网**
@@ -160,19 +160,22 @@ impl Failure {
         }
     }
 
-    /// 对方说了话（4xx、读不懂的回答）：它就是这样，再问也一样。连不上、超时、5xx、429
-    /// 说明不了什么
+    /// 对方说了话（转到别处去、4xx、读不懂的回答）：它就是这样，再问也一样。连不上、超时、
+    /// 5xx、429 说明不了什么。
+    ///
+    /// **3xx 也是回答**：出站的 client 不跟跳转，问到一个跳去登录页、首页的地址，说明这里
+    /// 没有这个接口，不是没问成
     fn answered(&self) -> bool {
         match self {
             Failure::Transport(_) => false,
-            Failure::Status(s) => (400..500).contains(s) && *s != 429,
+            Failure::Status(s) => (300..500).contains(s) && *s != 429,
             Failure::Unrecognized => true,
         }
     }
 }
 
-/// 发一个 GET，读回 JSON。
-async fn get_json(http: &reqwest::Client, url: &str, auth: &str) -> Result<Value, Failure> {
+/// 发一个 GET，读回 JSON。`auth` 是 `None` 的不带凭据（公开的接口）
+async fn get_json(http: &reqwest::Client, url: &str, auth: Option<&str>) -> Result<Value, Failure> {
     let mut req = http.get(url).timeout(TIMEOUT);
     for (name, value) in crate::egress::balance_headers(auth) {
         req = req.header(name, value);
@@ -223,40 +226,48 @@ fn chain(e: &reqwest::Error) -> String {
     detail
 }
 
-/// 先问 Sub2API（和企业网关）的用量接口，再问 New API 的账单接口。**认出来了就交回那一次
-/// 的回答**：Sub2API 和企业网关的余额就在里面，不用再问一遍
-pub async fn detect(
-    http: &reqwest::Client,
-    origin: &str,
-    auth: &str,
-) -> (Detection, Option<Value>) {
-    let usage = get_json(http, &format!("{origin}/v1/usage"), auth).await;
+/// 问出来的是哪一种。
+#[derive(Debug)]
+pub enum Detected {
+    /// 认出来了，**连同认出它的那一次回答**：Sub2API 和企业网关的余额就在里面，New API 的
+    /// 总额度也在，不用再问一遍
+    Found(BalanceSource, Value),
+    /// 两个都答了话，可都不是
+    Neither,
+    /// 有一个没问成：连不上、超时、对方出错。带着头一个没问成的原因
+    Undecided(Failure),
+}
+
+/// 先问 Sub2API（和企业网关）的用量接口，再问 New API 的账单接口。
+pub async fn detect(http: &reqwest::Client, origin: &str, auth: &str) -> Detected {
+    let usage = get_json(http, &format!("{origin}/v1/usage"), Some(auth)).await;
     if let Ok(v) = &usage {
         if parse::is_sub2api(v) {
-            return (Detection::Found(BalanceSource::Sub2api), usage.ok());
+            return Detected::Found(BalanceSource::Sub2api, v.clone());
         }
         if parse::is_thinkwatch(v) {
-            return (Detection::Found(BalanceSource::Thinkwatch), usage.ok());
+            return Detected::Found(BalanceSource::Thinkwatch, v.clone());
         }
     }
     let billing = get_json(
         http,
         &format!("{origin}/v1/dashboard/billing/subscription"),
-        auth,
+        Some(auth),
     )
     .await;
     if let Ok(v) = &billing
         && parse::is_newapi(v)
     {
-        return (Detection::Found(BalanceSource::Newapi), billing.ok());
+        return Detected::Found(BalanceSource::Newapi, v.clone());
     }
-    // 两个都答了话（不是这个形状、没有这个接口、不认这把密钥）：两种都不是。有一个没问成，
-    // 就说不准
-    let answered = |r: &Result<Value, Failure>| r.as_ref().map_or_else(Failure::answered, |_| true);
-    if answered(&usage) && answered(&billing) {
-        (Detection::Neither, None)
-    } else {
-        (Detection::Undecided, None)
+    // 两个都答了话（不是这个形状、没有这个接口、不认这把密钥、转到别处去）：两种都不是。
+    // 有一个没问成，就说不准
+    match [usage, billing]
+        .into_iter()
+        .find_map(|r| r.err().filter(|f| !f.answered()))
+    {
+        Some(f) => Detected::Undecided(f),
+        None => Detected::Neither,
     }
 }
 
@@ -271,7 +282,7 @@ pub async fn read(
     let origin = origin(base_url).ok_or(Failure::Unrecognized)?;
     let get = |path: &str| {
         let url = format!("{origin}{path}");
-        async move { get_json(http, &url, auth).await }
+        async move { get_json(http, &url, Some(auth)).await }
     };
     let known_or = |path: &'static str| {
         let known = known.clone();
@@ -284,13 +295,9 @@ pub async fn read(
     };
     let parsed = |r: Option<Reading>| r.ok_or(Failure::Unrecognized);
     match source {
-        BalanceSource::Openrouter => match parse::openrouter_key(&get("/api/v1/key").await?) {
-            Some(parse::OpenRouterKey::Limited(r)) => Ok(r),
-            Some(parse::OpenRouterKey::Unlimited) => {
-                parsed(parse::openrouter_credits(&get("/api/v1/credits").await?))
-            }
-            None => Err(Failure::Unrecognized),
-        },
+        // **只问这把密钥自己的接口**：账户余额（`/api/v1/credits`）只有管理密钥问得到，
+        // 能转发请求的密钥问它是 403
+        BalanceSource::Openrouter => parsed(parse::openrouter(&get("/api/v1/key").await?)),
         BalanceSource::Deepseek => parsed(parse::deepseek(&get("/user/balance").await?)),
         BalanceSource::Moonshot => {
             // 回答里不写货币：国际站是美元，国内站是人民币
@@ -309,7 +316,15 @@ pub async fn read(
         BalanceSource::Newapi => {
             let subscription = known_or("/v1/dashboard/billing/subscription").await?;
             let usage = get(&newapi_usage_path(chrono::Utc::now().date_naive())).await?;
-            parsed(parse::newapi(&subscription, &usage))
+            // 账单接口的数按站点的额度显示方式折算（美元、人民币或者 token），回答里不说是
+            // 哪一种：问站点的状态接口。它是公开的，不带凭据。答了话却说不出来的，单位是
+            // 「不知道」；没问成的这一次就没读成，留着上一次读到的
+            let unit = match get_json(http, &format!("{origin}/api/status"), None).await {
+                Ok(status) => parse::newapi_unit(&status),
+                Err(f) if f.answered() => parse::UNKNOWN,
+                Err(f) => return Err(f),
+            };
+            parsed(parse::newapi(&subscription, &usage, unit))
         }
     }
 }
@@ -326,7 +341,7 @@ fn newapi_usage_path(today: chrono::NaiveDate) -> String {
     )
 }
 
-/// 做一步：要先认来源的先认，认出来了接着读。交回这一次的结果（给 [`Tracker::settle`]）
+/// 做一步：要先认来源的先认，认出来了接着读。交回这一次的结果（给 [`tracker::Claim::settle`]）
 pub async fn run(http: &reqwest::Client, step: Step, base_url: &str, auth: &str) -> Outcome {
     let Some(origin) = origin(base_url) else {
         return Outcome {
@@ -337,10 +352,16 @@ pub async fn run(http: &reqwest::Client, step: Step, base_url: &str, auth: &str)
     let (source, known, detection) = match step {
         Step::Read(s) => (s, None, None),
         Step::Detect => match detect(http, &origin, auth).await {
-            (Detection::Found(s), known) => (s, known, Some(Detection::Found(s))),
-            (other, _) => {
+            Detected::Found(s, known) => (s, Some(known), Some(Detection::Found(s))),
+            Detected::Neither => {
                 return Outcome {
-                    detection: Some(other),
+                    detection: Some(Detection::Neither),
+                    read: None,
+                };
+            }
+            Detected::Undecided(f) => {
+                return Outcome {
+                    detection: Some(Detection::Undecided(f.msg())),
                     read: None,
                 };
             }
