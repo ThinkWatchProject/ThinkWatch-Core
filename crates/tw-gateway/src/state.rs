@@ -10,6 +10,7 @@ use crate::health::Health;
 use crate::outbound::{base_client_builder, client_for_provider, proxy_shape};
 use tw_types::{Msg, msg};
 
+mod balances;
 mod credentials;
 mod glm;
 pub use credentials::credential_failed;
@@ -180,6 +181,9 @@ pub struct AppState {
     quotas: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::quota::Quota>>>,
     /// 每个 GLM Coding Plan 上游问额度的节奏（见 [`crate::glm`]）。**跨重载存活**
     glm: Arc<crate::glm::Tracker>,
+    /// 每家上游的余额和读的节奏（见 [`crate::balances`]）。**跨重载存活**：改一条规则不该
+    /// 让所有余额重读一遍
+    pub balances: Arc<crate::balances::Tracker>,
     /// 监听地址变了。**这是「温」那一级**（三级热重载） ——
     /// 换端口不能只换配置：监听器是启动时建的，不重建的话新端口上什么
     /// 都没有，而旧端口还在服务。那种「改了没反应」比报错难查得多。
@@ -305,6 +309,7 @@ impl AppState {
             body_sink: Arc::new(std::sync::Mutex::new(None)),
             quotas: Arc::new(std::sync::Mutex::new(Default::default())),
             glm: Default::default(),
+            balances: Default::default(),
             relisten: Arc::new(tokio::sync::Notify::new()),
             listening: Arc::new(std::sync::Mutex::new(Default::default())),
             oauth: Arc::new(crate::oauth::Cache::new()),

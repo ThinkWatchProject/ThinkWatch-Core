@@ -666,6 +666,8 @@ impl Recorder {
             | Event::ConfigRejected { .. }
             | Event::QuotaSeen { .. }
             | Event::QuotaExhausted { .. }
+            // 余额同理：是那家上游现在的样子
+            | Event::BalanceUpdated { .. }
             // 密钥用量到了上限：说的是那把密钥现在的样子，它的用量就是这张表里的那些行
             | Event::KeyLimitAlert { .. }
             // 凭据轮换说的是配置文件该改了，跟哪一次请求无关

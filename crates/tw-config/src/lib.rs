@@ -194,6 +194,7 @@ impl Default for Provider {
             model_specs: std::collections::BTreeMap::new(),
             max_concurrent: None,
             disabled: false,
+            balance: BalanceSetting::Auto,
         }
     }
 }
@@ -844,6 +845,60 @@ pub struct Provider {
     /// `/v1/models` 里。要暂时不用一家上游时，比删掉再重新填一遍凭据好。
     #[serde(default, skip_serializing_if = "is_default")]
     pub disabled: bool,
+    /// 余额从哪儿读，见 [`BalanceSetting`]。不写就是 `auto`
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub balance: BalanceSetting,
+}
+
+/// 一家上游的余额从哪儿读。
+///
+/// **`auto` 不写进配置**：官方地址按主机认（OpenRouter、DeepSeek、Moonshot），别的地址由
+/// 网关问一次它是哪一种中转站，认出来的只记在内存里。向导按用户选的那一项写明来源，
+/// 就不用再问。ChatGPT、Z.ai 账号和 Bedrock 不读余额，写了什么都一样：它们的额度另有来处
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BalanceSetting {
+    #[default]
+    Auto,
+    /// 不读
+    Off,
+    Openrouter,
+    Deepseek,
+    Moonshot,
+    Sub2api,
+    Newapi,
+    Thinkwatch,
+}
+
+impl From<BalanceSetting> for tw_api::BalanceSetting {
+    fn from(b: BalanceSetting) -> Self {
+        match b {
+            BalanceSetting::Auto => Self::Auto,
+            BalanceSetting::Off => Self::Off,
+            BalanceSetting::Openrouter => Self::Openrouter,
+            BalanceSetting::Deepseek => Self::Deepseek,
+            BalanceSetting::Moonshot => Self::Moonshot,
+            BalanceSetting::Sub2api => Self::Sub2api,
+            BalanceSetting::Newapi => Self::Newapi,
+            BalanceSetting::Thinkwatch => Self::Thinkwatch,
+        }
+    }
+}
+
+impl From<tw_api::BalanceSetting> for BalanceSetting {
+    fn from(b: tw_api::BalanceSetting) -> Self {
+        use tw_api::BalanceSetting as B;
+        match b {
+            B::Auto => Self::Auto,
+            B::Off => Self::Off,
+            B::Openrouter => Self::Openrouter,
+            B::Deepseek => Self::Deepseek,
+            B::Moonshot => Self::Moonshot,
+            B::Sub2api => Self::Sub2api,
+            B::Newapi => Self::Newapi,
+            B::Thinkwatch => Self::Thinkwatch,
+        }
+    }
 }
 
 /// 一家上游的并发上限最多写多少

@@ -117,6 +117,9 @@ endpoints! {
     /// 模型，和列出的一样算这家提供。**不在 `/providers/` 底下**，同上
     SetManualModels: PUT "/provider-manual-models", api::ManualModelsSave => api::ConfigWritten;
     RefreshProviderModels: POST "/providers/{name}/models/refresh" [name], () => api::ProviderModelsView;
+    /// 马上读一次这家的余额（`balance` 是 `auto` 时先认出是哪一种中转站）。没有余额可读的
+    /// 是 404（`control.balance_none`）
+    RefreshBalance: POST "/providers/{name}/balance/refresh" [name], () => api::Balance;
     RefreshStaleModels: POST "/models/refresh", () => api::ModelsRefreshing;
     CreateProxy: POST "/proxies", api::ProxySave => api::ConfigWritten;
     TestProxy: POST "/proxy-test", api::ProxyTest => api::L1Result;
