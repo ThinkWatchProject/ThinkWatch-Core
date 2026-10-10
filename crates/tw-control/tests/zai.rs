@@ -329,10 +329,28 @@ async fn a_login_writes_the_account_into_the_config_as_an_anthropic_upstream() {
         "made-key.the-secret"
     );
     assert!(p.oauth.is_none(), "这类上游不用 OAuth，不该写 oauth 块");
+    // 记下密钥是哪一家的账号登录换来的：key 本身和手填的没有区别
+    assert_eq!(p.signed_in, Some(tw_config::SignedIn::Zai));
+    assert!(b.file().contains("signed_in: zai"), "{}", b.file());
     // 计费是默认那档：订阅账号也按价目表算费用
     assert_eq!(p.billing, tw_config::Billing::PerToken);
     // 原有的上游一个都没动
     assert!(b.file().contains("sk-relay"));
+    // 界面拿到的上游视图带着它；手填密钥的上游是 null
+    let (st, ov) = b.call("GET", "/overview", Value::Null).await;
+    assert_eq!(st, StatusCode::OK, "{ov}");
+    let view = |name: &str| {
+        ov["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(view("zai")["signed_in"], "zai");
+    assert_eq!(view("relay")["signed_in"], Value::Null);
+    assert!(view("relay").get("signed_in").is_some(), "null 也要写出来");
 
     // 轮询凭据是我们自己生成的，不是平台回显的那个
     let init_auth = b.zai.auth_of("/api/v1/oauth/cli/init").unwrap();
@@ -451,6 +469,8 @@ async fn signing_in_again_only_replaces_the_key() {
     assert_eq!(p.models_only.as_deref(), Some(&["glm-4.6".to_string()][..]));
     assert!(p.disabled);
     assert_eq!(b.zai.hit("/api_keys:create"), 0, "已经有的 key 应当复用");
+    // 这一项出现之前登录的上游没有记号，重新登录之后有了
+    assert_eq!(p.signed_in, Some(tw_config::SignedIn::Zai));
 }
 
 #[tokio::test]
@@ -489,6 +509,7 @@ async fn bigmodel_signs_in_with_the_oauth_token_itself_and_may_get_a_key_without
     assert_eq!(p.base_url, b.endpoints.bigmodel_upstream);
     // secret 那一半没有时，BigModel 的 key 就是它自己
     assert_eq!(p.key.as_ref().unwrap().resolve().unwrap(), "made-key");
+    assert_eq!(p.signed_in, Some(tw_config::SignedIn::Bigmodel));
     // 它的业务接口直接认 OAuth 的 access token，**不带 `Bearer ` 前缀**
     assert_eq!(
         b.zai.auth_of("/api/biz/customer/getCustomerInfo").unwrap(),
@@ -549,4 +570,68 @@ async fn a_login_can_be_cancelled_and_a_new_one_replaces_the_old() {
     assert_eq!(b.login_finished().await.0, "done");
     let (st, _) = b.call("GET", &format!("/zai/login/{id}"), json!({})).await;
     assert_eq!(st, StatusCode::NOT_FOUND, "旧的那次已经不在了");
+}
+
+// ---------------------------------------------------------------- 登录之后在界面里改
+
+/// 登录写下的一条上游，`signed_in` 已经在了
+fn signed_in_upstream(e: &Endpoints) -> String {
+    format!(
+        "  - name: zai
+    base_url: {upstream}
+    protocol: anthropic
+    key: made-key.the-secret
+    signed_in: zai
+",
+        upstream = e.zai_upstream
+    )
+}
+
+/// 编辑对话框交回来的整份定义
+fn edited(b: &Bed, key: &str) -> Value {
+    json!({"provider": {
+        "name": "zai",
+        "base_url": b.endpoints.zai_upstream,
+        "protocol": "anthropic",
+        "key": key,
+        "proxy": "system",
+        "disabled": true,
+    }})
+}
+
+#[tokio::test]
+async fn an_edit_that_keeps_the_signed_in_key_keeps_the_mark() {
+    let b = bed(signed_in_upstream).await;
+    let (st, v) = b
+        .call("PUT", "/providers/zai", edited(&b, "made-key.the-secret"))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let p = b.provider("zai").unwrap();
+    // 别的设置照改，密钥没变，它就还是登录换来的
+    assert_eq!(p.proxy, "system");
+    assert!(p.disabled);
+    assert_eq!(p.signed_in, Some(tw_config::SignedIn::Zai));
+    let (_, ov) = b.call("GET", "/overview", Value::Null).await;
+    assert_eq!(ov["providers"][1]["name"], "zai");
+    assert_eq!(ov["providers"][1]["signed_in"], "zai");
+}
+
+#[tokio::test]
+async fn replacing_the_key_by_hand_drops_the_mark() {
+    let b = bed(signed_in_upstream).await;
+    let (st, v) = b
+        .call("PUT", "/providers/zai", edited(&b, "typed-by-hand.secret"))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let p = b.provider("zai").unwrap();
+    assert_eq!(
+        p.key.as_ref().unwrap().resolve().unwrap(),
+        "typed-by-hand.secret"
+    );
+    // 密钥已经不是登录换来的了
+    assert_eq!(p.signed_in, None);
+    assert!(!b.file().contains("signed_in"), "{}", b.file());
+    let (_, ov) = b.call("GET", "/overview", Value::Null).await;
+    assert_eq!(ov["providers"][1]["name"], "zai");
+    assert_eq!(ov["providers"][1]["signed_in"], Value::Null);
 }

@@ -895,6 +895,10 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// `POST /providers/{name}/balance/refresh`（→ [`Balance`]）马上读一次；没有余额可读是 404
 /// （`control.balance_none`）。读失败的原因是 `gw.balance.*`。配置里的 `balance:` 写了不认识的
 /// 取值时加载不了（`config.unknown_variant`，一键修复改回 `auto`）。照 45 写的界面不认这个事件。
+///
+/// **46 起看得出密钥是账号登录换来的**：[`ProviderView`] 多了 `signed_in`（[`ZaiFamily`]）。
+/// Z.ai / BigModel 的账号登录在它写的上游上记下 `signed_in: zai | bigmodel`；重新登录照旧
+/// 写上，在界面里保存时密钥没变就留着，换成了别的密钥就去掉。手填的密钥和别的上游是 null。
 pub const CONTROL_API_VERSION: u32 = 46;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2256,6 +2260,9 @@ pub struct ProviderView {
     /// 认不出是哪一种中转站），或者还没读完第一次。读到了、读失败了都报
     /// [`Event::BalanceUpdated`]
     pub balance: Option<Balance>,
+    /// 密钥是用哪一家的账号登录换来的（配置里的 `signed_in:`）：`zai` / `bigmodel`。手填的
+    /// 密钥、别的上游、这一项出现之前登录的都是空。在界面里手动换掉密钥之后也是空
+    pub signed_in: Option<ZaiFamily>,
 }
 
 /// 一行请求头，配置里写的原样。

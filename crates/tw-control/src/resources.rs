@@ -513,6 +513,10 @@ fn to_provider(
         profile: nonblank(&a.profile),
         region: nonblank(&a.region),
     });
+    // 账号登录换来的密钥原样交回来，才还是登录换来的；换成了手填的，这个记号跟着去掉
+    let signed_in = existing
+        .filter(|e| key.is_some() && e.key == key)
+        .and_then(|e| e.signed_in);
     let provider = tw_config::Provider {
         name,
         base_url,
@@ -542,6 +546,7 @@ fn to_provider(
         max_concurrent: input.max_concurrent,
         disabled: input.disabled,
         balance: input.balance.map(Into::into).unwrap_or_default(),
+        signed_in,
     };
     // **保存和检测之前就说清楚凭据写法哪儿不对**，而不是等整份配置校验时
     // 报一条指着 YAML 的错误
