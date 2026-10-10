@@ -48,14 +48,8 @@ impl Traffic {
 
     /// 刚记下的那一跳没发出去：连不上（地址不通、代理拒绝、握手失败），上游一个字节都没收到
     pub fn unsent(&self, n: usize) {
-        let _ = self
-            .out
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
-        let _ = self
-            .sent
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(n as u64))
-            });
+        take_back(&self.out, 1);
+        take_back(&self.sent, n as u64);
     }
 
     /// 连上了，还没发任何东西：WebSocket 握手成功的那一刻。之后的帧另外记
@@ -80,6 +74,20 @@ impl Traffic {
             self.sent.load(Ordering::Relaxed),
             self.received.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// 从计数里减掉 `n`，到 0 为止。手写比较交换：`fetch_update` 在新版标准库里改了名
+/// （`try_update`），旧版又没有新名字，两头都要编得过（和 `tw_watch` 的 kqueue 同一个做法）
+fn take_back(a: &AtomicU64, n: u64) {
+    let mut cur = a.load(Ordering::Relaxed);
+    while let Err(now) = a.compare_exchange_weak(
+        cur,
+        cur.saturating_sub(n),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        cur = now;
     }
 }
 
