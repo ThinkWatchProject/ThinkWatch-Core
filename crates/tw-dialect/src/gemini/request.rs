@@ -15,6 +15,24 @@ use crate::think;
 /// 历史修复也用它）
 pub const SYNTHETIC_SIGNATURE: &str = "skip_thought_signature_validator";
 
+/// functionCall 这一格上的思考签名在中间表示里怎么放。
+///
+/// Gemini 开着思考时把一轮的签名放在第一个 functionCall 上，不放在思考文字上。
+/// 中间表示的工具调用没有签名字段，也不为一家加一个：记成一个**紧挨在那个工具调用
+/// 前面、没有文字的 Google 签名思考块**。别家客户端照常把它当一段推理带出去、下一轮
+/// 带回来；编码回 Gemini 时认出这个形状，把签名放回 functionCall 上，而不是写成一格
+/// 单独的思考。
+///
+/// `parts[i]` 是这样的块时给出它的签名（不论哪家签发的，由调用方决定要不要）。
+pub(crate) fn call_signature(parts: &[Part], i: usize) -> Option<&Signature> {
+    match (&parts[i], parts.get(i + 1)) {
+        (Part::Thinking(th), Some(Part::ToolCall(_))) if th.text.is_empty() => {
+            th.signature.as_ref()
+        }
+        _ => None,
+    }
+}
+
 /// 按驼峰名取字段，取不到再试下划线写法
 pub(crate) fn field<'a>(v: &'a Value, camel: &str) -> Option<&'a Value> {
     v.get(camel).or_else(|| {
@@ -80,11 +98,20 @@ pub fn decode_request(
         for (pi, p) in arr_of(content, "parts").iter().enumerate() {
             if let Some(t) = fstr(p, "text") {
                 if p.get("thought").and_then(Value::as_bool) == Some(true) {
-                    parts.push(Part::Thinking(Thinking {
-                        text: t.to_string(),
-                        signature: fstr(p, "thoughtSignature")
-                            .and_then(|s| Signature::read(s, Vendor::Google)),
-                    }));
+                    let signature = fstr(p, "thoughtSignature")
+                        .and_then(|s| Signature::read(s, Vendor::Google));
+                    // 流式写出去的思考是一格一段，签名在最后一格：没签名的前几格并进来，
+                    // 签名才对得上整段文字
+                    match parts.last_mut() {
+                        Some(Part::Thinking(prev)) if prev.signature.is_none() => {
+                            prev.text.push_str(t);
+                            prev.signature = signature;
+                        }
+                        _ => parts.push(Part::Thinking(Thinking {
+                            text: t.to_string(),
+                            signature,
+                        })),
+                    }
                 } else if !t.is_empty() {
                     parts.push(Part::Text(t.to_string()));
                 }
@@ -102,6 +129,17 @@ pub fn decode_request(
                     dropped.path("contents.parts.inlineData");
                 }
             } else if let Some(call) = field(p, "functionCall") {
+                // 这一格上的签名记成紧挨在前面的空思考块（见 [`call_signature`]）。
+                // 迁移历史用的占位值不是签名
+                if let Some(sig) = fstr(p, "thoughtSignature")
+                    .filter(|s| *s != SYNTHETIC_SIGNATURE)
+                    .and_then(|s| Signature::read(s, Vendor::Google))
+                {
+                    parts.push(Part::Thinking(Thinking {
+                        text: String::new(),
+                        signature: Some(sig),
+                    }));
+                }
                 let name = fstr(call, "name").unwrap_or_default().to_string();
                 let id = fstr(call, "id")
                     .map(str::to_string)
@@ -328,7 +366,9 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
     let mut contents = Vec::new();
     for m in merge_roles(r.messages.clone()) {
         let mut parts = Vec::new();
-        for p in &m.parts {
+        // 空思考块上的 Google 签名，放到紧接着的 functionCall 上
+        let mut call_sig: Option<&str> = None;
+        for (i, p) in m.parts.iter().enumerate() {
             match p {
                 Part::Text(t) if !t.is_empty() => parts.push(json!({ "text": t })),
                 Part::Text(_) => {}
@@ -339,16 +379,28 @@ pub fn encode_request(r: &Request, _t: &Target, dropped: &mut Dropped) -> Value 
                     Media::Url(_) => dropped.feature(Feature::MediaUrl),
                 },
                 Part::Thinking(th) => match &th.signature {
-                    Some(s) if s.vendor == Vendor::Google => parts.push(json!({
-                        "text": th.text,
-                        "thought": true,
-                        "thoughtSignature": s.value,
-                    })),
+                    Some(s) if s.vendor == Vendor::Google => {
+                        if call_signature(&m.parts, i).is_some() {
+                            call_sig = Some(&s.value);
+                        } else {
+                            parts.push(json!({
+                                "text": th.text,
+                                "thought": true,
+                                "thoughtSignature": s.value,
+                            }));
+                        }
+                    }
                     _ => dropped.feature(Feature::ReasoningHistory),
                 },
-                Part::ToolCall(c) => parts.push(json!({
-                    "functionCall": { "id": c.id, "name": c.name, "args": c.input.to_object() },
-                })),
+                Part::ToolCall(c) => {
+                    let mut part = json!({
+                        "functionCall": { "id": c.id, "name": c.name, "args": c.input.to_object() },
+                    });
+                    if let Some(sig) = call_sig.take() {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(part);
+                }
                 Part::ToolResult(res) => {
                     if res.has_image() {
                         dropped.feature(Feature::ToolResultImage);
@@ -563,6 +615,121 @@ mod tests {
             (true, Some(8192), true)
         );
         assert_eq!(dropped, ["tools.googleSearch", "safetySettings"]);
+    }
+
+    /// 签名在 functionCall 那一格上：读成紧挨在前面的空思考块，占位值不算签名；
+    /// 一段一格的思考文字并成一块。
+    #[test]
+    fn a_signature_on_a_function_call_is_kept_and_the_placeholder_is_not() {
+        let (r, _) = decode(
+            r#"{"contents": [
+                {"role": "user", "parts": [{"text": "读 a"}]},
+                {"role": "model", "parts": [
+                    {"text": "先", "thought": true},
+                    {"text": "想想", "thought": true, "thoughtSignature": "tw1.a.sig"},
+                    {"functionCall": {"name": "Read", "args": {"p": "a"}}, "thoughtSignature": "CiQB"},
+                    {"functionCall": {"name": "Read", "args": {"p": "b"}}, "thoughtSignature": "skip_thought_signature_validator"},
+                    {"functionCall": {"name": "Read", "args": {"p": "c"}}, "thoughtSignature": "tw1.ar.data"}
+                ]}
+            ]}"#,
+        );
+        let parts = &r.messages[1].parts;
+        assert_eq!(parts.len(), 6, "{parts:?}");
+        assert_eq!(
+            parts[0],
+            Part::Thinking(Thinking {
+                text: "先想想".into(),
+                signature: Some(Signature::new(Vendor::Anthropic, "sig")),
+            })
+        );
+        assert_eq!(
+            parts[1],
+            Part::Thinking(Thinking {
+                text: String::new(),
+                signature: Some(Signature::new(Vendor::Google, "CiQB")),
+            })
+        );
+        assert!(
+            matches!(&parts[2], Part::ToolCall(c) if c.input == ToolInput::Json(json!({"p": "a"})))
+        );
+        assert!(
+            matches!(&parts[3], Part::ToolCall(c) if c.input == ToolInput::Json(json!({"p": "b"})))
+        );
+        assert_eq!(
+            parts[4],
+            Part::Thinking(Thinking {
+                text: String::new(),
+                signature: Some(Signature {
+                    vendor: Vendor::Anthropic,
+                    value: "data".into(),
+                    redacted: true,
+                }),
+            })
+        );
+        assert!(matches!(&parts[5], Part::ToolCall(_)));
+    }
+
+    /// 回 Gemini 时签名放回 functionCall 那一格，不写成单独的思考，也不写占位值。
+    #[test]
+    fn a_calls_signature_goes_back_on_the_function_call() {
+        let r = Request {
+            model: "gemini-3-pro-preview".into(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![Part::Text("读 a".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        Part::Thinking(Thinking {
+                            text: "想".into(),
+                            signature: Some(Signature::new(Vendor::Google, "thought_sig")),
+                        }),
+                        Part::Thinking(Thinking {
+                            text: String::new(),
+                            signature: Some(Signature::new(Vendor::Google, "CiQB")),
+                        }),
+                        Part::ToolCall(ToolCall {
+                            id: "call_1".into(),
+                            name: "Read".into(),
+                            input: ToolInput::Json(json!({"p": "a"})),
+                        }),
+                        Part::ToolCall(ToolCall {
+                            id: "call_2".into(),
+                            name: "Read".into(),
+                            input: ToolInput::Json(json!({"p": "b"})),
+                        }),
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    parts: vec![
+                        Part::ToolResult(ToolResult {
+                            id: "call_1".into(),
+                            content: vec![Part::Text("A".into())],
+                            is_error: false,
+                        }),
+                        Part::ToolResult(ToolResult {
+                            id: "call_2".into(),
+                            content: vec![Part::Text("B".into())],
+                            is_error: false,
+                        }),
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+        let (v, dropped) = encode(&r, Dialect::Anthropic);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        let parts = v["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["thoughtSignature"], "thought_sig");
+        assert_eq!(parts[1]["functionCall"]["args"]["p"], "a");
+        assert_eq!(parts[1]["thoughtSignature"], "CiQB");
+        assert_eq!(parts[2]["functionCall"]["args"]["p"], "b");
+        assert!(parts[2].get("thoughtSignature").is_none());
     }
 
     #[test]

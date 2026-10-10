@@ -53,6 +53,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
+# 压缩过的请求体和上游回答：gzip、deflate 用它解，zstd 用上面那个
+flate2 = { workspace = true }
 
 [dev-dependencies]
 # 假的 Bedrock 要回 eventstream 的二进制帧

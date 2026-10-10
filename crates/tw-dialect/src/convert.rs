@@ -210,6 +210,8 @@ pub struct Session {
     pub stream: bool,
     /// 客户端定义成自由格式的工具
     pub(crate) freeform: HashSet<String>,
+    /// 请求定义的全部工具名：Chat 上游把调用写进正文时，只认这些（见 [`chat::text_calls`]）
+    pub(crate) tools: HashSet<String>,
     /// 客户端的写法细节
     pub(crate) shape: ClientShape,
 }
@@ -232,6 +234,7 @@ impl Session {
                 .filter(|t| matches!(t.kind, ToolKind::Freeform { .. }))
                 .map(|t| t.name.clone())
                 .collect(),
+            tools: r.tools.iter().map(|t| t.name.clone()).collect(),
             shape,
         }
     }
@@ -353,8 +356,12 @@ impl Session {
         }
     }
 
-    /// 自由格式工具的输入：别家上游把它包在 `{"input": …}` 里，拆出来
+    /// 自由格式工具的输入：别家上游把它包在 `{"input": …}` 里，拆出来。Chat 上游写进
+    /// 正文的工具调用先换成调用块
     fn normalize(&self, r: &mut Response) {
+        if self.upstream == Dialect::Chat {
+            chat::text_calls::rewrite(r, &self.tools);
+        }
         for b in &mut r.blocks {
             if let Block::ToolCall(c) = b
                 && self.is_freeform(&c.name)
@@ -373,6 +380,7 @@ impl Session {
             model: "m".into(),
             stream: true,
             freeform: HashSet::new(),
+            tools: HashSet::new(),
             shape: ClientShape {
                 namespaced: HashMap::new(),
                 include_usage: false,
@@ -522,7 +530,8 @@ impl Parser {
 enum Writer {
     Anthropic(anthropic::stream::Writer),
     Chat(chat::stream::Writer),
-    Responses(responses::stream::Writer),
+    /// 装箱：Responses 的写出器比别家的大一倍，不装箱的话每条流都按它的大小占内存
+    Responses(Box<responses::stream::Writer>),
     Gemini(gemini::stream::Writer),
     Bedrock(bedrock::stream::Writer),
 }
@@ -532,7 +541,7 @@ impl Writer {
         match s.client {
             Dialect::Anthropic => Writer::Anthropic(anthropic::stream::Writer::new(s)),
             Dialect::Chat => Writer::Chat(chat::stream::Writer::new(s)),
-            Dialect::Responses => Writer::Responses(responses::stream::Writer::new(s)),
+            Dialect::Responses => Writer::Responses(Box::new(responses::stream::Writer::new(s))),
             Dialect::Gemini => Writer::Gemini(gemini::stream::Writer::new(s)),
             Dialect::Bedrock => Writer::Bedrock(bedrock::stream::Writer::new(s)),
         }
@@ -559,12 +568,15 @@ impl Writer {
     }
 }
 
-/// 解析器和写出器之间的两处修正。
+/// 解析器和写出器之间的几处修正。
 ///
+/// - **写进正文的工具调用**：Chat 上游的文本块里按模板写的调用换成调用块
+///   （见 [`chat::text_calls`]），排在最前，后面两条也适用于换出来的调用
 /// - **自由格式工具**：别家上游把原文包在 `{"input": …}` 里分片发来，攒到块结束拆出原文
 /// - **没有参数的函数调用**：有的上游一个参数片段都不发，补一个 `{}`，否则客户端解析
 ///   空串会失败
 struct Normalizer {
+    text_calls: Option<chat::text_calls::Stage>,
     freeform: HashSet<String>,
     /// 上游把自由格式的输入包成 JSON（除 Responses 以外都是）
     wrapped: bool,
@@ -576,6 +588,8 @@ struct Normalizer {
 impl Normalizer {
     fn new(s: &Session) -> Normalizer {
         Normalizer {
+            text_calls: (s.upstream == Dialect::Chat && !s.tools.is_empty())
+                .then(|| chat::text_calls::Stage::new(s.tools.clone())),
             freeform: s.freeform.clone(),
             wrapped: s.upstream != Dialect::Responses,
             buffers: HashMap::new(),
@@ -584,6 +598,16 @@ impl Normalizer {
     }
 
     fn apply(&mut self, e: Event, out: &mut Vec<Event>) {
+        let events = match self.text_calls.as_mut() {
+            Some(stage) => stage.apply(e),
+            None => vec![e],
+        };
+        for e in events {
+            self.apply_one(e, out);
+        }
+    }
+
+    fn apply_one(&mut self, e: Event, out: &mut Vec<Event>) {
         match &e {
             Event::BlockStart {
                 index,
@@ -980,6 +1004,16 @@ pub fn strip_carried(client: Dialect, body: &[u8]) -> Option<Vec<u8>> {
                             ))
                     });
                     changed |= parts.len() != before;
+                    // functionCall 上别家的签名：这一格要留，签名换成迁移历史用的占位值，
+                    // 和转换时给无签名调用写的一样
+                    for p in parts.iter_mut().filter(|p| p.get("functionCall").is_some()) {
+                        for key in ["thoughtSignature", "thought_signature"] {
+                            if carried(p.get(key)) {
+                                p[key] = Value::from(gemini::request::SYNTHETIC_SIGNATURE);
+                                changed = true;
+                            }
+                        }
+                    }
                 }
             }
             contents.retain(|c| {
@@ -1451,6 +1485,26 @@ mod tests {
                 .unwrap();
         assert_eq!(out["input"].as_array().unwrap().len(), 1);
         assert_eq!(out["input"][0]["id"], "rs_1");
+
+        let body = json!({"contents": [
+            {"role": "model", "parts": [
+                {"text": "x", "thought": true, "thoughtSignature": "tw1.a.sig"},
+                {"functionCall": {"name": "ls", "args": {}}, "thoughtSignature": "tw1.ar.data"},
+                {"functionCall": {"name": "cat", "args": {}}, "thoughtSignature": "CiQB"}
+            ]}
+        ]})
+        .to_string();
+        let out: Value =
+            serde_json::from_slice(&strip_carried(Dialect::Gemini, body.as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(
+            out["contents"][0]["parts"],
+            json!([
+                {"functionCall": {"name": "ls", "args": {}}, "thoughtSignature": gemini::request::SYNTHETIC_SIGNATURE},
+                {"functionCall": {"name": "cat", "args": {}}, "thoughtSignature": "CiQB"}
+            ]),
+            "functionCall 那一格要留，别家的签名换成占位值"
+        );
     }
 
     /// 独立的错误帧：每种格式都是客户端认得的那种事件，类别跟着状态码走。

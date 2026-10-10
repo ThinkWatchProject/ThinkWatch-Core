@@ -5,8 +5,10 @@
 //! 本地应答在准入之前（离线也要能答），准入在路由之前（列表即承诺），
 //! 并发闸门在路由之后（被规则挡下的不用先排队）。
 //!
-//! 发出开始事件之后的两段各自一个子模块：[`hop`] 依次试候选上游（每一跳先过插件的
-//! 请求钩子，见 [`plug`]），[`relay`] 把选中那一家的响应交给客户端。
+//! 路由之后的几步归 [`answer`] 所有：流式的回答压着不给响应头的时限（见 [`commit`]）从进
+//! 准入起算，排在这把密钥的并发闸门、用量窗口后面的请求和等上游空位的一样，过了时限先拿到
+//! `200` 和保活。发出开始事件之后的两段各自一个子模块：[`hop`] 依次试候选上游（每一跳先过
+//! 插件的请求钩子，见 [`plug`]），[`relay`] 把选中那一家的响应交给客户端。
 
 use std::sync::Arc;
 
@@ -85,7 +87,7 @@ struct Started {
 pub(super) async fn pipeline(
     state: AppState,
     rt: Arc<Runtime>,
-    mut req: Inbound,
+    req: Inbound,
     live: crate::live::Pass,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Result<Response, GatewayError> {
@@ -142,6 +144,98 @@ pub(super) async fn pipeline(
         }
     };
 
+    // 管线第 3 步起**归回答那一段**（见 [`answer`]）：流式的回答压着不给响应头的时限从进
+    // 准入起算 —— 等这把密钥的并发空位、等用量窗口的空位和等上游的空位一样，等过了时限客户端
+    // 拿到 `200` 和保活（见 `commit`），不至于一个字节都收不到而自己断开
+    let early = commit::early(&state, &req, &reading);
+    let abort = req.abort.clone();
+    let dialect = req.dialect;
+    let run = answer(
+        state,
+        rt,
+        req,
+        Chosen {
+            parsed,
+            reading,
+            fp,
+            conv,
+            choice,
+            decision,
+        },
+        live,
+        ending.take(),
+    );
+    match early {
+        None => run.await,
+        Some(e) => commit::hold(run, dialect, e, abort).await,
+    }
+}
+
+/// 路由之后定下的，准入起归回答那一段所有（见 [`answer`]）。
+struct Chosen {
+    /// 解析过的请求体：内容过滤还要用一次，之后就用完了
+    parsed: Option<serde_json::Value>,
+    reading: crate::client_api::Reading,
+    /// 这段对话的指纹（见 [`crate::affinity::identity`]）
+    fp: Option<String>,
+    conv: Option<crate::affinity::Conversation>,
+    choice: Choice,
+    decision: tw_engine::Decision,
+}
+
+/// 发出开始事件之后，回答那一段要的：路由事实、决定、开始时定下的、这段对话这一轮，和两张
+/// 通行证（在服务中、这把密钥的并发）。
+struct Tail {
+    reading: crate::client_api::Reading,
+    decision: tw_engine::Decision,
+    started: Started,
+    conv: Option<crate::affinity::Conversation>,
+    passes: (crate::live::Pass, crate::limits::Pass),
+}
+
+/// 管线第 3 步起：准入（见 [`admission`]）、内容过滤、开始事件，然后依次试候选上游（见
+/// [`hop`]），把接下的那一家的回答交给客户端（见 [`relay`]）。
+///
+/// **拥有它要的一切**（不借管线的东西）：流式的回答等过一阵还没有内容时，响应头先交出去，
+/// 它挪进响应体里接着跑（见 [`commit`]）—— 等准入的那一段也在里面，排着队的请求一样等得到
+/// 响应头。结局也在它手上：返回错误之前自己报失败（准入拒绝的也是，和路由拒绝的留一样的
+/// 一行），被丢掉由结局的 Drop 报（客户端走了是取消，叫停了是手动中止）。
+async fn answer(
+    state: AppState,
+    rt: Arc<Runtime>,
+    mut req: Inbound,
+    chosen: Chosen,
+    live: crate::live::Pass,
+    mut ending: Option<crate::ending::Ending>,
+) -> Result<Response, GatewayError> {
+    let r = async {
+        let tail = enter(&state, &rt, &mut req, chosen, live, &mut ending).await?;
+        answer_with(&state, &rt, &req, tail, &mut ending).await
+    }
+    .await;
+    if let (Err(e), Some(end)) = (&r, ending.take()) {
+        end.failed(e.source.into(), e.detail.clone());
+    }
+    r
+}
+
+/// 管线第 3、4 步：准入，内容过滤，发出开始事件。
+async fn enter(
+    state: &AppState,
+    rt: &Arc<Runtime>,
+    req: &mut Inbound,
+    chosen: Chosen,
+    live: crate::live::Pass,
+    ending: &mut Option<crate::ending::Ending>,
+) -> Result<Tail, GatewayError> {
+    let Chosen {
+        parsed,
+        mut reading,
+        fp,
+        conv,
+        choice,
+        decision,
+    } = chosen;
     // 管线第 3 步：这把密钥的用量上限和并发上限（见 `admission`）。放在路由之后：被规则
     // 挡下的请求不用先等一轮。被用量上限拒绝的照样留一行
     //
@@ -152,9 +246,9 @@ pub(super) async fn pipeline(
         hold,
         wait_until,
     } = admission::admit(
-        &state,
-        &rt,
-        &req,
+        state,
+        rt,
+        req,
         &reading,
         &choice,
         &decision,
@@ -168,13 +262,13 @@ pub(super) async fn pipeline(
     let size = req.body.len();
     let screened = req.body.clone();
     let (screening, started) = heavy_for(size, || {
-        let screening = screen(&rt, &mut req, &mut reading, parsed.as_ref());
+        let screening = screen(rt, req, &mut reading, parsed.as_ref());
         // 解析出来的那一份到这里就用完了：删过字的话它也不再是请求体的样子
         drop(parsed);
         let started = start(
-            &state,
-            &rt,
-            &req,
+            state,
+            rt,
+            req,
             &reading,
             choice,
             wait_until,
@@ -192,7 +286,7 @@ pub(super) async fn pipeline(
     let refused = (!screening.hits.is_empty())
         .then(|| {
             // 前后文和存下来的正文一样换、打码：同一套规则、同一本账
-            let redaction = redaction(&rt, started.ledger.clone());
+            let redaction = redaction(rt, started.ledger.clone());
             let src = crate::guard::detail::Screened {
                 body: &screened,
                 dialect: req.api.map(|a| a.dialect()),
@@ -208,59 +302,16 @@ pub(super) async fn pipeline(
     if let Some(why) = refused {
         return Err(GatewayError::denied(why));
     }
-    // 管线第 5 步：试上游、交回答（见 `answer`）。它拿走这个请求要的一切：流式的回答等不到
-    // 内容时，响应头先交给客户端，它在响应体里接着跑（见 `commit`）
-    let early = commit::early(&state, &req, &reading);
-    let abort = req.abort.clone();
-    let dialect = req.dialect;
-    let run = answer(
-        state,
-        rt,
-        req,
-        Tail {
-            reading,
-            decision,
-            started,
-            conv,
-            passes: (live, pass),
-        },
-        ending.take(),
-    );
-    match early {
-        None => run.await,
-        Some(e) => commit::hold(run, dialect, e, abort).await,
-    }
-}
-
-/// 发出开始事件之后，回答那一段要的：路由事实、决定、开始时定下的、这段对话这一轮，和两张
-/// 通行证（在服务中、这把密钥的并发）。
-struct Tail {
-    reading: crate::client_api::Reading,
-    decision: tw_engine::Decision,
-    started: Started,
-    conv: Option<crate::affinity::Conversation>,
-    passes: (crate::live::Pass, crate::limits::Pass),
+    Ok(Tail {
+        reading,
+        decision,
+        started,
+        conv,
+        passes: (live, pass),
+    })
 }
 
 /// 管线第 5 步：依次试候选上游（见 [`hop`]），把接下的那一家的回答交给客户端（见 [`relay`]）。
-///
-/// **拥有它要的一切**（不借管线的东西）：流式的回答等过一阵还没有内容时，响应头先交出去，
-/// 它挪进响应体里接着跑（见 [`commit`]）。结局也在它手上：返回错误之前自己报失败，被丢掉
-/// 由结局的 Drop 报（客户端走了是取消，叫停了是手动中止）。
-async fn answer(
-    state: AppState,
-    rt: Arc<Runtime>,
-    req: Inbound,
-    tail: Tail,
-    mut ending: Option<crate::ending::Ending>,
-) -> Result<Response, GatewayError> {
-    let r = answer_with(&state, &rt, &req, tail, &mut ending).await;
-    if let (Err(e), Some(end)) = (&r, ending.take()) {
-        end.failed(e.source.into(), e.detail.clone());
-    }
-    r
-}
-
 async fn answer_with(
     state: &AppState,
     rt: &Arc<Runtime>,

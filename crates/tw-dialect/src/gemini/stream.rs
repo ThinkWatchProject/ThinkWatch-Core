@@ -92,6 +92,23 @@ impl Parser {
                 }
             } else if let Some(call) = field(p, "functionCall") {
                 self.close(out);
+                // 这一格上的签名记成紧挨在前面的空思考块（见 `request::call_signature`）
+                if let Some(sig) = field(p, "thoughtSignature")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Signature::read(s, Vendor::Google))
+                {
+                    let index = self.next;
+                    self.next += 1;
+                    out.push(Event::BlockStart {
+                        index,
+                        kind: BlockKind::Thinking,
+                    });
+                    out.push(Event::Delta {
+                        index,
+                        delta: Delta::Signature(sig),
+                    });
+                    out.push(Event::BlockStop { index });
+                }
                 let index = self.next;
                 self.next += 1;
                 self.tool_call = true;
@@ -169,8 +186,14 @@ pub struct Writer {
     model: String,
     /// 工具块 → (id, 名字, 攒着的参数)
     tools: HashMap<usize, (String, String, String)>,
+    /// 思考块最后一段还没写出的文字：块结束时和签名写在同一格里，所以每段都压一段
+    /// 再写，只晚一段
+    thoughts: HashMap<usize, String>,
     /// 思考块的签名，块结束时写出
     signatures: HashMap<usize, Signature>,
+    /// 没有文字的思考块只是签名（functionCall 的签名、改写过的思考）：等着写到下一个
+    /// functionCall 那一格上；下一格不是 functionCall 就单独写一格
+    pending: Vec<Signature>,
     usage: Option<Usage>,
     stop: Option<StopReason>,
     done: bool,
@@ -184,7 +207,9 @@ impl Writer {
             id: new_id(""),
             model: s.model.clone(),
             tools: HashMap::new(),
+            thoughts: HashMap::new(),
             signatures: HashMap::new(),
+            pending: Vec::new(),
             usage: None,
             stop: None,
             done: false,
@@ -201,7 +226,24 @@ impl Writer {
         self.wrote_any = true;
     }
 
-    fn chunk(&mut self, parts: Vec<Value>, out: &mut String) {
+    /// 等着放到 functionCall 上的签名各自写成一格空思考
+    fn flush_pending(&mut self, parts: &mut Vec<Value>) {
+        for s in self.pending.drain(..) {
+            parts.push(json!({
+                "text": "",
+                "thought": true,
+                "thoughtSignature": s.carried_in(Vendor::Google),
+            }));
+        }
+    }
+
+    fn chunk(&mut self, mut parts: Vec<Value>, out: &mut String) {
+        if !self.pending.is_empty() {
+            let mut all = Vec::new();
+            self.flush_pending(&mut all);
+            all.append(&mut parts);
+            parts = all;
+        }
         let v = json!({
             "candidates": [{ "content": { "role": "model", "parts": parts }, "index": 0 }],
             "modelVersion": self.model,
@@ -234,9 +276,12 @@ impl Writer {
             Event::BlockStart { .. } => {}
             Event::Delta { index, delta } => match delta {
                 Delta::Text(t) => self.chunk(vec![json!({ "text": t })], &mut out),
-                Delta::Thinking(t) => {
-                    self.chunk(vec![json!({ "text": t, "thought": true })], &mut out)
+                Delta::Thinking(t) if !t.is_empty() => {
+                    if let Some(prev) = self.thoughts.insert(*index, t.clone()) {
+                        self.chunk(vec![json!({ "text": prev, "thought": true })], &mut out);
+                    }
                 }
+                Delta::Thinking(_) => {}
                 Delta::Signature(s) => {
                     self.signatures.insert(*index, s.clone());
                 }
@@ -248,20 +293,29 @@ impl Writer {
             },
             Event::BlockStop { index } => {
                 if let Some((id, name, args)) = self.tools.remove(index) {
-                    let args = ToolInput::from_json_text(&args).to_object();
-                    self.chunk(
-                        vec![json!({ "functionCall": { "id": id, "name": name, "args": args } })],
-                        &mut out,
-                    );
-                } else if let Some(s) = self.signatures.remove(index) {
-                    self.chunk(
-                        vec![json!({
-                            "text": "",
-                            "thought": true,
-                            "thoughtSignature": s.carried_in(Vendor::Google),
-                        })],
-                        &mut out,
-                    );
+                    let call = ToolCall {
+                        id,
+                        name,
+                        input: ToolInput::from_json_text(&args),
+                    };
+                    // 一格只放一个签名：攒了几个时前面的各自写一格
+                    let sig = self.pending.pop();
+                    let mut parts = Vec::new();
+                    self.flush_pending(&mut parts);
+                    parts.push(super::response::call_part(&call, sig.as_ref()));
+                    self.chunk(parts, &mut out);
+                } else {
+                    match (self.thoughts.remove(index), self.signatures.remove(index)) {
+                        (Some(text), sig) => {
+                            let mut p = json!({ "text": text, "thought": true });
+                            if let Some(s) = sig {
+                                p["thoughtSignature"] = json!(s.carried_in(Vendor::Google));
+                            }
+                            self.chunk(vec![p], &mut out);
+                        }
+                        (None, Some(s)) => self.pending.push(s),
+                        (None, None) => {}
+                    }
                 }
             }
             Event::Usage(u) => self.usage.get_or_insert_default().merge(u),
@@ -287,9 +341,21 @@ impl Writer {
         if self.done {
             return out;
         }
+        let mut parts = Vec::new();
+        self.flush_pending(&mut parts);
+        // 没等到块结束的思考文字也不能丢
+        let mut open: Vec<(usize, String)> = self.thoughts.drain().collect();
+        open.sort_by_key(|(i, _)| *i);
+        for (index, text) in open {
+            let mut p = json!({ "text": text, "thought": true });
+            if let Some(s) = self.signatures.remove(&index) {
+                p["thoughtSignature"] = json!(s.carried_in(Vendor::Google));
+            }
+            parts.push(p);
+        }
         let mut v = json!({
             "candidates": [{
-                "content": { "role": "model", "parts": [] },
+                "content": { "role": "model", "parts": parts },
                 "finishReason": finish_reason(self.stop.as_ref().unwrap_or(&StopReason::EndTurn)),
                 "index": 0,
             }],
@@ -337,8 +403,17 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(kinds.len(), 3);
-        assert!(matches!(kinds[2], BlockKind::ToolCall { name, .. } if name == "ls"));
+        assert_eq!(kinds.len(), 4);
+        assert_eq!(
+            kinds[2],
+            &BlockKind::Thinking,
+            "functionCall 上的签名是紧挨在调用前面的一个空思考块"
+        );
+        assert!(matches!(kinds[3], BlockKind::ToolCall { name, .. } if name == "ls"));
+        assert!(ev.contains(&Event::Delta {
+            index: 2,
+            delta: Delta::Signature(Signature::new(Vendor::Google, "CiQB")),
+        }));
         let text: String = ev
             .iter()
             .filter_map(|e| match e {
@@ -429,6 +504,169 @@ mod tests {
         assert_eq!(chunks[2]["candidates"][0]["finishReason"], "STOP");
         assert_eq!(chunks[2]["usageMetadata"]["totalTokenCount"], 10);
         assert_eq!(chunks[0]["modelVersion"], "claude-opus-4-7");
+    }
+
+    fn chunks_of(events: &[Event]) -> Vec<Value> {
+        let s = Session::for_test(Dialect::Gemini, Dialect::Anthropic);
+        let mut w = Writer::new(&s);
+        let mut out = String::new();
+        for e in events {
+            out.push_str(&w.event(e));
+        }
+        out.push_str(&w.finish());
+        let mut d = Decoder::default();
+        d.feed(out.as_bytes())
+            .into_iter()
+            .map(|f| serde_json::from_str(&f.data).unwrap())
+            .collect()
+    }
+
+    fn parts_of(chunks: &[Value]) -> Vec<Value> {
+        chunks
+            .iter()
+            .flat_map(|c| {
+                c["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// 思考文字一段一段写，签名和最后一段写在同一格里，不单独占一格。
+    #[test]
+    fn a_thoughts_signature_is_written_in_the_same_part_as_its_last_text() {
+        let chunks = chunks_of(&[
+            Event::BlockStart {
+                index: 0,
+                kind: BlockKind::Thinking,
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Thinking("先".into()),
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Thinking("想想".into()),
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Signature(Signature::new(Vendor::Anthropic, "sig")),
+            },
+            Event::BlockStop { index: 0 },
+            Event::BlockStart {
+                index: 1,
+                kind: BlockKind::Text,
+            },
+            Event::Delta {
+                index: 1,
+                delta: Delta::Text("好".into()),
+            },
+            Event::BlockStop { index: 1 },
+            Event::Stop(StopReason::EndTurn),
+        ]);
+        let parts = parts_of(&chunks);
+        assert_eq!(
+            parts,
+            json!([
+                {"text": "先", "thought": true},
+                {"text": "想想", "thought": true, "thoughtSignature": "tw1.a.sig"},
+                {"text": "好"},
+            ])
+            .as_array()
+            .unwrap()
+            .as_slice(),
+            "{chunks:?}"
+        );
+    }
+
+    /// 没有文字的签名块跟着工具调用：签名写在 functionCall 那一格上。
+    #[test]
+    fn a_calls_signature_is_written_on_the_function_call_part() {
+        let chunks = chunks_of(&[
+            Event::BlockStart {
+                index: 0,
+                kind: BlockKind::Thinking,
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Thinking(String::new()),
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Signature(Signature::new(Vendor::Google, "CiQB")),
+            },
+            Event::BlockStop { index: 0 },
+            Event::BlockStart {
+                index: 1,
+                kind: BlockKind::ToolCall {
+                    id: "call_1".into(),
+                    name: "ls".into(),
+                },
+            },
+            Event::Delta {
+                index: 1,
+                delta: Delta::ToolInput("{\"p\":\".\"}".into()),
+            },
+            Event::BlockStop { index: 1 },
+            Event::Stop(StopReason::ToolUse),
+        ]);
+        let parts = parts_of(&chunks);
+        assert_eq!(parts.len(), 1, "{chunks:?}");
+        assert_eq!(parts[0]["functionCall"]["name"], "ls");
+        assert_eq!(parts[0]["thoughtSignature"], "CiQB");
+    }
+
+    /// 签名块后面不是工具调用：单独写一格，不能丢。
+    #[test]
+    fn a_signature_without_a_call_after_it_still_gets_a_part() {
+        let chunks = chunks_of(&[
+            Event::BlockStart {
+                index: 0,
+                kind: BlockKind::Thinking,
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Signature(Signature {
+                    vendor: Vendor::Anthropic,
+                    value: "data".into(),
+                    redacted: true,
+                }),
+            },
+            Event::BlockStop { index: 0 },
+            Event::BlockStart {
+                index: 1,
+                kind: BlockKind::Text,
+            },
+            Event::Delta {
+                index: 1,
+                delta: Delta::Text("好".into()),
+            },
+            Event::BlockStop { index: 1 },
+        ]);
+        assert_eq!(
+            parts_of(&chunks),
+            json!([
+                {"text": "", "thought": true, "thoughtSignature": "tw1.ar.data"},
+                {"text": "好"},
+            ])
+            .as_array()
+            .unwrap()
+            .as_slice()
+        );
+        // 流结束时还挂着的也写出来
+        let chunks = chunks_of(&[
+            Event::BlockStart {
+                index: 0,
+                kind: BlockKind::Thinking,
+            },
+            Event::Delta {
+                index: 0,
+                delta: Delta::Signature(Signature::new(Vendor::Google, "CiQB")),
+            },
+            Event::BlockStop { index: 0 },
+        ]);
+        assert_eq!(parts_of(&chunks)[0]["thoughtSignature"], "CiQB");
     }
 
     #[test]
