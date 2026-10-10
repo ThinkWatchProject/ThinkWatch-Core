@@ -86,6 +86,16 @@ pub fn decode_response(v: &Value) -> Response {
                 blocks.push(Block::Text(t.to_string()));
             }
         } else if let Some(call) = field(p, "functionCall") {
+            // 这一格上的签名记成紧挨在前面的空思考块（见 `request::call_signature`）
+            if let Some(sig) = field(p, "thoughtSignature")
+                .and_then(Value::as_str)
+                .and_then(|s| Signature::read(s, Vendor::Google))
+            {
+                blocks.push(Block::Thinking(Thinking {
+                    text: String::new(),
+                    signature: Some(sig),
+                }));
+            }
             blocks.push(Block::ToolCall(ToolCall {
                 id: field(call, "id")
                     .and_then(Value::as_str)
@@ -121,28 +131,49 @@ pub fn decode_response(v: &Value) -> Response {
     }
 }
 
-pub(crate) fn part(b: &Block) -> Option<Value> {
-    Some(match b {
-        Block::Text(t) => json!({ "text": t }),
-        Block::Thinking(th) => {
-            if th.text.is_empty() && th.signature.is_none() {
-                return None;
-            }
-            let mut p = json!({ "text": th.text, "thought": true });
-            if let Some(s) = &th.signature {
-                p["thoughtSignature"] = json!(s.carried_in(Vendor::Google));
-            }
-            p
+pub(crate) fn call_part(c: &ToolCall, signature: Option<&Signature>) -> Value {
+    let mut p = json!({
+        "functionCall": { "id": c.id, "name": c.name, "args": c.input.to_object() },
+    });
+    if let Some(s) = signature {
+        p["thoughtSignature"] = json!(s.carried_in(Vendor::Google));
+    }
+    p
+}
+
+/// 给 Gemini 客户端的 parts。没有文字、紧挨着工具调用的思考块只是那个调用的签名
+/// （见 `request::call_signature`），写在 functionCall 那一格上
+pub(crate) fn parts(blocks: &[Block]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut call_sig: Option<&Signature> = None;
+    for (i, b) in blocks.iter().enumerate() {
+        match b {
+            Block::Text(t) => out.push(json!({ "text": t })),
+            Block::Thinking(th) => match &th.signature {
+                Some(s)
+                    if th.text.is_empty()
+                        && matches!(blocks.get(i + 1), Some(Block::ToolCall(_))) =>
+                {
+                    call_sig = Some(s);
+                }
+                None if th.text.is_empty() => {}
+                sig => {
+                    let mut p = json!({ "text": th.text, "thought": true });
+                    if let Some(s) = sig {
+                        p["thoughtSignature"] = json!(s.carried_in(Vendor::Google));
+                    }
+                    out.push(p);
+                }
+            },
+            Block::ToolCall(c) => out.push(call_part(c, call_sig.take())),
         }
-        Block::ToolCall(c) => json!({
-            "functionCall": { "id": c.id, "name": c.name, "args": c.input.to_object() },
-        }),
-    })
+    }
+    out
 }
 
 /// 中间表示 → 给 Gemini 客户端的整包响应。
 pub fn encode_response(r: &Response, s: &Session) -> Value {
-    let parts: Vec<Value> = r.blocks.iter().filter_map(part).collect();
+    let parts = parts(&r.blocks);
     let mut out = json!({
         "candidates": [{
             "content": { "role": "model", "parts": parts },
@@ -212,7 +243,45 @@ mod tests {
             ]}, "finishReason": "STOP"}]
         }));
         assert_eq!(r.stop, Some(StopReason::ToolUse));
-        assert!(matches!(&r.blocks[1], Block::ToolCall(c) if c.id.starts_with("call_")));
+        assert_eq!(
+            r.blocks[1],
+            Block::Thinking(Thinking {
+                text: String::new(),
+                signature: Some(Signature::new(Vendor::Google, "CiQB")),
+            }),
+            "functionCall 上的签名记成紧挨在前面的空思考块"
+        );
+        assert!(matches!(&r.blocks[2], Block::ToolCall(c) if c.id.starts_with("call_")));
+    }
+
+    #[test]
+    fn a_calls_signature_goes_back_on_the_function_call_part() {
+        let r = Response {
+            blocks: vec![
+                Block::Thinking(Thinking {
+                    text: "想".into(),
+                    signature: Some(Signature::new(Vendor::Anthropic, "sig_a")),
+                }),
+                Block::Thinking(Thinking {
+                    text: String::new(),
+                    signature: Some(Signature::new(Vendor::Google, "CiQB")),
+                }),
+                Block::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "ls".into(),
+                    input: ToolInput::Json(json!({"p": "."})),
+                }),
+            ],
+            stop: Some(StopReason::ToolUse),
+            ..Default::default()
+        };
+        let v = encode_response(&r, &Session::for_test(Dialect::Gemini, Dialect::Gemini));
+        let parts = v["candidates"][0]["content"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["thoughtSignature"], "tw1.a.sig_a");
+        assert_eq!(parts[1]["functionCall"]["name"], "ls");
+        assert_eq!(parts[1]["thoughtSignature"], "CiQB");
     }
 
     #[test]
