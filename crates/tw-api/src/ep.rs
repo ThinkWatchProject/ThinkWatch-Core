@@ -118,7 +118,8 @@ endpoints! {
     SetManualModels: PUT "/provider-manual-models", api::ManualModelsSave => api::ConfigWritten;
     RefreshProviderModels: POST "/providers/{name}/models/refresh" [name], () => api::ProviderModelsView;
     /// 马上读一次这家的余额（`balance` 是 `auto` 时先认出是哪一种中转站）。没有余额可读的
-    /// 是 404（`control.balance_none`）
+    /// 是 404（`control.balance_none`）；`auto` 的没问成是哪一种（连不上、超时、对方出错）
+    /// 是 502，带着原因（`gw.balance.*`）
     RefreshBalance: POST "/providers/{name}/balance/refresh" [name], () => api::Balance;
     RefreshStaleModels: POST "/models/refresh", () => api::ModelsRefreshing;
     CreateProxy: POST "/proxies", api::ProxySave => api::ConfigWritten;
