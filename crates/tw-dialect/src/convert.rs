@@ -356,8 +356,17 @@ impl Session {
         }
     }
 
+    /// **不**把 Chat 上游写进正文的工具调用换成调用块。
+    ///
+    /// 原样转发的流，客户端收到的就是那段正文；照着它记的副本（日志、缓存）不该比客户端
+    /// 多出一个调用来。只转发、不转换的一方在拿到会话之后调一次这个
+    pub fn keep_text_calls(mut self) -> Session {
+        self.tools.clear();
+        self
+    }
+
     /// 自由格式工具的输入：别家上游把它包在 `{"input": …}` 里，拆出来。Chat 上游写进
-    /// 正文的工具调用先换成调用块
+    /// 正文的工具调用先换成调用块（除非 [`Session::keep_text_calls`]）
     fn normalize(&self, r: &mut Response) {
         if self.upstream == Dialect::Chat {
             chat::text_calls::rewrite(r, &self.tools);
@@ -1177,6 +1186,26 @@ mod stream_error_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 只转发、不转换的一方：客户端收到的是正文，照着它记的副本也要是正文
+    #[test]
+    fn keep_text_calls_leaves_a_written_call_as_text() {
+        let text = "<tool_call>{\"name\": \"Read\", \"arguments\": {}}</tool_call>";
+        let fresh = || Response {
+            blocks: vec![Block::Text(text.into())],
+            stop: Some(StopReason::EndTurn),
+            ..Default::default()
+        };
+        let mut s = Session::for_test(Dialect::Anthropic, Dialect::Chat);
+        s.tools.insert("Read".into());
+        let mut r = fresh();
+        s.normalize(&mut r);
+        assert!(matches!(&r.blocks[0], Block::ToolCall(c) if c.name == "Read"));
+        let s = s.keep_text_calls();
+        let mut r = fresh();
+        s.normalize(&mut r);
+        assert_eq!(r.blocks[0], Block::Text(text.into()));
+    }
 
     fn target(d: Dialect) -> Target {
         Target {
