@@ -1004,6 +1004,16 @@ pub fn strip_carried(client: Dialect, body: &[u8]) -> Option<Vec<u8>> {
                             ))
                     });
                     changed |= parts.len() != before;
+                    // functionCall 上别家的签名：这一格要留，签名换成迁移历史用的占位值，
+                    // 和转换时给无签名调用写的一样
+                    for p in parts.iter_mut().filter(|p| p.get("functionCall").is_some()) {
+                        for key in ["thoughtSignature", "thought_signature"] {
+                            if carried(p.get(key)) {
+                                p[key] = Value::from(gemini::request::SYNTHETIC_SIGNATURE);
+                                changed = true;
+                            }
+                        }
+                    }
                 }
             }
             contents.retain(|c| {
@@ -1475,6 +1485,26 @@ mod tests {
                 .unwrap();
         assert_eq!(out["input"].as_array().unwrap().len(), 1);
         assert_eq!(out["input"][0]["id"], "rs_1");
+
+        let body = json!({"contents": [
+            {"role": "model", "parts": [
+                {"text": "x", "thought": true, "thoughtSignature": "tw1.a.sig"},
+                {"functionCall": {"name": "ls", "args": {}}, "thoughtSignature": "tw1.ar.data"},
+                {"functionCall": {"name": "cat", "args": {}}, "thoughtSignature": "CiQB"}
+            ]}
+        ]})
+        .to_string();
+        let out: Value =
+            serde_json::from_slice(&strip_carried(Dialect::Gemini, body.as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(
+            out["contents"][0]["parts"],
+            json!([
+                {"functionCall": {"name": "ls", "args": {}}, "thoughtSignature": gemini::request::SYNTHETIC_SIGNATURE},
+                {"functionCall": {"name": "cat", "args": {}}, "thoughtSignature": "CiQB"}
+            ]),
+            "functionCall 那一格要留，别家的签名换成占位值"
+        );
     }
 
     /// 独立的错误帧：每种格式都是客户端认得的那种事件，类别跟着状态码走。

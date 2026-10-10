@@ -318,6 +318,8 @@ fn decode_client_stream(d: Dialect, bytes: &[u8]) -> Response {
             }
             Event::Delta { index, delta } => match (&mut r.blocks[open[&index]], delta) {
                 (Block::Text(t), Delta::Text(x)) => t.push_str(&x),
+                (Block::Thinking(th), Delta::Thinking(x)) => th.text.push_str(&x),
+                (Block::Thinking(th), Delta::Signature(s)) => th.signature = Some(s),
                 (Block::ToolCall(c), Delta::ToolInput(x)) => {
                     if let ToolInput::Text(t) = &mut c.input {
                         t.push_str(&x);
@@ -471,6 +473,150 @@ fn a_stream_collected_for_a_client_that_wanted_a_whole_response() {
                 upstream,
                 "收集",
                 seen_response(&decode_client_response(client, &out)),
+            );
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────── Gemini 的调用签名
+
+/// 上游 Gemini 开着思考时，一轮的思考签名放在第一个 functionCall 那一格上。
+fn gemini_signed_call_response() -> Value {
+    json!({
+        "candidates": [{"content": {"role": "model", "parts": [
+            {"text": "想想", "thought": true},
+            {"text": "天气晴"},
+            {"functionCall": {"name": "get_weather", "args": {"city": "北京"}}, "thoughtSignature": "CiQB"}
+        ]}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 100, "cachedContentTokenCount": 40, "candidatesTokenCount": 20},
+        "modelVersion": "up-model", "responseId": "r_up"
+    })
+}
+
+fn gemini_signed_call_stream() -> String {
+    let chunk = |parts: Value| {
+        data(
+            json!({"candidates": [{"content": {"role": "model", "parts": parts}}], "modelVersion": "up-model", "responseId": "r_up"}),
+        )
+    };
+    [
+        chunk(json!([{"text": "想想", "thought": true}])),
+        chunk(json!([{"text": "天气晴"}])),
+        data(json!({"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "get_weather", "args": {"city": "北京"}}, "thoughtSignature": "CiQB"}
+            ]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 100, "cachedContentTokenCount": 40, "candidatesTokenCount": 20}})),
+    ]
+    .concat()
+}
+
+/// 客户端把上一轮的回答原样带回来，再加工具结果：用客户端格式自己的编码器写回答，
+/// 和客户端 SDK 保存的东西一个形状。
+fn second_turn(client: Dialect, first: &Response, s: &Session) -> Vec<u8> {
+    let call_id = first
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::ToolCall(c) => Some(c.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let body = match client {
+        Dialect::Anthropic => {
+            let answer = anthropic::encode_response(first, s);
+            json!({
+                "model": "test-model", "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "北京天气？"},
+                    {"role": "assistant", "content": answer["content"]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "晴，25 度"}]}
+                ],
+                "tools": [{"name": "get_weather", "description": "查天气", "input_schema": schema()}],
+            })
+        }
+        Dialect::Responses => {
+            let answer = responses::encode_response(first, s);
+            let mut input =
+                vec![json!({"type": "message", "role": "user", "content": "北京天气？"})];
+            input.extend(answer["output"].as_array().unwrap().iter().cloned());
+            input.push(
+                json!({"type": "function_call_output", "call_id": call_id, "output": "晴，25 度"}),
+            );
+            json!({
+                "model": "test-model", "input": input,
+                "tools": [{"type": "function", "name": "get_weather", "description": "查天气", "parameters": schema(), "strict": false}],
+            })
+        }
+        other => panic!("{other:?}"),
+    };
+    body.to_string().into_bytes()
+}
+
+/// 上游 Gemini 的工具调用带着思考签名：Anthropic、Responses 客户端把它当一段推理
+/// 带出去，下一轮带回来时它回到 functionCall 那一格上，不写占位值、不另开一格思考。
+#[test]
+fn a_gemini_calls_signature_comes_back_on_the_call_through_other_clients() {
+    for client in [Dialect::Anthropic, Dialect::Responses] {
+        for stream in [false, true] {
+            let at = format!(
+                "{client:?} ← Gemini（{}）",
+                if stream { "流式" } else { "整包" }
+            );
+            let s = session(client, Dialect::Gemini, stream);
+            let first = if stream {
+                let mut c = s.stream();
+                let mut out = Vec::new();
+                for piece in gemini_signed_call_stream().as_bytes().chunks(7) {
+                    out.extend(c.process(piece));
+                }
+                out.extend(c.finish());
+                decode_client_stream(client, &out)
+            } else {
+                let out = s
+                    .response(gemini_signed_call_response().to_string().as_bytes())
+                    .unwrap();
+                decode_client_response(client, &out)
+            };
+            check(client, Dialect::Gemini, "签名", seen_response(&first));
+            // 客户端拿到的：签名是紧挨在调用前面的一块空推理，签发方认成 Google
+            let sig = first
+                .blocks
+                .iter()
+                .position(|b| matches!(b, Block::Thinking(th) if th.text.is_empty()))
+                .unwrap_or_else(|| panic!("{at}：没有带签名的推理块：{:?}", first.blocks));
+            assert_eq!(
+                first.blocks[sig],
+                Block::Thinking(Thinking {
+                    text: String::new(),
+                    signature: Some(Signature::new(Vendor::Google, "CiQB")),
+                }),
+                "{at}"
+            );
+            assert!(matches!(first.blocks[sig + 1], Block::ToolCall(_)), "{at}");
+
+            let (_, path, query) = client_request(client, false);
+            let body = second_turn(client, &first, &s);
+            let p = prepare(
+                client,
+                &body,
+                &path,
+                query.as_deref(),
+                &target(Dialect::Gemini),
+            )
+            .unwrap_or_else(|e| panic!("{at}：{e}"));
+            let v: Value = serde_json::from_slice(&p.body).unwrap();
+            let model_turn = &v["contents"][1];
+            assert_eq!(model_turn["role"], "model", "{at}: {v}");
+            let parts = model_turn["parts"].as_array().unwrap();
+            let call = parts
+                .iter()
+                .find(|p| p.get("functionCall").is_some())
+                .unwrap_or_else(|| panic!("{at}：没有 functionCall：{parts:?}"));
+            assert_eq!(call["thoughtSignature"], "CiQB", "{at}: {parts:?}");
+            // 没签名的思考摘要照旧带不回去，签名不该另占一格思考
+            assert!(
+                !parts.iter().any(|p| p.get("thought").is_some()),
+                "{at}：{parts:?}"
             );
         }
     }
