@@ -514,6 +514,8 @@ fn provider_view(
             .collect(),
         pricing: p.pricing.clone(),
         max_concurrent: p.max_concurrent,
+        balance_setting: p.balance.into(),
+        balance: s.gateway.balance_of(p),
     }
 }
 

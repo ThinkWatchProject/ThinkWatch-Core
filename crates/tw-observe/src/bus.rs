@@ -112,6 +112,7 @@ fn about_the_request(ev: &tw_api::Event) -> bool {
         | E::RequestPriced { .. }
         | E::QuotaSeen { .. }
         | E::QuotaExhausted { .. }
+        | E::BalanceUpdated { .. }
         // 一把密钥的用量到了上限：说的是那把密钥，不是哪一个请求
         | E::KeyLimitAlert { .. }
         | E::LocallyAnswered { .. }

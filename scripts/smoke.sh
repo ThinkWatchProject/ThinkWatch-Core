@@ -534,6 +534,11 @@ done
 C=$(post /dryrun '{"model":"claude-sonnet-4-5","route":"默认"}'); [ "$C" = "200" ] && ok "POST /dryrun" || bad "POST /dryrun 返回 $C"
 # 页面打开时补问模型清单：立刻返回开始问的那几家，不等上游回话
 C=$(post /models/refresh '{}'); [ "$C" = "200" ] && ok "POST /models/refresh" || bad "POST /models/refresh 返回 $C"
+# 余额：假上游哪一种中转站都不是，马上读一次是 404 并说清没有余额可读；概览带着配置里的 balance
+C=$(post /providers/relay/balance/refresh '{}')
+if [ "$C" = "404" ] && grep -q '"control.balance_none"' "$TMP/out"; then ok "POST /providers/{name}/balance/refresh"; else bad "POST /providers/relay/balance/refresh 返回 $C" "$(head -c 300 "$TMP/out")"; fi
+C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["balance_setting"]=="auto" and "balance" in p)')
+[ "$C" = "True" ] && ok "/overview 带余额字段" || bad "/overview 的余额字段不对：$C"
 C=$(ctl /overview | python3 -c 'import json,sys;p=json.load(sys.stdin)["providers"][0];print(p["model_status"] in ("pending","listed","no_list","failed") and isinstance(p["model_fetching"],bool))')
 [ "$C" = "True" ] && ok "/overview 带模型获取状态" || bad "/overview 的模型状态字段不对：$C"
 

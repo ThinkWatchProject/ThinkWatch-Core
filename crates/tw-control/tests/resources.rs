@@ -908,3 +908,186 @@ async fn testing_a_proxy_checks_its_credentials() {
     .await;
     assert_eq!(json(&body)["ok"], true, "{body}");
 }
+
+// ─────────────────────────────────────────────────────────── 余额
+
+/// 一家假中转站，地址带着 `/anthropic`：模型清单只认 `sk-good`，用量接口（接在源后面）回
+/// Sub2API 的钱包
+async fn fake_relay_with_a_wallet() -> std::net::SocketAddr {
+    let app = axum::Router::new()
+        .route(
+            "/anthropic/v1/models",
+            axum::routing::get(|h: axum::http::HeaderMap| async move {
+                if h.get("x-api-key").and_then(|v| v.to_str().ok()) != Some("sk-good") {
+                    return (StatusCode::UNAUTHORIZED, "{}".to_string());
+                }
+                (
+                    StatusCode::OK,
+                    r#"{"data":[{"id":"claude-sonnet-4-5"}]}"#.to_string(),
+                )
+            }),
+        )
+        .route(
+            "/v1/usage",
+            axum::routing::get(|h: axum::http::HeaderMap| async move {
+                if h.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer sk-good") {
+                    return (StatusCode::UNAUTHORIZED, "{}".to_string());
+                }
+                (
+                    StatusCode::OK,
+                    r#"{"mode":"unrestricted","planName":"钱包余额","unit":"USD","balance":8.25,"remaining":8.25}"#
+                        .to_string(),
+                )
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    a
+}
+
+/// 「检测连接」顺带读余额：`auto` 的先认出是哪一种中转站
+#[tokio::test]
+async fn checking_an_upstream_also_reads_its_balance() {
+    let b = bed(BASE);
+    let up = fake_relay_with_a_wallet().await;
+    let test = |key: &str| {
+        serde_json::json!({ "provider": {
+            "name": "relay",
+            "base_url": format!("http://{up}/anthropic"),
+            "key": key,
+            "protocol": "anthropic",
+        }})
+    };
+    let (st, body) = call(&b.app, "POST", "/provider-test", test("sk-good")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["ok"], true, "{body}");
+    assert_eq!(v["balance"]["source"], "sub2api", "{body}");
+    assert_eq!(v["balance"]["wallet"]["amount"], 8.25);
+    assert_eq!(v["balance"]["wallet"]["currency"], "USD");
+    assert_eq!(v["balance"]["error"], serde_json::Value::Null);
+
+    // 不通的不读
+    let (_, body) = call(&b.app, "POST", "/provider-test", test("sk-bad")).await;
+    let v = json(&body);
+    assert_eq!(v["ok"], false, "{body}");
+    assert_eq!(v["balance"], serde_json::Value::Null);
+
+    // 关掉了就不读
+    let mut off = test("sk-good");
+    off["provider"]["balance"] = "off".into();
+    let (_, body) = call(&b.app, "POST", "/provider-test", off).await;
+    assert_eq!(json(&body)["balance"], serde_json::Value::Null, "{body}");
+}
+
+/// `balance` 写进配置；`auto` 不写。概览原样给回 `balance_setting`
+#[tokio::test]
+async fn the_balance_setting_is_saved_and_shown() {
+    let b = bed(BASE);
+    let mut p = relay("relay");
+    p["balance"] = "sub2api".into();
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/providers",
+        serde_json::json!({ "provider": p }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(b.file().contains("balance: sub2api"), "{}", b.file());
+    assert_eq!(
+        b.parsed().providers[1].balance,
+        tw_config::BalanceSetting::Sub2api
+    );
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let v = json(&body);
+    assert_eq!(v["providers"][0]["balance_setting"], "auto");
+    assert_eq!(v["providers"][1]["balance_setting"], "sub2api");
+
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/providers",
+        serde_json::json!({ "provider": relay("relay2") }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(b.file().matches("balance:").count(), 1, "{}", b.file());
+
+    // 不认识的取值交不进来
+    let mut bad = relay("relay3");
+    bad["balance"] = "wallet".into();
+    let (st, _) = call(
+        &b.app,
+        "POST",
+        "/providers",
+        serde_json::json!({ "provider": bad }),
+    )
+    .await;
+    assert!(st.is_client_error(), "{st}");
+}
+
+/// 马上读一次：读到的进概览，报一条 `balance_updated`
+#[tokio::test]
+async fn refreshing_a_balance_reads_it_now_and_the_overview_shows_it() {
+    let up = fake_relay_with_a_wallet().await;
+    let b = bed(&BASE.replace(
+        "    key: sk-official\n",
+        &format!(
+            "    key: sk-official\n  - name: relay\n    base_url: http://{up}/anthropic\n    key: sk-good\n    protocol: anthropic\n"
+        ),
+    ));
+    let mut rx = b.gateway().bus.subscribe();
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/providers/relay/balance/refresh",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["source"], "sub2api");
+    assert_eq!(v["wallet"]["amount"], 8.25);
+
+    let (_, body) = call(&b.app, "GET", "/overview", serde_json::Value::Null).await;
+    let v = json(&body);
+    let relay = v["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "relay")
+        .unwrap();
+    assert_eq!(relay["balance"]["wallet"]["amount"], 8.25, "{relay}");
+    // 官方地址没有余额可读
+    assert_eq!(v["providers"][0]["balance"], serde_json::Value::Null);
+
+    let updated = std::iter::from_fn(|| rx.try_recv().ok()).any(
+        |e| matches!(e, tw_api::Event::BalanceUpdated { provider, .. } if provider == "relay"),
+    );
+    assert!(updated);
+}
+
+#[tokio::test]
+async fn refreshing_an_upstream_without_a_balance_is_a_404() {
+    let b = bed(BASE);
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/providers/官方/balance/refresh",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(json(&body)["code"], "control.balance_none");
+    let (st, body) = call(
+        &b.app,
+        "POST",
+        "/providers/nobody/balance/refresh",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(json(&body)["code"], "control.upstream_not_found");
+}

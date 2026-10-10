@@ -984,6 +984,8 @@ fn cmd_serve(path: &Path, port: Option<u16>, safe: bool, parent: Option<u32>) ->
         // 模型目录：后台去问每个上游有哪些模型。**不挡启动** ——
         // 探测要打网络，而网关不该因为一次探测慢而起不来。
         tw_gateway::models::spawn(state.clone());
+        // 余额：启动时读一遍，之后按节奏读（见 `tw_gateway::balances`）。**不挡启动，不挡转发**
+        tw_gateway::balances::spawn(state.clone());
 
         tracing::info!(listen = %listen_at, "starting");
         tokio::select! {

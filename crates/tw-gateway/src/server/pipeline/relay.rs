@@ -176,6 +176,8 @@ pub(super) fn respond(
     let mut pulse = crate::pulse::Pulse::new(plan.is_sse.then_some(upstream_dialect));
     let abort = req.abort.clone();
     let (bus, health) = (state.bus.clone(), state.health.clone());
+    // 这个请求结束时记一笔，到了时候重读这一家的余额（见 `crate::balances`）
+    let passing = state.balance_passing(&upstream_name);
     let stream = async_stream::stream! {
         // **通行证跟着响应体走。**这个流被丢掉的时候它才还回去：正常
         // 发完是一种，客户端中途断开、hyper 丢掉响应体是另一种 —— 两种
@@ -185,6 +187,7 @@ pub(super) fn respond(
         // 回答交完、客户端走掉，才轮到下一个
         let _pass = pass;
         let _slot = slot;
+        let _passing = passing;
         // 结局也一样：流被丢掉的时候，它替流报「客户端取消」。
         let mut ending = ending;
         let mut chunks = std::pin::pin!(chunks);

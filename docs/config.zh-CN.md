@@ -303,6 +303,7 @@ clients:
 | `model_specs` | 映射： 模型 ID → [`providers[].model_specs.*`](#cfg-providers-model_specs) | `{}` | 手写这家上游某些模型的上下文窗口、输出上限、会不会推理、收不收图，按模型 ID 完全匹配。写了就优先于价目表，用于价目表里没有或写错的模型。 |
 | `max_concurrent` | 整数 | — | 同时发给这家的请求最多几个，取值 1 到 1000。满了的时候，留在这家的对话等空位，别的请求换下一家；等多久见 `failover.slot_wait_secs`。不写：不限。 |
 | `disabled` | 布尔 | `false` | 不参与路由，模型也不出现在模型列表里；配置原样保留。 |
+| `balance` | `auto` \| `off` \| `openrouter` \| `deepseek` \| `moonshot` \| `sub2api` \| `newapi` \| `thinkwatch` | `auto` | 从哪里读这家上游的余额，用它自己的密钥、走它自己的代理：`openrouter`、`deepseek`、`moonshot`、`sub2api`、`newapi`（New API 和 One API）或 `thinkwatch`（ThinkWatch 企业网关）。`auto`：OpenRouter、DeepSeek、Moonshot 按 `base_url` 识别；其他地址（Anthropic、OpenAI、Gemini 的官方地址除外）询问一次它是不是 Sub2API、ThinkWatch 企业网关或 New API 中转站，结果只保存在内存中。`off`：不读余额。ChatGPT、Z.ai 账号和 Bedrock 不读余额，与这里写什么无关。 |
 <!-- /generated -->
 
 凭据有四种写法：`key`，放进协议规定的请求头；`oauth`，用 refresh token 换取 token；`aws`，Bedrock 上游签名请求用的访问密钥；`headers`，用于上游自有的鉴权方式。`headers` 可以和其余几种同时使用，但不能再设置已经承载凭据的那个请求头。

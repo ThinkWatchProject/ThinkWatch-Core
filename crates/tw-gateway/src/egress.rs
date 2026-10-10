@@ -91,6 +91,17 @@ pub const CLIENT_IDENTITY: &[&str] =
 /// [`CLIENT_IDENTITY`] 之外，按前缀认的那一族
 const CLIENT_IDENTITY_PREFIX: &str = "x-codex-";
 
+/// 读余额（[`crate::balances`]）时发的头，**只有这三个**：ThinkWatch 的 User-Agent、
+/// `Accept` 和凭据。那不是转发，没有客户端的头可取；上游配置里写的别的头也不发 ——
+/// 余额接口只认凭据
+pub fn balance_headers(authorization: &str) -> [(&'static str, String); 3] {
+    [
+        ("user-agent", crate::user_agent()),
+        ("accept", "application/json".to_string()),
+        ("authorization", authorization.to_string()),
+    ]
+}
+
 /// 客户端请求里的这个头发不发给这家。
 pub fn takes_from_client(hop: &Hop, name: &str) -> bool {
     let n = name.to_ascii_lowercase();

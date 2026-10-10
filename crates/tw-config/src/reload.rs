@@ -437,6 +437,69 @@ routes:
         }
     }
 
+    /// 一家上游的 `balance:`：`auto`、`off` 和每一种来源都读得进；不写就是 `auto`，
+    /// 而且写回去时不写出来
+    #[test]
+    fn every_balance_setting_loads() {
+        use crate::BalanceSetting as B;
+        let with = |value: &str| {
+            format!(
+                "{GOOD}providers:\n  - name: relay\n    base_url: https://relay.example\n    key: sk\n    balance: {value}\n"
+            )
+        };
+        for (value, want) in [
+            ("auto", B::Auto),
+            ("off", B::Off),
+            ("openrouter", B::Openrouter),
+            ("deepseek", B::Deepseek),
+            ("moonshot", B::Moonshot),
+            ("sub2api", B::Sub2api),
+            ("newapi", B::Newapi),
+            ("thinkwatch", B::Thinkwatch),
+        ] {
+            let cfg = try_parse(&with(value)).unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(cfg.providers[0].balance, want, "{value}");
+            // 和契约里的那个词一一对应
+            assert_eq!(tw_api::BalanceSetting::from(want).slug(), value);
+            assert_eq!(
+                crate::BalanceSetting::from(tw_api::BalanceSetting::from(want)),
+                want
+            );
+        }
+        let plain = format!(
+            "{GOOD}providers:\n  - name: relay\n    base_url: https://relay.example\n    key: sk\n"
+        );
+        let cfg = try_parse(&plain).unwrap();
+        assert_eq!(cfg.providers[0].balance, B::Auto);
+        let written = serde_yaml_ng::to_string(&cfg.providers[0]).unwrap();
+        assert!(!written.contains("balance"), "{written}");
+    }
+
+    /// 不认识的取值：加载不了，说清楚是哪个字段、写了什么、能写哪几个、在第几行；一键修复
+    /// 删掉这一行，回到 `auto`
+    #[test]
+    fn an_unknown_balance_setting_is_refused_and_repaired_to_auto() {
+        let text = format!(
+            "{GOOD}providers:\n  - name: relay\n    base_url: https://relay.example\n    key: sk\n    balance: wallet\n"
+        );
+        let r = try_parse(&text).unwrap_err();
+        assert_eq!(r.stage, Stage::Schema, "{r:?}");
+        assert_eq!(r.message.code, "config.unknown_variant", "{r:?}");
+        assert_eq!(r.message.arg("field"), "providers[0].balance");
+        assert_eq!(r.message.arg("value"), "wallet");
+        assert_eq!(
+            r.message.arg("expected"),
+            "auto, off, openrouter, deepseek, moonshot, sub2api, newapi, thinkwatch"
+        );
+        assert_eq!(r.line, Some(text.lines().count()));
+        let fix = crate::repair::repair(&text).expect("一键修复改得了");
+        assert_eq!(fix.fixes[0].field, "providers[0].balance");
+        assert_eq!(
+            try_parse(&fix.text).unwrap().providers[0].balance,
+            crate::BalanceSetting::Auto
+        );
+    }
+
     #[test]
     fn the_display_form_reads_like_a_sentence_a_person_can_act_on() {
         let bad = "version: 1\nclients:\n  - name: c\n    kye: tw-k\n";
