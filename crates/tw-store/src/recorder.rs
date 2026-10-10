@@ -44,6 +44,8 @@ struct Partial {
     session_log_bytes: Option<i64>,
     /// 本地估的输入 token 数。开始事件带着
     input_estimate: Option<i64>,
+    /// 从哪个出口出去的。路由事件带着（`RequestRouted::egress`），等不到它的是 None
+    egress: Option<String>,
 }
 
 impl Partial {
@@ -210,7 +212,10 @@ impl Recorder {
             ttft_ms: p.ttft_ms,
             duration_ms: None,
             tokens_per_sec: None,
-            bytes: None,
+            // 流量要等结局才报：在跑的时候说不出一个总数
+            sent_bytes: None,
+            received_bytes: None,
+            egress: p.egress.clone(),
             input_tokens: None,
             output_tokens: None,
             cache_read_tokens: None,
@@ -312,6 +317,7 @@ impl Recorder {
                         translated: None,
                         session_log_bytes: session_log_bytes.map(|b| b as i64),
                         input_estimate: input_estimate.map(|n| n.min(i64::MAX as u64) as i64),
+                        egress: None,
                     },
                 );
             }
@@ -325,6 +331,7 @@ impl Recorder {
                 affinity,
                 attempts,
                 billing,
+                egress,
             } => {
                 if let Some(p) = self.inflight.get_mut(id) {
                     // **归到实际服务的那家，不是第一个候选。**
@@ -352,6 +359,7 @@ impl Recorder {
                         attempts: attempts.clone(),
                     };
                     p.billing = *billing;
+                    p.egress = egress.clone();
                     // 做转换的不是服务它的那一跳（转换那家失败了，后面一家直通）
                     let converted_by = p
                         .translated
@@ -504,7 +512,8 @@ impl Recorder {
             Event::RequestFinished {
                 id,
                 status,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms,
                 usage,
                 tokens_per_sec,
@@ -513,7 +522,7 @@ impl Recorder {
             } => self.settle(
                 *id,
                 Some(*status),
-                Some(*bytes),
+                (Some(*sent_bytes), Some(*received_bytes)),
                 Some(*duration_ms),
                 *usage,
                 answered_model.clone(),
@@ -533,7 +542,8 @@ impl Recorder {
             Event::RequestCancelled {
                 id,
                 status,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms,
                 usage,
                 answered_model,
@@ -541,7 +551,7 @@ impl Recorder {
             } => self.settle(
                 *id,
                 *status,
-                Some(*bytes),
+                (*sent_bytes, *received_bytes),
                 Some(*duration_ms),
                 *usage,
                 answered_model.clone(),
@@ -557,7 +567,8 @@ impl Recorder {
             Event::RequestFailed {
                 id,
                 message,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms,
                 usage,
                 answered_model,
@@ -565,7 +576,7 @@ impl Recorder {
             } => self.settle(
                 *id,
                 None,
-                *bytes,
+                (*sent_bytes, *received_bytes),
                 *duration_ms,
                 *usage,
                 answered_model.clone(),
@@ -601,7 +612,10 @@ impl Recorder {
                     ttft_ms: None,
                     duration_ms: Some(0),
                     tokens_per_sec: None,
-                    bytes: None,
+                    // 一个字节都没发给上游：没有流量可说，也没有出口
+                    sent_bytes: None,
+                    received_bytes: None,
+                    egress: None,
                     input_tokens: None,
                     output_tokens: None,
                     cache_read_tokens: None,
@@ -660,7 +674,8 @@ impl Recorder {
         // 结局事件自己带的状态码。没带的（失败、响应头之前的取消）用
         // 响应头那个事件记下的
         status: Option<u16>,
-        bytes: Option<u64>,
+        // 和上游之间的流量：（发出去的，收回来的）。一跳都没发出去的是一对 None
+        (sent_bytes, received_bytes): (Option<u64>, Option<u64>),
         duration_ms: Option<u64>,
         usage: Option<tw_api::UsageView>,
         answered_model: Option<String>,
@@ -693,6 +708,12 @@ impl Recorder {
             .attempts
             .last()
             .is_some_and(|a| a.outcome == tw_api::AttemptOutcome::Estimated);
+        // 网关估了数、一跳都没发出去的（选中的上游是别的格式）：和本地应答一样没有流量可说。
+        // 先问过上游、它回了 404 的，流量照记
+        let (sent_bytes, received_bytes) = match (sent_bytes, received_bytes) {
+            (Some(0), Some(0)) if local => (None, None),
+            traffic => traffic,
+        };
         //
         // **没跑完的一律按估算记**（取消、失败）。输出只算到断开那一刻，而
         // Anthropic 在流的末尾才报累计输出 —— 断在中间时手里那个数是个
@@ -781,7 +802,9 @@ impl Recorder {
                 Ending::Finished { tokens_per_sec } => tokens_per_sec,
                 _ => None,
             },
-            bytes: bytes.map(|b| b as i64),
+            sent_bytes: sent_bytes.map(|b| b.min(i64::MAX as u64) as i64),
+            received_bytes: received_bytes.map(|b| b.min(i64::MAX as u64) as i64),
+            egress: p.egress,
             input_tokens: u.map(|u| u.input as i64),
             output_tokens: u.map(|u| u.output as i64),
             cache_read_tokens: u.map(|u| u.cache_read as i64),
@@ -872,7 +895,8 @@ mod tests {
             id,
             model: String::new(),
             status: 200,
-            bytes: 1234,
+            sent_bytes: 2048,
+            received_bytes: 1234,
             duration_ms: 4000,
             usage,
             tokens_per_sec: None,
@@ -916,6 +940,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -927,16 +952,28 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: Some("机场".into()),
                 },
             ],
             billing: tw_api::Billing::PerToken,
+            egress: Some("机场".into()),
         });
+        // 在跑的时候已经说得出出口；流量要等结局
+        let running = r.in_flight_row(1).unwrap();
+        assert_eq!(running.egress.as_deref(), Some("机场"));
+        assert_eq!((running.sent_bytes, running.received_bytes), (None, None));
         r.on_event(&finished(1, None));
 
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(
             row.provider, "中转",
             "转移之后这一行还归给第一个候选，成本和延迟都会记到没服务的那家头上"
+        );
+        // 出口是接下它的那一跳走的代理，流量是结局报的
+        assert_eq!(row.egress.as_deref(), Some("机场"));
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(1234))
         );
         // 尝试链本身一个字都不能少 —— 归属改了，但「试过谁、为什么失败」
         // 是排查的全部价值。
@@ -949,6 +986,12 @@ mod tests {
             routing.attempts[0].error.as_ref().map(|m| m.text.as_str()),
             Some("上游响应超时")
         );
+        let proxies: Vec<_> = routing
+            .attempts
+            .iter()
+            .map(|a| a.proxy.as_deref())
+            .collect();
+        assert_eq!(proxies, [None, Some("机场")]);
     }
 
     /// 一次就成的请求不该被这条规则改坏：链长度为 1，最后一跳就是它自己。
@@ -974,8 +1017,10 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         r.on_event(&finished(2, None));
         assert_eq!(r.db().get(2).unwrap().unwrap().provider, "官方");
@@ -1006,6 +1051,7 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
                 tw_api::AttemptView {
                     provider: "中转".into(),
@@ -1017,9 +1063,11 @@ mod tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 },
             ],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         r.on_event(&finished(
             3,
@@ -1068,15 +1116,18 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         assert_eq!(r.in_flight_row(1).unwrap().sent_model, "claude-sonnet-4-5");
         r.on_event(&Event::RequestFinished {
             id: 1,
             model: String::new(),
             status: 200,
-            bytes: 10,
+            sent_bytes: 0,
+            received_bytes: 10,
             duration_ms: 400,
             usage: None,
             tokens_per_sec: None,
@@ -1100,7 +1151,8 @@ mod tests {
             id: 2,
             model: String::new(),
             status: Some(200),
-            bytes: 10,
+            sent_bytes: Some(0),
+            received_bytes: Some(10),
             duration_ms: 100,
             usage: None,
             answered_model: Some("gpt-5-2025-08-07".into()),
@@ -1115,7 +1167,8 @@ mod tests {
                 args: Default::default(),
                 text: "broke".into(),
             },
-            bytes: Some(10),
+            sent_bytes: Some(0),
+            received_bytes: Some(10),
             duration_ms: Some(100),
             usage: None,
             answered_model: None,
@@ -1191,8 +1244,10 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         });
         r.on_event(&Event::RequestFailed {
             id: 1,
@@ -1203,7 +1258,8 @@ mod tests {
                 args: Default::default(),
                 text: "denied".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: Some(1),
             usage: None,
             answered_model: None,
@@ -1266,7 +1322,8 @@ mod tests {
             id: 1,
             model: String::new(),
             status: 200,
-            bytes: 1234,
+            sent_bytes: 0,
+            received_bytes: 1234,
             duration_ms: 4000,
             usage: None,
             tokens_per_sec: Some(180),
@@ -1300,7 +1357,8 @@ mod tests {
             id: 1,
             model: String::new(),
             status: Some(200),
-            bytes: 10,
+            sent_bytes: Some(0),
+            received_bytes: Some(10),
             duration_ms: 3_000,
             usage: None,
             answered_model: None,
@@ -1450,7 +1508,8 @@ mod tests {
                 args: Default::default(),
                 text: "cannot connect".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: None,
             answered_model: None,
@@ -1474,6 +1533,11 @@ mod tests {
         });
         let row = r.db().get(9).unwrap().unwrap();
         assert!(row.local);
+        // 一个字节都没发给上游：没有流量可说，也没有出口
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes, row.egress),
+            (None, None, None)
+        );
         // 网关自己答的：费用是一个确定的 0，和不计费的上游是同一句话
         assert_eq!(
             (row.billing, row.cost_micros),
@@ -1506,9 +1570,11 @@ mod tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::Free,
             affinity: None,
+            egress: None,
         });
         r.on_event(&finished(3, None));
         let row = r.db().get(3).unwrap().unwrap();
@@ -1518,9 +1584,54 @@ mod tests {
         let routing: tw_api::RoutingView =
             serde_json::from_str(row.routing.as_deref().unwrap()).unwrap();
         assert_eq!(routing.attempts[0].status, Some(404));
+        // 先问过上游：那一趟的流量照记
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(1234))
+        );
         let s = r.db().summary(0, i64::MAX).unwrap();
         assert_eq!(s.requests, 0, "估的数混进了请求总数");
         assert_eq!(s.locally_answered, 1);
+
+        // 选中的上游是别的格式、一个字节都没发：和本地应答一样没有流量可说，不是一对 0
+        r.on_event(&started(4, "gpt-5"));
+        r.on_event(&Event::RequestRouted {
+            id: 4,
+            route: "default".into(),
+            rule: "默认".into(),
+            group: None,
+            rewritten_by: vec![],
+            denied_by: None,
+            attempts: vec![tw_api::AttemptView {
+                provider: "官方".into(),
+                model: None,
+                outcome: tw_api::AttemptOutcome::Estimated,
+                status: None,
+                error: None,
+                ms: 1,
+                usage: None,
+                queued_ms: None,
+                skipped: None,
+                proxy: None,
+            }],
+            billing: tw_api::Billing::Free,
+            affinity: None,
+            egress: None,
+        });
+        r.on_event(&Event::RequestFinished {
+            id: 4,
+            model: String::new(),
+            status: 200,
+            sent_bytes: 0,
+            received_bytes: 0,
+            duration_ms: 1,
+            usage: None,
+            tokens_per_sec: None,
+            answered_model: None,
+        });
+        let row = r.db().get(4).unwrap().unwrap();
+        assert!(row.local);
+        assert_eq!((row.sent_bytes, row.received_bytes), (None, None));
     }
 
     #[test]
@@ -1582,8 +1693,10 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing,
+            egress: None,
         }
     }
 
@@ -1672,8 +1785,10 @@ mod billing_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing,
+            egress: None,
         }
     }
 
@@ -1683,7 +1798,8 @@ mod billing_tests {
             id,
             model: String::new(),
             status: 101,
-            bytes: 2048,
+            sent_bytes: 0,
+            received_bytes: 2048,
             duration_ms: 600_000,
             usage: None,
             tokens_per_sec: None,
@@ -1759,7 +1875,8 @@ mod billing_tests {
                 id,
                 model: String::new(),
                 status: None,
-                bytes: 0,
+                sent_bytes: Some(0),
+                received_bytes: Some(0),
                 duration_ms: 3_000,
                 usage: None,
                 answered_model: None,
@@ -2063,9 +2180,11 @@ mod translation_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 })
                 .collect(),
             billing: tw_api::Billing::PerToken,
+            egress: None,
         }
     }
 
@@ -2218,7 +2337,8 @@ mod cancellation_tests {
             id,
             model: String::new(),
             status: Some(200),
-            bytes: 312,
+            sent_bytes: Some(2048),
+            received_bytes: Some(312),
             duration_ms: 2_500,
             usage,
             answered_model: None,
@@ -2254,7 +2374,10 @@ mod cancellation_tests {
         assert_eq!(row.status, Some(200));
         assert_eq!(row.ttfb_ms, Some(900));
         assert_eq!(row.duration_ms, Some(2_500));
-        assert_eq!(row.bytes, Some(312));
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(312))
+        );
         assert_eq!(row.input_tokens, Some(100_000));
         assert_eq!(row.output_tokens, Some(1));
         // Sonnet 4.5：输入 $3/M、输出 $15/M —— 十万个输入加一个输出
@@ -2332,7 +2455,8 @@ mod cancellation_tests {
             id: 1,
             model: String::new(),
             status: None,
-            bytes: 0,
+            sent_bytes: Some(0),
+            received_bytes: Some(0),
             duration_ms: 12_000,
             usage: None,
             answered_model: None,
@@ -2475,7 +2599,8 @@ mod failure_tests {
                 args: Default::default(),
                 text: "the stream broke: the upstream disconnected".into(),
             },
-            bytes: Some(312),
+            sent_bytes: Some(2048),
+            received_bytes: Some(312),
             duration_ms: Some(2_500),
             usage,
             answered_model: None,
@@ -2510,7 +2635,10 @@ mod failure_tests {
         assert_eq!(e.code, "t.broke");
         assert!(!row.cancelled);
         assert_eq!(row.status, Some(200), "状态码来自响应头那个事件");
-        assert_eq!(row.bytes, Some(312));
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (Some(2048), Some(312))
+        );
         assert_eq!(row.duration_ms, Some(2_500));
         assert_eq!(row.input_tokens, Some(100_000));
         // Sonnet 4.5：输入 $3/M、输出 $15/M
@@ -2554,7 +2682,8 @@ mod failure_tests {
                 args: Default::default(),
                 text: "`up` rate-limited us".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: Some(20_000),
             usage: None,
             answered_model: None,
@@ -2563,7 +2692,11 @@ mod failure_tests {
         let row = r.db().get(1).unwrap().unwrap();
         assert_eq!(row.cost_micros, None);
         assert_eq!(row.input_tokens, None);
-        assert_eq!(row.bytes, None, "响应头都没到，没有「收到了多少字节」");
+        assert_eq!(
+            (row.sent_bytes, row.received_bytes),
+            (None, None),
+            "一跳都没发出去，没有流量可说"
+        );
         assert_eq!(row.duration_ms, Some(20_000));
     }
 
@@ -2615,7 +2748,8 @@ mod failure_tests {
             model: String::new(),
             source: tw_api::FailureSource::Upstream,
             message: said.clone(),
-            bytes: Some(120),
+            sent_bytes: Some(0),
+            received_bytes: Some(120),
             duration_ms: Some(320),
             usage: None,
             answered_model: None,
@@ -2626,7 +2760,8 @@ mod failure_tests {
             id: 3,
             model: String::new(),
             status: Some(200),
-            bytes: 40,
+            sent_bytes: Some(0),
+            received_bytes: Some(40),
             duration_ms: 900,
             usage: None,
             answered_model: None,
@@ -2737,8 +2872,10 @@ mod settle_hook_tests {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         }
     }
 
@@ -2756,7 +2893,8 @@ mod settle_hook_tests {
             id: 2,
             model: String::new(),
             status: Some(200),
-            bytes: 1,
+            sent_bytes: Some(0),
+            received_bytes: Some(1),
             duration_ms: 1,
             usage: usage(),
             answered_model: None,
@@ -2770,7 +2908,8 @@ mod settle_hook_tests {
                 args: Default::default(),
                 text: "broke".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: usage(),
             answered_model: None,
@@ -2808,7 +2947,8 @@ mod settle_hook_tests {
                 args: Default::default(),
                 text: "denied".into(),
             },
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: None,
             answered_model: None,

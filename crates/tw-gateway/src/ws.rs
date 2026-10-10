@@ -703,7 +703,7 @@ pub(crate) async fn proxy(
     let name = &upstream.provider.name;
     // 每一轮一行的连接连上了：连接本身不留行，每一轮各有各的号（见 `turn`）。连不上的补上
     // 这一行，和整条连接一行的一样报
-    let (id, ending, turns, realtime) = match (rows, &connected) {
+    let (id, mut ending, turns, realtime) = match (rows, &connected) {
         (
             Rows::Connection {
                 id,
@@ -760,6 +760,12 @@ pub(crate) async fn proxy(
         Err(_) => state.health.record_failure(name),
     };
     crate::server::note_health(&state.bus, &state.health, name, change);
+    // 整条连接一行的：连上了，从这一刻起有流量可说（之后两个方向的帧各自记上，见 `pump`）
+    if connected.is_ok()
+        && let Some(e) = ending.as_mut()
+    {
+        e.connected();
+    }
     if ending.is_some() {
         // 这一跳记发出去的模型名，和 HTTP 那条路一样。一条连接跑好几轮、每一帧写的模型可能
         // 不一样，升级时定得下来的只有每一帧都发的那个（指定模型、阶段一的改写，见
@@ -797,6 +803,8 @@ pub(crate) async fn proxy(
             affinity: None,
             attempts: vec![attempt],
             billing: billing.into(),
+            // WebSocket 只连直连的上游（走代理的升级时就拒了，见 `server::upgrade`）
+            egress: None,
         });
     }
     let up = match connected {
@@ -995,8 +1003,16 @@ async fn pump(
         while waiting.is_none()
             && let Some(m) = held.pop_front()
         {
-            if let Step::End(end) =
-                client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting).await
+            if let Step::End(end) = client_frame(
+                &state,
+                p,
+                m,
+                &mut c_tx,
+                &mut u_tx,
+                &mut waiting,
+                &mut ending,
+            )
+            .await
             {
                 break 'pump end;
             }
@@ -1009,7 +1025,7 @@ async fn pump(
                     held.push_back(m);
                     continue;
                 }
-                if let Step::End(end) = client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting).await {
+                if let Step::End(end) = client_frame(&state, p, m, &mut c_tx, &mut u_tx, &mut waiting, &mut ending).await {
                     break end;
                 }
             }
@@ -1087,6 +1103,10 @@ type UpstreamSink = futures::stream::SplitSink<Stream, UpMsg>;
 
 /// 客户端 → 上游的一帧：**和普通请求同一个脱敏函数**。Responses 的连接上，一帧
 /// `response.create` 是一轮的开头（[`begin_turn`]），要过准入时放进 `waiting`。
+///
+/// 发出去的帧记进流量（[`payload`]）：整条连接一行的记在那一行上（`ending`），Responses 的连接上
+/// 记在上游此刻在回答的那一轮上 —— 没有在答的，这一帧不归哪一行
+#[allow(clippy::too_many_arguments)]
 async fn client_frame(
     state: &AppState,
     p: &mut Pipes,
@@ -1094,6 +1114,7 @@ async fn client_frame(
     c_tx: &mut ClientSink,
     u_tx: &mut UpstreamSink,
     waiting: &mut Option<Waiting>,
+    ending: &mut Option<crate::ending::Ending>,
 ) -> Step {
     let out = match m {
         Message::Text(t) => {
@@ -1120,9 +1141,30 @@ async fn client_frame(
         Message::Pong(b) => UpMsg::Pong(b),
         Message::Close(_) => return Step::End(End::Closed),
     };
+    let size = payload(&out);
     match u_tx.send(out).await {
-        Ok(()) => Step::Go,
+        Ok(()) => {
+            match ending.as_mut() {
+                Some(e) => e.sending(size),
+                None => {
+                    if let Some(t) = p.turns.as_mut().and_then(turn::Turns::front) {
+                        t.sending(size);
+                    }
+                }
+            }
+            Step::Go
+        }
         Err(e) => Step::End(End::Broke(send_failed(e))),
+    }
+}
+
+/// 一帧发给上游的载荷有多少字节，记进流量的就是它。**只数数据帧**（文本、二进制）：ping、
+/// pong、关闭是连接自己的事，不是这个请求发的内容
+fn payload(m: &UpMsg) -> usize {
+    match m {
+        UpMsg::Text(t) => t.len(),
+        UpMsg::Binary(b) => b.len(),
+        UpMsg::Ping(_) | UpMsg::Pong(_) | UpMsg::Close(_) | UpMsg::Frame(_) => 0,
     }
 }
 
@@ -1268,8 +1310,10 @@ async fn admitted(
     let model = Some(p.sent_model.clone()).filter(|m| !m.is_empty() && *m != p.requested_model);
     let out = outbound(state, p, turn.id, text);
     turn.sent(model.clone());
+    let size = payload(&out);
     match u_tx.send(out).await {
         Ok(()) => {
+            turn.sending(size);
             if let Some(t) = p.turns.as_mut() {
                 t.push(turn);
             }
@@ -1356,6 +1400,11 @@ async fn upstream_text(
     c_tx: &mut ClientSink,
     ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
+    // 整条连接一行的：收到的流量数**上游原话**（还原占位符之前）。Responses 的连接上由那一轮
+    // 自己数（`Turn::upstream`）
+    if let Some(e) = ending.as_mut() {
+        e.count(t.len());
+    }
     let kind = frame_kind(t);
     // Realtime 的一次回答收了尾：它的用量加到这条连接的那一行上。**看的是上游原话**，和
     // 别的路一样（占位符不影响数字）
@@ -1384,7 +1433,7 @@ async fn upstream_text(
             }
         }
     }
-    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx, ending).await;
+    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx).await;
     if let Some(turns) = p.turns.as_mut() {
         match &flow {
             Flow::Sent if late.is_none() && ends_turn(kind.as_deref()) => turns.finish_front(),
@@ -1449,7 +1498,6 @@ async fn relay(
     kind: Option<&str>,
     late: bool,
     c_tx: &mut ClientSink,
-    ending: &mut Option<crate::ending::Ending>,
 ) -> Flow {
     let restored = tw_guard::redact::replace::restore(t, &p.ledger);
     // 模型名换回客户端用的名称：一条消息是一个完整的 JSON，整条过一遍。排在回答钩子之前，
@@ -1546,9 +1594,6 @@ async fn relay(
                 .send(Message::Text(format!("[ThinkWatch] {}", why.text).into()))
                 .await;
             return Flow::End(End::Cut(why));
-        }
-        if let Some(e) = ending.as_mut() {
-            e.count(msg.len());
         }
         // 发不给客户端，就是客户端已经走了
         if c_tx.send(Message::Text(msg.into())).await.is_err() {

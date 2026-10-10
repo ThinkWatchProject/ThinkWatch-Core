@@ -30,7 +30,10 @@ use tw_api::Msg;
 ///
 /// 26：尝试链的结果（`routing` 里的 `outcome`）没有了 `slow_start`，多了 `idle_timeout` 和
 /// `aborted`。
-pub(crate) const SCHEMA: i64 = 26;
+///
+/// 27：`bytes`（解码之后的回答有多少字节）换成网关和上游之间的流量 —— `sent_bytes`、
+/// `received_bytes` —— 和出口 `egress`；尝试链的每一跳（`routing`）多了 `proxy`。
+pub(crate) const SCHEMA: i64 = 27;
 
 /// 这一行算不出钱，**因为价目表里没有这个模型**：用量是有的，缺的是单价。
 ///
@@ -121,7 +124,13 @@ pub struct RequestRow {
     /// 生成速度，token/秒。网关在结局里算好的（`RequestFinished::tokens_per_sec`），
     /// 只有跑完的流式请求有
     pub tokens_per_sec: Option<u32>,
-    pub bytes: Option<i64>,
+    /// 发给上游的请求体，每一跳加起来，按线上的样子（`RequestFinished::sent_bytes`）。
+    /// 本地应答的、一跳都没发出去的是 None
+    pub sent_bytes: Option<i64>,
+    /// 从上游收到的响应体，每一跳加起来，解压之前（`RequestFinished::received_bytes`）
+    pub received_bytes: Option<i64>,
+    /// 从哪个出口出去的：代理名，直连是 None（`RequestRouted::egress`）
+    pub egress: Option<String>,
     /// 上游报的输入，**不含缓存读写**：几种格式在解析时已经换算成三项互不重叠的数，
     /// 三项加起来才是上游计费的全部输入
     pub input_tokens: Option<i64>,
@@ -366,7 +375,13 @@ impl Db {
                 -- 生成速度，token/秒。**在记录的时候就定下**：推理被隐藏时要扣掉推理
                 -- token，而那只有看着流的网关知道，事后从这几列推不回来
                 tokens_per_sec     INTEGER,
-                bytes              INTEGER,
+                -- 网关和上游之间的流量：发出去的请求体、收回来的响应体，每一跳加起来，
+                -- 按线上的样子（压缩之后、解压之前）。**走代理、被计量的是这一段**，客户端
+                -- 和网关之间在本机，不算
+                sent_bytes         INTEGER,
+                received_bytes     INTEGER,
+                -- 从哪个出口出去的：代理名，直连是 NULL。按出口数流量看它
+                egress             TEXT,
                 input_tokens       INTEGER,
                 output_tokens      INTEGER,
                 cache_read_tokens  INTEGER,
@@ -463,13 +478,14 @@ impl Db {
     pub fn insert(&self, r: &RequestRow) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO requests
-             (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, bytes,
+             (id, at_ms, client, provider, model, path, status, ttfb_ms, duration_ms, sent_bytes,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               cost_micros, cost_estimated, error, local, routing, billing, cache_saved_micros,
               client_hint, session, cancelled, price_source, translated,
               error_code, error_args, peer, key_masked, session_log_bytes,
-              ttft_ms, tokens_per_sec, sent_model, answered_model, input_estimate)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)",
+              ttft_ms, tokens_per_sec, sent_model, answered_model, input_estimate,
+              received_bytes, egress)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38)",
             params![
                 r.id,
                 r.at_ms,
@@ -480,7 +496,7 @@ impl Db {
                 r.status,
                 r.ttfb_ms,
                 r.duration_ms,
-                r.bytes,
+                r.sent_bytes,
                 r.input_tokens,
                 r.output_tokens,
                 r.cache_read_tokens,
@@ -510,6 +526,8 @@ impl Db {
                 r.sent_model,
                 r.answered_model,
                 r.input_estimate,
+                r.received_bytes,
+                r.egress,
             ],
         )?;
         Ok(())
@@ -893,7 +911,23 @@ impl Db {
             unpriced,
             cache_saved,
             no_usage,
-        ): (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
+            sent,
+            received,
+        ): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self.conn.query_row(
             &format!(
                 "SELECT
                 COUNT(*),
@@ -906,7 +940,9 @@ impl Db {
                 COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
                 COALESCE(SUM({NO_PRICE}), 0),
                 COALESCE(SUM(cache_saved_micros), 0),
-                COALESCE(SUM({NO_USAGE}), 0)
+                COALESCE(SUM({NO_USAGE}), 0),
+                COALESCE(SUM(sent_bytes), 0),
+                COALESCE(SUM(received_bytes), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0"
             ),
@@ -924,6 +960,8 @@ impl Db {
                     r.get(8)?,
                     r.get(9)?,
                     r.get(10)?,
+                    r.get(11)?,
+                    r.get(12)?,
                 ))
             },
         )?;
@@ -940,6 +978,8 @@ impl Db {
             output_tokens: out_tok,
             cache_read_tokens: cache_r,
             cache_write_tokens: cache_w,
+            sent_bytes: sent,
+            received_bytes: received,
             cost_micros_exact: exact,
             cost_micros_estimated: estimated,
             unpriced_requests: unpriced,
@@ -1161,12 +1201,23 @@ impl Db {
         since_ms: i64,
         until_ms: i64,
     ) -> Result<Vec<Latency>, DbError> {
-        let mut st = self.conn.prepare(
-            "SELECT provider, ttft_ms FROM requests
+        self.latency_by("provider", since_ms, until_ms)
+    }
+
+    /// 按密钥分的首 token 分位数：谁在用、谁等得久。**和按上游分是两个问题** —— 一把密钥
+    /// 的请求可能分在好几家上游，慢的是哪一家要看按上游分的那个。样本的规矩和按模型分的一样
+    pub fn latency_by_client(&self, since_ms: i64, until_ms: i64) -> Result<Vec<Latency>, DbError> {
+        self.latency_by("client", since_ms, until_ms)
+    }
+
+    /// `by` 只会是上面两个调用方给的列名，不来自外面
+    fn latency_by(&self, by: &str, since_ms: i64, until_ms: i64) -> Result<Vec<Latency>, DbError> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {by}, ttft_ms FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttft_ms IS NOT NULL
-               AND provider <> ''
-             ORDER BY provider, ttft_ms",
-        )?;
+               AND {by} <> ''
+             ORDER BY {by}, ttft_ms"
+        ))?;
         let rows = st.query_map(params![since_ms, until_ms], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })?;
@@ -1263,7 +1314,13 @@ impl Db {
                     COALESCE(SUM(CASE WHEN cost_estimated = 0 THEN cost_micros ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN cost_estimated = 1 THEN cost_micros ELSE 0 END), 0),
                     COALESCE(SUM({NO_PRICE}), 0),
-                    COALESCE(SUM({NO_USAGE}), 0)
+                    COALESCE(SUM({NO_USAGE}), 0),
+                    COALESCE(SUM(sent_bytes), 0),
+                    COALESCE(SUM(received_bytes), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
              GROUP BY b ORDER BY b"
@@ -1277,9 +1334,43 @@ impl Db {
                 cost_micros_estimated: r.get(4)?,
                 unpriced_requests: r.get(5)?,
                 no_usage_requests: r.get(6)?,
+                sent_bytes: r.get(7)?,
+                received_bytes: r.get(8)?,
+                input_tokens: r.get(9)?,
+                output_tokens: r.get(10)?,
+                cache_read_tokens: r.get(11)?,
+                cache_write_tokens: r.get(12)?,
+                ttft_p50_ms: None,
+                ttft_p95_ms: None,
+                ttft_samples: 0,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut buckets = rows.collect::<Result<Vec<_>, _>>()?;
+        // 每一格的首 token 分位数：**样本和 `latency_by_model` 同一个口径**（有第一个 token 的、
+        // 不是本地应答的）。分位数在 SQL 里求不出来，按格取出排好序的样本在这里求；一格的
+        // 样本就是那一格里的流式请求，不多
+        let mut st = self.conn.prepare(
+            "SELECT ((at_ms - ?1) / ?3) AS b, ttft_ms FROM requests
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND ttft_ms IS NOT NULL
+             ORDER BY b, ttft_ms",
+        )?;
+        let rows = st.query_map(params![since_ms, until_ms, bucket_ms], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut by: std::collections::BTreeMap<i64, Vec<i64>> = Default::default();
+        for row in rows {
+            let (b, t) = row?;
+            by.entry(b).or_default().push(t);
+        }
+        for bucket in &mut buckets {
+            let b = (bucket.at_ms - since_ms) / bucket_ms;
+            if let Some(xs) = by.get(&b) {
+                bucket.ttft_p50_ms = Some(percentile(xs, 50));
+                bucket.ttft_p95_ms = Some(percentile(xs, 95));
+                bucket.ttft_samples = xs.len() as i64;
+            }
+        }
+        Ok(buckets)
     }
 
     /// 按某个维度分组的花费（钱花在哪儿）。
@@ -1305,11 +1396,7 @@ impl Db {
         if bucket_ms <= 0 {
             return Ok(Vec::new());
         }
-        let col = match dim {
-            tw_api::CostDim::Model => "model",
-            tw_api::CostDim::Provider => "provider",
-            tw_api::CostDim::Client => "client",
-        };
+        let col = dim_col(dim);
         // 缺着钱的两种和 `cost_buckets` 用同一对条件：每一格里各项加起来，
         // 就是那一格自己的数
         let sql = format!(
@@ -1323,7 +1410,9 @@ impl Db {
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(cache_write_tokens), 0)
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(sent_bytes), 0),
+                    COALESCE(SUM(received_bytes), 0)
              FROM requests
              WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0
              GROUP BY b, {col} ORDER BY b"
@@ -1343,6 +1432,8 @@ impl Db {
                 output_tokens: r.get(9)?,
                 cache_read_tokens: r.get(10)?,
                 cache_write_tokens: r.get(11)?,
+                sent_bytes: r.get(12)?,
+                received_bytes: r.get(13)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1354,10 +1445,12 @@ impl Db {
         since_ms: i64,
         until_ms: i64,
     ) -> Result<Vec<tw_api::CostGroup>, DbError> {
-        let col = match dim {
-            tw_api::CostDim::Model => "model",
-            tw_api::CostDim::Provider => "provider",
-            tw_api::CostDim::Client => "client",
+        let col = dim_col(dim);
+        // 名字是空的不成一组（本地应答之外，WebSocket 的连接行不知道模型）。**出口除外**：
+        // 空串是直连那一组
+        let named = match dim {
+            tw_api::CostDim::Egress => "1".to_string(),
+            _ => format!("{col} <> ''"),
         };
         let sql = format!(
             "SELECT {col}, COUNT(*),
@@ -1366,7 +1459,7 @@ impl Db {
                     COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM({NO_USAGE}), 0)
              FROM requests
-             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND {col} <> ''
+             WHERE at_ms >= ?1 AND at_ms < ?2 AND local = 0 AND {named}
              GROUP BY {col} ORDER BY 3 DESC"
         );
         let mut st = self.conn.prepare(&sql)?;
@@ -1682,6 +1775,18 @@ impl Db {
     }
 }
 
+/// 分组维度对应的那一列。**只有这几个固定的值** —— 维度来自查询串，拼进 SQL 的只能是这里
+/// 写死的列名（见 `tw_api::CostDim`）
+fn dim_col(dim: tw_api::CostDim) -> &'static str {
+    match dim {
+        tw_api::CostDim::Model => "model",
+        tw_api::CostDim::Provider => "provider",
+        tw_api::CostDim::Client => "client",
+        // 直连的出口是 NULL：算成空串那一组，不丢掉
+        tw_api::CostDim::Egress => "COALESCE(egress, '')",
+    }
+}
+
 /// 排好序的样本里的第 p 百分位，**最近秩法**。
 ///
 /// 不做线性插值：延迟本来就是毫秒粒度的整数，插出一个「843.7ms」只是
@@ -1732,7 +1837,9 @@ pub(crate) fn row_from(r: &rusqlite::Row) -> rusqlite::Result<RequestRow> {
         ttft_ms: r.get("ttft_ms")?,
         duration_ms: r.get("duration_ms")?,
         tokens_per_sec: r.get("tokens_per_sec")?,
-        bytes: r.get("bytes")?,
+        sent_bytes: r.get("sent_bytes")?,
+        received_bytes: r.get("received_bytes")?,
+        egress: r.get("egress")?,
         input_tokens: r.get("input_tokens")?,
         output_tokens: r.get("output_tokens")?,
         cache_read_tokens: r.get("cache_read_tokens")?,
@@ -1765,6 +1872,9 @@ pub struct Summary {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// 和上游之间的流量合计：发出去的请求体、收回来的响应体
+    pub sent_bytes: i64,
+    pub received_bytes: i64,
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
     /// 有多少条请求**根本没有价格**（模型不在价目表里，见 `NO_PRICE`）。
@@ -1911,7 +2021,9 @@ pub(crate) mod tests {
             ttft_ms: Some(800),
             duration_ms: Some(4000),
             tokens_per_sec: Some(156),
-            bytes: Some(12345),
+            sent_bytes: Some(4321),
+            received_bytes: Some(12345),
+            egress: None,
             input_tokens: Some(1000),
             output_tokens: Some(500),
             cache_read_tokens: Some(200),
@@ -2064,6 +2176,173 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 一条流量：发出去多少、收回来多少、从哪个出口
+    fn traffic(id: i64, at_ms: i64, sent: i64, received: i64, egress: Option<&str>) -> RequestRow {
+        let mut r = row(id, at_ms);
+        r.sent_bytes = Some(sent);
+        r.received_bytes = Some(received);
+        r.egress = egress.map(str::to_string);
+        r
+    }
+
+    /// 流量和出口跟着一行走：写进去、读出来一样；一跳都没发出去的是 None，不是 0
+    #[test]
+    fn traffic_and_egress_survive_a_round_trip() {
+        let db = Db::in_memory().unwrap();
+        db.insert(&traffic(1, 1000, 2048, 312, Some("机场")))
+            .unwrap();
+        let mut never = row(2, 1001);
+        never.sent_bytes = None;
+        never.received_bytes = None;
+        db.insert(&never).unwrap();
+        let r = db.get(1).unwrap().unwrap();
+        assert_eq!(
+            (r.sent_bytes, r.received_bytes, r.egress.as_deref()),
+            (Some(2048), Some(312), Some("机场"))
+        );
+        let r = db.get(2).unwrap().unwrap();
+        assert_eq!(
+            (r.sent_bytes, r.received_bytes, r.egress),
+            (None, None, None)
+        );
+    }
+
+    /// 汇总、每一格、每一格的每一项都带着流量的合计；一跳都没发出去的那几行不算（没有流量），
+    /// 本地应答的也不算
+    #[test]
+    fn traffic_adds_up_in_the_summary_and_in_every_bucket() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let hour = 3_600_000i64;
+        db.insert(&traffic(1, t0 + 1, 100, 1_000, None)).unwrap();
+        db.insert(&traffic(2, t0 + 2, 200, 2_000, Some("机场")))
+            .unwrap();
+        db.insert(&traffic(3, t0 + hour + 1, 400, 4_000, Some("机场")))
+            .unwrap();
+        let mut refused = row(4, t0 + 3);
+        refused.sent_bytes = None;
+        refused.received_bytes = None;
+        db.insert(&refused).unwrap();
+        let mut local = traffic(5, t0 + 4, 9_999, 9_999, None);
+        local.local = true;
+        db.insert(&local).unwrap();
+
+        let s = db.summary(t0, t0 + 2 * hour).unwrap();
+        assert_eq!((s.sent_bytes, s.received_bytes), (700, 7_000));
+
+        let b = db.cost_buckets(t0, t0 + 2 * hour, hour).unwrap();
+        let per: Vec<_> = b.iter().map(|b| (b.sent_bytes, b.received_bytes)).collect();
+        assert_eq!(per, [(300, 3_000), (400, 4_000)]);
+        // 每一格也带着四类 token：`row` 是输入 1000、输出 500、缓存读 200
+        assert_eq!(
+            (
+                b[0].input_tokens,
+                b[0].output_tokens,
+                b[0].cache_read_tokens,
+                b[0].cache_write_tokens
+            ),
+            (3_000, 1_500, 600, 0)
+        );
+
+        let by = db
+            .cost_buckets_by(tw_api::CostDim::Model, t0, t0 + 2 * hour, hour)
+            .unwrap();
+        let per: Vec<_> = by
+            .iter()
+            .map(|b| (b.at_ms, b.sent_bytes, b.received_bytes))
+            .collect();
+        assert_eq!(per, [(t0, 300, 3_000), (t0 + hour, 400, 4_000)]);
+    }
+
+    /// 按出口分：**直连的那一组名字是空串**，不丢掉 —— 少了它各组加起来对不上总数
+    #[test]
+    fn grouping_by_egress_keeps_the_direct_traffic_as_an_empty_name() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        db.insert(&traffic(1, t0 + 1, 100, 1_000, None)).unwrap();
+        db.insert(&traffic(2, t0 + 2, 200, 2_000, Some("机场")))
+            .unwrap();
+        db.insert(&traffic(3, t0 + 3, 400, 4_000, Some("机场")))
+            .unwrap();
+
+        let mut by = db
+            .cost_buckets_by(tw_api::CostDim::Egress, t0, t0 + 1000, 1000)
+            .unwrap();
+        by.sort_by(|a, b| a.name.cmp(&b.name));
+        let per: Vec<_> = by
+            .iter()
+            .map(|b| (b.name.as_str(), b.requests, b.sent_bytes, b.received_bytes))
+            .collect();
+        assert_eq!(per, [("", 1, 100, 1_000), ("机场", 2, 600, 6_000)]);
+
+        let g = db.cost_by(tw_api::CostDim::Egress, t0, t0 + 1000).unwrap();
+        let mut names: Vec<_> = g.iter().map(|g| (g.name.as_str(), g.requests)).collect();
+        names.sort();
+        assert_eq!(names, [("", 1), ("机场", 2)]);
+    }
+
+    /// 每一格的首 token 分位数：**样本和 `latency_by_model` 同一个口径** —— 有第一个 token 的
+    /// （流式的）才算，本地应答的不算。没有样本的格子是空的，不是 0
+    #[test]
+    fn every_bucket_carries_its_first_token_percentiles() {
+        let db = Db::in_memory().unwrap();
+        let t0 = 1_000_000_000i64;
+        let hour = 3_600_000i64;
+        // 第 0 格：100 到 1000 毫秒的十个流式请求，加一个非流式的
+        for i in 1..=10 {
+            let mut r = row(i, t0 + i);
+            r.ttft_ms = Some(i * 100);
+            db.insert(&r).unwrap();
+        }
+        let mut whole = row(11, t0 + 11);
+        whole.ttft_ms = None;
+        db.insert(&whole).unwrap();
+        let mut local = row(12, t0 + 12);
+        local.local = true;
+        local.ttft_ms = Some(1);
+        db.insert(&local).unwrap();
+        // 第 1 格：只有非流式的
+        let mut later = row(13, t0 + hour + 1);
+        later.ttft_ms = None;
+        db.insert(&later).unwrap();
+
+        let b = db.cost_buckets(t0, t0 + 2 * hour, hour).unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(
+            (b[0].ttft_p50_ms, b[0].ttft_p95_ms, b[0].ttft_samples),
+            (Some(500), Some(1000), 10)
+        );
+        assert_eq!(
+            (b[1].ttft_p50_ms, b[1].ttft_p95_ms, b[1].ttft_samples),
+            (None, None, 0)
+        );
+        // 和整段的按模型分同一个口径
+        let all = db.latency_by_model(t0, t0 + hour).unwrap();
+        assert_eq!((all[0].p50, all[0].p95, all[0].samples), (500, 1000, 10));
+    }
+
+    /// 按密钥分的首 token 分位数：每把密钥一组，规矩和按模型分的一样
+    #[test]
+    fn latency_by_client_groups_by_the_key() {
+        let db = Db::in_memory().unwrap();
+        for i in 1..=4 {
+            let mut r = row(i, 1000 + i);
+            r.client = if i % 2 == 0 { "codex" } else { "claude-code" }.into();
+            r.ttft_ms = Some(i * 100);
+            db.insert(&r).unwrap();
+        }
+        let mut whole = row(5, 1005);
+        whole.client = "codex".into();
+        whole.ttft_ms = None;
+        db.insert(&whole).unwrap();
+        let lat = db.latency_by_client(0, 10_000).unwrap();
+        let got: Vec<_> = lat
+            .iter()
+            .map(|l| (l.model.as_str(), l.p50, l.p95, l.samples))
+            .collect();
+        assert_eq!(got, [("claude-code", 100, 300, 2), ("codex", 200, 400, 2)]);
     }
 
     /// 密钥用量上限重启之后加回来的数：按密钥、路径、有没有发到上游分组，从那一刻起，网关
@@ -3171,6 +3450,7 @@ mod cost_state_tests {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 }],
                 ..Default::default()
             })
@@ -3667,6 +3947,7 @@ mod cost {
                     usage: None,
                     queued_ms: None,
                     skipped: None,
+                    proxy: None,
                 }
             })
             .collect();

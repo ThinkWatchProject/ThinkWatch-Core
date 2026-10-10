@@ -35,7 +35,7 @@ const MIN_GENERATION_MS: u64 = 500;
 
 /// 一个还欠着结局的请求。
 ///
-/// **到目前为止对响应知道的一切都在它身上**：状态码、收到多少字节、嗅到
+/// **到目前为止对响应知道的一切都在它身上**：状态码、和上游之间走了多少流量、嗅到
 /// 多少用量、攒下的响应体。放在一处是因为结局要用的正是这些 —— 不管这个
 /// 结局是显式报的，还是在 Drop 里报的。
 #[must_use = "dropping it reports that the client disconnected"]
@@ -53,8 +53,10 @@ pub struct Ending {
     /// 上游的响应头。**没到的时候客户端就走了的，没有状态码可报** —— 那时
     /// 报一个 0 或者 499，都是在编
     status: Option<u16>,
-    /// 从上游收到多少字节。**数的是上游原话**，不是还原、翻译之后的那版
-    bytes: u64,
+    /// 和上游之间走了多少流量（见 [`crate::traffic`]）。HTTP 那条路上和请求共用一个
+    /// （[`Ending::metered_by`]）：每一跳发、收的时候各自记进去，这里只管报；WebSocket 的帧由
+    /// 那条路记在这里（[`Ending::count`]、[`Ending::sending`]）
+    traffic: std::sync::Arc<crate::traffic::Traffic>,
     /// 旁路嗅探。客户端走掉那一刻手里有多少用量，靠的就是它
     sniffer: Sniffer,
     /// 一条连接上每一次回答报的用量加起来（[`Ending::add_usage`]）。有它就不看嗅探器
@@ -214,7 +216,7 @@ impl Ending {
             sink,
             redaction: None,
             status: None,
-            bytes: 0,
+            traffic: crate::traffic::Traffic::new(),
             sniffer: Sniffer::new(),
             total: None,
             tap: ResponseTap::new(),
@@ -291,6 +293,11 @@ impl Ending {
         self.redaction = Some(r);
     }
 
+    /// 流量记在这一个上（HTTP 那条路：请求身上那一个，每一跳发、收的时候记进去）。
+    pub fn metered_by(&mut self, t: std::sync::Arc<crate::traffic::Traffic>) {
+        self.traffic = t;
+    }
+
     /// 这一次由谁回答：成功走完时记下它和它读写了多少缓存。
     pub fn answered_by(&mut self, ticket: crate::affinity::Ticket) {
         self.answer = Some(ticket);
@@ -317,8 +324,10 @@ impl Ending {
     /// 上游来了一块。**这里看的是上游原话**（带占位符的那一版）：usage
     /// 数字不受影响，而请求详情里存的正是「发出去的和收回来的」。原话里要是带着
     /// 认得出的值（观察档下模型回显的密钥），落盘之前打码（见 [`crate::bodies`]）。
+    ///
+    /// **流量不在这里数**：这里看到的是转码过的（Bedrock 的二进制帧转成了 SSE），数的是收到
+    /// 的那一处（见 [`crate::traffic`]）。
     pub fn feed(&mut self, chunk: &[u8]) {
-        self.bytes += chunk.len() as u64;
         self.sniffer.feed(chunk);
         // 没有去处（观测层没起来）就不攒：一个回答最多攒 4 MB，攒了也交不出去
         if self.sink.is_some() {
@@ -379,7 +388,8 @@ impl Ending {
         });
     }
 
-    /// 只数字节，不嗅用量、不留档。
+    /// 只数字节，不嗅用量、不留档：上游发来的一帧，载荷 `bytes` 字节（**上游原话**，还原占位符
+    /// 之前）。
     ///
     /// 整条连接一行的 WebSocket 用它（Realtime 和别的路径，见 [`crate::ws`]）。一条连接上
     /// 跑着好几轮回答，每轮各报一次用量，而嗅探器是「每个字段取最大值」—— 喂给它，得到的
@@ -387,7 +397,18 @@ impl Ending {
     /// 每一轮用量的（Realtime 的 `response.done`）由调用方一轮一轮加上（[`Ending::add_usage`]）。
     /// Responses 的连接每一轮各是一个请求，用的是 [`Ending::frame`]。
     pub fn count(&mut self, bytes: usize) {
-        self.bytes += bytes as u64;
+        self.traffic.received(bytes);
+    }
+
+    /// 发给上游的一帧，载荷 `bytes` 字节（脱敏之后、真正发出去的那一份）：WebSocket 那条路
+    /// 记发出去的流量。控制帧（ping、pong、关闭）不算
+    pub fn sending(&mut self, bytes: usize) {
+        self.traffic.sending(bytes);
+    }
+
+    /// 和上游的 WebSocket 连上了：从这一刻起有流量可说（一帧都没发也是 0，不是没有）
+    pub fn connected(&mut self) {
+        self.traffic.connected();
     }
 
     /// 一条连接上又一次回答的用量：加到这一行上（Realtime 的连接，见 [`crate::ws`]）。结局
@@ -404,7 +425,7 @@ impl Ending {
 
     /// WebSocket 上上游的一帧文本：Responses 连接上的一轮（见 `crate::ws::turn`）。一条消息
     /// 就是一个事件，**按 SSE 的一帧喂**给认第一个 token、嗅用量、看错误的那几样 —— 它们
-    /// 读的是 SSE；字节只数消息本身。已经是 SSE 形状的（桥接过来的）原样喂
+    /// 读的是 SSE；流量只数消息本身。已经是 SSE 形状的（桥接过来的）原样喂
     pub fn frame(&mut self, text: &str) {
         let sse = if text.lines().any(|l| l.starts_with("data: ")) {
             std::borrow::Cow::Borrowed(text)
@@ -412,7 +433,7 @@ impl Ending {
             std::borrow::Cow::Owned(format!("data: {text}\n\n"))
         };
         self.feed(sse.as_bytes());
-        self.bytes = self.bytes - sse.len() as u64 + text.len() as u64;
+        self.traffic.received(text.len());
     }
 
     /// 走完了。上游在流里报过错的、回的不是 2xx 的，报的是失败（见 [`Ending::streaming`]、
@@ -448,11 +469,13 @@ impl Ending {
         }
         let duration_ms = self.duration_ms();
         let tokens_per_sec = rate(self.opened, usage.as_ref(), duration_ms);
+        let (sent_bytes, received_bytes) = self.traffic.totals();
         self.bus.emit(tw_api::Event::RequestFinished {
             id: self.id,
             model: std::mem::take(&mut self.model),
             status,
-            bytes: self.bytes,
+            sent_bytes,
+            received_bytes,
             duration_ms,
             usage: usage.map(view),
             tokens_per_sec,
@@ -466,12 +489,14 @@ impl Ending {
     /// **断在流中间的失败也带着用量** —— 上游已经为它计了费。
     pub fn failed(mut self, source: tw_api::FailureSource, message: Msg) {
         let (usage, answered_model) = self.settle();
+        let (sent_bytes, received_bytes) = self.traffic_seen();
         self.bus.emit(tw_api::Event::RequestFailed {
             id: self.id,
             model: std::mem::take(&mut self.model),
             source,
             message,
-            bytes: self.received(),
+            sent_bytes,
+            received_bytes,
             duration_ms: Some(self.duration_ms()),
             usage: usage.map(view),
             answered_model,
@@ -506,10 +531,14 @@ impl Ending {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// 收到了多少字节。**响应头都没到的，没有「收到了多少」这回事** ——
-    /// 报 0 会让它看起来像一个空响应。
-    fn received(&self) -> Option<u64> {
-        self.status.map(|_| self.bytes)
+    /// （发出去的，收回来的）流量。**一跳都没发出去的，没有流量可说** —— 报一对 0 会让它
+    /// 看起来像发出去了、上游一声不吭（见 [`crate::traffic::Traffic::reached`]）
+    fn traffic_seen(&self) -> (Option<u64>, Option<u64>) {
+        if !self.traffic.reached() {
+            return (None, None);
+        }
+        let (sent, received) = self.traffic.totals();
+        (Some(sent), Some(received))
     }
 }
 
@@ -523,6 +552,7 @@ impl Drop for Ending {
         // 往通道里 try_send、往广播里 send、读一下时钟。
         let (usage, answered_model) = self.settle();
         let usage = usage.map(view);
+        let (sent_bytes, received_bytes) = self.traffic_seen();
         // 在界面上叫停之后被丢掉的（见 `crate::abort`）：是手动中止，不是客户端走了
         if self.abort.as_ref().is_some_and(|r| r.thrown()) {
             self.bus.emit(tw_api::Event::RequestFailed {
@@ -530,7 +560,8 @@ impl Drop for Ending {
                 model: std::mem::take(&mut self.model),
                 source: tw_api::FailureSource::Aborted,
                 message: crate::error::GatewayError::aborted().detail,
-                bytes: self.received(),
+                sent_bytes,
+                received_bytes,
                 duration_ms: Some(self.duration_ms()),
                 usage,
                 answered_model,
@@ -547,7 +578,8 @@ impl Drop for Ending {
                 message: msg!(
                     "gw.internal" => "The request was interrupted by an error inside the gateway."
                 ),
-                bytes: self.received(),
+                sent_bytes,
+                received_bytes,
                 duration_ms: Some(self.duration_ms()),
                 usage,
                 answered_model,
@@ -558,7 +590,8 @@ impl Drop for Ending {
             id: self.id,
             model: std::mem::take(&mut self.model),
             status: self.status,
-            bytes: self.bytes,
+            sent_bytes,
+            received_bytes,
             duration_ms: self.duration_ms(),
             usage,
             answered_model,
@@ -646,12 +679,22 @@ mod tests {
     const MESSAGE_START: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5000,\"cache_read_input_tokens\":4000,\"output_tokens\":1}}}\n\n";
     const MESSAGE_DELTA: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":777}}\n\n";
     const MODEL: &str = "claude-sonnet-5";
+    /// 发给上游的请求体有多少字节（HTTP 那条路上由发送的那一处记，见 `crate::traffic`）
+    const SENT: usize = 321;
 
-    /// 一个响应头已经到了的请求。
+    /// 一个发出去了、响应头已经到了的请求。
     fn responding(bus: &tw_observe::EventBus) -> Ending {
         let mut e = Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None);
+        e.traffic.sending(SENT);
         e.responded(200);
         e
+    }
+
+    /// 上游的一块到了：HTTP 那条路上收的那一处记下它（`crate::traffic::metered`），再交给
+    /// 结局去嗅、去留档
+    fn wire(e: &mut Ending, chunk: &[u8]) {
+        e.traffic.received(chunk.len());
+        e.feed(chunk);
     }
 
     /// 总线上此刻有的全部事件。
@@ -666,8 +709,8 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.feed(MESSAGE_START);
-        e.feed(MESSAGE_DELTA);
+        wire(&mut e, MESSAGE_START);
+        wire(&mut e, MESSAGE_DELTA);
         e.finished(200);
 
         let got = drain(&mut rx);
@@ -676,11 +719,16 @@ mod tests {
             Event::RequestFinished {
                 id: 7,
                 status: 200,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 usage: Some(u),
                 ..
             } => {
-                assert_eq!(*bytes, (MESSAGE_START.len() + MESSAGE_DELTA.len()) as u64);
+                assert_eq!(*sent_bytes, SENT as u64);
+                assert_eq!(
+                    *received_bytes,
+                    (MESSAGE_START.len() + MESSAGE_DELTA.len()) as u64
+                );
                 assert_eq!((u.input, u.output, u.cache_read), (5000, 777, 4000));
             }
             other => panic!("该是一条结束，实际 {other:?}"),
@@ -692,7 +740,7 @@ mod tests {
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let mut e = responding(&bus);
-        e.feed(MESSAGE_START);
+        wire(&mut e, MESSAGE_START);
         e.failed(
             tw_api::FailureSource::Upstream,
             msg!("t.broke" => "the stream broke: the upstream disconnected"),
@@ -703,13 +751,15 @@ mod tests {
         match &got[0] {
             Event::RequestFailed {
                 source,
-                bytes,
+                sent_bytes,
+                received_bytes,
                 duration_ms: Some(_),
                 usage: Some(u),
                 ..
             } => {
                 assert_eq!(*source, tw_api::FailureSource::Upstream);
-                assert_eq!(*bytes, Some(MESSAGE_START.len() as u64));
+                assert_eq!(*sent_bytes, Some(SENT as u64));
+                assert_eq!(*received_bytes, Some(MESSAGE_START.len() as u64));
                 // **断在中间也要带着用量**：输入在第一帧里就齐了，上游已经为它计费
                 assert_eq!((u.input, u.cache_read), (5000, 4000));
             }
@@ -771,6 +821,7 @@ mod tests {
     /// 一个响应头已经到了、回的不是 2xx 的请求，原样交给客户端（见 `Ending::refused`）
     fn refused(bus: &tw_observe::EventBus, status: u16, provider: &str) -> Ending {
         let mut e = Ending::new(bus.clone(), 7, MODEL.into(), Instant::now(), 1_000, None);
+        e.traffic.sending(SENT);
         e.responded(status);
         e.refused(ir::Dialect::Anthropic, provider, None);
         e
@@ -801,7 +852,7 @@ mod tests {
         let mut e = refused(&bus, 400, "官方");
         // 错误正文分几块到
         for part in TOO_LONG.chunks(7) {
-            e.feed(part);
+            wire(&mut e, part);
         }
         e.finished(400);
 
@@ -810,7 +861,7 @@ mod tests {
                 Event::RequestFailed {
                     source,
                     message,
-                    bytes: Some(bytes),
+                    received_bytes: Some(bytes),
                     duration_ms: Some(_),
                     usage: None,
                     ..
@@ -1027,7 +1078,8 @@ mod tests {
             matches!(
                 got.as_slice(),
                 [Event::RequestFailed {
-                    bytes: None,
+                    sent_bytes: None,
+                    received_bytes: None,
                     duration_ms: Some(_),
                     usage: None,
                     ..
@@ -1052,8 +1104,9 @@ mod tests {
             1_000,
             Some(tx),
         );
+        e.traffic.sending(SENT);
         e.responded(200);
-        e.feed(MESSAGE_START);
+        wire(&mut e, MESSAGE_START);
         drop(e);
 
         let got = drain(&mut rx);
@@ -1062,11 +1115,13 @@ mod tests {
             Event::RequestCancelled {
                 id: 7,
                 status: Some(200),
-                bytes,
+                sent_bytes,
+                received_bytes,
                 usage: Some(u),
                 ..
             } => {
-                assert_eq!(*bytes, MESSAGE_START.len() as u64);
+                assert_eq!(*sent_bytes, Some(SENT as u64));
+                assert_eq!(*received_bytes, Some(MESSAGE_START.len() as u64));
                 // 输入和缓存读在第一帧里就是齐的，那正是账单上最大的一块
                 assert_eq!((u.input, u.cache_read), (5000, 4000));
             }
@@ -1088,8 +1143,8 @@ mod tests {
         e.feed(MESSAGE_START);
         let (kept, seen) = std::mem::take(&mut e.tap).finish();
         assert!(kept.is_empty() && seen == 0, "{seen}");
-        // 数还是照数的
-        assert_eq!(e.bytes, MESSAGE_START.len() as u64);
+        // 流量也不在这里数：喂进来的是转码过的，数的是收到的那一处（见 `crate::traffic`）
+        assert_eq!(e.traffic.totals(), (0, 0));
         e.finished(200);
     }
 
@@ -1114,7 +1169,8 @@ mod tests {
                 got.as_slice(),
                 [Event::RequestCancelled {
                     status: None,
-                    bytes: 0,
+                    sent_bytes: None,
+                    received_bytes: None,
                     usage: None,
                     ..
                 }]
@@ -1321,7 +1377,9 @@ mod tests {
         let mut rx = bus.subscribe();
         // WebSocket 那条路不知道模型名
         let mut e = Ending::new(bus.clone(), 7, String::new(), Instant::now(), 1_000, None);
+        e.connected();
         e.responded(101);
+        e.sending(12);
         e.count(MESSAGE_START.len());
         e.finished(101);
 
@@ -1329,8 +1387,8 @@ mod tests {
         assert!(
             matches!(
                 got.as_slice(),
-                [Event::RequestFinished { status: 101, bytes, usage: None, .. }]
-                    if *bytes == MESSAGE_START.len() as u64
+                [Event::RequestFinished { status: 101, sent_bytes: 12, received_bytes, usage: None, .. }]
+                    if *received_bytes == MESSAGE_START.len() as u64
             ),
             "{got:?}"
         );
@@ -1362,12 +1420,17 @@ mod tests {
         );
         match got.last() {
             Some(Event::RequestFinished {
-                bytes,
+                sent_bytes,
+                received_bytes,
                 usage: Some(u),
                 answered_model,
                 ..
             }) => {
-                assert_eq!(*bytes, frames.iter().map(|f| f.len() as u64).sum::<u64>());
+                assert_eq!(*sent_bytes, SENT as u64);
+                assert_eq!(
+                    *received_bytes,
+                    frames.iter().map(|f| f.len() as u64).sum::<u64>()
+                );
                 assert_eq!((u.input, u.cache_read, u.output), (30, 20, 5));
                 assert_eq!(answered_model.as_deref(), Some("gpt-5"));
             }

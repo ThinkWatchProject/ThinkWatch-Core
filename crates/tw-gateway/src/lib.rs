@@ -51,6 +51,7 @@ pub mod session;
 pub mod slots;
 mod splice;
 pub mod state;
+pub mod traffic;
 pub mod translate;
 pub mod wire;
 pub mod ws;

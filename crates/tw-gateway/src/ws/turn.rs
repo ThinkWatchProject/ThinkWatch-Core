@@ -278,6 +278,14 @@ impl Turn {
         }
     }
 
+    /// 这一轮发给上游的一帧，载荷 `bytes` 字节：`response.create` 那一帧，和它在答的时候客户端
+    /// 接着发来的帧。记进这一轮的流量
+    pub(crate) fn sending(&mut self, bytes: usize) {
+        if let Some(e) = self.ending.as_mut() {
+            e.sending(bytes);
+        }
+    }
+
     /// 上游开始答这一轮了：发出去时前面没有在答的，或者前面那一轮刚收尾。这一家的快慢样本
     /// 从这一刻量到第一段内容（见 [`crate::latency`]）—— 前一轮还在答的时候，这一轮排在后面
     /// 等，那一段不是这一家慢
@@ -427,6 +435,8 @@ fn routed(
         affinity: None,
         attempts,
         billing,
+        // WebSocket 只连直连的上游（走代理的升级时就拒了，见 `server::upgrade`）
+        egress: None,
     }
 }
 

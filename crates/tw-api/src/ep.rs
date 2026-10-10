@@ -53,6 +53,8 @@ endpoints! {
     HistorySearch: POST "/history/search", api::HistorySearchQuery => api::HistorySearchPage;
     Latency: GET "/latency", api::Window => Vec<api::LatencyView>;
     LatencyByProvider: GET "/latency/provider", api::Window => Vec<api::LatencyView>;
+    /// 首 token 的分位数，按密钥（谁在用、谁等得久）
+    LatencyByClient: GET "/latency/client", api::Window => Vec<api::LatencyView>;
     /// 生成速度的中位数，按模型、按上游
     TokenRate: GET "/token-rate", api::Window => Vec<api::TokenRateView>;
     TokenRateByProvider: GET "/token-rate/provider", api::Window => Vec<api::TokenRateView>;

@@ -44,6 +44,9 @@ pub(super) struct Inbound {
     pub(super) from: Sender,
     /// 手动中止的开关（见 [`crate::abort`]）：开始之后登记上，等上游、交回答时看着它
     pub(super) abort: crate::abort::Switch,
+    /// 这个请求和上游之间走了多少流量（见 [`crate::traffic`]）：每一跳发的时候记、收的时候记，
+    /// 结局报出去的是它
+    pub(super) traffic: std::sync::Arc<crate::traffic::Traffic>,
 }
 
 /// 发出开始事件之后，后面几步都要用的。
@@ -1033,6 +1036,8 @@ fn open(
         sink.clone(),
     );
     end.redact_with(redaction.clone());
+    // 流量记在请求身上（每一跳发、收的时候记，见 `hop`），结局报的是同一个数
+    end.metered_by(req.traffic.clone());
     // 从这一刻起可以手动中止：登记跟着结局走，结局报了就不在跑了（见 `crate::abort`）
     end.abortable(state.aborts.enter(id, session, req.abort.clone()));
     *ending = Some(end);
