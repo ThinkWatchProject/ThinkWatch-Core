@@ -1,7 +1,7 @@
 //! 一个请求在网关和上游之间走了多少流量、从哪个出口出去的，端到端（见 `tw_gateway::traffic`）。
 //!
 //! - 故障转移：**每一跳都算**，连不上的那一跳没发出去、不算；失败的那一跳读过的错误正文算
-//! - 收到的按线上的样子数，**解压之前**：上游压缩过的回答数压缩着的字节
+//! - 收到的按线上的样子数，**解压之前**：上游压缩过的回答数压缩着的字节，交给客户端的是解开的
 //! - 走代理的上游：结局的出口、尝试链上每一跳的代理都是它的名字；直连的没有
 
 use std::net::SocketAddr;
@@ -73,7 +73,7 @@ fn cfg(providers: Vec<Provider>) -> Config {
     }
 }
 
-/// 发一个请求，交回状态码和**原样**的正文（测试用的客户端不解压）
+/// 发一个请求，交回状态码和**原样**的正文（测试用的客户端不解压：看到的就是网关发出的字节）
 async fn post(gw: SocketAddr) -> (u16, bytes::Bytes) {
     let r = reqwest::Client::new()
         .post(format!("http://{gw}/v1/messages"))
@@ -109,7 +109,8 @@ async fn routed_and_ended(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> (
 /// 三家：第一家连不上，第二家回 503，第三家回一个 zstd 压缩过的整包回答。
 ///
 /// **发出去的是两跳的请求体**：连不上的那一跳一个字节都没出去。**收回来的是 503 的错误正文
-/// 加上压缩着的回答** —— 解压之后的长度不是流量。全都直连：没有出口
+/// 加上压缩着的回答** —— 解压之后的长度不是流量；回答本身解开了交给客户端（见
+/// `tw_gateway::inflate`），数的还是线上的字节。全都直连：没有出口
 #[tokio::test]
 async fn every_hop_counts_and_what_arrived_is_counted_before_decompression() {
     let dead = format!("http://127.0.0.1:{}", spare_port());
@@ -144,7 +145,11 @@ async fn every_hop_counts_and_what_arrived_is_counted_before_decompression() {
 
     let (status, body) = post(gw).await;
     assert_eq!(status, 200);
-    assert_eq!(&body[..], &packed[..], "回答原样交给了客户端");
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        ANSWER,
+        "回答解开了交给客户端"
+    );
 
     let (routed, end) = routed_and_ended(&mut rx).await;
     let Event::RequestRouted {

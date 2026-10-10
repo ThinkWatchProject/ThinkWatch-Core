@@ -1758,8 +1758,9 @@ async fn send(
 }
 
 /// 发出去一次：请求体（`size` 字节）记进这个请求的流量，响应套上一层、读到的每一块都记上
-/// （见 [`crate::traffic`]）。**连不上的退回**：地址不通、代理拒绝、握手失败时上游一个字节都
-/// 没收到。别的错误（超时、发到一半断了）照记：请求体多半已经出去了
+/// （见 [`crate::traffic`]）；压缩着回的在计数之外再套一层解开（见 [`crate::inflate`]），
+/// 后面读它的每一处拿到的都是解开的字节。**连不上的退回**：地址不通、代理拒绝、握手失败时
+/// 上游一个字节都没收到。别的错误（超时、发到一半断了）照记：请求体多半已经出去了
 async fn dispatch(
     traffic: &std::sync::Arc<crate::traffic::Traffic>,
     size: usize,
@@ -1767,7 +1768,9 @@ async fn dispatch(
 ) -> reqwest::Result<reqwest::Response> {
     traffic.sending(size);
     match sending.await {
-        Ok(r) => Ok(crate::traffic::metered(r, traffic)),
+        Ok(r) => Ok(crate::inflate::inflated(crate::traffic::metered(
+            r, traffic,
+        ))),
         Err(e) => {
             if e.is_connect() {
                 traffic.unsent(size);
@@ -1826,7 +1829,13 @@ async fn bedrock_refusal(
              so it is not passed on."
         ),
     };
-    for h in ["content-length", "content-type", "transfer-encoding"] {
+    // 正文换成了我们自己的一句话：说明原来那份正文长什么样的头都不能留
+    for h in [
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "transfer-encoding",
+    ] {
         headers.remove(h);
     }
     // 前缀只在交给客户端的这一份上（和网关自己的错误一样，见 `crate::error`）：记录里的

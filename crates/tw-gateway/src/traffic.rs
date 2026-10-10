@@ -13,8 +13,9 @@
 //! 第一段内容的、把回答交给客户端的，各走各的路，数的是同一个数，不会漏一处、也不会数两遍。
 //!
 //! 解压之前怎么数得到：**网关的 HTTP 客户端不解压**（reqwest 没开 gzip、brotli、zstd、
-//! deflate 这几个特性），读到的就是线上的那些字节，上游压缩过的也还压缩着。哪天开了自动
-//! 解压，这里数到的就成了解压之后的 —— `tests::the_client_does_not_decompress` 守着这一条。
+//! deflate 这几个特性），读到的就是线上的那些字节，上游压缩过的也还压缩着；解压是网关自己
+//! 的一层（[`crate::inflate`]），套在计数的外面。哪天开了 reqwest 的自动解压，这里数到的就成了
+//! 解压之后的 —— `tests::the_client_does_not_decompress` 守着这一条。
 //!
 //! WebSocket 不走 HTTP 客户端：帧的载荷由那条路自己记（见 [`crate::ending::Ending::count`]、
 //! [`crate::ending::Ending::sending`]）。
