@@ -193,6 +193,7 @@ pub fn sub2api(v: &Value) -> Option<Reading> {
                 amount,
                 currency: unit.clone(),
                 period: SpentPeriod::Today,
+                scope: None,
             }),
         ..Default::default()
     };
@@ -286,6 +287,7 @@ pub fn newapi(subscription: &Value, usage: &Value) -> Option<Reading> {
             amount: used,
             currency: USD.to_string(),
             period: SpentPeriod::Total,
+            scope: None,
         });
     } else {
         r.quota = Some(BalanceQuota {
@@ -316,7 +318,7 @@ pub fn is_thinkwatch(v: &Value) -> bool {
 ///
 /// 每一条限额是一个窗口，单位就是 `kind`（`requests`、`tokens`），带着它管的是这把密钥还是
 /// 它所属的用户（`scope`）；认不出的一条不要。这个月花了多少（`usage.cost_usd_month`）是
-/// 花费。**没有钱包，也没有总额度**：企业网关的限额都是按时间窗口的
+/// 花费，顶层的 `scope` 说它是这把密钥的还是用户整体的。**没有钱包，也没有总额度**：企业网关的限额都是按时间窗口的
 pub fn thinkwatch(v: &Value) -> Option<Reading> {
     let limits = v.get("limits")?.as_array()?;
     let windows = limits
@@ -355,6 +357,11 @@ pub fn thinkwatch(v: &Value) -> Option<Reading> {
                 amount,
                 currency: USD.to_string(),
                 period: SpentPeriod::Month,
+                // 顶层的 `scope`：密钥自己设了限额时是这把密钥花的，没设时是用户整体花的
+                scope: v
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .and_then(BalanceScope::from_slug),
             }),
         ..Default::default()
     })
@@ -521,7 +528,8 @@ mod tests {
             Some(Spent {
                 amount: 0.12,
                 currency: "USD".into(),
-                period: SpentPeriod::Today
+                period: SpentPeriod::Today,
+                scope: None,
             })
         );
     }
@@ -632,7 +640,8 @@ mod tests {
             Some(Spent {
                 amount: 5.0,
                 currency: "USD".into(),
-                period: SpentPeriod::Total
+                period: SpentPeriod::Total,
+                scope: None,
             })
         );
         assert_eq!(r.expires_at_ms, None, "0 是不到期");
@@ -656,6 +665,22 @@ mod tests {
             r#"{{"usage":{{"requests_today":3,"tokens_today":9000,"requests_month":80,"tokens_month":400000,"cost_usd_month":12.5}},
                  "limits":[{limits}],"expires_at":"2027-01-01T00:00:00Z"}}"#
         ))
+    }
+
+    /// 顶层的 `scope` 落到花费上：密钥自己设了限额是 key，没设是用户整体；没写是空
+    #[test]
+    fn enterprise_spent_says_whose_money_it_is() {
+        let with = |scope: &str| {
+            json(&format!(
+                r#"{{"scope":{scope},"usage":{{"cost_usd_month":3.5}},"limits":[],"expires_at":null}}"#
+            ))
+        };
+        let spent = |v: &Value| thinkwatch(v).unwrap().spent.unwrap();
+        assert_eq!(spent(&with(r#""key""#)).scope, Some(BalanceScope::Key));
+        assert_eq!(spent(&with(r#""user""#)).scope, Some(BalanceScope::User));
+        assert_eq!(spent(&with("null")).scope, None);
+        assert_eq!(spent(&with(r#""team""#)).scope, None);
+        assert_eq!(spent(&with(r#""user""#)).amount, 3.5);
     }
 
     fn scopes(r: &Reading) -> Vec<(String, Option<BalanceScope>)> {
@@ -692,7 +717,8 @@ mod tests {
             Some(Spent {
                 amount: 12.5,
                 currency: "USD".into(),
-                period: SpentPeriod::Month
+                period: SpentPeriod::Month,
+                scope: None,
             })
         );
         assert_eq!(r.expires_at_ms, Some(ms("2027-01-01T00:00:00Z")));
