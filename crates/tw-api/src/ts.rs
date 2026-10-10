@@ -296,6 +296,37 @@ mod tests {
         assert!(event.contains("answered_model?: string"), "{event}");
     }
 
+    /// 一轮的上下文：两个路径参数都在，`parts` 可以是 null，四块和合计都是数
+    #[test]
+    fn a_turn_context_has_its_parts_or_null() {
+        let ts = typescript();
+        assert!(ts.contains("  SessionTurnContext: { req: null; res: TurnContext };"));
+        assert!(ts.contains(
+            "  SessionTurnContext: { method: \"GET\", path: \"/sessions/{id}/turns/{turn}/context\", params: [\"id\", \"turn\"], format: \"json\" },"
+        ));
+        let context = decl_of(&ts, "TurnContext");
+        for field in [
+            "kept: boolean",
+            "window: number | null",
+            "input_tokens: number | null",
+            "cache_read_tokens: number | null",
+            "parts: ContextParts | null",
+        ] {
+            assert!(context.contains(field), "{field} in {context}");
+        }
+        let parts = decl_of(&ts, "ContextParts");
+        for field in [
+            "system: number",
+            "tools: number",
+            "history: number",
+            "last_user: number",
+            "total: number",
+        ] {
+            assert!(parts.contains(field), "{field} in {parts}");
+        }
+        assert!(decl_of(&ts, "TurnView").contains("context_window: number | null"));
+    }
+
     /// 对话记录：请求号是字符串；可以为空的是 null（必有的字段，不是省掉）；块是按 `kind`
     /// 分的联合，角色和缺口是字面量
     #[test]

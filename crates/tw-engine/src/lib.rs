@@ -12,5 +12,5 @@ pub use engine::{
     RuleNotes, SetAction, Target, balance_factors, has_catch_all, is_builtin_group, notes,
     order_by, scalar_name,
 };
-pub use facts::{RequestFacts, estimate_strings, estimate_tokens};
+pub use facts::{RequestFacts, TokenParts, estimate_parts, estimate_strings, estimate_tokens};
 pub use weighted::Member;

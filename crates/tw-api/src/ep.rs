@@ -76,6 +76,9 @@ endpoints! {
     /// 一次会话读成一段对话：每一轮新说的话、回答、工具调用和结果（已脱敏）。可以只要
     /// 从某一轮起的那些
     SessionTranscript: GET "/sessions/{id}/transcript" [id], api::TranscriptQuery => api::Transcript;
+    /// 一次会话里的一轮，上下文由什么占着：系统提示、工具、历史、最后一条用户消息各估多少
+    /// token，连同实测的输入和缓存读。会话不存在、那一轮不在这次会话里都是 404
+    SessionTurnContext: GET "/sessions/{id}/turns/{turn}/context" [id, turn], () => api::TurnContext;
     /// 中止一次会话里所有在跑的请求。一个都没有是 404
     AbortSession: POST "/sessions/{id}/abort" [id], () => api::Aborted;
 

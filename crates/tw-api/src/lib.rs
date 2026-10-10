@@ -868,7 +868,16 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// 客户端收到的话、删掉了几段，[`OutcomeDetail`]）。[`RequestDetail`] 的 `security` 是同一个
 /// 类型。事件跟着改：[`SecretItem`]、[`Event::ContentMatched`]、[`Event::ToolCallFlagged`]
 /// 多了 `detail`（[`SecurityHitDetail`]）。细节存在请求记录的库里，和请求一起过期。
-pub const CONTROL_API_VERSION: u32 = 44;
+///
+/// **45 起会话里的每一轮说得出上下文窗口有多大、被什么占着**：[`TurnView`] 多了
+/// `context_window`（答这一轮的那家那个模型的上下文窗口，按**此刻**知道的规格：手写的
+/// 优先，其次价目表；不知道是 null）。新端点 `GET /sessions/{id}/turns/{turn}/context`
+/// （→ [`TurnContext`]）：这一轮存下来的请求体按系统提示、工具定义、历史、最后一条用户消息
+/// 四块各估多少 token（和数 token 由网关自己答的是同一个估算），连同实测的输入和缓存读。
+/// 请求体没存下来、已经清掉、只存了开头或读不懂的，`kept` 是 false、`parts` 是 null。
+/// 会话不存在是 404（`control.session_not_found`），那一轮不在这次会话里也是 404
+/// （`control.request_not_found`）。照 44 写的界面读不到 `context_window`。
+pub const CONTROL_API_VERSION: u32 = 45;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -5019,6 +5028,10 @@ pub struct TurnView {
     /// 服务它的那家怎么收钱，和 `HistoryRow::billing` 同一套词：`per-token` /
     /// `free`
     pub billing: Billing,
+    /// 答这一轮的那家那个模型的上下文窗口（token），按**此刻**知道的规格：这一家手写的
+    /// `model_specs` 优先，其次价目表。不知道是 None。**不是那一轮当时的数** —— 规格改了
+    /// 这里跟着变
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5026,6 +5039,44 @@ pub struct TurnView {
 pub struct SessionDetail {
     pub session: SessionView,
     pub turns: Vec<TurnView>,
+}
+
+/// 一轮的上下文由什么占着（`GET /sessions/{id}/turns/{turn}/context`）。
+///
+/// `parts` 是**本地的估算**，在存下来的请求体上算，和数 token 由网关自己答的那个数是
+/// 同一个算法（`tw_engine::estimate_tokens`）；`input_tokens`、`cache_read_tokens` 是上游
+/// 实测报的。两个数差一两成是正常的，界面别把估算画成实测。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TurnContext {
+    /// 请求体还在不在。没存下来、已经清掉（`retention.body_days`）、只存了开头、读不懂
+    /// 的都是 false，那时 `parts` 是 null
+    pub kept: bool,
+    /// 和 [`TurnView::context_window`] 同一个数
+    pub window: Option<u64>,
+    /// 这一轮实测的输入 token（上游按它收费），记录里的那个
+    pub input_tokens: Option<i64>,
+    /// 这一轮实测的缓存读 token，记录里的那个
+    pub cache_read_tokens: Option<i64>,
+    /// 四块各估多少。请求体不在了是 null
+    pub parts: Option<ContextParts>,
+}
+
+/// 请求体的四块各估多少 token。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ContextParts {
+    /// 系统提示：Anthropic 的 `system`、Chat 和 Responses 的 system、developer 消息、
+    /// Responses 的 `instructions`、Gemini 的 `systemInstruction`
+    pub system: u64,
+    /// 工具定义
+    pub tools: u64,
+    /// 最后一条用户消息之前的每一条消息
+    pub history: u64,
+    /// 最后一条用户消息，连同它带着的工具结果
+    pub last_user: u64,
+    /// 四块之和
+    pub total: u64,
 }
 
 /// 一次会话读成一段对话（`GET /sessions/{id}/transcript`）：每一轮新说的话、回答、推理、

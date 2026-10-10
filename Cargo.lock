@@ -3235,6 +3235,7 @@ dependencies = [
  "tw-api",
  "tw-bedrock",
  "tw-config",
+ "tw-dialect",
  "tw-engine",
  "tw-gateway",
  "tw-guard",

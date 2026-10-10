@@ -665,6 +665,8 @@ pub struct TurnRow {
     pub id: i64,
     pub at_ms: i64,
     pub model: String,
+    /// 发给上游的模型名（见 [`RequestRow::sent_model`]）。规格按它查：上游收到的是它
+    pub sent_model: String,
     pub provider: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -784,7 +786,7 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT id, at_ms, model, provider, input_tokens, output_tokens,
                     cache_read_tokens, cost_micros, duration_ms, error, cancelled,
-                    cost_estimated, billing, error_code, error_args, status
+                    cost_estimated, billing, error_code, error_args, status, sent_model
              FROM requests WHERE session = ?1 AND local = 0 ORDER BY at_ms, id",
         )?;
         let rows = st.query_map([session], |r| {
@@ -792,6 +794,7 @@ impl Db {
                 id: r.get(0)?,
                 at_ms: r.get(1)?,
                 model: r.get(2)?,
+                sent_model: r.get(16)?,
                 provider: r.get(3)?,
                 input_tokens: r.get(4)?,
                 output_tokens: r.get(5)?,

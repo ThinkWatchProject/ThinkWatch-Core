@@ -140,6 +140,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::Sessions, sessions)
         .at(ep::SessionDetail, session_detail)
         .at(ep::SessionTranscript, session_transcript)
+        .at(ep::SessionTurnContext, session_turn_context)
         .at(ep::AbortSession, abort_session)
         .at(ep::DryRun, dryrun::dry_run)
         // 为客户端发专用密钥。接管本身在桌面端做
@@ -1735,8 +1736,24 @@ fn session_view(s: &tw_store::db::SessionRow) -> tw_api::SessionView {
     }
 }
 
-fn turn_view(t: &tw_store::db::TurnRow) -> tw_api::TurnView {
+/// 答这一轮的那家那个模型，**此刻**的上下文窗口：和 `/v1/models`、上游页、别名同一个查法
+/// （`tw_config::model_specs`），按发给上游的名字查 —— 上游收到的是它
+fn context_window(
+    cfg: &tw_config::Config,
+    book: &tw_pricing::PriceBook,
+    provider: &str,
+    sent_model: &str,
+) -> Option<u64> {
+    cfg.model_spec(book, provider, sent_model).context_window()
+}
+
+fn turn_view(
+    cfg: &tw_config::Config,
+    book: &tw_pricing::PriceBook,
+    t: &tw_store::db::TurnRow,
+) -> tw_api::TurnView {
     tw_api::TurnView {
+        context_window: context_window(cfg, book, &t.provider, &t.sent_model),
         id: t.id,
         at_ms: t.at_ms as u64,
         model: t.model.clone(),
@@ -1794,10 +1811,89 @@ async fn session_detail(
         .map_err(records)?
     };
     let session = session.ok_or_else(|| no_such_session(&id))?;
+    let (cfg, book) = (s.config(), s.gateway.pricing.load());
     Ok(Json(tw_api::SessionDetail {
         session: session_view(&session),
-        turns: turns.iter().map(turn_view).collect(),
+        turns: turns.iter().map(|t| turn_view(&cfg, &book, t)).collect(),
     }))
+}
+
+/// 一轮的上下文由什么占着（见 [`tw_api::TurnContext`]）。
+///
+/// 请求体按客户端的格式解码成中间表示，再按块估 token（`tw_engine::estimate_parts`）：
+/// 四种格式的系统提示、工具、消息都读到同一个地方，和数 token 由网关自己答的是同一个
+/// 估算。**正文读和解析在阻塞线程上**，锁只在取行的时候拿：一份请求体可以有几 MB。
+async fn session_turn_context(
+    State(s): State<ControlState>,
+    axum::extract::Path((id, turn)): axum::extract::Path<(String, i64)>,
+) -> Result<Json<tw_api::TurnContext>, Fail> {
+    let store = need_store(&s)?;
+    let (row, blobs) = {
+        let id = id.clone();
+        on_store(store, move |g| {
+            let row = g
+                .db()
+                .get(turn)?
+                .filter(|r| !r.local && r.session.as_deref() == Some(id.as_str()));
+            let Some(row) = row else {
+                // 会话不存在和那一轮不在这次会话里是两个 404
+                return Ok(Err(match g.db().session(&id)? {
+                    Some(_) => fail(
+                        StatusCode::NOT_FOUND,
+                        msg!("control.request_not_found", id = turn => "There is no request {id}."),
+                    ),
+                    None => no_such_session(&id),
+                }));
+            };
+            // 正文目录只是一个路径，读它不需要锁
+            let blobs = tw_store::Blobs::new(g.blobs().root().to_path_buf());
+            Ok::<_, tw_store::DbError>(Ok((row, blobs)))
+        })
+        .await?
+        .map_err(records)??
+    };
+    let window = {
+        let (cfg, book) = (s.config(), s.gateway.pricing.load());
+        context_window(&cfg, &book, &row.provider, &row.sent_model)
+    };
+    let (input_tokens, cache_read_tokens) = (row.input_tokens, row.cache_read_tokens);
+    let parts = tokio::task::spawn_blocking(move || stored_parts(&row, &blobs))
+        .await
+        .map_err(internal)?;
+    Ok(Json(tw_api::TurnContext {
+        kept: parts.is_some(),
+        window,
+        input_tokens,
+        cache_read_tokens,
+        parts,
+    }))
+}
+
+/// 存下来的请求体按块估。没存、清掉了、只存了开头、解析不了、解码不了的都是 None。
+fn stored_parts(
+    row: &tw_store::db::RequestRow,
+    blobs: &tw_store::Blobs,
+) -> Option<tw_api::ContextParts> {
+    let raw = blobs.get(row.at_ms, row.id, tw_store::Which::Request)?;
+    if blobs
+        .original_len(row.at_ms, row.id, tw_store::Which::Request)
+        .is_some_and(|n| n > raw.len())
+    {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let client = tw_store::search::text::client_dialect(&row.path)?;
+    let r = tw_dialect::convert::decode(client, &v, &row.path, None)
+        .ok()?
+        .request;
+    let p = tw_engine::estimate_parts(&r);
+    Some(tw_api::ContextParts {
+        system: p.system,
+        tools: p.tools,
+        history: p.history,
+        last_user: p.last_user,
+        total: p.total(),
+    })
 }
 
 /// 中止一个在跑的请求（见 `tw_gateway::abort`）。**叫停是立刻的**：和上游的连接在请求自己
