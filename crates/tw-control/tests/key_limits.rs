@@ -143,14 +143,17 @@ fn request(id: u64, key: &str, at: i64, input: u64) -> Vec<Event> {
                 usage: None,
                 queued_ms: None,
                 skipped: None,
+                proxy: None,
             }],
             billing: tw_api::Billing::PerToken,
+            egress: None,
         },
         Event::RequestFinished {
             id,
             model: String::new(),
             status: 200,
-            bytes: 1,
+            sent_bytes: 0,
+            received_bytes: 1,
             duration_ms: 1,
             usage: Some(tw_api::UsageView {
                 input,
@@ -420,7 +423,8 @@ fn refused(
             args: Default::default(),
             text: "refused".into(),
         },
-        bytes: None,
+        sent_bytes: None,
+        received_bytes: None,
         duration_ms: Some(1),
         usage: None,
         answered_model: None,
@@ -443,6 +447,7 @@ fn hop(outcome: tw_api::AttemptOutcome, code: &str, busy: bool) -> tw_api::Attem
         usage: None,
         queued_ms: None,
         skipped: busy.then_some(tw_api::ServeSkip::Busy),
+        proxy: None,
     }
 }
 

@@ -91,6 +91,8 @@ struct Backend {
     calls: AtomicUsize,
     /// 每次收到的 (路径和查询串, 请求头, 请求体)
     seen: Mutex<Vec<(String, HeaderMap, Value)>>,
+    /// 每次收到的请求体在线上有多少字节（解压之前）
+    wire: Mutex<Vec<usize>>,
     /// 用这个 access token 的请求回 401
     reject: Option<String>,
     /// 不论什么 token 都回 401
@@ -146,6 +148,7 @@ async fn start_backend(b: Arc<Backend>) -> String {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        b.wire.lock().unwrap().push(body.len());
         // 网关发来的请求体是 zstd 压缩的，和 Codex 直连时一样
         let zstd = headers.get("content-encoding").is_some_and(|v| v == "zstd");
         let body = if zstd {
@@ -573,7 +576,7 @@ async fn a_401_gets_one_fresh_token_and_one_retry() {
     let base = start_backend(backend.clone()).await;
     let mut p = chatgpt_provider(&base, &token_url);
     p.oauth.as_mut().unwrap().access = Some("at-0".into());
-    let (gw, _, _rx) = start_gateway(p).await;
+    let (gw, _, mut rx) = start_gateway(p).await;
 
     let (status, _, body) = post_json(
         gw,
@@ -590,6 +593,28 @@ async fn a_401_gets_one_fresh_token_and_one_retry() {
         seen[1].1.get("authorization").unwrap(),
         "Bearer at-1",
         "重发用的是换回来的新 token"
+    );
+
+    // 流量：**两次都发出去了**，按线上的样子数 —— 压缩之后的请求体，不是 JSON 原文。被 401
+    // 拒的那一次正文没读，没收到；收到的是重发那一次的整条流
+    let wire = backend.wire.lock().unwrap().clone();
+    let plain = serde_json::to_vec(&seen[1].2).unwrap().len();
+    assert_ne!(wire[1], plain, "发出去的该是压缩过的那一份");
+    let finished = drain(&mut rx)
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            tw_api::Event::RequestFinished {
+                sent_bytes,
+                received_bytes,
+                ..
+            } => Some((sent_bytes, received_bytes)),
+            _ => None,
+        })
+        .expect("没有结束事件");
+    assert_eq!(
+        finished,
+        ((wire[0] + wire[1]) as u64, stream_body().len() as u64)
     );
 }
 

@@ -204,6 +204,7 @@ async fn passthrough(
         started,
         from,
         abort: abort.clone(),
+        traffic: crate::traffic::Traffic::new(),
     };
     // 被手动中止时，**管线先自己收场**（`biased`）：在等上游的那几处它看着开关，丢掉那一跳、
     // 报完尝试链再返回。停在别处（等密钥的上限、取凭据）的，由这里整个丢掉，结局照样按
@@ -344,6 +345,8 @@ pub(crate) fn routed_nowhere(id: u64, choice: Choice) -> tw_api::Event {
         attempts: Vec::new(),
         // 一家都没接下：没有哪一家的计费方式可以跟着走
         billing: tw_api::Billing::PerToken,
+        // 一跳都没发出去：没有出口可说
+        egress: None,
     }
 }
 
@@ -366,6 +369,7 @@ pub(crate) fn hop(
         usage: None,
         queued_ms: None,
         skipped: None,
+        proxy: None,
     }
 }
 
@@ -392,6 +396,7 @@ pub(crate) fn hop_busy(
         usage: None,
         queued_ms,
         skipped: Some(tw_api::ServeSkip::Busy),
+        proxy: None,
     }
 }
 
@@ -412,6 +417,7 @@ pub(crate) fn hop_failed(
         usage: None,
         queued_ms: None,
         skipped: None,
+        proxy: None,
     }
 }
 

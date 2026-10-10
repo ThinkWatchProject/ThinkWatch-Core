@@ -836,7 +836,21 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// [`ABORTED`]，上游不停用。已经结束了的回 404（`control.request_not_running`、
 /// `control.session_not_running`）。流中途停了的另有 `gw.upstream.idle_timeout_mid_stream`。
 /// 照 42 写的界面读不到 `idle_timeout_secs`，不认 `aborted` 这个来源。
-pub const CONTROL_API_VERSION: u32 = 43;
+///
+/// **44 起每个请求记着网关和上游之间走了多少流量、从哪个出口出去的**：[`HistoryRow`] 的
+/// `bytes`（以前数的是解码之后的回答）删了，换成 `sent_bytes`（发给上游的请求体，每一跳
+/// 加起来，按线上的样子：Codex 后端的 zstd 压缩之后）、`received_bytes`（从上游收到的
+/// 响应体，每一跳加起来，没解压之前），和 `egress`（接下它的那一跳走的代理，直连是空）。
+/// 本地应答的两个数都是空。事件跟着改：[`Event::RequestFinished`] 的 `bytes` 换成
+/// `sent_bytes`、`received_bytes`，[`Event::RequestFailed`]、[`Event::RequestCancelled`] 换成
+/// 两个可空的（一跳都没发出去的是空）；[`Event::RequestRouted`] 多了 `egress`，
+/// [`InFlightRequest`] 也是，尝试链的每一跳（[`AttemptView`]）多了 `proxy`。[`ReplayOriginal`]
+/// 的 `bytes` 改叫 `received_bytes`。[`Summary`]、[`CostBucketGroup`] 多了两个流量的合计，
+/// [`CostBucket`] 还多了四类 token 和首 token 的分位数（`ttft_p50_ms`、`ttft_p95_ms`、
+/// `ttft_samples`）；[`CostDim`] 多了 `egress`（直连那一组的名字是空串）。新端点
+/// `GET /latency/client`：按密钥分的首 token 分位数。请求记录的库换了版本，升级时清空。
+/// 照 43 写的界面读不到 `bytes`，按出口分组会被拒。
+pub const CONTROL_API_VERSION: u32 = 44;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1018,7 +1032,17 @@ pub enum Event {
         /// 升级时还不知道，是空串。
         model: String,
         status: u16,
-        bytes: u64,
+        /// 发给上游的请求体有多少字节：**每一跳加起来**（故障转移之前失败了的那几跳也算），
+        /// 按线上的样子数 —— 网关自己压缩过的（Codex 后端的 zstd）是压缩之后的。请求头不算。
+        ///
+        /// **只数网关和上游之间的**：走代理、被计量的是这一段，客户端和网关之间在本机。
+        /// 连不上的那一跳没发出去，不算。整条连接一行的 WebSocket 和 Responses 连接上的一轮
+        /// 数的是发给上游的帧（文本和二进制，不算控制帧）的载荷。网关自己估了数、一跳都没
+        /// 发的（数 token）是 0
+        sent_bytes: u64,
+        /// 从上游收到的响应体有多少字节：每一跳加起来（失败了的那几跳读过的错误正文也算），
+        /// **按线上的样子、解压之前**。WebSocket 数的是上游发来的帧的载荷
+        received_bytes: u64,
         duration_ms: u64,
         /// 上游报的用量。**没报就是 None，不是零** —— 零会让一次真实的
         /// 调用看起来是免费的
@@ -1054,9 +1078,14 @@ pub enum Event {
         model: String,
         source: FailureSource,
         message: Msg,
-        /// 失败之前从上游收到了多少字节。**响应头都没到的没有**
+        /// 失败之前发给上游的请求体，口径同 `RequestFinished::sent_bytes`。**一跳都没发出去
+        /// 的没有**（被规则、内容过滤、用量上限拒了，上游都满着，都连不上）
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        bytes: Option<u64>,
+        sent_bytes: Option<u64>,
+        /// 失败之前从上游收到的响应体，口径同 `RequestFinished::received_bytes`。一跳都没发
+        /// 出去的没有；发出去了、什么都没收到的是 0
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_bytes: Option<u64>,
         /// 从请求进来到失败用了多久。「试过三家、二十秒后放弃」和「立刻被拒」
         /// 是两件事
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1092,8 +1121,14 @@ pub enum Event {
         /// 上游的响应头还没到就走了的，**没有状态码** —— 不是 0
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
-        /// 断开之前从上游收到了多少字节
-        bytes: u64,
+        /// 断开之前发给上游的请求体，口径同 `RequestFinished::sent_bytes`。还没发出去就走了
+        /// 的没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_bytes: Option<u64>,
+        /// 断开之前从上游收到的响应体，口径同 `RequestFinished::received_bytes`。还没发出去
+        /// 就走了的没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_bytes: Option<u64>,
         duration_ms: u64,
         /// **没嗅到就是 None，不是零** —— 客户端可能在第一帧之前就走了
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1149,6 +1184,15 @@ pub enum Event {
         ///
         /// 一家都没接下时是 `per-token`：没有哪一家的计费方式可以跟着走。
         billing: Billing,
+        /// 这个请求从哪个出口出去的：接下它的那一跳走的代理名（配置里的名字，跟随系统的是
+        /// `system`），直连是 None。一家都没接下的，是最后一个发到了上游的那一跳走的
+        /// （见 [`AttemptView::sent`]）；一跳都没发出去的是 None。WebSocket 只连直连的上游，
+        /// 一律是 None。
+        ///
+        /// **流量按它归到出口**（`CostDim::Egress`）：每一跳各自走的在尝试链上
+        /// （[`AttemptView::proxy`]）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress: Option<String>,
     },
     /// 调用方发来的正文里（连同工具结果）命中了内容规则。**一条规则一条事件**，在请求
     /// 开始之后报（结论在开始之前就定了：删过的请求，开始事件和存下来的就是删过的那一份）。
@@ -1590,6 +1634,11 @@ pub struct AttemptView {
     /// 多久）。这时 `outcome` 是 `error`，`error` 是同一件事的那句话。发出去了的没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<ServeSkip>,
+    /// 这一跳走的代理：这家上游配置的代理名（跟随系统的是 `system`），直连是 None。没发出去
+    /// 的一跳（满着、被拒、转换不了……）是它要走的那个 —— 连不上的那一跳，问题可能就出在
+    /// 这个代理上。WebSocket 只连直连的上游，一律是 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 /// 发出去之后才失败的一跳报的码（见 [`AttemptView::sent`]）：上游没在时限内回话、请求在路上
@@ -1875,6 +1924,10 @@ pub struct InFlightRequest {
     /// `ContentMatched`、`ToolCallFlagged`）。
     /// 说的是上游现状的（`QuotaSeen`）不在里面：那是 `/quota` 的事
     pub events: Vec<Event>,
+    /// 从哪个出口出去的，同 `RequestRouted::egress`。**路由报出结论之前没有**（还在等上游，
+    /// 或者正在故障转移），直连的也没有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<String>,
 }
 
 /// 手动中止（`POST /request/{id}/abort`、`POST /sessions/{id}/abort`）叫停了哪几个请求。
@@ -3851,6 +3904,23 @@ pub struct CostBucket {
     pub unpriced_requests: i64,
     /// 没有拿到用量的条数，见 `Summary::no_usage_requests`
     pub no_usage_requests: i64,
+    /// 这一格里发给上游、从上游收到的字节合计，口径同 [`HistoryRow::sent_bytes`]、
+    /// [`HistoryRow::received_bytes`]
+    pub sent_bytes: i64,
+    pub received_bytes: i64,
+    /// 这一格里用掉的 token，四类分开给（理由见 [`CostBucketGroup::input_tokens`]）
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 这一格里第一个 token 到的时刻的分位数，毫秒。**样本和 `GET /latency` 同一个口径**：
+    /// 有第一个 token 的请求（流式的），本地应答的不算。没有样本的格子是 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_p50_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_p95_ms: Option<i64>,
+    /// 上面两个数有几个样本
+    pub ttft_samples: i64,
 }
 
 /// 一个时间桶里，某一个模型（或上游）的那部分。
@@ -3863,7 +3933,7 @@ pub struct CostBucket {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CostBucketGroup {
     pub at_ms: i64,
-    /// 模型名、上游名或密钥名，看查的是哪一维
+    /// 模型名、上游名、密钥名或出口（代理名，直连是空串），看查的是哪一维
     pub name: String,
     pub requests: i64,
     pub failed: i64,
@@ -3885,6 +3955,10 @@ pub struct CostBucketGroup {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// 这一格里这一项发给上游、从上游收到的字节合计，口径同 [`HistoryRow::sent_bytes`]、
+    /// [`HistoryRow::received_bytes`]
+    pub sent_bytes: i64,
+    pub received_bytes: i64,
 }
 
 /// 按模型或上游分组的花费（钱花在哪儿）。
@@ -3979,6 +4053,9 @@ pub enum CostDim {
     /// 按网关密钥。**密钥是不可伪造的那个身份** —— `client_hint` 来自请求头，
     /// 谁都能写；而这一列是网关自己按密钥反查出来的
     Client,
+    /// 按出口：请求从哪个代理出去的（[`HistoryRow::egress`]）。**直连的那一组名字是空串**，
+    /// 不丢掉 —— 流量多半走的是直连，少了它各组加起来对不上总数
+    Egress,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3994,6 +4071,10 @@ pub struct Summary {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// 发给上游、从上游收到的字节合计，口径同 [`HistoryRow::sent_bytes`]、
+    /// [`HistoryRow::received_bytes`]。本地应答的不算（它们没有流量）
+    pub sent_bytes: i64,
+    pub received_bytes: i64,
     /// 单位是微分（百万分之一美元）
     pub cost_micros_exact: i64,
     pub cost_micros_estimated: i64,
@@ -4023,10 +4104,11 @@ pub struct Summary {
     pub pricing_date: String,
 }
 
-/// 第一个 token 到的时刻的分位数（`GET /latency`、`/latency/provider`），毫秒。
+/// 第一个 token 到的时刻的分位数（`GET /latency`、`/latency/provider`、`/latency/client`），
+/// 毫秒。
 ///
 /// **只有流式请求有样本**：非流式的没有第一个 token（见 [`Event::RequestFirstToken`]）。
-/// `model` 在按上游分的那个端点里是上游名。
+/// `model` 在按上游分的那个端点里是上游名，按密钥分的那个里是密钥名。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct LatencyView {
@@ -4236,7 +4318,15 @@ pub struct HistoryRow {
     /// 生成速度，token/秒。只有跑完的流式请求有，见
     /// `RequestFinished::tokens_per_sec`
     pub tokens_per_sec: Option<u32>,
-    pub bytes: Option<i64>,
+    /// 发给上游的请求体有多少字节：每一跳加起来，按线上的样子（压缩之后），见
+    /// `RequestFinished::sent_bytes`。本地应答的、一跳都没发出去的没有
+    pub sent_bytes: Option<i64>,
+    /// 从上游收到的响应体有多少字节：每一跳加起来，解压之前，见
+    /// `RequestFinished::received_bytes`。本地应答的、一跳都没发出去的没有
+    pub received_bytes: Option<i64>,
+    /// 从哪个出口出去的：代理名（跟随系统的是 `system`），直连是 None，见
+    /// `RequestRouted::egress`
+    pub egress: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
@@ -4955,7 +5045,8 @@ pub struct ReplayOriginal {
     pub status: Option<u16>,
     pub ttfb_ms: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub bytes: Option<i64>,
+    /// 从上游收到的响应体有多少字节，同 [`HistoryRow::received_bytes`]（每一跳加起来）
+    pub received_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4965,6 +5056,7 @@ pub struct ReplayResult {
     pub status: u16,
     pub ttfb_ms: i64,
     pub duration_ms: i64,
+    /// 从上游收到的响应体有多少字节，解压之前（重放只有一跳）
     pub bytes: i64,
     /// 响应正文，**已还原占位符、已脱敏、已截断**
     pub body: String,
@@ -5868,6 +5960,7 @@ mod tests {
             usage: None,
             queued_ms: None,
             skipped: None,
+            proxy: None,
         }
     }
 
@@ -6102,7 +6195,8 @@ mod tests {
             id: 1,
             model: "claude-sonnet-5".into(),
             status: 200,
-            bytes: 10,
+            sent_bytes: 0,
+            received_bytes: 10,
             duration_ms: 5,
             usage: None,
             tokens_per_sec: None,
@@ -6236,7 +6330,8 @@ mod tests {
                 id: 7,
                 model: String::new(),
                 status: 200,
-                bytes: 1,
+                sent_bytes: 0,
+                received_bytes: 1,
                 duration_ms: 1,
                 usage: None,
                 tokens_per_sec: None,
@@ -6247,7 +6342,8 @@ mod tests {
                 model: String::new(),
                 source: FailureSource::Upstream,
                 message: tw_types::msg!("t.x" => "x"),
-                bytes: None,
+                sent_bytes: None,
+                received_bytes: None,
                 duration_ms: None,
                 usage: None,
                 answered_model: None,
@@ -6256,7 +6352,8 @@ mod tests {
                 id: 7,
                 model: String::new(),
                 status: Some(200),
-                bytes: 1,
+                sent_bytes: Some(0),
+                received_bytes: Some(1),
                 duration_ms: 1,
                 usage: None,
                 answered_model: None,
@@ -6312,6 +6409,7 @@ mod tests {
                     status: 200,
                     ttfb_ms: 40,
                 }],
+                egress: None,
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
@@ -6330,7 +6428,8 @@ mod tests {
             id: 3,
             model: String::new(),
             status: Some(200),
-            bytes: 512,
+            sent_bytes: Some(0),
+            received_bytes: Some(512),
             duration_ms: 2400,
             usage: Some(UsageView {
                 input: 5000,
@@ -6353,7 +6452,8 @@ mod tests {
             id: 4,
             model: String::new(),
             status: None,
-            bytes: 0,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: 10,
             usage: None,
             answered_model: None,
@@ -6361,6 +6461,9 @@ mod tests {
         let v = serde_json::to_value(&none).unwrap();
         assert!(v.get("usage").is_none(), "{v}");
         assert!(v.get("status").is_none(), "{v}");
+        // 还没发出去就走了的：没有流量可说，两个数都不出现，不是 0
+        assert!(v.get("sent_bytes").is_none(), "{v}");
+        assert!(v.get("received_bytes").is_none(), "{v}");
     }
 
     /// 回答里写的模型名跟着结局走，本地估的输入跟着开始走；**没有的不出现**，不是空串、不是 0
@@ -6370,7 +6473,8 @@ mod tests {
             id: 1,
             model: "claude-sonnet-4-5".into(),
             status: 200,
-            bytes: 10,
+            sent_bytes: 0,
+            received_bytes: 10,
             duration_ms: 5,
             usage: None,
             tokens_per_sec: None,
@@ -6389,7 +6493,8 @@ mod tests {
             model: String::new(),
             source: FailureSource::Upstream,
             message: tw_types::msg!("t.x" => "x"),
-            bytes: None,
+            sent_bytes: None,
+            received_bytes: None,
             duration_ms: None,
             usage: None,
             answered_model: None,

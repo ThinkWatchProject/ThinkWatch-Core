@@ -957,6 +957,18 @@ pub(super) async fn try_upstreams<'a>(
             ),
         );
     }
+    // 每一跳走的代理，和这个请求从哪个出口出去的（见 `AttemptView::proxy`、
+    // `RequestRouted::egress`）。**按这个请求的运行时查**：配置半路换过，这个请求走的还是它
+    // 开始时的那一份 Client
+    for a in &mut chain {
+        a.proxy = rt
+            .config
+            .providers
+            .iter()
+            .find(|p| p.name == a.provider)
+            .and_then(crate::outbound::egress);
+    }
+    let egress = egress_of(&chain);
     let choice = &started.choice;
     state.bus.emit(tw_api::Event::RequestRouted {
         id,
@@ -968,6 +980,7 @@ pub(super) async fn try_upstreams<'a>(
         affinity: choice.affinity.clone(),
         attempts: chain,
         billing: billing.into(),
+        egress,
     });
     if let Some(err) = halt {
         return Err(err);
@@ -1030,6 +1043,17 @@ pub(super) async fn try_upstreams<'a>(
     Ok(Answer::Served(Box::new(served)))
 }
 
+/// 这个请求从哪个出口出去的：接下它的那一跳走的代理。一家都没接下的，是最后一个发到了上游的
+/// 那一跳走的 —— 它的流量也是从那儿出去的；一跳都没发出去的没有
+fn egress_of(chain: &[tw_api::AttemptView]) -> Option<String> {
+    chain
+        .iter()
+        .rev()
+        .find(|a| a.outcome == tw_api::AttemptOutcome::Served)
+        .or_else(|| chain.iter().rev().find(|a| a.sent()))
+        .and_then(|a| a.proxy.clone())
+}
+
 /// 等过空位的那一跳：在尝试链上补上它等了多久。`at` 是它那一行的位置 —— 等到之后，
 /// 这一跳不管怎么收场都只进一行
 fn stamp_queued(chain: &mut [tw_api::AttemptView], queued: Option<(usize, u64)>) {
@@ -1075,6 +1099,7 @@ fn estimated_hop(
         usage: None,
         queued_ms: None,
         skipped: None,
+        proxy: None,
     }
 }
 
@@ -1647,15 +1672,24 @@ async fn send(
     let signer = aws
         .filter(|_| !tw_bedrock::carries_api_key(upstream_headers.iter().map(|(k, _)| k.as_str())))
         .map(|c| (c, provider.bedrock_region().unwrap_or_default()));
+    // 发出去的请求体按线上的样子记：压缩过的是压缩之后的（见 `crate::traffic`）
+    let (traffic, size) = (&req.traffic, body.len());
     if let Some((credentials, region)) = signer {
         let mut request = build(&upstream_headers)
             .body(body.clone())
             .build()
             .map_err(SendError::Http)?;
         crate::bedrock::sign_request(&mut request, credentials, region).map_err(SendError::Sign)?;
-        return http.execute(request).await.map_err(SendError::Http);
+        return dispatch(traffic, size, http.execute(request))
+            .await
+            .map_err(SendError::Http);
     }
-    let mut sent = build(&upstream_headers).body(body.clone()).send().await;
+    let mut sent = dispatch(
+        traffic,
+        size,
+        build(&upstream_headers).body(body.clone()).send(),
+    )
+    .await;
     // **OAuth 上游回 401：换一个 access token 再发一次，只一次。**token 可能在别处被
     // 吊销了、提前失效了；不重试的话，这个请求连同之后每一个请求都会原样失败，直到
     // 缓存里那个 token 按时间过期。换回来的还是 401，说明问题不在 token
@@ -1663,7 +1697,7 @@ async fn send(
         match state.headers_after_401(provider, http, sent_at).await {
             // 换回来的还是同一个（刚换过不久）：再发一次也是 401
             Ok(fresh) if fresh != upstream_headers => {
-                sent = build(&fresh).body(body).send().await;
+                sent = dispatch(traffic, size, build(&fresh).body(body).send()).await;
             }
             Ok(_) => {}
             Err(e) => {
@@ -1672,6 +1706,26 @@ async fn send(
         }
     }
     sent.map_err(SendError::Http)
+}
+
+/// 发出去一次：请求体（`size` 字节）记进这个请求的流量，响应套上一层、读到的每一块都记上
+/// （见 [`crate::traffic`]）。**连不上的退回**：地址不通、代理拒绝、握手失败时上游一个字节都
+/// 没收到。别的错误（超时、发到一半断了）照记：请求体多半已经出去了
+async fn dispatch(
+    traffic: &std::sync::Arc<crate::traffic::Traffic>,
+    size: usize,
+    sending: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+) -> reqwest::Result<reqwest::Response> {
+    traffic.sending(size);
+    match sending.await {
+        Ok(r) => Ok(crate::traffic::metered(r, traffic)),
+        Err(e) => {
+            if e.is_connect() {
+                traffic.unsent(size);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Bedrock 拒绝了凭证（401/403）：状态码和响应头照原样，正文换成我们自己的一句话。

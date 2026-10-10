@@ -118,6 +118,7 @@ pub fn router(state: ControlState) -> Router {
         .at(ep::HistorySearch, history_search)
         .at(ep::Latency, latency)
         .at(ep::LatencyByProvider, latency_by_provider)
+        .at(ep::LatencyByClient, latency_by_client)
         .at(ep::TokenRate, token_rate)
         .at(ep::TokenRateByProvider, token_rate_by_provider)
         .at(ep::UpstreamHealth, upstream_health)
@@ -751,6 +752,8 @@ async fn summary(
         output_tokens: x.output_tokens,
         cache_read_tokens: x.cache_read_tokens,
         cache_write_tokens: x.cache_write_tokens,
+        sent_bytes: x.sent_bytes,
+        received_bytes: x.received_bytes,
         cost_micros_exact: x.cost_micros_exact,
         cost_micros_estimated: x.cost_micros_estimated,
         unpriced_requests: x.unpriced_requests,
@@ -1171,6 +1174,27 @@ async fn latency_by_provider(
     ))
 }
 
+/// 按密钥分的延迟：**谁在用、谁等得久**（概览上每把密钥一行）。样本的规矩和按模型分的一样
+async fn latency_by_client(
+    State(s): State<ControlState>,
+    axum::extract::Query(q): axum::extract::Query<tw_api::Window>,
+) -> Result<Json<Vec<tw_api::LatencyView>>, Fail> {
+    let (from, to) = range(q.from_ms, q.to_ms);
+    let store = need_store(&s)?;
+    let xs = on_store(store, move |g| g.db().latency_by_client(from, to)).await?;
+    Ok(Json(
+        xs.map_err(records)?
+            .into_iter()
+            .map(|l| tw_api::LatencyView {
+                model: l.model,
+                p50: l.p50,
+                p95: l.p95,
+                samples: l.samples,
+            })
+            .collect(),
+    ))
+}
+
 /// 生成速度的中位数，按模型。**「哪个模型吐得快」**
 async fn token_rate(
     State(s): State<ControlState>,
@@ -1296,7 +1320,9 @@ fn history_row(
         ttft_ms: r.ttft_ms,
         duration_ms: r.duration_ms,
         tokens_per_sec: r.tokens_per_sec,
-        bytes: r.bytes,
+        sent_bytes: r.sent_bytes,
+        received_bytes: r.received_bytes,
+        egress: r.egress,
         input_tokens: r.input_tokens,
         output_tokens: r.output_tokens,
         cache_read_tokens: r.cache_read_tokens,

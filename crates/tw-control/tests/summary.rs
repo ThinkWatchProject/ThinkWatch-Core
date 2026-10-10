@@ -33,7 +33,9 @@ fn req(id: i64, model: &str) -> tw_store::db::RequestRow {
         ttft_ms: None,
         duration_ms: Some(200),
         tokens_per_sec: None,
-        bytes: Some(10),
+        sent_bytes: Some(10),
+        received_bytes: Some(10),
+        egress: None,
         input_tokens: Some(50),
         output_tokens: Some(20),
         cache_read_tokens: None,
@@ -150,4 +152,94 @@ async fn every_group_in_the_trend_says_how_much_of_its_money_is_missing() {
     )
     .await;
     assert_eq!(v, serde_json::json!([]));
+}
+
+/// 流量和出口一路走到界面拿到的那份 JSON：每一行的两个数和出口，汇总、每一格、每一格的每一项
+/// 的合计，按出口分组（直连的那一组名字是空串），每一格的首 token 分位数，按密钥分的延迟
+#[tokio::test]
+async fn traffic_and_egress_reach_every_view() {
+    let mut direct = req(1, "claude-sonnet-4-5");
+    direct.sent_bytes = Some(100);
+    direct.received_bytes = Some(1_000);
+    direct.ttft_ms = Some(300);
+    let mut proxied = req(2, "claude-sonnet-4-5");
+    proxied.sent_bytes = Some(200);
+    proxied.received_bytes = Some(2_000);
+    proxied.egress = Some("机场".into());
+    proxied.ttft_ms = Some(500);
+    let mut never = req(3, "claude-sonnet-4-5");
+    never.sent_bytes = None;
+    never.received_bytes = None;
+    never.client = "codex".into();
+    let (_d, app) = app(&[direct, proxied, never]);
+
+    let rows = get(&app, "/history?from_ms=0&to_ms=10000").await;
+    let row = |id: i64| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(2)["sent_bytes"], 200);
+    assert_eq!(row(2)["received_bytes"], 2_000);
+    assert_eq!(row(2)["egress"], "机场");
+    assert!(row(2).get("bytes").is_none(), "{}", row(2));
+    assert_eq!(row(1)["egress"], serde_json::Value::Null);
+    assert_eq!(row(3)["sent_bytes"], serde_json::Value::Null);
+
+    let s = get(&app, "/summary?from_ms=0&to_ms=10000").await;
+    assert_eq!(
+        (s["sent_bytes"].clone(), s["received_bytes"].clone()),
+        (300.into(), 3_000.into())
+    );
+
+    let b = get(
+        &app,
+        "/summary/buckets?from_ms=0&to_ms=10000&bucket_ms=10000",
+    )
+    .await;
+    assert_eq!(b[0]["sent_bytes"], 300, "{b}");
+    assert_eq!(b[0]["received_bytes"], 3_000, "{b}");
+    assert_eq!(b[0]["input_tokens"], 150, "{b}");
+    assert_eq!(b[0]["output_tokens"], 60, "{b}");
+    assert_eq!(b[0]["ttft_p50_ms"], 300, "{b}");
+    assert_eq!(b[0]["ttft_p95_ms"], 500, "{b}");
+    assert_eq!(b[0]["ttft_samples"], 2, "{b}");
+
+    let by = get(
+        &app,
+        "/summary/buckets/by?from_ms=0&to_ms=10000&bucket_ms=10000&dim=egress",
+    )
+    .await;
+    let mut groups: Vec<_> = by
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["name"].as_str().unwrap().to_string(),
+                g["sent_bytes"].as_i64().unwrap(),
+                g["received_bytes"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    groups.sort();
+    assert_eq!(
+        groups,
+        [
+            ("".to_string(), 100, 1_000),
+            ("机场".to_string(), 200, 2_000)
+        ],
+        "直连的两行（一行没有流量）合成名字是空串的一组：{by}"
+    );
+    let by = get(&app, "/summary/by?from_ms=0&to_ms=10000&dim=egress").await;
+    assert_eq!(by.as_array().unwrap().len(), 2, "{by}");
+
+    let lat = get(&app, "/latency/client?from_ms=0&to_ms=10000").await;
+    assert_eq!(
+        lat,
+        serde_json::json!([{"model": "我", "p50": 300, "p95": 500, "samples": 2}])
+    );
 }
