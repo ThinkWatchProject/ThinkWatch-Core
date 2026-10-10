@@ -255,11 +255,15 @@ fn user_parts(content: &Value, dropped: &mut Dropped) -> Vec<Part> {
 
 fn assistant_parts(m: &Value, dropped: &mut Dropped) -> Vec<Part> {
     let mut parts = Vec::new();
-    // DeepSeek 等实现的推理字段，不在 OpenAI 的定义里
-    if let Some(t) = str_of(m, "reasoning_content").filter(|t| !t.is_empty()) {
+    // DeepSeek 等实现的推理字段，不在 OpenAI 的定义里。DeepSeek 叫 reasoning_content，
+    // OpenRouter、vLLM 叫 reasoning
+    if let Some(t) = str_of(m, "reasoning_content")
+        .or_else(|| str_of(m, "reasoning"))
+        .filter(|t| !t.is_empty())
+    {
         parts.push(Part::Thinking(Thinking {
             text: t.to_string(),
-            signature: None,
+            signature: Some(Signature::new(Vendor::Chat, "")),
         }));
     }
     match m.get("content") {
@@ -308,7 +312,10 @@ pub fn encode_request(r: &Request, t: &Target, dropped: &mut Dropped) -> Value {
     if !r.system.is_empty() {
         messages.push(json!({ "role": "system", "content": r.system.join("\n\n") }));
     }
-    for m in &r.messages {
+    // 连着的几条助手消息并成一条：Responses 客户端一项一条消息，推理、文字、工具调用
+    // 各在一条里，而 DeepSeek 要 reasoning_content 和 tool_calls 写在同一条助手消息上。
+    // 用户那一侧不并：对话中途折成用户消息的系统提示要留在原位（见 `fold_system_turns`）
+    for m in &merge_assistant_turns(&r.messages) {
         match m.role {
             Role::User | Role::System => user_messages(m, dropped, &mut messages),
             Role::Assistant => {
@@ -498,8 +505,23 @@ fn user_messages(m: &Message, dropped: &mut Dropped, out: &mut Vec<Value>) {
     out.push(json!({ "role": "user", "content": content }));
 }
 
+/// 连着的助手消息并成一条，别的原样
+fn merge_assistant_turns(messages: &[Message]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        match out.last_mut() {
+            Some(last) if last.role == Role::Assistant && m.role == Role::Assistant => {
+                last.parts.extend(m.parts.iter().cloned())
+            }
+            _ => out.push(m.clone()),
+        }
+    }
+    out
+}
+
 fn assistant_message(m: &Message, dropped: &mut Dropped) -> Option<Value> {
     let mut texts = Vec::new();
+    let mut reasoning = Vec::new();
     let mut calls = Vec::new();
     for p in &m.parts {
         match p {
@@ -509,7 +531,15 @@ fn assistant_message(m: &Message, dropped: &mut Dropped) -> Option<Value> {
                 "type": "function",
                 "function": { "name": c.name, "arguments": c.input.to_json_text() },
             })),
-            Part::Thinking(_) => dropped.feature(Feature::ReasoningHistory),
+            // 只写回 Chat 上游自己给的推理：DeepSeek 在工具调用的那几轮要它原样带回；
+            // 别家签发的写过去没有意义，而且 OpenAI 自己的接口不认 reasoning_content
+            Part::Thinking(th) => match &th.signature {
+                Some(s) if s.vendor == Vendor::Chat && !th.text.is_empty() => {
+                    reasoning.push(th.text.as_str())
+                }
+                Some(s) if s.vendor == Vendor::Chat => {}
+                _ => dropped.feature(Feature::ReasoningHistory),
+            },
             _ => {}
         }
     }
@@ -520,6 +550,9 @@ fn assistant_message(m: &Message, dropped: &mut Dropped) -> Option<Value> {
         "role": "assistant",
         "content": if texts.is_empty() { Value::Null } else { json!(texts.join("\n")) },
     });
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning.join("\n\n"));
+    }
     if !calls.is_empty() {
         msg["tool_calls"] = Value::Array(calls);
     }
@@ -614,11 +647,52 @@ mod tests {
             m[3],
             json!({"role": "tool", "tool_call_id": "call_1", "content": "放大了"})
         );
-        // 兼容实现：max_tokens；推理内容不回传
+        // 兼容实现：max_tokens；Chat 上游给的推理内容原样写回
         assert_eq!(v["max_tokens"], 2000);
-        assert_eq!(dropped, ["messages.content.thinking"]);
+        assert_eq!(m[2]["reasoning_content"], "看图");
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(v["stream_options"]["include_usage"], true);
         assert_eq!(v["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn reasoning_signed_by_another_vendor_is_not_written_back() {
+        let r = Request {
+            model: "gpt-5".into(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                parts: vec![
+                    Part::Thinking(Thinking {
+                        text: "想".into(),
+                        signature: Some(Signature::new(Vendor::Anthropic, "sig")),
+                    }),
+                    Part::Thinking(Thinking {
+                        text: "想".into(),
+                        signature: None,
+                    }),
+                    Part::Text("答".into()),
+                ],
+            }],
+            ..Default::default()
+        };
+        let (v, dropped) = encode(&r, Dialect::Anthropic, true);
+        assert_eq!(v["messages"][0]["content"], "答");
+        assert!(v["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(dropped, ["messages.content.thinking"]);
+    }
+
+    #[test]
+    fn reasoning_is_read_too() {
+        let (r, _, _) = decode(
+            r#"{"model": "m", "messages": [{"role": "assistant", "content": "答", "reasoning": "想"}]}"#,
+        );
+        assert_eq!(
+            r.messages[0].parts[0],
+            Part::Thinking(Thinking {
+                text: "想".into(),
+                signature: Some(Signature::new(Vendor::Chat, "")),
+            })
+        );
     }
 
     #[test]

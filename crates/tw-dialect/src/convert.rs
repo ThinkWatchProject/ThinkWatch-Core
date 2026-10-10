@@ -1462,7 +1462,8 @@ mod tests {
                 {"type": "thinking", "thinking": "x", "signature": "tw1.o.rs_1:enc"},
                 {"type": "text", "text": "answer"}
             ]},
-            {"role": "assistant", "content": [{"type": "thinking", "thinking": "y", "signature": "tw1.n."}]}
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "y", "signature": "tw1.n."}]},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "z", "signature": "tw1.ch."}]}
         ]})
         .to_string();
         let out: Value =
