@@ -16,6 +16,25 @@ keep in sync and no window in which a fix is merged but not yet
 releasable; the `dev` branch's last act was to sit still for five days
 while thirty-five commits landed on `main` without it.
 
+## Sign the Contributor License Agreement once
+
+Your first pull request to this repository gets a comment from a bot
+asking you to sign the [Contributor License Agreement](CLA.md)
+([Chinese translation](CLA.zh-CN.md)). Read it, then reply on the pull
+request with exactly:
+
+```text
+I have read the CLA Document and I hereby sign the CLA
+```
+
+That is the only time. The signature is recorded in this repository and
+covers all your later pull requests here. If the check stays red after
+you sign, comment `recheck`.
+
+You keep the copyright in your contribution; the agreement grants the
+project the right to license it under any terms, including commercial
+ones.
+
 ## What this repository is
 
 A set of crates, and the `twcore` binary built from them. `bin/twcore` is
