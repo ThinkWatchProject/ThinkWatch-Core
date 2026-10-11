@@ -515,6 +515,23 @@ impl Runtime {
     }
 }
 
+/// 照源码里写着的读出 manifest，**不编译、不起沙箱**：manifest 是纯数据（[`literal`]），照着
+/// 源码就读得出来，核对的规矩和 [`Runtime::load`] 一条一条完全一样（同一个函数）。
+///
+/// **钩子说不出来**：导出了哪些函数要执行模块才看得到，所以返回的 `hooks` 一律是空的，钩子和
+/// 权限对不对得上也没核对。也就是说，编得过的插件，这里读出来的除了钩子和编出来的一模一样；
+/// 反过来不成立 —— 这里读得出来的未必编得过（模块别处有语法错、钩子和权限对不上、模块代码改了
+/// manifest）。
+///
+/// **只拿来显示**一个还没编过的插件（停用着、为它起沙箱不值得）。要跑它、按它的权限做判断，
+/// 先 [`Runtime::load`]。大小由调用方管（[`Limits::max_source`]）
+pub fn declared_manifest(source: &[u8]) -> Result<Manifest, LoadError> {
+    let text = std::str::from_utf8(source).map_err(|e| not_utf8(source, e.valid_up_to()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let lit = literal::find(text).map_err(not_data)?;
+    manifest::declared(&lit)
+}
+
 // ── 插件 ─────────────────────────────────────────────────────────
 
 /// 一个加载好的插件。克隆很便宜，可以跨线程共享
@@ -891,11 +908,7 @@ pub fn js_equal(a: &Value, b: &Value) -> bool {
 /// manifest 得是源码里写着的那一段纯数据，沙箱求值出来的也得正好是它：模块顶层改了
 /// manifest（加一个权限、换一个值）的不认 —— 界面改的是写着的那一份，跑起来的就得是它
 fn same_as_written(text: &str, evaluated: &Value) -> Result<(), LoadError> {
-    let lit = literal::find(text).map_err(|e| LoadError::NotData {
-        message: e.message,
-        line: e.line,
-        column: e.column,
-    })?;
+    let lit = literal::find(text).map_err(not_data)?;
     if !js_equal(&lit.data.to_json(), evaluated) {
         return Err(LoadError::NotData {
             message: "the module's code changes the manifest after declaring it; the manifest \
@@ -906,6 +919,15 @@ fn same_as_written(text: &str, evaluated: &Value) -> Result<(), LoadError> {
         });
     }
     Ok(())
+}
+
+/// 源码里找不到 manifest，或者它不是纯数据
+fn not_data(e: literal::NotData) -> LoadError {
+    LoadError::NotData {
+        message: e.message,
+        line: e.line,
+        column: e.column,
+    }
 }
 
 fn to_json(v: &Value) -> Vec<u8> {

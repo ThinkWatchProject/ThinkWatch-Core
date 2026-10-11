@@ -106,6 +106,22 @@ pub fn declared(bytes: &[u8]) -> Option<(OnError, Scope)> {
     ))
 }
 
+/// 文件里写着的整份 manifest，**不编译、不起沙箱**（[`tw_plugin::declared_manifest`]）：
+/// 和编出来的同一套规矩，只是说不出导出了哪些钩子 —— `hooks` 一律是空的。
+///
+/// **只拿来显示**：一个插件都没打开时，停用的插件不编（见 [`crate::plugin::load`]），缓存里
+/// 又没有它编过的那一份（core 升级过、缓存没了），列表就照这一份说它是什么。它跑不了，也不
+/// 写进缓存（缓存里只放编出来的）；要跑它、按它的权限做判断，先真的编一遍。
+///
+/// 读不出来（不是纯数据、不合规矩、太大）是 None
+pub fn display_manifest(bytes: &[u8]) -> Option<Manifest> {
+    if bytes.len() > MAX_SOURCE {
+        return None;
+    }
+    let m = tw_plugin::declared_manifest(bytes).ok()?;
+    Some(crate::plugin::sandbox::manifest(&m))
+}
+
 /// 把 `from` 里**写明了的**那几样搬到 `into` 上：出错时怎么办（`on_error`）、范围（`match`），
 /// 以及 `into` 还声明着、类型也没变的设置的值（`value`）。默认插件换成新版时用：用户设过的
 /// 留着，新版新加的设置取新版写的值。

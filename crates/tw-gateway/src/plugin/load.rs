@@ -14,8 +14,10 @@
 //! **一个插件都没打开时不起运行时**：沙箱一起来就是几 MB 常驻内存，而 core 自带的默认
 //! 插件装上时都停用着 —— 一个插件都没打开的用户不该为它付这个钱。这时停用的插件照样读
 //! 文件、算哈希，但不编：它们是「休眠」的（[`PluginHost::dormant`]，跑不了任何钩子），
-//! 列表上显示的 manifest 来自缓存（[`super::manifests`]，只拿来显示），缓存里没有就只有
-//! id。有一个插件开着，运行时反正要起，所有插件照常编，缓存跟着补齐。
+//! 列表上显示的 manifest 来自缓存（[`super::manifests`]，编过的那一份）；缓存里没有（core
+//! 升级了、缓存整份作废）就照批准的那份字节里写着的读（[`super::source::display_manifest`]，
+//! 不编：除了导出了哪些钩子，和编出来的一样）；连那也读不出来才只有 id。这两份都**只拿来
+//! 显示**。有一个插件开着，运行时反正要起，所有插件照常编，缓存跟着补齐。
 //!
 //! **出错时怎么办、范围、设置的值都在插件文件里**（契约附录四），配置里只有 id、文件、
 //! 哈希和开关。所以它们跟着 manifest 走：编得出来就是编出来的那一份；编不出来（运行时
@@ -300,7 +302,8 @@ impl Plugins {
 
     /// 停用着、运行时没起的一个插件：**不编**。文件照样读、哈希照样比（「文件变了」照样
     /// 查得出来）；这个进程里编过的直接拿来用，没编过的是休眠的，显示用的 manifest 从缓存
-    /// 里拿，缓存里没有就只有 id（出错时怎么办和范围照文件里写着的）
+    /// 里拿，缓存里没有就照批准的那份字节里写着的读（不编），再读不出来就只有 id（出错时
+    /// 怎么办和范围照文件里写着的）
     fn dormant_one(
         &self,
         dir: &Path,
@@ -331,10 +334,12 @@ impl Plugins {
         let bytes = match read_capped(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Loaded::shown(Broken::Changed, shown);
+                return dormant_broken(dir, p, Broken::Changed, shown);
             }
             Err(e) => {
-                return Loaded::shown(
+                return dormant_broken(
+                    dir,
+                    p,
                     Broken::Error(msg!(
                         "gw.plugin.unreadable", file = &p.file, detail = e =>
                         "The plugin file {file} cannot be read: {detail}"
@@ -345,7 +350,7 @@ impl Plugins {
         };
         let sha: [u8; 32] = Sha256::digest(&bytes).into();
         if hex(&sha) != p.sha256 {
-            return Loaded::shown(Broken::Changed, shown);
+            return dormant_broken(dir, p, Broken::Changed, shown);
         }
         if let Some((_, host)) = compiled {
             return Loaded {
@@ -354,7 +359,10 @@ impl Plugins {
                 declared: None,
             };
         }
-        let declared = shown.is_none().then(|| source::declared(&bytes)).flatten();
+        let (shown, declared) = match shown {
+            Some(m) => (Some(m), None),
+            None => written(&bytes),
+        };
         let host = Dormant {
             manifest: shown.clone().unwrap_or_else(|| placeholder(&p.id)),
             sha256: sha,
@@ -378,10 +386,7 @@ impl Plugins {
         why: Broken,
     ) -> Loaded {
         let state = State::Broken(why);
-        let Some(bytes) = read_capped(&tw_config::plugins::approved_path(dir, &p.id))
-            .ok()
-            .filter(|b| sha256_hex(b) == p.sha256)
-        else {
+        let Some(bytes) = approved_copy(dir, p) else {
             return Loaded {
                 state,
                 manifest: None,
@@ -417,7 +422,7 @@ impl Plugins {
 /// 一个插件读下来的样子（[`Plugins::build`] 用）
 struct Loaded {
     state: State,
-    /// 编出来的（或者缓存里的）manifest
+    /// 编出来的 manifest；休眠的插件是显示用的那一份（缓存里的，或者照源码读的）
     manifest: Option<Manifest>,
     /// 读不出 manifest 时，批准的那份字节里写着的出错时怎么办和范围
     declared: Option<(tw_api::OnError, Scope)>,
@@ -431,14 +436,41 @@ impl Loaded {
             declared: None,
         }
     }
+}
 
-    fn shown(why: Broken, manifest: Option<Manifest>) -> Self {
-        Self {
-            state: State::Broken(why),
-            manifest,
-            declared: None,
-        }
+/// 休眠的插件跑不了（文件变了、读不了）：显示批准过的那一份。缓存里有就是缓存里的，没有就照
+/// 底稿里写着的读（不编，和醒着时 [`Plugins::approved`] 编底稿是同一个意思）
+fn dormant_broken(
+    dir: &Path,
+    p: &tw_config::Plugin,
+    why: Broken,
+    shown: Option<Manifest>,
+) -> Loaded {
+    let (manifest, declared) = match shown {
+        Some(m) => (Some(m), None),
+        None => approved_copy(dir, p).map_or((None, None), |b| written(&b)),
+    };
+    Loaded {
+        state: State::Broken(why),
+        manifest,
+        declared,
     }
+}
+
+/// 照一份字节里写着的读（不编）：读得出整份 manifest 就是它（**只拿来显示**，见
+/// [`source::display_manifest`]）；读不出就只有出错时怎么办和范围，再读不出是两个 None
+fn written(bytes: &[u8]) -> (Option<Manifest>, Option<(tw_api::OnError, Scope)>) {
+    match source::display_manifest(bytes) {
+        Some(m) => (Some(m), None),
+        None => (None, source::declared(bytes)),
+    }
+}
+
+/// 底稿（`plugins/.approved/<id>.js`），**只在它就是批准的那一份时**：被人动过的不拿来冒充
+fn approved_copy(dir: &Path, p: &tw_config::Plugin) -> Option<Vec<u8>> {
+    read_capped(&tw_config::plugins::approved_path(dir, &p.id))
+        .ok()
+        .filter(|b| sha256_hex(b) == p.sha256)
 }
 
 /// 交给插件的设置：manifest 里每个设置此刻的值
@@ -451,7 +483,7 @@ pub fn values_of(m: &Manifest) -> serde_json::Map<String, serde_json::Value> {
 
 /// 停用着、这个进程里还没编过的插件（见 [`Plugins::build`]）。**跑不了任何钩子**（
 /// [`PluginHost`] 的默认实现一律报错）：要它跑之前，调用方先真的编一遍。手里的 manifest
-/// 是缓存里的那一份或者只有名字的占位，**只拿来显示**
+/// 是缓存里的那一份、照源码读的那一份（钩子是空的），或者只有名字的占位，**只拿来显示**
 struct Dormant {
     manifest: Manifest,
     sha256: [u8; 32],
@@ -469,7 +501,7 @@ impl PluginHost for Dormant {
     }
 }
 
-/// 缓存里没有它的 manifest 时的占位：名字就是 id，什么权限、钩子都没有
+/// 缓存里没有、照源码也读不出它的 manifest 时的占位：名字就是 id，什么权限、钩子都没有
 fn placeholder(id: &str) -> Manifest {
     Manifest {
         name: id.to_string(),
@@ -885,7 +917,7 @@ mod tests {
         p
     }
 
-    /// 一个插件都没开：停用的不编（不起运行时），休眠着；缓存里没有就只有 id
+    /// 一个插件都没开：停用的不编（不起运行时），休眠着，跑不了
     #[test]
     fn with_nothing_enabled_a_disabled_plugin_is_not_compiled() {
         let bed = Bed::new();
@@ -896,10 +928,122 @@ mod tests {
         let a = set.get("add-date").unwrap();
         let host = a.ready().expect("a dormant plugin is not broken");
         assert!(host.dormant());
-        assert_eq!(a.name, "add-date");
-        assert!(a.manifest.is_none() && a.permissions.is_empty());
         // 跑不了：钩子一律报错
         assert!(host.on_request(json!({}), json!({})).result.is_err());
+    }
+
+    /// 休眠的插件、缓存里没有（core 升级了，缓存整份作废；或者从来没编过）：不编，照文件里
+    /// 写着的显示 —— 名字、说明、权限、处理哪几种请求、范围、出错时怎么办、设置（先后、标签、
+    /// 值），除了钩子（说不出来，空着）和编出来的一样。**它不写进缓存**：缓存里只放编出来的
+    #[test]
+    fn a_dormant_plugin_without_a_usable_cache_shows_what_its_file_declares() {
+        // 手写：设置项的先后不按字母（`json!` 会把键排好序）
+        let src = r#"export const manifest = {
+  name: "附加日期",
+  api: 1,
+  description: "在系统提示里写上今天的日期",
+  permissions: ["messages", "system"],
+  requests: ["embeddings", "conversation"],
+  match: { clients: ["codex"], models: ["claude-*"] },
+  on_error: "skip",
+  reply: "block",
+  settings: {
+    note: { type: "string", label: "附加内容", value: "今天" },
+    days: { type: "number", label: "天数", value: 2.5 },
+    loud: { type: "boolean" },
+  },
+};
+export function onRequest(x, ctx) {}
+"#;
+        let compiled = FakeEngine.load(src.as_bytes()).unwrap().manifest().clone();
+        for invalid_cache in [false, true] {
+            let bed = Bed::new();
+            let p = off(bed.install("add-date", src));
+            let cache = manifests::path_in(bed.dir.path());
+            if invalid_cache {
+                // 上一版 core 编过、记下的：版本对不上，整份不认
+                bed.plugins.remember(&p.sha256, &add_date_manifest());
+                let text = std::fs::read_to_string(&cache).unwrap();
+                std::fs::write(&cache, text.replace(&manifests::version(), "0.69.0/old/3"))
+                    .unwrap();
+            }
+            // 下一个进程
+            let engine = Arc::new(Counting(Default::default()));
+            let next = Plugins::new(engine.clone());
+            next.set_dir(bed.dir.path().to_path_buf());
+            let before = std::fs::read(&cache).ok();
+            let set = next.build(&tw_config::Config {
+                plugins: vec![p.clone()],
+                ..Default::default()
+            });
+            assert_eq!(engine.count(), 0, "invalid cache: {invalid_cache}");
+            let a = set.get("add-date").unwrap();
+            assert!(a.ready().unwrap().dormant());
+            let shown = a.manifest.clone().expect("nothing was read from the file");
+            assert_eq!(
+                Manifest {
+                    hooks: compiled.hooks,
+                    ..shown.clone()
+                },
+                compiled,
+                "invalid cache: {invalid_cache}"
+            );
+            assert_eq!(shown.hooks, crate::plugin::Hooks::default());
+            assert_eq!(a.name, "附加日期");
+            assert_eq!(
+                a.permissions,
+                [tw_api::Permission::System, tw_api::Permission::Messages]
+            );
+            assert_eq!(
+                a.requests,
+                [
+                    tw_api::RequestKind::Conversation,
+                    tw_api::RequestKind::Embeddings
+                ]
+            );
+            assert_eq!(a.on_error, tw_api::OnError::Skip);
+            assert_eq!(a.scope.clients, ["codex"]);
+            assert_eq!(a.scope.models, ["claude-*"]);
+            let keys: Vec<_> = shown.settings.iter().map(|s| s.key.as_str()).collect();
+            assert_eq!(keys, ["note", "days", "loud"]);
+            assert_eq!(shown.settings[2].label, "loud");
+            assert_eq!(a.settings["days"], json!(2.5));
+            assert_eq!(a.settings["loud"], json!(false));
+            // 照源码读的不进缓存
+            assert_eq!(std::fs::read(&cache).ok(), before);
+        }
+    }
+
+    /// 照源码也读不出来：manifest 不是纯数据就只有 id（出错时怎么办、范围也说不出来）；是纯数据
+    /// 但不合规矩，只有 id，出错时怎么办和范围照文件里写着的
+    #[test]
+    fn a_dormant_plugin_whose_manifest_cannot_be_read_is_listed_by_its_id() {
+        let bed = Bed::new();
+        let engine = Arc::new(Counting(Default::default()));
+        bed.plugins.set_engine(engine.clone());
+        let not_data = "const NAME = \"x\";\nexport const manifest = { name: NAME, api: 1, \
+                        permissions: [\"system\"], on_error: \"skip\" };\n\
+                        export function onRequest(x, ctx) {}\n";
+        let against_the_rules = source(
+            json!({"name": "x", "api": 1, "permissions": ["network"],
+                   "match": {"models": ["gpt-*"]}, "on_error": "skip"}),
+            &["onRequest"],
+        );
+        let set = bed.build(vec![
+            off(bed.install("not-data", not_data)),
+            off(bed.install("against-the-rules", &against_the_rules)),
+        ]);
+        assert_eq!(engine.count(), 0);
+        let a = set.get("not-data").unwrap();
+        assert!(a.ready().unwrap().dormant());
+        assert_eq!(a.name, "not-data");
+        assert!(a.manifest.is_none() && a.permissions.is_empty());
+        assert_eq!(a.on_error, tw_api::OnError::Reject);
+        let a = set.get("against-the-rules").unwrap();
+        assert_eq!(a.name, "against-the-rules");
+        assert!(a.manifest.is_none() && a.permissions.is_empty());
+        assert_eq!(a.on_error, tw_api::OnError::Skip);
+        assert_eq!(a.scope.models, ["gpt-*"]);
     }
 
     /// 编过一次的记在缓存里：下一个进程里它停用着，列表照样说得出它是什么，而且不编
@@ -921,41 +1065,32 @@ mod tests {
         assert_eq!(a.settings["note"], json!("今天"));
     }
 
-    /// 休眠的插件、缓存里没有：只有 id，可出错时怎么办和范围照文件里写着的说得出来
-    #[test]
-    fn a_dormant_plugin_without_a_cached_manifest_still_shows_its_on_error_and_scope() {
-        let bed = Bed::new();
-        let src = source(
-            json!({"name": "x", "api": 1, "permissions": ["system"],
-                   "match": {"clients": ["codex"]}, "on_error": "skip"}),
-            &["onRequest"],
-        );
-        let engine = Arc::new(Counting(Default::default()));
-        bed.plugins.set_engine(engine.clone());
-        let set = bed.build(vec![off(bed.install("x", &src))]);
-        assert_eq!(engine.count(), 0);
-        let a = set.get("x").unwrap();
-        assert!(a.ready().unwrap().dormant());
-        assert!(a.manifest.is_none());
-        assert_eq!(a.on_error, tw_api::OnError::Skip);
-        assert_eq!(a.scope.clients, ["codex"]);
-    }
-
-    /// 有一个开着，运行时反正要起：全都编，停用的也编（缓存跟着补齐）
+    /// 有一个开着，运行时反正要起：全都编，停用的也编（缓存跟着补齐）。之前照源码显示的
+    /// 休眠插件也一样编，手里换成编出来的那一份（钩子有了）
     #[test]
     fn once_one_plugin_is_enabled_every_plugin_is_compiled() {
         let bed = Bed::new();
         let engine = Arc::new(Counting(Default::default()));
         bed.plugins.set_engine(engine.clone());
         let other = add_date().replace("附加日期", "另一个");
-        let set = bed.build(vec![
-            off(bed.install("add-date", &add_date())),
-            bed.install("other", &other),
-        ]);
+        let a = off(bed.install("add-date", &add_date()));
+        let o = bed.install("other", &other);
+        let dormant = bed.build(vec![a.clone(), off(o.clone())]);
+        assert_eq!(engine.count(), 0);
+        assert_eq!(dormant.get("add-date").unwrap().name, "附加日期");
+        assert!(!dormant.get("add-date").unwrap().hooks.request);
+        let set = bed.build(vec![a.clone(), o]);
         assert_eq!(engine.count(), 2);
         let a = set.get("add-date").unwrap();
         assert!(!a.ready().unwrap().dormant());
         assert_eq!(a.name, "附加日期");
+        assert!(a.hooks.request);
+        assert!(set.get("other").unwrap().hooks.request);
+        // 缓存里记的是编出来的那一份
+        let cached = manifests::Cache::default()
+            .get(bed.dir.path(), &sha256_hex(add_date().as_bytes()))
+            .unwrap();
+        assert!(cached.hooks.request);
     }
 
     /// 休眠的插件文件变了：照样是「变了」（只算哈希，不编），显示的是缓存里批准的那一份
@@ -978,7 +1113,7 @@ mod tests {
         assert_eq!(engine.count(), 0);
     }
 
-    /// 缓存里是另一份字节的（插件换过源码）：不拿来冒充
+    /// 缓存里是另一份字节的（插件换过源码）：不拿来冒充，显示的是这一份文件里写着的
     #[test]
     fn a_cached_manifest_of_other_bytes_is_not_used() {
         let bed = Bed::new();
@@ -988,8 +1123,45 @@ mod tests {
         let p = bed.install("add-date", &newer);
         let set = bed.build(vec![off(p)]);
         let a = set.get("add-date").unwrap();
+        assert_eq!(a.name, "新的一版");
+        assert_eq!(a.manifest.as_ref().unwrap().name, "新的一版");
+    }
+
+    /// 休眠的插件文件变了、缓存里也没有：照底稿（批准的那一份）里写着的显示，照样不编。
+    /// 底稿也对不上就只有 id
+    #[test]
+    fn a_dormant_plugin_whose_file_changed_shows_its_approved_copy_without_compiling() {
+        let bed = Bed::new();
+        let src = source(
+            json!({"name": "附加日期", "api": 1, "permissions": ["system"],
+                   "match": {"models": ["gpt-*"]}, "on_error": "skip"}),
+            &["onRequest"],
+        );
+        let p = off(bed.install("add-date", &src));
+        let engine = Arc::new(Counting(Default::default()));
+        bed.plugins.set_engine(engine.clone());
+        let file = tw_config::plugins::file_path(bed.dir.path(), "add-date");
+        std::fs::write(&file, src.replace("附加日期", "改过的")).unwrap();
+        let set = bed.build(vec![p.clone()]);
+        let a = set.get("add-date").unwrap();
+        assert_eq!(a.broken(), Some(&Broken::Changed));
+        assert_eq!(a.name, "附加日期");
+        assert_eq!(a.permissions, [tw_api::Permission::System]);
+        assert_eq!(a.on_error, tw_api::OnError::Skip);
+        assert_eq!(a.scope.models, ["gpt-*"]);
+        assert_eq!(engine.count(), 0);
+
+        std::fs::write(
+            tw_config::plugins::approved_path(bed.dir.path(), "add-date"),
+            src.replace("附加日期", "也改过"),
+        )
+        .unwrap();
+        let set = bed.build(vec![p]);
+        let a = set.get("add-date").unwrap();
+        assert_eq!(a.broken(), Some(&Broken::Changed));
         assert_eq!(a.name, "add-date");
         assert!(a.manifest.is_none());
+        assert_eq!(a.on_error, tw_api::OnError::Reject);
     }
 
     fn add_date_manifest() -> Manifest {

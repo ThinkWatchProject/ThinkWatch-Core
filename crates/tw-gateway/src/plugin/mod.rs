@@ -36,7 +36,8 @@
 //! - [`trial`]：对着存下来的请求和回答试跑一个插件。
 //!
 //! [`defaults`] 是随 core 一起发的那几个插件（清单和源码）；[`manifests`] 是编过的插件的
-//! manifest 缓存，一个插件都没开时拿它显示停用的插件，不为此起运行时（见 [`load`]）。
+//! manifest 缓存，一个插件都没开时拿它显示停用的插件，不为此起运行时；缓存里没有的照源码
+//! 读（[`source::display_manifest`]，不编）（见 [`load`]）。
 
 pub mod bridge;
 pub mod defaults;

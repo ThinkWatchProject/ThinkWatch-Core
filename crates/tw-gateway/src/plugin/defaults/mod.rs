@@ -168,6 +168,73 @@ mod tests {
         assert!(changed[0].1.contains("value: \"English\""), "{changed:?}");
     }
 
+    /// 不编、照源码读出来的（休眠时列表上显示的那一份，[`crate::plugin::source::display_manifest`]）
+    /// 和真的沙箱编出来的一个字段一个字段都一样，只差钩子（说不出来，空着）。用户在界面上改过
+    /// 出错时怎么办、范围和设置的值之后也一样
+    #[test]
+    fn every_default_reads_without_compiling_as_the_sandbox_compiles_it() {
+        let engine = crate::plugin::default_engine();
+        for (id, source) in ALL {
+            let shipped = source.to_string();
+            let settings: std::collections::BTreeMap<_, _> = engine
+                .load(source.as_bytes())
+                .unwrap_or_else(|e| panic!("{id} does not load: {}", e.msg()))
+                .manifest()
+                .settings
+                .iter()
+                .map(|s| {
+                    let v = match s.kind {
+                        tw_api::SettingKind::String => tw_api::SettingValue::String("改过".into()),
+                        tw_api::SettingKind::Number => tw_api::SettingValue::Number(7.5),
+                        tw_api::SettingKind::Boolean => {
+                            tw_api::SettingValue::Bool(s.value != serde_json::json!(true))
+                        }
+                    };
+                    (s.key.clone(), v)
+                })
+                .collect();
+            let edited = crate::plugin::source::rewrite(
+                source,
+                tw_api::OnError::Skip,
+                &tw_api::PluginScope {
+                    clients: vec!["codex".into()],
+                    models: vec!["claude-*".into(), "gpt-*".into()],
+                    upstreams: vec!["relay".into()],
+                },
+                &settings,
+            )
+            .unwrap_or_else(|e| panic!("{id}: {e:?}"));
+            for (what, src) in [("shipped", shipped), ("edited", edited)] {
+                let compiled = engine.load(src.as_bytes()).unwrap().manifest().clone();
+                let shown = crate::plugin::source::display_manifest(src.as_bytes())
+                    .unwrap_or_else(|| panic!("{id} ({what}) does not read without compiling"));
+                assert_eq!(shown.name, compiled.name, "{id} ({what})");
+                assert_eq!(shown.api, compiled.api, "{id} ({what})");
+                assert_eq!(shown.description, compiled.description, "{id} ({what})");
+                assert_eq!(shown.permissions, compiled.permissions, "{id} ({what})");
+                assert_eq!(shown.requests, compiled.requests, "{id} ({what})");
+                assert_eq!(shown.scope, compiled.scope, "{id} ({what})");
+                assert_eq!(shown.on_error, compiled.on_error, "{id} ({what})");
+                assert_eq!(shown.reply_mode, compiled.reply_mode, "{id} ({what})");
+                assert_eq!(shown.settings, compiled.settings, "{id} ({what})");
+                assert_eq!(
+                    shown.hooks,
+                    crate::plugin::Hooks::default(),
+                    "{id} ({what})"
+                );
+                // 上面一条一条比过了；这一条兜住以后加的字段
+                assert_eq!(
+                    crate::plugin::Manifest {
+                        hooks: compiled.hooks,
+                        ..shown
+                    },
+                    compiled,
+                    "{id} ({what})"
+                );
+            }
+        }
+    }
+
     /// 每一个都在真的沙箱里编得成：装不上的默认插件只会在日志里留一行
     #[test]
     fn every_default_compiles_in_the_real_sandbox() {

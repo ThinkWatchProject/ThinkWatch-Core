@@ -442,6 +442,179 @@ fn requests_that_break_the_rules_are_load_errors() {
     }
 }
 
+// ── 不编译、照源码读（`declared_manifest`）──────────────────────────
+
+/// 照源码读 manifest（停用的插件显示用的那一份）和编译认的是同一套规矩：编得过的，读出来
+/// 除了钩子一模一样；字段不合规矩的，两边报同一个错。只有编了才看得出来的（钩子和权限对不上、
+/// 模块别处的语法错、模块代码改了 manifest）照源码读得出来 —— 那一份只拿来显示
+#[test]
+fn reading_the_manifest_without_compiling_follows_the_same_rules() {
+    let reply_end = "export function onReplyTextEnd() { return \"\"; }";
+    let loads = [
+        plugin(
+            r#"{ name: "合法", api: 1, permissions: ["system", "params"] }"#,
+            ON_REQUEST,
+        ),
+        plugin(
+            r#"{
+  // 注释、多行、结尾的逗号
+  name: "  全的  ",
+  api: 1,
+  description: "说明",
+  permissions: ["reply.text", "system", "messages"],
+  requests: ["embeddings", "conversation"],
+  match: { clients: ["codex"], models: ["claude-*"], upstreams: [] },
+  on_error: "skip",
+  reply: "stream",
+  settings: {
+    zeta: { type: "string", label: "  Z  ", value: "今天" },
+    alpha: { type: "number", value: 2.5 },
+    mid: { type: "boolean", label: "", value: true },
+    none: { type: "number", label: null, value: null },
+  },
+}"#,
+            &format!("{ON_REQUEST}\n{ON_TEXT}\n{reply_end}"),
+        ),
+        format!(
+            "\u{feff}{}",
+            plugin(
+                r#"{ name: "x", api: 1, permissions: ["messages"], requests: ["completions"] }"#,
+                ON_REQUEST,
+            )
+        ),
+    ];
+    for src in &loads {
+        let compiled = load_source(src).manifest().clone();
+        let read = tw_plugin::declared_manifest(src.as_bytes())
+            .unwrap_or_else(|e| panic!("{src}\n=> {e:?}"));
+        assert_eq!(read.hooks, tw_plugin::Hooks::default(), "{src}");
+        assert_eq!(
+            tw_plugin::Manifest {
+                hooks: compiled.hooks,
+                ..read
+            },
+            compiled,
+            "{src}"
+        );
+    }
+
+    // 字段不合规矩：同一个错
+    let fields_break: Vec<String> = [
+        r#"{ name: "x", api: 1, permissions: [] }"#.to_string(),
+        r#"{ name: "x", api: 1, permissions: ["system", "network"] }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system", "system"] }"#.into(),
+        r#"{ api: 1, permissions: ["system"] }"#.into(),
+        r#"{ name: " ", api: 1, permissions: ["system"] }"#.into(),
+        format!(r#"{{ name: "{}", api: 1, permissions: ["system"] }}"#, "名".repeat(65)),
+        format!(
+            r#"{{ name: "x", api: 1, description: "{}", permissions: ["system"] }}"#,
+            "述".repeat(501)
+        ),
+        r#"{ name: "x", api: 2, permissions: ["system"] }"#.into(),
+        r#"{ name: "x", api: "1", permissions: ["system"] }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], colour: "red" }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], on_error: "retry" }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], reply: "batch" }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], match: { models: "claude-*" } }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], match: { models: [" "] } }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], match: { hosts: [] } }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "file" } } }"#
+            .into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "number", value: "八" } } }"#
+            .into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], settings: { "1a": { type: "string" } } }"#
+            .into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], settings: { a: { type: "string", hint: "h" } } }"#
+            .into(),
+        format!(
+            r#"{{ name: "x", api: 1, permissions: ["system"], settings: {{ {} }} }}"#,
+            (0..21)
+                .map(|i| format!(r#"s{i}: {{ type: "string" }}"#))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        r#"{ name: "x", api: 1, permissions: ["messages"], requests: [] }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["messages"], requests: ["images"] }"#.into(),
+        r#"{ name: "x", api: 1, permissions: ["system"], requests: ["conversation", "embeddings"] }"#
+            .into(),
+        r#"{ name: "x", api: 1, permissions: ["system", "messages"], requests: ["completions"] }"#
+            .into(),
+    ]
+    .into();
+    let mut cases: Vec<Vec<u8>> = fields_break
+        .iter()
+        .map(|m| plugin(m, ON_REQUEST).into_bytes())
+        .collect();
+    // 回答钩子只在对话上跑：钩子和权限对得上，错在 `requests`
+    cases.push(
+        plugin(
+            r#"{ name: "x", api: 1, permissions: ["messages", "reply.text"], requests: ["embeddings"] }"#,
+            &format!("{ON_REQUEST}\n{ON_TEXT}"),
+        )
+        .into_bytes(),
+    );
+    // 不是纯数据：说得出同一个位置
+    cases.push(
+        format!(
+            "export const manifest = {{\n  name: \"x\" + \"y\",\n  api: 1,\n  permissions: [\"system\"],\n}};\n{ON_REQUEST}\n"
+        )
+        .into_bytes(),
+    );
+    // 不是 UTF-8
+    let mut not_utf8 = plugin(
+        r#"{ name: "x", api: 1, permissions: ["system"] }"#,
+        ON_REQUEST,
+    )
+    .into_bytes();
+    not_utf8.extend_from_slice(b"// \xff\xfe\n");
+    cases.push(not_utf8);
+    for src in &cases {
+        let shown = String::from_utf8_lossy(src);
+        assert_eq!(
+            tw_plugin::declared_manifest(src),
+            Err(load_err(src)),
+            "{shown}"
+        );
+    }
+
+    // 只有编了才看得出来的：照源码读得出来
+    let compile_only = [
+        plugin(r#"{ name: "x", api: 1, permissions: ["system"] }"#, ""),
+        plugin(r#"{ name: "x", api: 1, permissions: ["system"] }"#, ON_TEXT),
+        plugin(
+            r#"{ name: "x", api: 1, permissions: ["system", "reply.text"] }"#,
+            ON_REQUEST,
+        ),
+        plugin(
+            r#"{ name: "x", api: 1, permissions: ["system"] }"#,
+            "export const onRequest = 42;",
+        ),
+        plugin(
+            r#"{ name: "x", api: 1, permissions: ["system"] }"#,
+            "export function onRequest(req) { return req +; }",
+        ),
+        plugin(
+            r#"{ name: "x", api: 1, permissions: ["system"] }"#,
+            &format!("manifest.permissions.push(\"params\");\n{ON_REQUEST}"),
+        ),
+    ];
+    for src in &compile_only {
+        load_err(src.as_bytes());
+        let read = tw_plugin::declared_manifest(src.as_bytes())
+            .unwrap_or_else(|e| panic!("{src}\n=> {e:?}"));
+        assert_eq!(read.name, "x");
+        assert_eq!(
+            read.permissions.len(),
+            src.matches("\"reply.text\"").count() + 1
+        );
+    }
+
+    // 没有 manifest：两边都读不出来（说法不同：沙箱看得到导出了什么）
+    assert!(tw_plugin::declared_manifest(ON_REQUEST.as_bytes()).is_err());
+    load_err(ON_REQUEST.as_bytes());
+    still_fine();
+}
+
 #[test]
 fn an_unsupported_api_version_is_named() {
     let e = load_err(

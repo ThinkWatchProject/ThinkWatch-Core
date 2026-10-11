@@ -195,7 +195,9 @@ pub(crate) fn on_error(o: tw_plugin::OnError) -> tw_api::OnError {
     }
 }
 
-fn manifest(m: &tw_plugin::Manifest) -> Manifest {
+/// 换成网关那一份。编出来的和照源码读出来的（[`crate::plugin::source::display_manifest`]）
+/// 都走这里
+pub(crate) fn manifest(m: &tw_plugin::Manifest) -> Manifest {
     let granted: Vec<tw_api::Permission> = m.permissions.iter().copied().map(permission).collect();
     let handled: Vec<tw_api::RequestKind> = m.requests.iter().copied().map(request_kind).collect();
     Manifest {
