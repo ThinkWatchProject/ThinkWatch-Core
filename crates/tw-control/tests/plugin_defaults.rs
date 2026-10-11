@@ -753,6 +753,58 @@ async fn the_shipped_defaults_go_in_turned_off_without_starting_the_sandbox() {
     assert_eq!(engine.count(), 0);
 }
 
+/// core 升级之后（显示用的缓存是上一版写的，整份作废；或者缓存没了）：随 core 发的那几个
+/// 停用着，列表照样说得全它们是什么 —— 照文件里写着的读，**不起运行时**，也不把读出来的写进
+/// 缓存。说得全：名字、说明、权限、处理哪几种请求、范围、出错时怎么办、设置
+#[tokio::test]
+async fn after_an_upgrade_the_shipped_defaults_still_list_in_full_without_the_sandbox() {
+    let b = bed_with("real", Counting::new(real()));
+    Seeder::shipped().seed(&b.mgr).await;
+    let stored = std::fs::read_to_string(cache_file(&b)).unwrap();
+    let version = tw_gateway::plugin::manifests::version();
+    assert!(stored.contains(&version), "{stored}");
+    for stale in [Some(stored.replace(&version, "0.63.0/old/3")), None] {
+        match &stale {
+            Some(text) => std::fs::write(cache_file(&b), text).unwrap(),
+            None => std::fs::remove_file(cache_file(&b)).unwrap(),
+        }
+        let engine = Counting::new(real());
+        let again = b.restart(engine.clone());
+        assert_eq!(Seeder::shipped().seed(&again.mgr).await, Seeded::default());
+        for (id, _) in tw_gateway::plugin::defaults::ALL {
+            let m = tw_gateway::plugin::defaults::manifest(id).unwrap();
+            let v = again.plugin(id).await;
+            assert_eq!(v["status"], json!({"kind": "disabled"}), "{id}: {v}");
+            assert_eq!(v["name"], m.name.as_str(), "{id}: {v}");
+            assert_eq!(v["description"], json!(m.description), "{id}: {v}");
+            assert_eq!(v["permissions"], json!(m.permissions), "{id}: {v}");
+            assert_eq!(v["requests"], json!(m.requests), "{id}: {v}");
+            assert_eq!(v["on_error"], json!(m.on_error), "{id}: {v}");
+            assert_eq!(v["reply_mode"], json!(m.reply_mode), "{id}: {v}");
+            assert_eq!(
+                v["scope"],
+                json!({"clients": m.scope.clients, "models": m.scope.models,
+                       "upstreams": m.scope.upstreams}),
+                "{id}: {v}"
+            );
+            let schema: Vec<Value> = m
+                .settings
+                .iter()
+                .map(|s| json!({"key": s.key, "kind": s.kind, "label": s.label, "value": s.value}))
+                .collect();
+            assert_eq!(v["settings_schema"], json!(schema), "{id}: {v}");
+            let a = again.gw.runtime().plugins.get(id).unwrap().clone();
+            assert!(a.ready().unwrap().dormant(), "{id}");
+        }
+        assert_eq!(engine.count(), 0, "listing started the sandbox");
+        assert_eq!(
+            std::fs::read_to_string(cache_file(&b)).ok(),
+            stale,
+            "the manifests read from the files went into the cache"
+        );
+    }
+}
+
 /// 打开一个默认插件：这时才真的编（起运行时），编出来就能跑
 #[tokio::test]
 async fn enabling_a_default_compiles_it_and_then_it_runs() {
@@ -905,15 +957,18 @@ async fn a_tampered_manifest_cache_cannot_hide_tool_calls_from_the_confirmation(
     );
 }
 
-/// 缓存对不上（版本不对、是别的字节的）：不认，插件只按 id 和状态列出来，也不为此编
+/// 缓存对不上（版本不对、是别的字节的、写坏了，或者干脆没有）：不认，也不为此编 —— 列表
+/// 照插件文件里写着的显示，不是缓存里那一条说的。照文件读的那一份不写回缓存
 #[tokio::test]
 async fn a_cache_entry_that_does_not_match_is_ignored() {
     let b = bed();
     let src = install_calls(&b).await;
-    let stored: Value =
+    let mut stored: Value =
         serde_json::from_str(&std::fs::read_to_string(cache_file(&b)).unwrap()).unwrap();
     let sha_now = sha(&src);
     assert!(stored["manifests"][&sha_now].is_object(), "{stored}");
+    // 缓存里那一条要是被用上了，列表上就是这个名字
+    stored["manifests"][&sha_now]["name"] = json!("缓存里的");
 
     let mut old_version = stored.clone();
     old_version["version"] = json!("0.0.0/old/1");
@@ -921,19 +976,115 @@ async fn a_cache_entry_that_does_not_match_is_ignored() {
     let entry = other_bytes["manifests"][&sha_now].clone();
     other_bytes["manifests"] = json!({ sha_now.replace(|c: char| c != '0', "0"): entry });
     for (what, file) in [
-        ("another version", old_version.to_string()),
-        ("other bytes", other_bytes.to_string()),
-        ("a broken file", "{ not json".to_string()),
+        ("another version", Some(old_version.to_string())),
+        ("other bytes", Some(other_bytes.to_string())),
+        ("a broken file", Some("{ not json".to_string())),
+        ("no file", None),
     ] {
-        std::fs::write(cache_file(&b), file).unwrap();
+        match &file {
+            Some(text) => std::fs::write(cache_file(&b), text).unwrap(),
+            None => std::fs::remove_file(cache_file(&b)).unwrap(),
+        }
         let engine = Counting::new(Arc::new(FakeEngine));
         let again = b.restart(engine.clone());
         let v = again.plugin("calls").await;
-        assert_eq!(v["name"], "calls", "{what}: {v}");
-        assert_eq!(v["permissions"], json!([]), "{what}: {v}");
+        assert_eq!(v["name"], "改工具调用", "{what}: {v}");
+        assert_eq!(v["permissions"], json!(["reply_tool_calls"]), "{what}: {v}");
+        assert_eq!(v["requests"], json!(["conversation"]), "{what}: {v}");
+        assert_eq!(v["settings_schema"][0]["label"], "方式", "{what}: {v}");
+        assert_eq!(v["settings_schema"][0]["value"], "a", "{what}: {v}");
         assert_eq!(v["status"], json!({"kind": "disabled"}), "{what}: {v}");
         assert_eq!(engine.count(), 0, "{what}");
+        // 照文件读的那一份没有写进去：缓存原样（别的字节的那一条照旧清掉）
+        let after = std::fs::read_to_string(cache_file(&b)).ok();
+        if what == "other bytes" {
+            let after: Value = serde_json::from_str(after.as_deref().unwrap()).unwrap();
+            assert_eq!(after["manifests"], json!({}), "{what}: {after}");
+        } else {
+            assert_eq!(after, file, "{what}: the cache was written");
+        }
     }
+}
+
+/// 编出来的说它改得了工具调用，照文件读的那一份说它只改系统提示（模块代码在运行时多要了
+/// 权限 —— 真的沙箱不收这种插件，这里用一个这么「编」的引擎）
+struct Steering;
+
+struct Steered {
+    manifest: tw_gateway::plugin::Manifest,
+    sha256: [u8; 32],
+}
+
+impl PluginHost for Steered {
+    fn manifest(&self) -> &tw_gateway::plugin::Manifest {
+        &self.manifest
+    }
+    fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+}
+
+impl Engine for Steering {
+    fn load(&self, source: &[u8]) -> Result<Arc<dyn PluginHost>, LoadError> {
+        let host = FakeEngine.load(source)?;
+        let mut manifest = host.manifest().clone();
+        manifest
+            .permissions
+            .push(tw_api::Permission::ReplyToolCalls);
+        manifest.hooks.tool_call = true;
+        Ok(Arc::new(Steered {
+            manifest,
+            sha256: host.sha256(),
+        }))
+    }
+}
+
+/// 缓存作废之后，休眠的插件列表上是照文件读的那一份；**判断不认它**：网页那条路打开它、改它的
+/// 代码，照样先真的编一遍、按编出来的权限要点头
+#[tokio::test]
+async fn a_manifest_read_without_compiling_is_not_what_the_confirmation_trusts() {
+    let b = bed();
+    let src = source(
+        json!({"name": "只改系统提示", "api": 1, "permissions": ["system"]}),
+        &["onRequest"],
+    );
+    let (st, v) = call(
+        &b.app,
+        "POST",
+        "/plugins",
+        Some(json!({"source": src, "id": "quiet", "enabled": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    std::fs::remove_file(cache_file(&b)).unwrap();
+
+    let engine = Counting::new(Arc::new(Steering));
+    let again = b.restart(engine.clone());
+    let v = again.plugin("quiet").await;
+    assert_eq!(v["name"], "只改系统提示", "{v}");
+    assert_eq!(v["permissions"], json!(["system"]), "{v}");
+    assert_eq!(engine.count(), 0);
+    for (what, source) in [
+        ("turning it on", src.clone()),
+        ("a code change", format!("{src}// 多一行\n")),
+    ] {
+        let (st, v) = call(
+            &again.app,
+            "PUT",
+            "/plugins/quiet",
+            Some(json!({"source": source, "enabled": what == "turning it on",
+                        "base_version": again.version().await})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: {v}");
+        assert_eq!(v["code"], "control.plugin.needs_confirmation", "{what}");
+    }
+    assert!(
+        engine.count() > 0,
+        "the decision was not made on a compiled manifest"
+    );
+    assert!(!again.entry("quiet").unwrap().enabled);
+    assert_eq!(again.read(again.file("quiet")), src);
 }
 
 /// `wsl-paths` 改得了回答里的工具调用：网页那条路打不开它，确认过的那条打得开；改它的
