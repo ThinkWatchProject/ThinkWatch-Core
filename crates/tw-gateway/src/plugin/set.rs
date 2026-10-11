@@ -98,12 +98,15 @@ pub struct Active {
     /// `requests` 的插件对待 —— 它拦的是对话，嵌入、补全照常过去
     pub requests: Vec<tw_api::RequestKind>,
     pub reply_mode: ReplyMode,
+    /// 导出了哪些钩子。**休眠的插件说不准**：缓存里的那一份有，照源码读的那一份没有（空的）
+    /// —— 休眠的插件都停用着，不跑，用不着它
     pub hooks: Hooks,
     /// 交给插件的设置：manifest 里每个设置此刻的值（`value`），加载时核对过类型。读不出
     /// manifest 时是空的
     pub settings: serde_json::Map<String, serde_json::Value>,
-    /// 读出来的 manifest。文件变了时是批准过的那一份的（只拿来显示，不跑）；
-    /// 哪一份都读不出来时是 None
+    /// 读出来的 manifest。文件变了时是批准过的那一份的（只拿来显示，不跑）；休眠的插件
+    /// （[`PluginHost::dormant`]）是显示用的那一份：缓存里编过的，或者照源码读的（不编，
+    /// 钩子是空的，见 [`crate::plugin::source::display_manifest`]）。哪一份都读不出来时是 None
     pub manifest: Option<Manifest>,
     pub state: State,
     pub stats: Arc<Stats>,

@@ -5,6 +5,11 @@
 //!
 //! 核对之前先对一遍源码：manifest 得是纯数据，沙箱求值出来的得正好是源码里写的那一份
 //! （[`crate::literal`]，由调用方给的 `literal` 做）。
+//!
+//! **同一套规矩有两个入口**：编译时读沙箱交来的那份（[`parse`]），不编译时照源码里写着的
+//! 读（[`declared`]，[`crate::declared_manifest`]）。钩子以外的字段都由 [`fields`] 读、
+//! [`finish`] 收尾 —— 两条路认的规矩没法各改各的。只有钩子是编了才知道的：导出了哪些函数
+//! 要执行模块才看得到，所以「钩子和权限一一对应」只在编译时核对。
 
 use std::collections::BTreeSet;
 
@@ -92,7 +97,31 @@ pub(crate) fn parse(
     let Value::Object(m) = info.manifest else {
         return Err(err("the manifest must be an object"));
     };
+    let m = fields(&m, info.settings_order.as_deref())?;
+    finish(m, Some(hooks))
+}
 
+/// 照源码里写着的读一份 manifest，**不编译**（[`crate::declared_manifest`]）：钩子说不出来，
+/// 一律是空的，钩子和权限对不对得上也不核对；别的和 [`parse`] 一条一条完全一样。
+///
+/// 设置项的先后就是字面量里写的先后。沙箱那边是 `Object.keys` 的先后，只在整数样子的键上
+/// 不同（它们排在最前面），而那样的键本来就不合规矩（不能以数字开头）
+pub(crate) fn declared(lit: &crate::literal::Literal) -> Result<Manifest, LoadError> {
+    let Value::Object(m) = lit.data.to_json() else {
+        return Err(err("the manifest must be an object"));
+    };
+    let order: Option<Vec<String>> = match lit.data.get("settings") {
+        Some(crate::literal::Data::Object(s)) => Some(s.iter().map(|(k, _)| k.clone()).collect()),
+        _ => None,
+    };
+    finish(fields(&m, order.as_deref())?, None)
+}
+
+/// 钩子以外的每个字段，逐项核对。`hooks` 先空着，由 [`finish`] 填
+fn fields(
+    m: &Map<String, Value>,
+    settings_order: Option<&[String]>,
+) -> Result<Manifest, LoadError> {
     // api 先看：将来的 api 2 可能有这里不认识的字段，那时该说的是「版本不支持」
     let api = match m.get("api") {
         None | Some(Value::Null) => return Err(err("the manifest needs `api: 1`")),
@@ -174,10 +203,7 @@ pub(crate) fn parse(
         Some(Value::String(s)) if s == "stream" => ReplyMode::Stream,
         Some(_) => return Err(err("`reply` must be \"block\" or \"stream\"")),
     };
-    let settings = settings(m.get("settings"), info.settings_order.as_deref())?;
-
-    check_hooks(&hooks, &permissions, reply_mode)?;
-    check_requests(&requests, &permissions)?;
+    let settings = settings(m.get("settings"), settings_order)?;
 
     Ok(Manifest {
         name,
@@ -189,8 +215,19 @@ pub(crate) fn parse(
         on_error,
         reply_mode,
         settings,
-        hooks,
+        hooks: Hooks::default(),
     })
+}
+
+/// 字段之间的约束。`hooks` 是编出来的那一份时，先核对钩子和权限一一对应、再填上；`None`
+/// 是说不出来（[`declared`]），钩子空着
+fn finish(mut m: Manifest, hooks: Option<Hooks>) -> Result<Manifest, LoadError> {
+    if let Some(hooks) = hooks {
+        check_hooks(&hooks, &m.permissions, m.reply_mode)?;
+        m.hooks = hooks;
+    }
+    check_requests(&m.requests, &m.permissions)?;
+    Ok(m)
 }
 
 fn permissions(v: Option<&Value>) -> Result<BTreeSet<Permission>, LoadError> {
