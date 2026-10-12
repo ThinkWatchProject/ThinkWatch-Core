@@ -680,6 +680,16 @@ fn for_each_token(text: &str, mut f: impl FnMut(&str, Range<usize>, bool)) {
 
 // ---------------------------------------------------------------- 私钥块
 
+/// 从 `at` 起、到所在 JSON 字符串结尾（没转义的引号）之前。没有引号就到文本末尾
+fn string_end(text: &str, at: usize) -> usize {
+    let b = text.as_bytes();
+    let mut i = at;
+    while i < b.len() && b[i] != b'"' {
+        i += if b[i] == b'\\' { 2 } else { 1 };
+    }
+    i.min(b.len())
+}
+
 const PEM_BEGIN: &str = "-----BEGIN ";
 const PEM_KEY: &str = "PRIVATE KEY-----";
 
@@ -687,11 +697,20 @@ const PEM_KEY: &str = "PRIVATE KEY-----";
 ///
 /// **整段换掉，不是只换 base64。**只换中间那段的话，模型看到的是一个
 /// 空壳 PEM，它会以为文件坏了然后建议你重新生成一把 —— 那是在帮倒忙。
-fn private_keys(text: &str, out: &mut Vec<Hit>) {
+fn private_keys(text: &str, json: bool, out: &mut Vec<Hit>) {
     let mut from = 0;
     // 按字节找（SIMD）：整个请求体都要过一遍，而它几乎从来不在里面
     while let Some(b) = memchr::memmem::find(&text.as_bytes()[from..], PEM_BEGIN.as_bytes()) {
         let begin = from + b;
+        // **头和 END 都在同一个字符串里找。**按整个请求体往后找的话，一条消息里一个半截的
+        // `-----BEGIN`（读到一半的文件、讲这条规则的代码）会一路接到后面另一条消息里的
+        // `END`：中间几条历史整段换成一个占位符，前后两条拼成一个对象，发出去的已经不是
+        // 原来那段对话
+        let text = if json {
+            &text[..string_end(text, begin)]
+        } else {
+            text
+        };
         // **不能按换行找那一行的结尾。**请求体是 JSON，里面的换行是
         // `\n` 两个字符，不是一个换行符 —— 按换行找的话整个 PEM 会落在
         // 「同一行」里，判据当场失效。而那是这条规则实际会遇到的唯一形态。
@@ -1336,8 +1355,11 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     if set.is_empty() {
         return out;
     }
+    // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
+    // JSON 的文本（直接拿来扫的一段话）不分里外
+    let json = text.trim_start().starts_with(['{', '[', '"']);
     if set.is_on("private-key") {
-        private_keys(text, &mut out);
+        private_keys(text, json, &mut out);
     }
     if set.is_on("conn-string-password") {
         conn_strings(text, &mut out);
@@ -1359,8 +1381,7 @@ pub fn scan(text: &str, set: &RuleSet) -> Vec<Hit> {
     // **个人号码只在 JSON 的字符串里找。**字符串外面的数字是 JSON 的数值：工具
     // 调用的参数（`"input":{"order_id":6222…}`）、`seed`。凭据规则在那儿天然认
     // 不出东西，号码规则却认得出 —— 而把一个数值换成占位符，整个请求体就不是
-    // JSON 了。不是 JSON 的文本（直接拿来扫的一段话）不分里外
-    let json = text.trim_start().starts_with(['{', '[', '"']);
+    // JSON 了
     let mut spaced = Spaced::default();
     for_each_token(text, |tok, span, quoted| {
         if want_phone && (quoted || !json) {
@@ -1712,6 +1733,23 @@ mod tests {
             found(r#"{"c":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"}"#)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_pem_does_not_reach_into_the_next_string() {
+        // 一条工具输出里只有半截的头（读的是讲这条规则的代码），END 在后面另一条消息里：
+        // 按整个请求体往后找的话，中间几条历史会整段换成一个占位符
+        let body = serde_json::json!({"input": [
+            {"type": "function_call_output", "call_id": "c1", "output": "const PEM_BEGIN: &str = \"-----BEGIN \";\nconst PEM_KEY: &str = \"PRIVATE KEY-----\";"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "好"}]},
+            {"type": "function_call_output", "call_id": "c2", "output": "-----END RSA PRIVATE KEY-----"},
+        ]})
+        .to_string();
+        assert!(found(&body).is_empty(), "{:?}", found(&body));
+        // 头在一个字符串里、END 在下一个字符串里也不算
+        let body = r#"{"a":"-----BEGIN RSA PRIVATE KEY-----
+MIIEow","b":"-----END RSA PRIVATE KEY-----"}"#;
+        assert!(found(body).is_empty(), "{:?}", found(body));
     }
 
     #[test]
