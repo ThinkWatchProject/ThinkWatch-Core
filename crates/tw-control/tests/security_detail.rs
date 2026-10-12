@@ -90,6 +90,7 @@ security:
     custom:
       - name: 公司令牌
         pattern: 'corp_[A-Z0-9]{{12}}'
+        match: regex
   inspect_tools:
     mode: enforce
   content:
@@ -284,6 +285,7 @@ async fn every_guard_logs_where_what_and_how_and_never_a_value() {
     );
     let corp = by_rule(&events, "公司令牌");
     assert_eq!(corp["rule_snapshot"]["pattern"], "corp_[A-Z0-9]{12}");
+    assert_eq!(corp["rule_snapshot"]["matching"], "regex");
     assert_eq!(
         corp["outcome_detail"]["placeholders"],
         json!(["<<TW_SECRET_2>>"])
@@ -402,7 +404,7 @@ async fn a_rule_edited_afterwards_leaves_the_earlier_record_as_it_was() {
         &w.app,
         "PUT",
         "/security/redact/custom/公司令牌",
-        json!({"name": "公司令牌", "pattern": "corp_[A-Z]{6}[0-9]{6}"}),
+        json!({"name": "公司令牌", "pattern": "corp_[A-Z]{6}[0-9]{6}", "match": "regex"}),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");

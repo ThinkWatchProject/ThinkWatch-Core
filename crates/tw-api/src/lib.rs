@@ -900,7 +900,19 @@ pub const MSG_CODES: &str = include_str!("../msg-codes.txt");
 /// **46 起看得出密钥是账号登录换来的**：[`ProviderView`] 多了 `signed_in`（[`ZaiFamily`]）。
 /// Z.ai / BigModel 的账号登录在它写的上游上记下 `signed_in: zai | bigmodel`；重新登录照旧
 /// 写上，在界面里保存时密钥没变就留着，换成了别的密钥就去掉。手填的密钥和别的上游是 null。
-pub const CONTROL_API_VERSION: u32 = 46;
+///
+/// **47 起出站脱敏的自定义规则能选怎么认、分不分大小写**：[`CustomRuleSave`] 和
+/// [`SecurityTestRequest`] 的 `match` 出站脱敏也认（`contains` 按原样找这段文字、`regex`；
+/// 不给是 `contains`，**以前是正则**），多了 `case_sensitive`（不给是不分）。规则视图里
+/// 出站脱敏的自定义规则是 [`Matcher`] 的 `contains` 或 `regex`，两者都多了
+/// `case_sensitive`（工具调用审查的正则开头写了 `(?i)` 的是 `false`，别的是 `true`）。安全日志的 [`RuleSnapshot`] 多了
+/// `case_sensitive`，出站脱敏的自定义规则也带 `matching`。码位交给出站脱敏是 400
+/// （`security.redact_match_bad`），配置里写了是 `config.rule_match_bad`。配置里不写
+/// `match` 的老规则从此按原样找。
+///
+/// 出站脱敏不再碰请求体的键；自定义规则也不碰协议里的 id、类型、角色、工具名、模型名这些值
+/// （内置规则照找）。
+pub const CONTROL_API_VERSION: u32 = 47;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -5897,9 +5909,13 @@ pub struct RuleSnapshot {
     /// 自定义规则写的样子，原样（正则、关键词、码位）。内置规则没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
-    /// 内容过滤：这条规则怎么认（`contains` / `regex` / `codepoints`）。别的防护没有
+    /// 自定义规则怎么认：内容过滤是 `contains` / `regex` / `codepoints`，出站脱敏是
+    /// `contains` / `regex`。内置规则和工具调用审查没有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matching: Option<ContentMatch>,
+    /// 出站脱敏的自定义规则：分大小写
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub case_sensitive: bool,
     /// 认出它的 core 的版本
     pub core_version: String,
 }
@@ -6028,15 +6044,19 @@ pub struct ActionSave {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CustomRuleSave {
     pub name: String,
-    /// 正则；内容过滤按 `match`：要找的那段文字、正则，或者码位（`U+200B, U+E0000–U+E007F`）
+    /// 工具调用审查是正则；出站脱敏和内容过滤按 `match`：要找的那段文字、正则，或者码位
+    /// （`U+200B, U+E0000–U+E007F`，只有内容过滤）
     pub pattern: String,
     /// 工具调用审查：`cut` / `record`；内容过滤：`block` / `strip` / `record`。不给按 `record`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<RuleAction>,
-    /// 内容过滤才有：`contains`（不分大小写的子串）/ `regex` / `codepoints`。不给按
-    /// `contains`。别的防护的自定义规则都是正则
+    /// 怎么认。内容过滤：`contains`（不分大小写的子串）/ `regex` / `codepoints`；出站脱敏：
+    /// `contains`（按原样找这段文字）/ `regex`。不给按 `contains`。工具调用审查的都是正则
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub matching: Option<ContentMatch>,
+    /// 出站脱敏才有：分大小写。不给是不分
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_sensitive: Option<bool>,
     /// 出站脱敏才有：占位符名称，`PROJECT` 换成 `<<TW_PROJECT_1>>`。大写字母开头，其余是
     /// 大写字母、数字、下划线，最多 24 个字符。不给是 `SECRET`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6887,6 +6907,7 @@ mod tests {
             name: "plan".into(),
             pattern: Some("forbidden-plan".into()),
             matching: Some(ContentMatch::Contains),
+            case_sensitive: false,
             core_version: "0.67.1".into(),
         };
         assert_eq!(

@@ -62,7 +62,13 @@ pub mod view;
 /// 这条正则要在每个请求上跑，而 `(a|aa){200}` 这种写法在默认的 10 MiB 上限下
 /// 要编好几秒、占几 MB，然后每个请求都付一遍。
 fn bounded(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    bounded_with(pattern, false)
+}
+
+/// [`bounded`]，`ignore_case` 时不分大小写
+fn bounded_with(pattern: &str, ignore_case: bool) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
         .size_limit(1 << 20)
         .dfa_size_limit(1 << 20)
         .build()

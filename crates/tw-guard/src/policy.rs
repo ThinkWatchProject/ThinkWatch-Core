@@ -12,7 +12,9 @@
 //!     disable: [jwt]               # 关掉出厂开着的内置规则
 //!     custom:
 //!       - name: 内部项目号          # 名字也是标识，同一项里不许重名
-//!         pattern: 'PRJ-\d{6}'     # 正则
+//!         pattern: 'PRJ-\d{6}'
+//!         match: regex             # contains | regex；不写 = contains（按原样找这段文字）
+//!         case_sensitive: true     # 可选；不写 = 不分大小写
 //!         label: PROJECT           # 可选；占位符 <<TW_PROJECT_1>>；不写 = SECRET
 //!         disabled: true           # 可选
 //!   inspect_tools:
@@ -57,7 +59,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::content::{self, CodepointError, Codepoints};
-use crate::redact::rules::RuleSet;
+use crate::redact::rules::{Pattern, RuleSet};
 use crate::tools::rules as tool_rules;
 
 /// 一项防护的档位。
@@ -260,8 +262,15 @@ pub fn placeholder_label(label: &str) -> String {
 pub struct CustomRedactRule {
     /// 日志和界面上显示的名字，也是它的标识
     pub name: String,
-    /// 正则表达式
+    /// 要找的那段文字，或者正则（按 `match`）
     pub pattern: String,
+    /// `contains`：按原样找这段文字（**不写就是它**：用户填的多半就是那个词，`.`、`*`
+    /// 不该有特殊含义）；`regex`：正则。码位只有内容过滤认
+    #[serde(rename = "match", default, skip_serializing_if = "is_default")]
+    pub matching: ContentMatch,
+    /// 分大小写。不写是不分
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub case_sensitive: bool,
     /// 占位符里的标签：`PROJECT` 换成 `<<TW_PROJECT_1>>`。不写是 [`DEFAULT_LABEL`]；写的
     /// 就是它的，读进来也是不写（见 `label_or_default`）
     #[serde(
@@ -415,6 +424,15 @@ pub enum PolicyError {
     BadLabel { name: String, label: String },
     #[error("security.{guard} names `{id}`, which is not a built-in rule")]
     UnknownRule { guard: Guard, id: String },
+    #[error(
+        "custom redaction rule `{name}` matches by `{}`; redaction rules match by contains or \
+         regex",
+        .matching.slug()
+    )]
+    BadMatch {
+        name: String,
+        matching: ContentMatch,
+    },
 }
 
 impl PolicyError {
@@ -428,6 +446,7 @@ impl PolicyError {
             PolicyError::BadCodepoints { .. } => "rule_codepoints_bad",
             PolicyError::BadLabel { .. } => "rule_label_bad",
             PolicyError::UnknownRule { .. } => "unknown_rule",
+            PolicyError::BadMatch { .. } => "rule_match_bad",
         }
     }
 
@@ -440,7 +459,7 @@ impl PolicyError {
             | PolicyError::BadPattern { guard, .. }
             | PolicyError::UnknownRule { guard, .. } => *guard,
             PolicyError::BadCodepoints { .. } => Guard::Content,
-            PolicyError::BadLabel { .. } => Guard::Redact,
+            PolicyError::BadLabel { .. } | PolicyError::BadMatch { .. } => Guard::Redact,
         }
     }
 }
@@ -527,7 +546,7 @@ impl RedactPolicy {
         for c in self.custom.iter().filter(|c| !c.disabled) {
             let label = custom_redact(c)?;
             set = set
-                .with_labeled(&c.name, &c.pattern, label.as_deref())
+                .with_rule(&c.name, redact_pattern(c)?, label.as_deref())
                 .map_err(|e| PolicyError::BadPattern {
                     guard: Guard::Redact,
                     name: e.name,
@@ -536,6 +555,32 @@ impl RedactPolicy {
         }
         Ok(set)
     }
+}
+
+/// 一条自定义脱敏规则写的样子和怎么认。码位不是它认的写法
+fn redact_pattern(c: &CustomRedactRule) -> Result<Pattern, PolicyError> {
+    redact_match(&c.pattern, c.matching, c.case_sensitive).ok_or_else(|| PolicyError::BadMatch {
+        name: c.name.clone(),
+        matching: c.matching,
+    })
+}
+
+/// 出站脱敏认的写法：按原样找、正则。码位是 `None`
+pub fn redact_match(
+    pattern: &str,
+    matching: ContentMatch,
+    case_sensitive: bool,
+) -> Option<Pattern> {
+    let regex = match matching {
+        ContentMatch::Contains => false,
+        ContentMatch::Regex => true,
+        ContentMatch::Codepoints => return None,
+    };
+    Some(Pattern {
+        text: pattern.to_string(),
+        regex,
+        case_sensitive,
+    })
 }
 
 /// 一条自定义脱敏规则编得过吗；编得过的话，它在占位符里的标签（不写是 `None`，用
@@ -547,11 +592,13 @@ fn custom_redact(c: &CustomRedactRule) -> Result<Option<String>, PolicyError> {
             name: c.name.clone(),
         });
     }
-    crate::redact::rules::compile(&c.name, &c.pattern).map_err(|e| PolicyError::BadPattern {
-        guard: Guard::Redact,
-        name: c.name.clone(),
-        detail: e.detail,
-    })?;
+    redact_pattern(c)?
+        .compile(&c.name)
+        .map_err(|e| PolicyError::BadPattern {
+            guard: Guard::Redact,
+            name: c.name.clone(),
+            detail: e.detail,
+        })?;
     match &c.label {
         None => Ok(None),
         Some(l) if label_ok(l) => Ok(Some(placeholder_label(l))),
@@ -877,8 +924,12 @@ content:
                 "rule_pattern_empty",
             ),
             (
-                "redact:\n  custom:\n    - { name: a, pattern: '(' }",
+                "redact:\n  custom:\n    - { name: a, pattern: '(', match: regex }",
                 "rule_pattern_bad",
+            ),
+            (
+                "redact:\n  custom:\n    - { name: a, pattern: x, match: codepoints }",
+                "rule_match_bad",
             ),
             (
                 "content:\n  custom:\n    - { name: a, pattern: '[', match: regex }",
@@ -973,7 +1024,7 @@ content:
     #[test]
     fn the_redact_policy_reaches_the_rules_with_labels() {
         let p: RedactPolicy = serde_yaml_ng::from_str(
-            "enable: [internal-ip]\ndisable: [jwt]\ncustom:\n  - { name: 项目号, pattern: 'PRJ-\\d{6}', label: PROJECT }\n  - { name: 停用的, pattern: zzz, disabled: true }\n  - { name: 不写标签, pattern: 'corp_[a-z]{4}' }\n",
+            "enable: [internal-ip]\ndisable: [jwt]\ncustom:\n  - { name: 项目号, pattern: 'PRJ-\\d{6}', match: regex, label: PROJECT }\n  - { name: 停用的, pattern: zzz, disabled: true }\n  - { name: 不写标签, pattern: 'corp_[a-z]{4}', match: regex }\n",
         )
         .unwrap();
         let rs = p.rules().unwrap();
@@ -986,6 +1037,35 @@ content:
             crate::redact::replace::Ledger::new(crate::redact::replace::Scheme::SECRET),
         );
         assert_eq!(r.text, "<<TW_PROJECT_1>> <<TW_SECRET_1>> zzz");
+    }
+
+    /// 不写 `match` 是按原样找：用户填的多半就是那个词，`.`、`*` 不该有特殊含义。不写
+    /// `case_sensitive` 是不分大小写
+    #[test]
+    fn a_redact_rule_looks_for_its_text_as_written_unless_it_says_regex() {
+        let rules = |yaml: &str| {
+            serde_yaml_ng::from_str::<RedactPolicy>(yaml)
+                .unwrap()
+                .rules()
+                .unwrap()
+        };
+        let found = |rs: &RuleSet, text: &str| -> Vec<String> {
+            crate::redact::rules::scan_plain(text, rs)
+                .iter()
+                .filter(|h| h.rule.custom())
+                .map(|h| text[h.bytes.clone()].to_string())
+                .collect()
+        };
+        let plain = rules("custom:\n  - { name: a, pattern: 'a.b*' }\n");
+        assert_eq!(found(&plain, "a.b* A.B* axbb"), ["a.b*", "A.B*"]);
+        let exact = rules("custom:\n  - { name: a, pattern: 'a.b*', case_sensitive: true }\n");
+        assert_eq!(found(&exact, "a.b* A.B* axbb"), ["a.b*"]);
+        let regex = rules("custom:\n  - { name: a, pattern: 'a.b+', match: regex }\n");
+        assert_eq!(found(&regex, "a.b AXBB"), ["a.b", "AXBB"]);
+        let regex = rules(
+            "custom:\n  - { name: a, pattern: 'a.b+', match: regex, case_sensitive: true }\n",
+        );
+        assert_eq!(found(&regex, "a.b AXBB"), ["a.b"]);
     }
 
     #[test]

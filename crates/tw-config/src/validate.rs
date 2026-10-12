@@ -1377,6 +1377,8 @@ groups:
             .map(|(n, pat)| crate::CustomRedactRule {
                 name: n.to_string(),
                 pattern: pat.to_string(),
+                matching: crate::ContentMatch::Regex,
+                case_sensitive: true,
                 label: None,
                 disabled: false,
             })

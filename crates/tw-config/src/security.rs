@@ -48,6 +48,11 @@ pub fn policy_msg(e: &PolicyError) -> Msg {
             "the placeholder name of custom redaction rule `{name}` is `{label}`; it has to be \
              1 to 24 capital letters, digits and underscores, starting with a letter"
         ),
+        PolicyError::BadMatch { name, matching } => msg!(
+            "config.rule_match_bad", name = name.clone(), matching = matching.slug() =>
+            "custom redaction rule `{name}` matches by `{matching}`; redaction rules match by \
+             contains or regex"
+        ),
         PolicyError::UnknownRule { guard, id } => msg!(
             "config.unknown_rule", guard = guard.slug(), rule = id.clone() =>
             "security.{guard} names `{rule}`, which is not a built-in rule"
@@ -89,8 +94,12 @@ mod tests {
                 "config.rule_pattern_empty",
             ),
             (
-                "redact:\n  custom:\n    - { name: a, pattern: '(' }",
+                "redact:\n  custom:\n    - { name: a, pattern: '(', match: regex }",
                 "config.rule_pattern_bad",
+            ),
+            (
+                "redact:\n  custom:\n    - { name: a, pattern: x, match: codepoints }",
+                "config.rule_match_bad",
             ),
             (
                 "content:\n  custom:\n    - { name: a, pattern: 'U+GG', match: codepoints }",

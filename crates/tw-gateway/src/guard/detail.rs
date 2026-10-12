@@ -391,16 +391,27 @@ fn secret_detail(
                 .to_string(),
             pattern: None,
             matching: None,
+            case_sensitive: false,
             core_version: core_version(),
         },
-        Rule::Custom(name) => RuleSnapshot {
-            builtin: false,
-            id: name.to_string(),
-            name: name.to_string(),
-            pattern: rules.custom_pattern(name).map(str::to_string),
-            matching: None,
-            core_version: core_version(),
-        },
+        Rule::Custom(name) => {
+            let p = rules.custom_pattern(name);
+            RuleSnapshot {
+                builtin: false,
+                id: name.to_string(),
+                name: name.to_string(),
+                pattern: p.map(|p| p.text.clone()),
+                matching: p.map(|p| {
+                    if p.regex {
+                        tw_api::ContentMatch::Regex
+                    } else {
+                        tw_api::ContentMatch::Contains
+                    }
+                }),
+                case_sensitive: p.is_some_and(|p| p.case_sensitive),
+                core_version: core_version(),
+            }
+        }
     };
     let outcome_detail = if seen.replaced {
         OutcomeDetail::Replaced {
@@ -526,6 +537,7 @@ pub fn content(src: &Screened<'_>, sc: &tw_guard::content::Screening) -> Vec<Sec
                 name: h.hit.name.clone(),
                 pattern: rule.filter(|r| r.custom).map(|r| r.pattern.clone()),
                 matching: Some(tw_api::ContentMatch::of(h.hit.matching)),
+                case_sensitive: false,
                 core_version: core_version(),
             };
             let outcome_detail = match h.outcome {
@@ -589,6 +601,7 @@ pub fn tool_call(
         name: v.name.clone(),
         pattern: v.custom.then(|| v.pattern.clone()),
         matching: None,
+        case_sensitive: false,
         core_version: core_version(),
     };
     let outcome_detail = if blocked {
