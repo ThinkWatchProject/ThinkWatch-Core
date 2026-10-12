@@ -1431,6 +1431,24 @@ pub(crate) fn is_json(text: &str) -> bool {
         && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
+/// 出站的请求体是不是 JSON：和 [`is_json`] 一样，只是字符串里原样写着的控制字符（换行、
+/// 制表符）不挑 —— 有的客户端这么发，上游也收；把它当成一段话的话，`"seed":42` 里的数值会被
+/// 换成占位符，请求就坏了。落盘打码用严格的 [`is_json`]：那边认不准时宁可多换
+pub(crate) fn json_like(text: &str) -> bool {
+    if is_json(text) {
+        return true;
+    }
+    if !text.trim_start().starts_with(['{', '[', '"']) || !text.bytes().any(|b| b < 0x20) {
+        return false;
+    }
+    // 控制字符换成空格再解一遍：字符串里外都还是合规的样子，结构不变
+    let spaced: String = text
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    serde_json::from_str::<serde::de::IgnoredAny>(&spaced).is_ok()
+}
+
 /// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
 pub(crate) fn json_string_spans(text: &str) -> Vec<Range<usize>> {
     let b = text.as_bytes();
@@ -1504,7 +1522,7 @@ pub(crate) fn scan_unresolved(text: &str, set: &RuleSet) -> Vec<Hit> {
     }
     // **个人号码只在 JSON 的字符串里找**（见下面），私钥块不跨出它所在的那个字符串。不是
     // JSON 的文本（直接拿来扫的一段话）不分里外
-    let json = is_json(text);
+    let json = json_like(text);
     if set.is_on("private-key") {
         private_keys(text, json, &mut out);
     }
@@ -1963,6 +1981,21 @@ mod tests {
             !is_json("[555-1234]") && !is_json("{\"p\":555-1234}"),
             "要合规"
         );
+    }
+
+    /// 出站的请求体字符串里原样写着换行（不合规、上游也收）：照样当 JSON 读，字符串外面的
+    /// 数值不换成占位符
+    #[test]
+    fn a_request_with_raw_newlines_in_strings_is_still_read_as_json() {
+        let rules = RuleSet::none().with_custom("ids", r"\d{6,}").unwrap();
+        let body = "{\"seed\":1234567,\"messages\":[{\"content\":\"line one\nmy id 7654321\"}]}";
+        let got: Vec<&str> = crate::redact::flow::hits(body, &rules)
+            .iter()
+            .map(|h| &body[h.bytes.clone()])
+            .collect();
+        assert_eq!(got, ["7654321"]);
+        assert!(json_like(body) && !is_json(body));
+        assert!(!json_like("[555-1234]") && !json_like("\"quoted\" then\n x"));
     }
 
     #[test]

@@ -2555,3 +2555,145 @@ async fn a_late_frame_of_a_forgotten_answer_does_not_touch_the_current_one() {
         assert_eq!(text, "x  y", "{answers}: {all}");
     }
 }
+
+/// 两次回答，三种上游：
+/// - 0：收尾的 `response.completed` 换了 id（中转站改写过）；
+/// - 1：说到一半来了一个谁都不认得的回答的 `response.failed`，这一次自己的收尾 id 对得上；
+/// - 2：同 0，收尾之前还有 `output_text.done`、`output_item.done`
+async fn rewritten_or_stray_ids(mode: u8) -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(move |mut sock: WebSocket| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(_) = m else { continue };
+                    n += 1;
+                    let d = |d: &str| serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":d});
+                    let item = |id: &str, t: &str| serde_json::json!({"type":"message","id":id,"role":"assistant","content":[{"type":"output_text","text":t}]});
+                    let created = |id: &str| serde_json::json!({"type":"response.created","response":{"id":id,"status":"in_progress","model":"gpt-5","output":[]}});
+                    let usage = serde_json::json!({"input_tokens":11,"output_tokens":7,"total_tokens":18});
+                    let full = format!("t{n} hello secret world tail");
+                    let completed = |id: String, t: &str| serde_json::json!({"type":"response.completed","response":{"id":id,"status":"completed","usage":usage,"output":[item("msg", t)]}});
+                    let frames = match mode {
+                        0 => vec![
+                            created(&format!("resp_A{n}")),
+                            d(&format!("t{n} hello sec")),
+                            d("ret world tail"),
+                            completed(format!("resp_B{n}"), &full),
+                        ],
+                        2 => vec![
+                            created(&format!("resp_A{n}")),
+                            d(&format!("t{n} hello sec")),
+                            d("ret world tail"),
+                            serde_json::json!({"type":"response.output_text.done","output_index":0,"content_index":0,"item_id":"msg","text":full}),
+                            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item("msg", &full)}),
+                            completed(format!("resp_B{n}"), &full),
+                        ],
+                        _ => vec![
+                            created(&format!("resp_{n}")),
+                            d(&format!("t{n} hello sec")),
+                            serde_json::json!({"type":"response.failed","response":{"id":"resp_ghost","status":"failed","output":[item("msg","ghost secret")]}}),
+                            d("ret world tail"),
+                            completed(format!("resp_{n}"), &full),
+                        ],
+                    };
+                    for f in frames {
+                        if sock.send(Message::Text(f.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// 收尾帧换了 id 的算正在答的这一次的（它扣着的尾巴照常交出去、命中和用量记在它那一轮）；
+/// 谁都不认得的回答半路插进来的一帧不碰这一次 —— 不让它收尾、不丢它的用量和命中
+#[tokio::test]
+async fn closing_frames_belong_to_the_answer_in_progress_unless_they_are_strays() {
+    for mode in [0u8, 1, 2] {
+        let up = rewritten_or_stray_ids(mode).await;
+        let (gw, mut rx, _state) = turns_gateway(
+            up,
+            move |cfg| {
+                cfg.security.content = tw_config::ContentPolicy {
+                    mode: SecurityMode::Enforce,
+                    custom: vec![tw_config::CustomContentRule {
+                        name: "r".into(),
+                        pattern: "secret".into(),
+                        scope: vec![tw_config::ContentScope::Response],
+                        matching: Default::default(),
+                        case_sensitive: false,
+                        action: tw_config::ContentAction::Strip,
+                        replacement: "***".into(),
+                        disabled: false,
+                    }],
+                    ..Default::default()
+                };
+            },
+            None,
+        )
+        .await;
+        let mut c = connect(gw).await;
+        let mut answers: Vec<Vec<serde_json::Value>> = Vec::new();
+        for _ in 0..2 {
+            c.send(create("hi")).await.unwrap();
+            let mut frames = Vec::new();
+            loop {
+                let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+                    .await
+                    .expect("the answer did not end")
+                    .expect("the connection closed")
+                    .unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                let done = v["type"] == "response.completed";
+                frames.push(v);
+                if done {
+                    break;
+                }
+            }
+            answers.push(frames);
+        }
+        let all = serde_json::to_string(&answers).unwrap();
+        assert!(!all.contains("secret"), "{mode}: 删掉的字到了客户端：{all}");
+        for (n, frames) in answers.iter().enumerate() {
+            let text: String = frames
+                .iter()
+                .filter(|f| f["type"] == "response.output_text.delta")
+                .map(|f| f["delta"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                text,
+                format!("t{} hello  world tail", n + 1),
+                "{mode}: {all}"
+            );
+        }
+        c.close(None).await.unwrap();
+        let evs = requests(&mut rx, 2).await;
+        for id in started_ids(&evs) {
+            let mine = of(&evs, id);
+            let counts: Vec<u64> = mine
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ContentMatched { count, .. } => Some(*count),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(counts, [1], "{mode}: {evs:?}");
+            assert!(
+                mine.iter()
+                    .any(|e| matches!(e, Event::RequestFinished { usage: Some(_), .. })),
+                "{mode}: 这一轮的用量丢了：{evs:?}"
+            );
+        }
+    }
+}

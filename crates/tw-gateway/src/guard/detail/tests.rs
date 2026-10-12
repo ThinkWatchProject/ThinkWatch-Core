@@ -1053,7 +1053,7 @@ fn an_answer_match_inside_a_ledger_value_shows_no_part_of_it() {
 }
 
 /// 安全日志一个请求要取上千段前后文（每个值五十处、最多一百项）：原值在整份原文里只找一遍，
-/// 不是每一段都从头找。值和原文一起变大四倍，花的时间也是四倍上下，不是十六倍
+/// 不是每一段都从头找。值和原文一起变大八倍，花的时间也是八倍上下，不是六十四倍
 #[test]
 fn reported_items_on_a_large_body_cost_linear_time() {
     fn run(values: usize, filler_kib: usize) -> std::time::Duration {
@@ -1091,12 +1091,19 @@ fn reported_items_on_a_large_body_cost_linear_time() {
         assert_eq!(items.len(), values);
         took
     }
-    let fastest = |v, k| (0..3).map(|_| run(v, k)).min().unwrap();
-    let small = fastest(25, 64);
-    let large = fastest(100, 256);
+    // 两种大小交替各跑五遍、各取中位数：并行跑的测试抢 CPU 时，一阵忙落在哪一遍上都不至于
+    // 左右结论。八倍大小：线性的 8 倍上下，每一段都整份找一遍的是 64 倍
+    let (mut s, mut l) = (Vec::new(), Vec::new());
+    for _ in 0..5 {
+        s.push(run(10, 32));
+        l.push(run(80, 256));
+    }
+    s.sort_unstable();
+    l.sort_unstable();
+    let (small, large) = (s[2], l[2]);
     let ratio = large.as_secs_f64() / small.as_secs_f64();
     assert!(
-        ratio < 10.0,
-        "四倍大小花了 {ratio:.1} 倍（{small:?} → {large:?}）：每一段前后文都把整份原文找了一遍"
+        ratio < 24.0,
+        "八倍大小花了 {ratio:.1} 倍（{small:?} → {large:?}）：每一段前后文都把整份原文找了一遍"
     );
 }

@@ -665,6 +665,83 @@ struct Pipes {
     answered: std::collections::VecDeque<Answered>,
     /// 这一次回答（`answer`）的命中挂在哪一行：它开始时在前头的那一轮
     answer_of: u64,
+    /// 哪一次回答的帧算谁的（见 [`Owner`]）
+    owner: Owner,
+}
+
+/// 上游带着回答 id 的一帧算哪一次回答的。
+///
+/// 有的中转站会改写回答 id（`response.created` 是一个，收尾的 `response.completed` 是另一个），
+/// 所以**不能只看 id 对不对得上**：一次回答正在答的时候来的收尾帧算它的，除非那个 id 认得出
+/// 是一次已经收了尾的回答的。认不出的 id 看这条连接上的上游的习惯：收尾帧换过 id 的，认不出的
+/// 也算正在答的这一次；id 一直对得上的，认不出的就是别的回答的。还没见过收尾时，认不出的
+/// `response.completed` 算这一次的（改写了 id），`response.failed`、`response.incomplete` 不算
+/// （多半是哪次早先报了 `error` 的回答补来的）。
+///
+/// 算别的回答的那一帧不碰此刻这一轮：不记进这一轮、不让它收尾、不过回答钩子、不碰这一次回答
+/// 的过滤（[`filter_late`]）。
+#[derive(Debug, Default)]
+struct Owner {
+    /// 有一次回答正在答（`response.created` 之后、收尾之前）
+    open: bool,
+    /// 这条连接上的上游会不会改写回答 id：见过的收尾帧说了算，没见过是 `None`
+    rewrites: Option<bool>,
+    /// 收了尾的回答的 id，最近 [`ENDED_IDS`] 个
+    ended: std::collections::VecDeque<String>,
+    ended_set: std::collections::HashSet<String>,
+}
+
+/// 记着多少个收了尾的回答的 id（[`Owner`]）
+const ENDED_IDS: usize = 1024;
+
+impl Owner {
+    /// `kind` 这一帧（带着回答 `id`）是不是别的回答的。`current` 是正在答（或者刚答完）的
+    /// 这一次回答在 `response.created` 里的 id
+    fn foreign(&self, kind: &str, id: Option<&str>, current: Option<&str>) -> bool {
+        let Some(id) = id.filter(|_| lifecycle(kind) && kind != "response.created") else {
+            return false;
+        };
+        if Some(id) == current {
+            return false;
+        }
+        if self.ended_set.contains(id) || !self.open {
+            return true;
+        }
+        match self.rewrites {
+            Some(rewrites) => !rewrites,
+            None => matches!(kind, "response.failed" | "response.incomplete"),
+        }
+    }
+
+    /// 算这一次回答的一帧过去了：开头、收尾记下来
+    fn saw(&mut self, kind: Option<&str>, id: Option<&str>, current: Option<&str>) {
+        match kind {
+            Some("response.created") => self.open = true,
+            Some("response.completed" | "response.failed" | "response.incomplete") => {
+                if id.is_some() {
+                    let rewritten = id != current;
+                    self.rewrites = Some(self.rewrites == Some(true) || rewritten);
+                }
+                self.end(current);
+                self.end(id);
+            }
+            Some("error") => self.end(current),
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, id: Option<&str>) {
+        self.open = false;
+        let Some(id) = id else { return };
+        if self.ended_set.insert(id.to_string()) {
+            self.ended.push_back(id.to_string());
+            if self.ended.len() > ENDED_IDS
+                && let Some(old) = self.ended.pop_front()
+            {
+                self.ended_set.remove(&old);
+            }
+        }
+    }
 }
 
 impl Pipes {
@@ -866,6 +943,7 @@ pub(crate) async fn proxy(
         answer: None,
         answered: std::collections::VecDeque::new(),
         answer_of: 0,
+        owner: Owner::default(),
     };
     pump(state.clone(), client, up, &mut p, ending).await;
     // 连接断在一次回答中间：这次回答里已经认定的命中照样报
@@ -1512,19 +1590,32 @@ async fn upstream_text(
         .as_mut()
         .zip(response.as_deref().zip(kind.as_deref()))
         .and_then(|(turns, (id, kind))| turns.late(id, kind));
+    // 别的回答的一帧（见 [`Owner`]）：和收了尾的那一轮补来的一样，不碰此刻这一轮
+    let foreign = late.is_none()
+        && p.turns.is_some()
+        && kind.as_deref().is_some_and(|k| {
+            p.owner
+                .foreign(k, response.as_deref(), p.response.as_deref())
+        });
     match late {
         Some(true) => return Flow::Sent,
         Some(false) => {}
+        None if foreign => {}
         None => {
             if let Some(turn) = p.turns.as_mut().and_then(turn::Turns::front) {
                 turn.upstream(t, kind.as_deref(), response.as_deref());
             }
         }
     }
-    let flow = relay(state, p, t, kind.as_deref(), late.is_some(), c_tx).await;
+    let theirs = late.is_some() || foreign;
+    let flow = relay(state, p, t, kind.as_deref(), theirs, c_tx).await;
+    if !theirs {
+        p.owner
+            .saw(kind.as_deref(), response.as_deref(), p.response.as_deref());
+    }
     if let Some(turns) = p.turns.as_mut() {
         match &flow {
-            Flow::Sent if late.is_none() && ends_turn(kind.as_deref()) => turns.finish_front(),
+            Flow::Sent if !theirs && ends_turn(kind.as_deref()) => turns.finish_front(),
             Flow::End(End::Cut(why)) => {
                 turns.fail_front(tw_api::FailureSource::Denied, why.clone())
             }
@@ -1619,7 +1710,7 @@ async fn forward(
         kind,
         Some("response.completed" | "response.failed" | "response.incomplete")
     );
-    // 收了尾的那一次回答又来的一帧不是此刻这一次的边界
+    // 收了尾的那一次回答又来的一帧、别的回答的一帧（见 [`Owner`]）不是此刻这一次的边界
     if late {
         // 原样往下走
     } else if kind == Some("response.created") {
@@ -1679,15 +1770,9 @@ async fn forward(
     };
     // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的。收了尾的
     // 那一次回答又来的一帧也过（上游先报 `error` 再补一个带着整段正文的 `response.failed`）
-    // 带着另一次回答的 id 的收尾帧（认不出是哪一轮的、早过了记着的那几轮的）也按它自己的
-    // 过滤处理：不管在不在那几轮里，**都不碰此刻这一次回答的路**
-    let theirs = response_id(&restored);
-    let foreign = kind.is_some_and(|k| lifecycle(k) && k != "response.created")
-        && p.response.is_some()
-        && theirs.is_some()
-        && theirs != p.response;
-    let outgoing = if late || foreign {
-        filter_late(state, p, outgoing, theirs.as_deref())
+    // 别的回答的一帧（见 [`Owner`]）也按它自己的过滤处理：**不碰此刻这一次回答的路**
+    let outgoing = if late {
+        filter_late(state, p, outgoing, response_id(&restored).as_deref())
     } else {
         let out = match p.answer.as_mut() {
             Some(f) => filter_answer(f, outgoing),

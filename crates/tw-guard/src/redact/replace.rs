@@ -455,7 +455,7 @@ impl<'l> ValueSpans<'l> {
                 if let Some(content) = text.get(span.clone()).filter(|c| !c.is_empty()) {
                     // 不是一整段 JSON 的上面已经整段找过：没有转义的字符串不用再找
                     if whole_json || content.contains('\\') {
-                        in_string(finder, content, &|i| span.start + i, 1, &mut found);
+                        in_string(finder, content, &|i| span.start + i, &mut found);
                     }
                 }
             }
@@ -463,19 +463,8 @@ impl<'l> ValueSpans<'l> {
         if found.is_empty() {
             return Self::default();
         }
-        // 压在已经写着的占位符上的不算：按起点排好，每一处二分查一次
-        let ours: Vec<Range<usize>> = ledger
-            .scheme
-            .find_in(text)
-            .into_iter()
-            .map(|(r, _, _)| r)
-            .collect();
         found.retain(|(r, _)| {
-            let k = ours.partition_point(|o| o.end <= r.start);
-            !ours.get(k).is_some_and(|o| o.start < r.end)
-                && text.is_char_boundary(r.start)
-                && text.is_char_boundary(r.end)
-                && r.start < r.end
+            text.is_char_boundary(r.start) && text.is_char_boundary(r.end) && r.start < r.end
         });
         found.sort_by_key(|(r, _)| (r.start, std::cmp::Reverse(r.end)));
         let mut merged: Vec<(Range<usize>, usize)> = Vec::with_capacity(found.len());
@@ -485,12 +474,33 @@ impl<'l> ValueSpans<'l> {
                 _ => merged.push((r, v)),
             }
         }
-        Self {
-            spans: merged
-                .into_iter()
-                .filter_map(|(r, v)| Some((r, finder.placeholders.get(v)?.as_str())))
-                .collect(),
+        // 已经写着的占位符里面不动：和它重叠的那一截让开，剩下的照样换 —— 整处不换的话，
+        // 挨着占位符的那一截原值就原样留着（`<<` 是原值时的 `<<<<TW_SECRET_6>>`）。占位符的
+        // 两头是 ASCII，切口落在字符边界上
+        let ours: Vec<Range<usize>> = ledger
+            .scheme
+            .find_in(text)
+            .into_iter()
+            .map(|(r, _, _)| r)
+            .collect();
+        let mut spans = Vec::with_capacity(merged.len());
+        for (r, v) in merged {
+            let Some(p) = finder.placeholders.get(v).map(String::as_str) else {
+                continue;
+            };
+            let mut from = r.start;
+            let k = ours.partition_point(|o| o.end <= r.start);
+            for o in ours[k..].iter().take_while(|o| o.start < r.end) {
+                if o.start > from {
+                    spans.push((from..o.start, p));
+                }
+                from = from.max(o.end);
+            }
+            if from < r.end {
+                spans.push((from..r.end, p));
+            }
         }
+        Self { spans }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -527,36 +537,54 @@ const UNESCAPE_DEPTH: usize = 6;
 
 /// 一个 JSON 字符串引号里面的一段（`content`，转义着的，`to` 把它里面的位置换回整段文字
 /// 里的）：解开一层找原值；解开之后还有反斜杠的（一段 JSON、转义过两遍的字），整段再解一层，
-/// 最多 [`UNESCAPE_DEPTH`] 层
+/// 最多 [`UNESCAPE_DEPTH`] 层。
+///
+/// **一层一层往下解，只留着这一层**：位置的对照每解一层就并成「这一层 → `content`」的一张，
+/// 上一层的字和对照随即放掉；哪一层什么都没解开（`\q` 这类不成样子的转义）就停。几 MB 满是
+/// 反斜杠的字符串，每一层都留着的话要上百 MB
 fn in_string(
     finder: &ValueFinder,
     content: &str,
     to: &dyn Fn(usize) -> usize,
-    depth: usize,
     out: &mut Vec<(Range<usize>, usize)>,
 ) {
-    if !content.contains('\\') {
-        // 没有转义：解开就是它自己，里面也不会有带引号的字符串
+    if !content.contains('\\') || u32::try_from(content.len()).is_err() {
+        // 没有转义：解开就是它自己
         finder.find_all(content, to, out);
         return;
     }
-    let (plain, at) = unescape_mapped(content);
-    let back = |i: usize| to(at.get(i).copied().unwrap_or(content.len()));
-    finder.find_all(&plain, &back, out);
-    if depth < UNESCAPE_DEPTH && plain.contains('\\') {
-        // 整段再解：引号里面的照解，引号外面没有转义的字解出来还是它自己
-        in_string(finder, &plain, &back, depth + 1, out);
+    let Some((mut plain, mut at)) = unescape_mapped(content) else {
+        finder.find_all(content, to, out);
+        return;
+    };
+    let back = |at: &[u32], i: usize| to(at.get(i).map_or(content.len(), |&p| p as usize));
+    finder.find_all(&plain, &|i| back(&at, i), out);
+    for _ in 1..UNESCAPE_DEPTH {
+        if !plain.contains('\\') {
+            break;
+        }
+        let Some((next, mut inner)) = unescape_mapped(&plain) else {
+            break;
+        };
+        // 并成一张：这一层的位置 → 上一层的 → `content` 的
+        for p in &mut inner {
+            *p = at.get(*p as usize).copied().unwrap_or(content.len() as u32);
+        }
+        (plain, at) = (next, inner);
+        finder.find_all(&plain, &|i| back(&at, i), out);
     }
 }
 
 /// JSON 字符串引号里面的一段解开一层转义：解出来的字，和它每个字节（含末尾）在 `s` 里从哪儿
-/// 起。不成样子的转义（`\q`、半个 `\u`）照原样留着；落单的代理项解成 U+FFFD
-fn unescape_mapped(s: &str) -> (String, Vec<usize>) {
+/// 起。不成样子的转义（`\q`、半个 `\u`）照原样留着；落单的代理项解成 U+FFFD。一个转义都没
+/// 解开的是 `None`（解出来就是它自己）。`s` 不超过 4 GiB（调用方查过）
+fn unescape_mapped(s: &str) -> Option<(String, Vec<u32>)> {
     let mut out = String::with_capacity(s.len());
-    let mut at: Vec<usize> = Vec::with_capacity(s.len() + 1);
-    let push = |out: &mut String, at: &mut Vec<usize>, c: char, from: usize| {
+    let mut at: Vec<u32> = Vec::with_capacity(s.len() + 1);
+    let mut changed = false;
+    let push = |out: &mut String, at: &mut Vec<u32>, c: char, from: usize| {
         out.push(c);
-        at.extend(std::iter::repeat_n(from, c.len_utf8()));
+        at.extend(std::iter::repeat_n(from as u32, c.len_utf8()));
     };
     let hex = |i: usize| {
         s.get(i..i + 4)
@@ -583,6 +611,7 @@ fn unescape_mapped(s: &str) -> (String, Vec<usize>) {
         };
         if let Some(d) = simple {
             push(&mut out, &mut at, d, i);
+            changed = true;
             i += 2;
             continue;
         }
@@ -606,10 +635,11 @@ fn unescape_mapped(s: &str) -> (String, Vec<usize>) {
             _ => (char::from_u32(u), 6),
         };
         push(&mut out, &mut at, c.unwrap_or('\u{FFFD}'), i);
+        changed = true;
         i += len;
     }
-    at.push(s.len());
-    (out, at)
+    at.push(s.len() as u32);
+    changed.then_some((out, at))
 }
 
 /// 一次性还原一份 **JSON 原文**（非流式响应、WebSocket 的一帧、存下来的回答）：原值按它
@@ -804,6 +834,34 @@ mod tests {
             hide_values("{\"p\":84721937-1}", &ledger, Form::Json),
             "{\"p\":<<TW_SECRET_2>>-1}",
             "不合规的 JSON 当一段文字"
+        );
+    }
+
+    /// 一处原值和已经写着的占位符重叠：重叠的那一截让开，剩下的照样换
+    #[test]
+    fn a_value_touching_a_placeholder_is_masked_outside_it() {
+        let ledger = ledger_of(&["<<"]);
+        let p = ledger.placeholder_of("<<").unwrap().to_string();
+        assert_eq!(
+            hide_values("<<<<TW_SECRET_6>><<", &ledger, Form::Text),
+            format!("{p}<<TW_SECRET_6>>{p}")
+        );
+    }
+
+    /// 满是不成样子的转义（`\q`）的字符串解一层就停：解不开的不再往下解；里面的原值照样找得到
+    #[test]
+    fn strings_full_of_bogus_escapes_are_decoded_once() {
+        let ledger = ledger_of(&["hunter2"]);
+        let body = format!("{{\"x\":\"{} hunter2 \\\"pw\\\"\"}}", "\\q".repeat(100_000));
+        let started = std::time::Instant::now();
+        let out = hide_values(&body, &ledger, Form::Json);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(out.contains("<<TW_SECRET_1>>") && !out.contains("hunter2"));
+        // 一层都没解开的字符串原样找
+        let plain = format!("{{\"x\":\"{}hunter2\"}}", "\\q".repeat(10));
+        assert_eq!(
+            hide_values(&plain, &ledger, Form::Json),
+            format!("{{\"x\":\"{}<<TW_SECRET_1>>\"}}", "\\q".repeat(10))
         );
     }
 
