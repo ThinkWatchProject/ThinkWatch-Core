@@ -1422,107 +1422,13 @@ fn json_safe(text: &str, m: Range<usize>) -> Option<Range<usize>> {
     (end > m.start).then_some(m.start..end)
 }
 
-/// `text` 是不是一整段 JSON（请求体、存下来的回答）。**看开头不够**：解码过的正文也可能以
-/// 引号、括号开头（`"quoted" then MYCORP-222222`、`[1] …`），当成 JSON 的话只在引号里面
-/// 找，引号外面的值就漏了。
-///
-/// 照 JSON 的结构走一遍，不建树、不解字符串；只是字符串里的控制字符不挑（有的客户端把
-/// 换行原样写进字符串，那也还是它要发的 JSON）
+/// `text` 是不是一整段合规的 JSON（请求体、存下来的回答）。**看开头不够**：解码过的正文也
+/// 可能以引号、括号开头（`"quoted" then MYCORP-222222`、`[555-1234]`），当成 JSON 的话只在
+/// 引号里面找，引号外面的值就漏了。开头像的才真的解一遍（不建树）；一个光秃秃的数也是 JSON，
+/// 可那是一段话（「620102198811110554」）
 pub(crate) fn is_json(text: &str) -> bool {
-    // 一个光秃秃的数也是 JSON，可那是一段话（「620102198811110554」）
-    text.trim_start().starts_with(['{', '[', '"']) && json_shape(text.as_bytes()).is_some()
-}
-
-fn json_shape(b: &[u8]) -> Option<()> {
-    enum Want {
-        Value,
-        Key,
-        Colon,
-        Next,
-    }
-    let skip_ws = |i: &mut usize| {
-        while b.get(*i).is_some_and(u8::is_ascii_whitespace) {
-            *i += 1;
-        }
-    };
-    // 引号起，交回收尾的引号后面
-    let string = |i: usize| {
-        let mut j = i + 1;
-        while *b.get(j)? != b'"' {
-            j += if b[j] == b'\\' { 2 } else { 1 };
-        }
-        Some(j + 1)
-    };
-    let mut stack: Vec<u8> = Vec::new();
-    let mut want = Want::Value;
-    let mut i = 0;
-    loop {
-        skip_ws(&mut i);
-        match want {
-            Want::Value => {
-                match *b.get(i)? {
-                    open @ (b'{' | b'[') => {
-                        stack.push(open);
-                        i += 1;
-                        skip_ws(&mut i);
-                        let close = if open == b'{' { b'}' } else { b']' };
-                        if b.get(i) == Some(&close) {
-                            stack.pop();
-                            i += 1;
-                            want = Want::Next;
-                        } else {
-                            want = if open == b'{' { Want::Key } else { Want::Value };
-                        }
-                        continue;
-                    }
-                    b'"' => i = string(i)?,
-                    c if c == b'-' || c.is_ascii_digit() => {
-                        i += 1;
-                        while b
-                            .get(i)
-                            .is_some_and(|c| c.is_ascii_digit() || b".eE+-".contains(c))
-                        {
-                            i += 1;
-                        }
-                    }
-                    _ => {
-                        let word = [&b"true"[..], b"false", b"null"]
-                            .into_iter()
-                            .find(|w| b.get(i..i + w.len()) == Some(w))?;
-                        i += word.len();
-                    }
-                }
-                want = Want::Next;
-            }
-            Want::Key => {
-                (b.get(i) == Some(&b'"')).then_some(())?;
-                i = string(i)?;
-                want = Want::Colon;
-            }
-            Want::Colon => {
-                (b.get(i) == Some(&b':')).then_some(())?;
-                i += 1;
-                want = Want::Value;
-            }
-            Want::Next => {
-                let Some(&open) = stack.last() else {
-                    return (i == b.len()).then_some(());
-                };
-                let close = if open == b'{' { b'}' } else { b']' };
-                match *b.get(i)? {
-                    b',' => {
-                        i += 1;
-                        want = if open == b'{' { Want::Key } else { Want::Value };
-                    }
-                    c if c == close => {
-                        stack.pop();
-                        i += 1;
-                    }
-                    _ => return None,
-                }
-            }
-        }
-    }
+    text.trim_start().starts_with(['{', '[', '"'])
+        && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
 /// 一段 JSON 原文里每个字符串引号里面的那一段，按先后
@@ -2054,8 +1960,8 @@ mod tests {
         assert!(!is_json("\"quoted\" then") && !is_json("{ see }") && !is_json("[1] x"));
         assert!(!is_json("620102198811110554"), "光秃秃的一个数是一段话");
         assert!(
-            is_json("{\"a\":\"line1\nline2\"}"),
-            "字符串里原样的换行不挑"
+            !is_json("[555-1234]") && !is_json("{\"p\":555-1234}"),
+            "要合规"
         );
     }
 
@@ -2071,8 +1977,7 @@ mod tests {
         .to_string();
         assert!(found(&body).is_empty(), "{:?}", found(&body));
         // 头在一个字符串里、END 在下一个字符串里也不算
-        let body = r#"{"a":"-----BEGIN RSA PRIVATE KEY-----
-MIIEow","b":"-----END RSA PRIVATE KEY-----"}"#;
+        let body = r#"{"a":"-----BEGIN RSA PRIVATE KEY-----\nMIIEow","b":"-----END RSA PRIVATE KEY-----"}"#;
         assert!(found(body).is_empty(), "{:?}", found(body));
     }
 

@@ -280,6 +280,64 @@ fn a_lane_split_over_fields_is_filtered_once_and_split_back_where_the_text_was()
     assert_eq!(lane.whole_split(&["ab", "", "cd"]), ["ab", "", "cd"]);
 }
 
+/// 开头连着删了几处：交出去都在开头，都不算接缝。流着的照样多扣 `reach` 个字，不比整份的
+/// 早发一个字
+#[test]
+fn deletions_at_the_very_start_do_not_send_text_early() {
+    let a = answer(vec![rule("p", "(?s).[^ ]", Match::Regex, Action::Strip)]);
+    for pieces in [
+        &["abcdefg k", "hijklmn"][..],
+        &["abcdefg k", "hijklm"],
+        &["ab c k", "defg"],
+        &["c k", "abc"],
+        &["abc k", "abc"],
+        &["abc k", "a"],
+        &["abc ", "kabc"],
+    ] {
+        let whole = whole_text(&a, true, &pieces.concat());
+        assert_eq!(streamed(&a, true, pieces), whole, "{pieces:?}");
+    }
+}
+
+/// 换成非空的替换文本不留接缝：要看前后一个字的规则不因为换上去的字再认一遍、一个字一个字
+/// 地换下去。整份的和流式的一样
+#[test]
+fn a_replacement_next_to_a_word_boundary_is_not_eaten_further() {
+    for (pattern, with, text, want) in [
+        (
+            r"\d{4}\b",
+            "****",
+            "card 4111111111111111 ok".to_string(),
+            "card 411111111111**** ok".to_string(),
+        ),
+        (
+            r"\w\b",
+            "[x]",
+            "hello world".to_string(),
+            "hell[x] worl[x]".to_string(),
+        ),
+        (
+            r"\w\b",
+            "[x]",
+            format!("{} and the rest", "a".repeat(300)),
+            format!("{}[x] an[x] th[x] res[x]", "a".repeat(299)),
+        ),
+    ] {
+        let a = answer(vec![RuleInput {
+            case_sensitive: true,
+            replacement: with,
+            ..rule("r", pattern, Match::Regex, Action::Replace)
+        }]);
+        assert_eq!(whole_text(&a, true, &text), want, "{pattern}");
+        for size in [1, 7, 10_000] {
+            let chars: Vec<char> = text.chars().collect();
+            let pieces: Vec<String> = chars.chunks(size).map(|c| c.iter().collect()).collect();
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            assert_eq!(streamed(&a, true, &refs), want, "{pattern} {size}");
+        }
+    }
+}
+
 #[test]
 fn case_variants_beyond_ascii_are_the_same_word() {
     // 开尔文符号 K 和 k、带重音的大小写、希腊字母的 Σ 和 σ
@@ -460,7 +518,10 @@ fn reference(a: &Answer, text: &str) -> (String, Vec<Range<usize>>) {
             if !w.is_empty() {
                 next.push(at..at + w.len());
             }
-            seams.extend([at, at + w.len()]);
+            // 只有删掉字的地方是接缝：换上去的替换文本两头不算
+            if w.is_empty() {
+                seams.push(at);
+            }
             delta += w.len() as isize - r.len() as isize;
         }
         next.extend(
@@ -485,6 +546,11 @@ fn reference(a: &Answer, text: &str) -> (String, Vec<Range<usize>>) {
         }
     }
     (t, kept)
+}
+
+/// 这条规则要不要看命中前后的一个字（`\b`、`$` 这类断言）
+fn looks(r: &AnswerRule) -> bool {
+    r.matching == Match::Regex && regex_hold(r.pattern.trim(), !r.case_sensitive).2
 }
 
 /// 每个位置上（从那儿起）的那一处命中，空的不算。互相重叠的都在
@@ -515,7 +581,7 @@ fn agree(
         let (want, kept) = reference(a, text);
         assert_eq!(whole, want, "{text:?} {why}");
         // 要看前后一个字的不查：这一路的开头、结尾不算接缝（见 `Pass::piece`）
-        for r in a.rules.iter().filter(|r| r.action.edits() && !r.looks) {
+        for r in a.rules.iter().filter(|r| r.action.edits() && !looks(r)) {
             let left: Vec<_> = every_match(&r.re, &want)
                 .into_iter()
                 .filter(|m| !overlapping(&kept, m))
@@ -553,7 +619,7 @@ fn agree(
         for r in a
             .rules
             .iter()
-            .filter(|r| r.action == Action::Strip && !r.looks)
+            .filter(|r| r.action == Action::Strip && !looks(r))
         {
             assert!(
                 r.re.find(&out).is_none(),

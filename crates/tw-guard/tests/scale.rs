@@ -152,3 +152,31 @@ fn hiding_tens_of_thousands_of_values_costs_linear_time() {
         "4 万个值花了 1 万个值的 {ratio:.1} 倍（{small:?} → {large:?}）：落盘前打码不再是线性的"
     );
 }
+
+/// 原值一个套一个：`\d{6,}` 认出来的一串串 1，长度 6 到 `6 + k`。正文长度是 k² 级的；每个
+/// 位置只取最长的那一个，打码的花费跟着正文走（四倍的 k 是十六倍的正文），不是正文 × 值的
+/// 个数（六十四倍），也不占上 G 的内存
+fn nested_runs(k: usize) -> Duration {
+    let rules = RuleSet::none().with_custom("ids", r"\d{6,}").unwrap();
+    let content: String = (6..6 + k).map(|l| format!("{} ", "1".repeat(l))).collect();
+    let body = json!({"messages": [{"role": "user", "content": content}]}).to_string();
+    let (_, ledger) = flow::look(Mode::Enforce, &rules, body.as_bytes());
+    assert_eq!(ledger.len(), k);
+    let started = Instant::now();
+    let out = replace::hide_values(&body, &ledger, replace::Form::Json);
+    let took = started.elapsed();
+    assert!(!out.contains("111111"));
+    took
+}
+
+#[test]
+fn nested_values_are_hidden_in_time_linear_in_the_text() {
+    let fastest = |k| (0..3).map(|_| nested_runs(k)).min().unwrap();
+    let small = fastest(100);
+    let large = fastest(400);
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    assert!(
+        ratio < 32.0,
+        "十六倍的正文花了 {ratio:.1} 倍（{small:?} → {large:?}）：一个套一个的原值在一处处地列"
+    );
+}

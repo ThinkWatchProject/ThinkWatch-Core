@@ -2459,3 +2459,99 @@ async fn new_text_in_a_late_frame_is_reported_on_its_own_answer() {
     assert_eq!(counts(ids[0]), [1, 1], "{evs:?}");
     assert!(counts(ids[1]).is_empty(), "{evs:?}");
 }
+
+/// `answers - 1` 次回答都在 `error` 那一帧收尾；最后一次说到一半时，第一次补来一个带着整段
+/// 正文的 `response.failed`
+async fn many_errors_then_a_late_frame(answers: usize) -> SocketAddr {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        axum::routing::any(move |ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(move |mut sock: WebSocket| async move {
+                let mut n = 0;
+                while let Some(Ok(m)) = sock.recv().await {
+                    let Message::Text(_) = m else { continue };
+                    n += 1;
+                    let delta = |d: &str| serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg","delta":d});
+                    let item = |id: &str, t: &str| serde_json::json!({"type":"message","id":id,"role":"assistant","content":[{"type":"output_text","text":t}]});
+                    let created = |id: String| serde_json::json!({"type":"response.created","response":{"id":id,"status":"in_progress","model":"gpt-5","output":[]}});
+                    let frames = if n < answers {
+                        vec![
+                            created(format!("resp_{n}")),
+                            delta(&format!("ans{n} ok")),
+                            serde_json::json!({"type":"error","error":{"type":"server_error","message":"boom"},"response_id":format!("resp_{n}")}),
+                        ]
+                    } else {
+                        vec![
+                            created(format!("resp_{n}")),
+                            delta("x sec"),
+                            serde_json::json!({"type":"response.failed","response":{"id":"resp_1","status":"failed","output":[item("msg", "ans1 ok")]}}),
+                            delta("ret y"),
+                            serde_json::json!({"type":"response.completed","response":{"id":format!("resp_{n}"),"status":"completed","output":[item("msg", "x secret y")]}}),
+                        ]
+                    };
+                    for f in frames {
+                        if sock.send(Message::Text(f.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    addr
+}
+
+/// 补来的收尾帧是哪一次回答的认不出来（早过了记着的那几轮）也不碰此刻这一次的路：此刻扣着的
+/// 「sec」不被它提前交出去
+#[tokio::test]
+async fn a_late_frame_of_a_forgotten_answer_does_not_touch_the_current_one() {
+    for answers in [3usize, 9, 11] {
+        let up = many_errors_then_a_late_frame(answers).await;
+        let gw = stripping_gateway(up, "secret").await;
+        let mut c = connect(gw).await;
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        for i in 1..=answers {
+            c.send(create("hi")).await.unwrap();
+            let end = if i < answers {
+                "error"
+            } else {
+                "response.completed"
+            };
+            loop {
+                let m = tokio::time::timeout(Duration::from_secs(5), c.next())
+                    .await
+                    .expect("the answer did not end")
+                    .expect("the connection closed")
+                    .unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(t) = m else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                let done = v["type"] == end;
+                frames.push(v);
+                if done {
+                    break;
+                }
+            }
+        }
+        let all = serde_json::to_string(&frames).unwrap();
+        assert!(
+            !all.contains("secret"),
+            "{answers}: 删掉的字到了客户端：{all}"
+        );
+        let last = format!("resp_{answers}");
+        let created = frames
+            .iter()
+            .position(|f| f["type"] == "response.created" && f["response"]["id"] == last.as_str())
+            .unwrap();
+        let text: String = frames[created..]
+            .iter()
+            .filter(|f| f["type"] == "response.output_text.delta")
+            .map(|f| f["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "x  y", "{answers}: {all}");
+    }
+}

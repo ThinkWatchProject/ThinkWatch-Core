@@ -19,15 +19,17 @@
 //! # 删过的地方再查，直到删干净
 //!
 //! 删掉一处之后，前后的字挨上了，可能又接成一处：`sesecretcret` 删掉中间的 `secret`，剩下的
-//! 又是 `secret`。和请求那边一样，**删到不再冒出新命中为止**：删过、换过的字交给下一遍
-//! （`Pass`），下一遍只在改过的地方（接缝）附近再找 —— 一处命中要用到的字里没有接缝，它在
+//! 又是 `secret`。和请求那边一样，**删到不再冒出新命中为止**：改过的字交给下一遍
+//! （`Pass`），下一遍只在删过字的地方（接缝）附近再找 —— 一处命中要用到的字里没有接缝，它在
 //! 上一遍就在，上一遍认得出就已经改掉了。替换上去的字是规则写的，不再查。第一遍之后又过了
 //! [`MAX_ROUNDS`] 遍还在改字的只能是刻意一层套一层写出来的：从还在改的那一处起这一路不再发，
 //! 前面的照发（请求那边是那一段整段删掉）。
 //!
-//! 两样不再查：用到开头、结尾的规则（`^`、`$`、`\A`、`\z`）只在模型的原文上查一遍；删在这一路
-//! 开头、末尾的地方不算接缝。删掉末尾的一个字，`(?s).\z`、`.\b` 又认得出前一个字，一路删下去
-//! 整段就没了，而流着的那边早就发出去了 —— 两边都不这么删，整份的和流式的才一样。
+//! 三样不再查：用到开头、结尾的规则（`^`、`$`、`\A`、`\z`）只在模型的原文上查一遍；删在这一路
+//! 开头、末尾的地方不算接缝；换成非空的替换文本的地方不算接缝。删掉末尾的一个字，`(?s).\z`、
+//! `.\b` 又认得出前一个字；`\w\b` 换成 `[x]` 之后，前一个字后面也成了词的边界 —— 再查就一个字
+//! 一个字地删、换下去，整段就没了，而流着的那边早就发出去了。两边都不这么做，整份的和流式的
+//! 才一样。
 //!
 //! 接出来的命中起点最远在接缝前 `reach` 个字（会改字的规则要扣的取大的）。所以会改字的时候，
 //! 最后一遍发给客户端的再多扣 `reach` 个字：以后哪儿删了字，接缝前面这些字还在手里。
@@ -78,11 +80,9 @@ pub struct Answer {
     /// 有没有会改字的规则（删除、替换）。没有的话不用扣
     edits: bool,
     /// 删过字的地方（接缝）前面要多扣几个字：接缝前后的字可能接成一处新命中，起点最远在接缝
-    /// 前这么多个字（会改字的规则要扣的取大的）。改动不会留下接缝的（都是换成非空的替换
-    /// 文本、又没有要看前后字的正则）是 0
+    /// 前这么多个字（会改字的规则要扣的取大的）。改动都是换成非空的替换文本的是 0：只有删掉
+    /// 字才留下接缝
     reach: usize,
-    /// 会改字的规则里有要看前后一个字的（`\b`、`$`）：替换文本两头也是接缝
-    looks: bool,
 }
 
 #[derive(Debug)]
@@ -102,8 +102,6 @@ struct AnswerRule {
     /// 一处命中最长多少个字算得出来、也不超过 [`REGEX_HOLD_MAX`]。算不出的那种，一处命中
     /// 碰到了收到的末尾就可能还在长
     bounded: bool,
-    /// 要看命中前后的一个字（`\b`、`$` 这类断言）
-    looks: bool,
     /// 用到了正文或者一行的开头、结尾（`^`、`$`、`\A`、`\z`）：只在模型的原文上查一遍，
     /// 删过之后不再查 —— 删掉末尾的一个字，前一个字就成了末尾，一路删下去整段就没了
     anchored: bool,
@@ -127,10 +125,10 @@ impl Answer {
         let editing = || out.iter().filter(|r| r.action.edits());
         // 删过之后再查的：会改字、没有锚点的
         let again = || editing().filter(|r| !r.anchored);
-        let looks = again().any(|r| r.looks);
-        // 删掉字（删除，或者换成空的）才会让前后的字挨上；换成非空的替换文本，只有要看前后
-        // 一个字的正则会因为它变
-        let seams = looks || editing().any(|r| r.edit_with().is_none_or(str::is_empty));
+        // 删掉字（删除，或者换成空的）才会让前后的字挨上。换上去的替换文本不算接缝：它两头的字
+        // 照样不和它拼成命中（和它重叠的不算），要看前后一个字的正则也不因为它再认一遍 ——
+        // `\w\b` 换成 `[x]` 之后前一个字后面也成了词的边界，再认一遍就一个字一个字地换下去
+        let seams = editing().any(|r| r.edit_with().is_none_or(str::is_empty));
         Some(Arc::new(Answer {
             hold: out.iter().map(|r| r.hold).max().unwrap_or(0),
             edits: editing().next().is_some(),
@@ -139,7 +137,6 @@ impl Answer {
             } else {
                 0
             },
-            looks,
             rules: out,
         }))
     }
@@ -181,7 +178,7 @@ impl AnswerRule {
             return None;
         }
         let re = crate::bounded_with(&source, !r.case_sensitive).ok()?;
-        let (hold, bounded, looks, anchored) = if literal {
+        let (hold, bounded, _, anchored) = if literal {
             (
                 r.pattern.chars().count().saturating_sub(1),
                 true,
@@ -203,7 +200,6 @@ impl AnswerRule {
             re,
             hold,
             bounded,
-            looks,
             anchored,
         })
     }
@@ -652,14 +648,20 @@ impl Pass {
                 .map_or(at, |(r, _)| r.start)
         };
         upto = straddle(upto).max(self.sent);
-        let live = |w: &str| answer.reach > 0 && (w.is_empty() || answer.looks);
-        // 删在这一路开头的不算接缝：前面没有字可接（见 [`Pass::piece`]）
-        let seamed = merged.iter().any(|(r, w)| {
-            r.start >= self.sent
-                && r.end <= upto
-                && live(w)
-                && !(w.is_empty() && !self.started && r.start == self.sent)
-        });
+        let live = |w: &str| answer.reach > 0 && w.is_empty();
+        // 这一次交出去的里面有没有接缝。删在这一路开头的不算：前面没有字可接（见
+        // [`Pass::piece`]）—— 开头连着删了几处，它们交出去都在开头，都不算
+        let seamed = {
+            let mut delta: isize = 0;
+            merged
+                .iter()
+                .filter(|(r, _)| r.start >= self.sent && r.end <= upto)
+                .any(|(r, w)| {
+                    let o = ((r.start - self.sent) as isize + delta).max(0);
+                    delta += w.len() as isize - r.len() as isize;
+                    live(w) && (self.started || o > 0)
+                })
+        };
         // 最后一遍交给客户端的，还要离以后的改动至少 `reach` 个字：以后在 `upto` 之后删了字，
         // 接缝前面这些字可能和后面的接成一处命中，得还在手里。这一次就有接缝的，整段交给下一遍
         if tail && !last && edits && answer.reach > 0 && !seamed {
@@ -738,9 +740,6 @@ impl Pass {
             }
             if live(w) {
                 seams.push(o);
-                if !w.is_empty() {
-                    seams.push(o + w.len());
-                }
             }
             delta += w.len() as isize - r.len() as isize;
             pos = r.end;

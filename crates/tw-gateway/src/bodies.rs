@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use tw_guard::redact::replace::{Form, Ledger, Scheme};
+use tw_guard::redact::replace::{Form, Ledger, Scheme, ValueSpans};
 use tw_guard::redact::rules::{Hit, Kind, Rule, RuleSet};
 
 /// 打码要多看的那一截。
@@ -134,11 +134,12 @@ impl Redaction {
             }
         };
         let sent = self.sent_as(form);
+        let values = self.values(text, form);
         // 摘要以外的各段照常（找过的命中照用）；摘要解开了重新找、换、打码，再包回去
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         for (span, summary) in carried_summaries(text) {
-            out.push_str(&self.piece(text, at..span.start, hits, &sent));
+            out.push_str(&self.piece(text, at..span.start, hits, &values, &sent));
             out.push_str(&tw_dialect::compaction::carry(&self.apply_found(
                 &summary,
                 None,
@@ -146,8 +147,13 @@ impl Redaction {
             )));
             at = span.end;
         }
-        out.push_str(&self.piece(text, at..text.len(), hits, &sent));
+        out.push_str(&self.piece(text, at..text.len(), hits, &values, &sent));
         out
+    }
+
+    /// 账本里的原值在 `text` 里都在哪儿（[`Self::piece`] 要）。**一段文字找一遍**，分几截取
+    pub(crate) fn values(&self, text: &str, form: Form) -> ValueSpans<'_> {
+        ValueSpans::new(text, &self.ledger, form)
     }
 
     /// 原值 → 发给上游的占位符（[`Self::piece`] 要的那张表），在 JSON 原文里找。存下来的
@@ -168,13 +174,14 @@ impl Redaction {
     /// 分开（见 [`carried_summaries`]），一段一段打和整段一起打是一样的。
     ///
     /// `hits` 是 [`crate::guard::hits`] 在 `text` 上找到的，按起点排好、互不重叠：整个落在这一段
-    /// 里的才算，按起点二分找到头一个。安全日志的前后文（[`crate::guard::detail`]）也走这里：
-    /// 和存下来的正文是同一个打码的办法
+    /// 里的才算，按起点二分找到头一个。`values` 是 [`Self::values`] 在 `text` 上找到的。安全
+    /// 日志的前后文（[`crate::guard::detail`]）也走这里：和存下来的正文是同一个打码的办法
     pub(crate) fn piece(
         &self,
         text: &str,
         range: Range<usize>,
         hits: &[Hit],
+        values: &ValueSpans<'_>,
         sent: &Sent<'_>,
     ) -> String {
         let first = hits.partition_point(|h| h.bytes.start < range.start);
@@ -183,10 +190,6 @@ impl Redaction {
             .take_while(|h| h.bytes.start < range.end)
             .filter(|h| h.bytes.end <= range.end)
             .collect();
-        // 规则认不出的原值也换掉：回答里换回来的口令单独出现时，没有前后文，规则认不出它
-        // （见 [`tw_guard::redact::replace::value_spans`]）。和规则的命中重叠的让给命中
-        let values =
-            tw_guard::redact::replace::value_spans(text, range.clone(), &self.ledger, sent.form);
         let mut changes: Vec<(Range<usize>, String)> = Vec::with_capacity(mine.len());
         for h in &mine {
             let value = &text[h.bytes.clone()];
@@ -198,10 +201,20 @@ impl Redaction {
                 },
             ));
         }
-        for (r, placeholder) in values {
+        // 规则认不出的原值也换掉：回答里换回来的口令单独出现时，没有前后文，规则认不出它
+        // （见 [`ValueSpans`]）。跨在这一段两头的切下来的那一截也换；和规则的命中重叠的那一截
+        // 让给命中，剩下的照样换 —— 一截都不原样留
+        for (r, placeholder) in values.within(range.clone()) {
+            let mut from = r.start;
             let k = mine.partition_point(|h| h.bytes.end <= r.start);
-            if !mine.get(k).is_some_and(|h| h.bytes.start < r.end) {
-                changes.push((r, placeholder.to_string()));
+            for h in mine[k..].iter().take_while(|h| h.bytes.start < r.end) {
+                if h.bytes.start > from {
+                    changes.push((from..h.bytes.start, placeholder.to_string()));
+                }
+                from = from.max(h.bytes.end);
+            }
+            if from < r.end {
+                changes.push((from..r.end, placeholder.to_string()));
             }
         }
         changes.sort_by_key(|(r, _)| r.start);

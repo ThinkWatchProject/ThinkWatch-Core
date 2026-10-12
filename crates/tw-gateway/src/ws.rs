@@ -1679,8 +1679,15 @@ async fn forward(
     };
     // 回答正文的过滤：插件改过的才是客户端将要看到的那一版，工具墙看的是过滤之后的。收了尾的
     // 那一次回答又来的一帧也过（上游先报 `error` 再补一个带着整段正文的 `response.failed`）
-    let outgoing = if late {
-        filter_late(state, p, outgoing, response_id(&restored).as_deref())
+    // 带着另一次回答的 id 的收尾帧（认不出是哪一轮的、早过了记着的那几轮的）也按它自己的
+    // 过滤处理：不管在不在那几轮里，**都不碰此刻这一次回答的路**
+    let theirs = response_id(&restored);
+    let foreign = kind.is_some_and(|k| lifecycle(k) && k != "response.created")
+        && p.response.is_some()
+        && theirs.is_some()
+        && theirs != p.response;
+    let outgoing = if late || foreign {
+        filter_late(state, p, outgoing, theirs.as_deref())
     } else {
         let out = match p.answer.as_mut() {
             Some(f) => filter_answer(f, outgoing),
