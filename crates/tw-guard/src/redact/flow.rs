@@ -5,11 +5,12 @@
 //!
 //! 不只是用户消息：系统提示、模型以前的回答、工具调用的参数里都可能躺着一把密钥。
 //! 规则直接跑在请求体的 JSON 原文上（见 [`crate::redact::rules::scan`]：它认得 JSON
-//! 的转义，换下来的值放回去还是合法的 JSON）。两样东西不算：
+//! 的转义，换下来的值放回去还是合法的 JSON）。三样东西不算：
 //!
 //! - **base64 载荷**（图片、文件、推理签名、`data:` URI）：一段编码过的图片里碰巧
 //!   有一截像密钥的字母，换掉它换坏的是那张图，报出来的是一条没人看得懂的误报；
-//! - **我们自己的占位符**（见 [`hits`]）。
+//! - **我们自己的占位符**（见 [`hits`]）；
+//! - **请求体的结构**：键，和 id、类型、角色、工具名这些标识（见 [`untouched`]）。
 //!
 //! # 观察档和替换档用同一套规则
 //!
@@ -43,7 +44,7 @@ pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
     off_placeholders(text, &mut hits);
     // 大多数请求一处都不命中：载荷在哪儿等有了命中再找
     if !hits.is_empty() {
-        outside(&mut hits, base64_payloads(text));
+        outside(&mut hits, untouched(text));
     }
     hits
 }
@@ -216,16 +217,60 @@ const CARRIERS: &[&str] = &[
 /// 图片、签名动辄上千
 const PAYLOAD_MIN: usize = 256;
 
-/// 一段 JSON 原文里装着 base64 的那些字符串（引号里面的部分）：上面那几个键下面、
-/// 长得像 base64 的值，和任何地方的 `data:…;base64,` URI。
+/// 不换的地方：base64 载荷（见 [`payload`]），和**请求体的结构** —— 每一个键、
+/// 标识一样东西的值（[`structural`]）。
+///
+/// 规则找的是用户写的话。一个自定义规则 `abc123` 按子串找，会找进 Codex 的条目 id
+/// （`fco_019f…`，十六进制的 UUID）里去：换成占位符之后上游以「id 里有别的字符」拒绝整个
+/// 请求，而历史每一轮都整段重发，这段对话从此每一轮都被拒。键、类型、工具名换掉同理。
+fn untouched(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    json_strings(text, |s, key, is_key| match key {
+        _ if is_key => out.push(s),
+        Some(k) if structural(k) => out.push(s),
+        _ if payload(&text[s.clone()], key) => out.push(s),
+        _ => {}
+    });
+    out
+}
+
+/// 一个值是不是 base64 载荷：[`CARRIERS`] 下面、长得像 base64 的，和任何地方的
+/// `data:…;base64,` URI
+fn payload(value: &str, key: Option<&str>) -> bool {
+    data_uri(value) || (key.is_some_and(|k| CARRIERS.contains(&k)) && looks_base64(value))
+}
+
+/// 值是一个标识、不是一段话的那些键：各家的 id（`id`、`call_id`、`tool_use_id`、`toolUseId`、
+/// `previous_response_id`……）、条目和内容块的类型、角色、工具名、模型名。
+fn structural(key: &str) -> bool {
+    key == "id"
+        || key.ends_with("_id")
+        || key.ends_with("Id")
+        || matches!(
+            key,
+            "type" | "role" | "name" | "namespace" | "model" | "status" | "object" | "phase"
+        )
+}
+
+/// `end` 是一个字符串的结尾（引号之前）：它后面（跳过空白）是冒号的话，这个字符串是一个键
+fn is_key(text: &str, end: usize) -> bool {
+    let b = text.as_bytes();
+    let mut k = end + 1;
+    while k < b.len() && b[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    b.get(k) == Some(&b':')
+}
+
+/// 一段 JSON 原文里的每一个字符串（引号里面的部分），连同它是哪个键的值（数组里的是
+/// `None`）。键本身也回调，第三个参数是 `true`。
 ///
 /// **只扫一遍、不解析**：请求体可以有几百 MB，为找这几段建一棵树不值得。不是 JSON
-/// 的文字（开头不是 `{` 或 `[`）没有载荷可言。
-fn base64_payloads(text: &str) -> Vec<Range<usize>> {
+/// 的文字（开头不是 `{` 或 `[`）一个都不回调。
+fn json_strings(text: &str, mut f: impl FnMut(Range<usize>, Option<&str>, bool)) {
     let b = text.as_bytes();
-    let mut out = Vec::new();
     if !text.trim_start().starts_with(['{', '[']) {
-        return out;
+        return;
     }
     // 上一个字符串是不是一个键（后面跟着冒号），是的话它是哪个
     let mut key: Option<Range<usize>> = None;
@@ -241,24 +286,17 @@ fn base64_payloads(text: &str) -> Vec<Range<usize>> {
                 let end = j.min(b.len());
                 let s = start..end;
                 i = end + 1;
-                // 后面（跳过空白）是冒号：这是一个键
-                let mut k = i;
-                while k < b.len() && b[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                if b.get(k) == Some(&b':') {
+                if is_key(text, end) {
+                    f(s.clone(), None, true);
                     key = Some(s);
-                    i = k + 1;
+                    // 跳过冒号
+                    while i < b.len() && b[i] != b':' {
+                        i += 1;
+                    }
+                    i += 1;
                     continue;
                 }
-                let value = &text[s.clone()];
-                let carried = key
-                    .as_ref()
-                    .is_some_and(|k| CARRIERS.contains(&&text[k.clone()]));
-                if data_uri(value) || (carried && looks_base64(value)) {
-                    out.push(s);
-                }
-                key = None;
+                f(s, key.take().map(|k| &text[k]), false);
             }
             // 一个键的值不是字符串（对象、数组、数）：那个键管不到里面
             b'{' | b'[' | b',' => {
@@ -268,7 +306,6 @@ fn base64_payloads(text: &str) -> Vec<Range<usize>> {
             _ => i += 1,
         }
     }
-    out
 }
 
 /// `data:image/png;base64,…`。JSON 原文里斜杠可能写成 `\/`
@@ -549,6 +586,51 @@ mod tests {
         assert_eq!(parts[3]["signature"], blob.as_str());
     }
 
+    /// 自定义规则按子串找：`abc123` 会找进 Codex 的条目 id（十六进制的 UUID）里去，换成
+    /// 占位符之后上游以「id 里有别的字符」拒绝整个请求，这段对话从此每一轮都被拒
+    #[test]
+    fn keys_and_identifiers_are_left_alone() {
+        let rules = RuleSet::defaults().with_custom("mine", "abc123").unwrap();
+        let body = serde_json::json!({
+            "model": "abc123-model",
+            "previous_response_id": "resp_abc123",
+            "abc123": "a key that happens to match",
+            "input": [
+                {"type": "message", "id": "msg_019fabc123de", "role": "user",
+                 "content": [{"type": "input_text", "text": "my code is abc123"}]},
+                {"type": "function_call", "id": "fc_abc123", "call_id": "call_abc123",
+                 "name": "abc123", "arguments": "{\"q\":\"abc123\"}"},
+                {"type": "function_call_output", "id": "fco_019f93de-abc123", "call_id": "call_abc123",
+                 "output": "found abc123"},
+            ],
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_abc123", "name": "x", "input": {}},
+                {"type": "tool_result", "tool_use_id": "toolu_abc123", "content": "abc123"},
+            ]}],
+            "toolUse": {"toolUseId": "abc123"},
+        })
+        .to_string();
+        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "abc123-model");
+        assert_eq!(v["previous_response_id"], "resp_abc123");
+        assert_eq!(v["abc123"], "a key that happens to match");
+        let input = &v["input"];
+        assert_eq!(input[0]["id"], "msg_019fabc123de");
+        assert_eq!(input[0]["content"][0]["text"], "my code is <<TW_SECRET_1>>");
+        assert_eq!(input[1]["id"], "fc_abc123");
+        assert_eq!(input[1]["call_id"], "call_abc123");
+        assert_eq!(input[1]["name"], "abc123");
+        assert_eq!(input[1]["arguments"], "{\"q\":\"<<TW_SECRET_1>>\"}");
+        assert_eq!(input[2]["id"], "fco_019f93de-abc123");
+        assert_eq!(input[2]["output"], "found <<TW_SECRET_1>>");
+        let parts = &v["messages"][0]["content"];
+        assert_eq!(parts[0]["id"], "toolu_abc123");
+        assert_eq!(parts[1]["tool_use_id"], "toolu_abc123");
+        assert_eq!(parts[1]["content"], "<<TW_SECRET_1>>");
+        assert_eq!(v["toolUse"]["toolUseId"], "abc123");
+    }
+
     #[test]
     fn a_short_value_under_a_payload_key_is_still_looked_at() {
         // 一把密钥写在 `data` 下面，照样要找：载荷是很长的那种
@@ -602,6 +684,17 @@ mod tests {
             outside(&mut kept, spans.clone());
             assert_eq!(kept, pairwise, "{spans:?}");
         }
+    }
+
+    /// 原文里装着 base64 载荷的那些字符串
+    fn base64_payloads(text: &str) -> Vec<Range<usize>> {
+        let mut out = Vec::new();
+        json_strings(text, |s, key, is_key| {
+            if !is_key && payload(&text[s.clone()], key) {
+                out.push(s);
+            }
+        });
+        out
     }
 
     #[test]
