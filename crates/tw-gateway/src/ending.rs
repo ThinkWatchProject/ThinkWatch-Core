@@ -648,9 +648,17 @@ impl Drop for Ending {
                 id: self.id,
                 model: std::mem::take(&mut self.model),
                 source: tw_api::FailureSource::Internal,
-                message: msg!(
-                    "gw.internal" => "The request was interrupted by an error inside the gateway."
-                ),
+                // 哪一行、为什么（见 `crate::panic_note`）。没装钩子的（测试、嵌进别处的
+                // 网关）只能说这一句
+                message: match crate::panic_note::take() {
+                    Some(detail) => msg!(
+                        "gw.internal_panic", detail = detail =>
+                        "The request was interrupted by an error inside the gateway: {detail}"
+                    ),
+                    None => msg!(
+                        "gw.internal" => "The request was interrupted by an error inside the gateway."
+                    ),
+                },
                 sent_bytes,
                 received_bytes,
                 duration_ms: Some(self.duration_ms()),
@@ -1584,6 +1592,7 @@ mod tests {
     /// 看得见那次 panic。
     #[test]
     fn a_stream_that_panics_is_not_blamed_on_the_client() {
+        crate::panic_note::install();
         let bus = tw_observe::EventBus::new();
         let mut rx = bus.subscribe();
         let e = responding(&bus);
@@ -1607,6 +1616,16 @@ mod tests {
                 [Event::RequestFailed { source, model, .. }] if *source == tw_api::FailureSource::Internal && model == MODEL
             ),
             "{got:?}"
+        );
+        // 说得出是哪一行、为什么
+        let Event::RequestFailed { message, .. } = &got[0] else {
+            unreachable!()
+        };
+        assert_eq!(message.code, "gw.internal_panic", "{message:?}");
+        let detail = message.args.get("detail").cloned().unwrap_or_default();
+        assert!(
+            detail.contains("流里的一个 bug") && detail.contains("ending.rs:"),
+            "{detail}"
         );
     }
 }

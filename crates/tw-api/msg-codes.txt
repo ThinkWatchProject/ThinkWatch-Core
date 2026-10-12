@@ -304,6 +304,7 @@ gw.convert.tools_unsendable
 gw.count_tokens.bedrock_upstream
 gw.files.unsupported
 gw.internal
+gw.internal_panic
 gw.key_limit.cost_per_period
 gw.key_limit.cost_rolling
 gw.key_limit.requests_per_period
