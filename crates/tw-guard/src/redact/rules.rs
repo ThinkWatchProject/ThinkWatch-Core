@@ -1524,8 +1524,9 @@ pub(crate) fn plain_with(text: &str, find: impl FnOnce(&str) -> Vec<Hit>) -> Vec
 /// 和 [`scan_plain`] 的差别只在自定义规则上。桌面版扫的是线上那份 JSON，所以
 /// 自定义规则的命中止于引号和反斜杠（见 `json_safe`）；而一个先解码请求、在
 /// 正文上找、再把结果带回去的调用方（企业版）看到的就是正文，`password="x"`
-/// 截成 `password=` 只会让真值漏出去。它换下来的值可能带引号，整包还原时要用
-/// [`crate::redact::replace::restore_json`]。
+/// 截成 `password=` 只会让真值漏出去。它换下来的值是正文里的样子，可能带引号和反斜杠：
+/// 记账用 [`crate::redact::replace::apply_text`]（不再解一次转义），还原时
+/// [`crate::redact::replace::restore`] 放回 JSON 原文会转义一次。
 pub fn scan_text(text: &str, set: &RuleSet) -> Vec<Hit> {
     let builtins = RuleSet {
         on: set.on.clone(),

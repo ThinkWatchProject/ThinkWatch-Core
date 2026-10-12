@@ -22,14 +22,18 @@
 
 use std::sync::Arc;
 
-use crate::redact::replace::Ledger;
+use crate::redact::replace::{Form, Ledger};
 
 /// 一条流上的还原器。
 ///
 /// **`process()` 的输出拼起来再接上 `flush()`，等于把整段内容一次性
 /// 还原的结果。**顺序和内容都不变，唯一的差别是有些字节晚几毫秒发出去。
+///
+/// 放回去的样子看这条流是哪种写法（[`Form`]）：一份 JSON 原文的字节流（[`Restorer::new`]）
+/// 放转义过的，解码过的正文（[`Restorer::text`]，SSE 里一帧的正文字段）放原值本来的样子。
 pub struct Restorer {
     book: Arc<Book>,
+    form: Form,
     /// 占位符开头的第一个字节。先按它筛，再比前缀
     lead: u8,
     open: &'static str,
@@ -42,8 +46,9 @@ pub struct Restorer {
 /// 查一次，不拿账里的每个占位符挨个比 —— 一个请求换了几万个值时，后者在每个 chunk 上
 /// 都要比几万次。
 struct Book {
-    /// (占位符, 原值)，按占位符的字节序排
-    entries: Vec<(String, String)>,
+    /// (占位符, 原值, 原值写在 JSON 字符串里的样子)，按占位符的字节序排。和原值一样的
+    /// （绝大多数）不另抄一份，是 `None`
+    entries: Vec<(String, String, Option<String>)>,
     /// 占位符有哪几种长度，从短到长
     lens: Vec<usize>,
     /// 最长的占位符有多长：扣住的永远不会比它更多
@@ -52,10 +57,16 @@ struct Book {
 
 impl Book {
     fn of(ledger: &Ledger) -> Self {
-        let mut entries: Vec<(String, String)> = ledger
+        let mut entries: Vec<(String, String, Option<String>)> = ledger
             .table()
             .iter()
-            .map(|(p, o)| (p.clone(), o.clone()))
+            .map(|(p, o)| {
+                let json = match crate::redact::replace::json_escaped(o) {
+                    std::borrow::Cow::Owned(j) => Some(j),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+                (p.clone(), o.clone(), json)
+            })
             .collect();
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let lens = ledger.lens().to_vec();
@@ -68,12 +79,16 @@ impl Book {
 
     /// 第一个不小于 `s` 的占位符在哪儿
     fn seek(&self, s: &[u8]) -> usize {
-        self.entries.partition_point(|(p, _)| p.as_bytes() < s)
+        self.entries.partition_point(|(p, _, _)| p.as_bytes() < s)
     }
 
-    fn original(&self, placeholder: &str) -> Option<&str> {
-        let (p, o) = self.entries.get(self.seek(placeholder.as_bytes()))?;
-        (p == placeholder).then_some(o.as_str())
+    /// 占位符的原值，按 `form` 写
+    fn original(&self, placeholder: &str, form: Form) -> Option<&str> {
+        let (p, o, json) = self.entries.get(self.seek(placeholder.as_bytes()))?;
+        (p == placeholder).then_some(match (form, json) {
+            (Form::Json, Some(j)) => j.as_str(),
+            _ => o.as_str(),
+        })
     }
 
     /// `tail` 是不是某个占位符的**严格**前缀。
@@ -85,15 +100,28 @@ impl Book {
         self.entries[self.seek(tail)..]
             .iter()
             .take(2)
-            .any(|(p, _)| p.len() > tail.len() && p.as_bytes().starts_with(tail))
+            .any(|(p, _, _)| p.len() > tail.len() && p.as_bytes().starts_with(tail))
     }
 }
 
 impl Restorer {
+    /// 一份 **JSON 原文**的流（非流式响应的字节）：原值转义一次再放回去（同
+    /// [`crate::redact::replace::restore`]）。
     pub fn new(ledger: &Ledger) -> Self {
+        Self::of(ledger, Form::Json)
+    }
+
+    /// 一段**解码过的正文**的流：放回去的是原值本来的样子（同
+    /// [`crate::redact::replace::restore_text`]）。
+    pub fn text(ledger: &Ledger) -> Self {
+        Self::of(ledger, Form::Text)
+    }
+
+    fn of(ledger: &Ledger, form: Form) -> Self {
         let open = ledger.scheme().open;
         Self {
             book: Arc::new(Book::of(ledger)),
+            form,
             lead: open.as_bytes()[0],
             open,
             buffer: String::new(),
@@ -103,8 +131,14 @@ impl Restorer {
     /// 同一本账、缓冲是空的另一个还原器。一条流里有好几路时各路一个，共用一份账
     /// （不各抄一份、各排一次序）。
     pub fn fresh(&self) -> Self {
+        self.fresh_as(self.form)
+    }
+
+    /// [`Restorer::fresh`]，放回去的写法换成 `form`：一帧里既有正文、又有工具参数那段 JSON
+    pub fn fresh_as(&self, form: Form) -> Self {
         Self {
             book: Arc::clone(&self.book),
+            form,
             lead: self.lead,
             open: self.open,
             buffer: String::new(),
@@ -171,13 +205,11 @@ impl Restorer {
         if self.is_noop() {
             return s.to_string();
         }
-        crate::redact::replace::swap_with(
-            s,
-            self.open,
-            &self.book.lens,
-            |ph| self.book.original(ph),
-            str::to_string,
-        )
+        crate::redact::replace::swap_with(s, self.open, &self.book.lens, |ph| {
+            self.book
+                .original(ph, self.form)
+                .map(std::borrow::Cow::Borrowed)
+        })
     }
 }
 

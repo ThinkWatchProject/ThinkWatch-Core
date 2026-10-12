@@ -708,6 +708,32 @@ fn a_replaced_value_names_its_placeholder_and_an_observed_one_does_not() {
 }
 
 #[test]
+fn a_value_written_with_escapes_still_names_its_placeholder() {
+    // 私钥块在请求体里写着 `\n`，账里记的是解开的样子：按原文截下来的值也要找得到它的号
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+    let body = json!({"messages": [{"role": "user", "content": format!("{KEY}\n{pem}")}]});
+    let d = redacted(
+        Mode::Enforce,
+        Some(Dialect::Anthropic),
+        &body,
+        RuleSet::defaults(),
+    );
+    let placeholders: Vec<OutcomeDetail> = d.iter().map(|x| x.outcome_detail.clone()).collect();
+    assert_eq!(
+        placeholders,
+        [
+            OutcomeDetail::Replaced {
+                placeholders: vec!["<<TW_SECRET_1>>".into()]
+            },
+            OutcomeDetail::Replaced {
+                placeholders: vec!["<<TW_SECRET_2>>".into()]
+            }
+        ]
+    );
+    no_leak(&d, &["MIIBOgIBAAJBAKj34Gkx"]);
+}
+
+#[test]
 fn a_refusal_records_what_the_client_was_told_and_a_strip_counts_its_segments() {
     let rules = rules_of(&[
         ("no plan", "forbidden-plan", Match::Contains, Action::Block),

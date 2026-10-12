@@ -155,6 +155,36 @@ async fn a_secret_in_a_frame_is_redacted_before_it_reaches_the_upstream() {
     assert!(text.contains(USER_KEY), "回显没还原：{text}");
 }
 
+/// 一帧里换下来的私钥块，回显里放回去转义一次：这一帧还是 JSON，解开是真的换行。
+#[tokio::test]
+async fn a_private_key_echoed_in_a_frame_keeps_the_frame_json() {
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA PRIVATE KEY-----";
+    let (up, seen) = start_upstream("verbatim").await;
+    let gw = start_gateway(up, SecurityMode::Enforce, SecurityMode::Observe).await;
+    let mut c = connect(gw).await;
+
+    let frame = serde_json::json!({ "text": format!("钥匙：{pem}") }).to_string();
+    c.send(tokio_tungstenite::tungstenite::Message::Text(
+        frame.clone().into(),
+    ))
+    .await
+    .unwrap();
+    let back = tokio::time::timeout(Duration::from_secs(3), c.next())
+        .await
+        .expect("等回帧超时")
+        .unwrap()
+        .unwrap();
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(!got[0].contains("MIIBOgIBAAJB"), "{got:?}");
+    assert!(got[0].contains("<<TW_SECRET_1>>"), "{got:?}");
+    let text = back.into_text().unwrap();
+    assert_eq!(text.as_str(), frame);
+    let v: serde_json::Value = serde_json::from_str(&text).expect("回来的一帧还是 JSON");
+    assert_eq!(v["text"], format!("钥匙：{pem}"));
+}
+
 /// 一次连接里的第二帧**不能重用第一帧的编号**。
 ///
 /// 重用的话，两个不同的密钥映射到同一个占位符，还原时必然给错一个。
