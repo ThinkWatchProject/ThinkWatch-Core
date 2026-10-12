@@ -61,6 +61,16 @@ fn content_actions() -> Vec<&'static str> {
 fn content_matches() -> Vec<&'static str> {
     super::fields::<ContentMatch>()
 }
+/// 出站脱敏认的那几种：码位只有内容过滤认
+fn redact_matches() -> Vec<&'static str> {
+    super::fields::<ContentMatch>()
+        .into_iter()
+        .filter(|m| {
+            let m: ContentMatch = serde_yaml_ng::from_str(m).unwrap();
+            tw_guard::policy::redact_match("x", m, false).is_some()
+        })
+        .collect()
+}
 fn group_types() -> Vec<&'static str> {
     super::fields::<GroupType>()
 }
@@ -1118,8 +1128,8 @@ pub fn sections() -> Vec<Section> {
                     Kind::Objs("security.redact.custom[]"),
                     Def::Is("[]"),
                     t(
-                        "Rules of your own: whatever a pattern matches is replaced like a credential.",
-                        "自定义规则：正则匹配到的内容和凭据一样替换。",
+                        "Rules of your own: whatever a rule matches is replaced like a credential.",
+                        "自定义规则：匹配到的内容和凭据一样替换。",
                     ),
                 ),
             ],
@@ -1133,15 +1143,36 @@ pub fn sections() -> Vec<Section> {
                     "pattern",
                     Kind::Str,
                     Def::Required,
-                    t("Regular expression.", "正则表达式。"),
+                    t(
+                        "The text to look for; a regular expression with `match: regex`.",
+                        "要查找的文字；`match: regex` 时为正则表达式。",
+                    ),
+                ),
+                row(
+                    "match",
+                    Kind::Enum(redact_matches),
+                    Def::Is("contains"),
+                    t(
+                        "`contains`: `pattern` is looked for as written; characters such as `.` and `*` have no special meaning. `regex`: `pattern` is a regular expression.",
+                        "`contains`：按原样查找 `pattern`，`.`、`*` 等字符没有特殊含义。`regex`：`pattern` 是正则表达式。",
+                    ),
+                ),
+                row(
+                    "case_sensitive",
+                    Kind::Bool,
+                    Def::Is("false"),
+                    t(
+                        "Tell capital letters from small ones. Off by default: `ABC` and `abc` both match.",
+                        "区分大小写。默认不区分：`ABC` 和 `abc` 都会匹配。",
+                    ),
                 ),
                 row(
                     "label",
                     Kind::Str,
                     Def::Is("SECRET"),
                     t(
-                        "Placeholder name: what the pattern matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters.",
-                        "占位符名称：正则匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。",
+                        "Placeholder name: what the rule matches is replaced with `<<TW_label_1>>`, numbered per name. Capital letters, digits and underscores, starting with a letter, at most 24 characters.",
+                        "占位符名称：匹配到的内容替换为 `<<TW_名称_序号>>`，每个名称各自编号。只能使用大写字母、数字和下划线，以字母开头，最多 24 个字符。",
                     ),
                 ),
                 row("disabled", Kind::Bool, Def::Is("false"), RULE_DISABLED),

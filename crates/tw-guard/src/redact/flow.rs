@@ -10,7 +10,8 @@
 //! - **base64 载荷**（图片、文件、推理签名、`data:` URI）：一段编码过的图片里碰巧
 //!   有一截像密钥的字母，换掉它换坏的是那张图，报出来的是一条没人看得懂的误报；
 //! - **我们自己的占位符**（见 [`hits`]）；
-//! - **请求体的结构**：键，和 id、类型、角色、工具名这些标识（见 [`untouched`]）。
+//! - **请求体的结构**：键；自定义规则也不找协议里的 id、类型、角色、工具名、模型名
+//!   （见 [`untouched`]）。
 //!
 //! # 观察档和替换档用同一套规则
 //!
@@ -44,7 +45,16 @@ pub fn hits(text: &str, rules: &RuleSet) -> Vec<Hit> {
     off_placeholders(text, &mut hits);
     // 大多数请求一处都不命中：载荷在哪儿等有了命中再找
     if !hits.is_empty() {
-        outside(&mut hits, untouched(text));
+        let (everyone, custom) = untouched(text);
+        outside(&mut hits, everyone);
+        if hits.iter().any(|h| h.rule.custom()) && !custom.is_empty() {
+            let (mut mine, builtin): (Vec<Hit>, Vec<Hit>) =
+                hits.into_iter().partition(|h| h.rule.custom());
+            outside(&mut mine, custom);
+            hits = builtin;
+            hits.extend(mine);
+            hits.sort_by_key(|h| h.bytes.start);
+        }
     }
     hits
 }
@@ -217,21 +227,25 @@ const CARRIERS: &[&str] = &[
 /// 图片、签名动辄上千
 const PAYLOAD_MIN: usize = 256;
 
-/// 不换的地方：base64 载荷（见 [`payload`]），和**请求体的结构** —— 每一个键、
-/// 标识一样东西的值（[`structural`]）。
+/// 不换的地方，两份：**哪条规则都不换的** —— base64 载荷（见 [`payload`]）和每一个键；
+/// **自定义规则不换的** —— 协议里标识一样东西的值（[`structural`]）。
 ///
-/// 规则找的是用户写的话。一个自定义规则 `abc123` 按子串找，会找进 Codex 的条目 id
-/// （`fco_019f…`，十六进制的 UUID）里去：换成占位符之后上游以「id 里有别的字符」拒绝整个
-/// 请求，而历史每一轮都整段重发，这段对话从此每一轮都被拒。键、类型、工具名换掉同理。
-fn untouched(text: &str) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
+/// 一个自定义规则 `abc123` 按子串找，会找进 Codex 的条目 id（`fco_019f…`，十六进制的
+/// UUID）里去：换成占位符之后上游以「id 里有别的字符」拒绝整个请求，而历史每一轮都整段
+/// 重发，这段对话从此每一轮都被拒。类型、工具名换掉同理。
+///
+/// **内置规则照找这些值**：它们认的是有前缀、有格式的东西（`AKIA…`、号码），不会长在一个
+/// 十六进制的 id 里；而工具参数这种对象里，凭据和号码常常就写在 `aws_access_key_id`、
+/// `user_id` 这样的键下面。
+fn untouched(text: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let (mut everyone, mut custom) = (Vec::new(), Vec::new());
     json_strings(text, |s, key, is_key| match key {
-        _ if is_key => out.push(s),
-        Some(k) if structural(k) => out.push(s),
-        _ if payload(&text[s.clone()], key) => out.push(s),
+        _ if is_key => everyone.push(s),
+        _ if payload(&text[s.clone()], key) => everyone.push(s),
+        Some(k) if structural(k) => custom.push(s),
         _ => {}
     });
-    out
+    (everyone, custom)
 }
 
 /// 一个值是不是 base64 载荷：[`CARRIERS`] 下面、长得像 base64 的，和任何地方的
@@ -240,16 +254,28 @@ fn payload(value: &str, key: Option<&str>) -> bool {
     data_uri(value) || (key.is_some_and(|k| CARRIERS.contains(&k)) && looks_base64(value))
 }
 
-/// 值是一个标识、不是一段话的那些键：各家的 id（`id`、`call_id`、`tool_use_id`、`toolUseId`、
-/// `previous_response_id`……）、条目和内容块的类型、角色、工具名、模型名。
+/// 各家协议里值是一个标识、不是一段话的那些键：条目和调用的 id、类型、角色、工具名、
+/// 模型名。**只认协议自己的键**，不按 `_id` 结尾去猜：工具参数里的 `user_id`、`order_id`
+/// 是用户的数据。
 fn structural(key: &str) -> bool {
-    key == "id"
-        || key.ends_with("_id")
-        || key.ends_with("Id")
-        || matches!(
-            key,
-            "type" | "role" | "name" | "namespace" | "model" | "status" | "object" | "phase"
-        )
+    matches!(
+        key,
+        "id" | "call_id"
+            | "item_id"
+            | "tool_use_id"
+            | "tool_call_id"
+            | "toolUseId"
+            | "previous_response_id"
+            | "response_id"
+            | "type"
+            | "role"
+            | "name"
+            | "namespace"
+            | "model"
+            | "status"
+            | "object"
+            | "phase"
+    )
 }
 
 /// `end` 是一个字符串的结尾（引号之前）：它后面（跳过空白）是冒号的话，这个字符串是一个键
@@ -629,6 +655,29 @@ mod tests {
         assert_eq!(parts[1]["tool_use_id"], "toolu_abc123");
         assert_eq!(parts[1]["content"], "<<TW_SECRET_1>>");
         assert_eq!(v["toolUse"]["toolUseId"], "abc123");
+    }
+
+    /// 工具参数这种对象里，凭据和号码就写在 `aws_access_key_id`、`user_id` 下面：内置规则
+    /// 照找；自定义规则也照找不属于协议的 `*_id`
+    #[test]
+    fn credentials_under_id_like_keys_of_user_data_are_still_found() {
+        let rules = RuleSet::defaults().with_custom("工号", "E-\\d{6}").unwrap();
+        let key = "AKIAABCDEFGHIJKLMNOP";
+        let body = serde_json::json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "deploy",
+                 "input": {"aws_access_key_id": key, "employee_id": "E-123456"}},
+            ]}],
+            "metadata": {"user_id": key},
+        })
+        .to_string();
+        let (out, _) = replace(Mode::Enforce, &rules, body.into(), &fresh());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = &v["messages"][0]["content"][0]["input"];
+        assert_eq!(input["aws_access_key_id"], "<<TW_SECRET_1>>");
+        assert_eq!(input["employee_id"], "<<TW_SECRET_2>>");
+        assert_eq!(v["metadata"]["user_id"], "<<TW_SECRET_1>>");
+        assert_eq!(v["messages"][0]["content"][0]["id"], "toolu_1");
     }
 
     #[test]

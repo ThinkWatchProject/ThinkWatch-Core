@@ -2208,6 +2208,7 @@ mod security_detail_tests {
                 name: "公司令牌".into(),
                 pattern: Some(pattern.into()),
                 matching: None,
+                case_sensitive: false,
                 core_version: "0.67.1".into(),
             },
             outcome_detail: outcome,

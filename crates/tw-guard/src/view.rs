@@ -16,10 +16,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::{self, Codepoints};
 use crate::policy::{
-    ContentAction, ContentPolicy, DEFAULT_LABEL, LABEL_PREFIX, Mode, RedactPolicy, Security,
-    ToolAction, ToolPolicy,
+    ContentAction, ContentMatch, ContentPolicy, DEFAULT_LABEL, LABEL_PREFIX, Mode, RedactPolicy,
+    Security, ToolAction, ToolPolicy,
 };
 use crate::redact::rules as redact_rules;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 
 /// 一条规则在第三档下做什么。工具调用审查是 `cut` / `record`，内容过滤是 `block` /
 /// `strip` / `record`；出站脱敏的规则命中即替换，没有这一项。
@@ -110,9 +114,20 @@ pub enum Matcher {
     /// 中国大陆手机号：11 位数字，`1` 开头、第二位是 `3`–`9`，前后不紧挨别的数字
     CnMobilePhone,
     /// 正则表达式：工具调用审查的全部规则，和各项防护的自定义规则
-    Regex { pattern: String },
-    /// 不分大小写的子串：内容过滤的关键词规则
-    Contains { text: String },
+    Regex {
+        pattern: String,
+        /// 分大小写：工具调用审查的规则（开头写了 `(?i)` 的除外）、写明了要分的出站脱敏
+        /// 自定义规则。内容过滤的不分
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_sensitive: bool,
+    },
+    /// 子串，按原样找：内容过滤的关键词规则、出站脱敏的自定义规则
+    Contains {
+        text: String,
+        /// 分大小写：写明了要分的出站脱敏自定义规则。内容过滤的不分
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_sensitive: bool,
+    },
     /// 这几段码位里的字符，一项一个。内置规则是规范写法（`U+200B`、`U+E0000–U+E007F`），
     /// 自定义规则是它存着的写法（各项用 `, ` 连起来就是存着的那一份的意思）
     Codepoints { ranges: Vec<String> },
@@ -271,8 +286,16 @@ pub fn redact(p: &RedactPolicy) -> GuardDetail {
         name: c.name.clone(),
         why: String::new(),
         kind: "custom".into(),
-        matcher: Matcher::Regex {
-            pattern: c.pattern.clone(),
+        matcher: match c.matching {
+            ContentMatch::Regex => Matcher::Regex {
+                pattern: c.pattern.clone(),
+                case_sensitive: c.case_sensitive,
+            },
+            // 码位过不了校验，到不了这里；万一到了，照它写的样子当文字给
+            _ => Matcher::Contains {
+                text: c.pattern.clone(),
+                case_sensitive: c.case_sensitive,
+            },
         },
         enabled: !c.disabled,
         on_by_default: true,
@@ -304,6 +327,7 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
                 },
                 None => Matcher::Regex {
                     pattern: r.pattern.clone(),
+                    case_sensitive: !ignores_case(&r.pattern),
                 },
             },
             enabled: !p.disable.contains(&r.id),
@@ -321,6 +345,7 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
         kind: "custom".into(),
         matcher: Matcher::Regex {
             pattern: c.pattern.clone(),
+            case_sensitive: !ignores_case(&c.pattern),
         },
         enabled: !c.disabled,
         on_by_default: true,
@@ -334,15 +359,29 @@ pub fn inspect_tools(p: &ToolPolicy) -> GuardDetail {
     }
 }
 
+/// 工具调用审查的正则整条不分大小写：开头写着 `(?i)` 这样的标志
+fn ignores_case(pattern: &str) -> bool {
+    pattern
+        .strip_prefix("(?")
+        .and_then(|rest| rest.split_once([')', ':']))
+        .is_some_and(|(flags, _)| {
+            // `-` 之后的是关掉的
+            flags.chars().all(|c| "imsuxU-".contains(c))
+                && flags.split('-').next().is_some_and(|on| on.contains('i'))
+        })
+}
+
 /// 内容规则按什么认。码位：内置规则写成规范写法，自定义规则照它写的样子一项一项给
 /// （界面拼回去存的就是这一份）；写坏了的（绕过校验写进去的）整段原样给
 fn content_matcher(matching: content::Match, pattern: &str, custom: bool) -> Matcher {
     match matching {
         content::Match::Contains => Matcher::Contains {
             text: pattern.to_string(),
+            case_sensitive: false,
         },
         content::Match::Regex => Matcher::Regex {
             pattern: pattern.to_string(),
+            case_sensitive: false,
         },
         content::Match::Codepoints => Matcher::Codepoints {
             ranges: match Codepoints::parse(pattern) {
@@ -462,12 +501,16 @@ mod tests {
                 CustomRedactRule {
                     name: "项目号".into(),
                     pattern: r"PRJ-\d{6}".into(),
+                    matching: ContentMatch::Regex,
+                    case_sensitive: true,
                     label: Some("PROJECT".into()),
                     disabled: false,
                 },
                 CustomRedactRule {
                     name: "不写标签".into(),
                     pattern: "x".into(),
+                    matching: ContentMatch::Contains,
+                    case_sensitive: false,
                     label: None,
                     disabled: true,
                 },
@@ -479,6 +522,27 @@ mod tests {
         assert_eq!(r("项目号").label.as_deref(), Some("PROJECT"));
         assert_eq!(r("不写标签").label.as_deref(), Some("SECRET"));
         assert!(!r("不写标签").enabled && r("不写标签").custom);
+    }
+
+    #[test]
+    fn a_regex_says_whether_it_tells_cases_apart() {
+        assert!(ignores_case(r"(?i)curl\s"));
+        assert!(ignores_case(r"(?im)x"));
+        assert!(ignores_case(r"(?i:rm)\s"));
+        assert!(!ignores_case(r"curl(?i)x"));
+        assert!(!ignores_case(r"(?-i)x"));
+        assert!(!ignores_case(r"(?m-i)x"));
+        assert!(!ignores_case(r"(?P<n>i)"));
+        let v = inspect_tools(&ToolPolicy::default());
+        for r in &v.rules {
+            if let Matcher::Regex {
+                pattern,
+                case_sensitive,
+            } = &r.matcher
+            {
+                assert_eq!(*case_sensitive, !pattern.starts_with("(?i)"), "{pattern}");
+            }
+        }
     }
 
     #[test]
@@ -601,7 +665,8 @@ mod tests {
                 .unwrap()
                 .matcher,
             Matcher::Contains {
-                text: "jailbreak".into()
+                text: "jailbreak".into(),
+                case_sensitive: false,
             }
         );
         let mine = v.rules.last().unwrap();
@@ -630,12 +695,16 @@ mod tests {
                     CustomRedactRule {
                         name: "项目号".into(),
                         pattern: r"PRJ-\d{6}".into(),
+                        matching: ContentMatch::Regex,
+                        case_sensitive: true,
                         label: Some("PROJECT".into()),
                         disabled: false,
                     },
                     CustomRedactRule {
                         name: "不写标签".into(),
                         pattern: "x".into(),
+                        matching: ContentMatch::Contains,
+                        case_sensitive: false,
                         label: None,
                         disabled: true,
                     },
@@ -720,8 +789,8 @@ mod tests {
                 .collect()
         }
         let pattern = |m: &Matcher| match m {
-            Matcher::Regex { pattern } => (pattern.clone(), ContentMatch::Regex),
-            Matcher::Contains { text } => (text.clone(), ContentMatch::Contains),
+            Matcher::Regex { pattern, .. } => (pattern.clone(), ContentMatch::Regex),
+            Matcher::Contains { text, .. } => (text.clone(), ContentMatch::Contains),
             Matcher::Codepoints { ranges } => (ranges.join(", "), ContentMatch::Codepoints),
             other => panic!("自定义规则不会是 {other:?}"),
         };
@@ -739,6 +808,17 @@ mod tests {
                 .map(|r| CustomRedactRule {
                     name: r.id.clone(),
                     pattern: pattern(&r.matcher).0,
+                    matching: pattern(&r.matcher).1,
+                    case_sensitive: matches!(
+                        r.matcher,
+                        Matcher::Regex {
+                            case_sensitive: true,
+                            ..
+                        } | Matcher::Contains {
+                            case_sensitive: true,
+                            ..
+                        }
+                    ),
                     label: r.label.clone(),
                     disabled: !r.enabled,
                 })

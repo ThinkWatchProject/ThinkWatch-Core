@@ -392,6 +392,8 @@ pub struct Hit {
 pub struct Custom {
     pub name: Arc<str>,
     pub re: regex::Regex,
+    /// 写的样子和怎么认（[`Pattern`]），原样：安全日志记下命中那一刻的规则
+    pub pattern: Pattern,
     /// 占位符里的标签（企业版的 `EMAIL`、`PHONE`）。`None` 用账本的默认标签
     pub label: Option<Arc<str>>,
 }
@@ -404,19 +406,50 @@ pub struct BadPattern {
     pub detail: String,
 }
 
+/// 一条自定义规则写的样子和怎么认。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pattern {
+    pub text: String,
+    /// 是正则；不是就按原样找这段文字
+    pub regex: bool,
+    /// 分大小写
+    pub case_sensitive: bool,
+}
+
+impl Pattern {
+    /// 一段正则，分大小写
+    pub fn regex(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            regex: true,
+            case_sensitive: true,
+        }
+    }
+
+    /// 编成正则：按原样找的那段文字先转义
+    pub fn compile(&self, name: &str) -> Result<regex::Regex, BadPattern> {
+        if self.text.is_empty() {
+            return Err(BadPattern {
+                name: name.to_string(),
+                detail: "the pattern is empty".to_string(),
+            });
+        }
+        let source = if self.regex {
+            self.text.clone()
+        } else {
+            regex::escape(&self.text)
+        };
+        crate::bounded_with(&source, !self.case_sensitive).map_err(|e| BadPattern {
+            name: name.to_string(),
+            detail: e.to_string(),
+        })
+    }
+}
+
 /// 编一条正则。**长度和编译后的大小都有上限** —— 这条正则要在每个请求体
 /// 上跑，一个写得很大的正则不该拖慢每一个请求。
 pub fn compile(name: &str, pattern: &str) -> Result<regex::Regex, BadPattern> {
-    if pattern.is_empty() {
-        return Err(BadPattern {
-            name: name.to_string(),
-            detail: "the pattern is empty".to_string(),
-        });
-    }
-    crate::bounded(pattern).map_err(|e| BadPattern {
-        name: name.to_string(),
-        detail: e.to_string(),
-    })
+    Pattern::regex(pattern).compile(name)
 }
 
 /// 这一次按哪些规则找。
@@ -484,11 +517,7 @@ impl RuleSet {
             set.on.remove(b.id);
         }
         for (name, pattern) in custom {
-            set.custom.push(Custom {
-                name: Arc::from(name),
-                re: compile(name, pattern)?,
-                label: None,
-            });
+            set = set.with_labeled(name, pattern, None)?;
         }
         Ok(set)
     }
@@ -498,16 +527,27 @@ impl RuleSet {
         self.with_labeled(name, pattern, None)
     }
 
-    /// 再加一条自定义规则，占位符用它自己的标签：`{{EMAIL_1}}` 里的 `EMAIL`。
+    /// 再加一条正则写的自定义规则，占位符用它自己的标签：`{{EMAIL_1}}` 里的 `EMAIL`。
     pub fn with_labeled(
-        mut self,
+        self,
         name: &str,
         pattern: &str,
         label: Option<&str>,
     ) -> Result<Self, BadPattern> {
+        self.with_rule(name, Pattern::regex(pattern), label)
+    }
+
+    /// 再加一条自定义规则：按原样找一段文字或者按正则，分不分大小写由 `pattern` 说。
+    pub fn with_rule(
+        mut self,
+        name: &str,
+        pattern: Pattern,
+        label: Option<&str>,
+    ) -> Result<Self, BadPattern> {
         self.custom.push(Custom {
             name: Arc::from(name),
-            re: compile(name, pattern)?,
+            re: pattern.compile(name)?,
+            pattern,
             label: label.map(Arc::from),
         });
         Ok(self)
@@ -517,13 +557,13 @@ impl RuleSet {
         self.on.contains(id)
     }
 
-    /// 名字是 `name` 的自定义规则的正则，**写的原样**（编译时没改过它）。没有这条规则是
-    /// `None`。安全日志记下命中那一刻的规则：之后改了、删了，那一条说的还是当时那一版
-    pub fn custom_pattern(&self, name: &str) -> Option<&str> {
+    /// 名字是 `name` 的自定义规则**写的样子和怎么认**。没有这条规则是 `None`。安全日志记下
+    /// 命中那一刻的规则：之后改了、删了，那一条说的还是当时那一版
+    pub fn custom_pattern(&self, name: &str) -> Option<&Pattern> {
         self.custom
             .iter()
             .find(|c| &*c.name == name)
-            .map(|c| c.re.as_str())
+            .map(|c| &c.pattern)
     }
 
     /// 一条都没开。**调用方据此整条短路** —— 没有规则的话，找都不用找。

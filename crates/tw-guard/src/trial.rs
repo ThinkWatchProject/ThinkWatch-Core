@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::content::{self, Codepoints, Scope};
 use crate::policy::{
     ContentAction, ContentMatch, ContentPolicy, Guard, PolicyError, RedactPolicy, Security,
-    ToolAction, ToolPolicy, label_ok, placeholder_label,
+    ToolAction, ToolPolicy, label_ok, placeholder_label, redact_match,
 };
 use crate::redact::replace::{Ledger, Scheme};
 use crate::redact::rules::RuleSet;
@@ -28,12 +28,16 @@ pub const TRIAL: &str = "trial";
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(rename = "SecurityTestRequest"))]
 pub struct TrialRequest {
     pub sample: String,
-    /// 只试这一条（正在编辑的规则）：出站脱敏和工具调用审查是正则，内容过滤按 `match`
+    /// 只试这一条（正在编辑的规则）：工具调用审查是正则，出站脱敏和内容过滤按 `match`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
-    /// 内容过滤试 `pattern` 时怎么认：`contains` / `regex` / `codepoints`，不给按 `contains`
+    /// 试 `pattern` 时怎么认：内容过滤是 `contains` / `regex` / `codepoints`，出站脱敏是
+    /// `contains` / `regex`。不给按 `contains`
     #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
     pub matching: Option<ContentMatch>,
+    /// 出站脱敏试 `pattern` 时分不分大小写。不给是不分
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_sensitive: Option<bool>,
     /// 只试这一条内置规则（停用着的也能试）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
@@ -101,6 +105,8 @@ pub enum TrialError {
     BadLabel { label: String },
     #[error("`{}` is not something a {} rule does", .action.slug(), .guard.rule_noun())]
     BadAction { guard: Guard, action: RuleAction },
+    #[error("redaction rules match by contains or regex, not `{}`", .matching.slug())]
+    BadMatch { matching: ContentMatch },
     /// 现在的策略本身编不起来（绕过了校验写进去的）
     #[error(transparent)]
     Policy(#[from] PolicyError),
@@ -115,6 +121,7 @@ impl TrialError {
             TrialError::BadCodepoints { .. } => "rule_codepoints_bad",
             TrialError::BadLabel { .. } => "rule_label_bad",
             TrialError::BadAction { .. } => "rule_action_bad",
+            TrialError::BadMatch { .. } => "rule_match_bad",
             TrialError::Policy(e) => e.code(),
         }
     }
@@ -145,8 +152,11 @@ fn redact(p: &RedactPolicy, req: &TrialRequest) -> Result<TrialResult, TrialErro
                 Some(l) if label_ok(l) => Some(placeholder_label(l)),
                 Some(l) => return Err(TrialError::BadLabel { label: l.clone() }),
             };
+            let matching = req.matching.unwrap_or_default();
+            let pattern = redact_match(pattern, matching, req.case_sensitive.unwrap_or(false))
+                .ok_or(TrialError::BadMatch { matching })?;
             RuleSet::none()
-                .with_labeled(TRIAL, pattern, label.as_deref())
+                .with_rule(TRIAL, pattern, label.as_deref())
                 .map_err(|e| TrialError::BadPattern { detail: e.detail })?
         }
         (None, Some(id)) => {
@@ -403,6 +413,7 @@ mod tests {
         let s = Security::default();
         let mut q = req("编号 PRJ-123456 和 PRJ-654321");
         q.pattern = Some(r"PRJ-\d{6}".into());
+        q.matching = Some(ContentMatch::Regex);
         q.label = Some("PROJECT".into());
         let r = run(Guard::Redact, &s, &q).unwrap();
         assert_eq!(
