@@ -227,12 +227,14 @@ fn redact_urls_within(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find("://") {
-        // scheme 是 `://` 前面那串合法字符，往前找到边界
-        let head = &rest[..i];
-        let scheme_start = head
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        // scheme 是 `://` 前面那串合法字符，往前找到边界。**按字节往回数**：边界上那个字是
+        // 多字节的（`上游换成了：https://…`）时，「它的位置加一」落在它中间，切片当场 panic。
+        // scheme 的字符都是单字节的 ASCII，数出来的起点一定在字符边界上
+        let scheme_start = i - rest.as_bytes()[..i]
+            .iter()
+            .rev()
+            .take_while(|&&c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'.' | b'-'))
+            .count();
         out.push_str(&rest[..scheme_start]);
         let url_part = &rest[scheme_start..];
         // URL 到第一个空白或引号为止
@@ -687,6 +689,20 @@ mod body_tests {
         let out = mask_config_yaml("    # 上游换成了 https://bob:hunter2@relay.example.com/v1\n");
         assert!(!out.contains("hunter2"), "URL 里的凭据漏了：{out}");
         assert!(out.contains("relay.example.com"), "主机名不该打掉：{out}");
+    }
+
+    /// URL 前面紧挨着一个中文字、全角冒号：以前切 scheme 时切在那个字中间，panic
+    #[test]
+    fn a_credential_url_right_after_chinese_text_is_masked_without_splitting_a_character() {
+        for line in [
+            "    # 上游换成了：https://bob:hunter2@relay.example.com/v1",
+            "    # 上游换成了https://bob:hunter2@relay.example.com/v1",
+            "    note: 见 é😀socks5h://bob:hunter2@127.0.0.1:7890",
+        ] {
+            let out = mask_line(line);
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(out.contains("上游换成了") || out.contains("é😀"), "{out}");
+        }
     }
 
     #[test]
